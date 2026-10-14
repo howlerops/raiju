@@ -1,0 +1,721 @@
+// External vector stores for the semantic cache (Bifrost's top-level vector_store):
+// Qdrant over its REST API, and Redis or Valkey over RESP with RediSearch. Each
+// entry is a vector, a payload of text fields, and an expiry (ms since the epoch).
+// Searches skip expired entries, so a stale answer is never returned even when the
+// server's own cleanup lags. The request builders and reply parsers are pure
+// functions and are tested here without a server.
+//
+// Reserved payload keys, written by the store: entry_id (the caller's id) and
+// expires_ms. Callers must not use them as field names.
+
+import { sha256, toHex, utf8 } from "./crypto"
+import { fields, elements, find, rawNum, decodeString, quote } from "./json"
+
+const ID_KEY = "entry_id"
+const EXP_KEY = "expires_ms"
+
+// A stored entry found by a search. score is cosine similarity (1 is identical).
+export type Hit = { id: string, score: f64, payload: Map<string, string> }
+
+// Keeps entries whose payload field `key` equals `eq`.
+export type Cond = { key: string, eq: string }
+
+// The vector_store section. Only qdrant and redis are read; the others are ignored.
+// Qdrant is reached over REST (rest_port, default 6333), not gRPC.
+export type VectorStoreSettings = {
+  enabled?: bool,
+  type: string,
+  config?: {
+    host?: string,
+    rest_port?: int,
+    use_tls?: bool,
+    api_key?: string,
+    addr?: string,
+    username?: string,
+    password?: string,
+    db?: int,
+  },
+}
+
+// The store a vector_store section names, or undefined when it is off or Raiju has no
+// client for its type. Throws when the section is on but incomplete.
+export function openVectorStore(s: VectorStoreSettings | undefined): VectorStore | undefined throws Error {
+  if (s === undefined || s.enabled === false) return undefined
+  const c = s.config ?? {}
+  if (s.type === "qdrant") {
+    const host = c.host ?? ""
+    if (host === "") throw new Error("vector_store: qdrant needs a host")
+    const scheme = c.use_tls === true ? "https" : "http"
+    return new QdrantStore(`${scheme}://${host}:${c.rest_port ?? 6333}`, c.api_key ?? "")
+  }
+  if (s.type === "redis") {
+    const addr = c.addr ?? ""
+    if (addr === "") throw new Error("vector_store: redis needs an addr")
+    return new RedisStore(addr, c.username ?? "", c.password ?? "", c.db ?? 0, c.use_tls === true)
+  }
+  return undefined
+}
+
+// The interface every store implements. Namespaces are created with ensure before
+// add or search use them.
+export abstract class VectorStore {
+  // Creates the namespace (a Qdrant collection, a RediSearch index) if missing.
+  // tags are the payload fields that searches may filter on.
+  abstract ensure(ns: string, dim: int, tags: string[]): Promise<void, Error>
+  // Stores or replaces an entry that expires ttlMs from now.
+  abstract add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error>
+  // The nearest unexpired entry whose similarity is at least threshold and whose
+  // payload matches every condition, or undefined.
+  abstract search(ns: string, vector: f64[], threshold: f64, filter: Cond[]): Promise<Hit | undefined, Error>
+  abstract delete(ns: string, id: string): Promise<void, Error>
+}
+
+// ---- shared helpers ----
+
+// The payload as a JSON object: the entry id, the expiry, then the caller's text fields.
+export function payloadJson(id: string, payload: Map<string, string>, expiresMs: int): string {
+  const parts: string[] = [quote(ID_KEY) + ":" + quote(id), quote(EXP_KEY) + ":" + `${expiresMs}`]
+  for (const k of payload.keys()) {
+    if (k === ID_KEY || k === EXP_KEY) continue
+    parts.push(quote(k) + ":" + quote(payload.get(k)!))
+  }
+  return "{" + parts.join(",") + "}"
+}
+
+// The entry id and text fields of a payload object (as payloadJson writes it, or
+// as Qdrant returns it). Non-string values other than the reserved keys are skipped.
+function readPayload(raw: string): { id: string, payload: Map<string, string> } throws SyntaxError {
+  const out: Map<string, string> = new Map()
+  let id = ""
+  for (const f of try fields(raw)) {
+    if (!f.raw.startsWith("\"")) continue
+    const v = try decodeString(f.raw)
+    if (f.key === ID_KEY) id = v
+    else if (f.key !== EXP_KEY) out.set(f.key, v)
+  }
+  return { id: id, payload: out }
+}
+
+// A point id for Qdrant, which takes UUIDs only: a version-5-shaped UUID hashed from
+// the entry id. The real id is kept in the payload.
+export function pointId(id: string): string {
+  const h = sha256(utf8(id))
+  const b: u8[] = []
+  for (let i = 0; i < 16; i++) b.push(h[i]!)
+  b[6] = u8((int(b[6]!) & 15) | 80)
+  b[8] = u8((int(b[8]!) & 63) | 128)
+  const x = toHex(b)
+  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20, 32)}`
+}
+
+// A JSON array of numbers.
+function vectorJson(v: f64[]): string {
+  const parts: string[] = []
+  for (const x of v) parts.push(`${x}`)
+  return "[" + parts.join(",") + "]"
+}
+
+// The IEEE 754 single-precision bytes of x, little-endian: what RediSearch reads as
+// FLOAT32. Rounds to nearest; values past the float range become infinities.
+export function f32Bytes(x: f64): u8[] {
+  let a = Math.abs(x)
+  let e = 0
+  if (a > 0.0) {
+    while (a >= 2.0) {
+      a = a / 2.0
+      e += 1
+    }
+    while (a < 1.0) {
+      a = a * 2.0
+      e -= 1
+    }
+  }
+  let biased = 0
+  let mant = 0
+  if (a > 0.0) {
+    if (e >= -126) {
+      mant = Math.round((a - 1.0) * 8388608.0)
+      biased = e + 127
+    } else {
+      // subnormal: the value is a * 2^e, and the mantissa counts units of 2^-149
+      mant = Math.round(a * Math.pow(2.0, e + 149))
+    }
+  }
+  if (biased >= 255) {
+    biased = 255
+    mant = 0
+  }
+  // a mantissa that rounds up to 2^23 carries into the exponent by itself
+  let bits = biased * 8388608 + mant
+  if (x < 0.0) bits += 2147483648
+  return [u8(bits & 255), u8((bits >> 8) & 255), u8((bits >> 16) & 255), u8((bits >> 24) & 255)]
+}
+
+function vectorBytes(v: f64[]): u8[] {
+  const out: u8[] = []
+  for (const x of v) {
+    for (const b of f32Bytes(x)) out.push(b)
+  }
+  return out
+}
+
+// Escapes a value for a RediSearch TAG filter: characters other than letters, digits
+// and underscore get a backslash (multi-byte characters are left as they are).
+export function tagEscape(s: string): string {
+  const safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+  let out = ""
+  for (const ch of s.chars()) {
+    if (ch.byteLength > 1 || safe.includes(ch)) out += ch
+    else out += "\\" + ch
+  }
+  return out
+}
+
+// ---- Qdrant (REST) ----
+
+// The body that creates a collection: unnamed vectors, cosine distance.
+export function qdrantCreateBody(dim: int): string {
+  return `{"vectors":{"size":${dim},"distance":"Cosine"}}`
+}
+
+// The must-clauses of a query: not expired at nowMs, and each condition.
+export function qdrantFilter(filter: Cond[], nowMs: int): string {
+  const must: string[] = [`{"key":"${EXP_KEY}","range":{"gt":${nowMs}}}`]
+  for (const c of filter) must.push(`{"key":${quote(c.key)},"match":{"value":${quote(c.eq)}}}`)
+  return `{"must":[${must.join(",")}]}`
+}
+
+export function qdrantUpsertBody(id: string, v: f64[], payload: string): string {
+  return `{"points":[{"id":${quote(pointId(id))},"vector":${vectorJson(v)},"payload":${payload}}]}`
+}
+
+export function qdrantSearchBody(v: f64[], threshold: f64, filter: Cond[], nowMs: int): string {
+  return `{"query":${vectorJson(v)},"limit":1,"score_threshold":${threshold},"with_payload":true,"filter":${qdrantFilter(filter, nowMs)}}`
+}
+
+export function qdrantDeleteBody(id: string): string {
+  return `{"points":[${quote(pointId(id))}]}`
+}
+
+// The best point of a /points/query reply ({"result":{"points":[...]}}), or undefined.
+export function parseQdrantHit(body: string): Hit | undefined throws SyntaxError {
+  const top = try fields(body)
+  const res = try fields(find(top, "result") ?? "{}")
+  const pts = try elements(find(res, "points") ?? "[]")
+  if (pts.length === 0) return undefined
+  const p = try fields(pts[0]!)
+  const pl = try readPayload(find(p, "payload") ?? "{}")
+  if (pl.id === "") return undefined
+  return { id: pl.id, score: rawNum(p, "score") ?? 0.0, payload: pl.payload }
+}
+
+export class QdrantStore extends VectorStore {
+  private ready: Set<string> = new Set()
+
+  // base is the REST origin, e.g. "http://qdrant:6333".
+  constructor(readonly base: string, readonly apiKey: string) {
+    super()
+  }
+
+  private need(ns: string): void throws Error {
+    if (!this.ready.has(ns)) throw new Error(`vector store namespace "${ns}" is not ensured`)
+  }
+
+  private async call(method: string, path: string, body: string): Promise<{ status: int, text: string }, Error> {
+    const hs: Record<string, string> = this.apiKey === "" ? { "Content-Type": "application/json" } : { "Content-Type": "application/json", "api-key": this.apiKey }
+    const res = try await fetch(this.base + path, { method: method, headers: hs, body: body, signal: AbortSignal.timeout(10000) })
+    const text = try await res.text()
+    return { status: res.status, text: text }
+  }
+
+  async ensure(ns: string, dim: int, tags: string[]): Promise<void, Error> {
+    // 409 means the collection exists already
+    const r = try await this.call("PUT", `/collections/${ns}`, qdrantCreateBody(dim))
+    if ((r.status < 200 || r.status >= 300) && r.status !== 409) throw new Error(`qdrant: create ${ns}: HTTP ${r.status}: ${r.text}`)
+    this.ready.add(ns)
+  }
+
+  async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
+    try this.need(ns)
+    const expires = Math.trunc(Date.now()) + ttlMs
+    const body = qdrantUpsertBody(id, vector, payloadJson(id, payload, expires))
+    const r = try await this.call("PUT", `/collections/${ns}/points?wait=true`, body)
+    if (r.status < 200 || r.status >= 300) throw new Error(`qdrant: upsert: HTTP ${r.status}: ${r.text}`)
+  }
+
+  async search(ns: string, vector: f64[], threshold: f64, filter: Cond[]): Promise<Hit | undefined, Error> {
+    try this.need(ns)
+    const body = qdrantSearchBody(vector, threshold, filter, Math.trunc(Date.now()))
+    const r = try await this.call("POST", `/collections/${ns}/points/query`, body)
+    if (r.status < 200 || r.status >= 300) throw new Error(`qdrant: search: HTTP ${r.status}: ${r.text}`)
+    return try parseQdrantHit(r.text)
+  }
+
+  async delete(ns: string, id: string): Promise<void, Error> {
+    try this.need(ns)
+    const r = try await this.call("POST", `/collections/${ns}/points/delete?wait=true`, qdrantDeleteBody(id))
+    if (r.status < 200 || r.status >= 300) throw new Error(`qdrant: delete: HTTP ${r.status}: ${r.text}`)
+  }
+}
+
+// ---- Redis (RESP, RediSearch) ----
+
+// A RESP reply. Bulk strings keep their bytes, since embeddings are binary.
+export type Resp =
+  | { kind: "str", text: string }
+  | { kind: "err", text: string }
+  | { kind: "int", n: int }
+  | { kind: "bulk", bytes: u8[] }
+  | { kind: "nil" }
+  | { kind: "arr", items: Resp[] }
+
+// A command as a RESP array of bulk strings. Arguments given as bytes go out as they are.
+export function respCommand(args: (string | u8[])[]): u8[] {
+  const out: u8[] = []
+  for (const b of utf8(`*${args.length}\r\n`)) out.push(b)
+  for (const a of args) {
+    const bytes = Array.isArray(a) ? a : utf8(a)
+    for (const b of utf8(`$${bytes.length}\r\n`)) out.push(b)
+    for (const b of bytes) out.push(b)
+    for (const b of utf8("\r\n")) out.push(b)
+  }
+  return out
+}
+
+// The UTF-8 text of some bytes.
+function textOf(b: u8[]): string throws Error {
+  const d = try new TextDecoder()
+  return try d.decode(b)
+}
+
+// The text up to the CRLF that starts at from, and the position after it.
+function lineAt(buf: u8[], from: int): { text: string, next: int } | undefined throws Error {
+  for (let i = from; i + 1 < buf.length; i++) {
+    if (buf[i] === u8(13) && buf[i + 1] === u8(10)) {
+      return { text: try textOf(buf.slice(from, i)), next: i + 2 }
+    }
+  }
+  return undefined
+}
+
+export type RespParse = { value: Resp, next: int }
+
+// Reads one reply that starts at pos. undefined when the reply is not complete yet.
+export function parseResp(buf: u8[], pos: int): RespParse | undefined throws Error {
+  if (pos >= buf.length) return undefined
+  const t = int(buf[pos]!)
+  const line = try lineAt(buf, pos + 1)
+  if (line === undefined) return undefined
+  if (t === 43) return { value: { kind: "str", text: line.text }, next: line.next }
+  if (t === 45) return { value: { kind: "err", text: line.text }, next: line.next }
+  if (t === 58) {
+    const n = parseInt(line.text)
+    if (n === undefined) throw new SyntaxError(`bad RESP integer ${line.text}`)
+    return { value: { kind: "int", n: n }, next: line.next }
+  }
+  if (t === 36) {
+    const n = parseInt(line.text)
+    if (n === undefined) throw new SyntaxError(`bad RESP bulk length ${line.text}`)
+    if (n < 0) return { value: { kind: "nil" }, next: line.next }
+    const end = line.next + n + 2
+    if (end > buf.length) return undefined
+    return { value: { kind: "bulk", bytes: buf.slice(line.next, line.next + n) }, next: end }
+  }
+  if (t === 42) {
+    const n = parseInt(line.text)
+    if (n === undefined) throw new SyntaxError(`bad RESP array length ${line.text}`)
+    if (n < 0) return { value: { kind: "nil" }, next: line.next }
+    const items: Resp[] = []
+    let p = line.next
+    for (let i = 0; i < n; i++) {
+      const r = try parseResp(buf, p)
+      if (r === undefined) return undefined
+      items.push(r.value)
+      p = r.next
+    }
+    return { value: { kind: "arr", items: items }, next: p }
+  }
+  throw new SyntaxError(`unknown RESP type byte ${t}`)
+}
+
+// The text of a bulk reply, or "" for anything else.
+export function bulkText(r: Resp): string throws Error {
+  if (r.kind !== "bulk") return ""
+  return try textOf(r.bytes)
+}
+
+// FT.CREATE for a namespace: the entry index (cosine, FLOAT32, HNSW), the expiry as a
+// number, and each filter field as a TAG.
+export function redisCreateArgs(ns: string, dim: int, tags: string[]): (string | u8[])[] {
+  const args: (string | u8[])[] = [
+    "FT.CREATE", ns, "ON", "HASH", "PREFIX", "1", `${ns}:`, "SCHEMA",
+    "embedding", "VECTOR", "HNSW", "6", "TYPE", "FLOAT32", "DIM", `${dim}`, "DISTANCE_METRIC", "COSINE",
+    EXP_KEY, "NUMERIC",
+  ]
+  for (const t of tags) args.push(t, "TAG")
+  return args
+}
+
+// HSET for an entry: the vector, the expiry, the payload as JSON in field p, and each
+// filter field as its own value.
+export function redisAddArgs(ns: string, id: string, v: f64[], payload: Map<string, string>, expiresMs: int, tags: string[]): (string | u8[])[] {
+  const args: (string | u8[])[] = ["HSET", `${ns}:${id}`, "embedding", vectorBytes(v), EXP_KEY, `${expiresMs}`, "p", payloadJson(id, payload, expiresMs)]
+  for (const t of tags) {
+    const val = payload.get(t)
+    if (val !== undefined) args.push(t, val)
+  }
+  return args
+}
+
+// FT.SEARCH: unexpired entries that match the filter, nearest first, one result,
+// with the score and payload returned.
+export function redisSearchArgs(ns: string, v: f64[], filter: Cond[], nowMs: int): (string | u8[])[] {
+  let q = `@${EXP_KEY}:[(${nowMs} +inf]`
+  for (const c of filter) q += ` @${c.key}:{${tagEscape(c.eq)}}`
+  return [
+    "FT.SEARCH", ns, `(${q})=>[KNN 1 @embedding $vec AS score]`,
+    "PARAMS", "2", "vec", vectorBytes(v),
+    "RETURN", "2", "score", "p",
+    "LIMIT", "0", "1", "DIALECT", "2",
+  ]
+}
+
+// The hit of an FT.SEARCH reply ([count, key, [field, value, ...]]). Its score is the
+// cosine distance (1 minus similarity), which RedisStore converts.
+export function parseRedisHit(r: Resp): Hit | undefined throws Error {
+  if (r.kind === "nil") return undefined
+  if (r.kind !== "arr") throw new SyntaxError("FT.SEARCH reply is not an array")
+  if (r.items.length < 3) return undefined
+  const f = r.items[2]!
+  if (f.kind !== "arr") throw new SyntaxError("FT.SEARCH reply has no fields")
+  let distance = 0.0
+  let p = ""
+  for (let i = 0; i + 1 < f.items.length; i += 2) {
+    const name = try bulkText(f.items[i]!)
+    const val = try bulkText(f.items[i + 1]!)
+    if (name === "score") distance = parseFloat(val) ?? 0.0
+    else if (name === "p") p = val
+  }
+  if (p === "") return undefined
+  const pl = try readPayload(p)
+  if (pl.id === "") return undefined
+  return { id: pl.id, score: distance, payload: pl.payload }
+}
+
+// One TCP connection to a RESP server. Replies come back in the order commands were
+// sent, so each command waits in a queue for the next reply. A connection that
+// drops, or a reply that does not come in time, is closed; the next command opens a
+// new one and runs the login commands first.
+class RespClient {
+  private sock: Socket<undefined> | undefined = undefined
+  private connecting: Promise<void, Error> | undefined = undefined
+  private buf: u8[] = []
+  private queue: ((r: Resp) => void)[] = []
+
+  constructor(readonly host: string, readonly port: int, readonly tls: bool, readonly login: (string | u8[])[][]) {}
+
+  // Sends one command and returns its reply. An err reply comes back as a value.
+  async command(args: (string | u8[])[]): Promise<Resp, Error> {
+    try await this.ensureOpen()
+    const self = this
+    const t = setTimeout(() => {
+      self.onClose()
+    }, 10000)
+    const r = try await this.send(args)
+    clearTimeout(t)
+    return r
+  }
+
+  // Opens the connection unless it is open. Concurrent callers share one attempt.
+  private async ensureOpen(): Promise<void, Error> {
+    if (this.sock !== undefined) return
+    if (this.connecting === undefined) this.connecting = this.open()
+    const c = this.connecting
+    if (c === undefined) return
+    try {
+      await c
+    } catch (e) {
+      this.connecting = undefined
+      throw e
+    }
+  }
+
+  private async open(): Promise<void, Error> {
+    const self = this
+    const sock = try await Bun.connect({
+      hostname: this.host,
+      port: this.port,
+      tls: this.tls,
+      socket: {
+        data(s, bytes) {
+          self.onData(bytes)
+        },
+        close(s) {
+          if (s === self.sock) self.onClose()
+        },
+        error(s, e) {
+          if (s === self.sock) self.onClose()
+        },
+      },
+    })
+    this.sock = sock
+    this.buf = []
+    for (const cmd of this.login) {
+      const r = try await this.send(cmd)
+      if (r.kind === "err") {
+        this.onClose()
+        throw new Error(`redis: login: ${r.text}`)
+      }
+    }
+  }
+
+  private async send(args: (string | u8[])[]): Promise<Resp, Error> {
+    const s = this.sock
+    if (s === undefined) throw new Error("redis: not connected")
+    const p = new Promise<Resp>((resolve) => {
+      this.queue.push(resolve)
+    })
+    s.write(respCommand(args))
+    return await p
+  }
+
+  private onData(bytes: u8[]): void {
+    for (const b of bytes) this.buf.push(b)
+    while (true) {
+      let r: RespParse | undefined = undefined
+      try {
+        r = parseResp(this.buf, 0)
+      } catch (e) {
+        this.onClose()
+        return
+      }
+      if (r === undefined) return
+      this.buf = this.buf.slice(r.next)
+      const f = this.queue.shift()
+      if (f !== undefined) f(r.value)
+    }
+  }
+
+  close(): void {
+    this.onClose()
+  }
+
+  private onClose(): void {
+    const s = this.sock
+    this.sock = undefined
+    this.connecting = undefined
+    this.buf = []
+    const q = this.queue
+    this.queue = []
+    for (const f of q) f({ kind: "err", text: "connection closed" })
+    if (s !== undefined) s.end()
+  }
+}
+
+export class RedisStore extends VectorStore {
+  private client: RespClient
+  private tags: Map<string, string[]> = new Map()
+
+  // addr is "host:port"; tls turns on TLS with the system's CA bundle.
+  constructor(addr: string, username: string, password: string, db: int, tls: bool) {
+    super()
+    const parts = addr.split(":")
+    const port = parseInt(parts[1] ?? "") ?? 6379
+    const login: (string | u8[])[][] = []
+    if (password !== "") login.push(username === "" ? ["AUTH", password] : ["AUTH", username, password])
+    if (db > 0) login.push(["SELECT", `${db}`])
+    this.client = new RespClient(parts[0] ?? "", port, tls, login)
+  }
+
+  private tagsOf(ns: string): string[] throws Error {
+    const t = this.tags.get(ns)
+    if (t === undefined) throw new Error(`vector store namespace "${ns}" is not ensured`)
+    return t
+  }
+
+  async ensure(ns: string, dim: int, tags: string[]): Promise<void, Error> {
+    const r = try await this.client.command(redisCreateArgs(ns, dim, tags))
+    if (r.kind === "err" && !r.text.startsWith("Index already exists")) throw new Error(`redis: create ${ns}: ${r.text}`)
+    this.tags.set(ns, tags)
+  }
+
+  async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
+    const tags = try this.tagsOf(ns)
+    const expires = Math.trunc(Date.now()) + ttlMs
+    const r = try await this.client.command(redisAddArgs(ns, id, vector, payload, expires, tags))
+    if (r.kind === "err") throw new Error(`redis: add: ${r.text}`)
+    const e = try await this.client.command(["PEXPIRE", `${ns}:${id}`, `${ttlMs}`])
+    if (e.kind === "err") throw new Error(`redis: expire: ${e.text}`)
+  }
+
+  async search(ns: string, vector: f64[], threshold: f64, filter: Cond[]): Promise<Hit | undefined, Error> {
+    try this.tagsOf(ns)
+    const r = try await this.client.command(redisSearchArgs(ns, vector, filter, Math.trunc(Date.now())))
+    if (r.kind === "err") throw new Error(`redis: search: ${r.text}`)
+    const hit = try parseRedisHit(r)
+    if (hit === undefined) return undefined
+    // COSINE distance d is similarity 1 - d
+    const sim = 1.0 - hit.score
+    if (sim < threshold) return undefined
+    return { id: hit.id, score: sim, payload: hit.payload }
+  }
+
+  async delete(ns: string, id: string): Promise<void, Error> {
+    try this.tagsOf(ns)
+    const r = try await this.client.command(["DEL", `${ns}:${id}`])
+    if (r.kind === "err") throw new Error(`redis: delete: ${r.text}`)
+  }
+
+  // Closes the connection. An open socket keeps the process running, so call this
+  // before a script that used the store is meant to end.
+  close(): void {
+    this.client.close()
+  }
+}
+
+// ---- tests (no network) ----
+
+test("the same entry id always gets the same point id, shaped as a UUID", () => {
+  const a = pointId("e1")
+  expect(a).toBe(pointId("e1"))
+  expect(a !== pointId("e2")).toBe(true)
+  expect(a.byteLength).toBe(36)
+  expect(a.slice(8, 9)).toBe("-")
+  expect(a.slice(14, 15)).toBe("5")
+})
+
+test("f32 bytes match the IEEE single encoding", () => {
+  expect(f32Bytes(1.0).join(",")).toBe("0,0,128,63")
+  expect(f32Bytes(-2.0).join(",")).toBe("0,0,0,192")
+  expect(f32Bytes(0.5).join(",")).toBe("0,0,0,63")
+  expect(f32Bytes(0.1).join(",")).toBe("205,204,204,61")
+  expect(f32Bytes(0.0).join(",")).toBe("0,0,0,0")
+  expect(f32Bytes(1e-40).join(",")).toBe("194,22,1,0")
+})
+
+test("tag values are escaped for RediSearch", () => {
+  expect(tagEscape("gpt-4o.mini")).toBe("gpt\\-4o\\.mini")
+  expect(tagEscape("abc_1")).toBe("abc_1")
+})
+
+test("qdrant bodies", () => {
+  expect(qdrantCreateBody(3)).toBe(`{"vectors":{"size":3,"distance":"Cosine"}}`)
+  const f = qdrantFilter([{ key: "scope", eq: "k" }], 1000)
+  expect(f).toBe(`{"must":[{"key":"expires_ms","range":{"gt":1000}},{"key":"scope","match":{"value":"k"}}]}`)
+  const body = qdrantSearchBody([1.0, 0.5], 0.8, [], 1000)
+  expect(body).toBe(`{"query":[1,0.5],"limit":1,"score_threshold":0.8,"with_payload":true,"filter":{"must":[{"key":"expires_ms","range":{"gt":1000}}]}}`)
+  const pm: Map<string, string> = new Map()
+  pm.set("scope", "s")
+  pm.set("body", "{\"a\":1}")
+  const up = qdrantUpsertBody("e7", [0.0, 1.0], payloadJson("e7", pm, 99))
+  expect(up.startsWith(`{"points":[{"id":"${pointId("e7")}","vector":[0,1],"payload":{"entry_id":"e7","expires_ms":99,"scope":"s","body":"{\\"a\\":1}"}}]}`)).toBe(true)
+  expect(qdrantDeleteBody("e7")).toBe(`{"points":["${pointId("e7")}"]}`)
+})
+
+test("qdrant search reply: best point, its id and payload", () => {
+  const body = `{"result":{"points":[{"id":"1a2b","version":3,"score":0.93,"payload":{"entry_id":"e9","expires_ms":5,"scope":"x","body":"{}","contentType":"application/json"}}]},"status":"ok","time":0.001}`
+  const h = try parseQdrantHit(body)
+  expect(h!.id).toBe("e9")
+  expect(h!.score).toBeCloseTo(0.93)
+  expect(h!.payload.get("body")!).toBe("{}")
+  expect(h!.payload.get("contentType")!).toBe("application/json")
+  expect(h!.payload.get("expires_ms")).toBeUndefined()
+  expect(try parseQdrantHit(`{"result":{"points":[]},"status":"ok"}`)).toBeUndefined()
+})
+
+test("RESP commands encode as bulk string arrays", () => {
+  const bytes = respCommand(["PING", "a"])
+  const s = try textOf(bytes)
+  expect(s).toBe("*2\r\n$4\r\nPING\r\n$1\r\na\r\n")
+  expect(respCommand([utf8("xyz")]).length).toBe(4 + 4 + 3 + 2)
+})
+
+function bytesOf(s: string): u8[] {
+  return utf8(s)
+}
+
+test("RESP replies parse, and incomplete ones wait for more bytes", () => {
+  const ok = try parseResp(bytesOf("+OK\r\n"), 0)
+  const v0 = ok!.value
+  expect(v0.kind).toBe("str")
+  if (v0.kind === "str") expect(v0.text).toBe("OK")
+  expect(ok!.next).toBe(5)
+  const err = try parseResp(bytesOf("-ERR nope\r\n"), 0)
+  const v1 = err!.value
+  expect(v1.kind).toBe("err")
+  if (v1.kind === "err") expect(v1.text).toBe("ERR nope")
+  const n = try parseResp(bytesOf(":42\r\n"), 0)
+  const v2 = n!.value
+  expect(v2.kind).toBe("int")
+  if (v2.kind === "int") expect(v2.n).toBe(42)
+  const nil = try parseResp(bytesOf("$-1\r\n"), 0)
+  expect(nil!.value.kind === "nil").toBe(true)
+  expect(try parseResp(bytesOf("$3\r\nfo"), 0)).toBeUndefined()
+  expect(try parseResp(bytesOf("*2\r\n$1\r\na\r\n"), 0)).toBeUndefined()
+  const arr = try parseResp(bytesOf("*2\r\n$1\r\na\r\n:2\r\n"), 0)
+  const v3 = arr!.value
+  expect(v3.kind).toBe("arr")
+  if (v3.kind === "arr") expect(v3.items.length).toBe(2)
+  expect(arr!.next).toBe(15)
+  let threw = false
+  try {
+    try parseResp(bytesOf("?x\r\n"), 0)
+  } catch (e) {
+    threw = e instanceof SyntaxError
+  }
+  expect(threw).toBe(true)
+})
+
+test("FT.CREATE and HSET arguments", () => {
+  const c = redisCreateArgs("sem", 4, ["scope"])
+  expect(c.slice(0, 8).join(" ")).toBe("FT.CREATE sem ON HASH PREFIX 1 sem: SCHEMA")
+  expect(c.slice(c.length - 4).join(" ")).toBe("expires_ms NUMERIC scope TAG")
+  const pm: Map<string, string> = new Map()
+  pm.set("scope", "s1")
+  const h = redisAddArgs("sem", "e3", [1.0], pm, 77, ["scope"])
+  expect(h[0]).toBe("HSET")
+  expect(h[1]).toBe("sem:e3")
+  expect(h.slice(4, 8).join(",")).toBe("expires_ms,77,p," + payloadJson("e3", pm, 77))
+  expect(h.slice(8).join(",")).toBe("scope,s1")
+})
+
+test("FT.SEARCH KNN query carries expiry and tag filters", () => {
+  const args = redisSearchArgs("sem", [1.0], [{ key: "scope", eq: "a-b" }], 500)
+  expect(args[2]).toBe("(@expires_ms:[(500 +inf] @scope:{a\\-b})=>[KNN 1 @embedding $vec AS score]")
+  expect(args.slice(3, 6).join(",")).toBe("PARAMS,2,vec")
+  const plain = redisSearchArgs("sem", [1.0], [], 500)
+  expect(plain[2]).toBe("(@expires_ms:[(500 +inf])=>[KNN 1 @embedding $vec AS score]")
+})
+
+test("FT.SEARCH reply: the best hit with its distance and payload", () => {
+  const pj = payloadJson("e5", new Map(), 9)
+  const reply = try parseResp(bytesOf(`*3\r\n:1\r\n$6\r\nsem:e5\r\n*4\r\n$5\r\nscore\r\n$6\r\n0.0625\r\n$1\r\np\r\n$${pj.byteLength}\r\n${pj}\r\n`), 0)
+  const h = try parseRedisHit(reply!.value)
+  expect(h!.id).toBe("e5")
+  expect(h!.score).toBeCloseTo(0.0625)
+  expect(try parseRedisHit({ kind: "arr", items: [{ kind: "int", n: 0 }] })).toBeUndefined()
+})
+
+test("a vector_store section parses into the settings type", () => {
+  const s = try JSON.parse(`{"enabled":true,"type":"qdrant","config":{"host":"q.internal","use_tls":true,"api_key":"k"}}`) as VectorStoreSettings
+  expect(s.type).toBe("qdrant")
+  expect(s.config!.rest_port).toBeUndefined()
+  expect(s.config!.host!).toBe("q.internal")
+  const r = try JSON.parse(`{"type":"redis","config":{"addr":"r:6379","db":2}}`) as VectorStoreSettings
+  expect(r.config!.db!).toBe(2)
+})
+
+test("openVectorStore picks the configured backend", () => {
+  expect(try openVectorStore(undefined)).toBeUndefined()
+  expect(try openVectorStore({ enabled: false, type: "qdrant" })).toBeUndefined()
+  expect(try openVectorStore({ type: "weaviate" })).toBeUndefined()
+  let threw = false
+  try {
+    try openVectorStore({ type: "qdrant", config: {} })
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  expect(try openVectorStore({ type: "qdrant", config: { host: "q" } })).toBeDefined()
+  expect(try openVectorStore({ type: "redis", config: { addr: "r:6379", db: 2 } })).toBeDefined()
+})

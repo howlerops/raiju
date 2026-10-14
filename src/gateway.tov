@@ -34,6 +34,7 @@ import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, buildChain } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey } from "./semcache"
 import { Deadline, deadline } from "./deadline"
+import { VectorStore, openVectorStore } from "./vectorstore"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
@@ -408,6 +409,10 @@ export class Engine {
   plugins: PluginChain | undefined = undefined
   semantic: SemanticCache | undefined = undefined
   semanticCfg: SemanticCacheConfig = defaultSemanticConfig()
+  // an external vector store for the semantic cache (Bifrost's vector_store), shared by all workers
+  vstore: VectorStore | undefined = undefined
+  vsNs = "BifrostSemanticCachePlugin"
+  vsReady = false
   guardInput = false
   guardOutput = false
   pricing: Pricing
@@ -451,6 +456,12 @@ export class Engine {
         cache_by_provider: sc.cache_by_provider ?? d.cache_by_provider,
       }
       this.semantic = new SemanticCache(this.semanticCfg)
+      this.vsNs = sc.vector_store_namespace ?? "BifrostSemanticCachePlugin"
+      try {
+        this.vstore = openVectorStore(cfg.vector_store)
+      } catch (e) {
+        console.error(`raiju: vector_store: ${e.message}; using the in-process semantic cache`)
+      }
     }
     this.jobs = new JobStore((cfg.client?.async_job_result_ttl ?? 3600) * 1000, 10000)
     const hc = cfg.health
@@ -808,6 +819,10 @@ export class Engine {
       this.semantic = fresh.semantic
       this.semanticCfg = fresh.semanticCfg
     }
+    if (this.vstore === undefined) {
+      this.vstore = fresh.vstore
+      this.vsNs = fresh.vsNs
+    }
   }
 
   // Embeds text with the semantic cache's embedding provider and model.
@@ -1063,7 +1078,8 @@ export class Engine {
           semVec = await this.embed(pt)
           semScope = scopeKey(primary.provider, primary.model, semKey, this.semanticCfg)
           const th = h.get("x-bf-cache-threshold")
-          const hit = sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : parseFloat(th))
+          const thr = th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold)
+          const hit = this.vstore !== undefined ? await this.vectorLookup(semScope, semVec, thr) : sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : parseFloat(th))
           if (hit !== undefined) {
             metrics.observeCacheHit(ctx.labels, "semantic")
             out.set("x-bf-cache", "semantic-hit")
@@ -1112,7 +1128,9 @@ export class Engine {
     }
     if (sem !== undefined && semVec.length > 0 && !noStore) {
       const ttlHeader = h.get("x-bf-cache-ttl")
-      sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttlHeader === undefined ? undefined : parseTtl(ttlHeader))
+      const ttl = ttlHeader === undefined ? undefined : parseTtl(ttlHeader)
+      if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, r.body, r.contentType, ttl ?? this.semanticCfg.ttl_ms)
+      else sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttl)
     }
     if (cache !== undefined && !noStore) {
       const ttlHeader = h.get("x-bf-cache-ttl")
@@ -1141,6 +1159,38 @@ export class Engine {
     ctx.cost = cost
     if (this.logStore !== undefined) ctx.output = r.body
     return respond(200, r.body, out)
+  }
+
+  // The best vector-store entry for a scope; a store error is a miss.
+  async vectorLookup(scope: string, v: f64[], threshold: f64): Promise<{ body: string, contentType: string, score: f64 } | undefined> {
+    const vs = this.vstore
+    if (vs === undefined) return undefined
+    try {
+      if (!this.vsReady) {
+        await vs.ensure(this.vsNs, this.cfg.semantic_cache?.dimension ?? v.length, ["scope"])
+        this.vsReady = true
+      }
+      const hit = await vs.search(this.vsNs, v, threshold, [{ key: "scope", eq: scope }])
+      if (hit === undefined) return undefined
+      return { body: hit.payload.get("body") ?? "", contentType: hit.payload.get("contentType") ?? "application/json", score: hit.score }
+    } catch (e) {
+      console.error(`raiju: vector_store search: ${e.message}`)
+      return undefined
+    }
+  }
+
+  async vectorStore(scope: string, v: f64[], body: string, contentType: string, ttlMs: int): Promise<void> {
+    const vs = this.vstore
+    if (vs === undefined || !this.vsReady) return
+    const payload: Map<string, string> = new Map()
+    payload.set("scope", scope)
+    payload.set("body", body)
+    payload.set("contentType", contentType)
+    try {
+      await vs.add(this.vsNs, newId("sc-"), v, payload, ttlMs)
+    } catch (e) {
+      console.error(`raiju: vector_store add: ${e.message}`)
+    }
   }
 
   // Request duration metric, stdout log line, log store entry and trace span for one request.

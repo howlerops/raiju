@@ -123,6 +123,8 @@ def write_config():
                          "pricing_overrides": [{"id": "po1", "name": "custom", "scope_kind": "global", "match_type": "exact", "pattern": "custom-model", "request_types": ["chat_completion"], "pricing_patch": json.dumps({"input_cost_per_token": 0.1, "output_cost_per_token": 0.1})}]},
           "guardrails_config": {"guardrail_rules": [{"id": 1, "name": "r", "enabled": True, "cel_expression": "true", "apply_to": "input", "provider_config_ids": [1]}],
                                 "guardrail_providers": [{"id": 1, "provider_name": "webhook", "policy_name": "hook", "enabled": True, "config": {"url": MOCK + "/guard-hook"}}]},
+          "plugins": [{"name": "semantic_cache", "enabled": True, "config": {"provider": "openai", "embedding_model": "text-embedding-3-small", "threshold": 0.95, "ttl": "5m", "vector_store_namespace": "e2e-ns"}}],
+          "vector_store": {"enabled": True, "type": "qdrant", "config": {"host": "127.0.0.1", "rest_port": 18089}},
           "server": {"port": 1}}
     json.dump(bf, open(os.path.join(BUILD, "e2e.bifrost.json"), "w"))
     return path
@@ -188,6 +190,7 @@ def main():
     shutil.rmtree(os.path.join(ROOT, "build/e2e-wlogs"), ignore_errors=True)
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
+    qdrant = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/qdrant_mock.py"), "18089"])
     wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
     idp, idp_state = start_idp()
     proxy, proxied = start_proxy()
@@ -648,6 +651,12 @@ def main():
         check("Bifrost's auth_config guards the management API", s == 200 and call("GET", "/api/config", base=BGW, auth=False)[0] == 401, s)
         s, _, b = bchat("openai/gpt-4o-mini", BK, "something forbidden")
         check("Bifrost's guardrails_config is enforced", s == 400 and "forbidden topic" in b, (s, b))
+        SK = {**BK, "x-bf-cache-key": "e2e"}
+        q1, h1, qb = bchat("openai/gpt-4o-mini", SK, "what is the capital of france")
+        _, h2, _ = bchat("openai/gpt-4o-mini", SK, "what is the capital of france?")
+        qc = json.loads(call("GET", "/_calls", base="http://127.0.0.1:18089")[2])
+        check("the semantic cache plugin uses Bifrost's vector_store (Qdrant)", q1 == 200 and hl(h1).get("x-bf-cache") != "semantic-hit" and hl(h2).get("x-bf-cache") == "semantic-hit"
+              and {"method": "PUT", "path": "/collections/e2e-ns/points"} in qc and {"method": "POST", "path": "/collections/e2e-ns/points/query"} in qc, (q1, qb, h1, h2, qc))
         s1, _, _ = bchat("openai/custom-model", BK)
         s2, _, b2 = bchat("openai/custom-model", BK)
         check("pricing_overrides price an unknown model, so its budget runs down", s1 == 200 and s2 == 402, (s1, s2, b2))
@@ -782,7 +791,7 @@ def main():
         s, _, b = call("POST", "/v1/chat/completions", "{not json")
         check("bad JSON is a 400", s == 400, b)
     finally:
-        gw.terminate(); gw_b.terminate(); mock.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown()
+        gw.terminate(); gw_b.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 
