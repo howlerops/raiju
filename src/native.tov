@@ -1,7 +1,7 @@
 // Drop-in SDK routes: requests in a provider's own format, forwarded with
 // governance, retries, fallbacks across keys, metrics and cost tracking.
 import { Field, fields, find, quote, build, isNull, rawStr, rawBool, setField } from "./json"
-import { Engine, Build, Translate, errorResponse, noHeaders } from "./gateway"
+import { Engine, Build, Translate, StreamSink, StreamConverter, ConverterFactory, streamable, converterKind, errorResponse, noHeaders } from "./gateway"
 import { Target, Translated } from "./providers/types"
 import { ChatRequest } from "./schemas"
 import { completionToSse } from "./sse"
@@ -79,7 +79,7 @@ export function bedrockUsage(text: string): Translated {
 // callers convert that into their own wire format.
 type Bridge = { build: Build, toOpenAI: Translate }
 
-function chatBridge(chatText: string, stream: bool, autoCache: bool): Bridge throws SyntaxError {
+function chatBridge(chatText: string, stream: bool, autoCache: bool, pipe: bool): Bridge throws SyntaxError {
   let fs = try fields(chatText)
   if (stream) setField(&fs, "stream_options", `{"include_usage":true}`)
   const streamFields = fs
@@ -87,6 +87,11 @@ function chatBridge(chatText: string, stream: bool, autoCache: bool): Bridge thr
   const req = try JSON.parse(chatText) as ChatRequest
   const b: Build = (t) => {
     if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, stream ? streamFields : plain)
+    // with a streaming client, providers that stream are converted as they go
+    if (stream && pipe) {
+      const su = try providers.streamUpstream(t, req, plain, autoCache)
+      if (su !== undefined) return su
+    }
     return try providers.chatUpstream(t, req, plain, autoCache)
   }
   const tr: Translate = (t, text, requested) => {
@@ -109,7 +114,7 @@ function bedrockAnthropicBody(body: Field[]): string {
   return build(fs)
 }
 
-export async function anthropicMessages(engine: Engine, req: Request): Promise<Response> {
+export async function anthropicMessages(engine: Engine, req: Request, sink?: StreamSink): Promise<Response> {
   const text = await req.text()
   let body: Field[] = []
   let bridge: Bridge | undefined = undefined
@@ -122,7 +127,7 @@ export async function anthropicMessages(engine: Engine, req: Request): Promise<R
   const clientModel = rawStr(body, "model") ?? ""
   try {
     // Every provider other than Anthropic (and non-streaming Bedrock) is reached through OpenAI chat.
-    bridge = chatBridge(anthropicIn.toChatRequest(text, clientModel), stream, false)
+    bridge = chatBridge(anthropicIn.toChatRequest(text, clientModel), stream, false, stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
@@ -140,7 +145,20 @@ export async function anthropicMessages(engine: Engine, req: Request): Promise<R
     const out = stream ? anthropicIn.toMessageStream(try asSse(o.body), clientModel) : try anthropicIn.toMessage(o.body, clientModel)
     return { body: out, promptTokens: o.promptTokens, completionTokens: o.completionTokens }
   }
-  return await engine.serve(req, "anthropic.messages", undefined, body, text, b, tr, stream)
+  // With a sink, events reach the client as the upstream produces them: Anthropic's own
+  // pass through, every other provider's are converted to Messages events.
+  const mk: ConverterFactory = (t, requested) => {
+    if (t.kind === "anthropic") {
+      const c = new StreamConverter("anthropic", requested, true)
+      c.raw = true
+      return c
+    }
+    if (!streamable(t)) return undefined
+    const c = new StreamConverter(converterKind(t), requested, true)
+    c.asAnthropic(clientModel)
+    return c
+  }
+  return await engine.serve(req, "anthropic.messages", undefined, body, text, b, tr, stream, undefined, stream ? sink : undefined, mk)
 }
 
 type RUsage = { usage?: { input_tokens?: int, output_tokens?: int }, response?: { usage?: { input_tokens?: int, output_tokens?: int } } }
@@ -172,7 +190,7 @@ export async function responsesApi(engine: Engine, req: Request): Promise<Respon
   let bridge: Bridge | undefined = undefined
   try {
     body = fields(reqText)
-    bridge = chatBridge(responses.toChatRequest(reqText, rawStr(body, "model") ?? ""), rawBool(body, "stream") ?? false, false)
+    bridge = chatBridge(responses.toChatRequest(reqText, rawStr(body, "model") ?? ""), rawBool(body, "stream") ?? false, false, false)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }

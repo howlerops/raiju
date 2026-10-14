@@ -449,6 +449,23 @@ def main():
             check("streamed model renamed for the caller", b'"model":"slowai/slow"' in data and b"[DONE]" in data, data[:300])
             check("usage chunk dropped when not requested", b'"usage"' not in data, data[-300:])
 
+            # the Anthropic route streams incrementally from an OpenAI-format provider too
+            body = json.dumps({"model": "slowai/slow", "max_tokens": 50, "stream": True, "messages": [{"role": "user", "content": "count"}]}).encode()
+            sock = _s.create_connection(("127.0.0.1", 18098), timeout=10)
+            sock.sendall(b"POST /anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nx-bf-mcp-include-clients: none\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+            t0 = time.time(); arrivals = []; data = b""
+            while b"message_stop" not in data:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+                for w in [b"one", b"two", b"three", b"four"]:
+                    if w in chunk:
+                        arrivals.append(round(time.time() - t0, 2))
+            sock.close()
+            spread = arrivals[-1] - arrivals[0] if len(arrivals) == 4 else 0
+            check("anthropic route streams events as they arrive", len(arrivals) == 4 and spread > 0.3 and b"content_block_delta" in data and b'"output_tokens":4' in data, (arrivals, data[-400:]))
+
         # --- wave 5 ---
         hl = lambda h: {k.lower(): v for k, v in h.items()}
         s, _, b = chat("vaulted/gpt-4o-mini", seed=901)

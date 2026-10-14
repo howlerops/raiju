@@ -5,6 +5,7 @@ import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, s
 import { ChatRequest, errorJson, newId, Hdrs, snapshot } from "./schemas"
 import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI } from "./streams"
 import { CohereToOpenAI } from "./streams_cohere"
+import { StreamState } from "./providers/anthropic_in"
 import { AffinityStore, resolveSticky, sessionId, sessionTtl, affinityMode } from "./affinity"
 import { Tier, tierTarget, overrideTier } from "./complexity"
 import * as cplx from "./complexity"
@@ -74,7 +75,61 @@ export class StreamConverter {
     }
   }
 
+  // For clients of the Anthropic Messages API: the OpenAI chunks become Messages events
+  // (asAnthropic), or an Anthropic upstream's events pass through as they are (raw).
+  out: StreamState | undefined = undefined
+  raw = false
+  private pending = ""
+
+  asAnthropic(model: string): void {
+    this.out = new StreamState(model)
+  }
+
   push(bytes: u8[]): string {
+    if (this.raw) {
+      const t = this.text(bytes)
+      const an = this.an
+      if (an !== undefined && t !== "") an.push(t)
+      return t
+    }
+    return this.post(this.inner(bytes))
+  }
+
+  end(): string {
+    if (this.raw) {
+      this.an?.end()
+      return ""
+    }
+    const tail = this.post(this.innerEnd())
+    const st = this.out
+    return st === undefined ? tail : tail + st.end()
+  }
+
+  private post(s: string): string {
+    const st = this.out
+    if (st === undefined) return s
+    this.pending += s
+    let res = ""
+    while (true) {
+      const i = this.pending.indexOf("\n\n")
+      if (i < 0) break
+      const ev = this.pending.slice(0, i)
+      this.pending = this.pending.slice(i + 2)
+      for (const line of ev.split("\n")) {
+        if (!line.startsWith("data:")) continue
+        const payload = line.slice(5).trim()
+        if (payload === "" || payload === "[DONE]") continue
+        try {
+          res += st.push(payload)
+        } catch (e) {
+          // a malformed chunk is skipped
+        }
+      }
+    }
+    return res
+  }
+
+  private inner(bytes: u8[]): string {
     const br = this.br
     if (br !== undefined) return br.push(bytes)
     const t = this.text(bytes)
@@ -90,7 +145,7 @@ export class StreamConverter {
     return ""
   }
 
-  end(): string {
+  private innerEnd(): string {
     const an = this.an
     if (an !== undefined) return an.end()
     const ge = this.ge
@@ -115,6 +170,17 @@ export class StreamConverter {
 
 class LastHeaders {
   h: Map<string, string> = new Map()
+}
+
+// Whether a kind's streams can be converted as they arrive, and which converter does it.
+export function streamable(t: Target): bool {
+  return providers.streamsNatively(t.kind) || t.kind === "anthropic" || t.kind === "gemini" || t.kind === "bedrock" || t.kind === "cohere" || t.kind === "vertex"
+}
+
+export function converterKind(t: Target): string {
+  // Vertex streams Anthropic events for Claude models and Gemini chunks for the rest
+  const kind = t.kind === "vertex" ? (isClaude(t.model) ? "anthropic" : "gemini") : t.kind
+  return providers.streamsNatively(kind) ? "openai" : kind
 }
 
 export type ConverterFactory = (t: Target, requestedModel: string) => StreamConverter | undefined
@@ -987,10 +1053,8 @@ export class Engine {
     // With a sink, OpenAI-format upstreams stream straight through as chunks arrive.
     const dropUsage = !wantUsage
     const mk: ConverterFactory = (t, requested) => {
-      if (!providers.streamsNatively(t.kind) && t.kind !== "anthropic" && t.kind !== "gemini" && t.kind !== "bedrock" && t.kind !== "cohere" && t.kind !== "vertex") return undefined
-      // Vertex streams Anthropic events for Claude models and Gemini chunks for the rest
-      const kind = t.kind === "vertex" ? (isClaude(t.model) ? "anthropic" : "gemini") : t.kind
-      return new StreamConverter(providers.streamsNatively(kind) ? "openai" : kind, requested, !dropUsage)
+      if (!streamable(t)) return undefined
+      return new StreamConverter(converterKind(t), requested, !dropUsage)
     }
     return try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
   }
