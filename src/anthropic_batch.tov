@@ -1,0 +1,429 @@
+// Anthropic Message Batches, Files and Models shapes for the /anthropic/v1 routes.
+// Anthropic targets pass through unchanged. For OpenAI-format providers the
+// requests and answers are converted here: a batch create body becomes an OpenAI
+// batch input file, and OpenAI batch, file and model objects become Anthropic ones.
+// Pure functions over JSON text; the caller does the HTTP and the uploads.
+import { Field, fields, elements, find, quote, rawStr, build, without, isNull } from "./json"
+import { toChatRequest, toMessage } from "./providers/anthropic_in"
+
+// Anthropic clients on an Anthropic target use the native API, so nothing converts.
+export function isPassthrough(provider: string): bool {
+  return provider === "anthropic"
+}
+
+const DAY = 86400.0
+
+// Zero-pads a whole number to w digits.
+function pad(n: f64, w: int): string {
+  let s = `${n}`
+  while (s.byteLength < w) s = "0" + s
+  return s
+}
+
+// Unix seconds as an RFC 3339 UTC timestamp. The civil date comes from the day
+// count (Howard Hinnant's civil_from_days), so no Date object is needed.
+export function rfc3339(sec: f64): string {
+  const s = Math.max(0.0, Math.floor(sec))
+  const days = Math.floor(s / DAY)
+  const rem = s - days * DAY
+  const z = days + 719468.0
+  const era = Math.floor(z / 146097.0)
+  const doe = z - era * 146097.0
+  const yoe = Math.floor((doe - Math.floor(doe / 1460.0) + Math.floor(doe / 36524.0) - Math.floor(doe / 146096.0)) / 365.0)
+  const doy = doe - (365.0 * yoe + Math.floor(yoe / 4.0) - Math.floor(yoe / 100.0))
+  const mp = Math.floor((5.0 * doy + 2.0) / 153.0)
+  const d = doy - Math.floor((153.0 * mp + 2.0) / 5.0) + 1.0
+  const m = mp < 10.0 ? mp + 3.0 : mp - 9.0
+  const y = yoe + era * 400.0 + (m <= 2.0 ? 1.0 : 0.0)
+  const hh = Math.floor(rem / 3600.0)
+  const mi = Math.floor((rem - hh * 3600.0) / 60.0)
+  const ss = rem - hh * 3600.0 - mi * 60.0
+  return `${pad(y, 4)}-${pad(m, 2)}-${pad(d, 2)}T${pad(hh, 2)}:${pad(mi, 2)}:${pad(ss, 2)}Z`
+}
+
+// A unix-seconds field as a number, or the fallback when absent or null.
+function secs(fs: Field[], key: string, dflt: f64): f64 {
+  const r = find(fs, key)
+  if (isNull(r)) return dflt
+  return numOf(r, dflt)
+}
+
+// A number from its raw text, or the fallback when it does not parse.
+function numOf(r: string | undefined, dflt: f64): f64 {
+  const n = parseFloat(r ?? "")
+  return n ?? dflt
+}
+
+// A raw field's text, or the fallback when absent or null.
+function rawOr(fs: Field[], key: string, dflt: string): string {
+  const r = find(fs, key)
+  if (isNull(r)) return dflt
+  return r ?? dflt
+}
+
+// A unix-seconds field as a quoted RFC 3339 string, or null when absent.
+function timeOrNull(fs: Field[], key: string): string {
+  const r = find(fs, key)
+  if (isNull(r)) return "null"
+  return quote(rfc3339(numOf(r, 0.0)))
+}
+
+// The first of several time fields that is set, as the Anthropic timestamp.
+function firstTime(fs: Field[], keys: string[]): string {
+  for (const k of keys) {
+    const t = timeOrNull(fs, k)
+    if (t !== "null") return t
+  }
+  return "null"
+}
+
+// An Anthropic list page: data, has_more, and the first and last ids.
+function pageJson(items: string[], ids: string[], hasMore: string): string {
+  const first = ids.length > 0 ? quote(ids[0] ?? "") : "null"
+  const last = ids.length > 0 ? quote(ids[ids.length - 1] ?? "") : "null"
+  return `{"data":[${items.join(",")}],"has_more":${hasMore},"first_id":${first},"last_id":${last}}`
+}
+
+// OpenAI batch status as Anthropic processing_status.
+export function processingStatus(status: string): string {
+  if (status === "cancelling") return "canceling"
+  if (status === "validating" || status === "in_progress" || status === "finalizing") return "in_progress"
+  return "ended"
+}
+
+// Anthropic batch create body ({requests: [{custom_id, params}]}) as an OpenAI
+// batch input file: one chat completion request per line. upstreamModel, when
+// set, replaces each params.model (the caller resolves "provider/model" to the
+// upstream name); otherwise each line uses its own model. Streaming is dropped.
+// Throws SyntaxError for a body that is invalid, which the caller answers as 400.
+export function batchInputJsonl(body: string, upstreamModel: string): string throws SyntaxError {
+  const top = try fields(body)
+  const reqs = find(top, "requests")
+  if (reqs === undefined || isNull(reqs)) throw new SyntaxError("requests is required")
+  const lines: string[] = []
+  const seen = new Set<string>()
+  for (const el of try elements(reqs)) {
+    const r = try fields(el)
+    const id = rawStr(r, "custom_id") ?? ""
+    if (id === "" || id.byteLength > 64) throw new SyntaxError("custom_id must be 1 to 64 characters")
+    if (seen.has(id)) throw new SyntaxError(`duplicate custom_id ${id}`)
+    seen.add(id)
+    const params = try fields(find(r, "params") ?? "{}")
+    const model = upstreamModel !== "" ? upstreamModel : (rawStr(params, "model") ?? "")
+    if (model === "") throw new SyntaxError(`model is required for ${id}`)
+    const chat = try toChatRequest(build(without(params, ["stream", "stream_options"])), model)
+    lines.push(`{"custom_id":${quote(id)},"method":"POST","url":"/v1/chat/completions","body":${chat}}`)
+  }
+  if (lines.length === 0) throw new SyntaxError("requests must not be empty")
+  return lines.join("\n") + "\n"
+}
+
+// OpenAI batch object as an Anthropic message_batch. resultsBase is the URL
+// prefix for results (for example ".../v1/anthropic/v1/messages/batches"); the
+// results_url is set once the batch has ended, and null while it runs.
+export function batchToAnthropic(openai: string, resultsBase: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const id = rawStr(fs, "id") ?? ""
+  const status = rawStr(fs, "status") ?? "validating"
+  const ps = processingStatus(status)
+  const countsRaw = find(fs, "request_counts")
+  let cf: Field[] = []
+  if (countsRaw !== undefined && !isNull(countsRaw)) cf = try fields(countsRaw)
+  const total = secs(cf, "total", 0.0)
+  const completed = secs(cf, "completed", 0.0)
+  const failed = secs(cf, "failed", 0.0)
+  // Requests that neither completed nor failed take the state of the batch.
+  const rest = Math.max(0.0, total - completed - failed)
+  let processing = 0.0
+  let errored = failed
+  let canceled = 0.0
+  let expired = 0.0
+  if (ps === "in_progress" || ps === "canceling") processing = rest
+  else if (status === "expired") expired = rest
+  else if (status === "cancelled") canceled = rest
+  else errored += rest
+  const created = secs(fs, "created_at", 0.0)
+  const expires = secs(fs, "expires_at", created + DAY)
+  const ended = ps === "ended"
+  const resultsUrl = ended && resultsBase !== "" ? quote(resultsBase + "/" + id + "/results") : "null"
+  return `{"id":${quote(id)},"type":"message_batch","processing_status":${quote(ps)},` +
+    `"request_counts":{"processing":${processing},"succeeded":${completed},"errored":${errored},"canceled":${canceled},"expired":${expired}},` +
+    `"ended_at":${firstTime(fs, ["completed_at", "failed_at", "expired_at", "cancelled_at"])},` +
+    `"created_at":${quote(rfc3339(created))},"expires_at":${quote(rfc3339(expires))},"archived_at":null,` +
+    `"cancel_initiated_at":${timeOrNull(fs, "cancelling_at")},"results_url":${resultsUrl}}`
+}
+
+// OpenAI batch list ({data, has_more, ...}) as an Anthropic batch page.
+export function batchListToAnthropic(openai: string, resultsBase: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const items: string[] = []
+  const ids: string[] = []
+  for (const el of try elements(find(fs, "data") ?? "[]")) {
+    items.push(try batchToAnthropic(el, resultsBase))
+    ids.push(rawStr(try fields(el), "id") ?? "")
+  }
+  return pageJson(items, ids, rawOr(fs, "has_more", "false"))
+}
+
+// The result of one failed request. raw is an error object, or the body of a
+// failed response, which wraps the error in "error". A batch_expired error is
+// an expired result.
+function errorResult(raw: string | undefined): string throws SyntaxError {
+  let ef: Field[] = []
+  if (raw !== undefined && !isNull(raw)) ef = try fields(raw)
+  const inner = find(ef, "error")
+  if (inner !== undefined && !isNull(inner)) ef = try fields(inner)
+  const code = rawStr(ef, "code") ?? rawStr(ef, "type") ?? "api_error"
+  const msg = rawStr(ef, "message") ?? "request failed"
+  if (code === "batch_expired") return `{"type":"expired"}`
+  return `{"type":"errored","error":{"type":"error","error":{"type":${quote(code)},"message":${quote(msg)}}}}`
+}
+
+// One line of the OpenAI batch output file as one Anthropic result line.
+function resultLine(line: string): string throws SyntaxError {
+  const fs = try fields(line)
+  const cid = rawStr(fs, "custom_id") ?? ""
+  const resp = find(fs, "response")
+  let result = ""
+  if (resp !== undefined && !isNull(resp)) {
+    const rf = try fields(resp)
+    const body = find(rf, "body")
+    const code = numOf(rawOr(rf, "status_code", "0"), 0.0)
+    if (code === 200.0 && body !== undefined && !isNull(body)) {
+      const model = rawStr(try fields(body), "model") ?? ""
+      result = `{"type":"succeeded","message":${try toMessage(body, model)}}`
+    } else result = try errorResult(body)
+  } else result = try errorResult(find(fs, "error"))
+  return `{"custom_id":${quote(cid)},"result":${result}}`
+}
+
+// OpenAI batch output JSONL as Anthropic results JSONL, one {custom_id, result}
+// per line. Lines without a response are errored or expired results.
+export function resultsJsonl(output: string): string throws SyntaxError {
+  const lines: string[] = []
+  for (const raw of output.split("\n")) {
+    const line = raw.trim()
+    if (line !== "") lines.push(try resultLine(line))
+  }
+  if (lines.length === 0) return ""
+  return lines.join("\n") + "\n"
+}
+
+// The MIME type of a file name, from its extension.
+export function mimeType(filename: string): string {
+  const parts = filename.split(".")
+  const ext = parts.length < 2 ? "" : (parts[parts.length - 1] ?? "").toLowerCase()
+  if (ext === "json") return "application/json"
+  if (ext === "jsonl") return "application/jsonl"
+  if (ext === "txt") return "text/plain"
+  if (ext === "md") return "text/markdown"
+  if (ext === "csv") return "text/csv"
+  if (ext === "html") return "text/html"
+  if (ext === "pdf") return "application/pdf"
+  if (ext === "png") return "image/png"
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg"
+  if (ext === "gif") return "image/gif"
+  if (ext === "webp") return "image/webp"
+  return "application/octet-stream"
+}
+
+// OpenAI file object as Anthropic file metadata. Batch output files are the
+// downloadable ones.
+export function fileToAnthropic(openai: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const name = rawStr(fs, "filename") ?? ""
+  const downloadable = rawStr(fs, "purpose") === "batch_output"
+  return `{"id":${quote(rawStr(fs, "id") ?? "")},"type":"file","filename":${quote(name)},` +
+    `"mime_type":${quote(mimeType(name))},"size_bytes":${rawOr(fs, "bytes", "0")},` +
+    `"created_at":${quote(rfc3339(secs(fs, "created_at", 0.0)))},"downloadable":${downloadable ? "true" : "false"}}`
+}
+
+// OpenAI file list ({data, has_more}) as an Anthropic file page.
+export function fileListToAnthropic(openai: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const items: string[] = []
+  const ids: string[] = []
+  for (const el of try elements(find(fs, "data") ?? "[]")) {
+    items.push(try fileToAnthropic(el))
+    ids.push(rawStr(try fields(el), "id") ?? "")
+  }
+  return pageJson(items, ids, rawOr(fs, "has_more", "false"))
+}
+
+// OpenAI file delete response as Anthropic's file_deleted object.
+export function fileDeletedToAnthropic(openai: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const type = find(fs, "deleted") === "true" ? "file_deleted" : "file"
+  return `{"id":${quote(rawStr(fs, "id") ?? "")},"type":${quote(type)}}`
+}
+
+// One Anthropic model object. The display name is the id, since the providers
+// do not send one.
+export function anthropicModel(id: string, created?: f64): string {
+  return `{"type":"model","id":${quote(id)},"display_name":${quote(id)},"created_at":${quote(rfc3339(created ?? 0.0))}}`
+}
+
+// The Anthropic models list for a set of ids, as GET /v1/models returns it.
+export function anthropicModels(ids: { id: string, created?: f64 }[]): string {
+  const items = ids.map((m) => anthropicModel(m.id, m.created))
+  return pageJson(items, ids.map((m) => m.id), "false")
+}
+
+// An OpenAI-style models list ({data: [{id, created}]}) as the Anthropic list.
+export function anthropicModelsFromOpenAI(openai: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const ids: { id: string, created?: f64 }[] = []
+  for (const el of try elements(find(fs, "data") ?? "[]")) {
+    const m = try fields(el)
+    const id = rawStr(m, "id") ?? ""
+    if (id !== "") ids.push({ id: id, created: secs(m, "created", 0.0) })
+  }
+  return anthropicModels(ids)
+}
+
+test("rfc3339 formats unix seconds", () => {
+  expect(rfc3339(0.0)).toBe("1970-01-01T00:00:00Z")
+  expect(rfc3339(1700000000.0)).toBe("2023-11-14T22:13:20Z")
+  expect(rfc3339(951782400.0)).toBe("2000-02-29T00:00:00Z")
+  expect(rfc3339(4102444799.0)).toBe("2099-12-31T23:59:59Z")
+})
+
+test("OpenAI batch status maps to processing_status", () => {
+  expect(processingStatus("validating")).toBe("in_progress")
+  expect(processingStatus("in_progress")).toBe("in_progress")
+  expect(processingStatus("finalizing")).toBe("in_progress")
+  expect(processingStatus("cancelling")).toBe("canceling")
+  expect(processingStatus("completed")).toBe("ended")
+  expect(processingStatus("cancelled")).toBe("ended")
+  expect(processingStatus("expired")).toBe("ended")
+  expect(processingStatus("failed")).toBe("ended")
+})
+
+test("batch create body becomes OpenAI batch input lines", () => {
+  const body = `{"requests":[
+    {"custom_id":"a","params":{"model":"gpt-4o","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}},
+    {"custom_id":"b","params":{"model":"gpt-4o-mini","stream":true,"system":"be brief","messages":[{"role":"user","content":"yo"}]}}]}`
+  const out = try batchInputJsonl(body, "")
+  const lines = out.split("\n")
+  expect(lines.length).toBe(3)
+  expect(lines[0]).toBe(`{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"max_tokens":100}}`)
+  expect(lines[1]).toBe(`{"custom_id":"b","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4o-mini","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"yo"}]}}`)
+  expect(lines[2]).toBe("")
+})
+
+test("upstream model overrides params.model", () => {
+  const body = `{"requests":[{"custom_id":"a","params":{"model":"openai/gpt-4o","messages":[]}}]}`
+  const out = try batchInputJsonl(body, "gpt-4o-2024-08-06")
+  expect(out.includes(`"model":"gpt-4o-2024-08-06"`)).toBe(true)
+  expect(out.includes("openai/gpt-4o")).toBe(false)
+})
+
+test("invalid batch create bodies throw", () => {
+  let threw = 0
+  try {
+    try batchInputJsonl(`{"requests":[]}`, "")
+  } catch (e) { threw += 1 }
+  try {
+    try batchInputJsonl(`{"nope":1}`, "")
+  } catch (e) { threw += 1 }
+  try {
+    try batchInputJsonl(`{"requests":[{"custom_id":"a","params":{"messages":[]}}]}`, "")
+  } catch (e) { threw += 1 }
+  try {
+    try batchInputJsonl(`{"requests":[{"custom_id":"a","params":{"model":"m","messages":[]}},{"custom_id":"a","params":{"model":"m","messages":[]}}]}`, "")
+  } catch (e) { threw += 1 }
+  try {
+    try batchInputJsonl(`{"requests":[{"params":{"model":"m","messages":[]}}]}`, "")
+  } catch (e) { threw += 1 }
+  expect(threw).toBe(5)
+})
+
+test("in-progress OpenAI batch becomes a message_batch", () => {
+  const ob = `{"id":"batch_1","object":"batch","status":"in_progress","created_at":1700000000,"expires_at":1700086400,"request_counts":{"total":3,"completed":1,"failed":0}}`
+  const out = try batchToAnthropic(ob, "https://gw.example/anthropic/v1/messages/batches")
+  expect(out).toBe(`{"id":"batch_1","type":"message_batch","processing_status":"in_progress","request_counts":{"processing":2,"succeeded":1,"errored":0,"canceled":0,"expired":0},"ended_at":null,"created_at":"2023-11-14T22:13:20Z","expires_at":"2023-11-15T22:13:20Z","archived_at":null,"cancel_initiated_at":null,"results_url":null}`)
+})
+
+test("completed batch carries ended_at and results_url", () => {
+  const ob = `{"id":"batch_2","status":"completed","created_at":1700000000,"expires_at":1700086400,"completed_at":1700003600,"request_counts":{"total":2,"completed":1,"failed":1}}`
+  const out = try batchToAnthropic(ob, "https://gw.example/b")
+  expect(out.includes(`"processing_status":"ended"`)).toBe(true)
+  expect(out.includes(`"request_counts":{"processing":0,"succeeded":1,"errored":1,"canceled":0,"expired":0}`)).toBe(true)
+  expect(out.includes(`"ended_at":"2023-11-14T23:13:20Z"`)).toBe(true)
+  expect(out.includes(`"results_url":"https://gw.example/b/batch_2/results"`)).toBe(true)
+})
+
+test("cancelling and expired batches", () => {
+  const c = try batchToAnthropic(`{"id":"x","status":"cancelling","created_at":0,"cancelling_at":1700000000,"request_counts":{"total":4,"completed":1,"failed":0}}`, "")
+  expect(c.includes(`"processing_status":"canceling"`)).toBe(true)
+  expect(c.includes(`"processing":3`)).toBe(true)
+  expect(c.includes(`"cancel_initiated_at":"2023-11-14T22:13:20Z"`)).toBe(true)
+  expect(c.includes(`"results_url":null`)).toBe(true)
+  const e = try batchToAnthropic(`{"id":"y","status":"expired","created_at":0,"expired_at":1700000000,"request_counts":{"total":4,"completed":1,"failed":0}}`, "")
+  expect(e.includes(`"expired":3`)).toBe(true)
+  expect(e.includes(`"processing":0`)).toBe(true)
+})
+
+test("batch list keeps order and paging fields", () => {
+  const list = `{"object":"list","has_more":true,"data":[{"id":"b1","status":"completed","created_at":1},{"id":"b2","status":"in_progress","created_at":2}]}`
+  const out = try batchListToAnthropic(list, "")
+  expect(out.startsWith(`{"data":[{"id":"b1"`)).toBe(true)
+  expect(out.includes(`{"id":"b2","type":"message_batch"`)).toBe(true)
+  expect(out.endsWith(`"has_more":true,"first_id":"b1","last_id":"b2"}`)).toBe(true)
+  const empty = try batchListToAnthropic(`{"data":[]}`, "")
+  expect(empty).toBe(`{"data":[],"has_more":false,"first_id":null,"last_id":null}`)
+})
+
+test("OpenAI batch output becomes Anthropic results", () => {
+  const output = `{"id":"r1","custom_id":"a","response":{"status_code":200,"request_id":"q","body":{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}},"error":null}
+{"id":"r2","custom_id":"b","response":null,"error":{"code":"batch_expired","message":"expired"}}
+{"id":"r3","custom_id":"c","response":{"status_code":400,"request_id":"q2","body":{"error":{"type":"invalid_request_error","message":"bad input"}}},"error":null}
+
+`
+  const out = try resultsJsonl(output)
+  const lines = out.split("\n")
+  expect(lines.length).toBe(4)
+  expect(lines[0]).toBe(`{"custom_id":"a","result":{"type":"succeeded","message":{"id":"msg_chatcmpl-1","type":"message","role":"assistant","model":"gpt-4o","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":2}}}}`)
+  expect(lines[1]).toBe(`{"custom_id":"b","result":{"type":"expired"}}`)
+  expect(lines[2]).toBe(`{"custom_id":"c","result":{"type":"errored","error":{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}}}`)
+  expect(lines[3]).toBe("")
+  const blank = try resultsJsonl("\n  \n")
+  expect(blank).toBe("")
+})
+
+test("OpenAI file object becomes Anthropic file metadata", () => {
+  const f = try fileToAnthropic(`{"id":"file-1","object":"file","bytes":120,"created_at":1700000000,"filename":"batch.jsonl","purpose":"batch"}`)
+  expect(f).toBe(`{"id":"file-1","type":"file","filename":"batch.jsonl","mime_type":"application/jsonl","size_bytes":120,"created_at":"2023-11-14T22:13:20Z","downloadable":false}`)
+  const o = try fileToAnthropic(`{"id":"file-2","bytes":5,"created_at":0,"filename":"out.JSON","purpose":"batch_output"}`)
+  expect(o.includes(`"mime_type":"application/json"`)).toBe(true)
+  expect(o.includes(`"downloadable":true`)).toBe(true)
+  expect(mimeType("noext")).toBe("application/octet-stream")
+})
+
+test("file list and delete", () => {
+  const list = try fileListToAnthropic(`{"object":"list","has_more":false,"data":[{"id":"file-1","bytes":1,"created_at":0,"filename":"a.txt","purpose":"batch"},{"id":"file-2","bytes":2,"created_at":0,"filename":"b.pdf","purpose":"batch"}]}`)
+  expect(list.endsWith(`"has_more":false,"first_id":"file-1","last_id":"file-2"}`)).toBe(true)
+  expect(list.startsWith(`{"data":[{"id":"file-1","type":"file","filename":"a.txt","mime_type":"text/plain"`)).toBe(true)
+  const del = try fileDeletedToAnthropic(`{"id":"file-1","object":"file","deleted":true}`)
+  expect(del).toBe(`{"id":"file-1","type":"file_deleted"}`)
+  const kept = try fileDeletedToAnthropic(`{"id":"file-1","deleted":false}`)
+  expect(kept).toBe(`{"id":"file-1","type":"file"}`)
+})
+
+test("models list in Anthropic shape", () => {
+  const out = anthropicModels([{ id: "gpt-4o", created: 1700000000.0 }, { id: "gpt-4o-mini" }])
+  expect(out).toBe(`{"data":[{"type":"model","id":"gpt-4o","display_name":"gpt-4o","created_at":"2023-11-14T22:13:20Z"},{"type":"model","id":"gpt-4o-mini","display_name":"gpt-4o-mini","created_at":"1970-01-01T00:00:00Z"}],"has_more":false,"first_id":"gpt-4o","last_id":"gpt-4o-mini"}`)
+  expect(anthropicModels([])).toBe(`{"data":[],"has_more":false,"first_id":null,"last_id":null}`)
+  expect(anthropicModel("claude-x", 0.0)).toBe(`{"type":"model","id":"claude-x","display_name":"claude-x","created_at":"1970-01-01T00:00:00Z"}`)
+})
+
+test("OpenAI models response converts", () => {
+  const out = try anthropicModelsFromOpenAI(`{"object":"list","data":[{"id":"gpt-4o","object":"model","created":1700000000,"owned_by":"openai"}]}`)
+  expect(out.includes(`{"type":"model","id":"gpt-4o","display_name":"gpt-4o","created_at":"2023-11-14T22:13:20Z"}`)).toBe(true)
+  expect(out.endsWith(`"first_id":"gpt-4o","last_id":"gpt-4o"}`)).toBe(true)
+})
+
+test("only anthropic passes through", () => {
+  expect(isPassthrough("anthropic")).toBe(true)
+  expect(isPassthrough("openai")).toBe(false)
+})

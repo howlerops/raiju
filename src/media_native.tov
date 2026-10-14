@@ -1,0 +1,1027 @@
+// Native builders and converters for the OpenAI-shaped media, file and batch
+// calls on Anthropic and Gemini. Builders return the request to send; converters
+// take the upstream body and return the OpenAI-shaped body. Nothing here does
+// HTTP. The caller reads a batch's input file (its text is passed in), sends the
+// requests, and handles errors.
+import { Field, fields, elements, find, quote, rawStr, rawNum, isNull, setField, build } from "./json"
+import { Target, headers, addExtraHeaders, trimSlash } from "./providers/types"
+import * as anthropic from "./providers/anthropic"
+import * as gemini from "./providers/gemini"
+import { ChatRequest, newId, nowSeconds } from "./schemas"
+import { decode } from "./base64"
+
+// The request to send. A FormData body is a multipart upload; the caller leaves
+// its content type to fetch.
+export type MediaRequest = { method: string, url: string, headers: Map<string, string>, body: string | FormData | undefined }
+
+// Speech audio and its content type.
+export type SpeechAudio = { bytes: u8[], contentType: string }
+
+const ANTHROPIC_VERSION = "2023-06-01"
+const FILES_BETA = "files-api-2025-04-14"
+// Gemini TTS audio is 16-bit mono PCM at this rate, unless its MIME type says otherwise.
+const GEMINI_PCM_RATE = 24000
+
+// ---- shared helpers ----
+
+function anthropicBase(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b === undefined || b === "") return "https://api.anthropic.com"
+  return trimSlash(b)
+}
+
+function geminiBase(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b === undefined || b === "") return "https://generativelanguage.googleapis.com"
+  return trimSlash(b)
+}
+
+function anthropicHeaders(t: Target, beta: string, json: bool): Map<string, string> {
+  const pairs: string[][] = [["anthropic-version", ANTHROPIC_VERSION]]
+  if (json) pairs.push(["content-type", "application/json"])
+  let h = headers(pairs)
+  const v = t.key.value ?? ""
+  if (v !== "") h.set("x-api-key", v)
+  if (beta !== "") h.set("anthropic-beta", beta)
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+function geminiHeaders(t: Target, json: bool): Map<string, string> {
+  const pairs: string[][] = []
+  if (json) pairs.push(["content-type", "application/json"])
+  let h = headers(pairs)
+  h.set("x-goog-api-key", t.key.value ?? "")
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+// The non-blank lines of a JSONL text.
+function jsonlLines(text: string): string[] {
+  const out: string[] = []
+  for (const line of text.split("\n")) {
+    const s = line.trim()
+    if (s !== "") out.push(s)
+  }
+  return out
+}
+
+// The model name without a "provider/" prefix.
+function bareModel(m: string): string {
+  const parts = m.split("/")
+  return parts[parts.length - 1]!
+}
+
+// The id without its resource prefix ("files/abc" -> "abc").
+function bareName(name: string, prefix: string): string {
+  return name.startsWith(prefix) ? name.slice(prefix.byteLength) : name
+}
+
+// The cursor query for a list call: OpenAI's limit and cursor, renamed for the
+// provider. An empty string when neither is set.
+function pageQuery(query: string, limitKey: string, cursorIn: string, cursorOut: string): string {
+  const sp = new URLSearchParams(query)
+  const out = new URLSearchParams()
+  const limit = sp.get("limit") ?? ""
+  if (limit !== "") out.set(limitKey, limit)
+  const cursor = sp.get(cursorIn) ?? ""
+  if (cursor !== "") out.set(cursorOut, cursor)
+  const s = out.toString()
+  return s === "" ? "" : "?" + s
+}
+
+// Unix seconds for an RFC 3339 time ("2026-10-14T12:00:00Z"; fractions and a
+// +hh:mm offset are allowed), or undefined when it does not parse.
+function isoSeconds(s: string): f64 | undefined {
+  if (s.byteLength < 20) return undefined
+  const y = parseInt(s.slice(0, 4))
+  const mo = parseInt(s.slice(5, 7))
+  const d = parseInt(s.slice(8, 10))
+  const h = parseInt(s.slice(11, 13))
+  const mi = parseInt(s.slice(14, 16))
+  const sec = parseInt(s.slice(17, 19))
+  if (y === undefined || mo === undefined || d === undefined || h === undefined || mi === undefined || sec === undefined) return undefined
+  let i = 19
+  if (s.slice(i, i + 1) === ".") {
+    i += 1
+    while (i < s.byteLength && isDigit(s.slice(i, i + 1))) i += 1
+  }
+  let off = 0
+  const z = s.slice(i, i + 1)
+  if (z === "+" || z === "-") {
+    const oh = parseInt(s.slice(i + 1, i + 3))
+    const om = parseInt(s.slice(i + 4, i + 6))
+    if (oh === undefined || om === undefined) return undefined
+    off = (z === "+" ? 1 : -1) * (oh * 3600 + om * 60)
+  } else if (z !== "Z") return undefined
+  const days = daysFromCivil(y, mo, d)
+  return days * 86400 + h * 3600 + mi * 60 + sec - off
+}
+
+function isDigit(c: string): bool {
+  return c.byteLength === 1 && c >= "0" && c <= "9"
+}
+
+// Days since 1970-01-01 for a civil date (proleptic Gregorian).
+function daysFromCivil(y: int, m: int, d: int): f64 {
+  const yy = m <= 2 ? y - 1 : y
+  const era = Math.floor(yy / 400)
+  const yoe = yy - era * 400
+  const mp = m > 2 ? m - 3 : m + 9
+  const doy = Math.floor((153 * mp + 2) / 5) + d - 1
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+}
+
+// A chat line of a batch input file ({custom_id, method, url, body}): its id,
+// its model as sent ("" when none, the prefix dropped) and its body fields.
+type BatchLine = { customId: string, model: string, body: Field[] }
+
+function batchLine(line: string): BatchLine throws SyntaxError {
+  const fs = try fields(line)
+  const customId = rawStr(fs, "custom_id") ?? ""
+  if (customId === "") throw new SyntaxError("every batch line needs a custom_id")
+  const url = rawStr(fs, "url") ?? ""
+  if (url !== "/v1/chat/completions") throw new SyntaxError(`batch line ${customId}: only /v1/chat/completions is supported`)
+  const bodyRaw = find(fs, "body")
+  if (bodyRaw === undefined || isNull(bodyRaw)) throw new SyntaxError(`batch line ${customId}: body is required`)
+  const body = try fields(bodyRaw)
+  if (find(body, "messages") === undefined) throw new SyntaxError(`batch line ${customId}: messages is required`)
+  return { customId: customId, model: bareModel(rawStr(body, "model") ?? ""), body: body }
+}
+
+// The line's chat request with the model set to the one it runs on. The typed
+// shape needs a model, which a line may leave out.
+function chatOf(bl: BatchLine, model: string): ChatRequest throws SyntaxError {
+  let fs = bl.body
+  setField(&fs, "model", quote(model))
+  return try JSON.parse(build(fs)) as ChatRequest
+}
+
+// ---- OpenAI batch objects ----
+
+type BatchCounts = { total: f64, completed: f64, failed: f64 }
+
+// The OpenAI batch object, with the times and output id that apply to its status.
+type OBatch = {
+  id: string,
+  object: string,
+  endpoint: string,
+  completion_window: string,
+  status: string,
+  created_at: f64,
+  expires_at?: f64,
+  cancelling_at?: f64,
+  cancelled_at?: f64,
+  completed_at?: f64,
+  expired_at?: f64,
+  failed_at?: f64,
+  output_file_id?: string,
+  request_counts: BatchCounts,
+}
+
+type BatchParts = {
+  id: string,
+  status: string,
+  createdAt: f64,
+  expiresAt?: f64,
+  cancellingAt?: f64,
+  endedAt?: f64,
+  outputFileId?: string,
+  total: f64,
+  completed: f64,
+  failed: f64,
+}
+
+function openAIBatch(p: BatchParts): string {
+  const b: OBatch = {
+    id: p.id,
+    object: "batch",
+    endpoint: "/v1/chat/completions",
+    completion_window: "24h",
+    status: p.status,
+    created_at: p.createdAt,
+    expires_at: p.expiresAt,
+    cancelling_at: p.cancellingAt,
+    output_file_id: p.outputFileId,
+    request_counts: { total: p.total, completed: p.completed, failed: p.failed },
+  }
+  // Only the time for the batch's own end state is set.
+  const ended = p.endedAt
+  if (ended !== undefined) {
+    if (p.status === "completed") b.completed_at = ended
+    else if (p.status === "failed") b.failed_at = ended
+    else if (p.status === "expired") b.expired_at = ended
+    else if (p.status === "cancelled") b.cancelled_at = ended
+  }
+  return JSON.stringify(b)
+}
+
+// One OpenAI batch output line for a request that succeeded.
+function successLine(customId: string, body: string): string {
+  return `{"id":${quote(newId("batch_req_"))},"custom_id":${quote(customId)},"response":{"status_code":200,"request_id":${quote(newId("req_"))},"body":${body}},"error":null}`
+}
+
+// One OpenAI batch output line for a request that did not produce a response.
+function errorLine(customId: string, code: string, message: string): string {
+  return `{"id":${quote(newId("batch_req_"))},"custom_id":${quote(customId)},"response":null,"error":{"code":${quote(code)},"message":${quote(message)}}}`
+}
+
+// ---- Anthropic Message Batches ----
+
+// POST /v1/messages/batches. `jsonl` is the text of the OpenAI batch input file:
+// each line's chat body becomes one Messages request. A line's model is its own
+// (with any "provider/" prefix dropped), or the target's when the line has none.
+export function anthropicBatchCreate(t: Target, jsonl: string): MediaRequest throws SyntaxError {
+  const items: string[] = []
+  for (const line of jsonlLines(jsonl)) {
+    const bl = try batchLine(line)
+    const model = bl.model !== "" ? bl.model : t.model
+    if (model === "") throw new SyntaxError(`batch line ${bl.customId}: model is required`)
+    const params = try anthropic.messagesBody(try chatOf(bl, model), bl.body, model, false, false)
+    items.push(`{"custom_id":${quote(bl.customId)},"params":${params}}`)
+  }
+  if (items.length === 0) throw new SyntaxError("the batch input has no requests")
+  return {
+    method: "POST",
+    url: anthropicBase(t) + "/v1/messages/batches",
+    headers: anthropicHeaders(t, "", true),
+    body: `{"requests":[${items.join(",")}]}`,
+  }
+}
+
+export function anthropicBatchGet(t: Target, id: string): MediaRequest {
+  return { method: "GET", url: `${anthropicBase(t)}/v1/messages/batches/${id}`, headers: anthropicHeaders(t, "", false), body: undefined }
+}
+
+// GET /v1/messages/batches with OpenAI's limit and after cursor.
+export function anthropicBatchList(t: Target, query: string): MediaRequest {
+  const qs = pageQuery(query, "limit", "after", "after_id")
+  return { method: "GET", url: `${anthropicBase(t)}/v1/messages/batches${qs}`, headers: anthropicHeaders(t, "", false), body: undefined }
+}
+
+export function anthropicBatchCancel(t: Target, id: string): MediaRequest {
+  return { method: "POST", url: `${anthropicBase(t)}/v1/messages/batches/${id}/cancel`, headers: anthropicHeaders(t, "", false), body: undefined }
+}
+
+// GET the results JSONL of a finished batch (the batch's results_url).
+export function anthropicBatchResults(t: Target, id: string): MediaRequest {
+  return { method: "GET", url: `${anthropicBase(t)}/v1/messages/batches/${id}/results`, headers: anthropicHeaders(t, "", false), body: undefined }
+}
+
+// The OpenAI batch object for an Anthropic message batch. Anthropic serves
+// results at results_url rather than as a file, so outputFileId is the caller's
+// choice (undefined leaves output_file_id out).
+export function anthropicBatchToOpenAI(raw: string, outputFileId: string | undefined): string throws SyntaxError {
+  const fs = try fields(raw)
+  const counts = try fields(find(fs, "request_counts") ?? "{}")
+  const processing = rawNum(counts, "processing") ?? 0
+  const succeeded = rawNum(counts, "succeeded") ?? 0
+  const errored = rawNum(counts, "errored") ?? 0
+  const canceled = rawNum(counts, "canceled") ?? 0
+  const expired = rawNum(counts, "expired") ?? 0
+  const ps = rawStr(fs, "processing_status") ?? ""
+  const cancelInit = rawStr(fs, "cancel_initiated_at")
+  const endedRaw = rawStr(fs, "ended_at") ?? ""
+  let status = "in_progress"
+  if (ps === "canceling") status = "cancelling"
+  else if (ps === "ended") {
+    if (cancelInit !== undefined) status = "cancelled"
+    else if (expired > 0 && succeeded === 0 && errored === 0 && canceled === 0) status = "expired"
+    else status = "completed"
+  }
+  return openAIBatch({
+    id: rawStr(fs, "id") ?? "",
+    status: status,
+    createdAt: isoSeconds(rawStr(fs, "created_at") ?? "") ?? 0,
+    expiresAt: isoSeconds(rawStr(fs, "expires_at") ?? ""),
+    cancellingAt: cancelInit === undefined ? undefined : isoSeconds(cancelInit),
+    endedAt: isoSeconds(endedRaw),
+    outputFileId: outputFileId,
+    total: processing + succeeded + errored + canceled + expired,
+    completed: succeeded,
+    failed: errored,
+  })
+}
+
+// The OpenAI list object for an Anthropic batch list page.
+export function anthropicBatchListToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const items: string[] = []
+  for (const el of try elements(find(fs, "data") ?? "[]")) items.push(try anthropicBatchToOpenAI(el, undefined))
+  return listJson(items, find(fs, "has_more") ?? "false", find(fs, "first_id"), find(fs, "last_id"))
+}
+
+// The OpenAI batch output JSONL for Anthropic results JSONL. Each line becomes
+// a success line (the chat completion) or an error line.
+export function anthropicResultsToOpenAI(jsonl: string, model: string): string throws SyntaxError {
+  const out: string[] = []
+  for (const line of jsonlLines(jsonl)) {
+    const fs = try fields(line)
+    const customId = rawStr(fs, "custom_id") ?? ""
+    const rf = try fields(find(fs, "result") ?? "{}")
+    const type = rawStr(rf, "type") ?? ""
+    if (type === "succeeded") {
+      const msg = find(rf, "message") ?? "{}"
+      const done = try anthropic.chatResponse(msg, model)
+      out.push(successLine(customId, done.body))
+    } else {
+      const ef = try fields(find(rf, "error") ?? "{}")
+      const message = rawStr(ef, "message") ?? failureMessage(type)
+      out.push(errorLine(customId, rawStr(ef, "type") ?? type, message))
+    }
+  }
+  return out.join("\n")
+}
+
+function failureMessage(type: string): string {
+  if (type === "expired") return "the request expired before it ran"
+  if (type === "canceled") return "the request was canceled"
+  return "the request failed"
+}
+
+// ---- Anthropic Files ----
+
+// POST /v1/files with the file as the "file" part. Anthropic has no purpose, so
+// the caller's purpose is not sent.
+export function anthropicFileUpload(t: Target, file: File): MediaRequest {
+  const fd = new FormData()
+  fd.append("file", file)
+  return { method: "POST", url: anthropicBase(t) + "/v1/files", headers: anthropicHeaders(t, FILES_BETA, false), body: fd }
+}
+
+export function anthropicFileList(t: Target, query: string): MediaRequest {
+  const qs = pageQuery(query, "limit", "after", "after_id")
+  return { method: "GET", url: `${anthropicBase(t)}/v1/files${qs}`, headers: anthropicHeaders(t, FILES_BETA, false), body: undefined }
+}
+
+export function anthropicFileGet(t: Target, id: string): MediaRequest {
+  return { method: "GET", url: `${anthropicBase(t)}/v1/files/${id}`, headers: anthropicHeaders(t, FILES_BETA, false), body: undefined }
+}
+
+export function anthropicFileDelete(t: Target, id: string): MediaRequest {
+  return { method: "DELETE", url: `${anthropicBase(t)}/v1/files/${id}`, headers: anthropicHeaders(t, FILES_BETA, false), body: undefined }
+}
+
+// GET the file's bytes; the caller passes the response through.
+export function anthropicFileContent(t: Target, id: string): MediaRequest {
+  return { method: "GET", url: `${anthropicBase(t)}/v1/files/${id}/content`, headers: anthropicHeaders(t, FILES_BETA, false), body: undefined }
+}
+
+// An OpenAI file object.
+type OFile = {
+  id: string,
+  object: string,
+  bytes: f64,
+  created_at: f64,
+  filename: string,
+  purpose: string,
+  status: string,
+  expires_at?: f64,
+}
+
+// The OpenAI file object for an Anthropic file.
+export function anthropicFileToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const f: OFile = {
+    id: rawStr(fs, "id") ?? "",
+    object: "file",
+    bytes: rawNum(fs, "size_bytes") ?? 0,
+    created_at: isoSeconds(rawStr(fs, "created_at") ?? "") ?? 0,
+    filename: rawStr(fs, "filename") ?? "",
+    purpose: "user_data",
+    status: "processed",
+  }
+  return JSON.stringify(f)
+}
+
+export function anthropicFileListToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const items: string[] = []
+  for (const el of try elements(find(fs, "data") ?? "[]")) items.push(try anthropicFileToOpenAI(el))
+  return listJson(items, find(fs, "has_more") ?? "false", find(fs, "first_id"), find(fs, "last_id"))
+}
+
+// The OpenAI delete object for an Anthropic file_deleted response.
+export function anthropicFileDeletedToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  return JSON.stringify({ id: rawStr(fs, "id") ?? "", object: "file", deleted: true })
+}
+
+// The OpenAI list object around already-converted items.
+function listJson(items: string[], hasMore: string, firstId: string | undefined, lastId: string | undefined): string {
+  const first = firstId === undefined || isNull(firstId) ? "null" : firstId
+  const last = lastId === undefined || isNull(lastId) ? "null" : lastId
+  return `{"object":"list","data":[${items.join(",")}],"has_more":${hasMore},"first_id":${first},"last_id":${last}}`
+}
+
+// ---- Gemini Files ----
+
+// The Gemini file name for an OpenAI file id ("abc" -> "files/abc").
+function geminiFileName(id: string): string {
+  return id.startsWith("files/") ? id : "files/" + id
+}
+
+// POST upload/v1beta/files: a JSON metadata part with the display name and MIME
+// type, then the file part.
+export function geminiFileUpload(t: Target, file: File, displayName: string): MediaRequest {
+  const mime = file.type !== "" ? `,"mimeType":${quote(file.type)}` : ""
+  const meta = `{"file":{"displayName":${quote(displayName)}${mime}}}`
+  const fd = new FormData()
+  fd.append("metadata", new Blob([meta], { type: "application/json" }))
+  fd.append("file", file)
+  return { method: "POST", url: `${geminiBase(t)}/upload/v1beta/files`, headers: geminiHeaders(t, false), body: fd }
+}
+
+export function geminiFileList(t: Target, query: string): MediaRequest {
+  const qs = pageQuery(query, "pageSize", "after", "pageToken")
+  return { method: "GET", url: `${geminiBase(t)}/v1beta/files${qs}`, headers: geminiHeaders(t, false), body: undefined }
+}
+
+export function geminiFileGet(t: Target, id: string): MediaRequest {
+  return { method: "GET", url: `${geminiBase(t)}/v1beta/${geminiFileName(id)}`, headers: geminiHeaders(t, false), body: undefined }
+}
+
+export function geminiFileDelete(t: Target, id: string): MediaRequest {
+  return { method: "DELETE", url: `${geminiBase(t)}/v1beta/${geminiFileName(id)}`, headers: geminiHeaders(t, false), body: undefined }
+}
+
+// Gemini does not serve the bytes of an uploaded file, so there is no content
+// request. The caller answers GET /v1/files/{id}/content for Gemini with an error.
+
+// The OpenAI file object for a Gemini file. Takes the file object itself or
+// an upload response ({"file": {...}}).
+export function geminiFileToOpenAI(raw: string): string throws SyntaxError {
+  const top = try fields(raw)
+  let fs = top
+  const inner = find(top, "file")
+  if (inner !== undefined) fs = try fields(inner)
+  const name = rawStr(fs, "name") ?? ""
+  const state = rawStr(fs, "state") ?? ""
+  let status = "uploaded"
+  if (state === "ACTIVE") status = "processed"
+  else if (state === "FAILED") status = "error"
+  const f: OFile = {
+    id: bareName(name, "files/"),
+    object: "file",
+    bytes: parseInt(rawStr(fs, "sizeBytes") ?? "") ?? 0,
+    created_at: isoSeconds(rawStr(fs, "createTime") ?? "") ?? 0,
+    filename: rawStr(fs, "displayName") ?? "",
+    purpose: "user_data",
+    status: status,
+    expires_at: isoSeconds(rawStr(fs, "expirationTime") ?? ""),
+  }
+  return JSON.stringify(f)
+}
+
+export function geminiFileListToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const items: string[] = []
+  for (const el of try elements(find(fs, "files") ?? "[]")) items.push(try geminiFileToOpenAI(el))
+  const next = rawStr(fs, "nextPageToken") ?? ""
+  const firstId = items.length > 0 ? try idOf(items[0]!) : undefined
+  const lastId = items.length > 0 ? try idOf(items[items.length - 1]!) : undefined
+  return listJson(items, next !== "" ? "true" : "false", firstId, lastId)
+}
+
+// The quoted id of an OpenAI object (JSON text), for a list's first_id and last_id.
+function idOf(obj: string): string throws SyntaxError {
+  return quote(rawStr(try fields(obj), "id") ?? "")
+}
+
+export function geminiFileDeletedToOpenAI(id: string): string {
+  return JSON.stringify({ id: bareName(id, "files/"), object: "file", deleted: true })
+}
+
+// ---- Gemini batches ----
+
+// POST models/{model}:batchGenerateContent with the requests inline. Each line's
+// chat body becomes a GenerateContentRequest keyed by its custom_id. Gemini takes
+// one model per batch: a line's model must match the target's (when set) and the
+// others.
+export function geminiBatchCreate(t: Target, jsonl: string): MediaRequest throws SyntaxError {
+  let model = t.model
+  const lines: BatchLine[] = []
+  for (const line of jsonlLines(jsonl)) {
+    const bl = try batchLine(line)
+    if (bl.model !== "") {
+      if (model === "") model = bl.model
+      else if (bl.model !== model) throw new SyntaxError(`batch line ${bl.customId}: a Gemini batch takes one model, not ${bl.model} and ${model}`)
+    }
+    lines.push(bl)
+  }
+  if (lines.length === 0) throw new SyntaxError("the batch input has no requests")
+  if (model === "") throw new SyntaxError("model is required")
+  const reqs: string[] = []
+  for (const bl of lines) {
+    const gen = try gemini.generateBody(try chatOf(bl, model), bl.body)
+    reqs.push(`{"request":${gen},"metadata":{"key":${quote(bl.customId)}}}`)
+  }
+  const name = newId("raiju-batch-")
+  const body = `{"batch":{"displayName":${quote(name)},"inputConfig":{"requests":{"requests":[${reqs.join(",")}]}}}}`
+  return { method: "POST", url: `${geminiBase(t)}/v1beta/models/${model}:batchGenerateContent`, headers: geminiHeaders(t, true), body: body }
+}
+
+export function geminiBatchGet(t: Target, id: string): MediaRequest {
+  return { method: "GET", url: `${geminiBase(t)}/v1beta/batches/${id}`, headers: geminiHeaders(t, false), body: undefined }
+}
+
+export function geminiBatchList(t: Target, query: string): MediaRequest {
+  const qs = pageQuery(query, "pageSize", "after", "pageToken")
+  return { method: "GET", url: `${geminiBase(t)}/v1beta/batches${qs}`, headers: geminiHeaders(t, false), body: undefined }
+}
+
+export function geminiBatchCancel(t: Target, id: string): MediaRequest {
+  return { method: "POST", url: `${geminiBase(t)}/v1beta/batches/${id}:cancel`, headers: geminiHeaders(t, false), body: "{}" }
+}
+
+// GET the results file of a file-based batch (the operation's dest.fileName,
+// such as "files/abc"). The bytes are the results JSONL.
+export function geminiBatchResultsFile(t: Target, fileName: string): MediaRequest {
+  return { method: "GET", url: `${geminiBase(t)}/download/v1beta/${fileName}:download?alt=media`, headers: geminiHeaders(t, false), body: undefined }
+}
+
+// Gemini batch state to the OpenAI status.
+function geminiStatus(state: string, done: bool, failed: bool): string {
+  if (state === "BATCH_STATE_PENDING" || state === "BATCH_STATE_RUNNING") return "in_progress"
+  if (state === "BATCH_STATE_SUCCEEDED") return "completed"
+  if (state === "BATCH_STATE_FAILED") return "failed"
+  if (state === "BATCH_STATE_CANCELLING") return "cancelling"
+  if (state === "BATCH_STATE_CANCELLED") return "cancelled"
+  if (state === "BATCH_STATE_EXPIRED") return "expired"
+  if (done) return failed ? "failed" : "completed"
+  return "in_progress"
+}
+
+// The OpenAI batch object for a Gemini batch operation (the create, get and
+// cancel responses). outputFileId is the caller's choice, as for Anthropic.
+export function geminiBatchToOpenAI(raw: string, outputFileId: string | undefined): string throws SyntaxError {
+  const fs = try fields(raw)
+  const meta = try fields(find(fs, "metadata") ?? "{}")
+  const stats = try fields(find(meta, "batchStats") ?? "{}")
+  const total = rawNum(stats, "requestCount") ?? 0
+  const succeeded = rawNum(stats, "successfulRequestCount") ?? 0
+  const pending = rawNum(stats, "pendingRequestCount") ?? 0
+  const failed = Math.max(0, total - succeeded - pending)
+  const status = geminiStatus(rawStr(meta, "state") ?? "", find(fs, "done") === "true", find(fs, "error") !== undefined)
+  return openAIBatch({
+    id: bareName(rawStr(fs, "name") ?? "", "batches/"),
+    status: status,
+    createdAt: isoSeconds(rawStr(meta, "createTime") ?? "") ?? 0,
+    endedAt: isoSeconds(rawStr(meta, "endTime") ?? ""),
+    outputFileId: outputFileId,
+    total: total,
+    completed: succeeded,
+    failed: failed,
+  })
+}
+
+// The OpenAI list object for a Gemini batch list page.
+export function geminiBatchListToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const items: string[] = []
+  for (const el of try elements(find(fs, "operations") ?? "[]")) items.push(try geminiBatchToOpenAI(el, undefined))
+  const next = rawStr(fs, "nextPageToken") ?? ""
+  const firstId = items.length > 0 ? try idOf(items[0]!) : undefined
+  const lastId = items.length > 0 ? try idOf(items[items.length - 1]!) : undefined
+  return listJson(items, next !== "" ? "true" : "false", firstId, lastId)
+}
+
+// One Gemini result: {key, response} or {key, error}. In an operation's inlined
+// responses the key sits in metadata.
+function geminiResultLine(raw: string, model: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  let key = rawStr(fs, "key") ?? ""
+  if (key === "") {
+    const meta = try fields(find(fs, "metadata") ?? "{}")
+    key = rawStr(meta, "key") ?? ""
+  }
+  const respRaw = find(fs, "response")
+  if (respRaw !== undefined && !isNull(respRaw)) {
+    const done = try gemini.chatResponse(respRaw, model)
+    return successLine(key, done.body)
+  }
+  const ef = try fields(find(fs, "error") ?? "{}")
+  return errorLine(key, rawStr(ef, "status") ?? "request_failed", rawStr(ef, "message") ?? "the request failed")
+}
+
+// The OpenAI batch output JSONL for a Gemini operation with inlined responses.
+// A file-based batch's results are read with geminiResultsJsonl instead.
+export function geminiInlinedToOpenAI(raw: string, model: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const resp = try fields(find(fs, "response") ?? "{}")
+  const inner = try fields(find(resp, "inlinedResponses") ?? "{}")
+  const out: string[] = []
+  for (const el of try elements(find(inner, "inlinedResponses") ?? "[]")) out.push(try geminiResultLine(el, model))
+  return out.join("\n")
+}
+
+// The OpenAI batch output JSONL for Gemini results JSONL (a downloaded results file).
+export function geminiResultsJsonl(jsonl: string, model: string): string throws SyntaxError {
+  const out: string[] = []
+  for (const line of jsonlLines(jsonl)) out.push(try geminiResultLine(line, model))
+  return out.join("\n")
+}
+
+// ---- Image generation ----
+
+// Pixel size to Gemini's aspect ratio and image size (as the Bifrost mapping).
+// Unknown sizes give empty strings.
+function sizeConfig(size: string): { aspect: string, imageSize: string } {
+  const parts = size.split("x")
+  if (parts.length !== 2) return { aspect: "", imageSize: "" }
+  const w = parseInt(parts[0]!) ?? 0
+  const h = parseInt(parts[1]!) ?? 0
+  if (w <= 0 || h <= 0) return { aspect: "", imageSize: "" }
+  let imageSize = ""
+  if (w <= 1024 && h <= 1024) imageSize = "1K"
+  else if (w <= 2048 && h <= 2048) imageSize = "2K"
+  else if (w <= 4096 && h <= 4096) imageSize = "4K"
+  const r = w / h
+  let aspect = ""
+  if (r >= 0.99 && r <= 1.01) aspect = "1:1"
+  else if (r >= 0.74 && r <= 0.76) aspect = "3:4"
+  else if (r >= 1.32 && r <= 1.34) aspect = "4:3"
+  else if (r >= 0.56 && r <= 0.57) aspect = "9:16"
+  else if (r >= 1.77 && r <= 1.78) aspect = "16:9"
+  return { aspect: aspect, imageSize: imageSize }
+}
+
+// The OpenAI images request as an image call on a Gemini model. Imagen models
+// (name contains "imagen") use :predict and take n from 1 to 4. Other models use
+// generateContent with IMAGE output, which makes one image per call, so n must be 1.
+// Reads prompt, n and size from the body; model is t.model.
+export function geminiImageGeneration(t: Target, body: Field[]): MediaRequest throws SyntaxError {
+  const prompt = rawStr(body, "prompt") ?? ""
+  if (prompt === "") throw new SyntaxError("prompt is required")
+  const n = rawNum(body, "n") ?? 1
+  const sc = sizeConfig(rawStr(body, "size") ?? "")
+  const base = geminiBase(t)
+  if (t.model.toLowerCase().includes("imagen")) {
+    if (n < 1 || n > 4) throw new SyntaxError("n must be between 1 and 4 for Imagen models")
+    const params: string[] = [`"sampleCount":${n}`]
+    if (sc.aspect !== "") params.push(`"aspectRatio":${quote(sc.aspect)}`)
+    if (sc.imageSize !== "") params.push(`"sampleImageSize":${quote(sc.imageSize)}`)
+    const payload = `{"instances":[{"prompt":${quote(prompt)}}],"parameters":{${params.join(",")}}}`
+    return { method: "POST", url: `${base}/v1beta/models/${t.model}:predict`, headers: geminiHeaders(t, true), body: payload }
+  }
+  if (n !== 1) throw new SyntaxError("Gemini image models make one image per request; n must be 1")
+  const gen: string[] = [`"responseModalities":["IMAGE"]`]
+  const ic: string[] = []
+  if (sc.aspect !== "") ic.push(`"aspectRatio":${quote(sc.aspect)}`)
+  if (sc.imageSize !== "") ic.push(`"imageSize":${quote(sc.imageSize)}`)
+  if (ic.length > 0) gen.push(`"imageConfig":{${ic.join(",")}}`)
+  const payload = `{"contents":[{"role":"user","parts":[{"text":${quote(prompt)}}]}],"generationConfig":{${gen.join(",")}}}`
+  return { method: "POST", url: `${base}/v1beta/models/${t.model}:generateContent`, headers: geminiHeaders(t, true), body: payload }
+}
+
+// The OpenAI images body from an Imagen :predict response.
+export function imagenToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const items: string[] = []
+  for (const p of try elements(find(fs, "predictions") ?? "[]")) {
+    const pf = try fields(p)
+    items.push(`{"b64_json":${find(pf, "bytesBase64Encoded") ?? "\"\""}}`)
+  }
+  return `{"created":${nowSeconds()},"data":[${items.join(",")}]}`
+}
+
+// The OpenAI images body from a generateContent response with inline image parts.
+// Throws SyntaxError when the response has no image (its finish reason says why).
+export function geminiImageToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const cands = try elements(find(fs, "candidates") ?? "[]")
+  if (cands.length === 0) throw new SyntaxError("no candidates in the image response")
+  const c = try fields(cands[0]!)
+  const items: string[] = []
+  const content = find(c, "content")
+  if (content !== undefined && !isNull(content)) {
+    const parts = find(try fields(content), "parts") ?? "[]"
+    for (const p of try elements(parts)) {
+      const inline = find(try fields(p), "inlineData")
+      if (inline !== undefined && !isNull(inline)) {
+        items.push(`{"b64_json":${find(try fields(inline), "data") ?? "\"\""}}`)
+      }
+    }
+  }
+  if (items.length === 0) throw new SyntaxError(`no image in the response (finishReason ${rawStr(c, "finishReason") ?? "unknown"})`)
+  return `{"created":${nowSeconds()},"data":[${items.join(",")}]}`
+}
+
+// ---- Speech ----
+
+// The output format of an OpenAI speech request: "wav" (the default here, where
+// OpenAI defaults to mp3) or "pcm". Other formats throw SyntaxError.
+export function speechFormat(body: Field[]): string throws SyntaxError {
+  const f = rawStr(body, "response_format") ?? "wav"
+  if (f !== "wav" && f !== "pcm") throw new SyntaxError(`Gemini speech supports response_format wav or pcm, not ${f}`)
+  return f
+}
+
+// generateContent with AUDIO output. The voice is Gemini's prebuilt voice name.
+export function geminiSpeech(t: Target, body: Field[]): MediaRequest throws SyntaxError {
+  const input = rawStr(body, "input") ?? ""
+  if (input === "") throw new SyntaxError("input is required")
+  try speechFormat(body)
+  const gen: string[] = [`"responseModalities":["AUDIO"]`]
+  const voice = rawStr(body, "voice") ?? ""
+  if (voice !== "") gen.push(`"speechConfig":{"voiceConfig":{"prebuiltVoiceConfig":{"voiceName":${quote(voice)}}}}`)
+  const payload = `{"contents":[{"parts":[{"text":${quote(input)}}]}],"generationConfig":{${gen.join(",")}}}`
+  return { method: "POST", url: `${geminiBase(t)}/v1beta/models/${t.model}:generateContent`, headers: geminiHeaders(t, true), body: payload }
+}
+
+// The audio of a Gemini TTS response. Its PCM (the MIME type's rate, 24 kHz by
+// default) is returned as-is for "pcm" and with a WAV header for "wav".
+export function geminiSpeechToAudio(raw: string, format: string): SpeechAudio throws SyntaxError {
+  const fs = try fields(raw)
+  const cands = try elements(find(fs, "candidates") ?? "[]")
+  if (cands.length === 0) throw new SyntaxError("no candidates in the speech response")
+  const c = try fields(cands[0]!)
+  const content = find(c, "content")
+  let pcm: u8[] = []
+  let rate = GEMINI_PCM_RATE
+  if (content !== undefined && !isNull(content)) {
+    const parts = find(try fields(content), "parts") ?? "[]"
+    for (const p of try elements(parts)) {
+      const inline = find(try fields(p), "inlineData")
+      if (inline === undefined || isNull(inline)) continue
+      const idf = try fields(inline)
+      const mime = rawStr(idf, "mimeType") ?? ""
+      if (!mime.startsWith("audio/")) continue
+      const rateAt = mime.indexOf("rate=")
+      if (rateAt >= 0) rate = parseInt(mime.slice(rateAt + 5)) ?? GEMINI_PCM_RATE
+      const bytes = try decode(rawStr(idf, "data") ?? "")
+      pcm = pcm.concat(bytes)
+    }
+  }
+  if (pcm.length === 0) throw new SyntaxError(`no audio in the response (finishReason ${rawStr(c, "finishReason") ?? "unknown"})`)
+  if (format === "pcm") return { bytes: pcm, contentType: "audio/pcm" }
+  return { bytes: wavBytes(pcm, rate), contentType: "audio/wav" }
+}
+
+// A 44-byte RIFF/WAVE header (PCM, mono, 16-bit) followed by the samples.
+function wavBytes(pcm: u8[], rate: int): u8[] {
+  let h: u8[] = []
+  ascii(&h, "RIFF")
+  le(&h, 36 + pcm.length, 4)
+  ascii(&h, "WAVE")
+  ascii(&h, "fmt ")
+  le(&h, 16, 4)
+  le(&h, 1, 2)
+  le(&h, 1, 2)
+  le(&h, rate, 4)
+  le(&h, rate * 2, 4)
+  le(&h, 2, 2)
+  le(&h, 16, 2)
+  ascii(&h, "data")
+  le(&h, pcm.length, 4)
+  return h.concat(pcm)
+}
+
+function ascii(inout out: u8[], s: string): void {
+  for (const b of new TextEncoder().encode(s)) out.push(u8(int(b)))
+}
+
+// A little-endian unsigned integer of n bytes.
+function le(inout out: u8[], v: int, n: int): void {
+  let x: f64 = v
+  for (let i = 0; i < n; i++) {
+    const low: int = int(Math.trunc(x % 256))
+    out.push(u8(low))
+    x = Math.floor(x / 256)
+  }
+}
+
+// ---- tests ----
+
+const ANTHROPIC_T: Target = { provider: "anthropic", kind: "anthropic", model: "claude-opus", key: { value: "ak" }, cfg: {} }
+const GEMINI_T: Target = { provider: "gemini", kind: "gemini", model: "", key: { value: "gk" }, cfg: {} }
+const GEMINI_TTS: Target = { provider: "gemini", kind: "gemini", model: "gemini-2.5-flash-preview-tts", key: { value: "gk" }, cfg: {} }
+
+test("anthropic batch create maps each line to a message request", () => {
+  const jsonl = [
+    `{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}],"max_tokens":20}}`,
+    `{"custom_id":"b","method":"POST","url":"/v1/chat/completions","body":{"messages":[{"role":"system","content":"s"},{"role":"user","content":"yo"}]}}`,
+  ].join("\n")
+  const req = try anthropicBatchCreate(ANTHROPIC_T, jsonl)
+  expect(req.method).toBe("POST")
+  expect(req.url).toBe("https://api.anthropic.com/v1/messages/batches")
+  expect(req.headers.get("x-api-key")).toBe("ak")
+  expect(req.headers.get("anthropic-version")).toBe("2023-06-01")
+  const body = req.body as string
+  expect(body.includes(`{"custom_id":"a","params":{"model":"claude-sonnet-4","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"max_tokens":20}}`)).toBe(true)
+  // the second line has no model, so the target's is used; its system text goes to "system"
+  expect(body.includes(`{"custom_id":"b","params":{"model":"claude-opus","system":"s"`)).toBe(true)
+})
+
+test("anthropic batch create rejects bad lines", () => {
+  let threw = false
+  try {
+    anthropicBatchCreate(ANTHROPIC_T, `{"custom_id":"a","url":"/v1/embeddings","body":{"model":"m","messages":[]}}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  let noModel = false
+  try {
+    anthropicBatchCreate({ provider: "anthropic", kind: "anthropic", model: "", key: { value: "k" }, cfg: {} }, `{"custom_id":"a","url":"/v1/chat/completions","body":{"messages":[]}}`)
+  } catch (e) {
+    noModel = true
+  }
+  expect(noModel).toBe(true)
+})
+
+test("anthropic batch objects map status and counts", () => {
+  const running = try JSON.parse(try anthropicBatchToOpenAI(`{"id":"msgbatch_1","type":"message_batch","processing_status":"in_progress","request_counts":{"processing":2,"succeeded":1,"errored":0,"canceled":0,"expired":0},"created_at":"1970-01-02T00:00:00Z","expires_at":"1970-01-03T00:00:00Z","ended_at":null}`, undefined)) as OBatch
+  expect(running.status).toBe("in_progress")
+  expect(running.object).toBe("batch")
+  expect(running.request_counts.total).toBe(3)
+  expect(running.request_counts.completed).toBe(1)
+  expect(running.created_at).toBe(86400)
+  expect(running.completed_at).toBeUndefined()
+  const done = try JSON.parse(try anthropicBatchToOpenAI(`{"id":"msgbatch_2","processing_status":"ended","request_counts":{"processing":0,"succeeded":2,"errored":1,"canceled":0,"expired":0},"created_at":"1970-01-02T00:00:00Z","ended_at":"1970-01-02T01:00:00Z"}`, "out_2")) as OBatch
+  expect(done.status).toBe("completed")
+  expect(done.completed_at).toBe(90000)
+  expect(done.output_file_id).toBe("out_2")
+  expect(done.request_counts.failed).toBe(1)
+  const cancelled = try JSON.parse(try anthropicBatchToOpenAI(`{"id":"msgbatch_3","processing_status":"ended","request_counts":{"processing":0,"succeeded":0,"errored":0,"canceled":3,"expired":0},"created_at":"1970-01-02T00:00:00Z","cancel_initiated_at":"1970-01-02T00:30:00Z","ended_at":"1970-01-02T00:31:00Z"}`, undefined)) as OBatch
+  expect(cancelled.status).toBe("cancelled")
+  expect(cancelled.cancelled_at).toBe(88260)
+  const expired = try JSON.parse(try anthropicBatchToOpenAI(`{"id":"msgbatch_4","processing_status":"ended","request_counts":{"processing":0,"succeeded":0,"errored":0,"canceled":0,"expired":2},"created_at":"1970-01-02T00:00:00Z","ended_at":"1970-01-03T00:00:00Z"}`, undefined)) as OBatch
+  expect(expired.status).toBe("expired")
+  expect(expired.expired_at).toBe(172800)
+})
+
+test("anthropic results become openai batch output lines", () => {
+  const jsonl = [
+    `{"custom_id":"a","result":{"type":"succeeded","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}}}`,
+    `{"custom_id":"b","result":{"type":"errored","error":{"type":"invalid_request_error","message":"bad"}}}`,
+    `{"custom_id":"c","result":{"type":"expired"}}`,
+  ].join("\n")
+  const out = (try anthropicResultsToOpenAI(jsonl, "claude-sonnet-4")).split("\n")
+  expect(out.length).toBe(3)
+  expect(out[0]!.includes(`"custom_id":"a","response":{"status_code":200`)).toBe(true)
+  expect(out[0]!.includes(`"content":"hello"`)).toBe(true)
+  expect(out[1]!.includes(`"response":null,"error":{"code":"invalid_request_error","message":"bad"}`)).toBe(true)
+  expect(out[2]!.includes(`"error":{"code":"expired","message":"the request expired before it ran"}`)).toBe(true)
+})
+
+test("anthropic file requests and objects", () => {
+  const list = anthropicFileList(ANTHROPIC_T, "limit=5&after=file_1")
+  expect(list.url).toBe("https://api.anthropic.com/v1/files?limit=5&after_id=file_1")
+  expect(list.headers.get("anthropic-beta")).toBe("files-api-2025-04-14")
+  expect(anthropicFileDelete(ANTHROPIC_T, "file_9").method).toBe("DELETE")
+  expect(anthropicFileContent(ANTHROPIC_T, "file_9").url).toBe("https://api.anthropic.com/v1/files/file_9/content")
+  const f = try JSON.parse(try anthropicFileToOpenAI(`{"id":"file_1","type":"file","filename":"in.jsonl","mime_type":"application/jsonl","size_bytes":120,"created_at":"1970-01-02T00:00:00Z","downloadable":false}`)) as OFile
+  expect(f.object).toBe("file")
+  expect(f.bytes).toBe(120)
+  expect(f.created_at).toBe(86400)
+  expect(f.filename).toBe("in.jsonl")
+  const page = try JSON.parse(try anthropicFileListToOpenAI(`{"data":[{"id":"file_1","type":"file","filename":"a","size_bytes":1,"created_at":"1970-01-01T00:00:00Z"}],"has_more":false,"first_id":"file_1","last_id":"file_1"}`)) as { object: string, data: OFile[], first_id: string }
+  expect(page.object).toBe("list")
+  expect(page.data.length).toBe(1)
+  expect(page.first_id).toBe("file_1")
+  const del = try JSON.parse(try anthropicFileDeletedToOpenAI(`{"id":"file_1","type":"file_deleted"}`)) as { deleted: bool }
+  expect(del.deleted).toBe(true)
+})
+
+test("gemini batch create inlines each line with its custom id", () => {
+  const jsonl = [
+    `{"custom_id":"a","url":"/v1/chat/completions","body":{"model":"gemini/gemini-2.5-flash","messages":[{"role":"user","content":"hi"}],"max_tokens":50}}`,
+    `{"custom_id":"b","url":"/v1/chat/completions","body":{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"yo"}]}}`,
+  ].join("\n")
+  const req = try geminiBatchCreate(GEMINI_T, jsonl)
+  expect(req.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:batchGenerateContent")
+  expect(req.headers.get("x-goog-api-key")).toBe("gk")
+  const body = req.body as string
+  expect(body.startsWith(`{"batch":{"displayName":"raiju-batch-`)).toBe(true)
+  expect(body.includes(`{"request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":50}},"metadata":{"key":"a"}}`)).toBe(true)
+  expect(body.includes(`"metadata":{"key":"b"}`)).toBe(true)
+  let mixed = false
+  try {
+    geminiBatchCreate(GEMINI_T, `{"custom_id":"a","url":"/v1/chat/completions","body":{"model":"gemini-2.5-pro","messages":[]}}\n{"custom_id":"b","url":"/v1/chat/completions","body":{"model":"gemini-2.5-flash","messages":[]}}`)
+  } catch (e) {
+    mixed = true
+  }
+  expect(mixed).toBe(true)
+})
+
+test("gemini batch objects map state and counts", () => {
+  const running = try JSON.parse(try geminiBatchToOpenAI(`{"name":"batches/123","metadata":{"@type":"x","state":"BATCH_STATE_RUNNING","createTime":"1970-01-02T00:00:00Z","batchStats":{"requestCount":4,"pendingRequestCount":3,"successfulRequestCount":1}}}`, undefined)) as OBatch
+  expect(running.id).toBe("123")
+  expect(running.status).toBe("in_progress")
+  expect(running.request_counts.total).toBe(4)
+  expect(running.request_counts.failed).toBe(0)
+  const done = try JSON.parse(try geminiBatchToOpenAI(`{"name":"batches/124","done":true,"metadata":{"state":"BATCH_STATE_SUCCEEDED","createTime":"1970-01-02T00:00:00Z","endTime":"1970-01-02T00:10:00Z","batchStats":{"requestCount":2,"pendingRequestCount":0,"successfulRequestCount":1}}}`, "files/o1")) as OBatch
+  expect(done.status).toBe("completed")
+  expect(done.completed_at).toBe(86400 + 600)
+  expect(done.output_file_id).toBe("files/o1")
+  expect(done.request_counts.failed).toBe(1)
+  const cancelled = try JSON.parse(try geminiBatchToOpenAI(`{"name":"batches/125","metadata":{"state":"BATCH_STATE_CANCELLED"}}`, undefined)) as OBatch
+  expect(cancelled.status).toBe("cancelled")
+})
+
+test("gemini inlined results become openai batch output lines", () => {
+  const op = `{"name":"batches/9","done":true,"response":{"inlinedResponses":{"inlinedResponses":[{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}},"metadata":{"key":"a"}},{"error":{"code":400,"message":"bad input","status":"INVALID_ARGUMENT"},"metadata":{"key":"b"}}]}}}`
+  const out = (try geminiInlinedToOpenAI(op, "gemini-2.5-flash")).split("\n")
+  expect(out.length).toBe(2)
+  expect(out[0]!.includes(`"custom_id":"a","response":{"status_code":200`)).toBe(true)
+  expect(out[0]!.includes(`"content":"ok"`)).toBe(true)
+  expect(out[1]!.includes(`"custom_id":"b","response":null,"error":{"code":"INVALID_ARGUMENT","message":"bad input"}`)).toBe(true)
+  const file = (try geminiResultsJsonl(`{"key":"c","response":{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}}`, "gemini-2.5-flash")).split("\n")
+  expect(file[0]!.includes(`"custom_id":"c"`)).toBe(true)
+})
+
+test("gemini file upload, object and list conversions", () => {
+  const up = geminiUploadForTest()
+  expect(up.url).toBe("https://generativelanguage.googleapis.com/upload/v1beta/files")
+  expect(up.method).toBe("POST")
+  const f = try JSON.parse(try geminiFileToOpenAI(`{"file":{"name":"files/abc123","displayName":"in.jsonl","mimeType":"application/jsonl","sizeBytes":"77","createTime":"1970-01-02T00:00:00Z","expirationTime":"1970-01-04T00:00:00Z","state":"ACTIVE"}}`)) as OFile
+  expect(f.id).toBe("abc123")
+  expect(f.bytes).toBe(77)
+  expect(f.status).toBe("processed")
+  expect(f.created_at).toBe(86400)
+  expect(f.expires_at).toBe(259200)
+  const page = try JSON.parse(try geminiFileListToOpenAI(`{"files":[{"name":"files/a1","state":"PROCESSING","sizeBytes":"1"},{"name":"files/a2","state":"FAILED","sizeBytes":"2"}],"nextPageToken":"tok"}`)) as { has_more: bool, first_id: string, last_id: string, data: OFile[] }
+  expect(page.has_more).toBe(true)
+  expect(page.first_id).toBe("a1")
+  expect(page.last_id).toBe("a2")
+  expect(page.data[0]!.status).toBe("uploaded")
+  expect(page.data[1]!.status).toBe("error")
+  expect(geminiFileGet(GEMINI_T, "abc123").url).toBe("https://generativelanguage.googleapis.com/v1beta/files/abc123")
+  expect(geminiFileDelete(GEMINI_T, "files/abc123").url).toBe("https://generativelanguage.googleapis.com/v1beta/files/abc123")
+})
+
+// A stand-in upload for the file tests (Blob and File from the runtime).
+function geminiUploadForTest(): MediaRequest {
+  return geminiFileUpload(GEMINI_T, new File(["{}"], "in.jsonl", { type: "application/jsonl" }), "in.jsonl")
+}
+
+test("gemini image requests use predict for imagen and generateContent otherwise", () => {
+  const imagen = try geminiImageGeneration({ provider: "gemini", kind: "gemini", model: "imagen-4.0-generate-001", key: { value: "k" }, cfg: {} }, try fields(`{"model":"x","prompt":"a fox","n":2,"size":"1920x1080"}`))
+  expect(imagen.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict")
+  expect((imagen.body as string).includes(`"parameters":{"sampleCount":2,"aspectRatio":"16:9","sampleImageSize":"2K"}`)).toBe(true)
+  const img = try geminiImageGeneration({ provider: "gemini", kind: "gemini", model: "gemini-2.5-flash-image", key: { value: "k" }, cfg: {} }, try fields(`{"prompt":"a fox","size":"1024x1024"}`))
+  expect(img.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent")
+  expect((img.body as string).includes(`"generationConfig":{"responseModalities":["IMAGE"],"imageConfig":{"aspectRatio":"1:1","imageSize":"1K"}}`)).toBe(true)
+  let many = false
+  try {
+    geminiImageGeneration({ provider: "gemini", kind: "gemini", model: "gemini-2.5-flash-image", key: { value: "k" }, cfg: {} }, try fields(`{"prompt":"a","n":2}`))
+  } catch (e) {
+    many = true
+  }
+  expect(many).toBe(true)
+})
+
+test("image responses become openai images bodies", () => {
+  const p = try JSON.parse(try imagenToOpenAI(`{"predictions":[{"bytesBase64Encoded":"QUJD","mimeType":"image/png"}]}`)) as { data: { b64_json: string }[] }
+  expect(p.data[0]!.b64_json).toBe("QUJD")
+  const g = try JSON.parse(try geminiImageToOpenAI(`{"candidates":[{"content":{"role":"model","parts":[{"text":"here"},{"inlineData":{"mimeType":"image/png","data":"WFla"}}]},"finishReason":"STOP"}]}`)) as { data: { b64_json: string }[] }
+  expect(g.data.length).toBe(1)
+  expect(g.data[0]!.b64_json).toBe("WFla")
+  let none = false
+  try {
+    geminiImageToOpenAI(`{"candidates":[{"content":{"parts":[{"text":"no"}]},"finishReason":"SAFETY"}]}`)
+  } catch (e) {
+    none = true
+  }
+  expect(none).toBe(true)
+})
+
+test("gemini speech wraps pcm in a wav header", () => {
+  const sp = try geminiSpeech(GEMINI_TTS, try fields(`{"model":"x","input":"hello","voice":"Kore","response_format":"wav"}`))
+  expect(sp.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent")
+  expect((sp.body as string).includes(`"responseModalities":["AUDIO"],"speechConfig":{"voiceConfig":{"prebuiltVoiceConfig":{"voiceName":"Kore"}}}`)).toBe(true)
+  const resp = `{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"audio/L16;codec=pcm;rate=24000","data":"AAABAA=="}}]},"finishReason":"STOP"}]}`
+  const wav = try geminiSpeechToAudio(resp, "wav")
+  expect(wav.contentType).toBe("audio/wav")
+  expect(wav.bytes.length).toBe(48)
+  expect(wav.bytes[0]!).toBe(82)
+  expect(wav.bytes[4]!).toBe(40)
+  // 24000 Hz little-endian is C0 5D 00 00
+  expect(wav.bytes[24]!).toBe(192)
+  expect(wav.bytes[25]!).toBe(93)
+  expect(wav.bytes[44]!).toBe(0)
+  expect(wav.bytes[46]!).toBe(1)
+  const pcm = try geminiSpeechToAudio(resp, "pcm")
+  expect(pcm.contentType).toBe("audio/pcm")
+  expect(pcm.bytes.length).toBe(4)
+  let badFormat = false
+  try {
+    speechFormat(try fields(`{"response_format":"mp3"}`))
+  } catch (e) {
+    badFormat = true
+  }
+  expect(badFormat).toBe(true)
+})
+
+test("iso times and pixel sizes", () => {
+  expect(isoSeconds("1970-01-01T00:00:00Z")).toBe(0)
+  expect(isoSeconds("2026-10-14T00:00:00Z")).toBe(1791936000)
+  expect(isoSeconds("1970-01-01T02:00:00+02:00")).toBe(0)
+  expect(isoSeconds("1970-01-01T00:00:00.123456789Z")).toBe(0)
+  expect(isoSeconds("nope")).toBeUndefined()
+  expect(sizeConfig("1024x1536").aspect).toBe("")
+  expect(sizeConfig("1024x1024").imageSize).toBe("1K")
+  expect(sizeConfig("auto").aspect).toBe("")
+})
