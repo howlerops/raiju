@@ -3,6 +3,7 @@
 // in the same scope is returned if its cosine similarity clears the threshold.
 // Vectors live in memory; there is no external vector DB.
 
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, rmSync } from "node:fs"
 import { fields, elements, find, rawStr, rawBool, isNull, decodeString } from "./json"
 
 export type SemanticCacheConfig = {
@@ -180,6 +181,7 @@ export class VectorIndex {
 }
 
 type Entry = { scope: string, body: string, contentType: string, expires: f64 }
+type SharedEntry = { scope: string, v: f64[], body: string, contentType: string, expires: f64 }
 
 // Partitioned by scope. Eviction is global FIFO: the oldest insert goes first,
 // whichever scope it is in.
@@ -191,7 +193,55 @@ export class SemanticCache {
   seq = 0
   hits = 0
   misses = 0
+  // With several workers: each stored entry is also a file here, and syncShared() takes in
+  // the other workers' entries.
+  shareDir = ""
+  private seen: Set<string> = new Set()
+  private shareExpiry: Map<string, f64> = new Map()
   constructor(readonly cfg: SemanticCacheConfig) {}
+
+  share(dir: string): void {
+    try {
+      mkdirSync(dir, { recursive: true })
+      this.shareDir = dir
+    } catch (e) {
+      this.shareDir = ""
+    }
+  }
+
+  // Takes in entries other workers stored since the last call, and removes expired files.
+  syncShared(nowMs: f64): int {
+    if (this.shareDir === "") return 0
+    let added = 0
+    let names: string[] = []
+    try {
+      names = readdirSync(this.shareDir)
+    } catch (e) {
+      return 0
+    }
+    for (const n of names) {
+      if (this.seen.has(n) || !n.endsWith(".json")) continue
+      try {
+        const x = JSON.parse(readFileSync(this.shareDir + "/" + n, "utf8")) as SharedEntry
+        this.seen.add(n)
+        this.shareExpiry.set(n, x.expires)
+        if (x.expires > nowMs && this.put(x.scope, x.v, x.body, x.contentType, x.expires)) added += 1
+      } catch (e) {
+        // being written; read again next time
+        continue
+      }
+    }
+    for (const n of this.shareExpiry.keys()) {
+      if (this.shareExpiry.get(n)! > nowMs) continue
+      this.shareExpiry.delete(n)
+      try {
+        unlinkSync(this.shareDir + "/" + n)
+      } catch (e) {
+        // another worker removed it
+      }
+    }
+    return added
+  }
 
   private drop(id: string): void {
     const e = this.meta.get(id)
@@ -245,6 +295,24 @@ export class SemanticCache {
 
   // False when v is unusable (empty, zero, or wrong dimension for the scope).
   store(scope: string, v: f64[], body: string, contentType: string, nowMs: f64, ttlOverride?: int): bool {
+    let ttl = this.cfg.ttl_ms
+    if (ttlOverride !== undefined) ttl = ttlOverride
+    const expires = nowMs + ttl
+    if (!this.put(scope, v, body, contentType, expires)) return false
+    if (this.shareDir !== "") {
+      const name = `${process.pid}-${this.seq}.json`
+      this.seen.add(name)
+      this.shareExpiry.set(name, expires)
+      try {
+        writeFileSync(this.shareDir + "/" + name, JSON.stringify({ scope: scope, v: v, body: body, contentType: contentType, expires: expires }))
+      } catch (e) {
+        // the shared copy is a bonus
+      }
+    }
+    return true
+  }
+
+  private put(scope: string, v: f64[], body: string, contentType: string, expires: f64): bool {
     if (v.length === 0 || this.cfg.max_entries < 1) return false
     let part = this.parts.get(scope)
     if (part !== undefined && part.dim !== v.length) return false
@@ -258,9 +326,7 @@ export class SemanticCache {
       if (part.size() === 0) this.parts.delete(scope)
       return false
     }
-    let ttl = this.cfg.ttl_ms
-    if (ttlOverride !== undefined) ttl = ttlOverride
-    this.meta.set(id, { scope: scope, body: body, contentType: contentType, expires: nowMs + ttl })
+    this.meta.set(id, { scope: scope, body: body, contentType: contentType, expires: expires })
     this.queue.push(id)
     while (this.meta.size > this.cfg.max_entries) this.evictOldest()
     return true
@@ -425,4 +491,21 @@ test("scopeKey respects config", () => {
   noModel.cache_by_model = false
   expect(scopeKey("openai", "gpt", "k", noModel)).toBe(scopeKey("openai", "gpt4", "k", noModel))
   expect(scopeKey("openai", "gpt", "k", noModel) !== scopeKey("azure", "gpt", "k", noModel)).toBe(true)
+})
+
+test("semantic entries are shared through a directory", () => {
+  const dir = "/tmp/raiju-sem-test-" + Math.floor(Math.random() * 1000000000)
+  const cfg = defaultSemanticConfig()
+  const a = new SemanticCache(cfg)
+  const b = new SemanticCache(cfg)
+  a.share(dir)
+  b.share(dir)
+  expect(a.store("s", [1.0, 0.0], "{}", "application/json", 1000.0)).toBe(true)
+  expect(b.lookup("s", [1.0, 0.0], 1001.0)).toBeUndefined()
+  expect(b.syncShared(1001.0)).toBe(1)
+  expect(b.lookup("s", [1.0, 0.0], 1002.0)?.body).toBe("{}")
+  expect(b.syncShared(1003.0)).toBe(0)
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (e) {}
 })

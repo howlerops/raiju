@@ -98,16 +98,14 @@ small enough to send upstream.
 `-server http1` is Raiju's own HTTP/1.1 server on raw sockets. It streams too,
 but runs in one process. It stays as a fallback.
 
-The workers of one node share budgets, rate limits and the response cache
-through `/tmp/raiju-<pid>` (the clustering CRDT, one slot per worker). Usage
+The workers of one node share budgets, rate limits, the response and semantic
+caches, request-log queries and `/metrics` (summed) through `/tmp/raiju-<pid>` (the clustering CRDT, one slot per worker). Usage
 reaches the other workers within about 200 ms, so a burst spread over several
 workers can pass a limit by a few requests, as across cluster nodes. Each
 worker starts its own stdio MCP servers.
 
 ## Known gaps
 
-- Request logs, metrics and the semantic cache are per worker process. Scrape
-  `/metrics` through a pod or service and sum, as with any multi-process server.
 - SOCKS5 proxies: Tov's `fetch` supports HTTP proxies only.
 - Out of scope (from the scoping form): videos and containers, the edge device
   agent, SCIM, MCP code mode and media providers.

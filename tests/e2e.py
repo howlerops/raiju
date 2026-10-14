@@ -111,6 +111,7 @@ def write_config():
     json.dump(b, open(os.path.join(BUILD, "e2e.node-b.json"), "w"))
     # a single node with three workers: a 3-request limit and the response cache are shared between them
     w = {"client": {"enable_logging": False}, "providers": {"openai": cfg["providers"]["openai"]}, "cache": {"enabled": True, "ttl_seconds": 60},
+         "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-wlogs")},
          "governance": {"rate_limits": [{"id": "w-rl", "request_max_limit": 3, "request_reset_duration": "1h"}], "virtual_keys": [{"id": "vk-w", "value": "sk-bf-workers", "rate_limit_id": "w-rl"}]}}
     json.dump(w, open(os.path.join(BUILD, "e2e.workers.json"), "w"))
     return path
@@ -173,6 +174,7 @@ def main():
     import shutil
     shutil.rmtree(os.path.join(ROOT, "build/e2e-logs"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-audit"), ignore_errors=True)
+    shutil.rmtree(os.path.join(ROOT, "build/e2e-wlogs"), ignore_errors=True)
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
@@ -629,6 +631,14 @@ def main():
                 _, h, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "cache me across workers"}]}, base=WGW)
                 hits.append(hl(h).get("x-bf-cache", "miss"))
             check("workers share the response cache", hits == ["miss", "hit", "hit", "hit", "hit"], hits)
+            stats = [json.loads(call("GET", "/api/logs/stats", base=WGW)[2])["requests"] for _ in range(4)]
+            check("any worker reports every worker's request logs", stats == [11] * 4, stats)
+            time.sleep(1.3)
+            def upstream_total():
+                b = call("GET", "/metrics", base=WGW)[2]
+                return sum(float(l.rsplit(" ", 1)[1]) for l in b.split("\n") if l.startswith("bifrost_upstream_requests_total{"))
+            totals = [upstream_total() for _ in range(4)]
+            check("any worker's /metrics sums every worker", totals == [4.0] * 4, totals)
 
         # --- wave 6 ---
         # clustering: a rate limit of 3 requests shared by both nodes
