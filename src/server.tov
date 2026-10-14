@@ -14,6 +14,7 @@ import { Session, prepare, onOpen, onMessage, onClose } from "./realtime"
 import { parseQuery } from "./logstore"
 import { matchRoute, handleMedia } from "./media"
 import { snapshot } from "./schemas"
+import { ConfigStore, checkAdmin, handleApi } from "./store"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -79,22 +80,22 @@ async function listModels(engine: Engine, req: Request): Promise<Response> {
   return Response.json({ object: "list", data: data })
 }
 
-// Providers and keys with secrets removed.
-function providersView(cfg: Config): Response {
-  const out: { name: string, kind: string, keys: { name: string, models: string[], weight: f64 }[], base_url: string }[] = []
-  const ps = cfg.providers
-  if (ps !== undefined) {
-    for (const name of ps.keys()) {
-      const p = ps.get(name)!
-      out.push({
-        name: name,
-        kind: kindOf(name, p),
-        keys: (p.keys ?? []).map((k) => ({ name: k.name ?? k.id ?? "", models: k.models ?? [], weight: k.weight ?? 1.0 })),
-        base_url: p.network_config?.base_url ?? "",
-      })
-    }
-  }
-  return Response.json({ providers: out })
+
+// 401 unless the request carries the admin credentials (when any are configured).
+function admin(engine: Engine, req: Request): Response | undefined {
+  if (checkAdmin(engine.cfg.governance?.auth_config, snapshot(req.headers))) return undefined
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  h.set("www-authenticate", `Bearer realm="raiju", Basic realm="raiju"`)
+  return new Response(`{"error":{"message":"admin credentials required","type":"authentication_error"}}`, { status: 401, headers: h })
+}
+
+async function manage(engine: Engine, store: ConfigStore, req: Request, path: string): Promise<Response> {
+  const denied = admin(engine, req)
+  if (denied !== undefined) return denied
+  const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
+  const r = handleApi(store, req.method, path, body)
+  return new Response(r.body, { status: r.status, headers: { "content-type": "application/json" } })
 }
 
 function mcpView(engine: Engine): Response {
@@ -134,8 +135,7 @@ function cors(cfg: Config, req: Request, res: Response): Response {
 
 export type ServeOptions = { port: int, hostname: string, workers: int }
 
-export function start(engine: Engine, opts: ServeOptions): string {
-  const cfg = engine.cfg
+export function start(engine: Engine, store: ConfigStore, opts: ServeOptions): string {
   const server = Bun.serve<Session>({
     port: opts.port,
     hostname: opts.hostname,
@@ -144,31 +144,30 @@ export function start(engine: Engine, opts: ServeOptions): string {
       "/health": () => Response.json({ status: "ok" }),
       "/metrics": () => new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4" } }),
 
-      "/v1/chat/completions": { POST: async (req) => cors(cfg, req, await engine.chat(req)) },
-      "/openai/v1/chat/completions": { POST: async (req) => cors(cfg, req, await engine.chat(req)) },
-      "/openai/chat/completions": { POST: async (req) => cors(cfg, req, await engine.chat(req)) },
-      "/openai/deployments/:deployment/chat/completions": { POST: async (req) => cors(cfg, req, await engine.chat(req)) },
-      "/v1/embeddings": { POST: async (req) => cors(cfg, req, await engine.embeddings(req)) },
-      "/openai/v1/embeddings": { POST: async (req) => cors(cfg, req, await engine.embeddings(req)) },
-      "/v1/completions": { POST: async (req) => cors(cfg, req, await engine.completions(req)) },
-      "/openai/v1/completions": { POST: async (req) => cors(cfg, req, await engine.completions(req)) },
-      "/v1/models": { GET: async (req) => cors(cfg, req, await listModels(engine, req)) },
-      "/openai/v1/models": { GET: async (req) => cors(cfg, req, await listModels(engine, req)) },
+      "/v1/chat/completions": { POST: async (req) => cors(engine.cfg, req, await engine.chat(req)) },
+      "/openai/v1/chat/completions": { POST: async (req) => cors(engine.cfg, req, await engine.chat(req)) },
+      "/openai/chat/completions": { POST: async (req) => cors(engine.cfg, req, await engine.chat(req)) },
+      "/openai/deployments/:deployment/chat/completions": { POST: async (req) => cors(engine.cfg, req, await engine.chat(req)) },
+      "/v1/embeddings": { POST: async (req) => cors(engine.cfg, req, await engine.embeddings(req)) },
+      "/openai/v1/embeddings": { POST: async (req) => cors(engine.cfg, req, await engine.embeddings(req)) },
+      "/v1/completions": { POST: async (req) => cors(engine.cfg, req, await engine.completions(req)) },
+      "/openai/v1/completions": { POST: async (req) => cors(engine.cfg, req, await engine.completions(req)) },
+      "/v1/models": { GET: async (req) => cors(engine.cfg, req, await listModels(engine, req)) },
+      "/openai/v1/models": { GET: async (req) => cors(engine.cfg, req, await listModels(engine, req)) },
 
-      "/v1/responses": { POST: async (req) => cors(cfg, req, await responsesApi(engine, req)) },
-      "/openai/v1/responses": { POST: async (req) => cors(cfg, req, await responsesApi(engine, req)) },
-      "/anthropic/v1/messages": { POST: async (req) => cors(cfg, req, await anthropicMessages(engine, req)) },
-      "/genai/v1beta/models/:modelAction": { POST: async (req) => cors(cfg, req, await genai(engine, req, req.params.modelAction)) },
-      "/bedrock/model/:modelId/:action": { POST: async (req) => cors(cfg, req, await bedrockModel(engine, req, req.params.modelId, req.params.action)) },
+      "/v1/responses": { POST: async (req) => cors(engine.cfg, req, await responsesApi(engine, req)) },
+      "/openai/v1/responses": { POST: async (req) => cors(engine.cfg, req, await responsesApi(engine, req)) },
+      "/anthropic/v1/messages": { POST: async (req) => cors(engine.cfg, req, await anthropicMessages(engine, req)) },
+      "/genai/v1beta/models/:modelAction": { POST: async (req) => cors(engine.cfg, req, await genai(engine, req, req.params.modelAction)) },
+      "/bedrock/model/:modelId/:action": { POST: async (req) => cors(engine.cfg, req, await bedrockModel(engine, req, req.params.modelId, req.params.action)) },
 
-      "/api/providers": { GET: () => providersView(cfg) },
-      "/api/governance/budgets": { GET: () => Response.json({ budgets: engine.gov.budgetUsage() }) },
-      "/api/cache": { GET: () => cacheView(engine) },
-      "/api/logs": { GET: (req) => logsView(engine, req, false) },
-      "/api/logs/stats": { GET: (req) => logsView(engine, req, true) },
-      "/v1/mcp/tool/execute": { POST: async (req) => cors(cfg, req, await engine.executeTool(req)) },
-      "/api/mcp": { GET: () => mcpView(engine) },
-      "/api/health": { GET: () => Response.json({ targets: engine.health.snapshot(Date.now()) }) },
+      "/api/cache": { GET: (req) => admin(engine, req) ?? cacheView(engine) },
+      "/api/logs": { GET: (req) => admin(engine, req) ?? logsView(engine, req, false) },
+      "/api/logs/stats": { GET: (req) => admin(engine, req) ?? logsView(engine, req, true) },
+      "/api/governance/usage": { GET: (req) => admin(engine, req) ?? Response.json({ budgets: engine.gov.budgetUsage() }) },
+      "/v1/mcp/tool/execute": { POST: async (req) => cors(engine.cfg, req, await engine.executeTool(req)) },
+      "/api/mcp": { GET: (req) => admin(engine, req) ?? mcpView(engine) },
+      "/api/health": { GET: (req) => admin(engine, req) ?? Response.json({ targets: engine.health.snapshot(Date.now()) }) },
     },
     fetch(req, server) {
       const u = URL.parse(req.url)
@@ -179,17 +178,19 @@ export function start(engine: Engine, opts: ServeOptions): string {
         if (server.upgrade(req, { data: up.session })) return
         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
       }
+      // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
+      if (p.startsWith("/api/")) return manage(engine, store, req, p)
       // audio, images, files and batches: passed through to OpenAI-compatible providers
       const media = matchRoute(req.method, p)
       if (media !== undefined) {
         if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
           return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
         }
-        return handleMedia(cfg, req, media)
+        return handleMedia(engine.cfg, req, media)
       }
       if (req.method === "OPTIONS") {
         const res = new Response(undefined, { status: 204, headers: { "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "*", "access-control-max-age": "86400" } })
-        return cors(cfg, req, res)
+        return cors(engine.cfg, req, res)
       }
       return errorResponse(404, `no route for ${req.method} ${req.url}`, "invalid_request_error", noHeaders())
     },

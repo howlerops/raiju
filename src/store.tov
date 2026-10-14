@@ -1,0 +1,1271 @@
+// Config store and management API (Bifrost's /api/*). Providers, keys, virtual
+// keys, budgets and rate limits change at runtime; each change is saved to the
+// config file and handed to the lead through onChange, which rebuilds the
+// engine. Secrets are masked on every read, and a masked value sent back
+// unchanged keeps the stored secret.
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
+import {
+  Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig,
+  RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig,
+} from "./config"
+import { decode } from "./base64"
+import { secureHex } from "./crypto"
+
+export type AdminAuth = AdminAuthConfig
+
+export type Failure = { kind: "error", status: int, message: string }
+export type Result = { kind: "ok", id: string } | Failure
+
+export type ApiReply = { status: int, body: string }
+
+type HasId = { id: string }
+
+// Request bodies: the server fills the id, and a missing required field is
+// caught by the store's validation instead of by JSON.parse's type check.
+type VkBody = { id?: string, name?: string, value?: string, description?: string, is_active?: bool, team_id?: string, customer_id?: string, budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], key_ids?: string[] }
+type BudgetBody = { id?: string, max_limit?: f64, reset_duration?: string, current_usage?: f64 }
+type RateBody = { id?: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string }
+type NamedBody = { id?: string, name?: string, customer_id?: string, budget_id?: string }
+
+const HEX = "0123456789abcdef"
+const DIGITS = "0123456789"
+const UNITS = "smhdwMQY"
+const COLLECTIONS = ["virtual-keys", "budgets", "rate-limits", "teams", "customers"]
+
+// Ids and virtual key values are bearer credentials: they come from the kernel CSPRNG.
+function randHex(n: int): string {
+  try {
+    return secureHex(n)
+  } catch (e) {
+    // No secure source: refuse to mint credentials rather than make weak ones.
+    console.error(`raiju: ${e.message}`)
+    process.exit(1)
+    return ""
+  }
+}
+
+export function randomId(prefix: string): string {
+  return prefix + randHex(12)
+}
+
+// A virtual key value: "sk-bf-" then 32 hex characters.
+export function newVkValue(): string {
+  return "sk-bf-" + randHex(32)
+}
+
+// Shows the first and last four characters. Short secrets become "****"; empty
+// values and "env.NAME" references are not secrets and pass through.
+export function maskSecret(v: string): string {
+  if (v === "" || v.startsWith("env.")) return v
+  const n = v.byteLength
+  if (n <= 8) return "****"
+  return v.slice(0, 4) + "…" + v.slice(n - 4)
+}
+
+function maskOpt(v: string | undefined): string | undefined {
+  return v === undefined ? undefined : maskSecret(v)
+}
+
+// A masked value sent back unchanged means "keep the stored secret".
+function keepSecret(incoming: string, existing: string | undefined): string {
+  if (existing === undefined) return incoming
+  return incoming === maskSecret(existing) ? existing : incoming
+}
+
+function keepOpt(incoming: string | undefined, existing: string | undefined): string | undefined {
+  if (incoming === undefined) return existing
+  return keepSecret(incoming, existing)
+}
+
+// Provider names: lower-case letters, digits, "_" and "-", 1 to 64 bytes.
+export function validProviderName(name: string): bool {
+  const n = name.byteLength
+  if (n < 1 || n > 64) return false
+  for (const b of new TextEncoder().encode(name)) {
+    const c = int(b)
+    const ok = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 45
+    if (!ok) return false
+  }
+  return true
+}
+
+// A positive number and one unit: s m h d w M (30 days) Q (90 days) Y.
+export function validDuration(s: string): bool {
+  let i = 0
+  while (i < s.byteLength && DIGITS.includes(s.slice(i, i + 1))) i += 1
+  if (i === 0 || i + 1 !== s.byteLength) return false
+  if (!UNITS.includes(s.slice(i))) return false
+  const n = parseInt(s.slice(0, i)) ?? 0
+  return n > 0
+}
+
+function fail(status: int, message: string): Failure {
+  return { kind: "error", status: status, message: message }
+}
+
+function gov(c: Config): GovernanceConfig {
+  const g = c.governance
+  return { budgets: g?.budgets, rate_limits: g?.rate_limits, virtual_keys: g?.virtual_keys, teams: g?.teams, customers: g?.customers }
+}
+
+function withGov(c: Config, g: GovernanceConfig): Config {
+  return { client: c.client, providers: c.providers, governance: g, cache: c.cache, pricing: c.pricing, prompt_cache: c.prompt_cache, health: c.health, guardrails: c.guardrails }
+}
+
+function copyProviders(c: Config): Map<string, ProviderConfig> {
+  const out: Map<string, ProviderConfig> = new Map()
+  const ps = c.providers
+  if (ps !== undefined) {
+    for (const n of ps.keys()) out.set(n, ps.get(n)!)
+  }
+  return out
+}
+
+function withProviders(c: Config, ps: Map<string, ProviderConfig>): Config {
+  return { client: c.client, providers: ps, governance: c.governance, cache: c.cache, pricing: c.pricing, prompt_cache: c.prompt_cache, health: c.health, guardrails: c.guardrails }
+}
+
+function withKeys(p: ProviderConfig, keys: KeyConfig[]): ProviderConfig {
+  return { keys: keys, network_config: p.network_config, proxy_config: p.proxy_config, custom_provider_config: p.custom_provider_config, send_back_raw_response: p.send_back_raw_response }
+}
+
+function findById<T extends HasId>(xs: T[] | undefined, id: string): T | undefined {
+  if (xs === undefined) return undefined
+  for (const x of xs) {
+    if (x.id === id) return x
+  }
+  return undefined
+}
+
+// Replaces the entry with x's id, or appends x.
+function putById<T extends HasId>(xs: T[], x: T): T[] {
+  const out: T[] = []
+  let placed = false
+  for (const y of xs) {
+    if (y.id === x.id) {
+      out.push(x)
+      placed = true
+    } else {
+      out.push(y)
+    }
+  }
+  if (!placed) out.push(x)
+  return out
+}
+
+function dropById<T extends HasId>(xs: T[], id: string): T[] {
+  const out: T[] = []
+  for (const y of xs) {
+    if (y.id !== id) out.push(y)
+  }
+  return out
+}
+
+function findKey(ks: KeyConfig[], id: string): KeyConfig | undefined {
+  for (const k of ks) {
+    if (k.id === id) return k
+  }
+  return undefined
+}
+
+function hasDupKeyIds(keys: KeyConfig[]): bool {
+  const seen: string[] = []
+  for (const k of keys) {
+    const id = k.id ?? ""
+    if (seen.includes(id)) return true
+    seen.push(id)
+  }
+  return false
+}
+
+// The stored form of a key: its id, and the stored secrets when the request
+// sent them masked or left them out.
+function prepKey(k: KeyConfig, id: string, old: KeyConfig | undefined): KeyConfig {
+  const bk = k.bedrock_key_config
+  const ob = old?.bedrock_key_config
+  const vk = k.vertex_key_config
+  const ov = old?.vertex_key_config
+  return {
+    id: id,
+    name: k.name,
+    value: keepOpt(k.value, old?.value),
+    models: k.models,
+    weight: k.weight,
+    aliases: k.aliases,
+    azure_key_config: k.azure_key_config,
+    vertex_key_config: vk === undefined ? undefined : { project_id: vk.project_id, region: vk.region, auth_credentials: keepOpt(vk.auth_credentials, ov?.auth_credentials) },
+    bedrock_key_config: bk === undefined ? undefined : {
+      access_key: bk.access_key,
+      secret_key: keepOpt(bk.secret_key, ob?.secret_key),
+      session_token: keepOpt(bk.session_token, ob?.session_token),
+      region: bk.region,
+      deployments: bk.deployments,
+    },
+  }
+}
+
+// Gives every key an id, keeping the stored secrets of keys sent back masked.
+function prepKeys(keys: KeyConfig[], old: KeyConfig[]): KeyConfig[] {
+  const out: KeyConfig[] = []
+  for (const k of keys) {
+    const id = k.id === undefined || k.id === "" ? randomId("key-") : k.id
+    out.push(prepKey(k, id, findKey(old, id)))
+  }
+  return out
+}
+
+function budgetError(b: BudgetConfig): string {
+  if (b.max_limit === undefined || !(b.max_limit > 0.0)) return "max_limit must be greater than 0"
+  if (b.reset_duration === undefined || !validDuration(b.reset_duration)) return "reset_duration must be a number and one unit: s m h d w M Q or Y"
+  const cu = b.current_usage
+  if (cu !== undefined && !(cu >= 0.0)) return "current_usage cannot be negative"
+  return ""
+}
+
+function rateLimitError(r: RateLimitConfig): string {
+  if (r.request_max_limit === undefined && r.token_max_limit === undefined) return "a rate limit needs request_max_limit or token_max_limit"
+  const rm = r.request_max_limit
+  if (rm !== undefined && rm < 1) return "request_max_limit must be at least 1"
+  const tm = r.token_max_limit
+  if (tm !== undefined && tm < 1) return "token_max_limit must be at least 1"
+  const rd = r.request_reset_duration
+  if (rd !== undefined && !validDuration(rd)) return "request_reset_duration must be a number and one unit: s m h d w M Q or Y"
+  const td = r.token_reset_duration
+  if (td !== undefined && !validDuration(td)) return "token_reset_duration must be a number and one unit: s m h d w M Q or Y"
+  return ""
+}
+
+// Names the first reference from a virtual key that points at nothing.
+function vkRefError(c: Config, vk: VirtualKeyConfig): string {
+  const g = gov(c)
+  const b = vk.budget_id
+  if (b !== undefined && findById(g.budgets, b) === undefined) return `unknown budget ${b}`
+  const rl = vk.rate_limit_id
+  if (rl !== undefined && findById(g.rate_limits, rl) === undefined) return `unknown rate limit ${rl}`
+  const t = vk.team_id
+  if (t !== undefined && findById(g.teams, t) === undefined) return `unknown team ${t}`
+  const cu = vk.customer_id
+  if (cu !== undefined && findById(g.customers, cu) === undefined) return `unknown customer ${cu}`
+  for (const pc of vk.provider_configs ?? []) {
+    const pb = pc.budget_id
+    if (pb !== undefined && findById(g.budgets, pb) === undefined) return `unknown budget ${pb}`
+    const pr = pc.rate_limit_id
+    if (pr !== undefined && findById(g.rate_limits, pr) === undefined) return `unknown rate limit ${pr}`
+  }
+  return ""
+}
+
+// What still refers to a budget, rate limit, team or customer; "" when nothing does.
+function budgetUsers(c: Config, id: string): string {
+  const g = gov(c)
+  for (const vk of g.virtual_keys ?? []) {
+    if (vk.budget_id === id) return `virtual key ${vk.id}`
+    for (const pc of vk.provider_configs ?? []) {
+      if (pc.budget_id === id) return `virtual key ${vk.id}`
+    }
+  }
+  for (const t of g.teams ?? []) {
+    if (t.budget_id === id) return `team ${t.id}`
+  }
+  for (const cu of g.customers ?? []) {
+    if (cu.budget_id === id) return `customer ${cu.id}`
+  }
+  return ""
+}
+
+function rateLimitUsers(c: Config, id: string): string {
+  for (const vk of gov(c).virtual_keys ?? []) {
+    if (vk.rate_limit_id === id) return `virtual key ${vk.id}`
+    for (const pc of vk.provider_configs ?? []) {
+      if (pc.rate_limit_id === id) return `virtual key ${vk.id}`
+    }
+  }
+  return ""
+}
+
+function teamUsers(c: Config, id: string): string {
+  for (const vk of gov(c).virtual_keys ?? []) {
+    if (vk.team_id === id) return `virtual key ${vk.id}`
+  }
+  return ""
+}
+
+function customerUsers(c: Config, id: string): string {
+  const g = gov(c)
+  for (const vk of g.virtual_keys ?? []) {
+    if (vk.customer_id === id) return `virtual key ${vk.id}`
+  }
+  for (const t of g.teams ?? []) {
+    if (t.customer_id === id) return `team ${t.id}`
+  }
+  return ""
+}
+
+// Masked copies for reads.
+function redactKey(k: KeyConfig): KeyConfig {
+  const br = k.bedrock_key_config
+  const vx = k.vertex_key_config
+  return {
+    id: k.id,
+    name: k.name,
+    value: maskOpt(k.value),
+    models: k.models,
+    weight: k.weight,
+    aliases: k.aliases,
+    azure_key_config: k.azure_key_config,
+    vertex_key_config: vx === undefined ? undefined : { project_id: vx.project_id, region: vx.region, auth_credentials: maskOpt(vx.auth_credentials) },
+    bedrock_key_config: br === undefined ? undefined : {
+      access_key: br.access_key,
+      secret_key: maskOpt(br.secret_key),
+      session_token: maskOpt(br.session_token),
+      region: br.region,
+      deployments: br.deployments,
+    },
+  }
+}
+
+function redactProvider(p: ProviderConfig): ProviderConfig {
+  const ks = p.keys
+  const px = p.proxy_config
+  return {
+    keys: ks === undefined ? undefined : ks.map((k) => redactKey(k)),
+    network_config: p.network_config,
+    proxy_config: px === undefined ? undefined : { type: px.type, url: px.url, username: px.username, password: maskOpt(px.password) },
+    custom_provider_config: p.custom_provider_config,
+    send_back_raw_response: p.send_back_raw_response,
+  }
+}
+
+function redactProviders(ps: Map<string, ProviderConfig> | undefined): Map<string, ProviderConfig> | undefined {
+  if (ps === undefined) return undefined
+  const out: Map<string, ProviderConfig> = new Map()
+  for (const n of ps.keys()) out.set(n, redactProvider(ps.get(n)!))
+  return out
+}
+
+function redactVk(vk: VirtualKeyConfig): VirtualKeyConfig {
+  return {
+    id: vk.id,
+    name: vk.name,
+    value: maskSecret(vk.value),
+    description: vk.description,
+    is_active: vk.is_active,
+    team_id: vk.team_id,
+    customer_id: vk.customer_id,
+    budget_id: vk.budget_id,
+    rate_limit_id: vk.rate_limit_id,
+    provider_configs: vk.provider_configs,
+    key_ids: vk.key_ids,
+  }
+}
+
+function redactConfig(c: Config): Config {
+  const g = c.governance
+  return {
+    client: c.client,
+    providers: redactProviders(c.providers),
+    governance: g === undefined ? undefined : {
+      budgets: g.budgets,
+      rate_limits: g.rate_limits,
+      virtual_keys: g.virtual_keys === undefined ? undefined : g.virtual_keys.map((vk) => redactVk(vk)),
+      teams: g.teams,
+      customers: g.customers,
+    },
+    cache: c.cache,
+    pricing: c.pricing,
+    prompt_cache: c.prompt_cache,
+    health: c.health,
+    guardrails: c.guardrails,
+  }
+}
+
+export class ConfigStore {
+  cfg: Config
+  version: int = 0
+  onChange: ((c: Config) => void) | undefined = undefined
+
+  // `initial` should be the config as written in the file (env.NAME references
+  // unresolved), so save() writes the references and not their values.
+  constructor(readonly path: string, initial: Config) {
+    this.cfg = initial
+  }
+
+  // Writes the config as JSON. node:fs has no rename, so the previous file is
+  // kept as <path>.bak first; a crash mid-write leaves that copy behind.
+  save(): void throws Error {
+    const text = JSON.stringify(this.cfg, undefined, 2)
+    if (existsSync(this.path)) {
+      const old = try readFileSync(this.path, "utf8")
+      try writeFileSync(this.path + ".bak", old)
+    }
+    try writeFileSync(this.path, text + "\n")
+  }
+
+  // Swaps in the next config, saves it and notifies. A failed save restores
+  // the previous config, so memory never differs from the file.
+  private commit(next: Config, id: string): Result {
+    const prev = this.cfg
+    this.cfg = next
+    try {
+      this.save()
+    } catch (e) {
+      this.cfg = prev
+      return fail(500, `could not save config: ${e.message}`)
+    }
+    this.version += 1
+    const f = this.onChange
+    if (f !== undefined) f(next)
+    return { kind: "ok", id: id }
+  }
+
+  private putProvider(name: string, np: ProviderConfig, id: string): Result {
+    const ps = copyProviders(this.cfg)
+    ps.set(name, np)
+    return this.commit(withProviders(this.cfg, ps), id)
+  }
+
+  // Replaces the provider. Omitted keys keep the stored ones; omitted or masked
+  // secrets keep the stored values.
+  upsertProvider(name: string, p: ProviderConfig): Result {
+    if (!validProviderName(name)) return fail(400, `invalid provider name ${name}`)
+    const old = providerOf(this.cfg, name)
+    const oldKeys = old?.keys ?? []
+    const keys = p.keys === undefined ? oldKeys : prepKeys(p.keys, oldKeys)
+    if (hasDupKeyIds(keys)) return fail(400, "duplicate key id")
+    const px = p.proxy_config
+    const opx = old?.proxy_config
+    return this.putProvider(name, {
+      keys: keys,
+      network_config: p.network_config,
+      proxy_config: px === undefined ? undefined : { type: px.type, url: px.url, username: px.username, password: keepOpt(px.password, opx?.password) },
+      custom_provider_config: p.custom_provider_config,
+      send_back_raw_response: p.send_back_raw_response,
+    }, name)
+  }
+
+  deleteProvider(name: string): Result {
+    const ps = copyProviders(this.cfg)
+    if (!ps.has(name)) return fail(404, `no provider ${name}`)
+    ps.delete(name)
+    return this.commit(withProviders(this.cfg, ps), name)
+  }
+
+  // Adds a key to an existing provider. The id is generated when missing.
+  addKey(provider: string, k: KeyConfig): Result {
+    const p = providerOf(this.cfg, provider)
+    if (p === undefined) return fail(404, `no provider ${provider}`)
+    const id = k.id === undefined || k.id === "" ? randomId("key-") : k.id
+    const keys = p.keys ?? []
+    if (findKey(keys, id) !== undefined) return fail(409, `key ${id} already exists`)
+    const next: KeyConfig[] = []
+    for (const x of keys) next.push(x)
+    next.push(prepKey(k, id, undefined))
+    return this.putProvider(provider, withKeys(p, next), id)
+  }
+
+  updateKey(provider: string, keyId: string, k: KeyConfig): Result {
+    const p = providerOf(this.cfg, provider)
+    if (p === undefined) return fail(404, `no provider ${provider}`)
+    const keys = p.keys ?? []
+    const old = findKey(keys, keyId)
+    if (old === undefined) return fail(404, `no key ${keyId} on provider ${provider}`)
+    const nk = prepKey(k, keyId, old)
+    const next: KeyConfig[] = []
+    for (const x of keys) next.push(x.id === keyId ? nk : x)
+    return this.putProvider(provider, withKeys(p, next), keyId)
+  }
+
+  deleteKey(provider: string, keyId: string): Result {
+    const p = providerOf(this.cfg, provider)
+    if (p === undefined) return fail(404, `no provider ${provider}`)
+    const keys = p.keys ?? []
+    if (findKey(keys, keyId) === undefined) return fail(404, `no key ${keyId} on provider ${provider}`)
+    const next: KeyConfig[] = []
+    for (const x of keys) {
+      if (x.id !== keyId) next.push(x)
+    }
+    return this.putProvider(provider, withKeys(p, next), keyId)
+  }
+
+  // Creates or replaces a virtual key. A missing id or value is generated; an
+  // existing key keeps its value when none is sent or the masked value is sent.
+  upsertVirtualKey(vk: VirtualKeyConfig): Result {
+    const id = vk.id === undefined || vk.id === "" ? randomId("vk-") : vk.id
+    const g = gov(this.cfg)
+    const old = findById(g.virtual_keys, id)
+    const value = vk.value === undefined || vk.value === ""
+      ? (old?.value ?? newVkValue())
+      : keepSecret(vk.value, old?.value)
+    for (const other of g.virtual_keys ?? []) {
+      if (other.value === value && other.id !== id) return fail(409, "another virtual key has this value")
+    }
+    const refErr = vkRefError(this.cfg, vk)
+    if (refErr !== "") return fail(400, refErr)
+    const next: VirtualKeyConfig = {
+      id: id,
+      name: vk.name,
+      value: value,
+      description: vk.description,
+      is_active: vk.is_active,
+      team_id: vk.team_id,
+      customer_id: vk.customer_id,
+      budget_id: vk.budget_id,
+      rate_limit_id: vk.rate_limit_id,
+      provider_configs: vk.provider_configs,
+      key_ids: vk.key_ids,
+    }
+    g.virtual_keys = putById(g.virtual_keys ?? [], next)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  deleteVirtualKey(id: string): Result {
+    const g = gov(this.cfg)
+    if (findById(g.virtual_keys, id) === undefined) return fail(404, `no virtual key ${id}`)
+    g.virtual_keys = dropById(g.virtual_keys ?? [], id)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  upsertBudget(b: BudgetConfig): Result {
+    const id = b.id === undefined || b.id === "" ? randomId("budget-") : b.id
+    const err = budgetError(b)
+    if (err !== "") return fail(400, err)
+    const g = gov(this.cfg)
+    const old = findById(g.budgets, id)
+    const next: BudgetConfig = {
+      id: id,
+      max_limit: b.max_limit,
+      reset_duration: b.reset_duration,
+      current_usage: b.current_usage ?? old?.current_usage,
+    }
+    g.budgets = putById(g.budgets ?? [], next)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  deleteBudget(id: string): Result {
+    const g = gov(this.cfg)
+    if (findById(g.budgets, id) === undefined) return fail(404, `no budget ${id}`)
+    const user = budgetUsers(this.cfg, id)
+    if (user !== "") return fail(409, `budget ${id} is used by ${user}`)
+    g.budgets = dropById(g.budgets ?? [], id)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  upsertRateLimit(r: RateLimitConfig): Result {
+    const id = r.id === undefined || r.id === "" ? randomId("rl-") : r.id
+    const err = rateLimitError(r)
+    if (err !== "") return fail(400, err)
+    const g = gov(this.cfg)
+    const next: RateLimitConfig = {
+      id: id,
+      token_max_limit: r.token_max_limit,
+      token_reset_duration: r.token_reset_duration,
+      request_max_limit: r.request_max_limit,
+      request_reset_duration: r.request_reset_duration,
+    }
+    g.rate_limits = putById(g.rate_limits ?? [], next)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  deleteRateLimit(id: string): Result {
+    const g = gov(this.cfg)
+    if (findById(g.rate_limits, id) === undefined) return fail(404, `no rate limit ${id}`)
+    const user = rateLimitUsers(this.cfg, id)
+    if (user !== "") return fail(409, `rate limit ${id} is used by ${user}`)
+    g.rate_limits = dropById(g.rate_limits ?? [], id)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  upsertTeam(t: TeamConfig): Result {
+    const id = t.id === undefined || t.id === "" ? randomId("team-") : t.id
+    if (t.name === undefined || t.name === "") return fail(400, "team name is required")
+    const g = gov(this.cfg)
+    const cu = t.customer_id
+    if (cu !== undefined && findById(g.customers, cu) === undefined) return fail(400, `unknown customer ${cu}`)
+    const b = t.budget_id
+    if (b !== undefined && findById(g.budgets, b) === undefined) return fail(400, `unknown budget ${b}`)
+    const next: TeamConfig = { id: id, name: t.name, customer_id: cu, budget_id: b }
+    g.teams = putById(g.teams ?? [], next)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  deleteTeam(id: string): Result {
+    const g = gov(this.cfg)
+    if (findById(g.teams, id) === undefined) return fail(404, `no team ${id}`)
+    const user = teamUsers(this.cfg, id)
+    if (user !== "") return fail(409, `team ${id} is used by ${user}`)
+    g.teams = dropById(g.teams ?? [], id)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  upsertCustomer(c: CustomerConfig): Result {
+    const id = c.id === undefined || c.id === "" ? randomId("customer-") : c.id
+    if (c.name === undefined || c.name === "") return fail(400, "customer name is required")
+    const g = gov(this.cfg)
+    const b = c.budget_id
+    if (b !== undefined && findById(g.budgets, b) === undefined) return fail(400, `unknown budget ${b}`)
+    const next: CustomerConfig = { id: id, name: c.name, budget_id: b }
+    g.customers = putById(g.customers ?? [], next)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  deleteCustomer(id: string): Result {
+    const g = gov(this.cfg)
+    if (findById(g.customers, id) === undefined) return fail(404, `no customer ${id}`)
+    const user = customerUsers(this.cfg, id)
+    if (user !== "") return fail(409, `customer ${id} is used by ${user}`)
+    g.customers = dropById(g.customers ?? [], id)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  // The whole config as JSON with secrets masked.
+  redacted(): string {
+    return JSON.stringify(redactConfig(this.cfg), undefined, 2)
+  }
+}
+
+// Compares two strings without stopping at the first difference.
+function safeEq(a: string, b: string): bool {
+  const x = new TextEncoder().encode(a)
+  const y = new TextEncoder().encode(b)
+  const n = x.length > y.length ? x.length : y.length
+  let d = x.length === y.length ? 0 : 1
+  for (let i = 0; i < n; i++) {
+    const p = i < x.length ? int(x[i]!) : 0
+    const q = i < y.length ? int(y[i]!) : 0
+    d = d | (p ^ q)
+  }
+  return d === 0
+}
+
+// The decoded "user:password" of a Basic credential, or undefined if it is not base64 text.
+function basicCreds(v: string): string | undefined {
+  try {
+    return new TextDecoder().decode(decode(v.trim()))
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Checks a request's credentials against the admin auth. With no auth
+// configured every request passes. Once any field is set, a request needs a
+// matching Bearer token or a matching Basic user and password; a partly
+// configured auth fails closed.
+export function checkAdmin(auth: AdminAuth | undefined, headers: Map<string, string>): bool {
+  if (auth === undefined) return true
+  const u = auth.username
+  const p = auth.password
+  const t = auth.token
+  if (u === undefined && p === undefined && t === undefined) return true
+  const h = headers.get("authorization") ?? ""
+  if (h.startsWith("Bearer ") || h.startsWith("bearer ")) {
+    if (t === undefined || t === "") return false
+    return safeEq(h.slice(7), t)
+  }
+  if (h.startsWith("Basic ") || h.startsWith("basic ")) {
+    if (u === undefined || p === undefined || u === "" || p === "") return false
+    const creds = basicCreds(h.slice(6))
+    if (creds === undefined) return false
+    const i = creds.indexOf(":")
+    if (i < 0) return false
+    const okUser = safeEq(creds.slice(0, i), u)
+    const okPass = safeEq(creds.slice(i + 1), p)
+    return okUser && okPass
+  }
+  return false
+}
+
+function reply(status: int, body: string): ApiReply {
+  return { status: status, body: body }
+}
+
+function errorBody(message: string): string {
+  return JSON.stringify({ error: { message: message } })
+}
+
+function notFound(path: string): ApiReply {
+  return reply(404, errorBody(`no route for ${path}`))
+}
+
+function notAllowed(method: string): ApiReply {
+  return reply(405, errorBody(`method ${method} is not allowed on this route`))
+}
+
+function badBody(): ApiReply {
+  return reply(400, errorBody("body must be a JSON object matching the resource"))
+}
+
+function serverError(): ApiReply {
+  return reply(500, errorBody("the saved record could not be read back"))
+}
+
+function errReply(f: Failure): ApiReply {
+  return reply(f.status, errorBody(f.message))
+}
+
+function storedReply<T extends HasId>(x: T | undefined, status: int): ApiReply {
+  if (x === undefined) return serverError()
+  return reply(status, JSON.stringify(x))
+}
+
+// The path id wins; otherwise the body's id, or a fresh one.
+function resolveId(pathId: string | undefined, bodyId: string | undefined, prefix: string): string {
+  if (pathId !== undefined) return pathId
+  if (bodyId === undefined || bodyId === "") return randomId(prefix)
+  return bodyId
+}
+
+function parseProvider(b: string): ProviderConfig | undefined {
+  try {
+    return JSON.parse(b) as ProviderConfig
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseKey(b: string): KeyConfig | undefined {
+  try {
+    return JSON.parse(b) as KeyConfig
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseVk(b: string): VkBody | undefined {
+  try {
+    return JSON.parse(b) as VkBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseBudget(b: string): BudgetBody | undefined {
+  try {
+    return JSON.parse(b) as BudgetBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseRate(b: string): RateBody | undefined {
+  try {
+    return JSON.parse(b) as RateBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseTeam(b: string): NamedBody | undefined {
+  try {
+    return JSON.parse(b) as NamedBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseCustomer(b: string): NamedBody | undefined {
+  try {
+    return JSON.parse(b) as NamedBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function listBody(c: Config, coll: string): string {
+  const g = gov(c)
+  if (coll === "virtual-keys") return JSON.stringify({ virtual_keys: (g.virtual_keys ?? []).map((vk) => redactVk(vk)) })
+  if (coll === "budgets") return JSON.stringify({ budgets: g.budgets ?? [] })
+  if (coll === "rate-limits") return JSON.stringify({ rate_limits: g.rate_limits ?? [] })
+  if (coll === "teams") return JSON.stringify({ teams: g.teams ?? [] })
+  return JSON.stringify({ customers: g.customers ?? [] })
+}
+
+// POST (pathId undefined) and PUT on the governance collections. Returns the
+// stored record; a virtual key's full value is included only when this call
+// created it.
+function putGov(store: ConfigStore, coll: string, pathId: string | undefined, body: string): ApiReply {
+  const g = gov(store.cfg)
+  if (coll === "virtual-keys") {
+    const b = parseVk(body)
+    if (b === undefined) return badBody()
+    const id = resolveId(pathId, b.id, "vk-")
+    const created = findById(g.virtual_keys, id) === undefined
+    const vk: VirtualKeyConfig = {
+      id: id,
+      name: b.name,
+      value: b.value ?? "",
+      description: b.description,
+      is_active: b.is_active,
+      team_id: b.team_id,
+      customer_id: b.customer_id,
+      budget_id: b.budget_id,
+      rate_limit_id: b.rate_limit_id,
+      provider_configs: b.provider_configs,
+      key_ids: b.key_ids,
+    }
+    const r = store.upsertVirtualKey(vk)
+    if (r.kind === "error") return errReply(r)
+    const stored = findById(gov(store.cfg).virtual_keys, id)
+    if (stored === undefined) return serverError()
+    return reply(created ? 201 : 200, JSON.stringify(created ? stored : redactVk(stored)))
+  }
+  if (coll === "budgets") {
+    const b = parseBudget(body)
+    if (b === undefined) return badBody()
+    const id = resolveId(pathId, b.id, "budget-")
+    const created = findById(g.budgets, id) === undefined
+    const r = store.upsertBudget({ id: id, max_limit: b.max_limit ?? 0.0, reset_duration: b.reset_duration ?? "", current_usage: b.current_usage })
+    if (r.kind === "error") return errReply(r)
+    return storedReply(findById(gov(store.cfg).budgets, id), created ? 201 : 200)
+  }
+  if (coll === "rate-limits") {
+    const b = parseRate(body)
+    if (b === undefined) return badBody()
+    const id = resolveId(pathId, b.id, "rl-")
+    const created = findById(g.rate_limits, id) === undefined
+    const r = store.upsertRateLimit({
+      id: id,
+      token_max_limit: b.token_max_limit,
+      token_reset_duration: b.token_reset_duration,
+      request_max_limit: b.request_max_limit,
+      request_reset_duration: b.request_reset_duration,
+    })
+    if (r.kind === "error") return errReply(r)
+    return storedReply(findById(gov(store.cfg).rate_limits, id), created ? 201 : 200)
+  }
+  if (coll === "teams") {
+    const b = parseTeam(body)
+    if (b === undefined) return badBody()
+    const id = resolveId(pathId, b.id, "team-")
+    const created = findById(g.teams, id) === undefined
+    const r = store.upsertTeam({ id: id, name: b.name ?? "", customer_id: b.customer_id, budget_id: b.budget_id })
+    if (r.kind === "error") return errReply(r)
+    return storedReply(findById(gov(store.cfg).teams, id), created ? 201 : 200)
+  }
+  const b = parseCustomer(body)
+  if (b === undefined) return badBody()
+  const id = resolveId(pathId, b.id, "customer-")
+  const created = findById(g.customers, id) === undefined
+  const r = store.upsertCustomer({ id: id, name: b.name ?? "", budget_id: b.budget_id })
+  if (r.kind === "error") return errReply(r)
+  return storedReply(findById(gov(store.cfg).customers, id), created ? 201 : 200)
+}
+
+function deleteGov(store: ConfigStore, coll: string, id: string): ApiReply {
+  let r: Result
+  if (coll === "virtual-keys") r = store.deleteVirtualKey(id)
+  else if (coll === "budgets") r = store.deleteBudget(id)
+  else if (coll === "rate-limits") r = store.deleteRateLimit(id)
+  else if (coll === "teams") r = store.deleteTeam(id)
+  else r = store.deleteCustomer(id)
+  if (r.kind === "error") return errReply(r)
+  return reply(200, JSON.stringify({ deleted: id }))
+}
+
+function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string): ApiReply {
+  const coll = segs[2] ?? ""
+  if (!COLLECTIONS.includes(coll) || segs.length > 4) return notFound(path)
+  if (segs.length === 3) {
+    if (m === "GET") return reply(200, listBody(store.cfg, coll))
+    if (m === "POST") return putGov(store, coll, undefined, body)
+    return notAllowed(m)
+  }
+  const id = segs[3] ?? ""
+  if (m === "PUT") return putGov(store, coll, id, body)
+  if (m === "DELETE") return deleteGov(store, coll, id)
+  if (m === "GET" && coll === "virtual-keys") {
+    const vk = findById(gov(store.cfg).virtual_keys, id)
+    if (vk === undefined) return reply(404, errorBody(`no virtual key ${id}`))
+    return reply(200, JSON.stringify(redactVk(vk)))
+  }
+  return notAllowed(m)
+}
+
+function providerRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string): ApiReply {
+  if (segs.length === 2) {
+    if (m === "GET") return reply(200, JSON.stringify({ providers: redactProviders(store.cfg.providers) }))
+    return notAllowed(m)
+  }
+  const name = segs[2] ?? ""
+  if (segs.length === 3) {
+    if (m === "GET") {
+      const p = providerOf(store.cfg, name)
+      if (p === undefined) return reply(404, errorBody(`no provider ${name}`))
+      return reply(200, JSON.stringify(redactProvider(p)))
+    }
+    if (m === "PUT") {
+      const p = parseProvider(body)
+      if (p === undefined) return badBody()
+      const r = store.upsertProvider(name, p)
+      if (r.kind === "error") return errReply(r)
+      const saved = providerOf(store.cfg, name)
+      if (saved === undefined) return serverError()
+      return reply(200, JSON.stringify(redactProvider(saved)))
+    }
+    if (m === "DELETE") {
+      const r = store.deleteProvider(name)
+      if (r.kind === "error") return errReply(r)
+      return reply(200, JSON.stringify({ deleted: name }))
+    }
+    return notAllowed(m)
+  }
+  if (segs[3] !== "keys" || segs.length > 5) return notFound(path)
+  if (segs.length === 4) {
+    if (m !== "POST") return notAllowed(m)
+    const k = parseKey(body)
+    if (k === undefined) return badBody()
+    const id = resolveId(undefined, k.id, "key-")
+    k.id = id
+    const r = store.addKey(name, k)
+    if (r.kind === "error") return errReply(r)
+    const saved = findKey(providerOf(store.cfg, name)?.keys ?? [], id)
+    if (saved === undefined) return serverError()
+    return reply(201, JSON.stringify(redactKey(saved)))
+  }
+  const keyId = segs[4] ?? ""
+  if (m === "PUT") {
+    const k = parseKey(body)
+    if (k === undefined) return badBody()
+    const r = store.updateKey(name, keyId, k)
+    if (r.kind === "error") return errReply(r)
+    const saved = findKey(providerOf(store.cfg, name)?.keys ?? [], keyId)
+    if (saved === undefined) return serverError()
+    return reply(200, JSON.stringify(redactKey(saved)))
+  }
+  if (m === "DELETE") {
+    const r = store.deleteKey(name, keyId)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: keyId }))
+  }
+  return notAllowed(m)
+}
+
+// Routes one request of the management API. Bodies are JSON; errors are
+// {"error":{"message":...}}. The query string is ignored.
+export function handleApi(store: ConfigStore, method: string, path: string, body: string): ApiReply {
+  const m = method.toUpperCase()
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  const segs = p.split("/").filter((s) => s !== "")
+  if (segs.length === 0 || segs[0] !== "api") return notFound(p)
+  const area = segs[1] ?? ""
+  if (area === "config") {
+    if (segs.length !== 2) return notFound(p)
+    return m === "GET" ? reply(200, store.redacted()) : notAllowed(m)
+  }
+  if (area === "providers") return providerRoute(store, m, segs, body, p)
+  if (area === "governance" && segs.length >= 3) return governanceRoute(store, m, segs, body, p)
+  return notFound(p)
+}
+
+// ---- tests ----
+
+function statusOf(r: Result): int {
+  return r.kind === "error" ? r.status : 200
+}
+
+function messageOf(r: Result): string {
+  return r.kind === "error" ? r.message : ""
+}
+
+function tmpPath(): string {
+  return "/tmp/raiju-store-" + randHex(12) + ".json"
+}
+
+function cleanup(path: string): void {
+  try {
+    unlinkSync(path)
+  } catch (e) {
+    // already gone
+  }
+  try {
+    unlinkSync(path + ".bak")
+  } catch (e) {
+    // no backup yet
+  }
+}
+
+class Counter {
+  n = 0
+}
+
+function authHeader(v: string): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  m.set("authorization", v)
+  return m
+}
+
+test("durations and provider names are validated", () => {
+  expect(validDuration("30s")).toBe(true)
+  expect(validDuration("1M")).toBe(true)
+  expect(validDuration("M")).toBe(false)
+  expect(validDuration("5x")).toBe(false)
+  expect(validDuration("0d")).toBe(false)
+  expect(validDuration("10")).toBe(false)
+  expect(validDuration("")).toBe(false)
+  expect(validProviderName("openai")).toBe(true)
+  expect(validProviderName("my_proxy-2")).toBe(true)
+  expect(validProviderName("OpenAI")).toBe(false)
+  expect(validProviderName("")).toBe(false)
+  expect(validProviderName("a/b")).toBe(false)
+})
+
+test("providers: upsert, read, delete and 404s", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertProvider("openai", { keys: [{ value: "sk-abcdefghijkl", models: ["gpt-4o"] }] }))).toBe(200)
+  expect(s.version).toBe(1)
+  const keys = providerOf(s.cfg, "openai")!.keys!
+  expect(keys[0]!.id!.startsWith("key-")).toBe(true)
+  expect(statusOf(s.upsertProvider("Bad Name", {}))).toBe(400)
+  expect(statusOf(s.deleteProvider("nope"))).toBe(404)
+  expect(statusOf(s.deleteProvider("openai"))).toBe(200)
+  expect(s.version).toBe(2)
+  expect(providerOf(s.cfg, "openai") === undefined).toBe(true)
+  cleanup(path)
+})
+
+test("keys: add, update, delete and 404/409", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertProvider("openai", {}))).toBe(200)
+  const added = s.addKey("openai", { value: "sk-first-0123456789" })
+  expect(statusOf(added)).toBe(200)
+  const id = added.kind === "ok" ? added.id : ""
+  expect(id.startsWith("key-")).toBe(true)
+  expect(statusOf(s.addKey("nope", { value: "x" }))).toBe(404)
+  expect(statusOf(s.addKey("openai", { id: id, value: "dup" }))).toBe(409)
+  expect(statusOf(s.updateKey("openai", "missing", { value: "x" }))).toBe(404)
+  expect(statusOf(s.updateKey("openai", id, { value: "sk-second-98765432", models: ["m1"] }))).toBe(200)
+  expect(providerOf(s.cfg, "openai")!.keys![0]!.value).toBe("sk-second-98765432")
+  expect(statusOf(s.deleteKey("openai", "missing"))).toBe(404)
+  expect(statusOf(s.deleteKey("openai", id))).toBe(200)
+  expect(providerOf(s.cfg, "openai")!.keys!.length).toBe(0)
+  cleanup(path)
+})
+
+test("a masked key value sent back keeps the stored secret", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.addKey("anthropic", { value: "x" }))).toBe(404)
+  expect(statusOf(s.upsertProvider("anthropic", { keys: [{ id: "key-a", value: "sk-ant-secret-1234" }] }))).toBe(200)
+  expect(statusOf(s.updateKey("anthropic", "key-a", { value: "sk-a…1234", name: "renamed" }))).toBe(200)
+  expect(providerOf(s.cfg, "anthropic")!.keys![0]!.value).toBe("sk-ant-secret-1234")
+  expect(providerOf(s.cfg, "anthropic")!.keys![0]!.name).toBe("renamed")
+  cleanup(path)
+})
+
+test("virtual keys: generated id and value format, masked update, refs and duplicates", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertVirtualKey({ id: "", name: "auto", value: "" }))).toBe(200)
+  const vk = s.cfg.governance!.virtual_keys![0]!
+  expect(vk.id.startsWith("vk-")).toBe(true)
+  expect(vk.value.startsWith("sk-bf-")).toBe(true)
+  expect(vk.value.byteLength).toBe(38)
+  let hexOk = true
+  for (const ch of vk.value.slice(6).chars()) {
+    if (!"0123456789abcdef".includes(ch)) hexOk = false
+  }
+  expect(hexOk).toBe(true)
+  const first = vk.value
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "dev", value: "" }))).toBe(200)
+  const v1 = s.cfg.governance!.virtual_keys!.filter((x) => x.id === "vk1")[0]!.value
+  expect(v1 === first).toBe(false)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "dev2", value: maskSecret(v1) }))).toBe(200)
+  expect(s.cfg.governance!.virtual_keys!.filter((x) => x.id === "vk1")[0]!.value).toBe(v1)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk2", name: "dup", value: v1 }))).toBe(409)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk3", name: "bad", value: "sk-x", budget_id: "nope" }))).toBe(400)
+  expect(statusOf(s.deleteVirtualKey("vk1"))).toBe(200)
+  expect(statusOf(s.deleteVirtualKey("vk1"))).toBe(404)
+  cleanup(path)
+})
+
+test("budgets: validation, 409 when referenced, delete", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertBudget({ id: "b1", max_limit: 0.0, reset_duration: "1M" }))).toBe(400)
+  expect(statusOf(s.upsertBudget({ id: "b1", max_limit: 10.0, reset_duration: "5x" }))).toBe(400)
+  expect(statusOf(s.upsertBudget({ id: "b1", max_limit: 10.0, reset_duration: "m" }))).toBe(400)
+  expect(statusOf(s.upsertBudget({ id: "b1", max_limit: 10.0, reset_duration: "10d" }))).toBe(200)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "x", value: "", budget_id: "b1" }))).toBe(200)
+  const r = s.deleteBudget("b1")
+  expect(statusOf(r)).toBe(409)
+  expect(messageOf(r).includes("vk1")).toBe(true)
+  expect(statusOf(s.deleteBudget("nope"))).toBe(404)
+  expect(statusOf(s.deleteVirtualKey("vk1"))).toBe(200)
+  expect(statusOf(s.deleteBudget("b1"))).toBe(200)
+  cleanup(path)
+})
+
+test("rate limits, teams and customers reference and delete rules", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertRateLimit({ id: "rl1", request_max_limit: 0, request_reset_duration: "1m" }))).toBe(400)
+  expect(statusOf(s.upsertRateLimit({ id: "rl1" }))).toBe(400)
+  expect(statusOf(s.upsertRateLimit({ id: "rl1", request_max_limit: 10, request_reset_duration: "1m" }))).toBe(200)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "x", value: "", rate_limit_id: "rl1" }))).toBe(200)
+  expect(statusOf(s.deleteRateLimit("rl1"))).toBe(409)
+  expect(statusOf(s.upsertCustomer({ id: "c1", name: "acme", budget_id: "nope" }))).toBe(400)
+  expect(statusOf(s.upsertCustomer({ id: "c1", name: "acme" }))).toBe(200)
+  expect(statusOf(s.upsertTeam({ id: "t1", name: "core", customer_id: "c1" }))).toBe(200)
+  expect(statusOf(s.upsertTeam({ id: "t2", name: "", customer_id: "c1" }))).toBe(400)
+  expect(statusOf(s.deleteCustomer("c1"))).toBe(409)
+  expect(statusOf(s.deleteTeam("t1"))).toBe(200)
+  expect(statusOf(s.deleteCustomer("c1"))).toBe(200)
+  expect(statusOf(s.deleteRateLimit("rl1"))).toBe(409)
+  expect(statusOf(s.deleteVirtualKey("vk1"))).toBe(200)
+  expect(statusOf(s.deleteRateLimit("rl1"))).toBe(200)
+  expect(statusOf(s.deleteRateLimit("rl1"))).toBe(404)
+  cleanup(path)
+})
+
+test("persistence: saved file parses back to the same config and keeps a backup", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertProvider("openai", { keys: [{ value: "env.OPENAI_KEY", models: ["gpt-4o"] }] }))).toBe(200)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "x", value: "" }))).toBe(200)
+  const text = try readFileSync(path, "utf8")
+  const back = try JSON.parse(text) as Config
+  expect(JSON.stringify(back, undefined, 2) === JSON.stringify(s.cfg, undefined, 2)).toBe(true)
+  const reloaded = new ConfigStore(path, back)
+  expect(reloaded.version).toBe(0)
+  expect(JSON.stringify(reloaded.cfg, undefined, 2) === JSON.stringify(s.cfg, undefined, 2)).toBe(true)
+  expect(statusOf(s.upsertProvider("anthropic", {}))).toBe(200)
+  expect(try readFileSync(path + ".bak", "utf8") === text).toBe(true)
+  cleanup(path)
+})
+
+test("a failed save leaves the in-memory config and version unchanged", () => {
+  const s = new ConfigStore("/nonexistent-raiju-dir/config.json", {})
+  const r = s.upsertProvider("openai", { keys: [{ value: "sk-abcdefghijkl" }] })
+  expect(statusOf(r)).toBe(500)
+  expect(s.cfg.providers === undefined).toBe(true)
+  expect(s.version).toBe(0)
+})
+
+test("onChange runs once per successful change only", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const seen = new Counter()
+  s.onChange = (c: Config) => {
+    seen.n += 1
+  }
+  expect(statusOf(s.upsertBudget({ id: "b1", max_limit: 0.0, reset_duration: "1d" }))).toBe(400)
+  expect(seen.n).toBe(0)
+  expect(statusOf(s.upsertBudget({ id: "b1", max_limit: 5.0, reset_duration: "1d" }))).toBe(200)
+  expect(seen.n).toBe(1)
+  expect(s.version).toBe(1)
+  cleanup(path)
+})
+
+test("redaction masks keys, bedrock secrets, proxy password and virtual keys; env refs stay", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertProvider("openai", {
+    keys: [{ value: "sk-abcdefghijkl" }, { value: "short" }, { value: "env.OPENAI_KEY" }],
+    proxy_config: { type: "http", url: "http://p", username: "u", password: "proxy-pass-123" },
+  }))).toBe(200)
+  expect(statusOf(s.upsertProvider("bedrock", {
+    keys: [{ value: "", bedrock_key_config: { access_key: "AKIAEXAMPLE", secret_key: "wJalrXUtnFEMI", session_token: "tok-abcdefghijk", region: "us-east-1" } }],
+  }))).toBe(200)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "x", value: "sk-bf-" + "f".repeat(32) }))).toBe(200)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk2", name: "env", value: "env.VK_SECRET" }))).toBe(200)
+  const red = s.redacted()
+  expect(red.includes("sk-abcdefghijkl")).toBe(false)
+  expect(red.includes("sk-a…ijkl")).toBe(true)
+  expect(red.includes("\"****\"")).toBe(true)
+  expect(red.includes("env.OPENAI_KEY")).toBe(true)
+  expect(red.includes("proxy-pass-123")).toBe(false)
+  expect(red.includes("wJalrXUtnFEMI")).toBe(false)
+  expect(red.includes("wJal…FEMI")).toBe(true)
+  expect(red.includes("AKIAEXAMPLE")).toBe(true)
+  expect(red.includes("tok-abcdefghijk")).toBe(false)
+  expect(red.includes("sk-bf-" + "f".repeat(32))).toBe(false)
+  expect(red.includes("sk-b…ffff")).toBe(true)
+  expect(red.includes("env.VK_SECRET")).toBe(true)
+  expect(maskSecret("12345678")).toBe("****")
+  expect(maskSecret("123456789")).toBe("1234…6789")
+  expect(maskSecret("")).toBe("")
+  cleanup(path)
+})
+
+test("checkAdmin: no auth, bearer, basic, wrong credentials and partial config", () => {
+  const none = new Map<string, string>()
+  expect(checkAdmin(undefined, none)).toBe(true)
+  expect(checkAdmin({}, none)).toBe(true)
+  const auth: AdminAuth = { username: "admin", password: "secret", token: "tok-123" }
+  expect(checkAdmin(auth, none)).toBe(false)
+  expect(checkAdmin(auth, authHeader("Bearer tok-123"))).toBe(true)
+  expect(checkAdmin(auth, authHeader("Bearer tok-12"))).toBe(false)
+  expect(checkAdmin(auth, authHeader("Bearer tok-1234"))).toBe(false)
+  expect(checkAdmin(auth, authHeader("Basic YWRtaW46c2VjcmV0"))).toBe(true)
+  expect(checkAdmin(auth, authHeader("Basic YWRtaW46bm9wZQ=="))).toBe(false)
+  expect(checkAdmin(auth, authHeader("Basic !!!"))).toBe(false)
+  expect(checkAdmin(auth, authHeader("Basic dXNlcg=="))).toBe(false)
+  const tokenOnly: AdminAuth = { token: "tok" }
+  expect(checkAdmin(tokenOnly, authHeader("Basic YWRtaW46c2VjcmV0"))).toBe(false)
+  expect(checkAdmin(tokenOnly, authHeader("Bearer "))).toBe(false)
+  const partial: AdminAuth = { username: "admin" }
+  expect(checkAdmin(partial, authHeader("Basic YWRtaW46c2VjcmV0"))).toBe(false)
+  expect(checkAdmin(partial, none)).toBe(false)
+})
+
+test("handleApi routes, methods and status codes", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(handleApi(s, "GET", "/api/config", "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/config?pretty=1", "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/nothing", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/v1/models", "").status).toBe(404)
+  expect(handleApi(s, "POST", "/api/config", "{}").status).toBe(405)
+  expect(handleApi(s, "PUT", "/api/providers", "{}").status).toBe(405)
+  expect(handleApi(s, "PUT", "/api/providers/openai", "not json").status).toBe(400)
+  expect(handleApi(s, "PUT", "/api/providers/OpenAI", "{}").status).toBe(400)
+  expect(handleApi(s, "GET", "/api/providers/openai", "").status).toBe(404)
+  const put = handleApi(s, "PUT", "/api/providers/openai", "{\"keys\":[{\"value\":\"sk-abcdefghijkl\"}]}")
+  expect(put.status).toBe(200)
+  expect(put.body.includes("sk-abcdefghijkl")).toBe(false)
+  expect(handleApi(s, "GET", "/api/providers", "").body.includes("sk-a…ijkl")).toBe(true)
+  expect(handleApi(s, "GET", "/api/providers/openai/keys", "").status).toBe(405)
+  expect(handleApi(s, "POST", "/api/providers/openai/keys", "{\"value\":\"sk-zzzzzzzzzzzz\"}").status).toBe(201)
+  expect(handleApi(s, "PUT", "/api/providers/openai/keys/nope", "{}").status).toBe(404)
+  expect(handleApi(s, "POST", "/api/providers/nope/keys", "{\"value\":\"x\"}").status).toBe(404)
+  expect(handleApi(s, "DELETE", "/api/providers/openai/keys/nope", "").status).toBe(404)
+  expect(handleApi(s, "POST", "/api/providers/openai/keys/x", "{}").status).toBe(405)
+
+  const vk = handleApi(s, "POST", "/api/governance/virtual-keys", "{\"name\":\"dev\"}")
+  expect(vk.status).toBe(201)
+  const created = try JSON.parse(vk.body) as VirtualKeyConfig
+  expect(created.value.startsWith("sk-bf-")).toBe(true)
+  expect(created.value.byteLength).toBe(38)
+  const list = handleApi(s, "GET", "/api/governance/virtual-keys", "")
+  expect(list.status).toBe(200)
+  expect(list.body.includes(created.value)).toBe(false)
+  const one = handleApi(s, "GET", "/api/governance/virtual-keys/" + created.id, "")
+  expect(one.body.includes(created.value)).toBe(false)
+  const again = handleApi(s, "PUT", "/api/governance/virtual-keys/" + created.id, "{\"name\":\"renamed\"}")
+  expect(again.status).toBe(200)
+  expect(again.body.includes(created.value)).toBe(false)
+  expect(handleApi(s, "GET", "/api/governance/virtual-keys/nope", "").status).toBe(404)
+  expect(handleApi(s, "PUT", "/api/governance/virtual-keys/" + created.id + "x", "{}").status).toBe(201)
+  expect(handleApi(s, "DELETE", "/api/governance/virtual-keys/nope", "").status).toBe(404)
+
+  expect(handleApi(s, "POST", "/api/governance/budgets", "{\"id\":\"b1\",\"max_limit\":0,\"reset_duration\":\"1d\"}").status).toBe(400)
+  expect(handleApi(s, "POST", "/api/governance/budgets", "{\"id\":\"b1\",\"max_limit\":5,\"reset_duration\":\"1d\"}").status).toBe(201)
+  expect(handleApi(s, "PUT", "/api/governance/budgets/b1", "{\"max_limit\":7,\"reset_duration\":\"1M\"}").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/governance/budgets/b1", "").status).toBe(405)
+  expect(handleApi(s, "GET", "/api/governance/budgets", "").body.includes("\"b1\"")).toBe(true)
+  expect(handleApi(s, "DELETE", "/api/governance/budgets/nope", "").status).toBe(404)
+  expect(handleApi(s, "DELETE", "/api/governance/budgets/b1", "").status).toBe(200)
+  expect(handleApi(s, "POST", "/api/governance/rate-limits", "{\"id\":\"rl\",\"request_max_limit\":3}").status).toBe(201)
+  expect(handleApi(s, "PUT", "/api/governance/rate-limits/rl", "{\"token_max_limit\":100,\"token_reset_duration\":\"1h\"}").status).toBe(200)
+  expect(handleApi(s, "POST", "/api/governance/teams", "{\"name\":\"core\"}").status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/customers", "{\"name\":\"acme\"}").status).toBe(201)
+  expect(handleApi(s, "DELETE", "/api/governance/customers/nope", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/governance/unknown", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/governance", "").status).toBe(404)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", "not json").status).toBe(400)
+  expect(handleApi(s, "DELETE", "/api/providers/openai", "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/unknown", "").body.includes("\"error\"")).toBe(true)
+  cleanup(path)
+})

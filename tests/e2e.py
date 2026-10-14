@@ -16,9 +16,12 @@ def build():
         env = {**os.environ, "TOV_CFLAGS": os.environ.get("TOV_CFLAGS", "-DTV_PLAIN_ALLOC")}
         subprocess.run(["tov", "build", os.path.join(ROOT, src), "-o", os.path.join(BUILD, out)], check=True, capture_output=True, env=env)
 
-def call(method, path, body=None, headers=None, base=GW):
+ADMIN = {"authorization": "Bearer admin-secret"}
+
+def call(method, path, body=None, headers=None, base=GW, auth=True):
     data = None if body is None else (body if isinstance(body, str) else json.dumps(body)).encode()
-    req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": "application/json", **(headers or {})})
+    extra = ADMIN if auth and base == GW and path.startswith("/api/") else {}
+    req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": "application/json", **extra, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return r.status, dict(r.headers), r.read().decode()
@@ -107,7 +110,7 @@ def main():
     config = write_config()
     import shutil
     shutil.rmtree(os.path.join(ROOT, "build/e2e-logs"), ignore_errors=True)
-    env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "MOCK_PORT": "18099"}
+    env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config], env=env, stderr=subprocess.DEVNULL)
     try:
@@ -285,6 +288,30 @@ def main():
         with urllib.request.urlopen(req, timeout=10) as res:
             audio = res.read(); ctype = res.headers.get("content-type")
         check("audio speech pass-through", audio == b"ID3fake-mp3-bytes" and ctype == "audio/mpeg" and json.loads(seen()[-1]["body"])["model"] == "tts-1", (audio, ctype))
+
+        # Management API: admin auth, CRUD, hot reload, secrets kept out of the file
+        s, _, _ = call("GET", "/api/config", auth=False)
+        check("management API requires admin credentials", s == 401, s)
+        s, _, b = call("GET", "/api/config")
+        check("config is redacted", s == 200 and "sk-spare" not in b and "bad-key" not in b and "env.E2E_OPENAI_KEY" in b, b[:300])
+        s, _, b = call("POST", "/api/governance/virtual-keys", {"name": "ci", "provider_configs": [{"provider": "openai", "allowed_models": ["gpt-4o-mini"]}]})
+        vk = json.loads(b)
+        value = vk.get("value", "")
+        check("virtual key created with a generated secret", s == 201 and value.startswith("sk-bf-") and len(value) == 38, b)
+        s, _, b = chat("openai/gpt-4o-mini", headers={"x-bf-vk": value}, seed=600)
+        check("new virtual key works without a restart", s == 200, b)
+        s, _, b = chat("anthropic/claude-sonnet-4", headers={"x-bf-vk": value}, seed=601)
+        check("new virtual key's allowlist is enforced", s == 403, b)
+        s, _, b = call("GET", "/api/governance/virtual-keys")
+        check("virtual key values are masked on read", value not in b and '"ci"' in b, b[:300])
+        s, _, b = call("PUT", "/api/providers/extra", {"keys": [{"name": "x", "value": "sk-extra-secret", "models": [], "weight": 1}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK}})
+        check("provider added", s in (200, 201), b)
+        s, _, b = chat("extra/some-model", seed=602)
+        check("traffic routes to the new provider", s == 200 and seen()[-1]["auth"] == "Bearer sk-extra-secret", (s, b))
+        saved = open(config).read()
+        check("saved config keeps env references and new keys", "env.E2E_OPENAI_KEY" in saved and "sk-from-env" not in saved and "sk-extra-secret" in saved, saved[:200])
+        s, _, b = call("POST", "/api/governance/budgets", {"id": "b-bad", "max_limit": -1, "reset_duration": "1d"})
+        check("invalid budget rejected", s == 400, b)
 
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
