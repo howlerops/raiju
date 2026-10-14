@@ -325,7 +325,7 @@ def main():
         vecs = json.loads(b).get("embeddings", {}).get("float", []) if s == 200 else []
         check("cohere embed returns one float vector per text", s == 200 and len(vecs) == 2 and all(len(v) == 64 for v in vecs), b[:300])
         check("cohere embed sends the texts as an OpenAI input list", json.loads(seen()[-1]["body"])["input"] == ["one", "two"] and seen()[-1]["path"] == "/v1/embeddings", seen()[-1])
-        s, _, b = call("POST", "/cohere/v2/rerank", {"model": "openai/rerank-english", "query": "capital of France", "documents": ["bananas are yellow", "Paris is the capital of France"]})
+        s, _, b = call("POST", "/cohere/v2/rerank", {"model": "raiju/lexical", "query": "capital of France", "documents": ["bananas are yellow", "Paris is the capital of France"]})
         results = json.loads(b).get("results", []) if s == 200 else []
         check("cohere rerank puts the best document first", s == 200 and len(results) == 2 and results[0].get("index") == 1, b[:300])
         s, _, b = call("POST", "/cohere/v1/tokenize", {"model": "command-r", "text": "hello world"})
@@ -450,6 +450,10 @@ def main():
         check("request logs are queryable", s == 200 and r["total"] >= 1 and all(e["provider"] == "anthropic" for e in r["entries"]), b[:400])
         s, _, b = call("GET", "/api/logs?status=error")
         check("failed requests are logged with their error", s == 200 and any(e.get("error") for e in json.loads(b)["entries"]), b[:400])
+        chat("openai/gpt-4o-mini", seed=1801, headers={"x-bf-disable-content-logging": "true", "x-request-id": "req-nocontent"}, messages=[{"role": "user", "content": "private words"}])
+        chat("openai/gpt-4o-mini", seed=1802, headers={"x-request-id": "req-content"}, messages=[{"role": "user", "content": "public words"}])
+        _, _, lb = call("GET", "/api/logs?limit=20")
+        check("x-bf-disable-content-logging keeps a request's bodies out of the log", "private words" not in lb and "public words" in lb and "req-nocontent" in lb, lb[:400])
         s, _, b = call("GET", "/api/logs/stats")
         st = json.loads(b)
         check("log stats", s == 200 and st["requests"] > 10 and st["tokens"] > 0, b[:300])
@@ -522,8 +526,24 @@ def main():
         s, _, b = call("POST", "/api/governance/budgets", {"id": "b-bad", "max_limit": -1, "reset_duration": "1d"})
         check("invalid budget rejected", s == 400, b)
 
-        # Rerank (local lexical ranking for providers without a rerank API)
-        s, _, b = call("POST", "/v1/rerank", {"model": "openai/any", "query": "solar panels on roofs", "documents": ["a recipe for soup", "installing solar panels on your roof", "train timetables"], "top_n": 2})
+        # the Responses lifecycle and realtime REST pass through to OpenAI (Bifrost's default provider)
+        got = []
+        for m, path in [("GET", "/v1/responses/resp_1"), ("DELETE", "/v1/responses/resp_1"), ("POST", "/v1/responses/resp_1/cancel"), ("GET", "/v1/responses/resp_1/input_items"), ("GET", "/openai/v1/responses/resp_2?provider=openai")]:
+            s, _, b = call(m, path)
+            got.append((s, json.loads(b).get("path") if s == 200 else b))
+        check("responses retrieve, delete, cancel and input_items pass through", got == [(200, "/v1/responses/resp_1"), (200, "/v1/responses/resp_1"), (200, "/v1/responses/resp_1/cancel"), (200, "/v1/responses/resp_1/input_items"), (200, "/v1/responses/resp_2")], got)
+        s, _, b = call("POST", "/v1/responses/input_tokens", {"model": "openai/gpt-4o", "input": "hi"})
+        up = seen()[-1]
+        check("responses input_tokens goes to the model's provider with a bare model", s == 200 and up["path"] == "/v1/responses/input_tokens" and '"model":"gpt-4o"' in up["body"].replace(" ", ""), (s, b, up))
+        s, _, b = call("POST", "/v1/realtime/client_secrets", {"session": {"type": "realtime", "model": "gpt-realtime"}})
+        s2, _, b2 = call("POST", "/v1/realtime/sessions", {"model": "openai/gpt-realtime"})
+        check("realtime client_secrets and sessions pass through", s == 200 and s2 == 200 and seen()[-1]["path"] == "/v1/realtime/sessions", (s, b, s2, b2))
+
+        # Rerank: a provider without a rerank API is an error, as in Bifrost
+        s, _, b = call("POST", "/v1/rerank", {"model": "openai/any", "query": "q", "documents": ["a"]})
+        check("rerank on a provider without a rerank API is an error", s == 400 and "not supported" in b, (s, b))
+        # ... and raiju/lexical asks for the local lexical ranking
+        s, _, b = call("POST", "/v1/rerank", {"model": "raiju/lexical", "query": "solar panels on roofs", "documents": ["a recipe for soup", "installing solar panels on your roof", "train timetables"], "top_n": 2})
         r = json.loads(b)
         check("rerank ranks the relevant document first", s == 200 and r["results"][0]["index"] == 1 and len(r["results"]) == 2, b)
 
