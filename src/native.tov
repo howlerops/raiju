@@ -3,7 +3,12 @@
 import { Field, fields, find, quote, build, isNull, rawStr, rawBool, setField } from "./json"
 import { Engine, Build, Translate, StreamSink, StreamConverter, ConverterFactory, streamable, converterKind, errorResponse, noHeaders } from "./gateway"
 import { Target, Translated } from "./providers/types"
-import { ChatRequest } from "./schemas"
+import { ChatRequest, snapshot } from "./schemas"
+import * as cohereIn from "./cohere_in"
+import * as genaiIn from "./genai_in"
+import * as bedrockIn from "./bedrock_in"
+import { estimateChatTokens, estimateTokens } from "./jobs"
+import { rerank } from "./extras"
 import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
@@ -210,36 +215,243 @@ export async function responsesApi(engine: Engine, req: Request): Promise<Respon
   return await engine.serve(req, "responses", undefined, body, reqText, b, tr, stream)
 }
 
-// /genai/v1beta/models/{model}:{method}
-export async function genai(engine: Engine, req: Request, modelAction: string): Promise<Response> {
+function jsonBody(body: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  return new Response(body, { headers: h })
+}
+
+// An internal POST to the gateway's own route, with the caller's headers (so its virtual key).
+function internalRequest(req: Request, path: string, body: string): Request {
+  const u = URL.parse(req.url)
+  const origin = u === undefined ? "http://localhost" : u.origin
+  return new Request(origin + path, { method: "POST", headers: snapshot(req.headers), body: body })
+}
+
+// /cohere/v2/chat: Cohere's chat API, served by any provider through OpenAI chat.
+export async function cohereChat(engine: Engine, req: Request, sink?: StreamSink): Promise<Response> {
+  const text = await req.text()
+  let body: Field[] = []
+  let bridge: Bridge | undefined = undefined
+  try {
+    body = fields(text)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const stream = find(body, "stream") === "true"
+  const clientModel = rawStr(body, "model") ?? ""
+  try {
+    bridge = chatBridge(cohereIn.chatToOpenAI(text, clientModel), stream, false, stream && sink !== undefined)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const br = bridge!
+  const b: Build = (t) => try br.build(t)
+  const tr: Translate = (t, out, requested) => {
+    const o = try br.toOpenAI(t, out, requested)
+    const res = stream ? cohereIn.toCohereStream(try asSse(o.body), clientModel) : try cohereIn.openAIToChat(o.body)
+    return { body: res, promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+  }
+  const mk: ConverterFactory = (t, requested) => {
+    if (!streamable(t)) return undefined
+    const c = new StreamConverter(converterKind(t), requested, true)
+    c.asCohere(clientModel)
+    return c
+  }
+  return await engine.serve(req, "cohere.chat", undefined, body, text, b, tr, stream, undefined, stream ? sink : undefined, mk)
+}
+
+// /cohere/v2/embed: the embeddings of any provider that serves them, in Cohere's shape.
+export async function cohereEmbed(engine: Engine, req: Request): Promise<Response> {
+  const text = await req.text()
+  let conv = ""
+  let texts: string[] = []
+  try {
+    conv = cohereIn.embedToOpenAI(text, rawStr(fields(text), "model") ?? "")
+    texts = cohereIn.embedTexts(text)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const r = await engine.embeddings(internalRequest(req, "/v1/embeddings", conv))
+  if (r.status !== 200) return r
+  try {
+    return jsonBody(cohereIn.openAIToEmbed(await r.text(), texts))
+  } catch (e) {
+    return errorResponse(502, `invalid upstream answer: ${e.message}`, "api_error", noHeaders())
+  }
+}
+
+// /cohere/v2/rerank: Raiju's rerank (Cohere's own, or the local lexical one), in Cohere's shape.
+export async function cohereRerank(engine: Engine, req: Request): Promise<Response> {
+  const text = await req.text()
+  let conv = ""
+  try {
+    conv = cohereIn.rerankToRaiju(text)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const r = await rerank(engine, internalRequest(req, "/v1/rerank", conv))
+  if (r.status !== 200) return r
+  try {
+    return jsonBody(cohereIn.raijuToRerank(await r.text()))
+  } catch (e) {
+    return errorResponse(502, `invalid upstream answer: ${e.message}`, "api_error", noHeaders())
+  }
+}
+
+// /cohere/v1/tokenize: an estimate (no provider tokenizer is called).
+export async function cohereTokenize(engine: Engine, req: Request): Promise<Response> {
+  const text = await req.text()
+  let t = ""
+  try {
+    t = cohereIn.tokenizeText(text)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
+    return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
+  }
+  return jsonBody(cohereIn.tokenizeResponse(t, estimateTokens(t)))
+}
+
+// /genai/v1beta/models/{model}:{method}. Gemini targets are passed through natively; other
+// targets are reached through OpenAI chat (generate) or embeddings and converted back.
+export async function genai(engine: Engine, req: Request, modelAction: string, sink?: StreamSink): Promise<Response> {
   const parts = modelAction.split(":")
   if (parts.length < 2) return errorResponse(404, "expected models/{model}:{method}", "invalid_request_error", noHeaders())
   const method = parts[parts.length - 1]!
   const model = parts.slice(0, parts.length - 1).join(":")
-  const text = await req.text()
-  const stream = method === "streamGenerateContent"
   const full = model.includes("/") ? model : "gemini/" + model
-  const build: Build = (t) => {
-    if (t.kind !== "gemini") throw new SyntaxError(`/genai routes go to Gemini, not ${t.provider}`)
-    const up = gemini.nativeRequest(t, method, text)
-    if (stream) up.url = up.url + "?alt=sse"
-    return up
+  const text = await req.text()
+  if (method === "embedContent" || method === "batchEmbedContents") return await genaiEmbed(engine, req, method, full, text)
+  if (method === "countTokens") return genaiCount(text, full)
+  if (method !== "generateContent" && method !== "streamGenerateContent") return errorResponse(404, `${method} isn't supported`, "invalid_request_error", noHeaders())
+  const stream = method === "streamGenerateContent"
+  let bridge: Bridge | undefined = undefined
+  try {
+    bridge = chatBridge(genaiIn.generateToOpenAI(text, full, stream), stream, false, stream && sink !== undefined)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
-  const translate: Translate = (t, text, requested) => geminiUsage(text, stream)
-  return await engine.serve(req, "genai." + method, full, [], text, build, translate, stream)
+  const br = bridge!
+  const b: Build = (t) => {
+    if (t.kind === "gemini") {
+      const up = gemini.nativeRequest(t, method, text)
+      if (stream) up.url = up.url + "?alt=sse"
+      return up
+    }
+    return try br.build(t)
+  }
+  const tr: Translate = (t, out, requested) => {
+    if (t.kind === "gemini") return geminiUsage(out, stream)
+    const o = try br.toOpenAI(t, out, requested)
+    const body = stream ? genaiIn.toGenAIStream(try asSse(o.body), full) : try genaiIn.openAIToGenerate(o.body, full)
+    return { body: body, promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+  }
+  // Gemini streams stay buffered; other providers' streams are converted as they arrive.
+  const mk: ConverterFactory = (t, requested) => {
+    if (t.kind === "gemini" || !streamable(t)) return undefined
+    const c = new StreamConverter(converterKind(t), requested, true)
+    c.asGenAI(full)
+    return c
+  }
+  return await engine.serve(req, "genai." + method, full, [], text, b, tr, stream, undefined, stream ? sink : undefined, mk)
 }
 
-// /bedrock/model/{modelId}/{converse|invoke}
-export async function bedrockModel(engine: Engine, req: Request, modelId: string, action: string): Promise<Response> {
-  if (action !== "converse" && action !== "invoke") return errorResponse(404, `${action} isn't supported; use converse or invoke`, "invalid_request_error", noHeaders())
+// :countTokens is an estimate of the request's text; no provider is called.
+function genaiCount(text: string, full: string): Response {
+  try {
+    return jsonBody(genaiIn.countTokensResponse(estimateChatTokens(genaiIn.generateToOpenAI(text, full, false))))
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+}
+
+// :embedContent and :batchEmbedContents. Gemini answers natively; other targets through their embeddings.
+async function genaiEmbed(engine: Engine, req: Request, method: string, full: string, text: string): Promise<Response> {
+  const batch = method === "batchEmbedContents"
+  let body: Field[] = []
+  try {
+    body = fields(genaiIn.embedToOpenAI(text, full))
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const b: Build = (t) => {
+    if (t.kind === "gemini") return gemini.nativeRequest(t, method, text)
+    if (!providers.supportsEmbeddings(t.kind)) throw new SyntaxError(`${t.provider} does not serve embeddings through this gateway yet`)
+    return try providers.embeddingsUpstream(t, body)
+  }
+  const tr: Translate = (t, out, requested) => {
+    if (t.kind === "gemini") return { body: out, promptTokens: 0, completionTokens: 0 }
+    const o = try providers.embeddingsTranslate(t.kind, t.model, out, requested)
+    return { body: try genaiIn.openAIToEmbed(o.body, batch), promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+  }
+  return await engine.serve(req, "genai." + method, full, [], text, b, tr, false)
+}
+
+const BEDROCK_ACTIONS = ["converse", "converse-stream", "invoke", "invoke-with-response-stream", "count-tokens"]
+
+// Bedrock's event-stream answer (binary frames) from frames built here.
+function eventStreamResponse(frames: u8[]): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/vnd.amazon.eventstream")
+  return new Response(frames, { headers: h })
+}
+
+// /bedrock/model/{modelId}/{action}: Bedrock's SDK routes, served by any provider. The
+// streaming actions stream frames when the server can (sink), else answer the frames whole.
+export async function bedrockModel(engine: Engine, req: Request, modelId: string, action: string, sink?: StreamSink): Promise<Response> {
+  if (!BEDROCK_ACTIONS.includes(action)) return errorResponse(404, `${action} isn't supported`, "invalid_request_error", noHeaders())
   const text = await req.text()
   // percent-decoded through URLSearchParams (model ids never contain "+")
   const id = new URLSearchParams("id=" + modelId).get("id") ?? modelId
-  const full = id.startsWith("bedrock/") ? id : "bedrock/" + id
-  const build: Build = (t) => {
-    if (t.kind !== "bedrock") throw new SyntaxError(`/bedrock routes go to Bedrock, not ${t.provider}`)
-    return bedrock.signedRequest(t, action, text)
+  if (action === "count-tokens") {
+    try {
+      return jsonBody(bedrockIn.countTokensResponse(estimateChatTokens(bedrockIn.countTokensToRaiju(text))))
+    } catch (e) {
+      return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+    }
   }
-  const translate: Translate = (t, text, requested) => bedrockUsage(text)
-  return await engine.serve(req, "bedrock." + action, full, [], text, build, translate, false)
+  const stream = action.endsWith("-stream")
+  const invoke = action.startsWith("invoke")
+  // "provider/model" names pass through; a bare Bedrock id is a Bedrock model
+  const full = id.includes("/") && !id.startsWith("arn:") ? id : "bedrock/" + id
+  let bridge: Bridge | undefined = undefined
+  try {
+    const chat = invoke ? (stream ? bedrockIn.invokeStreamToOpenAI(text, id) : bedrockIn.invokeToOpenAI(text, id)) : bedrockIn.converseToOpenAI(text, id, stream)
+    bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const br = bridge!
+  // a Bedrock target gets the native call for the non-streaming actions, as Anthropic's route does
+  const native = (t: Target) => t.kind === "bedrock" && !stream
+  const b: Build = (t) => {
+    if (native(t)) return bedrock.signedRequest(t, action, text)
+    return try br.build(t)
+  }
+  const tr: Translate = (t, out, requested) => {
+    if (native(t)) return bedrockUsage(out)
+    const o = try br.toOpenAI(t, out, requested)
+    if (stream) return { body: try asSse(o.body), promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+    const body = invoke ? try anthropicIn.toMessage(o.body, id) : try bedrockIn.openAIToConverse(o.body)
+    return { body: body, promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+  }
+  const mk: ConverterFactory = (t, requested) => {
+    if (!streamable(t)) return undefined
+    const c = new StreamConverter(converterKind(t), requested, true)
+    if (invoke) c.asInvoke(id)
+    else c.asConverse()
+    return c
+  }
+  const r = await engine.serve(req, "bedrock." + action, full, [], text, b, tr, stream, undefined, stream ? sink : undefined, mk)
+  // a buffered streaming answer: its SSE, turned into the frames the client reads
+  if (!stream || r.status !== 200 || (sink !== undefined && sink.started)) return r
+  let sse = ""
+  try {
+    sse = await r.text()
+  } catch (e) {
+    return errorResponse(502, `invalid upstream answer: ${e.message}`, "api_error", noHeaders())
+  }
+  return eventStreamResponse(invoke ? bedrockIn.invokeFramesFromSse(sse, id) : bedrockIn.converseFramesFromSse(sse))
 }

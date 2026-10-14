@@ -2,7 +2,8 @@
 // metrics, health and a read-only management API.
 import { Config, providerOf, providerNames } from "./config"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
-import { anthropicMessages, genai, bedrockModel, responsesApi } from "./native"
+import { anthropicMessages, genai, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
+import * as genaiIn from "./genai_in"
 import { kindOf } from "./router"
 import { Target, Upstream } from "./providers/types"
 import * as openai from "./providers/openai"
@@ -86,6 +87,20 @@ async function retrieveModel(engine: Engine, req: Request, id: string): Promise<
   const known = await providerModels(engine.cfg, provider)
   const listed = known.includes(id) || known.includes(id.slice(slash + 1))
   return Response.json({ id: id, object: "model", created: 0, owned_by: provider, listed: listed })
+}
+
+const GENAI = "/genai/v1beta/models/"
+
+// GET /genai/v1beta/models and /models/{id}: the configured models, in GenAI's shape.
+async function genaiModels(engine: Engine, id: string): Promise<Response> {
+  const ids: string[] = []
+  for (const n of providerNames(engine.cfg)) {
+    for (const m of await providerModels(engine.cfg, n)) ids.push(m)
+  }
+  if (id === "") return new Response(genaiIn.modelsList(ids), { headers: { "content-type": "application/json" } })
+  const name = new URLSearchParams("id=" + id).get("id") ?? id
+  if (!ids.includes(name)) return errorResponse(404, `models/${name} not found`, "invalid_request_error", noHeaders())
+  return new Response(genaiIn.modelInfo(name), { headers: { "content-type": "application/json" } })
 }
 
 async function listModels(engine: Engine, req: Request): Promise<Response> {
@@ -305,6 +320,8 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
     if (p === "/metrics") return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
     if (p === "/v1/models" || p === "/openai/v1/models") return await cors(engine.cfg, req, await listModels(engine, req))
     if (p.startsWith("/v1/models/")) return await cors(engine.cfg, req, await retrieveModel(engine, req, p.slice(11)))
+    if (p === "/genai/v1beta/models") return await cors(engine.cfg, req, await genaiModels(engine, ""))
+    if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genaiModels(engine, p.slice(GENAI.byteLength)))
     const poll = asyncPoll(p)
     if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id)
     if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
@@ -324,7 +341,11 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
     if (p === "/anthropic/v1/messages/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, true))
     if (p === "/anthropic/v1/messages") return await cors(engine.cfg, req, await anthropicMessages(engine, req))
     if (p === "/v1/mcp/tool/execute") return await cors(engine.cfg, req, await engine.executeTool(req))
-    if (p.startsWith("/genai/v1beta/models/") && segs.length === 5) return await cors(engine.cfg, req, await genai(engine, req, segs[4]!))
+    if (p === "/cohere/v2/chat") return await cors(engine.cfg, req, await cohereChat(engine, req))
+    if (p === "/cohere/v2/embed") return await cors(engine.cfg, req, await cohereEmbed(engine, req))
+    if (p === "/cohere/v2/rerank") return await cors(engine.cfg, req, await cohereRerank(engine, req))
+    if (p === "/cohere/v1/tokenize") return await cors(engine.cfg, req, await cohereTokenize(engine, req))
+    if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genai(engine, req, p.slice(GENAI.byteLength)))
     if (p.startsWith("/bedrock/model/") && segs.length === 5) return await cors(engine.cfg, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
     if (p.startsWith("/v1/async/")) return await asyncSubmit(engine.jobs, req, p, dispatcher(engine))
   }
@@ -362,9 +383,46 @@ class StreamHead {
   }
 }
 
-async function runChat(engine: Engine, req: Request, sink: StreamSink, head: StreamHead, anthropic: bool): Promise<void> {
+// The routes that can stream, by kind: the kind picks the handler (routeStream).
+export function streamKind(p: string): string {
+  if (CHAT_PATHS.includes(p)) return "openai"
+  if (p === "/anthropic/v1/messages") return "anthropic"
+  if (p === "/cohere/v2/chat") return "cohere"
+  if (p.startsWith(GENAI) && p.endsWith(":streamGenerateContent")) return "genai"
+  if (p.startsWith("/bedrock/model/") && (p.endsWith("/converse-stream") || p.endsWith("/invoke-with-response-stream"))) return "bedrock"
+  return ""
+}
+
+// Whether a streamed route streams this request: GenAI and Bedrock stream routes are named by
+// their path; the others take "stream": true in the body.
+export function streamsRequest(kind: string, text: string): bool {
+  if (kind === "") return false
+  if (kind === "genai" || kind === "bedrock") return true
+  if (!text.includes("\"stream\"")) return false
   try {
-    const r = anthropic ? await anthropicMessages(engine, req, sink) : await engine.chat(req, sink)
+    return rawBool(fields(text), "stream") ?? false
+  } catch (e) {
+    return false
+  }
+}
+
+// The answer of a route kind; streamed into sink when there is one.
+export async function routeStream(engine: Engine, req: Request, kind: string, sink?: StreamSink): Promise<Response> {
+  const u = URL.parse(req.url)
+  const p = compatPath(u === undefined ? "" : u.pathname)
+  if (kind === "anthropic") return await anthropicMessages(engine, req, sink)
+  if (kind === "cohere") return await cohereChat(engine, req, sink)
+  if (kind === "genai") return await genai(engine, req, p.slice(GENAI.byteLength), sink)
+  if (kind === "bedrock") {
+    const segs = p.split("/")
+    return await bedrockModel(engine, req, segs[3]!, segs[4]!, sink)
+  }
+  return await engine.chat(req, sink)
+}
+
+async function runChat(engine: Engine, req: Request, sink: StreamSink, head: StreamHead, kind: string): Promise<void> {
+  try {
+    const r = await routeStream(engine, req, kind, sink)
     // never started streaming (an error, a cache hit, a non-streaming provider): the whole answer
     if (!sink.started) head.give(r)
   } catch (e) {
@@ -372,19 +430,13 @@ async function runChat(engine: Engine, req: Request, sink: StreamSink, head: Str
   }
 }
 
-// A chat request with "stream": true on Bun.serve: the answer is a ReadableStream body that
-// gets each SSE event as the upstream produces it (needs Tov's stream bodies; see tov-patches/).
-async function chatStreamed(engine: Engine, req: Request, anthropic: bool): Promise<Response> {
+// A streamed route on Bun.serve: the answer is a ReadableStream body that gets each SSE event
+// (or binary Bedrock frame) as the upstream produces it (needs Tov's stream bodies; see tov-patches/).
+async function chatStreamed(engine: Engine, req: Request, kind: string): Promise<Response> {
   const text = await req.text()
   const hs: Record<string, string> = snapshot(req.headers)
   const again = new Request(req.url, { method: "POST", headers: hs, body: text })
-  let wants = false
-  try {
-    wants = text.includes("\"stream\"") && (rawBool(fields(text), "stream") ?? false)
-  } catch (e) {
-    wants = false
-  }
-  if (!wants) return await cors(engine.cfg, req, anthropic ? await anthropicMessages(engine, again) : await engine.chat(again))
+  if (!streamsRequest(kind, text)) return await cors(engine.cfg, req, await routeStream(engine, again, kind))
   const head = new StreamHead()
   const sink = new StreamSink(
     (status, headers) => {
@@ -409,10 +461,14 @@ async function chatStreamed(engine: Engine, req: Request, anthropic: bool): Prom
       sink.cancelled = true
     },
   })
+  sink.writeBytes = (chunk) => {
+    const c = head.ctl
+    if (c !== undefined) c.enqueue(chunk)
+  }
   const p = new Promise<Response>((resolve) => {
     head.resolve = resolve
   })
-  runChat(engine, again, sink, head, anthropic)
+  runChat(engine, again, sink, head, kind)
   return await cors(engine.cfg, req, await p)
 }
 
@@ -435,8 +491,8 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
       const cp = compatPath(p)
       const t0 = performance.now()
       const reqBytes = parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0
-      if (req.method === "POST" && CHAT_PATHS.includes(cp)) return timed(p, req.method, t0, reqBytes, chatStreamed(engine, req, false))
-      if (req.method === "POST" && cp === "/anthropic/v1/messages") return timed(p, req.method, t0, reqBytes, chatStreamed(engine, req, true))
+      const kind = req.method === "POST" ? streamKind(cp) : ""
+      if (kind !== "") return timed(p, req.method, t0, reqBytes, chatStreamed(engine, req, kind))
       return timed(p, req.method, t0, reqBytes, dispatch(engine, ops, req))
     },
     websocket: {

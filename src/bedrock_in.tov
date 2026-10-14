@@ -1,0 +1,829 @@
+// Bedrock Converse and InvokeModel in front of the gateway. A Converse request
+// becomes an OpenAI chat request, so any provider can serve it; the OpenAI answer
+// becomes a Converse response; OpenAI chunks become Bedrock event-stream frames.
+// Anthropic-format invoke bodies reuse the Messages translation in anthropic_in.
+import { Field, fields, elements, find, quote, rawStr, rawNum, build, decodeString } from "./json"
+import { encode, decode } from "./base64"
+import { encodeEventStreamFrame, BedrockEventStreamToOpenAI } from "./streams"
+import { toChatRequest, StreamState } from "./providers/anthropic_in"
+
+const enc = new TextEncoder()
+
+// A field's raw value, or undefined when it is absent or null.
+function present(fs: Field[], key: string): string | undefined {
+  const r = find(fs, key)
+  if (r === undefined || r === "null") return undefined
+  return r
+}
+
+// A counter field as an integer; absent reads as 0.
+function intOf(fs: Field[], key: string): int {
+  return Math.floor(rawNum(fs, key) ?? 0)
+}
+
+// OpenAI finish reasons as Converse stop reasons.
+function converseStop(finish: string | undefined): string {
+  if (finish === "length") return "max_tokens"
+  if (finish === "tool_calls" || finish === "function_call") return "tool_use"
+  if (finish === "content_filter") return "content_filtered"
+  return "end_turn"
+}
+
+// An image block as an OpenAI image_url part; the bytes are base64 in both formats.
+function imagePart(img: Field[]): string throws SyntaxError {
+  const src = try fields(present(img, "source") ?? "{}")
+  const bytes = rawStr(src, "bytes")
+  if (bytes === undefined) return ""
+  const format = rawStr(img, "format") ?? "png"
+  return `{"type":"image_url","image_url":{"url":${quote(`data:image/${format};base64,${bytes}`)}}}`
+}
+
+// A toolUse block as an OpenAI tool call. Arguments are a JSON string, so the
+// input object is quoted as it is.
+function toolCall(use: Field[]): string {
+  const input = present(use, "input") ?? "{}"
+  return `{"id":${quote(rawStr(use, "toolUseId") ?? "")},"type":"function","function":{"name":${quote(rawStr(use, "name") ?? "")},"arguments":${quote(input)}}}`
+}
+
+// A toolResult block as a tool message. Its text and JSON items are joined.
+function toolResult(res: Field[]): string throws SyntaxError {
+  let text = ""
+  const content = present(res, "content")
+  if (content !== undefined) {
+    for (const el of try elements(content)) {
+      const item = try fields(el)
+      const t = rawStr(item, "text")
+      const j = present(item, "json")
+      if (t !== undefined) text += t
+      else if (j !== undefined) text += j
+    }
+  }
+  return `{"role":"tool","tool_call_id":${quote(rawStr(res, "toolUseId") ?? "")},"content":${quote(text)}}`
+}
+
+// One Converse message becomes chat messages. Tool results come first, each as
+// its own tool message, and the turn's remaining content follows them.
+function convertTurn(role: string, content: string, inout out: string[]): void throws SyntaxError {
+  const parts: string[] = []
+  const calls: string[] = []
+  const results: string[] = []
+  for (const el of try elements(content)) {
+    const b = try fields(el)
+    const text = rawStr(b, "text")
+    const image = present(b, "image")
+    const use = present(b, "toolUse")
+    const result = present(b, "toolResult")
+    if (text !== undefined) parts.push(`{"type":"text","text":${quote(text)}}`)
+    else if (image !== undefined) {
+      const part = try imagePart(try fields(image))
+      if (part !== "") parts.push(part)
+    } else if (use !== undefined && role === "assistant") calls.push(toolCall(try fields(use)))
+    else if (result !== undefined) results.push(try toolResult(try fields(result)))
+    // document, video, reasoning and cache-point blocks have no chat equivalent
+  }
+  for (const r of results) out.push(r)
+  if (calls.length > 0) {
+    const text = parts.length > 0 ? `[${parts.join(",")}]` : "null"
+    out.push(`{"role":"assistant","content":${text},"tool_calls":[${calls.join(",")}]}`)
+  } else if (parts.length > 0) {
+    out.push(`{"role":${quote(role)},"content":[${parts.join(",")}]}`)
+  }
+}
+
+// The text of the system blocks, joined.
+function systemText(raw: string): string throws SyntaxError {
+  let s = ""
+  for (const el of try elements(raw)) {
+    const b = try fields(el)
+    const t = rawStr(b, "text")
+    if (t !== undefined) s += t
+  }
+  return s
+}
+
+// Converse tool specs as chat tools; cache points are skipped.
+function toolsJson(raw: string): string throws SyntaxError {
+  const out: string[] = []
+  for (const el of try elements(raw)) {
+    const spec = try fields(el)
+    const ts = present(spec, "toolSpec")
+    if (ts === undefined) continue
+    const t = try fields(ts)
+    const desc = present(t, "description")
+    const sch = try fields(present(t, "inputSchema") ?? "{}")
+    const schema = present(sch, "json") ?? `{"type":"object","properties":{}}`
+    const descPart = desc === undefined ? "" : `,"description":${desc}`
+    out.push(`{"type":"function","function":{"name":${quote(rawStr(t, "name") ?? "")}${descPart},"parameters":${schema}}}`)
+  }
+  return "[" + out.join(",") + "]"
+}
+
+// Converse tool choice as a chat tool_choice; undefined when it has no equivalent.
+function toolChoiceJson(raw: string): string | undefined throws SyntaxError {
+  const fs = try fields(raw)
+  if (find(fs, "auto") !== undefined) return `"auto"`
+  if (find(fs, "any") !== undefined) return `"required"`
+  const tool = present(fs, "tool")
+  if (tool !== undefined) {
+    const tf = try fields(tool)
+    return `{"type":"function","function":{"name":${quote(rawStr(tf, "name") ?? "")}}}`
+  }
+  return undefined
+}
+
+// A Converse request as an OpenAI chat request for the given model.
+export function converseToOpenAI(converseBody: string, model: string, stream: bool): string throws SyntaxError {
+  const fs = try fields(converseBody)
+  let msgs: string[] = []
+  const sysRaw = present(fs, "system")
+  if (sysRaw !== undefined) {
+    const sys = try systemText(sysRaw)
+    if (sys !== "") msgs.push(`{"role":"system","content":${quote(sys)}}`)
+  }
+  const list = present(fs, "messages")
+  if (list !== undefined) {
+    for (const el of try elements(list)) {
+      const m = try fields(el)
+      const content = present(m, "content")
+      if (content !== undefined) try convertTurn(rawStr(m, "role") ?? "user", content, &msgs)
+    }
+  }
+  const parts: string[] = [`"model":${quote(model)}`, `"messages":[${msgs.join(",")}]`]
+  const inf = present(fs, "inferenceConfig")
+  if (inf !== undefined) {
+    const c = try fields(inf)
+    const maxTokens = present(c, "maxTokens")
+    if (maxTokens !== undefined) parts.push(`"max_tokens":${maxTokens}`)
+    const temperature = present(c, "temperature")
+    if (temperature !== undefined) parts.push(`"temperature":${temperature}`)
+    const topP = present(c, "topP")
+    if (topP !== undefined) parts.push(`"top_p":${topP}`)
+    const stop = present(c, "stopSequences")
+    if (stop !== undefined) parts.push(`"stop":${stop}`)
+  }
+  if (stream) {
+    parts.push(`"stream":true`)
+    parts.push(`"stream_options":{"include_usage":true}`)
+  }
+  const tc = present(fs, "toolConfig")
+  if (tc !== undefined) {
+    const t = try fields(tc)
+    const tools = present(t, "tools")
+    const specs = tools === undefined ? "[]" : try toolsJson(tools)
+    if (specs !== "[]") {
+      parts.push(`"tools":${specs}`)
+      const choice = present(t, "toolChoice")
+      if (choice !== undefined) {
+        const c = try toolChoiceJson(choice)
+        if (c !== undefined) parts.push(`"tool_choice":${c}`)
+      }
+    }
+  }
+  return "{" + parts.join(",") + "}"
+}
+
+// Tool input must be a JSON object for Converse; anything else becomes {}.
+function inputObject(args: string): string {
+  if (!args.startsWith("{")) return "{}"
+  try {
+    const v = JSON.parse(args) as {}
+    return args
+  } catch (e) {
+    return "{}"
+  }
+}
+
+// The text of an OpenAI message content: a string, or an array of text parts.
+function contentText(raw: string | undefined): string throws SyntaxError {
+  if (raw === undefined) return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (!raw.startsWith("[")) return ""
+  let s = ""
+  for (const el of try elements(raw)) {
+    const b = try fields(el)
+    if (rawStr(b, "type") === "text") s += rawStr(b, "text") ?? ""
+  }
+  return s
+}
+
+// An OpenAI chat completion as a Converse response.
+export function openAIToConverse(openaiCompletion: string): string throws SyntaxError {
+  const fs = try fields(openaiCompletion)
+  let choice: Field[] = []
+  const choicesRaw = present(fs, "choices")
+  if (choicesRaw !== undefined) {
+    const els = try elements(choicesRaw)
+    const first = els[0]
+    if (first !== undefined) choice = try fields(first)
+  }
+  const msgRaw = present(choice, "message")
+  const msg: Field[] = msgRaw === undefined ? [] : try fields(msgRaw)
+  const blocks: string[] = []
+  const text = try contentText(present(msg, "content"))
+  if (text !== "") blocks.push(`{"text":${quote(text)}}`)
+  const calls = present(msg, "tool_calls")
+  if (calls !== undefined) {
+    for (const el of try elements(calls)) {
+      const tc = try fields(el)
+      const fnRaw = present(tc, "function") ?? "{}"
+      const fn = try fields(fnRaw)
+      const input = inputObject(rawStr(fn, "arguments") ?? "")
+      blocks.push(`{"toolUse":{"toolUseId":${quote(rawStr(tc, "id") ?? "")},"name":${quote(rawStr(fn, "name") ?? "")},"input":${input}}}`)
+    }
+  }
+  const usageRaw = present(fs, "usage")
+  const usage: Field[] = usageRaw === undefined ? [] : try fields(usageRaw)
+  const pt = intOf(usage, "prompt_tokens")
+  const ct = intOf(usage, "completion_tokens")
+  const stop = converseStop(rawStr(choice, "finish_reason"))
+  return `{"output":{"message":{"role":"assistant","content":[${blocks.join(",")}]}},"stopReason":${quote(stop)},` +
+    `"usage":{"inputTokens":${pt},"outputTokens":${ct},"totalTokens":${pt + ct}},"metrics":{"latencyMs":0}}`
+}
+
+// ---- event stream output ----
+
+// One event frame of a ConverseStream response.
+function eventFrame(eventType: string, payload: string): u8[] {
+  const h: Map<string, string> = new Map()
+  h.set(":event-type", eventType)
+  h.set(":content-type", "application/json")
+  h.set(":message-type", "event")
+  return encodeEventStreamFrame(h, payload)
+}
+
+// An exception frame: the stream's way to report an error after it has begun.
+function exceptionFrame(message: string): u8[] {
+  const h: Map<string, string> = new Map()
+  h.set(":exception-type", "internalServerException")
+  h.set(":content-type", "application/json")
+  h.set(":message-type", "exception")
+  return encodeEventStreamFrame(h, `{"message":${quote(message)}}`)
+}
+
+function append(inout out: u8[], more: u8[]): void {
+  for (const b of more) out.push(b)
+}
+
+// Converts OpenAI chunks one at a time into ConverseStream frames. Text is a
+// block with no start event; a tool call's block opens with contentBlockStart.
+export class ConverseStream {
+  private started = false
+  private stopped = false     // messageStop has gone out
+  private done = false        // metadata has gone out, or an error ended the stream
+  private next = 0            // index of the next content block
+  private block = -1          // index of the open content block, or -1
+  private kind = ""           // "text" or "tool" while a block is open
+  private tool = -1           // OpenAI tool_call index of the open tool block
+  private seen: int[] = []    // tool calls already opened; a closed block cannot reopen
+  private finish: string | undefined = undefined
+  private inTokens: int = 0
+  private outTokens: int = 0
+
+  // Frames for one chunk JSON. "[DONE]" ends the message.
+  push(openaiChunkJson: string): u8[] throws SyntaxError {
+    if (this.done) return []
+    if (openaiChunkJson === "[DONE]") return this.end()
+    const fs = try fields(openaiChunkJson)
+    const errRaw = present(fs, "error")
+    if (errRaw !== undefined) {
+      this.done = true
+      const ef = try fields(errRaw)
+      return exceptionFrame(rawStr(ef, "message") ?? "upstream error")
+    }
+    let out: u8[] = []
+    append(&out, this.begin())
+    const usageRaw = present(fs, "usage")
+    if (usageRaw !== undefined) {
+      const uf = try fields(usageRaw)
+      this.inTokens = intOf(uf, "prompt_tokens")
+      this.outTokens = intOf(uf, "completion_tokens")
+    }
+    const choicesRaw = present(fs, "choices")
+    if (choicesRaw !== undefined && !this.stopped) {
+      const els = try elements(choicesRaw)
+      const first = els[0]
+      if (first !== undefined) {
+        const fc = try fields(first)
+        const more = try this.choice(fc)
+        append(&out, more)
+      }
+    }
+    return out
+  }
+
+  // Closes the message and sends metadata. Safe to call more than once.
+  end(): u8[] {
+    if (this.done) return []
+    this.done = true
+    let out: u8[] = this.begin()
+    append(&out, this.stop())
+    const total = this.inTokens + this.outTokens
+    append(&out, eventFrame("metadata", `{"usage":{"inputTokens":${this.inTokens},"outputTokens":${this.outTokens},"totalTokens":${total}},"metrics":{"latencyMs":0}}`))
+    return out
+  }
+
+  private begin(): u8[] {
+    if (this.started) return []
+    this.started = true
+    return eventFrame("messageStart", `{"role":"assistant"}`)
+  }
+
+  private choice(c: Field[]): u8[] throws SyntaxError {
+    let out: u8[] = []
+    const deltaRaw = present(c, "delta")
+    if (deltaRaw !== undefined) {
+      const d = try fields(deltaRaw)
+      const text = rawStr(d, "content")
+      if (text !== undefined && text !== "") append(&out, this.addText(text))
+      const calls = present(d, "tool_calls")
+      if (calls !== undefined) {
+        for (const el of try elements(calls)) {
+          const tc = try fields(el)
+          const fnRaw = present(tc, "function") ?? "{}"
+          const fn = try fields(fnRaw)
+          const index = intOf(tc, "index")
+          append(&out, this.addToolCall(index, rawStr(tc, "id") ?? "", rawStr(fn, "name") ?? "", rawStr(fn, "arguments") ?? ""))
+        }
+      }
+    }
+    const finish = rawStr(c, "finish_reason")
+    if (finish !== undefined) {
+      this.finish = finish
+      append(&out, this.stop())
+    }
+    return out
+  }
+
+  // Sends messageStop once, closing any open block first.
+  private stop(): u8[] {
+    if (this.stopped) return []
+    this.stopped = true
+    let out = this.closeBlock()
+    append(&out, eventFrame("messageStop", `{"stopReason":${quote(converseStop(this.finish))}}`))
+    return out
+  }
+
+  private addText(s: string): u8[] {
+    let out: u8[] = []
+    if (this.kind !== "text") {
+      append(&out, this.closeBlock())
+      this.open("text", -1)
+    }
+    append(&out, eventFrame("contentBlockDelta", `{"contentBlockIndex":${this.block},"delta":{"text":${quote(s)}}}`))
+    return out
+  }
+
+  private addToolCall(index: int, id: string, name: string, args: string): u8[] {
+    let out: u8[] = []
+    if (this.kind !== "tool" || this.tool !== index) {
+      // a call seen again after its block closed has nowhere to go; it is dropped
+      if (this.seen.includes(index)) return out
+      append(&out, this.closeBlock())
+      this.seen.push(index)
+      this.open("tool", index)
+      append(&out, eventFrame("contentBlockStart", `{"contentBlockIndex":${this.block},"start":{"toolUse":{"toolUseId":${quote(id)},"name":${quote(name)}}}}`))
+    }
+    if (args !== "") append(&out, eventFrame("contentBlockDelta", `{"contentBlockIndex":${this.block},"delta":{"toolUse":{"input":${quote(args)}}}}`))
+    return out
+  }
+
+  private open(kind: string, tool: int): void {
+    this.block = this.next
+    this.next += 1
+    this.kind = kind
+    this.tool = tool
+  }
+
+  private closeBlock(): u8[] {
+    if (this.block < 0) return []
+    const out = eventFrame("contentBlockStop", `{"contentBlockIndex":${this.block}}`)
+    this.block = -1
+    this.kind = ""
+    this.tool = -1
+    return out
+  }
+}
+
+// Anthropic-format Messages events, one per event-stream frame. Bedrock carries
+// each event's JSON base64 encoded in the "bytes" member of a chunk.
+export class InvokeStream {
+  private state: StreamState
+
+  constructor(model: string) {
+    this.state = new StreamState(model)
+  }
+
+  push(openaiChunkJson: string): u8[] throws SyntaxError {
+    const sse = try this.state.push(openaiChunkJson)
+    return invokeFrames(sse)
+  }
+
+  end(): u8[] {
+    return invokeFrames(this.state.end())
+  }
+}
+
+function invokeFrames(sse: string): u8[] {
+  let out: u8[] = []
+  for (const ev of sse.split("\n\n")) {
+    for (const line of ev.split("\n")) {
+      if (!line.startsWith("data: ")) continue
+      const json = line.slice(6)
+      append(&out, eventFrame("chunk", `{"bytes":${quote(encode(enc.encode(json)))}}`))
+    }
+  }
+  return out
+}
+
+// The data lines of a complete OpenAI SSE body, each as one chunk JSON.
+function sseChunks(openaiSse: string): string[] {
+  const out: string[] = []
+  for (const line of openaiSse.split("\n")) {
+    if (!line.startsWith("data:")) continue
+    const payload = line.slice(5).trim()
+    if (payload !== "") out.push(payload)
+  }
+  return out
+}
+
+// A complete OpenAI SSE body as ConverseStream frames, for a non-streaming client.
+export function converseFramesFromSse(openaiSse: string): u8[] {
+  const s = new ConverseStream()
+  let out: u8[] = []
+  for (const c of sseChunks(openaiSse)) {
+    try {
+      const f = try s.push(c)
+      append(&out, f)
+    } catch (e) {
+      // a malformed chunk is skipped
+    }
+  }
+  append(&out, s.end())
+  return out
+}
+
+// A complete OpenAI SSE body as InvokeStream frames.
+export function invokeFramesFromSse(openaiSse: string, model: string): u8[] {
+  const s = new InvokeStream(model)
+  let out: u8[] = []
+  for (const c of sseChunks(openaiSse)) {
+    try {
+      const f = try s.push(c)
+      append(&out, f)
+    } catch (e) {
+      // a malformed chunk is skipped
+    }
+  }
+  append(&out, s.end())
+  return out
+}
+
+// ---- Anthropic-format invoke bodies ----
+
+// An Anthropic InvokeModel body as a chat request. Bedrock sends anthropic_version
+// and no model or stream fields, so those are replaced here.
+function invokeChat(body: string, model: string, stream: bool): string throws SyntaxError {
+  const fs = try fields(body)
+  const kept = fs.filter((f) => f.key !== "anthropic_version" && f.key !== "model" && f.key !== "stream")
+  if (stream) kept.push({ key: "stream", raw: "true" })
+  return try toChatRequest(build(kept), model)
+}
+
+export function invokeToOpenAI(body: string, model: string): string throws SyntaxError {
+  return try invokeChat(body, model, false)
+}
+
+// The same request for the invoke-with-response-stream route.
+export function invokeStreamToOpenAI(body: string, model: string): string throws SyntaxError {
+  return try invokeChat(body, model, true)
+}
+
+// ---- count tokens ----
+
+// A Bedrock CountTokens body (input.converse or input.invokeModel) as a chat
+// request with no model, for the token estimate.
+export function countTokensToRaiju(body: string): string throws SyntaxError {
+  const fs = try fields(body)
+  const input = try fields(present(fs, "input") ?? "{}")
+  const conv = present(input, "converse")
+  if (conv !== undefined) return try converseToOpenAI(conv, "", false)
+  const inv = present(input, "invokeModel")
+  if (inv !== undefined) {
+    const ifs = try fields(inv)
+    const raw = find(ifs, "body") ?? "{}"
+    const inner = raw.startsWith("\"") ? try decodeString(raw) : raw
+    return try invokeChat(inner, "", false)
+  }
+  throw new SyntaxError("count-tokens needs input.converse or input.invokeModel")
+}
+
+export function countTokensResponse(n: int): string {
+  return `{"inputTokens":${n}}`
+}
+
+// ---- tests ----
+
+// Test-only event-stream reader. Checks both CRCs and returns each frame's
+// event name and payload, so tests see what a Bedrock client sees.
+type TestFrame = { name: string, payload: string }
+
+function crcTable(): int[] {
+  const t: int[] = []
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) {
+      if ((c & 1) === 1) c = 0xedb88320 ^ (c >> 1)
+      else c = c >> 1
+    }
+    t.push(c)
+  }
+  return t
+}
+
+const TEST_CRC = crcTable()
+
+function crcOf(b: u8[]): int {
+  let crc = 0xffffffff
+  for (const x of b) crc = TEST_CRC[(crc ^ int(x)) & 0xff]! ^ (crc >> 8)
+  return crc ^ 0xffffffff
+}
+
+function u32At(b: u8[], at: int): int {
+  return (int(b[at]!) << 24) | (int(b[at + 1]!) << 16) | (int(b[at + 2]!) << 8) | int(b[at + 3]!)
+}
+
+// String-valued headers only, which is all this module writes.
+function readHeaders(b: u8[]): Map<string, string> throws SyntaxError | RangeError | TypeError {
+  const m: Map<string, string> = new Map()
+  const dec = try new TextDecoder()
+  let i = 0
+  while (i < b.length) {
+    const nl = int(b[i]!)
+    const name = try dec.decode(b.slice(i + 1, i + 1 + nl))
+    i += 1 + nl
+    const vl = int(b[i + 1]!) * 256 + int(b[i + 2]!)
+    const value = try dec.decode(b.slice(i + 3, i + 3 + vl))
+    i += 3 + vl
+    m.set(name, value)
+  }
+  return m
+}
+
+function readFrames(b: u8[]): TestFrame[] throws SyntaxError | RangeError | TypeError {
+  const out: TestFrame[] = []
+  const dec = try new TextDecoder()
+  let at = 0
+  while (at < b.length) {
+    const total = u32At(b, at)
+    const hlen = u32At(b, at + 4)
+    if (crcOf(b.slice(at, at + 8)) !== u32At(b, at + 8)) throw new SyntaxError("prelude CRC mismatch")
+    if (crcOf(b.slice(at, at + total - 4)) !== u32At(b, at + total - 4)) throw new SyntaxError("message CRC mismatch")
+    const h = try readHeaders(b.slice(at + 12, at + 12 + hlen))
+    const payload = try dec.decode(b.slice(at + 12 + hlen, at + total - 4))
+    out.push({ name: h.get(":event-type") ?? h.get(":exception-type") ?? "", payload: payload })
+    at += total
+  }
+  return out
+}
+
+function namesOf(frames: TestFrame[]): string[] {
+  return frames.map((f) => f.name)
+}
+
+function converseFrames(chunks: string[]): u8[] throws SyntaxError {
+  const s = new ConverseStream()
+  let out: u8[] = []
+  for (const c of chunks) {
+    const f = try s.push(c)
+    append(&out, f)
+  }
+  append(&out, s.end())
+  return out
+}
+
+// The bytes fed to the streams.tov frame parser in pieces of n bytes.
+function decodeWithStreams(bytes: u8[], n: int): string {
+  const conv = new BedrockEventStreamToOpenAI("gpt-4o", true)
+  let out = ""
+  for (let i = 0; i < bytes.length; i += n) out += conv.push(bytes.slice(i, i + n))
+  return out + conv.end()
+}
+
+test("converse system, text and inference config", () => {
+  const raw = `{"system":[{"text":"be brief"}],"messages":[{"role":"user","content":[{"text":"hi"}]}],"inferenceConfig":{"maxTokens":50,"temperature":0.2,"topP":0.9,"stopSequences":["END"]}}`
+  expect(try converseToOpenAI(raw, "gpt-4o", false)).toBe(`{"model":"gpt-4o","messages":[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"hi"}]}],"max_tokens":50,"temperature":0.2,"top_p":0.9,"stop":["END"]}`)
+  const s = try converseToOpenAI(`{"system":[{"text":"one"},{"cachePoint":{"type":"default"}},{"text":"two"}],"messages":[]}`, "m", true)
+  expect(s).toBe(`{"model":"m","messages":[{"role":"system","content":"onetwo"}],"stream":true,"stream_options":{"include_usage":true}}`)
+  expect(try converseToOpenAI(`{}`, "m", false)).toBe(`{"model":"m","messages":[]}`)
+})
+
+test("converse image blocks become image_url data URLs", () => {
+  const raw = `{"messages":[{"role":"user","content":[{"image":{"format":"png","source":{"bytes":"AAAA"}}},{"text":"what is this"},{"image":{"format":"jpeg","source":{"bytes":"/9j/"}}}]}]}`
+  expect(try converseToOpenAI(raw, "m", false)).toBe(`{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/"}}]}]}`)
+})
+
+test("tool use round trip between Converse and chat", () => {
+  const raw = `{"messages":[
+    {"role":"user","content":[{"text":"weather in Paris?"}]},
+    {"role":"assistant","content":[{"text":"Checking."},{"toolUse":{"toolUseId":"tu1","name":"weather","input":{"city":"Paris"}}}]},
+    {"role":"user","content":[{"toolResult":{"toolUseId":"tu1","content":[{"json":{"temp":18}}],"status":"success"}},{"text":"thanks"}]}],
+    "toolConfig":{"tools":[{"toolSpec":{"name":"weather","description":"look up","inputSchema":{"json":{"type":"object","properties":{"city":{"type":"string"}}}}}}],"toolChoice":{"auto":{}}}}`
+  const chat = try converseToOpenAI(raw, "gpt-4o", false)
+  expect(chat).toBe(`{"model":"gpt-4o","messages":[` +
+    `{"role":"user","content":[{"type":"text","text":"weather in Paris?"}]},` +
+    `{"role":"assistant","content":[{"type":"text","text":"Checking."}],"tool_calls":[{"id":"tu1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Paris\\"}"}}]},` +
+    `{"role":"tool","tool_call_id":"tu1","content":"{\\"temp\\":18}"},` +
+    `{"role":"user","content":[{"type":"text","text":"thanks"}]}],` +
+    `"tools":[{"type":"function","function":{"name":"weather","description":"look up","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"tool_choice":"auto"}`)
+  const answer = `{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"Looking.","tool_calls":[{"id":"tu2","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Rome\\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":30,"completion_tokens":12,"total_tokens":42}}`
+  expect(try openAIToConverse(answer)).toBe(`{"output":{"message":{"role":"assistant","content":[{"text":"Looking."},{"toolUse":{"toolUseId":"tu2","name":"weather","input":{"city":"Rome"}}}]}},"stopReason":"tool_use","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42},"metrics":{"latencyMs":0}}`)
+})
+
+test("tool choice variants and empty tool lists", () => {
+  const tools = `"toolConfig":{"tools":[{"toolSpec":{"name":"f","inputSchema":{"json":{"type":"object"}}}}],"toolChoice":`
+  expect(try converseToOpenAI(`{"messages":[],${tools}{"any":{}}}}`, "m", false)).toBe(`{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":"required"}`)
+  expect(try converseToOpenAI(`{"messages":[],${tools}{"tool":{"name":"f"}}}}`, "m", false)).toBe(`{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"f"}}}`)
+  expect(try converseToOpenAI(`{"messages":[],"toolConfig":{"tools":[]}}`, "m", false)).toBe(`{"model":"m","messages":[]}`)
+})
+
+test("a tool result with no content and an assistant turn with only tool calls", () => {
+  const raw = `{"messages":[{"role":"assistant","content":[{"toolUse":{"toolUseId":"a","name":"n","input":{}}}]},{"role":"user","content":[{"toolResult":{"toolUseId":"a"}}]}]}`
+  expect(try converseToOpenAI(raw, "m", false)).toBe(`{"model":"m","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"n","arguments":"{}"}}]},{"role":"tool","tool_call_id":"a","content":""}]}`)
+})
+
+test("openAIToConverse maps text, usage and stop reasons", () => {
+  const text = try openAIToConverse(`{"id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`)
+  expect(text).toBe(`{"output":{"message":{"role":"assistant","content":[{"text":"Hello"}]}},"stopReason":"end_turn","usage":{"inputTokens":11,"outputTokens":2,"totalTokens":13},"metrics":{"latencyMs":0}}`)
+  const reasons = [["length", "max_tokens"], ["content_filter", "content_filtered"], ["stop", "end_turn"]]
+  for (const r of reasons) {
+    const o = try openAIToConverse(`{"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"${r[0]!}"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+    expect(o.includes(`"stopReason":"${r[1]!}"`)).toBe(true)
+  }
+  const empty = try openAIToConverse(`{"choices":[{"index":0,"message":{"role":"assistant","content":null},"finish_reason":null}]}`)
+  expect(empty).toBe(`{"output":{"message":{"role":"assistant","content":[]}},"stopReason":"end_turn","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0},"metrics":{"latencyMs":0}}`)
+})
+
+test("invalid tool arguments become an empty input object", () => {
+  const bad = try openAIToConverse(`{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":"{not json"}},{"id":"b","type":"function","function":{"name":"g","arguments":"{\\"x\\":1} trailing"}},{"id":"c","type":"function","function":{"name":"h","arguments":"[1]"}}]},"finish_reason":"tool_calls"}]}`)
+  expect(bad.includes(`{"toolUse":{"toolUseId":"a","name":"f","input":{}}}`)).toBe(true)
+  expect(bad.includes(`{"toolUse":{"toolUseId":"b","name":"g","input":{}}}`)).toBe(true)
+  expect(bad.includes(`{"toolUse":{"toolUseId":"c","name":"h","input":{}}}`)).toBe(true)
+  expect(bad.includes(`"text"`)).toBe(false)
+})
+
+test("ConverseStream text frames decode with exact payloads", () => {
+  const bytes = try converseFrames([
+    `{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+    `{"id":"c1","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}`,
+    `{"id":"c1","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}`,
+    `{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+    `{"id":"c1","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`,
+    "[DONE]",
+  ])
+  const frames = try readFrames(bytes)
+  expect(namesOf(frames)).toEqual(["messageStart", "contentBlockDelta", "contentBlockDelta", "contentBlockStop", "messageStop", "metadata"])
+  expect(frames[0]!.payload).toBe(`{"role":"assistant"}`)
+  expect(frames[1]!.payload).toBe(`{"contentBlockIndex":0,"delta":{"text":"Hel"}}`)
+  expect(frames[2]!.payload).toBe(`{"contentBlockIndex":0,"delta":{"text":"lo"}}`)
+  expect(frames[3]!.payload).toBe(`{"contentBlockIndex":0}`)
+  expect(frames[4]!.payload).toBe(`{"stopReason":"end_turn"}`)
+  expect(frames[5]!.payload).toBe(`{"usage":{"inputTokens":5,"outputTokens":2,"totalTokens":7},"metrics":{"latencyMs":0}}`)
+  const out = decodeWithStreams(bytes, 5)
+  expect(out.includes(`"content":"Hel"`)).toBe(true)
+  expect(out.includes(`"content":"lo"`)).toBe(true)
+  expect(out.includes(`"finish_reason":"stop"`)).toBe(true)
+  expect(out.includes(`"prompt_tokens":5`)).toBe(true)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("ConverseStream tool calls open blocks and close text first", () => {
+  const bytes = try converseFrames([
+    `{"id":"c2","choices":[{"index":0,"delta":{"content":"Let me look."},"finish_reason":null}]}`,
+    `{"id":"c2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"look","arguments":""}}]},"finish_reason":null}]}`,
+    `{"id":"c2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"q\\":"}}]},"finish_reason":null}]}`,
+    `{"id":"c2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"cat\\"}"}}]},"finish_reason":null}]}`,
+    `{"id":"c2","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"t2","type":"function","function":{"name":"time","arguments":"{}"}}]},"finish_reason":null}]}`,
+    `{"id":"c2","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+    `{"id":"c2","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":9,"total_tokens":17}}`,
+    "[DONE]",
+  ])
+  const frames = try readFrames(bytes)
+  expect(namesOf(frames)).toEqual([
+    "messageStart",
+    "contentBlockDelta", "contentBlockStop",
+    "contentBlockStart", "contentBlockDelta", "contentBlockDelta", "contentBlockStop",
+    "contentBlockStart", "contentBlockDelta", "contentBlockStop",
+    "messageStop", "metadata",
+  ])
+  expect(frames[3]!.payload).toBe(`{"contentBlockIndex":1,"start":{"toolUse":{"toolUseId":"t1","name":"look"}}}`)
+  expect(frames[4]!.payload).toBe(`{"contentBlockIndex":1,"delta":{"toolUse":{"input":"{\\"q\\":"}}}`)
+  expect(frames[7]!.payload).toBe(`{"contentBlockIndex":2,"start":{"toolUse":{"toolUseId":"t2","name":"time"}}}`)
+  expect(frames[10]!.payload).toBe(`{"stopReason":"tool_use"}`)
+  const out = decodeWithStreams(bytes, 7)
+  expect(out.includes(`"name":"look"`)).toBe(true)
+  expect(out.includes(`"name":"time"`)).toBe(true)
+  expect(out.includes(`"finish_reason":"tool_calls"`)).toBe(true)
+  expect(out.includes(`"arguments":"{\\"q\\":"`)).toBe(true)
+})
+
+test("ConverseStream error chunks become exception frames and end the stream", () => {
+  const s = new ConverseStream()
+  const f = try s.push(`{"error":{"message":"overloaded","type":"server_error"}}`)
+  const frames = try readFrames(f)
+  expect(frames.length).toBe(1)
+  expect(frames[0]!.name).toBe("internalServerException")
+  expect(frames[0]!.payload).toBe(`{"message":"overloaded"}`)
+  expect(s.end().length).toBe(0)
+  expect((try s.push(`{"choices":[]}`)).length).toBe(0)
+})
+
+test("ConverseStream with no chunks still ends cleanly and once", () => {
+  const s = new ConverseStream()
+  const frames = try readFrames(s.end())
+  expect(namesOf(frames)).toEqual(["messageStart", "messageStop", "metadata"])
+  expect(frames[1]!.payload).toBe(`{"stopReason":"end_turn"}`)
+  expect(s.end().length).toBe(0)
+})
+
+test("a flipped byte fails the frame CRC in the streams.tov parser", () => {
+  const bytes = try converseFrames([`{"choices":[{"index":0,"delta":{"content":"abc"},"finish_reason":"stop"}]}`, "[DONE]"])
+  const clean = decodeWithStreams(bytes, 64)
+  expect(clean.includes(`"content":"abc"`)).toBe(true)
+  const bad: u8[] = bytes.slice(0)
+  bad[30] = u8(int(bad[30]!) ^ 1)
+  expect(decodeWithStreams(bad, 64).includes("bad message CRC")).toBe(true)
+  let threw = false
+  try {
+    readFrames(bad)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("invoke bodies become chat requests without anthropic_version", () => {
+  const body = `{"anthropic_version":"bedrock-2023-05-31","max_tokens":20,"system":"be brief","messages":[{"role":"user","content":"hi"}],"tools":[{"name":"look","input_schema":{"type":"object"}}]}`
+  expect(try invokeToOpenAI(body, "claude-x")).toBe(`{"model":"claude-x","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}],"max_tokens":20,"tools":[{"type":"function","function":{"name":"look","parameters":{"type":"object"}}}]}`)
+  const streamed = try invokeStreamToOpenAI(body, "claude-x")
+  expect(streamed.includes(`"stream":true,"stream_options":{"include_usage":true}`)).toBe(true)
+})
+
+test("invoke stream frames carry Messages events base64 encoded", () => {
+  const s = new InvokeStream("claude-x")
+  let bytes: u8[] = []
+  const chunks = [
+    `{"id":"c9","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}`,
+    `{"id":"c9","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}}`,
+    "[DONE]",
+  ]
+  for (const c of chunks) {
+    const f = try s.push(c)
+    append(&bytes, f)
+  }
+  append(&bytes, s.end())
+  const frames = try readFrames(bytes)
+  expect(frames.length).toBe(6)
+  const types: string[] = []
+  for (const f of frames) {
+    expect(f.name).toBe("chunk")
+    const outer = try fields(f.payload)
+    const b64 = rawStr(outer, "bytes") ?? ""
+    const json = try new TextDecoder().decode(try decode(b64))
+    const ev = try fields(json)
+    types.push(rawStr(ev, "type") ?? "")
+    if (rawStr(ev, "type") === "message_delta") expect(json.includes(`"input_tokens":4,"output_tokens":1`)).toBe(true)
+  }
+  expect(types).toEqual(["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"])
+})
+
+test("count-tokens bodies become chat requests and a count response", () => {
+  const conv = `{"input":{"converse":{"system":[{"text":"be brief"}],"messages":[{"role":"user","content":[{"text":"hi"}]}]}}}`
+  expect(try countTokensToRaiju(conv)).toBe(`{"model":"","messages":[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+  const inv = `{"input":{"invokeModel":{"body":"{\\"anthropic_version\\":\\"bedrock-2023-05-31\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"hi\\"}]}"}}}`
+  expect(try countTokensToRaiju(inv)).toBe(`{"model":"","messages":[{"role":"user","content":"hi"}]}`)
+  expect(countTokensResponse(7)).toBe(`{"inputTokens":7}`)
+  let threw = false
+  try {
+    countTokensToRaiju(`{"input":{}}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("a buffered OpenAI SSE body converts to Converse and invoke frames", () => {
+  const sse = `data: {"id":"c3","choices":[{"index":0,"delta":{"role":"assistant","content":"Ok"},"finish_reason":null}]}
+
+data: {"id":"c3","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}
+
+data: [DONE]
+
+`
+  const frames = try readFrames(converseFramesFromSse(sse))
+  expect(namesOf(frames)).toEqual(["messageStart", "contentBlockDelta", "contentBlockStop", "messageStop", "metadata"])
+  expect(frames[3]!.payload).toBe(`{"stopReason":"max_tokens"}`)
+  expect(frames[4]!.payload).toBe(`{"usage":{"inputTokens":2,"outputTokens":3,"totalTokens":5},"metrics":{"latencyMs":0}}`)
+  const inv = try readFrames(invokeFramesFromSse(sse, "claude-x"))
+  expect(inv.length).toBe(6)
+  expect(inv[0]!.name).toBe("chunk")
+})

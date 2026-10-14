@@ -1,0 +1,702 @@
+// Google GenAI SDK routes (generateContent) in front of the gateway: a GenAI request
+// becomes an OpenAI chat request, and the OpenAI answer becomes a GenerateContentResponse.
+// Function arguments and responses are JSON, so they stay raw text where possible.
+import { Field, fields, elements, find, quote, rawStr, rawBool, rawNum, decodeString, build } from "./json"
+import { newId } from "./schemas"
+
+// A field's raw value, or undefined when it is absent or null.
+function present(fs: Field[], key: string): string | undefined {
+  const r = find(fs, key)
+  if (r === undefined || r === "null") return undefined
+  return r
+}
+
+// A field under its camelCase name or its snake_case name; the REST API takes both.
+function either(fs: Field[], camel: string, snake: string): string | undefined {
+  return present(fs, camel) ?? present(fs, snake)
+}
+
+// The text of a parts array, thoughts left out.
+function partsText(parts: string): string throws SyntaxError {
+  let out = ""
+  for (const el of try elements(parts)) {
+    const p = try fields(el)
+    if (rawBool(p, "thought") !== true) out += rawStr(p, "text") ?? ""
+  }
+  return out
+}
+
+// The text of a Content value (systemInstruction, embedding content).
+function contentText(content: string | undefined): string throws SyntaxError {
+  if (content === undefined) return ""
+  const parts = present(try fields(content), "parts")
+  if (parts === undefined) return ""
+  return try partsText(parts)
+}
+
+// The text of an OpenAI message content: a string, or an array of text parts.
+function messageText(raw: string | undefined): string throws SyntaxError {
+  if (raw === undefined) return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (!raw.startsWith("[")) return ""
+  let out = ""
+  for (const el of try elements(raw)) {
+    const b = try fields(el)
+    if (rawStr(b, "type") === "text") out += rawStr(b, "text") ?? ""
+  }
+  return out
+}
+
+// Copies one raw field into the request under its OpenAI name, when it is set.
+function copyField(inout out: string[], src: Field[], from: string, to: string): void {
+  const v = present(src, from)
+  if (v !== undefined) out.push(`${quote(to)}:${v}`)
+}
+
+// An inline blob or file as an image_url part; inline data arrives as a data URL.
+function mediaPart(url: string): string {
+  return `{"type":"image_url","image_url":{"url":${quote(url)}}}`
+}
+
+// Gemini matches a function response to its call by name, OpenAI by id. Calls are
+// answered in order, so a response takes the earliest open call with its name.
+class CallIds {
+  open: { name: string, id: string }[] = []
+
+  issue(name: string): string {
+    const id = newId("call_")
+    this.open.push({ name: name, id: id })
+    return id
+  }
+
+  answer(name: string): string {
+    for (let i = 0; i < this.open.length; i++) {
+      const c = this.open[i]!
+      if (c.name === name) {
+        this.open = this.open.slice(0, i).concat(this.open.slice(i + 1))
+        return c.id
+      }
+    }
+    return newId("call_")
+  }
+}
+
+// The text of a function response: the value under a lone "content" or "output" key
+// (the shape the gateway's Gemini translator writes), or else the response object.
+function responseText(raw: string): string throws SyntaxError {
+  const rf = try fields(raw)
+  if (rf.length === 1) {
+    const s = rawStr(rf, "content") ?? rawStr(rf, "output")
+    if (s !== undefined) return s
+  }
+  return raw
+}
+
+// Content of one OpenAI message: a plain string when there is only text, content
+// parts when there is media.
+function contentJson(pieces: string[], texts: string[], media: bool): string {
+  if (media) return `[${pieces.join(",")}]`
+  return quote(texts.join(""))
+}
+
+// One Gemini content becomes OpenAI messages. Function responses come first as tool
+// messages, then the turn's text and media, and its function calls go on an assistant message.
+function convertContent(role: string, parts: string, calls: CallIds, inout out: string[]): void throws SyntaxError {
+  const pieces: string[] = []
+  const texts: string[] = []
+  const toolCalls: string[] = []
+  const results: string[] = []
+  let media = false
+  for (const el of try elements(parts)) {
+    const p = try fields(el)
+    if (rawBool(p, "thought") === true) continue
+    const text = rawStr(p, "text")
+    if (text !== undefined) {
+      pieces.push(`{"type":"text","text":${quote(text)}}`)
+      texts.push(text)
+      continue
+    }
+    const inline = either(p, "inlineData", "inline_data")
+    if (inline !== undefined) {
+      const blob = try fields(inline)
+      const mime = rawStr(blob, "mimeType") ?? rawStr(blob, "mime_type") ?? ""
+      const data = rawStr(blob, "data") ?? ""
+      pieces.push(mediaPart("data:" + mime + ";base64," + data))
+      media = true
+      continue
+    }
+    const file = either(p, "fileData", "file_data")
+    if (file !== undefined) {
+      const f = try fields(file)
+      pieces.push(mediaPart(rawStr(f, "fileUri") ?? rawStr(f, "file_uri") ?? ""))
+      media = true
+      continue
+    }
+    const call = either(p, "functionCall", "function_call")
+    if (call !== undefined) {
+      const f = try fields(call)
+      const name = rawStr(f, "name") ?? ""
+      const args = present(f, "args") ?? "{}"
+      toolCalls.push(`{"id":${quote(calls.issue(name))},"type":"function","function":{"name":${quote(name)},"arguments":${quote(args)}}}`)
+      continue
+    }
+    const reply = either(p, "functionResponse", "function_response")
+    if (reply !== undefined) {
+      const f = try fields(reply)
+      const id = calls.answer(rawStr(f, "name") ?? "")
+      const text = try responseText(present(f, "response") ?? "{}")
+      results.push(`{"role":"tool","tool_call_id":${quote(id)},"content":${quote(text)}}`)
+    }
+    // executable code and code results have no OpenAI form and are dropped
+  }
+  for (const r of results) out.push(r)
+  if (toolCalls.length > 0) {
+    const content = pieces.length > 0 ? contentJson(pieces, texts, media) : "null"
+    out.push(`{"role":"assistant","content":${content},"tool_calls":[${toolCalls.join(",")}]}`)
+  } else if (pieces.length > 0) {
+    out.push(`{"role":${quote(role)},"content":${contentJson(pieces, texts, media)}}`)
+  }
+}
+
+// Gemini writes schema types in capitals (OBJECT, STRING); JSON Schema wants lower case.
+function lowerType(t: string): string {
+  if (t === "STRING") return "string"
+  if (t === "NUMBER") return "number"
+  if (t === "INTEGER") return "integer"
+  if (t === "BOOLEAN") return "boolean"
+  if (t === "ARRAY") return "array"
+  if (t === "OBJECT") return "object"
+  if (t === "NULL") return "null"
+  return t
+}
+
+// Lower-cases the "type" keywords of a schema, at any depth. Only keys named "type"
+// with a string value change, so a property named "type" is left alone.
+function lowerSchema(raw: string): string throws SyntaxError {
+  if (raw.startsWith("[")) {
+    const out: string[] = []
+    for (const el of try elements(raw)) out.push(try lowerSchema(el))
+    return "[" + out.join(",") + "]"
+  }
+  if (!raw.startsWith("{")) return raw
+  const members = try fields(raw)
+  const out: Field[] = []
+  for (const f of members) {
+    if (f.key === "type" && f.raw.startsWith("\"")) out.push({ key: f.key, raw: quote(lowerType(try decodeString(f.raw))) })
+    else if (f.raw.startsWith("{") || f.raw.startsWith("[")) out.push({ key: f.key, raw: try lowerSchema(f.raw) })
+    else out.push(f)
+  }
+  return build(out)
+}
+
+// functionDeclarations as OpenAI function tools, one entry per declaration.
+function toolEntries(raw: string): string[] throws SyntaxError {
+  const out: string[] = []
+  for (const el of try elements(raw)) {
+    const group = try fields(el)
+    const decls = present(group, "functionDeclarations")
+    if (decls === undefined) continue
+    for (const d of try elements(decls)) {
+      const f = try fields(d)
+      const desc = present(f, "description")
+      const descPart = desc === undefined ? "" : `,"description":${desc}`
+      let params = `{"type":"object","properties":{}}`
+      const schema = present(f, "parameters") ?? present(f, "parametersJsonSchema")
+      if (schema !== undefined) params = try lowerSchema(schema)
+      out.push(`{"type":"function","function":{"name":${quote(rawStr(f, "name") ?? "")}${descPart},"parameters":${params}}}`)
+    }
+  }
+  return out
+}
+
+// toolConfig.functionCallingConfig as tool_choice. ANY with one allowed name pins that tool.
+function toolChoice(raw: string): string | undefined throws SyntaxError {
+  const cfg = present(try fields(raw), "functionCallingConfig")
+  if (cfg === undefined) return undefined
+  const c = try fields(cfg)
+  const mode = rawStr(c, "mode")
+  if (mode === "AUTO") return `"auto"`
+  if (mode === "NONE") return `"none"`
+  if (mode === "ANY") {
+    const names = present(c, "allowedFunctionNames")
+    if (names !== undefined) {
+      const els = try elements(names)
+      if (els.length === 1) return `{"type":"function","function":{"name":${quote(try decodeString(els[0]!))}}}`
+    }
+    return `"required"`
+  }
+  return undefined
+}
+
+// A generateContent request as an OpenAI chat request for `model`.
+export function generateToOpenAI(geminiBody: string, model: string, stream: bool): string throws SyntaxError {
+  const fs = try fields(geminiBody)
+  let msgs: string[] = []
+  const sys = try contentText(either(fs, "systemInstruction", "system_instruction"))
+  if (sys !== "") msgs.push(`{"role":"system","content":${quote(sys)}}`)
+  const calls = new CallIds()
+  const list = present(fs, "contents")
+  if (list !== undefined) {
+    for (const el of try elements(list)) {
+      const c = try fields(el)
+      const parts = present(c, "parts")
+      if (parts === undefined) continue
+      const role = rawStr(c, "role") === "model" ? "assistant" : "user"
+      try convertContent(role, parts, calls, &msgs)
+    }
+  }
+  let out: string[] = [`"model":${quote(model)}`, `"messages":[${msgs.join(",")}]`]
+  const gc = present(fs, "generationConfig")
+  if (gc !== undefined) {
+    const g = try fields(gc)
+    copyField(&out, g, "temperature", "temperature")
+    copyField(&out, g, "topP", "top_p")
+    copyField(&out, g, "maxOutputTokens", "max_tokens")
+    copyField(&out, g, "stopSequences", "stop")
+    copyField(&out, g, "candidateCount", "n")
+    copyField(&out, g, "presencePenalty", "presence_penalty")
+    copyField(&out, g, "frequencyPenalty", "frequency_penalty")
+    copyField(&out, g, "seed", "seed")
+    if (rawStr(g, "responseMimeType") === "application/json") out.push(`"response_format":{"type":"json_object"}`)
+  }
+  const toolsRaw = present(fs, "tools")
+  const tools: string[] = toolsRaw === undefined ? [] : try toolEntries(toolsRaw)
+  if (tools.length > 0) {
+    out.push(`"tools":[${tools.join(",")}]`)
+    const tc = present(fs, "toolConfig")
+    if (tc !== undefined) {
+      const choice = try toolChoice(tc)
+      if (choice !== undefined) out.push(`"tool_choice":${choice}`)
+    }
+  }
+  if (stream) {
+    out.push(`"stream":true`)
+    out.push(`"stream_options":{"include_usage":true}`)
+  }
+  return "{" + out.join(",") + "}"
+}
+
+// Tool arguments are a JSON string; Gemini wants the object, or {} when it is not one.
+function argsObject(args: string): string {
+  try {
+    const fs = fields(args)
+    const v = JSON.parse(args) as {}
+    return args
+  } catch (e) {
+    return "{}"
+  }
+}
+
+// OpenAI finish reasons as GenerateContent finish reasons.
+function finishReason(finish: string | undefined): string {
+  if (finish === "length") return "MAX_TOKENS"
+  if (finish === "content_filter") return "SAFETY"
+  return "STOP"
+}
+
+// The first choice of an OpenAI response, as fields.
+function firstChoice(fs: Field[]): Field[] throws SyntaxError {
+  const choices = present(fs, "choices")
+  if (choices === undefined) return []
+  const first = (try elements(choices))[0]
+  if (first === undefined) return []
+  return try fields(first)
+}
+
+// An OpenAI chat completion as a GenerateContentResponse with one candidate.
+export function openAIToGenerate(openaiCompletion: string, model: string): string throws SyntaxError {
+  const fs = try fields(openaiCompletion)
+  const choice = try firstChoice(fs)
+  const msgRaw = present(choice, "message")
+  const msg: Field[] = msgRaw === undefined ? [] : try fields(msgRaw)
+  const parts: string[] = []
+  const text = try messageText(present(msg, "content"))
+  if (text !== "") parts.push(`{"text":${quote(text)}}`)
+  const tcs = present(msg, "tool_calls")
+  if (tcs !== undefined) {
+    for (const el of try elements(tcs)) {
+      const tc = try fields(el)
+      const fn = try fields(present(tc, "function") ?? "{}")
+      parts.push(`{"functionCall":{"name":${quote(rawStr(fn, "name") ?? "")},"args":${argsObject(rawStr(fn, "arguments") ?? "")}}}`)
+    }
+  }
+  const usageRaw = present(fs, "usage")
+  const usage: Field[] = usageRaw === undefined ? [] : try fields(usageRaw)
+  const pt = Math.floor(rawNum(usage, "prompt_tokens") ?? 0)
+  const ct = Math.floor(rawNum(usage, "completion_tokens") ?? 0)
+  const tt = Math.floor(rawNum(usage, "total_tokens") ?? pt + ct)
+  const finish = finishReason(rawStr(choice, "finish_reason"))
+  return `{"candidates":[{"content":{"role":"model","parts":[${parts.join(",")}]},"finishReason":${quote(finish)},"index":0}],` +
+    `"usageMetadata":{"promptTokenCount":${pt},"candidatesTokenCount":${ct},"totalTokenCount":${tt}},"modelVersion":${quote(model)}}`
+}
+
+type ToolAcc = { index: int, name: string, args: string }
+
+// Turns OpenAI chat.completion.chunk JSON into streamGenerateContent events
+// (`data: {GenerateContentResponse}` with CRLF terminators). Gemini sends a function
+// call as one whole part, so a tool call's arguments are buffered until the call ends:
+// the next call starts, text follows, or the finish reason arrives.
+export class GenAIStream {
+  private done = false
+  private open = false                   // a tool call is being assembled
+  private cur: ToolAcc = { index: -1, name: "", args: "" }
+  private finish: string | undefined = undefined
+  private inTokens: int = 0
+  private outTokens: int = 0
+
+  constructor(readonly model: string) {}
+
+  // Events for one chunk JSON. "[DONE]" ends the stream.
+  push(chunk: string): string throws SyntaxError {
+    if (this.done) return ""
+    if (chunk === "[DONE]") return this.end()
+    const fs = try fields(chunk)
+    const usageRaw = present(fs, "usage")
+    if (usageRaw !== undefined) {
+      const uf = try fields(usageRaw)
+      this.inTokens = Math.floor(rawNum(uf, "prompt_tokens") ?? 0)
+      this.outTokens = Math.floor(rawNum(uf, "completion_tokens") ?? 0)
+    }
+    const choices = present(fs, "choices")
+    if (choices === undefined) return ""
+    const first = (try elements(choices))[0]
+    if (first === undefined) return ""
+    return try this.choice(try fields(first))
+  }
+
+  // The final chunk: the open tool call, then the finish reason and usage. Safe to call twice.
+  end(): string {
+    if (this.done) return ""
+    this.done = true
+    const out = this.flush()
+    const usage = `"usageMetadata":{"promptTokenCount":${this.inTokens},"candidatesTokenCount":${this.outTokens},"totalTokenCount":${this.inTokens + this.outTokens}}`
+    return out + `data: {"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":${quote(finishReason(this.finish))},"index":0}],${usage},"modelVersion":${quote(this.model)}}\r\n\r\n`
+  }
+
+  private choice(c: Field[]): string throws SyntaxError {
+    let out = ""
+    const deltaRaw = present(c, "delta")
+    if (deltaRaw !== undefined) {
+      const d = try fields(deltaRaw)
+      const text = rawStr(d, "content")
+      if (text !== undefined && text !== "") {
+        out += this.flush()
+        out += this.event(`{"text":${quote(text)}}`)
+      }
+      const calls = present(d, "tool_calls")
+      if (calls !== undefined) {
+        for (const el of try elements(calls)) {
+          const tc = try fields(el)
+          const fn = try fields(present(tc, "function") ?? "{}")
+          out += this.fragment(Math.floor(rawNum(tc, "index") ?? 0), rawStr(fn, "name") ?? "", rawStr(fn, "arguments") ?? "")
+        }
+      }
+    }
+    const finish = rawStr(c, "finish_reason")
+    if (finish !== undefined) {
+      this.finish = finish
+      out += this.flush()
+    }
+    return out
+  }
+
+  // Adds one fragment to the open tool call, or closes that call and opens the next index.
+  private fragment(index: int, name: string, args: string): string {
+    let out = ""
+    if (!(this.open && this.cur.index === index)) {
+      out += this.flush()
+      this.cur = { index: index, name: "", args: "" }
+      this.open = true
+    }
+    const c = this.cur
+    this.cur = { index: c.index, name: c.name !== "" ? c.name : name, args: c.args + args }
+    return out
+  }
+
+  // The open tool call is complete: its arguments go out as one functionCall part.
+  private flush(): string {
+    if (!this.open) return ""
+    this.open = false
+    const c = this.cur
+    return this.event(`{"functionCall":{"name":${quote(c.name)},"args":${argsObject(c.args)}}}`)
+  }
+
+  private event(part: string): string {
+    return `data: {"candidates":[{"content":{"role":"model","parts":[${part}]},"index":0}],"modelVersion":${quote(this.model)}}\r\n\r\n`
+  }
+}
+
+// A complete OpenAI SSE body as streamGenerateContent events, for answers that were
+// not streamed from the provider.
+export function toGenAIStream(openaiSse: string, model: string): string {
+  const st = new GenAIStream(model)
+  let out = ""
+  for (const line of openaiSse.split("\n")) {
+    if (!line.startsWith("data:")) continue
+    const payload = line.slice(5).trim()
+    if (payload === "") continue
+    try {
+      const piece = try st.push(payload)
+      out += piece
+    } catch (e) {
+      // a malformed chunk is skipped
+    }
+  }
+  return out + st.end()
+}
+
+// A countTokens answer.
+export function countTokensResponse(tokens: int): string {
+  return `{"totalTokens":${tokens}}`
+}
+
+// :embedContent (one "content") or :batchEmbedContents ("requests") as an OpenAI
+// embeddings request. A batch becomes an input array.
+export function embedToOpenAI(body: string, model: string): string throws SyntaxError {
+  const fs = try fields(body)
+  let dimension = present(fs, "outputDimensionality")
+  let input = ""
+  const batch = present(fs, "requests")
+  if (batch !== undefined) {
+    const items: string[] = []
+    for (const el of try elements(batch)) {
+      const r = try fields(el)
+      items.push(quote(try contentText(present(r, "content"))))
+      if (dimension === undefined) dimension = present(r, "outputDimensionality")
+    }
+    input = "[" + items.join(",") + "]"
+  } else {
+    input = quote(try contentText(present(fs, "content")))
+  }
+  const dim = dimension === undefined ? "" : `,"dimensions":${dimension}`
+  return `{"model":${quote(model)},"input":${input}${dim}}`
+}
+
+// An OpenAI embeddings response as :embedContent ({"embedding"}) or, when batch is set,
+// :batchEmbedContents ({"embeddings"}).
+export function openAIToEmbed(resp: string, batch?: bool): string throws SyntaxError {
+  const data = present(try fields(resp), "data")
+  const vectors: string[] = []
+  if (data !== undefined) {
+    for (const el of try elements(data)) {
+      vectors.push(`{"values":${present(try fields(el), "embedding") ?? "[]"}}`)
+    }
+  }
+  if (batch === true) return `{"embeddings":[${vectors.join(",")}]}`
+  return `{"embedding":${vectors[0] ?? `{"values":[]}`}}`
+}
+
+// The prompt tokens of an OpenAI embeddings response.
+export function embedTokens(resp: string): int throws SyntaxError {
+  const usageRaw = present(try fields(resp), "usage")
+  if (usageRaw === undefined) return 0
+  return Math.floor(rawNum(try fields(usageRaw), "prompt_tokens") ?? 0)
+}
+
+// One model in the GenAI shape.
+export function modelInfo(id: string): string {
+  const methods = id.includes("embed") ? `"embedContent","batchEmbedContents"` : `"generateContent","countTokens","streamGenerateContent"`
+  return `{"name":${quote("models/" + id)},"version":"001","displayName":${quote(id)},"supportedGenerationMethods":[${methods}]}`
+}
+
+// A models.list answer for the given ids.
+export function modelsList(ids: string[]): string {
+  const models: string[] = []
+  for (const id of ids) models.push(modelInfo(id))
+  return `{"models":[${models.join(",")}]}`
+}
+
+type WireMsg = { role: string, content?: string, tool_call_id?: string, tool_calls?: { id: string, function: { name: string, arguments: string } }[] }
+type WireReq = { messages: WireMsg[] }
+
+// The stream output for a chunk sequence, as the gateway writes it.
+function streamAll(model: string, chunks: string[]): string throws SyntaxError {
+  const st = new GenAIStream(model)
+  let out = ""
+  for (const c of chunks) {
+    const piece = try st.push(c)
+    out += piece
+  }
+  return out + st.end()
+}
+
+test("multi-turn function call and response", () => {
+  const raw = `{"systemInstruction":{"parts":[{"text":"be brief"}]},
+    "contents":[
+      {"role":"user","parts":[{"text":"weather in Oslo?"}]},
+      {"role":"model","parts":[{"text":"Checking."},{"functionCall":{"name":"weather","args":{"city":"Oslo"}}}]},
+      {"role":"user","parts":[{"functionResponse":{"name":"weather","response":{"content":"rain"}}},{"text":"thanks"}]}],
+    "generationConfig":{"temperature":0.2,"topP":0.9,"maxOutputTokens":50,"stopSequences":["END"],"candidateCount":1},
+    "tools":[{"functionDeclarations":[{"name":"weather","description":"look up","parameters":{"type":"OBJECT","properties":{"city":{"type":"STRING"}},"required":["city"]}}]}],
+    "toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["weather"]}}}`
+  const out = try generateToOpenAI(raw, "gpt-4o", false)
+  const req = try JSON.parse(out) as WireReq
+  expect(req.messages.length).toBe(5)
+  const callId = req.messages[2]!.tool_calls![0]!.id
+  expect(callId.startsWith("call_")).toBe(true)
+  expect(req.messages[3]!.tool_call_id).toBe(callId)
+  const expected = `{"model":"gpt-4o","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"weather in Oslo?"},` +
+    `{"role":"assistant","content":"Checking.","tool_calls":[{"id":"${callId}","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Oslo\\"}"}}]},` +
+    `{"role":"tool","tool_call_id":"${callId}","content":"rain"},{"role":"user","content":"thanks"}],` +
+    `"temperature":0.2,"top_p":0.9,"max_tokens":50,"stop":["END"],"n":1,` +
+    `"tools":[{"type":"function","function":{"name":"weather","description":"look up","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],` +
+    `"tool_choice":{"type":"function","function":{"name":"weather"}}}`
+  expect(out).toBe(expected)
+})
+
+test("function responses match calls by name, in order", () => {
+  const raw = `{"contents":[
+    {"role":"model","parts":[{"functionCall":{"name":"a","args":{}}},{"functionCall":{"name":"b","args":{"x":1}}},{"functionCall":{"name":"a","args":{"n":2}}}]},
+    {"role":"user","parts":[{"functionResponse":{"name":"a","response":{"output":"first"}}},{"functionResponse":{"name":"b","response":{"ok":true}}},{"functionResponse":{"name":"a","response":{"content":"second"}}}]}]}`
+  const req = try JSON.parse(try generateToOpenAI(raw, "m", false)) as WireReq
+  const calls = req.messages[0]!.tool_calls!
+  expect(calls.length).toBe(3)
+  expect(req.messages[1]!.tool_call_id).toBe(calls[0]!.id)
+  expect(req.messages[1]!.content).toBe("first")
+  expect(req.messages[2]!.tool_call_id).toBe(calls[1]!.id)
+  expect(req.messages[2]!.content).toBe(`{"ok":true}`)
+  expect(req.messages[3]!.tool_call_id).toBe(calls[2]!.id)
+  expect(req.messages[3]!.content).toBe("second")
+  expect(calls[1]!.function.arguments).toBe(`{"x":1}`)
+})
+
+test("inline data, file data and snake_case blobs become image parts", () => {
+  const raw = `{"contents":[{"role":"user","parts":[
+    {"inlineData":{"mimeType":"image/png","data":"AAAA"}},
+    {"fileData":{"mimeType":"image/jpeg","fileUri":"https://example.com/a.jpg"}},
+    {"inline_data":{"mime_type":"image/webp","data":"BBBB"}},
+    {"text":"what is this"}]}]}`
+  expect(try generateToOpenAI(raw, "m", false)).toBe(`{"model":"m","messages":[{"role":"user","content":[` +
+    `{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},` +
+    `{"type":"image_url","image_url":{"url":"https://example.com/a.jpg"}},` +
+    `{"type":"image_url","image_url":{"url":"data:image/webp;base64,BBBB"}},` +
+    `{"type":"text","text":"what is this"}]}]}`)
+})
+
+test("text parts join, thoughts are dropped, JSON mode and stream flags", () => {
+  const raw = `{"contents":[{"role":"model","parts":[{"text":"a","thought":true},{"text":"b"},{"text":"c"}]}],"generationConfig":{"responseMimeType":"application/json"}}`
+  expect(try generateToOpenAI(raw, "m", true)).toBe(`{"model":"m","messages":[{"role":"assistant","content":"bc"}],` +
+    `"response_format":{"type":"json_object"},"stream":true,"stream_options":{"include_usage":true}}`)
+  expect(try generateToOpenAI(`{}`, "m", false)).toBe(`{"model":"m","messages":[]}`)
+})
+
+test("tool schemas get lower-case types and default parameters", () => {
+  const raw = `{"tools":[{"functionDeclarations":[{"name":"kind","parameters":{"type":"OBJECT","properties":{"type":{"type":"STRING","enum":["A","B"]},"tags":{"type":"ARRAY","items":{"type":"INTEGER"}}}}},{"name":"ping"}]}]}`
+  expect(try generateToOpenAI(raw, "m", false)).toBe(`{"model":"m","messages":[],"tools":[` +
+    `{"type":"function","function":{"name":"kind","parameters":{"type":"object","properties":{"type":{"type":"string","enum":["A","B"]},"tags":{"type":"array","items":{"type":"integer"}}}}}},` +
+    `{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}]}`)
+})
+
+test("tool config modes map to tool_choice only when tools are sent", () => {
+  const modes = [["AUTO", `"auto"`], ["NONE", `"none"`], ["ANY", `"required"`]]
+  for (const m of modes) {
+    const raw = `{"tools":[{"functionDeclarations":[{"name":"f"}]}],"toolConfig":{"functionCallingConfig":{"mode":"${m[0]!}"}}}`
+    expect((try generateToOpenAI(raw, "m", false)).includes(`"tool_choice":${m[1]!}`)).toBe(true)
+  }
+  expect(try generateToOpenAI(`{"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}}}`, "m", false)).toBe(`{"model":"m","messages":[]}`)
+})
+
+test("text completion becomes a candidate with usage", () => {
+  const out = try openAIToGenerate(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`, "gemini-2.5-flash")
+  expect(out).toBe(`{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":"STOP","index":0}],` +
+    `"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":2,"totalTokenCount":13},"modelVersion":"gemini-2.5-flash"}`)
+  const parts = try openAIToGenerate(`{"choices":[{"index":0,"message":{"role":"assistant","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},"finish_reason":"length"}]}`, "m")
+  expect(parts.includes(`"parts":[{"text":"ab"}]`)).toBe(true)
+  expect(parts.includes(`"finishReason":"MAX_TOKENS"`)).toBe(true)
+  expect(parts.includes(`"totalTokenCount":0`)).toBe(true)
+  const filtered = try openAIToGenerate(`{"choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}`, "m")
+  expect(filtered.includes(`"finishReason":"SAFETY"`)).toBe(true)
+})
+
+test("tool calls become functionCall parts; bad arguments become {}", () => {
+  const out = try openAIToGenerate(`{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[` +
+    `{"id":"c1","type":"function","function":{"name":"look","arguments":"{\\"q\\":\\"cat\\"}"}},` +
+    `{"id":"c2","type":"function","function":{"name":"bad","arguments":"{not json"}},` +
+    `{"id":"c3","type":"function","function":{"name":"extra","arguments":"{\\"x\\":1} trailing"}}]},"finish_reason":"tool_calls"}],` +
+    `"usage":{"prompt_tokens":3,"completion_tokens":4}}`, "m")
+  expect(out.includes(`"parts":[{"functionCall":{"name":"look","args":{"q":"cat"}}},{"functionCall":{"name":"bad","args":{}}},{"functionCall":{"name":"extra","args":{}}}]`)).toBe(true)
+  expect(out.includes(`"finishReason":"STOP"`)).toBe(true)
+  expect(out.includes(`"totalTokenCount":7`)).toBe(true)
+})
+
+test("stream of text chunks ends with the finish reason and usage", () => {
+  const out = try streamAll("m", [
+    `{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+    `{"choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}`,
+    `{"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}`,
+    `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+    `{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`,
+    "[DONE]"])
+  expect(out).toBe(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hel"}]},"index":0}],"modelVersion":"m"}\r\n\r\n` +
+    `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"lo"}]},"index":0}],"modelVersion":"m"}\r\n\r\n` +
+    `data: {"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2,"totalTokenCount":7},"modelVersion":"m"}\r\n\r\n`)
+})
+
+test("stream buffers a tool call until it is whole", () => {
+  const out = try streamAll("m", [
+    `{"choices":[{"index":0,"delta":{"content":"Let me look."},"finish_reason":null}]}`,
+    `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"look","arguments":""}}]},"finish_reason":null}]}`,
+    `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"q\\""}}]},"finish_reason":null}]}`,
+    `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\"cat\\"}"}}]},"finish_reason":null}]}`,
+    `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"t2","type":"function","function":{"name":"time","arguments":"{}"}}]},"finish_reason":null}]}`,
+    `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+    `{"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":9,"total_tokens":17}}`,
+    "[DONE]"])
+  const events = out.split("\r\n\r\n").filter((e) => e !== "")
+  expect(events.length).toBe(4)
+  expect(events[0]!.includes(`{"text":"Let me look."}`)).toBe(true)
+  expect(events[1]).toBe(`data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"look","args":{"q":"cat"}}}]},"index":0}],"modelVersion":"m"}`)
+  expect(events[2]!.includes(`{"functionCall":{"name":"time","args":{}}}`)).toBe(true)
+  expect(events[3]!.includes(`"finishReason":"STOP"`)).toBe(true)
+  expect(events[3]!.includes(`"totalTokenCount":17`)).toBe(true)
+})
+
+test("stream state ends once and ignores later chunks", () => {
+  const st = new GenAIStream("m")
+  const last = try st.push("[DONE]")
+  expect(last.includes(`"finishReason":"STOP"`)).toBe(true)
+  expect(st.end()).toBe("")
+  expect(try st.push(`{"choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}]}`)).toBe("")
+})
+
+test("malformed bodies throw SyntaxError", () => {
+  let threw = false
+  try {
+    generateToOpenAI("{", "m", false)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("embeddings in both shapes and their answers", () => {
+  expect(try embedToOpenAI(`{"model":"models/text-embedding-004","content":{"parts":[{"text":"hello"}]},"outputDimensionality":256}`, "te")).toBe(`{"model":"te","input":"hello","dimensions":256}`)
+  expect(try embedToOpenAI(`{"requests":[{"model":"models/te","content":{"parts":[{"text":"a"}]}},{"model":"models/te","content":{"parts":[{"text":"b"}]},"outputDimensionality":8}]}`, "te")).toBe(`{"model":"te","input":["a","b"],"dimensions":8}`)
+  const resp = `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,-0.2]}],"model":"te","usage":{"prompt_tokens":3,"total_tokens":3}}`
+  expect(try openAIToEmbed(resp, false)).toBe(`{"embedding":{"values":[0.1,-0.2]}}`)
+  expect(try openAIToEmbed(resp, true)).toBe(`{"embeddings":[{"values":[0.1,-0.2]}]}`)
+  expect(try embedTokens(resp)).toBe(3)
+})
+
+test("a whole OpenAI SSE body becomes GenAI stream events", () => {
+  const sse = `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: {"id":"c1","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}
+
+data: [DONE]
+
+`
+  expect(toGenAIStream(sse, "m")).toBe(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hi"}]},"index":0}],"modelVersion":"m"}\r\n\r\n` +
+    `data: {"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"MAX_TOKENS","index":0}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"totalTokenCount":3},"modelVersion":"m"}\r\n\r\n`)
+})
+
+test("countTokens and models in the GenAI shape", () => {
+  expect(countTokensResponse(7)).toBe(`{"totalTokens":7}`)
+  expect(modelsList(["gpt-4o", "text-embedding-3-small"])).toBe(`{"models":[` +
+    `{"name":"models/gpt-4o","version":"001","displayName":"gpt-4o","supportedGenerationMethods":["generateContent","countTokens","streamGenerateContent"]},` +
+    `{"name":"models/text-embedding-3-small","version":"001","displayName":"text-embedding-3-small","supportedGenerationMethods":["embedContent","batchEmbedContents"]}]}`)
+  expect(modelInfo("openai/gpt-4o").startsWith(`{"name":"models/openai/gpt-4o"`)).toBe(true)
+  expect(modelsList([])).toBe(`{"models":[]}`)
+})

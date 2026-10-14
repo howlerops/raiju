@@ -3,7 +3,9 @@
 
 Usage: tests/e2e.py  (builds both binaries into ./build first)
 """
-import json, os, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
+import base64, json, os, struct, subprocess, sys, time, urllib.request, urllib.error, urllib.parse, zlib
+
+B64 = base64  # main() imports base64 locally, which would shadow this module
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
@@ -73,6 +75,44 @@ def ws_roundtrip(path, message, headers=None):
     data = read(ln).decode()
     sock.close()
     return 101, data
+
+def call_bytes(method, path, body=None, headers=None, base=GW):
+    """Like call(), but returns the body as bytes (for binary streams); the headers are a Message."""
+    data = None if body is None else (body if isinstance(body, str) else json.dumps(body)).encode()
+    req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+def eventstream(data: bytes):
+    """Decodes AWS event-stream frames, checking the prelude and message CRCs. Returns [(headers, payload)]."""
+    out = []
+    i = 0
+    while i < len(data):
+        if len(data) - i < 16:
+            raise ValueError("truncated frame")
+        total, hlen = struct.unpack(">II", data[i:i + 8])
+        if zlib.crc32(data[i:i + 8]) != struct.unpack(">I", data[i + 8:i + 12])[0]:
+            raise ValueError("bad prelude CRC")
+        msg = data[i:i + total]
+        if len(msg) != total or zlib.crc32(msg[:-4]) != struct.unpack(">I", msg[-4:])[0]:
+            raise ValueError("bad message CRC")
+        headers = {}
+        j = i + 12
+        while j < i + 12 + hlen:
+            nl = data[j]
+            name = data[j + 1:j + 1 + nl].decode()
+            j += 1 + nl
+            if data[j] != 7:
+                raise ValueError("header type is not a string")
+            vl = struct.unpack(">H", data[j + 1:j + 3])[0]
+            headers[name] = data[j + 3:j + 3 + vl].decode()
+            j += 3 + vl
+        out.append((headers, msg[12 + hlen:-4]))
+        i += total
+    return out
 
 def seen(traces=False):
     """What the mock received; trace exports arrive asynchronously, so they're left out unless asked for."""
@@ -272,6 +312,70 @@ def main():
 
         s, _, b = call("POST", "/bedrock/model/claude/converse", {"messages": [{"role": "user", "content": [{"text": "hi"}]}]})
         check("bedrock SDK route", s == 200 and "Hi from bedrock" in b, b)
+
+        # Cohere, GenAI and Bedrock SDK routes, with an OpenAI-format model behind them
+        s, _, b = call("POST", "/cohere/v2/chat", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}]})
+        r = json.loads(b) if s == 200 else {}
+        check("cohere chat answers in Cohere's shape", s == 200 and r.get("message", {}).get("role") == "assistant" and "Hello from gpt-4o-mini" in json.dumps(r.get("message", {}).get("content")), b)
+        check("cohere chat sends an OpenAI chat body upstream", json.loads(seen()[-1]["body"])["model"] == "gpt-4o-mini" and seen()[-1]["path"] == "/v1/chat/completions", seen()[-1])
+        s, _, b = call("POST", "/cohere/v2/chat", {"model": "openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "s"}]})
+        names = [l[7:] for l in b.split("\n") if l.startswith("event: ")]
+        check("cohere chat streams message-start to message-end", s == 200 and names[:1] == ["message-start"] and names[-1:] == ["message-end"] and "content-delta" in names and "Hel" in b, (s, names, b[:300]))
+        s, _, b = call("POST", "/cohere/v2/embed", {"model": "openai/text-embedding-3-small", "texts": ["one", "two"], "input_type": "search_document", "embedding_types": ["float"]})
+        vecs = json.loads(b).get("embeddings", {}).get("float", []) if s == 200 else []
+        check("cohere embed returns one float vector per text", s == 200 and len(vecs) == 2 and all(len(v) == 64 for v in vecs), b[:300])
+        check("cohere embed sends the texts as an OpenAI input list", json.loads(seen()[-1]["body"])["input"] == ["one", "two"] and seen()[-1]["path"] == "/v1/embeddings", seen()[-1])
+        s, _, b = call("POST", "/cohere/v2/rerank", {"model": "openai/rerank-english", "query": "capital of France", "documents": ["bananas are yellow", "Paris is the capital of France"]})
+        results = json.loads(b).get("results", []) if s == 200 else []
+        check("cohere rerank puts the best document first", s == 200 and len(results) == 2 and results[0].get("index") == 1, b[:300])
+        s, _, b = call("POST", "/cohere/v1/tokenize", {"model": "command-r", "text": "hello world"})
+        r = json.loads(b) if s == 200 else {}
+        check("cohere tokenize returns tokens and their strings", s == 200 and len(r.get("tokens", [])) > 0 and len(r.get("tokens", [])) == len(r.get("token_strings", [])), b[:300])
+
+        GEN = "/genai/v1beta/models/openai/gpt-4o-mini"
+        s, _, b = call("POST", GEN + ":generateContent", {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]})
+        r = json.loads(b) if s == 200 else {}
+        cand = (r.get("candidates") or [{}])[0]
+        check("genai generateContent to an OpenAI model", s == 200 and cand.get("content", {}).get("parts", [{}])[0].get("text") == "Hello from gpt-4o-mini" and cand.get("finishReason") == "STOP" and r.get("usageMetadata", {}).get("promptTokenCount") == 3, b[:400])
+        check("genai sends an OpenAI chat body upstream", json.loads(seen()[-1]["body"])["model"] == "gpt-4o-mini" and seen()[-1]["path"] == "/v1/chat/completions", seen()[-1])
+        s, _, b = call("POST", GEN + ":streamGenerateContent", {"contents": [{"role": "user", "parts": [{"text": "s"}]}]})
+        chunks = [json.loads(l[6:]) for l in b.split("\n") if l.startswith("data: ")]
+        text = "".join(p.get("text", "") for c in chunks for cand in c.get("candidates", []) for p in cand.get("content", {}).get("parts", []))
+        check("genai streamGenerateContent streams the text and a STOP", s == 200 and text == "Hello" and any(cand.get("finishReason") == "STOP" for c in chunks for cand in c.get("candidates", [])), b[:400])
+        s, _, b = call("POST", GEN + ":countTokens", {"contents": [{"role": "user", "parts": [{"text": "hello world, how are you today"}]}]})
+        check("genai countTokens", s == 200 and json.loads(b).get("totalTokens", 0) > 0, b)
+        s, _, b = call("GET", "/genai/v1beta/models")
+        names = [m["name"] for m in json.loads(b).get("models", [])] if s == 200 else []
+        check("genai models list", s == 200 and "models/openai/rotate-me" in names, b[:300])
+        s, _, b = call("GET", "/genai/v1beta/models/openai/rotate-me")
+        r = json.loads(b) if s == 200 else {}
+        check("genai model info", s == 200 and r.get("name") == "models/openai/rotate-me" and "generateContent" in r.get("supportedGenerationMethods", []), b[:300])
+
+        BED = "/bedrock/model/openai%2Fgpt-4o-mini/"
+        conv = {"messages": [{"role": "user", "content": [{"text": "hi"}]}]}
+        s, _, b = call("POST", BED + "converse", conv)
+        r = json.loads(b) if s == 200 else {}
+        check("bedrock converse to an OpenAI model", s == 200 and r.get("output", {}).get("message", {}).get("content", [{}])[0].get("text") == "Hello from gpt-4o-mini" and r.get("stopReason") == "end_turn" and r.get("usage", {}).get("inputTokens") == 3, b[:400])
+        check("bedrock converse sends an OpenAI chat body upstream", json.loads(seen()[-1]["body"])["model"] == "gpt-4o-mini" and seen()[-1]["path"] == "/v1/chat/completions", seen()[-1])
+        s, h, raw = call_bytes("POST", BED + "converse-stream", conv)
+        try:
+            frames = eventstream(raw)
+        except ValueError:
+            frames = []
+        names = [hd.get(":event-type") for hd, _ in frames]
+        text = "".join(json.loads(p)["delta"]["text"] for hd, p in frames if hd.get(":event-type") == "contentBlockDelta")
+        meta = [json.loads(p) for hd, p in frames if hd.get(":event-type") == "metadata"]
+        check("bedrock converse-stream frames have valid CRCs and events", s == 200 and h.get("content-type") == "application/vnd.amazon.eventstream" and names == ["messageStart", "contentBlockDelta", "contentBlockDelta", "contentBlockStop", "messageStop", "metadata"] and text == "Hello" and all(hd.get(":message-type") == "event" for hd, _ in frames) and meta and meta[0]["usage"]["inputTokens"] == 3, (s, names, raw[:80]))
+        check("bedrock converse-stream asks the upstream to stream", json.loads(seen()[-1]["body"]).get("stream") is True, seen()[-1])
+        s, _, b = call("POST", BED + "count-tokens", {"input": {"converse": {"messages": [{"role": "user", "content": [{"text": "hello there, friend"}]}]}}})
+        check("bedrock count-tokens", s == 200 and json.loads(b).get("inputTokens", 0) > 0, b)
+        s, h, raw = call_bytes("POST", BED + "invoke-with-response-stream", {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]})
+        try:
+            frames = eventstream(raw)
+        except ValueError:
+            frames = []
+        events = [json.loads(B64.b64decode(json.loads(p)["bytes"])) for hd, p in frames if hd.get(":event-type") == "chunk"]
+        check("bedrock invoke-with-response-stream wraps Messages events", s == 200 and events[:1] and events[0]["type"] == "message_start" and events[-1]["type"] == "message_stop" and any(e.get("delta", {}).get("text") == "Hel" for e in events), (s, raw[:80]))
 
         s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "openai"})
         ids = [m["id"] for m in json.loads(b)["data"]]

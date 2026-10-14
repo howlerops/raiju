@@ -6,30 +6,24 @@ import { listen, Http1Request, Http1Response } from "./http1"
 import { WsConnection } from "./ws"
 import { Engine, StreamSink } from "./gateway"
 import { Ops } from "./ops"
-import { dispatch, compatPath } from "./server"
-import { fields, rawBool } from "./json"
+import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel } from "./server"
+import * as metrics from "./metrics"
 import { relayHttp1 } from "./realtime"
-import { anthropicMessages } from "./native"
 
 export type FrontOptions = { hostname: string, port: int, maxBodyBytes: int }
-
-const CHAT_PATHS = ["/v1/chat/completions", "/openai/v1/chat/completions", "/openai/chat/completions"]
 
 function pathOf(target: string): string {
   const q = target.indexOf("?")
   return q < 0 ? target : target.slice(0, q)
 }
 
-function wantsStream(req: Http1Request): bool {
-  if (req.method !== "POST") return false
-  const p = compatPath(pathOf(req.path))
-  if (!CHAT_PATHS.includes(p) && p !== "/anthropic/v1/messages") return false
-  if (!req.body.includes("\"stream\"")) return false
-  try {
-    return rawBool(fields(req.body), "stream") ?? false
-  } catch (e) {
-    return false
-  }
+// The streamed route kind of a request this front end streams, or "". Bedrock's event streams
+// are binary, which this front end can't write yet, so those answer whole.
+function streamingKind(req: Http1Request): string {
+  if (req.method !== "POST") return ""
+  const kind = streamKind(compatPath(pathOf(req.path)))
+  if (kind === "bedrock") return ""
+  return streamsRequest(kind, req.body) ? kind : ""
 }
 
 function toRequest(req: Http1Request, host: string): Request {
@@ -39,7 +33,7 @@ function toRequest(req: Http1Request, host: string): Request {
   return new Request(url, { method: req.method, headers: h, body: req.body })
 }
 
-async function write(res: Http1Response, r: Response): Promise<void> {
+async function write(res: Http1Response, r: Response): Promise<int> {
   const h: Map<string, string> = new Map()
   r.headers.forEach((value, key) => {
     h.set(key, value)
@@ -53,22 +47,32 @@ async function write(res: Http1Response, r: Response): Promise<void> {
   }
   res.writeHead(r.status, h)
   res.endBytes(body)
+  return body.length
 }
 
 async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request, res: Http1Response): Promise<void> {
   const request = toRequest(req, host)
+  const t0 = performance.now()
+  const label = pathLabel(pathOf(req.path))
+  const inBytes = req.body.byteLength * 1.0
   try {
-    if (wantsStream(req)) {
+    const kind = streamingKind(req)
+    if (kind !== "") {
       const sink = new StreamSink(
         (status, headers) => res.writeHead(status, headers),
         (chunk) => res.write(chunk),
         () => res.end(),
       )
-      const r = compatPath(pathOf(req.path)) === "/anthropic/v1/messages" ? await anthropicMessages(engine, request, sink) : await engine.chat(request, sink)
-      if (!sink.started) await write(res, r)
+      const r = await routeStream(engine, request, kind, sink)
+      // Bifrost's http_* metrics; a streamed body counts as 0 bytes
+      let n = 0
+      if (!sink.started) n = await write(res, r)
+      metrics.observeHttp(label, req.method, r.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0)
       return
     }
-    await write(res, await dispatch(engine, ops, request))
+    const r = await dispatch(engine, ops, request)
+    const n = await write(res, r)
+    metrics.observeHttp(label, req.method, r.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0)
   } catch (e) {
     if (!res.finished) {
       const h: Map<string, string> = new Map()

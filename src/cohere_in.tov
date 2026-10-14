@@ -1,0 +1,739 @@
+// Cohere v2 API in front of the gateway: a Cohere request becomes the OpenAI or
+// Raiju request the gateway already serves, and the answer becomes a Cohere
+// response again. Tool schemas and tool arguments are arbitrary JSON, so they
+// stay raw text.
+import { Field, fields, elements, find, quote, rawStr, rawNum, rawBool, decodeString } from "./json"
+import { newId } from "./schemas"
+import { parseRerank, estimateTokens } from "./jobs"
+import { CohereToOpenAI } from "./streams_cohere"
+
+// The text of a content value: a JSON string, or the text parts of an array.
+function textOf(raw: string | undefined): string throws SyntaxError {
+  if (raw === undefined || raw === "null") return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (!raw.startsWith("[")) return ""
+  const parts: string[] = []
+  for (const el of try elements(raw)) {
+    const b = try fields(el)
+    if (rawStr(b, "type") === "text") parts.push(rawStr(b, "text") ?? "")
+  }
+  return parts.join("")
+}
+
+// A field's raw value, or undefined when it is absent or null.
+function present(fs: Field[], key: string): string | undefined {
+  const r = find(fs, key)
+  if (r === undefined || r === "null") return undefined
+  return r
+}
+
+// A count field as an int; absent reads as 0.
+function countOf(fs: Field[], key: string): int {
+  const n = rawNum(fs, key)
+  return n === undefined ? 0 : Math.trunc(n)
+}
+
+// A user's content keeps its images: a JSON string, or text and image parts.
+function userContent(raw: string | undefined): string throws SyntaxError {
+  if (raw === undefined) return `""`
+  if (raw.startsWith("\"")) return raw
+  if (!raw.startsWith("[")) return `""`
+  const parts: string[] = []
+  for (const el of try elements(raw)) {
+    const b = try fields(el)
+    const type = rawStr(b, "type")
+    if (type === "text") parts.push(`{"type":"text","text":${quote(rawStr(b, "text") ?? "")}}`)
+    else if (type === "image_url") {
+      const img = present(b, "image_url")
+      if (img !== undefined) parts.push(`{"type":"image_url","image_url":${img}}`)
+    }
+  }
+  return `[${parts.join(",")}]`
+}
+
+// A tool result's text: a JSON string, or the text and document parts of an array.
+function toolText(raw: string | undefined): string throws SyntaxError {
+  if (raw === undefined || raw === "null") return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (!raw.startsWith("[")) return ""
+  const parts: string[] = []
+  for (const el of try elements(raw)) {
+    const b = try fields(el)
+    const type = rawStr(b, "type")
+    if (type === "text") parts.push(rawStr(b, "text") ?? "")
+    else if (type === "document") {
+      const doc = try fields(present(b, "document") ?? "{}")
+      const data = present(doc, "data")
+      if (data !== undefined) {
+        if (data.startsWith("\"")) parts.push(try decodeString(data))
+        else parts.push(data)
+      }
+    }
+  }
+  return parts.join("")
+}
+
+// Cohere tool arguments are a JSON string; an object is passed on as its text.
+function argsJson(raw: string | undefined): string {
+  if (raw === undefined) return `"{}"`
+  return raw.startsWith("\"") ? raw : quote(raw)
+}
+
+// A Cohere tool call as an OpenAI tool call.
+function openaiToolCall(c: Field[]): string throws SyntaxError {
+  const fn = try fields(present(c, "function") ?? "{}")
+  return `{"id":${quote(rawStr(c, "id") ?? "")},"type":"function","function":{"name":${quote(rawStr(fn, "name") ?? "")},"arguments":${argsJson(present(fn, "arguments"))}}}`
+}
+
+// One Cohere message becomes one OpenAI message. Thinking and tool plans are dropped.
+function convertMessage(m: Field[], inout out: string[]): void throws SyntaxError {
+  const role = rawStr(m, "role") ?? "user"
+  const content = present(m, "content")
+  if (role === "tool") {
+    const text = try toolText(content)
+    out.push(`{"role":"tool","tool_call_id":${quote(rawStr(m, "tool_call_id") ?? "")},"content":${quote(text)}}`)
+    return
+  }
+  if (role === "system") {
+    const text = try textOf(content)
+    out.push(`{"role":"system","content":${quote(text)}}`)
+    return
+  }
+  if (role === "assistant") {
+    const text = try textOf(content)
+    const cs: string[] = []
+    const calls = present(m, "tool_calls")
+    if (calls !== undefined) {
+      for (const el of try elements(calls)) cs.push(try openaiToolCall(try fields(el)))
+    }
+    const parts: string[] = [`"role":"assistant"`, `"content":${text === "" && cs.length > 0 ? "null" : quote(text)}`]
+    if (cs.length > 0) parts.push(`"tool_calls":[${cs.join(",")}]`)
+    out.push("{" + parts.join(",") + "}")
+    return
+  }
+  const body = try userContent(content)
+  out.push(`{"role":"user","content":${body}}`)
+}
+
+// Cohere's json_object with a schema becomes OpenAI's json_schema; without one, json_object.
+function responseFormat(raw: string): string | undefined throws SyntaxError {
+  const f = try fields(raw)
+  if (rawStr(f, "type") !== "json_object") return undefined
+  const schema = present(f, "json_schema")
+  if (schema === undefined) return `{"type":"json_object"}`
+  return `{"type":"json_schema","json_schema":{"name":"response","schema":${schema}}}`
+}
+
+// Cohere's REQUIRED and NONE map to OpenAI's required and none. Absent means auto.
+function toolChoice(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined
+  const v = raw.toUpperCase()
+  if (v === "REQUIRED") return `"required"`
+  if (v === "NONE") return `"none"`
+  return undefined
+}
+
+// A Cohere v2 chat body as an OpenAI chat request for the given gateway model.
+// Cohere's p is top_p, stop_sequences is stop, and k has no OpenAI counterpart.
+export function chatToOpenAI(cohereBody: string, model: string): string throws SyntaxError {
+  const fs = try fields(cohereBody)
+  let msgs: string[] = []
+  const list = present(fs, "messages")
+  if (list !== undefined) {
+    for (const el of try elements(list)) {
+      const m = try fields(el)
+      try convertMessage(m, &msgs)
+    }
+  }
+  const parts: string[] = [`"model":${quote(model)}`, `"messages":[${msgs.join(",")}]`]
+  const maxTokens = present(fs, "max_tokens")
+  if (maxTokens !== undefined) parts.push(`"max_tokens":${maxTokens}`)
+  const temperature = present(fs, "temperature")
+  if (temperature !== undefined) parts.push(`"temperature":${temperature}`)
+  const p = present(fs, "p")
+  if (p !== undefined) parts.push(`"top_p":${p}`)
+  const stop = present(fs, "stop_sequences")
+  if (stop !== undefined) parts.push(`"stop":${stop}`)
+  const seed = present(fs, "seed")
+  if (seed !== undefined) parts.push(`"seed":${seed}`)
+  const fp = present(fs, "frequency_penalty")
+  if (fp !== undefined) parts.push(`"frequency_penalty":${fp}`)
+  const pp = present(fs, "presence_penalty")
+  if (pp !== undefined) parts.push(`"presence_penalty":${pp}`)
+  const rf = present(fs, "response_format")
+  if (rf !== undefined) {
+    const f = try responseFormat(rf)
+    if (f !== undefined) parts.push(`"response_format":${f}`)
+  }
+  const tools = present(fs, "tools")
+  if (tools !== undefined) parts.push(`"tools":${tools}`)
+  const choice = toolChoice(rawStr(fs, "tool_choice"))
+  if (choice !== undefined) parts.push(`"tool_choice":${choice}`)
+  const stream = present(fs, "stream")
+  if (stream !== undefined) parts.push(`"stream":${stream}`)
+  if (stream === "true") parts.push(`"stream_options":{"include_usage":true}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// OpenAI finish reasons as Cohere finish reasons.
+function finishReason(r: string | undefined): string {
+  if (r === "length") return "MAX_TOKENS"
+  if (r === "tool_calls" || r === "function_call") return "TOOL_CALL"
+  if (r === "content_filter") return "ERROR"
+  return "COMPLETE"
+}
+
+// An OpenAI chat completion as a Cohere v2 chat response.
+export function openAIToChat(openaiCompletion: string): string throws SyntaxError {
+  const fs = try fields(openaiCompletion)
+  let choice: Field[] = []
+  const choicesRaw = present(fs, "choices")
+  if (choicesRaw !== undefined) {
+    const els = try elements(choicesRaw)
+    const first = els[0]
+    if (first !== undefined) choice = try fields(first)
+  }
+  const msgRaw = present(choice, "message")
+  const msg: Field[] = msgRaw === undefined ? [] : try fields(msgRaw)
+  const text = try textOf(present(msg, "content"))
+  const cs: string[] = []
+  const calls = present(msg, "tool_calls")
+  if (calls !== undefined) {
+    for (const el of try elements(calls)) {
+      const tc = try fields(el)
+      const fn = try fields(present(tc, "function") ?? "{}")
+      const id = rawStr(tc, "id") ?? newId("call_")
+      cs.push(`{"id":${quote(id)},"type":"function","function":{"name":${quote(rawStr(fn, "name") ?? "")},"arguments":${quote(rawStr(fn, "arguments") ?? "{}")}}}`)
+    }
+  }
+  const usageRaw = present(fs, "usage")
+  const usage: Field[] = usageRaw === undefined ? [] : try fields(usageRaw)
+  const pt = countOf(usage, "prompt_tokens")
+  const ct = countOf(usage, "completion_tokens")
+  const id = rawStr(fs, "id") ?? ""
+  const content = text === "" ? "" : `,"content":[{"type":"text","text":${quote(text)}}]`
+  const toolPart = cs.length === 0 ? "" : `,"tool_calls":[${cs.join(",")}]`
+  const stop = finishReason(rawStr(choice, "finish_reason"))
+  const cid = id === "" ? newId("chat_") : id
+  return `{"id":${quote(cid)},"finish_reason":${quote(stop)},"message":{"role":"assistant"${content}${toolPart}},` +
+    `"usage":{"billed_units":{"input_tokens":${pt},"output_tokens":${ct}},"tokens":{"input_tokens":${pt},"output_tokens":${ct}}}}`
+}
+
+function sse(name: string, data: string): string {
+  return `event: ${name}\ndata: ${data}\n\n`
+}
+
+// Writes Cohere v2 stream events from OpenAI chunk JSON, one chunk at a time.
+// Text and tool calls each take the next content index, and a block closes
+// before the next one opens. Usage and the finish reason arrive before [DONE],
+// so message-end is written by end(), once the usage is known.
+export class CohereStream {
+  private started = false
+  private done = false
+  private next = 0               // index of the next content block
+  private block = -1             // index of the open content block, or -1
+  private kind = ""              // "text" or "tool" while a block is open
+  private tool = -1              // OpenAI tool_call index of the open tool block
+  private seen: int[] = []       // tool calls already opened; a closed block cannot reopen
+  private id = ""
+  private finish: string | undefined = undefined
+  private inTokens: int = 0
+  private outTokens: int = 0
+
+  constructor(readonly model: string) {}
+
+  // Events for one chunk JSON. "[DONE]" ends the stream.
+  push(chunk: string): string throws SyntaxError {
+    if (this.done) return ""
+    if (chunk === "[DONE]") return this.end()
+    const fs = try fields(chunk)
+    let out = ""
+    if (!this.started) out += this.begin(rawStr(fs, "id") ?? "")
+    const usageRaw = present(fs, "usage")
+    if (usageRaw !== undefined) {
+      const uf = try fields(usageRaw)
+      this.inTokens = countOf(uf, "prompt_tokens")
+      this.outTokens = countOf(uf, "completion_tokens")
+    }
+    const choicesRaw = present(fs, "choices")
+    if (choicesRaw !== undefined) {
+      const els = try elements(choicesRaw)
+      const first = els[0]
+      if (first !== undefined) out += try this.choice(try fields(first))
+    }
+    return out
+  }
+
+  // Closes the open block and writes message-end. Safe to call more than once.
+  end(): string {
+    if (this.done) return ""
+    this.done = true
+    let out = ""
+    if (!this.started) out += this.begin("")
+    out += this.closeBlock()
+    const usage = `{"input_tokens":${this.inTokens},"output_tokens":${this.outTokens}}`
+    const reason = finishReason(this.finish)
+    out += sse("message-end", `{"type":"message-end","delta":{"finish_reason":${quote(reason)},"usage":{"billed_units":${usage},"tokens":${usage}}}}`)
+    return out
+  }
+
+  private begin(rawId: string): string {
+    this.started = true
+    this.id = rawId === "" ? newId("c_") : rawId
+    return sse("message-start", `{"type":"message-start","id":${quote(this.id)},"delta":{"message":{"role":"assistant"}}}`)
+  }
+
+  private choice(c: Field[]): string throws SyntaxError {
+    let out = ""
+    const deltaRaw = present(c, "delta")
+    if (deltaRaw !== undefined) {
+      const d = try fields(deltaRaw)
+      const text = rawStr(d, "content")
+      if (text !== undefined && text !== "") out += this.addText(text)
+      const calls = present(d, "tool_calls")
+      if (calls !== undefined) {
+        for (const el of try elements(calls)) {
+          const tc = try fields(el)
+          const fn = try fields(present(tc, "function") ?? "{}")
+          const index = Math.floor(rawNum(tc, "index") ?? 0)
+          out += this.addToolCall(index, rawStr(tc, "id") ?? "", rawStr(fn, "name") ?? "", rawStr(fn, "arguments") ?? "")
+        }
+      }
+    }
+    const finish = rawStr(c, "finish_reason")
+    if (finish !== undefined) this.finish = finish
+    return out
+  }
+
+  private addText(s: string): string {
+    let out = ""
+    if (this.kind !== "text") {
+      out += this.closeBlock()
+      this.block = this.next
+      this.next += 1
+      this.kind = "text"
+      this.tool = -1
+      out += sse("content-start", `{"type":"content-start","index":${this.block},"delta":{"message":{"content":{"type":"text","text":""}}}}`)
+    }
+    return out + sse("content-delta", `{"type":"content-delta","index":${this.block},"delta":{"message":{"content":{"text":${quote(s)}}}}}`)
+  }
+
+  private addToolCall(index: int, id: string, name: string, args: string): string {
+    let out = ""
+    if (this.kind !== "tool" || this.tool !== index) {
+      // a call seen again after its block closed has nowhere to go; it is dropped
+      if (this.seen.includes(index)) return ""
+      out += this.closeBlock()
+      this.seen.push(index)
+      this.block = this.next
+      this.next += 1
+      this.kind = "tool"
+      this.tool = index
+      out += sse("tool-call-start", `{"type":"tool-call-start","index":${this.block},"delta":{"message":{"tool_calls":{"id":${quote(id)},"type":"function","function":{"name":${quote(name)},"arguments":""}}}}}`)
+    }
+    if (args !== "") out += this.toolDelta(args)
+    return out
+  }
+
+  private toolDelta(args: string): string {
+    return sse("tool-call-delta", `{"type":"tool-call-delta","index":${this.block},"delta":{"message":{"tool_calls":{"function":{"arguments":${quote(args)}}}}}}`)
+  }
+
+  private closeBlock(): string {
+    if (this.block < 0) return ""
+    const name = this.kind === "text" ? "content-end" : "tool-call-end"
+    const out = sse(name, `{"type":"${name}","index":${this.block}}`)
+    this.block = -1
+    this.kind = ""
+    this.tool = -1
+    return out
+  }
+}
+
+// A complete OpenAI SSE body as Cohere stream events.
+export function toCohereStream(openaiSse: string, model: string): string {
+  const conv = new CohereStream(model)
+  let out = ""
+  for (const line of openaiSse.split("\n")) {
+    if (!line.startsWith("data:")) continue
+    const payload = line.slice(5).trim()
+    if (payload === "") continue
+    try {
+      out += try conv.push(payload)
+    } catch (e) {
+      // a malformed chunk is skipped
+    }
+  }
+  return out + conv.end()
+}
+
+// ---- embeddings ----
+
+// The strings of a Cohere embed body's texts list.
+export function embedTexts(body: string): string[] throws SyntaxError {
+  const fs = try fields(body)
+  const texts = present(fs, "texts")
+  const out: string[] = []
+  if (texts === undefined) return out
+  for (const el of try elements(texts)) out.push(try decodeString(el))
+  return out
+}
+
+// Cohere v2 embed as an OpenAI embeddings request. Only float vectors are served;
+// input_type has no OpenAI counterpart and is dropped.
+export function embedToOpenAI(body: string, model: string): string throws SyntaxError {
+  const fs = try fields(body)
+  const texts = present(fs, "texts")
+  if (texts === undefined || !texts.startsWith("[")) throw new SyntaxError("embed request needs a texts list")
+  const types = present(fs, "embedding_types")
+  if (types !== undefined && !types.includes(`"float"`)) throw new SyntaxError("only float embeddings are supported")
+  const parts: string[] = [`"model":${quote(model)}`, `"input":${texts}`]
+  const dim = present(fs, "output_dimension")
+  if (dim !== undefined) parts.push(`"dimensions":${dim}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// An OpenAI embeddings response as a Cohere v2 embed response. Vectors are
+// ordered by index and stay as the raw text OpenAI sent.
+export function openAIToEmbed(openaiResponse: string, texts: string[]): string throws SyntaxError {
+  const fs = try fields(openaiResponse)
+  const dataRaw = present(fs, "data")
+  const items: { index: int, raw: string }[] = []
+  if (dataRaw !== undefined) {
+    for (const el of try elements(dataRaw)) {
+      const d = try fields(el)
+      const vec = present(d, "embedding")
+      if (vec === undefined) continue
+      const idx = rawNum(d, "index")
+      const index = idx === undefined ? items.length : Math.trunc(idx)
+      items.push({ index: index, raw: vec })
+    }
+  }
+  items.sort((a, b) => a.index - b.index)
+  const vecs = items.map((it) => it.raw)
+  const usageRaw = present(fs, "usage")
+  const usage: Field[] = usageRaw === undefined ? [] : try fields(usageRaw)
+  const pt = countOf(usage, "prompt_tokens")
+  const echoed = texts.map((t) => quote(t)).join(",")
+  return `{"id":${quote(newId("embed_"))},"embeddings":{"float":[${vecs.join(",")}]},"texts":[${echoed}],` +
+    `"meta":{"api_version":{"version":"2"},"billed_units":{"input_tokens":${pt}}}}`
+}
+
+// ---- rerank ----
+
+// Cohere v2 rerank as a Raiju /v1/rerank body. Documents become strings, and
+// return_documents defaults to false as Cohere does (Raiju's own default is true).
+export function rerankToRaiju(body: string): string throws SyntaxError {
+  const r = try parseRerank(body)
+  const fs = try fields(body)
+  const ret = rawBool(fs, "return_documents") === true ? "true" : "false"
+  const docs = r.documents.map((d) => quote(d)).join(",")
+  return `{"model":${quote(r.model)},"query":${quote(r.query)},"documents":[${docs}],"top_n":${r.topN},"return_documents":${ret}}`
+}
+
+// A Raiju rerank answer as a Cohere v2 rerank response. Search units come from
+// usage, or from a Cohere-style meta when the answer was passed through.
+export function raijuToRerank(raijuRerankResponse: string): string throws SyntaxError {
+  const fs = try fields(raijuRerankResponse)
+  const resRaw = present(fs, "results")
+  const items: string[] = []
+  if (resRaw !== undefined) {
+    for (const el of try elements(resRaw)) {
+      const r = try fields(el)
+      const index = find(r, "index") ?? "0"
+      const score = find(r, "relevance_score") ?? "0"
+      const doc = present(r, "document")
+      let docPart = ""
+      if (doc !== undefined) docPart = doc.startsWith("{") ? `,"document":${doc}` : `,"document":{"text":${doc}}`
+      items.push(`{"index":${index},"relevance_score":${score}${docPart}}`)
+    }
+  }
+  let units = 0
+  const usageRaw = present(fs, "usage")
+  if (usageRaw !== undefined) {
+    const uf = try fields(usageRaw)
+    units = countOf(uf, "search_units")
+  } else {
+    const metaRaw = present(fs, "meta")
+    if (metaRaw !== undefined) {
+      const mf = try fields(metaRaw)
+      const bu = present(mf, "billed_units")
+      if (bu !== undefined) {
+        const bf = try fields(bu)
+        units = countOf(bf, "search_units")
+      }
+    }
+  }
+  return `{"id":${quote(newId("rerank_"))},"results":[${items.join(",")}],` +
+    `"meta":{"api_version":{"version":"2"},"billed_units":{"search_units":${units}}}}`
+}
+
+// ---- tokenize ----
+
+// The text of a Cohere /v1/tokenize body.
+export function tokenizeText(body: string): string throws SyntaxError {
+  const fs = try fields(body)
+  const text = rawStr(fs, "text")
+  if (text === undefined) throw new SyntaxError("tokenize request needs text")
+  return text
+}
+
+function isContinuation(b: u8 | undefined): bool {
+  if (b === undefined) return false
+  const v = int(b)
+  return v >= 128 && v < 192
+}
+
+// Splits text into at most n pieces of about equal size. Cuts fall on character
+// boundaries, so every piece is valid UTF-8.
+function pieces(text: string, n: int): string[] {
+  const bytes = new TextEncoder().encode(text)
+  const total = bytes.length
+  const out: string[] = []
+  if (total === 0 || n <= 0) return out
+  let start = 0
+  for (let k = 1; k <= n; k++) {
+    let end = k === n ? total : Math.floor(total * k / n)
+    while (end < total && isContinuation(bytes[end])) end += 1
+    if (end > start) {
+      out.push(text.slice(start, end))
+      start = end
+    }
+  }
+  return out
+}
+
+// A placeholder id for a piece: a hash of its bytes, not a vocabulary id.
+function pieceId(s: string): int {
+  let h = 7
+  for (const b of new TextEncoder().encode(s)) h = (h * 31 + int(b)) % 1000000007
+  return h
+}
+
+// A Cohere /v1/tokenize answer. The caller passes the estimated token count
+// (estimateTokens in jobs.tov); the pieces are estimates, not model tokens.
+export function tokenizeResponse(text: string, tokens: int): string {
+  const ps = pieces(text, tokens)
+  const ids: string[] = []
+  const strs: string[] = []
+  for (const p of ps) {
+    ids.push(`${pieceId(p)}`)
+    strs.push(quote(p))
+  }
+  return `{"tokens":[${ids.join(",")}],"token_strings":[${strs.join(",")}],"meta":{"api_version":{"version":"1"}}}`
+}
+
+// ---- tests ----
+
+type Tok = { tokens: int[], token_strings: string[] }
+
+// The event name of each event in a Cohere SSE output.
+function eventNames(sse: string): string[] {
+  return sse.split("\n").filter((l) => l.startsWith("event: ")).map((l) => l.slice(7))
+}
+
+test("chat body maps sampling, stop, seed and stream", () => {
+  const raw = `{"model":"command-a","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}],` +
+    `"max_tokens":50,"temperature":0.3,"p":0.9,"k":5,"stop_sequences":["END"],"seed":7,"stream":true}`
+  const out = try chatToOpenAI(raw, "gpt-4o")
+  expect(out).toBe(`{"model":"gpt-4o","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}],` +
+    `"max_tokens":50,"temperature":0.3,"top_p":0.9,"stop":["END"],"seed":7,"stream":true,"stream_options":{"include_usage":true}}`)
+  const plain = try chatToOpenAI(`{"messages":[{"role":"user","content":"x"}],"stream":false}`, "m")
+  expect(plain).toBe(`{"model":"m","messages":[{"role":"user","content":"x"}],"stream":false}`)
+})
+
+test("user content keeps text and image parts; system and text arrays join", () => {
+  const raw = `{"messages":[{"role":"user","content":[{"type":"text","text":"what is"},
+    {"type":"image_url","image_url":{"url":"https://example.com/a.png"}},{"type":"thinking","thinking":"x"}]},
+    {"role":"system","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}]}`
+  const out = try chatToOpenAI(raw, "m")
+  expect(out).toBe(`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"what is"},` +
+    `{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]},{"role":"system","content":"onetwo"}]}`)
+})
+
+test("tool round trip: calls, results, tools, tool_choice and response format", () => {
+  const raw = `{"model":"command-a","messages":[
+    {"role":"user","content":"weather in Oslo?"},
+    {"role":"assistant","content":[{"type":"thinking","thinking":"hmm"}],"tool_plan":"I will check.",
+     "tool_calls":[{"id":"tc1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Oslo\\"}"}}]},
+    {"role":"tool","tool_call_id":"tc1","content":[{"type":"document","document":{"data":"{\\"temp\\":4}"}}]}],
+    "tools":[{"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object"}}}],
+    "tool_choice":"REQUIRED","response_format":{"type":"json_object","json_schema":{"type":"object"}}}`
+  const out = try chatToOpenAI(raw, "gpt-4o")
+  expect(out).toBe(`{"model":"gpt-4o","messages":[` +
+    `{"role":"user","content":"weather in Oslo?"},` +
+    `{"role":"assistant","content":null,"tool_calls":[{"id":"tc1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Oslo\\"}"}}]},` +
+    `{"role":"tool","tool_call_id":"tc1","content":"{\\"temp\\":4}"}],` +
+    `"response_format":{"type":"json_schema","json_schema":{"name":"response","schema":{"type":"object"}}},` +
+    `"tools":[{"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object"}}}],` +
+    `"tool_choice":"required"}`)
+  const none = try chatToOpenAI(`{"messages":[],"tool_choice":"NONE","response_format":{"type":"json_object"}}`, "m")
+  expect(none).toBe(`{"model":"m","messages":[],"response_format":{"type":"json_object"},"tool_choice":"none"}`)
+  const auto = try chatToOpenAI(`{"messages":[]}`, "m")
+  expect(auto.includes("tool_choice")).toBe(false)
+})
+
+test("openAIToChat converts text, tool calls, usage and finish reasons", () => {
+  const text = try openAIToChat(`{"id":"chatcmpl-9","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`)
+  expect(text).toBe(`{"id":"chatcmpl-9","finish_reason":"COMPLETE","message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]},` +
+    `"usage":{"billed_units":{"input_tokens":11,"output_tokens":2},"tokens":{"input_tokens":11,"output_tokens":2}}}`)
+  const tools = try openAIToChat(`{"id":"c2","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"look","arguments":"{\\"q\\":\\"cat\\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
+  expect(tools).toBe(`{"id":"c2","finish_reason":"TOOL_CALL","message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"look","arguments":"{\\"q\\":\\"cat\\"}"}}]},` +
+    `"usage":{"billed_units":{"input_tokens":3,"output_tokens":4},"tokens":{"input_tokens":3,"output_tokens":4}}}`)
+  const length = try openAIToChat(`{"id":"c3","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}]}`)
+  expect(length.includes(`"finish_reason":"MAX_TOKENS"`)).toBe(true)
+  expect(length.includes(`"billed_units":{"input_tokens":0,"output_tokens":0}`)).toBe(true)
+})
+
+test("a tool conversation survives the OpenAI side and comes back as Cohere", () => {
+  const req = try chatToOpenAI(`{"messages":[{"role":"user","content":"q"}],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}`, "m")
+  expect(req.includes(`"tools":[{"type":"function","function":{"name":"f","parameters":{}}}]`)).toBe(true)
+  const back = try openAIToChat(`{"id":"r","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+  expect(back.includes(`"content":[{"type":"text","text":"done"}]`)).toBe(true)
+})
+
+test("Cohere stream writes text, a tool call and usage in order", () => {
+  const conv = new CohereStream("m")
+  let out = ""
+  out += try conv.push(`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`)
+  out += try conv.push(`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"Let me look."},"finish_reason":null}]}`)
+  out += try conv.push(`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"look","arguments":""}}]},"finish_reason":null}]}`)
+  out += try conv.push(`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"q\\":"}}]},"finish_reason":null}]}`)
+  out += try conv.push(`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":null}]}`)
+  out += try conv.push(`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"t2","type":"function","function":{"name":"time","arguments":"{}"}}]},"finish_reason":null}]}`)
+  out += try conv.push(`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+  out += try conv.push(`{"id":"chatcmpl-1","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":9,"total_tokens":17}}`)
+  out += try conv.push("[DONE]")
+  expect(eventNames(out)).toEqual([
+    "message-start",
+    "content-start", "content-delta", "content-end",
+    "tool-call-start", "tool-call-delta", "tool-call-delta", "tool-call-end",
+    "tool-call-start", "tool-call-delta", "tool-call-end",
+    "message-end",
+  ])
+  expect(out.includes(`event: message-start\ndata: {"type":"message-start","id":"chatcmpl-1","delta":{"message":{"role":"assistant"}}}\n\n`)).toBe(true)
+  expect(out.includes(`data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"Let me look."}}}}`)).toBe(true)
+  expect(out.includes(`data: {"type":"tool-call-start","index":1,"delta":{"message":{"tool_calls":{"id":"t1","type":"function","function":{"name":"look","arguments":""}}}}}`)).toBe(true)
+  expect(out.includes(`data: {"type":"tool-call-delta","index":1,"delta":{"message":{"tool_calls":{"function":{"arguments":"{\\"q\\":"}}}}}`)).toBe(true)
+  expect(out.includes(`data: {"type":"tool-call-start","index":2,"delta":{"message":{"tool_calls":{"id":"t2","type":"function","function":{"name":"time","arguments":""}}}}}`)).toBe(true)
+  expect(out.includes(`data: {"type":"message-end","delta":{"finish_reason":"TOOL_CALL","usage":{"billed_units":{"input_tokens":8,"output_tokens":9},"tokens":{"input_tokens":8,"output_tokens":9}}}}`)).toBe(true)
+  expect(out.endsWith("\n\n")).toBe(true)
+  expect(try conv.push(`{"choices":[]}`)).toBe("")
+  expect(conv.end()).toBe("")
+})
+
+test("Cohere stream ends cleanly without usage or with a length stop", () => {
+  const conv = new CohereStream("m")
+  let out = try conv.push(`{"id":"a","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}`)
+  out += try conv.push(`{"id":"a","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"length"}]}`)
+  out += conv.end()
+  expect(eventNames(out)).toEqual(["message-start", "content-start", "content-delta", "content-delta", "content-end", "message-end"])
+  expect(out.includes(`"finish_reason":"MAX_TOKENS","usage":{"billed_units":{"input_tokens":0,"output_tokens":0}`)).toBe(true)
+  expect(conv.end()).toBe("")
+  const empty = new CohereStream("m")
+  expect(eventNames(empty.end())).toEqual(["message-start", "message-end"])
+})
+
+test("a Cohere stream converts back to OpenAI chunks", () => {
+  const conv = new CohereStream("m")
+  let wire = ""
+  wire += try conv.push(`{"id":"r1","choices":[{"index":0,"delta":{"content":"Checking"},"finish_reason":null}]}`)
+  wire += try conv.push(`{"id":"r1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"t9","type":"function","function":{"name":"f","arguments":"{\\"x\\":"}}]},"finish_reason":null}]}`)
+  wire += try conv.push(`{"id":"r1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}`)
+  wire += try conv.push(`{"id":"r1","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}`)
+  wire += try conv.push("[DONE]")
+  const back = new CohereToOpenAI("m", true)
+  const out = back.push(wire) + back.end()
+  expect(out.includes(`"content":"Checking"`)).toBe(true)
+  // the call opens with empty arguments; its fragments follow as deltas
+  expect(out.includes(`"id":"t9","type":"function","function":{"name":"f","arguments":""}`)).toBe(true)
+  expect(out.includes(`"arguments":"{\\"x\\":"`)).toBe(true)
+  expect(out.includes(`"arguments":"2}"`)).toBe(true)
+  expect(out.includes(`"finish_reason":"tool_calls"`)).toBe(true)
+  expect(out.includes(`"prompt_tokens":5,"completion_tokens":6,"total_tokens":11`)).toBe(true)
+  expect(back.done).toBe(true)
+})
+
+test("embed request and response keep order and reject non-float types", () => {
+  const body = `{"model":"embed-v4.0","texts":["a","b"],"input_type":"search_document","embedding_types":["float"]}`
+  expect(try embedToOpenAI(body, "cohere/embed")).toBe(`{"model":"cohere/embed","input":["a","b"]}`)
+  expect(try embedToOpenAI(`{"texts":["a"],"output_dimension":256}`, "m")).toBe(`{"model":"m","input":["a"],"dimensions":256}`)
+  let threw = false
+  try {
+    embedToOpenAI(`{"texts":["a"],"embedding_types":["int8"]}`, "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  const resp = `{"object":"list","data":[{"object":"embedding","index":1,"embedding":[0.5,0.25]},{"object":"embedding","index":0,"embedding":[1,2]}],"model":"m","usage":{"prompt_tokens":6,"total_tokens":6}}`
+  const out = try openAIToEmbed(resp, ["a", "b"])
+  expect(out.includes(`"embeddings":{"float":[[1,2],[0.5,0.25]]}`)).toBe(true)
+  expect(out.includes(`"texts":["a","b"]`)).toBe(true)
+  expect(out.includes(`"meta":{"api_version":{"version":"2"},"billed_units":{"input_tokens":6}}`)).toBe(true)
+})
+
+test("rerank request defaults return_documents to false and reads {text} documents", () => {
+  const body = `{"model":"rerank-v3.5","query":"q","documents":["x",{"text":"y"}],"top_n":1}`
+  expect(try rerankToRaiju(body)).toBe(`{"model":"rerank-v3.5","query":"q","documents":["x","y"],"top_n":1,"return_documents":false}`)
+  const withDocs = try rerankToRaiju(`{"model":"r","query":"q","documents":["x"],"return_documents":true}`)
+  expect(withDocs).toBe(`{"model":"r","query":"q","documents":["x"],"top_n":1,"return_documents":true}`)
+  let threw = false
+  try {
+    rerankToRaiju(`{"model":"r","documents":["x"]}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("rerank answer maps results, documents and search units", () => {
+  const raiju = `{"results":[{"index":1,"relevance_score":0.9,"document":{"text":"y"}},{"index":0,"relevance_score":0.2}],"model":"m","usage":{"search_units":1}}`
+  const out = try raijuToRerank(raiju)
+  expect(out.includes(`"results":[{"index":1,"relevance_score":0.9,"document":{"text":"y"}},{"index":0,"relevance_score":0.2}]`)).toBe(true)
+  expect(out.includes(`"meta":{"api_version":{"version":"2"},"billed_units":{"search_units":1}}`)).toBe(true)
+  const passed = try raijuToRerank(`{"results":[{"index":0,"relevance_score":0.5,"document":"x"}],"meta":{"billed_units":{"search_units":3}}}`)
+  expect(passed.includes(`"document":{"text":"x"}`)).toBe(true)
+  expect(passed.includes(`"search_units":3`)).toBe(true)
+})
+
+test("tokenize splits text into pieces that join back to the text", () => {
+  expect(try tokenizeText(`{"text":"hi there","model":"x"}`)).toBe("hi there")
+  const text = "héllo wörld, 日本語 ok"
+  const n = estimateTokens(text)
+  const t = try JSON.parse(tokenizeResponse(text, n)) as Tok
+  expect(t.token_strings.length <= n).toBe(true)
+  expect(t.token_strings.length).toBe(t.tokens.length)
+  expect(t.token_strings.join("")).toBe(text)
+  const cjk = try JSON.parse(tokenizeResponse("日本語", 2)) as Tok
+  expect(cjk.token_strings.join("")).toBe("日本語")
+  expect(cjk.token_strings.length).toBe(2)
+  const empty = try JSON.parse(tokenizeResponse("", 5)) as Tok
+  expect(empty.token_strings.length).toBe(0)
+  const short = try JSON.parse(tokenizeResponse("abc", 10)) as Tok
+  expect(short.token_strings.join("")).toBe("abc")
+  expect(tokenizeResponse("abc", 3).includes(`"meta":{"api_version":{"version":"1"}}`)).toBe(true)
+})
+
+test("a buffered OpenAI stream converts to Cohere events", () => {
+  const sse = `data: {"id":"s1","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}
+
+data: {"id":"s1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"s1","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}
+
+data: [DONE]
+
+`
+  const out = toCohereStream(sse, "m")
+  expect(eventNames(out)).toEqual(["message-start", "content-start", "content-delta", "content-end", "message-end"])
+  expect(out.includes(`"finish_reason":"COMPLETE","usage":{"billed_units":{"input_tokens":3,"output_tokens":1}`)).toBe(true)
+})
+
+test("embed texts read back in order, with escapes", () => {
+  const t = try embedTexts(`{"texts":["a","b\\n\\"c\\""],"model":"m"}`)
+  expect(t.length).toBe(2)
+  expect(t[0]).toBe("a")
+  expect(t[1]).toBe("b\n\"c\"")
+  const none = try embedTexts(`{"model":"m"}`)
+  expect(none.length).toBe(0)
+})

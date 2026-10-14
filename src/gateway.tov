@@ -5,6 +5,9 @@ import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, s
 import { ChatRequest, errorJson, newId, Hdrs, snapshot } from "./schemas"
 import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI } from "./streams"
 import { CohereToOpenAI } from "./streams_cohere"
+import { CohereStream } from "./cohere_in"
+import { GenAIStream } from "./genai_in"
+import { ConverseStream, InvokeStream } from "./bedrock_in"
 import { StreamState } from "./providers/anthropic_in"
 import { AffinityStore, resolveSticky, sessionId, sessionTtl, affinityMode } from "./affinity"
 import { Tier, tierTarget, overrideTier } from "./complexity"
@@ -48,6 +51,8 @@ export class StreamSink {
   // the client went away: stop reading the upstream
   cancelled = false
   constructor(readonly open: (status: int, headers: Map<string, string>) => void, readonly write: (chunk: string) => void, readonly close: () => void) {}
+  // binary event-stream frames (Bedrock's streaming routes); only the Bun.serve path sets it
+  writeBytes: ((chunk: u8[]) => void) | undefined = undefined
 }
 
 // Turns a provider's streaming body into OpenAI SSE events as bytes arrive.
@@ -60,6 +65,13 @@ export class StreamConverter {
   br: BedrockEventStreamToOpenAI | undefined = undefined
   co: CohereToOpenAI | undefined = undefined
   readonly dec: TextDecoder | undefined = utf8Decoder()
+  // output converters: the client's own stream format (one is set, or none)
+  gen: GenAIStream | undefined = undefined
+  cohereOut: CohereStream | undefined = undefined
+  cv: ConverseStream | undefined = undefined
+  iv: InvokeStream | undefined = undefined
+  // binary frames for the client, taken with takeFrames()
+  private frames: u8[] = []
 
   constructor(readonly kind: string, requested: string, includeUsage: bool) {
     if (kind === "anthropic") this.an = new AnthropicToOpenAI(requested, includeUsage)
@@ -90,6 +102,37 @@ export class StreamConverter {
     this.out = new StreamState(model)
   }
 
+  asGenAI(model: string): void {
+    this.gen = new GenAIStream(model)
+  }
+
+  asCohere(model: string): void {
+    this.cohereOut = new CohereStream(model)
+  }
+
+  asConverse(): void {
+    this.cv = new ConverseStream()
+  }
+
+  asInvoke(model: string): void {
+    this.iv = new InvokeStream(model)
+  }
+
+  // Bedrock's event streams are binary, so their frames are kept apart from the text.
+  framed(): bool {
+    return this.cv !== undefined || this.iv !== undefined
+  }
+
+  takeFrames(): u8[] {
+    const f = this.frames
+    this.frames = []
+    return f
+  }
+
+  private collect(bytes: u8[]): void {
+    for (const b of bytes) this.frames.push(b)
+  }
+
   push(bytes: u8[]): string {
     if (this.raw) {
       const t = this.text(bytes)
@@ -106,13 +149,26 @@ export class StreamConverter {
       return ""
     }
     const tail = this.post(this.innerEnd())
+    const cv = this.cv
+    if (cv !== undefined) this.collect(cv.end())
+    const iv = this.iv
+    if (iv !== undefined) this.collect(iv.end())
     const st = this.out
-    return st === undefined ? tail : tail + st.end()
+    if (st !== undefined) return tail + st.end()
+    const g = this.gen
+    if (g !== undefined) return tail + g.end()
+    const co = this.cohereOut
+    if (co !== undefined) return tail + co.end()
+    return tail
   }
 
   private post(s: string): string {
     const st = this.out
-    if (st === undefined) return s
+    const g = this.gen
+    const co = this.cohereOut
+    const cv = this.cv
+    const iv = this.iv
+    if (st === undefined && g === undefined && co === undefined && cv === undefined && iv === undefined) return s
     this.pending += s
     let res = ""
     while (true) {
@@ -125,7 +181,11 @@ export class StreamConverter {
         const payload = line.slice(5).trim()
         if (payload === "" || payload === "[DONE]") continue
         try {
-          res += st.push(payload)
+          if (cv !== undefined) this.collect(cv.push(payload))
+          else if (iv !== undefined) this.collect(iv.push(payload))
+          else if (st !== undefined) res += st.push(payload)
+          else if (g !== undefined) res += g.push(payload)
+          else if (co !== undefined) res += co.push(payload)
         } catch (e) {
           // a malformed chunk is skipped
         }
@@ -696,7 +756,7 @@ export class Engine {
           const stream = res.body
           if (conv !== undefined && sink !== undefined && stream !== undefined) {
             // Past this point the client has bytes, so there's no retry or fallback.
-            ctx.outHeaders.set("content-type", "text/event-stream")
+            ctx.outHeaders.set("content-type", conv.framed() ? "application/vnd.amazon.eventstream" : "text/event-stream")
             ctx.outHeaders.set("cache-control", "no-cache")
             ctx.outHeaders.set("x-bf-attempts", "" + attempts)
             routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs)
@@ -723,13 +783,20 @@ export class Engine {
                     lastAt = at
                     sink.write(out)
                   }
+                  const fb = conv.takeFrames()
+                  const wb = sink.writeBytes
+                  if (wb !== undefined && fb.length > 0) wb(fb)
                 }
               }
             } catch (e) {
-              sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
+              // a binary stream just ends: a text error would corrupt its frames
+              if (!conv.framed()) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
             }
             const tail = conv.end()
             if (tail !== "") sink.write(tail)
+            const fe = conv.takeFrames()
+            const we = sink.writeBytes
+            if (we !== undefined && fe.length > 0) we(fe)
             sink.close()
             dl.finish()
             upstreamMs += performance.now() - started
