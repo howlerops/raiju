@@ -15,7 +15,7 @@ const GW = "http://127.0.0.1:18198"
 const dir = mkdtempSync(join(tmpdir(), "raiju-ui-"))
 const config = join(dir, "config.json")
 writeFileSync(config, JSON.stringify({
-  client: { enable_logging: false },
+  client: { enable_logging: false, enforce_auth_on_inference: false },
   providers: { openai: { keys: [{ name: "main", value: "sk-ui-test", models: [], weight: 1 }], network_config: { base_url: "http://127.0.0.1:18199" } } },
   governance: { auth_config: { token: "admin-secret" }, budgets: [{ id: "monthly", max_limit: 50, reset_duration: "1M" }] },
   logs_store: { enabled: true, dir: join(dir, "logs") },

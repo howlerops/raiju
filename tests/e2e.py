@@ -110,7 +110,7 @@ def write_config():
     b["cluster"] = {**cfg["cluster"], "node_id": "b", "peers": [GW]}
     json.dump(b, open(os.path.join(BUILD, "e2e.node-b.json"), "w"))
     # a single node with three workers: a 3-request limit and the response cache are shared between them
-    w = {"client": {"enable_logging": False}, "providers": {"openai": cfg["providers"]["openai"]}, "cache": {"enabled": True, "ttl_seconds": 60},
+    w = {"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "providers": {"openai": cfg["providers"]["openai"]}, "cache": {"enabled": True, "ttl_seconds": 60},
          "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-wlogs")},
          "governance": {"rate_limits": [{"id": "w-rl", "request_max_limit": 3, "request_reset_duration": "1h"}], "virtual_keys": [{"id": "vk-w", "value": "sk-bf-workers", "rate_limit_id": "w-rl"}]}}
     json.dump(w, open(os.path.join(BUILD, "e2e.workers.json"), "w"))

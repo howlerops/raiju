@@ -78,6 +78,14 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 - **Observability:** Prometheus `/metrics` with Bifrost's metric names,
   `x-bifrost-request-id`, JSON request logs, `x-bf-overhead-us`.
 
+## Inference auth
+
+As in Bifrost, `client.enforce_auth_on_inference` makes inference require a virtual key, or
+admin credentials. When it is omitted, Raiju turns it on if the config has credentials to
+use (virtual keys, admin users or `auth_config`), and leaves it off otherwise. Set it to
+`false` to serve anonymous inference with keys configured. `auth_config` takes Bifrost's
+`admin_username`, `admin_password` and `is_enabled`, at the top level or under `governance`.
+
 ## Servers
 
 The default server is Tov's built-in `Bun.serve`. `-workers N` forks N
