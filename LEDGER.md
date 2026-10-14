@@ -141,24 +141,31 @@ and 249 missing out of 497 features. P0 are the gaps a Bifrost user hits on swit
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L46 | G8 | Cohere SDK routes (chat, embed, rerank, tokenize; streaming) | worker → lead | module done (`cohere_in.tov`); integrating |
-| L47 | G11 | GenAI SDK cross-provider, models routes, countTokens, streaming | worker → lead | module done (`genai_in.tov`); integrating |
-| L48 | G6, G12 | Bedrock SDK cross-provider, converse-stream, invoke-with-response-stream, count-tokens | worker → lead | module done (`bedrock_in.tov`); integrating |
-| L49 | G19 | Reasoning parameters → Anthropic, Gemini, Bedrock | worker → lead | module done (`reasoning.tov`); integrating |
-| L50 | G23 | RE2 regex for `matches`, Bifrost CEL variables | worker → lead | done: unit (regex 17, cel 40); wired in route() |
-| L51 | G24, G25, G27 | Azure Entra ID, Bedrock assume-role, Bedrock Mantle | worker → lead | module done (`cloud_auth.tov`, `bedrock_mantle.tov`); integrating |
-| L52 | G29 | OTLP metrics push | worker → lead | done: unit; wired in ops |
+| L46 | G8 | Cohere SDK routes (chat, embed, rerank, tokenize; streaming) | worker; wired by L61 | done: unit + e2e |
+| L47 | G11 | GenAI SDK cross-provider, models routes, countTokens, streaming | worker; wired by L61 | done: unit + e2e |
+| L48 | G6, G12 | Bedrock SDK cross-provider, converse-stream, invoke-with-response-stream, count-tokens | worker; wired by L61 | done: unit + e2e (event-stream CRCs checked); http1 answers Bedrock streams whole |
+| L49 | G19 | Reasoning parameters → Anthropic, Gemini, Bedrock; reasoning text back | worker → lead | done: unit + e2e |
+| L50 | G23 | RE2 regex for `matches`, Bifrost CEL variables (percent units, "" when absent) | worker → lead | done: unit |
+| L51 | G24, G25, G27 | Azure Entra ID, Bedrock assume-role, Bedrock Mantle | worker → lead | done: unit (fixed Microsoft/AWS hosts, no e2e) |
+| L52 | G29 | OTLP metrics push | worker → lead | done: unit |
 | L53 | G31 | Teams and PagerDuty channels, rate-limit metrics, channel cooldowns | worker → lead | done: unit; Bifrost channel mapping |
-| L54 | G10 | Anthropic SDK models, message batches, files | worker | assigned |
-| L55 | G16 | Native batches and files for Anthropic and Gemini; Gemini speech/images | worker | assigned |
-| L56 | G18 | Bifrost metric names and enrichment labels | worker | assigned |
-| L57 | G21 | Governance model configs, provider governance, management routes | worker | assigned |
-| L58 | G22 | MCP client and virtual MCP management API, client config fields | worker | assigned |
-| L59 | G30 | Bifrost semanticcache plugin config; Qdrant and Redis vector stores | worker | assigned |
-| L60 | G31 | Bifrost alert rules (CEL over scope usage) and `/api/alerting/*` | worker | assigned |
-| X20 | G13, G15 | Responses lifecycle; realtime client_secrets, sessions, calls | lead | todo |
-| X21 | G20, G28, G33 | Content-logging control; rerank semantics; count-token labelling | lead | todo |
-| X22 | G26 | TLS options (needs a Tov fetch check) | lead | todo |
+| L54 | G10 | Anthropic SDK models, message batches, files | worker; wiring in L62 | module done |
+| L55 | G16 | Native batches and files for Anthropic and Gemini; Gemini speech/images | worker; wiring in L62 | module done |
+| L56 | G18 | Bifrost metric names and enrichment labels | worker → lead | done: unit + e2e |
+| L57 | G21 | Governance model configs, provider governance, management routes | worker → lead | done: unit + e2e |
+| L58 | G22 | MCP client and virtual MCP management API | worker → lead | done: unit + e2e; also fixed GET /api/config leaking MCP, OIDC, cluster and store secrets |
+| L59 | G30 | Bifrost semanticcache plugin config; Qdrant and Redis vector stores | worker → lead | done: unit + e2e (Qdrant REST mock); RediSearch untested against a real server |
+| L60 | G31 | Bifrost alert rules (CEL over scope usage) and `/api/alerting/*` | worker → lead | done: unit + e2e |
+| L61 | G6, G8, G11, G12 | Wire L46–L48 into the routes, one route kind for streaming | worker | done: e2e on both servers |
+| L62 | G10, G16 | Wire L54 and L55 | worker | assigned |
+| L63 | G29 | Bifrost otel plugin options (trace headers, TLS, request headers, excluded attributes) | worker | assigned |
+| L64 | G34, G39, G49 | Direct keys, raw request/response echo, drop_excess_requests, prometheus_labels | worker | assigned |
+| L65 | G38 | Remaining chat providers (databricks, cloudflare, ...) | worker | assigned |
+| L66 | G50 | Bare-model provider resolution through the catalog; chained aliases | worker | assigned |
+| L67 | G35, G47 | Passthrough routes; /api/version, /api/models, /api/keys, PUT /api/config | worker | assigned |
+| X20 | G13, G15 | Responses lifecycle; realtime client_secrets, sessions, calls | lead | done: e2e |
+| X21 | G20, G28 | Content-logging control; rerank semantics (vLLM native, error otherwise, raiju/lexical) | lead | done: e2e |
+| X22 | G26 | TLS options (insecure_skip_verify, ca_cert_pem) | lead | done: e2e against a private-CA HTTPS upstream |
 
 Earlier summary of the wave:
 
