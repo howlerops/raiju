@@ -121,6 +121,38 @@ Integration glue (lead): `src/ops.tov` (RBAC gate, audit, alert, cluster and exp
 - Access profiles: a deleted profile would have silently lifted its limits. Keys now fail closed, and deleting a profile that is in use is refused.
 - `connection_string` was required, so stdio MCP configs failed to load.
 
+## Wave 8: Bifrost parity P0 (from docs/parity.md)
+
+The parity audit (docs/parity.md, against Bifrost main 6c84d7a) found 107 done, 124 partial
+and 249 missing out of 497 features. P0 are the gaps a Bifrost user hits on switching.
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L43 | G4 | Bifrost price datasheet (5,125 models) embedded and synced; pricing_overrides | worker | assigned |
+| L44 | G3 | Read Bifrost's `guardrails_config` | worker | assigned |
+| L45 | G7, G48, G49 | Bifrost section names (`alerting`, `audit_logs`, `cluster_config`, ...) and unknown-key warnings | worker | assigned |
+| X15 | G1 | Async: `/v1/async/<op>/{id}`, Bifrost status names, missing ops | lead | todo |
+| X16 | G2 | `client.enforce_auth_on_inference` and `auth_config.is_enabled` | lead | todo |
+| X17 | G5, G14 | Everything under `/openai/v1/*`; `GET /v1/models/{id}` | lead | todo |
+| X18 | G6 | Bedrock SDK `converse-stream` and `invoke-with-response-stream` | lead | todo |
+| X19 | G32 | SCOPE.md rows corrected to partial | lead | done |
+
+## Wave 9: Bifrost parity P1 (queued)
+
+G8–G31, G33 in docs/parity.md: Cohere and PydanticAI SDK routes, Anthropic models/batches/files,
+GenAI and Bedrock cross-provider, responses lifecycle, WebRTC realtime, media for non-OpenAI
+providers, the x-bifrost-* response headers, metric names and labels, reasoning parameters,
+content-logging control, governance model configs and provider budgets, MCP management API,
+CEL variables, Azure Entra ID, Bedrock IAM roles, TLS options, Bedrock Mantle, rerank semantics,
+OTel metrics, semantic cache plugin config and vector stores, alert channels, count-token labelling.
+
+## P2 decisions for the owner
+
+G34–G50 are mostly product decisions (passthrough routes, decisions API, compat plugin, more
+providers, raw request echo, live/WebSocket responses, projects and custom RBAC, more log sinks
+and guardrail engines, cluster discovery, auth proxies, the remaining management API and config
+keys). See docs/parity.md.
+
 ## Next
 
 Everything in SCOPE.md is done except the five "Out" items. Remaining limits are in the README's Known gaps.

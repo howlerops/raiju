@@ -1,5 +1,7 @@
 # Raiju scope
 
+Bifrost feature parity in detail, with every gap: [docs/parity.md](docs/parity.md).
+
 Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6SjdriReWQr) (P0 first release, P1 next, P2 later, Out not building). Status is what this repository does today.
 
 ## P0
@@ -9,22 +11,22 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Chat completions + streaming | done (chunk-by-chunk on the default server) |
 | Embeddings | done (OpenAI-format, Cohere, Gemini, Vertex, Bedrock Titan and Cohere) |
 | List models | done |
-| Realtime (WebSocket) | done (OpenAI, Azure) |
+| Realtime (WebSocket) | done for WebSocket (OpenAI, Azure); no WebRTC calls, client secrets or sessions |
 | Exact-match cache | done |
-| Anthropic SDK route | done (any provider, streaming chunk by chunk) |
-| Bedrock SDK route | done |
-| Google GenAI SDK route | done |
-| OpenAI SDK route | done |
+| Anthropic SDK route | partial: messages (any provider, streaming); no models, batches or files routes |
+| Bedrock SDK route | partial: converse and invoke to Bedrock only; no streaming routes, count-tokens or rerank |
+| Google GenAI SDK route | partial: generateContent family to Gemini only; no models, files, batches or cached contents |
+| OpenAI SDK route | partial: chat, completions, embeddings, responses, models list; audio, images, files, batches and responses lifecycle not under /openai/v1 |
 | Budgets | done |
 | Rate limits | done |
 | Cost tracking | done |
 | Virtual keys | done |
 | Request IDs | done |
-| Prometheus metrics | done |
-| config.json compatibility | done |
+| Prometheus metrics | partial: core bifrost_* series; Bifrost's label set and some series missing |
+| config.json compatibility | partial: see docs/parity.md (c); several Bifrost section names are not read yet |
 | Multi-core workers | done (budgets, rate limits and cache shared between workers) |
 | Anthropic | done |
-| Azure OpenAI | done |
+| Azure OpenAI | partial: API keys; no Entra ID |
 | AWS Bedrock | SigV4 or API key |
 | Gemini | done |
 | Ollama / vLLM / SGLang | done |
@@ -40,10 +42,10 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Feature | Status |
 |---|---|
 | Async jobs | done |
-| Audio (speech, transcription) | done |
+| Audio (speech, transcription) | partial: OpenAI-format and Azure providers only |
 | Text completions | done |
-| Files and batches | done |
-| Images | done |
+| Files and batches | partial: OpenAI-format and Azure providers only |
+| Images | partial: OpenAI-format and Azure providers only |
 | Rerank, OCR, count tokens | done |
 | Responses API | done |
 | Semantic cache | done |
