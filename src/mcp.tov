@@ -2,6 +2,7 @@
 // HTTP, lists their tools so chat requests can offer them to the model, and runs
 // the tool calls the model makes. The protocol lives in pure functions that test
 // without a network; McpSession and McpManager wrap them around fetch.
+import { McpAuthConfig, TokenCache, staticHeaders, tokenRequest, discoveryUrls, parseAuthServerMetadata } from "./mcpauth"
 import { fields, elements, find, rawStr, rawBool, rawNum, quote, build, setField, isNull, decodeString } from "./json"
 import { deadline } from "./deadline"
 
@@ -14,6 +15,8 @@ export type McpClientConfig = {
   headers?: Map<string, string>,
   tools_to_execute?: string[],
   tools_to_skip?: string[],
+  // credentials for the server: a bearer token, extra headers, or OAuth (client credentials, refresh token)
+  auth?: McpAuthConfig,
 }
 
 export type McpConfig = {
@@ -303,6 +306,9 @@ export class McpSession {
   private exposed: Map<string, string> = new Map()
 
   readonly timeoutMs: int
+  private tokens = new TokenCache()
+  // the OAuth token endpoint, from auth.token_url or the server's metadata
+  private tokenUrl = ""
 
   // timeoutMs bounds each tool call.
   constructor(readonly cfg: McpClientConfig, timeoutMs?: int) {
@@ -322,6 +328,13 @@ export class McpSession {
     if (extra !== undefined) {
       for (const k of extra.keys()) h.set(k.toLowerCase(), extra.get(k)!)
     }
+    const a = this.cfg.auth
+    if (a !== undefined) {
+      const sh = staticHeaders(a)
+      for (const k of sh.keys()) h.set(k, sh.get(k)!)
+      const bearer = this.tokens.header(this.cfg.name, Date.now())
+      if (bearer !== undefined) h.set("authorization", bearer)
+    }
     h.set("content-type", "application/json")
     h.set("accept", "application/json, text/event-stream")
     if (this.sessionId !== "") h.set("mcp-session-id", this.sessionId)
@@ -329,8 +342,63 @@ export class McpSession {
     return h
   }
 
-  // POSTs one message under a deadline. The session id from the server is kept for later requests.
+  private isOAuth(): bool {
+    const t = this.cfg.auth?.type
+    return t === "oauth_client_credentials" || t === "oauth_refresh_token"
+  }
+
+  // Gets an OAuth access token (client credentials, or the refresh token), finding the
+  // token endpoint in the server's authorization metadata when none is configured.
+  private async fetchToken(): Promise<void> throws Error {
+    const a = this.cfg.auth
+    if (a === undefined) return
+    if (this.tokenUrl === "") this.tokenUrl = a.token_url ?? ""
+    if (this.tokenUrl === "") {
+      const urls = discoveryUrls(this.cfg.connection_string)
+      if (urls.length < 2) throw new Error(`${this.cfg.name}: no token_url and no metadata URL`)
+      const dl = deadline(CONNECT_TIMEOUT_MS)
+      try {
+        const r = await fetch(urls[1]!, { signal: dl.controller.signal })
+        this.tokenUrl = parseAuthServerMetadata(await r.text()).token_endpoint
+      } catch (e) {
+        throw new Error(`${this.cfg.name}: OAuth metadata: ${e.message}`)
+      } finally {
+        dl.finish()
+      }
+    }
+    const refresh = a.type === "oauth_refresh_token"
+    const rt = this.tokens.refreshToken(this.cfg.name)
+    let req = a
+    req.token_url = this.tokenUrl
+    if (refresh && rt !== undefined) req.refresh_token = rt
+    const tr = try tokenRequest(req)
+    const dl = deadline(CONNECT_TIMEOUT_MS)
+    try {
+      const hs: Record<string, string> = tr.headers
+      const r = await fetch(tr.url, { method: "POST", headers: hs, body: tr.body, signal: dl.controller.signal })
+      const text = await r.text()
+      if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`)
+      this.tokens.store(this.cfg.name, text, Date.now())
+    } catch (e) {
+      throw new Error(`${this.cfg.name}: OAuth token request failed: ${e.message}`)
+    } finally {
+      dl.finish()
+    }
+  }
+
+  // POSTs one message, with an OAuth token when the server needs one: fetched first if
+  // missing, and once more after a 401.
   private async exchange(body: string, timeoutMs: int): Promise<Reply> throws Error {
+    if (this.isOAuth() && this.tokens.header(this.cfg.name, Date.now()) === undefined) try await this.fetchToken()
+    const first = try await this.send(body, timeoutMs)
+    if (first.status !== 401 || !this.isOAuth()) return first
+    this.tokens.invalidate(this.cfg.name)
+    try await this.fetchToken()
+    return try await this.send(body, timeoutMs)
+  }
+
+  // POSTs one message under a deadline. The session id from the server is kept for later requests.
+  private async send(body: string, timeoutMs: int): Promise<Reply> throws Error {
     const dl = deadline(timeoutMs)
     let reply: Reply = { status: 0, contentType: "", body: "" }
     try {

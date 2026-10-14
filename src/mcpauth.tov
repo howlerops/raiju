@@ -1,0 +1,434 @@
+// Authentication for the gateway's outbound connections to MCP servers (MCP
+// authorization, which is OAuth 2.1). Everything here is pure: builders for the
+// token request and the discovery URLs, parsers for the metadata and the 401
+// challenge, and a token cache. The HTTP calls are made by the caller.
+import { fields, rawStr, rawNum } from "./json"
+import { encode } from "./base64"
+
+export type McpAuthConfig = {
+  type: "none" | "bearer" | "headers" | "oauth_client_credentials" | "oauth_refresh_token",
+  token?: string,
+  headers?: Map<string, string>,
+  token_url?: string,
+  client_id?: string,
+  client_secret?: string,
+  refresh_token?: string,
+  scope?: string,
+  audience?: string,
+  auth_method?: "client_secret_basic" | "client_secret_post",
+}
+
+// A token this close to its expiry counts as expired, so a request never leaves
+// carrying a token that dies in flight.
+const EXPIRY_MARGIN_MS = 60000
+const DEFAULT_EXPIRES_IN_S: number = 3600
+const HEX = "0123456789ABCDEF"
+const PARAM = "resource_metadata="
+
+// RFC 3986 unreserved bytes are never escaped.
+function isUnreserved(c: int): bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45 || c === 46 || c === 95 || c === 126
+}
+
+// Percent-encodes a value for a form body or a Basic credential (RFC 6749 appendix B).
+// Works on bytes, so non-ASCII text is escaped as its UTF-8 bytes.
+function formEncode(s: string): string throws Error {
+  const hex = new TextEncoder().encode(HEX)
+  const out: u8[] = []
+  for (const b of new TextEncoder().encode(s)) {
+    const c = int(b)
+    if (isUnreserved(c)) {
+      out.push(b)
+    } else {
+      out.push(u8(37))
+      out.push(hex[c >> 4]!)
+      out.push(hex[c & 15]!)
+    }
+  }
+  return try new TextDecoder().decode(out)
+}
+
+// Headers for a static configuration. "bearer" gives an authorization header;
+// "headers" gives the configured headers with lower-cased names. The OAuth types
+// get their header from TokenCache, so they return an empty map here.
+export function staticHeaders(a: McpAuthConfig): Map<string, string> {
+  const h: Map<string, string> = new Map()
+  if (a.type === "bearer") {
+    const t = a.token ?? ""
+    if (t !== "") h.set("authorization", `Bearer ${t}`)
+  } else if (a.type === "headers") {
+    const extra = a.headers
+    if (extra !== undefined) {
+      for (const k of extra.keys()) h.set(k.toLowerCase(), extra.get(k)!)
+    }
+  }
+  return h
+}
+
+// The POST that fetches an access token for an OAuth grant. A client secret
+// goes in a Basic header (client_secret_basic, the default) or in the body
+// (client_secret_post). With no secret the client is public: its id goes in the
+// body, which only the refresh grant allows.
+export function tokenRequest(a: McpAuthConfig): { url: string, headers: Map<string, string>, body: string } throws Error {
+  const isCC = a.type === "oauth_client_credentials"
+  if (!isCC && a.type !== "oauth_refresh_token") throw new Error(`auth type ${a.type} has no token request`)
+  const url = a.token_url ?? ""
+  if (!url.startsWith("https://") && !url.startsWith("http://")) throw new Error("token_url must be an http or https URL")
+  const clientId = a.client_id ?? ""
+  if (clientId === "") throw new Error("client_id is required")
+  const sec = a.client_secret ?? ""
+  const hasSecret = sec !== ""
+  if (isCC && !hasSecret) throw new Error("client_credentials needs a client_secret")
+
+  const parts: string[] = []
+  if (isCC) {
+    parts.push("grant_type=client_credentials")
+  } else {
+    const rt = a.refresh_token ?? ""
+    if (rt === "") throw new Error("refresh_token is required")
+    const rtEnc = try formEncode(rt)
+    parts.push("grant_type=refresh_token", "refresh_token=" + rtEnc)
+  }
+  const scope = a.scope ?? ""
+  if (scope !== "") {
+    const scopeEnc = try formEncode(scope)
+    parts.push("scope=" + scopeEnc)
+  }
+  const audience = a.audience ?? ""
+  if (audience !== "") {
+    const audEnc = try formEncode(audience)
+    parts.push("audience=" + audEnc)
+  }
+
+  const headers: Map<string, string> = new Map()
+  headers.set("content-type", "application/x-www-form-urlencoded")
+  headers.set("accept", "application/json")
+  const method = a.auth_method ?? "client_secret_basic"
+  const idEnc = try formEncode(clientId)
+  if (hasSecret && method === "client_secret_basic") {
+    const secEnc = try formEncode(sec)
+    const cred = idEnc + ":" + secEnc
+    headers.set("authorization", "Basic " + encode(new TextEncoder().encode(cred)))
+  } else {
+    parts.push("client_id=" + idEnc)
+    if (hasSecret) {
+      const secEnc = try formEncode(sec)
+      parts.push("client_secret=" + secEnc)
+    }
+  }
+  return { url: url, headers: headers, body: parts.join("&") }
+}
+
+type Entry = { access: string, expiresAt: number, refresh: string }
+
+// Access and refresh tokens per MCP server, keyed by the server's name. Share one
+// cache per gateway. Methods take the time in ms so tests need no clock.
+export class TokenCache {
+  private entries: Map<string, Entry> = new Map()
+
+  // "Bearer <token>" while the token is valid for more than 60 s, else undefined.
+  header(serverName: string, nowMs: number): string | undefined {
+    const e = this.entries.get(serverName)
+    if (e === undefined || e.access === "") return undefined
+    if (e.expiresAt - nowMs <= EXPIRY_MARGIN_MS) return undefined
+    return `Bearer ${e.access}`
+  }
+
+  // Stores a token endpoint response. expires_in defaults to 3600 s when absent or
+  // not a positive number. A response without a refresh_token keeps the old one.
+  store(serverName: string, responseJson: string, nowMs: number): void throws SyntaxError {
+    const fs = try fields(responseJson)
+    const access = rawStr(fs, "access_token") ?? ""
+    if (access === "") throw new SyntaxError("token response has no access_token")
+    const expiresIn = rawNum(fs, "expires_in")
+    let secs: number = DEFAULT_EXPIRES_IN_S
+    if (expiresIn !== undefined && expiresIn > 0) secs = expiresIn
+    let refresh = rawStr(fs, "refresh_token") ?? ""
+    const old = this.entries.get(serverName)
+    if (refresh === "" && old !== undefined) refresh = old.refresh
+    this.entries.set(serverName, { access: access, expiresAt: nowMs + secs * 1000, refresh: refresh })
+  }
+
+  // The stored refresh token, if any.
+  refreshToken(serverName: string): string | undefined {
+    const e = this.entries.get(serverName)
+    if (e === undefined || e.refresh === "") return undefined
+    return e.refresh
+  }
+
+  // Drops the access token after a 401. The refresh token stays so the caller can
+  // still refresh; if the refresh fails too, it should fetch a new grant.
+  invalidate(serverName: string): void {
+    const e = this.entries.get(serverName)
+    if (e === undefined) return
+    this.entries.set(serverName, { access: "", expiresAt: 0, refresh: e.refresh })
+  }
+}
+
+// Lower-cases ASCII letters only. The byte length is kept, so offsets found in the
+// result are valid in the original string.
+function asciiLower(s: string): string {
+  const out: u8[] = []
+  for (const b of new TextEncoder().encode(s)) {
+    const c = int(b)
+    out.push(c >= 65 && c <= 90 ? u8(c + 32) : b)
+  }
+  try {
+    return new TextDecoder().decode(out)
+  } catch (e) {
+    return s
+  }
+}
+
+// "scheme://host[:port]" of an absolute http(s) URL, without userinfo, path, query or fragment.
+function originOf(u: string): string | undefined {
+  const sep = u.indexOf("://")
+  if (sep <= 0) return undefined
+  const scheme = u.slice(0, sep).toLowerCase()
+  if (scheme !== "http" && scheme !== "https") return undefined
+  const rest = u.slice(sep + 3)
+  let end = rest.byteLength
+  for (const d of ["/", "?", "#"]) {
+    const i = rest.indexOf(d)
+    if (i >= 0 && i < end) end = i
+  }
+  let host = rest.slice(0, end)
+  const at = host.indexOf("@")
+  if (at >= 0) host = host.slice(at + 1)
+  if (host === "") return undefined
+  return `${scheme}://${host}`
+}
+
+// The two metadata URLs to try for a server: its protected resource metadata, then
+// its authorization server metadata. Both are on the server's origin. An empty list
+// means the URL is not absolute http(s).
+export function discoveryUrls(serverUrl: string): string[] {
+  const origin = originOf(serverUrl)
+  if (origin === undefined) return []
+  return [origin + "/.well-known/oauth-protected-resource", origin + "/.well-known/oauth-authorization-server"]
+}
+
+// The token endpoint and issuer from authorization server metadata (RFC 8414).
+export function parseAuthServerMetadata(json: string): { token_endpoint: string, issuer: string } throws SyntaxError {
+  const fs = try fields(json)
+  const te = rawStr(fs, "token_endpoint") ?? ""
+  const iss = rawStr(fs, "issuer") ?? ""
+  if (te === "") throw new SyntaxError("metadata has no token_endpoint")
+  if (iss === "") throw new SyntaxError("metadata has no issuer")
+  return { token_endpoint: te, issuer: iss }
+}
+
+// The value of a param at byte offset start: a quoted string, or a token up to a
+// comma or whitespace. Empty values are undefined.
+function paramValue(s: string, start: int): string | undefined {
+  const rest = s.slice(start)
+  if (rest.startsWith("\"")) {
+    const close = rest.slice(1).indexOf("\"")
+    if (close < 0) return undefined
+    const v = rest.slice(1, close + 1)
+    return v === "" ? undefined : v
+  }
+  let end = rest.byteLength
+  for (const d of [",", " ", "\t"]) {
+    const i = rest.indexOf(d)
+    if (i >= 0 && i < end) end = i
+  }
+  const v = rest.slice(0, end)
+  return v === "" ? undefined : v
+}
+
+// The resource_metadata URL from a 401's WWW-Authenticate header (RFC 9728). The
+// param name is matched without regard to case. The URL keeps its case.
+export function wwwAuthenticateResource(header: string): string | undefined {
+  const lower = asciiLower(header)
+  let from = 0
+  while (from < lower.byteLength) {
+    const i = lower.slice(from).indexOf(PARAM)
+    if (i < 0) return undefined
+    const at = from + i
+    const before = at === 0 ? " " : header.slice(at - 1, at)
+    if (before === " " || before === "," || before === "\t") {
+      return paramValue(header, at + PARAM.byteLength)
+    }
+    from = at + PARAM.byteLength
+  }
+  return undefined
+}
+
+test("static headers for bearer, headers and none", () => {
+  const bearer = staticHeaders({ type: "bearer", token: "abc" })
+  expect(bearer.get("authorization")).toBe("Bearer abc")
+  expect(staticHeaders({ type: "bearer", token: "" }).size).toBe(0)
+  expect(staticHeaders({ type: "bearer" }).size).toBe(0)
+
+  const hs: Map<string, string> = new Map()
+  hs.set("X-Api-Key", "k1")
+  hs.set("Authorization", "Basic zz")
+  const h = staticHeaders({ type: "headers", headers: hs })
+  expect(h.get("x-api-key")).toBe("k1")
+  expect(h.get("authorization")).toBe("Basic zz")
+  expect(h.size).toBe(2)
+
+  expect(staticHeaders({ type: "none" }).size).toBe(0)
+  expect(staticHeaders({ type: "oauth_client_credentials", token_url: "https://a/t", client_id: "c", client_secret: "s" }).size).toBe(0)
+})
+
+test("client credentials request with basic auth", () => {
+  const r = try tokenRequest({ type: "oauth_client_credentials", token_url: "https://auth.example/token", client_id: "my app", client_secret: "p@ss/w:rd+" })
+  expect(r.url).toBe("https://auth.example/token")
+  expect(r.body).toBe("grant_type=client_credentials")
+  expect(r.headers.get("content-type")).toBe("application/x-www-form-urlencoded")
+  expect(r.headers.get("accept")).toBe("application/json")
+  // the id and secret are form-encoded before base64, per RFC 6749 section 2.3.1
+  expect(r.headers.get("authorization")).toBe("Basic bXklMjBhcHA6cCU0MHNzJTJGdyUzQXJkJTJC")
+  expect(r.body.includes("client_id")).toBe(false)
+})
+
+test("client credentials with scope, audience and client_secret_post", () => {
+  const r = try tokenRequest({
+    type: "oauth_client_credentials",
+    token_url: "http://localhost:9/token",
+    client_id: "id",
+    client_secret: "sec",
+    scope: "read write",
+    audience: "https://mcp.example/",
+    auth_method: "client_secret_post",
+  })
+  expect(r.headers.get("authorization")).toBe(undefined)
+  expect(r.body).toBe("grant_type=client_credentials&scope=read%20write&audience=https%3A%2F%2Fmcp.example%2F&client_id=id&client_secret=sec")
+})
+
+test("refresh token request", () => {
+  const r = try tokenRequest({ type: "oauth_refresh_token", token_url: "https://auth.example/token", client_id: "id", client_secret: "sec", refresh_token: "r/1+2", scope: "a" })
+  expect(r.body).toBe("grant_type=refresh_token&refresh_token=r%2F1%2B2&scope=a")
+  expect(r.headers.get("authorization")).toBe("Basic " + "aWQ6c2Vj")
+})
+
+test("public client refresh sends the client id in the body", () => {
+  const r = try tokenRequest({ type: "oauth_refresh_token", token_url: "https://auth.example/token", client_id: "pub", refresh_token: "r" })
+  expect(r.body).toBe("grant_type=refresh_token&refresh_token=r&client_id=pub")
+  expect(r.headers.get("authorization")).toBe(undefined)
+})
+
+test("token request percent-encodes UTF-8 and keeps unreserved bytes", () => {
+  expect(try formEncode("café")).toBe("caf%C3%A9")
+  expect(try formEncode("a-b_c.d~e Z9")).toBe("a-b_c.d~e%20Z9")
+  expect(try formEncode("")).toBe("")
+})
+
+test("token request rejects incomplete configs", () => {
+  const bad: McpAuthConfig[] = [
+    { type: "none" },
+    { type: "bearer", token: "x" },
+    { type: "oauth_client_credentials", client_id: "c", client_secret: "s" },
+    { type: "oauth_client_credentials", token_url: "ftp://x/t", client_id: "c", client_secret: "s" },
+    { type: "oauth_client_credentials", token_url: "https://x/t", client_secret: "s" },
+    { type: "oauth_client_credentials", token_url: "https://x/t", client_id: "c" },
+    { type: "oauth_refresh_token", token_url: "https://x/t", client_id: "c", client_secret: "s" },
+  ]
+  let threw = 0
+  for (const a of bad) {
+    try {
+      tokenRequest(a)
+    } catch (e) {
+      threw += 1
+    }
+  }
+  expect(threw).toBe(bad.length)
+})
+
+test("token cache hands out a token only while it has more than 60 s left", () => {
+  const c = new TokenCache()
+  expect(c.header("s", 0)).toBe(undefined)
+  try c.store("s", '{"access_token":"tok","expires_in":100}', 1000000)
+  expect(c.header("s", 1000000)).toBe("Bearer tok")
+  // 40 s in: 60 s left, which is the margin, so it is no longer handed out
+  expect(c.header("s", 1040000)).toBe(undefined)
+  expect(c.header("s", 1039999)).toBe("Bearer tok")
+  expect(c.header("other", 1000000)).toBe(undefined)
+})
+
+test("token cache defaults expires_in and replaces refresh tokens", () => {
+  const c = new TokenCache()
+  try c.store("s", '{"access_token":"a1","refresh_token":"r1"}', 0)
+  expect(c.header("s", 3500000)).toBe("Bearer a1")
+  expect(c.header("s", 3540000)).toBe(undefined)
+  expect(c.refreshToken("s")).toBe("r1")
+
+  // a response without a refresh token keeps the old one
+  try c.store("s", '{"access_token":"a2","expires_in":"soon"}', 0)
+  expect(c.header("s", 0)).toBe("Bearer a2")
+  expect(c.refreshToken("s")).toBe("r1")
+
+  try c.store("s", '{"access_token":"a3","refresh_token":"r2","expires_in":60}', 0)
+  expect(c.refreshToken("s")).toBe("r2")
+  expect(c.header("s", 0)).toBe(undefined)
+})
+
+test("token cache rejects responses without a token", () => {
+  const c = new TokenCache()
+  let threw = 0
+  for (const body of ["not json", '{"error":"invalid_client"}', '{"access_token":""}', '{"access_token":null}', "[1]"]) {
+    try {
+      c.store("s", body, 0)
+    } catch (e) {
+      threw += 1
+    }
+  }
+  expect(threw).toBe(5)
+  expect(c.header("s", 0)).toBe(undefined)
+  expect(c.refreshToken("s")).toBe(undefined)
+})
+
+test("invalidate drops the access token and keeps the refresh token", () => {
+  const c = new TokenCache()
+  c.invalidate("nobody")
+  try c.store("s", '{"access_token":"a","refresh_token":"r","expires_in":3600}', 0)
+  c.invalidate("s")
+  expect(c.header("s", 0)).toBe(undefined)
+  expect(c.refreshToken("s")).toBe("r")
+  try c.store("s", '{"access_token":"b"}', 0)
+  expect(c.header("s", 0)).toBe("Bearer b")
+})
+
+test("discovery URLs come from the origin", () => {
+  const want = ["https://mcp.example.com:8443/.well-known/oauth-protected-resource", "https://mcp.example.com:8443/.well-known/oauth-authorization-server"]
+  expect(discoveryUrls("https://mcp.example.com:8443/v1/mcp?x=1#f")).toEqual(want)
+  expect(discoveryUrls("HTTP://user:pw@mcp.example.com/mcp")).toEqual([
+    "http://mcp.example.com/.well-known/oauth-protected-resource",
+    "http://mcp.example.com/.well-known/oauth-authorization-server",
+  ])
+  expect(discoveryUrls("https://mcp.example.com?q=1")[0]).toBe("https://mcp.example.com/.well-known/oauth-protected-resource")
+  expect(discoveryUrls("/relative").length).toBe(0)
+  expect(discoveryUrls("ftp://x/y").length).toBe(0)
+  expect(discoveryUrls("https://").length).toBe(0)
+  expect(discoveryUrls("https:///path").length).toBe(0)
+})
+
+test("parses authorization server metadata", () => {
+  const m = try parseAuthServerMetadata('{"issuer":"https://auth.example","token_endpoint":"https://auth.example/token","code_challenge_methods_supported":["S256"]}')
+  expect(m.token_endpoint).toBe("https://auth.example/token")
+  expect(m.issuer).toBe("https://auth.example")
+
+  let threw = 0
+  for (const body of ['{"issuer":"https://a"}', '{"token_endpoint":"https://a/t"}', '{"issuer":"https://a","token_endpoint":""}', "{oops"]) {
+    try {
+      parseAuthServerMetadata(body)
+    } catch (e) {
+      threw += 1
+    }
+  }
+  expect(threw).toBe(4)
+})
+
+test("reads resource_metadata from WWW-Authenticate", () => {
+  expect(wwwAuthenticateResource('Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource"')).toBe("https://mcp.example/.well-known/oauth-protected-resource")
+  expect(wwwAuthenticateResource('Bearer realm="x", Resource_Metadata="https://Mcp.Example/Meta", error="invalid_token"')).toBe("https://Mcp.Example/Meta")
+  expect(wwwAuthenticateResource("Bearer resource_metadata=https://m.example/r, error=\"x\"")).toBe("https://m.example/r")
+  expect(wwwAuthenticateResource('Bearer error="invalid_token"')).toBe(undefined)
+  expect(wwwAuthenticateResource('Bearer myresource_metadata="https://no"')).toBe(undefined)
+  expect(wwwAuthenticateResource('Bearer resource_metadata="" ')).toBe(undefined)
+  expect(wwwAuthenticateResource('Bearer resource_metadata="unterminated')).toBe(undefined)
+  expect(wwwAuthenticateResource('Bearer xresource_metadata="https://no", resource_metadata="https://yes"')).toBe("https://yes")
+  expect(wwwAuthenticateResource("")).toBe(undefined)
+})

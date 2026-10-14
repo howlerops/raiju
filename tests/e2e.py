@@ -346,6 +346,12 @@ def main():
         check("mcp tool execution", s == 200 and r == {"role": "tool", "tool_call_id": "call_1", "content": "Sunny in Oslo"}, b)
         mcp_calls = [x for x in seen() if x["path"] == "/mcp"]
         check("mcp tools/call sent upstream", '"method":"tools/call"' in mcp_calls[-1]["body"] and '"city":"Oslo"' in mcp_calls[-1]["body"], mcp_calls[-1])
+        sec = [c for c in st if c["name"] == "secure"]
+        check("an OAuth-protected MCP server connects with a client-credentials token", sec and sec[0]["connected"] and sec[0]["tools"] == 1, st)
+        s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "call_2", "type": "function", "function": {"name": "secure-get_weather", "arguments": "{\"city\":\"Oslo\"}"}})
+        toks = [x for x in seen() if x["path"] == "/oauth/token"]
+        # one token per node (the cluster test runs a second gateway), reused for every RPC
+        check("OAuth MCP tool runs on the cached token", s == 200 and "Sunny in Oslo" in b and len(toks) <= 2 and all(t["auth"] == "Basic cmFpanU6czNjcmV0" for t in toks), (b, len(toks)))
 
         # Media pass-through keeps binary bodies and content types
         req = urllib.request.Request(GW + "/v1/audio/speech", data=json.dumps({"model": "openai/tts-1", "input": "hi", "voice": "alloy"}).encode(), method="POST", headers={"content-type": "application/json"})
