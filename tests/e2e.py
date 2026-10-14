@@ -584,6 +584,14 @@ def main():
         check("unknown virtual MCP is 404", s == 404, s)
         s, _, b = call("GET", "/api/mcp/virtual")
         check("virtual MCPs are listed", s == 200 and '"forecast"' in b, b)
+        s, _, b = call("GET", "/api/mcp/clients")
+        check("Bifrost's MCP clients list", s == 200 and '"client_id":"local"' in b.replace(" ", ""), b[:400])
+        s, _, b = call("POST", "/api/mcp/client/local/refresh-tools")
+        check("an MCP client's tools refresh on the live manager", s == 200 and '"tool_count"' in b, (s, b))
+        s, _, b = call("POST", "/api/mcp/client/nope/reconnect")
+        check("reconnecting an unknown MCP client is 404", s == 404, (s, b))
+        s, _, b = call("GET", "/api/config")
+        check("the config view masks MCP env secrets", s == 200 and '"MCP_GREETING":"hello"' not in b.replace(" ", ""), b[:300])
 
         # RBAC: a viewer reads but can't change anything
         s, _, b = call("POST", "/api/users", {"name": "viewer1", "role": "viewer"})

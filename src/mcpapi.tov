@@ -1,0 +1,949 @@
+// Bifrost's MCP management API: /api/mcp/clients, /api/mcp/client and /api/mcp/virtual-mcps.
+// Client configs live in cfg.mcp.client_configs and virtual MCPs in cfg.virtual_mcps, so each
+// write edits the config, saves it and hands it to the lead through onChange, as ConfigStore
+// does for its own writes. A client's id is its name (its tools are served as "<name>-<tool>"),
+// and a virtual MCP's id is its name too. Secrets are masked on every read, and a masked value
+// sent back unchanged keeps the stored secret. Reconnect and refresh need the live manager, so
+// they come back as an action for the lead to run on it.
+import { readFileSync, unlinkSync } from "node:fs"
+import { Config } from "./config"
+import { ConfigStore, maskSecret, randomId } from "./store"
+import { McpAuthConfig } from "./mcpauth"
+import { McpClientConfig, McpConfig, McpTlsConfig, sanitizeName } from "./mcp"
+import * as vmcp from "./vmcp"
+import { Field, fields, elements, find, quote } from "./json"
+
+// The reply. action asks the lead to run a step on the live manager after sending body:
+// "reconnect" or "refresh" for the client named by id. For a refresh the lead answers with
+// the tool count itself.
+export type McpReply = { status: int, body: string, action?: "reconnect" | "refresh", id?: string }
+
+type ClientBody = {
+  name?: string,
+  connection_type?: string,
+  connection_string?: string,
+  auth_type?: string,
+  headers?: Map<string, string>,
+  auth?: McpAuthConfig,
+  stdio_config?: { command: string, args?: string[], env?: Map<string, string>, cwd?: string },
+  tools_to_execute?: string[],
+  tools_to_skip?: string[],
+  tools_to_auto_execute?: string[],
+  allow_by_default?: bool,
+  allow_on_all_virtual_keys?: bool,
+  disabled?: bool,
+  tool_sync_interval?: string,
+  tls_config?: McpTlsConfig,
+}
+
+// A tool in a virtual MCP's tools: Bifrost's {mcp_client_id, tool_names} or Raiju's native form.
+type ToolBody = { mcp_client_id?: string, tool_names?: string[], source?: string, as?: string, description?: string, defaults?: string }
+
+type VmcpBody = { name?: string, endpoint_slug?: string, description?: string, enabled?: bool }
+
+// The JSON kind each body field must have: s string, b bool, a array, o object.
+const CLIENT_KINDS: string[] = ["name:s", "connection_type:s", "connection_string:s", "auth_type:s", "headers:o", "auth:o", "stdio_config:o", "tools_to_execute:a", "tools_to_skip:a", "tools_to_auto_execute:a", "allow_by_default:b", "allow_on_all_virtual_keys:b", "disabled:b", "tool_sync_interval:s", "tls_config:o"]
+const VMCP_KINDS: string[] = ["name:s", "endpoint_slug:s", "description:s", "enabled:b", "tools:a"]
+const TOOL_KINDS: string[] = ["mcp_client_id:s", "tool_names:a", "source:s", "as:s", "description:s", "defaults:s"]
+const VERIFY_ROUTES: string[] = ["openapi-spec", "complete-oauth", "initiate-verification", "reauthorize", "reregister", "verify-headers", "verify-exchange"]
+
+function reply(status: int, body: string): McpReply {
+  return { status: status, body: body }
+}
+
+function errorBody(message: string): string {
+  return JSON.stringify({ error: { message: message } })
+}
+
+function fail(status: int, message: string): McpReply {
+  return reply(status, errorBody(message))
+}
+
+function notAllowed(method: string): McpReply {
+  return fail(405, `method ${method} is not allowed on this route`)
+}
+
+// The fields of a JSON object given as text, or undefined when the text is not one.
+function objectFields(text: string): Field[] | undefined {
+  const t = text.trim()
+  if (!t.startsWith("{")) return undefined
+  try {
+    if (elements(`[${t}]`).length !== 1) return undefined
+    return fields(t)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Whether a field is present and not null.
+function has(fs: Field[], key: string): bool {
+  const r = find(fs, key)
+  return r !== undefined && r !== "null"
+}
+
+// The value when the field is present, else undefined: a JSON null counts as absent.
+function present<T>(fs: Field[], key: string, v: T | undefined): T | undefined {
+  return has(fs, key) ? v : undefined
+}
+
+// Whether a field, when present and not null, has the JSON kind named by kind.
+function kindOk(fs: Field[], key: string, kind: string): bool {
+  const r = find(fs, key)
+  if (r === undefined || r === "null") return true
+  if (kind === "s") return r.startsWith("\"")
+  if (kind === "b") return r === "true" || r === "false"
+  if (kind === "a") return r.startsWith("[")
+  return r.startsWith("{")
+}
+
+function kindsOk(fs: Field[], spec: string[]): bool {
+  for (const s of spec) {
+    const parts = s.split(":")
+    if (!kindOk(fs, parts[0]!, parts[1]!)) return false
+  }
+  return true
+}
+
+// Whether a raw array holds only strings, and a raw object only string values.
+function strArrayOk(raw: string | undefined): bool {
+  if (raw === undefined || raw === "null") return true
+  if (!raw.startsWith("[")) return false
+  try {
+    for (const el of elements(raw)) {
+      if (!el.startsWith("\"")) return false
+    }
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+function strMapOk(raw: string | undefined): bool {
+  if (raw === undefined || raw === "null") return true
+  const fs = objectFields(raw)
+  if (fs === undefined) return false
+  for (const f of fs) {
+    if (!f.raw.startsWith("\"")) return false
+  }
+  return true
+}
+
+// The request body's fields when the body is a JSON object of the right kinds, else undefined.
+function checkedFields(body: string, spec: string[]): Field[] | undefined {
+  const fs = objectFields(body)
+  if (fs === undefined || !kindsOk(fs, spec)) return undefined
+  return fs
+}
+
+function clientsOf(c: Config): McpClientConfig[] {
+  const m = c.mcp
+  if (m === undefined || m.client_configs === undefined) return []
+  return m.client_configs
+}
+
+function virtualsOf(c: Config): vmcp.VirtualMcp[] {
+  return c.virtual_mcps ?? []
+}
+
+function clientIndex(list: McpClientConfig[], name: string): int {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i]!.name === name) return i
+  }
+  return -1
+}
+
+function virtualIndex(list: vmcp.VirtualMcp[], name: string): int {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i]!.name === name) return i
+  }
+  return -1
+}
+
+function virtualKeyIds(c: Config): string[] {
+  const out: string[] = []
+  for (const vk of c.governance?.virtual_keys ?? []) out.push(vk.id)
+  return out
+}
+
+// Writes next as the config and notifies the lead, as ConfigStore does. A failed save keeps
+// the previous config, so memory never differs from the file.
+function persist(store: ConfigStore, next: Config): McpReply | undefined {
+  const prev = store.cfg
+  store.cfg = next
+  try {
+    store.save()
+  } catch (e) {
+    store.cfg = prev
+    return fail(500, `could not save config: ${e.message}`)
+  }
+  store.version += 1
+  const f = store.onChange
+  if (f !== undefined) f(next)
+  return undefined
+}
+
+function withClients(c: Config, list: McpClientConfig[]): Config {
+  let n = c
+  let m: McpConfig = n.mcp ?? {}
+  m.client_configs = list
+  n.mcp = m
+  return n
+}
+
+function withVirtuals(c: Config, list: vmcp.VirtualMcp[]): Config {
+  let n = c
+  n.virtual_mcps = list
+  return n
+}
+
+// ---- secrets ----
+
+function maskMap(m: Map<string, string> | undefined): Map<string, string> | undefined {
+  if (m === undefined) return undefined
+  const out: Map<string, string> = new Map()
+  for (const k of m.keys()) out.set(k, maskSecret(m.get(k)!))
+  return out
+}
+
+function maskOpt(v: string | undefined): string | undefined {
+  return v === undefined ? undefined : maskSecret(v)
+}
+
+// A masked value sent back unchanged keeps the stored one (prev, when there is one).
+function keepStr(v: string, prev: string | undefined): string {
+  if (prev !== undefined && v === maskSecret(prev)) return prev
+  return v
+}
+
+function keepOpt(v: string | undefined, prev: string | undefined): string | undefined {
+  if (v === undefined) return undefined
+  return keepStr(v, prev)
+}
+
+function keepMap(incoming: Map<string, string> | undefined, old: Map<string, string> | undefined): Map<string, string> | undefined {
+  if (incoming === undefined) return undefined
+  const out: Map<string, string> = new Map()
+  for (const k of incoming.keys()) {
+    const prev: string | undefined = old === undefined ? undefined : old.get(k)
+    out.set(k, keepStr(incoming.get(k)!, prev))
+  }
+  return out
+}
+
+function keepAuth(incoming: McpAuthConfig, old: McpAuthConfig | undefined): McpAuthConfig {
+  let n = incoming
+  const oh: Map<string, string> | undefined = old === undefined ? undefined : old.headers
+  n.headers = keepMap(n.headers, oh)
+  n.token = keepOpt(n.token, old === undefined ? undefined : old.token)
+  n.client_secret = keepOpt(n.client_secret, old === undefined ? undefined : old.client_secret)
+  n.refresh_token = keepOpt(n.refresh_token, old === undefined ? undefined : old.refresh_token)
+  return n
+}
+
+// A client with its secrets masked: header values, auth secrets and stdio env values.
+function redactClient(c: McpClientConfig): McpClientConfig {
+  let n = c
+  n.headers = maskMap(n.headers)
+  const a = n.auth
+  if (a !== undefined) {
+    let na = a
+    na.headers = maskMap(na.headers)
+    na.token = maskOpt(na.token)
+    na.client_secret = maskOpt(na.client_secret)
+    na.refresh_token = maskOpt(na.refresh_token)
+    n.auth = na
+  }
+  const sc = n.stdio_config
+  if (sc !== undefined) {
+    let ns = sc
+    ns.env = maskMap(ns.env)
+    n.stdio_config = ns
+  }
+  return n
+}
+
+// One client's JSON: its stored fields, secrets masked, with client_id (its name) first.
+function clientJson(c: McpClientConfig): string {
+  const j = JSON.stringify(redactClient(c))
+  return `{"client_id":${quote(c.name)},${j.slice(1)}`
+}
+
+// ---- clients ----
+
+// Bifrost's name rules for a client: ASCII, no hyphens or spaces, not starting with a digit.
+function clientNameError(name: string): string {
+  if (name.trim() === "") return "name is required for MCP client"
+  // every ASCII character is one byte, so any longer byte count means a non-ASCII one
+  if (name.byteLength !== name.chars().length) return "name must contain only ASCII characters"
+  if (name.includes("-")) return "name cannot contain hyphens"
+  if (name.includes(" ")) return "name cannot contain spaces"
+  if ("0123456789".includes(name.slice(0, 1))) return "name cannot start with a number"
+  return ""
+}
+
+const AUTH_TYPES: string[] = ["none", "bearer", "headers", "oauth_client_credentials", "oauth_refresh_token"]
+
+// The auth object must have a type this gateway knows. "" when fine or absent.
+function authError(a: McpAuthConfig | undefined): string {
+  if (a === undefined) return ""
+  if (!AUTH_TYPES.includes(a.type)) return `auth.type "${a.type}" must be one of ${AUTH_TYPES.join(", ")}`
+  return ""
+}
+
+// The connection fields a new client needs for its transport. "" when fine.
+function connectionError(b: ClientBody, ct: string): string {
+  if (ct === "stdio") {
+    if ((b.stdio_config?.command ?? "") === "") return "stdio_config.command is required for stdio connections"
+    if ((b.connection_string ?? "") !== "") return "connection_string must not be set for stdio connections"
+    return ""
+  }
+  const url = b.connection_string ?? ""
+  if (url === "") return "connection_string is required for http and sse connections"
+  if (!url.startsWith("http://") && !url.startsWith("https://")) return "connection_string must be an http or https URL"
+  return ""
+}
+
+// A Go duration in whole seconds, as Bifrost takes tool_sync_interval: "0", "90s", "10m", "1h30m".
+function durationError(s: string): string {
+  const bad = "tool_sync_interval must be 0 or a positive duration in whole seconds, such as \"10m\" or \"90s\""
+  if (s === "0") return ""
+  let digits = ""
+  let last: int = 0
+  for (const ch of s.chars()) {
+    if ("0123456789".includes(ch)) {
+      digits += ch
+      continue
+    }
+    const rank: int = ch === "h" ? 1 : ch === "m" ? 2 : ch === "s" ? 3 : 0
+    if (rank === 0 || digits === "" || rank <= last) return bad
+    last = rank
+    digits = ""
+  }
+  if (digits !== "" || last === 0) return bad
+  return ""
+}
+
+// The allow flag: allow_by_default decides, else the older allow_on_all_virtual_keys, else existing.
+function allowFlag(fs: Field[], b: ClientBody, existing: bool): bool {
+  if (has(fs, "allow_by_default")) return b.allow_by_default ?? existing
+  if (has(fs, "allow_on_all_virtual_keys")) return b.allow_on_all_virtual_keys ?? existing
+  return existing
+}
+
+// The body with every optional field that is null treated as absent.
+function clientFields(fs: Field[], b: ClientBody): ClientBody {
+  let n = b
+  n.name = present(fs, "name", n.name)
+  n.connection_type = present(fs, "connection_type", n.connection_type)
+  n.connection_string = present(fs, "connection_string", n.connection_string)
+  n.auth_type = present(fs, "auth_type", n.auth_type)
+  n.headers = present(fs, "headers", n.headers)
+  n.auth = present(fs, "auth", n.auth)
+  n.stdio_config = present(fs, "stdio_config", n.stdio_config)
+  n.tools_to_execute = present(fs, "tools_to_execute", n.tools_to_execute)
+  n.tools_to_skip = present(fs, "tools_to_skip", n.tools_to_skip)
+  n.tools_to_auto_execute = present(fs, "tools_to_auto_execute", n.tools_to_auto_execute)
+  n.allow_by_default = present(fs, "allow_by_default", n.allow_by_default)
+  n.allow_on_all_virtual_keys = present(fs, "allow_on_all_virtual_keys", n.allow_on_all_virtual_keys)
+  n.disabled = present(fs, "disabled", n.disabled)
+  n.tool_sync_interval = present(fs, "tool_sync_interval", n.tool_sync_interval)
+  n.tls_config = present(fs, "tls_config", n.tls_config)
+  return n
+}
+
+function listClients(store: ConfigStore): McpReply {
+  const list = clientsOf(store.cfg)
+  const parts: string[] = []
+  for (const c of list) parts.push(clientJson(c))
+  return reply(200, `{"clients":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
+}
+
+function createClient(store: ConfigStore, body: string): McpReply {
+  const fs = checkedFields(body, CLIENT_KINDS)
+  if (fs === undefined || !strArrayOk(find(fs, "tools_to_execute")) || !strArrayOk(find(fs, "tools_to_skip")) || !strArrayOk(find(fs, "tools_to_auto_execute")) || !strMapOk(find(fs, "headers"))) {
+    return fail(400, "Invalid request payload")
+  }
+  let parsed: ClientBody = {}
+  try {
+    parsed = JSON.parse(body) as ClientBody
+  } catch (e) {
+    return fail(400, "Invalid request payload")
+  }
+  const b = clientFields(fs, parsed)
+  const name = b.name ?? ""
+  const nameProblem = clientNameError(name)
+  if (nameProblem !== "") return fail(400, `Invalid client name: ${nameProblem}`)
+  const list = clientsOf(store.cfg)
+  if (clientIndex(list, name) >= 0 || virtualIndex(virtualsOf(store.cfg), name) >= 0) {
+    return fail(409, "an MCP client or virtual MCP with this name already exists")
+  }
+  const ct = b.connection_type ?? ""
+  if (ct !== "http" && ct !== "sse" && ct !== "stdio") return fail(400, `Invalid connection_type "${ct}": must be one of http, sse, stdio`)
+  const auth = b.auth_type ?? "none"
+  if (auth !== "none" && auth !== "headers") return fail(400, `auth_type "${auth}" is not supported by this gateway: use none or headers`)
+  const cp = connectionError(b, ct)
+  if (cp !== "") return fail(400, cp)
+  const ae = authError(b.auth)
+  if (ae !== "") return fail(400, ae)
+  const syncErr = durationError(b.tool_sync_interval ?? "0")
+  if (syncErr !== "") return fail(400, syncErr)
+
+  let c: McpClientConfig = { name: name, connection_type: ct }
+  if (ct !== "stdio") c.connection_string = b.connection_string
+  c.headers = b.headers
+  c.auth = b.auth
+  c.stdio_config = b.stdio_config
+  c.tools_to_execute = b.tools_to_execute
+  c.tools_to_skip = b.tools_to_skip
+  c.tools_to_auto_execute = b.tools_to_auto_execute
+  c.allow_by_default = allowFlag(fs, b, false)
+  c.disabled = b.disabled
+  c.tool_sync_interval = b.tool_sync_interval
+  c.tls_config = b.tls_config
+
+  let next: McpClientConfig[] = list
+  next.push(c)
+  const err = persist(store, withClients(store.cfg, next))
+  if (err !== undefined) return err
+  return reply(201, clientJson(c))
+}
+
+function updateClient(store: ConfigStore, id: string, body: string): McpReply {
+  const list = clientsOf(store.cfg)
+  const at = clientIndex(list, id)
+  if (at < 0) return fail(404, "MCP client not found")
+  const fs = checkedFields(body, CLIENT_KINDS)
+  if (fs === undefined || !strArrayOk(find(fs, "tools_to_execute")) || !strArrayOk(find(fs, "tools_to_skip")) || !strArrayOk(find(fs, "tools_to_auto_execute")) || !strMapOk(find(fs, "headers"))) {
+    return fail(400, "Invalid request payload")
+  }
+  let parsed: ClientBody = {}
+  try {
+    parsed = JSON.parse(body) as ClientBody
+  } catch (e) {
+    return fail(400, "Invalid request payload")
+  }
+  const b = clientFields(fs, parsed)
+  // The name is the id and the prefix of every tool name a virtual MCP uses, so it stays.
+  if (b.name !== undefined && b.name !== id) return fail(400, "renaming an MCP client is not supported: its name prefixes its tools in virtual MCPs")
+  if (has(fs, "tool_sync_interval")) {
+    const syncErr = durationError(b.tool_sync_interval ?? "")
+    if (syncErr !== "") return fail(400, syncErr)
+  }
+  const ae = authError(b.auth)
+  if (ae !== "") return fail(400, ae)
+
+  const cur = list[at]!
+  let c = cur
+  if (has(fs, "disabled")) c.disabled = b.disabled
+  if (has(fs, "allow_by_default") || has(fs, "allow_on_all_virtual_keys")) c.allow_by_default = allowFlag(fs, b, c.allow_by_default ?? false)
+  if (has(fs, "tools_to_execute")) c.tools_to_execute = b.tools_to_execute
+  if (has(fs, "tools_to_skip")) c.tools_to_skip = b.tools_to_skip
+  if (has(fs, "tools_to_auto_execute")) c.tools_to_auto_execute = b.tools_to_auto_execute
+  if (has(fs, "tool_sync_interval")) c.tool_sync_interval = b.tool_sync_interval
+  if (has(fs, "tls_config")) c.tls_config = b.tls_config
+  if (has(fs, "headers")) c.headers = keepMap(b.headers, c.headers)
+  if (has(fs, "auth")) c.auth = keepAuth(b.auth!, c.auth)
+
+  let next: McpClientConfig[] = list
+  next[at] = c
+  const err = persist(store, withClients(store.cfg, next))
+  if (err !== undefined) return err
+  return reply(200, clientJson(c))
+}
+
+function deleteClient(store: ConfigStore, id: string): McpReply {
+  const list = clientsOf(store.cfg)
+  if (clientIndex(list, id) < 0) return fail(404, "MCP client not found")
+  let next: McpClientConfig[] = []
+  for (const c of list) {
+    if (c.name !== id) next.push(c)
+  }
+  const err = persist(store, withClients(store.cfg, next))
+  if (err !== undefined) return err
+  return reply(200, `{"status":"success","message":"MCP client removed successfully"}`)
+}
+
+// Reconnect and refresh are the manager's work: this checks the client, then hands the step over.
+function runClient(store: ConfigStore, id: string, step: string): McpReply {
+  const list = clientsOf(store.cfg)
+  const at = clientIndex(list, id)
+  if (at < 0) return fail(404, "MCP client not found")
+  const c = list[at]!
+  if (step === "reconnect") {
+    if (c.disabled === true) return fail(400, "cannot reconnect a disabled MCP client: enable the client first")
+    return { status: 200, body: `{"status":"success","message":"MCP client reconnected successfully"}`, action: "reconnect", id: id }
+  }
+  if (c.disabled === true) return fail(400, "cannot refresh tools for a disabled MCP client: enable the client first")
+  return { status: 200, body: `{"status":"success","message":"MCP client tools refreshed successfully"}`, action: "refresh", id: id }
+}
+
+function clientRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string): McpReply {
+  if (segs.length === 3) return m === "POST" ? createClient(store, body) : notAllowed(m)
+  const id = segs[3]!
+  if (segs.length === 4) {
+    if (m === "PUT") return updateClient(store, id, body)
+    if (m === "DELETE") return deleteClient(store, id)
+    return notAllowed(m)
+  }
+  if (segs.length !== 5) return fail(404, `no route for ${p}`)
+  const sub = segs[4]!
+  if (sub === "reconnect" || sub === "refresh-tools") {
+    if (m !== "POST") return notAllowed(m)
+    return runClient(store, id, sub === "reconnect" ? "reconnect" : "refresh")
+  }
+  if (VERIFY_ROUTES.includes(sub)) return fail(501, `${sub} is not supported by this gateway`)
+  return fail(404, `no route for ${p}`)
+}
+
+// ---- virtual MCPs ----
+
+// The virtual tools a tools list means. A Bifrost spec {mcp_client_id, tool_names} becomes sources
+// "<server>-<tool>" (or "<server>-*" for "*"); a native tool {source, as, description, defaults} is
+// kept as it is. A source whose server is not a configured client is named in the error.
+function virtualTools(raw: string, clients: McpClientConfig[]): { tools: vmcp.VirtualTool[], error: string } {
+  let out: vmcp.VirtualTool[] = []
+  let unknown: string[] = []
+  let els: string[] = []
+  try {
+    els = elements(raw)
+  } catch (e) {
+    return { tools: [], error: "tools must be a JSON array" }
+  }
+  for (const el of els) {
+    const fs = objectFields(el)
+    if (fs === undefined || !kindsOk(fs, TOOL_KINDS) || !strArrayOk(find(fs, "tool_names"))) return { tools: [], error: "each tool must be a JSON object" }
+    let parsed: ToolBody = {}
+    try {
+      parsed = JSON.parse(el) as ToolBody
+    } catch (e) {
+      return { tools: [], error: "each tool must be a JSON object" }
+    }
+    const t: ToolBody = { mcp_client_id: present(fs, "mcp_client_id", parsed.mcp_client_id), tool_names: present(fs, "tool_names", parsed.tool_names), source: present(fs, "source", parsed.source), as: present(fs, "as", parsed.as), description: present(fs, "description", parsed.description), defaults: present(fs, "defaults", parsed.defaults) }
+    if (t.mcp_client_id !== undefined) {
+      const id = t.mcp_client_id
+      const at = clientIndex(clients, id)
+      if (at < 0) {
+        unknown.push(id)
+        continue
+      }
+      const server = clients[at]!.name
+      for (const name of t.tool_names ?? []) {
+        out.push({ source: name === "*" ? `${sanitizeName(server)}-*` : sanitizeName(`${server}-${name}`) })
+      }
+    } else {
+      const src = t.source ?? ""
+      let vt: vmcp.VirtualTool = { source: src }
+      if (t.as !== undefined) vt.as = t.as
+      if (t.description !== undefined) vt.description = t.description
+      if (t.defaults !== undefined) vt.defaults = t.defaults
+      if (src !== "" && !clients.some((c) => src.startsWith(sanitizeName(c.name) + "-"))) unknown.push(src)
+      out.push(vt)
+    }
+  }
+  if (unknown.length > 0) return { tools: [], error: "invalid MCP client IDs: " + unknown.join(", ") }
+  return { tools: out, error: "" }
+}
+
+// One virtual MCP's JSON. virtual_key_ids is who may use it: every key when allowed_keys is unset.
+function virtualJson(v: vmcp.VirtualMcp, keyIds: string[]): string {
+  const keys = v.allowed_keys ?? keyIds
+  const quotedKeys: string[] = []
+  for (const k of keys) quotedKeys.push(quote(k))
+  const desc = v.description === undefined ? "" : `,"description":${quote(v.description)}`
+  return `{"id":${quote(v.name)},"name":${quote(v.name)},"endpoint_slug":${quote(v.name)}${desc},"enabled":true,"tools":${JSON.stringify(v.tools)},"virtual_key_ids":[${quotedKeys.join(",")}]}`
+}
+
+function listVirtuals(store: ConfigStore): McpReply {
+  const list = virtualsOf(store.cfg)
+  const keyIds = virtualKeyIds(store.cfg)
+  const parts: string[] = []
+  for (const v of list) parts.push(virtualJson(v, keyIds))
+  return reply(200, `{"virtual_mcps":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
+}
+
+// Whether a virtual MCP name is taken by another virtual MCP or by an MCP client (they share
+// the endpoint namespace). self is the virtual MCP being renamed, which does not count.
+function virtualNameTaken(store: ConfigStore, name: string, self: string): bool {
+  if (name !== self && virtualIndex(virtualsOf(store.cfg), name) >= 0) return true
+  return clientIndex(clientsOf(store.cfg), name) >= 0
+}
+
+const NAME_TAKEN = "a virtual MCP with this name or endpoint already exists"
+
+function createVirtual(store: ConfigStore, body: string): McpReply {
+  const fs = checkedFields(body, VMCP_KINDS)
+  if (fs === undefined) return fail(400, "Invalid request payload")
+  let parsed: VmcpBody = {}
+  try {
+    parsed = JSON.parse(body) as VmcpBody
+  } catch (e) {
+    return fail(400, "Invalid request payload")
+  }
+  const b: VmcpBody = { name: present(fs, "name", parsed.name), endpoint_slug: present(fs, "endpoint_slug", parsed.endpoint_slug), description: present(fs, "description", parsed.description), enabled: present(fs, "enabled", parsed.enabled) }
+  const name = b.name ?? ""
+  if (name === "") return fail(400, "name is required")
+  if (b.endpoint_slug !== undefined && b.endpoint_slug !== name) return fail(400, "endpoint_slug must equal the name: a virtual MCP is served at /mcp/<name>")
+  if (b.enabled === false) return fail(400, "enabled: false is not supported: a virtual MCP is always served")
+  const shape = vmcp.validate({ name: name, tools: [] })
+  if (shape !== "") return fail(400, shape)
+  if (virtualNameTaken(store, name, "")) return fail(409, NAME_TAKEN)
+  let tools: vmcp.VirtualTool[] = []
+  if (has(fs, "tools")) {
+    const got = virtualTools(find(fs, "tools")!, clientsOf(store.cfg))
+    if (got.error !== "") return fail(400, got.error)
+    tools = got.tools
+  }
+  let v: vmcp.VirtualMcp = { name: name, tools: tools }
+  v.description = b.description
+  const problem = vmcp.validate(v)
+  if (problem !== "") return fail(400, problem)
+  let next: vmcp.VirtualMcp[] = virtualsOf(store.cfg)
+  next.push(v)
+  const err = persist(store, withVirtuals(store.cfg, next))
+  if (err !== undefined) return err
+  return reply(201, `{"virtual_mcp":${virtualJson(v, virtualKeyIds(store.cfg))}}`)
+}
+
+function updateVirtual(store: ConfigStore, id: string, body: string): McpReply {
+  const list = virtualsOf(store.cfg)
+  const at = virtualIndex(list, id)
+  if (at < 0) return fail(404, "virtual MCP not found")
+  const fs = checkedFields(body, VMCP_KINDS)
+  if (fs === undefined) return fail(400, "Invalid request payload")
+  let b: VmcpBody = {}
+  try {
+    b = JSON.parse(body) as VmcpBody
+  } catch (e) {
+    return fail(400, "Invalid request payload")
+  }
+  if (b.enabled === false) return fail(400, "enabled: false is not supported: a virtual MCP is always served")
+  let v = list[at]!
+  if (has(fs, "name") && b.name !== id) {
+    const newName = b.name ?? ""
+    const shape = vmcp.validate({ name: newName, tools: [] })
+    if (shape !== "") return fail(400, shape)
+    if (virtualNameTaken(store, newName, id)) return fail(409, NAME_TAKEN)
+    v.name = newName
+  }
+  if (has(fs, "description")) v.description = b.description
+  if (has(fs, "tools")) {
+    const got = virtualTools(find(fs, "tools")!, clientsOf(store.cfg))
+    if (got.error !== "") return fail(400, got.error)
+    v.tools = got.tools
+  }
+  const problem = vmcp.validate(v)
+  if (problem !== "") return fail(400, problem)
+  let next: vmcp.VirtualMcp[] = list
+  next[at] = v
+  const err = persist(store, withVirtuals(store.cfg, next))
+  if (err !== undefined) return err
+  return reply(200, `{"virtual_mcp":${virtualJson(v, virtualKeyIds(store.cfg))}}`)
+}
+
+function deleteVirtual(store: ConfigStore, id: string): McpReply {
+  const list = virtualsOf(store.cfg)
+  if (virtualIndex(list, id) < 0) return fail(404, "virtual MCP not found")
+  let next: vmcp.VirtualMcp[] = []
+  for (const v of list) {
+    if (v.name !== id) next.push(v)
+  }
+  const err = persist(store, withVirtuals(store.cfg, next))
+  if (err !== undefined) return err
+  return reply(200, `{"success":true}`)
+}
+
+// Attaches or detaches a virtual key. An unset allowed_keys means every key already has it, so
+// attaching changes nothing, and detaching lists every other key explicitly.
+function setAttached(store: ConfigStore, id: string, vkId: string, attach: bool): McpReply {
+  const list = virtualsOf(store.cfg)
+  const at = virtualIndex(list, id)
+  if (at < 0) return fail(404, "virtual MCP not found")
+  if (attach && !virtualKeyIds(store.cfg).includes(vkId)) return fail(404, "virtual key not found")
+  let v = list[at]!
+  let keys: string[] = v.allowed_keys ?? virtualKeyIds(store.cfg)
+  if (attach) {
+    if (v.allowed_keys === undefined || keys.includes(vkId)) return reply(200, `{"success":true}`)
+    keys.push(vkId)
+  } else {
+    if (v.allowed_keys === undefined && !keys.includes(vkId)) return reply(200, `{"success":true}`)
+    keys = keys.filter((k) => k !== vkId)
+  }
+  v.allowed_keys = keys
+  let next: vmcp.VirtualMcp[] = list
+  next[at] = v
+  const err = persist(store, withVirtuals(store.cfg, next))
+  if (err !== undefined) return err
+  return reply(200, `{"success":true}`)
+}
+
+function virtualRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string): McpReply {
+  if (segs.length === 3) {
+    if (m === "GET") return listVirtuals(store)
+    if (m === "POST") return createVirtual(store, body)
+    return notAllowed(m)
+  }
+  const id = segs[3]!
+  if (segs.length === 4) {
+    if (m === "GET") {
+      const at = virtualIndex(virtualsOf(store.cfg), id)
+      if (at < 0) return fail(404, "virtual MCP not found")
+      return reply(200, `{"virtual_mcp":${virtualJson(virtualsOf(store.cfg)[at]!, virtualKeyIds(store.cfg))}}`)
+    }
+    if (m === "PUT") return updateVirtual(store, id, body)
+    if (m === "DELETE") return deleteVirtual(store, id)
+    return notAllowed(m)
+  }
+  if (segs.length === 6 && segs[4] === "virtual-keys") {
+    if (m === "POST") return setAttached(store, id, segs[5]!, true)
+    if (m === "DELETE") return setAttached(store, id, segs[5]!, false)
+    return notAllowed(m)
+  }
+  return fail(404, `no route for ${p}`)
+}
+
+// The MCP management route for method and path, or undefined when the path is not one of them.
+// The caller passes every /api/mcp path that is not handled elsewhere (the /api/mcp view and the
+// library are not).
+export function mcpApi(store: ConfigStore, method: string, path: string, body: string): McpReply | undefined {
+  const m = method.toUpperCase()
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  const segs = p.split("/").filter((s) => s !== "")
+  if (segs.length < 3 || segs[0] !== "api" || segs[1] !== "mcp") return undefined
+  const area = segs[2]!
+  if (area === "clients") return m === "GET" ? listClients(store) : notAllowed(m)
+  if (area === "client") return clientRoute(store, m, segs, body, p)
+  if (area === "virtual-mcps") return virtualRoute(store, m, segs, body, p)
+  return undefined
+}
+
+// ---- tests ----
+
+function tmpPath(): string {
+  return "/tmp/raiju-mcpapi-" + randomId("t") + ".json"
+}
+
+function cleanupFile(path: string): void {
+  try {
+    unlinkSync(path)
+  } catch (e) {
+    // already gone
+  }
+  try {
+    unlinkSync(path + ".bak")
+  } catch (e) {
+    // no backup on a first save
+  }
+}
+
+function oneEntry(k: string, v: string): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  m.set(k, v)
+  return m
+}
+
+// A store on a fresh file: two virtual keys and two clients, one http and one stdio.
+function fixture(): ConfigStore {
+  const c: Config = {
+    governance: { virtual_keys: [{ id: "vk1", value: "sk-bf-1", name: "dev" }, { id: "vk2", value: "sk-bf-2", name: "ops" }] },
+    mcp: {
+      client_configs: [
+        { name: "fs", connection_type: "http", connection_string: "http://localhost:9000/mcp", headers: oneEntry("authorization", "Bearer abcdefghijklmnop"), tools_to_execute: ["*"] },
+        { name: "git", connection_type: "stdio", stdio_config: { command: "git-mcp", env: oneEntry("TOKEN", "tok-secret-value") } },
+      ],
+    },
+  }
+  return new ConfigStore(tmpPath(), c)
+}
+
+test("list shows every client with secrets masked", () => {
+  const s = fixture()
+  const r = mcpApi(s, "GET", "/api/mcp/clients", "")!
+  expect(r.status).toBe(200)
+  expect(r.body.includes("\"client_id\":\"fs\"")).toBe(true)
+  expect(r.body.includes("\"count\":2")).toBe(true)
+  expect(r.body.includes("abcdefghijklmnop")).toBe(false)
+  expect(r.body.includes("tok-secret-value")).toBe(false)
+  expect(r.body.includes("Bearer abcd")).toBe(false)
+  expect(mcpApi(s, "POST", "/api/mcp/clients", "{}")!.status).toBe(405)
+  expect(mcpApi(s, "GET", "/api/mcp/other", "") === undefined).toBe(true)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual", "") === undefined).toBe(true)
+  cleanupFile(s.path)
+})
+
+test("create adds a client, validates it, and saves", () => {
+  const s = fixture()
+  const v0 = s.version
+  const r = mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"docs\",\"connection_type\":\"http\",\"connection_string\":\"https://docs.example/mcp\",\"headers\":{\"x-key\":\"sk-live-0123456789\"},\"tool_sync_interval\":\"10m\",\"tls_config\":{\"insecure_skip_verify\":false}}")!
+  expect(r.status).toBe(201)
+  expect(r.body.includes("\"client_id\":\"docs\"")).toBe(true)
+  expect(r.body.includes("sk-live-0123456789")).toBe(false)
+  expect(clientsOf(s.cfg).length).toBe(3)
+  expect(s.version).toBe(v0 + 1)
+  const saved = try readFileSync(s.path, "utf8")
+  expect(saved.includes("\"docs\"")).toBe(true)
+  expect(saved.includes("sk-live-0123456789")).toBe(true)
+  expect(saved.includes("\"tool_sync_interval\": \"10m\"")).toBe(true)
+
+  expect(mcpApi(s, "POST", "/api/mcp/client", "not json")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "[1]")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":5}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"connection_type\":\"http\"}")!.body.includes("name is required")).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"my-srv\",\"connection_type\":\"http\"}")!.body.includes("cannot contain hyphens")).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"1abc\",\"connection_type\":\"http\"}")!.body.includes("cannot start with a number")).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"fs\",\"connection_type\":\"http\",\"connection_string\":\"http://x\"}")!.status).toBe(409)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"inprocess\"}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\"}")!.body.includes("connection_string is required")).toBe(true)
+  expect(clientsOf(s.cfg).length).toBe(3)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"ftp://x\"}")!.body.includes("http or https")).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"stdio\"}")!.body.includes("stdio_config.command is required")).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"http://x\",\"auth_type\":\"oauth\"}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"http://x\",\"auth\":{\"type\":\"weird\"}}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"http://x\",\"tool_sync_interval\":\"1500ms\"}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"http://x\",\"headers\":{\"a\":1}}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"http://x\",\"tools_to_execute\":[1]}")!.status).toBe(400)
+  expect(clientsOf(s.cfg).length).toBe(3)
+  cleanupFile(s.path)
+})
+
+test("duration checks accept Go durations in whole seconds", () => {
+  expect(durationError("0")).toBe("")
+  expect(durationError("90s")).toBe("")
+  expect(durationError("10m")).toBe("")
+  expect(durationError("1h30m")).toBe("")
+  expect(durationError("1h30m15s")).toBe("")
+  expect(durationError("1m30m") === "").toBe(false)
+  expect(durationError("30m1h") === "").toBe(false)
+  expect(durationError("10") === "").toBe(false)
+  expect(durationError("") === "").toBe(false)
+  expect(durationError("1500ms") === "").toBe(false)
+})
+
+test("update patches fields, keeps masked secrets, and refuses renames", () => {
+  const s = fixture()
+  const r = mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"disabled\":true,\"tools_to_skip\":[\"rm\"],\"headers\":{\"authorization\":\"Bear…mnop\",\"x-new\":\"v\"}}")!
+  expect(r.status).toBe(200)
+  expect(r.body.includes("\"disabled\":true")).toBe(true)
+  const c = s.cfg.mcp!.client_configs![0]!
+  expect(c.disabled).toBe(true)
+  expect(c.tools_to_skip!.includes("rm")).toBe(true)
+  expect(c.headers!.get("authorization")).toBe("Bearer abcdefghijklmnop")
+  expect(c.headers!.get("x-new")).toBe("v")
+  expect(c.tools_to_execute!.includes("*")).toBe(true)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"allow_on_all_virtual_keys\":true}")!.body.includes("\"allow_by_default\":true")).toBe(true)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"name\":\"files\"}")!.status).toBe(400)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"name\":\"fs\"}")!.status).toBe(200)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"tool_sync_interval\":\"soon\"}")!.status).toBe(400)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"auth\":null,\"disabled\":false}")!.status).toBe(200)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"auth\":{\"type\":\"weird\"}}")!.status).toBe(400)
+  const au = mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"auth\":{\"type\":\"bearer\",\"token\":\"tok-123456789\"}}")!
+  expect(au.body.includes("tok-…6789")).toBe(true)
+  expect(au.body.includes("tok-123456789")).toBe(false)
+  const kept = mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"auth\":{\"type\":\"bearer\",\"token\":\"tok-…6789\"}}")!
+  expect(kept.status).toBe(200)
+  expect(s.cfg.mcp!.client_configs![0]!.auth!.token).toBe("tok-123456789")
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "not json")!.status).toBe(400)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/nope", "{}")!.status).toBe(404)
+  expect(mcpApi(s, "GET", "/api/mcp/client/fs", "")!.status).toBe(405)
+  cleanupFile(s.path)
+})
+
+test("delete removes a client", () => {
+  const s = fixture()
+  expect(mcpApi(s, "DELETE", "/api/mcp/client/git", "")!.status).toBe(200)
+  expect(s.cfg.mcp!.client_configs!.length).toBe(1)
+  expect(mcpApi(s, "DELETE", "/api/mcp/client/git", "")!.status).toBe(404)
+  cleanupFile(s.path)
+})
+
+test("reconnect and refresh hand the step to the lead, and refuse disabled clients", () => {
+  const s = fixture()
+  const rc = mcpApi(s, "POST", "/api/mcp/client/fs/reconnect", "")!
+  expect(rc.status).toBe(200)
+  expect(rc.action === "reconnect").toBe(true)
+  expect(rc.id === "fs").toBe(true)
+  const rf = mcpApi(s, "POST", "/api/mcp/client/git/refresh-tools", "")!
+  expect(rf.action === "refresh").toBe(true)
+  expect(rf.id === "git").toBe(true)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"disabled\":true}")!.status).toBe(200)
+  const off = mcpApi(s, "POST", "/api/mcp/client/fs/reconnect", "")!
+  expect(off.status).toBe(400)
+  expect(off.action === undefined).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/client/fs/refresh-tools", "")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/client/nope/reconnect", "")!.status).toBe(404)
+  expect(mcpApi(s, "GET", "/api/mcp/client/fs/reconnect", "")!.status).toBe(405)
+  expect(mcpApi(s, "POST", "/api/mcp/client/fs/openapi-spec", "")!.status).toBe(501)
+  expect(mcpApi(s, "POST", "/api/mcp/client/fs/complete-oauth", "")!.status).toBe(501)
+  expect(mcpApi(s, "POST", "/api/mcp/client/fs/whatever", "")!.status).toBe(404)
+  cleanupFile(s.path)
+})
+
+test("virtual MCPs: create with Bifrost and native tools, then read, update and delete", () => {
+  const s = fixture()
+  const c = mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"dev\",\"description\":\"Dev tools\",\"tools\":[{\"mcp_client_id\":\"fs\",\"tool_names\":[\"read\",\"write\"]},{\"mcp_client_id\":\"git\",\"tool_names\":[\"*\"]}]}")!
+  expect(c.status).toBe(201)
+  expect(c.body.includes("\"source\":\"fs-read\"")).toBe(true)
+  expect(c.body.includes("\"source\":\"git-*\"")).toBe(true)
+  expect(c.body.includes("\"description\":\"Dev tools\"")).toBe(true)
+  expect(c.body.includes("\"virtual_key_ids\":[\"vk1\",\"vk2\"]")).toBe(true)
+
+  const native = mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"nat\",\"endpoint_slug\":\"nat\",\"tools\":[{\"source\":\"fs-read\",\"as\":\"read_file\",\"defaults\":\"{\\\"limit\\\":5}\"}]}")!
+  expect(native.status).toBe(201)
+  expect(native.body.includes("\"as\":\"read_file\"")).toBe(true)
+
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"dev\"}")!.status).toBe(409)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"fs\"}")!.status).toBe(409)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{}")!.body.includes("name is required")).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"Bad Name\"}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"x\",\"endpoint_slug\":\"y\"}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"x\",\"enabled\":false}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"x\",\"tools\":[{\"mcp_client_id\":\"nope\",\"tool_names\":[\"a\"]}]}")!.body.includes("invalid MCP client IDs: nope")).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"x\",\"tools\":[{\"source\":\"zzz-read\"}]}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"x\",\"tools\":[{\"source\":\"fs-*\",\"as\":\"n\"}]}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"x\",\"tools\":\"no\"}")!.status).toBe(400)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"x\",\"tools\":[\"fs-read\"]}")!.status).toBe(400)
+
+  const list = mcpApi(s, "GET", "/api/mcp/virtual-mcps", "")!
+  expect(list.body.includes("\"count\":2")).toBe(true)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/dev", "")!.body.includes("\"virtual_mcp\"")).toBe(true)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/nope", "")!.status).toBe(404)
+
+  const up = mcpApi(s, "PUT", "/api/mcp/virtual-mcps/dev", "{\"description\":\"Renamed\",\"tools\":[{\"source\":\"git-log\"}]}")!
+  expect(up.status).toBe(200)
+  expect(up.body.includes("\"description\":\"Renamed\"")).toBe(true)
+  expect(s.cfg.virtual_mcps![0]!.tools.length).toBe(1)
+  expect(mcpApi(s, "PUT", "/api/mcp/virtual-mcps/dev", "{\"name\":\"nat\"}")!.status).toBe(409)
+  expect(mcpApi(s, "PUT", "/api/mcp/virtual-mcps/dev", "{\"name\":\"devs\"}")!.status).toBe(200)
+  expect(mcpApi(s, "PUT", "/api/mcp/virtual-mcps/devs", "{\"enabled\":false}")!.status).toBe(400)
+  expect(mcpApi(s, "PUT", "/api/mcp/virtual-mcps/nope", "{}")!.status).toBe(404)
+
+  expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/devs", "")!.body.includes("\"success\":true")).toBe(true)
+  expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/devs", "")!.status).toBe(404)
+  expect(mcpApi(s, "PATCH", "/api/mcp/virtual-mcps", "")!.status).toBe(405)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/nat/other", "")!.status).toBe(404)
+  cleanupFile(s.path)
+})
+
+test("attach and detach change which virtual keys may use a virtual MCP", () => {
+  const s = fixture()
+  mcpApi(s, "POST", "/api/mcp/virtual-mcps", "{\"name\":\"dev\"}")
+  // unset allowed_keys: every key already has it, so attaching changes nothing
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk1", "")!.status).toBe(200)
+  expect(s.cfg.virtual_mcps![0]!.allowed_keys === undefined).toBe(true)
+  // detaching from an open one lists the other keys
+  expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/dev/virtual-keys/vk2", "")!.status).toBe(200)
+  expect(s.cfg.virtual_mcps![0]!.allowed_keys!.join(",")).toBe("vk1")
+  expect(vmcp.keyAllowed(s.cfg.virtual_mcps![0]!, "vk2")).toBe(false)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk2", "")!.status).toBe(200)
+  expect(s.cfg.virtual_mcps![0]!.allowed_keys!.join(",")).toBe("vk1,vk2")
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk2", "")!.status).toBe(200)
+  expect(s.cfg.virtual_mcps![0]!.allowed_keys!.length).toBe(2)
+  expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/dev/virtual-keys/vk1", "")!.status).toBe(200)
+  expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/dev/virtual-keys/vk2", "")!.status).toBe(200)
+  expect(s.cfg.virtual_mcps![0]!.allowed_keys!.length).toBe(0)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/nope", "")!.status).toBe(404)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/nope/virtual-keys/vk1", "")!.status).toBe(404)
+  expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/nope/virtual-keys/vk1", "")!.status).toBe(404)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/dev/virtual-keys/vk1", "")!.status).toBe(405)
+  cleanupFile(s.path)
+})
