@@ -1,0 +1,334 @@
+// Build log export to S3-compatible object storage: AWS S3, MinIO, and GCS
+// through its S3 interoperability HMAC keys. This module builds the PUT and
+// tracks what has been sent; the lead performs the upload.
+import { sha256, hmacSha256, toHex, utf8 } from "./crypto"
+import { amzDate, encodeSegment } from "./providers/bedrock"
+import { trimSlash } from "./providers/types"
+import { LogExportsConfig } from "./config"
+
+export type ExportConfig = LogExportsConfig
+
+export type PutRequest = { url: string, method: "PUT", headers: Map<string, string>, body: string }
+
+const DEFAULT_INTERVAL = 300
+const CONTENT_TYPE = "application/x-ndjson"
+
+export function exportInterval(cfg: ExportConfig): int {
+  const s = cfg.interval_seconds
+  return s !== undefined && s > 0 ? s : DEFAULT_INTERVAL
+}
+
+// GCS signs with the "auto" region; S3 needs a real one, and us-east-1 is
+// the default that every S3-compatible server accepts.
+function regionOf(cfg: ExportConfig): string {
+  const r = cfg.region
+  if (r !== undefined && r !== "") return r
+  return cfg.kind === "gcs" ? "auto" : "us-east-1"
+}
+
+function hasEndpoint(cfg: ExportConfig): bool {
+  const e = cfg.endpoint
+  return e !== undefined && e !== ""
+}
+
+function endpointOf(cfg: ExportConfig): string {
+  if (hasEndpoint(cfg)) return trimSlash(cfg.endpoint!)
+  if (cfg.kind === "gcs") return "https://storage.googleapis.com"
+  return `https://s3.${regionOf(cfg)}.amazonaws.com`
+}
+
+// A custom endpoint (MinIO and the like) rarely has bucket subdomains, so an
+// endpoint, or an explicit path_style, means the bucket goes in the path.
+function pathStyle(cfg: ExportConfig): bool {
+  return (cfg.path_style ?? false) || hasEndpoint(cfg)
+}
+
+type Endpoint = { scheme: string, host: string, base: string }
+
+// "https://host[:port][/base]" split into its parts. base is "" or "/path".
+function parseEndpoint(ep: string): Endpoint {
+  let rest = ep
+  let scheme = "https://"
+  if (rest.startsWith("http://")) {
+    scheme = "http://"
+    rest = rest.slice(7)
+  } else if (rest.startsWith("https://")) {
+    rest = rest.slice(8)
+  }
+  const slash = rest.indexOf("/")
+  if (slash < 0) return { scheme: scheme, host: rest, base: "" }
+  return { scheme: scheme, host: rest.slice(0, slash), base: rest.slice(slash) }
+}
+
+// "YYYY-MM-DDTHH:MM:SS.mmmZ", UTC, the form object keys carry.
+function isoMs(ms: number): string {
+  const d = amzDate(ms)
+  const millis = Math.floor(ms) % 1000
+  const frac = millis < 10 ? "00" + millis : millis < 100 ? "0" + millis : "" + millis
+  return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}T${d.slice(9, 11)}:${d.slice(11, 13)}:${d.slice(13, 15)}.${frac}Z`
+}
+
+// <prefix>/raiju-logs/YYYY/MM/DD/<startISO>-<endISO>-<node>.jsonl. The day
+// comes from startMs, so a batch belongs to the day it starts on.
+export function objectKey(cfg: ExportConfig, startMs: number, endMs: number, node: string): string {
+  const d = amzDate(startMs)
+  // empty segments drop out, so a stray slash in the prefix cannot double up
+  const segs = (cfg.prefix ?? "").split("/").filter((s) => s !== "")
+  segs.push("raiju-logs", `${d.slice(0, 4)}/${d.slice(4, 6)}/${d.slice(6, 8)}`)
+  const name = `${isoMs(startMs)}-${isoMs(endMs)}-${node.split("/").join("-")}.jsonl`
+  return segs.join("/") + "/" + name
+}
+
+// Where the object lives: the scheme, the Host header, and the canonical
+// path (already percent-encoded once, as S3 signs it).
+function locate(cfg: ExportConfig, key: string): { scheme: string, host: string, path: string } {
+  const ep = parseEndpoint(endpointOf(cfg))
+  const objPath = key.split("/").map((s) => encodeSegment(s)).join("/")
+  if (pathStyle(cfg)) {
+    return { scheme: ep.scheme, host: ep.host, path: `${trimSlash(ep.base)}/${encodeSegment(cfg.bucket)}/${objPath}` }
+  }
+  return { scheme: ep.scheme, host: `${cfg.bucket}.${ep.host}`, path: `/${objPath}` }
+}
+
+// ---- SigV4 for S3 ----
+
+// The shared bedrock signer only knows POST with three fixed headers, and S3
+// PUT signs the caller's own header set (x-amz-content-sha256, date, storage
+// class), so this signer takes the headers as given.
+type S3Creds = { accessKey: string, secretKey: string, sessionToken?: string, region: string }
+
+// Returns the Authorization header value. hs holds lower-case names and
+// values, including host; the payload hash is the hex SHA-256 of the body.
+function signS3(c: S3Creds, method: string, host: string, path: string, hs: string[][], payloadHash: string, date: string): string {
+  const day = date.slice(0, 8)
+  const sorted = hs.slice().sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0))
+  const canonicalHeaders = sorted.map((h) => `${h[0]!}:${h[1]!}\n`).join("")
+  const signed = sorted.map((h) => h[0]!).join(";")
+  // no query string, so the empty line after the path is the query
+  const canonical = `${method}\n${path}\n\n${canonicalHeaders}\n${signed}\n${payloadHash}`
+  const scope = `${day}/${c.region}/s3/aws4_request`
+  const toSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${toHex(sha256(utf8(canonical)))}`
+  const kDate = hmacSha256(utf8("AWS4" + c.secretKey), utf8(day))
+  const kRegion = hmacSha256(kDate, utf8(c.region))
+  const kService = hmacSha256(kRegion, utf8("s3"))
+  const kSigning = hmacSha256(kService, utf8("aws4_request"))
+  const signature = toHex(hmacSha256(kSigning, utf8(toSign)))
+  return `AWS4-HMAC-SHA256 Credential=${c.accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}`
+}
+
+// A signed PUT of body to key. nowMs sets the signing time, so pass the
+// time of the request, not of the batch.
+export function putRequest(cfg: ExportConfig, key: string, body: string, nowMs: number): PutRequest {
+  const loc = locate(cfg, key)
+  const date = amzDate(nowMs)
+  const payloadHash = toHex(sha256(utf8(body)))
+  const token = cfg.session_token
+  const hs: string[][] = [["content-type", CONTENT_TYPE], ["host", loc.host], ["x-amz-content-sha256", payloadHash], ["x-amz-date", date]]
+  if (token !== undefined && token !== "") hs.push(["x-amz-security-token", token])
+  const auth = signS3({ accessKey: cfg.access_key_id, secretKey: cfg.secret_access_key, sessionToken: token, region: regionOf(cfg) },
+    "PUT", loc.host, loc.path, hs, payloadHash, date)
+  // Host is left to the HTTP client, which sends the URL's host
+  const headers: Map<string, string> = new Map()
+  for (const h of hs) {
+    if (h[0] !== "host") headers.set(h[0]!, h[1]!)
+  }
+  headers.set("authorization", auth)
+  return { url: loc.scheme + loc.host + loc.path, method: "PUT", headers: headers, body: body }
+}
+
+// Tracks the newest exported timestamp (ms). Entries at or before it are
+// never selected again, so the cursor only moves after an upload succeeds.
+export class ExportCursor {
+  private last: number
+
+  constructor(startMs?: number) {
+    this.last = startMs ?? 0
+  }
+
+  // Time the cursor has reached; persist it to resume after a restart.
+  position(): number {
+    return this.last
+  }
+
+  // The lines with cursor < ts <= nowMs, joined as JSONL. Each entry must be a
+  // single line. Nothing changes until commit(). Returns undefined when empty.
+  pending(entriesJsonl: string[], tsOf: number[], nowMs: number): { body: string, startMs: number, endMs: number, count: number } | undefined {
+    const lines: string[] = []
+    let startMs = 0
+    let endMs = 0
+    const n = Math.min(entriesJsonl.length, tsOf.length)
+    for (let i = 0; i < n; i++) {
+      const ts = tsOf[i]!
+      if (ts <= this.last || ts > nowMs) continue
+      if (lines.length === 0 || ts < startMs) startMs = ts
+      if (lines.length === 0 || ts > endMs) endMs = ts
+      lines.push(entriesJsonl[i]!)
+    }
+    if (lines.length === 0) return undefined
+    return { body: lines.join("\n") + "\n", startMs: startMs, endMs: endMs, count: lines.length }
+  }
+
+  // Call only after the upload of a pending batch succeeded. Never moves back.
+  commit(endMs: number): void {
+    if (endMs > this.last) this.last = endMs
+  }
+}
+
+// ---- tests ----
+
+const AK = "AKIAIOSFODNN7EXAMPLE"
+const SK = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+const T0 = 1791979200000.0 // 2026-10-14T12:00:00Z
+const T1 = 1791979500000.0 // 2026-10-14T12:05:00Z
+const PAYLOAD_WELCOME = "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072"
+const PAYLOAD_EMPTY = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+function s3Cfg(overrides: { kind?: "s3" | "gcs", region?: string, endpoint?: string, path_style?: bool, prefix?: string, session_token?: string }): ExportConfig {
+  return {
+    enabled: true,
+    kind: overrides.kind ?? "s3",
+    bucket: "logs",
+    region: overrides.region,
+    endpoint: overrides.endpoint,
+    prefix: overrides.prefix,
+    path_style: overrides.path_style,
+    session_token: overrides.session_token,
+    access_key_id: AK,
+    secret_access_key: SK,
+  }
+}
+
+test("sigv4 PUT matches the AWS S3 example", () => {
+  // AWS docs "PUT Object" example: signed headers include x-amz-content-sha256
+  const creds: S3Creds = { accessKey: AK, secretKey: SK, region: "us-east-1" }
+  const hs = [
+    ["date", "Fri, 24 May 2013 00:00:00 GMT"],
+    ["host", "examplebucket.s3.amazonaws.com"],
+    ["x-amz-content-sha256", PAYLOAD_WELCOME],
+    ["x-amz-date", "20130524T000000Z"],
+    ["x-amz-storage-class", "REDUCED_REDUNDANCY"],
+  ]
+  const auth = signS3(creds, "PUT", "examplebucket.s3.amazonaws.com", "/test%24file.text", hs, PAYLOAD_WELCOME, "20130524T000000Z")
+  expect(auth.includes("SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class,")).toBe(true)
+  expect(auth.endsWith("Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd")).toBe(true)
+})
+
+test("sigv4 GET matches the AWS S3 example", () => {
+  const creds: S3Creds = { accessKey: AK, secretKey: SK, region: "us-east-1" }
+  const hs = [
+    ["host", "examplebucket.s3.amazonaws.com"],
+    ["range", "bytes=0-9"],
+    ["x-amz-content-sha256", PAYLOAD_EMPTY],
+    ["x-amz-date", "20130524T000000Z"],
+  ]
+  const auth = signS3(creds, "GET", "examplebucket.s3.amazonaws.com", "/test.txt", hs, PAYLOAD_EMPTY, "20130524T000000Z")
+  expect(auth.endsWith("Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")).toBe(true)
+})
+
+test("object keys", () => {
+  const cfg = s3Cfg({})
+  expect(objectKey(cfg, T0, T1, "node-a")).toBe("raiju-logs/2026/10/14/2026-10-14T12:00:00.000Z-2026-10-14T12:05:00.000Z-node-a.jsonl")
+  // stray slashes in the prefix do not produce empty segments
+  expect(objectKey(s3Cfg({ prefix: "/exports//team/" }), T0, T1, "n")).toBe("exports/team/raiju-logs/2026/10/14/2026-10-14T12:00:00.000Z-2026-10-14T12:05:00.000Z-n.jsonl")
+  expect(objectKey(s3Cfg({ prefix: "" }), T0, T1, "n").startsWith("raiju-logs/")).toBe(true)
+  // the day is the start batch's day, even when the batch ends after midnight
+  const late = 1792022280000.0 // 2026-10-14T23:58:00Z
+  expect(objectKey(cfg, late, late + 300000.0, "n")).toBe("raiju-logs/2026/10/14/2026-10-14T23:58:00.000Z-2026-10-15T00:03:00.000Z-n.jsonl")
+  // a node name with a slash cannot add a path segment
+  expect(objectKey(cfg, T0, T1, "rack/3").endsWith("-rack-3.jsonl")).toBe(true)
+  // millisecond padding
+  expect(objectKey(cfg, T0 + 7.0, T1, "n").includes("T12:00:00.007Z-")).toBe(true)
+})
+
+test("s3 URLs default to virtual-hosted style", () => {
+  const key = objectKey(s3Cfg({ region: "eu-west-1" }), T0, T1, "node-a")
+  const req = putRequest(s3Cfg({ region: "eu-west-1" }), key, "x", T1)
+  expect(req.url).toBe("https://logs.s3.eu-west-1.amazonaws.com/raiju-logs/2026/10/14/2026-10-14T12%3A00%3A00.000Z-2026-10-14T12%3A05%3A00.000Z-node-a.jsonl")
+  expect(req.method).toBe("PUT")
+  // no region means us-east-1
+  expect(putRequest(s3Cfg({}), "k", "x", T1).url).toBe("https://logs.s3.us-east-1.amazonaws.com/k")
+})
+
+test("path style for path_style and custom endpoints", () => {
+  // an explicit path_style with the default endpoint
+  expect(putRequest(s3Cfg({ path_style: true }), "k.jsonl", "x", T1).url).toBe("https://s3.us-east-1.amazonaws.com/logs/k.jsonl")
+  // a MinIO endpoint, trailing slash trimmed, default region
+  const minio = putRequest(s3Cfg({ endpoint: "http://minio.internal:9000/" }), "a b/c+d.jsonl", "x", T1)
+  expect(minio.url).toBe("http://minio.internal:9000/logs/a%20b/c%2Bd.jsonl")
+  expect(minio.headers.get("host")).toBe(undefined)
+  expect(minio.headers.get("authorization")!.includes("Credential=AKIAIOSFODNN7EXAMPLE/20261014/us-east-1/s3/aws4_request")).toBe(true)
+  // an endpoint with a base path keeps it ahead of the bucket
+  expect(putRequest(s3Cfg({ endpoint: "https://proxy.example/minio" }), "k", "x", T1).url).toBe("https://proxy.example/minio/logs/k")
+})
+
+test("gcs uses the storage host and the auto region", () => {
+  const gcs: ExportConfig = { enabled: true, kind: "gcs", bucket: "logs", access_key_id: "GOOG1EXAMPLE", secret_access_key: SK }
+  expect(putRequest(gcs, "k", "x", T1).url).toBe("https://logs.storage.googleapis.com/k")
+  expect(putRequest(gcs, "k", "x", T1).headers.get("authorization")!.includes("/20261014/auto/s3/aws4_request")).toBe(true)
+  // an explicit GCS region still wins over auto
+  expect(putRequest(s3Cfg({ kind: "gcs", region: "us-east1" }), "k", "x", T1).headers.get("authorization")!.includes("/us-east1/s3/")).toBe(true)
+})
+
+test("put request signature matches the independent reference", () => {
+  // Reference computed with Python's hmac/hashlib over the same canonical request.
+  const key = objectKey(s3Cfg({ region: "eu-west-1" }), T0, T1, "node-a")
+  const req = putRequest(s3Cfg({ region: "eu-west-1", session_token: "TOKEN123" }), key, "{\"a\":1}\n", T1)
+  const auth = req.headers.get("authorization")!
+  expect(req.headers.get("x-amz-date")).toBe("20261014T120500Z")
+  expect(req.headers.get("x-amz-content-sha256")).toBe(toHex(sha256(utf8("{\"a\":1}\n"))))
+  expect(req.headers.get("x-amz-security-token")).toBe("TOKEN123")
+  expect(req.headers.get("content-type")).toBe("application/x-ndjson")
+  expect(req.body).toBe("{\"a\":1}\n")
+  expect(auth.includes("SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token,")).toBe(true)
+  expect(auth.endsWith("Signature=b1209c6c1c33e9ab5eeeea4f3c40ef56759779d1b0450553c35ef0ae70b7014a")).toBe(true)
+})
+
+test("cursor selects new lines and commits only on request", () => {
+  const lines = [`{"ts":100}`, `{"ts":200}`, `{"ts":300}`, `{"ts":400}`]
+  const ts = [100.0, 200.0, 300.0, 400.0]
+  const c = new ExportCursor()
+  const first = c.pending(lines, ts, 1000.0)
+  expect(first !== undefined).toBe(true)
+  expect(first!.count).toBe(4)
+  expect(first!.startMs).toBe(100.0)
+  expect(first!.endMs).toBe(400.0)
+  expect(first!.body).toBe(lines.join("\n") + "\n")
+  // nothing committed yet, so the same batch comes back
+  expect(c.pending(lines, ts, 1000.0)!.count).toBe(4)
+  c.commit(300.0)
+  expect(c.position()).toBe(300.0)
+  const second = c.pending(lines, ts, 1000.0)
+  expect(second!.count).toBe(1)
+  expect(second!.startMs).toBe(400.0)
+  expect(second!.body).toBe(`{"ts":400}\n`)
+  // the cursor never moves back
+  c.commit(200.0)
+  expect(c.position()).toBe(300.0)
+  c.commit(400.0)
+  expect(c.pending(lines, ts, 1000.0)).toBe(undefined)
+})
+
+test("cursor respects its bounds", () => {
+  const lines = [`{"ts":100}`, `{"ts":200}`, `{"ts":900}`]
+  const ts = [100.0, 200.0, 900.0]
+  const c = new ExportCursor()
+  // the upper bound is inclusive, and entries after nowMs wait for a later batch
+  const early = c.pending(lines, ts, 200.0)
+  expect(early!.count).toBe(2)
+  expect(early!.endMs).toBe(200.0)
+  c.commit(200.0)
+  expect(c.pending(lines, ts, 500.0)).toBe(undefined)
+  expect(c.pending(lines, ts, 1000.0)!.body).toBe(`{"ts":900}\n`)
+  // a cursor seeded from storage skips what is already there
+  expect(new ExportCursor(200.0).pending(lines, ts, 1000.0)!.count).toBe(1)
+  // mismatched lengths use the shorter list
+  expect(new ExportCursor().pending(lines, [100.0], 1000.0)!.count).toBe(1)
+  expect(new ExportCursor().pending([], [], 1000.0)).toBe(undefined)
+})
+
+test("export interval defaults to 300 seconds", () => {
+  expect(exportInterval(s3Cfg({}))).toBe(300)
+  const cfg = s3Cfg({})
+  cfg.interval_seconds = 60
+  expect(exportInterval(cfg)).toBe(60)
+})

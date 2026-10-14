@@ -1,0 +1,747 @@
+// OpenID Connect single sign-on for the admin UI and management API: the
+// authorization code flow with PKCE (RFC 7636), ID token checks (OIDC Core
+// 3.1.3.7) and RS256 signatures (RFC 7518, RSASSA-PKCS1-v1_5). The lead does
+// the HTTP calls (discovery, token, JWKS); everything here is pure except the
+// small state held by OidcFlows and UiSessions.
+import { Field, fields, elements, find, rawStr, rawNum, decodeString } from "./json"
+import { sha256, utf8, secureHex } from "./crypto"
+import { encodeUrl, decode } from "./base64"
+import { modPow, signRs256 } from "./jwt"
+
+export type OidcConfig = {
+  enabled: bool,
+  issuer: string,
+  client_id: string,
+  client_secret?: string,
+  redirect_uri: string,
+  scopes?: string[],
+  role_claim?: string,
+  role_map?: Record<string, string>,
+  default_role?: string,
+  session_ttl_seconds?: int,
+}
+
+export type Discovery = { authorization_endpoint: string, token_endpoint: string, jwks_uri: string, issuer: string }
+
+export type IdTokenResult = { kind: "ok", sub: string, email?: string, role: string } | { kind: "error", message: string }
+
+export type Session = { sub: string, role: string }
+
+const ROLES = ["admin", "editor", "viewer", "auditor"]
+
+// Clock skew allowed on exp and nbf, in seconds.
+const SKEW_S = 60
+
+// A login must finish within this window; abandoned logins expire.
+const PENDING_TTL_MS = 600000.0
+
+// Upper bound on logins in flight, so unfinished logins cannot grow memory without limit.
+const MAX_PENDING = 10000
+
+const enc = new TextEncoder()
+
+// ---- discovery ----
+
+export function discoveryUrl(issuer: string): string {
+  let base = issuer
+  while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+  return base + "/.well-known/openid-configuration"
+}
+
+// Endpoints must be https; plain http is allowed only for a local IdP in development.
+function endpoint(fs: Field[], key: string): string throws SyntaxError {
+  const u = rawStr(fs, key)
+  if (u === undefined || !(u.startsWith("https://") || u.startsWith("http://localhost") || u.startsWith("http://127.0.0.1"))) {
+    throw new SyntaxError(`discovery: ${key} is missing or not https`)
+  }
+  return u
+}
+
+export function parseDiscovery(json: string): Discovery throws SyntaxError {
+  const fs = try fields(json)
+  const issuer = rawStr(fs, "issuer")
+  if (issuer === undefined) throw new SyntaxError("discovery: missing issuer")
+  return {
+    authorization_endpoint: try endpoint(fs, "authorization_endpoint"),
+    token_endpoint: try endpoint(fs, "token_endpoint"),
+    jwks_uri: try endpoint(fs, "jwks_uri"),
+    issuer: issuer,
+  }
+}
+
+// ---- encoding helpers ----
+
+const HEX = "0123456789ABCDEF"
+
+// Byte-indexed table: the RFC 3986 unreserved characters map to themselves, every other byte to "".
+function makeUnreserved(): string[] {
+  const t: string[] = []
+  for (let i = 0; i < 256; i++) t.push("")
+  const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+  const bs = enc.encode(alpha)
+  for (let i = 0; i < alpha.byteLength; i++) t[int(bs[i]!)] = alpha.slice(i, i + 1)
+  return t
+}
+
+const UNRESERVED = makeUnreserved()
+
+// Percent-encodes a string for a query or form body (RFC 3986).
+function pct(s: string): string {
+  const out: string[] = []
+  for (const b of utf8(s)) {
+    const c = int(b)
+    const plain = UNRESERVED[c]!
+    if (plain !== "") {
+      out.push(plain)
+    } else {
+      out.push("%" + HEX.slice(c >> 4, (c >> 4) + 1) + HEX.slice(c & 15, (c & 15) + 1))
+    }
+  }
+  return out.join("")
+}
+
+function kv(k: string, v: string): string {
+  return pct(k) + "=" + pct(v)
+}
+
+function decodeText(s: string): string throws Error {
+  return try new TextDecoder().decode(try decode(s))
+}
+
+// ---- authorization request and token request ----
+
+type Pending = { verifier: string, nonce: string, expires: number }
+
+export class OidcFlows {
+  pending: Map<string, Pending> = new Map()
+
+  // Starts a login: stores state, nonce and PKCE verifier, and returns the authorize URL.
+  begin(cfg: OidcConfig, disc: Discovery, nowMs: number): { url: string, state: string } throws Error {
+    if (disc.issuer !== cfg.issuer) throw new Error("oidc: discovery issuer does not match the configured issuer")
+    const state = try secureHex(32)
+    const nonce = try secureHex(32)
+    // 64 hex characters are a valid PKCE verifier (43 to 128 unreserved characters).
+    const verifier = try secureHex(64)
+    const challenge = encodeUrl(sha256(utf8(verifier)))
+    this.sweep(nowMs)
+    this.pending.set(state, { verifier: verifier, nonce: nonce, expires: nowMs + PENDING_TTL_MS })
+    let scopes = cfg.scopes ?? ["openid", "email", "profile"]
+    if (!scopes.includes("openid")) scopes = ["openid"].concat(scopes)
+    const params = [
+      kv("response_type", "code"),
+      kv("client_id", cfg.client_id),
+      kv("redirect_uri", cfg.redirect_uri),
+      kv("scope", scopes.join(" ")),
+      kv("state", state),
+      kv("nonce", nonce),
+      kv("code_challenge", challenge),
+      kv("code_challenge_method", "S256"),
+    ]
+    const sep = disc.authorization_endpoint.includes("?") ? "&" : "?"
+    return { url: disc.authorization_endpoint + sep + params.join("&"), state: state }
+  }
+
+  // Returns the stored verifier and nonce for a state, once. Later calls, and calls after expiry, get undefined.
+  complete(state: string, nowMs: number): { verifier: string, nonce: string } | undefined {
+    const p = this.pending.get(state)
+    if (p === undefined) return undefined
+    this.pending.delete(state)
+    if (p.expires <= nowMs) return undefined
+    return { verifier: p.verifier, nonce: p.nonce }
+  }
+
+  private sweep(nowMs: number): void {
+    for (const k of this.pending.keys()) {
+      const p = this.pending.get(k)
+      if (p !== undefined && p.expires <= nowMs) this.pending.delete(k)
+    }
+    if (this.pending.size >= MAX_PENDING) {
+      const first = this.pending.keys()[0]
+      if (first !== undefined) this.pending.delete(first)
+    }
+  }
+}
+
+// The form body for the token endpoint. client_secret is sent in the body (client_secret_post).
+export function tokenRequestBody(cfg: OidcConfig, code: string, verifier: string): string {
+  const parts = [
+    kv("grant_type", "authorization_code"),
+    kv("code", code),
+    kv("redirect_uri", cfg.redirect_uri),
+    kv("client_id", cfg.client_id),
+    kv("code_verifier", verifier),
+  ]
+  const secret = cfg.client_secret
+  if (secret !== undefined && secret !== "") parts.push(kv("client_secret", secret))
+  return parts.join("&")
+}
+
+// ---- RS256 verification ----
+
+// Big-endian bytes as a non-negative bigint.
+function bigOfBytes(b: u8[]): bigint {
+  let v = 0n
+  for (const x of b) v = v * 256n + BigInt(int(x))
+  return v
+}
+
+function byteLenOf(x: bigint): int {
+  let n = 0
+  let v = x
+  while (v > 0n) {
+    v = v >> 8n
+    n++
+  }
+  return n
+}
+
+// DigestInfo prefix for SHA-256 (RFC 8017, section 9.2 note 1).
+const SHA256_DIGEST_INFO: int[] = [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20]
+
+// The expected padded message EM = 00 01 FF..FF 00 || DigestInfo || hash, as a k-byte number.
+function expectedEm(hash: u8[], k: int): bigint throws Error {
+  const tLen = SHA256_DIGEST_INFO.length + hash.length
+  if (k < tLen + 11) throw new Error("oidc: RSA key too small for SHA-256")
+  const em: u8[] = [u8(0), u8(1)]
+  for (let i = 0; i < k - tLen - 3; i++) em.push(u8(0xff))
+  em.push(u8(0))
+  for (const b of SHA256_DIGEST_INFO) em.push(u8(b))
+  for (const b of hash) em.push(b)
+  return bigOfBytes(em)
+}
+
+// RSASSA-PKCS1-v1_5 verification: s^e mod n must equal the expected encoding.
+function rsaVerify(signingInput: string, sigB64: string, nB64: string, eB64: string): bool throws Error {
+  const n = bigOfBytes(try decode(nB64))
+  const e = bigOfBytes(try decode(eB64))
+  const k = byteLenOf(n)
+  // Refuse keys under 2048 bits, and exponents that are not odd and above 1.
+  if (k < 256) throw new Error("oidc: RSA key shorter than 2048 bits")
+  if (e < 3n || (e & 1n) === 0n) throw new Error("oidc: invalid RSA exponent")
+  const sig = try decode(sigB64)
+  if (sig.length !== k) return false
+  const s = bigOfBytes(sig)
+  if (s >= n) return false
+  const m = modPow(s, e, n)
+  const want = try expectedEm(sha256(utf8(signingInput)), k)
+  return m === want
+}
+
+// The JWK with the header's kid (or the only RSA signing key when there is no kid).
+function findJwk(jwksJson: string, kid: string | undefined): Field[] throws Error {
+  const jfs = try fields(jwksJson)
+  const keysRaw = find(jfs, "keys")
+  if (keysRaw === undefined) throw new Error("oidc: JWKS has no keys")
+  const found: Field[][] = []
+  for (const raw of try elements(keysRaw)) {
+    const kfs = try fields(raw)
+    if (rawStr(kfs, "kty") !== "RSA") continue
+    const use = rawStr(kfs, "use")
+    if (use !== undefined && use !== "sig") continue
+    const alg = rawStr(kfs, "alg")
+    if (alg !== undefined && alg !== "RS256") continue
+    if (kid !== undefined && rawStr(kfs, "kid") !== kid) continue
+    found.push(kfs)
+  }
+  if (found.length !== 1) throw new Error("oidc: no unique signing key matches the ID token")
+  return found[0]!
+}
+
+// Strings in a JSON value: a string gives one, an array gives its string elements.
+function stringsOf(raw: string | undefined): string[] throws SyntaxError {
+  const out: string[] = []
+  if (raw === undefined) return out
+  if (raw.startsWith("\"")) {
+    out.push(try decodeString(raw))
+  } else if (raw.startsWith("[")) {
+    for (const el of try elements(raw)) {
+      if (el.startsWith("\"")) out.push(try decodeString(el))
+    }
+  }
+  return out
+}
+
+const ROLE_DEFAULT = "viewer"
+
+function isRole(r: string): bool {
+  return ROLES.includes(r)
+}
+
+// First group (in claim order) with a role_map entry wins; else default_role.
+function roleOf(cfg: OidcConfig, pfs: Field[]): string throws Error {
+  const groups = try stringsOf(find(pfs, cfg.role_claim ?? "groups"))
+  const map = cfg.role_map
+  if (map !== undefined) {
+    for (const g of groups) {
+      const r = map.get(g)
+      if (r !== undefined) {
+        if (!isRole(r)) throw new Error(`oidc: role_map maps to unknown role ${r}`)
+        return r
+      }
+    }
+  }
+  const d = cfg.default_role ?? ROLE_DEFAULT
+  if (!isRole(d)) throw new Error(`oidc: default_role ${d} is not a role`)
+  return d
+}
+
+function checkToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string, nowMs: number): IdTokenResult throws Error {
+  const parts = idToken.split(".")
+  if (parts.length !== 3) throw new Error("oidc: ID token is not a JWS compact serialization")
+  const hfs = try fields(try decodeText(parts[0]!))
+  if (rawStr(hfs, "alg") !== "RS256") throw new Error("oidc: ID token alg is not RS256")
+  const kid = rawStr(hfs, "kid")
+  const pfs = try fields(try decodeText(parts[1]!))
+  const jwk = try findJwk(jwksJson, kid)
+  const nB64 = rawStr(jwk, "n")
+  const eB64 = rawStr(jwk, "e")
+  if (nB64 === undefined || eB64 === undefined) throw new Error("oidc: signing key has no modulus or exponent")
+  const signingInput = parts[0]! + "." + parts[1]!
+  const ok = try rsaVerify(signingInput, parts[2]!, nB64, eB64)
+  if (!ok) throw new Error("oidc: ID token signature is invalid")
+
+  if (rawStr(pfs, "iss") !== issuer) throw new Error("oidc: ID token issuer does not match")
+
+  // aud is a string or an array; the array form also needs azp (OIDC Core 3.1.3.7 step 3 and 5).
+  const audList = try stringsOf(find(pfs, "aud"))
+  if (!audList.includes(cfg.client_id)) throw new Error("oidc: ID token audience does not include this client")
+  const azp = rawStr(pfs, "azp")
+  if (azp !== undefined && azp !== cfg.client_id) throw new Error("oidc: ID token azp is not this client")
+  if (audList.length > 1 && azp === undefined) throw new Error("oidc: ID token has several audiences and no azp")
+
+  const nowS = nowMs / 1000.0
+  const exp = rawNum(pfs, "exp")
+  if (exp === undefined) throw new Error("oidc: ID token has no exp")
+  if (nowS > exp + SKEW_S) throw new Error("oidc: ID token has expired")
+  const nbf = rawNum(pfs, "nbf")
+  if (nbf !== undefined && nowS + SKEW_S < nbf) throw new Error("oidc: ID token is not valid yet")
+
+  if (rawStr(pfs, "nonce") !== nonce) throw new Error("oidc: ID token nonce does not match")
+  const sub = rawStr(pfs, "sub")
+  if (sub === undefined || sub === "") throw new Error("oidc: ID token has no sub")
+  const email = rawStr(pfs, "email")
+  const role = try roleOf(cfg, pfs)
+  return { kind: "ok", sub: sub, email: email, role: role }
+}
+
+// Checks an ID token from the token endpoint. Every failure is returned as kind "error".
+export function verifyIdToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string, nowMs: number): IdTokenResult {
+  try {
+    return try checkToken(idToken, jwksJson, cfg, issuer, nonce, nowMs)
+  } catch (e) {
+    return { kind: "error", message: e.message }
+  }
+}
+
+// ---- UI sessions ----
+
+type SessionRecord = { sub: string, role: string, expires: number }
+
+const SESSION_PREFIX = "sk-sess-"
+const SESSION_TTL_S = 28800
+
+export class UiSessions {
+  sessions: Map<string, SessionRecord> = new Map()
+
+  readonly ttlSeconds: number
+
+  constructor(ttlSeconds?: number) {
+    this.ttlSeconds = ttlSeconds ?? SESSION_TTL_S
+  }
+
+  create(sub: string, role: string, nowMs: number): string throws Error {
+    this.sweep(nowMs)
+    const token = SESSION_PREFIX + (try secureHex(48))
+    this.sessions.set(token, { sub: sub, role: role, expires: nowMs + this.ttlSeconds * 1000.0 })
+    return token
+  }
+
+  get(token: string, nowMs: number): Session | undefined {
+    const s = this.sessions.get(token)
+    if (s === undefined) return undefined
+    if (s.expires <= nowMs) {
+      this.sessions.delete(token)
+      return undefined
+    }
+    return { sub: s.sub, role: s.role }
+  }
+
+  delete(token: string): void {
+    this.sessions.delete(token)
+  }
+
+  private sweep(nowMs: number): void {
+    for (const k of this.sessions.keys()) {
+      const s = this.sessions.get(k)
+      if (s !== undefined && s.expires <= nowMs) this.sessions.delete(k)
+    }
+  }
+}
+
+// ---- tests ----
+// The key below is a throwaway test key generated for these tests. It guards nothing.
+
+const TEST_PKCS1 = `-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEA4/SdoF7s2TMIr/XGII0fMmrXMKzQLq3EhMcQByZwJesgiswd
+lMWeTOH2n/imze3Dk4LsRtabiEtuLReF6SD3YVfOBOff+93SjxKUJst+XgdLvTQR
+yic+mZYRP4JcwuLkBgjCL2PGF3fZCh1BVkqemnQVGSn/nl0EyaQMt99x2pZUsK6g
+hQqqKRa1AtUzNQgQMVsYKcfxgc/htvD4BEktxtH4boEgKdqrZaWDn/wLx434ZiSp
+xu4SNAYxRV0/mr+EAddlUgPkxrmnEMolyap73+oLUWF5Y+UA2VMatZPLuerhyvIi
+4GKBWnOODBZyngcJmmDinr6AheLqQ+gXnfUcdwIDAQABAoIBADbfGZhScUHhOnyc
+tTn9rl5FAJKrbptl4bGydyW5d3JxNE6kzpQSs8W++M5OHNziGFtoPvbYTu0Sdy1s
+haP19wZcC+/7XtuybC5bYwUpo7v/lpgvMf8Ozk9LI9C9URXqZsgbEJ82rabVhw2b
+uDAM2zvDqJZ7mRfmPTJKhnM2WqIqbF0EEXm1EoKwd8wuKIrAyPJYc6Jka6vNg9g2
+0HF3a0WZM4cVqLnWymcKH54TVpM0PjDInjA5dHK5OVoqzKs8Z//QaDy37svtRwwu
+kvGlP4RbEJdRR8JaG35mFn792/BW0mZZDW80YHvlZRqtDCbaYu8ERDFi6Sd1N+1z
+hszAzVECgYEA9WyPx5ffitUwc4hsWl5ihhP6Y0TcOWl260ifhn9lnG4EZES2MjhT
+NtpvW88ccsYTghlPN4lPrDsM8orgLwZD7yeQnjwmElucblFNiWM6e7HJt5U3WgtP
+xy/krhPQRZJlh4sNfkIdltDL6y74AIP/zil6ymNZrSvKCDPfcIJ2u5ECgYEA7cdY
+y+6Duuw4llJ/jdf2wYGBGPDEH11R/6DZPgpQthxGMGYbpisc4lGcZURXoamd0Nu8
+6yXPdcBHhKGLSn7+/VCaK8Si0VuXVeKuwrXN1a+v1msmXU8wchXfIJypmfcVypdW
+O3mOnon7OZwZpzmCZU9egDE3p7fB5Xe6wXkNg4cCgYEA2VxD3vcAUdpMphYuOL8d
+LThmayLilKp2Wx2fw6PzH19E3nUIlGPUN2GwfLRqsrABORknUr125cgKyIj80kkP
+Q7Fb4PjOkzW1zvKM5GAQvNqSF9i9BC++gWBGfXIo5GUrLKeX1LnDsP3NjMa1eOdv
+WGzeRn9FPhzpOuiOPPwfIjECgYEA2Y8YVB98MD+K1x/Mzb/Yat1Pfb5t9DSyni5S
+F03g43+jSQ1kJvozh3AcpRuPAr/rQfqMNKt30smHpncYt6TTMnvZVEqqntwq785l
+EIrANtB1Fr8bbyzRqtEQQwqUs+c77Q3jPK/QKocdcmy9nCAmiwO/95MQ1UhxBMA0
+BGn6T2kCgYBgssGF4J2g5wbw+Zu+anFrf/f/nDwqHPbZMadaoTa8EG60yrgrG2qK
+tvXYApS6r6F7+4P4xjBbDd5PDjE22IoJYyq3Og2lYahywpZB6k+GCrZG3A9Tx3Sc
+aEy6Q44P6XH5hNSYe8QMGciuVngx2xODii2p1/m5ZuhzhHsjJgklPA==
+-----END RSA PRIVATE KEY-----`
+
+// The public half of TEST_PKCS1 as a JWKS (modulus from openssl, exponent 65537).
+const TEST_JWKS = `{"keys":[{"kty":"RSA","kid":"test-key","use":"sig","alg":"RS256","n":"4_SdoF7s2TMIr_XGII0fMmrXMKzQLq3EhMcQByZwJesgiswdlMWeTOH2n_imze3Dk4LsRtabiEtuLReF6SD3YVfOBOff-93SjxKUJst-XgdLvTQRyic-mZYRP4JcwuLkBgjCL2PGF3fZCh1BVkqemnQVGSn_nl0EyaQMt99x2pZUsK6ghQqqKRa1AtUzNQgQMVsYKcfxgc_htvD4BEktxtH4boEgKdqrZaWDn_wLx434ZiSpxu4SNAYxRV0_mr-EAddlUgPkxrmnEMolyap73-oLUWF5Y-UA2VMatZPLuerhyvIi4GKBWnOODBZyngcJmmDinr6AheLqQ-gXnfUcdw","e":"AQAB"}]}`
+
+// A token signed by openssl (dgst -sha256 -sign) over the same key, as an independent reference.
+const OPENSSL_TOKEN = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5IiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlLmNvbSIsInN1YiI6InVzZXItMTIzIiwiYXVkIjoiY2xpZW50LWFiYyIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwLCJub25jZSI6Im4tMDA0MiIsImVtYWlsIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJncm91cHMiOlsiZW5naW5lZXJzIiwicGxhdGZvcm0tYWRtaW5zIl19.o23IwcaGOnNvW76yf9fcUYLxuOB3-G7Ga46BSAfeVOLw0byxKdZuzV0MfoLVxuh42QLnu7sgPnoFGOMlTYOXODDTRpWEeuzpkYu1q6kVGMEDyUiF8gRss7lTyIjWuZXm0bAn2MrIrZYRADeQecZrC2CRnqbso5rhB625EoMMlL-2PhcstRogEKyrnYDKG_rWoerN5YAQXlmKZ8s5hhaXz97zxghVmJW4z42Hc_UimVJLoP5xW2KXgNi9SkNCMTZX64vOIrKnZfvexHMvajwVd-HapOYQ0wOt0jC8FEdtuKphK5m9E0RW3doiO08x21ByNe_slJKMRIAnkV7_tvuQKw"
+
+const TEST_NOW_MS = 1700000000000.0
+const TEST_ISS = "https://idp.example.com"
+const TEST_CLIENT = "client-abc"
+
+function testCfg(roleMap: Record<string, string>, defaultRole?: string, roleClaim?: string): OidcConfig {
+  return {
+    enabled: true,
+    issuer: TEST_ISS,
+    client_id: TEST_CLIENT,
+    redirect_uri: "https://gw.example.com/admin/callback",
+    role_map: roleMap,
+    default_role: defaultRole,
+    role_claim: roleClaim,
+  }
+}
+
+function b64(s: string): string {
+  return encodeUrl(utf8(s))
+}
+
+// A token over the given claims, signed with TEST_PKCS1 (header alg RS256, kid test-key).
+function signedToken(claims: string): string throws SyntaxError {
+  const input = b64(`{"alg":"RS256","kid":"test-key","typ":"JWT"}`) + "." + b64(claims)
+  return input + "." + (try signRsTest(input))
+}
+
+function signRsTest(input: string): string throws SyntaxError {
+  return try signRs256(TEST_PKCS1, input)
+}
+
+// Claims for a valid token; tests override single fields by building their own strings.
+function claimsJson(extra: string): string {
+  return `{"iss":"${TEST_ISS}","sub":"user-123","aud":"${TEST_CLIENT}","iat":1700000000,"exp":1700003600,"nonce":"n-1","email":"alice@example.com"${extra}}`
+}
+
+// Changes one character in the middle of a string, so the value changes but stays well formed.
+function flipAt(s: string, i: int): string {
+  const c = s.slice(i, i + 1)
+  return s.slice(0, i) + (c === "A" ? "B" : "A") + s.slice(i + 1)
+}
+
+function paramOf(url: string, name: string): string | undefined {
+  let at = url.indexOf("?" + name + "=")
+  if (at < 0) at = url.indexOf("&" + name + "=")
+  if (at < 0) return undefined
+  const start = at + name.byteLength + 2
+  const rest = url.slice(start)
+  const end = rest.indexOf("&")
+  return end < 0 ? rest : rest.slice(0, end)
+}
+
+const TEST_DISC: Discovery = {
+  authorization_endpoint: "https://idp.example.com/authorize",
+  token_endpoint: "https://idp.example.com/token",
+  jwks_uri: "https://idp.example.com/jwks",
+  issuer: TEST_ISS,
+}
+
+test("discovery URL drops trailing slashes", () => {
+  expect(discoveryUrl("https://idp.example.com")).toBe("https://idp.example.com/.well-known/openid-configuration")
+  expect(discoveryUrl("https://idp.example.com/")).toBe("https://idp.example.com/.well-known/openid-configuration")
+  expect(discoveryUrl("https://idp.example.com/tenant//")).toBe("https://idp.example.com/tenant/.well-known/openid-configuration")
+})
+
+test("parses discovery and rejects incomplete or insecure documents", () => {
+  const d = try parseDiscovery(`{"issuer":"${TEST_ISS}","authorization_endpoint":"https://idp.example.com/authorize","token_endpoint":"https://idp.example.com/token","jwks_uri":"https://idp.example.com/jwks","scopes_supported":["openid"]}`)
+  expect(d.token_endpoint).toBe("https://idp.example.com/token")
+  expect(d.issuer).toBe(TEST_ISS)
+  let threw = false
+  try {
+    parseDiscovery(`{"issuer":"${TEST_ISS}","authorization_endpoint":"https://idp.example.com/authorize","token_endpoint":"https://idp.example.com/token"}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    parseDiscovery(`{"issuer":"${TEST_ISS}","authorization_endpoint":"https://idp.example.com/authorize","token_endpoint":"http://idp.example.com/token","jwks_uri":"https://idp.example.com/jwks"}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    parseDiscovery("not json")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("begin builds the authorize URL with PKCE S256 and a matching verifier", () => {
+  const flows = new OidcFlows()
+  const cfg = testCfg({})
+  const r = try flows.begin(cfg, TEST_DISC, TEST_NOW_MS)
+  expect(r.url.startsWith("https://idp.example.com/authorize?")).toBe(true)
+  expect(paramOf(r.url, "response_type")).toBe("code")
+  expect(paramOf(r.url, "client_id")).toBe(TEST_CLIENT)
+  expect(paramOf(r.url, "code_challenge_method")).toBe("S256")
+  expect(paramOf(r.url, "scope")).toBe("openid%20email%20profile")
+  expect(paramOf(r.url, "redirect_uri")).toBe("https%3A%2F%2Fgw.example.com%2Fadmin%2Fcallback")
+  expect(paramOf(r.url, "state")).toBe(r.state)
+  const challenge = paramOf(r.url, "code_challenge")
+  const nonce = paramOf(r.url, "nonce")
+  expect(nonce === undefined).toBe(false)
+  const done = flows.complete(r.state, TEST_NOW_MS)
+  expect(done === undefined).toBe(false)
+  if (done !== undefined) {
+    expect(done.nonce).toBe(nonce!)
+    expect(done.verifier.byteLength).toBe(64)
+    expect(encodeUrl(sha256(utf8(done.verifier)))).toBe(challenge!)
+  }
+})
+
+test("begin keeps a configured scope list and adds openid to it", () => {
+  const flows = new OidcFlows()
+  const cfg: OidcConfig = { enabled: true, issuer: TEST_ISS, client_id: TEST_CLIENT, redirect_uri: "https://gw.example.com/cb", scopes: ["email"] }
+  const r = try flows.begin(cfg, TEST_DISC, TEST_NOW_MS)
+  expect(paramOf(r.url, "scope")).toBe("openid%20email")
+})
+
+test("begin refuses a discovery document from another issuer", () => {
+  const flows = new OidcFlows()
+  const other: Discovery = { authorization_endpoint: "https://idp.example.com/authorize", token_endpoint: "https://idp.example.com/token", jwks_uri: "https://idp.example.com/jwks", issuer: "https://evil.example.com" }
+  let threw = false
+  try {
+    flows.begin(testCfg({}), other, TEST_NOW_MS)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("state is single use and expires after 10 minutes", () => {
+  const flows = new OidcFlows()
+  const cfg = testCfg({})
+  const a = try flows.begin(cfg, TEST_DISC, TEST_NOW_MS)
+  const b = try flows.begin(cfg, TEST_DISC, TEST_NOW_MS)
+  expect(a.state === b.state).toBe(false)
+  expect(flows.complete(a.state, TEST_NOW_MS) === undefined).toBe(false)
+  expect(flows.complete(a.state, TEST_NOW_MS) === undefined).toBe(true)
+  expect(flows.complete("unknown-state", TEST_NOW_MS) === undefined).toBe(true)
+  // 599 s is inside the window, 600 s is outside it
+  expect(flows.complete(b.state, TEST_NOW_MS + 599000.0) === undefined).toBe(false)
+  const c = try flows.begin(cfg, TEST_DISC, TEST_NOW_MS)
+  expect(flows.complete(c.state, TEST_NOW_MS + 600000.0) === undefined).toBe(true)
+})
+
+test("token request body is form encoded and carries the verifier", () => {
+  const cfg = testCfg({})
+  const body = tokenRequestBody(cfg, "abc/123", "ver.ifier")
+  expect(body.includes("grant_type=authorization_code")).toBe(true)
+  expect(body.includes("code=abc%2F123")).toBe(true)
+  expect(body.includes("code_verifier=ver.ifier")).toBe(true)
+  expect(body.includes("client_id=client-abc")).toBe(true)
+  expect(body.includes("client_secret")).toBe(false)
+  const withSecret: OidcConfig = { enabled: true, issuer: TEST_ISS, client_id: TEST_CLIENT, redirect_uri: "https://gw.example.com/admin/callback", client_secret: "s3cr&t" }
+  expect(tokenRequestBody(withSecret, "c", "v").includes("client_secret=s3cr%26t")).toBe(true)
+})
+
+test("verifies an openssl-signed token", () => {
+  const r = verifyIdToken(OPENSSL_TOKEN, TEST_JWKS, testCfg({}), TEST_ISS, "n-0042", TEST_NOW_MS)
+  expect(r.kind).toBe("ok")
+  if (r.kind === "ok") {
+    expect(r.sub).toBe("user-123")
+    expect(r.email).toBe("alice@example.com")
+    expect(r.role).toBe("viewer")
+  }
+})
+
+test("verifies a token signed in the test", () => {
+  const tok = try signedToken(claimsJson(""))
+  const r = verifyIdToken(tok, TEST_JWKS, testCfg({}), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(r.kind).toBe("ok")
+})
+
+test("rejects a tampered signature and a tampered payload", () => {
+  const tok = try signedToken(claimsJson(""))
+  const parts = tok.split(".")
+  const head = parts[0]! + "." + parts[1]! + "."
+  const sig = parts[2]!
+  const r1 = verifyIdToken(head + flipAt(sig, 20), TEST_JWKS, testCfg({}), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(r1.kind).toBe("error")
+  // the same signature over a different email
+  const forged = b64(claimsJson(`,"x":1`).replaceAll("alice", "mallory"))
+  const r2 = verifyIdToken(parts[0]! + "." + forged + "." + sig, TEST_JWKS, testCfg({}), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(r2.kind).toBe("error")
+  // a truncated signature
+  const r3 = verifyIdToken(head + sig.slice(0, 100), TEST_JWKS, testCfg({}), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(r3.kind).toBe("error")
+})
+
+test("rejects a token checked against a different key", () => {
+  const tok = try signedToken(claimsJson(""))
+  const n = "4_SdoF7s2TMIr_XGII0fMmrXMKzQLq3EhMcQByZwJesgiswdlMWeTOH2n_imze3Dk4LsRtabiEtuLReF6SD3YVfOBOff-93SjxKUJst-XgdLvTQRyic-mZYRP4JcwuLkBgjCL2PGF3fZCh1BVkqemnQVGSn_nl0EyaQMt99x2pZUsK6ghQqqKRa1AtUzNQgQMVsYKcfxgc_htvD4BEktxtH4boEgKdqrZaWDn_wLx434ZiSpxu4SNAYxRV0_mr-EAddlUgPkxrmnEMolyap73-oLUWF5Y-UA2VMatZPLuerhyvIi4GKBWnOODBZyngcJmmDinr6AheLqQ-gXnfUcdw"
+  const other = flipAt(n, 30)
+  const jwks = `{"keys":[{"kty":"RSA","kid":"test-key","n":"${other}","e":"AQAB"}]}`
+  const r = verifyIdToken(tok, jwks, testCfg({}), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(r.kind).toBe("error")
+  // no key with the header's kid
+  const noKid = `{"keys":[{"kty":"RSA","kid":"other","n":"${n}","e":"AQAB"}]}`
+  expect(verifyIdToken(tok, noKid, testCfg({}), TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+})
+
+test("rejects alg none, HS256 and malformed tokens", () => {
+  const cfg = testCfg({})
+  const none = b64(`{"alg":"none"}`) + "." + b64(claimsJson("")) + "."
+  expect(verifyIdToken(none, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const hs = b64(`{"alg":"HS256","kid":"test-key"}`) + "." + b64(claimsJson("")) + "." + b64("x")
+  expect(verifyIdToken(hs, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  expect(verifyIdToken("abc", TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  expect(verifyIdToken("a.b.c.d", TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  expect(verifyIdToken("!!.!!.!!", TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+})
+
+test("rejects a wrong issuer and a wrong audience", () => {
+  const cfg = testCfg({})
+  const wrongIss = try signedToken(claimsJson("").replace(TEST_ISS, "https://other.example.com"))
+  expect(verifyIdToken(wrongIss, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const wrongAud = try signedToken(claimsJson("").replace(`"aud":"${TEST_CLIENT}"`, `"aud":"someone-else"`))
+  expect(verifyIdToken(wrongAud, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  // a list of audiences is fine when it contains this client
+  const oneAud = try signedToken(claimsJson("").replace(`"aud":"${TEST_CLIENT}"`, `"aud":["${TEST_CLIENT}"]`))
+  expect(verifyIdToken(oneAud, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("ok")
+  // several audiences need azp (OIDC Core 3.1.3.7): refused without it, accepted with azp = this client
+  const multi = try signedToken(claimsJson("").replace(`"aud":"${TEST_CLIENT}"`, `"aud":["x","${TEST_CLIENT}"]`))
+  expect(verifyIdToken(multi, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const multiAzp = try signedToken(claimsJson(`,"azp":"${TEST_CLIENT}"`).replace(`"aud":"${TEST_CLIENT}"`, `"aud":["x","${TEST_CLIENT}"]`))
+  expect(verifyIdToken(multiAzp, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("ok")
+  // azp for another client is refused
+  const badAzp = try signedToken(claimsJson(`,"azp":"someone-else"`))
+  expect(verifyIdToken(badAzp, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+})
+
+test("checks exp with 60 s of skew", () => {
+  const cfg = testCfg({})
+  // exp is 1700003600; the token is good up to exp + 60 s
+  const tok = try signedToken(claimsJson(""))
+  expect(verifyIdToken(tok, TEST_JWKS, cfg, TEST_ISS, "n-1", 1700003660000.0).kind).toBe("ok")
+  expect(verifyIdToken(tok, TEST_JWKS, cfg, TEST_ISS, "n-1", 1700003661000.0).kind).toBe("error")
+  const noExp = try signedToken(claimsJson("").replace(`"exp":1700003600,`, ""))
+  expect(verifyIdToken(noExp, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+})
+
+test("checks nbf with 60 s of skew", () => {
+  const cfg = testCfg({})
+  const tok = try signedToken(claimsJson(`,"nbf":1700000100`))
+  expect(verifyIdToken(tok, TEST_JWKS, cfg, TEST_ISS, "n-1", 1700000040000.0).kind).toBe("ok")
+  expect(verifyIdToken(tok, TEST_JWKS, cfg, TEST_ISS, "n-1", 1700000030000.0).kind).toBe("error")
+})
+
+test("rejects a wrong nonce and a missing sub", () => {
+  const cfg = testCfg({})
+  const tok = try signedToken(claimsJson(""))
+  expect(verifyIdToken(tok, TEST_JWKS, cfg, TEST_ISS, "n-2", TEST_NOW_MS).kind).toBe("error")
+  const noNonce = try signedToken(claimsJson("").replace(`"nonce":"n-1",`, ""))
+  expect(verifyIdToken(noNonce, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const noSub = try signedToken(claimsJson("").replace(`"sub":"user-123",`, ""))
+  expect(verifyIdToken(noSub, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+})
+
+// The role of an ok result, or the error message, so a failed verification fails the assertion.
+function resultRole(r: IdTokenResult): string {
+  return r.kind === "ok" ? r.role : r.message
+}
+
+test("maps roles from the groups claim in claim order", () => {
+  const tok = try signedToken(claimsJson(`,"groups":["stranger","platform-admins","engineers"]`))
+  const map: Record<string, string> = { "engineers": "editor", "platform-admins": "admin" }
+  const r = verifyIdToken(tok, TEST_JWKS, testCfg(map), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(r.kind).toBe("ok")
+  expect(resultRole(r)).toBe("admin")
+  // the first group with a mapping decides, even when a later group maps higher
+  const tok2 = try signedToken(claimsJson(`,"groups":["engineers","platform-admins"]`))
+  const r2 = verifyIdToken(tok2, TEST_JWKS, testCfg(map), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(resultRole(r2)).toBe("editor")
+})
+
+test("maps roles from a string claim, a custom claim and the default role", () => {
+  const cfgRole = testCfg({ "admins": "admin", "ops": "auditor" }, undefined, "roles")
+  const tok = try signedToken(claimsJson(`,"roles":"ops"`))
+  const r = verifyIdToken(tok, TEST_JWKS, cfgRole, TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(resultRole(r)).toBe("auditor")
+  // no group matches: default_role applies, and viewer when it is unset
+  const none = try signedToken(claimsJson(`,"groups":["nobody"]`))
+  const d1 = verifyIdToken(none, TEST_JWKS, testCfg({ "admins": "admin" }, "editor"), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(resultRole(d1)).toBe("editor")
+  const d2 = verifyIdToken(none, TEST_JWKS, testCfg({ "admins": "admin" }), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(resultRole(d2)).toBe("viewer")
+  // no groups claim at all
+  const noGroups = try signedToken(claimsJson(""))
+  const d3 = verifyIdToken(noGroups, TEST_JWKS, testCfg({}), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(resultRole(d3)).toBe("viewer")
+})
+
+test("refuses a role_map or default_role that is not a role", () => {
+  const tok = try signedToken(claimsJson(`,"groups":["engineers"]`))
+  const bad = verifyIdToken(tok, TEST_JWKS, testCfg({ "engineers": "superuser" }), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(bad.kind).toBe("error")
+  const badDefault = verifyIdToken(tok, TEST_JWKS, testCfg({}, "root"), TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(badDefault.kind).toBe("error")
+})
+
+test("session store creates, reads, expires and deletes sessions", () => {
+  const store = new UiSessions()
+  const t = try store.create("user-1", "admin", TEST_NOW_MS)
+  expect(t.startsWith("sk-sess-")).toBe(true)
+  expect(t.byteLength).toBe(8 + 48)
+  const s = store.get(t, TEST_NOW_MS + 1000.0)
+  expect(s === undefined).toBe(false)
+  if (s !== undefined) {
+    expect(s.sub).toBe("user-1")
+    expect(s.role).toBe("admin")
+  }
+  // 8 hours by default
+  expect(store.get(t, TEST_NOW_MS + 28799000.0) === undefined).toBe(false)
+  expect(store.get(t, TEST_NOW_MS + 28800000.0) === undefined).toBe(true)
+  const t2 = try store.create("user-2", "viewer", TEST_NOW_MS)
+  expect(t2 === t).toBe(false)
+  expect(store.get("sk-sess-nope", TEST_NOW_MS) === undefined).toBe(true)
+  store.delete(t2)
+  expect(store.get(t2, TEST_NOW_MS) === undefined).toBe(true)
+})
+
+test("session TTL follows session_ttl_seconds", () => {
+  const store = new UiSessions(60)
+  const t = try store.create("u", "editor", TEST_NOW_MS)
+  expect(store.get(t, TEST_NOW_MS + 59000.0) === undefined).toBe(false)
+  expect(store.get(t, TEST_NOW_MS + 60000.0) === undefined).toBe(true)
+})

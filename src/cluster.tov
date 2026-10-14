@@ -1,0 +1,263 @@
+// Shared budget and rate-limit state for a cluster of gateways. Each counter
+// is a state-based CRDT keyed by node id: a node only ever writes its own slot,
+// and a merge takes the newer window or, within one window, the max per slot.
+// That join is commutative, associative and idempotent, so nodes converge
+// whatever order payloads arrive in and however often they repeat.
+// HTTP transport and the sync timer live in the server; this file is pure state.
+import { hmacSha256, toHex, utf8 } from "./crypto"
+
+export type ClusterConfig = { enabled: bool, node_id?: string, peers: string[], secret: string, interval_ms?: int }
+
+export function syncInterval(cfg: ClusterConfig): int {
+  return cfg.interval_ms ?? 1000
+}
+
+type WireCounter = { name: string, window: string, slots: Record<string, f64> }
+type Wire = { node: string, ts: f64, counters: WireCounter[] }
+
+// Slot values must be finite; NaN and infinities would poison every total.
+// Far above any budget or token count, and below the f64 limit.
+const MAX_SLOT: f64 = 1.0e300
+
+// Parses and checks a payload before anything is merged, so a bad one changes nothing.
+function parseWire(text: string): Wire throws SyntaxError {
+  const w = try JSON.parse(text) as Wire
+  if (w.node.byteLength === 0) throw new SyntaxError("cluster payload has no node id")
+  for (const c of w.counters) {
+    if (c.name.byteLength === 0) throw new SyntaxError("cluster payload has an empty counter name")
+    for (const id of c.slots.keys()) {
+      const v = c.slots.get(id)!
+      if (!(v >= 0 && v <= MAX_SLOT)) throw new SyntaxError("cluster payload has a negative or out-of-range slot")
+    }
+  }
+  return w
+}
+
+class Counter {
+  slots: Map<string, f64> = new Map()
+  constructor(readonly window: string) {}
+}
+
+export class Counters {
+  private counters: Map<string, Counter> = new Map()
+  // Last time a peer's payload was merged, by node id. Own node is never tracked.
+  private seen: Map<string, f64> = new Map()
+  constructor(readonly nodeId: string) {}
+
+  // Grow-only add to this node's slot. A newer window starts fresh; an older one is ignored.
+  add(name: string, window: string, by: f64): void {
+    if (!(by >= 0 && by <= MAX_SLOT)) return
+    let c = this.counters.get(name)
+    if (c === undefined || c.window < window) {
+      c = new Counter(window)
+      this.counters.set(name, c)
+    }
+    if (c.window !== window) return
+    c.slots.set(this.nodeId, (c.slots.get(this.nodeId) ?? 0) + by)
+  }
+
+  // Sums in node-id order so every node adds the same floats in the same order.
+  total(name: string, window: string): f64 {
+    const c = this.counters.get(name)
+    if (c === undefined || c.window !== window) return 0
+    let sum = 0.0
+    const ids = c.slots.keys()
+    ids.sort()
+    for (const id of ids) sum += c.slots.get(id) ?? 0
+    return sum
+  }
+
+  // nowMs is the local receipt time used for peer liveness; the payload's ts is the sender's clock.
+  merge(remote: string, nowMs?: f64): void throws SyntaxError {
+    const w = try parseWire(remote)
+    for (const rc of w.counters) {
+      const cur = this.counters.get(rc.name)
+      if (cur === undefined || rc.window > cur.window) {
+        const c = new Counter(rc.window)
+        for (const id of rc.slots.keys()) c.slots.set(id, rc.slots.get(id)!)
+        this.counters.set(rc.name, c)
+      } else if (rc.window === cur.window) {
+        for (const id of rc.slots.keys()) {
+          const v = rc.slots.get(id)!
+          if (v > (cur.slots.get(id) ?? 0)) cur.slots.set(id, v)
+        }
+      }
+    }
+    if (w.node !== this.nodeId) this.seen.set(w.node, nowMs ?? Date.now())
+  }
+
+  // Full state, so a node relays what it learned from others too.
+  encode(): string {
+    const names = this.counters.keys()
+    names.sort()
+    const counters: WireCounter[] = []
+    for (const name of names) {
+      const c = this.counters.get(name)!
+      counters.push({ name, window: c.window, slots: c.slots })
+    }
+    const w: Wire = { node: this.nodeId, ts: Date.now(), counters }
+    return JSON.stringify(w)
+  }
+
+  // Peers merged from, sorted by id. With sinceMs, only those heard from at or after it.
+  peers(sinceMs?: f64): { id: string, lastSeen: f64 }[] {
+    const out: { id: string, lastSeen: f64 }[] = []
+    const ids = this.seen.keys()
+    ids.sort()
+    for (const id of ids) {
+      const t = this.seen.get(id)!
+      if (sinceMs === undefined || t >= sinceMs) out.push({ id, lastSeen: t })
+    }
+    return out
+  }
+
+  // Drops the slots of peers not heard from since olderThanMs. A peer that
+  // still holds the slot resends it, so every node should forget on the same schedule.
+  forget(olderThanMs: f64): void {
+    for (const id of this.seen.keys()) {
+      if (this.seen.get(id)! >= olderThanMs) continue
+      this.seen.delete(id)
+      for (const c of this.counters.values()) c.slots.delete(id)
+    }
+  }
+}
+
+// Hex HMAC-SHA256 of the request body, sent in the x-raiju-cluster-sig header.
+export function sign(secret: string, body: string): string {
+  return toHex(hmacSha256(utf8(secret), utf8(body)))
+}
+
+// Constant-time: the loop always runs over the whole signature, so timing reveals only its length.
+export function verify(secret: string, body: string, sig: string): bool {
+  const want = utf8(sign(secret, body))
+  const got = utf8(sig)
+  if (want.length !== got.length) return false
+  let diff = 0
+  for (let i = 0; i < want.length; i++) diff = diff | (int(want[i]!) ^ int(got[i]!))
+  return diff === 0
+}
+
+test("merge is commutative", () => {
+  const a = new Counters("a")
+  const b = new Counters("b")
+  a.add("budget:monthly", "2026-10", 5)
+  b.add("budget:monthly", "2026-10", 3)
+  b.add("rl:key1:tokens", "10:00", 7)
+  const ea = a.encode()
+  const eb = b.encode()
+  try a.merge(eb)
+  try b.merge(ea)
+  expect(a.total("budget:monthly", "2026-10")).toBe(8)
+  expect(b.total("budget:monthly", "2026-10")).toBe(8)
+  expect(a.total("rl:key1:tokens", "10:00")).toBe(b.total("rl:key1:tokens", "10:00"))
+  expect(a.total("rl:key1:tokens", "10:00")).toBe(7)
+})
+
+test("merge is idempotent", () => {
+  const a = new Counters("a")
+  const b = new Counters("b")
+  b.add("c", "w", 4)
+  const eb = b.encode()
+  try a.merge(eb)
+  try a.merge(eb)
+  try a.merge(eb)
+  expect(a.total("c", "w")).toBe(4)
+})
+
+test("a newer window resets the counter and older windows are ignored", () => {
+  const a = new Counters("a")
+  a.add("budget:monthly", "2026-10", 4)
+  a.add("budget:monthly", "2026-11", 2)
+  expect(a.total("budget:monthly", "2026-11")).toBe(2)
+  expect(a.total("budget:monthly", "2026-10")).toBe(0)
+  a.add("budget:monthly", "2026-10", 100)
+  expect(a.total("budget:monthly", "2026-11")).toBe(2)
+
+  const b = new Counters("b")
+  b.add("budget:monthly", "2026-10", 9)
+  try a.merge(b.encode())
+  expect(a.total("budget:monthly", "2026-11")).toBe(2)
+  b.add("budget:monthly", "2026-11", 1)
+  try a.merge(b.encode())
+  expect(a.total("budget:monthly", "2026-11")).toBe(3)
+  expect(a.total("budget:monthly", "2026-10")).toBe(0)
+})
+
+test("a bad payload throws SyntaxError and changes nothing", () => {
+  const a = new Counters("a")
+  a.add("c", "w", 1)
+  const bad = [
+    "not json",
+    `{"node":"b"}`,
+    `{"node":"b","ts":1,"counters":[{"name":"c","window":"w","slots":{"b":-3}}]}`,
+    `{"node":"b","ts":1,"counters":[{"name":"c","window":"w","slots":{"b":5},"x":1}, {"name":"c","window":"w","slots":{"b":"oops"}}]}`,
+    `{"node":"","ts":1,"counters":[]}`,
+  ]
+  let threw = 0
+  for (const text of bad) {
+    try {
+      a.merge(text)
+    } catch (e) {
+      if (e instanceof SyntaxError) threw += 1
+    }
+  }
+  expect(threw).toBe(bad.length)
+  expect(a.total("c", "w")).toBe(1)
+  expect(a.peers().length).toBe(0)
+})
+
+test("signatures verify and reject tampering", () => {
+  // RFC 4231 test case 2 through the cluster helper
+  expect(sign("Jefe", "what do ya want for nothing?")).toBe("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+  const body = new Counters("a").encode()
+  const sig = sign("s3cret", body)
+  expect(verify("s3cret", body, sig)).toBe(true)
+  expect(verify("other", body, sig)).toBe(false)
+  expect(verify("s3cret", body + " ", sig)).toBe(false)
+  expect(verify("s3cret", body, sig.slice(0, 10))).toBe(false)
+  expect(verify("s3cret", body, "")).toBe(false)
+})
+
+test("peers and forget track who was heard from", () => {
+  const a = new Counters("a")
+  const b = new Counters("b")
+  const c = new Counters("c")
+  b.add("x", "w", 2)
+  c.add("x", "w", 3)
+  try a.merge(b.encode(), 1000)
+  try a.merge(c.encode(), 5000)
+  a.add("x", "w", 1)
+  expect(a.total("x", "w")).toBe(6)
+  expect(a.peers().length).toBe(2)
+  expect(a.peers(2000).length).toBe(1)
+  expect(a.peers(2000)[0]!.id).toBe("c")
+  a.forget(3000)
+  expect(a.peers().length).toBe(1)
+  expect(a.total("x", "w")).toBe(4)
+})
+
+test("three nodes converge", () => {
+  const nodes = [new Counters("n1"), new Counters("n2"), new Counters("n3")]
+  nodes[0]!.add("budget:monthly", "2026-10", 1.5)
+  nodes[1]!.add("budget:monthly", "2026-10", 2)
+  nodes[2]!.add("budget:monthly", "2026-10", 0.25)
+  nodes[2]!.add("rl:key1:requests", "00:00", 3)
+  nodes[0]!.add("rl:key1:requests", "00:00", 1)
+  // A ring gossip, then a second round in the other direction, so every node
+  // hears from the others transitively.
+  for (let round = 0; round < 2; round++) {
+    const ea = nodes[0]!.encode()
+    try nodes[1]!.merge(ea)
+    const eb = nodes[1]!.encode()
+    try nodes[2]!.merge(eb)
+    const ec = nodes[2]!.encode()
+    try nodes[0]!.merge(ec)
+    try nodes[2]!.merge(ea)
+    try nodes[1]!.merge(ec)
+    try nodes[0]!.merge(eb)
+  }
+  for (const n of nodes) {
+    expect(n.total("budget:monthly", "2026-10")).toBe(3.75)
+    expect(n.total("rl:key1:requests", "00:00")).toBe(4)
+  }
+})

@@ -3,12 +3,13 @@
 
 Usage: tests/e2e.py  (builds both binaries into ./build first)
 """
-import json, os, subprocess, sys, time, urllib.request, urllib.error
+import json, os, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 GW = "http://127.0.0.1:18098"
 MOCK = "http://127.0.0.1:18099"
+GW_B = "http://127.0.0.1:18097"
 
 def build():
     os.makedirs(BUILD, exist_ok=True)
@@ -103,7 +104,47 @@ def write_config():
     }
     path = os.path.join(BUILD, "e2e.config.json")
     json.dump(cfg, open(path, "w"))
+    # a second node of the same cluster, without the file-writing features
+    b = {k: v for k, v in cfg.items() if k not in ("audit", "logs_store", "alerts", "log_exports", "otel", "oidc")}
+    b["cluster"] = {**cfg["cluster"], "node_id": "b", "peers": [GW]}
+    json.dump(b, open(os.path.join(BUILD, "e2e.node-b.json"), "w"))
     return path
+
+def start_idp():
+    """A tiny OpenID provider on 18096: discovery, JWKS and a token endpoint that
+    signs ID tokens with a throwaway RSA key (openssl)."""
+    import base64, hashlib, http.server, threading, urllib.parse
+    key = os.path.join(BUILD, "idp.key")
+    subprocess.run(["openssl", "genrsa", "-out", key, "2048"], check=True, capture_output=True)
+    mod = subprocess.run(["openssl", "rsa", "-in", key, "-noout", "-modulus"], check=True, capture_output=True, text=True).stdout.strip().split("=")[1]
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    jwks = json.dumps({"keys": [{"kty": "RSA", "kid": "k1", "use": "sig", "alg": "RS256", "n": b64(bytes.fromhex(mod)), "e": "AQAB"}]})
+    iss = "http://127.0.0.1:18096"
+    state = {"nonce": "", "verifier": "", "challenge": ""}
+    def sign(claims):
+        head = b64(json.dumps({"alg": "RS256", "kid": "k1", "typ": "JWT"}).encode()) + "." + b64(json.dumps(claims).encode())
+        sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key, "-binary"], input=head.encode(), check=True, capture_output=True).stdout
+        return head + "." + b64(sig)
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def send(self, body, ctype="application/json"):
+            self.send_response(200); self.send_header("content-type", ctype); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body.encode())
+        def do_GET(self):
+            if self.path == "/.well-known/openid-configuration":
+                self.send(json.dumps({"issuer": iss, "authorization_endpoint": iss + "/authorize", "token_endpoint": iss + "/token", "jwks_uri": iss + "/jwks"}))
+            elif self.path == "/jwks":
+                self.send(jwks)
+            else:
+                self.send_response(404); self.end_headers()
+        def do_POST(self):
+            form = urllib.parse.parse_qs(self.rfile.read(int(self.headers["content-length"])).decode())
+            state["verifier"] = form.get("code_verifier", [""])[0]
+            now = int(time.time())
+            self.send(json.dumps({"token_type": "Bearer", "access_token": "at", "id_token": sign({"iss": iss, "aud": "raiju", "sub": "alice", "email": "alice@example.com", "iat": now, "exp": now + 300, "nonce": state["nonce"], "groups": ["staff", "raiju-editors"]})}))
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 18096), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, state
 
 def main():
     build()
@@ -114,9 +155,11 @@ def main():
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
+    idp, idp_state = start_idp()
     gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "http1")], env=env, stderr=subprocess.DEVNULL)
+    gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18097", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.node-b.json")], env=env, stderr=subprocess.DEVNULL)
     try:
-        wait(MOCK + "/_seen"); wait(GW + "/health")
+        wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
 
         s, h, b = chat("openai/gpt-4o-mini")
         r = json.loads(b)
@@ -455,13 +498,56 @@ def main():
         s, _, b = call("GET", "/api/alerts")
         check("alert state is visible", s == 200 and '"firing"' in b, b[:300])
 
+        # --- wave 6 ---
+        # clustering: a rate limit of 3 requests shared by both nodes
+        vk = {"x-bf-vk": "sk-bf-cluster", "x-bf-mcp-include-clients": "none"}
+        r1 = [chat("openai/gpt-4o-mini", headers=vk, seed=950 + i)[0] for i in range(2)]
+        time.sleep(0.8)
+        r2 = [call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}], "seed": 960 + i}, vk, base=GW_B)[0] for i in range(2)]
+        check("cluster nodes share rate-limit usage", r1 == [200, 200] and r2 == [200, 429], (r1, r2))
+        s, _, _ = call("POST", "/api/cluster/sync", "{}", {"x-raiju-cluster-sig": "00"}, auth=False)
+        check("cluster sync needs the shared secret", s == 401, s)
+
+        # log exports to S3-compatible storage
+        time.sleep(1.5)
+        puts = [x for x in seen() if x["path"].startswith("/logs/raiju-logs/")]
+        lines = [json.loads(l) for x in puts for l in x["body"].strip().split("\n") if l]
+        check("request logs are exported to object storage", puts and puts[0]["path"].endswith(".jsonl") and puts[0]["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") and any("gpt-4o-mini" in l.get("model", "") for l in lines), [p["path"] for p in puts][:3])
+
+        # SSO (OIDC, authorization code + PKCE)
+        import http.client, base64, hashlib
+        s, _, b = call("GET", "/api/oidc/status", auth=False)
+        check("SSO status is public", s == 200 and json.loads(b)["enabled"] is True, b)
+        conn = http.client.HTTPConnection("127.0.0.1", 18098, timeout=10)
+        conn.request("GET", "/api/oidc/login"); r = conn.getresponse(); r.read()
+        loc = r.getheader("location") or ""
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        check("SSO login redirects to the provider with PKCE", r.status == 302 and loc.startswith("http://127.0.0.1:18096/authorize?") and q.get("code_challenge_method") == ["S256"] and q.get("client_id") == ["raiju"], loc)
+        idp_state["nonce"] = q.get("nonce", [""])[0]
+        st = q.get("state", [""])[0]
+        s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + st, auth=False)
+        verifier = idp_state["verifier"]
+        check("the token request carries the PKCE verifier", base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode() == q.get("code_challenge", [""])[0], verifier)
+        import re as _re
+        m = _re.search(r'"(sk-sess-[0-9a-f]+)"', page)
+        check("SSO callback signs the browser in", s == 200 and m is not None, (s, page[:300]))
+        S = {"authorization": "Bearer " + (m.group(1) if m else "none")}
+        s1, _, _ = call("GET", "/api/config", headers=S)
+        s2, _, _ = call("POST", "/api/governance/budgets", {"id": "sso-made", "max_limit": 5, "reset_duration": "1d"}, headers=S)
+        s3, _, _ = call("POST", "/api/users", {"name": "x", "role": "admin"}, headers=S)
+        check("an SSO editor (from the groups claim) reads and edits but can't manage users", (s1, s3) == (200, 403) and s2 < 300, (s1, s2, s3))
+        s, _, _ = call("GET", "/api/oidc/callback?code=abc&state=" + st, auth=False)
+        check("an SSO state can't be reused", s == 401, s)
+        s, _, b = call("GET", "/api/audit-logs")
+        check("SSO changes are audited under the user", '"actor":"sso:alice"' in b, b[-400:])
+
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
 
         s, _, b = call("POST", "/v1/chat/completions", "{not json")
         check("bad JSON is a 400", s == 400, b)
     finally:
-        gw.terminate(); mock.terminate()
+        gw.terminate(); gw_b.terminate(); mock.terminate(); idp.shutdown()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 

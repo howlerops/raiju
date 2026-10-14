@@ -1,10 +1,10 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, providerNames } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, providerNames } from "./config"
 import { Engine } from "./gateway"
 import { ConfigStore, checkAdmin } from "./store"
-import { RbacConfig, UserConfig, authorize, handleUsers, fromLegacy } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, handleUsers, fromLegacy, required, allowed } from "./rbac"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing } from "./alerts"
 import * as alerts from "./alerts"
@@ -13,6 +13,11 @@ import { resolveAll } from "./secrets"
 import { fields, find, rawStr, isNull } from "./json"
 import { snapshot, errorJson } from "./schemas"
 import { deadline } from "./deadline"
+import { secureHex } from "./crypto"
+import { Counters, ClusterConfig, syncInterval } from "./cluster"
+import * as cluster from "./cluster"
+import { ExportCursor, objectKey, putRequest, exportInterval } from "./exports"
+import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
 
@@ -71,6 +76,52 @@ export async function withSecrets(c: Config): Promise<Config> {
   }
 }
 
+function roleOf(s: string): Role | undefined {
+  if (s === "admin") return "admin"
+  if (s === "editor") return "editor"
+  if (s === "viewer") return "viewer"
+  if (s === "auditor") return "auditor"
+  return undefined
+}
+
+async function getText(url: string): Promise<{ status: int, body: string }> {
+  const dl = deadline(10000)
+  try {
+    const r = await fetch(url, { signal: dl.controller.signal })
+    const b = await r.text()
+    dl.finish()
+    return { status: r.status, body: b }
+  } catch (e) {
+    dl.finish()
+    return { status: 0, body: e.message }
+  }
+}
+
+async function postText(url: string, headers: Map<string, string>, body: string): Promise<{ status: int, body: string }> {
+  const dl = deadline(10000)
+  try {
+    const hs: Record<string, string> = headers
+    const r = await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+    const b = await r.text()
+    dl.finish()
+    return { status: r.status, body: b }
+  } catch (e) {
+    dl.finish()
+    return { status: 0, body: e.message }
+  }
+}
+
+function html(status: int, body: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "text/html; charset=utf-8")
+  h.set("cache-control", "no-store")
+  return new Response(body, { status: status, headers: h })
+}
+
+function trimPeer(p: string): string {
+  return p.endsWith("/") ? p.slice(0, p.byteLength - 1) : p
+}
+
 export class Ops {
   rbac: RbacConfig = { users: [] }
   authOn = false
@@ -79,8 +130,28 @@ export class Ops {
   alertsKey = ""
   alertTimer: int = -1
   mcpSessions = new SessionStore(1800000.0)
+  nodeId = "node"
+  counters: Counters | undefined = undefined
+  clusterCfg: ClusterConfig | undefined = undefined
+  clusterTimer: int = -1
+  pushed: Map<string, f64> = new Map()
+  pushedWindow: Map<string, string> = new Map()
+  exportCfg: LogExportsConfig | undefined = undefined
+  exportTimer: int = -1
+  exportKey = ""
+  cursor = new ExportCursor(Date.now())
+  exporting = false
+  oidcCfg: OidcConfig | undefined = undefined
+  discovery: Discovery | undefined = undefined
+  flows = new OidcFlows()
+  sessions = new UiSessions(28800)
 
   constructor(readonly engine: Engine, readonly store: ConfigStore) {
+    try {
+      this.nodeId = secureHex(6)
+    } catch (e) {
+      this.nodeId = "node"
+    }
     this.configure(engine.cfg)
   }
 
@@ -107,6 +178,205 @@ export class Ops {
       }
     }
     this.configureAlerts(cfg.alerts)
+    this.configureCluster(cfg.cluster)
+    this.configureExports(cfg.log_exports)
+    const oc = cfg.oidc
+    const same = oc !== undefined && this.oidcCfg !== undefined && JSON.stringify(oc) === JSON.stringify(this.oidcCfg)
+    if (!same) {
+      this.discovery = undefined
+      this.oidcCfg = oc !== undefined && oc.enabled ? oc : undefined
+      if (oc !== undefined) this.sessions = new UiSessions(oc.session_ttl_seconds ?? 28800)
+    }
+  }
+
+  // ---- clustering: budget and rate-limit usage shared between nodes ----
+
+  configureCluster(cc: ClusterConfig | undefined): void {
+    if (this.clusterTimer >= 0) {
+      clearInterval(this.clusterTimer)
+      this.clusterTimer = -1
+    }
+    if (cc === undefined || !cc.enabled) {
+      this.clusterCfg = undefined
+      return
+    }
+    this.clusterCfg = cc
+    const id = cc.node_id ?? ""
+    if (id !== "") this.nodeId = id
+    if (this.counters === undefined) this.counters = new Counters(this.nodeId)
+    this.clusterTimer = setInterval(() => {
+      this.syncCluster()
+    }, Math.max(100, syncInterval(cc)))
+  }
+
+  // Adds this node's new usage to its slots and gives each window the other nodes' share.
+  pushLocal(c: Counters): void {
+    const now = Date.now()
+    for (const u of this.engine.gov.sharedUsage(now)) {
+      let prev = this.pushed.get(u.name) ?? 0.0
+      if (this.pushedWindow.get(u.name) !== u.window) prev = 0.0
+      if (u.used > prev) c.add(u.name, u.window, u.used - prev)
+      this.pushed.set(u.name, u.used)
+      this.pushedWindow.set(u.name, u.window)
+    }
+  }
+
+  applyRemote(c: Counters): void {
+    const now = Date.now()
+    const gov = this.engine.gov
+    for (const u of gov.sharedUsage(now)) gov.setRemote(u.name, u.window, Math.max(0.0, c.total(u.name, u.window) - u.used), now)
+  }
+
+  syncCluster(): void {
+    const c = this.counters
+    const cc = this.clusterCfg
+    if (c === undefined || cc === undefined) return
+    this.pushLocal(c)
+    const body = c.encode()
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
+    for (const p of cc.peers) this.pushTo(trimPeer(p) + "/api/cluster/sync", h, body, c, cc.secret)
+    c.forget(Date.now() - 30.0 * syncInterval(cc))
+  }
+
+  async pushTo(url: string, h: Map<string, string>, body: string, c: Counters, secret: string): Promise<void> {
+    const r = await postText(url, h, body)
+    if (r.status !== 200) return
+    // the peer answers with its own state: push and pull in one round trip
+    try {
+      c.merge(r.body)
+      this.applyRemote(c)
+    } catch (e) {
+      console.error(`raiju: cluster: bad state from ${url}: ${e.message}`)
+    }
+  }
+
+  // POST /api/cluster/sync from a peer, signed with the shared secret.
+  async clusterSync(req: Request): Promise<Response> {
+    const c = this.counters
+    const cc = this.clusterCfg
+    if (c === undefined || cc === undefined) return json(404, errorJson("clustering is off", "invalid_request_error", undefined))
+    const body = await req.text()
+    if (!cluster.verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    try {
+      c.merge(body)
+    } catch (e) {
+      return json(400, errorJson(e.message, "invalid_request_error", undefined))
+    }
+    this.pushLocal(c)
+    this.applyRemote(c)
+    return json(200, c.encode())
+  }
+
+  // ---- request log exports ----
+
+  configureExports(ec: LogExportsConfig | undefined): void {
+    const key = ec !== undefined && ec.enabled ? JSON.stringify(ec) : ""
+    if (key === this.exportKey) return
+    this.exportKey = key
+    if (this.exportTimer >= 0) {
+      clearInterval(this.exportTimer)
+      this.exportTimer = -1
+    }
+    if (ec === undefined || !ec.enabled) {
+      this.exportCfg = undefined
+      return
+    }
+    this.exportCfg = ec
+    this.exportTimer = setInterval(() => {
+      this.exportLogs()
+    }, Math.max(1, exportInterval(ec)) * 1000)
+  }
+
+  async exportLogs(): Promise<void> {
+    const ec = this.exportCfg
+    const ls = this.engine.logStore
+    if (ec === undefined || ls === undefined || this.exporting) return
+    const now = Date.now()
+    const entries = ls.since(this.cursor.position())
+    const batch = this.cursor.pending(entries.map((e) => JSON.stringify(e)), entries.map((e) => e.ts), now)
+    if (batch === undefined) return
+    this.exporting = true
+    const put = putRequest(ec, objectKey(ec, batch.startMs, batch.endMs, this.nodeId), batch.body, now)
+    const dl = deadline(30000)
+    try {
+      const hs: Record<string, string> = put.headers
+      const r = await fetch(put.url, { method: "PUT", headers: hs, body: put.body, signal: dl.controller.signal })
+      await r.text()
+      if (r.status >= 200 && r.status < 300) this.cursor.commit(batch.endMs)
+      else console.error(`raiju: log export: HTTP ${r.status} from ${put.url}`)
+    } catch (e) {
+      console.error(`raiju: log export: ${e.message}`)
+    }
+    dl.finish()
+    this.exporting = false
+  }
+
+  // ---- SSO (OIDC) for the UI and the management API ----
+
+  async disc(oc: OidcConfig): Promise<Discovery | undefined> {
+    const d = this.discovery
+    if (d !== undefined) return d
+    const r = await getText(discoveryUrl(oc.issuer))
+    if (r.status !== 200) return undefined
+    try {
+      const parsed = parseDiscovery(r.body)
+      this.discovery = parsed
+      return parsed
+    } catch (e) {
+      return undefined
+    }
+  }
+
+  // GET /api/oidc/status, /api/oidc/login, /api/oidc/callback: open routes.
+  async oidcRoute(req: Request, path: string): Promise<Response> {
+    const oc = this.oidcCfg
+    if (path === "/api/oidc/status") return json(200, `{"enabled":${oc !== undefined}}`)
+    if (oc === undefined) return json(404, errorJson("SSO is off", "invalid_request_error", undefined))
+    const d = await this.disc(oc)
+    if (d === undefined) return json(502, errorJson("could not read the identity provider's discovery document", "api_error", undefined))
+    const now = Date.now()
+    if (path === "/api/oidc/login") {
+      try {
+        const b = this.flows.begin(oc, d, now)
+        const h: Record<string, string> = new Map()
+        h.set("location", b.url)
+        h.set("cache-control", "no-store")
+        return new Response(undefined, { status: 302, headers: h })
+      } catch (e) {
+        return json(500, errorJson(e.message, "api_error", undefined))
+      }
+    }
+    if (path !== "/api/oidc/callback") return json(404, errorJson(`no route for ${path}`, "invalid_request_error", undefined))
+    const u = URL.parse(req.url)
+    const params = u === undefined ? new URLSearchParams("") : u.searchParams
+    const flow = this.flows.complete(params.get("state") ?? "", now)
+    if (flow === undefined) return html(401, "<p>This sign-in link expired or was already used. <a href=\"/api/oidc/login\">Sign in again</a>.</p>")
+    const th: Map<string, string> = new Map()
+    th.set("content-type", "application/x-www-form-urlencoded")
+    th.set("accept", "application/json")
+    const tr = await postText(d.token_endpoint, th, tokenRequestBody(oc, params.get("code") ?? "", flow.verifier))
+    if (tr.status !== 200) return html(502, `<p>The identity provider refused the sign-in (HTTP ${tr.status}).</p>`)
+    let idToken = ""
+    try {
+      idToken = rawStr(fields(tr.body), "id_token") ?? ""
+    } catch (e) {
+      idToken = ""
+    }
+    if (idToken === "") return html(502, "<p>The identity provider sent no ID token.</p>")
+    const jw = await getText(d.jwks_uri)
+    if (jw.status !== 200) return html(502, "<p>Could not read the identity provider's signing keys.</p>")
+    const v = verifyIdToken(idToken, jw.body, oc, d.issuer, flow.nonce, Date.now())
+    if (v.kind === "error") return html(401, `<p>Sign-in failed: ${v.message.replace("<", "&lt;")}</p>`)
+    let token = ""
+    try {
+      token = this.sessions.create(v.sub, v.role, Date.now())
+    } catch (e) {
+      return html(500, "<p>Could not create a session.</p>")
+    }
+    // the UI keeps its admin token in sessionStorage; the session token takes its place
+    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.setItem("raiju.adminToken", ${JSON.stringify(token)}); location.replace("/");</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`)
   }
 
   configureAlerts(al: AlertsConfig | undefined): void {
@@ -152,6 +422,18 @@ export class Ops {
 
   // Whether the caller may use this /api route; the actor names them in the audit log.
   gate(req: Request, path: string): Gate {
+    const auth = req.headers.get("authorization") ?? ""
+    if (auth.startsWith("Bearer sk-sess-")) {
+      const s = this.sessions.get(auth.slice(7), Date.now())
+      const role = s === undefined ? undefined : roleOf(s.role)
+      if (s === undefined || role === undefined) return { kind: "deny", res: denied(401, "the session expired; sign in again") }
+      const perm = required(req.method, path)
+      if (!allowed(role, perm, path)) {
+        this.recordChange("sso:" + s.sub, req, path, 403, "")
+        return { kind: "deny", res: denied(403, `role ${role} may not ${perm} this route`) }
+      }
+      return { kind: "ok", actor: "sso:" + s.sub }
+    }
     if (!this.authOn) return { kind: "ok", actor: "anonymous" }
     const v = authorize(this.rbac, snapshot(req.headers), req.method, path)
     if (v.kind === "ok") return { kind: "ok", actor: v.actor }
