@@ -1,0 +1,411 @@
+// Complexity router. Classifies a chat request as SIMPLE, MEDIUM or COMPLEX
+// from cheap deterministic features (sizes, counts of cue words, tools,
+// images), with no model call. Routing rules can match on the tier, or a
+// tier map can send each tier to its own "provider/model".
+//
+// The features are read with the lazy scanner in ./json, so the request body
+// is never fully decoded into a tree.
+
+import { fields, elements, find, rawStr } from "./json"
+
+export type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX"
+
+export type Features = {
+  promptTokens: int, // estimate over all message text: ASCII bytes / 4, plus 1 per non-ASCII char
+  messages: int,
+  hasTools: bool,
+  hasImages: bool,
+  codeBlocks: int, // complete ``` fenced blocks (fence pairs), all messages
+  reasoningCues: int, // whole-word hits in user/system text; last user message counts double
+  constraintCues: int, // same counting as reasoningCues
+  questionMarks: int, // '?' in user messages
+  maxTurnTokens: int, // largest single message, same estimate as promptTokens
+}
+
+// Weights for score(). Each term is weight * min(count, cap), so one
+// feature cannot dominate the score on its own.
+export type Weights = {
+  tokenScale: f64, // applied to log2(promptTokens + 1)
+  reasoningEach: f64,
+  reasoningCap: f64,
+  constraintEach: f64,
+  constraintCap: f64,
+  codeEach: f64,
+  codeCap: f64,
+  tools: f64,
+  images: f64,
+  extraMessageEach: f64, // applied to messages beyond freeMessages
+  freeMessages: int,
+  extraMessageCap: f64,
+}
+
+export type ComplexityConfig = {
+  simple_max_score: f64, // score <= this is SIMPLE
+  complex_min_score: f64, // score >= this is COMPLEX; in between is MEDIUM
+  weights?: Weights,
+}
+
+export function defaultWeights(): Weights {
+  return {
+    tokenScale: 0.5,
+    reasoningEach: 1.5,
+    reasoningCap: 6.0,
+    constraintEach: 0.5,
+    constraintCap: 3.0,
+    codeEach: 1.5,
+    codeCap: 3.0,
+    tools: 2.0,
+    images: 1.0,
+    extraMessageEach: 0.25,
+    freeMessages: 4,
+    extraMessageCap: 2.0,
+  }
+}
+
+export function defaultComplexityConfig(): ComplexityConfig {
+  return { simple_max_score: 3.0, complex_min_score: 8.0, weights: defaultWeights() }
+}
+
+// Cue words. Matching is on whole words only, case-insensitive: "reasoning"
+// does not count as "reason". Multi-word cues are matched as word sequences,
+// and hyphens split words, so "trade-off" matches "trade off" too.
+function reasoningCueList(): string[] {
+  return [
+    "why", "explain", "prove", "derive", "analyze", "analyse", "compare", "tradeoff",
+    "trade-off", "design", "architect", "optimize", "debug", "step by step", "reason",
+    "evaluate", "critique",
+  ]
+}
+
+function constraintCueList(): string[] {
+  return [
+    "must", "should", "exactly", "at least", "at most", "without", "only", "never",
+    "always", "format", "json", "schema", "table",
+  ]
+}
+
+// Splits text into lower-cased ASCII words. Any byte outside [a-zA-Z0-9]
+// separates words, so multi-byte characters never join a word.
+function wordsOf(text: string, b: u8[]): string[] {
+  const out: string[] = []
+  let start = -1
+  for (let i = 0; i <= b.length; i++) {
+    const c = i < b.length ? int(b[i]!) : 0
+    const alnum = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+    if (alnum && start < 0) start = i
+    else if (!alnum && start >= 0) {
+      out.push(text.slice(start, i).toLowerCase())
+      start = -1
+    }
+  }
+  return out
+}
+
+// Counts whole-word or phrase matches of the cue list in the words.
+function countCues(words: string[], cues: string[]): int {
+  let n = 0
+  for (const cue of cues) {
+    const parts = wordsOf(cue, new TextEncoder().encode(cue))
+    if (parts.length === 0) continue
+    for (let i = 0; i + parts.length <= words.length; i++) {
+      let ok = true
+      for (let j = 0; j < parts.length; j++) {
+        if (words[i + j] !== parts[j]) {
+          ok = false
+          break
+        }
+      }
+      if (ok) n += 1
+    }
+  }
+  return n
+}
+
+// Estimate: one token per 4 ASCII bytes, and one per non-ASCII character.
+// A UTF-8 lead byte (>= 0xC0) starts a character; continuation bytes are skipped.
+function estimateTokens(b: u8[]): int {
+  let ascii = 0
+  let multi = 0
+  for (const x of b) {
+    const c = int(x)
+    if (c < 128) ascii += 1
+    else if (c >= 192) multi += 1
+  }
+  return Math.floor(ascii / 4) + multi
+}
+
+function countByte(b: u8[], want: int): int {
+  let n = 0
+  for (const x of b) {
+    if (int(x) === want) n += 1
+  }
+  return n
+}
+
+// Non-overlapping ``` fences.
+function countFences(b: u8[]): int {
+  let n = 0
+  let i = 0
+  while (i + 2 < b.length) {
+    if (int(b[i]!) === 96 && int(b[i + 1]!) === 96 && int(b[i + 2]!) === 96) {
+      n += 1
+      i += 3
+    } else i += 1
+  }
+  return n
+}
+
+type Msg = { role: string, text: string }
+
+// Reads the messages array. Text parts are joined with newlines so words in
+// separate parts do not run together. Images are noted, not read.
+function readMessages(chatBody: string): { msgs: Msg[], hasImages: bool, hasTools: bool } throws SyntaxError {
+  const top = try fields(chatBody)
+  const msgs: Msg[] = []
+  let hasImages = false
+  const rawMsgs = find(top, "messages")
+  if (rawMsgs !== undefined && rawMsgs.startsWith("[")) {
+    for (const raw of try elements(rawMsgs)) {
+      const mf = try fields(raw)
+      const role = rawStr(mf, "role") ?? ""
+      const content = find(mf, "content")
+      let text = ""
+      if (content !== undefined && content.startsWith("\"")) {
+        text = rawStr(mf, "content") ?? ""
+      } else if (content !== undefined && content.startsWith("[")) {
+        const parts: string[] = []
+        for (const p of try elements(content)) {
+          const pf = try fields(p)
+          const type = rawStr(pf, "type")
+          if (type === "text") parts.push(rawStr(pf, "text") ?? "")
+          else if (type === "image_url") hasImages = true
+        }
+        text = parts.join("\n")
+      }
+      msgs.push({ role: role, text: text })
+    }
+  }
+  const tools = find(top, "tools")
+  const hasTools = tools !== undefined && tools !== "null" && tools !== "[]"
+  return { msgs: msgs, hasImages: hasImages, hasTools: hasTools }
+}
+
+export function features(chatBody: string): Features throws SyntaxError {
+  const read = try readMessages(chatBody)
+  const msgs = read.msgs
+  let lastUser = -1
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i]!.role === "user") lastUser = i
+  }
+
+  let promptTokens = 0
+  let maxTurnTokens = 0
+  let fences = 0
+  let questionMarks = 0
+  let reasoningCues = 0
+  let constraintCues = 0
+  const reasoning = reasoningCueList()
+  const constraints = constraintCueList()
+
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i]!
+    const b = new TextEncoder().encode(m.text)
+    const tokens = estimateTokens(b)
+    promptTokens += tokens
+    if (tokens > maxTurnTokens) maxTurnTokens = tokens
+    fences += countFences(b)
+    if (m.role === "user") questionMarks += countByte(b, 63)
+    if (m.role === "user" || m.role === "system") {
+      const words = wordsOf(m.text, b)
+      const weight = i === lastUser ? 2 : 1
+      reasoningCues += weight * countCues(words, reasoning)
+      constraintCues += weight * countCues(words, constraints)
+    }
+  }
+
+  return {
+    promptTokens: promptTokens,
+    messages: msgs.length,
+    hasTools: read.hasTools,
+    hasImages: read.hasImages,
+    codeBlocks: Math.floor(fences / 2),
+    reasoningCues: reasoningCues,
+    constraintCues: constraintCues,
+    questionMarks: questionMarks,
+    maxTurnTokens: maxTurnTokens,
+  }
+}
+
+// The one place the routing formula lives:
+//   score = tokenScale * log2(promptTokens + 1)
+//         + min(reasoningCap,  reasoningEach * reasoningCues)
+//         + min(constraintCap, constraintEach * constraintCues)
+//         + min(codeCap,       codeEach * codeBlocks)
+//         + tools  (if hasTools)
+//         + images (if hasImages)
+//         + min(extraMessageCap, extraMessageEach * max(0, messages - freeMessages))
+// Length grows the score logarithmically, so a long but plain request stays
+// cheap. Cues, code and tools carry most of the weight.
+export function score(f: Features, cfg: ComplexityConfig): f64 {
+  const w = cfg.weights ?? defaultWeights()
+  const tokens = Math.log(f.promptTokens + 1) / Math.log(2)
+  const reasoning = Math.min(w.reasoningCap, w.reasoningEach * f.reasoningCues)
+  const constraint = Math.min(w.constraintCap, w.constraintEach * f.constraintCues)
+  const code = Math.min(w.codeCap, w.codeEach * f.codeBlocks)
+  const tools = f.hasTools ? w.tools : 0
+  const images = f.hasImages ? w.images : 0
+  const extra = Math.min(w.extraMessageCap, w.extraMessageEach * Math.max(0, f.messages - w.freeMessages))
+  return w.tokenScale * tokens + reasoning + constraint + code + tools + images + extra
+}
+
+export function classify(chatBody: string, cfg: ComplexityConfig): { tier: Tier, score: f64, features: Features } throws SyntaxError {
+  const f = try features(chatBody)
+  const s = score(f, cfg)
+  let tier: Tier = "MEDIUM"
+  if (s <= cfg.simple_max_score) tier = "SIMPLE"
+  else if (s >= cfg.complex_min_score) tier = "COMPLEX"
+  return { tier: tier, score: s, features: f }
+}
+
+// Tier to "provider/model" target. An empty string counts as unset.
+export type TierMap = { simple?: string, medium?: string, complex?: string }
+
+export function tierTarget(tier: Tier, map: TierMap): string | undefined {
+  let t: string | undefined = undefined
+  if (tier === "SIMPLE") t = map.simple
+  else if (tier === "MEDIUM") t = map.medium
+  else t = map.complex
+  if (t === undefined || t === "") return undefined
+  return t
+}
+
+// Tier forced by the x-bf-complexity-tier header (any letter case).
+// Unknown values are ignored.
+export function overrideTier(h: Map<string, string>): Tier | undefined {
+  const raw = h.get("x-bf-complexity-tier")
+  if (raw === undefined) return undefined
+  const v = raw.trim().toUpperCase()
+  if (v === "SIMPLE") return "SIMPLE"
+  if (v === "MEDIUM") return "MEDIUM"
+  if (v === "COMPLEX") return "COMPLEX"
+  return undefined
+}
+
+const CFG = defaultComplexityConfig()
+
+test("greeting and short factual question are SIMPLE", () => {
+  expect((try classify('{"model":"x","messages":[{"role":"user","content":"Hi there!"}]}', CFG)).tier).toBe("SIMPLE")
+  const q = try classify('{"model":"x","messages":[{"role":"user","content":"What is the capital of France?"}]}', CFG)
+  expect(q.tier).toBe("SIMPLE")
+  expect(q.features.questionMarks).toBe(1)
+})
+
+test("explanation with one cue is MEDIUM", () => {
+  const body = '{"model":"x","messages":[{"role":"user","content":"Can you explain how HTTP caching works and what the Cache-Control header does for a typical web app with a CDN in front of it?"}]}'
+  const r = try classify(body, CFG)
+  // one hit in the only (and so last) user message, which counts double
+  expect(r.features.reasoningCues).toBe(2)
+  expect(r.tier).toBe("MEDIUM")
+})
+
+test("multi-paragraph design request with constraints and code is COMPLEX", () => {
+  const body = '{"model":"x","messages":[' +
+    '{"role":"system","content":"You are a senior architect. Answer in JSON and never skip edge cases."},' +
+    '{"role":"user","content":"I need to design a rate limiter for our gateway. Compare a token bucket with a sliding window.\\n\\n' +
+    'Explain the tradeoffs, and why one is better under bursty traffic. The output must follow this schema exactly and should be a table.\\n\\n' +
+    'Here is the current code:\\n```go\\nfunc allow(k string) bool { return true }\\n```\\n\\n' +
+    'Please evaluate the failure modes step by step, at least three of them, without relying on Redis."}]}'
+  const r = try classify(body, CFG)
+  expect(r.features.codeBlocks).toBe(1)
+  expect(r.features.reasoningCues >= 4).toBe(true)
+  expect(r.tier).toBe("COMPLEX")
+})
+
+test("tools push the score over the boundary", () => {
+  const plain = '{"model":"x","messages":[{"role":"user","content":"What is the weather in Paris today?"}]}'
+  const withTools = '{"model":"x","messages":[{"role":"user","content":"What is the weather in Paris today?"}],"tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]}'
+  const a = try classify(plain, CFG)
+  const b = try classify(withTools, CFG)
+  expect(b.features.hasTools).toBe(true)
+  expect(a.features.hasTools).toBe(false)
+  expect(b.score > a.score + 1.9).toBe(true)
+  expect(a.tier).toBe("SIMPLE")
+  expect(b.tier).toBe("MEDIUM")
+})
+
+test("whole-word cue matching", () => {
+  // "Why", "Trade-off", "tradeoff" and "step by step" are 4 hits; the single
+  // user message is also the last one, so they count double. "Reasoning" and
+  // "reasons" are not "reason".
+  const f = try features('{"messages":[{"role":"user","content":"Reasoning about this, I will reasons later. Why? Trade-off or tradeoff; step by step."}]}')
+  expect(f.reasoningCues).toBe(8)
+  const g = try features('{"messages":[{"role":"user","content":"designs and redesign, debugger, musts, mustn\'t"}]}')
+  expect(g.reasoningCues).toBe(0)
+  expect(g.constraintCues).toBe(0)
+})
+
+test("last user message counts double for cues", () => {
+  const body = '{"messages":[{"role":"user","content":"why?"},{"role":"assistant","content":"because"},{"role":"user","content":"why again?"}]}'
+  const f = try features(body)
+  expect(f.reasoningCues).toBe(3)
+  const sys = try features('{"messages":[{"role":"system","content":"only json"},{"role":"assistant","content":"only"}]}')
+  expect(sys.constraintCues).toBe(2)
+})
+
+test("assistant text is not scanned for cues", () => {
+  const f = try features('{"messages":[{"role":"assistant","content":"explain why, must, only"}]}')
+  expect(f.reasoningCues).toBe(0)
+  expect(f.constraintCues).toBe(0)
+})
+
+test("non-ASCII token estimate", () => {
+  // "héllo": 4 ASCII bytes (1 token) plus 1 non-ASCII char (1 token)
+  const f = try features('{"messages":[{"role":"user","content":"héllo"}]}')
+  expect(f.promptTokens).toBe(2)
+  // four CJK chars: 12 bytes, 0 ASCII, 4 characters
+  const g = try features('{"messages":[{"role":"user","content":"日本語テ"}]}')
+  expect(g.promptTokens).toBe(4)
+  // escaped unicode is decoded before counting
+  const h = try features('{"messages":[{"role":"user","content":"\\u00e9\\u00e9\\u00e9\\u00e9"}]}')
+  expect(h.promptTokens).toBe(4)
+})
+
+test("content parts, images and code fences", () => {
+  const body = '{"messages":[{"role":"user","content":[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]},' +
+    '{"role":"assistant","content":"```\\na\\n```\\n```\\nb\\n```"}]}'
+  const f = try features(body)
+  expect(f.hasImages).toBe(true)
+  expect(f.codeBlocks).toBe(2)
+  expect(f.questionMarks).toBe(1)
+  expect(f.messages).toBe(2)
+  expect(f.maxTurnTokens <= f.promptTokens).toBe(true)
+})
+
+test("tierTarget and header override", () => {
+  const map: TierMap = { simple: "openai/gpt-4o-mini", complex: "anthropic/claude-sonnet" }
+  expect(tierTarget("SIMPLE", map)).toBe("openai/gpt-4o-mini")
+  expect(tierTarget("MEDIUM", map)).toBe(undefined)
+  expect(tierTarget("COMPLEX", { complex: "" })).toBe(undefined)
+
+  expect(overrideTier(hdrs([["x-bf-complexity-tier", "complex"]]))).toBe("COMPLEX")
+  expect(overrideTier(hdrs([["x-bf-complexity-tier", " Simple "]]))).toBe("SIMPLE")
+  expect(overrideTier(hdrs([["x-bf-complexity-tier", "huge"]]))).toBe(undefined)
+  expect(overrideTier(new Map())).toBe(undefined)
+})
+
+function hdrs(pairs: string[][]): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  for (const p of pairs) m.set(p[0]!, p[1]!)
+  return m
+}
+
+test("malformed body throws", () => {
+  let threw = false
+  try {
+    const f = try features('{"messages":[')
+    expect(f.messages).toBe(0)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

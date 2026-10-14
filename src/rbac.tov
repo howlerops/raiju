@@ -1,0 +1,581 @@
+// Role-based access to the management API (/api/*): several admin users, each
+// with a role, in place of one shared token. Credentials are kept as hashes;
+// a token is shown once, when its user is created, and never stored.
+import { sha256, toHex, utf8, secureHex } from "./crypto"
+import { decode, encode } from "./base64"
+import { AdminAuthConfig, AdminUserConfig } from "./config"
+
+export type Role = "admin" | "editor" | "viewer" | "auditor"
+
+export type UserConfig = AdminUserConfig
+
+export type RbacConfig = { users: UserConfig[] }
+
+export type Identity = { kind: "user", name: string, role: Role } | { kind: "anonymous" } | { kind: "denied", reason: string }
+
+export type Permission = "read" | "write" | "manage_users" | "audit"
+
+export type Verdict = { kind: "ok", actor: string } | { kind: "error", status: int, message: string }
+
+export type UsersReply = { status: int, body: string, cfg: RbacConfig }
+
+const EDITOR_COLLECTIONS = ["virtual-keys", "budgets", "rate-limits", "teams", "customers"]
+const SECRET_SEGMENTS = ["secrets", "reveal"]
+const LAST_ADMIN = "cannot remove or disable the last enabled admin"
+
+export function hashToken(token: string): string {
+  return toHex(sha256(utf8(token)))
+}
+
+export function hashPassword(salt: string, password: string): string {
+  return toHex(sha256(utf8(salt + ":" + password)))
+}
+
+// Compares without stopping at the first difference.
+function safeEq(a: string, b: string): bool {
+  const x = utf8(a)
+  const y = utf8(b)
+  const n = x.length > y.length ? x.length : y.length
+  let d = x.length === y.length ? 0 : 1
+  for (let i = 0; i < n; i++) {
+    const p = i < x.length ? int(x[i]!) : 0
+    const q = i < y.length ? int(y[i]!) : 0
+    d = d | (p ^ q)
+  }
+  return d === 0
+}
+
+// The decoded "user:password" of a Basic credential, or undefined if it is not base64 text.
+function basicCreds(v: string): string | undefined {
+  try {
+    return new TextDecoder().decode(decode(v.trim()))
+  } catch (e) {
+    return undefined
+  }
+}
+
+function live(u: UserConfig): Identity {
+  if (u.disabled === true) return { kind: "denied", reason: "user is disabled" }
+  return { kind: "user", name: u.name, role: u.role }
+}
+
+// Every user is compared, so the time taken does not show which one matched.
+function bearerUser(cfg: RbacConfig, token: string): Identity {
+  if (token === "") return { kind: "denied", reason: "empty bearer token" }
+  const want = hashToken(token)
+  let hit: UserConfig | undefined = undefined
+  for (const u of cfg.users) {
+    const h = u.token_sha256
+    if (h !== undefined && safeEq(want, h)) hit = u
+  }
+  if (hit === undefined) return { kind: "denied", reason: "invalid credentials" }
+  return live(hit)
+}
+
+function basicUser(cfg: RbacConfig, v: string): Identity {
+  const creds = basicCreds(v)
+  if (creds === undefined) return { kind: "denied", reason: "malformed basic credentials" }
+  const i = creds.indexOf(":")
+  if (i < 0) return { kind: "denied", reason: "malformed basic credentials" }
+  const name = creds.slice(0, i)
+  const pw = creds.slice(i + 1)
+  let hit: UserConfig | undefined = undefined
+  for (const u of cfg.users) {
+    if (u.name === name) hit = u
+  }
+  if (hit === undefined) return { kind: "denied", reason: "invalid credentials" }
+  const salt = hit.salt
+  const stored = hit.password_sha256
+  if (salt === undefined || stored === undefined) return { kind: "denied", reason: "invalid credentials" }
+  if (!safeEq(hashPassword(salt, pw), stored)) return { kind: "denied", reason: "invalid credentials" }
+  return live(hit)
+}
+
+// Who the request's Authorization header names. No header is anonymous; a
+// wrong, unknown or disabled credential is denied.
+export function authenticate(cfg: RbacConfig, headers: Map<string, string>): Identity {
+  const h = headers.get("authorization") ?? ""
+  if (h === "") return { kind: "anonymous" }
+  if (h.startsWith("Bearer ") || h.startsWith("bearer ")) return bearerUser(cfg, h.slice(7))
+  if (h.startsWith("Basic ") || h.startsWith("basic ")) return basicUser(cfg, h.slice(6))
+  return { kind: "denied", reason: "unsupported authorization scheme" }
+}
+
+function segmentsOf(path: string): string[] {
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  return p.split("/").filter((s) => s !== "")
+}
+
+// Only /api/... is the management API; anything else is admin-only.
+function isApi(segs: string[]): bool {
+  return (segs[0] ?? "") === "api"
+}
+
+function isAudit(segs: string[]): bool {
+  const a = segs[1] ?? ""
+  return a === "audit-logs" || a === "logs"
+}
+
+function isSecret(segs: string[]): bool {
+  for (const s of segs) {
+    if (SECRET_SEGMENTS.includes(s)) return true
+  }
+  return false
+}
+
+function editorWrites(segs: string[]): bool {
+  const area = segs[1] ?? ""
+  if (area === "providers") return true
+  if (area === "governance") return EDITOR_COLLECTIONS.includes(segs[2] ?? "")
+  return false
+}
+
+// What a request needs: user management, audit logs, a write, or a read.
+export function required(method: string, path: string): Permission {
+  const segs = segmentsOf(path)
+  if (isApi(segs) && (segs[1] ?? "") === "users") return "manage_users"
+  const m = method.toUpperCase()
+  if (m === "GET" || m === "HEAD") return isAudit(segs) ? "audit" : "read"
+  return "write"
+}
+
+// admin: everything. editor: read everything, write providers and governance
+// records, no user management. viewer: GET except secrets and audit logs. auditor: audit logs only.
+export function allowed(role: Role, perm: Permission, path: string): bool {
+  if (role === "admin") return true
+  const segs = segmentsOf(path)
+  if (!isApi(segs)) return false
+  if (perm === "manage_users") return false
+  if (perm === "audit" && !isAudit(segs)) return false
+  // the audit trail is for admins and auditors only
+  if (perm === "audit" && (segs[1] ?? "") === "audit-logs" && role !== "auditor") return false
+  if (role === "auditor") return perm === "audit"
+  if (perm === "write") return role === "editor" && editorWrites(segs)
+  if (role === "editor") return true
+  return !isSecret(segs)
+}
+
+// The access decision for one request. 401 when the caller is not
+// authenticated, 403 when the role does not cover the request.
+export function authorize(cfg: RbacConfig, headers: Map<string, string>, method: string, path: string): Verdict {
+  const who = authenticate(cfg, headers)
+  if (who.kind === "anonymous") return { kind: "error", status: 401, message: "authentication required" }
+  if (who.kind === "denied") return { kind: "error", status: 401, message: who.reason }
+  const perm = required(method, path)
+  if (!allowed(who.role, perm, path)) return { kind: "error", status: 403, message: `role ${who.role} may not ${perm} this route` }
+  return { kind: "ok", actor: who.name }
+}
+
+// ---- user management ----
+
+type UserBody = { name?: string, role?: string, disabled?: bool }
+
+type UserView = { name: string, role: Role, disabled: bool }
+
+function roleOf(s: string): Role | undefined {
+  if (s === "admin") return "admin"
+  if (s === "editor") return "editor"
+  if (s === "viewer") return "viewer"
+  if (s === "auditor") return "auditor"
+  return undefined
+}
+
+// Names are Basic auth user names and path segments: lower-case letters, digits, "_" and "-".
+function validName(name: string): bool {
+  const n = name.byteLength
+  if (n < 1 || n > 64) return false
+  for (const b of utf8(name)) {
+    const c = int(b)
+    const ok = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 45
+    if (!ok) return false
+  }
+  return true
+}
+
+function view(u: UserConfig): UserView {
+  return { name: u.name, role: u.role, disabled: u.disabled === true }
+}
+
+function parseUserBody(b: string): UserBody | undefined {
+  try {
+    const v = JSON.parse(b) as UserBody
+    return v
+  } catch (e) {
+    return undefined
+  }
+}
+
+// A fresh bearer token, "sk-admin-" then 40 hex characters from the kernel CSPRNG.
+function newToken(): string | undefined {
+  try {
+    return "sk-admin-" + secureHex(40)
+  } catch (e) {
+    return undefined
+  }
+}
+
+function findUser(users: UserConfig[], name: string): UserConfig | undefined {
+  for (const u of users) {
+    if (u.name === name) return u
+  }
+  return undefined
+}
+
+function isActiveAdmin(u: UserConfig): bool {
+  return u.role === "admin" && u.disabled !== true
+}
+
+// Enabled admins other than `except`.
+function otherActiveAdmins(users: UserConfig[], except: string): int {
+  let n = 0
+  for (const u of users) {
+    if (u.name !== except && isActiveAdmin(u)) n += 1
+  }
+  return n
+}
+
+function ureply(status: int, body: string, cfg: RbacConfig): UsersReply {
+  return { status: status, body: body, cfg: cfg }
+}
+
+function uerror(status: int, message: string, cfg: RbacConfig): UsersReply {
+  return ureply(status, JSON.stringify({ error: { message: message } }), cfg)
+}
+
+function createUser(cfg: RbacConfig, body: string): UsersReply {
+  const b = parseUserBody(body)
+  if (b === undefined) return uerror(400, "body must be a JSON object with name and role", cfg)
+  const name = b.name ?? ""
+  if (!validName(name)) return uerror(400, "name must be 1 to 64 lower-case letters, digits, _ or -", cfg)
+  const role = roleOf(b.role ?? "")
+  if (role === undefined) return uerror(400, "role must be admin, editor, viewer or auditor", cfg)
+  if (findUser(cfg.users, name) !== undefined) return uerror(409, `user ${name} already exists`, cfg)
+  const token = newToken()
+  if (token === undefined) return uerror(500, "no secure random source; the user was not created", cfg)
+  const users: UserConfig[] = []
+  for (const u of cfg.users) users.push(u)
+  users.push({ name: name, role: role, token_sha256: hashToken(token), disabled: false })
+  // the token is returned here and never again
+  const out = { name: name, role: role, disabled: false, token: token }
+  return ureply(201, JSON.stringify(out), { users: users })
+}
+
+function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
+  const old = findUser(cfg.users, name)
+  if (old === undefined) return uerror(404, `no user ${name}`, cfg)
+  const b = parseUserBody(body)
+  if (b === undefined) return uerror(400, "body must be a JSON object with role or disabled", cfg)
+  let role: Role = old.role
+  if (b.role !== undefined) {
+    const r = roleOf(b.role)
+    if (r === undefined) return uerror(400, "role must be admin, editor, viewer or auditor", cfg)
+    role = r
+  }
+  const disabled = b.disabled === undefined ? old.disabled : b.disabled
+  const next: UserConfig = {
+    name: old.name,
+    role: role,
+    token_sha256: old.token_sha256,
+    password_sha256: old.password_sha256,
+    salt: old.salt,
+    disabled: disabled,
+  }
+  if (isActiveAdmin(old) && !isActiveAdmin(next) && otherActiveAdmins(cfg.users, name) === 0) {
+    return uerror(409, LAST_ADMIN, cfg)
+  }
+  const users: UserConfig[] = []
+  for (const u of cfg.users) users.push(u.name === name ? next : u)
+  return ureply(200, JSON.stringify(view(next)), { users: users })
+}
+
+function deleteUser(cfg: RbacConfig, name: string): UsersReply {
+  const old = findUser(cfg.users, name)
+  if (old === undefined) return uerror(404, `no user ${name}`, cfg)
+  if (isActiveAdmin(old) && otherActiveAdmins(cfg.users, name) === 0) return uerror(409, LAST_ADMIN, cfg)
+  const users: UserConfig[] = []
+  for (const u of cfg.users) {
+    if (u.name !== name) users.push(u)
+  }
+  return ureply(200, JSON.stringify({ deleted: name }), { users: users })
+}
+
+// GET /api/users (never with hashes), POST /api/users, PUT and DELETE
+// /api/users/{name}. Pure: the caller stores the returned cfg. Access is
+// checked by authorize() first (manage_users).
+export function handleUsers(cfg: RbacConfig, method: string, path: string, body: string): UsersReply {
+  const segs = segmentsOf(path)
+  if (!isApi(segs) || (segs[1] ?? "") !== "users" || segs.length > 3) return uerror(404, "no route for this path", cfg)
+  const m = method.toUpperCase()
+  const name = segs[2]
+  if (name === undefined) {
+    if (m === "GET") return ureply(200, JSON.stringify({ users: cfg.users.map((u) => view(u)) }), cfg)
+    if (m === "POST") return createUser(cfg, body)
+    return uerror(405, `method ${m} is not allowed on this route`, cfg)
+  }
+  if (m === "PUT") return updateUser(cfg, name, body)
+  if (m === "DELETE") return deleteUser(cfg, name)
+  return uerror(405, `method ${m} is not allowed on this route`, cfg)
+}
+
+// The single credential of the old governance.auth_config, as admin users. The
+// password gets a random salt, so this throws if the kernel random source fails.
+export function fromLegacy(auth: AdminAuthConfig | undefined): RbacConfig throws Error {
+  const users: UserConfig[] = []
+  if (auth === undefined) return { users: users }
+  const t = auth.token
+  if (t !== undefined && t !== "") users.push({ name: "legacy-token", role: "admin", token_sha256: hashToken(t) })
+  const u = auth.username
+  const p = auth.password
+  if (u !== undefined && u !== "" && p !== undefined && p !== "") {
+    const salt = try secureHex(16)
+    users.push({ name: u, role: "admin", salt: salt, password_sha256: hashPassword(salt, p) })
+  }
+  return { users: users }
+}
+
+// ---- tests ----
+
+function hdr(v: string): Map<string, string> {
+  const m = new Map<string, string>()
+  m.set("authorization", v)
+  return m
+}
+
+function basic(name: string, pw: string): Map<string, string> {
+  return hdr("Basic " + encode(utf8(name + ":" + pw)))
+}
+
+function who(i: Identity): string {
+  if (i.kind === "user") return "user " + i.name + " " + i.role
+  if (i.kind === "anonymous") return "anonymous"
+  return "denied"
+}
+
+function statusOf(v: Verdict): int {
+  return v.kind === "error" ? v.status : 200
+}
+
+function actorOf(v: Verdict): string {
+  return v.kind === "ok" ? v.actor : ""
+}
+
+function fixture(): RbacConfig {
+  return {
+    users: [
+      { name: "root", role: "admin", token_sha256: hashToken("sk-root-token") },
+      { name: "ed", role: "editor", salt: "salt1", password_sha256: hashPassword("salt1", "ed-pass") },
+      { name: "vi", role: "viewer", token_sha256: hashToken("sk-view-token") },
+      { name: "au", role: "auditor", salt: "salt2", password_sha256: hashPassword("salt2", "au-pass") },
+      { name: "gone", role: "editor", token_sha256: hashToken("sk-gone"), disabled: true },
+    ],
+  }
+}
+
+type Made = { name: string, role: string, disabled: bool, token: string }
+
+test("bearer tokens authenticate and wrong ones are denied", () => {
+  const cfg = fixture()
+  expect(who(authenticate(cfg, hdr("Bearer sk-root-token")))).toBe("user root admin")
+  expect(who(authenticate(cfg, hdr("bearer sk-view-token")))).toBe("user vi viewer")
+  expect(who(authenticate(cfg, hdr("Bearer sk-root-toke")))).toBe("denied")
+  expect(who(authenticate(cfg, hdr("Bearer sk-root-tokenX")))).toBe("denied")
+  expect(who(authenticate(cfg, hdr("Bearer ")))).toBe("denied")
+  expect(who(authenticate(cfg, hdr("Basic !!!")))).toBe("denied")
+  expect(who(authenticate(cfg, hdr("Token sk-root-token")))).toBe("denied")
+})
+
+test("basic credentials check the salted password", () => {
+  const cfg = fixture()
+  expect(who(authenticate(cfg, basic("ed", "ed-pass")))).toBe("user ed editor")
+  expect(who(authenticate(cfg, basic("au", "au-pass")))).toBe("user au auditor")
+  expect(who(authenticate(cfg, basic("ed", "wrong")))).toBe("denied")
+  expect(who(authenticate(cfg, basic("ed", "")))).toBe("denied")
+  expect(who(authenticate(cfg, basic("nobody", "ed-pass")))).toBe("denied")
+  expect(who(authenticate(cfg, basic("root", "sk-root-token")))).toBe("denied")
+  expect(who(authenticate(cfg, hdr("Basic " + encode(utf8("ed")))))).toBe("denied")
+})
+
+test("no credentials is anonymous", () => {
+  expect(who(authenticate(fixture(), new Map<string, string>()))).toBe("anonymous")
+})
+
+test("disabled users are denied by bearer and by basic", () => {
+  const cfg = fixture()
+  expect(who(authenticate(cfg, hdr("Bearer sk-gone")))).toBe("denied")
+  const off: RbacConfig = { users: [{ name: "ed", role: "editor", salt: "s", password_sha256: hashPassword("s", "pw"), disabled: true }] }
+  expect(who(authenticate(off, basic("ed", "pw")))).toBe("denied")
+  const r = authenticate(off, basic("ed", "pw"))
+  expect(r.kind === "denied" ? r.reason : "").toBe("user is disabled")
+})
+
+test("required maps methods and paths to permissions", () => {
+  expect(required("GET", "/api/providers")).toBe("read")
+  expect(required("head", "/api/config")).toBe("read")
+  expect(required("GET", "/api/logs?limit=5")).toBe("audit")
+  expect(required("GET", "/api/audit-logs/export")).toBe("audit")
+  expect(required("POST", "/api/logs")).toBe("write")
+  expect(required("POST", "/api/providers/openai/keys")).toBe("write")
+  expect(required("DELETE", "/api/governance/budgets/b1")).toBe("write")
+  expect(required("GET", "/api/users")).toBe("manage_users")
+  expect(required("POST", "/api/users")).toBe("manage_users")
+  expect(required("DELETE", "/api/users/bob")).toBe("manage_users")
+})
+
+test("allowed matrix for every role", () => {
+  // admin
+  expect(allowed("admin", "manage_users", "/api/users")).toBe(true)
+  expect(allowed("admin", "write", "/api/config")).toBe(true)
+  expect(allowed("admin", "read", "/api/secrets/x")).toBe(true)
+  // editor
+  expect(allowed("editor", "read", "/api/providers")).toBe(true)
+  expect(allowed("editor", "read", "/api/config")).toBe(true)
+  expect(allowed("editor", "audit", "/api/logs")).toBe(true)
+  expect(allowed("editor", "write", "/api/providers/openai/keys")).toBe(true)
+  expect(allowed("editor", "write", "/api/governance/virtual-keys/vk1")).toBe(true)
+  expect(allowed("editor", "write", "/api/governance/budgets")).toBe(true)
+  expect(allowed("editor", "write", "/api/governance/rate-limits")).toBe(true)
+  expect(allowed("editor", "write", "/api/governance/teams")).toBe(true)
+  expect(allowed("editor", "write", "/api/governance/customers/c1")).toBe(true)
+  expect(allowed("editor", "write", "/api/governance/usage")).toBe(false)
+  expect(allowed("editor", "write", "/api/config")).toBe(false)
+  expect(allowed("editor", "write", "/api/logs")).toBe(false)
+  expect(allowed("editor", "manage_users", "/api/users")).toBe(false)
+  // viewer
+  expect(allowed("viewer", "read", "/api/providers")).toBe(true)
+  expect(allowed("viewer", "read", "/api/config")).toBe(true)
+  expect(allowed("viewer", "read", "/api/governance/virtual-keys")).toBe(true)
+  expect(allowed("viewer", "audit", "/api/logs")).toBe(true)
+  expect(allowed("viewer", "read", "/api/providers/openai/reveal")).toBe(false)
+  expect(allowed("viewer", "read", "/api/secrets")).toBe(false)
+  expect(allowed("viewer", "write", "/api/providers/openai")).toBe(false)
+  expect(allowed("viewer", "write", "/api/config")).toBe(false)
+  expect(allowed("viewer", "manage_users", "/api/users")).toBe(false)
+  // auditor
+  expect(allowed("auditor", "audit", "/api/logs")).toBe(true)
+  expect(allowed("auditor", "audit", "/api/audit-logs")).toBe(true)
+  expect(allowed("auditor", "read", "/api/providers")).toBe(false)
+  expect(allowed("auditor", "read", "/api/config")).toBe(false)
+  expect(allowed("auditor", "audit", "/api/providers")).toBe(false)
+  expect(allowed("auditor", "write", "/api/logs")).toBe(false)
+  expect(allowed("auditor", "manage_users", "/api/users")).toBe(false)
+  // not under /api: admin only
+  expect(allowed("viewer", "read", "/v1/models")).toBe(false)
+  expect(allowed("admin", "read", "/v1/models")).toBe(true)
+})
+
+test("authorize returns 401 for missing or bad credentials and 403 for a role", () => {
+  const cfg = fixture()
+  const none = new Map<string, string>()
+  expect(statusOf(authorize(cfg, none, "GET", "/api/providers"))).toBe(401)
+  expect(statusOf(authorize(cfg, hdr("Bearer nope"), "GET", "/api/providers"))).toBe(401)
+  expect(statusOf(authorize(cfg, hdr("Bearer sk-gone"), "GET", "/api/providers"))).toBe(401)
+  expect(statusOf(authorize(cfg, hdr("Bearer sk-view-token"), "POST", "/api/providers"))).toBe(403)
+  expect(statusOf(authorize(cfg, hdr("Bearer sk-view-token"), "GET", "/api/providers"))).toBe(200)
+  expect(actorOf(authorize(cfg, hdr("Bearer sk-view-token"), "GET", "/api/providers"))).toBe("vi")
+  expect(statusOf(authorize(cfg, basic("ed", "ed-pass"), "PUT", "/api/users/au"))).toBe(403)
+  expect(statusOf(authorize(cfg, basic("ed", "ed-pass"), "PUT", "/api/providers/openai"))).toBe(200)
+  expect(statusOf(authorize(cfg, basic("au", "au-pass"), "GET", "/api/providers"))).toBe(403)
+  expect(statusOf(authorize(cfg, basic("au", "au-pass"), "GET", "/api/logs"))).toBe(200)
+  expect(statusOf(authorize(cfg, hdr("Bearer sk-root-token"), "DELETE", "/api/users/au"))).toBe(200)
+})
+
+test("handleUsers lists without hashes and creates a token shown once", () => {
+  const cfg: RbacConfig = { users: [{ name: "root", role: "admin", token_sha256: hashToken("sk-root-token") }] }
+  const list = handleUsers(cfg, "GET", "/api/users", "")
+  expect(list.status).toBe(200)
+  expect(list.body.includes("root")).toBe(true)
+  expect(list.body.includes("token_sha256")).toBe(false)
+  expect(list.body.includes(hashToken("sk-root-token"))).toBe(false)
+
+  const made = handleUsers(cfg, "POST", "/api/users", "{\"name\":\"bob\",\"role\":\"viewer\"}")
+  expect(made.status).toBe(201)
+  const body = try JSON.parse(made.body) as Made
+  expect(body.token.startsWith("sk-admin-")).toBe(true)
+  expect(body.token.byteLength).toBe(9 + 40)
+  expect(JSON.stringify(made.cfg).includes(body.token)).toBe(false)
+  expect(who(authenticate(made.cfg, hdr("Bearer " + body.token)))).toBe("user bob viewer")
+  expect(statusOf(authorize(made.cfg, hdr("Bearer " + body.token), "GET", "/api/providers"))).toBe(200)
+  expect(statusOf(authorize(made.cfg, hdr("Bearer " + body.token), "POST", "/api/providers"))).toBe(403)
+  const after = handleUsers(made.cfg, "GET", "/api/users", "")
+  expect(after.body.includes(body.token)).toBe(false)
+  expect(after.body.includes("bob")).toBe(true)
+
+  expect(handleUsers(made.cfg, "POST", "/api/users", "{\"name\":\"bob\",\"role\":\"editor\"}").status).toBe(409)
+  expect(handleUsers(made.cfg, "POST", "/api/users", "{\"name\":\"x\",\"role\":\"root\"}").status).toBe(400)
+  expect(handleUsers(made.cfg, "POST", "/api/users", "{\"name\":\"Bad Name\",\"role\":\"viewer\"}").status).toBe(400)
+  expect(handleUsers(made.cfg, "POST", "/api/users", "not json").status).toBe(400)
+  expect(handleUsers(made.cfg, "PATCH", "/api/users", "{}").status).toBe(405)
+  expect(handleUsers(made.cfg, "GET", "/api/users/a/b", "").status).toBe(404)
+})
+
+test("handleUsers updates role and disabled, then deletes", () => {
+  const cfg: RbacConfig = {
+    users: [
+      { name: "root", role: "admin", token_sha256: hashToken("sk-root-token") },
+      { name: "bob", role: "viewer", token_sha256: hashToken("sk-bob") },
+    ],
+  }
+  const up = handleUsers(cfg, "PUT", "/api/users/bob", "{\"role\":\"editor\"}")
+  expect(up.status).toBe(200)
+  expect(who(authenticate(up.cfg, hdr("Bearer sk-bob")))).toBe("user bob editor")
+  expect(up.body.includes("token_sha256")).toBe(false)
+  const off = handleUsers(up.cfg, "PUT", "/api/users/bob", "{\"disabled\":true}")
+  expect(off.status).toBe(200)
+  expect(who(authenticate(off.cfg, hdr("Bearer sk-bob")))).toBe("denied")
+  expect(handleUsers(off.cfg, "PUT", "/api/users/bob", "{\"role\":\"superuser\"}").status).toBe(400)
+  expect(handleUsers(off.cfg, "PUT", "/api/users/nobody", "{}").status).toBe(404)
+  expect(handleUsers(off.cfg, "PUT", "/api/users/bob", "nope").status).toBe(400)
+  const gone = handleUsers(off.cfg, "DELETE", "/api/users/bob", "")
+  expect(gone.status).toBe(200)
+  expect(handleUsers(gone.cfg, "DELETE", "/api/users/bob", "").status).toBe(404)
+  expect(gone.cfg.users.length).toBe(1)
+})
+
+test("the last enabled admin cannot be deleted, demoted or disabled", () => {
+  const only: RbacConfig = { users: [{ name: "root", role: "admin", token_sha256: hashToken("sk-root") }] }
+  expect(handleUsers(only, "DELETE", "/api/users/root", "").status).toBe(409)
+  expect(handleUsers(only, "PUT", "/api/users/root", "{\"role\":\"editor\"}").status).toBe(409)
+  expect(handleUsers(only, "PUT", "/api/users/root", "{\"disabled\":true}").status).toBe(409)
+  expect(handleUsers(only, "PUT", "/api/users/root", "{\"role\":\"admin\"}").status).toBe(200)
+
+  // a disabled admin does not count as a remaining admin
+  const withOff: RbacConfig = {
+    users: [
+      { name: "root", role: "admin", token_sha256: hashToken("sk-root") },
+      { name: "old", role: "admin", token_sha256: hashToken("sk-old"), disabled: true },
+    ],
+  }
+  expect(handleUsers(withOff, "DELETE", "/api/users/root", "").status).toBe(409)
+  expect(handleUsers(withOff, "DELETE", "/api/users/old", "").status).toBe(200)
+
+  // with a second enabled admin, either one can go
+  const two = handleUsers(only, "POST", "/api/users", "{\"name\":\"root2\",\"role\":\"admin\"}")
+  expect(two.status).toBe(201)
+  const first = handleUsers(two.cfg, "DELETE", "/api/users/root", "")
+  expect(first.status).toBe(200)
+  expect(handleUsers(first.cfg, "DELETE", "/api/users/root2", "").status).toBe(409)
+})
+
+test("fromLegacy turns the old token or user and password into admin users", () => {
+  expect(try fromLegacy(undefined).users.length).toBe(0)
+  expect(try fromLegacy({}).users.length).toBe(0)
+  expect(try fromLegacy({ username: "admin" }).users.length).toBe(0)
+
+  const tok = try fromLegacy({ token: "tok-legacy" })
+  expect(tok.users.length).toBe(1)
+  expect(tok.users[0]!.role).toBe("admin")
+  expect(tok.users[0]!.password_sha256 === undefined).toBe(true)
+  expect(who(authenticate(tok, hdr("Bearer tok-legacy")))).toBe("user legacy-token admin")
+  expect(who(authenticate(tok, hdr("Bearer tok-legacy2")))).toBe("denied")
+
+  const pw = try fromLegacy({ username: "admin", password: "secret" })
+  expect(who(authenticate(pw, basic("admin", "secret")))).toBe("user admin admin")
+  expect(who(authenticate(pw, basic("admin", "wrong")))).toBe("denied")
+  expect(who(authenticate(pw, hdr("Bearer secret")))).toBe("denied")
+
+  const both = try fromLegacy({ username: "admin", password: "secret", token: "tok" })
+  expect(both.users.length).toBe(2)
+  expect(who(authenticate(both, hdr("Bearer tok")))).toBe("user legacy-token admin")
+  expect(who(authenticate(both, basic("admin", "secret")))).toBe("user admin admin")
+})

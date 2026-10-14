@@ -1,0 +1,254 @@
+// MCP agent mode. When the model answers with tool calls the gateway may run itself,
+// the calls are executed, their results appended to the conversation, and the model is
+// called again. The loop ends when the model answers without such calls, or at the depth
+// limit, and the caller gets the final answer. The step logic is pure so it tests without
+// a network; runAgent takes the model call and the tool executor as functions.
+import { fields, elements, find, rawStr, isNull, decodeString, build, setField } from "./json"
+import { toolMessage } from "./mcp"
+
+export type AgentConfig = {
+  // Bifrost's client.mcp_agent_depth: how many rounds of tool execution are allowed.
+  max_depth: int,
+  // Chat tool names ("<server>-<tool>") that run without asking the caller. "*" means every MCP tool.
+  auto_execute: string[],
+  // Run one step's calls concurrently.
+  parallel: bool,
+}
+
+export type ToolCallRef = { id: string, name: string, argumentsJson: string }
+
+export type AgentDecision =
+  | { kind: "done" }
+  | { kind: "execute", calls: ToolCallRef[] }
+  | { kind: "stop", reason: string, completion: string }
+
+export function defaultAgentConfig(): AgentConfig {
+  return { max_depth: 10, auto_execute: [], parallel: true }
+}
+
+// The raw message object of the first choice, or undefined when there is none.
+function firstMessage(completion: string): string | undefined throws SyntaxError {
+  const fs = try fields(completion)
+  const choices = find(fs, "choices")
+  if (choices === undefined || isNull(choices)) return undefined
+  const els = try elements(choices)
+  if (els.length === 0) return undefined
+  const msg = find(try fields(els[0]!), "message")
+  if (msg === undefined || isNull(msg)) return undefined
+  return msg
+}
+
+// The tool calls of the first choice. A completion without tool calls gives [].
+export function toolCallsOf(completion: string): ToolCallRef[] throws SyntaxError {
+  const msg = try firstMessage(completion)
+  if (msg === undefined) return []
+  const tcRaw = find(try fields(msg), "tool_calls")
+  if (tcRaw === undefined || isNull(tcRaw)) return []
+  const out: ToolCallRef[] = []
+  for (const el of try elements(tcRaw)) {
+    const tf = try fields(el)
+    const fnRaw = find(tf, "function")
+    const ff = try fields(fnRaw === undefined || isNull(fnRaw) ? "{}" : fnRaw)
+    // OpenAI sends arguments as a JSON string; an object is taken as it is.
+    const argsRaw = find(ff, "arguments")
+    let argumentsJson = "{}"
+    if (argsRaw !== undefined && !isNull(argsRaw)) {
+      argumentsJson = argsRaw.startsWith('"') ? try decodeString(argsRaw) : argsRaw
+    }
+    out.push({ id: rawStr(tf, "id") ?? "", name: rawStr(ff, "name") ?? "", argumentsJson: argumentsJson })
+  }
+  return out
+}
+
+// The raw assistant message to append to the conversation, tool_calls included.
+export function assistantMessage(completion: string): string throws SyntaxError {
+  const msg = try firstMessage(completion)
+  if (msg === undefined) throw new SyntaxError("completion has no message")
+  return msg
+}
+
+// A tool may run on its own only if it is an MCP tool and the list allows it.
+export function allowed(name: string, cfg: AgentConfig, mcpNames: string[]): bool {
+  if (!mcpNames.includes(name)) return false
+  return cfg.auto_execute.includes("*") || cfg.auto_execute.includes(name)
+}
+
+// The chat request with the assistant message and the tool results appended to messages.
+// Other fields keep their raw values.
+export function nextRequest(chatBody: string, assistantMsg: string, toolMessages: string[]): string throws SyntaxError {
+  let fs = try fields(chatBody)
+  try fields(assistantMsg)
+  const parts: string[] = []
+  const existing = find(fs, "messages")
+  if (existing !== undefined && !isNull(existing)) {
+    for (const el of try elements(existing)) parts.push(el)
+  }
+  parts.push(assistantMsg)
+  for (const m of toolMessages) parts.push(m)
+  setField(&fs, "messages", "[" + parts.join(",") + "]")
+  return build(fs)
+}
+
+// What the loop does with one completion. depth is the number of tool rounds already run.
+export function decide(completion: string, cfg: AgentConfig, mcpNames: string[], depth: int): AgentDecision throws SyntaxError {
+  const calls = try toolCallsOf(completion)
+  if (calls.length === 0) return { kind: "done" }
+  for (const c of calls) {
+    if (!allowed(c.name, cfg, mcpNames)) return { kind: "stop", reason: `tool ${c.name} is not auto-executed`, completion: completion }
+  }
+  if (depth >= cfg.max_depth) return { kind: "stop", reason: `agent depth limit ${cfg.max_depth} reached`, completion: completion }
+  return { kind: "execute", calls: calls }
+}
+
+// Adds the agent's counts to a completion.
+export function annotate(completion: string, steps: int, toolCalls: int): string throws SyntaxError {
+  let fs = try fields(completion)
+  setField(&fs, "agent", `{"steps":${steps},"tool_calls":${toolCalls}}`)
+  return build(fs)
+}
+
+// Runs one call. A failure becomes a tool message with the error text, not a failure of the loop.
+async function runOne(c: ToolCallRef, exec: (name: string, argsJson: string) => Promise<{ text: string, isError: bool }, Error>): Promise<string> {
+  try {
+    const r = try await exec(c.name, c.argumentsJson)
+    return toolMessage(c.id, r.isError ? "Error: " + r.text : r.text)
+  } catch (e) {
+    return toolMessage(c.id, "Error: " + e.message)
+  }
+}
+
+// Calls the model until it answers without auto-executable tool calls or the depth limit is
+// reached. steps counts model calls that succeeded; toolCalls counts tool executions. A non-2xx
+// reply from the model is returned as it is. An answer that is not JSON is returned unannotated.
+export async function runAgent(
+  chatBody: string,
+  call: (body: string) => Promise<{ status: int, body: string }, Error>,
+  exec: (name: string, argsJson: string) => Promise<{ text: string, isError: bool }, Error>,
+  cfg: AgentConfig,
+  mcpNames: string[],
+): Promise<{ status: int, body: string, steps: int, toolCalls: int }, Error> throws SyntaxError | Error {
+  let body = chatBody
+  let steps = 0
+  let toolCalls = 0
+  while (true) {
+    const r = try await call(body)
+    if (r.status < 200 || r.status >= 300) return { status: r.status, body: r.body, steps: steps, toolCalls: toolCalls }
+    steps += 1
+    let d: AgentDecision = { kind: "done" }
+    try {
+      d = decide(r.body, cfg, mcpNames, steps - 1)
+    } catch (e) {
+      return { status: r.status, body: r.body, steps: steps, toolCalls: toolCalls }
+    }
+    if (d.kind !== "execute") {
+      const done = try annotate(r.body, steps, toolCalls)
+      return { status: r.status, body: done, steps: steps, toolCalls: toolCalls }
+    }
+    const results: string[] = []
+    if (cfg.parallel) {
+      const pending: Promise<string>[] = []
+      for (const c of d.calls) pending.push(runOne(c, exec))
+      for (const m of try await Promise.all(pending)) results.push(m)
+    } else {
+      for (const c of d.calls) results.push(try await runOne(c, exec))
+    }
+    body = try nextRequest(body, try assistantMessage(r.body), results)
+    toolCalls += d.calls.length
+  }
+}
+
+test("tool calls and the assistant message of a completion", () => {
+  const msgJson = '{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs-read","arguments":"{\\"path\\":\\"a.txt\\"}"}},{"id":"call_2","type":"function","function":{"name":"fs-list","arguments":{"dir":"/"}}}]}'
+  const completion = '{"id":"c1","choices":[{"index":0,"message":' + msgJson + ',"finish_reason":"tool_calls"}],"usage":{"total_tokens":3}}'
+  const calls = try toolCallsOf(completion)
+  expect(calls.length).toBe(2)
+  expect(calls[0]).toEqual({ id: "call_1", name: "fs-read", argumentsJson: '{"path":"a.txt"}' })
+  expect(calls[1]).toEqual({ id: "call_2", name: "fs-list", argumentsJson: '{"dir":"/"}' })
+  expect(try assistantMessage(completion)).toBe(msgJson)
+
+  const plain = '{"choices":[{"message":{"role":"assistant","content":"Paris"}}]}'
+  expect(try toolCallsOf(plain)).toEqual([])
+  expect(try toolCallsOf('{"choices":[]}')).toEqual([])
+  expect(try toolCallsOf('{"choices":[{"message":{"tool_calls":null}}]}')).toEqual([])
+  let threw = false
+  try {
+    toolCallsOf("not json")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    assistantMessage('{"choices":[]}')
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("allowed: MCP tools only, by list or by star", () => {
+  const mcp = ["fs-read", "fs-list"]
+  const none: AgentConfig = { max_depth: 10, auto_execute: [], parallel: true }
+  const one: AgentConfig = { max_depth: 10, auto_execute: ["fs-read"], parallel: true }
+  const star: AgentConfig = { max_depth: 10, auto_execute: ["*"], parallel: true }
+  expect(allowed("fs-read", none, mcp)).toBe(false)
+  expect(allowed("fs-read", one, mcp)).toBe(true)
+  expect(allowed("fs-list", one, mcp)).toBe(false)
+  expect(allowed("fs-list", star, mcp)).toBe(true)
+  // a function the caller defined is never run here, even under "*"
+  expect(allowed("get_weather", star, mcp)).toBe(false)
+  expect(allowed("get_weather", one, mcp)).toBe(false)
+  expect(defaultAgentConfig().max_depth).toBe(10)
+})
+
+test("nextRequest appends messages and keeps other fields raw", () => {
+  const body = '{"model":"gpt-4o","temperature":0.2,"tools":[{"type":"function"}],"messages":[{"role":"user","content":"caf\\u00e9"}],"stream":false}'
+  const asst = '{"role":"assistant","content":null,"tool_calls":[]}'
+  const t1 = toolMessage("call_1", "one")
+  const t2 = toolMessage("call_2", "Error: two")
+  const out = try nextRequest(body, asst, [t1, t2])
+  expect(out).toBe(`{"model":"gpt-4o","temperature":0.2,"tools":[{"type":"function"}],"messages":[{"role":"user","content":"caf\\u00e9"},${asst},${t1},${t2}],"stream":false}`)
+
+  const noMsgs = try nextRequest('{"model":"m"}', asst, [t1])
+  expect(noMsgs).toBe(`{"model":"m","messages":[${asst},${t1}]}`)
+
+  let threw = false
+  try {
+    nextRequest(body, "[1", [])
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("decide: done, execute, not-allowed stop and depth stop", () => {
+  const msgJson = '{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs-read","arguments":"{}"}}]}'
+  const withCall = '{"choices":[{"message":' + msgJson + '}]}'
+  const final = '{"choices":[{"message":{"role":"assistant","content":"done"}}]}'
+  const mcp = ["fs-read"]
+  const cfg: AgentConfig = { max_depth: 2, auto_execute: ["*"], parallel: true }
+
+  expect(try decide(final, cfg, mcp, 0)).toEqual({ kind: "done" })
+  const ex = try decide(withCall, cfg, mcp, 1)
+  expect(ex.kind).toBe("execute")
+  if (ex.kind === "execute") expect(ex.calls).toEqual([{ id: "call_1", name: "fs-read", argumentsJson: "{}" }])
+
+  const notAllowed = try decide(withCall, { max_depth: 2, auto_execute: ["other"], parallel: true }, mcp, 0)
+  expect(notAllowed.kind).toBe("stop")
+  if (notAllowed.kind === "stop") {
+    expect(notAllowed.completion).toBe(withCall)
+    expect(notAllowed.reason.indexOf("fs-read") >= 0).toBe(true)
+  }
+
+  const depth = try decide(withCall, cfg, mcp, 2)
+  expect(depth.kind).toBe("stop")
+  if (depth.kind === "stop") expect(depth.completion).toBe(withCall)
+  // a final answer at the limit is still final
+  expect(try decide(final, cfg, mcp, 2)).toEqual({ kind: "done" })
+})
+
+test("annotate adds the agent counts", () => {
+  const out = try annotate('{"id":"c","choices":[]}', 2, 1)
+  expect(out).toBe('{"id":"c","choices":[],"agent":{"steps":2,"tool_calls":1}}')
+  expect(rawStr(try fields(out), "id")).toBe("c")
+})

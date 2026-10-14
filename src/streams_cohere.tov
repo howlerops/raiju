@@ -1,0 +1,406 @@
+// Cohere v2 chat streams: converts the events of POST /v2/chat with
+// "stream": true into OpenAI chat.completion.chunk events, as they arrive.
+// The shape matches AnthropicToOpenAI in streams.tov.
+import { Field, fields, find, quote, rawStr, rawNum } from "./json"
+import { newId, nowSeconds, ChatRequest } from "./schemas"
+import { SseSplitter } from "./streams"
+import { Target } from "./providers/types"
+import { chatRequest, streamRequest } from "./providers/cohere"
+
+const DONE = "data: [DONE]\n\n"
+
+// Writes OpenAI chat.completion.chunk events for one response. Copied from
+// streams.tov, where the writer is private.
+class ChunkWriter {
+  id: string
+  created: int
+
+  constructor(readonly model: string) {
+    this.id = newId("chatcmpl-")
+    this.created = nowSeconds()
+  }
+
+  private chunk(delta: string, finish: string): string {
+    return `data: {"id":${quote(this.id)},"object":"chat.completion.chunk","created":${this.created},"model":${quote(this.model)},"choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+  }
+
+  role(): string {
+    return this.chunk(`{"role":"assistant","content":""}`, "null")
+  }
+
+  text(s: string): string {
+    return this.chunk(`{"content":${quote(s)}}`, "null")
+  }
+
+  toolCall(index: int, id: string, name: string, args: string): string {
+    return this.chunk(`{"tool_calls":[{"index":${index},"id":${quote(id)},"type":"function","function":{"name":${quote(name)},"arguments":${quote(args)}}}]}`, "null")
+  }
+
+  toolArgs(index: int, args: string): string {
+    return this.chunk(`{"tool_calls":[{"index":${index},"function":{"arguments":${quote(args)}}}]}`, "null")
+  }
+
+  finishChunk(reason: string): string {
+    return this.chunk("{}", quote(reason))
+  }
+
+  usage(prompt: int, completion: int): string {
+    return `data: {"id":${quote(this.id)},"object":"chat.completion.chunk","created":${this.created},"model":${quote(this.model)},"choices":[],"usage":{"prompt_tokens":${prompt},"completion_tokens":${completion},"total_tokens":${prompt + completion}}}\n\n`
+  }
+
+  error(message: string, type: string): string {
+    return `data: {"error":{"message":${quote(message)},"type":${quote(type)},"code":null}}\n\n`
+  }
+}
+
+// Fields of a raw object value; absent or null reads as no fields.
+function objFields(raw: string | undefined): Field[] throws SyntaxError {
+  if (raw === undefined || raw === "null") return []
+  return try fields(raw)
+}
+
+// A numeric field as an int; absent reads as 0.
+function count(fs: Field[], key: string): int {
+  const n = rawNum(fs, key)
+  return n === undefined ? 0 : Math.trunc(n)
+}
+
+// The first of two counts that is present: tokens, else billed_units.
+function pick(a: Field[], b: Field[], key: string): int {
+  const n = rawNum(a, key)
+  if (n !== undefined) return Math.trunc(n)
+  return count(b, key)
+}
+
+// Finish reason of a message-end event. ERROR ends as a normal stop.
+function mapFinish(r: string | undefined): string {
+  if (r === "MAX_TOKENS") return "length"
+  if (r === "TOOL_CALL") return "tool_calls"
+  return "stop"
+}
+
+// Converts Cohere v2 stream events into chunks. Each tool-call-start opens tool
+// call n, counting tool calls from 0. The stream closes with message-end, and
+// token counts come only from that event.
+export class CohereToOpenAI {
+  private split = new SseSplitter()
+  private w: ChunkWriter
+  private begun = false          // the role chunk has gone out
+  done = false
+  private curTool = -1           // tool call index of the open tool call
+  private nextTool = 0
+  inTokens: int = 0
+  outTokens: int = 0
+
+  constructor(readonly requestedModel: string, readonly includeUsage: bool) {
+    this.w = new ChunkWriter(requestedModel)
+  }
+
+  push(text: string): string {
+    let out = ""
+    for (const ev of this.split.push(text)) out += this.event(ev.event, ev.data)
+    return out
+  }
+
+  // Ends the stream. A stream that stops before message-end is an error.
+  end(): string {
+    let out = ""
+    for (const ev of this.split.flush()) out += this.event(ev.event, ev.data)
+    if (!this.done) out += this.fail("upstream stream ended before message-end", "api_error")
+    return out
+  }
+
+  private event(name: string, data: string): string {
+    if (this.done) return ""
+    try {
+      return try this.handle(name, data)
+    } catch (e) {
+      return this.fail("malformed stream event from upstream", "api_error")
+    }
+  }
+
+  private handle(name: string, data: string): string throws SyntaxError {
+    const fs = try fields(data)
+    const type = rawStr(fs, "type") ?? name
+    if (type === "message-start") {
+      const id = rawStr(fs, "id")
+      if (id !== undefined && id !== "") this.w.id = id
+      return this.begin()
+    }
+    // every other event carries delta.message
+    const d = try objFields(find(fs, "delta"))
+    const m = try objFields(find(d, "message"))
+    if (type === "content-start") {
+      this.curTool = -1
+      const c = try objFields(find(m, "content"))
+      const text = rawStr(c, "text") ?? ""
+      return this.begin() + (text === "" ? "" : this.w.text(text))
+    }
+    if (type === "content-delta") {
+      const c = try objFields(find(m, "content"))
+      const text = rawStr(c, "text") ?? ""
+      return this.begin() + (text === "" ? "" : this.w.text(text))
+    }
+    if (type === "tool-call-start") {
+      const tc = try objFields(find(m, "tool_calls"))
+      const fn = try objFields(find(tc, "function"))
+      this.curTool = this.nextTool
+      this.nextTool += 1
+      return this.begin() + this.w.toolCall(this.curTool, rawStr(tc, "id") ?? "", rawStr(fn, "name") ?? "", rawStr(fn, "arguments") ?? "")
+    }
+    if (type === "tool-call-delta") {
+      if (this.curTool < 0) return ""
+      const tc = try objFields(find(m, "tool_calls"))
+      const fn = try objFields(find(tc, "function"))
+      const args = rawStr(fn, "arguments") ?? ""
+      return this.begin() + (args === "" ? "" : this.w.toolArgs(this.curTool, args))
+    }
+    if (type === "tool-call-end") {
+      this.curTool = -1
+      return ""
+    }
+    if (type === "message-end") {
+      const u = try objFields(find(d, "usage"))
+      const tk = try objFields(find(u, "tokens"))
+      const bu = try objFields(find(u, "billed_units"))
+      this.inTokens = pick(tk, bu, "input_tokens")
+      this.outTokens = pick(tk, bu, "output_tokens")
+      let out = this.begin() + this.w.finishChunk(mapFinish(rawStr(d, "finish_reason")))
+      if (this.includeUsage) out += this.w.usage(this.inTokens, this.outTokens)
+      this.done = true
+      return out + DONE
+    }
+    // content-end, tool-plan-delta and unknown events have no OpenAI counterpart.
+    // The tool plan is left out, as chatResponse leaves it out of full answers.
+    return ""
+  }
+
+  private begin(): string {
+    if (this.begun) return ""
+    this.begun = true
+    return this.w.role()
+  }
+
+  private fail(message: string, type: string): string {
+    this.done = true
+    return this.w.error(message, type) + DONE
+  }
+}
+
+// ---- tests ----
+
+// A Cohere stream with text, then two tool calls, then message-end.
+const COHERE_TOOLS = `event: message-start
+data: {"type":"message-start","id":"c_01","delta":{"message":{"role":"assistant"}}}
+
+event: content-start
+data: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}
+
+event: content-delta
+data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"Checking"}}}}
+
+event: content-delta
+data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"."}}}}
+
+event: content-end
+data: {"type":"content-end","index":0}
+
+event: tool-plan-delta
+data: {"type":"tool-plan-delta","delta":{"message":{"tool_plan":"I will look twice."}}}
+
+event: tool-call-start
+data: {"type":"tool-call-start","index":1,"delta":{"message":{"tool_calls":{"id":"tc_a","type":"function","function":{"name":"look","arguments":""}}}}}
+
+event: tool-call-delta
+data: {"type":"tool-call-delta","index":1,"delta":{"message":{"tool_calls":{"function":{"arguments":"{\\"q\\":"}}}}}
+
+event: tool-call-delta
+data: {"type":"tool-call-delta","index":1,"delta":{"message":{"tool_calls":{"function":{"arguments":"1}"}}}}}
+
+event: tool-call-end
+data: {"type":"tool-call-end","index":1}
+
+event: tool-call-start
+data: {"type":"tool-call-start","index":2,"delta":{"message":{"tool_calls":{"id":"tc_b","type":"function","function":{"name":"look","arguments":""}}}}}
+
+event: tool-call-delta
+data: {"type":"tool-call-delta","index":2,"delta":{"message":{"tool_calls":{"function":{"arguments":"{\\"q\\":2}"}}}}}
+
+event: tool-call-end
+data: {"type":"tool-call-end","index":2}
+
+event: message-end
+data: {"type":"message-end","delta":{"finish_reason":"TOOL_CALL","usage":{"billed_units":{"input_tokens":11,"output_tokens":9},"tokens":{"input_tokens":20,"output_tokens":9}}}}
+
+`
+
+// Plain text ending at the token limit; usage comes from billed_units only.
+const COHERE_TEXT = `event: message-start
+data: {"type":"message-start","id":"c_02","delta":{"message":{"role":"assistant"}}}
+
+event: content-start
+data: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}
+
+event: content-delta
+data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"Hello "}}}}
+
+event: content-delta
+data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"there"}}}}
+
+event: content-end
+data: {"type":"content-end","index":0}
+
+event: message-end
+data: {"type":"message-end","delta":{"finish_reason":"MAX_TOKENS","usage":{"billed_units":{"input_tokens":4,"output_tokens":2}}}}
+
+`
+
+// Feeds text in pieces of n bytes (ASCII in tests), returning all the output.
+function piecesOf(text: string, n: int, push: (t: string) => string): string {
+  let out = ""
+  for (let i = 0; i < text.byteLength; i += n) out += push(text.slice(i, i + n))
+  return out
+}
+
+// The data of each chunk event in an output, parsed. [DONE] and errors are left out.
+type TestChunk = {
+  id: string,
+  object: string,
+  created: int,
+  model: string,
+  choices: {
+    index: int,
+    delta: {
+      role?: string,
+      content?: string,
+      tool_calls?: { index: int, id?: string, type?: string, function: { name?: string, arguments?: string } }[]
+    },
+    finish_reason?: string
+  }[],
+  usage?: { prompt_tokens: int, completion_tokens: int, total_tokens: int },
+}
+
+function chunksOf(out: string): TestChunk[] throws SyntaxError {
+  const res: TestChunk[] = []
+  for (const ev of out.split("\n\n")) {
+    if (ev.startsWith("data: {") && ev.indexOf(`"choices"`) >= 0) res.push(try JSON.parse(ev.slice(6)) as TestChunk)
+  }
+  return res
+}
+
+test("Cohere tool stream in 7-byte pieces numbers tool calls and counts tokens", () => {
+  const conv = new CohereToOpenAI("req-model", true)
+  let out = piecesOf(COHERE_TOOLS, 7, (t) => conv.push(t))
+  out += conv.end()
+  const chunks = try chunksOf(out)
+  // role, two text pieces, tool a start and two argument pieces, tool b start and args, finish, usage
+  expect(chunks.length).toBe(10)
+  expect(chunks[0]!.choices[0]!.delta.role).toBe("assistant")
+  expect(chunks[1]!.choices[0]!.delta.content).toBe("Checking")
+  expect(chunks[2]!.choices[0]!.delta.content).toBe(".")
+  const a = chunks[3]!.choices[0]!.delta.tool_calls![0]!
+  expect(a.index).toBe(0)
+  expect(a.id).toBe("tc_a")
+  expect(a.type).toBe("function")
+  expect(a.function.name).toBe("look")
+  expect(chunks[4]!.choices[0]!.delta.tool_calls![0]!.index).toBe(0)
+  expect(chunks[5]!.choices[0]!.delta.tool_calls![0]!.index).toBe(0)
+  const b = chunks[6]!.choices[0]!.delta.tool_calls![0]!
+  expect(b.index).toBe(1)
+  expect(b.id).toBe("tc_b")
+  expect(chunks[7]!.choices[0]!.delta.tool_calls![0]!.index).toBe(1)
+  expect(chunks[8]!.choices[0]!.finish_reason).toBe("tool_calls")
+  // the arguments of each call join into its JSON
+  let argsA = ""
+  let argsB = ""
+  for (const c of chunks) {
+    // the usage chunk has no choices
+    if (c.choices.length === 0) continue
+    const tc = c.choices[0]!.delta.tool_calls
+    if (tc === undefined) continue
+    if (tc[0]!.index === 0) argsA += tc[0]!.function.arguments ?? ""
+    if (tc[0]!.index === 1) argsB += tc[0]!.function.arguments ?? ""
+  }
+  expect(argsA).toBe(`{"q":1}`)
+  expect(argsB).toBe(`{"q":2}`)
+  // tokens come from tokens, not billed_units
+  expect(chunks[9]!.usage!.prompt_tokens).toBe(20)
+  expect(chunks[9]!.usage!.completion_tokens).toBe(9)
+  expect(chunks[9]!.usage!.total_tokens).toBe(29)
+  expect(conv.inTokens).toBe(20)
+  expect(conv.outTokens).toBe(9)
+  expect(conv.done).toBe(true)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("Cohere stream in 3-byte pieces with CRLF line ends, and text one byte at a time", () => {
+  const crlf = COHERE_TOOLS.split("\n").join("\r\n")
+  const conv = new CohereToOpenAI("req-model", false)
+  let out = piecesOf(crlf, 3, (t) => conv.push(t))
+  out += conv.end()
+  const chunks = try chunksOf(out)
+  // no usage chunk, so the finish chunk is the last one
+  expect(chunks.length).toBe(9)
+  expect(chunks[1]!.choices[0]!.delta.content).toBe("Checking")
+  expect(chunks[8]!.choices[0]!.finish_reason).toBe("tool_calls")
+  expect(out.includes(`"usage"`)).toBe(false)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+  // one byte at a time gives the same text
+  const slow = new CohereToOpenAI("req-model", false)
+  let out2 = piecesOf(COHERE_TEXT, 1, (t) => slow.push(t))
+  out2 += slow.end()
+  expect(out2.includes(`"content":"Hello "`)).toBe(true)
+  expect(out2.includes(`"content":"there"`)).toBe(true)
+})
+
+test("Cohere text stream maps MAX_TOKENS and falls back to billed_units", () => {
+  const conv = new CohereToOpenAI("req-model", true)
+  let out = piecesOf(COHERE_TEXT, 11, (t) => conv.push(t))
+  out += conv.end()
+  const chunks = try chunksOf(out)
+  expect(chunks.length).toBe(5)
+  expect(chunks[1]!.choices[0]!.delta.content).toBe("Hello ")
+  expect(chunks[2]!.choices[0]!.delta.content).toBe("there")
+  expect(chunks[3]!.choices[0]!.finish_reason).toBe("length")
+  expect(chunks[4]!.usage!.prompt_tokens).toBe(4)
+  expect(chunks[4]!.usage!.completion_tokens).toBe(2)
+  expect(conv.outTokens).toBe(2)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+  // a message-end with nothing after it adds nothing
+  expect(conv.push("event: message-end\ndata: {\"type\":\"message-end\"}\n\n")).toBe("")
+})
+
+test("Cohere finish reasons COMPLETE, STOP_SEQUENCE and ERROR map to stop", () => {
+  for (const r of ["COMPLETE", "STOP_SEQUENCE", "ERROR"]) {
+    const conv = new CohereToOpenAI("m", false)
+    const out = conv.push(`data: {"type":"message-start","id":"c","delta":{"message":{"role":"assistant"}}}\n\ndata: {"type":"message-end","delta":{"finish_reason":"${r}"}}\n\n`)
+    expect(out.includes(`"finish_reason":"stop"`)).toBe(true)
+    expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+  }
+})
+
+test("Cohere stream that ends before message-end is an error", () => {
+  const conv = new CohereToOpenAI("m", false)
+  const out = conv.push(`data: {"type":"message-start","id":"c","delta":{"message":{"role":"assistant"}}}\n\n`) + conv.end()
+  expect(out.includes(`"type":"api_error"`)).toBe(true)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+  expect(conv.done).toBe(true)
+})
+
+test("Cohere tool-call-delta before any tool-call-start is ignored", () => {
+  const conv = new CohereToOpenAI("m", false)
+  const out = conv.push(`data: {"type":"tool-call-delta","delta":{"message":{"tool_calls":{"function":{"arguments":"{}"}}}}}\n\n`)
+  expect(out.includes(`"tool_calls"`)).toBe(false)
+})
+
+test("Cohere request streams with stream true and the same body otherwise", () => {
+  const t: Target = { provider: "cohere", kind: "cohere", model: "command-a-03-2025", key: { value: "ck" }, cfg: {} }
+  const raw = `{"model":"cohere/command-a","messages":[{"role":"user","content":"hi"}],"max_tokens":9}`
+  const req = try JSON.parse(raw) as ChatRequest
+  const up = try streamRequest(t, req, try fields(raw))
+  const plain = try chatRequest(t, req, try fields(raw))
+  expect(up.url).toBe("https://api.cohere.com/v2/chat")
+  expect(up.body).toBe(plain.body.slice(0, plain.body.byteLength - 1) + `,"stream":true}`)
+  expect(up.headers.get("authorization")).toBe("Bearer ck")
+  expect(plain.body.includes(`"stream"`)).toBe(false)
+})

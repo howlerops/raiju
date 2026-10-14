@@ -1,0 +1,270 @@
+// Management-side state shared by both servers: who may use /api (RBAC), the
+// audit log of changes, the alerting loop, the gateway's own MCP server and
+// cluster counters. One instance per process; rebuilt parts follow config changes.
+import { Config, AlertsConfig, providerNames } from "./config"
+import { Engine } from "./gateway"
+import { ConfigStore, checkAdmin } from "./store"
+import { RbacConfig, UserConfig, authorize, handleUsers, fromLegacy } from "./rbac"
+import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
+import { AlertEngine, SampleRing } from "./alerts"
+import * as alerts from "./alerts"
+import { ExposedTool, SessionStore, handleMcp } from "./mcpserver"
+import { resolveAll } from "./secrets"
+import { fields, find, rawStr, isNull } from "./json"
+import { snapshot, errorJson } from "./schemas"
+import { deadline } from "./deadline"
+
+export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
+
+export type Reply = { status: int, body: string, contentType: string }
+
+function json(status: int, body: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  return new Response(body, { status: status, headers: h })
+}
+
+function denied(status: int, message: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  if (status === 401) h.set("www-authenticate", `Bearer realm="raiju", Basic realm="raiju"`)
+  return new Response(errorJson(message, status === 401 ? "authentication_error" : "permission_error", undefined), { status: status, headers: h })
+}
+
+function num(params: URLSearchParams, name: string): f64 | undefined {
+  const v = params.get(name)
+  if (v === undefined || v === "") return undefined
+  return parseFloat(v)
+}
+
+// The tools of a chat tool definition list, as MCP tools.
+function exposedTools(defs: string[]): ExposedTool[] {
+  const out: ExposedTool[] = []
+  for (const d of defs) {
+    try {
+      const fnRaw = find(fields(d), "function")
+      if (fnRaw === undefined) continue
+      const f = fields(fnRaw)
+      const params = find(f, "parameters")
+      out.push({ name: rawStr(f, "name") ?? "", description: rawStr(f, "description") ?? "", inputSchemaRaw: params === undefined || isNull(params) ? `{"type":"object"}` : params })
+    } catch (e) {
+      continue
+    }
+  }
+  return out
+}
+
+// Secret references (vault.<path>#<field>, aws-sm.<id>) in a resolved config,
+// fetched and substituted. Without any, the config comes back untouched.
+export async function withSecrets(c: Config): Promise<Config> {
+  const text = JSON.stringify(c)
+  if (!text.includes("\"vault.") && !text.includes("\"aws-sm.")) return c
+  const r = await resolveAll(text, c.secrets ?? {})
+  for (const e of r.errors) console.error(`raiju: secret ${e}`)
+  try {
+    let out = JSON.parse(r.json) as Config
+    out.plugins = c.plugins
+    return out
+  } catch (e) {
+    console.error(`raiju: config after secret resolution: ${e.message}`)
+    return c
+  }
+}
+
+export class Ops {
+  rbac: RbacConfig = { users: [] }
+  authOn = false
+  audit: AuditLog | undefined = undefined
+  alerts: AlertEngine | undefined = undefined
+  alertsKey = ""
+  alertTimer: int = -1
+  mcpSessions = new SessionStore(1800000.0)
+
+  constructor(readonly engine: Engine, readonly store: ConfigStore) {
+    this.configure(engine.cfg)
+  }
+
+  // Applies the parts of a (resolved) config that live here.
+  configure(cfg: Config): void {
+    const gov = cfg.governance
+    const users: UserConfig[] = gov?.users ?? []
+    const auth = gov?.auth_config
+    let legacy: UserConfig[] = []
+    try {
+      legacy = fromLegacy(auth).users
+    } catch (e) {
+      console.error(`raiju: admin credentials: ${e.message}`)
+    }
+    this.rbac = { users: users.concat(legacy) }
+    // auth_config with only part of a credential still locks the API, as before
+    this.authOn = this.rbac.users.length > 0 || !checkAdmin(auth, new Map())
+    const ac = cfg.audit
+    if (this.audit === undefined && ac !== undefined && ac.enabled === true) {
+      try {
+        this.audit = new AuditLog(ac.dir ?? "logs/audit", ac.key ?? "", ac.max_memory ?? 10000)
+      } catch (e) {
+        console.error(`raiju: audit log disabled: ${e.message}`)
+      }
+    }
+    this.configureAlerts(cfg.alerts)
+  }
+
+  configureAlerts(al: AlertsConfig | undefined): void {
+    const on = al !== undefined && al.enabled !== false && (al.rules ?? []).length > 0
+    // a changed rule set starts over; an unchanged one keeps its state
+    const key = on ? JSON.stringify(al) : ""
+    if (key === this.alertsKey) return
+    this.alertsKey = key
+    if (this.alertTimer >= 0) {
+      clearInterval(this.alertTimer)
+      this.alertTimer = -1
+    }
+    if (!on || al === undefined) {
+      this.alerts = undefined
+      this.engine.samples = undefined
+      return
+    }
+    const eng = new AlertEngine(al.rules ?? [], al.channels ?? [])
+    this.alerts = eng
+    if (this.engine.samples === undefined) this.engine.samples = new SampleRing(50000)
+    const secs = Math.max(1, al.interval_seconds ?? 30)
+    this.alertTimer = setInterval(() => {
+      this.tick(eng)
+    }, secs * 1000)
+  }
+
+  tick(eng: AlertEngine): void {
+    const ring = this.engine.samples
+    if (ring === undefined) return
+    const now = Date.now()
+    let longest = 300
+    for (const r of eng.rules) longest = Math.max(longest, r.window_seconds ?? 300)
+    const open: string[] = []
+    for (const t of this.engine.health.snapshot(now)) {
+      if (t.state === "open") open.push(t.id)
+    }
+    const notes = eng.evaluate({ samples: ring.since(now - longest * 1000.0), budgets: this.engine.gov.budgetUsage(), openBreakers: open }, now)
+    for (const n of notes) {
+      const r = alerts.request(n)
+      sendAlert(r.url, r.headers, r.body, n.ruleId)
+    }
+  }
+
+  // Whether the caller may use this /api route; the actor names them in the audit log.
+  gate(req: Request, path: string): Gate {
+    if (!this.authOn) return { kind: "ok", actor: "anonymous" }
+    const v = authorize(this.rbac, snapshot(req.headers), req.method, path)
+    if (v.kind === "ok") return { kind: "ok", actor: v.actor }
+    this.recordChange("unauthenticated", req, path, v.status, "")
+    return { kind: "deny", res: denied(v.status, v.message) }
+  }
+
+  // The gate for read-only routes: undefined when allowed.
+  check(req: Request, path: string): Response | undefined {
+    const g = this.gate(req, path)
+    return g.kind === "deny" ? g.res : undefined
+  }
+
+  recordChange(actor: string, req: Request, path: string, status: int, body: string): void {
+    const log = this.audit
+    const m = req.method
+    if (log === undefined || m === "GET" || m === "HEAD" || m === "OPTIONS") return
+    const q = path.indexOf("?")
+    const a = actionFor(m, q < 0 ? path : path.slice(0, q))
+    const ip = req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip") ?? undefined
+    const detail = maskDetail(body)
+    try {
+      log.record(actor, a.action, a.target, m, path, status, ip, detail === "" ? undefined : detail, Date.now())
+    } catch (e) {
+      console.error(`raiju: audit write failed: ${e.message}`)
+    }
+  }
+
+  // /api/users*: the reply, after saving any change through the config store.
+  users(method: string, path: string, body: string): Reply {
+    // only stored users are managed here; legacy auth_config credentials stay in the config
+    const stored: UserConfig[] = this.store.cfg.governance?.users ?? []
+    const r = handleUsers({ users: stored }, method, path, body)
+    if (method !== "GET" && r.status < 300) {
+      const saved = this.store.setUsers(r.cfg.users)
+      if (saved.kind === "error") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
+    }
+    return { status: r.status, body: r.body, contentType: "application/json" }
+  }
+
+  // GET /api/audit-logs, /api/audit-logs/export (JSONL), /api/audit-logs/verify
+  auditRoute(req: Request, path: string): Reply {
+    const log = this.audit
+    if (log === undefined) return { status: 404, body: errorJson("the audit log is off; set audit.enabled in the config", "invalid_request_error", undefined), contentType: "application/json" }
+    if (req.method !== "GET") return { status: 405, body: errorJson(`method ${req.method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+    const u = URL.parse(req.url)
+    const params = u === undefined ? new URLSearchParams("") : u.searchParams
+    const p = path.indexOf("?") < 0 ? path : path.slice(0, path.indexOf("?"))
+    try {
+      if (p === "/api/audit-logs/verify") return { status: 200, body: JSON.stringify(log.verify()), contentType: "application/json" }
+      if (p === "/api/audit-logs/export") return { status: 200, body: log.exportJsonl(num(params, "since"), num(params, "until")), contentType: "application/x-ndjson" }
+    } catch (e) {
+      return { status: 500, body: errorJson(e.message, "api_error", undefined), contentType: "application/json" }
+    }
+    if (p !== "/api/audit-logs") return { status: 404, body: errorJson(`no route for ${p}`, "invalid_request_error", undefined), contentType: "application/json" }
+    const q: AuditQuery = {}
+    const actor = params.get("actor")
+    if (actor !== undefined && actor !== "") q.actor = actor
+    const action = params.get("action")
+    if (action !== undefined && action !== "") q.action = action
+    q.since = num(params, "since")
+    q.until = num(params, "until")
+    const limit = params.get("limit")
+    if (limit !== undefined) q.limit = parseInt(limit)
+    const offset = params.get("offset")
+    if (offset !== undefined) q.offset = parseInt(offset)
+    return { status: 200, body: JSON.stringify(log.query(q)), contentType: "application/json" }
+  }
+
+  // GET /api/alerts: rule states and recent transitions.
+  alertsView(): Reply {
+    const a = this.alerts
+    if (a === undefined) return { status: 200, body: `{"enabled":false,"rules":[],"history":[]}`, contentType: "application/json" }
+    return { status: 200, body: JSON.stringify({ enabled: true, rules: a.states(), history: a.history() }), contentType: "application/json" }
+  }
+
+  // POST /mcp: the connected MCP servers' tools, served to MCP clients.
+  async mcp(req: Request): Promise<Response> {
+    const m = this.engine.mcp
+    if (m === undefined || this.engine.cfg.mcp_server?.enabled === false) return json(404, errorJson("no MCP servers are connected", "invalid_request_error", undefined))
+    const h = snapshot(req.headers)
+    if (this.engine.gov.enforce && this.engine.gov.findKey(h) === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)")
+    if (req.method === "DELETE") {
+      const sid = h.get("mcp-session-id")
+      if (sid !== undefined) this.mcpSessions.delete(sid)
+      return new Response(undefined, { status: 204 })
+    }
+    if (req.method !== "POST") return json(405, errorJson("use POST for MCP requests", "invalid_request_error", undefined))
+    const body = await req.text()
+    const now = Date.now()
+    this.mcpSessions.expire(now)
+    const run = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
+      const r = try await m.execute(name, args)
+      return { text: r.text, isError: r.isError }
+    }
+    const r = await handleMcp(body, h.get("mcp-session-id"), exposedTools(m.allTools()), run, this.mcpSessions, now)
+    const out: Record<string, string> = new Map()
+    out.set("content-type", r.contentType)
+    const sid = r.sessionId
+    if (sid !== undefined) out.set("mcp-session-id", sid)
+    return new Response(r.status === 202 ? undefined : r.body, { status: r.status, headers: out })
+  }
+}
+
+async function sendAlert(url: string, headers: Map<string, string>, body: string, rule: string): Promise<void> {
+  const dl = deadline(10000)
+  try {
+    const hs: Record<string, string> = headers
+    const res = await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+    if (res.status < 200 || res.status >= 300) console.error(`raiju: alert ${rule}: webhook answered HTTP ${res.status}`)
+    await res.text()
+  } catch (e) {
+    console.error(`raiju: alert ${rule}: ${e.message}`)
+  }
+  dl.finish()
+}

@@ -1,9 +1,15 @@
 // The request engine: governance, cache, the attempt loop (retries, key
 // rotation, fallbacks), translation, accounting.
-import { Config, ProviderConfig, providerOf } from "./config"
+import { Config, ProviderConfig, ComplexitySettings, providerOf } from "./config"
 import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, snapshot } from "./schemas"
 import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI } from "./streams"
+import { CohereToOpenAI } from "./streams_cohere"
+import { AffinityStore, resolveSticky, sessionId, sessionTtl, affinityMode } from "./affinity"
+import { Tier, tierTarget, overrideTier } from "./complexity"
+import * as cplx from "./complexity"
+import { AgentConfig, runAgent } from "./agent"
+import { SampleRing } from "./alerts"
 import { Target, Upstream, Translated } from "./providers/types"
 import { ModelRef, parseModel, target, classify, backoffMs, maxRetries, timeoutMs, healthId } from "./router"
 import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
@@ -14,7 +20,7 @@ import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
 import * as metrics from "./metrics"
-import { TokenCache, parseServiceAccount } from "./providers/vertex"
+import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
 import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails"
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, defaultLogStoreConfig } from "./logstore"
@@ -44,12 +50,14 @@ export class StreamConverter {
   an: AnthropicToOpenAI | undefined = undefined
   ge: GeminiToOpenAI | undefined = undefined
   br: BedrockEventStreamToOpenAI | undefined = undefined
+  co: CohereToOpenAI | undefined = undefined
   readonly dec: TextDecoder | undefined = utf8Decoder()
 
   constructor(readonly kind: string, requested: string, includeUsage: bool) {
     if (kind === "anthropic") this.an = new AnthropicToOpenAI(requested, includeUsage)
     else if (kind === "gemini") this.ge = new GeminiToOpenAI(requested, includeUsage)
     else if (kind === "bedrock") this.br = new BedrockEventStreamToOpenAI(requested, includeUsage)
+    else if (kind === "cohere") this.co = new CohereToOpenAI(requested, includeUsage)
     else this.oa = new OpenAIPassthrough(requested, !includeUsage)
   }
 
@@ -73,6 +81,8 @@ export class StreamConverter {
     if (an !== undefined) return an.push(t)
     const ge = this.ge
     if (ge !== undefined) return ge.push(t)
+    const co = this.co
+    if (co !== undefined) return co.push(t)
     const oa = this.oa
     if (oa !== undefined) return oa.push(t)
     return ""
@@ -85,18 +95,24 @@ export class StreamConverter {
     if (ge !== undefined) return ge.end()
     const br = this.br
     if (br !== undefined) return br.end()
+    const co = this.co
+    if (co !== undefined) return co.end()
     const oa = this.oa
     if (oa !== undefined) return oa.end()
     return ""
   }
 
   promptTokens(): int {
-    return this.an?.inTokens ?? this.ge?.inTokens ?? this.br?.promptTokens ?? this.oa?.promptTokens ?? 0
+    return this.an?.inTokens ?? this.ge?.inTokens ?? this.br?.promptTokens ?? this.co?.inTokens ?? this.oa?.promptTokens ?? 0
   }
 
   completionTokens(): int {
-    return this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.oa?.completionTokens ?? 0
+    return this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.co?.outTokens ?? this.oa?.completionTokens ?? 0
   }
+}
+
+class LastHeaders {
+  h: Map<string, string> = new Map()
 }
 
 export type ConverterFactory = (t: Target, requestedModel: string) => StreamConverter | undefined
@@ -226,6 +242,11 @@ export class Engine {
   cacheTtlMs = 300000
   autoPromptCache = false
   logRequests = true
+  affinity: AffinityStore | undefined = undefined
+  complexity: ComplexitySettings | undefined = undefined
+  agent: AgentConfig | undefined = undefined
+  // set by the alerting loop when alerts are on
+  samples: SampleRing | undefined = undefined
 
   constructor(public cfg: Config) {
     this.gov = new Governance(cfg)
@@ -298,6 +319,32 @@ export class Engine {
     }
     this.autoPromptCache = cfg.prompt_cache?.auto_inject ?? false
     this.logRequests = cfg.client?.enable_logging ?? true
+    const sa = cfg.session_affinity
+    if (sa !== undefined && sa.enabled === true) {
+      this.affinity = new AffinityStore({ enabled: true, ttl_ms: (sa.ttl_seconds ?? 3600) * 1000, max_sessions: sa.max_sessions ?? 100000 })
+    }
+    const cx = cfg.complexity_router
+    if (cx !== undefined && cx.enabled !== false) this.complexity = cx
+    const auto = cfg.client?.mcp_auto_execute ?? []
+    if (auto.length > 0) this.agent = { max_depth: cfg.client?.mcp_agent_depth ?? 10, auto_execute: auto, parallel: true }
+  }
+
+  // Remembers the key that served a session, so its next requests go to the same key.
+  stick(h: Hdrs, ref: ModelRef, t: Target): void {
+    const aff = this.affinity
+    if (aff === undefined || affinityMode(h) === "off") return
+    const sid = sessionId(h)
+    const kid = t.key.id ?? t.key.name
+    if (sid === undefined || kid === undefined) return
+    aff.bind(sid, ref.provider, ref.model, kid, sessionTtl(h, aff.cfg), Date.now())
+  }
+
+  tierOf(text: string, cx: ComplexitySettings): Tier {
+    try {
+      return cplx.classify(text, { simple_max_score: cx.simple_max_score ?? 3.0, complex_min_score: cx.complex_min_score ?? 8.0 }).tier
+    } catch (e) {
+      return "MEDIUM"
+    }
   }
 
   // Tries each model in order; within one, retries transient failures with
@@ -313,8 +360,16 @@ export class Engine {
       const p: ProviderConfig = providerOf(this.cfg, ref.provider) ?? {}
       const retries = maxRetries(p)
       let retry = 0
+      // session affinity: the key that served this session before, tried first
+      let soft: string | undefined = undefined
+      const aff = this.affinity
+      if (aff !== undefined && pinned === undefined) soft = resolveSticky(aff, h, ref.provider, ref.model, Date.now())?.keyId
       while (true) {
-        const sel = target(this.cfg, ref, tried, pinned, this.health)
+        const sel = target(this.cfg, ref, tried, pinned ?? soft, this.health)
+        if (sel === undefined && soft !== undefined) {
+          soft = undefined
+          continue
+        }
         if (sel === undefined) break
         let t = sel.t
         if (t.kind === "vertex") {
@@ -387,6 +442,7 @@ export class Engine {
             dl.finish()
             upstreamMs += performance.now() - started
             metrics.inc("bifrost_upstream_requests_total", metrics.labels(ref.provider, ref.model, "success"), 1.0)
+            this.stick(h, ref, t)
             return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true }
           }
           text = await res.text()
@@ -419,6 +475,7 @@ export class Engine {
         if (ok) {
           try {
             const tr = translate(t, text, requested)
+            this.stick(h, ref, t)
             return { ok: true, status: 200, body: tr.body, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs }
           } catch (e) {
             last = { ok: false, status: 502, body: errorJson(`could not read ${ref.provider}'s response: ${e.message}`, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
@@ -426,11 +483,17 @@ export class Engine {
           }
         }
         last = { ok: false, status: status === 0 ? 502 : status, body: text.startsWith("{") ? text : errorJson(text === "" ? `${ref.provider} returned HTTP ${status}` : text, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
-        const d = status === 0 ? "retry" : classify(status)
+        const d = status === 0 ? "retry" : try classify(status)
         if (d === "fail") return last
         if (d === "fallback") break
         if (d === "rotate") {
           if (sel.keyIndex < 0 || pinned !== undefined) break
+          if (soft !== undefined) {
+            // the sticky key stopped working: drop the binding and pick normally
+            soft = undefined
+            const sid = sessionId(h)
+            if (aff !== undefined && sid !== undefined) aff.forget(sid)
+          }
           tried.add(sel.keyIndex)
           continue
         }
@@ -461,6 +524,10 @@ export class Engine {
     this.autoPromptCache = fresh.autoPromptCache
     this.plugins = fresh.plugins
     this.logRequests = fresh.logRequests
+    this.complexity = fresh.complexity
+    this.agent = fresh.agent
+    if (fresh.affinity === undefined) this.affinity = undefined
+    else if (this.affinity === undefined) this.affinity = fresh.affinity
     if (this.cache === undefined) this.cache = fresh.cache
     if (this.semantic === undefined) {
       this.semantic = fresh.semantic
@@ -539,7 +606,7 @@ export class Engine {
 
   // Applies the first matching routing rule: its weighted target replaces the
   // requested model (keeping a pinned key), and its fallbacks come next.
-  route(rules: RuleSet, op: string, refs: ModelRef[], inout h: Hdrs, body: Field[]): ModelRef[] | undefined {
+  route(rules: RuleSet, op: string, refs: ModelRef[], inout h: Hdrs, body: Field[], tier: Tier | undefined): ModelRef[] | undefined {
     const first = refs[0]!
     const vk = this.gov.findKey(h)
     const params: Map<string, string> = new Map()
@@ -555,6 +622,7 @@ export class Engine {
       customer: vk?.customer_id,
       budget_used: this.gov.budgetFraction(vk),
       tokens_used: 0.0,
+      complexity_tier: tier,
       headers: h,
       params: params,
     }
@@ -581,7 +649,7 @@ export class Engine {
     const tracer = this.tracer
     if (tracer !== undefined) ctx.span = tracer.startRequest(op, h.get("traceparent"), Date.now())
     if (this.logStore !== undefined) ctx.input = text
-    const res = await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed)
+    const res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed)
     ctx.status = res.status
     this.record(ctx)
     return res
@@ -597,10 +665,23 @@ export class Engine {
     const model = modelName ?? rawStr(body, "model")
     ctx.model = model ?? ""
     if (model === undefined) return errorResponse(400, "the request needs a model, e.g. \"openai/gpt-4o-mini\"", "invalid_request_error", out)
+    // complexity tier: for routing rules (complexity_tier) and the tier map behind model "auto"
+    let tier: Tier | undefined = undefined
+    const cx = this.complexity
+    if (cx !== undefined && op === "chat") {
+      const forced = overrideTier(h)
+      const t: Tier = forced !== undefined ? forced : this.tierOf(text, cx)
+      tier = t
+      out.set("x-bf-complexity-tier", t)
+    }
     let refs = [parseModel(this.cfg, model)].concat(fallbackRefs(this.cfg, body))
+    if (cx !== undefined && tier !== undefined && model === (cx.model ?? "auto")) {
+      const tt = tierTarget(tier, cx.tiers ?? {})
+      if (tt !== undefined) refs = [parseModel(this.cfg, tt)].concat(refs.slice(1))
+    }
     const rules = this.rules
     if (rules !== undefined) {
-      const routed = this.route(rules, op, refs, &h, body)
+      const routed = this.route(rules, op, refs, &h, body, tier)
       if (routed !== undefined) {
         refs = routed
         out.set("x-bf-routing-rule", h.get("x-bf-routing-rule") ?? "")
@@ -666,7 +747,7 @@ export class Engine {
     }
 
     ctx.outHeaders = out
-    const r = await this.attempt(allowed, h, build, translate, streamed, ctx)
+    const r = try await this.attempt(allowed, h, build, translate, streamed, ctx)
     out.set("x-bf-attempts", "" + r.attempts)
     if (!r.ok) {
       ctx.error = r.body.byteLength > 2000 ? r.body.slice(0, 2000) : r.body
@@ -719,6 +800,8 @@ export class Engine {
     if (this.logRequests) {
       process.stdout.write(JSON.stringify({ ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, latency_ms: Math.round(ms), cache_hit: c.cached }) + "\n")
     }
+    const ring = this.samples
+    if (ring !== undefined) ring.push({ ts: Date.now(), provider: c.provider, model: c.model, status: c.status, latency_ms: ms, cost: c.cost })
     const store = this.logStore
     if (store !== undefined) {
       store.add({
@@ -749,7 +832,52 @@ export class Engine {
     sendSpans(up.url, up.headers, up.body)
   }
 
+  // Chat completions. With MCP agent mode on (client.mcp_auto_execute), tool calls to
+  // the listed MCP tools run here and the model is called again, up to mcp_agent_depth
+  // rounds; streamed requests and x-bf-mcp-agent: off skip it.
   async chat(req: Request, sink?: StreamSink): Promise<Response> {
+    const ag = this.agent
+    const m = this.mcp
+    if (ag === undefined || m === undefined || req.method !== "POST" || req.headers.get("x-bf-mcp-agent") === "off") return try await this.chatOnce(req, sink)
+    const text = await req.text()
+    const hs: Record<string, string> = snapshot(req.headers)
+    let streamed = false
+    try {
+      streamed = rawBool(fields(text), "stream") ?? false
+    } catch (e) {
+      streamed = false
+    }
+    if (streamed) return try await this.chatOnce(new Request(req.url, { method: "POST", headers: hs, body: text }), sink)
+    const url = req.url
+    const last = new LastHeaders()
+    const call = async (b: string): Promise<{ status: int, body: string }> => {
+      const r = try await this.chatOnce(new Request(url, { method: "POST", headers: hs, body: b }), undefined)
+      const kept: Map<string, string> = new Map()
+      r.headers.forEach((v, k) => {
+        if (k !== "content-length") kept.set(k, v)
+      })
+      last.h = kept
+      return { status: r.status, body: try await r.text() }
+    }
+    const exec = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
+      const r = try await m.execute(name, args)
+      metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", name, r.isError ? "error" : "success"), 1.0)
+      return { text: r.text, isError: r.isError }
+    }
+    try {
+      const r = await runAgent(text, call, exec, ag, m.toolNames())
+      // the last model call's headers (request id, cache, attempts), plus the agent's counts
+      const out: Record<string, string> = last.h
+      if (!out.has("content-type")) out.set("content-type", "application/json")
+      out.set("x-bf-agent-steps", "" + r.steps)
+      out.set("x-bf-agent-tool-calls", "" + r.toolCalls)
+      return new Response(r.body, { status: r.status, headers: out })
+    } catch (e) {
+      return errorResponse(502, `agent mode failed: ${e.message}`, "api_error", noHeaders())
+    }
+  }
+
+  async chatOnce(req: Request, sink?: StreamSink): Promise<Response> {
     let text = await req.text()
     let body: Field[] = []
     const guard = this.guard
@@ -851,10 +979,12 @@ export class Engine {
     // With a sink, OpenAI-format upstreams stream straight through as chunks arrive.
     const dropUsage = !wantUsage
     const mk: ConverterFactory = (t, requested) => {
-      if (!providers.streamsNatively(t.kind) && t.kind !== "anthropic" && t.kind !== "gemini" && t.kind !== "bedrock") return undefined
-      return new StreamConverter(providers.streamsNatively(t.kind) ? "openai" : t.kind, requested, !dropUsage)
+      if (!providers.streamsNatively(t.kind) && t.kind !== "anthropic" && t.kind !== "gemini" && t.kind !== "bedrock" && t.kind !== "cohere" && t.kind !== "vertex") return undefined
+      // Vertex streams Anthropic events for Claude models and Gemini chunks for the rest
+      const kind = t.kind === "vertex" ? (isClaude(t.model) ? "anthropic" : "gemini") : t.kind
+      return new StreamConverter(providers.streamsNatively(kind) ? "openai" : kind, requested, !dropUsage)
     }
-    return await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
+    return try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
   }
 
   async embeddings(req: Request): Promise<Response> {
@@ -870,7 +1000,7 @@ export class Engine {
       return try providers.embeddingsUpstream(t, body)
     }
     const translate: Translate = (t, text, requested) => try providers.embeddingsTranslate(t.kind, text, requested)
-    return await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
+    return try await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
   }
 
   async completions(req: Request): Promise<Response> {
@@ -887,7 +1017,7 @@ export class Engine {
       return openai.completionsRequest(t, body)
     }
     const translate: Translate = (t, text, requested) => stream ? openai.streamResponse(text, requested) : try openai.chatResponse(text, requested)
-    return await this.serve(req, "completions", undefined, body, text, build, translate, stream)
+    return try await this.serve(req, "completions", undefined, body, text, build, translate, stream)
   }
 }
 

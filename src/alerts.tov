@@ -1,0 +1,551 @@
+// Alert rules over recent request stats. Evaluation is pure: the caller passes a
+// snapshot and the time, and gets back the notifications to send. Each rule goes
+// ok -> pending -> firing -> ok, and a firing rule notifies once, not every time.
+// Timestamps are ms since the epoch, as in the log.
+
+export type Metric = "error_rate" | "p95_latency_ms" | "avg_latency_ms" | "requests" | "cost" | "budget_used" | "breaker_open"
+
+export type AlertRule = {
+  id: string,
+  name?: string,
+  metric: Metric,
+  op: ">" | ">=" | "<" | "<=",
+  threshold: f64,
+  window_seconds?: int, // default 300
+  filter?: { provider?: string, model?: string, budget_id?: string },
+  for_evaluations?: int, // consecutive breaching evaluations before firing; default 1
+  cooldown_seconds?: int, // after a resolve, no new firing for this long; default 900
+  channels: string[],
+  enabled?: bool,
+}
+
+export type Channel = { id: string, type: "webhook" | "slack", url: string, headers?: Map<string, string> }
+
+export type Sample = { ts: f64, provider: string, model: string, status: int, latency_ms: f64, cost: f64 }
+
+export type Snapshot = {
+  samples: Sample[],
+  budgets: { id: string, used: f64, limit: f64 }[],
+  openBreakers: string[], // health target ids, "provider#key"
+}
+
+export type Notification = { channel: Channel, ruleId: string, kind: "firing" | "resolved", body: string }
+
+export type AlertRecord = { ruleId: string, from: string, to: string, value?: f64, ts: f64 }
+
+const HISTORY_CAP = 500
+
+// The newest finished requests, for alert windows. Fed by the engine.
+export class SampleRing {
+  private items: Sample[] = []
+  private next = 0
+
+  constructor(readonly cap: int) {}
+
+  push(s: Sample): void {
+    if (this.items.length < this.cap) this.items.push(s)
+    else this.items[this.next] = s
+    this.next = (this.next + 1) % this.cap
+  }
+
+  since(ts: f64): Sample[] {
+    return this.items.filter((s) => s.ts >= ts)
+  }
+}
+
+function windowOf(rule: AlertRule): int {
+  return rule.window_seconds ?? 300
+}
+
+// Samples inside the rule's window that match its provider and model filter.
+// Samples dated after nowMs are left out.
+function inWindow(snap: Snapshot, rule: AlertRule, nowMs: f64): Sample[] {
+  const since = nowMs - windowOf(rule) * 1000.0
+  const f = rule.filter
+  const out: Sample[] = []
+  for (const s of snap.samples) {
+    if (s.ts < since || s.ts > nowMs) continue
+    if (f !== undefined && f.provider !== undefined && s.provider !== f.provider) continue
+    if (f !== undefined && f.model !== undefined && s.model !== f.model) continue
+    out.push(s)
+  }
+  return out
+}
+
+// The value a rule is judged on, or undefined when the window has no data for it.
+// requests and cost are sums, so an empty window gives 0; error_rate and latency
+// need at least one request.
+export function measure(rule: AlertRule, snap: Snapshot, nowMs: f64): f64 | undefined {
+  const f = rule.filter
+  if (rule.metric === "breaker_open") {
+    let n = 0
+    for (const id of snap.openBreakers) {
+      if (f === undefined || f.provider === undefined || id.startsWith(f.provider + "#")) n += 1
+    }
+    return n
+  }
+  if (rule.metric === "budget_used") {
+    if (f === undefined || f.budget_id === undefined) return undefined
+    for (const b of snap.budgets) {
+      if (b.id === f.budget_id) return b.limit > 0.0 ? b.used / b.limit : undefined
+    }
+    return undefined
+  }
+  const xs = inWindow(snap, rule, nowMs)
+  if (rule.metric === "requests") return xs.length
+  if (rule.metric === "cost") {
+    let total = 0.0
+    for (const s of xs) total += s.cost
+    return total
+  }
+  if (xs.length === 0) return undefined
+  if (rule.metric === "error_rate") {
+    let errors = 0
+    for (const s of xs) {
+      if (s.status < 200 || s.status >= 300) errors += 1
+    }
+    return errors / xs.length
+  }
+  if (rule.metric === "avg_latency_ms") {
+    let total = 0.0
+    for (const s of xs) total += s.latency_ms
+    return total / xs.length
+  }
+  // p95_latency_ms, nearest rank
+  const lat: f64[] = []
+  for (const s of xs) lat.push(s.latency_ms)
+  lat.sort((a, b) => a - b)
+  const rank = Math.ceil(0.95 * lat.length)
+  return lat[rank - 1]!
+}
+
+function breaches(v: f64, op: string, threshold: f64): bool {
+  if (op === ">") return v > threshold
+  if (op === ">=") return v >= threshold
+  if (op === "<") return v < threshold
+  return v <= threshold
+}
+
+// Up to 3 decimals, without float noise in the output.
+function fmt(v: f64): string {
+  if (!(Math.abs(v) < 1e12)) return `${v}`
+  return `${Math.round(v * 1000.0) / 1000.0}`
+}
+
+function span(secs: int): string {
+  if (secs >= 3600 && secs % 3600 === 0) return `${Math.floor(secs / 3600)}h`
+  if (secs >= 60 && secs % 60 === 0) return `${Math.floor(secs / 60)}m`
+  return `${secs}s`
+}
+
+function scope(rule: AlertRule): string {
+  const f = rule.filter
+  if (f === undefined) return "all"
+  const bits: string[] = []
+  if (f.provider !== undefined) bits.push(f.provider)
+  if (f.model !== undefined) bits.push(f.model)
+  if (f.budget_id !== undefined) bits.push(`budget ${f.budget_id}`)
+  if (bits.length === 0) return "all"
+  return bits.join(", ")
+}
+
+function oneLine(rule: AlertRule, kind: "firing" | "resolved", value: f64): string {
+  const name = rule.name ?? rule.id
+  const where = `${scope(rule)}, last ${span(windowOf(rule))}`
+  if (kind === "firing") {
+    return `[FIRING] ${name}: ${rule.metric} ${fmt(value)} ${rule.op} ${fmt(rule.threshold)} (${where})`
+  }
+  return `[RESOLVED] ${name}: ${rule.metric} ${fmt(value)} (${where})`
+}
+
+// Webhook: a JSON object. Slack: {"text": "..."} with one readable line.
+export function notificationBody(channel: Channel, rule: AlertRule, kind: "firing" | "resolved", value: f64, nowMs: f64): string {
+  if (channel.type === "slack") {
+    return JSON.stringify({ text: oneLine(rule, kind, value) })
+  }
+  return JSON.stringify({
+    alert: rule.name ?? rule.id,
+    rule: rule.id,
+    kind: kind,
+    metric: rule.metric,
+    value: value,
+    threshold: rule.threshold,
+    ts: nowMs,
+  })
+}
+
+// The HTTP request that delivers a notification. Slack and webhook both get JSON.
+export function request(n: Notification): { url: string, headers: Map<string, string>, body: string } {
+  const headers: Map<string, string> = new Map()
+  const src = n.channel.headers
+  if (src !== undefined) {
+    for (const k of src.keys()) headers.set(k, src.get(k)!)
+  }
+  let hasType = false
+  for (const k of headers.keys()) {
+    if (k.toLowerCase() === "content-type") hasType = true
+  }
+  if (!hasType) headers.set("content-type", "application/json")
+  return { url: n.channel.url, headers: headers, body: n.body }
+}
+
+class RuleState {
+  state: string = "ok" // ok | pending | firing
+  count: int = 0 // consecutive breaching evaluations
+  value: f64 | undefined = undefined // last measured value
+  since: f64 = 0.0
+  resolvedAt: f64 | undefined = undefined
+}
+
+export class AlertEngine {
+  private rs: Map<string, RuleState> = new Map()
+  private hist: AlertRecord[] = []
+  private chans: Map<string, Channel> = new Map()
+
+  constructor(readonly rules: AlertRule[], readonly channels: Channel[]) {
+    for (const c of channels) this.chans.set(c.id, c)
+  }
+
+  // Checks every enabled rule against the snapshot and returns what to send.
+  evaluate(snap: Snapshot, nowMs: f64): Notification[] {
+    let out: Notification[] = []
+    for (const rule of this.rules) {
+      if (rule.enabled === false) continue
+      const st = this.stateOf(rule.id)
+      const v = measure(rule, snap, nowMs)
+      if (v !== undefined) st.value = v
+      // No data counts as not breaching, so a quiet window resolves the rule.
+      const hit = v !== undefined && breaches(v, rule.op, rule.threshold)
+      const shown = v !== undefined ? v : (st.value ?? 0.0)
+
+      if (!hit) {
+        st.count = 0
+        if (st.state === "firing") {
+          this.moveTo(rule, st, "ok", v, nowMs)
+          st.resolvedAt = nowMs
+          this.notify(rule, "resolved", shown, nowMs, &out)
+        } else if (st.state !== "ok") {
+          this.moveTo(rule, st, "ok", v, nowMs)
+        }
+        continue
+      }
+
+      st.count += 1
+      if (st.state === "firing") continue
+      const need = Math.max(1, rule.for_evaluations ?? 1)
+      const ra = st.resolvedAt
+      const cooling = ra !== undefined && nowMs - ra < (rule.cooldown_seconds ?? 900) * 1000.0
+      if (st.count >= need && !cooling) {
+        this.moveTo(rule, st, "firing", v, nowMs)
+        this.notify(rule, "firing", shown, nowMs, &out)
+      } else if (st.state === "ok") {
+        this.moveTo(rule, st, "pending", v, nowMs)
+      }
+    }
+    return out
+  }
+
+  // Every change of state, oldest first, at most the last 500.
+  history(): AlertRecord[] {
+    return this.hist
+  }
+
+  // Current state per rule. A disabled rule reports "disabled".
+  states(): { id: string, state: string, value?: f64, since: f64 }[] {
+    const out: { id: string, state: string, value?: f64, since: f64 }[] = []
+    for (const r of this.rules) {
+      const st = this.stateOf(r.id)
+      out.push({ id: r.id, state: r.enabled === false ? "disabled" : st.state, value: st.value, since: st.since })
+    }
+    return out
+  }
+
+  private stateOf(id: string): RuleState {
+    const have = this.rs.get(id)
+    if (have !== undefined) return have
+    const n = new RuleState()
+    this.rs.set(id, n)
+    return n
+  }
+
+  private moveTo(rule: AlertRule, st: RuleState, to: string, value: f64 | undefined, nowMs: f64): void {
+    this.hist.push({ ruleId: rule.id, from: st.state, to: to, value: value, ts: nowMs })
+    if (this.hist.length > HISTORY_CAP) this.hist.shift()
+    st.state = to
+    st.since = nowMs
+  }
+
+  private notify(rule: AlertRule, kind: "firing" | "resolved", value: f64, nowMs: f64, inout out: Notification[]): void {
+    for (const cid of rule.channels) {
+      const ch = this.chans.get(cid)
+      if (ch === undefined) continue
+      out.push({ channel: ch, ruleId: rule.id, kind: kind, body: notificationBody(ch, rule, kind, value, nowMs) })
+    }
+  }
+}
+
+// ---- tests ----
+
+function smp(ts: f64, provider: string, model: string, status: int, latency: f64, cost: f64): Sample {
+  return { ts: ts, provider: provider, model: model, status: status, latency_ms: latency, cost: cost }
+}
+
+const NOW = 1000000.0
+
+function snapOf(samples: Sample[]): Snapshot {
+  return { samples: samples, budgets: [], openBreakers: [] }
+}
+
+function ruleOf(metric: Metric, op: ">" | ">=" | "<" | "<=", threshold: f64): AlertRule {
+  return { id: "r", metric: metric, op: op, threshold: threshold, channels: ["ch"] }
+}
+
+function headerMap(k: string, v: string): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  m.set(k, v)
+  return m
+}
+
+const SLACK: Channel = { id: "ch", type: "slack", url: "https://hooks.example/slack" }
+const HOOK: Channel = { id: "ch", type: "webhook", url: "https://hooks.example/hook", headers: headerMap("X-Token", "t") }
+
+test("error_rate counts non-2xx over the window and is undefined with no requests", () => {
+  const snap = snapOf([
+    smp(NOW - 1000.0, "openai", "gpt", 200, 10.0, 0.0),
+    smp(NOW - 2000.0, "openai", "gpt", 500, 10.0, 0.0),
+    smp(NOW - 3000.0, "openai", "gpt", 429, 10.0, 0.0),
+    smp(NOW - 400000.0, "openai", "gpt", 500, 10.0, 0.0), // outside 300s
+  ])
+  expect(measure(ruleOf("error_rate", ">", 0.0), snap, NOW)!).toBeCloseTo(2.0 / 3.0)
+  expect(measure(ruleOf("error_rate", ">", 0.0), snapOf([]), NOW)).toBeUndefined()
+})
+
+test("requests and cost sum the window; empty windows give 0", () => {
+  const snap = snapOf([
+    smp(NOW - 1000.0, "openai", "gpt", 200, 10.0, 0.25),
+    smp(NOW - 2000.0, "anthropic", "claude", 200, 10.0, 0.5),
+  ])
+  expect(measure(ruleOf("requests", ">", 0.0), snap, NOW)).toBe(2.0)
+  expect(measure(ruleOf("cost", ">", 0.0), snap, NOW)).toBe(0.75)
+  expect(measure(ruleOf("requests", "<", 1.0), snapOf([]), NOW)).toBe(0.0)
+  expect(measure(ruleOf("cost", "<", 1.0), snapOf([]), NOW)).toBe(0.0)
+})
+
+test("avg_latency_ms is the mean and undefined with no requests", () => {
+  const snap = snapOf([smp(NOW - 1.0, "a", "m", 200, 100.0, 0.0), smp(NOW - 2.0, "a", "m", 200, 300.0, 0.0)])
+  expect(measure(ruleOf("avg_latency_ms", ">", 0.0), snap, NOW)).toBe(200.0)
+  expect(measure(ruleOf("avg_latency_ms", ">", 0.0), snapOf([]), NOW)).toBeUndefined()
+})
+
+test("p95 uses nearest rank", () => {
+  const xs: Sample[] = []
+  for (let i = 1; i <= 20; i++) xs.push(smp(NOW - 1.0 * i, "a", "m", 200, i * 10.0, 0.0))
+  // 20 values: ceil(0.95 * 20) = 19th smallest = 190
+  expect(measure(ruleOf("p95_latency_ms", ">", 0.0), snapOf(xs), NOW)).toBe(190.0)
+  const one = snapOf([smp(NOW - 1.0, "a", "m", 200, 42.0, 0.0)])
+  expect(measure(ruleOf("p95_latency_ms", ">", 0.0), one, NOW)).toBe(42.0)
+  expect(measure(ruleOf("p95_latency_ms", ">", 0.0), snapOf([]), NOW)).toBeUndefined()
+})
+
+test("provider and model filters narrow every sample metric", () => {
+  const snap = snapOf([
+    smp(NOW - 1.0, "openai", "gpt", 500, 10.0, 1.0),
+    smp(NOW - 2.0, "openai", "mini", 200, 10.0, 2.0),
+    smp(NOW - 3.0, "anthropic", "gpt", 200, 10.0, 4.0),
+  ])
+  const byProv: AlertRule = { id: "r", metric: "cost", op: ">", threshold: 0.0, channels: [], filter: { provider: "openai" } }
+  expect(measure(byProv, snap, NOW)).toBe(3.0)
+  const byModel: AlertRule = { id: "r", metric: "error_rate", op: ">", threshold: 0.0, channels: [], filter: { model: "gpt" } }
+  expect(measure(byModel, snap, NOW)).toBe(0.5)
+  const both: AlertRule = { id: "r", metric: "requests", op: ">", threshold: 0.0, channels: [], filter: { provider: "openai", model: "gpt" } }
+  expect(measure(both, snap, NOW)).toBe(1.0)
+  const none: AlertRule = { id: "r", metric: "requests", op: ">", threshold: 0.0, channels: [], filter: { provider: "nobody" } }
+  expect(measure(none, snap, NOW)).toBe(0.0)
+})
+
+test("budget_used is used over limit for the filtered budget", () => {
+  const snap: Snapshot = { samples: [], budgets: [{ id: "b1", used: 3.0, limit: 4.0 }, { id: "b2", used: 1.0, limit: 0.0 }], openBreakers: [] }
+  const r: AlertRule = { id: "r", metric: "budget_used", op: ">=", threshold: 0.8, channels: [], filter: { budget_id: "b1" } }
+  expect(measure(r, snap, NOW)).toBe(0.75)
+  const zero: AlertRule = { id: "r", metric: "budget_used", op: ">=", threshold: 0.8, channels: [], filter: { budget_id: "b2" } }
+  expect(measure(zero, snap, NOW)).toBeUndefined()
+  const missing: AlertRule = { id: "r", metric: "budget_used", op: ">=", threshold: 0.8, channels: [], filter: { budget_id: "nope" } }
+  expect(measure(missing, snap, NOW)).toBeUndefined()
+  expect(measure(ruleOf("budget_used", ">", 0.0), snap, NOW)).toBeUndefined()
+})
+
+test("breaker_open counts open targets, optionally by provider", () => {
+  const snap: Snapshot = { samples: [], budgets: [], openBreakers: ["openai#a", "openai#b", "anthropic#a"] }
+  expect(measure(ruleOf("breaker_open", ">", 0.0), snap, NOW)).toBe(3.0)
+  const r: AlertRule = { id: "r", metric: "breaker_open", op: ">", threshold: 0.0, channels: [], filter: { provider: "openai" } }
+  expect(measure(r, snap, NOW)).toBe(2.0)
+  expect(measure(ruleOf("breaker_open", ">", 0.0), snapOf([]), NOW)).toBe(0.0)
+})
+
+test("the window excludes old samples and ones dated after now", () => {
+  const snap = snapOf([
+    smp(NOW - 299000.0, "a", "m", 200, 10.0, 0.0),
+    smp(NOW - 301000.0, "a", "m", 200, 10.0, 0.0),
+    smp(NOW + 5000.0, "a", "m", 200, 10.0, 0.0),
+  ])
+  expect(measure(ruleOf("requests", ">", 0.0), snap, NOW)).toBe(1.0)
+  const short: AlertRule = { id: "r", metric: "requests", op: ">", threshold: 0.0, channels: [], window_seconds: 60 }
+  expect(measure(short, snap, NOW)).toBe(0.0)
+})
+
+test("state machine: ok -> pending -> firing -> ok with for_evaluations=2", () => {
+  const rule: AlertRule = { id: "r", metric: "error_rate", op: ">", threshold: 0.2, channels: ["ch"], for_evaluations: 2 }
+  const eng = new AlertEngine([rule], [SLACK])
+  const bad = snapOf([smp(NOW - 1.0, "openai", "gpt", 500, 1.0, 0.0)])
+  const good = snapOf([smp(NOW - 1.0, "openai", "gpt", 200, 1.0, 0.0)])
+
+  expect(eng.evaluate(bad, NOW).length).toBe(0)
+  expect(eng.states()[0]!.state).toBe("pending")
+  const fired = eng.evaluate(bad, NOW + 1000.0)
+  expect(fired.length).toBe(1)
+  expect(fired[0]!.kind).toBe("firing")
+  expect(eng.states()[0]!.state).toBe("firing")
+  expect(eng.states()[0]!.since).toBe(NOW + 1000.0)
+
+  // still breaching: no repeat notification
+  expect(eng.evaluate(bad, NOW + 2000.0).length).toBe(0)
+  expect(eng.evaluate(bad, NOW + 3000.0).length).toBe(0)
+
+  const resolved = eng.evaluate(good, NOW + 4000.0)
+  expect(resolved.length).toBe(1)
+  expect(resolved[0]!.kind).toBe("resolved")
+  expect(eng.states()[0]!.state).toBe("ok")
+
+  const h = eng.history()
+  expect(h.length).toBe(3)
+  expect(h[0]!.from).toBe("ok")
+  expect(h[0]!.to).toBe("pending")
+  expect(h[1]!.to).toBe("firing")
+  expect(h[2]!.from).toBe("firing")
+  expect(h[2]!.to).toBe("ok")
+  expect(h[2]!.ts).toBe(NOW + 4000.0)
+})
+
+test("a breach that clears before for_evaluations goes back to ok without notifying", () => {
+  const rule: AlertRule = { id: "r", metric: "error_rate", op: ">", threshold: 0.2, channels: ["ch"], for_evaluations: 3 }
+  const eng = new AlertEngine([rule], [SLACK])
+  const bad = snapOf([smp(NOW - 1.0, "openai", "gpt", 500, 1.0, 0.0)])
+  const good = snapOf([smp(NOW - 1.0, "openai", "gpt", 200, 1.0, 0.0)])
+  eng.evaluate(bad, NOW)
+  eng.evaluate(bad, NOW + 1.0)
+  expect(eng.states()[0]!.state).toBe("pending")
+  expect(eng.evaluate(good, NOW + 2.0).length).toBe(0)
+  expect(eng.states()[0]!.state).toBe("ok")
+})
+
+test("no data resolves a firing rule, and a rule with no data never fires", () => {
+  const rule: AlertRule = { id: "r", metric: "error_rate", op: ">", threshold: 0.2, channels: ["ch"] }
+  const eng = new AlertEngine([rule], [SLACK])
+  expect(eng.evaluate(snapOf([]), NOW).length).toBe(0)
+  expect(eng.states()[0]!.state).toBe("ok")
+  eng.evaluate(snapOf([smp(NOW - 1.0, "o", "m", 500, 1.0, 0.0)]), NOW + 1.0)
+  expect(eng.states()[0]!.state).toBe("firing")
+  const quiet = eng.evaluate(snapOf([]), NOW + 2.0)
+  expect(quiet.length).toBe(1)
+  expect(quiet[0]!.kind).toBe("resolved")
+})
+
+test("default for_evaluations=1 fires on the first breach", () => {
+  const rule: AlertRule = { id: "r", metric: "requests", op: ">=", threshold: 1.0, channels: ["ch"] }
+  const eng = new AlertEngine([rule], [SLACK])
+  const n = eng.evaluate(snapOf([smp(NOW - 1.0, "o", "m", 200, 1.0, 0.0)]), NOW)
+  expect(n.length).toBe(1)
+  expect(n[0]!.kind).toBe("firing")
+})
+
+test("cooldown holds back a re-fire after resolve and then lets it fire", () => {
+  const rule: AlertRule = { id: "r", metric: "error_rate", op: ">", threshold: 0.2, channels: ["ch"], cooldown_seconds: 60 }
+  const eng = new AlertEngine([rule], [SLACK])
+  const bad = snapOf([smp(NOW - 1.0, "o", "m", 500, 1.0, 0.0)])
+  const good = snapOf([smp(NOW - 1.0, "o", "m", 200, 1.0, 0.0)])
+  expect(eng.evaluate(bad, NOW).length).toBe(1)
+  expect(eng.evaluate(good, NOW + 1000.0).length).toBe(1) // resolved at NOW+1s
+  // breaching again 10s after the resolve: suppressed
+  expect(eng.evaluate(bad, NOW + 11000.0).length).toBe(0)
+  expect(eng.states()[0]!.state).toBe("pending")
+  expect(eng.evaluate(bad, NOW + 30000.0).length).toBe(0)
+  // cooldown is over (60s after NOW+1s): fires once
+  const again = eng.evaluate(bad, NOW + 62000.0)
+  expect(again.length).toBe(1)
+  expect(again[0]!.kind).toBe("firing")
+})
+
+test("disabled rules never notify or fire", () => {
+  const off: AlertRule = { id: "off", metric: "requests", op: ">=", threshold: 0.0, channels: ["ch"], enabled: false }
+  const eng = new AlertEngine([off], [SLACK])
+  expect(eng.evaluate(snapOf([smp(NOW - 1.0, "o", "m", 200, 1.0, 0.0)]), NOW).length).toBe(0)
+  expect(eng.states()[0]!.state).toBe("disabled")
+  expect(eng.history().length).toBe(0)
+})
+
+test("a rule notifies every channel it names, and skips unknown ones", () => {
+  const rule: AlertRule = { id: "r", metric: "requests", op: ">=", threshold: 1.0, channels: ["ch", "missing", "two"] }
+  const two: Channel = { id: "two", type: "webhook", url: "https://b.example" }
+  const eng = new AlertEngine([rule], [SLACK, two])
+  const n = eng.evaluate(snapOf([smp(NOW - 1.0, "o", "m", 200, 1.0, 0.0)]), NOW)
+  expect(n.length).toBe(2)
+  expect(n[0]!.channel.id).toBe("ch")
+  expect(n[1]!.channel.id).toBe("two")
+})
+
+test("slack body is one readable line", () => {
+  const rule: AlertRule = {
+    id: "hi",
+    name: "High error rate",
+    metric: "error_rate",
+    op: ">",
+    threshold: 0.2,
+    window_seconds: 300,
+    channels: ["ch"],
+    filter: { provider: "openai" },
+  }
+  const body = notificationBody(SLACK, rule, "firing", 0.31, NOW)
+  expect(body).toBe(`{"text":"[FIRING] High error rate: error_rate 0.31 > 0.2 (openai, last 5m)"}`)
+  const res = notificationBody(SLACK, rule, "resolved", 0.05, NOW)
+  expect(res).toBe(`{"text":"[RESOLVED] High error rate: error_rate 0.05 (openai, last 5m)"}`)
+  const hourly: AlertRule = { id: "x", metric: "cost", op: ">", threshold: 5.0, channels: [], window_seconds: 7200 }
+  expect(notificationBody(SLACK, hourly, "firing", 6.0, NOW)).toBe(`{"text":"[FIRING] x: cost 6 > 5 (all, last 2h)"}`)
+})
+
+test("webhook body is the JSON record", () => {
+  const rule: AlertRule = { id: "r1", name: "Spend", metric: "cost", op: ">", threshold: 5.0, channels: ["ch"] }
+  const body = notificationBody(HOOK, rule, "firing", 6.5, NOW)
+  expect(body).toBe(`{"alert":"Spend","rule":"r1","kind":"firing","metric":"cost","value":6.5,"threshold":5,"ts":1000000}`)
+})
+
+test("request carries the channel url, headers and body, with a JSON content type", () => {
+  const rule: AlertRule = { id: "r1", metric: "cost", op: ">", threshold: 5.0, channels: ["ch"] }
+  const n: Notification = { channel: HOOK, ruleId: "r1", kind: "firing", body: "{}" }
+  const req = request(n)
+  expect(req.url).toBe("https://hooks.example/hook")
+  expect(req.body).toBe("{}")
+  expect(req.headers.get("X-Token")).toBe("t")
+  expect(req.headers.get("content-type")).toBe("application/json")
+  const typed: Channel = { id: "ch", type: "webhook", url: "https://c.example", headers: headerMap("Content-Type", "text/plain") }
+  const req2 = request({ channel: typed, ruleId: rule.id, kind: "firing", body: "x" })
+  expect(req2.headers.get("Content-Type")).toBe("text/plain")
+  expect(req2.headers.has("content-type")).toBe(false)
+  const plain = request({ channel: SLACK, ruleId: "r", kind: "resolved", body: "y" })
+  expect(plain.headers.get("content-type")).toBe("application/json")
+})
+
+test("history keeps only the last 500 changes", () => {
+  const rule: AlertRule = { id: "flap", metric: "requests", op: ">=", threshold: 1.0, channels: ["ch"], cooldown_seconds: 0 }
+  const eng = new AlertEngine([rule], [SLACK])
+  const hit = snapOf([smp(NOW - 1.0, "o", "m", 200, 1.0, 0.0)])
+  const miss = snapOf([])
+  for (let i = 0; i < 300; i++) {
+    eng.evaluate(hit, NOW + i * 2.0)
+    eng.evaluate(miss, NOW + i * 2.0 + 1.0)
+  }
+  const h = eng.history()
+  expect(h.length).toBe(500)
+  // 600 transitions were made, one per ms from NOW; the oldest 100 are gone
+  expect(h[0]!.ts).toBe(NOW + 100.0)
+  expect(h[499]!.ts).toBe(NOW + 599.0)
+})

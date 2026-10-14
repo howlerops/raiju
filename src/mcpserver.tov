@@ -1,0 +1,625 @@
+// The gateway as an MCP server (Streamable HTTP, spec 2025-06-18, POST only). An MCP
+// client connects once and sees one server whose tools are the tools of every MCP
+// server the gateway is connected to, filtered per virtual key. The protocol lives in
+// pure functions that test without a network; handleMcp runs the tool calls.
+import { Field, fields, elements, find, rawStr, quote, isNull } from "./json"
+import { secureHex } from "./crypto"
+
+export type ExposedTool = { name: string, description: string, inputSchemaRaw: string }
+
+export type ToolRunner = (name: string, argsJson: string) => Promise<{ text: string, isError: bool }, Error>
+
+export type Session = { id: string, protocolVersion: string, initialized: bool, createdMs: f64 }
+
+export type McpReply = { status: int, body: string, sessionId?: string, contentType: string }
+
+// The outcome of a request that does not call a tool.
+export type Outcome = { kind: "ok", raw: string } | { kind: "err", code: int, message: string }
+
+const PROTOCOL = "2025-06-18"
+const SUPPORTED: string[] = ["2025-06-18", "2025-03-26", "2024-11-05"]
+const PAGE_SIZE = 100
+const EMPTY_SCHEMA = '{"type":"object","properties":{}}'
+const DIGITS = "0123456789"
+
+// One parsed message. A request has an id; a notification does not. A reply is a
+// response to a request the server never sent, so the server only acknowledges it.
+type Msg =
+  | { kind: "request", id: string, method: string, params: string }
+  | { kind: "notification", method: string, params: string }
+  | { kind: "reply" }
+  | { kind: "invalid", id: string, code: int, message: string }
+
+// A call to run once the plan is made. Replies are final text already.
+type Pending = { kind: "reply", text: string } | { kind: "call", id: string, name: string, argumentsJson: string }
+
+// What to answer for one HTTP POST, before any tool has run.
+export type Plan = { status: int, batch: bool, items: Pending[], sessionId?: string }
+
+// A JSON-RPC response with the given raw id ("null" when the request had none).
+export function rpcResult(id: string, resultRaw: string): string {
+  return `{"jsonrpc":"2.0","id":${id},"result":${resultRaw}}`
+}
+
+export function rpcError(id: string, code: int, message: string): string {
+  return `{"jsonrpc":"2.0","id":${id},"error":{"code":${code},"message":${quote(message)}}}`
+}
+
+// The result of tools/call. Tool failures are results with isError, not protocol errors.
+export function buildCallResult(text: string, isError: bool): string {
+  return `{"content":[{"type":"text","text":${quote(text)}}],"isError":${isError ? "true" : "false"}}`
+}
+
+function invalid(id: string, code: int, message: string): Msg {
+  return { kind: "invalid", id: id, code: code, message: message }
+}
+
+// True when text is exactly one JSON value. The scanner checks the outer shape only,
+// so the callers still validate the fields they read.
+function isJson(text: string): bool {
+  try {
+    return elements("[" + text + "]").length === 1
+  } catch (e) {
+    return false
+  }
+}
+
+// True when raw is a JSON object the scanner accepts.
+function isObjectJson(raw: string): bool {
+  try {
+    fields(raw)
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+// An id is a string, a number or null.
+function validId(raw: string): bool {
+  return raw === "null" || raw.startsWith('"') || "-0123456789".includes(raw.slice(0, 1))
+}
+
+function parseMessage(text: string): Msg {
+  const t = text.trim()
+  if (!isJson(t)) return invalid("null", -32700, "parse error")
+  if (!t.startsWith("{")) return invalid("null", -32600, "a message must be a JSON object")
+  let fs: Field[] = []
+  try {
+    fs = fields(t)
+  } catch (e) {
+    return invalid("null", -32700, "parse error")
+  }
+  const idRaw = find(fs, "id")
+  if (idRaw !== undefined && !validId(idRaw)) return invalid("null", -32600, "id must be a string, a number or null")
+  if (find(fs, "method") === undefined) {
+    if (find(fs, "result") !== undefined || find(fs, "error") !== undefined) return { kind: "reply" }
+    return invalid(idRaw ?? "null", -32600, "missing method")
+  }
+  const method = rawStr(fs, "method")
+  if (method === undefined) return invalid(idRaw ?? "null", -32600, "method must be a string")
+  const params = find(fs, "params") ?? ""
+  if (idRaw === undefined) return { kind: "notification", method: method, params: params }
+  return { kind: "request", id: idRaw, method: method, params: params }
+}
+
+// The fields of a params value. Absent params count as empty; undefined means the
+// value is present but not an object.
+function paramFields(paramsRaw: string): Field[] | undefined {
+  if (paramsRaw === "" || isNull(paramsRaw)) return []
+  try {
+    return fields(paramsRaw)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Negotiates the protocol version: the client's when the server knows it, else the latest.
+function negotiate(asked: string | undefined): string {
+  if (asked !== undefined && SUPPORTED.includes(asked)) return asked
+  return PROTOCOL
+}
+
+// The initialize result, and the protocol version the session will use.
+export function buildInitialize(paramsRaw: string): { version: string, raw: string } {
+  const fs = paramFields(paramsRaw)
+  const asked = fs === undefined ? undefined : rawStr(fs, "protocolVersion")
+  const version = negotiate(asked)
+  const raw = `{"protocolVersion":${quote(version)},"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"raiju","version":"0.1.0"}}`
+  return { version: version, raw: raw }
+}
+
+// A page index from a cursor. Cursors are plain decimal offsets into the tool list.
+function parseCursor(c: string): int | undefined {
+  if (c === "" || c.byteLength > 9) return undefined
+  let n = 0
+  for (const ch of c.chars()) {
+    const d = DIGITS.indexOf(ch)
+    if (d < 0) return undefined
+    n = n * 10 + d
+  }
+  return n
+}
+
+// A tool's raw schema, or an empty object schema when the one given is not an object.
+function schemaOf(raw: string): string {
+  const t = raw.trim()
+  if (t.startsWith("{") && isObjectJson(t)) return t
+  return EMPTY_SCHEMA
+}
+
+function toolJson(t: ExposedTool): string {
+  return `{"name":${quote(t.name)},"description":${quote(t.description)},"inputSchema":${schemaOf(t.inputSchemaRaw)}}`
+}
+
+// One page of tools/list. The cursor is the index of the page's first tool.
+export function buildToolsList(tools: ExposedTool[], cursor: string | undefined): Outcome {
+  let start = 0
+  if (cursor !== undefined) {
+    const n = parseCursor(cursor)
+    if (n === undefined || n > tools.length) return { kind: "err", code: -32602, message: "invalid cursor" }
+    start = n
+  }
+  let end = start + PAGE_SIZE
+  if (end > tools.length) end = tools.length
+  const parts: string[] = []
+  for (let i = start; i < end; i++) parts.push(toolJson(tools[i]!))
+  let raw = `{"tools":[${parts.join(",")}]`
+  if (end < tools.length) raw += `,"nextCursor":"${end}"`
+  raw += "}"
+  return { kind: "ok", raw: raw }
+}
+
+// Answers a request that does not call a tool. Unknown methods are -32601.
+export function dispatchSync(method: string, paramsRaw: string, tools: ExposedTool[]): Outcome {
+  if (method === "ping") return { kind: "ok", raw: "{}" }
+  if (method === "tools/list") {
+    const fs = paramFields(paramsRaw)
+    if (fs === undefined) return { kind: "err", code: -32602, message: "params must be an object" }
+    const cursorRaw = find(fs, "cursor")
+    let cursor: string | undefined = undefined
+    if (cursorRaw !== undefined && !isNull(cursorRaw)) {
+      cursor = rawStr(fs, "cursor")
+      if (cursor === undefined) return { kind: "err", code: -32602, message: "cursor must be a string" }
+    }
+    return buildToolsList(tools, cursor)
+  }
+  return { kind: "err", code: -32601, message: `method not found: ${method}` }
+}
+
+// The name and arguments of a tools/call, or the error to answer with.
+function parseCallParams(paramsRaw: string): { kind: "call", name: string, argumentsJson: string } | { kind: "err", code: int, message: string } {
+  const fs = paramFields(paramsRaw)
+  if (fs === undefined) return { kind: "err", code: -32602, message: "params must be an object" }
+  const name = rawStr(fs, "name")
+  if (name === undefined || name === "") return { kind: "err", code: -32602, message: "tools/call needs a tool name" }
+  const argRaw = find(fs, "arguments")
+  let argumentsJson = "{}"
+  if (argRaw !== undefined && !isNull(argRaw)) {
+    if (!isObjectJson(argRaw)) return { kind: "err", code: -32602, message: "arguments must be an object" }
+    argumentsJson = argRaw
+  }
+  return { kind: "call", name: name, argumentsJson: argumentsJson }
+}
+
+function hasTool(tools: ExposedTool[], name: string): bool {
+  for (const t of tools) {
+    if (t.name === name) return true
+  }
+  return false
+}
+
+function methodOf(m: Msg): string | undefined {
+  if (m.kind === "request") return m.method
+  if (m.kind === "notification") return m.method
+  return undefined
+}
+
+function idOf(m: Msg): string | undefined {
+  if (m.kind === "request") return m.id
+  if (m.kind === "invalid") return m.id
+  return undefined
+}
+
+function failPlan(status: int, id: string, code: int, message: string): Plan {
+  return { status: status, batch: false, items: [{ kind: "reply", text: rpcError(id, code, message) }] }
+}
+
+// Decides every reply to one POST without running tools. Tool calls come back as
+// pending items for handleMcp to run, in order.
+export function planMcp(body: string, sessionId: string | undefined, tools: ExposedTool[], store: SessionStore, nowMs: f64): Plan {
+  const t = body.trim()
+  const batch = t.startsWith("[")
+  let texts: string[] = [t]
+  if (batch) {
+    try {
+      texts = elements(t)
+    } catch (e) {
+      return failPlan(400, "null", -32700, "parse error")
+    }
+    if (texts.length === 0) return failPlan(400, "null", -32600, "empty batch")
+  }
+  const msgs: Msg[] = texts.map((x) => parseMessage(x))
+
+  // Spec 2025-06-18: initialize is never part of a batch.
+  for (const m of msgs) {
+    if (batch && methodOf(m) === "initialize") return failPlan(400, "null", -32600, "initialize cannot be sent in a batch")
+  }
+
+  // Every message but initialize needs a live session.
+  let needsSession = false
+  for (const m of msgs) {
+    const meth = methodOf(m)
+    if (meth !== undefined && meth !== "initialize") needsSession = true
+  }
+  let live: Session | undefined = undefined
+  if (needsSession) {
+    if (sessionId !== undefined) live = store.get(sessionId, nowMs)
+    if (live === undefined) {
+      const first = msgs[0]!
+      return failPlan(400, batch ? "null" : (idOf(first) ?? "null"), -32600, "missing or unknown Mcp-Session-Id")
+    }
+  }
+
+  const items: Pending[] = []
+  let status: int = 200
+  let sid: string | undefined = undefined
+  for (const m of msgs) {
+    if (m.kind === "reply") continue
+    if (m.kind === "invalid") {
+      items.push({ kind: "reply", text: rpcError(m.id, m.code, m.message) })
+      if (!batch) status = 400
+      continue
+    }
+    if (m.kind === "notification") {
+      if (m.method === "notifications/initialized" && sessionId !== undefined) store.markInitialized(sessionId, nowMs)
+      continue
+    }
+    if (m.method === "initialize") {
+      const init = buildInitialize(m.params)
+      const s = store.create(init.version, nowMs)
+      if (s === undefined) {
+        items.push({ kind: "reply", text: rpcError(m.id, -32603, "could not create a session") })
+        status = 500
+      } else {
+        sid = s.id
+        items.push({ kind: "reply", text: rpcResult(m.id, init.raw) })
+      }
+    } else if (m.method === "tools/call") {
+      const cp = parseCallParams(m.params)
+      if (cp.kind === "err") {
+        items.push({ kind: "reply", text: rpcError(m.id, cp.code, cp.message) })
+      } else if (!hasTool(tools, cp.name)) {
+        items.push({ kind: "reply", text: rpcError(m.id, -32602, `unknown tool: ${cp.name}`) })
+      } else {
+        items.push({ kind: "call", id: m.id, name: cp.name, argumentsJson: cp.argumentsJson })
+      }
+    } else {
+      const out = dispatchSync(m.method, m.params, tools)
+      const text = out.kind === "ok" ? rpcResult(m.id, out.raw) : rpcError(m.id, out.code, out.message)
+      items.push({ kind: "reply", text: text })
+    }
+  }
+  // Only notifications and replies: the spec answers with 202 and no body.
+  if (items.length === 0 && status === 200) status = 202
+  const plan: Plan = { status: status, batch: batch, items: items }
+  if (sid !== undefined) plan.sessionId = sid
+  return plan
+}
+
+// Runs one tool call. A failing tool is reported as an error result, not a protocol error.
+async function runCall(id: string, name: string, argumentsJson: string, run: ToolRunner): Promise<string> {
+  try {
+    const r = await run(name, argumentsJson)
+    return rpcResult(id, buildCallResult(r.text, r.isError))
+  } catch (e) {
+    return rpcResult(id, buildCallResult(e.message, true))
+  }
+}
+
+// Handles one HTTP POST to the MCP endpoint. tools must be the list already filtered
+// for the caller's virtual key; run is only called with names from that list.
+export async function handleMcp(body: string, sessionId: string | undefined, tools: ExposedTool[], run: ToolRunner, store: SessionStore, nowMs: f64): Promise<McpReply> {
+  const plan = planMcp(body, sessionId, tools, store, nowMs)
+  const parts: string[] = []
+  for (const it of plan.items) {
+    if (it.kind === "reply") parts.push(it.text)
+    else parts.push(await runCall(it.id, it.name, it.argumentsJson, run))
+  }
+  let text = ""
+  if (plan.batch && parts.length > 0) text = "[" + parts.join(",") + "]"
+  else if (parts.length > 0) text = parts[0]!
+  const out: McpReply = { status: plan.status, body: text, contentType: "application/json" }
+  if (plan.sessionId !== undefined) out.sessionId = plan.sessionId
+  return out
+}
+
+// Keeps the tools a virtual key may see. undefined allows every tool; an empty list
+// allows none. An entry ending in "*" matches every name with that prefix.
+export function filterTools(all: ExposedTool[], allowed: string[] | undefined): ExposedTool[] {
+  if (allowed === undefined) return all
+  return all.filter((t) => matchesAny(allowed, t.name))
+}
+
+function patternMatches(p: string, name: string): bool {
+  if (p.endsWith("*")) return name.startsWith(p.slice(0, p.byteLength - 1))
+  return p === name
+}
+
+function matchesAny(patterns: string[], name: string): bool {
+  for (const p of patterns) {
+    if (patternMatches(p, name)) return true
+  }
+  return false
+}
+
+type Entry = { session: Session, seenMs: f64 }
+
+// Sessions of this process, in memory. A session expires when it has been idle longer
+// than the ttl; get() counts as activity.
+export class SessionStore {
+  private entries: Map<string, Entry> = new Map()
+
+  constructor(readonly ttlMs: f64) {}
+
+  // A new session under a random id. Undefined when the random source fails.
+  create(protocolVersion: string, nowMs: f64): Session | undefined {
+    this.expire(nowMs)
+    let id = ""
+    try {
+      id = secureHex(32)
+    } catch (e) {
+      return undefined
+    }
+    const s: Session = { id: id, protocolVersion: protocolVersion, initialized: false, createdMs: nowMs }
+    this.entries.set(id, { session: s, seenMs: nowMs })
+    return s
+  }
+
+  // The session, or undefined when it is unknown or has expired.
+  get(id: string, nowMs: f64): Session | undefined {
+    const e = this.entries.get(id)
+    if (e === undefined) return undefined
+    if (nowMs - e.seenMs > this.ttlMs) {
+      this.entries.delete(id)
+      return undefined
+    }
+    this.entries.set(id, { session: e.session, seenMs: nowMs })
+    return e.session
+  }
+
+  // Records the client's notifications/initialized.
+  markInitialized(id: string, nowMs: f64): void {
+    const s = this.get(id, nowMs)
+    if (s === undefined) return
+    const done: Session = { id: s.id, protocolVersion: s.protocolVersion, initialized: true, createdMs: s.createdMs }
+    this.entries.set(id, { session: done, seenMs: nowMs })
+  }
+
+  delete(id: string): void {
+    this.entries.delete(id)
+  }
+
+  // Drops the sessions idle past the ttl. Returns how many were dropped.
+  expire(nowMs: f64): int {
+    let n = 0
+    for (const id of this.entries.keys()) {
+      const e = this.entries.get(id)
+      if (e !== undefined && nowMs - e.seenMs > this.ttlMs) {
+        this.entries.delete(id)
+        n += 1
+      }
+    }
+    return n
+  }
+
+  count(): int {
+    return this.entries.keys().length
+  }
+}
+
+// Test fixtures: n tools named t0..t(n-1).
+function toolsNamed(n: int): ExposedTool[] {
+  const out: ExposedTool[] = []
+  for (let i = 0; i < n; i++) out.push({ name: `s-t${i}`, description: `tool ${i}`, inputSchemaRaw: '{"type":"object"}' })
+  return out
+}
+
+// Parses an HTTP result's body as an object's fields.
+function bodyFields(text: string): Field[] {
+  return try fields(text)
+}
+
+test("rpc envelopes", () => {
+  expect(rpcError("null", -32601, "nope")).toBe('{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"nope"}}')
+  expect(rpcResult("7", "{}")).toBe('{"jsonrpc":"2.0","id":7,"result":{}}')
+  expect(rpcResult('"abc"', '{"ok":true}')).toBe('{"jsonrpc":"2.0","id":"abc","result":{"ok":true}}')
+})
+
+test("call results have the text shape", () => {
+  expect(buildCallResult("hi", false)).toBe('{"content":[{"type":"text","text":"hi"}],"isError":false}')
+  expect(buildCallResult('a "b"\nc', true)).toBe('{"content":[{"type":"text","text":"a \\"b\\"\\nc"}],"isError":true}')
+})
+
+test("initialize negotiates the protocol version", () => {
+  expect(buildInitialize('{"protocolVersion":"2025-03-26","capabilities":{}}').version).toBe("2025-03-26")
+  expect(buildInitialize('{"protocolVersion":"2024-11-05"}').version).toBe("2024-11-05")
+  expect(buildInitialize('{"protocolVersion":"1999-01-01"}').version).toBe("2025-06-18")
+  expect(buildInitialize("").version).toBe("2025-06-18")
+  expect(buildInitialize('{"protocolVersion":3}').version).toBe("2025-06-18")
+  const init = buildInitialize('{"protocolVersion":"2025-06-18"}')
+  expect(init.raw).toBe('{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"raiju","version":"0.1.0"}}')
+})
+
+test("sessions expire after idle ttl", () => {
+  const store = new SessionStore(1000.0)
+  const s = store.create("2025-06-18", 0.0)
+  expect(s === undefined).toBe(false)
+  if (s === undefined) return
+  expect(s.id.byteLength).toBe(32)
+  expect(s.initialized).toBe(false)
+  expect(store.get(s.id, 900.0) === undefined).toBe(false)
+  // get() refreshed the idle time, so 1900 is within the ttl of 900
+  expect(store.get(s.id, 1900.0) === undefined).toBe(false)
+  expect(store.get(s.id, 3000.0) === undefined).toBe(true)
+  const t = store.create("2025-06-18", 0.0)
+  if (t !== undefined) {
+    store.delete(t.id)
+    expect(store.get(t.id, 0.0) === undefined).toBe(true)
+  }
+  const u = store.create("2025-06-18", 0.0)
+  expect(u === undefined).toBe(false)
+  expect(store.expire(5000.0)).toBe(1)
+  expect(store.count()).toBe(0)
+})
+
+test("tools/list pages by 100 with a cursor", () => {
+  const tools = toolsNamed(250)
+  const first = buildToolsList(tools, undefined)
+  expect(first.kind).toBe("ok")
+  if (first.kind !== "ok") return
+  const f1 = try bodyFields(first.raw)
+  expect(try elements(find(f1, "tools")!).length).toBe(100)
+  expect(rawStr(f1, "nextCursor")).toBe("100")
+  const second = buildToolsList(tools, "100")
+  if (second.kind !== "ok") return
+  const f2 = try bodyFields(second.raw)
+  expect(try elements(find(f2, "tools")!).length).toBe(100)
+  const last = buildToolsList(tools, "200")
+  if (last.kind !== "ok") return
+  const f3 = try bodyFields(last.raw)
+  expect(try elements(find(f3, "tools")!).length).toBe(50)
+  expect(find(f3, "nextCursor") === undefined).toBe(true)
+  const tail = try elements(find(f3, "tools")!)
+  expect(rawStr(try fields(tail[0]!), "name")).toBe("s-t200")
+  expect(rawStr(try fields(tail[0]!), "description")).toBe("tool 200")
+  expect(find(try fields(tail[0]!), "inputSchema")).toBe('{"type":"object"}')
+  const empty = buildToolsList(tools.slice(0, 0), undefined)
+  expect(empty.kind === "ok" && empty.raw === '{"tools":[]}').toBe(true)
+  const at = buildToolsList(tools, "250")
+  expect(at.kind === "ok" && at.raw === '{"tools":[]}').toBe(true)
+})
+
+test("tools/list rejects bad cursors", () => {
+  const tools = toolsNamed(3)
+  for (const c of ["abc", "-1", "", "4", "1.5", "12345678901"]) {
+    const r = buildToolsList(tools, c)
+    expect(r.kind === "err" && r.code === -32602).toBe(true)
+  }
+  expect(dispatchSync("tools/list", "[1]", tools).kind === "err").toBe(true)
+  expect(dispatchSync("tools/list", '{"cursor":5}', tools).kind === "err").toBe(true)
+  const ok = dispatchSync("tools/list", "", tools)
+  expect(ok.kind === "ok" && ok.raw.startsWith('{"tools":[{"name":"s-t0"')).toBe(true)
+})
+
+test("dispatchSync answers ping and rejects unknown methods", () => {
+  expect(dispatchSync("ping", "", [])).toEqual({ kind: "ok", raw: "{}" })
+  const r = dispatchSync("resources/list", "{}", [])
+  expect(r.kind === "err" && r.code === -32601).toBe(true)
+})
+
+test("filters tools by allowlist with wildcards", () => {
+  const all: ExposedTool[] = [
+    { name: "fs-read", description: "", inputSchemaRaw: "{}" },
+    { name: "fs-write", description: "", inputSchemaRaw: "{}" },
+    { name: "git-log", description: "", inputSchemaRaw: "{}" },
+    { name: "git", description: "", inputSchemaRaw: "{}" },
+  ]
+  expect(filterTools(all, undefined).length).toBe(4)
+  expect(filterTools(all, []).length).toBe(0)
+  expect(filterTools(all, ["fs-*"]).map((t) => t.name)).toEqual(["fs-read", "fs-write"])
+  expect(filterTools(all, ["git-log", "fs-read"]).map((t) => t.name)).toEqual(["fs-read", "git-log"])
+  expect(filterTools(all, ["git*"]).length).toBe(2)
+  expect(filterTools(all, ["*"]).length).toBe(4)
+  expect(filterTools(all, ["fs"]).length).toBe(0)
+})
+
+test("a POST without a live session is 400", () => {
+  const store = new SessionStore(60000.0)
+  const ping = '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+  const none = planMcp(ping, undefined, [], store, 0.0)
+  expect(none.status).toBe(400)
+  expect(none.items[0]!.kind).toBe("reply")
+  const unknown = planMcp(ping, "deadbeef", [], store, 0.0)
+  expect(unknown.status).toBe(400)
+  const init = planMcp('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}', undefined, [], store, 0.0)
+  expect(init.status).toBe(200)
+  const sid = init.sessionId ?? ""
+  expect(sid.byteLength).toBe(32)
+  expect(planMcp(ping, sid, [], store, 1.0).status).toBe(200)
+  const note = planMcp('{"jsonrpc":"2.0","method":"notifications/initialized"}', sid, [], store, 2.0)
+  expect(note.status).toBe(202)
+  expect(note.items.length).toBe(0)
+  const s = store.get(sid, 3.0)
+  expect(s === undefined ? false : s.initialized).toBe(true)
+})
+
+test("initialize returns a session id, and a batch cannot carry it", () => {
+  const store = new SessionStore(60000.0)
+  const init = planMcp('{"jsonrpc":"2.0","id":"a","method":"initialize","params":{"protocolVersion":"2024-11-05"}}', undefined, [], store, 0.0)
+  expect(init.status).toBe(200)
+  expect(init.batch).toBe(false)
+  const it = init.items[0]!
+  if (it.kind === "reply") expect(it.text.startsWith('{"jsonrpc":"2.0","id":"a","result":{"protocolVersion":"2024-11-05"')).toBe(true)
+  const bad = planMcp('[{"jsonrpc":"2.0","id":1,"method":"initialize"}]', undefined, [], store, 0.0)
+  expect(bad.status).toBe(400)
+  expect(store.count()).toBe(1)
+})
+
+test("batches answer each request and skip notifications", () => {
+  const store = new SessionStore(60000.0)
+  const sid = store.create("2025-06-18", 0.0)?.id ?? ""
+  const body = '[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"nope"}]'
+  const plan = planMcp(body, sid, [], store, 0.0)
+  expect(plan.status).toBe(200)
+  expect(plan.batch).toBe(true)
+  expect(plan.items.length).toBe(2)
+  const a = plan.items[0]!
+  const b = plan.items[1]!
+  if (a.kind === "reply") expect(a.text).toBe('{"jsonrpc":"2.0","id":1,"result":{}}')
+  if (b.kind === "reply") expect(b.text).toBe('{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"method not found: nope"}}')
+  const onlyNotes = planMcp('[{"jsonrpc":"2.0","method":"notifications/initialized"}]', sid, [], store, 0.0)
+  expect(onlyNotes.status).toBe(202)
+  expect(planMcp("[]", sid, [], store, 0.0).status).toBe(400)
+})
+
+test("parse and request errors", () => {
+  const store = new SessionStore(60000.0)
+  const p = planMcp("{not json", undefined, [], store, 0.0)
+  expect(p.status).toBe(400)
+  const pe = p.items[0]!
+  if (pe.kind === "reply") expect(pe.text).toBe('{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}')
+  expect(planMcp("", undefined, [], store, 0.0).status).toBe(400)
+  const num = planMcp("42", undefined, [], store, 0.0).items[0]!
+  if (num.kind === "reply") expect(num.text).toBe('{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"a message must be a JSON object"}}')
+  const noMethod = planMcp('{"jsonrpc":"2.0","id":5}', undefined, [], store, 0.0)
+  expect(noMethod.status).toBe(400)
+  const nm = noMethod.items[0]!
+  if (nm.kind === "reply") expect(nm.text).toBe('{"jsonrpc":"2.0","id":5,"error":{"code":-32600,"message":"missing method"}}')
+  const sid = store.create("2025-06-18", 0.0)?.id ?? ""
+  const inBatch = planMcp('[42,{"jsonrpc":"2.0","id":3,"method":"ping"}]', sid, [], store, 0.0)
+  expect(inBatch.status).toBe(200)
+  expect(inBatch.items.length).toBe(2)
+})
+
+test("tools/call is planned for known tools only", () => {
+  const store = new SessionStore(60000.0)
+  const sid = store.create("2025-06-18", 0.0)?.id ?? ""
+  const tools = toolsNamed(2)
+  const call = planMcp('{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"s-t1","arguments":{"x":1}}}', sid, tools, store, 0.0)
+  expect(call.status).toBe(200)
+  const c = call.items[0]!
+  expect(c.kind === "call").toBe(true)
+  if (c.kind === "call") {
+    expect(c.name).toBe("s-t1")
+    expect(c.argumentsJson).toBe('{"x":1}')
+    expect(c.id).toBe("9")
+  }
+  const noArgs = planMcp('{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"s-t0"}}', sid, tools, store, 0.0).items[0]!
+  if (noArgs.kind === "call") expect(noArgs.argumentsJson).toBe("{}")
+  const unknown = planMcp('{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"s-t9"}}', sid, tools, store, 0.0).items[0]!
+  if (unknown.kind === "reply") expect(unknown.text).toBe('{"jsonrpc":"2.0","id":9,"error":{"code":-32602,"message":"unknown tool: s-t9"}}')
+  const noName = planMcp('{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"arguments":{}}}', sid, tools, store, 0.0).items[0]!
+  if (noName.kind === "reply") expect(noName.text.indexOf('"code":-32602') >= 0).toBe(true)
+  const badArgs = planMcp('{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"s-t0","arguments":[1]}}', sid, tools, store, 0.0).items[0]!
+  if (badArgs.kind === "reply") expect(badArgs.text.indexOf('"code":-32602') >= 0).toBe(true)
+})

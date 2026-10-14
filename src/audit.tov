@@ -1,0 +1,539 @@
+// Tamper-evident audit log of admin actions. Each event carries the hash of
+// the event before it, and an HMAC of its own hash under a server key. Editing,
+// deleting or reordering lines is caught by verify(); rewriting the whole chain
+// needs the key. Events go to one JSON-lines file; the newest are also kept in
+// memory for queries. Tov has no database driver, so the file is the store.
+import { readFileSync, appendFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs"
+import { join } from "node:path"
+import { sha256, hmacSha256, toHex, utf8, secureHex } from "./crypto"
+import { Field, fields, elements, build, quote } from "./json"
+
+export type AuditEvent = {
+  seq: int,
+  ts: f64, // ms since the epoch
+  actor: string,
+  action: string, // e.g. "virtual_key.create"
+  target: string, // the object acted on, e.g. a provider name or a virtual key id
+  method: string,
+  path: string,
+  status: int,
+  ip?: string,
+  detail?: string, // JSON text, secrets already masked by the caller
+  prev: string, // hash of the previous event; 64 zeros for the first
+  hash: string,
+  sig: string,
+}
+
+export type AuditQuery = {
+  actor?: string,
+  action?: string,
+  since?: f64,
+  until?: f64,
+  limit?: int,
+  offset?: int,
+}
+
+export type VerifyResult = { ok: bool, checked: int, firstBad?: int, reason?: string }
+
+const KEY_FILE = "audit.key"
+const LOG_FILE = "audit.jsonl"
+const SECRET_FIELDS = ["value", "secret_key", "session_token", "auth_credentials", "password", "token"]
+
+function genesis(): string {
+  let s = ""
+  for (let i = 0; i < 64; i++) s += "0"
+  return s
+}
+
+// The fixed-order JSON that the hash covers: every field except hash and sig.
+// Optional fields are left out when absent, as JSON.stringify leaves them out.
+function canonical(e: AuditEvent): string {
+  const parts: string[] = []
+  parts.push(quote("seq") + ":" + JSON.stringify(e.seq))
+  parts.push(quote("ts") + ":" + JSON.stringify(e.ts))
+  parts.push(quote("actor") + ":" + quote(e.actor))
+  parts.push(quote("action") + ":" + quote(e.action))
+  parts.push(quote("target") + ":" + quote(e.target))
+  parts.push(quote("method") + ":" + quote(e.method))
+  parts.push(quote("path") + ":" + quote(e.path))
+  parts.push(quote("status") + ":" + JSON.stringify(e.status))
+  const ip = e.ip
+  if (ip !== undefined) parts.push(quote("ip") + ":" + quote(ip))
+  const detail = e.detail
+  if (detail !== undefined) parts.push(quote("detail") + ":" + quote(detail))
+  parts.push(quote("prev") + ":" + quote(e.prev))
+  return "{" + parts.join(",") + "}"
+}
+
+function digest(e: AuditEvent): string {
+  return toHex(sha256(utf8(canonical(e))))
+}
+
+function sign(key: u8[], hash: string): string {
+  return toHex(hmacSha256(key, utf8(hash)))
+}
+
+// A line that is not a complete event (a torn write, or a foreign line) is undefined.
+function parseLine(line: string): AuditEvent | undefined {
+  try {
+    return JSON.parse(line) as AuditEvent
+  } catch (err) {
+    return undefined
+  }
+}
+
+// With no key configured, the key is kept in <dir>/audit.key so signatures still
+// verify after a restart. node:fs has no chmod, so the file gets the process umask;
+// deployments should restrict it to the service user.
+function loadOrCreateKey(dir: string): string throws Error {
+  const file = join(dir, KEY_FILE)
+  if (existsSync(file)) {
+    const stored = (try readFileSync(file, "utf8")).trim()
+    if (stored !== "") return stored
+  }
+  const key = try secureHex(64)
+  try writeFileSync(file, key + "\n")
+  return key
+}
+
+function matches(e: AuditEvent, q: AuditQuery): bool {
+  if (q.actor !== undefined && e.actor !== q.actor) return false
+  if (q.action !== undefined && e.action !== q.action) return false
+  if (q.since !== undefined && e.ts < q.since) return false
+  if (q.until !== undefined && e.ts > q.until) return false
+  return true
+}
+
+export class AuditLog {
+  private file: string
+  private keyBytes: u8[]
+  private cap: int
+  private mem: AuditEvent[] = []
+  private lastSeq: int = 0
+  private lastHash: string = genesis()
+
+  // The chain continues from the newest parseable event already in the file.
+  constructor(readonly dir: string, key: string, maxMemory: int) throws Error {
+    this.file = join(dir, LOG_FILE)
+    this.cap = Math.max(1, maxMemory)
+    try mkdirSync(dir, { recursive: true })
+    const k = key === "" ? try loadOrCreateKey(dir) : key
+    this.keyBytes = utf8(k)
+    if (existsSync(this.file)) {
+      for (const line of try readFileSync(this.file, "utf8").split("\n")) {
+        const e = parseLine(line)
+        if (e === undefined) continue
+        this.lastSeq = e.seq
+        this.lastHash = e.hash
+        this.remember(e)
+      }
+    }
+  }
+
+  // Appends one event. If the write fails it throws and the chain does not
+  // advance, so no later event links to one that is not on disk.
+  record(actor: string, action: string, target: string, method: string, path: string, status: int, ip: string | undefined, detail: string | undefined, nowMs: f64): AuditEvent throws Error {
+    const e: AuditEvent = {
+      seq: this.lastSeq + 1,
+      ts: nowMs,
+      actor: actor,
+      action: action,
+      target: target,
+      method: method,
+      path: path,
+      status: status,
+      ip: ip,
+      detail: detail,
+      prev: this.lastHash,
+      hash: "",
+      sig: "",
+    }
+    e.hash = digest(e)
+    e.sig = sign(this.keyBytes, e.hash)
+    try appendFileSync(this.file, JSON.stringify(e) + "\n")
+    this.lastSeq = e.seq
+    this.lastHash = e.hash
+    this.remember(e)
+    return e
+  }
+
+  // Re-reads the whole file and checks each event in order: seq runs 1, 2, 3 ...;
+  // prev is the hash before it; hash is the digest of its content; sig is the
+  // HMAC of the hash under this log's key. Stops at the first failure.
+  // Removing the newest lines is not visible here: that needs an external anchor.
+  verify(): VerifyResult throws Error {
+    if (!existsSync(this.file)) return { ok: true, checked: 0 }
+    let checked: int = 0
+    let seq: int = 0
+    let prev = genesis()
+    for (const line of try readFileSync(this.file, "utf8").split("\n")) {
+      if (line === "") continue
+      const want = seq + 1
+      const e = parseLine(line)
+      if (e === undefined) return { ok: false, checked: checked, firstBad: want, reason: "line is not a complete event" }
+      if (e.seq !== want) return { ok: false, checked: checked, firstBad: want, reason: "seq is " + e.seq + ", expected " + want }
+      if (e.prev !== prev) return { ok: false, checked: checked, firstBad: want, reason: "prev does not match the previous event's hash" }
+      const hash = digest(e)
+      if (e.hash !== hash) return { ok: false, checked: checked, firstBad: want, reason: "hash does not match the event content" }
+      if (e.sig !== sign(this.keyBytes, hash)) return { ok: false, checked: checked, firstBad: want, reason: "signature does not verify with this key" }
+      seq = want
+      prev = hash
+      checked += 1
+    }
+    return { ok: true, checked: checked }
+  }
+
+  // Events in memory, newest first. Limit is clamped to 1000 and defaults to 50.
+  query(q: AuditQuery): { events: AuditEvent[], total: int } {
+    const limit = Math.min(1000, Math.max(0, q.limit ?? 50))
+    const offset = Math.max(0, q.offset ?? 0)
+    const events: AuditEvent[] = []
+    let total = 0
+    for (let i = this.mem.length - 1; i >= 0; i--) {
+      const e = this.mem[i]!
+      if (!matches(e, q)) continue
+      if (total >= offset && events.length < limit) events.push(e)
+      total += 1
+    }
+    return { events: events, total: total }
+  }
+
+  // The file's lines, unchanged, so each one still verifies on its own. With a
+  // range, lines that cannot be read are left out, since they have no time.
+  exportJsonl(since?: f64, until?: f64): string throws Error {
+    if (!existsSync(this.file)) return ""
+    const ranged = since !== undefined || until !== undefined
+    const out: string[] = []
+    for (const line of try readFileSync(this.file, "utf8").split("\n")) {
+      if (line === "") continue
+      const e = parseLine(line)
+      if (e === undefined) {
+        if (!ranged) out.push(line)
+        continue
+      }
+      if (since !== undefined && e.ts < since) continue
+      if (until !== undefined && e.ts > until) continue
+      out.push(line)
+    }
+    return out.length === 0 ? "" : out.join("\n") + "\n"
+  }
+
+  private remember(e: AuditEvent): void {
+    this.mem.push(e)
+    if (this.mem.length > this.cap) this.mem = this.mem.slice(this.mem.length - this.cap)
+  }
+}
+
+// The singular object name of a governance collection, or undefined.
+function singular(collection: string): string | undefined {
+  if (collection === "virtual-keys") return "virtual_key"
+  if (collection === "budgets") return "budget"
+  if (collection === "rate-limits") return "rate_limit"
+  if (collection === "teams") return "team"
+  if (collection === "customers") return "customer"
+  return undefined
+}
+
+// The admin action a management API request performs, and the object it acts on.
+// Routes not listed here are recorded as api.<method> with the path as target.
+export function actionFor(method: string, path: string): { action: string, target: string } {
+  const m = method.toUpperCase()
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  const segs = p.split("/").filter((s) => s !== "")
+  const generic = { action: "api." + m.toLowerCase(), target: p }
+  if (segs[0] === "api" && segs[1] === "providers" && segs.length >= 3) {
+    const name = segs[2]!
+    if (segs.length === 3) {
+      if (m === "PUT") return { action: "provider.upsert", target: name }
+      if (m === "DELETE") return { action: "provider.delete", target: name }
+    }
+    if (segs.length === 4 && segs[3] === "keys" && m === "POST") return { action: "key.create", target: name }
+    if (segs.length === 5 && segs[3] === "keys") {
+      const target = name + "/" + segs[4]!
+      if (m === "PUT") return { action: "key.update", target: target }
+      if (m === "DELETE") return { action: "key.delete", target: target }
+    }
+    return generic
+  }
+  if (segs[0] === "api" && segs[1] === "governance" && segs.length >= 3) {
+    const sing = singular(segs[2]!)
+    if (sing !== undefined) {
+      if (segs.length === 3 && m === "POST") return { action: sing + ".create", target: "" }
+      if (segs.length === 4) {
+        const id = segs[3]!
+        if (m === "PUT") return { action: sing + ".update", target: id }
+        if (m === "DELETE") return { action: sing + ".delete", target: id }
+      }
+    }
+  }
+  return generic
+}
+
+// The JSON body with the value of every secret field replaced by "****", at any
+// depth inside objects and arrays. A body that is not a JSON object or array
+// becomes "" rather than being logged raw.
+export function maskDetail(body: string): string {
+  const t = body.trim()
+  if (!t.startsWith("{") && !t.startsWith("[")) return ""
+  try {
+    return maskRaw(t)
+  } catch (err) {
+    return ""
+  }
+}
+
+function maskRaw(raw: string): string throws SyntaxError {
+  if (raw.startsWith("[")) {
+    const parts: string[] = []
+    for (const el of try elements(raw)) {
+      const masked = try maskRaw(el)
+      parts.push(masked)
+    }
+    return "[" + parts.join(",") + "]"
+  }
+  if (raw.startsWith("{")) {
+    const out: Field[] = []
+    for (const f of try fields(raw)) {
+      const isSecret = SECRET_FIELDS.includes(f.key.toLowerCase()) && f.raw !== "null"
+      if (isSecret) {
+        out.push({ key: f.key, raw: quote("****") })
+      } else {
+        const masked = try maskRaw(f.raw)
+        out.push({ key: f.key, raw: masked })
+      }
+    }
+    return build(out)
+  }
+  return raw
+}
+
+function tmpDir(): string {
+  const r = try secureHex(12)
+  return "/tmp/raiju-audit-test-" + r
+}
+
+function expectAction(method: string, path: string, action: string, target: string): void {
+  const r = actionFor(method, path)
+  expect(r.action).toBe(action)
+  expect(r.target).toBe(target)
+}
+
+const TEST_KEY = "test-key-0123456789"
+
+test("records chain: each event links to the hash before it", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    const a = try log.record("alice", "virtual_key.create", "", "POST", "/api/governance/virtual-keys", 201, "10.0.0.1", "{}", 1000.0)
+    const b = try log.record("alice", "provider.upsert", "openai", "PUT", "/api/providers/openai", 200, undefined, undefined, 2000.0)
+    const c = try log.record("ops-é", "provider.delete", "openai", "DELETE", "/api/providers/openai", 200, undefined, undefined, 3000.0)
+    expect(a.seq).toBe(1)
+    expect(b.seq).toBe(2)
+    expect(c.seq).toBe(3)
+    expect(a.prev).toBe(genesis())
+    expect(b.prev).toBe(a.hash)
+    expect(c.prev).toBe(b.hash)
+    expect(a.hash.byteLength).toBe(64)
+    expect(a.sig.byteLength).toBe(64)
+    expect(a.hash === b.hash).toBe(false)
+    expect(a.ip).toBe("10.0.0.1")
+    expect(b.ip).toBeUndefined()
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("verify accepts an intact log and reports how many it checked", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    try log.record("alice", "a.one", "", "PUT", "/api/providers/x", 200, undefined, "{\"keys\":[]}", 1.0)
+    try log.record("alice", "a.two", "", "PUT", "/api/providers/y", 200, undefined, undefined, 2.0)
+    try log.record("bob", "a.three", "", "DELETE", "/api/providers/y", 200, undefined, undefined, 3.0)
+    const r = try log.verify()
+    expect(r.ok).toBe(true)
+    expect(r.checked).toBe(3)
+    expect(r.firstBad).toBeUndefined()
+    expect((try new AuditLog(dir + "-empty", TEST_KEY, 5).verify()).ok).toBe(true)
+    try rmSync(dir + "-empty", { recursive: true, force: true })
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("editing a line is detected at that line's seq", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    try log.record("alice", "a.one", "", "PUT", "/api/providers/x", 200, undefined, undefined, 1.0)
+    try log.record("alice", "a.two", "", "PUT", "/api/providers/y", 200, undefined, undefined, 2.0)
+    try log.record("alice", "a.three", "", "PUT", "/api/providers/z", 200, undefined, undefined, 3.0)
+    const path = join(dir, "audit.jsonl")
+    const lines = try readFileSync(path, "utf8").split("\n")
+    lines[1] = lines[1]!.replaceAll("\"alice\"", "\"mallory\"")
+    try writeFileSync(path, lines.join("\n"))
+    const r = try log.verify()
+    expect(r.ok).toBe(false)
+    expect(r.checked).toBe(1)
+    expect(r.firstBad).toBe(2)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("deleting a line is detected as a seq gap", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    try log.record("alice", "a.one", "", "PUT", "/api/providers/x", 200, undefined, undefined, 1.0)
+    try log.record("alice", "a.two", "", "PUT", "/api/providers/y", 200, undefined, undefined, 2.0)
+    try log.record("alice", "a.three", "", "PUT", "/api/providers/z", 200, undefined, undefined, 3.0)
+    const path = join(dir, "audit.jsonl")
+    const lines = try readFileSync(path, "utf8").split("\n").filter((l) => l !== "")
+    const kept = lines.filter((_l, i) => i !== 1)
+    try writeFileSync(path, kept.join("\n") + "\n")
+    const r = try new AuditLog(dir, TEST_KEY, 100).verify()
+    expect(r.ok).toBe(false)
+    expect(r.checked).toBe(1)
+    expect(r.firstBad).toBe(2)
+    expect(r.reason!.includes("seq is 3")).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a new log on the same dir continues the chain after a restart", () => {
+  const dir = try tmpDir()
+  try {
+    const a = try new AuditLog(dir, TEST_KEY, 100)
+    try a.record("alice", "a.one", "", "PUT", "/api/providers/x", 200, undefined, undefined, 1.0)
+    const last = try a.record("alice", "a.two", "", "PUT", "/api/providers/y", 200, undefined, undefined, 2.0)
+    const b = try new AuditLog(dir, TEST_KEY, 100)
+    expect(b.query({}).total).toBe(2)
+    const next = try b.record("bob", "a.three", "", "DELETE", "/api/providers/y", 200, undefined, undefined, 3.0)
+    expect(next.seq).toBe(3)
+    expect(next.prev).toBe(last.hash)
+    const r = try b.verify()
+    expect(r.ok).toBe(true)
+    expect(r.checked).toBe(3)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a signature made with another key fails verification", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    try log.record("alice", "a.one", "", "PUT", "/api/providers/x", 200, undefined, undefined, 1.0)
+    const other = try new AuditLog(dir, "some-other-key", 100)
+    const r = try other.verify()
+    expect(r.ok).toBe(false)
+    expect(r.firstBad).toBe(1)
+    expect(r.reason!.includes("signature")).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("an empty key generates one that is persisted and reused", () => {
+  const dir = try tmpDir()
+  try {
+    const a = try new AuditLog(dir, "", 100)
+    try a.record("alice", "a.one", "", "PUT", "/api/providers/x", 200, undefined, undefined, 1.0)
+    const stored = try readFileSync(join(dir, "audit.key"), "utf8")
+    expect(stored.trim().byteLength).toBe(64)
+    const b = try new AuditLog(dir, "", 100)
+    expect((try b.verify()).ok).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("actionFor maps management routes to actions and targets", () => {
+  expectAction("PUT", "/api/providers/openai", "provider.upsert", "openai")
+  expectAction("DELETE", "/api/providers/openai", "provider.delete", "openai")
+  expectAction("POST", "/api/providers/openai/keys", "key.create", "openai")
+  expectAction("DELETE", "/api/providers/openai/keys/k1", "key.delete", "openai/k1")
+  expectAction("POST", "/api/governance/virtual-keys", "virtual_key.create", "")
+  expectAction("PUT", "/api/governance/virtual-keys/vk1?x=1", "virtual_key.update", "vk1")
+  expectAction("DELETE", "/api/governance/virtual-keys/vk1", "virtual_key.delete", "vk1")
+  expectAction("POST", "/api/governance/budgets", "budget.create", "")
+  expectAction("PUT", "/api/governance/rate-limits/rl", "rate_limit.update", "rl")
+  expectAction("DELETE", "/api/governance/teams/t1", "team.delete", "t1")
+  expectAction("POST", "/api/governance/customers", "customer.create", "")
+  expectAction("GET", "/api/config", "api.get", "/api/config")
+  expectAction("POST", "/api/unknown/x", "api.post", "/api/unknown/x")
+})
+
+test("maskDetail masks secret fields at any depth and keeps the rest", () => {
+  const body = "{\"keys\":[{\"value\":\"sk-abc\",\"id\":\"1\"}],\"meta\":{\"token\":\"t\",\"name\":\"n\"},\"list\":[1,\"a\",{\"password\":\"p\"}],\"x\":null,\"auth_credentials\":{\"a\":1}}"
+  const want = "{\"keys\":[{\"value\":\"****\",\"id\":\"1\"}],\"meta\":{\"token\":\"****\",\"name\":\"n\"},\"list\":[1,\"a\",{\"password\":\"****\"}],\"x\":null,\"auth_credentials\":\"****\"}"
+  expect(maskDetail(body)).toBe(want)
+  expect(maskDetail("{\"name\":\"gpt\"}")).toBe("{\"name\":\"gpt\"}")
+  expect(maskDetail("[{\"session_token\":\"s\"}]")).toBe("[{\"session_token\":\"****\"}]")
+  expect(maskDetail("not json")).toBe("")
+  expect(maskDetail("{\"value\":")).toBe("")
+})
+
+test("query filters by actor, action and time, newest first, with paging", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    try log.record("alice", "provider.upsert", "openai", "PUT", "/api/providers/openai", 200, undefined, undefined, 1000.0)
+    try log.record("bob", "virtual_key.create", "", "POST", "/api/governance/virtual-keys", 201, undefined, undefined, 2000.0)
+    try log.record("alice", "virtual_key.delete", "vk1", "DELETE", "/api/governance/virtual-keys/vk1", 200, undefined, undefined, 3000.0)
+    try log.record("carol", "provider.delete", "openai", "DELETE", "/api/providers/openai", 200, undefined, undefined, 4000.0)
+
+    const all = log.query({})
+    expect(all.total).toBe(4)
+    expect(all.events[0]!.seq).toBe(4)
+    expect(all.events[3]!.seq).toBe(1)
+    expect(log.query({ actor: "alice" }).total).toBe(2)
+    expect(log.query({ action: "provider.delete" }).total).toBe(1)
+    expect(log.query({ actor: "alice", action: "virtual_key.delete" }).events[0]!.target).toBe("vk1")
+    expect(log.query({ since: 2000.0, until: 3000.0 }).total).toBe(2)
+    expect(log.query({ actor: "nobody" }).total).toBe(0)
+
+    const page = log.query({ limit: 2, offset: 1 })
+    expect(page.total).toBe(4)
+    expect(page.events.map((e) => e.seq).join(",")).toBe("3,2")
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("exportJsonl returns file lines in range, unchanged and still verifiable", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    try log.record("alice", "a.one", "", "PUT", "/api/providers/x", 200, undefined, undefined, 1000.0)
+    try log.record("alice", "a.two", "", "PUT", "/api/providers/y", 200, undefined, undefined, 2000.0)
+    try log.record("alice", "a.three", "", "PUT", "/api/providers/z", 200, undefined, undefined, 3000.0)
+    const all = (try log.exportJsonl()).split("\n").filter((l) => l !== "")
+    expect(all.length).toBe(3)
+    const mid = (try log.exportJsonl(2000.0, 3000.0)).split("\n").filter((l) => l !== "")
+    expect(mid.length).toBe(2)
+    expect((try parseLine(mid[0]!))!.seq).toBe(2)
+    expect((try parseLine(mid[1]!))!.seq).toBe(3)
+    expect(try log.exportJsonl(5000.0)).toBe("")
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("the in-memory window keeps only the newest maxMemory events", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 2)
+    for (let i = 1; i <= 4; i++) try log.record("a", "x", "", "PUT", "/p", 200, undefined, undefined, i * 1.0)
+    const r = log.query({})
+    expect(r.total).toBe(2)
+    expect(r.events[0]!.seq).toBe(4)
+    expect(r.events[1]!.seq).toBe(3)
+    expect((try log.verify()).checked).toBe(4)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})

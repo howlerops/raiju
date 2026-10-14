@@ -1,0 +1,293 @@
+// Session affinity (Bifrost's sticky sessions): requests in one conversation go
+// to the same provider and key, so upstream prompt caches stay warm and replies
+// stay consistent. Pure logic: every call takes `nowMs`, so nothing reads a clock.
+
+import { Hdrs, hdrs } from "./schemas"
+
+export type AffinityConfig = { enabled: bool, ttl_ms: int, max_sessions: int }
+
+// Off by default: affinity changes which key a request gets, so it is opt-in.
+export function defaultAffinityConfig(): AffinityConfig {
+  return { enabled: false, ttl_ms: 3600000, max_sessions: 100000 }
+}
+
+// Header names that can carry a session id, in precedence order. A function, not
+// a top-level constant, because top-level statements in imported modules do not run.
+function sessionHeaders(): string[] {
+  return ["x-bf-session-id", "x-claude-code-session-id", "x-session-id", "session_id", "thread-id", "conversation_id"]
+}
+
+// The first non-empty session id. Oversized values (over 256 bytes) count as
+// absent, so the next header is tried.
+export function sessionId(h: Hdrs): string | undefined {
+  for (const name of sessionHeaders()) {
+    const v = h.get(name)
+    if (v === undefined) continue
+    const t = v.trim()
+    if (t === "" || t.byteLength > 256) continue
+    return t
+  }
+  return undefined
+}
+
+// The binding lifetime for this request: `x-bf-session-ttl` as seconds ("600")
+// or with an s/m/h suffix ("10m"), clamped to [1 s, 24 h]. Anything unparsable
+// falls back to the configured ttl.
+export function sessionTtl(h: Hdrs, cfg: AffinityConfig): int {
+  const raw = h.get("x-bf-session-ttl")
+  if (raw === undefined) return cfg.ttl_ms
+  const s = raw.trim().toLowerCase()
+  if (s === "") return cfg.ttl_ms
+  const n = s.byteLength
+  const unit = s.slice(n - 1, n)
+  let num = s
+  let mult = 1000.0
+  if (unit === "s" || unit === "m" || unit === "h") {
+    num = s.slice(0, n - 1)
+    mult = unit === "s" ? 1000.0 : unit === "m" ? 60000.0 : 3600000.0
+  }
+  const v = parseFloat(num)
+  if (v === undefined || !(v >= 0.0)) return cfg.ttl_ms
+  return Math.round(Math.min(Math.max(v * mult, 1000.0), 86400000.0))
+}
+
+// `x-bf-session-affinity: off` opts a single request out of affinity.
+export function affinityMode(h: Hdrs): "sticky" | "off" {
+  const v = h.get("x-bf-session-affinity")
+  if (v !== undefined && v.trim().toLowerCase() === "off") return "off"
+  return "sticky"
+}
+
+export type Binding = { provider: string, model: string, keyId: string, expires: f64 }
+
+// Bindings by session id. Expired entries are dropped when read, by sweep(), or
+// when the store is full.
+export class AffinityStore {
+  private entries: Map<string, Binding> = new Map()
+
+  constructor(readonly cfg: AffinityConfig) {}
+
+  // The live binding for a session. An expired one is removed and reads as absent.
+  get(session: string, nowMs: f64): Binding | undefined {
+    const b = this.entries.get(session)
+    if (b === undefined) return undefined
+    if (nowMs >= b.expires) {
+      this.entries.delete(session)
+      return undefined
+    }
+    return b
+  }
+
+  bind(session: string, provider: string, model: string, keyId: string, ttlMs: int, nowMs: f64): void {
+    if (!this.entries.has(session) && this.entries.size >= this.cfg.max_sessions) this.evict(nowMs)
+    this.entries.set(session, { provider: provider, model: model, keyId: keyId, expires: nowMs + ttlMs })
+  }
+
+  // Sliding expiry: a live session's binding runs for ttlMs from this use.
+  // Returns false when there is no live binding to extend.
+  touch(session: string, nowMs: f64, ttlMs: int): bool {
+    const b = this.get(session, nowMs)
+    if (b === undefined) return false
+    this.entries.set(session, { provider: b.provider, model: b.model, keyId: b.keyId, expires: nowMs + ttlMs })
+    return true
+  }
+
+  forget(session: string): void {
+    this.entries.delete(session)
+  }
+
+  // Stored entries, including expired ones that sweep() has not removed yet.
+  size(): int {
+    return this.entries.size
+  }
+
+  // Removes expired entries and returns how many went.
+  sweep(nowMs: f64): int {
+    let n = 0
+    for (const k of this.entries.keys()) {
+      const b = this.entries.get(k)
+      if (b !== undefined && nowMs >= b.expires) {
+        this.entries.delete(k)
+        n += 1
+      }
+    }
+    return n
+  }
+
+  // Called when full: drops expired entries, then the entries closest to expiry,
+  // down to 90% of capacity. Batching keeps the sort from running on every bind.
+  private evict(nowMs: f64): void {
+    this.sweep(nowMs)
+    const max = this.cfg.max_sessions
+    if (this.entries.size < max) return
+    const target = Math.floor(max * 0.9)
+    const all: { k: string, e: f64 }[] = []
+    for (const k of this.entries.keys()) all.push({ k: k, e: this.entries.get(k)!.expires })
+    all.sort((a, b) => a.e - b.e)
+    const drop = this.entries.size - target
+    for (let i = 0; i < drop && i < all.length; i++) this.entries.delete(all[i]!.k)
+  }
+}
+
+// The binding for this request's session, if it is for the same provider and
+// model being requested now. A different model in the same session is not forced
+// onto the old key. A hit extends the binding (sliding expiry).
+export function resolveSticky(store: AffinityStore, h: Hdrs, requestedProvider: string, requestedModel: string, nowMs: f64): { provider: string, model: string, keyId: string } | undefined {
+  if (!store.cfg.enabled || affinityMode(h) === "off") return undefined
+  const sid = sessionId(h)
+  if (sid === undefined) return undefined
+  const b = store.get(sid, nowMs)
+  if (b === undefined || b.provider !== requestedProvider || b.model !== requestedModel) return undefined
+  store.touch(sid, nowMs, sessionTtl(h, store.cfg))
+  return { provider: b.provider, model: b.model, keyId: b.keyId }
+}
+
+function testConfig(enabled: bool, max: int): AffinityConfig {
+  return { enabled: enabled, ttl_ms: 60000, max_sessions: max }
+}
+
+test("session id takes the first non-empty known header", () => {
+  expect(sessionId(hdrs([["x-bf-session-id", "bf"], ["x-session-id", "s"]]))).toBe("bf")
+  expect(sessionId(hdrs([["x-claude-code-session-id", "cc"], ["thread-id", "t"]]))).toBe("cc")
+  expect(sessionId(hdrs([["conversation_id", "c"]]))).toBe("c")
+  expect(sessionId(hdrs([["session_id", "u"], ["thread-id", "t"]]))).toBe("u")
+  // empty and blank values fall through to the next header
+  expect(sessionId(hdrs([["x-bf-session-id", ""], ["thread-id", "t"]]))).toBe("t")
+  expect(sessionId(hdrs([["x-bf-session-id", "   "], ["x-session-id", " s "]]))).toBe("s")
+  expect(sessionId(hdrs([["content-type", "application/json"]]))).toBeUndefined()
+})
+
+test("oversized session ids are ignored", () => {
+  const big = "a".repeat(257)
+  expect(sessionId(hdrs([["x-bf-session-id", big], ["x-session-id", "ok"]]))).toBe("ok")
+  expect(sessionId(hdrs([["x-bf-session-id", big]]))).toBeUndefined()
+  expect(sessionId(hdrs([["x-bf-session-id", "a".repeat(256)]]))).toBe("a".repeat(256))
+})
+
+test("session ttl parses seconds and units and clamps", () => {
+  const cfg = testConfig(true, 10)
+  expect(sessionTtl(new Map<string, string>(), cfg)).toBe(60000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "600"]]), cfg)).toBe(600000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "30s"]]), cfg)).toBe(30000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "10m"]]), cfg)).toBe(600000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "2h"]]), cfg)).toBe(7200000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "1.5m"]]), cfg)).toBe(90000)
+  // clamped to [1 s, 24 h]
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "0"]]), cfg)).toBe(1000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "1"]]), cfg)).toBe(1000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "99h"]]), cfg)).toBe(86400000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "1000000"]]), cfg)).toBe(86400000)
+  // unparsable values fall back to the configured ttl
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "soon"]]), cfg)).toBe(60000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "5x"]]), cfg)).toBe(60000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", "-5"]]), cfg)).toBe(60000)
+  expect(sessionTtl(hdrs([["x-bf-session-ttl", ""]]), cfg)).toBe(60000)
+})
+
+test("affinity can be turned off per request", () => {
+  expect(affinityMode(hdrs([["x-bf-session-affinity", "off"]]))).toBe("off")
+  expect(affinityMode(hdrs([["x-bf-session-affinity", " OFF "]]))).toBe("off")
+  expect(affinityMode(hdrs([["x-bf-session-affinity", "on"]]))).toBe("sticky")
+  expect(affinityMode(new Map<string, string>())).toBe("sticky")
+  expect(defaultAffinityConfig().ttl_ms).toBe(3600000)
+  expect(defaultAffinityConfig().max_sessions).toBe(100000)
+})
+
+test("bindings are readable until they expire", () => {
+  const s = new AffinityStore(testConfig(true, 10))
+  s.bind("a", "openai", "gpt-4o", "key1", 500, 1000.0)
+  expect(s.get("a", 1499.0)?.keyId).toBe("key1")
+  expect(s.get("a", 1500.0)).toBeUndefined()
+  // the expired read removed it
+  expect(s.size()).toBe(0)
+  s.bind("b", "openai", "gpt-4o", "key2", 500, 0.0)
+  s.forget("b")
+  expect(s.get("b", 0.0)).toBeUndefined()
+})
+
+test("touch slides the expiry on use", () => {
+  const s = new AffinityStore(testConfig(true, 10))
+  s.bind("a", "openai", "gpt-4o", "key1", 1000, 0.0)
+  expect(s.touch("a", 900.0, 1000)).toBe(true)
+  // now expires at 1900, not 1000
+  expect(s.get("a", 1500.0)?.keyId).toBe("key1")
+  expect(s.get("a", 1900.0)).toBeUndefined()
+  // touching an absent or expired session does nothing
+  expect(s.touch("a", 5000.0, 1000)).toBe(false)
+  expect(s.touch("zzz", 0.0, 1000)).toBe(false)
+})
+
+test("sweep removes only expired bindings", () => {
+  const s = new AffinityStore(testConfig(true, 10))
+  s.bind("short", "openai", "m", "k1", 100, 0.0)
+  s.bind("long", "openai", "m", "k2", 1000, 0.0)
+  expect(s.sweep(500.0)).toBe(1)
+  expect(s.size()).toBe(1)
+  expect(s.get("long", 500.0)?.keyId).toBe("k2")
+  expect(s.sweep(500.0)).toBe(0)
+})
+
+test("a full store evicts the bindings closest to expiry", () => {
+  const s = new AffinityStore(testConfig(true, 10))
+  for (let i = 0; i < 10; i++) s.bind("s" + i, "openai", "m", "k", 1000 * (i + 1), 0.0)
+  expect(s.size()).toBe(10)
+  s.bind("new", "openai", "m", "k", 100000, 0.0)
+  expect(s.size() <= 10).toBe(true)
+  // the soonest-expiring sessions went first; the latest-expiring survived
+  expect(s.get("s0", 0.0)).toBeUndefined()
+  expect(s.get("s9", 0.0)?.keyId).toBe("k")
+  expect(s.get("new", 0.0)?.keyId).toBe("k")
+  // rebinding a live session does not need room
+  const t = new AffinityStore(testConfig(true, 2))
+  t.bind("x", "openai", "m", "k", 1000, 0.0)
+  t.bind("y", "openai", "m", "k", 1000, 0.0)
+  t.bind("x", "anthropic", "m2", "k3", 1000, 0.0)
+  expect(t.get("x", 0.0)?.provider).toBe("anthropic")
+  expect(t.get("y", 0.0)?.keyId).toBe("k")
+})
+
+test("a full store drops expired bindings before live ones", () => {
+  const s = new AffinityStore(testConfig(true, 3))
+  s.bind("dead", "openai", "m", "k", 10, 0.0)
+  s.bind("live1", "openai", "m", "k", 100000, 0.0)
+  s.bind("live2", "openai", "m", "k", 100000, 0.0)
+  s.bind("new", "openai", "m", "k", 100000, 1000.0)
+  expect(s.get("live1", 1000.0)?.keyId).toBe("k")
+  expect(s.get("live2", 1000.0)?.keyId).toBe("k")
+  expect(s.get("new", 1000.0)?.keyId).toBe("k")
+})
+
+test("resolveSticky returns the binding only for the same provider and model", () => {
+  const s = new AffinityStore(testConfig(true, 10))
+  s.bind("sess-1", "openai", "gpt-4o", "key-a", 60000, 0.0)
+  const h = hdrs([["x-bf-session-id", "sess-1"]])
+  expect(resolveSticky(s, h, "openai", "gpt-4o", 1000.0)).toEqual({ provider: "openai", model: "gpt-4o", keyId: "key-a" })
+  // a different model in the same session is not forced onto the old key
+  expect(resolveSticky(s, h, "openai", "gpt-4o-mini", 1000.0)).toBeUndefined()
+  expect(resolveSticky(s, h, "anthropic", "gpt-4o", 1000.0)).toBeUndefined()
+  // a mismatch does not touch the binding
+  expect(s.get("sess-1", 60000.0 - 1.0)?.keyId).toBe("key-a")
+})
+
+test("resolveSticky respects off, missing ids, disabled config and expiry", () => {
+  const s = new AffinityStore(testConfig(true, 10))
+  s.bind("sess-1", "openai", "gpt-4o", "key-a", 60000, 0.0)
+  const off = hdrs([["x-bf-session-id", "sess-1"], ["x-bf-session-affinity", "off"]])
+  expect(resolveSticky(s, off, "openai", "gpt-4o", 1000.0)).toBeUndefined()
+  expect(resolveSticky(s, new Map<string, string>(), "openai", "gpt-4o", 1000.0)).toBeUndefined()
+  const h = hdrs([["x-bf-session-id", "sess-1"]])
+  expect(resolveSticky(s, h, "openai", "gpt-4o", 60000.0)).toBeUndefined()
+  const d = new AffinityStore(testConfig(false, 10))
+  d.bind("sess-1", "openai", "gpt-4o", "key-a", 60000, 0.0)
+  expect(resolveSticky(d, h, "openai", "gpt-4o", 1000.0)).toBeUndefined()
+})
+
+test("a sticky hit slides the expiry by the request's ttl", () => {
+  const s = new AffinityStore(testConfig(true, 10))
+  s.bind("sess-1", "openai", "gpt-4o", "key-a", 60000, 0.0)
+  const h = hdrs([["x-bf-session-id", "sess-1"], ["x-bf-session-ttl", "2m"]])
+  expect(resolveSticky(s, h, "openai", "gpt-4o", 50000.0) === undefined).toBe(false)
+  // extended to 50000 + 120000
+  expect(s.get("sess-1", 150000.0)?.keyId).toBe("key-a")
+  expect(s.get("sess-1", 170000.0)).toBeUndefined()
+})

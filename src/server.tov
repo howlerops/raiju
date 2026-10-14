@@ -14,7 +14,8 @@ import { Session, prepare, onOpen, onMessage, onClose } from "./realtime"
 import { parseQuery } from "./logstore"
 import { matchRoute, handleMedia } from "./media"
 import { snapshot } from "./schemas"
-import { ConfigStore, checkAdmin, handleApi } from "./store"
+import { handleApi } from "./store"
+import { Ops, Reply } from "./ops"
 import { rerank, countTokens, asyncSubmit, asyncGet, Dispatch } from "./extras"
 import { INDEX_HTML } from "./ui_assets"
 
@@ -99,21 +100,23 @@ function dispatcher(engine: Engine): Dispatch {
   }
 }
 
-// 401 unless the request carries the admin credentials (when any are configured).
-function admin(engine: Engine, req: Request): Response | undefined {
-  if (checkAdmin(engine.cfg.governance?.auth_config, snapshot(req.headers))) return undefined
-  const h: Record<string, string> = new Map()
-  h.set("content-type", "application/json")
-  h.set("www-authenticate", `Bearer realm="raiju", Basic realm="raiju"`)
-  return new Response(`{"error":{"message":"admin credentials required","type":"authentication_error"}}`, { status: 401, headers: h })
-}
-
-async function manage(engine: Engine, store: ConfigStore, req: Request, path: string): Promise<Response> {
-  const denied = admin(engine, req)
-  if (denied !== undefined) return denied
+// The management API, behind RBAC; every change lands in the audit log.
+async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
+  const gate = ops.gate(req, path)
+  if (gate.kind === "deny") return gate.res
   const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
-  const r = handleApi(store, req.method, path, body)
-  return new Response(r.body, { status: r.status, headers: { "content-type": "application/json" } })
+  let r: Reply = { status: 404, body: "", contentType: "application/json" }
+  if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body)
+  else if (path === "/api/audit-logs" || path.startsWith("/api/audit-logs/")) r = ops.auditRoute(req, path)
+  else if (path === "/api/alerts") r = req.method === "GET" ? ops.alertsView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else {
+    const a = handleApi(ops.store, req.method, path, body)
+    r = { status: a.status, body: a.body, contentType: "application/json" }
+  }
+  ops.recordChange(gate.actor, req, path, r.status, body)
+  const h: Record<string, string> = new Map()
+  h.set("content-type", r.contentType)
+  return new Response(r.body, { status: r.status, headers: h })
 }
 
 function mcpView(engine: Engine): Response {
@@ -163,23 +166,24 @@ const CHAT_PATHS = ["/v1/chat/completions", "/openai/v1/chat/completions", "/ope
 
 // Every HTTP route except the WebSocket upgrade, in one function so both
 // servers (http1 for streaming, Bun.serve as the fallback) share it.
-export async function dispatch(engine: Engine, store: ConfigStore, req: Request): Promise<Response> throws TypeError {
+export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   const m = req.method
   const segs = p.split("/")
+  if (p === "/mcp") return await ops.mcp(req)
   if (m === "GET" || m === "HEAD") {
     if (p === "/health") return Response.json({ status: "ok" })
     if (p === "/") return textResponse(INDEX_HTML, "text/html; charset=utf-8")
     if (p === "/metrics") return textResponse(metrics.render(), "text/plain; version=0.0.4")
     if (p === "/v1/models" || p === "/openai/v1/models") return cors(engine.cfg, req, await listModels(engine, req))
     if (p.startsWith("/v1/async/jobs/") && segs.length === 5) return asyncGet(engine.jobs, segs[4]!)
-    if (p === "/api/cache") return admin(engine, req) ?? cacheView(engine)
-    if (p === "/api/logs") return admin(engine, req) ?? logsView(engine, req, false)
-    if (p === "/api/logs/stats") return admin(engine, req) ?? logsView(engine, req, true)
-    if (p === "/api/governance/usage") return admin(engine, req) ?? Response.json({ budgets: engine.gov.budgetUsage() })
-    if (p === "/api/mcp") return admin(engine, req) ?? mcpView(engine)
-    if (p === "/api/health") return admin(engine, req) ?? Response.json({ targets: engine.health.snapshot(Date.now()) })
+    if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
+    if (p === "/api/logs") return ops.check(req, p) ?? logsView(engine, req, false)
+    if (p === "/api/logs/stats") return ops.check(req, p) ?? logsView(engine, req, true)
+    if (p === "/api/governance/usage") return ops.check(req, p) ?? Response.json({ budgets: engine.gov.budgetUsage() })
+    if (p === "/api/mcp") return ops.check(req, p) ?? mcpView(engine)
+    if (p === "/api/health") return ops.check(req, p) ?? Response.json({ targets: engine.health.snapshot(Date.now()) })
   }
   if (m === "POST") {
     if (CHAT_PATHS.includes(p) || (p.startsWith("/openai/deployments/") && p.endsWith("/chat/completions"))) return cors(engine.cfg, req, await engine.chat(req))
@@ -196,7 +200,7 @@ export async function dispatch(engine: Engine, store: ConfigStore, req: Request)
     if (p.startsWith("/v1/async/")) return await asyncSubmit(engine.jobs, req, p, dispatcher(engine))
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
-  if (p.startsWith("/api/")) return await manage(engine, store, req, p)
+  if (p.startsWith("/api/")) return await manage(ops, req, p)
   // audio, images, files and batches: passed through to OpenAI-compatible providers
   const media = matchRoute(m, p)
   if (media !== undefined) {
@@ -213,7 +217,7 @@ export async function dispatch(engine: Engine, store: ConfigStore, req: Request)
 }
 
 // The Bun.serve server (used with -server bun): buffered responses, Tov's multi-process workers.
-export function start(engine: Engine, store: ConfigStore, opts: ServeOptions): string {
+export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
   const server = Bun.serve<Session>({
     port: opts.port,
     hostname: opts.hostname,
@@ -227,7 +231,7 @@ export function start(engine: Engine, store: ConfigStore, opts: ServeOptions): s
         if (server.upgrade(req, { data: up.session })) return
         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
       }
-      return dispatch(engine, store, req)
+      return dispatch(engine, ops, req)
     },
     websocket: {
       open: (ws) => onOpen(ws),

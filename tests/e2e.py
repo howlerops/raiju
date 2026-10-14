@@ -110,6 +110,7 @@ def main():
     config = write_config()
     import shutil
     shutil.rmtree(os.path.join(ROOT, "build/e2e-logs"), ignore_errors=True)
+    shutil.rmtree(os.path.join(ROOT, "build/e2e-audit"), ignore_errors=True)
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
@@ -387,6 +388,72 @@ def main():
             check("stream chunks arrive incrementally", len(arrivals) == 4 and spread > 0.3, arrivals)
             check("streamed model renamed for the caller", b'"model":"slowai/slow"' in data and b"[DONE]" in data, data[:300])
             check("usage chunk dropped when not requested", b'"usage"' not in data, data[-300:])
+
+        # --- wave 5 ---
+        hl = lambda h: {k.lower(): v for k, v in h.items()}
+        s, _, b = chat("vaulted/gpt-4o-mini", seed=901)
+        vault_reads = [x for x in seen() if x["path"] == "/v1/secret/data/raiju"]
+        check("vault secret resolved into a provider key", s == 200 and seen()[-1]["auth"] == "Bearer sk-from-vault" and vault_reads and vault_reads[0]["body"] == "root-token", (s, b, seen()[-1]))
+
+        s, h, b = chat("auto", seed=902)
+        check("complexity router sends a simple prompt to the simple tier", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hello from gpt-4o-mini" and hl(h).get("x-bf-complexity-tier") == "SIMPLE", (h, b))
+        s, h, b = chat("auto", headers={"x-bf-complexity-tier": "complex"}, seed=903)
+        check("complexity tier override picks the complex tier", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hi from claude", b)
+
+        attempts = []
+        for i in range(6):
+            s, h, _ = chat("openai/rotate-me", headers={"x-bf-session-id": "sess-42", "x-bf-mcp-include-clients": "none"}, seed=910 + i)
+            attempts.append((s, hl(h).get("x-bf-attempts")))
+        check("session affinity keeps a session on the key that worked", all(a == (200, "1") for a in attempts[1:]), attempts)
+
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "openai/agent-x", "messages": [{"role": "user", "content": "weather in Oslo?"}]})
+        r = json.loads(b)
+        check("MCP agent mode runs the tool and answers", s == 200 and r["choices"][0]["message"]["content"] == "It is sunny in Oslo" and hl(h).get("x-bf-agent-tool-calls") == "1", (h, b))
+
+        # the gateway as an MCP server
+        s, h, b = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}})
+        sid = hl(h).get("mcp-session-id", "")
+        check("MCP server initialize gives a session", s == 200 and sid != "" and "protocolVersion" in b, (s, h, b))
+        s, _, b = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {"mcp-session-id": sid})
+        check("MCP server lists the connected tools", s == 200 and "weather-get_weather" in b, b)
+        s, _, b = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "weather-get_weather", "arguments": {"city": "Oslo"}}}, {"mcp-session-id": sid})
+        check("MCP server runs a tool", s == 200 and "Sunny in Oslo" in b, b)
+        s, _, _ = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
+        check("MCP server refuses requests without a session", s == 400)
+
+        # RBAC: a viewer reads but can't change anything
+        s, _, b = call("POST", "/api/users", {"name": "viewer1", "role": "viewer"})
+        token = json.loads(b).get("token", "") if s == 201 else ""
+        check("admin creates a user and gets its token once", s == 201 and token.startswith("sk-admin-"), (s, b))
+        time.sleep(0.2)
+        V = {"authorization": "Bearer " + token}
+        s, _, _ = call("GET", "/api/config", headers=V)
+        check("a viewer can read the config", s == 200, s)
+        s, _, _ = call("PUT", "/api/providers/nope", {"keys": []}, headers=V)
+        check("a viewer can't change providers", s == 403, s)
+        s, _, b = call("GET", "/api/users")
+        check("users are listed without credential hashes", s == 200 and "viewer1" in b and "sha256" not in b, b)
+        saved = json.load(open(config))
+        check("users are saved hashed", any(u["name"] == "viewer1" and len(u.get("token_sha256", "")) == 64 for u in saved["governance"]["users"]), saved["governance"].get("users"))
+
+        # audit log
+        s, _, b = call("GET", "/api/audit-logs")
+        ev = json.loads(b).get("events", []) if s == 200 else []
+        check("audit log records changes with the actor", any(e["actor"] == "legacy-token" and e["path"] == "/api/users" and e["status"] == 201 for e in ev), b[:500])
+        check("audit log records denied changes", any(e["status"] == 403 and e["actor"] == "unauthenticated" for e in ev), b[:800])
+        s, _, b = call("GET", "/api/audit-logs/verify")
+        check("audit chain verifies", s == 200 and json.loads(b)["ok"] is True and json.loads(b)["checked"] >= 2, b)
+        s, h, b = call("GET", "/api/audit-logs/export")
+        check("audit export is JSONL", s == 200 and all(json.loads(l)["sig"] for l in b.strip().split("\n")), b[:300])
+        s, _, _ = call("GET", "/api/audit-logs", headers=V)
+        check("a viewer can't read the audit log", s == 403, s)
+
+        # alerting: "any traffic" fires to the webhook within one interval
+        time.sleep(1.5)
+        hooks = [json.loads(x["body"]) for x in seen() if x["path"] == "/alert-hook"]
+        check("an alert fires to the webhook", any(x.get("kind") == "firing" and x.get("rule") == "any-traffic" for x in hooks), hooks)
+        s, _, b = call("GET", "/api/alerts")
+        check("alert state is visible", s == 200 and '"firing"' in b, b[:300])
 
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
