@@ -626,6 +626,16 @@ def main():
         check("an alert fires to the webhook", any(x.get("kind") == "firing" and x.get("rule") == "any-traffic" for x in hooks), hooks)
         s, _, b = call("GET", "/api/alerts")
         check("alert state is visible", s == 200 and '"firing"' in b, b[:300])
+        # Bifrost's alert rules: CEL over a virtual key's budget usage, managed through /api/alerting
+        s, _, b = call("POST", "/api/alerting/rules", {"name": "vk budget", "enabled": True, "scope_type": "virtual_key", "scope_id": "vk-budget", "cel_expression": "budget_usage_percent >= 0.0 && budget_limit > 0.0", "channel_ids": ["hook"], "cooldown_milliseconds": 0})
+        rid = json.loads(b).get("id", "") if s in (200, 201) else ""
+        s2, _, _ = call("POST", "/api/alerting/rules", {"name": "bad", "enabled": True, "scope_type": "virtual_key", "scope_id": "vk-budget", "cel_expression": "budget_usage_percent >", "channel_ids": ["hook"]})
+        time.sleep(2.5)
+        hooks = [x["body"] for x in seen() if x["path"] == "/alert-hook"]
+        _, _, hb = call("GET", "/api/alerting/history")
+        check("a Bifrost alert rule is created over the API and fires", s in (200, 201) and rid != "" and s2 == 400 and any(rid in h or "vk budget" in h for h in hooks) and rid in hb, (s, b, s2, hooks[-2:], hb[:300]))
+        s, _, _ = call("DELETE", "/api/alerting/rules/" + rid)
+        check("alert rules delete", s == 200, s)
 
         # --- wave 7: providers and embeddings ---
         s, _, b = chat("watsonx/ibm/granite-3-8b-instruct", seed=1001, headers={"x-bf-mcp-include-clients": "none"})

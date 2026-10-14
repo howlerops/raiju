@@ -3,6 +3,7 @@
 import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig, AccessProfile, ModelConfigGovernance, ProviderGovernance } from "./config"
 import { Effective, applyProfiles, modelAllowed } from "./profiles"
 import { Hdrs, hdrs } from "./schemas"
+import { BudgetUsage, RateUse, ScopeUsage } from "./alerts"
 
 // "30s", "5m", "1h", "1d", "1w", "1M" (30 days), "1Q", "1Y" in milliseconds.
 export function durationMs(s: string): int {
@@ -423,6 +424,77 @@ export class Governance {
     return out
   }
 
+  // What a scope's alert rules are judged on: its budgets (each with the reset cycle it is
+  // in), and its highest-used request and token rate limits. Undefined when the scope does
+  // not exist. A virtual key owns its budget, and its provider configs' budgets and limits;
+  // a team or customer owns its budget. Reads the windows (rolling them to now) and changes nothing else.
+  scopeUsage(scopeType: string, scopeId: string, now: f64): ScopeUsage | undefined {
+    const budgetIds: string[] = []
+    const limitIds: string[] = []
+    if (scopeType === "virtual_key") {
+      const vk = this.vkById(scopeId)
+      if (vk === undefined) return undefined
+      if (vk.budget_id !== undefined) budgetIds.push(vk.budget_id)
+      if (vk.rate_limit_id !== undefined) limitIds.push(vk.rate_limit_id)
+      for (const pc of vk.provider_configs ?? []) {
+        if (pc.budget_id !== undefined) budgetIds.push(pc.budget_id)
+        if (pc.rate_limit_id !== undefined) limitIds.push(pc.rate_limit_id)
+      }
+    } else if (scopeType === "team") {
+      const t = this.teams.get(scopeId)
+      if (t === undefined) return undefined
+      if (t.budget !== undefined) budgetIds.push(t.budget)
+    } else if (scopeType === "customer") {
+      if (!this.customers.has(scopeId)) return undefined
+      const cb = this.customers.get(scopeId)
+      if (cb !== undefined) budgetIds.push(cb)
+    } else {
+      return undefined
+    }
+    const budgets: BudgetUsage[] = []
+    for (const id of budgetIds) {
+      const b = this.budgets.get(id)
+      if (b === undefined) continue
+      b.roll(now)
+      budgets.push({ id: id, spent: b.used + b.remote, limit: b.limit, window: b.id(now) })
+    }
+    const out: ScopeUsage = { scope_type: scopeType, scope_id: scopeId, budgets: budgets }
+    const rq = this.topLimit(limitIds, "request", now)
+    if (rq !== undefined) out.requests = rq
+    const tk = this.topLimit(limitIds, "token", now)
+    if (tk !== undefined) out.tokens = tk
+    return out
+  }
+
+  // The virtual key with this id (vks is keyed by the key's value).
+  private vkById(id: string): VirtualKeyConfig | undefined {
+    for (const k of this.vks.keys()) {
+      const vk = this.vks.get(k)
+      if (vk !== undefined && vk.id === id) return vk
+    }
+    return undefined
+  }
+
+  // The most-used of the named rate limits of one kind, as used (other nodes' use included) and limit.
+  private topLimit(ids: string[], kind: "request" | "token", now: f64): RateUse | undefined {
+    let best: RateUse | undefined = undefined
+    let bestFrac = -1.0
+    for (const id of ids) {
+      const l = this.limits.get(id)
+      if (l === undefined) continue
+      const w = kind === "request" ? l.requests : l.tokens
+      if (w === undefined || w.limit <= 0.0) continue
+      w.roll(now)
+      const used = w.used + w.remote
+      const frac = used / w.limit
+      if (frac > bestFrac) {
+        bestFrac = frac
+        best = { id: id, used: used, limit: w.limit }
+      }
+    }
+    return best
+  }
+
   budgetUsage(): { id: string, used: f64, limit: f64 }[] {
     const out: { id: string, used: f64, limit: f64 }[] = []
     for (const id of this.budgets.keys()) {
@@ -571,4 +643,51 @@ test("provider rate limit denies 429 for that provider only", () => {
   const d = g.admit(none, "anthropic", "claude")
   expect((d as Denial).status).toBe(429)
   expect(isDenial(g.admit(none, "openai", "gpt-4o"))).toBe(false)
+})
+
+test("scopeUsage gives a scope's budgets and most-used rate limits", () => {
+  const cfg: Config = {
+    governance: {
+      budgets: [
+        { id: "b-vk", max_limit: 10.0, reset_duration: "1M" },
+        { id: "b-team", max_limit: 100.0, reset_duration: "1d", current_usage: 25.0 },
+        { id: "b-cust", max_limit: 50.0, reset_duration: "1M" },
+      ],
+      rate_limits: [
+        { id: "rl-a", request_max_limit: 10, request_reset_duration: "1m", token_max_limit: 1000, token_reset_duration: "1m" },
+        { id: "rl-b", request_max_limit: 4, request_reset_duration: "1m" },
+      ],
+      teams: [{ id: "t1", name: "core", budget_id: "b-team", customer_id: "c1" }],
+      customers: [{ id: "c1", name: "Acme", budget_id: "b-cust" }],
+      virtual_keys: [{ id: "vk1", value: "sk-bf-one", team_id: "t1", budget_id: "b-vk", rate_limit_id: "rl-a", provider_configs: [{ provider: "openai", rate_limit_id: "rl-b" }] }],
+    },
+  }
+  const g = new Governance(cfg)
+  const now = Date.now()
+  g.record({ kind: "grant", vk: undefined, budgets: ["b-vk"], rateLimits: ["rl-a"] }, 300, 2.5)
+
+  const vk = g.scopeUsage("virtual_key", "vk1", now)!
+  expect(vk.budgets.length).toBe(1)
+  expect(vk.budgets[0]!.id).toBe("b-vk")
+  expect(vk.budgets[0]!.spent).toBe(2.5)
+  expect(vk.budgets[0]!.limit).toBe(10.0)
+  expect(vk.requests!.id).toBe("rl-a")
+  expect(vk.requests!.limit).toBe(10.0)
+  expect(vk.tokens!.used).toBe(300.0)
+  expect(vk.tokens!.limit).toBe(1000.0)
+
+  const team = g.scopeUsage("team", "t1", now)!
+  expect(team.budgets[0]!.id).toBe("b-team")
+  expect(team.budgets[0]!.spent).toBe(25.0)
+  expect(team.requests).toBeUndefined()
+  expect(team.tokens).toBeUndefined()
+
+  const cust = g.scopeUsage("customer", "c1", now)!
+  expect(cust.budgets[0]!.id).toBe("b-cust")
+  expect(cust.budgets[0]!.spent).toBe(0.0)
+
+  expect(g.scopeUsage("virtual_key", "nope", now)).toBeUndefined()
+  expect(g.scopeUsage("team", "t9", now)).toBeUndefined()
+  expect(g.scopeUsage("customer", "c9", now)).toBeUndefined()
+  expect(g.scopeUsage("widget", "vk1", now)).toBeUndefined()
 })

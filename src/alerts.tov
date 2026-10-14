@@ -2,6 +2,10 @@
 // snapshot and the time, and gets back the notifications to send. Each rule goes
 // ok -> pending -> firing -> ok, and a firing rule notifies once, not every time.
 // Timestamps are ms since the epoch, as in the log.
+//
+// CelEngine runs Bifrost's alert rules: a CEL expression over a governance scope's
+// budgets and rate limits, notifying on each match, held back by cooldowns.
+import { compileExpr, evalBool, Program, Value } from "./cel"
 
 export type Metric =
   | "error_rate"
@@ -37,6 +41,9 @@ export type AlertRule = {
 // "microsoft_teams" and "pagerduty" are the config.json type names.
 export type Channel = {
   id: string,
+  name?: string, // Bifrost's operator-facing name
+  description?: string,
+  enabled?: bool, // false = never sent to; unset = enabled
   type: "webhook" | "slack" | "microsoft_teams" | "pagerduty",
   url: string, // unused for pagerduty, which always posts to its Events API endpoint
   headers?: Map<string, string>,
@@ -60,6 +67,51 @@ export type Snapshot = {
 export type Notification = { channel: Channel, ruleId: string, kind: "firing" | "resolved", body: string }
 
 export type AlertRecord = { ruleId: string, from: string, to: string, value?: f64, ts: f64 }
+
+// A Bifrost alert rule. The expression is judged once per budget of the scope (or
+// the one budget target_id names), with the scope's rate limits alongside.
+export type CelRule = {
+  id: string,
+  name: string,
+  description?: string,
+  enabled?: bool,
+  scope_type: string, // virtual_key | team | customer
+  scope_id: string,
+  cel_expression: string,
+  channel_ids: string[],
+  cooldown_seconds?: int, // between notices for one rule, scope and budget; default 60, 0 = none
+  notify_once_per_reset_cycle?: bool, // at most one notice per budget reset cycle; replaces the cooldown
+  target_type?: string, // "budget" with target_id
+  target_id?: string,
+}
+
+// One budget of a scope: spent and limit in dollars; window names its current reset cycle.
+export type BudgetUsage = { id: string, spent: f64, limit: f64, window: string }
+
+// A rate limit's used and limit, in requests or tokens.
+export type RateUse = { id: string, used: f64, limit: f64 }
+
+// What a scope's CEL rules are judged on. Governance's scopeUsage builds it: the
+// scope's budgets, and its highest-used request and token rate limits.
+export type ScopeUsage = { scope_type: string, scope_id: string, budgets: BudgetUsage[], requests?: RateUse, tokens?: RateUse }
+
+// One row of alert history, as Bifrost's /api/alerting/history shows it.
+export type CelRecord = {
+  id: string,
+  rule_id: string,
+  rule_name: string,
+  channel_id: string, // "" when the skip came before any channel
+  channel_name: string,
+  channel_type: string,
+  scope_type: string,
+  scope_id: string,
+  target_type: string,
+  target_id: string,
+  cel_expression: string,
+  status: string, // sent | skipped
+  status_detail: string,
+  ts: f64,
+}
 
 const HISTORY_CAP = 500
 
@@ -259,6 +311,233 @@ function pagerdutyBody(ch: Channel, rule: AlertRule, kind: "firing" | "resolved"
       },
     },
   })
+}
+
+// ---- CEL rules ----
+
+const RULE_COOLDOWN = 60
+
+// The CEL variables that are numbers, in the order a notice lists them.
+type Num = { name: string, v: f64 }
+
+function pctOf(used: f64, limit: f64): f64 {
+  return limit > 0.0 ? (100.0 * used) / limit : 0.0
+}
+
+// The numeric variables for one budget, or for no budget (all budget fields 0).
+// Rate limit fields come from the scope's highest-used limits.
+function numsOf(u: ScopeUsage, b: BudgetUsage | undefined): Num[] {
+  let spent = 0.0
+  let limit = 0.0
+  if (b !== undefined) {
+    spent = b.spent
+    limit = b.limit
+  }
+  let ru = 0.0
+  let rl = 0.0
+  const rq = u.requests
+  if (rq !== undefined) {
+    ru = rq.used
+    rl = rq.limit
+  }
+  let tu = 0.0
+  let tl = 0.0
+  const tk = u.tokens
+  if (tk !== undefined) {
+    tu = tk.used
+    tl = tk.limit
+  }
+  return [
+    { name: "budget_usage_percent", v: pctOf(spent, limit) },
+    { name: "budget_spent", v: spent },
+    { name: "budget_limit", v: limit },
+    { name: "rate_limit_request_usage_percent", v: pctOf(ru, rl) },
+    { name: "rate_limit_token_usage_percent", v: pctOf(tu, tl) },
+    { name: "request_usage", v: ru },
+    { name: "request_limit", v: rl },
+    { name: "token_usage", v: tu },
+    { name: "token_limit", v: tl },
+  ]
+}
+
+function varsOf(u: ScopeUsage, b: BudgetUsage | undefined, nums: Num[]): Map<string, Value> {
+  const m: Map<string, Value> = new Map()
+  for (const n of nums) m.set(n.name, { kind: "num", n: n.v })
+  m.set("scope_type", { kind: "str", s: u.scope_type })
+  m.set("scope_id", { kind: "str", s: u.scope_id })
+  m.set("target_type", { kind: "str", s: b !== undefined ? "budget" : "" })
+  m.set("target_id", { kind: "str", s: b !== undefined ? b.id : "" })
+  return m
+}
+
+// The JSON object of the variables, for webhook and PagerDuty bodies.
+function inputOf(u: ScopeUsage, b: BudgetUsage | undefined, nums: Num[]): string {
+  const parts: string[] = []
+  for (const n of nums) parts.push(`${JSON.stringify(n.name)}:${fmt(n.v)}`)
+  parts.push(`"scope_type":${JSON.stringify(u.scope_type)}`)
+  parts.push(`"scope_id":${JSON.stringify(u.scope_id)}`)
+  parts.push(`"target_type":${JSON.stringify(b !== undefined ? "budget" : "")}`)
+  parts.push(`"target_id":${JSON.stringify(b !== undefined ? b.id : "")}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// The notice text, worded as Bifrost words it.
+function celMessage(rule: CelRule, u: ScopeUsage, b: BudgetUsage | undefined, nums: Num[]): string {
+  const target = b !== undefined ? `budget/${b.id}` : "none"
+  const vals = nums.map((n) => `${n.name}=${fmt(n.v)}`).join(", ")
+  return `Alert matched: ${rule.name}\nScope: ${u.scope_type}/${u.scope_id}\nTarget: ${target}\nExpression: ${rule.cel_expression}\nValues: ${vals}`
+}
+
+// Slack and Teams get the message; PagerDuty a trigger keyed by rule, scope and target;
+// a webhook the JSON record, as Bifrost sends it.
+function celBody(ch: Channel, rule: CelRule, u: ScopeUsage, msg: string, input: string, key: string): string {
+  if (ch.type === "slack") return JSON.stringify({ text: msg })
+  if (ch.type === "microsoft_teams") {
+    return `{"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","contentUrl":null,"content":{"$schema":"http://adaptivecards.io/schemas/adaptive-card.json","type":"AdaptiveCard","version":"1.4","body":[{"type":"TextBlock","size":"Medium","weight":"Bolder","wrap":true,"color":"Attention","text":${JSON.stringify(msg)}}]}}]}`
+  }
+  if (ch.type === "pagerduty") {
+    const sev: Severity = ch.severity ?? "warning"
+    return `{"routing_key":${JSON.stringify(ch.routing_key ?? "")},"event_action":"trigger","dedup_key":${JSON.stringify(key)},"payload":{"summary":${JSON.stringify(msg)},"severity":${JSON.stringify(sev)},"source":"Bifrost Alerting","custom_details":${input}}}`
+  }
+  return `{"rule":{"id":${JSON.stringify(rule.id)},"name":${JSON.stringify(rule.name)}},"scope":{"type":${JSON.stringify(u.scope_type)},"id":${JSON.stringify(u.scope_id)}},"cel_expression":${JSON.stringify(rule.cel_expression)},"input":${input},"message":${JSON.stringify(msg)}}`
+}
+
+function scopeOf(scopes: ScopeUsage[], r: CelRule): ScopeUsage | undefined {
+  for (const s of scopes) {
+    if (s.scope_type === r.scope_type && s.scope_id === r.scope_id) return s
+  }
+  return undefined
+}
+
+// Judges Bifrost alert rules. Each rule compiles once; a bad expression is reported by
+// errors() and the other rules still run. A match sends a notice (there is no resolve),
+// unless the rule's cooldown for that scope and budget, or a channel's cooldown, holds it.
+export class CelEngine {
+  private progs: Map<string, Program> = new Map()
+  private errs: string[] = []
+  private chans: Map<string, Channel> = new Map()
+  private sentAt: Map<string, f64> = new Map() // channel id -> last send
+  private ruleSent: Map<string, f64> = new Map() // rule, scope and target -> last send
+  private cycles: Map<string, string> = new Map() // rule, scope and target -> reset cycle last notified
+  private recs: CelRecord[] = []
+  private seq = 0
+
+  constructor(readonly rules: CelRule[], channels: Channel[]) {
+    for (const c of channels) {
+      if (c.enabled !== false) this.chans.set(c.id, c)
+    }
+    for (const r of rules) {
+      if (r.enabled === false) continue
+      try {
+        this.progs.set(r.id, compileExpr(r.cel_expression))
+      } catch (e) {
+        this.errs.push(`rule ${r.id}: ${e.message}`)
+      }
+    }
+  }
+
+  errors(): string[] {
+    return this.errs
+  }
+
+  // Judges every enabled rule against the usage of its scope, and returns the notices to send.
+  // scopes holds the usage of each scope the rules name (see governance's scopeUsage);
+  // a rule whose scope is missing from it is not judged.
+  evaluate(scopes: ScopeUsage[], nowMs: f64): Notification[] {
+    let out: Notification[] = []
+    for (const r of this.rules) {
+      if (r.enabled === false) continue
+      const prog = this.progs.get(r.id)
+      if (prog === undefined) continue
+      const u = scopeOf(scopes, r)
+      if (u === undefined) continue
+      const want = r.target_id
+      if (r.target_type === "budget" && want !== undefined) {
+        for (const b of u.budgets) {
+          if (b.id === want) this.judge(r, prog, u, b, nowMs, &out)
+        }
+      } else if (u.budgets.length === 0) {
+        this.judge(r, prog, u, undefined, nowMs, &out)
+      } else {
+        for (const b of u.budgets) this.judge(r, prog, u, b, nowMs, &out)
+      }
+    }
+    return out
+  }
+
+  // Every alert record so far, oldest first, at most the last 500.
+  history(): CelRecord[] {
+    return this.recs
+  }
+
+  private judge(rule: CelRule, prog: Program, u: ScopeUsage, b: BudgetUsage | undefined, nowMs: f64, inout out: Notification[]): void {
+    const nums = numsOf(u, b)
+    if (evalBool(prog, varsOf(u, b, nums)) !== true) return
+    const target = b !== undefined ? b.id : ""
+    const key = rule.id + "|" + u.scope_type + "|" + u.scope_id + "|" + target
+    const once = rule.notify_once_per_reset_cycle === true
+    const cycle = b !== undefined ? b.window : ""
+    if (once) {
+      if (this.cycles.get(key) === cycle) {
+        this.record(rule, u, b, undefined, "skipped", "skipped due to reset cycle", nowMs)
+        return
+      }
+    } else {
+      const last = this.ruleSent.get(key)
+      const cool = (rule.cooldown_seconds ?? RULE_COOLDOWN) * 1000.0
+      if (last !== undefined && nowMs - last < cool) {
+        this.record(rule, u, b, undefined, "skipped", "skipped due to rule cooldown", nowMs)
+        return
+      }
+    }
+    const msg = celMessage(rule, u, b, nums)
+    const input = inputOf(u, b, nums)
+    let sent = false
+    for (const cid of rule.channel_ids) {
+      const ch = this.chans.get(cid)
+      if (ch === undefined) continue
+      if (this.channelCooling(ch, nowMs)) {
+        this.record(rule, u, b, ch, "skipped", "skipped due to channel cooldown", nowMs)
+        continue
+      }
+      this.sentAt.set(ch.id, nowMs)
+      sent = true
+      out.push({ channel: ch, ruleId: rule.id, kind: "firing", body: celBody(ch, rule, u, msg, input, key) })
+      this.record(rule, u, b, ch, "sent", "", nowMs)
+    }
+    if (sent) {
+      this.ruleSent.set(key, nowMs)
+      if (once) this.cycles.set(key, cycle)
+    }
+  }
+
+  private channelCooling(ch: Channel, nowMs: f64): bool {
+    const cool = ch.cooldown_seconds ?? 0
+    if (cool <= 0) return false
+    const last = this.sentAt.get(ch.id)
+    return last !== undefined && nowMs - last < cool * 1000.0
+  }
+
+  private record(rule: CelRule, u: ScopeUsage, b: BudgetUsage | undefined, ch: Channel | undefined, status: string, detail: string, nowMs: f64): void {
+    this.seq += 1
+    this.recs.push({
+      id: "" + this.seq,
+      rule_id: rule.id,
+      rule_name: rule.name,
+      channel_id: ch !== undefined ? ch.id : "",
+      channel_name: ch !== undefined ? (ch.name ?? "") : "",
+      channel_type: ch !== undefined ? ch.type : "",
+      scope_type: u.scope_type,
+      scope_id: u.scope_id,
+      target_type: b !== undefined ? "budget" : "",
+      target_id: b !== undefined ? b.id : "",
+      cel_expression: rule.cel_expression,
+      status: status,
+      status_detail: detail,
+      ts: nowMs,
+    })
+    if (this.recs.length > HISTORY_CAP) this.recs.shift()
+  }
 }
 
 function fact(title: string, value: string): string {
@@ -840,4 +1119,158 @@ test("history keeps only the last 500 changes", () => {
   // 600 transitions were made, one per ms from NOW; the oldest 100 are gone
   expect(h[0]!.ts).toBe(NOW + 100.0)
   expect(h[499]!.ts).toBe(NOW + 599.0)
+})
+
+// ---- CEL rule tests ----
+
+function celRule(id: string, expr: string, channels: string[]): CelRule {
+  return { id: id, name: id, scope_type: "virtual_key", scope_id: "vk1", cel_expression: expr, channel_ids: channels }
+}
+
+function vkUsage(budgets: BudgetUsage[]): ScopeUsage {
+  return { scope_type: "virtual_key", scope_id: "vk1", budgets: budgets }
+}
+
+const CEL_SLACK: Channel = { id: "ch", name: "Ops", type: "slack", url: "https://hooks.example/slack" }
+const CEL_LIMITED: Channel = { id: "lim", type: "slack", url: "https://hooks.example/slack", cooldown_seconds: 60 }
+
+test("a budget rule judges each budget of its scope and names the one that matched", () => {
+  const u = vkUsage([{ id: "b1", spent: 90.0, limit: 100.0, window: "w1" }, { id: "b2", spent: 10.0, limit: 100.0, window: "w1" }])
+  const eng = new CelEngine([celRule("hot", "budget_usage_percent >= 80.0", ["ch"])], [CEL_SLACK])
+  const n = eng.evaluate([u], NOW)
+  expect(n.length).toBe(1)
+  expect(n[0]!.kind).toBe("firing")
+  expect(n[0]!.body.includes("Target: budget/b1")).toBe(true)
+  expect(n[0]!.body.includes("budget_usage_percent=90")).toBe(true)
+  const h = eng.history()
+  expect(h.length).toBe(1)
+  expect(h[0]!.status).toBe("sent")
+  expect(h[0]!.target_type).toBe("budget")
+  expect(h[0]!.target_id).toBe("b1")
+  expect(h[0]!.channel_type).toBe("slack")
+  expect(h[0]!.channel_name).toBe("Ops")
+})
+
+test("a rule's scope must be in the usage it is given", () => {
+  const u: ScopeUsage = { scope_type: "team", scope_id: "t1", budgets: [{ id: "b1", spent: 90.0, limit: 100.0, window: "w" }] }
+  const eng = new CelEngine([celRule("hot", "budget_usage_percent >= 80.0", ["ch"])], [CEL_SLACK])
+  expect(eng.evaluate([u], NOW).length).toBe(0)
+  expect(eng.evaluate([], NOW).length).toBe(0)
+})
+
+test("the rule cooldown holds back a repeat per scope and budget, then lets it fire again", () => {
+  const u = vkUsage([{ id: "b1", spent: 90.0, limit: 100.0, window: "w1" }])
+  const eng = new CelEngine([celRule("hot", "budget_usage_percent >= 80.0", ["ch"])], [CEL_SLACK])
+  expect(eng.evaluate([u], NOW).length).toBe(1)
+  expect(eng.evaluate([u], NOW + 10000.0).length).toBe(0)
+  const h = eng.history()
+  expect(h[1]!.status).toBe("skipped")
+  expect(h[1]!.status_detail).toBe("skipped due to rule cooldown")
+  expect(h[1]!.channel_id).toBe("")
+  expect(eng.evaluate([u], NOW + 61000.0).length).toBe(1)
+})
+
+test("cooldown_seconds 0 sends every match", () => {
+  const u = vkUsage([{ id: "b1", spent: 90.0, limit: 100.0, window: "w1" }])
+  const r: CelRule = { id: "every", name: "every", scope_type: "virtual_key", scope_id: "vk1", cel_expression: "budget_usage_percent >= 80.0", channel_ids: ["ch"], cooldown_seconds: 0 }
+  const eng = new CelEngine([r], [CEL_SLACK])
+  expect(eng.evaluate([u], NOW).length).toBe(1)
+  expect(eng.evaluate([u], NOW + 1000.0).length).toBe(1)
+})
+
+test("notify_once_per_reset_cycle sends once per budget window", () => {
+  const r: CelRule = { id: "once", name: "once", scope_type: "virtual_key", scope_id: "vk1", cel_expression: "budget_usage_percent >= 80.0", channel_ids: ["ch"], notify_once_per_reset_cycle: true }
+  const eng = new CelEngine([r], [CEL_SLACK])
+  expect(eng.evaluate([vkUsage([{ id: "b1", spent: 90.0, limit: 100.0, window: "w1" }])], NOW).length).toBe(1)
+  expect(eng.evaluate([vkUsage([{ id: "b1", spent: 95.0, limit: 100.0, window: "w1" }])], NOW + 1000.0).length).toBe(0)
+  expect(eng.history()[1]!.status_detail).toBe("skipped due to reset cycle")
+  expect(eng.evaluate([vkUsage([{ id: "b1", spent: 85.0, limit: 100.0, window: "w2" }])], NOW + 2000.0).length).toBe(1)
+})
+
+test("target_type budget narrows the rule to that budget", () => {
+  const r: CelRule = { id: "t", name: "t", scope_type: "virtual_key", scope_id: "vk1", cel_expression: "budget_spent > 5.0", channel_ids: ["ch"], target_type: "budget", target_id: "b2" }
+  const eng = new CelEngine([r], [CEL_SLACK])
+  const quiet = vkUsage([{ id: "b1", spent: 9.0, limit: 100.0, window: "w" }, { id: "b2", spent: 1.0, limit: 100.0, window: "w" }])
+  expect(eng.evaluate([quiet], NOW).length).toBe(0)
+  const hot = vkUsage([{ id: "b1", spent: 9.0, limit: 100.0, window: "w" }, { id: "b2", spent: 6.0, limit: 100.0, window: "w" }])
+  const n = eng.evaluate([hot], NOW)
+  expect(n.length).toBe(1)
+  expect(n[0]!.body.includes("Target: budget/b2")).toBe(true)
+  expect(eng.evaluate([vkUsage([{ id: "b1", spent: 9.0, limit: 100.0, window: "w" }])], NOW + 1.0).length).toBe(0)
+})
+
+test("a scope with no budgets is judged once, on its rate limits", () => {
+  const u: ScopeUsage = { scope_type: "virtual_key", scope_id: "vk1", budgets: [], requests: { id: "rl", used: 11.0, limit: 10.0 } }
+  const eng = new CelEngine([celRule("rl", "rate_limit_request_usage_percent >= 100.0 && request_usage > 10", ["ch"])], [CEL_SLACK])
+  expect(eng.evaluate([u], NOW).length).toBe(1)
+  expect(eng.history()[0]!.target_id).toBe("")
+  expect(eng.history()[0]!.target_type).toBe("")
+})
+
+test("the rate limit and budget variables read the scope's usage", () => {
+  const u: ScopeUsage = {
+    scope_type: "virtual_key",
+    scope_id: "vk1",
+    budgets: [{ id: "b1", spent: 25.0, limit: 50.0, window: "w" }],
+    tokens: { id: "tl", used: 500.0, limit: 1000.0 },
+  }
+  const expr = "rate_limit_token_usage_percent == 50.0 && token_limit == 1000.0 && budget_limit == 50.0 && budget_usage_percent == 50.0 && scope_id == \"vk1\" && target_id == \"b1\""
+  const eng = new CelEngine([celRule("v", expr, ["ch"])], [CEL_SLACK])
+  expect(eng.evaluate([u], NOW).length).toBe(1)
+  expect(eng.errors().length).toBe(0)
+})
+
+test("disabled rules are not judged, and a bad expression is reported without stopping the others", () => {
+  const u = vkUsage([{ id: "b1", spent: 90.0, limit: 100.0, window: "w" }])
+  const off: CelRule = { id: "off", name: "off", scope_type: "virtual_key", scope_id: "vk1", cel_expression: "budget_usage_percent >= 80.0", channel_ids: ["ch"], enabled: false }
+  const bad = celRule("bad", "budget_usage_percent >", ["ch"])
+  const good = celRule("good", "budget_usage_percent >= 80.0", ["ch"])
+  const eng = new CelEngine([off, bad, good], [CEL_SLACK])
+  expect(eng.errors().length).toBe(1)
+  expect(eng.errors()[0]!.startsWith("rule bad: ")).toBe(true)
+  const n = eng.evaluate([u], NOW)
+  expect(n.length).toBe(1)
+  expect(n[0]!.ruleId).toBe("good")
+})
+
+test("a channel cooldown skips the channel for other rules too, and a disabled channel is never sent to", () => {
+  const u = vkUsage([{ id: "b1", spent: 90.0, limit: 100.0, window: "w" }])
+  const eng = new CelEngine([celRule("a", "budget_usage_percent >= 80.0", ["lim"]), celRule("b", "budget_spent > 1.0", ["lim"])], [CEL_LIMITED])
+  const first = eng.evaluate([u], NOW)
+  expect(first.length).toBe(1)
+  expect(first[0]!.ruleId).toBe("a")
+  const second = eng.evaluate([u], NOW + 1000.0)
+  expect(second.length).toBe(0)
+  const h = eng.history()
+  const last = h[h.length - 1]!
+  expect(last.status).toBe("skipped")
+  expect(last.status_detail).toBe("skipped due to channel cooldown")
+  expect(last.channel_id).toBe("lim")
+
+  const off: Channel = { id: "off", type: "slack", url: "https://hooks.example/slack", enabled: false }
+  const quiet = new CelEngine([celRule("c", "budget_usage_percent >= 80.0", ["off"])], [off])
+  expect(quiet.evaluate([u], NOW).length).toBe(0)
+  expect(quiet.history().length).toBe(0)
+})
+
+test("pagerduty is keyed by rule, scope and budget; webhook carries the record", () => {
+  const u = vkUsage([{ id: "b1", spent: 90.0, limit: 100.0, window: "w" }])
+  const pd: Channel = { id: "pd", type: "pagerduty", url: "", routing_key: "R0KEY", severity: "critical" }
+  const hook: Channel = { id: "hk", type: "webhook", url: "https://hooks.example/hook" }
+  const eng = new CelEngine([celRule("hot", "budget_usage_percent >= 80.0", ["pd", "hk"])], [pd, hook])
+  const n = eng.evaluate([u], NOW)
+  expect(n.length).toBe(2)
+  const p = try JSON.parse(n[0]!.body) as { routing_key: string, event_action: string, dedup_key: string, payload: { severity: string, source: string, custom_details: { budget_usage_percent: f64, target_id: string } } }
+  expect(p.routing_key).toBe("R0KEY")
+  expect(p.event_action).toBe("trigger")
+  expect(p.dedup_key).toBe("hot|virtual_key|vk1|b1")
+  expect(p.payload.severity).toBe("critical")
+  expect(p.payload.source).toBe("Bifrost Alerting")
+  expect(p.payload.custom_details.budget_usage_percent).toBe(90.0)
+  expect(p.payload.custom_details.target_id).toBe("b1")
+  const w = try JSON.parse(n[1]!.body) as { rule: { id: string }, scope: { type: string, id: string }, input: { budget_spent: f64 }, message: string }
+  expect(w.rule.id).toBe("hot")
+  expect(w.scope.type).toBe("virtual_key")
+  expect(w.input.budget_spent).toBe(90.0)
+  expect(w.message.includes("Expression: budget_usage_percent >= 80.0")).toBe(true)
 })

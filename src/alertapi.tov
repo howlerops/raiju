@@ -1,0 +1,704 @@
+// Bifrost's /api/alerting/ API: CEL alert rules, channels and history. Pure over the
+// alerts config. A change returns the config to save next (reply.next), and the caller
+// commits it, as the governance routes do. History comes from the running CelEngine,
+// through AlertEnv.
+import { AlertsConfig } from "./config"
+import { CelRule, Channel, CelRecord, CelEngine, ScopeUsage } from "./alerts"
+import { compileExpr } from "./cel"
+import { Field, fields, find, rawStr, rawBool, rawNum, decodeString, elements } from "./json"
+
+export type AlertReply = { status: int, body: string, next?: AlertsConfig }
+
+// What the routes need from the gateway: a scope's usage (governance's scopeUsage, undefined
+// when the scope does not exist) and the alert history so far.
+export type AlertEnv = {
+  usage: (scopeType: string, scopeId: string) => ScopeUsage | undefined,
+  history: () => CelRecord[],
+}
+
+type RuleParse = { kind: "ok", rule: CelRule } | { kind: "error", message: string }
+type ChannelParse = { kind: "ok", ch: Channel } | { kind: "error", message: string }
+
+const SCOPES = ["virtual_key", "team", "customer"]
+const SORTS = ["created_at", "rule_name", "channel_name", "scope_type", "status"]
+const MASK = "********"
+const BODY_MESSAGE = "body must be a JSON object matching the resource"
+
+function js(s: string): string {
+  return JSON.stringify(s)
+}
+
+function bstr(b: bool): string {
+  return b ? "true" : "false"
+}
+
+function reply(status: int, body: string): AlertReply {
+  return { status: status, body: body }
+}
+
+function fail(status: int, message: string): AlertReply {
+  return reply(status, JSON.stringify({ error: { message: message, type: "invalid_request_error" } }))
+}
+
+// A rule or channel id the request did not name.
+function freshId(prefix: string): string {
+  return prefix + Date.now() + "-" + Math.floor(Math.random() * 1000000000.0)
+}
+
+// A URL shows its scheme and host; the rest is masked.
+function maskUrl(u: string): string {
+  if (u === "") return ""
+  const i = u.indexOf("://")
+  if (i < 0) return MASK
+  const rest = u.slice(i + 3)
+  const j = rest.indexOf("/")
+  const host = j < 0 ? rest : rest.slice(0, j)
+  return u.slice(0, i + 3) + host + "/" + MASK
+}
+
+// Other secrets (routing keys, header values) are masked whole.
+function maskKey(k: string): string {
+  return k === "" ? "" : MASK
+}
+
+function parseBody(body: string): Field[] | undefined {
+  try {
+    return fields(body)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The members of a JSON object given as raw text; anything else has none.
+function membersOf(raw: string | undefined): Field[] {
+  if (raw === undefined || !raw.startsWith("{")) return []
+  try {
+    return fields(raw)
+  } catch (e) {
+    return []
+  }
+}
+
+// The strings of a JSON array given as raw text, or undefined when it is not one.
+function strList(raw: string): string[] | undefined {
+  if (!raw.startsWith("[")) return undefined
+  const out: string[] = []
+  try {
+    for (const el of elements(raw)) {
+      if (!el.startsWith("\"")) return undefined
+      out.push(decodeString(el))
+    }
+  } catch (e) {
+    return undefined
+  }
+  return out
+}
+
+// A JSON object of string values as a map, or undefined when it is not one.
+function headersOf(raw: string | undefined): Map<string, string> | undefined {
+  if (raw === undefined || !raw.startsWith("{")) return undefined
+  const m: Map<string, string> = new Map()
+  try {
+    for (const f of fields(raw)) {
+      if (f.raw.startsWith("\"")) m.set(f.key, decodeString(f.raw))
+    }
+  } catch (e) {
+    return undefined
+  }
+  return m
+}
+
+// Header values sent back masked keep the stored value.
+function unmaskHeaders(h: Map<string, string>, old: Map<string, string> | undefined): Map<string, string> {
+  const out: Map<string, string> = new Map()
+  for (const k of h.keys()) {
+    const v = h.get(k) ?? ""
+    let prev: string | undefined = undefined
+    if (old !== undefined) prev = old.get(k)
+    out.set(k, prev !== undefined && v === maskKey(prev) ? prev : v)
+  }
+  return out
+}
+
+function kindOf(s: string): "webhook" | "slack" | "microsoft_teams" | "pagerduty" | undefined {
+  if (s === "slack") return "slack"
+  if (s === "microsoft_teams") return "microsoft_teams"
+  if (s === "pagerduty") return "pagerduty"
+  if (s === "webhook") return "webhook"
+  return undefined
+}
+
+function celError(src: string): string {
+  try {
+    compileExpr(src)
+    return ""
+  } catch (e) {
+    return e.message
+  }
+}
+
+function hasChannel(chans: Channel[], id: string): bool {
+  for (const c of chans) {
+    if (c.id === id) return true
+  }
+  return false
+}
+
+function hasBudget(u: ScopeUsage, id: string): bool {
+  for (const b of u.budgets) {
+    if (b.id === id) return true
+  }
+  return false
+}
+
+function copyRule(r: CelRule): CelRule {
+  let c: CelRule = { id: r.id, name: r.name, scope_type: r.scope_type, scope_id: r.scope_id, cel_expression: r.cel_expression, channel_ids: r.channel_ids }
+  if (r.description !== undefined) c.description = r.description
+  if (r.enabled !== undefined) c.enabled = r.enabled
+  if (r.cooldown_seconds !== undefined) c.cooldown_seconds = r.cooldown_seconds
+  if (r.notify_once_per_reset_cycle !== undefined) c.notify_once_per_reset_cycle = r.notify_once_per_reset_cycle
+  if (r.target_type !== undefined) c.target_type = r.target_type
+  if (r.target_id !== undefined) c.target_id = r.target_id
+  return c
+}
+
+function withRules(cfg: AlertsConfig, rules: CelRule[]): AlertsConfig {
+  return { enabled: cfg.enabled, interval_seconds: cfg.interval_seconds, rules: cfg.rules, cel_rules: rules, channels: cfg.channels }
+}
+
+function withChannels(cfg: AlertsConfig, chans: Channel[]): AlertsConfig {
+  return { enabled: cfg.enabled, interval_seconds: cfg.interval_seconds, rules: cfg.rules, cel_rules: cfg.cel_rules, channels: chans }
+}
+
+function ruleErr(message: string): RuleParse {
+  return { kind: "error", message: message }
+}
+
+function chanErr(message: string): ChannelParse {
+  return { kind: "error", message: message }
+}
+
+// The rule a request describes. Fields the body leaves out keep the old rule's values.
+function ruleFrom(body: string, old: CelRule | undefined, newId: string, chans: Channel[], env: AlertEnv): RuleParse {
+  const f = parseBody(body)
+  if (f === undefined) return ruleErr(BODY_MESSAGE)
+  const id = old !== undefined ? old.id : (rawStr(f, "id") ?? newId)
+  const name = rawStr(f, "name") ?? old?.name ?? ""
+  if (name === "") return ruleErr("name is required")
+  const scopeType = rawStr(f, "scope_type") ?? old?.scope_type ?? ""
+  if (!SCOPES.includes(scopeType)) return ruleErr("scope_type must be virtual_key, team or customer")
+  const scopeId = rawStr(f, "scope_id") ?? old?.scope_id ?? ""
+  if (scopeId === "") return ruleErr("scope_id is required")
+  const usage = env.usage(scopeType, scopeId)
+  if (usage === undefined) return ruleErr(`${scopeType} ${scopeId} does not exist`)
+  const expr = rawStr(f, "cel_expression") ?? old?.cel_expression ?? ""
+  if (expr === "") return ruleErr("cel_expression is required")
+  const cerr = celError(expr)
+  if (cerr !== "") return ruleErr(`cel_expression: ${cerr}`)
+
+  let chanIds: string[] = old !== undefined ? old.channel_ids : []
+  const rawIds = find(f, "channel_ids")
+  if (rawIds !== undefined) {
+    const parsed = strList(rawIds)
+    if (parsed === undefined) return ruleErr("channel_ids must be a list of channel ids")
+    chanIds = parsed
+  }
+  if (chanIds.length === 0) return ruleErr("at least one channel is required")
+  for (const cid of chanIds) {
+    if (!hasChannel(chans, cid)) return ruleErr(`unknown channel ${cid}`)
+  }
+
+  let cool: f64 = old !== undefined ? (old.cooldown_seconds ?? 60) * 1000.0 : 60000.0
+  const reqCool = rawNum(f, "cooldown_milliseconds")
+  if (reqCool !== undefined) {
+    if (!(reqCool >= 0.0) || reqCool % 1000.0 !== 0.0) return ruleErr("cooldown_milliseconds must be a whole number of seconds, 0 or more")
+    cool = reqCool
+  }
+
+  let tType = old?.target_type
+  let tId = old?.target_id
+  if (find(f, "target_type") !== undefined) tType = rawStr(f, "target_type")
+  if (find(f, "target_id") !== undefined) tId = rawStr(f, "target_id")
+  if (tType !== undefined && tType !== "budget") return ruleErr("target_type must be budget")
+  if ((tType === undefined) !== (tId === undefined)) return ruleErr("target_type and target_id go together")
+  if (tId !== undefined && !hasBudget(usage, tId)) return ruleErr(`budget ${tId} is not in ${scopeType} ${scopeId}`)
+
+  let rule: CelRule = {
+    id: id,
+    name: name,
+    scope_type: scopeType,
+    scope_id: scopeId,
+    cel_expression: expr,
+    channel_ids: chanIds,
+    enabled: rawBool(f, "enabled") ?? (old?.enabled ?? true),
+    cooldown_seconds: Math.round(cool / 1000.0),
+    notify_once_per_reset_cycle: rawBool(f, "notify_once_per_reset_cycle") ?? (old?.notify_once_per_reset_cycle ?? false),
+  }
+  const desc = rawStr(f, "description") ?? old?.description
+  if (desc !== undefined) rule.description = desc
+  if (tType !== undefined) rule.target_type = tType
+  if (tId !== undefined) rule.target_id = tId
+  return { kind: "ok", rule: rule }
+}
+
+// The channel a request describes. Secrets sent back masked keep the stored value.
+function channelFrom(body: string, old: Channel | undefined, newId: string): ChannelParse {
+  const f = parseBody(body)
+  if (f === undefined) return chanErr(BODY_MESSAGE)
+  const id = old !== undefined ? old.id : (rawStr(f, "id") ?? newId)
+  const want = rawStr(f, "type")
+  let kind: "webhook" | "slack" | "microsoft_teams" | "pagerduty" = old !== undefined ? old.type : "webhook"
+  if (want !== undefined) {
+    const k = kindOf(want)
+    if (k === undefined) return chanErr("type must be slack, microsoft_teams, pagerduty or webhook")
+    kind = k
+  }
+  const conf = membersOf(find(f, "config"))
+
+  let url = old?.url ?? ""
+  const hookUrl = rawStr(conf, "webhook_url") ?? rawStr(conf, "url")
+  if (hookUrl !== undefined && hookUrl !== maskUrl(url)) url = hookUrl
+  let key = old?.routing_key ?? ""
+  const rk = rawStr(conf, "routing_key") ?? rawStr(conf, "integration_key")
+  if (rk !== undefined && rk !== maskKey(key)) key = rk
+
+  if (kind === "pagerduty") {
+    if (key === "") return chanErr("a pagerduty channel needs a routing_key")
+  } else if (!(url.startsWith("https://") || url.startsWith("http://"))) {
+    return chanErr("a slack, microsoft_teams or webhook channel needs an http(s) url")
+  }
+
+  let cool: f64 = old !== undefined ? (old.cooldown_seconds ?? 0) * 1000.0 : 0.0
+  const reqCool = rawNum(f, "cooldown_milliseconds")
+  if (reqCool !== undefined) {
+    if (!(reqCool >= 0.0) || reqCool % 1000.0 !== 0.0) return chanErr("cooldown_milliseconds must be a whole number of seconds, 0 or more")
+    cool = reqCool
+  }
+
+  let ch: Channel = {
+    id: id,
+    name: rawStr(f, "name") ?? old?.name ?? id,
+    description: rawStr(f, "description") ?? old?.description ?? "",
+    enabled: rawBool(f, "enabled") ?? (old?.enabled ?? true),
+    type: kind,
+    url: kind === "pagerduty" ? "" : url,
+    cooldown_seconds: Math.round(cool / 1000.0),
+  }
+  if (kind === "pagerduty") ch.routing_key = key
+  if (kind === "webhook") {
+    const sent = headersOf(find(conf, "headers"))
+    let prev: Map<string, string> | undefined = undefined
+    if (old !== undefined) prev = old.headers
+    if (sent !== undefined) ch.headers = unmaskHeaders(sent, prev)
+    else if (prev !== undefined) ch.headers = prev
+  }
+  if (old !== undefined && old.severity !== undefined) ch.severity = old.severity
+  return { kind: "ok", ch: ch }
+}
+
+// A rule as Bifrost shows it: the cooldown in milliseconds, absent target as null.
+function ruleJson(r: CelRule): string {
+  const cool = (r.cooldown_seconds ?? 60) * 1000
+  const tt = r.target_type !== undefined ? js(r.target_type) : "null"
+  const ti = r.target_id !== undefined ? js(r.target_id) : "null"
+  return `{"id":${js(r.id)},"name":${js(r.name)},"description":${js(r.description ?? "")},"enabled":${bstr(r.enabled !== false)},"scope_type":${js(r.scope_type)},"scope_id":${js(r.scope_id)},"cel_expression":${js(r.cel_expression)},"channel_ids":${JSON.stringify(r.channel_ids)},"cooldown_milliseconds":${cool},"notify_once_per_reset_cycle":${bstr(r.notify_once_per_reset_cycle === true)},"target_type":${tt},"target_id":${ti}}`
+}
+
+function headersJson(h: Map<string, string> | undefined): string {
+  if (h === undefined) return "{}"
+  const parts: string[] = []
+  for (const k of h.keys()) parts.push(`${js(k)}:${js(maskKey(h.get(k) ?? ""))}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// A channel with its secrets masked.
+function channelJson(c: Channel): string {
+  let conf = ""
+  if (c.type === "pagerduty") {
+    conf = `"routing_key":${js(maskKey(c.routing_key ?? ""))}`
+  } else if (c.type === "webhook") {
+    conf = `"url":${js(maskUrl(c.url))},"headers":${headersJson(c.headers)}`
+  } else {
+    conf = `"webhook_url":${js(maskUrl(c.url))}`
+  }
+  const cool = (c.cooldown_seconds ?? 0) * 1000
+  return `{"id":${js(c.id)},"name":${js(c.name ?? c.id)},"description":${js(c.description ?? "")},"type":${js(c.type)},"enabled":${bstr(c.enabled !== false)},"cooldown_milliseconds":${cool},"config":{${conf}}}`
+}
+
+function indexOfRule(rules: CelRule[], id: string): int {
+  for (let i = 0; i < rules.length; i++) {
+    if (rules[i]!.id === id) return i
+  }
+  return -1
+}
+
+function indexOfChannel(chans: Channel[], id: string): int {
+  for (let i = 0; i < chans.length; i++) {
+    if (chans[i]!.id === id) return i
+  }
+  return -1
+}
+
+function rulesRoute(cfg: AlertsConfig, env: AlertEnv, method: string, id: string, body: string): AlertReply {
+  const rules = cfg.cel_rules ?? []
+  const chans = cfg.channels ?? []
+  if (id === "") {
+    if (method === "GET") return reply(200, `{"rules":[${rules.map((r) => ruleJson(r)).join(",")}]}`)
+    if (method !== "POST") return fail(405, `method ${method} is not allowed on this route`)
+    const made = ruleFrom(body, undefined, freshId("rule-"), chans, env)
+    if (made.kind === "error") return fail(400, made.message)
+    if (indexOfRule(rules, made.rule.id) >= 0) return fail(409, `alert rule ${made.rule.id} already exists`)
+    let next: CelRule[] = []
+    for (const r of rules) next.push(r)
+    next.push(made.rule)
+    return { status: 201, body: ruleJson(made.rule), next: withRules(cfg, next) }
+  }
+  const at = indexOfRule(rules, id)
+  if (method === "GET") {
+    if (at < 0) return fail(404, `alert rule ${id} not found`)
+    return reply(200, ruleJson(rules[at]!))
+  }
+  if (method === "PUT") {
+    if (at < 0) return fail(404, `alert rule ${id} not found`)
+    const made = ruleFrom(body, rules[at]!, id, chans, env)
+    if (made.kind === "error") return fail(400, made.message)
+    let next: CelRule[] = []
+    for (let i = 0; i < rules.length; i++) next.push(i === at ? made.rule : rules[i]!)
+    return { status: 200, body: ruleJson(made.rule), next: withRules(cfg, next) }
+  }
+  if (method === "DELETE") {
+    if (at < 0) return fail(404, `alert rule ${id} not found`)
+    let next: CelRule[] = []
+    for (const r of rules) {
+      if (r.id !== id) next.push(r)
+    }
+    return { status: 200, body: `{"deleted":true,"id":${js(id)}}`, next: withRules(cfg, next) }
+  }
+  return fail(405, `method ${method} is not allowed on this route`)
+}
+
+function channelsRoute(cfg: AlertsConfig, method: string, id: string, body: string): AlertReply {
+  const chans = cfg.channels ?? []
+  if (id === "") {
+    if (method === "GET") return reply(200, `{"channels":[${chans.map((c) => channelJson(c)).join(",")}]}`)
+    if (method !== "POST") return fail(405, `method ${method} is not allowed on this route`)
+    const made = channelFrom(body, undefined, freshId("channel-"))
+    if (made.kind === "error") return fail(400, made.message)
+    if (indexOfChannel(chans, made.ch.id) >= 0) return fail(409, `alert channel ${made.ch.id} already exists`)
+    let next: Channel[] = []
+    for (const c of chans) next.push(c)
+    next.push(made.ch)
+    return { status: 201, body: channelJson(made.ch), next: withChannels(cfg, next) }
+  }
+  const at = indexOfChannel(chans, id)
+  if (method === "GET") {
+    if (at < 0) return fail(404, `alert channel ${id} not found`)
+    return reply(200, channelJson(chans[at]!))
+  }
+  if (method === "PUT") {
+    if (at < 0) return fail(404, `alert channel ${id} not found`)
+    const made = channelFrom(body, chans[at]!, id)
+    if (made.kind === "error") return fail(400, made.message)
+    let next: Channel[] = []
+    for (let i = 0; i < chans.length; i++) next.push(i === at ? made.ch : chans[i]!)
+    return { status: 200, body: channelJson(made.ch), next: withChannels(cfg, next) }
+  }
+  if (method === "DELETE") {
+    if (at < 0) return fail(404, `alert channel ${id} not found`)
+    // the channel leaves every rule that named it
+    let next: Channel[] = []
+    for (const c of chans) {
+      if (c.id !== id) next.push(c)
+    }
+    let rules: CelRule[] = []
+    for (const r of cfg.cel_rules ?? []) {
+      let c = copyRule(r)
+      c.channel_ids = r.channel_ids.filter((x) => x !== id)
+      rules.push(c)
+    }
+    return { status: 200, body: `{"deleted":true,"id":${js(id)}}`, next: { enabled: cfg.enabled, interval_seconds: cfg.interval_seconds, rules: cfg.rules, cel_rules: rules, channels: next } }
+  }
+  return fail(405, `method ${method} is not allowed on this route`)
+}
+
+function queryOf(query: string, key: string): string | undefined {
+  for (const part of query.split("&")) {
+    const eq = part.indexOf("=")
+    if (eq < 0) continue
+    if (part.slice(0, eq) === key) return part.slice(eq + 1)
+  }
+  return undefined
+}
+
+function listOf(v: string | undefined): string[] {
+  if (v === undefined || v === "") return []
+  return v.split(",")
+}
+
+function rowJson(r: CelRecord): string {
+  return `{"id":${js(r.id)},"rule_id":${js(r.rule_id)},"rule_name":${js(r.rule_name)},"channel_id":${js(r.channel_id)},"channel_name":${js(r.channel_name)},"channel_type":${js(r.channel_type)},"scope_type":${js(r.scope_type)},"scope_id":${js(r.scope_id)},"target_type":${js(r.target_type)},"target_id":${js(r.target_id)},"cel_expression":${js(r.cel_expression)},"status":${js(r.status)},"status_detail":${js(r.status_detail)},"created_at":${js(isoOf(r.ts))}}`
+}
+
+function padNum(n: f64, w: int): string {
+  let s = "" + Math.floor(n)
+  while (s.byteLength < w) s = "0" + s
+  return s
+}
+
+// RFC 3339 in UTC with milliseconds, for ms since the epoch (ms >= 0).
+function isoOf(ms: f64): string {
+  const secs = Math.floor(ms / 1000.0)
+  const milli = ms - secs * 1000.0
+  const days = Math.floor(secs / 86400.0)
+  const sod = secs - days * 86400.0
+  const hh = Math.floor(sod / 3600.0)
+  const mm = Math.floor((sod - hh * 3600.0) / 60.0)
+  const ss = sod - hh * 3600.0 - mm * 60.0
+  // civil date from day count (H. Hinnant's days_from_civil, inverted)
+  const z = days + 719468.0
+  const era = Math.floor(z / 146097.0)
+  const doe = z - era * 146097.0
+  const yoe = Math.floor((doe - Math.floor(doe / 1460.0) + Math.floor(doe / 36524.0) - Math.floor(doe / 146096.0)) / 365.0)
+  const doy = doe - (365.0 * yoe + Math.floor(yoe / 4.0) - Math.floor(yoe / 100.0))
+  const mp = Math.floor((5.0 * doy + 2.0) / 153.0)
+  const d = doy - Math.floor((153.0 * mp + 2.0) / 5.0) + 1.0
+  const m = mp < 10.0 ? mp + 3.0 : mp - 9.0
+  const y = yoe + era * 400.0 + (m <= 2.0 ? 1.0 : 0.0)
+  return `${padNum(y, 4)}-${padNum(m, 2)}-${padNum(d, 2)}T${padNum(hh, 2)}:${padNum(mm, 2)}:${padNum(ss, 2)}.${padNum(milli, 3)}Z`
+}
+
+// The text a history row sorts by, for the non-time sorts.
+function sortText(r: CelRecord, by: string): string {
+  if (by === "rule_name") return r.rule_name
+  if (by === "channel_name") return r.channel_name
+  if (by === "scope_type") return r.scope_type
+  return r.status
+}
+
+// GET /history: filters, sort (newest first among equal values) and paging, as Bifrost.
+function historyRoute(env: AlertEnv, query: string): AlertReply {
+  const by = queryOf(query, "sort_by") ?? "created_at"
+  if (!SORTS.includes(by)) return fail(400, `sort_by must be one of ${SORTS.join(", ")}`)
+  const order = queryOf(query, "sort_order") ?? "desc"
+  if (order !== "asc" && order !== "desc") return fail(400, "sort_order must be asc or desc")
+  const statuses = listOf(queryOf(query, "status"))
+  const scopes = listOf(queryOf(query, "scope_type"))
+  const chanTypes = listOf(queryOf(query, "channel_type"))
+  let limit = parseInt(queryOf(query, "limit") ?? "25") ?? 25
+  if (!(limit >= 1)) limit = 25
+  if (limit > 1000) limit = 1000
+  let offset = parseInt(queryOf(query, "offset") ?? "0") ?? 0
+  if (!(offset >= 0)) offset = 0
+
+  let rows: CelRecord[] = []
+  for (const r of env.history()) {
+    if (statuses.length > 0 && !statuses.includes(r.status)) continue
+    if (scopes.length > 0 && !scopes.includes(r.scope_type)) continue
+    if (chanTypes.length > 0 && !chanTypes.includes(r.channel_type)) continue
+    rows.push(r)
+  }
+  const dir = order === "asc" ? 1.0 : -1.0
+  rows.sort((a, b) => {
+    let d = 0.0
+    if (by === "created_at") {
+      d = a.ts - b.ts
+    } else {
+      const x = sortText(a, by)
+      const y = sortText(b, by)
+      d = x < y ? -1.0 : (x > y ? 1.0 : 0.0)
+    }
+    if (d !== 0.0) return dir * d
+    return b.ts - a.ts
+  })
+  const page: string[] = []
+  for (let i = offset; i < rows.length && i < offset + limit; i++) page.push(rowJson(rows[i]!))
+  return reply(200, `{"history":[${page.join(",")}],"total":${rows.length},"limit":${limit},"offset":${offset}}`)
+}
+
+// Routes one request under /api/alerting/. The reply carries next when the alerts
+// config changes; the caller saves it and the reply goes back to the client.
+export function alertingRoute(cfg: AlertsConfig, env: AlertEnv, method: string, path: string, body: string): AlertReply {
+  const q = path.indexOf("?")
+  const route = q < 0 ? path : path.slice(0, q)
+  const query = q < 0 ? "" : path.slice(q + 1)
+  const pre = "/api/alerting/"
+  if (!route.startsWith(pre)) return fail(404, `no route for ${route}`)
+  const segs = route.slice(pre.byteLength).split("/")
+  if (segs.length > 2) return fail(404, `no route for ${route}`)
+  const head = segs[0]!
+  const id = segs.length > 1 ? segs[1]! : ""
+  if (head === "rules") return rulesRoute(cfg, env, method, id, body)
+  if (head === "channels") return channelsRoute(cfg, method, id, body)
+  if (head === "history" && id === "") {
+    if (method !== "GET") return fail(405, `method ${method} is not allowed on this route`)
+    return historyRoute(env, query)
+  }
+  return fail(404, `no route for ${route}`)
+}
+
+// ---- tests ----
+
+function usageOf(scopeType: string, scopeId: string): ScopeUsage | undefined {
+  if (scopeType !== "virtual_key" || scopeId !== "vk1") return undefined
+  return { scope_type: "virtual_key", scope_id: "vk1", budgets: [{ id: "b1", spent: 90.0, limit: 100.0, window: "w" }] }
+}
+
+const TEST_ENV: AlertEnv = { usage: usageOf, history: () => [] }
+
+const OPS: Channel = { id: "ops", name: "Ops", type: "slack", url: "https://hooks.example/services/T1/B1/secret", enabled: true, cooldown_seconds: 0 }
+
+const RULE_BODY = `{"name":"Budget at 80%","scope_type":"virtual_key","scope_id":"vk1","cel_expression":"budget_usage_percent >= 80.0","channel_ids":["ops"],"cooldown_milliseconds":300000}`
+
+test("rules: create, list, get, update and delete in Bifrost's shape", () => {
+  const cfg: AlertsConfig = { channels: [OPS], cel_rules: [] }
+  const made = alertingRoute(cfg, TEST_ENV, "POST", "/api/alerting/rules", RULE_BODY)
+  expect(made.status).toBe(201)
+  expect(made.body.includes(`"cooldown_milliseconds":300000`)).toBe(true)
+  expect(made.body.includes(`"target_type":null`)).toBe(true)
+  const c1 = made.next!
+  expect(c1.cel_rules!.length).toBe(1)
+  const id = c1.cel_rules![0]!.id
+  expect(id.startsWith("rule-")).toBe(true)
+
+  const list = alertingRoute(c1, TEST_ENV, "GET", "/api/alerting/rules", "")
+  expect(list.status).toBe(200)
+  expect(list.body.startsWith(`{"rules":[`)).toBe(true)
+  expect(list.body.includes(`"name":"Budget at 80%"`)).toBe(true)
+  expect(list.next).toBeUndefined()
+
+  const one = alertingRoute(c1, TEST_ENV, "GET", `/api/alerting/rules/${id}`, "")
+  expect(one.status).toBe(200)
+  expect(one.body.includes(`"id":"${id}"`)).toBe(true)
+
+  const off = alertingRoute(c1, TEST_ENV, "PUT", `/api/alerting/rules/${id}`, `{"enabled":false}`)
+  expect(off.status).toBe(200)
+  expect(off.body.includes(`"enabled":false`)).toBe(true)
+  expect(off.body.includes(`"name":"Budget at 80%"`)).toBe(true)
+  const c2 = off.next!
+  expect(c2.cel_rules![0]!.enabled).toBe(false)
+
+  const gone = alertingRoute(c2, TEST_ENV, "DELETE", `/api/alerting/rules/${id}`, "")
+  expect(gone.status).toBe(200)
+  expect(gone.next!.cel_rules!.length).toBe(0)
+})
+
+test("a rule with a target budget is saved with it, and a PUT can clear it", () => {
+  const cfg: AlertsConfig = { channels: [OPS], cel_rules: [] }
+  const body = `{"id":"b-rule","name":"B1","scope_type":"virtual_key","scope_id":"vk1","cel_expression":"budget_spent > 1.0","channel_ids":["ops"],"target_type":"budget","target_id":"b1"}`
+  const made = alertingRoute(cfg, TEST_ENV, "POST", "/api/alerting/rules", body)
+  expect(made.status).toBe(201)
+  expect(made.body.includes(`"target_id":"b1"`)).toBe(true)
+  expect(made.body.includes(`"cooldown_milliseconds":60000`)).toBe(true)
+  const cleared = alertingRoute(made.next!, TEST_ENV, "PUT", "/api/alerting/rules/b-rule", `{"target_type":null,"target_id":null}`)
+  expect(cleared.status).toBe(200)
+  expect(cleared.body.includes(`"target_id":null`)).toBe(true)
+})
+
+test("rules are checked on create: scope, expression, channels, cooldown, target", () => {
+  const cfg: AlertsConfig = { channels: [OPS], cel_rules: [] }
+  const cases: { body: string, message: string }[] = [
+    { body: `{"name":"x","scope_type":"virtual_key","scope_id":"nope","cel_expression":"true","channel_ids":["ops"]}`, message: "virtual_key nope does not exist" },
+    { body: `{"name":"x","scope_type":"widget","scope_id":"vk1","cel_expression":"true","channel_ids":["ops"]}`, message: "scope_type must be" },
+    { body: `{"name":"x","scope_type":"virtual_key","scope_id":"vk1","cel_expression":"budget_usage_percent >=","channel_ids":["ops"]}`, message: "cel_expression:" },
+    { body: `{"name":"x","scope_type":"virtual_key","scope_id":"vk1","cel_expression":"true","channel_ids":["nope"]}`, message: "unknown channel nope" },
+    { body: `{"name":"x","scope_type":"virtual_key","scope_id":"vk1","cel_expression":"true","channel_ids":[]}`, message: "at least one channel" },
+    { body: `{"name":"x","scope_type":"virtual_key","scope_id":"vk1","cel_expression":"true","channel_ids":["ops"],"cooldown_milliseconds":1500}`, message: "whole number of seconds" },
+    { body: `{"name":"x","scope_type":"virtual_key","scope_id":"vk1","cel_expression":"true","channel_ids":["ops"],"target_type":"budget","target_id":"zz"}`, message: "budget zz is not in" },
+    { body: `{"name":"x","scope_type":"virtual_key","scope_id":"vk1","cel_expression":"true","channel_ids":["ops"],"target_type":"budget"}`, message: "go together" },
+    { body: `{"scope_type":"virtual_key","scope_id":"vk1","cel_expression":"true","channel_ids":["ops"]}`, message: "name is required" },
+    { body: `{"name":"x"`, message: "JSON object" },
+  ]
+  for (const c of cases) {
+    const r = alertingRoute(cfg, TEST_ENV, "POST", "/api/alerting/rules", c.body)
+    expect(r.status).toBe(400)
+    expect(r.body.includes(c.message)).toBe(true)
+    expect(r.next).toBeUndefined()
+  }
+})
+
+test("a rule that is not there cannot be read, changed or removed", () => {
+  const cfg: AlertsConfig = { channels: [OPS], cel_rules: [] }
+  expect(alertingRoute(cfg, TEST_ENV, "GET", "/api/alerting/rules/nope", "").status).toBe(404)
+  expect(alertingRoute(cfg, TEST_ENV, "PUT", "/api/alerting/rules/nope", `{"enabled":false}`).status).toBe(404)
+  expect(alertingRoute(cfg, TEST_ENV, "DELETE", "/api/alerting/rules/nope", "").status).toBe(404)
+  expect(alertingRoute(cfg, TEST_ENV, "PATCH", "/api/alerting/rules", "").status).toBe(405)
+  expect(alertingRoute(cfg, TEST_ENV, "GET", "/api/alerting/nothing", "").status).toBe(404)
+})
+
+test("channels: secrets are masked on read and kept when sent back masked", () => {
+  const cfg: AlertsConfig = { channels: [], cel_rules: [] }
+  const made = alertingRoute(cfg, TEST_ENV, "POST", "/api/alerting/channels", `{"name":"Ops","type":"slack","config":{"webhook_url":"https://hooks.example/services/T1/B1/secret"}}`)
+  expect(made.status).toBe(201)
+  expect(made.body.includes(`"webhook_url":"https://hooks.example/********"`)).toBe(true)
+  expect(made.body.includes("secret")).toBe(false)
+  const c1 = made.next!
+  const id = c1.channels![0]!.id
+  expect(c1.channels![0]!.url).toBe("https://hooks.example/services/T1/B1/secret")
+
+  const put = alertingRoute(c1, TEST_ENV, "PUT", `/api/alerting/channels/${id}`, `{"name":"Renamed","config":{"webhook_url":"https://hooks.example/********"}}`)
+  expect(put.status).toBe(200)
+  expect(put.next!.channels![0]!.url).toBe("https://hooks.example/services/T1/B1/secret")
+  expect(put.next!.channels![0]!.name).toBe("Renamed")
+
+  const newUrl = alertingRoute(c1, TEST_ENV, "PUT", `/api/alerting/channels/${id}`, `{"config":{"webhook_url":"https://hooks.example/services/T2"}}`)
+  expect(newUrl.next!.channels![0]!.url).toBe("https://hooks.example/services/T2")
+})
+
+test("channels: a pagerduty key and webhook headers are masked, and the checks hold", () => {
+  const cfg: AlertsConfig = { channels: [], cel_rules: [] }
+  const pd = alertingRoute(cfg, TEST_ENV, "POST", "/api/alerting/channels", `{"name":"PD","type":"pagerduty","config":{"routing_key":"R0KEY"}}`)
+  expect(pd.status).toBe(201)
+  expect(pd.body.includes(`"routing_key":"********"`)).toBe(true)
+  expect(pd.body.includes("R0KEY")).toBe(false)
+  expect(alertingRoute(cfg, TEST_ENV, "POST", "/api/alerting/channels", `{"name":"PD","type":"pagerduty","config":{}}`).status).toBe(400)
+  expect(alertingRoute(cfg, TEST_ENV, "POST", "/api/alerting/channels", `{"name":"W","type":"sms","config":{"url":"https://x.example"}}`).status).toBe(400)
+  expect(alertingRoute(cfg, TEST_ENV, "POST", "/api/alerting/channels", `{"name":"W","type":"webhook","config":{"url":"ftp://x.example"}}`).status).toBe(400)
+
+  const hook = alertingRoute(cfg, TEST_ENV, "POST", "/api/alerting/channels", `{"name":"H","type":"webhook","cooldown_milliseconds":60000,"config":{"url":"https://h.example/x","headers":{"X-Key":"abc"}}}`)
+  expect(hook.status).toBe(201)
+  expect(hook.body.includes(`"headers":{"X-Key":"********"}`)).toBe(true)
+  expect(hook.body.includes(`"cooldown_milliseconds":60000`)).toBe(true)
+  expect(hook.next!.channels![0]!.headers!.get("X-Key")).toBe("abc")
+})
+
+test("deleting a channel takes it out of the rules that named it", () => {
+  const rule: CelRule = { id: "r1", name: "R", scope_type: "virtual_key", scope_id: "vk1", cel_expression: "budget_usage_percent >= 80.0", channel_ids: ["ops", "other"] }
+  const other: Channel = { id: "other", type: "webhook", url: "https://o.example/h" }
+  const cfg: AlertsConfig = { channels: [OPS, other], cel_rules: [rule] }
+  const r = alertingRoute(cfg, TEST_ENV, "DELETE", "/api/alerting/channels/ops", "")
+  expect(r.status).toBe(200)
+  expect(r.next!.channels!.length).toBe(1)
+  expect(r.next!.cel_rules![0]!.channel_ids.length).toBe(1)
+  expect(r.next!.cel_rules![0]!.channel_ids[0]!).toBe("other")
+  expect(cfg.cel_rules![0]!.channel_ids.length).toBe(2)
+})
+
+test("history: filters, sorts newest first and pages, in Bifrost's shape", () => {
+  const rule: CelRule = { id: "every", name: "Every", scope_type: "virtual_key", scope_id: "vk1", cel_expression: "budget_usage_percent >= 80.0", channel_ids: ["ops"], cooldown_seconds: 0 }
+  const eng = new CelEngine([rule], [OPS])
+  const u = usageOf("virtual_key", "vk1")!
+  eng.evaluate([u], 1000000.0)
+  eng.evaluate([u], 1000001.0)
+  eng.evaluate([u], 1000002.0)
+  const env: AlertEnv = { usage: usageOf, history: () => eng.history() }
+  const cfg: AlertsConfig = { channels: [OPS], cel_rules: [rule] }
+
+  const page = alertingRoute(cfg, env, "GET", "/api/alerting/history?limit=2", "")
+  expect(page.status).toBe(200)
+  expect(page.body.startsWith(`{"history":[`)).toBe(true)
+  expect(page.body.includes(`"total":3`)).toBe(true)
+  expect(page.body.includes(`"created_at":"1970-01-01T00:16:40.002Z"`)).toBe(true)
+  expect(page.body.includes(`"status":"sent"`)).toBe(true)
+
+  const asc = alertingRoute(cfg, env, "GET", "/api/alerting/history?sort_order=asc&limit=1&offset=1", "")
+  expect(asc.body.includes(`"created_at":"1970-01-01T00:16:40.001Z"`)).toBe(true)
+  expect(asc.body.includes(`"total":3,"limit":1,"offset":1`)).toBe(true)
+
+  const none = alertingRoute(cfg, env, "GET", "/api/alerting/history?status=skipped", "")
+  expect(none.body.includes(`"history":[]`)).toBe(true)
+  expect(none.body.includes(`"total":0`)).toBe(true)
+
+  const byChan = alertingRoute(cfg, env, "GET", "/api/alerting/history?channel_type=slack&scope_type=virtual_key&sort_by=rule_name", "")
+  expect(byChan.body.includes(`"total":3`)).toBe(true)
+  expect(alertingRoute(cfg, env, "GET", "/api/alerting/history?sort_by=cost", "").status).toBe(400)
+})

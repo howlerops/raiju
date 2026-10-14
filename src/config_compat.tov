@@ -261,8 +261,8 @@ function mapMcp(inout top: Field[], inout notes: string[]): void throws SyntaxEr
   setField(&top, "virtual_mcps", "[" + vms.join(",") + "]")
 }
 
-// alerting becomes alerts. Raiju alerts fire on metric thresholds, so Bifrost's
-// CEL rules are not loaded; channels carry over when Raiju can send to them.
+// alerting becomes alerts. Raiju's metric rules are separate, so Bifrost's CEL rules
+// load as cel_rules; channels carry over when Raiju can send to them.
 function mapAlerting(inout top: Field[], inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "alerting")
   if (raw === undefined) return
@@ -288,6 +288,7 @@ function mapAlerting(inout top: Field[], inout notes: string[]): void throws Syn
     }
     let ch: Field[] = []
     add(&ch, "id", strRaw(cf, "id") ?? quote(`channel-${channels.length + 1}`))
+    add(&ch, "name", strRaw(cf, "name"))
     add(&ch, "type", quote(kind))
     add(&ch, "url", url ?? quote(""))
     if (kind === "webhook") add(&ch, "headers", find(conf, "headers"))
@@ -296,13 +297,47 @@ function mapAlerting(inout top: Field[], inout notes: string[]): void throws Syn
     channels.push(build(ch))
   }
   if (skipped > 0) notes.push(`config: ${skipped} alerting channel(s) skipped: a channel needs to be enabled, of a known type, and have a url (a routing_key for pagerduty)`)
-  const rules = try items(find(af, "rules")).length
-  if (rules > 0) notes.push(`config: ${rules} alerting rule(s) use CEL expressions, which Raiju does not evaluate; they are not loaded`)
+  let celRules: string[] = []
+  let badRules = 0
+  for (const el of try items(find(af, "rules"))) {
+    const rf = try members(el)
+    const id = strRaw(rf, "id")
+    const scopeType = strRaw(rf, "scope_type")
+    const scopeId = strRaw(rf, "scope_id")
+    const expr = strRaw(rf, "cel_expression")
+    const chans = find(rf, "channel_ids")
+    const chanIds = try items(chans)
+    if (id === undefined || scopeId === undefined || expr === undefined || !scopeKindRaw(scopeType) || chanIds.length === 0) {
+      badRules += 1
+      continue
+    }
+    let rl: Field[] = []
+    add(&rl, "id", id)
+    add(&rl, "name", strRaw(rf, "name") ?? id)
+    add(&rl, "description", strRaw(rf, "description"))
+    add(&rl, "enabled", find(rf, "enabled"))
+    add(&rl, "scope_type", scopeType)
+    add(&rl, "scope_id", scopeId)
+    add(&rl, "cel_expression", expr)
+    add(&rl, "channel_ids", chans)
+    add(&rl, "cooldown_seconds", find(rf, "cooldown_seconds"))
+    add(&rl, "notify_once_per_reset_cycle", find(rf, "notify_once_per_reset_cycle"))
+    add(&rl, "target_type", strRaw(rf, "target_type"))
+    add(&rl, "target_id", strRaw(rf, "target_id"))
+    celRules.push(build(rl))
+  }
+  if (badRules > 0) notes.push(`config: ${badRules} alerting rule(s) skipped: a rule needs an id, a scope_type of virtual_key, team or customer, a scope_id, a cel_expression and channel_ids`)
   ignored("alerting", af, ["history_retention_days", "webhook_network"], &notes)
   let out: Field[] = []
   add(&out, "channels", "[" + channels.join(",") + "]")
   add(&out, "rules", "[]")
+  add(&out, "cel_rules", "[" + celRules.join(",") + "]")
   put(&top, "alerts", out)
+}
+
+// Bifrost's scope_type values, as quoted JSON text.
+function scopeKindRaw(raw: string | undefined): bool {
+  return raw === "\"virtual_key\"" || raw === "\"team\"" || raw === "\"customer\""
 }
 
 // audit_logs becomes audit. Bifrost's disabled flag is the inverse of Raiju's enabled.
@@ -603,14 +638,30 @@ test("renames alerting to alerts and maps channels", () => {
   expect(find(al, "rules")).toBe("[]")
   const chans = try elements(find(al, "channels")!)
   expect(chans.length).toBe(4)
-  expect(chans[2]).toBe(`{"id":"pd","type":"pagerduty","url":"","routing_key":"k","cooldown_seconds":30}`)
-  expect(chans[3]).toBe(`{"id":"ms","type":"microsoft_teams","url":"https://hooks.example/t"}`)
-  expect(chans[0]).toBe(`{"id":"ops","type":"slack","url":"https://hooks.example/slack"}`)
-  expect(chans[1]).toBe(`{"id":"hook","type":"webhook","url":"https://hooks.example/h","headers":{ "X-Token": "t" }}`)
+  expect(chans[2]).toBe(`{"id":"pd","name":"pd","type":"pagerduty","url":"","routing_key":"k","cooldown_seconds":30}`)
+  expect(chans[3]).toBe(`{"id":"ms","name":"ms","type":"microsoft_teams","url":"https://hooks.example/t"}`)
+  expect(chans[0]).toBe(`{"id":"ops","name":"ops","type":"slack","url":"https://hooks.example/slack"}`)
+  expect(chans[1]).toBe(`{"id":"hook","name":"hook","type":"webhook","url":"https://hooks.example/h","headers":{ "X-Token": "t" }}`)
+  expect(find(al, "cel_rules")).toBe(`[{"id":"r1","name":"spend","enabled":true,"scope_type":"virtual_key","scope_id":"vk1","cel_expression":"budget_usage_percent > 90","channel_ids":["ops"]}]`)
   expect(r.notes.includes(`config: "alerting" read as "alerts"`)).toBe(true)
   expect(r.notes.includes(`config: 1 alerting channel(s) skipped: a channel needs to be enabled, of a known type, and have a url (a routing_key for pagerduty)`)).toBe(true)
-  expect(r.notes.includes(`config: 1 alerting rule(s) use CEL expressions, which Raiju does not evaluate; they are not loaded`)).toBe(true)
+  expect(r.notes.some((n) => n.includes("alerting rule(s) use CEL"))).toBe(false)
   expect(r.notes.includes(`config: "alerting.history_retention_days" is not supported by Raiju and is ignored`)).toBe(true)
+})
+
+test("alerting rules load as cel_rules; a rule without a valid scope or channels is skipped", () => {
+  const r = try normalize(`{
+    "alerting": {
+      "rules": [
+        { "id": "ok", "name": "Budget", "enabled": true, "scope_type": "team", "scope_id": "t1", "cel_expression": "budget_usage_percent >= 80.0", "channel_ids": ["ops"], "cooldown_seconds": 300, "notify_once_per_reset_cycle": true, "target_type": "budget", "target_id": "b1", "description": "d" },
+        { "id": "bad-scope", "enabled": true, "scope_type": "widget", "scope_id": "w1", "cel_expression": "true", "channel_ids": ["ops"] },
+        { "id": "no-channel", "enabled": true, "scope_type": "customer", "scope_id": "c1", "cel_expression": "true", "channel_ids": [] }
+      ]
+    }
+  }`)
+  const al = try fields(find(try fields(r.text), "alerts")!)
+  expect(find(al, "cel_rules")).toBe(`[{"id":"ok","name":"Budget","description":"d","enabled":true,"scope_type":"team","scope_id":"t1","cel_expression":"budget_usage_percent >= 80.0","channel_ids":["ops"],"cooldown_seconds":300,"notify_once_per_reset_cycle":true,"target_type":"budget","target_id":"b1"}]`)
+  expect(r.notes.includes(`config: 2 alerting rule(s) skipped: a rule needs an id, a scope_type of virtual_key, team or customer, a scope_id, a cel_expression and channel_ids`)).toBe(true)
 })
 
 test("maps audit_logs to audit and flags an empty signing key", () => {
