@@ -22,11 +22,11 @@ RUN scripts/build-tov.sh \
  && mkdir -p /out/app/data \
  && TOV_CFLAGS=-DTV_PLAIN_ALLOC build/tov/target/release/tov build src/main.tov -o /out/raiju
 
-# Runtime. The binary links glibc and libm dynamically (check with
-# `ldd build/raiju`), so a fully static base is not enough. base-debian12 adds
-# glibc, libgcc and CA certificates for HTTPS upstreams. There is no shell and
-# no curl, so HEALTHCHECK is not possible: probe GET /health from outside.
-FROM gcr.io/distroless/base-debian12:nonroot
+# Runtime. The binary links glibc, libm and (built here, with Tov's BoringSSL
+# compiled by g++) libstdc++ dynamically; check with `ldd`. distroless/cc adds
+# libstdc++, libgcc and CA certificates for HTTPS upstreams to glibc. There is
+# no shell and no curl, so HEALTHCHECK is not possible: probe GET /health from outside.
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=build --chown=65532:65532 /out/app /app
 COPY --from=build /out/raiju /usr/local/bin/raiju

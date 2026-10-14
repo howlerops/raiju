@@ -103,7 +103,7 @@ the HPA, adds another full set of per-process limits.
 ## Limits of this packaging
 
 - The image builds Tov from source (the installer needs network access and takes
-  several minutes). The binary is dynamically linked against glibc, so the
-  runtime is `distroless/base-debian12`, not `static`.
+  several minutes). The binary is dynamically linked against glibc and libstdc++, so the
+  runtime is `distroless/cc-debian12`, not `static`.
 - The chart's pod security settings (read-only root filesystem, no capabilities)
   have not been exercised on a cluster.
