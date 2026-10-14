@@ -1,0 +1,137 @@
+// IBM watsonx.ai chat. The key's API key is exchanged at IBM IAM for a bearer
+// token that lasts about an hour. Chat requests take an OpenAI-shaped body and
+// answer in the same shape, so the response side reuses openai.tov.
+import { Field, fields, find, isNull, quote, rawNum, rawStr } from "../json"
+import { Upstream, Translated, headers, trimSlash } from "./types"
+import { WatsonxKeyConfig } from "../config"
+import * as openai from "./openai"
+
+const IAM_URL = "https://iam.cloud.ibm.com/identity/token"
+const IAM_GRANT = "grant_type=urn%3Aibm%3Aparams%3Aoauth%3Agrant-type%3Aapikey&apikey="
+const CHAT_PATH = "/ml/v1/text/chat?version=2024-10-08"
+
+// A watsonx.ai service instance: its API key, project and regional endpoint.
+export type WatsonxKey = WatsonxKeyConfig
+
+// Percent-encodes a form value. Bytes outside RFC 3986's unreserved set are
+// escaped, so the API key cannot change the form's fields.
+function formEncode(s: string): string {
+  const hexd = "0123456789ABCDEF"
+  const bytes = new TextEncoder().encode(s)
+  let out = ""
+  for (let i = 0; i < bytes.length; i++) {
+    const b = int(bytes[i]!)
+    const unreserved = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 126
+    if (unreserved) out += s.slice(i, i + 1)
+    else out += "%" + hexd.slice(b >> 4, (b >> 4) + 1) + hexd.slice(b & 15, (b & 15) + 1)
+  }
+  return out
+}
+
+// The POST that exchanges an API key for an IAM access token.
+export function iamTokenRequest(apiKey: string): Upstream {
+  return {
+    url: IAM_URL,
+    headers: headers([["content-type", "application/x-www-form-urlencoded"], ["accept", "application/json"]]),
+    body: IAM_GRANT + formEncode(apiKey),
+  }
+}
+
+// The token and its absolute expiry (epoch seconds) from an IAM response.
+export function parseIamToken(text: string): { token: string, expiresAtSec: int } throws SyntaxError {
+  const fs = try fields(text)
+  const token = rawStr(fs, "access_token")
+  if (token === undefined || token === "") throw new SyntaxError(`watsonx: IAM token request failed: ${rawStr(fs, "errorMessage") ?? "no access_token"}`)
+  const exp = rawNum(fs, "expiration")
+  if (exp === undefined) throw new SyntaxError("watsonx: IAM response has no expiration")
+  return { token: token, expiresAtSec: Math.floor(exp) }
+}
+
+// Fields copied as they are when the caller sent them.
+const PASS_THROUGH = ["temperature", "top_p", "tools"]
+
+// The POST to watsonx's chat endpoint. The OpenAI body's messages, sampling and
+// tools carry over; everything else (stream, n, the gateway's own fields) is dropped.
+export function chatRequest(key: WatsonxKey, token: string, model: string, openaiChatBody: string): Upstream throws SyntaxError {
+  const req = try fields(openaiChatBody)
+  const parts: string[] = [`"model_id":${quote(model)}`, `"project_id":${quote(key.project_id)}`]
+  const msgs = find(req, "messages")
+  if (msgs !== undefined && !isNull(msgs)) parts.push(`"messages":${msgs}`)
+  let maxTokens = find(req, "max_tokens")
+  if (maxTokens === undefined || isNull(maxTokens)) maxTokens = find(req, "max_completion_tokens")
+  if (maxTokens !== undefined && !isNull(maxTokens)) parts.push(`"max_tokens":${maxTokens}`)
+  for (const p of passThrough(req)) parts.push(p)
+  const base = trimSlash(key.url)
+  return {
+    url: base + CHAT_PATH,
+    headers: headers([["content-type", "application/json"], ["accept", "application/json"], ["authorization", "Bearer " + token]]),
+    body: "{" + parts.join(",") + "}",
+  }
+}
+
+function passThrough(req: Field[]): string[] {
+  const out: string[] = []
+  for (const k of PASS_THROUGH) {
+    const raw = find(req, k)
+    if (raw !== undefined && !isNull(raw)) out.push(quote(k) + ":" + raw)
+  }
+  return out
+}
+
+// watsonx answers with OpenAI-shaped choices and usage. The model is reported
+// as the caller asked for it.
+export function chatResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  return try openai.chatResponse(text, requestedModel)
+}
+
+// ---- tests ----
+
+test("IAM token request form-encodes the API key", () => {
+  const up = iamTokenRequest("a+b/c=d")
+  expect(up.url).toBe("https://iam.cloud.ibm.com/identity/token")
+  expect(up.body).toBe("grant_type=urn%3Aibm%3Aparams%3Aoauth%3Agrant-type%3Aapikey&apikey=a%2Bb%2Fc%3Dd")
+  expect(up.headers.get("content-type")).toBe("application/x-www-form-urlencoded")
+})
+
+test("IAM token response gives token and expiry", () => {
+  const t = try parseIamToken(`{"access_token":"tok","refresh_token":"not_supported","token_type":"Bearer","expires_in":3600,"expiration":1700003600}`)
+  expect(t.token).toBe("tok")
+  expect(t.expiresAtSec).toBe(1700003600)
+  let threw = false
+  try {
+    parseIamToken(`{"errorCode":"BXNIM0415E","errorMessage":"bad key"}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    parseIamToken(`{"access_token":"tok"}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("chat request maps an OpenAI body to watsonx", () => {
+  const key: WatsonxKey = { api_key: "k", project_id: "proj-1", url: "https://us-south.ml.cloud.ibm.com/" }
+  const body = `{"model":"watsonx/ibm/granite-3-8b-instruct","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":40,"temperature":0.3,"top_p":null,"stream":true,"fallbacks":["openai/gpt-4o"],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]}`
+  const up = try chatRequest(key, "iam-tok", "ibm/granite-3-8b-instruct", body)
+  expect(up.url).toBe("https://us-south.ml.cloud.ibm.com/ml/v1/text/chat?version=2024-10-08")
+  expect(up.headers.get("authorization")).toBe("Bearer iam-tok")
+  expect(up.body).toBe(`{"model_id":"ibm/granite-3-8b-instruct","project_id":"proj-1","messages":[{"role":"user","content":"hi"}],"max_tokens":40,"temperature":0.3,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]}`)
+})
+
+test("chat request without optional fields", () => {
+  const key: WatsonxKey = { api_key: "k", project_id: "p", url: "https://eu-de.ml.cloud.ibm.com" }
+  const up = try chatRequest(key, "t", "m", `{"messages":[]}`)
+  expect(up.url).toBe("https://eu-de.ml.cloud.ibm.com/ml/v1/text/chat?version=2024-10-08")
+  expect(up.body).toBe(`{"model_id":"m","project_id":"p","messages":[]}`)
+})
+
+test("chat response reports the requested model and usage", () => {
+  const r = try chatResponse(`{"id":"x","model_id":"ibm/granite","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12}}`, "watsonx/ibm/granite")
+  expect(r.body.includes(`"model":"watsonx/ibm/granite"`)).toBe(true)
+  expect(r.promptTokens).toBe(9)
+  expect(r.completionTokens).toBe(3)
+})

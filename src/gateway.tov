@@ -11,7 +11,7 @@ import { Tier, tierTarget, overrideTier } from "./complexity"
 import * as cplx from "./complexity"
 import { AgentConfig, runAgent } from "./agent"
 import { SampleRing } from "./alerts"
-import { Target, Upstream, Translated, proxyOf } from "./providers/types"
+import { Target, Upstream, Translated, proxyOf, RS } from "./providers/types"
 import { ModelRef, parseModel, target, classify, backoffMs, maxRetries, timeoutMs, healthId } from "./router"
 import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
 import { Governance, Grant, Denial } from "./governance"
@@ -20,6 +20,7 @@ import { ResponseCache, cacheKey, parseTtl } from "./cache"
 import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
+import * as watsonx from "./providers/watsonx"
 import * as metrics from "./metrics"
 import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
 import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails"
@@ -294,6 +295,7 @@ export class Engine {
   gov: Governance
   health: Health
   vertexTokens = new TokenCache()
+  iamTokens: Map<string, { token: string, expiresAtSec: int }> = new Map()
   guard: GuardConfig | undefined = undefined
   rules: RuleSet | undefined = undefined
   logStore: LogStore | undefined = undefined
@@ -441,6 +443,14 @@ export class Engine {
         }
         if (sel === undefined) break
         let t = sel.t
+        if (t.kind === "watsonx") {
+          const tok = await this.watsonxToken(t)
+          if (tok.error !== "") {
+            last = { ok: false, status: 502, body: errorJson(tok.error, "authentication_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+          t.key.value = tok.token
+        }
         if (t.kind === "vertex") {
           const tok = await this.vertexToken(t)
           if (tok.error !== "") {
@@ -520,6 +530,21 @@ export class Engine {
             return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true }
           }
           text = await res.text()
+          // follow-up calls of a multi-call request (one embedding input per call)
+          const more = up.extra
+          if (more !== undefined && status >= 200 && status < 300) {
+            for (const x of more) {
+              const xh: Record<string, string> = x.headers
+              const xr = await fetch(x.url, { method: "POST", headers: xh, body: x.body, signal: signal, proxy: px })
+              const xt = await xr.text()
+              if (xr.status < 200 || xr.status >= 300) {
+                status = xr.status
+                text = xt
+                break
+              }
+              text = text + RS + xt
+            }
+          }
           dl.finish()
           retryAfter = res.headers.get("retry-after") ?? undefined
         } catch (e) {
@@ -661,6 +686,30 @@ export class Engine {
 
   // A Vertex OAuth access token for the key's service account, from the cache
   // or from Google's token endpoint (a signed JWT exchanged for an hour-long token).
+  // An IBM Cloud IAM token for a watsonx key, cached until a minute before it expires.
+  async watsonxToken(t: Target): Promise<{ token: string, error: string }> {
+    const wk = t.key.watsonx_key_config
+    if (wk === undefined) return { token: "", error: "watsonx: the key needs watsonx_key_config" }
+    const now = Math.floor(Date.now() / 1000)
+    const c = this.iamTokens.get(wk.api_key)
+    if (c !== undefined && c.expiresAtSec - 60 > now) return { token: c.token, error: "" }
+    try {
+      let up = watsonx.iamTokenRequest(wk.api_key)
+      const iam = wk.iam_url
+      if (iam !== undefined && iam !== "") up.url = iam
+      const hs: Record<string, string> = up.headers
+      const dl = deadline(10000)
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal })
+      const text = await res.text()
+      dl.finish()
+      const tok = watsonx.parseIamToken(text)
+      this.iamTokens.set(wk.api_key, tok)
+      return { token: tok.token, error: "" }
+    } catch (e) {
+      return { token: "", error: `watsonx authentication failed: ${e.message}` }
+    }
+  }
+
   async vertexToken(t: Target): Promise<{ token: string, error: string }> {
     const now = Math.floor(Date.now() / 1000)
     try {
@@ -1071,7 +1120,7 @@ export class Engine {
       if (!providers.supportsEmbeddings(t.kind)) throw new SyntaxError(`${t.provider} does not serve embeddings through this gateway yet`)
       return try providers.embeddingsUpstream(t, body)
     }
-    const translate: Translate = (t, text, requested) => try providers.embeddingsTranslate(t.kind, text, requested)
+    const translate: Translate = (t, text, requested) => try providers.embeddingsTranslate(t.kind, t.model, text, requested)
     return try await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
   }
 

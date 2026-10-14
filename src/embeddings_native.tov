@@ -1,0 +1,390 @@
+// Embeddings for the providers whose wire formats are not OpenAI's: Gemini's
+// batchEmbedContents, Vertex's predict, and Bedrock's InvokeModel for Titan v2
+// (one input per call) and Cohere (all inputs in one call). Each response is
+// turned into an OpenAI embeddings body.
+import { Field, fields, elements, find, quote, rawNum, isNull, decodeString } from "./json"
+import { KeyConfig, NetworkConfig } from "./config"
+import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./providers/types"
+import * as gemini from "./providers/gemini"
+import * as bedrock from "./providers/bedrock"
+
+// The input strings of an OpenAI embeddings request. Token arrays are refused:
+// the native providers take text.
+export function inputs(body: Field[]): string[] throws SyntaxError {
+  const raw = find(body, "input")
+  if (raw === undefined || isNull(raw)) throw new SyntaxError("input is required")
+  if (raw.startsWith("\"")) {
+    const one = try decodeString(raw)
+    if (one === "") throw new SyntaxError("input must not be empty")
+    return [one]
+  }
+  if (!raw.startsWith("[")) throw new SyntaxError("input must be a string or an array of strings")
+  const out: string[] = []
+  for (const el of try elements(raw)) {
+    if (!el.startsWith("\"")) throw new SyntaxError("token-array input is not supported; send strings")
+    const s = try decodeString(el)
+    if (s === "") throw new SyntaxError("input must not be empty")
+    out.push(s)
+  }
+  if (out.length === 0) throw new SyntaxError("input must not be empty")
+  return out
+}
+
+// The request's dimensions as raw JSON, or undefined when unset. Only a positive
+// integer is accepted, so the raw text can go upstream unchanged.
+function dimensionsRaw(body: Field[]): string | undefined throws SyntaxError {
+  const raw = find(body, "dimensions")
+  if (raw === undefined || isNull(raw)) return undefined
+  const d = rawNum(body, "dimensions")
+  if (d === undefined || d < 1 || d !== Math.floor(d)) throw new SyntaxError("dimensions must be a positive integer")
+  return raw
+}
+
+// The OpenAI embeddings body. Each vector is already JSON text, so it is kept as sent.
+function embeddingsBody(vectors: string[], pt: int, requested: string): string {
+  const data: string[] = []
+  for (let i = 0; i < vectors.length; i++) {
+    data.push(`{"object":"embedding","index":${i},"embedding":${vectors[i]!}}`)
+  }
+  return `{"object":"list","data":[${data.join(",")}],"model":${quote(requested)},` +
+    `"usage":{"prompt_tokens":${pt},"total_tokens":${pt}}}`
+}
+
+// ---- Gemini ----
+
+function geminiBase(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b === undefined || b === "") return "https://generativelanguage.googleapis.com"
+  return trimSlash(b)
+}
+
+// One batchEmbedContents call carrying every input.
+export function geminiRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const texts = try inputs(body)
+  const dims = try dimensionsRaw(body)
+  const reqs: string[] = []
+  for (const s of texts) {
+    const parts = [`"model":${quote("models/" + t.model)}`, `"content":{"parts":[{"text":${quote(s)}}]}`]
+    if (dims !== undefined) parts.push(`"outputDimensionality":${dims}`)
+    reqs.push("{" + parts.join(",") + "}")
+  }
+  return {
+    url: `${geminiBase(t)}/v1beta/models/${t.model}:batchEmbedContents`,
+    headers: gemini.upstreamHeaders(t),
+    body: `{"requests":[${reqs.join(",")}]}`,
+  }
+}
+
+// Gemini's batch answer has no token counts, so usage is 0.
+export function geminiResponse(text: string, requested: string): Translated throws SyntaxError {
+  const fs = try fields(text)
+  const vectors: string[] = []
+  const embs = find(fs, "embeddings")
+  if (embs !== undefined && !isNull(embs)) {
+    for (const el of try elements(embs)) {
+      const v = find(try fields(el), "values")
+      if (v === undefined || isNull(v)) throw new SyntaxError("gemini: embedding has no values")
+      vectors.push(v)
+    }
+  }
+  return { body: embeddingsBody(vectors, 0, requested), promptTokens: 0, completionTokens: 0 }
+}
+
+// ---- Vertex ----
+
+function vertexHost(region: string): string {
+  return region === "global" ? "aiplatform.googleapis.com" : `${region}-aiplatform.googleapis.com`
+}
+
+// One predict call carrying every input. The access token comes from the
+// gateway's cached service-account token.
+export function vertexRequest(t: Target, body: Field[], accessToken: string): Upstream throws SyntaxError {
+  const vk = t.key.vertex_key_config
+  if (vk === undefined) throw new SyntaxError("vertex: key has no vertex_key_config")
+  const b = t.cfg.network_config?.base_url
+  const origin = b === undefined || b === "" ? `https://${vertexHost(vk.region)}` : trimSlash(b)
+  const url = `${origin}/v1/projects/${vk.project_id}/locations/${vk.region}/publishers/google/models/${t.model}:predict`
+  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + accessToken]])
+  addExtraHeaders(&h, t.cfg)
+  const texts = try inputs(body)
+  const dims = try dimensionsRaw(body)
+  const instances: string[] = []
+  for (const s of texts) instances.push(`{"content":${quote(s)}}`)
+  const parts = [`"instances":[${instances.join(",")}]`]
+  if (dims !== undefined) parts.push(`"parameters":{"outputDimensionality":${dims}}`)
+  return { url: url, headers: h, body: "{" + parts.join(",") + "}" }
+}
+
+// Token counts are summed over the predictions.
+export function vertexResponse(text: string, requested: string): Translated throws SyntaxError {
+  const fs = try fields(text)
+  const vectors: string[] = []
+  let pt = 0
+  const preds = find(fs, "predictions")
+  if (preds !== undefined && !isNull(preds)) {
+    for (const el of try elements(preds)) {
+      const embRaw = find(try fields(el), "embeddings")
+      if (embRaw === undefined || isNull(embRaw)) throw new SyntaxError("vertex: prediction has no embeddings")
+      const ef = try fields(embRaw)
+      const v = find(ef, "values")
+      if (v === undefined || isNull(v)) throw new SyntaxError("vertex: embedding has no values")
+      vectors.push(v)
+      const statRaw = find(ef, "statistics")
+      if (statRaw !== undefined && !isNull(statRaw)) {
+        const n = rawNum(try fields(statRaw), "token_count")
+        if (n !== undefined) pt += Math.floor(n)
+      }
+    }
+  }
+  return { body: embeddingsBody(vectors, pt, requested), promptTokens: pt, completionTokens: 0 }
+}
+
+// ---- Bedrock ----
+
+function isTitan(model: string): bool {
+  return model.startsWith("amazon.titan-embed")
+}
+
+function isBedrockCohere(model: string): bool {
+  return model.startsWith("cohere.embed-")
+}
+
+// One InvokeModel call per input for Titan v2, and one call with every input for
+// Cohere on Bedrock. The lead sends the calls and passes the responses, in the
+// same order, to bedrockResponse.
+export function bedrockRequests(t: Target, body: Field[]): Upstream[] throws SyntaxError {
+  const texts = try inputs(body)
+  const dims = try dimensionsRaw(body)
+  if (isTitan(t.model)) {
+    const out: Upstream[] = []
+    for (const s of texts) {
+      const parts = [`"inputText":${quote(s)}`]
+      if (dims !== undefined) parts.push(`"dimensions":${dims}`)
+      parts.push(`"normalize":true`)
+      out.push(bedrock.signedRequest(t, "invoke", "{" + parts.join(",") + "}"))
+    }
+    return out
+  }
+  if (isBedrockCohere(t.model)) {
+    // dimensions is not sent: the Cohere body here has no output size field
+    const list: string[] = []
+    for (const s of texts) list.push(quote(s))
+    return [bedrock.signedRequest(t, "invoke", `{"texts":[${list.join(",")}],"input_type":"search_document"}`)]
+  }
+  throw new SyntaxError(`bedrock: ${t.model} does not serve embeddings through this gateway`)
+}
+
+// Combines the response bodies of bedrockRequests' calls, in order, into one
+// embeddings body. Titan reports a token count per call; Cohere on Bedrock does not.
+export function bedrockResponse(model: string, responses: string[], requested: string): Translated throws SyntaxError {
+  const vectors: string[] = []
+  let pt = 0
+  for (const r of responses) {
+    const fs = try fields(r)
+    if (isTitan(model)) {
+      const v = find(fs, "embedding")
+      if (v === undefined || isNull(v)) throw new SyntaxError("bedrock: titan response has no embedding")
+      vectors.push(v)
+      const n = rawNum(fs, "inputTextTokenCount")
+      if (n !== undefined) pt += Math.floor(n)
+    } else if (isBedrockCohere(model)) {
+      const embs = find(fs, "embeddings")
+      if (embs === undefined || isNull(embs)) throw new SyntaxError("bedrock: cohere response has no embeddings")
+      for (const v of try elements(embs)) vectors.push(v)
+    } else {
+      throw new SyntaxError(`bedrock: ${model} does not serve embeddings through this gateway`)
+    }
+  }
+  return { body: embeddingsBody(vectors, pt, requested), promptTokens: pt, completionTokens: 0 }
+}
+
+// ---- tests ----
+
+function netOf(base: string | undefined): NetworkConfig {
+  const net: NetworkConfig = {}
+  if (base !== undefined) net.base_url = base
+  return net
+}
+
+function gTarget(model: string, base: string | undefined): Target {
+  const key: KeyConfig = { value: "gk" }
+  return { provider: "gemini", kind: "gemini", model: model, key: key, cfg: { network_config: netOf(base) } }
+}
+
+function vTarget(region: string, base: string | undefined): Target {
+  const key: KeyConfig = { vertex_key_config: { project_id: "proj", region: region } }
+  return { provider: "vertex", kind: "vertex", model: "text-embedding-005", key: key, cfg: { network_config: netOf(base) } }
+}
+
+function bTarget(model: string, bk: bool): Target {
+  const key: KeyConfig = bk ? { value: "bk" } : { bedrock_key_config: { access_key: "AKID", secret_key: "secret", region: "eu-west-1" } }
+  return { provider: "bedrock", kind: "bedrock", model: model, key: key, cfg: {} }
+}
+
+test("inputs accept a string, a list, and escapes", () => {
+  expect(try inputs(try fields(`{"input":"hi"}`))).toEqual(["hi"])
+  expect(try inputs(try fields(`{"input":["a","b\\n"]}`))).toEqual(["a", "b\n"])
+  let threw = false
+  try {
+    inputs(try fields(`{"input":[1,2]}`))
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    inputs(try fields(`{"input":[["x"]]}`))
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    inputs(try fields(`{"input":[]}`))
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    inputs(try fields(`{"model":"m"}`))
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("dimensions must be a positive integer", () => {
+  let threw = false
+  try {
+    geminiRequest(gTarget("m", undefined), try fields(`{"input":"a","dimensions":"8"}`))
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    geminiRequest(gTarget("m", undefined), try fields(`{"input":"a","dimensions":1.5}`))
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  // null means unset
+  const up = try geminiRequest(gTarget("m", undefined), try fields(`{"input":"a","dimensions":null}`))
+  expect(up.body).toBe(`{"requests":[{"model":"models/m","content":{"parts":[{"text":"a"}]}}]}`)
+})
+
+test("gemini request batches inputs with dimensions", () => {
+  const up = try geminiRequest(gTarget("gemini-embedding-001", undefined), try fields(`{"input":["a","b"],"dimensions":256}`))
+  expect(up.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents")
+  expect(up.headers.get("x-goog-api-key")).toBe("gk")
+  expect(up.body).toBe(`{"requests":[` +
+    `{"model":"models/gemini-embedding-001","content":{"parts":[{"text":"a"}]},"outputDimensionality":256},` +
+    `{"model":"models/gemini-embedding-001","content":{"parts":[{"text":"b"}]},"outputDimensionality":256}]}`)
+  const custom = try geminiRequest(gTarget("m", "https://proxy.local/g/"), try fields(`{"input":"x"}`))
+  expect(custom.url).toBe("https://proxy.local/g/v1beta/models/m:batchEmbedContents")
+})
+
+test("gemini response becomes an OpenAI body", () => {
+  const r = try geminiResponse(`{"embeddings":[{"values":[0.5,-1.0]},{"values":[2,3]}]}`, "gemini/gemini-embedding-001")
+  expect(r.body).toBe(`{"object":"list","data":[` +
+    `{"object":"embedding","index":0,"embedding":[0.5,-1.0]},` +
+    `{"object":"embedding","index":1,"embedding":[2,3]}],` +
+    `"model":"gemini/gemini-embedding-001","usage":{"prompt_tokens":0,"total_tokens":0}}`)
+  expect(r.promptTokens).toBe(0)
+  let threw = false
+  try {
+    geminiResponse(`{"embeddings":[{"other":1}]}`, "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("vertex request posts every input to predict", () => {
+  const up = try vertexRequest(vTarget("us-central1", undefined), try fields(`{"input":["a","b"],"dimensions":768}`), "tok")
+  expect(up.url).toBe("https://us-central1-aiplatform.googleapis.com/v1/projects/proj/locations/us-central1/publishers/google/models/text-embedding-005:predict")
+  expect(up.headers.get("authorization")).toBe("Bearer tok")
+  expect(up.body).toBe(`{"instances":[{"content":"a"},{"content":"b"}],"parameters":{"outputDimensionality":768}}`)
+  const g = try vertexRequest(vTarget("global", "https://vx.local/"), try fields(`{"input":"a"}`), "tok")
+  expect(g.url).toBe("https://vx.local/v1/projects/proj/locations/global/publishers/google/models/text-embedding-005:predict")
+  expect(g.body).toBe(`{"instances":[{"content":"a"}]}`)
+  const glob = try vertexRequest(vTarget("global", undefined), try fields(`{"input":"a"}`), "tok")
+  expect(glob.url.startsWith("https://aiplatform.googleapis.com/v1/projects/proj/locations/global/")).toBe(true)
+  let threw = false
+  const noKey: Target = { provider: "vertex", kind: "vertex", model: "m", key: {}, cfg: {} }
+  try {
+    vertexRequest(noKey, try fields(`{"input":"a"}`), "tok")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("vertex response sums token counts", () => {
+  const r = try vertexResponse(`{"predictions":[` +
+    `{"embeddings":{"values":[0.1,0.2],"statistics":{"truncated":false,"token_count":3}}},` +
+    `{"embeddings":{"values":[0.3,0.4],"statistics":{"truncated":false,"token_count":5}}}]}`, "vertex/text-embedding-005")
+  expect(r.body).toBe(`{"object":"list","data":[` +
+    `{"object":"embedding","index":0,"embedding":[0.1,0.2]},` +
+    `{"object":"embedding","index":1,"embedding":[0.3,0.4]}],` +
+    `"model":"vertex/text-embedding-005","usage":{"prompt_tokens":8,"total_tokens":8}}`)
+  expect(r.promptTokens).toBe(8)
+})
+
+test("bedrock titan takes one call per input", () => {
+  const ups = try bedrockRequests(bTarget("amazon.titan-embed-text-v2:0", false), try fields(`{"input":["a","b"],"dimensions":512}`))
+  expect(ups.length).toBe(2)
+  expect(ups[0]!.url).toBe("https://bedrock-runtime.eu-west-1.amazonaws.com/model/amazon.titan-embed-text-v2%3A0/invoke")
+  expect(ups[0]!.body).toBe(`{"inputText":"a","dimensions":512,"normalize":true}`)
+  expect(ups[1]!.body).toBe(`{"inputText":"b","dimensions":512,"normalize":true}`)
+  expect(ups[1]!.headers.get("authorization")!.startsWith("AWS4-HMAC-SHA256 Credential=AKID/")).toBe(true)
+  const bare = try bedrockRequests(bTarget("amazon.titan-embed-text-v2:0", true), try fields(`{"input":"a"}`))
+  expect(bare[0]!.body).toBe(`{"inputText":"a","normalize":true}`)
+  expect(bare[0]!.headers.get("authorization")).toBe("Bearer bk")
+})
+
+test("bedrock cohere takes all inputs in one call", () => {
+  const ups = try bedrockRequests(bTarget("cohere.embed-english-v3", true), try fields(`{"input":["a","b"]}`))
+  expect(ups.length).toBe(1)
+  // the bearer-key target sets no region, so the default applies
+  expect(ups[0]!.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/cohere.embed-english-v3/invoke")
+  expect(ups[0]!.body).toBe(`{"texts":["a","b"],"input_type":"search_document"}`)
+})
+
+test("bedrock rejects models it does not embed with", () => {
+  let threw = false
+  try {
+    bedrockRequests(bTarget("anthropic.claude-3-haiku-20240307-v1:0", true), try fields(`{"input":"a"}`))
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    bedrockResponse("anthropic.claude-3", [`{}`], "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("bedrock titan responses combine in order", () => {
+  const r = try bedrockResponse("amazon.titan-embed-text-v2:0", [
+    `{"embedding":[0.1,0.2],"inputTextTokenCount":2}`,
+    `{"embedding":[0.3,0.4],"inputTextTokenCount":4}`,
+  ], "bedrock/amazon.titan-embed-text-v2:0")
+  expect(r.body).toBe(`{"object":"list","data":[` +
+    `{"object":"embedding","index":0,"embedding":[0.1,0.2]},` +
+    `{"object":"embedding","index":1,"embedding":[0.3,0.4]}],` +
+    `"model":"bedrock/amazon.titan-embed-text-v2:0","usage":{"prompt_tokens":6,"total_tokens":6}}`)
+  expect(r.promptTokens).toBe(6)
+})
+
+test("bedrock cohere response keeps vectors and has no token count", () => {
+  const r = try bedrockResponse("cohere.embed-english-v3", [`{"embeddings":[[1,2],[3,4]],"response_type":"embeddings_floats"}`], "m")
+  expect(r.body).toBe(`{"object":"list","data":[` +
+    `{"object":"embedding","index":0,"embedding":[1,2]},` +
+    `{"object":"embedding","index":1,"embedding":[3,4]}],` +
+    `"model":"m","usage":{"prompt_tokens":0,"total_tokens":0}}`)
+})

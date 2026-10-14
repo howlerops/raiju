@@ -532,6 +532,22 @@ def main():
         s, _, b = call("GET", "/api/alerts")
         check("alert state is visible", s == 200 and '"firing"' in b, b[:300])
 
+        # --- wave 7: providers and embeddings ---
+        s, _, b = chat("watsonx/ibm/granite-3-8b-instruct", seed=1001, headers={"x-bf-mcp-include-clients": "none"})
+        wx = [x for x in seen() if x["path"] == "/ml/v1/text/chat"]
+        iam = [x for x in seen() if x["path"] == "/identity/token"]
+        check("watsonx chat with an IAM token", s == 200 and "Hi from watsonx" in b and wx and wx[-1]["auth"] == "Bearer iam-token" and json.loads(wx[-1]["body"])["project_id"] == "proj-1" and iam and "apikey=ibm-key" in iam[0]["body"], (s, b, wx[-1:] if wx else None))
+        s, _, b = chat("nvidia/meta/llama-3.1-8b-instruct", seed=1002, headers={"x-bf-mcp-include-clients": "none"})
+        check("a long-tail OpenAI-compatible provider", s == 200 and "Hello from meta/llama-3.1-8b-instruct" in b and seen()[-1]["auth"] == "Bearer nv-key", b)
+        s, _, b = call("POST", "/v1/embeddings", {"model": "gemini/text-embedding-004", "input": ["alpha", "beta"]})
+        r = json.loads(b) if s == 200 else {}
+        check("gemini embeddings", s == 200 and len(r["data"]) == 2 and r["data"][1]["embedding"] == [1.5, 1] and seen()[-1]["path"].endswith(":batchEmbedContents"), b[:300])
+        n = len(seen())
+        s, _, b = call("POST", "/v1/embeddings", {"model": "bedrock/amazon.titan-embed-text-v2:0", "input": ["one", "two", "three"]})
+        r = json.loads(b) if s == 200 else {}
+        calls = [x for x in seen()[n:] if x["path"].endswith("/invoke")]
+        check("bedrock titan embeddings, one call per input", s == 200 and len(r["data"]) == 3 and r["usage"]["prompt_tokens"] == 9 and len(calls) == 3, (b[:300], len(calls)))
+
         # --- X07 ---
         s, _, b = chat("proxied/gpt-4o-mini", seed=990, headers={"x-bf-mcp-include-clients": "none"})
         import base64 as _b64

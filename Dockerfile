@@ -1,18 +1,19 @@
 # syntax=docker/dockerfile:1
 
 # Build stage. Tov is built from source with the patches in tov-patches/
-# (streamed response bodies); its installer sets up Rust. Debian bookworm
+# (streamed response bodies), so it needs Rust and a C++ compiler (Tov builds
+# BoringSSL for TLS on first use). Debian bookworm
 # matches the glibc of the runtime image below.
 FROM debian:bookworm-slim AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git make gcc libc6-dev \
+      ca-certificates curl git make gcc g++ libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 
 ENV PATH=/root/.cargo/bin:$PATH
-RUN curl -fsSL https://tov.sh/install.sh | sh
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
 
 WORKDIR /src
 COPY . .
