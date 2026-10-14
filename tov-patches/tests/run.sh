@@ -26,5 +26,15 @@ while b"0\r\n\r\n" not in data:
         times.append(time.time() - t0)
 ok = b"transfer-encoding: chunked" in data.lower() and data.count(b"chunk ") == 3 and len(times) == 3 and times[-1] - times[0] > 0.15
 print("ok stream body arrives in chunks" if ok else f"FAIL {times} {data[:300]!r}")
-sys.exit(0 if ok else 1)
+f = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+f.sendall(b"GET /fail HTTP/1.1\r\nHost: x\r\n\r\n")
+got = b""
+while True:
+    c = f.recv(4096)
+    if not c:
+        break
+    got += c
+cut = b"partial" in got and not got.endswith(b"0\r\n\r\n")
+print("ok a failed stream cuts the connection without the last chunk" if cut else f"FAIL {got[-200:]!r}")
+sys.exit(0 if ok and cut else 1)
 PY

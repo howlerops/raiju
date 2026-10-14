@@ -1,0 +1,647 @@
+From 06ba666b660daf9bab806370e98300a22f4f42bd Mon Sep 17 00:00:00 2001
+From: Raiju contributors <raiju@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 21:19:45 +0000
+Subject: [PATCH] feat: streamed response bodies with Bun's API: new
+ Response(stream) for a ReadableStream with an underlying source (start with
+ enqueue, close and error, cancel when the client leaves), sent with
+ transfer-encoding: chunked as each chunk is enqueued, in every worker
+
+Bun.serve could only answer with a body that was complete when the handler returned. A
+handler now returns a Response whose body is a ReadableStream made with an underlying source:
+the head goes out with transfer-encoding: chunked, and each enqueued chunk follows at once. A
+client that leaves cancels the stream. text() and bytes() on such a response read it whole.
+
+Tests: tests/http.rs streams /stream and /endless from tests/http/app.tov (chunked framing,
+chunks spread over time, a client leaving mid-stream cancels the source and the next request
+is served, twelve streams on three workers); tests/run/native_stream_response.tov drains a
+pushed stream with text() and bytes() and checks that a failing stream rejects.
+---
+ crates/tov/src/check/builtins.rs        |   4 +
+ crates/tov/src/driver.rs                |   2 +-
+ crates/tov/src/std/http.tov             | 192 +++++++++++++++++++++++-
+ docs/spec.md                            |   3 +-
+ runtime/tov.c                           |  43 ++++++
+ runtime/tov.h                           |   3 +
+ tests/http.rs                           |  96 ++++++++++++
+ tests/http/app.tov                      |  33 ++++
+ tests/run/native_stream_response.stdout |   5 +
+ tests/run/native_stream_response.tov    |  33 ++++
+ 10 files changed, 404 insertions(+), 10 deletions(-)
+ create mode 100644 tests/run/native_stream_response.stdout
+ create mode 100644 tests/run/native_stream_response.tov
+
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index 2584eb7..2891f04 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -46,6 +46,10 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "httpDefer" => (vec![], INT),
+         "spawnTail" => (vec![], VOID),
+         "httpRespondTo" => (vec![INT, INT, STR, STR, BOOL], VOID),
++        "httpStreamStart" => (vec![INT, INT, STR], VOID),
++        "httpStreamWrite" => (vec![INT, STR, BOOL], VOID),
++        "httpStreamAbort" => (vec![INT], VOID),
++        "httpBuffered" => (vec![INT], INT),
+         "headerIndex" => (vec![STR, STR], INT),
+         "headerValue" => (vec![STR, INT], STR),
+         "headerRemove" => (vec![STR, STR], STR),
+diff --git a/crates/tov/src/driver.rs b/crates/tov/src/driver.rs
+index d0f0fcd..d3cfb12 100644
+--- a/crates/tov/src/driver.rs
++++ b/crates/tov/src/driver.rs
+@@ -20,7 +20,7 @@ const STD_MODULES: &[(&str, &str, bool)] =
+ 
+ /// Globals that come from std/http, as in Bun.
+ pub(crate) const WEB_GLOBALS: &[&str] =
+-    &["Bun", "Request", "Response", "Headers", "URL", "URLSearchParams", "fetch", "AbortController", "AbortSignal", "DOMException", "FetchError", "ReadableStream", "TextEncoder", "TextDecoder", "Blob", "File", "FormData", "Socket", "SocketError", "TCPSocketListener", "WebSocket", "ServerWebSocket", "WebSocketEvent", "MessageEvent", "CloseEvent"];
++    &["Bun", "Request", "Response", "Headers", "URL", "URLSearchParams", "fetch", "AbortController", "AbortSignal", "DOMException", "FetchError", "ReadableStream", "ReadableStreamDefaultController", "TextEncoder", "TextDecoder", "Blob", "File", "FormData", "Socket", "SocketError", "TCPSocketListener", "WebSocket", "ServerWebSocket", "WebSocketEvent", "MessageEvent", "CloseEvent"];
+ 
+ /// The standard module an import names (`"node:fs"`, `"fs"`, `"std/http"`), if any.
+ fn std_module(spec: &str) -> Option<&'static (&'static str, &'static str, bool)> {
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index 4504dcf..74ac201 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -827,25 +827,32 @@ export class Response {
+   private signal: AbortSignal | undefined
+   private stream: ReadableStream | undefined
+ 
+-  constructor(body?: BodyInit, init?: ResponseInit) {
+-    this.bodyText = body === undefined ? "" : bodyText(body)
++  constructor(body?: BodyInit | ReadableStream, init?: ResponseInit) {
++    let pushed: ReadableStream | undefined = undefined
++    let plain: BodyInit | undefined = undefined
++    if (body instanceof ReadableStream) {
++      pushed = body
++    } else {
++      plain = body
++    }
++    this.bodyText = plain === undefined ? "" : bodyText(plain)
+     this.hasBody = body !== undefined
+     const status = init?.status
+     this.status = status === undefined ? 200 : Math.trunc(status)
+     this.statusText = init?.statusText ?? ""
+     const h = init?.headers
+     this.rawHeaders = h === undefined ? "" : new Headers(h).wire()
+-    if (body !== undefined && bodyType(body) !== "" && __native.headerIndex(this.rawHeaders, "content-type") < 0) {
+-      this.rawHeaders = __native.headerAppend(this.rawHeaders, "Content-Type", bodyType(body))
++    if (plain !== undefined && bodyType(plain) !== "" && __native.headerIndex(this.rawHeaders, "content-type") < 0) {
++      this.rawHeaders = __native.headerAppend(this.rawHeaders, "Content-Type", bodyType(plain))
+     }
+     this.used = false
+     this.finalUrl = ""
+     this.wasRedirected = false
+-    this.clean = (body === undefined || typeof body === "string" || body instanceof URLSearchParams) && !this.bodyText.startsWith("\uFEFF")
++    this.clean = (plain === undefined || typeof plain === "string" || plain instanceof URLSearchParams) && !this.bodyText.startsWith("\uFEFF")
+     this.id = 0
+     this.handle = undefined
+     this.signal = undefined
+-    this.stream = undefined
++    this.stream = pushed
+   }
+ 
+   // Internal: the response to fetch() request `id`, whose head has arrived.
+@@ -909,6 +916,20 @@ export class Response {
+     }
+     this.used = true
+     const id = this.id
++    const st = this.stream
++    if (id === 0 && st !== undefined && st.pushed) {
++      const parts: string[] = []
++      while (true) {
++        const r = try await st.pull()
++        const v = r.value
++        if (r.done || v === undefined) {
++          break
++        }
++        parts.push(__native.bytesToString(v))
++      }
++      this.clean = false
++      return parts.join("")
++    }
+     if (id === 0) {
+       return this.bodyText
+     }
+@@ -1011,6 +1032,15 @@ export class Response {
+   wireTyped(): bool {
+     return this.hasBody
+   }
++
++  // Internal: the body to send in chunks, for a response made with a ReadableStream.
++  wireStream(): ReadableStream | undefined {
++    const st = this.stream
++    if (this.id === 0 && st !== undefined && st.pushed) {
++      return st
++    }
++    return undefined
++  }
+ }
+ 
+ export type UpgradeOptions<T> = { data?: T, headers?: HeadersInit }
+@@ -1214,9 +1244,43 @@ async function respondLater(id: int, pending: Promise<Response | undefined, Erro
+   }
+   // (nothing: an upgrade, whose connection the response no longer goes to, or a mistake)
+   const r = res ?? new Response("", { status: 500 })
++  const st = r.wireStream()
++  if (st !== undefined) {
++    await pump(id, r, st)
++    return
++  }
+   __native.httpRespondTo(id, r.status, r.wireHeaders(), r.wireBody(), r.wireTyped())
+ }
+ 
++// Sends a stream body with chunked transfer encoding, each chunk as it is enqueued. Works in
++// every worker process (the bytes go out on the worker's own connection). A client that went
++// away cancels the stream.
++async function pump(id: int, r: Response, st: ReadableStream) {
++  __native.httpStreamStart(id, r.status, r.wireHeaders())
++  while (true) {
++    let c: ReadableStreamReadResult = { done: true, value: undefined }
++    try {
++      c = await st.pull()
++    } catch (e) {
++      // the head is out: close the connection without the last chunk, so the client
++      // sees the body cut off (as Bun does) rather than a complete answer
++      __native.httpStreamAbort(id)
++      return
++    }
++    const v = c.value
++    if (c.done || v === undefined) {
++      break
++    }
++    if (__native.httpBuffered(id) < 0) {
++      await st.cancel()
++      __native.httpStreamWrite(id, "", true)
++      return
++    }
++    __native.httpStreamWrite(id, __native.bytesToString(v), false)
++  }
++  __native.httpStreamWrite(id, "", true)
++}
++
+ function internalError(e: Error, method: string, target: string, onError: ((error: Error) => Response) | undefined): Response {
+   console.error(`error: ${e.message}\n${method} - ${target} failed`)
+   if (onError !== undefined) {
+@@ -1311,7 +1375,12 @@ export function serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+       }
+     } else if (res instanceof Response) {
+       server.tookUpgrade()
+-      __native.httpRespond(res.status, res.wireHeaders(), res.wireBody(), res.wireTyped())
++      const st = res.wireStream()
++      if (st !== undefined) {
++        pump(__native.httpDefer(), res, st)
++      } else {
++        __native.httpRespond(res.status, res.wireHeaders(), res.wireBody(), res.wireTyped())
++      }
+     } else {
+       server.tookUpgrade()
+       // Nothing observable follows (the loop runs microtasks next), so the response can go out
+@@ -1535,9 +1604,48 @@ export type ReadableStreamReadResult = { done: bool, value: u8[] | undefined }
+ 
+ // A body as a stream of byte chunks: `res.body`. Read it with `getReader()` (`read()` until
+ // `done`) or `for await (const chunk of res.body)`. A fetch() body streams as it arrives.
++// What a ReadableStream made in the program reads from: `start` gets a controller to
++// enqueue chunks to, `cancel` runs when the reader stops (for a response: the client left).
++export type UnderlyingSource = {
++  start?: (controller: ReadableStreamDefaultController) => void
++  cancel?: () => void
++}
++
++export class ReadableStreamDefaultController {
++  private stream: ReadableStream
++
++  constructor(stream: ReadableStream) {
++    this.stream = stream
++  }
++
++  // Adds a chunk (bytes, or a string as UTF-8).
++  enqueue(chunk: u8[] | string): void {
++    this.stream.push(typeof chunk === "string" ? __native.stringToBytes(chunk) : chunk)
++  }
++
++  close(): void {
++    this.stream.end("")
++  }
++
++  error(e: Error): void {
++    this.stream.end(e.message === "" ? "stream error" : e.message)
++  }
++
++  // Bytes queued and not yet read.
++  get desiredSize(): int {
++    return 0 - this.stream.queued()
++  }
++}
++
+ export class ReadableStream {
+   // a fetch() request's body (0: the chunks below)
+   private id: int
++  // made in the program with an underlying source: chunks arrive through its controller
++  readonly pushed: bool
++  private waiter: ((n: int) => void) | undefined
++  private failure: string
++  private onCancel: (() => void) | undefined
++  private queuedBytes: int
+   private handle: Promise<int> | undefined
+   private signal: AbortSignal | undefined
+   private chunks: u8[][]
+@@ -1545,7 +1653,7 @@ export class ReadableStream {
+   private started: bool
+   private finished: bool
+ 
+-  constructor() {
++  constructor(source?: UnderlyingSource) {
+     this.id = 0
+     this.handle = undefined
+     this.signal = undefined
+@@ -1553,6 +1661,49 @@ export class ReadableStream {
+     this.isLocked = false
+     this.started = false
+     this.finished = false
++    this.pushed = source !== undefined
++    this.waiter = undefined
++    this.failure = ""
++    this.onCancel = source?.cancel
++    this.queuedBytes = 0
++    const start = source?.start
++    if (start !== undefined) {
++      start(new ReadableStreamDefaultController(this))
++    }
++  }
++
++  // Internal (the controller): a chunk for the reader.
++  push(bytes: u8[]): void {
++    if (this.finished) {
++      return
++    }
++    if (bytes.length > 0) {
++      this.chunks.push(bytes)
++      this.queuedBytes += bytes.length
++    }
++    this.wake()
++  }
++
++  // Internal (the controller): no more chunks; a message makes the next read fail.
++  end(failure: string): void {
++    if (this.finished) {
++      return
++    }
++    this.finished = true
++    this.failure = failure
++    this.wake()
++  }
++
++  queued(): int {
++    return this.queuedBytes
++  }
++
++  private wake(): void {
++    const w = this.waiter
++    if (w !== undefined) {
++      this.waiter = undefined
++      w(0)
++    }
+   }
+ 
+   // Internal: the body of fetch() request `id`.
+@@ -1594,8 +1745,15 @@ export class ReadableStream {
+   // Stops the body: a fetch() request is aborted (its connection closed).
+   async cancel(): Promise<void> {
+     this.started = true
++    const already = this.finished
+     this.finished = true
+     this.chunks = []
++    this.queuedBytes = 0
++    const c = this.onCancel
++    if (c !== undefined && !already) {
++      this.onCancel = undefined
++      c()
++    }
+     if (this.id !== 0) {
+       __native.fetchAbort(this.id)
+     }
+@@ -1605,6 +1763,24 @@ export class ReadableStream {
+   async pull(): Promise<ReadableStreamReadResult> throws Error {
+     this.started = true
+     const id = this.id
++    if (this.pushed) {
++      while (true) {
++        const c = this.chunks.shift()
++        if (c !== undefined) {
++          this.queuedBytes -= c.length
++          return { done: false, value: c }
++        }
++        if (this.finished) {
++          if (this.failure !== "") {
++            throw new Error(this.failure)
++          }
++          return { done: true, value: undefined }
++        }
++        await new Promise<int>((resolve) => {
++          this.waiter = resolve
++        })
++      }
++    }
+     if (id === 0 || this.finished) {
+       const c = this.chunks.shift()
+       if (c === undefined) {
+diff --git a/docs/spec.md b/docs/spec.md
+index d283c84..edd0482 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -200,7 +200,8 @@ console.log(`Listening on ${server.url}`)
+ - **Errors.** A handler that throws (or whose promise rejects) is logged to stderr and answered by `error(err)` if given, else `500 Something went wrong!`, like Bun in production.
+ - **Types.** `Request`: `method`, `url`, `headers`, `text()` (a `Promise<string>`), `json<T>()` (a `Promise<T, SyntaxError>`, parsed against the expected type). `Response(body?, { status?, statusText?, headers? })`, `Response.json(value, init?)`, `Response.redirect(url, status?)`, `status`, `ok`, `headers`, `text()`, `json<T>()` (promises, as on `Request`). `Headers(init?)`: `get`/`has`/`set`/`append`/`delete`/`forEach`/`toJSON`, case-insensitive; CR/LF in names and values are dropped. `URL(input, base?)` (throws `TypeError`): `href`, `protocol`, `host`, `hostname`, `port`, `pathname`, `search`, `hash`, `origin`, `searchParams`; `URL.parse`, `URL.canParse`. `URLSearchParams`: `get`/`getAll`/`has`/`set`/`append`/`delete`/`size`/`forEach`/`keys`/`values`/`toString`. `Request` also has `formData()`, `blob()`, `bytes()` and `arrayBuffer()`; a `Response` body can be a `Blob` or a `FormData`.
+ - **Protocol.** HTTP/1.1 with keep-alive, pipelining, `Content-Length` and chunked request bodies, `Expect: 100-continue` and `HEAD`; `content-length` and `date` are added, and `content-type: text/plain;charset=utf-8` when a body has none. Malformed or oversized requests get `400`/`413`/`431` and are closed.
+-- Not yet: TLS for `Bun.serve`, HTTP/2, streaming bodies, `Bun.file`.
++- **Stream bodies.** `new Response(stream)` takes a `ReadableStream` made with an underlying source: `start(controller)` (`controller.enqueue(chunk)` with bytes or a string, `close()`, `error(e)`), and `cancel()`, which runs when the client leaves. The head goes out with `transfer-encoding: chunked`, and each chunk is sent as it's enqueued, so server-sent events and other incremental output work with `workers: n`. `text()` and `bytes()` on such a response read the stream whole.
++- Not yet: TLS for `Bun.serve`, HTTP/2, `Bun.file`.
+ - **WebSockets** as in Bun: `Bun.serve<T>({ fetch(req, server) { if (server.upgrade(req, { data, headers })) return; ... }, websocket: { open, message, close, drain, ping, pong, maxPayloadLength } })`. A handler that upgrades returns nothing. `ServerWebSocket<T>`: `data` (`T | undefined`), `send(text | bytes)`, `sendText`, `sendBinary`, `ping`, `pong`, `close(code?, reason?)`, `terminate()`, `subscribe`, `unsubscribe`, `isSubscribed`, `subscriptions`, `publish(topic, data)` (to the other subscribers; `publishToSelf` includes it), `readyState`, `remoteAddress`; `server.publish(topic, data)` and `server.subscriberCount(topic)`. `message` gets a `string` for text and `u8[]` for binary. Frames are checked as RFC 6455 says (Autobahn's test suite passes); text must be UTF-8; a message over `maxPayloadLength` (16 MB) closes with 1009. Compression (`perMessageDeflate`) and idle timeouts aren't there yet.
+ - The **`WebSocket` client**: `new WebSocket(url, protocols? | { protocols?, headers?, tls? })` (`ws:`, `wss:`; `try`: a bad URL throws a `SyntaxError`), `onopen`/`onmessage`/`onclose`/`onerror` and `addEventListener`, `send` (messages sent before it opens go out once it does), `close(code?, reason?)`, `readyState`, `protocol`. Events are `WebSocketEvent`s: `data` (`string | u8[]`), `code`, `reason`, `wasClean`.
+ 
+diff --git a/runtime/tov.c b/runtime/tov.c
+index 2bc9474..3c05568 100644
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -4225,6 +4225,49 @@ void tv_native_httpWriteRaw(tv_int id, const char *p, size_t n, int end) {
+     tv_http_mark_dirty(c);
+ }
+ 
++/* A streamed response for deferred request id: httpStreamStart writes the head (chunked
++ * transfer encoding, the date, connection: close when the request asked for it), then each
++ * httpStreamWrite one chunk; last writes the terminating chunk and finishes the response. */
++void tv_native_httpStreamStart(tv_int id, tv_int status, tv_str headers) {
++    if (id <= 0 || id > tv_http_ndeferred) return;
++    tv_http_req *r = tv_http_deferred[id];
++    if (!r || (uintptr_t)r <= (uintptr_t)tv_http_ndeferred) return;
++    if (status < 100 || status > 999) status = 500;
++    tv_http_refresh_date();
++    tv_sb sb = {0};
++    char line[64];
++    int n = snprintf(line, sizeof line, "HTTP/1.1 %d %s\r\n", (int)status, tv_http_reason(status));
++    tv_sb_push(&sb, line, (size_t)n);
++    tv_sb_push(&sb, "transfer-encoding: chunked\r\n", 28);
++    tv_sb_push(&sb, tv_http_date, strlen(tv_http_date));
++    if (!r->keep) tv_sb_push(&sb, "connection: close\r\n", 19);
++    tv_sb_push(&sb, headers.p->data, (size_t)headers.p->len);
++    tv_sb_push(&sb, "\r\n", 2);
++    tv_native_httpWriteRaw(id, sb.data, sb.len, 0);
++    tv_sb_free(&sb);
++}
++
++void tv_native_httpStreamWrite(tv_int id, tv_str data, bool last) {
++    size_t len = (size_t)data.p->len;
++    if (len) {
++        tv_sb sb = {0};
++        char size[24];
++        int n = snprintf(size, sizeof size, "%zx\r\n", len);
++        tv_sb_push(&sb, size, (size_t)n);
++        tv_sb_push(&sb, data.p->data, len);
++        tv_sb_push(&sb, "\r\n", 2);
++        tv_native_httpWriteRaw(id, sb.data, sb.len, 0);
++        tv_sb_free(&sb);
++    }
++    if (last) tv_native_httpWriteRaw(id, "0\r\n\r\n", 5, 1);
++}
++
++/* Ends a chunked body without its terminating chunk and closes the connection, so the client
++ * sees a cut-off body rather than a complete one (the stream failed after the head went out). */
++void tv_native_httpStreamAbort(tv_int id) {
++    tv_native_httpWriteRaw(id, "", 0, 2);
++}
++
+ int64_t tv_native_httpBuffered(tv_int id) {
+     if (id <= 0 || id > tv_http_ndeferred) return -1;
+     tv_http_req *r = tv_http_deferred[id];
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 6dfe8fc..892be4b 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -740,6 +740,9 @@ extern void (*tv_http_on_gone)(tv_int id);   /* a deferred request's client went
+ /* bytes of deferred request id's response not yet taken by the socket (its own, and what's
+  * queued ahead of it on the connection), or -1 if the client has gone */
+ int64_t tv_native_httpBuffered(tv_int id);
++void tv_native_httpStreamStart(tv_int id, tv_int status, tv_str headers);
++void tv_native_httpStreamAbort(tv_int id);
++void tv_native_httpStreamWrite(tv_int id, tv_str data, bool last);
+ int tv_native_httpTakeover(tv_int id, tv_sb *rest);
+ void tv_native_httpNodeErrors(tv_int id);   /* malformed requests answered in Node.js's form */
+ extern bool tv_http_v10;
+diff --git a/tests/http.rs b/tests/http.rs
+index c05c08e..4de15ae 100644
+--- a/tests/http.rs
++++ b/tests/http.rs
+@@ -99,6 +99,48 @@ fn read_resp(c: &mut TcpStream, buf: &mut Vec<u8>, head_only: bool) -> Resp {
+     }
+ }
+ 
++/// Reads a chunked response's head and up to `max` chunks, each with the time (since `start`)
++/// its bytes were read. Returns after the last chunk, or once `max` chunks have arrived.
++fn read_chunked(c: &mut TcpStream, start: Instant, max: usize) -> (String, Vec<(Duration, Vec<u8>)>) {
++    let mut buf = Vec::new();
++    let mut chunks = Vec::new();
++    let mut head_end = None;
++    let mut pos = 0;
++    while chunks.len() < max {
++        let mut tmp = [0u8; 4096];
++        let n = c.read(&mut tmp).expect("read");
++        assert!(n > 0, "connection closed early; have {:?}", String::from_utf8_lossy(&buf));
++        buf.extend_from_slice(&tmp[..n]);
++        let at = start.elapsed();
++        if head_end.is_none() {
++            match buf.windows(4).position(|w| w == b"\r\n\r\n") {
++                Some(i) => {
++                    head_end = Some(i);
++                    pos = i + 4;
++                }
++                None => continue,
++            }
++        }
++        // a chunk is complete once its data and the CRLF after it have arrived
++        while let Some(line) = buf[pos..].windows(2).position(|w| w == b"\r\n") {
++            let size = usize::from_str_radix(&String::from_utf8_lossy(&buf[pos..pos + line]), 16).unwrap();
++            let data = pos + line + 2;
++            if buf.len() < data + size + 2 {
++                break;
++            }
++            pos = data + size + 2;
++            if size == 0 {
++                return (String::from_utf8_lossy(&buf[..head_end.unwrap()]).into_owned(), chunks);
++            }
++            chunks.push((at, buf[data..data + size].to_vec()));
++            if chunks.len() == max {
++                break;
++            }
++        }
++    }
++    (String::from_utf8_lossy(&buf[..head_end.unwrap_or(buf.len())]).into_owned(), chunks)
++}
++
+ fn fill(c: &mut TcpStream, buf: &mut Vec<u8>) {
+     let mut tmp = [0u8; 65536];
+     let n = c.read(&mut tmp).expect("read");
+@@ -257,6 +299,60 @@ fn main() {
+     check(f, "logs flushed", r.text() == "ok" && line == "logged ?x1\n", line);
+     drop(s);
+ 
++    // streamed bodies (a ReadableStream with a source): sent chunked, each chunk as it's produced
++    let mut s = start_with(&built.binary, 1, std::process::Stdio::piped());
++    let mut c = connect(&s);
++    let t0 = Instant::now();
++    c.write_all(b"GET /stream HTTP/1.1\r\n\r\n").unwrap();
++    let (head, chunks) = read_chunked(&mut c, t0, usize::MAX);
++    let texts: Vec<String> = chunks.iter().map(|(_, b)| String::from_utf8_lossy(b).into_owned()).collect();
++    check(f, "stream head", head.starts_with("HTTP/1.1 200") && head.to_ascii_lowercase().contains("transfer-encoding: chunked") && !head.to_ascii_lowercase().contains("content-length"), &head);
++    check(f, "stream chunks", texts == ["chunk 1\n", "chunk 2\n", "chunk 3\n"], &texts);
++    // the chunks come 100 ms apart: the first reached the client well before the last was made
++    let spread = match (chunks.first(), chunks.last()) {
++        (Some(a), Some(b)) if chunks.len() == 3 => b.0.saturating_sub(a.0),
++        _ => Duration::ZERO,
++    };
++    check(f, "stream spread over time", spread >= Duration::from_millis(150), spread);
++    drop(c);
++
++    // a client that leaves mid-stream: the stream is cancelled, and the next request is fine
++    let (tx, rx) = std::sync::mpsc::channel();
++    let out = s.child.stdout.take().unwrap();
++    std::thread::spawn(move || {
++        for line in std::io::BufRead::lines(std::io::BufReader::new(out)).map_while(Result::ok) {
++            let _ = tx.send(line);
++        }
++    });
++    let mut c = connect(&s);
++    c.write_all(b"GET /endless HTTP/1.1\r\n\r\n").unwrap();
++    let (_, first) = read_chunked(&mut c, Instant::now(), 1);
++    check(f, "endless stream first chunk", first.len() == 1 && first[0].1 == b"chunk 1\n", &first);
++    drop(c);
++    let cancelled = rx.recv_timeout(Duration::from_secs(5)).is_ok_and(|l| l == "stream cancelled");
++    check(f, "stream cancelled when the client leaves", cancelled, "");
++    let r = roundtrip(&s, "GET / HTTP/1.1\r\n\r\n");
++    check(f, "request after a client leaves mid-stream", r.status == 200 && r.text() == "hello", &r);
++    drop(s);
++
++    // streams on several workers, at once
++    let s = start(&built.binary, 3);
++    let port = s.port;
++    let handles: Vec<_> = (0..12)
++        .map(|_| {
++            std::thread::spawn(move || {
++                let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
++                c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
++                c.write_all(b"GET /stream HTTP/1.1\r\n\r\n").unwrap();
++                let (head, chunks) = read_chunked(&mut c, Instant::now(), usize::MAX);
++                head.starts_with("HTTP/1.1 200") && chunks.len() == 3 && chunks[2].1 == b"chunk 3\n"
++            })
++        })
++        .collect();
++    let ok = handles.into_iter().map(|h| h.join().unwrap_or(false)).filter(|&ok| ok).count();
++    check(f, "streams on workers", ok == 12, ok);
++    drop(s);
++
+     // several workers; a worker killed by a trap is replaced
+     let s = start(&built.binary, 3);
+     let oks = (0..30).filter(|_| roundtrip(&s, "GET / HTTP/1.1\r\n\r\n").text() == "hello").count();
+diff --git a/tests/http/app.tov b/tests/http/app.tov
+index 41772b7..b3a5231 100644
+--- a/tests/http/app.tov
++++ b/tests/http/app.tov
+@@ -9,6 +9,33 @@ async function echo(req: Request): Promise<Response> {
+   return new Response(body, { status: 200, headers: { "content-type": "application/octet-stream" } })
+ }
+ 
++// `/stream` answers with a pushed ReadableStream: three chunks 100 ms apart, then the end.
++// `/endless` never ends (a chunk every 50 ms): when the client leaves, `cancel` runs.
++function streamed(endless: boolean): Response {
++  let n = 0
++  const body = new ReadableStream({
++    start(c) {
++      let tick: () => void = () => {}
++      tick = () => {
++        n += 1
++        c.enqueue(`chunk ${n}\n`)
++        if (endless) {
++          setTimeout(tick, 50)
++        } else if (n < 3) {
++          setTimeout(tick, 100)
++        } else {
++          c.close()
++        }
++      }
++      tick()
++    },
++    cancel() {
++      console.log("stream cancelled")
++    },
++  })
++  return new Response(body, { headers: { "content-type": "text/plain" } })
++}
++
+ function route(req: Request): Response | Promise<Response> throws TypeError {
+   const url = try new URL(req.url)
+   const path = url.pathname
+@@ -35,6 +62,12 @@ function route(req: Request): Response | Promise<Response> throws TypeError {
+     h.append("x-multi", "b")
+     return new Response("ok", { headers: h })
+   }
++  if (path === "/stream") {
++    return streamed(false)
++  }
++  if (path === "/endless") {
++    return streamed(true)
++  }
+   if (path === "/empty") {
+     return new Response(undefined, { status: 204 })
+   }
+diff --git a/tests/run/native_stream_response.stdout b/tests/run/native_stream_response.stdout
+new file mode 100644
+index 0000000..c361c49
+--- /dev/null
++++ b/tests/run/native_stream_response.stdout
+@@ -0,0 +1,5 @@
++hello, stream
++
++4
++empty: ""
++failed: broken
+diff --git a/tests/run/native_stream_response.tov b/tests/run/native_stream_response.tov
+new file mode 100644
+index 0000000..a895bb4
+--- /dev/null
++++ b/tests/run/native_stream_response.tov
+@@ -0,0 +1,33 @@
++// A pushed ReadableStream as a Response body: text() and bytes() drain it, and a stream that
++// errors makes the read reject with its error.
++function pushed(parts: string[], fail: string): ReadableStream {
++  return new ReadableStream({
++    start(c) {
++      for (const part of parts) {
++        c.enqueue(part)
++      }
++      if (fail === "") {
++        c.close()
++      } else {
++        c.error(new Error(fail))
++      }
++    },
++  })
++}
++
++async function drain() {
++  const text = try await new Response(pushed(["hello", ", ", "stream\n"], "")).text()
++  console.log(text)
++  const bytes = try await new Response(pushed(["ab", "cd"], "")).bytes()
++  console.log(bytes.length)
++  const empty = try await new Response(pushed([], "")).text()
++  console.log(`empty: "${empty}"`)
++  try {
++    await new Response(pushed(["partial"], "broken")).text()
++    console.log("no error")
++  } catch (e) {
++    console.log("failed:", e.message)
++  }
++}
++
++try await drain()
+-- 
+2.43.0
+

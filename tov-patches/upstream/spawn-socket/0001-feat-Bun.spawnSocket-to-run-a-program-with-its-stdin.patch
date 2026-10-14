@@ -1,0 +1,364 @@
+From 593ee48a3d2ae1a3f7669b28874bffc666ffeb9a Mon Sep 17 00:00:00 2001
+From: Raiju contributors <raiju@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 21:21:49 +0000
+Subject: [PATCH] feat: Bun.spawnSocket to run a program with its stdin and
+ stdout on a Socket: a Unix socketpair end handed to the existing socket
+ table, so data, write, backpressure and close work as they do for connect,
+ with env, cwd and the usual SocketHandler (SIGTERM to the child when its
+ parent dies, on Linux)
+
+Tov had no way to start a process, so a program couldn't talk to a child process that speaks
+newline-delimited JSON over its stdin and stdout, a common way to run tool servers. Bun.spawnSocket
+runs the command with a socketpair as its stdin and stdout and returns the Socket for the
+parent end. A program that can't start closes the socket at once, with the reason on stderr.
+There is no exit status and stderr is inherited.
+
+Tests: tests/run/native_spawn.tov runs a shell loop with an env var and a cwd, writes two
+lines, checks the echoed output and the close event, and checks that a missing executable
+closes its socket.
+---
+ crates/tov/src/check/builtins.rs |  1 +
+ crates/tov/src/std/http.tov      | 35 ++++++++++++
+ docs/spec.md                     |  9 +++
+ runtime/net.c                    | 97 ++++++++++++++++++++++++++++++++
+ runtime/tov.h                    |  1 +
+ tests/run/native_spawn.stdout    |  5 ++
+ tests/run/native_spawn.tov       | 74 ++++++++++++++++++++++++
+ 7 files changed, 222 insertions(+)
+ create mode 100644 tests/run/native_spawn.stdout
+ create mode 100644 tests/run/native_spawn.tov
+
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index 2584eb7..82efbc0 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -81,6 +81,7 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "headerEntries" => (vec![STR], str_arr),
+         // sockets (runtime/net.c)
+         "netConnect" => (vec![STR, INT, INT, BOOL, STR, STR], INT),
++        "netSpawn" => (vec![STR, STR, STR], INT),
+         "netBind" => {
+             let p = |ty| FnParam { ty, inout: false, optional: false };
+             let bytes = types.array(U8);
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index 4504dcf..752d3bc 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -1810,6 +1810,15 @@ export type ConnectOptions<T> = {
+   socket: SocketHandler<T>
+ }
+ 
++// Bun.spawnSocket (Tov): a child process whose stdin and stdout are a Socket.
++export type SpawnSocketOptions<T> = {
++  cmd: string[]
++  env?: Record<string, string>
++  cwd?: string
++  data?: T
++  socket: SocketHandler<T>
++}
++
+ export type ListenOptions<T> = {
+   hostname?: string
+   port?: number
+@@ -2057,6 +2066,28 @@ function connectSocket<T>(options: ConnectOptions<T>): Promise<Socket<T>, Error>
+   return p
+ }
+ 
++// Runs a program with its stdin and stdout on a Socket (a Unix socketpair): the program's
++// output arrives as `data` events, and writes go to its input. Resolves once the socket is
++// open; rejects with a SocketError when the program can't be started (a missing executable
++// shows up as the socket closing, with the reason on stderr).
++function spawnSocket<T>(options: SpawnSocketOptions<T>): Promise<Socket<T>, Error> {
++  const env: string[] = []
++  const e = options.env
++  if (e !== undefined) {
++    for (const k of e.keys()) env.push(k + "=" + e.get(k)!)
++  }
++  const id = __native.netSpawn(options.cmd.join("\u0000"), env.join("\u0000"), options.cwd ?? "")
++  if (id < 0) {
++    return Promise.reject(new SocketError(__native.netError(), "ERR_SPAWN"))
++  }
++  const socket = new Socket<T>(id, options.socket, options.data)
++  const p = new Promise<Socket<T>, Error>((resolve, reject) => {
++    socket.waits(resolve, reject)
++  })
++  socket.start("", "")
++  return p
++}
++
+ export class TCPSocketListener<T = undefined> {
+   readonly hostname: string
+   data: T | undefined
+@@ -2553,6 +2584,10 @@ export class Bun {
+     return connectSocket(options)
+   }
+ 
++  static spawnSocket<T = undefined>(options: SpawnSocketOptions<T>): Promise<Socket<T>, Error> {
++    return spawnSocket(options)
++  }
++
+   static listen<T = undefined>(options: ListenOptions<T>): TCPSocketListener<T> {
+     return listenSockets(options)
+   }
+diff --git a/docs/spec.md b/docs/spec.md
+index d283c84..ca80d25 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -241,6 +241,15 @@ const client = try await Bun.connect({ hostname: "localhost", port: 7000, socket
+ client.write("hello")
+ ```
+ - `Bun.connect` resolves once the socket is open (with TLS, once the handshake is done and the certificate checked) and rejects with a `SocketError` (`code`: `ECONNREFUSED`, `ENOTFOUND`, `CERT_HAS_EXPIRED`, ...) when it can't connect. `Bun.listen` returns a `TCPSocketListener` (`port`, `hostname`, `stop(closeActive?)`, `ref`, `unref`); a port that can't be bound prints the error and exits, as an uncaught error does in Bun.
++- **`Bun.spawnSocket(options)`** (Tov only; Bun's `Bun.spawn` has a stream-based shape instead) runs a program with its stdin and stdout on a `Socket`: `data` gets what it writes, `write` goes to its input, and `close` runs when it exits. `options` are `cmd` (argv), `env` (added to the inherited environment), `cwd`, `data` (the socket's starting `socket.data`) and `socket` (the handlers, as for `Bun.connect`). It resolves with the `Socket` once it's open. A program that can't start closes the socket at once, with the reason on stderr. On Linux the program gets SIGTERM if the process that started it dies. There's no exit status, stderr is inherited, and Windows isn't supported.
++```ts
++const sock = await Bun.spawnSocket({
++  cmd: ["python3", "server.py"],
++  env: { API_KEY: "..." },
++  socket: { data(socket, bytes) { console.log(bytes.length) }, close(socket) {} },
++})
++sock.write("request\n")   // read by the program's stdin
++```
+ - `Socket`: `write(text | bytes)`, `end(data?)`, `flush()`, `terminate()`, `shutdown()`, `setNoDelay(on?)`, `ref()`, `unref()`, `data`, `remoteAddress`, `remotePort`, `localAddress`, `localPort`, `bufferedAmount` (Tov). Unlike Bun's, `write` takes everything: what the kernel can't take yet is buffered (Bun returns a short count and drops the rest), and `drain` follows once it's out. Writes made in a handler go out together when it returns: one system call for many small writes.
+ - `end()` closes the socket once its data is out (`close` runs); with `allowHalfOpen` it shuts only the sending side, and the peer can keep sending. A handler that throws hands the error to `error`, else it's logged and the socket closes. A connect's `socket.data` is `T | undefined` (`T` from `data`, or the type argument: `Bun.listen<Session>(...)`).
+ 
+diff --git a/runtime/net.c b/runtime/net.c
+index 69ef748..2b3149e 100644
+--- a/runtime/net.c
++++ b/runtime/net.c
+@@ -21,6 +21,8 @@ enum { TV_NE_OPEN = 1, TV_NE_DATA, TV_NE_DRAIN, TV_NE_END, TV_NE_CLOSE, TV_NE_CO
+ typedef struct tv_ns {
+     tv_io io;
+     int fd;
++    int spawn_fd;            /* netSpawn: our end of the child's stdin/stdout, until netBind */
++    bool spawned;
+     tv_int id;
+     uint8_t state;
+     bool bound;              /* cb holds the Socket's closure */
+@@ -113,6 +115,21 @@ static void tv_ns_free(tv_ns *s) {
+ 
+ static void tv_ns_close(tv_ns *s, const char *err);
+ 
++/* Children started by netSpawn, reaped with waitpid(pid, WNOHANG) (see netSpawn). */
++static pid_t tv_spawned[256];
++static int tv_nspawned;
++
++static void tv_spawn_reap(void) {
++    int k = 0;
++    for (int i = 0; i < tv_nspawned; i++) {
++        int st;
++        pid_t r = waitpid(tv_spawned[i], &st, WNOHANG);
++        if (r == 0 || (r < 0 && errno == EINTR)) tv_spawned[k++] = tv_spawned[i];
++    }
++    tv_nspawned = k;
++}
++
++
+ /* Delivers an event to the Socket (data and text borrowed for the call). */
+ static void tv_ns_emit(tv_ns *s, int kind, const void *data, size_t n, const char *text) {
+     if (!s->bound) return;
+@@ -259,6 +276,7 @@ static void tv_net_flush_all(void) {
+ /* Closes the socket now (whatever wasn't written is dropped) and tells the Socket, with the
+  * error that closed it, if any. Freed once no event of its is being delivered. */
+ static void tv_ns_close(tv_ns *s, const char *err) {
++    if (tv_nspawned) tv_spawn_reap();
+     if (s->state == TV_NS_CLOSED) return;
+     bool was_open = s->state == TV_NS_OPEN || s->state == TV_NS_HANDSHAKE;
+     bool connecting = s->state == TV_NS_RESOLVING || s->state == TV_NS_CONNECTING || (s->state == TV_NS_HANDSHAKE && !s->server);
+@@ -510,6 +528,15 @@ tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, t
+ /* (connecting starts once the Socket has bound its events: a failure is reported to it) */
+ static void tv_ns_start(tv_ns *s, tv_str host, tv_str unix_path) {
+     tv_addrs addrs;
++    if (s->spawned) {
++        /* a child process on the other end of a socketpair: open at once */
++        s->spawned = false;
++        s->fd = s->spawn_fd;
++        s->registered = false;
++        s->state = TV_NS_CONNECTING;
++        tv_ns_opened(s);
++        return;
++    }
+     if (unix_path.p->len) {
+         struct sockaddr_un *un = (struct sockaddr_un *)&addrs.a[0];
+         memset(un, 0, sizeof *un);
+@@ -840,6 +867,76 @@ void tv_native_netListenRef(tv_int id, bool ref) {
+     tv_io_refs += ref ? 1 : -1;
+ }
+ 
++/* netSpawn(argv, env, cwd) -> socket id, or -1 (netError says why). Runs a program with its
++ * stdin and stdout on one end of a Unix socketpair; the socket is the other end, so the
++ * program's output arrives as data events and writes reach its input. argv and env are lists
++ * separated by NUL bytes (env entries "NAME=value" are added to the inherited environment).
++ * stderr is inherited. The child gets SIGTERM if this process dies. Exited children are reaped
++ * with waitpid(pid, WNOHANG) on each spawn and each socket close, only for the pids spawned
++ * here, so other code that waits for its own children is unaffected. */
++tv_int tv_native_netSpawn(tv_str argv, tv_str env, tv_str cwd) {
++    tv_spawn_reap();
++    size_t an = 0;
++    for (size_t i = 0; i < (size_t)argv.p->len; i++) if (argv.p->data[i] == 0) an++;
++    if (argv.p->len == 0) { snprintf(tv_net_err, sizeof tv_net_err, "ENOENT: no command"); return -1; }
++    an++;
++    char **args = tv_alloc((an + 1) * sizeof *args);
++    size_t k = 0;
++    char *copy = tv_alloc((size_t)argv.p->len + 1);
++    memcpy(copy, argv.p->data, (size_t)argv.p->len);
++    copy[argv.p->len] = 0;
++    args[k++] = copy;
++    for (size_t i = 0; i < (size_t)argv.p->len; i++) if (copy[i] == 0) args[k++] = copy + i + 1;
++    args[k] = NULL;
++    int sv[2];
++    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
++        snprintf(tv_net_err, sizeof tv_net_err, "socketpair: %s", strerror(errno));
++        return -1;
++    }
++    tv_out_flush();
++    pid_t pid = fork();
++    if (pid < 0) {
++        snprintf(tv_net_err, sizeof tv_net_err, "fork: %s", strerror(errno));
++        close(sv[0]);
++        close(sv[1]);
++        return -1;
++    }
++    if (pid == 0) {
++#ifdef __linux__
++        prctl(PR_SET_PDEATHSIG, SIGTERM);
++#endif
++        signal(SIGPIPE, SIG_DFL);
++        dup2(sv[1], 0);
++        dup2(sv[1], 1);
++        if (cwd.p->len && chdir(cwd.p->data) != 0) _exit(127);
++        const char *e = env.p->data;
++        size_t el = (size_t)env.p->len;
++        size_t start = 0;
++        for (size_t i = 0; i <= el; i++) {
++            if (i == el || e[i] == 0) {
++                if (i > start) {
++                    char *kv = strndup(e + start, i - start);
++                    if (kv) putenv(kv);
++                }
++                start = i + 1;
++            }
++        }
++        execvp(args[0], args);
++        dprintf(2, "spawn %s: %s\n", args[0], strerror(errno));
++        _exit(127);
++    }
++    close(sv[1]);
++    if (tv_nspawned < (int)(sizeof tv_spawned / sizeof *tv_spawned)) tv_spawned[tv_nspawned++] = pid;
++    int fl = fcntl(sv[0], F_GETFL, 0);
++    fcntl(sv[0], F_SETFL, fl | O_NONBLOCK);
++    tv_ns *s = tv_ns_new();
++    s->io.ready = tv_ns_ready;
++    s->state = TV_NS_RESOLVING;
++    s->spawned = true;
++    s->spawn_fd = sv[0];
++    return s->id;
++}
++
+ tv_str tv_native_netError(void) { return tv_str_from(tv_net_err, strlen(tv_net_err)); }
+ 
+ /* ---- the loop's hooks */
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 6dfe8fc..85f76ae 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -866,6 +866,7 @@ tv_arr tv_native_headerEntries(tv_str block);                  /* sorted [name,
+ tv_arr tv_native_headerValues(tv_str block, tv_str name);
+ /* sockets (runtime/net.c): Bun.connect, Bun.listen */
+ tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path);
++tv_int tv_native_netSpawn(tv_str argv, tv_str env, tv_str cwd);
+ void tv_native_netBind(tv_int id, tv_fn events, tv_str host, tv_str unix_path);
+ tv_int tv_native_netWrite(tv_int id, tv_arr bytes);
+ tv_int tv_native_netWriteText(tv_int id, tv_str text);
+diff --git a/tests/run/native_spawn.stdout b/tests/run/native_spawn.stdout
+new file mode 100644
+index 0000000..2c75fc4
+--- /dev/null
++++ b/tests/run/native_spawn.stdout
+@@ -0,0 +1,5 @@
++tag:one
++tag:two
++closed
++cwd: /
++missing executable: closed
+diff --git a/tests/run/native_spawn.tov b/tests/run/native_spawn.tov
+new file mode 100644
+index 0000000..600d902
+--- /dev/null
++++ b/tests/run/native_spawn.tov
+@@ -0,0 +1,74 @@
++// Bun.spawnSocket: a child process whose stdin and stdout are a Socket (the child is a shell loop
++// that echoes each line with the env var X in front).
++async function echo() {
++  const dec = try new TextDecoder()
++  let got = ""
++  const done = new Promise<int>((resolve) => {
++    Bun.spawnSocket({
++      cmd: ["sh", "-c", 'while read l; do echo "$X:$l"; done'],
++      env: { X: "tag" },
++      socket: {
++        open(socket) {
++          socket.write("one\ntwo\n")
++        },
++        data(socket, data) {
++          got += try dec.decode(data)
++          if (got.endsWith("tag:two\n")) {
++            socket.end()
++          }
++        },
++        close(socket) {
++          resolve(0)
++        },
++      },
++    })
++  })
++  await done
++  for (const line of got.split("\n")) {
++    if (line !== "") {
++      console.log(line)
++    }
++  }
++  console.log("closed")
++}
++
++async function inDirectory() {
++  const dec = try new TextDecoder()
++  let got = ""
++  const done = new Promise<int>((resolve) => {
++    Bun.spawnSocket({
++      cmd: ["pwd"],
++      cwd: "/",
++      socket: {
++        data(socket, data) {
++          got += try dec.decode(data)
++        },
++        close(socket) {
++          resolve(0)
++        },
++      },
++    })
++  })
++  await done
++  console.log(`cwd: ${got.trimEnd()}`)
++}
++
++async function missing() {
++  const done = new Promise<int>((resolve) => {
++    Bun.spawnSocket({
++      cmd: ["no-such-program-for-tov-test"],
++      socket: {
++        data(socket, data) {},
++        close(socket) {
++          resolve(0)
++        },
++      },
++    })
++  })
++  await done
++  console.log("missing executable: closed")
++}
++
++try await echo()
++try await inDirectory()
++try await missing()
+-- 
+2.43.0
+

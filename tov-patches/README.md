@@ -7,6 +7,17 @@ written to be offered upstream. `tests/run.sh` checks both with the patched
 compiler: `TOV=build/tov/target/release/tov tov-patches/tests/run.sh` (or
 `make tov-test`).
 
+## Submitting upstream
+
+Tov (MIT) takes outside pull requests; its rules are in its `AGENTS.md`: no mention of
+coding agents anywhere, and no attribution trailers in commits or pull requests. The
+upstream-ready versions are in [upstream/](upstream/): one `git format-patch` commit per
+pull request, in Tov's `feat: ...` style with tests in Tov's own harness (`tests/http.rs`,
+`tests/run/`) and docs in `docs/spec.md`, plus the pull request descriptions. Apply with
+`git am` on a fork at the pinned commit and open the PRs from there. Checked with
+`cargo test --release --test http` (passes) and `--test run` (passes except
+`npm_const_throws`, which fails the same way on unpatched Tov without JavaScriptCore).
+
 ## 0001 — streamed response bodies for `Bun.serve`
 
 **Problem.** `Bun.serve` answers with a complete body only. A handler can't send
@@ -41,7 +52,8 @@ return new Response(body, { headers: { "content-type": "text/event-stream" } })
   therefore stays on the worker's own connection and works in every forked
   worker.
 - A client that disconnects (`httpBuffered < 0`) cancels the stream and runs the
-  source's `cancel`.
+  source's `cancel`. A source that fails after the head went out closes the connection
+  without the last chunk (`httpStreamAbort`), so the client sees a cut-off body.
 
 **Files.**
 - `runtime/tov.c`, `runtime/tov.h`: `httpStreamStart`, `httpStreamWrite`.
@@ -79,8 +91,9 @@ sock.write("request\n")       // to the child's stdin
   `end()` and close events then come from the code that serves TCP and Unix
   sockets.
 - The child gets `PR_SET_PDEATHSIG(SIGTERM)` on Linux, so it dies with its
-  parent (a `Bun.serve` worker, say). `SIGCHLD` is ignored, so exits are reaped
-  by the kernel.
+  parent (a `Bun.serve` worker, say). Exited children are reaped with
+  `waitpid(pid, WNOHANG)` for the spawned pids only, so other code that waits for its
+  own children is unaffected.
 - stderr is inherited. A missing executable prints to stderr and shows up as
   the socket closing.
 
@@ -90,6 +103,6 @@ sock.write("request\n")       // to the child's stdin
 - `crates/tov/src/check/builtins.rs`: the signature.
 - `crates/tov/src/std/http.tov`: `SpawnSocketOptions` and `Bun.spawnSocket`.
 
-**Not covered.** There is no exit status (exits are reaped by the kernel), no
+**Not covered.** There is no exit status, no
 separate stderr pipe and no Windows support. A Bun-compatible `Bun.spawn` with
 `stdout: "pipe"` could be built on the same native later.
