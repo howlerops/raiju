@@ -14,6 +14,8 @@ import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
 import * as metrics from "./metrics"
 import { TokenCache, parseServiceAccount } from "./providers/vertex"
+import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails"
+import { RuleSet, Activation, pickTarget } from "./cel"
 import { Deadline, deadline } from "./deadline"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
@@ -89,6 +91,10 @@ export class Engine {
   gov: Governance
   health: Health
   vertexTokens = new TokenCache()
+  guard: GuardConfig | undefined = undefined
+  rules: RuleSet | undefined = undefined
+  guardInput = false
+  guardOutput = false
   pricing: Pricing
   cache: ResponseCache | undefined = undefined
   cacheTtlMs = 300000
@@ -108,6 +114,20 @@ export class Engine {
       halfOpenProbes: d.halfOpenProbes,
     }
     this.health = new Health(bc)
+    const rr = cfg.governance?.routing_rules
+    if (rr !== undefined && rr.length > 0) {
+      const rs = new RuleSet(rr)
+      for (const e of rs.errors()) console.error(`raiju: routing rule: ${e}`)
+      this.rules = rs
+    }
+    const g = cfg.guardrails
+    if (g !== undefined && g.enabled !== false) {
+      const mode = g.mode === "block" ? "block" : g.mode === "log" ? "log" : "redact"
+      this.guard = { detect: g.detect ?? ["email", "phone", "ssn", "credit_card", "api_key", "aws_key", "jwt", "private_key"], mode: mode, custom: g.custom }
+      const where = g.apply_to ?? "input"
+      this.guardInput = where === "input" || where === "both"
+      this.guardOutput = where === "output" || where === "both"
+    }
     this.pricing = new Pricing(cfg)
     const c = cfg.cache
     if (c !== undefined && c.enabled === true) {
@@ -232,16 +252,58 @@ export class Engine {
     }
   }
 
+  // Applies the first matching routing rule: its weighted target replaces the
+  // requested model (keeping a pinned key), and its fallbacks come next.
+  route(rules: RuleSet, op: string, refs: ModelRef[], inout h: Hdrs, body: Field[]): ModelRef[] | undefined {
+    const first = refs[0]!
+    const vk = this.gov.findKey(h)
+    const params: Map<string, string> = new Map()
+    for (const f of body) {
+      if (!f.raw.startsWith("[") && !f.raw.startsWith("{")) params.set(f.key, f.raw)
+    }
+    const act: Activation = {
+      model: first.model,
+      provider: first.provider,
+      request_type: op,
+      virtual_key: vk?.id,
+      team: vk?.team_id,
+      customer: vk?.customer_id,
+      budget_used: this.gov.budgetFraction(vk),
+      tokens_used: 0.0,
+      headers: h,
+      params: params,
+    }
+    const m = rules.match(act, { virtual_key: vk?.id, team: vk?.team_id, customer: vk?.customer_id })
+    if (m === undefined) return undefined
+    const i = pickTarget(m.targets, Math.random())
+    if (i < 0) return undefined
+    const tg = m.targets[i]!
+    const out: ModelRef[] = [{ provider: tg.provider, model: tg.model ?? first.model }]
+    if (tg.key_id !== undefined) h.set("x-bf-api-key", tg.key_id)
+    h.set("x-bf-routing-rule", m.rule)
+    for (const f of m.fallbacks) out.push(parseModel(this.cfg, f))
+    for (const r of refs.slice(1)) out.push(r)
+    return out
+  }
+
   // Shared front half of every inference endpoint.
   async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool): Promise<Response> {
     const started = performance.now()
-    const h = snapshot(req.headers)
+    let h = snapshot(req.headers)
     const rid = h.get("x-request-id") ?? newId("req_")
     const out: Hdrs = new Map()
     out.set("x-bifrost-request-id", rid)
     const model = modelName ?? rawStr(body, "model")
     if (model === undefined) return errorResponse(400, "the request needs a model, e.g. \"openai/gpt-4o-mini\"", "invalid_request_error", out)
-    const refs = [parseModel(this.cfg, model)].concat(fallbackRefs(this.cfg, body))
+    let refs = [parseModel(this.cfg, model)].concat(fallbackRefs(this.cfg, body))
+    const rules = this.rules
+    if (rules !== undefined) {
+      const routed = this.route(rules, op, refs, &h, body)
+      if (routed !== undefined) {
+        refs = routed
+        out.set("x-bf-routing-rule", h.get("x-bf-routing-rule") ?? "")
+      }
+    }
     const primary = refs[0]!
     const admitted = this.gov.admit(h, primary.provider, primary.model)
     if (admitted.kind === "denial") return errorResponse(admitted.status, admitted.message, admitted.type, out)
@@ -304,9 +366,22 @@ export class Engine {
   }
 
   async chat(req: Request): Promise<Response> {
-    const text = await req.text()
+    let text = await req.text()
     let body: Field[] = []
+    const guard = this.guard
     try {
+      if (guard !== undefined && this.guardInput) {
+        const g = applyToChatRequest(text, guard)
+        for (const f of g.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, guard.mode), 1.0)
+        if (g.blocked) {
+          const kinds: string[] = []
+          for (const f of g.findings) {
+            if (!kinds.includes(f.kind)) kinds.push(f.kind)
+          }
+          return errorResponse(400, `request blocked by guardrails: found ${kinds.join(", ")}`, "guardrail_violation", noHeaders())
+        }
+        text = g.body
+      }
       body = fields(text)
     } catch (e) {
       return errorResponse(400, `invalid chat request: ${e.message}`, "invalid_request_error", noHeaders())
@@ -337,8 +412,16 @@ export class Engine {
       if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, body)
       return try providers.chatUpstream(t, try typed.get(), body, autoCache)
     }
+    const outGuard = this.guardOutput ? guard : undefined
     const translate: Translate = (t, text, requested) => {
-      if (!stream) return try providers.chatTranslate(t.kind, t.model, text, requested, false)
+      if (!stream) {
+        const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        if (outGuard === undefined) return tr
+        const g = try applyToCompletion(tr.body, outGuard)
+        for (const f of g.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, outGuard.mode), 1.0)
+        if (g.blocked) throw new SyntaxError("the response was blocked by guardrails")
+        return { body: g.body, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+      }
       if (providers.streamsNatively(t.kind)) {
         const tr = openai.streamResponse(text, requested)
         return { body: wantUsage ? tr.body : dropUsageChunks(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }

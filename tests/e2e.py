@@ -84,11 +84,28 @@ def chat(model, extra=None, headers=None, **kw):
     body = {"model": model, "messages": [{"role": "user", "content": "hello"}], **kw}
     return call("POST", "/v1/chat/completions", body, headers)
 
+def write_config():
+    """The e2e config plus a Vertex provider whose service account uses the
+    throwaway test key from src/jwt.tov's tests and a token URI on the mock."""
+    import re
+    cfg = json.load(open(os.path.join(ROOT, "tests/e2e.config.json")))
+    src = open(os.path.join(ROOT, "src/jwt.tov")).read()
+    pem = re.search(r"const TEST_PKCS8 = `(.*?)`", src, re.S).group(1)
+    sa = {"type": "service_account", "client_email": "e2e@test.iam.gserviceaccount.com", "private_key": pem, "token_uri": MOCK + "/token"}
+    cfg["providers"]["vertex"] = {
+        "keys": [{"name": "vx", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps(sa)}}],
+        "network_config": {"base_url": MOCK},
+    }
+    path = os.path.join(BUILD, "e2e.config.json")
+    json.dump(cfg, open(path, "w"))
+    return path
+
 def main():
     build()
+    config = write_config()
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
-    gw = subprocess.Popen([os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", os.path.join(ROOT, "tests/e2e.config.json")], env=env, stderr=subprocess.DEVNULL)
+    gw = subprocess.Popen([os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config], env=env, stderr=subprocess.DEVNULL)
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health")
 
@@ -174,6 +191,52 @@ def main():
         check("realtime relays events with the provider key", st == 101 and r.get("event") == '{"type":"session.update"}' and r.get("auth", "").startswith("Bearer sk-from-env") and "model=gpt-realtime" in r.get("auth", ""), (st, reply))
         st, _ = ws_roundtrip("/v1/realtime?model=anthropic/claude", "{}")
         check("realtime refuses providers without a realtime API", st == 400, st)
+
+        # Anthropic SDK route to a non-Anthropic provider
+        s, _, b = call("POST", "/anthropic/v1/messages", {"model": "openai/gpt-4o-mini", "max_tokens": 20, "system": "be brief", "messages": [{"role": "user", "content": "hi"}]})
+        r = json.loads(b)
+        check("anthropic route reaches openai", s == 200 and r.get("type") == "message" and r["content"][0]["text"] == "Hello from gpt-4o-mini" and r["usage"]["input_tokens"] == 3, b)
+        up = json.loads(seen()[-1]["body"])
+        check("anthropic route sends an openai chat body", up["messages"][0] == {"role": "system", "content": "be brief"} and up["model"] == "gpt-4o-mini", up)
+        s, _, b = call("POST", "/anthropic/v1/messages", {"model": "openai/gpt-4o-mini", "max_tokens": 20, "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+        types = [l[7:] for l in b.split("\n") if l.startswith("event: ")]
+        check("anthropic route streams anthropic events", s == 200 and types[0] == "message_start" and types[-1] == "message_stop" and '"text":"Hel"' in b, b[:600])
+
+        # Responses API
+        s, _, b = call("POST", "/v1/responses", {"model": "openai/gpt-4o-mini", "input": "hi"})
+        check("responses passes through to openai", s == 200 and "native responses" in b and seen()[-1]["path"] == "/v1/responses" and json.loads(seen()[-1]["body"])["model"] == "gpt-4o-mini", b)
+        s, _, b = call("POST", "/v1/responses", {"model": "anthropic/claude-sonnet-4", "instructions": "terse", "input": "hi", "max_output_tokens": 30})
+        r = json.loads(b)
+        check("responses translated for anthropic", s == 200 and r["object"] == "response" and r["output"][0]["content"][0]["text"] == "Hi from claude" and r["usage"]["input_tokens"] == 11, b)
+        check("responses instructions become system", json.loads(seen()[-1]["body"])["system"] == "terse", seen()[-1]["body"])
+        s, _, b = call("POST", "/v1/responses", {"model": "gemini/gemini-2.5-flash", "input": "hi", "stream": True})
+        evs = [l[7:] for l in b.split("\n") if l.startswith("event: ")]
+        check("responses streaming for gemini", s == 200 and evs[0] == "response.created" and "response.output_text.delta" in evs and evs[-1] == "response.completed", b[:500])
+
+        # Vertex: service-account JWT exchanged for a token, then generateContent
+        s, _, b = chat("vertex/gemini-2.5-flash")
+        check("vertex gemini via service account", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hi from vertex", b)
+        tok = [x for x in seen() if x["path"] == "/token"]
+        last = seen()[-1]
+        check("vertex token request is a jwt-bearer grant", len(tok) == 1 and "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=ey" in tok[0]["body"], tok)
+        check("vertex call uses the token and project path", last["auth"] == "Bearer ya29.test-token" and last["path"] == "/v1/projects/proj/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent", last)
+        chat("vertex/gemini-2.5-flash", seed=1)
+        check("vertex token is cached", len([x for x in seen() if x["path"] == "/token"]) == 1)
+
+        # Guardrails redact PII before it leaves the gateway
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "mail jane@example.com or call 415-555-2671"}]})
+        sent = json.loads(seen()[-1]["body"])["messages"][0]["content"]
+        check("guardrails redact the prompt", s == 200 and "jane@example.com" not in sent and "[REDACTED:EMAIL]" in sent, sent)
+
+        # Routing rules
+        s, h, b = chat("openai/gpt-4o-mini", headers={"x-tier": "premium"}, seed=300)
+        hl = {k.lower(): v for k, v in h.items()}
+        check("routing rule sends premium traffic to anthropic", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hi from claude" and hl.get("x-bf-routing-rule") == "premium-to-claude", (s, b, h))
+        s, _, b = chat("openai/gpt-4o-mini", seed=301)
+        check("other traffic is unaffected by the rule", json.loads(b)["choices"][0]["message"]["content"] == "Hello from gpt-4o-mini", b)
+
+        s, _, b = call("GET", "/api/health")
+        check("health status endpoint", s == 200 and "targets" in json.loads(b), b)
 
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
