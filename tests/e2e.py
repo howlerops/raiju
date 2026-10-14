@@ -647,6 +647,16 @@ def main():
         check("unknown config keys are reported at startup", 'unknown key "server" is ignored' in log, log[:600])
 
         # --- X07 ---
+        req = urllib.request.Request(GW + "/openai/v1/audio/speech", data=json.dumps({"model": "openai/tts-1", "input": "hi", "voice": "alloy"}).encode(), method="POST", headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as res:
+            audio = res.read()
+        check("the OpenAI SDK route serves audio under /openai/v1", audio[:3] == b"ID3", audio[:10])
+        s, _, b = call("POST", "/pydanticai/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "via pydantic"}]})
+        check("PydanticAI route prefix", s == 200 and "Hello from gpt-4o-mini" in b, b)
+        s, _, b = call("GET", "/openai/v1/models/openai/gpt-4o-mini")
+        check("model retrieve", s == 200 and json.loads(b)["id"] == "openai/gpt-4o-mini" and json.loads(b)["owned_by"] == "openai", b)
+        s, _, _ = call("GET", "/v1/models/nope/x")
+        check("model retrieve for an unknown provider is 404", s == 404, s)
         s, _, b = chat("proxied/gpt-4o-mini", seed=990, headers={"x-bf-mcp-include-clients": "none"})
         import base64 as _b64
         check("provider requests go through its HTTP proxy with credentials", s == 200 and "via proxy" in b and proxied and proxied[-1]["target"] == "http://upstream.example:8000/v1/chat/completions" and proxied[-1]["auth"] == "Basic " + _b64.b64encode(b"proxy-user:pa:ss").decode(), (s, b, proxied))
