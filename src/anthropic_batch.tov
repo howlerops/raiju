@@ -5,6 +5,13 @@
 // Pure functions over JSON text; the caller does the HTTP and the uploads.
 import { Field, fields, elements, find, quote, rawStr, build, without, isNull } from "./json"
 import { toChatRequest, toMessage } from "./providers/anthropic_in"
+import { Config, providerOf } from "./config"
+import { kindOf, target } from "./router"
+import { Target, trimSlash } from "./providers/types"
+import * as openai from "./providers/openai"
+import * as anthropic from "./providers/anthropic"
+import { handleMedia, matchRoute, providerTarget, send } from "./media"
+import { MediaRequest } from "./media_native"
 
 // Anthropic clients on an Anthropic target use the native API, so nothing converts.
 export function isPassthrough(provider: string): bool {
@@ -280,6 +287,276 @@ export function anthropicModelsFromOpenAI(openai: string): string throws SyntaxE
   }
   return anthropicModels(ids)
 }
+
+// ---- routes ----
+
+// The operation a /anthropic/v1 SDK call names, and the id in its path.
+export type SdkRoute = { op: string, id: string }
+
+// The route for a method and path under /anthropic/v1, or undefined when the path is
+// not a batch, file or model route. /anthropic/v1/messages is the chat route.
+export function sdkRoute(method: string, path: string): SdkRoute | undefined {
+  const pre = "/anthropic/v1"
+  if (!path.startsWith(pre + "/")) return undefined
+  const s = path.slice(pre.byteLength).split("/")
+  const m = method.toUpperCase()
+  const n = s.length
+  const a = s[1] ?? ""
+  const b = s[2] ?? ""
+  const c = s[3] ?? ""
+  const d = s[4] ?? ""
+  if (a === "models") {
+    if (n === 2 && m === "GET") return { op: "models.list", id: "" }
+    if (n === 3 && b !== "" && m === "GET") return { op: "models.retrieve", id: b }
+    return undefined
+  }
+  if (a === "messages" && b === "batches") {
+    if (n === 3 && m === "GET") return { op: "batches.list", id: "" }
+    if (n === 3 && m === "POST") return { op: "batches.create", id: "" }
+    if (n === 4 && c !== "" && m === "GET") return { op: "batches.retrieve", id: c }
+    if (n === 5 && c !== "" && d === "cancel" && m === "POST") return { op: "batches.cancel", id: c }
+    if (n === 5 && c !== "" && d === "results" && m === "GET") return { op: "batches.results", id: c }
+    return undefined
+  }
+  if (a === "files") {
+    if (n === 2 && m === "GET") return { op: "files.list", id: "" }
+    if (n === 2 && m === "POST") return { op: "files.upload", id: "" }
+    if (n === 3 && b !== "" && m === "GET") return { op: "files.retrieve", id: b }
+    if (n === 3 && b !== "" && m === "DELETE") return { op: "files.delete", id: b }
+    if (n === 4 && b !== "" && c === "content" && m === "GET") return { op: "files.content", id: b }
+  }
+  return undefined
+}
+
+// An error in Anthropic's envelope.
+export function anthropicError(status: int, type: string, message: string): Response {
+  return new Response(`{"type":"error","error":{"type":${quote(type)},"message":${quote(message)}}}`, { status: status, headers: { "content-type": "application/json" } })
+}
+
+function reply(body: string, contentType: string): Response {
+  return new Response(body, { headers: { "content-type": contentType } })
+}
+
+// An upstream error answer, in Anthropic's envelope with the upstream's message.
+async function failed(res: Response): Promise<Response> throws Error {
+  const text = try await res.text()
+  let message = text
+  try {
+    message = rawStr(try fields(find(try fields(text), "error") ?? "{}"), "message") ?? text
+  } catch (e) {
+    message = text
+  }
+  return anthropicError(res.status, "api_error", message)
+}
+
+// The OpenAI list query for the Anthropic one: after_id becomes after.
+function pagingQuery(sp: URLSearchParams): string {
+  const out = new URLSearchParams()
+  const limit = sp.get("limit") ?? ""
+  if (limit !== "") out.set("limit", limit)
+  const after = sp.get("after_id") ?? ""
+  if (after !== "") out.set("after", after)
+  return out.toString()
+}
+
+// The upstream name of the one model that every request in a batch body names. A
+// "provider/" prefix is dropped and the key's alias is used, as chat does.
+function batchModel(cfg: Config, provider: string, body: string): string throws SyntaxError {
+  let model = ""
+  for (const el of try elements(find(try fields(body), "requests") ?? "[]")) {
+    const m = rawStr(try fields(find(try fields(el), "params") ?? "{}"), "model") ?? ""
+    if (m === "") continue
+    if (model !== "" && m !== model) throw new SyntaxError(`a batch takes one model, not ${model} and ${m}`)
+    model = m
+  }
+  if (model === "") throw new SyntaxError("model is required")
+  const prefix = provider + "/"
+  const bare = model.startsWith(prefix) ? model.slice(prefix.byteLength) : model
+  const sel = target(cfg, { provider: provider, model: bare }, new Set<int>(), undefined)
+  if (sel === undefined) throw new SyntaxError(`no key serves model ${model}`)
+  return sel.t.model
+}
+
+// One call through media.tov's path, for the provider named in x-bf-provider.
+async function viaMedia(cfg: Config, provider: string, method: string, path: string, qs: string, body: string | FormData | undefined): Promise<Response> throws TypeError | Error {
+  const route = matchRoute(method, path)
+  if (route === undefined) return anthropicError(404, "not_found_error", `no route for ${method} ${path}`)
+  const hs = new Headers()
+  hs.set("x-bf-provider", provider)
+  const url = "http://gateway.internal" + path + (qs === "" ? "" : "?" + qs)
+  return try await handleMedia(cfg, new Request(url, { method: method, headers: hs, body: body }), route)
+}
+
+// An Anthropic target: the request goes upstream with its own body, the provider's
+// key, and the client's Anthropic headers.
+async function passthrough(t: Target, req: Request, path: string, search: string): Promise<Response> throws TypeError | Error {
+  const hs = anthropic.upstreamHeaders(t)
+  for (const k of ["anthropic-beta", "anthropic-version", "content-type"]) {
+    const v = req.headers.get(k) ?? ""
+    if (v !== "") hs.set(k, v)
+  }
+  let body: string | FormData | undefined = undefined
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    if ((req.headers.get("content-type") ?? "").startsWith("multipart/form-data")) {
+      body = try await req.formData()
+      hs.delete("content-type")
+    } else {
+      const text = try await req.text()
+      if (text !== "") body = text
+    }
+  }
+  const base = trimSlash(t.cfg.network_config?.base_url ?? "https://api.anthropic.com")
+  const url = base + path.slice("/anthropic".byteLength) + (search === "" ? "" : "?" + search)
+  const mr: MediaRequest = { method: req.method, url: url, headers: hs, body: body }
+  return await send(t, mr)
+}
+
+// A provider that is not Anthropic: the call goes through media.tov, and its answer is
+// converted to Anthropic's shape.
+async function converted(cfg: Config, provider: string, t: Target, r: SdkRoute, req: Request, origin: string, search: string): Promise<Response> throws SyntaxError | TypeError | Error {
+  const base = origin + "/anthropic/v1/messages/batches"
+  const sp = new URLSearchParams(search)
+  if (r.op === "models.list" || r.op === "models.retrieve") {
+    if (!openai.isOpenAICompatible(t.kind)) return anthropicError(400, "invalid_request_error", `provider ${provider} does not list models for the Anthropic API`)
+    const mq = openai.modelsRequest(t)
+    const got = await send(t, { method: "GET", url: mq.url, headers: mq.headers, body: undefined })
+    if (!got.ok) return try await failed(got)
+    const list = try anthropicModelsFromOpenAI(try await got.text())
+    if (r.op === "models.list") return reply(list, "application/json")
+    for (const el of try elements(find(try fields(list), "data") ?? "[]")) {
+      if (rawStr(try fields(el), "id") === r.id) return reply(el, "application/json")
+    }
+    return anthropicError(404, "not_found_error", `model ${r.id} not found`)
+  }
+  if (r.op === "batches.create") {
+    const body = try await req.text()
+    const upstream = try batchModel(cfg, provider, body)
+    const jsonl = try batchInputJsonl(body, upstream)
+    const fd = new FormData()
+    fd.append("file", new File([jsonl], "batch.jsonl", { type: "application/jsonl" }))
+    fd.append("purpose", "batch")
+    const up = try await viaMedia(cfg, provider, "POST", "/v1/files", "", fd)
+    if (!up.ok) return try await failed(up)
+    const fileId = rawStr(try fields(try await up.text()), "id") ?? ""
+    const made = try await viaMedia(cfg, provider, "POST", "/v1/batches", "", `{"input_file_id":${quote(fileId)},"endpoint":"/v1/chat/completions","completion_window":"24h"}`)
+    if (!made.ok) return try await failed(made)
+    return reply(try batchToAnthropic(try await made.text(), base), "application/json")
+  }
+  if (r.op === "batches.list") {
+    const got = try await viaMedia(cfg, provider, "GET", "/v1/batches", pagingQuery(sp), undefined)
+    if (!got.ok) return try await failed(got)
+    return reply(try batchListToAnthropic(try await got.text(), base), "application/json")
+  }
+  if (r.op === "batches.retrieve") {
+    const got = try await viaMedia(cfg, provider, "GET", "/v1/batches/" + r.id, "", undefined)
+    if (!got.ok) return try await failed(got)
+    return reply(try batchToAnthropic(try await got.text(), base), "application/json")
+  }
+  if (r.op === "batches.cancel") {
+    const got = try await viaMedia(cfg, provider, "POST", "/v1/batches/" + r.id + "/cancel", "", undefined)
+    if (!got.ok) return try await failed(got)
+    return reply(try batchToAnthropic(try await got.text(), base), "application/json")
+  }
+  if (r.op === "batches.results") {
+    const got = try await viaMedia(cfg, provider, "GET", "/v1/batches/" + r.id, "", undefined)
+    if (!got.ok) return try await failed(got)
+    const ob = try fields(try await got.text())
+    if (processingStatus(rawStr(ob, "status") ?? "") !== "ended") return anthropicError(400, "invalid_request_error", `batch ${r.id} has not ended`)
+    // the error lines come first, then the successes, as Anthropic lists them
+    let out = ""
+    for (const key of ["error_file_id", "output_file_id"]) {
+      const fid = rawStr(ob, key) ?? ""
+      if (fid === "") continue
+      const f = try await viaMedia(cfg, provider, "GET", "/v1/files/" + fid + "/content", "", undefined)
+      if (!f.ok) return try await failed(f)
+      const part = try await f.text()
+      out += part
+      if (part !== "" && !part.endsWith("\n")) out += "\n"
+    }
+    return reply(try resultsJsonl(out), "application/x-jsonl")
+  }
+  if (r.op === "files.upload") {
+    const fd = try await req.formData()
+    const f = fd.get("file") ?? undefined
+    if (f === undefined || typeof f === "string") return anthropicError(400, "invalid_request_error", "the request needs a file part")
+    let purpose = "batch"
+    const pv = fd.get("purpose")
+    if (typeof pv === "string" && pv !== "") purpose = pv
+    const out = new FormData()
+    out.append("file", f)
+    out.append("purpose", purpose)
+    const got = try await viaMedia(cfg, provider, "POST", "/v1/files", "", out)
+    if (!got.ok) return try await failed(got)
+    return reply(try fileToAnthropic(try await got.text()), "application/json")
+  }
+  if (r.op === "files.list") {
+    const got = try await viaMedia(cfg, provider, "GET", "/v1/files", pagingQuery(sp), undefined)
+    if (!got.ok) return try await failed(got)
+    return reply(try fileListToAnthropic(try await got.text()), "application/json")
+  }
+  if (r.op === "files.retrieve") {
+    const got = try await viaMedia(cfg, provider, "GET", "/v1/files/" + r.id, "", undefined)
+    if (!got.ok) return try await failed(got)
+    return reply(try fileToAnthropic(try await got.text()), "application/json")
+  }
+  if (r.op === "files.delete") {
+    const got = try await viaMedia(cfg, provider, "DELETE", "/v1/files/" + r.id, "", undefined)
+    if (!got.ok) return try await failed(got)
+    return reply(try fileDeletedToAnthropic(try await got.text()), "application/json")
+  }
+  if (r.op === "files.content") {
+    const got = try await viaMedia(cfg, provider, "GET", "/v1/files/" + r.id + "/content", "", undefined)
+    if (!got.ok) return try await failed(got)
+    return got
+  }
+  return anthropicError(404, "not_found_error", `no route for ${req.method} ${req.url}`)
+}
+
+// Serves one Anthropic SDK call. An Anthropic provider (the x-model-provider header,
+// default "anthropic") gets the request unchanged; any other provider is called through
+// media.tov and its answers converted. Undefined paths are for the caller to skip.
+export async function anthropicSdk(cfg: Config, req: Request): Promise<Response> {
+  const u = URL.parse(req.url)
+  const origin = u === undefined ? "http://localhost" : u.origin
+  const path = u === undefined ? "" : u.pathname
+  const search = u === undefined ? "" : u.search.slice(1)
+  const r = sdkRoute(req.method, path)
+  if (r === undefined) return anthropicError(404, "not_found_error", `no route for ${req.method} ${path}`)
+  const h = req.headers.get("x-model-provider") ?? ""
+  const provider = h === "" ? "anthropic" : h
+  const p = providerOf(cfg, provider)
+  if (p === undefined) return anthropicError(404, "not_found_error", `provider ${provider} is not configured`)
+  const t = providerTarget(cfg, provider)
+  if (t === undefined) return anthropicError(404, "not_found_error", `provider ${provider} has no key`)
+  try {
+    if (isPassthrough(kindOf(provider, p))) return await passthrough(t, req, path, search)
+    return await converted(cfg, provider, t, r, req, origin, search)
+  } catch (e) {
+    return anthropicError(400, "invalid_request_error", `invalid request: ${e.message}`)
+  }
+}
+
+test("sdk routes name the operation and the id", () => {
+  const b = sdkRoute("GET", "/anthropic/v1/messages/batches/msgbatch_1")!
+  expect(b).toEqual({ op: "batches.retrieve", id: "msgbatch_1" })
+  expect(sdkRoute("POST", "/anthropic/v1/messages/batches")!.op).toBe("batches.create")
+  expect(sdkRoute("GET", "/anthropic/v1/messages/batches/b1/results")!.op).toBe("batches.results")
+  expect(sdkRoute("POST", "/anthropic/v1/messages/batches/b1/cancel")!.id).toBe("b1")
+  expect(sdkRoute("POST", "/anthropic/v1/files")!.op).toBe("files.upload")
+  expect(sdkRoute("DELETE", "/anthropic/v1/files/file_1")).toEqual({ op: "files.delete", id: "file_1" })
+  expect(sdkRoute("GET", "/anthropic/v1/files/file_1/content")!.op).toBe("files.content")
+  expect(sdkRoute("GET", "/anthropic/v1/models")!.op).toBe("models.list")
+  expect(sdkRoute("GET", "/anthropic/v1/models/gpt-4o")!.id).toBe("gpt-4o")
+  expect(sdkRoute("POST", "/anthropic/v1/messages")).toBeUndefined()
+  expect(sdkRoute("POST", "/anthropic/v1/messages/count_tokens")).toBeUndefined()
+  expect(sdkRoute("GET", "/anthropic/v1/messages/batches/")).toBeUndefined()
+  expect(sdkRoute("GET", "/v1/messages/batches")).toBeUndefined()
+})
+
+test("anthropic errors use the envelope", () => {
+  expect(anthropicError(404, "not_found_error", "no").status).toBe(404)
+  expect(pagingQuery(new URLSearchParams("limit=5&after_id=b9&x=1"))).toBe("limit=5&after=b9")
+})
 
 test("rfc3339 formats unix seconds", () => {
   expect(rfc3339(0.0)).toBe("1970-01-01T00:00:00Z")

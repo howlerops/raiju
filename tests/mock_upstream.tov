@@ -9,6 +9,54 @@ type Seen = { path: string, auth: string, body: string, team: string }
 const seen: Seen[] = []
 let flakyCalls = 0
 
+// Batch and file state for the Anthropic, OpenAI and Gemini batch and file APIs.
+// OpenAI's files hold their text; batches run at once, answering every line.
+const mockFiles: Map<string, string> = new Map()
+const openaiBatches: Map<string, string> = new Map()
+const anthropicBatches: Map<string, string> = new Map()
+const anthropicFiles: string[] = []
+const openaiFiles: string[] = []
+const geminiOps: Map<string, string> = new Map()
+let mockSeq = 0
+const STAMP = "2025-01-01T00:00:00Z"
+
+// Anthropic clients send x-api-key; OpenAI-shaped ones send a bearer token.
+function isAnthropic(req: Request): bool {
+  return (req.headers.get("x-api-key") ?? "") !== ""
+}
+
+function nextId(prefix: string): string {
+  mockSeq += 1
+  return prefix + mockSeq
+}
+
+type BatchLine = { custom_id: string, body: { model: string } }
+
+// One answer line per request of a JSONL batch input: a chat completion echoing the model.
+function answerLines(input: string): string[] throws SyntaxError {
+  const outs: string[] = []
+  for (const line of input.split("\n")) {
+    if (line.trim() === "") continue
+    const l = try JSON.parse(line) as BatchLine
+    const n = outs.length
+    outs.push(`{"id":"batch_req_${n}","custom_id":"${l.custom_id}","response":{"status_code":200,"request_id":"req_${n}","body":{"id":"chatcmpl-${n}","object":"chat.completion","created":1,"model":"${l.body.model}","choices":[{"index":0,"message":{"role":"assistant","content":"Batch reply from ${l.body.model}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}},"error":null}`)
+  }
+  return outs
+}
+
+// The Anthropic message for one request of a message batch, answered by its model.
+function anthropicResult(customId: string, model: string): string {
+  return `{"custom_id":"${customId}","result":{"type":"succeeded","message":{"id":"msg_${customId}","type":"message","role":"assistant","model":"${model}","content":[{"type":"text","text":"Batch reply from ${model}"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":3}}}}`
+}
+
+// The custom ids and models of an Anthropic create body, one request each.
+function anthropicRequests(body: string): { id: string, model: string }[] throws SyntaxError {
+  const out: { id: string, model: string }[] = []
+  const reqs = try JSON.parse(body) as { requests: { custom_id: string, params: { model: string } }[] }
+  for (const r of reqs.requests) out.push({ id: r.custom_id, model: r.params.model })
+  return out
+}
+
 function record(req: Request, path: string, body: string): void {
   const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? req.headers.get("x-goog-api-key") ?? req.headers.get("api-key") ?? ""
   seen.push({ path: path, auth: auth, body: body, team: req.headers.get("x-team") ?? "" })
@@ -107,7 +155,109 @@ Bun.serve<string>({
         return new Response(`{"object":"list","data":[${data.join(",")}],"model":"e","usage":{"prompt_tokens":2,"completion_tokens":0,"total_tokens":2}}`, { headers: { "content-type": "application/json" } })
       },
     },
-    "/v1/models": () => Response.json({ object: "list", data: [{ id: "m-a", object: "model" }, { id: "m-b", object: "model" }] }),
+    // Anthropic's list for a client that sends x-api-key, OpenAI's otherwise
+    "/v1/models": (req) => {
+      if (isAnthropic(req)) return Response.json({ data: [{ type: "model", id: "claude-sonnet-4", display_name: "Claude Sonnet 4", created_at: STAMP }], has_more: false, first_id: "claude-sonnet-4", last_id: "claude-sonnet-4" })
+      return Response.json({ object: "list", data: [{ id: "m-a", object: "model", created: 1735689600 }, { id: "m-b", object: "model" }] })
+    },
+    // Anthropic files (x-api-key) and OpenAI files (bearer) share the path
+    "/v1/files": {
+      POST: async (req) => {
+        record(req, "/v1/files", "multipart")
+        const fd = try await req.formData()
+        const f = fd.get("file")
+        if (typeof f === "string" || f === undefined) return Response.json({ error: { message: "no file part", type: "invalid_request_error" } }, { status: 400 })
+        const text = try await f.text()
+        const id = nextId(isAnthropic(req) ? "file_" : "file-")
+        mockFiles.set(id, text)
+        if (isAnthropic(req)) {
+          const meta = `{"id":"${id}","type":"file","filename":"${f.name}","mime_type":"application/jsonl","size_bytes":${text.byteLength},"created_at":"${STAMP}","downloadable":false}`
+          anthropicFiles.push(meta)
+          return new Response(meta, { headers: { "content-type": "application/json" } })
+        }
+        const purpose = fd.get("purpose")
+        const meta = `{"id":"${id}","object":"file","bytes":${text.byteLength},"created_at":1735689600,"filename":"${f.name}","purpose":"${typeof purpose === "string" ? purpose : "batch"}","status":"processed"}`
+        openaiFiles.push(meta)
+        return new Response(meta, { headers: { "content-type": "application/json" } })
+      },
+      GET: (req) => {
+        record(req, "/v1/files", "")
+        if (isAnthropic(req)) return new Response(`{"data":[${anthropicFiles.join(",")}],"has_more":false,"first_id":null,"last_id":null}`, { headers: { "content-type": "application/json" } })
+        return new Response(`{"object":"list","data":[${openaiFiles.join(",")}],"has_more":false}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    "/v1/files/:id/content": {
+      GET: (req) => {
+        record(req, "/v1/files/" + req.params.id + "/content", "")
+        return new Response(mockFiles.get(req.params.id) ?? "", { headers: { "content-type": "application/jsonl" } })
+      },
+    },
+    // OpenAI's batch: it runs at once, and its output file holds one answer per line
+    "/v1/batches": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v1/batches", body)
+        const b = try JSON.parse(body) as { input_file_id: string }
+        const outs = try answerLines(mockFiles.get(b.input_file_id) ?? "")
+        const id = nextId("batch_")
+        const outId = nextId("file-out-")
+        mockFiles.set(outId, outs.join("\n") + "\n")
+        const n = outs.length
+        const obj = `{"id":"${id}","object":"batch","endpoint":"/v1/chat/completions","input_file_id":"${b.input_file_id}","completion_window":"24h","status":"completed","created_at":1735689600,"expires_at":1735776000,"completed_at":1735693200,"output_file_id":"${outId}","request_counts":{"total":${n},"completed":${n},"failed":0}}`
+        openaiBatches.set(id, obj)
+        return new Response(obj, { headers: { "content-type": "application/json" } })
+      },
+    },
+    "/v1/batches/:id": {
+      GET: (req) => {
+        record(req, "/v1/batches/" + req.params.id, "")
+        return new Response(openaiBatches.get(req.params.id) ?? "", { status: openaiBatches.has(req.params.id) ? 200 : 404 })
+      },
+    },
+    // Anthropic's message batches: in progress when created, ended when read
+    "/v1/messages/batches": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v1/messages/batches", body)
+        const reqs = try anthropicRequests(body)
+        const id = nextId("msgbatch_")
+        anthropicBatches.set(id, body)
+        return new Response(`{"id":"${id}","type":"message_batch","processing_status":"in_progress","request_counts":{"processing":${reqs.length},"succeeded":0,"errored":0,"canceled":0,"expired":0},"ended_at":null,"created_at":"${STAMP}","expires_at":"${STAMP}","archived_at":null,"cancel_initiated_at":null,"results_url":null}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    "/v1/messages/batches/:id": {
+      GET: async (req) => {
+        record(req, "/v1/messages/batches/" + req.params.id, "")
+        const reqs = try anthropicRequests(anthropicBatches.get(req.params.id) ?? "")
+        const n = reqs.length
+        return new Response(`{"id":"${req.params.id}","type":"message_batch","processing_status":"ended","request_counts":{"processing":0,"succeeded":${n},"errored":0,"canceled":0,"expired":0},"ended_at":"${STAMP}","created_at":"${STAMP}","expires_at":"${STAMP}","archived_at":null,"cancel_initiated_at":null,"results_url":"/v1/messages/batches/${req.params.id}/results"}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    "/v1/messages/batches/:id/results": {
+      GET: async (req) => {
+        record(req, "/v1/messages/batches/" + req.params.id + "/results", "")
+        const reqs = try anthropicRequests(anthropicBatches.get(req.params.id) ?? "")
+        const lines = reqs.map((r) => anthropicResult(r.id, r.model))
+        return new Response(lines.join("\n") + "\n", { headers: { "content-type": "application/x-jsonl" } })
+      },
+    },
+    // Gemini's file upload: the metadata and file parts
+    "/upload/v1beta/files": {
+      POST: async (req) => {
+        record(req, "/upload/v1beta/files", "multipart")
+        const fd = try await req.formData()
+        const f = fd.get("file")
+        if (typeof f === "string" || f === undefined) return Response.json({ error: { message: "no file part", status: "INVALID_ARGUMENT" } }, { status: 400 })
+        const id = nextId("g-")
+        return Response.json({ file: { name: "files/" + id, displayName: f.name, mimeType: "application/jsonl", sizeBytes: "" + f.size, createTime: STAMP, state: "ACTIVE" } })
+      },
+    },
+    "/v1beta/batches/:id": {
+      GET: (req) => {
+        record(req, "/v1beta/batches/" + req.params.id, "")
+        return new Response(geminiOps.get(req.params.id) ?? "", { status: geminiOps.has(req.params.id) ? 200 : 404 })
+      },
+    },
     "/v1/messages/count_tokens": {
       POST: async (req) => {
         const body = await req.text()
@@ -132,6 +282,25 @@ Bun.serve<string>({
       POST: async (req) => {
         const body = await req.text()
         record(req, "/v1beta/models/" + req.params.modelAction, body)
+        const action = req.params.modelAction
+        const model = action.split(":")[0] ?? ""
+        // a Gemini batch runs at once: one inlined answer per request, keyed by its metadata key
+        if (action.endsWith(":batchGenerateContent")) {
+          const id = nextId("gb-")
+          const parts = body.split(`"metadata":{"key":"`)
+          const inl: string[] = []
+          for (let i = 1; i < parts.length; i++) {
+            const key = (parts[i] ?? "").split(`"`)[0] ?? ""
+            inl.push(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Batch reply from ${model}"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}},"metadata":{"key":"${key}"}}`)
+          }
+          const op = `{"name":"batches/${id}","done":true,"metadata":{"model":"${model}","name":"batches/${id}","state":"BATCH_STATE_SUCCEEDED","createTime":"${STAMP}","endTime":"${STAMP}","batchStats":{"requestCount":${inl.length},"successfulRequestCount":${inl.length},"pendingRequestCount":0}},"response":{"inlinedResponses":{"inlinedResponses":[${inl.join(",")}]}}}`
+          geminiOps.set(id, op)
+          return new Response(op, { headers: { "content-type": "application/json" } })
+        }
+        if (action.endsWith(":predict")) return Response.json({ predictions: [{ bytesBase64Encoded: "iVBORw0KGgo=" }] })
+        // image models answer with inline image data; TTS with 16-bit mono PCM at 24 kHz
+        if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
+        if (body.includes(`"AUDIO"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "audio/L16;codec=pcm;rate=24000", data: "AAECAw==" } }] }, finishReason: "STOP" }] })
         if (req.params.modelAction.endsWith(":batchEmbedContents")) {
           const n = body.split(`"content"`).length - 1
           const vs: string[] = []

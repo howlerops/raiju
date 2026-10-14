@@ -2,14 +2,17 @@
 // endpoints find the provider from the model ("provider/model" in a JSON field
 // or a form field). File and batch endpoints have no model, so the provider
 // comes from the x-bf-provider header or the provider query parameter. The
-// rest of each request goes upstream unchanged.
+// rest of each request goes upstream unchanged. Anthropic and Gemini providers
+// have their own APIs: media_native.tov builds those requests and the answers
+// are converted to OpenAI's shapes here.
 import { Config, KeyConfig, providerOf } from "./config"
 import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf } from "./providers/types"
 import { isOpenAICompatible, modelsRequest } from "./providers/openai"
 import { parseModel, target, kindOf, pickKey, timeoutMs } from "./router"
-import { fields, rawStr, setField, build, quote } from "./json"
-import { errorJson, Hdrs, snapshot } from "./schemas"
+import { fields, find, rawStr, setField, build, quote } from "./json"
+import { errorJson, snapshot } from "./schemas"
 import { deadline } from "./deadline"
+import * as native from "./media_native"
 
 export type MediaRoute = { op: string, method: string, upstreamPath: string, modelIn: "json" | "form" | "none" }
 
@@ -153,7 +156,7 @@ function modelTarget(cfg: Config, model: string): Target | undefined {
 
 // The target for a file or batch request. These have no model, so keys that
 // are limited to certain models are used only when no unrestricted key exists.
-function providerTarget(cfg: Config, provider: string): Target | undefined {
+export function providerTarget(cfg: Config, provider: string): Target | undefined {
   const p = providerOf(cfg, provider)
   if (p === undefined) return undefined
   const kind = kindOf(provider, p)
@@ -190,19 +193,19 @@ function formWithModel(fd: FormData, model: string): FormData {
   return out
 }
 
-async function send(t: Target, route: MediaRoute, qs: string, body: string | FormData | undefined, contentType: string | undefined): Promise<Response> {
-  const up = upstreamUrl(t, route, qs)
-  const hs: Hdrs = authHeaders(t)
-  if (contentType !== undefined) hs.set("content-type", contentType)
-  const r: Record<string, string> = hs
+// Sends one request upstream and returns the answer as it came. A failed call
+// is a 502 in the OpenAI error shape.
+export async function send(t: Target, mr: native.MediaRequest): Promise<Response> {
+  const r: Record<string, string> = mr.headers
+  const body = mr.body
   const dl = deadline(timeoutMs(t.cfg))
   const signal = dl.controller.signal
   try {
     let res: Response
     const px = proxyOf(t.cfg)
     const tls = tlsOf(t.cfg)
-    if (body === undefined) res = try await fetch(up, { method: route.method, headers: r, signal: signal, proxy: px, tls: tls })
-    else res = try await fetch(up, { method: route.method, headers: r, body: body, signal: signal, proxy: px, tls: tls })
+    if (body === undefined) res = try await fetch(mr.url, { method: mr.method, headers: r, signal: signal, proxy: px, tls: tls })
+    else res = try await fetch(mr.url, { method: mr.method, headers: r, body: body, signal: signal, proxy: px, tls: tls })
     const bytes = try await res.bytes()
     dl.finish()
     const ct = res.headers.get("content-type") ?? "application/json"
@@ -231,9 +234,11 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       const text = try await req.text()
       const model = rawStr(try fields(text), "model")
       if (model === undefined) return errorReply(400, "the request needs a \"model\" field", "invalid_request_error")
-      t = modelTarget(cfg, model)
-      if (t === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
-      body = try rewriteJsonModel(text, t.model)
+      const mt = modelTarget(cfg, model)
+      if (mt === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
+      t = mt
+      if (isNative(mt.kind)) return await nativeMedia(mt, route, qs, text, undefined)
+      body = try rewriteJsonModel(text, mt.model)
       contentType = "application/json"
     } else if (route.modelIn === "form") {
       const fd = try await req.formData()
@@ -243,15 +248,18 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       if (t === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
       body = formWithModel(fd, t.model)
     } else {
-      t = providerTarget(cfg, provider)
-      if (t === undefined) return errorReply(404, `provider "${provider}" is not configured or has no key`, "invalid_request_error")
-      if (route.op === "files.create") body = try await req.formData()
-      else if (route.method === "POST") {
-        const text = try await req.text()
-        if (text !== "") {
-          body = text
-          contentType = "application/json"
-        }
+      const pt = providerTarget(cfg, provider)
+      if (pt === undefined) return errorReply(404, `provider "${provider}" is not configured or has no key`, "invalid_request_error")
+      t = pt
+      let text = ""
+      let form: FormData | undefined = undefined
+      if (route.op === "files.create") form = try await req.formData()
+      else if (route.method === "POST") text = try await req.text()
+      if (isNative(pt.kind)) return await nativeMedia(pt, route, qs, text, form)
+      if (form !== undefined) body = form
+      else if (text !== "") {
+        body = text
+        contentType = "application/json"
       }
     }
   } catch (e) {
@@ -259,7 +267,300 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
   }
   const tt: Target = t === undefined ? { provider: provider, kind: "", model: "", key: { value: "" }, cfg: {} } : t
   if (!supported(tt.kind)) return errorReply(400, `provider "${tt.provider}" does not support ${route.op}`, "invalid_request_error")
-  return await send(tt, route, qs, body, contentType)
+  const hs = authHeaders(tt)
+  if (contentType !== undefined) hs.set("content-type", contentType)
+  return await send(tt, { method: route.method, url: upstreamUrl(tt, route, qs), headers: hs, body: body })
+}
+
+// ---- Anthropic and Gemini ----
+// Their answers are converted to OpenAI's shapes (media_native.tov builds the
+// requests). An upstream error comes back as the upstream sent it.
+
+// Batch output files have the ids "raiju-batch-output-<batch id>".
+const OUTPUT_PREFIX = "raiju-batch-output-"
+
+// Gateway-side copies of uploaded files, by the id the upstream returned. Anthropic
+// and Gemini do not serve an upload's bytes back, but a batch reads its input from
+// here. Kept in memory: a restart forgets them, and only the newest UPLOAD_CAP stay.
+const UPLOAD_CAP = 256
+const uploads: Map<string, string> = new Map()
+const uploadOrder: string[] = []
+// The model of each batch made here, which its results are converted with.
+const batchModels: Map<string, string> = new Map()
+
+function isNative(kind: string): bool {
+  return kind === "anthropic" || kind === "gemini"
+}
+
+function remember(id: string, content: string): void {
+  if (id === "") return
+  if (!uploads.has(id)) uploadOrder.push(id)
+  uploads.set(id, content)
+  while (uploadOrder.length > UPLOAD_CAP) {
+    const old = uploadOrder.shift() ?? ""
+    uploads.delete(old)
+  }
+}
+
+function jsonReply(body: string): Response {
+  return new Response(body, { headers: { "content-type": "application/json" } })
+}
+
+function jsonlReply(body: string): Response {
+  return new Response(body, { headers: { "content-type": "application/x-jsonl" } })
+}
+
+// The last part of a slash path: "batches/abc" gives "abc".
+function lastPart(s: string): string {
+  const parts = s.split("/")
+  return parts[parts.length - 1] ?? ""
+}
+
+// The id in a route's path: "/files/{id}/content" and "/batches/{id}" both give it.
+function routeId(route: MediaRoute): string {
+  const parts = route.upstreamPath.split("/")
+  return parts[2] ?? ""
+}
+
+// The model of the first request in a batch input file, without its provider prefix.
+function firstModel(jsonl: string): string throws SyntaxError {
+  const line = jsonl.split("\n")[0] ?? ""
+  const body = try fields(find(try fields(line), "body") ?? "{}")
+  return lastPart(rawStr(body, "model") ?? "")
+}
+
+// The results file a finished Gemini batch names, or "" when its results are inline.
+function responsesFileOf(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const file = rawStr(try fields(find(fs, "response") ?? "{}"), "responsesFile") ?? ""
+  if (file !== "") return file
+  return rawStr(try fields(find(fs, "dest") ?? "{}"), "fileName") ?? ""
+}
+
+// The uploaded file of a files.create form, or undefined when there is none.
+function filePart(form: FormData | undefined): File | undefined {
+  if (form === undefined) return undefined
+  const f = form.get("file") ?? undefined
+  if (f === undefined || typeof f === "string") return undefined
+  return f
+}
+
+// Serves a media, file or batch call for an Anthropic or Gemini provider.
+async function nativeMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> {
+  try {
+    if (t.kind === "anthropic") return await anthropicMedia(t, route, qs, text, form)
+    return await geminiMedia(t, route, qs, text, form)
+  } catch (e) {
+    return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
+  }
+}
+
+async function anthropicMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  const id = routeId(route)
+  if (route.op === "files.create") {
+    const f = filePart(form)
+    if (f === undefined) return errorReply(400, "the request needs a \"file\" part", "invalid_request_error")
+    const up = await send(t, native.anthropicFileUpload(t, f))
+    if (!up.ok) return up
+    const meta = try native.anthropicFileToOpenAI(try await up.text())
+    remember(rawStr(try fields(meta), "id") ?? "", try await f.text())
+    return jsonReply(meta)
+  }
+  if (route.op === "files.list") {
+    const up = await send(t, native.anthropicFileList(t, qs))
+    if (!up.ok) return up
+    return jsonReply(try native.anthropicFileListToOpenAI(try await up.text()))
+  }
+  if (route.op === "files.retrieve") {
+    const up = await send(t, native.anthropicFileGet(t, id))
+    if (!up.ok) return up
+    return jsonReply(try native.anthropicFileToOpenAI(try await up.text()))
+  }
+  if (route.op === "files.delete") {
+    const up = await send(t, native.anthropicFileDelete(t, id))
+    if (!up.ok) return up
+    uploads.delete(id)
+    return jsonReply(try native.anthropicFileDeletedToOpenAI(try await up.text()))
+  }
+  if (route.op === "files.content") {
+    if (id.startsWith(OUTPUT_PREFIX)) return try await anthropicBatchOutput(t, id.slice(OUTPUT_PREFIX.byteLength))
+    return await send(t, native.anthropicFileContent(t, id))
+  }
+  if (route.op === "batches.create") {
+    let input = ""
+    try {
+      input = rawStr(try fields(text), "input_file_id") ?? ""
+    } catch (e) {
+      return errorReply(400, "the request body must be a JSON object", "invalid_request_error")
+    }
+    const jsonl = uploads.get(input)
+    if (jsonl === undefined) return errorReply(404, `no uploaded file ${input}`, "invalid_request_error")
+    let mr: native.MediaRequest | undefined = undefined
+    let model = ""
+    try {
+      mr = try native.anthropicBatchCreate(t, jsonl)
+      model = try firstModel(jsonl)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (mr === undefined) return errorReply(400, "the batch input has no requests", "invalid_request_error")
+    const up = await send(t, mr)
+    if (!up.ok) return up
+    const created = try await up.text()
+    const bid = rawStr(try fields(created), "id") ?? ""
+    batchModels.set(bid, model)
+    return jsonReply(try native.anthropicBatchToOpenAI(created, OUTPUT_PREFIX + bid))
+  }
+  if (route.op === "batches.list") {
+    const up = await send(t, native.anthropicBatchList(t, qs))
+    if (!up.ok) return up
+    return jsonReply(try native.anthropicBatchListToOpenAI(try await up.text()))
+  }
+  if (route.op === "batches.retrieve") {
+    const up = await send(t, native.anthropicBatchGet(t, id))
+    if (!up.ok) return up
+    return jsonReply(try native.anthropicBatchToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
+  }
+  if (route.op === "batches.cancel") {
+    const up = await send(t, native.anthropicBatchCancel(t, id))
+    if (!up.ok) return up
+    return jsonReply(try native.anthropicBatchToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
+  }
+  return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
+}
+
+// The OpenAI output lines of a finished Anthropic batch.
+async function anthropicBatchOutput(t: Target, bid: string): Promise<Response> throws SyntaxError | Error {
+  const got = await send(t, native.anthropicBatchGet(t, bid))
+  if (!got.ok) return got
+  const status = rawStr(try fields(try await got.text()), "processing_status") ?? ""
+  if (status !== "ended") return errorReply(400, `batch ${bid} has not ended`, "invalid_request_error")
+  const res = await send(t, native.anthropicBatchResults(t, bid))
+  if (!res.ok) return res
+  return jsonlReply(try native.anthropicResultsToOpenAI(try await res.text(), batchModels.get(bid) ?? ""))
+}
+
+async function geminiMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  const id = routeId(route)
+  if (route.op === "files.create") {
+    const f = filePart(form)
+    if (f === undefined) return errorReply(400, "the request needs a \"file\" part", "invalid_request_error")
+    const up = await send(t, native.geminiFileUpload(t, f, f.name))
+    if (!up.ok) return up
+    const meta = try native.geminiFileToOpenAI(try await up.text())
+    remember(rawStr(try fields(meta), "id") ?? "", try await f.text())
+    return jsonReply(meta)
+  }
+  if (route.op === "files.list") {
+    const up = await send(t, native.geminiFileList(t, qs))
+    if (!up.ok) return up
+    return jsonReply(try native.geminiFileListToOpenAI(try await up.text()))
+  }
+  if (route.op === "files.retrieve") {
+    const up = await send(t, native.geminiFileGet(t, id))
+    if (!up.ok) return up
+    return jsonReply(try native.geminiFileToOpenAI(try await up.text()))
+  }
+  if (route.op === "files.delete") {
+    const up = await send(t, native.geminiFileDelete(t, id))
+    if (!up.ok) return up
+    uploads.delete(id)
+    return jsonReply(native.geminiFileDeletedToOpenAI(id))
+  }
+  if (route.op === "files.content") {
+    if (id.startsWith(OUTPUT_PREFIX)) return try await geminiBatchOutput(t, id.slice(OUTPUT_PREFIX.byteLength))
+    return errorReply(400, "Gemini does not serve uploaded files; only batch output can be read", "invalid_request_error")
+  }
+  if (route.op === "batches.create") {
+    let input = ""
+    try {
+      input = rawStr(try fields(text), "input_file_id") ?? ""
+    } catch (e) {
+      return errorReply(400, "the request body must be a JSON object", "invalid_request_error")
+    }
+    const jsonl = uploads.get(input)
+    if (jsonl === undefined) return errorReply(404, `no uploaded file ${input}`, "invalid_request_error")
+    let mr: native.MediaRequest | undefined = undefined
+    let model = ""
+    try {
+      mr = try native.geminiBatchCreate(t, jsonl)
+      model = try firstModel(jsonl)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (mr === undefined) return errorReply(400, "the batch input has no requests", "invalid_request_error")
+    const up = await send(t, mr)
+    if (!up.ok) return up
+    const created = try await up.text()
+    const bid = lastPart(rawStr(try fields(created), "name") ?? "")
+    batchModels.set(bid, model)
+    return jsonReply(try native.geminiBatchToOpenAI(created, OUTPUT_PREFIX + bid))
+  }
+  if (route.op === "batches.list") {
+    const up = await send(t, native.geminiBatchList(t, qs))
+    if (!up.ok) return up
+    return jsonReply(try native.geminiBatchListToOpenAI(try await up.text()))
+  }
+  if (route.op === "batches.retrieve") {
+    const up = await send(t, native.geminiBatchGet(t, id))
+    if (!up.ok) return up
+    return jsonReply(try native.geminiBatchToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
+  }
+  if (route.op === "batches.cancel") {
+    const cancel = await send(t, native.geminiBatchCancel(t, id))
+    if (!cancel.ok) return cancel
+    const up = await send(t, native.geminiBatchGet(t, id))
+    if (!up.ok) return up
+    return jsonReply(try native.geminiBatchToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
+  }
+  if (route.op === "images.generations") {
+    let mr: native.MediaRequest | undefined = undefined
+    try {
+      mr = try native.geminiImageGeneration(t, try fields(text))
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (mr === undefined) return errorReply(400, "the request needs a prompt", "invalid_request_error")
+    const up = await send(t, mr)
+    if (!up.ok) return up
+    const raw = try await up.text()
+    if (t.model.toLowerCase().includes("imagen")) return jsonReply(try native.imagenToOpenAI(raw))
+    return jsonReply(try native.geminiImageToOpenAI(raw))
+  }
+  if (route.op === "audio.speech") {
+    let format = "wav"
+    let mr: native.MediaRequest | undefined = undefined
+    try {
+      const fs = try fields(text)
+      format = try native.speechFormat(fs)
+      mr = try native.geminiSpeech(t, fs)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (mr === undefined) return errorReply(400, "the request needs input", "invalid_request_error")
+    const up = await send(t, mr)
+    if (!up.ok) return up
+    const audio = try native.geminiSpeechToAudio(try await up.text(), format)
+    return new Response(audio.bytes, { headers: { "content-type": audio.contentType } })
+  }
+  return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
+}
+
+// The OpenAI output lines of a finished Gemini batch: from its results file when it
+// has one, else from the inline responses.
+async function geminiBatchOutput(t: Target, bid: string): Promise<Response> throws SyntaxError | Error {
+  const got = await send(t, native.geminiBatchGet(t, bid))
+  if (!got.ok) return got
+  const raw = try await got.text()
+  if (find(try fields(raw), "done") !== "true") return errorReply(400, `batch ${bid} has not ended`, "invalid_request_error")
+  const model = batchModels.get(bid) ?? ""
+  const file = try responsesFileOf(raw)
+  if (file !== "") {
+    const res = await send(t, native.geminiBatchResultsFile(t, file))
+    if (!res.ok) return res
+    return jsonlReply(try native.geminiResultsJsonl(try await res.text(), model))
+  }
+  return jsonlReply(try native.geminiInlinedToOpenAI(raw, model))
 }
 
 test("matches every media route", () => {
@@ -358,4 +659,23 @@ test("provider precedence: header, query, default", () => {
   h.set("x-bf-provider", "")
   expect(providerFor(h, new URLSearchParams("provider=together"))).toBe("together")
   expect(providerFor(h, new URLSearchParams("provider="))).toBe("openai")
+})
+
+test("native routes: batch and file ids, first model, upload copies", () => {
+  expect(routeId(matchRoute("GET", "/v1/batches/b_1")!)).toBe("b_1")
+  expect(routeId(matchRoute("GET", "/v1/files/raiju-batch-output-b_1/content")!)).toBe("raiju-batch-output-b_1")
+  expect(routeId(matchRoute("GET", "/v1/files")!)).toBe("")
+  expect(isNative("anthropic")).toBe(true)
+  expect(isNative("openai")).toBe(false)
+  expect(try firstModel(`{"custom_id":"a","method":"POST","url":"/v1/chat/completions","body":{"model":"openai/gpt-4o"}}\n`)).toBe("gpt-4o")
+  let threw = false
+  try {
+    firstModel("not json")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  for (let i = 0; i < UPLOAD_CAP + 2; i++) remember("f" + i, "x" + i)
+  expect(uploads.has("f0")).toBe(false)
+  expect(uploads.get("f" + (UPLOAD_CAP + 1))).toBe("x" + (UPLOAD_CAP + 1))
 })

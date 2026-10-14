@@ -86,6 +86,19 @@ def call_bytes(method, path, body=None, headers=None, base=GW):
     except urllib.error.HTTPError as e:
         return e.code, e.headers, e.read()
 
+def multipart(path, filename, data: bytes, fields=None, headers=None):
+    """POSTs a multipart form: the file part plus text fields. Returns (status, body)."""
+    boundary = "raiju-e2e-boundary"
+    parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in (fields or {}).items()]
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode() + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(GW + path, data=b"".join(parts), method="POST", headers={"content-type": f"multipart/form-data; boundary={boundary}", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
 def eventstream(data: bytes):
     """Decodes AWS event-stream frames, checking the prelude and message CRCs. Returns [(headers, payload)]."""
     out = []
@@ -535,6 +548,79 @@ def main():
         with urllib.request.urlopen(req, timeout=10) as res:
             audio = res.read(); ctype = res.headers.get("content-type")
         check("audio speech pass-through", audio == bytes([0x49, 0x44, 0x33, 0xff, 0xfb, 0x90, 0x00, 0x80, 0xc3, 0x28]) and ctype == "audio/mpeg" and json.loads(seen()[-1]["body"])["model"] == "tts-1", (audio, ctype))
+
+        # --- Anthropic SDK batches, files and models; Gemini files, batches, images and speech ---
+        def bline(cid, model):
+            return json.dumps({"custom_id": cid, "method": "POST", "url": "/v1/chat/completions", "body": {"model": model, "messages": [{"role": "user", "content": "hi"}]}})
+        msg = [{"role": "user", "content": "hi"}]
+        oa = {"x-model-provider": "openai"}
+        # create -> get -> results against an OpenAI-format provider (through media.tov's files and batches)
+        s, _, b = call("POST", "/anthropic/v1/messages/batches", {"requests": [{"custom_id": "a", "params": {"model": "gpt-4o-mini", "max_tokens": 10, "messages": msg}}]}, oa)
+        mb = json.loads(b) if s == 200 else {}
+        bid = mb.get("id", "")
+        sent = [x["path"] for x in seen()[-2:]]
+        check("anthropic batch create goes through an OpenAI-format provider", s == 200 and mb.get("type") == "message_batch" and mb.get("processing_status") == "ended" and mb.get("request_counts", {}).get("succeeded") == 1 and mb.get("results_url", "").endswith(f"/anthropic/v1/messages/batches/{bid}/results") and sent == ["/v1/files", "/v1/batches"] and json.loads(seen()[-1]["body"])["endpoint"] == "/v1/chat/completions", (s, b, sent))
+        s, _, b = call("GET", f"/anthropic/v1/messages/batches/{bid}", headers=oa)
+        check("anthropic batch retrieve on an OpenAI-format provider", s == 200 and json.loads(b).get("id") == bid and json.loads(b).get("processing_status") == "ended", (s, b))
+        s, _, b = call("GET", f"/anthropic/v1/messages/batches/{bid}/results", headers=oa)
+        res = [json.loads(x) for x in b.split("\n") if x.strip()]
+        check("anthropic batch results from an OpenAI-format provider", s == 200 and len(res) == 1 and res[0]["custom_id"] == "a" and res[0]["result"]["type"] == "succeeded" and res[0]["result"]["message"]["content"][0]["text"] == "Batch reply from gpt-4o-mini", (s, b))
+        s, _, b = call("POST", "/anthropic/v1/messages/batches", {"requests": [{"custom_id": "x", "params": {"model": "gpt-4o", "messages": msg}}, {"custom_id": "y", "params": {"model": "gpt-4o-mini", "messages": msg}}]}, oa)
+        check("a batch with two models is refused in Anthropic's error shape", s == 400 and json.loads(b)["error"]["type"] == "invalid_request_error", (s, b))
+        # Anthropic target: the body goes upstream unchanged, results come back as Anthropic sends them
+        s, _, b = call("POST", "/anthropic/v1/messages/batches", {"requests": [{"custom_id": "c1", "params": {"model": "claude-sonnet-4", "max_tokens": 10, "messages": msg}}]})
+        ab = json.loads(b) if s == 200 else {}
+        abid = ab.get("id", "")
+        up = seen()[-1]
+        check("anthropic batch create passes through unchanged", s == 200 and ab.get("processing_status") == "in_progress" and abid.startswith("msgbatch_") and up["path"] == "/v1/messages/batches" and up["auth"] == "sk-ant" and json.loads(up["body"])["requests"][0]["params"]["model"] == "claude-sonnet-4", (s, b, up))
+        s, _, b = call("GET", f"/anthropic/v1/messages/batches/{abid}/results")
+        res = [json.loads(x) for x in b.split("\n") if x.strip()]
+        check("anthropic batch results pass through", s == 200 and len(res) == 1 and res[0]["custom_id"] == "c1" and res[0]["result"]["message"]["content"][0]["text"] == "Batch reply from claude-sonnet-4", (s, b))
+        # Anthropic files: upload and list pass through
+        s, b = multipart("/anthropic/v1/files", "batch.jsonl", b'{"custom_id":"f1"}\n', {"purpose": "batch"})
+        af = json.loads(b) if s == 200 else {}
+        check("anthropic file upload passes through", s == 200 and af.get("id", "").startswith("file_") and af.get("type") == "file" and seen()[-1]["auth"] == "sk-ant", (s, b))
+        s, _, b = call("GET", "/anthropic/v1/files")
+        check("anthropic file list includes the upload", s == 200 and af.get("id") in [x["id"] for x in json.loads(b)["data"]], (s, b[:300]))
+        # models: Anthropic's own list, and an OpenAI-format provider's in Anthropic's shape
+        s, _, b = call("GET", "/anthropic/v1/models")
+        check("anthropic models pass through", s == 200 and "claude-sonnet-4" in [m["id"] for m in json.loads(b)["data"]], (s, b[:300]))
+        s, _, b = call("GET", "/anthropic/v1/models", headers=oa)
+        check("an OpenAI-format provider's models in Anthropic's shape", s == 200 and [m["id"] for m in json.loads(b)["data"]] == ["m-a", "m-b"] and json.loads(b)["data"][0]["type"] == "model", (s, b[:300]))
+        s, _, b = call("GET", "/anthropic/v1/models/m-b", headers=oa)
+        check("one model from an OpenAI-format provider", s == 200 and json.loads(b).get("id") == "m-b" and json.loads(b).get("type") == "model", (s, b))
+        s, _, b = call("GET", "/anthropic/v1/models/nope", headers=oa)
+        check("an unknown model is a 404 in Anthropic's shape", s == 404 and json.loads(b)["error"]["type"] == "not_found_error", (s, b))
+        # Gemini through /v1/files and /v1/batches (x-bf-provider), to the batch's results
+        gem = {"x-bf-provider": "gemini"}
+        gin = bline("g1", "gemini-2.5-flash") + "\n"
+        s, b = multipart("/v1/files", "gemini.jsonl", gin.encode(), {"purpose": "batch"}, gem)
+        gf = json.loads(b) if s == 200 else {}
+        gfid = gf.get("id", "")
+        check("gemini file upload is OpenAI-shaped", s == 200 and gfid.startswith("g-") and gf.get("object") == "file" and gf.get("bytes") == len(gin), (s, b))
+        s, _, b = call("POST", "/v1/batches", {"input_file_id": gfid, "endpoint": "/v1/chat/completions", "completion_window": "24h"}, gem)
+        gb = json.loads(b) if s == 200 else {}
+        gbid = gb.get("id", "")
+        check("gemini batch created from an uploaded file", s == 200 and gbid.startswith("gb-") and gb.get("status") == "completed" and gb.get("output_file_id") == "raiju-batch-output-" + gbid, (s, b))
+        s, _, b = call("GET", "/v1/batches/" + gbid, headers=gem)
+        check("gemini batch retrieve", s == 200 and json.loads(b).get("status") == "completed", (s, b))
+        s, _, b = call("GET", "/v1/files/raiju-batch-output-" + gbid + "/content", headers=gem)
+        out = [json.loads(x) for x in b.split("\n") if x.strip()]
+        check("gemini batch results are OpenAI's batch output", s == 200 and len(out) == 1 and out[0]["custom_id"] == "g1" and out[0]["response"]["body"]["choices"][0]["message"]["content"] == "Batch reply from gemini-2.5-flash", (s, b[:400]))
+        gp = [x for x in seen() if x["path"].endswith(":batchGenerateContent")]
+        check("gemini batch went to batchGenerateContent with the uploaded requests", gp and '"metadata":{"key":"g1"}' in gp[-1]["body"], gp[-1:] )
+        s, _, b = call("GET", "/v1/files/" + gfid + "/content", headers=gem)
+        check("gemini uploaded files are not served back", s == 400, (s, b))
+        # Gemini images: Imagen's :predict, and a Gemini image model's generateContent
+        s, _, b = call("POST", "/v1/images/generations", {"model": "gemini/imagen-3.0-generate-002", "prompt": "a red fox", "n": 1, "size": "1024x1024"})
+        r = json.loads(b) if s == 200 else {}
+        check("imagen returns base64 image data", s == 200 and r.get("data", [{}])[0].get("b64_json") == "iVBORw0KGgo=" and seen()[-1]["path"] == "/v1beta/models/imagen-3.0-generate-002:predict" and '"sampleCount":1' in seen()[-1]["body"], (s, b))
+        s, _, b = call("POST", "/v1/images/generations", {"model": "gemini/gemini-2.5-flash-image", "prompt": "a red fox", "size": "1024x1024"})
+        r = json.loads(b) if s == 200 else {}
+        check("a gemini image model returns inline image data", s == 200 and r.get("data", [{}])[0].get("b64_json") == "iVBORw0KGgo=" and seen()[-1]["path"] == "/v1beta/models/gemini-2.5-flash-image:generateContent" and '"IMAGE"' in seen()[-1]["body"], (s, b))
+        # Gemini speech: a WAV file (RIFF header, 4 bytes of PCM from the mock)
+        s, h, audio = call_bytes("POST", "/v1/audio/speech", {"model": "gemini/gemini-2.5-flash-preview-tts", "input": "hi", "voice": "Kore"})
+        check("gemini speech returns a WAV", s == 200 and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE" and h.get("content-type") == "audio/wav" and struct.unpack("<I", audio[40:44])[0] == 4 and audio[44:] == bytes([0, 1, 2, 3]), (s, audio[:44]))
 
         # Management API: admin auth, CRUD, hot reload, secrets kept out of the file
         s, _, _ = call("GET", "/api/config", auth=False)
