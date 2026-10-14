@@ -6,6 +6,8 @@ import { parseModel, target } from "./router"
 import { Target } from "./providers/types"
 import { snapshot } from "./schemas"
 import * as metrics from "./metrics"
+import { WsConnection } from "./ws"
+import { errorJson } from "./schemas"
 
 export class Session {
   upstream: WebSocket | undefined = undefined
@@ -100,6 +102,45 @@ export function onClose(ws: ServerWebSocket<Session>): void {
   metrics.addGauge("raiju_realtime_sessions", labels(s), -1.0)
   const up = s.upstream
   if (up !== undefined && up.readyState < 2) up.close()
+}
+
+// The same relay on the http1 server's WebSocket connections. No stored handler
+// captures its own connection (that would form a cycle nothing frees).
+export function relayHttp1(engine: Engine, req: Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void): void {
+  const up = prepare(engine, req)
+  if (up.kind === "refused") {
+    reject(up.status, errorJson(up.message, "invalid_request_error", undefined))
+    return
+  }
+  const s = up.session
+  const client = accept()
+  if (client === undefined) return
+  metrics.addGauge("raiju_realtime_sessions", labels(s), 1.0)
+  try {
+    const hs: Record<string, string> = {}
+    for (const k of s.headers.keys()) hs.set(k, s.headers.get(k)!)
+    const upstream = new WebSocket(s.url, { headers: hs })
+    upstream.onmessage = (ev) => {
+      const d = ev.data
+      if (typeof d === "string") client.send(d)
+      else client.sendBinary(d)
+    }
+    upstream.onclose = (ev) => {
+      client.close(ev.code === 1005 || ev.code === 1006 ? 1011 : ev.code, ev.reason)
+    }
+    upstream.onerror = (ev) => {
+      client.close(1011, "upstream realtime connection failed")
+    }
+    client.onMessage = (m) => {
+      upstream.send(m)
+    }
+    client.onClose = (code, reason) => {
+      metrics.addGauge("raiju_realtime_sessions", labels(s), -1.0)
+      if (upstream.readyState < 2) upstream.close()
+    }
+  } catch (e) {
+    client.close(1011, e.message)
+  }
 }
 
 test("realtime upstream URLs", () => {

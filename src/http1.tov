@@ -6,6 +6,8 @@
 // The parser is byte-level and incremental: feed() takes whatever the socket
 // delivered, which may end anywhere inside a request or hold several.
 
+import { WsConnection, WsSink, acceptKey, validKey } from "./ws"
+
 export type Http1Request = { method: string, path: string, version: string, headers: Map<string, string>, body: string }
 export type Http1Fail = { kind: "fail", status: int, message: string }
 export type Http1Result = { kind: "request", req: Http1Request } | Http1Fail
@@ -143,6 +145,27 @@ export function keepAlive(req: Http1Request): bool {
   return true
 }
 
+// An upgrade request: Connection lists "upgrade" and Upgrade lists "websocket".
+function wantsUpgrade(headers: Map<string, string>): bool {
+  return listHas(headers.get("connection"), "upgrade") && listHas(headers.get("upgrade"), "websocket")
+}
+
+// Whether a comma-separated header value has this token, in any case.
+function listHas(raw: string | undefined, token: string): bool {
+  if (raw === undefined) return false
+  for (const t of raw.toLowerCase().split(",")) {
+    if (t.trim() === token) return true
+  }
+  return false
+}
+
+// Decides an upgrade request (see listen). accept() must be called during the
+// hook: it writes the 101 and returns the WebSocket, or returns undefined after
+// answering the request. Return false to answer 426; true means the hook took
+// the request, and a connection it didn't accept is closed.
+// reject(status, jsonBody) answers the upgrade request with an HTTP error instead.
+export type UpgradeHandler = (req: Http1Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void) => bool
+
 export class Http1Parser {
   private buf: u8[] = []
   private pos = 0
@@ -178,6 +201,15 @@ export class Http1Parser {
       this.pos = 0
     }
     return out
+  }
+
+  // The bytes after the last request: after an upgrade request these are the
+  // start of the WebSocket stream.
+  takeRest(): u8[] {
+    const rest = this.buf.slice(this.pos)
+    this.buf = []
+    this.pos = 0
+    return rest
   }
 
   private step(inout out: Http1Result[]): bool {
@@ -223,6 +255,10 @@ export class Http1Parser {
   private startBody(inout out: Http1Result[]): bool {
     const te = this.headers.get("transfer-encoding")
     const cl = this.headers.get("content-length")
+    // an upgrade hands the connection over after the head, so it can't have a body
+    if (wantsUpgrade(this.headers) && (te !== undefined || (cl !== undefined && decimal(cl) !== 0))) {
+      return this.reject(&out, 400, "upgrade request with a body")
+    }
     // both would make the framing ambiguous, which is how request smuggling works
     if (te !== undefined) {
       if (cl !== undefined) return this.reject(&out, 400, "both Transfer-Encoding and Content-Length")
@@ -310,6 +346,11 @@ export class Http1Parser {
   private complete(inout out: Http1Result[]): bool {
     const req: Http1Request = { method: this.method, path: this.path, version: this.version, headers: this.headers, body: decodeUtf8(this.body) }
     out.push({ kind: "request", req })
+    // what follows an upgrade request is WebSocket frames, not requests
+    if (wantsUpgrade(req.headers)) {
+      this.stopped = true
+      return false
+    }
     if (!keepAlive(req)) this.stopped = true
     this.body = []
     this.headers = new Map()
@@ -382,6 +423,7 @@ function reason(status: int): string {
     case 411: return "Length Required"
     case 413: return "Payload Too Large"
     case 415: return "Unsupported Media Type"
+    case 426: return "Upgrade Required"
     case 429: return "Too Many Requests"
     case 431: return "Request Header Fields Too Large"
     case 500: return "Internal Server Error"
@@ -427,6 +469,14 @@ function plainHeaders(): Map<string, string> {
   return h
 }
 
+// A 426 names the protocol version the server speaks.
+function upgradeRequired(): Map<string, string> {
+  const h = plainHeaders()
+  h.set("upgrade", "websocket")
+  h.set("sec-websocket-version", "13")
+  return h
+}
+
 // One TCP connection. Responses leave in request order: the response at the
 // head of `queue` writes straight to the socket, and the ones behind it hold
 // their output until it is their turn. `sock` and `queue` form a cycle through
@@ -437,7 +487,14 @@ cyclic class Http1Conn {
   queue: Http1Response[] = []
   // a connection without a socket (tests) keeps its output here
   sent: string[] = []
+  sentBytes: u8[][] = []
   parser: Http1Parser
+  // set by listen(); decides the upgrade requests
+  onUpgrade: UpgradeHandler | undefined = undefined
+  // once upgraded, the socket carries WebSocket frames instead of requests
+  ws: WsConnection | undefined = undefined
+  // set once an upgrade request has its answer (the 101 or an HTTP error)
+  answered = false
 
   constructor(maxBodyBytes?: int) {
     this.parser = new Http1Parser(maxBodyBytes)
@@ -451,6 +508,8 @@ cyclic class Http1Conn {
         const res = this.respond("GET", "HTTP/1.1", true)
         res.writeHead(r.status, plainHeaders())
         res.end(`${r.message}\n`)
+      } else if (wantsUpgrade(r.req.headers)) {
+        this.upgrade(r.req)
       } else {
         const res = this.respond(r.req.method, r.req.version, !keepAlive(r.req))
         try {
@@ -478,6 +537,11 @@ cyclic class Http1Conn {
       const pending = r.buf
       r.buf = []
       for (const s of pending) this.sendRaw(s)
+      if (r.tail.length > 0) {
+        const t = r.tail
+        r.tail = []
+        this.sendBytes(t)
+      }
       if (!r.finished) return
       this.queue.shift()
       if (r.closeAfter) {
@@ -507,6 +571,98 @@ cyclic class Http1Conn {
     this.sock = undefined
     this.queue = []
   }
+
+  // Runs the upgrade hook. The socket switches to frames only when accept()
+  // takes the request. Otherwise the request gets an HTTP answer and the
+  // connection closes.
+  private upgrade(req: Http1Request): void {
+    const up = this.onUpgrade
+    let handled = false
+    if (up !== undefined) handled = up(req, () => this.accept(req), (status, body) => this.rejectUpgrade(status, body))
+    const w = this.ws
+    if (w !== undefined) {
+      // bytes that came after the head are already the first frames
+      w.feed(this.parser.takeRest())
+      return
+    }
+    if (this.answered) return
+    if (handled) this.close()
+    else this.answer(426, upgradeRequired(), "WebSocket upgrade required")
+  }
+
+  // The handshake. Validates the request and writes the 101; returns the
+  // WebSocket, or undefined after answering the request with an error.
+  private accept(req: Http1Request): WsConnection | undefined {
+    const have = this.ws
+    if (have !== undefined) return have
+    if (this.answered || this.closed) return undefined
+    if (req.headers.get("sec-websocket-version") !== "13") {
+      this.answer(426, upgradeRequired(), "WebSocket version 13 required")
+      return undefined
+    }
+    const key = req.headers.get("sec-websocket-key")
+    if (key === undefined || !validKey(key)) {
+      this.answer(400, plainHeaders(), "malformed Sec-WebSocket-Key")
+      return undefined
+    }
+    // a 101 can't overtake responses still pending on this connection
+    if (this.queue.length > 0) {
+      this.answer(400, plainHeaders(), "upgrade after a pending response")
+      return undefined
+    }
+    this.answered = true
+    this.sendRaw(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey(key)}\r\n\r\n`)
+    const writer = new WsWriter(this)
+    const w = new WsConnection(new WsSink((b) => writer.write(b), () => writer.end()))
+    this.ws = w
+    return w
+  }
+
+  private rejectUpgrade(status: int, body: string): void {
+    if (this.answered || this.closed) return
+    this.answered = true
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    const res = this.respond("GET", "HTTP/1.1", true)
+    res.writeHead(status, h)
+    res.end(body)
+  }
+
+  // An HTTP answer to an upgrade request. It closes the connection after it.
+  private answer(status: int, headers: Map<string, string>, message: string): void {
+    this.answered = true
+    const res = this.respond("GET", "HTTP/1.1", true)
+    res.writeHead(status, headers)
+    res.end(`${message}\n`)
+  }
+
+  // Binary output, for an upgraded connection.
+  sendBytes(b: u8[]): void {
+    if (this.closed) return
+    const s = this.sock
+    if (s === undefined) this.sentBytes.push(b)
+    else s.write(b)
+  }
+}
+
+// The WsSink of an upgraded connection. Its back-reference is weak: the socket
+// holds the connection, which holds the frames, which must not hold it back.
+class WsWriter {
+  weak conn: Http1Conn | undefined
+
+  constructor(conn: Http1Conn) {
+    this.conn = conn
+  }
+
+  write(bytes: u8[]): void {
+    const c = this.conn
+    if (c !== undefined) c.sendBytes(bytes)
+  }
+
+  end(): void {
+    const c = this.conn
+    if (c !== undefined) c.close()
+  }
 }
 
 // The response to one request. Writes before the head is sent are held in
@@ -518,6 +674,8 @@ export class Http1Response {
   finished = false
   closeAfter: bool
   buf: string[] = []
+  // a binary body given to endBytes(), sent after buf
+  tail: u8[] = []
   private headSent = false
   // a back-reference: a response outliving its connection writes nowhere
   weak conn: Http1Conn | undefined
@@ -561,6 +719,31 @@ export class Http1Response {
     if (c !== undefined) c.advance()
   }
 
+  // Ends the response with a binary body (Content-Length framing).
+  endBytes(body: u8[]): void {
+    if (this.finished) return
+    if (this.headSent) {
+      // already streaming text: fall back to the bytes as one chunk of text
+      let text = ""
+      try {
+        text = new TextDecoder().decode(body)
+      } catch (e) {
+        text = ""
+      }
+      this.end(text)
+      return
+    }
+    this.sendHead({ kind: "length", n: body.length })
+    if (!this.bodyless()) {
+      const c = this.conn
+      if (c !== undefined && c.queue.length > 0 && c.queue[0] === this) c.sendBytes(body)
+      else this.tail = body
+    }
+    this.finished = true
+    const c = this.conn
+    if (c !== undefined) c.advance()
+  }
+
   private startStream(): void {
     if (this.version === "HTTP/1.1") this.sendHead({ kind: "chunked" })
     else {
@@ -590,7 +773,8 @@ export class Http1Response {
 
 // Listens on a port and serves HTTP/1.1 through `handler`. The handler may
 // finish its response later, from async code.
-export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int }, handler: Handler): TCPSocketListener<Http1Conn> {
+// onUpgrade (optional) takes WebSocket upgrade requests; see UpgradeHandler.
+export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, onUpgrade?: UpgradeHandler }, handler: Handler): TCPSocketListener<Http1Conn> {
   const maxBody = opts.maxBodyBytes ?? DEFAULT_MAX_BODY
   return Bun.listen<Http1Conn>({
     hostname: opts.hostname,
@@ -599,16 +783,26 @@ export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int }
       open(socket) {
         const conn = new Http1Conn(maxBody)
         conn.sock = socket
+        conn.onUpgrade = opts.onUpgrade
         socket.data = conn
       },
       data(socket, bytes) {
         const conn = socket.data
         if (conn === undefined || conn.closed) return
+        const w = conn.ws
+        if (w !== undefined) {
+          w.feed(bytes)
+          return
+        }
         conn.serve(conn.parser.feed(bytes), handler)
       },
       close(socket) {
         const conn = socket.data
-        if (conn !== undefined) conn.detach()
+        if (conn !== undefined) {
+          const w = conn.ws
+          if (w !== undefined) w.socketClosed()
+          conn.detach()
+        }
         socket.data = undefined
       },
       error(socket) {
@@ -830,4 +1024,87 @@ test("a throwing handler gets a 500", () => {
 test("httpDate formats epoch milliseconds", () => {
   expect(httpDate(0)).toBe("Thu, 01 Jan 1970 00:00:00 GMT")
   expect(httpDate(784111777000)).toBe("Sun, 06 Nov 1994 08:49:37 GMT")
+})
+
+// An upgrade request. The key is RFC 6455's example.
+function upgradeRequest(version: string, key: string): string {
+  return `GET /ws HTTP/1.1\r\nHost: example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: ${version}\r\n\r\n`
+}
+
+test("an upgrade answers 101 and hands the socket to the frames", () => {
+  const conn = new Http1Conn()
+  const got: string[] = []
+  conn.onUpgrade = (req, accept) => {
+    const ws = accept()
+    if (ws === undefined) return true
+    ws.onMessage = (m) => {
+      if (typeof m === "string") got.push(m)
+    }
+    return true
+  }
+  // a masked "hi" frame in the same read as the request
+  const bytes: u8[] = enc.encode(upgradeRequest("13", "dGhlIHNhbXBsZSBub25jZQ=="))
+  for (const b of [0x81, 0x82, 1, 2, 3, 4, 0x69, 0x6b]) bytes.push(u8(b))
+  conn.serve(conn.parser.feed(bytes), (req, res) => {})
+  expect(conn.sent.join("")).toBe("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+  expect(got.length).toBe(1)
+  expect(got[0]).toBe("hi")
+  expect(conn.closed).toBe(false)
+})
+
+test("an upgrade without a hook is a 426 that closes", () => {
+  const conn = new Http1Conn()
+  conn.serve(new Http1Parser().feed(enc.encode(upgradeRequest("13", "dGhlIHNhbXBsZSBub25jZQ=="))), (req, res) => {})
+  const all = conn.sent.join("")
+  expect(all.startsWith("HTTP/1.1 426 Upgrade Required\r\n")).toBe(true)
+  expect(all.includes("sec-websocket-version: 13\r\n")).toBe(true)
+  expect(all.includes("connection: close\r\n")).toBe(true)
+  expect(conn.closed).toBe(true)
+  expect(conn.ws).toBeUndefined()
+})
+
+test("a hook that declines is a 426, and a bad version or key is answered by accept", () => {
+  const declines = new Http1Conn()
+  declines.onUpgrade = (req, accept) => false
+  declines.serve(new Http1Parser().feed(enc.encode(upgradeRequest("13", "dGhlIHNhbXBsZSBub25jZQ=="))), (req, res) => {})
+  expect(declines.sent.join("").startsWith("HTTP/1.1 426 ")).toBe(true)
+
+  const oldVersion = new Http1Conn()
+  oldVersion.onUpgrade = (req, accept) => {
+    accept()
+    return true
+  }
+  oldVersion.serve(new Http1Parser().feed(enc.encode(upgradeRequest("8", "dGhlIHNhbXBsZSBub25jZQ=="))), (req, res) => {})
+  const v = oldVersion.sent.join("")
+  expect(v.startsWith("HTTP/1.1 426 ")).toBe(true)
+  expect(v.includes("sec-websocket-version: 13\r\n")).toBe(true)
+  expect(oldVersion.ws).toBeUndefined()
+
+  const badKey = new Http1Conn()
+  badKey.onUpgrade = (req, accept) => {
+    accept()
+    return true
+  }
+  badKey.serve(new Http1Parser().feed(enc.encode(upgradeRequest("13", "not-a-key"))), (req, res) => {})
+  expect(badKey.sent.join("").startsWith("HTTP/1.1 400 Bad Request\r\n")).toBe(true)
+  expect(badKey.closed).toBe(true)
+})
+
+test("frames after an upgrade are not read as requests", () => {
+  const conn = new Http1Conn()
+  conn.onUpgrade = (req, accept) => {
+    accept()
+    return true
+  }
+  // "GET" is not a frame: its first byte has the reserved bit set
+  const bytes: u8[] = enc.encode(upgradeRequest("13", "dGhlIHNhbXBsZSBub25jZQ==") + "GET / HTTP/1.1\r\n\r\n")
+  let served = 0
+  conn.serve(conn.parser.feed(bytes), (req, res) => {
+    served += 1
+  })
+  expect(served).toBe(0)
+  expect(conn.closed).toBe(true)
+  // the 1002 close frame went out on the socket
+  expect(int(conn.sentBytes[0]![0]!)).toBe(0x88)
+  expect(int(conn.sentBytes[0]![2]!) * 256 + int(conn.sentBytes[0]![3]!)).toBe(1002)
 })

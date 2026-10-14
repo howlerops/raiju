@@ -1,0 +1,781 @@
+// WebSocket (RFC 6455) for the http1 server: the handshake hash, a frame
+// parser that takes whatever the socket delivers, a frame encoder, and a
+// connection that answers pings and runs the close handshake. Nothing here
+// touches a socket: WsConnection writes through a WsSink, so http1.tov (or a
+// test) supplies the transport.
+//
+// A protocol violation comes out of the parser as an "error" message carrying
+// the close code to send (1002, 1007, 1009); the connection closes with it.
+
+import { encode, decode } from "./base64"
+import { utf8, toHex } from "./crypto"
+
+export type WsMessage =
+  | { kind: "text", text: string }
+  | { kind: "binary", bytes: u8[] }
+  | { kind: "ping", bytes: u8[] }
+  | { kind: "pong", bytes: u8[] }
+  | { kind: "close", code: int, reason: string }
+  | { kind: "error", code: int, message: string }
+
+// The default cap on one message (all fragments together).
+export const MAX_MESSAGE = 16 * 1024 * 1024
+
+const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const M32 = 0xffffffff
+
+function rotl(x: int, n: int): int {
+  return ((x << n) | (x >> (32 - n))) & M32
+}
+
+// SHA-1 (FIPS 180-1). Only the handshake uses it, so it stays here.
+export function sha1(bytes: u8[]): u8[] {
+  const h: int[] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0]
+  const bitLen = bytes.length * 8
+  const data: u8[] = bytes.slice()
+  data.push(u8(0x80))
+  while (data.length % 64 !== 56) data.push(u8(0))
+  for (let i = 7; i >= 0; i--) data.push(u8((bitLen >> (i * 8)) & 0xff))
+  const w: int[] = []
+  for (let i = 0; i < 80; i++) w.push(0)
+  for (let off = 0; off < data.length; off += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = off + i * 4
+      w[i] = (int(data[j]!) << 24) | (int(data[j + 1]!) << 16) | (int(data[j + 2]!) << 8) | int(data[j + 3]!)
+    }
+    for (let i = 16; i < 80; i++) {
+      w[i] = rotl(w[i - 3]! ^ w[i - 8]! ^ w[i - 14]! ^ w[i - 16]!, 1)
+    }
+    let a = h[0]!
+    let b = h[1]!
+    let c = h[2]!
+    let d = h[3]!
+    let e = h[4]!
+    for (let i = 0; i < 80; i++) {
+      let f = 0
+      let k = 0
+      if (i < 20) {
+        f = (b & c) | ((~b & M32) & d)
+        k = 0x5a827999
+      } else if (i < 40) {
+        f = b ^ c ^ d
+        k = 0x6ed9eba1
+      } else if (i < 60) {
+        f = (b & c) | (b & d) | (c & d)
+        k = 0x8f1bbcdc
+      } else {
+        f = b ^ c ^ d
+        k = 0xca62c1d6
+      }
+      const t = (rotl(a, 5) + f + e + k + w[i]!) & M32
+      e = d
+      d = c
+      c = rotl(b, 30)
+      b = a
+      a = t
+    }
+    h[0] = (h[0]! + a) & M32
+    h[1] = (h[1]! + b) & M32
+    h[2] = (h[2]! + c) & M32
+    h[3] = (h[3]! + d) & M32
+    h[4] = (h[4]! + e) & M32
+  }
+  const out: u8[] = []
+  for (const v of h) {
+    out.push(u8((v >> 24) & 0xff))
+    out.push(u8((v >> 16) & 0xff))
+    out.push(u8((v >> 8) & 0xff))
+    out.push(u8(v & 0xff))
+  }
+  return out
+}
+
+// The Sec-WebSocket-Accept value for a client's Sec-WebSocket-Key.
+export function acceptKey(secWebSocketKey: string): string {
+  return encode(sha1(utf8(secWebSocketKey + GUID)))
+}
+
+// A client key is the base64 of 16 random bytes (RFC 6455 4.1).
+export function validKey(key: string): bool {
+  if (key.byteLength !== 24) return false
+  try {
+    return decode(key).length === 16
+  } catch (e) {
+    return false
+  }
+}
+
+// Strict UTF-8: undefined when the bytes aren't valid. The BOM is kept, since
+// a message is not a file.
+function decodeStrict(b: u8[]): string | undefined {
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(b)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Close codes a peer may send (RFC 6455 7.4.1 and 7.4.2).
+function validCloseCode(c: int): bool {
+  if (c >= 1000 && c <= 1003) return true
+  if (c >= 1007 && c <= 1014) return true
+  return c >= 3000 && c <= 4999
+}
+
+// Parses frames off a byte stream. Feed it whatever the socket delivered:
+// frames may split anywhere and several may share a chunk. Payload bytes are
+// copied as they arrive, so a large message is never held twice.
+//
+// A server takes masked frames (requireMask, the default); a client takes
+// unmasked ones. The other kind is a 1002 error.
+export class FrameParser {
+  private hdr: u8[] = []
+  private headNeed = 2
+  private inPayload = false
+  private mask: int[] = [0, 0, 0, 0]
+  private left = 0
+  private off = 0
+  private ctrl = false
+  private opcode = 0
+  private fin = false
+  // data of the message being assembled, and of the control frame in flight
+  private msg: u8[] = []
+  private ctl: u8[] = []
+  private msgOpcode = 0
+  private inMsg = false
+  private stopped = false
+  private max: int
+  private requireMask: bool
+
+  constructor(maxMessageBytes?: int, requireMask?: bool) {
+    this.max = maxMessageBytes ?? MAX_MESSAGE
+    this.requireMask = requireMask ?? true
+  }
+
+  // The messages this chunk completes, in order. After an error, or a close
+  // frame, the parser ignores the rest of the stream.
+  feed(chunk: u8[]): WsMessage[] {
+    let out: WsMessage[] = []
+    let i = 0
+    while (i < chunk.length && !this.stopped) {
+      if (this.inPayload) {
+        const avail = chunk.length - i
+        const n = avail < this.left ? avail : this.left
+        for (let k = 0; k < n; k++) {
+          const x = u8(int(chunk[i + k]!) ^ this.mask[(this.off + k) & 3]!)
+          if (this.ctrl) this.ctl.push(x)
+          else this.msg.push(x)
+        }
+        i += n
+        this.off += n
+        this.left -= n
+        if (this.left === 0) this.endFrame(&out)
+      } else {
+        this.hdr.push(chunk[i]!)
+        i += 1
+        if (this.hdr.length === 2) this.checkFirst(&out)
+        if (!this.stopped && this.hdr.length === this.headNeed) this.startFrame(&out)
+      }
+    }
+    return out
+  }
+
+  // The first two bytes fix the rest of the header's size and the rules.
+  private checkFirst(inout out: WsMessage[]): void {
+    const b0 = int(this.hdr[0]!)
+    const b1 = int(this.hdr[1]!)
+    if ((b0 & 0x70) !== 0) {
+      this.fail(&out, 1002, "reserved bits set")
+      return
+    }
+    const op = b0 & 15
+    if (op !== 0 && op !== 1 && op !== 2 && op !== 8 && op !== 9 && op !== 10) {
+      this.fail(&out, 1002, "unknown opcode")
+      return
+    }
+    const masked = (b1 & 0x80) !== 0
+    if (masked !== this.requireMask) {
+      this.fail(&out, 1002, this.requireMask ? "client frames must be masked" : "server frames must not be masked")
+      return
+    }
+    const len7 = b1 & 0x7f
+    const ext = len7 === 126 ? 2 : len7 === 127 ? 8 : 0
+    this.headNeed = 2 + ext + (masked ? 4 : 0)
+  }
+
+  // The whole header is in hdr: read the length and mask, then check the frame.
+  private startFrame(inout out: WsMessage[]): void {
+    const h = this.hdr
+    const b0 = int(h[0]!)
+    const b1 = int(h[1]!)
+    const len7 = b1 & 0x7f
+    let len = len7
+    let p = 2
+    if (len7 === 126) {
+      len = (int(h[2]!) << 8) | int(h[3]!)
+      p = 4
+    } else if (len7 === 127) {
+      if ((int(h[2]!) & 0x80) !== 0) {
+        this.fail(&out, 1002, "64-bit length has its top bit set")
+        return
+      }
+      // anything past 32 bits is far over the limit, so it's refused unread
+      if ((int(h[2]!) | int(h[3]!) | int(h[4]!) | int(h[5]!)) !== 0) {
+        this.fail(&out, 1009, "message too big")
+        return
+      }
+      len = (int(h[6]!) << 24) | (int(h[7]!) << 16) | (int(h[8]!) << 8) | int(h[9]!)
+      p = 10
+    }
+    const masked = (b1 & 0x80) !== 0
+    const op = b0 & 15
+    const fin = (b0 & 0x80) !== 0
+    if (!this.checkHeader(&out, op, fin, len)) return
+    // a control frame may interleave with fragments, so it doesn't set the type
+    if (op !== 0 && op < 8) this.msgOpcode = op
+    this.ctrl = op >= 8
+    this.opcode = op
+    this.fin = fin
+    this.mask = masked ? [int(h[p]!), int(h[p + 1]!), int(h[p + 2]!), int(h[p + 3]!)] : [0, 0, 0, 0]
+    this.left = len
+    this.off = 0
+    this.hdr = []
+    this.headNeed = 2
+    this.inPayload = true
+    if (len === 0) this.endFrame(&out)
+  }
+
+  // The sequencing rules: fragments, control frames, and the size cap.
+  private checkHeader(inout out: WsMessage[], op: int, fin: bool, len: int): bool {
+    if (op >= 8) {
+      if (!fin) {
+        this.fail(&out, 1002, "fragmented control frame")
+        return false
+      }
+      if (len > 125) {
+        this.fail(&out, 1002, "control frame payload over 125 bytes")
+        return false
+      }
+      return true
+    }
+    if (op === 0 && !this.inMsg) {
+      this.fail(&out, 1002, "continuation frame without a message")
+      return false
+    }
+    if (op !== 0 && this.inMsg) {
+      this.fail(&out, 1002, "new message inside a fragmented one")
+      return false
+    }
+    if (this.msg.length + len > this.max) {
+      this.fail(&out, 1009, "message too big")
+      return false
+    }
+    return true
+  }
+
+  private endFrame(inout out: WsMessage[]): void {
+    this.inPayload = false
+    if (this.ctrl) {
+      const p = this.ctl
+      this.ctl = []
+      if (this.opcode === 8) this.closeMessage(&out, p)
+      else if (this.opcode === 9) out.push({ kind: "ping", bytes: p })
+      else out.push({ kind: "pong", bytes: p })
+      return
+    }
+    if (!this.fin) {
+      this.inMsg = true
+      return
+    }
+    const m = this.msg
+    this.msg = []
+    this.inMsg = false
+    if (this.msgOpcode === 1) {
+      const text = decodeStrict(m)
+      if (text === undefined) {
+        this.fail(&out, 1007, "text message is not valid UTF-8")
+        return
+      }
+      out.push({ kind: "text", text })
+    } else {
+      out.push({ kind: "binary", bytes: m })
+    }
+  }
+
+  private closeMessage(inout out: WsMessage[], p: u8[]): void {
+    this.stopped = true
+    if (p.length === 0) {
+      out.push({ kind: "close", code: 1005, reason: "" })
+      return
+    }
+    if (p.length === 1) {
+      this.fail(&out, 1002, "close frame with a one-byte payload")
+      return
+    }
+    const code = (int(p[0]!) << 8) | int(p[1]!)
+    if (!validCloseCode(code)) {
+      this.fail(&out, 1002, "invalid close code")
+      return
+    }
+    const reason = decodeStrict(p.slice(2))
+    if (reason === undefined) {
+      this.fail(&out, 1007, "close reason is not valid UTF-8")
+      return
+    }
+    out.push({ kind: "close", code, reason })
+  }
+
+  private fail(inout out: WsMessage[], code: int, message: string): void {
+    out.push({ kind: "error", code, message })
+    this.stopped = true
+  }
+}
+
+// One frame, as a server sends it (unmasked). The payload's length picks the
+// 7-, 16- or 64-bit length form.
+export function encodeFrame(opcode: int, payload: u8[], fin: bool): u8[] {
+  const n = payload.length
+  const out: u8[] = []
+  const fin0: int = fin ? 0x80 : 0
+  out.push(u8(fin0 | (opcode & 15)))
+  if (n < 126) {
+    out.push(u8(n))
+  } else if (n < 65536) {
+    out.push(u8(126))
+    out.push(u8(n >> 8))
+    out.push(u8(n & 0xff))
+  } else {
+    out.push(u8(127))
+    for (let i = 7; i >= 0; i--) out.push(u8((n >> (i * 8)) & 0xff))
+  }
+  for (const b of payload) out.push(b)
+  return out
+}
+
+export function textFrame(s: string): u8[] {
+  return encodeFrame(1, utf8(s), true)
+}
+
+export function binaryFrame(b: u8[]): u8[] {
+  return encodeFrame(2, b, true)
+}
+
+// A close frame. No code means an empty payload (no status). The reason is
+// cut to the 123 bytes a control frame allows, never inside a character.
+export function closeFrame(code?: int, reason?: string): u8[] {
+  const body: u8[] = []
+  if (code !== undefined) {
+    body.push(u8(code >> 8))
+    body.push(u8(code & 0xff))
+    const rb: u8[] = reason === undefined ? [] : utf8(reason)
+    let n = rb.length > 123 ? 123 : rb.length
+    while (n > 0 && n < rb.length && (int(rb[n]!) & 0xc0) === 0x80) n--
+    for (let i = 0; i < n; i++) body.push(rb[i]!)
+  }
+  return encodeFrame(8, body, true)
+}
+
+export function pingFrame(bytes: u8[]): u8[] {
+  return encodeFrame(9, bytes, true)
+}
+
+export function pongFrame(bytes: u8[]): u8[] {
+  return encodeFrame(10, bytes, true)
+}
+
+// Where a connection writes its bytes: a socket in production.
+// Where a connection's frames go. A class of two functions rather than an
+// interface: class instances held only through interface values were freed
+// while still in use in this Tov build.
+export class WsSink {
+  constructor(readonly write: (bytes: u8[]) => void, readonly end: () => void) {}
+}
+
+// One open WebSocket. readyState: 0 connecting, 1 open, 2 closing (our close
+// frame is out, waiting for the peer's), 3 closed. A connection handed out by
+// accept() is already open.
+export class WsConnection {
+  onMessage: ((m: string | u8[]) => void) | undefined = undefined
+  onClose: ((code: int, reason: string) => void) | undefined = undefined
+  private state: int = 1
+  private parser: FrameParser
+  private sink: WsSink
+
+  constructor(sink: WsSink, maxMessageBytes?: int) {
+    this.sink = sink
+    this.parser = new FrameParser(maxMessageBytes, true)
+  }
+
+  get readyState(): int {
+    return this.state
+  }
+
+  // Takes bytes the transport delivered. Handlers should be set before the
+  // first call, or messages that arrive first are dropped.
+  feed(bytes: u8[]): void {
+    if (this.state === 3) return
+    for (const m of this.parser.feed(bytes)) {
+      if (this.state === 3) return
+      if (m.kind === "text") {
+        if (this.state === 1) this.deliver(m.text)
+      } else if (m.kind === "binary") {
+        if (this.state === 1) this.deliver(m.bytes)
+      } else if (m.kind === "ping") {
+        this.sink.write(pongFrame(m.bytes))
+      } else if (m.kind === "close") {
+        this.peerClosed(m.code, m.reason)
+      } else if (m.kind === "error") {
+        this.failed(m.code, m.message)
+      }
+    }
+  }
+
+  // Sends a text message. False when the connection isn't open.
+  send(text: string): bool {
+    if (this.state !== 1) return false
+    this.sink.write(textFrame(text))
+    return true
+  }
+
+  sendBinary(b: u8[]): bool {
+    if (this.state !== 1) return false
+    this.sink.write(binaryFrame(b))
+    return true
+  }
+
+  // Starts the close handshake. The socket ends once the peer's close frame
+  // arrives.
+  close(code?: int, reason?: string): void {
+    if (this.state !== 1) return
+    this.state = 2
+    this.sink.write(closeFrame(code, reason))
+  }
+
+  // The transport went away without a close handshake.
+  socketClosed(): void {
+    this.finish(1006, "")
+  }
+
+  private deliver(m: string | u8[]): void {
+    const h = this.onMessage
+    if (h !== undefined) h(m)
+  }
+
+  private peerClosed(code: int, reason: string): void {
+    // echo the code, unless the peer sent none
+    if (this.state === 1) this.sink.write(closeFrame(code === 1005 ? undefined : code))
+    this.finish(code, reason)
+  }
+
+  private failed(code: int, message: string): void {
+    this.sink.write(closeFrame(code, message))
+    this.finish(code, message)
+  }
+
+  private finish(code: int, reason: string): void {
+    if (this.state === 3) return
+    this.state = 3
+    this.sink.end()
+    const h = this.onClose
+    if (h !== undefined) h(code, reason)
+  }
+}
+
+// ---- tests ----
+
+// Raw bytes from plain numbers.
+function raw(xs: int[]): u8[] {
+  const out: u8[] = []
+  for (const x of xs) out.push(u8(x))
+  return out
+}
+
+function cat(parts: u8[][]): u8[] {
+  const out: u8[] = []
+  for (const p of parts) for (const b of p) out.push(b)
+  return out
+}
+
+// A client frame, masked as browsers send them, with the length form that
+// encodeFrame would pick.
+function clientFrame(opcode: int, fin: bool, payload: u8[], mask: int[]): u8[] {
+  const n = payload.length
+  const out: u8[] = []
+  const fin0: int = fin ? 0x80 : 0
+  const mbit: int = 0x80
+  out.push(u8(fin0 | opcode))
+  if (n < 126) {
+    out.push(u8(mbit | n))
+  } else if (n < 65536) {
+    out.push(u8(mbit | 126))
+    out.push(u8(n >> 8))
+    out.push(u8(n & 0xff))
+  } else {
+    out.push(u8(mbit | 127))
+    for (let i = 7; i >= 0; i--) out.push(u8((n >> (i * 8)) & 0xff))
+  }
+  for (const k of mask) out.push(u8(k))
+  for (let i = 0; i < n; i++) out.push(u8(int(payload[i]!) ^ mask[i & 3]!))
+  return out
+}
+
+const KEY: int[] = [0x37, 0xfa, 0x21, 0x3d]
+
+function textAt(ms: WsMessage[], i: int): string {
+  const m = ms[i]
+  if (m !== undefined && m.kind === "text") return m.text
+  return "not text"
+}
+
+function binaryAt(ms: WsMessage[], i: int): u8[] {
+  const m = ms[i]
+  if (m !== undefined && m.kind === "binary") return m.bytes
+  return []
+}
+
+function kindAt(ms: WsMessage[], i: int): string {
+  const m = ms[i]
+  if (m === undefined) return "none"
+  return m.kind
+}
+
+function errorCode(ms: WsMessage[]): int {
+  for (const m of ms) {
+    if (m.kind === "error") return m.code
+  }
+  return -1
+}
+
+function closeAt(ms: WsMessage[], i: int): string {
+  const m = ms[i]
+  if (m !== undefined && m.kind === "close") return `${m.code} ${m.reason}`
+  return "not close"
+}
+
+// Records what a connection writes and whether it ended.
+class FakeSink {
+  out: u8[] = []
+  ended = false
+  write(bytes: u8[]): void {
+    for (const b of bytes) this.out.push(b)
+  }
+  end(): void {
+    this.ended = true
+  }
+}
+
+test("sha1 known vectors", () => {
+  expect(toHex(sha1(utf8("abc")))).toBe("a9993e364706816aba3e25717850c26c9cd0d89d")
+  expect(toHex(sha1(utf8("")))).toBe("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+  expect(toHex(sha1(utf8("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")))).toBe("84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+  const million: u8[] = []
+  for (let i = 0; i < 1000000; i++) million.push(u8(97))
+  expect(toHex(sha1(million))).toBe("34aa973cd4c4daa4f61eeb2bdbad27316534016f")
+})
+
+test("acceptKey matches RFC 6455's example", () => {
+  expect(acceptKey("dGhlIHNhbXBsZSBub25jZQ==")).toBe("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+  expect(validKey("dGhlIHNhbXBsZSBub25jZQ==")).toBe(true)
+  expect(validKey("dGhlIHNhbXBsZSBub25j")).toBe(false)
+  expect(validKey("!!!!!!!!!!!!!!!!!!!!!!!!")).toBe(false)
+  expect(validKey("AAAAAAAAAAAAAAAAAAAAAA==")).toBe(true)
+})
+
+test("parses a masked text frame (RFC 6455 example)", () => {
+  const p = new FrameParser()
+  const ms = p.feed(raw([0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58]))
+  expect(ms.length).toBe(1)
+  expect(textAt(ms, 0)).toBe("Hello")
+})
+
+test("a frame split byte by byte", () => {
+  const bytes = raw([0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58])
+  const p = new FrameParser()
+  const got: WsMessage[] = []
+  for (let i = 0; i < bytes.length; i++) {
+    for (const m of p.feed([bytes[i]!])) got.push(m)
+  }
+  expect(got.length).toBe(1)
+  expect(textAt(got, 0)).toBe("Hello")
+})
+
+test("several frames in one chunk, with a ping inside a fragmented message", () => {
+  const bytes = cat([
+    clientFrame(1, false, raw([0x48, 0x65, 0x6c]), KEY),
+    clientFrame(9, true, raw([0x70]), KEY),
+    clientFrame(0, true, raw([0x6c, 0x6f]), KEY),
+    clientFrame(1, true, raw([0x61, 0x67, 0x61, 0x69, 0x6e]), KEY),
+  ])
+  const ms = new FrameParser().feed(bytes)
+  expect(ms.length).toBe(3)
+  expect(kindAt(ms, 0)).toBe("ping")
+  expect(textAt(ms, 1)).toBe("Hello")
+  expect(textAt(ms, 2)).toBe("again")
+})
+
+test("16-bit and 64-bit lengths", () => {
+  const big: u8[] = []
+  for (let i = 0; i < 300; i++) big.push(u8(i & 0xff))
+  const ms = new FrameParser().feed(clientFrame(2, true, big, KEY))
+  expect(binaryAt(ms, 0).length).toBe(300)
+  expect(int(binaryAt(ms, 0)[299]!)).toBe(299 & 0xff)
+
+  const huge: u8[] = []
+  for (let i = 0; i < 70000; i++) huge.push(u8(i & 0xff))
+  const p = new FrameParser()
+  const hs = p.feed(clientFrame(2, true, huge, KEY))
+  expect(binaryAt(hs, 0).length).toBe(70000)
+  expect(int(binaryAt(hs, 0)[69999]!)).toBe(69999 & 0xff)
+})
+
+test("an unmasked client frame is 1002", () => {
+  expect(errorCode(new FrameParser().feed(raw([0x81, 0x02, 0x68, 0x69])))).toBe(1002)
+})
+
+test("a masked server frame is 1002 for a client parser", () => {
+  expect(errorCode(new FrameParser(undefined, false).feed(clientFrame(1, true, raw([0x61]), KEY)))).toBe(1002)
+})
+
+test("bad UTF-8 in a text message is 1007", () => {
+  expect(errorCode(new FrameParser().feed(clientFrame(1, true, raw([0xff]), KEY)))).toBe(1007)
+  expect(errorCode(new FrameParser().feed(clientFrame(1, true, raw([0xed, 0xa0, 0x80]), KEY)))).toBe(1007)
+})
+
+test("messages over the size cap are 1009", () => {
+  const big: u8[] = []
+  for (let i = 0; i < 101; i++) big.push(u8(1))
+  expect(errorCode(new FrameParser(100).feed(clientFrame(2, true, big, KEY)))).toBe(1009)
+  // fragments count together
+  const half: u8[] = []
+  for (let i = 0; i < 60; i++) half.push(u8(1))
+  const ms = new FrameParser(100).feed(cat([clientFrame(2, false, half, KEY), clientFrame(0, true, half, KEY)]))
+  expect(errorCode(ms)).toBe(1009)
+})
+
+test("close frames carry a code and reason", () => {
+  expect(closeAt(new FrameParser().feed(clientFrame(8, true, raw([0x03, 0xe8, 0x62, 0x79, 0x65]), KEY)), 0)).toBe("1000 bye")
+  expect(closeAt(new FrameParser().feed(clientFrame(8, true, [], KEY)), 0)).toBe("1005 ")
+  // 1005 may not be sent
+  expect(errorCode(new FrameParser().feed(clientFrame(8, true, raw([0x03, 0xed]), KEY)))).toBe(1002)
+})
+
+test("malformed frame headers are 1002", () => {
+  // RSV1 set
+  expect(errorCode(new FrameParser().feed(raw([0xc1, 0x80])))).toBe(1002)
+  // opcode 3 is reserved
+  expect(errorCode(new FrameParser().feed(raw([0x83, 0x80])))).toBe(1002)
+  // control frames can't be fragmented
+  expect(errorCode(new FrameParser().feed(clientFrame(9, false, [], KEY)))).toBe(1002)
+  // a continuation with nothing to continue
+  expect(errorCode(new FrameParser().feed(clientFrame(0, true, raw([0x61]), KEY)))).toBe(1002)
+})
+
+test("textFrame and binaryFrame have the server header", () => {
+  expect(toHex(textFrame("Hi"))).toBe("81024869")
+  expect(toHex(binaryFrame(raw([1, 2])))).toBe("82020102")
+})
+
+test("encodeFrame round trips through a client-side parser", () => {
+  const dec = new FrameParser(undefined, false)
+  expect(textAt(dec.feed(textFrame("héllo")), 0)).toBe("héllo")
+  const mid: u8[] = []
+  for (let i = 0; i < 300; i++) mid.push(u8(i & 0xff))
+  expect(binaryAt(dec.feed(binaryFrame(mid)), 0).length).toBe(300)
+  const huge: u8[] = []
+  for (let i = 0; i < 70000; i++) huge.push(u8(i & 0xff))
+  const hb = binaryAt(dec.feed(binaryFrame(huge)), 0)
+  expect(hb.length).toBe(70000)
+  expect(int(hb[69999]!)).toBe(69999 & 0xff)
+  expect(kindAt(dec.feed(pingFrame(raw([1, 2]))), 0)).toBe("ping")
+  expect(kindAt(dec.feed(pongFrame(raw([1, 2]))), 0)).toBe("pong")
+  expect(closeAt(dec.feed(closeFrame(1001, "going")), 0)).toBe("1001 going")
+  // a close frame ends the stream, so the next one needs its own parser
+  expect(closeAt(new FrameParser(undefined, false).feed(closeFrame()), 0)).toBe("1005 ")
+  const long: string[] = []
+  for (let i = 0; i < 200; i++) long.push("a")
+  const cm = new FrameParser(undefined, false).feed(closeFrame(1000, long.join("")))
+  // "1000 " plus the 123 bytes a control frame leaves for a reason
+  expect(closeAt(cm, 0).byteLength).toBe(5 + 123)
+})
+
+test("WsConnection answers a ping with a pong", () => {
+  const sink = new FakeSink()
+  const ws = new WsConnection(new WsSink((b) => sink.write(b), () => sink.end()))
+  ws.feed(clientFrame(9, true, raw([0x78]), KEY))
+  expect(toHex(sink.out)).toBe("8a0178")
+  expect(ws.readyState).toBe(1)
+})
+
+test("WsConnection delivers messages and sends replies", () => {
+  const sink = new FakeSink()
+  const ws = new WsConnection(new WsSink((b) => sink.write(b), () => sink.end()))
+  const got: string[] = []
+  ws.onMessage = (m) => {
+    if (typeof m === "string") got.push(m)
+  }
+  ws.feed(clientFrame(1, true, raw([0x68, 0x69]), KEY))
+  expect(got.length).toBe(1)
+  expect(got[0]).toBe("hi")
+  expect(ws.send("yo")).toBe(true)
+  expect(toHex(sink.out)).toBe("8102796f")
+})
+
+test("the peer's close is echoed and ends the socket", () => {
+  const sink = new FakeSink()
+  const ws = new WsConnection(new WsSink((b) => sink.write(b), () => sink.end()))
+  const log: string[] = []
+  ws.onClose = (code, reason) => {
+    log.push(`${code} ${reason}`)
+  }
+  ws.feed(clientFrame(8, true, raw([0x03, 0xe8, 0x6f, 0x6b]), KEY))
+  expect(toHex(sink.out)).toBe("880203e8")
+  expect(sink.ended).toBe(true)
+  expect(ws.readyState).toBe(3)
+  expect(log.length).toBe(1)
+  expect(log[0]).toBe("1000 ok")
+  expect(ws.send("late")).toBe(false)
+})
+
+test("our close waits for the peer's close frame", () => {
+  const sink = new FakeSink()
+  const ws = new WsConnection(new WsSink((b) => sink.write(b), () => sink.end()))
+  const log: string[] = []
+  ws.onClose = (code, reason) => {
+    log.push(`${code} ${reason}`)
+  }
+  ws.close(1001, "bye")
+  expect(ws.readyState).toBe(2)
+  expect(toHex(sink.out)).toBe("880503e9627965")
+  expect(sink.ended).toBe(false)
+  ws.feed(clientFrame(8, true, raw([0x03, 0xe9]), KEY))
+  expect(sink.ended).toBe(true)
+  expect(ws.readyState).toBe(3)
+  expect(log[0]).toBe("1001 ")
+})
+
+test("a protocol error closes with its code", () => {
+  const sink = new FakeSink()
+  const ws = new WsConnection(new WsSink((b) => sink.write(b), () => sink.end()))
+  const log: string[] = []
+  ws.onClose = (code, reason) => {
+    log.push(`${code}`)
+  }
+  ws.feed(raw([0x81, 0x01, 0x61]))
+  expect(int(sink.out[0]!)).toBe(0x88)
+  expect(int(sink.out[2]!) * 256 + int(sink.out[3]!)).toBe(1002)
+  expect(sink.ended).toBe(true)
+  expect(log[0]).toBe("1002")
+})
+
+test("a socket that goes away is a 1006 close", () => {
+  const sink = new FakeSink()
+  const ws = new WsConnection(new WsSink((b) => sink.write(b), () => sink.end()))
+  const log: string[] = []
+  ws.onClose = (code, reason) => {
+    log.push(`${code}`)
+  }
+  ws.socketClosed()
+  expect(ws.readyState).toBe(3)
+  expect(log[0]).toBe("1006")
+  expect(sink.out.length).toBe(0)
+})

@@ -15,6 +15,7 @@ unit:
 
 e2e:
 	python3 tests/e2e.py
+	RAIJU_SERVER=bun python3 tests/e2e.py
 
 ui:
 	NODE_PATH=$$(npm root -g) node tests/ui_e2e.mjs

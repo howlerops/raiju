@@ -113,7 +113,7 @@ def main():
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
-    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=subprocess.DEVNULL)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "http1")], env=env, stderr=subprocess.DEVNULL)
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health")
 
@@ -166,7 +166,7 @@ def main():
 
         s, _, b = call("POST", "/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "stream": True, "stream_options": {"include_usage": True}, "messages": [{"role": "user", "content": "s"}]})
         # buffered servers replay the full answer as SSE; the http1 server converts Anthropic's own stream
-        content = '"delta":{"content":"hi"}' if os.environ.get("RAIJU_SERVER") == "http1" else '"delta":{"content":"Hi from claude"}'
+        content = '"delta":{"content":"hi"}' if os.environ.get("RAIJU_SERVER", "http1") == "http1" else '"delta":{"content":"Hi from claude"}'
         check("non-openai streaming as SSE", s == 200 and content in b and '"usage":' in b and b.endswith("data: [DONE]\n\n"), b)
 
         s, _, b = call("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "x"})
@@ -290,7 +290,7 @@ def main():
         req = urllib.request.Request(GW + "/v1/audio/speech", data=json.dumps({"model": "openai/tts-1", "input": "hi", "voice": "alloy"}).encode(), method="POST", headers={"content-type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as res:
             audio = res.read(); ctype = res.headers.get("content-type")
-        check("audio speech pass-through", audio == b"ID3fake-mp3-bytes" and ctype == "audio/mpeg" and json.loads(seen()[-1]["body"])["model"] == "tts-1", (audio, ctype))
+        check("audio speech pass-through", audio == bytes([0x49, 0x44, 0x33, 0xff, 0xfb, 0x90, 0x00, 0x80, 0xc3, 0x28]) and ctype == "audio/mpeg" and json.loads(seen()[-1]["body"])["model"] == "tts-1", (audio, ctype))
 
         # Management API: admin auth, CRUD, hot reload, secrets kept out of the file
         s, _, _ = call("GET", "/api/config", auth=False)
@@ -368,7 +368,7 @@ def main():
         check("no semantic lookup without a cache key", not any(x["path"] == "/v1/embeddings" for x in seen()[n:]))
 
         # Streaming: chunks reach the client as the upstream produces them (http1 server only)
-        if os.environ.get("RAIJU_SERVER") == "http1":
+        if os.environ.get("RAIJU_SERVER", "http1") == "http1":
             import socket as _s
             body = json.dumps({"model": "slowai/slow", "stream": True, "messages": [{"role": "user", "content": "count"}]}).encode()
             sock = _s.create_connection(("127.0.0.1", 18098), timeout=10)

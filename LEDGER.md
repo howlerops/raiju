@@ -10,7 +10,9 @@ Status: `todo` → `assigned` → `review` → `done` (or `blocked`, `rework`).
 
 | ID | Work | Pri | Files | Status | Verified by |
 |---|---|---|---|---|---|
-| L01 | Streaming HTTP/1.1 server on raw sockets | P0 | `src/http1.tov` | done (module); gateway integration is X04 | 21 unit tests; demo streams SSE incrementally |
+| L01 | Streaming HTTP/1.1 server on raw sockets | P0 | `src/http1.tov` | done | unit + e2e (slow upstream proves incremental chunks) |
+| L19 | WebSocket server for http1 | P0 | `src/ws.tov` | done | unit (RFC vectors) + e2e realtime relay |
+| L20 | Incremental stream converters | P0 | `src/streams.tov` | done | unit (byte-split streams, CRCs) + e2e Anthropic stream |
 | L02 | Anthropic Messages in → any provider | P0 | `src/providers/anthropic_in.tov` | done | unit + e2e (plain and streaming to OpenAI) |
 | L03 | Responses API | P1 | `src/responses.tov` | done | unit + e2e (passthrough, translated, streaming) |
 | L04 | Circuit breakers + adaptive load balancing | P1 | `src/health.tov` | done | unit (router: breakers, adaptive weights) |
@@ -36,7 +38,7 @@ Status: `todo` → `assigned` → `review` → `done` (or `blocked`, `rework`).
 | X01 | Integrate each module; e2e coverage per feature | done for everything above |
 | X02 | Model aliases | done |
 | X03 | Keep SCOPE.md and README in sync | ongoing |
-| X04 | Real streaming: serve streaming routes on the `http1` server, forward upstream chunks as they arrive | in progress |
+| X04 | Real streaming on the `http1` server (default), WebSocket realtime on it, binary bodies | done |
 | X05 | Semantic cache in the request path (embed on exact miss) | done |
 
 ## Defects found in review (all fixed)
@@ -47,6 +49,8 @@ Status: `todo` → `assigned` → `review` → `done` (or `blocked`, `rework`).
 - Adaptive weights compared latency across unrelated models: now only among the candidates.
 - Responses route echoed the upstream body instead of the request (shadowed variable).
 - README claimed a static binary; it links glibc.
+- scripts/check.py applied safe fixes at byte offsets; tov reports character columns (corrupted edits on non-ASCII lines).
+- Interface-held class instances crashed (Tov bug): converters and the WebSocket sink are concrete classes now.
 
 ## Next (P2 from SCOPE.md)
 

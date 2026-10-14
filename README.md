@@ -28,11 +28,16 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 
 ## What works
 
-- **API:** `/v1/chat/completions` (tools, vision, JSON mode, streaming), `/v1/embeddings`,
-  `/v1/completions`, `/v1/models`, `/v1/realtime` (WebSocket relay).
-- **Drop-in SDK routes:** `/openai/v1/*`, `/anthropic/v1/messages`,
+- **API:** `/v1/chat/completions` (tools, vision, JSON mode, streaming), `/v1/responses`,
+  `/v1/embeddings`, `/v1/completions`, `/v1/models`, `/v1/realtime` (WebSocket relay),
+  `/v1/rerank`, `/v1/count_tokens`, `/v1/async/*` jobs, audio, images, files and batches.
+- **Drop-in SDK routes:** `/openai/v1/*`, `/anthropic/v1/messages` (to any provider),
   `/genai/v1beta/models/{model}:{method}`, `/bedrock/model/{id}/{converse|invoke}`.
-- **Providers:** OpenAI, Azure OpenAI, Anthropic, Gemini, Bedrock (SigV4 or API key),
+- **Gateway features:** routing rules (CEL), circuit breakers and adaptive load
+  balancing, guardrails (PII and secret redaction), semantic cache, MCP gateway,
+  plugins, request log store, OpenTelemetry, management API with admin auth,
+  web UI at `/`. Deployment: Dockerfile, compose and a Helm chart in `deploy/`.
+- **Providers:** OpenAI, Azure OpenAI, Anthropic, Gemini, Vertex AI, Cohere, Bedrock (SigV4 or API key),
   Groq, Mistral, xAI, DeepSeek, Cerebras, Fireworks, Together, Nebius, Parasail,
   OpenRouter, Perplexity, Ollama, vLLM, SGLang, LM Studio, and custom
   OpenAI-compatible providers (`custom_provider_config`).
@@ -49,12 +54,23 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 - **Observability:** Prometheus `/metrics` with Bifrost's metric names,
   `x-bifrost-request-id`, JSON request logs, `x-bf-overhead-us`.
 
+## Servers
+
+The default server (`-server http1`) is Raiju's own HTTP/1.1 implementation on
+raw sockets: answers stream to the client chunk by chunk (OpenAI-format,
+Anthropic, Gemini and Bedrock streams are converted as they arrive), and
+WebSockets serve `/v1/realtime`. It runs in one process, which handled about
+16k requests/second in our tests; for more cores, run one process per core
+behind a load balancer (or Helm replicas).
+
+`-workers N` (N > 1) switches to Tov's built-in server, which forks N
+processes but buffers streamed answers (they arrive complete, as SSE).
+
 ## Known gaps
 
-- **Streaming is buffered.** SSE output is correct but arrives in one piece:
-  Tov's HTTP server can't stream bodies yet ([docs/tov-notes.md](docs/tov-notes.md)).
-- Governance, cache and metrics state is in memory per worker process.
-- `/anthropic/v1/messages` routes only to Anthropic and (non-streaming) Bedrock.
+- Governance, cache and metrics state is in memory per process.
+- Vertex and Cohere streams are buffered (answered in one piece).
+- See [LEDGER.md](LEDGER.md) for what's next.
 
 ## Performance
 
@@ -90,7 +106,8 @@ measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
 
 ```sh
 make check   # tov check --json on every file, applying "safe" fixes
-make unit    # tov test (30 tests)
-make e2e     # gateway against a mock upstream (33 checks)
+make unit    # tov test (270 tests)
+make e2e     # gateway against a mock upstream, on both servers
+make ui      # the web UI in headless Chromium against a real gateway
 make bench
 ```

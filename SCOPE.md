@@ -6,13 +6,13 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 
 | Feature | Status |
 |---|---|
-| Chat completions + streaming | buffered streaming (see Known gaps) |
+| Chat completions + streaming | done (chunk-by-chunk on the default server) |
 | Embeddings | OpenAI-format providers |
 | List models | done |
-| Realtime (WebSocket) | OpenAI, Azure |
+| Realtime (WebSocket) | done (OpenAI, Azure) |
 | Exact-match cache | done |
 | Anthropic SDK route | Anthropic + Bedrock (non-stream) targets |
-| Bedrock SDK route | converse, invoke |
+| Bedrock SDK route | done |
 | Google GenAI SDK route | done |
 | OpenAI SDK route | done |
 | Budgets | done |
@@ -31,7 +31,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | OpenAI-compatible family | done |
 | Fallback chains | done |
 | Weighted key balancing | done |
-| Auto prompt caching | Anthropic, Bedrock |
+| Auto prompt caching | done |
 | Retries with backoff | done |
 | Timeouts | request timeout |
 
@@ -39,34 +39,34 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 
 | Feature | Status |
 |---|---|
-| Async jobs |  |
-| Audio (speech, transcription) |  |
-| Text completions | OpenAI-format providers |
-| Files and batches |  |
-| Images |  |
-| Rerank, OCR, count tokens |  |
-| Responses API |  |
-| Semantic cache |  |
-| Adaptive load balancing |  |
-| Circuit breaker |  |
-| Native guardrails |  |
-| Admin auth |  |
+| Async jobs | done |
+| Audio (speech, transcription) | done |
+| Text completions | done |
+| Files and batches | done |
+| Images | done |
+| Rerank, OCR, count tokens | rerank and count tokens done; OCR todo |
+| Responses API | done |
+| Semantic cache | done |
+| Adaptive load balancing | done |
+| Circuit breaker | done |
+| Native guardrails | done |
+| Admin auth | done |
 | Customers and teams | done |
-| MCP client (HTTP/SSE) |  |
-| MCP tool execution endpoint |  |
-| Request log store |  |
-| OpenTelemetry |  |
-| Docker / Helm / Terraform |  |
-| Plugin hooks |  |
-| Config store + management API |  |
-| Web UI |  |
-| Cohere |  |
+| MCP client (HTTP/SSE) | done |
+| MCP tool execution endpoint | done |
+| Request log store | done |
+| OpenTelemetry | done |
+| Docker / Helm / Terraform | Docker, compose, Helm done; Terraform todo |
+| Plugin hooks | done (compiled-in plugins) |
+| Config store + management API | done |
+| Web UI | done |
+| Cohere | done |
 | Custom providers | done |
-| Vertex AI |  |
-| Model aliases |  |
+| Vertex AI | done |
+| Model aliases | done |
 | Header/param forwarding | x-bf-eh-* done |
 | Key pinning | done |
-| Routing rules (CEL) |  |
+| Routing rules (CEL) | done |
 
 ## P2
 
