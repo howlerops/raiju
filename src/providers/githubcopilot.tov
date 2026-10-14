@@ -1,0 +1,256 @@
+// GitHub Copilot chat, as Bifrost does it. A Copilot API token comes from one of two places:
+//   1. the key value, a token issued to the caller; its host is base_url, since the token
+//      does not carry one;
+//   2. GitHub App credentials (github_copilot_key_config), minted in three calls:
+//      App JWT (RS256) -> installation token -> Copilot token. The Copilot token names the
+//      host to call. The gateway runs the three calls, caches the result, and calls
+//      chatRequest with the token as the key value and the host as base_url.
+// Only the request and response shapes live here; the gateway does the HTTP. The Copilot
+// token exchange is a GET with no body, and the others are POSTs (installation: JSON body).
+import { Field, fields, find, setField, quote, build, without, rawStr, rawNum } from "../json"
+import { Target, Upstream, headers, addExtraHeaders, trimSlash } from "./types"
+import { GATEWAY_FIELDS } from "./openai"
+import { signRs256 } from "../jwt"
+import { encodeUrl } from "../base64"
+import { utf8 } from "../crypto"
+import { parseIsoUtcMs } from "../cloud_auth"
+
+const PUBLIC_API = "https://api.github.com"
+// The public Copilot domain: its tier hosts are api.individual, api.business and api.enterprise
+const COPILOT_DOMAIN = "githubcopilot.com"
+const DEFAULT_COPILOT_BASE = "https://api." + COPILOT_DOMAIN
+const GITHUB_JSON = "application/vnd.github+json"
+const GITHUB_API_VERSION = "2022-11-28"
+// GitHub 403s a request with no User-Agent, and a stable one is rate-limited per app.
+const EXCHANGE_AGENT = "Bifrost-Copilot/1.0"
+const EDITOR_VERSION = "vscode/1.111.0"
+const PLUGIN_VERSION = "copilot-chat/0.40.0"
+const CLIENT_AGENT = "GitHubCopilotChat/0.40.0"
+const INTEGRATION_ID = "vscode-chat"
+const CHAT_API_VERSION = "2025-04-01"
+
+// JWT times: issued 60 s in the past, valid 8 minutes (GitHub rejects a span over 10 minutes).
+const JWT_SKEW_SECS = 60
+const JWT_LIFETIME_SECS = 480
+
+// The host without a scheme or path, lower-cased.
+function hostOf(url: string): string {
+  let s = url.trim()
+  const cut = s.indexOf("://")
+  if (cut >= 0) s = s.slice(cut + 3)
+  const slash = s.indexOf("/")
+  if (slash >= 0) s = s.slice(0, slash)
+  return s.toLowerCase()
+}
+
+// The GitHub API root for a deployment: github.com, a ghe.com tenant (api.<domain>), or a
+// GitHub Enterprise Server (<domain>/api/v3).
+export function githubApiBase(domain: string): string {
+  const d = hostOf(domain)
+  if (d === "" || d === "github.com") return PUBLIC_API
+  if (d.endsWith(".ghe.com")) return "https://api." + d
+  return "https://" + d + "/api/v3"
+}
+
+// Whether a Copilot API host GitHub returned may be used for this deployment. A ghe.com tenant
+// may use only its own domain (data residency); a GHES may use the public host too.
+function hostAllowed(host: string, domain: string): bool {
+  if (host.includes("@") || host === "") return false
+  const d = hostOf(domain)
+  const pub = host === COPILOT_DOMAIN || host.endsWith("." + COPILOT_DOMAIN)
+  if (d === "" || d === "github.com") return pub
+  if (d.endsWith(".ghe.com")) return host === d || host.endsWith("." + d)
+  return pub || host === d || host.endsWith("." + d)
+}
+
+function enterprise(domain: string): bool {
+  const d = hostOf(domain)
+  return d !== "" && d !== "github.com"
+}
+
+// The App JWT that authorizes the installation calls, signed with the App's private key.
+export function appJwt(appId: string, privateKeyPem: string, nowSec: int): string throws SyntaxError {
+  const header = encodeUrl(utf8(`{"alg":"RS256","typ":"JWT"}`))
+  const claims = `{"iss":${quote(appId)},"exp":${nowSec + JWT_LIFETIME_SECS},"iat":${nowSec - JWT_SKEW_SECS}}`
+  const input = header + "." + encodeUrl(utf8(claims))
+  const sig = try signRs256(privateKeyPem, input)
+  return input + "." + sig
+}
+
+// Digits only, at most 20 (an installation or repository id goes into a path or a JSON number).
+function digits(s: string, what: string): string throws SyntaxError {
+  if (s.byteLength === 0 || s.byteLength > 20) throw new SyntaxError(`github copilot: ${what} must be a numeric id`)
+  for (let i = 0; i < s.byteLength; i++) {
+    if (!"0123456789".includes(s.slice(i, i + 1))) throw new SyntaxError(`github copilot: ${what} must be a numeric id`)
+  }
+  return s
+}
+
+// Step 2: the App JWT trades for an installation token scoped to one repository, with write
+// access to Copilot requests.
+export function installationTokenRequest(apiBase: string, installationId: string, repositoryId: string, jwt: string): Upstream throws SyntaxError {
+  const inst = try digits(installationId, "installation_id")
+  const repo = try digits(repositoryId, "repository_id")
+  return {
+    url: apiBase + "/app/installations/" + inst + "/access_tokens",
+    headers: headers([["content-type", "application/json"], ["accept", GITHUB_JSON], ["x-github-api-version", GITHUB_API_VERSION], ["user-agent", EXCHANGE_AGENT], ["authorization", "Bearer " + jwt]]),
+    body: `{"repository_ids":[${repo}],"permissions":{"copilot_requests":"write"}}`,
+  }
+}
+
+// The installation token and its expiry (epoch ms). GitHub gives the expiry as RFC 3339.
+export function parseInstallationToken(text: string): { token: string, expiresAtMs: f64 } throws SyntaxError {
+  const fs = try fields(text)
+  const token = rawStr(fs, "token")
+  if (token === undefined || token === "") throw new SyntaxError(`github copilot: no installation token: ${rawStr(fs, "message") ?? "unknown error"}`)
+  const exp = parseIsoUtcMs(rawStr(fs, "expires_at") ?? "")
+  if (exp === undefined) throw new SyntaxError("github copilot: unparseable installation token expiry")
+  return { token: token, expiresAtMs: exp }
+}
+
+// Step 3: the installation token for a Copilot API token. A GET with no body.
+export function copilotTokenRequest(apiBase: string, installationToken: string): Upstream {
+  return {
+    url: apiBase + "/copilot_internal/v2/token",
+    headers: headers([["accept", GITHUB_JSON], ["authorization", "token " + installationToken], ["editor-version", EDITOR_VERSION], ["editor-plugin-version", PLUGIN_VERSION], ["user-agent", EXCHANGE_AGENT]]),
+    body: "",
+  }
+}
+
+export type CopilotToken = { token: string, baseURL: string, expiresAtSec: f64 }
+
+// The Copilot token, its expiry (epoch seconds) and the host to call. A host outside what the
+// deployment may use falls back to the public Copilot host, except on an enterprise
+// deployment, where it is an error (the prompts must not leave the enterprise's host).
+export function parseCopilotToken(text: string, domain: string, nowSec: f64): CopilotToken throws SyntaxError {
+  const fs = try fields(text)
+  const token = rawStr(fs, "token")
+  if (token === undefined || token === "") {
+    throw new SyntaxError(`github copilot: ${rawStr(fs, "message") ?? "no active Copilot entitlement for this installation"}`)
+  }
+  const exp = rawNum(fs, "expires_at")
+  if (exp === undefined) throw new SyntaxError("github copilot: Copilot token response has no expires_at")
+  if (exp <= nowSec) throw new SyntaxError("github copilot: Copilot token is already expired")
+  let api = ""
+  const eps = find(fs, "endpoints")
+  if (eps !== undefined) {
+    const efs = try fields(eps)
+    api = rawStr(efs, "api") ?? ""
+  }
+  const host = hostOf(api)
+  const ok = api.startsWith("https://") && hostAllowed(host, domain)
+  if (!ok && enterprise(domain)) throw new SyntaxError(`github copilot: refusing the Copilot host GitHub returned for this enterprise deployment: ${api}`)
+  const baseURL = ok ? "https://" + host : DEFAULT_COPILOT_BASE
+  return { token: token, baseURL: baseURL, expiresAtSec: exp }
+}
+
+// The chat POST to a Copilot host with the headers Copilot expects. The key value is the
+// Copilot token and cfg.network_config.base_url its host (required, as in Bifrost).
+export function chatRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const tok = t.key.value ?? ""
+  if (tok === "") throw new SyntaxError("github copilot: no Copilot token: set the key value, or github_copilot_key_config to mint one")
+  const base = t.cfg.network_config?.base_url ?? ""
+  if (base === "") throw new SyntaxError("github copilot: a Copilot token needs network_config.base_url, the host it was issued for (api.individual, api.business or api.enterprise.githubcopilot.com)")
+  let h = headers([
+    ["content-type", "application/json"],
+    ["authorization", "Bearer " + tok],
+    ["copilot-integration-id", INTEGRATION_ID],
+    ["editor-version", EDITOR_VERSION],
+    ["editor-plugin-version", PLUGIN_VERSION],
+    ["user-agent", CLIENT_AGENT],
+    ["openai-intent", "conversation-panel"],
+    ["x-github-api-version", CHAT_API_VERSION],
+  ])
+  // images need the vision flag; the messages are scanned raw for an image part
+  const msgs = find(body, "messages") ?? ""
+  if (msgs.includes(`"image_url"`)) h.set("copilot-vision-request", "true")
+  addExtraHeaders(&h, t.cfg)
+  let fs = without(body, GATEWAY_FIELDS)
+  setField(&fs, "model", quote(t.model))
+  return { url: trimSlash(base) + "/chat/completions", headers: h, body: build(fs) }
+}
+
+// ---- tests ----
+
+test("GitHub API roots for github.com, ghe.com and GHES", () => {
+  expect(githubApiBase("")).toBe("https://api.github.com")
+  expect(githubApiBase("github.com")).toBe("https://api.github.com")
+  expect(githubApiBase("acme.ghe.com")).toBe("https://api.acme.ghe.com")
+  expect(githubApiBase("https://ghes.acme.com")).toBe("https://ghes.acme.com/api/v3")
+})
+
+test("App JWT has three parts and an RS256 header", () => {
+  const pem = "-----BEGIN RSA PRIVATE KEY-----\nnot-a-key\n-----END RSA PRIVATE KEY-----"
+  let threw = false
+  try {
+    appJwt("12345", pem, 1791982800)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("installation token request names the installation and one repository", () => {
+  const up = try installationTokenRequest("https://api.github.com", "777", "4242", "jwt.x.y")
+  expect(up.url).toBe("https://api.github.com/app/installations/777/access_tokens")
+  expect(up.headers.get("authorization")).toBe("Bearer jwt.x.y")
+  expect(up.body).toBe(`{"repository_ids":[4242],"permissions":{"copilot_requests":"write"}}`)
+  let threw = false
+  try {
+    installationTokenRequest("https://api.github.com", "1/../../user", "4242", "j")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("installation token response gives token and RFC 3339 expiry", () => {
+  const r = try parseInstallationToken(`{"token":"ghs_abc","expires_at":"2026-10-14T13:00:00Z","permissions":{"copilot_requests":"write"}}`)
+  expect(r.token).toBe("ghs_abc")
+  expect(r.expiresAtMs).toBe(1791982800000.0)
+  let threw = false
+  try {
+    parseInstallationToken(`{"message":"Bad credentials"}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("Copilot token response picks the tier host and refuses foreign hosts for enterprises", () => {
+  const body = `{"token":"tid=1","expires_at":1791986400,"refresh_in":1500,"endpoints":{"api":"https://api.business.githubcopilot.com"}}`
+  const r = try parseCopilotToken(body, "github.com", 1791982800.0)
+  expect(r.baseURL).toBe("https://api.business.githubcopilot.com")
+  expect(r.expiresAtSec).toBe(1791986400.0)
+  const evil = `{"token":"t","expires_at":1791986400,"endpoints":{"api":"https://api.githubcopilot.com.evil.net"}}`
+  const fb = try parseCopilotToken(evil, "", 1791982800.0)
+  expect(fb.baseURL).toBe("https://api.githubcopilot.com")
+  let threw = false
+  try {
+    parseCopilotToken(evil, "ghes.acme.com", 1791982800.0)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("chat request uses the Copilot host and editor headers", () => {
+  const t: Target = { provider: "github-copilot", kind: "github-copilot", model: "gpt-4o", key: { value: "tid=1" }, cfg: { network_config: { base_url: "https://api.individual.githubcopilot.com" } } }
+  const up = try chatRequest(t, try fields(`{"model":"github-copilot/gpt-4o","messages":[{"role":"user","content":"hi"}],"fallbacks":["openai/gpt-4o"]}`))
+  expect(up.url).toBe("https://api.individual.githubcopilot.com/chat/completions")
+  expect(up.headers.get("authorization")).toBe("Bearer tid=1")
+  expect(up.headers.get("copilot-integration-id")).toBe("vscode-chat")
+  expect(up.headers.has("copilot-vision-request")).toBe(false)
+  expect(up.body).toBe(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+})
+
+test("chat request needs a token and a base_url", () => {
+  const noBase: Target = { provider: "github-copilot", kind: "github-copilot", model: "gpt-4o", key: { value: "tid=1" }, cfg: {} }
+  let threw = false
+  try {
+    chatRequest(noBase, [])
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

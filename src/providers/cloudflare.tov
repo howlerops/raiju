@@ -1,0 +1,83 @@
+// Cloudflare Workers AI chat and embeddings. The endpoints sit under the key's account
+// (cloudflare_key_config.account_id) and take and answer OpenAI-shaped bodies, so the
+// response side reuses openai.tov. Streaming goes through the buffered path: the upstream
+// is called without stream and the answer is replayed as SSE (see index.tov).
+import { Field, fields, find, setField, quote, build, without } from "../json"
+import { Target, Upstream, headers, addExtraHeaders, trimSlash } from "./types"
+import { GATEWAY_FIELDS } from "./openai"
+
+// Bifrost's default: the account API root, to which /accounts/<id> is appended.
+const DEFAULT_BASE = "https://api.cloudflare.com/client/v4"
+const ALNUM = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+// <base>/accounts/<account_id>. The id is checked to be alphanumeric, since it goes into the path.
+export function accountBase(t: Target): string throws SyntaxError {
+  const id = t.key.cloudflare_key_config?.account_id ?? ""
+  if (id === "") throw new SyntaxError("cloudflare: the key needs cloudflare_key_config.account_id")
+  for (let i = 0; i < id.byteLength; i++) {
+    if (!ALNUM.includes(id.slice(i, i + 1))) throw new SyntaxError("cloudflare: account_id must be alphanumeric")
+  }
+  const b = t.cfg.network_config?.base_url ?? ""
+  const root = b === "" ? DEFAULT_BASE : trimSlash(b)
+  return root + "/accounts/" + id
+}
+
+function authHeaders(t: Target): Map<string, string> {
+  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + (t.key.value ?? "")]])
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+// The body with gateway-only fields removed and the model set to the name Workers AI knows
+// (for example "@cf/meta/llama-3.1-8b-instruct").
+function withModel(t: Target, body: Field[]): string {
+  let fs = without(body, GATEWAY_FIELDS)
+  setField(&fs, "model", quote(t.model))
+  return build(fs)
+}
+
+export function chatRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const url = try accountBase(t)
+  return { url: url + "/ai/v1/chat/completions", headers: authHeaders(t), body: withModel(t, body) }
+}
+
+export function embeddingsRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const url = try accountBase(t)
+  return { url: url + "/ai/v1/embeddings", headers: authHeaders(t), body: withModel(t, body) }
+}
+
+// ---- tests ----
+
+test("cloudflare chat URL is scoped to the key's account", () => {
+  const t: Target = { provider: "cloudflare", kind: "cloudflare", model: "@cf/meta/llama-3.1-8b-instruct", key: { value: "cf-tok", cloudflare_key_config: { account_id: "abc123" } }, cfg: {} }
+  const up = try chatRequest(t, try fields(`{"model":"cloudflare/@cf/meta/llama-3.1-8b-instruct","messages":[],"fallbacks":["openai/gpt-4o"]}`))
+  expect(up.url).toBe("https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1/chat/completions")
+  expect(up.headers.get("authorization")).toBe("Bearer cf-tok")
+  expect(up.body).toBe(`{"model":"@cf/meta/llama-3.1-8b-instruct","messages":[]}`)
+})
+
+test("cloudflare embeddings and base_url override", () => {
+  const t: Target = { provider: "cloudflare", kind: "cloudflare", model: "@cf/baai/bge-base-en-v1.5", key: { value: "k", cloudflare_key_config: { account_id: "acc" } }, cfg: { network_config: { base_url: "https://gw.example.com/client/v4/" } } }
+  const up = try embeddingsRequest(t, try fields(`{"input":"hi"}`))
+  expect(up.url).toBe("https://gw.example.com/client/v4/accounts/acc/ai/v1/embeddings")
+  expect(up.body).toBe(`{"input":"hi","model":"@cf/baai/bge-base-en-v1.5"}`)
+})
+
+test("cloudflare needs an alphanumeric account id", () => {
+  const none: Target = { provider: "cloudflare", kind: "cloudflare", model: "m", key: { value: "k" }, cfg: {} }
+  let threw = false
+  try {
+    accountBase(none)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  const bad: Target = { provider: "cloudflare", kind: "cloudflare", model: "m", key: { value: "k", cloudflare_key_config: { account_id: "a/../b" } }, cfg: {} }
+  threw = false
+  try {
+    accountBase(bad)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

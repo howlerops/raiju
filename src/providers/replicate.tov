@@ -1,0 +1,192 @@
+// Replicate chat, as one prediction. The conversation is folded into the model's input
+// (prompt, system_prompt, image_input); the answer is the prediction's output joined. The
+// request asks for a synchronous answer (Prefer: wait). A prediction still running when
+// that wait ends is an error here: the gateway does not poll (see the notes in INTEGRATION).
+// Replicate's wire format is not OpenAI's, so this translates both ways.
+import { fields, find, rawStr, decodeString, elements, quote } from "../json"
+import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
+import { ChatRequest, ContentPart, textOf, nowSeconds } from "../schemas"
+import { parseIsoUtcMs } from "../cloud_auth"
+
+const DEFAULT_BASE = "https://api.replicate.com"
+const HEX = "0123456789abcdef"
+const DEEPSEEK = "deepseek-ai/deepseek"
+
+// A 64-character lower-case hex id is a model version: its predictions are at /v1/predictions.
+export function isVersion(s: string): bool {
+  if (s.byteLength !== 64) return false
+  for (let i = 0; i < 64; i++) {
+    if (!HEX.includes(s.slice(i, i + 1))) return false
+  }
+  return true
+}
+
+// owner/name uses /v1/models/<owner>/<name>/predictions; a version id uses /v1/predictions.
+export function predictionPath(model: string): string {
+  if (isVersion(model)) return "/v1/predictions"
+  return "/v1/models/" + model + "/predictions"
+}
+
+// The text pieces of a conversation: system text, and user and assistant text in order, and
+// image URLs. DeepSeek models take no system_prompt, so their system text is put first in the prompt.
+type Pieces = { system: string, prompt: string, images: string[] }
+
+function pieces(req: ChatRequest): Pieces {
+  const sys: string[] = []
+  const parts: string[] = []
+  const images: string[] = []
+  for (const m of req.messages) {
+    const c = m.content
+    if (c !== undefined && typeof c !== "string") {
+      for (const p of c as ContentPart[]) {
+        if (p.type === "image_url" && p.image_url !== undefined) images.push(p.image_url.url)
+      }
+    }
+    const text = textOf(c)
+    if (text === "") continue
+    if (m.role === "system") sys.push(text)
+    else if (m.role === "user" || m.role === "assistant") parts.push(text)
+  }
+  return { system: sys.join("\n"), prompt: parts.join("\n\n"), images: images }
+}
+
+// The POST body: {"input": {...}}. Sampling and the output limit carry over.
+export function chatBody(model: string, version: bool, req: ChatRequest): string {
+  const pc = pieces(req)
+  const deepseek = model.toLowerCase().startsWith(DEEPSEEK)
+  let prompt = pc.prompt
+  let system = pc.system
+  if (deepseek && system !== "") {
+    prompt = prompt === "" ? system : system + "\n\n" + prompt
+    system = ""
+  }
+  const input: string[] = []
+  if (prompt !== "") input.push(`"prompt":${quote(prompt)}`)
+  if (system !== "") input.push(`"system_prompt":${quote(system)}`)
+  if (pc.images.length > 0) input.push(`"image_input":[${pc.images.map((u) => quote(u)).join(",")}]`)
+  const maxTokens = req.max_completion_tokens ?? req.max_tokens
+  if (maxTokens !== undefined) input.push(`"max_tokens":${maxTokens}`)
+  if (req.temperature !== undefined) input.push(`"temperature":${req.temperature}`)
+  if (req.top_p !== undefined) input.push(`"top_p":${req.top_p}`)
+  const head = version ? `"version":${quote(model)},` : ""
+  return "{" + head + `"input":{${input.join(",")}}}`
+}
+
+// The create-prediction POST. The key value is the API token.
+export function chatRequest(t: Target, req: ChatRequest): Upstream throws SyntaxError {
+  const key = t.key.value ?? ""
+  if (key === "") throw new SyntaxError("replicate: the key needs a value: an API token")
+  const b = t.cfg.network_config?.base_url ?? ""
+  const root = b === "" ? DEFAULT_BASE : trimSlash(b)
+  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
+  addExtraHeaders(&h, t.cfg)
+  const version = isVersion(t.model)
+  return { url: root + predictionPath(t.model), headers: h, body: chatBody(t.model, version, req) }
+}
+
+// The number after a log label such as "Input token count: 12", or 0.
+function countAfter(logs: string, label: string): int {
+  const i = logs.indexOf(label)
+  if (i < 0) return 0
+  const rest = logs.slice(i + label.byteLength).trimStart()
+  let n: int = 0
+  for (let k = 0; k < rest.byteLength; k++) {
+    const d = "0123456789".indexOf(rest.slice(k, k + 1))
+    if (d < 0) break
+    n = n * 10 + d
+  }
+  return n
+}
+
+// The output as text: a string, an array of strings (joined), or an object with "text".
+function outputText(raw: string | undefined): string throws SyntaxError {
+  if (raw === undefined || raw === "null") return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (raw.startsWith("[")) {
+    const out: string[] = []
+    for (const el of try elements(raw)) {
+      if (el.startsWith("\"")) out.push(try decodeString(el))
+    }
+    return out.join("")
+  }
+  if (raw.startsWith("{")) {
+    const ofs = try fields(raw)
+    return rawStr(ofs, "text") ?? ""
+  }
+  return ""
+}
+
+// The answer as an OpenAI chat completion, with the requested model name and token counts
+// from the logs when Replicate reports them.
+export function chatResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  const fs = try fields(text)
+  const status = rawStr(fs, "status") ?? ""
+  if (status === "failed" || status === "canceled") {
+    throw new SyntaxError(`replicate: prediction ${status}: ${rawStr(fs, "error") ?? "no error given"}`)
+  }
+  if (status !== "succeeded") {
+    throw new SyntaxError(`replicate: prediction is ${status === "" ? "unknown" : status}; the wait for a synchronous answer ended first`)
+  }
+  const content = try outputText(find(fs, "output"))
+  const created = parseIsoUtcMs(rawStr(fs, "created_at") ?? "")
+  const createdSec = created === undefined ? nowSeconds() : Math.floor(created / 1000.0)
+  const logs = rawStr(fs, "logs") ?? ""
+  const pt = countAfter(logs, "Input token count:")
+  const ct = countAfter(logs, "Output token count:")
+  const body = `{"id":${quote(rawStr(fs, "id") ?? "")},"object":"chat.completion","created":${createdSec},"model":${quote(requestedModel)},"choices":[{"index":0,"message":{"role":"assistant","content":${quote(content)}},"finish_reason":"stop"}],"usage":{"prompt_tokens":${pt},"completion_tokens":${ct},"total_tokens":${pt + ct}}}`
+  return { body: body, promptTokens: pt, completionTokens: ct }
+}
+
+// ---- tests ----
+
+test("prediction path for a model name and for a version", () => {
+  expect(predictionPath("meta/llama-3-8b-instruct")).toBe("/v1/models/meta/llama-3-8b-instruct/predictions")
+  const v = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  expect(predictionPath(v)).toBe("/v1/predictions")
+})
+
+test("chat becomes one prediction with the system text apart", () => {
+  const t: Target = { provider: "replicate", kind: "replicate", model: "meta/llama-3-8b-instruct", key: { value: "r8_x" }, cfg: {} }
+  const req: ChatRequest = { model: "replicate/meta/llama-3-8b-instruct", messages: [{ role: "system", content: "be brief" }, { role: "user", content: "hi" }], max_tokens: 5 }
+  const up = try chatRequest(t, req)
+  expect(up.url).toBe("https://api.replicate.com/v1/models/meta/llama-3-8b-instruct/predictions")
+  expect(up.headers.get("prefer")).toBe("wait")
+  expect(up.headers.get("authorization")).toBe("Bearer r8_x")
+  expect(up.body).toBe(`{"input":{"prompt":"hi","system_prompt":"be brief","max_tokens":5}}`)
+})
+
+test("DeepSeek takes the system text in the prompt, and a version id uses /v1/predictions", () => {
+  const req: ChatRequest = { model: "x", messages: [{ role: "system", content: "S" }, { role: "user", content: "U" }] }
+  expect(chatBody("deepseek-ai/deepseek-r1", false, req)).toBe(`{"input":{"prompt":"S\\n\\nU"}}`)
+  const v = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  expect(chatBody(v, true, req)).toBe(`{"version":"${v}","input":{"prompt":"U","system_prompt":"S"}}`)
+})
+
+test("a succeeded prediction becomes a chat completion with joined output and log tokens", () => {
+  const text = `{"id":"p1","status":"succeeded","created_at":"2026-10-14T13:00:00.123Z","output":["Hel","lo"],"logs":"Input token count: 12\\nOutput token count: 3"}`
+  const r = try chatResponse(text, "replicate/meta/llama")
+  expect(r.body.includes(`"content":"Hello"`)).toBe(true)
+  expect(r.body.includes(`"model":"replicate/meta/llama"`)).toBe(true)
+  expect(r.promptTokens).toBe(12)
+  expect(r.completionTokens).toBe(3)
+  expect(r.body.includes(`"created":1791982800`)).toBe(true)
+})
+
+test("a string output and a failed prediction", () => {
+  const r = try chatResponse(`{"id":"p2","status":"succeeded","output":"ok"}`, "m")
+  expect(r.body.includes(`"content":"ok"`)).toBe(true)
+  let threw = false
+  try {
+    chatResponse(`{"status":"failed","error":"boom"}`, "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    chatResponse(`{"status":"processing"}`, "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

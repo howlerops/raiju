@@ -26,6 +26,8 @@ import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
 import * as watsonx from "./providers/watsonx"
+import * as databricks from "./providers/databricks"
+import * as copilot from "./providers/githubcopilot"
 import * as metrics from "./metrics"
 import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
 import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails"
@@ -522,6 +524,9 @@ export class Engine {
   health: Health
   vertexTokens = new TokenCache()
   entraTokens: cloudAuth.TokenCache<string> = cloudAuth.stringCache()
+  // Databricks OAuth M2M tokens, and GitHub Copilot tokens ("<host>\n<token>")
+  databricksTokens: cloudAuth.TokenCache<string> = cloudAuth.stringCache()
+  copilotTokens: cloudAuth.TokenCache<string> = cloudAuth.stringCache()
   stsCreds: cloudAuth.TokenCache<cloudAuth.AssumedCreds> = cloudAuth.credsCache()
   iamTokens: Map<string, { token: string, expiresAtSec: int }> = new Map()
   guard: GuardConfig | undefined = undefined
@@ -753,6 +758,28 @@ export class Engine {
             break
           }
           t.key.value = tok.token
+        }
+        const dk = t.key.databricks_key_config
+        if (t.kind === "databricks" && (t.key.value ?? "") === "" && dk !== undefined && dk.client_id !== undefined) {
+          const tok = await this.databricksToken(t)
+          if (tok.error !== "") {
+            last = { ok: false, status: 502, body: errorJson(tok.error, "authentication_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+          t.key.value = tok.token
+        }
+        if (t.kind === "github-copilot" && (t.key.value ?? "") === "" && t.key.github_copilot_key_config !== undefined) {
+          const tok = await this.copilotToken(t)
+          if (tok.error !== "") {
+            last = { ok: false, status: 502, body: errorJson(tok.error, "authentication_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+          t.key.value = tok.token
+          let nc = t.cfg.network_config ?? {}
+          nc.base_url = tok.host
+          let pc = t.cfg
+          pc.network_config = nc
+          t.cfg = pc
         }
         if (t.kind === "azure" && t.key.azure_key_config?.tenant_id !== undefined) {
           const tok = await this.entraToken(t)
@@ -1066,6 +1093,60 @@ export class Engine {
       return { token: tok.token, error: "" }
     } catch (e) {
       return { token: "", error: `watsonx authentication failed: ${e.message}` }
+    }
+  }
+
+  // A Databricks OAuth (machine-to-machine) token for a key's client_id and client_secret.
+  async databricksToken(t: Target): Promise<{ token: string, error: string }> {
+    const dk = t.key.databricks_key_config!
+    try {
+      const host = databricks.workspaceHost(t)
+      const key = host + "|" + (dk.client_id ?? "")
+      const now = Date.now()
+      const cached = this.databricksTokens.get(key, now)
+      if (cached !== undefined) return { token: cached, error: "" }
+      const up = databricks.oauthTokenRequest(host, dk.client_id ?? "", dk.client_secret ?? "")
+      const hs: Record<string, string> = up.headers
+      const dl = deadline(10000)
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg) })
+      const text = await res.text()
+      dl.finish()
+      const tok = databricks.parseOAuthToken(text, now)
+      this.databricksTokens.put(key, tok.token, tok.expiresAtMs)
+      return { token: tok.token, error: "" }
+    } catch (e) {
+      return { token: "", error: `databricks authentication failed: ${e.message}` }
+    }
+  }
+
+  // A GitHub Copilot token and the host to call, minted from a GitHub App installation.
+  async copilotToken(t: Target): Promise<{ token: string, host: string, error: string }> {
+    const gc = t.key.github_copilot_key_config!
+    const key = gc.app_id + "|" + gc.installation_id + "|" + gc.repository_id
+    const now = Date.now()
+    const cached = this.copilotTokens.get(key, now)
+    if (cached !== undefined) {
+      const nl = cached.indexOf("\n")
+      return { host: cached.slice(0, nl), token: cached.slice(nl + 1), error: "" }
+    }
+    try {
+      const domain = gc.github_domain ?? ""
+      const api = copilot.githubApiBase(domain)
+      const jwt = copilot.appJwt(gc.app_id, gc.private_key, Math.floor(now / 1000))
+      const iu = copilot.installationTokenRequest(api, gc.installation_id, gc.repository_id, jwt)
+      const ih: Record<string, string> = iu.headers
+      const dl = deadline(10000)
+      const ir = await fetch(iu.url, { method: "POST", headers: ih, body: iu.body, signal: dl.controller.signal })
+      const inst = copilot.parseInstallationToken(await ir.text())
+      const cu = copilot.copilotTokenRequest(api, inst.token)
+      const ch: Record<string, string> = cu.headers
+      const cr = await fetch(cu.url, { method: "GET", headers: ch, signal: dl.controller.signal })
+      const tok = copilot.parseCopilotToken(await cr.text(), domain, now / 1000.0)
+      dl.finish()
+      this.copilotTokens.put(key, tok.baseURL + "\n" + tok.token, tok.expiresAtSec * 1000.0)
+      return { token: tok.token, host: tok.baseURL, error: "" }
+    } catch (e) {
+      return { token: "", host: "", error: `github copilot authentication failed: ${e.message}` }
     }
   }
 

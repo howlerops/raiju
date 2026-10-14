@@ -1,0 +1,192 @@
+// Databricks chat and embeddings. Two inference surfaces under the workspace host, both
+// OpenAI-shaped, so responses reuse openai.tov:
+//   - Model Serving at /serving-endpoints: the model is an endpoint name.
+//   - Unity AI Gateway at /ai-gateway/mlflow/v1: the model is a Unity Catalog name, and a
+//     bare name gets the "system.ai." prefix.
+// The bearer token is the key value: a personal access token, or an OAuth M2M token the
+// gateway mints with oauthTokenRequest and caches (as for Cohere and Vertex).
+import { Field, fields, find, setField, quote, build, without, rawStr, rawNum } from "../json"
+import { Target, Upstream, headers, addExtraHeaders, trimSlash } from "./types"
+import { GATEWAY_FIELDS } from "./openai"
+import { encode } from "../base64"
+import { utf8 } from "../crypto"
+import { pctEncode } from "../cloud_auth"
+
+const SERVING = "/serving-endpoints"
+const GATEWAY = "/ai-gateway/mlflow/v1"
+const SYSTEM_PREFIX = "system.ai."
+const OAUTH_PATH = "/oidc/v1/token"
+const OAUTH_SCOPE = "all-apis"
+
+// The bare host from a workspace URL, which may carry a scheme or a trailing path.
+export function normalizeHost(raw: string): string {
+  let s = raw.trim()
+  const cut = s.indexOf("://")
+  if (cut >= 0) s = s.slice(cut + 3)
+  const slash = s.indexOf("/")
+  if (slash >= 0) s = s.slice(0, slash)
+  return s
+}
+
+// The workspace host: the key's workspace_url, else the provider's base_url.
+export function workspaceHost(t: Target): string throws SyntaxError {
+  const w = t.key.databricks_key_config?.workspace_url ?? ""
+  if (w !== "") return normalizeHost(w)
+  const b = t.cfg.network_config?.base_url ?? ""
+  if (b !== "") return normalizeHost(b)
+  throw new SyntaxError("databricks: set databricks_key_config.workspace_url on the key, or a provider base_url")
+}
+
+// A name with at least two dots is a Unity Catalog name; one dot is a version ("gpt-5.5").
+function catalogQualified(model: string): bool {
+  return model.split(".").length - 1 >= 2
+}
+
+// "model_serving" or "ai_gateway": the key's api_format, else chosen by name as Bifrost does
+// (databricks-* endpoints are Model Serving; any other bare name is a system.ai model).
+export function surfaceOf(t: Target): string {
+  const f = t.key.databricks_key_config?.api_format ?? ""
+  if (f === "model_serving" || f === "ai_gateway") return f
+  if (catalogQualified(t.model)) return "ai_gateway"
+  if (t.model.toLowerCase().startsWith("databricks-")) return "model_serving"
+  return "ai_gateway"
+}
+
+// The model name sent upstream. Only a bare name on the AI Gateway is rewritten.
+export function wireModel(t: Target): string {
+  if (surfaceOf(t) !== "ai_gateway" || catalogQualified(t.model)) return t.model
+  return SYSTEM_PREFIX + t.model
+}
+
+function inferenceUrl(t: Target, suffix: string): string throws SyntaxError {
+  const host = try workspaceHost(t)
+  const base = surfaceOf(t) === "ai_gateway" ? GATEWAY : SERVING
+  return "https://" + host + base + suffix
+}
+
+// The bearer token, which must be set (a PAT, or the minted OAuth token).
+function bearer(t: Target): string throws SyntaxError {
+  const v = t.key.value ?? ""
+  if (v === "") throw new SyntaxError("databricks: the key needs a value: a personal access token, or an OAuth M2M token from client_id and client_secret")
+  return v
+}
+
+function authHeaders(t: Target): Map<string, string> throws SyntaxError {
+  const tok = try bearer(t)
+  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + tok]])
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+function withModel(t: Target, body: Field[]): string {
+  let fs = without(body, GATEWAY_FIELDS)
+  setField(&fs, "model", quote(wireModel(t)))
+  return build(fs)
+}
+
+export function chatRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const url = try inferenceUrl(t, "/chat/completions")
+  const h = try authHeaders(t)
+  return { url: url, headers: h, body: withModel(t, body) }
+}
+
+export function embeddingsRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const url = try inferenceUrl(t, "/embeddings")
+  const h = try authHeaders(t)
+  return { url: url, headers: h, body: withModel(t, body) }
+}
+
+// The POST that trades a service principal's client id and secret for an OAuth access
+// token at the workspace (client credentials, all-apis). The credentials go in Basic auth,
+// form-escaped first, as Bifrost's oauth2 client does.
+export function oauthTokenRequest(host: string, clientId: string, clientSecret: string): Upstream {
+  const basic = encode(utf8(pctEncode(clientId) + ":" + pctEncode(clientSecret)))
+  return {
+    url: "https://" + host + OAUTH_PATH,
+    headers: headers([["content-type", "application/x-www-form-urlencoded"], ["accept", "application/json"], ["authorization", "Basic " + basic]]),
+    body: "grant_type=client_credentials&scope=" + OAUTH_SCOPE,
+  }
+}
+
+// The token and its absolute expiry (epoch ms) from a token response. Without expires_in
+// it is taken as an hour.
+export function parseOAuthToken(text: string, nowMs: f64): { token: string, expiresAtMs: f64 } throws SyntaxError {
+  const fs = try fields(text)
+  const token = rawStr(fs, "access_token")
+  if (token === undefined || token === "") {
+    throw new SyntaxError(`databricks: OAuth token request failed: ${rawStr(fs, "error_description") ?? rawStr(fs, "error") ?? "no access_token"}`)
+  }
+  const secs = rawNum(fs, "expires_in") ?? 3600.0
+  return { token: token, expiresAtMs: nowMs + secs * 1000.0 }
+}
+
+// ---- tests ----
+
+test("workspace host drops scheme and path", () => {
+  expect(normalizeHost("https://adb-123.4.azuredatabricks.net/")).toBe("adb-123.4.azuredatabricks.net")
+  expect(normalizeHost("dbc-abc.cloud.databricks.com/serving-endpoints")).toBe("dbc-abc.cloud.databricks.com")
+})
+
+test("model serving endpoints keep their name and use /serving-endpoints", () => {
+  const t: Target = { provider: "databricks", kind: "databricks", model: "databricks-claude-sonnet-4-5", key: { value: "dapi", databricks_key_config: { workspace_url: "https://dbc-x.cloud.databricks.com" } }, cfg: {} }
+  const up = try chatRequest(t, try fields(`{"model":"databricks/databricks-claude-sonnet-4-5","messages":[],"fallbacks":["openai/gpt-4o"]}`))
+  expect(up.url).toBe("https://dbc-x.cloud.databricks.com/serving-endpoints/chat/completions")
+  expect(up.headers.get("authorization")).toBe("Bearer dapi")
+  expect(up.body).toBe(`{"model":"databricks-claude-sonnet-4-5","messages":[]}`)
+})
+
+test("a bare name goes to the AI Gateway with the system.ai prefix", () => {
+  const t: Target = { provider: "databricks", kind: "databricks", model: "gpt-5.5", key: { value: "dapi", databricks_key_config: { workspace_url: "dbc-x.cloud.databricks.com" } }, cfg: {} }
+  const up = try chatRequest(t, try fields(`{"messages":[]}`))
+  expect(up.url).toBe("https://dbc-x.cloud.databricks.com/ai-gateway/mlflow/v1/chat/completions")
+  expect(up.body).toBe(`{"messages":[],"model":"system.ai.gpt-5.5"}`)
+})
+
+test("catalog names and api_format override the name rule", () => {
+  const cat: Target = { provider: "databricks", kind: "databricks", model: "main.default.svc", key: { value: "d", databricks_key_config: { workspace_url: "h" } }, cfg: {} }
+  expect(surfaceOf(cat)).toBe("ai_gateway")
+  expect(wireModel(cat)).toBe("main.default.svc")
+  const pt: Target = { provider: "databricks", kind: "databricks", model: "my-throughput", key: { value: "d", databricks_key_config: { workspace_url: "h", api_format: "model_serving" } }, cfg: {} }
+  expect(surfaceOf(pt)).toBe("model_serving")
+  expect(wireModel(pt)).toBe("my-throughput")
+})
+
+test("the host falls back to base_url and a missing token is an error", () => {
+  const t: Target = { provider: "databricks", kind: "databricks", model: "databricks-x", key: { value: "d" }, cfg: { network_config: { base_url: "https://ws.example.net/" } } }
+  expect(try workspaceHost(t)).toBe("ws.example.net")
+  const none: Target = { provider: "databricks", kind: "databricks", model: "databricks-x", key: { value: "" }, cfg: { network_config: { base_url: "ws.example.net" } } }
+  let threw = false
+  try {
+    chatRequest(none, [])
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("embeddings go to the same surface", () => {
+  const t: Target = { provider: "databricks", kind: "databricks", model: "databricks-bge-large-en", key: { value: "d", databricks_key_config: { workspace_url: "h" } }, cfg: {} }
+  const up = try embeddingsRequest(t, try fields(`{"input":"x"}`))
+  expect(up.url).toBe("https://h/serving-endpoints/embeddings")
+  expect(up.body).toBe(`{"input":"x","model":"databricks-bge-large-en"}`)
+})
+
+test("OAuth M2M token request uses Basic auth and the all-apis scope", () => {
+  const up = oauthTokenRequest("dbc-x.cloud.databricks.com", "id", "sec")
+  expect(up.url).toBe("https://dbc-x.cloud.databricks.com/oidc/v1/token")
+  expect(up.headers.get("authorization")).toBe("Basic aWQ6c2Vj")
+  expect(up.body).toBe("grant_type=client_credentials&scope=all-apis")
+})
+
+test("OAuth token response gives token and expiry", () => {
+  const r = try parseOAuthToken(`{"access_token":"tok","token_type":"Bearer","expires_in":3600}`, 1000.0)
+  expect(r.token).toBe("tok")
+  expect(r.expiresAtMs).toBe(3601000.0)
+  let threw = false
+  try {
+    parseOAuthToken(`{"error":"invalid_client","error_description":"bad secret"}`, 0.0)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
