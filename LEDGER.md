@@ -176,7 +176,7 @@ content-logging control, governance model configs and provider budgets, MCP mana
 CEL variables, Azure Entra ID, Bedrock IAM roles, TLS options, Bedrock Mantle, rerank semantics,
 OTel metrics, semantic cache plugin config and vector stores, alert channels, count-token labelling.
 
-| L68 | — | Re-audit docs/parity.md against the code | worker | assigned |
+| L68 | — | Re-audit docs/parity.md against the code | worker → lead | done: 197 done, 131 partial, 152 missing of 498; three wrong claims found and fixed |
 
 Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 `flock /tmp/raiju-e2e.lock`; a worker's stray mock once broke another run.
