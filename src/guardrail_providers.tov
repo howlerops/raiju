@@ -1,0 +1,526 @@
+// External guardrail services: request builders and verdict parsers for AWS
+// Bedrock Guardrails, Azure AI Content Safety, Patronus and a generic webhook.
+// Nothing here does I/O. The gateway sends checkRequest's output, then feeds the
+// status and body back to parseVerdict. A failed call follows on_error.
+
+import { fields, elements, find, rawStr, rawNum, rawBool, quote, decodeString, isNull } from "./json"
+import { sign, encodeSegment, Credentials } from "./providers/bedrock"
+import { GuardrailProviderConfig, PatronusEvaluatorConfig } from "./config"
+
+export type PatronusEvaluator = PatronusEvaluatorConfig
+export type GuardrailProvider = GuardrailProviderConfig
+
+export type GuardrailRequest = { url: string, method: string, headers: Map<string, string>, body: string }
+
+export type Verdict = { action: "allow" | "block" | "redact", reason: string, text?: string }
+
+const BEDROCK_REGION = "us-east-1"
+const AZURE_API_VERSION = "2024-09-01"
+const AZURE_CATEGORIES = ["Hate", "SelfHarm", "Sexual", "Violence"]
+const AZURE_DEFAULT_THRESHOLD = 4
+const PATRONUS_BASE = "https://api.patronus.ai"
+
+// Whether the provider runs on this side of the exchange.
+export function appliesTo(p: GuardrailProvider, source: "input" | "output"): bool {
+  const a = p.apply_to ?? "both"
+  return a === "both" || a === source
+}
+
+function need(v: string | undefined, what: string): string throws Error {
+  if (v === undefined || v === "") throw new Error(`guardrail provider needs ${what}`)
+  return v
+}
+
+function trimSlashes(s: string): string {
+  let out = s
+  while (out.endsWith("/")) out = out.slice(0, out.byteLength - 1)
+  return out
+}
+
+// ---- requests ----
+
+// ApplyGuardrail. The path is signed like the other Bedrock calls: SigV4 with
+// service "bedrock" and the segments encoded as the signer expects.
+function bedrockRequest(p: GuardrailProvider, text: string, source: string, nowMs: f64): GuardrailRequest throws Error {
+  const id = try need(p.guardrail_id, "guardrail_id")
+  const ver = try need(p.guardrail_version, "guardrail_version")
+  const ak = try need(p.access_key, "access_key")
+  const sk = try need(p.secret_key, "secret_key")
+  const region = p.region ?? BEDROCK_REGION
+  const host = `bedrock-runtime.${region}.amazonaws.com`
+  const path = `/guardrail/${encodeSegment(id)}/version/${encodeSegment(ver)}/apply`
+  const src = source === "input" ? "INPUT" : "OUTPUT"
+  const body = `{"source":"${src}","content":[{"text":{"text":${quote(text)}}}]}`
+  const creds: Credentials = { accessKey: ak, secretKey: sk, sessionToken: p.session_token, region: region }
+  const hs = sign(creds, "bedrock", host, path, body, nowMs)
+  return { url: `https://${host}${path}`, method: "POST", headers: hs, body: body }
+}
+
+function azureRequest(p: GuardrailProvider, text: string): GuardrailRequest throws Error {
+  const endpoint = trimSlashes(try need(p.endpoint, "endpoint"))
+  const key = try need(p.api_key, "api_key")
+  const cats = p.categories ?? AZURE_CATEGORIES
+  for (const c of cats) {
+    if (!AZURE_CATEGORIES.includes(c)) throw new Error(`unknown azure content safety category: ${c}`)
+  }
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/json")
+  hs.set("Ocp-Apim-Subscription-Key", key)
+  const catJson = cats.map((c) => quote(c)).join(",")
+  const body = `{"text":${quote(text)},"categories":[${catJson}],"outputType":"FourSeverityLevels"}`
+  return { url: `${endpoint}/contentsafety/text:analyze?api-version=${AZURE_API_VERSION}`, method: "POST", headers: hs, body: body }
+}
+
+function evaluatorJson(e: PatronusEvaluator): string {
+  const c = e.criteria
+  if (c === undefined || c === "") return `{"evaluator":${quote(e.evaluator)}}`
+  return `{"evaluator":${quote(e.evaluator)},"criteria":${quote(c)}}`
+}
+
+function patronusRequest(p: GuardrailProvider, text: string, source: string): GuardrailRequest throws Error {
+  const base = trimSlashes(p.base_url ?? PATRONUS_BASE)
+  const key = try need(p.api_key, "api_key")
+  const evs = p.evaluators ?? []
+  if (evs.length === 0) throw new Error("patronus needs at least one evaluator")
+  const field = source === "input" ? "evaluated_model_input" : "evaluated_model_output"
+  const evJson = evs.map((e) => evaluatorJson(e)).join(",")
+  const body = `{"evaluators":[${evJson}],${quote(field)}:${quote(text)}}`
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/json")
+  hs.set("X-API-KEY", key)
+  return { url: `${base}/v1/evaluate`, method: "POST", headers: hs, body: body }
+}
+
+// The webhook receives {"source","text"}. Custom headers are added after the
+// defaults, so a configured Content-Type wins.
+function webhookRequest(p: GuardrailProvider, text: string, source: string): GuardrailRequest throws Error {
+  const url = try need(p.url, "url")
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/json")
+  const extra = p.headers
+  if (extra !== undefined) {
+    for (const k of extra.keys()) hs.set(k.toLowerCase(), extra.get(k)!)
+  }
+  const body = `{"source":${quote(source)},"text":${quote(text)}}`
+  return { url: url, method: "POST", headers: hs, body: body }
+}
+
+// The HTTP request for checking one text. Throws when the provider config is
+// missing a field the kind needs.
+export function checkRequest(p: GuardrailProvider, text: string, source: "input" | "output", nowMs: f64): GuardrailRequest throws Error {
+  if (p.kind === "bedrock") return try bedrockRequest(p, text, source, nowMs)
+  if (p.kind === "azure_content_safety") return try azureRequest(p, text)
+  if (p.kind === "patronus") return try patronusRequest(p, text, source)
+  if (p.kind === "webhook") return try webhookRequest(p, text, source)
+  throw new Error("unknown guardrail kind")
+}
+
+// ---- verdicts ----
+
+// Applies on_error. Allow is the default: a guardrail outage does not stop traffic.
+function onError(p: GuardrailProvider, why: string): Verdict {
+  const reason = `${p.id} guardrail error: ${why}`
+  if (p.on_error === "block") return { action: "block", reason: reason }
+  return { action: "allow", reason: reason }
+}
+
+// ApplyGuardrail response. Each assessment holds policy objects, and each
+// policy holds lists of items with an action. A BLOCKED item anywhere blocks.
+// When the only actions are ANONYMIZED PII items, the response's output text is
+// the redacted replacement.
+function bedrockVerdict(body: string): Verdict throws Error {
+  const fs = try fields(body)
+  const action = rawStr(fs, "action")
+  if (action === "NONE") return { action: "allow", reason: "" }
+  if (action !== "GUARDRAIL_INTERVENED") throw new Error("unknown bedrock action")
+  const blocked: string[] = []
+  let anonymized = 0
+  const assessments = find(fs, "assessments") ?? "[]"
+  for (const a of try elements(assessments)) {
+    for (const pol of try fields(a)) {
+      if (!pol.raw.startsWith("{")) continue
+      for (const list of try fields(pol.raw)) {
+        if (!list.raw.startsWith("[")) continue
+        for (const item of try elements(list.raw)) {
+          const f = try fields(item)
+          const act = rawStr(f, "action")
+          // name before type: a topic has both. match is left out, it can be the PII itself
+          const label = rawStr(f, "name") ?? rawStr(f, "type") ?? pol.key
+          if (act === "BLOCKED") blocked.push(label)
+          else if (act === "ANONYMIZED") anonymized += 1
+        }
+      }
+    }
+  }
+  let outText: string | undefined = undefined
+  const outputs = find(fs, "outputs")
+  if (outputs !== undefined) {
+    const first = try elements(outputs)[0]
+    if (first !== undefined) outText = rawStr(try fields(first), "text")
+  }
+  if (blocked.length === 0 && anonymized > 0 && outText !== undefined) {
+    return { action: "redact", reason: "bedrock guardrail redacted PII", text: outText }
+  }
+  const labels = blocked.length > 0 ? blocked.join(", ") : "no policy detail"
+  return { action: "block", reason: `bedrock guardrail intervened: ${labels}` }
+}
+
+// Azure returns one severity per category. Any severity at or above the
+// threshold blocks.
+function azureVerdict(p: GuardrailProvider, body: string): Verdict throws Error {
+  const thr = p.threshold ?? AZURE_DEFAULT_THRESHOLD
+  const list = find(try fields(body), "categoriesAnalysis")
+  if (list === undefined || isNull(list)) throw new Error("no categoriesAnalysis in response")
+  const hits: string[] = []
+  for (const el of try elements(list)) {
+    const f = try fields(el)
+    const cat = rawStr(f, "category") ?? "unknown"
+    const sev = rawNum(f, "severity")
+    if (sev === undefined) throw new Error("category without severity")
+    if (sev >= thr) hits.push(`${cat} severity ${sev}`)
+  }
+  if (hits.length > 0) {
+    return { action: "block", reason: `azure content safety blocked: ${hits.join(", ")} (threshold ${thr})` }
+  }
+  return { action: "allow", reason: "" }
+}
+
+// Patronus returns one result per evaluator. Any result with pass false blocks.
+function patronusVerdict(body: string): Verdict throws Error {
+  const list = find(try fields(body), "results")
+  if (list === undefined || isNull(list)) throw new Error("no results in response")
+  const failed: string[] = []
+  for (const el of try elements(list)) {
+    const f = try fields(el)
+    if (rawBool(f, "pass") !== false) continue
+    failed.push(rawStr(f, "evaluator_id") ?? rawStr(f, "evaluator") ?? rawStr(f, "criteria_name") ?? rawStr(f, "criteria") ?? "evaluator")
+  }
+  if (failed.length > 0) return { action: "block", reason: `patronus evaluator failed: ${failed.join(", ")}` }
+  return { action: "allow", reason: "" }
+}
+
+// The webhook answers {"allowed", "reason"?, "text"?}. A text on an allowed
+// result is the redacted replacement.
+function webhookVerdict(body: string): Verdict throws Error {
+  const f = try fields(body)
+  const allowed = rawBool(f, "allowed")
+  if (allowed === undefined) throw new Error("no allowed flag in response")
+  const reason = rawStr(f, "reason") ?? ""
+  if (!allowed) return { action: "block", reason: reason !== "" ? reason : "webhook guardrail denied" }
+  const text = rawStr(f, "text")
+  if (text !== undefined) return { action: "redact", reason: reason, text: text }
+  return { action: "allow", reason: reason }
+}
+
+// The verdict for a response. A non-2xx status or an unparsable body follows
+// on_error, and the reason says why.
+export function parseVerdict(p: GuardrailProvider, status: int, body: string): Verdict {
+  if (status < 200 || status > 299) return onError(p, `HTTP ${status}`)
+  try {
+    if (p.kind === "bedrock") return bedrockVerdict(body)
+    if (p.kind === "azure_content_safety") return azureVerdict(p, body)
+    if (p.kind === "patronus") return patronusVerdict(body)
+    return webhookVerdict(body)
+  } catch (e) {
+    return onError(p, `unparsable response: ${e.message}`)
+  }
+}
+
+// ---- chat text ----
+
+// Text of a message's content: a plain string, or the text parts of an array.
+function contentText(raw: string | undefined): string {
+  if (raw === undefined || isNull(raw)) return ""
+  if (raw.startsWith("[")) {
+    const parts: string[] = []
+    try {
+      for (const el of elements(raw)) {
+        const t = rawStr(fields(el), "text")
+        if (t !== undefined) parts.push(t)
+      }
+    } catch (e) {
+      return parts.join("\n")
+    }
+    return parts.join("\n")
+  }
+  if (!raw.startsWith("\"")) return ""
+  try {
+    return decodeString(raw)
+  } catch (e) {
+    return ""
+  }
+}
+
+// All message text of a chat request, one message per line. A body that is not
+// valid JSON yields "", so callers should check the body parses before scanning.
+export function extractText(chatBody: string): string {
+  try {
+    const msgs = find(fields(chatBody), "messages")
+    if (msgs === undefined || isNull(msgs)) return ""
+    const out: string[] = []
+    for (const m of elements(msgs)) {
+      const t = contentText(find(fields(m), "content"))
+      if (t !== "") out.push(t)
+    }
+    return out.join("\n")
+  } catch (e) {
+    return ""
+  }
+}
+
+// The content of the first choice of a chat completion. Empty when there is no
+// text, for example a tool call.
+export function completionText(completion: string): string {
+  try {
+    const choices = find(fields(completion), "choices")
+    if (choices === undefined || isNull(choices)) return ""
+    const first = elements(choices)[0]
+    if (first === undefined) return ""
+    const msg = find(fields(first), "message")
+    if (msg === undefined || isNull(msg)) return ""
+    return contentText(find(fields(msg), "content"))
+  } catch (e) {
+    return ""
+  }
+}
+
+// ---- tests ----
+
+function bedrockProvider(): GuardrailProvider {
+  return {
+    id: "pii-guard",
+    kind: "bedrock",
+    guardrail_id: "gr-abc123",
+    guardrail_version: "1",
+    region: "eu-west-1",
+    access_key: "AKIDEXAMPLE",
+    secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+  }
+}
+
+function azureProvider(): GuardrailProvider {
+  return { id: "azure", kind: "azure_content_safety", endpoint: "https://safety.example.cognitiveservices.azure.com/", api_key: "k1" }
+}
+
+function patronusProvider(): GuardrailProvider {
+  return { id: "pat", kind: "patronus", api_key: "pk", evaluators: [{ evaluator: "toxicity" }, { evaluator: "custom", criteria: "no-pii" }] }
+}
+
+function webhookProvider(): GuardrailProvider {
+  const h: Map<string, string> = new Map()
+  h.set("Authorization", "Bearer t")
+  h.set("Content-Type", "application/vnd.custom+json")
+  return { id: "hook", kind: "webhook", url: "https://guard.example.com/check", headers: h }
+}
+
+test("bedrock request is a signed ApplyGuardrail call", () => {
+  const r = try checkRequest(bedrockProvider(), "my card is 4111", "input", 1440938160000.0)
+  expect(r.method).toBe("POST")
+  expect(r.url).toBe("https://bedrock-runtime.eu-west-1.amazonaws.com/guardrail/gr-abc123/version/1/apply")
+  expect(r.body).toBe(`{"source":"INPUT","content":[{"text":{"text":"my card is 4111"}}]}`)
+  expect(r.headers.get("x-amz-date")).toBe("20150830T123600Z")
+  expect(r.headers.get("content-type")).toBe("application/json")
+  expect(r.headers.get("x-amz-security-token")).toBeUndefined()
+  const auth = r.headers.get("authorization")!
+  expect(auth.startsWith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/eu-west-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=")).toBe(true)
+  // signature from an independent Python hmac/hashlib computation over the same canonical request
+  expect(auth.endsWith("Signature=8995a45fb444ebc79c4c018b6a34f76a3ed5a2a34ef6b9f1759498051640b7bb")).toBe(true)
+})
+
+test("bedrock output source and session token", () => {
+  const p = bedrockProvider()
+  p.session_token = "tok"
+  p.region = undefined
+  const r = try checkRequest(p, "x", "output", 1440938160000.0)
+  expect(r.body.includes(`"source":"OUTPUT"`)).toBe(true)
+  expect(r.url.startsWith("https://bedrock-runtime.us-east-1.amazonaws.com/")).toBe(true)
+  expect(r.headers.get("x-amz-security-token")).toBe("tok")
+})
+
+test("bedrock guardrail id is percent-encoded and the signature is stable", () => {
+  const p = bedrockProvider()
+  p.guardrail_id = "a b"
+  const r = try checkRequest(p, "x", "input", 1440938160000.0)
+  expect(r.url.endsWith("/guardrail/a%20b/version/1/apply")).toBe(true)
+  const again = try checkRequest(p, "x", "input", 1440938160000.0)
+  expect(again.headers.get("authorization")).toBe(r.headers.get("authorization"))
+})
+
+test("bedrock missing fields throw", () => {
+  const p = bedrockProvider()
+  p.access_key = undefined
+  let msg = ""
+  try {
+    checkRequest(p, "x", "input", 0.0)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("guardrail provider needs access_key")
+  p.access_key = "AK"
+  p.guardrail_id = undefined
+  msg = ""
+  try {
+    checkRequest(p, "x", "input", 0.0)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("guardrail provider needs guardrail_id")
+})
+
+test("bedrock verdicts", () => {
+  const p = bedrockProvider()
+  expect(parseVerdict(p, 200, `{"action":"NONE","outputs":[],"assessments":[]}`)).toEqual({ action: "allow", reason: "" })
+  // a denied topic blocks and names the topic
+  const topic = `{"action":"GUARDRAIL_INTERVENED","outputs":[{"text":"blocked"}],"assessments":[{"topicPolicy":{"topics":[{"name":"Weapons","type":"DENY","action":"BLOCKED"}]}}]}`
+  const v = parseVerdict(p, 200, topic)
+  expect(v.action).toBe("block")
+  expect(v.reason).toBe("bedrock guardrail intervened: Weapons")
+  // only ANONYMIZED PII redacts to the output text
+  const pii = `{"action":"GUARDRAIL_INTERVENED","outputs":[{"text":"mail me at {EMAIL}"}],"assessments":[{"sensitiveInformationPolicy":{"piiEntities":[{"type":"EMAIL","match":"a@b.co","action":"ANONYMIZED"}]}}]}`
+  const rv = parseVerdict(p, 200, pii)
+  expect(rv.action).toBe("redact")
+  expect(rv.text).toBe("mail me at {EMAIL}")
+  // a BLOCKED PII entity in the same assessment blocks even with anonymized ones
+  const mixed = `{"action":"GUARDRAIL_INTERVENED","outputs":[{"text":"x"}],"assessments":[{"sensitiveInformationPolicy":{"piiEntities":[{"type":"EMAIL","match":"a@b.co","action":"ANONYMIZED"},{"type":"US_SSN","match":"123","action":"BLOCKED"}]}}]}`
+  expect(parseVerdict(p, 200, mixed).action).toBe("block")
+  expect(parseVerdict(p, 200, mixed).reason).toBe("bedrock guardrail intervened: US_SSN")
+  // intervened with nothing listed blocks
+  expect(parseVerdict(p, 200, `{"action":"GUARDRAIL_INTERVENED","outputs":[{"text":"x"}],"assessments":[]}`).action).toBe("block")
+  // an unknown action is an unparsable response, so on_error applies
+  expect(parseVerdict(p, 200, `{"action":"WHATEVER"}`).action).toBe("allow")
+})
+
+test("azure request shape", () => {
+  const r = try checkRequest(azureProvider(), "hello", "input", 0.0)
+  expect(r.url).toBe("https://safety.example.cognitiveservices.azure.com/contentsafety/text:analyze?api-version=2024-09-01")
+  expect(r.headers.get("Ocp-Apim-Subscription-Key")).toBe("k1")
+  expect(r.headers.get("content-type")).toBe("application/json")
+  expect(r.body).toBe(`{"text":"hello","categories":["Hate","SelfHarm","Sexual","Violence"],"outputType":"FourSeverityLevels"}`)
+  const p = azureProvider()
+  p.categories = ["Violence"]
+  expect((try checkRequest(p, "hi", "output", 0.0)).body).toBe(`{"text":"hi","categories":["Violence"],"outputType":"FourSeverityLevels"}`)
+  p.categories = ["Profanity"]
+  let msg = ""
+  try {
+    checkRequest(p, "hi", "output", 0.0)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("unknown azure content safety category: Profanity")
+})
+
+test("azure verdicts use the threshold", () => {
+  const p = azureProvider()
+  const ok = `{"categoriesAnalysis":[{"category":"Hate","severity":0},{"category":"Violence","severity":2}]}`
+  expect(parseVerdict(p, 200, ok)).toEqual({ action: "allow", reason: "" })
+  const bad = `{"categoriesAnalysis":[{"category":"Hate","severity":0},{"category":"Violence","severity":4},{"category":"Sexual","severity":6}]}`
+  const v = parseVerdict(p, 200, bad)
+  expect(v.action).toBe("block")
+  expect(v.reason.includes("Violence severity 4")).toBe(true)
+  expect(v.reason.includes("Sexual severity 6")).toBe(true)
+  expect(v.reason.includes("Hate")).toBe(false)
+  p.threshold = 6
+  expect(parseVerdict(p, 200, bad).reason.includes("Sexual")).toBe(true)
+  expect(parseVerdict(p, 200, bad).reason.includes("Violence")).toBe(false)
+})
+
+test("patronus request shape", () => {
+  const r = try checkRequest(patronusProvider(), "reply text", "output", 0.0)
+  expect(r.url).toBe("https://api.patronus.ai/v1/evaluate")
+  expect(r.headers.get("X-API-KEY")).toBe("pk")
+  expect(r.body).toBe(`{"evaluators":[{"evaluator":"toxicity"},{"evaluator":"custom","criteria":"no-pii"}],"evaluated_model_output":"reply text"}`)
+  const i = try checkRequest(patronusProvider(), "q", "input", 0.0)
+  expect(i.body.endsWith(`"evaluated_model_input":"q"}`)).toBe(true)
+  const p = patronusProvider()
+  p.base_url = "https://eu.example.com/"
+  expect((try checkRequest(p, "q", "input", 0.0)).url).toBe("https://eu.example.com/v1/evaluate")
+  p.evaluators = []
+  let msg = ""
+  try {
+    checkRequest(p, "q", "input", 0.0)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("patronus needs at least one evaluator")
+})
+
+test("patronus verdicts", () => {
+  const p = patronusProvider()
+  expect(parseVerdict(p, 200, `{"results":[{"evaluator_id":"toxicity","pass":true},{"evaluator_id":"custom","pass":true}]}`)).toEqual({ action: "allow", reason: "" })
+  const v = parseVerdict(p, 200, `{"results":[{"evaluator_id":"toxicity","pass":false},{"evaluator_id":"custom","pass":true}]}`)
+  expect(v).toEqual({ action: "block", reason: "patronus evaluator failed: toxicity" })
+  // a missing results array is not a clean pass
+  expect(parseVerdict(p, 200, `{}`).action).toBe("allow")
+  expect(parseVerdict(p, 200, `{}`).reason.startsWith("pat guardrail error: unparsable response")).toBe(true)
+})
+
+test("webhook request shape and headers", () => {
+  const r = try checkRequest(webhookProvider(), "hi \"there\"", "input", 0.0)
+  expect(r.url).toBe("https://guard.example.com/check")
+  expect(r.method).toBe("POST")
+  expect(r.body).toBe(`{"source":"input","text":"hi \\"there\\""}`)
+  expect(r.headers.get("authorization")).toBe("Bearer t")
+  // a configured Content-Type overrides the default
+  expect(r.headers.get("content-type")).toBe("application/vnd.custom+json")
+  const p = webhookProvider()
+  p.url = undefined
+  let msg = ""
+  try {
+    checkRequest(p, "x", "input", 0.0)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("guardrail provider needs url")
+})
+
+test("webhook verdicts", () => {
+  const p = webhookProvider()
+  expect(parseVerdict(p, 200, `{"allowed":true}`)).toEqual({ action: "allow", reason: "" })
+  expect(parseVerdict(p, 200, `{"allowed":false,"reason":"leaks keys"}`)).toEqual({ action: "block", reason: "leaks keys" })
+  expect(parseVerdict(p, 200, `{"allowed":false}`).reason).toBe("webhook guardrail denied")
+  expect(parseVerdict(p, 200, `{"allowed":true,"text":"my key is [REDACTED]"}`)).toEqual({ action: "redact", reason: "", text: "my key is [REDACTED]" })
+  expect(parseVerdict(p, 200, `{"text":"x"}`).action).toBe("allow")
+  expect(parseVerdict(p, 200, `{"text":"x"}`).reason.startsWith("hook guardrail error")).toBe(true)
+})
+
+test("non-2xx and unparsable responses follow on_error", () => {
+  const p = webhookProvider()
+  const allow = parseVerdict(p, 503, "upstream down")
+  expect(allow.action).toBe("allow")
+  expect(allow.reason).toBe("hook guardrail error: HTTP 503")
+  p.on_error = "block"
+  expect(parseVerdict(p, 503, "").action).toBe("block")
+  expect(parseVerdict(p, 200, "not json").action).toBe("block")
+  expect(parseVerdict(p, 199, `{"allowed":true}`).action).toBe("block")
+  p.on_error = "allow"
+  expect(parseVerdict(p, 200, "not json").action).toBe("allow")
+  const az = azureProvider()
+  expect(parseVerdict(az, 401, `{"error":{}}`).reason.includes("HTTP 401")).toBe(true)
+  expect(parseVerdict(az, 200, `{"categoriesAnalysis":[{"category":"Hate"}]}`).reason.includes("without severity")).toBe(true)
+})
+
+test("applies_to", () => {
+  const p = webhookProvider()
+  expect(appliesTo(p, "input")).toBe(true)
+  p.apply_to = "output"
+  expect(appliesTo(p, "input")).toBe(false)
+  expect(appliesTo(p, "output")).toBe(true)
+  p.apply_to = "both"
+  expect(appliesTo(p, "input")).toBe(true)
+})
+
+test("extract text from chat bodies", () => {
+  const body = `{"model":"x","messages":[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}},{"type":"text","text":"there"}]},{"role":"assistant","content":null,"tool_calls":[]},{"role":"tool","tool_call_id":"t","content":"42 \\"quoted\\""}]}`
+  expect(extractText(body)).toBe("be brief\nhi\nthere\n42 \"quoted\"")
+  expect(extractText(`{"messages":[]}`)).toBe("")
+  expect(extractText(`{"nope":1}`)).toBe("")
+  expect(extractText("[oops")).toBe("")
+})
+
+test("completion text is the first choice", () => {
+  const c = `{"id":"1","choices":[{"index":0,"message":{"role":"assistant","content":"yes \\u00e9"}},{"index":1,"message":{"content":"no"}}]}`
+  expect(completionText(c)).toBe("yes é")
+  expect(completionText(`{"choices":[{"message":{"content":null,"tool_calls":[]}}]}`)).toBe("")
+  expect(completionText(`{"choices":[]}`)).toBe("")
+  expect(completionText(`{"usage":{}}`)).toBe("")
+})

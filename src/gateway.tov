@@ -12,6 +12,7 @@ import * as cplx from "./complexity"
 import { AgentConfig, runAgent } from "./agent"
 import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
+import { GuardrailProvider, appliesTo, checkRequest, parseVerdict, extractText, completionText } from "./guardrail_providers"
 import { Target, Upstream, Translated, proxyOf, RS } from "./providers/types"
 import { ModelRef, parseModel, target, classify, backoffMs, maxRetries, timeoutMs, healthId } from "./router"
 import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
@@ -167,6 +168,48 @@ export class StreamConverter {
 
   completionTokens(): int {
     return this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.co?.outTokens ?? this.oa?.completionTokens ?? 0
+  }
+}
+
+// The chat body with its only message's text replaced, or undefined when there isn't exactly
+// one message with string content.
+function singleTextMessage(chatBody: string, replacement: string): string | undefined {
+  try {
+    let fs = fields(chatBody)
+    const msgs = find(fs, "messages")
+    if (msgs === undefined) return undefined
+    const els = elements(msgs)
+    if (els.length !== 1) return undefined
+    let m = fields(els[0]!)
+    const c = find(m, "content")
+    if (c === undefined || !c.startsWith("\"")) return undefined
+    setField(&m, "content", quote(replacement))
+    setField(&fs, "messages", "[" + build(m) + "]")
+    return build(fs)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// A chat completion with its first choice's message content replaced.
+function replaceFirstContent(completion: string, text: string): string {
+  try {
+    let fs = fields(completion)
+    const choices = find(fs, "choices")
+    if (choices === undefined) return completion
+    const els = elements(choices)
+    if (els.length === 0) return completion
+    let c = fields(els[0]!)
+    const mraw = find(c, "message")
+    if (mraw === undefined) return completion
+    let m = fields(mraw)
+    setField(&m, "content", quote(text))
+    setField(&c, "message", build(m))
+    const rest = els.slice(1)
+    setField(&fs, "choices", "[" + [build(c)].concat(rest).join(",") + "]")
+    return build(fs)
+  } catch (e) {
+    return completion
   }
 }
 
@@ -327,6 +370,7 @@ export class Engine {
   samples: SampleRing | undefined = undefined
   // set by the exporters loop: every logged request is queued for each exporter
   exportQueues: ExportQueue[] = []
+  guardProviders: GuardrailProvider[] = []
 
   constructor(public cfg: Config) {
     this.gov = new Governance(cfg)
@@ -400,6 +444,7 @@ export class Engine {
     }
     this.autoPromptCache = cfg.prompt_cache?.auto_inject ?? false
     this.logRequests = cfg.client?.enable_logging ?? true
+    this.guardProviders = cfg.guardrails?.providers ?? []
     const sa = cfg.session_affinity
     if (sa !== undefined && sa.enabled === true) {
       this.affinity = new AffinityStore({ enabled: true, ttl_ms: (sa.ttl_seconds ?? 3600) * 1000, max_sessions: sa.max_sessions ?? 100000 })
@@ -408,6 +453,40 @@ export class Engine {
     if (cx !== undefined && cx.enabled !== false) this.complexity = cx
     const auto = cfg.client?.mcp_auto_execute ?? []
     if (auto.length > 0) this.agent = { max_depth: cfg.client?.mcp_agent_depth ?? 10, auto_execute: auto, parallel: true }
+  }
+
+  // Asks every external guardrail that covers `source` about `text`; stops at the first block.
+  async externalGuard(text: string, source: "input" | "output"): Promise<{ action: string, reason: string, text?: string }> {
+    let out: { action: string, reason: string, text?: string } = { action: "allow", reason: "" }
+    for (const p of this.guardProviders) {
+      if (!appliesTo(p, source)) continue
+      let status = 0
+      let body = ""
+      try {
+        const r = checkRequest(p, text, source, Date.now())
+        const hs: Record<string, string> = r.headers
+        const dl = deadline(10000)
+        try {
+          const res = await fetch(r.url, { method: r.method, headers: hs, body: r.body, signal: dl.controller.signal })
+          status = res.status
+          body = await res.text()
+        } catch (e) {
+          status = 0
+        }
+        dl.finish()
+      } catch (e) {
+        status = 0
+      }
+      const v = parseVerdict(p, status, body)
+      metrics.inc("raiju_guardrail_checks_total", metrics.labels("", p.id, v.action), 1.0)
+      if (v.action === "block") return { action: "block", reason: `${p.id}: ${v.reason}` }
+      const red = v.text
+      if (v.action === "redact" && red !== undefined) {
+        text = red
+        out = { action: "redact", reason: `${p.id}: ${v.reason}`, text: red }
+      }
+    }
+    return out
   }
 
   // Remembers the key that served a session, so its next requests go to the same key.
@@ -634,6 +713,7 @@ export class Engine {
     this.plugins = fresh.plugins
     this.logRequests = fresh.logRequests
     this.complexity = fresh.complexity
+    this.guardProviders = fresh.guardProviders
     this.agent = fresh.agent
     if (fresh.affinity === undefined) this.affinity = undefined
     else if (this.affinity === undefined) this.affinity = fresh.affinity
@@ -1042,6 +1122,17 @@ export class Engine {
         }
         text = g.body
       }
+      if (this.guardProviders.length > 0) {
+        const v = await this.externalGuard(extractText(text), "input")
+        if (v.action === "block") return errorResponse(400, `request blocked by guardrails: ${v.reason}`, "guardrail_violation", noHeaders())
+        const red = v.text
+        // a redaction replaces the prompt when it is a single text message; otherwise it can't be placed
+        if (red !== undefined) {
+          const one = singleTextMessage(text, red)
+          if (one === undefined) return errorResponse(400, `request blocked by guardrails: ${v.reason} (redaction needs a single text message)`, "guardrail_violation", noHeaders())
+          text = one
+        }
+      }
       text = try this.withMcpTools(text, snapshot(req.headers))
       body = fields(text)
       // a key's access profile may cap max_tokens
@@ -1146,7 +1237,25 @@ export class Engine {
       if (!streamable(t)) return undefined
       return new StreamConverter(converterKind(t), requested, !dropUsage)
     }
-    return try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
+    const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
+    // external output guardrails see the whole answer, so they apply to non-streamed answers
+    if (this.guardProviders.length === 0 || stream || res.status !== 200) return res
+    let answer = ""
+    try {
+      answer = await res.text()
+    } catch (e) {
+      return errorResponse(502, `could not read the answer: ${e.message}`, "api_error", noHeaders())
+    }
+    const v = await this.externalGuard(completionText(answer), "output")
+    if (v.action === "block") return errorResponse(400, `response blocked by guardrails: ${v.reason}`, "guardrail_violation", noHeaders())
+    let out = answer
+    const red = v.text
+    if (red !== undefined) out = replaceFirstContent(answer, red)
+    const hs: Record<string, string> = new Map()
+    res.headers.forEach((value, key) => {
+      if (key !== "content-length") hs.set(key, value)
+    })
+    return new Response(out, { status: 200, headers: hs })
   }
 
   async embeddings(req: Request): Promise<Response> {

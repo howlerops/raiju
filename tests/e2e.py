@@ -504,6 +504,14 @@ def main():
         s, _, _ = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
         check("MCP server refuses requests without a session", s == 400)
 
+        # external guardrails (a webhook provider)
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "tell me something forbidden"}]})
+        check("an external guardrail blocks a prompt", s == 400 and "forbidden topic" in b and "policy-hook" in b, (s, b))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "my secret-word"}]})
+        check("an external guardrail redacts a prompt", s == 200 and json.loads(seen()[-1]["body"])["messages"][0]["content"] == "my [REDACTED]", seen()[-1]["body"][:200])
+        s, _, b = chat("openai/forbidden-model", seed=1200)
+        check("an external guardrail blocks an answer", s == 400 and "response blocked" in b, (s, b))
+
         # access profiles: one policy shared by keys
         PK = {"x-bf-vk": "sk-bf-profiled"}
         s, _, b = chat("openai/gpt-4o-mini", headers=PK, seed=1100)
