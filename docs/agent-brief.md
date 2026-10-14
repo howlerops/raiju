@@ -14,7 +14,9 @@ file before writing code. Your task message says exactly which files you own.
 3. **Tests:** put `test("...", () => { ... })` blocks at the bottom of your
    module. Run `tov test <file>`. Every test must pass. Cover the edge cases in
    your task's acceptance criteria. Tests must be synchronous (no `await` in tests).
-4. Build with `TOV_CFLAGS=-DTV_PLAIN_ALLOC` if you build a binary (`tov build`).
+4. Use the patched compiler: `export TOV=/home/user/raiju/build/tov/target/release/tov`
+   (scripts/check.py honours it) and run tests with `$TOV test <file>`. Build with
+   `TOV_CFLAGS=-DTV_PLAIN_ALLOC` if you build a binary.
 5. **Do not commit, push or create branches.** Leave your files in the working tree.
 6. Don't mention AI assistants, agents or models in code or comments.
 7. Match the existing style: 2-space indent, no semicolons, short comments that
