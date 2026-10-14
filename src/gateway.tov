@@ -1,6 +1,6 @@
 // The request engine: governance, cache, the attempt loop (retries, key
 // rotation, fallbacks), translation, accounting.
-import { Config, ProviderConfig, ComplexitySettings, providerOf } from "./config"
+import { Config, ProviderConfig, ComplexitySettings, BedrockKeyConfig, providerOf } from "./config"
 import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, snapshot } from "./schemas"
 import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI } from "./streams"
@@ -35,6 +35,7 @@ import { PluginChain, PluginContext, buildChain } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey } from "./semcache"
 import { Deadline, deadline } from "./deadline"
 import { VectorStore, openVectorStore } from "./vectorstore"
+import * as cloudAuth from "./cloud_auth"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
@@ -399,6 +400,8 @@ export class Engine {
   gov: Governance
   health: Health
   vertexTokens = new TokenCache()
+  entraTokens: cloudAuth.TokenCache<string> = cloudAuth.stringCache()
+  stsCreds: cloudAuth.TokenCache<cloudAuth.AssumedCreds> = cloudAuth.credsCache()
   iamTokens: Map<string, { token: string, expiresAtSec: int }> = new Map()
   guard: GuardConfig | undefined = undefined
   rules: RuleSet | undefined = undefined
@@ -624,6 +627,28 @@ export class Engine {
             break
           }
           t.key.value = tok.token
+        }
+        if (t.kind === "azure" && t.key.azure_key_config?.tenant_id !== undefined) {
+          const tok = await this.entraToken(t)
+          if (tok.error !== "") {
+            last = { ok: false, status: 502, body: errorJson(tok.error, "authentication_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+          t.key.value = tok.token
+        }
+        const bk = t.key.bedrock_key_config
+        if ((t.kind === "bedrock" || t.kind === "bedrock_mantle") && bk !== undefined && bk.role_arn !== undefined) {
+          const ar = await this.assumeRole(bk)
+          if (ar.error !== "") {
+            last = { ok: false, status: 502, body: errorJson(ar.error, "authentication_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+          let nb = bk
+          nb.access_key = ar.creds!.accessKey
+          nb.secret_key = ar.creds!.secretKey
+          nb.session_token = ar.creds!.sessionToken
+          nb.role_arn = undefined
+          t.key.bedrock_key_config = nb
         }
         if (t.kind === "vertex") {
           const tok = await this.vertexToken(t)
@@ -904,6 +929,51 @@ export class Engine {
       return { token: tok.token, error: "" }
     } catch (e) {
       return { token: "", error: `watsonx authentication failed: ${e.message}` }
+    }
+  }
+
+  // An Entra ID access token for an Azure key with a service principal, cached until a minute before it expires.
+  async entraToken(t: Target): Promise<{ token: string, error: string }> {
+    const az = t.key.azure_key_config!
+    const key = (az.tenant_id ?? "") + "/" + (az.client_id ?? "")
+    const now = Date.now()
+    const cached = this.entraTokens.get(key, now)
+    if (cached !== undefined) return { token: cached, error: "" }
+    try {
+      const up = cloudAuth.entraTokenRequest(az.tenant_id ?? "", az.client_id ?? "", az.client_secret ?? "", az.scopes ?? [])
+      const hs: Record<string, string> = up.headers
+      const dl = deadline(10000)
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal })
+      const text = await res.text()
+      dl.finish()
+      const tok = cloudAuth.parseTokenResponse(text, now)
+      this.entraTokens.put(key, tok.token, tok.expiresAtMs)
+      return { token: tok.token, error: "" }
+    } catch (e) {
+      return { token: "", error: `azure entra authentication failed: ${e.message}` }
+    }
+  }
+
+  // Temporary credentials for a Bedrock key's role_arn (STS AssumeRole), cached until they near expiry.
+  async assumeRole(bk: BedrockKeyConfig): Promise<{ creds?: cloudAuth.AssumedCreds, error: string }> {
+    const role = bk.role_arn ?? ""
+    const session = bk.session_name ?? "bifrost-session"
+    const key = role + "|" + (bk.external_id ?? "") + "|" + session
+    const now = Date.now()
+    const cached = this.stsCreds.get(key, now)
+    if (cached !== undefined) return { creds: cached, error: "" }
+    try {
+      const up = cloudAuth.assumeRoleRequest({ accessKey: bk.access_key ?? "", secretKey: bk.secret_key ?? "", sessionToken: bk.session_token }, bk.region ?? "us-east-1", role, bk.external_id, session, 3600, now)
+      const hs: Record<string, string> = up.headers
+      const dl = deadline(10000)
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal })
+      const text = await res.text()
+      dl.finish()
+      const creds = cloudAuth.parseAssumeRole(text)
+      this.stsCreds.put(key, creds, creds.expiresAtMs)
+      return { creds: creds, error: "" }
+    } catch (e) {
+      return { error: `bedrock assume-role failed: ${e.message}` }
     }
   }
 

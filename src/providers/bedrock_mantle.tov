@@ -1,0 +1,171 @@
+// Bedrock Mantle: Bedrock's OpenAI-compatible endpoint on bedrock-mantle.<region>.api.aws,
+// which serves gpt-*, Gemma and Grok models. The OpenAI body goes out with only the model
+// rewritten, so the reply is openai.tov's. Anthropic-family models use the native Messages
+// surface on the same host, which this module does not translate.
+import { Field, build, fields, quote, setField, without } from "../json"
+import { Target, Upstream, Translated, headers, addExtraHeaders } from "./types"
+import * as openai from "./openai"
+import { AwsCreds, signV4 } from "../cloud_auth"
+import { BedrockKeyConfig } from "../config"
+
+const DEFAULT_REGION = "us-east-1"
+const SIGNING_SERVICE = "bedrock-mantle"
+
+// A region name such as "us-west-2": lower-case letters and digits, hyphens, ending in a digit.
+function isRegion(s: string): bool {
+  if (s.indexOf("-") < 0) return false
+  if (!"0123456789".includes(s.slice(s.byteLength - 1))) return false
+  for (const c of s.chars()) {
+    if (!"abcdefghijklmnopqrstuvwxyz0123456789-".includes(c)) return false
+  }
+  return true
+}
+
+// Splits Bifrost's per-request "region/model" form. The region is undefined when the
+// model has no such prefix.
+export function splitRegion(model: string): { region: string | undefined, model: string } {
+  const slash = model.indexOf("/")
+  if (slash > 0 && isRegion(model.slice(0, slash))) {
+    return { region: model.slice(0, slash), model: model.slice(slash + 1) }
+  }
+  return { region: undefined, model: model }
+}
+
+// The OpenAI-compatible base path. gpt-5/6, Gemma 4 and Grok are served under
+// /openai/v1, the rest under /v1 (as Bifrost's fallback routing does).
+export function basePath(model: string): string {
+  const m = model.toLowerCase()
+  if (m.includes("gpt-5") || m.includes("gpt-6") || m.includes("gemma-4") || m.includes("grok")) return "openai/v1"
+  return "v1"
+}
+
+export function isAnthropicFamily(model: string): bool {
+  const m = model.toLowerCase()
+  return m.startsWith("anthropic.") || m.includes("claude")
+}
+
+// The OpenAI body with gateway-only fields dropped and the model set to the name
+// Mantle knows (sent verbatim, with no regional prefix).
+function withModel(body: Field[], model: string): string {
+  let fs = without(body, openai.GATEWAY_FIELDS)
+  setField(&fs, "model", quote(model))
+  return build(fs)
+}
+
+// The chat POST at a given time. Bearer auth when the key has a value; otherwise SigV4
+// with the key's access keys, signed for service "bedrock-mantle".
+export function chatRequestAt(t: Target, body: Field[], nowMs: f64): Upstream throws SyntaxError {
+  const sel = splitRegion(t.model)
+  if (isAnthropicFamily(sel.model)) {
+    throw new SyntaxError("bedrock_mantle: Anthropic-family models use the native Messages surface, which this provider does not translate")
+  }
+  const bk = t.key.bedrock_key_config
+  const region = sel.region ?? bk?.region ?? DEFAULT_REGION
+  const host = `bedrock-mantle.${region}.api.aws`
+  const path = `/${basePath(sel.model)}/chat/completions`
+  const text = withModel(body, sel.model)
+  const extra = t.cfg.network_config?.extra_headers
+  const bearer = t.key.value ?? ""
+  if (bearer !== "") {
+    let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + bearer]])
+    addExtraHeaders(&h, t.cfg)
+    return { url: `https://${host}${path}`, headers: h, body: text }
+  }
+  const ak = bk?.access_key ?? ""
+  if (ak === "") throw new SyntaxError("bedrock_mantle: the key needs a value (API key) or access_key and secret_key")
+  // x-amz-* extra headers are part of the signature; the rest are added after signing
+  const signedExtra: string[][] = [["accept", "application/json"]]
+  if (extra !== undefined) {
+    for (const k of extra.keys()) {
+      const lk = k.toLowerCase()
+      if (lk.startsWith("x-amz-")) signedExtra.push([lk, extra.get(k)!])
+    }
+  }
+  const creds: AwsCreds = { accessKey: ak, secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token ?? "" }
+  const h = signV4(creds, region, SIGNING_SERVICE, host, path, "application/json", text, nowMs, signedExtra)
+  if (extra !== undefined) {
+    for (const k of extra.keys()) {
+      if (!k.toLowerCase().startsWith("x-amz-")) h.set(k, extra.get(k)!)
+    }
+  }
+  return { url: `https://${host}${path}`, headers: h, body: text }
+}
+
+export function chatRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  return try chatRequestAt(t, body, Date.now())
+}
+
+// Mantle answers in the OpenAI shape, so the reply is translated by openai.tov.
+export function chatResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  return try openai.chatResponse(text, requestedModel)
+}
+
+function mantleTarget(model: string, value: string, region: string | undefined): Target {
+  const bk: BedrockKeyConfig | undefined = region === undefined ? undefined : { access_key: "AKIDEXAMPLE", secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", region: region }
+  return { provider: "bedrock_mantle", kind: "bedrock_mantle", model: model, key: { value: value, bedrock_key_config: bk }, cfg: {} }
+}
+
+test("base path follows the model family", () => {
+  expect(basePath("openai.gpt-5.5")).toBe("openai/v1")
+  expect(basePath("openai.gpt-6-luna")).toBe("openai/v1")
+  expect(basePath("google.gemma-4-31b")).toBe("openai/v1")
+  expect(basePath("openai.gpt-oss-120b")).toBe("v1")
+  expect(basePath("deepseek.v3.2")).toBe("v1")
+})
+
+test("a region prefix on the model selects the region", () => {
+  const a = splitRegion("us-west-2/openai.gpt-5.5")
+  expect(a.region).toBe("us-west-2")
+  expect(a.model).toBe("openai.gpt-5.5")
+  const b = splitRegion("openai.gpt-5.5")
+  expect(b.region).toBeUndefined()
+  expect(b.model).toBe("openai.gpt-5.5")
+  expect(splitRegion("zai/glm").region).toBeUndefined()
+})
+
+test("bearer request goes to the regional OpenAI-compatible path", () => {
+  const body = try fields(`{"model":"gpt","messages":[{"role":"user","content":"hi"}],"max_tokens":5,"fallbacks":["x"],"provider":"p"}`)
+  const up = try chatRequestAt(mantleTarget("openai.gpt-5.5", "mk-123", undefined), body, 1440938160000.0)
+  expect(up.url).toBe("https://bedrock-mantle.us-east-1.api.aws/openai/v1/chat/completions")
+  expect(up.headers.get("authorization")).toBe("Bearer mk-123")
+  expect(up.headers.get("content-type")).toBe("application/json")
+  expect(up.body).toBe(`{"model":"openai.gpt-5.5","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`)
+})
+
+test("sigv4 request is signed for bedrock-mantle in the key's region", () => {
+  const body = try fields(`{"model":"gpt","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`)
+  const up = try chatRequestAt(mantleTarget("us-west-2/openai.gpt-oss-120b", "", "us-west-2"), body, 1440938160000.0)
+  expect(up.url).toBe("https://bedrock-mantle.us-west-2.api.aws/v1/chat/completions")
+  expect(up.headers.get("x-amz-date")).toBe("20150830T123600Z")
+  expect(up.headers.has("host")).toBe(false)
+  expect(up.headers.has("authorization")).toBe(true)
+  const auth = up.headers.get("authorization")!
+  expect(auth.startsWith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-west-2/bedrock-mantle/aws4_request, SignedHeaders=accept;content-type;host;x-amz-date, Signature=")).toBe(true)
+  // reference from a Python hmac/hashlib implementation (scratch script, not in the repo)
+  expect(auth.endsWith("Signature=f66fd317c719543a2834ca8cbe1b1c415802039f809c5dec4f4c45b47fecc151")).toBe(true)
+})
+
+test("claude-family and keyless requests are refused", () => {
+  const body = try fields(`{"model":"gpt","messages":[]}`)
+  let msg = ""
+  try {
+    chatRequestAt(mantleTarget("anthropic.claude-haiku-4-5", "mk", undefined), body, 0.0)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg.includes("native Messages surface")).toBe(true)
+  msg = ""
+  try {
+    chatRequestAt(mantleTarget("openai.gpt-5.5", "", undefined), body, 0.0)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg.includes("needs a value")).toBe(true)
+})
+
+test("mantle chat reply is read as an OpenAI reply", () => {
+  const r = try chatResponse(`{"id":"x","object":"chat.completion","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`, "bedrock_mantle/openai.gpt-5.5")
+  expect(r.promptTokens).toBe(3)
+  expect(r.completionTokens).toBe(4)
+  expect(r.body.includes(`"model":"bedrock_mantle/openai.gpt-5.5"`)).toBe(true)
+})

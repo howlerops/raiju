@@ -1,0 +1,291 @@
+// Cloud credentials beyond static keys: Microsoft Entra ID client-credentials tokens
+// for Azure, AWS STS AssumeRole credentials for Bedrock, and a small token cache that
+// keeps both until shortly before they expire.
+import { fields, rawStr, rawNum } from "./json"
+import { Upstream, headers } from "./providers/types"
+import { utf8, sha256, hmacSha256, toHex } from "./crypto"
+import { amzDate } from "./providers/bedrock"
+
+// Tokens are reused only while more than this much of their life is left.
+const CACHE_MARGIN_MS = 60000.0
+
+const ENTRA_DEFAULT_SCOPE = "https://cognitiveservices.azure.com/.default"
+const STS_API_VERSION = "2011-06-15"
+
+const UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+const HEXU = "0123456789ABCDEF"
+
+// RFC 3986 percent-encoding of s: each character outside the unreserved set becomes
+// the %XX escapes of its UTF-8 bytes.
+export function pctEncode(s: string): string {
+  const out: string[] = []
+  for (const c of s.chars()) {
+    if (UNRESERVED.includes(c)) {
+      out.push(c)
+      continue
+    }
+    for (const b of utf8(c)) {
+      const v = int(b)
+      out.push("%" + HEXU.slice(v >> 4, (v >> 4) + 1) + HEXU.slice(v & 15, (v & 15) + 1))
+    }
+  }
+  return out.join("")
+}
+
+// ---- Entra ID (client credentials) ----
+
+// The POST that exchanges a client secret for an access token. An empty scopes
+// list means the default Cognitive Services scope; configured scopes replace it.
+export function entraTokenRequest(tenantId: string, clientId: string, clientSecret: string, scopes: string[]): Upstream {
+  const list = scopes.length === 0 ? [ENTRA_DEFAULT_SCOPE] : scopes
+  const body = `grant_type=client_credentials&client_id=${pctEncode(clientId)}&client_secret=${pctEncode(clientSecret)}&scope=${pctEncode(list.join(" "))}`
+  return {
+    url: `https://login.microsoftonline.com/${pctEncode(tenantId)}/oauth2/v2.0/token`,
+    headers: headers([["content-type", "application/x-www-form-urlencoded"]]),
+    body: body,
+  }
+}
+
+// The access token and its absolute expiry from a token response. A response without
+// expires_in is given Entra's usual one hour.
+export function parseTokenResponse(text: string, nowMs: f64): { token: string, expiresAtMs: f64 } throws SyntaxError {
+  const fs = try fields(text)
+  const token = rawStr(fs, "access_token")
+  if (token === undefined || token === "") {
+    throw new SyntaxError(`entra: token request failed: ${rawStr(fs, "error_description") ?? rawStr(fs, "error") ?? "no access_token"}`)
+  }
+  const secs = rawNum(fs, "expires_in") ?? 3600.0
+  return { token: token, expiresAtMs: nowMs + secs * 1000.0 }
+}
+
+// ---- AWS SigV4 ----
+
+export type AwsCreds = { accessKey: string, secretKey: string, sessionToken?: string }
+
+// Headers for a signed POST. `contentType` and `extra` (lower-case names, e.g. accept
+// or x-amz-*) are signed. The host is signed but left out of the result, since fetch
+// sets it. The result carries authorization, x-amz-date and the security token.
+export function signV4(creds: AwsCreds, region: string, service: string, host: string, path: string, contentType: string, body: string, nowMs: f64, extra: string[][]): Map<string, string> {
+  const date = amzDate(nowMs)
+  const day = date.slice(0, 8)
+  const hs: string[][] = [["content-type", contentType], ["host", host], ["x-amz-date", date]]
+  for (const e of extra) hs.push(e)
+  const token = creds.sessionToken
+  if (token !== undefined && token !== "") hs.push(["x-amz-security-token", token])
+  // canonical headers are sorted by name
+  hs.sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0))
+  const canonicalPath = path.split("/").map((seg) => pctEncode(seg)).join("/")
+  const canonicalHeaders = hs.map((h) => `${h[0]!}:${h[1]!}\n`).join("")
+  const signed = hs.map((h) => h[0]!).join(";")
+  const payloadHash = toHex(sha256(utf8(body)))
+  const canonical = `POST\n${canonicalPath}\n\n${canonicalHeaders}\n${signed}\n${payloadHash}`
+  const scope = `${day}/${region}/${service}/aws4_request`
+  const toSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${toHex(sha256(utf8(canonical)))}`
+  const kDate = hmacSha256(utf8("AWS4" + creds.secretKey), utf8(day))
+  const kRegion = hmacSha256(kDate, utf8(region))
+  const kService = hmacSha256(kRegion, utf8(service))
+  const kSigning = hmacSha256(kService, utf8("aws4_request"))
+  const signature = toHex(hmacSha256(kSigning, utf8(toSign)))
+  const out: Map<string, string> = new Map()
+  for (const h of hs) {
+    if (h[0] !== "host") out.set(h[0]!, h[1]!)
+  }
+  out.set("authorization", `AWS4-HMAC-SHA256 Credential=${creds.accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}`)
+  return out
+}
+
+// ---- STS AssumeRole ----
+
+// The AssumeRole POST to the regional STS endpoint. The form body is signed as
+// service "sts". externalId is sent only when it is set and not empty.
+export function assumeRoleRequest(creds: AwsCreds, region: string, roleArn: string, externalId: string | undefined, sessionName: string, durationSeconds: int, nowMs: f64): Upstream {
+  const pairs: string[][] = [["Action", "AssumeRole"], ["Version", STS_API_VERSION], ["RoleArn", roleArn], ["RoleSessionName", sessionName], ["DurationSeconds", `${durationSeconds}`]]
+  if (externalId !== undefined && externalId !== "") pairs.push(["ExternalId", externalId])
+  const body = pairs.map((p) => `${p[0]!}=${pctEncode(p[1]!)}`).join("&")
+  const host = `sts.${region}.amazonaws.com`
+  const contentType = "application/x-www-form-urlencoded; charset=utf-8"
+  const hs = signV4(creds, region, "sts", host, "/", contentType, body, nowMs, [])
+  return { url: `https://${host}/`, headers: hs, body: body }
+}
+
+// The text inside the first <tag>...</tag> of xml, with the five predefined entities
+// decoded. undefined when the tag is absent.
+export function xmlTag(xml: string, tag: string): string | undefined {
+  const open = `<${tag}>`
+  const start = xml.indexOf(open)
+  if (start < 0) return undefined
+  const from = start + open.byteLength
+  const rel = xml.slice(from).indexOf(`</${tag}>`)
+  if (rel < 0) return undefined
+  return xml.slice(from, from + rel).replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", "\"").replaceAll("&apos;", "'").replaceAll("&amp;", "&")
+}
+
+// Days since 1970-01-01 for a proleptic Gregorian date (H. Hinnant's days_from_civil).
+function daysFromCivil(y: int, m: int, d: int): int {
+  const yy = m <= 2 ? y - 1 : y
+  const era = Math.floor(yy / 400)
+  const yoe = yy - era * 400
+  const mp = m > 2 ? m - 3 : m + 9
+  const doy = Math.floor((153 * mp + 2) / 5) + d - 1
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+}
+
+// Epoch milliseconds for an ISO 8601 UTC timestamp such as "2015-08-30T13:36:00Z".
+// Fractional seconds are accepted and ignored. undefined when the text does not fit.
+export function parseIsoUtcMs(s: string): f64 | undefined {
+  if (s.byteLength < 20 || !s.endsWith("Z")) return undefined
+  const y = parseInt(s.slice(0, 4))
+  const mo = parseInt(s.slice(5, 7))
+  const d = parseInt(s.slice(8, 10))
+  const h = parseInt(s.slice(11, 13))
+  const mi = parseInt(s.slice(14, 16))
+  const se = parseInt(s.slice(17, 19))
+  if (y === undefined || mo === undefined || d === undefined || h === undefined || mi === undefined || se === undefined) return undefined
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return undefined
+  const secs = daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se
+  return secs * 1000.0
+}
+
+export type AssumedCreds = { accessKey: string, secretKey: string, sessionToken: string, expiresAtMs: f64 }
+
+// The temporary credentials from an AssumeRole response. An <Error> response
+// throws with its message.
+export function parseAssumeRole(xml: string): AssumedCreds throws SyntaxError {
+  const creds = xmlTag(xml, "Credentials")
+  if (creds === undefined) {
+    throw new SyntaxError(`sts: AssumeRole failed: ${xmlTag(xml, "Message") ?? "no Credentials in the response"}`)
+  }
+  const accessKey = xmlTag(creds, "AccessKeyId")
+  const secretKey = xmlTag(creds, "SecretAccessKey")
+  const sessionToken = xmlTag(creds, "SessionToken")
+  const exp = xmlTag(creds, "Expiration")
+  if (accessKey === undefined || secretKey === undefined || sessionToken === undefined || exp === undefined) {
+    throw new SyntaxError("sts: AssumeRole response is missing a credential field")
+  }
+  const expiresAtMs = parseIsoUtcMs(exp)
+  if (expiresAtMs === undefined) throw new SyntaxError("sts: AssumeRole Expiration is not an ISO 8601 UTC time")
+  return { accessKey: accessKey, secretKey: secretKey, sessionToken: sessionToken, expiresAtMs: expiresAtMs }
+}
+
+// ---- cache ----
+
+type Entry<T> = { value: T, expiresAtMs: f64 }
+
+// Values by key, for tokens and temporary credentials. get returns a value only while
+// more than 60 seconds of its life remain, so a request never starts with a token that
+// expires mid-flight.
+export class TokenCache<T> {
+  entries: Map<string, Entry<T>> = new Map()
+
+  get(key: string, nowMs: f64): T | undefined {
+    const e = this.entries.get(key)
+    if (e === undefined) return undefined
+    if (e.expiresAtMs - nowMs <= CACHE_MARGIN_MS) return undefined
+    return e.value
+  }
+
+  put(key: string, value: T, expiresAtMs: f64): void {
+    this.entries.set(key, { value: value, expiresAtMs: expiresAtMs })
+  }
+}
+
+// Factories, for importers that already have a TokenCache of their own (no `new ns.Class()` in Tov).
+export function stringCache(): TokenCache<string> {
+  return new TokenCache<string>()
+}
+
+export function credsCache(): TokenCache<AssumedCreds> {
+  return new TokenCache<AssumedCreds>()
+}
+
+test("percent-encoding is byte-based", () => {
+  expect(pctEncode("a b/é")).toBe("a%20b%2F%C3%A9")
+  // a multibyte character before an ASCII one must not shift the ASCII byte's offset
+  expect(pctEncode("é/a")).toBe("%C3%A9%2Fa")
+  expect(pctEncode("A-z_0.~")).toBe("A-z_0.~")
+})
+
+test("entra token request defaults the scope", () => {
+  const up = entraTokenRequest("tenant-1", "client 1", "s3cret+/=", [])
+  expect(up.url).toBe("https://login.microsoftonline.com/tenant-1/oauth2/v2.0/token")
+  expect(up.headers.get("content-type")).toBe("application/x-www-form-urlencoded")
+  expect(up.body).toBe("grant_type=client_credentials&client_id=client%201&client_secret=s3cret%2B%2F%3D&scope=https%3A%2F%2Fcognitiveservices.azure.com%2F.default")
+})
+
+test("entra token request uses configured scopes as given", () => {
+  const up = entraTokenRequest("t", "c", "s", ["api://x/.default", "offline_access"])
+  expect(up.body.endsWith("&scope=api%3A%2F%2Fx%2F.default%20offline_access")).toBe(true)
+})
+
+test("entra token response", () => {
+  const r = try parseTokenResponse(`{"token_type":"Bearer","expires_in":3599,"access_token":"eyJ.abc"}`, 1440938160000.0)
+  expect(r.token).toBe("eyJ.abc")
+  expect(r.expiresAtMs).toBe(1440938160000.0 + 3599000.0)
+  const d = try parseTokenResponse(`{"access_token":"t"}`, 1000.0)
+  expect(d.expiresAtMs).toBe(1000.0 + 3600000.0)
+  let threw = false
+  try {
+    parseTokenResponse(`{"error":"invalid_client","error_description":"bad secret"}`, 0.0)
+  } catch (e) {
+    threw = e.message.includes("bad secret")
+  }
+  expect(threw).toBe(true)
+})
+
+test("iso 8601 expiry", () => {
+  expect(parseIsoUtcMs("2015-08-30T12:36:00Z")).toBe(1440938160000.0)
+  expect(parseIsoUtcMs("2015-08-30T12:36:00.123Z")).toBe(1440938160000.0)
+  expect(parseIsoUtcMs("1970-01-01T00:00:00Z")).toBe(0.0)
+  expect(parseIsoUtcMs("2024-02-29T23:59:59Z")).toBe(1709251199000.0)
+  expect(parseIsoUtcMs("2015-08-30 12:36:00")).toBeUndefined()
+})
+
+test("sts request is a signed form POST", () => {
+  const creds: AwsCreds = { accessKey: "AKIDEXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" }
+  const up = assumeRoleRequest(creds, "us-east-1", "arn:aws:iam::123456789012:role/Bedrock", "ext-1", "bifrost-session", 3600, 1440938160000.0)
+  expect(up.url).toBe("https://sts.us-east-1.amazonaws.com/")
+  expect(up.body).toBe("Action=AssumeRole&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2FBedrock&RoleSessionName=bifrost-session&DurationSeconds=3600&ExternalId=ext-1")
+  expect(up.headers.get("x-amz-date")).toBe("20150830T123600Z")
+  expect(up.headers.has("host")).toBe(false)
+  const auth = up.headers.get("authorization")!
+  expect(auth.startsWith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/sts/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=")).toBe(true)
+  // reference from a Python hmac/hashlib implementation, checked against the AWS vector
+  expect(auth.endsWith("Signature=e0642fdb2362faee8ef5d4a2c96c255f9d9621e24c39c5a51c9e032f2ba66960")).toBe(true)
+})
+
+test("sts request without external id or with a session token", () => {
+  const creds: AwsCreds = { accessKey: "AKIDEXAMPLE", secretKey: "secret", sessionToken: "tok+/=" }
+  const up = assumeRoleRequest(creds, "eu-west-1", "arn:aws:iam::1:role/r", undefined, "s", 900, 1440938160000.0)
+  expect(up.body).toBe("Action=AssumeRole&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A1%3Arole%2Fr&RoleSessionName=s&DurationSeconds=900")
+  expect(up.url).toBe("https://sts.eu-west-1.amazonaws.com/")
+  expect(up.headers.get("x-amz-security-token")).toBe("tok+/=")
+  const auth = up.headers.get("authorization")!
+  expect(auth.includes("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token,")).toBe(true)
+  expect(auth.endsWith("Signature=52533bf2244d95ddb685f2e2b5d5d0f393bd469f75aef86aefbe3f7ddaf112fa")).toBe(true)
+})
+
+test("assume role response", () => {
+  const xml = `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASIAEXAMPLE</AccessKeyId><SecretAccessKey>sec/+=</SecretAccessKey><SessionToken>FQoGZXIvYXdz&amp;x</SessionToken><Expiration>2015-08-30T13:36:00Z</Expiration></Credentials><AssumedRoleUser><Arn>arn:aws:sts::1:assumed-role/r/s</Arn></AssumedRoleUser></AssumeRoleResult></AssumeRoleResponse>`
+  const c = try parseAssumeRole(xml)
+  expect(c.accessKey).toBe("ASIAEXAMPLE")
+  expect(c.secretKey).toBe("sec/+=")
+  expect(c.sessionToken).toBe("FQoGZXIvYXdz&x")
+  expect(c.expiresAtMs).toBe(1440941760000.0)
+  let msg = ""
+  try {
+    parseAssumeRole(`<ErrorResponse><Error><Code>AccessDenied</Code><Message>not allowed</Message></Error></ErrorResponse>`)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg.includes("not allowed")).toBe(true)
+})
+
+test("token cache keeps tokens with a 60 second margin", () => {
+  const c: TokenCache<string> = new TokenCache()
+  c.put("k", "tok", 1000000.0)
+  expect(c.get("k", 0.0)).toBe("tok")
+  expect(c.get("k", 1000000.0 - 60000.0)).toBeUndefined()
+  expect(c.get("k", 1000000.0 - 60001.0)).toBe("tok")
+  expect(c.get("other", 0.0)).toBeUndefined()
+})
