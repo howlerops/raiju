@@ -9,6 +9,7 @@ import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing } from "./alerts"
 import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp } from "./mcpserver"
+import * as vmcp from "./vmcp"
 import { resolveAll } from "./secrets"
 import { fields, find, rawStr, isNull } from "./json"
 import { snapshot, errorJson } from "./schemas"
@@ -176,6 +177,10 @@ export class Ops {
       } catch (e) {
         console.error(`raiju: audit log disabled: ${e.message}`)
       }
+    }
+    for (const v of cfg.virtual_mcps ?? []) {
+      const problem = vmcp.validate(v)
+      if (problem !== "") console.error(`raiju: virtual MCP ${v.name}: ${problem}`)
     }
     this.configureAlerts(cfg.alerts)
     this.configureCluster(cfg.cluster)
@@ -511,11 +516,36 @@ export class Ops {
   }
 
   // POST /mcp: the connected MCP servers' tools, served to MCP clients.
-  async mcp(req: Request): Promise<Response> {
+  // GET /api/mcp/virtual: each virtual MCP with its resolved tool names and problems.
+  virtualView(): Reply {
+    const m = this.engine.mcp
+    const all: ExposedTool[] = m === undefined ? [] : exposedTools(m.allTools())
+    return { status: 200, body: vmcp.listView(this.engine.cfg.virtual_mcps ?? [], all), contentType: "application/json" }
+  }
+
+  // POST /mcp (every connected tool) and /mcp/{name} (a virtual MCP's tool set).
+  async mcp(req: Request, virtualName: string | undefined): Promise<Response> {
     const m = this.engine.mcp
     if (m === undefined || this.engine.cfg.mcp_server?.enabled === false) return json(404, errorJson("no MCP servers are connected", "invalid_request_error", undefined))
     const h = snapshot(req.headers)
-    if (this.engine.gov.enforce && this.engine.gov.findKey(h) === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)")
+    const vk = this.engine.gov.findKey(h)
+    if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)")
+    let tools = exposedTools(m.allTools())
+    // virtual names → the source tool and its argument defaults
+    let mapping: Map<string, { source: string, defaults: string }> = new Map()
+    if (virtualName !== undefined) {
+      let v: vmcp.VirtualMcp | undefined = undefined
+      for (const x of this.engine.cfg.virtual_mcps ?? []) {
+        if (x.name === virtualName) v = x
+      }
+      if (v === undefined) return json(404, errorJson(`no virtual MCP ${virtualName}`, "invalid_request_error", undefined))
+      if (!vmcp.keyAllowed(v, vk?.id)) return denied(403, `this key may not use the virtual MCP ${virtualName}`)
+      const r = vmcp.resolve(v, tools)
+      for (const e of r.errors) console.error(`raiju: virtual MCP ${virtualName}: ${e}`)
+      tools = r.tools
+      mapping = r.map
+    }
+    const virtual = virtualName !== undefined
     if (req.method === "DELETE") {
       const sid = h.get("mcp-session-id")
       if (sid !== undefined) this.mcpSessions.delete(sid)
@@ -526,10 +556,22 @@ export class Ops {
     const now = Date.now()
     this.mcpSessions.expire(now)
     const run = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
-      const r = try await m.execute(name, args)
+      if (!virtual) {
+        const r = try await m.execute(name, args)
+        return { text: r.text, isError: r.isError }
+      }
+      const target = mapping.get(name)
+      if (target === undefined) throw new Error(`unknown tool ${name}`)
+      let merged = args
+      try {
+        merged = vmcp.mergeArgs(target.defaults, args)
+      } catch (e) {
+        return { text: `bad arguments: ${e.message}`, isError: true }
+      }
+      const r = try await m.execute(target.source, merged)
       return { text: r.text, isError: r.isError }
     }
-    const r = await handleMcp(body, h.get("mcp-session-id"), exposedTools(m.allTools()), run, this.mcpSessions, now)
+    const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now)
     const out: Record<string, string> = new Map()
     out.set("content-type", r.contentType)
     const sid = r.sessionId

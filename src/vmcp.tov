@@ -1,0 +1,293 @@
+// Virtual MCP servers: named tool sets assembled from the tools of several connected MCP
+// servers. The gateway serves one at /mcp/{name}. Each virtual tool points back at a chat
+// tool name ("<server>-<tool>") or a "<server>-*" pattern, and may rename the tool, override
+// its description and merge argument defaults under the caller's arguments.
+import { Field, fields, elements, find, quote, build, setField } from "./json"
+import { ExposedTool } from "./mcpserver"
+
+export type VirtualTool = { source: string, as?: string, description?: string, defaults?: string }
+
+export type VirtualMcp = { name: string, description?: string, tools: VirtualTool[], allowed_keys?: string[] }
+
+// Where a call to a virtual tool goes: the chat tool it came from and the defaults to merge.
+export type VirtualTarget = { source: string, defaults: string }
+
+export type Resolved = { tools: ExposedTool[], map: Map<string, VirtualTarget>, errors: string[] }
+
+const NAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_-"
+const MAX_NAME = 64
+
+// A virtual name or rename: [a-z0-9_-], 1 to 64 bytes.
+function validName(s: string): bool {
+  if (s === "" || s.byteLength > MAX_NAME) return false
+  for (const ch of s.chars()) {
+    if (!NAME_CHARS.includes(ch)) return false
+  }
+  return true
+}
+
+function isPattern(source: string): bool {
+  return source.endsWith("*")
+}
+
+// The chat name prefix a pattern matches: "git-*" matches "git-" followed by anything.
+function patternPrefix(source: string): string {
+  return source.slice(0, source.byteLength - 1)
+}
+
+// The fields of one JSON object given as text. Empty text counts as an empty object.
+// fields() alone would skip trailing text, so the outer shape is checked with elements().
+function objectFields(text: string): Field[] throws SyntaxError {
+  const t = text.trim()
+  if (t === "") return []
+  if (!t.startsWith("{")) throw new SyntaxError("expected a JSON object")
+  const parts = try elements(`[${t}]`)
+  if (parts.length !== 1) throw new SyntaxError("expected one JSON object")
+  return try fields(t)
+}
+
+// The argument defaults merged under the caller's arguments. The caller's fields win.
+export function mergeArgs(defaults: string, argsJson: string): string throws SyntaxError {
+  const dfs = try objectFields(defaults)
+  const afs = try objectFields(argsJson)
+  let out: Field[] = []
+  for (const f of dfs) setField(&out, f.key, f.raw)
+  for (const f of afs) setField(&out, f.key, f.raw)
+  return build(out)
+}
+
+// "" when v is well formed, else the first problem found. Duplicate names can only be
+// seen against the available tools, so resolve reports those.
+export function validate(v: VirtualMcp): string {
+  if (!validName(v.name)) return `name "${v.name}" must be [a-z0-9_-], 1 to 64 characters`
+  for (const t of v.tools) {
+    if (t.source === "") return "a virtual tool has an empty source"
+    if (isPattern(t.source)) {
+      const server = t.source.slice(0, t.source.byteLength - 2)
+      if (!t.source.endsWith("-*") || server === "" || server.includes("*")) return `pattern "${t.source}" must be "<server>-*"`
+      if (t.as !== undefined) return `pattern "${t.source}" cannot be renamed`
+    } else if (t.as !== undefined && !validName(t.as)) {
+      return `rename "${t.as}" must be [a-z0-9_-], 1 to 64 characters`
+    }
+    if (t.defaults !== undefined) {
+      let ok = true
+      try {
+        objectFields(t.defaults)
+      } catch (e) {
+        ok = false
+      }
+      if (!ok) return `defaults for "${t.source}" must be a JSON object`
+    }
+  }
+  return ""
+}
+
+// The exposed tools of v under their virtual names, from the tools available to the caller.
+// Patterns expand in the order of available. A source that matches nothing, or a name that
+// is already taken, goes into errors and the rest still resolves.
+export function resolve(v: VirtualMcp, available: ExposedTool[]): Resolved {
+  const out: ExposedTool[] = []
+  const map: Map<string, VirtualTarget> = new Map()
+  const errors: string[] = []
+  for (const t of v.tools) {
+    const defaults = t.defaults ?? "{}"
+    const picked = isPattern(t.source)
+      ? available.filter((a) => a.name.startsWith(patternPrefix(t.source)))
+      : available.filter((a) => a.name === t.source)
+    if (picked.length === 0) {
+      errors.push(isPattern(t.source) ? `pattern ${t.source} matches no tools` : `unknown source ${t.source}`)
+      continue
+    }
+    for (const a of picked) {
+      // For a plain source the name is the rename, or the source itself.
+      const name = t.as ?? a.name
+      if (map.has(name)) {
+        errors.push(`duplicate tool name ${name}`)
+        continue
+      }
+      out.push({ name: name, description: t.description ?? a.description, inputSchemaRaw: a.inputSchemaRaw })
+      map.set(name, { source: a.name, defaults: defaults })
+    }
+  }
+  return { tools: out, map: map, errors: errors }
+}
+
+// Whether a virtual key may use v. Without allowed_keys every key may, including no key.
+export function keyAllowed(v: VirtualMcp, vkId: string | undefined): bool {
+  const keys = v.allowed_keys
+  if (keys === undefined) return true
+  if (vkId === undefined) return false
+  return keys.includes(vkId)
+}
+
+// The JSON for GET /api/mcp/virtual: each virtual MCP with its resolved tool names and errors.
+// A missing description is "".
+export function listView(vs: VirtualMcp[], available: ExposedTool[]): string {
+  const parts: string[] = []
+  for (const v of vs) {
+    const r = resolve(v, available)
+    const names = r.tools.map((t) => quote(t.name))
+    const errs = r.errors.map((e) => quote(e))
+    parts.push(`{"name":${quote(v.name)},"description":${quote(v.description ?? "")},"tools":[${names.join(",")}],"errors":[${errs.join(",")}]}`)
+  }
+  return `[${parts.join(",")}]`
+}
+
+// Test fixtures: two servers, fs and git.
+function fixtureTools(): ExposedTool[] {
+  return [
+    { name: "fs-read", description: "read a file", inputSchemaRaw: '{"type":"object"}' },
+    { name: "fs-write", description: "write a file", inputSchemaRaw: '{"type":"object","properties":{}}' },
+    { name: "git-log", description: "log", inputSchemaRaw: "{}" },
+    { name: "git-status", description: "status", inputSchemaRaw: "{}" },
+  ]
+}
+
+test("a pattern expands to every tool of its server, in the order of available", () => {
+  const tools = fixtureTools()
+  const v: VirtualMcp = { name: "dev", tools: [{ source: "git-*" }] }
+  const r = resolve(v, tools)
+  expect(r.tools.map((t) => t.name)).toEqual(["git-log", "git-status"])
+  expect(r.errors.length).toBe(0)
+  expect(r.map.size).toBe(2)
+  const g = r.map.get("git-status")!
+  expect(g.source).toBe("git-status")
+  expect(g.defaults).toBe("{}")
+  expect(r.tools[0]!.description).toBe("log")
+
+  const reversed = [tools[3]!, tools[2]!, tools[0]!, tools[1]!]
+  const r2 = resolve({ name: "dev", tools: [{ source: "fs-*" }] }, reversed)
+  expect(r2.tools.map((t) => t.name)).toEqual(["fs-read", "fs-write"])
+
+  // a description on a pattern applies to every tool it expands to
+  const d = resolve({ name: "dev", tools: [{ source: "git-*", description: "Git" }] }, tools)
+  expect(d.tools.map((t) => t.description)).toEqual(["Git", "Git"])
+})
+
+test("renames and description overrides apply to one tool", () => {
+  const tools = fixtureTools()
+  const v: VirtualMcp = { name: "dev", tools: [{ source: "fs-read", as: "read_file", description: "Read a file" }] }
+  const r = resolve(v, tools)
+  expect(r.errors.length).toBe(0)
+  expect(r.tools.length).toBe(1)
+  expect(r.tools[0]!.name).toBe("read_file")
+  expect(r.tools[0]!.description).toBe("Read a file")
+  expect(r.tools[0]!.inputSchemaRaw).toBe('{"type":"object"}')
+  expect(r.map.get("read_file")!.source).toBe("fs-read")
+  expect(r.map.get("fs-read") === undefined).toBe(true)
+
+  // no rename keeps the chat name, and no description keeps the tool's own
+  const plain = resolve({ name: "dev", tools: [{ source: "git-log" }] }, tools)
+  expect(plain.tools[0]!.name).toBe("git-log")
+  expect(plain.tools[0]!.description).toBe("log")
+})
+
+test("unknown sources and empty patterns are errors, and the rest still resolves", () => {
+  const tools = fixtureTools()
+  const v: VirtualMcp = { name: "dev", tools: [{ source: "nope-x" }, { source: "zzz-*" }, { source: "fs-write" }] }
+  const r = resolve(v, tools)
+  expect(r.errors).toEqual(["unknown source nope-x", "pattern zzz-* matches no tools"])
+  expect(r.tools.map((t) => t.name)).toEqual(["fs-write"])
+})
+
+test("a later duplicate name is an error and the first one is kept", () => {
+  const tools = fixtureTools()
+  const r = resolve({ name: "dev", tools: [{ source: "fs-read" }, { source: "fs-*" }] }, tools)
+  expect(r.tools.map((t) => t.name)).toEqual(["fs-read", "fs-write"])
+  expect(r.errors).toEqual(["duplicate tool name fs-read"])
+  expect(r.map.get("fs-read")!.source).toBe("fs-read")
+
+  // a rename can collide with a tool that already has that name
+  const renamed = resolve({ name: "dev", tools: [{ source: "git-log", as: "fs-write" }, { source: "fs-write" }] }, tools)
+  expect(renamed.tools.map((t) => t.name)).toEqual(["fs-write"])
+  expect(renamed.tools[0]!.description).toBe("log")
+  expect(renamed.errors).toEqual(["duplicate tool name fs-write"])
+})
+
+test("defaults travel with the mapping", () => {
+  const tools = fixtureTools()
+  const v: VirtualMcp = { name: "dev", tools: [{ source: "fs-read", defaults: '{"limit":10}' }, { source: "git-*", defaults: '{"n":1}' }] }
+  const r = resolve(v, tools)
+  expect(r.map.get("fs-read")!.defaults).toBe('{"limit":10}')
+  expect(r.map.get("git-log")!.defaults).toBe('{"n":1}')
+  expect(r.map.get("git-log")!.source).toBe("git-log")
+})
+
+test("mergeArgs puts the caller's fields over the defaults", () => {
+  expect(try mergeArgs('{"limit":10,"fmt":"json"}', '{"limit":5}')).toBe('{"limit":5,"fmt":"json"}')
+  expect(try mergeArgs('{"a":{"x":1}}', '{"b":null}')).toBe('{"a":{"x":1},"b":null}')
+  expect(try mergeArgs("{}", "")).toBe("{}")
+  expect(try mergeArgs("", '{"a":1}')).toBe('{"a":1}')
+  expect(try mergeArgs('{"a":1}', " { } ")).toBe('{"a":1}')
+
+  let threw = 0
+  try {
+    mergeArgs("[]", "{}")
+  } catch (e) {
+    threw += 1
+  }
+  try {
+    mergeArgs("{}", "[1]")
+  } catch (e) {
+    threw += 1
+  }
+  try {
+    mergeArgs("{}", '{"a":1} x')
+  } catch (e) {
+    threw += 1
+  }
+  expect(threw).toBe(3)
+})
+
+test("validate accepts good names and rejects bad ones", () => {
+  expect(validate({ name: "dev", tools: [] })).toBe("")
+  expect(validate({ name: "dev-tools_2", description: "d", tools: [{ source: "fs-read", as: "read_file" }] })).toBe("")
+  expect(validate({ name: "Dev", tools: [] }) === "").toBe(false)
+  expect(validate({ name: "", tools: [] }) === "").toBe(false)
+  expect(validate({ name: "a b", tools: [] }) === "").toBe(false)
+
+  let long = ""
+  for (let i = 0; i < 64; i++) long += "a"
+  expect(validate({ name: long, tools: [] })).toBe("")
+  expect(validate({ name: long + "a", tools: [] }) === "").toBe(false)
+})
+
+test("validate checks renames, patterns, sources and defaults", () => {
+  expect(validate({ name: "dev", tools: [{ source: "fs-read", as: "Bad Name" }] }) === "").toBe(false)
+  expect(validate({ name: "dev", tools: [{ source: "fs-read", as: "ok_name-1" }] })).toBe("")
+  expect(validate({ name: "dev", tools: [{ source: "fs-*", as: "x" }] }) === "").toBe(false)
+  expect(validate({ name: "dev", tools: [{ source: "fs-*" }] })).toBe("")
+  expect(validate({ name: "dev", tools: [{ source: "fs*" }] }) === "").toBe(false)
+  expect(validate({ name: "dev", tools: [{ source: "-*" }] }) === "").toBe(false)
+  expect(validate({ name: "dev", tools: [{ source: "" }] }) === "").toBe(false)
+  expect(validate({ name: "dev", tools: [{ source: "fs-read", defaults: '{"a":1}' }] })).toBe("")
+  expect(validate({ name: "dev", tools: [{ source: "fs-read", defaults: "" }] })).toBe("")
+  expect(validate({ name: "dev", tools: [{ source: "fs-read", defaults: "[1]" }] }) === "").toBe(false)
+  expect(validate({ name: "dev", tools: [{ source: "fs-read", defaults: '{"a":1} x' }] }) === "").toBe(false)
+})
+
+test("keyAllowed: no list means every key, an empty list means none", () => {
+  const open: VirtualMcp = { name: "dev", tools: [] }
+  expect(keyAllowed(open, "vk1")).toBe(true)
+  expect(keyAllowed(open, undefined)).toBe(true)
+  const some: VirtualMcp = { name: "dev", tools: [], allowed_keys: ["vk1"] }
+  expect(keyAllowed(some, "vk1")).toBe(true)
+  expect(keyAllowed(some, "vk2")).toBe(false)
+  expect(keyAllowed(some, undefined)).toBe(false)
+  const none: VirtualMcp = { name: "dev", tools: [], allowed_keys: [] }
+  expect(keyAllowed(none, "vk1")).toBe(false)
+  expect(keyAllowed(none, undefined)).toBe(false)
+})
+
+test("listView gives names, resolved tools and errors", () => {
+  const tools = fixtureTools()
+  const vs: VirtualMcp[] = [
+    { name: "dev", description: "Dev tools", tools: [{ source: "fs-read", as: "read" }, { source: "nope" }] },
+    { name: "git", tools: [{ source: "git-*" }] },
+  ]
+  expect(listView(vs, tools)).toBe(
+    '[{"name":"dev","description":"Dev tools","tools":["read"],"errors":["unknown source nope"]},' +
+      '{"name":"git","description":"","tools":["git-log","git-status"],"errors":[]}]',
+  )
+  expect(listView([], tools)).toBe("[]")
+})

@@ -504,6 +504,20 @@ def main():
         s, _, _ = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
         check("MCP server refuses requests without a session", s == 400)
 
+        # virtual MCP: a renamed tool with argument defaults
+        s, h, b = call("POST", "/mcp/weather-desk", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}})
+        vsid = hl(h).get("mcp-session-id", "")
+        s, _, b = call("POST", "/mcp/weather-desk", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {"mcp-session-id": vsid})
+        names = [t["name"] for t in json.loads(b)["result"]["tools"]] if s == 200 else []
+        check("a virtual MCP lists only its renamed tools", names == ["forecast"] and "Forecast for a city" in b, b[:300])
+        s, _, b = call("POST", "/mcp/weather-desk", {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "forecast", "arguments": {"city": "Oslo"}}}, {"mcp-session-id": vsid})
+        up = [x for x in seen() if x["path"] == "/mcp" and "tools/call" in x["body"]][-1]["body"]
+        check("a virtual MCP tool call reaches the source tool with defaults", s == 200 and "Sunny in Oslo" in b and '"name":"get_weather"' in up and '"units":"metric"' in up and '"city":"Oslo"' in up, (b, up))
+        s, _, _ = call("POST", "/mcp/nope", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        check("unknown virtual MCP is 404", s == 404, s)
+        s, _, b = call("GET", "/api/mcp/virtual")
+        check("virtual MCPs are listed", s == 200 and '"forecast"' in b, b)
+
         # RBAC: a viewer reads but can't change anything
         s, _, b = call("POST", "/api/users", {"name": "viewer1", "role": "viewer"})
         token = json.loads(b).get("token", "") if s == 201 else ""
