@@ -1,6 +1,6 @@
 // Virtual keys, budgets and rate limits, with Bifrost's Customer → Team → VK
 // hierarchy. State is in memory, per process.
-import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig, AccessProfile } from "./config"
+import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig, AccessProfile, ModelConfigGovernance, ProviderGovernance } from "./config"
 import { Effective, applyProfiles, modelAllowed } from "./profiles"
 import { Hdrs, hdrs } from "./schemas"
 
@@ -84,6 +84,9 @@ export class Governance {
   required: string[] = []
   // the effective policy of each key that uses access profiles, by key id
   policies: Map<string, Effective> = new Map()
+  // governance.model_configs and governance.providers, applied to every request by modelLimits()
+  modelConfigs: ModelConfigGovernance[] = []
+  providerGovs: ProviderGovernance[] = []
 
   constructor(cfg: Config) {
     const g0 = cfg.governance
@@ -95,6 +98,8 @@ export class Governance {
     this.required = (cfg.client?.required_headers ?? []).map((n) => n.toLowerCase())
     const g = cfg.governance
     if (g === undefined) return
+    this.modelConfigs = g.model_configs ?? []
+    this.providerGovs = g.providers ?? []
     for (const b of g.budgets ?? []) {
       const w = new Window(b.max_limit, durationMs(b.reset_duration))
       w.used = b.current_usage ?? 0.0
@@ -160,8 +165,9 @@ export class Governance {
     if (vk === undefined) {
       const alt = this.altAuth
       if (this.enforce && !(alt !== undefined && alt(h))) return { kind: "denial", status: 401, type: "authentication_error", message: "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)" }
-      const empty: string[] = []
-      return { kind: "grant", vk: undefined, budgets: empty, rateLimits: empty }
+      // no key: model configs and provider governance still apply
+      const lim = this.modelLimits(undefined, provider, model)
+      return this.checkLimits(undefined, lim.budgets, lim.rateLimits)
     }
     if (vk.is_active === false) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} is inactive` }
     const pol = this.policies.get(vk.id)
@@ -202,6 +208,15 @@ export class Governance {
       const cb = this.customers.get(customer)
       if (cb !== undefined) budgets.push(cb)
     }
+    // model configs and provider governance add their budgets and limits to the key's own
+    const lim = this.modelLimits(vk, provider, model)
+    for (const id of lim.budgets) budgets.push(id)
+    for (const id of lim.rateLimits) rateLimits.push(id)
+    return this.checkLimits(vk, budgets, rateLimits)
+  }
+
+  // Denies when a budget is used up (402) or a rate limit is reached (429); otherwise counts the request.
+  checkLimits(vk: VirtualKeyConfig | undefined, budgets: string[], rateLimits: string[]): Grant | Denial {
     const now = Date.now()
     for (const id of budgets) {
       const b = this.budgets.get(id)
@@ -220,6 +235,37 @@ export class Governance {
       if (r !== undefined) r.add(now, 1.0)
     }
     return { kind: "grant", vk: vk, budgets: budgets, rateLimits: rateLimits }
+  }
+
+  // The budgets and rate limits that model configs and provider governance put on provider/model.
+  // A model config applies when its model is this one or "*", and its provider is this one or unset;
+  // a virtual_key-scoped one only for that key. Every match applies. Base-model aliases are not matched.
+  modelLimits(vk: VirtualKeyConfig | undefined, provider: string, model: string): { budgets: string[], rateLimits: string[] } {
+    const budgets: string[] = []
+    const rateLimits: string[] = []
+    for (const mc of this.modelConfigs) {
+      if (mc.model_name !== model && mc.model_name !== "*") continue
+      const p = mc.provider
+      if (p !== undefined && p !== provider) continue
+      const sc = mc.scope ?? "global"
+      if (sc === "virtual_key") {
+        if (vk === undefined || mc.scope_id !== vk.id) continue
+      } else if (sc !== "global") continue
+      const one = mc.budget_id
+      if (one !== undefined) budgets.push(one)
+      for (const id of mc.budget_ids ?? []) budgets.push(id)
+      const rl = mc.rate_limit_id
+      if (rl !== undefined) rateLimits.push(rl)
+    }
+    for (const pg of this.providerGovs) {
+      if (pg.name !== provider) continue
+      const pb = pg.budget_id
+      if (pb !== undefined) budgets.push(pb)
+      for (const id of pg.budget_ids ?? []) budgets.push(id)
+      const pr = pg.rate_limit_id
+      if (pr !== undefined) rateLimits.push(pr)
+    }
+    return { budgets: budgets, rateLimits: rateLimits }
   }
 
   // Debits cost from every budget and tokens from every token limit.
@@ -470,4 +516,59 @@ test("inference auth defaults on when there are credentials", () => {
   g.altAuth = (h) => h.get("authorization") === "Bearer admin"
   expect(g.admit(hdrs([["authorization", "Bearer admin"]]), "openai", "m").kind).toBe("grant")
   expect(g.admit(hdrs([]), "openai", "m").kind).toBe("denial")
+})
+
+test("model config budget denies 402 for that model only", () => {
+  const cfg: Config = {
+    governance: {
+      budgets: [{ id: "mb", max_limit: 1.0, reset_duration: "1d" }],
+      model_configs: [{ id: "mc1", model_name: "gpt-4o", provider: "openai", budget_id: "mb" }],
+    },
+  }
+  const g = new Governance(cfg)
+  const none = hdrs([])
+  const a = g.admit(none, "openai", "gpt-4o")
+  expect(isDenial(a)).toBe(false)
+  expect((a as Grant).budgets).toEqual(["mb"])
+  g.record(a as Grant, 0, 1.5)
+  const d = g.admit(none, "openai", "gpt-4o")
+  expect((d as Denial).status).toBe(402)
+  expect(isDenial(g.admit(none, "openai", "gpt-4o-mini"))).toBe(false)
+  expect(isDenial(g.admit(none, "anthropic", "gpt-4o"))).toBe(false)
+})
+
+test("model config limits apply to a virtual key and wildcard models", () => {
+  const cfg: Config = {
+    governance: {
+      budgets: [{ id: "wb", max_limit: 5.0, reset_duration: "1d" }],
+      virtual_keys: [{ id: "vk1", value: "sk-bf-one" }, { id: "vk2", value: "sk-bf-two" }],
+      model_configs: [
+        { id: "mc-all", model_name: "*", provider: "openai", budget_ids: ["wb"] },
+        { id: "mc-vk", model_name: "*", scope: "virtual_key", scope_id: "vk2", rate_limit_id: "rl" },
+      ],
+      rate_limits: [{ id: "rl", request_max_limit: 1, request_reset_duration: "1m" }],
+    },
+  }
+  const g = new Governance(cfg)
+  const one = g.admit(hdrs([["x-bf-vk", "sk-bf-one"]]), "openai", "gpt-4o")
+  expect((one as Grant).budgets).toEqual(["wb"])
+  expect((one as Grant).rateLimits).toEqual([])
+  const two = hdrs([["x-bf-vk", "sk-bf-two"]])
+  expect((g.admit(two, "openai", "gpt-4o") as Grant).rateLimits).toEqual(["rl"])
+  expect((g.admit(two, "openai", "gpt-4o") as Denial).status).toBe(429)
+})
+
+test("provider rate limit denies 429 for that provider only", () => {
+  const cfg: Config = {
+    governance: {
+      rate_limits: [{ id: "prl", request_max_limit: 1, request_reset_duration: "1m" }],
+      providers: [{ name: "anthropic", rate_limit_id: "prl" }],
+    },
+  }
+  const g = new Governance(cfg)
+  const none = hdrs([])
+  expect(isDenial(g.admit(none, "anthropic", "claude"))).toBe(false)
+  const d = g.admit(none, "anthropic", "claude")
+  expect((d as Denial).status).toBe(429)
+  expect(isDenial(g.admit(none, "openai", "gpt-4o"))).toBe(false)
 })

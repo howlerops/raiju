@@ -762,6 +762,15 @@ def main():
         s, _, b = call("GET", "/api/audit-logs")
         check("SSO changes are audited under the user", '"actor":"sso:alice"' in b, b[-400:])
 
+        s, _, b = call("POST", "/api/governance/model-configs", {"model_name": "gpt-mc", "provider": "openai", "rate_limit": {"request_max_limit": 1, "request_reset_duration": "1h"}})
+        mcid = json.loads(b).get("id", "") if s == 201 else ""
+        s1, _, _ = chat("openai/gpt-mc", seed=1701)
+        s2, _, b2 = chat("openai/gpt-mc", seed=1702)
+        s3, _, _ = chat("openai/gpt-4o-mini", seed=1703)
+        check("a model config's rate limit applies to that model only", s == 201 and (s1, s2, s3) == (200, 429, 200), (s, s1, s2, s3, b2))
+        s, _, _ = call("DELETE", "/api/governance/model-configs/" + mcid)
+        check("model configs delete", s == 200, s)
+
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
         import re as _re

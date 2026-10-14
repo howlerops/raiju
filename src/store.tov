@@ -7,9 +7,10 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
+  ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig,
 } from "./config"
 import { decode } from "./base64"
-import { Field, fields, find, quote } from "./json"
+import { Field, fields, find, isNull, quote } from "./json"
 import { secureHex } from "./crypto"
 
 export type AdminAuth = AdminAuthConfig
@@ -27,6 +28,11 @@ type VkBody = { id?: string, name?: string, value?: string, description?: string
 type BudgetBody = { id?: string, max_limit?: f64, reset_duration?: string, current_usage?: f64 }
 type RateBody = { id?: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string }
 type NamedBody = { id?: string, name?: string, customer_id?: string, budget_id?: string }
+// Bifrost's model config, provider governance and pricing override requests. Budgets and rate
+// limits come inline; the store keeps them under ids the owner derives.
+type ModelConfigBody = { id?: string, model_name?: string, provider?: string, scope?: string, scope_id?: string, calendar_aligned?: bool, budgets?: BudgetBody[], rate_limit?: RateBody }
+type ProviderBody = { description?: string, budget?: BudgetBody, budgets?: BudgetBody[], rate_limit?: RateBody }
+type PricingBody = { name?: string, scope_kind?: string, provider_id?: string, provider_key_id?: string, virtual_key_id?: string, user_id?: string, request_types?: string[], match_type?: string, pattern?: string }
 
 const HEX = "0123456789abcdef"
 const DIGITS = "0123456789"
@@ -251,6 +257,243 @@ function rateLimitError(r: RateLimitConfig): string {
   return ""
 }
 
+// Budgets and rate limits an owner (a model config or a provider) created from inline values
+// carry ids derived from the owner's id, so deleting the owner can find them.
+function ownsBudget(owner: string, id: string): bool {
+  return id.startsWith(owner + "-budget-")
+}
+
+function ownsRate(owner: string, id: string): bool {
+  return id === owner + "-rate-limit"
+}
+
+type Inline = { err: string, budgetIds?: string[], rateSet: bool, rateId?: string }
+
+// Stores inline budgets (absent keeps the owner's) and a rate limit ({} clears it) under the owner's
+// derived ids. The caller keeps g only when err is "".
+function applyInline(inout g: GovernanceConfig, owner: string, budgets: BudgetBody[] | undefined, rate: RateBody | undefined): Inline {
+  const out: Inline = { err: "", rateSet: false }
+  if (budgets !== undefined) {
+    let next: BudgetConfig[] = (g.budgets ?? []).filter((x) => !ownsBudget(owner, x.id))
+    const ids: string[] = []
+    let i = 0
+    for (const x of budgets) {
+      const bid = `${owner}-budget-${i}`
+      i += 1
+      const nb: BudgetConfig = { id: bid, max_limit: x.max_limit ?? 0.0, reset_duration: x.reset_duration ?? "", current_usage: findById(g.budgets, bid)?.current_usage }
+      const err = budgetError(nb)
+      if (err !== "") {
+        out.err = err
+        return out
+      }
+      next = putById(next, nb)
+      ids.push(bid)
+    }
+    g.budgets = next
+    out.budgetIds = ids
+  }
+  if (rate !== undefined) {
+    const rid = owner + "-rate-limit"
+    const kept: RateLimitConfig[] = (g.rate_limits ?? []).filter((x) => x.id !== rid)
+    out.rateSet = true
+    if (rate.request_max_limit === undefined && rate.token_max_limit === undefined) {
+      g.rate_limits = kept
+      return out
+    }
+    const nr: RateLimitConfig = { id: rid, token_max_limit: rate.token_max_limit, token_reset_duration: rate.token_reset_duration, request_max_limit: rate.request_max_limit, request_reset_duration: rate.request_reset_duration }
+    const err = rateLimitError(nr)
+    if (err !== "") {
+      out.err = err
+      return out
+    }
+    g.rate_limits = putById(kept, nr)
+    out.rateId = rid
+  }
+  return out
+}
+
+// Drops the budgets and rate limit an owner created.
+function dropOwned(inout g: GovernanceConfig, owner: string): void {
+  g.budgets = (g.budgets ?? []).filter((x) => !ownsBudget(owner, x.id))
+  g.rate_limits = (g.rate_limits ?? []).filter((x) => !ownsRate(owner, x.id))
+}
+
+// Names what still uses a budget or rate limit the owner created; "" when nothing does.
+function ownedInUse(c: Config, g: GovernanceConfig, owner: string): string {
+  const probe = withGov(c, g)
+  for (const x of g.budgets ?? []) {
+    if (ownsBudget(owner, x.id)) {
+      const u = budgetUsers(probe, x.id)
+      if (u !== "") return `budget ${x.id} is used by ${u}`
+    }
+  }
+  for (const x of g.rate_limits ?? []) {
+    if (ownsRate(owner, x.id)) {
+      const u = rateLimitUsers(probe, x.id)
+      if (u !== "") return `rate limit ${x.id} is used by ${u}`
+    }
+  }
+  return ""
+}
+
+function budgetsOf(g: GovernanceConfig, ids: string[]): BudgetConfig[] {
+  const out: BudgetConfig[] = []
+  for (const id of ids) {
+    const x = findById(g.budgets, id)
+    if (x !== undefined) out.push(x)
+  }
+  return out
+}
+
+function providerGovFor(g: GovernanceConfig, name: string): ProviderGovernance | undefined {
+  for (const pg of g.providers ?? []) {
+    if (pg.name === name) return pg
+  }
+  return undefined
+}
+
+function overrideById(xs: PricingOverrideConfig[] | undefined, id: string): PricingOverrideConfig | undefined {
+  for (const x of xs ?? []) {
+    if (x.id === id) return x
+  }
+  return undefined
+}
+
+// Bifrost's view of a model config: its budgets and rate limit inline.
+function modelConfigView(c: Config, mc: ModelConfigGovernance): string {
+  const g = gov(c)
+  const ids: string[] = []
+  if (mc.budget_id !== undefined) ids.push(mc.budget_id)
+  for (const id of mc.budget_ids ?? []) ids.push(id)
+  return JSON.stringify({
+    id: mc.id,
+    model_name: mc.model_name,
+    provider: mc.provider,
+    scope: mc.scope ?? "global",
+    scope_id: mc.scope_id,
+    calendar_aligned: mc.calendar_aligned ?? false,
+    budgets: budgetsOf(g, ids),
+    rate_limit: findById(g.rate_limits, mc.rate_limit_id ?? ""),
+  })
+}
+
+function modelConfigList(c: Config): string {
+  const views: string[] = []
+  for (const mc of gov(c).model_configs ?? []) views.push(modelConfigView(c, mc))
+  const n = views.length
+  return `{"model_configs":[${views.join(",")}],"count":${n},"total_count":${n}}`
+}
+
+function providerGovView(c: Config, pg: ProviderGovernance): string {
+  const g = gov(c)
+  const ids: string[] = []
+  if (pg.budget_id !== undefined) ids.push(pg.budget_id)
+  for (const id of pg.budget_ids ?? []) ids.push(id)
+  return JSON.stringify({
+    provider: pg.name,
+    description: pg.description,
+    budgets: budgetsOf(g, ids),
+    rate_limit: findById(g.rate_limits, pg.rate_limit_id ?? ""),
+  })
+}
+
+function providerGovList(c: Config): string {
+  const views: string[] = []
+  for (const pg of gov(c).providers ?? []) views.push(providerGovView(c, pg))
+  const n = views.length
+  return `{"providers":[${views.join(",")}],"count":${n}}`
+}
+
+// A pricing override as Bifrost returns it: the stored patch text becomes the patch object.
+function pricingView(o: PricingOverrideConfig): string {
+  const head = JSON.stringify({
+    id: o.id,
+    name: o.name,
+    scope_kind: o.scope_kind,
+    provider_id: o.provider_id,
+    provider_key_id: o.provider_key_id,
+    virtual_key_id: o.virtual_key_id,
+    user_id: o.user_id,
+    request_types: o.request_types,
+    match_type: o.match_type,
+    pattern: o.pattern,
+  })
+  return head.slice(0, head.byteLength - 1) + ",\"patch\":" + o.pricing_patch + "}"
+}
+
+function pricingList(c: Config): string {
+  const views: string[] = []
+  for (const o of gov(c).pricing_overrides ?? []) views.push(pricingView(o))
+  const n = views.length
+  return `{"pricing_overrides":[${views.join(",")}],"count":${n},"total_count":${n},"limit":${n},"offset":0}`
+}
+
+// Why a pricing override cannot be stored; "" when it can.
+function pricingError(o: PricingOverrideConfig): string {
+  const k = o.scope_kind
+  if (k !== "global" && k !== "provider" && k !== "provider_key" && k !== "virtual_key" && k !== "user") return `invalid scope_kind ${k}`
+  if (k === "provider" && (o.provider_id ?? "") === "") return "provider_id is required for a provider scope"
+  if (k === "provider_key" && (o.provider_key_id ?? "") === "") return "provider_key_id is required for a provider_key scope"
+  if (k === "virtual_key" && (o.virtual_key_id ?? "") === "") return "virtual_key_id is required for a virtual_key scope"
+  if (k === "user" && (o.user_id ?? "") === "") return "user_id is required for a user scope"
+  const mt = o.match_type
+  if (mt !== "exact" && mt !== "wildcard") return `invalid match_type ${mt}`
+  if (o.pattern === "") return "pattern is required"
+  if (mt === "wildcard" && !o.pattern.endsWith("*")) return "a wildcard pattern must end with *"
+  const raw = o.pricing_patch
+  let ok = raw.trim().startsWith("{")
+  if (ok) {
+    try {
+      // a text that starts with "{" parses to an object or fails
+      JSON.parse(raw) as Record<string, f64>
+    } catch (e) {
+      ok = false
+    }
+  }
+  if (!ok) return "patch must be a JSON object"
+  return ""
+}
+
+// A nullable id from a PUT body: absent keeps the old value, null clears it, a string sets it.
+function nullable(fs: Field[], key: string, incoming: string | undefined, old: string | undefined): string | undefined {
+  const raw = find(fs, key)
+  if (raw === undefined) return old
+  if (isNull(raw)) return undefined
+  return incoming
+}
+
+function parseModelConfig(b: string): ModelConfigBody | undefined {
+  try {
+    return JSON.parse(b) as ModelConfigBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseProviderGov(b: string): ProviderBody | undefined {
+  try {
+    return JSON.parse(b) as ProviderBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parsePricing(b: string): PricingBody | undefined {
+  try {
+    return JSON.parse(b) as PricingBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseFields(b: string): Field[] | undefined {
+  try {
+    return fields(b)
+  } catch (e) {
+    return undefined
+  }
+}
+
 // Names the first reference from a virtual key that points at nothing.
 function vkRefError(c: Config, vk: VirtualKeyConfig): string {
   const g = gov(c)
@@ -274,6 +517,12 @@ function vkRefError(c: Config, vk: VirtualKeyConfig): string {
 // What still refers to a budget, rate limit, team or customer; "" when nothing does.
 function budgetUsers(c: Config, id: string): string {
   const g = gov(c)
+  for (const mc of g.model_configs ?? []) {
+    if (mc.budget_id === id || (mc.budget_ids ?? []).includes(id)) return `model config ${mc.id}`
+  }
+  for (const pg of g.providers ?? []) {
+    if (pg.budget_id === id || (pg.budget_ids ?? []).includes(id)) return `provider ${pg.name}`
+  }
   for (const vk of g.virtual_keys ?? []) {
     if (vk.budget_id === id) return `virtual key ${vk.id}`
     for (const pc of vk.provider_configs ?? []) {
@@ -290,6 +539,12 @@ function budgetUsers(c: Config, id: string): string {
 }
 
 function rateLimitUsers(c: Config, id: string): string {
+  for (const mc of gov(c).model_configs ?? []) {
+    if (mc.rate_limit_id === id) return `model config ${mc.id}`
+  }
+  for (const pg of gov(c).providers ?? []) {
+    if (pg.rate_limit_id === id) return `provider ${pg.name}`
+  }
   for (const vk of gov(c).virtual_keys ?? []) {
     if (vk.rate_limit_id === id) return `virtual key ${vk.id}`
     for (const pc of vk.provider_configs ?? []) {
@@ -699,6 +954,112 @@ export class ConfigStore {
     return this.commit(withGov(this.cfg, g), id)
   }
 
+  // A model config for one model (or "*"), provider and scope. Inline budgets and rate limit replace
+  // the ones it owns; an absent one stays as it was.
+  upsertModelConfig(id: string, b: ModelConfigBody): Result {
+    const model = b.model_name ?? ""
+    if (model === "") return fail(400, "model_name is required")
+    const scope = b.scope ?? "global"
+    if (scope !== "global" && scope !== "virtual_key") return fail(400, `invalid scope ${scope}`)
+    const sid = b.scope_id ?? ""
+    const scopeId = scope === "virtual_key" ? sid : undefined
+    if (scope === "virtual_key" && findById(gov(this.cfg).virtual_keys, sid) === undefined) return fail(400, `unknown virtual key ${sid}`)
+    const prov = b.provider === "" ? undefined : b.provider
+    let g = gov(this.cfg)
+    const old = findById(g.model_configs, id)
+    for (const x of g.model_configs ?? []) {
+      if (x.id !== id && x.model_name === model && x.provider === prov && (x.scope ?? "global") === scope && x.scope_id === scopeId) {
+        return fail(409, `model config ${x.id} already covers ${model}`)
+      }
+    }
+    const inl = applyInline(&g, id, b.budgets, b.rate_limit)
+    if (inl.err !== "") return fail(400, inl.err)
+    const next: ModelConfigGovernance = {
+      id: id,
+      model_name: model,
+      provider: prov,
+      scope: scope,
+      scope_id: scopeId,
+      calendar_aligned: b.calendar_aligned ?? old?.calendar_aligned,
+      budget_id: old?.budget_id,
+      budget_ids: inl.budgetIds ?? old?.budget_ids,
+      rate_limit_id: inl.rateSet ? inl.rateId : old?.rate_limit_id,
+    }
+    g.model_configs = putById(g.model_configs ?? [], next)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  deleteModelConfig(id: string): Result {
+    let g = gov(this.cfg)
+    if (findById(g.model_configs, id) === undefined) return fail(404, `no model config ${id}`)
+    g.model_configs = dropById(g.model_configs ?? [], id)
+    const user = ownedInUse(this.cfg, g, id)
+    if (user !== "") return fail(409, user)
+    dropOwned(&g, id)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  // Provider governance (Bifrost's PUT /api/governance/providers/{name}): one entry per provider.
+  upsertProviderGov(name: string, description: string | undefined, budgets: BudgetBody[] | undefined, rate: RateBody | undefined): Result {
+    if (providerOf(this.cfg, name) === undefined) return fail(404, `no provider ${name}`)
+    let g = gov(this.cfg)
+    const old = providerGovFor(g, name)
+    const owner = "provider-" + name
+    const inl = applyInline(&g, owner, budgets, rate)
+    if (inl.err !== "") return fail(400, inl.err)
+    const next: ProviderGovernance = {
+      id: old?.id ?? owner,
+      name: name,
+      description: description ?? old?.description,
+      budget_id: old?.budget_id,
+      budget_ids: inl.budgetIds ?? old?.budget_ids,
+      rate_limit_id: inl.rateSet ? inl.rateId : old?.rate_limit_id,
+    }
+    let list: ProviderGovernance[] = (g.providers ?? []).filter((x) => x.name !== name)
+    list.push(next)
+    g.providers = list
+    return this.commit(withGov(this.cfg, g), name)
+  }
+
+  deleteProviderGov(name: string): Result {
+    let g = gov(this.cfg)
+    if (providerGovFor(g, name) === undefined) return fail(404, `no provider governance for ${name}`)
+    g.providers = (g.providers ?? []).filter((x) => x.name !== name)
+    const owner = "provider-" + name
+    const user = ownedInUse(this.cfg, g, owner)
+    if (user !== "") return fail(409, user)
+    dropOwned(&g, owner)
+    return this.commit(withGov(this.cfg, g), name)
+  }
+
+  // A pricing override, replacing the one with the same id or adding it.
+  savePricingOverride(o: PricingOverrideConfig): Result {
+    const err = pricingError(o)
+    if (err !== "") return fail(400, err)
+    const g = gov(this.cfg)
+    const id = o.id ?? ""
+    const list: PricingOverrideConfig[] = []
+    let placed = false
+    for (const x of g.pricing_overrides ?? []) {
+      if (x.id === id) {
+        list.push(o)
+        placed = true
+      } else {
+        list.push(x)
+      }
+    }
+    if (!placed) list.push(o)
+    g.pricing_overrides = list
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  deletePricingOverride(id: string): Result {
+    const g = gov(this.cfg)
+    if (overrideById(g.pricing_overrides, id) === undefined) return fail(404, `no pricing override ${id}`)
+    g.pricing_overrides = (g.pricing_overrides ?? []).filter((x) => x.id !== id)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
   // The whole config as JSON with secrets masked.
   redacted(): string {
     return JSON.stringify(redactConfig(this.cfg), undefined, 2)
@@ -943,8 +1304,133 @@ function deleteGov(store: ConfigStore, coll: string, id: string): ApiReply {
   return reply(200, JSON.stringify({ deleted: id }))
 }
 
+// POST and PUT on /api/governance/model-configs. A PUT keeps what the body leaves out; scope is not editable.
+function putModelConfig(store: ConfigStore, pathId: string | undefined, body: string): ApiReply {
+  const b = parseModelConfig(body)
+  if (b === undefined) return badBody()
+  const id = resolveId(pathId, b.id, "mc-")
+  const old = findById(gov(store.cfg).model_configs, id)
+  if (pathId !== undefined && old === undefined) return reply(404, errorBody(`no model config ${id}`))
+  const merged: ModelConfigBody = {
+    id: id,
+    model_name: b.model_name ?? old?.model_name,
+    provider: b.provider ?? old?.provider,
+    scope: old === undefined ? b.scope : old.scope,
+    scope_id: old === undefined ? b.scope_id : old.scope_id,
+    calendar_aligned: b.calendar_aligned,
+    budgets: b.budgets,
+    rate_limit: b.rate_limit,
+  }
+  const r = store.upsertModelConfig(id, merged)
+  if (r.kind === "error") return errReply(r)
+  const saved = findById(gov(store.cfg).model_configs, id)
+  if (saved === undefined) return serverError()
+  return reply(old === undefined ? 201 : 200, modelConfigView(store.cfg, saved))
+}
+
+function modelConfigRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string): ApiReply {
+  if (segs.length === 3) {
+    if (m === "GET") return reply(200, modelConfigList(store.cfg))
+    if (m === "POST") return putModelConfig(store, undefined, body)
+    return notAllowed(m)
+  }
+  if (segs.length > 4) return notFound(path)
+  const id = segs[3] ?? ""
+  if (m === "GET") {
+    const mc = findById(gov(store.cfg).model_configs, id)
+    if (mc === undefined) return reply(404, errorBody(`no model config ${id}`))
+    return reply(200, modelConfigView(store.cfg, mc))
+  }
+  if (m === "PUT") return putModelConfig(store, id, body)
+  if (m === "DELETE") {
+    const r = store.deleteModelConfig(id)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: id }))
+  }
+  return notAllowed(m)
+}
+
+// /api/governance/providers: GET the list, PUT or DELETE one provider by name (Bifrost's routes).
+function providerGovRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string): ApiReply {
+  if (segs.length === 3) {
+    if (m === "GET") return reply(200, providerGovList(store.cfg))
+    return notAllowed(m)
+  }
+  if (segs.length > 4) return notFound(path)
+  const name = segs[3] ?? ""
+  if (m === "PUT") {
+    const b = parseProviderGov(body)
+    if (b === undefined) return badBody()
+    if (b.budget !== undefined && b.budgets !== undefined) return reply(400, errorBody("only one of 'budget' or 'budgets' may be set"))
+    let list: BudgetBody[] | undefined = b.budgets
+    const one = b.budget
+    if (one !== undefined) list = [one]
+    const created = providerGovFor(gov(store.cfg), name) === undefined
+    const r = store.upsertProviderGov(name, b.description, list, b.rate_limit)
+    if (r.kind === "error") return errReply(r)
+    const saved = providerGovFor(gov(store.cfg), name)
+    if (saved === undefined) return serverError()
+    return reply(created ? 201 : 200, providerGovView(store.cfg, saved))
+  }
+  if (m === "DELETE") {
+    const r = store.deleteProviderGov(name)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: name }))
+  }
+  return notAllowed(m)
+}
+
+// POST and PUT on /api/governance/pricing-overrides. The patch is kept as the JSON text it came in.
+function putPricing(store: ConfigStore, pathId: string | undefined, body: string): ApiReply {
+  const b = parsePricing(body)
+  const fs = parseFields(body)
+  if (b === undefined || fs === undefined) return badBody()
+  const old = overrideById(gov(store.cfg).pricing_overrides, pathId ?? "")
+  if (pathId !== undefined && old === undefined) return reply(404, errorBody(`no pricing override ${pathId}`))
+  const id = pathId ?? randomId("po-")
+  const raw = find(fs, "patch")
+  const next: PricingOverrideConfig = {
+    id: id,
+    name: b.name ?? old?.name,
+    scope_kind: b.scope_kind ?? old?.scope_kind ?? "",
+    provider_id: nullable(fs, "provider_id", b.provider_id, old?.provider_id),
+    provider_key_id: nullable(fs, "provider_key_id", b.provider_key_id, old?.provider_key_id),
+    virtual_key_id: nullable(fs, "virtual_key_id", b.virtual_key_id, old?.virtual_key_id),
+    user_id: nullable(fs, "user_id", b.user_id, old?.user_id),
+    request_types: b.request_types ?? old?.request_types,
+    match_type: b.match_type ?? old?.match_type ?? "",
+    pattern: b.pattern ?? old?.pattern ?? "",
+    pricing_patch: raw ?? old?.pricing_patch ?? "{}",
+  }
+  const r = store.savePricingOverride(next)
+  if (r.kind === "error") return errReply(r)
+  const saved = overrideById(gov(store.cfg).pricing_overrides, id)
+  if (saved === undefined) return serverError()
+  return reply(pathId === undefined ? 201 : 200, pricingView(saved))
+}
+
+function pricingRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string): ApiReply {
+  if (segs.length === 3) {
+    if (m === "GET") return reply(200, pricingList(store.cfg))
+    if (m === "POST") return putPricing(store, undefined, body)
+    return notAllowed(m)
+  }
+  if (segs.length > 4) return notFound(path)
+  const id = segs[3] ?? ""
+  if (m === "PUT") return putPricing(store, id, body)
+  if (m === "DELETE") {
+    const r = store.deletePricingOverride(id)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: id }))
+  }
+  return notAllowed(m)
+}
+
 function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string): ApiReply {
   const coll = segs[2] ?? ""
+  if (coll === "model-configs") return modelConfigRoute(store, m, segs, body, path)
+  if (coll === "providers") return providerGovRoute(store, m, segs, body, path)
+  if (coll === "pricing-overrides") return pricingRoute(store, m, segs, body, path)
   if (!COLLECTIONS.includes(coll) || segs.length > 4) return notFound(path)
   if (segs.length === 3) {
     if (m === "GET") return reply(200, listBody(store.cfg, coll))
@@ -1391,4 +1877,84 @@ test("sections the config type doesn't know survive a save", () => {
   expect(JSON.stringify(try JSON.parse(saved) as Config).includes("enable_logging")).toBe(true)
   expect(saved.includes(`"guardrails_config": {"guardrail_rules":[{"id":"r1"}]}`)).toBe(true)
   expect(saved.includes(`"server": {"port":1}`)).toBe(true)
+})
+
+test("model configs: inline budgets and rate limit, derived ids, 409s and cleanup", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const mc = "/api/governance/model-configs"
+  const c = handleApi(s, "POST", mc, "{\"model_name\":\"gpt-4o\",\"provider\":\"openai\",\"budgets\":[{\"max_limit\":5,\"reset_duration\":\"1d\"}],\"rate_limit\":{\"request_max_limit\":10,\"request_reset_duration\":\"1m\"}}")
+  expect(c.status).toBe(201)
+  expect(c.body.includes("\"max_limit\":5")).toBe(true)
+  expect(c.body.includes("\"request_max_limit\":10")).toBe(true)
+  const idOf = try JSON.parse(c.body) as { id: string }
+  const id = idOf.id
+  expect(handleApi(s, "POST", mc, "{\"model_name\":\"gpt-4o\",\"provider\":\"openai\"}").status).toBe(409)
+  expect(handleApi(s, "POST", mc, "{\"provider\":\"openai\"}").status).toBe(400)
+  expect(handleApi(s, "POST", mc, "{\"model_name\":\"x\",\"scope\":\"virtual_key\"}").status).toBe(400)
+  expect(handleApi(s, "POST", mc + "/" + id, "{}").status).toBe(405)
+  expect(handleApi(s, "GET", mc, "").body.includes(id)).toBe(true)
+  expect(handleApi(s, "GET", mc + "/" + id, "").status).toBe(200)
+  expect(handleApi(s, "GET", mc + "/nope", "").status).toBe(404)
+  // the budget it owns is in use, so the budget route refuses to drop it
+  expect(handleApi(s, "DELETE", "/api/governance/budgets/" + id + "-budget-0", "").status).toBe(409)
+  // PUT keeps what the body leaves out; {} clears the rate limit
+  const put = handleApi(s, "PUT", mc + "/" + id, "{\"budgets\":[{\"max_limit\":7,\"reset_duration\":\"1M\"}]}")
+  expect(put.status).toBe(200)
+  expect(put.body.includes("gpt-4o")).toBe(true)
+  expect(put.body.includes("\"max_limit\":7")).toBe(true)
+  expect(put.body.includes("\"request_max_limit\":10")).toBe(true)
+  expect(handleApi(s, "PUT", mc + "/" + id, "{\"rate_limit\":{}}").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/governance/rate-limits", "").body.includes(id + "-rate-limit")).toBe(false)
+  expect(handleApi(s, "PUT", mc + "/nope", "{}").status).toBe(404)
+  expect(handleApi(s, "DELETE", mc + "/" + id, "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/governance/budgets", "").body.includes(id)).toBe(false)
+  expect(handleApi(s, "DELETE", mc + "/" + id, "").status).toBe(404)
+  cleanup(path)
+})
+
+test("provider governance: needs a provider, budgets and rate limit, delete", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const pg = "/api/governance/providers"
+  expect(handleApi(s, "PUT", pg + "/openai", "{}").status).toBe(404)
+  expect(handleApi(s, "PUT", "/api/providers/openai", "{\"keys\":[{\"value\":\"sk-abcdefghijkl\"}]}").status).toBe(200)
+  expect(handleApi(s, "PUT", pg + "/openai", "not json").status).toBe(400)
+  expect(handleApi(s, "POST", pg, "{}").status).toBe(405)
+  const put = handleApi(s, "PUT", pg + "/openai", "{\"budgets\":[{\"max_limit\":3,\"reset_duration\":\"1d\"}],\"rate_limit\":{\"request_max_limit\":2,\"request_reset_duration\":\"1m\"}}")
+  expect(put.status).toBe(201)
+  expect(handleApi(s, "PUT", pg + "/openai", "{\"budget\":{\"max_limit\":1,\"reset_duration\":\"1d\"},\"budgets\":[]}").status).toBe(400)
+  const list = handleApi(s, "GET", pg, "")
+  expect(list.body.includes("\"provider\":\"openai\"")).toBe(true)
+  expect(list.body.includes("\"max_limit\":3")).toBe(true)
+  expect(handleApi(s, "DELETE", pg + "/openai", "").status).toBe(200)
+  expect(handleApi(s, "DELETE", pg + "/openai", "").status).toBe(404)
+  expect(handleApi(s, "GET", pg, "").body.includes("openai")).toBe(false)
+  cleanup(path)
+})
+
+test("pricing overrides: CRUD in Bifrost's shape, patch kept as sent", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const po = "/api/governance/pricing-overrides"
+  const bad = "{\"scope_kind\":\"global\",\"match_type\":\"exact\",\"pattern\":\"gpt-4o\",\"patch\":{\"input_cost_per_token\":0.000001}}"
+  expect(handleApi(s, "POST", po, "{\"scope_kind\":\"galaxy\",\"match_type\":\"exact\",\"pattern\":\"x\",\"patch\":{}}").status).toBe(400)
+  expect(handleApi(s, "POST", po, "{\"scope_kind\":\"provider\",\"match_type\":\"exact\",\"pattern\":\"x\",\"patch\":{}}").status).toBe(400)
+  expect(handleApi(s, "POST", po, "{\"scope_kind\":\"global\",\"match_type\":\"wildcard\",\"pattern\":\"gpt\",\"patch\":{}}").status).toBe(400)
+  expect(handleApi(s, "POST", po, "{\"scope_kind\":\"global\",\"match_type\":\"exact\",\"pattern\":\"x\",\"patch\":\"nope\"}").status).toBe(400)
+  const created = handleApi(s, "POST", po, bad)
+  expect(created.status).toBe(201)
+  expect(created.body.includes("\"patch\":{\"input_cost_per_token\":0.000001}")).toBe(true)
+  const idOf = try JSON.parse(created.body) as { id: string }
+  const id = idOf.id
+  expect(s.cfg.governance!.pricing_overrides!.length).toBe(1)
+  const put = handleApi(s, "PUT", po + "/" + id, "{\"provider_id\":null,\"pattern\":\"gpt-4*\",\"match_type\":\"wildcard\"}")
+  expect(put.status).toBe(200)
+  expect(put.body.includes("gpt-4*")).toBe(true)
+  expect(put.body.includes("\"patch\":{\"input_cost_per_token\":0.000001}")).toBe(true)
+  expect(handleApi(s, "PUT", po + "/nope", "{}").status).toBe(404)
+  expect(handleApi(s, "GET", po, "").body.includes(id)).toBe(true)
+  expect(handleApi(s, "DELETE", po + "/" + id, "").status).toBe(200)
+  expect(handleApi(s, "DELETE", po + "/" + id, "").status).toBe(404)
+  cleanup(path)
 })
