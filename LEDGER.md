@@ -39,7 +39,7 @@ Status: `todo` → `assigned` → `review` → `done` (or `blocked`, `rework`).
 | ID | Work | Status |
 |---|---|---|
 | X01 | Integrate each module into gateway/server; e2e coverage per feature | ongoing |
-| X02 | Model aliases (`aliases` on keys) | todo |
+| X02 | Model aliases (`aliases` on keys) | done |
 | X03 | Keep SCOPE.md status and README in sync | ongoing |
 
 ## Log
