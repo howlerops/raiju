@@ -531,7 +531,105 @@ function mapVectorStore(inout top: Field[], inout notes: string[]): void throws 
   put(&top, "vector_store", out)
 }
 
-// Takes the semantic cache out of plugins[]; the other plugins stay in place.
+// A collector URL as Raiju's OTLP/HTTP exporter takes it. A bare host:port gets http://.
+// A gRPC port 4317 moves to the HTTP port 4318. A trace URL with no path gets /v1/traces
+// (for HTTP profiles, or a gRPC one whose port moved).
+function otelUrl(raw: string, grpc: bool, tracePath: bool, label: string, inout notes: string[]): string {
+  let u = raw
+  if (!u.includes("://")) {
+    u = "http://" + u
+    notes.push(`config: "${label}" has no scheme; http:// is assumed`)
+  }
+  const parts = u.split("/")
+  let hostport = parts[2]!
+  let moved = false
+  if (grpc) {
+    if (hostport.endsWith(":4317")) {
+      hostport = hostport.slice(0, hostport.byteLength - 5) + ":4318"
+      moved = true
+      notes.push(`config: "${label}" uses gRPC port 4317; Raiju exports OTLP/HTTP, so the HTTP port 4318 is used`)
+    } else {
+      notes.push(`config: "${label}" uses protocol "grpc"; Raiju exports OTLP/HTTP only, so the URL must be an OTLP/HTTP endpoint`)
+    }
+  }
+  parts[2] = hostport
+  let out = parts.join("/")
+  const noPath = parts.length <= 3 || (parts.length === 4 && parts[3] === "")
+  if (tracePath && noPath && (!grpc || moved)) {
+    if (out.endsWith("/")) out = out.slice(0, out.byteLength - 1)
+    out = out + "/v1/traces"
+  }
+  return out
+}
+
+// The Bifrost otel plugin entry becomes the top-level otel section. Its config is a
+// profiles wrapper or one flat profile; the first enabled profile is read. Bifrost's
+// trace and metrics headers, timeout, TLS and request header settings carry over.
+function mapOtelPlugin(f: Field[], pname: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  if (rawBool(f, "enabled") === false) {
+    notes.push(`config: plugin "${pname}" is disabled in Bifrost and is not loaded`)
+    return
+  }
+  if (find(top, "otel") !== undefined) {
+    notes.push(`config: plugin "${pname}" is ignored: "otel" is set, and it wins`)
+    return
+  }
+  const path = `plugins[${pname}].config`
+  const cf = try members(find(f, "config"))
+  let prof: Field[] = cf
+  if (find(cf, "profiles") !== undefined) {
+    let en: Field[][] = []
+    for (const el of try items(find(cf, "profiles"))) {
+      const pf = try members(el)
+      if (rawBool(pf, "enabled") !== false) en.push(pf)
+    }
+    if (en.length === 0) {
+      notes.push(`config: plugin "${pname}" has no enabled profile; it is not loaded`)
+      return
+    }
+    if (en.length > 1) notes.push(`config: plugin "${pname}" has ${en.length - 1} more enabled profile(s); Raiju exports the first only`)
+    prof = en[0]!
+    ignored(path, cf, ["plugin_span_filter", "export_overhead_spans"], &notes)
+  }
+  ignored(path, prof, ["trace_type", "overhead_breakdown_enabled", "export_raw_payloads", "group_traces_by_session", "disable_root_span_content", "plugin_span_filter", "export_overhead_spans"], &notes)
+
+  const traces = rawBool(prof, "traces_enabled") !== false
+  const grpc = rawStr(prof, "protocol") === "grpc"
+  const https = (strRaw(prof, "collector_url") ?? "").includes("https://")
+  let out: Field[] = []
+  let endpoint = ""
+  const coll = strRaw(prof, "collector_url")
+  if (traces) {
+    if (coll === undefined) notes.push(`config: plugin "${pname}" has traces on and no collector_url; traces are not exported`)
+    else endpoint = otelUrl(try decodeString(coll), grpc, true, "collector_url", &notes)
+  }
+  add(&out, "endpoint", quote(endpoint))
+  if (!traces) add(&out, "traces_enabled", "false")
+  add(&out, "service_name", strRaw(prof, "service_name") ?? quote("bifrost"))
+  add(&out, "headers", find(prof, "headers"))
+  add(&out, "trace_headers", find(prof, "trace_headers"))
+  add(&out, "metrics_headers", find(prof, "metrics_headers"))
+  // Bifrost's default trace export timeout is 5 seconds
+  add(&out, "export_timeout", find(prof, "export_timeout") ?? "5")
+  add(&out, "metrics_enabled", find(prof, "metrics_enabled"))
+  add(&out, "metrics_push_interval", find(prof, "metrics_push_interval"))
+  const mep = strRaw(prof, "metrics_endpoint")
+  if (mep !== undefined) add(&out, "metrics_endpoint", quote(otelUrl(try decodeString(mep), grpc, false, "metrics_endpoint", &notes)))
+  add(&out, "request_headers", find(prof, "request_headers"))
+  add(&out, "excluded_attributes", find(prof, "excluded_attributes"))
+  add(&out, "disable_content_logging", find(prof, "disable_content_logging"))
+  add(&out, "tls_ca_cert", strRaw(prof, "tls_ca_cert"))
+  const ins = find(prof, "insecure")
+  if (ins !== undefined) {
+    add(&out, "insecure", ins)
+  } else if (https) {
+    notes.push(`config: plugin "${pname}" has no "insecure"; Raiju verifies the collector's certificate, where Bifrost skips verification when it is omitted`)
+  }
+  put(&top, "otel", out)
+  notes.push(`config: plugin "${pname}" read as "otel"`)
+}
+
+// Takes the semantic cache and the otel plugin out of plugins[]; the other plugins stay in place.
 function mapPlugins(inout top: Field[], inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "plugins")
   if (raw === undefined || !raw.startsWith("[")) return
@@ -540,6 +638,10 @@ function mapPlugins(inout top: Field[], inout notes: string[]): void throws Synt
   for (const el of try elements(raw)) {
     const f = try members(el)
     const name = rawStr(f, "name") ?? ""
+    if (name === "otel") {
+      try mapOtelPlugin(f, name, &top, &notes)
+      continue
+    }
     if (name !== "semantic_cache" && name !== "semanticcache") {
       keep.push(el)
       continue
@@ -945,6 +1047,93 @@ test("a whole Bifrost example: what is mapped and what is left", () => {
   expect(w.includes(`config: unknown key "mcp.tool_manager_config" is ignored`)).toBe(true)
   expect(w.includes(`config: unknown key "$schema" is ignored`)).toBe(false)
   expect(w.length).toBe(3 + 3)
+})
+
+test("maps a flat otel plugin entry and drops it from plugins", () => {
+  const r = try normalize(`{
+    "plugins": [
+      { "enabled": true, "name": "otel", "config": {
+        "collector_url": "http://otel-collector:4318", "trace_type": "genai_extension", "protocol": "http", "service_name": "bifrost-gateway",
+        "headers": { "x-key": "a" }, "trace_headers": { "x-trace": "t" }, "metrics_headers": { "x-metric": "m" },
+        "export_timeout": 8, "request_headers": ["x-team", "x-custom-*"], "excluded_attributes": ["gen_ai.request.tools"],
+        "disable_content_logging": true, "insecure": true,
+        "metrics_enabled": true, "metrics_endpoint": "http://otel-collector:4318/v1/metrics", "metrics_push_interval": 30 } },
+      { "enabled": true, "name": "maxtokens", "config": {} }
+    ]
+  }`)
+  const o = try fields(find(try fields(r.text), "otel")!)
+  expect(rawStr(o, "endpoint")).toBe("http://otel-collector:4318/v1/traces")
+  expect(rawStr(o, "service_name")).toBe("bifrost-gateway")
+  expect(find(o, "headers")).toBe(`{ "x-key": "a" }`)
+  expect(find(o, "trace_headers")).toBe(`{ "x-trace": "t" }`)
+  expect(find(o, "metrics_headers")).toBe(`{ "x-metric": "m" }`)
+  expect(find(o, "export_timeout")).toBe("8")
+  expect(find(o, "request_headers")).toBe(`["x-team", "x-custom-*"]`)
+  expect(find(o, "excluded_attributes")).toBe(`["gen_ai.request.tools"]`)
+  expect(find(o, "disable_content_logging")).toBe("true")
+  expect(find(o, "insecure")).toBe("true")
+  expect(rawStr(o, "metrics_endpoint")).toBe("http://otel-collector:4318/v1/metrics")
+  expect(find(o, "metrics_push_interval")).toBe("30")
+  expect(find(o, "trace_type")).toBeUndefined()
+  const plugins = try elements(find(try fields(r.text), "plugins")!)
+  expect(plugins.length).toBe(1)
+  expect(r.notes.includes(`config: plugin "otel" read as "otel"`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[otel].config.trace_type" is not supported by Raiju and is ignored`)).toBe(true)
+})
+
+test("otel defaults: bifrost service name, 5 second export timeout, and no insecure unless set", () => {
+  const r = try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": { "collector_url": "https://c.example:4318/custom", "protocol": "http" } } ] }`)
+  const o = try fields(find(try fields(r.text), "otel")!)
+  expect(rawStr(o, "endpoint")).toBe("https://c.example:4318/custom")
+  expect(rawStr(o, "service_name")).toBe("bifrost")
+  expect(find(o, "export_timeout")).toBe("5")
+  expect(find(o, "insecure")).toBeUndefined()
+  expect(r.notes.some((n) => n.includes(`has no "insecure"`))).toBe(true)
+})
+
+test("otel grpc port 4317 moves to the HTTP port 4318 with a note, and a bare host gets http", () => {
+  const r = try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": { "collector_url": "collector:4317", "protocol": "grpc", "metrics_enabled": true, "metrics_endpoint": "collector:4317/v1/metrics" } } ] }`)
+  const o = try fields(find(try fields(r.text), "otel")!)
+  expect(rawStr(o, "endpoint")).toBe("http://collector:4318/v1/traces")
+  expect(rawStr(o, "metrics_endpoint")).toBe("http://collector:4318/v1/metrics")
+  expect(r.notes.includes(`config: "collector_url" uses gRPC port 4317; Raiju exports OTLP/HTTP, so the HTTP port 4318 is used`)).toBe(true)
+  expect(r.notes.includes(`config: "collector_url" has no scheme; http:// is assumed`)).toBe(true)
+  const other = try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": { "collector_url": "http://c:9999", "protocol": "grpc" } } ] }`)
+  expect(rawStr(try fields(find(try fields(other.text), "otel")!), "endpoint")).toBe("http://c:9999")
+  expect(other.notes.includes(`config: "collector_url" uses protocol "grpc"; Raiju exports OTLP/HTTP only, so the URL must be an OTLP/HTTP endpoint`)).toBe(true)
+})
+
+test("otel profiles: the first enabled profile is read and the rest are noted", () => {
+  const r = try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": { "profiles": [
+    { "enabled": false, "collector_url": "http://off:4318", "protocol": "http" },
+    { "enabled": true, "collector_url": "http://first:4318/x", "protocol": "http", "service_name": "one", "plugin_span_filter": { "mode": "include", "plugins": [] } },
+    { "enabled": true, "collector_url": "http://second:4318", "protocol": "http" }
+  ], "plugin_span_filter": { "mode": "exclude", "plugins": ["governance"] } } } ] }`)
+  const o = try fields(find(try fields(r.text), "otel")!)
+  expect(rawStr(o, "endpoint")).toBe("http://first:4318/x")
+  expect(rawStr(o, "service_name")).toBe("one")
+  expect(r.notes.includes(`config: plugin "otel" has 1 more enabled profile(s); Raiju exports the first only`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[otel].config.plugin_span_filter" is not supported by Raiju and is ignored`)).toBe(true)
+  const none = try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": { "profiles": [ { "enabled": false, "collector_url": "http://x" } ] } } ] }`)
+  expect(find(try fields(none.text), "otel")).toBeUndefined()
+})
+
+test("a metrics-only otel profile needs no collector_url, and a disabled or shadowed plugin is not loaded", () => {
+  const m = try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": { "traces_enabled": false, "metrics_enabled": true, "metrics_endpoint": "http://m:4318/v1/metrics", "protocol": "http" } } ] }`)
+  const mo = try fields(find(try fields(m.text), "otel")!)
+  expect(rawStr(mo, "endpoint")).toBe("")
+  expect(rawBool(mo, "traces_enabled")).toBe(false)
+  expect(rawStr(mo, "metrics_endpoint")).toBe("http://m:4318/v1/metrics")
+  expect(m.notes.some((n) => n.includes("no collector_url"))).toBe(false)
+
+  const off = try normalize(`{ "plugins": [ { "enabled": false, "name": "otel", "config": { "collector_url": "http://c:4318" } } ] }`)
+  expect(find(try fields(off.text), "otel")).toBeUndefined()
+  expect(find(try fields(off.text), "plugins")).toBe("[]")
+  expect(off.notes.includes(`config: plugin "otel" is disabled in Bifrost and is not loaded`)).toBe(true)
+
+  const shadow = try normalize(`{ "otel": { "endpoint": "http://mine:4318/v1/traces" }, "plugins": [ { "enabled": true, "name": "otel", "config": { "collector_url": "http://c:4318" } } ] }`)
+  expect(rawStr(try fields(find(try fields(shadow.text), "otel")!), "endpoint")).toBe("http://mine:4318/v1/traces")
+  expect(shadow.notes.includes(`config: plugin "otel" is ignored: "otel" is set, and it wins`)).toBe(true)
 })
 
 test("invalid JSON throws SyntaxError", () => {

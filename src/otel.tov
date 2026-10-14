@@ -2,6 +2,9 @@
 // span per gateway request, a client span per upstream attempt, sent as OTLP
 // JSON over HTTP. An inbound W3C traceparent continues the caller's trace.
 
+import { readFileSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+
 export type OtelConfig = {
   endpoint: string,
   service_name?: string,
@@ -14,7 +17,25 @@ export type OtelConfig = {
   metrics_endpoint?: string,
   metrics_headers?: Map<string, string>,
   metrics_push_interval?: int,
+  // Bifrost's profile fields for traces: false keeps the spans off (metrics only)
+  traces_enabled?: bool,
+  trace_headers?: Map<string, string>,
+  // header name patterns (exact, "*" or "x-custom-*") recorded on the request span
+  request_headers?: string[],
+  // span attribute keys dropped before export, matched exactly
+  excluded_attributes?: string[],
+  // drops gen_ai content attributes (prompts, messages, tool arguments and results)
+  disable_content_logging?: bool,
+  // seconds per export request; unset is 10
+  export_timeout?: int,
+  // path to a PEM CA file for the collector; wins over insecure
+  tls_ca_cert?: string,
+  // skip certificate verification for the collector
+  insecure?: bool,
 }
+
+// TLS options for Tov's fetch.
+export type TlsOpts = { rejectUnauthorized?: bool, ca?: string }
 
 export type TraceContext = { traceId: string, parentId: string, sampled: bool }
 
@@ -146,6 +167,76 @@ export class Span {
   }
 }
 
+const DEFAULT_EXPORT_MS: int = 10000
+const MAX_EXPORT_S: int = 60
+
+// Milliseconds for one export request. Unset or below 1 second is the default; above
+// the 60 second cap is the cap (Bifrost rejects those at Init).
+export function exportTimeoutMs(s: int | undefined): int {
+  if (s === undefined || s < 1) return DEFAULT_EXPORT_MS
+  if (s > MAX_EXPORT_S) return MAX_EXPORT_S * 1000
+  return s * 1000
+}
+
+// Whether spans are exported at all. A metrics-only profile has traces_enabled false.
+export function tracesOn(cfg: OtelConfig): bool {
+  return cfg.traces_enabled !== false && cfg.endpoint !== ""
+}
+
+// TLS for the collector. A CA file wins and keeps verification on; otherwise
+// insecure skips it. undefined is the default (system roots). An unreadable CA
+// file is logged, and the default applies.
+export function otelTls(cfg: OtelConfig): TlsOpts | undefined {
+  const ca = cfg.tls_ca_cert ?? ""
+  if (ca !== "") {
+    try {
+      return { rejectUnauthorized: true, ca: readFileSync(ca, "utf8") }
+    } catch (e) {
+      console.error(`raiju: otel tls_ca_cert ${ca} is unreadable: ${e.message}`)
+      return undefined
+    }
+  }
+  if (cfg.insecure === true) return { rejectUnauthorized: false }
+  return undefined
+}
+
+// Bifrost's header pattern match: exact name, "*" for all, or a trailing "*" prefix.
+export function headerMatches(name: string, pattern: string): bool {
+  const p = pattern.trim().toLowerCase()
+  if (p === "") return false
+  if (p === "*") return true
+  if (p.endsWith("*")) return name.startsWith(p.slice(0, p.byteLength - 1))
+  return name === p
+}
+
+// Credential-bearing header names, as Bifrost's IsSensitiveHeader. Their values are
+// recorded as REDACTED.
+export function isSensitiveHeader(name: string): bool {
+  const n = name.trim().toLowerCase()
+  if (n === "authorization" || n === "proxy-authorization" || n === "cookie" || n === "set-cookie" || n === "x-bf-vk") return true
+  return n.includes("api-key") || n.includes("authorization") || n.includes("secret") || n.includes("assertion") || n.includes("jwt") || n.startsWith("cf-access-") || n.startsWith("x-amzn-oidc-") || n.endsWith("-token") || n.endsWith("_token")
+}
+
+// The gen_ai attribute keys that carry message, prompt, tool or raw body content.
+const CONTENT_ATTRS: string[] = [
+  "gen_ai.input.messages", "gen_ai.input.text", "gen_ai.input.speech", "gen_ai.input.embedding",
+  "gen_ai.request.prompt", "gen_ai.request.instructions", "gen_ai.request.suffix",
+  "gen_ai.request.tools", "gen_ai.request.tool_choice_type", "gen_ai.request.tool_choice_name",
+  "gen_ai.responses.tools", "gen_ai.responses.tool_choice_type", "gen_ai.responses.tool_choice_name",
+  "gen_ai.output.messages", "gen_ai.responses.reasoning",
+  "gen_ai.tool.name", "gen_ai.tool.call.id", "gen_ai.tool.call.arguments", "gen_ai.tool.call.result", "gen_ai.tool.type",
+  "bifrost.raw_request", "bifrost.raw_response",
+]
+
+// Whether an attribute is exported under cfg: not excluded, and not content when
+// disable_content_logging is set.
+function keepAttr(cfg: OtelConfig, k: string): bool {
+  const ex = cfg.excluded_attributes ?? []
+  if (ex.includes(k)) return false
+  if (cfg.disable_content_logging === true && CONTENT_ATTRS.includes(k)) return false
+  return true
+}
+
 // Spans are queued when they finish and sent in batches. A caller that has
 // nothing to flush can ignore the tracer entirely.
 export class Tracer {
@@ -155,12 +246,30 @@ export class Tracer {
   flushMs: f64
   ratio: f64
   serviceName: string
+  tls: TlsOpts | undefined = undefined
 
   constructor(readonly cfg: OtelConfig) {
     this.batchSize = cfg.batch_size ?? 512
     this.flushMs = cfg.flush_ms ?? 2000
     this.ratio = cfg.sample_ratio ?? 1.0
     this.serviceName = cfg.service_name ?? "raiju"
+    this.tls = otelTls(cfg)
+  }
+
+  // Records the request headers that match request_headers on the request span, as
+  // http.request.header.<name>. Credential values are REDACTED, and the name stays.
+  recordRequestHeaders(span: Span, h: Map<string, string>): void {
+    const pats = this.cfg.request_headers ?? []
+    if (pats.length === 0) return
+    for (const name of h.keys()) {
+      let hit = false
+      for (const p of pats) {
+        if (headerMatches(name, p)) hit = true
+      }
+      if (!hit) continue
+      const v = isSensitiveHeader(name) ? "REDACTED" : h.get(name)!
+      span.setStr("http.request.header." + name, v)
+    }
   }
 
   // The inbound sampled flag wins when a valid traceparent came in. Otherwise
@@ -195,7 +304,7 @@ export class Tracer {
   flushPayload(): string | undefined {
     if (this.pending.length === 0) return undefined
     const spans: OtlpSpan[] = []
-    for (const s of this.pending) spans.push(spanJson(s))
+    for (const s of this.pending) spans.push(spanJson(s, this.cfg))
     this.pending = []
     this.lastFlushMs = Date.now()
     const payload: OtlpPayload = {
@@ -234,10 +343,10 @@ function attrKv(k: string, v: AttrValue): OtlpKv {
   return { key: k, value: { intValue: "" + v.i } }
 }
 
-function spanJson(s: Span): OtlpSpan {
+function spanJson(s: Span, cfg: OtelConfig): OtlpSpan {
   const attrs: OtlpKv[] = []
   for (const k of s.attributes.keys()) {
-    attrs.push(attrKv(k, s.attributes.get(k)!))
+    if (keepAttr(cfg, k)) attrs.push(attrKv(k, s.attributes.get(k)!))
   }
   return {
     traceId: s.traceId,
@@ -285,14 +394,19 @@ export function genAiAttributes(span: Span, a: GenAiAttrs): void {
 }
 
 // The HTTP request that sends one flushed payload. The caller does the fetch.
-export function exportRequest(cfg: OtelConfig, payload: string): { url: string, headers: Map<string, string>, body: string } {
+// headers is the shared set, then trace_headers, which win on a key collision.
+export function exportRequest(cfg: OtelConfig, payload: string): { url: string, headers: Map<string, string>, body: string, timeoutMs: int } {
   const headers: Map<string, string> = new Map()
   headers.set("content-type", "application/json")
   const extra = cfg.headers
   if (extra !== undefined) {
     for (const k of extra.keys()) headers.set(k, extra.get(k)!)
   }
-  return { url: cfg.endpoint, headers: headers, body: payload }
+  const own = cfg.trace_headers
+  if (own !== undefined) {
+    for (const k of own.keys()) headers.set(k, own.get(k)!)
+  }
+  return { url: cfg.endpoint, headers: headers, body: payload, timeoutMs: exportTimeoutMs(cfg.export_timeout) }
 }
 
 // ---- tests ----
@@ -490,4 +604,105 @@ test("exportRequest carries the content type and configured headers", () => {
   expect(req.headers.get("content-type")).toBe("application/json")
   expect(req.headers.get("x-honeycomb-team")).toBe("key")
   expect(req.body).toBe("{}")
+})
+
+test("trace_headers overlay the shared headers on the trace export only", () => {
+  const shared: Map<string, string> = new Map()
+  shared.set("x-key", "shared")
+  shared.set("x-team", "a")
+  const own: Map<string, string> = new Map()
+  own.set("x-key", "trace")
+  const req = exportRequest({ endpoint: "http://c/v1/traces", headers: shared, trace_headers: own }, "{}")
+  expect(req.headers.get("x-key")).toBe("trace")
+  expect(req.headers.get("x-team")).toBe("a")
+  expect(shared.get("x-key")).toBe("shared")
+})
+
+test("export timeout: default 10s, seconds converted, capped at 60", () => {
+  expect(exportTimeoutMs(undefined)).toBe(10000)
+  expect(exportTimeoutMs(0)).toBe(10000)
+  expect(exportTimeoutMs(3)).toBe(3000)
+  expect(exportTimeoutMs(600)).toBe(60000)
+  expect(exportRequest({ endpoint: "x", export_timeout: 4 }, "{}").timeoutMs).toBe(4000)
+})
+
+test("traces_enabled false turns span export off", () => {
+  expect(tracesOn({ endpoint: "http://c/v1/traces" })).toBe(true)
+  expect(tracesOn({ endpoint: "http://c/v1/traces", traces_enabled: false })).toBe(false)
+  expect(tracesOn({ endpoint: "" })).toBe(false)
+})
+
+test("header patterns: exact, prefix wildcard and *; credentials are redacted", () => {
+  expect(headerMatches("x-team", "X-Team")).toBe(true)
+  expect(headerMatches("x-custom-a", "x-custom-*")).toBe(true)
+  expect(headerMatches("x-other", "x-custom-*")).toBe(false)
+  expect(headerMatches("anything", "*")).toBe(true)
+  expect(headerMatches("x-team", "")).toBe(false)
+  expect(isSensitiveHeader("Authorization")).toBe(true)
+  expect(isSensitiveHeader("x-api-key")).toBe(true)
+  expect(isSensitiveHeader("x-session-token")).toBe(true)
+  expect(isSensitiveHeader("x-team")).toBe(false)
+
+  const tr = new Tracer({ endpoint: "x", request_headers: ["x-team", "x-custom-*", "authorization"] })
+  const h: Map<string, string> = new Map()
+  h.set("x-team", "search")
+  h.set("x-custom-id", "42")
+  h.set("authorization", "Bearer secret")
+  h.set("accept", "json")
+  const span = tr.startRequest("chat", undefined, 1700000000000)
+  tr.recordRequestHeaders(span, h)
+  expect(span.attributes.get("http.request.header.x-team")).toEqual({ kind: "s", s: "search" })
+  expect(span.attributes.get("http.request.header.x-custom-id")).toEqual({ kind: "s", s: "42" })
+  expect(span.attributes.get("http.request.header.authorization")).toEqual({ kind: "s", s: "REDACTED" })
+  expect(span.attributes.get("http.request.header.accept")).toBeUndefined()
+
+  const none = new Tracer({ endpoint: "x" })
+  const bare = none.startRequest("chat", undefined, 1700000000000)
+  none.recordRequestHeaders(bare, h)
+  expect(bare.attributes.size).toBe(0)
+})
+
+test("excluded_attributes drops exact keys from the exported span", () => {
+  const tr = new Tracer({ endpoint: "x", excluded_attributes: ["gen_ai.request.tools"] })
+  const span = tr.startRequest("chat", undefined, 1700000000000)
+  span.setStr("gen_ai.request.tools", "big")
+  span.setStr("gen_ai.request.model", "m")
+  span.end(1700000000001)
+  tr.finish(span)
+  const text = tr.flushPayload()!
+  expect(text.includes("gen_ai.request.tools")).toBe(false)
+  expect(text.includes(`{"key":"gen_ai.request.model","value":{"stringValue":"m"}}`)).toBe(true)
+})
+
+test("disable_content_logging drops content attributes and keeps metadata", () => {
+  const off = new Tracer({ endpoint: "x", disable_content_logging: true })
+  const span = off.startRequest("chat", undefined, 1700000000000)
+  span.setStr("gen_ai.input.messages", "hi")
+  span.setStr("gen_ai.tool.call.arguments", "{}")
+  span.setStr("gen_ai.request.model", "m")
+  span.end(1700000000001)
+  off.finish(span)
+  const text = off.flushPayload()!
+  expect(text.includes("gen_ai.input.messages")).toBe(false)
+  expect(text.includes("gen_ai.tool.call.arguments")).toBe(false)
+  expect(text.includes("gen_ai.request.model")).toBe(true)
+
+  const on = new Tracer({ endpoint: "x" })
+  const kept = on.startRequest("chat", undefined, 1700000000000)
+  kept.setStr("gen_ai.input.messages", "hi")
+  kept.end(1700000000001)
+  on.finish(kept)
+  expect(on.flushPayload()!.includes("gen_ai.input.messages")).toBe(true)
+})
+
+test("tls: insecure skips verification, a CA file keeps it on, unreadable CA falls back", () => {
+  expect(otelTls({ endpoint: "https://c/v1/traces" })).toBeUndefined()
+  expect(otelTls({ endpoint: "https://c/v1/traces", insecure: true })).toEqual({ rejectUnauthorized: false })
+  const path = `${try tmpdir()}/raiju-otel-ca-test.pem`
+  try writeFileSync(path, "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n")
+  const ca = otelTls({ endpoint: "https://c/v1/traces", tls_ca_cert: path, insecure: true })
+  expect(ca?.rejectUnauthorized).toBe(true)
+  expect(ca?.ca?.includes("BEGIN CERTIFICATE")).toBe(true)
+  expect(otelTls({ endpoint: "https://c", tls_ca_cert: `${try tmpdir()}/raiju-no-such-ca.pem` })).toBeUndefined()
+  expect(new Tracer({ endpoint: "https://c", insecure: true }).tls).toEqual({ rejectUnauthorized: false })
 })

@@ -31,7 +31,7 @@ import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
 import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails"
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
-import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor } from "./otel"
+import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts } from "./otel"
 import { McpManager, injectTools, executeEndpointBody, toolMessage } from "./mcp"
 import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, buildChain } from "./plugins"
@@ -554,7 +554,7 @@ export class Engine {
     const mc = cfg.mcp
     if (mc !== undefined && (mc.client_configs ?? []).length > 0) this.mcp = new McpManager(mc)
     const oc = cfg.otel
-    if (oc !== undefined && oc.endpoint !== "") this.tracer = new Tracer(oc)
+    if (oc !== undefined && tracesOn(oc)) this.tracer = new Tracer(oc)
     const rr = cfg.governance?.routing_rules
     if (rr !== undefined && rr.length > 0) {
       const rs = new RuleSet(rr)
@@ -1111,7 +1111,11 @@ export class Engine {
     ctx.makeConverter = makeConverter
     if (upstreamHeaders !== undefined) ctx.upstreamHeaders = upstreamHeaders
     const tracer = this.tracer
-    if (tracer !== undefined) ctx.span = tracer.startRequest(op, h.get("traceparent"), Date.now())
+    if (tracer !== undefined) {
+      const rs = tracer.startRequest(op, h.get("traceparent"), Date.now())
+      tracer.recordRequestHeaders(rs, h)
+      ctx.span = rs
+    }
     ctx.contentOff = this.contentOff(h)
     if (this.logStore !== undefined && !ctx.contentOff) ctx.input = text
     const res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed)
@@ -1389,7 +1393,7 @@ export class Engine {
     const payload = tracer.flushPayload()
     if (payload === undefined) return
     const up = exportRequest(tracer.cfg, payload)
-    sendSpans(up.url, up.headers, up.body)
+    sendSpans(up.url, up.headers, up.body, tracer.tls, up.timeoutMs)
   }
 
   // Chat completions. With MCP agent mode on (client.mcp_auto_execute), tool calls to
@@ -1624,10 +1628,10 @@ export class Engine {
   }
 }
 
-async function sendSpans(url: string, headers: Map<string, string>, body: string): Promise<void> {
+async function sendSpans(url: string, headers: Map<string, string>, body: string, tls: TlsOpts | undefined, timeoutMs: int): Promise<void> {
   try {
     const hs: Record<string, string> = headers
-    const res = await fetch(url, { method: "POST", headers: hs, body: body, signal: deadline(10000).controller.signal })
+    const res = await fetch(url, { method: "POST", headers: hs, body: body, tls: tls, signal: deadline(timeoutMs).controller.signal })
     await res.text()
     if (!res.ok) console.error(`raiju: trace export returned HTTP ${res.status}`)
   } catch (e) {
