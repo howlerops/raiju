@@ -348,6 +348,22 @@ def main():
         check("header plugin tags upstream requests", last["team"] == "e2e", last)
         check("maxtokens plugin sets a default", json.loads(last["body"]).get("max_tokens") == 777, last["body"][:200])
 
+        # Semantic cache: a near-duplicate prompt with the same cache key is served from cache
+        key = {"x-bf-cache-key": "faq", "x-bf-mcp-include-clients": "none"}  # requests with tools are never cached
+        def ask(q, extra=None):
+            return call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": q}]}, {**key, **(extra or {})})
+        s, h, _ = ask("What is the capital city of France?")
+        n = len(seen())
+        s, h, b = ask("what is the capital city of france ?")
+        hl = {k.lower(): v for k, v in h.items()}
+        check("semantic cache serves a near-duplicate prompt", s == 200 and hl.get("x-bf-cache") == "semantic-hit" and float(hl.get("x-bf-cache-similarity", 0)) >= 0.95 and len([x for x in seen()[n:] if x["path"] == "/v1/chat/completions"]) == 0, (h, b))
+        s, h, _ = ask("Write a haiku about penguins sliding on ice")
+        hl = {k.lower(): v for k, v in h.items()}
+        check("semantic cache misses an unrelated prompt", hl.get("x-bf-cache") != "semantic-hit", h)
+        n = len(seen())
+        call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "what is the capital city of france ??"}]})
+        check("no semantic lookup without a cache key", not any(x["path"] == "/v1/embeddings" for x in seen()[n:]))
+
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
 

@@ -21,6 +21,7 @@ import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor } from "./
 import { McpManager, injectTools, executeEndpointBody, toolMessage } from "./mcp"
 import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, buildChain } from "./plugins"
+import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey } from "./semcache"
 import { Deadline, deadline } from "./deadline"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
@@ -128,6 +129,8 @@ export class Engine {
   mcp: McpManager | undefined = undefined
   jobs: JobStore
   plugins: PluginChain | undefined = undefined
+  semantic: SemanticCache | undefined = undefined
+  semanticCfg: SemanticCacheConfig = defaultSemanticConfig()
   guardInput = false
   guardOutput = false
   pricing: Pricing
@@ -143,6 +146,20 @@ export class Engine {
       const built = buildChain(specs.map((p) => ({ name: p.name, enabled: p.enabled, configJson: p.config_json ?? "{}" })))
       for (const e of built.errors) console.error(`raiju: plugin: ${e}`)
       this.plugins = built.chain
+    }
+    const sc = cfg.semantic_cache
+    if (sc !== undefined && sc.enabled !== false && sc.embedding_model !== "") {
+      const d = defaultSemanticConfig()
+      this.semanticCfg = {
+        threshold: sc.threshold ?? d.threshold,
+        ttl_ms: (sc.ttl ?? 300) * 1000,
+        max_entries: sc.max_entries ?? d.max_entries,
+        conversation_history_threshold: sc.conversation_history_threshold ?? d.conversation_history_threshold,
+        exclude_system_prompt: sc.exclude_system_prompt ?? d.exclude_system_prompt,
+        cache_by_model: sc.cache_by_model ?? d.cache_by_model,
+        cache_by_provider: sc.cache_by_provider ?? d.cache_by_provider,
+      }
+      this.semantic = new SemanticCache(this.semanticCfg)
     }
     this.jobs = new JobStore((cfg.client?.async_job_result_ttl ?? 3600) * 1000, 10000)
     const hc = cfg.health
@@ -324,6 +341,26 @@ export class Engine {
     this.plugins = fresh.plugins
     this.logRequests = fresh.logRequests
     if (this.cache === undefined) this.cache = fresh.cache
+    if (this.semantic === undefined) {
+      this.semantic = fresh.semantic
+      this.semanticCfg = fresh.semanticCfg
+    }
+  }
+
+  // Embeds text with the semantic cache's embedding provider and model.
+  async embed(text: string): Promise<f64[]> throws Error {
+    const sc = this.cfg.semantic_cache!
+    const none: Set<int> = new Set()
+    const sel = target(this.cfg, { provider: sc.provider, model: sc.embedding_model }, none, undefined)
+    if (sel === undefined) throw new Error(`no key for the embedding model ${sc.provider}/${sc.embedding_model}`)
+    const up = try providers.embeddingsUpstream(sel.t, try fields(`{"model":${quote(sc.embedding_model)},"input":${quote(text)}}`))
+    const hs: Record<string, string> = up.headers
+    const dl = deadline(10000)
+    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal })
+    const body = try await res.text()
+    dl.finish()
+    if (!res.ok) throw new Error(`embedding request failed with HTTP ${res.status}`)
+    return try parseEmbedding(body)
   }
 
   // Adds the connected MCP servers' tools to a chat request. x-bf-mcp-include-clients
@@ -477,6 +514,34 @@ export class Engine {
       }
     }
 
+    // Semantic cache: only for requests that name a cache key (header or config default).
+    let semScope = ""
+    let semVec: f64[] = []
+    const sem = this.semantic
+    const semKey = h.get("x-bf-cache-key") ?? this.cfg.semantic_cache?.default_cache_key
+    if (sem !== undefined && semKey !== undefined && op === "chat" && h.get("x-bf-cache-type") !== "direct") {
+      try {
+        const pt = promptText(text, this.semanticCfg)
+        if (pt !== undefined) {
+          semVec = await this.embed(pt)
+          semScope = scopeKey(primary.provider, primary.model, semKey, this.semanticCfg)
+          const th = h.get("x-bf-cache-threshold")
+          const hit = sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : parseFloat(th))
+          if (hit !== undefined) {
+            metrics.inc("bifrost_cache_hits_total", metrics.labels(primary.provider, primary.model, "semantic"), 1.0)
+            out.set("x-bf-cache", "semantic-hit")
+            out.set("x-bf-cache-similarity", hit.score.toFixed(4))
+            out.set("content-type", hit.contentType)
+            ctx.cached = true
+            return respond(200, hit.body, out)
+          }
+        }
+      } catch (e) {
+        // an embedding failure only skips the semantic cache
+        semVec = []
+      }
+    }
+
     const r = await this.attempt(allowed, h, build, translate, streamed, ctx)
     out.set("x-bf-attempts", "" + r.attempts)
     if (!r.ok) {
@@ -490,6 +555,10 @@ export class Engine {
     metrics.inc("bifrost_input_tokens_total", l, r.promptTokens)
     metrics.inc("bifrost_output_tokens_total", l, r.completionTokens)
     metrics.inc("bifrost_cost_total", l, cost)
+    if (sem !== undefined && semVec.length > 0 && !noStore) {
+      const ttlHeader = h.get("x-bf-cache-ttl")
+      sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttlHeader === undefined ? undefined : parseTtl(ttlHeader))
+    }
     if (cache !== undefined && !noStore) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? this.cacheTtlMs : parseTtl(ttlHeader) ?? this.cacheTtlMs

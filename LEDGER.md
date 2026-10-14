@@ -23,7 +23,7 @@ Status: `todo` → `assigned` → `review` → `done` (or `blocked`, `rework`).
 | L11 | Cohere | P1 | `src/providers/cohere.tov` | done | unit |
 | L12 | MCP client + tool execution | P1 | `src/mcp.tov` | done | unit + e2e (mock MCP server) |
 | L13 | Config store, management API, admin auth | P1 | `src/store.tov` | done | unit + e2e (CRUD, hot reload, redaction) |
-| L14 | Semantic cache index | P1 | `src/semcache.tov` | module done; integration is X05 | unit |
+| L14 | Semantic cache | P1 | `src/semcache.tov` | done | unit + e2e (near-duplicate hit, unrelated miss) |
 | L15 | Audio, images, files, batches | P1 | `src/media.tov` | done | unit + e2e (binary audio) |
 | L16 | Plugins | P1 | `src/plugins.tov` | done | unit + e2e (mocker, header, maxtokens) |
 | L17 | Web UI | P1 | `ui/index.html`, `src/ui_assets.tov` | done | Chromium test against a real gateway (`make ui`) |
@@ -37,7 +37,7 @@ Status: `todo` → `assigned` → `review` → `done` (or `blocked`, `rework`).
 | X02 | Model aliases | done |
 | X03 | Keep SCOPE.md and README in sync | ongoing |
 | X04 | Real streaming: serve streaming routes on the `http1` server, forward upstream chunks as they arrive | in progress |
-| X05 | Semantic cache in the request path (embed on exact miss) | todo |
+| X05 | Semantic cache in the request path (embed on exact miss) | done |
 
 ## Defects found in review (all fixed)
 
