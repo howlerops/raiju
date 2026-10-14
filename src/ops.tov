@@ -1,7 +1,7 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, providerNames } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, providerNames } from "./config"
 import { Engine } from "./gateway"
 import { ConfigStore, checkAdmin } from "./store"
 import { RbacConfig, UserConfig, Role, authorize, handleUsers, fromLegacy, required, allowed } from "./rbac"
@@ -11,6 +11,8 @@ import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp } from "./mcpserver"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
+import { ExportQueue } from "./exporters"
+import * as exporters from "./exporters"
 import { resolveAll } from "./secrets"
 import { fields, find, rawStr, isNull } from "./json"
 import { snapshot, errorJson } from "./schemas"
@@ -143,6 +145,9 @@ export class Ops {
   exportKey = ""
   cursor = new ExportCursor(Date.now())
   exporting = false
+  exportersKey = ""
+  exportersTimer: int = -1
+  sending = false
   oidcCfg: OidcConfig | undefined = undefined
   discovery: Discovery | undefined = undefined
   flows = new OidcFlows()
@@ -186,6 +191,7 @@ export class Ops {
     this.configureAlerts(cfg.alerts)
     this.configureCluster(cfg.cluster)
     this.configureExports(cfg.log_exports)
+    this.configureExporters(cfg.exporters ?? [])
     const oc = cfg.oidc
     const same = oc !== undefined && this.oidcCfg !== undefined && JSON.stringify(oc) === JSON.stringify(this.oidcCfg)
     if (!same) {
@@ -273,6 +279,50 @@ export class Ops {
     this.pushLocal(c)
     this.applyRemote(c)
     return json(200, c.encode())
+  }
+
+  // ---- log exporters (Datadog, Splunk, Elasticsearch, HTTP) ----
+
+  configureExporters(list: LogExporterConfig[]): void {
+    const key = JSON.stringify(list)
+    if (key === this.exportersKey) return
+    this.exportersKey = key
+    if (this.exportersTimer >= 0) {
+      clearInterval(this.exportersTimer)
+      this.exportersTimer = -1
+    }
+    const qs: ExportQueue[] = []
+    for (const c of list) {
+      if (c.enabled === false) continue
+      const problem = exporters.validate(c)
+      if (problem !== "") {
+        console.error(`raiju: exporter ${c.id}: ${problem}`)
+        continue
+      }
+      qs.push(new ExportQueue(c))
+    }
+    this.engine.exportQueues = qs
+    if (qs.length === 0) return
+    this.exportersTimer = setInterval(() => {
+      this.flushExporters()
+    }, 1000)
+  }
+
+  async flushExporters(): Promise<void> {
+    if (this.sending) return
+    this.sending = true
+    const now = Date.now()
+    for (const q of this.engine.exportQueues) {
+      if (!q.due(now)) continue
+      const batch = q.take(now)
+      if (batch.length === 0) continue
+      const r = exporters.batchRequest(q.cfg, batch)
+      const res = await postText(r.url, r.headers, r.body)
+      // a network error, 429 or 5xx is tried again later; any other refusal won't improve
+      if (res.status === 0 || res.status === 429 || res.status >= 500) q.requeue(batch)
+      else if (res.status >= 300) console.error(`raiju: exporter ${q.cfg.id}: HTTP ${res.status}, batch dropped`)
+    }
+    this.sending = false
   }
 
   // ---- request log exports ----

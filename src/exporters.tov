@@ -1,0 +1,499 @@
+// Log exporters: batch request log entries and build the HTTP requests that
+// ship them to Datadog, Splunk HEC, Elasticsearch or a generic HTTP endpoint.
+// The lead owns the timer and the fetch. This module builds the requests and
+// holds the queue of entries waiting to go out.
+import { LogEntry } from "./logstore"
+import { utf8 } from "./crypto"
+import { encode } from "./base64"
+import { trimSlash } from "./providers/types"
+import { LogExporterConfig } from "./config"
+
+export type ExporterConfig = LogExporterConfig
+
+export type ExportRequest = { url: string, method: "POST", headers: Map<string, string>, body: string }
+
+const DEFAULT_BATCH = 500
+const MAX_BATCH = 10000
+const DEFAULT_INTERVAL = 10
+const MAX_BATCHES = 10
+const DEFAULT_SITE = "datadoghq.com"
+const DEFAULT_SERVICE = "raiju"
+const DEFAULT_SOURCETYPE = "raiju:request"
+const BAD_INDEX_CHARS = ["/", "\\", " ", ",", "*", "?", "\"", "<", ">", "|", "#"]
+
+type DdLog = { ddsource: string, service: string, ddtags: string, hostname?: string, message: string, status: string, raiju: LogEntry }
+type HecEvent = { time: f64, event: LogEntry, sourcetype: string, index?: string }
+type BulkAction = { index: { _index: string } }
+
+function nonEmpty(v: string | undefined): string | undefined {
+  return v !== undefined && v !== "" ? v : undefined
+}
+
+function orDefault(v: string | undefined, fallback: string): string {
+  return v !== undefined && v !== "" ? v : fallback
+}
+
+function isHttpUrl(u: string | undefined): bool {
+  return u !== undefined && (u.startsWith("http://") || u.startsWith("https://"))
+}
+
+function batchSize(cfg: ExporterConfig): int {
+  const n = cfg.batch_size
+  return n !== undefined && n > 0 ? n : DEFAULT_BATCH
+}
+
+function intervalMs(cfg: ExporterConfig): f64 {
+  const s = cfg.interval_seconds
+  return (s !== undefined && s > 0 ? s : DEFAULT_INTERVAL) * 1000.0
+}
+
+// Entries leave without their request and response bodies unless the exporter
+// asks for content. Copied field by field so the bodies are absent, not empty.
+function shaped(cfg: ExporterConfig, e: LogEntry): LogEntry {
+  if (cfg.include_content === true) return e
+  return {
+    id: e.id,
+    ts: e.ts,
+    request_id: e.request_id,
+    op: e.op,
+    provider: e.provider,
+    model: e.model,
+    status: e.status,
+    latency_ms: e.latency_ms,
+    prompt_tokens: e.prompt_tokens,
+    completion_tokens: e.completion_tokens,
+    cost: e.cost,
+    cache_hit: e.cache_hit,
+    virtual_key: e.virtual_key,
+    error: e.error,
+  }
+}
+
+function pad2(n: int): string {
+  return n < 10 ? "0" + n : "" + n
+}
+
+// The UTC calendar date of a timestamp (the same algorithm as the log store's
+// day files, which does not export it).
+function utcDate(ms: f64): { y: int, m: int, d: int } {
+  const z = Math.floor(ms / 86400000.0) + 719468
+  const era = Math.floor(z / 146097)
+  const doe = z - era * 146097
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365)
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100))
+  const mp = Math.floor((5 * doy + 2) / 153)
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1
+  const m = mp < 10 ? mp + 3 : mp - 9
+  return { y: yoe + era * 400 + (m <= 2 ? 1 : 0), m: m, d: d }
+}
+
+// Expands %Y, %m and %d in an index name from the entry's UTC day.
+function indexFor(pattern: string, ts: f64): string {
+  if (!pattern.includes("%")) return pattern
+  const c = utcDate(ts)
+  return pattern.split("%Y").join("" + c.y).split("%m").join(pad2(c.m)).split("%d").join(pad2(c.d))
+}
+
+function hasBadIndexChar(s: string): bool {
+  for (const c of BAD_INDEX_CHARS) {
+    if (s.includes(c)) return true
+  }
+  return false
+}
+
+function esAuth(cfg: ExporterConfig): string | undefined {
+  const key = nonEmpty(cfg.api_key)
+  if (key !== undefined) return "ApiKey " + key
+  const user = nonEmpty(cfg.username)
+  if (user !== undefined) return "Basic " + encode(utf8(user + ":" + (cfg.password ?? "")))
+  return undefined
+}
+
+function datadogRequest(cfg: ExporterConfig, rows: LogEntry[]): ExportRequest {
+  const service = orDefault(cfg.service, DEFAULT_SERVICE)
+  const tags: string[] = cfg.tags ?? []
+  const ddtags = tags.join(",")
+  const logs: DdLog[] = []
+  for (const e of rows) {
+    logs.push({
+      ddsource: "raiju",
+      service: service,
+      ddtags: ddtags,
+      hostname: cfg.hostname,
+      message: `${e.status} ${e.provider}/${e.model} ${Math.round(e.latency_ms)}ms`,
+      status: e.status >= 400 ? "error" : "info",
+      raiju: e,
+    })
+  }
+  const headers: Map<string, string> = new Map()
+  headers.set("DD-API-KEY", cfg.api_key ?? "")
+  headers.set("content-type", "application/json")
+  const site = orDefault(cfg.site, DEFAULT_SITE)
+  return { url: "https://http-intake.logs." + site + "/api/v2/logs", method: "POST", headers: headers, body: JSON.stringify(logs) }
+}
+
+// HEC takes events back to back, with no separator between them.
+function splunkRequest(cfg: ExporterConfig, rows: LogEntry[]): ExportRequest {
+  const sourcetype = orDefault(cfg.sourcetype, DEFAULT_SOURCETYPE)
+  const index = nonEmpty(cfg.index)
+  const parts: string[] = []
+  for (const e of rows) {
+    const ev: HecEvent = { time: e.ts / 1000.0, event: e, sourcetype: sourcetype, index: index }
+    parts.push(JSON.stringify(ev))
+  }
+  const headers: Map<string, string> = new Map()
+  headers.set("Authorization", "Splunk " + (cfg.token ?? ""))
+  headers.set("content-type", "application/json")
+  return { url: trimSlash(cfg.url ?? "") + "/services/collector/event", method: "POST", headers: headers, body: parts.join("") }
+}
+
+// Each entry gets its own action line, so a %Y.%m.%d index follows the entry's day.
+function elasticRequest(cfg: ExporterConfig, rows: LogEntry[]): ExportRequest {
+  const pattern = cfg.index ?? ""
+  let body = ""
+  for (const e of rows) {
+    const action: BulkAction = { index: { _index: indexFor(pattern, e.ts) } }
+    body += JSON.stringify(action) + "\n" + JSON.stringify(e) + "\n"
+  }
+  const headers: Map<string, string> = new Map()
+  headers.set("content-type", "application/x-ndjson")
+  const auth = esAuth(cfg)
+  if (auth !== undefined) headers.set("Authorization", auth)
+  return { url: trimSlash(cfg.url ?? "") + "/_bulk", method: "POST", headers: headers, body: body }
+}
+
+function httpRequest(cfg: ExporterConfig, rows: LogEntry[]): ExportRequest {
+  const ndjson = cfg.format === "ndjson"
+  const headers: Map<string, string> = new Map()
+  headers.set("content-type", ndjson ? "application/x-ndjson" : "application/json")
+  const extra = cfg.headers
+  if (extra !== undefined) {
+    for (const k of extra.keys()) headers.set(k, extra.get(k)!)
+  }
+  let body = ""
+  if (ndjson) {
+    for (const e of rows) body += JSON.stringify(e) + "\n"
+  } else {
+    body = JSON.stringify(rows)
+  }
+  return { url: cfg.url ?? "", method: "POST", headers: headers, body: body }
+}
+
+// The request that sends these entries to the exporter's backend. The caller does the fetch.
+export function batchRequest(cfg: ExporterConfig, entries: LogEntry[]): ExportRequest {
+  const rows: LogEntry[] = []
+  for (const e of entries) rows.push(shaped(cfg, e))
+  if (cfg.kind === "datadog") return datadogRequest(cfg, rows)
+  if (cfg.kind === "splunk") return splunkRequest(cfg, rows)
+  if (cfg.kind === "elasticsearch") return elasticRequest(cfg, rows)
+  return httpRequest(cfg, rows)
+}
+
+function earliestTs(batch: LogEntry[]): f64 {
+  let t = batch[0]!.ts
+  for (const e of batch) {
+    if (e.ts < t) t = e.ts
+  }
+  return t
+}
+
+// Entries for one exporter, waiting for their next batch. A failed batch is
+// requeued and goes out before newer entries.
+export class ExportQueue {
+  private items: LogEntry[] = []
+  // Failed batches to send again; the front is the next to go.
+  private retry: LogEntry[][] = []
+  private lastFlush: f64 = 0.0
+  // Entries thrown away because the retry backlog was full.
+  dropped: int = 0
+
+  constructor(readonly cfg: ExporterConfig) {}
+
+  add(e: LogEntry): void {
+    this.items.push(shaped(this.cfg, e))
+  }
+
+  // Entries waiting in the queue, retries included.
+  size(): int {
+    let n = this.items.length
+    for (const b of this.retry) n += b.length
+    return n
+  }
+
+  // True when a full batch is waiting, or entries are waiting and the interval
+  // has passed since the last take.
+  due(nowMs: f64): bool {
+    if (this.items.length === 0 && this.retry.length === 0) return false
+    if (this.items.length >= batchSize(this.cfg)) return true
+    return nowMs - this.lastFlush >= intervalMs(this.cfg)
+  }
+
+  // The next batch to send: a requeued batch first, else up to batch_size new
+  // entries. nowMs marks the flush time for the interval; it defaults to the clock.
+  take(nowMs?: f64): LogEntry[] {
+    this.lastFlush = nowMs ?? Date.now()
+    const first = this.retry.shift()
+    if (first !== undefined) return first
+    const n = Math.min(batchSize(this.cfg), this.items.length)
+    const out = this.items.slice(0, n)
+    this.items = this.items.slice(n)
+    return out
+  }
+
+  // Puts a batch whose send failed back at the front of the queue. When the
+  // backlog holds more than 10 batches, the batch with the oldest entry is dropped.
+  requeue(entries: LogEntry[]): void {
+    if (entries.length === 0) return
+    this.retry.unshift(entries)
+    this.trimRetry()
+  }
+
+  private trimRetry(): void {
+    while (this.retry.length > MAX_BATCHES) {
+      let victim = 0
+      for (let i = 1; i < this.retry.length; i++) {
+        if (earliestTs(this.retry[i]!) < earliestTs(this.retry[victim]!)) victim = i
+      }
+      this.dropped += this.retry[victim]!.length
+      const kept: LogEntry[][] = []
+      for (let i = 0; i < this.retry.length; i++) {
+        if (i !== victim) kept.push(this.retry[i]!)
+      }
+      this.retry = kept
+    }
+  }
+}
+
+// "" when the config can be used, otherwise the first problem found.
+export function validate(cfg: ExporterConfig): string {
+  if (cfg.id === "") return "exporter id is required"
+  const bs = cfg.batch_size
+  if (bs !== undefined && (bs < 1 || bs > MAX_BATCH)) return `${cfg.id}: batch_size must be between 1 and ${MAX_BATCH}`
+  const iv = cfg.interval_seconds
+  if (iv !== undefined && iv < 1) return `${cfg.id}: interval_seconds must be at least 1`
+  if (cfg.kind === "datadog") {
+    if (nonEmpty(cfg.api_key) === undefined) return `${cfg.id}: datadog needs api_key`
+    const site = cfg.site
+    if (site !== undefined && (site.includes("/") || site.includes(" "))) return `${cfg.id}: site must be a host such as datadoghq.com`
+    return ""
+  }
+  if (cfg.kind === "splunk") {
+    if (!isHttpUrl(cfg.url)) return `${cfg.id}: splunk needs an http or https url`
+    if (nonEmpty(cfg.token) === undefined) return `${cfg.id}: splunk needs token`
+    return ""
+  }
+  if (cfg.kind === "elasticsearch") {
+    if (!isHttpUrl(cfg.url)) return `${cfg.id}: elasticsearch needs an http or https url`
+    const index = nonEmpty(cfg.index)
+    if (index === undefined) return `${cfg.id}: elasticsearch needs index`
+    if (hasBadIndexChar(index)) return `${cfg.id}: index ${index} has characters Elasticsearch rejects`
+    const user = nonEmpty(cfg.username)
+    if (nonEmpty(cfg.api_key) === undefined && user !== undefined && nonEmpty(cfg.password) === undefined) {
+      return `${cfg.id}: username needs password`
+    }
+    return ""
+  }
+  if (!isHttpUrl(cfg.url)) return `${cfg.id}: http exporter needs an http or https url`
+  return ""
+}
+
+// ---- tests ----
+
+function sampleEntry(id: string, ts: f64, status: int): LogEntry {
+  return {
+    id: id,
+    ts: ts,
+    request_id: "req-" + id,
+    op: "chat",
+    provider: "openai",
+    model: "gpt-4o",
+    status: status,
+    latency_ms: 10.0,
+    prompt_tokens: 3,
+    completion_tokens: 4,
+    cost: 0.5,
+    cache_hit: false,
+    input: "secret prompt",
+    output: "secret answer",
+  }
+}
+
+function ids(es: LogEntry[]): string {
+  return es.map((e) => e.id).join(",")
+}
+
+function bad(cfg: ExporterConfig): bool {
+  return validate(cfg) !== ""
+}
+
+test("datadog: intake URL, api key header, one record per entry without bodies", () => {
+  const cfg: ExporterConfig = { id: "dd", kind: "datadog", api_key: "dd-key", tags: ["env:prod", "team:ml"] }
+  const req = batchRequest(cfg, [sampleEntry("a", 1000.0, 200), sampleEntry("b", 2000.0, 502)])
+  expect(req.url).toBe("https://http-intake.logs.datadoghq.com/api/v2/logs")
+  expect(req.method).toBe("POST")
+  expect(req.headers.get("DD-API-KEY")).toBe("dd-key")
+  const rows: DdLog[] = try JSON.parse(req.body)
+  expect(rows.length).toBe(2)
+  expect(rows[0]!.ddsource).toBe("raiju")
+  expect(rows[0]!.service).toBe("raiju")
+  expect(rows[0]!.ddtags).toBe("env:prod,team:ml")
+  expect(rows[0]!.message).toBe("200 openai/gpt-4o 10ms")
+  expect(rows[0]!.status).toBe("info")
+  expect(rows[1]!.status).toBe("error")
+  expect(rows[1]!.raiju.id).toBe("b")
+  expect(req.body.includes("secret")).toBe(false)
+})
+
+test("datadog: site, service and content overrides", () => {
+  const cfg: ExporterConfig = { id: "dd", kind: "datadog", api_key: "k", site: "datadoghq.eu", service: "gateway", include_content: true }
+  const req = batchRequest(cfg, [sampleEntry("a", 1000.0, 200)])
+  expect(req.url).toBe("https://http-intake.logs.datadoghq.eu/api/v2/logs")
+  const rows: DdLog[] = try JSON.parse(req.body)
+  expect(rows[0]!.service).toBe("gateway")
+  expect(rows[0]!.ddtags).toBe("")
+  expect(rows[0]!.raiju.input).toBe("secret prompt")
+})
+
+test("splunk: HEC event URL, token header, events back to back", () => {
+  const cfg: ExporterConfig = { id: "s", kind: "splunk", url: "https://splunk.example:8088/", token: "tok", index: "llm" }
+  const req = batchRequest(cfg, [sampleEntry("a", 1000.0, 200), sampleEntry("b", 2500.0, 200)])
+  expect(req.url).toBe("https://splunk.example:8088/services/collector/event")
+  expect(req.headers.get("Authorization")).toBe("Splunk tok")
+  expect(req.body.startsWith('{"time":1,"event":{"id":"a"')).toBe(true)
+  expect(req.body.includes('"sourcetype":"raiju:request","index":"llm"}{"time":2.5,"event":{"id":"b"')).toBe(true)
+  expect(req.body.includes("secret")).toBe(false)
+})
+
+test("splunk: index is omitted when unset", () => {
+  const req = batchRequest({ id: "s", kind: "splunk", url: "https://h", token: "t" }, [sampleEntry("a", 1000.0, 200)])
+  expect(req.url).toBe("https://h/services/collector/event")
+  expect(req.body.includes("index")).toBe(false)
+  expect(req.body.includes('"sourcetype":"raiju:request"')).toBe(true)
+})
+
+test("elasticsearch: bulk action per entry, index expanded from each entry's UTC day", () => {
+  const cfg: ExporterConfig = { id: "es", kind: "elasticsearch", url: "https://es.example:9200/", index: "raiju-%Y.%m.%d", api_key: "ek" }
+  const req = batchRequest(cfg, [sampleEntry("a", 1791979200000.0, 200), sampleEntry("b", 1791935999000.0, 200)])
+  expect(req.url).toBe("https://es.example:9200/_bulk")
+  expect(req.headers.get("content-type")).toBe("application/x-ndjson")
+  expect(req.headers.get("Authorization")).toBe("ApiKey ek")
+  const lines = req.body.split("\n")
+  expect(lines.length).toBe(5)
+  expect(lines[0]).toBe('{"index":{"_index":"raiju-2026.10.14"}}')
+  expect(lines[2]).toBe('{"index":{"_index":"raiju-2026.10.13"}}')
+  expect(lines[1]!.startsWith('{"id":"a"')).toBe(true)
+  expect(lines[3]!.startsWith('{"id":"b"')).toBe(true)
+  expect(lines[4]).toBe("")
+  expect(req.body.includes("secret")).toBe(false)
+})
+
+test("elasticsearch: basic auth with credentials, no header without them", () => {
+  const basic = batchRequest({ id: "es", kind: "elasticsearch", url: "http://es", index: "i", username: "u", password: "p" }, [sampleEntry("a", 1000.0, 200)])
+  expect(basic.headers.get("Authorization")).toBe("Basic dTpw")
+  const anon = batchRequest({ id: "es", kind: "elasticsearch", url: "http://es", index: "i" }, [sampleEntry("a", 1000.0, 200)])
+  expect(anon.headers.get("Authorization")).toBeUndefined()
+})
+
+test("http: JSON array by default, NDJSON when asked, configured headers kept", () => {
+  const h: Map<string, string> = new Map()
+  h.set("X-Team", "ml")
+  const entries = [sampleEntry("a", 1000.0, 200), sampleEntry("b", 2000.0, 200)]
+  const json = batchRequest({ id: "h", kind: "http", url: "https://hook.example/logs", headers: h }, entries)
+  expect(json.url).toBe("https://hook.example/logs")
+  expect(json.method).toBe("POST")
+  expect(json.headers.get("content-type")).toBe("application/json")
+  expect(json.headers.get("X-Team")).toBe("ml")
+  const rows: LogEntry[] = try JSON.parse(json.body)
+  expect(rows.length).toBe(2)
+
+  const nd = batchRequest({ id: "h", kind: "http", url: "https://hook.example/logs", format: "ndjson" }, entries)
+  expect(nd.headers.get("content-type")).toBe("application/x-ndjson")
+  const lines = nd.body.split("\n")
+  expect(lines.length).toBe(3)
+  expect(lines[1]!.startsWith('{"id":"b"')).toBe(true)
+})
+
+test("queue: due on a full batch or an elapsed interval, never when empty", () => {
+  const q = new ExportQueue({ id: "q", kind: "http", url: "http://x", batch_size: 2 })
+  expect(q.due(60000.0)).toBe(false)
+  q.add(sampleEntry("a", 1.0, 200))
+  expect(q.due(5000.0)).toBe(false)
+  expect(q.due(10000.0)).toBe(true)
+  q.add(sampleEntry("b", 2.0, 200))
+  expect(q.due(5000.0)).toBe(true)
+  expect(q.size()).toBe(2)
+})
+
+test("queue: take returns one batch and restarts the interval", () => {
+  const q = new ExportQueue({ id: "q", kind: "http", url: "http://x", batch_size: 2 })
+  for (const id of ["a", "b", "c"]) q.add(sampleEntry(id, 1.0, 200))
+  expect(ids(q.take(20000.0))).toBe("a,b")
+  expect(q.size()).toBe(1)
+  expect(q.due(25000.0)).toBe(false)
+  expect(q.due(30000.0)).toBe(true)
+  expect(ids(q.take(30000.0))).toBe("c")
+  expect(q.take().length).toBe(0)
+})
+
+test("queue: entries leave without bodies unless content is on", () => {
+  const q = new ExportQueue({ id: "q", kind: "http", url: "http://x" })
+  q.add(sampleEntry("a", 1.0, 200))
+  expect(q.take(0.0)[0]!.input).toBeUndefined()
+  const on = new ExportQueue({ id: "q", kind: "http", url: "http://x", include_content: true })
+  on.add(sampleEntry("b", 1.0, 200))
+  expect(on.take(0.0)[0]!.output).toBe("secret answer")
+})
+
+test("queue: a requeued batch goes out first, ahead of newer entries", () => {
+  const q = new ExportQueue({ id: "q", kind: "http", url: "http://x", batch_size: 2 })
+  q.add(sampleEntry("a", 1.0, 200))
+  q.add(sampleEntry("b", 2.0, 200))
+  const failed = q.take(10000.0)
+  q.requeue(failed)
+  q.add(sampleEntry("c", 3.0, 200))
+  expect(q.size()).toBe(3)
+  expect(ids(q.take(10000.0))).toBe("a,b")
+  expect(ids(q.take(10000.0))).toBe("c")
+  expect(q.dropped).toBe(0)
+})
+
+test("queue: the retry backlog keeps 10 batches and drops the oldest", () => {
+  const q = new ExportQueue({ id: "q", kind: "http", url: "http://x", batch_size: 1 })
+  for (let i = 1; i <= 11; i++) q.requeue([sampleEntry("e" + i, i * 1000.0, 500)])
+  expect(q.dropped).toBe(1)
+  expect(q.size()).toBe(10)
+  const order: string[] = []
+  for (let i = 0; i < 10; i++) order.push(q.take(0.0)[0]!.id)
+  expect(order.join(",")).toBe("e11,e10,e9,e8,e7,e6,e5,e4,e3,e2")
+  expect(q.size()).toBe(0)
+})
+
+test("validate: each kind checks its own required fields", () => {
+  expect(validate({ id: "dd", kind: "datadog", api_key: "k" })).toBe("")
+  expect(bad({ id: "dd", kind: "datadog" })).toBe(true)
+  expect(bad({ id: "dd", kind: "datadog", api_key: "k", site: "https://x/y" })).toBe(true)
+  expect(validate({ id: "s", kind: "splunk", url: "https://s:8088", token: "t" })).toBe("")
+  expect(bad({ id: "s", kind: "splunk", url: "ftp://s", token: "t" })).toBe(true)
+  expect(bad({ id: "s", kind: "splunk", url: "https://s" })).toBe(true)
+  expect(validate({ id: "es", kind: "elasticsearch", url: "https://es", index: "logs-%Y.%m.%d", username: "u", password: "p" })).toBe("")
+  expect(bad({ id: "es", kind: "elasticsearch", url: "https://es", index: "" })).toBe(true)
+  expect(bad({ id: "es", kind: "elasticsearch", url: "https://es", index: "a b" })).toBe(true)
+  expect(bad({ id: "es", kind: "elasticsearch", url: "https://es", index: "i", username: "u" })).toBe(true)
+  expect(validate({ id: "h", kind: "http", url: "https://hook" })).toBe("")
+  expect(bad({ id: "h", kind: "http", url: "" })).toBe(true)
+})
+
+test("validate: shared limits and a missing id", () => {
+  expect(bad({ id: "", kind: "http", url: "https://hook" })).toBe(true)
+  expect(bad({ id: "h", kind: "http", url: "https://hook", batch_size: 0 })).toBe(true)
+  expect(bad({ id: "h", kind: "http", url: "https://hook", interval_seconds: 0 })).toBe(true)
+  expect(bad({ id: "h", kind: "http", url: "https://hook", batch_size: 100, interval_seconds: 5 })).toBe(false)
+})
+
+test("UTC dates for index names", () => {
+  expect(utcDate(0.0)).toEqual({ y: 1970, m: 1, d: 1 })
+  expect(utcDate(-1.0).y).toBe(1969)
+  expect(utcDate(951782400000.0)).toEqual({ y: 2000, m: 2, d: 29 })
+  expect(indexFor("raiju-%Y.%m.%d", 1791979200000.0)).toBe("raiju-2026.10.14")
+  expect(indexFor("plain", 0.0)).toBe("plain")
+})

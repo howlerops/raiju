@@ -613,6 +613,14 @@ def main():
         lines = [json.loads(l) for x in puts for l in x["body"].strip().split("\n") if l]
         check("request logs are exported to object storage", puts and puts[0]["path"].endswith(".jsonl") and puts[0]["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") and any("gpt-4o-mini" in l.get("model", "") for l in lines), [p["path"] for p in puts][:3])
 
+        # log exporters
+        hooks = [x for x in seen() if x["path"] == "/export-hook"]
+        bulk = [x for x in seen() if x["path"] == "/_bulk"]
+        lines = [json.loads(l) for x in hooks for l in x["body"].strip().split("\n") if l]
+        check("request logs reach an HTTP exporter as NDJSON", hooks and any("gpt-4o-mini" in l.get("model", "") for l in lines), [h["body"][:200] for h in hooks[:1]])
+        bl = bulk[0]["body"].split("\n") if bulk else []
+        check("request logs reach Elasticsearch's bulk API", bulk and bulk[0]["auth"] == "ApiKey es-key" and '"_index":"raiju-' in bl[0] and bulk[0]["body"].endswith("\n"), [b["body"][:200] for b in bulk[:1]])
+
         # SSO (OIDC, authorization code + PKCE)
         import http.client, base64, hashlib
         s, _, b = call("GET", "/api/oidc/status", auth=False)
