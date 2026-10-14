@@ -4,6 +4,8 @@ import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
 import { Target } from "./providers/types"
 import { isOpenAICompatible } from "./providers/openai"
 import { Health, pickAdaptive } from "./health"
+import { datasheetProviders } from "./pricing"
+import { aliasLookup, aliasProblem, resolveKeyAlias, AliasResult } from "./aliases"
 
 export type ModelRef = { provider: string, model: string }
 
@@ -13,9 +15,34 @@ export function isKnownKind(kind: string): bool {
   return NATIVE_KINDS.includes(kind) || isOpenAICompatible(kind)
 }
 
-// "openai/gpt-4o" → openai + gpt-4o. A bare model is looked up in the keys'
-// model lists, then defaults to OpenAI.
+// The catalog's name for a provider, where Raiju names it differently.
+function configName(catalogName: string): string {
+  if (catalogName === "vertex_ai") return "vertex"
+  return catalogName
+}
+
+// The canonical provider of an integration route, preferred among catalog matches.
+export function routeProvider(route: string): string {
+  if (route === "openai") return "openai"
+  if (route === "anthropic") return "anthropic"
+  if (route === "genai") return "gemini"
+  if (route === "bedrock") return "bedrock"
+  if (route === "cohere") return "cohere"
+  return ""
+}
+
+// "openai/gpt-4o" → openai + gpt-4o. A bare model resolves, in order, to: a
+// provider whose key lists it (as a model or an alias); a configured provider
+// that the datasheet lists for it (the route's provider if it is one of them,
+// else the first by name); the claude/gemini prefix rule. Otherwise provider is
+// "" and the caller answers with ProviderAutoResolveErrorMessage.
 export function parseModel(cfg: Config, s: string): ModelRef {
+  return parseModelVia(cfg, s, "")
+}
+
+// parseModel for a request on an integration route: "openai", "anthropic",
+// "genai", "bedrock", "cohere", or "" for none.
+export function parseModelVia(cfg: Config, s: string, route: string): ModelRef {
   const i = s.indexOf("/")
   if (i > 0) {
     const p = s.slice(0, i)
@@ -29,10 +56,28 @@ export function parseModel(cfg: Config, s: string): ModelRef {
         if ((k.models ?? []).includes(s)) return { provider: name, model: s }
       }
     }
+    for (const name of ps.keys()) {
+      for (const k of ps.get(name)!.keys ?? []) {
+        const a = k.aliases
+        if (a !== undefined && aliasLookup(a, s) !== undefined) return { provider: name, model: s }
+      }
+    }
+    // the model family's own provider, when configured, before the catalog (whose bare
+    // claude-* names are often Bedrock's or Vertex's)
     if (s.startsWith("claude") && ps.has("anthropic")) return { provider: "anthropic", model: s }
     if (s.startsWith("gemini") && ps.has("gemini")) return { provider: "gemini", model: s }
+    const names: string[] = []
+    for (const c of datasheetProviders(s)) {
+      const n = configName(c)
+      if (ps.has(n) && !names.includes(n)) names.push(n)
+    }
+    if (names.length > 0) {
+      const hinted = routeProvider(route)
+      if (hinted !== "" && names.includes(hinted)) return { provider: hinted, model: s }
+      return { provider: names[0]!, model: s }
+    }
   }
-  return { provider: "openai", model: s }
+  return { provider: "", model: s }
 }
 
 export function kindOf(name: string, p: ProviderConfig): string {
@@ -41,18 +86,37 @@ export function kindOf(name: string, p: ProviderConfig): string {
   return name
 }
 
-// The model name this key sends upstream: its alias for the requested name, if any.
-export function resolveAlias(k: KeyConfig, model: string): string {
+// The model name this key sends upstream: its alias chain followed to the end.
+// error is set when the chain loops or is longer than the depth limit.
+export function resolveAlias(k: KeyConfig, model: string): AliasResult {
   const a = k.aliases
-  if (a === undefined) return model
-  return a.get(model) ?? model
+  if (a === undefined) return { model: model, error: "" }
+  return resolveKeyAlias(a, model)
+}
+
+// Problems in the aliases of every key of every provider, one line each ("" when
+// none). Meant for config load, so a bad chain is reported before a request uses it.
+export function aliasProblems(cfg: Config): string[] {
+  const out: string[] = []
+  const ps = cfg.providers
+  if (ps === undefined) return out
+  for (const name of ps.keys()) {
+    const keys = ps.get(name)!.keys ?? []
+    for (let i = 0; i < keys.length; i++) {
+      const a = keys[i]!.aliases
+      if (a === undefined) continue
+      const p = aliasProblem(a)
+      if (p !== "") out.push(name + " key " + (keys[i]!.name ?? ("" + i)) + ": " + p)
+    }
+  }
+  return out
 }
 
 export function keyAllows(k: KeyConfig, model: string): bool {
   const ms = k.models
   if (ms === undefined || ms.length === 0) return true
   const a = k.aliases
-  if (a !== undefined && a.has(model)) return true
+  if (a !== undefined && aliasLookup(a, model) !== undefined) return true
   for (const m of ms) {
     if (m === "*" || m === model) return true
   }
@@ -141,7 +205,9 @@ export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: st
   const useHealth = health !== undefined && pinned === undefined && hc !== undefined && (hc.circuit_breaker === true || hc.adaptive === true)
   const i = useHealth ? pickHealthy(ref.provider, keys, ref.model, exclude, health!, hc!.adaptive === true) : pickKey(keys, ref.model, exclude, pinned)
   if (i < 0) return undefined
-  return { t: { provider: ref.provider, kind: kind, model: resolveAlias(keys[i]!, ref.model), key: keys[i]!, cfg: p }, keyIndex: i }
+  const up = resolveAlias(keys[i]!, ref.model)
+  if (up.error !== "") return undefined
+  return { t: { provider: ref.provider, kind: kind, model: up.model, key: keys[i]!, cfg: p }, keyIndex: i }
 }
 
 // How an upstream failure is handled.
@@ -184,7 +250,59 @@ test("parses provider-prefixed and bare models", () => {
   expect(parseModel(cfg, "mygw/x/y")).toEqual({ provider: "mygw", model: "x/y" })
   expect(parseModel(cfg, "special-1")).toEqual({ provider: "mygw", model: "special-1" })
   expect(parseModel(cfg, "claude-sonnet-4")).toEqual({ provider: "anthropic", model: "claude-sonnet-4" })
-  expect(parseModel(cfg, "meta-llama/Llama-3")).toEqual({ provider: "openai", model: "meta-llama/Llama-3" })
+  expect(parseModel(cfg, "meta-llama/Llama-3")).toEqual({ provider: "", model: "meta-llama/Llama-3" })
+})
+
+test("bare models resolve through the catalog to a configured provider", () => {
+  const cfg: Config = { providers: new Map() }
+  cfg.providers!.set("openai", { keys: [{ value: "k" }] })
+  cfg.providers!.set("anthropic", { keys: [{ value: "k" }] })
+  cfg.providers!.set("gemini", { keys: [{ value: "k" }] })
+  expect(parseModel(cfg, "gpt-4o")).toEqual({ provider: "openai", model: "gpt-4o" })
+  expect(parseModel(cfg, "claude-sonnet-4-5")).toEqual({ provider: "anthropic", model: "claude-sonnet-4-5" })
+  expect(parseModel(cfg, "gemini-2.5-flash")).toEqual({ provider: "gemini", model: "gemini-2.5-flash" })
+  expect(parseModel(cfg, "gpt-4o-2024-08-06")).toEqual({ provider: "openai", model: "gpt-4o-2024-08-06" })
+  expect(parseModel(cfg, "no-such-model")).toEqual({ provider: "", model: "no-such-model" })
+  // the datasheet names a provider, but none is configured for it
+  const only: Config = { providers: new Map() }
+  only.providers!.set("anthropic", { keys: [{ value: "k" }] })
+  expect(parseModel(only, "gpt-4o")).toEqual({ provider: "", model: "gpt-4o" })
+})
+
+test("a model two configured providers serve goes to the route's provider, else the first by name", () => {
+  const cfg: Config = { providers: new Map() }
+  cfg.providers!.set("openai", { keys: [{ value: "k" }] })
+  cfg.providers!.set("azure", { keys: [{ value: "k" }] })
+  expect(parseModel(cfg, "gpt-4o")).toEqual({ provider: "azure", model: "gpt-4o" })
+  expect(parseModelVia(cfg, "gpt-4o", "openai")).toEqual({ provider: "openai", model: "gpt-4o" })
+  expect(parseModelVia(cfg, "gpt-4o", "genai")).toEqual({ provider: "azure", model: "gpt-4o" })
+})
+
+test("a key's alias name counts as a model for bare-name resolution", () => {
+  const aliases: Map<string, string> = new Map()
+  aliases.set("house-model", "mystery-7")
+  const cfg: Config = { providers: new Map() }
+  cfg.providers!.set("mygw", { keys: [{ value: "k", aliases: aliases }], custom_provider_config: { base_provider_type: "openai" } })
+  expect(parseModel(cfg, "House-Model")).toEqual({ provider: "mygw", model: "House-Model" })
+})
+
+test("chained key aliases resolve to the final name; cycles fail the key", () => {
+  const chain: Map<string, string> = new Map()
+  chain.set("a", "b")
+  chain.set("b", "c")
+  const loop: Map<string, string> = new Map()
+  loop.set("x", "y")
+  loop.set("y", "x")
+  const cfg: Config = { providers: new Map() }
+  cfg.providers!.set("openai", { keys: [{ value: "k", models: ["c"], aliases: chain }] })
+  const none: Set<int> = new Set()
+  expect(target(cfg, { provider: "openai", model: "a" }, none, undefined)!.t.model).toBe("c")
+  expect(target(cfg, { provider: "openai", model: "c" }, none, undefined)!.t.model).toBe("c")
+  expect(aliasProblems(cfg)).toEqual([])
+  const bad: Config = { providers: new Map() }
+  bad.providers!.set("openai", { keys: [{ name: "k1", value: "k", models: ["x"], aliases: loop }] })
+  expect(target(bad, { provider: "openai", model: "x" }, none, undefined)).toBeUndefined()
+  expect(aliasProblems(bad)).toEqual(["openai key k1: alias cycle: x -> y -> x"])
 })
 
 test("weighted key choice respects models and exclusions", () => {
