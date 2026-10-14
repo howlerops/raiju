@@ -764,6 +764,11 @@ def main():
 
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
+        import re as _re
+        check("Bifrost metric families and labels",
+              all(f in b for f in ["bifrost_success_requests_total{", "bifrost_error_requests_total{", "bifrost_stream_first_token_latency_seconds_bucket{", "http_requests_total{path=\"/v1/chat/completions\""])
+              and _re.search(r'bifrost_success_requests_total\{[^}]*method="chat_completion"[^}]*virtual_key_id="', b) is not None
+              and _re.search(r'bifrost_error_requests_total\{[^}]*status_code="5\d\d"', b) is not None, b[:800])
 
         s, _, b = call("POST", "/v1/chat/completions", "{not json")
         check("bad JSON is a 400", s == 400, b)

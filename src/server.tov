@@ -97,6 +97,38 @@ async function listModels(engine: Engine, req: Request): Promise<Response> {
 }
 
 
+// Bifrost's http_* metrics for one request. A streamed body counts as 0 bytes.
+async function timed(path: string, method: string, t0: f64, reqBytes: f64, p: Promise<Response, TypeError>): Promise<Response, TypeError> {
+  const res = try await p
+  const len = parseFloat(res.headers.get("content-length") ?? "0") ?? 0.0
+  metrics.observeHttp(pathLabel(path), method, res.status, (performance.now() - t0) / 1000.0, reqBytes, len)
+  return res
+}
+
+// A bounded path label: ids (segments with digits, or past the fourth) become {id}.
+export function pathLabel(path: string): string {
+  const segs = path.split("/")
+  const out: string[] = []
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]!
+    let id = i > 4
+    for (const ch of s.chars()) {
+      if (ch >= "0" && ch <= "9") id = true
+    }
+    // version segments such as v1 and v1beta stay
+    if (i <= 2 && s.startsWith("v") && s.byteLength <= 7) id = false
+    out.push(id && s !== "" ? "{id}" : s)
+  }
+  return out.join("/")
+}
+
+test("path labels hide ids", () => {
+  expect(pathLabel("/v1/chat/completions")).toBe("/v1/chat/completions")
+  expect(pathLabel("/api/governance/virtual-keys/vk-1")).toBe("/api/governance/virtual-keys/{id}")
+  expect(pathLabel("/genai/v1beta/models/gemini-2.5-flash:generateContent")).toBe("/genai/v1beta/models/{id}")
+  expect(pathLabel("/bedrock/model/a/b/c/converse")).toBe("/bedrock/model/a/b/{id}/{id}")
+})
+
 // Runs an internal request (an async job) through the same handlers as live traffic.
 function dispatcher(engine: Engine): Dispatch {
   return async (req) => {
@@ -370,9 +402,11 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
       }
       const cp = compatPath(p)
-      if (req.method === "POST" && CHAT_PATHS.includes(cp)) return chatStreamed(engine, req, false)
-      if (req.method === "POST" && cp === "/anthropic/v1/messages") return chatStreamed(engine, req, true)
-      return dispatch(engine, ops, req)
+      const t0 = performance.now()
+      const reqBytes = parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0
+      if (req.method === "POST" && CHAT_PATHS.includes(cp)) return timed(p, req.method, t0, reqBytes, chatStreamed(engine, req, false))
+      if (req.method === "POST" && cp === "/anthropic/v1/messages") return timed(p, req.method, t0, reqBytes, chatStreamed(engine, req, true))
+      return timed(p, req.method, t0, reqBytes, dispatch(engine, ops, req))
     },
     websocket: {
       open: (ws) => onOpen(ws),

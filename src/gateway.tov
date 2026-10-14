@@ -372,6 +372,8 @@ class ReqCtx {
   sink: StreamSink | undefined = undefined
   makeConverter: ConverterFactory | undefined = undefined
   outHeaders: Map<string, string> = new Map()
+  // Bifrost's metric labels for this request, filled once it is routed and admitted
+  labels: metrics.RequestLabels = metrics.newLabels("", "", "")
   constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
 }
 
@@ -598,6 +600,12 @@ export class Engine {
         }
         if (sel === undefined) break
         let t = sel.t
+        let tl = ctx.labels
+        tl.provider = ref.provider
+        tl.model = ref.model
+        tl.fallbackIndex = "" + Math.max(0, refIndex)
+        tl.selectedKeyId = t.key.id ?? ""
+        tl.selectedKeyName = t.key.name ?? ""
         if (t.kind === "watsonx") {
           const tok = await this.watsonxToken(t)
           if (tok.error !== "") {
@@ -660,6 +668,8 @@ export class Engine {
             sink.open(200, ctx.outHeaders)
             const reader = stream.getReader()
             try {
+              let chunkIndex = 0
+              let lastAt = started
               while (true) {
                 if (sink.cancelled) {
                   await reader.cancel()
@@ -670,7 +680,13 @@ export class Engine {
                 const v = c.value
                 if (v !== undefined) {
                   const out = conv.push(v)
-                  if (out !== "") sink.write(out)
+                  if (out !== "") {
+                    const at = performance.now()
+                    metrics.observeStreamChunk(tl, chunkIndex, (at - lastAt) / 1000.0)
+                    chunkIndex += 1
+                    lastAt = at
+                    sink.write(out)
+                  }
                 }
               }
             } catch (e) {
@@ -681,7 +697,7 @@ export class Engine {
             sink.close()
             dl.finish()
             upstreamMs += performance.now() - started
-            metrics.inc("bifrost_upstream_requests_total", metrics.labels(ref.provider, ref.model, "success"), 1.0)
+            metrics.observeRequest(tl, { ok: true, status: 200, errorType: "", retries: 0.0 }, (performance.now() - started) / 1000.0)
             this.stick(h, ref, t)
             return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true }
           }
@@ -724,8 +740,7 @@ export class Engine {
           const healthy = ok || (status >= 400 && status < 500 && status !== 429 && status !== 408)
           this.health.record(healthId(ref.provider, t.key, sel.keyIndex), healthy, tookMs, Date.now())
         }
-        metrics.observe("bifrost_upstream_latency_seconds", metrics.labels(ref.provider, ref.model, ok ? "success" : "error"), secs)
-        metrics.inc("bifrost_upstream_requests_total", metrics.labels(ref.provider, ref.model, ok ? "success" : "error"), 1.0)
+        metrics.observeRequest(tl, { ok: ok, status: status, errorType: ok ? "" : status === 0 ? "provider_connection_failed" : metrics.errorTypeForStatus(status), retries: 0.0 }, secs)
         const requested = ref.provider + "/" + ref.model
         if (ok) {
           try {
@@ -994,6 +1009,25 @@ export class Engine {
     const grant: Grant = admitted
     ctx.virtualKey = grant.vk?.id ?? ""
     ctx.provider = primary.provider
+    let rl = metrics.newLabels(primary.provider, primary.model, requestType(op, streamed))
+    const gvk = grant.vk
+    if (gvk !== undefined) {
+      rl.virtualKeyId = gvk.id
+      rl.virtualKeyName = gvk.name ?? ""
+      rl.teamId = gvk.team_id ?? ""
+      rl.teamName = this.gov.teamName(gvk) ?? ""
+      rl.customerId = gvk.customer_id ?? this.gov.teams.get(gvk.team_id ?? "")?.customer ?? ""
+      rl.customerName = this.gov.customerName(gvk) ?? ""
+    }
+    const ruleName = out.get("x-bf-routing-rule")
+    if (ruleName !== undefined && ruleName !== "") {
+      rl.routingRuleName = ruleName
+      rl.routingEngineUsed = "routing_rule"
+    }
+    if (tier !== undefined) rl.complexityTier = tier
+    if (model !== primary.provider + "/" + primary.model && model !== primary.model) rl.alias = model
+    rl.app = h.get("x-bf-app") ?? ""
+    ctx.labels = rl
     // Fallbacks the key may not use are dropped.
     const allowed: ModelRef[] = [primary]
     for (const r of refs.slice(1)) {
@@ -1007,7 +1041,7 @@ export class Engine {
       key = cacheKey(op + (h.get("x-bf-cache-key") ?? ""), model, text)
       const hit = cache.get(key)
       if (hit !== undefined) {
-        metrics.inc("bifrost_cache_hits_total", metrics.labels(primary.provider, primary.model, "hit"), 1.0)
+        metrics.observeCacheHit(ctx.labels, "direct")
         out.set("x-bf-cache", "hit")
         cacheHeaders(&out, "direct", primary, undefined, undefined)
         out.set("content-type", hit.contentType)
@@ -1031,7 +1065,7 @@ export class Engine {
           const th = h.get("x-bf-cache-threshold")
           const hit = sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : parseFloat(th))
           if (hit !== undefined) {
-            metrics.inc("bifrost_cache_hits_total", metrics.labels(primary.provider, primary.model, "semantic"), 1.0)
+            metrics.observeCacheHit(ctx.labels, "semantic")
             out.set("x-bf-cache", "semantic-hit")
             out.set("x-bf-cache-similarity", hit.score.toFixed(4))
             cacheHeaders(&out, "semantic", primary, hit.score, th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold))
@@ -1064,10 +1098,10 @@ export class Engine {
       console.error(`raiju: no price for ${r.provider}/${r.model}: budgets don't count its requests; add a pricing override`)
     }
     this.gov.record(grant, r.promptTokens + r.completionTokens, cost)
-    const l = metrics.labels(r.provider, r.model, "success")
-    metrics.inc("bifrost_input_tokens_total", l, r.promptTokens)
-    metrics.inc("bifrost_output_tokens_total", l, r.completionTokens)
-    metrics.inc("bifrost_cost_total", l, cost)
+    let ul = ctx.labels
+    ul.provider = r.provider
+    ul.model = r.model
+    metrics.observeUsage(ul, { input: r.promptTokens, output: r.completionTokens, cost: cost, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
     if (r.direct === true) {
       // already streamed to the client; nothing to cache or send
       ctx.provider = r.provider
@@ -1099,7 +1133,7 @@ export class Engine {
     if (r.contentType === "text/event-stream") out.set("cache-control", "no-cache")
     // Time spent in the gateway itself, upstream calls excluded (Bifrost's "overhead").
     const overheadUs = (performance.now() - started - r.upstreamMs) * 1000.0
-    metrics.observeOverhead(overheadUs)
+    metrics.observeOverheadFor(ul, overheadUs)
     out.set("x-bf-overhead-us", "" + Math.round(overheadUs))
     ctx.provider = r.provider
     ctx.promptTokens = r.promptTokens
@@ -1113,7 +1147,6 @@ export class Engine {
   record(c: ReqCtx): void {
     const ms = performance.now() - c.started
     const ok = c.status >= 200 && c.status < 300
-    metrics.observe("bifrost_request_duration_seconds", metrics.labels(c.provider, c.model, ok ? "success" : "error"), ms / 1000.0)
     if (this.logRequests) {
       process.stdout.write(JSON.stringify({ ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, latency_ms: Math.round(ms), cache_hit: c.cached }) + "\n")
     }
