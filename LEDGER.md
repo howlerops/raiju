@@ -128,16 +128,39 @@ and 249 missing out of 497 features. P0 are the gaps a Bifrost user hits on swit
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L43 | G4 | Bifrost price datasheet (5,125 models) embedded and synced; pricing_overrides | worker | assigned |
-| L44 | G3 | Read Bifrost's `guardrails_config` | worker | assigned |
-| L45 | G7, G48, G49 | Bifrost section names (`alerting`, `audit_logs`, `cluster_config`, ...) and unknown-key warnings | worker | assigned |
-| X15 | G1 | Async: `/v1/async/<op>/{id}`, Bifrost status names, missing ops | lead | todo |
-| X16 | G2 | `client.enforce_auth_on_inference` and `auth_config.is_enabled` | lead | todo |
-| X17 | G5, G14 | Everything under `/openai/v1/*`; `GET /v1/models/{id}` | lead | todo |
-| X18 | G6 | Bedrock SDK `converse-stream` and `invoke-with-response-stream` | lead | todo |
+| L43 | G4 | Bifrost price datasheet (4,487 models) embedded and synced; pricing_overrides | worker | done: unit + e2e |
+| L44 | G3 | Read Bifrost's `guardrails_config` | worker | done: unit + e2e |
+| L45 | G7, G48, G49 | Bifrost section names (`alerting`, `audit_logs`, `cluster_config`, ...) and unknown-key warnings | worker | done: unit + e2e (e2e config in Bifrost's dialect) |
+| X15 | G1 | Async: `/v1/async/<op>/{id}`, Bifrost status names, missing ops | lead | done: e2e |
+| X16 | G2 | `client.enforce_auth_on_inference` and `auth_config.is_enabled` (default on when credentials exist, as Bifrost) | lead | done: unit + e2e |
+| X17 | G5, G9, G14, G17 | `/openai/v1/*`, `/pydanticai`, `GET /v1/models/{id}`, x-bifrost-* headers + CORS expose | lead | done: e2e |
+| X18 | G6 | Bedrock SDK `converse-stream` and `invoke-with-response-stream` | lead | moved to wave 9 (L48) |
 | X19 | G32 | SCOPE.md rows corrected to partial | lead | done |
 
-## Wave 9: Bifrost parity P1 (queued)
+## Wave 9: Bifrost parity P1
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L46 | G8 | Cohere SDK routes (chat, embed, rerank, tokenize; streaming) | worker → lead | module done (`cohere_in.tov`); integrating |
+| L47 | G11 | GenAI SDK cross-provider, models routes, countTokens, streaming | worker → lead | module done (`genai_in.tov`); integrating |
+| L48 | G6, G12 | Bedrock SDK cross-provider, converse-stream, invoke-with-response-stream, count-tokens | worker → lead | module done (`bedrock_in.tov`); integrating |
+| L49 | G19 | Reasoning parameters → Anthropic, Gemini, Bedrock | worker → lead | module done (`reasoning.tov`); integrating |
+| L50 | G23 | RE2 regex for `matches`, Bifrost CEL variables | worker → lead | done: unit (regex 17, cel 40); wired in route() |
+| L51 | G24, G25, G27 | Azure Entra ID, Bedrock assume-role, Bedrock Mantle | worker → lead | module done (`cloud_auth.tov`, `bedrock_mantle.tov`); integrating |
+| L52 | G29 | OTLP metrics push | worker → lead | done: unit; wired in ops |
+| L53 | G31 | Teams and PagerDuty channels, rate-limit metrics, channel cooldowns | worker → lead | done: unit; Bifrost channel mapping |
+| L54 | G10 | Anthropic SDK models, message batches, files | worker | assigned |
+| L55 | G16 | Native batches and files for Anthropic and Gemini; Gemini speech/images | worker | assigned |
+| L56 | G18 | Bifrost metric names and enrichment labels | worker | assigned |
+| L57 | G21 | Governance model configs, provider governance, management routes | worker | assigned |
+| L58 | G22 | MCP client and virtual MCP management API, client config fields | worker | assigned |
+| L59 | G30 | Bifrost semanticcache plugin config; Qdrant and Redis vector stores | worker | assigned |
+| L60 | G31 | Bifrost alert rules (CEL over scope usage) and `/api/alerting/*` | worker | assigned |
+| X20 | G13, G15 | Responses lifecycle; realtime client_secrets, sessions, calls | lead | todo |
+| X21 | G20, G28, G33 | Content-logging control; rerank semantics; count-token labelling | lead | todo |
+| X22 | G26 | TLS options (needs a Tov fetch check) | lead | todo |
+
+Earlier summary of the wave:
 
 G8–G31, G33 in docs/parity.md: Cohere and PydanticAI SDK routes, Anthropic models/batches/files,
 GenAI and Bedrock cross-provider, responses lifecycle, WebRTC realtime, media for non-OpenAI
