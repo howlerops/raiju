@@ -1,0 +1,86 @@
+// The front end on the http1 server (raw sockets), so streamed answers reach
+// the client chunk by chunk. Every request runs through the same dispatch() as
+// the Bun.serve server; streaming chat requests get a sink that writes SSE
+// events to the socket as they arrive from the upstream.
+import { listen, Http1Request, Http1Response } from "./http1"
+import { Engine, StreamSink } from "./gateway"
+import { ConfigStore } from "./store"
+import { dispatch } from "./server"
+import { fields, rawBool } from "./json"
+
+export type FrontOptions = { hostname: string, port: int, maxBodyBytes: int }
+
+const CHAT_PATHS = ["/v1/chat/completions", "/openai/v1/chat/completions", "/openai/chat/completions"]
+
+function pathOf(target: string): string {
+  const q = target.indexOf("?")
+  return q < 0 ? target : target.slice(0, q)
+}
+
+function wantsStream(req: Http1Request): bool {
+  if (req.method !== "POST") return false
+  const p = pathOf(req.path)
+  if (!CHAT_PATHS.includes(p)) return false
+  if (!req.body.includes("\"stream\"")) return false
+  try {
+    return rawBool(fields(req.body), "stream") ?? false
+  } catch (e) {
+    return false
+  }
+}
+
+function toRequest(req: Http1Request, host: string): Request {
+  const h: Record<string, string> = req.headers
+  const url = "http://" + (req.headers.get("host") ?? host) + req.path
+  if (req.method === "GET" || req.method === "HEAD") return new Request(url, { method: req.method, headers: h })
+  return new Request(url, { method: req.method, headers: h, body: req.body })
+}
+
+async function write(res: Http1Response, r: Response): Promise<void> {
+  const h: Map<string, string> = new Map()
+  r.headers.forEach((value, key) => {
+    h.set(key, value)
+  })
+  let body = ""
+  try {
+    body = await r.text()
+  } catch (e) {
+    body = ""
+  }
+  res.writeHead(r.status, h)
+  res.end(body)
+}
+
+async function handle(engine: Engine, store: ConfigStore, host: string, req: Http1Request, res: Http1Response): Promise<void> {
+  const request = toRequest(req, host)
+  try {
+    if (wantsStream(req)) {
+      const sink = new StreamSink(
+        (status, headers) => res.writeHead(status, headers),
+        (chunk) => res.write(chunk),
+        () => res.end(),
+      )
+      const r = await engine.chat(request, sink)
+      if (!sink.started) await write(res, r)
+      return
+    }
+    await write(res, await dispatch(engine, store, request))
+  } catch (e) {
+    if (!res.finished) {
+      const h: Map<string, string> = new Map()
+      h.set("content-type", "application/json")
+      res.writeHead(500, h)
+      res.end(`{"error":{"message":"internal error","type":"api_error"}}`)
+    }
+    console.error(`raiju: ${e.message}`)
+  }
+}
+
+export function startFront(engine: Engine, store: ConfigStore, opts: FrontOptions): string {
+  const host = `${opts.hostname}:${opts.port}`
+  listen({ hostname: opts.hostname, port: opts.port, maxBodyBytes: opts.maxBodyBytes }, (req, res) => {
+    // runs as its own task; the response is finished from there
+    handle(engine, store, host, req, res)
+  })
+  return `http://${host}/`
+}

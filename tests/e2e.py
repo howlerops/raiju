@@ -112,7 +112,8 @@ def main():
     shutil.rmtree(os.path.join(ROOT, "build/e2e-logs"), ignore_errors=True)
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
-    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config], env=env, stderr=subprocess.DEVNULL)
+    wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=subprocess.DEVNULL)
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health")
 
@@ -164,7 +165,9 @@ def main():
         check("stream_options added upstream", json.loads(seen()[-1]["body"])["stream_options"] == {"include_usage": True})
 
         s, _, b = call("POST", "/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "stream": True, "stream_options": {"include_usage": True}, "messages": [{"role": "user", "content": "s"}]})
-        check("non-openai streaming replayed as SSE", s == 200 and '"delta":{"content":"Hi from claude"}' in b and '"usage":' in b and b.endswith("data: [DONE]\n\n"), b)
+        # buffered servers replay the full answer as SSE; the http1 server converts Anthropic's own stream
+        content = '"delta":{"content":"hi"}' if os.environ.get("RAIJU_SERVER") == "http1" else '"delta":{"content":"Hi from claude"}'
+        check("non-openai streaming as SSE", s == 200 and content in b and '"usage":' in b and b.endswith("data: [DONE]\n\n"), b)
 
         s, _, b = call("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "x"})
         check("embeddings", s == 200 and json.loads(b)["data"][0]["embedding"] == [0.1, 0.2], b)
@@ -363,6 +366,27 @@ def main():
         n = len(seen())
         call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "what is the capital city of france ??"}]})
         check("no semantic lookup without a cache key", not any(x["path"] == "/v1/embeddings" for x in seen()[n:]))
+
+        # Streaming: chunks reach the client as the upstream produces them (http1 server only)
+        if os.environ.get("RAIJU_SERVER") == "http1":
+            import socket as _s
+            body = json.dumps({"model": "slowai/slow", "stream": True, "messages": [{"role": "user", "content": "count"}]}).encode()
+            sock = _s.create_connection(("127.0.0.1", 18098), timeout=10)
+            sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nx-bf-mcp-include-clients: none\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+            t0 = time.time(); arrivals = []; data = b""
+            while b"[DONE]" not in data:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+                for w in [b"one", b"two", b"three", b"four"]:
+                    if w in chunk:
+                        arrivals.append(round(time.time() - t0, 2))
+            sock.close()
+            spread = arrivals[-1] - arrivals[0] if len(arrivals) == 4 else 0
+            check("stream chunks arrive incrementally", len(arrivals) == 4 and spread > 0.3, arrivals)
+            check("streamed model renamed for the caller", b'"model":"slowai/slow"' in data and b"[DONE]" in data, data[:300])
+            check("usage chunk dropped when not requested", b'"usage"' not in data, data[-300:])
 
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])

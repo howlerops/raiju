@@ -1,0 +1,1071 @@
+// Incremental stream converters. Each one takes upstream bytes or text as they
+// arrive, split at any point, and returns the OpenAI chat.completion.chunk
+// events that are complete so far, ready to forward to the client.
+//
+// Text must be whole UTF-8 characters: a caller that decodes network chunks
+// must hold back an incomplete trailing sequence until the next chunk.
+import { Field, fields, elements, find, quote, rawStr, rawNum, setField, build } from "./json"
+import { newId, nowSeconds } from "./schemas"
+
+const DONE = "data: [DONE]\n\n"
+const MAX_FRAME = 16777216
+const enc = new TextEncoder()
+
+export type SseEvent = { event: string, data: string }
+
+// Splits an SSE stream into events. Line ends may be \n, \r\n or \r, and any
+// line may be cut between pushes. A chunk that ends in \r may be followed by
+// the \n of the same line ending in the next chunk, so that \n is skipped.
+export class SseSplitter {
+  private rest = ""              // text after the last line end, not yet a line
+  private skipLF = false         // the last chunk ended in \r
+  private ready: SseEvent[] = []
+  private eventName = ""
+  private data: string[] = []
+
+  push(text: string): SseEvent[] {
+    let s = this.rest + text
+    this.rest = ""
+    if (this.skipLF && s !== "") {
+      this.skipLF = false
+      if (s.startsWith("\n")) s = s.slice(1)
+    }
+    if (s.endsWith("\r")) this.skipLF = true
+    const lines = s.split("\r\n").join("\n").split("\r").join("\n").split("\n")
+    this.rest = lines.pop() ?? ""
+    for (const line of lines) this.line(line)
+    return this.take()
+  }
+
+  // Ends the stream: a last line without a line end is read, and a pending
+  // event is dispatched even without its blank line.
+  flush(): SseEvent[] {
+    const tail = this.rest
+    this.rest = ""
+    if (tail !== "") this.line(tail)
+    this.dispatch()
+    return this.take()
+  }
+
+  private take(): SseEvent[] {
+    const out = this.ready
+    this.ready = []
+    return out
+  }
+
+  private line(line: string): void {
+    if (line === "") {
+      this.dispatch()
+      return
+    }
+    // comments (and the keep-alives servers send as them) are ignored
+    if (line.startsWith(":")) return
+    const colon = line.indexOf(":")
+    const field = colon < 0 ? line : line.slice(0, colon)
+    let value = colon < 0 ? "" : line.slice(colon + 1)
+    if (value.startsWith(" ")) value = value.slice(1)
+    if (field === "event") this.eventName = value
+    else if (field === "data") this.data.push(value)
+  }
+
+  private dispatch(): void {
+    if (this.data.length > 0) {
+      this.ready.push({ event: this.eventName === "" ? "message" : this.eventName, data: this.data.join("\n") })
+    }
+    this.eventName = ""
+    this.data = []
+  }
+}
+
+// Writes OpenAI chat.completion.chunk events for one response. The id and
+// created time are the same on every chunk.
+class ChunkWriter {
+  id: string
+  created: int
+
+  constructor(readonly model: string) {
+    this.id = newId("chatcmpl-")
+    this.created = nowSeconds()
+  }
+
+  private chunk(delta: string, finish: string): string {
+    return `data: {"id":${quote(this.id)},"object":"chat.completion.chunk","created":${this.created},"model":${quote(this.model)},"choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+  }
+
+  role(): string {
+    return this.chunk(`{"role":"assistant","content":""}`, "null")
+  }
+
+  text(s: string): string {
+    return this.chunk(`{"content":${quote(s)}}`, "null")
+  }
+
+  // A tool call in full: id, name and all its arguments at once.
+  toolCall(index: int, id: string, name: string, args: string): string {
+    return this.chunk(`{"tool_calls":[{"index":${index},"id":${quote(id)},"type":"function","function":{"name":${quote(name)},"arguments":${quote(args)}}}]}`, "null")
+  }
+
+  // More arguments for the tool call at index.
+  toolArgs(index: int, args: string): string {
+    return this.chunk(`{"tool_calls":[{"index":${index},"function":{"arguments":${quote(args)}}}]}`, "null")
+  }
+
+  finishChunk(reason: string): string {
+    return this.chunk("{}", quote(reason))
+  }
+
+  usage(prompt: int, completion: int): string {
+    return `data: {"id":${quote(this.id)},"object":"chat.completion.chunk","created":${this.created},"model":${quote(this.model)},"choices":[],"usage":{"prompt_tokens":${prompt},"completion_tokens":${completion},"total_tokens":${prompt + completion}}}\n\n`
+  }
+
+  error(message: string, type: string): string {
+    return `data: {"error":{"message":${quote(message)},"type":${quote(type)},"code":null}}\n\n`
+  }
+}
+
+// Fields of a raw object value; absent or null reads as no fields.
+function objFields(raw: string | undefined): Field[] throws SyntaxError {
+  if (raw === undefined || raw === "null") return []
+  return try fields(raw)
+}
+
+// A numeric field as an int; absent reads as 0.
+function count(fs: Field[], key: string): int {
+  const n = rawNum(fs, key)
+  return n === undefined ? 0 : Math.trunc(n)
+}
+
+// Finish reason of the Messages and Converse streams.
+function mapStop(r: string | undefined): string {
+  if (r === "tool_use") return "tool_calls"
+  if (r === "max_tokens") return "length"
+  if (r === "refusal" || r === "guardrail_intervened" || r === "content_filtered") return "content_filter"
+  return "stop"
+}
+
+// True when a chunk has no choices, as the final usage-only chunk does.
+function noChoices(fs: Field[]): bool throws SyntaxError {
+  const c = find(fs, "choices")
+  if (c === undefined || c === "null") return true
+  return (try elements(c)).length === 0
+}
+
+// ---- OpenAI-compatible upstreams ----
+
+// Forwards OpenAI chunks with the model renamed. Usage is recorded from the
+// usage chunk; with dropUsage it is not forwarded (the client did not ask).
+export class OpenAIPassthrough {
+  promptTokens: int = 0
+  completionTokens: int = 0
+  sawUsage: bool = false
+  done: bool = false
+  private split = new SseSplitter()
+
+  constructor(readonly requestedModel: string, readonly dropUsage: bool) {}
+
+  push(text: string): string {
+    let out = ""
+    for (const ev of this.split.push(text)) out += this.event(ev.data)
+    return out
+  }
+
+  // Ends the stream. [DONE] is added if the upstream never sent it.
+  end(): string {
+    let out = ""
+    for (const ev of this.split.flush()) out += this.event(ev.data)
+    if (!this.done) {
+      this.done = true
+      out += DONE
+    }
+    return out
+  }
+
+  private event(data: string): string {
+    if (data === "[DONE]") {
+      this.done = true
+      return DONE
+    }
+    try {
+      return try this.rewrite(data)
+    } catch (e) {
+      // not a JSON object: forward it as it came
+      return `data: ${data}\n\n`
+    }
+  }
+
+  private rewrite(data: string): string throws SyntaxError {
+    let fs = try fields(data)
+    const usageRaw = find(fs, "usage")
+    const hasUsage = usageRaw !== undefined && usageRaw !== "null"
+    if (hasUsage) {
+      const u = try objFields(usageRaw)
+      this.sawUsage = true
+      this.promptTokens = count(u, "prompt_tokens")
+      this.completionTokens = count(u, "completion_tokens")
+    }
+    if (this.dropUsage && hasUsage && (try noChoices(fs))) return ""
+    if (find(fs, "model") !== undefined) setField(&fs, "model", quote(this.requestedModel))
+    return `data: ${build(fs)}\n\n`
+  }
+}
+
+// ---- Anthropic Messages ----
+
+// Converts Messages stream events into chunks. Content blocks arrive one at a
+// time; each tool_use block is tool call n, counting tool blocks from 0.
+export class AnthropicToOpenAI {
+  private split = new SseSplitter()
+  private w: ChunkWriter
+  private begun = false          // the role chunk has gone out
+  done = false
+  private curTool = -1           // tool call index of the open tool_use block
+  private nextTool = 0
+  private finish = "stop"
+  inTokens: int = 0
+  outTokens: int = 0
+
+  constructor(readonly requestedModel: string, readonly includeUsage: bool) {
+    this.w = new ChunkWriter(requestedModel)
+  }
+
+  push(text: string): string {
+    let out = ""
+    for (const ev of this.split.push(text)) out += this.event(ev.event, ev.data)
+    return out
+  }
+
+  // Ends the stream. A stream that stops before message_stop is an error.
+  end(): string {
+    let out = ""
+    for (const ev of this.split.flush()) out += this.event(ev.event, ev.data)
+    if (!this.done) out += this.fail("upstream stream ended before message_stop", "api_error")
+    return out
+  }
+
+  private event(name: string, data: string): string {
+    if (this.done) return ""
+    try {
+      return try this.handle(name, data)
+    } catch (e) {
+      return this.fail("malformed stream event from upstream", "api_error")
+    }
+  }
+
+  private handle(name: string, data: string): string throws SyntaxError {
+    const fs = try fields(data)
+    const type = rawStr(fs, "type") ?? name
+    if (type === "message_start") {
+      const m = try objFields(find(fs, "message"))
+      const id = rawStr(m, "id")
+      if (id !== undefined && id !== "") this.w.id = id
+      const u = try objFields(find(m, "usage"))
+      this.inTokens = count(u, "input_tokens") + count(u, "cache_read_input_tokens") + count(u, "cache_creation_input_tokens")
+      this.outTokens = count(u, "output_tokens")
+      return this.begin()
+    }
+    if (type === "content_block_start") {
+      const cb = try objFields(find(fs, "content_block"))
+      if (rawStr(cb, "type") === "tool_use") {
+        this.curTool = this.nextTool
+        this.nextTool += 1
+        return this.begin() + this.w.toolCall(this.curTool, rawStr(cb, "id") ?? "", rawStr(cb, "name") ?? "", "")
+      }
+      this.curTool = -1
+      const text = rawStr(cb, "text") ?? ""
+      return this.begin() + (text === "" ? "" : this.w.text(text))
+    }
+    if (type === "content_block_delta") {
+      const d = try objFields(find(fs, "delta"))
+      const dt = rawStr(d, "type")
+      if (dt === "text_delta") {
+        const text = rawStr(d, "text") ?? ""
+        return this.begin() + (text === "" ? "" : this.w.text(text))
+      }
+      if (dt === "input_json_delta" && this.curTool >= 0) {
+        const args = rawStr(d, "partial_json") ?? ""
+        return this.begin() + (args === "" ? "" : this.w.toolArgs(this.curTool, args))
+      }
+      return ""
+    }
+    if (type === "message_delta") {
+      const d = try objFields(find(fs, "delta"))
+      this.finish = mapStop(rawStr(d, "stop_reason"))
+      const u = try objFields(find(fs, "usage"))
+      const o = rawNum(u, "output_tokens")
+      if (o !== undefined) this.outTokens = Math.trunc(o)
+      return ""
+    }
+    if (type === "message_stop") {
+      let out = this.begin() + this.w.finishChunk(this.finish)
+      if (this.includeUsage) out += this.w.usage(this.inTokens, this.outTokens)
+      this.done = true
+      return out + DONE
+    }
+    if (type === "error") {
+      const e = try objFields(find(fs, "error"))
+      return this.fail(rawStr(e, "message") ?? "upstream error", rawStr(e, "type") ?? "api_error")
+    }
+    // ping and content_block_stop have no OpenAI counterpart
+    return ""
+  }
+
+  private begin(): string {
+    if (this.begun) return ""
+    this.begun = true
+    return this.w.role()
+  }
+
+  private fail(message: string, type: string): string {
+    this.done = true
+    return this.w.error(message, type) + DONE
+  }
+}
+
+// ---- Gemini ----
+
+function geminiFinish(r: string, hasCalls: bool): string {
+  if (hasCalls) return "tool_calls"
+  if (r === "MAX_TOKENS") return "length"
+  if (r === "SAFETY" || r === "RECITATION" || r === "BLOCKLIST" || r === "PROHIBITED_CONTENT" || r === "SPII") return "content_filter"
+  return "stop"
+}
+
+// Converts streamGenerateContent (alt=sse) events into chunks. Gemini has no
+// closing event, so the usage chunk and [DONE] come from end().
+export class GeminiToOpenAI {
+  private split = new SseSplitter()
+  private w: ChunkWriter
+  private begun = false
+  private finished = false       // the finish chunk has gone out
+  done = false
+  private calls: int = 0
+  private sawUsage: bool = false
+  inTokens: int = 0
+  outTokens: int = 0
+
+  constructor(readonly requestedModel: string, readonly includeUsage: bool) {
+    this.w = new ChunkWriter(requestedModel)
+  }
+
+  push(text: string): string {
+    let out = ""
+    for (const ev of this.split.push(text)) out += this.event(ev.data)
+    return out
+  }
+
+  end(): string {
+    if (this.done) return ""
+    let out = ""
+    for (const ev of this.split.flush()) out += this.event(ev.data)
+    if (this.done) return out
+    if (!this.finished) return out + this.fail("upstream stream ended before finishReason", "api_error")
+    if (this.includeUsage && this.sawUsage) out += this.w.usage(this.inTokens, this.outTokens)
+    this.done = true
+    return out + DONE
+  }
+
+  private event(data: string): string {
+    if (this.done) return ""
+    try {
+      return try this.handle(data)
+    } catch (e) {
+      return this.fail("malformed stream event from upstream", "api_error")
+    }
+  }
+
+  private handle(data: string): string throws SyntaxError {
+    const fs = try fields(data)
+    const errRaw = find(fs, "error")
+    if (errRaw !== undefined && errRaw !== "null") {
+      const e = try fields(errRaw)
+      return this.fail(rawStr(e, "message") ?? "upstream error", rawStr(e, "status") ?? "api_error")
+    }
+    let out = this.begin()
+    const u = try objFields(find(fs, "usageMetadata"))
+    if (u.length > 0) {
+      this.sawUsage = true
+      this.inTokens = count(u, "promptTokenCount")
+      this.outTokens = count(u, "candidatesTokenCount") + count(u, "thoughtsTokenCount")
+    }
+    const cands = find(fs, "candidates")
+    if (cands !== undefined && cands !== "null") {
+      const first = (try elements(cands))[0]
+      if (first !== undefined) {
+        const c = try fields(first)
+        const content = try objFields(find(c, "content"))
+        const partsRaw = find(content, "parts")
+        if (partsRaw !== undefined && partsRaw !== "null") {
+          for (const p of try elements(partsRaw)) {
+            const piece = try this.part(p)
+            out += piece
+          }
+        }
+        const fr = rawStr(c, "finishReason")
+        if (fr !== undefined && !this.finished) {
+          this.finished = true
+          out += this.w.finishChunk(geminiFinish(fr, this.calls > 0))
+        }
+      }
+    }
+    return out
+  }
+
+  private part(p: string): string throws SyntaxError {
+    const pf = try fields(p)
+    if (find(pf, "thought") === "true") return ""
+    const t = rawStr(pf, "text")
+    if (t !== undefined && t !== "") return this.w.text(t)
+    const fc = find(pf, "functionCall")
+    if (fc !== undefined && fc !== "null") {
+      const f = try fields(fc)
+      const raw = find(f, "args")
+      const args = raw === undefined || raw === "null" ? "{}" : raw
+      const index = this.calls
+      this.calls += 1
+      // Gemini sends each call whole, so each one is a complete tool call
+      return this.w.toolCall(index, newId("call_"), rawStr(f, "name") ?? "", args)
+    }
+    return ""
+  }
+
+  private begin(): string {
+    if (this.begun) return ""
+    this.begun = true
+    return this.w.role()
+  }
+
+  private fail(message: string, type: string): string {
+    this.done = true
+    return this.w.error(message, type) + DONE
+  }
+}
+
+// ---- AWS event stream (Bedrock ConverseStream) ----
+
+// CRC-32 (IEEE 802.3) table, built once.
+function makeCrcTable(): int[] {
+  const t: int[] = []
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) {
+      if ((c & 1) === 1) c = 0xedb88320 ^ (c >> 1)
+      else c = c >> 1
+    }
+    t.push(c)
+  }
+  return t
+}
+
+const CRC_TABLE = makeCrcTable()
+
+function crc32(b: u8[]): int {
+  let crc = 0xffffffff
+  for (const x of b) crc = CRC_TABLE[(crc ^ int(x)) & 0xff]! ^ (crc >> 8)
+  return crc ^ 0xffffffff
+}
+
+function byteAt(b: u8[], i: int): int throws SyntaxError {
+  if (i < 0 || i >= b.length) throw new SyntaxError("truncated event stream frame")
+  return int(b[i]!)
+}
+
+function u32(b: u8[], at: int): int {
+  return (int(b[at]!) << 24) | (int(b[at + 1]!) << 16) | (int(b[at + 2]!) << 8) | int(b[at + 3]!)
+}
+
+function pushU16(inout out: u8[], n: int): void {
+  out.push(u8((n >> 8) & 255))
+  out.push(u8(n & 255))
+}
+
+function pushU32(inout out: u8[], n: int): void {
+  out.push(u8((n >> 24) & 255))
+  out.push(u8((n >> 16) & 255))
+  out.push(u8((n >> 8) & 255))
+  out.push(u8(n & 255))
+}
+
+function pushAll(inout out: u8[], b: u8[]): void {
+  for (const x of b) out.push(x)
+}
+
+function decodeText(b: u8[]): string throws SyntaxError {
+  try {
+    return try new TextDecoder().decode(b)
+  } catch (e) {
+    throw new SyntaxError("invalid UTF-8 in event stream")
+  }
+}
+
+// Header values of string type (7) are kept; the other types are skipped by size.
+function parseHeaders(b: u8[]): Map<string, string> throws SyntaxError {
+  const out: Map<string, string> = new Map()
+  let i = 0
+  while (i < b.length) {
+    const nl = try byteAt(b, i)
+    const name = try decodeText(b.slice(i + 1, i + 1 + nl))
+    i += 1 + nl
+    const type = try byteAt(b, i)
+    i += 1
+    let size = 0
+    if (type === 0 || type === 1) size = 0
+    else if (type === 2) size = 1
+    else if (type === 3) size = 2
+    else if (type === 4) size = 4
+    else if (type === 5 || type === 8) size = 8
+    else if (type === 9) size = 16
+    else if (type === 6 || type === 7) {
+      size = (try byteAt(b, i)) * 256 + (try byteAt(b, i + 1))
+      if (type === 7) {
+        const value = try decodeText(b.slice(i + 2, i + 2 + size))
+        out.set(name, value)
+      }
+      size += 2
+    } else throw new SyntaxError(`unknown header type ${type}`)
+    if (i + size > b.length) throw new SyntaxError("truncated event stream header")
+    i += size
+  }
+  return out
+}
+
+// The message of an exception payload, or the payload itself.
+function errorMessage(payload: string): string {
+  try {
+    const fs = try fields(payload)
+    return rawStr(fs, "message") ?? payload
+  } catch (e) {
+    return payload
+  }
+}
+
+// Converts ConverseStream binary frames into chunks. Frames may be split at
+// any byte; each frame's two CRCs are checked before its payload is read.
+export class BedrockEventStreamToOpenAI {
+  promptTokens: int = 0
+  completionTokens: int = 0
+  done: bool = false
+  private buf: u8[] = []
+  private w: ChunkWriter
+  private begun = false
+  private finished = false       // messageStop has gone out
+  private curTool = -1
+  private nextTool = 0
+  private finish = "stop"
+
+  constructor(readonly requestedModel: string, readonly includeUsage: bool) {
+    this.w = new ChunkWriter(requestedModel)
+  }
+
+  push(bytes: u8[]): string {
+    if (this.done) return ""
+    for (const b of bytes) this.buf.push(b)
+    let out = ""
+    while (!this.done && this.buf.length >= 12) {
+      // the prelude is checked as soon as it is complete, before the rest of the frame
+      if (crc32(this.buf.slice(0, 8)) !== u32(this.buf, 8)) return out + this.fail("bad prelude CRC in event stream", "api_error")
+      const total = u32(this.buf, 0)
+      const hlen = u32(this.buf, 4)
+      if (total < 16 || total > MAX_FRAME || hlen > total - 16) return out + this.fail("invalid event stream frame length", "api_error")
+      if (this.buf.length < total) break
+      const frame = this.buf.slice(0, total)
+      this.buf = this.buf.slice(total)
+      if (crc32(frame.slice(0, total - 4)) !== u32(frame, total - 4)) return out + this.fail("bad message CRC in event stream", "api_error")
+      let piece = ""
+      try {
+        piece = try this.message(frame, hlen)
+      } catch (e) {
+        return out + this.fail("malformed event stream frame", "api_error")
+      }
+      out += piece
+    }
+    return out
+  }
+
+  // Ends the stream. A stream that stops before messageStop is an error.
+  end(): string {
+    if (this.done) return ""
+    if (this.finished) {
+      this.done = true
+      return DONE
+    }
+    return this.fail("upstream stream ended before messageStop", "api_error")
+  }
+
+  private message(frame: u8[], hlen: int): string throws SyntaxError {
+    const headers = try parseHeaders(frame.slice(12, 12 + hlen))
+    const payload = try decodeText(frame.slice(12 + hlen, frame.length - 4))
+    const mtype = headers.get(":message-type") ?? "event"
+    if (mtype !== "event") {
+      return this.fail(errorMessage(payload), headers.get(":exception-type") ?? headers.get(":error-code") ?? "api_error")
+    }
+    const type = headers.get(":event-type") ?? ""
+    if (type === "messageStart") return this.begin()
+    if (type === "contentBlockStart") {
+      const fs = try fields(payload)
+      const start = try objFields(find(fs, "start"))
+      const tuRaw = find(start, "toolUse")
+      if (tuRaw !== undefined && tuRaw !== "null") {
+        const tu = try fields(tuRaw)
+        this.curTool = this.nextTool
+        this.nextTool += 1
+        return this.begin() + this.w.toolCall(this.curTool, rawStr(tu, "toolUseId") ?? "", rawStr(tu, "name") ?? "", "")
+      }
+      this.curTool = -1
+      return ""
+    }
+    if (type === "contentBlockDelta") {
+      const fs = try fields(payload)
+      const delta = try objFields(find(fs, "delta"))
+      const text = rawStr(delta, "text") ?? ""
+      if (text !== "") return this.begin() + this.w.text(text)
+      const tuRaw = find(delta, "toolUse")
+      if (tuRaw !== undefined && tuRaw !== "null" && this.curTool >= 0) {
+        const tu = try fields(tuRaw)
+        const input = rawStr(tu, "input") ?? ""
+        if (input !== "") return this.begin() + this.w.toolArgs(this.curTool, input)
+      }
+      return ""
+    }
+    if (type === "contentBlockStop") {
+      this.curTool = -1
+      return ""
+    }
+    if (type === "messageStop") {
+      const fs = try fields(payload)
+      this.finish = mapStop(rawStr(fs, "stopReason"))
+      this.finished = true
+      return this.begin() + this.w.finishChunk(this.finish)
+    }
+    if (type === "metadata") {
+      const fs = try fields(payload)
+      const u = try objFields(find(fs, "usage"))
+      this.promptTokens = count(u, "inputTokens") + count(u, "cacheReadInputTokens") + count(u, "cacheWriteInputTokens")
+      this.completionTokens = count(u, "outputTokens")
+      // metadata is the last frame of a ConverseStream response
+      let out = ""
+      if (this.includeUsage) out += this.w.usage(this.promptTokens, this.completionTokens)
+      this.done = true
+      return out + DONE
+    }
+    return ""
+  }
+
+  private begin(): string {
+    if (this.begun) return ""
+    this.begun = true
+    return this.w.role()
+  }
+
+  private fail(message: string, type: string): string {
+    this.done = true
+    this.buf = []
+    return this.w.error(message, type) + DONE
+  }
+}
+
+// Builds one event stream frame. Headers are name/value pairs sent as strings.
+export function encodeEventStreamFrame(headers: Map<string, string>, payload: string): u8[] {
+  let head: u8[] = []
+  for (const name of headers.keys()) {
+    const nb = enc.encode(name)
+    const vb = enc.encode(headers.get(name) ?? "")
+    head.push(u8(nb.length))
+    pushAll(&head, nb)
+    head.push(u8(7))
+    pushU16(&head, vb.length)
+    pushAll(&head, vb)
+  }
+  const body = enc.encode(payload)
+  const total = 12 + head.length + body.length + 4
+  let frame: u8[] = []
+  pushU32(&frame, total)
+  pushU32(&frame, head.length)
+  const preludeCrc = crc32(frame)
+  pushU32(&frame, preludeCrc)
+  pushAll(&frame, head)
+  pushAll(&frame, body)
+  const messageCrc = crc32(frame)
+  pushU32(&frame, messageCrc)
+  return frame
+}
+
+// ---- tests ----
+
+type TestChunk = {
+  id: string,
+  object: string,
+  created: int,
+  model: string,
+  choices: {
+    index: int,
+    delta: {
+      role?: string,
+      content?: string,
+      tool_calls?: { index: int, id?: string, type?: string, function: { name?: string, arguments?: string } }[]
+    },
+    finish_reason?: string
+  }[],
+  usage?: { prompt_tokens: int, completion_tokens: int, total_tokens: int },
+}
+
+// The data of each chunk event in an output, parsed. [DONE] and errors are left out.
+function chunksOf(out: string): TestChunk[] throws SyntaxError {
+  const res: TestChunk[] = []
+  for (const ev of out.split("\n\n")) {
+    if (ev.startsWith("data: {") && ev.indexOf(`"choices"`) >= 0) res.push(try JSON.parse(ev.slice(6)) as TestChunk)
+  }
+  return res
+}
+
+// Feeds text in pieces of n bytes (ASCII in tests), returning all the output.
+function pieces(text: string, n: int, push: (t: string) => string): string {
+  let out = ""
+  for (let i = 0; i < text.byteLength; i += n) out += push(text.slice(i, i + n))
+  return out
+}
+
+function bytePieces(bytes: u8[], n: int, push: (b: u8[]) => string): string {
+  let out = ""
+  for (let i = 0; i < bytes.length; i += n) out += push(bytes.slice(i, i + n))
+  return out
+}
+
+// Replaces each created time with 0, so exact output can be compared.
+function noCreated(s: string): string {
+  const parts = s.split(`"created":`)
+  let out = parts[0]!
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i]!
+    out += `"created":0` + p.slice(p.indexOf(","))
+  }
+  return out
+}
+
+function headersOf(pairs: string[][]): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  for (const p of pairs) m.set(p[0]!, p[1]!)
+  return m
+}
+
+// A Messages stream with a text block and then a tool_use block.
+const ANTHROPIC_TEXT = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":12,"cache_read_input_tokens":3,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: ping
+data: {"type":"ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
+const ANTHROPIC_TOOLS = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_02","type":"message","role":"assistant","model":"up","content":[],"stop_reason":null,"usage":{"input_tokens":20,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Checking."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_a","name":"look","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"1}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_b","name":"look","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":2}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
+// Frames of a ConverseStream response, as Bedrock sends them.
+function converseFrame(eventType: string, payload: string): u8[] {
+  return encodeEventStreamFrame(headersOf([[":event-type", eventType], [":content-type", "application/json"], [":message-type", "event"]]), payload)
+}
+
+function concatBytes(parts: u8[][]): u8[] {
+  let out: u8[] = []
+  for (const p of parts) pushAll(&out, p)
+  return out
+}
+
+test("SSE splitter handles CRLF, split lines and multi-line data", () => {
+  const sp = new SseSplitter()
+  // CRLF split between the \r and its \n, and between events
+  const a = sp.push("data: a\r")
+  expect(a.length).toBe(0)
+  const b = sp.push("\n\r")
+  expect(b.length).toBe(1)
+  expect(b[0]!.data).toBe("a")
+  const c = sp.push("\ndata: b\n\n")
+  expect(c.length).toBe(1)
+  expect(c[0]!.data).toBe("b")
+  expect(c[0]!.event).toBe("message")
+
+  // a line cut mid-word, then a comment, an event name and two data lines
+  const d = new SseSplitter()
+  expect(d.push("da").length).toBe(0)
+  const first = d.push("ta: x\n: keep-alive\n\nevent: foo\ndata: line1\n")
+  expect(first.length).toBe(1)
+  expect(first[0]!.data).toBe("x")
+  const e = d.push("data: line2\n\n")
+  expect(e.length).toBe(1)
+  expect(e[0]!.event).toBe("foo")
+  expect(e[0]!.data).toBe("line1\nline2")
+})
+
+test("SSE splitter flushes a trailing event without a blank line", () => {
+  const sp = new SseSplitter()
+  expect(sp.push("data: tail").length).toBe(0)
+  const f = sp.flush()
+  expect(f.length).toBe(1)
+  expect(f[0]!.data).toBe("tail")
+  expect(sp.flush().length).toBe(0)
+})
+
+test("OpenAI passthrough rewrites the model and tracks usage", () => {
+  const p = new OpenAIPassthrough("gpt-x", false)
+  const out = p.push(`data: {"id":"1","model":"up","choices":[{"index":0,"delta":{"content":"a"}}]}\n\ndata: {"id":"1","model":"up","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\ndata: [DONE]\n\n`)
+  expect(out.includes(`"model":"gpt-x"`)).toBe(true)
+  expect(out.includes(`"model":"up"`)).toBe(false)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+  expect(p.sawUsage).toBe(true)
+  expect(p.done).toBe(true)
+  expect(p.promptTokens).toBe(4)
+  expect(p.completionTokens).toBe(2)
+  expect(p.end()).toBe("")
+})
+
+test("OpenAI passthrough drops the usage chunk when not asked for", () => {
+  const p = new OpenAIPassthrough("gpt-x", true)
+  const text = `data: {"id":"1","model":"up","choices":[{"index":0,"delta":{"content":"a"}}]}\n\ndata: {"id":"1","model":"up","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n`
+  const out = p.push(text) + p.end()
+  expect(out.includes("usage")).toBe(false)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+  expect(p.promptTokens).toBe(4)
+})
+
+test("Anthropic text stream in 7-byte pieces", () => {
+  const conv = new AnthropicToOpenAI("req-model", true)
+  let out = pieces(ANTHROPIC_TEXT, 7, (t) => conv.push(t))
+  out += conv.end()
+  const exact = `data: {"id":"msg_01","object":"chat.completion.chunk","created":0,"model":"req-model","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"msg_01","object":"chat.completion.chunk","created":0,"model":"req-model","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}
+
+data: {"id":"msg_01","object":"chat.completion.chunk","created":0,"model":"req-model","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}
+
+data: {"id":"msg_01","object":"chat.completion.chunk","created":0,"model":"req-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"msg_01","object":"chat.completion.chunk","created":0,"model":"req-model","choices":[],"usage":{"prompt_tokens":15,"completion_tokens":5,"total_tokens":20}}
+
+data: [DONE]
+
+`
+  expect(noCreated(out)).toBe(exact)
+  expect(conv.done).toBe(true)
+})
+
+test("Anthropic tool stream numbers tool calls and maps stop reasons", () => {
+  const conv = new AnthropicToOpenAI("req-model", false)
+  let out = pieces(ANTHROPIC_TOOLS, 7, (t) => conv.push(t))
+  out += conv.end()
+  const chunks = try chunksOf(out)
+  // role, text, tool start, two argument pieces, second tool start and args, finish
+  expect(chunks.length).toBe(8)
+  expect(chunks[2]!.choices[0]!.delta.tool_calls![0]!.id).toBe("toolu_a")
+  expect(chunks[2]!.choices[0]!.delta.tool_calls![0]!.index).toBe(0)
+  expect(chunks[2]!.choices[0]!.delta.tool_calls![0]!.function.arguments).toBe("")
+  expect(chunks[3]!.choices[0]!.delta.tool_calls![0]!.index).toBe(0)
+  expect(chunks[4]!.choices[0]!.delta.tool_calls![0]!.function.arguments).toBe("1}")
+  expect(chunks[5]!.choices[0]!.delta.tool_calls![0]!.id).toBe("toolu_b")
+  expect(chunks[5]!.choices[0]!.delta.tool_calls![0]!.index).toBe(1)
+  expect(chunks[7]!.choices[0]!.finish_reason).toBe("tool_calls")
+  // the arguments of each call join into its JSON
+  let args = ""
+  for (const c of chunks) {
+    const tc = c.choices[0]!.delta.tool_calls
+    if (tc !== undefined && tc[0]!.index === 0) args += tc[0]!.function.arguments ?? ""
+  }
+  expect(args).toBe(`{"q":1}`)
+  // no usage chunk when not asked for
+  expect(out.includes(`"usage"`)).toBe(false)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("Anthropic usage chunk and error event", () => {
+  const conv = new AnthropicToOpenAI("req-model", true)
+  const out = conv.push(`event: message_start
+data: {"type":"message_start","message":{"id":"msg_03","usage":{"input_tokens":2,"output_tokens":0}}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+
+`)
+  expect(out.endsWith(`data: {"error":{"message":"Overloaded","type":"overloaded_error","code":null}}\n\ndata: [DONE]\n\n`)).toBe(true)
+  // nothing after the error
+  expect(conv.push(`event: message_stop\ndata: {"type":"message_stop"}\n\n`)).toBe("")
+})
+
+test("Anthropic stream that ends early is an error", () => {
+  const conv = new AnthropicToOpenAI("req-model", false)
+  const out = conv.push(`event: message_start\ndata: {"type":"message_start","message":{"id":"msg_04"}}\n\n`) + conv.end()
+  expect(out.includes(`"type":"api_error"`)).toBe(true)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("Gemini text, function call and finish reason", () => {
+  const conv = new GeminiToOpenAI("req-model", true)
+  let out = pieces(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"hidden","thought":true}]}}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Let me "}]}}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"check."},{"functionCall":{"name":"weather","args":{"city":"Oslo"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":4,"totalTokenCount":13}}
+
+`, 11, (t) => conv.push(t))
+  out += conv.end()
+  const chunks = try chunksOf(out)
+  expect(out.includes("hidden")).toBe(false)
+  expect(chunks.length).toBe(6)
+  expect(chunks[0]!.choices[0]!.delta.role).toBe("assistant")
+  expect(chunks[1]!.choices[0]!.delta.content).toBe("Let me ")
+  expect(chunks[2]!.choices[0]!.delta.content).toBe("check.")
+  const call = chunks[3]!.choices[0]!.delta.tool_calls![0]!
+  expect(call.index).toBe(0)
+  expect(call.type).toBe("function")
+  expect(call.function.name).toBe("weather")
+  expect(call.function.arguments).toBe(`{"city":"Oslo"}`)
+  expect(call.id!.startsWith("call_")).toBe(true)
+  expect(chunks[4]!.choices[0]!.finish_reason).toBe("tool_calls")
+  expect(chunks[5]!.usage!.prompt_tokens).toBe(9)
+  expect(chunks[5]!.usage!.completion_tokens).toBe(4)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("Gemini max tokens and safety finish reasons", () => {
+  const a = new GeminiToOpenAI("m", false)
+  const outA = a.push(`data: {"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"MAX_TOKENS"}]}\n\n`) + a.end()
+  expect(outA.includes(`"finish_reason":"length"`)).toBe(true)
+  const b = new GeminiToOpenAI("m", false)
+  const outB = b.push(`data: {"candidates":[{"finishReason":"SAFETY"}]}\n\n`) + b.end()
+  expect(outB.includes(`"finish_reason":"content_filter"`)).toBe(true)
+  // a stream with no finish reason is an error
+  const c = new GeminiToOpenAI("m", false)
+  expect(c.push(`data: {"candidates":[{"content":{"parts":[{"text":"x"}]}}]}\n\n`).includes("role")).toBe(true)
+  expect(c.end().includes(`"type":"api_error"`)).toBe(true)
+})
+
+test("CRC-32 check value", () => {
+  expect(crc32(enc.encode("123456789"))).toBe(0xcbf43926)
+  expect(crc32(enc.encode(""))).toBe(0)
+})
+
+test("event stream frames fed byte by byte", () => {
+  const conv = new BedrockEventStreamToOpenAI("req-model", true)
+  const frames = concatBytes([
+    converseFrame("messageStart", `{"role":"assistant"}`),
+    converseFrame("contentBlockDelta", `{"contentBlockIndex":0,"delta":{"text":"Hi"}}`),
+    converseFrame("contentBlockStop", `{"contentBlockIndex":0}`),
+    converseFrame("messageStop", `{"stopReason":"end_turn"}`),
+    converseFrame("metadata", `{"usage":{"inputTokens":5,"outputTokens":2,"totalTokens":7}}`),
+  ])
+  let out = bytePieces(frames, 1, (b) => conv.push(b))
+  out += conv.end()
+  const chunks = try chunksOf(out)
+  expect(chunks.length).toBe(4)
+  expect(chunks[0]!.choices[0]!.delta.role).toBe("assistant")
+  expect(chunks[1]!.choices[0]!.delta.content).toBe("Hi")
+  expect(chunks[2]!.choices[0]!.finish_reason).toBe("stop")
+  expect(chunks[3]!.usage!.prompt_tokens).toBe(5)
+  expect(chunks[3]!.usage!.completion_tokens).toBe(2)
+  expect(conv.promptTokens).toBe(5)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("event stream tool use", () => {
+  const conv = new BedrockEventStreamToOpenAI("req-model", false)
+  const frames = concatBytes([
+    converseFrame("messageStart", `{"role":"assistant"}`),
+    converseFrame("contentBlockStart", `{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"tu_9","name":"look"}}}`),
+    converseFrame("contentBlockDelta", `{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\\"q\\":"}}}`),
+    converseFrame("contentBlockDelta", `{"contentBlockIndex":0,"delta":{"toolUse":{"input":"1}"}}}`),
+    converseFrame("contentBlockStop", `{"contentBlockIndex":0}`),
+    converseFrame("messageStop", `{"stopReason":"tool_use"}`),
+    converseFrame("metadata", `{"usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2}}`),
+  ])
+  const out = bytePieces(frames, 13, (b) => conv.push(b))
+  const chunks = try chunksOf(out)
+  expect(chunks.length).toBe(5)
+  const start = chunks[1]!.choices[0]!.delta.tool_calls![0]!
+  expect(start.id).toBe("tu_9")
+  expect(start.function.name).toBe("look")
+  expect(chunks[2]!.choices[0]!.delta.tool_calls![0]!.function.arguments).toBe(`{"q":`)
+  expect(chunks[3]!.choices[0]!.delta.tool_calls![0]!.function.arguments).toBe("1}")
+  expect(chunks[4]!.choices[0]!.finish_reason).toBe("tool_calls")
+  expect(out.includes(`"usage"`)).toBe(false)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("event stream detects bad CRCs", () => {
+  const good = converseFrame("messageStart", `{"role":"assistant"}`)
+  // a flipped payload byte breaks the message CRC
+  const bad = good.slice(0, good.length)
+  bad[good.length - 6] = u8(int(bad[good.length - 6]!) ^ 1)
+  const a = new BedrockEventStreamToOpenAI("m", false)
+  const outA = a.push(bad)
+  expect(outA.includes("bad message CRC")).toBe(true)
+  expect(a.done).toBe(true)
+  // a flipped prelude byte breaks the prelude CRC, seen before the rest arrives
+  const pre = good.slice(0, good.length)
+  pre[9] = u8(int(pre[9]!) ^ 4)
+  const b = new BedrockEventStreamToOpenAI("m", false)
+  expect(b.push(pre.slice(0, 12)).includes("bad prelude CRC")).toBe(true)
+})
+
+test("event stream exceptions become error events", () => {
+  const frame = encodeEventStreamFrame(headersOf([[":message-type", "exception"], [":exception-type", "throttlingException"]]), `{"message":"slow down"}`)
+  const conv = new BedrockEventStreamToOpenAI("m", false)
+  const out = conv.push(frame)
+  expect(out).toBe(`data: {"error":{"message":"slow down","type":"throttlingException","code":null}}\n\ndata: [DONE]\n\n`)
+  expect(conv.end()).toBe("")
+})

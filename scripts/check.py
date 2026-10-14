@@ -22,8 +22,9 @@ def apply_safe(diags):
         # apply bottom-up so earlier offsets stay valid
         for e in sorted(edits, key=lambda e: (e["start"]["line"], e["start"]["col"]), reverse=True):
             sl, sc, el, ec = e["start"]["line"] - 1, e["start"]["col"] - 1, e["end"]["line"] - 1, e["end"]["col"] - 1
-            head = lines[sl].encode()[:sc].decode()
-            tail = lines[el].encode()[ec:].decode()
+            # tov reports columns in characters (code points), not bytes
+            head = lines[sl][:sc]
+            tail = lines[el][ec:]
             lines[sl:el + 1] = (head + e["text"] + tail).split("\n")
         open(path, "w").write("\n".join(lines))
     return sum(len(v) for v in by_file.values())

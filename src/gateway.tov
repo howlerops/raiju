@@ -3,6 +3,7 @@
 import { Config, ProviderConfig, providerOf } from "./config"
 import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, snapshot } from "./schemas"
+import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI } from "./streams"
 import { Target, Upstream, Translated } from "./providers/types"
 import { ModelRef, parseModel, target, classify, backoffMs, maxRetries, timeoutMs, healthId } from "./router"
 import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
@@ -27,7 +28,90 @@ import { Deadline, deadline } from "./deadline"
 export type Build = (t: Target) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64 }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool }
+
+// Where a streamed answer goes, when the server can stream (the http1 front end).
+export class StreamSink {
+  started = false
+  constructor(readonly open: (status: int, headers: Map<string, string>) => void, readonly write: (chunk: string) => void, readonly close: () => void) {}
+}
+
+// Turns a provider's streaming body into OpenAI SSE events as bytes arrive.
+// One concrete class over the per-provider converters in streams.tov (calls
+// through an interface value crashed this Tov build).
+export class StreamConverter {
+  oa: OpenAIPassthrough | undefined = undefined
+  an: AnthropicToOpenAI | undefined = undefined
+  ge: GeminiToOpenAI | undefined = undefined
+  br: BedrockEventStreamToOpenAI | undefined = undefined
+  readonly dec: TextDecoder | undefined = utf8Decoder()
+
+  constructor(readonly kind: string, requested: string, includeUsage: bool) {
+    if (kind === "anthropic") this.an = new AnthropicToOpenAI(requested, includeUsage)
+    else if (kind === "gemini") this.ge = new GeminiToOpenAI(requested, includeUsage)
+    else if (kind === "bedrock") this.br = new BedrockEventStreamToOpenAI(requested, includeUsage)
+    else this.oa = new OpenAIPassthrough(requested, !includeUsage)
+  }
+
+  // text converters take whole characters: the streaming decoder holds back a split one
+  text(bytes: u8[]): string {
+    const d = this.dec
+    if (d === undefined) return ""
+    try {
+      return d.decode(bytes, { stream: true })
+    } catch (e) {
+      return ""
+    }
+  }
+
+  push(bytes: u8[]): string {
+    const br = this.br
+    if (br !== undefined) return br.push(bytes)
+    const t = this.text(bytes)
+    if (t === "") return ""
+    const an = this.an
+    if (an !== undefined) return an.push(t)
+    const ge = this.ge
+    if (ge !== undefined) return ge.push(t)
+    const oa = this.oa
+    if (oa !== undefined) return oa.push(t)
+    return ""
+  }
+
+  end(): string {
+    const an = this.an
+    if (an !== undefined) return an.end()
+    const ge = this.ge
+    if (ge !== undefined) return ge.end()
+    const br = this.br
+    if (br !== undefined) return br.end()
+    const oa = this.oa
+    if (oa !== undefined) return oa.end()
+    return ""
+  }
+
+  promptTokens(): int {
+    return this.an?.inTokens ?? this.ge?.inTokens ?? this.br?.promptTokens ?? this.oa?.promptTokens ?? 0
+  }
+
+  completionTokens(): int {
+    return this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.oa?.completionTokens ?? 0
+  }
+}
+
+export type ConverterFactory = (t: Target, requestedModel: string) => StreamConverter | undefined
+
+function utf8Decoder(): TextDecoder | undefined {
+  try {
+    return new TextDecoder()
+  } catch (e) {
+    return undefined
+  }
+}
+
+// OpenAI-format upstreams: events pass through with the model renamed to what
+// the caller asked for; usage is read for accounting and, when the caller
+// didn't ask for it, the usage-only chunk is dropped.
 
 async function sleep(ms: int): Promise<void> {
   await new Promise<void>((resolve) => {
@@ -98,6 +182,10 @@ class ReqCtx {
   span: Span | undefined = undefined
   // headers plugins asked to send upstream
   upstreamHeaders: Map<string, string> = new Map()
+  // set when the answer streams straight to the client
+  sink: StreamSink | undefined = undefined
+  makeConverter: ConverterFactory | undefined = undefined
+  outHeaders: Map<string, string> = new Map()
   constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
 }
 
@@ -268,6 +356,39 @@ export class Engine {
           const signal = dl.controller.signal
           const res = up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal })
           status = res.status
+          const sink = ctx.sink
+          const mk = ctx.makeConverter
+          const conv = status >= 200 && status < 300 && sink !== undefined && mk !== undefined ? mk(t, ref.provider + "/" + ref.model) : undefined
+          const stream = res.body
+          if (conv !== undefined && sink !== undefined && stream !== undefined) {
+            // Past this point the client has bytes, so there's no retry or fallback.
+            ctx.outHeaders.set("content-type", "text/event-stream")
+            ctx.outHeaders.set("cache-control", "no-cache")
+            ctx.outHeaders.set("x-bf-attempts", "" + attempts)
+            sink.started = true
+            sink.open(200, ctx.outHeaders)
+            const reader = stream.getReader()
+            try {
+              while (true) {
+                const c = await reader.read()
+                if (c.done) break
+                const v = c.value
+                if (v !== undefined) {
+                  const out = conv.push(v)
+                  if (out !== "") sink.write(out)
+                }
+              }
+            } catch (e) {
+              sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
+            }
+            const tail = conv.end()
+            if (tail !== "") sink.write(tail)
+            sink.close()
+            dl.finish()
+            upstreamMs += performance.now() - started
+            metrics.inc("bifrost_upstream_requests_total", metrics.labels(ref.provider, ref.model, "success"), 1.0)
+            return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true }
+          }
           text = await res.text()
           dl.finish()
           retryAfter = res.headers.get("retry-after") ?? undefined
@@ -451,9 +572,11 @@ export class Engine {
   }
 
   // Shared front half of every inference endpoint.
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>): Promise<Response> {
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory): Promise<Response> {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
+    ctx.sink = sink
+    ctx.makeConverter = makeConverter
     if (upstreamHeaders !== undefined) ctx.upstreamHeaders = upstreamHeaders
     const tracer = this.tracer
     if (tracer !== undefined) ctx.span = tracer.startRequest(op, h.get("traceparent"), Date.now())
@@ -542,6 +665,7 @@ export class Engine {
       }
     }
 
+    ctx.outHeaders = out
     const r = await this.attempt(allowed, h, build, translate, streamed, ctx)
     out.set("x-bf-attempts", "" + r.attempts)
     if (!r.ok) {
@@ -555,6 +679,14 @@ export class Engine {
     metrics.inc("bifrost_input_tokens_total", l, r.promptTokens)
     metrics.inc("bifrost_output_tokens_total", l, r.completionTokens)
     metrics.inc("bifrost_cost_total", l, cost)
+    if (r.direct === true) {
+      // already streamed to the client; nothing to cache or send
+      ctx.provider = r.provider
+      ctx.promptTokens = r.promptTokens
+      ctx.completionTokens = r.completionTokens
+      ctx.cost = cost
+      return respond(200, "", out)
+    }
     if (sem !== undefined && semVec.length > 0 && !noStore) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttlHeader === undefined ? undefined : parseTtl(ttlHeader))
@@ -617,7 +749,7 @@ export class Engine {
     sendSpans(up.url, up.headers, up.body)
   }
 
-  async chat(req: Request): Promise<Response> {
+  async chat(req: Request, sink?: StreamSink): Promise<Response> {
     let text = await req.text()
     let body: Field[] = []
     const guard = this.guard
@@ -679,11 +811,17 @@ export class Engine {
     // Usage is always requested from streaming upstreams, for budgets and metrics.
     let streamBody = body.slice()
     if (stream) setField(&streamBody, "stream_options", `{"include_usage":true}`)
+    const canPipe = stream && sink !== undefined
     const build: Build = (t) => {
       if (stream && providers.streamsNatively(t.kind)) return openai.chatRequest(t, streamBody)
       if (stream) {
-        // called without streaming, replayed as SSE below
         const plain = streamBody.filter((f) => f.key !== "stream" && f.key !== "stream_options")
+        // with a streaming client, Anthropic, Gemini and Bedrock stream too and are converted as they go
+        if (canPipe) {
+          const su = try providers.streamUpstream(t, try typed.get(), plain, autoCache)
+          if (su !== undefined) return su
+        }
+        // otherwise called without streaming and replayed as SSE below
         return try providers.chatUpstream(t, try typed.get(), plain, autoCache)
       }
       if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, body)
@@ -710,7 +848,13 @@ export class Engine {
       const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
       return { body: try completionToSse(tr.body, wantUsage), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
     }
-    return await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers)
+    // With a sink, OpenAI-format upstreams stream straight through as chunks arrive.
+    const dropUsage = !wantUsage
+    const mk: ConverterFactory = (t, requested) => {
+      if (!providers.streamsNatively(t.kind) && t.kind !== "anthropic" && t.kind !== "gemini" && t.kind !== "bedrock") return undefined
+      return new StreamConverter(providers.streamsNatively(t.kind) ? "openai" : t.kind, requested, !dropUsage)
+    }
+    return await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
   }
 
   async embeddings(req: Request): Promise<Response> {
