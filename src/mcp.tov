@@ -1,0 +1,632 @@
+// MCP (Model Context Protocol) client. Connects to MCP servers over Streamable
+// HTTP, lists their tools so chat requests can offer them to the model, and runs
+// the tool calls the model makes. The protocol lives in pure functions that test
+// without a network; McpSession and McpManager wrap them around fetch.
+import { fields, elements, find, rawStr, rawBool, rawNum, quote, build, setField, isNull, decodeString } from "./json"
+import { deadline } from "./deadline"
+
+// Bifrost's client config. Only the HTTP transport is implemented; "sse" uses the
+// same POST transport, and "stdio" is refused.
+export type McpClientConfig = {
+  name: string,
+  connection_type: string,
+  connection_string: string,
+  headers?: Map<string, string>,
+  tools_to_execute?: string[],
+  tools_to_skip?: string[],
+}
+
+export type McpConfig = {
+  client_configs?: McpClientConfig[],
+  tool_execution_timeout_seconds?: int,
+}
+
+export type McpTool = { name: string, description: string, inputSchemaRaw: string }
+
+export type RpcResult = { kind: "result", raw: string } | { kind: "error", code: int, message: string }
+
+export type ToolText = { text: string, isError: bool }
+
+const PROTOCOL = "2025-06-18"
+const CONNECT_TIMEOUT_MS = 15000
+const DEFAULT_TOOL_TIMEOUT_MS = 30000
+// A server that keeps returning a cursor is cut off here.
+const MAX_TOOL_PAGES = 100
+const EMPTY_SCHEMA = '{"type":"object","properties":{}}'
+const NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+const MAX_NAME = 64
+
+// Request ids are plain ints; a notification has no id.
+export function initializeRequest(id: int): string {
+  return `{"jsonrpc":"2.0","id":${id},"method":"initialize","params":{"protocolVersion":"${PROTOCOL}","capabilities":{},"clientInfo":{"name":"raiju","version":"0.1.0"}}}`
+}
+
+export function initializedNotification(): string {
+  return '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+}
+
+export function listToolsRequest(id: int, cursor?: string): string {
+  const params = cursor === undefined ? "{}" : `{"cursor":${quote(cursor)}}`
+  return `{"jsonrpc":"2.0","id":${id},"method":"tools/list","params":${params}}`
+}
+
+// Checks that text is one JSON object and returns it trimmed ("" means no arguments).
+function objectText(text: string): string throws SyntaxError {
+  const t = text.trim()
+  if (t === "") return "{}"
+  try fields(t)
+  return t
+}
+
+// argumentsJson is the tool's arguments object as raw JSON text.
+export function callToolRequest(id: int, name: string, argumentsJson: string): string throws SyntaxError {
+  const args = try objectText(argumentsJson)
+  return `{"jsonrpc":"2.0","id":${id},"method":"tools/call","params":{"name":${quote(name)},"arguments":${args}}}`
+}
+
+// The data of each SSE event in a body. The data lines of one event are joined by newlines.
+function sseData(body: string): string[] {
+  const out: string[] = []
+  let cur: string[] = []
+  for (const raw of body.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, raw.byteLength - 1) : raw
+    if (line === "") {
+      if (cur.length > 0) out.push(cur.join("\n"))
+      cur = []
+    } else if (line.startsWith("data:")) {
+      let v = line.slice(5)
+      if (v.startsWith(" ")) v = v.slice(1)
+      cur.push(v)
+    }
+  }
+  if (cur.length > 0) out.push(cur.join("\n"))
+  return out
+}
+
+// The JSON-RPC messages in a body: SSE events, a batch array, or the body itself.
+function messageTexts(contentType: string, body: string): string[] {
+  if (contentType.toLowerCase().indexOf("text/event-stream") >= 0) return sseData(body)
+  const t = body.trim()
+  if (t.startsWith("[")) return try elements(t)
+  return [t]
+}
+
+// The reply to request `id` in one message, or undefined. Notifications and
+// server requests carry a method, so they never match.
+function matchMessage(text: string, id: int): RpcResult | undefined {
+  try {
+    const fs = fields(text)
+    if (find(fs, "method") !== undefined) return undefined
+    if (find(fs, "id") !== `${id}`) return undefined
+    const result = find(fs, "result")
+    if (result !== undefined) return { kind: "result", raw: result }
+    const errRaw = find(fs, "error")
+    if (errRaw !== undefined) {
+      const ef = fields(errRaw)
+      return { kind: "error", code: Math.floor(rawNum(ef, "code") ?? -32603), message: rawStr(ef, "message") ?? "unknown error" }
+    }
+    return undefined
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The reply to request `id`, from a plain JSON body or a text/event-stream body.
+export function parseRpcResponse(contentType: string, body: string, id: int): RpcResult {
+  let texts: string[] = []
+  try {
+    texts = messageTexts(contentType, body)
+  } catch (e) {
+    return { kind: "error", code: -32700, message: `invalid MCP response: ${e.message}` }
+  }
+  for (const t of texts) {
+    const m = matchMessage(t, id)
+    if (m !== undefined) return m
+  }
+  return { kind: "error", code: -32603, message: "MCP response had no reply to this request" }
+}
+
+// One page of a tools/list result.
+export function parseTools(resultRaw: string): { tools: McpTool[], nextCursor?: string } throws SyntaxError {
+  const fs = try fields(resultRaw)
+  const tools: McpTool[] = []
+  const list = find(fs, "tools")
+  if (list !== undefined && !isNull(list)) {
+    for (const el of try elements(list)) {
+      const tf = try fields(el)
+      const name = rawStr(tf, "name")
+      if (name === undefined || name === "") continue
+      const schema = find(tf, "inputSchema")
+      tools.push({
+        name: name,
+        description: rawStr(tf, "description") ?? "",
+        inputSchemaRaw: schema === undefined || isNull(schema) ? EMPTY_SCHEMA : schema,
+      })
+    }
+  }
+  const out: { tools: McpTool[], nextCursor?: string } = { tools: tools }
+  const cursor = rawStr(fs, "nextCursor")
+  if (cursor !== undefined && cursor !== "") out.nextCursor = cursor
+  return out
+}
+
+// Replaces every byte outside [a-zA-Z0-9_-] with "_" and truncates to 64 bytes.
+export function sanitizeName(s: string): string {
+  const bytes = new TextEncoder().encode(s)
+  let out = ""
+  for (let i = 0; i < bytes.length; i++) {
+    const c = int(bytes[i]!)
+    // Only ASCII bytes are sliced, so every slice starts on a character boundary.
+    out += c < 128 && NAME_CHARS.indexOf(s.slice(i, i + 1)) >= 0 ? s.slice(i, i + 1) : "_"
+  }
+  return out.slice(0, MAX_NAME)
+}
+
+// The name a tool has in chat: "<server>-<tool>", sanitized.
+function chatName(server: string, tool: string): string {
+  return sanitizeName(`${server}-${tool}`)
+}
+
+// Bifrost's allow and skip lists. An empty allow list (or "*") exposes every tool.
+function toolAllowed(name: string, cfg: McpClientConfig): bool {
+  const allow = cfg.tools_to_execute ?? []
+  if (allow.length > 0 && !allow.includes("*") && !allow.includes(name)) return false
+  return !(cfg.tools_to_skip ?? []).includes(name)
+}
+
+// OpenAI tool definitions for the tools this server exposes.
+export function toolsForChat(server: string, tools: McpTool[], cfg: McpClientConfig): string[] {
+  const out: string[] = []
+  for (const t of tools) {
+    if (!toolAllowed(t.name, cfg)) continue
+    out.push(`{"type":"function","function":{"name":${quote(chatName(server, t.name))},"description":${quote(t.description)},"parameters":${t.inputSchemaRaw}}}`)
+  }
+  return out
+}
+
+// The name of a tool definition, or undefined when it has none.
+function toolName(json: string): string | undefined throws SyntaxError {
+  const fs = try fields(json)
+  const fnRaw = find(fs, "function")
+  if (fnRaw === undefined || isNull(fnRaw)) return undefined
+  return rawStr(try fields(fnRaw), "name")
+}
+
+// Appends tool definitions to a chat request's tools array, skipping names it already
+// has. A request with nothing to add is returned unchanged; otherwise the other fields
+// keep their raw values.
+export function injectTools(chatBody: string, toolJsons: string[]): string throws SyntaxError {
+  let fs = try fields(chatBody)
+  const have: string[] = []
+  const out: string[] = []
+  const existing = find(fs, "tools")
+  if (existing !== undefined && !isNull(existing)) {
+    for (const el of try elements(existing)) {
+      out.push(el)
+      const n = try toolName(el)
+      if (n !== undefined) have.push(n)
+    }
+  }
+  let added = 0
+  for (const tj of toolJsons) {
+    const n = try toolName(tj)
+    if (n === undefined || have.includes(n)) continue
+    have.push(n)
+    out.push(tj)
+    added += 1
+  }
+  if (added === 0) return chatBody
+  setField(&fs, "tools", "[" + out.join(",") + "]")
+  return build(fs)
+}
+
+// Splits "<server>-<tool>" into its parts. When several server names fit, the longest wins.
+export function splitToolName(full: string, servers: string[]): { server: string, tool: string } | undefined {
+  let best: { server: string, tool: string } | undefined = undefined
+  let bestLen = 0
+  for (const s of servers) {
+    const prefix = sanitizeName(s) + "-"
+    const len = prefix.byteLength
+    if (full.startsWith(prefix) && full.byteLength > len && len > bestLen) {
+      best = { server: s, tool: full.slice(len) }
+      bestLen = len
+    }
+  }
+  return best
+}
+
+// One content item of a tool result, as text. Non-text items are described in brackets.
+function contentText(raw: string): string throws SyntaxError {
+  const p = try fields(raw)
+  const type = rawStr(p, "type") ?? ""
+  if (type === "text") return rawStr(p, "text") ?? ""
+  if (type === "image" || type === "audio") return `[${type} ${rawStr(p, "mimeType") ?? "unknown"}]`
+  if (type === "resource") {
+    const rf = try fields(find(p, "resource") ?? "{}")
+    const text = rawStr(rf, "text")
+    if (text !== undefined) return text
+    return `[resource ${rawStr(rf, "uri") ?? ""} ${rawStr(rf, "mimeType") ?? ""}]`
+  }
+  return `[${type === "" ? "content" : type}]`
+}
+
+// The text of a tools/call result. Parts are joined by newlines.
+export function toolResultText(resultRaw: string): ToolText throws SyntaxError {
+  const fs = try fields(resultRaw)
+  const parts: string[] = []
+  const content = find(fs, "content")
+  if (content !== undefined && !isNull(content)) {
+    for (const el of try elements(content)) parts.push(try contentText(el))
+  }
+  return { text: parts.join("\n"), isError: rawBool(fs, "isError") ?? false }
+}
+
+// The chat message that answers a tool call.
+export function toolMessage(callId: string, result: string): string {
+  return `{"role":"tool","tool_call_id":${quote(callId)},"content":${quote(result)}}`
+}
+
+// The body of POST /v1/mcp/tool/execute: one OpenAI-style tool call. The arguments may be
+// a JSON string (OpenAI's form) or an object. callId is the call's id, when it has one.
+export function executeEndpointBody(body: string): { name: string, argumentsJson: string, callId?: string } throws SyntaxError {
+  const fs = try fields(body)
+  const type = rawStr(fs, "type")
+  if (type !== undefined && type !== "function") throw new SyntaxError(`unsupported tool call type ${type}`)
+  const fnRaw = find(fs, "function")
+  if (fnRaw === undefined || isNull(fnRaw)) throw new SyntaxError("tool call has no function")
+  const fn = try fields(fnRaw)
+  const name = rawStr(fn, "name")
+  if (name === undefined || name === "") throw new SyntaxError("tool call has no name")
+  const argsRaw = find(fn, "arguments")
+  let argsText = "{}"
+  if (argsRaw !== undefined && !isNull(argsRaw)) {
+    argsText = argsRaw.startsWith('"') ? try decodeString(argsRaw) : argsRaw
+  }
+  const out: { name: string, argumentsJson: string, callId?: string } = { name: name, argumentsJson: try objectText(argsText) }
+  const callId = rawStr(fs, "id")
+  if (callId !== undefined) out.callId = callId
+  return out
+}
+
+type Reply = { status: int, contentType: string, body: string }
+
+// One connection to an MCP server. connect() initializes and lists every tool; a failure
+// is kept in lastError and leaves connected false.
+export class McpSession {
+  tools: McpTool[] = []
+  connected = false
+  lastError = ""
+  private sessionId = ""
+  private version = ""
+  private nextId = 1
+  // chat tool name → the server's name for the tool, for allowed tools only
+  private exposed: Map<string, string> = new Map()
+
+  readonly timeoutMs: int
+
+  // timeoutMs bounds each tool call.
+  constructor(readonly cfg: McpClientConfig, timeoutMs?: int) {
+    this.timeoutMs = timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS
+  }
+
+  private newId(): int {
+    const id = this.nextId
+    this.nextId += 1
+    return id
+  }
+
+  // Headers for one POST. The configured headers go first so the protocol headers win.
+  private headers(): Map<string, string> {
+    const h: Map<string, string> = new Map()
+    const extra = this.cfg.headers
+    if (extra !== undefined) {
+      for (const k of extra.keys()) h.set(k.toLowerCase(), extra.get(k)!)
+    }
+    h.set("content-type", "application/json")
+    h.set("accept", "application/json, text/event-stream")
+    if (this.sessionId !== "") h.set("mcp-session-id", this.sessionId)
+    if (this.version !== "") h.set("mcp-protocol-version", this.version)
+    return h
+  }
+
+  // POSTs one message under a deadline. The session id from the server is kept for later requests.
+  private async exchange(body: string, timeoutMs: int): Promise<Reply> throws Error {
+    const dl = deadline(timeoutMs)
+    let reply: Reply = { status: 0, contentType: "", body: "" }
+    try {
+      const hs: Record<string, string> = this.headers()
+      const res = await fetch(this.cfg.connection_string, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+      const sid = res.headers.get("mcp-session-id") ?? ""
+      if (sid !== "") this.sessionId = sid
+      const text = await res.text()
+      reply = { status: res.status, contentType: res.headers.get("content-type") ?? "", body: text }
+    } catch (e) {
+      throw new Error(`${this.cfg.name}: request failed: ${e.message}`)
+    } finally {
+      dl.finish()
+    }
+    return reply
+  }
+
+  // A request: returns the raw result, or throws on HTTP and JSON-RPC errors.
+  private async rpc(body: string, id: int, timeoutMs: int): Promise<string> throws Error {
+    const reply = try await this.exchange(body, timeoutMs)
+    if (reply.status < 200 || reply.status >= 300) throw new Error(`${this.cfg.name}: HTTP ${reply.status}`)
+    const r = parseRpcResponse(reply.contentType, reply.body, id)
+    if (r.kind === "error") throw new Error(`${this.cfg.name}: ${r.message} (code ${r.code})`)
+    return r.raw
+  }
+
+  // A notification: no reply body is expected.
+  private async notify(body: string): Promise<void> throws Error {
+    const reply = try await this.exchange(body, CONNECT_TIMEOUT_MS)
+    if (reply.status < 200 || reply.status >= 300) throw new Error(`${this.cfg.name}: HTTP ${reply.status} for notification`)
+  }
+
+  async connect(): Promise<void> {
+    this.connected = false
+    this.lastError = ""
+    this.sessionId = ""
+    this.version = ""
+    try {
+      const transport = this.cfg.connection_type
+      if (transport !== "http" && transport !== "sse") throw new Error(`unsupported connection type ${transport}`)
+      const initId = this.newId()
+      try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS)
+      // From here on the protocol version is sent with every request.
+      this.version = PROTOCOL
+      try await this.notify(initializedNotification())
+      const all: McpTool[] = []
+      let cursor: string | undefined = undefined
+      for (let page = 0; page < MAX_TOOL_PAGES; page++) {
+        const id = this.newId()
+        const raw = try await this.rpc(listToolsRequest(id, cursor), id, CONNECT_TIMEOUT_MS)
+        const got = try parseTools(raw)
+        for (const t of got.tools) all.push(t)
+        cursor = got.nextCursor
+        if (cursor === undefined) break
+      }
+      this.tools = all
+      const ex: Map<string, string> = new Map()
+      for (const t of all) {
+        if (toolAllowed(t.name, this.cfg)) ex.set(chatName(this.cfg.name, t.name), t.name)
+      }
+      this.exposed = ex
+      this.connected = true
+    } catch (e) {
+      this.connected = false
+      this.lastError = e.message
+    }
+  }
+
+  // The chat tool definitions for this server's allowed tools.
+  chatTools(): string[] {
+    return toolsForChat(this.cfg.name, this.tools, this.cfg)
+  }
+
+  // The server's name for a chat tool name, if this session exposes it.
+  original(chatToolName: string): string | undefined {
+    return this.exposed.get(chatToolName)
+  }
+
+  exposedCount(): int {
+    return this.exposed.size
+  }
+
+  // Calls a tool by its name on the server. Tool failures come back as isError; protocol failures throw.
+  async callTool(name: string, argsJson: string): Promise<ToolText> throws Error {
+    if (!this.connected) throw new Error(`${this.cfg.name}: not connected: ${this.lastError}`)
+    const id = this.newId()
+    const body = try callToolRequest(id, name, argsJson)
+    const raw = try await this.rpc(body, id, this.timeoutMs)
+    return try toolResultText(raw)
+  }
+}
+
+// All configured MCP servers: connects them, offers their tools to chat and routes tool calls.
+export class McpManager {
+  readonly sessions: McpSession[]
+
+  constructor(cfg: McpConfig) {
+    const secs = cfg.tool_execution_timeout_seconds
+    const ms: int = secs === undefined ? DEFAULT_TOOL_TIMEOUT_MS : secs * 1000
+    const list = cfg.client_configs ?? []
+    this.sessions = list.map((c) => new McpSession(c, ms))
+  }
+
+  // Connects every server. A server that fails is recorded in status(), not thrown.
+  async connectAll(): Promise<void> {
+    await Promise.all(this.sessions.map((s) => s.connect()))
+  }
+
+  // Chat tool definitions from every connected server.
+  allTools(): string[] {
+    const out: string[] = []
+    for (const s of this.sessions) {
+      if (!s.connected) continue
+      for (const t of s.chatTools()) out.push(t)
+    }
+    return out
+  }
+
+  // Runs a tool by its chat name ("<server>-<tool>").
+  async execute(fullToolName: string, argsJson: string): Promise<ToolText> throws Error {
+    for (const s of this.sessions) {
+      if (!s.connected) continue
+      const original = s.original(fullToolName)
+      if (original !== undefined) {
+        const r = try await s.callTool(original, argsJson)
+        return r
+      }
+    }
+    throw new Error(`unknown MCP tool ${fullToolName}`)
+  }
+
+  status(): { name: string, connected: bool, tools: int, error: string }[] {
+    return this.sessions.map((s) => ({ name: s.cfg.name, connected: s.connected, tools: s.exposedCount(), error: s.lastError }))
+  }
+}
+
+test("request bodies", () => {
+  expect(initializeRequest(1)).toBe('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"raiju","version":"0.1.0"}}}')
+  expect(initializedNotification()).toBe('{"jsonrpc":"2.0","method":"notifications/initialized"}')
+  expect(listToolsRequest(2)).toBe('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')
+  expect(listToolsRequest(3, "page 2")).toBe('{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"cursor":"page 2"}}')
+  expect(try callToolRequest(4, "get-weather", ' {"city":"Paris"} ')).toBe('{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get-weather","arguments":{"city":"Paris"}}}')
+  expect(try callToolRequest(5, "ping", "")).toBe('{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ping","arguments":{}}}')
+  let threw = false
+  try {
+    callToolRequest(6, "ping", "[1]")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("parses plain JSON, SSE and error responses", () => {
+  const plain = parseRpcResponse("application/json", '{"jsonrpc":"2.0","id":3,"result":{"tools":[]}}', 3)
+  expect(plain.kind).toBe("result")
+  if (plain.kind === "result") expect(plain.raw).toBe('{"tools":[]}')
+
+  // a notification arrives before the reply, and a multi-line data field is joined
+  const sse = 'event: message\r\ndata: {"jsonrpc":"2.0","method":"notifications/message","params":{}}\r\n\r\ndata: {"jsonrpc":"2.0",\ndata: "id":2,"result":{"ok":true}}\n\n'
+  const fromSse = parseRpcResponse("text/event-stream; charset=utf-8", sse, 2)
+  expect(fromSse.kind).toBe("result")
+  if (fromSse.kind === "result") expect(fromSse.raw).toBe('{"ok":true}')
+
+  const err = parseRpcResponse("application/json", '{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"Method not found"}}', 4)
+  expect(err.kind).toBe("error")
+  if (err.kind === "error") {
+    expect(err.code).toBe(-32601)
+    expect(err.message).toBe("Method not found")
+  }
+
+  const missing = parseRpcResponse("text/event-stream", 'data: {"jsonrpc":"2.0","id":9,"result":{}}\n\n', 5)
+  expect(missing.kind).toBe("error")
+  const garbage = parseRpcResponse("application/json", "not json", 1)
+  expect(garbage.kind).toBe("error")
+})
+
+test("parses tool pages with a cursor", () => {
+  const page = try parseTools('{"tools":[{"name":"get-weather","description":"Weather","inputSchema":{"type":"object","properties":{"city":{"type":"string"}}}},{"name":"ping"},{"description":"no name"}],"nextCursor":"p2"}')
+  expect(page.tools.length).toBe(2)
+  expect(page.tools[0]!.name).toBe("get-weather")
+  expect(page.tools[0]!.description).toBe("Weather")
+  expect(page.tools[0]!.inputSchemaRaw).toBe('{"type":"object","properties":{"city":{"type":"string"}}}')
+  expect(page.tools[1]!.description).toBe("")
+  expect(page.tools[1]!.inputSchemaRaw).toBe(EMPTY_SCHEMA)
+  expect(page.nextCursor).toBe("p2")
+  const last = try parseTools('{"tools":[]}')
+  expect(last.tools.length).toBe(0)
+  expect(last.nextCursor).toBe(undefined)
+})
+
+test("chat tool names are sanitized and filtered", () => {
+  const tools: McpTool[] = [
+    { name: "get weather/v2.1", description: "d", inputSchemaRaw: '{"type":"object"}' },
+    { name: "é", description: "unicode", inputSchemaRaw: "{}" },
+    { name: "skipme", description: "", inputSchemaRaw: "{}" },
+    { name: "keep", description: "", inputSchemaRaw: "{}" },
+  ]
+  const base: McpClientConfig = { name: "my.srv", connection_type: "http", connection_string: "http://localhost" }
+  const all = toolsForChat("my.srv", tools, base)
+  expect(all.length).toBe(4)
+  const first = try fields(all[0]!)
+  const fn = try fields(find(first, "function")!)
+  expect(rawStr(fn, "name")).toBe("my_srv-get_weather_v2_1")
+  expect(rawStr(fn, "description")).toBe("d")
+  expect(find(fn, "parameters")).toBe('{"type":"object"}')
+  const uni = try fields(find(try fields(all[1]!), "function")!)
+  expect(rawStr(uni, "name")).toBe("my_srv-__")
+
+  let long = ""
+  for (let i = 0; i < 80; i++) long += "a"
+  const lt = toolsForChat("s", [{ name: long, description: "", inputSchemaRaw: "{}" }], base)
+  const lname = rawStr(try fields(find(try fields(lt[0]!), "function")!), "name") ?? ""
+  expect(lname.byteLength).toBe(64)
+  expect(lname.startsWith("s-a")).toBe(true)
+
+  const allowList: McpClientConfig = { name: "my.srv", connection_type: "http", connection_string: "http://localhost", tools_to_execute: ["keep", "skipme"], tools_to_skip: ["skipme"] }
+  const allowed = toolsForChat("my.srv", tools, allowList)
+  expect(allowed.length).toBe(1)
+  expect(rawStr(try fields(find(try fields(allowed[0]!), "function")!), "name")).toBe("my_srv-keep")
+  const emptyList: McpClientConfig = { name: "my.srv", connection_type: "http", connection_string: "http://localhost", tools_to_execute: [] }
+  expect(toolsForChat("my.srv", tools, emptyList).length).toBe(4)
+  const starList: McpClientConfig = { name: "my.srv", connection_type: "http", connection_string: "http://localhost", tools_to_execute: ["*"], tools_to_skip: ["keep"] }
+  expect(toolsForChat("my.srv", tools, starList).length).toBe(3)
+})
+
+test("injects tools into a chat request", () => {
+  const t1 = '{"type":"function","function":{"name":"s-a","description":"","parameters":{}}}'
+  const t2 = '{"type":"function","function":{"name":"s-b","description":"","parameters":{}}}'
+  expect(try injectTools('{"model":"m","messages":[]}', [t1])).toBe(`{"model":"m","messages":[],"tools":[${t1}]}`)
+
+  const body = '{"tools":[' + t1 + '],"model":"m","messages":[{"role":"user","content":"caf\\u00e9 \\"q\\""}]}'
+  const merged = try injectTools(body, [t1, t2])
+  expect(merged).toBe(`{"tools":[${t1},${t2}],"model":"m","messages":[{"role":"user","content":"caf\\u00e9 \\"q\\""}]}`)
+  expect(try injectTools(body, [t1])).toBe(body)
+  expect(try injectTools(body, [])).toBe(body)
+
+  let threw = false
+  try {
+    injectTools("[1]", [t1])
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("splits tool names when server names have dashes", () => {
+  const servers = ["my-server", "my", "other"]
+  expect(splitToolName("my-server-get_thing", servers)).toEqual({ server: "my-server", tool: "get_thing" })
+  expect(splitToolName("my-get_x", servers)).toEqual({ server: "my", tool: "get_x" })
+  expect(splitToolName("other-x", servers)).toEqual({ server: "other", tool: "x" })
+  expect(splitToolName("unknown-x", servers)).toBe(undefined)
+  expect(splitToolName("my-server-", ["my-server"])).toBe(undefined)
+})
+
+test("turns tool results into text", () => {
+  const r = try toolResultText('{"content":[{"type":"text","text":"hello"},{"type":"image","data":"AAA","mimeType":"image/png"},{"type":"text","text":"world"}],"isError":true}')
+  expect(r.text).toBe("hello\n[image image/png]\nworld")
+  expect(r.isError).toBe(true)
+  const res = try toolResultText('{"content":[{"type":"resource","resource":{"uri":"file:///a.txt","mimeType":"text/plain"}}]}')
+  expect(res.text).toBe("[resource file:///a.txt text/plain]")
+  expect(res.isError).toBe(false)
+  const empty = try toolResultText("{}")
+  expect(empty.text).toBe("")
+})
+
+test("parses tool execute bodies and builds tool messages", () => {
+  const call = try executeEndpointBody('{"id":"call_1","type":"function","function":{"name":"my-server-get_weather","arguments":"{\\"city\\":\\"Paris\\"}"}}')
+  expect(call.name).toBe("my-server-get_weather")
+  expect(call.argumentsJson).toBe('{"city":"Paris"}')
+  expect(call.callId).toBe("call_1")
+
+  const obj = try executeEndpointBody('{"function":{"name":"s-a","arguments":{"n":1}}}')
+  expect(obj.argumentsJson).toBe('{"n":1}')
+  expect(obj.callId).toBe(undefined)
+  const none = try executeEndpointBody('{"function":{"name":"s-a","arguments":""}}')
+  expect(none.argumentsJson).toBe("{}")
+
+  let threw = 0
+  try {
+    executeEndpointBody('{"function":{"arguments":"{}"}}')
+  } catch (e) {
+    threw += 1
+  }
+  try {
+    executeEndpointBody('{"function":{"name":"s-a","arguments":"[1]"}}')
+  } catch (e) {
+    threw += 1
+  }
+  try {
+    executeEndpointBody('{"type":"retrieval","function":{"name":"s-a"}}')
+  } catch (e) {
+    threw += 1
+  }
+  expect(threw).toBe(3)
+
+  const msg = toolMessage("call_1", 'a "quoted" line')
+  expect(msg).toBe('{"role":"tool","tool_call_id":"call_1","content":"a \\"quoted\\" line"}')
+  expect(rawStr(try fields(msg), "role")).toBe("tool")
+})

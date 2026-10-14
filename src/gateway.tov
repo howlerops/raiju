@@ -18,6 +18,7 @@ import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, defaultLogStoreConfig } from "./logstore"
 import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor } from "./otel"
+import { McpManager, injectTools, executeEndpointBody, toolMessage } from "./mcp"
 import { Deadline, deadline } from "./deadline"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
@@ -115,6 +116,7 @@ export class Engine {
   rules: RuleSet | undefined = undefined
   logStore: LogStore | undefined = undefined
   tracer: Tracer | undefined = undefined
+  mcp: McpManager | undefined = undefined
   guardInput = false
   guardOutput = false
   pricing: Pricing
@@ -147,6 +149,8 @@ export class Engine {
         console.error(`raiju: request log store disabled: ${e.message}`)
       }
     }
+    const mc = cfg.mcp
+    if (mc !== undefined && (mc.client_configs ?? []).length > 0) this.mcp = new McpManager(mc)
     const oc = cfg.otel
     if (oc !== undefined && oc.endpoint !== "") this.tracer = new Tracer(oc)
     const rr = cfg.governance?.routing_rules
@@ -282,6 +286,40 @@ export class Engine {
     last.attempts = attempts
     last.upstreamMs = upstreamMs
     return last
+  }
+
+  // Adds the connected MCP servers' tools to a chat request. x-bf-mcp-include-clients
+  // (comma-separated server names) narrows them; "none" leaves the request alone.
+  withMcpTools(text: string, h: Hdrs): string throws SyntaxError {
+    const m = this.mcp
+    if (m === undefined) return text
+    let tools = m.allTools()
+    const only = h.get("x-bf-mcp-include-clients")
+    if (only !== undefined) {
+      if (only.trim() === "none") return text
+      const names = only.split(",").map((n) => n.trim() + "-")
+      tools = tools.filter((t) => names.some((n) => t.includes(`"name":"${n}`)))
+    }
+    if (tools.length === 0) return text
+    return try injectTools(text, tools)
+  }
+
+  // POST /v1/mcp/tool/execute: runs one tool call and answers with the tool message.
+  async executeTool(req: Request): Promise<Response> {
+    const m = this.mcp
+    if (m === undefined) return errorResponse(404, "no MCP servers are configured", "invalid_request_error", noHeaders())
+    const text = await req.text()
+    try {
+      const call = executeEndpointBody(text)
+      const result = await m.execute(call.name, call.argumentsJson)
+      metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", call.name, result.isError ? "error" : "success"), 1.0)
+      const r: Record<string, string> = new Map()
+      r.set("content-type", "application/json")
+      return new Response(toolMessage(call.callId ?? "", result.text), { status: 200, headers: r })
+    } catch (e) {
+      if (e instanceof SyntaxError) return errorResponse(400, e.message, "invalid_request_error", noHeaders())
+      return errorResponse(502, e.message, "api_error", noHeaders())
+    }
   }
 
   // A Vertex OAuth access token for the key's service account, from the cache
@@ -488,6 +526,7 @@ export class Engine {
         }
         text = g.body
       }
+      text = try this.withMcpTools(text, snapshot(req.headers))
       body = fields(text)
     } catch (e) {
       return errorResponse(400, `invalid chat request: ${e.message}`, "invalid_request_error", noHeaders())

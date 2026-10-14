@@ -265,6 +265,27 @@ def main():
         check("inbound traceparent continues the trace", "0af7651916cd43dd8448eb211c80319c" in joined and '"parentSpanId":"b7ad6b7169203331"' in joined, joined[:300])
         check("gen_ai attributes on spans", '"gen_ai.request.model"' in joined and '"gen_ai.usage.input_tokens"' in joined, joined[:300])
 
+        # MCP: tools from connected servers are injected into chat requests and can be executed
+        s, _, b = call("GET", "/api/mcp")
+        st = json.loads(b)["clients"]
+        check("mcp server connected at startup", s == 200 and st and st[0]["connected"] and st[0]["tools"] == 1, b)
+        chat("openai/gpt-4o-mini", seed=500)
+        tools = json.loads(seen()[-1]["body"]).get("tools", [])
+        check("mcp tools injected into chat", any(t["function"]["name"] == "weather-get_weather" and t["function"]["parameters"]["required"] == ["city"] for t in tools), tools)
+        chat("openai/gpt-4o-mini", headers={"x-bf-mcp-include-clients": "none"}, seed=501)
+        check("x-bf-mcp-include-clients none skips injection", "tools" not in json.loads(seen()[-1]["body"]), seen()[-1]["body"][:200])
+        s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "call_1", "type": "function", "function": {"name": "weather-get_weather", "arguments": "{\"city\":\"Oslo\"}"}})
+        r = json.loads(b)
+        check("mcp tool execution", s == 200 and r == {"role": "tool", "tool_call_id": "call_1", "content": "Sunny in Oslo"}, b)
+        mcp_calls = [x for x in seen() if x["path"] == "/mcp"]
+        check("mcp tools/call sent upstream", '"method":"tools/call"' in mcp_calls[-1]["body"] and '"city":"Oslo"' in mcp_calls[-1]["body"], mcp_calls[-1])
+
+        # Media pass-through keeps binary bodies and content types
+        req = urllib.request.Request(GW + "/v1/audio/speech", data=json.dumps({"model": "openai/tts-1", "input": "hi", "voice": "alloy"}).encode(), method="POST", headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as res:
+            audio = res.read(); ctype = res.headers.get("content-type")
+        check("audio speech pass-through", audio == b"ID3fake-mp3-bytes" and ctype == "audio/mpeg" and json.loads(seen()[-1]["body"])["model"] == "tts-1", (audio, ctype))
+
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
 
