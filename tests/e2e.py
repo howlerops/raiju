@@ -504,6 +504,24 @@ def main():
         s, _, _ = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
         check("MCP server refuses requests without a session", s == 400)
 
+        # access profiles: one policy shared by keys
+        PK = {"x-bf-vk": "sk-bf-profiled"}
+        s, _, b = chat("openai/gpt-4o-mini", headers=PK, seed=1100)
+        check("an access profile's required header is enforced", s == 400 and "x-project" in b, (s, b))
+        s, _, b = chat("anthropic/claude-sonnet-4", headers={**PK, "x-project": "p1"}, seed=1101)
+        check("an access profile limits models", s == 403, (s, b))
+        s, _, b = chat("openai/gpt-4o-mini", headers={**PK, "x-project": "p1"}, seed=1102, max_tokens=500)
+        up = json.loads(seen()[-1]["body"])
+        names = [t["function"]["name"] for t in up.get("tools", [])]
+        check("an access profile caps max_tokens and narrows MCP tools", s == 200 and up.get("max_tokens") == 64 and names == ["weather-get_weather"], (s, up.get("max_tokens"), names))
+        s, _, b = call("POST", "/api/governance/access-profiles", {"id": "readers", "allowed_models": ["openai/*"]})
+        s2, _, b2 = call("GET", "/api/governance/access-profiles")
+        check("access profiles are managed through the API", s == 201 and s2 == 200 and "readers" in b2 and "restricted" in b2, (s, b, b2))
+        s, _, b = call("DELETE", "/api/governance/access-profiles/restricted")
+        check("a profile in use can't be deleted", s == 409 and "vk-profiled" in b, (s, b))
+        s, _, _ = call("DELETE", "/api/governance/access-profiles/readers")
+        check("an unused profile is deleted", s == 200, s)
+
         # virtual MCP: a renamed tool with argument defaults
         s, h, b = call("POST", "/mcp/weather-desk", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}})
         vsid = hl(h).get("mcp-session-id", "")

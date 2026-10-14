@@ -1,6 +1,7 @@
 // Virtual keys, budgets and rate limits, with Bifrost's Customer → Team → VK
 // hierarchy. State is in memory, per process.
-import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig } from "./config"
+import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig, AccessProfile } from "./config"
+import { Effective, applyProfiles, modelAllowed } from "./profiles"
 import { Hdrs, hdrs } from "./schemas"
 
 // "30s", "5m", "1h", "1d", "1w", "1M" (30 days), "1Q", "1Y" in milliseconds.
@@ -77,6 +78,8 @@ export class Governance {
   customers: Map<string, string | undefined> = new Map()
   enforce = false
   required: string[] = []
+  // the effective policy of each key that uses access profiles, by key id
+  policies: Map<string, Effective> = new Map()
 
   constructor(cfg: Config) {
     this.enforce = cfg.client?.enforce_governance_header ?? false
@@ -90,7 +93,18 @@ export class Governance {
       this.budgets.set(b.id, w)
     }
     for (const r of g.rate_limits ?? []) this.addRateLimit(r)
-    for (const vk of g.virtual_keys ?? []) this.vks.set(vk.value, vk)
+    const profiles: Map<string, AccessProfile> = new Map()
+    for (const p of g.access_profiles ?? []) profiles.set(p.id, p)
+    for (const vk of g.virtual_keys ?? []) {
+      const ids = vk.access_profile_ids ?? []
+      if (ids.length === 0) {
+        this.vks.set(vk.value, vk)
+        continue
+      }
+      const eff = applyProfiles(vk, ids, profiles)
+      this.vks.set(vk.value, eff.vk)
+      this.policies.set(vk.id, eff)
+    }
     for (const t of g.teams ?? []) this.teams.set(t.id, { budget: t.budget_id, customer: t.customer_id })
     for (const c of g.customers ?? []) this.customers.set(c.id, c.budget_id)
   }
@@ -133,6 +147,14 @@ export class Governance {
       return { kind: "grant", vk: undefined, budgets: empty, rateLimits: empty }
     }
     if (vk.is_active === false) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} is inactive` }
+    const pol = this.policies.get(vk.id)
+    if (pol !== undefined) {
+      // fail closed: a profile that went missing must not lift its restrictions
+      if (pol.errors.length > 0) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id}: ${pol.errors.join("; ")}` }
+      if (!modelAllowed(pol, provider, model)) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} may not use ${provider}/${model}` }
+      const miss = missingHeader(h, pol.requiredHeaders)
+      if (miss !== undefined) return { kind: "denial", status: 400, type: "invalid_request_error", message: `the request needs the ${miss} header` }
+    }
     const budgets: string[] = []
     const rateLimits: string[] = []
     const pcs = vk.provider_configs ?? []
@@ -274,6 +296,12 @@ export class Governance {
       if (b !== undefined && b.limit > 0.0) worst = Math.max(worst, b.used / b.limit)
     }
     return worst
+  }
+
+  // The access-profile policy of the request's key, if it has one.
+  policyFor(h: Hdrs): Effective | undefined {
+    const vk = this.findKey(h)
+    return vk === undefined ? undefined : this.policies.get(vk.id)
   }
 
   budgetUsage(): { id: string, used: f64, limit: f64 }[] {

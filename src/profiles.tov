@@ -1,0 +1,856 @@
+// Access profiles: reusable permission sets that virtual keys reference by id,
+// so many keys share one policy. A key's own settings win; profiles fill what
+// the key leaves unset, and lists from several profiles narrow each other.
+// Pure functions: the caller stores the profile list and passes it in.
+import { VirtualKeyConfig, ProviderConfigRef, AccessProfile } from "./config"
+
+
+// The effective policy for one key. Any entry in errors means the request must
+// be refused: an unknown profile may have been deleted while a key still used it.
+export type Effective = {
+  vk: VirtualKeyConfig,
+  mcpTools: string[] | undefined,
+  requiredHeaders: string[],
+  maxTokens: int | undefined,
+  deniedModels: string[],
+  allowedModels: string[] | undefined,
+  errors: string[],
+}
+
+// ---- entry patterns ----
+
+// "provider/model" split at the first slash, since model names may contain
+// slashes. "*" means every provider and model.
+function parts(e: string): { provider: string, model: string } {
+  if (e === "*") return { provider: "*", model: "*" }
+  const i = e.indexOf("/")
+  if (i < 0) return { provider: e, model: "" }
+  return { provider: e.slice(0, i), model: e.slice(i + 1) }
+}
+
+// Whether pattern f admits everything entry e admits. Bare model names (as in
+// provider_configs) are compared exactly, with "*" as the only wildcard.
+function covers(f: string, e: string, bare: bool): bool {
+  if (bare) return f === "*" || f === e
+  const fp = parts(f)
+  if (fp.provider === "*") return true
+  const ep = parts(e)
+  if (ep.provider === "*") return false
+  return fp.provider === ep.provider && (fp.model === "*" || fp.model === ep.model)
+}
+
+function anyCovers(list: string[], e: string, bare: bool): bool {
+  for (const f of list) {
+    if (covers(f, e, bare)) return true
+  }
+  return false
+}
+
+// Entries admitted by both lists: each entry of one list that the other list
+// covers. The result can be empty, which admits nothing.
+function intersectLists(a: string[], b: string[], bare: bool): string[] {
+  const out: string[] = []
+  for (const e of a) {
+    if (anyCovers(b, e, bare) && !out.includes(e)) out.push(e)
+  }
+  for (const f of b) {
+    if (anyCovers(a, f, bare) && !out.includes(f)) out.push(f)
+  }
+  return out
+}
+
+// Whether a concrete provider and model match one "provider/model" entry.
+function matches(e: string, provider: string, model: string): bool {
+  const p = parts(e)
+  if (p.provider === "*") return true
+  return p.provider === provider && (p.model === "*" || p.model === model)
+}
+
+// ---- applying profiles ----
+
+function providerIndex(pcs: ProviderConfigRef[], provider: string): int {
+  for (let i = 0; i < pcs.length; i++) {
+    if (pcs[i]!.provider === provider) return i
+  }
+  return -1
+}
+
+// The key's ref with its unset fields filled from a profile's ref. allowed_models
+// is handled separately, because lists from several profiles intersect.
+function fillRef(e: ProviderConfigRef, pc: ProviderConfigRef): ProviderConfigRef {
+  return {
+    provider: e.provider,
+    weight: e.weight ?? pc.weight,
+    allowed_models: e.allowed_models,
+    budget_id: e.budget_id ?? pc.budget_id,
+    rate_limit_id: e.rate_limit_id ?? pc.rate_limit_id,
+  }
+}
+
+// The effective key for a request: the key's settings, with the profiles named
+// by profileIds applied in order. An unknown or invalid profile is reported in
+// errors and skipped, and an invalid one also makes the key inactive.
+export function applyProfiles(vk: VirtualKeyConfig, profileIds: string[], profiles: Map<string, AccessProfile>): Effective {
+  const errors: string[] = []
+  const found: AccessProfile[] = []
+  let inactive = vk.is_active === false
+  for (const id of profileIds) {
+    const p = profiles.get(id)
+    if (p === undefined) {
+      errors.push(`unknown access profile ${id}`)
+      continue
+    }
+    const why = validateProfile(p)
+    if (why !== "") {
+      errors.push(`access profile ${id} is invalid: ${why}`)
+      inactive = true
+      continue
+    }
+    found.push(p)
+  }
+
+  // value copy: the caller's key is not touched
+  let out: VirtualKeyConfig = vk
+  let allowed: string[] | undefined = undefined
+  let mcp: string[] | undefined = undefined
+  let maxTokens: int | undefined = undefined
+  const denied: string[] = []
+  const headers: string[] = []
+
+  // provider_configs: the key's entries first, then providers the profiles add
+  const pcs: ProviderConfigRef[] = []
+  for (const pc of vk.provider_configs ?? []) pcs.push(pc)
+  const profAllowed = new Map<string, string[]>()
+  for (const p of found) {
+    for (const pc of p.provider_configs ?? []) {
+      let i = providerIndex(pcs, pc.provider)
+      if (i < 0) {
+        pcs.push({ provider: pc.provider })
+        i = pcs.length - 1
+      }
+      const next = fillRef(pcs[i]!, pc)
+      pcs[i] = next
+      const al = pc.allowed_models
+      if (al !== undefined) {
+        const prev = profAllowed.get(pc.provider)
+        profAllowed.set(pc.provider, prev === undefined ? intersectLists(al, al, true) : intersectLists(prev, al, true))
+      }
+    }
+  }
+  const finalPcs: ProviderConfigRef[] = []
+  for (const e of pcs) {
+    const al = profAllowed.get(e.provider)
+    if (e.allowed_models !== undefined || al === undefined) {
+      finalPcs.push(e)
+      continue
+    }
+    // an empty list would read as "every model" to the governance check, so fail closed
+    if (al.length === 0) {
+      errors.push(`access profiles allow no models for provider ${e.provider}`)
+      inactive = true
+    }
+    finalPcs.push({ provider: e.provider, weight: e.weight, allowed_models: al, budget_id: e.budget_id, rate_limit_id: e.rate_limit_id })
+  }
+  out.provider_configs = finalPcs.length === 0 ? undefined : finalPcs
+
+  // the key's own budget and rate limit win; otherwise the first profile that sets one
+  for (const p of found) {
+    if (out.budget_id === undefined && p.budget_id !== undefined) out.budget_id = p.budget_id
+    if (out.rate_limit_id === undefined && p.rate_limit_id !== undefined) out.rate_limit_id = p.rate_limit_id
+  }
+
+  for (const p of found) {
+    const al = p.allowed_models
+    if (al !== undefined) allowed = allowed === undefined ? intersectLists(al, al, false) : intersectLists(allowed, al, false)
+    const ml = p.mcp_tools
+    if (ml !== undefined) mcp = mcp === undefined ? intersectLists(ml, ml, true) : intersectLists(mcp, ml, true)
+    for (const e of p.denied_models ?? []) {
+      if (!denied.includes(e)) denied.push(e)
+    }
+    for (const h of p.required_headers ?? []) {
+      const l = h.toLowerCase()
+      if (!headers.includes(l)) headers.push(l)
+    }
+    const mt = p.max_tokens
+    if (mt !== undefined && (maxTokens === undefined || mt < maxTokens)) maxTokens = mt
+    if (p.is_active === false) inactive = true
+  }
+
+  if (inactive) out.is_active = false
+  return {
+    vk: out,
+    mcpTools: mcp,
+    requiredHeaders: headers,
+    maxTokens: maxTokens,
+    deniedModels: denied,
+    allowedModels: allowed,
+    errors: errors,
+  }
+}
+
+// Whether the effective key may call provider/model. Deny wins over allow, and
+// an unset allow list allows every model that is not denied.
+export function modelAllowed(eff: Effective, provider: string, model: string): bool {
+  if (eff.vk.is_active === false) return false
+  for (const d of eff.deniedModels) {
+    if (matches(d, provider, model)) return false
+  }
+  const al = eff.allowedModels
+  if (al === undefined) return true
+  for (const a of al) {
+    if (matches(a, provider, model)) return true
+  }
+  return false
+}
+
+// ---- validation ----
+
+// Every byte below 128. Byte slices below are only safe on ASCII text.
+function asciiOnly(s: string): bool {
+  for (const b of new TextEncoder().encode(s)) {
+    if (int(b) >= 128) return false
+  }
+  return true
+}
+
+function validId(s: string): bool {
+  if (!asciiOnly(s)) return false
+  if (s.byteLength < 1 || s.byteLength > 64) return false
+  for (let i = 0; i < s.byteLength; i++) {
+    if (!"abcdefghijklmnopqrstuvwxyz0123456789_-".includes(s.slice(i, i + 1))) return false
+  }
+  return true
+}
+
+function validProvider(s: string): bool {
+  if (!asciiOnly(s)) return false
+  if (s.byteLength < 1) return false
+  for (let i = 0; i < s.byteLength; i++) {
+    if (!"abcdefghijklmnopqrstuvwxyz0123456789_.-".includes(s.slice(i, i + 1))) return false
+  }
+  return true
+}
+
+// A model name: non-empty, no wildcard and no whitespace.
+function validModel(s: string): bool {
+  if (!asciiOnly(s)) return false
+  if (s.byteLength < 1) return false
+  for (let i = 0; i < s.byteLength; i++) {
+    if ("* \t\r\n".includes(s.slice(i, i + 1))) return false
+  }
+  return true
+}
+
+// "*", "provider/*" or "provider/model".
+function validEntry(e: string): bool {
+  if (e === "*") return true
+  const p = parts(e)
+  if (p.model === "") return false
+  if (!validProvider(p.provider)) return false
+  return p.model === "*" || validModel(p.model)
+}
+
+// A mcp tool name ("<server>-<tool>") or "*": no whitespace, not empty.
+function validTool(s: string): bool {
+  if (!asciiOnly(s)) return false
+  if (s.byteLength < 1) return false
+  for (let i = 0; i < s.byteLength; i++) {
+    if (" \t\r\n".includes(s.slice(i, i + 1))) return false
+  }
+  return true
+}
+
+// A header name, lower-cased before the check: letters, digits and "-".
+function validHeader(s: string): bool {
+  if (!asciiOnly(s)) return false
+  if (s.byteLength < 1) return false
+  for (let i = 0; i < s.byteLength; i++) {
+    if (!"abcdefghijklmnopqrstuvwxyz0123456789-".includes(s.slice(i, i + 1))) return false
+  }
+  return true
+}
+
+// "" when the profile is valid, else the reason it is not.
+export function validateProfile(p: AccessProfile): string {
+  if (!validId(p.id ?? "")) return "id must be 1 to 64 lower-case letters, digits, _ or -"
+  const al = p.allowed_models
+  if (al !== undefined) {
+    if (al.length === 0) return "allowed_models is empty; omit it to allow every model"
+    for (const e of al) {
+      if (!validEntry(e)) return `allowed_models entry "${e}" must be "*", "provider/*" or "provider/model"`
+    }
+  }
+  for (const e of p.denied_models ?? []) {
+    if (!validEntry(e)) return `denied_models entry "${e}" must be "*", "provider/*" or "provider/model"`
+  }
+  const ml = p.mcp_tools
+  if (ml !== undefined) {
+    if (ml.length === 0) return "mcp_tools is empty; omit it to allow every tool"
+    for (const t of ml) {
+      if (!validTool(t)) return `mcp_tools entry "${t}" must be a tool name without spaces, or "*"`
+    }
+  }
+  for (const h of p.required_headers ?? []) {
+    if (!validHeader(h.toLowerCase())) return `required_headers entry "${h}" is not a header name`
+  }
+  const mt = p.max_tokens
+  if (mt !== undefined && mt <= 0) return "max_tokens must be a positive integer"
+  if (p.budget_id !== undefined && p.budget_id === "") return "budget_id must not be empty"
+  if (p.rate_limit_id !== undefined && p.rate_limit_id === "") return "rate_limit_id must not be empty"
+  for (const pc of p.provider_configs ?? []) {
+    if (!validProvider(pc.provider ?? "")) return `provider_configs provider "${pc.provider ?? ""}" is not a provider name`
+    const pal = pc.allowed_models
+    if (pal !== undefined) {
+      if (pal.length === 0) return `provider_configs ${pc.provider} allowed_models is empty; omit it to allow every model`
+      for (const m of pal) {
+        if (!(m === "*" || validModel(m))) return `provider_configs ${pc.provider} allowed_models entry "${m}" is not a model name`
+      }
+    }
+    if (pc.budget_id !== undefined && pc.budget_id === "") return "provider_configs budget_id must not be empty"
+    if (pc.rate_limit_id !== undefined && pc.rate_limit_id === "") return "provider_configs rate_limit_id must not be empty"
+  }
+  return ""
+}
+
+// ---- management API ----
+
+export type ProfilesReply = { status: int, body: string, profiles: AccessProfile[] }
+
+function preply(status: int, body: string, profiles: AccessProfile[]): ProfilesReply {
+  return { status: status, body: body, profiles: profiles }
+}
+
+function perror(status: int, message: string, profiles: AccessProfile[]): ProfilesReply {
+  return preply(status, JSON.stringify({ error: { message: message } }), profiles)
+}
+
+function segmentsOf(path: string): string[] {
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  return p.split("/").filter((s) => s !== "")
+}
+
+function indexOfProfile(profiles: AccessProfile[], id: string): int {
+  for (let i = 0; i < profiles.length; i++) {
+    if (profiles[i]!.id === id) return i
+  }
+  return -1
+}
+
+// A profile as a request body gives it. The id may be left out, since a PUT
+// path names it; a body without one does not parse as a full AccessProfile.
+type ProfileInput = {
+  id?: string,
+  name?: string,
+  description?: string,
+  provider_configs?: ProviderConfigRef[],
+  allowed_models?: string[],
+  denied_models?: string[],
+  budget_id?: string,
+  rate_limit_id?: string,
+  mcp_tools?: string[],
+  required_headers?: string[],
+  max_tokens?: int,
+  is_active?: bool,
+}
+
+// The body as a profile input, or undefined when it is not a JSON object.
+function parseBody(body: string): ProfileInput | undefined {
+  if (!body.trim().startsWith("{")) return undefined
+  try {
+    const v = JSON.parse(body) as ProfileInput
+    return v
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The stored profile: the given id with the body's fields.
+function toProfile(b: ProfileInput, id: string): AccessProfile {
+  return {
+    id: id,
+    name: b.name,
+    description: b.description,
+    provider_configs: b.provider_configs,
+    allowed_models: b.allowed_models,
+    denied_models: b.denied_models,
+    budget_id: b.budget_id,
+    rate_limit_id: b.rate_limit_id,
+    mcp_tools: b.mcp_tools,
+    required_headers: b.required_headers,
+    max_tokens: b.max_tokens,
+    is_active: b.is_active,
+  }
+}
+
+function createProfile(profiles: AccessProfile[], body: string): ProfilesReply {
+  const b = parseBody(body)
+  if (b === undefined) return perror(400, "body must be a JSON object with an id", profiles)
+  const p = toProfile(b, b.id ?? "")
+  const why = validateProfile(p)
+  if (why !== "") return perror(400, why, profiles)
+  if (indexOfProfile(profiles, p.id) >= 0) return perror(409, `access profile ${p.id} already exists`, profiles)
+  const next: AccessProfile[] = []
+  for (const q of profiles) next.push(q)
+  next.push(p)
+  return preply(201, JSON.stringify(p), next)
+}
+
+function updateProfile(profiles: AccessProfile[], id: string, body: string): ProfilesReply {
+  const i = indexOfProfile(profiles, id)
+  if (i < 0) return perror(404, `no access profile ${id}`, profiles)
+  const b = parseBody(body)
+  if (b === undefined) return perror(400, "body must be a JSON object", profiles)
+  if (b.id !== undefined && b.id !== id) return perror(400, "the id in the body must match the id in the path", profiles)
+  const p = toProfile(b, id)
+  const why = validateProfile(p)
+  if (why !== "") return perror(400, why, profiles)
+  const next: AccessProfile[] = []
+  for (let j = 0; j < profiles.length; j++) {
+    next.push(j === i ? p : profiles[j]!)
+  }
+  return preply(200, JSON.stringify(p), next)
+}
+
+function deleteProfile(profiles: AccessProfile[], id: string): ProfilesReply {
+  if (indexOfProfile(profiles, id) < 0) return perror(404, `no access profile ${id}`, profiles)
+  const next: AccessProfile[] = []
+  for (const q of profiles) {
+    if (q.id !== id) next.push(q)
+  }
+  return preply(200, JSON.stringify({ deleted: id }), next)
+}
+
+// GET /api/governance/access-profiles, POST the same (201, 409 when the id
+// exists), and GET, PUT (replaces the whole profile) or DELETE
+// /api/governance/access-profiles/{id}. Pure: the caller stores the returned
+// profiles. Access is checked by the caller first.
+export function handleProfiles(profiles: AccessProfile[], method: string, path: string, body: string): ProfilesReply {
+  const segs = segmentsOf(path)
+  if (segs.length < 3 || segs.length > 4 || (segs[0] ?? "") !== "api" || (segs[1] ?? "") !== "governance" || (segs[2] ?? "") !== "access-profiles") {
+    return perror(404, "no route for this path", profiles)
+  }
+  const m = method.toUpperCase()
+  const id = segs[3]
+  if (id === undefined) {
+    if (m === "GET") return preply(200, JSON.stringify({ profiles: profiles }), profiles)
+    if (m === "POST") return createProfile(profiles, body)
+    return perror(405, `method ${m} is not allowed on this route`, profiles)
+  }
+  if (m === "GET") {
+    const i = indexOfProfile(profiles, id)
+    if (i < 0) return perror(404, `no access profile ${id}`, profiles)
+    return preply(200, JSON.stringify(profiles[i]!), profiles)
+  }
+  if (m === "PUT") return updateProfile(profiles, id, body)
+  if (m === "DELETE") return deleteProfile(profiles, id)
+  return perror(405, `method ${m} is not allowed on this route`, profiles)
+}
+
+// ---- tests ----
+
+function vkOf(): VirtualKeyConfig {
+  return { id: "vk1", value: "sk-bf-one", name: "one" }
+}
+
+function profileMap(ps: AccessProfile[]): Map<string, AccessProfile> {
+  const m = new Map<string, AccessProfile>()
+  for (const p of ps) m.set(p.id, p)
+  return m
+}
+
+function effOf(vk: VirtualKeyConfig, ids: string[], ps: AccessProfile[]): Effective {
+  return applyProfiles(vk, ids, profileMap(ps))
+}
+
+test("no profiles leave the key and the policy unrestricted", () => {
+  const eff = effOf(vkOf(), [], [])
+  expect(eff.vk.id).toBe("vk1")
+  expect(eff.vk.is_active).toBeUndefined()
+  expect(eff.vk.provider_configs).toBeUndefined()
+  expect(eff.mcpTools).toBeUndefined()
+  expect(eff.maxTokens).toBeUndefined()
+  expect(eff.allowedModels).toBeUndefined()
+  expect(eff.deniedModels).toEqual([])
+  expect(eff.requiredHeaders).toEqual([])
+  expect(eff.errors).toEqual([])
+  expect(modelAllowed(eff, "openai", "gpt-4o")).toBe(true)
+})
+
+test("a profile fills budget and rate limit the key leaves unset", () => {
+  const p: AccessProfile = { id: "team-a", budget_id: "b-profile", rate_limit_id: "rl-profile" }
+  const eff = effOf(vkOf(), ["team-a"], [p])
+  expect(eff.vk.budget_id).toBe("b-profile")
+  expect(eff.vk.rate_limit_id).toBe("rl-profile")
+})
+
+test("the key's own budget and rate limit win over profiles", () => {
+  const p: AccessProfile = { id: "p", budget_id: "b-profile", rate_limit_id: "rl-profile" }
+  const vk: VirtualKeyConfig = { id: "vk1", value: "v", budget_id: "b-key", rate_limit_id: "rl-key" }
+  const eff = effOf(vk, ["p"], [p])
+  expect(eff.vk.budget_id).toBe("b-key")
+  expect(eff.vk.rate_limit_id).toBe("rl-key")
+})
+
+test("the first profile in order that sets a budget wins", () => {
+  const a: AccessProfile = { id: "a" }
+  const b: AccessProfile = { id: "b", budget_id: "b-b", rate_limit_id: "rl-b" }
+  const c: AccessProfile = { id: "c", budget_id: "b-c", rate_limit_id: "rl-c" }
+  const eff = effOf(vkOf(), ["a", "b", "c"], [a, b, c])
+  expect(eff.vk.budget_id).toBe("b-b")
+  expect(eff.vk.rate_limit_id).toBe("rl-b")
+})
+
+test("provider_configs: the key's entry keeps its own fields and profiles fill the rest", () => {
+  const vk: VirtualKeyConfig = { id: "vk1", value: "v", provider_configs: [{ provider: "openai", budget_id: "b-key" }] }
+  const p: AccessProfile = { id: "p", provider_configs: [{ provider: "openai", budget_id: "b-p", rate_limit_id: "rl-p", weight: 2.0 }] }
+  const eff = effOf(vk, ["p"], [p])
+  const pcs = eff.vk.provider_configs ?? []
+  expect(pcs.length).toBe(1)
+  expect(pcs[0]!.provider).toBe("openai")
+  expect(pcs[0]!.budget_id).toBe("b-key")
+  expect(pcs[0]!.rate_limit_id).toBe("rl-p")
+  expect(pcs[0]!.weight).toBe(2.0)
+})
+
+test("provider_configs from profiles are merged by provider", () => {
+  const vk: VirtualKeyConfig = { id: "vk1", value: "v", provider_configs: [{ provider: "openai" }] }
+  const a: AccessProfile = { id: "a", provider_configs: [{ provider: "anthropic", budget_id: "b-a" }] }
+  const b: AccessProfile = { id: "b", provider_configs: [{ provider: "anthropic", budget_id: "b-b", rate_limit_id: "rl-b" }, { provider: "gemini" }] }
+  const eff = effOf(vk, ["a", "b"], [a, b])
+  const pcs = eff.vk.provider_configs ?? []
+  expect(pcs.map((x) => x.provider)).toEqual(["openai", "anthropic", "gemini"])
+  expect(pcs[1]!.budget_id).toBe("b-a")
+  expect(pcs[1]!.rate_limit_id).toBe("rl-b")
+})
+
+test("a profile's provider list restricts a key that had none", () => {
+  const p: AccessProfile = { id: "p", provider_configs: [{ provider: "openai" }] }
+  const eff = effOf(vkOf(), ["p"], [p])
+  const pcs = eff.vk.provider_configs ?? []
+  expect(pcs.length).toBe(1)
+  expect(pcs[0]!.provider).toBe("openai")
+})
+
+test("per-provider model lists: the key's own list wins, profile lists intersect", () => {
+  const vk: VirtualKeyConfig = { id: "vk1", value: "v", provider_configs: [{ provider: "openai", allowed_models: ["gpt-4o", "gpt-4o-mini"] }, { provider: "anthropic" }] }
+  const a: AccessProfile = { id: "a", provider_configs: [{ provider: "openai", allowed_models: ["gpt-4o"] }, { provider: "anthropic", allowed_models: ["*", "claude-x"] }] }
+  const b: AccessProfile = { id: "b", provider_configs: [{ provider: "anthropic", allowed_models: ["claude-x", "claude-y"] }] }
+  const eff = effOf(vk, ["a", "b"], [a, b])
+  const pcs = eff.vk.provider_configs ?? []
+  expect(pcs[0]!.allowed_models).toEqual(["gpt-4o", "gpt-4o-mini"])
+  expect(pcs[1]!.allowed_models).toEqual(["claude-x", "claude-y"])
+  expect(eff.errors).toEqual([])
+})
+
+test("a provider with no common models makes the key inactive", () => {
+  const a: AccessProfile = { id: "a", provider_configs: [{ provider: "openai", allowed_models: ["gpt-4o"] }] }
+  const b: AccessProfile = { id: "b", provider_configs: [{ provider: "openai", allowed_models: ["gpt-5"] }] }
+  const eff = effOf(vkOf(), ["a", "b"], [a, b])
+  expect(eff.vk.is_active).toBe(false)
+  expect(eff.errors.length).toBe(1)
+})
+
+test("allowed_models from one profile is used as written", () => {
+  const p: AccessProfile = { id: "p", allowed_models: ["openai/*", "anthropic/claude-x"] }
+  const eff = effOf(vkOf(), ["p"], [p])
+  expect(eff.allowedModels).toEqual(["openai/*", "anthropic/claude-x"])
+})
+
+test("allowed_models from several profiles intersect, with wildcards", () => {
+  const a: AccessProfile = { id: "a", allowed_models: ["openai/*", "anthropic/claude-x"] }
+  const b: AccessProfile = { id: "b", allowed_models: ["openai/gpt-4o", "anthropic/*", "gemini/g1"] }
+  const eff = effOf(vkOf(), ["a", "b"], [a, b])
+  const al = eff.allowedModels ?? []
+  expect(al.includes("openai/gpt-4o")).toBe(true)
+  expect(al.includes("anthropic/claude-x")).toBe(true)
+  expect(al.includes("openai/*")).toBe(false)
+  expect(al.includes("gemini/g1")).toBe(false)
+  expect(al.length).toBe(2)
+  expect(modelAllowed(eff, "openai", "gpt-4o")).toBe(true)
+  expect(modelAllowed(eff, "openai", "gpt-4o-mini")).toBe(false)
+  expect(modelAllowed(eff, "anthropic", "claude-x")).toBe(true)
+  expect(modelAllowed(eff, "gemini", "g1")).toBe(false)
+})
+
+test("a profile without allowed_models does not narrow another one", () => {
+  const a: AccessProfile = { id: "a", allowed_models: ["openai/gpt-4o"] }
+  const b: AccessProfile = { id: "b", max_tokens: 100 }
+  const eff = effOf(vkOf(), ["a", "b"], [a, b])
+  expect(eff.allowedModels).toEqual(["openai/gpt-4o"])
+})
+
+test("a star in one profile keeps the other list as it is", () => {
+  const a: AccessProfile = { id: "a", allowed_models: ["*"] }
+  const b: AccessProfile = { id: "b", allowed_models: ["openai/gpt-4o", "anthropic/*"] }
+  const eff = effOf(vkOf(), ["a", "b"], [a, b])
+  expect(eff.allowedModels).toEqual(["openai/gpt-4o", "anthropic/*"])
+})
+
+test("denied_models union across profiles without duplicates", () => {
+  const a: AccessProfile = { id: "a", denied_models: ["openai/gpt-5", "anthropic/*"] }
+  const b: AccessProfile = { id: "b", denied_models: ["anthropic/*", "gemini/g1"] }
+  const eff = effOf(vkOf(), ["a", "b"], [a, b])
+  expect(eff.deniedModels).toEqual(["openai/gpt-5", "anthropic/*", "gemini/g1"])
+})
+
+test("mcp_tools intersect across profiles and stay undefined when no profile sets them", () => {
+  const a: AccessProfile = { id: "a", mcp_tools: ["fs-read", "fs-write", "web-search"] }
+  const b: AccessProfile = { id: "b", mcp_tools: ["fs-read", "web-search", "db-query"] }
+  const c: AccessProfile = { id: "c" }
+  const both = effOf(vkOf(), ["a", "b", "c"], [a, b, c])
+  expect(both.mcpTools).toEqual(["fs-read", "web-search"])
+  const none = effOf(vkOf(), ["c"], [c])
+  expect(none.mcpTools).toBeUndefined()
+  const star = effOf(vkOf(), ["c", "a"], [c, { id: "a", mcp_tools: ["*"] }])
+  expect(star.mcpTools).toEqual(["*"])
+})
+
+test("required_headers union, lower-cased, without duplicates", () => {
+  const a: AccessProfile = { id: "a", required_headers: ["X-Team", "x-cost-center"] }
+  const b: AccessProfile = { id: "b", required_headers: ["x-team", "X-Ticket"] }
+  const eff = effOf(vkOf(), ["a", "b"], [a, b])
+  expect(eff.requiredHeaders).toEqual(["x-team", "x-cost-center", "x-ticket"])
+})
+
+test("max_tokens takes the minimum across profiles", () => {
+  const a: AccessProfile = { id: "a", max_tokens: 4000 }
+  const b: AccessProfile = { id: "b", max_tokens: 1000 }
+  const c: AccessProfile = { id: "c" }
+  expect(effOf(vkOf(), ["a", "b", "c"], [a, b, c]).maxTokens).toBe(1000)
+  expect(effOf(vkOf(), ["c"], [c]).maxTokens).toBeUndefined()
+})
+
+test("an inactive profile makes the key inactive", () => {
+  const p: AccessProfile = { id: "p", is_active: false }
+  const eff = effOf(vkOf(), ["p"], [p])
+  expect(eff.vk.is_active).toBe(false)
+  expect(eff.errors).toEqual([])
+  expect(modelAllowed(eff, "openai", "gpt-4o")).toBe(false)
+})
+
+test("an active profile does not reactivate an inactive key", () => {
+  const vk: VirtualKeyConfig = { id: "vk1", value: "v", is_active: false }
+  const eff = effOf(vk, ["p"], [{ id: "p", is_active: true }])
+  expect(eff.vk.is_active).toBe(false)
+})
+
+test("an active profile leaves an unset key active", () => {
+  const eff = effOf(vkOf(), ["p"], [{ id: "p", is_active: true }])
+  expect(eff.vk.is_active).toBeUndefined()
+})
+
+test("unknown profile ids are reported and the others still apply", () => {
+  const p: AccessProfile = { id: "p", budget_id: "b-p" }
+  const eff = effOf(vkOf(), ["gone", "p"], [p])
+  expect(eff.errors).toEqual(["unknown access profile gone"])
+  expect(eff.vk.budget_id).toBe("b-p")
+})
+
+test("an invalid profile is reported, skipped and makes the key inactive", () => {
+  const bad: AccessProfile = { id: "bad", max_tokens: 0, denied_models: ["openai/gpt-5"] }
+  const eff = effOf(vkOf(), ["bad"], [bad])
+  expect(eff.errors.length).toBe(1)
+  expect(eff.vk.is_active).toBe(false)
+  expect(eff.maxTokens).toBeUndefined()
+  expect(eff.deniedModels).toEqual([])
+})
+
+test("the caller's key and profiles are not changed", () => {
+  const vk: VirtualKeyConfig = { id: "vk1", value: "v", provider_configs: [{ provider: "openai" }] }
+  const p: AccessProfile = { id: "p", budget_id: "b-p", provider_configs: [{ provider: "anthropic" }] }
+  const eff = effOf(vk, ["p"], [p])
+  expect(eff.vk.budget_id).toBe("b-p")
+  expect(vk.budget_id).toBeUndefined()
+  expect(vk.provider_configs!.length).toBe(1)
+  expect(p.provider_configs!.length).toBe(1)
+  expect(p.budget_id).toBe("b-p")
+})
+
+test("modelAllowed: unset lists allow everything, deny wins over allow", () => {
+  const open = effOf(vkOf(), [], [])
+  expect(modelAllowed(open, "openai", "gpt-4o")).toBe(true)
+  const p: AccessProfile = { id: "p", allowed_models: ["openai/*"], denied_models: ["openai/gpt-5"] }
+  const eff = effOf(vkOf(), ["p"], [p])
+  expect(modelAllowed(eff, "openai", "gpt-4o")).toBe(true)
+  expect(modelAllowed(eff, "openai", "gpt-5")).toBe(false)
+  expect(modelAllowed(eff, "anthropic", "claude-x")).toBe(false)
+})
+
+test("modelAllowed: a star deny blocks everything, and a star allow admits everything", () => {
+  const blocked = effOf(vkOf(), ["p"], [{ id: "p", denied_models: ["*"], allowed_models: ["*"] }])
+  expect(modelAllowed(blocked, "openai", "gpt-4o")).toBe(false)
+  const star = effOf(vkOf(), ["p"], [{ id: "p", allowed_models: ["*"] }])
+  expect(modelAllowed(star, "xai", "grok-4")).toBe(true)
+})
+
+test("modelAllowed: profiles with disjoint allow lists admit nothing", () => {
+  const a: AccessProfile = { id: "a", allowed_models: ["openai/gpt-4o"] }
+  const b: AccessProfile = { id: "b", allowed_models: ["anthropic/claude-x"] }
+  const eff = effOf(vkOf(), ["a", "b"], [a, b])
+  expect(eff.allowedModels).toEqual([])
+  expect(modelAllowed(eff, "openai", "gpt-4o")).toBe(false)
+  expect(modelAllowed(eff, "anthropic", "claude-x")).toBe(false)
+})
+
+test("modelAllowed: provider names match exactly and model names may contain slashes", () => {
+  const p: AccessProfile = { id: "p", allowed_models: ["openai/*", "openrouter/meta-llama/llama-3"] }
+  const eff = effOf(vkOf(), ["p"], [p])
+  expect(modelAllowed(eff, "openai", "gpt-4o")).toBe(true)
+  expect(modelAllowed(eff, "openai-compat", "gpt-4o")).toBe(false)
+  expect(modelAllowed(eff, "openrouter", "meta-llama/llama-3")).toBe(true)
+  expect(modelAllowed(eff, "openrouter", "meta-llama/llama-4")).toBe(false)
+})
+
+test("modelAllowed: an inactive key admits nothing", () => {
+  const eff = effOf({ id: "vk1", value: "v", is_active: false }, [], [])
+  expect(modelAllowed(eff, "openai", "gpt-4o")).toBe(false)
+})
+
+test("validateProfile accepts a well-formed profile", () => {
+  const p: AccessProfile = {
+    id: "team-a_1",
+    name: "Team A",
+    description: "x",
+    provider_configs: [{ provider: "openai", allowed_models: ["gpt-4o", "meta-llama/llama-3"], budget_id: "b1", weight: 1.0 }],
+    allowed_models: ["openai/*", "anthropic/claude-x", "openrouter/meta-llama/llama-3", "*"],
+    denied_models: ["openai/gpt-5"],
+    budget_id: "b1",
+    rate_limit_id: "rl1",
+    mcp_tools: ["fs-read", "*"],
+    required_headers: ["X-Team"],
+    max_tokens: 1,
+    is_active: true,
+  }
+  expect(validateProfile(p)).toBe("")
+  expect(validateProfile({ id: "a" })).toBe("")
+})
+
+test("validateProfile rejects bad ids", () => {
+  expect(validateProfile({ id: "" }) === "").toBe(false)
+  expect(validateProfile({ id: "Team" }) === "").toBe(false)
+  expect(validateProfile({ id: "team a" }) === "").toBe(false)
+  expect(validateProfile({ id: "team/a" }) === "").toBe(false)
+  expect(validateProfile({ id: "team.a" }) === "").toBe(false)
+  expect(validateProfile({ id: "x".repeat(65) }) === "").toBe(false)
+  expect(validateProfile({ id: "x".repeat(64) })).toBe("")
+  expect(validateProfile({ id: "é" }) === "").toBe(false)
+})
+
+test("validateProfile rejects bad list entries", () => {
+  const bad = ["openai", "/gpt-4o", "openai/", "*/gpt-4o", "openai/gpt*", "openai/*x", "Openai/gpt", "open ai/gpt", "openai/gpt 4", "", "*x"]
+  for (const e of bad) {
+    expect(validateProfile({ id: "p", allowed_models: [e] }) === "").toBe(false)
+    expect(validateProfile({ id: "p", denied_models: [e] }) === "").toBe(false)
+  }
+  expect(validateProfile({ id: "p", allowed_models: ["openai/gpt-4o"], denied_models: ["*"] })).toBe("")
+})
+
+test("validateProfile rejects empty allowed and tool lists, and bad tool names", () => {
+  expect(validateProfile({ id: "p", allowed_models: [] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", mcp_tools: [] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", mcp_tools: ["fs read"] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", mcp_tools: [""] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", denied_models: [] })).toBe("")
+})
+
+test("validateProfile rejects non-positive max_tokens and bad headers", () => {
+  expect(validateProfile({ id: "p", max_tokens: 0 }) === "").toBe(false)
+  expect(validateProfile({ id: "p", max_tokens: -5 }) === "").toBe(false)
+  expect(validateProfile({ id: "p", required_headers: ["x team"] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", required_headers: [""] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", required_headers: ["X-Team"] })).toBe("")
+})
+
+test("validateProfile rejects empty budget and rate limit ids", () => {
+  expect(validateProfile({ id: "p", budget_id: "" }) === "").toBe(false)
+  expect(validateProfile({ id: "p", rate_limit_id: "" }) === "").toBe(false)
+  expect(validateProfile({ id: "p", provider_configs: [{ provider: "openai", budget_id: "" }] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", provider_configs: [{ provider: "Open AI" }] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", provider_configs: [{ provider: "openai", allowed_models: [] }] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", provider_configs: [{ provider: "openai", allowed_models: ["*x"] }] }) === "").toBe(false)
+  expect(validateProfile({ id: "p", provider_configs: [{ provider: "openai", allowed_models: ["gpt-4o"] }] })).toBe("")
+})
+
+// Management API
+
+function rootOf(): string {
+  return "/api/governance/access-profiles"
+}
+
+test("GET lists profiles and GET by id returns one", () => {
+  const ps: AccessProfile[] = [{ id: "a", max_tokens: 10 }, { id: "b" }]
+  const list = handleProfiles(ps, "GET", rootOf(), "")
+  expect(list.status).toBe(200)
+  expect(list.body.includes("\"id\":\"a\"")).toBe(true)
+  expect(list.body.includes("\"id\":\"b\"")).toBe(true)
+  expect(list.profiles.length).toBe(2)
+  const one = handleProfiles(ps, "GET", rootOf() + "/a", "")
+  expect(one.status).toBe(200)
+  expect(one.body.includes("\"max_tokens\":10")).toBe(true)
+  expect(handleProfiles(ps, "GET", rootOf() + "/nope", "").status).toBe(404)
+})
+
+test("GET accepts a trailing slash and a query string", () => {
+  const ps: AccessProfile[] = [{ id: "a" }]
+  expect(handleProfiles(ps, "GET", rootOf() + "/", "").status).toBe(200)
+  expect(handleProfiles(ps, "GET", rootOf() + "/a?x=1", "").status).toBe(200)
+  expect(handleProfiles(ps, "GET", rootOf() + "?x=1", "").status).toBe(200)
+  expect(handleProfiles(ps, "get", rootOf(), "").status).toBe(200)
+})
+
+test("POST creates a profile (201) and rejects a duplicate (409)", () => {
+  const r = handleProfiles([], "POST", rootOf(), "{\"id\":\"team-a\",\"allowed_models\":[\"openai/*\"]}")
+  expect(r.status).toBe(201)
+  expect(r.profiles.length).toBe(1)
+  expect(r.profiles[0]!.id).toBe("team-a")
+  expect(r.profiles[0]!.allowed_models).toEqual(["openai/*"])
+  expect(handleProfiles(r.profiles, "POST", rootOf(), "{\"id\":\"team-a\"}").status).toBe(409)
+})
+
+test("POST rejects invalid bodies with 400 and leaves the list alone", () => {
+  const ps: AccessProfile[] = [{ id: "a" }]
+  const bads = ["", "not json", "[]", "null", "{\"id\":\"Bad Id\"}", "{\"name\":\"no id\"}", "{\"id\":\"p\",\"max_tokens\":0}", "{\"id\":\"p\",\"allowed_models\":[\"openai\"]}"]
+  for (const b of bads) {
+    const r = handleProfiles(ps, "POST", rootOf(), b)
+    expect(r.status).toBe(400)
+    expect(r.profiles.length).toBe(1)
+  }
+})
+
+test("PUT replaces a profile, and rejects unknown ids, mismatched ids and bad bodies", () => {
+  const ps: AccessProfile[] = [{ id: "a", max_tokens: 10 }, { id: "b" }]
+  const r = handleProfiles(ps, "PUT", rootOf() + "/a", "{\"allowed_models\":[\"anthropic/*\"]}")
+  expect(r.status).toBe(200)
+  expect(r.profiles.length).toBe(2)
+  expect(r.profiles[0]!.id).toBe("a")
+  expect(r.profiles[0]!.max_tokens).toBeUndefined()
+  expect(r.profiles[0]!.allowed_models).toEqual(["anthropic/*"])
+  expect(r.profiles[1]!.id).toBe("b")
+  expect(handleProfiles(ps, "PUT", rootOf() + "/zzz", "{}").status).toBe(404)
+  expect(handleProfiles(ps, "PUT", rootOf() + "/a", "{\"id\":\"b\"}").status).toBe(400)
+  expect(handleProfiles(ps, "PUT", rootOf() + "/a", "{\"max_tokens\":-1}").status).toBe(400)
+  expect(handleProfiles(ps, "PUT", rootOf() + "/a", "oops").status).toBe(400)
+  expect(handleProfiles(ps, "PUT", rootOf() + "/a", "{\"id\":\"a\",\"max_tokens\":5}").status).toBe(200)
+})
+
+test("DELETE removes a profile, and unknown ids are 404", () => {
+  const ps: AccessProfile[] = [{ id: "a" }, { id: "b" }]
+  const r = handleProfiles(ps, "DELETE", rootOf() + "/a", "")
+  expect(r.status).toBe(200)
+  expect(r.profiles.length).toBe(1)
+  expect(r.profiles[0]!.id).toBe("b")
+  expect(r.body).toBe("{\"deleted\":\"a\"}")
+  expect(handleProfiles(r.profiles, "DELETE", rootOf() + "/a", "").status).toBe(404)
+  expect(ps.length).toBe(2)
+})
+
+test("wrong methods are 405 and other paths are 404", () => {
+  const ps: AccessProfile[] = [{ id: "a" }]
+  expect(handleProfiles(ps, "PUT", rootOf(), "{}").status).toBe(405)
+  expect(handleProfiles(ps, "DELETE", rootOf(), "").status).toBe(405)
+  expect(handleProfiles(ps, "PATCH", rootOf() + "/a", "{}").status).toBe(405)
+  expect(handleProfiles(ps, "GET", "/api/governance/virtual-keys", "").status).toBe(404)
+  expect(handleProfiles(ps, "GET", "/api/governance/access-profiles/a/extra", "").status).toBe(404)
+  expect(handleProfiles(ps, "GET", "/api/users", "").status).toBe(404)
+})
