@@ -58,16 +58,33 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 
 ## Performance
 
-`make bench` (the mock upstream, the load generator and the gateway on one machine):
+`bench/compare.sh` runs Raiju and Bifrost side by side against the same mock
+upstream, with [vegeta](https://github.com/tsenart/vegeta) generating load.
+Each gateway runs alone, pinned to the same 2 cores; the mock and the load
+generator get their own cores. Logging, caching and governance are off on both.
+"Added p50" is the gateway's median latency minus the direct (no gateway) median at the same rate.
 
-| | this VM (4 shared cores) | Bifrost (README, t3.xlarge) |
-|---|---|---|
-| Gateway overhead at 5,000 RPS, mean | 40 µs | 11 µs |
-| Success rate at 5,000 RPS | 100% | 100% |
-| Single-worker ceiling (closed loop, 64 clients) | ~20,700 rps | not published |
+Results from one 4-core cloud VM (single run, 15 s per rate, 100% success everywhere):
 
-Overhead is handler time minus upstream time (the same thing Bifrost reports);
-end-to-end the extra local hop costs ~0.3 ms at p50 here.
+| | Raiju | Bifrost v1.3.10 | Bifrost v2.3.0 |
+|---|---|---|---|
+| Added p50 at 1,000 RPS | 198 µs | 338 µs | 816 µs |
+| Added p50 at 2,500 RPS | 179 µs | 234 µs | 1,179 µs |
+| Added p50 at 5,000 RPS | 99 µs | 139 µs | can't sustain (3,387 rps) |
+| Max throughput, 2 cores | 27,700 rps* | 18,400 rps | 3,700 rps |
+| Memory (RSS) | 10–13 MB | 100–120 MB | 280–470 MB |
+| Binary | 3 MB | 49 MB | 134 MB |
+
+\* Raiju's ceiling is the mock upstream and load generator (one core each), not Raiju.
+At 10,000 RPS the load generator's own core saturates, so those rows (in
+`bench/results/`) aren't meaningful for either gateway.
+
+Caveats: Raiju passes request and response bodies through mostly untouched,
+while Bifrost parses and re-serializes them and runs more plugins (model
+catalog, telemetry, compat); Raiju also buffers streaming. Bifrost's published
+11 µs is internal overhead on a dedicated t3.xlarge, not this end-to-end
+measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
+5,000 RPS on a busier setup.
 
 ## Development
 
