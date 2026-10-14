@@ -98,6 +98,7 @@ def write_config():
     src = open(os.path.join(ROOT, "src/jwt.tov")).read()
     pem = re.search(r"const TEST_PKCS8 = `(.*?)`", src, re.S).group(1)
     sa = {"type": "service_account", "client_email": "e2e@test.iam.gserviceaccount.com", "private_key": pem, "token_uri": MOCK + "/token"}
+    cfg["mcp"]["client_configs"].append({"name": "local", "connection_type": "stdio", "stdio_config": {"command": "python3", "args": [os.path.join(ROOT, "tests/mcp_stdio.py")], "env": {"MCP_GREETING": "hello"}}})
     cfg["providers"]["vertex"] = {
         "keys": [{"name": "vx", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps(sa)}}],
         "network_config": {"base_url": MOCK},
@@ -346,6 +347,10 @@ def main():
         check("mcp tool execution", s == 200 and r == {"role": "tool", "tool_call_id": "call_1", "content": "Sunny in Oslo"}, b)
         mcp_calls = [x for x in seen() if x["path"] == "/mcp"]
         check("mcp tools/call sent upstream", '"method":"tools/call"' in mcp_calls[-1]["body"] and '"city":"Oslo"' in mcp_calls[-1]["body"], mcp_calls[-1])
+        loc = [c for c in st if c["name"] == "local"]
+        check("a stdio MCP server is started and connected", loc and loc[0]["connected"] and loc[0]["tools"] == 1, st)
+        s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "call_3", "type": "function", "function": {"name": "local-echo", "arguments": "{\"text\":\"ping\"}"}})
+        check("a stdio MCP tool runs in the child process with its environment", s == 200 and "hello: ping (pid " in b, b)
         sec = [c for c in st if c["name"] == "secure"]
         check("an OAuth-protected MCP server connects with a client-credentials token", sec and sec[0]["connected"] and sec[0]["tools"] == 1, st)
         s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "call_2", "type": "function", "function": {"name": "secure-get_weather", "arguments": "{\"city\":\"Oslo\"}"}})

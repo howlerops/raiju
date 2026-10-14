@@ -6,17 +6,20 @@ import { McpAuthConfig, TokenCache, staticHeaders, tokenRequest, discoveryUrls, 
 import { fields, elements, find, rawStr, rawBool, rawNum, quote, build, setField, isNull, decodeString } from "./json"
 import { deadline } from "./deadline"
 
-// Bifrost's client config. Only the HTTP transport is implemented; "sse" uses the
-// same POST transport, and "stdio" is refused.
+// Bifrost's client config. "http" is Streamable HTTP ("sse" uses the same POST
+// transport); "stdio" runs stdio_config.command and speaks newline-delimited
+// JSON-RPC on its stdin and stdout (needs Tov's Bun.spawnSocket, tov-patches/).
 export type McpClientConfig = {
   name: string,
   connection_type: string,
-  connection_string: string,
+  connection_string?: string, // http and sse
   headers?: Map<string, string>,
   tools_to_execute?: string[],
   tools_to_skip?: string[],
   // credentials for the server: a bearer token, extra headers, or OAuth (client credentials, refresh token)
   auth?: McpAuthConfig,
+  // stdio servers: the program, its arguments, extra environment and working directory
+  stdio_config?: { command: string, args?: string[], env?: Map<string, string>, cwd?: string },
 }
 
 export type McpConfig = {
@@ -293,6 +296,111 @@ export function executeEndpointBody(body: string): { name: string, argumentsJson
 
 type Reply = { status: int, contentType: string, body: string }
 
+// The stdio transport: one JSON-RPC message per line, both ways, on a child process.
+class StdioChannel {
+  sock: Socket<undefined> | undefined = undefined
+  private buf = ""
+  private waiting: Map<int, (line: string) => void> = new Map()
+  private dec: TextDecoder | undefined = undefined
+  closed = false
+
+  async open(name: string, cmd: string[], env: Map<string, string>, cwd: string): Promise<void> throws Error {
+    try {
+      this.dec = new TextDecoder()
+    } catch (e) {
+      this.dec = undefined
+    }
+    const self = this
+    const envRec: Record<string, string> = env
+    try {
+      this.sock = await Bun.spawnSocket({
+        cmd: cmd,
+        env: envRec,
+        cwd: cwd,
+        socket: {
+          data(sock, bytes) {
+            self.onData(bytes)
+          },
+          close(sock) {
+            self.onClose()
+          },
+        },
+      })
+    } catch (e) {
+      throw new Error(`${name}: could not start ${cmd[0] ?? ""}: ${e.message}`)
+    }
+  }
+
+  private onData(bytes: u8[]): void {
+    const d = this.dec
+    if (d === undefined) return
+    try {
+      this.buf += d.decode(bytes, { stream: true })
+    } catch (e) {
+      return
+    }
+    while (true) {
+      const nl = this.buf.indexOf("\n")
+      if (nl < 0) break
+      const line = this.buf.slice(0, nl).trim()
+      this.buf = this.buf.slice(nl + 1)
+      if (line === "") continue
+      // only replies are of interest; the server's own requests and notifications are ignored
+      let id = -1
+      try {
+        const fs = fields(line)
+        if (find(fs, "method") !== undefined) continue
+        id = Math.floor(rawNum(fs, "id") ?? -1)
+      } catch (e) {
+        continue
+      }
+      const w = this.waiting.get(id)
+      if (w !== undefined) {
+        this.waiting.delete(id)
+        w(line)
+      }
+    }
+  }
+
+  private onClose(): void {
+    this.closed = true
+    const ws = this.waiting
+    this.waiting = new Map()
+    for (const k of ws.keys()) ws.get(k)!("")
+  }
+
+  async request(body: string, id: int, timeoutMs: int): Promise<string> throws Error {
+    const s = this.sock
+    if (s === undefined || this.closed) throw new Error("the server process has exited")
+    const p = new Promise<string>((resolve) => {
+      this.waiting.set(id, resolve)
+    })
+    const t = setTimeout(() => {
+      const w = this.waiting.get(id)
+      if (w !== undefined) {
+        this.waiting.delete(id)
+        w("")
+      }
+    }, timeoutMs)
+    s.write(body + "\n")
+    const line = await p
+    clearTimeout(t)
+    if (line === "") throw new Error(this.closed ? "the server process has exited" : "no reply in time")
+    return line
+  }
+
+  send(body: string): void throws Error {
+    const s = this.sock
+    if (s === undefined || this.closed) throw new Error("the server process has exited")
+    s.write(body + "\n")
+  }
+
+  stop(): void {
+    const s = this.sock
+    if (s !== undefined && !this.closed) s.end()
+  }
+}
+
 // One connection to an MCP server. connect() initializes and lists every tool; a failure
 // is kept in lastError and leaves connected false.
 export class McpSession {
@@ -307,6 +415,7 @@ export class McpSession {
 
   readonly timeoutMs: int
   private tokens = new TokenCache()
+  private stdio: StdioChannel | undefined = undefined
   // the OAuth token endpoint, from auth.token_url or the server's metadata
   private tokenUrl = ""
 
@@ -354,7 +463,7 @@ export class McpSession {
     if (a === undefined) return
     if (this.tokenUrl === "") this.tokenUrl = a.token_url ?? ""
     if (this.tokenUrl === "") {
-      const urls = discoveryUrls(this.cfg.connection_string)
+      const urls = discoveryUrls(this.cfg.connection_string ?? "")
       if (urls.length < 2) throw new Error(`${this.cfg.name}: no token_url and no metadata URL`)
       const dl = deadline(CONNECT_TIMEOUT_MS)
       try {
@@ -403,7 +512,7 @@ export class McpSession {
     let reply: Reply = { status: 0, contentType: "", body: "" }
     try {
       const hs: Record<string, string> = this.headers()
-      const res = await fetch(this.cfg.connection_string, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+      const res = await fetch(this.cfg.connection_string ?? "", { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
       const sid = res.headers.get("mcp-session-id") ?? ""
       if (sid !== "") this.sessionId = sid
       const text = await res.text()
@@ -418,6 +527,18 @@ export class McpSession {
 
   // A request: returns the raw result, or throws on HTTP and JSON-RPC errors.
   private async rpc(body: string, id: int, timeoutMs: int): Promise<string> throws Error {
+    const ch = this.stdio
+    if (ch !== undefined) {
+      let line = ""
+      try {
+        line = await ch.request(body, id, timeoutMs)
+      } catch (e) {
+        throw new Error(`${this.cfg.name}: ${e.message}`)
+      }
+      const r = parseRpcResponse("application/json", line, id)
+      if (r.kind === "error") throw new Error(`${this.cfg.name}: ${r.message} (code ${r.code})`)
+      return r.raw
+    }
     const reply = try await this.exchange(body, timeoutMs)
     if (reply.status < 200 || reply.status >= 300) throw new Error(`${this.cfg.name}: HTTP ${reply.status}`)
     const r = parseRpcResponse(reply.contentType, reply.body, id)
@@ -427,6 +548,15 @@ export class McpSession {
 
   // A notification: no reply body is expected.
   private async notify(body: string): Promise<void> throws Error {
+    const ch = this.stdio
+    if (ch !== undefined) {
+      try {
+        ch.send(body)
+      } catch (e) {
+        throw new Error(`${this.cfg.name}: ${e.message}`)
+      }
+      return
+    }
     const reply = try await this.exchange(body, CONNECT_TIMEOUT_MS)
     if (reply.status < 200 || reply.status >= 300) throw new Error(`${this.cfg.name}: HTTP ${reply.status} for notification`)
   }
@@ -438,7 +568,16 @@ export class McpSession {
     this.version = ""
     try {
       const transport = this.cfg.connection_type
-      if (transport !== "http" && transport !== "sse") throw new Error(`unsupported connection type ${transport}`)
+      if (transport !== "http" && transport !== "sse" && transport !== "stdio") throw new Error(`unsupported connection type ${transport}`)
+      if (transport === "stdio") {
+        const sc = this.cfg.stdio_config
+        if (sc === undefined || sc.command === "") throw new Error("stdio needs stdio_config.command")
+        const old = this.stdio
+        if (old !== undefined) old.stop()
+        const ch = new StdioChannel()
+        try await ch.open(this.cfg.name, [sc.command].concat(sc.args ?? []), sc.env ?? new Map(), sc.cwd ?? "")
+        this.stdio = ch
+      }
       const initId = this.newId()
       try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS)
       // From here on the protocol version is sent with every request.
@@ -506,9 +645,15 @@ export class McpManager {
     this.sessions = list.map((c) => new McpSession(c, ms))
   }
 
-  // Connects every server. A server that fails is recorded in status(), not thrown.
+  // Connects every HTTP server. A server that fails is recorded in status(), not thrown.
   async connectAll(): Promise<void> {
-    await Promise.all(this.sessions.map((s) => s.connect()))
+    await Promise.all(this.sessions.filter((s) => s.cfg.connection_type !== "stdio").map((s) => s.connect()))
+  }
+
+  // Starts and connects the stdio servers. Called once the process serves (in every worker
+  // after the fork), so each worker talks to its own server process.
+  async connectStdio(): Promise<void> {
+    await Promise.all(this.sessions.filter((s) => s.cfg.connection_type === "stdio").map((s) => s.connect()))
   }
 
   // Chat tool definitions from every connected server.
@@ -544,8 +689,8 @@ export class McpManager {
     return out
   }
 
-  status(): { name: string, connected: bool, tools: int, error: string }[] {
-    return this.sessions.map((s) => ({ name: s.cfg.name, connected: s.connected, tools: s.exposedCount(), error: s.lastError }))
+  status(): { name: string, connected: bool, tools: int, error: string, stdio: bool }[] {
+    return this.sessions.map((s) => ({ name: s.cfg.name, connected: s.connected, tools: s.exposedCount(), error: s.lastError, stdio: s.cfg.connection_type === "stdio" }))
   }
 }
 
