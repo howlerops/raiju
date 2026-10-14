@@ -1,0 +1,194 @@
+// OpenAI and every provider that speaks its wire format. Requests pass through
+// with only the model rewritten and gateway-only fields removed.
+import { Field, build, quote, setField, without, fields, find, elements } from "../json"
+import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
+import { UsageOnly } from "../schemas"
+
+// Default base URL and path prefix per OpenAI-compatible provider. As in
+// Bifrost, network_config.base_url replaces the base and the path is appended.
+type Endpoint = { base: string, prefix: string }
+
+function makeEndpoints(): Map<string, Endpoint> {
+  const m: Map<string, Endpoint> = new Map()
+  m.set("openai", { base: "https://api.openai.com", prefix: "/v1" })
+  m.set("groq", { base: "https://api.groq.com/openai", prefix: "/v1" })
+  m.set("mistral", { base: "https://api.mistral.ai", prefix: "/v1" })
+  m.set("xai", { base: "https://api.x.ai", prefix: "/v1" })
+  m.set("deepseek", { base: "https://api.deepseek.com", prefix: "/v1" })
+  m.set("cerebras", { base: "https://api.cerebras.ai", prefix: "/v1" })
+  m.set("fireworks", { base: "https://api.fireworks.ai/inference", prefix: "/v1" })
+  m.set("together", { base: "https://api.together.xyz", prefix: "/v1" })
+  m.set("nebius", { base: "https://api.studio.nebius.ai", prefix: "/v1" })
+  m.set("parasail", { base: "https://api.parasail.io", prefix: "/v1" })
+  m.set("openrouter", { base: "https://openrouter.ai/api", prefix: "/v1" })
+  m.set("perplexity", { base: "https://api.perplexity.ai", prefix: "" })
+  m.set("ollama", { base: "http://localhost:11434", prefix: "/v1" })
+  m.set("vllm", { base: "http://localhost:8000", prefix: "/v1" })
+  m.set("sgl", { base: "http://localhost:30000", prefix: "/v1" })
+  m.set("lmstudio", { base: "http://localhost:1234", prefix: "/v1" })
+  return m
+}
+
+const ENDPOINTS: Map<string, Endpoint> = makeEndpoints()
+
+export function isOpenAICompatible(kind: string): bool {
+  return ENDPOINTS.has(kind)
+}
+
+export function knownOpenAIKinds(): string[] {
+  return ENDPOINTS.keys()
+}
+
+// Fields only the gateway reads; providers reject unknown fields.
+export const GATEWAY_FIELDS = ["fallbacks", "provider", "bifrost", "raiju"]
+
+function endpoint(t: Target): string {
+  const e = ENDPOINTS.get(t.kind) ?? { base: "https://api.openai.com", prefix: "/v1" }
+  const base = t.cfg.network_config?.base_url
+  if (base === undefined || base === "") return e.base + e.prefix
+  const b = trimSlash(base)
+  // A base_url given with its version path (".../v1") is used as is.
+  if (e.prefix !== "" && b.endsWith(e.prefix)) return b
+  return b + e.prefix
+}
+
+function authHeaders(t: Target): Map<string, string> {
+  let h = headers([["content-type", "application/json"]])
+  const v = t.key.value ?? ""
+  if (v !== "") h.set("authorization", "Bearer " + v)
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+function withModel(body: Field[], model: string): string {
+  let fs = without(body, GATEWAY_FIELDS)
+  setField(&fs, "model", quote(model))
+  return build(fs)
+}
+
+function azureUrl(t: Target, op: string): string {
+  const az = t.key.azure_key_config
+  const endpointUrl = trimSlash(az?.endpoint ?? t.cfg.network_config?.base_url ?? "")
+  let deployment = t.model
+  const deps = az?.deployments
+  if (deps !== undefined) deployment = deps.get(t.model) ?? t.model
+  const version = az?.api_version ?? "2024-10-21"
+  return `${endpointUrl}/openai/deployments/${deployment}/${op}?api-version=${version}`
+}
+
+function azureHeaders(t: Target): Map<string, string> {
+  let h = headers([["content-type", "application/json"], ["api-key", t.key.value ?? ""]])
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+export function chatRequest(t: Target, body: Field[]): Upstream {
+  if (t.kind === "azure") return { url: azureUrl(t, "chat/completions"), headers: azureHeaders(t), body: withModel(body, t.model) }
+  return { url: endpoint(t) + "/chat/completions", headers: authHeaders(t), body: withModel(body, t.model) }
+}
+
+export function embeddingsRequest(t: Target, body: Field[]): Upstream {
+  if (t.kind === "azure") return { url: azureUrl(t, "embeddings"), headers: azureHeaders(t), body: withModel(body, t.model) }
+  return { url: endpoint(t) + "/embeddings", headers: authHeaders(t), body: withModel(body, t.model) }
+}
+
+export function completionsRequest(t: Target, body: Field[]): Upstream {
+  if (t.kind === "azure") return { url: azureUrl(t, "completions"), headers: azureHeaders(t), body: withModel(body, t.model) }
+  return { url: endpoint(t) + "/completions", headers: authHeaders(t), body: withModel(body, t.model) }
+}
+
+export function modelsRequest(t: Target): Upstream {
+  return { url: endpoint(t) + "/models", headers: authHeaders(t), body: "" }
+}
+
+// Reports the model as the caller asked for it ("openai/gpt-4o") and reads usage.
+export function chatResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  let fs = try fields(text)
+  setField(&fs, "model", quote(requestedModel))
+  const u = find(fs, "usage")
+  let pt = 0
+  let ct = 0
+  if (u !== undefined && u !== "null") {
+    const usage = try JSON.parse(`{"usage":${u}}`) as UsageOnly
+    pt = usage.usage?.prompt_tokens ?? 0
+    ct = usage.usage?.completion_tokens ?? 0
+  }
+  return { body: build(fs), promptTokens: pt, completionTokens: ct }
+}
+
+// For a buffered SSE body: rewrites each chunk's model and sums the usage the
+// last chunk reports (when stream_options.include_usage is set).
+export function streamResponse(text: string, requestedModel: string): Translated {
+  const out: string[] = []
+  let pt = 0
+  let ct = 0
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data: ") || line === "data: [DONE]") {
+      out.push(line)
+      continue
+    }
+    const payload = line.slice(6)
+    try {
+      let fs = fields(payload)
+      setField(&fs, "model", quote(requestedModel))
+      const u = find(fs, "usage")
+      if (u !== undefined && u !== "null") {
+        const usage = JSON.parse(`{"usage":${u}}`) as UsageOnly
+        pt = usage.usage?.prompt_tokens ?? pt
+        ct = usage.usage?.completion_tokens ?? ct
+      }
+      out.push("data: " + build(fs))
+    } catch (e) {
+      out.push(line)
+    }
+  }
+  return { body: out.join("\n"), promptTokens: pt, completionTokens: ct }
+}
+
+export function embeddingsResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  return try chatResponse(text, requestedModel)
+}
+
+// Model ids from a /models response, prefixed with the provider name.
+export function modelIds(text: string, provider: string): string[] throws SyntaxError {
+  const fs = try fields(text)
+  const data = find(fs, "data") ?? find(fs, "models")
+  if (data === undefined) return []
+  const out: string[] = []
+  for (const el of try elements(data)) {
+    const m = try fields(el)
+    const id = find(m, "id") ?? find(m, "name")
+    if (id !== undefined && id.startsWith("\"")) out.push(provider + "/" + (try JSON.parse(id) as string))
+  }
+  return out
+}
+
+test("rewrites model and strips gateway fields", () => {
+  const t: Target = { provider: "groq", kind: "groq", model: "llama-3.3-70b", key: { value: "gk" }, cfg: {} }
+  const up = chatRequest(t, try fields('{"model":"groq/llama-3.3-70b","messages":[],"fallbacks":["openai/gpt-4o"]}'))
+  expect(up.url).toBe("https://api.groq.com/openai/v1/chat/completions")
+  expect(up.body).toBe('{"model":"llama-3.3-70b","messages":[]}')
+  expect(up.headers.get("authorization")).toBe("Bearer gk")
+})
+
+test("base_url override and azure deployments", () => {
+  const t: Target = { provider: "ollama", kind: "ollama", model: "llama3", key: { value: "" }, cfg: { network_config: { base_url: "http://gpu:11434/" } } }
+  expect(chatRequest(t, []).url).toBe("http://gpu:11434/v1/chat/completions")
+  expect(chatRequest(t, []).headers.has("authorization")).toBe(false)
+  const deps: Map<string, string> = new Map()
+  deps.set("gpt-4o", "prod-4o")
+  const az: Target = { provider: "azure", kind: "azure", model: "gpt-4o", key: { value: "ak", azure_key_config: { endpoint: "https://x.openai.azure.com", deployments: deps, api_version: "2024-10-21" } }, cfg: {} }
+  const up = chatRequest(az, [])
+  expect(up.url).toBe("https://x.openai.azure.com/openai/deployments/prod-4o/chat/completions?api-version=2024-10-21")
+  expect(up.headers.get("api-key")).toBe("ak")
+})
+
+test("response usage and model", () => {
+  const r = try chatResponse('{"id":"c1","model":"gpt-4o-2024","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}', "openai/gpt-4o")
+  expect(r.promptTokens).toBe(5)
+  expect(r.completionTokens).toBe(7)
+  expect(r.body.includes('"model":"openai/gpt-4o"')).toBe(true)
+  const s = streamResponse('data: {"model":"x","choices":[]}\n\ndata: {"model":"x","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}\n\ndata: [DONE]\n\n', "openai/gpt-4o")
+  expect(s.completionTokens).toBe(2)
+  expect(s.body.includes('data: {"model":"openai/gpt-4o","choices":[]}')).toBe(true)
+})

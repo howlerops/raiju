@@ -1,0 +1,101 @@
+// A fake provider for end-to-end tests. Speaks enough of OpenAI, Anthropic,
+// Gemini and Bedrock to exercise translation, and fails on demand:
+//   model "flaky-*"   → 503 on every other call
+//   model "down-*"    → always 500
+//   key "bad-key"     → 401
+type Seen = { path: string, auth: string, body: string }
+
+const seen: Seen[] = []
+let flakyCalls = 0
+
+function record(req: Request, path: string, body: string): void {
+  const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? req.headers.get("x-goog-api-key") ?? req.headers.get("api-key") ?? ""
+  seen.push({ path: path, auth: auth, body: body })
+}
+
+function failure(model: string, auth: string): Response | undefined {
+  if (auth.includes("bad-key")) return Response.json({ error: { message: "invalid api key", type: "auth" } }, { status: 401 })
+  if (model.startsWith("down-")) return Response.json({ error: { message: "upstream down", type: "server" } }, { status: 500 })
+  if (model.startsWith("flaky-")) {
+    flakyCalls += 1
+    if (flakyCalls % 2 === 1) return Response.json({ error: { message: "overloaded", type: "server" } }, { status: 503 })
+  }
+  return undefined
+}
+
+type Model = { model?: string, stream?: bool }
+
+const port = parseInt(process.env.MOCK_PORT ?? "18099") ?? 18099
+
+Bun.serve<string>({
+  port: port,
+  routes: {
+    "/v1/chat/completions": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v1/chat/completions", body)
+        const m = try JSON.parse(body) as Model
+        const model = m.model ?? ""
+        const f = failure(model, req.headers.get("authorization") ?? "")
+        if (f !== undefined) return f
+        if (m.stream === true) {
+          const chunk = (delta: string, finish: string) => `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          const sse = chunk(`{"role":"assistant","content":""}`, "null") + chunk(`{"content":"Hel"}`, "null") + chunk(`{"content":"lo"}`, "null") + chunk(`{}`, `"stop"`) +
+            `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\ndata: [DONE]\n\n`
+          return new Response(sse, { headers: { "content-type": "text/event-stream" } })
+        }
+        return Response.json({ id: "c1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "Hello from " + model }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
+      },
+    },
+    "/v1/embeddings": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v1/embeddings", body)
+        return Response.json({ object: "list", data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }], model: "e", usage: { prompt_tokens: 2, completion_tokens: 0, total_tokens: 2 } })
+      },
+    },
+    "/v1/models": () => Response.json({ object: "list", data: [{ id: "m-a", object: "model" }, { id: "m-b", object: "model" }] }),
+    "/v1/messages": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v1/messages", body)
+        const m = try JSON.parse(body) as Model
+        const f = failure(m.model ?? "", req.headers.get("x-api-key") ?? "")
+        if (f !== undefined) return f
+        if (m.stream === true) {
+          return new Response(`event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`, { headers: { "content-type": "text/event-stream" } })
+        }
+        return Response.json({ id: "msg_1", type: "message", role: "assistant", model: m.model ?? "", content: [{ type: "text", text: "Hi from claude" }], stop_reason: "end_turn", usage: { input_tokens: 11, output_tokens: 5 } })
+      },
+    },
+    "/v1beta/models/:modelAction": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v1beta/models/" + req.params.modelAction, body)
+        return Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "Hi from gemini" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 6, candidatesTokenCount: 3, totalTokenCount: 9 } })
+      },
+    },
+    "/model/:modelId/converse": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/model/" + req.params.modelId + "/converse", body)
+        return Response.json({ output: { message: { role: "assistant", content: [{ text: "Hi from bedrock" }] } }, stopReason: "end_turn", usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 } })
+      },
+    },
+    "/_seen": () => Response.json(seen),
+  },
+  fetch(req, server) {
+    // realtime: echo each event back, tagged with the credentials and URL the gateway used
+    if (req.url.includes("/v1/realtime")) {
+      const tag = (req.headers.get("authorization") ?? "") + " " + req.url
+      if (server.upgrade(req, { data: tag })) return
+    }
+    return new Response("not found", { status: 404 })
+  },
+  websocket: {
+    message(ws, m) {
+      ws.send(JSON.stringify({ type: "echo", auth: ws.data ?? "", event: typeof m === "string" ? m : "binary" }))
+    },
+  },
+})
+console.log(`mock upstream on ${port}`)

@@ -1,0 +1,308 @@
+// AWS Bedrock Converse API with SigV4 signing (or a Bedrock API key as a bearer token).
+import { Field, fields, elements, find, quote, rawStr, isNull, build } from "../json"
+import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
+import { ChatRequest, ContentPart, newId, nowSeconds } from "../schemas"
+import { sha256, hmacSha256, toHex, utf8 } from "../crypto"
+
+// ---- SigV4 ----
+
+function pad2(n: int): string {
+  return n < 10 ? "0" + n : "" + n
+}
+
+// UTC "YYYYMMDDTHHMMSSZ" for a Unix time in milliseconds.
+export function amzDate(ms: f64): string {
+  const secs = Math.floor(ms / 1000)
+  const days = Math.floor(secs / 86400)
+  const rem = secs - days * 86400
+  // civil-from-days (Howard Hinnant)
+  const z = days + 719468
+  const era = Math.floor(z / 146097)
+  const doe = z - era * 146097
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365)
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100))
+  const mp = Math.floor((5 * doy + 2) / 153)
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1
+  const m = mp < 10 ? mp + 3 : mp - 9
+  const y = yoe + era * 400 + (m <= 2 ? 1 : 0)
+  return `${y}${pad2(m)}${pad2(d)}T${pad2(Math.floor(rem / 3600))}${pad2(Math.floor((rem % 3600) / 60))}${pad2(rem % 60)}Z`
+}
+
+const UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+const HEXU = "0123456789ABCDEF"
+
+// RFC 3986 percent-encoding of one path segment.
+export function encodeSegment(s: string): string {
+  const out: string[] = []
+  const bytes = utf8(s)
+  for (let i = 0; i < bytes.length; i++) {
+    const v = int(bytes[i]!)
+    // an ASCII byte is one character of s at the same byte offset
+    const ch = v < 128 ? s.slice(i, i + 1) : ""
+    if (v < 128 && UNRESERVED.includes(ch)) out.push(ch)
+    else out.push("%" + HEXU.slice(v >> 4, (v >> 4) + 1) + HEXU.slice(v & 15, (v & 15) + 1))
+  }
+  return out.join("")
+}
+
+export type Credentials = { accessKey: string, secretKey: string, sessionToken?: string, region: string }
+
+// Signs a POST. `path` is already percent-encoded once; SigV4 for non-S3
+// services encodes each segment again in the canonical request.
+export function sign(creds: Credentials, service: string, host: string, path: string, body: string, nowMs: f64): Map<string, string> {
+  const date = amzDate(nowMs)
+  const day = date.slice(0, 8)
+  const canonicalPath = path.split("/").map((seg) => encodeSegment(seg)).join("/")
+  const payloadHash = toHex(sha256(utf8(body)))
+  const hs: string[][] = [["content-type", "application/json"], ["host", host], ["x-amz-date", date]]
+  const token = creds.sessionToken
+  if (token !== undefined && token !== "") hs.push(["x-amz-security-token", token])
+  const canonicalHeaders = hs.map((h) => `${h[0]!}:${h[1]!}\n`).join("")
+  const signed = hs.map((h) => h[0]!).join(";")
+  const canonical = `POST\n${canonicalPath}\n\n${canonicalHeaders}\n${signed}\n${payloadHash}`
+  const scope = `${day}/${creds.region}/${service}/aws4_request`
+  const toSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${toHex(sha256(utf8(canonical)))}`
+  const kDate = hmacSha256(utf8("AWS4" + creds.secretKey), utf8(day))
+  const kRegion = hmacSha256(kDate, utf8(creds.region))
+  const kService = hmacSha256(kRegion, utf8(service))
+  const kSigning = hmacSha256(kService, utf8("aws4_request"))
+  const signature = toHex(hmacSha256(kSigning, utf8(toSign)))
+  const out = headers(hs)
+  out.delete("host")
+  out.set("authorization", `AWS4-HMAC-SHA256 Credential=${creds.accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}`)
+  return out
+}
+
+// ---- Converse translation ----
+
+function contentOf(c: string | ContentPart[] | undefined): string[] {
+  if (c === undefined) return []
+  if (typeof c === "string") return c === "" ? [] : [`{"text":${quote(c)}}`]
+  const out: string[] = []
+  for (const p of c) {
+    if (p.type === "text" && p.text !== undefined) out.push(`{"text":${quote(p.text)}}`)
+    else if (p.type === "image_url" && p.image_url !== undefined && p.image_url.url.startsWith("data:image/")) {
+      const url = p.image_url.url
+      const semi = url.indexOf(";")
+      const comma = url.indexOf(",")
+      const format = url.slice(11, semi > 0 ? semi : comma)
+      out.push(`{"image":{"format":${quote(format === "jpg" ? "jpeg" : format)},"source":{"bytes":${quote(url.slice(comma + 1))}}}}`)
+    }
+  }
+  return out
+}
+
+function argsObject(args: string): string {
+  try {
+    return build(fields(args))
+  } catch (e) {
+    return "{}"
+  }
+}
+
+type Turn = { role: string, content: string[] }
+
+function pushTurn(inout turns: Turn[], role: string, content: string[]): void {
+  if (content.length === 0) return
+  const last = turns.length - 1
+  if (last >= 0 && turns[last]!.role === role) {
+    turns[last] = { role: role, content: turns[last]!.content.concat(content) }
+    return
+  }
+  turns.push({ role: role, content: content })
+}
+
+function toolConfig(tools: string, choice: string | undefined): string throws SyntaxError {
+  const specs: string[] = []
+  for (const el of try elements(tools)) {
+    const fnRaw = find(try fields(el), "function")
+    if (fnRaw === undefined) continue
+    const fn = try fields(fnRaw)
+    const parts = [`"name":${quote(rawStr(fn, "name") ?? "")}`]
+    const desc = find(fn, "description")
+    if (desc !== undefined && !isNull(desc)) parts.push(`"description":${desc}`)
+    const params = find(fn, "parameters")
+    parts.push(`"inputSchema":{"json":${isNull(params) ? `{"type":"object","properties":{}}` : params!}}`)
+    specs.push(`{"toolSpec":{${parts.join(",")}}}`)
+  }
+  let tc = ""
+  if (choice === `"auto"`) tc = `,"toolChoice":{"auto":{}}`
+  else if (choice === `"required"`) tc = `,"toolChoice":{"any":{}}`
+  else if (choice !== undefined && choice.startsWith("{")) {
+    const fnRaw = find(try fields(choice), "function")
+    if (fnRaw !== undefined) tc = `,"toolChoice":{"tool":{"name":${quote(rawStr(try fields(fnRaw), "name") ?? "")}}}`
+  }
+  return `{"tools":[${specs.join(",")}]${tc}}`
+}
+
+export function converseBody(req: ChatRequest, body: Field[], autoCache: bool): string throws SyntaxError {
+  let turns: Turn[] = []
+  const system: string[] = []
+  for (const m of req.messages) {
+    if (m.role === "system" || m.role === "developer") {
+      for (const c of contentOf(m.content)) system.push(c)
+      continue
+    }
+    if (m.role === "tool") {
+      const text = typeof m.content === "string" ? m.content : (m.content ?? []).map((p) => p.text ?? "").join("")
+      pushTurn(&turns, "user", [`{"toolResult":{"toolUseId":${quote(m.tool_call_id ?? "")},"content":[{"text":${quote(text)}}]}}`])
+      continue
+    }
+    const role = m.role === "assistant" ? "assistant" : "user"
+    const content = contentOf(m.content)
+    for (const c of m.tool_calls ?? []) {
+      content.push(`{"toolUse":{"toolUseId":${quote(c.id)},"name":${quote(c.function.name)},"input":${argsObject(c.function.arguments)}}}`)
+    }
+    pushTurn(&turns, role, content)
+  }
+  if (autoCache) {
+    // cache points after the system prompt and the newest turn
+    if (turns.length > 0) {
+      const last = turns[turns.length - 1]!
+      turns[turns.length - 1] = { role: last.role, content: last.content.concat([`{"cachePoint":{"type":"default"}}`]) }
+    }
+    if (system.length > 0) system.push(`{"cachePoint":{"type":"default"}}`)
+  }
+  const out: string[] = [`"messages":[${turns.map((t) => `{"role":"${t.role}","content":[${t.content.join(",")}]}`).join(",")}]`]
+  if (system.length > 0) out.push(`"system":[${system.join(",")}]`)
+  const inf: string[] = []
+  const max = req.max_completion_tokens ?? req.max_tokens
+  if (max !== undefined) inf.push(`"maxTokens":${max}`)
+  if (req.temperature !== undefined) inf.push(`"temperature":${req.temperature}`)
+  if (req.top_p !== undefined) inf.push(`"topP":${req.top_p}`)
+  const stop = req.stop
+  if (stop !== undefined) inf.push(`"stopSequences":${typeof stop === "string" ? `[${quote(stop)}]` : JSON.stringify(stop)}`)
+  if (inf.length > 0) out.push(`"inferenceConfig":{${inf.join(",")}}`)
+  const tools = find(body, "tools")
+  if (tools !== undefined && !isNull(tools)) out.push(`"toolConfig":${try toolConfig(tools, find(body, "tool_choice"))}`)
+  return "{" + out.join(",") + "}"
+}
+
+type BedrockUsage = { inputTokens?: int, outputTokens?: int, cacheReadInputTokens?: int, cacheWriteInputTokens?: int }
+
+function finishReason(r: string | undefined): string {
+  if (r === "tool_use") return "tool_calls"
+  if (r === "max_tokens") return "length"
+  if (r === "guardrail_intervened" || r === "content_filtered") return "content_filter"
+  return "stop"
+}
+
+export function chatResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  const fs = try fields(text)
+  const textParts: string[] = []
+  const calls: string[] = []
+  const output = find(fs, "output")
+  if (output !== undefined && !isNull(output)) {
+    const msg = find(try fields(output), "message")
+    if (msg !== undefined && !isNull(msg)) {
+      const content = find(try fields(msg), "content")
+      if (content !== undefined) {
+        for (const el of try elements(content)) {
+          const b = try fields(el)
+          const t = rawStr(b, "text")
+          if (t !== undefined) textParts.push(t)
+          const tu = find(b, "toolUse")
+          if (tu !== undefined) {
+            const u = try fields(tu)
+            calls.push(`{"id":${quote(rawStr(u, "toolUseId") ?? "")},"type":"function","function":{"name":${quote(rawStr(u, "name") ?? "")},"arguments":${quote(find(u, "input") ?? "{}")}}}`)
+          }
+        }
+      }
+    }
+  }
+  let pt = 0
+  let ct = 0
+  const u = find(fs, "usage")
+  if (u !== undefined && !isNull(u)) {
+    const usage = try JSON.parse(u) as BedrockUsage
+    pt = (usage.inputTokens ?? 0) + (usage.cacheReadInputTokens ?? 0) + (usage.cacheWriteInputTokens ?? 0)
+    ct = usage.outputTokens ?? 0
+  }
+  const joined = textParts.join("")
+  const msg: string[] = [`"role":"assistant"`, `"content":${joined === "" && calls.length > 0 ? "null" : quote(joined)}`]
+  if (calls.length > 0) msg.push(`"tool_calls":[${calls.join(",")}]`)
+  const out = `{"id":${quote(newId("chatcmpl-"))},"object":"chat.completion","created":${nowSeconds()},"model":${quote(requestedModel)},` +
+    `"choices":[{"index":0,"message":{${msg.join(",")}},"finish_reason":"${finishReason(rawStr(fs, "stopReason"))}"}],` +
+    `"usage":{"prompt_tokens":${pt},"completion_tokens":${ct},"total_tokens":${pt + ct}}}`
+  return { body: out, promptTokens: pt, completionTokens: ct }
+}
+
+// ---- requests ----
+
+function region(t: Target): string {
+  return t.key.bedrock_key_config?.region ?? "us-east-1"
+}
+
+function modelId(t: Target): string {
+  let id = t.model
+  const deps = t.key.bedrock_key_config?.deployments
+  if (deps !== undefined) id = deps.get(t.model) ?? t.model
+  return id
+}
+
+function host(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b !== undefined && b !== "") {
+    const u = URL.parse(b)
+    if (u !== undefined) return u.host
+  }
+  return `bedrock-runtime.${region(t)}.amazonaws.com`
+}
+
+function scheme(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b !== undefined && b.startsWith("http://")) return "http://"
+  return "https://"
+}
+
+// A request to /model/{id}/{action}, signed with the key's AWS credentials,
+// or sent with its Bedrock API key as a bearer token.
+export function signedRequest(t: Target, action: string, body: string): Upstream {
+  const path = `/model/${encodeSegment(modelId(t))}/${action}`
+  const h = host(t)
+  const bk = t.key.bedrock_key_config
+  const ak = bk?.access_key ?? ""
+  let hs: Map<string, string> = new Map()
+  if (ak !== "") {
+    hs = sign({ accessKey: ak, secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token, region: region(t) }, "bedrock", h, path, body, Date.now())
+  } else {
+    hs = headers([["content-type", "application/json"], ["authorization", "Bearer " + (t.key.value ?? "")]])
+  }
+  addExtraHeaders(&hs, t.cfg)
+  return { url: scheme(t) + h + path, headers: hs, body: body }
+}
+
+export function chatRequest(t: Target, req: ChatRequest, body: Field[], autoCache: bool): Upstream throws SyntaxError {
+  return signedRequest(t, "converse", try converseBody(req, body, autoCache))
+}
+
+test("amz dates", () => {
+  expect(amzDate(0.0)).toBe("19700101T000000Z")
+  expect(amzDate(1440938160000.0)).toBe("20150830T123600Z")
+  expect(amzDate(1709251199000.0)).toBe("20240229T235959Z")
+})
+
+test("sigv4 matches the AWS reference signature", () => {
+  // Reference signature computed independently with Python's hmac/hashlib for this input.
+  const creds: Credentials = { accessKey: "AKIDEXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", region: "us-east-1" }
+  const h = sign(creds, "bedrock", "bedrock-runtime.us-east-1.amazonaws.com", "/model/anthropic.claude-3-haiku-20240307-v1%3A0/converse", "{}", 1440938160000.0)
+  expect(h.get("x-amz-date")).toBe("20150830T123600Z")
+  const auth = h.get("authorization")!
+  expect(auth.startsWith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=")).toBe(true)
+  expect(auth.endsWith("Signature=1e3e5ff96e9eaa6f374cc3e88308f4dd8c58e317eb37fe847a49419ac9af2387")).toBe(true)
+})
+
+test("segment encoding", () => {
+  expect(encodeSegment("anthropic.claude-3-haiku-20240307-v1:0")).toBe("anthropic.claude-3-haiku-20240307-v1%3A0")
+  expect(encodeSegment("a b/é")).toBe("a%20b%2F%C3%A9")
+})
+
+test("converse translation", () => {
+  const raw = `{"model":"bedrock/claude","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}],"max_tokens":10,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":"auto"}`
+  const out = try converseBody(try JSON.parse(raw) as ChatRequest, try fields(raw), false)
+  expect(out).toBe(`{"messages":[{"role":"user","content":[{"text":"hi"}]}],"system":[{"text":"s"}],"inferenceConfig":{"maxTokens":10},"toolConfig":{"tools":[{"toolSpec":{"name":"f","inputSchema":{"json":{"type":"object"}}}}],"toolChoice":{"auto":{}}}}`)
+  const r = try chatResponse(`{"output":{"message":{"role":"assistant","content":[{"text":"yo"},{"toolUse":{"toolUseId":"t9","name":"f","input":{"a":1}}}]}},"stopReason":"tool_use","usage":{"inputTokens":4,"outputTokens":6,"totalTokens":10}}`, "bedrock/claude")
+  expect(r.body.includes(`"finish_reason":"tool_calls"`)).toBe(true)
+  expect(r.body.includes(`"arguments":"{\\"a\\":1}"`)).toBe(true)
+  expect(r.completionTokens).toBe(6)
+})

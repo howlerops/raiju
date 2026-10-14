@@ -1,0 +1,225 @@
+// Lazy JSON. Request and response bodies pass through the gateway mostly
+// untouched, so instead of building a tree we scan for value boundaries and
+// keep each value as its raw text. Only the fields the gateway reads are decoded.
+//
+// Offsets are byte offsets: Tov strings slice by byte, so the offsets found in
+// the encoded bytes slice the original string directly.
+
+export type Field = { key: string, raw: string }
+
+const enc = new TextEncoder()
+
+class Scanner {
+  pos = 0
+  constructor(readonly b: u8[], readonly text: string) {}
+
+  ws(): void {
+    while (this.pos < this.b.length) {
+      const c = this.b[this.pos]!
+      if (c === u8(32) || c === u8(10) || c === u8(13) || c === u8(9)) this.pos += 1
+      else return
+    }
+  }
+
+  peek(): int {
+    const c = this.b[this.pos]
+    if (c === undefined) return -1
+    return int(c)
+  }
+
+  expect(ch: int): void throws SyntaxError {
+    this.ws()
+    if (this.peek() !== ch) throw new SyntaxError(`invalid JSON at byte ${this.pos}`)
+    this.pos += 1
+  }
+
+  // Skips a string starting at the opening quote; returns the end offset (after the closing quote).
+  skipString(): void throws SyntaxError {
+    this.pos += 1
+    while (this.pos < this.b.length) {
+      const c = int(this.b[this.pos]!)
+      if (c === 92) this.pos += 2
+      else if (c === 34) {
+        this.pos += 1
+        return
+      } else this.pos += 1
+    }
+    throw new SyntaxError("unterminated JSON string")
+  }
+
+  // Skips any value; leaves pos after it.
+  skipValue(): void throws SyntaxError {
+    this.ws()
+    const c = this.peek()
+    if (c === 34) {
+      try this.skipString()
+      return
+    }
+    if (c === 123 || c === 91) {
+      let depth = 0
+      while (this.pos < this.b.length) {
+        const d = int(this.b[this.pos]!)
+        if (d === 34) {
+          try this.skipString()
+          continue
+        }
+        if (d === 123 || d === 91) depth += 1
+        else if (d === 125 || d === 93) {
+          depth -= 1
+          if (depth === 0) {
+            this.pos += 1
+            return
+          }
+        }
+        this.pos += 1
+      }
+      throw new SyntaxError("unterminated JSON container")
+    }
+    // number, true, false, null
+    const start = this.pos
+    while (this.pos < this.b.length) {
+      const d = int(this.b[this.pos]!)
+      if (d === 44 || d === 125 || d === 93 || d === 32 || d === 10 || d === 13 || d === 9) break
+      this.pos += 1
+    }
+    if (this.pos === start) throw new SyntaxError(`invalid JSON at byte ${start}`)
+  }
+}
+
+function scannerFor(text: string): Scanner {
+  return new Scanner(enc.encode(text), text)
+}
+
+// The members of a JSON object, in order, each value as raw text.
+export function fields(text: string): Field[] throws SyntaxError {
+  const s = scannerFor(text)
+  const out: Field[] = []
+  try s.expect(123)
+  s.ws()
+  if (s.peek() === 125) return out
+  while (true) {
+    s.ws()
+    if (s.peek() !== 34) throw new SyntaxError(`expected a key at byte ${s.pos}`)
+    const ks = s.pos
+    try s.skipString()
+    const key = try decodeString(text.slice(ks, s.pos))
+    try s.expect(58)
+    s.ws()
+    const vs = s.pos
+    try s.skipValue()
+    out.push({ key: key, raw: text.slice(vs, s.pos) })
+    s.ws()
+    const c = s.peek()
+    s.pos += 1
+    if (c === 125) return out
+    if (c !== 44) throw new SyntaxError(`expected , or } at byte ${s.pos - 1}`)
+  }
+}
+
+// The elements of a JSON array, each as raw text.
+export function elements(text: string): string[] throws SyntaxError {
+  const s = scannerFor(text)
+  const out: string[] = []
+  try s.expect(91)
+  s.ws()
+  if (s.peek() === 93) return out
+  while (true) {
+    s.ws()
+    const vs = s.pos
+    try s.skipValue()
+    out.push(text.slice(vs, s.pos))
+    s.ws()
+    const c = s.peek()
+    s.pos += 1
+    if (c === 93) return out
+    if (c !== 44) throw new SyntaxError(`expected , or ] at byte ${s.pos - 1}`)
+  }
+}
+
+export function find(fs: Field[], key: string): string | undefined {
+  for (const f of fs) {
+    if (f.key === key) return f.raw
+  }
+  return undefined
+}
+
+// Decodes a raw JSON string literal (quotes included).
+export function decodeString(raw: string): string throws SyntaxError {
+  if (raw.indexOf("\\") < 0) return raw.slice(1, raw.byteLength - 1)
+  const s: string = try JSON.parse(raw)
+  return s
+}
+
+export function quote(s: string): string {
+  return JSON.stringify(s)
+}
+
+export function rawStr(fs: Field[], key: string): string | undefined {
+  const r = find(fs, key)
+  if (r === undefined || !r.startsWith("\"")) return undefined
+  try {
+    return decodeString(r)
+  } catch (e) {
+    return undefined
+  }
+}
+
+export function rawBool(fs: Field[], key: string): bool | undefined {
+  const r = find(fs, key)
+  if (r === "true") return true
+  if (r === "false") return false
+  return undefined
+}
+
+export function rawNum(fs: Field[], key: string): f64 | undefined {
+  const r = find(fs, key)
+  if (r === undefined) return undefined
+  return parseFloat(r)
+}
+
+export function isNull(raw: string | undefined): bool {
+  return raw === undefined || raw === "null"
+}
+
+// Builds an object from fields, in order.
+export function build(fs: Field[]): string {
+  const parts: string[] = []
+  for (const f of fs) parts.push(quote(f.key) + ":" + f.raw)
+  return "{" + parts.join(",") + "}"
+}
+
+export function setField(inout fs: Field[], key: string, raw: string): void {
+  for (let i = 0; i < fs.length; i++) {
+    if (fs[i]!.key === key) {
+      fs[i] = { key: key, raw: raw }
+      return
+    }
+  }
+  fs.push({ key: key, raw: raw })
+}
+
+export function without(fs: Field[], keys: string[]): Field[] {
+  return fs.filter((f) => !keys.includes(f.key))
+}
+
+test("fields and elements", () => {
+  const fs = try fields(' { "model" : "gpt-4o", "n": 2, "msgs": [{"a":"}]"}, [1,2]], "s": "é\\"x", "t": true, "z": null } ')
+  expect(fs.length).toBe(6)
+  expect(rawStr(fs, "model")).toBe("gpt-4o")
+  expect(rawNum(fs, "n")).toBe(2.0)
+  expect(find(fs, "msgs")).toBe('[{"a":"}]"}, [1,2]]')
+  expect(rawStr(fs, "s")).toBe('é"x')
+  expect(rawBool(fs, "t")).toBe(true)
+  expect(isNull(find(fs, "z"))).toBe(true)
+  const els = try elements(find(fs, "msgs")!)
+  expect(els.length).toBe(2)
+  expect(els[1]).toBe("[1,2]")
+})
+
+test("build round trip", () => {
+  let fs = try fields('{"model":"a","stream":true,"fallbacks":["x"]}')
+  setField(&fs, "model", quote("b"))
+  expect(build(without(fs, ["fallbacks"]))).toBe('{"model":"b","stream":true}')
+  expect(try elements("[]")).toEqual([])
+  expect((try fields("{}")).length).toBe(0)
+})

@@ -1,0 +1,115 @@
+// /v1/realtime: a WebSocket relay between the caller and the provider's
+// realtime endpoint (OpenAI or Azure OpenAI). The gateway checks the virtual
+// key, picks the provider key, and passes events through untouched.
+import { Engine } from "./gateway"
+import { parseModel, target } from "./router"
+import { Target } from "./providers/types"
+import { snapshot } from "./schemas"
+import * as metrics from "./metrics"
+
+export class Session {
+  upstream: WebSocket | undefined = undefined
+  constructor(readonly url: string, readonly headers: Map<string, string>, readonly provider: string, readonly model: string) {}
+}
+
+export type Upgrade = { kind: "session", session: Session } | { kind: "refused", status: int, message: string }
+
+function wsBase(url: string): string {
+  if (url.startsWith("https://")) return "wss://" + url.slice(8)
+  if (url.startsWith("http://")) return "ws://" + url.slice(7)
+  return url
+}
+
+function trim(s: string): string {
+  return s.endsWith("/") ? s.slice(0, s.byteLength - 1) : s
+}
+
+export function upstreamFor(t: Target, beta: string | undefined): { url: string, headers: Map<string, string> } {
+  const h: Map<string, string> = new Map()
+  if (t.kind === "azure") {
+    const az = t.key.azure_key_config
+    let deployment = t.model
+    const deps = az?.deployments
+    if (deps !== undefined) deployment = deps.get(t.model) ?? t.model
+    h.set("api-key", t.key.value ?? "")
+    const endpoint = trim(az?.endpoint ?? t.cfg.network_config?.base_url ?? "")
+    return { url: `${wsBase(endpoint)}/openai/realtime?api-version=${az?.api_version ?? "2025-04-01-preview"}&deployment=${deployment}`, headers: h }
+  }
+  const base = trim(t.cfg.network_config?.base_url ?? "https://api.openai.com")
+  h.set("authorization", "Bearer " + (t.key.value ?? ""))
+  if (beta !== undefined) h.set("openai-beta", beta)
+  const extra = t.cfg.network_config?.extra_headers
+  if (extra !== undefined) {
+    for (const k of extra.keys()) h.set(k, extra.get(k)!)
+  }
+  return { url: `${wsBase(base)}/v1/realtime?model=${t.model}`, headers: h }
+}
+
+// Decides whether a /v1/realtime upgrade may proceed, and where it goes.
+export function prepare(engine: Engine, req: Request): Upgrade {
+  const u = URL.parse(req.url)
+  const model = u === undefined ? undefined : u.searchParams.get("model")
+  if (model === undefined || model === undefined || model === "") return { kind: "refused", status: 400, message: "add ?model=openai/gpt-realtime (or another realtime model)" }
+  const ref = parseModel(engine.cfg, model)
+  const h = snapshot(req.headers)
+  const admitted = engine.gov.admit(h, ref.provider, ref.model)
+  if (admitted.kind === "denial") return { kind: "refused", status: admitted.status, message: admitted.message }
+  const none: Set<int> = new Set()
+  const sel = target(engine.cfg, ref, none, req.headers.get("x-bf-api-key") ?? undefined)
+  if (sel === undefined) return { kind: "refused", status: 404, message: `no key is configured for ${ref.provider}/${ref.model}` }
+  if (sel.t.kind !== "openai" && sel.t.kind !== "azure") return { kind: "refused", status: 400, message: `${ref.provider} has no realtime API this gateway can relay` }
+  const up = upstreamFor(sel.t, req.headers.get("openai-beta") ?? undefined)
+  return { kind: "session", session: new Session(up.url, up.headers, ref.provider, ref.model) }
+}
+
+function labels(s: Session): string {
+  return metrics.labels(s.provider, s.model, "open")
+}
+
+export function onOpen(ws: ServerWebSocket<Session>): void {
+  const s = ws.data
+  if (s === undefined) return
+  metrics.addGauge("raiju_realtime_sessions", labels(s), 1.0)
+  try {
+    const hs: Record<string, string> = {}
+    for (const k of s.headers.keys()) hs.set(k, s.headers.get(k)!)
+    const up = new WebSocket(s.url, { headers: hs })
+    up.onmessage = (ev) => {
+      ws.send(ev.data)
+    }
+    up.onclose = (ev) => {
+      ws.close(ev.code === 1005 || ev.code === 1006 ? 1011 : ev.code, ev.reason)
+    }
+    up.onerror = (ev) => {
+      ws.close(1011, "upstream realtime connection failed")
+    }
+    s.upstream = up
+  } catch (e) {
+    ws.close(1011, e.message)
+  }
+}
+
+export function onMessage(ws: ServerWebSocket<Session>, m: string | u8[]): void {
+  const up = ws.data?.upstream
+  if (up !== undefined) up.send(m)
+}
+
+export function onClose(ws: ServerWebSocket<Session>): void {
+  const s = ws.data
+  if (s === undefined) return
+  metrics.addGauge("raiju_realtime_sessions", labels(s), -1.0)
+  const up = s.upstream
+  if (up !== undefined && up.readyState < 2) up.close()
+}
+
+test("realtime upstream URLs", () => {
+  const t: Target = { provider: "openai", kind: "openai", model: "gpt-realtime", key: { value: "sk" }, cfg: {} }
+  const u = upstreamFor(t, "realtime=v1")
+  expect(u.url).toBe("wss://api.openai.com/v1/realtime?model=gpt-realtime")
+  expect(u.headers.get("authorization")).toBe("Bearer sk")
+  expect(u.headers.get("openai-beta")).toBe("realtime=v1")
+  const deps: Map<string, string> = new Map()
+  deps.set("gpt-realtime", "rt-prod")
+  const az: Target = { provider: "azure", kind: "azure", model: "gpt-realtime", key: { value: "ak", azure_key_config: { endpoint: "https://x.openai.azure.com/", deployments: deps, api_version: "2025-04-01-preview" } }, cfg: {} }
+  expect(upstreamFor(az, undefined).url).toBe("wss://x.openai.azure.com/openai/realtime?api-version=2025-04-01-preview&deployment=rt-prod")
+})

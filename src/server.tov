@@ -1,0 +1,167 @@
+// HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
+// metrics, health and a read-only management API.
+import { Config, providerOf, providerNames } from "./config"
+import { Engine, errorResponse, noHeaders } from "./gateway"
+import { anthropicMessages, genai, bedrockModel } from "./native"
+import { kindOf } from "./router"
+import { Target, Upstream } from "./providers/types"
+import * as openai from "./providers/openai"
+import * as anthropic from "./providers/anthropic"
+import * as gemini from "./providers/gemini"
+import { fields, find, elements, rawStr } from "./json"
+import * as metrics from "./metrics"
+import { Session, prepare, onOpen, onMessage, onClose } from "./realtime"
+
+type ModelEntry = { id: string, object: string, created: int, owned_by: string }
+
+class ModelCache {
+  ids: Map<string, string[]> = new Map()
+  fetchedAt: Map<string, f64> = new Map()
+}
+
+const modelCache = new ModelCache()
+
+function upstreamModels(provider: string, kind: string, t: Target): Upstream | undefined {
+  if (openai.isOpenAICompatible(kind)) return openai.modelsRequest(t)
+  if (kind === "anthropic") {
+    const base = t.cfg.network_config?.base_url ?? "https://api.anthropic.com"
+    return { url: base + "/v1/models?limit=1000", headers: anthropic.upstreamHeaders(t), body: "" }
+  }
+  if (kind === "gemini") {
+    const base = t.cfg.network_config?.base_url ?? "https://generativelanguage.googleapis.com"
+    return { url: base + "/v1beta/models?pageSize=1000", headers: gemini.upstreamHeaders(t), body: "" }
+  }
+  return undefined
+}
+
+async function providerModels(cfg: Config, provider: string): Promise<string[]> {
+  const p = providerOf(cfg, provider)
+  if (p === undefined) return []
+  const listed: string[] = []
+  for (const k of p.keys ?? []) {
+    for (const m of k.models ?? []) {
+      if (m !== "*" && !listed.includes(provider + "/" + m)) listed.push(provider + "/" + m)
+    }
+  }
+  if (listed.length > 0) return listed
+  const cachedAt = modelCache.fetchedAt.get(provider) ?? 0.0
+  if (Date.now() - cachedAt < 300000.0) return modelCache.ids.get(provider) ?? []
+  const kind = kindOf(provider, p)
+  const key = (p.keys ?? [])[0] ?? { value: "" }
+  const up = upstreamModels(provider, kind, { provider: provider, kind: kind, model: "", key: key, cfg: p })
+  if (up === undefined) return []
+  let ids: string[] = []
+  try {
+    const hs = new Headers()
+    for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+    const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+    const text = await res.text()
+    if (res.ok) ids = openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/"))
+  } catch (e) {
+    ids = []
+  }
+  modelCache.ids.set(provider, ids)
+  modelCache.fetchedAt.set(provider, Date.now())
+  return ids
+}
+
+async function listModels(engine: Engine, req: Request): Promise<Response> {
+  const only = req.headers.get("x-bf-list-models-provider") ?? req.headers.get("x-bf-model-provider") ?? "all"
+  const names = providerNames(engine.cfg).filter((n) => only === "all" || n === only)
+  const lists = await Promise.all(names.map((n) => providerModels(engine.cfg, n)))
+  const data: ModelEntry[] = []
+  for (let i = 0; i < names.length; i++) {
+    for (const id of lists[i]!) data.push({ id: id, object: "model", created: 0, owned_by: names[i]! })
+  }
+  return Response.json({ object: "list", data: data })
+}
+
+// Providers and keys with secrets removed.
+function providersView(cfg: Config): Response {
+  const out: { name: string, kind: string, keys: { name: string, models: string[], weight: f64 }[], base_url: string }[] = []
+  const ps = cfg.providers
+  if (ps !== undefined) {
+    for (const name of ps.keys()) {
+      const p = ps.get(name)!
+      out.push({
+        name: name,
+        kind: kindOf(name, p),
+        keys: (p.keys ?? []).map((k) => ({ name: k.name ?? k.id ?? "", models: k.models ?? [], weight: k.weight ?? 1.0 })),
+        base_url: p.network_config?.base_url ?? "",
+      })
+    }
+  }
+  return Response.json({ providers: out })
+}
+
+function cacheView(engine: Engine): Response {
+  const c = engine.cache
+  if (c === undefined) return Response.json({ enabled: false, entries: 0, hits: 0, misses: 0 })
+  return Response.json({ enabled: true, entries: c.entries.size, hits: c.hits, misses: c.misses })
+}
+
+function cors(cfg: Config, req: Request, res: Response): Response {
+  const origins = cfg.client?.allowed_origins ?? []
+  const origin = req.headers.get("origin")
+  if (origin === undefined || origins.length === 0) return res
+  if (origins.includes("*") || origins.includes(origin)) {
+    res.headers.set("access-control-allow-origin", origin)
+    res.headers.set("vary", "origin")
+  }
+  return res
+}
+
+export type ServeOptions = { port: int, hostname: string, workers: int }
+
+export function start(engine: Engine, opts: ServeOptions): string {
+  const cfg = engine.cfg
+  const server = Bun.serve<Session>({
+    port: opts.port,
+    hostname: opts.hostname,
+    workers: opts.workers,
+    routes: {
+      "/health": () => Response.json({ status: "ok" }),
+      "/metrics": () => new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4" } }),
+
+      "/v1/chat/completions": { POST: async (req) => cors(cfg, req, await engine.chat(req)) },
+      "/openai/v1/chat/completions": { POST: async (req) => cors(cfg, req, await engine.chat(req)) },
+      "/openai/chat/completions": { POST: async (req) => cors(cfg, req, await engine.chat(req)) },
+      "/openai/deployments/:deployment/chat/completions": { POST: async (req) => cors(cfg, req, await engine.chat(req)) },
+      "/v1/embeddings": { POST: async (req) => cors(cfg, req, await engine.embeddings(req)) },
+      "/openai/v1/embeddings": { POST: async (req) => cors(cfg, req, await engine.embeddings(req)) },
+      "/v1/completions": { POST: async (req) => cors(cfg, req, await engine.completions(req)) },
+      "/openai/v1/completions": { POST: async (req) => cors(cfg, req, await engine.completions(req)) },
+      "/v1/models": { GET: async (req) => cors(cfg, req, await listModels(engine, req)) },
+      "/openai/v1/models": { GET: async (req) => cors(cfg, req, await listModels(engine, req)) },
+
+      "/anthropic/v1/messages": { POST: async (req) => cors(cfg, req, await anthropicMessages(engine, req)) },
+      "/genai/v1beta/models/:modelAction": { POST: async (req) => cors(cfg, req, await genai(engine, req, req.params.modelAction)) },
+      "/bedrock/model/:modelId/:action": { POST: async (req) => cors(cfg, req, await bedrockModel(engine, req, req.params.modelId, req.params.action)) },
+
+      "/api/providers": { GET: () => providersView(cfg) },
+      "/api/governance/budgets": { GET: () => Response.json({ budgets: engine.gov.budgetUsage() }) },
+      "/api/cache": { GET: () => cacheView(engine) },
+    },
+    fetch(req, server) {
+      const u = URL.parse(req.url)
+      const p = u === undefined ? "" : u.pathname
+      if (p === "/v1/realtime" || p === "/openai/v1/realtime") {
+        const up = prepare(engine, req)
+        if (up.kind === "refused") return errorResponse(up.status, up.message, "invalid_request_error", noHeaders())
+        if (server.upgrade(req, { data: up.session })) return
+        return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
+      }
+      if (req.method === "OPTIONS") {
+        const res = new Response(undefined, { status: 204, headers: { "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "*", "access-control-max-age": "86400" } })
+        return cors(cfg, req, res)
+      }
+      return errorResponse(404, `no route for ${req.method} ${req.url}`, "invalid_request_error", noHeaders())
+    },
+    websocket: {
+      open: (ws) => onOpen(ws),
+      message: (ws, m) => onMessage(ws, m),
+      close: (ws) => onClose(ws),
+    },
+  })
+  return server.url.href
+}

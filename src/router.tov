@@ -1,0 +1,162 @@
+// Turns "provider/model" plus fallbacks into attempts: picks a provider config
+// and a weighted key for each, and decides what to retry.
+import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
+import { Target } from "./providers/types"
+import { isOpenAICompatible } from "./providers/openai"
+
+export type ModelRef = { provider: string, model: string }
+
+const NATIVE_KINDS = ["azure", "anthropic", "gemini"]
+
+export function isKnownKind(kind: string): bool {
+  return NATIVE_KINDS.includes(kind) || isOpenAICompatible(kind)
+}
+
+// "openai/gpt-4o" → openai + gpt-4o. A bare model is looked up in the keys'
+// model lists, then defaults to OpenAI.
+export function parseModel(cfg: Config, s: string): ModelRef {
+  const i = s.indexOf("/")
+  if (i > 0) {
+    const p = s.slice(0, i)
+    const ps = cfg.providers
+    if ((ps !== undefined && ps.has(p)) || isKnownKind(p)) return { provider: p, model: s.slice(i + 1) }
+  }
+  const ps = cfg.providers
+  if (ps !== undefined) {
+    for (const name of ps.keys()) {
+      for (const k of ps.get(name)!.keys ?? []) {
+        if ((k.models ?? []).includes(s)) return { provider: name, model: s }
+      }
+    }
+    if (s.startsWith("claude") && ps.has("anthropic")) return { provider: "anthropic", model: s }
+    if (s.startsWith("gemini") && ps.has("gemini")) return { provider: "gemini", model: s }
+  }
+  return { provider: "openai", model: s }
+}
+
+export function kindOf(name: string, p: ProviderConfig): string {
+  const custom = p.custom_provider_config
+  if (custom !== undefined) return custom.base_provider_type
+  return name
+}
+
+export function keyAllows(k: KeyConfig, model: string): bool {
+  const ms = k.models
+  if (ms === undefined || ms.length === 0) return true
+  for (const m of ms) {
+    if (m === "*" || m === model) return true
+  }
+  return false
+}
+
+// Weighted random choice among keys that serve the model, skipping excluded ones.
+export function pickKey(keys: KeyConfig[], model: string, exclude: Set<int>, pinned: string | undefined): int {
+  if (pinned !== undefined) {
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i]!
+      if (k.name === pinned || k.id === pinned) return i
+    }
+    return -1
+  }
+  let total = 0.0
+  const eligible: int[] = []
+  for (let i = 0; i < keys.length; i++) {
+    if (exclude.has(i) || !keyAllows(keys[i]!, model)) continue
+    eligible.push(i)
+    total += keys[i]!.weight ?? 1.0
+  }
+  if (eligible.length === 0) return -1
+  let r = Math.random() * total
+  for (const i of eligible) {
+    r -= keys[i]!.weight ?? 1.0
+    if (r <= 0.0) return i
+  }
+  return eligible[eligible.length - 1]!
+}
+
+export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: string | undefined): { t: Target, keyIndex: int } | undefined {
+  const p = providerOf(cfg, ref.provider)
+  if (p === undefined) return undefined
+  const kind = kindOf(ref.provider, p)
+  const keys = p.keys ?? []
+  const keyless = p.custom_provider_config?.is_key_less ?? false
+  if (keys.length === 0) {
+    if (!keyless && kind !== "ollama" && kind !== "vllm" && kind !== "sgl" && kind !== "lmstudio") return undefined
+    return { t: { provider: ref.provider, kind: kind, model: ref.model, key: { value: "" }, cfg: p }, keyIndex: -1 }
+  }
+  const i = pickKey(keys, ref.model, exclude, pinned)
+  if (i < 0) return undefined
+  return { t: { provider: ref.provider, kind: kind, model: ref.model, key: keys[i]!, cfg: p }, keyIndex: i }
+}
+
+// How an upstream failure is handled.
+export type Disposition = "retry" | "rotate" | "fallback" | "fail"
+
+export function classify(status: int): Disposition {
+  if (status === 429 || status === 408 || status >= 500) return "retry"
+  if (status === 401 || status === 403 || status === 402) return "rotate"
+  if (status === 400 || status === 422 || status === 413) return "fail"
+  return "fallback"
+}
+
+export function backoffMs(p: ProviderConfig, attempt: int, retryAfter: string | undefined): int {
+  if (retryAfter !== undefined) {
+    const secs = parseFloat(retryAfter)
+    if (secs !== undefined && secs >= 0.0) return Math.min(Math.round(secs * 1000), 60000)
+  }
+  const initial = p.network_config?.retry_backoff_initial ?? 500
+  const max = p.network_config?.retry_backoff_max ?? 5000
+  let d = initial
+  for (let i = 0; i < attempt; i++) d = d * 2
+  if (d > max) d = max
+  // 0.8 to 1.2 jitter, as Bifrost does
+  return Math.round(d * (0.8 + Math.random() * 0.4))
+}
+
+export function maxRetries(p: ProviderConfig): int {
+  return p.network_config?.max_retries ?? 0
+}
+
+export function timeoutMs(p: ProviderConfig): int {
+  return (p.network_config?.default_request_timeout_in_seconds ?? 30) * 1000
+}
+
+test("parses provider-prefixed and bare models", () => {
+  const cfg: Config = { providers: new Map() }
+  cfg.providers!.set("anthropic", { keys: [{ value: "k" }] })
+  cfg.providers!.set("mygw", { keys: [{ value: "k", models: ["special-1"] }], custom_provider_config: { base_provider_type: "openai" } })
+  expect(parseModel(cfg, "openai/gpt-4o")).toEqual({ provider: "openai", model: "gpt-4o" })
+  expect(parseModel(cfg, "mygw/x/y")).toEqual({ provider: "mygw", model: "x/y" })
+  expect(parseModel(cfg, "special-1")).toEqual({ provider: "mygw", model: "special-1" })
+  expect(parseModel(cfg, "claude-sonnet-4")).toEqual({ provider: "anthropic", model: "claude-sonnet-4" })
+  expect(parseModel(cfg, "meta-llama/Llama-3")).toEqual({ provider: "openai", model: "meta-llama/Llama-3" })
+})
+
+test("weighted key choice respects models and exclusions", () => {
+  const keys: KeyConfig[] = [{ value: "a", models: ["m1"], weight: 1.0 }, { value: "b", weight: 3.0 }, { value: "c", name: "pin", weight: 0.0 }]
+  const none: Set<int> = new Set()
+  let b = 0
+  for (let i = 0; i < 2000; i++) {
+    const k = pickKey(keys, "m1", none, undefined)
+    if (k === 1) b += 1
+  }
+  // b has 3/4 of the weight for m1
+  expect(b > 1300 && b < 1700).toBe(true)
+  expect(pickKey(keys, "m2", none, undefined)).toBe(1)
+  const ex: Set<int> = new Set()
+  ex.add(1)
+  expect(pickKey(keys, "m2", ex, undefined)).toBe(2)
+  expect(pickKey(keys, "m2", none, "pin")).toBe(2)
+})
+
+test("classifies failures and backs off", () => {
+  expect(classify(429)).toBe("retry")
+  expect(classify(503)).toBe("retry")
+  expect(classify(401)).toBe("rotate")
+  expect(classify(400)).toBe("fail")
+  expect(classify(404)).toBe("fallback")
+  const p: ProviderConfig = { network_config: { retry_backoff_initial: 100, retry_backoff_max: 300 } }
+  const d = backoffMs(p, 3, undefined)
+  expect(d >= 240 && d <= 360).toBe(true)
+  expect(backoffMs(p, 0, "2")).toBe(2000)
+})

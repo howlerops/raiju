@@ -1,0 +1,128 @@
+// Drop-in SDK routes: requests in a provider's own format, forwarded with
+// governance, retries, fallbacks across keys, metrics and cost tracking.
+import { Field, fields, find, quote, build, isNull } from "./json"
+import { Engine, Build, Translate, errorResponse, noHeaders } from "./gateway"
+import { Target, Translated } from "./providers/types"
+import * as anthropic from "./providers/anthropic"
+import * as gemini from "./providers/gemini"
+import * as bedrock from "./providers/bedrock"
+
+type AUsage = { input_tokens?: int, output_tokens?: int, cache_read_input_tokens?: int, cache_creation_input_tokens?: int }
+type AUsageHolder = { usage?: AUsage, message?: { usage?: AUsage } }
+
+// Token counts from a Messages response, or from its SSE events.
+export function anthropicUsage(text: string, streamed: bool): Translated {
+  let pt = 0
+  let ct = 0
+  const payloads: string[] = []
+  if (streamed) {
+    for (const line of text.split("\n")) {
+      if (line.startsWith("data: ") && line.includes("usage")) payloads.push(line.slice(6))
+    }
+  } else payloads.push(text)
+  for (const p of payloads) {
+    try {
+      const h = JSON.parse(p) as AUsageHolder
+      const u = h.usage ?? h.message?.usage
+      if (u !== undefined) {
+        const input = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
+        if (input > 0) pt = input
+        if ((u.output_tokens ?? 0) > 0) ct = u.output_tokens ?? 0
+      }
+    } catch (e) {
+      // events without usage are skipped
+    }
+  }
+  return { body: text, promptTokens: pt, completionTokens: ct }
+}
+
+type GUsage = { usageMetadata?: { promptTokenCount?: int, candidatesTokenCount?: int, thoughtsTokenCount?: int } }
+
+export function geminiUsage(text: string, streamed: bool): Translated {
+  let pt = 0
+  let ct = 0
+  const payloads: string[] = streamed ? text.split("\n").filter((l) => l.startsWith("data: ")).map((l) => l.slice(6)) : [text]
+  for (const p of payloads) {
+    try {
+      const u = (JSON.parse(p) as GUsage).usageMetadata
+      if (u !== undefined) {
+        pt = u.promptTokenCount ?? pt
+        ct = (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0)
+      }
+    } catch (e) {
+      // skipped
+    }
+  }
+  return { body: text, promptTokens: pt, completionTokens: ct }
+}
+
+type BUsage = { usage?: { inputTokens?: int, outputTokens?: int }, input_tokens?: int }
+
+export function bedrockUsage(text: string): Translated {
+  try {
+    const u = (JSON.parse(text) as BUsage).usage
+    if (u !== undefined) return { body: text, promptTokens: u.inputTokens ?? 0, completionTokens: u.outputTokens ?? 0 }
+  } catch (e) {
+    // not JSON with usage
+  }
+  return anthropicUsage(text, false)
+}
+
+// Bedrock's InvokeModel takes Anthropic's body without model or stream, plus a version.
+function bedrockAnthropicBody(body: Field[]): string {
+  const fs = body.filter((f) => f.key !== "model" && f.key !== "stream" && f.key !== "anthropic_version")
+  fs.unshift({ key: "anthropic_version", raw: quote("bedrock-2023-05-31") })
+  return build(fs)
+}
+
+export async function anthropicMessages(engine: Engine, req: Request): Promise<Response> {
+  const text = await req.text()
+  let body: Field[] = []
+  try {
+    body = fields(text)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const stream = find(body, "stream") === "true"
+  const build: Build = (t) => {
+    if (t.kind === "anthropic") return anthropic.nativeRequest(t, body)
+    if (t.kind === "bedrock" && !stream) return bedrock.signedRequest(t, "invoke", bedrockAnthropicBody(body))
+    throw new SyntaxError(`/anthropic/v1/messages can't route to ${t.provider} yet; use /v1/chat/completions`)
+  }
+  const translate: Translate = (t, text, requested) => t.kind === "bedrock" ? bedrockUsage(text) : anthropicUsage(text, stream)
+  return await engine.serve(req, "anthropic.messages", undefined, body, text, build, translate, stream)
+}
+
+// /genai/v1beta/models/{model}:{method}
+export async function genai(engine: Engine, req: Request, modelAction: string): Promise<Response> {
+  const parts = modelAction.split(":")
+  if (parts.length < 2) return errorResponse(404, "expected models/{model}:{method}", "invalid_request_error", noHeaders())
+  const method = parts[parts.length - 1]!
+  const model = parts.slice(0, parts.length - 1).join(":")
+  const text = await req.text()
+  const stream = method === "streamGenerateContent"
+  const full = model.includes("/") ? model : "gemini/" + model
+  const build: Build = (t) => {
+    if (t.kind !== "gemini") throw new SyntaxError(`/genai routes go to Gemini, not ${t.provider}`)
+    const up = gemini.nativeRequest(t, method, text)
+    if (stream) up.url = up.url + "?alt=sse"
+    return up
+  }
+  const translate: Translate = (t, text, requested) => geminiUsage(text, stream)
+  return await engine.serve(req, "genai." + method, full, [], text, build, translate, stream)
+}
+
+// /bedrock/model/{modelId}/{converse|invoke}
+export async function bedrockModel(engine: Engine, req: Request, modelId: string, action: string): Promise<Response> {
+  if (action !== "converse" && action !== "invoke") return errorResponse(404, `${action} isn't supported; use converse or invoke`, "invalid_request_error", noHeaders())
+  const text = await req.text()
+  // percent-decoded through URLSearchParams (model ids never contain "+")
+  const id = new URLSearchParams("id=" + modelId).get("id") ?? modelId
+  const full = id.startsWith("bedrock/") ? id : "bedrock/" + id
+  const build: Build = (t) => {
+    if (t.kind !== "bedrock") throw new SyntaxError(`/bedrock routes go to Bedrock, not ${t.provider}`)
+    return bedrock.signedRequest(t, action, text)
+  }
+  const translate: Translate = (t, text, requested) => bedrockUsage(text)
+  return await engine.serve(req, "bedrock." + action, full, [], text, build, translate, false)
+}

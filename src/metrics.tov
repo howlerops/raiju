@@ -1,0 +1,149 @@
+// Prometheus metrics, exposed at GET /metrics in the text exposition format.
+// Names follow Bifrost's (bifrost_*) so existing dashboards keep working.
+
+const BUCKETS: f64[] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]
+
+class Histogram {
+  counts: int[] = []
+  sum = 0.0
+  count = 0
+  constructor() {
+    for (const _b of BUCKETS) this.counts.push(0)
+  }
+  observe(v: f64): void {
+    for (let i = 0; i < BUCKETS.length; i++) {
+      if (v <= BUCKETS[i]!) this.counts[i] = this.counts[i]! + 1
+    }
+    this.sum += v
+    this.count += 1
+  }
+}
+
+class Registry {
+  counters: Map<string, f64> = new Map()
+  histograms: Map<string, Histogram> = new Map()
+  gauges: Map<string, f64> = new Map()
+}
+
+const reg = new Registry()
+
+function esc(v: string): string {
+  if (!v.includes("\\") && !v.includes("\"") && !v.includes("\n")) return v
+  return v.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("\n", "\\n")
+}
+
+function seriesKey(name: string, labels: string): string {
+  return name + "{" + labels + "}"
+}
+
+export function inc(name: string, labels: string, by: f64): void {
+  const k = seriesKey(name, labels)
+  reg.counters.set(k, (reg.counters.get(k) ?? 0.0) + by)
+}
+
+export function setGauge(name: string, labels: string, v: f64): void {
+  reg.gauges.set(seriesKey(name, labels), v)
+}
+
+export function addGauge(name: string, labels: string, by: f64): void {
+  const k = seriesKey(name, labels)
+  reg.gauges.set(k, (reg.gauges.get(k) ?? 0.0) + by)
+}
+
+export function observe(name: string, labels: string, v: f64): void {
+  const k = seriesKey(name, labels)
+  let h = reg.histograms.get(k)
+  if (h === undefined) {
+    const nh = new Histogram()
+    reg.histograms.set(k, nh)
+    h = nh
+  }
+  h.observe(v)
+}
+
+function splitKey(k: string): { name: string, labels: string } {
+  const i = k.indexOf("{")
+  return { name: k.slice(0, i), labels: k.slice(i + 1, k.byteLength - 1) }
+}
+
+function withLabel(labels: string, extra: string): string {
+  if (labels === "") return "{" + extra + "}"
+  return "{" + labels + "," + extra + "}"
+}
+
+function braces(labels: string): string {
+  return labels === "" ? "" : "{" + labels + "}"
+}
+
+class Overhead {
+  sum = 0.0
+  count = 0
+}
+const overhead = new Overhead()
+
+// Gateway overhead per request in microseconds (handler time minus upstream time).
+export function observeOverhead(us: f64): void {
+  overhead.sum += us
+  overhead.count += 1
+}
+
+export function render(): string {
+  const out: string[] = []
+  out.push("# TYPE bifrost_overhead_latency_microseconds summary")
+  out.push(`bifrost_overhead_latency_microseconds_sum ${overhead.sum}`)
+  out.push(`bifrost_overhead_latency_microseconds_count ${overhead.count}`)
+  const typed: Set<string> = new Set()
+  for (const k of reg.counters.keys()) {
+    const s = splitKey(k)
+    if (!typed.has(s.name)) {
+      out.push(`# TYPE ${s.name} counter`)
+      typed.add(s.name)
+    }
+    out.push(`${s.name}${braces(s.labels)} ${reg.counters.get(k) ?? 0.0}`)
+  }
+  for (const k of reg.gauges.keys()) {
+    const s = splitKey(k)
+    if (!typed.has(s.name)) {
+      out.push(`# TYPE ${s.name} gauge`)
+      typed.add(s.name)
+    }
+    out.push(`${s.name}${braces(s.labels)} ${reg.gauges.get(k) ?? 0.0}`)
+  }
+  for (const k of reg.histograms.keys()) {
+    const s = splitKey(k)
+    const h = reg.histograms.get(k)!
+    if (!typed.has(s.name)) {
+      out.push(`# TYPE ${s.name} histogram`)
+      typed.add(s.name)
+    }
+    for (let i = 0; i < BUCKETS.length; i++) {
+      out.push(`${s.name}_bucket${withLabel(s.labels, `le="${BUCKETS[i]!}"`)} ${h.counts[i]!}`)
+    }
+    out.push(`${s.name}_bucket${withLabel(s.labels, `le="+Inf"`)} ${h.count}`)
+    out.push(`${s.name}_sum${braces(s.labels)} ${h.sum}`)
+    out.push(`${s.name}_count${braces(s.labels)} ${h.count}`)
+  }
+  return out.join("\n") + "\n"
+}
+
+const labelCache: Map<string, string> = new Map()
+
+// The rendered label set for a provider, model and status, built once per combination.
+export function labels(provider: string, model: string, status: string): string {
+  const k = provider + "\u0000" + model + "\u0000" + status
+  const hit = labelCache.get(k)
+  if (hit !== undefined) return hit
+  const text = `provider="${esc(provider)}",model="${esc(model)}",status="${esc(status)}"`
+  if (labelCache.size < 100000) labelCache.set(k, text)
+  return text
+}
+
+test("render counters and histograms", () => {
+  inc("bifrost_upstream_requests_total", labels("openai", "gpt-4o", "success"), 1.0)
+  inc("bifrost_upstream_requests_total", labels("openai", "gpt-4o", "success"), 1.0)
+  observe("bifrost_upstream_latency_seconds", labels("openai", "gpt-4o", "success"), 0.2)
+  const text = render()
+  expect(text.includes(`bifrost_upstream_requests_total{provider="openai",model="gpt-4o",status="success"} 2`)).toBe(true)
+  expect(text.includes(`bifrost_upstream_latency_seconds_bucket{provider="openai",model="gpt-4o",status="success",le="0.25"} 1`)).toBe(true)
+  expect(text.includes(`bifrost_upstream_latency_seconds_count{provider="openai",model="gpt-4o",status="success"} 1`)).toBe(true)
+})

@@ -1,0 +1,236 @@
+// Virtual keys, budgets and rate limits, with Bifrost's Customer → Team → VK
+// hierarchy. State is in memory, per process.
+import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig } from "./config"
+import { Hdrs, hdrs } from "./schemas"
+
+// "30s", "5m", "1h", "1d", "1w", "1M" (30 days), "1Q", "1Y" in milliseconds.
+export function durationMs(s: string): int {
+  let i = 0
+  while (i < s.byteLength && "0123456789".includes(s.slice(i, i + 1))) i += 1
+  const n = parseInt(s.slice(0, i)) ?? 1
+  const unit = s.slice(i)
+  if (unit === "s") return n * 1000
+  if (unit === "m") return n * 60000
+  if (unit === "h") return n * 3600000
+  if (unit === "d") return n * 86400000
+  if (unit === "w") return n * 604800000
+  if (unit === "M") return n * 2592000000
+  if (unit === "Q") return n * 7776000000
+  if (unit === "Y") return n * 31536000000
+  return n * 60000
+}
+
+class Window {
+  used = 0.0
+  start = 0.0
+  constructor(readonly limit: f64, readonly periodMs: int) {}
+  roll(now: f64): void {
+    if (now - this.start >= this.periodMs) {
+      this.start = now
+      this.used = 0.0
+    }
+  }
+  remaining(now: f64): f64 {
+    this.roll(now)
+    return this.limit - this.used
+  }
+  add(now: f64, by: f64): void {
+    this.roll(now)
+    this.used += by
+  }
+}
+
+class Limits {
+  requests: Window | undefined = undefined
+  tokens: Window | undefined = undefined
+}
+
+export type Denial = { kind: "denial", status: int, type: string, message: string }
+
+// What a request is allowed to do once its virtual key checks out.
+export type Grant = { kind: "grant", vk: VirtualKeyConfig | undefined, budgets: string[], rateLimits: string[] }
+
+export class Governance {
+  vks: Map<string, VirtualKeyConfig> = new Map()
+  budgets: Map<string, Window> = new Map()
+  limits: Map<string, Limits> = new Map()
+  teams: Map<string, { budget?: string, customer?: string }> = new Map()
+  customers: Map<string, string | undefined> = new Map()
+  enforce = false
+
+  constructor(cfg: Config) {
+    this.enforce = cfg.client?.enforce_governance_header ?? false
+    const g = cfg.governance
+    if (g === undefined) return
+    for (const b of g.budgets ?? []) {
+      const w = new Window(b.max_limit, durationMs(b.reset_duration))
+      w.used = b.current_usage ?? 0.0
+      w.start = Date.now()
+      this.budgets.set(b.id, w)
+    }
+    for (const r of g.rate_limits ?? []) this.addRateLimit(r)
+    for (const vk of g.virtual_keys ?? []) this.vks.set(vk.value, vk)
+    for (const t of g.teams ?? []) this.teams.set(t.id, { budget: t.budget_id, customer: t.customer_id })
+    for (const c of g.customers ?? []) this.customers.set(c.id, c.budget_id)
+  }
+
+  addRateLimit(r: RateLimitConfig): void {
+    const l = new Limits()
+    const rm = r.request_max_limit
+    if (rm !== undefined) l.requests = new Window(rm, durationMs(r.request_reset_duration ?? "1m"))
+    const tm = r.token_max_limit
+    if (tm !== undefined) l.tokens = new Window(tm, durationMs(r.token_reset_duration ?? "1m"))
+    this.limits.set(r.id, l)
+  }
+
+  // Finds the virtual key in any header an SDK might carry it in.
+  findKey(h: Hdrs): VirtualKeyConfig | undefined {
+    const candidates: string[] = []
+    const direct = h.get("x-bf-vk")
+    if (direct !== undefined) candidates.push(direct)
+    const auth = h.get("authorization")
+    if (auth !== undefined && auth.startsWith("Bearer ")) candidates.push(auth.slice(7))
+    for (const name of ["x-api-key", "x-goog-api-key", "api-key"]) {
+      const v = h.get(name)
+      if (v !== undefined) candidates.push(v)
+    }
+    for (const c of candidates) {
+      const vk = this.vks.get(c.trim())
+      if (vk !== undefined) return vk
+    }
+    return undefined
+  }
+
+  // Checks the key, the provider and model it may use, and every limit above it.
+  admit(h: Hdrs, provider: string, model: string): Grant | Denial {
+    const vk = this.findKey(h)
+    if (vk === undefined) {
+      if (this.enforce) return { kind: "denial", status: 401, type: "authentication_error", message: "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)" }
+      const empty: string[] = []
+      return { kind: "grant", vk: undefined, budgets: empty, rateLimits: empty }
+    }
+    if (vk.is_active === false) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} is inactive` }
+    const budgets: string[] = []
+    const rateLimits: string[] = []
+    const pcs = vk.provider_configs ?? []
+    if (pcs.length > 0) {
+      let allowed = false
+      for (const pc of pcs) {
+        if (pc.provider !== provider) continue
+        const am = pc.allowed_models ?? []
+        if (am.length === 0 || am.includes(model) || am.includes("*")) {
+          allowed = true
+          if (pc.budget_id !== undefined) budgets.push(pc.budget_id)
+          if (pc.rate_limit_id !== undefined) rateLimits.push(pc.rate_limit_id)
+        }
+      }
+      if (!allowed) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} may not use ${provider}/${model}` }
+    }
+    if (vk.budget_id !== undefined) budgets.push(vk.budget_id)
+    if (vk.rate_limit_id !== undefined) rateLimits.push(vk.rate_limit_id)
+    let customer = vk.customer_id
+    if (vk.team_id !== undefined) {
+      const t = this.teams.get(vk.team_id)
+      if (t !== undefined) {
+        if (t.budget !== undefined) budgets.push(t.budget)
+        if (customer === undefined) customer = t.customer
+      }
+    }
+    if (customer !== undefined) {
+      const cb = this.customers.get(customer)
+      if (cb !== undefined) budgets.push(cb)
+    }
+    const now = Date.now()
+    for (const id of budgets) {
+      const b = this.budgets.get(id)
+      if (b !== undefined && b.remaining(now) <= 0.0) return { kind: "denial", status: 402, type: "budget_exceeded", message: `budget ${id} is used up until it resets` }
+    }
+    for (const id of rateLimits) {
+      const l = this.limits.get(id)
+      if (l === undefined) continue
+      const r = l.requests
+      if (r !== undefined && r.remaining(now) < 1.0) return { kind: "denial", status: 429, type: "rate_limit_exceeded", message: `request rate limit ${id} reached` }
+      const t = l.tokens
+      if (t !== undefined && t.remaining(now) <= 0.0) return { kind: "denial", status: 429, type: "rate_limit_exceeded", message: `token rate limit ${id} reached` }
+    }
+    for (const id of rateLimits) {
+      const r = this.limits.get(id)?.requests
+      if (r !== undefined) r.add(now, 1.0)
+    }
+    return { kind: "grant", vk: vk, budgets: budgets, rateLimits: rateLimits }
+  }
+
+  // Debits cost from every budget and tokens from every token limit.
+  record(g: Grant, tokens: int, cost: f64): void {
+    const now = Date.now()
+    for (const id of g.budgets) {
+      const b = this.budgets.get(id)
+      if (b !== undefined) b.add(now, cost)
+    }
+    for (const id of g.rateLimits) {
+      const t = this.limits.get(id)?.tokens
+      if (t !== undefined) t.add(now, tokens)
+    }
+  }
+
+  budgetUsage(): { id: string, used: f64, limit: f64 }[] {
+    const out: { id: string, used: f64, limit: f64 }[] = []
+    for (const id of this.budgets.keys()) {
+      const b = this.budgets.get(id)!
+      out.push({ id: id, used: b.used, limit: b.limit })
+    }
+    return out
+  }
+}
+
+export function isDenial(x: Grant | Denial): bool {
+  return x.kind === "denial"
+}
+
+function govConfig(): Config {
+  return {
+    client: { enforce_governance_header: true },
+    governance: {
+      budgets: [{ id: "b-team", max_limit: 1.0, reset_duration: "1d" }, { id: "b-vk", max_limit: 10.0, reset_duration: "1M" }],
+      rate_limits: [{ id: "rl", request_max_limit: 2, request_reset_duration: "1m" }],
+      teams: [{ id: "t1", name: "core", budget_id: "b-team" }],
+      virtual_keys: [
+        { id: "vk1", value: "sk-bf-one", team_id: "t1", budget_id: "b-vk", rate_limit_id: "rl", provider_configs: [{ provider: "openai", allowed_models: ["gpt-4o-mini"] }] },
+        { id: "vk2", value: "sk-bf-off", is_active: false },
+      ],
+    },
+  }
+}
+
+test("durations", () => {
+  expect(durationMs("30s")).toBe(30000)
+  expect(durationMs("1h")).toBe(3600000)
+  expect(durationMs("1M")).toBe(2592000000)
+})
+
+test("virtual key admission and limits", () => {
+  const g = new Governance(govConfig())
+  const none = hdrs([])
+  const a = g.admit(none, "openai", "gpt-4o-mini")
+  expect(isDenial(a)).toBe(true)
+  const h = hdrs([["authorization", "Bearer sk-bf-one"]])
+  expect(isDenial(g.admit(h, "anthropic", "claude"))).toBe(true)
+  const ok = g.admit(h, "openai", "gpt-4o-mini")
+  expect(isDenial(ok)).toBe(false)
+  expect((ok as Grant).budgets).toEqual(["b-vk", "b-team"])
+  expect(isDenial(g.admit(h, "openai", "gpt-4o-mini"))).toBe(false)
+  // third request inside the minute hits the request limit
+  const third = g.admit(h, "openai", "gpt-4o-mini")
+  expect((third as Denial).status).toBe(429)
+  const off = g.admit(hdrs([["x-bf-vk", "sk-bf-off"]]), "openai", "x")
+  expect((off as Denial).status).toBe(403)
+})
+
+test("budgets debit up the hierarchy", () => {
+  const g = new Governance(govConfig())
+  const grant: Grant = { kind: "grant", vk: undefined, budgets: ["b-vk", "b-team"], rateLimits: [] }
+  g.record(grant, 100, 1.5)
+  const h = hdrs([["x-api-key", "sk-bf-one"]])
+  const d = g.admit(h, "openai", "gpt-4o-mini")
+  expect((d as Denial).status).toBe(402)
+})

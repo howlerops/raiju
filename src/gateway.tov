@@ -1,0 +1,346 @@
+// The request engine: governance, cache, the attempt loop (retries, key
+// rotation, fallbacks), translation, accounting.
+import { Config, ProviderConfig, providerOf } from "./config"
+import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
+import { ChatRequest, errorJson, newId, Hdrs, snapshot } from "./schemas"
+import { Target, Upstream, Translated } from "./providers/types"
+import { ModelRef, parseModel, target, classify, backoffMs, maxRetries, timeoutMs } from "./router"
+import { Governance, Grant, Denial } from "./governance"
+import { Pricing } from "./pricing"
+import { ResponseCache, cacheKey, parseTtl } from "./cache"
+import { completionToSse } from "./sse"
+import * as providers from "./providers/index"
+import * as openai from "./providers/openai"
+import * as metrics from "./metrics"
+import { Deadline, deadline } from "./deadline"
+
+export type Build = (t: Target) => Upstream throws SyntaxError
+export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
+
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64 }
+
+async function sleep(ms: int): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), ms)
+  })
+}
+
+export function errorResponse(status: int, message: string, type: string, extra: Hdrs): Response {
+  let h: Record<string, string> = extra
+  h.set("content-type", "application/json")
+  return new Response(errorJson(message, type, undefined), { status: status, headers: h })
+}
+
+export function noHeaders(): Hdrs {
+  const m: Hdrs = new Map()
+  return m
+}
+
+function respond(status: int, body: string, h: Hdrs): Response {
+  const r: Record<string, string> = h
+  return new Response(body, { status: status, headers: r })
+}
+
+// Headers the caller sends as x-bf-eh-<name> go upstream as <name>.
+function forwardedHeaders(h: Hdrs): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  for (const key of h.keys()) {
+    if (key.startsWith("x-bf-eh-")) m.set(key.slice(8), h.get(key)!)
+  }
+  return m
+}
+
+function fallbackRefs(cfg: Config, body: Field[]): ModelRef[] {
+  const out: ModelRef[] = []
+  const raw = find(body, "fallbacks")
+  if (raw === undefined || isNull(raw)) return out
+  try {
+    for (const el of elements(raw)) {
+      if (el.startsWith("\"")) out.push(parseModel(cfg, JSON.parse(el) as string))
+      else if (el.startsWith("{")) {
+        // { "provider": "anthropic", "model": "claude-..." }
+        const f = fields(el)
+        const p = rawStr(f, "provider")
+        const m = rawStr(f, "model")
+        if (p !== undefined && m !== undefined) out.push({ provider: p, model: m })
+      }
+    }
+  } catch (e) {
+    // malformed fallbacks are ignored, as an absent list would be
+  }
+  return out
+}
+
+class LazyChat {
+  value: ChatRequest | undefined = undefined
+  constructor(readonly text: string) {}
+  get(): ChatRequest throws SyntaxError {
+    const v = this.value
+    if (v !== undefined) return v
+    const parsed = try JSON.parse(this.text) as ChatRequest
+    this.value = parsed
+    return parsed
+  }
+}
+
+export class Engine {
+  gov: Governance
+  pricing: Pricing
+  cache: ResponseCache | undefined = undefined
+  cacheTtlMs = 300000
+  autoPromptCache = false
+  logRequests = true
+
+  constructor(readonly cfg: Config) {
+    this.gov = new Governance(cfg)
+    this.pricing = new Pricing(cfg)
+    const c = cfg.cache
+    if (c !== undefined && c.enabled === true) {
+      this.cacheTtlMs = (c.ttl_seconds ?? 300) * 1000
+      this.cache = new ResponseCache(this.cacheTtlMs, c.max_entries ?? 10000)
+    }
+    this.autoPromptCache = cfg.prompt_cache?.auto_inject ?? false
+    this.logRequests = cfg.client?.enable_logging ?? true
+  }
+
+  // Tries each model in order; within one, retries transient failures with
+  // backoff and moves to another key on credential errors.
+  async attempt(refs: ModelRef[], h: Hdrs, build: Build, translate: Translate, streamed: bool): Promise<Outcome> {
+    const pinned = h.get("x-bf-api-key") ?? h.get("x-bf-api-key-id") ?? undefined
+    const extra = forwardedHeaders(h)
+    let last: Outcome = { ok: false, status: 404, body: errorJson("no provider is configured for this model", "invalid_request_error", "model_not_found"), contentType: "application/json", provider: "", model: "", promptTokens: 0, completionTokens: 0, attempts: 0, upstreamMs: 0.0 }
+    let attempts = 0
+    let upstreamMs = 0.0
+    for (const ref of refs) {
+      const tried: Set<int> = new Set()
+      const p: ProviderConfig = providerOf(this.cfg, ref.provider) ?? {}
+      const retries = maxRetries(p)
+      let retry = 0
+      while (true) {
+        const sel = target(this.cfg, ref, tried, pinned)
+        if (sel === undefined) break
+        const t = sel.t
+        let up: Upstream = { url: "", headers: new Map(), body: "" }
+        try {
+          up = build(t)
+        } catch (e) {
+          return { ok: false, status: 400, body: errorJson(e.message, "invalid_request_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+        }
+        for (const k of extra.keys()) up.headers.set(k, extra.get(k)!)
+        attempts += 1
+        const started = performance.now()
+        let status = 0
+        let text = ""
+        let retryAfter: string | undefined = undefined
+        let live: Deadline | undefined = undefined
+        try {
+          const hs: Record<string, string> = up.headers
+          const dl = deadline(timeoutMs(p))
+          live = dl
+          const signal = dl.controller.signal
+          const res = up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal })
+          status = res.status
+          text = await res.text()
+          dl.finish()
+          retryAfter = res.headers.get("retry-after") ?? undefined
+        } catch (e) {
+          live?.finish()
+          status = 0
+          text = errorJson(`${ref.provider} request failed: ${e.message}`, "api_connection_error", undefined)
+        }
+        const tookMs = performance.now() - started
+        upstreamMs += tookMs
+        const secs = tookMs / 1000.0
+        const ok = status >= 200 && status < 300
+        metrics.observe("bifrost_upstream_latency_seconds", metrics.labels(ref.provider, ref.model, ok ? "success" : "error"), secs)
+        metrics.inc("bifrost_upstream_requests_total", metrics.labels(ref.provider, ref.model, ok ? "success" : "error"), 1.0)
+        const requested = ref.provider + "/" + ref.model
+        if (ok) {
+          try {
+            const tr = translate(t, text, requested)
+            return { ok: true, status: 200, body: tr.body, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs }
+          } catch (e) {
+            last = { ok: false, status: 502, body: errorJson(`could not read ${ref.provider}'s response: ${e.message}`, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+        }
+        last = { ok: false, status: status === 0 ? 502 : status, body: text.startsWith("{") ? text : errorJson(text === "" ? `${ref.provider} returned HTTP ${status}` : text, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+        const d = status === 0 ? "retry" : classify(status)
+        if (d === "fail") return last
+        if (d === "fallback") break
+        if (d === "rotate") {
+          if (sel.keyIndex < 0 || pinned !== undefined) break
+          tried.add(sel.keyIndex)
+          continue
+        }
+        // retry
+        if (retry >= retries) break
+        await sleep(backoffMs(p, retry, retryAfter))
+        retry += 1
+      }
+    }
+    last.attempts = attempts
+    last.upstreamMs = upstreamMs
+    return last
+  }
+
+  // Shared front half of every inference endpoint.
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool): Promise<Response> {
+    const started = performance.now()
+    const h = snapshot(req.headers)
+    const rid = h.get("x-request-id") ?? newId("req_")
+    const out: Hdrs = new Map()
+    out.set("x-bifrost-request-id", rid)
+    const model = modelName ?? rawStr(body, "model")
+    if (model === undefined) return errorResponse(400, "the request needs a model, e.g. \"openai/gpt-4o-mini\"", "invalid_request_error", out)
+    const refs = [parseModel(this.cfg, model)].concat(fallbackRefs(this.cfg, body))
+    const primary = refs[0]!
+    const admitted = this.gov.admit(h, primary.provider, primary.model)
+    if (admitted.kind === "denial") return errorResponse(admitted.status, admitted.message, admitted.type, out)
+    const grant: Grant = admitted
+    // Fallbacks the key may not use are dropped.
+    const allowed: ModelRef[] = [primary]
+    for (const r of refs.slice(1)) {
+      if (this.gov.admit(h, r.provider, r.model).kind === "grant") allowed.push(r)
+    }
+
+    const cache = this.cache
+    let key = ""
+    const noStore = h.get("x-bf-cache-no-store") === "true"
+    if (cache !== undefined) {
+      key = cacheKey(op + (h.get("x-bf-cache-key") ?? ""), model, text)
+      const hit = cache.get(key)
+      if (hit !== undefined) {
+        metrics.inc("bifrost_cache_hits_total", metrics.labels(primary.provider, primary.model, "hit"), 1.0)
+        out.set("x-bf-cache", "hit")
+        out.set("content-type", hit.contentType)
+        this.log(rid, op, model, 200, 0, 0, 0.0, started, true)
+        return respond(200, hit.body, out)
+      }
+    }
+
+    const r = await this.attempt(allowed, h, build, translate, streamed)
+    out.set("x-bf-attempts", "" + r.attempts)
+    if (!r.ok) {
+      this.log(rid, op, model, r.status, 0, 0, 0.0, started, false)
+      out.set("content-type", "application/json")
+      return respond(r.status, r.body, out)
+    }
+    const cost = this.pricing.cost(r.provider, r.model, r.promptTokens, r.completionTokens)
+    this.gov.record(grant, r.promptTokens + r.completionTokens, cost)
+    const l = metrics.labels(r.provider, r.model, "success")
+    metrics.inc("bifrost_input_tokens_total", l, r.promptTokens)
+    metrics.inc("bifrost_output_tokens_total", l, r.completionTokens)
+    metrics.inc("bifrost_cost_total", l, cost)
+    if (cache !== undefined && !noStore) {
+      const ttlHeader = h.get("x-bf-cache-ttl")
+      const ttl = ttlHeader === undefined ? this.cacheTtlMs : parseTtl(ttlHeader) ?? this.cacheTtlMs
+      cache.set(key, r.body, r.contentType, ttl)
+    }
+    if (r.provider !== primary.provider || r.model !== primary.model) out.set("x-bf-fallback-used", r.provider + "/" + r.model)
+    out.set("content-type", r.contentType)
+    if (r.contentType === "text/event-stream") out.set("cache-control", "no-cache")
+    // Time spent in the gateway itself, upstream calls excluded (Bifrost's "overhead").
+    const overheadUs = (performance.now() - started - r.upstreamMs) * 1000.0
+    metrics.observeOverhead(overheadUs)
+    out.set("x-bf-overhead-us", "" + Math.round(overheadUs))
+    this.log(rid, op, model, 200, r.promptTokens, r.completionTokens, cost, started, false)
+    return respond(200, r.body, out)
+  }
+
+  log(rid: string, op: string, model: string, status: int, pt: int, ct: int, cost: f64, started: f64, cached: bool): void {
+    const ms = performance.now() - started
+    metrics.observe("bifrost_request_duration_seconds", metrics.labels("", model, status === 200 ? "success" : "error"), ms / 1000.0)
+    if (!this.logRequests) return
+    process.stdout.write(JSON.stringify({ ts: Date.now(), request_id: rid, op: op, model: model, status: status, prompt_tokens: pt, completion_tokens: ct, cost: cost, latency_ms: Math.round(ms), cache_hit: cached }) + "\n")
+  }
+
+  async chat(req: Request): Promise<Response> {
+    const text = await req.text()
+    let body: Field[] = []
+    try {
+      body = fields(text)
+    } catch (e) {
+      return errorResponse(400, `invalid chat request: ${e.message}`, "invalid_request_error", noHeaders())
+    }
+    // The typed request is only needed to translate for non-OpenAI providers.
+    const typed = new LazyChat(text)
+    const stream = rawBool(body, "stream") ?? false
+    let wantUsage = false
+    const so = find(body, "stream_options")
+    if (so !== undefined && so.startsWith("{")) {
+      try {
+        wantUsage = rawBool(fields(so), "include_usage") ?? false
+      } catch (e) {
+        wantUsage = false
+      }
+    }
+    const autoCache = this.autoPromptCache || req.headers.get("x-bf-prompt-cache-auto-inject") === "true"
+    // Usage is always requested from streaming upstreams, for budgets and metrics.
+    let streamBody = body.slice()
+    if (stream) setField(&streamBody, "stream_options", `{"include_usage":true}`)
+    const build: Build = (t) => {
+      if (stream && providers.streamsNatively(t.kind)) return openai.chatRequest(t, streamBody)
+      if (stream) {
+        // called without streaming, replayed as SSE below
+        const plain = streamBody.filter((f) => f.key !== "stream" && f.key !== "stream_options")
+        return try providers.chatUpstream(t, try typed.get(), plain, autoCache)
+      }
+      if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, body)
+      return try providers.chatUpstream(t, try typed.get(), body, autoCache)
+    }
+    const translate: Translate = (t, text, requested) => {
+      if (!stream) return try providers.chatTranslate(t.kind, text, requested, false)
+      if (providers.streamsNatively(t.kind)) {
+        const tr = openai.streamResponse(text, requested)
+        return { body: wantUsage ? tr.body : dropUsageChunks(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+      }
+      const tr = try providers.chatTranslate(t.kind, text, requested, false)
+      return { body: try completionToSse(tr.body, wantUsage), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+    }
+    return await this.serve(req, "chat", undefined, body, text, build, translate, stream)
+  }
+
+  async embeddings(req: Request): Promise<Response> {
+    const text = await req.text()
+    let body: Field[] = []
+    try {
+      body = fields(text)
+    } catch (e) {
+      return errorResponse(400, `invalid embeddings request: ${e.message}`, "invalid_request_error", noHeaders())
+    }
+    const build: Build = (t) => {
+      if (!providers.supportsEmbeddings(t.kind)) throw new SyntaxError(`${t.provider} does not serve embeddings through this gateway yet`)
+      return openai.embeddingsRequest(t, body)
+    }
+    const translate: Translate = (t, text, requested) => try openai.embeddingsResponse(text, requested)
+    return await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
+  }
+
+  async completions(req: Request): Promise<Response> {
+    const text = await req.text()
+    let body: Field[] = []
+    try {
+      body = fields(text)
+    } catch (e) {
+      return errorResponse(400, `invalid completions request: ${e.message}`, "invalid_request_error", noHeaders())
+    }
+    const stream = rawBool(body, "stream") ?? false
+    const build: Build = (t) => {
+      if (!providers.streamsNatively(t.kind)) throw new SyntaxError(`${t.provider} does not serve text completions`)
+      return openai.completionsRequest(t, body)
+    }
+    const translate: Translate = (t, text, requested) => stream ? openai.streamResponse(text, requested) : try openai.chatResponse(text, requested)
+    return await this.serve(req, "completions", undefined, body, text, build, translate, stream)
+  }
+}
+
+// Removes the trailing usage-only chunk the gateway asked for but the caller didn't.
+export function dropUsageChunks(sse: string): string {
+  return sse.split("\n\n").filter((e) => !(e.startsWith("data: ") && e.includes(`"choices":[]`) && e.includes(`"usage":`))).join("\n\n")
+}
+
+test("drops usage-only chunks", () => {
+  const s = `data: {"choices":[{"delta":{}}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":1}}\n\ndata: [DONE]\n\n`
+  expect(dropUsageChunks(s)).toBe(`data: {"choices":[{"delta":{}}]}\n\ndata: [DONE]\n\n`)
+})
