@@ -28,11 +28,21 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 
 ## What works
 
-- **API:** `/v1/chat/completions` (tools, vision, JSON mode, streaming), `/v1/responses`,
-  `/v1/embeddings`, `/v1/completions`, `/v1/models`, `/v1/realtime` (WebSocket relay),
-  `/v1/rerank`, `/v1/count_tokens`, `/v1/async/*` jobs, audio, images, files and batches.
-- **Drop-in SDK routes:** `/openai/v1/*`, `/anthropic/v1/messages` (to any provider),
-  `/genai/v1beta/models/{model}:{method}`, `/bedrock/model/{id}/{converse|invoke}`.
+- **API:** `/v1/chat/completions` (tools, vision, JSON mode, reasoning, streaming),
+  `/v1/responses` (and its retrieve, delete, cancel, input_items, input_tokens, compact),
+  `/v1/embeddings`, `/v1/completions`, `/v1/models`, `/v1/realtime` (WebSocket relay; WebRTC
+  calls, client secrets and sessions), `/v1/rerank`, `/v1/count_tokens`, `/v1/async/*` jobs,
+  audio, images, files and batches.
+- **Drop-in SDK routes:** `/openai/v1/*`; `/anthropic/v1/messages` (to any provider),
+  models, message batches and files; `/genai/v1beta/models/{model}:{method}` to any
+  provider; `/bedrock/model/{id}/{converse|invoke}` and their streaming forms (AWS
+  event-stream) to any provider; `/cohere/v2/{chat|embed|rerank}`; `/litellm`, `/langchain`,
+  `/pydanticai`; provider passthroughs (`/openai_passthrough/*` and the rest).
+- **Bifrost compatibility:** reads Bifrost's `config.json` (section names, plugins,
+  guardrails, alerting, vector store, otel) and reports what it ignores; sends the
+  `x-bifrost-*` response headers and Bifrost's Prometheus families and labels.
+- **Count tokens** are exact for Anthropic and Gemini (their APIs) and estimated for
+  everyone else; estimates are marked `"exact": false`.
 - **Gateway features:** routing rules (CEL), circuit breakers and adaptive load
   balancing, guardrails (PII and secret redaction), semantic cache, MCP gateway,
   plugins, request log store, OpenTelemetry, management API with admin auth,
@@ -40,7 +50,7 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 - **Enterprise:** RBAC for the management API (admin, editor, viewer, auditor;
   `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), a hash-chained
   HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting
-  to webhooks and Slack (`alerts`), secrets from HashiCorp Vault and AWS Secrets
+  to webhooks, Slack, Teams and PagerDuty (`alerts`, Bifrost's CEL alert rules), secrets from HashiCorp Vault and AWS Secrets
   Manager (`vault.<path>#<field>`, `aws-sm.<id>`), log exports to S3, MinIO or GCS
   (`log_exports`), and clustering that shares budget and rate-limit usage
   between nodes (`cluster`).
@@ -114,7 +124,8 @@ worker starts its own stdio MCP servers.
 
 ## Known gaps
 
-- SOCKS5 proxies: Tov's `fetch` supports HTTP proxies only.
+- SOCKS5 proxies: Tov's `fetch` supports HTTP proxies only. OTLP export is HTTP only (no gRPC).
+- Open product decisions and remaining gaps: [SCOPE.md](SCOPE.md) and [docs/parity.md](docs/parity.md).
 - Out of scope (from the scoping form): videos and containers, the edge device
   agent, SCIM, MCP code mode and media providers.
 - See [LEDGER.md](LEDGER.md) for the history.

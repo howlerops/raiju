@@ -149,20 +149,20 @@ and 249 missing out of 497 features. P0 are the gaps a Bifrost user hits on swit
 | L51 | G24, G25, G27 | Azure Entra ID, Bedrock assume-role, Bedrock Mantle | worker → lead | done: unit (fixed Microsoft/AWS hosts, no e2e) |
 | L52 | G29 | OTLP metrics push | worker → lead | done: unit |
 | L53 | G31 | Teams and PagerDuty channels, rate-limit metrics, channel cooldowns | worker → lead | done: unit; Bifrost channel mapping |
-| L54 | G10 | Anthropic SDK models, message batches, files | worker; wiring in L62 | module done |
-| L55 | G16 | Native batches and files for Anthropic and Gemini; Gemini speech/images | worker; wiring in L62 | module done |
+| L54 | G10 | Anthropic SDK models, message batches, files | worker; wired by L62 | done: unit + e2e |
+| L55 | G16 | Native batches and files for Anthropic and Gemini; Gemini speech/images | worker; wired by L62 | done: unit + e2e (uploads kept in memory, 256 files) |
 | L56 | G18 | Bifrost metric names and enrichment labels | worker → lead | done: unit + e2e |
 | L57 | G21 | Governance model configs, provider governance, management routes | worker → lead | done: unit + e2e |
 | L58 | G22 | MCP client and virtual MCP management API | worker → lead | done: unit + e2e; also fixed GET /api/config leaking MCP, OIDC, cluster and store secrets |
 | L59 | G30 | Bifrost semanticcache plugin config; Qdrant and Redis vector stores | worker → lead | done: unit + e2e (Qdrant REST mock); RediSearch untested against a real server |
 | L60 | G31 | Bifrost alert rules (CEL over scope usage) and `/api/alerting/*` | worker → lead | done: unit + e2e |
 | L61 | G6, G8, G11, G12 | Wire L46–L48 into the routes, one route kind for streaming | worker | done: e2e on both servers |
-| L62 | G10, G16 | Wire L54 and L55 | worker | assigned |
-| L63 | G29 | Bifrost otel plugin options (trace headers, TLS, request headers, excluded attributes) | worker | assigned |
-| L64 | G34, G39, G49 | Direct keys, raw request/response echo, drop_excess_requests, prometheus_labels | worker | assigned |
-| L65 | G38 | Remaining chat providers (databricks, cloudflare, ...) | worker | assigned |
-| L66 | G50 | Bare-model provider resolution through the catalog; chained aliases | worker | assigned |
-| L67 | G35, G47 | Passthrough routes; /api/version, /api/models, /api/keys, PUT /api/config | worker | assigned |
+| L62 | G10, G16 | Wire L54 and L55 | worker | done: e2e (21 checks) |
+| L63 | G29 | Bifrost otel plugin options (trace headers, TLS, request headers, excluded attributes) | worker | done: unit + e2e; no gRPC |
+| L64 | G34, G39, G49 | Direct keys, raw request/response echo, drop_excess_requests, prometheus_labels | worker | done: unit + e2e; drop_excess_requests is a logged no-op (no queue) |
+| L65 | G38 | Remaining chat providers (databricks, cloudflare, github-copilot, replicate, sarvam, wafer, opencode) | worker → lead (token minting) | done: unit; no live accounts |
+| L66 | G50 | Bare-model provider resolution through the catalog; chained aliases | worker → lead (route hint, 400) | done: unit + e2e |
+| L67 | G35, G47 | Passthrough routes; /api/version, /api/models, /api/keys, PUT /api/config | worker | done: unit + e2e; passthrough applies the VK gate only |
 | X20 | G13, G15 | Responses lifecycle; realtime client_secrets, sessions, calls | lead | done: e2e |
 | X21 | G20, G28 | Content-logging control; rerank semantics (vLLM native, error otherwise, raiju/lexical) | lead | done: e2e |
 | X22 | G26 | TLS options (insecure_skip_verify, ca_cert_pem) | lead | done: e2e against a private-CA HTTPS upstream |
@@ -175,6 +175,19 @@ providers, the x-bifrost-* response headers, metric names and labels, reasoning 
 content-logging control, governance model configs and provider budgets, MCP management API,
 CEL variables, Azure Entra ID, Bedrock IAM roles, TLS options, Bedrock Mantle, rerank semantics,
 OTel metrics, semantic cache plugin config and vector stores, alert channels, count-token labelling.
+
+| L68 | — | Re-audit docs/parity.md against the code | worker | assigned |
+
+Process note: e2e uses fixed ports, so every run (workers and lead) goes through
+`flock /tmp/raiju-e2e.lock`; a worker's stray mock once broke another run.
+
+## UI track (after parity)
+
+The owner wants a native client for desktop and mobile in time, as fast as gpui. The
+web UI stays as the built-in admin page. Plan: freeze the management API as an
+OpenAPI spec first, then spike a small client (providers list plus live logs) in gpui
+(desktop; mobile via the experimental gpui-mobile) and in Slint, and compare startup
+time, memory and feel. Tauri 2 around the web UI is the quick all-platform fallback.
 
 ## P2 decisions for the owner
 
