@@ -3,6 +3,7 @@
 import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
 import { Target } from "./providers/types"
 import { isOpenAICompatible } from "./providers/openai"
+import { Health, pickAdaptive } from "./health"
 
 export type ModelRef = { provider: string, model: string }
 
@@ -83,7 +84,50 @@ export function pickKey(keys: KeyConfig[], model: string, exclude: Set<int>, pin
   return eligible[eligible.length - 1]!
 }
 
-export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: string | undefined): { t: Target, keyIndex: int } | undefined {
+// The id health tracking uses for a key: "<provider>#<key name or id or index>".
+export function healthId(provider: string, k: KeyConfig, index: int): string {
+  return provider + "#" + (k.name ?? k.id ?? ("" + index))
+}
+
+// Breaker-aware choice: keys whose breaker is open are skipped, the rest are
+// weighted by measured health when `adaptive` is set, else by static weight.
+function pickHealthy(provider: string, keys: KeyConfig[], model: string, exclude: Set<int>, health: Health, adaptive: bool): int {
+  const now = Date.now()
+  const tried: Set<int> = new Set()
+  for (const i of exclude.values()) tried.add(i)
+  while (true) {
+    const idx: int[] = []
+    const ids: string[] = []
+    const ws: f64[] = []
+    for (let i = 0; i < keys.length; i++) {
+      if (tried.has(i) || !keyAllows(keys[i]!, model)) continue
+      idx.push(i)
+      ids.push(healthId(provider, keys[i]!, i))
+      ws.push(keys[i]!.weight ?? 1.0)
+    }
+    if (idx.length === 0) return -1
+    let j = -1
+    if (adaptive) j = pickAdaptive(ids, ws, health, now, Math.random())
+    else {
+      // static weights, open breakers skipped
+      const open: Set<int> = new Set()
+      for (let k = 0; k < idx.length; k++) {
+        if (!health.wouldAllow(ids[k]!, now)) open.add(idx[k]!)
+      }
+      const all: Set<int> = new Set()
+      for (const t of tried.values()) all.add(t)
+      for (const o of open.values()) all.add(o)
+      const i = pickKey(keys, model, all, undefined)
+      j = idx.indexOf(i)
+    }
+    if (j < 0) return -1
+    // allow() starts a half-open probe; if another request took the only probe slot, pick again
+    if (health.allow(ids[j]!, now)) return idx[j]!
+    tried.add(idx[j]!)
+  }
+}
+
+export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: string | undefined, health?: Health): { t: Target, keyIndex: int } | undefined {
   const p = providerOf(cfg, ref.provider)
   if (p === undefined) return undefined
   const kind = kindOf(ref.provider, p)
@@ -93,7 +137,9 @@ export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: st
     if (!keyless && kind !== "ollama" && kind !== "vllm" && kind !== "sgl" && kind !== "lmstudio") return undefined
     return { t: { provider: ref.provider, kind: kind, model: ref.model, key: { value: "" }, cfg: p }, keyIndex: -1 }
   }
-  const i = pickKey(keys, ref.model, exclude, pinned)
+  const hc = cfg.health
+  const useHealth = health !== undefined && pinned === undefined && hc !== undefined && (hc.circuit_breaker === true || hc.adaptive === true)
+  const i = useHealth ? pickHealthy(ref.provider, keys, ref.model, exclude, health!, hc!.adaptive === true) : pickKey(keys, ref.model, exclude, pinned)
   if (i < 0) return undefined
   return { t: { provider: ref.provider, kind: kind, model: resolveAlias(keys[i]!, ref.model), key: keys[i]!, cfg: p }, keyIndex: i }
 }
@@ -168,6 +214,37 @@ test("aliases map a request model to each key's own name", () => {
   expect(sel!.t.model).toBe("gpt-4o-mini-2024-07-18")
   expect(target(cfg, { provider: "openai", model: "gpt-4o" }, none, undefined)!.t.model).toBe("gpt-4o")
   expect(target(cfg, { provider: "openai", model: "other" }, none, undefined)).toBeUndefined()
+})
+
+test("open breakers take keys out of rotation", () => {
+  const cfg: Config = { providers: new Map(), health: { circuit_breaker: true } }
+  cfg.providers!.set("openai", { keys: [{ name: "a", value: "1" }, { name: "b", value: "2" }] })
+  const h = new Health()
+  for (let i = 0; i < 5; i++) h.record("openai#a", false, 0.0, Date.now())
+  const none: Set<int> = new Set()
+  for (let i = 0; i < 50; i++) expect(target(cfg, { provider: "openai", model: "m" }, none, undefined, h)!.t.key.name).toBe("b")
+  for (let i = 0; i < 5; i++) h.record("openai#b", false, 0.0, Date.now())
+  expect(target(cfg, { provider: "openai", model: "m" }, none, undefined, h)).toBeUndefined()
+  // pinning bypasses health
+  expect(target(cfg, { provider: "openai", model: "m" }, none, "a", h)!.t.key.name).toBe("a")
+})
+
+test("adaptive weights favor the faster key", () => {
+  const cfg: Config = { providers: new Map(), health: { adaptive: true } }
+  cfg.providers!.set("openai", { keys: [{ name: "fast", value: "1" }, { name: "slow", value: "2" }] })
+  const h = new Health()
+  const now = Date.now()
+  for (let i = 0; i < 20; i++) {
+    h.record("openai#fast", true, 100.0, now)
+    h.record("openai#slow", true, 1000.0, now)
+  }
+  const none: Set<int> = new Set()
+  let fast = 0
+  for (let i = 0; i < 1000; i++) {
+    if (target(cfg, { provider: "openai", model: "m" }, none, undefined, h)!.t.key.name === "fast") fast += 1
+  }
+  // weights 1.0 vs 0.1: about 91% fast
+  expect(fast > 850).toBe(true)
 })
 
 test("classifies failures and backs off", () => {

@@ -4,7 +4,8 @@ import { Config, ProviderConfig, providerOf } from "./config"
 import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, snapshot } from "./schemas"
 import { Target, Upstream, Translated } from "./providers/types"
-import { ModelRef, parseModel, target, classify, backoffMs, maxRetries, timeoutMs } from "./router"
+import { ModelRef, parseModel, target, classify, backoffMs, maxRetries, timeoutMs, healthId } from "./router"
+import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
 import { Governance, Grant, Denial } from "./governance"
 import { Pricing } from "./pricing"
 import { ResponseCache, cacheKey, parseTtl } from "./cache"
@@ -85,6 +86,7 @@ class LazyChat {
 
 export class Engine {
   gov: Governance
+  health: Health
   pricing: Pricing
   cache: ResponseCache | undefined = undefined
   cacheTtlMs = 300000
@@ -93,6 +95,17 @@ export class Engine {
 
   constructor(readonly cfg: Config) {
     this.gov = new Governance(cfg)
+    const hc = cfg.health
+    const d = defaultBreakerConfig()
+    const bc: BreakerConfig = hc === undefined ? d : {
+      failureThreshold: hc.failure_threshold ?? d.failureThreshold,
+      failureRateThreshold: hc.failure_rate_threshold ?? d.failureRateThreshold,
+      minRequests: hc.min_requests ?? d.minRequests,
+      windowMs: (hc.window_seconds ?? 60) * 1000,
+      openMs: (hc.open_seconds ?? 30) * 1000,
+      halfOpenProbes: d.halfOpenProbes,
+    }
+    this.health = new Health(bc)
     this.pricing = new Pricing(cfg)
     const c = cfg.cache
     if (c !== undefined && c.enabled === true) {
@@ -117,7 +130,7 @@ export class Engine {
       const retries = maxRetries(p)
       let retry = 0
       while (true) {
-        const sel = target(this.cfg, ref, tried, pinned)
+        const sel = target(this.cfg, ref, tried, pinned, this.health)
         if (sel === undefined) break
         const t = sel.t
         let up: Upstream = { url: "", headers: new Map(), body: "" }
@@ -152,6 +165,12 @@ export class Engine {
         upstreamMs += tookMs
         const secs = tookMs / 1000.0
         const ok = status >= 200 && status < 300
+        // Health counts what the provider got wrong: network errors, timeouts, 429 and 5xx.
+        // A 4xx other than 429 is the caller's fault and says the provider is up.
+        if (sel.keyIndex >= 0) {
+          const healthy = ok || (status >= 400 && status < 500 && status !== 429 && status !== 408)
+          this.health.record(healthId(ref.provider, t.key, sel.keyIndex), healthy, tookMs, Date.now())
+        }
         metrics.observe("bifrost_upstream_latency_seconds", metrics.labels(ref.provider, ref.model, ok ? "success" : "error"), secs)
         metrics.inc("bifrost_upstream_requests_total", metrics.labels(ref.provider, ref.model, ok ? "success" : "error"), 1.0)
         const requested = ref.provider + "/" + ref.model
