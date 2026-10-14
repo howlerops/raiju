@@ -1,71 +1,405 @@
-// Per-token prices for cost tracking and budgets. The built-in table covers
-// common models (USD per million tokens, list prices); config.pricing entries
-// ("provider/model" or "model", per token, as Bifrost writes them) override it.
+// Per-token prices in USD for cost tracking and budgets.
+//
+// find(provider, model) tries, in order:
+//   1. config.pricing: "provider/model" or "model", per token
+//   2. Bifrost pricing overrides (governance.pricing_overrides), patched over
+//      the datasheet price for the same model
+//   3. the datasheet: exact "provider/model" key, "model" key, provider + base
+//      model; then the same with a trailing "-YYYYMMDD" removed; then the
+//      longest key the model starts with, or contains as ".key" (regions).
+//
+// The datasheet is PRICING_DATA (scripts/gen_pricing.py); replaceCatalog swaps
+// in a fresh one parsed by parseDatasheet. Rows carry no mode, so chat and
+// embedding entries are looked up alike.
 import { Config } from "./config"
+import { PRICING_DATA } from "./pricing_data"
 
-type Price = { input: f64, output: f64 }
+// USD per token. A missing cache rate bills cached tokens at the input rate.
+export type Price = { input: f64, output: f64, cacheRead?: f64, cacheWrite?: f64 }
 
-function builtin(): Map<string, Price> {
-  const m: Map<string, Price> = new Map()
-  m.set("gpt-4o", { input: 2.5, output: 10.0 })
-  m.set("gpt-4o-mini", { input: 0.15, output: 0.6 })
-  m.set("gpt-4.1", { input: 2.0, output: 8.0 })
-  m.set("gpt-4.1-mini", { input: 0.4, output: 1.6 })
-  m.set("gpt-4.1-nano", { input: 0.1, output: 0.4 })
-  m.set("o3", { input: 2.0, output: 8.0 })
-  m.set("o4-mini", { input: 1.1, output: 4.4 })
-  m.set("text-embedding-3-small", { input: 0.02, output: 0.0 })
-  m.set("text-embedding-3-large", { input: 0.13, output: 0.0 })
-  m.set("claude-opus-4", { input: 15.0, output: 75.0 })
-  m.set("claude-sonnet-4", { input: 3.0, output: 15.0 })
-  m.set("claude-3-5-haiku", { input: 0.8, output: 4.0 })
-  m.set("gemini-2.5-pro", { input: 1.25, output: 10.0 })
-  m.set("gemini-2.5-flash", { input: 0.3, output: 2.5 })
-  m.set("gemini-2.0-flash", { input: 0.1, output: 0.4 })
-  return m
+// One datasheet row with the provider and base model it was filed under.
+export type PriceRow = { provider: string, baseModel: string, price: Price }
+
+// A pricing override as Bifrost stores it. Only scope_kind "global" and
+// "provider" apply; virtual-key scopes need request context and are skipped
+// (setOverrides returns how many it skipped). request_types are not checked.
+export type PricingOverride = {
+  scope_kind: string,
+  provider_id?: string,
+  match_type: string,
+  pattern: string,
+  pricing_patch: string,
 }
 
-const BUILTIN = builtin()
+// Rates an override sets. pricing_patch is JSON in Bifrost's field names;
+// only the fields present replace the datasheet's.
+type PricePatch = {
+  input_cost_per_token?: f64,
+  output_cost_per_token?: f64,
+  cache_read_input_token_cost?: f64,
+  cache_creation_input_token_cost?: f64,
+}
+
+type Patch = { provider: string, pattern: string, wildcard: bool, rates: PricePatch }
+
+type Catalog = {
+  rows: Map<string, PriceRow>,
+  byBase: Map<string, PriceRow>,   // "provider|baseModel" -> plainest row
+  keys: string[],                  // longest first, for prefix matching
+}
+
+type DatasheetEntry = {
+  provider?: string,
+  base_model?: string,
+  input_cost_per_token?: f64,
+  output_cost_per_token?: f64,
+  cache_read_input_token_cost?: f64,
+  cache_creation_input_token_cost?: f64,
+}
+
+// Bedrock variants and Vertex's two spellings are filed under one name each.
+function normalizeProvider(p: string): string {
+  if (p.startsWith("bedrock")) return "bedrock"
+  if (p === "vertex" || p === "google-vertex") return "vertex_ai"
+  return p
+}
+
+function makeRow(provider: string, baseModel: string, input: f64, output: f64, cacheRead: f64 | undefined, cacheWrite: f64 | undefined): PriceRow {
+  return { provider: normalizeProvider(provider), baseModel, price: { input, output, cacheRead, cacheWrite } }
+}
+
+// Parses PRICING_DATA's lines: key, provider, input, output, cacheRead,
+// cacheWrite, baseModel. Empty rates are missing; malformed lines are skipped.
+function parseTable(text: string): Map<string, PriceRow> {
+  const rows: Map<string, PriceRow> = new Map()
+  for (const line of text.split("\n")) {
+    const f = line.split("\t")
+    if (f.length !== 7) continue
+    const input = parseFloat(f[2]!)
+    const output = parseFloat(f[3]!)
+    if (input === undefined && output === undefined) continue
+    rows.set(f[0]!, makeRow(f[1]!, f[6]!, input ?? 0.0, output ?? 0.0, parseFloat(f[4]!), parseFloat(f[5]!)))
+  }
+  return rows
+}
+
+// Parses a Bifrost datasheet (https://getbifrost.ai/datasheet). Entries with
+// neither an input nor an output price are dropped; a missing one is 0.
+export function parseDatasheet(json: string): Map<string, PriceRow> throws SyntaxError {
+  const sheet = try JSON.parse(json) as Record<string, DatasheetEntry>
+  const rows: Map<string, PriceRow> = new Map()
+  for (const k of sheet.keys()) {
+    const e = sheet.get(k)!
+    if (e.input_cost_per_token === undefined && e.output_cost_per_token === undefined) continue
+    rows.set(k, makeRow(e.provider ?? "", e.base_model ?? "", e.input_cost_per_token ?? 0.0, e.output_cost_per_token ?? 0.0, e.cache_read_input_token_cost, e.cache_creation_input_token_cost))
+  }
+  return rows
+}
+
+// Orders names by length, then by bytes; `dir` is 1 for shortest first.
+function byLength(dir: int): (a: string, b: string) => int {
+  return (a: string, b: string): int => {
+    if (a.byteLength !== b.byteLength) return dir * (a.byteLength - b.byteLength)
+    if (a === b) return 0
+    return a < b ? -1 : 1
+  }
+}
+
+function buildCatalog(rows: Map<string, PriceRow>): Catalog {
+  const keys = rows.keys()
+  // Shortest name first, so the plainest key wins for each provider and base model.
+  keys.sort(byLength(1))
+  const byBase: Map<string, PriceRow> = new Map()
+  for (const k of keys) {
+    const r = rows.get(k)!
+    if (r.baseModel === "") continue
+    const bk = r.provider + "|" + r.baseModel
+    if (!byBase.has(bk)) byBase.set(bk, r)
+  }
+  const longest = keys.slice()
+  longest.sort(byLength(-1))
+  return { rows, byBase, keys: longest }
+}
+
+const BUILTIN: Catalog = buildCatalog(parseTable(PRICING_DATA))
+
+// A dated suffix is "-" and eight digits at the end of the name ("-20250514").
+function stripDate(model: string): string {
+  const n = model.byteLength
+  if (n < 9 || model.slice(n - 9, n - 8) !== "-") return model
+  for (let i = n - 8; i < n; i += 1) {
+    const ch = model.slice(i, i + 1)
+    if (ch < "0" || ch > "9") return model
+  }
+  return model.slice(0, n - 9)
+}
+
+// True when key k is at byte offset `at` of model and ends the name there.
+function startsAt(model: string, k: string, at: int): bool {
+  const end = at + k.byteLength
+  if (model.slice(at, end) !== k) return false
+  if (end === model.byteLength) return true
+  const next = model.slice(end, end + 1)
+  return next === "-" || next === ":" || next === "@"
+}
+
+function byName(c: Catalog, provider: string, model: string): PriceRow | undefined {
+  const r = c.rows.get(provider + "/" + model)
+  if (r !== undefined) return r
+  const m = c.rows.get(model)
+  if (m !== undefined) return m
+  return c.byBase.get(normalizeProvider(provider) + "|" + model)
+}
+
+function prefixMatch(c: Catalog, model: string): PriceRow | undefined {
+  for (const k of c.keys) {
+    if (startsAt(model, k, 0)) return c.rows.get(k)
+    const d = model.indexOf("." + k)
+    if (d >= 0 && startsAt(model, k, d + 1)) return c.rows.get(k)
+  }
+  return undefined
+}
+
+function lookupDatasheet(c: Catalog, provider: string, model: string): Price | undefined {
+  const exact = byName(c, provider, model)
+  if (exact !== undefined) return exact.price
+  const dated = stripDate(model)
+  if (dated !== model) {
+    const d = byName(c, provider, dated)
+    if (d !== undefined) return d.price
+  }
+  const p = prefixMatch(c, dated)
+  return p === undefined ? undefined : p.price
+}
+
+// Patches the datasheet price: fields the override sets win; a model with no
+// datasheet row starts from zero rates.
+function overlay(base: Price | undefined, r: PricePatch): Price {
+  const b: Price = base ?? { input: 0.0, output: 0.0 }
+  return {
+    input: r.input_cost_per_token ?? b.input,
+    output: r.output_cost_per_token ?? b.output,
+    cacheRead: r.cache_read_input_token_cost ?? b.cacheRead,
+    cacheWrite: r.cache_creation_input_token_cost ?? b.cacheWrite,
+  }
+}
+
+function overrideError(msg: string): SyntaxError {
+  return new SyntaxError("pricing override: " + msg)
+}
 
 export class Pricing {
-  overrides: Map<string, Price> = new Map()
+  overrides: Map<string, Price> = new Map()   // config.pricing, per token
+  catalog: Catalog = BUILTIN
+  patches: Patch[] = []                       // most specific first
+  memo: Map<string, Price> = new Map()        // datasheet hits
+  misses: Set<string> = new Set()             // datasheet misses
+
   constructor(cfg: Config) {
     const p = cfg.pricing
     if (p === undefined) return
     for (const k of p.keys()) {
       const e = p.get(k)!
-      this.overrides.set(k, { input: e.input_cost_per_token * 1000000.0, output: e.output_cost_per_token * 1000000.0 })
+      this.overrides.set(k, { input: e.input_cost_per_token, output: e.output_cost_per_token })
     }
   }
 
+  // Swaps in a datasheet from parseDatasheet. Pure: the caller does the fetch.
+  replaceCatalog(rows: Map<string, PriceRow>): void {
+    this.catalog = buildCatalog(rows)
+    this.clearMemo()
+  }
+
+  // Installs governance.pricing_overrides, replacing any earlier set. Returns
+  // how many entries were skipped for an unsupported scope. Throws SyntaxError
+  // for a malformed entry, leaving the previous set in place.
+  setOverrides(list: PricingOverride[]): int throws SyntaxError {
+    const groups: Patch[][] = [[], [], [], []]   // provider exact, provider wildcard, global exact, global wildcard
+    let skipped = 0
+    for (const o of list) {
+      if (o.scope_kind !== "global" && o.scope_kind !== "provider") {
+        skipped += 1
+        continue
+      }
+      const provider = o.scope_kind === "provider" ? normalizeProvider(o.provider_id ?? "") : ""
+      if (o.scope_kind === "provider" && provider === "") throw overrideError("provider scope needs provider_id")
+      const rates = try JSON.parse(o.pricing_patch) as PricePatch
+      let pattern = o.pattern
+      let wildcard = false
+      if (o.match_type === "wildcard") {
+        wildcard = true
+        if (!pattern.endsWith("*")) throw overrideError("wildcard pattern must end with *")
+        pattern = pattern.slice(0, pattern.byteLength - 1)
+      } else if (o.match_type !== "exact") {
+        throw overrideError("unknown match_type " + o.match_type)
+      }
+      const g = (provider === "" ? 2 : 0) + (wildcard ? 1 : 0)
+      groups[g]!.push({ provider, pattern, wildcard, rates })
+    }
+    for (const g of [1, 3]) groups[g]!.sort((a, b) => b.pattern.byteLength - a.pattern.byteLength)
+    const out: Patch[] = []
+    for (const g of groups) for (const p of g) out.push(p)
+    this.patches = out
+    this.clearMemo()
+    return skipped
+  }
+
+  clearMemo(): void {
+    this.memo = new Map()
+    this.misses = new Set()
+  }
+
+  patchFor(provider: string, model: string): PricePatch | undefined {
+    const p = normalizeProvider(provider)
+    for (const x of this.patches) {
+      if (x.provider !== "" && x.provider !== p) continue
+      const hit = x.wildcard ? model.startsWith(x.pattern) : model === x.pattern
+      if (hit) return x.rates
+    }
+    return undefined
+  }
+
+  datasheet(provider: string, model: string): Price | undefined {
+    const key = provider + "\n" + model
+    const hit = this.memo.get(key)
+    if (hit !== undefined) return hit
+    if (this.misses.has(key)) return undefined
+    const p = lookupDatasheet(this.catalog, provider, model)
+    if (p === undefined) {
+      if (this.misses.size >= 4096) this.misses = new Set()
+      this.misses.add(key)
+      return undefined
+    }
+    if (this.memo.size >= 4096) this.memo = new Map()
+    this.memo.set(key, p)
+    return p
+  }
+
+  // Per-token price for the model, or undefined when nothing prices it.
   find(provider: string, model: string): Price | undefined {
-    const exact = this.overrides.get(provider + "/" + model) ?? this.overrides.get(model)
-    if (exact !== undefined) return exact
-    const b = BUILTIN.get(model)
-    if (b !== undefined) return b
-    // Dated and regional variants ("claude-sonnet-4-20250514",
-    // "us.anthropic.claude-sonnet-4-...") match the longest known prefix.
-    let best = ""
-    for (const k of BUILTIN.keys()) {
-      if ((model.startsWith(k) || model.includes("." + k)) && k.byteLength > best.byteLength) best = k
-    }
-    return best === "" ? undefined : BUILTIN.get(best)
+    const c = this.overrides.get(provider + "/" + model) ?? this.overrides.get(model)
+    if (c !== undefined) return c
+    const base = this.datasheet(provider, model)
+    const patch = this.patchFor(provider, model)
+    if (patch === undefined) return base
+    return overlay(base, patch)
   }
 
-  // USD for one request; 0 when the model's price is unknown.
-  cost(provider: string, model: string, promptTokens: int, completionTokens: int): f64 {
+  known(provider: string, model: string): bool {
+    return this.find(provider, model) !== undefined
+  }
+
+  // USD for one request; 0 when the model's price is unknown. promptTokens
+  // includes the cached ones (cachedRead and cachedWrite are subsets of it),
+  // as the Anthropic translator reports them.
+  cost(provider: string, model: string, promptTokens: int, completionTokens: int, cachedRead?: int, cachedWrite?: int): f64 {
     const p = this.find(provider, model)
     if (p === undefined) return 0.0
-    return (promptTokens * p.input + completionTokens * p.output) / 1000000.0
+    const r = cachedRead ?? 0
+    const w = cachedWrite ?? 0
+    const fresh = Math.max(0, promptTokens - r - w)
+    const readRate = p.cacheRead ?? p.input
+    const writeRate = p.cacheWrite ?? p.input
+    return fresh * p.input + r * readRate + w * writeRate + completionTokens * p.output
   }
 }
 
-test("costs from the table, prefixes and overrides", () => {
+test("datasheet prices for OpenAI, Anthropic, Gemini and Vertex", () => {
+  const p = new Pricing({})
+  expect(p.cost("openai", "gpt-4o", 1000000, 0)).toBeCloseTo(2.5)
+  expect(p.cost("openai", "gpt-4o", 0, 1000000)).toBeCloseTo(10.0)
+  expect(p.cost("anthropic", "claude-sonnet-4-5", 1000000, 1000000)).toBeCloseTo(18.0)
+  expect(p.cost("gemini", "gemini-2.5-pro", 1000000, 0)).toBeCloseTo(1.25)
+  expect(p.cost("vertex_ai", "gemini-2.5-flash", 1000000, 0)).toBeCloseTo(0.3)
+  expect(p.known("openai", "text-embedding-3-small")).toBe(true)
+})
+
+test("regional and dated names resolve to their base price", () => {
+  const p = new Pricing({})
+  expect(p.cost("bedrock", "us.anthropic.claude-sonnet-4-20250514-v1:0", 1000000, 0)).toBeCloseTo(3.0)
+  expect(p.cost("bedrock", "claude-sonnet-4-20250514", 1000000, 0)).toBeCloseTo(3.0)
+  expect(p.cost("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0", 1000000, 0)).toBeCloseTo(3.0)
+  expect(p.cost("openai", "gpt-4o-2024-08-06", 1000000, 0)).toBeCloseTo(2.5)
+  expect(p.known("openai", "no-such-model")).toBe(false)
+  expect(p.cost("openai", "no-such-model", 100, 100)).toBe(0.0)
+})
+
+test("cache read and write tokens are billed at their own rates", () => {
+  const p = new Pricing({})
+  // 1000 prompt tokens: 600 read from cache, none written.
+  expect(p.cost("anthropic", "claude-sonnet-4-5", 1000, 0, 600)).toBeCloseTo(0.00138)
+  // 200 of them written to cache as well.
+  expect(p.cost("anthropic", "claude-sonnet-4-5", 1000, 0, 600, 200)).toBeCloseTo(0.00153)
+  // gpt-4 has no cache rate, so cached tokens cost the input rate.
+  expect(p.cost("openai", "gpt-4", 1000, 0, 500)).toBeCloseTo(0.03)
+})
+
+test("overrides: config beats Bifrost, provider scope beats global", () => {
   const cfg: Config = { pricing: new Map() }
   cfg.pricing!.set("openai/gpt-4o", { input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 })
   const p = new Pricing(cfg)
+  const skipped = try p.setOverrides([
+    { scope_kind: "global", match_type: "exact", pattern: "gpt-4o", pricing_patch: "{\"input_cost_per_token\":0.000005}" },
+    { scope_kind: "provider", provider_id: "openai", match_type: "wildcard", pattern: "gpt-4*", pricing_patch: "{\"input_cost_per_token\":0.000007}" },
+    { scope_kind: "virtual_key", match_type: "exact", pattern: "gpt-4o", pricing_patch: "{}" },
+  ])
+  expect(skipped).toBe(1)
+  // The config entry wins outright.
   expect(p.cost("openai", "gpt-4o", 1000000, 0)).toBeCloseTo(1.0)
-  expect(p.cost("anthropic", "claude-sonnet-4-20250514", 1000, 1000)).toBeCloseTo(0.018)
-  expect(p.cost("bedrock", "us.anthropic.claude-sonnet-4-20250514-v1:0", 1000000, 0)).toBeCloseTo(3.0)
-  expect(p.cost("x", "unknown", 100, 100)).toBe(0.0)
+  // Without it, the provider-scoped override patches the input rate and keeps the datasheet output.
+  const q = new Pricing({})
+  try q.setOverrides([
+    { scope_kind: "global", match_type: "exact", pattern: "gpt-4o", pricing_patch: "{\"input_cost_per_token\":0.000005}" },
+    { scope_kind: "provider", provider_id: "openai", match_type: "wildcard", pattern: "gpt-4*", pricing_patch: "{\"input_cost_per_token\":0.000007}" },
+  ])
+  expect(q.cost("openai", "gpt-4o", 1000000, 1000000)).toBeCloseTo(17.0)
+  expect(q.cost("anthropic", "gpt-4o", 1000000, 0)).toBeCloseTo(5.0)
+  // Override-only models: unset rates are zero.
+  try q.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "my-model", pricing_patch: "{\"output_cost_per_token\":0.00001}" }])
+  expect(q.cost("custom", "my-model", 1000000, 1000000)).toBeCloseTo(10.0)
+  expect(q.cost("openai", "gpt-4o", 1000000, 0)).toBeCloseTo(2.5)
+})
+
+test("malformed overrides throw and keep the previous set", () => {
+  const p = new Pricing({})
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "gpt-4o", pricing_patch: "{\"input_cost_per_token\":0.000001}" }])
+  let threw = false
+  try {
+    p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "gpt-4o", pricing_patch: "not json" }])
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  expect(p.cost("openai", "gpt-4o", 1000000, 0)).toBeCloseTo(1.0)
+})
+
+test("parseDatasheet and replaceCatalog swap the table", () => {
+  const sample = "{" +
+    "\"fake-1\": {\"provider\": \"acme\", \"base_model\": \"fake\", \"input_cost_per_token\": 0.000001, \"output_cost_per_token\": 0.000002, \"cache_read_input_token_cost\": 0.0000001, \"mode\": \"chat\"}," +
+    "\"fake-2\": {\"provider\": \"acme\", \"base_model\": \"fake\", \"input_cost_per_token\": 0.000009, \"output_cost_per_token\": 0.000009}," +
+    "\"output-only\": {\"provider\": \"acme\", \"output_cost_per_token\": 0.5}," +
+    "\"no-price\": {\"provider\": \"acme\", \"mode\": \"image\"}" +
+    "}"
+  const rows = try parseDatasheet(sample)
+  expect(rows.size).toBe(3)
+  const p = new Pricing({})
+  expect(p.known("acme", "fake-1")).toBe(false)
+  p.replaceCatalog(rows)
+  // Half the prompt is cached: 0.5 at 1.0 + 0.5 at 0.1, plus 2.0 of output.
+  expect(p.cost("acme", "fake-1", 1000000, 1000000, 500000)).toBeCloseTo(2.55)
+  // The plainest key wins for a provider and base model.
+  expect(p.cost("acme", "fake", 1000000, 0)).toBeCloseTo(1.0)
+  // Input is missing, so prompt tokens are free; one completion token costs 0.5.
+  expect(p.cost("acme", "output-only", 1000000, 1)).toBeCloseTo(0.5)
+  expect(p.known("acme", "no-price")).toBe(false)
+  expect(p.cost("openai", "gpt-4o", 1000000, 0)).toBe(0.0)
+  // Not in the new table, so the built-in one no longer applies.
+  expect(p.known("openai", "gpt-4o")).toBe(false)
+  let threw = false
+  try {
+    parseDatasheet("{\"x\": ")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
 })

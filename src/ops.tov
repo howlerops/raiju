@@ -1,7 +1,8 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, providerNames } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames } from "./config"
+import { parseDatasheet } from "./pricing"
 import { Engine } from "./gateway"
 import { ConfigStore, checkAdmin } from "./store"
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, allowed } from "./rbac"
@@ -193,6 +194,7 @@ export class Ops {
       const problem = vmcp.validate(v)
       if (problem !== "") console.error(`raiju: virtual MCP ${v.name}: ${problem}`)
     }
+    this.configurePricing(cfg.pricing_sync)
     this.configureAlerts(cfg.alerts)
     this.configureCluster(cfg.cluster)
     this.configureExports(cfg.log_exports)
@@ -382,6 +384,44 @@ export class Ops {
     this.pushLocal(c)
     this.applyRemote(c)
     return json(200, c.encode())
+  }
+
+  // ---- the price datasheet (Bifrost's framework.pricing) ----
+
+  pricingTimer: int = -1
+  pricingKey = ""
+
+  configurePricing(ps: PricingSyncConfig | undefined): void {
+    const key = JSON.stringify(ps ?? {})
+    if (key === this.pricingKey) return
+    this.pricingKey = key
+    if (this.pricingTimer >= 0) {
+      clearInterval(this.pricingTimer)
+      this.pricingTimer = -1
+    }
+    // syncing is opt-in: the built-in copy needs no network
+    if (ps === undefined || ps.enabled === false) return
+    const url = ps.url ?? "https://getbifrost.ai/datasheet"
+    const every = Math.max(3600, ps.interval_seconds ?? 86400)
+    this.syncPricing(url)
+    this.pricingTimer = setInterval(() => {
+      this.syncPricing(url)
+    }, every * 1000)
+  }
+
+  async syncPricing(url: string): Promise<void> {
+    const r = await getText(url)
+    if (r.status !== 200) {
+      console.error(`raiju: price datasheet from ${url}: HTTP ${r.status}; keeping the current prices`)
+      return
+    }
+    try {
+      const rows = parseDatasheet(r.body)
+      this.engine.catalogRows = rows
+      this.engine.pricing.replaceCatalog(rows)
+    } catch (e) {
+      console.error(`raiju: price datasheet from ${url}: ${e.message}; keeping the current prices`)
+    }
   }
 
   // ---- log exporters (Datadog, Splunk, Elasticsearch, HTTP) ----

@@ -1,0 +1,822 @@
+// Reads a Bifrost config.json the way Raiju reads its own. Bifrost names some
+// sections differently, and some of its keys have no Raiju counterpart.
+// normalize() rewrites the sections Raiju has under another name, so the typed
+// parse picks them up. warnings() lists what is still ignored, so nothing is
+// dropped silently. Both work on the raw text, and fields this module does not
+// model stay as they are.
+
+import { Field, fields, elements, find, rawStr, rawBool, decodeString, build, quote, setField, without } from "./json"
+
+// Raiju's top-level keys (the Config type in config.tov), plus the Bifrost
+// sections this module reads and the pricing_sync key it writes.
+function topKeys(): string[] {
+  return ["client", "providers", "governance", "cache", "pricing", "prompt_cache", "health", "guardrails", "logs_store", "otel", "mcp", "plugins", "semantic_cache", "secrets", "audit", "alerts", "session_affinity", "complexity_router", "mcp_server", "virtual_mcps", "log_exports", "exporters", "cluster", "oidc", "framework", "auth_config", "alerting", "audit_logs", "cluster_config", "circuit_breaker_config", "load_balancer_config", "pricing_sync", "guardrails_config", "$schema"]
+}
+
+// Raiju's keys one level down. client also takes the two keys normalize maps.
+function clientKeys(): string[] {
+  return ["drop_excess_requests", "enable_logging", "enable_governance", "enforce_governance_header", "required_headers", "allow_direct_keys", "allowed_origins", "max_request_body_size_mb", "prometheus_labels", "async_job_result_ttl", "mcp_agent_depth", "mcp_auto_execute", "mcp_tool_execution_timeout", "log_retention_days", "enforce_auth_on_inference"]
+}
+
+function providerKeys(): string[] {
+  return ["keys", "network_config", "proxy_config", "custom_provider_config", "send_back_raw_response"]
+}
+
+function governanceKeys(): string[] {
+  return ["auth_config", "users", "access_profiles", "budgets", "rate_limits", "virtual_keys", "teams", "customers", "routing_rules", "pricing_overrides"]
+}
+
+function mcpKeys(): string[] {
+  return ["client_configs", "tool_execution_timeout_seconds", "virtual_mcps", "tool_groups"]
+}
+
+// Keys Raiju parses, or writes, and never acts on.
+function notImplemented(p: string): bool {
+  if (p === "client.drop_excess_requests" || p === "client.prometheus_labels" || p === "client.allow_direct_keys") return true
+  return p.startsWith("providers.") && p.endsWith(".send_back_raw_response")
+}
+
+// The members of a JSON object given as raw text. Anything else has none.
+function members(raw: string | undefined): Field[] throws SyntaxError {
+  const r = raw ?? ""
+  if (!r.startsWith("{")) return []
+  return try fields(r)
+}
+
+// The elements of a JSON array given as raw text. Anything else has none.
+function items(raw: string | undefined): string[] throws SyntaxError {
+  const r = raw ?? ""
+  if (!r.startsWith("[")) return []
+  return try elements(r)
+}
+
+// The values of a JSON array of strings; other elements are skipped.
+function strings(raw: string | undefined): string[] throws SyntaxError {
+  const out: string[] = []
+  for (const el of try items(raw)) {
+    if (el.startsWith("\"")) out.push(try decodeString(el))
+  }
+  return out
+}
+
+// The raw text of a string value, or undefined when the value is not a string.
+function strRaw(fs: Field[], key: string): string | undefined {
+  const r = find(fs, key)
+  if (r === undefined) return undefined
+  if (!r.startsWith("\"")) return undefined
+  return r
+}
+
+function add(inout fs: Field[], key: string, raw: string | undefined): void {
+  if (raw !== undefined) fs.push({ key: key, raw: raw })
+}
+
+function put(inout top: Field[], key: string, fs: Field[]): void {
+  setField(&top, key, build(fs))
+}
+
+// One "not supported" note for each of keys that is present in fs.
+function ignored(path: string, fs: Field[], keys: string[], inout notes: string[]): void {
+  for (const k of keys) {
+    if (find(fs, k) !== undefined) notes.push(`config: "${path}.${k}" is not supported by Raiju and is ignored`)
+  }
+}
+
+// Seconds in a Go duration such as "30s", "5m" or "1h". undefined for anything else.
+function goSeconds(s: string): f64 | undefined {
+  // "ms" and "us" come before "m" and "s", which they end with
+  const units: { suffix: string, factor: f64 }[] = [
+    { suffix: "ns", factor: 0.000000001 },
+    { suffix: "us", factor: 0.000001 },
+    { suffix: "µs", factor: 0.000001 },
+    { suffix: "ms", factor: 0.001 },
+    { suffix: "h", factor: 3600.0 },
+    { suffix: "m", factor: 60.0 },
+    { suffix: "s", factor: 1.0 },
+  ]
+  for (const u of units) {
+    if (s.endsWith(u.suffix)) {
+      const n = parseFloat(s.slice(0, s.byteLength - u.suffix.byteLength))
+      if (n === undefined || n < 0.0) return undefined
+      return n * u.factor
+    }
+  }
+  return undefined
+}
+
+// Bifrost's top-level auth_config (deprecated there) and governance.auth_config
+// become Raiju's governance.auth_config, with admin_username and admin_password
+// read as username and password.
+function adminFields(src: Field[], path: string, inout notes: string[]): Field[] {
+  if (path === "governance.auth_config") {
+    if (find(src, "admin_username") !== undefined) notes.push(`config: "governance.auth_config.admin_username" read as "governance.auth_config.username"`)
+    if (find(src, "admin_password") !== undefined) notes.push(`config: "governance.auth_config.admin_password" read as "governance.auth_config.password"`)
+  }
+  let out: Field[] = []
+  add(&out, "username", strRaw(src, "admin_username") ?? strRaw(src, "username"))
+  add(&out, "password", strRaw(src, "admin_password") ?? strRaw(src, "password"))
+  add(&out, "token", strRaw(src, "token"))
+  ignored(path, src, ["is_enabled", "disable_auth_on_inference"], &notes)
+  return out
+}
+
+function mapAuth(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const topRaw = find(top, "auth_config")
+  let gov = try members(find(top, "governance"))
+  if (topRaw !== undefined) {
+    top = without(top, ["auth_config"])
+    if (find(gov, "auth_config") !== undefined) {
+      notes.push(`config: "auth_config" is ignored: "governance.auth_config" is set, and it wins`)
+    } else {
+      notes.push(`config: "auth_config" read as "governance.auth_config"`)
+      setField(&gov, "auth_config", build(adminFields(try members(topRaw), "auth_config", &notes)))
+    }
+  }
+  const cur = find(gov, "auth_config")
+  if (cur === undefined) return
+  setField(&gov, "auth_config", build(adminFields(try members(cur), "governance.auth_config", &notes)))
+  put(&top, "governance", gov)
+}
+
+// Bifrost's client keys that Raiju keeps elsewhere.
+function mapClient(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const raw = find(top, "client")
+  if (raw === undefined) return
+  let cf = try members(raw)
+  let mcp = try members(find(top, "mcp"))
+  let mcpChanged = false
+  let clientChanged = false
+
+  const timeout = find(cf, "mcp_tool_execution_timeout")
+  if (timeout !== undefined) {
+    cf = without(cf, ["mcp_tool_execution_timeout"])
+    clientChanged = true
+    if (find(mcp, "tool_execution_timeout_seconds") === undefined) {
+      setField(&mcp, "tool_execution_timeout_seconds", timeout)
+      mcpChanged = true
+      notes.push(`config: "client.mcp_tool_execution_timeout" read as "mcp.tool_execution_timeout_seconds"`)
+    } else {
+      notes.push(`config: "client.mcp_tool_execution_timeout" is ignored: "mcp.tool_execution_timeout_seconds" is set, and it wins`)
+    }
+  }
+
+  const retention = find(cf, "log_retention_days")
+  if (retention !== undefined) {
+    cf = without(cf, ["log_retention_days"])
+    clientChanged = true
+    const lsRaw = find(top, "logs_store")
+    if (lsRaw === undefined) {
+      notes.push(`config: "client.log_retention_days" is not applied: it needs a "logs_store" section`)
+    } else {
+      let ls = try members(lsRaw)
+      if (find(ls, "retention_days") === undefined) {
+        setField(&ls, "retention_days", retention)
+        put(&top, "logs_store", ls)
+        notes.push(`config: "client.log_retention_days" read as "logs_store.retention_days"`)
+      } else {
+        notes.push(`config: "client.log_retention_days" is ignored: "logs_store.retention_days" is set, and it wins`)
+      }
+    }
+  }
+
+  if (clientChanged) put(&top, "client", cf)
+  if (mcpChanged) put(&top, "mcp", mcp)
+}
+
+// The name each Bifrost MCP client id goes by. Raiju's tool names start with it.
+function clientNames(mf: Field[]): Map<string, string> throws SyntaxError {
+  const out: Map<string, string> = new Map()
+  for (const el of try items(find(mf, "client_configs"))) {
+    const cf = try members(el)
+    const id = rawStr(cf, "client_id")
+    const name = rawStr(cf, "name")
+    if (id !== undefined && name !== undefined) out.set(id, name)
+  }
+  return out
+}
+
+// One Bifrost virtual MCP as a Raiju VirtualMcp (src/vmcp.tov), or undefined when it is not loaded.
+function virtualMcp(el: string, names: Map<string, string>, inout notes: string[]): string | undefined throws SyntaxError {
+  const f = try members(el)
+  const name = rawStr(f, "endpoint_slug") ?? rawStr(f, "name")
+  if (name === undefined || name === "") {
+    notes.push(`config: a virtual MCP with no endpoint_slug or name is not loaded`)
+    return undefined
+  }
+  if (rawBool(f, "enabled") === false) {
+    notes.push(`config: virtual MCP "${name}" is disabled in Bifrost and is not loaded`)
+    return undefined
+  }
+  let vf: Field[] = [{ key: "name", raw: quote(name) }]
+  add(&vf, "description", strRaw(f, "description"))
+  let tools: string[] = []
+  for (const t of try items(find(f, "tools"))) {
+    const tf = try members(t)
+    let client: string | undefined = rawStr(tf, "mcp_client_name")
+    if (client === undefined) {
+      const id = rawStr(tf, "mcp_client_id")
+      if (id !== undefined) client = names.get(id)
+    }
+    if (client === undefined) {
+      notes.push(`config: virtual MCP "${name}" has a tool entry for an unknown MCP client, which is skipped`)
+      continue
+    }
+    for (const tn of try strings(find(tf, "tool_names"))) {
+      // "*" in Bifrost means every tool of the client, so it becomes Raiju's "<client>-*" pattern
+      const src = tn === "*" ? `${client}-*` : `${client}-${tn}`
+      tools.push(build([{ key: "source", raw: quote(src) }]))
+    }
+  }
+  vf.push({ key: "tools", raw: "[" + tools.join(",") + "]" })
+  add(&vf, "allowed_keys", find(f, "virtual_key_ids"))
+  return build(vf)
+}
+
+// mcp.virtual_mcps becomes the top-level virtual_mcps list. mcp.tool_groups is the
+// deprecated Bifrost name for the same list, with the same tool entries.
+function mapMcp(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const raw = find(top, "mcp")
+  if (raw === undefined) return
+  const mf = try members(raw)
+  const vraw = find(mf, "virtual_mcps")
+  const graw = find(mf, "tool_groups")
+  if (vraw === undefined && graw === undefined) return
+  put(&top, "mcp", without(mf, ["virtual_mcps", "tool_groups"]))
+  if (find(top, "virtual_mcps") !== undefined) {
+    notes.push(`config: "mcp.virtual_mcps" is ignored: "virtual_mcps" is set, and it wins`)
+    return
+  }
+  if (vraw !== undefined) {
+    notes.push(`config: "mcp.virtual_mcps" read as "virtual_mcps"`)
+    if (graw !== undefined) notes.push(`config: "mcp.tool_groups" is ignored: "mcp.virtual_mcps" is set, and it wins`)
+  } else {
+    notes.push(`config: "mcp.tool_groups" read as "virtual_mcps" (deprecated in Bifrost)`)
+  }
+  const names = try clientNames(mf)
+  let vms: string[] = []
+  for (const el of try items(vraw ?? graw)) {
+    const vm = try virtualMcp(el, names, &notes)
+    if (vm !== undefined) vms.push(vm)
+  }
+  setField(&top, "virtual_mcps", "[" + vms.join(",") + "]")
+}
+
+// alerting becomes alerts. Raiju alerts fire on metric thresholds, so Bifrost's
+// CEL rules are not loaded; channels carry over when Raiju can send to them.
+function mapAlerting(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const raw = find(top, "alerting")
+  if (raw === undefined) return
+  top = without(top, ["alerting"])
+  if (find(top, "alerts") !== undefined) {
+    notes.push(`config: "alerting" is ignored: "alerts" is set, and it wins`)
+    return
+  }
+  notes.push(`config: "alerting" read as "alerts"`)
+  const af = try members(raw)
+  let channels: string[] = []
+  let skipped = 0
+  for (const el of try items(find(af, "channels"))) {
+    const cf = try members(el)
+    const kind = rawStr(cf, "type") ?? ""
+    const conf = try members(find(cf, "config"))
+    const url = strRaw(conf, "url") ?? strRaw(conf, "webhook_url")
+    if (rawBool(cf, "enabled") === false || (kind !== "slack" && kind !== "webhook") || url === undefined) {
+      skipped += 1
+      continue
+    }
+    let ch: Field[] = []
+    add(&ch, "id", strRaw(cf, "id") ?? quote(`channel-${channels.length + 1}`))
+    add(&ch, "type", quote(kind))
+    add(&ch, "url", url)
+    if (kind === "webhook") add(&ch, "headers", find(conf, "headers"))
+    channels.push(build(ch))
+  }
+  if (skipped > 0) notes.push(`config: ${skipped} alerting channel(s) skipped: Raiju sends to enabled slack and webhook channels with a url`)
+  const rules = try items(find(af, "rules")).length
+  if (rules > 0) notes.push(`config: ${rules} alerting rule(s) use CEL expressions, which Raiju does not evaluate; they are not loaded`)
+  ignored("alerting", af, ["history_retention_days", "webhook_network"], &notes)
+  let out: Field[] = []
+  add(&out, "channels", "[" + channels.join(",") + "]")
+  add(&out, "rules", "[]")
+  put(&top, "alerts", out)
+}
+
+// audit_logs becomes audit. Bifrost's disabled flag is the inverse of Raiju's enabled.
+function mapAudit(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const raw = find(top, "audit_logs")
+  if (raw === undefined) return
+  top = without(top, ["audit_logs"])
+  if (find(top, "audit") !== undefined) {
+    notes.push(`config: "audit_logs" is ignored: "audit" is set, and it wins`)
+    return
+  }
+  notes.push(`config: "audit_logs" read as "audit"`)
+  const af = try members(raw)
+  let out: Field[] = []
+  add(&out, "enabled", rawBool(af, "disabled") === true ? "false" : "true")
+  const key = strRaw(af, "hmac_key")
+  add(&out, "key", key)
+  if (key === undefined || key === "\"\"") notes.push(`config: "audit_logs.hmac_key" is not set, so audit entries are signed with an empty key`)
+  ignored("audit_logs", af, ["retention_days", "omit_ip_addresses", "archive_interval", "archive_grace_period", "archive_max_object_bytes", "object_storage"], &notes)
+  put(&top, "audit", out)
+}
+
+// cluster_config becomes cluster. Raiju signs cluster sync with cluster.secret,
+// which Bifrost does not have, and it syncs only mesh-style peers. So the cluster
+// stays off until a secret is set in the Raiju section.
+function mapCluster(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const raw = find(top, "cluster_config")
+  if (raw === undefined) return
+  top = without(top, ["cluster_config"])
+  if (find(top, "cluster") !== undefined) {
+    notes.push(`config: "cluster_config" is ignored: "cluster" is set, and it wins`)
+    return
+  }
+  notes.push(`config: "cluster_config" read as "cluster"`)
+  const cf = try members(raw)
+  let enabled = rawBool(cf, "enabled") === true
+  if (enabled && rawStr(cf, "type") === "broker") {
+    notes.push(`config: "cluster_config.type" is "broker", which Raiju does not support; cluster sync is off`)
+    enabled = false
+  }
+  if (enabled) {
+    notes.push(`config: "cluster_config" has no shared secret, which Raiju needs for cluster sync; cluster sync is off until "cluster.secret" is set`)
+    enabled = false
+  }
+  ignored("cluster_config", cf, ["region", "gossip", "grpc", "discovery", "broker"], &notes)
+  let out: Field[] = []
+  add(&out, "enabled", enabled ? "true" : "false")
+  add(&out, "peers", find(cf, "peers") ?? "[]")
+  put(&top, "cluster", out)
+}
+
+// circuit_breaker_config and load_balancer_config both feed Raiju's health section.
+// Raiju's breaker opens on failures, not on Bifrost's response-header signals, and
+// it does not reroute to another provider. Adaptive balancing maps to key selection.
+function mapHealth(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const cbRaw = find(top, "circuit_breaker_config")
+  const lbRaw = find(top, "load_balancer_config")
+  if (cbRaw === undefined && lbRaw === undefined) return
+  top = without(top, ["circuit_breaker_config", "load_balancer_config"])
+  if (find(top, "health") !== undefined) {
+    if (cbRaw !== undefined) notes.push(`config: "circuit_breaker_config" is ignored: "health" is set, and it wins`)
+    if (lbRaw !== undefined) notes.push(`config: "load_balancer_config" is ignored: "health" is set, and it wins`)
+    return
+  }
+  let hc: Field[] = []
+  if (cbRaw !== undefined) {
+    notes.push(`config: "circuit_breaker_config" read as "health"`)
+    let on = false
+    let cooldown: string | undefined = undefined
+    for (const el of try items(find(try members(cbRaw), "policies"))) {
+      const pf = try members(el)
+      if (rawBool(pf, "enabled") !== true) continue
+      on = true
+      const name = rawStr(pf, "name") ?? ""
+      if (find(pf, "fallback_provider") !== undefined) notes.push(`config: circuit breaker "${name}" has a fallback provider; Raiju does not reroute to another provider, so the fallback is not applied`)
+      if (find(pf, "condition") !== undefined) notes.push(`config: circuit breaker "${name}" opens on response headers; Raiju opens on failures, so the header signal is not read`)
+      const cd = rawStr(pf, "default_cooldown")
+      if (cd !== undefined && cooldown === undefined) {
+        const secs = goSeconds(cd)
+        if (secs === undefined) notes.push(`config: circuit breaker "${name}" has an unreadable default_cooldown; Raiju's default is used`)
+        else cooldown = `${secs}`
+      }
+    }
+    if (on) add(&hc, "circuit_breaker", "true")
+    add(&hc, "open_seconds", cooldown)
+  }
+  if (lbRaw !== undefined) {
+    notes.push(`config: "load_balancer_config" read as "health.adaptive"`)
+    const lf = try members(lbRaw)
+    const on = rawBool(lf, "enabled") === true && rawBool(lf, "route_selection_enabled") !== false
+    add(&hc, "adaptive", on ? "true" : "false")
+    ignored("load_balancer_config", lf, ["direction_selection_enabled", "append_fallbacks_to_pinned", "reroute_failed_directions", "prune_failed_fallbacks", "tracker_config", "bootstrap"], &notes)
+  }
+  if (hc.length > 0) put(&top, "health", hc)
+}
+
+// framework.pricing's pricing_url and pricing_sync_interval become pricing_sync.
+// framework itself stays as written.
+function mapPricing(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const fw = try members(find(top, "framework"))
+  const praw = find(fw, "pricing")
+  if (praw === undefined) return
+  const pf = try members(praw)
+  ignored("framework.pricing", pf, ["model_parameters_url", "mcp_library_url", "mcp_library_sync_interval", "live_models_sync_interval"], &notes)
+  const url = strRaw(pf, "pricing_url")
+  const iv = find(pf, "pricing_sync_interval")
+  if (url === undefined && iv === undefined) return
+  if (find(top, "pricing_sync") !== undefined) {
+    notes.push(`config: "framework.pricing" is ignored: "pricing_sync" is set, and it wins`)
+    return
+  }
+  notes.push(`config: "framework.pricing" read as "pricing_sync"`)
+  let out: Field[] = []
+  add(&out, "url", url)
+  add(&out, "interval_seconds", iv)
+  put(&top, "pricing_sync", out)
+}
+
+// A semantic_cache plugin entry becomes the top-level semantic_cache section.
+// Bifrost's ttl may be a duration string; Raiju's is seconds.
+function semanticCache(f: Field[], pname: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  if (find(top, "semantic_cache") !== undefined) {
+    notes.push(`config: plugin "${pname}" is ignored: "semantic_cache" is set, and it wins`)
+    return
+  }
+  const cf = try members(find(f, "config"))
+  const provider = strRaw(cf, "provider")
+  const model = strRaw(cf, "embedding_model")
+  if (provider === undefined || model === undefined) {
+    notes.push(`config: plugin "${pname}" needs both provider and embedding_model; it is not loaded`)
+    return
+  }
+  notes.push(`config: plugin "${pname}" read as "semantic_cache"`)
+  let out: Field[] = []
+  add(&out, "enabled", find(f, "enabled"))
+  add(&out, "provider", provider)
+  add(&out, "embedding_model", model)
+  for (const k of ["threshold", "conversation_history_threshold", "exclude_system_prompt", "cache_by_model", "cache_by_provider", "default_cache_key"]) {
+    add(&out, k, find(cf, k))
+  }
+  const ttl = find(cf, "ttl")
+  if (ttl !== undefined) {
+    if (ttl.startsWith("\"")) {
+      const secs = goSeconds(try decodeString(ttl))
+      if (secs === undefined) notes.push(`config: plugin "${pname}" has an unreadable ttl; Raiju's default is used`)
+      else add(&out, "ttl", `${secs}`)
+    } else {
+      add(&out, "ttl", ttl)
+    }
+  }
+  ignored(`plugins[${pname}].config`, cf, ["vector_store_namespace", "dimension", "cache_tool_call_responses", "disable_identity_scoping"], &notes)
+  put(&top, "semantic_cache", out)
+}
+
+// Takes the semantic cache out of plugins[]; the other plugins stay in place.
+function mapPlugins(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const raw = find(top, "plugins")
+  if (raw === undefined || !raw.startsWith("[")) return
+  let keep: string[] = []
+  let found = false
+  for (const el of try elements(raw)) {
+    const f = try members(el)
+    const name = rawStr(f, "name") ?? ""
+    if (name !== "semantic_cache" && name !== "semanticcache") {
+      keep.push(el)
+      continue
+    }
+    if (found) {
+      notes.push(`config: plugin "${name}" is ignored: only one semantic cache plugin is read`)
+      continue
+    }
+    found = true
+    try semanticCache(f, name, &top, &notes)
+  }
+  setField(&top, "plugins", "[" + keep.join(",") + "]")
+}
+
+// Rewrites a Bifrost config.json into the names Raiju reads. The returned text
+// is for parsing only: it drops the Bifrost sections it consumed, so keep the
+// original text for anything written back to the config store. notes says what
+// was renamed, what was kept because Raiju already had the section, and what
+// could not be mapped.
+export function normalize(configText: string): { text: string, notes: string[] } throws SyntaxError {
+  let top = try fields(configText)
+  let notes: string[] = []
+  try mapAuth(&top, &notes)
+  try mapClient(&top, &notes)
+  try mapMcp(&top, &notes)
+  try mapAlerting(&top, &notes)
+  try mapAudit(&top, &notes)
+  try mapCluster(&top, &notes)
+  try mapHealth(&top, &notes)
+  try mapPricing(&top, &notes)
+  try mapPlugins(&top, &notes)
+  return { text: build(top), notes: notes }
+}
+
+function checkChildren(path: string, raw: string, known: string[], inout out: string[]): void throws SyntaxError {
+  for (const f of try members(raw)) {
+    const p = `${path}.${f.key}`
+    if (!known.includes(f.key) || notImplemented(p)) out.push(p)
+  }
+}
+
+// Dotted paths of keys Raiju does not understand, for top-level sections and one
+// level down in client, providers.<name>, governance and mcp. Keys Raiju parses
+// but never acts on are listed too; warnings() tells the two kinds apart.
+export function unknownKeys(configText: string): string[] throws SyntaxError {
+  const top = try fields(configText)
+  let out: string[] = []
+  for (const f of top) {
+    if (!topKeys().includes(f.key)) {
+      out.push(f.key)
+      continue
+    }
+    if (f.key === "client") try checkChildren("client", f.raw, clientKeys(), &out)
+    if (f.key === "governance") try checkChildren("governance", f.raw, governanceKeys(), &out)
+    if (f.key === "mcp") try checkChildren("mcp", f.raw, mcpKeys(), &out)
+    if (f.key === "providers") {
+      for (const p of try members(f.raw)) {
+        try checkChildren(`providers.${p.key}`, p.raw, providerKeys(), &out)
+      }
+    }
+    if (notImplemented(f.key)) out.push(f.key)
+  }
+  return out
+}
+
+// Human-readable startup warnings: the notes from normalize, then a line for each
+// key that is ignored or accepted but not implemented. Unknown keys are checked on
+// the normalized text, so the Bifrost sections already read do not show up again.
+export function warnings(configText: string): string[] throws SyntaxError {
+  const n = try normalize(configText)
+  let out: string[] = n.notes
+  for (const p of try unknownKeys(n.text)) {
+    if (notImplemented(p)) out.push(`config: "${p}" is accepted but not implemented`)
+    else out.push(`config: unknown key "${p}" is ignored`)
+  }
+  return out
+}
+
+test("renames alerting to alerts and maps channels", () => {
+  const r = try normalize(`{
+    "alerting": {
+      "history_retention_days": 90,
+      "channels": [
+        { "id": "ops", "name": "ops", "type": "slack", "enabled": true, "config": { "webhook_url": "https://hooks.example/slack" } },
+        { "id": "hook", "name": "hook", "type": "webhook", "enabled": true, "config": { "url": "https://hooks.example/h", "headers": { "X-Token": "t" } } },
+        { "id": "pd", "name": "pd", "type": "pagerduty", "enabled": true, "config": { "routing_key": "k" } }
+      ],
+      "rules": [ { "id": "r1", "name": "spend", "enabled": true, "scope_type": "virtual_key", "scope_id": "vk1", "cel_expression": "budget_usage_percent > 90", "channel_ids": ["ops"] } ]
+    }
+  }`)
+  expect(find(try fields(r.text), "alerting")).toBeUndefined()
+  const al = try fields(find(try fields(r.text), "alerts")!)
+  expect(find(al, "rules")).toBe("[]")
+  const chans = try elements(find(al, "channels")!)
+  expect(chans.length).toBe(2)
+  expect(chans[0]).toBe(`{"id":"ops","type":"slack","url":"https://hooks.example/slack"}`)
+  expect(chans[1]).toBe(`{"id":"hook","type":"webhook","url":"https://hooks.example/h","headers":{ "X-Token": "t" }}`)
+  expect(r.notes.includes(`config: "alerting" read as "alerts"`)).toBe(true)
+  expect(r.notes.includes(`config: 1 alerting channel(s) skipped: Raiju sends to enabled slack and webhook channels with a url`)).toBe(true)
+  expect(r.notes.includes(`config: 1 alerting rule(s) use CEL expressions, which Raiju does not evaluate; they are not loaded`)).toBe(true)
+  expect(r.notes.includes(`config: "alerting.history_retention_days" is not supported by Raiju and is ignored`)).toBe(true)
+})
+
+test("maps audit_logs to audit and flags an empty signing key", () => {
+  const r = try normalize(`{ "audit_logs": { "disabled": false, "hmac_key": "env.AUDIT_KEY", "retention_days": 30, "archive_interval": "24h" } }`)
+  const au = try fields(find(try fields(r.text), "audit")!)
+  expect(rawBool(au, "enabled")).toBe(true)
+  expect(rawStr(au, "key")).toBe("env.AUDIT_KEY")
+  expect(r.notes.includes(`config: "audit_logs.retention_days" is not supported by Raiju and is ignored`)).toBe(true)
+  const off = try normalize(`{ "audit_logs": { "disabled": true } }`)
+  const af = try fields(find(try fields(off.text), "audit")!)
+  expect(rawBool(af, "enabled")).toBe(false)
+  expect(off.notes.includes(`config: "audit_logs.hmac_key" is not set, so audit entries are signed with an empty key`)).toBe(true)
+})
+
+test("keeps the cluster off without a secret, and says why", () => {
+  const r = try normalize(`{ "cluster_config": { "enabled": true, "type": "mesh", "region": "eu", "peers": ["https://n2.example"], "gossip": { "port": 4001, "config": { "timeout_seconds": 3, "success_threshold": 1, "failure_threshold": 3 } } } }`)
+  const cl = try fields(find(try fields(r.text), "cluster")!)
+  expect(rawBool(cl, "enabled")).toBe(false)
+  expect(find(cl, "peers")).toBe(`["https://n2.example"]`)
+  expect(r.notes.includes(`config: "cluster_config" has no shared secret, which Raiju needs for cluster sync; cluster sync is off until "cluster.secret" is set`)).toBe(true)
+  const b = try normalize(`{ "cluster_config": { "enabled": true, "type": "broker" } }`)
+  expect(b.notes.includes(`config: "cluster_config.type" is "broker", which Raiju does not support; cluster sync is off`)).toBe(true)
+})
+
+test("maps circuit_breaker_config and load_balancer_config into one health section", () => {
+  const r = try normalize(`{
+    "circuit_breaker_config": { "policies": [
+      { "name": "spill", "enabled": true, "primary_provider": "azure", "primary_model": "gpt-4o", "fallback_provider": "azure", "fallback_model": "gpt-4o-paygo",
+        "condition": { "operator": "OR", "signals": [ { "source": "response_header", "header_name": "X-Spill", "header_value": "true" } ] },
+        "default_cooldown": "30s" },
+      { "name": "off", "enabled": false, "primary_provider": "openai", "primary_model": "gpt-4o" }
+    ] },
+    "load_balancer_config": { "enabled": true, "direction_selection_enabled": true, "route_selection_enabled": true, "prune_failed_fallbacks": true }
+  }`)
+  const h = try fields(find(try fields(r.text), "health")!)
+  expect(rawBool(h, "circuit_breaker")).toBe(true)
+  expect(find(h, "open_seconds")).toBe("30")
+  expect(rawBool(h, "adaptive")).toBe(true)
+  expect(find(try fields(r.text), "circuit_breaker_config")).toBeUndefined()
+  expect(find(try fields(r.text), "load_balancer_config")).toBeUndefined()
+  expect(r.notes.includes(`config: circuit breaker "spill" has a fallback provider; Raiju does not reroute to another provider, so the fallback is not applied`)).toBe(true)
+  expect(r.notes.includes(`config: circuit breaker "spill" opens on response headers; Raiju opens on failures, so the header signal is not read`)).toBe(true)
+  expect(r.notes.includes(`config: "load_balancer_config.direction_selection_enabled" is not supported by Raiju and is ignored`)).toBe(true)
+  const lb = try normalize(`{ "load_balancer_config": { "enabled": true, "route_selection_enabled": false } }`)
+  expect(rawBool(try fields(find(try fields(lb.text), "health")!), "adaptive")).toBe(false)
+})
+
+test("reads framework.pricing as pricing_sync and keeps framework", () => {
+  const r = try normalize(`{ "framework": { "pricing": { "pricing_url": "https://prices.example/x.json", "pricing_sync_interval": 3600, "model_parameters_url": "https://p.example" } } }`)
+  const ps = try fields(find(try fields(r.text), "pricing_sync")!)
+  expect(rawStr(ps, "url")).toBe("https://prices.example/x.json")
+  expect(find(ps, "interval_seconds")).toBe("3600")
+  expect(find(try fields(r.text), "framework")).toBeDefined()
+  expect(r.notes.includes(`config: "framework.pricing" read as "pricing_sync"`)).toBe(true)
+  expect(r.notes.includes(`config: "framework.pricing.model_parameters_url" is not supported by Raiju and is ignored`)).toBe(true)
+})
+
+test("maps mcp.virtual_mcps to virtual_mcps with Raiju tool sources", () => {
+  const r = try normalize(`{
+    "mcp": {
+      "client_configs": [ { "client_id": "c-git", "name": "git", "connection_type": "http", "connection_string": "https://g.example/mcp" } ],
+      "virtual_mcps": [
+        { "id": 1, "name": "dev", "endpoint_slug": "dev", "description": "Dev tools", "enabled": true,
+          "tools": [ { "mcp_client_id": "c-git", "tool_names": ["status", "log"] }, { "mcp_client_name": "fs", "tool_names": ["*"] } ],
+          "virtual_key_ids": ["vk-1"] },
+        { "id": 2, "name": "old", "endpoint_slug": "old", "enabled": false, "tools": [] }
+      ]
+    }
+  }`)
+  const vm = try elements(find(try fields(r.text), "virtual_mcps")!)
+  expect(vm.length).toBe(1)
+  const v = try fields(vm[0]!)
+  expect(rawStr(v, "name")).toBe("dev")
+  expect(rawStr(v, "description")).toBe("Dev tools")
+  expect(find(v, "tools")).toBe(`[{"source":"git-status"},{"source":"git-log"},{"source":"fs-*"}]`)
+  expect(find(v, "allowed_keys")).toBe(`["vk-1"]`)
+  const mcp = try fields(find(try fields(r.text), "mcp")!)
+  expect(find(mcp, "virtual_mcps")).toBeUndefined()
+  expect(find(mcp, "client_configs")).toBeDefined()
+  expect(r.notes.includes(`config: virtual MCP "old" is disabled in Bifrost and is not loaded`)).toBe(true)
+})
+
+test("reads the deprecated mcp.tool_groups as virtual_mcps", () => {
+  const r = try normalize(`{ "mcp": { "tool_groups": [ { "name": "ops", "enabled": true, "tools": [ { "mcp_client_name": "git", "tool_names": ["*"] } ] } ] } }`)
+  const vm = try elements(find(try fields(r.text), "virtual_mcps")!)
+  expect(vm.length).toBe(1)
+  expect(find(try fields(vm[0]!), "tools")).toBe(`[{"source":"git-*"}]`)
+  expect(find(try fields(find(try fields(r.text), "mcp")!), "tool_groups")).toBeUndefined()
+  expect(r.notes.includes(`config: "mcp.tool_groups" read as "virtual_mcps" (deprecated in Bifrost)`)).toBe(true)
+})
+
+test("maps the semantic_cache plugin and keeps the other plugins", () => {
+  const r = try normalize(`{
+    "plugins": [
+      { "enabled": true, "name": "semantic_cache", "config": { "provider": "openai", "embedding_model": "text-embedding-3-small", "ttl": "5m", "threshold": 0.9, "dimension": 1536, "cache_by_model": false } },
+      { "enabled": true, "name": "maxtokens", "config": { "default_max_tokens": 100 } }
+    ]
+  }`)
+  const sc = try fields(find(try fields(r.text), "semantic_cache")!)
+  expect(rawStr(sc, "provider")).toBe("openai")
+  expect(rawStr(sc, "embedding_model")).toBe("text-embedding-3-small")
+  expect(find(sc, "ttl")).toBe("300")
+  expect(find(sc, "threshold")).toBe("0.9")
+  expect(find(sc, "cache_by_model")).toBe("false")
+  const plugins = try elements(find(try fields(r.text), "plugins")!)
+  expect(plugins.length).toBe(1)
+  expect(r.notes.includes(`config: "plugins[semantic_cache].config.dimension" is not supported by Raiju and is ignored`)).toBe(true)
+  const numTtl = try normalize(`{ "plugins": [ { "enabled": true, "name": "semanticcache", "config": { "provider": "openai", "embedding_model": "e", "ttl": 90 } } ] }`)
+  const nsc = find(try fields(numTtl.text), "semantic_cache")!
+  expect(find(try fields(nsc), "ttl")).toBe("90")
+})
+
+test("existing Raiju sections win over Bifrost ones, with a note", () => {
+  const r = try normalize(`{
+    "alerts": { "enabled": false },
+    "alerting": { "channels": [] },
+    "audit": { "enabled": true, "dir": "logs/x" },
+    "audit_logs": { "disabled": true },
+    "plugins": [ { "enabled": true, "name": "semantic_cache", "config": { "provider": "openai", "embedding_model": "e" } } ],
+    "semantic_cache": { "enabled": false, "provider": "openai", "embedding_model": "mine" }
+  }`)
+  expect(find(try fields(r.text), "alerting")).toBeUndefined()
+  expect(find(try fields(r.text), "alerts")).toBe(`{ "enabled": false }`)
+  expect(find(try fields(r.text), "audit")).toBe(`{ "enabled": true, "dir": "logs/x" }`)
+  expect(r.notes.includes(`config: "alerting" is ignored: "alerts" is set, and it wins`)).toBe(true)
+  expect(r.notes.includes(`config: "audit_logs" is ignored: "audit" is set, and it wins`)).toBe(true)
+  expect(r.notes.includes(`config: plugin "semantic_cache" is ignored: "semantic_cache" is set, and it wins`)).toBe(true)
+  expect(find(try fields(r.text), "semantic_cache")).toBe(`{ "enabled": false, "provider": "openai", "embedding_model": "mine" }`)
+})
+
+test("maps client keys and top-level auth into Raiju's sections", () => {
+  const r = try normalize(`{
+    "client": { "mcp_tool_execution_timeout": 45, "log_retention_days": 14, "enforce_auth_on_inference": true, "max_request_body_size_mb": 10 },
+    "logs_store": { "enabled": true },
+    "auth_config": { "admin_username": "root", "admin_password": "env.ADMIN_PW", "is_enabled": true }
+  }`)
+  const cl = try fields(find(try fields(r.text), "client")!)
+  expect(find(cl, "mcp_tool_execution_timeout")).toBeUndefined()
+  expect(find(cl, "log_retention_days")).toBeUndefined()
+  expect(find(cl, "max_request_body_size_mb")).toBe("10")
+  const mcp = try fields(find(try fields(r.text), "mcp")!)
+  expect(find(mcp, "tool_execution_timeout_seconds")).toBe("45")
+  const ls = try fields(find(try fields(r.text), "logs_store")!)
+  expect(find(ls, "retention_days")).toBe("14")
+  const gov = try fields(find(try fields(r.text), "governance")!)
+  const ga = try fields(find(gov, "auth_config")!)
+  expect(rawStr(ga, "username")).toBe("root")
+  expect(rawStr(ga, "password")).toBe("env.ADMIN_PW")
+  expect(find(try fields(r.text), "auth_config")).toBeUndefined()
+  expect(r.notes.includes(`config: "auth_config.is_enabled" is not supported by Raiju and is ignored`)).toBe(true)
+  const none = try normalize(`{ "client": { "log_retention_days": 14 } }`)
+  expect(none.notes.includes(`config: "client.log_retention_days" is not applied: it needs a "logs_store" section`)).toBe(true)
+})
+
+test("unknownKeys lists ignored keys and the accepted-but-unused ones", () => {
+  const keys = try unknownKeys(`{
+    "$schema": "x",
+    "server": { "port": 8080 },
+    "guardrails_config": {},
+    "guardrails": { "enabled": true },
+    "client": { "enforce_auth_on_inference": true, "drop_excess_requests": false, "allow_direct_keys": false, "prometheus_labels": [], "enable_logging": true },
+    "providers": { "openai": { "keys": [], "send_back_raw_response": false, "prompt_cache": {} } },
+    "governance": { "business_units": [], "budgets": [] },
+    "mcp": { "tool_manager_config": {}, "client_configs": [] },
+    "pricing_sync": { "url": "x" }
+  }`)
+  expect(keys).toEqual([
+    "server",
+    "client.drop_excess_requests",
+    "client.allow_direct_keys",
+    "client.prometheus_labels",
+    "providers.openai.send_back_raw_response",
+    "providers.openai.prompt_cache",
+    "governance.business_units",
+    "mcp.tool_manager_config",
+  ])
+})
+
+test("warnings formats renames and unknown keys", () => {
+  const w = try warnings(`{ "alerting": { "channels": [] }, "server": {}, "client": { "drop_excess_requests": true } }`)
+  expect(w.includes(`config: "alerting" read as "alerts"`)).toBe(true)
+  expect(w.includes(`config: unknown key "server" is ignored`)).toBe(true)
+  expect(w.includes(`config: "client.drop_excess_requests" is accepted but not implemented`)).toBe(true)
+  expect(w.includes(`config: unknown key "alerting" is ignored`)).toBe(false)
+  expect(w.length).toBe(3)
+  const clean = try warnings(`{ "client": { "enable_logging": true }, "providers": {} }`)
+  expect(clean.length).toBe(0)
+})
+
+// The shape Raiju reads from the normalized text, as the lead's typed parse sees it.
+type Probe = {
+  health?: { circuit_breaker?: bool, adaptive?: bool, open_seconds?: int },
+  alerts?: { channels?: { id: string, type: "webhook" | "slack", url: string }[], rules?: string[] },
+  semantic_cache?: { provider: string, embedding_model: string, ttl?: int },
+  pricing_sync?: { url?: string, interval_seconds?: int },
+}
+
+test("normalized text parses into the typed shape Raiju reads", () => {
+  const r = try normalize(`{
+    "alerting": { "channels": [ { "id": "ops", "type": "slack", "enabled": true, "config": { "webhook_url": "https://hooks.example/s" } } ] },
+    "circuit_breaker_config": { "policies": [ { "name": "p", "enabled": true, "default_cooldown": "1m" } ] },
+    "load_balancer_config": { "enabled": true },
+    "framework": { "pricing": { "pricing_url": "https://prices.example/p.json", "pricing_sync_interval": 3600 } },
+    "plugins": [ { "enabled": true, "name": "semantic_cache", "config": { "provider": "openai", "embedding_model": "e", "ttl": "1h" } } ]
+  }`)
+  const p = try JSON.parse(r.text) as Probe
+  expect(p.alerts!.channels![0]!.url).toBe("https://hooks.example/s")
+  expect(p.alerts!.rules!.length).toBe(0)
+  expect(p.health!.circuit_breaker).toBe(true)
+  expect(p.health!.adaptive).toBe(true)
+  expect(p.health!.open_seconds).toBe(60)
+  expect(p.semantic_cache!.provider).toBe("openai")
+  expect(p.semantic_cache!.ttl).toBe(3600)
+  expect(p.pricing_sync!.interval_seconds).toBe(3600)
+})
+
+// A trimmed copy of Bifrost's withpostgresmcpclientsinconfig example.
+test("a whole Bifrost example: what is mapped and what is left", () => {
+  const text = `{
+    "$schema": "https://www.getbifrost.ai/schema",
+    "client": { "enable_logging": true, "enforce_auth_on_inference": true, "log_retention_days": 30, "initial_pool_size": 300, "max_request_body_size_mb": 100 },
+    "config_store": { "enabled": true, "type": "postgres", "config": { "host": "localhost" } },
+    "logs_store": { "enabled": true, "type": "postgres", "config": { "host": "localhost" } },
+    "mcp": {
+      "tool_manager_config": { "server_instructions_mode": "gateway" },
+      "client_configs": [ { "name": "WeatherService", "connection_type": "http", "client_id": "weather", "connection_string": "http://localhost:8080/mcp" } ]
+    },
+    "governance": {
+      "auth_config": { "admin_username": "env.ADMIN_USER", "admin_password": "env.ADMIN_PW" },
+      "virtual_keys": [ { "id": "vk-1", "name": "portal", "value": "env.VK", "mcp_configs": [ { "mcp_client_name": "WeatherService", "tools_to_execute": ["*"] } ] } ]
+    },
+    "plugins": [ { "enabled": true, "name": "governance", "config": { "is_vk_mandatory": true } } ],
+    "providers": { "openai": { "keys": [ { "name": "k", "value": "env.OPENAI_API_KEY", "models": ["*"], "weight": 1 } ] } }
+  }`
+  const r = try normalize(text)
+  const p = try JSON.parse(r.text) as { logs_store?: { retention_days?: int }, governance?: { auth_config?: { username?: string, password?: string } } }
+  expect(p.logs_store!.retention_days).toBe(30)
+  expect(p.governance!.auth_config!.username).toBe("env.ADMIN_USER")
+  expect(p.governance!.auth_config!.password).toBe("env.ADMIN_PW")
+  expect(r.notes.length).toBe(3)
+  const w = try warnings(text)
+  expect(w.includes(`config: unknown key "config_store" is ignored`)).toBe(true)
+  expect(w.includes(`config: unknown key "client.initial_pool_size" is ignored`)).toBe(true)
+  expect(w.includes(`config: unknown key "mcp.tool_manager_config" is ignored`)).toBe(true)
+  expect(w.includes(`config: unknown key "$schema" is ignored`)).toBe(false)
+  expect(w.length).toBe(3 + 3)
+})
+
+test("invalid JSON throws SyntaxError", () => {
+  let threw = false
+  try {
+    normalize(`{ "alerting": `)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

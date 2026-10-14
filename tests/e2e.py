@@ -114,6 +114,17 @@ def write_config():
          "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-wlogs")},
          "governance": {"rate_limits": [{"id": "w-rl", "request_max_limit": 3, "request_reset_duration": "1h"}], "virtual_keys": [{"id": "vk-w", "value": "sk-bf-workers", "rate_limit_id": "w-rl"}]}}
     json.dump(w, open(os.path.join(BUILD, "e2e.workers.json"), "w"))
+    # a config in Bifrost's own dialect: inference auth on by default, top-level auth_config,
+    # guardrails_config, pricing_overrides, and a section Raiju doesn't know
+    bf = {"client": {"enable_logging": False}, "providers": {"openai": cfg["providers"]["openai"]},
+          "auth_config": {"admin_username": "admin", "admin_password": "pw", "is_enabled": True},
+          "governance": {"budgets": [{"id": "bb", "max_limit": 0.5, "reset_duration": "1d"}],
+                         "virtual_keys": [{"id": "vk-bf", "value": "sk-bf-dialect", "budget_id": "bb"}],
+                         "pricing_overrides": [{"id": "po1", "name": "custom", "scope_kind": "global", "match_type": "exact", "pattern": "custom-model", "request_types": ["chat_completion"], "pricing_patch": json.dumps({"input_cost_per_token": 0.1, "output_cost_per_token": 0.1})}]},
+          "guardrails_config": {"guardrail_rules": [{"id": 1, "name": "r", "enabled": True, "cel_expression": "true", "apply_to": "input", "provider_config_ids": [1]}],
+                                "guardrail_providers": [{"id": 1, "provider_name": "webhook", "policy_name": "hook", "enabled": True, "config": {"url": MOCK + "/guard-hook"}}]},
+          "server": {"port": 1}}
+    json.dump(bf, open(os.path.join(BUILD, "e2e.bifrost.json"), "w"))
     return path
 
 def start_proxy():
@@ -181,6 +192,7 @@ def main():
     idp, idp_state = start_idp()
     proxy, proxied = start_proxy()
     gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=subprocess.DEVNULL)
+    gw_bf = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18093", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.bifrost.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.bifrost.log"), "w"))
     gw_w = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18094", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.workers.json"), "-workers", "3"], env=env, stderr=subprocess.DEVNULL)
     gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18097", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.node-b.json")], env=env, stderr=subprocess.DEVNULL)
     try:
@@ -612,6 +624,28 @@ def main():
         calls = [x for x in seen()[n:] if x["path"].endswith("/invoke")]
         check("bedrock titan embeddings, one call per input", s == 200 and len(r["data"]) == 3 and r["usage"]["prompt_tokens"] == 9 and len(calls) == 3, (b[:300], len(calls)))
 
+        # --- wave 8: a config in Bifrost's dialect ---
+        wait("http://127.0.0.1:18093/health")
+        BGW = "http://127.0.0.1:18093"
+        def bchat(model, headers=None, content="hello"):
+            return call("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": content}]}, headers, base=BGW)
+        s, _, _ = bchat("openai/gpt-4o-mini")
+        check("inference auth is on by default when the config has keys", s == 401, s)
+        BK = {"x-bf-vk": "sk-bf-dialect"}
+        s, _, _ = bchat("openai/gpt-4o-mini", BK)
+        check("a virtual key passes inference auth", s == 200, s)
+        s, _, _ = bchat("openai/gpt-4o-mini", {"authorization": "Basic YWRtaW46cHc="})
+        check("Bifrost's auth_config admin credentials pass inference auth", s == 200, s)
+        s, _, _ = call("GET", "/api/config", base=BGW, auth=False, headers={"authorization": "Basic YWRtaW46cHc="})
+        check("Bifrost's auth_config guards the management API", s == 200 and call("GET", "/api/config", base=BGW, auth=False)[0] == 401, s)
+        s, _, b = bchat("openai/gpt-4o-mini", BK, "something forbidden")
+        check("Bifrost's guardrails_config is enforced", s == 400 and "forbidden topic" in b, (s, b))
+        s1, _, _ = bchat("openai/custom-model", BK)
+        s2, _, b2 = bchat("openai/custom-model", BK)
+        check("pricing_overrides price an unknown model, so its budget runs down", s1 == 200 and s2 == 402, (s1, s2, b2))
+        log = open(os.path.join(BUILD, "e2e.bifrost.log")).read()
+        check("unknown config keys are reported at startup", 'unknown key "server" is ignored' in log, log[:600])
+
         # --- X07 ---
         s, _, b = chat("proxied/gpt-4o-mini", seed=990, headers={"x-bf-mcp-include-clients": "none"})
         import base64 as _b64
@@ -703,7 +737,7 @@ def main():
         s, _, b = call("POST", "/v1/chat/completions", "{not json")
         check("bad JSON is a 400", s == 400, b)
     finally:
-        gw.terminate(); gw_b.terminate(); mock.terminate(); gw_w.terminate(); idp.shutdown(); proxy.shutdown()
+        gw.terminate(); gw_b.terminate(); mock.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 

@@ -1,0 +1,663 @@
+// Reads Bifrost's guardrails_config and translates what Raiju can enforce into
+// Raiju's own GuardrailsConfig. Bifrost describes checks as rules that link to
+// provider profiles by id; Raiju runs one set of built-in detectors plus a list
+// of external providers, each with one scope. Anything without a Raiju
+// equivalent comes back as a warning, so no part of a Bifrost config is dropped
+// silently.
+
+import { GuardrailsConfig, GuardrailProviderConfig, PatronusEvaluatorConfig, getEnv } from "./config"
+import { Field, fields, elements, find, rawStr, rawNum, rawBool, isNull, decodeString } from "./json"
+
+type Scope = "input" | "output" | "both"
+
+// A Bifrost rule after the rule-level checks; providerIds are the raw id texts.
+type BRule = { label: string, scope: Scope, providerIds: string[] }
+
+// A Bifrost provider profile: top-level fields and the config object's fields.
+type BProvider = { id: string, label: string, kind: string, enabled: bool, top: Field[], cfg: Field[] }
+
+// Collects the output: Raiju providers, built-in detectors, detector modes and warnings.
+class Build {
+  notes: string[] = []
+  providers: GuardrailProviderConfig[] = []
+  detect: string[] = []
+  modes: string[] = []
+
+  warn(msg: string): void {
+    this.notes.push(msg)
+  }
+
+  addDetect(name: string): void {
+    if (!this.detect.includes(name)) this.detect.push(name)
+  }
+}
+
+// Keys that are present with a value. Used for settings Raiju cannot honour.
+function setKeys(fs: Field[], keys: string[]): string[] {
+  const out: string[] = []
+  for (const k of keys) {
+    if (!isNull(find(fs, k))) out.push(k)
+  }
+  return out
+}
+
+// Like setKeys, but false counts as off, for switches that default to off.
+function onKeys(fs: Field[], keys: string[]): string[] {
+  const out: string[] = []
+  for (const k of keys) {
+    const v = find(fs, k)
+    if (!isNull(v) && v !== "false") out.push(k)
+  }
+  return out
+}
+
+function ignoreNote(b: Build, label: string, keys: string[]): void {
+  if (keys.length > 0) b.warn(`${label}: ${keys.join(", ")} not supported by Raiju and ignored`)
+}
+
+// A string setting, or a number written as one (guardrail_version may be either).
+function strField(fs: Field[], key: string): string | undefined {
+  const s = rawStr(fs, key)
+  if (s !== undefined) return s
+  const n = rawNum(fs, key)
+  if (n === undefined) return undefined
+  return `${n}`
+}
+
+// Resolves an "env.NAME" reference now. An unset variable is reported and yields
+// undefined, so the provider is left out rather than failing on every request.
+function envValue(b: Build, label: string, key: string, v: string | undefined): string | undefined {
+  if (v === undefined) return undefined
+  if (!v.startsWith("env.")) return v
+  const got = getEnv(v.slice(4))
+  if (got === undefined || got === "") {
+    b.warn(`${label}: ${key} refers to ${v}, which is not set`)
+    return undefined
+  }
+  return got
+}
+
+function envStr(b: Build, label: string, cfg: Field[], key: string): string | undefined {
+  return envValue(b, label, key, strField(cfg, key))
+}
+
+// A required setting. Without it the provider cannot run, so it is left out.
+function need(b: Build, label: string, key: string, v: string | undefined): string | undefined {
+  if (v === undefined || v === "") {
+    b.warn(`${label} has no ${key}, so it is not loaded`)
+    return undefined
+  }
+  return v
+}
+
+// Bifrost actions: detect_only only logs, block stops the request, redact rewrites it.
+function actionMode(b: Build, label: string, action: string): string {
+  if (action === "detect_only") return "log"
+  if (action === "block") return "block"
+  if (action === "redact") return "redact"
+  b.warn(`${label}: unknown action "${action}", treated as block`)
+  return "block"
+}
+
+// Raiju redacts live content and writes [REDACTED:KIND]; other Bifrost choices differ.
+function redactNotes(b: Build, label: string, cfg: Field[], action: string): void {
+  if (action !== "redact") return
+  const rm = rawStr(cfg, "redaction_mode") ?? "runtime"
+  if (rm !== "runtime") b.warn(`${label}: redaction_mode "${rm}" is not supported; Raiju redacts the live request and response`)
+  const rs = rawStr(cfg, "redaction_strategy") ?? "replace"
+  if (rs !== "replace") b.warn(`${label}: redaction_strategy "${rs}" is not supported; Raiju replaces matches with [REDACTED:KIND]`)
+}
+
+// The strictest mode wins, since Raiju has one mode for all detectors.
+function strictest(modes: string[]): string | undefined {
+  let best: string | undefined = undefined
+  let rank = 0
+  for (const m of modes) {
+    const r = m === "block" ? 3 : m === "redact" ? 2 : 1
+    if (r > rank) {
+      rank = r
+      best = m
+    }
+  }
+  return best
+}
+
+// Bifrost regex patterns that describe a built-in PII type, by their description
+// or entity type. Any other pattern is a custom regex, which Raiju cannot run.
+function builtinFor(text: string): string | undefined {
+  if (text.includes("email")) return "email"
+  if (text.includes("ssn") || text.includes("social security")) return "ssn"
+  if (text.includes("credit")) return "credit_card"
+  if (text.includes("phone")) return "phone"
+  if (text.includes("ipv4") || text.includes("ip address")) return "ipv4"
+  return undefined
+}
+
+// ---- Bifrost rules and providers ----
+
+function parseRules(raw: string | undefined, b: Build): BRule[] throws SyntaxError {
+  const out: BRule[] = []
+  if (raw === undefined || !raw.startsWith("[")) return out
+  for (const el of try elements(raw)) {
+    const f = try fields(el)
+    const name = rawStr(f, "name")
+    const label = name !== undefined ? `rule "${name}"` : `rule ${find(f, "id") ?? "?"}`
+    // a missing enabled reads as on; the Bifrost schema requires it anyway
+    if (rawBool(f, "enabled") === false) {
+      b.warn(`${label} is disabled, so it is not loaded`)
+      continue
+    }
+    const target = rawStr(f, "target") ?? "llm"
+    if (target !== "llm") {
+      b.warn(`${label} targets ${target}; Raiju has no MCP guardrails, so it is not loaded`)
+      continue
+    }
+    const cel = (rawStr(f, "cel_expression") ?? "true").trim()
+    if (cel !== "true" && cel !== "") {
+      b.warn(`${label}: the condition ${cel} is not evaluated by Raiju, so its checks apply to all traffic`)
+    }
+    const ign = setKeys(f, ["timeout", "evaluation_mode", "send_all_conversation_turns", "max_turns_to_send"])
+    const sr = rawNum(f, "sampling_rate")
+    if (sr !== undefined && sr !== 100) ign.push("sampling_rate")
+    const sri = rawNum(f, "stream_replay_event_interval_ms")
+    if (sri !== undefined && sri > 0) ign.push("stream_replay_event_interval_ms")
+    ignoreNote(b, label, ign)
+    const at = rawStr(f, "apply_to") ?? "both"
+    let scope: Scope = "both"
+    if (at === "input") scope = "input"
+    else if (at === "output") scope = "output"
+    else if (at !== "both") b.warn(`${label}: unknown apply_to "${at}", treated as both`)
+    const providerIds: string[] = []
+    const pci = find(f, "provider_config_ids")
+    if (pci !== undefined && pci.startsWith("[")) {
+      for (const e of try elements(pci)) providerIds.push(e.trim())
+    }
+    if (providerIds.length === 0) b.warn(`${label} links no providers, so it enforces nothing`)
+    out.push({ label: label, scope: scope, providerIds: providerIds })
+  }
+  return out
+}
+
+function parseProviders(raw: string | undefined): BProvider[] throws SyntaxError {
+  const out: BProvider[] = []
+  if (raw === undefined || !raw.startsWith("[")) return out
+  for (const el of try elements(raw)) {
+    const f = try fields(el)
+    const id = find(f, "id") ?? ""
+    const kind = rawStr(f, "provider_name") ?? ""
+    const policy = rawStr(f, "policy_name") ?? id
+    const cfgRaw = find(f, "config") ?? "{}"
+    let cfg: Field[] = []
+    if (cfgRaw.startsWith("{")) cfg = try fields(cfgRaw)
+    out.push({ id: id, label: `${kind} provider "${policy}"`, kind: kind, enabled: rawBool(f, "enabled") !== false, top: f, cfg: cfg })
+  }
+  return out
+}
+
+// ---- external providers ----
+
+function bedrock(b: Build, label: string, pid: string, scope: Scope, cfg: Field[]): GuardrailProviderConfig | undefined {
+  const auth = rawStr(cfg, "auth_type") ?? "inferred"
+  if (auth !== "keys" && auth !== "inferred") {
+    b.warn(`${label}: auth_type "${auth}" is not supported (Raiju signs with static keys), so it is not loaded`)
+    return undefined
+  }
+  if (setKeys(cfg, ["role_arn"]).length > 0) {
+    b.warn(`${label}: role_arn is not supported (Raiju signs with the static keys), so it is not loaded`)
+    return undefined
+  }
+  const arn = need(b, label, "guardrail_arn", rawStr(cfg, "guardrail_arn"))
+  if (arn === undefined) return undefined
+  // a full ARN carries the region and the id after "guardrail/"
+  const at = arn.indexOf("guardrail/")
+  const gid = at >= 0 ? arn.slice(at + "guardrail/".byteLength) : arn
+  const parts = arn.split(":")
+  const arnRegion = parts.length >= 6 ? parts[3] : undefined
+  const region = envValue(b, label, "region", strField(cfg, "region")) ?? arnRegion
+  const ver = need(b, label, "guardrail_version", strField(cfg, "guardrail_version"))
+  if (ver === undefined) return undefined
+  const ak = need(b, label, "access_key", envStr(b, label, cfg, "access_key"))
+  if (ak === undefined) return undefined
+  const sk = need(b, label, "secret_key", envStr(b, label, cfg, "secret_key"))
+  if (sk === undefined) return undefined
+  const ign = setKeys(cfg, ["bedrock_api_key", "external_id", "session_name"])
+  for (const k of onKeys(cfg, ["images_enabled"])) ign.push(k)
+  ignoreNote(b, label, ign)
+  if (onKeys(cfg, ["images_enabled"]).length > 0) b.warn(`${label}: image content is not checked by Raiju, only text`)
+  return {
+    id: pid,
+    kind: "bedrock",
+    apply_to: scope,
+    guardrail_id: gid,
+    guardrail_version: ver,
+    region: region,
+    access_key: ak,
+    secret_key: sk,
+    session_token: envStr(b, label, cfg, "session_token"),
+  }
+}
+
+// Bifrost's "azure" kind is Azure AI Content Safety (azure-pii is a different service).
+function azure(b: Build, label: string, pid: string, scope: Scope, cfg: Field[]): GuardrailProviderConfig | undefined {
+  const auth = rawStr(cfg, "auth_type") ?? "api_key"
+  if (auth !== "api_key") {
+    b.warn(`${label}: auth_type "${auth}" is not supported (Raiju uses an API key), so it is not loaded`)
+    return undefined
+  }
+  if (rawBool(cfg, "analyze_enabled") === false) {
+    b.warn(`${label}: analyze_enabled is false, so there is no content analysis to run; not loaded`)
+    return undefined
+  }
+  const endpoint = need(b, label, "endpoint", envStr(b, label, cfg, "endpoint"))
+  if (endpoint === undefined) return undefined
+  const key = need(b, label, "api_key", envStr(b, label, cfg, "api_key"))
+  if (key === undefined) return undefined
+  // same severity cut-offs as Bifrost's table: low 2, medium 4, high 6
+  const sev = rawStr(cfg, "analyze_severity_threshold") ?? "medium"
+  let thr: number = 4
+  if (sev === "low") thr = 2
+  else if (sev === "high") thr = 6
+  else if (sev !== "medium") b.warn(`${label}: unknown analyze_severity_threshold "${sev}", using medium`)
+  const ign = onKeys(cfg, ["jailbreak_shield_enabled", "indirect_attack_shield_enabled", "copyright_enabled", "text_blocklist_enabled"])
+  for (const k of setKeys(cfg, ["blocklist_names"])) ign.push(k)
+  ignoreNote(b, label, ign)
+  return { id: pid, kind: "azure_content_safety", apply_to: scope, endpoint: endpoint, api_key: key, threshold: thr }
+}
+
+function patronus(b: Build, label: string, pid: string, scope: Scope, cfg: Field[]): GuardrailProviderConfig | undefined {
+  const key = need(b, label, "api_key", envStr(b, label, cfg, "api_key"))
+  if (key === undefined) return undefined
+  const evs: PatronusEvaluatorConfig[] = []
+  let explain = false
+  const raw = find(cfg, "evaluators")
+  if (raw !== undefined && raw.startsWith("[")) {
+    for (const el of try elements(raw)) {
+      const ef = try fields(el)
+      const name = rawStr(ef, "evaluator")
+      if (name === undefined) {
+        b.warn(`${label}: an evaluator has no name, so it is skipped`)
+        continue
+      }
+      evs.push({ evaluator: name, criteria: rawStr(ef, "criteria") })
+      if (!isNull(find(ef, "explain_strategy"))) explain = true
+    }
+  }
+  if (evs.length === 0) {
+    b.warn(`${label} has no evaluators, so it is not loaded`)
+    return undefined
+  }
+  if (explain) b.warn(`${label}: explain_strategy is not supported and ignored`)
+  const cap = rawStr(cfg, "capture")
+  if (cap !== undefined && cap !== "none") b.warn(`${label}: capture "${cap}" is not supported; Raiju does not store evaluation results`)
+  ignoreNote(b, label, setKeys(cfg, ["timeout"]))
+  return { id: pid, kind: "patronus", apply_to: scope, api_key: key, base_url: envStr(b, label, cfg, "base_url"), evaluators: evs }
+}
+
+// Bifrost defines no webhook kind. A "webhook" provider is mapped on the
+// assumption that its endpoint speaks Raiju's webhook protocol.
+function webhook(b: Build, label: string, pid: string, scope: Scope, cfg: Field[]): GuardrailProviderConfig | undefined {
+  const url = need(b, label, "url", envStr(b, label, cfg, "url"))
+  if (url === undefined) return undefined
+  const headers: Map<string, string> = new Map()
+  const hraw = find(cfg, "headers")
+  if (hraw !== undefined && hraw.startsWith("{")) {
+    for (const h of try fields(hraw)) {
+      if (!h.raw.startsWith("\"")) {
+        b.warn(`${label}: header ${h.key} is not a string, so it is skipped`)
+        continue
+      }
+      const hv = try decodeString(h.raw)
+      headers.set(h.key, hv)
+    }
+  }
+  b.warn(`${label}: the endpoint must answer in Raiju's webhook format ({"allowed", "reason", "text"})`)
+  return { id: pid, kind: "webhook", apply_to: scope, url: url, headers: headers }
+}
+
+// ---- built-in detectors ----
+
+// Raiju's secret detectors cover API keys with known prefixes, AWS access keys,
+// JWTs and private keys. Gitleaks, which Bifrost uses, covers far more formats.
+function secrets(b: Build, label: string, top: Field[], cfg: Field[]): void {
+  b.warn(`${label}: Raiju detects API keys with known prefixes, AWS keys, JWTs and private keys; other secret formats are not detected`)
+  const kw = find(cfg, "ignored_secret_keywords")
+  if (kw !== undefined && kw !== "[]" && !isNull(kw)) b.warn(`${label}: ignored_secret_keywords not supported; matches with those words are still reported`)
+  for (const d of ["private_key", "jwt", "api_key", "aws_key"]) b.addDetect(d)
+  const action = rawStr(cfg, "action") ?? "block"
+  b.modes.push(actionMode(b, label, action))
+  redactNotes(b, label, cfg, action)
+  ignoreNote(b, label, setKeys(top, ["timeout"]))
+}
+
+function regex(b: Build, label: string, top: Field[], cfg: Field[]): void {
+  const raw = find(cfg, "patterns")
+  if (raw === undefined || !raw.startsWith("[")) {
+    b.warn(`${label} has no patterns, so nothing is enforced`)
+    return
+  }
+  for (const el of try elements(raw)) {
+    const pf = try fields(el)
+    const pattern = rawStr(pf, "pattern") ?? ""
+    const desc = rawStr(pf, "description") ?? pattern
+    const hint = (rawStr(pf, "description") ?? "") + " " + (rawStr(pf, "entity_type") ?? "")
+    const name = builtinFor(hint.toLowerCase())
+    if (name === undefined) {
+      b.warn(`${label}: pattern "${desc}" is a custom regex and cannot run in Raiju; not enforced`)
+      continue
+    }
+    b.addDetect(name)
+    const action = rawStr(pf, "action") ?? "block"
+    b.modes.push(actionMode(b, `${label} pattern "${desc}"`, action))
+    redactNotes(b, label, pf, action)
+    ignoreNote(b, `${label} pattern "${desc}"`, setKeys(pf, ["allowed_values"]))
+  }
+  ignoreNote(b, label, setKeys(top, ["timeout"]))
+}
+
+// ---- entry points ----
+
+// Translates the guardrails_config object of a Bifrost config (its raw JSON text).
+// Rules with a CEL condition keep their checks but lose the condition, and each
+// detector runs on the union of the scopes that use it.
+export function fromBifrost(guardrailsConfigJson: string): { config: GuardrailsConfig, warnings: string[] } throws SyntaxError {
+  const text = guardrailsConfigJson.trim()
+  if (text === "" || text === "null") return { config: { enabled: false }, warnings: [] }
+  const top = try fields(text)
+  const b = new Build()
+  const rules = try parseRules(find(top, "guardrail_rules"), b)
+  const provs = try parseProviders(find(top, "guardrail_providers"))
+
+  const known: Set<string> = new Set()
+  for (const p of provs) known.add(p.id)
+  const inputOf: Set<string> = new Set()
+  const outputOf: Set<string> = new Set()
+  for (const r of rules) {
+    for (const pid of r.providerIds) {
+      if (!known.has(pid)) b.warn(`${r.label} links provider ${pid}, which is not defined`)
+      if (r.scope !== "output") inputOf.add(pid)
+      if (r.scope !== "input") outputOf.add(pid)
+    }
+  }
+
+  let detIn = false
+  let detOut = false
+  const detScopes: Scope[] = []
+  for (const p of provs) {
+    if (!p.enabled) {
+      b.warn(`${p.label} is disabled, so it is not loaded`)
+      continue
+    }
+    const inp = inputOf.has(p.id)
+    const outp = outputOf.has(p.id)
+    if (!inp && !outp) {
+      b.warn(`${p.label} is not linked to any enabled rule, so it is not loaded`)
+      continue
+    }
+    const scope: Scope = inp && outp ? "both" : inp ? "input" : "output"
+    const pid = "bifrost-" + p.id
+    if (p.kind === "bedrock") {
+      const g = bedrock(b, p.label, pid, scope, p.cfg)
+      if (g !== undefined) b.providers.push(g)
+    } else if (p.kind === "azure") {
+      const g = azure(b, p.label, pid, scope, p.cfg)
+      if (g !== undefined) b.providers.push(g)
+    } else if (p.kind === "patronus-ai") {
+      const g = try patronus(b, p.label, pid, scope, p.cfg)
+      if (g !== undefined) b.providers.push(g)
+    } else if (p.kind === "webhook") {
+      const g = try webhook(b, p.label, pid, scope, p.cfg)
+      if (g !== undefined) b.providers.push(g)
+    } else if (p.kind === "secrets") {
+      secrets(b, p.label, p.top, p.cfg)
+      detScopes.push(scope)
+      if (scope !== "output") detIn = true
+      if (scope !== "input") detOut = true
+    } else if (p.kind === "regex") {
+      try regex(b, p.label, p.top, p.cfg)
+      detScopes.push(scope)
+      if (scope !== "output") detIn = true
+      if (scope !== "input") detOut = true
+    } else {
+      b.warn(`${p.label}: provider "${p.kind}" has no Raiju equivalent, so it is not enforced`)
+    }
+  }
+
+  const detApply: Scope | undefined = detIn && detOut ? "both" : detIn ? "input" : detOut ? "output" : undefined
+  if (detApply !== undefined) {
+    for (const s of detScopes) {
+      if (s !== detApply) {
+        b.warn(`built-in detectors apply to ${detApply} traffic as a whole; some were scoped more narrowly in Bifrost`)
+        break
+      }
+    }
+  }
+  const mode = strictest(b.modes)
+  if (mode !== undefined && b.modes.some((m) => m !== mode)) {
+    b.warn(`built-in detectors use the strictest Bifrost action (${mode}) for every detector`)
+  }
+  const config: GuardrailsConfig = {
+    enabled: b.detect.length > 0 || b.providers.length > 0,
+    providers: b.providers,
+    detect: b.detect,
+    mode: mode,
+    apply_to: detApply,
+  }
+  return { config: config, warnings: b.notes }
+}
+
+// Combines the config file's own guardrails with the translated Bifrost ones.
+// Providers are concatenated (a clashing id from Bifrost is prefixed), detector
+// and custom lists are unioned, and scalar settings take the own value.
+export function merge(own: GuardrailsConfig | undefined, fromBifrost: GuardrailsConfig | undefined): GuardrailsConfig | undefined {
+  if (own === undefined) return fromBifrost
+  if (fromBifrost === undefined) return own
+  const providers: GuardrailProviderConfig[] = []
+  const ids: Set<string> = new Set()
+  for (const p of own.providers ?? []) {
+    ids.add(p.id)
+    providers.push(p)
+  }
+  for (const p of fromBifrost.providers ?? []) {
+    let q = p
+    if (ids.has(q.id)) q.id = `bifrost-${q.id}`
+    ids.add(q.id)
+    providers.push(q)
+  }
+  const detect: string[] = []
+  for (const d of (own.detect ?? []).concat(fromBifrost.detect ?? [])) {
+    if (!detect.includes(d)) detect.push(d)
+  }
+  const custom: string[] = []
+  for (const c of (own.custom ?? []).concat(fromBifrost.custom ?? [])) {
+    if (!custom.includes(c)) custom.push(c)
+  }
+  return {
+    enabled: own.enabled ?? fromBifrost.enabled,
+    providers: providers,
+    detect: detect,
+    mode: own.mode ?? fromBifrost.mode,
+    custom: custom,
+    apply_to: own.apply_to ?? fromBifrost.apply_to,
+  }
+}
+
+// ---- tests ----
+
+function warned(ws: string[], part: string): bool {
+  return ws.some((w) => w.includes(part))
+}
+
+// Bifrost's config.json example: bedrock on input, azure content safety on output.
+const DOCS_BEDROCK_AZURE = `{"guardrail_rules":[
+  {"id":1,"name":"Block PII in Prompts","enabled":true,"target":"llm","cel_expression":"true","apply_to":"input","sampling_rate":100,"timeout":5000,"provider_config_ids":[3]},
+  {"id":2,"name":"Content Filter for Responses","enabled":true,"target":"llm","cel_expression":"true","apply_to":"output","sampling_rate":100,"timeout":3000,"send_all_conversation_turns":false,"max_turns_to_send":8,"evaluation_mode":"per_turn","provider_config_ids":[4]}
+],"guardrail_providers":[
+  {"id":3,"provider_name":"bedrock","policy_name":"PII Detection Profile","enabled":true,"config":{"access_key":"AKIDEXAMPLE","secret_key":"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY","guardrail_arn":"arn:aws:bedrock:us-east-1:123456789:guardrail/abc123","guardrail_version":"1","region":"us-east-1"}},
+  {"id":4,"provider_name":"azure","policy_name":"Content Safety Profile","enabled":true,"config":{"endpoint":"https://your-resource.cognitiveservices.azure.com/","api_key":"key-123","analyze_enabled":true,"analyze_severity_threshold":"medium","jailbreak_shield_enabled":true,"indirect_attack_shield_enabled":true}}
+]}`
+
+test("bedrock and azure providers map to Raiju fields", () => {
+  const r = try fromBifrost(DOCS_BEDROCK_AZURE)
+  expect(r.config.enabled).toBe(true)
+  const ps = r.config.providers ?? []
+  expect(ps.length).toBe(2)
+  const bd = ps[0]!
+  expect(bd.kind).toBe("bedrock")
+  expect(bd.id).toBe("bifrost-3")
+  expect(bd.apply_to).toBe("input")
+  expect(bd.guardrail_id).toBe("abc123")
+  expect(bd.guardrail_version).toBe("1")
+  expect(bd.region).toBe("us-east-1")
+  expect(bd.access_key).toBe("AKIDEXAMPLE")
+  expect(bd.secret_key).toBe("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+  const az = ps[1]!
+  expect(az.kind).toBe("azure_content_safety")
+  expect(az.apply_to).toBe("output")
+  expect(az.endpoint).toBe("https://your-resource.cognitiveservices.azure.com/")
+  expect(az.api_key).toBe("key-123")
+  expect(az.threshold).toBe(4.0)
+  expect(warned(r.warnings, "jailbreak_shield_enabled")).toBe(true)
+  expect(warned(r.warnings, "send_all_conversation_turns")).toBe(true)
+  expect(warned(r.warnings, "timeout")).toBe(true)
+  expect(warned(r.warnings, "evaluation_mode")).toBe(true)
+  expect(r.warnings.length).toBe(3)
+})
+
+test("bedrock region comes from the ARN when unset, and a bare id is accepted", () => {
+  const text = `{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"both","provider_config_ids":[1]}],
+    "guardrail_providers":[{"id":1,"provider_name":"bedrock","policy_name":"p","enabled":true,"config":{"access_key":"AK","secret_key":"SK","guardrail_arn":"arn:aws:bedrock:eu-west-1:111122223333:guardrail/gr-9","guardrail_version":2}}]}`
+  const r = try fromBifrost(text)
+  const p = r.config.providers![0]!
+  expect(p.region).toBe("eu-west-1")
+  expect(p.guardrail_id).toBe("gr-9")
+  expect(p.guardrail_version).toBe("2")
+  expect(r.warnings.length).toBe(0)
+  const bare = try fromBifrost(`{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[1]}],"guardrail_providers":[{"id":1,"provider_name":"bedrock","policy_name":"p","enabled":true,"config":{"access_key":"AK","secret_key":"SK","guardrail_arn":"gr-7","guardrail_version":"DRAFT"}}]}`)
+  expect(bare.config.providers![0]!.guardrail_id).toBe("gr-7")
+  expect(bare.config.providers![0]!.region).toBeUndefined()
+})
+
+test("secrets and PII regex patterns map to built-in detectors", () => {
+  const text = `{"guardrail_rules":[{"id":1,"name":"Block secrets","enabled":true,"cel_expression":"true","apply_to":"both","provider_config_ids":[1,2]}],
+  "guardrail_providers":[
+    {"id":1,"provider_name":"secrets","policy_name":"block-leaked-credentials","enabled":true,"timeout":5,"config":{"ignored_secret_keywords":["example","dummy"],"action":"redact","redaction_strategy":"replace","redaction_mode":"logs_only"}},
+    {"id":2,"provider_name":"regex","policy_name":"pii-detection","enabled":true,"config":{"patterns":[
+      {"pattern":"\\\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\\\.[A-Z]{2,}\\\\b","description":"Email address","flags":"i","action":"redact","allowed_values":["support@example.com"]},
+      {"pattern":"\\\\b\\\\d{3}-\\\\d{2}-\\\\d{4}\\\\b","description":"US Social Security Number","action":"block"},
+      {"pattern":"PROJ-\\\\d+","description":"Internal project code","action":"block"}]}}
+  ]}`
+  const r = try fromBifrost(text)
+  expect(r.config.detect).toEqual(["private_key", "jwt", "api_key", "aws_key", "email", "ssn"])
+  expect(r.config.apply_to).toBe("both")
+  // redact and block are both present, so the strictest, block, applies to every detector
+  expect(r.config.mode).toBe("block")
+  expect(r.config.providers!.length).toBe(0)
+  expect(warned(r.warnings, "Internal project code")).toBe(true)
+  expect(warned(r.warnings, "redaction_mode")).toBe(true)
+  expect(warned(r.warnings, "ignored_secret_keywords")).toBe(true)
+  expect(warned(r.warnings, "allowed_values")).toBe(true)
+  expect(warned(r.warnings, "strictest")).toBe(true)
+})
+
+test("detect_only maps to log and secrets alone keeps its mode", () => {
+  const text = `{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[1]}],
+  "guardrail_providers":[{"id":1,"provider_name":"secrets","policy_name":"s","enabled":true,"config":{"action":"detect_only"}}]}`
+  const r = try fromBifrost(text)
+  expect(r.config.mode).toBe("log")
+  expect(r.config.detect!.includes("jwt")).toBe(true)
+  expect(r.config.apply_to).toBe("input")
+})
+
+test("unsupported providers, MCP rules and disabled items are warned, not dropped silently", () => {
+  const text = `{"guardrail_rules":[
+    {"id":1,"name":"Protect GitHub issue creation","enabled":true,"target":"mcp","cel_expression":"mcp_client == 'github'","apply_to":"input","provider_config_ids":[6]},
+    {"id":2,"name":"Armor prompts","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[5,6,7]},
+    {"id":3,"name":"Judge","enabled":false,"cel_expression":"true","apply_to":"output","provider_config_ids":[8]},
+    {"id":4,"name":"Scoped","enabled":true,"cel_expression":"headers[\\"x-env\\"] == \\"prod\\"","apply_to":"output","provider_config_ids":[9]}
+  ],"guardrail_providers":[
+    {"id":5,"provider_name":"bedrock","policy_name":"Bedrock Guard","enabled":true,"config":{"guardrail_arn":"arn:aws:bedrock:us-east-1:123456789:guardrail/g1","guardrail_version":"1","access_key":"env.RAIJU_COMPAT_TEST_UNSET_VAR","secret_key":"sk"}},
+    {"id":6,"provider_name":"crowdstrike-aidr","policy_name":"CrowdStrike AIDR Production","enabled":true,"config":{"api_key":"x"}},
+    {"id":7,"provider_name":"presidio","policy_name":"Presidio PII","enabled":true,"config":{}},
+    {"id":8,"provider_name":"prompt-guardrail","policy_name":"no-medical","enabled":true,"config":{}},
+    {"id":9,"provider_name":"patronus-ai","policy_name":"Quality","enabled":true,"config":{"api_key":"pk","evaluators":[{"evaluator":"pii","explain_strategy":"on-fail"},{"evaluator":"judge","criteria":"patronus:is-concise"}],"capture":"none"}},
+    {"id":10,"provider_name":"grayswan","policy_name":"Unlinked","enabled":true,"config":{}}
+  ]}`
+  const r = try fromBifrost(text)
+  expect(warned(r.warnings, 'rule "Protect GitHub issue creation" targets mcp')).toBe(true)
+  expect(warned(r.warnings, "access_key refers to env.RAIJU_COMPAT_TEST_UNSET_VAR")).toBe(true)
+  expect(warned(r.warnings, "CrowdStrike AIDR Production")).toBe(true)
+  expect(warned(r.warnings, "Presidio PII")).toBe(true)
+  expect(warned(r.warnings, "no-medical")).toBe(true)
+  expect(warned(r.warnings, 'rule "Judge" is disabled')).toBe(true)
+  expect(warned(r.warnings, "condition headers")).toBe(true)
+  expect(warned(r.warnings, "explain_strategy")).toBe(true)
+  expect(warned(r.warnings, "grayswan")).toBe(true)
+  // the scoped rule still runs its patronus check, widened to all traffic
+  const ps = r.config.providers ?? []
+  expect(ps.length).toBe(1)
+  expect(ps[0]!.kind).toBe("patronus")
+  expect(ps[0]!.apply_to).toBe("output")
+  expect(ps[0]!.evaluators!.length).toBe(2)
+  expect(ps[0]!.evaluators![1]!.criteria).toBe("patronus:is-concise")
+})
+
+test("a rule with no providers and an undefined provider link are warned", () => {
+  const text = `{"guardrail_rules":[
+    {"id":1,"name":"Empty","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[]},
+    {"id":2,"name":"Dangling","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[42]}
+  ],"guardrail_providers":[]}`
+  const r = try fromBifrost(text)
+  expect(warned(r.warnings, 'rule "Empty" links no providers')).toBe(true)
+  expect(warned(r.warnings, "provider 42, which is not defined")).toBe(true)
+  expect(r.config.enabled).toBe(false)
+})
+
+test("azure severity maps to Raiju thresholds and disabled analysis is left out", () => {
+  const mk = (sev: string): string =>
+    `{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"output","provider_config_ids":[1]}],"guardrail_providers":[{"id":1,"provider_name":"azure","policy_name":"a","enabled":true,"config":{"endpoint":"https://x.example/","api_key":"k","analyze_severity_threshold":"${sev}"}}]}`
+  expect((try fromBifrost(mk("low"))).config.providers![0]!.threshold).toBe(2.0)
+  expect((try fromBifrost(mk("high"))).config.providers![0]!.threshold).toBe(6.0)
+  const off = try fromBifrost(`{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"output","provider_config_ids":[1]}],"guardrail_providers":[{"id":1,"provider_name":"azure","policy_name":"a","enabled":true,"config":{"endpoint":"https://x.example/","api_key":"k","analyze_enabled":false}}]}`)
+  expect(off.config.providers!.length).toBe(0)
+  expect(warned(off.warnings, "analyze_enabled is false")).toBe(true)
+})
+
+test("webhook provider keeps its url and headers", () => {
+  const text = `{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[1]}],"guardrail_providers":[{"id":1,"provider_name":"webhook","policy_name":"hook","enabled":true,"config":{"url":"https://guard.example.com/check","headers":{"Authorization":"Bearer t"}}}]}`
+  const r = try fromBifrost(text)
+  const p = r.config.providers![0]!
+  expect(p.kind).toBe("webhook")
+  expect(p.url).toBe("https://guard.example.com/check")
+  expect(p.headers!.get("Authorization")).toBe("Bearer t")
+})
+
+test("empty input and malformed JSON", () => {
+  const none = try fromBifrost("null")
+  expect(none.config.enabled).toBe(false)
+  expect(none.warnings.length).toBe(0)
+  let threw = false
+  try {
+    fromBifrost("{")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("merge keeps both sides, unions detectors and lets own settings win", () => {
+  expect(merge(undefined, undefined)).toBeUndefined()
+  const bif: GuardrailsConfig = { enabled: true, detect: ["email", "ssn"], mode: "block", apply_to: "input", providers: [{ id: "bifrost-3", kind: "bedrock", apply_to: "input" }] }
+  const own: GuardrailsConfig = { enabled: true, detect: ["email", "phone"], mode: "redact", providers: [{ id: "bifrost-3", kind: "patronus", apply_to: "both", api_key: "k" }] }
+  const only = merge(undefined, bif)
+  expect(only!.mode).toBe("block")
+  const m = merge(own, bif)!
+  expect(m.detect).toEqual(["email", "phone", "ssn"])
+  expect(m.mode).toBe("redact")
+  expect(m.apply_to).toBe("input")
+  const ps = m.providers ?? []
+  expect(ps.length).toBe(2)
+  expect(ps[0]!.kind).toBe("patronus")
+  expect(ps[1]!.id).toBe("bifrost-bifrost-3")
+  expect(ps[1]!.kind).toBe("bedrock")
+  expect(merge(own, undefined)!.mode).toBe("redact")
+})
