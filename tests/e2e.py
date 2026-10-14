@@ -138,6 +138,10 @@ def write_config():
     src = open(os.path.join(ROOT, "src/jwt.tov")).read()
     pem = re.search(r"const TEST_PKCS8 = `(.*?)`", src, re.S).group(1)
     sa = {"type": "service_account", "client_email": "e2e@test.iam.gserviceaccount.com", "private_key": pem, "token_uri": MOCK + "/token"}
+    # an HTTPS upstream with its own CA: trusted through ca_cert_pem, skipped with insecure_skip_verify, refused otherwise
+    pem = make_tls()
+    for name, nc in [("tls-ca", {"ca_cert_pem": pem}), ("tls-skip", {"insecure_skip_verify": True}), ("tls-none", {})]:
+        cfg["providers"][name] = {"keys": [], "custom_provider_config": {"base_provider_type": "openai", "is_key_less": True}, "network_config": {"base_url": "https://127.0.0.1:18087", "max_retries": 0, **nc}}
     cfg["mcp"]["client_configs"].append({"name": "local", "connection_type": "stdio", "stdio_config": {"command": "python3", "args": [os.path.join(ROOT, "tests/mcp_stdio.py")], "env": {"MCP_GREETING": "hello"}}})
     cfg["providers"]["vertex"] = {
         "keys": [{"name": "vx", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps(sa)}}],
@@ -168,6 +172,35 @@ def write_config():
           "server": {"port": 1}}
     json.dump(bf, open(os.path.join(BUILD, "e2e.bifrost.json"), "w"))
     return path
+
+def make_tls():
+    """A throwaway CA and a server certificate for 127.0.0.1 it signed; returns the CA's PEM."""
+    d = os.path.join(BUILD, "e2e-tls")
+    os.makedirs(d, exist_ok=True)
+    run = lambda *a: subprocess.run(list(a), check=True, capture_output=True, cwd=d)
+    run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "2", "-subj", "/CN=raiju-e2e-ca")
+    run("openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "srv.key", "-out", "srv.csr", "-subj", "/CN=127.0.0.1")
+    open(os.path.join(d, "ext.cnf"), "w").write("subjectAltName=IP:127.0.0.1\n")
+    run("openssl", "x509", "-req", "-in", "srv.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-out", "srv.pem", "-days", "2", "-extfile", "ext.cnf")
+    return open(os.path.join(d, "ca.pem")).read()
+
+def start_tls_upstream():
+    """An HTTPS chat upstream on 18087, with the certificate from make_tls."""
+    import http.server, ssl, threading
+    class T(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length", "0")))
+            body = json.dumps({"id": "t1", "object": "chat.completion", "created": 1, "model": "m", "choices": [{"index": 0, "message": {"role": "assistant", "content": "over tls"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}})
+            self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body.encode())
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 18087), T)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    d = os.path.join(BUILD, "e2e-tls")
+    ctx.load_cert_chain(os.path.join(d, "srv.pem"), os.path.join(d, "srv.key"))
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
 def start_proxy():
     """An HTTP forward proxy stand-in on 18095 that records what it is asked for and answers itself."""
@@ -234,6 +267,7 @@ def main():
     wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
     idp, idp_state = start_idp()
     proxy, proxied = start_proxy()
+    tls_up = start_tls_upstream()
     gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=subprocess.DEVNULL)
     gw_bf = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18093", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.bifrost.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.bifrost.log"), "w"))
     gw_w = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18094", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.workers.json"), "-workers", "3"], env=env, stderr=subprocess.DEVNULL)
@@ -525,6 +559,10 @@ def main():
         check("saved config keeps env references and new keys", "env.E2E_OPENAI_KEY" in saved and "sk-from-env" not in saved and "sk-extra-secret" in saved, saved[:200])
         s, _, b = call("POST", "/api/governance/budgets", {"id": "b-bad", "max_limit": -1, "reset_duration": "1d"})
         check("invalid budget rejected", s == 400, b)
+
+        # TLS options per provider
+        res = [chat(p + "/m", seed=1900 + i) for i, p in enumerate(["tls-ca", "tls-skip", "tls-none"])]
+        check("ca_cert_pem trusts a private CA, insecure_skip_verify skips checks, and neither refuses", res[0][0] == 200 and "over tls" in res[0][2] and res[1][0] == 200 and res[2][0] >= 500, [(r[0], r[2][:120]) for r in res])
 
         # the Responses lifecycle and realtime REST pass through to OpenAI (Bifrost's default provider)
         got = []
@@ -933,7 +971,7 @@ def main():
         s, _, b = call("POST", "/v1/chat/completions", "{not json")
         check("bad JSON is a 400", s == 400, b)
     finally:
-        gw.terminate(); gw_b.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown()
+        gw.terminate(); gw_b.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 
