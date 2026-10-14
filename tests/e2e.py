@@ -646,6 +646,19 @@ def main():
         log = open(os.path.join(BUILD, "e2e.bifrost.log")).read()
         check("unknown config keys are reported at startup", 'unknown key "server" is ignored' in log, log[:600])
 
+        # Bifrost's x-bifrost-* response headers
+        _, h, _ = chat("openai/gpt-4o-mini", seed=1400, headers={"x-bf-mcp-include-clients": "none"})
+        H = hl(h)
+        check("routed-identity headers", H.get("x-bifrost-provider") == "openai" and H.get("x-bifrost-resolved-model") == "gpt-4o-mini" and H.get("x-bifrost-original-model") == "openai/gpt-4o-mini" and H.get("x-bifrost-request-type") == "chat_completion" and H.get("x-bifrost-fallback-index") == "0" and "x-bifrost-latency-ms" in H and H.get("x-bifrost-cache-hit") == "false", H)
+        _, h, _ = chat("openai/gpt-4o-mini", seed=1400, headers={"x-bf-mcp-include-clients": "none"})
+        H = hl(h)
+        check("cache headers on a hit", H.get("x-bifrost-cache-hit") == "true" and H.get("x-bifrost-cache-hit-type") == "direct", H)
+        _, h, _ = chat("openai/down-model", extra=None, fallbacks=["anthropic/claude-fallback"], seed=1401)
+        H = hl(h)
+        check("fallback headers", H.get("x-bifrost-fallback-index") == "1" and H.get("x-bifrost-routing-info-is-fallback") == "true" and H.get("x-bifrost-provider") == "anthropic", H)
+        _, h, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "x"}]}, {"origin": "http://localhost:3000"})
+        check("CORS exposes the gateway's headers", "x-bifrost-provider" in hl(h).get("access-control-expose-headers", ""), hl(h).get("access-control-expose-headers"))
+
         # --- X07 ---
         req = urllib.request.Request(GW + "/openai/v1/audio/speech", data=json.dumps({"model": "openai/tts-1", "input": "hi", "voice": "alloy"}).encode(), method="POST", headers={"content-type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as res:

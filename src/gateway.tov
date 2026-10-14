@@ -224,6 +224,54 @@ class LastHeaders {
   h: Map<string, string> = new Map()
 }
 
+// Bifrost's request type names (core/schemas/bifrost.go), for x-bifrost-request-type.
+function requestType(op: string, streamed: bool): string {
+  let t = op
+  if (op === "chat" || op === "anthropic.messages") t = "chat_completion"
+  else if (op === "completions") t = "text_completion"
+  else if (op === "embeddings") t = "embedding"
+  else if (op === "responses") t = "responses"
+  return streamed && (t === "chat_completion" || t === "text_completion" || t === "responses") ? t + "_stream" : t
+}
+
+// The routed identity, as Bifrost reports it (lib/responseheaders.go): who answered, what was
+// asked for, and whether it took a fallback.
+function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, model: string, idx: int, requested: string, upstreamMs: f64): void {
+  out.set("x-bifrost-provider", provider)
+  out.set("x-bifrost-original-model", requested)
+  out.set("x-bifrost-resolved-model", model)
+  out.set("x-bifrost-fallback-index", "" + Math.max(0, idx))
+  out.set("x-bifrost-upstream-latency-ms", "" + Math.round(upstreamMs))
+  out.set("x-bifrost-routing-info-provider", provider)
+  out.set("x-bifrost-routing-info-model", model)
+  out.set("x-bifrost-routing-info-is-fallback", idx > 0 ? "true" : "false")
+  out.set("x-bifrost-routing-info-primary-provider", primary.provider)
+  out.set("x-bifrost-routing-info-primary-model", primary.model)
+  const slash = requested.indexOf("/")
+  out.set("x-bifrost-routing-info-requested-provider", slash > 0 ? requested.slice(0, slash) : primary.provider)
+  out.set("x-bifrost-routing-info-requested-model", slash > 0 ? requested.slice(slash + 1) : requested)
+}
+
+function cacheHeaders(inout out: Hdrs, kind: string, primary: ModelRef, similarity: f64 | undefined, threshold: f64 | undefined): void {
+  out.set("x-bifrost-cache-hit", "true")
+  out.set("x-bifrost-cache-hit-type", kind)
+  out.set("x-bifrost-cache-requested-provider", primary.provider)
+  out.set("x-bifrost-cache-requested-model", primary.model)
+  if (similarity !== undefined) out.set("x-bifrost-cache-similarity", similarity.toFixed(4))
+  if (threshold !== undefined) out.set("x-bifrost-cache-threshold", "" + threshold)
+}
+
+// The error's type field, for x-bifrost-error-type.
+function errorType(body: string): string {
+  try {
+    const e = find(fields(body), "error")
+    if (e === undefined || !e.startsWith("{")) return ""
+    return rawStr(fields(e), "type") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
 // Whether a kind's streams can be converted as they arrive, and which converter does it.
 export function streamable(t: Target): bool {
   return providers.streamsNatively(t.kind) || t.kind === "anthropic" || t.kind === "gemini" || t.kind === "bedrock" || t.kind === "cohere" || t.kind === "vertex"
@@ -316,6 +364,8 @@ class ReqCtx {
   input = ""
   output = ""
   span: Span | undefined = undefined
+  // the model as the caller named it
+  requested = ""
   // headers plugins asked to send upstream
   upstreamHeaders: Map<string, string> = new Map()
   // set when the answer streams straight to the client
@@ -529,7 +579,9 @@ export class Engine {
     let last: Outcome = { ok: false, status: 404, body: errorJson("no provider is configured for this model", "invalid_request_error", "model_not_found"), contentType: "application/json", provider: "", model: "", promptTokens: 0, completionTokens: 0, attempts: 0, upstreamMs: 0.0 }
     let attempts = 0
     let upstreamMs = 0.0
+    let refIndex = -1
     for (const ref of refs) {
+      refIndex += 1
       const tried: Set<int> = new Set()
       const p: ProviderConfig = providerOf(this.cfg, ref.provider) ?? {}
       const retries = maxRetries(p)
@@ -603,6 +655,7 @@ export class Engine {
             ctx.outHeaders.set("content-type", "text/event-stream")
             ctx.outHeaders.set("cache-control", "no-cache")
             ctx.outHeaders.set("x-bf-attempts", "" + attempts)
+            routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs)
             sink.started = true
             sink.open(200, ctx.outHeaders)
             const reader = stream.getReader()
@@ -897,8 +950,11 @@ export class Engine {
     const started = ctx.started
     let h = h0
     const rid = ctx.rid
-    const out: Hdrs = new Map()
+    let out: Hdrs = new Map()
     out.set("x-bifrost-request-id", rid)
+    out.set("x-bifrost-request-type", requestType(op, streamed))
+    const span = ctx.span
+    if (span !== undefined) out.set("x-bifrost-trace-id", span.traceId)
     const model = modelName ?? rawStr(body, "model")
     ctx.model = model ?? ""
     if (model === undefined) return errorResponse(400, "the request needs a model, e.g. \"openai/gpt-4o-mini\"", "invalid_request_error", out)
@@ -948,6 +1004,7 @@ export class Engine {
       if (hit !== undefined) {
         metrics.inc("bifrost_cache_hits_total", metrics.labels(primary.provider, primary.model, "hit"), 1.0)
         out.set("x-bf-cache", "hit")
+        cacheHeaders(&out, "direct", primary, undefined, undefined)
         out.set("content-type", hit.contentType)
         ctx.cached = true
         ctx.output = hit.body
@@ -972,6 +1029,7 @@ export class Engine {
             metrics.inc("bifrost_cache_hits_total", metrics.labels(primary.provider, primary.model, "semantic"), 1.0)
             out.set("x-bf-cache", "semantic-hit")
             out.set("x-bf-cache-similarity", hit.score.toFixed(4))
+            cacheHeaders(&out, "semantic", primary, hit.score, th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold))
             out.set("content-type", hit.contentType)
             ctx.cached = true
             return respond(200, hit.body, out)
@@ -983,12 +1041,16 @@ export class Engine {
       }
     }
 
+    if (cache !== undefined || semVec.length > 0) out.set("x-bifrost-cache-hit", "false")
     ctx.outHeaders = out
+    ctx.requested = model
     const r = try await this.attempt(allowed, h, build, translate, streamed, ctx)
     out.set("x-bf-attempts", "" + r.attempts)
     if (!r.ok) {
       ctx.error = r.body.byteLength > 2000 ? r.body.slice(0, 2000) : r.body
       out.set("content-type", "application/json")
+      const et = errorType(r.body)
+      if (et !== "") out.set("x-bifrost-error-type", et)
       return respond(r.status, r.body, out)
     }
     const cost = this.pricing.cost(r.provider, r.model, r.promptTokens, r.completionTokens)
@@ -1019,6 +1081,15 @@ export class Engine {
       cache.set(key, r.body, r.contentType, ttl)
     }
     if (r.provider !== primary.provider || r.model !== primary.model) out.set("x-bf-fallback-used", r.provider + "/" + r.model)
+    let idx = 0
+    for (let i = 0; i < allowed.length; i++) {
+      if (allowed[i]!.provider === r.provider && allowed[i]!.model === r.model) {
+        idx = i
+        break
+      }
+    }
+    routedHeaders(&out, primary, r.provider, r.model, idx, model, r.upstreamMs)
+    out.set("x-bifrost-latency-ms", "" + Math.round(performance.now() - started))
     out.set("content-type", r.contentType)
     if (r.contentType === "text/event-stream") out.set("cache-control", "no-cache")
     // Time spent in the gateway itself, upstream calls excluded (Bifrost's "overhead").
