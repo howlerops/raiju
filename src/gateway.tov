@@ -16,6 +16,8 @@ import * as metrics from "./metrics"
 import { TokenCache, parseServiceAccount } from "./providers/vertex"
 import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails"
 import { RuleSet, Activation, pickTarget } from "./cel"
+import { LogStore, defaultLogStoreConfig } from "./logstore"
+import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor } from "./otel"
 import { Deadline, deadline } from "./deadline"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
@@ -75,6 +77,24 @@ function fallbackRefs(cfg: Config, body: Field[]): ModelRef[] {
   return out
 }
 
+// What one request did, gathered as it runs and recorded once at the end
+// (request log, log store, trace span).
+class ReqCtx {
+  provider = ""
+  model = ""
+  status = 0
+  promptTokens = 0
+  completionTokens = 0
+  cost = 0.0
+  cached = false
+  error = ""
+  virtualKey = ""
+  input = ""
+  output = ""
+  span: Span | undefined = undefined
+  constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
+}
+
 class LazyChat {
   value: ChatRequest | undefined = undefined
   constructor(readonly text: string) {}
@@ -93,6 +113,8 @@ export class Engine {
   vertexTokens = new TokenCache()
   guard: GuardConfig | undefined = undefined
   rules: RuleSet | undefined = undefined
+  logStore: LogStore | undefined = undefined
+  tracer: Tracer | undefined = undefined
   guardInput = false
   guardOutput = false
   pricing: Pricing
@@ -114,6 +136,19 @@ export class Engine {
       halfOpenProbes: d.halfOpenProbes,
     }
     this.health = new Health(bc)
+    const ls = cfg.logs_store
+    if (ls !== undefined && ls.enabled === true) {
+      const d = defaultLogStoreConfig(ls.dir ?? "logs")
+      try {
+        const store = new LogStore({ dir: d.dir, retention_days: ls.retention_days ?? d.retention_days, max_memory_entries: ls.max_memory_entries ?? d.max_memory_entries, content_logging: ls.content_logging ?? d.content_logging, max_content_bytes: d.max_content_bytes })
+        store.prune(Date.now())
+        this.logStore = store
+      } catch (e) {
+        console.error(`raiju: request log store disabled: ${e.message}`)
+      }
+    }
+    const oc = cfg.otel
+    if (oc !== undefined && oc.endpoint !== "") this.tracer = new Tracer(oc)
     const rr = cfg.governance?.routing_rules
     if (rr !== undefined && rr.length > 0) {
       const rs = new RuleSet(rr)
@@ -140,7 +175,7 @@ export class Engine {
 
   // Tries each model in order; within one, retries transient failures with
   // backoff and moves to another key on credential errors.
-  async attempt(refs: ModelRef[], h: Hdrs, build: Build, translate: Translate, streamed: bool): Promise<Outcome> {
+  async attempt(refs: ModelRef[], h: Hdrs, build: Build, translate: Translate, streamed: bool, ctx: ReqCtx): Promise<Outcome> {
     const pinned = h.get("x-bf-api-key") ?? h.get("x-bf-api-key-id") ?? undefined
     const extra = forwardedHeaders(h)
     let last: Outcome = { ok: false, status: 404, body: errorJson("no provider is configured for this model", "invalid_request_error", "model_not_found"), contentType: "application/json", provider: "", model: "", promptTokens: 0, completionTokens: 0, attempts: 0, upstreamMs: 0.0 }
@@ -171,6 +206,16 @@ export class Engine {
         }
         for (const k of extra.keys()) up.headers.set(k, extra.get(k)!)
         attempts += 1
+        const tracer = this.tracer
+        const parent = ctx.span
+        let child: Span | undefined = undefined
+        if (tracer !== undefined && parent !== undefined) {
+          const cs = tracer.startChild(parent, `${ref.provider} ${ref.model}`, Date.now())
+          cs.setStr("gen_ai.system", ref.provider)
+          cs.setStr("server.address", up.url)
+          if (cs.sampled) up.headers.set("traceparent", traceparentFor(cs.traceId, cs.spanId, true))
+          child = cs
+        }
         const started = performance.now()
         let status = 0
         let text = ""
@@ -193,6 +238,12 @@ export class Engine {
         }
         const tookMs = performance.now() - started
         upstreamMs += tookMs
+        if (tracer !== undefined && child !== undefined) {
+          child.setInt("http.response.status_code", status)
+          if (status < 200 || status >= 300) child.fail(`HTTP ${status}`)
+          child.end(Date.now())
+          tracer.finish(child)
+        }
         const secs = tookMs / 1000.0
         const ok = status >= 200 && status < 300
         // Health counts what the provider got wrong: network errors, timeouts, 429 and 5xx.
@@ -288,12 +339,26 @@ export class Engine {
 
   // Shared front half of every inference endpoint.
   async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool): Promise<Response> {
-    const started = performance.now()
-    let h = snapshot(req.headers)
-    const rid = h.get("x-request-id") ?? newId("req_")
+    const h = snapshot(req.headers)
+    const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
+    const tracer = this.tracer
+    if (tracer !== undefined) ctx.span = tracer.startRequest(op, h.get("traceparent"), Date.now())
+    if (this.logStore !== undefined) ctx.input = text
+    const res = await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed)
+    ctx.status = res.status
+    this.record(ctx)
+    return res
+  }
+
+  async serveInner(req: Request, h0: Hdrs, ctx: ReqCtx, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool): Promise<Response> {
+    const op = ctx.op
+    const started = ctx.started
+    let h = h0
+    const rid = ctx.rid
     const out: Hdrs = new Map()
     out.set("x-bifrost-request-id", rid)
     const model = modelName ?? rawStr(body, "model")
+    ctx.model = model ?? ""
     if (model === undefined) return errorResponse(400, "the request needs a model, e.g. \"openai/gpt-4o-mini\"", "invalid_request_error", out)
     let refs = [parseModel(this.cfg, model)].concat(fallbackRefs(this.cfg, body))
     const rules = this.rules
@@ -306,8 +371,13 @@ export class Engine {
     }
     const primary = refs[0]!
     const admitted = this.gov.admit(h, primary.provider, primary.model)
-    if (admitted.kind === "denial") return errorResponse(admitted.status, admitted.message, admitted.type, out)
+    if (admitted.kind === "denial") {
+      ctx.error = admitted.message
+      return errorResponse(admitted.status, admitted.message, admitted.type, out)
+    }
     const grant: Grant = admitted
+    ctx.virtualKey = grant.vk?.id ?? ""
+    ctx.provider = primary.provider
     // Fallbacks the key may not use are dropped.
     const allowed: ModelRef[] = [primary]
     for (const r of refs.slice(1)) {
@@ -324,15 +394,16 @@ export class Engine {
         metrics.inc("bifrost_cache_hits_total", metrics.labels(primary.provider, primary.model, "hit"), 1.0)
         out.set("x-bf-cache", "hit")
         out.set("content-type", hit.contentType)
-        this.log(rid, op, model, 200, 0, 0, 0.0, started, true)
+        ctx.cached = true
+        ctx.output = hit.body
         return respond(200, hit.body, out)
       }
     }
 
-    const r = await this.attempt(allowed, h, build, translate, streamed)
+    const r = await this.attempt(allowed, h, build, translate, streamed, ctx)
     out.set("x-bf-attempts", "" + r.attempts)
     if (!r.ok) {
-      this.log(rid, op, model, r.status, 0, 0, 0.0, started, false)
+      ctx.error = r.body.byteLength > 2000 ? r.body.slice(0, 2000) : r.body
       out.set("content-type", "application/json")
       return respond(r.status, r.body, out)
     }
@@ -354,15 +425,50 @@ export class Engine {
     const overheadUs = (performance.now() - started - r.upstreamMs) * 1000.0
     metrics.observeOverhead(overheadUs)
     out.set("x-bf-overhead-us", "" + Math.round(overheadUs))
-    this.log(rid, op, model, 200, r.promptTokens, r.completionTokens, cost, started, false)
+    ctx.provider = r.provider
+    ctx.promptTokens = r.promptTokens
+    ctx.completionTokens = r.completionTokens
+    ctx.cost = cost
+    if (this.logStore !== undefined) ctx.output = r.body
     return respond(200, r.body, out)
   }
 
-  log(rid: string, op: string, model: string, status: int, pt: int, ct: int, cost: f64, started: f64, cached: bool): void {
-    const ms = performance.now() - started
-    metrics.observe("bifrost_request_duration_seconds", metrics.labels("", model, status === 200 ? "success" : "error"), ms / 1000.0)
-    if (!this.logRequests) return
-    process.stdout.write(JSON.stringify({ ts: Date.now(), request_id: rid, op: op, model: model, status: status, prompt_tokens: pt, completion_tokens: ct, cost: cost, latency_ms: Math.round(ms), cache_hit: cached }) + "\n")
+  // Request duration metric, stdout log line, log store entry and trace span for one request.
+  record(c: ReqCtx): void {
+    const ms = performance.now() - c.started
+    const ok = c.status >= 200 && c.status < 300
+    metrics.observe("bifrost_request_duration_seconds", metrics.labels(c.provider, c.model, ok ? "success" : "error"), ms / 1000.0)
+    if (this.logRequests) {
+      process.stdout.write(JSON.stringify({ ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, latency_ms: Math.round(ms), cache_hit: c.cached }) + "\n")
+    }
+    const store = this.logStore
+    if (store !== undefined) {
+      store.add({
+        id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
+        latency_ms: ms, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, cache_hit: c.cached,
+        virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, error: c.error === "" ? undefined : c.error,
+        input: c.input === "" ? undefined : c.input, output: c.output === "" ? undefined : c.output,
+      })
+    }
+    const tracer = this.tracer
+    const span = c.span
+    if (tracer !== undefined && span !== undefined) {
+      genAiAttributes(span, { system: c.provider, operation: c.op, requestModel: c.model, inputTokens: c.promptTokens, outputTokens: c.completionTokens })
+      span.setInt("http.response.status_code", c.status)
+      span.setBool("raiju.cache_hit", c.cached)
+      if (!ok) span.fail(c.error === "" ? `HTTP ${c.status}` : c.error)
+      span.end(Date.now())
+      tracer.finish(span)
+      if (tracer.shouldFlush(Date.now())) this.flushTraces(tracer)
+    }
+  }
+
+  // Sends queued spans to the collector in the background; export failures are logged, never raised.
+  flushTraces(tracer: Tracer): void {
+    const payload = tracer.flushPayload()
+    if (payload === undefined) return
+    const up = exportRequest(tracer.cfg, payload)
+    sendSpans(up.url, up.headers, up.body)
   }
 
   async chat(req: Request): Promise<Response> {
@@ -442,9 +548,9 @@ export class Engine {
     }
     const build: Build = (t) => {
       if (!providers.supportsEmbeddings(t.kind)) throw new SyntaxError(`${t.provider} does not serve embeddings through this gateway yet`)
-      return openai.embeddingsRequest(t, body)
+      return try providers.embeddingsUpstream(t, body)
     }
-    const translate: Translate = (t, text, requested) => try openai.embeddingsResponse(text, requested)
+    const translate: Translate = (t, text, requested) => try providers.embeddingsTranslate(t.kind, text, requested)
     return await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
   }
 
@@ -463,6 +569,17 @@ export class Engine {
     }
     const translate: Translate = (t, text, requested) => stream ? openai.streamResponse(text, requested) : try openai.chatResponse(text, requested)
     return await this.serve(req, "completions", undefined, body, text, build, translate, stream)
+  }
+}
+
+async function sendSpans(url: string, headers: Map<string, string>, body: string): Promise<void> {
+  try {
+    const hs: Record<string, string> = headers
+    const res = await fetch(url, { method: "POST", headers: hs, body: body, signal: deadline(10000).controller.signal })
+    await res.text()
+    if (!res.ok) console.error(`raiju: trace export returned HTTP ${res.status}`)
+  } catch (e) {
+    console.error(`raiju: trace export failed: ${e.message}`)
   }
 }
 

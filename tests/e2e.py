@@ -70,8 +70,10 @@ def ws_roundtrip(path, message, headers=None):
     sock.close()
     return 101, data
 
-def seen():
-    return json.loads(call("GET", "/_seen", base=MOCK)[2])
+def seen(traces=False):
+    """What the mock received; trace exports arrive asynchronously, so they're left out unless asked for."""
+    got = json.loads(call("GET", "/_seen", base=MOCK)[2])
+    return [x for x in got if traces or x["path"] != "/v1/traces"]
 
 FAILS = []
 
@@ -103,9 +105,11 @@ def write_config():
 def main():
     build()
     config = write_config()
+    import shutil
+    shutil.rmtree(os.path.join(ROOT, "build/e2e-logs"), ignore_errors=True)
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
-    gw = subprocess.Popen([os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config], env=env, stderr=subprocess.DEVNULL)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config], env=env, stderr=subprocess.DEVNULL)
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health")
 
@@ -237,6 +241,29 @@ def main():
 
         s, _, b = call("GET", "/api/health")
         check("health status endpoint", s == 200 and "targets" in json.loads(b), b)
+
+        # Request logs
+        s, _, b = call("GET", "/api/logs?provider=anthropic&limit=5")
+        r = json.loads(b)
+        check("request logs are queryable", s == 200 and r["total"] >= 1 and all(e["provider"] == "anthropic" for e in r["entries"]), b[:400])
+        s, _, b = call("GET", "/api/logs?status=error")
+        check("failed requests are logged with their error", s == 200 and any(e.get("error") for e in json.loads(b)["entries"]), b[:400])
+        s, _, b = call("GET", "/api/logs/stats")
+        st = json.loads(b)
+        check("log stats", s == 200 and st["requests"] > 10 and st["tokens"] > 0, b[:300])
+        files = os.listdir(os.path.join(ROOT, "build/e2e-logs"))
+        check("logs persisted as daily JSONL", len(files) == 1 and files[0].startswith("requests-") and files[0].endswith(".jsonl"), files)
+
+        # Traces: a server span per request and a client span per upstream attempt, honoring traceparent
+        tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        chat("openai/gpt-4o-mini", headers={"traceparent": tp}, seed=400)
+        time.sleep(0.3)
+        upstream = [x for x in seen() if x["path"] == "/v1/chat/completions"][-1]
+        traces = [x["body"] for x in seen(traces=True) if x["path"] == "/v1/traces"]
+        joined = "".join(traces)
+        check("spans exported over OTLP/HTTP", len(traces) > 0 and '"resourceSpans"' in joined and "raiju-e2e" in joined, traces[:1])
+        check("inbound traceparent continues the trace", "0af7651916cd43dd8448eb211c80319c" in joined and '"parentSpanId":"b7ad6b7169203331"' in joined, joined[:300])
+        check("gen_ai attributes on spans", '"gen_ai.request.model"' in joined and '"gen_ai.usage.input_tokens"' in joined, joined[:300])
 
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])

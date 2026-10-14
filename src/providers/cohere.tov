@@ -1,0 +1,324 @@
+// Cohere API v2: translates OpenAI-shaped chat, embeddings and rerank requests and responses.
+import { Field, fields, elements, find, quote, rawStr, isNull } from "../json"
+import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
+import { ChatRequest, ContentPart, Message, textOf, newId, nowSeconds } from "../schemas"
+
+function apiBase(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b === undefined || b === "") return "https://api.cohere.com"
+  return trimSlash(b)
+}
+
+function upstreamHeaders(t: Target): Map<string, string> {
+  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + (t.key.value ?? "")]])
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+// A user message is a string or a list of text and image parts.
+function userContent(c: string | ContentPart[] | undefined): string {
+  if (c === undefined) return quote("")
+  if (typeof c === "string") return quote(c)
+  const parts: string[] = []
+  for (const p of c) {
+    if (p.type === "text" && p.text !== undefined) parts.push(`{"type":"text","text":${quote(p.text)}}`)
+    else if (p.type === "image_url" && p.image_url !== undefined) {
+      parts.push(`{"type":"image_url","image_url":{"url":${quote(p.image_url.url)}}}`)
+    }
+  }
+  return `[${parts.join(",")}]`
+}
+
+function messageJson(m: Message): string {
+  if (m.role === "system" || m.role === "developer") return `{"role":"system","content":${quote(textOf(m.content))}}`
+  // Cohere v2 accepts a plain string as a tool result's content.
+  if (m.role === "tool") return `{"role":"tool","tool_call_id":${quote(m.tool_call_id ?? "")},"content":${quote(textOf(m.content))}}`
+  if (m.role === "assistant") {
+    const out: string[] = [`"role":"assistant"`]
+    const text = textOf(m.content)
+    if (text !== "") out.push(`"content":${quote(text)}`)
+    const calls = m.tool_calls ?? []
+    if (calls.length > 0) {
+      const cs = calls.map((c) => `{"id":${quote(c.id)},"type":"function","function":{"name":${quote(c.function.name)},"arguments":${quote(c.function.arguments)}}}`)
+      out.push(`"tool_calls":[${cs.join(",")}]`)
+    }
+    return "{" + out.join(",") + "}"
+  }
+  return `{"role":"user","content":${userContent(m.content)}}`
+}
+
+// Function tools in Cohere's OpenAI-style shape; parameters stay raw.
+function toolsJson(raw: string): string throws SyntaxError {
+  const specs: string[] = []
+  for (const el of try elements(raw)) {
+    const fnRaw = find(try fields(el), "function")
+    if (fnRaw === undefined || isNull(fnRaw)) continue
+    const fn = try fields(fnRaw)
+    const parts = [`"name":${quote(rawStr(fn, "name") ?? "")}`]
+    const desc = find(fn, "description")
+    if (desc !== undefined && !isNull(desc)) parts.push(`"description":${desc}`)
+    const params = find(fn, "parameters")
+    if (params !== undefined && !isNull(params)) parts.push(`"parameters":${params}`)
+    specs.push(`{"type":"function","function":{${parts.join(",")}}}`)
+  }
+  return `[${specs.join(",")}]`
+}
+
+// json_object for JSON mode; json_schema carries the bare schema.
+function responseFormat(body: Field[]): string | undefined throws SyntaxError {
+  const rf = find(body, "response_format")
+  if (rf === undefined || isNull(rf)) return undefined
+  const f = try fields(rf)
+  const type = rawStr(f, "type")
+  if (type === "json_object") return `{"type":"json_object"}`
+  if (type === "json_schema") {
+    const js = find(f, "json_schema")
+    if (js === undefined || isNull(js)) return `{"type":"json_object"}`
+    const schema = find(try fields(js), "schema")
+    if (schema === undefined || isNull(schema)) return `{"type":"json_object"}`
+    return `{"type":"json_object","json_schema":${schema}}`
+  }
+  return undefined
+}
+
+function chatBody(t: Target, req: ChatRequest, body: Field[]): string throws SyntaxError {
+  const out: string[] = [`"model":${quote(t.model)}`]
+  const msgs = req.messages.map((m) => messageJson(m))
+  out.push(`"messages":[${msgs.join(",")}]`)
+  const max = req.max_completion_tokens ?? req.max_tokens
+  if (max !== undefined) out.push(`"max_tokens":${max}`)
+  if (req.temperature !== undefined) out.push(`"temperature":${req.temperature}`)
+  if (req.top_p !== undefined) out.push(`"p":${req.top_p}`)
+  const stop = req.stop
+  if (stop !== undefined) out.push(`"stop_sequences":${typeof stop === "string" ? `[${quote(stop)}]` : JSON.stringify(stop)}`)
+  const tools = find(body, "tools")
+  if (tools !== undefined && !isNull(tools)) out.push(`"tools":${try toolsJson(tools)}`)
+  const rf = try responseFormat(body)
+  if (rf !== undefined) out.push(`"response_format":${rf}`)
+  return "{" + out.join(",") + "}"
+}
+
+export function chatRequest(t: Target, req: ChatRequest, body: Field[]): Upstream throws SyntaxError {
+  return { url: `${apiBase(t)}/v2/chat`, headers: upstreamHeaders(t), body: try chatBody(t, req, body) }
+}
+
+type CohereTokens = { input_tokens?: int, output_tokens?: int, search_units?: int }
+type CohereUsage = { tokens?: CohereTokens, billed_units?: CohereTokens }
+
+function finishReason(r: string | undefined): string {
+  if (r === "MAX_TOKENS") return "length"
+  if (r === "TOOL_CALL") return "tool_calls"
+  // COMPLETE, STOP_SEQUENCE and ERROR all end as a normal stop
+  return "stop"
+}
+
+export function chatResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  const fs = try fields(text)
+  const textParts: string[] = []
+  const calls: string[] = []
+  const msgRaw = find(fs, "message")
+  if (msgRaw !== undefined && !isNull(msgRaw)) {
+    const msg = try fields(msgRaw)
+    const content = find(msg, "content")
+    if (content !== undefined && !isNull(content)) {
+      for (const el of try elements(content)) {
+        const block = try fields(el)
+        const t = rawStr(block, "text")
+        if (t !== undefined) textParts.push(t)
+      }
+    }
+    const tcs = find(msg, "tool_calls")
+    if (tcs !== undefined && !isNull(tcs)) {
+      for (const el of try elements(tcs)) {
+        const c = try fields(el)
+        let fn: Field[] = []
+        const fnRaw = find(c, "function")
+        if (fnRaw !== undefined && !isNull(fnRaw)) fn = try fields(fnRaw)
+        // arguments is a JSON string in v2; an object is passed on as its text
+        const argRaw = find(fn, "arguments")
+        let args = "{}"
+        if (argRaw !== undefined) args = argRaw.startsWith("\"") ? (rawStr(fn, "arguments") ?? "{}") : argRaw
+        calls.push(`{"id":${quote(rawStr(c, "id") ?? newId("call_"))},"type":"function","function":{"name":${quote(rawStr(fn, "name") ?? "")},"arguments":${quote(args)}}}`)
+      }
+    }
+  }
+  let pt = 0
+  let ct = 0
+  const u = find(fs, "usage")
+  if (u !== undefined && !isNull(u)) {
+    const usage = try JSON.parse(u) as CohereUsage
+    // tokens is the billed-free count; billed_units is the fallback
+    pt = usage.tokens?.input_tokens ?? usage.billed_units?.input_tokens ?? 0
+    ct = usage.tokens?.output_tokens ?? usage.billed_units?.output_tokens ?? 0
+  }
+  const joined = textParts.join("")
+  const msg: string[] = [`"role":"assistant"`, `"content":${joined === "" && calls.length > 0 ? "null" : quote(joined)}`]
+  if (calls.length > 0) msg.push(`"tool_calls":[${calls.join(",")}]`)
+  const body = `{"id":${quote(newId("chatcmpl-"))},"object":"chat.completion","created":${nowSeconds()},"model":${quote(requestedModel)},` +
+    `"choices":[{"index":0,"message":{${msg.join(",")}},"finish_reason":"${finishReason(rawStr(fs, "finish_reason"))}"}],` +
+    `"usage":{"prompt_tokens":${pt},"completion_tokens":${ct},"total_tokens":${pt + ct}}}`
+  return { body: body, promptTokens: pt, completionTokens: ct }
+}
+
+// ---- embeddings ----
+
+export function embeddingsRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  // a single string becomes a one-element list; a list passes through raw
+  const input = find(body, "input") ?? "[]"
+  const texts = input.startsWith("[") ? input : `[${input}]`
+  const inputType = rawStr(body, "input_type") ?? "search_document"
+  const b = `{"model":${quote(t.model)},"texts":${texts},"input_type":${quote(inputType)},"embedding_types":["float"]}`
+  return { url: `${apiBase(t)}/v2/embed`, headers: upstreamHeaders(t), body: b }
+}
+
+export function embeddingsResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  const fs = try fields(text)
+  const data: string[] = []
+  const embRaw = find(fs, "embeddings")
+  if (embRaw !== undefined && !isNull(embRaw)) {
+    const vecs = find(try fields(embRaw), "float")
+    if (vecs !== undefined && !isNull(vecs)) {
+      // vectors stay as the raw text Cohere sent, so no float is re-rounded
+      const vs = try elements(vecs)
+      for (let i = 0; i < vs.length; i++) {
+        data.push(`{"object":"embedding","index":${i},"embedding":${vs[i]!}}`)
+      }
+    }
+  }
+  let pt = 0
+  const metaRaw = find(fs, "meta")
+  if (metaRaw !== undefined && !isNull(metaRaw)) {
+    const bu = find(try fields(metaRaw), "billed_units")
+    if (bu !== undefined && !isNull(bu)) pt = (try JSON.parse(bu) as CohereTokens).input_tokens ?? 0
+  }
+  const body = `{"object":"list","data":[${data.join(",")}],"model":${quote(requestedModel)},` +
+    `"usage":{"prompt_tokens":${pt},"total_tokens":${pt}}}`
+  return { body: body, promptTokens: pt, completionTokens: 0 }
+}
+
+// ---- rerank ----
+
+export function rerankRequest(t: Target, body: Field[]): Upstream {
+  const out: string[] = [`"model":${quote(t.model)}`]
+  for (const k of ["query", "documents", "top_n"]) {
+    const v = find(body, k)
+    if (v !== undefined && !isNull(v)) out.push(`${quote(k)}:${v}`)
+  }
+  return { url: `${apiBase(t)}/v2/rerank`, headers: upstreamHeaders(t), body: "{" + out.join(",") + "}" }
+}
+
+export function rerankResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  const fs = try fields(text)
+  const resultsRaw = find(fs, "results")
+  const results = isNull(resultsRaw) ? "[]" : resultsRaw!
+  let pt = 0
+  const metaRaw = find(fs, "meta")
+  if (metaRaw !== undefined && !isNull(metaRaw)) {
+    const bu = find(try fields(metaRaw), "billed_units")
+    if (bu !== undefined && !isNull(bu)) pt = (try JSON.parse(bu) as CohereTokens).search_units ?? 0
+  }
+  const meta = metaRaw === undefined || isNull(metaRaw) ? "" : `,"meta":${metaRaw}`
+  const body = `{"results":${results},"model":${quote(requestedModel)}${meta}}`
+  return { body: body, promptTokens: pt, completionTokens: 0 }
+}
+
+// ---- tests ----
+
+test("chat request maps messages, tools and sampling", () => {
+  const raw = `{"model":"cohere/command-a","messages":[{"role":"system","content":"terse"},{"role":"user","content":"hi"},
+    {"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Oslo\\"}"}}]},
+    {"role":"tool","tool_call_id":"c1","content":"rain"}],"max_tokens":50,"top_p":0.8,"stop":"END","temperature":0.2,
+    "tools":[{"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object"}}}],
+    "response_format":{"type":"json_object"}}`
+  const t: Target = { provider: "cohere", kind: "cohere", model: "command-a-03-2025", key: { value: "ck" }, cfg: {} }
+  const up = try chatRequest(t, try JSON.parse(raw) as ChatRequest, try fields(raw))
+  expect(up.url).toBe("https://api.cohere.com/v2/chat")
+  expect(up.headers.get("authorization")).toBe("Bearer ck")
+  expect(up.body.includes(`"model":"command-a-03-2025"`)).toBe(true)
+  expect(up.body.includes(`{"role":"system","content":"terse"}`)).toBe(true)
+  expect(up.body.includes(`{"role":"user","content":"hi"}`)).toBe(true)
+  expect(up.body.includes(`{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Oslo\\"}"}}]}`)).toBe(true)
+  expect(up.body.includes(`{"role":"tool","tool_call_id":"c1","content":"rain"}`)).toBe(true)
+  expect(up.body.includes(`"max_tokens":50`)).toBe(true)
+  expect(up.body.includes(`"temperature":0.2`)).toBe(true)
+  expect(up.body.includes(`"p":0.8`)).toBe(true)
+  expect(up.body.includes(`"stop_sequences":["END"]`)).toBe(true)
+  expect(up.body.includes(`"tools":[{"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object"}}}]`)).toBe(true)
+  expect(up.body.includes(`"response_format":{"type":"json_object"}`)).toBe(true)
+})
+
+test("chat request maps json_schema and image parts", () => {
+  const raw = `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}],
+    "response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"a":{"type":"string"}}},"strict":true}}}`
+  const t: Target = { provider: "cohere", kind: "cohere", model: "command-r", key: { value: "ck" }, cfg: {} }
+  const up = try chatRequest(t, try JSON.parse(raw) as ChatRequest, try fields(raw))
+  expect(up.body.includes(`"content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]`)).toBe(true)
+  expect(up.body.includes(`"response_format":{"type":"json_object","json_schema":{"type":"object","properties":{"a":{"type":"string"}}}}`)).toBe(true)
+})
+
+test("chat response maps text and usage", () => {
+  const r = try chatResponse(`{"id":"x","finish_reason":"COMPLETE","message":{"role":"assistant","content":[{"type":"text","text":"Hello"},{"type":"text","text":" there"}]},"usage":{"billed_units":{"input_tokens":3,"output_tokens":2},"tokens":{"input_tokens":30,"output_tokens":2}}}`, "cohere/command-a")
+  expect(r.body.includes(`"content":"Hello there"`)).toBe(true)
+  expect(r.body.includes(`"finish_reason":"stop"`)).toBe(true)
+  expect(r.body.includes(`"model":"cohere/command-a"`)).toBe(true)
+  expect(r.promptTokens).toBe(30)
+  expect(r.completionTokens).toBe(2)
+  // billed_units is the fallback when tokens is absent
+  const f = try chatResponse(`{"finish_reason":"STOP_SEQUENCE","message":{"content":[{"type":"text","text":"ok"}]},"usage":{"billed_units":{"input_tokens":3,"output_tokens":1}}}`, "m")
+  expect(f.promptTokens).toBe(3)
+  expect(f.body.includes(`"finish_reason":"stop"`)).toBe(true)
+})
+
+test("chat response maps tool calls", () => {
+  const r = try chatResponse(`{"id":"x","finish_reason":"TOOL_CALL","message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Oslo\\"}"}}]},"usage":{"tokens":{"input_tokens":5,"output_tokens":7}}}`, "cohere/command-a")
+  expect(r.body.includes(`"finish_reason":"tool_calls"`)).toBe(true)
+  expect(r.body.includes(`"content":null`)).toBe(true)
+  expect(r.body.includes(`{"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Oslo\\"}"}}`)).toBe(true)
+  expect(r.completionTokens).toBe(7)
+})
+
+test("chat response maps MAX_TOKENS to length", () => {
+  const r = try chatResponse(`{"finish_reason":"MAX_TOKENS","message":{"content":[{"type":"text","text":"cut"}]},"usage":{"tokens":{"input_tokens":1,"output_tokens":4}}}`, "m")
+  expect(r.body.includes(`"finish_reason":"length"`)).toBe(true)
+  expect(r.body.includes(`"content":"cut"`)).toBe(true)
+})
+
+test("embeddings request takes string and list input", () => {
+  const t: Target = { provider: "cohere", kind: "cohere", model: "embed-v4.0", key: { value: "ck" }, cfg: {} }
+  const one = try embeddingsRequest(t, try fields(`{"model":"cohere/embed-v4.0","input":"hello"}`))
+  expect(one.url).toBe("https://api.cohere.com/v2/embed")
+  expect(one.body).toBe(`{"model":"embed-v4.0","texts":["hello"],"input_type":"search_document","embedding_types":["float"]}`)
+  const many = try embeddingsRequest(t, try fields(`{"model":"x","input":["a","b"],"input_type":"classification"}`))
+  expect(many.body).toBe(`{"model":"embed-v4.0","texts":["a","b"],"input_type":"classification","embedding_types":["float"]}`)
+})
+
+test("embeddings response keeps vectors byte-identical", () => {
+  const txt = `{"id":"e1","embeddings":{"float":[[0.1,-2.50e-3,1E10],[ 1 ,0.0,-0]]},"meta":{"billed_units":{"input_tokens":4}}}`
+  const r = try embeddingsResponse(txt, "cohere/embed-v4.0")
+  expect(r.body.includes(`{"object":"embedding","index":0,"embedding":[0.1,-2.50e-3,1E10]}`)).toBe(true)
+  expect(r.body.includes(`{"object":"embedding","index":1,"embedding":[ 1 ,0.0,-0]}`)).toBe(true)
+  expect(r.body.includes(`"usage":{"prompt_tokens":4,"total_tokens":4}`)).toBe(true)
+  expect(r.promptTokens).toBe(4)
+})
+
+test("rerank passes results through", () => {
+  const t: Target = { provider: "cohere", kind: "cohere", model: "rerank-v3.5", key: { value: "ck" }, cfg: {} }
+  const up = rerankRequest(t, try fields(`{"model":"cohere/rerank-v3.5","query":"q","documents":["a","b"],"top_n":1,"extra":1}`))
+  expect(up.url).toBe("https://api.cohere.com/v2/rerank")
+  expect(up.body).toBe(`{"model":"rerank-v3.5","query":"q","documents":["a","b"],"top_n":1}`)
+  const r = try rerankResponse(`{"id":"r1","results":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.1}],"meta":{"billed_units":{"search_units":1}}}`, "cohere/rerank-v3.5")
+  expect(r.body.startsWith(`{"results":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.1}],"model":"cohere/rerank-v3.5"`)).toBe(true)
+  expect(r.promptTokens).toBe(1)
+})
+
+test("base_url override and extra headers", () => {
+  const eh: Map<string, string> = new Map()
+  eh.set("x-team", "core")
+  const t: Target = { provider: "cohere", kind: "cohere", model: "command-r", key: { value: "k" }, cfg: { network_config: { base_url: "https://proxy.local/cohere/", extra_headers: eh } } }
+  const chat = try chatRequest(t, { model: "m", messages: [] }, [])
+  expect(chat.url).toBe("https://proxy.local/cohere/v2/chat")
+  expect(chat.headers.get("x-team")).toBe("core")
+  expect(chat.headers.get("content-type")).toBe("application/json")
+  expect(try embeddingsRequest(t, try fields(`{"input":"a"}`)).url).toBe("https://proxy.local/cohere/v2/embed")
+  expect(rerankRequest(t, []).url).toBe("https://proxy.local/cohere/v2/rerank")
+})

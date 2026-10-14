@@ -1,0 +1,488 @@
+// OpenTelemetry tracing in the shape Bifrost's otel plugin exports: one server
+// span per gateway request, a client span per upstream attempt, sent as OTLP
+// JSON over HTTP. An inbound W3C traceparent continues the caller's trace.
+
+export type OtelConfig = {
+  endpoint: string,
+  service_name?: string,
+  headers?: Map<string, string>,
+  batch_size?: int,
+  flush_ms?: int,
+  sample_ratio?: f64,
+}
+
+export type TraceContext = { traceId: string, parentId: string, sampled: bool }
+
+// A typed attribute value. A record with a discriminant avoids typeof checks
+// on a union and keeps the OTLP encoding decided in one place.
+export type AttrValue =
+  | { kind: "s", s: string }
+  | { kind: "d", d: f64 }
+  | { kind: "b", b: bool }
+  | { kind: "i", i: int }
+
+export type SpanStatus = { code: int, message?: string }
+
+const HEX_DIGITS = "0123456789abcdef"
+
+// Lowercase hex digit value, or -1. W3C requires lowercase ids and flags.
+function hexVal(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 97 && c <= 102) return c - 87
+  return -1
+}
+
+function isHexOf(s: string, n: int): bool {
+  if (s.byteLength !== n) return false
+  for (const b of new TextEncoder().encode(s)) {
+    if (hexVal(int(b)) < 0) return false
+  }
+  return true
+}
+
+function allZero(s: string): bool {
+  for (const b of new TextEncoder().encode(s)) {
+    if (int(b) !== 48) return false
+  }
+  return true
+}
+
+// Accepts `00-<32 hex>-<16 hex>-<2 hex>`. Other versions may carry extra
+// fields after the four we read, as the W3C spec allows.
+export function parseTraceparent(h: string | undefined): TraceContext | undefined {
+  if (h === undefined) return undefined
+  const parts = h.split("-")
+  if (parts.length < 4) return undefined
+  const version = parts[0]!
+  if (!isHexOf(version, 2) || version === "ff") return undefined
+  if (version === "00" && parts.length !== 4) return undefined
+  const traceId = parts[1]!
+  const parentId = parts[2]!
+  const flags = parts[3]!
+  if (!isHexOf(traceId, 32) || allZero(traceId)) return undefined
+  if (!isHexOf(parentId, 16) || allZero(parentId)) return undefined
+  if (!isHexOf(flags, 2)) return undefined
+  // The sampled bit is the low bit of the second flags digit.
+  const low = hexVal(int(new TextEncoder().encode(flags)[1]!))
+  return { traceId: traceId, parentId: parentId, sampled: low % 2 === 1 }
+}
+
+// n random lowercase hex digits. Math.random is enough for ids (not secrets).
+function randomHex(n: int): string {
+  let out = ""
+  for (let i = 0; i < n; i += 1) {
+    const d = Math.floor(Math.random() * 16.0)
+    out += HEX_DIGITS.slice(d, d + 1)
+  }
+  return out
+}
+
+// All-zero ids are invalid under W3C, so they are redrawn.
+export function newTraceId(): string {
+  while (true) {
+    const s = randomHex(32)
+    if (!allZero(s)) return s
+  }
+}
+
+export function newSpanId(): string {
+  while (true) {
+    const s = randomHex(16)
+    if (!allZero(s)) return s
+  }
+}
+
+export function traceparentFor(traceId: string, spanId: string, sampled: bool): string {
+  return "00-" + traceId + "-" + spanId + "-" + (sampled ? "01" : "00")
+}
+
+// OTLP times are unix nanoseconds. Microsecond precision is kept, and the
+// arithmetic stays in int so no f64 rounding creeps in.
+function msToNs(nowMs: f64): int {
+  return Math.floor(nowMs * 1000.0) * 1000
+}
+
+export class Span {
+  attributes: Map<string, AttrValue> = new Map()
+  status: SpanStatus = { code: 0 }
+  endNs: int = 0
+  constructor(
+    readonly traceId: string,
+    readonly spanId: string,
+    readonly parentSpanId: string | undefined,
+    readonly name: string,
+    readonly kind: int,
+    readonly startNs: int,
+    readonly sampled: bool,
+  ) {}
+
+  setStr(k: string, v: string): void {
+    this.attributes.set(k, { kind: "s", s: v })
+  }
+
+  setNum(k: string, v: f64): void {
+    this.attributes.set(k, { kind: "d", d: v })
+  }
+
+  setInt(k: string, v: int): void {
+    this.attributes.set(k, { kind: "i", i: v })
+  }
+
+  setBool(k: string, v: bool): void {
+    this.attributes.set(k, { kind: "b", b: v })
+  }
+
+  end(nowMs: f64): void {
+    this.endNs = msToNs(nowMs)
+  }
+
+  fail(message: string): void {
+    this.status = { code: 2, message: message }
+  }
+}
+
+// Spans are queued when they finish and sent in batches. A caller that has
+// nothing to flush can ignore the tracer entirely.
+export class Tracer {
+  pending: Span[] = []
+  lastFlushMs: f64 = Date.now()
+  batchSize: int
+  flushMs: f64
+  ratio: f64
+  serviceName: string
+
+  constructor(readonly cfg: OtelConfig) {
+    this.batchSize = cfg.batch_size ?? 512
+    this.flushMs = cfg.flush_ms ?? 2000
+    this.ratio = cfg.sample_ratio ?? 1.0
+    this.serviceName = cfg.service_name ?? "raiju"
+  }
+
+  // The inbound sampled flag wins when a valid traceparent came in. Otherwise
+  // the ratio decides for a new trace.
+  startRequest(name: string, traceparent: string | undefined, nowMs: f64): Span {
+    const inbound = parseTraceparent(traceparent)
+    if (inbound !== undefined) {
+      return new Span(inbound.traceId, newSpanId(), inbound.parentId, name, 2, msToNs(nowMs), inbound.sampled)
+    }
+    const sampled = Math.random() < this.ratio
+    return new Span(newTraceId(), newSpanId(), undefined, name, 2, msToNs(nowMs), sampled)
+  }
+
+  // A child shares the parent's trace and sampling decision.
+  startChild(parent: Span, name: string, nowMs: f64): Span {
+    return new Span(parent.traceId, newSpanId(), parent.spanId, name, 3, msToNs(nowMs), parent.sampled)
+  }
+
+  finish(span: Span): void {
+    if (span.sampled) this.pending.push(span)
+  }
+
+  // A full batch goes now. Otherwise a non-empty queue goes once flush_ms has
+  // passed since the last flush.
+  shouldFlush(nowMs: f64): bool {
+    if (this.pending.length === 0) return false
+    if (this.pending.length >= this.batchSize) return true
+    return nowMs - this.lastFlushMs >= this.flushMs
+  }
+
+  // The OTLP/HTTP JSON body for everything queued, or undefined when empty.
+  flushPayload(): string | undefined {
+    if (this.pending.length === 0) return undefined
+    const spans: OtlpSpan[] = []
+    for (const s of this.pending) spans.push(spanJson(s))
+    this.pending = []
+    this.lastFlushMs = Date.now()
+    const payload: OtlpPayload = {
+      resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: this.serviceName } }] },
+        scopeSpans: [{ scope: { name: "raiju" }, spans: spans }],
+      }],
+    }
+    return JSON.stringify(payload)
+  }
+}
+
+// OTLP/HTTP JSON wire types. Field names follow the spec exactly.
+type OtlpAny = { stringValue?: string, intValue?: string, doubleValue?: f64, boolValue?: bool }
+type OtlpKv = { key: string, value: OtlpAny }
+type OtlpSpan = {
+  traceId: string,
+  spanId: string,
+  parentSpanId?: string,
+  name: string,
+  kind: int,
+  startTimeUnixNano: string,
+  endTimeUnixNano: string,
+  attributes: OtlpKv[],
+  status: SpanStatus,
+}
+type OtlpPayload = {
+  resourceSpans: { resource: { attributes: OtlpKv[] }, scopeSpans: { scope: { name: string }, spans: OtlpSpan[] }[] }[],
+}
+
+// int64 values travel as decimal strings in OTLP JSON.
+function attrKv(k: string, v: AttrValue): OtlpKv {
+  if (v.kind === "s") return { key: k, value: { stringValue: v.s } }
+  if (v.kind === "d") return { key: k, value: { doubleValue: v.d } }
+  if (v.kind === "b") return { key: k, value: { boolValue: v.b } }
+  return { key: k, value: { intValue: "" + v.i } }
+}
+
+function spanJson(s: Span): OtlpSpan {
+  const attrs: OtlpKv[] = []
+  for (const k of s.attributes.keys()) {
+    attrs.push(attrKv(k, s.attributes.get(k)!))
+  }
+  return {
+    traceId: s.traceId,
+    spanId: s.spanId,
+    parentSpanId: s.parentSpanId,
+    name: s.name,
+    kind: s.kind,
+    startTimeUnixNano: "" + s.startNs,
+    endTimeUnixNano: "" + s.endNs,
+    attributes: attrs,
+    status: s.status,
+  }
+}
+
+export type GenAiAttrs = {
+  system: string,
+  operation: string,
+  requestModel: string,
+  responseModel?: string,
+  inputTokens?: int,
+  outputTokens?: int,
+  maxTokens?: int,
+  temperature?: f64,
+  finishReason?: string,
+}
+
+// OpenTelemetry GenAI semantic-convention attributes. Optional values that are
+// unknown are left off rather than sent as zero.
+export function genAiAttributes(span: Span, a: GenAiAttrs): void {
+  span.setStr("gen_ai.system", a.system)
+  span.setStr("gen_ai.operation.name", a.operation)
+  span.setStr("gen_ai.request.model", a.requestModel)
+  const rm = a.responseModel
+  if (rm !== undefined) span.setStr("gen_ai.response.model", rm)
+  const it = a.inputTokens
+  if (it !== undefined) span.setInt("gen_ai.usage.input_tokens", it)
+  const ot = a.outputTokens
+  if (ot !== undefined) span.setInt("gen_ai.usage.output_tokens", ot)
+  const mt = a.maxTokens
+  if (mt !== undefined) span.setInt("gen_ai.request.max_tokens", mt)
+  const temp = a.temperature
+  if (temp !== undefined) span.setNum("gen_ai.request.temperature", temp)
+  const fr = a.finishReason
+  if (fr !== undefined) span.setStr("gen_ai.response.finish_reasons", fr)
+}
+
+// The HTTP request that sends one flushed payload. The caller does the fetch.
+export function exportRequest(cfg: OtelConfig, payload: string): { url: string, headers: Map<string, string>, body: string } {
+  const headers: Map<string, string> = new Map()
+  headers.set("content-type", "application/json")
+  const extra = cfg.headers
+  if (extra !== undefined) {
+    for (const k of extra.keys()) headers.set(k, extra.get(k)!)
+  }
+  return { url: cfg.endpoint, headers: headers, body: payload }
+}
+
+// ---- tests ----
+
+test("parses a valid traceparent", () => {
+  const t = parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+  expect(t).toEqual({ traceId: "4bf92f3577b34da6a3ce929d0e0e4736", parentId: "00f067aa0ba902b7", sampled: true })
+  const u = parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
+  expect(u?.sampled).toBe(false)
+})
+
+test("rejects invalid traceparent values", () => {
+  expect(parseTraceparent(undefined)).toBeUndefined()
+  expect(parseTraceparent("")).toBeUndefined()
+  expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7")).toBeUndefined()
+  // wrong lengths
+  expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01")).toBeUndefined()
+  expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b-01")).toBeUndefined()
+  expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1")).toBeUndefined()
+  // all zero ids
+  expect(parseTraceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01")).toBeUndefined()
+  expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01")).toBeUndefined()
+  // non-hex and uppercase
+  expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01")).toBeUndefined()
+  expect(parseTraceparent("00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01")).toBeUndefined()
+  expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz")).toBeUndefined()
+  // version ff is reserved, and version 00 takes exactly four fields
+  expect(parseTraceparent("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")).toBeUndefined()
+  expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra")).toBeUndefined()
+})
+
+test("accepts a future version with extra fields", () => {
+  const t = parseTraceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra")
+  expect(t?.traceId).toBe("4bf92f3577b34da6a3ce929d0e0e4736")
+  expect(t?.sampled).toBe(true)
+})
+
+test("traceparent round trips", () => {
+  const h = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+  const t = parseTraceparent(h)!
+  expect(traceparentFor(t.traceId, t.parentId, t.sampled)).toBe(h)
+  expect(traceparentFor(t.traceId, t.parentId, false)).toBe("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
+})
+
+test("generated ids are lowercase hex of the right length and never zero", () => {
+  for (let i = 0; i < 50; i += 1) {
+    const tid = newTraceId()
+    const sid = newSpanId()
+    expect(tid.byteLength).toBe(32)
+    expect(sid.byteLength).toBe(16)
+    expect(isHexOf(tid, 32)).toBe(true)
+    expect(isHexOf(sid, 16)).toBe(true)
+    expect(allZero(tid)).toBe(false)
+    expect(allZero(sid)).toBe(false)
+  }
+})
+
+test("child spans share the trace and point at the parent", () => {
+  const tr = new Tracer({ endpoint: "http://collector:4318/v1/traces" })
+  const root = tr.startRequest("chat", undefined, 1700000000000)
+  const child = tr.startChild(root, "upstream", 1700000000010)
+  expect(child.traceId).toBe(root.traceId)
+  expect(child.parentSpanId).toBe(root.spanId)
+  expect(child.kind).toBe(3)
+  expect(root.kind).toBe(2)
+  expect(root.parentSpanId).toBeUndefined()
+})
+
+test("an inbound traceparent continues the trace", () => {
+  const tr = new Tracer({ endpoint: "http://collector:4318/v1/traces" })
+  const span = tr.startRequest("chat", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", 1700000000000)
+  expect(span.traceId).toBe("4bf92f3577b34da6a3ce929d0e0e4736")
+  expect(span.parentSpanId).toBe("00f067aa0ba902b7")
+  expect(span.sampled).toBe(true)
+  expect(span.spanId.byteLength).toBe(16)
+})
+
+test("converts milliseconds to nanoseconds without loss", () => {
+  const tr = new Tracer({ endpoint: "x" })
+  const span = tr.startRequest("chat", undefined, 1700000000123)
+  expect(span.startNs).toBe(1700000000123000000)
+  expect(msToNs(1.5)).toBe(1500000)
+  expect(msToNs(1700000000123.5)).toBe(1700000000123500000)
+  span.end(1700000000125)
+  expect(span.endNs).toBe(1700000000125000000)
+})
+
+test("payload has the OTLP JSON shape and exact attribute encodings", () => {
+  const tr = new Tracer({ endpoint: "x", service_name: "gw" })
+  const span = tr.startRequest("chat", undefined, 1700000000123)
+  span.setStr("a", "x")
+  span.setInt("b", 42)
+  span.setNum("c", 1.5)
+  span.setBool("d", true)
+  span.fail("boom")
+  span.end(1700000000125)
+  tr.finish(span)
+  const text = tr.flushPayload()!
+  expect(text.includes(`{"key":"b","value":{"intValue":"42"}}`)).toBe(true)
+  expect(text.includes(`{"key":"c","value":{"doubleValue":1.5}}`)).toBe(true)
+  expect(text.includes(`{"key":"d","value":{"boolValue":true}}`)).toBe(true)
+  expect(text.includes(`{"key":"a","value":{"stringValue":"x"}}`)).toBe(true)
+  expect(text.includes(`"startTimeUnixNano":"1700000000123000000"`)).toBe(true)
+  expect(text.includes(`"endTimeUnixNano":"1700000000125000000"`)).toBe(true)
+  expect(text.includes(`"status":{"code":2,"message":"boom"}`)).toBe(true)
+
+  const p = try JSON.parse(text) as OtlpPayload
+  const rs = p.resourceSpans[0]!
+  expect(rs.resource.attributes[0]!.key).toBe("service.name")
+  expect(rs.resource.attributes[0]!.value.stringValue).toBe("gw")
+  const sp = rs.scopeSpans[0]!.spans[0]!
+  expect(rs.scopeSpans[0]!.scope.name).toBe("raiju")
+  expect(sp.name).toBe("chat")
+  expect(sp.kind).toBe(2)
+  expect(sp.traceId.byteLength).toBe(32)
+  expect(sp.parentSpanId).toBeUndefined()
+  expect(sp.attributes[1]!.value.intValue).toBe("42")
+})
+
+test("sample ratio 0 queues nothing, but an inbound sampled flag still records", () => {
+  const tr = new Tracer({ endpoint: "x", sample_ratio: 0.0 })
+  const dropped = tr.startRequest("chat", undefined, 1700000000000)
+  expect(dropped.sampled).toBe(false)
+  tr.finish(dropped)
+  expect(tr.flushPayload()).toBeUndefined()
+
+  const kept = tr.startRequest("chat", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", 1700000000000)
+  expect(kept.sampled).toBe(true)
+  tr.finish(kept)
+  expect(tr.flushPayload()).toBeDefined()
+})
+
+test("an inbound unsampled flag wins over a ratio of 1", () => {
+  const tr = new Tracer({ endpoint: "x" })
+  const span = tr.startRequest("chat", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00", 1700000000000)
+  expect(span.sampled).toBe(false)
+  const child = tr.startChild(span, "upstream", 1700000000000)
+  expect(child.sampled).toBe(false)
+})
+
+test("batching: shouldFlush on full batch or elapsed time, and flush clears", () => {
+  const tr = new Tracer({ endpoint: "x", batch_size: 2, flush_ms: 2000 })
+  const base = tr.lastFlushMs
+  expect(tr.shouldFlush(base + 5000)).toBe(false)
+  const a = tr.startRequest("a", undefined, base)
+  tr.finish(a)
+  expect(tr.shouldFlush(base + 1999)).toBe(false)
+  expect(tr.shouldFlush(base + 2000)).toBe(true)
+  const b = tr.startRequest("b", undefined, base)
+  tr.finish(b)
+  expect(tr.shouldFlush(base + 1)).toBe(true)
+
+  const p = try JSON.parse(tr.flushPayload()!) as OtlpPayload
+  expect(p.resourceSpans[0]!.scopeSpans[0]!.spans.length).toBe(2)
+  expect(tr.flushPayload()).toBeUndefined()
+  expect(tr.shouldFlush(tr.lastFlushMs + 10000)).toBe(false)
+})
+
+test("genAiAttributes sets the semantic-convention keys", () => {
+  const tr = new Tracer({ endpoint: "x" })
+  const span = tr.startRequest("chat", undefined, 1700000000000)
+  genAiAttributes(span, {
+    system: "openai",
+    operation: "chat",
+    requestModel: "gpt-4o-mini",
+    responseModel: "gpt-4o-mini-2024",
+    inputTokens: 12,
+    outputTokens: 7,
+    maxTokens: 256,
+    temperature: 0.2,
+    finishReason: "stop",
+  })
+  expect(span.attributes.size).toBe(9)
+  expect(span.attributes.get("gen_ai.system")).toEqual({ kind: "s", s: "openai" })
+  expect(span.attributes.get("gen_ai.operation.name")).toEqual({ kind: "s", s: "chat" })
+  expect(span.attributes.get("gen_ai.request.model")).toEqual({ kind: "s", s: "gpt-4o-mini" })
+  expect(span.attributes.get("gen_ai.response.model")).toEqual({ kind: "s", s: "gpt-4o-mini-2024" })
+  expect(span.attributes.get("gen_ai.usage.input_tokens")).toEqual({ kind: "i", i: 12 })
+  expect(span.attributes.get("gen_ai.usage.output_tokens")).toEqual({ kind: "i", i: 7 })
+  expect(span.attributes.get("gen_ai.request.max_tokens")).toEqual({ kind: "i", i: 256 })
+  expect(span.attributes.get("gen_ai.request.temperature")).toEqual({ kind: "d", d: 0.2 })
+  expect(span.attributes.get("gen_ai.response.finish_reasons")).toEqual({ kind: "s", s: "stop" })
+
+  const bare = tr.startRequest("chat", undefined, 1700000000000)
+  genAiAttributes(bare, { system: "anthropic", operation: "chat", requestModel: "m" })
+  expect(bare.attributes.size).toBe(3)
+  expect(bare.attributes.get("gen_ai.response.model")).toBeUndefined()
+})
+
+test("exportRequest carries the content type and configured headers", () => {
+  const h: Map<string, string> = new Map()
+  h.set("x-honeycomb-team", "key")
+  const req = exportRequest({ endpoint: "http://collector:4318/v1/traces", headers: h }, "{}")
+  expect(req.url).toBe("http://collector:4318/v1/traces")
+  expect(req.headers.get("content-type")).toBe("application/json")
+  expect(req.headers.get("x-honeycomb-team")).toBe("key")
+  expect(req.body).toBe("{}")
+})

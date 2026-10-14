@@ -1,0 +1,428 @@
+// Semantic cache (Bifrost's semantic_cache plugin). When the exact-match cache
+// misses, the prompt is embedded by the caller and the nearest stored prompt
+// in the same scope is returned if its cosine similarity clears the threshold.
+// Vectors live in memory; there is no external vector DB.
+
+import { fields, elements, find, rawStr, rawBool, isNull, decodeString } from "./json"
+
+export type SemanticCacheConfig = {
+  threshold: f64,
+  ttl_ms: int,
+  max_entries: int,
+  conversation_history_threshold: int,
+  exclude_system_prompt: bool,
+  cache_by_model: bool,
+  cache_by_provider: bool,
+}
+
+export function defaultSemanticConfig(): SemanticCacheConfig {
+  return {
+    threshold: 0.8,
+    ttl_ms: 300000,
+    max_entries: 10000,
+    conversation_history_threshold: 3,
+    exclude_system_prompt: false,
+    cache_by_model: true,
+    cache_by_provider: true,
+  }
+}
+
+// Text-only embeddings cannot tell two images apart, so requests with images
+// are not cached.
+function contentText(raw: string | undefined): string | undefined throws SyntaxError {
+  if (raw === undefined || raw === "null") return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (!raw.startsWith("[")) return ""
+  let out = ""
+  for (const p of try elements(raw)) {
+    const pf = try fields(p)
+    const t = rawStr(pf, "type")
+    if (t === "image_url" || t === "input_audio" || t === "file") return undefined
+    if (t === "text") {
+      const s = rawStr(pf, "text")
+      if (s !== undefined) out += s
+    }
+  }
+  return out
+}
+
+// The text to embed for a chat request, one "role: text" line per message.
+// Undefined means the request is not cacheable semantically: too long a
+// conversation, tool use, streaming, or images.
+export function promptText(chatBody: string, cfg: SemanticCacheConfig): string | undefined throws SyntaxError {
+  const fs = try fields(chatBody)
+  if (rawBool(fs, "stream") === true) return undefined
+  if (!isNull(find(fs, "tools")) || !isNull(find(fs, "functions"))) return undefined
+  const raw = find(fs, "messages")
+  if (raw === undefined) return undefined
+  const msgs = try elements(raw)
+  if (msgs.length === 0 || msgs.length > cfg.conversation_history_threshold) return undefined
+  const lines: string[] = []
+  for (const m of msgs) {
+    const mf = try fields(m)
+    const role = rawStr(mf, "role")
+    if (role === undefined) return undefined
+    if (role === "tool" || role === "function") return undefined
+    if (!isNull(find(mf, "tool_calls"))) return undefined
+    if (role === "system" && cfg.exclude_system_prompt) continue
+    const text = try contentText(find(mf, "content"))
+    if (text === undefined) return undefined
+    lines.push(role + ": " + text)
+  }
+  if (lines.length === 0) return undefined
+  return lines.join("\n")
+}
+
+type EmbeddingResponse = { data: { embedding: f64[] }[] }
+
+// The first embedding of an OpenAI embeddings response.
+export function parseEmbedding(openaiEmbeddingsResponse: string): f64[] throws SyntaxError {
+  const r = try JSON.parse(openaiEmbeddingsResponse) as EmbeddingResponse
+  if (r.data.length === 0) throw new SyntaxError("embeddings response has no data")
+  return r.data[0]!.embedding
+}
+
+// Scope key for the partitions. Provider and model are left out when the
+// config says not to separate by them.
+export function scopeKey(provider: string, model: string, cacheKey: string, cfg: SemanticCacheConfig): string {
+  const p = cfg.cache_by_provider ? provider : ""
+  const m = cfg.cache_by_model ? model : ""
+  return p + "\u0000" + m + "\u0000" + cacheKey
+}
+
+// Scales v to unit length; undefined for the zero vector.
+function unit(v: f64[]): f64[] | undefined {
+  let sq = 0.0
+  for (const x of v) sq += x * x
+  if (sq === 0.0) return undefined
+  const n = Math.sqrt(sq)
+  const out: f64[] = []
+  for (const x of v) out.push(x / n)
+  return out
+}
+
+// Flat row-major store of unit vectors. Cosine similarity is then a dot
+// product, and a scan walks one contiguous buffer.
+export class VectorIndex {
+  vecs: f64[] = []
+  ids: string[] = []
+  rows: Map<string, int> = new Map()
+  constructor(readonly dim: int) {}
+
+  size(): int {
+    return this.ids.length
+  }
+
+  // False for a wrong dimension, a zero vector, or a non-finite value.
+  add(id: string, v: f64[]): bool {
+    if (v.length !== this.dim) return false
+    const u = unit(v)
+    if (u === undefined) return false
+    // NaN and Infinity are the only values that are not equal to themselves minus themselves
+    for (const x of u) {
+      if (x - x !== 0.0) return false
+    }
+    const existing = this.rows.get(id)
+    if (existing !== undefined) {
+      const base = existing * this.dim
+      for (let j = 0; j < this.dim; j++) this.vecs[base + j] = u[j]!
+      return true
+    }
+    this.rows.set(id, this.ids.length)
+    this.ids.push(id)
+    for (const x of u) this.vecs.push(x)
+    return true
+  }
+
+  // Swap-remove: the last row fills the hole, so rows stay contiguous.
+  remove(id: string): bool {
+    const idx = this.rows.get(id)
+    if (idx === undefined) return false
+    const last = this.ids.length - 1
+    if (idx !== last) {
+      const from = last * this.dim
+      const to = idx * this.dim
+      for (let j = 0; j < this.dim; j++) this.vecs[to + j] = this.vecs[from + j]!
+      const moved = this.ids[last]!
+      this.ids[idx] = moved
+      this.rows.set(moved, idx)
+    }
+    this.ids.pop()
+    this.rows.delete(id)
+    for (let j = 0; j < this.dim; j++) this.vecs.pop()
+    return true
+  }
+
+  // Top k by cosine, best first, keeping only scores >= minScore.
+  search(v: f64[], k: int, minScore: f64): { id: string, score: f64 }[] {
+    const out: { id: string, score: f64 }[] = []
+    const n = this.ids.length
+    if (k <= 0 || n === 0 || v.length !== this.dim) return out
+    const q = unit(v)
+    if (q === undefined) return out
+    const d = this.dim
+    for (let r = 0; r < n; r++) {
+      const base = r * d
+      let dot = 0.0
+      for (let j = 0; j < d; j++) dot += q[j]! * this.vecs[base + j]!
+      if (dot < minScore) continue
+      if (out.length === k && dot <= out[k - 1]!.score) continue
+      let p = out.length
+      while (p > 0 && out[p - 1]!.score < dot) p--
+      const hit = { id: this.ids[r]!, score: dot }
+      out.push(hit)
+      for (let i = out.length - 1; i > p; i--) out[i] = out[i - 1]!
+      out[p] = hit
+      if (out.length > k) out.pop()
+    }
+    return out
+  }
+}
+
+type Entry = { scope: string, body: string, contentType: string, expires: f64 }
+
+// Partitioned by scope. Eviction is global FIFO: the oldest insert goes first,
+// whichever scope it is in.
+export class SemanticCache {
+  parts: Map<string, VectorIndex> = new Map()
+  meta: Map<string, Entry> = new Map()
+  queue: string[] = []
+  head = 0
+  seq = 0
+  hits = 0
+  misses = 0
+  constructor(readonly cfg: SemanticCacheConfig) {}
+
+  private drop(id: string): void {
+    const e = this.meta.get(id)
+    if (e === undefined) return
+    this.meta.delete(id)
+    const part = this.parts.get(e.scope)
+    if (part === undefined) return
+    part.remove(id)
+    if (part.size() === 0) this.parts.delete(e.scope)
+  }
+
+  private evictOldest(): void {
+    while (this.head < this.queue.length) {
+      const id = this.queue[this.head]!
+      this.head += 1
+      if (this.meta.has(id)) {
+        this.drop(id)
+        break
+      }
+    }
+    // Drop the consumed prefix once it is most of the queue.
+    if (this.head > 1024 && this.head * 2 > this.queue.length) {
+      this.queue = this.queue.slice(this.head)
+      this.head = 0
+    }
+  }
+
+  // Returns the best unexpired entry in the scope at or above the threshold.
+  // Expired entries found on the way are removed.
+  lookup(scope: string, v: f64[], nowMs: f64, thresholdOverride?: f64): { body: string, contentType: string, score: f64 } | undefined {
+    let threshold = this.cfg.threshold
+    if (thresholdOverride !== undefined) threshold = thresholdOverride
+    while (true) {
+      const part = this.parts.get(scope)
+      if (part === undefined) break
+      const best = part.search(v, 1, threshold)
+      if (best.length === 0) break
+      const hit = best[0]!
+      const e = this.meta.get(hit.id)
+      if (e === undefined) break
+      if (nowMs >= e.expires) {
+        this.drop(hit.id)
+        continue
+      }
+      this.hits += 1
+      return { body: e.body, contentType: e.contentType, score: hit.score }
+    }
+    this.misses += 1
+    return undefined
+  }
+
+  // False when v is unusable (empty, zero, or wrong dimension for the scope).
+  store(scope: string, v: f64[], body: string, contentType: string, nowMs: f64, ttlOverride?: int): bool {
+    if (v.length === 0 || this.cfg.max_entries < 1) return false
+    let part = this.parts.get(scope)
+    if (part !== undefined && part.dim !== v.length) return false
+    if (part === undefined) {
+      part = new VectorIndex(v.length)
+      this.parts.set(scope, part)
+    }
+    this.seq += 1
+    const id = "e" + this.seq
+    if (!part.add(id, v)) {
+      if (part.size() === 0) this.parts.delete(scope)
+      return false
+    }
+    let ttl = this.cfg.ttl_ms
+    if (ttlOverride !== undefined) ttl = ttlOverride
+    this.meta.set(id, { scope: scope, body: body, contentType: contentType, expires: nowMs + ttl })
+    this.queue.push(id)
+    while (this.meta.size > this.cfg.max_entries) this.evictOldest()
+    return true
+  }
+
+  stats(): { entries: int, partitions: int, hits: int, misses: int } {
+    return { entries: this.meta.size, partitions: this.parts.size, hits: this.hits, misses: this.misses }
+  }
+}
+
+test("cosine on known vectors", () => {
+  const ix = new VectorIndex(3)
+  expect(ix.add("a", [1.0, 0.0, 0.0])).toBe(true)
+  expect(ix.add("b", [0.0, 1.0, 0.0])).toBe(true)
+  expect(ix.add("c", [5.0, 0.0, 0.0])).toBe(true)
+  const r = ix.search([1.0, 0.0, 0.0], 3, -1.0)
+  expect(r.length).toBe(3)
+  expect(r[0]!.score).toBeCloseTo(1.0)
+  expect(r[1]!.score).toBeCloseTo(1.0)
+  const orth = ix.search([0.0, 0.0, 1.0], 3, -1.0)
+  expect(orth[orth.length - 1]!.score).toBeCloseTo(0.0)
+  expect(ix.search([0.0, 0.0, 0.0], 3, -1.0).length).toBe(0)
+})
+
+test("top-k ordering and minScore", () => {
+  const ix = new VectorIndex(2)
+  ix.add("far", [0.0, 1.0])
+  ix.add("near", [1.0, 0.1])
+  ix.add("mid", [1.0, 1.0])
+  ix.add("exact", [1.0, 0.0])
+  const top2 = ix.search([1.0, 0.0], 2, -1.0)
+  expect(top2.length).toBe(2)
+  expect(top2[0]!.id).toBe("exact")
+  expect(top2[1]!.id).toBe("near")
+  const filtered = ix.search([1.0, 0.0], 10, 0.9)
+  expect(filtered.length).toBe(2)
+  expect(filtered[0]!.id).toBe("exact")
+  expect(filtered[1]!.id).toBe("near")
+  expect(ix.search([1.0, 0.0], 0, -1.0).length).toBe(0)
+})
+
+test("swap-remove keeps the index consistent", () => {
+  const ix = new VectorIndex(2)
+  ix.add("a", [1.0, 0.0])
+  ix.add("b", [0.0, 1.0])
+  ix.add("c", [1.0, 1.0])
+  ix.add("d", [-1.0, 0.0])
+  expect(ix.remove("a")).toBe(true)
+  expect(ix.remove("a")).toBe(false)
+  expect(ix.size()).toBe(3)
+  expect(ix.search([0.0, 1.0], 1, 0.99)[0]!.id).toBe("b")
+  expect(ix.search([-1.0, 0.0], 1, 0.99)[0]!.id).toBe("d")
+  expect(ix.remove("d")).toBe(true)
+  expect(ix.remove("b")).toBe(true)
+  const left = ix.search([1.0, 1.0], 5, -1.0)
+  expect(left.length).toBe(1)
+  expect(left[0]!.id).toBe("c")
+  expect(left[0]!.score).toBeCloseTo(1.0)
+  expect(ix.add("a", [0.0, -1.0])).toBe(true)
+  expect(ix.size()).toBe(2)
+  expect(ix.search([0.0, -1.0], 1, 0.99)[0]!.id).toBe("a")
+})
+
+test("dimension mismatch is rejected", () => {
+  const ix = new VectorIndex(3)
+  expect(ix.add("x", [1.0, 2.0])).toBe(false)
+  expect(ix.add("y", [1.0, 2.0, 3.0, 4.0])).toBe(false)
+  expect(ix.add("z", [0.0, 0.0, 0.0])).toBe(false)
+  expect(ix.size()).toBe(0)
+  ix.add("ok", [1.0, 2.0, 3.0])
+  expect(ix.search([1.0, 2.0], 1, -1.0).length).toBe(0)
+})
+
+test("promptText rules", () => {
+  const cfg = defaultSemanticConfig()
+  const body = '{"model":"gpt-4o","messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"}]}'
+  expect(try promptText(body, cfg)).toBe("system: be terse\nuser: hi")
+  let ex = defaultSemanticConfig()
+  ex.exclude_system_prompt = true
+  expect(try promptText(body, ex)).toBe("user: hi")
+  const parts = '{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}'
+  expect(try promptText(parts, cfg)).toBe("user: ab")
+  const long = '{"messages":[{"role":"user","content":"1"},{"role":"assistant","content":"2"},{"role":"user","content":"3"},{"role":"assistant","content":"4"}]}'
+  expect(try promptText(long, cfg)).toBeUndefined()
+  const three = '{"messages":[{"role":"user","content":"1"},{"role":"assistant","content":"2"},{"role":"user","content":"3"}]}'
+  expect(try promptText(three, cfg)).toBe("user: 1\nassistant: 2\nuser: 3")
+  const tools = '{"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function"}]}'
+  expect(try promptText(tools, cfg)).toBeUndefined()
+  const toolMsg = '{"messages":[{"role":"tool","content":"x","tool_call_id":"1"}]}'
+  expect(try promptText(toolMsg, cfg)).toBeUndefined()
+  const calls = '{"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"1"}]}]}'
+  expect(try promptText(calls, cfg)).toBeUndefined()
+  const streamed = '{"messages":[{"role":"user","content":"x"}],"stream":true}'
+  expect(try promptText(streamed, cfg)).toBeUndefined()
+  const img = '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"u"}}]}]}'
+  expect(try promptText(img, cfg)).toBeUndefined()
+  const onlySys = '{"messages":[{"role":"system","content":"s"}]}'
+  expect(try promptText(onlySys, ex)).toBeUndefined()
+})
+
+test("TTL, threshold override, partitions and eviction", () => {
+  const cfg = defaultSemanticConfig()
+  const c = new SemanticCache(cfg)
+  expect(c.store("p|m", [1.0, 0.0], "A", "application/json", 1000.0, 500)).toBe(true)
+  expect(c.lookup("p|m", [1.0, 0.0], 1200.0)!.body).toBe("A")
+  expect(c.lookup("p|m", [1.0, 0.0], 1500.0)).toBeUndefined()
+  expect(c.stats().entries).toBe(0)
+  expect(c.stats().partitions).toBe(0)
+
+  c.store("p|m", [1.0, 0.0], "B", "application/json", 0.0)
+  c.store("p|m", [1.0, 0.1], "C", "application/json", 0.0)
+  // [1,0.5] is about 0.934 from C and 0.894 from B: C wins, a hit at the
+  // default 0.8 and a miss when the override asks for 0.95
+  const near = c.lookup("p|m", [1.0, 0.5], 1.0)
+  expect(near!.body).toBe("C")
+  expect(near!.score).toBeCloseTo(0.934, 2)
+  expect(c.lookup("p|m", [1.0, 0.5], 1.0, 0.95)).toBeUndefined()
+  expect(c.lookup("p|m", [0.0, 1.0], 1.0)).toBeUndefined()
+
+  c.store("other", [1.0, 0.0], "O", "application/json", 0.0)
+  expect(c.lookup("other", [1.0, 0.0], 1.0)!.body).toBe("O")
+  // [0,1] is about 0.1 from C, so a 0.2 override misses while a 0 override would hit
+  expect(c.lookup("p|m", [0.0, 1.0], 1.0, 0.2)).toBeUndefined()
+  expect(c.stats().partitions).toBe(2)
+  expect(c.stats().hits).toBe(3)
+
+  let tiny = defaultSemanticConfig()
+  tiny.max_entries = 3
+  const small = new SemanticCache(tiny)
+  small.store("s", [1.0, 0.0], "1", "t", 0.0)
+  small.store("s", [0.0, 1.0], "2", "t", 0.0)
+  small.store("t", [1.0, 1.0], "3", "t", 0.0)
+  small.store("t", [-1.0, 0.0], "4", "t", 0.0)
+  expect(small.stats().entries).toBe(3)
+  expect(small.lookup("s", [1.0, 0.0], 1.0)).toBeUndefined()
+  expect(small.lookup("s", [0.0, 1.0], 1.0)!.body).toBe("2")
+  expect(small.lookup("t", [-1.0, 0.0], 1.0)!.body).toBe("4")
+  expect(small.store("t", [1.0, 0.0, 0.0], "bad", "t", 0.0)).toBe(false)
+  expect(small.store("t", [0.0, 0.0], "bad", "t", 0.0)).toBe(false)
+  expect(small.stats().entries).toBe(3)
+})
+
+test("parseEmbedding", () => {
+  const v = try parseEmbedding('{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.5,-1.25,3e-2]}],"model":"m","usage":{"prompt_tokens":1,"total_tokens":1}}')
+  expect(v.length).toBe(3)
+  expect(v[0]!).toBe(0.5)
+  expect(v[1]!).toBe(-1.25)
+  expect(v[2]!).toBeCloseTo(0.03)
+  let threw = false
+  try {
+    try parseEmbedding('{"error":{"message":"bad"}}')
+  } catch (e) {
+    threw = e instanceof SyntaxError
+  }
+  expect(threw).toBe(true)
+})
+
+test("scopeKey respects config", () => {
+  const cfg = defaultSemanticConfig()
+  expect(scopeKey("openai", "gpt", "k", cfg) !== scopeKey("openai", "gpt4", "k", cfg)).toBe(true)
+  let noModel = defaultSemanticConfig()
+  noModel.cache_by_model = false
+  expect(scopeKey("openai", "gpt", "k", noModel)).toBe(scopeKey("openai", "gpt4", "k", noModel))
+  expect(scopeKey("openai", "gpt", "k", noModel) !== scopeKey("azure", "gpt", "k", noModel)).toBe(true)
+})

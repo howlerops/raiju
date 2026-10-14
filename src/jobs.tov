@@ -1,0 +1,603 @@
+// Async jobs, token counting and rerank shapes.
+//
+// Async: POST /v1/async/<op> answers 202 with a job id; the gateway runs the
+// request in the background and GET /v1/async/jobs/{id} reports the result.
+// Finished jobs are kept for a TTL; unfinished ones also expire, so a request
+// that never completes cannot fill the store.
+//
+// Token counting: exact counts come from the provider's count endpoint when it
+// has one; the estimates here cover the rest.
+//
+// Rerank: the Cohere-style request and response shapes. Providers without a
+// rerank API are scored by lexicalRerank.
+import { fields, elements, find, quote, rawStr, rawNum, setField, without, build, decodeString } from "./json"
+import { Target, Upstream, trimSlash } from "./providers/types"
+import * as anthropic from "./providers/anthropic"
+import * as gemini from "./providers/gemini"
+import { newId } from "./schemas"
+
+export type Job = {
+  id: string,
+  op: string,
+  status: "queued" | "running" | "succeeded" | "failed",
+  created_at: int,
+  completed_at?: int,
+  http_status?: int,
+  result?: string,
+  error?: string,
+}
+
+// The store's own bookkeeping: `at` is the ms the expiry clock started
+// (creation, then completion), which the job's seconds can't express exactly.
+type Slot = { job: Job, at: int }
+
+function isFinished(j: Job): bool {
+  return j.status === "succeeded" || j.status === "failed"
+}
+
+// True when `text` is exactly one JSON value. The scanner only reports the
+// elements it reads, so the element has to be the whole input.
+function isJsonValue(text: string): bool {
+  try {
+    const els = elements("[" + text + "]")
+    return els.length === 1 && els[0] === text
+  } catch (e) {
+    return false
+  }
+}
+
+// error.message of an OpenAI- or Gemini-shaped error body, if it has one.
+function errorMessage(body: string): string | undefined {
+  try {
+    const top = fields(body)
+    const err = find(top, "error")
+    if (err === undefined) return undefined
+    if (err.startsWith("\"")) return decodeString(err)
+    if (!err.startsWith("{")) return undefined
+    return rawStr(fields(err), "message")
+  } catch (e) {
+    return undefined
+  }
+}
+
+export class JobStore {
+  // Insertion order is creation order, which the eviction below relies on.
+  private jobs: Map<string, Slot> = new Map()
+
+  constructor(readonly ttlMs: int, readonly maxJobs: int) {}
+
+  private expired(slot: Slot, nowMs: int): bool {
+    return nowMs >= slot.at + this.ttlMs
+  }
+
+  // Removes the oldest finished job; unfinished jobs are never evicted.
+  private evictOne(): bool {
+    for (const id of this.jobs.keys()) {
+      const slot = this.jobs.get(id)
+      if (slot !== undefined && isFinished(slot.job)) {
+        this.jobs.delete(id)
+        return true
+      }
+    }
+    return false
+  }
+
+  // Returns undefined when the store is full of unfinished jobs.
+  create(op: string, nowMs: int): Job | undefined {
+    if (this.jobs.size >= this.maxJobs) {
+      this.sweep(nowMs)
+      if (this.jobs.size >= this.maxJobs && !this.evictOne()) return undefined
+    }
+    const job: Job = { id: newId("job_"), op: op, status: "queued", created_at: Math.floor(nowMs / 1000) }
+    this.jobs.set(job.id, { job: job, at: nowMs })
+    return job
+  }
+
+  start(id: string): bool {
+    const slot = this.jobs.get(id)
+    if (slot === undefined || slot.job.status !== "queued") return false
+    const job: Job = { id: slot.job.id, op: slot.job.op, status: "running", created_at: slot.job.created_at }
+    this.jobs.set(id, { job: job, at: slot.at })
+    return true
+  }
+
+  // Records the upstream answer. A 2xx body is the result; anything else fails
+  // with the body's error.message when it has one.
+  finish(id: string, httpStatus: int, body: string, nowMs: int): bool {
+    const cur = this.get(id, nowMs)
+    if (cur === undefined || isFinished(cur)) return false
+    const completed = Math.floor(nowMs / 1000)
+    let job: Job
+    if (httpStatus >= 200 && httpStatus < 300) {
+      const text = body.trim()
+      const result = isJsonValue(text) ? text : quote(body)
+      job = { id: cur.id, op: cur.op, status: "succeeded", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, result: result }
+    } else {
+      const msg = errorMessage(body) ?? `upstream returned HTTP ${httpStatus}`
+      job = { id: cur.id, op: cur.op, status: "failed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, error: msg }
+    }
+    this.jobs.set(id, { job: job, at: nowMs })
+    return true
+  }
+
+  get(id: string, nowMs: int): Job | undefined {
+    const slot = this.jobs.get(id)
+    if (slot === undefined) return undefined
+    if (this.expired(slot, nowMs)) {
+      this.jobs.delete(id)
+      return undefined
+    }
+    return slot.job
+  }
+
+  // Drops every expired job; returns how many went.
+  sweep(nowMs: int): int {
+    let removed = 0
+    for (const id of this.jobs.keys()) {
+      const slot = this.jobs.get(id)
+      if (slot !== undefined && this.expired(slot, nowMs)) {
+        this.jobs.delete(id)
+        removed += 1
+      }
+    }
+    return removed
+  }
+
+  count(): int {
+    return this.jobs.size
+  }
+}
+
+// The job as the GET /v1/async/jobs/{id} body. `result` is embedded raw.
+export function jobJson(j: Job): string {
+  const completed = j.completed_at === undefined ? "null" : `${j.completed_at}`
+  const result = j.result === undefined ? "null" : j.result
+  const error = j.error === undefined ? "null" : `{"message":${quote(j.error)}}`
+  return `{"id":${quote(j.id)},"object":"async.job","op":${quote(j.op)},"status":${quote(j.status)},` +
+    `"created_at":${j.created_at},"completed_at":${completed},"result":${result},"error":${error}}`
+}
+
+// Async ops and the sync route each one runs as. Built by a function because
+// top-level statements in an imported module do not run.
+function makeAsyncOps(): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  for (const op of ["chat/completions", "completions", "embeddings", "responses", "images/generations", "audio/speech"]) {
+    m.set(op, "/v1/" + op)
+  }
+  m.set("messages", "/anthropic/v1/messages")
+  return m
+}
+
+const ASYNC_OPS = makeAsyncOps()
+
+// The sync path for a /v1/async/<op> path, or undefined for anything else.
+export function asyncOp(path: string): string | undefined {
+  const prefix = "/v1/async/"
+  if (!path.startsWith(prefix)) return undefined
+  return ASYNC_OPS.get(path.slice(prefix.byteLength, path.byteLength))
+}
+
+// Non-ASCII characters are one token each; ASCII text is about four bytes a token.
+export function estimateTokens(text: string): int {
+  if (text === "") return 0
+  let ascii = 0
+  let wide = 0
+  for (const b of new TextEncoder().encode(text)) {
+    const v = int(b)
+    if (v < 128) ascii += 1
+    else if (v >= 192) wide += 1 // a lead byte: one per character
+  }
+  const n = Math.floor(ascii / 4) + wide
+  return n === 0 ? 1 : n
+}
+
+// The text of a message content: a string, or the text parts of an array.
+function contentText(raw: string): string throws SyntaxError {
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (!raw.startsWith("[")) return ""
+  const out: string[] = []
+  for (const el of try elements(raw)) {
+    const t = rawStr(try fields(el), "text")
+    if (t !== undefined) out.push(t)
+  }
+  return out.join("")
+}
+
+// Rough prompt size of a chat request: per message a fixed overhead plus its
+// text, and the raw tool definitions at four bytes a token.
+export function estimateChatTokens(chatBody: string): int throws SyntaxError {
+  const fs = try fields(chatBody)
+  let total = 3
+  const msgs = find(fs, "messages")
+  if (msgs !== undefined) {
+    for (const el of try elements(msgs)) {
+      const m = try fields(el)
+      total += 4
+      const content = find(m, "content")
+      if (content !== undefined) total += estimateTokens(try contentText(content))
+      const name = rawStr(m, "name")
+      if (name !== undefined) total += estimateTokens(name)
+      const calls = find(m, "tool_calls")
+      if (calls !== undefined) total += estimateTokens(calls)
+    }
+  }
+  const tools = find(fs, "tools")
+  if (tools !== undefined) total += Math.floor(tools.byteLength / 4)
+  return total
+}
+
+// Anthropic's count_tokens takes the Messages body without the sampling fields.
+const ANTHROPIC_COUNT_DROP = ["max_tokens", "stream", "temperature"]
+
+function anthropicBase(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b === undefined || b === "") return "https://api.anthropic.com"
+  return trimSlash(b)
+}
+
+function geminiBase(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b === undefined || b === "") return "https://generativelanguage.googleapis.com"
+  return trimSlash(b)
+}
+
+export function anthropicCountRequest(t: Target, messagesBody: string): Upstream throws SyntaxError {
+  let fs = try fields(messagesBody)
+  setField(&fs, "model", quote(t.model))
+  fs = without(fs, ANTHROPIC_COUNT_DROP)
+  return { url: anthropicBase(t) + "/v1/messages/count_tokens", headers: anthropic.upstreamHeaders(t), body: build(fs) }
+}
+
+// Gemini's countTokens takes the contents of a generateContent body.
+export function geminiCountRequest(t: Target, generateBody: string): Upstream throws SyntaxError {
+  const fs = try fields(generateBody)
+  const contents = find(fs, "contents")
+  if (contents === undefined) throw new SyntaxError("generateContent body has no contents")
+  return {
+    url: `${geminiBase(t)}/v1beta/models/${t.model}:countTokens`,
+    headers: gemini.upstreamHeaders(t),
+    body: `{"contents":${contents}}`,
+  }
+}
+
+// The count from a count endpoint's reply: "anthropic" or "gemini".
+export function countResponse(kind: string, text: string): int throws SyntaxError {
+  const fs = try fields(text)
+  const key = kind === "gemini" ? "totalTokens" : "input_tokens"
+  const n = rawNum(fs, key)
+  if (n === undefined) throw new SyntaxError(`count response has no ${key}`)
+  return Math.floor(n)
+}
+
+export function countTokensJson(n: int, model: string, exact: bool): string {
+  return `{"object":"token_count","model":${quote(model)},"input_tokens":${n},"exact":${exact}}`
+}
+
+export type RerankRequest = { model: string, query: string, documents: string[], topN: int }
+
+// Documents are strings or {text} objects; top_n defaults to all of them.
+export function parseRerank(body: string): RerankRequest throws SyntaxError {
+  const fs = try fields(body)
+  const model = rawStr(fs, "model")
+  if (model === undefined) throw new SyntaxError("rerank request needs a model")
+  const query = rawStr(fs, "query")
+  if (query === undefined) throw new SyntaxError("rerank request needs a query")
+  const raw = find(fs, "documents")
+  if (raw === undefined) throw new SyntaxError("rerank request needs documents")
+  const documents: string[] = []
+  for (const el of try elements(raw)) {
+    if (el.startsWith("\"")) {
+      documents.push(try decodeString(el))
+    } else if (el.startsWith("{")) {
+      const text = rawStr(try fields(el), "text")
+      if (text === undefined) throw new SyntaxError("rerank document object needs a text")
+      documents.push(text)
+    } else {
+      throw new SyntaxError("rerank documents must be strings or {text} objects")
+    }
+  }
+  let topN = documents.length
+  const n = rawNum(fs, "top_n")
+  if (n !== undefined) {
+    topN = Math.floor(n)
+    if (topN > documents.length) topN = documents.length
+    if (topN < 0) topN = 0
+  }
+  return { model: model, query: query, documents: documents, topN: topN }
+}
+
+// The Cohere-style rerank reply. The caller sorts and cuts to top_n first;
+// this orders by score anyway so the output holds for any input order.
+export function rerankJson(results: { index: int, score: f64 }[], docs: string[], returnDocuments: bool, model: string, searchUnits: int): string {
+  const sorted = results.slice().sort((a, b) => {
+    const d = b.score - a.score
+    if (d !== 0) return d
+    return a.index - b.index
+  })
+  const items: string[] = []
+  for (const r of sorted) {
+    const parts = [`"index":${r.index}`, `"relevance_score":${JSON.stringify(r.score)}`]
+    const doc = docs[r.index]
+    if (returnDocuments && doc !== undefined) parts.push(`"document":{"text":${quote(doc)}}`)
+    items.push("{" + parts.join(",") + "}")
+  }
+  return `{"results":[${items.join(",")}],"model":${quote(model)},"usage":{"search_units":${searchUnits}}}`
+}
+
+// Lowercased ASCII words, as byte ranges. Non-ASCII bytes stay inside a word,
+// so slicing on ASCII boundaries keeps the text valid UTF-8.
+function wordsOf(text: string): string[] {
+  const out: string[] = []
+  const bytes = new TextEncoder().encode(text)
+  let start = -1
+  let i = 0
+  for (const b of bytes) {
+    const v = int(b)
+    const word = v >= 128 || (v >= 48 && v <= 57) || (v >= 65 && v <= 90) || (v >= 97 && v <= 122)
+    if (word && start < 0) start = i
+    if (!word && start >= 0) {
+      out.push(text.slice(start, i).toLowerCase())
+      start = -1
+    }
+    i += 1
+  }
+  if (start >= 0) out.push(text.slice(start, i).toLowerCase())
+  return out
+}
+
+// Fallback scorer for providers without a rerank API: BM25 over lowercase
+// words, scaled so the best document scores 1. Results come in document order.
+export function lexicalRerank(query: string, docs: string[]): { index: int, score: f64 }[] {
+  const K1 = 1.2
+  const B = 0.75
+  const n = docs.length
+  const qTerms: string[] = []
+  for (const w of wordsOf(query)) if (!qTerms.includes(w)) qTerms.push(w)
+  const tfs: Map<string, int>[] = []
+  const lens: int[] = []
+  let totalLen = 0
+  for (const d of docs) {
+    const words = wordsOf(d)
+    const tf: Map<string, int> = new Map()
+    for (const w of words) tf.set(w, (tf.get(w) ?? 0) + 1)
+    tfs.push(tf)
+    lens.push(words.length)
+    totalLen += words.length
+  }
+  let avg: f64 = n === 0 ? 1 : totalLen / n
+  if (avg <= 0) avg = 1
+  const scores: f64[] = []
+  let best: f64 = 0
+  for (let i = 0; i < n; i++) {
+    let s: f64 = 0
+    for (const term of qTerms) {
+      const f = tfs[i]!.get(term) ?? 0
+      if (f === 0) continue
+      let df = 0
+      for (const other of tfs) if (other.has(term)) df += 1
+      const idf = Math.log((n - df + 0.5) / (df + 0.5) + 1)
+      s += idf * (f * (K1 + 1)) / (f + K1 * (1 - B + B * lens[i]! / avg))
+    }
+    scores.push(s)
+    if (s > best) best = s
+  }
+  const out: { index: int, score: f64 }[] = []
+  for (let i = 0; i < n; i++) {
+    out.push({ index: i, score: best > 0 ? scores[i]! / best : 0 })
+  }
+  return out
+}
+
+test("job lifecycle maps status codes", () => {
+  const s = new JobStore(60000, 10)
+  const a = s.create("chat/completions", 5000)!
+  expect(a.status).toBe("queued")
+  expect(a.created_at).toBe(5)
+  expect(a.id.startsWith("job_")).toBe(true)
+  expect(s.start(a.id)).toBe(true)
+  expect(s.get(a.id, 6000)!.status).toBe("running")
+  expect(s.finish(a.id, 200, `{"id":"x","choices":[]}`, 7000)).toBe(true)
+  const ok = s.get(a.id, 7000)!
+  expect(ok.status).toBe("succeeded")
+  expect(ok.completed_at).toBe(7)
+  expect(ok.http_status).toBe(200)
+  expect(ok.result).toBe(`{"id":"x","choices":[]}`)
+  expect(ok.error).toBeUndefined()
+
+  const b = s.create("embeddings", 5000)!
+  expect(s.finish(b.id, 429, `{"error":{"message":"slow down","type":"rate"}}`, 7000)).toBe(true)
+  const bad = s.get(b.id, 7000)!
+  expect(bad.status).toBe("failed")
+  expect(bad.error).toBe("slow down")
+  expect(bad.result).toBeUndefined()
+
+  const c = s.create("responses", 5000)!
+  s.finish(c.id, 502, "bad gateway", 7000)
+  expect(s.get(c.id, 7000)!.error).toBe("upstream returned HTTP 502")
+  expect(s.get(c.id, 7000)!.result).toBeUndefined()
+
+  // a finished job cannot be finished again, and an unknown id is refused
+  expect(s.finish(a.id, 500, "{}", 8000)).toBe(false)
+  expect(s.finish("job_missing", 200, "{}", 8000)).toBe(false)
+  expect(s.start(a.id)).toBe(false)
+})
+
+test("a non-JSON success body is stored as a string", () => {
+  const s = new JobStore(60000, 10)
+  const j = s.create("embeddings", 0)!
+  s.finish(j.id, 200, "plain text", 0)
+  expect(s.get(j.id, 0)!.result).toBe(`"plain text"`)
+})
+
+test("jobs expire after the TTL", () => {
+  const s = new JobStore(1000, 10)
+  const j = s.create("chat/completions", 0)!
+  s.finish(j.id, 200, "{}", 500)
+  // the TTL runs from completion
+  expect(s.get(j.id, 1499)).toBeDefined()
+  expect(s.get(j.id, 1500)).toBeUndefined()
+  expect(s.count()).toBe(0)
+
+  // an unfinished job expires too, so it cannot hold a slot forever
+  const k = s.create("chat/completions", 0)!
+  expect(s.get(k.id, 999)).toBeDefined()
+  expect(s.get(k.id, 1000)).toBeUndefined()
+
+  const m = s.create("chat/completions", 0)!
+  s.finish(m.id, 200, "{}", 10)
+  expect(s.sweep(500)).toBe(0)
+  expect(s.count()).toBe(1)
+  expect(s.sweep(1010)).toBe(1)
+  expect(s.count()).toBe(0)
+})
+
+test("a full store refuses jobs and evicts finished ones only", () => {
+  const s = new JobStore(60000, 2)
+  const a = s.create("chat/completions", 0)!
+  const b = s.create("chat/completions", 0)!
+  expect(s.create("chat/completions", 0)).toBeUndefined()
+  expect(s.count()).toBe(2)
+
+  s.finish(b.id, 200, "{}", 1)
+  const c = s.create("chat/completions", 2)
+  expect(c).toBeDefined()
+  expect(s.get(b.id, 2)).toBeUndefined()
+  expect(s.get(a.id, 2)).toBeDefined()
+  expect(s.count()).toBe(2)
+
+  // with no finished job left, a full store refuses again
+  expect(s.create("chat/completions", 3)).toBeUndefined()
+  expect(s.get(a.id, 3)!.status).toBe("queued")
+})
+
+test("jobJson embeds the result raw", () => {
+  const s = new JobStore(60000, 10)
+  const j = s.create("chat/completions", 9000)!
+  expect(jobJson(j)).toBe(`{"id":"${j.id}","object":"async.job","op":"chat/completions","status":"queued","created_at":9,"completed_at":null,"result":null,"error":null}`)
+  s.finish(j.id, 200, `{"a": 1}`, 10000)
+  const out = jobJson(s.get(j.id, 10000)!)
+  expect(out.includes(`"result":{"a": 1}`)).toBe(true)
+  expect(out.includes(`"completed_at":10`)).toBe(true)
+  expect(out.includes(`"error":null`)).toBe(true)
+  const f = s.create("embeddings", 0)!
+  s.finish(f.id, 400, `{"error":{"message":"bad \\"x\\""}}`, 0)
+  expect(jobJson(s.get(f.id, 0)!).includes(`"error":{"message":"bad \\"x\\""}`)).toBe(true)
+})
+
+test("asyncOp maps known ops only", () => {
+  expect(asyncOp("/v1/async/chat/completions")).toBe("/v1/chat/completions")
+  expect(asyncOp("/v1/async/embeddings")).toBe("/v1/embeddings")
+  expect(asyncOp("/v1/async/responses")).toBe("/v1/responses")
+  expect(asyncOp("/v1/async/images/generations")).toBe("/v1/images/generations")
+  expect(asyncOp("/v1/async/audio/speech")).toBe("/v1/audio/speech")
+  expect(asyncOp("/v1/async/messages")).toBe("/anthropic/v1/messages")
+  expect(asyncOp("/v1/async/jobs/job_1")).toBeUndefined()
+  expect(asyncOp("/v1/async/unknown")).toBeUndefined()
+  expect(asyncOp("/v1/chat/completions")).toBeUndefined()
+})
+
+test("token estimates for ASCII, multi-byte and empty text", () => {
+  expect(estimateTokens("")).toBe(0)
+  expect(estimateTokens("a")).toBe(1)
+  expect(estimateTokens("abcd")).toBe(1)
+  expect(estimateTokens("abcdefgh")).toBe(2)
+  expect(estimateTokens("é")).toBe(1)
+  expect(estimateTokens("日本語")).toBe(3)
+  expect(estimateTokens("abcdefgh日本")).toBe(4)
+})
+
+test("chat estimate counts messages, content and tools", () => {
+  const body = `{"model":"m","messages":[{"role":"system","content":"abcdefgh"},{"role":"user","content":[{"type":"text","text":"abcd"},{"type":"image_url","image_url":{"url":"x"}}]}]}`
+  // 3 + (4 + 2) + (4 + 1)
+  expect(try estimateChatTokens(body)).toBe(14)
+  const withTools = `{"model":"m","messages":[{"role":"user","content":"abcdefgh"}],"tools":[{"type":"function","function":{"name":"f"}}]}`
+  const toolBytes = `[{"type":"function","function":{"name":"f"}}]`.byteLength
+  expect(try estimateChatTokens(withTools)).toBe(3 + 4 + 2 + Math.floor(toolBytes / 4))
+  expect(try estimateChatTokens(`{"model":"m"}`)).toBe(3)
+})
+
+test("anthropic count request keeps fields and drops sampling ones", () => {
+  const t: Target = { provider: "anthropic", kind: "anthropic", model: "claude-real", key: { value: "k" }, cfg: { network_config: { base_url: "https://proxy.local/" } } }
+  const body = `{"model":"alias","max_tokens":64,"stream":true,"temperature":0.2,"system":"be brief","messages":[{"role":"user","content":"hi"}],"tools":[]}`
+  const up = try anthropicCountRequest(t, body)
+  expect(up.url).toBe("https://proxy.local/v1/messages/count_tokens")
+  expect(up.body).toBe(`{"model":"claude-real","system":"be brief","messages":[{"role":"user","content":"hi"}],"tools":[]}`)
+  expect(up.headers.get("x-api-key")).toBe("k")
+  expect(up.headers.get("anthropic-version")).toBe("2023-06-01")
+})
+
+test("gemini count request wraps contents", () => {
+  const t: Target = { provider: "gemini", kind: "gemini", model: "gemini-2.5-flash", key: { value: "gk" }, cfg: {} }
+  const up = try geminiCountRequest(t, `{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":5}}`)
+  expect(up.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:countTokens")
+  expect(up.body).toBe(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+  expect(up.headers.get("x-goog-api-key")).toBe("gk")
+  let threw = false
+  try {
+    geminiCountRequest(t, `{"generationConfig":{}}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("countResponse reads each provider's count", () => {
+  expect(try countResponse("anthropic", `{"input_tokens":2095}`)).toBe(2095)
+  expect(try countResponse("gemini", `{"totalTokens": 31}`)).toBe(31)
+  let threw = false
+  try {
+    countResponse("anthropic", `{"other":1}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("countTokensJson shape", () => {
+  expect(countTokensJson(12, "claude-x", true)).toBe(`{"object":"token_count","model":"claude-x","input_tokens":12,"exact":true}`)
+})
+
+test("parseRerank accepts strings and {text} documents", () => {
+  const r = try parseRerank(`{"model":"rerank-1","query":"fox","documents":["a fox","dog"],"top_n":1}`)
+  expect(r.model).toBe("rerank-1")
+  expect(r.query).toBe("fox")
+  expect(r.documents).toEqual(["a fox", "dog"])
+  expect(r.topN).toBe(1)
+  const o = try parseRerank(`{"model":"m","query":"q","documents":[{"text":"x"},{"text":"y"},{"text":"z"}]}`)
+  expect(o.documents).toEqual(["x", "y", "z"])
+  expect(o.topN).toBe(3)
+  expect(try parseRerank(`{"model":"m","query":"q","documents":["a"],"top_n":99}`)).toEqual({ model: "m", query: "q", documents: ["a"], topN: 1 })
+})
+
+test("parseRerank rejects bad shapes", () => {
+  const bad = [`{"model":"m","query":"q","documents":[1]}`, `{"model":"m","documents":[]}`, `{"model":"m","query":"q","documents":[{"title":"x"}]}`]
+  let failed = 0
+  for (const b of bad) {
+    try {
+      parseRerank(b)
+    } catch (e) {
+      failed += 1
+    }
+  }
+  expect(failed).toBe(3)
+})
+
+test("rerankJson sorts by score and embeds documents on request", () => {
+  const docs = ["a", "b", "c"]
+  const out = rerankJson([{ index: 0, score: 0.2 }, { index: 2, score: 0.9 }, { index: 1, score: 0.5 }], docs, true, "rr", 1)
+  expect(out).toBe(`{"results":[{"index":2,"relevance_score":0.9,"document":{"text":"c"}},{"index":1,"relevance_score":0.5,"document":{"text":"b"}},{"index":0,"relevance_score":0.2,"document":{"text":"a"}}],"model":"rr","usage":{"search_units":1}}`)
+  const plain = rerankJson([{ index: 1, score: 0.5 }], docs, false, "rr", 1)
+  expect(plain).toBe(`{"results":[{"index":1,"relevance_score":0.5}],"model":"rr","usage":{"search_units":1}}`)
+})
+
+test("lexicalRerank ranks an exact match first", () => {
+  const docs = ["the quick brown dog", "red Fox jumps", "a slow turtle", "fox"]
+  const scores = lexicalRerank("Red FOX", docs)
+  expect(scores.length).toBe(4)
+  let top = 0
+  for (const s of scores) if (s.score > scores[top]!.score) top = s.index
+  expect(top).toBe(1)
+  expect(scores[1]!.score).toBe(1)
+  expect(scores[2]!.score).toBe(0)
+  expect(lexicalRerank("zzz", ["a", "b"])[0]!.score).toBe(0)
+})
