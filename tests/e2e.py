@@ -109,6 +109,10 @@ def write_config():
     b = {k: v for k, v in cfg.items() if k not in ("audit", "logs_store", "alerts", "log_exports", "otel", "oidc")}
     b["cluster"] = {**cfg["cluster"], "node_id": "b", "peers": [GW]}
     json.dump(b, open(os.path.join(BUILD, "e2e.node-b.json"), "w"))
+    # a single node with three workers: a 3-request limit and the response cache are shared between them
+    w = {"client": {"enable_logging": False}, "providers": {"openai": cfg["providers"]["openai"]}, "cache": {"enabled": True, "ttl_seconds": 60},
+         "governance": {"rate_limits": [{"id": "w-rl", "request_max_limit": 3, "request_reset_duration": "1h"}], "virtual_keys": [{"id": "vk-w", "value": "sk-bf-workers", "rate_limit_id": "w-rl"}]}}
+    json.dump(w, open(os.path.join(BUILD, "e2e.workers.json"), "w"))
     return path
 
 def start_proxy():
@@ -175,6 +179,7 @@ def main():
     idp, idp_state = start_idp()
     proxy, proxied = start_proxy()
     gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=subprocess.DEVNULL)
+    gw_w = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18094", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.workers.json"), "-workers", "3"], env=env, stderr=subprocess.DEVNULL)
     gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18097", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.node-b.json")], env=env, stderr=subprocess.DEVNULL)
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
@@ -610,6 +615,21 @@ def main():
         s, _, b = call("POST", "/v1/ocr", {"model": "openai/mistral-ocr-latest", "document": {"type": "document_url", "document_url": "https://example.com/a.pdf"}})
         check("OCR passes through", s == 200 and seen()[-1]["path"] == "/v1/ocr" and json.loads(seen()[-1]["body"])["model"] == "mistral-ocr-latest", (s, b, seen()[-1]))
 
+        # the workers of one node share rate limits and the response cache
+        if os.environ.get("RAIJU_SERVER", "bun") == "bun":
+            wait("http://127.0.0.1:18094/health")
+            WGW = "http://127.0.0.1:18094"
+            codes = []
+            for i in range(6):
+                codes.append(call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "w"}], "seed": 1300 + i}, {"x-bf-vk": "sk-bf-workers"}, base=WGW)[0])
+                time.sleep(0.4)
+            check("workers share a rate limit", codes == [200, 200, 200, 429, 429, 429], codes)
+            hits = []
+            for i in range(5):
+                _, h, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "cache me across workers"}]}, base=WGW)
+                hits.append(hl(h).get("x-bf-cache", "miss"))
+            check("workers share the response cache", hits == ["miss", "hit", "hit", "hit", "hit"], hits)
+
         # --- wave 6 ---
         # clustering: a rate limit of 3 requests shared by both nodes
         vk = {"x-bf-vk": "sk-bf-cluster", "x-bf-mcp-include-clients": "none"}
@@ -667,7 +687,7 @@ def main():
         s, _, b = call("POST", "/v1/chat/completions", "{not json")
         check("bad JSON is a 400", s == 400, b)
     finally:
-        gw.terminate(); gw_b.terminate(); mock.terminate(); idp.shutdown(); proxy.shutdown()
+        gw.terminate(); gw_b.terminate(); mock.terminate(); gw_w.terminate(); idp.shutdown(); proxy.shutdown()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 

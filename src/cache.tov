@@ -1,6 +1,10 @@
 // Exact-match response cache (Bifrost's "direct" semantic-cache mode). The key
 // is the routed model plus the request body; x-bf-cache-key scopes entries,
 // x-bf-cache-ttl overrides the TTL and x-bf-cache-no-store skips storing.
+// With shareDir set (the workers of one node), entries are also files there,
+// so a response cached by one worker is a hit in the others.
+import { readFileSync, writeFileSync, readdirSync, unlinkSync, mkdirSync, rmSync } from "node:fs"
+import { sha256, toHex, utf8 } from "./crypto"
 
 type Entry = { body: string, contentType: string, expires: f64 }
 
@@ -8,10 +12,78 @@ export class ResponseCache {
   entries: Map<string, Entry> = new Map()
   hits = 0
   misses = 0
+  shareDir = ""
+
   constructor(readonly ttlMs: int, readonly maxEntries: int) {}
 
+  share(dir: string): void {
+    try {
+      mkdirSync(dir, { recursive: true })
+      this.shareDir = dir
+    } catch (e) {
+      this.shareDir = ""
+    }
+  }
+
+  private file(key: string): string {
+    return this.shareDir + "/" + toHex(sha256(utf8(key)))
+  }
+
+  // A shared entry: "<expires>\t<body bytes>\t<content type>\n<body>". A file being written
+  // (no atomic rename in node:fs) has a short body and reads as a miss.
+  private readShared(key: string): Entry | undefined {
+    if (this.shareDir === "") return undefined
+    let text = ""
+    try {
+      text = readFileSync(this.file(key), "utf8")
+    } catch (e) {
+      return undefined
+    }
+    const nl = text.indexOf("\n")
+    if (nl < 0) return undefined
+    const head = text.slice(0, nl).split("\t")
+    const expires = parseFloat(head[0] ?? "")
+    const len = parseInt(head[1] ?? "")
+    const body = text.slice(nl + 1)
+    if (expires === undefined || len === undefined || head.length < 3 || body.byteLength !== len) return undefined
+    if (expires < Date.now()) return undefined
+    return { body: body, contentType: head.slice(2).join("\t"), expires: expires }
+  }
+
+  // Removes expired shared files; returns how many went.
+  sweepShared(now: f64): int {
+    if (this.shareDir === "") return 0
+    let n = 0
+    try {
+      for (const f of readdirSync(this.shareDir)) {
+        const p = this.shareDir + "/" + f
+        try {
+          const t = readFileSync(p, "utf8")
+          const tab = t.indexOf("\t")
+          const exp = tab < 0 ? undefined : parseFloat(t.slice(0, tab))
+          if (exp !== undefined && exp < now) {
+            unlinkSync(p)
+            n += 1
+          }
+        } catch (e) {
+          continue
+        }
+      }
+    } catch (e) {
+      return n
+    }
+    return n
+  }
+
   get(key: string): Entry | undefined {
-    const e = this.entries.get(key)
+    let e = this.entries.get(key)
+    if (e === undefined) {
+      const shared = this.readShared(key)
+      if (shared !== undefined) {
+        this.entries.set(key, shared)
+        e = shared
+      }
+    }
     if (e === undefined) {
       this.misses += 1
       return undefined
@@ -27,7 +99,15 @@ export class ResponseCache {
 
   set(key: string, body: string, contentType: string, ttlMs: int): void {
     if (this.entries.size >= this.maxEntries) this.evict()
-    this.entries.set(key, { body: body, contentType: contentType, expires: Date.now() + ttlMs })
+    const expires = Date.now() + ttlMs
+    this.entries.set(key, { body: body, contentType: contentType, expires: expires })
+    if (this.shareDir !== "") {
+      try {
+        writeFileSync(this.file(key), `${expires}\t${body.byteLength}\t${contentType}\n${body}`)
+      } catch (e) {
+        // the shared copy is a bonus; this worker still has the entry
+      }
+    }
   }
 
   // Drops expired entries, then the oldest tenth if still full.
@@ -84,4 +164,22 @@ test("stores, expires and evicts", () => {
   expect(c.entries.size <= 10).toBe(true)
   expect(parseTtl("5m")).toBe(300000)
   expect(parseTtl("30")).toBe(30000)
+})
+
+test("a shared cache directory serves entries across instances", () => {
+  const dir = "/tmp/raiju-cache-test-" + Math.floor(Math.random() * 1000000000)
+  const a = new ResponseCache(1000, 10)
+  const b = new ResponseCache(1000, 10)
+  a.share(dir)
+  b.share(dir)
+  a.set("k", "{\"x\":1}", "application/json", 60000)
+  const got = b.get("k")
+  expect(got?.body).toBe("{\"x\":1}")
+  expect(got?.contentType).toBe("application/json")
+  b.set("old", "gone", "text/plain", -1000)
+  expect(a.sweepShared(Date.now())).toBe(1)
+  expect(a.get("old")).toBeUndefined()
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (e) {}
 })

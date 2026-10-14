@@ -18,6 +18,7 @@ import { fields, find, rawStr, isNull } from "./json"
 import { snapshot, errorJson } from "./schemas"
 import { deadline } from "./deadline"
 import { secureHex } from "./crypto"
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs"
 import { Counters, ClusterConfig, syncInterval } from "./cluster"
 import * as cluster from "./cluster"
 import { ExportCursor, objectKey, putRequest, exportInterval } from "./exports"
@@ -219,6 +220,63 @@ export class Ops {
     this.clusterTimer = setInterval(() => {
       this.syncCluster()
     }, Math.max(100, syncInterval(cc)))
+  }
+
+  // ---- the worker processes of one node share budgets, rate limits and the response cache ----
+
+  shareDir = ""
+  shareTimer: int = -1
+  sweeps = 0
+
+  // Called in each worker after the fork. Usage counters gossip through files in a
+  // directory named after the supervisor (the same CRDT merge as clustering), and the
+  // response cache keeps its entries there too.
+  startLocalShare(supervisorPid: int): void {
+    this.shareDir = `/tmp/raiju-${supervisorPid}`
+    removeStaleShares()
+    try {
+      mkdirSync(this.shareDir + "/counters", { recursive: true })
+    } catch (e) {
+      console.error(`raiju: can't share state between workers: ${e.message}`)
+      return
+    }
+    // each worker is its own slot (inherited counters would collide)
+    this.counters = new Counters(this.nodeId + "/" + process.pid)
+    this.pushed = new Map()
+    this.pushedWindow = new Map()
+    this.engine.sharedWindows = true
+    this.engine.gov.alignWindows()
+    const cache = this.engine.cache
+    if (cache !== undefined) cache.share(this.shareDir + "/cache")
+    this.shareTimer = setInterval(() => {
+      this.shareTick()
+    }, 250)
+  }
+
+  shareTick(): void {
+    const c = this.counters
+    if (c === undefined) return
+    this.pushLocal(c)
+    const dir = this.shareDir + "/counters"
+    const mine = `${process.pid}.json`
+    try {
+      writeFileSync(dir + "/" + mine, c.encode())
+      for (const f of readdirSync(dir)) {
+        if (f === mine || !f.endsWith(".json")) continue
+        try {
+          c.merge(readFileSync(dir + "/" + f, "utf8"))
+        } catch (e) {
+          // a file being written, or left half-written; the next tick reads it again
+          continue
+        }
+      }
+    } catch (e) {
+      return
+    }
+    this.applyRemote(c)
+    this.sweeps += 1
+    const cache = this.engine.cache
+    if (cache !== undefined && this.sweeps % 240 === 0) cache.sweepShared(Date.now())
   }
 
   // Adds this node's new usage to its slots and gives each window the other nodes' share.
@@ -650,6 +708,20 @@ export class Ops {
     const sid = r.sessionId
     if (sid !== undefined) out.set("mcp-session-id", sid)
     return new Response(r.status === 202 ? undefined : r.body, { status: r.status, headers: out })
+  }
+}
+
+// Share directories of gateways that are no longer running (their supervisor's pid is gone).
+function removeStaleShares(): void {
+  try {
+    for (const d of readdirSync("/tmp")) {
+      if (!d.startsWith("raiju-")) continue
+      const pid = parseInt(d.slice(6))
+      if (pid === undefined || "" + pid !== d.slice(6)) continue
+      if (!existsSync(`/proc/${pid}`)) rmSync("/tmp/" + d, { recursive: true, force: true })
+    }
+  } catch (e) {
+    // best effort
   }
 }
 

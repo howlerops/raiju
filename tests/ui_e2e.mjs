@@ -2,7 +2,7 @@
 // upstream). Run: NODE_PATH=$(npm root -g) node tests/ui_e2e.mjs
 // Needs build/raiju and build/mock_upstream (python3 tests/e2e.py builds both).
 import { spawn } from "node:child_process"
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs"
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -96,6 +96,7 @@ try {
 } finally {
   await browser?.close()
   for (const p of procs) p.kill()
+  rmSync(dir, { recursive: true, force: true })
 }
 console.log(fails.length ? `\n${fails.length} failed` : "\nall passed")
 process.exit(fails.length ? 1 : 0)
