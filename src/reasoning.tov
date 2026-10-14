@@ -1,0 +1,315 @@
+// Reasoning controls for providers that take a thinking budget or an effort level.
+// OpenAI's `reasoning_effort` and `reasoning: {effort, max_tokens}` are mapped to
+// each provider's native field. Budgets, minimums and request shapes follow Bifrost's
+// reasoning conversion (docs/providers/reasoning.mdx).
+import { Field, find, fields, elements, rawStr, rawNum, rawBool } from "./json"
+
+export type Reasoning = { effort?: string, maxTokens?: int }
+
+// Converts a float to an int, or undefined when it is out of range (Math.trunc traps on overflow).
+function toInt(x: f64): int | undefined {
+  if (x > 1e15 || x < -1e15) return undefined
+  return Math.trunc(x)
+}
+
+// The reasoning request of an OpenAI chat body. `reasoning.effort` and `reasoning.max_tokens`
+// win over the top-level `reasoning_effort` for the effort.
+export function fromChat(body: Field[]): Reasoning | undefined {
+  let effort: string | undefined = undefined
+  let maxTokens: int | undefined = undefined
+  const nested = find(body, "reasoning")
+  if (nested !== undefined && nested.startsWith("{")) {
+    try {
+      const rs = fields(nested)
+      effort = rawStr(rs, "effort")
+      const mt = rawNum(rs, "max_tokens")
+      if (mt !== undefined) maxTokens = toInt(mt)
+    } catch (e) {
+      return undefined
+    }
+  }
+  if (effort === undefined) effort = rawStr(body, "reasoning_effort")
+  if (effort === undefined && maxTokens === undefined) return undefined
+  return { effort: effort, maxTokens: maxTokens }
+}
+
+// Share of the budget range each effort level gets. Unknown efforts use medium.
+function ratioOf(effort: string): f64 {
+  if (effort === "minimal") return 0.025
+  if (effort === "low") return 0.15
+  if (effort === "medium") return 0.425
+  if (effort === "high") return 0.8
+  if (effort === "xhigh") return 0.92
+  if (effort === "max") return 1.0
+  return 0.425
+}
+
+// Minimum budget per provider family: Anthropic (direct, Bedrock, Vertex) and Gemini need 1024.
+// Nova and everything else use 1.
+function minBudget(provider: string): int {
+  if (provider === "anthropic" || provider === "gemini") return 1024
+  return 1
+}
+
+// Output size assumed when the request sets no max tokens.
+function defaultCompletion(provider: string): int {
+  if (provider === "gemini") return 8192
+  return 4096
+}
+
+// Thinking budget for a reasoning request. `maxTokens` in the request is used as given (0
+// disables, -1 means dynamic and maps to the minimum). Otherwise the effort is scaled over
+// [min, maxOutput]. The result is always below maxOutput.
+export function budgetFor(r: Reasoning, maxOutput: int | undefined, provider: string): int {
+  if (r.maxTokens !== undefined) {
+    if (r.maxTokens === -1) return minBudget(provider)
+    return r.maxTokens
+  }
+  const effort = r.effort
+  if (effort === undefined || effort === "none") return 0
+  const min = minBudget(provider)
+  const max: int = maxOutput === undefined ? defaultCompletion(provider) : maxOutput
+  if (max <= min) return min
+  const budget: int = min + Math.trunc(ratioOf(effort) * (max - min))
+  if (budget >= max) return max - 1
+  return budget
+}
+
+// The effort that a budget stands for, over [min, max]: under 25% low, up to 60% medium, else high.
+function effortFromBudget(budget: int, min: int, max: int): string {
+  if (budget <= 0) return "none"
+  if (max <= 0) return "medium"
+  let b = budget
+  if (b < min) b = min
+  if (b > max) b = max
+  if (max <= min) return "high"
+  const ratio = (b - min) / (max - min)
+  if (ratio <= 0.25) return "low"
+  if (ratio <= 0.6) return "medium"
+  return "high"
+}
+
+export type ThinkingPlan = { thinking?: string, maxTokens: int, error?: string }
+
+// The Anthropic `thinking` object and the max_tokens to send with it. The budget is always
+// below max_tokens. When an explicit budget does not fit, it is refit to the effort (high if
+// none was given), as Bifrost does. Errors are returned in `error`, not thrown.
+export function anthropicThinking(r: Reasoning | undefined, maxTokens: int | undefined): ThinkingPlan {
+  const max: int = maxTokens === undefined ? 4096 : maxTokens
+  if (r === undefined) return { maxTokens: max }
+  const explicit = r.maxTokens
+  if (explicit === 0) return { maxTokens: max }
+  if (explicit !== undefined && explicit !== -1 && explicit < 1024) {
+    return { maxTokens: max, error: "reasoning.max_tokens must be >= 1024 for anthropic" }
+  }
+  if (explicit === undefined && (r.effort === undefined || r.effort === "none")) return { maxTokens: max }
+  if (max <= 1024) {
+    return { maxTokens: max, error: "max_tokens must be > 1024 when reasoning is enabled for anthropic" }
+  }
+  let budget = budgetFor(r, max, "anthropic")
+  if (budget >= max) {
+    const effort = r.effort === undefined || r.effort === "none" ? "high" : r.effort
+    budget = budgetFor({ effort: effort }, max, "anthropic")
+  }
+  return { thinking: `{"type":"enabled","budget_tokens":${budget}}`, maxTokens: max }
+}
+
+// Gemini 3 takes a thinkingLevel. Pro models have no minimal or medium rung, so those move up.
+function geminiLevel(effort: string, model: string): string {
+  const pro = model.includes("-pro")
+  if (effort === "minimal") return pro ? "low" : "minimal"
+  if (effort === "low") return "low"
+  if (effort === "medium") return pro ? "high" : "medium"
+  if (effort === "high" || effort === "xhigh" || effort === "max") return "high"
+  return pro ? "high" : "medium"
+}
+
+// generationConfig.thinkingConfig for Gemini. Gemini 3 gets a thinkingLevel from the effort.
+// Gemini 2.5 gets a thinkingBudget. A max_tokens value takes priority over the effort.
+export function geminiThinkingConfig(r: Reasoning | undefined, model: string, maxOutput: int | undefined): string | undefined {
+  if (r === undefined) return undefined
+  const explicit = r.maxTokens
+  if (explicit !== undefined) {
+    if (explicit === 0) return `{"thinkingBudget":0,"includeThoughts":false}`
+    return `{"thinkingBudget":${explicit},"includeThoughts":true}`
+  }
+  const effort = r.effort
+  if (effort === undefined) return undefined
+  if (effort === "none") return `{"thinkingBudget":0,"includeThoughts":false}`
+  if (model.includes("gemini-3")) return `{"thinkingLevel":"${geminiLevel(effort, model)}","includeThoughts":true}`
+  return `{"thinkingBudget":${budgetFor(r, maxOutput, "gemini")},"includeThoughts":true}`
+}
+
+export type BedrockPlan = {
+  fields?: string, // additionalModelRequestFields, raw
+  maxTokens?: int, // max tokens to send in inferenceConfig (Anthropic models only)
+  clearSampling: bool, // Nova high effort: drop maxTokens, temperature and topP from inferenceConfig
+  error?: string,
+}
+
+// additionalModelRequestFields for Bedrock. Claude models get `thinking` (the Anthropic
+// shape). Nova models get `reasoningConfig` with maxReasoningEffort. Other models get nothing.
+export function bedrockReasoning(r: Reasoning | undefined, modelId: string, maxOutput: int | undefined): BedrockPlan {
+  if (modelId.includes("anthropic") || modelId.includes("claude")) {
+    const plan = anthropicThinking(r, maxOutput)
+    const f = plan.thinking === undefined ? undefined : `{"thinking":${plan.thinking}}`
+    return { fields: f, maxTokens: plan.maxTokens, clearSampling: false, error: plan.error }
+  }
+  if (modelId.includes("nova")) {
+    if (r === undefined) return { clearSampling: false }
+    let effort = "none"
+    if (r.maxTokens !== undefined) {
+      const max: int = maxOutput === undefined ? 4096 : maxOutput
+      effort = effortFromBudget(budgetFor(r, max, "nova"), 1, max)
+    } else if (r.effort !== undefined) {
+      const e = r.effort
+      if (e === "minimal" || e === "low") effort = "low"
+      else if (e === "high" || e === "xhigh" || e === "max") effort = "high"
+      else if (e === "medium") effort = "medium"
+      else effort = "none"
+    }
+    if (effort === "none") return { fields: `{"reasoningConfig":{"type":"disabled"}}`, clearSampling: false }
+    return {
+      fields: `{"reasoningConfig":{"type":"enabled","maxReasoningEffort":"${effort}"}}`,
+      clearSampling: effort === "high",
+    }
+  }
+  return { clearSampling: false }
+}
+
+// The text of the thinking blocks in an Anthropic `content` array (raw JSON). Redacted and
+// other blocks are skipped. Malformed input yields "" rather than failing the response.
+export function anthropicReasoning(contentBlocksRaw: string): string {
+  const out: string[] = []
+  try {
+    for (const el of elements(contentBlocksRaw)) {
+      const b = fields(el)
+      if (rawStr(b, "type") === "thinking") out.push(rawStr(b, "thinking") ?? "")
+    }
+  } catch (e) {
+    return ""
+  }
+  return out.join("")
+}
+
+// The text of the `thought: true` parts in a Gemini `parts` array (raw JSON). Malformed input
+// yields "" rather than failing the response.
+export function geminiReasoning(partsRaw: string): string {
+  const out: string[] = []
+  try {
+    for (const el of elements(partsRaw)) {
+      const p = fields(el)
+      if (rawBool(p, "thought") === true) out.push(rawStr(p, "text") ?? "")
+    }
+  } catch (e) {
+    return ""
+  }
+  return out.join("")
+}
+
+test("fromChat reads reasoning_effort and the nested reasoning object", () => {
+  const top = try fields(`{"model":"m","reasoning_effort":"low"}`)
+  expect(fromChat(top)!.effort).toBe("low")
+  expect(fromChat(top)!.maxTokens).toBeUndefined()
+  const both = try fields(`{"reasoning":{"effort":"high","max_tokens":4096}}`)
+  expect(fromChat(both)!.effort).toBe("high")
+  expect(fromChat(both)!.maxTokens).toBe(4096)
+  const budget = try fields(`{"reasoning":{"max_tokens":2000}}`)
+  expect(fromChat(budget)!.effort).toBeUndefined()
+  expect(fromChat(budget)!.maxTokens).toBe(2000)
+  const nested = try fields(`{"reasoning_effort":"low","reasoning":{"effort":"minimal"}}`)
+  expect(fromChat(nested)!.effort).toBe("minimal")
+  expect(fromChat(try fields(`{"messages":[]}`))).toBeUndefined()
+})
+
+test("budgets follow Bifrost's effort ratios and minimums", () => {
+  // doc example: 1024 + 0.80 * (2000 - 1024) = 1804
+  expect(budgetFor({ effort: "high" }, 2000, "anthropic")).toBe(1804)
+  expect(budgetFor({ effort: "high" }, 4096, "anthropic")).toBe(3481)
+  expect(budgetFor({ effort: "low" }, 4096, "anthropic")).toBe(1484)
+  expect(budgetFor({ effort: "medium" }, 4096, "anthropic")).toBe(2329)
+  expect(budgetFor({ effort: "minimal" }, 4096, "anthropic")).toBe(1100)
+  expect(budgetFor({ effort: "high" }, undefined, "anthropic")).toBe(3481)
+  expect(budgetFor({ effort: "high" }, undefined, "gemini")).toBe(6758)
+  expect(budgetFor({ effort: "medium" }, 4096, "nova")).toBe(1741)
+  expect(budgetFor({ effort: "none" }, 4096, "anthropic")).toBe(0)
+  expect(budgetFor({ effort: "high" }, 1024, "anthropic")).toBe(1024)
+})
+
+test("an explicit max_tokens budget is used as given", () => {
+  expect(budgetFor({ effort: "medium", maxTokens: 2500 }, 4096, "anthropic")).toBe(2500)
+  expect(budgetFor({ maxTokens: -1 }, 4096, "anthropic")).toBe(1024)
+  expect(budgetFor({ maxTokens: 0 }, 4096, "gemini")).toBe(0)
+})
+
+test("anthropicThinking builds the thinking object and keeps max_tokens above the budget", () => {
+  const none = anthropicThinking(undefined, undefined)
+  expect(none.thinking).toBeUndefined()
+  expect(none.maxTokens).toBe(4096)
+  const high = anthropicThinking({ effort: "high" }, 2000)
+  expect(high.thinking).toBe(`{"type":"enabled","budget_tokens":1804}`)
+  expect(high.maxTokens).toBe(2000)
+  const explicit = anthropicThinking({ effort: "medium", maxTokens: 2500 }, 4096)
+  expect(explicit.thinking).toBe(`{"type":"enabled","budget_tokens":2500}`)
+  // an explicit budget at or above max_tokens is refit to the effort
+  const refit = anthropicThinking({ maxTokens: 3000 }, 2000)
+  expect(refit.thinking).toBe(`{"type":"enabled","budget_tokens":1804}`)
+  const dynamic = anthropicThinking({ maxTokens: -1 }, 4096)
+  expect(dynamic.thinking).toBe(`{"type":"enabled","budget_tokens":1024}`)
+  expect(anthropicThinking({ effort: "none" }, 4096).thinking).toBeUndefined()
+  expect(anthropicThinking({ maxTokens: 0 }, 4096).thinking).toBeUndefined()
+})
+
+test("anthropicThinking rejects budgets Anthropic cannot take", () => {
+  const low = anthropicThinking({ maxTokens: 500 }, 4096)
+  expect(low.error).toBeDefined()
+  expect(low.thinking).toBeUndefined()
+  const small = anthropicThinking({ effort: "low" }, 1024)
+  expect(small.error).toBeDefined()
+})
+
+test("geminiThinkingConfig uses thinkingLevel on Gemini 3 and thinkingBudget before it", () => {
+  expect(geminiThinkingConfig(undefined, "gemini-2.5-flash", 4096)).toBeUndefined()
+  expect(geminiThinkingConfig({ effort: "high" }, "gemini-2.5-flash", 4096)).toBe(`{"thinkingBudget":3481,"includeThoughts":true}`)
+  expect(geminiThinkingConfig({ maxTokens: 3000 }, "gemini-2.5-flash", 4096)).toBe(`{"thinkingBudget":3000,"includeThoughts":true}`)
+  expect(geminiThinkingConfig({ maxTokens: -1 }, "gemini-2.5-flash", 4096)).toBe(`{"thinkingBudget":-1,"includeThoughts":true}`)
+  expect(geminiThinkingConfig({ maxTokens: 0 }, "gemini-2.5-flash", 4096)).toBe(`{"thinkingBudget":0,"includeThoughts":false}`)
+  expect(geminiThinkingConfig({ effort: "none" }, "gemini-2.5-flash", 4096)).toBe(`{"thinkingBudget":0,"includeThoughts":false}`)
+  expect(geminiThinkingConfig({ effort: "high" }, "gemini-3.0-flash", 4096)).toBe(`{"thinkingLevel":"high","includeThoughts":true}`)
+  expect(geminiThinkingConfig({ effort: "minimal" }, "gemini-3.0-flash", 4096)).toBe(`{"thinkingLevel":"minimal","includeThoughts":true}`)
+  expect(geminiThinkingConfig({ effort: "minimal" }, "gemini-3.0-pro", 4096)).toBe(`{"thinkingLevel":"low","includeThoughts":true}`)
+  expect(geminiThinkingConfig({ effort: "medium" }, "gemini-3.0-pro", 4096)).toBe(`{"thinkingLevel":"high","includeThoughts":true}`)
+  // max_tokens wins over effort on Gemini 3 too
+  expect(geminiThinkingConfig({ effort: "high", maxTokens: 2000 }, "gemini-3.0-flash", 4096)).toBe(`{"thinkingBudget":2000,"includeThoughts":true}`)
+})
+
+test("bedrockReasoning maps Claude to thinking and Nova to reasoningConfig", () => {
+  const claude = bedrockReasoning({ effort: "high" }, "us.anthropic.claude-sonnet-4-5-v1:0", 2000)
+  expect(claude.fields).toBe(`{"thinking":{"type":"enabled","budget_tokens":1804}}`)
+  expect(claude.maxTokens).toBe(2000)
+  expect(claude.clearSampling).toBe(false)
+  const high = bedrockReasoning({ effort: "high" }, "us.amazon.nova-pro-v1:0", 4096)
+  expect(high.fields).toBe(`{"reasoningConfig":{"type":"enabled","maxReasoningEffort":"high"}}`)
+  expect(high.clearSampling).toBe(true)
+  // doc example 2: 2000 tokens of 4096 is 48.8% of the range, which is medium
+  const budget = bedrockReasoning({ maxTokens: 2000 }, "us.amazon.nova-pro-v1:0", 4096)
+  expect(budget.fields).toBe(`{"reasoningConfig":{"type":"enabled","maxReasoningEffort":"medium"}}`)
+  expect(bedrockReasoning({ effort: "minimal" }, "us.amazon.nova-lite-v1:0", 4096).fields).toBe(`{"reasoningConfig":{"type":"enabled","maxReasoningEffort":"low"}}`)
+  expect(bedrockReasoning({ effort: "none" }, "us.amazon.nova-lite-v1:0", 4096).fields).toBe(`{"reasoningConfig":{"type":"disabled"}}`)
+  expect(bedrockReasoning({ effort: "high" }, "meta.llama3-70b", 4096).fields).toBeUndefined()
+  expect(bedrockReasoning(undefined, "us.amazon.nova-pro-v1:0", 4096).fields).toBeUndefined()
+})
+
+test("anthropicReasoning returns the thinking text only", () => {
+  const raw = `[{"type":"thinking","thinking":"Let me analyze","signature":"sig"},{"type":"redacted_thinking","data":"x"},{"type":"text","text":"42"},{"type":"thinking","thinking":" more"}]`
+  expect(anthropicReasoning(raw)).toBe("Let me analyze more")
+  expect(anthropicReasoning(`[{"type":"text","text":"42"}]`)).toBe("")
+  expect(anthropicReasoning(`[{"type":"thinking","thinking":"ok"},{"type":`)).toBe("")
+})
+
+test("geminiReasoning returns the thought parts only", () => {
+  const raw = `[{"thought":true,"text":"Analyzing the problem..."},{"text":"The answer is 42."}]`
+  expect(geminiReasoning(raw)).toBe("Analyzing the problem...")
+  expect(geminiReasoning(`[{"text":"42"}]`)).toBe("")
+  expect(geminiReasoning(`[{"thought":true,"text":"a"},`)).toBe("")
+})

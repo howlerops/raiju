@@ -215,6 +215,14 @@ def main():
         up = json.loads(seen()[-1]["body"])
         check("anthropic upstream body", up["model"] == "claude-sonnet-4" and up["max_tokens"] == 20 and seen()[-1]["auth"] == "sk-ant", up)
 
+        s, _, b = chat("anthropic/claude-sonnet-4", max_tokens=4096, reasoning_effort="high", temperature=0.5, seed=91)
+        up = json.loads(seen()[-1]["body"])
+        check("reasoning_effort becomes an Anthropic thinking budget", s == 200 and up.get("thinking", {}).get("type") == "enabled" and 1024 <= up["thinking"]["budget_tokens"] < 4096 and "temperature" not in up, up)
+
+        s, _, b = chat("gemini/gemini-2.5-flash", reasoning_effort="low", max_tokens=2000, seed=92)
+        up = json.loads(seen()[-1]["body"])
+        check("reasoning_effort becomes a Gemini thinking config", s == 200 and "thinkingBudget" in up.get("generationConfig", {}).get("thinkingConfig", {}), up)
+
         s, _, b = chat("gemini/gemini-2.5-flash")
         r = json.loads(b)
         check("gemini translation", s == 200 and r["choices"][0]["message"]["content"] == "Hi from gemini", b)

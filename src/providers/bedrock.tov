@@ -1,5 +1,6 @@
 // AWS Bedrock Converse API with SigV4 signing (or a Bedrock API key as a bearer token).
 import { Field, fields, elements, find, quote, rawStr, isNull, build } from "../json"
+import { fromChat, bedrockReasoning } from "../reasoning"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, ContentPart, newId, nowSeconds } from "../schemas"
 import { sha256, hmacSha256, toHex, utf8 } from "../crypto"
@@ -135,7 +136,7 @@ function toolConfig(tools: string, choice: string | undefined): string throws Sy
   return `{"tools":[${specs.join(",")}]${tc}}`
 }
 
-export function converseBody(req: ChatRequest, body: Field[], autoCache: bool): string throws SyntaxError {
+export function converseBody(req: ChatRequest, body: Field[], autoCache: bool, modelId?: string): string throws SyntaxError {
   let turns: Turn[] = []
   const system: string[] = []
   for (const m of req.messages) {
@@ -166,13 +167,19 @@ export function converseBody(req: ChatRequest, body: Field[], autoCache: bool): 
   const out: string[] = [`"messages":[${turns.map((t) => `{"role":"${t.role}","content":[${t.content.join(",")}]}`).join(",")}]`]
   if (system.length > 0) out.push(`"system":[${system.join(",")}]`)
   const inf: string[] = []
-  const max = req.max_completion_tokens ?? req.max_tokens
-  if (max !== undefined) inf.push(`"maxTokens":${max}`)
-  if (req.temperature !== undefined) inf.push(`"temperature":${req.temperature}`)
-  if (req.top_p !== undefined) inf.push(`"topP":${req.top_p}`)
+  const max0 = req.max_completion_tokens ?? req.max_tokens
+  // Claude thinking or Nova reasoning, from reasoning_effort / reasoning.max_tokens
+  const plan = bedrockReasoning(fromChat(body), modelId ?? "", max0)
+  if (plan.error !== undefined) throw new SyntaxError(plan.error)
+  const max = plan.maxTokens ?? max0
+  const sampling = !plan.clearSampling && plan.fields?.includes(`"thinking"`) !== true
+  if (max !== undefined && !plan.clearSampling) inf.push(`"maxTokens":${max}`)
+  if (req.temperature !== undefined && sampling) inf.push(`"temperature":${req.temperature}`)
+  if (req.top_p !== undefined && sampling) inf.push(`"topP":${req.top_p}`)
   const stop = req.stop
   if (stop !== undefined) inf.push(`"stopSequences":${typeof stop === "string" ? `[${quote(stop)}]` : JSON.stringify(stop)}`)
   if (inf.length > 0) out.push(`"inferenceConfig":{${inf.join(",")}}`)
+  if (plan.fields !== undefined) out.push(`"additionalModelRequestFields":${plan.fields}`)
   const tools = find(body, "tools")
   if (tools !== undefined && !isNull(tools)) out.push(`"toolConfig":${try toolConfig(tools, find(body, "tool_choice"))}`)
   return "{" + out.join(",") + "}"
@@ -190,6 +197,7 @@ function finishReason(r: string | undefined): string {
 export function chatResponse(text: string, requestedModel: string): Translated throws SyntaxError {
   const fs = try fields(text)
   const textParts: string[] = []
+  const reasoning: string[] = []
   const calls: string[] = []
   const output = find(fs, "output")
   if (output !== undefined && !isNull(output)) {
@@ -201,6 +209,11 @@ export function chatResponse(text: string, requestedModel: string): Translated t
           const b = try fields(el)
           const t = rawStr(b, "text")
           if (t !== undefined) textParts.push(t)
+          const rc = find(b, "reasoningContent")
+          if (rc !== undefined && !isNull(rc)) {
+            const rt = find(try fields(rc), "reasoningText")
+            if (rt !== undefined && !isNull(rt)) reasoning.push(rawStr(try fields(rt), "text") ?? "")
+          }
           const tu = find(b, "toolUse")
           if (tu !== undefined) {
             const u = try fields(tu)
@@ -221,6 +234,8 @@ export function chatResponse(text: string, requestedModel: string): Translated t
   const joined = textParts.join("")
   const msg: string[] = [`"role":"assistant"`, `"content":${joined === "" && calls.length > 0 ? "null" : quote(joined)}`]
   if (calls.length > 0) msg.push(`"tool_calls":[${calls.join(",")}]`)
+  const rs = reasoning.join("")
+  if (rs !== "") msg.push(`"reasoning":${quote(rs)},"reasoning_content":${quote(rs)}`)
   const out = `{"id":${quote(newId("chatcmpl-"))},"object":"chat.completion","created":${nowSeconds()},"model":${quote(requestedModel)},` +
     `"choices":[{"index":0,"message":{${msg.join(",")}},"finish_reason":"${finishReason(rawStr(fs, "stopReason"))}"}],` +
     `"usage":{"prompt_tokens":${pt},"completion_tokens":${ct},"total_tokens":${pt + ct}}}`
@@ -273,11 +288,11 @@ export function signedRequest(t: Target, action: string, body: string): Upstream
 }
 
 export function streamRequest(t: Target, req: ChatRequest, body: Field[], autoCache: bool): Upstream throws SyntaxError {
-  return signedRequest(t, "converse-stream", try converseBody(req, body, autoCache))
+  return signedRequest(t, "converse-stream", try converseBody(req, body, autoCache, t.model))
 }
 
 export function chatRequest(t: Target, req: ChatRequest, body: Field[], autoCache: bool): Upstream throws SyntaxError {
-  return signedRequest(t, "converse", try converseBody(req, body, autoCache))
+  return signedRequest(t, "converse", try converseBody(req, body, autoCache, t.model))
 }
 
 test("amz dates", () => {
@@ -309,4 +324,13 @@ test("converse translation", () => {
   expect(r.body.includes(`"finish_reason":"tool_calls"`)).toBe(true)
   expect(r.body.includes(`"arguments":"{\\"a\\":1}"`)).toBe(true)
   expect(r.completionTokens).toBe(6)
+})
+
+test("reasoning_effort becomes Claude thinking fields; reasoning text comes back", () => {
+  const raw = `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"medium","max_tokens":4096,"temperature":0.3}`
+  const out = try converseBody(try JSON.parse(raw) as ChatRequest, try fields(raw), false, "anthropic.claude-sonnet-4")
+  expect(out.includes(`"additionalModelRequestFields":{"thinking":{"type":"enabled","budget_tokens":`)).toBe(true)
+  expect(out.includes(`"temperature"`)).toBe(false)
+  const r = try chatResponse(`{"output":{"message":{"content":[{"reasoningContent":{"reasoningText":{"text":"why","signature":"s"}}},{"text":"ok"}]}},"stopReason":"end_turn"}`, "m")
+  expect(r.body.includes(`"reasoning":"why","reasoning_content":"why"`)).toBe(true)
 })

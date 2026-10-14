@@ -2,6 +2,7 @@
 import { Field, fields, elements, find, quote, rawStr, isNull, build } from "../json"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, Message, ContentPart, newId, nowSeconds } from "../schemas"
+import { fromChat, anthropicThinking, anthropicReasoning } from "../reasoning"
 
 const DEFAULT_MAX_TOKENS = 4096
 
@@ -141,9 +142,15 @@ export function messagesBody(req: ChatRequest, body: Field[], model: string, str
     else parts.push(`"system":${quote(sys)}`)
   }
   parts.push(`"messages":[${turns.map((t) => `{"role":"${t.role}","content":[${t.blocks.join(",")}]}`).join(",")}]`)
-  parts.push(`"max_tokens":${req.max_completion_tokens ?? req.max_tokens ?? DEFAULT_MAX_TOKENS}`)
-  if (req.temperature !== undefined) parts.push(`"temperature":${req.temperature}`)
-  if (req.top_p !== undefined) parts.push(`"top_p":${req.top_p}`)
+  // reasoning_effort / reasoning.max_tokens become an extended-thinking budget, as Bifrost
+  const plan = anthropicThinking(fromChat(body), req.max_completion_tokens ?? req.max_tokens)
+  if (plan.error !== undefined) throw new SyntaxError(plan.error)
+  const thinking = plan.thinking !== undefined
+  parts.push(`"max_tokens":${plan.maxTokens}`)
+  if (plan.thinking !== undefined) parts.push(`"thinking":${plan.thinking}`)
+  // Anthropic takes only default sampling with thinking on
+  if (req.temperature !== undefined && !thinking) parts.push(`"temperature":${req.temperature}`)
+  if (req.top_p !== undefined && !thinking) parts.push(`"top_p":${req.top_p}`)
   const stop = req.stop
   if (stop !== undefined) parts.push(`"stop_sequences":${typeof stop === "string" ? `[${quote(stop)}]` : JSON.stringify(stop)}`)
   const tools = find(body, "tools")
@@ -151,7 +158,8 @@ export function messagesBody(req: ChatRequest, body: Field[], model: string, str
   const choice = find(body, "tool_choice")
   if (choice !== undefined) {
     const c = try toolChoiceJson(choice)
-    if (c !== undefined) parts.push(`"tool_choice":${c}`)
+    // with thinking on, Anthropic accepts only auto or none
+    if (c !== undefined) parts.push(`"tool_choice":${thinking && c !== `{"type":"none"}` ? `{"type":"auto"}` : c}`)
   }
   const user = req.user
   if (user !== undefined) parts.push(`"metadata":{"user_id":${quote(user)}}`)
@@ -196,7 +204,7 @@ export function finishReason(stop: string | undefined): string {
 type AnthropicUsage = { input_tokens?: int, output_tokens?: int, cache_read_input_tokens?: int, cache_creation_input_tokens?: int }
 
 // The text, tool calls and finish reason of a Messages response, as OpenAI parts.
-export type Assistant = { text: string, toolCalls: string[], finish: string, promptTokens: int, completionTokens: int, id: string }
+export type Assistant = { text: string, toolCalls: string[], finish: string, promptTokens: int, completionTokens: int, id: string, reasoning: string }
 
 export function readAssistant(text: string): Assistant throws SyntaxError {
   const fs = try fields(text)
@@ -222,12 +230,15 @@ export function readAssistant(text: string): Assistant throws SyntaxError {
     pt = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
     ct = u.output_tokens ?? 0
   }
-  return { text: textParts.join(""), toolCalls: calls, finish: finishReason(rawStr(fs, "stop_reason")), promptTokens: pt, completionTokens: ct, id: rawStr(fs, "id") ?? newId("chatcmpl-") }
+  const reasoning = content === undefined || isNull(content) ? "" : anthropicReasoning(content)
+  return { text: textParts.join(""), toolCalls: calls, finish: finishReason(rawStr(fs, "stop_reason")), promptTokens: pt, completionTokens: ct, id: rawStr(fs, "id") ?? newId("chatcmpl-"), reasoning: reasoning }
 }
 
 export function completionJson(a: Assistant, model: string): string {
   const msg: string[] = [`"role":"assistant"`, `"content":${a.text === "" && a.toolCalls.length > 0 ? "null" : quote(a.text)}`]
   if (a.toolCalls.length > 0) msg.push(`"tool_calls":[${a.toolCalls.join(",")}]`)
+  // both spellings, as Bifrost
+  if (a.reasoning !== "") msg.push(`"reasoning":${quote(a.reasoning)},"reasoning_content":${quote(a.reasoning)}`)
   return `{"id":${quote(a.id)},"object":"chat.completion","created":${nowSeconds()},"model":${quote(model)},` +
     `"choices":[{"index":0,"message":{${msg.join(",")}},"finish_reason":"${a.finish}"}],` +
     `"usage":{"prompt_tokens":${a.promptTokens},"completion_tokens":${a.completionTokens},"total_tokens":${a.promptTokens + a.completionTokens}}}`
@@ -237,6 +248,18 @@ export function chatResponse(text: string, requestedModel: string): Translated t
   const a = try readAssistant(text)
   return { body: completionJson(a, requestedModel), promptTokens: a.promptTokens, completionTokens: a.completionTokens }
 }
+
+test("reasoning_effort becomes an extended-thinking budget", () => {
+  const raw = `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","max_tokens":4096,"temperature":0.5,"tool_choice":"required","tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}`
+  const out = try messagesBody(try JSON.parse(raw) as ChatRequest, try fields(raw), "m", false, false)
+  expect(out.includes(`"thinking":{"type":"enabled","budget_tokens":`)).toBe(true)
+  expect(out.includes(`"max_tokens":4096`)).toBe(true)
+  expect(out.includes(`"temperature"`)).toBe(false)
+  expect(out.includes(`"tool_choice":{"type":"auto"}`)).toBe(true)
+  const a = try readAssistant(`{"id":"x","content":[{"type":"thinking","thinking":"hmm","signature":"s"},{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`)
+  expect(a.reasoning).toBe("hmm")
+  expect(completionJson(a, "m").includes(`"reasoning":"hmm","reasoning_content":"hmm"`)).toBe(true)
+})
 
 test("translates an OpenAI chat request", () => {
   const raw = `{"model":"anthropic/claude-sonnet-4","messages":[

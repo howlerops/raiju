@@ -1,5 +1,6 @@
 // Google Gemini (generativelanguage API): translates OpenAI chat requests and responses.
 import { Field, fields, elements, find, quote, rawStr, isNull, build } from "../json"
+import { fromChat, geminiThinkingConfig, geminiReasoning } from "../reasoning"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, ContentPart, newId, nowSeconds } from "../schemas"
 
@@ -59,7 +60,7 @@ function declarations(raw: string): string throws SyntaxError {
   return `[{"functionDeclarations":[${out.join(",")}]}]`
 }
 
-export function generateBody(req: ChatRequest, body: Field[]): string throws SyntaxError {
+export function generateBody(req: ChatRequest, body: Field[], model?: string): string throws SyntaxError {
   let turns: Turn[] = []
   const system: string[] = []
   // Gemini names function responses by function, not by call id.
@@ -97,6 +98,8 @@ export function generateBody(req: ChatRequest, body: Field[]): string throws Syn
   if (stop !== undefined) gen.push(`"stopSequences":${typeof stop === "string" ? `[${quote(stop)}]` : JSON.stringify(stop)}`)
   const rf = find(body, "response_format")
   if (rf !== undefined && rf.includes(`"json_object"`)) gen.push(`"responseMimeType":"application/json"`)
+  const tc = geminiThinkingConfig(fromChat(body), model ?? "", max)
+  if (tc !== undefined) gen.push(`"thinkingConfig":${tc}`)
   if (gen.length > 0) out.push(`"generationConfig":{${gen.join(",")}}`)
   const tools = find(body, "tools")
   if (tools !== undefined && !isNull(tools)) out.push(`"tools":${try declarations(tools)}`)
@@ -116,11 +119,11 @@ export function upstreamHeaders(t: Target): Map<string, string> {
 }
 
 export function chatRequest(t: Target, req: ChatRequest, body: Field[]): Upstream throws SyntaxError {
-  return { url: `${apiBase(t)}/v1beta/models/${t.model}:generateContent`, headers: upstreamHeaders(t), body: try generateBody(req, body) }
+  return { url: `${apiBase(t)}/v1beta/models/${t.model}:generateContent`, headers: upstreamHeaders(t), body: try generateBody(req, body, t.model) }
 }
 
 export function streamRequest(t: Target, req: ChatRequest, body: Field[]): Upstream throws SyntaxError {
-  return { url: `${apiBase(t)}/v1beta/models/${t.model}:streamGenerateContent?alt=sse`, headers: upstreamHeaders(t), body: try generateBody(req, body) }
+  return { url: `${apiBase(t)}/v1beta/models/${t.model}:streamGenerateContent?alt=sse`, headers: upstreamHeaders(t), body: try generateBody(req, body, t.model) }
 }
 
 // Native passthrough for /genai routes.
@@ -142,6 +145,7 @@ export function chatResponse(text: string, requestedModel: string): Translated t
   const textParts: string[] = []
   const calls: string[] = []
   let finish: string | undefined = undefined
+  let reasoning = ""
   const cands = find(fs, "candidates")
   if (cands !== undefined && !isNull(cands)) {
     const first = (try elements(cands))[0]
@@ -152,6 +156,7 @@ export function chatResponse(text: string, requestedModel: string): Translated t
       if (content !== undefined && !isNull(content)) {
         const parts = find(try fields(content), "parts")
         if (parts !== undefined) {
+          reasoning = geminiReasoning(parts)
           for (const p of try elements(parts)) {
             const pf = try fields(p)
             if (find(pf, "thought") === "true") continue
@@ -178,6 +183,7 @@ export function chatResponse(text: string, requestedModel: string): Translated t
   }
   const joined = textParts.join("")
   const msg: string[] = [`"role":"assistant"`, `"content":${joined === "" && calls.length > 0 ? "null" : quote(joined)}`]
+  if (reasoning !== "") msg.push(`"reasoning":${quote(reasoning)},"reasoning_content":${quote(reasoning)}`)
   if (calls.length > 0) msg.push(`"tool_calls":[${calls.join(",")}]`)
   const body = `{"id":${quote(newId("chatcmpl-"))},"object":"chat.completion","created":${nowSeconds()},"model":${quote(requestedModel)},` +
     `"choices":[{"index":0,"message":{${msg.join(",")}},"finish_reason":"${finishReason(finish, calls.length > 0)}"}],` +
@@ -203,4 +209,13 @@ test("translates a generateContent response", () => {
   expect(r.body.includes(`"content":"Hello there"`)).toBe(true)
   expect(r.completionTokens).toBe(2)
   expect(r.body.includes(`"finish_reason":"stop"`)).toBe(true)
+})
+
+test("reasoning_effort becomes a thinking config; thoughts come back as reasoning", () => {
+  const raw = `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low","max_tokens":2000}`
+  const out = try generateBody(try JSON.parse(raw) as ChatRequest, try fields(raw), "gemini-2.5-flash")
+  expect(out.includes(`"thinkingConfig":{"thinkingBudget":`)).toBe(true)
+  const r = try chatResponse(`{"candidates":[{"content":{"parts":[{"text":"plan","thought":true},{"text":"ok"}]},"finishReason":"STOP"}]}`, "m")
+  expect(r.body.includes(`"content":"ok"`)).toBe(true)
+  expect(r.body.includes(`"reasoning":"plan","reasoning_content":"plan"`)).toBe(true)
 })
