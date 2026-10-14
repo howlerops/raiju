@@ -1,0 +1,283 @@
+// RS256 service-account JWTs (RFC 7519 and RFC 7523) for Google OAuth. Tov has
+// no RSA library, so the RSASSA-PKCS1-v1_5 signature (RFC 8017) is computed
+// here with bigint: parse the PEM key, then one modular exponentiation.
+import { quote } from "./json"
+import { sha256, utf8 } from "./crypto"
+import { encodeUrl, decode } from "./base64"
+
+// ---- DER ----
+
+// One ASN.1 TLV: its tag, its content bytes, and the offset just after it.
+type Tlv = { tag: int, value: u8[], next: int }
+
+function readTlv(der: u8[], pos: int): Tlv throws SyntaxError {
+  if (pos + 2 > der.length) throw new SyntaxError("der: truncated")
+  const tag = int(der[pos]!)
+  let len = int(der[pos + 1]!)
+  let p = pos + 2
+  if (len >= 0x80) {
+    const n = len - 0x80
+    if (n < 1 || n > 4) throw new SyntaxError("der: unsupported length")
+    len = 0
+    for (let i = 0; i < n; i++) {
+      if (p >= der.length) throw new SyntaxError("der: truncated")
+      len = len * 256 + int(der[p]!)
+      p++
+    }
+  }
+  if (p + len > der.length) throw new SyntaxError("der: truncated")
+  return { tag: tag, value: der.slice(p, p + len), next: p + len }
+}
+
+function child(der: u8[], pos: int, tag: int): Tlv throws SyntaxError {
+  const t = try readTlv(der, pos)
+  if (t.tag !== tag) throw new SyntaxError(`der: expected tag ${tag}, found ${t.tag}`)
+  return t
+}
+
+// An INTEGER's content bytes as a non-negative bigint.
+function bigOf(b: u8[]): bigint {
+  let v = 0n
+  for (const x of b) v = v * 256n + BigInt(int(x))
+  return v
+}
+
+// Big-endian bytes of x, left-padded to len.
+function bytesOf(x: bigint, len: int): u8[] {
+  const out: u8[] = []
+  for (let i = 0; i < len; i++) out.push(u8(0))
+  let v = x
+  for (let i = len - 1; i >= 0; i--) {
+    out[i] = u8(int(v & 0xffn))
+    v = v >> 8n
+  }
+  return out
+}
+
+function byteLen(x: bigint): int {
+  let n = 0
+  let v = x
+  while (v > 0n) {
+    v = v >> 8n
+    n++
+  }
+  return n
+}
+
+// ---- keys ----
+
+type RsaKey = { n: bigint, e: bigint, d: bigint, p: bigint, q: bigint, dP: bigint, dQ: bigint, qInv: bigint }
+
+// PKCS#1 RSAPrivateKey: SEQUENCE { version, n, e, d, p, q, dP, dQ, qInv }.
+function rsaFromPkcs1(der: u8[]): RsaKey throws SyntaxError {
+  const body = (try child(der, 0, 0x30)).value
+  const v: bigint[] = []
+  let pos = 0
+  for (let i = 0; i < 9; i++) {
+    const t = try child(body, pos, 0x02)
+    v.push(bigOf(t.value))
+    pos = t.next
+  }
+  if (v[0]! !== 0n) throw new SyntaxError("rsa: unsupported key version")
+  return { n: v[1]!, e: v[2]!, d: v[3]!, p: v[4]!, q: v[5]!, dP: v[6]!, dQ: v[7]!, qInv: v[8]! }
+}
+
+// rsaEncryption OID (1.2.840.113549.1.1.1) as the AlgorithmIdentifier starts it.
+const RSA_ALG: int[] = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]
+
+// PKCS#8 PrivateKeyInfo: SEQUENCE { version, AlgorithmIdentifier, OCTET STRING }.
+// The octet string holds the PKCS#1 key.
+function pkcs8Inner(der: u8[]): u8[] throws SyntaxError {
+  const body = (try child(der, 0, 0x30)).value
+  const ver = try child(body, 0, 0x02)
+  const alg = try child(body, ver.next, 0x30)
+  for (let i = 0; i < RSA_ALG.length; i++) {
+    const b = alg.value[i]
+    if (b === undefined || int(b) !== RSA_ALG[i]!) throw new SyntaxError("pkcs8: not an RSA key")
+  }
+  const key = try child(body, alg.next, 0x04)
+  return key.value
+}
+
+// Reads a PEM private key, PKCS#8 (BEGIN PRIVATE KEY) or PKCS#1 (BEGIN RSA PRIVATE KEY).
+function parseKey(pem: string): RsaKey throws SyntaxError {
+  const pkcs1 = pem.includes("-----BEGIN RSA PRIVATE KEY-----")
+  const pkcs8 = pem.includes("-----BEGIN PRIVATE KEY-----")
+  if (!pkcs1 && !pkcs8) throw new SyntaxError("pem: no unencrypted RSA private key")
+  const lines: string[] = []
+  for (const line of pem.split("\n")) {
+    const l = line.trim()
+    if (l === "" || l.startsWith("-----")) continue
+    lines.push(l)
+  }
+  const der = try decode(lines.join(""))
+  if (pkcs1) return try rsaFromPkcs1(der)
+  return try rsaFromPkcs1(try pkcs8Inner(der))
+}
+
+// ---- RSASSA-PKCS1-v1_5 with SHA-256 ----
+
+// DigestInfo prefix for SHA-256 (RFC 8017, section 9.2 note 1).
+const SHA256_DIGEST_INFO: int[] = [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20]
+
+// base^exp mod m, square and multiply, most significant bit first.
+export function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
+  let result = 1n % mod
+  let b = base % mod
+  let e = exp
+  while (e > 0n) {
+    if ((e & 1n) === 1n) result = (result * b) % mod
+    b = (b * b) % mod
+    e = e >> 1n
+  }
+  return result
+}
+
+// The padded message EM = 00 01 FF..FF 00 || DigestInfo || hash, k bytes long.
+function encodeEmsa(hash: u8[], k: int): bigint throws SyntaxError {
+  const tLen = SHA256_DIGEST_INFO.length + hash.length
+  if (k < tLen + 11) throw new SyntaxError("rsa: key too small for SHA-256 signatures")
+  const em: u8[] = [u8(0), u8(1)]
+  for (let i = 0; i < k - tLen - 3; i++) em.push(u8(0xff))
+  em.push(u8(0))
+  for (const b of SHA256_DIGEST_INFO) em.push(u8(b))
+  for (const b of hash) em.push(b)
+  return bigOf(em)
+}
+
+// m^d mod n by the Chinese remainder theorem: two half-size exponentiations.
+function rsaSign(key: RsaKey, m: bigint): bigint throws SyntaxError {
+  const m1 = modPow(m, key.dP, key.p)
+  const m2 = modPow(m, key.dQ, key.q)
+  let h = (m1 - m2) % key.p
+  if (h < 0n) h += key.p
+  h = (key.qInv * h) % key.p
+  const s = m2 + h * key.q
+  // A faulty CRT result would leak the key; check it against the public key.
+  if (modPow(s, key.e, key.n) !== m) throw new SyntaxError("rsa: key is inconsistent")
+  return s
+}
+
+// Base64url RS256 signature of signingInput under a PEM private key.
+export function signRs256(pem: string, signingInput: string): string throws SyntaxError {
+  const key = try parseKey(pem)
+  const k = byteLen(key.n)
+  const m = try encodeEmsa(sha256(utf8(signingInput)), k)
+  const s = try rsaSign(key, m)
+  return encodeUrl(bytesOf(s, k))
+}
+
+// A signed JWT for a Google service account: header.claims.signature.
+export function serviceAccountJwt(clientEmail: string, privateKeyPem: string, scope: string, audience: string, nowSeconds: int): string throws SyntaxError {
+  const header = encodeUrl(utf8(`{"alg":"RS256","typ":"JWT"}`))
+  const claims = `{"iss":${quote(clientEmail)},"scope":${quote(scope)},"aud":${quote(audience)},"iat":${nowSeconds},"exp":${nowSeconds + 3600}}`
+  const input = header + "." + encodeUrl(utf8(claims))
+  const sig = try signRs256(privateKeyPem, input)
+  return input + "." + sig
+}
+
+// ---- tests ----
+// The keys below are throwaway test keys generated for these tests. They guard nothing.
+
+const TEST_PKCS8 = `-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDj9J2gXuzZMwiv
+9cYgjR8yatcwrNAurcSExxAHJnAl6yCKzB2UxZ5M4faf+KbN7cOTguxG1puIS24t
+F4XpIPdhV84E59/73dKPEpQmy35eB0u9NBHKJz6ZlhE/glzC4uQGCMIvY8YXd9kK
+HUFWSp6adBUZKf+eXQTJpAy333HallSwrqCFCqopFrUC1TM1CBAxWxgpx/GBz+G2
+8PgESS3G0fhugSAp2qtlpYOf/AvHjfhmJKnG7hI0BjFFXT+av4QB12VSA+TGuacQ
+yiXJqnvf6gtRYXlj5QDZUxq1k8u56uHK8iLgYoFac44MFnKeBwmaYOKevoCF4upD
+6Bed9Rx3AgMBAAECggEANt8ZmFJxQeE6fJy1Of2uXkUAkqtum2XhsbJ3Jbl3cnE0
+TqTOlBKzxb74zk4c3OIYW2g+9thO7RJ3LWyFo/X3BlwL7/te27JsLltjBSmju/+W
+mC8x/w7OT0sj0L1RFepmyBsQnzatptWHDZu4MAzbO8OolnuZF+Y9MkqGczZaoips
+XQQRebUSgrB3zC4oisDI8lhzomRrq82D2DbQcXdrRZkzhxWoudbKZwofnhNWkzQ+
+MMieMDl0crk5WirMqzxn/9BoPLfuy+1HDC6S8aU/hFsQl1FHwlobfmYWfv3b8FbS
+ZlkNbzRge+VlGq0MJtpi7wREMWLpJ3U37XOGzMDNUQKBgQD1bI/Hl9+K1TBziGxa
+XmKGE/pjRNw5aXbrSJ+Gf2WcbgRkRLYyOFM22m9bzxxyxhOCGU83iU+sOwzyiuAv
+BkPvJ5CePCYSW5xuUU2JYzp7scm3lTdaC0/HL+SuE9BFkmWHiw1+Qh2W0MvrLvgA
+g//OKXrKY1mtK8oIM99wgna7kQKBgQDtx1jL7oO67DiWUn+N1/bBgYEY8MQfXVH/
+oNk+ClC2HEYwZhumKxziUZxlRFehqZ3Q27zrJc91wEeEoYtKfv79UJorxKLRW5dV
+4q7Ctc3Vr6/WayZdTzByFd8gnKmZ9xXKl1Y7eY6eifs5nBmnOYJlT16AMTent8Hl
+d7rBeQ2DhwKBgQDZXEPe9wBR2kymFi44vx0tOGZrIuKUqnZbHZ/Do/MfX0TedQiU
+Y9Q3YbB8tGqysAE5GSdSvXblyArIiPzSSQ9DsVvg+M6TNbXO8ozkYBC82pIX2L0E
+L76BYEZ9cijkZSssp5fUucOw/c2MxrV4529YbN5Gf0U+HOk66I48/B8iMQKBgQDZ
+jxhUH3wwP4rXH8zNv9hq3U99vm30NLKeLlIXTeDjf6NJDWQm+jOHcBylG48Cv+tB
++ow0q3fSyYemdxi3pNMye9lUSqqe3CrvzmUQisA20HUWvxtvLNGq0RBDCpSz5zvt
+DeM8r9Aqhx1ybL2cICaLA7/3kxDVSHEEwDQEafpPaQKBgGCywYXgnaDnBvD5m75q
+cWt/9/+cPCoc9tkxp1qhNrwQbrTKuCsbaoq29dgClLqvoXv7g/jGMFsN3k8OMTbY
+igljKrc6DaVhqHLClkHqT4YKtkbcD1PHdJxoTLpDjg/pcfmE1Jh7xAwZyK5WeDHb
+E4OKLanX+blm6HOEeyMmCSU8
+-----END PRIVATE KEY-----`
+
+const TEST_PKCS1 = `-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEA4/SdoF7s2TMIr/XGII0fMmrXMKzQLq3EhMcQByZwJesgiswd
+lMWeTOH2n/imze3Dk4LsRtabiEtuLReF6SD3YVfOBOff+93SjxKUJst+XgdLvTQR
+yic+mZYRP4JcwuLkBgjCL2PGF3fZCh1BVkqemnQVGSn/nl0EyaQMt99x2pZUsK6g
+hQqqKRa1AtUzNQgQMVsYKcfxgc/htvD4BEktxtH4boEgKdqrZaWDn/wLx434ZiSp
+xu4SNAYxRV0/mr+EAddlUgPkxrmnEMolyap73+oLUWF5Y+UA2VMatZPLuerhyvIi
+4GKBWnOODBZyngcJmmDinr6AheLqQ+gXnfUcdwIDAQABAoIBADbfGZhScUHhOnyc
+tTn9rl5FAJKrbptl4bGydyW5d3JxNE6kzpQSs8W++M5OHNziGFtoPvbYTu0Sdy1s
+haP19wZcC+/7XtuybC5bYwUpo7v/lpgvMf8Ozk9LI9C9URXqZsgbEJ82rabVhw2b
+uDAM2zvDqJZ7mRfmPTJKhnM2WqIqbF0EEXm1EoKwd8wuKIrAyPJYc6Jka6vNg9g2
+0HF3a0WZM4cVqLnWymcKH54TVpM0PjDInjA5dHK5OVoqzKs8Z//QaDy37svtRwwu
+kvGlP4RbEJdRR8JaG35mFn792/BW0mZZDW80YHvlZRqtDCbaYu8ERDFi6Sd1N+1z
+hszAzVECgYEA9WyPx5ffitUwc4hsWl5ihhP6Y0TcOWl260ifhn9lnG4EZES2MjhT
+NtpvW88ccsYTghlPN4lPrDsM8orgLwZD7yeQnjwmElucblFNiWM6e7HJt5U3WgtP
+xy/krhPQRZJlh4sNfkIdltDL6y74AIP/zil6ymNZrSvKCDPfcIJ2u5ECgYEA7cdY
+y+6Duuw4llJ/jdf2wYGBGPDEH11R/6DZPgpQthxGMGYbpisc4lGcZURXoamd0Nu8
+6yXPdcBHhKGLSn7+/VCaK8Si0VuXVeKuwrXN1a+v1msmXU8wchXfIJypmfcVypdW
+O3mOnon7OZwZpzmCZU9egDE3p7fB5Xe6wXkNg4cCgYEA2VxD3vcAUdpMphYuOL8d
+LThmayLilKp2Wx2fw6PzH19E3nUIlGPUN2GwfLRqsrABORknUr125cgKyIj80kkP
+Q7Fb4PjOkzW1zvKM5GAQvNqSF9i9BC++gWBGfXIo5GUrLKeX1LnDsP3NjMa1eOdv
+WGzeRn9FPhzpOuiOPPwfIjECgYEA2Y8YVB98MD+K1x/Mzb/Yat1Pfb5t9DSyni5S
+F03g43+jSQ1kJvozh3AcpRuPAr/rQfqMNKt30smHpncYt6TTMnvZVEqqntwq785l
+EIrANtB1Fr8bbyzRqtEQQwqUs+c77Q3jPK/QKocdcmy9nCAmiwO/95MQ1UhxBMA0
+BGn6T2kCgYBgssGF4J2g5wbw+Zu+anFrf/f/nDwqHPbZMadaoTa8EG60yrgrG2qK
+tvXYApS6r6F7+4P4xjBbDd5PDjE22IoJYyq3Og2lYahywpZB6k+GCrZG3A9Tx3Sc
+aEy6Q44P6XH5hNSYe8QMGciuVngx2xODii2p1/m5ZuhzhHsjJgklPA==
+-----END RSA PRIVATE KEY-----`
+
+// openssl dgst -sha256 -sign over "hello", base64url without padding
+const SIG_HELLO = "BCL82sCsrUeBOrj2lIUB-2thcudrQl0jIsodmaiyVKATNrssMwjGzNskettZchQag0imkVC-CE2jvQ9VTwn0AlRAXtUGYRr5is6YB7_l8lluIyaPx5QUvoyOAzLwsGCF7jZdx-yD7snaju8XfZPBchCQGIInOMpIEABo326C27OWraPhQ0DvqFsFkaxyk1b-wdKGsW0ke42hmtRBCsU_a6xQzenZ7DxlmFKxMVc0ErZayw7aywUAB4VBLfR6RVLZ-cqjzq4v2S5oi-ducGT97ccIEqgu4aKUPwrHou7KgCKl6ByaLP-kadbysqYyaV4lPjpjxjvaxuIb6vj96eG6UA"
+
+test("modPow matches known values", () => {
+  expect(modPow(4n, 13n, 497n)).toBe(445n)
+  expect(modPow(2n, 10n, 1000n)).toBe(24n)
+  expect(modPow(7n, 0n, 13n)).toBe(1n)
+})
+
+test("parses PKCS#8 and PKCS#1 keys to the same numbers", () => {
+  const a = try parseKey(TEST_PKCS8)
+  const b = try parseKey(TEST_PKCS1)
+  expect(a.n).toBe(b.n)
+  expect(a.d).toBe(b.d)
+  expect(a.e).toBe(65537n)
+  expect(a.p * a.q).toBe(a.n)
+})
+
+test("RS256 signature matches openssl", () => {
+  expect(try signRs256(TEST_PKCS8, "hello")).toBe(SIG_HELLO)
+  expect(try signRs256(TEST_PKCS1, "hello")).toBe(SIG_HELLO)
+})
+
+test("service account JWT matches an openssl reference", () => {
+  const jwt = try serviceAccountJwt("test-sa@example.iam.gserviceaccount.com", TEST_PKCS8, "https://www.googleapis.com/auth/cloud-platform", "https://oauth2.googleapis.com/token", 1700000000)
+  expect(jwt).toBe("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ0ZXN0LXNhQGV4YW1wbGUuaWFtLmdzZXJ2aWNlYWNjb3VudC5jb20iLCJzY29wZSI6Imh0dHBzOi8vd3d3Lmdvb2dsZWFwaXMuY29tL2F1dGgvY2xvdWQtcGxhdGZvcm0iLCJhdWQiOiJodHRwczovL29hdXRoMi5nb29nbGVhcGlzLmNvbS90b2tlbiIsImlhdCI6MTcwMDAwMDAwMCwiZXhwIjoxNzAwMDAzNjAwfQ.GOqovJ2pcvsDm_akNndplIIYwmsKvGQworqqYOfV16_OY0ZcLaltIFHIfvZtDDq2yQ6XEhDazLMR_-NlwYk8fM6XHIhuR7FWMTmQ_csOrIXRqrH13-JNoX4Prle-zM-iAPBpJowiOIC8GSMuxqglGPxf--QHpho8ACYtSSLNJf3bRtBuPI9wy1ijdaVYXcTwRsZpzcm8ZVzlilW8xa-SSwFvxTPZjy_OxtbeuO_mEAt1-7DF8d7oW3K4RwPvg1qPqa1KxgK_hwI73EZEL9OxubYeBLVDJmcp49oeR8ZHZIPkjAvof9vacG6Luaolss51aRivYx4tzbr0ahfvzH1ZKQ")
+  expect(jwt.split(".").length).toBe(3)
+})
+
+test("rejects bad keys", () => {
+  let threw = false
+  try {
+    signRs256("not a key", "x")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    signRs256("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----", "x")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

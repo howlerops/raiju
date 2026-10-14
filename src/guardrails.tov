@@ -1,0 +1,698 @@
+// Native guardrails: detect and redact PII and secrets in prompts and
+// completions. Tov has no regular expressions, so each detector is a small
+// scanner over the UTF-8 bytes. Offsets are byte offsets, which is what string
+// slicing uses, so a finding slices the original text directly.
+
+import { fields, elements, find, rawStr, decodeString, quote, build, setField } from "./json"
+
+export type Finding = { kind: string, start: int, end: int, text: string }
+export type GuardConfig = { detect: string[], mode: "redact" | "block" | "log", custom?: string[] }
+export type GuardResult = { body: string, findings: Finding[], blocked: bool }
+
+type Span = { kind: string, start: int, end: int }
+type Rewrite = { raw: string, changed: bool, findings: Finding[] }
+
+const enc = new TextEncoder()
+const NL = enc.encode("\n")
+const BEGIN = enc.encode("-----BEGIN ")
+const END = enc.encode("-----END ")
+const PK = enc.encode("PRIVATE KEY-----")
+const AKIA = enc.encode("AKIA")
+const ASIA = enc.encode("ASIA")
+
+// Prefixes of the API keys we know. The token after the prefix must have at
+// least 16 characters from [A-Za-z0-9_-]; shorter tokens are usually prose.
+const API_PREFIXES: u8[][] = [
+  enc.encode("sk-"),
+  enc.encode("sk_live_"),
+  enc.encode("pk_live_"),
+  enc.encode("ghp_"),
+  enc.encode("gho_"),
+  enc.encode("xoxb-"),
+  enc.encode("AIza"),
+]
+
+// Order decides which finding wins when two have the same length and overlap.
+// Custom literals go first so an explicit user rule is never shadowed.
+const KIND_ORDER = ["custom", "private_key", "jwt", "api_key", "aws_key", "email", "credit_card", "ssn", "ipv4", "phone"]
+
+// Byte at i, or -1 outside the text, so scanners can look ahead without checks.
+function at(b: u8[], i: int): int {
+  if (i < 0) return -1
+  const v = b[i]
+  return v === undefined ? -1 : int(v)
+}
+
+function isDigit(c: int): bool {
+  return c >= 48 && c <= 57
+}
+
+function isUpper(c: int): bool {
+  return c >= 65 && c <= 90
+}
+
+function isAlnum(c: int): bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+}
+
+// base64url alphabet, also the characters of an API key token.
+function isB64u(c: int): bool {
+  return isAlnum(c) || c === 45 || c === 95
+}
+
+function matchesAt(b: u8[], p: int, want: u8[]): bool {
+  for (let k = 0; k < want.length; k++) {
+    if (at(b, p + k) !== int(want[k]!)) return false
+  }
+  return true
+}
+
+function indexOfBytes(b: u8[], needle: u8[], from: int, limit: int): int {
+  for (let i = from; i + needle.length <= limit; i++) {
+    if (matchesAt(b, i, needle)) return i
+  }
+  return -1
+}
+
+// Value of n digits starting at p (the caller checks they are digits).
+function numAt(b: u8[], p: int, n: int): int {
+  let v = 0
+  for (let k = 0; k < n; k++) v = v * 10 + (at(b, p + k) - 48)
+  return v
+}
+
+function digitsAt(b: u8[], p: int, n: int): bool {
+  for (let k = 0; k < n; k++) {
+    if (!isDigit(at(b, p + k))) return false
+  }
+  return true
+}
+
+// Each matcher takes a start offset and returns the end offset of a match there, or -1.
+// The runner calls it at every offset and skips past each match.
+function runMatcher(b: u8[], kind: string, inout out: Span[], f: (b: u8[], p: int) => int): void {
+  for (let p = 0; p < b.length; p++) {
+    const e = f(b, p)
+    if (e > p) {
+      out.push({ kind: kind, start: p, end: e })
+      p = e - 1
+    }
+  }
+}
+
+// local@domain.tld. The TLD must be at least two letters, which keeps
+// "a@b.c" and "user@localhost" out.
+function findEmails(b: u8[], inout out: Span[]): void {
+  for (let i = 0; i < b.length; i++) {
+    if (at(b, i) !== 64) continue
+    let s = i
+    while (s > 0 && isEmailLocal(at(b, s - 1))) s--
+    while (s < i && at(b, s) === 46) s++
+    if (s === i) continue
+    let e = i + 1
+    while (e < b.length && (isAlnum(at(b, e)) || at(b, e) === 46 || at(b, e) === 45)) e++
+    while (e > i + 1 && at(b, e - 1) === 46) e--
+    // the last dot splits the labels from the TLD
+    let k = e - 1
+    while (k > i + 1 && at(b, k) !== 46) k--
+    if (k <= i + 1 || e - k - 1 < 2) continue
+    let ok = true
+    for (let j = k + 1; j < e; j++) {
+      if (!isLetter(at(b, j))) ok = false
+    }
+    if (!ok) continue
+    out.push({ kind: "email", start: s, end: e })
+    i = e - 1
+  }
+}
+
+function isLetter(c: int): bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+function isEmailLocal(c: int): bool {
+  return isAlnum(c) || c === 46 || c === 95 || c === 37 || c === 43 || c === 45
+}
+
+// Separators allowed inside a phone number.
+function isPhoneSep(c: int): bool {
+  return c === 32 || c === 45 || c === 46 || c === 40 || c === 41
+}
+
+// Counts the digits in [p, end). Dotted numbers must use 3- or 4-digit groups
+// after the first, so version strings like 10.20.30.40.50 are not phones.
+// Returns -1 when the dot rule fails.
+function phoneDigits(b: u8[], p: int, end: int): int {
+  let digits = 0
+  let group = 0
+  let closed = 0
+  let dotted = false
+  let bad = false
+  for (let i = p; i < end; i++) {
+    const c = at(b, i)
+    if (isDigit(c)) {
+      digits += 1
+      group += 1
+      continue
+    }
+    if (c === 46) {
+      dotted = true
+      if (closed > 0 && group !== 3 && group !== 4) bad = true
+      closed += 1
+    }
+    group = 0
+  }
+  if (dotted && closed > 0 && group !== 3 && group !== 4) bad = true
+  return bad ? -1 : digits
+}
+
+// Optional +country code, then digits with separators. Trailing separators
+// are not part of the number, and a digit run must not continue on either side.
+function phoneEnd(b: u8[], p: int): int {
+  if (isDigit(at(b, p - 1))) return -1
+  const c = at(b, p)
+  if (!(isDigit(c) || ((c === 43 || c === 40) && isDigit(at(b, p + 1))))) return -1
+  let i = p + (c === 43 ? 1 : 0)
+  let end = p
+  while (true) {
+    const d = at(b, i)
+    if (isDigit(d)) end = i + 1
+    else if (!isPhoneSep(d)) break
+    i += 1
+  }
+  const n = phoneDigits(b, p, end)
+  return n >= 10 && n <= 15 ? end : -1
+}
+
+// ddd-dd-dddd with the invalid ranges excluded: area 000, 666 or 9xx,
+// group 00, serial 0000.
+function ssnEnd(b: u8[], p: int): int {
+  if (isDigit(at(b, p - 1))) return -1
+  if (!digitsAt(b, p, 3) || at(b, p + 3) !== 45 || !digitsAt(b, p + 4, 2)) return -1
+  if (at(b, p + 6) !== 45 || !digitsAt(b, p + 7, 4) || isDigit(at(b, p + 11))) return -1
+  const area = numAt(b, p, 3)
+  if (area === 0 || area === 666 || area >= 900) return -1
+  if (numAt(b, p + 4, 2) === 0 || numAt(b, p + 7, 4) === 0) return -1
+  return p + 11
+}
+
+function luhn(digits: int[]): bool {
+  let sum = 0
+  let dbl = false
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let v = digits[i]!
+    if (dbl) {
+      v = v * 2
+      if (v > 9) v -= 9
+    }
+    sum += v
+    dbl = !dbl
+  }
+  return sum % 10 === 0
+}
+
+// 13 to 19 digits, optionally grouped by single spaces or dashes, passing Luhn.
+// A separator only counts when a digit follows it.
+function cardEnd(b: u8[], p: int): int {
+  if (isDigit(at(b, p - 1)) || !isDigit(at(b, p))) return -1
+  const digits: int[] = []
+  let i = p
+  let end = p
+  while (true) {
+    const d = at(b, i)
+    if (isDigit(d)) {
+      digits.push(d - 48)
+      i += 1
+      end = i
+    } else if ((d === 32 || d === 45) && isDigit(at(b, i + 1))) {
+      i += 1
+    } else break
+  }
+  if (digits.length < 13 || digits.length > 19 || !luhn(digits)) return -1
+  return end
+}
+
+// Four octets 0-255 joined by dots. A dotted run that continues (1.2.3.4.5)
+// is not an address.
+function ipv4End(b: u8[], p: int): int {
+  const pc = at(b, p - 1)
+  if (isDigit(pc) || pc === 46 || !isDigit(at(b, p))) return -1
+  let i = p
+  for (let oct = 0; oct < 4; oct++) {
+    if (oct > 0) {
+      if (at(b, i) !== 46) return -1
+      i += 1
+    }
+    let v = 0
+    let n = 0
+    while (isDigit(at(b, i))) {
+      v = v * 10 + (at(b, i) - 48)
+      i += 1
+      n += 1
+    }
+    if (n === 0 || n > 3 || v > 255) return -1
+  }
+  const after = at(b, i)
+  if (isDigit(after) || (after === 46 && isDigit(at(b, i + 1)))) return -1
+  return i
+}
+
+// A known prefix followed by at least 16 token characters, as a whole token.
+function apiKeyEnd(b: u8[], p: int): int {
+  const pc = at(b, p - 1)
+  if (isB64u(pc)) return -1
+  for (const want of API_PREFIXES) {
+    if (!matchesAt(b, p, want)) continue
+    let i = p + want.length
+    while (isB64u(at(b, i))) i += 1
+    return i - p - want.length >= 16 ? i : -1
+  }
+  return -1
+}
+
+// AKIA or ASIA, then 16 uppercase letters or digits, as a whole token.
+function awsEnd(b: u8[], p: int): int {
+  if (isAlnum(at(b, p - 1))) return -1
+  if (!matchesAt(b, p, AKIA) && !matchesAt(b, p, ASIA)) return -1
+  for (let k = 4; k < 20; k++) {
+    const c = at(b, p + k)
+    if (!isUpper(c) && !isDigit(c)) return -1
+  }
+  if (isAlnum(at(b, p + 20))) return -1
+  return p + 20
+}
+
+// Three base64url segments joined by dots, the first starting with eyJ
+// (base64 of "{\"").
+function jwtEnd(b: u8[], p: int): int {
+  const pc = at(b, p - 1)
+  if (isB64u(pc) || pc === 46) return -1
+  if (at(b, p) !== 101 || at(b, p + 1) !== 121 || at(b, p + 2) !== 74) return -1
+  let i = p
+  for (let seg = 0; seg < 3; seg++) {
+    if (seg > 0) {
+      if (at(b, i) !== 46) return -1
+      i += 1
+    }
+    const s = i
+    while (isB64u(at(b, i))) i += 1
+    if (i === s) return -1
+  }
+  return i
+}
+
+// From "-----BEGIN ... PRIVATE KEY-----" through the matching END line. If the
+// END line is missing, only the header line is reported.
+function privateKeyEnd(b: u8[], p: int): int {
+  if (!matchesAt(b, p, BEGIN)) return -1
+  const nl = indexOfBytes(b, NL, p, b.length)
+  const lineEnd = nl < 0 ? b.length : nl
+  if (indexOfBytes(b, PK, p + BEGIN.length, lineEnd) < 0) return -1
+  const endAt = indexOfBytes(b, END, lineEnd, b.length)
+  if (endAt < 0) return lineEnd
+  const close = indexOfBytes(b, PK, endAt + END.length, b.length)
+  if (close < 0) return lineEnd
+  return close + PK.length
+}
+
+// Literal substrings, matched case-insensitively (ASCII letters only).
+function lowerByte(c: int): int {
+  return isUpper(c) ? c + 32 : c
+}
+
+function findCustom(b: u8[], lits: u8[][], inout out: Span[]): void {
+  for (const lit of lits) {
+    if (lit.length === 0) continue
+    for (let p = 0; p + lit.length <= b.length; p++) {
+      let ok = true
+      for (let k = 0; k < lit.length; k++) {
+        if (lowerByte(at(b, p + k)) !== lowerByte(int(lit[k]!))) {
+          ok = false
+          break
+        }
+      }
+      if (ok) {
+        out.push({ kind: "custom", start: p, end: p + lit.length })
+        p += lit.length - 1
+      }
+    }
+  }
+}
+
+function detectSpans(b: u8[], cfg: GuardConfig): Span[] {
+  let out: Span[] = []
+  const custom = cfg.custom ?? []
+  if (custom.length > 0) {
+    const lits: u8[][] = []
+    for (const s of custom) lits.push(enc.encode(s))
+    findCustom(b, lits, &out)
+  }
+  const on = cfg.detect
+  if (on.includes("private_key")) runMatcher(b, "private_key", &out, privateKeyEnd)
+  if (on.includes("jwt")) runMatcher(b, "jwt", &out, jwtEnd)
+  if (on.includes("api_key")) runMatcher(b, "api_key", &out, apiKeyEnd)
+  if (on.includes("aws_key")) runMatcher(b, "aws_key", &out, awsEnd)
+  if (on.includes("email")) findEmails(b, &out)
+  if (on.includes("credit_card")) runMatcher(b, "credit_card", &out, cardEnd)
+  if (on.includes("ssn")) runMatcher(b, "ssn", &out, ssnEnd)
+  if (on.includes("ipv4")) runMatcher(b, "ipv4", &out, ipv4End)
+  if (on.includes("phone")) runMatcher(b, "phone", &out, phoneEnd)
+  return out
+}
+
+function rankOf(kind: string): int {
+  for (let i = 0; i < KIND_ORDER.length; i++) {
+    if (KIND_ORDER[i] === kind) return i
+  }
+  return KIND_ORDER.length
+}
+
+// Keeps non-overlapping spans, longest first, so an overlap keeps the longer one.
+// Returns them sorted by start.
+function resolve(cands: Span[]): Span[] {
+  const sorted = cands.slice().sort((x: Span, y: Span) => {
+    const lx = x.end - x.start
+    const ly = y.end - y.start
+    if (lx !== ly) return ly - lx
+    const rx = rankOf(x.kind)
+    const ry = rankOf(y.kind)
+    if (rx !== ry) return rx - ry
+    return x.start - y.start
+  })
+  const kept: Span[] = []
+  for (const c of sorted) {
+    let clash = false
+    for (const k of kept) {
+      if (c.start < k.end && k.start < c.end) {
+        clash = true
+        break
+      }
+    }
+    if (!clash) kept.push(c)
+  }
+  kept.sort((x: Span, y: Span) => x.start - y.start)
+  return kept
+}
+
+export function scan(text: string, cfg: GuardConfig): Finding[] {
+  const b = enc.encode(text)
+  const spans = resolve(detectSpans(b, cfg))
+  const out: Finding[] = []
+  for (const s of spans) {
+    out.push({ kind: s.kind, start: s.start, end: s.end, text: text.slice(s.start, s.end) })
+  }
+  return out
+}
+
+// Replaces each finding with [REDACTED:KIND]. Overlapping findings are skipped.
+export function redact(text: string, findings: Finding[]): string {
+  const sorted = findings.slice().sort((x: Finding, y: Finding) => x.start - y.start)
+  let out = ""
+  let pos = 0
+  for (const f of sorted) {
+    if (f.start < pos || f.end <= f.start) continue
+    out += text.slice(pos, f.start) + "[REDACTED:" + f.kind.toUpperCase() + "]"
+    pos = f.end
+  }
+  return out + text.slice(pos, text.byteLength)
+}
+
+// Scans a plain text. In redact mode the body is rewritten, in block mode
+// blocked is set and the body is kept, in log mode only the findings are reported.
+export function applyToText(text: string, cfg: GuardConfig): GuardResult {
+  const findings = scan(text, cfg)
+  if (findings.length === 0) return { body: text, findings: findings, blocked: false }
+  if (cfg.mode === "redact") return { body: redact(text, findings), findings: findings, blocked: false }
+  return { body: text, findings: findings, blocked: cfg.mode === "block" }
+}
+
+// Scans one message object. Only a message that changes is rebuilt.
+function guardMessage(m: string, cfg: GuardConfig): Rewrite throws SyntaxError {
+  let fs = try fields(m)
+  const c = find(fs, "content")
+  if (c === undefined) return { raw: m, changed: false, findings: [] }
+  if (c.startsWith("\"")) {
+    const s = try decodeString(c)
+    const r = applyToText(s, cfg)
+    if (r.body === s) return { raw: m, changed: false, findings: r.findings }
+    setField(&fs, "content", quote(r.body))
+    return { raw: build(fs), changed: true, findings: r.findings }
+  }
+  if (c.startsWith("[")) {
+    const parts = try elements(c)
+    const outParts: string[] = []
+    const found: Finding[] = []
+    let touched = false
+    for (const p of parts) {
+      let pfs = try fields(p)
+      const t = rawStr(pfs, "text")
+      if (t === undefined) {
+        outParts.push(p)
+        continue
+      }
+      const r = applyToText(t, cfg)
+      for (const f of r.findings) found.push(f)
+      if (r.body === t) {
+        outParts.push(p)
+        continue
+      }
+      setField(&pfs, "text", quote(r.body))
+      outParts.push(build(pfs))
+      touched = true
+    }
+    if (!touched) return { raw: m, changed: false, findings: found }
+    setField(&fs, "content", "[" + outParts.join(",") + "]")
+    return { raw: build(fs), changed: true, findings: found }
+  }
+  return { raw: m, changed: false, findings: [] }
+}
+
+// Scans the text of every message in an OpenAI chat request: string content
+// and the text of content parts. Offsets in each finding are relative to the
+// string it was found in. Fields other than messages are passed through as raw text.
+export function applyToChatRequest(body: string, cfg: GuardConfig): GuardResult throws SyntaxError {
+  let fs = try fields(body)
+  const raw = find(fs, "messages")
+  if (raw === undefined || !raw.startsWith("[")) return { body: body, findings: [], blocked: false }
+  const msgs = try elements(raw)
+  const all: Finding[] = []
+  const outMsgs: string[] = []
+  let changed = false
+  for (const m of msgs) {
+    const r = try guardMessage(m, cfg)
+    for (const f of r.findings) all.push(f)
+    if (r.changed) changed = true
+    outMsgs.push(r.raw)
+  }
+  const blocked = cfg.mode === "block" && all.length > 0
+  if (!changed || blocked) return { body: body, findings: all, blocked: blocked }
+  setField(&fs, "messages", "[" + outMsgs.join(",") + "]")
+  return { body: build(fs), findings: all, blocked: false }
+}
+
+// The assistant text of every choice in an OpenAI chat.completion body.
+export function applyToCompletion(body: string, cfg: GuardConfig): GuardResult throws SyntaxError {
+  let fs = try fields(body)
+  const raw = find(fs, "choices")
+  if (raw === undefined || !raw.startsWith("[")) return { body: body, findings: [], blocked: false }
+  const all: Finding[] = []
+  const out: string[] = []
+  let changed = false
+  for (const ch of try elements(raw)) {
+    let cf = try fields(ch)
+    const mraw = find(cf, "message")
+    if (mraw === undefined || !mraw.startsWith("{")) {
+      out.push(ch)
+      continue
+    }
+    let mf = try fields(mraw)
+    const content = rawStr(mf, "content")
+    if (content === undefined) {
+      out.push(ch)
+      continue
+    }
+    const r = applyToText(content, cfg)
+    for (const f of r.findings) all.push(f)
+    if (r.body !== content) {
+      changed = true
+      setField(&mf, "content", quote(r.body))
+      setField(&cf, "message", build(mf))
+      out.push(build(cf))
+    } else out.push(ch)
+  }
+  const blocked = cfg.mode === "block" && all.length > 0
+  if (!changed || blocked) return { body: body, findings: all, blocked: blocked }
+  setField(&fs, "choices", "[" + out.join(",") + "]")
+  return { body: build(fs), findings: all, blocked: false }
+}
+
+test("redacts completion text and leaves the rest", () => {
+  const cfg: GuardConfig = { detect: ["email"], mode: "redact" }
+  const body = `{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"write to a@example.com"},"finish_reason":"stop"}],"usage":{"total_tokens":3}}`
+  const r = try applyToCompletion(body, cfg)
+  expect(r.body).toBe(`{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"write to [REDACTED:EMAIL]"},"finish_reason":"stop"}],"usage":{"total_tokens":3}}`)
+  expect((try applyToCompletion(body, { detect: ["ssn"], mode: "redact" })).body).toBe(body)
+})
+
+test("email", () => {
+  const cfg: GuardConfig = { detect: ["email"], mode: "log" }
+  const f = scan("mail jane.doe+x@example.co.uk now", cfg)
+  expect(f.length).toBe(1)
+  expect(f[0]!.text).toBe("jane.doe+x@example.co.uk")
+  expect(f[0]!.kind).toBe("email")
+  expect(scan("user@localhost and a@b.c", cfg).length).toBe(0)
+})
+
+test("phone", () => {
+  const cfg: GuardConfig = { detect: ["phone"], mode: "log" }
+  const f = scan("call +1 (415) 555-2671 today", cfg)
+  expect(f.length).toBe(1)
+  expect(f[0]!.text).toBe("+1 (415) 555-2671")
+  expect(scan("order 12345678901234567890", cfg).length).toBe(0)
+  expect(scan("versions 10.20.30.40.50", cfg).length).toBe(0)
+  expect(scan("year 2024 and 42", cfg).length).toBe(0)
+})
+
+test("ssn", () => {
+  const cfg: GuardConfig = { detect: ["ssn"], mode: "log" }
+  const f = scan("SSN 123-45-6789 ok", cfg)
+  expect(f.length).toBe(1)
+  expect(f[0]!.text).toBe("123-45-6789")
+  expect(scan("999-12-3456", cfg).length).toBe(0)
+  expect(scan("000-12-3456", cfg).length).toBe(0)
+  expect(scan("666-12-3456", cfg).length).toBe(0)
+  expect(scan("123-00-4567", cfg).length).toBe(0)
+  expect(scan("123-45-0000", cfg).length).toBe(0)
+})
+
+test("credit card", () => {
+  const cfg: GuardConfig = { detect: ["credit_card"], mode: "log" }
+  const f = scan("card 4111 1111 1111 1111 ok", cfg)
+  expect(f.length).toBe(1)
+  expect(f[0]!.text).toBe("4111 1111 1111 1111")
+  expect(scan("4111-1111-1111-1111", cfg).length).toBe(1)
+  expect(scan("4111 1111 1111 1112", cfg).length).toBe(0)
+  expect(scan("4111  1111 1111 1111", cfg).length).toBe(0)
+})
+
+test("ipv4", () => {
+  const cfg: GuardConfig = { detect: ["ipv4"], mode: "log" }
+  const f = scan("host 192.168.1.10 up", cfg)
+  expect(f.length).toBe(1)
+  expect(f[0]!.text).toBe("192.168.1.10")
+  expect(scan("256.1.1.1", cfg).length).toBe(0)
+  expect(scan("1.2.3.4.5", cfg).length).toBe(0)
+})
+
+test("api keys and aws keys", () => {
+  const cfg: GuardConfig = { detect: ["api_key", "aws_key"], mode: "log" }
+  const f = scan("key sk-abcdefghijklmnop1234 and AKIAIOSFODNN7EXAMPLE", cfg)
+  expect(f.length).toBe(2)
+  expect(f[0]!.kind).toBe("api_key")
+  expect(f[1]!.kind).toBe("aws_key")
+  expect(f[1]!.text).toBe("AKIAIOSFODNN7EXAMPLE")
+  expect(scan("sk-short", cfg).length).toBe(0)
+  expect(scan("AKIAshort", cfg).length).toBe(0)
+  expect(scan("task-abcdefghijklmnopqrstu", cfg).length).toBe(0)
+  expect(scan("ghp_abcdefghijklmnopqrstuvwxyz0123456789", cfg).length).toBe(1)
+})
+
+test("jwt", () => {
+  const cfg: GuardConfig = { detect: ["jwt"], mode: "log" }
+  const f = scan("token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln here", cfg)
+  expect(f.length).toBe(1)
+  expect(f[0]!.text).toBe("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln")
+  expect(scan("abc.def.ghi", cfg).length).toBe(0)
+})
+
+test("private key", () => {
+  const cfg: GuardConfig = { detect: ["private_key"], mode: "log" }
+  const text = "key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----\nend"
+  const f = scan(text, cfg)
+  expect(f.length).toBe(1)
+  expect(f[0]!.text.startsWith("-----BEGIN ")).toBe(true)
+  expect(f[0]!.text.endsWith("PRIVATE KEY-----")).toBe(true)
+  expect(scan("-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----", cfg).length).toBe(0)
+})
+
+test("custom literals are case-insensitive", () => {
+  const cfg: GuardConfig = { detect: [], mode: "redact", custom: ["ACME"] }
+  const text = "acme and AcMe"
+  const f = scan(text, cfg)
+  expect(f.length).toBe(2)
+  expect(f[0]!.kind).toBe("custom")
+  expect(f[1]!.text).toBe("AcMe")
+  expect(redact(text, f)).toBe("[REDACTED:CUSTOM] and [REDACTED:CUSTOM]")
+})
+
+test("overlaps keep the longer finding", () => {
+  // the custom literal sits inside the phone number, so the phone wins
+  const cfg: GuardConfig = { detect: ["phone"], mode: "log", custom: ["555-2671"] }
+  const f = scan("+1 (415) 555-2671", cfg)
+  expect(f.length).toBe(1)
+  expect(f[0]!.kind).toBe("phone")
+})
+
+test("redact output", () => {
+  const cfg: GuardConfig = { detect: ["email", "ssn"], mode: "redact" }
+  const text = "mail a@b.com or 123-45-6789 ok"
+  const r = applyToText(text, cfg)
+  expect(r.body).toBe("mail [REDACTED:EMAIL] or [REDACTED:SSN] ok")
+  expect(r.blocked).toBe(false)
+  expect(redact(text, [])).toBe(text)
+})
+
+test("applyToText modes", () => {
+  const text = "reach me at x@y.io"
+  const log = applyToText(text, { detect: ["email"], mode: "log" })
+  expect(log.body).toBe(text)
+  expect(log.findings.length).toBe(1)
+  expect(log.blocked).toBe(false)
+  const block = applyToText(text, { detect: ["email"], mode: "block" })
+  expect(block.body).toBe(text)
+  expect(block.blocked).toBe(true)
+  const red = applyToText(text, { detect: ["email"], mode: "redact" })
+  expect(red.body).toBe("reach me at [REDACTED:EMAIL]")
+})
+
+test("applyToChatRequest modes", () => {
+  const body = '{"model":"gpt-4o","tools":[{"type":"function","function":{"name":"x","parameters":{"a":"b@c.com"}}}],"messages":[{"role":"user","content":"my email is jane@example.com"},{"role":"user","content":[{"type":"text","text":"ssn 123-45-6789"},{"type":"image_url","image_url":{"url":"https://x"}}]},{"role":"user","content":"nothing here"}]}'
+  const cfg: GuardConfig = { detect: ["email", "ssn"], mode: "redact" }
+
+  const red = try applyToChatRequest(body, cfg)
+  expect(red.blocked).toBe(false)
+  expect(red.findings.length).toBe(2)
+  expect(red.body.includes("my email is [REDACTED:EMAIL]")).toBe(true)
+  expect(red.body.includes("ssn [REDACTED:SSN]")).toBe(true)
+  expect(red.body.includes('{"type":"image_url","image_url":{"url":"https://x"}}')).toBe(true)
+  expect(red.body.includes("nothing here")).toBe(true)
+  // unrelated fields come back byte-identical
+  const before = try fields(body)
+  const after = try fields(red.body)
+  expect(find(after, "tools")).toBe(find(before, "tools"))
+  expect(find(after, "model")).toBe(find(before, "model"))
+
+  const logged = try applyToChatRequest(body, { detect: ["email", "ssn"], mode: "log" })
+  expect(logged.body).toBe(body)
+  expect(logged.findings.length).toBe(2)
+  expect(logged.blocked).toBe(false)
+
+  const blocked = try applyToChatRequest(body, { detect: ["email", "ssn"], mode: "block" })
+  expect(blocked.body).toBe(body)
+  expect(blocked.blocked).toBe(true)
+  expect(blocked.findings.length).toBe(2)
+
+  const clean = try applyToChatRequest('{"messages":[{"role":"user","content":"hi"}]}', { detect: ["email"], mode: "block" })
+  expect(clean.blocked).toBe(false)
+  expect(clean.body).toBe('{"messages":[{"role":"user","content":"hi"}]}')
+})
+
+test("applyToChatRequest rejects malformed JSON", () => {
+  let threw = false
+  try {
+    applyToChatRequest("{", { detect: ["email"], mode: "log" })
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

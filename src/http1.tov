@@ -1,0 +1,833 @@
+// HTTP/1.1 on Tov's raw TCP sockets. Bun.serve buffers response bodies, so the
+// gateway's SSE routes come through here: requests are parsed off Bun.listen
+// sockets, and responses go out with chunked transfer encoding as the handler
+// writes them.
+//
+// The parser is byte-level and incremental: feed() takes whatever the socket
+// delivered, which may end anywhere inside a request or hold several.
+
+export type Http1Request = { method: string, path: string, version: string, headers: Map<string, string>, body: string }
+export type Http1Fail = { kind: "fail", status: int, message: string }
+export type Http1Result = { kind: "request", req: Http1Request } | Http1Fail
+export type Framing = { kind: "length", n: int } | { kind: "chunked" } | { kind: "none" }
+export type Handler = (req: Http1Request, res: Http1Response) => void throws Error
+
+const MAX_HEAD = 65536
+const MAX_LINE = 8192
+// Any declared length above this is over every limit, so it is capped here
+// to keep the arithmetic away from int overflow.
+const MAX_NUM = 1000000000000000
+
+export const DEFAULT_MAX_BODY = 100 * 1024 * 1024
+
+const enc = new TextEncoder()
+const HEX = "0123456789abcdef"
+
+type Head = { method: string, path: string, version: string, headers: Map<string, string> }
+type HeadResult = { kind: "head", head: Head } | Http1Fail
+type Phase = "head" | "length" | "chunk-size" | "chunk-data" | "chunk-crlf" | "trailer"
+
+function fail(status: int, message: string): Http1Fail {
+  return { kind: "fail", status, message }
+}
+
+function decodeUtf8(b: u8[]): string {
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+// RFC 9110 token characters, the allowed bytes of a method or header name.
+function tchar(c: int): bool {
+  if (c >= 48 && c <= 57) return true
+  if (c >= 65 && c <= 90) return true
+  if (c >= 97 && c <= 122) return true
+  return c === 33 || c === 35 || c === 36 || c === 37 || c === 38 || c === 39 || c === 42 || c === 43 ||
+    c === 45 || c === 46 || c === 94 || c === 95 || c === 96 || c === 124 || c === 126
+}
+
+function isToken(s: string): bool {
+  const b = enc.encode(s)
+  if (b.length === 0) return false
+  for (const c of b) if (!tchar(int(c))) return false
+  return true
+}
+
+// A request target has no spaces or control bytes.
+function isTarget(s: string): bool {
+  const b = enc.encode(s)
+  if (b.length === 0) return false
+  for (const c of b) if (int(c) <= 32 || int(c) >= 127) return false
+  return true
+}
+
+// A decimal length; -1 when it isn't all digits.
+function decimal(s: string): int {
+  const b = enc.encode(s)
+  if (b.length === 0) return -1
+  let v = 0
+  for (const c of b) {
+    const d = int(c) - 48
+    if (d < 0 || d > 9) return -1
+    v = v > MAX_NUM ? MAX_NUM + 1 : v * 10 + d
+  }
+  return v
+}
+
+function hexVal(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 97 && c <= 102) return c - 87
+  if (c >= 65 && c <= 70) return c - 55
+  return -1
+}
+
+// Parses a chunk-size line's digits (bytes from..to, extensions already cut
+// off by the caller); -1 when there are none or they're malformed.
+function chunkSize(b: u8[], from: int, to: int): int {
+  let i = from
+  let v = 0
+  let digits = 0
+  while (i < to) {
+    const h = hexVal(int(b[i]!))
+    if (h < 0) break
+    v = v > MAX_NUM ? MAX_NUM + 1 : v * 16 + h
+    digits += 1
+    i += 1
+  }
+  if (digits === 0) return -1
+  // only spaces may separate the size from a ";" extension
+  while (i < to && b[i] === u8(32)) i += 1
+  if (i < to && b[i] !== u8(59)) return -1
+  return v
+}
+
+function parseHead(s: string): HeadResult {
+  const lines = s.split("\r\n")
+  const parts = (lines[0] ?? "").split(" ")
+  if (parts.length !== 3) return fail(400, "malformed request line")
+  const method = parts[0]!
+  const path = parts[1]!
+  const version = parts[2]!
+  if (!isToken(method) || !isTarget(path)) return fail(400, "malformed request line")
+  if (version !== "HTTP/1.1" && version !== "HTTP/1.0") return fail(400, "unsupported HTTP version")
+  const headers: Map<string, string> = new Map()
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i]!
+    // a colon at byte 0 would be an empty name, and obsolete line folding
+    // starts with a space, which isn't a token
+    const colon = line.indexOf(":")
+    if (colon <= 0) return fail(400, "malformed header line")
+    const name = line.slice(0, colon)
+    if (!isToken(name)) return fail(400, "malformed header name")
+    const value = line.slice(colon + 1).trim()
+    const key = name.toLowerCase()
+    const prev = headers.get(key)
+    if (prev === undefined) headers.set(key, value)
+    else if (key === "content-length") {
+      if (prev !== value) return fail(400, "conflicting Content-Length headers")
+    } else headers.set(key, `${prev}, ${value}`)
+  }
+  return { kind: "head", head: { method, path, version, headers } }
+}
+
+// Whether the connection stays open after this request. HTTP/1.1 keeps it
+// unless the client says close; HTTP/1.0 closes unless it asks to keep alive.
+export function keepAlive(req: Http1Request): bool {
+  const raw = req.headers.get("connection")
+  const tokens: string[] = []
+  if (raw !== undefined) for (const t of raw.toLowerCase().split(",")) tokens.push(t.trim())
+  if (tokens.includes("close")) return false
+  if (req.version === "HTTP/1.0") return tokens.includes("keep-alive")
+  return true
+}
+
+export class Http1Parser {
+  private buf: u8[] = []
+  private pos = 0
+  // how far the header terminator search got, so a split head isn't rescanned
+  private scan = 0
+  private phase: Phase = "head"
+  private stopped = false
+  private left = 0
+  private trailerBytes = 0
+  private body: u8[] = []
+  private method = ""
+  private path = ""
+  private version = ""
+  private headers: Map<string, string> = new Map()
+  private max: int
+
+  constructor(maxBodyBytes?: int) {
+    this.max = maxBodyBytes ?? DEFAULT_MAX_BODY
+  }
+
+  // Returns the requests (and at most one failure) that this chunk completes,
+  // in order. After a failure, or a request that asks to close, the parser
+  // ignores the rest of the stream.
+  feed(chunk: u8[]): Http1Result[] {
+    let out: Http1Result[] = []
+    if (this.stopped) return out
+    for (const b of chunk) this.buf.push(b)
+    let more = true
+    while (more && !this.stopped) more = this.step(&out)
+    if (this.pos > 0) {
+      this.buf = this.buf.slice(this.pos)
+      this.scan = this.scan > this.pos ? this.scan - this.pos : 0
+      this.pos = 0
+    }
+    return out
+  }
+
+  private step(inout out: Http1Result[]): bool {
+    if (this.phase === "head") return this.stepHead(&out)
+    if (this.phase === "length") return this.stepData(&out)
+    if (this.phase === "chunk-data") return this.stepData(&out)
+    if (this.phase === "chunk-size") return this.stepChunkSize(&out)
+    if (this.phase === "chunk-crlf") return this.stepCrlf(&out)
+    return this.stepTrailer(&out)
+  }
+
+  private stepHead(inout out: Http1Result[]): bool {
+    // RFC 9112 2.2: empty lines before a request line are ignored
+    while (this.buf.length - this.pos >= 2 && this.buf[this.pos] === u8(13) && this.buf[this.pos + 1] === u8(10)) this.pos += 2
+    const e = this.headEnd()
+    if (e < 0) {
+      if (this.buf.length - this.pos > MAX_HEAD) return this.reject(&out, 431, "header block too large")
+      return false
+    }
+    if (e - this.pos > MAX_HEAD) return this.reject(&out, 431, "header block too large")
+    const r = parseHead(decodeUtf8(this.buf.slice(this.pos, e - 4)))
+    if (r.kind === "fail") return this.reject(&out, r.status, r.message)
+    this.pos = e
+    this.method = r.head.method
+    this.path = r.head.path
+    this.version = r.head.version
+    this.headers = r.head.headers
+    return this.startBody(&out)
+  }
+
+  // Index just past the first CRLFCRLF at or after pos, or -1.
+  private headEnd(): int {
+    const b = this.buf
+    let i = this.scan > this.pos ? this.scan : this.pos
+    while (i + 3 < b.length) {
+      if (b[i] === u8(13) && b[i + 1] === u8(10) && b[i + 2] === u8(13) && b[i + 3] === u8(10)) return i + 4
+      i += 1
+    }
+    this.scan = i
+    return -1
+  }
+
+  private startBody(inout out: Http1Result[]): bool {
+    const te = this.headers.get("transfer-encoding")
+    const cl = this.headers.get("content-length")
+    // both would make the framing ambiguous, which is how request smuggling works
+    if (te !== undefined) {
+      if (cl !== undefined) return this.reject(&out, 400, "both Transfer-Encoding and Content-Length")
+      if (te.toLowerCase() !== "chunked") return this.reject(&out, 400, "unsupported Transfer-Encoding")
+      this.phase = "chunk-size"
+      return true
+    }
+    if (cl === undefined) return this.complete(&out)
+    const n = decimal(cl)
+    if (n < 0) return this.reject(&out, 400, "malformed Content-Length")
+    if (n > this.max) return this.reject(&out, 413, "request body too large")
+    if (n === 0) return this.complete(&out)
+    this.left = n
+    this.phase = "length"
+    return true
+  }
+
+  // Reads body bytes for a Content-Length body or one chunk's data.
+  private stepData(inout out: Http1Result[]): bool {
+    const avail = this.buf.length - this.pos
+    if (avail === 0) return false
+    const n = avail < this.left ? avail : this.left
+    this.take(n)
+    this.left -= n
+    if (this.left > 0) return true
+    if (this.phase === "length") return this.complete(&out)
+    this.phase = "chunk-crlf"
+    return true
+  }
+
+  private take(n: int): void {
+    const end = this.pos + n
+    for (let i = this.pos; i < end; i++) this.body.push(this.buf[i]!)
+    this.pos = end
+  }
+
+  private stepChunkSize(inout out: Http1Result[]): bool {
+    const lf = this.indexOfLf()
+    if (lf < 0) {
+      if (this.buf.length - this.pos > MAX_LINE) return this.reject(&out, 400, "chunk size line too long")
+      return false
+    }
+    const end = this.buf[lf - 1] === u8(13) && lf - 1 >= this.pos ? lf - 1 : lf
+    const size = chunkSize(this.buf, this.pos, end)
+    if (size < 0) return this.reject(&out, 400, "malformed chunk size")
+    this.pos = lf + 1
+    if (size === 0) {
+      this.phase = "trailer"
+      return true
+    }
+    if (size > this.max - this.body.length) return this.reject(&out, 413, "request body too large")
+    this.left = size
+    this.phase = "chunk-data"
+    return true
+  }
+
+  private stepCrlf(inout out: Http1Result[]): bool {
+    if (this.buf.length - this.pos < 2) return false
+    if (this.buf[this.pos] !== u8(13) || this.buf[this.pos + 1] !== u8(10)) return this.reject(&out, 400, "chunk data not followed by CRLF")
+    this.pos += 2
+    this.phase = "chunk-size"
+    return true
+  }
+
+  // Trailer fields are read past and dropped; the empty line ends the message.
+  private stepTrailer(inout out: Http1Result[]): bool {
+    const lf = this.indexOfLf()
+    if (lf < 0) {
+      if (this.buf.length - this.pos > MAX_LINE) return this.reject(&out, 400, "trailer line too long")
+      return false
+    }
+    const empty = lf === this.pos || (lf === this.pos + 1 && this.buf[this.pos] === u8(13))
+    this.trailerBytes += lf + 1 - this.pos
+    this.pos = lf + 1
+    if (this.trailerBytes > MAX_HEAD) return this.reject(&out, 431, "trailer section too large")
+    if (empty) return this.complete(&out)
+    return true
+  }
+
+  private indexOfLf(): int {
+    for (let i = this.pos; i < this.buf.length; i++) if (this.buf[i] === u8(10)) return i
+    return -1
+  }
+
+  private complete(inout out: Http1Result[]): bool {
+    const req: Http1Request = { method: this.method, path: this.path, version: this.version, headers: this.headers, body: decodeUtf8(this.body) }
+    out.push({ kind: "request", req })
+    if (!keepAlive(req)) this.stopped = true
+    this.body = []
+    this.headers = new Map()
+    this.trailerBytes = 0
+    this.phase = "head"
+    return true
+  }
+
+  private reject(inout out: Http1Result[], status: int, message: string): bool {
+    out.push(fail(status, message))
+    this.stopped = true
+    return false
+  }
+}
+
+// Status line and headers. Framing headers come from `body`, and the caller's
+// own copies of them (and of date and connection) are dropped.
+export function serializeHead(version: string, status: int, headers: Map<string, string>, body: Framing, closing: bool, date: string): string {
+  let s = `${version} ${status} ${reason(status)}\r\n`
+  for (const k of headers.keys()) {
+    const lk = k.toLowerCase()
+    if (lk === "content-length" || lk === "transfer-encoding" || lk === "connection" || lk === "date") continue
+    s += `${k}: ${headers.get(k) ?? ""}\r\n`
+  }
+  // 1xx, 204 and 304 responses have no body, so no framing either
+  const bodyless = status < 200 || status === 204 || status === 304
+  if (!bodyless) {
+    if (body.kind === "length") s += `content-length: ${body.n}\r\n`
+    else if (body.kind === "chunked") s += "transfer-encoding: chunked\r\n"
+  }
+  s += `date: ${date}\r\n`
+  if (closing) s += "connection: close\r\n"
+  else if (version === "HTTP/1.0") s += "connection: keep-alive\r\n"
+  return s + "\r\n"
+}
+
+// One chunked transfer-coding chunk. Empty text is no chunk: a zero-size chunk
+// would end the body.
+export function chunk(text: string): string {
+  const n = text.byteLength
+  if (n === 0) return ""
+  return `${hexOf(n)}\r\n${text}\r\n`
+}
+
+function hexOf(n: int): string {
+  let s = ""
+  let v = n
+  while (v > 0) {
+    s = HEX.slice(v % 16, (v % 16) + 1) + s
+    v = Math.floor(v / 16)
+  }
+  return s
+}
+
+function reason(status: int): string {
+  switch (status) {
+    case 200: return "OK"
+    case 201: return "Created"
+    case 202: return "Accepted"
+    case 204: return "No Content"
+    case 301: return "Moved Permanently"
+    case 302: return "Found"
+    case 304: return "Not Modified"
+    case 400: return "Bad Request"
+    case 401: return "Unauthorized"
+    case 403: return "Forbidden"
+    case 404: return "Not Found"
+    case 405: return "Method Not Allowed"
+    case 408: return "Request Timeout"
+    case 411: return "Length Required"
+    case 413: return "Payload Too Large"
+    case 415: return "Unsupported Media Type"
+    case 429: return "Too Many Requests"
+    case 431: return "Request Header Fields Too Large"
+    case 500: return "Internal Server Error"
+    case 502: return "Bad Gateway"
+    case 503: return "Service Unavailable"
+    case 504: return "Gateway Timeout"
+    default: return "Unknown"
+  }
+}
+
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+function pad(n: int): string {
+  return n < 10 ? `0${n}` : `${n}`
+}
+
+// IMF-fixdate for a time in epoch milliseconds (Tov has no Date).
+export function httpDate(ms: int): string {
+  const secs = Math.floor(ms / 1000)
+  const days = Math.floor(secs / 86400)
+  const rem = secs - days * 86400
+  const hh = Math.floor(rem / 3600)
+  const mm = Math.floor((rem % 3600) / 60)
+  const ss = rem % 60
+  // civil date from a day count (Howard Hinnant's algorithm)
+  const z = days + 719468
+  const era = Math.floor(z / 146097)
+  const doe = z - era * 146097
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365)
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100))
+  const mp = Math.floor((5 * doy + 2) / 153)
+  const day = doy - Math.floor((153 * mp + 2) / 5) + 1
+  const month = mp < 10 ? mp + 3 : mp - 9
+  const year = yoe + era * 400 + (month <= 2 ? 1 : 0)
+  const wd = (((days + 4) % 7) + 7) % 7
+  return `${DAYS[wd]!}, ${pad(day)} ${MONTHS[month - 1]!} ${year} ${pad(hh)}:${pad(mm)}:${pad(ss)} GMT`
+}
+
+function plainHeaders(): Map<string, string> {
+  const h: Map<string, string> = new Map()
+  h.set("content-type", "text/plain;charset=utf-8")
+  return h
+}
+
+// One TCP connection. Responses leave in request order: the response at the
+// head of `queue` writes straight to the socket, and the ones behind it hold
+// their output until it is their turn. `sock` and `queue` form a cycle through
+// socket.data, so the class is cyclic for the collector.
+cyclic class Http1Conn {
+  sock: Socket<Http1Conn> | undefined = undefined
+  closed = false
+  queue: Http1Response[] = []
+  // a connection without a socket (tests) keeps its output here
+  sent: string[] = []
+  parser: Http1Parser
+
+  constructor(maxBodyBytes?: int) {
+    this.parser = new Http1Parser(maxBodyBytes)
+  }
+
+  // Routes parsed requests to the handler, one response per request. A handler
+  // that throws gets a 500 unless it already started its response.
+  serve(results: Http1Result[], handler: Handler): void {
+    for (const r of results) {
+      if (r.kind === "fail") {
+        const res = this.respond("GET", "HTTP/1.1", true)
+        res.writeHead(r.status, plainHeaders())
+        res.end(`${r.message}\n`)
+      } else {
+        const res = this.respond(r.req.method, r.req.version, !keepAlive(r.req))
+        try {
+          handler(r.req, res)
+        } catch (e) {
+          res.writeHead(500, plainHeaders())
+          res.end("Internal Server Error\n")
+        }
+      }
+    }
+  }
+
+  respond(method: string, version: string, closeAfter: bool): Http1Response {
+    const res = new Http1Response(this, method, version, closeAfter)
+    this.queue.push(res)
+    return res
+  }
+
+  // Moves output out of the finished responses at the front of the queue. The
+  // first unfinished one streams from here on, and a finished one that asked
+  // to close ends the connection.
+  advance(): void {
+    while (this.queue.length > 0) {
+      const r = this.queue[0]!
+      const pending = r.buf
+      r.buf = []
+      for (const s of pending) this.sendRaw(s)
+      if (!r.finished) return
+      this.queue.shift()
+      if (r.closeAfter) {
+        this.close()
+        return
+      }
+    }
+  }
+
+  sendRaw(text: string): void {
+    if (this.closed) return
+    const s = this.sock
+    if (s === undefined) this.sent.push(text)
+    else s.write(text)
+  }
+
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    const s = this.sock
+    if (s !== undefined) s.end()
+  }
+
+  // Called when the socket closes: pending responses are dropped.
+  detach(): void {
+    this.closed = true
+    this.sock = undefined
+    this.queue = []
+  }
+}
+
+// The response to one request. Writes before the head is sent are held in
+// `buf` by the connection; the head is serialized at the first write (chunked)
+// or at end() (Content-Length, when end(body) is the only call).
+export class Http1Response {
+  status = 200
+  headers: Map<string, string> = new Map()
+  finished = false
+  closeAfter: bool
+  buf: string[] = []
+  private headSent = false
+  // a back-reference: a response outliving its connection writes nowhere
+  weak conn: Http1Conn | undefined
+
+  constructor(conn: Http1Conn, readonly method: string, readonly version: string, closeAfter: bool) {
+    this.conn = conn
+    this.closeAfter = closeAfter
+  }
+
+  // Sets the status and headers. Ignored once output has started.
+  writeHead(status: int, headers: Map<string, string>): void {
+    if (this.headSent) return
+    this.status = status
+    this.headers = headers
+  }
+
+  // Writes a piece of the body, chunked for HTTP/1.1. HTTP/1.0 has no chunked
+  // coding, so its body runs to the end of the connection instead.
+  write(text: string): void {
+    if (this.finished) return
+    if (!this.headSent) this.startStream()
+    if (this.bodyless()) return
+    this.emit(this.version === "HTTP/1.1" ? chunk(text) : text)
+  }
+
+  // Finishes the response, with an optional last piece of body.
+  end(body?: string): void {
+    if (this.finished) return
+    const text = body ?? ""
+    if (!this.headSent) {
+      this.sendHead({ kind: "length", n: text.byteLength })
+      if (!this.bodyless()) this.emit(text)
+    } else if (!this.bodyless()) {
+      if (this.version === "HTTP/1.1") {
+        this.emit(chunk(text))
+        this.emit("0\r\n\r\n")
+      } else this.emit(text)
+    }
+    this.finished = true
+    const c = this.conn
+    if (c !== undefined) c.advance()
+  }
+
+  private startStream(): void {
+    if (this.version === "HTTP/1.1") this.sendHead({ kind: "chunked" })
+    else {
+      this.closeAfter = true
+      this.sendHead({ kind: "none" })
+    }
+  }
+
+  private sendHead(framing: Framing): void {
+    this.headSent = true
+    this.emit(serializeHead(this.version, this.status, this.headers, framing, this.closeAfter, httpDate(Math.trunc(Date.now()))))
+  }
+
+  // HEAD responses and 204/304 carry no body bytes.
+  private bodyless(): bool {
+    return this.method === "HEAD" || this.status === 204 || this.status === 304 || this.status < 200
+  }
+
+  private emit(text: string): void {
+    if (text === "") return
+    const c = this.conn
+    if (c === undefined) return
+    if (c.queue.length > 0 && c.queue[0] === this) c.sendRaw(text)
+    else this.buf.push(text)
+  }
+}
+
+// Listens on a port and serves HTTP/1.1 through `handler`. The handler may
+// finish its response later, from async code.
+export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int }, handler: Handler): TCPSocketListener<Http1Conn> {
+  const maxBody = opts.maxBodyBytes ?? DEFAULT_MAX_BODY
+  return Bun.listen<Http1Conn>({
+    hostname: opts.hostname,
+    port: opts.port,
+    socket: {
+      open(socket) {
+        const conn = new Http1Conn(maxBody)
+        conn.sock = socket
+        socket.data = conn
+      },
+      data(socket, bytes) {
+        const conn = socket.data
+        if (conn === undefined || conn.closed) return
+        conn.serve(conn.parser.feed(bytes), handler)
+      },
+      close(socket) {
+        const conn = socket.data
+        if (conn !== undefined) conn.detach()
+        socket.data = undefined
+      },
+      error(socket) {
+        socket.terminate()
+      },
+    },
+  })
+}
+
+// ---- tests ----
+
+function feedText(p: Http1Parser, s: string): Http1Result[] {
+  return p.feed(enc.encode(s))
+}
+
+function requestsOf(rs: Http1Result[]): Http1Request[] {
+  const out: Http1Request[] = []
+  for (const r of rs) if (r.kind === "request") out.push(r.req)
+  return out
+}
+
+function failuresOf(rs: Http1Result[]): Http1Fail[] {
+  const out: Http1Fail[] = []
+  for (const r of rs) if (r.kind === "fail") out.push(r)
+  return out
+}
+
+function failStatus(s: string): int {
+  const fs = failuresOf(feedText(new Http1Parser(), s))
+  return fs.length === 1 ? fs[0]!.status : -1
+}
+
+test("parses a simple GET", () => {
+  const rs = requestsOf(feedText(new Http1Parser(), "GET /v1/models?x=1 HTTP/1.1\r\nHost: example\r\n\r\n"))
+  expect(rs.length).toBe(1)
+  expect(rs[0]!.method).toBe("GET")
+  expect(rs[0]!.path).toBe("/v1/models?x=1")
+  expect(rs[0]!.version).toBe("HTTP/1.1")
+  expect(rs[0]!.headers.get("host")).toBe("example")
+  expect(rs[0]!.body).toBe("")
+})
+
+test("parses a POST with Content-Length", () => {
+  const rs = requestsOf(feedText(new Http1Parser(), "POST /p HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"))
+  expect(rs.length).toBe(1)
+  expect(rs[0]!.method).toBe("POST")
+  expect(rs[0]!.body).toBe("hello")
+})
+
+test("parses a chunked body with extensions and trailers", () => {
+  const s = "POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4;ext=1\r\nWiki\r\n5 ;x\r\npedia\r\n0\r\nX-Trailer: 1\r\n\r\n"
+  const rs = requestsOf(feedText(new Http1Parser(), s))
+  expect(rs.length).toBe(1)
+  expect(rs[0]!.body).toBe("Wikipedia")
+})
+
+test("parses a request split byte by byte", () => {
+  const bytes = enc.encode("POST /b HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+  const p = new Http1Parser()
+  const got: Http1Request[] = []
+  for (let i = 0; i < bytes.length; i++) {
+    for (const r of requestsOf(p.feed([bytes[i]!]))) got.push(r)
+  }
+  expect(got.length).toBe(1)
+  expect(got[0]!.path).toBe("/b")
+  expect(got[0]!.body).toBe("hello")
+})
+
+test("parses a chunked request split byte by byte", () => {
+  const bytes = enc.encode("POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")
+  const p = new Http1Parser()
+  const got: Http1Request[] = []
+  for (let i = 0; i < bytes.length; i++) {
+    for (const r of requestsOf(p.feed([bytes[i]!]))) got.push(r)
+  }
+  expect(got.length).toBe(1)
+  expect(got[0]!.body).toBe("abc")
+})
+
+test("parses two pipelined requests in one buffer", () => {
+  const rs = requestsOf(feedText(new Http1Parser(), "GET /a HTTP/1.1\r\n\r\nPOST /b HTTP/1.1\r\nContent-Length: 2\r\n\r\nhiGET /c HTTP/1.1\r\n\r\n"))
+  expect(rs.length).toBe(3)
+  expect(rs[0]!.path).toBe("/a")
+  expect(rs[1]!.path).toBe("/b")
+  expect(rs[1]!.body).toBe("hi")
+  expect(rs[2]!.path).toBe("/c")
+})
+
+test("header names are case-insensitive and stored lower-cased", () => {
+  const rs = requestsOf(feedText(new Http1Parser(), "GET / HTTP/1.1\r\nCONTENT-length: 3\r\nX-Foo:   Bar  \r\n\r\nabc"))
+  expect(rs.length).toBe(1)
+  expect(rs[0]!.headers.get("x-foo")).toBe("Bar")
+  expect(rs[0]!.headers.get("content-length")).toBe("3")
+  expect(rs[0]!.headers.get("X-Foo")).toBeUndefined()
+  expect(rs[0]!.body).toBe("abc")
+})
+
+test("Connection: close stops the stream after that request", () => {
+  const rs = requestsOf(feedText(new Http1Parser(), "GET /a HTTP/1.1\r\nConnection: close\r\n\r\nGET /b HTTP/1.1\r\n\r\n"))
+  expect(rs.length).toBe(1)
+  expect(keepAlive(rs[0]!)).toBe(false)
+})
+
+test("keep-alive follows the version and Connection header", () => {
+  const p = new Http1Parser()
+  const v11 = requestsOf(feedText(p, "GET / HTTP/1.1\r\n\r\n"))
+  expect(keepAlive(v11[0]!)).toBe(true)
+  const v10 = requestsOf(feedText(new Http1Parser(), "GET / HTTP/1.0\r\n\r\n"))
+  expect(keepAlive(v10[0]!)).toBe(false)
+  const v10ka = requestsOf(feedText(new Http1Parser(), "GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n"))
+  expect(keepAlive(v10ka[0]!)).toBe(true)
+})
+
+test("body over the limit is 413 before it is read", () => {
+  const fs = failuresOf(feedText(new Http1Parser(4), "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n"))
+  expect(fs.length).toBe(1)
+  expect(fs[0]!.status).toBe(413)
+  const chunked = failuresOf(feedText(new Http1Parser(4), "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"))
+  expect(chunked[0]!.status).toBe(413)
+})
+
+test("header block over 64 KiB is 431", () => {
+  const big = "GET / HTTP/1.1\r\nX: " + "a".repeat(70000)
+  expect(failStatus(big)).toBe(431)
+  expect(failStatus("GET / HTTP/1.1\r\nX: " + "a".repeat(70000) + "\r\n\r\n")).toBe(431)
+})
+
+test("malformed requests are 400", () => {
+  expect(failStatus("GARBAGE\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/2.0\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nBad Name: x\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\n folded\r\n\r\n")).toBe(400)
+  expect(failStatus("POST / HTTP/1.1\r\nContent-Length: x\r\n\r\n")).toBe(400)
+  expect(failStatus("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n")).toBe(400)
+  expect(failStatus("POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n")).toBe(400)
+  expect(failStatus("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")).toBe(400)
+})
+
+test("writes a head with Content-Length", () => {
+  const h: Map<string, string> = new Map()
+  h.set("content-type", "text/plain")
+  const head = serializeHead("HTTP/1.1", 200, h, { kind: "length", n: 5 }, false, "Thu, 01 Jan 1970 00:00:00 GMT")
+  expect(head).toBe("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\ndate: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n")
+})
+
+test("end(body) without writes sends Content-Length", () => {
+  const conn = new Http1Conn()
+  const res = conn.respond("GET", "HTTP/1.1", false)
+  res.writeHead(200, new Map())
+  res.end("hello")
+  const all = conn.sent.join("")
+  expect(all.includes("content-length: 5\r\n")).toBe(true)
+  expect(all.includes("transfer-encoding")).toBe(false)
+  expect(all.endsWith("\r\n\r\nhello")).toBe(true)
+})
+
+test("chunked encoding of three writes then end", () => {
+  const conn = new Http1Conn()
+  const res = conn.respond("GET", "HTTP/1.1", false)
+  res.write("ab")
+  res.write("cde")
+  res.write("fghij")
+  res.end()
+  const all = conn.sent.join("")
+  expect(all.includes("transfer-encoding: chunked\r\n")).toBe(true)
+  expect(all.includes("content-length")).toBe(false)
+  const body = all.slice(all.indexOf("\r\n\r\n") + 4)
+  expect(body).toBe("2\r\nab\r\n3\r\ncde\r\n5\r\nfghij\r\n0\r\n\r\n")
+})
+
+test("chunk() frames text and drops empty text", () => {
+  expect(chunk("")).toBe("")
+  expect(chunk("hello")).toBe("5\r\nhello\r\n")
+  expect(chunk("x".repeat(26)).startsWith("1a\r\n")).toBe(true)
+})
+
+test("HEAD sends framing but no body", () => {
+  const conn = new Http1Conn()
+  const res = conn.respond("HEAD", "HTTP/1.1", false)
+  res.end("abc")
+  const all = conn.sent.join("")
+  expect(all.includes("content-length: 3\r\n")).toBe(true)
+  expect(all.endsWith("\r\n\r\n")).toBe(true)
+})
+
+test("responses leave in request order", () => {
+  const conn = new Http1Conn()
+  const held: Http1Response[] = []
+  const reqs = requestsOf(feedText(new Http1Parser(), "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n"))
+  conn.serve([{ kind: "request", req: reqs[0]! }, { kind: "request", req: reqs[1]! }], (req, res) => {
+    if (req.path === "/a") held.push(res)
+    else res.end("two")
+  })
+  expect(conn.sent.join("").includes("two")).toBe(false)
+  held[0]!.end("one")
+  const all = conn.sent.join("")
+  expect(all.indexOf("one") >= 0).toBe(true)
+  expect(all.indexOf("one") < all.indexOf("two")).toBe(true)
+})
+
+test("a parse failure answers and closes the connection", () => {
+  const conn = new Http1Conn()
+  conn.serve([{ kind: "fail", status: 431, message: "header block too large" }], (req, res) => {})
+  const all = conn.sent.join("")
+  expect(all.startsWith("HTTP/1.1 431 Request Header Fields Too Large\r\n")).toBe(true)
+  expect(all.includes("connection: close\r\n")).toBe(true)
+  expect(conn.closed).toBe(true)
+})
+
+test("a throwing handler gets a 500", () => {
+  const conn = new Http1Conn()
+  const reqs = requestsOf(feedText(new Http1Parser(), "GET / HTTP/1.1\r\n\r\n"))
+  conn.serve([{ kind: "request", req: reqs[0]! }], (req, res) => {
+    throw new Error("boom")
+  })
+  expect(conn.sent.join("").startsWith("HTTP/1.1 500 Internal Server Error\r\n")).toBe(true)
+})
+
+test("httpDate formats epoch milliseconds", () => {
+  expect(httpDate(0)).toBe("Thu, 01 Jan 1970 00:00:00 GMT")
+  expect(httpDate(784111777000)).toBe("Sun, 06 Nov 1994 08:49:37 GMT")
+})

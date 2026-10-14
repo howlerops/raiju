@@ -3,7 +3,7 @@
 An LLM gateway written in [Tov](https://tov.sh), aiming to be a drop-in
 replacement for [Bifrost](https://github.com/maximhq/bifrost): the same
 `config.json`, the same `provider/model` names, the same `x-bf-*` headers and
-`bifrost_*` metrics, compiled to one native binary.
+`bifrost_*` metrics, compiled to one small native binary.
 
 Scope and priorities: [SCOPE.md](SCOPE.md) (from the
 [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6SjdriReWQr)).
@@ -12,7 +12,7 @@ Scope and priorities: [SCOPE.md](SCOPE.md) (from the
 
 ```sh
 curl -fsSL https://tov.sh/install.sh | sh
-make build                       # build/raiju (3 MB, static)
+make build                       # build/raiju (3 MB; links only glibc)
 OPENAI_API_KEY=sk-... build/raiju            # no config: providers from env vars
 build/raiju -app-dir ~/.config/bifrost       # or an existing Bifrost config.json
 build/raiju -config config.json -port 8080 -workers 4

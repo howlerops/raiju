@@ -1,8 +1,14 @@
 // Drop-in SDK routes: requests in a provider's own format, forwarded with
 // governance, retries, fallbacks across keys, metrics and cost tracking.
-import { Field, fields, find, quote, build, isNull } from "./json"
+import { Field, fields, find, quote, build, isNull, rawStr, rawBool, setField } from "./json"
 import { Engine, Build, Translate, errorResponse, noHeaders } from "./gateway"
 import { Target, Translated } from "./providers/types"
+import { ChatRequest } from "./schemas"
+import { completionToSse } from "./sse"
+import * as providers from "./providers/index"
+import * as openai from "./providers/openai"
+import * as anthropicIn from "./providers/anthropic_in"
+import * as responses from "./responses"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
 import * as bedrock from "./providers/bedrock"
@@ -68,6 +74,34 @@ export function bedrockUsage(text: string): Translated {
   return anthropicUsage(text, false)
 }
 
+// An OpenAI chat request (JSON text) that can be sent to any provider. toOpenAI
+// gives back an OpenAI completion, or SSE when the provider streamed natively;
+// callers convert that into their own wire format.
+type Bridge = { build: Build, toOpenAI: Translate }
+
+function chatBridge(chatText: string, stream: bool, autoCache: bool): Bridge throws SyntaxError {
+  let fs = try fields(chatText)
+  if (stream) setField(&fs, "stream_options", `{"include_usage":true}`)
+  const streamFields = fs
+  const plain = fs.filter((f) => f.key !== "stream" && f.key !== "stream_options")
+  const req = try JSON.parse(chatText) as ChatRequest
+  const b: Build = (t) => {
+    if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, stream ? streamFields : plain)
+    return try providers.chatUpstream(t, req, plain, autoCache)
+  }
+  const tr: Translate = (t, text, requested) => {
+    if (stream && providers.streamsNatively(t.kind)) return openai.streamResponse(text, requested)
+    return try providers.chatTranslate(t.kind, t.model, text, requested, false)
+  }
+  return { build: b, toOpenAI: tr }
+}
+
+// SSE from either kind of bridge result.
+function asSse(body: string): string throws SyntaxError {
+  if (body.startsWith("{")) return try completionToSse(body, true)
+  return body
+}
+
 // Bedrock's InvokeModel takes Anthropic's body without model or stream, plus a version.
 function bedrockAnthropicBody(body: Field[]): string {
   const fs = body.filter((f) => f.key !== "model" && f.key !== "stream" && f.key !== "anthropic_version")
@@ -78,19 +112,84 @@ function bedrockAnthropicBody(body: Field[]): string {
 export async function anthropicMessages(engine: Engine, req: Request): Promise<Response> {
   const text = await req.text()
   let body: Field[] = []
+  let bridge: Bridge | undefined = undefined
   try {
     body = fields(text)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
   const stream = find(body, "stream") === "true"
-  const build: Build = (t) => {
+  const clientModel = rawStr(body, "model") ?? ""
+  try {
+    // Every provider other than Anthropic (and non-streaming Bedrock) is reached through OpenAI chat.
+    bridge = chatBridge(anthropicIn.toChatRequest(text, clientModel), stream, false)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const br = bridge!
+  const native = (t: Target) => t.kind === "anthropic" || (t.kind === "bedrock" && !stream)
+  const b: Build = (t) => {
     if (t.kind === "anthropic") return anthropic.nativeRequest(t, body)
     if (t.kind === "bedrock" && !stream) return bedrock.signedRequest(t, "invoke", bedrockAnthropicBody(body))
-    throw new SyntaxError(`/anthropic/v1/messages can't route to ${t.provider} yet; use /v1/chat/completions`)
+    return try br.build(t)
   }
-  const translate: Translate = (t, text, requested) => t.kind === "bedrock" ? bedrockUsage(text) : anthropicUsage(text, stream)
-  return await engine.serve(req, "anthropic.messages", undefined, body, text, build, translate, stream)
+  const tr: Translate = (t, text, requested) => {
+    if (t.kind === "anthropic") return anthropicUsage(text, stream)
+    if (native(t)) return bedrockUsage(text)
+    const o = try br.toOpenAI(t, text, requested)
+    const out = stream ? anthropicIn.toMessageStream(try asSse(o.body), clientModel) : try anthropicIn.toMessage(o.body, clientModel)
+    return { body: out, promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+  }
+  return await engine.serve(req, "anthropic.messages", undefined, body, text, b, tr, stream)
+}
+
+type RUsage = { usage?: { input_tokens?: int, output_tokens?: int }, response?: { usage?: { input_tokens?: int, output_tokens?: int } } }
+
+// Token counts from a Responses API body, or from its response.completed event.
+function responsesUsage(text: string, stream: bool): Translated {
+  const payloads: string[] = stream ? text.split("\n").filter((l) => l.startsWith("data: ") && l.includes("usage")).map((l) => l.slice(6)) : [text]
+  let pt = 0
+  let ct = 0
+  for (const p of payloads) {
+    try {
+      const h = JSON.parse(p) as RUsage
+      const u = h.usage ?? h.response?.usage
+      if (u !== undefined) {
+        pt = u.input_tokens ?? pt
+        ct = u.output_tokens ?? ct
+      }
+    } catch (e) {
+      // skipped
+    }
+  }
+  return { body: text, promptTokens: pt, completionTokens: ct }
+}
+
+// /v1/responses: passed through to OpenAI; translated through chat for everyone else.
+export async function responsesApi(engine: Engine, req: Request): Promise<Response> {
+  const reqText = await req.text()
+  let body: Field[] = []
+  let bridge: Bridge | undefined = undefined
+  try {
+    body = fields(reqText)
+    bridge = chatBridge(responses.toChatRequest(reqText, rawStr(body, "model") ?? ""), rawBool(body, "stream") ?? false, false)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const br = bridge!
+  const stream = rawBool(body, "stream") ?? false
+  const clientModel = rawStr(body, "model") ?? ""
+  const b: Build = (t) => {
+    if (t.kind === "openai") return openai.responsesRequest(t, body)
+    return try br.build(t)
+  }
+  const tr: Translate = (t, text, requested) => {
+    if (t.kind === "openai") return responsesUsage(text, stream)
+    const o = try br.toOpenAI(t, text, requested)
+    const out = stream ? responses.toResponseStream(try asSse(o.body), clientModel) : try responses.toResponse(o.body, clientModel, reqText)
+    return { body: out, promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+  }
+  return await engine.serve(req, "responses", undefined, body, reqText, b, tr, stream)
 }
 
 // /genai/v1beta/models/{model}:{method}

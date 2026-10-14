@@ -13,6 +13,7 @@ import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
 import * as metrics from "./metrics"
+import { TokenCache, parseServiceAccount } from "./providers/vertex"
 import { Deadline, deadline } from "./deadline"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
@@ -87,6 +88,7 @@ class LazyChat {
 export class Engine {
   gov: Governance
   health: Health
+  vertexTokens = new TokenCache()
   pricing: Pricing
   cache: ResponseCache | undefined = undefined
   cacheTtlMs = 300000
@@ -132,7 +134,15 @@ export class Engine {
       while (true) {
         const sel = target(this.cfg, ref, tried, pinned, this.health)
         if (sel === undefined) break
-        const t = sel.t
+        let t = sel.t
+        if (t.kind === "vertex") {
+          const tok = await this.vertexToken(t)
+          if (tok.error !== "") {
+            last = { ok: false, status: 502, body: errorJson(tok.error, "authentication_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+          t.key.value = tok.token
+        }
         let up: Upstream = { url: "", headers: new Map(), body: "" }
         try {
           up = build(t)
@@ -201,6 +211,25 @@ export class Engine {
     last.attempts = attempts
     last.upstreamMs = upstreamMs
     return last
+  }
+
+  // A Vertex OAuth access token for the key's service account, from the cache
+  // or from Google's token endpoint (a signed JWT exchanged for an hour-long token).
+  async vertexToken(t: Target): Promise<{ token: string, error: string }> {
+    const now = Math.floor(Date.now() / 1000)
+    try {
+      const sa = parseServiceAccount(t.key.vertex_key_config?.auth_credentials)
+      const cached = this.vertexTokens.get(sa.client_email, now)
+      if (cached !== undefined) return { token: cached, error: "" }
+      const up = this.vertexTokens.tokenRequest(sa, now)
+      const hs: Record<string, string> = up.headers
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: deadline(10000).controller.signal })
+      const text = await res.text()
+      this.vertexTokens.store(sa.client_email, text, now)
+      return { token: this.vertexTokens.get(sa.client_email, now) ?? "", error: "" }
+    } catch (e) {
+      return { token: "", error: `vertex authentication failed: ${e.message}` }
+    }
   }
 
   // Shared front half of every inference endpoint.
@@ -309,12 +338,12 @@ export class Engine {
       return try providers.chatUpstream(t, try typed.get(), body, autoCache)
     }
     const translate: Translate = (t, text, requested) => {
-      if (!stream) return try providers.chatTranslate(t.kind, text, requested, false)
+      if (!stream) return try providers.chatTranslate(t.kind, t.model, text, requested, false)
       if (providers.streamsNatively(t.kind)) {
         const tr = openai.streamResponse(text, requested)
         return { body: wantUsage ? tr.body : dropUsageChunks(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
-      const tr = try providers.chatTranslate(t.kind, text, requested, false)
+      const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
       return { body: try completionToSse(tr.body, wantUsage), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
     }
     return await this.serve(req, "chat", undefined, body, text, build, translate, stream)

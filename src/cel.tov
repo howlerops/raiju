@@ -1,0 +1,1181 @@
+// CEL subset for Bifrost routing rules. Each cel_expression is compiled once
+// into an AST and evaluated against an Activation (the request's identifiers).
+// The first enabled, in-scope rule whose expression is true wins.
+//
+// Supported: string, number, bool and null literals; lists; the identifiers in
+// Activation; map lookups (`headers["x-tier"]`, `params.temperature`); has();
+// `in`; operators with CEL precedence; `c ? a : b`; methods startsWith,
+// endsWith, contains, matches, lowerAscii, size; global lower(), size().
+//
+// Notes:
+// - Numbers are f64, so integers above 2^53 lose precision.
+// - Header and param keys are matched exactly. Callers pass lower-cased
+//   header names, as schemas.tov's Hdrs does.
+// - Optional identifiers (virtual_key, team, customer, complexity_tier) are
+//   null when absent, so `team == null` works.
+// - matches(p) supports only: a leading ^, a trailing $, .* for any run of
+//   text, and literal text (unanchored means "contains"). Any other
+//   metacharacter is a compile error when the pattern is a literal, and an
+//   evaluation error otherwise, so it never matches silently.
+// - Not supported: map literals, raw strings, regex, macros other than has(),
+//   and type conversions such as int() or string().
+import { fields, elements, decodeString } from "./json"
+
+export type Activation = {
+  model: string,
+  provider: string,
+  request_type: string,
+  virtual_key?: string,
+  team?: string,
+  customer?: string,
+  budget_used: f64,
+  tokens_used: f64,
+  complexity_tier?: string,
+  headers: Map<string, string>,
+  params: Map<string, string>,
+}
+
+export type RuleTarget = { provider: string, model?: string, key_id?: string, weight?: f64 }
+
+export type RoutingRule = {
+  id: string,
+  name?: string,
+  cel_expression: string,
+  targets: RuleTarget[],
+  fallbacks?: string[],
+  scope?: "global" | "virtual_key" | "team" | "customer",
+  scope_id?: string,
+  priority?: int,
+  enabled?: bool,
+}
+
+export type ScopeIds = { virtual_key?: string, team?: string, customer?: string }
+
+// rule is the matched rule's id.
+export type RouteMatch = { rule: string, targets: RuleTarget[], fallbacks: string[] }
+
+export type Program = { root: Expr }
+
+class CelError extends Error {}
+
+// Recursive through lists and maps. Tov's recursive unions work at runtime.
+type Value = { kind: "str", s: string } | { kind: "num", n: f64 } | { kind: "bool", b: bool } | { kind: "list", items: Value[] } | { kind: "map", m: Map<string, Value> } | { kind: "null" }
+
+// Children live in arrays so no node contains itself directly.
+type Expr = { kind: "lit", v: Value }
+  | { kind: "id", name: string }
+  | { kind: "list", items: Expr[] }
+  | { kind: "un", op: string, args: Expr[] }
+  | { kind: "bin", op: string, args: Expr[] }
+  | { kind: "cond", args: Expr[] }
+  | { kind: "index", args: Expr[] }
+  | { kind: "call", name: string, args: Expr[] }
+  | { kind: "method", name: string, args: Expr[] }
+
+type Tok = { kind: string, text: string, n: f64, pos: int }
+
+const OPS1 = "+-*/%?:.,()[]<>!"
+const IDENTS = ["model", "provider", "request_type", "virtual_key", "team", "customer", "budget_used", "tokens_used", "complexity_tier", "headers", "params"]
+const META = ["^", "$", ".", "(", ")", "[", "]", "{", "}", "|", "+", "?", "*", "\\"]
+
+function syntaxErr(pos: int, msg: string): SyntaxError {
+  return new SyntaxError(`${msg} at column ${pos + 1}`)
+}
+
+function isDigit(c: int): bool {
+  return c >= 48 && c <= 57
+}
+
+function isAlpha(c: int): bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c === 95
+}
+
+function hexVal(c: int): int {
+  if (isDigit(c)) return c - 48
+  if (c >= 97 && c <= 102) return c - 87
+  if (c >= 65 && c <= 70) return c - 55
+  return -1
+}
+
+function utf8Push(inout buf: u8[], cp: int): void {
+  if (cp < 0x80) {
+    buf.push(u8(cp))
+  } else if (cp < 0x800) {
+    buf.push(u8(0xc0 | (cp >> 6)))
+    buf.push(u8(0x80 | (cp & 0x3f)))
+  } else {
+    buf.push(u8(0xe0 | (cp >> 12)))
+    buf.push(u8(0x80 | ((cp >> 6) & 0x3f)))
+    buf.push(u8(0x80 | (cp & 0x3f)))
+  }
+}
+
+function decodeUtf8(buf: u8[], at: int): string throws SyntaxError {
+  try {
+    return new TextDecoder().decode(buf)
+  } catch (e) {
+    throw syntaxErr(at, "invalid UTF-8 in string")
+  }
+}
+
+type Lit = { text: string, end: int }
+
+// Reads the quoted string that starts at b[start]. Returns its decoded text and
+// the offset just past the closing quote.
+function readString(b: u8[], start: int): Lit throws SyntaxError {
+  const q = int(b[start]!)
+  let buf: u8[] = []
+  let i = start + 1
+  while (i < b.length && int(b[i]!) !== q) {
+    if (int(b[i]!) !== 92) {
+      buf.push(b[i]!)
+      i += 1
+      continue
+    }
+    const e = i + 1 < b.length ? int(b[i + 1]!) : -1
+    i += 2
+    if (e === 110) buf.push(u8(10))
+    else if (e === 116) buf.push(u8(9))
+    else if (e === 114) buf.push(u8(13))
+    else if (e === 92 || e === 34 || e === 39) buf.push(u8(e))
+    else if (e === 117) {
+      let cp = 0
+      for (let k = 0; k < 4; k++) {
+        const h = i + k < b.length ? hexVal(int(b[i + k]!)) : -1
+        if (h < 0) throw syntaxErr(i - 2, "invalid \\u escape")
+        cp = cp * 16 + h
+      }
+      if (cp >= 0xd800 && cp <= 0xdfff) throw syntaxErr(i - 2, "surrogate in \\u escape")
+      utf8Push(&buf, cp)
+      i += 4
+    } else {
+      throw syntaxErr(i - 2, "invalid escape")
+    }
+  }
+  if (i >= b.length) throw syntaxErr(start, "unterminated string")
+  const text = try decodeUtf8(buf, start)
+  return { text: text, end: i + 1 }
+}
+
+function lex(src: string): Tok[] throws SyntaxError {
+  const b = new TextEncoder().encode(src)
+  const out: Tok[] = []
+  let i = 0
+  while (i < b.length) {
+    const c = int(b[i]!)
+    if (c === 32 || c === 9 || c === 10 || c === 13) {
+      i += 1
+    } else if (isDigit(c)) {
+      let j = i
+      while (j < b.length && isDigit(int(b[j]!))) j += 1
+      if (j + 1 < b.length && int(b[j]!) === 46 && isDigit(int(b[j + 1]!))) {
+        j += 1
+        while (j < b.length && isDigit(int(b[j]!))) j += 1
+      }
+      if (j < b.length && (int(b[j]!) === 101 || int(b[j]!) === 69)) {
+        let k = j + 1
+        if (k < b.length && (int(b[k]!) === 43 || int(b[k]!) === 45)) k += 1
+        if (k < b.length && isDigit(int(b[k]!))) {
+          j = k
+          while (j < b.length && isDigit(int(b[j]!))) j += 1
+        }
+      }
+      const text = src.slice(i, j)
+      const n = parseFloat(text)
+      if (n === undefined) throw syntaxErr(i, "bad number")
+      out.push({ kind: "num", text: text, n: n, pos: i })
+      i = j
+    } else if (isAlpha(c)) {
+      let j = i
+      while (j < b.length && (isAlpha(int(b[j]!)) || isDigit(int(b[j]!)))) j += 1
+      out.push({ kind: "id", text: src.slice(i, j), n: 0.0, pos: i })
+      i = j
+    } else if (c === 34 || c === 39) {
+      const lit = try readString(b, i)
+      out.push({ kind: "str", text: lit.text, n: 0.0, pos: i })
+      i = lit.end
+    } else {
+      // Only ASCII reaches the slices below; anything else is rejected first.
+      if (c >= 128) throw syntaxErr(i, "unexpected character")
+      const d = i + 1 < b.length ? int(b[i + 1]!) : 0
+      const two = (c === 38 && d === 38) || (c === 124 && d === 124) || (c === 61 && d === 61)
+        || (c === 33 && d === 61) || (c === 60 && d === 61) || (c === 62 && d === 61)
+      if (two) {
+        out.push({ kind: "op", text: src.slice(i, i + 2), n: 0.0, pos: i })
+        i += 2
+      } else if (OPS1.includes(src.slice(i, i + 1))) {
+        out.push({ kind: "op", text: src.slice(i, i + 1), n: 0.0, pos: i })
+        i += 1
+      } else {
+        throw syntaxErr(i, "unexpected character")
+      }
+    }
+  }
+  out.push({ kind: "eof", text: "", n: 0.0, pos: b.length })
+  return out
+}
+
+function describe(t: Tok): string {
+  if (t.kind === "eof") return "end of input"
+  return `'${t.text}'`
+}
+
+// Arity of a method (receiver not counted), or -1 when there is no such method.
+function methodArity(name: string): int {
+  if (name === "size" || name === "lowerAscii") return 0
+  if (name === "startsWith" || name === "endsWith" || name === "contains" || name === "matches") return 1
+  return -1
+}
+
+// Recursive descent over the token list, one method per precedence level.
+class Parser {
+  private i = 0
+  constructor(private toks: Tok[]) {}
+
+  peek(): Tok {
+    return this.toks[this.i]!
+  }
+
+  // Moves past the current token. The eof token stays put.
+  advance(): void {
+    if (this.i < this.toks.length - 1) this.i += 1
+  }
+
+  isOp(text: string): bool {
+    const t = this.peek()
+    return t.kind === "op" && t.text === text
+  }
+
+  expect(text: string): void throws SyntaxError {
+    if (!this.isOp(text)) throw syntaxErr(this.peek().pos, `expected '${text}'`)
+    this.advance()
+  }
+
+  isRelOp(): bool {
+    const t = this.peek()
+    if (t.kind === "id") return t.text === "in"
+    if (t.kind !== "op") return false
+    return t.text === "==" || t.text === "!=" || t.text === "<" || t.text === "<=" || t.text === ">" || t.text === ">="
+  }
+
+  expr(): Expr throws SyntaxError {
+    const c = try this.or()
+    if (!this.isOp("?")) return c
+    this.advance()
+    const a = try this.expr()
+    try this.expect(":")
+    const b = try this.expr()
+    return { kind: "cond", args: [c, a, b] }
+  }
+
+  or(): Expr throws SyntaxError {
+    let l = try this.and()
+    while (this.isOp("||")) {
+      this.advance()
+      const r = try this.and()
+      l = { kind: "bin", op: "||", args: [l, r] }
+    }
+    return l
+  }
+
+  and(): Expr throws SyntaxError {
+    let l = try this.rel()
+    while (this.isOp("&&")) {
+      this.advance()
+      const r = try this.rel()
+      l = { kind: "bin", op: "&&", args: [l, r] }
+    }
+    return l
+  }
+
+  rel(): Expr throws SyntaxError {
+    let l = try this.add()
+    while (this.isRelOp()) {
+      const op = this.peek().text
+      this.advance()
+      const r = try this.add()
+      l = { kind: "bin", op: op, args: [l, r] }
+    }
+    return l
+  }
+
+  add(): Expr throws SyntaxError {
+    let l = try this.mul()
+    while (this.isOp("+") || this.isOp("-")) {
+      const op = this.peek().text
+      this.advance()
+      const r = try this.mul()
+      l = { kind: "bin", op: op, args: [l, r] }
+    }
+    return l
+  }
+
+  mul(): Expr throws SyntaxError {
+    let l = try this.unary()
+    while (this.isOp("*") || this.isOp("/") || this.isOp("%")) {
+      const op = this.peek().text
+      this.advance()
+      const r = try this.unary()
+      l = { kind: "bin", op: op, args: [l, r] }
+    }
+    return l
+  }
+
+  unary(): Expr throws SyntaxError {
+    if (this.isOp("!") || this.isOp("-")) {
+      const op = this.peek().text
+      this.advance()
+      const x = try this.unary()
+      return { kind: "un", op: op, args: [x] }
+    }
+    return try this.member()
+  }
+
+  member(): Expr throws SyntaxError {
+    let e = try this.primary()
+    while (this.isOp(".") || this.isOp("[")) {
+      if (this.isOp("[")) {
+        this.advance()
+        const k = try this.expr()
+        try this.expect("]")
+        e = { kind: "index", args: [e, k] }
+        continue
+      }
+      this.advance()
+      const name = this.peek()
+      if (name.kind !== "id") throw syntaxErr(name.pos, "expected a field name")
+      this.advance()
+      if (this.isOp("(")) {
+        const args = try this.args()
+        const want = methodArity(name.text)
+        if (want < 0) throw syntaxErr(name.pos, `unknown method ${name.text}`)
+        if (want !== args.length) throw syntaxErr(name.pos, `${name.text} takes ${want} argument(s)`)
+        if (name.text === "matches") {
+          const pat = args[0]!
+          if (pat.kind === "lit" && pat.v.kind === "str") {
+            const g = parseGlob(pat.v.s)
+            if (g.err !== "") throw syntaxErr(name.pos, g.err)
+          }
+        }
+        e = { kind: "method", name: name.text, args: [e].concat(args) }
+      } else {
+        e = { kind: "index", args: [e, { kind: "lit", v: { kind: "str", s: name.text } }] }
+      }
+    }
+    return e
+  }
+
+  primary(): Expr throws SyntaxError {
+    const t = this.peek()
+    this.advance()
+    if (t.kind === "num") return { kind: "lit", v: { kind: "num", n: t.n } }
+    if (t.kind === "str") return { kind: "lit", v: { kind: "str", s: t.text } }
+    if (t.kind === "op" && t.text === "(") {
+      const e = try this.expr()
+      try this.expect(")")
+      return e
+    }
+    if (t.kind === "op" && t.text === "[") {
+      const items = try this.seq("]")
+      return { kind: "list", items: items }
+    }
+    if (t.kind === "id") {
+      if (t.text === "true") return { kind: "lit", v: { kind: "bool", b: true } }
+      if (t.text === "false") return { kind: "lit", v: { kind: "bool", b: false } }
+      if (t.text === "null") return { kind: "lit", v: { kind: "null" } }
+      if (this.isOp("(")) {
+        const args = try this.args()
+        if (t.text === "has") {
+          if (args.length !== 1 || args[0]!.kind !== "index") throw syntaxErr(t.pos, "has() needs a field selection")
+        } else if (t.text === "size" || t.text === "lower") {
+          if (args.length !== 1) throw syntaxErr(t.pos, `${t.text}() takes one argument`)
+        } else {
+          throw syntaxErr(t.pos, `unknown function ${t.text}`)
+        }
+        return { kind: "call", name: t.text, args: args }
+      }
+      if (!IDENTS.includes(t.text)) throw syntaxErr(t.pos, `unknown identifier ${t.text}`)
+      return { kind: "id", name: t.text }
+    }
+    throw syntaxErr(t.pos, `unexpected ${describe(t)}`)
+  }
+
+  args(): Expr[] throws SyntaxError {
+    try this.expect("(")
+    return try this.seq(")")
+  }
+
+  // Comma-separated expressions up to and including `close`. A trailing comma is allowed.
+  seq(close: string): Expr[] throws SyntaxError {
+    const out: Expr[] = []
+    while (!this.isOp(close)) {
+      const x = try this.expr()
+      out.push(x)
+      if (!this.isOp(close)) try this.expect(",")
+    }
+    this.advance()
+    return out
+  }
+}
+
+// Parses src. The error message ends with the 1-based column of the problem.
+export function compile(src: string): Program throws SyntaxError {
+  const toks = try lex(src)
+  const p = new Parser(toks)
+  const root = try p.expr()
+  if (p.peek().kind !== "eof") throw syntaxErr(p.peek().pos, `unexpected ${describe(p.peek())}`)
+  return { root: root }
+}
+
+// ---- evaluation ----
+
+function vStr(s: string): Value {
+  return { kind: "str", s: s }
+}
+
+function vNum(n: f64): Value {
+  return { kind: "num", n: n }
+}
+
+function vBool(b: bool): Value {
+  return { kind: "bool", b: b }
+}
+
+function optStr(s: string | undefined): Value {
+  if (s === undefined) return { kind: "null" }
+  return { kind: "str", s: s }
+}
+
+function isSafeInt(x: f64): bool {
+  if (x > 9.0e15 || x < -9.0e15) return false
+  return Math.floor(x) === x
+}
+
+function valEq(a: Value, b: Value): bool {
+  switch (a.kind) {
+    case "str": return b.kind === "str" && a.s === b.s
+    case "num": return b.kind === "num" && a.n === b.n
+    case "bool": return b.kind === "bool" && a.b === b.b
+    case "null": return b.kind === "null"
+    case "list": {
+      if (b.kind !== "list" || a.items.length !== b.items.length) return false
+      for (let i = 0; i < a.items.length; i++) {
+        if (!valEq(a.items[i]!, b.items[i]!)) return false
+      }
+      return true
+    }
+    case "map": {
+      if (b.kind !== "map" || a.m.size !== b.m.size) return false
+      for (const k of a.m.keys()) {
+        const x = a.m.get(k)
+        const y = b.m.get(k)
+        if (x === undefined || y === undefined || !valEq(x, y)) return false
+      }
+      return true
+    }
+  }
+}
+
+// Orders two numbers or two strings.
+function compare(a: Value, b: Value): int throws CelError {
+  if (a.kind === "num" && b.kind === "num") {
+    if (a.n < b.n) return -1
+    if (a.n > b.n) return 1
+    return 0
+  }
+  if (a.kind === "str" && b.kind === "str") {
+    if (a.s < b.s) return -1
+    if (a.s > b.s) return 1
+    return 0
+  }
+  throw new CelError("no such overload for comparison")
+}
+
+function inOp(x: Value, c: Value): bool throws CelError {
+  if (c.kind === "list") {
+    for (const it of c.items) {
+      if (valEq(x, it)) return true
+    }
+    return false
+  }
+  if (c.kind === "map") {
+    if (x.kind !== "str") return false
+    return c.m.has(x.s)
+  }
+  throw new CelError("'in' needs a list or a map")
+}
+
+function indexValue(obj: Value, key: Value): Value throws CelError {
+  if (obj.kind === "map") {
+    if (key.kind !== "str") throw new CelError("map keys are strings")
+    const v = obj.m.get(key.s)
+    if (v === undefined) throw new CelError(`no such key: ${key.s}`)
+    return v
+  }
+  if (obj.kind === "list") {
+    if (key.kind !== "num" || !isSafeInt(key.n) || key.n < 0.0 || key.n >= obj.items.length) {
+      throw new CelError("list index out of range")
+    }
+    return obj.items[Math.trunc(key.n)]!
+  }
+  throw new CelError("value cannot be indexed")
+}
+
+// has(m.k) and has(m["k"]): true when the map holds the key.
+function hasOp(sel: Expr, env: Map<string, Value>): bool throws CelError {
+  if (sel.kind !== "index") throw new CelError("has() needs a field selection")
+  const base = try ev(sel.args[0]!, env)
+  const key = try ev(sel.args[1]!, env)
+  if (base.kind !== "map") throw new CelError("has() needs a map")
+  if (key.kind !== "str") throw new CelError("has() key must be a string")
+  return base.m.has(key.s)
+}
+
+// Characters in a string (counted as code points), or entries in a collection.
+function sizeOf(x: Value): f64 throws CelError {
+  if (x.kind === "str") return x.s.chars().length + 0.0
+  if (x.kind === "list") return x.items.length + 0.0
+  if (x.kind === "map") return x.m.size + 0.0
+  throw new CelError("size() needs a string, list or map")
+}
+
+// ASCII-only lowercasing, so non-ASCII text is left alone, as CEL's lowerAscii does.
+function lowerAscii(s: string): string {
+  const b = new TextEncoder().encode(s)
+  const out: u8[] = []
+  for (const c of b) {
+    const v = int(c)
+    out.push(v >= 65 && v <= 90 ? u8(v + 32) : c)
+  }
+  try {
+    return new TextDecoder().decode(out)
+  } catch (e) {
+    return s
+  }
+}
+
+type Glob = { anchorStart: bool, anchorEnd: bool, parts: string[], err: string }
+
+// Parses the matches() subset: ^ and $ at the ends, .* between literal parts.
+function parseGlob(p: string): Glob {
+  let s = p
+  let anchorStart = false
+  let anchorEnd = false
+  if (s.startsWith("^")) {
+    anchorStart = true
+    s = s.slice(1, s.byteLength)
+  }
+  if (s.endsWith("$")) {
+    anchorEnd = true
+    s = s.slice(0, s.byteLength - 1)
+  }
+  const parts = s.split(".*")
+  for (const part of parts) {
+    for (const m of META) {
+      if (part.includes(m)) {
+        return { anchorStart: false, anchorEnd: false, parts: [], err: `unsupported pattern "${p}": only ^, $, .* and literal text` }
+      }
+    }
+  }
+  return { anchorStart: anchorStart, anchorEnd: anchorEnd, parts: parts, err: "" }
+}
+
+// Matches the parts left to right; each part is searched for after the previous one.
+function globMatch(s: string, g: Glob): bool {
+  const parts = g.parts
+  if (parts.length === 1) {
+    const lit = parts[0]!
+    if (g.anchorStart && g.anchorEnd) return s === lit
+    if (g.anchorStart) return s.startsWith(lit)
+    if (g.anchorEnd) return s.endsWith(lit)
+    return s.includes(lit)
+  }
+  let rest = s
+  for (let i = 0; i < parts.length; i++) {
+    const piece = parts[i]!
+    if (i === 0 && g.anchorStart) {
+      if (!rest.startsWith(piece)) return false
+      rest = rest.slice(piece.byteLength, rest.byteLength)
+    } else if (i === parts.length - 1 && g.anchorEnd) {
+      return rest.endsWith(piece)
+    } else {
+      const at = rest.indexOf(piece)
+      if (at < 0) return false
+      rest = rest.slice(at + piece.byteLength, rest.byteLength)
+    }
+  }
+  return true
+}
+
+function methodCall(name: string, recv: Value, args: Expr[], env: Map<string, Value>): Value throws CelError {
+  if (name === "size") {
+    const n = try sizeOf(recv)
+    return vNum(n)
+  }
+  if (recv.kind !== "str") throw new CelError(`${name}() needs a string`)
+  const s = recv.s
+  if (name === "lowerAscii") return vStr(lowerAscii(s))
+  const arg = try ev(args[1]!, env)
+  if (arg.kind !== "str") throw new CelError(`${name}() needs a string argument`)
+  const x = arg.s
+  if (name === "startsWith") return vBool(s.startsWith(x))
+  if (name === "endsWith") return vBool(s.endsWith(x))
+  if (name === "contains") return vBool(s.includes(x))
+  const g = parseGlob(x)
+  if (g.err !== "") throw new CelError(g.err)
+  return vBool(globMatch(s, g))
+}
+
+function callFn(name: string, args: Expr[], env: Map<string, Value>): Value throws CelError {
+  if (name === "has") {
+    const ok = try hasOp(args[0]!, env)
+    return vBool(ok)
+  }
+  const x = try ev(args[0]!, env)
+  if (name === "size") {
+    const n = try sizeOf(x)
+    return vNum(n)
+  }
+  if (x.kind !== "str") throw new CelError("lower() needs a string")
+  return vStr(lowerAscii(x.s))
+}
+
+// An operand of && or ||. An error comes back as text so the operator can absorb it.
+function boolArg(e: Expr, env: Map<string, Value>): bool | string {
+  try {
+    const v = ev(e, env)
+    if (v.kind === "bool") return v.b
+    return "expected a bool"
+  } catch (err) {
+    return err.message
+  }
+}
+
+function binary(op: string, l: Expr, r: Expr, env: Map<string, Value>): Value throws CelError {
+  // CEL error absorption: a false operand wins over an error for &&, a true one for ||.
+  if (op === "&&") {
+    const a = boolArg(l, env)
+    if (a === false) return vBool(false)
+    const b = boolArg(r, env)
+    if (b === false) return vBool(false)
+    if (typeof a === "string") throw new CelError(a)
+    if (typeof b === "string") throw new CelError(b)
+    return vBool(true)
+  }
+  if (op === "||") {
+    const a = boolArg(l, env)
+    if (a === true) return vBool(true)
+    const b = boolArg(r, env)
+    if (b === true) return vBool(true)
+    if (typeof a === "string") throw new CelError(a)
+    if (typeof b === "string") throw new CelError(b)
+    return vBool(false)
+  }
+  const a = try ev(l, env)
+  const b = try ev(r, env)
+  if (op === "==") return vBool(valEq(a, b))
+  if (op === "!=") return vBool(!valEq(a, b))
+  if (op === "in") {
+    const found = try inOp(a, b)
+    return vBool(found)
+  }
+  if (op === "<" || op === "<=" || op === ">" || op === ">=") {
+    const c = try compare(a, b)
+    if (op === "<") return vBool(c < 0)
+    if (op === "<=") return vBool(c <= 0)
+    if (op === ">") return vBool(c > 0)
+    return vBool(c >= 0)
+  }
+  if (op === "+") {
+    if (a.kind === "num" && b.kind === "num") return vNum(a.n + b.n)
+    if (a.kind === "str" && b.kind === "str") return vStr(a.s + b.s)
+    if (a.kind === "list" && b.kind === "list") {
+      const items: Value[] = []
+      for (const x of a.items) items.push(x)
+      for (const x of b.items) items.push(x)
+      return { kind: "list", items: items }
+    }
+    throw new CelError("no such overload for +")
+  }
+  if (a.kind !== "num" || b.kind !== "num") throw new CelError(`no such overload for ${op}`)
+  if (op === "-") return vNum(a.n - b.n)
+  if (op === "*") return vNum(a.n * b.n)
+  if (b.n === 0.0) throw new CelError("division by zero")
+  if (op === "/") return vNum(a.n / b.n)
+  // %: truncating remainder on integer operands.
+  if (!isSafeInt(a.n) || !isSafeInt(b.n)) throw new CelError("% needs integer operands")
+  const m = Math.trunc(a.n) % Math.trunc(b.n)
+  return vNum(m + 0.0)
+}
+
+function ev(e: Expr, env: Map<string, Value>): Value throws CelError {
+  switch (e.kind) {
+    case "lit": return e.v
+    case "id": {
+      const v = env.get(e.name)
+      if (v === undefined) throw new CelError(`no such attribute ${e.name}`)
+      return v
+    }
+    case "list": {
+      const items: Value[] = []
+      for (const x of e.items) {
+        const v = try ev(x, env)
+        items.push(v)
+      }
+      return { kind: "list", items: items }
+    }
+    case "un": {
+      const x = try ev(e.args[0]!, env)
+      if (e.op === "!") {
+        if (x.kind !== "bool") throw new CelError("! needs a bool")
+        return vBool(!x.b)
+      }
+      if (x.kind !== "num") throw new CelError("unary - needs a number")
+      return vNum(-x.n)
+    }
+    case "bin": return try binary(e.op, e.args[0]!, e.args[1]!, env)
+    case "cond": {
+      const c = try ev(e.args[0]!, env)
+      if (c.kind !== "bool") throw new CelError("ternary condition must be a bool")
+      if (c.b) return try ev(e.args[1]!, env)
+      return try ev(e.args[2]!, env)
+    }
+    case "index": {
+      const obj = try ev(e.args[0]!, env)
+      const key = try ev(e.args[1]!, env)
+      return try indexValue(obj, key)
+    }
+    case "call": return try callFn(e.name, e.args, env)
+    case "method": {
+      const recv = try ev(e.args[0]!, env)
+      return try methodCall(e.name, recv, e.args, env)
+    }
+  }
+}
+
+// Runs a compiled program. Any error, or a result that is not a bool, comes back as text.
+function run(p: Program, env: Map<string, Value>): bool | string {
+  try {
+    const v = ev(p.root, env)
+    if (v.kind !== "bool") return "result is not a bool"
+    return v.b
+  } catch (e) {
+    return e.message
+  }
+}
+
+// Params arrive as raw JSON text. Decode it into the values CEL sees.
+function jsonValue(raw: string): Value {
+  if (raw === "null") return { kind: "null" }
+  if (raw === "true") return vBool(true)
+  if (raw === "false") return vBool(false)
+  if (raw.startsWith("\"")) {
+    try {
+      return vStr(decodeString(raw))
+    } catch (e) {
+      return vStr(raw)
+    }
+  }
+  if (raw.startsWith("[")) {
+    const items: Value[] = []
+    try {
+      for (const el of elements(raw)) items.push(jsonValue(el))
+    } catch (e) {
+      return vStr(raw)
+    }
+    return { kind: "list", items: items }
+  }
+  if (raw.startsWith("{")) {
+    const m = new Map<string, Value>()
+    try {
+      for (const f of fields(raw)) m.set(f.key, jsonValue(f.raw))
+    } catch (e) {
+      return vStr(raw)
+    }
+    return { kind: "map", m: m }
+  }
+  const n = parseFloat(raw)
+  if (n !== undefined) return vNum(n)
+  return vStr(raw)
+}
+
+function buildEnv(act: Activation): Map<string, Value> {
+  const env = new Map<string, Value>()
+  env.set("model", vStr(act.model))
+  env.set("provider", vStr(act.provider))
+  env.set("request_type", vStr(act.request_type))
+  env.set("virtual_key", optStr(act.virtual_key))
+  env.set("team", optStr(act.team))
+  env.set("customer", optStr(act.customer))
+  env.set("complexity_tier", optStr(act.complexity_tier))
+  env.set("budget_used", vNum(act.budget_used))
+  env.set("tokens_used", vNum(act.tokens_used))
+  const h = new Map<string, Value>()
+  for (const k of act.headers.keys()) {
+    const v = act.headers.get(k)
+    if (v !== undefined) h.set(k, vStr(v))
+  }
+  env.set("headers", { kind: "map", m: h })
+  const p = new Map<string, Value>()
+  for (const k of act.params.keys()) {
+    const raw = act.params.get(k)
+    if (raw !== undefined) p.set(k, jsonValue(raw))
+  }
+  env.set("params", { kind: "map", m: p })
+  return env
+}
+
+// Evaluates a compiled program. Returns true or false, or an error message
+// when evaluation fails or the result is not a bool.
+export function evaluate(p: Program, act: Activation): bool | string {
+  return run(p, buildEnv(act))
+}
+
+// ---- rule matching ----
+
+// Failures that make a rule unusable. "" means the rule is fine.
+function ruleProblem(r: RoutingRule): string {
+  if (r.targets.length === 0) return "no targets"
+  const s = r.scope
+  if (s !== undefined && s !== "global" && r.scope_id === undefined) return `scope ${s} needs scope_id`
+  return ""
+}
+
+function scopeOk(r: RoutingRule, ids: ScopeIds): bool {
+  const s = r.scope
+  if (s === undefined || s === "global") return true
+  const want = r.scope_id
+  if (want === undefined) return false
+  if (s === "virtual_key") return ids.virtual_key === want
+  if (s === "team") return ids.team === want
+  return ids.customer === want
+}
+
+type Compiled = { rule: RoutingRule, prog: Program, priority: int, order: int }
+
+// Compiles every rule up front. Rules that fail are left out and reported by
+// errors(); the others still match.
+export class RuleSet {
+  private compiled: Compiled[] = []
+  private errs: string[] = []
+
+  constructor(rules: RoutingRule[]) {
+    for (let i = 0; i < rules.length; i++) {
+      const r = rules[i]!
+      const problem = ruleProblem(r)
+      if (problem !== "") {
+        this.errs.push(`rule ${r.id}: ${problem}`)
+        continue
+      }
+      try {
+        const prog = compile(r.cel_expression)
+        const priority = r.priority !== undefined ? r.priority : 0
+        this.compiled.push({ rule: r, prog: prog, priority: priority, order: i })
+      } catch (e) {
+        this.errs.push(`rule ${r.id}: ${e.message}`)
+      }
+    }
+    // Lower priority first; ties keep config order.
+    this.compiled.sort((a, b) => {
+      const d = a.priority - b.priority
+      return d !== 0 ? d : a.order - b.order
+    })
+  }
+
+  errors(): string[] {
+    return this.errs
+  }
+
+  // First enabled rule in scope whose expression is true. Evaluation errors count as no match.
+  match(act: Activation, scopeIds: ScopeIds): RouteMatch | undefined {
+    const env = buildEnv(act)
+    for (const c of this.compiled) {
+      const r = c.rule
+      if (r.enabled === false || !scopeOk(r, scopeIds)) continue
+      if (run(c.prog, env) === true) {
+        const fallbacks = r.fallbacks !== undefined ? r.fallbacks : []
+        return { rule: r.id, targets: r.targets, fallbacks: fallbacks }
+      }
+    }
+    return undefined
+  }
+}
+
+function weightOf(t: RuleTarget): f64 {
+  const w = t.weight
+  if (w === undefined) return 1.0
+  return w > 0.0 ? w : 0.0
+}
+
+// Weighted choice. r is uniform in [0, 1); the caller supplies it. Returns the
+// index of the chosen target, or -1 when no target has a positive weight.
+export function pickTarget(targets: RuleTarget[], r: f64): int {
+  let total = 0.0
+  for (const t of targets) total += weightOf(t)
+  if (total <= 0.0) return -1
+  let x = r * total
+  for (let i = 0; i < targets.length; i++) {
+    const w = weightOf(targets[i]!)
+    if (w <= 0.0) continue
+    if (x < w) return i
+    x -= w
+  }
+  // Float rounding can leave x just past the end; take the last positive target.
+  for (let i = targets.length - 1; i >= 0; i--) {
+    if (weightOf(targets[i]!) > 0.0) return i
+  }
+  return -1
+}
+
+// ---- tests ----
+
+function sample(): Activation {
+  const h = new Map<string, string>()
+  h.set("x-tier", "gold")
+  const p = new Map<string, string>()
+  p.set("temperature", "0.7")
+  p.set("stream", "true")
+  p.set("n", "2")
+  p.set("stop", "[\"END\",\"STOP\"]")
+  p.set("meta", "{\"k\":\"v\"}")
+  p.set("label", "\"hi\"")
+  p.set("spaced", "[ 1 , \"x\" ]")
+  return {
+    model: "gpt-4o",
+    provider: "openai",
+    request_type: "chat",
+    virtual_key: "vk1",
+    team: "core",
+    budget_used: 0.25,
+    tokens_used: 1200.0,
+    headers: h,
+    params: p,
+  }
+}
+
+function evalSrc(src: string, a: Activation): bool | string {
+  try {
+    return evaluate(compile(src), a)
+  } catch (e) {
+    return "compile: " + e.message
+  }
+}
+
+function compileMsg(src: string): string {
+  try {
+    compile(src)
+    return ""
+  } catch (e) {
+    return e.message
+  }
+}
+
+test("arithmetic and boolean precedence", () => {
+  expect(evalSrc("1 + 2 * 3 == 7", sample())).toBe(true)
+  expect(evalSrc("(1 + 2) * 3 == 9", sample())).toBe(true)
+  expect(evalSrc("10 - 4 - 3 == 3", sample())).toBe(true)
+  expect(evalSrc("-2 * 3 == -6", sample())).toBe(true)
+  expect(evalSrc("7 % 4 == 3", sample())).toBe(true)
+  expect(evalSrc("-7 % 3 == -1", sample())).toBe(true)
+  expect(evalSrc("8 / 4 == 2", sample())).toBe(true)
+  expect(evalSrc("1e3 == 1000.0", sample())).toBe(true)
+  expect(evalSrc("true || false && false", sample())).toBe(true)
+  expect(evalSrc("!false && 2 > 1", sample())).toBe(true)
+  expect(evalSrc("1 == \"1\"", sample())).toBe(false)
+  expect(evalSrc("budget_used * 4 >= 1.0", sample())).toBe(true)
+  expect(evalSrc("1 / 0 == 1", sample())).toBe("division by zero")
+})
+
+test("string literals, concatenation and methods", () => {
+  expect(evalSrc("\"ab\" + 'c' == \"abc\"", sample())).toBe(true)
+  expect(evalSrc("'it\\'s' == \"it's\"", sample())).toBe(true)
+  expect(evalSrc("\"a\\tb\" == \"a\u0009b\"", sample())).toBe(true)
+  expect(evalSrc("size(\"a\\\\b\") == 3", sample())).toBe(true)
+  expect(evalSrc("\"\\u00e9\" == \"é\"", sample())).toBe(true)
+  expect(onModel("gpt-4o", "model.startsWith(\"gpt\")")).toBe(true)
+  expect(onModel("gpt-4o", "model.endsWith(\"4o\")")).toBe(true)
+  expect(onModel("gpt-4o", "model.contains(\"-4\")")).toBe(true)
+  expect(onModel("gpt-4o", "model.contains(\"x\")")).toBe(false)
+  expect(evalSrc("lower(\"ABC\") == \"abc\"", sample())).toBe(true)
+  expect(evalSrc("\"ÀBC\".lowerAscii() == \"Àbc\"", sample())).toBe(true)
+  expect(evalSrc("size(\"héllo\") == 5", sample())).toBe(true)
+  expect(evalSrc("size([1, 2, 3]) == 3", sample())).toBe(true)
+  expect(evalSrc("[1] + [2] == [1, 2]", sample())).toBe(true)
+  expect(evalSrc("\"a\" < \"b\"", sample())).toBe(true)
+})
+
+// Evaluates src against the sample request with its model replaced.
+function onModel(m: string, src: string): bool | string {
+  const a = sample()
+  a.model = m
+  return evalSrc(src, a)
+}
+
+test("in works on lists and maps", () => {
+  expect(evalSrc("\"x\" in [\"a\", \"x\"]", sample())).toBe(true)
+  expect(evalSrc("3 in [1, 2]", sample())).toBe(false)
+  expect(evalSrc("\"x-tier\" in headers", sample())).toBe(true)
+  expect(evalSrc("\"nope\" in headers", sample())).toBe(false)
+  expect(evalSrc("\"temperature\" in params", sample())).toBe(true)
+  expect(evalSrc("\"x\" in 5", sample())).toBe("'in' needs a list or a map")
+})
+
+test("header and param lookups", () => {
+  expect(evalSrc("headers[\"x-tier\"] == \"gold\"", sample())).toBe(true)
+  // Dashed names are not identifiers, so this parses as subtraction and fails at compile time.
+  expect(evalSrc("headers.x-tier == \"gold\"", sample())).toBe("compile: unknown identifier tier at column 11")
+  expect(evalSrc("params.temperature > 0.5", sample())).toBe(true)
+  expect(evalSrc("params.stream == true", sample())).toBe(true)
+  expect(evalSrc("params.n + 1 == 3", sample())).toBe(true)
+  expect(evalSrc("size(params.stop) == 2", sample())).toBe(true)
+  expect(evalSrc("params.stop[1] == \"STOP\"", sample())).toBe(true)
+  expect(evalSrc("params.meta.k == \"v\"", sample())).toBe(true)
+  expect(evalSrc("params.label == \"hi\"", sample())).toBe(true)
+  expect(evalSrc("size(headers) == 1", sample())).toBe(true)
+})
+
+test("missing key is an error unless guarded with has()", () => {
+  expect(evalSrc("headers[\"nope\"] == \"x\"", sample())).toBe("no such key: nope")
+  expect(evalSrc("params.nope == 1", sample())).toBe("no such key: nope")
+  expect(evalSrc("has(headers.nope)", sample())).toBe(false)
+  expect(evalSrc("has(headers[\"x-tier\"])", sample())).toBe(true)
+  expect(evalSrc("has(headers.nope) && headers.nope == \"x\"", sample())).toBe(false)
+  expect(evalSrc("has(headers.nope) || headers.nope == \"x\"", sample())).toBe("no such key: nope")
+  expect(evalSrc("\"nope\" in headers ? headers.nope == \"x\" : true", sample())).toBe(true)
+})
+
+test("&& and || absorb errors as CEL does", () => {
+  expect(evalSrc("false && headers.nope == \"x\"", sample())).toBe(false)
+  expect(evalSrc("headers.nope == \"x\" && false", sample())).toBe(false)
+  expect(evalSrc("true || headers.nope == \"x\"", sample())).toBe(true)
+  expect(evalSrc("headers.nope == \"x\" || true", sample())).toBe(true)
+  expect(evalSrc("true && headers.nope == \"x\"", sample())).toBe("no such key: nope")
+  expect(evalSrc("false || headers.nope == \"x\"", sample())).toBe("no such key: nope")
+  expect(evalSrc("headers.nope == \"x\" && headers.nope == \"y\"", sample())).toBe("no such key: nope")
+  // The right side of a false && is never evaluated, so it cannot fail here.
+  expect(evalSrc("false && (1 / 0 == 1)", sample())).toBe(false)
+})
+
+test("ternary picks one branch", () => {
+  expect(evalSrc("model == \"gpt-4o\" ? 1 < 2 : false", sample())).toBe(true)
+  expect(evalSrc("budget_used > 0.9 ? headers.nope == \"x\" : true", sample())).toBe(true)
+  expect(evalSrc("team == null ? false : team == \"core\"", sample())).toBe(true)
+  expect(evalSrc("virtual_key == null ? true : false", sample())).toBe(false)
+  expect(evalSrc("1 ? true : false", sample())).toBe("ternary condition must be a bool")
+})
+
+test("matches supports ^ $ .* and literals", () => {
+  expect(onModel("gpt-4o", "model.matches(\"^gpt-.*\")")).toBe(true)
+  expect(onModel("gpt-4o", "model.matches(\"gpt\")")).toBe(true)
+  expect(onModel("gpt-4o", "model.matches(\"^4o\")")).toBe(false)
+  expect(onModel("gpt-4o", "model.matches(\"4o$\")")).toBe(true)
+  expect(onModel("gpt-4o", "model.matches(\"^gpt-4o$\")")).toBe(true)
+  expect(onModel("gpt-4o", "model.matches(\"^gpt$\")")).toBe(false)
+  expect(onModel("gpt-4o", "model.matches(\"^g.*t-.*o$\")")).toBe(true)
+  expect(onModel("gpt-4o", "model.matches(\"^.*$\")")).toBe(true)
+  expect(onModel("gpt-4o", "model.matches(\"o.*4\")")).toBe(false)
+  expect(onModel("claude-3-5-sonnet", "model.matches(\"claude-.*-sonnet$\")")).toBe(true)
+  expect(onModel("claude-3-5-sonnet", "model.matches(\"sonnet.*claude\")")).toBe(false)
+  expect(onModel("abc", "model.matches(\"\")")).toBe(true)
+})
+
+test("matches rejects unsupported syntax", () => {
+  expect(compileMsg("model.matches(\"gpt+\")").includes("unsupported pattern")).toBe(true)
+  expect(compileMsg("model.matches(\"^gpt\\\\d\")").includes("unsupported pattern")).toBe(true)
+  expect(compileMsg("model.matches(\"a.b\")").includes("unsupported pattern")).toBe(true)
+  // Not a literal, so it is checked at evaluation and counts as no match.
+  expect(evalSrc("model.matches(team + \"[x]\")", sample())).toBe("unsupported pattern \"core[x]\": only ^, $, .* and literal text")
+})
+
+test("compile errors carry the column", () => {
+  expect(compileMsg("1 +")).toBe("unexpected end of input at column 4")
+  expect(compileMsg("model ==== 'x'")).toBe("unexpected '==' at column 9")
+  expect(compileMsg("1 + ) ")).toBe("unexpected ')' at column 5")
+  expect(compileMsg("teem == \"x\"")).toBe("unknown identifier teem at column 1")
+  expect(compileMsg("foo(1)")).toBe("unknown function foo at column 1")
+  expect(compileMsg("\"abc")).toBe("unterminated string at column 1")
+  expect(compileMsg("model = 'x'")).toBe("unexpected character at column 7")
+  expect(compileMsg("[1, 2")).toBe("expected ',' at column 6")
+  expect(compileMsg("has(model)")).toBe("has() needs a field selection at column 1")
+  expect(compileMsg("model.startsWith()")).toBe("startsWith takes 1 argument(s) at column 7")
+  expect(compileMsg("model.frob()")).toBe("unknown method frob at column 7")
+  expect(compileMsg("1 2")).toBe("unexpected '2' at column 3")
+  expect(compileMsg("model == 'gpt-4o' && (true")).toBe("expected ')' at column 27")
+})
+
+test("numbers from params convert to comparable values", () => {
+  expect(evalSrc("params.temperature == 0.7", sample())).toBe(true)
+  expect(evalSrc("params.label + \"!\" == \"hi!\"", sample())).toBe(true)
+  expect(evalSrc("size(params.spaced) == 2 && params.spaced[1] == \"x\"", sample())).toBe(true)
+})
+
+test("RuleSet orders by priority, then config order, and honors scope and enabled", () => {
+  const rules: RoutingRule[] = [
+    { id: "late", cel_expression: "true", targets: [{ provider: "a" }], priority: 5 },
+    { id: "first", cel_expression: "model == 'gpt-4o'", targets: [{ provider: "b" }], priority: 1 },
+    { id: "second", cel_expression: "true", targets: [{ provider: "c" }], priority: 1 },
+    { id: "off", cel_expression: "true", targets: [{ provider: "d" }], enabled: false },
+    { id: "vk-other", cel_expression: "true", targets: [{ provider: "e" }], scope: "virtual_key", scope_id: "vk2" },
+    { id: "vk-mine", cel_expression: "true", targets: [{ provider: "f" }], scope: "virtual_key", scope_id: "vk1" },
+    { id: "team-core", cel_expression: "true", targets: [{ provider: "g" }], scope: "team", scope_id: "core", priority: 2 },
+    { id: "cust", cel_expression: "true", targets: [{ provider: "h" }], scope: "customer", scope_id: "acme", priority: 0 },
+    { id: "glob", cel_expression: "true", targets: [{ provider: "i" }], scope: "global", scope_id: "ignored", priority: 9 },
+  ]
+  const rs = new RuleSet(rules)
+  expect(rs.errors().length).toBe(0)
+  expect(rs.match(sample(), { virtual_key: "vk1" })?.rule).toBe("vk-mine")
+  expect(rs.match(sample(), { virtual_key: "vk2" })?.rule).toBe("vk-other")
+  expect(rs.match(sample(), {})?.rule).toBe("first")
+  expect(rs.match(sample(), { team: "core" })?.rule).toBe("first")
+
+  const m = rs.match(sample(), { virtual_key: "vk1" })
+  expect(m === undefined ? "" : m.targets[0]!.provider).toBe("f")
+  expect(m === undefined ? -1 : m.fallbacks.length).toBe(0)
+
+  // Without the first rule's model, the next rule at the same priority wins.
+  const other = new RuleSet([
+    { id: "a", cel_expression: "model == 'x'", targets: [{ provider: "p" }], priority: 1 },
+    { id: "b", cel_expression: "true", targets: [{ provider: "q" }], priority: 1 },
+    { id: "c", cel_expression: "true", targets: [{ provider: "r" }], priority: 0 },
+  ])
+  expect(other.match(sample(), {})?.rule).toBe("c")
+  const none = new RuleSet([{ id: "n", cel_expression: "false", targets: [{ provider: "p" }] }])
+  expect(none.match(sample(), {}) === undefined).toBe(true)
+})
+
+test("an invalid rule does not stop the others", () => {
+  const rs = new RuleSet([
+    { id: "bad", cel_expression: "model ==", targets: [{ provider: "a" }] },
+    { id: "notarget", cel_expression: "true", targets: [] },
+    { id: "noscope", cel_expression: "true", targets: [{ provider: "b" }], scope: "team" },
+    { id: "errs", cel_expression: "headers.missing == 'x'", targets: [{ provider: "x" }] },
+    { id: "notbool", cel_expression: "model", targets: [{ provider: "y" }] },
+    { id: "good", cel_expression: "model == 'gpt-4o'", targets: [{ provider: "openai" }], fallbacks: ["anthropic/claude"] },
+  ])
+  // Compile and structure errors are reported up front. The last two rules
+  // compile, and fail only at match time, so they are skipped there.
+  expect(rs.errors().length).toBe(3)
+  expect(rs.errors()[0]!.startsWith("rule bad: ")).toBe(true)
+  const m = rs.match(sample(), {})
+  expect(m === undefined ? "" : m.rule).toBe("good")
+  expect(m === undefined ? -1 : m.fallbacks.length).toBe(1)
+  expect(m === undefined ? "" : m.fallbacks[0]!).toBe("anthropic/claude")
+})
+
+test("pickTarget chooses by weight", () => {
+  const ts: RuleTarget[] = [{ provider: "a", weight: 1.0 }, { provider: "b", weight: 3.0 }, { provider: "c", weight: 0.0 }, { provider: "d" }]
+  // Total weight 5: a gets [0, 0.2), b [0.2, 0.8), d [0.8, 1); c never.
+  expect(pickTarget(ts, 0.0)).toBe(0)
+  expect(pickTarget(ts, 0.19)).toBe(0)
+  expect(pickTarget(ts, 0.21)).toBe(1)
+  expect(pickTarget(ts, 0.79)).toBe(1)
+  expect(pickTarget(ts, 0.81)).toBe(3)
+  expect(pickTarget(ts, 0.999)).toBe(3)
+  let bCount = 0
+  for (let i = 0; i < 1000; i++) {
+    if (pickTarget(ts, i / 1000.0) === 1) bCount += 1
+  }
+  expect(bCount >= 590 && bCount <= 610).toBe(true)
+  expect(pickTarget([], 0.5)).toBe(-1)
+  expect(pickTarget([{ provider: "z", weight: 0.0 }], 0.5)).toBe(-1)
+})

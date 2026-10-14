@@ -1,0 +1,577 @@
+// OpenAI Responses API (POST /v1/responses). OpenAI itself gets the request
+// passed through; other providers are called with chat completions, so the
+// request and the result are translated here, whole or as a stream.
+import { Field, elements, fields, find, quote, rawStr, isNull } from "./json"
+import { newId, nowSeconds } from "./schemas"
+
+// A chat message being built. A function_call that follows an assistant
+// message joins it, so one assistant turn stays one chat message.
+type Out = { role: string, content: string | undefined, calls: string[], callId: string }
+
+type Counts = { prompt_tokens?: int, completion_tokens?: int, total_tokens?: int }
+
+// Raw text of an optional value, read as an empty list or object when absent.
+function elementsOf(raw: string | undefined): string[] throws SyntaxError {
+  if (raw === undefined || isNull(raw)) return []
+  return try elements(raw)
+}
+
+function objectOf(raw: string | undefined): Field[] throws SyntaxError {
+  if (raw === undefined || isNull(raw)) return []
+  return try fields(raw)
+}
+
+// A Responses message content (a string, or typed parts) as chat content.
+// Strings are already JSON literals, so they pass through untouched.
+function contentJson(raw: string): string throws SyntaxError {
+  if (raw.startsWith("\"")) return raw
+  const parts: string[] = []
+  for (const el of try elements(raw)) {
+    const p = try fields(el)
+    const type = rawStr(p, "type") ?? ""
+    if (type === "input_text" || type === "output_text" || type === "text") {
+      parts.push(`{"type":"text","text":${quote(rawStr(p, "text") ?? "")}}`)
+    } else if (type === "input_image") {
+      const url = rawStr(p, "image_url")
+      if (url !== undefined) {
+        const detail = find(p, "detail")
+        const d = detail === undefined || isNull(detail) ? "" : `,"detail":${detail}`
+        parts.push(`{"type":"image_url","image_url":{"url":${quote(url)}${d}}}`)
+      }
+    }
+  }
+  return parts.length === 0 ? "\"\"" : "[" + parts.join(",") + "]"
+}
+
+// developer and system both become the chat system role.
+function chatRole(role: string): string {
+  return role === "developer" || role === "system" ? "system" : role
+}
+
+// A function_call_output: a string, or parts whose text is joined.
+function toolOutput(raw: string): string throws SyntaxError {
+  if (raw === "" || raw === "null") return "\"\""
+  if (raw.startsWith("\"")) return raw
+  if (!raw.startsWith("[")) return quote(raw)
+  const texts: string[] = []
+  for (const el of try elements(raw)) {
+    const p = try fields(el)
+    texts.push(rawStr(p, "text") ?? "")
+  }
+  return quote(texts.join(""))
+}
+
+// Responses tools are flat; chat wraps them in "function". Non-function tools
+// (web_search and the like) have no chat equivalent and are dropped.
+function toolsJson(raw: string): string[] throws SyntaxError {
+  const out: string[] = []
+  for (const el of try elements(raw)) {
+    const t = try fields(el)
+    if (rawStr(t, "type") !== "function") continue
+    const parts = [`"name":${quote(rawStr(t, "name") ?? "")}`]
+    for (const k of ["description", "parameters", "strict"]) {
+      const v = find(t, k)
+      if (v !== undefined && !isNull(v)) parts.push(`${quote(k)}:${v}`)
+    }
+    out.push(`{"type":"function","function":{${parts.join(",")}}}`)
+  }
+  return out
+}
+
+function toolChoiceJson(raw: string): string | undefined throws SyntaxError {
+  if (raw.startsWith("\"")) return raw
+  if (!raw.startsWith("{")) return undefined
+  const fs = try fields(raw)
+  if (rawStr(fs, "type") !== "function") return undefined
+  return `{"type":"function","function":{"name":${quote(rawStr(fs, "name") ?? "")}}}`
+}
+
+// text.format: json_object and json_schema have chat equivalents. Plain text is the default.
+function responseFormat(textRaw: string | undefined): string | undefined throws SyntaxError {
+  if (textRaw === undefined || isNull(textRaw)) return undefined
+  const tf = try fields(textRaw)
+  const fmtRaw = find(tf, "format")
+  if (fmtRaw === undefined || isNull(fmtRaw)) return undefined
+  const fm = try fields(fmtRaw)
+  const type = rawStr(fm, "type")
+  if (type === "json_object") return `{"type":"json_object"}`
+  if (type !== "json_schema") return undefined
+  const parts = [`"name":${quote(rawStr(fm, "name") ?? "response")}`]
+  for (const k of ["schema", "strict"]) {
+    const v = find(fm, k)
+    if (v !== undefined && !isNull(v)) parts.push(`${quote(k)}:${v}`)
+  }
+  return `{"type":"json_schema","json_schema":{${parts.join(",")}}}`
+}
+
+function outJson(o: Out): string {
+  if (o.role === "tool") {
+    const c = o.content ?? "\"\""
+    return `{"role":"tool","tool_call_id":${quote(o.callId)},"content":${c}}`
+  }
+  const c = o.content ?? "null"
+  const parts = [`"role":${quote(o.role)}`, `"content":${c}`]
+  if (o.calls.length > 0) parts.push(`"tool_calls":[${o.calls.join(",")}]`)
+  return "{" + parts.join(",") + "}"
+}
+
+// Responses request JSON to chat completions JSON. The target's name replaces
+// the one the client sent.
+export function toChatRequest(responsesBody: string, model: string): string throws SyntaxError {
+  const fs = try fields(responsesBody)
+  const outs: Out[] = []
+  const instructions = rawStr(fs, "instructions")
+  if (instructions !== undefined && instructions !== "") {
+    outs.push({ role: "system", content: quote(instructions), calls: [], callId: "" })
+  }
+  const input = find(fs, "input")
+  if (input !== undefined && input.startsWith("\"")) {
+    outs.push({ role: "user", content: input, calls: [], callId: "" })
+  } else if (input !== undefined && !isNull(input)) {
+    for (const el of try elements(input)) {
+      const it = try fields(el)
+      const type = rawStr(it, "type") ?? "message"
+      if (type === "message") {
+        const c = find(it, "content") ?? "\"\""
+        const content = try contentJson(isNull(c) ? "\"\"" : c)
+        outs.push({ role: chatRole(rawStr(it, "role") ?? "user"), content: content, calls: [], callId: "" })
+      } else if (type === "function_call") {
+        const call = `{"id":${quote(rawStr(it, "call_id") ?? "")},"type":"function","function":{"name":${quote(rawStr(it, "name") ?? "")},"arguments":${quote(rawStr(it, "arguments") ?? "")}}}`
+        const last = outs.length - 1
+        if (last >= 0 && outs[last]!.role === "assistant") {
+          const prev = outs[last]!
+          outs[last] = { role: prev.role, content: prev.content, calls: prev.calls.concat([call]), callId: "" }
+        } else {
+          outs.push({ role: "assistant", content: undefined, calls: [call], callId: "" })
+        }
+      } else if (type === "function_call_output") {
+        const out = try toolOutput(find(it, "output") ?? "\"\"")
+        outs.push({ role: "tool", content: out, calls: [], callId: rawStr(it, "call_id") ?? "" })
+      }
+      // Reasoning items and built-in tool calls have no chat equivalent.
+    }
+  }
+  const parts: string[] = [`"model":${quote(model)}`, `"messages":[${outs.map(outJson).join(",")}]`]
+  for (const k of ["temperature", "top_p", "stream", "user", "parallel_tool_calls"]) {
+    const v = find(fs, k)
+    if (v !== undefined && !isNull(v)) parts.push(`${quote(k)}:${v}`)
+  }
+  const maxOut = find(fs, "max_output_tokens")
+  if (maxOut !== undefined && !isNull(maxOut)) parts.push(`"max_tokens":${maxOut}`)
+  const tools = find(fs, "tools")
+  if (tools !== undefined && !isNull(tools)) {
+    const list = try toolsJson(tools)
+    if (list.length > 0) parts.push(`"tools":[${list.join(",")}]`)
+  }
+  const choice = find(fs, "tool_choice")
+  if (choice !== undefined && !isNull(choice)) {
+    const c = try toolChoiceJson(choice)
+    if (c !== undefined) parts.push(`"tool_choice":${c}`)
+  }
+  const format = try responseFormat(find(fs, "text"))
+  if (format !== undefined) parts.push(`"response_format":${format}`)
+  return "{" + parts.join(",") + "}"
+}
+
+function messageItem(id: string, status: string, parts: string): string {
+  return `{"type":"message","id":${quote(id)},"status":${quote(status)},"role":"assistant","content":${parts}}`
+}
+
+function outputText(text: string): string {
+  return `{"type":"output_text","text":${quote(text)},"annotations":[]}`
+}
+
+function functionCallItem(id: string, callId: string, name: string, args: string, status: string): string {
+  return `{"type":"function_call","id":${quote(id)},"call_id":${quote(callId)},"name":${quote(name)},"arguments":${quote(args)},"status":${quote(status)}}`
+}
+
+function usageJson(p: int, c: int, t: int): string {
+  return `{"input_tokens":${p},"output_tokens":${c},"total_tokens":${t}}`
+}
+
+// A chat usage block as a Responses usage block.
+function usageFrom(raw: string): string throws SyntaxError {
+  const u = try JSON.parse(raw) as Counts
+  const p = u.prompt_tokens ?? 0
+  const c = u.completion_tokens ?? 0
+  return usageJson(p, c, u.total_tokens ?? p + c)
+}
+
+// The reason a chat finish_reason leaves the response incomplete, if it does.
+function incompleteReason(finish: string | undefined): string | undefined {
+  if (finish === "length") return "max_output_tokens"
+  if (finish === "content_filter") return "content_filter"
+  return undefined
+}
+
+// The response object. `echo` holds request fields to repeat (raw "key":value pairs).
+function responseJson(id: string, created: string, model: string, status: string, reason: string | undefined, output: string[], usage: string | undefined, echo: string[]): string {
+  const details = reason === undefined ? "null" : `{"reason":${quote(reason)}}`
+  const head = [`"id":${quote(id)}`, `"object":"response"`, `"created_at":${created}`, `"status":${quote(status)}`, `"error":null`, `"incomplete_details":${details}`]
+  const tail = [`"model":${quote(model)}`, `"output":[${output.join(",")}]`]
+  if (usage !== undefined) tail.push(`"usage":${usage}`)
+  return "{" + head.concat(echo).concat(tail).join(",") + "}"
+}
+
+// A complete chat.completion as a Responses response object.
+export function toResponse(chatCompletion: string, model: string, requestBody: string): string throws SyntaxError {
+  const cc = try fields(chatCompletion)
+  const choices = try elementsOf(find(cc, "choices"))
+  const ch = try objectOf(choices[0])
+  const msg = try objectOf(find(ch, "message"))
+  const text = rawStr(msg, "content") ?? ""
+  const finish = rawStr(ch, "finish_reason")
+
+  const callItems: string[] = []
+  for (const el of try elementsOf(find(msg, "tool_calls"))) {
+    const tc = try fields(el)
+    const fn = try objectOf(find(tc, "function"))
+    callItems.push(functionCallItem(newId("fc_"), rawStr(tc, "id") ?? "", rawStr(fn, "name") ?? "", rawStr(fn, "arguments") ?? "", "completed"))
+  }
+  // Text comes first. An empty text with tool calls is only the calls.
+  const msgItems: string[] = []
+  if (text !== "" || callItems.length === 0) msgItems.push(messageItem(newId("msg_"), "completed", `[${outputText(text)}]`))
+  const output = msgItems.concat(callItems)
+
+  let usage = usageJson(0, 0, 0)
+  const usageRaw = find(cc, "usage")
+  if (usageRaw !== undefined && !isNull(usageRaw)) usage = try usageFrom(usageRaw)
+
+  const rq = try fields(requestBody)
+  const echo: string[] = []
+  for (const k of ["instructions", "temperature", "tools"]) {
+    const v = find(rq, k)
+    if (v !== undefined && !isNull(v)) echo.push(`${quote(k)}:${v}`)
+  }
+  const created = find(cc, "created") ?? `${nowSeconds()}`
+  const reason = incompleteReason(finish)
+  const status = reason === undefined ? "completed" : "incomplete"
+  return responseJson(newId("resp_"), created, model, status, reason, output, usage, echo)
+}
+
+type Call = { key: string, itemId: string, callId: string, name: string, args: string, outputIndex: int }
+
+// Streaming state for one response. Chat chunks go in through streamChunk and
+// Responses events come out. At most one output item is open at a time, so a
+// new item closes the one before it. Output items are kept for response.completed.
+export class StreamState {
+  seq: int = 0
+  started = false
+  finished = false
+  readonly id = newId("resp_")
+  readonly created = `${nowSeconds()}`
+  nextIndex: int = 0
+  output: string[] = []
+  usage: string | undefined = undefined
+  finish: string | undefined = undefined
+  msgOpen = false
+  msgId = ""
+  msgText = ""
+  msgIndex: int = 0
+  calls: Call[] = []
+  openCall: int = -1
+
+  constructor(readonly model: string) {}
+
+  // One SSE event; every event numbers itself in order.
+  emit(type: string, rest: string): string {
+    const n = this.seq
+    this.seq += 1
+    return `event: ${type}\ndata: {"type":"${type}","sequence_number":${n},${rest}}\n\n`
+  }
+
+  response(status: string, reason: string | undefined, output: string[]): string {
+    return responseJson(this.id, this.created, this.model, status, reason, output, this.usage, [])
+  }
+
+  // The opening events. Emitted once, before anything else.
+  start(): string {
+    if (this.started) return ""
+    this.started = true
+    const r = this.response("in_progress", undefined, [])
+    return this.emit("response.created", `"response":${r}`) + this.emit("response.in_progress", `"response":${r}`)
+  }
+
+  openMessage(): string {
+    if (this.msgOpen) return ""
+    const out = this.closeCall()
+    this.msgOpen = true
+    this.msgId = newId("msg_")
+    this.msgText = ""
+    this.msgIndex = this.nextIndex
+    this.nextIndex += 1
+    const item = messageItem(this.msgId, "in_progress", "[]")
+    return out + this.emit("response.output_item.added", `"output_index":${this.msgIndex},"item":${item}`) +
+      this.emit("response.content_part.added", `"item_id":${quote(this.msgId)},"output_index":${this.msgIndex},"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}`)
+  }
+
+  closeMessage(): string {
+    if (!this.msgOpen) return ""
+    this.msgOpen = false
+    const part = outputText(this.msgText)
+    const item = messageItem(this.msgId, "completed", `[${part}]`)
+    this.output.push(item)
+    return this.emit("response.output_text.done", `"item_id":${quote(this.msgId)},"output_index":${this.msgIndex},"content_index":0,"text":${quote(this.msgText)}`) +
+      this.emit("response.content_part.done", `"item_id":${quote(this.msgId)},"output_index":${this.msgIndex},"content_index":0,"part":${part}`) +
+      this.emit("response.output_item.done", `"output_index":${this.msgIndex},"item":${item}`)
+  }
+
+  textDelta(text: string): string {
+    const out = this.openMessage()
+    this.msgText += text
+    return out + this.emit("response.output_text.delta", `"item_id":${quote(this.msgId)},"output_index":${this.msgIndex},"content_index":0,"delta":${quote(text)}`)
+  }
+
+  // Index of the tool call with this chunk key (its index in the message), or -1.
+  callAt(key: string): int {
+    for (let i = 0; i < this.calls.length; i++) {
+      if (this.calls[i]!.key === key) return i
+    }
+    return -1
+  }
+
+  closeCall(): string {
+    if (this.openCall < 0) return ""
+    const c = this.calls[this.openCall]!
+    this.openCall = -1
+    const item = functionCallItem(c.itemId, c.callId, c.name, c.args, "completed")
+    this.output.push(item)
+    return this.emit("response.function_call_arguments.done", `"item_id":${quote(c.itemId)},"output_index":${c.outputIndex},"arguments":${quote(c.args)}`) +
+      this.emit("response.output_item.done", `"output_index":${c.outputIndex},"item":${item}`)
+  }
+
+  // One tool call delta. Arguments arriving for a call that is no longer open
+  // are dropped: its item has already been closed.
+  callDelta(key: string, callId: string, name: string, args: string): string {
+    let out = ""
+    let i = this.callAt(key)
+    if (i < 0) {
+      out = this.closeMessage() + this.closeCall()
+      i = this.calls.length
+      const fresh: Call = { key: key, itemId: newId("fc_"), callId: callId, name: name, args: "", outputIndex: this.nextIndex }
+      this.nextIndex += 1
+      this.calls.push(fresh)
+      this.openCall = i
+      out += this.emit("response.output_item.added", `"output_index":${fresh.outputIndex},"item":${functionCallItem(fresh.itemId, fresh.callId, fresh.name, "", "in_progress")}`)
+    }
+    if (i !== this.openCall) return out
+    const c = this.calls[i]!
+    this.calls[i] = { key: c.key, itemId: c.itemId, callId: c.callId === "" ? callId : c.callId, name: c.name === "" ? name : c.name, args: c.args + args, outputIndex: c.outputIndex }
+    if (args === "") return out
+    return out + this.emit("response.function_call_arguments.delta", `"item_id":${quote(c.itemId)},"output_index":${c.outputIndex},"delta":${quote(args)}`)
+  }
+
+  closeOpen(): string {
+    return this.closeMessage() + this.closeCall()
+  }
+}
+
+function chunkEvents(state: StreamState, chunkJson: string): string throws SyntaxError {
+  const fs = try fields(chunkJson)
+  let out = state.start()
+  const usageRaw = find(fs, "usage")
+  if (usageRaw !== undefined && !isNull(usageRaw)) state.usage = try usageFrom(usageRaw)
+  const choices = try elementsOf(find(fs, "choices"))
+  if (choices.length === 0) return out
+  const ch = try fields(choices[0]!)
+  const delta = try objectOf(find(ch, "delta"))
+  const content = rawStr(delta, "content")
+  if (content !== undefined && content !== "") out += state.textDelta(content)
+  for (const el of try elementsOf(find(delta, "tool_calls"))) {
+    const tc = try fields(el)
+    const key = find(tc, "index") ?? "0"
+    const fn = try objectOf(find(tc, "function"))
+    out += state.callDelta(key, rawStr(tc, "id") ?? "", rawStr(fn, "name") ?? "", rawStr(fn, "arguments") ?? "")
+  }
+  const finish = rawStr(ch, "finish_reason")
+  if (finish !== undefined) {
+    state.finish = finish
+    out += state.closeOpen()
+  }
+  return out
+}
+
+// One chat.completion.chunk as Responses events. A chunk that cannot be read is skipped.
+export function streamChunk(state: StreamState, chunkJson: string): string {
+  if (state.finished) return ""
+  try {
+    return chunkEvents(state, chunkJson)
+  } catch (e) {
+    return ""
+  }
+}
+
+// Closes what is open and emits the final event: response.completed, or
+// response.incomplete when the chat finish_reason is length. Later calls return "".
+export function streamEnd(state: StreamState): string {
+  if (state.finished) return ""
+  state.finished = true
+  const out = state.start() + state.closeOpen()
+  const reason = incompleteReason(state.finish)
+  const type = reason === undefined ? "response.completed" : "response.incomplete"
+  const status = reason === undefined ? "completed" : "incomplete"
+  return out + state.emit(type, `"response":${state.response(status, reason, state.output)}`)
+}
+
+// A complete chat SSE body as a Responses event stream.
+export function toResponseStream(chatSse: string, model: string): string {
+  const state = new StreamState(model)
+  let out = ""
+  for (const line of chatSse.split("\n")) {
+    if (!line.startsWith("data:")) continue
+    const payload = line.slice(5).trim()
+    if (payload === "[DONE]") break
+    out += streamChunk(state, payload)
+  }
+  return out + streamEnd(state)
+}
+
+// ---- tests ----
+
+function eventTypes(sse: string): string[] {
+  const out: string[] = []
+  for (const e of sse.split("\n\n")) {
+    if (e !== "") out.push(e.split("\n")[0]!.slice(7))
+  }
+  return out
+}
+
+// The last event block of a stream, without its trailing blank line.
+function lastEvent(sse: string): string {
+  const es = sse.split("\n\n").filter((e) => e !== "")
+  return es[es.length - 1]!
+}
+
+function sequences(sse: string): int[] throws SyntaxError {
+  const out: int[] = []
+  for (const e of sse.split("\n\n")) {
+    if (e === "") continue
+    const ev = try JSON.parse(e.split("\n")[1]!.slice(6)) as { sequence_number: int }
+    out.push(ev.sequence_number)
+  }
+  return out
+}
+
+function sseChunk(delta: string, finish: string): string {
+  return `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+}
+
+test("string input and instructions", () => {
+  const raw = `{"model":"gpt-4o","instructions":"be brief","input":"hi there","max_output_tokens":100,"temperature":0.5,"stream":true,"user":"u1"}`
+  const out = try toChatRequest(raw, "gpt-4o-mini")
+  expect(out).toBe(`{"model":"gpt-4o-mini","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi there"}],"temperature":0.5,"stream":true,"user":"u1","max_tokens":100}`)
+})
+
+test("message array with developer role and images", () => {
+  const raw = `{"input":[
+    {"role":"developer","content":"Answer in French."},
+    {"type":"message","role":"user","content":[{"type":"input_text","text":"what is this?"},{"type":"input_image","image_url":"https://x/y.png","detail":"low"}]},
+    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"A cat."}]}]}`
+  const out = try toChatRequest(raw, "m")
+  expect(out).toBe(`{"model":"m","messages":[{"role":"system","content":"Answer in French."},{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"https://x/y.png","detail":"low"}}]},{"role":"assistant","content":[{"type":"text","text":"A cat."}]}]}`)
+})
+
+test("function call round trip merges consecutive calls", () => {
+  const raw = `{"input":[
+    {"role":"user","content":"weather in Paris and Rome?"},
+    {"type":"function_call","call_id":"c1","name":"weather","arguments":"{\\"city\\":\\"Paris\\"}"},
+    {"type":"function_call","call_id":"c2","name":"weather","arguments":"{\\"city\\":\\"Rome\\"}"},
+    {"type":"function_call_output","call_id":"c1","output":"18C"},
+    {"type":"function_call_output","call_id":"c2","output":[{"type":"input_text","text":"21C"}]}]}`
+  const out = try toChatRequest(raw, "m")
+  expect(out).toBe(`{"model":"m","messages":[{"role":"user","content":"weather in Paris and Rome?"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Paris\\"}"}},{"id":"c2","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Rome\\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"18C"},{"role":"tool","tool_call_id":"c2","content":"21C"}]}`)
+})
+
+test("tools, tool_choice and json_schema format", () => {
+  const raw = `{"input":"x","tools":[{"type":"function","name":"get_time","description":"Current time","parameters":{"type":"object","properties":{}},"strict":true},{"type":"web_search"}],"tool_choice":{"type":"function","name":"get_time"},"text":{"format":{"type":"json_schema","name":"place","schema":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true}}}`
+  const out = try toChatRequest(raw, "m")
+  expect(out.includes(`"tools":[{"type":"function","function":{"name":"get_time","description":"Current time","parameters":{"type":"object","properties":{}},"strict":true}}]`)).toBe(true)
+  expect(out.includes(`"tool_choice":{"type":"function","function":{"name":"get_time"}}`)).toBe(true)
+  expect(out.endsWith(`"response_format":{"type":"json_schema","json_schema":{"name":"place","schema":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true}}}`)).toBe(true)
+  const json = try toChatRequest(`{"input":"x","tool_choice":"auto","text":{"format":{"type":"json_object"}}}`, "m")
+  expect(json).toBe(`{"model":"m","messages":[{"role":"user","content":"x"}],"tool_choice":"auto","response_format":{"type":"json_object"}}`)
+})
+
+test("chat completion becomes a response", () => {
+  const cc = `{"id":"chatcmpl-1","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hello!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`
+  const r = try toResponse(cc, "gpt-4o", `{"model":"x","instructions":"be brief","temperature":0.2,"input":"hi"}`)
+  expect(r.startsWith(`{"id":"resp_`)).toBe(true)
+  expect(r.includes(`"object":"response","created_at":1700000000,"status":"completed","error":null,"incomplete_details":null,"instructions":"be brief","temperature":0.2,"model":"gpt-4o","output":[{"type":"message","id":"msg_`)).toBe(true)
+  expect(r.includes(`"status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hello!","annotations":[]}]}]`)).toBe(true)
+  expect(r.endsWith(`"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`)).toBe(true)
+  expect(r.includes(`"output_text"`)).toBe(true)
+  expect(r.includes(`"tools"`)).toBe(false)
+})
+
+test("tool calls become function_call items", () => {
+  const cc = `{"id":"c2","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+  const r = try toResponse(cc, "m", `{"input":"x","tools":[{"type":"function","name":"get_time"}]}`)
+  expect(r.includes(`{"type":"function_call","id":"fc_`)).toBe(true)
+  expect(r.includes(`"call_id":"call_9","name":"get_time","arguments":"{}","status":"completed"}]`)).toBe(true)
+  expect(r.includes(`"type":"message"`)).toBe(false)
+  expect(r.includes(`"tools":[{"type":"function","name":"get_time"}]`)).toBe(true)
+  expect(r.includes(`"status":"completed"`)).toBe(true)
+})
+
+test("length finish is incomplete", () => {
+  const cc = `{"id":"c3","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"partial"},"finish_reason":"length"}],"usage":{"prompt_tokens":3,"completion_tokens":9,"total_tokens":12}}`
+  const r = try toResponse(cc, "m", `{"input":"x"}`)
+  expect(r.includes(`"status":"incomplete","error":null,"incomplete_details":{"reason":"max_output_tokens"}`)).toBe(true)
+  expect(r.includes(`"usage":{"input_tokens":3,"output_tokens":9,"total_tokens":12}`)).toBe(true)
+})
+
+test("stream of a text answer", () => {
+  const sse = sseChunk(`{"role":"assistant","content":""}`, "null") +
+    sseChunk(`{"content":"Hel"}`, "null") +
+    sseChunk(`{"content":"lo"}`, "null") +
+    sseChunk(`{}`, `"stop"`) +
+    `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n` +
+    "data: [DONE]\n\n"
+  const out = toResponseStream(sse, "m")
+  expect(eventTypes(out)).toEqual([
+    "response.created", "response.in_progress", "response.output_item.added", "response.content_part.added",
+    "response.output_text.delta", "response.output_text.delta", "response.output_text.done",
+    "response.content_part.done", "response.output_item.done", "response.completed",
+  ])
+  expect(try sequences(out)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+  expect(out.includes(`"item_id":"msg_`)).toBe(true)
+  expect(out.includes(`"output_index":0,"content_index":0,"delta":"Hel"`)).toBe(true)
+  expect(out.includes(`"output_index":0,"content_index":0,"text":"Hello"`)).toBe(true)
+  const last = lastEvent(out)
+  expect(last.includes(`"status":"completed"`)).toBe(true)
+  expect(last.includes(`"output":[{"type":"message","id":"msg_`)).toBe(true)
+  expect(last.includes(`"content":[{"type":"output_text","text":"Hello","annotations":[]}]}]`)).toBe(true)
+  expect(last.endsWith(`"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`)).toBe(true)
+})
+
+test("stream of a tool call", () => {
+  const sse = sseChunk(`{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_time","arguments":""}}]}`, "null") +
+    sseChunk(`{"tool_calls":[{"index":0,"function":{"arguments":"{\\"tz\\":"}}]}`, "null") +
+    sseChunk(`{"tool_calls":[{"index":0,"function":{"arguments":"\\"UTC\\"}"}}]}`, "null") +
+    sseChunk(`{}`, `"tool_calls"`) +
+    "data: [DONE]\n\n"
+  const out = toResponseStream(sse, "m")
+  expect(eventTypes(out)).toEqual([
+    "response.created", "response.in_progress", "response.output_item.added",
+    "response.function_call_arguments.delta", "response.function_call_arguments.delta",
+    "response.function_call_arguments.done", "response.output_item.done", "response.completed",
+  ])
+  expect(try sequences(out)).toEqual([0, 1, 2, 3, 4, 5, 6, 7])
+  expect(out.includes(`"item":{"type":"function_call","id":"fc_`)).toBe(true)
+  expect(out.includes(`"delta":"{\\"tz\\":"`)).toBe(true)
+  expect(out.includes(`"arguments":"{\\"tz\\":\\"UTC\\"}"`)).toBe(true)
+  const last = lastEvent(out)
+  expect(last.includes(`"output":[{"type":"function_call","id":"fc_`)).toBe(true)
+  expect(last.includes(`"call_id":"call_1","name":"get_time","arguments":"{\\"tz\\":\\"UTC\\"}","status":"completed"}]`)).toBe(true)
+})
+
+test("stream with text then a tool call and a length stop", () => {
+  const sse = sseChunk(`{"content":"Checking."}`, "null") +
+    sseChunk(`{"tool_calls":[{"index":0,"id":"c7","type":"function","function":{"name":"f","arguments":"{}"}}]}`, "null") +
+    sseChunk(`{}`, `"length"`)
+  const out = toResponseStream(sse, "m")
+  expect(lastEvent(out).startsWith("event: response.incomplete")).toBe(true)
+  expect(out.includes(`"output_index":1,"item":{"type":"function_call"`)).toBe(true)
+  expect(out.includes(`"output_index":0,"item":{"type":"message"`)).toBe(true)
+  expect(out.includes(`"incomplete_details":{"reason":"max_output_tokens"}`)).toBe(true)
+})

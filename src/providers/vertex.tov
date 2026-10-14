@@ -1,0 +1,216 @@
+// Google Vertex AI: service-account OAuth, regional endpoints, and the Gemini
+// and Claude request paths. The key's service account signs a JWT, which the
+// token endpoint exchanges for a bearer token that lasts an hour.
+import { Field, fields, find, quote, rawStr, rawNum, build, without, setField } from "../json"
+import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
+import { ChatRequest } from "../schemas"
+import { serviceAccountJwt } from "../jwt"
+import * as anthropic from "./anthropic"
+import * as gemini from "./gemini"
+
+const SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+const DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token"
+const ANTHROPIC_VERSION = "vertex-2023-10-16"
+const GRANT_PREFIX = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion="
+
+// The service-account JSON from a key's auth_credentials.
+export type ServiceAccount = { client_email: string, private_key: string, token_uri?: string }
+
+export function parseServiceAccount(text: string | undefined): ServiceAccount throws SyntaxError {
+  if (text === undefined || text === "") throw new SyntaxError("vertex: auth_credentials is required")
+  const sa = try JSON.parse(text) as ServiceAccount
+  if (sa.client_email === "" || sa.private_key === "") throw new SyntaxError("vertex: auth_credentials needs client_email and private_key")
+  return sa
+}
+
+type CachedToken = { token: string, expiresAt: int }
+
+// Bearer tokens by client_email. A token is reused until less than 60 seconds
+// of its life is left.
+export class TokenCache {
+  tokens: Map<string, CachedToken> = new Map()
+
+  // The POST that exchanges a fresh JWT for an access token.
+  tokenRequest(sa: ServiceAccount, nowSeconds: int): Upstream throws SyntaxError {
+    const uri = sa.token_uri ?? DEFAULT_TOKEN_URI
+    const jwt = try serviceAccountJwt(sa.client_email, sa.private_key, SCOPE, uri, nowSeconds)
+    return {
+      url: uri,
+      headers: headers([["content-type", "application/x-www-form-urlencoded"]]),
+      body: GRANT_PREFIX + jwt,
+    }
+  }
+
+  // Keeps the access token from a token endpoint response.
+  store(email: string, responseJson: string, nowSeconds: int): void throws SyntaxError {
+    const fs = try fields(responseJson)
+    const token = rawStr(fs, "access_token")
+    if (token === undefined || token === "") {
+      throw new SyntaxError(`vertex: token request failed: ${rawStr(fs, "error") ?? "no access_token"}`)
+    }
+    const expires = rawNum(fs, "expires_in")
+    const ttl = expires === undefined ? 3600 : Math.floor(expires)
+    this.tokens.set(email, { token: token, expiresAt: nowSeconds + ttl })
+  }
+
+  // The cached token, or undefined when none is stored or it is about to expire.
+  get(email: string, nowSeconds: int): string | undefined {
+    const c = this.tokens.get(email)
+    if (c === undefined) return undefined
+    if (c.expiresAt - nowSeconds <= 60) return undefined
+    return c.token
+  }
+}
+
+// Gemini and Claude share the regional host; "global" has no region prefix.
+function host(region: string): string {
+  return region === "global" ? "aiplatform.googleapis.com" : `${region}-aiplatform.googleapis.com`
+}
+
+function isClaude(model: string): bool {
+  return model.startsWith("claude")
+}
+
+// The model's URL under a publisher ("google" or "anthropic") and method.
+function vertexUrl(t: Target, publisher: string, method: string): string throws SyntaxError {
+  const vk = t.key.vertex_key_config
+  if (vk === undefined) throw new SyntaxError("vertex: key has no vertex_key_config")
+  const b = t.cfg.network_config?.base_url
+  const origin = b === undefined || b === "" ? `https://${host(vk.region)}` : trimSlash(b)
+  return `${origin}/v1/projects/${vk.project_id}/locations/${vk.region}/publishers/${publisher}/models/${t.model}:${method}`
+}
+
+// The request for a chat completion. Claude models take the Anthropic Messages
+// body, without model, and the Vertex version; other models take Gemini's body.
+export function chatRequest(t: Target, req: ChatRequest, body: Field[], accessToken: string): Upstream throws SyntaxError {
+  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + accessToken]])
+  addExtraHeaders(&h, t.cfg)
+  if (isClaude(t.model)) {
+    const raw = try anthropic.messagesBody(req, body, t.model, false, false)
+    let fs = without(try fields(raw), ["model"])
+    setField(&fs, "anthropic_version", quote(ANTHROPIC_VERSION))
+    return { url: try vertexUrl(t, "anthropic", "rawPredict"), headers: h, body: build(fs) }
+  }
+  return { url: try vertexUrl(t, "google", "generateContent"), headers: h, body: try gemini.generateBody(req, body) }
+}
+
+// The OpenAI-shaped answer for a Vertex response, by the model's family.
+export function chatResponse(model: string, text: string, requestedModel: string): Translated throws SyntaxError {
+  if (isClaude(model)) return try anthropic.chatResponse(text, requestedModel)
+  return try gemini.chatResponse(text, requestedModel)
+}
+
+// ---- tests ----
+// The key below is a throwaway test key generated for these tests. It guards nothing.
+
+const TEST_PKCS8 = `-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDj9J2gXuzZMwiv
+9cYgjR8yatcwrNAurcSExxAHJnAl6yCKzB2UxZ5M4faf+KbN7cOTguxG1puIS24t
+F4XpIPdhV84E59/73dKPEpQmy35eB0u9NBHKJz6ZlhE/glzC4uQGCMIvY8YXd9kK
+HUFWSp6adBUZKf+eXQTJpAy333HallSwrqCFCqopFrUC1TM1CBAxWxgpx/GBz+G2
+8PgESS3G0fhugSAp2qtlpYOf/AvHjfhmJKnG7hI0BjFFXT+av4QB12VSA+TGuacQ
+yiXJqnvf6gtRYXlj5QDZUxq1k8u56uHK8iLgYoFac44MFnKeBwmaYOKevoCF4upD
+6Bed9Rx3AgMBAAECggEANt8ZmFJxQeE6fJy1Of2uXkUAkqtum2XhsbJ3Jbl3cnE0
+TqTOlBKzxb74zk4c3OIYW2g+9thO7RJ3LWyFo/X3BlwL7/te27JsLltjBSmju/+W
+mC8x/w7OT0sj0L1RFepmyBsQnzatptWHDZu4MAzbO8OolnuZF+Y9MkqGczZaoips
+XQQRebUSgrB3zC4oisDI8lhzomRrq82D2DbQcXdrRZkzhxWoudbKZwofnhNWkzQ+
+MMieMDl0crk5WirMqzxn/9BoPLfuy+1HDC6S8aU/hFsQl1FHwlobfmYWfv3b8FbS
+ZlkNbzRge+VlGq0MJtpi7wREMWLpJ3U37XOGzMDNUQKBgQD1bI/Hl9+K1TBziGxa
+XmKGE/pjRNw5aXbrSJ+Gf2WcbgRkRLYyOFM22m9bzxxyxhOCGU83iU+sOwzyiuAv
+BkPvJ5CePCYSW5xuUU2JYzp7scm3lTdaC0/HL+SuE9BFkmWHiw1+Qh2W0MvrLvgA
+g//OKXrKY1mtK8oIM99wgna7kQKBgQDtx1jL7oO67DiWUn+N1/bBgYEY8MQfXVH/
+oNk+ClC2HEYwZhumKxziUZxlRFehqZ3Q27zrJc91wEeEoYtKfv79UJorxKLRW5dV
+4q7Ctc3Vr6/WayZdTzByFd8gnKmZ9xXKl1Y7eY6eifs5nBmnOYJlT16AMTent8Hl
+d7rBeQ2DhwKBgQDZXEPe9wBR2kymFi44vx0tOGZrIuKUqnZbHZ/Do/MfX0TedQiU
+Y9Q3YbB8tGqysAE5GSdSvXblyArIiPzSSQ9DsVvg+M6TNbXO8ozkYBC82pIX2L0E
+L76BYEZ9cijkZSssp5fUucOw/c2MxrV4529YbN5Gf0U+HOk66I48/B8iMQKBgQDZ
+jxhUH3wwP4rXH8zNv9hq3U99vm30NLKeLlIXTeDjf6NJDWQm+jOHcBylG48Cv+tB
++ow0q3fSyYemdxi3pNMye9lUSqqe3CrvzmUQisA20HUWvxtvLNGq0RBDCpSz5zvt
+DeM8r9Aqhx1ybL2cICaLA7/3kxDVSHEEwDQEafpPaQKBgGCywYXgnaDnBvD5m75q
+cWt/9/+cPCoc9tkxp1qhNrwQbrTKuCsbaoq29dgClLqvoXv7g/jGMFsN3k8OMTbY
+igljKrc6DaVhqHLClkHqT4YKtkbcD1PHdJxoTLpDjg/pcfmE1Jh7xAwZyK5WeDHb
+E4OKLanX+blm6HOEeyMmCSU8
+-----END PRIVATE KEY-----`
+
+function target(model: string, region: string): Target {
+  return { provider: "vertex", kind: "vertex", model: model, key: { vertex_key_config: { project_id: "my-proj", region: region } }, cfg: {} }
+}
+
+test("regional and global Vertex URLs", () => {
+  expect(try vertexUrl(target("gemini-2.5-flash", "us-central1"), "google", "generateContent")).toBe(
+    "https://us-central1-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent")
+  expect(try vertexUrl(target("gemini-2.5-flash", "global"), "google", "generateContent")).toBe(
+    "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models/gemini-2.5-flash:generateContent")
+  expect(try vertexUrl(target("claude-sonnet-4@20250514", "us-east5"), "anthropic", "rawPredict")).toBe(
+    "https://us-east5-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-east5/publishers/anthropic/models/claude-sonnet-4@20250514:rawPredict")
+})
+
+test("token request posts a signed JWT", () => {
+  const sa: ServiceAccount = { client_email: "test-sa@example.iam.gserviceaccount.com", private_key: TEST_PKCS8 }
+  const up = try new TokenCache().tokenRequest(sa, 1700000000)
+  expect(up.url).toBe("https://oauth2.googleapis.com/token")
+  expect(up.headers.get("content-type")).toBe("application/x-www-form-urlencoded")
+  expect(up.body.startsWith(GRANT_PREFIX)).toBe(true)
+  const jwt = up.body.slice(GRANT_PREFIX.byteLength)
+  expect(jwt.startsWith("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.")).toBe(true)
+  expect(jwt.split(".").length).toBe(3)
+  const custom = try new TokenCache().tokenRequest({ client_email: "a@b", private_key: TEST_PKCS8, token_uri: "https://sts.test/token" }, 1)
+  expect(custom.url).toBe("https://sts.test/token")
+})
+
+test("token cache reuses a token until 60 seconds are left", () => {
+  const c = new TokenCache()
+  try c.store("a@x", `{"access_token":"tok1","expires_in":3600,"token_type":"Bearer"}`, 1000)
+  expect(c.get("a@x", 1000)).toBe("tok1")
+  expect(c.get("a@x", 1000 + 3539)).toBe("tok1")
+  expect(c.get("a@x", 1000 + 3540)).toBe(undefined)
+  expect(c.get("b@x", 1000)).toBe(undefined)
+  let threw = false
+  try {
+    c.store("a@x", `{"error":"invalid_grant"}`, 0)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("Anthropic body has the Vertex version and no model", () => {
+  const raw = `{"model":"claude-sonnet-4@20250514","messages":[{"role":"user","content":"hi"}],"max_tokens":64}`
+  const up = try chatRequest(target("claude-sonnet-4@20250514", "us-east5"), try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  expect(up.url).toBe("https://us-east5-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-east5/publishers/anthropic/models/claude-sonnet-4@20250514:rawPredict")
+  expect(up.body).toBe(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"max_tokens":64,"anthropic_version":"vertex-2023-10-16"}`)
+  expect(up.headers.get("authorization")).toBe("Bearer tok")
+})
+
+test("Gemini body goes to generateContent", () => {
+  const raw = `{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]}`
+  const up = try chatRequest(target("gemini-2.5-flash", "global"), try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  expect(up.url).toBe("https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models/gemini-2.5-flash:generateContent")
+  expect(up.body).toBe(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+})
+
+test("responses translate by model family", () => {
+  const a = try chatResponse("claude-sonnet-4", `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}`, "vertex/claude-sonnet-4")
+  expect(a.body.includes(`"content":"Hi"`)).toBe(true)
+  const g = try chatResponse("gemini-2.5-flash", `{"candidates":[{"content":{"role":"model","parts":[{"text":"Yo"}]},"finishReason":"STOP"}]}`, "vertex/gemini-2.5-flash")
+  expect(g.body.includes(`"content":"Yo"`)).toBe(true)
+})
+
+test("service account and key errors", () => {
+  const sa = try parseServiceAccount(`{"client_email":"a@b","private_key":"k","token_uri":"https://t"}`)
+  expect(sa.token_uri).toBe("https://t")
+  let threw = false
+  try {
+    parseServiceAccount(undefined)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    chatRequest({ provider: "vertex", kind: "vertex", model: "gemini-2.5-flash", key: {}, cfg: {} }, { model: "x", messages: [] }, [], "tok")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

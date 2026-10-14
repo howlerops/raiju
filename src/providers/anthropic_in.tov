@@ -1,0 +1,488 @@
+// Anthropic Messages API in front of the gateway: an incoming Messages request
+// becomes an OpenAI chat request, and the OpenAI answer becomes a Message again.
+// Tool schemas and tool input are arbitrary JSON, so they stay raw text.
+import { Field, fields, elements, find, quote, rawStr, rawNum, decodeString } from "../json"
+import { newId } from "../schemas"
+
+// The text of a content value: a JSON string, or an array of text blocks.
+function contentText(raw: string | undefined): string throws SyntaxError {
+  if (raw === undefined || raw === "null") return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (!raw.startsWith("[")) return ""
+  const parts: string[] = []
+  for (const el of try elements(raw)) {
+    const b = try fields(el)
+    if (rawStr(b, "type") === "text") parts.push(rawStr(b, "text") ?? "")
+  }
+  return parts.join("")
+}
+
+// A field's raw value, or undefined when it is absent or null.
+function present(fs: Field[], key: string): string | undefined {
+  const r = find(fs, key)
+  if (r === undefined || r === "null") return undefined
+  return r
+}
+
+// Anthropic image source as an OpenAI image_url part.
+function imagePart(src: Field[]): string {
+  if (rawStr(src, "type") === "base64") {
+    const url = `data:${rawStr(src, "media_type") ?? ""};base64,${rawStr(src, "data") ?? ""}`
+    return `{"type":"image_url","image_url":{"url":${quote(url)}}}`
+  }
+  return `{"type":"image_url","image_url":{"url":${quote(rawStr(src, "url") ?? "")}}}`
+}
+
+// A tool_use block as an OpenAI tool call. Arguments are a JSON string, so the
+// input object is quoted as it is.
+function toolCall(b: Field[]): string {
+  const input = find(b, "input") ?? "{}"
+  return `{"id":${quote(rawStr(b, "id") ?? "")},"type":"function","function":{"name":${quote(rawStr(b, "name") ?? "")},"arguments":${quote(input)}}}`
+}
+
+// One Anthropic message becomes OpenAI messages. Tool results come first, each
+// as its own tool message, and the turn's remaining content follows them.
+function convertMessage(role: string, content: string, inout out: string[]): void throws SyntaxError {
+  if (content.startsWith("\"")) {
+    out.push(`{"role":${quote(role)},"content":${content}}`)
+    return
+  }
+  const parts: string[] = []
+  const calls: string[] = []
+  const results: string[] = []
+  for (const el of try elements(content)) {
+    const b = try fields(el)
+    const type = rawStr(b, "type")
+    if (type === "text") parts.push(`{"type":"text","text":${quote(rawStr(b, "text") ?? "")}}`)
+    else if (type === "image") parts.push(imagePart(try fields(find(b, "source") ?? "{}")))
+    else if (type === "tool_use" && role === "assistant") calls.push(toolCall(b))
+    else if (type === "tool_result") {
+      const text = try contentText(find(b, "content"))
+      results.push(`{"role":"tool","tool_call_id":${quote(rawStr(b, "tool_use_id") ?? "")},"content":${quote(text)}}`)
+    }
+    // thinking and redacted_thinking blocks are dropped
+  }
+  for (const r of results) out.push(r)
+  if (calls.length > 0) {
+    const text = parts.length > 0 ? `[${parts.join(",")}]` : "null"
+    out.push(`{"role":"assistant","content":${text},"tool_calls":[${calls.join(",")}]}`)
+  } else if (parts.length > 0) {
+    out.push(`{"role":${quote(role)},"content":[${parts.join(",")}]}`)
+  }
+}
+
+function toolsJson(raw: string): string throws SyntaxError {
+  const out: string[] = []
+  for (const el of try elements(raw)) {
+    const t = try fields(el)
+    const desc = present(t, "description")
+    const schema = present(t, "input_schema") ?? `{"type":"object","properties":{}}`
+    const descPart = desc === undefined ? "" : `,"description":${desc}`
+    out.push(`{"type":"function","function":{"name":${quote(rawStr(t, "name") ?? "")}${descPart},"parameters":${schema}}}`)
+  }
+  return "[" + out.join(",") + "]"
+}
+
+function toolChoice(raw: string): string | undefined throws SyntaxError {
+  const fs = try fields(raw)
+  const type = rawStr(fs, "type")
+  if (type === "auto") return `"auto"`
+  if (type === "any") return `"required"`
+  if (type === "none") return `"none"`
+  if (type === "tool") return `{"type":"function","function":{"name":${quote(rawStr(fs, "name") ?? "")}}}`
+  return undefined
+}
+
+export function toChatRequest(anthropicBody: string, model: string): string throws SyntaxError {
+  const fs = try fields(anthropicBody)
+  let msgs: string[] = []
+  const sys = try contentText(present(fs, "system"))
+  if (sys !== "") msgs.push(`{"role":"system","content":${quote(sys)}}`)
+  const list = present(fs, "messages")
+  if (list !== undefined) {
+    for (const el of try elements(list)) {
+      const m = try fields(el)
+      const content = present(m, "content")
+      if (content !== undefined) try convertMessage(rawStr(m, "role") ?? "user", content, &msgs)
+    }
+  }
+  const parts: string[] = [`"model":${quote(model)}`, `"messages":[${msgs.join(",")}]`]
+  const maxTokens = present(fs, "max_tokens")
+  if (maxTokens !== undefined) parts.push(`"max_tokens":${maxTokens}`)
+  const temperature = present(fs, "temperature")
+  if (temperature !== undefined) parts.push(`"temperature":${temperature}`)
+  const topP = present(fs, "top_p")
+  if (topP !== undefined) parts.push(`"top_p":${topP}`)
+  const stop = present(fs, "stop_sequences")
+  if (stop !== undefined) parts.push(`"stop":${stop}`)
+  const stream = present(fs, "stream")
+  if (stream !== undefined) parts.push(`"stream":${stream}`)
+  if (stream === "true") parts.push(`"stream_options":{"include_usage":true}`)
+  const tools = present(fs, "tools")
+  if (tools !== undefined) parts.push(`"tools":${try toolsJson(tools)}`)
+  const choice = present(fs, "tool_choice")
+  if (choice !== undefined) {
+    const c = try toolChoice(choice)
+    if (c !== undefined) parts.push(`"tool_choice":${c}`)
+  }
+  const md = present(fs, "metadata")
+  if (md !== undefined) {
+    const mf = try fields(md)
+    const user = rawStr(mf, "user_id")
+    if (user !== undefined) parts.push(`"user":${quote(user)}`)
+  }
+  return "{" + parts.join(",") + "}"
+}
+
+// OpenAI finish reasons as Messages stop reasons.
+function stopReason(finish: string | undefined): string {
+  if (finish === "length") return "max_tokens"
+  if (finish === "tool_calls") return "tool_use"
+  return "end_turn"
+}
+
+// Message ids carry the msg_ prefix.
+function messageId(id: string): string {
+  if (id === "") return newId("msg_")
+  if (id.startsWith("msg_")) return id
+  return "msg_" + id
+}
+
+// Tool arguments are a JSON string; the input is that object, or "{}" when the
+// string does not hold a valid one.
+function inputObject(args: string): string {
+  try {
+    const fs = fields(args)
+    const v = JSON.parse(args) as {}
+    return args
+  } catch (e) {
+    return "{}"
+  }
+}
+
+export function toMessage(openaiCompletion: string, model: string): string throws SyntaxError {
+  const fs = try fields(openaiCompletion)
+  let choice: Field[] = []
+  const choicesRaw = present(fs, "choices")
+  if (choicesRaw !== undefined) {
+    const els = try elements(choicesRaw)
+    const first = els[0]
+    if (first !== undefined) choice = try fields(first)
+  }
+  const msgRaw = present(choice, "message")
+  const msg: Field[] = msgRaw === undefined ? [] : try fields(msgRaw)
+  const blocks: string[] = []
+  const text = try contentText(present(msg, "content"))
+  if (text !== "") blocks.push(`{"type":"text","text":${quote(text)}}`)
+  const calls = present(msg, "tool_calls")
+  if (calls !== undefined) {
+    for (const el of try elements(calls)) {
+      const tc = try fields(el)
+      const fn = try fields(find(tc, "function") ?? "{}")
+      const input = inputObject(rawStr(fn, "arguments") ?? "")
+      blocks.push(`{"type":"tool_use","id":${quote(rawStr(tc, "id") ?? "")},"name":${quote(rawStr(fn, "name") ?? "")},"input":${input}}`)
+    }
+  }
+  const usageRaw = present(fs, "usage")
+  const usage: Field[] = usageRaw === undefined ? [] : try fields(usageRaw)
+  const pt = find(usage, "prompt_tokens") ?? "0"
+  const ct = find(usage, "completion_tokens") ?? "0"
+  const stop = stopReason(rawStr(choice, "finish_reason"))
+  const id = messageId(rawStr(fs, "id") ?? "")
+  return `{"id":${quote(id)},"type":"message","role":"assistant","model":${quote(model)},"content":[${blocks.join(",")}],"stop_reason":${quote(stop)},"stop_sequence":null,"usage":{"input_tokens":${pt},"output_tokens":${ct}}}`
+}
+
+// Converts chat.completion.chunk events one at a time into Messages events.
+// Content blocks never interleave: a text block closes before a tool block
+// opens, and a tool call's block opens with its first fragment.
+export class StreamState {
+  private started = false
+  private done = false
+  private next = 0                // index of the next content block
+  private block = -1              // index of the open content block, or -1
+  private kind = ""               // "text" or "tool" while a block is open
+  private tool = -1               // OpenAI tool_call index of the open tool block
+  private seen: int[] = []        // tool calls already opened; a closed block cannot reopen
+  private finish: string | undefined = undefined
+  private inTokens = "0"
+  private outTokens = "0"
+
+  constructor(readonly model: string) {}
+
+  // Events for one chunk JSON. "[DONE]" ends the message.
+  push(chunk: string): string throws SyntaxError {
+    if (this.done) return ""
+    if (chunk === "[DONE]") return this.end()
+    const fs = try fields(chunk)
+    let out = ""
+    if (!this.started) out += this.begin(rawStr(fs, "id") ?? "")
+    const usageRaw = present(fs, "usage")
+    if (usageRaw !== undefined) {
+      const uf = try fields(usageRaw)
+      this.inTokens = find(uf, "prompt_tokens") ?? "0"
+      this.outTokens = find(uf, "completion_tokens") ?? "0"
+    }
+    const choicesRaw = present(fs, "choices")
+    if (choicesRaw !== undefined) {
+      const els = try elements(choicesRaw)
+      const first = els[0]
+      if (first !== undefined) out += try this.choice(try fields(first))
+    }
+    return out
+  }
+
+  // Closes the open block and ends the message. Safe to call more than once.
+  end(): string {
+    if (this.done) return ""
+    this.done = true
+    let out = ""
+    if (!this.started) out += this.begin("")
+    out += this.closeBlock()
+    const stop = stopReason(this.finish)
+    out += `event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":${quote(stop)},"stop_sequence":null},"usage":{"input_tokens":${this.inTokens},"output_tokens":${this.outTokens}}}\n\n`
+    out += `event: message_stop\ndata: {"type":"message_stop"}\n\n`
+    return out
+  }
+
+  private begin(rawId: string): string {
+    this.started = true
+    const msg = `{"id":${quote(messageId(rawId))},"type":"message","role":"assistant","model":${quote(this.model)},"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`
+    return `event: message_start\ndata: {"type":"message_start","message":${msg}}\n\n`
+  }
+
+  private choice(c: Field[]): string throws SyntaxError {
+    let out = ""
+    const deltaRaw = present(c, "delta")
+    if (deltaRaw !== undefined) {
+      const d = try fields(deltaRaw)
+      const text = rawStr(d, "content")
+      if (text !== undefined && text !== "") out += this.addText(text)
+      const calls = present(d, "tool_calls")
+      if (calls !== undefined) {
+        for (const el of try elements(calls)) {
+          const tc = try fields(el)
+          const fn = try fields(find(tc, "function") ?? "{}")
+          const index = Math.floor(rawNum(tc, "index") ?? 0)
+          out += this.addToolCall(index, rawStr(tc, "id") ?? "", rawStr(fn, "name") ?? "", rawStr(fn, "arguments") ?? "")
+        }
+      }
+    }
+    const finish = rawStr(c, "finish_reason")
+    if (finish !== undefined) this.finish = finish
+    return out
+  }
+
+  private addText(s: string): string {
+    let out = ""
+    if (this.kind !== "text") {
+      out += this.closeBlock()
+      out += this.openBlock("text", -1, `{"type":"text","text":""}`)
+    }
+    return out + this.delta(`{"type":"text_delta","text":${quote(s)}}`)
+  }
+
+  private addToolCall(index: int, id: string, name: string, args: string): string {
+    let out = ""
+    if (this.kind !== "tool" || this.tool !== index) {
+      // A call seen again after its block closed has nowhere to go; it is dropped.
+      if (this.seen.includes(index)) return ""
+      out += this.closeBlock()
+      this.seen.push(index)
+      out += this.openBlock("tool", index, `{"type":"tool_use","id":${quote(id)},"name":${quote(name)},"input":{}}`)
+    }
+    if (args !== "") out += this.delta(`{"type":"input_json_delta","partial_json":${quote(args)}}`)
+    return out
+  }
+
+  private openBlock(kind: string, tool: int, content: string): string {
+    this.block = this.next
+    this.next += 1
+    this.kind = kind
+    this.tool = tool
+    return `event: content_block_start\ndata: {"type":"content_block_start","index":${this.block},"content_block":${content}}\n\n`
+  }
+
+  private delta(d: string): string {
+    return `event: content_block_delta\ndata: {"type":"content_block_delta","index":${this.block},"delta":${d}}\n\n`
+  }
+
+  private closeBlock(): string {
+    if (this.block < 0) return ""
+    const out = `event: content_block_stop\ndata: {"type":"content_block_stop","index":${this.block}}\n\n`
+    this.block = -1
+    this.kind = ""
+    this.tool = -1
+    return out
+  }
+}
+
+export function streamChunk(state: StreamState, openaiChunkJson: string): string throws SyntaxError {
+  return try state.push(openaiChunkJson)
+}
+
+// A complete OpenAI SSE body as Messages events.
+export function toMessageStream(openaiSse: string, model: string): string {
+  const state = new StreamState(model)
+  let out = ""
+  for (const line of openaiSse.split("\n")) {
+    if (!line.startsWith("data:")) continue
+    const payload = line.slice(5).trim()
+    if (payload === "") continue
+    try {
+      out += try state.push(payload)
+    } catch (e) {
+      // a malformed chunk is skipped
+    }
+  }
+  return out + state.end()
+}
+
+function eventNames(sse: string): string[] {
+  return sse.split("\n").filter((l) => l.startsWith("event: ")).map((l) => l.slice(7))
+}
+
+test("system as a string or as text blocks", () => {
+  const a = try toChatRequest(`{"model":"x","system":"be brief","messages":[{"role":"user","content":"hi"}]}`, "gpt-4o")
+  expect(a).toBe(`{"model":"gpt-4o","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}`)
+  const b = try toChatRequest(`{"system":[{"type":"text","text":"one"},{"type":"text","text":"two"}],"messages":[]}`, "m")
+  expect(b).toBe(`{"model":"m","messages":[{"role":"system","content":"onetwo"}]}`)
+  const c = try toChatRequest(`{"messages":[{"role":"user","content":"hi"}]}`, "m")
+  expect(c.includes("system")).toBe(false)
+})
+
+test("image blocks become image_url parts", () => {
+  const raw = `{"messages":[{"role":"user","content":[
+    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
+    {"type":"image","source":{"type":"url","url":"https://example.com/a.jpg"}},
+    {"type":"text","text":"what is this"}]}]}`
+  const out = try toChatRequest(raw, "m")
+  expect(out.includes(`{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}`)).toBe(true)
+  expect(out.includes(`{"type":"image_url","image_url":{"url":"https://example.com/a.jpg"}}`)).toBe(true)
+  expect(out.includes(`{"type":"text","text":"what is this"}`)).toBe(true)
+})
+
+test("multi-turn tool conversation keeps message order and ids", () => {
+  const raw = `{"model":"c","messages":[
+    {"role":"user","content":"weather?"},
+    {"role":"assistant","content":[
+      {"type":"thinking","thinking":"hmm","signature":"s"},
+      {"type":"text","text":"Checking."},
+      {"type":"tool_use","id":"tu1","name":"weather","input":{"city":"Paris","units":"c"}},
+      {"type":"tool_use","id":"tu2","name":"time","input":{}}]},
+    {"role":"user","content":[
+      {"type":"text","text":"also, be quick"},
+      {"type":"tool_result","tool_use_id":"tu1","content":"18 C"},
+      {"type":"tool_result","tool_use_id":"tu2","content":[{"type":"text","text":"12:00"},{"type":"text","text":" UTC"}]}]}]}`
+  const out = try toChatRequest(raw, "gpt-4o")
+  const expected = `{"model":"gpt-4o","messages":[` +
+    `{"role":"user","content":"weather?"},` +
+    `{"role":"assistant","content":[{"type":"text","text":"Checking."}],"tool_calls":[` +
+    `{"id":"tu1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Paris\\",\\"units\\":\\"c\\"}"}},` +
+    `{"id":"tu2","type":"function","function":{"name":"time","arguments":"{}"}}]},` +
+    `{"role":"tool","tool_call_id":"tu1","content":"18 C"},` +
+    `{"role":"tool","tool_call_id":"tu2","content":"12:00 UTC"},` +
+    `{"role":"user","content":[{"type":"text","text":"also, be quick"}]}]}`
+  expect(out).toBe(expected)
+})
+
+test("tools, tool_choice, stop, stream and metadata", () => {
+  const raw = `{"max_tokens":100,"temperature":0.5,"top_p":0.9,"stop_sequences":["END"],"stream":true,
+    "metadata":{"user_id":"u-7"},
+    "tools":[{"name":"look","description":"look up","input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}],
+    "tool_choice":{"type":"tool","name":"look"},
+    "messages":[{"role":"user","content":"x"}]}`
+  const out = try toChatRequest(raw, "m")
+  expect(out.includes(`"max_tokens":100,"temperature":0.5,"top_p":0.9,"stop":["END"],"stream":true,"stream_options":{"include_usage":true}`)).toBe(true)
+  expect(out.includes(`"tools":[{"type":"function","function":{"name":"look","description":"look up","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]`)).toBe(true)
+  expect(out.includes(`"tool_choice":{"type":"function","function":{"name":"look"}}`)).toBe(true)
+  expect(out.endsWith(`"user":"u-7"}`)).toBe(true)
+  const choices = [["auto", `"auto"`], ["any", `"required"`], ["none", `"none"`]]
+  for (const c of choices) {
+    const o = try toChatRequest(`{"tool_choice":{"type":"${c[0]}"},"messages":[]}`, "m")
+    expect(o.includes(`"tool_choice":${c[1]}`)).toBe(true)
+  }
+  expect(try toChatRequest(`{"messages":[],"stream":false}`, "m")).toBe(`{"model":"m","messages":[],"stream":false}`)
+})
+
+test("toMessage converts text and tool calls", () => {
+  const text = try toMessage(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`, "claude-x")
+  expect(text).toBe(`{"id":"msg_chatcmpl-1","type":"message","role":"assistant","model":"claude-x","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":11,"output_tokens":2}}`)
+  const tools = try toMessage(`{"id":"msg_9","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"look","arguments":"{\\"q\\":\\"cat\\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`, "m")
+  expect(tools.includes(`"id":"msg_9"`)).toBe(true)
+  expect(tools.includes(`"content":[{"type":"tool_use","id":"c1","name":"look","input":{"q":"cat"}}]`)).toBe(true)
+  expect(tools.includes(`"stop_reason":"tool_use"`)).toBe(true)
+})
+
+test("toMessage falls back to an empty input on invalid arguments", () => {
+  const bad = try toMessage(`{"id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":"{not json"}},{"id":"b","type":"function","function":{"name":"g","arguments":"{\\"x\\":1} trailing"}}]},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`, "m")
+  expect(bad.includes(`{"type":"tool_use","id":"a","name":"f","input":{}}`)).toBe(true)
+  expect(bad.includes(`{"type":"tool_use","id":"b","name":"g","input":{}}`)).toBe(true)
+  expect(bad.includes(`"text"`)).toBe(false)
+  expect(bad.includes(`"stop_reason":"max_tokens"`)).toBe(true)
+})
+
+test("stream of text chunks", () => {
+  const sse = `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}
+
+data: [DONE]
+
+`
+  const out = toMessageStream(sse, "claude-x")
+  expect(eventNames(out)).toEqual(["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_delta", "message_stop"])
+  expect(out.includes(`{"type":"message_start","message":{"id":"msg_c1","type":"message","role":"assistant","model":"claude-x","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`)).toBe(true)
+  expect(out.includes(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)).toBe(true)
+  expect(out.includes(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}`)).toBe(true)
+  expect(out.includes(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}`)).toBe(true)
+  expect(out.includes(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":5,"output_tokens":2}}`)).toBe(true)
+})
+
+test("stream of tool-call chunks closes text before tools open", () => {
+  const sse = `data: {"id":"c2","choices":[{"index":0,"delta":{"content":"Let me look."},"finish_reason":null}]}
+
+data: {"id":"c2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"look","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"c2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"q\\""}}]},"finish_reason":null}]}
+
+data: {"id":"c2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\"cat\\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"c2","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"t2","type":"function","function":{"name":"time","arguments":"{}"}}]},"finish_reason":null}]}
+
+data: {"id":"c2","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"c2","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":9,"total_tokens":17}}
+
+data: [DONE]
+
+`
+  const out = toMessageStream(sse, "m")
+  expect(eventNames(out)).toEqual([
+    "message_start",
+    "content_block_start", "content_block_delta", "content_block_stop",
+    "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop",
+    "content_block_start", "content_block_delta", "content_block_stop",
+    "message_delta", "message_stop",
+  ])
+  const lines = out.split("\n").filter((l) => l.startsWith("data: {\"type\":\"content_block"))
+  expect(lines[3]).toBe(`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"look","input":{}}}`)
+  expect(lines[4]).toBe(`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\""}}`)
+  expect(lines[5]).toBe(`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":":\\"cat\\"}"}}`)
+  expect(lines[7]).toBe(`data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t2","name":"time","input":{}}}`)
+  expect(out.includes(`"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":8,"output_tokens":9}`)).toBe(true)
+})
+
+test("streamChunk converts chunk by chunk and ends on DONE", () => {
+  const state = new StreamState("m")
+  const first = try streamChunk(state, `{"id":"abc","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}`)
+  expect(eventNames(first)).toEqual(["message_start", "content_block_start", "content_block_delta"])
+  const last = try streamChunk(state, "[DONE]")
+  expect(eventNames(last)).toEqual(["content_block_stop", "message_delta", "message_stop"])
+  expect(try streamChunk(state, "[DONE]")).toBe("")
+})
