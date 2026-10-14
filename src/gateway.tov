@@ -1,8 +1,8 @@
 // The request engine: governance, cache, the attempt loop (retries, key
 // rotation, fallbacks), translation, accounting.
-import { Config, ProviderConfig, ComplexitySettings, BedrockKeyConfig, providerOf } from "./config"
+import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, providerOf } from "./config"
 import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
-import { ChatRequest, errorJson, newId, Hdrs, snapshot } from "./schemas"
+import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
 import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI } from "./streams"
 import { CohereToOpenAI } from "./streams_cohere"
 import { CohereStream } from "./cohere_in"
@@ -17,9 +17,9 @@ import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
 import { GuardrailProvider, appliesTo, checkRequest, parseVerdict, extractText, completionText } from "./guardrail_providers"
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
-import { ModelRef, parseModel, parseModelVia, target, classify, backoffMs, maxRetries, timeoutMs, healthId } from "./router"
+import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId } from "./router"
 import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
-import { Governance, Grant, Denial } from "./governance"
+import { Governance, Grant, Denial, directKeyFrom } from "./governance"
 import { Pricing, PriceRow } from "./pricing"
 import { ResponseCache, cacheKey, parseTtl } from "./cache"
 import { completionToSse } from "./sse"
@@ -43,7 +43,7 @@ import * as cloudAuth from "./cloud_auth"
 export type Build = (t: Target) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool }
 
 // Where a streamed answer goes, when the server can stream (the http1 front end).
 export class StreamSink {
@@ -398,6 +398,57 @@ function forwardedHeaders(h: Hdrs): Map<string, string> {
   return m
 }
 
+// Bifrost's send_back_raw_request / send_back_raw_response: the provider's setting, which the
+// x-bf-send-back-raw-request / -response header overrides when client.allow_per_request_raw_override is on.
+function sendBackRaw(h: Hdrs, cfg: Config, p: ProviderConfig, which: string): bool {
+  const hv = (h.get("x-bf-send-back-raw-" + which) ?? "").trim().toLowerCase()
+  if (cfg.client?.allow_per_request_raw_override === true) {
+    if (hv === "true" || hv === "1" || hv === "t") return true
+    if (hv === "false" || hv === "0" || hv === "f") return false
+  }
+  return which === "request" ? p.send_back_raw_request === true : p.send_back_raw_response === true
+}
+
+// A captured body as a JSON value, the way Bifrost embeds raw bytes: the body itself when it is JSON, else a JSON string.
+function rawJson(s: string): string {
+  return jsonOk(s) ? s.trim() : quote(s)
+}
+
+// A raw body is a JSON object or array (the scanners in json.tov accept only those).
+function jsonOk(s: string): bool {
+  try {
+    try fields(s)
+    return true
+  } catch (e) {
+    try {
+      try elements(s)
+      return true
+    } catch (e2) {
+      return false
+    }
+  }
+}
+
+// Adds Bifrost's extra_fields { raw_request, raw_response } to a JSON object body; other bodies pass unchanged.
+function withRawFields(body: string, rawReq: string | undefined, rawResp: string | undefined): string {
+  if (rawReq === undefined && rawResp === undefined) return body
+  const t = body.trim()
+  if (!t.startsWith("{") || !t.endsWith("}")) return body
+  const parts: string[] = []
+  if (rawReq !== undefined) parts.push(`"raw_request":${rawJson(rawReq)}`)
+  if (rawResp !== undefined) parts.push(`"raw_response":${rawJson(rawResp)}`)
+  const inner = t.slice(0, t.byteLength - 1).trim()
+  const sep = inner === "{" ? "" : ","
+  return `${inner}${sep}"extra_fields":{${parts.join(",")}}}`
+}
+
+// The caller's own key (x-bf-direct-key) as the target of the primary provider: no pool, no health, no rotation.
+function directTarget(cfg: Config, ref: ModelRef, key: string): { t: Target, keyIndex: int } {
+  const p: ProviderConfig = providerOf(cfg, ref.provider) ?? {}
+  const k: KeyConfig = { id: "header-provided", name: "header-provided", value: key, weight: 1.0 }
+  return { t: { provider: ref.provider, kind: kindOf(ref.provider, p), model: ref.model, key: k, cfg: p }, keyIndex: -1 }
+}
+
 function fallbackRefs(cfg: Config, body: Field[]): ModelRef[] {
   const out: ModelRef[] = []
   const raw = find(body, "fallbacks")
@@ -594,6 +645,9 @@ export class Engine {
     }
     this.autoPromptCache = cfg.prompt_cache?.auto_inject ?? false
     this.logRequests = cfg.client?.enable_logging ?? true
+    metrics.setCustomLabels(cfg.client?.prometheus_labels ?? [])
+    // Raiju does not queue requests per provider, so there is no full queue for drop_excess_requests to act on
+    if (cfg.client?.drop_excess_requests === true) console.error("raiju: client.drop_excess_requests has no effect: requests are not queued, so none is dropped")
     this.guardProviders = cfg.guardrails?.providers ?? []
     const sa = cfg.session_affinity
     if (sa !== undefined && sa.enabled === true) {
@@ -661,6 +715,7 @@ export class Engine {
   // backoff and moves to another key on credential errors.
   async attempt(refs: ModelRef[], h: Hdrs, build: Build, translate: Translate, streamed: bool, ctx: ReqCtx): Promise<Outcome> {
     const pinned = h.get("x-bf-api-key") ?? h.get("x-bf-api-key-id") ?? undefined
+    const direct = directKeyFrom(h, this.cfg.client?.allow_direct_keys === true)
     const extra = forwardedHeaders(h)
     let last: Outcome = { ok: false, status: 404, body: errorJson("no provider is configured for this model", "invalid_request_error", "model_not_found"), contentType: "application/json", provider: "", model: "", promptTokens: 0, completionTokens: 0, attempts: 0, upstreamMs: 0.0 }
     let attempts = 0
@@ -677,7 +732,8 @@ export class Engine {
       const aff = this.affinity
       if (aff !== undefined && pinned === undefined) soft = resolveSticky(aff, h, ref.provider, ref.model, Date.now())?.keyId
       while (true) {
-        const sel = target(this.cfg, ref, tried, pinned ?? soft, this.health)
+        // the caller's own key serves the primary provider only: a fallback never gets it
+        const sel = refIndex === 0 && direct !== undefined ? directTarget(this.cfg, ref, direct) : target(this.cfg, ref, tried, pinned ?? soft, this.health)
         if (sel === undefined && soft !== undefined) {
           soft = undefined
           continue
@@ -811,7 +867,7 @@ export class Engine {
             dl.finish()
             upstreamMs += performance.now() - started
             metrics.observeRequest(tl, { ok: true, status: 200, errorType: "", retries: 0.0 }, (performance.now() - started) / 1000.0)
-            this.stick(h, ref, t)
+            if (sel.keyIndex >= 0) this.stick(h, ref, t)
             return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true }
           }
           text = await res.text()
@@ -858,8 +914,12 @@ export class Engine {
         if (ok) {
           try {
             const tr = translate(t, text, requested)
-            this.stick(h, ref, t)
-            return { ok: true, status: 200, body: tr.body, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs }
+            if (sel.keyIndex >= 0) this.stick(h, ref, t)
+            // raw echo: not for streamed answers, whose body is not one JSON object
+            const echoReq = !streamed && up.body !== "" && sendBackRaw(h, this.cfg, p, "request")
+            const echoResp = !streamed && sendBackRaw(h, this.cfg, p, "response")
+            const rawBody = echoReq || echoResp ? withRawFields(tr.body, echoReq ? up.body : undefined, echoResp ? text : undefined) : tr.body
+            return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp }
           } catch (e) {
             last = { ok: false, status: 502, body: errorJson(`could not read ${ref.provider}'s response: ${e.message}`, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
             break
@@ -1199,6 +1259,7 @@ export class Engine {
     if (tier !== undefined) rl.complexityTier = tier
     if (model !== primary.provider + "/" + primary.model && model !== primary.model) rl.alias = model
     rl.app = h.get("x-bf-app") ?? ""
+    rl.custom = metrics.customValues(h)
     ctx.labels = rl
     // Fallbacks the key may not use are dropped.
     const allowed: ModelRef[] = [primary]
@@ -1283,13 +1344,14 @@ export class Engine {
       ctx.cost = cost
       return respond(200, "", out)
     }
-    if (sem !== undefined && semVec.length > 0 && !noStore) {
+    // a body with raw fields is for this caller only: it never enters a cache
+    if (sem !== undefined && semVec.length > 0 && !noStore && r.raw !== true) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? undefined : parseTtl(ttlHeader)
       if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, r.body, r.contentType, ttl ?? this.semanticCfg.ttl_ms)
       else sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttl)
     }
-    if (cache !== undefined && !noStore) {
+    if (cache !== undefined && !noStore && r.raw !== true) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? this.cacheTtlMs : parseTtl(ttlHeader) ?? this.cacheTtlMs
       cache.set(key, r.body, r.contentType, ttl)
@@ -1660,4 +1722,35 @@ export function dropUsageChunks(sse: string): string {
 test("drops usage-only chunks", () => {
   const s = `data: {"choices":[{"delta":{}}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":1}}\n\ndata: [DONE]\n\n`
   expect(dropUsageChunks(s)).toBe(`data: {"choices":[{"delta":{}}]}\n\ndata: [DONE]\n\n`)
+})
+
+test("raw fields go into extra_fields, JSON bodies embedded and others quoted", () => {
+  expect(withRawFields(`{"id":"x"}`, `{"model":"m"}`, `{"a":1}`)).toBe(`{"id":"x","extra_fields":{"raw_request":{"model":"m"},"raw_response":{"a":1}}}`)
+  expect(withRawFields(`{}`, undefined, `{"a":1}`)).toBe(`{"extra_fields":{"raw_response":{"a":1}}}`)
+  expect(withRawFields(`{"id":"x"}`, `not json`, undefined)).toBe(`{"id":"x","extra_fields":{"raw_request":"not json"}}`)
+  // nothing to add, or not a JSON object: unchanged
+  expect(withRawFields(`{"id":"x"}`, undefined, undefined)).toBe(`{"id":"x"}`)
+  expect(withRawFields(`[1]`, `{}`, undefined)).toBe(`[1]`)
+})
+
+test("send-back-raw: the provider setting, overridden per request only when allowed", () => {
+  const p: ProviderConfig = { send_back_raw_response: true }
+  const cfg: Config = { client: { allow_per_request_raw_override: true } }
+  const off: Config = { client: { allow_per_request_raw_override: false } }
+  expect(sendBackRaw(hdrs([]), off, p, "response")).toBe(true)
+  expect(sendBackRaw(hdrs([]), off, p, "request")).toBe(false)
+  expect(sendBackRaw(hdrs([["x-bf-send-back-raw-response", "false"]]), cfg, p, "response")).toBe(false)
+  expect(sendBackRaw(hdrs([["x-bf-send-back-raw-request", "true"]]), cfg, p, "request")).toBe(true)
+  // the override is ignored unless allowed
+  expect(sendBackRaw(hdrs([["x-bf-send-back-raw-response", "false"]]), off, p, "response")).toBe(true)
+  expect(sendBackRaw(hdrs([["x-bf-send-back-raw-response", "garbage"]]), cfg, p, "response")).toBe(true)
+})
+
+test("direct key target: the caller's key replaces the pool", () => {
+  const cfg: Config = { providers: new Map() }
+  cfg.providers!.set("anthropic", { keys: [{ value: "pool-key" }] })
+  const sel = directTarget(cfg, { provider: "anthropic", model: "claude-x" }, "caller-key")
+  expect(sel.t.key.value).toBe("caller-key")
+  expect(sel.t.kind).toBe("anthropic")
+  expect(sel.keyIndex).toBe(-1)
 })

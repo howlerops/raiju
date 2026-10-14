@@ -71,6 +71,27 @@ export type Denial = { kind: "denial", status: int, type: string, message: strin
 // What a request is allowed to do once its virtual key checks out.
 export type Grant = { kind: "grant", vk: VirtualKeyConfig | undefined, budgets: string[], rateLimits: string[] }
 
+// Bifrost's virtual key prefix: a key with it is a virtual key, never a provider key.
+const VK_PREFIX = "sk-bf-"
+
+// The caller's own provider key (Bifrost's direct key), or undefined. It counts only when the server
+// allows direct keys (client.allow_direct_keys) and the request says x-bf-direct-key: true. The key is
+// the Bearer token, else x-api-key, else x-goog-api-key; a virtual key never counts. Matches ctx.go.
+export function directKeyFrom(h: Hdrs, allowed: bool): string | undefined {
+  if (!allowed || h.get("x-bf-direct-key") !== "true") return undefined
+  const isProviderKey = (v: string): bool => v !== "" && !v.toLowerCase().startsWith(VK_PREFIX)
+  const auth = h.get("authorization") ?? ""
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    const v = auth.slice(7).trim()
+    if (isProviderKey(v)) return v
+  }
+  for (const name of ["x-api-key", "x-goog-api-key"]) {
+    const v = (h.get(name) ?? "").trim()
+    if (isProviderKey(v)) return v
+  }
+  return undefined
+}
+
 export class Governance {
   vks: Map<string, VirtualKeyConfig> = new Map()
   budgets: Map<string, Window> = new Map()
@@ -83,6 +104,8 @@ export class Governance {
   // other credentials accepted on inference when enforced (admin users and tokens, as Bifrost)
   altAuth: ((h: Hdrs) => bool) | undefined = undefined
   required: string[] = []
+  // client.allow_direct_keys: a request may carry its own provider key instead of a virtual key
+  directKeys = false
   // the effective policy of each key that uses access profiles, by key id
   policies: Map<string, Effective> = new Map()
   // governance.model_configs and governance.providers, applied to every request by modelLimits()
@@ -97,6 +120,7 @@ export class Governance {
     // Bifrost's enforce_auth_on_inference (enforce_governance_header is its older name)
     this.enforce = cfg.client?.enforce_auth_on_inference ?? cfg.client?.enforce_governance_header ?? hasCredentials
     this.required = (cfg.client?.required_headers ?? []).map((n) => n.toLowerCase())
+    this.directKeys = cfg.client?.allow_direct_keys === true
     const g = cfg.governance
     if (g === undefined) return
     this.modelConfigs = g.model_configs ?? []
@@ -165,7 +189,9 @@ export class Governance {
     const vk = this.findKey(h)
     if (vk === undefined) {
       const alt = this.altAuth
-      if (this.enforce && !(alt !== undefined && alt(h))) return { kind: "denial", status: 401, type: "authentication_error", message: "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)" }
+      // a direct provider key satisfies the auth requirement, as in Bifrost; provider and model limits still apply
+      const direct = directKeyFrom(h, this.directKeys) !== undefined
+      if (this.enforce && !direct && !(alt !== undefined && alt(h))) return { kind: "denial", status: 401, type: "authentication_error", message: "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)" }
       // no key: model configs and provider governance still apply
       const lim = this.modelLimits(undefined, provider, model)
       return this.checkLimits(undefined, lim.budgets, lim.rateLimits)
@@ -588,6 +614,28 @@ test("inference auth defaults on when there are credentials", () => {
   g.altAuth = (h) => h.get("authorization") === "Bearer admin"
   expect(g.admit(hdrs([["authorization", "Bearer admin"]]), "openai", "m").kind).toBe("grant")
   expect(g.admit(hdrs([]), "openai", "m").kind).toBe("denial")
+})
+
+test("direct keys: header gate, key sources and virtual keys never count", () => {
+  const on = [["x-bf-direct-key", "true"], ["authorization", "Bearer sk-prov"]]
+  expect(directKeyFrom(hdrs(on), true)).toBe("sk-prov")
+  expect(directKeyFrom(hdrs(on), false)).toBe(undefined)
+  expect(directKeyFrom(hdrs([["authorization", "Bearer sk-prov"]]), true)).toBe(undefined)
+  expect(directKeyFrom(hdrs([["x-bf-direct-key", "1"], ["authorization", "Bearer sk-prov"]]), true)).toBe(undefined)
+  expect(directKeyFrom(hdrs([["x-bf-direct-key", "true"], ["x-api-key", "anth-key"]]), true)).toBe("anth-key")
+  expect(directKeyFrom(hdrs([["x-bf-direct-key", "true"], ["x-goog-api-key", "g-key"]]), true)).toBe("g-key")
+  // a virtual key in Authorization is not a provider key; the next source is tried
+  expect(directKeyFrom(hdrs([["x-bf-direct-key", "true"], ["authorization", "Bearer sk-bf-vk"], ["x-api-key", "anth"]]), true)).toBe("anth")
+  expect(directKeyFrom(hdrs([["x-bf-direct-key", "true"], ["authorization", "Bearer sk-bf-vk"]]), true)).toBe(undefined)
+})
+
+test("direct keys satisfy enforced inference auth, with no virtual key", () => {
+  const g = new Governance({ client: { enforce_auth_on_inference: true, allow_direct_keys: true }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }] } })
+  expect(g.admit(hdrs([["x-bf-direct-key", "true"], ["x-api-key", "anth"]]), "anthropic", "m").kind).toBe("grant")
+  expect(g.admit(hdrs([["x-api-key", "anth"]]), "anthropic", "m").kind).toBe("denial")
+  // the gate is off: the header alone does nothing
+  const off = new Governance({ client: { enforce_auth_on_inference: true }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }] } })
+  expect(off.admit(hdrs([["x-bf-direct-key", "true"], ["x-api-key", "anth"]]), "anthropic", "m").kind).toBe("denial")
 })
 
 test("model config budget denies 402 for that model only", () => {

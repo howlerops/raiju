@@ -12,6 +12,7 @@ BUILD = os.path.join(ROOT, "build")
 GW = "http://127.0.0.1:18098"
 MOCK = "http://127.0.0.1:18099"
 GW_B = "http://127.0.0.1:18097"
+GW_D = "http://127.0.0.1:18092"
 
 def build():
     os.makedirs(BUILD, exist_ok=True)
@@ -184,6 +185,15 @@ def write_config():
           "vector_store": {"enabled": True, "type": "qdrant", "config": {"host": "127.0.0.1", "rest_port": 18089}},
           "server": {"port": 1}}
     json.dump(bf, open(os.path.join(BUILD, "e2e.bifrost.json"), "w"))
+    # direct keys, per-request raw echo and prometheus_labels are switched on here only; the
+    # provider keys are pool keys the callers' own keys must replace
+    d = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_direct_keys": True, "allow_per_request_raw_override": True,
+                    "drop_excess_requests": True, "prometheus_labels": ["env", "team"]},
+         "providers": {
+             "openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "send_back_raw_response": True},
+             "anthropic": {"keys": [{"name": "apool", "value": "sk-ant-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+         "governance": {"virtual_keys": [{"id": "vk-d", "value": "sk-bf-direct-vk"}]}}
+    json.dump(d, open(os.path.join(BUILD, "e2e.direct.json"), "w"))
     return path
 
 def make_tls():
@@ -285,6 +295,7 @@ def main():
     gw_bf = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18093", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.bifrost.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.bifrost.log"), "w"))
     gw_w = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18094", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.workers.json"), "-workers", "3"], env=env, stderr=subprocess.DEVNULL)
     gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18097", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.node-b.json")], env=env, stderr=subprocess.DEVNULL)
+    gw_d = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18092", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.direct.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.direct.log"), "w"))
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
 
@@ -1056,8 +1067,42 @@ def main():
 
         s, _, b = call("POST", "/v1/chat/completions", "{not json")
         check("bad JSON is a 400", s == 400, b)
+
+        # Direct keys: the caller's own key replaces the pool key, only with the header and the server setting
+        wait(GW_D + "/health")
+        def msg(text, model="openai/gpt-4o-mini", **kw):
+            return {"model": model, "messages": [{"role": "user", "content": text}], **kw}
+        s, _, b = call("POST", "/v1/chat/completions", msg("direct-1"), {"x-bf-direct-key": "true", "authorization": "Bearer sk-caller"}, base=GW_D)
+        check("a direct key serves the request without a virtual key", s == 200 and seen()[-1]["auth"] == "Bearer sk-caller", (s, b, seen()[-1]))
+        s, _, b = call("POST", "/v1/chat/completions", msg("direct-2"), {"authorization": "Bearer sk-caller"}, base=GW_D)
+        check("without x-bf-direct-key the same bearer is not a credential", s == 401, (s, b))
+        s, _, b = call("POST", "/v1/chat/completions", msg("direct-3", "anthropic/claude-sonnet-4", max_tokens=20), {"x-bf-direct-key": "true", "x-api-key": "sk-ant-caller"}, base=GW_D)
+        check("a direct x-api-key goes upstream to its provider", s == 200 and seen()[-1]["auth"] == "sk-ant-caller", (s, b, seen()[-1]))
+        s, _, b = call("POST", "/v1/chat/completions", msg("direct-4"), {"x-bf-direct-key": "true", "authorization": "Bearer sk-bf-direct-vk"}, base=GW_D)
+        check("a virtual key in Authorization is not a direct key", s == 200 and seen()[-1]["auth"] == "Bearer sk-pool", (s, b, seen()[-1]))
+        s, _, b = call("POST", "/v1/chat/completions", msg("direct-5"), {"x-bf-direct-key": "true", "authorization": "Bearer sk-caller"}, base=GW)
+        check("direct keys are ignored unless client.allow_direct_keys is on", s == 200 and seen()[-1]["auth"] == "Bearer sk-from-env", (s, b, seen()[-1]))
+
+        # Raw echo: the provider's send_back_raw_response, and per-request headers when allowed
+        VK = {"authorization": "Bearer sk-bf-direct-vk"}
+        s, _, b = call("POST", "/v1/chat/completions", msg("raw-1"), VK, base=GW_D)
+        ef = json.loads(b).get("extra_fields", {})
+        check("send_back_raw_response puts the upstream body in extra_fields", s == 200 and ef.get("raw_response", {}).get("choices", [{}])[0].get("message", {}).get("content") == "Hello from gpt-4o-mini" and "raw_request" not in ef, b)
+        s, _, b = call("POST", "/v1/chat/completions", msg("raw-2"), {**VK, "x-bf-send-back-raw-request": "true"}, base=GW_D)
+        ef = json.loads(b).get("extra_fields", {})
+        check("x-bf-send-back-raw-request echoes the upstream request", s == 200 and ef.get("raw_request", {}).get("model") == "gpt-4o-mini" and ef["raw_request"]["messages"][0]["content"] == "raw-2", b)
+        s, _, b = call("POST", "/v1/chat/completions", msg("raw-3", "anthropic/claude-sonnet-4", max_tokens=20), VK, base=GW_D)
+        check("no raw fields unless asked for", s == 200 and "extra_fields" not in json.loads(b), b)
+        s, _, b = call("POST", "/v1/chat/completions", msg("raw-4"), {"x-bf-send-back-raw-response": "true"}, base=GW)
+        check("per-request raw headers are ignored without allow_per_request_raw_override", s == 200 and "extra_fields" not in json.loads(b), b)
+
+        # prometheus_labels: named labels filled from x-bf-dim-<name> headers, empty when absent
+        s, _, b = call("POST", "/v1/chat/completions", msg("labels-1"), {**VK, "x-bf-dim-env": "prod"}, base=GW_D)
+        _, _, m = call("GET", "/metrics", base=GW_D)
+        check("prometheus_labels are filled from x-bf-dim headers", s == 200 and _re.search(r'bifrost_upstream_requests_total\{[^}]*env="prod",team=""\}', m) is not None, m[:400])
+        check("drop_excess_requests logs that it has no effect", "drop_excess_requests has no effect" in open(os.path.join(BUILD, "e2e.direct.log")).read(), "")
     finally:
-        gw.terminate(); gw_b.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
+        gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 

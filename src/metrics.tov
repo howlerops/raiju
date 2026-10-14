@@ -289,6 +289,8 @@ export type RequestLabels = {
   businessUnitId: string, businessUnitName: string,
   projectId: string, projectName: string,
   fallbackIndex: string,
+  // values of client.prometheus_labels, in the configured order (see setCustomLabels)
+  custom: string[],
 }
 
 // Base label names, in Bifrost's order (the metric-safe enrichment dimensions).
@@ -301,16 +303,52 @@ const BASE_NAMES: string[] = [
 ]
 
 function baseValues(l: RequestLabels): string[] {
-  return [
+  const vals = [
     l.provider, l.model, l.method, l.alias, l.app, l.routingEngineUsed,
     l.virtualKeyId, l.virtualKeyName, l.selectedKeyId, l.selectedKeyName,
     l.routingRuleId, l.routingRuleName, l.complexityTier, l.complexityMechanism,
     l.teamId, l.teamName, l.customerId, l.customerName,
     l.businessUnitId, l.businessUnitName, l.projectId, l.projectName, l.fallbackIndex,
   ]
+  for (const v of l.custom) vals.push(v)
+  return vals
 }
 
 const baseCache: Map<string, string> = new Map()
+
+// client.prometheus_labels: extra label names on the bifrost_* request families. Each one is filled
+// per request from the x-bf-dim-<name> header (customValues), as Bifrost's telemetry plugin does.
+// Names that are not valid label names, that repeat, or that clash with a built-in label are dropped.
+let customNames: string[] = []
+
+const RESERVED_LABELS: string[] = ["status", "path", "is_success", "status_code", "error_type", "cache_type", "le"]
+
+function validLabelName(n: string): bool {
+  if (n === "") return false
+  for (let i = 0; i < n.byteLength; i++) {
+    const c = n.slice(i, i + 1)
+    const ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_".includes(c) || (i > 0 && "0123456789".includes(c))
+    if (!ok) return false
+  }
+  return true
+}
+
+export function setCustomLabels(names: string[]): void {
+  const out: string[] = []
+  for (const n of names) {
+    if (!validLabelName(n) || BASE_NAMES.includes(n) || RESERVED_LABELS.includes(n) || out.includes(n)) continue
+    out.push(n)
+  }
+  customNames = out
+  baseCache.clear()
+}
+
+// The custom label values of a request, in the configured order ("" when the header is absent).
+export function customValues(h: Map<string, string>): string[] {
+  const out: string[] = []
+  for (const n of customNames) out.push(h.get("x-bf-dim-" + n.toLowerCase()) ?? "")
+  return out
+}
 
 // The rendered base label set for a request, built once per distinct combination.
 export function baseLabels(l: RequestLabels): string {
@@ -318,10 +356,11 @@ export function baseLabels(l: RequestLabels): string {
   const k = vals.join("\u0000")
   const hit = baseCache.get(k)
   if (hit !== undefined) return hit
+  const names: string[] = BASE_NAMES.concat(customNames)
   let text = ""
-  for (let i = 0; i < BASE_NAMES.length; i++) {
+  for (let i = 0; i < names.length; i++) {
     if (i > 0) text += ","
-    text += `${BASE_NAMES[i]!}="${esc(vals[i]!)}"`
+    text += `${names[i]!}="${esc(vals[i] ?? "")}"`
   }
   if (baseCache.size < 100000) baseCache.set(k, text)
   return text
@@ -335,7 +374,7 @@ export function newLabels(provider: string, model: string, method: string): Requ
     routingRuleId: "", routingRuleName: "", complexityTier: "", complexityMechanism: "",
     teamId: "", teamName: "", customerId: "", customerName: "",
     businessUnitId: "", businessUnitName: "", projectId: "", projectName: "",
-    fallbackIndex: "",
+    fallbackIndex: "", custom: [],
   }
 }
 
@@ -441,6 +480,25 @@ test("bifrost request family carries Bifrost names, labels and HELP", () => {
   expect(text.includes(`is_success="true",le="900"} 1`)).toBe(true)
   expect(text.includes(`is_success="true",le="+Inf"} 1`)).toBe(true)
   expect(text.includes(`bifrost_upstream_latency_seconds_count{provider="openai"`)).toBe(true)
+})
+
+test("prometheus_labels add named labels filled from x-bf-dim headers", () => {
+  setCustomLabels(["env", "team", "env", "le", "bad-name", "provider"])
+  const dims: Map<string, string> = new Map()
+  dims.set("x-bf-dim-env", "prod")
+  let l = newLabels("openai", "gpt-4o", "chat_completion")
+  l.custom = customValues(dims)
+  observeRequest(l, { ok: true, status: 200, errorType: "", retries: 0.0 }, 0.2)
+  const text = render()
+  expect(text.includes(`fallback_index="",env="prod",team=""} 1`)).toBe(true)
+  // a request without the header gets an empty value
+  let plain = newLabels("openai", "gpt-4o", "chat_completion")
+  plain.custom = customValues(new Map())
+  observeRequest(plain, { ok: true, status: 200, errorType: "", retries: 0.0 }, 0.2)
+  const again = render()
+  expect(again.includes(`fallback_index="",env="",team=""} 1`)).toBe(true)
+  setCustomLabels([])
+  expect(customValues(dims).length).toBe(0)
 })
 
 test("error counter carries status_code and error_type, latency is_success=false", () => {
