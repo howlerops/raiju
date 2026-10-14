@@ -1,4 +1,4 @@
-.PHONY: build test unit e2e ui check run bench tov
+.PHONY: build test unit e2e ui check run bench tov tov-test
 
 # Tov's async slab allocator corrupts its free lists once ~30 fetches are in
 # flight (see docs/tov-notes.md); plain malloc avoids it at the same speed.
@@ -10,6 +10,9 @@ export TOV ?= $(if $(wildcard $(TOV_PATCHED)),$(abspath $(TOV_PATCHED)),tov)
 
 tov:
 	scripts/build-tov.sh
+
+tov-test:
+	tov-patches/tests/run.sh
 
 build:
 	mkdir -p build && $(TOV) build src/main.tov -o build/raiju
@@ -27,7 +30,7 @@ e2e:
 ui:
 	NODE_PATH=$$(npm root -g) node tests/ui_e2e.mjs
 
-test: check unit e2e ui
+test: check unit tov-test e2e ui
 
 run:
 	$(TOV) run src/main.tov

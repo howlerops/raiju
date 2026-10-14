@@ -44,11 +44,22 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   Manager (`vault.<path>#<field>`, `aws-sm.<id>`), log exports to S3, MinIO or GCS
   (`log_exports`), and clustering that shares budget and rate-limit usage
   between nodes (`cluster`).
-- **MCP:** the gateway as an MCP server (`POST /mcp`), and agent mode that runs
-  allowed tool calls itself (`client.mcp_auto_execute`, `mcp_agent_depth`).
+- **MCP:** HTTP and stdio servers, with bearer, header or OAuth auth
+  (`client_configs[].auth`); the gateway as an MCP server (`POST /mcp`); virtual
+  MCPs that combine and rename tools (`virtual_mcps`, `/mcp/{name}`); and agent
+  mode that runs allowed tool calls itself (`client.mcp_auto_execute`,
+  `mcp_agent_depth`).
+- **Policy:** access profiles shared by virtual keys (models, budgets, rate
+  limits, MCP tools, `max_tokens`, required headers), global required headers,
+  and external guardrails (AWS Bedrock Guardrails, Azure AI Content Safety,
+  Patronus, any webhook) alongside the built-in PII and secret redaction.
+- **Log exporters:** Datadog, Splunk HEC, Elasticsearch and any HTTP endpoint
+  (`exporters`), next to the S3/GCS object exports.
 - **Routing:** session affinity (`x-bf-session-id`, `session_affinity`) and a
   complexity router (`complexity_tier` in routing rules, tiers behind model `auto`).
-- **Providers:** OpenAI, Azure OpenAI, Anthropic, Gemini, Vertex AI, Cohere, Bedrock (SigV4 or API key),
+- **Providers:** OpenAI, Azure OpenAI, Anthropic, Gemini, Vertex AI, Cohere, Bedrock (SigV4 or API key), IBM watsonx,
+  Hugging Face, NVIDIA, SambaNova, DeepInfra, Novita, Hyperbolic, Lambda, Moonshot, Zhipu, Qwen (DashScope),
+  AI21, Upstage, Baseten, Featherless, Inception, Friendli, SiliconFlow, GitHub Models,
   Groq, Mistral, xAI, DeepSeek, Cerebras, Fireworks, Together, Nebius, Parasail,
   OpenRouter, Perplexity, Ollama, vLLM, SGLang, LM Studio, and custom
   OpenAI-compatible providers (`custom_provider_config`).
@@ -80,19 +91,27 @@ small enough to send upstream.
 
 | Server (mock upstream, 64 connections, 4-core VM) | Throughput | Gateway overhead |
 |---|---|---|
-| `-server bun -workers 2` | 36,000 rps | 40 µs mean |
+| `-server bun -workers 2` | 31,000–36,000 rps | 40 µs mean |
 | `-server bun` (1 process) | 16,300 rps | 68 µs mean |
 | `-server http1` (1 process) | 14,300 rps | 100 µs mean |
 
 `-server http1` is Raiju's own HTTP/1.1 server on raw sockets. It streams too,
 but runs in one process. It stays as a fallback.
 
+The workers of one node share budgets, rate limits and the response cache
+through `/tmp/raiju-<pid>` (the clustering CRDT, one slot per worker). Usage
+reaches the other workers within about 200 ms, so a burst spread over several
+workers can pass a limit by a few requests, as across cluster nodes. Each
+worker starts its own stdio MCP servers.
+
 ## Known gaps
 
-- Within one node, budget, rate-limit and cache state is per worker process.
-  Clustering shares budgets and rate limits between nodes, not between the
-  workers of one node.
-- See [LEDGER.md](LEDGER.md) for what's next.
+- Request logs, metrics and the semantic cache are per worker process. Scrape
+  `/metrics` through a pod or service and sum, as with any multi-process server.
+- SOCKS5 proxies: Tov's `fetch` supports HTTP proxies only.
+- Out of scope (from the scoping form): videos and containers, the edge device
+  agent, SCIM, MCP code mode and media providers.
+- See [LEDGER.md](LEDGER.md) for the history.
 
 ## Performance
 
@@ -128,7 +147,9 @@ measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
 
 ```sh
 make check   # tov check --json on every file, applying "safe" fixes
-make unit    # tov test (406 tests)
+make tov     # Tov with the patches in tov-patches/
+make tov-test # the patches' own tests
+make unit    # tov test (522 tests)
 make e2e     # gateway against a mock upstream, on both servers
 make ui      # the web UI in headless Chromium against a real gateway
 make bench

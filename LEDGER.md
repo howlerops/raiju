@@ -82,7 +82,7 @@ Integration glue (lead): `src/ops.tov` (RBAC gate, audit, alert, cluster and exp
 |---|---|---|
 | X06 | Patch Tov so `Bun.serve` streams `ReadableStream` bodies (`tov-patches/`, `scripts/build-tov.sh`); `Bun.serve` is now the default server, streaming in every worker | done: e2e on both servers, 2 workers 36k rps vs 16k for one process |
 | X07 | Outbound proxies (`proxy_config`; Tov's fetch has `proxy`), LiteLLM/LangChain route prefixes, OCR pass-through | done: e2e (proxy request line and credentials, prefixed routes, `/v1/ocr`) |
-| X08 | Not possible in this Tov: stdio MCP servers (no process spawning) | won't do |
+| X08 | stdio MCP servers | superseded by X11 |
 
 ## Defects found in review (waves 5–6, fixed)
 
@@ -91,29 +91,36 @@ Integration glue (lead): `src/ops.tov` (RBAC gate, audit, alert, cluster and exp
 - `scripts/check.py` applied "safe" fixes that cascaded from an unrelated error (it added `throws` and `try` across three files). Re-check after fixing the root error; don't apply fixes while it is red.
 - A mock left running from a manual test made e2e flaky (port already bound). Kill stray processes before suites.
 
-## Wave 7 (everything left in SCOPE.md)
+## Wave 7 (everything left in SCOPE.md, done)
 
 | ID | Work | Pri | Files | Status |
 |---|---|---|---|---|
-| L33 | Guardrail integrations: AWS Bedrock Guardrails, Azure AI Content Safety, Patronus, generic webhook | P2 | `src/guardrail_providers.tov` | assigned |
-| L34 | Access profiles: reusable permission sets (providers, models, budgets, rate limits, MCP tools) for virtual keys | P2 | `src/profiles.tov` | assigned |
-| L35 | Virtual MCPs: named tool sets assembled from several MCP servers, served at `/mcp/{name}` | P2 | `src/vmcp.tov` | assigned |
-| L36 | MCP auth: OAuth 2.1 for MCP servers (client credentials, refresh tokens, token cache) | P2 | `src/mcpauth.tov` | assigned |
-| L37 | Required headers (reject requests missing configured headers) | P2 | lead: `governance.tov` | todo |
-| L38 | Exporters: request logs to Datadog, Splunk HEC, Elasticsearch, generic HTTP | P2 | `src/exporters.tov` | assigned |
-| L39 | Long-tail providers (OpenAI-compatible family + IBM watsonx) | P2 | `src/providers/longtail.tov`, `src/providers/watsonx.tov` | assigned |
-| L40 | Terraform: Helm release module and AWS ECS Fargate module | P1 | `deploy/terraform/**` | assigned |
-| L41 | Embeddings for Gemini, Bedrock (Titan, Cohere) and Vertex | P0 | `src/embeddings_native.tov` | assigned |
-| L42 | Anthropic SDK route streaming from any provider (OpenAI SSE → Anthropic events) | P0 | `src/streams_anthropic_out.tov` | assigned |
+| L33 | Guardrail integrations: AWS Bedrock Guardrails, Azure AI Content Safety, Patronus, generic webhook | P2 | `src/guardrail_providers.tov` | done: unit (SigV4 checked against Python) + e2e (block, redact, output block) |
+| L34 | Access profiles: reusable permission sets (providers, models, budgets, rate limits, MCP tools) for virtual keys | P2 | `src/profiles.tov` | done: unit + e2e (required header, model limit, max_tokens cap, MCP tools, API, delete guard) |
+| L35 | Virtual MCPs: named tool sets assembled from several MCP servers, served at `/mcp/{name}` | P2 | `src/vmcp.tov` | done: unit + e2e (renamed tool, defaults, 404, listing) |
+| L36 | MCP auth: OAuth 2.1 for MCP servers (client credentials, refresh tokens, token cache) | P2 | `src/mcpauth.tov` | done: unit + e2e (client credentials, token reuse) |
+| L37 | Required headers (reject requests missing configured headers) | P2 | lead: `governance.tov` | done: unit + e2e |
+| L38 | Exporters: request logs to Datadog, Splunk HEC, Elasticsearch, generic HTTP | P2 | `src/exporters.tov` | done: unit + e2e (HTTP NDJSON, Elasticsearch bulk) |
+| L39 | Long-tail providers (OpenAI-compatible family + IBM watsonx) | P2 | `src/providers/longtail.tov`, `src/providers/watsonx.tov` | done: unit + e2e (watsonx IAM + chat, NVIDIA) |
+| L40 | Terraform: Helm release module and AWS ECS Fargate module | P1 | `deploy/terraform/**` | done: terraform fmt + validate on all three examples (no plan/apply: no cloud account) |
+| L41 | Embeddings for Gemini, Bedrock (Titan, Cohere) and Vertex | P0 | `src/embeddings_native.tov` | done: unit + e2e (Gemini batch, Titan one call per input) |
+| L42 | Anthropic SDK route streaming from any provider (OpenAI SSE → Anthropic events) | P0 | lead: `gateway.tov`, `native.tov` (anthropic_in already had the converter) | done: e2e (incremental events from an OpenAI-format upstream) |
 
 | ID | Lead work | Status |
 |---|---|---|
-| X09 | Share budget, rate-limit and cache state between the worker processes of one node | todo |
-| X10 | Build and run the Docker image (a daemon runs here now) | todo |
-| X11 | stdio MCP servers: Tov patch for spawning processes with pipes | todo |
-| X12 | Package the Tov patches for upstream (description, tests) | todo |
-| X13 | SCOPE.md and README in sync | todo |
+| X09 | Share budget, rate-limit and cache state between the worker processes of one node | done: file gossip of the CRDT counters + shared cache files; e2e on 3 workers |
+| X10 | Build and run the Docker image (a daemon runs here now) | done: found and fixed two bugs (no g++ for BoringSSL; libstdc++ missing at runtime → distroless/cc); image 10.7 MB, serves with -workers 2 |
+| X11 | stdio MCP servers: Tov patch for spawning processes with pipes | done: patch 0002 (`Bun.spawnSocket`); e2e; one server per worker, killed with it |
+| X12 | Package the Tov patches for upstream (description, tests) | done: `tov-patches/README.md`, `tov-patches/tests/run.sh` (opening the upstream PR needs access to richiemcilroy/Tov) |
+| X13 | SCOPE.md and README in sync | done |
 
-## Next (P2 from SCOPE.md)
+## Defects found in review (wave 7, fixed)
 
-Sharing budget, rate-limit and cache state between the workers of one node (today: per process). SOCKS5 proxies (Tov's fetch has HTTP proxies only).
+- Two Docker image bugs that only a real build showed: g++ was missing for BoringSSL, and libstdc++ was missing in the runtime image.
+- The guardrail webhook mock recorded its calls, which broke every test that reads the last upstream request.
+- Access profiles: a deleted profile would have silently lifted its limits. Keys now fail closed, and deleting a profile that is in use is refused.
+- `connection_string` was required, so stdio MCP configs failed to load.
+
+## Next
+
+Everything in SCOPE.md is done except the five "Out" items. Remaining limits are in the README's Known gaps.

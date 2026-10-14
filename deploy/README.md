@@ -1,5 +1,8 @@
 # Deploying Raiju
 
+Raiju is one binary. Terraform modules (Helm release, AWS ECS Fargate) are in
+[terraform/](terraform/README.md).
+
 Raiju is one binary. The image runs it as non-root on a distroless base, with
 no shell. It takes a Bifrost-format `config.json` from `/app/data`, and provider
 keys come from environment variables that the config refers to as `env.NAME`.
