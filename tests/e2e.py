@@ -407,17 +407,23 @@ def main():
         r = json.loads(b)
         check("count_tokens estimates for other providers", s == 200 and r["exact"] is False and 5 < r["input_tokens"] < 40, b)
 
-        # Async jobs
+        # Async jobs, polled at Bifrost's /v1/async/<op>/{id} with Bifrost's status names
         s, _, b = call("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "later"}]})
         job = json.loads(b)
-        check("async job accepted", s == 202 and job["status"] in ("queued", "running") and job["id"].startswith("job_"), b)
+        check("async job accepted", s == 202 and job["status"] in ("pending", "processing") and job["id"].startswith("job_") and job["created_at"].endswith("Z"), b)
         for _ in range(50):
-            s, _, b = call("GET", f"/v1/async/jobs/{job['id']}")
-            if json.loads(b)["status"] in ("succeeded", "failed"):
+            s, _, b = call("GET", f"/v1/async/chat/completions/{job['id']}")
+            if json.loads(b)["status"] in ("completed", "failed"):
                 break
             time.sleep(0.05)
         done = json.loads(b)
-        check("async job completes with the result", done["status"] == "succeeded" and done["result"]["choices"][0]["message"]["content"] == "Hello from gpt-4o-mini", b)
+        check("async job completes with the result", done["status"] == "completed" and done["status_code"] == 200 and done["result"]["choices"][0]["message"]["content"] == "Hello from gpt-4o-mini" and "expires_at" in done, b)
+        s, _, _ = call("GET", f"/v1/async/jobs/{job['id']}")
+        check("the generic job path still works", s == 200, s)
+        s, _, _ = call("GET", f"/v1/async/embeddings/{job['id']}")
+        check("polling under another op is 404", s == 404, s)
+        s, _, b = call("POST", "/v1/async/rerank", {"model": "openai/rr", "query": "q", "documents": ["a", "b"]})
+        check("async rerank is accepted", s == 202, (s, b))
         s, _, _ = call("GET", "/v1/async/jobs/job_nope")
         check("unknown job is 404", s == 404)
 

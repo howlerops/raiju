@@ -15,11 +15,12 @@ import { Target, Upstream, trimSlash } from "./providers/types"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
 import { newId } from "./schemas"
+import { isoMs } from "./exports"
 
 export type Job = {
   id: string,
   op: string,
-  status: "queued" | "running" | "succeeded" | "failed",
+  status: "pending" | "processing" | "completed" | "failed",
   created_at: int,
   completed_at?: int,
   http_status?: int,
@@ -32,7 +33,7 @@ export type Job = {
 type Slot = { job: Job, at: int }
 
 function isFinished(j: Job): bool {
-  return j.status === "succeeded" || j.status === "failed"
+  return j.status === "completed" || j.status === "failed"
 }
 
 // True when `text` is exactly one JSON value. The scanner only reports the
@@ -88,15 +89,15 @@ export class JobStore {
       this.sweep(nowMs)
       if (this.jobs.size >= this.maxJobs && !this.evictOne()) return undefined
     }
-    const job: Job = { id: newId("job_"), op: op, status: "queued", created_at: Math.floor(nowMs / 1000) }
+    const job: Job = { id: newId("job_"), op: op, status: "pending", created_at: Math.floor(nowMs / 1000) }
     this.jobs.set(job.id, { job: job, at: nowMs })
     return job
   }
 
   start(id: string): bool {
     const slot = this.jobs.get(id)
-    if (slot === undefined || slot.job.status !== "queued") return false
-    const job: Job = { id: slot.job.id, op: slot.job.op, status: "running", created_at: slot.job.created_at }
+    if (slot === undefined || slot.job.status !== "pending") return false
+    const job: Job = { id: slot.job.id, op: slot.job.op, status: "processing", created_at: slot.job.created_at }
     this.jobs.set(id, { job: job, at: slot.at })
     return true
   }
@@ -111,7 +112,7 @@ export class JobStore {
     if (httpStatus >= 200 && httpStatus < 300) {
       const text = body.trim()
       const result = isJsonValue(text) ? text : quote(body)
-      job = { id: cur.id, op: cur.op, status: "succeeded", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, result: result }
+      job = { id: cur.id, op: cur.op, status: "completed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, result: result }
     } else {
       const msg = errorMessage(body) ?? `upstream returned HTTP ${httpStatus}`
       job = { id: cur.id, op: cur.op, status: "failed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, error: msg }
@@ -148,20 +149,30 @@ export class JobStore {
   }
 }
 
-// The job as the GET /v1/async/jobs/{id} body. `result` is embedded raw.
-export function jobJson(j: Job): string {
-  const completed = j.completed_at === undefined ? "null" : `${j.completed_at}`
-  const result = j.result === undefined ? "null" : j.result
-  const error = j.error === undefined ? "null" : `{"message":${quote(j.error)}}`
-  return `{"id":${quote(j.id)},"object":"async.job","op":${quote(j.op)},"status":${quote(j.status)},` +
-    `"created_at":${j.created_at},"completed_at":${completed},"result":${result},"error":${error}}`
+// The job as Bifrost's AsyncJobResponse (core/schemas/async.go): times as RFC 3339,
+// status_code and result once done, a Bifrost-shaped error when it failed. `result` is
+// embedded raw; `op` is an extra.
+export function jobJson(j: Job, ttlMs: int): string {
+  const parts = [`"id":${quote(j.id)}`, `"object":"async.job"`, `"op":${quote(j.op)}`, `"status":${quote(j.status)}`, `"created_at":${quote(isoMs(j.created_at * 1000))}`]
+  const done = j.completed_at
+  if (done !== undefined) {
+    parts.push(`"completed_at":${quote(isoMs(done * 1000))}`)
+    parts.push(`"expires_at":${quote(isoMs(done * 1000 + ttlMs))}`)
+  }
+  const st = j.http_status
+  if (st !== undefined) parts.push(`"status_code":${st}`)
+  const result = j.result
+  if (result !== undefined) parts.push(`"result":${result}`)
+  const err = j.error
+  if (err !== undefined) parts.push(`"error":{"is_bifrost_error":false,"status_code":${st ?? 500},"error":{"message":${quote(err)}}}`)
+  return "{" + parts.join(",") + "}"
 }
 
 // Async ops and the sync route each one runs as. Built by a function because
 // top-level statements in an imported module do not run.
 function makeAsyncOps(): Map<string, string> {
   const m: Map<string, string> = new Map()
-  for (const op of ["chat/completions", "completions", "embeddings", "responses", "images/generations", "audio/speech"]) {
+  for (const op of ["chat/completions", "completions", "embeddings", "responses", "images/generations", "images/edits", "images/variations", "audio/speech", "audio/transcriptions", "rerank", "ocr"]) {
     m.set(op, "/v1/" + op)
   }
   m.set("messages", "/anthropic/v1/messages")
@@ -169,6 +180,18 @@ function makeAsyncOps(): Map<string, string> {
 }
 
 const ASYNC_OPS = makeAsyncOps()
+
+// The op and job id of a poll path (/v1/async/<op>/{id}), or undefined.
+export function asyncPoll(path: string): { op: string, id: string } | undefined {
+  const prefix = "/v1/async/"
+  if (!path.startsWith(prefix)) return undefined
+  const segs = path.slice(prefix.byteLength, path.byteLength).split("/")
+  if (segs.length < 2) return undefined
+  const id = segs[segs.length - 1]!
+  const op = segs.slice(0, segs.length - 1).join("/")
+  if (id === "" || (op !== "jobs" && !ASYNC_OPS.has(op))) return undefined
+  return { op: op, id: id }
+}
 
 // The sync path for a /v1/async/<op> path, or undefined for anything else.
 export function asyncOp(path: string): string | undefined {
@@ -391,14 +414,14 @@ export function lexicalRerank(query: string, docs: string[]): { index: int, scor
 test("job lifecycle maps status codes", () => {
   const s = new JobStore(60000, 10)
   const a = s.create("chat/completions", 5000)!
-  expect(a.status).toBe("queued")
+  expect(a.status).toBe("pending")
   expect(a.created_at).toBe(5)
   expect(a.id.startsWith("job_")).toBe(true)
   expect(s.start(a.id)).toBe(true)
-  expect(s.get(a.id, 6000)!.status).toBe("running")
+  expect(s.get(a.id, 6000)!.status).toBe("processing")
   expect(s.finish(a.id, 200, `{"id":"x","choices":[]}`, 7000)).toBe(true)
   const ok = s.get(a.id, 7000)!
-  expect(ok.status).toBe("succeeded")
+  expect(ok.status).toBe("completed")
   expect(ok.completed_at).toBe(7)
   expect(ok.http_status).toBe(200)
   expect(ok.result).toBe(`{"id":"x","choices":[]}`)
@@ -467,21 +490,26 @@ test("a full store refuses jobs and evicts finished ones only", () => {
 
   // with no finished job left, a full store refuses again
   expect(s.create("chat/completions", 3)).toBeUndefined()
-  expect(s.get(a.id, 3)!.status).toBe("queued")
+  expect(s.get(a.id, 3)!.status).toBe("pending")
 })
 
 test("jobJson embeds the result raw", () => {
   const s = new JobStore(60000, 10)
   const j = s.create("chat/completions", 9000)!
-  expect(jobJson(j)).toBe(`{"id":"${j.id}","object":"async.job","op":"chat/completions","status":"queued","created_at":9,"completed_at":null,"result":null,"error":null}`)
+  expect(jobJson(j, 60000)).toBe(`{"id":"${j.id}","object":"async.job","op":"chat/completions","status":"pending","created_at":"1970-01-01T00:00:09.000Z"}`)
   s.finish(j.id, 200, `{"a": 1}`, 10000)
-  const out = jobJson(s.get(j.id, 10000)!)
+  const out = jobJson(s.get(j.id, 10000)!, 60000)
   expect(out.includes(`"result":{"a": 1}`)).toBe(true)
-  expect(out.includes(`"completed_at":10`)).toBe(true)
-  expect(out.includes(`"error":null`)).toBe(true)
+  expect(out.includes(`"completed_at":"1970-01-01T00:00:10.000Z"`)).toBe(true)
+  expect(out.includes(`"expires_at":"1970-01-01T00:01:10.000Z"`)).toBe(true)
+  expect(out.includes(`"status_code":200`)).toBe(true)
+  expect(out.includes(`"error"`)).toBe(false)
   const f = s.create("embeddings", 0)!
   s.finish(f.id, 400, `{"error":{"message":"bad \\"x\\""}}`, 0)
-  expect(jobJson(s.get(f.id, 0)!).includes(`"error":{"message":"bad \\"x\\""}`)).toBe(true)
+  expect(jobJson(s.get(f.id, 0)!, 60000).includes(`"error":{"is_bifrost_error":false,"status_code":400,"error":{"message":"bad \\"x\\""}}`)).toBe(true)
+  expect(asyncPoll("/v1/async/chat/completions/job_1")).toEqual({ op: "chat/completions", id: "job_1" })
+  expect(asyncPoll("/v1/async/jobs/job_1")).toEqual({ op: "jobs", id: "job_1" })
+  expect(asyncPoll("/v1/async/nope/job_1")).toBeUndefined()
 })
 
 test("asyncOp maps known ops only", () => {
