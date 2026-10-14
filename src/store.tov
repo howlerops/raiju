@@ -7,7 +7,7 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
-  ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig,
+  ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames,
 } from "./config"
 import { decode } from "./base64"
 import { Field, fields, find, isNull, quote, elements, decodeString } from "./json"
@@ -760,6 +760,13 @@ export class ConfigStore {
     let g: GovernanceConfig = this.cfg.governance ?? {}
     g.users = users
     return this.commit(withGov(this.cfg, g), "users")
+  }
+
+  // Replaces the client section (Bifrost's client_config); see putConfig.
+  setClient(c: ClientConfig): Result {
+    let n: Config = this.cfg
+    n.client = c
+    return this.commit(n, "client")
   }
 
   private putProvider(name: string, np: ProviderConfig, id: string): Result {
@@ -1571,6 +1578,102 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
 
 // Routes one request of the management API. Bodies are JSON; errors are
 // {"error":{"message":...}}. The query string is ignored.
+// The gateway's version, as GET /api/version returns it.
+const RAIJU_VERSION = "0.1.0"
+
+// The client section's settings by JSON type, for PUT /api/config. Any other name is refused.
+const CLIENT_BOOL = ["drop_excess_requests", "disable_content_logging", "allow_per_request_content_storage_override", "enable_logging", "enable_governance", "enforce_governance_header", "enforce_auth_on_inference", "allow_direct_keys"]
+const CLIENT_INT = ["max_request_body_size_mb", "async_job_result_ttl", "mcp_agent_depth"]
+const CLIENT_LIST = ["required_headers", "allowed_origins", "prometheus_labels", "mcp_auto_execute"]
+
+// "" when the client section is a JSON object of known settings with the right types, else
+// what is wrong with it.
+function clientProblem(text: string): string {
+  if (!text.trim().startsWith("{")) return "client must be a JSON object"
+  let fs: Field[] = []
+  try {
+    fs = fields(text)
+  } catch (e) {
+    return "client must be a JSON object"
+  }
+  for (const f of fs) {
+    const raw = f.raw
+    if (CLIENT_BOOL.includes(f.key)) {
+      if (raw !== "true" && raw !== "false") return `${f.key} must be true or false`
+    } else if (CLIENT_INT.includes(f.key)) {
+      if (!digitsOnly(raw)) return `${f.key} must be a whole number`
+    } else if (CLIENT_LIST.includes(f.key)) {
+      if (!raw.startsWith("[")) return `${f.key} must be a list`
+    } else return `unknown client setting ${f.key}`
+  }
+  return ""
+}
+
+function digitsOnly(s: string): bool {
+  if (s === "") return false
+  for (const ch of s.chars()) {
+    if (ch < "0" || ch > "9") return false
+  }
+  return true
+}
+
+// PUT /api/config: replaces the client section, given as client_config (Bifrost) or client.
+// The rest of the config is saved as it was.
+function putConfig(store: ConfigStore, body: string): ApiReply {
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return badBody()
+  }
+  const raw = find(fs, "client_config") ?? find(fs, "client")
+  if (raw === undefined) return reply(400, errorBody("the body needs a client_config (or client) object"))
+  const problem = clientProblem(raw)
+  if (problem !== "") return reply(400, errorBody(problem))
+  let c: ClientConfig = {}
+  try {
+    c = JSON.parse(raw) as ClientConfig
+  } catch (e) {
+    return badBody()
+  }
+  const r = store.setClient(c)
+  if (r.kind === "error") return errReply(r)
+  return reply(200, JSON.stringify({ status: "success", message: "config updated successfully", client: store.cfg.client ?? {} }))
+}
+
+// GET /api/keys: every provider key in one list, secrets masked (Bifrost's shape).
+function keyList(c: Config): string {
+  const out: { id: string, name: string, provider: string, value: string, models: string[], weight: f64 }[] = []
+  for (const name of providerNames(c)) {
+    for (const k of providerOf(c, name)!.keys ?? []) {
+      out.push({ id: k.id ?? "", name: k.name ?? "", provider: name, value: maskOpt(k.value) ?? "", models: k.models ?? [], weight: k.weight ?? 1.0 })
+    }
+  }
+  return JSON.stringify(out)
+}
+
+// The models named by the providers' keys ("*" is not a model), in Bifrost's list shape:
+// {models: [{name, provider}], total}, filtered by provider and by a case-insensitive query
+// and paged by limit and offset. Models the providers serve but the config does not name
+// are not listed.
+function modelList(c: Config, only: string, query: string, limit: f64, offset: f64): string {
+  const all: { name: string, provider: string }[] = []
+  const want = query.toLowerCase()
+  for (const name of providerNames(c)) {
+    if (only !== "" && name !== only) continue
+    for (const k of providerOf(c, name)!.keys ?? []) {
+      for (const m of k.models ?? []) {
+        if (m === "*" || all.some((x) => x.name === m && x.provider === name)) continue
+        if (want !== "" && !m.toLowerCase().includes(want)) continue
+        all.push({ name: m, provider: name })
+      }
+    }
+  }
+  const from = offset >= 0 ? Math.floor(offset) : 0
+  const n = limit >= 0 ? Math.floor(limit) : 5
+  return JSON.stringify({ models: all.slice(from, from + n), total: all.length })
+}
+
 export function handleApi(store: ConfigStore, method: string, path: string, body: string): ApiReply {
   const m = method.toUpperCase()
   const q = path.indexOf("?")
@@ -1580,7 +1683,29 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   const area = segs[1] ?? ""
   if (area === "config") {
     if (segs.length !== 2) return notFound(p)
+    if (m === "PUT") return putConfig(store, body)
     return m === "GET" ? reply(200, store.redacted()) : notAllowed(m)
+  }
+  if (area === "version") {
+    if (segs.length !== 2) return notFound(p)
+    return m === "GET" ? reply(200, JSON.stringify(RAIJU_VERSION)) : notAllowed(m)
+  }
+  if (area === "keys") {
+    if (segs.length !== 2) return notFound(p)
+    return m === "GET" ? reply(200, keyList(store.cfg)) : notAllowed(m)
+  }
+  if (area === "models") {
+    if (m !== "GET") return notAllowed(m)
+    const sp = new URLSearchParams(q < 0 ? "" : path.slice(q + 1))
+    const limit: f64 = parseFloat(sp.get("limit") ?? "5") ?? 5.0
+    const offset: f64 = parseFloat(sp.get("offset") ?? "0") ?? 0.0
+    if (segs.length === 2) return reply(200, modelList(store.cfg, sp.get("provider") ?? "", sp.get("query") ?? "", limit, offset))
+    if (segs.length === 3) {
+      const pn = segs[2]!
+      if (providerOf(store.cfg, pn) === undefined) return reply(404, errorBody(`no provider ${pn}`))
+      return reply(200, modelList(store.cfg, pn, sp.get("query") ?? "", limit, offset))
+    }
+    return notFound(p)
   }
   if (area === "providers") return providerRoute(store, m, segs, body, p)
   if (area === "governance" && segs.length >= 3) return governanceRoute(store, m, segs, body, p)
@@ -2018,5 +2143,49 @@ test("pricing overrides: CRUD in Bifrost's shape, patch kept as sent", () => {
   expect(handleApi(s, "GET", po, "").body.includes(id)).toBe(true)
   expect(handleApi(s, "DELETE", po + "/" + id, "").status).toBe(200)
   expect(handleApi(s, "DELETE", po + "/" + id, "").status).toBe(404)
+  cleanup(path)
+})
+
+test("client section: known settings with their types only", () => {
+  expect(clientProblem(`{"enable_logging": false, "max_request_body_size_mb": 10, "allowed_origins": ["*"]}`)).toBe("")
+  expect(clientProblem(`{"enable_logging": "yes"}`) === "").toBe(false)
+  expect(clientProblem(`{"max_request_body_size_mb": -1}`) === "").toBe(false)
+  expect(clientProblem(`{"allowed_origins": "*"}`) === "").toBe(false)
+  expect(clientProblem(`{"made_up": true}`) === "").toBe(false)
+  expect(clientProblem(`[1]`) === "").toBe(false)
+})
+
+test("config put replaces only the client section", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, { providers: new Map(), otel: { endpoint: "http://c:4318/v1/traces" } })
+  const r = handleApi(s, "PUT", "/api/config", `{"client_config": {"enable_logging": false, "required_headers": ["x-team"]}}`)
+  expect(r.status).toBe(200)
+  expect(s.cfg.client?.enable_logging).toBe(false)
+  expect((s.cfg.client?.required_headers ?? [])[0] ?? "").toBe("x-team")
+  expect(s.cfg.otel?.endpoint).toBe("http://c:4318/v1/traces")
+  expect(handleApi(s, "PUT", "/api/config", `{"client": {"enable_logging": 1}}`).status).toBe(400)
+  expect(handleApi(s, "PUT", "/api/config", `{"other": {}}`).status).toBe(400)
+  expect(handleApi(s, "PUT", "/api/config", `not json`).status).toBe(400)
+  cleanup(path)
+})
+
+test("version, keys and models: masked keys, configured models in Bifrost's shape", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertProvider("openai", { keys: [{ id: "k1", name: "main", value: "sk-abcdefghijkl", models: ["gpt-4o", "*"] }] }))).toBe(200)
+  expect(statusOf(s.upsertProvider("anthropic", { keys: [{ value: "sk-ant-xyz-12345678", models: ["claude-3-haiku", "gpt-4o"] }] }))).toBe(200)
+  const v = handleApi(s, "GET", "/api/version", "")
+  expect(v.status).toBe(200)
+  const ks = handleApi(s, "GET", "/api/keys", "")
+  expect(ks.body.includes("sk-abcdefghijkl")).toBe(false)
+  expect(ks.body.includes(`"provider":"openai"`)).toBe(true)
+  const all = try JSON.parse(handleApi(s, "GET", "/api/models?limit=10", "").body) as { models: { name: string, provider: string }[], total: number }
+  expect(all.total).toBe(3)
+  expect(all.models[0]!.name).toBe("gpt-4o")
+  const one = try JSON.parse(handleApi(s, "GET", "/api/models/anthropic?query=HAIKU", "").body) as { models: { name: string, provider: string }[], total: number }
+  expect(one.total).toBe(1)
+  expect(one.models[0]!.provider).toBe("anthropic")
+  expect(handleApi(s, "GET", "/api/models/nope", "").status).toBe(404)
+  expect(handleApi(s, "POST", "/api/models", "").status).toBe(405)
   cleanup(path)
 })

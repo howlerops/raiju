@@ -157,6 +157,9 @@ def write_config():
     for name, nc in [("tls-ca", {"ca_cert_pem": pem}), ("tls-skip", {"insecure_skip_verify": True}), ("tls-none", {})]:
         cfg["providers"][name] = {"keys": [], "custom_provider_config": {"base_provider_type": "openai", "is_key_less": True}, "network_config": {"base_url": "https://127.0.0.1:18087", "max_retries": 0, **nc}}
     cfg["mcp"]["client_configs"].append({"name": "local", "connection_type": "stdio", "stdio_config": {"command": "python3", "args": [os.path.join(ROOT, "tests/mcp_stdio.py")], "env": {"MCP_GREETING": "hello"}}})
+    # Azure's passthrough reaches the mock through the endpoint; the price sync is off, with a URL that 404s
+    cfg["providers"]["azure"] = {"keys": [{"name": "az", "value": "az-key", "models": [], "weight": 1.0, "azure_key_config": {"endpoint": MOCK}}]}
+    cfg["pricing_sync"] = {"url": MOCK + "/nodatasheet", "enabled": False}
     cfg["providers"]["vertex"] = {
         "keys": [{"name": "vx", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps(sa)}}],
         "network_config": {"base_url": MOCK},
@@ -1101,6 +1104,61 @@ def main():
         _, _, m = call("GET", "/metrics", base=GW_D)
         check("prometheus_labels are filled from x-bf-dim headers", s == 200 and _re.search(r'bifrost_upstream_requests_total\{[^}]*env="prod",team=""\}', m) is not None, m[:400])
         check("drop_excess_requests logs that it has no effect", "drop_excess_requests has no effect" in open(os.path.join(BUILD, "e2e.direct.log")).read(), "")
+
+        # ---- provider passthroughs (passthrough.tov) ----
+        s, _, b = call("POST", "/openai_passthrough/pt/echo?x=1", {"a": 1}, headers={"authorization": "Bearer caller-key", "x-bf-vk": "sk-bf-nope", "anthropic-beta": "beta-1"})
+        pe = json.loads(b) if s == 200 else {}
+        check("openai passthrough: POST, query and body reach the provider unchanged", s == 200 and pe.get("method") == "POST" and pe.get("path") == "/pt/echo" and pe.get("query") == "?x=1" and json.loads(pe.get("body", "{}")) == {"a": 1}, (s, b))
+        check("openai passthrough: the key's auth replaces the caller's, gateway headers stay home, caller headers go", seen()[-1]["auth"] == "Bearer sk-from-env" and "anthropic-beta=beta-1" in pe.get("headers", []) and "authorization=Bearer caller-key" not in pe.get("headers", []) and not any(x.startswith("x-bf-vk=") for x in pe.get("headers", [])), (seen()[-1], pe))
+        s, _, b = call("GET", "/anthropic_passthrough/pt/echo?beta=true", headers={"x-api-key": "caller-ant"})
+        pe = json.loads(b) if s == 200 else {}
+        check("anthropic passthrough: x-api-key and anthropic-version", s == 200 and pe.get("method") == "GET" and "anthropic-version=2023-06-01" in pe.get("headers", []) and seen()[-1]["auth"] == "sk-ant", (s, b, seen()[-1]))
+        s, _, b = call("POST", "/genai_passthrough/pt/echo", {"contents": []})
+        check("genai passthrough: x-goog-api-key", s == 200 and seen()[-1]["auth"] == "g-key" and json.loads(seen()[-1]["body"]) == {"contents": []}, (s, b))
+        s, _, b = call("GET", "/azure_passthrough/pt/echo?api-version=2024-02-01")
+        check("azure passthrough: api-key and the caller's api-version query", s == 200 and seen()[-1]["auth"] == "az-key" and json.loads(b)["query"] == "?api-version=2024-02-01", (s, b, seen()[-1]))
+        s, _, b = call("POST", "/bedrock_passthrough/knowledgebases/KB1/retrieve", {"retrievalQuery": {"text": "hi"}})
+        kb = [x for x in seen() if x["path"] == "/knowledgebases/KB1/retrieve"]
+        check("bedrock passthrough: SigV4-signed retrieve", s == 200 and len(kb) > 0 and kb[-1]["auth"].startswith("AWS4-HMAC-SHA256"), (s, b, kb[-1:]))
+        s, _, b = call("POST", "/bedrock_passthrough/model/anthropic.claude/converse", {"messages": []})
+        check("bedrock passthrough refuses operations other than InvokeAgent, Retrieve and ApplyGuardrail", s == 400 and "only forwards" in b, (s, b))
+        s, h, b = call("GET", "/openai_passthrough/pt/sse")
+        check("passthrough streams an event stream back unchanged", s == 200 and b == "data: one\n\ndata: two\n\n" and {k.lower(): v for k, v in h.items()}.get("content-type", "").startswith("text/event-stream") and {k.lower(): v for k, v in h.items()}.get("x-upstream-tag") == "sse", (s, h, b))
+        s, h, b = call("GET", "/openai_passthrough/pt/gzip")
+        hl = {k.lower(): v for k, v in h.items()}
+        check("passthrough does not relay the gateway's own or encoding headers", s == 200 and "x-bf-internal" not in hl and "content-encoding" not in hl, hl)
+        s, _, b = call("GET", "/openai_passthrough/pt/x%2Fsecret")
+        check("passthrough refuses encoded slashes", s == 400 and "invalid passthrough path" in b, (s, b))
+        s, _, b = call("POST", "/chatgpt_passthrough/backend-api/other", {})
+        check("chatgpt passthrough forwards only the Codex responses endpoint", s == 404 and "codex/responses" in b, (s, b))
+        s, _, b = call("GET", "/runware_passthrough/v1/tasks")
+        check("runware passthrough is not served", s == 404, (s, b))
+        s, _, b = call("GET", "/api/version")
+        check("GET /api/version", s == 200 and json.loads(b) == "0.1.0", (s, b))
+        s, _, b = call("GET", "/api/keys")
+        check("GET /api/keys lists keys with secrets masked", s == 200 and any(k.get("provider") == "openai" for k in json.loads(b)) and "bad-key" not in b and '"sk-ant"' not in b, b[:300])
+        s, _, b = call("GET", "/api/models?provider=openai&limit=50")
+        check("GET /api/models lists the configured models in Bifrost's shape", s == 200 and {"name": "rotate-me", "provider": "openai"} in json.loads(b)["models"], (s, b))
+        s, _, b = call("GET", "/api/models/nope")
+        check("GET /api/models/{provider} is a 404 for an unknown provider", s == 404, (s, b))
+        s, _, b = call("GET", "/api/config")
+        client = json.loads(b).get("client", {})
+        client["drop_excess_requests"] = True
+        s, _, b = call("PUT", "/api/config", {"client_config": client})
+        s2, _, b2 = call("GET", "/api/config")
+        check("PUT /api/config replaces the client section and saves it", s == 200 and json.loads(b2)["client"].get("drop_excess_requests") is True, (s, b, b2[:300]))
+        s, _, b = call("PUT", "/api/config", {"client_config": {"no_such_setting": 1}})
+        check("PUT /api/config refuses unknown settings", s == 400, (s, b))
+        s, _, b = call("POST", "/api/pricing/force-sync")
+        check("pricing force-sync reports a failed datasheet fetch", s == 500 and "HTTP 404" in b, (s, b))
+        s, _, b = call("GET", "/api/pricing/force-sync")
+        check("pricing force-sync is POST only", s == 405, (s, b))
+        # the virtual-key gate, on the gateway that enforces inference auth
+        GW_BF = "http://127.0.0.1:18093"
+        s, _, b = call("POST", "/openai_passthrough/pt/echo", {}, base=GW_BF)
+        check("passthrough needs a virtual key when inference auth is enforced", s == 401, (s, b))
+        s, _, b = call("POST", "/openai_passthrough/pt/echo", {}, headers={"x-bf-vk": "sk-bf-dialect"}, base=GW_BF)
+        check("passthrough with a virtual key goes through", s == 200 and seen()[-1]["auth"] == "Bearer sk-from-env", (s, b))
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")

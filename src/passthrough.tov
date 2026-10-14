@@ -1,0 +1,400 @@
+// Raw passthrough to a provider's own API (Bifrost's /openai_passthrough, /anthropic_passthrough,
+// /azure_passthrough, /bedrock_passthrough, /genai_passthrough and /chatgpt_passthrough). The
+// method, the path after the prefix, the query, the body and the caller's safe headers go
+// upstream unchanged; the configured key supplies the auth. The answer comes back as it arrives.
+// Runware (/runware_passthrough) is out of scope.
+import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
+import { addExtraHeaders, trimSlash, proxyOf, tlsOf } from "./providers/types"
+import { sign } from "./providers/bedrock"
+import { pickKey, timeoutMs, kindOf } from "./router"
+import { errorJson } from "./schemas"
+import { deadline } from "./deadline"
+
+// One prefix: the configured provider it uses, that provider's wire kind, and the base URL
+// the remainder is appended to (empty when the key or the provider's config sets it).
+type PassRoute = { prefix: string, provider: string, kind: string, base: string, chatgpt: bool }
+
+const ROUTES: PassRoute[] = [
+  { prefix: "/openai_passthrough", provider: "openai", kind: "openai", base: "https://api.openai.com", chatgpt: false },
+  { prefix: "/anthropic_passthrough", provider: "anthropic", kind: "anthropic", base: "https://api.anthropic.com", chatgpt: false },
+  { prefix: "/azure_passthrough", provider: "azure", kind: "azure", base: "", chatgpt: false },
+  { prefix: "/bedrock_passthrough", provider: "bedrock", kind: "bedrock", base: "", chatgpt: false },
+  { prefix: "/genai_passthrough", provider: "gemini", kind: "gemini", base: "https://generativelanguage.googleapis.com", chatgpt: false },
+  // the Codex responses endpoint only, not a general ChatGPT backend proxy
+  { prefix: "/chatgpt_passthrough", provider: "openai", kind: "openai", base: "https://chatgpt.com", chatgpt: true },
+]
+
+// The route for a request path and the remainder after its prefix (rooted, "/" when empty).
+// A prefix matches only at a segment boundary.
+export function routeFor(path: string): { r: PassRoute, rest: string } | undefined {
+  for (const r of ROUTES) {
+    if (path === r.prefix) return { r: r, rest: "/" }
+    if (path.startsWith(r.prefix + "/")) return { r: r, rest: path.slice(r.prefix.byteLength) }
+  }
+  return undefined
+}
+
+// Whether a request path belongs to a passthrough route.
+export function passthroughPath(path: string): bool {
+  return routeFor(path) !== undefined
+}
+
+// Why a remainder cannot be joined onto a base URL, or "" when it can. It must be rooted by
+// exactly one "/", carry no backslash, scheme, control character, userinfo in its first segment
+// or dot-dot segment, and no percent-encoded dot, slash, backslash or at sign that a server
+// could decode into one.
+export function badPath(p: string): string {
+  if (!p.startsWith("/")) return "must start with /"
+  if (p.startsWith("//")) return "must not start with //"
+  if (p.includes("\\") || p.includes("://")) return "must not contain a backslash or a scheme"
+  const b = new TextEncoder().encode(p)
+  for (let i = 0; i < b.length; i++) {
+    const c = int(b[i]!)
+    if (c < 32 || c === 127) return "must not contain control characters"
+  }
+  const first = p.slice(1).split("/")[0] ?? ""
+  if (first.includes("@")) return "first segment must not contain @"
+  for (const s of p.split("/")) {
+    if (s === "..") return "must not contain .. segments"
+  }
+  const low = p.toLowerCase()
+  for (const enc of ["%2e", "%2f", "%5c", "%40"]) {
+    if (low.includes(enc)) return "must not percent-encode dots, slashes, backslashes or @"
+  }
+  return ""
+}
+
+// The upstream URL: the base with its trailing slash dropped, the remainder, then the raw query.
+export function passUrl(base: string, rest: string, query: string): string {
+  const u = trimSlash(base) + rest
+  return query === "" ? u : u + "?" + query
+}
+
+// Whether the caller's Authorization is a JWT bearer (ChatGPT/Codex OAuth), which Bifrost
+// forwards in place of the key. Plain API keys do not match.
+export function isJWTBearer(auth: string): bool {
+  if (!auth.toLowerCase().startsWith("bearer ")) return false
+  const parts = auth.slice(7).trim().split(".")
+  return parts.length === 3 && parts[0]!.startsWith("eyJ") && parts[1] !== "" && parts[2] !== ""
+}
+
+// Caller headers that never go upstream: the caller's credentials, hop-by-hop headers, the
+// body length (fetch sets it) and the gateway's own x-bf-* and x-model-provider headers.
+export function keepRequestHeader(name: string): bool {
+  const k = name.toLowerCase()
+  if (k.startsWith("x-bf-")) return false
+  return !["authorization", "api-key", "x-api-key", "x-goog-api-key", "host", "connection", "transfer-encoding", "cookie", "proxy-authorization", "accept-encoding", "content-length", "x-model-provider"].includes(k)
+}
+
+// Response headers that are not relayed: hop-by-hop, the encoding and length fetch already
+// applied to the body, cookies and the gateway's own x-bf-* headers.
+export function keepResponseHeader(name: string): bool {
+  const k = name.toLowerCase()
+  if (k.startsWith("x-bf-")) return false
+  return !["connection", "keep-alive", "transfer-encoding", "set-cookie", "proxy-authenticate", "www-authenticate", "content-length", "content-encoding"].includes(k)
+}
+
+// The service for a Bedrock passthrough request, or "" when the path is not one of the three
+// operations Bifrost forwards (InvokeAgent, Retrieve and ApplyGuardrail). Each id is checked
+// against the character set AWS gives it.
+export function bedrockService(method: string, rest: string): string {
+  if (method.toUpperCase() !== "POST") return ""
+  const parts = rest.slice(1).split("/")
+  if (parts.length === 7 && parts[0] === "agents" && parts[2] === "agentAliases" && parts[4] === "sessions" && parts[6] === "text") {
+    if (alnumId(parts[1]!, 128) && alnumId(parts[3]!, 128) && sessionId(parts[5]!)) return "bedrock-agent-runtime"
+    return ""
+  }
+  if (parts.length === 3 && parts[0] === "knowledgebases" && parts[2] === "retrieve") {
+    return alnumId(parts[1]!, 128) ? "bedrock-agent-runtime" : ""
+  }
+  if (parts.length === 5 && parts[0] === "guardrail" && parts[2] === "version" && parts[4] === "apply") {
+    if (!alnumId(parts[1]!, 128)) return ""
+    const v = parts[3]!
+    if (v === "DRAFT" || digitsVersion(v)) return "bedrock-runtime"
+    return ""
+  }
+  return ""
+}
+
+// 1 to max ASCII letters or digits.
+function alnumId(s: string, max: int): bool {
+  if (s === "" || s.byteLength > max) return false
+  for (const ch of s.chars()) {
+    const ok = (ch >= "0" && ch <= "9") || (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")
+    if (!ok) return false
+  }
+  return true
+}
+
+// 1 to 128 of [0-9a-zA-Z._:-], not only dots.
+function sessionId(s: string): bool {
+  if (s === "" || s.byteLength > 128) return false
+  let dots = true
+  for (const ch of s.chars()) {
+    const ok = (ch >= "0" && ch <= "9") || (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || ch === "." || ch === "_" || ch === ":" || ch === "-"
+    if (!ok) return false
+    if (ch !== ".") dots = false
+  }
+  return !dots
+}
+
+// A guardrail version: 1 to 8 digits, the first not zero.
+function digitsVersion(s: string): bool {
+  if (s.byteLength === 0 || s.byteLength > 8 || s.startsWith("0")) return false
+  for (const ch of s.chars()) {
+    if (ch < "0" || ch > "9") return false
+  }
+  return true
+}
+
+// The key that serves a passthrough request: an unrestricted key when there is one, else the
+// first key. undefined when the provider has none.
+export function passKey(p: ProviderConfig): KeyConfig | undefined {
+  const ks = p.keys ?? []
+  if (ks.length === 0) return undefined
+  const pool = ks.filter((k) => (k.models ?? []).length === 0)
+  const i = pool.length > 0 ? pickKey(pool, "", new Set<int>(), undefined) : -1
+  if (i >= 0) return pool[i]!
+  return ks[0]!
+}
+
+// The copy between an upstream body and the caller's: the caller's stream is fed chunk by chunk
+// (Tov's fetch body cannot be handed to a Response as it is), and a caller that goes away
+// stops the copy.
+class Relay {
+  ctl: ReadableStreamDefaultController | undefined = undefined
+  cancelled = false
+}
+
+// The caller's stream of an upstream body; the copy runs in the background.
+function relay(upstream: ReadableStream): ReadableStream {
+  const rl = new Relay()
+  const out = new ReadableStream({
+    start: (c) => {
+      rl.ctl = c
+    },
+    cancel: () => {
+      rl.cancelled = true
+    },
+  })
+  copyChunks(upstream, rl)
+  return out
+}
+
+async function copyChunks(upstream: ReadableStream, rl: Relay): Promise<void> {
+  try {
+    const reader = upstream.getReader()
+    while (!rl.cancelled) {
+      const r = await reader.read()
+      if (r.done) break
+      const v = r.value
+      const c = rl.ctl
+      if (v !== undefined && c !== undefined) c.enqueue(v)
+    }
+  } catch (e) {
+    // the upstream broke off: the caller's body ends here
+  }
+  const c = rl.ctl
+  if (c !== undefined && !rl.cancelled) {
+    try {
+      c.close()
+    } catch (e) {
+      // already closed by the caller
+    }
+  }
+}
+
+function errorReply(status: int, message: string, type: string): Response {
+  return new Response(errorJson(message, type, undefined), { status: status, headers: { "content-type": "application/json" } })
+}
+
+// The Bedrock host and scheme for a service: the provider's base_url when set, else the
+// regional endpoint of the key's region.
+function bedrockHost(p: ProviderConfig, key: KeyConfig, service: string): { host: string, scheme: string } {
+  const b = p.network_config?.base_url ?? ""
+  const scheme = b.startsWith("http://") ? "http://" : "https://"
+  if (b !== "") {
+    const u = URL.parse(b)
+    if (u !== undefined) return { host: u.host, scheme: scheme }
+  }
+  const region = key.bedrock_key_config?.region ?? "us-east-1"
+  return { host: `${service}.${region}.amazonaws.com`, scheme: "https://" }
+}
+
+// Serves one passthrough request. The remainder of the path and the query go upstream as they
+// were sent; the answer is streamed back when the upstream streams it.
+export async function passthroughRoute(cfg: Config, req: Request): Promise<Response> throws TypeError {
+  const u = URL.parse(req.url)
+  const path = u === undefined ? "" : u.pathname
+  const hit = routeFor(path)
+  if (hit === undefined) return errorReply(404, "no passthrough route matches the request path", "invalid_request_error")
+  const r = hit.r
+  const rest = hit.rest
+  const method = req.method.toUpperCase()
+  const bad = badPath(rest)
+  if (bad !== "") return errorReply(400, "invalid passthrough path: " + bad, "invalid_request_error")
+  if (r.chatgpt && !(method === "POST" && rest === "/backend-api/codex/responses")) {
+    return errorReply(404, "the chatgpt passthrough only forwards POST /backend-api/codex/responses", "invalid_request_error")
+  }
+  const service = r.kind === "bedrock" ? bedrockService(method, rest) : ""
+  if (r.kind === "bedrock" && service === "") {
+    return errorReply(400, "bedrock passthrough only forwards POST InvokeAgent, Retrieve and ApplyGuardrail requests", "invalid_request_error")
+  }
+  const p = providerOf(cfg, r.provider)
+  if (p === undefined || kindOf(r.provider, p) !== r.kind) return errorReply(404, `provider "${r.provider}" is not configured`, "invalid_request_error")
+  const hasBody = method !== "GET" && method !== "HEAD"
+  const qi = req.url.indexOf("?")
+  const query = qi < 0 ? "" : req.url.slice(qi + 1)
+
+  // a caller's ChatGPT (OAuth JWT) or Claude Code OAuth token replaces the key, over https only
+  const caller = req.headers.get("authorization") ?? ""
+  const https = r.base.startsWith("https://") || (p.network_config?.base_url ?? "").startsWith("https://")
+  const forwardCaller = https && ((r.kind === "openai" && isJWTBearer(caller)) || (r.kind === "anthropic" && caller.toLowerCase().startsWith("bearer sk-ant-oat")))
+  const key: KeyConfig | undefined = passKey(p)
+  if (key === undefined && !forwardCaller && r.kind !== "bedrock") {
+    const keyless = p.custom_provider_config?.is_key_less ?? false
+    if (!keyless) return errorReply(404, `provider "${r.provider}" has no key`, "invalid_request_error")
+  }
+  const k: KeyConfig = key ?? { value: "" }
+  const keyValue = k.value ?? ""
+
+  let body: u8[] = []
+  let bodyText = ""
+  if (hasBody) {
+    try {
+      // Bedrock signs the body's text; every other route forwards the bytes as they came
+      if (r.kind === "bedrock") {
+        bodyText = await req.text()
+        body = new TextEncoder().encode(bodyText)
+      } else body = await req.bytes()
+    } catch (e) {
+      return errorReply(400, `invalid request body: ${e.message}`, "invalid_request_error")
+    }
+  }
+
+  let hs: Map<string, string> = new Map()
+  req.headers.forEach((v, name) => {
+    if (keepRequestHeader(name)) hs.set(name.toLowerCase(), v)
+  })
+  let up = ""
+  if (r.kind === "bedrock") {
+    const bh = bedrockHost(p, k, service)
+    up = bh.scheme + bh.host + rest + (query === "" ? "" : "?" + query)
+    const bk = k.bedrock_key_config
+    if ((bk?.access_key ?? "") !== "") {
+      // SigV4 over the path and body; the query is not part of the signed canonical request here
+      const signed = sign({ accessKey: bk?.access_key ?? "", secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token, region: bk?.region ?? "us-east-1" }, service, bh.host, rest, bodyText, Date.now())
+      for (const sk of signed.keys()) hs.set(sk, signed.get(sk)!)
+    } else if (keyValue !== "") {
+      hs.set("authorization", "Bearer " + keyValue)
+    }
+  } else {
+    let base = r.base
+    if (r.kind === "azure") {
+      base = k.azure_key_config?.endpoint ?? p.network_config?.base_url ?? ""
+      if (base === "") return errorReply(400, `azure provider "${r.provider}" has no endpoint`, "invalid_request_error")
+    } else if (!r.chatgpt && (p.network_config?.base_url ?? "") !== "") {
+      base = p.network_config?.base_url ?? base
+    }
+    up = passUrl(base, rest, query)
+    if (forwardCaller) {
+      hs.set("authorization", caller)
+    } else if (keyValue !== "") {
+      if (r.kind === "azure") hs.set("api-key", keyValue)
+      else if (r.kind === "anthropic") hs.set("x-api-key", keyValue)
+      else if (r.kind === "gemini") hs.set("x-goog-api-key", keyValue)
+      else hs.set("authorization", "Bearer " + keyValue)
+    }
+    if (r.kind === "anthropic" && !hs.has("anthropic-version")) hs.set("anthropic-version", "2023-06-01")
+  }
+  addExtraHeaders(&hs, p)
+
+  const dl = deadline(timeoutMs(p))
+  try {
+    let res: Response
+    const px = proxyOf(p)
+    const tls = tlsOf(p)
+    const hr: Record<string, string> = hs
+    if (hasBody) res = try await fetch(up, { method: method, headers: hr, body: body, signal: dl.controller.signal, proxy: px, tls: tls })
+    else res = try await fetch(up, { method: method, headers: hr, signal: dl.controller.signal, proxy: px, tls: tls })
+    const rh: Record<string, string> = new Map()
+    res.headers.forEach((v, name) => {
+      if (keepResponseHeader(name)) rh.set(name.toLowerCase(), v)
+    })
+    // the upstream's stream is copied to the caller as it arrives; the deadline covers the head
+    const st = res.body
+    if (st !== undefined) {
+      dl.finish()
+      return new Response(relay(st), { status: res.status, headers: rh })
+    }
+    const bytes = try await res.bytes()
+    dl.finish()
+    return new Response(bytes, { status: res.status, headers: rh })
+  } catch (e) {
+    dl.finish()
+    return errorReply(502, `${r.provider} passthrough request failed: ${e.message}`, "api_connection_error")
+  }
+}
+
+test("routes map a prefix to its provider and remainder", () => {
+  const a = routeFor("/openai_passthrough/v1/chat/completions")!
+  expect(a.r.provider).toBe("openai")
+  expect(a.rest).toBe("/v1/chat/completions")
+  expect(routeFor("/anthropic_passthrough")!.rest).toBe("/")
+  expect(routeFor("/genai_passthrough/v1beta/models/x:generateContent")!.r.kind).toBe("gemini")
+  expect(routeFor("/chatgpt_passthrough/backend-api/codex/responses")!.r.chatgpt).toBe(true)
+  expect(routeFor("/openai_passthroughx/v1")).toBeUndefined()
+  expect(routeFor("/runware_passthrough/v1")).toBeUndefined()
+  expect(routeFor("/openai/v1/chat/completions")).toBeUndefined()
+  expect(passthroughPath("/azure_passthrough/openai/x")).toBe(true)
+})
+
+test("unsafe remainders are refused", () => {
+  expect(badPath("/v1/chat")).toBe("")
+  expect(badPath("v1") === "").toBe(false)
+  expect(badPath("//host/x") === "").toBe(false)
+  expect(badPath("/a\\b") === "").toBe(false)
+  expect(badPath("/https://evil") === "").toBe(false)
+  expect(badPath("/v1/../secret") === "").toBe(false)
+  expect(badPath("/x%2e%2e/secret") === "").toBe(false)
+  expect(badPath("/x%2F..") === "").toBe(false)
+  expect(badPath("/user@host/x") === "").toBe(false)
+  expect(badPath("/models/claude@20250929")).toBe("")
+})
+
+test("passthrough urls join base, remainder and query", () => {
+  expect(passUrl("https://api.openai.com/", "/v1/models", "")).toBe("https://api.openai.com/v1/models")
+  expect(passUrl("http://127.0.0.1:18099", "/v1/x", "limit=2&after=a")).toBe("http://127.0.0.1:18099/v1/x?limit=2&after=a")
+})
+
+test("bedrock allows the three operations and no others", () => {
+  expect(bedrockService("POST", "/model/x/converse")).toBe("")
+  expect(bedrockService("GET", "/knowledgebases/KB1/retrieve")).toBe("")
+  expect(bedrockService("POST", "/knowledgebases/KB1/retrieve")).toBe("bedrock-agent-runtime")
+  expect(bedrockService("POST", "/guardrail/gr1/version/DRAFT/apply")).toBe("bedrock-runtime")
+  expect(bedrockService("POST", "/guardrail/gr1/version/012/apply")).toBe("")
+  expect(bedrockService("POST", "/guardrail/gr1/version/3/apply")).toBe("bedrock-runtime")
+  expect(bedrockService("POST", "/agents/A1/agentAliases/L1/sessions/s.1-2:x/text")).toBe("bedrock-agent-runtime")
+  expect(bedrockService("POST", "/agents/A1/agentAliases/L1/sessions/s%2F/text")).toBe("")
+  expect(bedrockService("POST", "/agents/A1/agentAliases/L1/sessions/s-1/text")).toBe("bedrock-agent-runtime")
+  expect(bedrockService("POST", "/agents/A1/agentAliases/L1/sessions/../text")).toBe("")
+})
+
+test("only a JWT bearer is forwarded", () => {
+  expect(isJWTBearer("Bearer eyJhbGc.eyJzdWIi.sig")).toBe(true)
+  expect(isJWTBearer("bearer eyJhbGc.eyJzdWIi.sig")).toBe(true)
+  expect(isJWTBearer("Bearer sk-abc")).toBe(false)
+  expect(isJWTBearer("Bearer sk-bf-abc.def.ghi")).toBe(false)
+  expect(isJWTBearer("Bearer eyJ.a")).toBe(false)
+})
+
+test("caller credentials and gateway headers stay home", () => {
+  expect(keepRequestHeader("Authorization")).toBe(false)
+  expect(keepRequestHeader("x-api-key")).toBe(false)
+  expect(keepRequestHeader("x-bf-vk")).toBe(false)
+  expect(keepRequestHeader("x-model-provider")).toBe(false)
+  expect(keepRequestHeader("anthropic-beta")).toBe(true)
+  expect(keepRequestHeader("content-type")).toBe(true)
+  expect(keepResponseHeader("content-encoding")).toBe(false)
+  expect(keepResponseHeader("content-type")).toBe(true)
+})
