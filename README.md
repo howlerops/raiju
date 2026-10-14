@@ -52,6 +52,8 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   Groq, Mistral, xAI, DeepSeek, Cerebras, Fireworks, Together, Nebius, Parasail,
   OpenRouter, Perplexity, Ollama, vLLM, SGLang, LM Studio, and custom
   OpenAI-compatible providers (`custom_provider_config`).
+- **Compat routes and proxies:** `/litellm/*` and `/langchain/*` prefixes, OCR
+  pass-through (`/v1/ocr`), per-provider HTTP proxies (`proxy_config`, with credentials).
 - **Reliability:** fallback chains, retries with jittered exponential backoff
   and `Retry-After`, key rotation on 401/403, weighted key selection with
   per-key model lists, key pinning (`x-bf-api-key`), timeouts, `x-bf-eh-*`

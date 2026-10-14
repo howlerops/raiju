@@ -110,6 +110,22 @@ def write_config():
     json.dump(b, open(os.path.join(BUILD, "e2e.node-b.json"), "w"))
     return path
 
+def start_proxy():
+    """An HTTP forward proxy stand-in on 18095 that records what it is asked for and answers itself."""
+    import http.server, threading
+    got = []
+    class P(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length", "0")))
+            got.append({"target": self.path, "auth": self.headers.get("proxy-authorization", "")})
+            body = json.dumps({"id": "p1", "object": "chat.completion", "created": 1, "model": "m", "choices": [{"index": 0, "message": {"role": "assistant", "content": "via proxy"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}})
+            self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body.encode())
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 18095), P)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, got
+
 def start_idp():
     """A tiny OpenID provider on 18096: discovery, JWKS and a token endpoint that
     signs ID tokens with a throwaway RSA key (openssl)."""
@@ -156,6 +172,7 @@ def main():
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
     idp, idp_state = start_idp()
+    proxy, proxied = start_proxy()
     gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=subprocess.DEVNULL)
     gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18097", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.node-b.json")], env=env, stderr=subprocess.DEVNULL)
     try:
@@ -498,6 +515,17 @@ def main():
         s, _, b = call("GET", "/api/alerts")
         check("alert state is visible", s == 200 and '"firing"' in b, b[:300])
 
+        # --- X07 ---
+        s, _, b = chat("proxied/gpt-4o-mini", seed=990, headers={"x-bf-mcp-include-clients": "none"})
+        import base64 as _b64
+        check("provider requests go through its HTTP proxy with credentials", s == 200 and "via proxy" in b and proxied and proxied[-1]["target"] == "http://upstream.example:8000/v1/chat/completions" and proxied[-1]["auth"] == "Basic " + _b64.b64encode(b"proxy-user:pa:ss").decode(), (s, b, proxied))
+        s, _, b = call("POST", "/litellm/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "via litellm"}]})
+        check("LiteLLM route prefix", s == 200 and "Hello from gpt-4o-mini" in b, b)
+        s, _, b = call("GET", "/langchain/v1/models")
+        check("LangChain route prefix", s == 200 and '"data"' in b, b[:200])
+        s, _, b = call("POST", "/v1/ocr", {"model": "openai/mistral-ocr-latest", "document": {"type": "document_url", "document_url": "https://example.com/a.pdf"}})
+        check("OCR passes through", s == 200 and seen()[-1]["path"] == "/v1/ocr" and json.loads(seen()[-1]["body"])["model"] == "mistral-ocr-latest", (s, b, seen()[-1]))
+
         # --- wave 6 ---
         # clustering: a rate limit of 3 requests shared by both nodes
         vk = {"x-bf-vk": "sk-bf-cluster", "x-bf-mcp-include-clients": "none"}
@@ -547,7 +575,7 @@ def main():
         s, _, b = call("POST", "/v1/chat/completions", "{not json")
         check("bad JSON is a 400", s == 400, b)
     finally:
-        gw.terminate(); gw_b.terminate(); mock.terminate(); idp.shutdown()
+        gw.terminate(); gw_b.terminate(); mock.terminate(); idp.shutdown(); proxy.shutdown()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 

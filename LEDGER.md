@@ -81,7 +81,7 @@ Integration glue (lead): `src/ops.tov` (RBAC gate, audit, alert, cluster and exp
 | ID | Work | Status |
 |---|---|---|
 | X06 | Patch Tov so `Bun.serve` streams `ReadableStream` bodies (`tov-patches/`, `scripts/build-tov.sh`); `Bun.serve` is now the default server, streaming in every worker | done: e2e on both servers, 2 workers 36k rps vs 16k for one process |
-| X07 | Outbound proxies (`proxy_config`; Tov's fetch has `proxy`), LiteLLM/LangChain route prefixes, OCR pass-through | todo |
+| X07 | Outbound proxies (`proxy_config`; Tov's fetch has `proxy`), LiteLLM/LangChain route prefixes, OCR pass-through | done: e2e (proxy request line and credentials, prefixed routes, `/v1/ocr`) |
 | X08 | Not possible in this Tov: stdio MCP servers (no process spawning) | won't do |
 
 ## Defects found in review (waves 5–6, fixed)
@@ -93,4 +93,4 @@ Integration glue (lead): `src/ops.tov` (RBAC gate, audit, alert, cluster and exp
 
 ## Next (P2 from SCOPE.md)
 
-Outbound proxies, LiteLLM/LangChain routes, OCR pass-through (X07). Sharing state between the workers of one node.
+Sharing budget, rate-limit and cache state between the workers of one node (today: per process). SOCKS5 proxies (Tov's fetch has HTTP proxies only).
