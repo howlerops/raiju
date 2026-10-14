@@ -52,6 +52,36 @@ Status: `todo` → `assigned` → `review` → `done` (or `blocked`, `rework`).
 - scripts/check.py applied safe fixes at byte offsets; tov reports character columns (corrupted edits on non-ASCII lines).
 - Interface-held class instances crashed (Tov bug): converters and the WebSocket sink are concrete classes now.
 
+## Wave 5 (P2)
+
+| ID | Work | Pri | Files | Status | Acceptance |
+|---|---|---|---|---|---|
+| L21 | Session affinity | P2 | `src/affinity.tov` | assigned | sticky provider/key per `x-bf-session-id` (and fallback headers) with TTL; expires; capacity bound |
+| L22 | Complexity router | P2 | `src/complexity.tov` | assigned | classify prompts SIMPLE/MEDIUM/COMPLEX from deterministic features; tier → target mapping |
+| L23 | MCP agent mode | P2 | `src/agent.tov` | assigned | auto-execute allowed tool calls in a loop with a depth limit, via an injected executor |
+| L24 | Gateway as an MCP server | P2 | `src/mcpserver.tov` | assigned | `/mcp` JSON-RPC: initialize, tools/list, tools/call over the connected servers' tools, scoped by virtual key |
+| L25 | Audit log | P2 | `src/audit.tov` | assigned | admin actions as a hash-chained, HMAC-signed JSONL log with verification and export |
+| L26 | RBAC | P2 | `src/rbac.tov` | assigned | admin users with roles (admin, editor, viewer) and per-route permissions |
+| L27 | Secret managers | P2 | `src/secrets.tov` | assigned | resolve `vault.<path>#<key>` (HashiCorp Vault KV v2) and `aws-sm.<name>#<key>` (AWS Secrets Manager, SigV4) |
+| L28 | Alerting | P2 | `src/alerts.tov` | assigned | rules over error rate, latency, budget use; webhook and Slack delivery; history; cooldowns |
+
+## Wave 6 (queued)
+
+| ID | Work | Pri | Files |
+|---|---|---|---|
+| L29 | Log exports to S3/GCS-compatible storage | P2 | `src/exports.tov` |
+| L30 | SSO (OIDC) for the UI and management API | P2 | `src/oidc.tov` |
+| L31 | Clustering: share budget and rate-limit counters across nodes | P2 | `src/cluster.tov` |
+| L32 | Vertex and Cohere stream converters | P1 | `src/streams.tov` |
+
+## Lead-owned (wave 5)
+
+| ID | Work | Status |
+|---|---|---|
+| X06 | Patch Tov so `Bun.serve` streams `ReadableStream` response bodies (the runtime's `httpWriteRaw`), keeping native multi-process workers and WebSockets; move streaming onto it | in progress |
+| X07 | Outbound proxies (`proxy_config`; Tov's fetch has `proxy`), LiteLLM/LangChain route prefixes, OCR pass-through | todo |
+| X08 | Not possible in this Tov: stdio MCP servers (no process spawning) | won't do |
+
 ## Next (P2 from SCOPE.md)
 
 Session affinity, complexity router, outbound proxies, LiteLLM/LangChain routes, stdio MCP, MCP agent mode, gateway as MCP server, clustering, SSO, RBAC, audit logs, log exports, secret managers, alerting.
