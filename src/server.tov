@@ -153,45 +153,71 @@ function cors(cfg: Config, req: Request, res: Response): Response {
 
 export type ServeOptions = { port: int, hostname: string, workers: int }
 
+function textResponse(body: string, contentType: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", contentType)
+  return new Response(body, { headers: h })
+}
+
+const CHAT_PATHS = ["/v1/chat/completions", "/openai/v1/chat/completions", "/openai/chat/completions"]
+
+// Every HTTP route except the WebSocket upgrade, in one function so both
+// servers (http1 for streaming, Bun.serve as the fallback) share it.
+export async function dispatch(engine: Engine, store: ConfigStore, req: Request): Promise<Response> throws TypeError {
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  const m = req.method
+  const segs = p.split("/")
+  if (m === "GET" || m === "HEAD") {
+    if (p === "/health") return Response.json({ status: "ok" })
+    if (p === "/") return textResponse(INDEX_HTML, "text/html; charset=utf-8")
+    if (p === "/metrics") return textResponse(metrics.render(), "text/plain; version=0.0.4")
+    if (p === "/v1/models" || p === "/openai/v1/models") return cors(engine.cfg, req, await listModels(engine, req))
+    if (p.startsWith("/v1/async/jobs/") && segs.length === 5) return asyncGet(engine.jobs, segs[4]!)
+    if (p === "/api/cache") return admin(engine, req) ?? cacheView(engine)
+    if (p === "/api/logs") return admin(engine, req) ?? logsView(engine, req, false)
+    if (p === "/api/logs/stats") return admin(engine, req) ?? logsView(engine, req, true)
+    if (p === "/api/governance/usage") return admin(engine, req) ?? Response.json({ budgets: engine.gov.budgetUsage() })
+    if (p === "/api/mcp") return admin(engine, req) ?? mcpView(engine)
+    if (p === "/api/health") return admin(engine, req) ?? Response.json({ targets: engine.health.snapshot(Date.now()) })
+  }
+  if (m === "POST") {
+    if (CHAT_PATHS.includes(p) || (p.startsWith("/openai/deployments/") && p.endsWith("/chat/completions"))) return cors(engine.cfg, req, await engine.chat(req))
+    if (p === "/v1/embeddings" || p === "/openai/v1/embeddings") return cors(engine.cfg, req, await engine.embeddings(req))
+    if (p === "/v1/completions" || p === "/openai/v1/completions") return cors(engine.cfg, req, await engine.completions(req))
+    if (p === "/v1/responses" || p === "/openai/v1/responses") return cors(engine.cfg, req, await responsesApi(engine, req))
+    if (p === "/v1/rerank") return cors(engine.cfg, req, await rerank(engine, req))
+    if (p === "/v1/count_tokens") return cors(engine.cfg, req, await countTokens(engine, req, false))
+    if (p === "/anthropic/v1/messages/count_tokens") return cors(engine.cfg, req, await countTokens(engine, req, true))
+    if (p === "/anthropic/v1/messages") return cors(engine.cfg, req, await anthropicMessages(engine, req))
+    if (p === "/v1/mcp/tool/execute") return cors(engine.cfg, req, await engine.executeTool(req))
+    if (p.startsWith("/genai/v1beta/models/") && segs.length === 5) return cors(engine.cfg, req, await genai(engine, req, segs[4]!))
+    if (p.startsWith("/bedrock/model/") && segs.length === 5) return cors(engine.cfg, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
+    if (p.startsWith("/v1/async/")) return await asyncSubmit(engine.jobs, req, p, dispatcher(engine))
+  }
+  // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
+  if (p.startsWith("/api/")) return await manage(engine, store, req, p)
+  // audio, images, files and batches: passed through to OpenAI-compatible providers
+  const media = matchRoute(m, p)
+  if (media !== undefined) {
+    if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
+      return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
+    }
+    return try await handleMedia(engine.cfg, req, media)
+  }
+  if (m === "OPTIONS") {
+    const res = new Response(undefined, { status: 204, headers: { "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS", "access-control-allow-headers": "*", "access-control-max-age": "86400" } })
+    return cors(engine.cfg, req, res)
+  }
+  return errorResponse(404, `no route for ${m} ${p}`, "invalid_request_error", noHeaders())
+}
+
+// The Bun.serve server (used with -server bun): buffered responses, Tov's multi-process workers.
 export function start(engine: Engine, store: ConfigStore, opts: ServeOptions): string {
   const server = Bun.serve<Session>({
     port: opts.port,
     hostname: opts.hostname,
     workers: opts.workers,
-    routes: {
-      "/health": () => Response.json({ status: "ok" }),
-      "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html; charset=utf-8" } }),
-      "/metrics": () => new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4" } }),
-
-      "/v1/chat/completions": { POST: async (req) => cors(engine.cfg, req, await engine.chat(req)) },
-      "/openai/v1/chat/completions": { POST: async (req) => cors(engine.cfg, req, await engine.chat(req)) },
-      "/openai/chat/completions": { POST: async (req) => cors(engine.cfg, req, await engine.chat(req)) },
-      "/openai/deployments/:deployment/chat/completions": { POST: async (req) => cors(engine.cfg, req, await engine.chat(req)) },
-      "/v1/embeddings": { POST: async (req) => cors(engine.cfg, req, await engine.embeddings(req)) },
-      "/openai/v1/embeddings": { POST: async (req) => cors(engine.cfg, req, await engine.embeddings(req)) },
-      "/v1/completions": { POST: async (req) => cors(engine.cfg, req, await engine.completions(req)) },
-      "/openai/v1/completions": { POST: async (req) => cors(engine.cfg, req, await engine.completions(req)) },
-      "/v1/models": { GET: async (req) => cors(engine.cfg, req, await listModels(engine, req)) },
-      "/openai/v1/models": { GET: async (req) => cors(engine.cfg, req, await listModels(engine, req)) },
-
-      "/v1/responses": { POST: async (req) => cors(engine.cfg, req, await responsesApi(engine, req)) },
-      "/openai/v1/responses": { POST: async (req) => cors(engine.cfg, req, await responsesApi(engine, req)) },
-      "/v1/rerank": { POST: async (req) => cors(engine.cfg, req, await rerank(engine, req)) },
-      "/v1/count_tokens": { POST: async (req) => cors(engine.cfg, req, await countTokens(engine, req, false)) },
-      "/anthropic/v1/messages/count_tokens": { POST: async (req) => cors(engine.cfg, req, await countTokens(engine, req, true)) },
-      "/v1/async/jobs/:id": { GET: (req) => asyncGet(engine.jobs, req.params.id) },
-      "/anthropic/v1/messages": { POST: async (req) => cors(engine.cfg, req, await anthropicMessages(engine, req)) },
-      "/genai/v1beta/models/:modelAction": { POST: async (req) => cors(engine.cfg, req, await genai(engine, req, req.params.modelAction)) },
-      "/bedrock/model/:modelId/:action": { POST: async (req) => cors(engine.cfg, req, await bedrockModel(engine, req, req.params.modelId, req.params.action)) },
-
-      "/api/cache": { GET: (req) => admin(engine, req) ?? cacheView(engine) },
-      "/api/logs": { GET: (req) => admin(engine, req) ?? logsView(engine, req, false) },
-      "/api/logs/stats": { GET: (req) => admin(engine, req) ?? logsView(engine, req, true) },
-      "/api/governance/usage": { GET: (req) => admin(engine, req) ?? Response.json({ budgets: engine.gov.budgetUsage() }) },
-      "/v1/mcp/tool/execute": { POST: async (req) => cors(engine.cfg, req, await engine.executeTool(req)) },
-      "/api/mcp": { GET: (req) => admin(engine, req) ?? mcpView(engine) },
-      "/api/health": { GET: (req) => admin(engine, req) ?? Response.json({ targets: engine.health.snapshot(Date.now()) }) },
-    },
     fetch(req, server) {
       const u = URL.parse(req.url)
       const p = u === undefined ? "" : u.pathname
@@ -201,22 +227,7 @@ export function start(engine: Engine, store: ConfigStore, opts: ServeOptions): s
         if (server.upgrade(req, { data: up.session })) return
         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
       }
-      if (p.startsWith("/v1/async/") && req.method === "POST") return asyncSubmit(engine.jobs, req, p, dispatcher(engine))
-      // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
-      if (p.startsWith("/api/")) return manage(engine, store, req, p)
-      // audio, images, files and batches: passed through to OpenAI-compatible providers
-      const media = matchRoute(req.method, p)
-      if (media !== undefined) {
-        if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
-          return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
-        }
-        return handleMedia(engine.cfg, req, media)
-      }
-      if (req.method === "OPTIONS") {
-        const res = new Response(undefined, { status: 204, headers: { "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "*", "access-control-max-age": "86400" } })
-        return cors(engine.cfg, req, res)
-      }
-      return errorResponse(404, `no route for ${req.method} ${req.url}`, "invalid_request_error", noHeaders())
+      return dispatch(engine, store, req)
     },
     websocket: {
       open: (ws) => onOpen(ws),
