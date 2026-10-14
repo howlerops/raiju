@@ -5,6 +5,7 @@ import { readFileSync, existsSync } from "node:fs"
 import { RoutingRule } from "./cel"
 import { OtelConfig } from "./otel"
 import { McpConfig } from "./mcp"
+import { fields, elements, find, rawStr, rawBool, isNull } from "./json"
 
 export type AzureKeyConfig = { endpoint: string, deployments?: Map<string, string>, api_version?: string }
 export type VertexKeyConfig = { project_id: string, region: string, auth_credentials?: string }
@@ -126,6 +127,10 @@ export type LogsStoreConfig = {
   content_logging?: bool,
 }
 
+// A plugin from the config's plugins list. Its "config" object can hold any JSON,
+// which typed parsing can't, so it's kept as raw text in config_json.
+export type PluginSpec = { name: string, enabled?: bool, config_json?: string }
+
 export type PromptCacheConfig = { auto_inject?: bool }
 
 export type PricingEntry = { input_cost_per_token: f64, output_cost_per_token: f64 }
@@ -142,6 +147,7 @@ export type Config = {
   logs_store?: LogsStoreConfig,
   otel?: OtelConfig,
   mcp?: McpConfig,
+  plugins?: PluginSpec[],
 }
 
 // The process environment by name. Tov's process.env takes only names written
@@ -191,26 +197,42 @@ function opt(v: string | undefined): string | undefined {
 }
 
 function resolveKey(k: KeyConfig): KeyConfig {
+  const value = opt(k.value)
   const az = k.azure_key_config
   const br = k.bedrock_key_config
   const vx = k.vertex_key_config
-  return {
-    id: k.id,
-    name: k.name,
-    value: opt(k.value),
-    models: k.models,
-    weight: k.weight,
-    aliases: k.aliases,
-    azure_key_config: az === undefined ? undefined : { endpoint: resolveEnv(az.endpoint), deployments: az.deployments, api_version: az.api_version },
-    bedrock_key_config: br === undefined ? undefined : {
-      access_key: opt(br.access_key),
-      secret_key: opt(br.secret_key),
-      session_token: opt(br.session_token),
-      region: opt(br.region),
-      deployments: br.deployments,
-    },
-    vertex_key_config: vx === undefined ? undefined : { project_id: resolveEnv(vx.project_id), region: resolveEnv(vx.region), auth_credentials: opt(vx.auth_credentials) },
+  // copy the whole key and replace the secret-bearing fields, so new fields survive
+  let n = k
+  n.value = value
+  if (az !== undefined) {
+    const endpoint = resolveEnv(az.endpoint)
+    let a = az
+    a.endpoint = endpoint
+    n.azure_key_config = a
   }
+  if (br !== undefined) {
+    const ak = opt(br.access_key)
+    const sk = opt(br.secret_key)
+    const st = opt(br.session_token)
+    const rg = opt(br.region)
+    let b = br
+    b.access_key = ak
+    b.secret_key = sk
+    b.session_token = st
+    b.region = rg
+    n.bedrock_key_config = b
+  }
+  if (vx !== undefined) {
+    const proj = resolveEnv(vx.project_id)
+    const rg = resolveEnv(vx.region)
+    const creds = opt(vx.auth_credentials)
+    let v = vx
+    v.project_id = proj
+    v.region = rg
+    v.auth_credentials = creds
+    n.vertex_key_config = v
+  }
+  return n
 }
 
 // Replaces every "env.NAME" value in the config with the variable's value.
@@ -221,13 +243,10 @@ export function resolveConfig(inout c: Config): void {
     for (const name of ps.keys()) {
       const p = ps.get(name)!
       const keys = p.keys
-      resolved.set(name, {
-        keys: keys === undefined ? undefined : keys.map((k) => resolveKey(k)),
-        network_config: p.network_config,
-        proxy_config: p.proxy_config,
-        custom_provider_config: p.custom_provider_config,
-        send_back_raw_response: p.send_back_raw_response,
-      })
+      const rk = keys === undefined ? undefined : keys.map((k) => resolveKey(k))
+      let np = p
+      np.keys = rk
+      resolved.set(name, np)
     }
     c.providers = resolved
   }
@@ -241,11 +260,10 @@ export function resolveConfig(inout c: Config): void {
     if (vks !== undefined) {
       const out: VirtualKeyConfig[] = []
       for (const vk of vks) {
-        out.push({
-          id: vk.id, name: vk.name, value: resolveEnv(vk.value), description: vk.description, is_active: vk.is_active,
-          team_id: vk.team_id, customer_id: vk.customer_id, budget_id: vk.budget_id, rate_limit_id: vk.rate_limit_id,
-          provider_configs: vk.provider_configs, key_ids: vk.key_ids,
-        })
+        const value = resolveEnv(vk.value)
+        let n = vk
+        n.value = value
+        out.push(n)
       }
       c.governance!.virtual_keys = out
     }
@@ -269,8 +287,27 @@ export function loadConfig(path: string): Config throws Error {
 // The config as written, with "env.NAME" references kept: what the config store
 // saves back, so secrets never land in the file.
 export function loadRawConfig(path: string): Config throws Error {
-  if (existsSync(path)) return try JSON.parse(try readFileSync(path, "utf8")) as Config
-  return fromEnv()
+  if (!existsSync(path)) return fromEnv()
+  const text = try readFileSync(path, "utf8")
+  let c = try JSON.parse(text) as Config
+  c.plugins = try pluginSpecs(text)
+  return c
+}
+
+// Each plugin with its config object as raw JSON text.
+export function pluginSpecs(configText: string): PluginSpec[] throws SyntaxError {
+  const raw = find(try fields(configText), "plugins")
+  const out: PluginSpec[] = []
+  if (raw === undefined || !raw.startsWith("[")) return out
+  for (const el of try elements(raw)) {
+    const f = try fields(el)
+    const name = rawStr(f, "name")
+    if (name === undefined) continue
+    const conf = find(f, "config")
+    const saved = rawStr(f, "config_json")
+    out.push({ name: name, enabled: rawBool(f, "enabled"), config_json: conf !== undefined && !isNull(conf) ? conf : saved })
+  }
+  return out
 }
 
 const ENV_PROVIDERS: { name: string, env: string }[] = [

@@ -20,6 +20,7 @@ import { LogStore, defaultLogStoreConfig } from "./logstore"
 import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor } from "./otel"
 import { McpManager, injectTools, executeEndpointBody, toolMessage } from "./mcp"
 import { JobStore } from "./jobs"
+import { PluginChain, PluginContext, buildChain } from "./plugins"
 import { Deadline, deadline } from "./deadline"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
@@ -94,7 +95,14 @@ class ReqCtx {
   input = ""
   output = ""
   span: Span | undefined = undefined
+  // headers plugins asked to send upstream
+  upstreamHeaders: Map<string, string> = new Map()
   constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
+}
+
+// One request's plugin context, shared by its pre and post hooks.
+class PluginRun {
+  constructor(public ctx: PluginContext) {}
 }
 
 class LazyChat {
@@ -119,6 +127,7 @@ export class Engine {
   tracer: Tracer | undefined = undefined
   mcp: McpManager | undefined = undefined
   jobs: JobStore
+  plugins: PluginChain | undefined = undefined
   guardInput = false
   guardOutput = false
   pricing: Pricing
@@ -129,6 +138,12 @@ export class Engine {
 
   constructor(public cfg: Config) {
     this.gov = new Governance(cfg)
+    const specs = cfg.plugins ?? []
+    if (specs.length > 0) {
+      const built = buildChain(specs.map((p) => ({ name: p.name, enabled: p.enabled, configJson: p.config_json ?? "{}" })))
+      for (const e of built.errors) console.error(`raiju: plugin: ${e}`)
+      this.plugins = built.chain
+    }
     this.jobs = new JobStore((cfg.client?.async_job_result_ttl ?? 3600) * 1000, 10000)
     const hc = cfg.health
     const d = defaultBreakerConfig()
@@ -212,6 +227,7 @@ export class Engine {
           return { ok: false, status: 400, body: errorJson(e.message, "invalid_request_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
         }
         for (const k of extra.keys()) up.headers.set(k, extra.get(k)!)
+        for (const k of ctx.upstreamHeaders.keys()) up.headers.set(k, ctx.upstreamHeaders.get(k)!)
         attempts += 1
         const tracer = this.tracer
         const parent = ctx.span
@@ -305,6 +321,7 @@ export class Engine {
     this.guardInput = fresh.guardInput
     this.guardOutput = fresh.guardOutput
     this.autoPromptCache = fresh.autoPromptCache
+    this.plugins = fresh.plugins
     this.logRequests = fresh.logRequests
     if (this.cache === undefined) this.cache = fresh.cache
   }
@@ -397,9 +414,10 @@ export class Engine {
   }
 
   // Shared front half of every inference endpoint.
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool): Promise<Response> {
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>): Promise<Response> {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
+    if (upstreamHeaders !== undefined) ctx.upstreamHeaders = upstreamHeaders
     const tracer = this.tracer
     if (tracer !== undefined) ctx.span = tracer.startRequest(op, h.get("traceparent"), Date.now())
     if (this.logStore !== undefined) ctx.input = text
@@ -552,6 +570,30 @@ export class Engine {
     } catch (e) {
       return errorResponse(400, `invalid chat request: ${e.message}`, "invalid_request_error", noHeaders())
     }
+    const chain = this.plugins
+    let run: PluginRun | undefined = undefined
+    if (chain !== undefined) {
+      const r = new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: "chat", model: rawStr(body, "model") ?? "", provider: "", headers: new Map(), values: new Map() })
+      const pre = chain.runPre(&r.ctx, text)
+      if (pre.kind === "short_circuit") {
+        const post = chain.runPost(&r.ctx, pre.status, pre.body)
+        const delay = parseInt(r.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
+        if (delay > 0) await sleep(delay)
+        const hs: Record<string, string> = new Map()
+        hs.set("content-type", pre.contentType)
+        hs.set("x-bf-plugin-short-circuit", "true")
+        return new Response(post.body, { status: pre.status, headers: hs })
+      }
+      run = r
+      if (pre.body !== text) {
+        text = pre.body
+        try {
+          body = fields(text)
+        } catch (e) {
+          return errorResponse(500, `a plugin produced an invalid request: ${e.message}`, "api_error", noHeaders())
+        }
+      }
+    }
     // The typed request is only needed to translate for non-OpenAI providers.
     const typed = new LazyChat(text)
     const stream = rawBool(body, "stream") ?? false
@@ -579,11 +621,15 @@ export class Engine {
       return try providers.chatUpstream(t, try typed.get(), body, autoCache)
     }
     const outGuard = this.guardOutput ? guard : undefined
+    const pluginRun = run
+    const pluginChain = chain
     const translate: Translate = (t, text, requested) => {
       if (!stream) {
         const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
-        if (outGuard === undefined) return tr
-        const g = try applyToCompletion(tr.body, outGuard)
+        let out = tr.body
+        if (pluginChain !== undefined && pluginRun !== undefined) out = pluginChain.runPost(&pluginRun.ctx, 200, out).body
+        if (outGuard === undefined) return { body: out, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+        const g = try applyToCompletion(out, outGuard)
         for (const f of g.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, outGuard.mode), 1.0)
         if (g.blocked) throw new SyntaxError("the response was blocked by guardrails")
         return { body: g.body, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
@@ -595,7 +641,7 @@ export class Engine {
       const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
       return { body: try completionToSse(tr.body, wantUsage), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
     }
-    return await this.serve(req, "chat", undefined, body, text, build, translate, stream)
+    return await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers)
   }
 
   async embeddings(req: Request): Promise<Response> {

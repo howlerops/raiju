@@ -103,13 +103,19 @@ function fail(status: int, message: string): Failure {
   return { kind: "error", status: status, message: message }
 }
 
+// These copy the whole value and replace one field, so config sections and
+// fields this file doesn't know about (auth_config, routing_rules, plugins,
+// otel, ...) survive every save.
 function gov(c: Config): GovernanceConfig {
   const g = c.governance
-  return { budgets: g?.budgets, rate_limits: g?.rate_limits, virtual_keys: g?.virtual_keys, teams: g?.teams, customers: g?.customers }
+  if (g === undefined) return {}
+  return g
 }
 
 function withGov(c: Config, g: GovernanceConfig): Config {
-  return { client: c.client, providers: c.providers, governance: g, cache: c.cache, pricing: c.pricing, prompt_cache: c.prompt_cache, health: c.health, guardrails: c.guardrails }
+  let n = c
+  n.governance = g
+  return n
 }
 
 function copyProviders(c: Config): Map<string, ProviderConfig> {
@@ -122,11 +128,15 @@ function copyProviders(c: Config): Map<string, ProviderConfig> {
 }
 
 function withProviders(c: Config, ps: Map<string, ProviderConfig>): Config {
-  return { client: c.client, providers: ps, governance: c.governance, cache: c.cache, pricing: c.pricing, prompt_cache: c.prompt_cache, health: c.health, guardrails: c.guardrails }
+  let n = c
+  n.providers = ps
+  return n
 }
 
 function withKeys(p: ProviderConfig, keys: KeyConfig[]): ProviderConfig {
-  return { keys: keys, network_config: p.network_config, proxy_config: p.proxy_config, custom_provider_config: p.custom_provider_config, send_back_raw_response: p.send_back_raw_response }
+  let n = p
+  n.keys = keys
+  return n
 }
 
 function findById<T extends HasId>(xs: T[] | undefined, id: string): T | undefined {
@@ -360,23 +370,25 @@ function redactVk(vk: VirtualKeyConfig): VirtualKeyConfig {
 }
 
 function redactConfig(c: Config): Config {
-  const g = c.governance
-  return {
-    client: c.client,
-    providers: redactProviders(c.providers),
-    governance: g === undefined ? undefined : {
-      budgets: g.budgets,
-      rate_limits: g.rate_limits,
-      virtual_keys: g.virtual_keys === undefined ? undefined : g.virtual_keys.map((vk) => redactVk(vk)),
-      teams: g.teams,
-      customers: g.customers,
-    },
-    cache: c.cache,
-    pricing: c.pricing,
-    prompt_cache: c.prompt_cache,
-    health: c.health,
-    guardrails: c.guardrails,
+  const ps = redactProviders(c.providers)
+  const g0 = c.governance
+  let n = c
+  n.providers = ps
+  if (g0 !== undefined) {
+    const vks = g0.virtual_keys
+    const auth = g0.auth_config
+    let g = g0
+    if (vks !== undefined) g.virtual_keys = vks.map((vk) => redactVk(vk))
+    if (auth !== undefined) {
+      g.auth_config = {
+        username: auth.username,
+        password: auth.password === undefined ? undefined : maskSecret(auth.password),
+        token: auth.token === undefined ? undefined : maskSecret(auth.token),
+      }
+    }
+    n.governance = g
   }
+  return n
 }
 
 export class ConfigStore {
@@ -993,6 +1005,35 @@ function authHeader(v: string): Map<string, string> {
   m.set("authorization", v)
   return m
 }
+
+test("saving keeps every config section", () => {
+  const path = "/tmp/raiju-store-sections-" + randomId("t") + ".json"
+  const c: Config = {
+    providers: new Map(),
+    governance: { auth_config: { token: "env.ADMIN" }, routing_rules: [{ id: "r", cel_expression: "true", targets: [{ provider: "openai" }] }] },
+    otel: { endpoint: "http://c:4318/v1/traces" },
+    logs_store: { enabled: true },
+    plugins: [{ name: "mocker", config_json: "{}" }],
+    health: { circuit_breaker: true },
+  }
+  const store = new ConfigStore(path, c)
+  const r = store.upsertBudget({ id: "b", max_limit: 1.0, reset_duration: "1d" })
+  expect(r.kind).toBe("ok")
+  const saved = try readFileSync(path, "utf8")
+  expect(saved.includes(`"auth_config"`)).toBe(true)
+  expect(saved.includes(`"routing_rules"`)).toBe(true)
+  expect(saved.includes(`"otel"`)).toBe(true)
+  expect(saved.includes(`"logs_store"`)).toBe(true)
+  expect(saved.includes(`"plugins"`)).toBe(true)
+  expect(saved.includes(`"health"`)).toBe(true)
+  expect(store.redacted().includes("env.ADMIN")).toBe(true)
+  try unlinkSync(path)
+  try {
+    unlinkSync(path + ".bak")
+  } catch (e) {
+    // no backup on a first save
+  }
+})
 
 test("durations and provider names are validated", () => {
   expect(validDuration("30s")).toBe(true)

@@ -339,6 +339,15 @@ def main():
         s, _, _ = call("GET", "/v1/async/jobs/job_nope")
         check("unknown job is 404", s == 404)
 
+        # Plugins
+        before = len(seen())
+        s, h, b = chat("openai/mock-me")
+        check("mocker plugin short-circuits", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "mocked!" and len(seen()) == before, b)
+        chat("openai/gpt-4o-mini", seed=700)
+        last = seen()[-1]
+        check("header plugin tags upstream requests", last["team"] == "e2e", last)
+        check("maxtokens plugin sets a default", json.loads(last["body"]).get("max_tokens") == 777, last["body"][:200])
+
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
 
