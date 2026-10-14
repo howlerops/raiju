@@ -23,7 +23,7 @@ writeFileSync(config, JSON.stringify({
 
 const procs = [
   spawn(join(root, "build/mock_upstream"), [], { env: { ...process.env, MOCK_PORT: "18199" }, stdio: "ignore" }),
-  spawn(join(root, "build/raiju"), ["-port", "18198", "-host", "127.0.0.1", "-config", config], { stdio: "ignore" }),
+  spawn(join(root, "build/raiju"), ["-port", "18198", "-host", "127.0.0.1", "-config", config, "-server", process.env.RAIJU_SERVER ?? "bun"], { stdio: "ignore" }),
 ]
 const fails = []
 const check = (name, ok, detail = "") => {

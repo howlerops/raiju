@@ -5,11 +5,11 @@ set -euo pipefail
 export TOV_CFLAGS="${TOV_CFLAGS:--DTV_PLAIN_ALLOC}"
 C=${C:-32}; D=${D:-5}
 mkdir -p build
-tov build src/main.tov -o build/raiju >/dev/null
-tov build tests/mock_upstream.tov -o build/mock_upstream >/dev/null
-tov build bench/load.tov -o build/load >/dev/null
+"${TOV:-tov}" build src/main.tov -o build/raiju >/dev/null
+"${TOV:-tov}" build tests/mock_upstream.tov -o build/mock_upstream >/dev/null
+"${TOV:-tov}" build bench/load.tov -o build/load >/dev/null
 MOCK_PORT=18099 build/mock_upstream >/dev/null & MOCK=$!
-build/raiju -port 18098 -host 127.0.0.1 -config bench/bench.config.json 2>/dev/null & GW=$!
+build/raiju -port 18098 -host 127.0.0.1 -config bench/bench.config.json ${RAIJU_ARGS:-} 2>/dev/null & GW=$!
 trap 'kill $MOCK $GW' EXIT
 sleep 0.5
 RATE=${RATE:-0}   # >0: open loop at RATE requests/second

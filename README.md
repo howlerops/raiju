@@ -11,7 +11,7 @@ Scope and priorities: [SCOPE.md](SCOPE.md) (from the
 ## Quick start
 
 ```sh
-curl -fsSL https://tov.sh/install.sh | sh
+make tov                         # Tov with the patches in tov-patches/ (needs git and cargo)
 make build                       # build/raiju (3 MB; links only glibc)
 OPENAI_API_KEY=sk-... build/raiju            # no config: providers from env vars
 build/raiju -app-dir ~/.config/bifrost       # or an existing Bifrost config.json
@@ -37,6 +37,17 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   balancing, guardrails (PII and secret redaction), semantic cache, MCP gateway,
   plugins, request log store, OpenTelemetry, management API with admin auth,
   web UI at `/`. Deployment: Dockerfile, compose and a Helm chart in `deploy/`.
+- **Enterprise:** RBAC for the management API (admin, editor, viewer, auditor;
+  `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), a hash-chained
+  HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting
+  to webhooks and Slack (`alerts`), secrets from HashiCorp Vault and AWS Secrets
+  Manager (`vault.<path>#<field>`, `aws-sm.<id>`), log exports to S3, MinIO or GCS
+  (`log_exports`), and clustering that shares budget and rate-limit usage
+  between nodes (`cluster`).
+- **MCP:** the gateway as an MCP server (`POST /mcp`), and agent mode that runs
+  allowed tool calls itself (`client.mcp_auto_execute`, `mcp_agent_depth`).
+- **Routing:** session affinity (`x-bf-session-id`, `session_affinity`) and a
+  complexity router (`complexity_tier` in routing rules, tiers behind model `auto`).
 - **Providers:** OpenAI, Azure OpenAI, Anthropic, Gemini, Vertex AI, Cohere, Bedrock (SigV4 or API key),
   Groq, Mistral, xAI, DeepSeek, Cerebras, Fireworks, Together, Nebius, Parasail,
   OpenRouter, Perplexity, Ollama, vLLM, SGLang, LM Studio, and custom
@@ -56,20 +67,29 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 
 ## Servers
 
-The default server (`-server http1`) is Raiju's own HTTP/1.1 implementation on
-raw sockets: answers stream to the client chunk by chunk (OpenAI-format,
-Anthropic, Gemini and Bedrock streams are converted as they arrive), and
-WebSockets serve `/v1/realtime`. It runs in one process, which handled about
-16k requests/second in our tests; for more cores, run one process per core
-behind a load balancer (or Helm replicas).
+The default server is Tov's built-in `Bun.serve`. `-workers N` forks N
+processes that share the port, and each one serves WebSockets (`/v1/realtime`).
+Streamed answers go to the client chunk by chunk as a `ReadableStream`
+response body. OpenAI-format, Anthropic, Gemini, Bedrock, Vertex and Cohere
+streams are converted as they arrive. Stream bodies need Tov with the patch in
+[`tov-patches/`](tov-patches/), which `make tov` and the Dockerfile build. The
+patch adds chunked responses on the runtime's existing raw-write path, and it is
+small enough to send upstream.
 
-`-workers N` (N > 1) switches to Tov's built-in server, which forks N
-processes but buffers streamed answers (they arrive complete, as SSE).
+| Server (mock upstream, 64 connections, 4-core VM) | Throughput | Gateway overhead |
+|---|---|---|
+| `-server bun -workers 2` | 36,000 rps | 40 µs mean |
+| `-server bun` (1 process) | 16,300 rps | 68 µs mean |
+| `-server http1` (1 process) | 14,300 rps | 100 µs mean |
+
+`-server http1` is Raiju's own HTTP/1.1 server on raw sockets. It streams too,
+but runs in one process. It stays as a fallback.
 
 ## Known gaps
 
-- Governance, cache and metrics state is in memory per process.
-- Vertex and Cohere streams are buffered (answered in one piece).
+- Within one node, budget, rate-limit and cache state is per worker process.
+  Clustering shares budgets and rate limits between nodes, not between the
+  workers of one node.
 - See [LEDGER.md](LEDGER.md) for what's next.
 
 ## Performance
@@ -97,7 +117,7 @@ At 10,000 RPS the load generator's own core saturates, so those rows (in
 
 Caveats: Raiju passes request and response bodies through mostly untouched,
 while Bifrost parses and re-serializes them and runs more plugins (model
-catalog, telemetry, compat); Raiju also buffers streaming. Bifrost's published
+catalog, telemetry, compat). Bifrost's published
 11 µs is internal overhead on a dedicated t3.xlarge, not this end-to-end
 measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
 5,000 RPS on a busier setup.
@@ -106,7 +126,7 @@ measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
 
 ```sh
 make check   # tov check --json on every file, applying "safe" fixes
-make unit    # tov test (270 tests)
+make unit    # tov test (406 tests)
 make e2e     # gateway against a mock upstream, on both servers
 make ui      # the web UI in headless Chromium against a real gateway
 make bench

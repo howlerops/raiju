@@ -15,7 +15,7 @@ def build():
     os.makedirs(BUILD, exist_ok=True)
     for src, out in [("src/main.tov", "raiju"), ("tests/mock_upstream.tov", "mock_upstream")]:
         env = {**os.environ, "TOV_CFLAGS": os.environ.get("TOV_CFLAGS", "-DTV_PLAIN_ALLOC")}
-        subprocess.run(["tov", "build", os.path.join(ROOT, src), "-o", os.path.join(BUILD, out)], check=True, capture_output=True, env=env)
+        subprocess.run([os.environ.get("TOV", "tov"), "build", os.path.join(ROOT, src), "-o", os.path.join(BUILD, out)], check=True, capture_output=True, env=env)
 
 ADMIN = {"authorization": "Bearer admin-secret"}
 
@@ -156,7 +156,7 @@ def main():
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
     idp, idp_state = start_idp()
-    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "http1")], env=env, stderr=subprocess.DEVNULL)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18098", "-host", "127.0.0.1", "-config", config, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=subprocess.DEVNULL)
     gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18097", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.node-b.json")], env=env, stderr=subprocess.DEVNULL)
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
@@ -411,8 +411,8 @@ def main():
         call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "what is the capital city of france ??"}]})
         check("no semantic lookup without a cache key", not any(x["path"] == "/v1/embeddings" for x in seen()[n:]))
 
-        # Streaming: chunks reach the client as the upstream produces them (http1 server only)
-        if os.environ.get("RAIJU_SERVER", "http1") == "http1":
+        # Streaming: chunks reach the client as the upstream produces them (both servers)
+        if True:
             import socket as _s
             body = json.dumps({"model": "slowai/slow", "stream": True, "messages": [{"role": "user", "content": "count"}]}).encode()
             sock = _s.create_connection(("127.0.0.1", 18098), timeout=10)

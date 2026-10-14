@@ -11,8 +11,8 @@ RATES=${RATES:-"1000 5000 10000"}
 DUR=${DUR:-15s}
 export TOV_CFLAGS="${TOV_CFLAGS:--DTV_PLAIN_ALLOC}"
 mkdir -p build bench/results
-tov build src/main.tov -o build/raiju >/dev/null
-tov build tests/mock_upstream.tov -o build/mock_upstream >/dev/null
+"${TOV:-tov}" build src/main.tov -o build/raiju >/dev/null
+"${TOV:-tov}" build tests/mock_upstream.tov -o build/mock_upstream >/dev/null
 OUT=bench/results/$(date +%Y%m%d-%H%M%S).jsonl
 TMP=$(mktemp -d)
 cp bench/bifrost/config.json "$TMP/config.json"

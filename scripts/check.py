@@ -3,10 +3,10 @@
 
 Usage: scripts/check.py [--no-fix] FILE...
 """
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 def run(files):
-    out = subprocess.run(["tov", "check", "--json", *files], capture_output=True, text=True).stdout
+    out = subprocess.run([os.environ.get("TOV", "tov"), "check", "--json", *files], capture_output=True, text=True).stdout
     return json.loads(out)
 
 def apply_safe(diags):

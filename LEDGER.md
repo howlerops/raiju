@@ -52,36 +52,45 @@ Status: `todo` → `assigned` → `review` → `done` (or `blocked`, `rework`).
 - scripts/check.py applied safe fixes at byte offsets; tov reports character columns (corrupted edits on non-ASCII lines).
 - Interface-held class instances crashed (Tov bug): converters and the WebSocket sink are concrete classes now.
 
-## Wave 5 (P2)
+## Wave 5 (P2, done)
 
-| ID | Work | Pri | Files | Status | Acceptance |
-|---|---|---|---|---|---|
-| L21 | Session affinity | P2 | `src/affinity.tov` | assigned | sticky provider/key per `x-bf-session-id` (and fallback headers) with TTL; expires; capacity bound |
-| L22 | Complexity router | P2 | `src/complexity.tov` | assigned | classify prompts SIMPLE/MEDIUM/COMPLEX from deterministic features; tier → target mapping |
-| L23 | MCP agent mode | P2 | `src/agent.tov` | assigned | auto-execute allowed tool calls in a loop with a depth limit, via an injected executor |
-| L24 | Gateway as an MCP server | P2 | `src/mcpserver.tov` | assigned | `/mcp` JSON-RPC: initialize, tools/list, tools/call over the connected servers' tools, scoped by virtual key |
-| L25 | Audit log | P2 | `src/audit.tov` | assigned | admin actions as a hash-chained, HMAC-signed JSONL log with verification and export |
-| L26 | RBAC | P2 | `src/rbac.tov` | assigned | admin users with roles (admin, editor, viewer) and per-route permissions |
-| L27 | Secret managers | P2 | `src/secrets.tov` | assigned | resolve `vault.<path>#<key>` (HashiCorp Vault KV v2) and `aws-sm.<name>#<key>` (AWS Secrets Manager, SigV4) |
-| L28 | Alerting | P2 | `src/alerts.tov` | assigned | rules over error rate, latency, budget use; webhook and Slack delivery; history; cooldowns |
+| ID | Work | Files | Status | Verified by |
+|---|---|---|---|---|
+| L21 | Session affinity | `src/affinity.tov` | done | unit + e2e (a session stays on the key that worked) |
+| L22 | Complexity router | `src/complexity.tov` | done | unit + e2e (tier map behind `auto`, header override) |
+| L23 | MCP agent mode | `src/agent.tov` | done | unit + e2e (tool call run by the gateway, final answer) |
+| L24 | Gateway as an MCP server | `src/mcpserver.tov` | done | unit + e2e (initialize, tools/list, tools/call, session required) |
+| L25 | Audit log | `src/audit.tov` | done | unit + e2e (actor, denied changes, verify, JSONL export) |
+| L26 | RBAC | `src/rbac.tov` | done | unit + e2e (viewer reads, can't write, can't read audit) |
+| L27 | Secret managers | `src/secrets.tov` | done | unit (SigV4 vectors) + e2e (Vault KV v2 key) |
+| L28 | Alerting | `src/alerts.tov` | done | unit + e2e (webhook fires, state visible) |
 
-## Wave 6 (queued)
+## Wave 6 (done)
 
-| ID | Work | Pri | Files |
-|---|---|---|---|
-| L29 | Log exports to S3/GCS-compatible storage | P2 | `src/exports.tov` |
-| L30 | SSO (OIDC) for the UI and management API | P2 | `src/oidc.tov` |
-| L31 | Clustering: share budget and rate-limit counters across nodes | P2 | `src/cluster.tov` |
-| L32 | Vertex and Cohere stream converters | P1 | `src/streams.tov` |
+| ID | Work | Files | Status | Verified by |
+|---|---|---|---|---|
+| L29 | Log exports to S3/GCS-compatible storage | `src/exports.tov` | done | unit (AWS SigV4 S3 examples) + e2e (signed PUT of JSONL) |
+| L30 | SSO (OIDC) for the UI and management API | `src/oidc.tov` | done | unit (RS256, claims) + e2e (test IdP: PKCE, role from groups, single-use state, audit actor) |
+| L31 | Clustering: shared budget and rate-limit counters | `src/cluster.tov` | done | unit (CRDT laws) + e2e (two nodes share a 3-request limit) |
+| L32 | Vertex and Cohere stream converters | `src/streams_cohere.tov`, `providers/vertex.tov` | done | unit (byte-split Cohere streams) |
 
-## Lead-owned (wave 5)
+Integration glue (lead): `src/ops.tov` (RBAC gate, audit, alert, cluster and export timers, `/mcp`, OIDC routes, secrets).
+
+## Lead-owned (waves 5–6)
 
 | ID | Work | Status |
 |---|---|---|
-| X06 | Patch Tov so `Bun.serve` streams `ReadableStream` response bodies (the runtime's `httpWriteRaw`), keeping native multi-process workers and WebSockets; move streaming onto it | in progress |
+| X06 | Patch Tov so `Bun.serve` streams `ReadableStream` bodies (`tov-patches/`, `scripts/build-tov.sh`); `Bun.serve` is now the default server, streaming in every worker | done: e2e on both servers, 2 workers 36k rps vs 16k for one process |
 | X07 | Outbound proxies (`proxy_config`; Tov's fetch has `proxy`), LiteLLM/LangChain route prefixes, OCR pass-through | todo |
 | X08 | Not possible in this Tov: stdio MCP servers (no process spawning) | won't do |
 
+## Defects found in review (waves 5–6, fixed)
+
+- Agent mode dropped the last call's headers (request id, cache, attempts): it now keeps them.
+- RBAC let viewers and editors read the audit log: it is now limited to admins and auditors.
+- `scripts/check.py` applied "safe" fixes that cascaded from an unrelated error (it added `throws` and `try` across three files). Re-check after fixing the root error; don't apply fixes while it is red.
+- A mock left running from a manual test made e2e flaky (port already bound). Kill stray processes before suites.
+
 ## Next (P2 from SCOPE.md)
 
-Session affinity, complexity router, outbound proxies, LiteLLM/LangChain routes, stdio MCP, MCP agent mode, gateway as MCP server, clustering, SSO, RBAC, audit logs, log exports, secret managers, alerting.
+Outbound proxies, LiteLLM/LangChain routes, OCR pass-through (X07). Sharing state between the workers of one node.

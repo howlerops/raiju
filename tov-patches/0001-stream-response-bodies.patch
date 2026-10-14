@@ -1,0 +1,373 @@
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index 2584eb7..3b73990 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -46,6 +46,9 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "httpDefer" => (vec![], INT),
+         "spawnTail" => (vec![], VOID),
+         "httpRespondTo" => (vec![INT, INT, STR, STR, BOOL], VOID),
++        "httpStreamStart" => (vec![INT, INT, STR], VOID),
++        "httpStreamWrite" => (vec![INT, STR, BOOL], VOID),
++        "httpBuffered" => (vec![INT], INT),
+         "headerIndex" => (vec![STR, STR], INT),
+         "headerValue" => (vec![STR, INT], STR),
+         "headerRemove" => (vec![STR, STR], STR),
+diff --git a/crates/tov/src/driver.rs b/crates/tov/src/driver.rs
+index d0f0fcd..d3cfb12 100644
+--- a/crates/tov/src/driver.rs
++++ b/crates/tov/src/driver.rs
+@@ -20,7 +20,7 @@ const STD_MODULES: &[(&str, &str, bool)] =
+ 
+ /// Globals that come from std/http, as in Bun.
+ pub(crate) const WEB_GLOBALS: &[&str] =
+-    &["Bun", "Request", "Response", "Headers", "URL", "URLSearchParams", "fetch", "AbortController", "AbortSignal", "DOMException", "FetchError", "ReadableStream", "TextEncoder", "TextDecoder", "Blob", "File", "FormData", "Socket", "SocketError", "TCPSocketListener", "WebSocket", "ServerWebSocket", "WebSocketEvent", "MessageEvent", "CloseEvent"];
++    &["Bun", "Request", "Response", "Headers", "URL", "URLSearchParams", "fetch", "AbortController", "AbortSignal", "DOMException", "FetchError", "ReadableStream", "ReadableStreamDefaultController", "TextEncoder", "TextDecoder", "Blob", "File", "FormData", "Socket", "SocketError", "TCPSocketListener", "WebSocket", "ServerWebSocket", "WebSocketEvent", "MessageEvent", "CloseEvent"];
+ 
+ /// The standard module an import names (`"node:fs"`, `"fs"`, `"std/http"`), if any.
+ fn std_module(spec: &str) -> Option<&'static (&'static str, &'static str, bool)> {
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index 4504dcf..186777c 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -827,25 +827,32 @@ export class Response {
+   private signal: AbortSignal | undefined
+   private stream: ReadableStream | undefined
+ 
+-  constructor(body?: BodyInit, init?: ResponseInit) {
+-    this.bodyText = body === undefined ? "" : bodyText(body)
++  constructor(body?: BodyInit | ReadableStream, init?: ResponseInit) {
++    let pushed: ReadableStream | undefined = undefined
++    let plain: BodyInit | undefined = undefined
++    if (body instanceof ReadableStream) {
++      pushed = body
++    } else {
++      plain = body
++    }
++    this.bodyText = plain === undefined ? "" : bodyText(plain)
+     this.hasBody = body !== undefined
+     const status = init?.status
+     this.status = status === undefined ? 200 : Math.trunc(status)
+     this.statusText = init?.statusText ?? ""
+     const h = init?.headers
+     this.rawHeaders = h === undefined ? "" : new Headers(h).wire()
+-    if (body !== undefined && bodyType(body) !== "" && __native.headerIndex(this.rawHeaders, "content-type") < 0) {
+-      this.rawHeaders = __native.headerAppend(this.rawHeaders, "Content-Type", bodyType(body))
++    if (plain !== undefined && bodyType(plain) !== "" && __native.headerIndex(this.rawHeaders, "content-type") < 0) {
++      this.rawHeaders = __native.headerAppend(this.rawHeaders, "Content-Type", bodyType(plain))
+     }
+     this.used = false
+     this.finalUrl = ""
+     this.wasRedirected = false
+-    this.clean = (body === undefined || typeof body === "string" || body instanceof URLSearchParams) && !this.bodyText.startsWith("\uFEFF")
++    this.clean = (plain === undefined || typeof plain === "string" || plain instanceof URLSearchParams) && !this.bodyText.startsWith("\uFEFF")
+     this.id = 0
+     this.handle = undefined
+     this.signal = undefined
+-    this.stream = undefined
++    this.stream = pushed
+   }
+ 
+   // Internal: the response to fetch() request `id`, whose head has arrived.
+@@ -909,6 +916,20 @@ export class Response {
+     }
+     this.used = true
+     const id = this.id
++    const st = this.stream
++    if (id === 0 && st !== undefined && st.pushed) {
++      const parts: string[] = []
++      while (true) {
++        const r = try await st.pull()
++        const v = r.value
++        if (r.done || v === undefined) {
++          break
++        }
++        parts.push(__native.bytesToString(v))
++      }
++      this.clean = false
++      return parts.join("")
++    }
+     if (id === 0) {
+       return this.bodyText
+     }
+@@ -1011,6 +1032,15 @@ export class Response {
+   wireTyped(): bool {
+     return this.hasBody
+   }
++
++  // Internal: the body to send in chunks, for a response made with a ReadableStream.
++  wireStream(): ReadableStream | undefined {
++    const st = this.stream
++    if (this.id === 0 && st !== undefined && st.pushed) {
++      return st
++    }
++    return undefined
++  }
+ }
+ 
+ export type UpgradeOptions<T> = { data?: T, headers?: HeadersInit }
+@@ -1214,9 +1244,41 @@ async function respondLater(id: int, pending: Promise<Response | undefined, Erro
+   }
+   // (nothing: an upgrade, whose connection the response no longer goes to, or a mistake)
+   const r = res ?? new Response("", { status: 500 })
++  const st = r.wireStream()
++  if (st !== undefined) {
++    await pump(id, r, st)
++    return
++  }
+   __native.httpRespondTo(id, r.status, r.wireHeaders(), r.wireBody(), r.wireTyped())
+ }
+ 
++// Sends a stream body with chunked transfer encoding, each chunk as it is enqueued. Works in
++// every worker process (the bytes go out on the worker's own connection). A client that went
++// away cancels the stream.
++async function pump(id: int, r: Response, st: ReadableStream) {
++  __native.httpStreamStart(id, r.status, r.wireHeaders())
++  while (true) {
++    let c: ReadableStreamReadResult = { done: true, value: undefined }
++    try {
++      c = await st.pull()
++    } catch (e) {
++      // the head is out: end the body; the client sees a short stream
++      break
++    }
++    const v = c.value
++    if (c.done || v === undefined) {
++      break
++    }
++    if (__native.httpBuffered(id) < 0) {
++      await st.cancel()
++      __native.httpStreamWrite(id, "", true)
++      return
++    }
++    __native.httpStreamWrite(id, __native.bytesToString(v), false)
++  }
++  __native.httpStreamWrite(id, "", true)
++}
++
+ function internalError(e: Error, method: string, target: string, onError: ((error: Error) => Response) | undefined): Response {
+   console.error(`error: ${e.message}\n${method} - ${target} failed`)
+   if (onError !== undefined) {
+@@ -1311,7 +1373,12 @@ export function serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+       }
+     } else if (res instanceof Response) {
+       server.tookUpgrade()
+-      __native.httpRespond(res.status, res.wireHeaders(), res.wireBody(), res.wireTyped())
++      const st = res.wireStream()
++      if (st !== undefined) {
++        pump(__native.httpDefer(), res, st)
++      } else {
++        __native.httpRespond(res.status, res.wireHeaders(), res.wireBody(), res.wireTyped())
++      }
+     } else {
+       server.tookUpgrade()
+       // Nothing observable follows (the loop runs microtasks next), so the response can go out
+@@ -1535,9 +1602,48 @@ export type ReadableStreamReadResult = { done: bool, value: u8[] | undefined }
+ 
+ // A body as a stream of byte chunks: `res.body`. Read it with `getReader()` (`read()` until
+ // `done`) or `for await (const chunk of res.body)`. A fetch() body streams as it arrives.
++// What a ReadableStream made in the program reads from: `start` gets a controller to
++// enqueue chunks to, `cancel` runs when the reader stops (for a response: the client left).
++export type UnderlyingSource = {
++  start?: (controller: ReadableStreamDefaultController) => void
++  cancel?: () => void
++}
++
++export class ReadableStreamDefaultController {
++  private stream: ReadableStream
++
++  constructor(stream: ReadableStream) {
++    this.stream = stream
++  }
++
++  // Adds a chunk (bytes, or a string as UTF-8).
++  enqueue(chunk: u8[] | string): void {
++    this.stream.push(typeof chunk === "string" ? __native.stringToBytes(chunk) : chunk)
++  }
++
++  close(): void {
++    this.stream.end("")
++  }
++
++  error(e: Error): void {
++    this.stream.end(e.message === "" ? "stream error" : e.message)
++  }
++
++  // Bytes queued and not yet read.
++  get desiredSize(): int {
++    return 0 - this.stream.queued()
++  }
++}
++
+ export class ReadableStream {
+   // a fetch() request's body (0: the chunks below)
+   private id: int
++  // made in the program with an underlying source: chunks arrive through its controller
++  readonly pushed: bool
++  private waiter: ((n: int) => void) | undefined
++  private failure: string
++  private onCancel: (() => void) | undefined
++  private queuedBytes: int
+   private handle: Promise<int> | undefined
+   private signal: AbortSignal | undefined
+   private chunks: u8[][]
+@@ -1545,7 +1651,7 @@ export class ReadableStream {
+   private started: bool
+   private finished: bool
+ 
+-  constructor() {
++  constructor(source?: UnderlyingSource) {
+     this.id = 0
+     this.handle = undefined
+     this.signal = undefined
+@@ -1553,6 +1659,49 @@ export class ReadableStream {
+     this.isLocked = false
+     this.started = false
+     this.finished = false
++    this.pushed = source !== undefined
++    this.waiter = undefined
++    this.failure = ""
++    this.onCancel = source?.cancel
++    this.queuedBytes = 0
++    const start = source?.start
++    if (start !== undefined) {
++      start(new ReadableStreamDefaultController(this))
++    }
++  }
++
++  // Internal (the controller): a chunk for the reader.
++  push(bytes: u8[]): void {
++    if (this.finished) {
++      return
++    }
++    if (bytes.length > 0) {
++      this.chunks.push(bytes)
++      this.queuedBytes += bytes.length
++    }
++    this.wake()
++  }
++
++  // Internal (the controller): no more chunks; a message makes the next read fail.
++  end(failure: string): void {
++    if (this.finished) {
++      return
++    }
++    this.finished = true
++    this.failure = failure
++    this.wake()
++  }
++
++  queued(): int {
++    return this.queuedBytes
++  }
++
++  private wake(): void {
++    const w = this.waiter
++    if (w !== undefined) {
++      this.waiter = undefined
++      w(0)
++    }
+   }
+ 
+   // Internal: the body of fetch() request `id`.
+@@ -1594,8 +1743,15 @@ export class ReadableStream {
+   // Stops the body: a fetch() request is aborted (its connection closed).
+   async cancel(): Promise<void> {
+     this.started = true
++    const already = this.finished
+     this.finished = true
+     this.chunks = []
++    this.queuedBytes = 0
++    const c = this.onCancel
++    if (c !== undefined && !already) {
++      this.onCancel = undefined
++      c()
++    }
+     if (this.id !== 0) {
+       __native.fetchAbort(this.id)
+     }
+@@ -1605,6 +1761,24 @@ export class ReadableStream {
+   async pull(): Promise<ReadableStreamReadResult> throws Error {
+     this.started = true
+     const id = this.id
++    if (this.pushed) {
++      while (true) {
++        const c = this.chunks.shift()
++        if (c !== undefined) {
++          this.queuedBytes -= c.length
++          return { done: false, value: c }
++        }
++        if (this.finished) {
++          if (this.failure !== "") {
++            throw new Error(this.failure)
++          }
++          return { done: true, value: undefined }
++        }
++        await new Promise<int>((resolve) => {
++          this.waiter = resolve
++        })
++      }
++    }
+     if (id === 0 || this.finished) {
+       const c = this.chunks.shift()
+       if (c === undefined) {
+diff --git a/runtime/tov.c b/runtime/tov.c
+index 2bc9474..02795c8 100644
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -4225,6 +4225,43 @@ void tv_native_httpWriteRaw(tv_int id, const char *p, size_t n, int end) {
+     tv_http_mark_dirty(c);
+ }
+ 
++/* A streamed response for deferred request id: httpStreamStart writes the head (chunked
++ * transfer encoding, the date, connection: close when the request asked for it), then each
++ * httpStreamWrite one chunk; last writes the terminating chunk and finishes the response. */
++void tv_native_httpStreamStart(tv_int id, tv_int status, tv_str headers) {
++    if (id <= 0 || id > tv_http_ndeferred) return;
++    tv_http_req *r = tv_http_deferred[id];
++    if (!r || (uintptr_t)r <= (uintptr_t)tv_http_ndeferred) return;
++    if (status < 100 || status > 999) status = 500;
++    tv_http_refresh_date();
++    tv_sb sb = {0};
++    char line[64];
++    int n = snprintf(line, sizeof line, "HTTP/1.1 %d %s\r\n", (int)status, tv_http_reason(status));
++    tv_sb_push(&sb, line, (size_t)n);
++    tv_sb_push(&sb, "transfer-encoding: chunked\r\n", 28);
++    tv_sb_push(&sb, tv_http_date, strlen(tv_http_date));
++    if (!r->keep) tv_sb_push(&sb, "connection: close\r\n", 19);
++    tv_sb_push(&sb, headers.p->data, (size_t)headers.p->len);
++    tv_sb_push(&sb, "\r\n", 2);
++    tv_native_httpWriteRaw(id, sb.data, sb.len, 0);
++    tv_sb_free(&sb);
++}
++
++void tv_native_httpStreamWrite(tv_int id, tv_str data, bool last) {
++    size_t len = (size_t)data.p->len;
++    if (len) {
++        tv_sb sb = {0};
++        char size[24];
++        int n = snprintf(size, sizeof size, "%zx\r\n", len);
++        tv_sb_push(&sb, size, (size_t)n);
++        tv_sb_push(&sb, data.p->data, len);
++        tv_sb_push(&sb, "\r\n", 2);
++        tv_native_httpWriteRaw(id, sb.data, sb.len, 0);
++        tv_sb_free(&sb);
++    }
++    if (last) tv_native_httpWriteRaw(id, "0\r\n\r\n", 5, 1);
++}
++
+ int64_t tv_native_httpBuffered(tv_int id) {
+     if (id <= 0 || id > tv_http_ndeferred) return -1;
+     tv_http_req *r = tv_http_deferred[id];
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 6dfe8fc..a0dc57a 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -740,6 +740,8 @@ extern void (*tv_http_on_gone)(tv_int id);   /* a deferred request's client went
+ /* bytes of deferred request id's response not yet taken by the socket (its own, and what's
+  * queued ahead of it on the connection), or -1 if the client has gone */
+ int64_t tv_native_httpBuffered(tv_int id);
++void tv_native_httpStreamStart(tv_int id, tv_int status, tv_str headers);
++void tv_native_httpStreamWrite(tv_int id, tv_str data, bool last);
+ int tv_native_httpTakeover(tv_int id, tv_sb *rest);
+ void tv_native_httpNodeErrors(tv_int id);   /* malformed requests answered in Node.js's form */
+ extern bool tv_http_v10;
