@@ -1,0 +1,609 @@
+// Plugins in the shape of Bifrost's hooks. Tov can't load shared libraries, so
+// a plugin is a class compiled into the binary and enabled by config. A chain
+// runs each plugin's preRequest in order, and postResponse in reverse for the
+// plugins whose preRequest ran (Bifrost's semantics).
+
+import { Field, fields, find, elements, rawStr, rawNum, isNull, quote, build, setField } from "./json"
+import { errorJson, newId, nowSeconds } from "./schemas"
+
+// Hooks take the context by inout: plugins add headers and share values
+// through ctx.headers and ctx.values, which parameters can't change.
+export type PluginContext = {
+  requestId: string,
+  op: string,
+  model: string,
+  provider: string,
+  headers: Map<string, string>,
+  values: Map<string, string>,
+}
+
+export type PreResult =
+  | { kind: "continue", body: string }
+  | { kind: "short_circuit", status: int, body: string, contentType: string }
+
+export type PostResult = { kind: "continue", body: string }
+
+// Each plugin's hooks pass through unless overridden.
+export abstract class BasePlugin {
+  abstract name(): string
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult throws Error {
+    return { kind: "continue", body: body }
+  }
+
+  postResponse(inout ctx: PluginContext, status: int, body: string): PostResult throws Error {
+    return { kind: "continue", body: body }
+  }
+}
+
+// Which plugins' preRequest ran for this request, as comma-separated indices.
+// It lives in ctx.values because one chain serves many requests at once.
+const RAN_KEY = "plugins.ran"
+
+// A hook that throws is logged and skipped; it never fails the request.
+function safePre(p: BasePlugin, inout ctx: PluginContext, body: string): PreResult | undefined {
+  try {
+    return p.preRequest(&ctx, body)
+  } catch (e) {
+    console.error(`raiju: plugin ${p.name()} preRequest failed: ${e.message}`)
+    return undefined
+  }
+}
+
+function safePost(p: BasePlugin, inout ctx: PluginContext, status: int, body: string): PostResult | undefined {
+  try {
+    return p.postResponse(&ctx, status, body)
+  } catch (e) {
+    console.error(`raiju: plugin ${p.name()} postResponse failed: ${e.message}`)
+    return undefined
+  }
+}
+
+export class PluginChain {
+  constructor(readonly plugins: BasePlugin[]) {}
+
+  // Stops at the first short-circuit. Later plugins' preRequest hooks don't run.
+  runPre(inout ctx: PluginContext, body: string): PreResult {
+    const ran: string[] = []
+    let cur = body
+    for (let i = 0; i < this.plugins.length; i++) {
+      const r = safePre(this.plugins[i]!, &ctx, cur)
+      if (r === undefined) continue
+      ran.push(`${i}`)
+      if (r.kind === "short_circuit") {
+        ctx.values.set(RAN_KEY, ran.join(","))
+        return r
+      }
+      cur = r.body
+    }
+    ctx.values.set(RAN_KEY, ran.join(","))
+    return { kind: "continue", body: cur }
+  }
+
+  // Runs postResponse in reverse, only for the plugins whose preRequest ran.
+  runPost(inout ctx: PluginContext, status: int, body: string): PostResult {
+    const ran = (ctx.values.get(RAN_KEY) ?? "").split(",")
+    ctx.values.delete(RAN_KEY)
+    let cur = body
+    for (let i = this.plugins.length - 1; i >= 0; i--) {
+      if (!ran.includes(`${i}`)) continue
+      const r = safePost(this.plugins[i]!, &ctx, status, cur)
+      if (r !== undefined) cur = r.body
+    }
+    return { kind: "continue", body: cur }
+  }
+}
+
+// ---- header ----
+
+export type HeaderConfig = { set_request_headers?: Map<string, string> }
+
+// Copies configured headers into ctx.headers; the lead forwards them upstream.
+export class HeaderPlugin extends BasePlugin {
+  constructor(readonly config: HeaderConfig) {
+    super()
+  }
+
+  name(): string {
+    return "header"
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult {
+    const set = this.config.set_request_headers
+    if (set !== undefined) {
+      for (const k of set.keys()) ctx.headers.set(k.toLowerCase(), set.get(k)!)
+    }
+    return { kind: "continue", body: body }
+  }
+}
+
+// ---- mocker ----
+
+export type MockRule = {
+  model?: string,
+  contains?: string,
+  status?: int,
+  response?: string,
+  content?: string,
+  latency_ms?: int,
+}
+export type MockerConfig = { rules: MockRule[] }
+
+// An OpenAI chat.completion with one assistant message and zero usage.
+function completionJson(model: string, content: string): string {
+  return `{"id":${quote(newId("mock-"))},"object":"chat.completion","created":${nowSeconds()},"model":${quote(model)},"choices":[{"index":0,"message":{"role":"assistant","content":${quote(content)}},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
+}
+
+// model: exact match or "*"; contains: substring of the request body. A missing
+// field matches anything.
+function matchesRule(r: MockRule, model: string, body: string): bool {
+  const m = r.model
+  if (m !== undefined && m !== "*" && m !== model) return false
+  const c = r.contains
+  if (c !== undefined && c !== "" && body.indexOf(c) < 0) return false
+  return true
+}
+
+// Short-circuits the first matching rule. A rule with no response or content
+// answers with an empty completion.
+export class MockerPlugin extends BasePlugin {
+  constructor(readonly config: MockerConfig) {
+    super()
+  }
+
+  name(): string {
+    return "mocker"
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult {
+    for (const r of this.config.rules) {
+      if (!matchesRule(r, ctx.model, body)) continue
+      const latency = r.latency_ms
+      if (latency !== undefined) ctx.values.set("mock_latency_ms", `${latency}`)
+      const status = r.status ?? 200
+      const raw = r.response
+      if (raw !== undefined) {
+        return { kind: "short_circuit", status: status, body: raw, contentType: "application/json" }
+      }
+      const out = completionJson(ctx.model, r.content ?? "")
+      return { kind: "short_circuit", status: status, body: out, contentType: "application/json" }
+    }
+    return { kind: "continue", body: body }
+  }
+}
+
+// ---- jsonparser ----
+
+export type JsonParserConfig = { strip_markdown_fences: bool }
+
+// Whether a fence's first line is a language tag (json, JSON, json5, ...).
+function isLangTag(tag: string): bool {
+  for (const c of new TextEncoder().encode(tag)) {
+    const v = int(c)
+    const ok = (v >= 48 && v <= 57) || (v >= 65 && v <= 90) || (v >= 97 && v <= 122) || v === 45 || v === 95 || v === 43 || v === 46
+    if (!ok) return false
+  }
+  return true
+}
+
+// The text inside a ```lang ... ``` fence, or undefined when the content is not
+// wrapped in one. The fence must cover the whole content.
+function unfence(s: string): string | undefined {
+  const t = s.trim()
+  if (t.byteLength < 6 || !t.startsWith("```") || !t.endsWith("```")) return undefined
+  let inner = t.slice(3, t.byteLength - 3)
+  const nl = inner.indexOf("\n")
+  if (nl >= 0 && isLangTag(inner.slice(0, nl).trim())) inner = inner.slice(nl + 1)
+  return inner.trim()
+}
+
+// Rewrites choices[].message.content in a chat.completion. Other fields and
+// the whole body are left as they were when nothing is fenced.
+function stripFencesIn(body: string): string throws SyntaxError {
+  let fs = try fields(body)
+  if (rawStr(fs, "object") !== "chat.completion") return body
+  const raw = find(fs, "choices")
+  if (raw === undefined) return body
+  let changed = false
+  const out: string[] = []
+  for (const el of try elements(raw)) {
+    let cf = try fields(el)
+    const mraw = find(cf, "message")
+    if (mraw === undefined) {
+      out.push(el)
+      continue
+    }
+    let mf = try fields(mraw)
+    const content = rawStr(mf, "content")
+    const plain = content === undefined ? undefined : unfence(content)
+    if (plain === undefined) {
+      out.push(el)
+      continue
+    }
+    setField(&mf, "content", quote(plain))
+    setField(&cf, "message", build(mf))
+    out.push(build(cf))
+    changed = true
+  }
+  if (!changed) return body
+  setField(&fs, "choices", "[" + out.join(",") + "]")
+  return build(fs)
+}
+
+export class JsonParserPlugin extends BasePlugin {
+  constructor(readonly config: JsonParserConfig) {
+    super()
+  }
+
+  name(): string {
+    return "jsonparser"
+  }
+
+  postResponse(inout ctx: PluginContext, status: int, body: string): PostResult {
+    if (!this.config.strip_markdown_fences) return { kind: "continue", body: body }
+    // Bodies that aren't chat completions JSON pass through untouched.
+    try {
+      return { kind: "continue", body: try stripFencesIn(body) }
+    } catch (e) {
+      return { kind: "continue", body: body }
+    }
+  }
+}
+
+// ---- blocklist ----
+
+export type BlocklistConfig = { words: string[], status?: int }
+
+// ASCII-only lowercasing, so non-ASCII text is left alone.
+function lowerAscii(s: string): string {
+  const b = new TextEncoder().encode(s)
+  const out: u8[] = []
+  for (const c of b) {
+    const v = int(c)
+    out.push(v >= 65 && v <= 90 ? u8(v + 32) : c)
+  }
+  try {
+    return new TextDecoder().decode(out)
+  } catch (e) {
+    return s
+  }
+}
+
+// Rejects the request when its body contains any listed word, ignoring ASCII case.
+export class BlocklistPlugin extends BasePlugin {
+  readonly words: string[]
+  readonly status: int
+
+  constructor(config: BlocklistConfig) {
+    super()
+    const words: string[] = []
+    for (const w of config.words) {
+      const lw = lowerAscii(w)
+      if (lw !== "") words.push(lw)
+    }
+    this.words = words
+    this.status = config.status ?? 400
+  }
+
+  name(): string {
+    return "blocklist"
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult {
+    const lower = lowerAscii(body)
+    for (const w of this.words) {
+      if (lower.indexOf(w) >= 0) {
+        const msg = errorJson("the request contains a blocked word", "invalid_request_error", "blocked_content")
+        return { kind: "short_circuit", status: this.status, body: msg, contentType: "application/json" }
+      }
+    }
+    return { kind: "continue", body: body }
+  }
+}
+
+// ---- maxtokens ----
+
+export type MaxTokensConfig = { default_max_tokens?: int, cap_max_tokens?: int }
+
+// Sets max_tokens on chat requests when absent and lowers it above the cap.
+// A request that sends max_completion_tokens instead gets no default, since
+// reasoning-style endpoints reject max_tokens.
+export class MaxTokensPlugin extends BasePlugin {
+  constructor(readonly config: MaxTokensConfig) {
+    super()
+  }
+
+  name(): string {
+    return "maxtokens"
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult throws Error {
+    const d = this.config.default_max_tokens
+    const cap = this.config.cap_max_tokens
+    if (d === undefined && cap === undefined) return { kind: "continue", body: body }
+    let fs = try fields(body)
+    if (find(fs, "messages") === undefined) return { kind: "continue", body: body }
+    const cur = find(fs, "max_tokens")
+    let want: int | undefined = undefined
+    if (isNull(cur)) {
+      if (d !== undefined && find(fs, "max_completion_tokens") === undefined) want = d
+    } else if (cap !== undefined) {
+      const v = rawNum(fs, "max_tokens")
+      if (v !== undefined && v > cap * 1.0) want = cap
+    }
+    if (cap !== undefined && want !== undefined && want > cap) want = cap
+    if (want === undefined) return { kind: "continue", body: body }
+    setField(&fs, "max_tokens", `${want}`)
+    return { kind: "continue", body: build(fs) }
+  }
+}
+
+// ---- configuration ----
+
+export type PluginEntry = { name: string, enabled?: bool, configJson: string }
+
+// Builds the plugin for one name from its raw JSON config. Throws SyntaxError
+// on a bad config; returns undefined for a name nothing provides.
+function makePlugin(name: string, text: string): BasePlugin | undefined throws SyntaxError {
+  if (name === "header") {
+    const cfg = try JSON.parse(text) as HeaderConfig
+    return new HeaderPlugin(cfg)
+  }
+  if (name === "mocker") {
+    const cfg = try JSON.parse(text) as MockerConfig
+    return new MockerPlugin(cfg)
+  }
+  if (name === "jsonparser") {
+    const cfg = try JSON.parse(text) as JsonParserConfig
+    return new JsonParserPlugin(cfg)
+  }
+  if (name === "blocklist") {
+    const cfg = try JSON.parse(text) as BlocklistConfig
+    return new BlocklistPlugin(cfg)
+  }
+  if (name === "maxtokens") {
+    const cfg = try JSON.parse(text) as MaxTokensConfig
+    return new MaxTokensPlugin(cfg)
+  }
+  return undefined
+}
+
+// The chain for the enabled entries, in config order. Unknown names and bad
+// configs are reported in errors and left out; they don't throw.
+export function buildChain(entries: PluginEntry[]): { chain: PluginChain, errors: string[] } {
+  const plugins: BasePlugin[] = []
+  const errors: string[] = []
+  for (const e of entries) {
+    if (e.enabled === false) continue
+    const text = e.configJson.trim() === "" ? "{}" : e.configJson
+    try {
+      const p = makePlugin(e.name, text)
+      if (p === undefined) errors.push(`unknown plugin "${e.name}"`)
+      else plugins.push(p)
+    } catch (err) {
+      errors.push(`plugin "${e.name}": ${err.message}`)
+    }
+  }
+  return { chain: new PluginChain(plugins), errors: errors }
+}
+
+// ---- tests ----
+
+// Records its hooks into ctx.values "trace", and can short-circuit or fail.
+class Recorder extends BasePlugin {
+  constructor(readonly id: string, readonly stop: bool, readonly failPre: bool, readonly failPost: bool) {
+    super()
+  }
+
+  name(): string {
+    return this.id
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult throws Error {
+    add(&ctx, "pre:" + this.id)
+    if (this.failPre) throw new Error("boom")
+    if (this.stop) return { kind: "short_circuit", status: 418, body: "stopped", contentType: "text/plain" }
+    return { kind: "continue", body: body + this.id }
+  }
+
+  postResponse(inout ctx: PluginContext, status: int, body: string): PostResult throws Error {
+    add(&ctx, "post:" + this.id)
+    if (this.failPost) throw new Error("boom")
+    return { kind: "continue", body: body + "+" + this.id }
+  }
+}
+
+function add(inout ctx: PluginContext, entry: string): void {
+  const prev = ctx.values.get("trace") ?? ""
+  ctx.values.set("trace", prev === "" ? entry : prev + " " + entry)
+}
+
+function ctxFor(model: string): PluginContext {
+  return { requestId: "req_test", op: "chat", model: model, provider: "openai", headers: new Map(), values: new Map() }
+}
+
+type Completion = { object: string, model: string, choices: { message: { role: string, content: string } }[] }
+
+test("chain runs pre hooks in order and threads the body", () => {
+  const chain = new PluginChain([new Recorder("a", false, false, false), new Recorder("b", false, false, false)])
+  let ctx = ctxFor("m")
+  const r = chain.runPre(&ctx, "x")
+  expect(r.kind).toBe("continue")
+  if (r.kind === "continue") expect(r.body).toBe("xab")
+  expect(ctx.values.get("trace")).toBe("pre:a pre:b")
+})
+
+test("short-circuit stops later pre hooks; post hooks run in reverse for those whose pre ran", () => {
+  const chain = new PluginChain([new Recorder("a", false, false, false), new Recorder("b", true, false, false), new Recorder("c", false, false, false)])
+  let ctx = ctxFor("m")
+  const r = chain.runPre(&ctx, "x")
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") {
+    expect(r.status).toBe(418)
+    expect(r.body).toBe("stopped")
+  }
+  expect(ctx.values.get("trace")).toBe("pre:a pre:b")
+  const p = chain.runPost(&ctx, 200, "resp")
+  expect(p.body).toBe("resp+b+a")
+  expect(ctx.values.get("trace")).toBe("pre:a pre:b post:b post:a")
+  expect(ctx.values.get("plugins.ran")).toBeUndefined()
+})
+
+test("post hooks run in reverse over all plugins when none short-circuits", () => {
+  const chain = new PluginChain([new Recorder("a", false, false, false), new Recorder("b", false, false, false)])
+  let ctx = ctxFor("m")
+  chain.runPre(&ctx, "x")
+  const p = chain.runPost(&ctx, 200, "resp")
+  expect(p.body).toBe("resp+b+a")
+  expect(ctx.values.get("trace")).toBe("pre:a pre:b post:b post:a")
+})
+
+test("a throwing plugin is skipped in both directions", () => {
+  const chain = new PluginChain([new Recorder("a", false, false, false), new Recorder("bad", false, true, true), new Recorder("c", false, false, false)])
+  let ctx = ctxFor("m")
+  const r = chain.runPre(&ctx, "x")
+  expect(r.kind).toBe("continue")
+  if (r.kind === "continue") expect(r.body).toBe("xac")
+  const p = chain.runPost(&ctx, 200, "resp")
+  expect(p.body).toBe("resp+c+a")
+  expect(ctx.values.get("trace")).toBe("pre:a pre:bad pre:c post:c post:a")
+})
+
+test("a throwing post hook is skipped and the rest still run", () => {
+  const chain = new PluginChain([new Recorder("a", false, false, false), new Recorder("bad", false, false, true)])
+  let ctx = ctxFor("m")
+  chain.runPre(&ctx, "x")
+  const p = chain.runPost(&ctx, 200, "resp")
+  expect(p.body).toBe("resp+a")
+})
+
+test("header plugin sets lower-cased request headers", () => {
+  const set: Map<string, string> = new Map()
+  set.set("X-Tenant", "blue")
+  const plugin = new HeaderPlugin({ set_request_headers: set })
+  let ctx = ctxFor("m")
+  const r = plugin.preRequest(&ctx, "{}")
+  expect(r.kind).toBe("continue")
+  expect(ctx.headers.get("x-tenant")).toBe("blue")
+})
+
+test("mocker matches model exactly or by wildcard, and substring of the body", () => {
+  const plugin = new MockerPlugin({ rules: [
+    { model: "gpt-x", contains: "ping", response: "{\"pong\":true}", status: 201 },
+    { model: "*", contains: "hello", content: "hi there" },
+  ] })
+  let ctx = ctxFor("gpt-x")
+  const a = plugin.preRequest(&ctx, "{\"msg\":\"ping\"}")
+  expect(a.kind).toBe("short_circuit")
+  if (a.kind === "short_circuit") {
+    expect(a.status).toBe(201)
+    expect(a.body).toBe("{\"pong\":true}")
+    expect(a.contentType).toBe("application/json")
+  }
+  let other = ctxFor("gpt-y")
+  expect(plugin.preRequest(&other, "{\"msg\":\"ping\"}").kind).toBe("continue")
+  let wild = ctxFor("anything")
+  const b = plugin.preRequest(&wild, "{\"msg\":\"hello\"}")
+  expect(b.kind).toBe("short_circuit")
+  let miss = ctxFor("gpt-x")
+  expect(plugin.preRequest(&miss, "{\"msg\":\"bye\"}").kind).toBe("continue")
+})
+
+test("mocker generates a chat.completion and reports latency", () => {
+  const plugin = new MockerPlugin({ rules: [{ content: "42", latency_ms: 250 }] })
+  let ctx = ctxFor("openai/gpt-4o")
+  const r = plugin.preRequest(&ctx, "{}")
+  expect(ctx.values.get("mock_latency_ms")).toBe("250")
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") {
+    expect(r.status).toBe(200)
+    expect(r.body.startsWith("{\"id\":\"mock-")).toBe(true)
+    const c = try JSON.parse(r.body) as Completion
+    expect(c.object).toBe("chat.completion")
+    expect(c.model).toBe("openai/gpt-4o")
+    expect(c.choices[0]!.message.role).toBe("assistant")
+    expect(c.choices[0]!.message.content).toBe("42")
+  }
+})
+
+test("jsonparser strips json fences with and without a language tag", () => {
+  const plugin = new JsonParserPlugin({ strip_markdown_fences: true })
+  const tagged = JSON.stringify({ object: "chat.completion", model: "m", choices: [{ index: 0, message: { role: "assistant", content: "```json\n{\"a\":1}\n```" } }] })
+  const bare = JSON.stringify({ object: "chat.completion", model: "m", choices: [{ index: 0, message: { role: "assistant", content: "```\n[1,2]\n```" } }] })
+  let ctx = ctxFor("m")
+  const t = plugin.postResponse(&ctx, 200, tagged)
+  expect((try JSON.parse(t.body) as Completion).choices[0]!.message.content).toBe("{\"a\":1}")
+  const b = plugin.postResponse(&ctx, 200, bare)
+  expect((try JSON.parse(b.body) as Completion).choices[0]!.message.content).toBe("[1,2]")
+})
+
+test("jsonparser leaves unfenced content and other bodies untouched", () => {
+  const plugin = new JsonParserPlugin({ strip_markdown_fences: true })
+  const plain = JSON.stringify({ object: "chat.completion", model: "m", choices: [{ index: 0, message: { role: "assistant", content: "{\"a\":1}" } }] })
+  let ctx = ctxFor("m")
+  expect(plugin.postResponse(&ctx, 200, plain).body).toBe(plain)
+  expect(plugin.postResponse(&ctx, 200, "not json").body).toBe("not json")
+  const off = new JsonParserPlugin({ strip_markdown_fences: false })
+  const fenced = JSON.stringify({ object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "```json\n{}\n```" } }] })
+  expect(off.postResponse(&ctx, 200, fenced).body).toBe(fenced)
+})
+
+test("blocklist rejects any case of a listed word", () => {
+  const plugin = new BlocklistPlugin({ words: ["Secret", ""] })
+  let ctx = ctxFor("m")
+  const r = plugin.preRequest(&ctx, "{\"messages\":[{\"content\":\"tell me the sECRET\"}]}")
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") {
+    expect(r.status).toBe(400)
+    expect(r.body.indexOf("\"type\":\"invalid_request_error\"") >= 0).toBe(true)
+  }
+  expect(plugin.preRequest(&ctx, "{\"content\":\"nothing here\"}").kind).toBe("continue")
+  const strict = new BlocklistPlugin({ words: ["bad"], status: 403 })
+  const s = strict.preRequest(&ctx, "BAD")
+  if (s.kind === "short_circuit") expect(s.status).toBe(403)
+})
+
+test("maxtokens sets a missing max_tokens and lowers one above the cap", () => {
+  const plugin = new MaxTokensPlugin({ default_max_tokens: 100, cap_max_tokens: 1000 })
+  let ctx = ctxFor("m")
+  const missing = try plugin.preRequest(&ctx, "{\"model\":\"m\",\"messages\":[]}")
+  expect(missing.kind === "continue" && (try rawNumOf(missing.body, "max_tokens")) === 100.0).toBe(true)
+  const high = try plugin.preRequest(&ctx, "{\"messages\":[],\"max_tokens\":5000}")
+  expect(high.kind === "continue" && (try rawNumOf(high.body, "max_tokens")) === 1000.0).toBe(true)
+  const low = "{\"messages\":[],\"max_tokens\":50}"
+  const kept = try plugin.preRequest(&ctx, low)
+  expect(kept.kind === "continue" && kept.body === low).toBe(true)
+  const notChat = "{\"input\":\"x\"}"
+  const skipped = try plugin.preRequest(&ctx, notChat)
+  expect(skipped.kind === "continue" && skipped.body === notChat).toBe(true)
+  const reasoning = "{\"messages\":[],\"max_completion_tokens\":200}"
+  const r2 = try plugin.preRequest(&ctx, reasoning)
+  expect(r2.kind === "continue" && r2.body === reasoning).toBe(true)
+})
+
+function rawNumOf(body: string, key: string): f64 throws SyntaxError {
+  return rawNum(try fields(body), key) ?? -1.0
+}
+
+test("buildChain keeps enabled plugins in order and reports bad entries", () => {
+  const built = buildChain([
+    { name: "header", configJson: "{\"set_request_headers\":{\"x-a\":\"1\"}}" },
+    { name: "blocklist", configJson: "{\"words\":[\"x\"]}" },
+    { name: "mocker", enabled: false, configJson: "{\"rules\":[]}" },
+    { name: "nosuch", configJson: "{}" },
+    { name: "blocklist", configJson: "{\"status\":400}" },
+    { name: "maxtokens", configJson: "{\"default_max_tokens\":\"lots\"}" },
+    { name: "jsonparser", configJson: "{\"strip_markdown_fences\":true}" },
+  ])
+  expect(built.chain.plugins.length).toBe(3)
+  expect(built.chain.plugins[0]!.name()).toBe("header")
+  expect(built.chain.plugins[2]!.name()).toBe("jsonparser")
+  expect(built.errors.length).toBe(3)
+  expect(built.errors[0]!.indexOf("nosuch") >= 0).toBe(true)
+})
+
+test("buildChain treats an empty config as an empty object", () => {
+  const built = buildChain([{ name: "maxtokens", configJson: "" }])
+  expect(built.errors.length).toBe(0)
+  expect(built.chain.plugins.length).toBe(1)
+})

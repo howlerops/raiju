@@ -1,0 +1,127 @@
+// Rerank, token counting and async jobs: endpoints built on the jobs.tov helpers.
+import { Field, fields, rawStr, rawBool } from "./json"
+import { Engine, Build, Translate, errorResponse, noHeaders } from "./gateway"
+import { ChatRequest, snapshot, errorJson } from "./schemas"
+import { parseModel, kindOf } from "./router"
+import { providerOf } from "./config"
+import { JobStore, jobJson, asyncOp, estimateChatTokens, anthropicCountRequest, geminiCountRequest, countResponse, countTokensJson, parseRerank, rerankJson, lexicalRerank } from "./jobs"
+import * as cohere from "./providers/cohere"
+import * as anthropic from "./providers/anthropic"
+import * as gemini from "./providers/gemini"
+import * as anthropicIn from "./providers/anthropic_in"
+
+function json(status: int, body: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  return new Response(body, { status: status, headers: h })
+}
+
+function kindFor(engine: Engine, model: string): { provider: string, model: string, kind: string } {
+  const ref = parseModel(engine.cfg, model)
+  const p = providerOf(engine.cfg, ref.provider)
+  return { provider: ref.provider, model: ref.model, kind: p === undefined ? ref.provider : kindOf(ref.provider, p) }
+}
+
+// POST /v1/rerank: Cohere's rerank API, or a local lexical (BM25) ranking for
+// providers that don't have one.
+export async function rerank(engine: Engine, req: Request): Promise<Response> {
+  const text = await req.text()
+  let body: Field[] = []
+  let model = ""
+  try {
+    body = fields(text)
+    model = parseRerank(text).model
+  } catch (e) {
+    return errorResponse(400, `invalid rerank request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const k = kindFor(engine, model)
+  if (k.kind === "cohere") {
+    const b: Build = (t) => cohere.rerankRequest(t, body)
+    const tr: Translate = (t, text, requested) => try cohere.rerankResponse(text, requested)
+    return await engine.serve(req, "rerank", undefined, body, text, b, tr, false)
+  }
+  if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
+    return errorResponse(401, "a virtual key is required", "authentication_error", noHeaders())
+  }
+  try {
+    const r = parseRerank(text)
+    const scored = lexicalRerank(r.query, r.documents)
+    scored.sort((a, b) => b.score - a.score)
+    const top = scored.slice(0, r.topN)
+    return json(200, rerankJson(top, r.documents, rawBool(body, "return_documents") ?? true, model, 0))
+  } catch (e) {
+    return errorResponse(400, `invalid rerank request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+}
+
+// POST /v1/count_tokens (an OpenAI chat body) and /anthropic/v1/messages/count_tokens
+// (an Anthropic Messages body). Anthropic and Gemini count exactly through their
+// APIs; everyone else gets an estimate, marked "exact": false.
+export async function countTokens(engine: Engine, req: Request, anthropicShape: bool): Promise<Response> {
+  const text = await req.text()
+  let body: Field[] = []
+  try {
+    body = fields(text)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const model = rawStr(body, "model") ?? ""
+  const k = kindFor(engine, model)
+  try {
+    if (anthropicShape) {
+      if (k.kind === "anthropic") {
+        const b: Build = (t) => try anthropicCountRequest(t, text)
+        const tr: Translate = (t, text, requested) => ({ body: text, promptTokens: 0, completionTokens: 0 })
+        return await engine.serve(req, "count_tokens", undefined, body, text, b, tr, false)
+      }
+      const n = estimateChatTokens(anthropicIn.toChatRequest(text, model))
+      return json(200, `{"input_tokens":${n}}`)
+    }
+    if (k.kind === "anthropic" || k.kind === "gemini") {
+      const typed = JSON.parse(text) as ChatRequest
+      const b: Build = (t) => {
+        if (t.kind === "gemini") return try geminiCountRequest(t, try gemini.generateBody(typed, body))
+        return try anthropicCountRequest(t, try anthropic.messagesBody(typed, body, t.model, false, false))
+      }
+      const tr: Translate = (t, text, requested) => ({ body: countTokensJson(try countResponse(t.kind, text), model, true), promptTokens: 0, completionTokens: 0 })
+      return await engine.serve(req, "count_tokens", undefined, body, text, b, tr, false)
+    }
+    return json(200, countTokensJson(estimateChatTokens(text), model, false))
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+}
+
+export type Dispatch = (req: Request) => Promise<Response, Error>
+
+async function runJob(jobs: JobStore, id: string, inner: Request, dispatch: Dispatch): Promise<void> {
+  jobs.start(id)
+  try {
+    const res = await dispatch(inner)
+    const text = await res.text()
+    jobs.finish(id, res.status, text, Math.floor(Date.now()))
+  } catch (e) {
+    jobs.finish(id, 500, errorJson(e.message, "api_error", undefined), Math.floor(Date.now()))
+  }
+}
+
+// POST /v1/async/<op>: answers 202 with a job at once and runs the request in the background.
+export async function asyncSubmit(jobs: JobStore, req: Request, path: string, dispatch: Dispatch): Promise<Response> {
+  const target = asyncOp(path)
+  if (target === undefined) return errorResponse(404, `no async operation for ${path}`, "invalid_request_error", noHeaders())
+  const job = jobs.create(target, Math.floor(Date.now()))
+  if (job === undefined) return errorResponse(503, "too many async jobs are running; retry later", "api_error", noHeaders())
+  const text = await req.text()
+  const h: Record<string, string> = snapshot(req.headers)
+  const inner = new Request("http://raiju.internal" + target, { method: "POST", headers: h, body: text })
+  // not awaited: runs as its own task after this response goes out
+  runJob(jobs, job.id, inner, dispatch)
+  return json(202, jobJson(job))
+}
+
+// GET /v1/async/jobs/{id}
+export function asyncGet(jobs: JobStore, id: string): Response {
+  const j = jobs.get(id, Math.floor(Date.now()))
+  if (j === undefined) return errorResponse(404, `no job ${id} (it may have expired)`, "invalid_request_error", noHeaders())
+  return json(200, jobJson(j))
+}

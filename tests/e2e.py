@@ -313,6 +313,32 @@ def main():
         s, _, b = call("POST", "/api/governance/budgets", {"id": "b-bad", "max_limit": -1, "reset_duration": "1d"})
         check("invalid budget rejected", s == 400, b)
 
+        # Rerank (local lexical ranking for providers without a rerank API)
+        s, _, b = call("POST", "/v1/rerank", {"model": "openai/any", "query": "solar panels on roofs", "documents": ["a recipe for soup", "installing solar panels on your roof", "train timetables"], "top_n": 2})
+        r = json.loads(b)
+        check("rerank ranks the relevant document first", s == 200 and r["results"][0]["index"] == 1 and len(r["results"]) == 2, b)
+
+        # Token counting: exact from Anthropic, estimated elsewhere
+        s, _, b = call("POST", "/anthropic/v1/messages/count_tokens", {"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "hello"}]})
+        check("anthropic count_tokens is exact", s == 200 and json.loads(b)["input_tokens"] == 42 and seen()[-1]["path"] == "/v1/messages/count_tokens", b)
+        s, _, b = call("POST", "/v1/count_tokens", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello there, how are you today?"}]})
+        r = json.loads(b)
+        check("count_tokens estimates for other providers", s == 200 and r["exact"] is False and 5 < r["input_tokens"] < 40, b)
+
+        # Async jobs
+        s, _, b = call("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "later"}]})
+        job = json.loads(b)
+        check("async job accepted", s == 202 and job["status"] in ("queued", "running") and job["id"].startswith("job_"), b)
+        for _ in range(50):
+            s, _, b = call("GET", f"/v1/async/jobs/{job['id']}")
+            if json.loads(b)["status"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.05)
+        done = json.loads(b)
+        check("async job completes with the result", done["status"] == "succeeded" and done["result"]["choices"][0]["message"]["content"] == "Hello from gpt-4o-mini", b)
+        s, _, _ = call("GET", "/v1/async/jobs/job_nope")
+        check("unknown job is 404", s == 404)
+
         s, _, b = call("GET", "/metrics")
         check("prometheus metrics", 'bifrost_upstream_requests_total{provider="openai"' in b and "bifrost_cost_total" in b, b[:500])
 
