@@ -76,6 +76,8 @@ export class Governance {
   limits: Map<string, Limits> = new Map()
   teams: Map<string, { budget?: string, customer?: string }> = new Map()
   customers: Map<string, string | undefined> = new Map()
+  // team and customer names, for routing rules' team_name and customer_name
+  names: Map<string, string> = new Map()
   enforce = false
   // other credentials accepted on inference when enforced (admin users and tokens, as Bifrost)
   altAuth: ((h: Hdrs) => bool) | undefined = undefined
@@ -112,8 +114,15 @@ export class Governance {
       this.vks.set(vk.value, eff.vk)
       this.policies.set(vk.id, eff)
     }
-    for (const t of g.teams ?? []) this.teams.set(t.id, { budget: t.budget_id, customer: t.customer_id })
-    for (const c of g.customers ?? []) this.customers.set(c.id, c.budget_id)
+    this.names = new Map()
+    for (const t of g.teams ?? []) {
+      this.teams.set(t.id, { budget: t.budget_id, customer: t.customer_id })
+      this.names.set("team:" + t.id, t.name)
+    }
+    for (const c of g.customers ?? []) {
+      this.customers.set(c.id, c.budget_id)
+      this.names.set("customer:" + c.id, c.name)
+    }
   }
 
   addRateLimit(r: RateLimitConfig): void {
@@ -309,10 +318,63 @@ export class Governance {
     return worst
   }
 
+  teamName(vk: VirtualKeyConfig | undefined): string | undefined {
+    const t = vk?.team_id
+    return t === undefined ? undefined : this.names.get("team:" + t)
+  }
+
+  // The name of the customer a key belongs to, directly or through its team.
+  customerName(vk: VirtualKeyConfig | undefined): string | undefined {
+    if (vk === undefined) return undefined
+    let c = vk.customer_id
+    if (c === undefined && vk.team_id !== undefined) c = this.teams.get(vk.team_id)?.customer
+    return c === undefined ? undefined : this.names.get("customer:" + c)
+  }
+
+  // The highest fraction used among a key's rate limits of one kind (routing rules' request and tokens_used).
+  rateFraction(vk: VirtualKeyConfig | undefined, kind: "request" | "token"): f64 {
+    if (vk === undefined) return 0.0
+    const ids: string[] = []
+    if (vk.rate_limit_id !== undefined) ids.push(vk.rate_limit_id)
+    for (const pc of vk.provider_configs ?? []) {
+      if (pc.rate_limit_id !== undefined) ids.push(pc.rate_limit_id)
+    }
+    const now = Date.now()
+    let worst = 0.0
+    for (const id of ids) {
+      const l = this.limits.get(id)
+      if (l === undefined) continue
+      const w = kind === "request" ? l.requests : l.tokens
+      if (w === undefined || w.limit <= 0.0) continue
+      w.roll(now)
+      worst = Math.max(worst, (w.used + w.remote) / w.limit)
+    }
+    return worst
+  }
+
   // The access-profile policy of the request's key, if it has one.
   policyFor(h: Hdrs): Effective | undefined {
     const vk = this.findKey(h)
     return vk === undefined ? undefined : this.policies.get(vk.id)
+  }
+
+  // Rate-limit windows as used/limit, other cluster nodes' and workers' use included (alerting).
+  rateLimitUsage(now: f64): { id: string, kind: "request" | "token", used: f64, limit: f64 }[] {
+    const out: { id: string, kind: "request" | "token", used: f64, limit: f64 }[] = []
+    for (const id of this.limits.keys()) {
+      const l = this.limits.get(id)!
+      const r = l.requests
+      if (r !== undefined) {
+        r.roll(now)
+        out.push({ id: id, kind: "request", used: r.used + r.remote, limit: r.limit })
+      }
+      const t = l.tokens
+      if (t !== undefined) {
+        t.roll(now)
+        out.push({ id: id, kind: "token", used: t.used + t.remote, limit: t.limit })
+      }
+    }
+    return out
   }
 
   budgetUsage(): { id: string, used: f64, limit: f64 }[] {

@@ -3,23 +3,28 @@
 // The first enabled, in-scope rule whose expression is true wins.
 //
 // Supported: string, number, bool and null literals; lists; the identifiers in
-// Activation; map lookups (`headers["x-tier"]`, `params.temperature`); has();
-// `in`; operators with CEL precedence; `c ? a : b`; methods startsWith,
-// endsWith, contains, matches, lowerAscii, size; global lower(), size().
+// IDENTS (the Activation fields and Bifrost's routing variables); map lookups
+// (`headers["x-tier"]`, `params.temperature`); has(); `in`; operators with CEL
+// precedence; `c ? a : b`; methods startsWith, endsWith, contains, matches,
+// lowerAscii, size; global lower(), size().
 //
 // Notes:
 // - Numbers are f64, so integers above 2^53 lose precision.
 // - Header and param keys are matched exactly. Callers pass lower-cased
 //   header names, as schemas.tov's Hdrs does.
-// - Optional identifiers (virtual_key, team, customer, complexity_tier) are
-//   null when absent, so `team == null` works.
-// - matches(p) supports only: a leading ^, a trailing $, .* for any run of
-//   text, and literal text (unanchored means "contains"). Any other
-//   metacharacter is a compile error when the pattern is a literal, and an
-//   evaluation error otherwise, so it never matches silently.
-// - Not supported: map literals, raw strings, regex, macros other than has(),
-//   and type conversions such as int() or string().
+// - Bifrost's names (virtual_key_id, virtual_key_name, team_id, team_name,
+//   customer_id, customer_name) are "" when absent, as in Bifrost. Raiju's
+//   older names (virtual_key, team, customer) are null when absent.
+// - request is the request rate-limit usage, request_used in Activation.
+//   budget_used, tokens_used and request are percentages (0-100), as Bifrost.
+// - matches(p) takes RE2 syntax (regex.tov). A literal pattern is compiled
+//   once, when the rule set is built, so a bad one is a compile error. A
+//   computed pattern is compiled at each evaluation, and a bad one is an
+//   evaluation error. Either way it never matches silently.
+// - Not supported: map literals, raw strings, macros other than has(), and
+//   type conversions such as int() or string().
 import { fields, elements, decodeString } from "./json"
+import { compileRegex, Regex } from "./regex"
 
 export type Activation = {
   model: string,
@@ -33,6 +38,12 @@ export type Activation = {
   complexity_tier?: string,
   headers: Map<string, string>,
   params: Map<string, string>,
+  // Organization names and request usage. Absent means null in CEL. The ids
+  // stay in virtual_key, team and customer.
+  virtual_key_name?: string,
+  team_name?: string,
+  customer_name?: string,
+  request_used?: f64,
 }
 
 export type RuleTarget = { provider: string, model?: string, key_id?: string, weight?: f64 }
@@ -71,12 +82,14 @@ type Expr = { kind: "lit", v: Value }
   | { kind: "index", args: Expr[] }
   | { kind: "call", name: string, args: Expr[] }
   | { kind: "method", name: string, args: Expr[] }
+  | { kind: "re", args: Expr[], re: Regex }
 
 type Tok = { kind: string, text: string, n: f64, pos: int }
 
 const OPS1 = "+-*/%?:.,()[]<>!"
-const IDENTS = ["model", "provider", "request_type", "virtual_key", "team", "customer", "budget_used", "tokens_used", "complexity_tier", "headers", "params"]
-const META = ["^", "$", ".", "(", ")", "[", "]", "{", "}", "|", "+", "?", "*", "\\"]
+// Bifrost's routing variables (routing-rules.mdx, "Available Variables"), plus
+// the Raiju names they alias.
+const IDENTS = ["model", "provider", "request_type", "virtual_key", "team", "customer", "virtual_key_id", "virtual_key_name", "team_id", "team_name", "customer_id", "customer_name", "budget_used", "tokens_used", "request", "complexity_tier", "headers", "params"]
 
 function syntaxErr(pos: int, msg: string): SyntaxError {
   return new SyntaxError(`${msg} at column ${pos + 1}`)
@@ -353,8 +366,9 @@ class Parser {
         if (name.text === "matches") {
           const pat = args[0]!
           if (pat.kind === "lit" && pat.v.kind === "str") {
-            const g = parseGlob(pat.v.s)
-            if (g.err !== "") throw syntaxErr(name.pos, g.err)
+            const re = try literalRegex(pat.v.s)
+            e = { kind: "re", args: [e], re: re }
+            continue
           }
         }
         e = { kind: "method", name: name.text, args: [e].concat(args) }
@@ -444,6 +458,11 @@ function vBool(b: bool): Value {
 function optStr(s: string | undefined): Value {
   if (s === undefined) return { kind: "null" }
   return { kind: "str", s: s }
+}
+
+function optNum(n: f64 | undefined): Value {
+  if (n === undefined) return { kind: "null" }
+  return vNum(n)
 }
 
 function isSafeInt(x: f64): bool {
@@ -554,57 +573,23 @@ function lowerAscii(s: string): string {
   }
 }
 
-type Glob = { anchorStart: bool, anchorEnd: bool, parts: string[], err: string }
-
-// Parses the matches() subset: ^ and $ at the ends, .* between literal parts.
-function parseGlob(p: string): Glob {
-  let s = p
-  let anchorStart = false
-  let anchorEnd = false
-  if (s.startsWith("^")) {
-    anchorStart = true
-    s = s.slice(1, s.byteLength)
+// A literal matches() pattern is compiled once, when the rule is parsed. The
+// regex error already gives its position inside the pattern.
+function literalRegex(src: string): Regex throws SyntaxError {
+  try {
+    return compileRegex(src)
+  } catch (e) {
+    throw new SyntaxError(`invalid regex "${src}": ${e.message}`)
   }
-  if (s.endsWith("$")) {
-    anchorEnd = true
-    s = s.slice(0, s.byteLength - 1)
-  }
-  const parts = s.split(".*")
-  for (const part of parts) {
-    for (const m of META) {
-      if (part.includes(m)) {
-        return { anchorStart: false, anchorEnd: false, parts: [], err: `unsupported pattern "${p}": only ^, $, .* and literal text` }
-      }
-    }
-  }
-  return { anchorStart: anchorStart, anchorEnd: anchorEnd, parts: parts, err: "" }
 }
 
-// Matches the parts left to right; each part is searched for after the previous one.
-function globMatch(s: string, g: Glob): bool {
-  const parts = g.parts
-  if (parts.length === 1) {
-    const lit = parts[0]!
-    if (g.anchorStart && g.anchorEnd) return s === lit
-    if (g.anchorStart) return s.startsWith(lit)
-    if (g.anchorEnd) return s.endsWith(lit)
-    return s.includes(lit)
+// A computed matches() pattern is compiled at each evaluation.
+function dynRegex(src: string): Regex throws CelError {
+  try {
+    return compileRegex(src)
+  } catch (e) {
+    throw new CelError(`invalid regex "${src}": ${e.message}`)
   }
-  let rest = s
-  for (let i = 0; i < parts.length; i++) {
-    const piece = parts[i]!
-    if (i === 0 && g.anchorStart) {
-      if (!rest.startsWith(piece)) return false
-      rest = rest.slice(piece.byteLength, rest.byteLength)
-    } else if (i === parts.length - 1 && g.anchorEnd) {
-      return rest.endsWith(piece)
-    } else {
-      const at = rest.indexOf(piece)
-      if (at < 0) return false
-      rest = rest.slice(at + piece.byteLength, rest.byteLength)
-    }
-  }
-  return true
 }
 
 function methodCall(name: string, recv: Value, args: Expr[], env: Map<string, Value>): Value throws CelError {
@@ -621,9 +606,8 @@ function methodCall(name: string, recv: Value, args: Expr[], env: Map<string, Va
   if (name === "startsWith") return vBool(s.startsWith(x))
   if (name === "endsWith") return vBool(s.endsWith(x))
   if (name === "contains") return vBool(s.includes(x))
-  const g = parseGlob(x)
-  if (g.err !== "") throw new CelError(g.err)
-  return vBool(globMatch(s, g))
+  const re = try dynRegex(x)
+  return vBool(re.test(s))
 }
 
 function callFn(name: string, args: Expr[], env: Map<string, Value>): Value throws CelError {
@@ -750,6 +734,11 @@ function ev(e: Expr, env: Map<string, Value>): Value throws CelError {
       const recv = try ev(e.args[0]!, env)
       return try methodCall(e.name, recv, e.args, env)
     }
+    case "re": {
+      const recv = try ev(e.args[0]!, env)
+      if (recv.kind !== "str") throw new CelError("matches() needs a string")
+      return vBool(e.re.test(recv.s))
+    }
   }
 }
 
@@ -808,6 +797,14 @@ function buildEnv(act: Activation): Map<string, Value> {
   env.set("team", optStr(act.team))
   env.set("customer", optStr(act.customer))
   env.set("complexity_tier", optStr(act.complexity_tier))
+  // Bifrost's names: the same ids, and "" (not null) when absent, as Bifrost.
+  env.set("virtual_key_id", vStr(act.virtual_key ?? ""))
+  env.set("team_id", vStr(act.team ?? ""))
+  env.set("customer_id", vStr(act.customer ?? ""))
+  env.set("virtual_key_name", vStr(act.virtual_key_name ?? ""))
+  env.set("team_name", vStr(act.team_name ?? ""))
+  env.set("customer_name", vStr(act.customer_name ?? ""))
+  env.set("request", vNum(act.request_used ?? 0.0))
   env.set("budget_used", vNum(act.budget_used))
   env.set("tokens_used", vNum(act.tokens_used))
   const h = new Map<string, Value>()
@@ -1079,12 +1076,32 @@ test("matches supports ^ $ .* and literals", () => {
   expect(onModel("abc", "model.matches(\"\")")).toBe(true)
 })
 
-test("matches rejects unsupported syntax", () => {
-  expect(compileMsg("model.matches(\"gpt+\")").includes("unsupported pattern")).toBe(true)
-  expect(compileMsg("model.matches(\"^gpt\\\\d\")").includes("unsupported pattern")).toBe(true)
-  expect(compileMsg("model.matches(\"a.b\")").includes("unsupported pattern")).toBe(true)
-  // Not a literal, so it is checked at evaluation and counts as no match.
-  expect(evalSrc("model.matches(team + \"[x]\")", sample())).toBe("unsupported pattern \"core[x]\": only ^, $, .* and literal text")
+test("matches rejects invalid patterns at compile time", () => {
+  expect(compileMsg("model.matches(\"gpt(\")").startsWith("invalid regex \"gpt(\": missing closing )")).toBe(true)
+  expect(compileMsg("model.matches(\"[a\")").startsWith("invalid regex \"[a\": missing closing ]")).toBe(true)
+  expect(compileMsg("model.matches(\"a{3,2}\")").includes("invalid repeat count")).toBe(true)
+  // Valid RE2 that the old glob subset rejected.
+  expect(compileMsg("model.matches(\"gpt+\")")).toBe("")
+  expect(compileMsg("model.matches(\"^gpt\\\\d\")")).toBe("")
+  expect(compileMsg("model.matches(\"a.b\")")).toBe("")
+  expect(onModel("gpt-4o", "model.matches(\"a.b\")")).toBe(false)
+  expect(onModel("gpt-4o", "model.matches(\"gpt-[0-9]o\")")).toBe(true)
+  // Not a literal, so it is compiled at evaluation and a bad pattern is an error.
+  expect(evalSrc("model.matches(team + \"(\")", sample())).toBe("invalid regex \"core(\": missing closing ) at position 6")
+  expect(evalSrc("model.matches(team + \"[x]\")", sample())).toBe(false)
+})
+
+test("matches uses RE2 syntax", () => {
+  const a = sample()
+  a.headers.set("x-app-version", "1.2.3")
+  expect(evalSrc("headers[\"x-app-version\"].matches(\"[0-9]+\\\\.[0-9]+\\\\.[0-9]+\")", a)).toBe(true)
+  a.headers.set("x-app-version", "1.2")
+  expect(evalSrc("headers[\"x-app-version\"].matches(\"[0-9]+\\\\.[0-9]+\\\\.[0-9]+\")", a)).toBe(false)
+  expect(evalSrc("model.matches(\"(?i)GPT-4(o|-turbo)$\")", sample())).toBe(true)
+  expect(evalSrc("model.matches(\"^gpt-\\\\d[a-z]$\")", sample())).toBe(true)
+  expect(evalSrc("model.matches(\"^(gpt|claude)-\")", sample())).toBe(true)
+  expect(evalSrc("model.matches(\"\\\\bo\\\\b\")", sample())).toBe(false)
+  expect(evalSrc("model.matches(\"(a*)*z\")", sample())).toBe(false)
 })
 
 test("compile errors carry the column", () => {
@@ -1178,4 +1195,130 @@ test("pickTarget chooses by weight", () => {
   expect(bCount >= 590 && bCount <= 610).toBe(true)
   expect(pickTarget([], 0.5)).toBe(-1)
   expect(pickTarget([{ provider: "z", weight: 0.0 }], 0.5)).toBe(-1)
+})
+
+// The sample request with the organization names, complexity and request usage filled in.
+function orgSample(): Activation {
+  const a = sample()
+  a.virtual_key_name = "prod-key-1"
+  a.team_name = "ml-research"
+  a.customer = "acme-corp"
+  a.customer_name = "Acme"
+  a.complexity_tier = "COMPLEX"
+  a.request_used = 95.0
+  return a
+}
+
+// Evaluates src against orgSample() and checks the result.
+function checkOrg(src: string, want: bool | string): void {
+  expect(evalSrc(src, orgSample())).toBe(want)
+}
+
+test("routing variables: ids alias the existing fields, names are new", () => {
+  const a = orgSample()
+  expect(evalSrc("virtual_key_id == virtual_key", a)).toBe(true)
+  expect(evalSrc("virtual_key_id == \"vk1\"", a)).toBe(true)
+  expect(evalSrc("team_id == team", a)).toBe(true)
+  expect(evalSrc("team_id == \"core\"", a)).toBe(true)
+  expect(evalSrc("customer_id == customer", a)).toBe(true)
+  expect(evalSrc("virtual_key_name == \"prod-key-1\"", a)).toBe(true)
+  expect(evalSrc("team_name == \"ml-research\"", a)).toBe(true)
+  expect(evalSrc("customer_name == \"Acme\"", a)).toBe(true)
+  expect(evalSrc("request == 95", a)).toBe(true)
+})
+
+test("absent Bifrost routing variables are empty, as Bifrost", () => {
+  const b = sample()
+  expect(evalSrc("virtual_key_name == \"\"", b)).toBe(true)
+  expect(evalSrc("team_name == \"\" && customer_name == \"\"", b)).toBe(true)
+  expect(evalSrc("customer_id == \"\" && !team_name.startsWith(\"x\")", b)).toBe(true)
+  expect(evalSrc("team_name == \"core\"", b)).toBe(false)
+  expect(evalSrc("request == 0", b)).toBe(true)
+  expect(evalSrc("virtual_key_name.startsWith(\"prod-\")", b)).toBe(false)
+  expect(evalSrc("request > 90", b)).toBe(false)
+  expect(evalSrc("team == null", b)).toBe(false)
+})
+
+test("routing rule expressions from the Bifrost docs compile", () => {
+  const docs: string[] = [
+    "headers[\"x-tier\"] == \"premium\"",
+    "headers[\"x-api-version\"] == \"v2\"",
+    "headers[\"user-agent\"].contains(\"mobile\")",
+    "team_name == \"ml-research\"",
+    "customer_id == \"acme-corp\"",
+    "virtual_key_name.startsWith(\"prod-\")",
+    "budget_used > 80",
+    "tokens_used < 50",
+    "request > 90",
+    "complexity_tier == \"COMPLEX\"",
+    "complexity_tier in [\"MEDIUM\", \"COMPLEX\"]",
+    "!(complexity_tier in [\"SIMPLE\", \"MEDIUM\"])",
+    "complexity_tier == \"COMPLEX\" && team_name == \"research\"",
+    "headers[\"x-tier\"] == \"premium\" && team_name == \"research\"",
+    "budget_used > 90 || headers[\"x-priority\"] == \"high\"",
+    "team_name == \"ml-ops\" && model.startsWith(\"claude-\")",
+    "headers[\"x-region\"] == \"us-east\" && tokens_used < 75",
+    "request_type == \"embedding\" && budget_used > 50",
+    "model.startsWith(\"gpt-4\")",
+    "headers[\"x-environment\"] in [\"staging\", \"testing\"]",
+    "headers[\"x-user-email\"].contains(\"@company.com\")",
+    "headers[\"x-app-version\"].matches(\"[0-9]+\\\\.[0-9]+\\\\.[0-9]+\")",
+    "headers[\"x-tier\"].matches(\".*premium.*\")",
+    "headers[\"x-environment\"] == \"production\" && headers[\"x-priority\"] == \"high\" && tokens_used < 75",
+    "model == 'gpt-4o'",
+    "model == \"gpt-4-turbo\"",
+    "true",
+  ]
+  for (const src of docs) {
+    expect(compileMsg(src)).toBe("")
+  }
+})
+
+test("routing rule expressions from the Bifrost docs evaluate", () => {
+  checkOrg("headers[\"x-tier\"] == \"premium\"", false)
+  checkOrg("headers[\"x-tier\"] == \"premium\" && team_name == \"research\"", false)
+  checkOrg("budget_used > 90 || headers[\"x-priority\"] == \"high\"", "no such key: x-priority")
+  checkOrg("team_name == \"ml-ops\" && model.startsWith(\"claude-\")", false)
+  checkOrg("headers[\"x-region\"] == \"us-east\" && tokens_used < 75", false)
+  checkOrg("request_type == \"embedding\" && budget_used > 50", false)
+  checkOrg("model.startsWith(\"gpt-4\")", true)
+  checkOrg("headers[\"x-environment\"] in [\"staging\", \"testing\"]", "no such key: x-environment")
+  checkOrg("team_name == \"ml-research\"", true)
+  checkOrg("customer_id == \"acme-corp\"", true)
+  checkOrg("virtual_key_name.startsWith(\"prod-\")", true)
+  checkOrg("team_name.startsWith(\"prod-\")", false)
+  checkOrg("budget_used > 80", false)
+  checkOrg("tokens_used < 50", false)
+  checkOrg("request > 90", true)
+  checkOrg("model == 'gpt-4o'", true)
+  checkOrg("model == \"gpt-4-turbo\"", false)
+  checkOrg("headers[\"x-tier\"].matches(\".*gold.*\")", true)
+  checkOrg("headers[\"x-tier\"].contains(\"gold\")", true)
+  checkOrg("true", true)
+})
+
+test("complexity_tier expressions from the Bifrost docs", () => {
+  checkOrg("complexity_tier == \"COMPLEX\"", true)
+  checkOrg("complexity_tier in [\"MEDIUM\", \"COMPLEX\"]", true)
+  checkOrg("!(complexity_tier in [\"SIMPLE\", \"MEDIUM\"])", true)
+  checkOrg("complexity_tier == \"COMPLEX\" && team_name == \"research\"", false)
+  checkOrg("complexity_tier == \"COMPLEX\" && team_name == \"ml-research\"", true)
+  expect(evalSrc("complexity_tier == \"COMPLEX\"", sample())).toBe(false)
+})
+
+test("routing rules from the Bifrost docs select the first match", () => {
+  const rules: RoutingRule[] = [
+    { id: "premium", cel_expression: "headers[\"x-tier\"] == \"premium\"", targets: [{ provider: "openai", model: "gpt-4o" }] },
+    { id: "prod-keys", cel_expression: "virtual_key_name.startsWith(\"prod-\")", targets: [{ provider: "azure" }] },
+    { id: "ml-research", cel_expression: "team_name == \"ml-research\"", targets: [{ provider: "anthropic" }] },
+    { id: "acme", cel_expression: "customer_id == \"acme-corp\"", targets: [{ provider: "x" }] },
+  ]
+  const rs = new RuleSet(rules)
+  expect(rs.errors().length).toBe(0)
+  expect(rs.match(orgSample(), {})?.rule).toBe("prod-keys")
+  const plain = sample()
+  expect(rs.match(plain, {})).toBeUndefined()
+  const hot = new RuleSet([{ id: "hot", cel_expression: "request > 90", targets: [{ provider: "azure" }] }])
+  expect(hot.match(orgSample(), {})?.rule).toBe("hot")
+  expect(hot.match(sample(), {}) === undefined).toBe(true)
 })

@@ -1,0 +1,1064 @@
+// RE2-style regular expressions: the subset that CEL's matches() and routing
+// rules use. test() is unanchored, like RE2's MatchString.
+//
+// The engine is a backtracking VM over code points. Each (instruction,
+// position) pair is explored at most once, as in RE2's BitState, so one search
+// costs at most instructions x (input code points + 1) steps. That keeps
+// nested quantifiers such as (a*)*b and (x+x+)+y fast, and makes loops whose
+// body can match the empty string safe.
+//
+// LIMITS:
+// - Matching works on code points. Case folding under (?i) covers ASCII only.
+// - Unicode classes (\pL, \p{Greek}) and \C are rejected, not ignored.
+// - Captures are parsed but not reported: test() says only whether the pattern
+//   matches. Named groups are accepted and ignored.
+// - Repeat counts are at most 1000. A pattern that expands past 50000
+//   instructions, such as (a{1000}){1000}, is rejected at compile time.
+// - Step budget: test() returns false without searching when instructions x
+//   (input code points + 1) exceeds 4194304. Each search step visits a new
+//   (instruction, position) pair, so that product is the most work a search
+//   can do. Routing-rule patterns are far below it.
+// - Greedy and lazy quantifiers accept the same strings, so for a bool result
+//   they behave the same. The flag changes only branch order.
+// - \Z, octal escapes and backreferences are not supported.
+
+// The matcher is a memoized backtracking VM over code points.
+export class Regex {
+  constructor(private prog: Inst[]) {}
+
+  test(s: string): bool {
+    const cps = decodeCps(s)
+    const n = cps.length
+    const width = this.prog.length
+    if (width * (n + 1) > stepLimit()) return false
+    let seen = newBits(width * (n + 1))
+    const stack: Branch[] = []
+    // Unanchored: a match may start at any position. States already visited
+    // from an earlier start failed then and fail now, so they are skipped.
+    for (let start = 0; start <= n; start++) {
+      stack.push({ pc: 0, pos: start })
+      while (stack.length > 0) {
+        const top = stack.pop()
+        if (top === undefined) break
+        let pc = top.pc
+        let pos = top.pos
+        while (true) {
+          const idx = pc * (n + 1) + pos
+          if (testBit(seen, idx)) break
+          setBit(&seen, idx)
+          const ins = this.prog[pc]!
+          if (ins.kind === "match") return true
+          if (ins.kind === "split") {
+            stack.push({ pc: ins.y, pos: pos })
+            pc = ins.x
+          } else if (ins.kind === "jmp") {
+            pc = ins.x
+          } else if (ins.kind === "char") {
+            if (pos >= n || cps[pos] !== ins.c) break
+            pc += 1
+            pos += 1
+          } else if (ins.kind === "set") {
+            if (pos >= n || !inRanges(ins.rs, cps[pos]!)) break
+            pc += 1
+            pos += 1
+          } else if (ins.kind === "any") {
+            if (pos >= n || (!ins.nl && cps[pos] === 10)) break
+            pc += 1
+            pos += 1
+          } else {
+            if (!assertHolds(ins.op, cps, pos)) break
+            pc += 1
+          }
+        }
+      }
+    }
+    return false
+  }
+}
+
+// Parses src and compiles it. The error says what is wrong and where.
+export function compileRegex(src: string): Regex throws SyntaxError {
+  const p = new ReParser(decodeCps(src))
+  const root = try p.top()
+  const c = new ReCompiler()
+  try c.gen(root)
+  try c.emit({ kind: "match" })
+  return new Regex(c.prog)
+}
+
+// ---- code points and bits ----
+
+// Decodes UTF-8 into code points. Tov strings are valid UTF-8, so the
+// fallback for a malformed byte is only defensive.
+function decodeCps(s: string): int[] {
+  const b = new TextEncoder().encode(s)
+  const out: int[] = []
+  let i = 0
+  while (i < b.length) {
+    const c = int(b[i]!)
+    let cp = 0xfffd
+    let n = 1
+    if (c < 0x80) {
+      cp = c
+    } else if (c >= 0xc0 && c < 0xe0 && i + 1 < b.length) {
+      cp = ((c & 0x1f) << 6) | (int(b[i + 1]!) & 0x3f)
+      n = 2
+    } else if (c >= 0xe0 && c < 0xf0 && i + 2 < b.length) {
+      cp = ((c & 0x0f) << 12) | ((int(b[i + 1]!) & 0x3f) << 6) | (int(b[i + 2]!) & 0x3f)
+      n = 3
+    } else if (c >= 0xf0 && c < 0xf8 && i + 3 < b.length) {
+      cp = ((c & 0x07) << 18) | ((int(b[i + 1]!) & 0x3f) << 12) | ((int(b[i + 2]!) & 0x3f) << 6) | (int(b[i + 3]!) & 0x3f)
+      n = 4
+    }
+    out.push(cp)
+    i += n
+  }
+  return out
+}
+
+function utf8Push(inout buf: u8[], cp: int): void {
+  if (cp < 0x80) {
+    buf.push(u8(cp))
+  } else if (cp < 0x800) {
+    buf.push(u8(0xc0 | (cp >> 6)))
+    buf.push(u8(0x80 | (cp & 0x3f)))
+  } else if (cp < 0x10000) {
+    buf.push(u8(0xe0 | (cp >> 12)))
+    buf.push(u8(0x80 | ((cp >> 6) & 0x3f)))
+    buf.push(u8(0x80 | (cp & 0x3f)))
+  } else {
+    buf.push(u8(0xf0 | (cp >> 18)))
+    buf.push(u8(0x80 | ((cp >> 12) & 0x3f)))
+    buf.push(u8(0x80 | ((cp >> 6) & 0x3f)))
+    buf.push(u8(0x80 | (cp & 0x3f)))
+  }
+}
+
+// Text of code points p[from..to). Used for the short ASCII names in [:name:].
+function cpString(p: int[], from: int, to: int): string {
+  let b: u8[] = []
+  for (let k = from; k < to; k++) utf8Push(&b, p[k]!)
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+// Visited set: one bit per (instruction, position) pair, 32 to an int.
+function newBits(count: int): int[] {
+  const words: int[] = []
+  const nw = (count >> 5) + 1
+  for (let i = 0; i < nw; i++) words.push(0)
+  return words
+}
+
+function testBit(words: int[], idx: int): bool {
+  return (words[idx >> 5]! & (1 << (idx & 31))) !== 0
+}
+
+function setBit(inout words: int[], idx: int): void {
+  const w = idx >> 5
+  words[w] = words[w]! | (1 << (idx & 31))
+}
+
+// Limits. Functions rather than constants: top-level statements in an imported
+// module do not run.
+function stepLimit(): int {
+  return 4194304
+}
+
+function progLimit(): int {
+  return 50000
+}
+
+function maxRepeat(): int {
+  return 1000
+}
+
+function isDigitCp(c: int): bool {
+  return c >= 48 && c <= 57
+}
+
+function isLetterCp(c: int): bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+function isWordCp(c: int): bool {
+  return isDigitCp(c) || isLetterCp(c) || c === 95
+}
+
+function hexDigit(c: int): int {
+  if (isDigitCp(c)) return c - 48
+  if (c >= 97 && c <= 102) return c - 87
+  if (c >= 65 && c <= 70) return c - 55
+  return -1
+}
+
+function toLower(c: int): int {
+  return c >= 65 && c <= 90 ? c + 32 : c
+}
+
+function toUpper(c: int): int {
+  return c >= 97 && c <= 122 ? c - 32 : c
+}
+
+// ---- ranges ----
+
+type Range = { lo: int, hi: int }
+
+const MAX_CP = 0x10ffff
+
+function r(lo: int, hi: int): Range {
+  return { lo: lo, hi: hi }
+}
+
+function inRanges(rs: Range[], c: int): bool {
+  for (const x of rs) {
+    if (c >= x.lo && c <= x.hi) return true
+  }
+  return false
+}
+
+// Sorts and merges, so complement() can walk the gaps.
+function normalize(rs: Range[]): Range[] {
+  const s: Range[] = []
+  for (const x of rs) s.push(x)
+  s.sort((a, b) => a.lo - b.lo)
+  const out: Range[] = []
+  for (const x of s) {
+    const last = out.length - 1
+    if (last >= 0 && x.lo <= out[last]!.hi + 1) {
+      if (x.hi > out[last]!.hi) out[last] = r(out[last]!.lo, x.hi)
+    } else {
+      out.push(x)
+    }
+  }
+  return out
+}
+
+// rs must be normalized.
+function complement(rs: Range[]): Range[] {
+  const out: Range[] = []
+  let next = 0
+  for (const x of rs) {
+    if (x.lo > next) out.push(r(next, x.lo - 1))
+    next = x.hi + 1
+  }
+  if (next <= MAX_CP) out.push(r(next, MAX_CP))
+  return out
+}
+
+// Adds the other-case ASCII letters of every range (ASCII-only folding).
+function foldRanges(rs: Range[]): Range[] {
+  const out: Range[] = []
+  for (const x of rs) {
+    out.push(x)
+    const a = x.lo > 65 ? x.lo : 65
+    const b = x.hi < 90 ? x.hi : 90
+    if (a <= b) out.push(r(a + 32, b + 32))
+    const c = x.lo > 97 ? x.lo : 97
+    const d = x.hi < 122 ? x.hi : 122
+    if (c <= d) out.push(r(c - 32, d - 32))
+  }
+  return out
+}
+
+function digitRanges(): Range[] {
+  return [r(48, 57)]
+}
+
+function spaceRanges(): Range[] {
+  // RE2's \s is [\t\n\f\r ]; it has no \v.
+  return [r(9, 10), r(12, 13), r(32, 32)]
+}
+
+function wordRanges(): Range[] {
+  return [r(48, 57), r(65, 90), r(95, 95), r(97, 122)]
+}
+
+// Ranges for \d \D \s \S \w \W, or undefined for any other escape.
+function escapeClass(c: int): Range[] | undefined {
+  if (c === 100) return digitRanges()
+  if (c === 68) return complement(digitRanges())
+  if (c === 115) return spaceRanges()
+  if (c === 83) return complement(spaceRanges())
+  if (c === 119) return wordRanges()
+  if (c === 87) return complement(wordRanges())
+  return undefined
+}
+
+// Ranges for a [:name:] class, or undefined for an unknown name.
+function posixRanges(name: string): Range[] | undefined {
+  if (name === "alnum") return [r(48, 57), r(65, 90), r(97, 122)]
+  if (name === "alpha") return [r(65, 90), r(97, 122)]
+  if (name === "ascii") return [r(0, 127)]
+  if (name === "blank") return [r(9, 9), r(32, 32)]
+  if (name === "cntrl") return [r(0, 31), r(127, 127)]
+  if (name === "digit") return digitRanges()
+  if (name === "graph") return [r(33, 126)]
+  if (name === "lower") return [r(97, 122)]
+  if (name === "print") return [r(32, 126)]
+  if (name === "punct") return [r(33, 47), r(58, 64), r(91, 96), r(123, 126)]
+  if (name === "space") return [r(9, 13), r(32, 32)]
+  if (name === "upper") return [r(65, 90)]
+  if (name === "word") return wordRanges()
+  if (name === "xdigit") return [r(48, 57), r(65, 70), r(97, 102)]
+  return undefined
+}
+
+// ---- parsing ----
+
+type Flags = { fold: bool, dotNl: bool, multi: bool, ungreedy: bool }
+
+// Children sit in arrays, so no node contains itself directly.
+type Node = { kind: "empty" }
+  | { kind: "lit", c: int }
+  | { kind: "set", rs: Range[] }
+  | { kind: "any", nl: bool }
+  | { kind: "assert", op: string }
+  | { kind: "cat", items: Node[] }
+  | { kind: "alt", items: Node[] }
+  | { kind: "rep", min: int, max: int, greedy: bool, items: Node[] }
+
+type Rep = { min: int, max: int, end: int }
+
+type Num = { n: int, end: int }
+
+class ReParser {
+  private i = 0
+  private flags: Flags = { fold: false, dotNl: false, multi: false, ungreedy: false }
+
+  constructor(private p: int[]) {}
+
+  more(): bool {
+    return this.i < this.p.length
+  }
+
+  at(k: int): int {
+    if (k < 0 || k >= this.p.length) return -1
+    return this.p[k]!
+  }
+
+  peek(): int {
+    return this.at(this.i)
+  }
+
+  peekIs(c: int): bool {
+    return this.at(this.i) === c
+  }
+
+  // Returns the code point at the cursor and moves past it. Callers check more() first.
+  next(): int {
+    const c = this.at(this.i)
+    this.i += 1
+    return c
+  }
+
+  fail(msg: string): SyntaxError {
+    return new SyntaxError(`${msg} at position ${this.i + 1}`)
+  }
+
+  top(): Node throws SyntaxError {
+    const n = try this.alt()
+    if (this.more()) throw this.fail("unexpected )")
+    return n
+  }
+
+  // alt := seq ('|' seq)*. Stops at ')' or the end; the caller checks which.
+  alt(): Node throws SyntaxError {
+    const alts: Node[] = []
+    alts.push(try this.seq())
+    while (this.peekIs(124)) {
+      this.i += 1
+      alts.push(try this.seq())
+    }
+    if (alts.length === 1) return alts[0]!
+    return { kind: "alt", items: alts }
+  }
+
+  seq(): Node throws SyntaxError {
+    const items: Node[] = []
+    while (this.more()) {
+      const c = this.peek()
+      if (c === 124 || c === 41) break
+      const a = try this.atom()
+      // A flag group such as (?i) yields no node.
+      if (a !== undefined) items.push(try this.quantified(a))
+    }
+    if (items.length === 0) return { kind: "empty" }
+    if (items.length === 1) return items[0]!
+    return { kind: "cat", items: items }
+  }
+
+  atom(): Node | undefined throws SyntaxError {
+    const start = this.i
+    const c = this.next()
+    if (c === 46) return { kind: "any", nl: this.flags.dotNl }
+    if (c === 94) return { kind: "assert", op: this.flags.multi ? "bol" : "bot" }
+    if (c === 36) return { kind: "assert", op: this.flags.multi ? "eol" : "eot" }
+    if (c === 91) return try this.cls()
+    if (c === 92) return try this.escape()
+    if (c === 40) return try this.group()
+    if (c === 42 || c === 43 || c === 63) throw this.fail("missing argument to repetition operator")
+    if (c === 123) {
+      // A '{' that does not start a valid repeat is a literal.
+      const rep = try this.repeatAt(start)
+      if (rep !== undefined) throw this.fail("missing argument to repetition operator")
+    }
+    return this.lit(c)
+  }
+
+  lit(c: int): Node {
+    if (this.flags.fold && isLetterCp(c)) {
+      return { kind: "set", rs: [r(toLower(c), toLower(c)), r(toUpper(c), toUpper(c))] }
+    }
+    return { kind: "lit", c: c }
+  }
+
+  quantified(a: Node): Node throws SyntaxError {
+    const c = this.peek()
+    let min: int = 0
+    let max: int = 0
+    if (c === 42) {
+      max = -1
+      this.i += 1
+    } else if (c === 43) {
+      min = 1
+      max = -1
+      this.i += 1
+    } else if (c === 63) {
+      max = 1
+      this.i += 1
+    } else if (c === 123) {
+      const rep = try this.repeatAt(this.i)
+      if (rep === undefined) return a
+      min = rep.min
+      max = rep.max
+      this.i = rep.end
+    } else {
+      return a
+    }
+    let greedy = !this.flags.ungreedy
+    if (this.peekIs(63)) {
+      greedy = !greedy
+      this.i += 1
+    }
+    if (try this.repeatStarts()) throw this.fail("invalid nested repetition operator")
+    return { kind: "rep", min: min, max: max, greedy: greedy, items: [a] }
+  }
+
+  repeatStarts(): bool throws SyntaxError {
+    const c = this.peek()
+    if (c === 42 || c === 43 || c === 63) return true
+    if (c === 123) {
+      const rep = try this.repeatAt(this.i)
+      return rep !== undefined
+    }
+    return false
+  }
+
+  // Digits at p[j..]. Undefined when there are none.
+  digits(j: int): Num | undefined {
+    let k = j
+    let n = 0
+    while (isDigitCp(this.at(k))) {
+      // Clamped: anything this large is over maxRepeat() anyway.
+      if (n < 100000) n = n * 10 + (this.at(k) - 48)
+      k += 1
+    }
+    if (k === j) return undefined
+    return { n: n, end: k }
+  }
+
+  // Parses {n}, {n,} or {n,m} at pos. Undefined when the text is not a repeat
+  // (then the '{' is a literal). Throws when the counts are out of range.
+  repeatAt(pos: int): Rep | undefined throws SyntaxError {
+    if (!this.peekAtIs(pos, 123)) return undefined
+    const lo = this.digits(pos + 1)
+    if (lo === undefined) return undefined
+    let min = lo.n
+    let max = lo.n
+    let j = lo.end
+    if (this.peekAtIs(j, 44)) {
+      j += 1
+      const hi = this.digits(j)
+      if (hi === undefined) {
+        max = -1
+      } else {
+        max = hi.n
+        j = hi.end
+      }
+    }
+    if (!this.peekAtIs(j, 125)) return undefined
+    if (min > maxRepeat() || max > maxRepeat() || (max >= 0 && min > max)) {
+      throw this.fail("invalid repeat count")
+    }
+    return { min: min, max: max, end: j + 1 }
+  }
+
+  peekAtIs(k: int, c: int): bool {
+    return this.at(k) === c
+  }
+
+  // Called after '('.
+  group(): Node | undefined throws SyntaxError {
+    const saved = this.flags
+    if (this.peekIs(63)) {
+      this.i += 1
+      if (this.peekIs(58)) {
+        this.i += 1
+      } else if (this.peekIs(80) || this.peekIs(60)) {
+        // (?P<name>re) and (?<name>re). Captures are not reported, so the name is only checked.
+        if (this.peekIs(80)) this.i += 1
+        if (!this.peekIs(60)) throw this.fail("invalid named capture")
+        this.i += 1
+        const nameStart = this.i
+        while (isWordCp(this.peek())) this.i += 1
+        if (this.i === nameStart || !this.peekIs(62)) throw this.fail("invalid named capture")
+        this.i += 1
+      } else {
+        return try this.flagGroup(saved)
+      }
+    }
+    const body = try this.alt()
+    if (!this.peekIs(41)) throw this.fail("missing closing )")
+    this.i += 1
+    this.flags = saved
+    return body
+  }
+
+  // (?flags) changes the flags of the enclosing group and yields no node.
+  // (?flags:re) is a group with those flags.
+  flagGroup(saved: Flags): Node | undefined throws SyntaxError {
+    let f = this.flags
+    let on = true
+    let any = false
+    while (this.more()) {
+      const c = this.next()
+      if (c === 41 || c === 58) {
+        if (!any) throw this.fail("missing flags in group")
+        this.flags = f
+        if (c === 41) return undefined
+        const body = try this.alt()
+        if (!this.peekIs(41)) throw this.fail("missing closing )")
+        this.i += 1
+        this.flags = saved
+        return body
+      }
+      if (c === 45) {
+        on = false
+      } else if (c === 105) {
+        f.fold = on
+      } else if (c === 109) {
+        f.multi = on
+      } else if (c === 115) {
+        f.dotNl = on
+      } else if (c === 85) {
+        f.ungreedy = on
+      } else {
+        throw this.fail("invalid or unsupported Perl syntax")
+      }
+      any = true
+    }
+    throw this.fail("missing closing )")
+  }
+
+  // Called after '\'. Outside a class.
+  escape(): Node throws SyntaxError {
+    if (!this.more()) throw this.fail("trailing \\")
+    const c = this.next()
+    if (c === 98) return { kind: "assert", op: "wordb" }
+    if (c === 66) return { kind: "assert", op: "nwordb" }
+    if (c === 65) return { kind: "assert", op: "bot" }
+    if (c === 122) return { kind: "assert", op: "eot" }
+    if (c === 81) return this.quoted()
+    if (c === 112 || c === 80) throw this.fail("Unicode classes are not supported")
+    const sub = escapeClass(c)
+    if (sub !== undefined) return { kind: "set", rs: sub }
+    return this.lit(try this.charEscape(c))
+  }
+
+  // \Q...\E: literal text. Without \E it runs to the end, as in RE2.
+  quoted(): Node {
+    const items: Node[] = []
+    while (this.more()) {
+      if (this.peekIs(92) && this.at(this.i + 1) === 69) {
+        this.i += 2
+        return { kind: "cat", items: items }
+      }
+      items.push(this.lit(this.next()))
+    }
+    return { kind: "cat", items: items }
+  }
+
+  // The code point for an escape whose letter c is already consumed.
+  charEscape(c: int): int throws SyntaxError {
+    if (c === 110) return 10
+    if (c === 116) return 9
+    if (c === 114) return 13
+    if (c === 102) return 12
+    if (c === 118) return 11
+    if (c === 97) return 7
+    if (c === 120) return try this.hexEscape()
+    if (c < 0) throw this.fail("trailing \\")
+    // Any ASCII punctuation or non-ASCII character escapes to itself. Letters,
+    // digits and '_' are reserved, so an escape of them is an error.
+    if (c >= 128 || !isWordCp(c)) return c
+    throw this.fail("invalid escape sequence")
+  }
+
+  // \xHH or \x{H...}. The 'x' is already consumed.
+  hexEscape(): int throws SyntaxError {
+    if (this.peekIs(123)) {
+      this.i += 1
+      let v = 0
+      let digits = 0
+      while (this.more() && !this.peekIs(125)) {
+        const h = hexDigit(this.next())
+        if (h < 0) throw this.fail("invalid \\x escape")
+        v = v * 16 + h
+        if (v > MAX_CP) throw this.fail("invalid \\x escape")
+        digits += 1
+      }
+      if (!this.more() || digits === 0) throw this.fail("invalid \\x escape")
+      this.i += 1
+      return v
+    }
+    const a = hexDigit(this.at(this.i))
+    const b = hexDigit(this.at(this.i + 1))
+    if (a < 0 || b < 0) throw this.fail("invalid \\x escape")
+    this.i += 2
+    return a * 16 + b
+  }
+
+  // Called after '['. The leading ']' is a literal, as in RE2.
+  cls(): Node throws SyntaxError {
+    let neg = false
+    if (this.peekIs(94)) {
+      neg = true
+      this.i += 1
+    }
+    const rs: Range[] = []
+    let first = true
+    let closed = false
+    while (this.more()) {
+      if (this.peekIs(93) && !first) {
+        this.i += 1
+        closed = true
+        break
+      }
+      first = false
+      if (this.peekIs(91) && this.at(this.i + 1) === 58) {
+        const named = try this.posix()
+        if (named !== undefined) {
+          for (const x of named) rs.push(x)
+          continue
+        }
+      }
+      let lo = 0
+      if (this.peekIs(92)) {
+        this.i += 1
+        if (!this.more()) throw this.fail("trailing \\")
+        const e = this.next()
+        const sub = escapeClass(e)
+        if (sub !== undefined) {
+          for (const x of sub) rs.push(x)
+          continue
+        }
+        lo = try this.charEscape(e)
+      } else {
+        lo = this.next()
+      }
+      let hi = lo
+      if (this.peekIs(45) && this.at(this.i + 1) >= 0 && this.at(this.i + 1) !== 93) {
+        this.i += 1
+        if (this.peekIs(92)) {
+          this.i += 1
+          if (!this.more()) throw this.fail("trailing \\")
+          hi = try this.charEscape(this.next())
+        } else {
+          hi = this.next()
+        }
+        if (hi < lo) throw this.fail("invalid character class range")
+      }
+      rs.push(r(lo, hi))
+    }
+    if (!closed) throw this.fail("missing closing ]")
+    let out = normalize(rs)
+    if (this.flags.fold) out = normalize(foldRanges(out))
+    if (neg) out = complement(out)
+    return { kind: "set", rs: out }
+  }
+
+  // At "[:". Returns the ranges of a [:name:] class, or undefined when the text is not one.
+  posix(): Range[] | undefined throws SyntaxError {
+    let j = this.i + 2
+    let neg = false
+    if (this.peekAtIs(j, 94)) {
+      neg = true
+      j += 1
+    }
+    const start = j
+    while (isLetterCp(this.at(j))) j += 1
+    if (!this.peekAtIs(j, 58) || !this.peekAtIs(j + 1, 93)) return undefined
+    const rs = posixRanges(cpString(this.p, start, j))
+    if (rs === undefined) throw this.fail("invalid character class name")
+    this.i = j + 2
+    if (neg) return complement(normalize(rs))
+    return rs
+  }
+}
+
+// ---- compiling ----
+
+type Inst = { kind: "char", c: int }
+  | { kind: "set", rs: Range[] }
+  | { kind: "any", nl: bool }
+  | { kind: "assert", op: string }
+  | { kind: "split", x: int, y: int }
+  | { kind: "jmp", x: int }
+  | { kind: "match" }
+
+type Branch = { pc: int, pos: int }
+
+
+function splitI(x: int, y: int): Inst {
+  return { kind: "split", x: x, y: y }
+}
+
+function jmpI(x: int): Inst {
+  return { kind: "jmp", x: x }
+}
+
+// Greedy prefers the body (x); lazy prefers the exit (y).
+function splitOf(body: int, exit: int, greedy: bool): Inst {
+  if (greedy) return splitI(body, exit)
+  return splitI(exit, body)
+}
+
+class ReCompiler {
+  prog: Inst[] = []
+
+  emit(i: Inst): int throws SyntaxError {
+    if (this.prog.length >= progLimit()) throw new SyntaxError("pattern too large")
+    this.prog.push(i)
+    return this.prog.length - 1
+  }
+
+  gen(n: Node): void throws SyntaxError {
+    if (n.kind === "empty") return
+    if (n.kind === "lit") {
+      try this.emit({ kind: "char", c: n.c })
+      return
+    }
+    if (n.kind === "set") {
+      try this.emit({ kind: "set", rs: n.rs })
+      return
+    }
+    if (n.kind === "any") {
+      try this.emit({ kind: "any", nl: n.nl })
+      return
+    }
+    if (n.kind === "assert") {
+      try this.emit({ kind: "assert", op: n.op })
+      return
+    }
+    if (n.kind === "cat") {
+      for (const x of n.items) {
+        try this.gen(x)
+      }
+      return
+    }
+    if (n.kind === "alt") {
+      const jumps: int[] = []
+      for (let k = 0; k < n.items.length; k++) {
+        const item = n.items[k]!
+        if (k + 1 < n.items.length) {
+          const sp = try this.emit(splitI(0, 0))
+          try this.gen(item)
+          jumps.push(try this.emit(jmpI(0)))
+          this.prog[sp] = splitI(sp + 1, this.prog.length)
+        } else {
+          try this.gen(item)
+        }
+      }
+      const end = this.prog.length
+      for (const j of jumps) {
+        this.prog[j] = jmpI(end)
+      }
+      return
+    }
+    // rep: min copies, then either a loop (unbounded) or max - min optional copies.
+    const sub = n.items[0]!
+    for (let k = 0; k < n.min; k++) {
+      try this.gen(sub)
+    }
+    if (n.max < 0) {
+      const loop = try this.emit(splitI(0, 0))
+      try this.gen(sub)
+      try this.emit(jmpI(loop))
+      this.prog[loop] = splitOf(loop + 1, this.prog.length, n.greedy)
+      return
+    }
+    const splits: int[] = []
+    for (let k = n.min; k < n.max; k++) {
+      splits.push(try this.emit(splitI(0, 0)))
+      try this.gen(sub)
+    }
+    const end = this.prog.length
+    for (const sp of splits) {
+      this.prog[sp] = splitOf(sp + 1, end, n.greedy)
+    }
+  }
+}
+
+// ---- helpers used by the matcher ----
+
+function assertHolds(op: string, cps: int[], pos: int): bool {
+  const n = cps.length
+  if (op === "bot") return pos === 0
+  if (op === "eot") return pos === n
+  if (op === "bol") return pos === 0 || cps[pos - 1] === 10
+  if (op === "eol") return pos === n || cps[pos] === 10
+  const before = pos > 0 && isWordCp(cps[pos - 1]!)
+  const after = pos < n && isWordCp(cps[pos]!)
+  if (op === "wordb") return before !== after
+  return before === after
+}
+
+// ---- tests ----
+
+// true or false, or "error: ..." when the pattern does not compile.
+function find(p: string, s: string): bool | string {
+  try {
+    return compileRegex(p).test(s)
+  } catch (e) {
+    return "error: " + e.message
+  }
+}
+
+function repeatText(unit: string, count: int): string {
+  const one = new TextEncoder().encode(unit)
+  const b: u8[] = []
+  for (let i = 0; i < count; i++) {
+    for (const x of one) b.push(x)
+  }
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+test("literals and unanchored search", () => {
+  expect(find("abc", "xabcx")).toBe(true)
+  expect(find("abc", "abd")).toBe(false)
+  expect(find("abc", "")).toBe(false)
+  expect(find("", "anything")).toBe(true)
+  expect(find("", "")).toBe(true)
+  expect(find("gpt", "gpt-4o")).toBe(true)
+  expect(find("a b", "a b")).toBe(true)
+})
+
+test("dot matches any code point except newline unless (?s)", () => {
+  expect(find("a.c", "abc")).toBe(true)
+  expect(find("a.c", "a\nc")).toBe(false)
+  expect(find("(?s)a.c", "a\nc")).toBe(true)
+  expect(find("^.$", "é")).toBe(true)
+  expect(find("^..$", "é")).toBe(false)
+  expect(find("^.$", "€")).toBe(true)
+})
+
+test("character classes, ranges and negation", () => {
+  expect(find("^[a-z0-9_]+$", "__x9")).toBe(true)
+  expect(find("^[a-z0-9_]+$", "X")).toBe(false)
+  expect(find("^[^0-9]$", "a")).toBe(true)
+  expect(find("^[^0-9]$", "7")).toBe(false)
+  expect(find("^[]a]$", "]")).toBe(true)
+  expect(find("^[a-]$", "-")).toBe(true)
+  expect(find("^[-a]$", "-")).toBe(true)
+  expect(find("^[\\]]$", "]")).toBe(true)
+  expect(find("^[\\d.]+$", "1.5")).toBe(true)
+  expect(find("^[\\W]$", " ")).toBe(true)
+  expect(find("^[\\x41-\\x43]+$", "ABC")).toBe(true)
+  expect(find("^[é-ê]$", "ê")).toBe(true)
+  expect(find("^[[:alpha:]]+$", "abcXYZ")).toBe(true)
+  expect(find("^[[:digit:][:space:]]+$", "1 2")).toBe(true)
+  expect(find("^[[:^digit:]]$", "5")).toBe(false)
+  expect(find("^[[:^digit:]]$", "x")).toBe(true)
+  expect(find("^[a[]$", "[")).toBe(true)
+})
+
+test("escapes", () => {
+  expect(find("\\d+", "ab12")).toBe(true)
+  expect(find("^\\D+$", "123")).toBe(false)
+  expect(find("^\\D+$", "ab")).toBe(true)
+  expect(find("\\w+@\\w+\\.com", "me@x.com")).toBe(true)
+  expect(find("\\w+@\\w+\\.com", "me@x-com")).toBe(false)
+  expect(find("a\\sb", "a b")).toBe(true)
+  expect(find("a\\s b", "a  b")).toBe(true)
+  expect(find("\\s", "ab")).toBe(false)
+  expect(find("^\\S+$", "a\tb")).toBe(false)
+  expect(find("a\\.b", "axb")).toBe(false)
+  expect(find("a\\.b", "a.b")).toBe(true)
+  expect(find("a\\\\b", "a\\b")).toBe(true)
+  expect(find("\\t", "a\tb")).toBe(true)
+  expect(find("\\n", "a\nb")).toBe(true)
+  expect(find("\\x41", "A")).toBe(true)
+  expect(find("\\x{263A}", "smile ☺")).toBe(true)
+  expect(find("\\(\\)\\[\\]\\{\\}\\*\\+\\?\\|\\^\\$", "()[]{}*+?|^$")).toBe(true)
+  expect(find("\\Q.*\\E", "a.*b")).toBe(true)
+  expect(find("\\Q.*\\E", "axb")).toBe(false)
+})
+
+test("anchors and word boundaries", () => {
+  expect(find("^abc$", "abc")).toBe(true)
+  expect(find("^abc$", "abcd")).toBe(false)
+  expect(find("^abc$", "xabc")).toBe(false)
+  expect(find("^$", "")).toBe(true)
+  expect(find("^$", "a")).toBe(false)
+  expect(find("\\Aabc\\z", "abc")).toBe(true)
+  expect(find("abc$", "abc\n")).toBe(false)
+  expect(find("(?m)^b$", "a\nb\nc")).toBe(true)
+  expect(find("^b$", "a\nb\nc")).toBe(false)
+  expect(find("(?m)a$", "a\nb")).toBe(true)
+  expect(find("\\bcat\\b", "a cat.")).toBe(true)
+  expect(find("\\bcat\\b", "concat")).toBe(false)
+  expect(find("\\Bcat", "concat")).toBe(true)
+})
+
+test("groups, alternation and empty alternatives", () => {
+  expect(find("(ab)+c", "ababc")).toBe(true)
+  expect(find("(?:ab|cd)e", "cde")).toBe(true)
+  expect(find("(?:ab|cd)e", "ce")).toBe(false)
+  expect(find("a(b|)c", "ac")).toBe(true)
+  expect(find("^(cat|dog)$", "dog")).toBe(true)
+  expect(find("cat|dog", "hotdog")).toBe(true)
+  expect(find("cat|dog", "bird")).toBe(false)
+  expect(find("(?P<name>x)y", "xy")).toBe(true)
+  expect(find("(?<name>x)y", "xy")).toBe(true)
+  expect(find("()", "")).toBe(true)
+  expect(find("a|", "zzz")).toBe(true)
+})
+
+test("quantifiers and counted repeats", () => {
+  expect(find("^a{2}$", "a")).toBe(false)
+  expect(find("^a{2}$", "aa")).toBe(true)
+  expect(find("^a{2,}$", "aaa")).toBe(true)
+  expect(find("^a{2,}$", "a")).toBe(false)
+  expect(find("^a{2,3}$", "aaaa")).toBe(false)
+  expect(find("^a{2,3}$", "aaa")).toBe(true)
+  expect(find("^x{0}$", "")).toBe(true)
+  expect(find("^a?b$", "b")).toBe(true)
+  expect(find("^a+$", "")).toBe(false)
+  expect(find("^a*$", "")).toBe(true)
+  expect(find("^a{1000}$", repeatText("a", 1000))).toBe(true)
+  expect(find("^a{1000}$", repeatText("a", 999))).toBe(false)
+  // Not a repeat, so the braces are literal.
+  expect(find("a{,2}", "a{,2}")).toBe(true)
+  expect(find("a{", "a{")).toBe(true)
+  expect(find("a{x}", "a{x}")).toBe(true)
+  expect(find("{", "{")).toBe(true)
+})
+
+test("lazy and ungreedy forms accept the same strings", () => {
+  expect(find("a.*?b", "aXbYb")).toBe(true)
+  expect(find("^a+?$", "aaa")).toBe(true)
+  expect(find("^a??$", "")).toBe(true)
+  expect(find("^a{2,3}?$", "aaa")).toBe(true)
+  expect(find("(?U)^a+$", "aaa")).toBe(true)
+  expect(find("(?U)^a+?$", "aaa")).toBe(true)
+})
+
+test("case folding is scoped by flag groups", () => {
+  expect(find("(?i)hello", "HeLLo")).toBe(true)
+  expect(find("(?i)[a-c]+", "B")).toBe(true)
+  expect(find("(?i)^[^a]$", "A")).toBe(false)
+  expect(find("(?i)^[^a]$", "b")).toBe(true)
+  expect(find("(?i:a)b", "Ab")).toBe(true)
+  expect(find("(?i:a)b", "AB")).toBe(false)
+  expect(find("a(?i)b", "aB")).toBe(true)
+  expect(find("a(?i)b", "AB")).toBe(false)
+  expect(find("(?i)\\bfoo\\b", "FOO!")).toBe(true)
+  expect(find("(?i)[[:upper:]]", "q")).toBe(true)
+  expect(find("(?i-i:a)", "A")).toBe(false)
+  expect(find("(?i)(?-i:a)", "A")).toBe(false)
+})
+
+test("nested groups and flags end with their group", () => {
+  expect(find("(a(?i)b)c", "aBc")).toBe(true)
+  expect(find("(a(?i)b)c", "aBC")).toBe(false)
+})
+
+test("catastrophic patterns finish and fail closed or match correctly", () => {
+  expect(find("(a*)*b", repeatText("a", 40))).toBe(false)
+  expect(find("(a|a)*b", repeatText("a", 40))).toBe(false)
+  expect(find("(x+x+)+y", repeatText("x", 40))).toBe(false)
+  expect(find("(a+)+$", repeatText("a", 40) + "!")).toBe(false)
+  expect(find("^(a|aa)+$", repeatText("a", 60))).toBe(true)
+})
+
+test("loops whose body can match empty still find later matches", () => {
+  expect(find("(a*)*b", "b")).toBe(true)
+  expect(find("(a|)+b", "b")).toBe(true)
+  expect(find("(a*)+$", "aa")).toBe(true)
+  expect(find("(a?){5}b", "b")).toBe(true)
+  expect(find("(|a)*c", "aac")).toBe(true)
+  expect(find("b.*c", "abbbcd")).toBe(true)
+  expect(find("xyz", "axyzb")).toBe(true)
+})
+
+test("routing-rule patterns from the Bifrost docs", () => {
+  expect(find("[0-9]+\\.[0-9]+\\.[0-9]+", "v1.2.3")).toBe(true)
+  expect(find("[0-9]+\\.[0-9]+\\.[0-9]+", "1.2")).toBe(false)
+  expect(find(".*premium.*", "x-premium-tier")).toBe(true)
+  expect(find("^prod-", "prod-7")).toBe(true)
+  expect(find("^gpt-4", "gpt-4o")).toBe(true)
+  expect(find("^[a-z]+@company\\.com$", "ann@company.com")).toBe(true)
+})
+
+test("syntax errors are reported", () => {
+  expect(find("(a", "")).toBe("error: missing closing ) at position 3")
+  expect(find("a)", "")).toBe("error: unexpected ) at position 2")
+  expect(find("[a", "")).toBe("error: missing closing ] at position 3")
+  expect(find("*a", "")).toBe("error: missing argument to repetition operator at position 2")
+  expect(find("a**", "")).toBe("error: invalid nested repetition operator at position 3")
+  expect(find("a*+", "")).toBe("error: invalid nested repetition operator at position 3")
+  expect(find("a{2}{3}", "")).toBe("error: invalid nested repetition operator at position 5")
+  expect(find("a{3,2}", "")).toBe("error: invalid repeat count at position 2")
+  expect(find("a{1001}", "")).toBe("error: invalid repeat count at position 2")
+  expect(find("a{1,1001}", "")).toBe("error: invalid repeat count at position 2")
+  expect(find("\\q", "")).toBe("error: invalid escape sequence at position 3")
+  expect(find("\\1", "")).toBe("error: invalid escape sequence at position 3")
+  expect(find("\\pL", "")).toBe("error: Unicode classes are not supported at position 3")
+  expect(find("\\p{Greek}", "")).toBe("error: Unicode classes are not supported at position 3")
+  expect(find("[z-a]", "")).toBe("error: invalid character class range at position 5")
+  expect(find("[[:nope:]]", "")).toBe("error: invalid character class name at position 2")
+  expect(find("(?=a)", "")).toBe("error: invalid or unsupported Perl syntax at position 4")
+  expect(find("(?P=n)", "")).toBe("error: invalid named capture at position 4")
+  expect(find("(?)", "")).toBe("error: missing flags in group at position 4")
+  expect(find("(?i", "")).toBe("error: missing closing ) at position 4")
+  expect(find("\\x{110000}", "")).toBe("error: invalid \\x escape at position 10")
+  expect(find("\\xZ1", "")).toBe("error: invalid \\x escape at position 3")
+  expect(find("a\\", "")).toBe("error: trailing \\ at position 3")
+  expect(find("[a\\", "")).toBe("error: trailing \\ at position 4")
+  expect(find("\\Qabc", "abc")).toBe(true)
+})
+
+test("an oversized program is rejected at compile time", () => {
+  expect(find("(a{1000}){1000}", "")).toBe("error: pattern too large")
+})
+
+test("inputs past the step budget fail closed", () => {
+  // 80 literal instructions over 65536 code points is past the budget, so the
+  // search is skipped and reports no match, even though the text matches.
+  const pat = repeatText("x", 80)
+  expect(find(pat, repeatText("x", 65536))).toBe(false)
+  expect(find(pat, repeatText("x", 200))).toBe(true)
+})
+
+test("long inputs within the budget match", () => {
+  expect(find("a$", repeatText("a", 50000))).toBe(true)
+  expect(find("b", repeatText("a", 50000))).toBe(false)
+})

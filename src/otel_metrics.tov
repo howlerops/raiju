@@ -1,0 +1,581 @@
+import { inc, labels, observe, render, setGauge } from "./metrics"
+
+// OpenTelemetry metrics in the shape Bifrost's otel plugin pushes them. The
+// Prometheus registry in metrics.tov is re-encoded as an OTLP/HTTP JSON
+// ExportMetricsServiceRequest. The registry holds running totals, so every push
+// is a full cumulative snapshot and nothing is kept between pushes here.
+// Config names follow Bifrost's profile fields (metrics_enabled and friends).
+
+// Bifrost's metrics fields. The wiring copies `headers` and the traces endpoint
+// from OtelConfig, so the metrics URL can fall back to /v1/metrics on the
+// traces base. Bifrost itself requires metrics_endpoint; this fallback is ours.
+export type OtelMetricsSettings = {
+  metrics_enabled?: bool,
+  metrics_endpoint?: string,
+  metrics_headers?: Map<string, string>,
+  metrics_push_interval?: int,
+  headers?: Map<string, string>,
+  traces_endpoint?: string,
+}
+
+// Bifrost's plugin_span_filter. Plugin names are the span owners.
+export type PluginSpanFilter = { mode: "include" | "exclude", plugins: string[] }
+
+const DEFAULT_PUSH_S: int = 15
+const MAX_PUSH_S: int = 300
+// OTLP AggregationTemporality: CUMULATIVE. Bifrost's SDK default, and what the
+// registry already holds.
+const CUMULATIVE: int = 2
+const TRACES_PATH = "/v1/traces"
+const METRICS_PATH = "/v1/metrics"
+
+// Per-signal headers: the shared set first, then the signal's own, which win on
+// a key collision (Bifrost's mergedResolvedHeaders). A new map each call.
+export function mergeHeaders(common: Map<string, string> | undefined, overlay: Map<string, string> | undefined): Map<string, string> {
+  const out: Map<string, string> = new Map()
+  if (common !== undefined) {
+    for (const k of common.keys()) out.set(k, common.get(k)!)
+  }
+  if (overlay !== undefined) {
+    for (const k of overlay.keys()) out.set(k, overlay.get(k)!)
+  }
+  return out
+}
+
+// metrics_endpoint is a full URL, as in Bifrost. Without it, the traces endpoint's
+// base gets /v1/metrics: `.../v1/traces` is replaced, and a bare host is extended.
+export function metricsUrl(cfg: OtelMetricsSettings): string | undefined {
+  const ep = cfg.metrics_endpoint
+  if (ep !== undefined && ep !== "") return ep
+  const t = cfg.traces_endpoint
+  if (t === undefined || t === "") return undefined
+  let base = t
+  if (base.endsWith(TRACES_PATH)) base = base.slice(0, base.byteLength - TRACES_PATH.byteLength)
+  while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+  return base + METRICS_PATH
+}
+
+// Bifrost's push interval: unset or <= 0 means 15 seconds, and anything above
+// 300 is rejected at Init (validateMetricsSettings). Clamped here as a fallback.
+export function pushIntervalSeconds(cfg: OtelMetricsSettings): int {
+  const iv = cfg.metrics_push_interval ?? 0
+  if (iv <= 0) return DEFAULT_PUSH_S
+  return iv > MAX_PUSH_S ? MAX_PUSH_S : iv
+}
+
+// The first config error, worded as Bifrost words it, or undefined when the
+// settings are usable. Metrics that are disabled are never an error.
+export function validateMetricsSettings(cfg: OtelMetricsSettings): string | undefined {
+  if (cfg.metrics_enabled !== true) return undefined
+  if (metricsUrl(cfg) === undefined) return "metrics_endpoint is required when metrics_enabled is true"
+  const iv = cfg.metrics_push_interval ?? 0
+  if (iv > MAX_PUSH_S) return `metrics_push_interval must be between 1 and 300 seconds, got ${iv}`
+  return undefined
+}
+
+// Bifrost's plugin span filter. include exports only the listed plugins' spans;
+// exclude exports everything except them. No filter exports everything, and an
+// unknown mode is treated as exclude. Meant for the tracer's finish step.
+export function spanAllowed(f: PluginSpanFilter | undefined, plugin: string): bool {
+  if (f === undefined) return true
+  const listed = f.plugins.includes(plugin)
+  return f.mode === "include" ? listed : !listed
+}
+
+// ---- Prometheus text parsing ----
+
+type Label = { k: string, v: string }
+type Sample = { name: string, labels: Label[], value: f64 }
+
+// One series' data. Scalars use `value`. Histograms collect the le buckets in
+// order (cums are Prometheus' cumulative counts), plus sum and count. Summaries
+// use sum and count only.
+class Point {
+  attrs: Label[] = []
+  value: f64 = 0.0
+  les: f64[] = []
+  cums: f64[] = []
+  sum: f64 = 0.0
+  count: f64 = 0.0
+}
+
+class Family {
+  pts: Map<string, Point> = new Map()
+  constructor(readonly name: string, readonly kind: string) {}
+}
+
+const SP: int = 32
+const LBRACE: int = 123
+const RBRACE: int = 125
+const EQ: int = 61
+const QUOTE: int = 34
+const COMMA: int = 44
+const BSLASH: int = 92
+const LOWER_N: int = 110
+
+// Bytes are read by offset, as strings are indexed by byte in Tov. -1 past the end.
+function byteAt(b: u8[], i: int): int {
+  const x = b[i]
+  return x === undefined ? -1 : int(x)
+}
+
+// Non-finite values come from a division by zero, which Tov does not write as a literal.
+function divide(a: f64, b: f64): f64 {
+  return a / b
+}
+
+// One sample line: `name{k="v",...} value`. Label values unescape \\, \" and \n,
+// the escapes metrics.tov writes. An optional timestamp after the value is ignored.
+function parseSample(line: string): Sample | undefined {
+  const b = new TextEncoder().encode(line)
+  const n = b.length
+  let i = 0
+  while (i < n && byteAt(b, i) !== SP && byteAt(b, i) !== LBRACE) i += 1
+  const name = line.slice(0, i)
+  if (name === "") return undefined
+  const labels: Label[] = []
+  if (byteAt(b, i) === LBRACE) {
+    i += 1
+    while (byteAt(b, i) !== RBRACE) {
+      const ks = i
+      while (i < n && byteAt(b, i) !== EQ) i += 1
+      if (i >= n) return undefined
+      const key = line.slice(ks, i)
+      i += 1
+      if (byteAt(b, i) !== QUOTE) return undefined
+      i += 1
+      let val = ""
+      let run = i
+      while (true) {
+        const c = byteAt(b, i)
+        if (c < 0) return undefined
+        if (c === QUOTE) break
+        if (c === BSLASH) {
+          val += line.slice(run, i)
+          val += byteAt(b, i + 1) === LOWER_N ? "\n" : line.slice(i + 1, i + 2)
+          i += 2
+          run = i
+        } else {
+          i += 1
+        }
+      }
+      val += line.slice(run, i)
+      i += 1
+      labels.push({ k: key, v: val })
+      if (byteAt(b, i) === COMMA) i += 1
+    }
+    i += 1
+  }
+  while (byteAt(b, i) === SP) i += 1
+  let end = i
+  while (end < n && byteAt(b, end) !== SP) end += 1
+  const text = line.slice(i, end)
+  let value = 0.0
+  if (text === "+Inf" || text === "Inf") {
+    value = divide(1.0, 0.0)
+  } else if (text === "-Inf") {
+    value = divide(-1.0, 0.0)
+  } else if (text === "NaN") {
+    value = divide(0.0, 0.0)
+  } else {
+    const p = parseFloat(text)
+    if (p === undefined) return undefined
+    value = p
+  }
+  return { name: name, labels: labels, value: value }
+}
+
+function labelKey(ls: Label[]): string {
+  let s = ""
+  for (const l of ls) s += l.k + "\u0001" + l.v + "\u0002"
+  return s
+}
+
+// Routes one sample to its family. A _bucket, _sum or _count line belongs to a
+// histogram or summary family, found from the # TYPE line. Anything else is a
+// scalar series of its own name.
+function addSample(inout out: Map<string, Family>, types: Map<string, string>, s: Sample): void {
+  let base = s.name
+  let part = ""
+  for (const suffix of ["_bucket", "_sum", "_count"]) {
+    if (s.name.endsWith(suffix)) {
+      const b = s.name.slice(0, s.name.byteLength - suffix.byteLength)
+      const t = types.get(b)
+      if (t === "histogram" || (t === "summary" && suffix !== "_bucket")) {
+        base = b
+        part = suffix.slice(1)
+        break
+      }
+    }
+  }
+  const kind = types.get(base) ?? "untyped"
+  if (part === "" && (kind === "histogram" || kind === "summary")) return
+  let fam = out.get(base)
+  if (fam === undefined) {
+    fam = new Family(base, kind)
+    out.set(base, fam)
+  }
+  let le = ""
+  const attrs: Label[] = []
+  for (const l of s.labels) {
+    if (part === "bucket" && l.k === "le") le = l.v
+    else attrs.push(l)
+  }
+  const key = labelKey(attrs)
+  let pt = fam.pts.get(key)
+  if (pt === undefined) {
+    pt = new Point()
+    pt.attrs = attrs
+    fam.pts.set(key, pt)
+  }
+  if (part === "bucket") {
+    // The +Inf bucket is the same number as _count, so it is not kept as a bound.
+    if (le === "+Inf") return
+    const bound = parseFloat(le)
+    if (bound === undefined) return
+    pt.les.push(bound)
+    pt.cums.push(s.value)
+  } else if (part === "sum") {
+    pt.sum = s.value
+  } else if (part === "count") {
+    pt.count = s.value
+  } else {
+    pt.value = s.value
+  }
+}
+
+// The families of one exposition. Types come from the # TYPE lines, read first
+// so a sample can be routed whatever order the lines come in.
+function parseExposition(text: string): Map<string, Family> {
+  const lines = text.split("\n")
+  const types: Map<string, string> = new Map()
+  for (const line of lines) {
+    if (!line.startsWith("# TYPE ")) continue
+    const parts = line.split(" ")
+    if (parts.length >= 4) types.set(parts[2]!, parts[3]!.trimEnd())
+  }
+  let out: Map<string, Family> = new Map()
+  for (const line of lines) {
+    if (line === "" || line.startsWith("#")) continue
+    const s = parseSample(line)
+    if (s === undefined) continue
+    addSample(&out, types, s)
+  }
+  return out
+}
+
+// ---- OTLP JSON ----
+
+type OtlpKv = { key: string, value: { stringValue: string } }
+type OtlpNumberPoint = { attributes: OtlpKv[], startTimeUnixNano: string, timeUnixNano: string, asDouble: f64 }
+type OtlpHistPoint = {
+  attributes: OtlpKv[],
+  startTimeUnixNano: string,
+  timeUnixNano: string,
+  count: string,
+  sum: f64,
+  bucketCounts: string[],
+  explicitBounds: f64[],
+}
+type OtlpSummaryPoint = {
+  attributes: OtlpKv[],
+  startTimeUnixNano: string,
+  timeUnixNano: string,
+  count: string,
+  sum: f64,
+  quantileValues: { quantile: f64, value: f64 }[],
+}
+type OtlpMetric = {
+  name: string,
+  sum?: { dataPoints: OtlpNumberPoint[], aggregationTemporality: int, isMonotonic: bool },
+  gauge?: { dataPoints: OtlpNumberPoint[] },
+  histogram?: { dataPoints: OtlpHistPoint[], aggregationTemporality: int },
+  summary?: { dataPoints: OtlpSummaryPoint[] },
+}
+type OtlpMetricsPayload = {
+  resourceMetrics: {
+    resource: { attributes: OtlpKv[] },
+    scopeMetrics: { scope: { name: string }, metrics: OtlpMetric[] }[],
+  }[],
+}
+
+// OTLP times are unix nanoseconds, sent as strings. Microseconds are kept, with
+// the arithmetic in int, as in otel.tov.
+function nanos(ms: f64): string {
+  return "" + (Math.floor(ms * 1000.0) * 1000)
+}
+
+// True for finite numbers. NaN and the infinities do not survive JSON.stringify
+// (they become null), so points carrying them are left out of the export.
+function finite(v: f64): bool {
+  return v - v === 0.0
+}
+
+function kvs(ls: Label[]): OtlpKv[] {
+  const out: OtlpKv[] = []
+  for (const l of ls) out.push({ key: l.k, value: { stringValue: l.v } })
+  return out
+}
+
+// OTLP counts are uint64 and travel as decimal strings.
+function countStr(v: f64): string {
+  return "" + Math.floor(Math.max(0.0, v) + 0.5)
+}
+
+// The bucket counts are the differences of the cumulative le counts. The last
+// (+Inf) bucket is _count minus the largest le count. OTLP wants one more
+// bucket than there are explicit bounds.
+function histPoint(pt: Point, start: string, now: string): OtlpHistPoint | undefined {
+  if (!finite(pt.sum)) return undefined
+  const counts: string[] = []
+  let prev = 0.0
+  for (const c of pt.cums) {
+    counts.push(countStr(c - prev))
+    prev = c
+  }
+  counts.push(countStr(pt.count - prev))
+  return {
+    attributes: kvs(pt.attrs),
+    startTimeUnixNano: start,
+    timeUnixNano: now,
+    count: countStr(pt.count),
+    sum: pt.sum,
+    bucketCounts: counts,
+    explicitBounds: pt.les,
+  }
+}
+
+function numberPoint(pt: Point, start: string, now: string): OtlpNumberPoint | undefined {
+  if (!finite(pt.value)) return undefined
+  return { attributes: kvs(pt.attrs), startTimeUnixNano: start, timeUnixNano: now, asDouble: pt.value }
+}
+
+function summaryPoint(pt: Point, start: string, now: string): OtlpSummaryPoint | undefined {
+  if (!finite(pt.sum)) return undefined
+  return {
+    attributes: kvs(pt.attrs),
+    startTimeUnixNano: start,
+    timeUnixNano: now,
+    count: countStr(pt.count),
+    sum: pt.sum,
+    quantileValues: [],
+  }
+}
+
+// counter -> Sum (cumulative, monotonic), gauge and untyped -> Gauge,
+// histogram -> Histogram, summary -> Summary.
+function toMetrics(fams: Map<string, Family>, startMs: f64, nowMs: f64): OtlpMetric[] {
+  const start = nanos(startMs)
+  const now = nanos(nowMs)
+  const out: OtlpMetric[] = []
+  for (const name of fams.keys()) {
+    const fam = fams.get(name)!
+    if (fam.kind === "histogram") {
+      const dps: OtlpHistPoint[] = []
+      for (const pt of fam.pts.values()) {
+        const hp = histPoint(pt, start, now)
+        if (hp !== undefined) dps.push(hp)
+      }
+      out.push({ name: name, histogram: { dataPoints: dps, aggregationTemporality: CUMULATIVE } })
+    } else if (fam.kind === "summary") {
+      const dps: OtlpSummaryPoint[] = []
+      for (const pt of fam.pts.values()) {
+        const sp = summaryPoint(pt, start, now)
+        if (sp !== undefined) dps.push(sp)
+      }
+      out.push({ name: name, summary: { dataPoints: dps } })
+    } else {
+      const dps: OtlpNumberPoint[] = []
+      for (const pt of fam.pts.values()) {
+        const np = numberPoint(pt, start, now)
+        if (np !== undefined) dps.push(np)
+      }
+      if (fam.kind === "counter") {
+        out.push({ name: name, sum: { dataPoints: dps, aggregationTemporality: CUMULATIVE, isMonotonic: true } })
+      } else {
+        out.push({ name: name, gauge: { dataPoints: dps } })
+      }
+    }
+  }
+  return out
+}
+
+// The OTLP/HTTP JSON request that pushes one snapshot of the registry. promText is
+// metrics.render() output (or the merged text). startMs is the process start, the
+// cumulative series' start time. nowMs is the push time. resource becomes the
+// OTLP resource attributes, and service.name defaults to "raiju". The caller
+// does the fetch, as exportRequest does for traces.
+export function exportMetricsRequest(cfg: OtelMetricsSettings, promText: string, startMs: f64, nowMs: f64, resource: Map<string, string>): { url: string, headers: Map<string, string>, body: string } {
+  const fams = parseExposition(promText)
+  const metrics = toMetrics(fams, startMs, nowMs)
+  const attrs: OtlpKv[] = []
+  for (const k of resource.keys()) attrs.push({ key: k, value: { stringValue: resource.get(k)! } })
+  if (resource.get("service.name") === undefined) attrs.push({ key: "service.name", value: { stringValue: "raiju" } })
+  const payload: OtlpMetricsPayload = {
+    resourceMetrics: [{
+      resource: { attributes: attrs },
+      scopeMetrics: [{ scope: { name: "raiju" }, metrics: metrics }],
+    }],
+  }
+  const headers = mergeHeaders(cfg.headers, cfg.metrics_headers)
+  headers.set("content-type", "application/json")
+  return { url: metricsUrl(cfg) ?? "", headers: headers, body: JSON.stringify(payload) }
+}
+
+// ---- tests ----
+
+const SAMPLE = [
+  "# TYPE bifrost_upstream_requests_total counter",
+  "bifrost_upstream_requests_total{provider=\"openai\",model=\"gpt-4o\",status=\"success\"} 2",
+  "# TYPE bifrost_sessions gauge",
+  "bifrost_sessions 3",
+  "# TYPE bifrost_upstream_latency_seconds histogram",
+  "bifrost_upstream_latency_seconds_bucket{provider=\"openai\",le=\"0.1\"} 1",
+  "bifrost_upstream_latency_seconds_bucket{provider=\"openai\",le=\"0.5\"} 3",
+  "bifrost_upstream_latency_seconds_bucket{provider=\"openai\",le=\"+Inf\"} 4",
+  "bifrost_upstream_latency_seconds_sum{provider=\"openai\"} 1.7",
+  "bifrost_upstream_latency_seconds_count{provider=\"openai\"} 4",
+  "# TYPE bifrost_overhead_latency_microseconds summary",
+  "bifrost_overhead_latency_microseconds_sum 120",
+  "bifrost_overhead_latency_microseconds_count 4",
+  "",
+].join("\n")
+
+const T0 = 1700000000123.0
+const T1 = 1700000060000.0
+
+function sampleBody(): OtlpMetricsPayload {
+  const r = exportMetricsRequest({ traces_endpoint: "http://collector:4318/v1/traces" }, SAMPLE, T0, T1, new Map())
+  return try JSON.parse(r.body) as OtlpMetricsPayload
+}
+
+test("metrics URL: explicit endpoint wins, otherwise the traces base", () => {
+  expect(metricsUrl({ metrics_endpoint: "http://m:4318/custom" })).toBe("http://m:4318/custom")
+  expect(metricsUrl({ traces_endpoint: "http://c:4318/v1/traces" })).toBe("http://c:4318/v1/metrics")
+  expect(metricsUrl({ traces_endpoint: "http://c:4318" })).toBe("http://c:4318/v1/metrics")
+  expect(metricsUrl({ traces_endpoint: "http://c:4318/otel/" })).toBe("http://c:4318/otel/v1/metrics")
+  expect(metricsUrl({})).toBeUndefined()
+})
+
+test("settings validation and push interval follow Bifrost", () => {
+  expect(validateMetricsSettings({})).toBeUndefined()
+  expect(validateMetricsSettings({ metrics_enabled: true })).toBe("metrics_endpoint is required when metrics_enabled is true")
+  expect(validateMetricsSettings({ metrics_enabled: true, traces_endpoint: "http://c:4318/v1/traces" })).toBeUndefined()
+  expect(validateMetricsSettings({ metrics_enabled: true, metrics_endpoint: "http://m", metrics_push_interval: 301 })).toBe("metrics_push_interval must be between 1 and 300 seconds, got 301")
+  expect(pushIntervalSeconds({})).toBe(15)
+  expect(pushIntervalSeconds({ metrics_push_interval: 0 })).toBe(15)
+  expect(pushIntervalSeconds({ metrics_push_interval: 30 })).toBe(30)
+})
+
+test("headers: per-signal overrides the shared set", () => {
+  const shared: Map<string, string> = new Map()
+  shared.set("x-honeycomb-team", "shared")
+  shared.set("x-env", "prod")
+  const own: Map<string, string> = new Map()
+  own.set("x-honeycomb-team", "metrics-key")
+  const m = mergeHeaders(shared, own)
+  expect(m.get("x-honeycomb-team")).toBe("metrics-key")
+  expect(m.get("x-env")).toBe("prod")
+  expect(mergeHeaders(undefined, undefined).size).toBe(0)
+  const req = exportMetricsRequest({ metrics_endpoint: "http://m/v1/metrics", headers: shared, metrics_headers: own }, "", T0, T1, new Map())
+  expect(req.headers.get("x-honeycomb-team")).toBe("metrics-key")
+  expect(req.headers.get("content-type")).toBe("application/json")
+  expect(req.url).toBe("http://m/v1/metrics")
+})
+
+test("span filter: include, exclude and no filter", () => {
+  const inc: PluginSpanFilter = { mode: "include", plugins: ["semcache"] }
+  const exc: PluginSpanFilter = { mode: "exclude", plugins: ["semcache"] }
+  expect(spanAllowed(undefined, "semcache")).toBe(true)
+  expect(spanAllowed(inc, "semcache")).toBe(true)
+  expect(spanAllowed(inc, "guardrails")).toBe(false)
+  expect(spanAllowed(exc, "semcache")).toBe(false)
+  expect(spanAllowed(exc, "guardrails")).toBe(true)
+})
+
+test("counter, gauge, histogram and summary map to their OTLP types", () => {
+  const p = try sampleBody()
+  const rm = p.resourceMetrics[0]!
+  expect(rm.resource.attributes[0]!.key).toBe("service.name")
+  expect(rm.resource.attributes[0]!.value.stringValue).toBe("raiju")
+  const sm = rm.scopeMetrics[0]!
+  expect(sm.scope.name).toBe("raiju")
+  expect(sm.metrics.length).toBe(4)
+
+  const c = sm.metrics[0]!
+  expect(c.name).toBe("bifrost_upstream_requests_total")
+  expect(c.gauge).toBeUndefined()
+  expect(c.sum!.aggregationTemporality).toBe(2)
+  expect(c.sum!.isMonotonic).toBe(true)
+  const cp = c.sum!.dataPoints[0]!
+  expect(cp.asDouble).toBe(2)
+  expect(cp.startTimeUnixNano).toBe("1700000000123000000")
+  expect(cp.timeUnixNano).toBe("1700000060000000000")
+  expect(cp.attributes.length).toBe(3)
+  expect(cp.attributes[0]).toEqual({ key: "provider", value: { stringValue: "openai" } })
+  expect(cp.attributes[2]).toEqual({ key: "status", value: { stringValue: "success" } })
+
+  const g = sm.metrics[1]!
+  expect(g.name).toBe("bifrost_sessions")
+  expect(g.sum).toBeUndefined()
+  expect(g.gauge!.dataPoints[0]!.asDouble).toBe(3)
+  expect(g.gauge!.dataPoints[0]!.attributes.length).toBe(0)
+})
+
+test("histogram: cumulative le counts become per-bucket counts", () => {
+  const h = try sampleBody().resourceMetrics[0]!.scopeMetrics[0]!.metrics[2]!
+  expect(h.name).toBe("bifrost_upstream_latency_seconds")
+  const hist = h.histogram!
+  expect(hist.aggregationTemporality).toBe(2)
+  expect(hist.dataPoints.length).toBe(1)
+  const dp = hist.dataPoints[0]!
+  expect(dp.count).toBe("4")
+  expect(dp.sum).toBe(1.7)
+  expect(dp.explicitBounds).toEqual([0.1, 0.5])
+  // le=0.1 holds 1, (0.1, 0.5] holds 3 - 1, (0.5, +Inf) holds 4 - 3
+  expect(dp.bucketCounts).toEqual(["1", "2", "1"])
+  expect(dp.bucketCounts.length).toBe(dp.explicitBounds.length + 1)
+  expect(dp.attributes.length).toBe(1)
+  expect(dp.attributes[0]!.key).toBe("provider")
+})
+
+test("summary keeps count and sum with no quantiles", () => {
+  const s = try sampleBody().resourceMetrics[0]!.scopeMetrics[0]!.metrics[3]!
+  expect(s.name).toBe("bifrost_overhead_latency_microseconds")
+  expect(s.summary!.dataPoints[0]!.count).toBe("4")
+  expect(s.summary!.dataPoints[0]!.sum).toBe(120)
+  expect(s.summary!.dataPoints[0]!.quantileValues.length).toBe(0)
+})
+
+test("label values unescape the escapes metrics.tov writes, and NaN points are dropped", () => {
+  const text = "# TYPE t counter\nt{p=\"a\\\"b\\\\c\\nd\"} 1\n# TYPE n gauge\nn 1\n" + "n{x=\"y\"} NaN\n"
+  const r = exportMetricsRequest({}, text, T0, T1, new Map())
+  const body = try JSON.parse(r.body) as OtlpMetricsPayload
+  const ms = body.resourceMetrics[0]!.scopeMetrics[0]!.metrics
+  expect(ms[0]!.sum!.dataPoints[0]!.attributes[0]!.value.stringValue).toBe("a\"b\\c\nd")
+  expect(ms[1]!.gauge!.dataPoints.length).toBe(1)
+  expect(r.url).toBe("")
+})
+
+test("metrics.render() output converts without loss", () => {
+  inc("otel_test_requests_total", labels("openai", "gpt-4o", "success"), 2.0)
+  setGauge("otel_test_inflight", "", 5.0)
+  observe("otel_test_latency_seconds", labels("openai", "gpt-4o", "success"), 0.2)
+  observe("otel_test_latency_seconds", labels("openai", "gpt-4o", "success"), 3.0)
+  const body = try JSON.parse(exportMetricsRequest({ traces_endpoint: "http://c/v1/traces" }, render(), T0, T1, new Map()).body) as OtlpMetricsPayload
+  const ms = body.resourceMetrics[0]!.scopeMetrics[0]!.metrics
+  const byName: Map<string, OtlpMetric> = new Map()
+  for (const m of ms) byName.set(m.name, m)
+  expect(byName.get("otel_test_requests_total")!.sum!.dataPoints[0]!.asDouble).toBe(2)
+  expect(byName.get("otel_test_inflight")!.gauge!.dataPoints[0]!.asDouble).toBe(5)
+  const h = byName.get("otel_test_latency_seconds")!.histogram!.dataPoints[0]!
+  expect(h.count).toBe("2")
+  expect(h.sum).toBe(3.2)
+  expect(h.explicitBounds.length).toBe(13)
+  // 0.2 lands in le=0.25, 3.0 in le=5; the bucket counts add back up to count
+  let total = 0.0
+  for (const c of h.bucketCounts) total += parseFloat(c)!
+  expect(total).toBe(2)
+  expect(h.bucketCounts[5]).toBe("1")
+  expect(h.bucketCounts[9]).toBe("1")
+})

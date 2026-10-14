@@ -3,29 +3,57 @@
 // ok -> pending -> firing -> ok, and a firing rule notifies once, not every time.
 // Timestamps are ms since the epoch, as in the log.
 
-export type Metric = "error_rate" | "p95_latency_ms" | "avg_latency_ms" | "requests" | "cost" | "budget_used" | "breaker_open"
+export type Metric =
+  | "error_rate"
+  | "p95_latency_ms"
+  | "avg_latency_ms"
+  | "requests"
+  | "cost"
+  | "budget_used"
+  | "breaker_open"
+  | "budget_usage_percent"
+  | "budget_spent"
+  | "rate_limit_request_usage_percent"
+  | "rate_limit_token_usage_percent"
+
+export type Severity = "critical" | "error" | "warning" | "info"
 
 export type AlertRule = {
   id: string,
   name?: string,
+  description?: string,
   metric: Metric,
   op: ">" | ">=" | "<" | "<=",
   threshold: f64,
   window_seconds?: int, // default 300
-  filter?: { provider?: string, model?: string, budget_id?: string },
+  filter?: { provider?: string, model?: string, budget_id?: string, rate_limit_id?: string },
   for_evaluations?: int, // consecutive breaching evaluations before firing; default 1
   cooldown_seconds?: int, // after a resolve, no new firing for this long; default 900
+  severity?: Severity, // PagerDuty severity; overrides the channel's; default "warning"
   channels: string[],
   enabled?: bool,
 }
 
-export type Channel = { id: string, type: "webhook" | "slack", url: string, headers?: Map<string, string> }
+// "microsoft_teams" and "pagerduty" are the config.json type names.
+export type Channel = {
+  id: string,
+  type: "webhook" | "slack" | "microsoft_teams" | "pagerduty",
+  url: string, // unused for pagerduty, which always posts to its Events API endpoint
+  headers?: Map<string, string>,
+  routing_key?: string, // pagerduty integration key
+  severity?: Severity, // pagerduty default when the rule sets none
+  cooldown_seconds?: int, // minimum seconds between sends on this channel; 0 or unset = none
+}
 
 export type Sample = { ts: f64, provider: string, model: string, status: int, latency_ms: f64, cost: f64 }
+
+// One governance rate limit's window: used and limit in the same unit (requests or tokens).
+export type RateLimitUsage = { id: string, kind: "request" | "token", used: f64, limit: f64 }
 
 export type Snapshot = {
   samples: Sample[],
   budgets: { id: string, used: f64, limit: f64 }[],
+  rateLimits?: RateLimitUsage[], // absent = no rate-limit metrics
   openBreakers: string[], // health target ids, "provider#key"
 }
 
@@ -34,6 +62,8 @@ export type Notification = { channel: Channel, ruleId: string, kind: "firing" | 
 export type AlertRecord = { ruleId: string, from: string, to: string, value?: f64, ts: f64 }
 
 const HISTORY_CAP = 500
+
+const PAGERDUTY_EVENTS_URL = "https://events.pagerduty.com/v2/enqueue"
 
 // The newest finished requests, for alert windows. Fed by the engine.
 export class SampleRing {
@@ -72,6 +102,46 @@ function inWindow(snap: Snapshot, rule: AlertRule, nowMs: f64): Sample[] {
   return out
 }
 
+// The largest budget usage in percent (0-100) among the budgets the filter names,
+// or among all budgets when none is named. Budgets with no limit are left out.
+function budgetPercent(snap: Snapshot, rule: AlertRule): f64 | undefined {
+  const f = rule.filter
+  let best: f64 | undefined = undefined
+  for (const b of snap.budgets) {
+    if (f !== undefined && f.budget_id !== undefined && b.id !== f.budget_id) continue
+    if (!(b.limit > 0.0)) continue
+    const p = (100.0 * b.used) / b.limit
+    if (best === undefined || p > best) best = p
+  }
+  return best
+}
+
+// The largest spend among the budgets the filter names, or among all of them.
+function budgetSpent(snap: Snapshot, rule: AlertRule): f64 | undefined {
+  const f = rule.filter
+  let best: f64 | undefined = undefined
+  for (const b of snap.budgets) {
+    if (f !== undefined && f.budget_id !== undefined && b.id !== f.budget_id) continue
+    if (best === undefined || b.used > best) best = b.used
+  }
+  return best
+}
+
+// The largest usage in percent (0-100) among the rate limits of one kind that the
+// filter names, or among all of them when none is named.
+function rateLimitPercent(snap: Snapshot, rule: AlertRule, kind: "request" | "token"): f64 | undefined {
+  const f = rule.filter
+  let best: f64 | undefined = undefined
+  for (const r of snap.rateLimits ?? []) {
+    if (r.kind !== kind) continue
+    if (f !== undefined && f.rate_limit_id !== undefined && r.id !== f.rate_limit_id) continue
+    if (!(r.limit > 0.0)) continue
+    const p = (100.0 * r.used) / r.limit
+    if (best === undefined || p > best) best = p
+  }
+  return best
+}
+
 // The value a rule is judged on, or undefined when the window has no data for it.
 // requests and cost are sums, so an empty window gives 0; error_rate and latency
 // need at least one request.
@@ -91,6 +161,10 @@ export function measure(rule: AlertRule, snap: Snapshot, nowMs: f64): f64 | unde
     }
     return undefined
   }
+  if (rule.metric === "budget_usage_percent") return budgetPercent(snap, rule)
+  if (rule.metric === "budget_spent") return budgetSpent(snap, rule)
+  if (rule.metric === "rate_limit_request_usage_percent") return rateLimitPercent(snap, rule, "request")
+  if (rule.metric === "rate_limit_token_usage_percent") return rateLimitPercent(snap, rule, "token")
   const xs = inWindow(snap, rule, nowMs)
   if (rule.metric === "requests") return xs.length
   if (rule.metric === "cost") {
@@ -145,6 +219,7 @@ function scope(rule: AlertRule): string {
   if (f.provider !== undefined) bits.push(f.provider)
   if (f.model !== undefined) bits.push(f.model)
   if (f.budget_id !== undefined) bits.push(`budget ${f.budget_id}`)
+  if (f.rate_limit_id !== undefined) bits.push(`rate limit ${f.rate_limit_id}`)
   if (bits.length === 0) return "all"
   return bits.join(", ")
 }
@@ -158,11 +233,66 @@ function oneLine(rule: AlertRule, kind: "firing" | "resolved", value: f64): stri
   return `[RESOLVED] ${name}: ${rule.metric} ${fmt(value)} (${where})`
 }
 
+// A rule's severity wins over its channel's; the doc's default is "warning".
+function severityOf(rule: AlertRule, ch: Channel): Severity {
+  return rule.severity ?? ch.severity ?? "warning"
+}
+
+// PagerDuty Events API v2. dedup_key is the rule id, so a resolve closes the incident
+// that its trigger opened.
+function pagerdutyBody(ch: Channel, rule: AlertRule, kind: "firing" | "resolved", value: f64): string {
+  return JSON.stringify({
+    routing_key: ch.routing_key ?? "",
+    event_action: kind === "firing" ? "trigger" : "resolve",
+    dedup_key: rule.id,
+    payload: {
+      summary: oneLine(rule, kind, value),
+      severity: severityOf(rule, ch),
+      source: "Bifrost Alerting",
+      custom_details: {
+        rule: rule.id,
+        description: rule.description,
+        metric: rule.metric,
+        value: value,
+        threshold: rule.threshold,
+        scope: scope(rule),
+      },
+    },
+  })
+}
+
+function fact(title: string, value: string): string {
+  return `{"title":${JSON.stringify(title)},"value":${JSON.stringify(value)}}`
+}
+
+// Teams incoming webhook or Workflows URL: a message holding one Adaptive Card.
+function teamsBody(ch: Channel, rule: AlertRule, kind: "firing" | "resolved", value: f64): string {
+  const parts: string[] = []
+  const color = kind === "firing" ? "Attention" : "Good"
+  parts.push(`{"type":"TextBlock","size":"Medium","weight":"Bolder","wrap":true,"color":"${color}","text":${JSON.stringify(oneLine(rule, kind, value))}}`)
+  if (rule.description !== undefined) {
+    parts.push(`{"type":"TextBlock","wrap":true,"isSubtle":true,"text":${JSON.stringify(rule.description)}}`)
+  }
+  const facts: string[] = [
+    fact("Rule", rule.id),
+    fact("Metric", rule.metric),
+    fact("Value", fmt(value)),
+    fact("Threshold", `${rule.op} ${fmt(rule.threshold)}`),
+    fact("Scope", scope(rule)),
+    fact("Severity", severityOf(rule, ch)),
+  ]
+  parts.push(`{"type":"FactSet","facts":[${facts.join(",")}]}`)
+  const card = `{"$schema":"http://adaptivecards.io/schemas/adaptive-card.json","type":"AdaptiveCard","version":"1.4","body":[${parts.join(",")}]}`
+  return `{"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","contentUrl":null,"content":${card}}]}`
+}
+
 // Webhook: a JSON object. Slack: {"text": "..."} with one readable line.
 export function notificationBody(channel: Channel, rule: AlertRule, kind: "firing" | "resolved", value: f64, nowMs: f64): string {
   if (channel.type === "slack") {
     return JSON.stringify({ text: oneLine(rule, kind, value) })
   }
+  if (channel.type === "microsoft_teams") return teamsBody(channel, rule, kind, value)
+  if (channel.type === "pagerduty") return pagerdutyBody(channel, rule, kind, value)
   return JSON.stringify({
     alert: rule.name ?? rule.id,
     rule: rule.id,
@@ -171,6 +301,8 @@ export function notificationBody(channel: Channel, rule: AlertRule, kind: "firin
     value: value,
     threshold: rule.threshold,
     ts: nowMs,
+    description: rule.description,
+    severity: rule.severity,
   })
 }
 
@@ -186,7 +318,8 @@ export function request(n: Notification): { url: string, headers: Map<string, st
     if (k.toLowerCase() === "content-type") hasType = true
   }
   if (!hasType) headers.set("content-type", "application/json")
-  return { url: n.channel.url, headers: headers, body: n.body }
+  const url = n.channel.type === "pagerduty" ? PAGERDUTY_EVENTS_URL : n.channel.url
+  return { url: url, headers: headers, body: n.body }
 }
 
 class RuleState {
@@ -201,6 +334,7 @@ export class AlertEngine {
   private rs: Map<string, RuleState> = new Map()
   private hist: AlertRecord[] = []
   private chans: Map<string, Channel> = new Map()
+  private sentAt: Map<string, f64> = new Map() // channel id -> last send, for channel cooldowns
 
   constructor(readonly rules: AlertRule[], readonly channels: Channel[]) {
     for (const c of channels) this.chans.set(c.id, c)
@@ -275,10 +409,22 @@ export class AlertEngine {
     st.since = nowMs
   }
 
+  // A firing notice waits out the channel's cooldown; a resolve never does, so an
+  // incident opened on the channel can always be closed.
+  private channelCooling(ch: Channel, kind: "firing" | "resolved", nowMs: f64): bool {
+    if (kind !== "firing") return false
+    const cool = ch.cooldown_seconds ?? 0
+    if (cool <= 0) return false
+    const last = this.sentAt.get(ch.id)
+    return last !== undefined && nowMs - last < cool * 1000.0
+  }
+
   private notify(rule: AlertRule, kind: "firing" | "resolved", value: f64, nowMs: f64, inout out: Notification[]): void {
     for (const cid of rule.channels) {
       const ch = this.chans.get(cid)
       if (ch === undefined) continue
+      if (this.channelCooling(ch, kind, nowMs)) continue
+      this.sentAt.set(ch.id, nowMs)
       out.push({ channel: ch, ruleId: rule.id, kind: kind, body: notificationBody(ch, rule, kind, value, nowMs) })
     }
   }
@@ -308,6 +454,8 @@ function headerMap(k: string, v: string): Map<string, string> {
 
 const SLACK: Channel = { id: "ch", type: "slack", url: "https://hooks.example/slack" }
 const HOOK: Channel = { id: "ch", type: "webhook", url: "https://hooks.example/hook", headers: headerMap("X-Token", "t") }
+const TEAMS: Channel = { id: "ch", type: "microsoft_teams", url: "https://teams.example/workflows/abc" }
+const PD: Channel = { id: "ch", type: "pagerduty", url: "", routing_key: "R0KEY", severity: "critical" }
 
 test("error_rate counts non-2xx over the window and is undefined with no requests", () => {
   const snap = snapOf([
@@ -516,6 +664,60 @@ test("webhook body is the JSON record", () => {
   const rule: AlertRule = { id: "r1", name: "Spend", metric: "cost", op: ">", threshold: 5.0, channels: ["ch"] }
   const body = notificationBody(HOOK, rule, "firing", 6.5, NOW)
   expect(body).toBe(`{"alert":"Spend","rule":"r1","kind":"firing","metric":"cost","value":6.5,"threshold":5,"ts":1000000}`)
+  const described: AlertRule = { id: "r1", metric: "cost", op: ">", threshold: 5.0, channels: ["ch"], description: "Daily spend", severity: "error" }
+  expect(notificationBody(HOOK, described, "resolved", 1.0, NOW)).toBe(`{"alert":"r1","rule":"r1","kind":"resolved","metric":"cost","value":1,"threshold":5,"ts":1000000,"description":"Daily spend","severity":"error"}`)
+})
+
+test("teams body is a message with one Adaptive Card", () => {
+  const rule: AlertRule = { id: "r1", name: "Spend", metric: "cost", op: ">", threshold: 5.0, channels: ["ch"] }
+  const body = notificationBody(TEAMS, rule, "firing", 6.5, NOW)
+  expect(body).toBe(
+    `{"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","contentUrl":null,"content":` +
+      `{"$schema":"http://adaptivecards.io/schemas/adaptive-card.json","type":"AdaptiveCard","version":"1.4","body":[` +
+      `{"type":"TextBlock","size":"Medium","weight":"Bolder","wrap":true,"color":"Attention","text":"[FIRING] Spend: cost 6.5 > 5 (all, last 5m)"},` +
+      `{"type":"FactSet","facts":[{"title":"Rule","value":"r1"},{"title":"Metric","value":"cost"},{"title":"Value","value":"6.5"},` +
+      `{"title":"Threshold","value":"> 5"},{"title":"Scope","value":"all"},{"title":"Severity","value":"warning"}]}]}}]}`
+  )
+  const parsed = try JSON.parse(body) as { type: string, attachments: { contentType: string, content: { type: string, body: { type: string }[] } }[] }
+  expect(parsed.type).toBe("message")
+  expect(parsed.attachments[0]!.content.type).toBe("AdaptiveCard")
+  expect(parsed.attachments[0]!.content.body.length).toBe(2)
+
+  const described: AlertRule = { id: "r2", metric: "budget_usage_percent", op: ">=", threshold: 80.0, channels: ["ch"], description: "Team budget", severity: "critical", filter: { budget_id: "b1" } }
+  const res = notificationBody(TEAMS, described, "resolved", 42.0, NOW)
+  const p2 = try JSON.parse(res) as { attachments: { content: { body: { type: string }[] } }[] }
+  // the TextBlock, the description, then the facts
+  expect(p2.attachments[0]!.content.body.length).toBe(3)
+  expect(res.indexOf(`"text":"Team budget"`) >= 0).toBe(true)
+  expect(res.indexOf(`{"title":"Severity","value":"critical"}`) >= 0).toBe(true)
+  expect(res.indexOf(`{"title":"Scope","value":"budget b1"}`) >= 0).toBe(true)
+})
+
+test("pagerduty trigger and resolve use the Events API v2 body, keyed by rule id", () => {
+  const rule: AlertRule = { id: "pd-1", name: "Breakers", metric: "breaker_open", op: ">", threshold: 0.0, channels: ["ch"] }
+  const fire = notificationBody(PD, rule, "firing", 2.0, NOW)
+  expect(fire).toBe(
+    `{"routing_key":"R0KEY","event_action":"trigger","dedup_key":"pd-1","payload":{` +
+      `"summary":"[FIRING] Breakers: breaker_open 2 > 0 (all, last 5m)","severity":"critical","source":"Bifrost Alerting",` +
+      `"custom_details":{"rule":"pd-1","metric":"breaker_open","value":2,"threshold":0,"scope":"all"}}}`
+  )
+  const parsed = try JSON.parse(fire) as { routing_key: string, event_action: string, dedup_key: string, payload: { summary: string, severity: string, source: string } }
+  expect(parsed.event_action).toBe("trigger")
+  expect(parsed.payload.source).toBe("Bifrost Alerting")
+
+  const resolve = notificationBody(PD, rule, "resolved", 0.0, NOW)
+  const r = try JSON.parse(resolve) as { routing_key: string, event_action: string, dedup_key: string, payload: { severity: string } }
+  expect(r.event_action).toBe("resolve")
+  expect(r.dedup_key).toBe("pd-1")
+  expect(r.routing_key).toBe("R0KEY")
+  // without a channel or rule severity, PagerDuty gets "warning"
+  const plain: Channel = { id: "ch", type: "pagerduty", url: "", routing_key: "K" }
+  const pl = try JSON.parse(notificationBody(plain, rule, "firing", 2.0, NOW)) as { payload: { severity: string } }
+  expect(pl.payload.severity).toBe("warning")
+  // a rule's own severity wins over the channel's
+  const sev: AlertRule = { id: "pd-2", metric: "requests", op: ">", threshold: 0.0, channels: ["ch"], severity: "info" }
+  const sv = try JSON.parse(notificationBody(PD, sev, "firing", 1.0, NOW)) as { payload: { severity: string } }
+  expect(sv.payload.severity).toBe("info")
 })
 
 test("request carries the channel url, headers and body, with a JSON content type", () => {
@@ -532,6 +734,96 @@ test("request carries the channel url, headers and body, with a JSON content typ
   expect(req2.headers.has("content-type")).toBe(false)
   const plain = request({ channel: SLACK, ruleId: "r", kind: "resolved", body: "y" })
   expect(plain.headers.get("content-type")).toBe("application/json")
+})
+
+test("request sends pagerduty to the Events API and teams to its own url", () => {
+  const rule: AlertRule = { id: "r", metric: "requests", op: ">=", threshold: 1.0, channels: ["ch"] }
+  const pd = request({ channel: PD, ruleId: rule.id, kind: "firing", body: "{}" })
+  expect(pd.url).toBe("https://events.pagerduty.com/v2/enqueue")
+  expect(pd.headers.get("content-type")).toBe("application/json")
+  const teams = request({ channel: TEAMS, ruleId: rule.id, kind: "firing", body: "{}" })
+  expect(teams.url).toBe("https://teams.example/workflows/abc")
+})
+
+test("budget_usage_percent is 0-100 over the filtered budget, or the largest budget when unfiltered", () => {
+  const snap: Snapshot = { samples: [], budgets: [{ id: "b1", used: 3.0, limit: 4.0 }, { id: "b2", used: 9.0, limit: 10.0 }, { id: "b3", used: 1.0, limit: 0.0 }], openBreakers: [] }
+  const one: AlertRule = { id: "r", metric: "budget_usage_percent", op: ">=", threshold: 80.0, channels: [], filter: { budget_id: "b1" } }
+  expect(measure(one, snap, NOW)).toBe(75.0)
+  expect(measure(ruleOf("budget_usage_percent", ">=", 80.0), snap, NOW)).toBe(90.0)
+  const zero: AlertRule = { id: "r", metric: "budget_usage_percent", op: ">=", threshold: 80.0, channels: [], filter: { budget_id: "b3" } }
+  expect(measure(zero, snap, NOW)).toBeUndefined()
+  expect(measure(ruleOf("budget_usage_percent", ">=", 80.0), snapOf([]), NOW)).toBeUndefined()
+})
+
+test("budget_spent is the absolute spend of the filtered budget, or the largest", () => {
+  const snap: Snapshot = { samples: [], budgets: [{ id: "b1", used: 3.5, limit: 4.0 }, { id: "b2", used: 9.0, limit: 0.0 }], openBreakers: [] }
+  expect(measure(ruleOf("budget_spent", ">", 1.0), snap, NOW)).toBe(9.0)
+  const one: AlertRule = { id: "r", metric: "budget_spent", op: ">", threshold: 1.0, channels: [], filter: { budget_id: "b1" } }
+  expect(measure(one, snap, NOW)).toBe(3.5)
+  expect(measure(ruleOf("budget_spent", ">", 1.0), snapOf([]), NOW)).toBeUndefined()
+})
+
+test("rate limit percents split request and token limits and honour rate_limit_id", () => {
+  const snap: Snapshot = {
+    samples: [],
+    budgets: [],
+    rateLimits: [
+      { id: "rl-a", kind: "request", used: 80.0, limit: 100.0 },
+      { id: "rl-a", kind: "token", used: 5.0, limit: 1000.0 },
+      { id: "rl-b", kind: "request", used: 10.0, limit: 40.0 },
+      { id: "rl-c", kind: "token", used: 1.0, limit: 0.0 },
+    ],
+    openBreakers: [],
+  }
+  expect(measure(ruleOf("rate_limit_request_usage_percent", ">=", 80.0), snap, NOW)).toBe(80.0)
+  expect(measure(ruleOf("rate_limit_token_usage_percent", ">=", 80.0), snap, NOW)).toBe(0.5)
+  const a: AlertRule = { id: "r", metric: "rate_limit_request_usage_percent", op: ">=", threshold: 80.0, channels: [], filter: { rate_limit_id: "rl-b" } }
+  expect(measure(a, snap, NOW)).toBe(25.0)
+  const none: AlertRule = { id: "r", metric: "rate_limit_token_usage_percent", op: ">=", threshold: 80.0, channels: [], filter: { rate_limit_id: "rl-c" } }
+  expect(measure(none, snap, NOW)).toBeUndefined()
+  // an absent rateLimits field is no data, not an error
+  expect(measure(ruleOf("rate_limit_request_usage_percent", ">=", 80.0), snapOf([]), NOW)).toBeUndefined()
+})
+
+test("rate limit and budget rules name their target in the message", () => {
+  const snap: Snapshot = { samples: [], budgets: [{ id: "b1", used: 9.0, limit: 10.0 }], rateLimits: [{ id: "rl-a", kind: "request", used: 95.0, limit: 100.0 }], openBreakers: [] }
+  const rl: AlertRule = { id: "rl", name: "RPM", metric: "rate_limit_request_usage_percent", op: ">=", threshold: 90.0, channels: ["ch"], filter: { rate_limit_id: "rl-a" } }
+  const eng = new AlertEngine([rl], [SLACK])
+  const n = eng.evaluate(snap, NOW)
+  expect(n.length).toBe(1)
+  expect(n[0]!.body).toBe(`{"text":"[FIRING] RPM: rate_limit_request_usage_percent 95 >= 90 (rate limit rl-a, last 5m)"}`)
+  const bud: AlertRule = { id: "bu", metric: "budget_usage_percent", op: ">=", threshold: 80.0, channels: ["ch"], filter: { budget_id: "b1" } }
+  const e2 = new AlertEngine([bud], [SLACK])
+  expect(e2.evaluate(snap, NOW)[0]!.body).toBe(`{"text":"[FIRING] bu: budget_usage_percent 90 >= 80 (budget b1, last 5m)"}`)
+})
+
+test("a channel cooldown holds back firing notices across rules, but never a resolve", () => {
+  const limited: Channel = { id: "ch", type: "slack", url: "https://hooks.example/slack", cooldown_seconds: 60 }
+  const a: AlertRule = { id: "a", metric: "requests", op: ">=", threshold: 1.0, channels: ["ch"], cooldown_seconds: 0 }
+  const b: AlertRule = { id: "b", metric: "error_rate", op: ">", threshold: 0.2, channels: ["ch"], cooldown_seconds: 0 }
+  const eng = new AlertEngine([a, b], [limited])
+  const hit = snapOf([smp(NOW - 1.0, "o", "m", 500, 1.0, 0.0)])
+  const miss = snapOf([])
+  // both rules breach; the channel takes a's notice and holds back b's
+  const first = eng.evaluate(hit, NOW)
+  expect(first.length).toBe(1)
+  expect(first[0]!.ruleId).toBe("a")
+  expect(eng.states()[1]!.state).toBe("firing")
+  // both resolve 10s later: resolves are not held back
+  const r = eng.evaluate(miss, NOW + 10000.0)
+  expect(r.length).toBe(2)
+  expect(r[0]!.kind).toBe("resolved")
+  expect(r[1]!.kind).toBe("resolved")
+})
+
+test("a channel with no cooldown sends every firing notice", () => {
+  const rule: AlertRule = { id: "r", metric: "requests", op: ">=", threshold: 1.0, channels: ["ch"], cooldown_seconds: 0 }
+  const eng = new AlertEngine([rule], [SLACK])
+  const hit = snapOf([smp(NOW - 1.0, "o", "m", 200, 1.0, 0.0)])
+  const miss = snapOf([])
+  expect(eng.evaluate(hit, NOW).length).toBe(1)
+  eng.evaluate(miss, NOW + 1.0)
+  expect(eng.evaluate(hit, NOW + 2.0).length).toBe(1)
 })
 
 test("history keeps only the last 500 changes", () => {

@@ -3,7 +3,7 @@
 
 Usage: scripts/check.py [--no-fix] FILE...
 """
-import json, os, subprocess, sys
+import re, json, os, subprocess, sys
 
 def run(files):
     out = subprocess.run([os.environ.get("TOV", "tov"), "check", "--json", *files], capture_output=True, text=True).stdout
@@ -25,6 +25,13 @@ def apply_safe(diags):
             # tov reports columns in characters (code points), not bytes
             head = lines[sl][:sc]
             tail = lines[el][ec:]
+            if e["text"] == "let" and sl == el and lines[sl][sc:ec] not in ("const", "var"):
+                # tov's span for "declare with let" can be off on indented lines; only ever
+                # swap the keyword itself, never the identifier after it
+                m = re.match(r"(\s*(?:export\s+)?)(const|var)\b", lines[sl])
+                if not m:
+                    continue
+                head, tail = m.group(1), lines[sl][m.end():]
             lines[sl:el + 1] = (head + e["text"] + tail).split("\n")
         open(path, "w").write("\n".join(lines))
     return sum(len(v) for v in by_file.values())

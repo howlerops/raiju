@@ -3,6 +3,8 @@
 // cluster counters. One instance per process; rebuilt parts follow config changes.
 import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames } from "./config"
 import { parseDatasheet } from "./pricing"
+import { OtelConfig } from "./otel"
+import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { Engine } from "./gateway"
 import { ConfigStore, checkAdmin } from "./store"
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, allowed } from "./rbac"
@@ -195,6 +197,7 @@ export class Ops {
       if (problem !== "") console.error(`raiju: virtual MCP ${v.name}: ${problem}`)
     }
     this.configurePricing(cfg.pricing_sync)
+    this.configureOtelMetrics(cfg.otel)
     this.configureAlerts(cfg.alerts)
     this.configureCluster(cfg.cluster)
     this.configureExports(cfg.log_exports)
@@ -384,6 +387,40 @@ export class Ops {
     this.pushLocal(c)
     this.applyRemote(c)
     return json(200, c.encode())
+  }
+
+  // ---- OpenTelemetry metrics (Bifrost's otel metrics_* settings) ----
+
+  otelTimer: int = -1
+  otelKey = ""
+  readonly startMs = Date.now()
+
+  configureOtelMetrics(oc: OtelConfig | undefined): void {
+    const key = oc === undefined || oc.metrics_enabled !== true ? "" : JSON.stringify(oc)
+    if (key === this.otelKey) return
+    this.otelKey = key
+    if (this.otelTimer >= 0) {
+      clearInterval(this.otelTimer)
+      this.otelTimer = -1
+    }
+    if (oc === undefined || key === "") return
+    const s: OtelMetricsSettings = { metrics_enabled: true, metrics_endpoint: oc.metrics_endpoint, metrics_headers: oc.metrics_headers, metrics_push_interval: oc.metrics_push_interval, headers: oc.headers, traces_endpoint: oc.endpoint }
+    const problem = validateMetricsSettings(s)
+    if (problem !== undefined) {
+      console.error(`raiju: otel metrics: ${problem}`)
+      return
+    }
+    const resource: Map<string, string> = new Map()
+    resource.set("service.name", oc.service_name ?? "raiju")
+    this.otelTimer = setInterval(() => {
+      const r = exportMetricsRequest(s, this.metricsText(), this.startMs, Date.now(), resource)
+      this.pushOtel(r.url, r.headers, r.body)
+    }, pushIntervalSeconds(s) * 1000)
+  }
+
+  async pushOtel(url: string, h: Map<string, string>, body: string): Promise<void> {
+    const r = await postText(url, h, body)
+    if (r.status < 200 || r.status >= 300) console.error(`raiju: otel metrics: HTTP ${r.status} from ${url}`)
   }
 
   // ---- the price datasheet (Bifrost's framework.pricing) ----
@@ -612,7 +649,7 @@ export class Ops {
     for (const t of this.engine.health.snapshot(now)) {
       if (t.state === "open") open.push(t.id)
     }
-    const notes = eng.evaluate({ samples: ring.since(now - longest * 1000.0), budgets: this.engine.gov.budgetUsage(), openBreakers: open }, now)
+    const notes = eng.evaluate({ samples: ring.since(now - longest * 1000.0), budgets: this.engine.gov.budgetUsage(), rateLimits: this.engine.gov.rateLimitUsage(now), openBreakers: open }, now)
     for (const n of notes) {
       const r = alerts.request(n)
       sendAlert(r.url, r.headers, r.body, n.ruleId)
