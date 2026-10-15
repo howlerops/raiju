@@ -1,0 +1,122 @@
+// Maxim observability sink. The request goes to the SDK log endpoint that
+// maxim-go's PushLogs uses: POST {base}/api/sdk/v3/log?id={repoId} with the
+// x-maxim-api-key header and a body of one serialized commit per line. Each log
+// entry becomes a trace (create) and a generation (update) with its tokens,
+// cost and latency. The line envelope (entity, id, action, data) follows the
+// action names maxim-go commits; its Serialize method was not readable, so the
+// envelope keys are inferred and not verified against a live repository.
+import { LogEntry } from "./logstore"
+import { isoMs } from "./exports"
+import { trimSlash } from "./providers/types"
+
+export const MAXIM_BASE = "https://app.getmaxim.ai"
+
+export type MaximRequest = { url: string, method: "POST", headers: Map<string, string>, body: string }
+
+// Trace data and generation data share one shape; a line sets only its own fields.
+type MaximData = {
+  id?: string,
+  name?: string,
+  startTimestamp?: string,
+  provider: string,
+  model: string,
+  status?: int,
+  virtual_key?: string,
+  prompt_tokens?: int,
+  completion_tokens?: int,
+  cost?: f64,
+  latency_ms?: f64,
+  cache_hit?: bool,
+  error?: string,
+}
+
+type MaximLine = { entity: string, id: string, action: string, data: MaximData }
+
+// The envelope lines for one entry: a trace with its request tags, then a
+// generation with the usage numbers.
+export function maximLines(e: LogEntry): string[] {
+  const trace: MaximLine = {
+    entity: "trace",
+    id: e.request_id,
+    action: "create",
+    data: { id: e.request_id, name: e.op, startTimestamp: isoMs(e.ts), provider: e.provider, model: e.model, status: e.status, virtual_key: e.virtual_key ?? "" },
+  }
+  const gen: MaximLine = {
+    entity: "generation",
+    id: e.id,
+    action: "result",
+    data: {
+      provider: e.provider,
+      model: e.model,
+      prompt_tokens: e.prompt_tokens,
+      completion_tokens: e.completion_tokens,
+      cost: e.cost,
+      latency_ms: e.latency_ms,
+      cache_hit: e.cache_hit,
+      error: e.error ?? "",
+    },
+  }
+  return [JSON.stringify(trace), JSON.stringify(gen)]
+}
+
+// The PushLogs POST for a batch. The log repo id is required by the endpoint.
+export function maximRequest(base: string, apiKey: string, repoId: string, rows: LogEntry[]): MaximRequest {
+  let body = ""
+  for (const e of rows) {
+    for (const line of maximLines(e)) body += line + "\n"
+  }
+  const headers: Map<string, string> = new Map()
+  headers.set("content-type", "application/json")
+  headers.set("accept", "application/json")
+  headers.set("x-maxim-api-key", apiKey)
+  const root = trimSlash(base === "" ? MAXIM_BASE : base)
+  return { url: `${root}/api/sdk/v3/log?id=${repoId}`, method: "POST", headers: headers, body: body }
+}
+
+// ---- tests ----
+
+function sample(id: string): LogEntry {
+  return {
+    id: id,
+    ts: 1791979200000.0,
+    request_id: "req-" + id,
+    op: "chat",
+    provider: "openai",
+    model: "gpt-4o",
+    status: 200,
+    latency_ms: 42.0,
+    prompt_tokens: 5,
+    completion_tokens: 6,
+    cost: 0.5,
+    cache_hit: false,
+    input: "secret",
+  }
+}
+
+test("maxim: PushLogs URL with the repo id, and the API key header", () => {
+  const r = maximRequest("https://maxim.example/", "mk", "repo1", [sample("a")])
+  expect(r.url).toBe("https://maxim.example/api/sdk/v3/log?id=repo1")
+  expect(r.method).toBe("POST")
+  expect(r.headers.get("x-maxim-api-key")).toBe("mk")
+  expect(r.headers.get("content-type")).toBe("application/json")
+})
+
+test("maxim: default base when none is set", () => {
+  expect(maximRequest("", "k", "r", []).url).toBe("https://app.getmaxim.ai/api/sdk/v3/log?id=r")
+})
+
+test("maxim: two newline-separated JSON lines per entry, no content", () => {
+  const r = maximRequest(MAXIM_BASE, "k", "r", [sample("a"), sample("b")])
+  const lines = r.body.split("\n")
+  expect(lines.length).toBe(5)
+  expect(lines[4]).toBe("")
+  const t = try JSON.parse(lines[0]!) as MaximLine
+  expect(t.entity).toBe("trace")
+  expect(t.action).toBe("create")
+  expect(t.id).toBe("req-a")
+  expect(t.data.startTimestamp).toBe("2026-10-14T12:00:00.000Z")
+  const g = try JSON.parse(lines[1]!) as MaximLine
+  expect(g.entity).toBe("generation")
+  expect(g.id).toBe("a")
+  expect(r.body.includes("secret")).toBe(false)
+})

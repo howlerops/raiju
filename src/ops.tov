@@ -18,8 +18,9 @@ import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp } from "./mcpserver"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
-import { ExportQueue } from "./exporters"
+import { ExportQueue, SinkSender } from "./exporters"
 import * as exporters from "./exporters"
+import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
 import { Field, fields, find, rawStr, isNull, elements } from "./json"
 import { trimSlash } from "./providers/types"
@@ -33,7 +34,7 @@ import { Counters, ClusterConfig, syncInterval } from "./cluster"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
-import { ExportCursor, objectKey, putRequest, exportInterval, isoMs } from "./exports"
+import { ExportCursor, objectKey, putRequest, putBytesRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs } from "./exports"
 import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
@@ -257,6 +258,10 @@ export class Ops {
   exporting = false
   exportersKey = ""
   exportersTimer: int = -1
+  // one sender per exporter id; closed and replaced when the exporters change
+  exporterSenders: Map<string, SinkSender> = new Map()
+  retentionTimer: int = -1
+  sweeping = false
   sending = false
   oidcCfg: OidcConfig | undefined = undefined
   discovery: Discovery | undefined = undefined
@@ -1140,6 +1145,9 @@ export class Ops {
       clearInterval(this.exportersTimer)
       this.exportersTimer = -1
     }
+    // the old senders close their broker sockets before the new ones start
+    for (const s of this.exporterSenders.values()) s.close()
+    this.exporterSenders = new Map()
     const qs: ExportQueue[] = []
     for (const c of list) {
       if (c.enabled === false) continue
@@ -1149,6 +1157,7 @@ export class Ops {
         continue
       }
       qs.push(new ExportQueue(c))
+      this.exporterSenders.set(c.id, new SinkSender(c))
     }
     this.engine.exportQueues = qs
     if (qs.length === 0) return
@@ -1165,11 +1174,15 @@ export class Ops {
       if (!q.due(now)) continue
       const batch = q.take(now)
       if (batch.length === 0) continue
-      const r = exporters.batchRequest(q.cfg, batch)
-      const res = await postText(r.url, r.headers, r.body)
-      // a network error, 429 or 5xx is tried again later; any other refusal won't improve
-      if (res.status === 0 || res.status === 429 || res.status >= 500) q.requeue(batch)
-      else if (res.status >= 300) console.error(`raiju: exporter ${q.cfg.id}: HTTP ${res.status}, batch dropped`)
+      const sender = this.exporterSenders.get(q.cfg.id)
+      if (sender === undefined) {
+        q.requeue(batch)
+        continue
+      }
+      const st = await sender.send(batch)
+      // 0 (network, token, a retriable broker error), 429 or 5xx is tried again later; any other refusal won't improve
+      if (st === 0 || st === 429 || st >= 500) q.requeue(batch)
+      else if (st >= 300) console.error(`raiju: exporter ${q.cfg.id}: status ${st}, batch dropped`)
     }
     this.sending = false
   }
@@ -1184,6 +1197,7 @@ export class Ops {
       clearInterval(this.exportTimer)
       this.exportTimer = -1
     }
+    this.configureRetention(ec)
     if (ec === undefined || !ec.enabled) {
       this.exportCfg = undefined
       return
@@ -1194,12 +1208,100 @@ export class Ops {
     }, Math.max(1, exportInterval(ec)) * 1000)
   }
 
+  // Retention sweeps: once shortly after start, then every few hours. Leader only.
+  configureRetention(ec: LogExportsConfig | undefined): void {
+    if (this.retentionTimer >= 0) {
+      clearInterval(this.retentionTimer)
+      this.retentionTimer = -1
+    }
+    if (ec === undefined || !ec.enabled || (ec.retention_days ?? 0) <= 0) return
+    setTimeout(() => {
+      if (this.isLeader()) this.sweepExports()
+    }, 5000)
+    this.retentionTimer = setInterval(() => {
+      if (this.isLeader()) this.sweepExports()
+    }, 4 * 3600 * 1000)
+  }
+
+  // Lists the export prefix and deletes the objects whose day is past retention_days.
+  async sweepExports(): Promise<void> {
+    const ec = this.exportCfg
+    if (ec === undefined || !ec.enabled || this.sweeping) return
+    const days = ec.retention_days ?? 0
+    if (days <= 0) return
+    this.sweeping = true
+    let token: string | undefined = undefined
+    let deleted = 0
+    for (let page = 0; page < 1000; page++) {
+      const lr = listRequest(ec, token, Date.now())
+      const lh: Record<string, string> = lr.headers
+      const dl = deadline(30000)
+      let xml = ""
+      try {
+        const lres = await fetch(lr.url, { method: "GET", headers: lh, signal: dl.controller.signal })
+        xml = await lres.text()
+        if (lres.status < 200 || lres.status >= 300) {
+          console.error(`raiju: log export retention: HTTP ${lres.status} listing ${lr.url}`)
+          dl.finish()
+          break
+        }
+      } catch (e) {
+        console.error(`raiju: log export retention: ${e.message}`)
+        dl.finish()
+        break
+      }
+      dl.finish()
+      const listing = parseListing(xml)
+      const now = Date.now()
+      for (const k of listing.keys) {
+        if (!expiredKey(k, now, days)) continue
+        const dr = deleteRequest(ec, k, Date.now())
+        const dh: Record<string, string> = dr.headers
+        const dd = deadline(30000)
+        try {
+          const dres = await fetch(dr.url, { method: "DELETE", headers: dh, signal: dd.controller.signal })
+          await dres.text()
+          if (dres.status >= 200 && dres.status < 300) deleted++
+          else console.error(`raiju: log export retention: HTTP ${dres.status} deleting ${k}`)
+        } catch (e) {
+          console.error(`raiju: log export retention: ${e.message}`)
+        }
+        dd.finish()
+      }
+      token = listing.next
+      if (token === undefined) break
+    }
+    if (deleted > 0) console.log(`raiju: log export retention: deleted ${deleted} object(s) older than ${days} day(s)`)
+    this.sweeping = false
+  }
+
   async exportLogs(): Promise<void> {
     const ec = this.exportCfg
     const ls = this.engine.logStore
     if (ec === undefined || ls === undefined || this.exporting) return
     const now = Date.now()
     const entries = ls.since(this.cursor.position())
+    if (isParquet(ec)) {
+      // one Parquet object per batch of the rows the cursor selects
+      const sel = this.cursor.select(entries.map((e) => e.ts), now)
+      if (sel === undefined) return
+      const rows: LogEntry[] = sel.idx.map((i) => entries[i]!)
+      const pq = putBytesRequest(ec, objectKey(ec, sel.startMs, sel.endMs, this.nodeId, "parquet"), logParquet(rows), now)
+      this.exporting = true
+      const pdl = deadline(30000)
+      try {
+        const hs: Record<string, string> = pq.headers
+        const r = await fetch(pq.url, { method: "PUT", headers: hs, body: pq.body, signal: pdl.controller.signal })
+        await r.text()
+        if (r.status >= 200 && r.status < 300) this.cursor.commit(sel.endMs)
+        else console.error(`raiju: log export: HTTP ${r.status} from ${pq.url}`)
+      } catch (e) {
+        console.error(`raiju: log export: ${e.message}`)
+      }
+      pdl.finish()
+      this.exporting = false
+      return
+    }
     const batch = this.cursor.pending(entries.map((e) => JSON.stringify(e)), entries.map((e) => e.ts), now)
     if (batch === undefined) return
     this.exporting = true

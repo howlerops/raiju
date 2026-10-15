@@ -1,0 +1,428 @@
+// A minimal Parquet writer for the log export: one file, one row group, one
+// data page per column, PLAIN values, every column OPTIONAL with RLE
+// definition levels, and no compression. It writes the log entry columns
+// (a null is a missing field). The format is the parquet-format spec, checked
+// by reading the files back with pyarrow.
+import { utf8 } from "./crypto"
+import { LogEntry } from "./logstore"
+
+const T_BOOL = 0
+const T_INT32 = 1
+const T_INT64 = 2
+const T_DOUBLE = 5
+const T_BYTE_ARRAY = 6
+
+const ENC_PLAIN = 0
+const ENC_RLE = 3
+const REP_OPTIONAL = 1
+const CT_UTF8 = 0
+const CODEC_NONE = 0
+const PAGE_DATA = 0
+
+export type PqKind = "string" | "double" | "int32" | "int64" | "bool"
+
+// One value. Only the field for the column's kind is read; a null cell is
+// undefined in the column.
+export type PqCell = { s: string, n: f64, b: bool }
+
+export type PqColumn = { name: string, kind: PqKind, cells: (PqCell | undefined)[] }
+
+// ---- little-endian values ----
+
+function le32(v: int): u8[] {
+  return [u8(v & 0xff), u8((v >> 8) & 0xff), u8((v >> 16) & 0xff), u8((v >> 24) & 0xff)]
+}
+
+// The 8 bytes of an IEEE 754 double, little-endian. Subnormals are written as
+// zero; the log's numbers (costs, latencies) are never that small.
+export function f64Bytes(x: f64): u8[] {
+  let a = Math.abs(x)
+  let e = 0
+  if (a > 0.0) {
+    while (a >= 2.0) {
+      a = a / 2.0
+      e += 1
+    }
+    while (a < 1.0) {
+      a = a * 2.0
+      e -= 1
+    }
+  }
+  let biased = 0
+  let mant = 0
+  if (a > 0.0) {
+    biased = e + 1023
+    mant = Math.round((a - 1.0) * 4503599627370496.0)
+  }
+  if (biased >= 2047) {
+    biased = 2047
+    mant = 0
+  }
+  const hiMant = Math.floor(mant / 4294967296.0)
+  const loMant = mant - hiMant * 4294967296.0
+  const hi = (x < 0.0 ? 2147483648 : 0) + biased * 1048576 + hiMant
+  return le32(Math.floor(loMant)).concat(le32(Math.floor(hi)))
+}
+
+function le64(v: f64): u8[] {
+  const hi = Math.floor(v / 4294967296.0)
+  const lo = v - hi * 4294967296.0
+  return le32(Math.floor(lo)).concat(le32(Math.floor(hi)))
+}
+
+// ---- RLE definition levels, bit width 1, as bit-packed groups of 8 ----
+
+function levels(present: bool[]): u8[] {
+  const n = present.length
+  const groups = Math.floor((n + 7) / 8)
+  const out: u8[] = uvarintOf((groups << 1) | 1)
+  for (let g = 0; g < groups; g++) {
+    let byte = 0
+    for (let i = 0; i < 8; i++) {
+      const k = g * 8 + i
+      if (k < n && present[k] === true) byte |= 1 << i
+    }
+    out.push(u8(byte))
+  }
+  // the data page prefixes the levels with their byte length
+  return le32(out.length).concat(out)
+}
+
+function uvarintOf(v: int): u8[] {
+  const out: u8[] = []
+  let n = v
+  while (n >= 128) {
+    out.push(u8((n & 0x7f) | 0x80))
+    n = n >> 7
+  }
+  out.push(u8(n))
+  return out
+}
+
+function appendAll(inout dst: u8[], src: u8[]): void {
+  for (const x of src) dst.push(x)
+}
+
+function zz(v: int): int {
+  return v >= 0 ? v * 2 : -v * 2 - 1
+}
+
+// ---- thrift compact protocol, the encoding of the footer and page headers ----
+
+class Tw {
+  buf: u8[] = []
+  private last: int = 0
+  private saved: int[] = []
+
+  private head(id: int, type: int): void {
+    const delta = id - this.last
+    if (delta > 0 && delta <= 15) {
+      this.buf.push(u8((delta << 4) | type))
+    } else {
+      this.buf.push(u8(type))
+      this.raw(uvarintOf(zz(id)))
+    }
+    this.last = id
+  }
+
+  private raw(b: u8[]): void {
+    for (const x of b) this.buf.push(x)
+  }
+
+  i32(id: int, v: int): void {
+    this.head(id, 5)
+    this.raw(uvarintOf(zz(v)))
+  }
+
+  i64(id: int, v: f64): void {
+    this.head(id, 6)
+    this.raw(uvarintOf(zz(Math.floor(v))))
+  }
+
+  binary(id: int, b: u8[]): void {
+    this.head(id, 8)
+    this.raw(uvarintOf(b.length))
+    this.raw(b)
+  }
+
+  str(id: int, s: string): void {
+    this.binary(id, utf8(s))
+  }
+
+  // A field holding a list: its header, then the elements written by the caller.
+  listOf(id: int, elem: int, n: int): void {
+    this.head(id, 9)
+    if (n < 15) {
+      this.buf.push(u8((n << 4) | elem))
+    } else {
+      this.buf.push(u8(0xf0 | elem))
+      this.raw(uvarintOf(n))
+    }
+  }
+
+  // A field holding a struct, or a list element that is a struct (no header).
+  beginStruct(id: int): void {
+    this.head(id, 12)
+    this.saved.push(this.last)
+    this.last = 0
+  }
+
+  beginElem(): void {
+    this.saved.push(this.last)
+    this.last = 0
+  }
+
+  endStruct(): void {
+    this.buf.push(0)
+    const back = this.saved.pop()
+    this.last = back ?? 0
+  }
+
+  elemI32(v: int): void {
+    this.raw(uvarintOf(zz(v)))
+  }
+
+  elemStr(s: string): void {
+    const b = utf8(s)
+    this.raw(uvarintOf(b.length))
+    this.raw(b)
+  }
+}
+
+// ---- pages and the file ----
+
+// One non-null value, PLAIN. Booleans collect into boolBits and are packed later.
+function encodeCell(kind: PqKind, c: PqCell, inout values: u8[], inout boolBits: bool[]): void {
+  if (kind === "string") {
+    const b = utf8(c.s)
+    appendAll(&values, le32(b.length))
+    appendAll(&values, b)
+  } else if (kind === "double") {
+    appendAll(&values, f64Bytes(c.n))
+  } else if (kind === "int32") {
+    appendAll(&values, le32(Math.floor(c.n)))
+  } else if (kind === "int64") {
+    appendAll(&values, le64(c.n))
+  } else {
+    boolBits.push(c.b)
+  }
+}
+
+// A data page: the page header, then the definition levels and the PLAIN values.
+function pageOf(col: PqColumn): { bytes: u8[], typ: int } {
+  const present: bool[] = []
+  let values: u8[] = []
+  let boolBits: bool[] = []
+  for (const cell of col.cells) {
+    if (cell === undefined) {
+      present.push(false)
+    } else {
+      present.push(true)
+      encodeCell(col.kind, cell, &values, &boolBits)
+    }
+  }
+  if (col.kind === "bool") {
+    // booleans are bit-packed, least significant bit first
+    const groups = Math.floor((boolBits.length + 7) / 8)
+    for (let g = 0; g < groups; g++) {
+      let byte = 0
+      for (let i = 0; i < 8; i++) {
+        const k = g * 8 + i
+        if (k < boolBits.length && boolBits[k] === true) byte |= 1 << i
+      }
+      values.push(u8(byte))
+    }
+  }
+  const typ = col.kind === "string" ? T_BYTE_ARRAY : col.kind === "double" ? T_DOUBLE : col.kind === "int32" ? T_INT32 : col.kind === "int64" ? T_INT64 : T_BOOL
+  const data = levels(present).concat(values)
+  return { bytes: data, typ: typ }
+}
+
+function pageHeader(numValues: int, size: int): u8[] {
+  const t = new Tw()
+  t.beginElem()
+  t.i32(1, PAGE_DATA)
+  t.i32(2, size)
+  t.i32(3, size)
+  t.beginStruct(5)
+  t.i32(1, numValues)
+  t.i32(2, ENC_PLAIN)
+  t.i32(3, ENC_RLE)
+  t.i32(4, ENC_RLE)
+  t.endStruct()
+  t.endStruct()
+  return t.buf
+}
+
+// A Parquet file for the columns, which must all have the same length.
+export function parquetFile(cols: PqColumn[]): u8[] {
+  const rows = cols.length === 0 ? 0 : cols[0]!.cells.length
+  const body: u8[] = utf8("PAR1")
+  const chunks: { off: int, typ: int, size: int, name: string }[] = []
+  for (const col of cols) {
+    const p = pageOf(col)
+    const hdr = pageHeader(rows, p.bytes.length)
+    chunks.push({ off: body.length, typ: p.typ, size: hdr.length + p.bytes.length, name: col.name })
+    for (const x of hdr) body.push(x)
+    for (const x of p.bytes) body.push(x)
+  }
+  const t = new Tw()
+  t.i32(1, 1)
+  // schema: the root, then one leaf per column
+  t.listOf(2, 12, cols.length + 1)
+  t.beginElem()
+  t.str(4, "schema")
+  t.i32(5, cols.length)
+  t.endStruct()
+  for (const col of cols) {
+    t.beginElem()
+    t.i32(1, typeOfKind(col.kind))
+    t.i32(3, REP_OPTIONAL)
+    t.str(4, col.name)
+    if (col.kind === "string") t.i32(6, CT_UTF8)
+    t.endStruct()
+  }
+  t.i64(3, rows)
+  // one row group holding a column chunk per column
+  t.listOf(4, 12, 1)
+  t.beginElem()
+  t.listOf(1, 12, chunks.length)
+  let total = 0
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i]!
+    total += c.size
+    t.beginElem()
+    t.i64(2, c.off)
+    t.beginStruct(3)
+    t.i32(1, c.typ)
+    t.listOf(2, 5, 2)
+    t.elemI32(ENC_PLAIN)
+    t.elemI32(ENC_RLE)
+    t.listOf(3, 8, 1)
+    t.elemStr(c.name)
+    t.i32(4, CODEC_NONE)
+    t.i64(5, rows)
+    t.i64(6, c.size)
+    t.i64(7, c.size)
+    t.i64(9, c.off)
+    t.endStruct()
+    t.endStruct()
+  }
+  t.i64(2, total)
+  t.i64(3, rows)
+  t.endStruct()
+  t.str(6, "raiju")
+  t.endStruct()
+  const footer = t.buf
+  const out = body.concat(footer).concat(le32(footer.length)).concat(utf8("PAR1"))
+  return out
+}
+
+function typeOfKind(k: PqKind): int {
+  if (k === "string") return T_BYTE_ARRAY
+  if (k === "double") return T_DOUBLE
+  if (k === "int32") return T_INT32
+  if (k === "int64") return T_INT64
+  return T_BOOL
+}
+
+// ---- the log entry columns ----
+
+function strCells(vals: (string | undefined)[]): (PqCell | undefined)[] {
+  return vals.map((v) => (v === undefined ? undefined : { s: v, n: 0.0, b: false }))
+}
+
+function numCells(vals: (f64 | undefined)[]): (PqCell | undefined)[] {
+  return vals.map((v) => (v === undefined ? undefined : { s: "", n: v, b: false }))
+}
+
+function boolCells(vals: (bool | undefined)[]): (PqCell | undefined)[] {
+  return vals.map((v) => (v === undefined ? undefined : { s: "", n: 0.0, b: v }))
+}
+
+// One row per entry, the fields Raiju logs. Content columns are null unless
+// the entry carries content.
+export function logColumns(rows: LogEntry[]): PqColumn[] {
+  return [
+    { name: "id", kind: "string", cells: strCells(rows.map((e) => e.id)) },
+    { name: "ts", kind: "double", cells: numCells(rows.map((e) => e.ts)) },
+    { name: "request_id", kind: "string", cells: strCells(rows.map((e) => e.request_id)) },
+    { name: "op", kind: "string", cells: strCells(rows.map((e) => e.op)) },
+    { name: "provider", kind: "string", cells: strCells(rows.map((e) => e.provider)) },
+    { name: "model", kind: "string", cells: strCells(rows.map((e) => e.model)) },
+    { name: "status", kind: "int32", cells: numCells(rows.map((e) => e.status * 1.0)) },
+    { name: "latency_ms", kind: "double", cells: numCells(rows.map((e) => e.latency_ms)) },
+    { name: "prompt_tokens", kind: "int64", cells: numCells(rows.map((e) => e.prompt_tokens * 1.0)) },
+    { name: "completion_tokens", kind: "int64", cells: numCells(rows.map((e) => e.completion_tokens * 1.0)) },
+    { name: "cost", kind: "double", cells: numCells(rows.map((e) => e.cost)) },
+    { name: "cache_hit", kind: "bool", cells: boolCells(rows.map((e) => e.cache_hit)) },
+    { name: "virtual_key", kind: "string", cells: strCells(rows.map((e) => e.virtual_key)) },
+    { name: "error", kind: "string", cells: strCells(rows.map((e) => e.error)) },
+    { name: "input", kind: "string", cells: strCells(rows.map((e) => e.input)) },
+    { name: "output", kind: "string", cells: strCells(rows.map((e) => e.output)) },
+  ]
+}
+
+// The export body for a batch of entries, as a Parquet file.
+export function logParquet(rows: LogEntry[]): u8[] {
+  return parquetFile(logColumns(rows))
+}
+
+// ---- tests ----
+
+function hexOf(b: u8[]): string {
+  const H = "0123456789abcdef"
+  let s = ""
+  for (const x of b) s += H.slice(int(x) >> 4, (int(x) >> 4) + 1) + H.slice(int(x) & 15, (int(x) & 15) + 1)
+  return s
+}
+
+test("f64 bytes match the IEEE 754 little-endian encoding", () => {
+  expect(hexOf(f64Bytes(1.0))).toBe("000000000000f03f")
+  expect(hexOf(f64Bytes(-2.5))).toBe("00000000000004c0")
+  expect(hexOf(f64Bytes(0.1))).toBe("9a9999999999b93f")
+  expect(hexOf(f64Bytes(0.0))).toBe("0000000000000000")
+  expect(hexOf(f64Bytes(1791979200000.0))).toBe("0000e089a4137a42")
+})
+
+test("levels: bit-packed groups with a byte length prefix", () => {
+  // 3 values: one group, bits 1,0,1
+  expect(hexOf(levels([true, false, true]))).toBe("02000000" + "03" + "05")
+  expect(hexOf(levels([]))).toBe("01000000" + "01")
+})
+
+test("zigzag and uvarint for thrift fields", () => {
+  expect(hexOf(uvarintOf(zz(-1)))).toBe("01")
+  expect(hexOf(uvarintOf(zz(1)))).toBe("02")
+  expect(hexOf(uvarintOf(300))).toBe("ac02")
+})
+
+test("a file starts and ends with the PAR1 magic, and the footer length is before the end", () => {
+  const f = parquetFile([{ name: "a", kind: "int32", cells: [{ s: "", n: 7.0, b: false }, undefined] }])
+  expect(hexOf(f.slice(0, 4))).toBe("50415231")
+  expect(hexOf(f.slice(f.length - 4))).toBe("50415231")
+  const flen = int(f[f.length - 8]!) + int(f[f.length - 7]!) * 256
+  expect(flen > 0).toBe(true)
+})
+
+test("an int32 column stores the present value as little-endian bytes after the levels", () => {
+  const f = parquetFile([{ name: "a", kind: "int32", cells: [{ s: "", n: 7.0, b: false }, undefined] }])
+  // the page follows the magic: levels are a 2-byte run (header 03: one bit-packed group) with row 0 present (01), then the value 7
+  expect(hexOf(f).includes("02000000" + "0301" + "07000000")).toBe(true)
+})
+
+test("log columns: 16 columns, nulls where content is off", () => {
+  const e: LogEntry = { id: "a", ts: 1000.0, request_id: "r", op: "chat", provider: "p", model: "m", status: 200, latency_ms: 1.5, prompt_tokens: 2, completion_tokens: 3, cost: 0.25, cache_hit: true, input: "in" }
+  const cols = logColumns([e])
+  expect(cols.length).toBe(16)
+  expect(cols[0]!.name).toBe("id")
+  expect(isNullCell(cols[13]!.cells[0])).toBe(true)
+  expect(isNullCell(cols[14]!.cells[0])).toBe(false)
+  expect(isNullCell(cols[15]!.cells[0])).toBe(true)
+  const f = logParquet([e])
+  expect(hexOf(f.slice(0, 4))).toBe("50415231")
+})
+
+function isNullCell(c: PqCell | undefined): bool {
+  return c === undefined
+}

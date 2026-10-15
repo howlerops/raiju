@@ -5,7 +5,7 @@
 // dropped silently. Both work on the raw text, and fields this module does not
 // model stay as they are.
 
-import { Field, fields, elements, find, rawStr, rawBool, decodeString, build, quote, setField, without } from "./json"
+import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString, build, quote, setField, without } from "./json"
 
 // Raiju's top-level keys (the Config type in config.tov), plus the Bifrost
 // sections this module reads and the pricing_sync key it writes.
@@ -773,6 +773,68 @@ function mapOtelPlugin(f: Field[], pname: string, inout top: Field[], inout note
   notes.push(`config: plugin "${pname}" read as "otel"`)
 }
 
+// The Bifrost log sink plugins (bigquery, pubsub, kafka, maxim) become entries in
+// Raiju's exporters list. Bifrost sends content unless disable_content_logging is
+// set, so include_content follows that. The Kafka plugin's SCRAM and custom CA
+// settings have no Raiju counterpart, so such a plugin is not loaded.
+function mapSinkPlugin(f: Field[], pname: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  if (offPlugin(f, pname, &notes)) return
+  const path = `plugins[${pname}].config`
+  const cf = try members(find(f, "config"))
+  let out: Field[] = []
+  add(&out, "id", quote(pname))
+  add(&out, "kind", quote(pname))
+  add(&out, "include_content", rawBool(cf, "disable_content_logging") === true ? "false" : "true")
+  if (pname === "bigquery") {
+    add(&out, "project_id", strRaw(cf, "project_id"))
+    add(&out, "dataset_id", strRaw(cf, "dataset_id"))
+    add(&out, "table_id", strRaw(cf, "table_id"))
+    add(&out, "service_account_key", strRaw(cf, "service_account_key"))
+    add(&out, "batch_size", find(cf, "buffer_size"))
+    add(&out, "interval_seconds", find(cf, "flush_interval_seconds"))
+    ignored(path, cf, ["location", "create_table_if_not_exists", "excluded_attributes", "export_raw_payloads", "request_headers", "custom_labels", "plugin_span_filter"], &notes)
+  } else if (pname === "pubsub") {
+    add(&out, "project_id", strRaw(cf, "project_id"))
+    add(&out, "topic_id", strRaw(cf, "topic_id"))
+    add(&out, "service_account_key", strRaw(cf, "service_account_key"))
+    ignored(path, cf, ["auto_create_topic", "excluded_attributes", "request_headers", "plugin_span_filter"], &notes)
+  } else if (pname === "kafka") {
+    const sasl = try members(find(cf, "sasl"))
+    if (rawBool(cf, "sasl_enabled") === true) {
+      const mech = rawStr(sasl, "mechanism") ?? ""
+      if (mech !== "PLAIN") {
+        notes.push(`config: plugin "${pname}" uses SASL ${mech}; Raiju supports PLAIN only, so the plugin is not loaded`)
+        return
+      }
+      add(&out, "sasl_username", strRaw(sasl, "username"))
+      add(&out, "sasl_password", strRaw(sasl, "password"))
+    }
+    if (rawBool(cf, "tls_enabled") === true) add(&out, "tls", "true")
+    const comp = rawStr(cf, "compression")
+    if (comp !== undefined && comp !== "\"none\"") notes.push(`config: "${path}.compression" is not supported by Raiju (records are sent uncompressed)`)
+    if (find(cf, "ca_cert") !== undefined) notes.push(`config: "${path}.ca_cert" is not supported by Raiju; the system CA pool is used`)
+    add(&out, "brokers", find(cf, "brokers"))
+    add(&out, "topic", strRaw(cf, "topic"))
+    add(&out, "batch_size", find(cf, "batch_size"))
+    const ms = rawNum(cf, "flush_interval_ms")
+    if (ms !== undefined) {
+      const secs = Math.max(1, Math.ceil(ms / 1000))
+      add(&out, "interval_seconds", `${secs}`)
+      if (ms % 1000 !== 0) notes.push(`config: "${path}.flush_interval_ms" is rounded up to ${secs} second(s)`)
+    }
+    ignored(path, cf, ["auto_create_topic", "excluded_attributes", "request_headers", "plugin_span_filter"], &notes)
+  } else {
+    add(&out, "api_key", strRaw(cf, "api_key"))
+    add(&out, "log_repo_id", strRaw(cf, "log_repo_id"))
+    ignored(path, cf, ["request_headers"], &notes)
+  }
+  ignored(path, cf, ["disable_content_logging"], &notes)
+  const cur = try items(find(top, "exporters"))
+  cur.push(build(out))
+  setField(&top, "exporters", "[" + cur.join(",") + "]")
+  notes.push(`config: plugin "${pname}" read as exporter "${pname}"`)
+}
+
 // True when the plugin entry is off in Bifrost; the note says it is not loaded.
 function offPlugin(f: Field[], pname: string, inout notes: string[]): bool {
   if (rawBool(f, "enabled") !== false) return false
@@ -907,6 +969,10 @@ function mapPlugins(inout top: Field[], inout notes: string[]): void throws Synt
     }
     if (name === "logging") {
       try mapLogging(f, name, &top, &notes)
+      continue
+    }
+    if (name === "bigquery" || name === "pubsub" || name === "kafka" || name === "maxim") {
+      try mapSinkPlugin(f, name, &top, &notes)
       continue
     }
     if (name === "telemetry") {
@@ -1641,13 +1707,13 @@ test("a disabled governance plugin is not loaded, and an unknown plugin name is 
   const r = try normalize(`{
     "plugins": [
       { "enabled": false, "name": "governance", "config": { "is_vk_mandatory": true } },
-      { "enabled": true, "name": "maxim", "config": { "api_key": "k" } }
+      { "enabled": true, "name": "webhooks", "config": { "url": "https://h" } }
     ]
   }`)
   expect(find(try fields(r.text), "client")).toBeUndefined()
   const plugins = try elements(find(try fields(r.text), "plugins")!)
   expect(plugins.length).toBe(1)
-  expect(rawStr(try fields(plugins[0]!), "name")).toBe("maxim")
+  expect(rawStr(try fields(plugins[0]!), "name")).toBe("webhooks")
   expect(r.notes.includes(`config: plugin "governance" is disabled in Bifrost and is not loaded`)).toBe(true)
 })
 
@@ -1682,3 +1748,70 @@ test("notes name each Bifrost section Raiju does not read", () => {
   expect(w.some((x) => x.includes(`"access_profiles" is not read`))).toBe(true)
   expect(w.some((x) => x.includes(`"encryption_key"`))).toBe(false)
 })
+
+test("sink plugins become exporters: bigquery and pubsub fields, content, and the ignored rest", () => {
+  const r = try normalize(`{
+    "plugins": [
+      { "enabled": true, "name": "bigquery", "config": { "project_id": "p", "dataset_id": "ds", "table_id": "tb",
+        "service_account_key": "env.GCP_KEY", "buffer_size": 100, "flush_interval_seconds": 7, "location": "EU",
+        "disable_content_logging": true, "custom_labels": {"a": "b"} } },
+      { "enabled": true, "name": "pubsub", "config": { "project_id": "p", "topic_id": "t", "auto_create_topic": true } },
+      { "enabled": true, "name": "maxtokens", "config": {} }
+    ]
+  }`)
+  const ex = try elements(find(try fields(r.text), "exporters")!)
+  expect(ex.length).toBe(2)
+  const bq = try fields(ex[0]!)
+  expect(rawStr(bq, "kind")).toBe("bigquery")
+  expect(rawStr(bq, "project_id")).toBe("p")
+  expect(rawStr(bq, "dataset_id")).toBe("ds")
+  expect(rawStr(bq, "service_account_key")).toBe("env.GCP_KEY")
+  expect(find(bq, "batch_size")).toBe("100")
+  expect(find(bq, "interval_seconds")).toBe("7")
+  expect(find(bq, "include_content")).toBe("false")
+  const ps = try fields(ex[1]!)
+  expect(rawStr(ps, "topic_id")).toBe("t")
+  expect(find(ps, "include_content")).toBe("true")
+  expect(r.notes.includes(`config: "plugins[bigquery].config.location" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[pubsub].config.auto_create_topic" is not supported by Raiju and is ignored`)).toBe(true)
+  // the sink plugins are no longer in plugins; the unknown one stays
+  expect(try elements(find(try fields(r.text), "plugins")!).length).toBe(1)
+})
+
+test("kafka plugin: brokers, PLAIN sasl and tls; SCRAM is refused with a note", () => {
+  const r = try normalize(`{
+    "plugins": [
+      { "enabled": true, "name": "kafka", "config": { "brokers": ["k1:9093"], "topic": "logs", "tls_enabled": true,
+        "sasl_enabled": true, "sasl": { "mechanism": "PLAIN", "username": "u", "password": "env.KP" },
+        "compression": "zstd", "batch_size": 50, "flush_interval_ms": 2500 } }
+    ]
+  }`)
+  const k = try fields(try elements(find(try fields(r.text), "exporters")!)[0]!)
+  expect(find(k, "brokers")).toBe(`["k1:9093"]`)
+  expect(rawStr(k, "topic")).toBe("logs")
+  expect(find(k, "tls")).toBe("true")
+  expect(rawStr(k, "sasl_username")).toBe("u")
+  expect(rawStr(k, "sasl_password")).toBe("env.KP")
+  expect(find(k, "interval_seconds")).toBe("3")
+  expect(find(k, "batch_size")).toBe("50")
+  expect(r.notes.includes(`config: "plugins[kafka].config.compression" is not supported by Raiju (records are sent uncompressed)`)).toBe(true)
+  const scram = try normalize(`{ "plugins": [ { "enabled": true, "name": "kafka", "config": { "brokers": ["k"], "topic": "t", "sasl_enabled": true, "sasl": { "mechanism": "SCRAM-SHA-256", "username": "u", "password": "p" } } } ] }`)
+  expect(scram.notes.includes(`config: plugin "kafka" uses SASL SCRAM-SHA-256; Raiju supports PLAIN only, so the plugin is not loaded`)).toBe(true)
+  expect(find(try fields(scram.text), "exporters")).toBe(undefined)
+})
+
+test("maxim plugin: api key and log repo id; a disabled sink is not loaded", () => {
+  const r = try normalize(`{
+    "plugins": [
+      { "enabled": true, "name": "maxim", "config": { "api_key": "mk", "log_repo_id": "repo" } },
+      { "enabled": false, "name": "kafka", "config": { "brokers": ["k"], "topic": "t" } }
+    ]
+  }`)
+  const ex = try elements(find(try fields(r.text), "exporters")!)
+  expect(ex.length).toBe(1)
+  const m = try fields(ex[0]!)
+  expect(rawStr(m, "api_key")).toBe("mk")
+  expect(rawStr(m, "log_repo_id")).toBe("repo")
+  expect(rawStr(m, "kind")).toBe("maxim")
+})
+

@@ -1,0 +1,647 @@
+// Kafka log sink over the Kafka wire protocol, on Bun's TCP sockets. Each log
+// entry is one record, keyed by its request id and carrying the entry's JSON.
+// Wire versions are fixed: Metadata v1, Produce v3 (record batch v2), SaslHandshake
+// v1 and SaslAuthenticate v0. Records are never compressed. Partitions are
+// picked by an FNV-1a hash of the key, so one request's entries keep their
+// order per key but the hash is not Java's murmur2. SASL/PLAIN and TLS (system
+// CA pool) are supported; SCRAM and a custom CA are not.
+import { utf8 } from "./crypto"
+import { LogEntry } from "./logstore"
+
+const M32 = 0xffffffff
+const PRODUCE_TIMEOUT_MS = 10000
+const CLIENT_ID = "raiju"
+
+// Error codes that mean "try again later" rather than "this batch is bad".
+const RETRIABLE: int[] = [3, 5, 6, 7, 15, 19, 20]
+
+export function retriable(code: int): bool {
+  return RETRIABLE.includes(code)
+}
+
+// ---- CRC-32C (Castagnoli), the checksum of record batch v2 ----
+
+// The table is built per call: module-level loops do not run at load.
+function crcTable(): int[] {
+  const t: int[] = []
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) c = (c & 1) !== 0 ? (c >> 1) ^ 0x82f63b78 : c >> 1
+    t.push(c)
+  }
+  return t
+}
+
+export function crc32c(b: u8[]): int {
+  const table = crcTable()
+  let c = M32
+  for (const x of b) c = (c >> 8) ^ table[(c ^ int(x)) & 0xff]!
+  return (c ^ M32) & M32
+}
+
+// ---- byte writer and reader ----
+
+export class Enc {
+  buf: u8[] = []
+
+  i8(v: int): void {
+    this.buf.push(u8(v & 0xff))
+  }
+
+  i16(v: int): void {
+    this.buf.push(u8((v >> 8) & 0xff))
+    this.buf.push(u8(v & 0xff))
+  }
+
+  i32(v: int): void {
+    for (let s = 24; s >= 0; s -= 8) this.buf.push(u8((v >> s) & 0xff))
+  }
+
+  // Exact for whole numbers up to 2^53 in either sign.
+  i64(v: f64): void {
+    const hi = Math.floor(v / 4294967296.0)
+    const lo = Math.floor(v - hi * 4294967296.0)
+    this.i32(hi)
+    this.i32(lo)
+  }
+
+  // Unsigned base-128 varint.
+  uvarint(v: int): void {
+    let n = v
+    while (n >= 128) {
+      this.buf.push(u8((n & 0x7f) | 0x80))
+      n = n >> 7
+    }
+    this.buf.push(u8(n))
+  }
+
+  // Zigzag varint, as record fields use.
+  varint(v: int): void {
+    this.uvarint(v >= 0 ? v * 2 : -v * 2 - 1)
+  }
+
+  // int16 length, then UTF-8. A null string is length -1.
+  string(s: string | undefined): void {
+    if (s === undefined) {
+      this.i16(-1)
+      return
+    }
+    const b = utf8(s)
+    this.i16(b.length)
+    this.raw(b)
+  }
+
+  // int32 length, then the bytes.
+  bytes(b: u8[]): void {
+    this.i32(b.length)
+    this.raw(b)
+  }
+
+  raw(b: u8[]): void {
+    for (const x of b) this.buf.push(x)
+  }
+}
+
+export class Dec {
+  pos: int = 0
+
+  constructor(readonly buf: u8[]) {}
+
+  private need(n: int): void throws Error {
+    if (this.pos + n > this.buf.length) throw new SyntaxError("kafka: response is shorter than its fields")
+  }
+
+  i8(): int throws Error {
+    try this.need(1)
+    const v = int(this.buf[this.pos]!)
+    this.pos += 1
+    return v
+  }
+
+  i16(): int throws Error {
+    try this.need(2)
+    const v = (int(this.buf[this.pos]!) << 8) | int(this.buf[this.pos + 1]!)
+    this.pos += 2
+    return v >= 0x8000 ? v - 0x10000 : v
+  }
+
+  i32(): int throws Error {
+    try this.need(4)
+    let v = 0
+    for (let i = 0; i < 4; i++) v = (v << 8) | int(this.buf[this.pos + i]!)
+    this.pos += 4
+    return v >= 0x80000000 ? v - 0x100000000 : v
+  }
+
+  string(): string | undefined throws Error {
+    const n = try this.i16()
+    if (n < 0) return undefined
+    try this.need(n)
+    const s = try new TextDecoder().decode(this.buf.slice(this.pos, this.pos + n))
+    this.pos += n
+    return s
+  }
+
+  // The count prefix of an array; -1 means none.
+  count(): int throws Error {
+    const n = try this.i32()
+    return n < 0 ? 0 : n
+  }
+
+  skipBytes(): void throws Error {
+    const n = try this.i32()
+    if (n > 0) {
+      try this.need(n)
+      this.pos += n
+    }
+  }
+}
+
+// ---- framing ----
+
+// A request: int32 size, then the request header (api key, version,
+// correlation id, client id) and the body.
+export function requestFrame(apiKey: int, apiVersion: int, corr: int, body: u8[]): u8[] {
+  const h = new Enc()
+  h.i16(apiKey)
+  h.i16(apiVersion)
+  h.i32(corr)
+  h.string(CLIENT_ID)
+  const head = h.buf.concat(body)
+  const out = new Enc()
+  out.i32(head.length)
+  return out.buf.concat(head)
+}
+
+// ---- record batch v2 ----
+
+export type KRecord = { key: string, value: u8[], ts: f64 }
+
+// One record: length varint, then attributes, timestamp delta, offset delta,
+// key, value and an empty header list. The fields are varints.
+function recordBytes(i: int, r: KRecord, first: f64): u8[] {
+  const k = new Enc()
+  k.i8(0)
+  k.varint(Math.floor(r.ts - first))
+  k.varint(i)
+  const key = utf8(r.key)
+  k.varint(key.length)
+  k.raw(key)
+  k.varint(r.value.length)
+  k.raw(r.value)
+  k.varint(0)
+  const out = new Enc()
+  out.varint(k.buf.length)
+  out.raw(k.buf)
+  return out.buf
+}
+
+// A record batch, magic 2, uncompressed, CreateTime, no producer id (idempotence
+// off). baseOffset is 0; the broker assigns the real offsets.
+export function recordBatch(recs: KRecord[]): u8[] {
+  let first = recs[0]!.ts
+  let last = first
+  for (const r of recs) {
+    if (r.ts < first) first = r.ts
+    if (r.ts > last) last = r.ts
+  }
+  const body = new Enc()
+  body.i16(0)
+  body.i32(recs.length - 1)
+  body.i64(first)
+  body.i64(last)
+  body.i64(-1)
+  body.i16(-1)
+  body.i32(-1)
+  body.i32(recs.length)
+  for (let i = 0; i < recs.length; i++) body.raw(recordBytes(i, recs[i]!, first))
+  const crc = crc32c(body.buf)
+  const head = new Enc()
+  head.i64(0)
+  // batchLength counts everything after itself: leader epoch, magic, crc and the body
+  head.i32(4 + 1 + 4 + body.buf.length)
+  head.i32(-1)
+  head.i8(2)
+  head.i32(crc)
+  return head.buf.concat(body.buf)
+}
+
+// ---- requests and responses ----
+
+export function metadataRequest(corr: int, topic: string): u8[] {
+  const b = new Enc()
+  b.i32(1)
+  b.string(topic)
+  return requestFrame(3, 1, corr, b.buf)
+}
+
+export type KBroker = { id: int, host: string, port: int }
+export type KPartition = { index: int, leader: int, error: int }
+export type KTopic = { error: int, name: string, partitions: KPartition[] }
+export type KMetadata = { brokers: KBroker[], topics: KTopic[] }
+
+// Metadata v1: brokers (with rack), the controller id, and topics with partitions.
+export function parseMetadata(b: u8[]): KMetadata throws Error {
+  const d = new Dec(b)
+  const brokers: KBroker[] = []
+  const nb = try d.count()
+  for (let i = 0; i < nb; i++) {
+    const id = try d.i32()
+    const host = (try d.string()) ?? ""
+    const port = try d.i32()
+    try d.string()
+    brokers.push({ id: id, host: host, port: port })
+  }
+  try d.i32()
+  const topics: KTopic[] = []
+  const nt = try d.count()
+  for (let i = 0; i < nt; i++) {
+    const error = try d.i16()
+    const name = (try d.string()) ?? ""
+    try d.i8()
+    const parts: KPartition[] = []
+    const np = try d.count()
+    for (let j = 0; j < np; j++) {
+      const perr = try d.i16()
+      const index = try d.i32()
+      const leader = try d.i32()
+      const nr = try d.count()
+      for (let r = 0; r < nr; r++) try d.i32()
+      const ni = try d.count()
+      for (let r = 0; r < ni; r++) try d.i32()
+      parts.push({ index: index, leader: leader, error: perr })
+    }
+    topics.push({ error: error, name: name, partitions: parts })
+  }
+  return { brokers: brokers, topics: topics }
+}
+
+// Produce v3 for one topic partition: transactional id null, acks all, one
+// partition's record batch.
+export function produceRequest(corr: int, topic: string, partition: int, batch: u8[]): u8[] {
+  const b = new Enc()
+  b.string(undefined)
+  b.i16(-1)
+  b.i32(PRODUCE_TIMEOUT_MS)
+  b.i32(1)
+  b.string(topic)
+  b.i32(1)
+  b.i32(partition)
+  b.bytes(batch)
+  return requestFrame(0, 3, corr, b.buf)
+}
+
+export type KProduced = { topic: string, partition: int, error: int, baseOffset: int }
+
+// Produce v3 response: per topic and partition its error code and base offset,
+// then the throttle time, which is ignored.
+export function parseProduce(b: u8[]): KProduced[] throws Error {
+  const d = new Dec(b)
+  const out: KProduced[] = []
+  const nt = try d.count()
+  for (let i = 0; i < nt; i++) {
+    const topic = (try d.string()) ?? ""
+    const np = try d.count()
+    for (let j = 0; j < np; j++) {
+      const partition = try d.i32()
+      const error = try d.i16()
+      const hi = try d.i32()
+      const lo = try d.i32()
+      const low = lo & M32
+      // log append time, an int64 that is not used
+      try d.i32()
+      try d.i32()
+      out.push({ topic: topic, partition: partition, error: error, baseOffset: hi * 4294967296 + low })
+    }
+  }
+  return out
+}
+
+export function saslHandshakeRequest(corr: int): u8[] {
+  const b = new Enc()
+  b.string("PLAIN")
+  return requestFrame(17, 1, corr, b.buf)
+}
+
+export function saslAuthenticateRequest(corr: int, user: string, pass: string): u8[] {
+  const b = new Enc()
+  // the SASL PLAIN initial response: authzid "", authcid, password, each NUL-separated
+  const auth = new Enc()
+  auth.i8(0)
+  auth.raw(utf8(user))
+  auth.i8(0)
+  auth.raw(utf8(pass))
+  b.bytes(auth.buf)
+  return requestFrame(36, 0, corr, b.buf)
+}
+
+// The error code of a SaslHandshake or SaslAuthenticate response (both start
+// with int16 error code; the authenticate response follows it with a message).
+export function saslError(b: u8[]): int throws Error {
+  const d = new Dec(b)
+  return try d.i16()
+}
+
+// ---- socket client ----
+
+type Waiter = (r: u8[]) => void
+
+// One connection to a broker. Requests are sent one at a time, so the reply
+// that comes next is the one awaited.
+class KafkaConn {
+  private sock: Socket<undefined> | undefined = undefined
+  private buf: u8[] = []
+  private waiting: Waiter[] = []
+
+  constructor(readonly host: string, readonly port: int, readonly tls: bool) {}
+
+  async open(): Promise<void, Error> {
+    if (this.sock !== undefined) return
+    const self = this
+    const sock = try await Bun.connect({
+      hostname: this.host,
+      port: this.port,
+      tls: this.tls,
+      socket: {
+        data(s, bytes) {
+          self.onData(bytes)
+        },
+        close(s) {
+          self.onClose()
+        },
+        error(s, e) {
+          self.onClose()
+        },
+      },
+    })
+    this.sock = sock
+  }
+
+  // Writes one framed request and resolves with the response body (without its
+  // correlation id).
+  async call(frame: u8[], corr: int): Promise<u8[], Error> {
+    const s = this.sock
+    if (s === undefined) throw new Error("kafka: not connected")
+    const p = new Promise<u8[]>((resolve) => {
+      this.waiting.push(resolve)
+    })
+    s.write(frame)
+    const body = await p
+    const d = new Dec(body)
+    const got = try d.i32()
+    if (got !== corr) throw new Error(`kafka: correlation id ${got}, want ${corr}`)
+    return body.slice(4)
+  }
+
+  private onData(bytes: u8[]): void {
+    for (const b of bytes) this.buf.push(b)
+    while (this.buf.length >= 4) {
+      const n = (int(this.buf[0]!) << 24) | (int(this.buf[1]!) << 16) | (int(this.buf[2]!) << 8) | int(this.buf[3]!)
+      if (this.buf.length < 4 + n) return
+      const frame = this.buf.slice(4, 4 + n)
+      this.buf = this.buf.slice(4 + n)
+      const w = this.waiting.shift()
+      if (w !== undefined) w(frame)
+    }
+  }
+
+  close(): void {
+    this.onClose()
+  }
+
+  private onClose(): void {
+    const s = this.sock
+    this.sock = undefined
+    this.buf = []
+    const q = this.waiting
+    this.waiting = []
+    // a pending call sees an empty reply, which fails its parse
+    for (const w of q) w([])
+    if (s !== undefined) s.end()
+  }
+}
+
+// Sends entries to one topic. The first request for a topic, and any request
+// after a leader error, reads the metadata again.
+export class KafkaSink {
+  private conns: Map<string, KafkaConn> = new Map()
+  private meta: KMetadata | undefined = undefined
+  private corr: int = 1
+  private user: string
+  private pass: string
+  private tlsOn: bool
+
+  constructor(readonly brokers: string[], readonly topic: string, readonly tls: bool, user: string, pass: string) {
+    this.tlsOn = tls
+    this.user = user
+    this.pass = pass
+  }
+
+  private nextCorr(): int {
+    this.corr += 1
+    return this.corr
+  }
+
+  // Connects to a broker by address, logs in when SASL is set, and keeps the connection.
+  private async connTo(host: string, port: int): Promise<KafkaConn, Error> {
+    const key = `${host}:${port}`
+    const have = this.conns.get(key)
+    if (have !== undefined) return have
+    const c = new KafkaConn(host, port, this.tlsOn)
+    try await c.open()
+    // a failed login closes the socket, or the process would stay alive
+    try {
+      if (this.user !== "") {
+        const hs = try await c.call(saslHandshakeRequest(this.nextCorr()), this.corr)
+        const e1 = try saslError(hs)
+        if (e1 !== 0) throw new Error(`kafka: sasl handshake error ${e1}`)
+        const au = try await c.call(saslAuthenticateRequest(this.nextCorr(), this.user, this.pass), this.corr)
+        const e2 = try saslError(au)
+        if (e2 !== 0) throw new Error(`kafka: sasl authenticate error ${e2}`)
+      }
+    } catch (e) {
+      c.close()
+      throw e
+    }
+    this.conns.set(key, c)
+    return c
+  }
+
+  private async metadata(): Promise<KMetadata, Error> {
+    const m = this.meta
+    if (m !== undefined) return m
+    const boot = this.brokers[0] ?? ""
+    const parts = boot.split(":")
+    const host = parts[0] ?? ""
+    const pn = parseInt(parts[1] ?? "") ?? 0
+    const port = pn > 0 ? pn : 9092
+    const c = try await this.connTo(host, port)
+    const corr = this.nextCorr()
+    const body = try await c.call(metadataRequest(corr, this.topic), corr)
+    const parsed = try parseMetadata(body)
+    this.meta = parsed
+    return parsed
+  }
+
+  // Sends the entries, grouped by partition, one Produce per partition. Throws
+  // on any refused partition; the caller keeps the entries and tries again.
+  async send(entries: LogEntry[]): Promise<void, Error> {
+    const meta = try await this.metadata()
+    const topic = meta.topics.find((t) => t.name === this.topic)
+    if (topic === undefined || topic.partitions.length === 0) throw new Error(`kafka: topic ${this.topic} has no partitions`)
+    const groups: KRecord[][] = []
+    for (let i = 0; i < topic.partitions.length; i++) groups.push([])
+    for (const e of entries) {
+      const rec: KRecord = { key: e.request_id, value: utf8(JSON.stringify(e)), ts: e.ts }
+      groups[fnv1a(rec.key) % topic.partitions.length]!.push(rec)
+    }
+    for (let p = 0; p < groups.length; p++) {
+      const recs = groups[p]!
+      if (recs.length === 0) continue
+      const part = topic.partitions[p]!
+      const leader = meta.brokers.find((b) => b.id === part.leader)
+      if (leader === undefined) {
+        this.meta = undefined
+        throw new Error(`kafka: no leader for ${this.topic}-${part.index}`)
+      }
+      const c = try await this.connTo(leader.host, leader.port)
+      const corr = this.nextCorr()
+      const resp = try await c.call(produceRequest(corr, this.topic, part.index, recordBatch(recs)), corr)
+      const got = try parseProduce(resp)
+      for (const g of got) {
+        if (g.error === 0) continue
+        // a moved leader or a missing topic: read the metadata again next time
+        this.meta = undefined
+        throw new Error(`kafka: produce error ${g.error} on ${g.topic}-${g.partition}${retriable(g.error) ? " (retriable)" : ""}`)
+      }
+    }
+  }
+
+  close(): void {
+    for (const c of this.conns.values()) c.close()
+    this.conns = new Map()
+    this.meta = undefined
+  }
+}
+
+// FNV-1a, 32 bit, over the key's UTF-8 bytes. Picks the partition.
+export function fnv1a(s: string): int {
+  let h = 0x811c9dc5
+  for (const b of utf8(s)) {
+    h = h ^ int(b)
+    h = (h * 0x01000193) & M32
+  }
+  return h
+}
+
+// ---- tests ----
+
+test("crc32c of the standard check string", () => {
+  expect(crc32c(utf8("123456789"))).toBe(0xe3069283)
+  expect(crc32c(utf8(""))).toBe(0)
+})
+
+test("varints: zigzag for signed values", () => {
+  const cases: { v: int, want: string }[] = [
+    { v: 0, want: "00" }, { v: -1, want: "01" }, { v: 1, want: "02" }, { v: 63, want: "7e" },
+    { v: 64, want: "8001" }, { v: -65, want: "8101" }, { v: 300, want: "d804" },
+  ]
+  for (const c of cases) {
+    const e = new Enc()
+    e.varint(c.v)
+    expect(hex(e.buf)).toBe(c.want)
+  }
+})
+
+test("big-endian fixed ints, including negatives and int64", () => {
+  const e = new Enc()
+  e.i16(-2)
+  e.i32(-1)
+  e.i64(-1)
+  e.i64(1791979200000.0)
+  expect(hex(e.buf)).toBe("fffeffffffffffffffffffffffff000001a13a489e00")
+})
+
+test("record batch v2 bytes match an independent encoder", () => {
+  const recs: KRecord[] = [
+    { key: "k1", value: utf8("hello"), ts: 1000.0 },
+    { key: "k2", value: utf8("x"), ts: 1005.0 },
+  ]
+  expect(hex(recordBatch(recs))).toBe(BATCH_HEX)
+})
+
+test("produce v3 request frame is the reference bytes", () => {
+  const frame = produceRequest(7, "t", 0, recordBatch([{ key: "k", value: utf8("v"), ts: 5.0 }]))
+  expect(hex(frame)).toBe(PRODUCE_HEX)
+})
+
+test("produce response: error code and base offset, log append time skipped", () => {
+  const e = new Enc()
+  e.i32(1)
+  e.string("t")
+  e.i32(1)
+  e.i32(0)
+  e.i16(0)
+  e.i64(42.0)
+  e.i64(-1.0)
+  e.i32(0)
+  const r = try parseProduce(e.buf)
+  expect(r.length).toBe(1)
+  expect(r[0]!.topic).toBe("t")
+  expect(r[0]!.error).toBe(0)
+  expect(r[0]!.baseOffset).toBe(42)
+})
+
+test("metadata v1 response parses brokers and partition leaders", () => {
+  const b = new Enc()
+  b.i32(1)
+  b.i32(3)
+  b.string("kafka1")
+  b.i32(9092)
+  b.string(undefined)
+  b.i32(3)
+  b.i32(1)
+  b.i16(0)
+  b.string("logs")
+  b.i8(0)
+  b.i32(1)
+  b.i16(0)
+  b.i32(0)
+  b.i32(3)
+  b.i32(1)
+  b.i32(3)
+  b.i32(1)
+  b.i32(3)
+  const m = try parseMetadata(b.buf)
+  expect(m.brokers[0]!.host).toBe("kafka1")
+  expect(m.brokers[0]!.port).toBe(9092)
+  expect(m.topics[0]!.name).toBe("logs")
+  expect(m.topics[0]!.partitions[0]!.leader).toBe(3)
+})
+
+test("sasl PLAIN authenticate request is the reference frame", () => {
+  expect(hex(saslAuthenticateRequest(2, "u", "p"))).toBe(SASL_HEX)
+})
+
+test("fnv1a of a known key is stable", () => {
+  expect(fnv1a("")).toBe(0x811c9dc5)
+  expect(fnv1a("a")).toBe(0xe40c292c)
+})
+
+test("retriable codes", () => {
+  expect(retriable(6)).toBe(true)
+  expect(retriable(87)).toBe(false)
+})
+
+const HEX = "0123456789abcdef"
+
+function hex(b: u8[]): string {
+  let s = ""
+  for (const x of b) s += HEX.slice(int(x) >> 4, (int(x) >> 4) + 1) + HEX.slice(int(x) & 15, (int(x) & 15) + 1)
+  return s
+}
+
+// Reference bytes from an independent Python encoder (bitwise CRC-32C, struct packing).
+const BATCH_HEX = "000000000000000000000049ffffffff0230cd6c6100000000000100000000000003e800000000000003edffffffffffffffffffffffffffff000000021a000000046b310a68656c6c6f0012000a02046b32027800"
+const PRODUCE_HEX = "00000070000000030000000700057261696a75ffffffff000027100000000100017400000001000000000000004600000000000000000000003affffffff0223f463e100000000000000000000000000050000000000000005ffffffffffffffffffffffffffff0000000110000000026b027600"
+const SASL_HEX = "00000017002400000000000200057261696a750000000400750070"

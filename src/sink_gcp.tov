@@ -1,0 +1,221 @@
+// Google Cloud log sinks: BigQuery streaming inserts (tabledata.insertAll) and
+// Pub/Sub publish. Both are plain HTTPS POSTs with a bearer token. The token
+// comes from a service account key (the Vertex JWT flow, reused through
+// providers/vertex) or, with no key, from the workload's metadata server (ADC).
+// The lead gets the token with bearer(), then builds the request with the
+// functions below and posts it.
+import { encode } from "./base64"
+import { utf8 } from "./crypto"
+import { LogEntry } from "./logstore"
+import { ServiceAccount, TokenCache, parseServiceAccount } from "./providers/vertex"
+import { encodeSegment } from "./providers/bedrock"
+import { isoMs } from "./exports"
+import { trimSlash } from "./providers/types"
+
+export type GcpRequest = { url: string, method: "POST", headers: Map<string, string>, body: string }
+
+// BigQuery's insertAll takes up to 10000 rows; Pub/Sub's publish takes up to 1000 messages.
+export const BQ_MAX_ROWS = 10000
+export const PUBSUB_MAX_MESSAGES = 1000
+
+const METADATA_TOKEN = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+const METADATA_KEY = "metadata"
+
+// Bearer tokens for one exporter. A key is the service-account JSON text; an
+// empty key means the metadata server's token for the attached service account.
+export class GcpToken {
+  private cache: TokenCache = new TokenCache()
+  private key: string
+
+  constructor(key: string) {
+    this.key = key
+  }
+
+  // A usable access token, fetched when none is cached or the cached one is near expiry.
+  async bearer(nowSec: int): Promise<string, Error> {
+    if (this.key === "") return try await this.fromMetadata(nowSec)
+    const sa: ServiceAccount = try parseServiceAccount(this.key)
+    const cached = this.cache.get(sa.client_email, nowSec)
+    if (cached !== undefined) return cached
+    const up = try this.cache.tokenRequest(sa, nowSec)
+    const r = try await fetch(up.url, { method: "POST", headers: up.headers, body: up.body })
+    const text = try await r.text()
+    try this.cache.store(sa.client_email, text, nowSec)
+    return this.cache.get(sa.client_email, nowSec) ?? ""
+  }
+
+  private async fromMetadata(nowSec: int): Promise<string, Error> {
+    const cached = this.cache.get(METADATA_KEY, nowSec)
+    if (cached !== undefined) return cached
+    const r = try await fetch(METADATA_TOKEN, { headers: { "Metadata-Flavor": "Google" } })
+    const text = try await r.text()
+    try this.cache.store(METADATA_KEY, text, nowSec)
+    return this.cache.get(METADATA_KEY, nowSec) ?? ""
+  }
+}
+
+// ---- BigQuery ----
+
+// One row. Column names follow the log entry; content columns exist only when
+// the entry carries content (the exporter's include_content).
+export type BqJson = {
+  log_id: string,
+  timestamp: string,
+  request_id: string,
+  op: string,
+  provider: string,
+  model: string,
+  status: int,
+  latency_ms: f64,
+  prompt_tokens: int,
+  completion_tokens: int,
+  total_tokens: int,
+  cost: f64,
+  cache_hit: bool,
+  virtual_key?: string,
+  error?: string,
+  input_history?: string,
+  output_message?: string,
+}
+
+export type BqRow = { insertId: string, json: BqJson }
+
+export function bqRow(e: LogEntry): BqRow {
+  const json: BqJson = {
+    log_id: e.id,
+    timestamp: isoMs(e.ts),
+    request_id: e.request_id,
+    op: e.op,
+    provider: e.provider,
+    model: e.model,
+    status: e.status,
+    latency_ms: e.latency_ms,
+    prompt_tokens: e.prompt_tokens,
+    completion_tokens: e.completion_tokens,
+    total_tokens: e.prompt_tokens + e.completion_tokens,
+    cost: e.cost,
+    cache_hit: e.cache_hit,
+    virtual_key: e.virtual_key,
+    error: e.error,
+    input_history: e.input,
+    output_message: e.output,
+  }
+  // insertId lets BigQuery drop a row that a retried batch sends twice.
+  return { insertId: e.id, json: json }
+}
+
+// The insertAll POST. skipInvalidRows and ignoreUnknownValues stay off, so a bad
+// row shows up in insertErrors instead of vanishing.
+// base overrides the API host (a proxy or a test double); "" or undefined means Google's.
+export function bigqueryRequest(project: string, dataset: string, table: string, rows: LogEntry[], bearer: string, base?: string): GcpRequest {
+  const bqRows: BqRow[] = []
+  for (const e of rows) bqRows.push(bqRow(e))
+  const body = JSON.stringify({ kind: "bigquery#tableDataInsertAllRequest", skipInvalidRows: false, ignoreUnknownValues: false, rows: bqRows })
+  const root = base === undefined || base === "" ? "https://bigquery.googleapis.com" : trimSlash(base)
+  const url = `${root}/bigquery/v2/projects/${encodeSegment(project)}/datasets/${encodeSegment(dataset)}/tables/${encodeSegment(table)}/insertAll`
+  return { url: url, method: "POST", headers: authHeaders(bearer), body: body }
+}
+
+// Rows BigQuery refused. insertAll answers 200 even when rows fail, so the
+// lead checks this count as well as the status. Zero when the body has no errors.
+export function bigqueryRefused(text: string): int throws SyntaxError {
+  const r = try JSON.parse(text) as { insertErrors?: { index: int }[] }
+  const errs = r.insertErrors
+  return errs === undefined ? 0 : errs.length
+}
+
+// ---- Pub/Sub ----
+
+export type PubsubAttrs = { request_id: string, provider: string, model: string, status: string }
+
+// publish: one message per entry, the entry's JSON as base64 data, and
+// attributes a subscriber can filter on without parsing the payload.
+export function pubsubRequest(project: string, topic: string, rows: LogEntry[], bearer: string, base?: string): GcpRequest {
+  const messages: { data: string, attributes: PubsubAttrs }[] = []
+  for (const e of rows) {
+    messages.push({
+      data: encode(utf8(JSON.stringify(e))),
+      attributes: { request_id: e.request_id, provider: e.provider, model: e.model, status: `${e.status}` },
+    })
+  }
+  const body = JSON.stringify({ messages: messages })
+  const proot = base === undefined || base === "" ? "https://pubsub.googleapis.com" : trimSlash(base)
+  const url = `${proot}/v1/projects/${encodeSegment(project)}/topics/${encodeSegment(topic)}:publish`
+  return { url: url, method: "POST", headers: authHeaders(bearer), body: body }
+}
+
+function authHeaders(bearer: string): Map<string, string> {
+  const h: Map<string, string> = new Map()
+  h.set("content-type", "application/json")
+  h.set("authorization", "Bearer " + bearer)
+  return h
+}
+
+// ---- tests ----
+
+function sampleRow(id: string, ts: f64): LogEntry {
+  return {
+    id: id,
+    ts: ts,
+    request_id: "req-" + id,
+    op: "chat",
+    provider: "openai",
+    model: "gpt-4o",
+    status: 200,
+    latency_ms: 12.5,
+    prompt_tokens: 3,
+    completion_tokens: 4,
+    cost: 0.25,
+    cache_hit: false,
+    virtual_key: "vk1",
+    input: "hello",
+    output: "world",
+  }
+}
+
+test("bigquery: insertAll URL, bearer header, one row per entry keyed by insertId", () => {
+  const req = bigqueryRequest("my-proj", "raiju_logs", "requests", [sampleRow("a", 1791979200000.0)], "tok")
+  expect(req.url).toBe("https://bigquery.googleapis.com/bigquery/v2/projects/my-proj/datasets/raiju_logs/tables/requests/insertAll")
+  expect(req.method).toBe("POST")
+  expect(req.headers.get("authorization")).toBe("Bearer tok")
+  const body = try JSON.parse(req.body) as { kind: string, skipInvalidRows: bool, rows: BqRow[] }
+  expect(body.kind).toBe("bigquery#tableDataInsertAllRequest")
+  expect(body.skipInvalidRows).toBe(false)
+  expect(body.rows.length).toBe(1)
+  expect(body.rows[0]!.insertId).toBe("a")
+  expect(body.rows[0]!.json.timestamp).toBe("2026-10-14T12:00:00.000Z")
+  expect(body.rows[0]!.json.total_tokens).toBe(7)
+  expect(body.rows[0]!.json.input_history).toBe("hello")
+})
+
+test("bigquery: content columns are absent when the entry has none", () => {
+  const e = sampleRow("b", 1000.0)
+  e.input = undefined
+  e.output = undefined
+  const req = bigqueryRequest("p", "d", "t", [e], "x")
+  expect(req.body.includes("input_history")).toBe(false)
+  expect(req.body.includes("output_message")).toBe(false)
+})
+
+test("bigquery: refused rows are counted from insertErrors", () => {
+  const none = try bigqueryRefused(`{"kind":"bigquery#tableDataInsertAllResponse"}`)
+  expect(none).toBe(0)
+  const two = try bigqueryRefused(`{"insertErrors":[{"index":0,"errors":[{"reason":"invalid"}]},{"index":2,"errors":[]}]}`)
+  expect(two).toBe(2)
+})
+
+test("pubsub: publish URL, base64 JSON data, and filter attributes", () => {
+  const req = pubsubRequest("my-proj", "raiju-logs", [sampleRow("a", 1000.0)], "tok")
+  expect(req.url).toBe("https://pubsub.googleapis.com/v1/projects/my-proj/topics/raiju-logs:publish")
+  expect(req.headers.get("authorization")).toBe("Bearer tok")
+  const body = try JSON.parse(req.body) as { messages: { data: string, attributes: PubsubAttrs }[] }
+  expect(body.messages.length).toBe(1)
+  // base64 of the entry's JSON, so a subscriber decodes it
+  expect(body.messages[0]!.data).toBe(encode(utf8(JSON.stringify(sampleRow("a", 1000.0)))))
+  expect(body.messages[0]!.attributes.request_id).toBe("req-a")
+  expect(body.messages[0]!.attributes.status).toBe("200")
+})
+
+test("pubsub: base64 of a known short string", () => {
+  expect(encode(utf8("{}"))).toBe("e30=")
+})

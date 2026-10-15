@@ -131,13 +131,16 @@ def eventstream(data: bytes):
     return out
 
 def background(x):
-    """Requests other gateways send on their own schedule: MCP handshakes and tool listings."""
+    """Requests gateways send on their own schedule: MCP handshakes and tool listings, vault reads."""
+    if x["path"] == "/v1/secret/data/raiju":
+        return True
     return x["path"].startswith("/mcp") and any(m in x.get("body", "") for m in ('"tools/list"', '"initialize"', '"notifications/'))
 
 def seen(traces=False):
     """What the mock received; trace exports and background MCP listings arrive asynchronously,
     so they're left out unless asked for."""
     got = json.loads(call("GET", "/_seen", base=MOCK)[2])
+    # traces=True returns everything, background requests included
     return [x for x in got if traces or (x["path"] != "/v1/traces" and not background(x))]
 
 FAILS = []
@@ -541,6 +544,116 @@ def discovery_and_proxy():
             p.terminate()
         for srv in servers:
             srv.shutdown()
+
+KAFKA_PORT = 18124
+GW_S = "http://127.0.0.1:18120"  # exports to the BigQuery, Pub/Sub, Maxim and Kafka sinks and writes Parquet, with retention
+
+def sinks_config(sa_text: str, kafka_out: str):
+    """The sink gateway's config: every sink points at the mock (base_url) or the Kafka stub."""
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-sinks-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "s", "value": "sk-sinks", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "exporters": [
+            {"id": "bq", "kind": "bigquery", "project_id": "proj", "dataset_id": "ds", "table_id": "tb", "service_account_key": sa_text, "base_url": MOCK, "interval_seconds": 1},
+            {"id": "ps", "kind": "pubsub", "project_id": "proj", "topic_id": "logs-topic", "service_account_key": sa_text, "base_url": MOCK, "interval_seconds": 1},
+            {"id": "mx", "kind": "maxim", "api_key": "mk", "log_repo_id": "repo-e2e", "base_url": MOCK, "interval_seconds": 1},
+            {"id": "kf", "kind": "kafka", "brokers": [f"127.0.0.1:{KAFKA_PORT}"], "topic": "raiju-logs", "interval_seconds": 1},
+        ],
+        # Parquet objects in their own bucket; the retention sweep deletes the days older than one
+        "log_exports": {"enabled": True, "kind": "s3", "bucket": "logs-pq", "endpoint": MOCK, "region": "us-east-1", "access_key_id": "AKIDEXAMPLE",
+                        "secret_access_key": "secret", "interval_seconds": 1, "format": "parquet", "retention_days": 1},
+    }
+
+def sinks_e2e(env, sa_text: str):
+    """Each sink gets a chat request's log entry; Parquet is a PAR1 file that reads back; the retention sweep deletes old days only."""
+    import datetime, socket
+    kafka_out = os.path.join(BUILD, "e2e-kafka.jsonl")
+    open(kafka_out, "w").close()
+    kafka = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/kafka_stub.py"), str(KAFKA_PORT), kafka_out], stderr=open(os.path.join(BUILD, "e2e-kafka.log"), "w"))
+    gw = None
+    try:
+        for _ in range(100):
+            try:
+                socket.create_connection(("127.0.0.1", KAFKA_PORT), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        cfg_path = os.path.join(BUILD, "e2e.sinks.json")
+        json.dump(sinks_config(sa_text, kafka_out), open(cfg_path, "w"))
+        gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18120", "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.sinks.log"), "w"))
+        wait(GW_S + "/health")
+        # an old day and today's day, in the export layout, before the first sweep (five seconds after start)
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d")
+        for key in (f"raiju-logs/2020/01/01/old-e2e.parquet", f"raiju-logs/{today}/keep-e2e.parquet"):
+            req = urllib.request.Request(MOCK + "/logs-pq/" + key, data=b"PAR1-seeded", method="PUT", headers={"content-type": "application/vnd.apache.parquet"})
+            urllib.request.urlopen(req, timeout=10).close()
+
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "sink-probe-4417"}]}, base=GW_S)
+        rid = {k.lower(): v for k, v in h.items()}.get("x-bifrost-request-id", "")
+        check("the sink gateway answers the probe chat", s == 200 and rid != "", (s, b[:200]))
+
+        def arrived(pred, tries=60):
+            for _ in range(tries):
+                got = [x for x in seen() if pred(x)]
+                if got:
+                    return got
+                time.sleep(0.5)
+            return []
+
+        bq = arrived(lambda x: x["path"].endswith("/insertAll") and rid in x["body"])
+        check("a chat's log entry reaches BigQuery insertAll, with the bearer token", bq and bq[0]["path"] == "/bigquery/v2/projects/proj/datasets/ds/tables/tb/insertAll" and bq[0]["auth"] == "Bearer ya29.test-token", [x["path"] for x in bq][:2])
+        check("BigQuery rows carry no content unless include_content is set", bq and "sink-probe-4417" not in bq[0]["body"], bq[:1])
+        ps = arrived(lambda x: x["path"] == "/v1/projects/proj/topics/logs-topic:publish" and rid in x["body"])
+        check("a chat's log entry reaches Pub/Sub publish, with the request id attribute", ps and f'"request_id":"{rid}"' in ps[0]["body"], [x["path"] for x in ps][:2])
+        mx = arrived(lambda x: x["path"] == "/api/sdk/v3/log?id=repo-e2e" and rid in x["body"])
+        check("a chat's log entry reaches Maxim's log repository", mx and "sink-probe-4417" not in mx[0]["body"], [x["path"] for x in mx][:2])
+
+        def kafka_hits():
+            out = []
+            for line in open(kafka_out):
+                if line.strip():
+                    batch = json.loads(line)
+                    for rec in batch["records"]:
+                        if rid in rec["value"]:
+                            out.append((batch["topic"], rec))
+            return out
+        kf = []
+        for _ in range(60):
+            kf = kafka_hits()
+            if kf:
+                break
+            time.sleep(0.5)
+        check("a chat's log entry reaches Kafka, with CRC-32C batches the stub accepts", kf and kf[0][0] == "raiju-logs" and "sink-probe-4417" not in kf[0][1]["value"], kf[:1])
+
+        pq = arrived(lambda x: x["path"].startswith("/logs-pq/raiju-logs/") and x["path"].endswith(".parquet") and rid.encode() in bytes.fromhex(x["body"]))
+        data = bytes.fromhex(pq[0]["body"]) if pq else b""
+        check("Parquet export is a PAR1 file carrying the request", pq and data[:4] == b"PAR1" and data[-4:] == b"PAR1", [x["path"] for x in pq][:2])
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as papq
+            table = papq.read_table(pa.BufferReader(data))
+            models = table.column("model").to_pylist()
+            check("the Parquet file reads back with the request id and model", rid in table.column("request_id").to_pylist() and any("gpt-4o-mini" in m for m in models), models[:3])
+        except ImportError:
+            print("skip the pyarrow read-back: pyarrow is not installed")
+
+        # retention: the old day is deleted, today's objects stay
+        old_status = keep_status = probe_status = 0
+        for _ in range(60):
+            old_status = call("GET", "/logs-pq/raiju-logs/2020/01/01/old-e2e.parquet", base=MOCK, auth=False)[0]
+            keep_status = call("GET", f"/logs-pq/raiju-logs/{today}/keep-e2e.parquet", base=MOCK, auth=False)[0]
+            if old_status == 404:
+                break
+            time.sleep(0.5)
+        probe_status = call("GET", pq[0]["path"], base=MOCK, auth=False)[0] if pq else 0
+        check("the retention sweep deletes objects of a day older than retention_days", old_status == 404 and keep_status == 200 and probe_status == 200, (old_status, keep_status, probe_status))
+    finally:
+        if gw is not None:
+            gw.terminate()
+        kafka.terminate()
 
 def main():
     build()
@@ -1388,7 +1501,7 @@ def main():
         # --- wave 5 ---
         hl = lambda h: {k.lower(): v for k, v in h.items()}
         s, _, b = chat("vaulted/gpt-4o-mini", seed=901)
-        vault_reads = [x for x in seen() if x["path"] == "/v1/secret/data/raiju"]
+        vault_reads = [x for x in seen(traces=True) if x["path"] == "/v1/secret/data/raiju"]
         check("vault secret resolved into a provider key", s == 200 and seen()[-1]["auth"] == "Bearer sk-from-vault" and vault_reads and vault_reads[0]["body"] == "root-token", (s, b, seen()[-1]))
 
         s, h, b = chat("auto", seed=902)
@@ -2088,6 +2201,8 @@ def main():
             check("a wrong encryption_key stops the start", False, "the gateway kept running")
         # cluster discovery and the identity-aware proxies (their own gateways and mocks)
         discovery_and_proxy()
+        # the log sinks: their own gateway, Kafka stub and Parquet bucket, run last so their traffic stays off the other checks
+        sinks_e2e(env, json.load(open(config))["providers"]["vertex"]["keys"][0]["vertex_key_config"]["auth_credentials"])
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

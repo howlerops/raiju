@@ -7,6 +7,9 @@ import { utf8 } from "./crypto"
 import { encode } from "./base64"
 import { trimSlash } from "./providers/types"
 import { LogExporterConfig } from "./config"
+import { GcpToken, bigqueryRequest, bigqueryRefused, pubsubRequest, PUBSUB_MAX_MESSAGES } from "./sink_gcp"
+import { KafkaSink } from "./sink_kafka"
+import { maximRequest } from "./sink_maxim"
 
 export type ExporterConfig = LogExporterConfig
 
@@ -180,13 +183,103 @@ function httpRequest(cfg: ExporterConfig, rows: LogEntry[]): ExportRequest {
 }
 
 // The request that sends these entries to the exporter's backend. The caller does the fetch.
-export function batchRequest(cfg: ExporterConfig, entries: LogEntry[]): ExportRequest {
+// bearer is the access token for BigQuery and Pub/Sub; the other kinds ignore it.
+// Kafka is not HTTP: SinkSender writes it to the socket, and this returns an empty request for it.
+export function batchRequest(cfg: ExporterConfig, entries: LogEntry[], bearer?: string): ExportRequest {
   const rows: LogEntry[] = []
   for (const e of entries) rows.push(shaped(cfg, e))
+  const tok = bearer ?? ""
   if (cfg.kind === "datadog") return datadogRequest(cfg, rows)
   if (cfg.kind === "splunk") return splunkRequest(cfg, rows)
   if (cfg.kind === "elasticsearch") return elasticRequest(cfg, rows)
+  if (cfg.kind === "bigquery") return bigqueryRequest(cfg.project_id ?? "", orDefault(cfg.dataset_id, "raiju_logs"), orDefault(cfg.table_id, "requests"), rows, tok, cfg.base_url)
+  if (cfg.kind === "pubsub") return pubsubRequest(cfg.project_id ?? "", cfg.topic_id ?? "", rows, tok, cfg.base_url)
+  if (cfg.kind === "maxim") return maximRequest(cfg.base_url ?? "", cfg.api_key ?? "", cfg.log_repo_id ?? "", rows)
+  if (cfg.kind === "kafka") return { url: "", method: "POST", headers: new Map(), body: "" }
   return httpRequest(cfg, rows)
+}
+
+// Whether the kind needs an access token (BigQuery and Pub/Sub).
+export function needsToken(cfg: ExporterConfig): bool {
+  return cfg.kind === "bigquery" || cfg.kind === "pubsub"
+}
+
+function nowSec(): int {
+  return Math.floor(Date.now() / 1000)
+}
+
+// Sends the batches of one exporter, whatever its kind: a token for BigQuery and
+// Pub/Sub, the broker socket for Kafka, and a POST for the rest. send() returns
+// the status the lead acts on: 200 when the batch landed, 0 for a failure to
+// retry later (network, token, a retriable broker error), the backend's own
+// status for HTTP kinds, and 400 for a batch that will not be accepted.
+export class SinkSender {
+  private token: GcpToken
+  private kafka: KafkaSink | undefined = undefined
+
+  constructor(readonly cfg: ExporterConfig) {
+    this.token = new GcpToken(cfg.service_account_key ?? "")
+    if (cfg.kind === "kafka") {
+      this.kafka = new KafkaSink(cfg.brokers ?? [], cfg.topic ?? "", cfg.tls ?? false, cfg.sasl_username ?? "", cfg.sasl_password ?? "")
+    }
+  }
+
+  async send(entries: LogEntry[]): Promise<int, Error> {
+    const k = this.kafka
+    if (k !== undefined) return await this.sendKafka(k, entries)
+    let bearer = ""
+    if (needsToken(this.cfg)) {
+      try {
+        bearer = await this.token.bearer(nowSec())
+      } catch (e) {
+        console.error(`raiju: exporter ${this.cfg.id}: access token: ${e.message}`)
+        return 0
+      }
+    }
+    const r = batchRequest(this.cfg, entries, bearer)
+    let status = 0
+    let text = ""
+    try {
+      const res = await fetch(r.url, { method: "POST", headers: r.headers, body: r.body })
+      status = res.status
+      text = await res.text()
+    } catch (e) {
+      console.error(`raiju: exporter ${this.cfg.id}: ${e.message}`)
+      return 0
+    }
+    if (status >= 300) return status
+    if (this.cfg.kind === "bigquery") {
+      try {
+        const refused = bigqueryRefused(text)
+        if (refused > 0) {
+          console.error(`raiju: exporter ${this.cfg.id}: BigQuery refused ${refused} row(s)`)
+          return 400
+        }
+      } catch (e) {
+        console.error(`raiju: exporter ${this.cfg.id}: unreadable BigQuery response`)
+      }
+    }
+    return 200
+  }
+
+  // Closes the broker connection. An open socket keeps the process running.
+  close(): void {
+    const k = this.kafka
+    if (k !== undefined) k.close()
+  }
+
+  private async sendKafka(k: KafkaSink, entries: LogEntry[]): Promise<int, Error> {
+    try {
+      await k.send(entries)
+      return 200
+    } catch (e) {
+      const msg = e.message
+      console.error(`raiju: exporter ${this.cfg.id}: ${msg}`)
+      // SASL refusals and non-retriable produce errors will not change on a retry
+      if (msg.includes("sasl") || (msg.includes("produce error") && !msg.includes("(retriable)"))) return 400
+      return 0
+    }
+  }
 }
 
 function earliestTs(batch: LogEntry[]): f64 {
@@ -291,6 +384,28 @@ export function validate(cfg: ExporterConfig): string {
     if (nonEmpty(cfg.api_key) === undefined && user !== undefined && nonEmpty(cfg.password) === undefined) {
       return `${cfg.id}: username needs password`
     }
+    return ""
+  }
+  if (cfg.kind === "bigquery") {
+    if (nonEmpty(cfg.project_id) === undefined) return `${cfg.id}: bigquery needs project_id`
+    return ""
+  }
+  if (cfg.kind === "pubsub") {
+    if (nonEmpty(cfg.project_id) === undefined || nonEmpty(cfg.topic_id) === undefined) return `${cfg.id}: pubsub needs project_id and topic_id`
+    if (bs !== undefined && bs > PUBSUB_MAX_MESSAGES) return `${cfg.id}: pubsub takes at most ${PUBSUB_MAX_MESSAGES} messages per batch`
+    return ""
+  }
+  if (cfg.kind === "kafka") {
+    const brokers = cfg.brokers ?? []
+    if (brokers.length === 0) return `${cfg.id}: kafka needs brokers`
+    if (nonEmpty(cfg.topic) === undefined) return `${cfg.id}: kafka needs topic`
+    if (nonEmpty(cfg.sasl_username) !== undefined && nonEmpty(cfg.sasl_password) === undefined) return `${cfg.id}: sasl_username needs sasl_password`
+    return ""
+  }
+  if (cfg.kind === "maxim") {
+    if (nonEmpty(cfg.api_key) === undefined || nonEmpty(cfg.log_repo_id) === undefined) return `${cfg.id}: maxim needs api_key and log_repo_id`
+    const base = cfg.base_url
+    if (base !== undefined && base !== "" && !isHttpUrl(base)) return `${cfg.id}: base_url must be an http or https url`
     return ""
   }
   if (!isHttpUrl(cfg.url)) return `${cfg.id}: http exporter needs an http or https url`
@@ -497,3 +612,40 @@ test("UTC dates for index names", () => {
   expect(indexFor("raiju-%Y.%m.%d", 1791979200000.0)).toBe("raiju-2026.10.14")
   expect(indexFor("plain", 0.0)).toBe("plain")
 })
+
+test("bigquery, pubsub and maxim: each kind's endpoint, with the bearer or the key", () => {
+  const bq = batchRequest({ id: "b", kind: "bigquery", project_id: "p", dataset_id: "d", table_id: "t" }, [sampleEntry("a", 1000.0, 200)], "tok")
+  expect(bq.url).toBe("https://bigquery.googleapis.com/bigquery/v2/projects/p/datasets/d/tables/t/insertAll")
+  expect(bq.headers.get("authorization")).toBe("Bearer tok")
+  const bqDefault = batchRequest({ id: "b", kind: "bigquery", project_id: "p" }, [sampleEntry("a", 1000.0, 200)], "tok")
+  expect(bqDefault.url.includes("/datasets/raiju_logs/tables/requests/insertAll")).toBe(true)
+  const ps = batchRequest({ id: "p", kind: "pubsub", project_id: "p", topic_id: "logs" }, [sampleEntry("a", 1000.0, 200)], "tok")
+  expect(ps.url).toBe("https://pubsub.googleapis.com/v1/projects/p/topics/logs:publish")
+  const mx = batchRequest({ id: "m", kind: "maxim", api_key: "mk", log_repo_id: "r" }, [sampleEntry("a", 1000.0, 200)])
+  expect(mx.url).toBe("https://app.getmaxim.ai/api/sdk/v3/log?id=r")
+  expect(mx.headers.get("x-maxim-api-key")).toBe("mk")
+  expect(mx.body.includes("secret")).toBe(false)
+  expect(needsToken({ id: "b", kind: "bigquery" })).toBe(true)
+  expect(needsToken({ id: "m", kind: "maxim" })).toBe(false)
+})
+
+test("kafka is not an HTTP request: batchRequest gives an empty one", () => {
+  const r = batchRequest({ id: "k", kind: "kafka", brokers: ["b:9092"], topic: "t" }, [sampleEntry("a", 1000.0, 200)])
+  expect(r.url).toBe("")
+  expect(r.body).toBe("")
+})
+
+test("validate: the new kinds need their own fields", () => {
+  expect(validate({ id: "b", kind: "bigquery", project_id: "p" })).toBe("")
+  expect(bad({ id: "b", kind: "bigquery" })).toBe(true)
+  expect(validate({ id: "p", kind: "pubsub", project_id: "p", topic_id: "t" })).toBe("")
+  expect(bad({ id: "p", kind: "pubsub", project_id: "p" })).toBe(true)
+  expect(bad({ id: "p", kind: "pubsub", project_id: "p", topic_id: "t", batch_size: 5000 })).toBe(true)
+  expect(validate({ id: "k", kind: "kafka", brokers: ["b:9092"], topic: "t" })).toBe("")
+  expect(bad({ id: "k", kind: "kafka", topic: "t" })).toBe(true)
+  expect(bad({ id: "k", kind: "kafka", brokers: ["b:9092"], topic: "t", sasl_username: "u" })).toBe(true)
+  expect(validate({ id: "m", kind: "maxim", api_key: "k", log_repo_id: "r" })).toBe("")
+  expect(bad({ id: "m", kind: "maxim", api_key: "k" })).toBe(true)
+  expect(bad({ id: "m", kind: "maxim", api_key: "k", log_repo_id: "r", base_url: "ftp://x" })).toBe(true)
+})
+

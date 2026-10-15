@@ -1,6 +1,9 @@
 // Build log export to S3-compatible object storage: AWS S3, MinIO, and GCS
-// through its S3 interoperability HMAC keys. This module builds the PUT and
-// tracks what has been sent; the lead performs the upload.
+// through its S3 interoperability HMAC keys. This module builds the requests
+// and tracks what has been sent; the lead performs the uploads, the listing and
+// the deletes. Bodies are JSONL, or Parquet (sink_parquet.tov). The retention
+// sweep lists the export prefix and deletes the objects whose day is older than
+// retention_days.
 import { sha256, hmacSha256, toHex, utf8 } from "./crypto"
 import { amzDate, encodeSegment } from "./providers/bedrock"
 import { trimSlash } from "./providers/types"
@@ -10,12 +13,23 @@ export type ExportConfig = LogExportsConfig
 
 export type PutRequest = { url: string, method: "PUT", headers: Map<string, string>, body: string }
 
+// A request with a byte body (Parquet) or none (list, delete).
+export type ByteRequest = { url: string, method: string, headers: Map<string, string>, body: u8[] }
+
 const DEFAULT_INTERVAL = 300
 const CONTENT_TYPE = "application/x-ndjson"
+const PARQUET_TYPE = "application/vnd.apache.parquet"
+const DAY_MS = 86400000.0
+const UNSIGNED_PAYLOAD_EMPTY = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 export function exportInterval(cfg: ExportConfig): int {
   const s = cfg.interval_seconds
   return s !== undefined && s > 0 ? s : DEFAULT_INTERVAL
+}
+
+// Parquet when format says so; JSONL otherwise.
+export function isParquet(cfg: ExportConfig): bool {
+  return cfg.format === "parquet"
 }
 
 // GCS signs with the "auto" region; S3 needs a real one, and us-east-1 is
@@ -68,14 +82,22 @@ export function isoMs(ms: number): string {
   return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}T${d.slice(9, 11)}:${d.slice(11, 13)}:${d.slice(13, 15)}.${frac}Z`
 }
 
-// <prefix>/raiju-logs/YYYY/MM/DD/<startISO>-<endISO>-<node>.jsonl. The day
-// comes from startMs, so a batch belongs to the day it starts on.
-export function objectKey(cfg: ExportConfig, startMs: number, endMs: number, node: string): string {
-  const d = amzDate(startMs)
-  // empty segments drop out, so a stray slash in the prefix cannot double up
+// The directory every export object sits under: <prefix>/raiju-logs/, with the
+// empty segments of the prefix dropped.
+function exportDir(cfg: ExportConfig): string[] {
   const segs = (cfg.prefix ?? "").split("/").filter((s) => s !== "")
-  segs.push("raiju-logs", `${d.slice(0, 4)}/${d.slice(4, 6)}/${d.slice(6, 8)}`)
-  const name = `${isoMs(startMs)}-${isoMs(endMs)}-${node.split("/").join("-")}.jsonl`
+  segs.push("raiju-logs")
+  return segs
+}
+
+// <prefix>/raiju-logs/YYYY/MM/DD/<startISO>-<endISO>-<node>.<ext>. The day
+// comes from startMs, so a batch belongs to the day it starts on. ext is
+// "jsonl" (the default) or "parquet".
+export function objectKey(cfg: ExportConfig, startMs: number, endMs: number, node: string, ext?: string): string {
+  const d = amzDate(startMs)
+  const segs = exportDir(cfg)
+  segs.push(`${d.slice(0, 4)}/${d.slice(4, 6)}/${d.slice(6, 8)}`)
+  const name = `${isoMs(startMs)}-${isoMs(endMs)}-${node.split("/").join("-")}.${ext ?? "jsonl"}`
   return segs.join("/") + "/" + name
 }
 
@@ -151,11 +173,10 @@ export function canonicalQuery(pairs: string[][]): string {
   return enc.map((p) => `${p[0]!}=${p[1]!}`).join("&")
 }
 
-// Signs and sets up one request. path is the canonical path the signer uses, and
-// the URL carries the same path and query. S3 also signs the payload hash.
-function awsRequest(c: S3Creds, service: string, scheme: string, host: string, method: string, path: string, canonicalPath: string, query: string, contentType: string, body: string, nowMs: number, s3: bool): AwsRequest {
+// The headers of a signed request (authorization included). The host is not
+// returned: the HTTP client sends the URL's host. S3 also signs the payload hash.
+function signedHeaders(c: S3Creds, service: string, host: string, method: string, canonicalPath: string, query: string, contentType: string, payloadHash: string, nowMs: number, s3: bool): Map<string, string> {
   const date = amzDate(nowMs)
-  const payloadHash = toHex(sha256(utf8(body)))
   const hs: string[][] = [["host", host], ["x-amz-date", date]]
   if (s3) hs.push(["x-amz-content-sha256", payloadHash])
   if (contentType !== "") hs.push(["content-type", contentType])
@@ -167,6 +188,14 @@ function awsRequest(c: S3Creds, service: string, scheme: string, host: string, m
     if (h[0] !== "host") out.set(h[0]!, h[1]!)
   }
   out.set("authorization", auth)
+  return out
+}
+
+// Signs and sets up one request. path is the canonical path the signer uses, and
+// the URL carries the same path and query.
+function awsRequest(c: S3Creds, service: string, scheme: string, host: string, method: string, path: string, canonicalPath: string, query: string, contentType: string, body: string, nowMs: number, s3: bool): AwsRequest {
+  const payloadHash = toHex(sha256(utf8(body)))
+  const out = signedHeaders(c, service, host, method, canonicalPath, query, contentType, payloadHash, nowMs, s3)
   return { url: scheme + host + path + (query === "" ? "" : "?" + query), method: method, headers: out, body: body }
 }
 
@@ -194,6 +223,117 @@ export function awsCall(c: S3Creds, service: string, scheme: string, host: strin
   return awsRequest(c, service, scheme, host, method, path, canonicalPath, canonicalQuery(pairs), body === "" ? "" : "application/json", body, nowMs, false)
 }
 
+// The export bucket's credentials, from the config.
+function credsOf(cfg: ExportConfig): S3Creds {
+  return { accessKey: cfg.access_key_id, secretKey: cfg.secret_access_key, sessionToken: cfg.session_token, region: regionOf(cfg) }
+}
+
+// A signed S3 request on the export bucket for key, with query pairs. The
+// payload hash is given, so a byte body can be signed without a string.
+function bucketRequest(cfg: ExportConfig, method: string, key: string, pairs: string[][], payloadHash: string, contentType: string, nowMs: number): { url: string, headers: Map<string, string> } {
+  const loc = locate(cfg, key)
+  const query = canonicalQuery(pairs)
+  const headers = signedHeaders(credsOf(cfg), "s3", loc.host, method, loc.path, query, contentType, payloadHash, nowMs, true)
+  return { url: loc.scheme + loc.host + loc.path + (query === "" ? "" : "?" + query), headers: headers }
+}
+
+// A signed PUT of a Parquet file (or any byte body).
+export function putBytesRequest(cfg: ExportConfig, key: string, body: u8[], nowMs: number): ByteRequest {
+  const r = bucketRequest(cfg, "PUT", key, [], toHex(sha256(body)), PARQUET_TYPE, nowMs)
+  return { url: r.url, method: "PUT", headers: r.headers, body: body }
+}
+
+// The content type a body is uploaded with, by format.
+export function contentTypeOf(cfg: ExportConfig): string {
+  return isParquet(cfg) ? PARQUET_TYPE : CONTENT_TYPE
+}
+
+// ---- retention: list the export prefix, delete the days that are too old ----
+
+// The prefix every export key starts with, ending in "/".
+export function listPrefix(cfg: ExportConfig): string {
+  return exportDir(cfg).join("/") + "/"
+}
+
+// ListObjectsV2 for the export prefix, from a continuation token when there is one.
+export function listRequest(cfg: ExportConfig, continuation: string | undefined, nowMs: number): ByteRequest {
+  const pairs: string[][] = [["list-type", "2"], ["prefix", listPrefix(cfg)]]
+  if (continuation !== undefined && continuation !== "") pairs.push(["continuation-token", continuation])
+  const r = bucketRequest(cfg, "GET", "", pairs, UNSIGNED_PAYLOAD_EMPTY, "", nowMs)
+  return { url: r.url, method: "GET", headers: r.headers, body: [] }
+}
+
+// DeleteObject for one key.
+export function deleteRequest(cfg: ExportConfig, key: string, nowMs: number): ByteRequest {
+  const r = bucketRequest(cfg, "DELETE", key, [], UNSIGNED_PAYLOAD_EMPTY, "", nowMs)
+  return { url: r.url, method: "DELETE", headers: r.headers, body: [] }
+}
+
+function unescapeXml(s: string): string {
+  return s.split("&lt;").join("<").split("&gt;").join(">").split("&quot;").join("\"").split("&apos;").join("'").split("&amp;").join("&")
+}
+
+export type Listing = { keys: string[], next: string | undefined }
+
+// The keys in a ListObjectsV2 response, and the continuation token when the
+// listing is truncated. Keys are read from their <Key> elements in order.
+export function parseListing(xml: string): Listing {
+  const keys: string[] = []
+  let rest = xml
+  while (true) {
+    const a = rest.indexOf("<Key>")
+    if (a < 0) break
+    const b = rest.slice(a + 5).indexOf("</Key>")
+    if (b < 0) break
+    keys.push(unescapeXml(rest.slice(a + 5, a + 5 + b)))
+    rest = rest.slice(a + 5 + b + 6)
+  }
+  let next: string | undefined = undefined
+  if (xml.indexOf("<IsTruncated>true</IsTruncated>") >= 0) {
+    const a = xml.indexOf("<NextContinuationToken>")
+    if (a >= 0) {
+      const tail = xml.slice(a + 23)
+      const b = tail.indexOf("</NextContinuationToken>")
+      if (b >= 0) next = unescapeXml(tail.slice(0, b))
+    }
+  }
+  return { keys: keys, next: next }
+}
+
+// Days since 1970-01-01 for a civil date (the inverse of utcDate in exporters.tov).
+function daysFromCivil(y0: int, m: int, d: int): int {
+  const y = m <= 2 ? y0 - 1 : y0
+  const era = Math.floor(y / 400)
+  const yoe = y - era * 400
+  const doy = Math.floor((153 * (m > 2 ? m - 3 : m + 9) + 2) / 5) + d - 1
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+}
+
+// The UTC start of the day an export key belongs to, from its
+// raiju-logs/YYYY/MM/DD/ path. undefined for a key with no such path.
+export function dayOfKey(key: string): f64 | undefined {
+  const at = key.indexOf("raiju-logs/")
+  if (at < 0) return undefined
+  const rest = key.slice(at + 11)
+  if (rest.byteLength < 11) return undefined
+  if (rest.slice(4, 5) !== "/" || rest.slice(7, 8) !== "/" || rest.slice(10, 11) !== "/") return undefined
+  const y = parseInt(rest.slice(0, 4)) ?? 0
+  const m = parseInt(rest.slice(5, 7)) ?? 0
+  const d = parseInt(rest.slice(8, 10)) ?? 0
+  if (y < 1970 || m < 1 || m > 12 || d < 1 || d > 31) return undefined
+  return daysFromCivil(y, m, d) * DAY_MS
+}
+
+// True when the key's day is more than days before the day of nowMs: a day
+// is kept for days days after it ends. Keys outside the export layout are never expired.
+export function expiredKey(key: string, nowMs: number, days: int): bool {
+  const day = dayOfKey(key)
+  if (day === undefined) return false
+  const today = Math.floor(nowMs / DAY_MS) * DAY_MS
+  return day < today - days * DAY_MS
+}
+
 // Tracks the newest exported timestamp (ms). Entries at or before it are
 // never selected again, so the cursor only moves after an upload succeeds.
 export class ExportCursor {
@@ -208,22 +348,31 @@ export class ExportCursor {
     return this.last
   }
 
+  // The indexes of the entries with cursor < ts <= nowMs, with the first and
+  // last of their timestamps. Nothing changes until commit().
+  select(tsOf: number[], nowMs: number): { idx: int[], startMs: number, endMs: number } | undefined {
+    const idx: int[] = []
+    let startMs = 0
+    let endMs = 0
+    for (let i = 0; i < tsOf.length; i++) {
+      const ts = tsOf[i]!
+      if (ts <= this.last || ts > nowMs) continue
+      if (idx.length === 0 || ts < startMs) startMs = ts
+      if (idx.length === 0 || ts > endMs) endMs = ts
+      idx.push(i)
+    }
+    if (idx.length === 0) return undefined
+    return { idx: idx, startMs: startMs, endMs: endMs }
+  }
+
   // The lines with cursor < ts <= nowMs, joined as JSONL. Each entry must be a
   // single line. Nothing changes until commit(). Returns undefined when empty.
   pending(entriesJsonl: string[], tsOf: number[], nowMs: number): { body: string, startMs: number, endMs: number, count: number } | undefined {
-    const lines: string[] = []
-    let startMs = 0
-    let endMs = 0
     const n = Math.min(entriesJsonl.length, tsOf.length)
-    for (let i = 0; i < n; i++) {
-      const ts = tsOf[i]!
-      if (ts <= this.last || ts > nowMs) continue
-      if (lines.length === 0 || ts < startMs) startMs = ts
-      if (lines.length === 0 || ts > endMs) endMs = ts
-      lines.push(entriesJsonl[i]!)
-    }
-    if (lines.length === 0) return undefined
-    return { body: lines.join("\n") + "\n", startMs: startMs, endMs: endMs, count: lines.length }
+    const s = this.select(tsOf.slice(0, n), nowMs)
+    if (s === undefined) return undefined
+    const lines: string[] = s.idx.map((i) => entriesJsonl[i]!)
+    return { body: lines.join("\n") + "\n", startMs: s.startMs, endMs: s.endMs, count: lines.length }
   }
 
   // Call only after the upload of a pending batch succeeded. Never moves back.
@@ -296,6 +445,8 @@ test("object keys", () => {
   expect(objectKey(cfg, T0, T1, "rack/3").endsWith("-rack-3.jsonl")).toBe(true)
   // millisecond padding
   expect(objectKey(cfg, T0 + 7.0, T1, "n").includes("T12:00:00.007Z-")).toBe(true)
+  // the extension follows the format
+  expect(objectKey(cfg, T0, T1, "n", "parquet").endsWith("-n.parquet")).toBe(true)
 })
 
 test("s3 URLs default to virtual-hosted style", () => {
@@ -341,6 +492,65 @@ test("put request signature matches the independent reference", () => {
   expect(auth.endsWith("Signature=b1209c6c1c33e9ab5eeeea4f3c40ef56759779d1b0450553c35ef0ae70b7014a")).toBe(true)
 })
 
+test("parquet put carries the parquet content type and the raw bytes", () => {
+  const body: u8[] = [u8(0x50), u8(0x41), u8(0x52), u8(0x31)]
+  const req = putBytesRequest(s3Cfg({ region: "eu-west-1" }), "k.parquet", body, T1)
+  expect(req.headers.get("content-type")).toBe("application/vnd.apache.parquet")
+  expect(req.body.length).toBe(4)
+  expect(req.headers.get("x-amz-content-sha256")).toBe(toHex(sha256(body)))
+  expect(contentTypeOf(s3Cfg({}))).toBe("application/x-ndjson")
+})
+
+test("canonical query sorts names and encodes values", () => {
+  expect(canonicalQuery([["prefix", "a/b c/"], ["list-type", "2"]])).toBe("list-type=2&prefix=a%2Fb%20c%2F")
+  expect(canonicalQuery([["continuation-token", "x+y"]])).toBe("continuation-token=x%2By")
+})
+
+test("list request: the export prefix, signed GET on the bucket", () => {
+  const req = listRequest(s3Cfg({ region: "eu-west-1", prefix: "/team/" }), undefined, T1)
+  expect(req.method).toBe("GET")
+  expect(req.url).toBe("https://logs.s3.eu-west-1.amazonaws.com/?list-type=2&prefix=team%2Fraiju-logs%2F")
+  expect(req.headers.get("x-amz-content-sha256")).toBe(PAYLOAD_EMPTY)
+  const next = listRequest(s3Cfg({ region: "eu-west-1" }), "tok/1", T1)
+  expect(next.url.includes("continuation-token=tok%2F1")).toBe(true)
+})
+
+test("delete request: a signed DELETE of one key", () => {
+  const req = deleteRequest(s3Cfg({ endpoint: "http://minio.internal:9000" }), "raiju-logs/2026/10/01/a.jsonl", T1)
+  expect(req.method).toBe("DELETE")
+  expect(req.url).toBe("http://minio.internal:9000/logs/raiju-logs/2026/10/01/a.jsonl")
+  expect(req.headers.get("authorization")!.includes("SignedHeaders=host;x-amz-content-sha256;x-amz-date,")).toBe(true)
+})
+
+test("listing: keys in order, continuation only when truncated, entities decoded", () => {
+  const xml = `<?xml version="1.0"?><ListBucketResult><Name>logs</Name><KeyCount>2</KeyCount><IsTruncated>true</IsTruncated>` +
+    `<Contents><Key>raiju-logs/2026/10/01/a&amp;b.jsonl</Key></Contents><Contents><Key>raiju-logs/2026/10/02/c.jsonl</Key></Contents>` +
+    `<NextContinuationToken>t-1</NextContinuationToken></ListBucketResult>`
+  const l = parseListing(xml)
+  expect(l.keys.length).toBe(2)
+  expect(l.keys[0]).toBe("raiju-logs/2026/10/01/a&b.jsonl")
+  expect(l.next).toBe("t-1")
+  const done = parseListing(`<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>x</Key></Contents><NextContinuationToken>z</NextContinuationToken></ListBucketResult>`)
+  expect(done.keys.length).toBe(1)
+  expect(done.next).toBe(undefined)
+  expect(parseListing("<ListBucketResult/>").keys.length).toBe(0)
+})
+
+test("day of a key, and the expiry cut-off", () => {
+  expect(dayOfKey("raiju-logs/2026/10/14/x.jsonl")).toBe(1791936000000.0)
+  expect(dayOfKey("p/raiju-logs/1970/01/01/x")).toBe(0.0)
+  expect(dayOfKey("other/file.txt")).toBe(undefined)
+  expect(dayOfKey("raiju-logs/2026-10-14/x")).toBe(undefined)
+  // now is 2026-10-15 12:00 UTC: with 1 day kept, the 13th goes and the 14th stays
+  const now = 1792065600000.0
+  expect(expiredKey("raiju-logs/2026/10/13/a.jsonl", now, 1)).toBe(true)
+  expect(expiredKey("raiju-logs/2026/10/14/a.jsonl", now, 1)).toBe(false)
+  expect(expiredKey("raiju-logs/2026/10/15/a.jsonl", now, 0)).toBe(false)
+  expect(expiredKey("raiju-logs/2026/10/14/a.jsonl", now, 0)).toBe(true)
+  // keys outside the export layout are never deleted
+  expect(expiredKey("bucket/readme.txt", now, 1)).toBe(false)
+})
+
 test("cursor selects new lines and commits only on request", () => {
   const lines = [`{"ts":100}`, `{"ts":200}`, `{"ts":300}`, `{"ts":400}`]
   const ts = [100.0, 200.0, 300.0, 400.0]
@@ -382,6 +592,17 @@ test("cursor respects its bounds", () => {
   // mismatched lengths use the shorter list
   expect(new ExportCursor().pending(lines, [100.0], 1000.0)!.count).toBe(1)
   expect(new ExportCursor().pending([], [], 1000.0)).toBe(undefined)
+})
+
+test("cursor select returns the indexes, for formats that are not JSONL", () => {
+  const ts = [100.0, 200.0, 900.0]
+  const c = new ExportCursor(100.0)
+  const s = c.select(ts, 500.0)
+  expect(s !== undefined).toBe(true)
+  expect(s!.idx.length).toBe(1)
+  expect(s!.idx[0]!).toBe(1)
+  expect(s!.startMs).toBe(200.0)
+  expect(s!.endMs).toBe(200.0)
 })
 
 test("export interval defaults to 300 seconds", () => {
