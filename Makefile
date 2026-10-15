@@ -1,4 +1,4 @@
-.PHONY: build test unit e2e ui check run bench tov tov-test
+.PHONY: build test unit e2e ui check openapi-check run bench tov tov-test
 
 # Tov's async slab allocator corrupts its free lists once ~30 fetches are in
 # flight (see docs/tov-notes.md); plain malloc avoids it at the same speed.
@@ -19,6 +19,10 @@ build:
 
 check:
 	scripts/check.py src/*.tov src/providers/*.tov tests/*.tov
+
+# the management API spec against the routes a probe gateway serves (needs build/raiju)
+openapi-check: build
+	python3 tests/openapi_check.py build/raiju
 
 unit:
 	$(TOV) test src/main.tov

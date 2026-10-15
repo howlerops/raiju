@@ -238,7 +238,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 
 | ID | Work | Owner | Status |
 |---|---|---|---|
-| L98 | OpenAPI spec for the management API, checked against the routes | worker | assigned |
+| L98 | OpenAPI spec for the management API, checked against the routes | worker | done: docs/openapi/management.yaml (203 operations), `make openapi-check` probes a gateway both ways; found /api/mcp/virtual answering any method (fixed) |
 | L99 | Native client spike (providers list plus live logs) in gpui and Slint; compare | worker | todo (after L98) |
 
 Decision taken by the lead: models without a price stay a warning (cost 0), as in Bifrost;
