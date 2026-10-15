@@ -1,9 +1,9 @@
 // The request engine: governance, cache, the attempt loop (retries, key
 // rotation, fallbacks), translation, accounting.
-import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, providerOf } from "./config"
+import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, providerOf } from "./config"
 import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
-import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI } from "./streams"
+import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
 import { CohereToOpenAI } from "./streams_cohere"
 import { CohereStream } from "./cohere_in"
 import { GenAIStream } from "./genai_in"
@@ -35,7 +35,8 @@ import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns } from "./mcp"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName } from "./mcp"
+import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, buildChain } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
@@ -100,6 +101,30 @@ export class StreamConverter {
   out: StreamState | undefined = undefined
   raw = false
   private pending = ""
+  // custom_provider_config: does_not_send_done_marker without wait_for_usage ends the stream at finish_reason
+  stopAtFinish = false
+  private finished = false
+  private quirkSplit = new SseSplitter()
+
+  private quirkPush(oa: OpenAIPassthrough, text: string): string {
+    let out = ""
+    for (const ev of this.quirkSplit.push(text)) {
+      if (this.finished) continue
+      out += oa.push(`data: ${ev.data}\n\n`)
+      if (finishes(ev.data)) this.finished = true
+    }
+    return out
+  }
+
+  private quirkEnd(oa: OpenAIPassthrough): string {
+    let out = ""
+    for (const ev of this.quirkSplit.flush()) {
+      if (this.finished) continue
+      out += oa.push(`data: ${ev.data}\n\n`)
+      if (finishes(ev.data)) this.finished = true
+    }
+    return out + oa.end()
+  }
 
   asAnthropic(model: string): void {
     this.out = new StreamState(model)
@@ -209,7 +234,7 @@ export class StreamConverter {
     const co = this.co
     if (co !== undefined) return co.push(t)
     const oa = this.oa
-    if (oa !== undefined) return oa.push(t)
+    if (oa !== undefined) return this.stopAtFinish ? this.quirkPush(oa, t) : oa.push(t)
     return ""
   }
 
@@ -223,7 +248,7 @@ export class StreamConverter {
     const co = this.co
     if (co !== undefined) return co.end()
     const oa = this.oa
-    if (oa !== undefined) return oa.end()
+    if (oa !== undefined) return this.stopAtFinish ? this.quirkEnd(oa) : oa.end()
     return ""
   }
 
@@ -477,6 +502,114 @@ function sendBackRaw(h: Hdrs, cfg: Config, p: ProviderConfig, which: string): bo
   return which === "request" ? p.send_back_raw_request === true : p.send_back_raw_response === true
 }
 
+// Bifrost's store_raw_request_response: the provider's setting, which x-bf-store-raw-request-response
+// overrides when client.allow_per_request_content_storage_override is on.
+function storeRawOn(h: Hdrs, cfg: Config, p: ProviderConfig): bool {
+  const hv = (h.get("x-bf-store-raw-request-response") ?? "").trim().toLowerCase()
+  if (cfg.client?.allow_per_request_content_storage_override === true) {
+    if (hv === "true" || hv === "1" || hv === "t") return true
+    if (hv === "false" || hv === "0" || hv === "f") return false
+  }
+  return p.store_raw_request_response === true
+}
+
+// Bifrost's custom_provider_config.allowed_requests: once the map is set, only the request types marked true are served.
+function allowedRequest(p: ProviderConfig, rtype: string): bool {
+  const allowed = p.custom_provider_config?.allowed_requests
+  if (allowed === undefined) return true
+  return allowed.get(rtype) === true
+}
+
+// Whether the stream ends at finish_reason: does_not_send_done_marker without wait_for_usage.
+function quirkStopsAtFinish(t: Target): bool {
+  const c = t.cfg.custom_provider_config
+  return c?.does_not_send_done_marker === true && c?.wait_for_usage !== true
+}
+
+// Whether an OpenAI stream chunk carries a non-null finish_reason.
+function finishes(data: string): bool {
+  if (!data.includes("finish_reason")) return false
+  try {
+    const v = JSON.parse(data) as { choices?: { finish_reason?: string }[] }
+    for (const c of v.choices ?? []) {
+      if ((c.finish_reason ?? "") !== "") return true
+    }
+    return false
+  } catch (e) {
+    return false
+  }
+}
+
+// One limiter per provider that sets concurrency_and_buffer_size (Bifrost's per-provider queue).
+function limitersFor(cfg: Config): Map<string, Limiter> {
+  const out: Map<string, Limiter> = new Map()
+  const ps = cfg.providers
+  if (ps === undefined) return out
+  const drop = cfg.client?.drop_excess_requests === true
+  for (const name of ps.keys()) {
+    const c = ps.get(name)!.concurrency_and_buffer_size
+    if (c === undefined) continue
+    out.set(name, new Limiter(c.concurrency < 1 ? 1 : c.concurrency, c.buffer_size < 1 ? 1 : c.buffer_size, drop))
+  }
+  return out
+}
+
+// The limiters of a reloaded config, keeping the old ones whose settings did not change (their slots stay counted).
+function carryLimiters(next: Map<string, Limiter>, prev: Map<string, Limiter>): Map<string, Limiter> {
+  const out: Map<string, Limiter> = new Map()
+  for (const name of next.keys()) {
+    const n = next.get(name)!
+    const old = prev.get(name)
+    const same = old !== undefined && old.limit === n.limit && old.buffer === n.buffer && old.drop === n.drop
+    out.set(name, same ? old! : n)
+  }
+  return out
+}
+
+// The chat names of every provider's injected tools, which the agent loop may run on their own.
+function injectedNames(cfg: Config): string[] {
+  const out: string[] = []
+  const ps = cfg.providers
+  if (ps === undefined) return out
+  for (const name of ps.keys()) {
+    for (const it of ps.get(name)!.injected_tools ?? []) out.push(it.name)
+  }
+  return out
+}
+
+// The MCP chat name ("<server>-<tool>") behind an injected tool name, or undefined.
+function injectedChatName(cfg: Config, name: string): string | undefined {
+  const ps = cfg.providers
+  if (ps === undefined) return undefined
+  for (const pn of ps.keys()) {
+    for (const it of ps.get(pn)!.injected_tools ?? []) {
+      if (it.name === name) return sanitizeName(`${it.mcp_client_name}-${it.tool_name}`)
+    }
+  }
+  return undefined
+}
+
+// The name of a chat tool definition, or undefined.
+function toolFnName(json: string): string | undefined throws SyntaxError {
+  const fr = find(try fields(json), "function")
+  if (fr === undefined || isNull(fr)) return undefined
+  return rawStr(try fields(fr), "name")
+}
+
+// An MCP tool as a chat tool definition under the injected tool's name, or undefined when the tool is not connected.
+function injectedDef(all: string[], it: InjectedTool): string | undefined throws SyntaxError {
+  const chat = sanitizeName(`${it.mcp_client_name}-${it.tool_name}`)
+  for (const tj of all) {
+    if ((try toolFnName(tj)) !== chat) continue
+    let outer = try fields(tj)
+    let fn = try fields(find(outer, "function") ?? "{}")
+    setField(&fn, "name", quote(it.name))
+    setField(&outer, "function", build(fn))
+    return build(outer)
+  }
+  return undefined
+}
+
 // A captured body as a JSON value, the way Bifrost embeds raw bytes: the body itself when it is JSON, else a JSON string.
 function rawJson(s: string): string {
   return jsonOk(s) ? s.trim() : quote(s)
@@ -563,6 +696,9 @@ class ReqCtx {
   outHeaders: Map<string, string> = new Map()
   // request and response bodies stay out of the logs (content logging is off for this request)
   contentOff = false
+  // the raw upstream request and response, kept for the log store (store_raw_request_response)
+  rawRequest = ""
+  rawResponse = ""
   // Bifrost's metric labels for this request, filled once it is routed and admitted
   labels: metrics.RequestLabels = metrics.newLabels("", "", "")
   constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
@@ -628,6 +764,8 @@ export class Engine {
   // set by the exporters loop: every logged request is queued for each exporter
   exportQueues: ExportQueue[] = []
   guardProviders: GuardrailProvider[] = []
+  // per-provider concurrency and queue (concurrency_and_buffer_size)
+  limiters: Map<string, Limiter> = new Map()
 
   constructor(public cfg: Config) {
     this.gov = new Governance(cfg)
@@ -719,8 +857,9 @@ export class Engine {
     this.autoPromptCache = cfg.prompt_cache?.auto_inject ?? false
     this.logRequests = cfg.client?.enable_logging ?? true
     metrics.setCustomLabels(cfg.client?.prometheus_labels ?? [])
-    // Raiju does not queue requests per provider, so there is no full queue for drop_excess_requests to act on
-    if (cfg.client?.drop_excess_requests === true) console.error("raiju: client.drop_excess_requests has no effect: requests are not queued, so none is dropped")
+    this.limiters = limitersFor(cfg)
+    if (cfg.client?.drop_excess_requests === true && this.limiters.size === 0) console.error("raiju: client.drop_excess_requests has no effect: no provider sets concurrency_and_buffer_size, so no queue is full")
+    if (injectedNames(cfg).length > 0 && (cfg.mcp?.client_configs ?? []).length === 0) console.error("raiju: injected_tools need MCP clients, and none are configured")
     this.guardProviders = cfg.guardrails?.providers ?? []
     const sa = cfg.session_affinity
     if (sa !== undefined && sa.enabled === true) {
@@ -728,7 +867,8 @@ export class Engine {
     }
     const cx = cfg.complexity_router
     if (cx !== undefined && cx.enabled !== false) this.complexity = cx
-    const auto = (cfg.client?.mcp_auto_execute ?? []).concat(autoExecutePatterns(cfg.mcp?.client_configs ?? []))
+    // injected tools run in the agent loop, so they are auto-executed like mcp_auto_execute names
+    const auto = (cfg.client?.mcp_auto_execute ?? []).concat(autoExecutePatterns(cfg.mcp?.client_configs ?? [])).concat(injectedNames(cfg))
     if (auto.length > 0) this.agent = { max_depth: cfg.client?.mcp_agent_depth ?? 10, auto_execute: auto, parallel: true }
   }
 
@@ -798,6 +938,12 @@ export class Engine {
       refIndex += 1
       const tried: Set<int> = new Set()
       const p: ProviderConfig = providerOf(this.cfg, ref.provider) ?? {}
+      // Bifrost's allowed_requests: a request type the provider does not allow is not sent; the next fallback may take it
+      const rtype = requestType(ctx.op, streamed)
+      if (!allowedRequest(p, rtype)) {
+        last = { ok: false, status: 400, body: errorJson(`${rtype} is not supported by ${ref.provider} provider`, "invalid_request_error", "unsupported_operation"), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+        continue
+      }
       const retries = maxRetries(p)
       let retry = 0
       // session affinity: the key that served this session before, tried first
@@ -898,6 +1044,16 @@ export class Engine {
           if (cs.sampled) up.headers.set("traceparent", traceparentFor(cs.traceId, cs.spanId, true))
           child = cs
         }
+        // Bifrost's per-provider queue: a dropped request is answered with a 503 and no upstream call
+        const lim = this.limiters.get(ref.provider)
+        let slot = false
+        if (lim !== undefined) {
+          const got = try await lim.acquire()
+          if (!got) return { ok: false, status: 503, body: errorJson("request dropped: queue is full", "request_dropped", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+          slot = true
+        }
+        const storeRaw = !ctx.contentOff && storeRawOn(h, this.cfg, p)
+        if (storeRaw) ctx.rawRequest = up.body
         const started = performance.now()
         let status = 0
         let text = ""
@@ -967,6 +1123,7 @@ export class Engine {
             return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true }
           }
           text = await res.text()
+          if (storeRaw) ctx.rawResponse = text
           // follow-up calls of a multi-call request (one embedding input per call)
           const more = up.extra
           if (more !== undefined && status >= 200 && status < 300) {
@@ -989,6 +1146,8 @@ export class Engine {
           live?.finish()
           status = 0
           text = errorJson(`${ref.provider} request failed: ${e.message}`, "api_connection_error", undefined)
+        } finally {
+          if (slot && lim !== undefined) lim.release()
         }
         const tookMs = performance.now() - started
         upstreamMs += tookMs
@@ -1076,6 +1235,7 @@ export class Engine {
     this.complexity = fresh.complexity
     this.guardProviders = fresh.guardProviders
     this.agent = fresh.agent
+    this.limiters = carryLimiters(fresh.limiters, this.limiters)
     if (fresh.affinity === undefined) this.affinity = undefined
     else if (this.affinity === undefined) this.affinity = fresh.affinity
     if (this.cache === undefined) this.cache = fresh.cache
@@ -1107,9 +1267,39 @@ export class Engine {
 
   // Adds the connected MCP servers' tools to a chat request. x-bf-mcp-include-clients
   // (comma-separated server names) narrows them; "none" leaves the request alone.
+  // Bifrost's injected_tools: the provider's MCP tools join each chat request it serves, under their configured names.
+  // A client tool with an injected name is replaced. Unchanged when nothing can be injected.
+  withInjected(t: Target, body: Field[]): Field[] throws SyntaxError {
+    const inj = t.cfg.injected_tools ?? []
+    const m = this.mcp
+    if (inj.length === 0 || m === undefined) return body
+    const all = m.allTools()
+    const defs: string[] = []
+    for (const it of inj) {
+      const d = try injectedDef(all, it)
+      if (d !== undefined) defs.push(d)
+    }
+    if (defs.length === 0) return body
+    const names: string[] = inj.map((x) => x.name)
+    const out: string[] = []
+    const existing = find(body, "tools")
+    if (existing !== undefined && !isNull(existing)) {
+      for (const el of try elements(existing)) {
+        const n = try toolFnName(el)
+        if (n === undefined || !names.includes(n)) out.push(el)
+      }
+    }
+    for (const d of defs) out.push(d)
+    let fs = body
+    setField(&fs, "tools", "[" + out.join(",") + "]")
+    return fs
+  }
+
   withMcpTools(text: string, h: Hdrs): string throws SyntaxError {
     const m = this.mcp
     if (m === undefined) return text
+    // Bifrost's client.mcp_disable_auto_tool_inject: tools are added only when the request names its clients
+    if (this.cfg.client?.mcp_disable_auto_tool_inject === true && h.get("x-bf-mcp-include-clients") === undefined) return text
     // a key's access profile may limit the MCP tools it gets; clients it doesn't name
     // count only with allow_by_default
     let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools)
@@ -1630,6 +1820,8 @@ export class Engine {
     }
     if (store !== undefined) {
       store.add({
+        raw_request: c.contentOff || c.rawRequest === "" ? undefined : c.rawRequest,
+        raw_response: c.contentOff || c.rawResponse === "" ? undefined : c.rawResponse,
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
         latency_ms: ms, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, cache_hit: c.cached,
         virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, error: c.error === "" ? undefined : c.error,
@@ -1689,14 +1881,15 @@ export class Engine {
       return { status: r.status, body: try await r.text() }
     }
     const exec = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
+      const real = injectedChatName(this.cfg, name) ?? name
       const t0 = performance.now()
-      const r = try await m.execute(name, args)
-      timedMcp(m, name, t0, r.isError)
-      metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", name, r.isError ? "error" : "success"), 1.0)
+      const r = try await m.execute(real, args)
+      timedMcp(m, real, t0, r.isError)
+      metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", real, r.isError ? "error" : "success"), 1.0)
       return { text: r.text, isError: r.isError }
     }
     try {
-      const r = await runAgent(text, call, exec, ag, m.toolNames())
+      const r = await runAgent(text, call, exec, ag, m.toolNames().concat(injectedNames(this.cfg)))
       // the last model call's headers (request id, cache, attempts), plus the agent's counts
       const out: Record<string, string> = last.h
       if (!out.has("content-type")) out.set("content-type", "application/json")
@@ -1798,20 +1991,22 @@ export class Engine {
     let streamBody = body.slice()
     if (stream) setField(&streamBody, "stream_options", `{"include_usage":true}`)
     const canPipe = stream && sink !== undefined
+    // a provider's own prompt_cache.auto_inject turns the breakpoints on for its requests
+    const autoFor = (t: Target): bool => autoCache || (t.cfg.prompt_cache?.auto_inject ?? false)
     const build: Build = (t) => {
-      if (stream && providers.streamsNatively(t.kind)) return openai.chatRequest(t, streamBody)
+      if (stream && providers.streamsNatively(t.kind)) return openai.chatRequest(t, try this.withInjected(t, streamBody))
       if (stream) {
-        const plain = streamBody.filter((f) => f.key !== "stream" && f.key !== "stream_options")
+        const plain = try this.withInjected(t, streamBody.filter((f) => f.key !== "stream" && f.key !== "stream_options"))
         // with a streaming client, Anthropic, Gemini and Bedrock stream too and are converted as they go
         if (canPipe) {
-          const su = try providers.streamUpstream(t, try typed.get(), plain, autoCache)
+          const su = try providers.streamUpstream(t, try typed.get(), plain, autoFor(t))
           if (su !== undefined) return su
         }
         // otherwise called without streaming and replayed as SSE below
-        return try providers.chatUpstream(t, try typed.get(), plain, autoCache)
+        return try providers.chatUpstream(t, try typed.get(), plain, autoFor(t))
       }
-      if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, body)
-      return try providers.chatUpstream(t, try typed.get(), body, autoCache)
+      if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, try this.withInjected(t, body))
+      return try providers.chatUpstream(t, try typed.get(), try this.withInjected(t, body), autoFor(t))
     }
     const outGuard = this.guardOutput ? guard : undefined
     const pluginRun = run
@@ -1838,7 +2033,9 @@ export class Engine {
     const dropUsage = !wantUsage
     const mk: ConverterFactory = (t, requested) => {
       if (!streamable(t)) return undefined
-      return new StreamConverter(converterKind(t), requested, !dropUsage)
+      const conv = new StreamConverter(converterKind(t), requested, !dropUsage)
+      conv.stopAtFinish = quirkStopsAtFinish(t)
+      return conv
     }
     const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
     // external output guardrails see the whole answer, so they apply to non-streamed answers
@@ -1945,4 +2142,88 @@ test("direct key target: the caller's key replaces the pool", () => {
   expect(sel.t.key.value).toBe("caller-key")
   expect(sel.t.kind).toBe("anthropic")
   expect(sel.keyIndex).toBe(-1)
+})
+
+test("store_raw_request_response: the header overrides the provider setting only when allowed", () => {
+  const p: ProviderConfig = { store_raw_request_response: true }
+  const off: ProviderConfig = {}
+  const allow: Config = { client: { allow_per_request_content_storage_override: true } }
+  const deny: Config = { client: {} }
+  expect(storeRawOn(hdrs([]), deny, p)).toBe(true)
+  expect(storeRawOn(hdrs([["x-bf-store-raw-request-response", "false"]]), deny, p)).toBe(true)
+  expect(storeRawOn(hdrs([["x-bf-store-raw-request-response", "false"]]), allow, p)).toBe(false)
+  expect(storeRawOn(hdrs([["x-bf-store-raw-request-response", "TRUE"]]), allow, off)).toBe(true)
+  expect(storeRawOn(hdrs([]), allow, off)).toBe(false)
+  expect(storeRawOn(hdrs([["x-bf-store-raw-request-response", "maybe"]]), allow, p)).toBe(true)
+})
+
+test("allowed_requests admits only the request types set to true", () => {
+  const m: Map<string, bool> = new Map()
+  m.set("chat_completion", true)
+  m.set("embedding", false)
+  const p: ProviderConfig = { custom_provider_config: { base_provider_type: "openai", allowed_requests: m } }
+  expect(allowedRequest(p, "chat_completion")).toBe(true)
+  expect(allowedRequest(p, "embedding")).toBe(false)
+  expect(allowedRequest(p, "chat_completion_stream")).toBe(false)
+  expect(allowedRequest({}, "embedding")).toBe(true)
+})
+
+test("does_not_send_done_marker without wait_for_usage ends at finish_reason", () => {
+  const stop: Target = { provider: "x", kind: "openai", model: "m", key: { value: "" }, cfg: { custom_provider_config: { base_provider_type: "openai", does_not_send_done_marker: true } } }
+  const wait: Target = { provider: "x", kind: "openai", model: "m", key: { value: "" }, cfg: { custom_provider_config: { base_provider_type: "openai", does_not_send_done_marker: true, wait_for_usage: true } } }
+  expect(quirkStopsAtFinish(stop)).toBe(true)
+  expect(quirkStopsAtFinish(wait)).toBe(false)
+  const enc = new TextEncoder()
+  const conv = new StreamConverter("openai", "openai/m", true)
+  conv.stopAtFinish = true
+  const a = conv.push(enc.encode(`data: {"model":"x","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\ndata: {"model":"x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: {"model":"x","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\n`))
+  const b = conv.end()
+  const all = a + b
+  expect(all.includes(`"content":"hi"`)).toBe(true)
+  expect(all.includes("prompt_tokens")).toBe(false)
+  expect(all.endsWith("data: [DONE]\n\n")).toBe(true)
+  expect(conv.promptTokens()).toBe(0)
+})
+
+test("finishes sees a non-null finish_reason only", () => {
+  expect(finishes(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`)).toBe(true)
+  expect(finishes(`{"choices":[{"delta":{"content":"a"},"finish_reason":null}]}`)).toBe(false)
+  expect(finishes(`{"choices":[],"usage":{"prompt_tokens":1}}`)).toBe(false)
+  expect(finishes("not json finish_reason")).toBe(false)
+})
+
+test("per-provider limiters follow concurrency_and_buffer_size and carry over unchanged", () => {
+  const ps: Map<string, ProviderConfig> = new Map()
+  ps.set("slow", { concurrency_and_buffer_size: { concurrency: 2, buffer_size: 4 } })
+  ps.set("plain", {})
+  const cfg: Config = { providers: ps, client: { drop_excess_requests: true } }
+  const made = limitersFor(cfg)
+  expect(made.size).toBe(1)
+  expect(made.get("slow")!.limit).toBe(2)
+  expect(made.get("slow")!.buffer).toBe(4)
+  expect(made.get("slow")!.drop).toBe(true)
+  const again = limitersFor(cfg)
+  const kept = carryLimiters(again, made)
+  expect(kept.get("slow") === made.get("slow")).toBe(true)
+  const changed: Map<string, ProviderConfig> = new Map()
+  changed.set("slow", { concurrency_and_buffer_size: { concurrency: 3, buffer_size: 4 } })
+  const moved = carryLimiters(limitersFor({ providers: changed }), made)
+  expect(moved.get("slow")!.limit).toBe(3)
+  expect(moved.get("slow") === made.get("slow")).toBe(false)
+})
+
+test("injected tools are named as configured and point at their MCP tool", () => {
+  const all = [`{"type":"function","function":{"name":"weather-get_weather","description":"d","parameters":{"type":"object"}}}`]
+  const it: InjectedTool = { name: "forecast", mcp_client_name: "weather", tool_name: "get_weather" }
+  const def = try injectedDef(all, it)
+  expect(def !== undefined).toBe(true)
+  expect(def!.includes(`"name":"forecast"`)).toBe(true)
+  expect(def!.includes("weather-get_weather")).toBe(false)
+  const missing = try injectedDef(all, { name: "x", mcp_client_name: "nope", tool_name: "y" })
+  expect(missing === undefined).toBe(true)
+  const ps: Map<string, ProviderConfig> = new Map()
+  ps.set("p", { injected_tools: [it] })
+  expect(injectedNames({ providers: ps }).includes("forecast")).toBe(true)
+  expect(injectedChatName({ providers: ps }, "forecast")).toBe("weather-get_weather")
+  expect(injectedChatName({ providers: ps }, "other") === undefined).toBe(true)
 })

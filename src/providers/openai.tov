@@ -73,10 +73,49 @@ export function rerankRequest(t: Target, body: Field[]): Upstream {
   return { url: endpoint(t) + "/rerank", headers: authHeaders(t), body: "{" + out.join(",") + "}" }
 }
 
-function withModel(body: Field[], model: string): string {
+function modelFields(body: Field[], model: string): Field[] {
   let fs = without(body, GATEWAY_FIELDS)
   setField(&fs, "model", quote(model))
-  return build(fs)
+  return fs
+}
+
+function withModel(body: Field[], model: string): string {
+  return build(modelFields(body, model))
+}
+
+// Bifrost's custom_provider_config.request_path_overrides: the path that replaces the default
+// for one request type, from the provider's config. An absolute URL is used as it is.
+function pathOverride(t: Target, requestType: string): string | undefined {
+  const overrides = t.cfg.custom_provider_config?.request_path_overrides
+  if (overrides === undefined) return undefined
+  const raw = overrides.get(requestType)
+  if (raw === undefined) return undefined
+  const path = raw.trim()
+  if (path === "") return undefined
+  if (path.startsWith("http://") || path.startsWith("https://")) return path
+  const dflt: string = ENDPOINTS.get(t.kind)?.base ?? "https://api.openai.com"
+  const base: string = trimSlash(t.cfg.network_config?.base_url ?? dflt)
+  return base + (path.startsWith("/") ? path : "/" + path)
+}
+
+// The upstream URL for a request type: the override when one is configured, else the default.
+function urlFor(t: Target, requestType: string, dflt: string): string {
+  const o = pathOverride(t, requestType)
+  if (o === undefined) return dflt
+  return o
+}
+
+// Bifrost's openai_config.disable_store: stored responses are turned off, so store is forced to false.
+function disablesStore(t: Target): bool {
+  const v: bool = t.cfg.openai_config?.disable_store ?? false
+  return v
+}
+
+function storeOff(body: Field[], t: Target): Field[] {
+  if (!disablesStore(t)) return body
+  let fs = body
+  setField(&fs, "store", "false")
+  return fs
 }
 
 function azureUrl(t: Target, op: string): string {
@@ -99,25 +138,25 @@ function azureHeaders(t: Target): Map<string, string> {
 
 export function chatRequest(t: Target, body: Field[]): Upstream {
   if (t.kind === "azure") return { url: azureUrl(t, "chat/completions"), headers: azureHeaders(t), body: withModel(body, t.model) }
-  return { url: endpoint(t) + "/chat/completions", headers: authHeaders(t), body: withModel(body, t.model) }
+  return { url: urlFor(t, "chat_completion", endpoint(t) + "/chat/completions"), headers: authHeaders(t), body: build(storeOff(modelFields(body, t.model), t)) }
 }
 
 export function embeddingsRequest(t: Target, body: Field[]): Upstream {
   if (t.kind === "azure") return { url: azureUrl(t, "embeddings"), headers: azureHeaders(t), body: withModel(body, t.model) }
-  return { url: endpoint(t) + "/embeddings", headers: authHeaders(t), body: withModel(body, t.model) }
+  return { url: urlFor(t, "embedding", endpoint(t) + "/embeddings"), headers: authHeaders(t), body: withModel(body, t.model) }
 }
 
 export function completionsRequest(t: Target, body: Field[]): Upstream {
   if (t.kind === "azure") return { url: azureUrl(t, "completions"), headers: azureHeaders(t), body: withModel(body, t.model) }
-  return { url: endpoint(t) + "/completions", headers: authHeaders(t), body: withModel(body, t.model) }
+  return { url: urlFor(t, "text_completion", endpoint(t) + "/completions"), headers: authHeaders(t), body: withModel(body, t.model) }
 }
 
 export function responsesRequest(t: Target, body: Field[]): Upstream {
-  return { url: endpoint(t) + "/responses", headers: authHeaders(t), body: withModel(body, t.model) }
+  return { url: urlFor(t, "responses", endpoint(t) + "/responses"), headers: authHeaders(t), body: build(storeOff(modelFields(body, t.model), t)) }
 }
 
 export function modelsRequest(t: Target): Upstream {
-  return { url: endpoint(t) + "/models", headers: authHeaders(t), body: "" }
+  return { url: urlFor(t, "list_models", endpoint(t) + "/models"), headers: authHeaders(t), body: "" }
 }
 
 // Reports the model as the caller asked for it ("openai/gpt-4o") and reads usage.
@@ -188,6 +227,19 @@ test("rewrites model and strips gateway fields", () => {
   expect(up.url).toBe("https://api.groq.com/openai/v1/chat/completions")
   expect(up.body).toBe('{"model":"llama-3.3-70b","messages":[]}')
   expect(up.headers.get("authorization")).toBe("Bearer gk")
+})
+
+test("path overrides and disable_store", () => {
+  const cp: Map<string, string> = new Map()
+  cp.set("chat_completion", "/custom/chat")
+  cp.set("embedding", "https://emb.example/v9/embed")
+  const t: Target = { provider: "gw", kind: "openai", model: "m", key: { value: "k" }, cfg: { network_config: { base_url: "http://up:9000/" }, custom_provider_config: { base_provider_type: "openai", request_path_overrides: cp } } }
+  expect(chatRequest(t, []).url).toBe("http://up:9000/custom/chat")
+  expect(embeddingsRequest(t, []).url).toBe("https://emb.example/v9/embed")
+  expect(completionsRequest(t, []).url).toBe("http://up:9000/v1/completions")
+  const off: Target = { provider: "openai", kind: "openai", model: "gpt-4o", key: { value: "k" }, cfg: { openai_config: { disable_store: true } } }
+  expect(chatRequest(off, try fields(`{"model":"x","store":true,"messages":[]}`)).body).toBe(`{"model":"gpt-4o","store":false,"messages":[]}`)
+  expect(chatRequest({ provider: "openai", kind: "openai", model: "gpt-4o", key: { value: "k" }, cfg: {} }, try fields(`{"store":true}`)).body).toBe(`{"store":true,"model":"gpt-4o"}`)
 })
 
 test("base_url override and azure deployments", () => {

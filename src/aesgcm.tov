@@ -1,0 +1,299 @@
+// AES-256 in GCM mode (FIPS 197, NIST SP 800-38D) and PBKDF2-HMAC-SHA256 (RFC 8018), for
+// encrypting saved config secrets. Written in Tov: the runtime has no AES cipher. Bytes are
+// kept in int arrays while they are worked on.
+import { hmacSha256, utf8 } from "./crypto"
+
+// The S-box, computed from the multiplicative inverse in GF(2^8) and the affine map (FIPS 197 5.1.1).
+function makeSbox(): int[] {
+  const box: int[] = []
+  for (let i = 0; i < 256; i++) box.push(0)
+  let p = 1
+  let q = 1
+  while (true) {
+    // p runs over all non-zero field elements; q is p's inverse
+    p = (p ^ ((p << 1) & 0xff) ^ ((p & 0x80) !== 0 ? 0x1b : 0)) & 0xff
+    q ^= (q << 1) & 0xff
+    q ^= (q << 2) & 0xff
+    q ^= (q << 4) & 0xff
+    if ((q & 0x80) !== 0) q ^= 0x09
+    q &= 0xff
+    const x = q ^ rotl8(q, 1) ^ rotl8(q, 2) ^ rotl8(q, 3) ^ rotl8(q, 4)
+    box[p] = (x ^ 0x63) & 0xff
+    if (p === 1) break
+  }
+  box[0] = 0x63
+  return box
+}
+
+function rotl8(x: int, n: int): int {
+  return ((x << n) | (x >> (8 - n))) & 0xff
+}
+
+const SBOX: int[] = makeSbox()
+
+function xtime(x: int): int {
+  return ((x << 1) ^ ((x & 0x80) !== 0 ? 0x1b : 0)) & 0xff
+}
+
+// The expanded key schedule for a 32-byte key: 15 round keys of 16 bytes each.
+function expandKey(key: int[]): int[] {
+  const nk = 8
+  const rounds = 14
+  const w: int[] = []
+  for (let i = 0; i < 4 * (rounds + 1) * 4; i++) w.push(0)
+  for (let i = 0; i < 32; i++) w[i] = key[i]!
+  let rcon = 1
+  for (let i = nk; i < 4 * (rounds + 1); i++) {
+    let t0 = w[(i - 1) * 4]!
+    let t1 = w[(i - 1) * 4 + 1]!
+    let t2 = w[(i - 1) * 4 + 2]!
+    let t3 = w[(i - 1) * 4 + 3]!
+    if (i % nk === 0) {
+      // RotWord, SubWord, then the round constant
+      const s0 = SBOX[t1]! ^ rcon
+      const s1 = SBOX[t2]!
+      const s2 = SBOX[t3]!
+      const s3 = SBOX[t0]!
+      t0 = s0
+      t1 = s1
+      t2 = s2
+      t3 = s3
+      rcon = xtime(rcon)
+    } else if (i % nk === 4) {
+      t0 = SBOX[t0]!
+      t1 = SBOX[t1]!
+      t2 = SBOX[t2]!
+      t3 = SBOX[t3]!
+    }
+    w[i * 4] = w[(i - nk) * 4]! ^ t0
+    w[i * 4 + 1] = w[(i - nk) * 4 + 1]! ^ t1
+    w[i * 4 + 2] = w[(i - nk) * 4 + 2]! ^ t2
+    w[i * 4 + 3] = w[(i - nk) * 4 + 3]! ^ t3
+  }
+  return w
+}
+
+// Encrypts one 16-byte block with the expanded key.
+function encryptBlock(w: int[], input: int[]): int[] {
+  const rounds = 14
+  let s: int[] = []
+  for (let i = 0; i < 16; i++) s.push(input[i]! ^ w[i]!)
+  for (let r = 1; r <= rounds; r++) {
+    // SubBytes and ShiftRows, on the column-major state
+    const t: int[] = []
+    for (let c = 0; c < 4; c++) {
+      for (let row = 0; row < 4; row++) {
+        t.push(SBOX[s[((c + row) % 4) * 4 + row]!]!)
+      }
+    }
+    // MixColumns, except in the last round
+    if (r !== rounds) {
+      const m: int[] = []
+      for (let c = 0; c < 4; c++) {
+        const a0 = t[c * 4]!
+        const a1 = t[c * 4 + 1]!
+        const a2 = t[c * 4 + 2]!
+        const a3 = t[c * 4 + 3]!
+        m.push(xtime(a0) ^ (xtime(a1) ^ a1) ^ a2 ^ a3)
+        m.push(a0 ^ xtime(a1) ^ (xtime(a2) ^ a2) ^ a3)
+        m.push(a0 ^ a1 ^ xtime(a2) ^ (xtime(a3) ^ a3))
+        m.push((xtime(a0) ^ a0) ^ a1 ^ a2 ^ xtime(a3))
+      }
+      s = m
+    } else {
+      s = t
+    }
+    for (let i = 0; i < 16; i++) s[i] = s[i]! ^ w[r * 16 + i]!
+  }
+  return s
+}
+
+// Multiplication in GF(2^128) with GCM's bit order (NIST SP 800-38D, Algorithm 1).
+function gmul(x: int[], y: int[]): int[] {
+  let z: int[] = []
+  for (let i = 0; i < 16; i++) z.push(0)
+  let v = y.slice()
+  for (let i = 0; i < 128; i++) {
+    if (((x[i >> 3]! >> (7 - (i & 7))) & 1) === 1) {
+      for (let j = 0; j < 16; j++) z[j] = z[j]! ^ v[j]!
+    }
+    const lsb = v[15]! & 1
+    for (let j = 15; j > 0; j--) v[j] = ((v[j]! >> 1) | ((v[j - 1]! & 1) << 7)) & 0xff
+    v[0] = v[0]! >> 1
+    if (lsb === 1) v[0] = v[0]! ^ 0xe1
+  }
+  return z
+}
+
+// GHASH over the padded AAD and ciphertext, then the lengths in bits.
+function ghash(h: int[], aad: int[], ct: int[]): int[] {
+  let y: int[] = []
+  for (let i = 0; i < 16; i++) y.push(0)
+  const blocks = (data: int[]): void => {
+    for (let off = 0; off < data.length; off += 16) {
+      const blk: int[] = []
+      for (let i = 0; i < 16; i++) blk.push(off + i < data.length ? data[off + i]! : 0)
+      for (let i = 0; i < 16; i++) y[i] = y[i]! ^ blk[i]!
+      y = gmul(y, h)
+    }
+  }
+  blocks(aad)
+  blocks(ct)
+  const len: int[] = []
+  const abits = aad.length * 8
+  const cbits = ct.length * 8
+  for (let i = 0; i < 8; i++) len.push(i < 4 ? 0 : (abits >> ((7 - i) * 8)) & 0xff)
+  for (let i = 0; i < 8; i++) len.push(i < 4 ? 0 : (cbits >> ((7 - i) * 8)) & 0xff)
+  for (let i = 0; i < 16; i++) y[i] = y[i]! ^ len[i]!
+  return gmul(y, h)
+}
+
+// Increments the last 32 bits of a counter block, big-endian.
+function inc32(cb: int[]): int[] {
+  const out = cb.slice()
+  for (let i = 15; i >= 12; i--) {
+    out[i] = (out[i]! + 1) & 0xff
+    if (out[i] !== 0) break
+  }
+  return out
+}
+
+function toInts(b: u8[]): int[] {
+  const out: int[] = []
+  for (const x of b) out.push(int(x))
+  return out
+}
+
+function toBytes(b: int[]): u8[] {
+  const out: u8[] = []
+  for (const x of b) out.push(u8(x))
+  return out
+}
+
+// AES-256-GCM: a 32-byte key and a 12-byte nonce. Returns the ciphertext with its 16-byte tag appended.
+export function gcmSeal(key: u8[], nonce: u8[], plain: u8[], aad: u8[]): u8[] {
+  const w = expandKey(toInts(key))
+  const h = encryptBlock(w, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  const j0 = toInts(nonce).concat([0, 0, 0, 1])
+  const p = toInts(plain)
+  const ct: int[] = []
+  let ctr = inc32(j0)
+  for (let off = 0; off < p.length; off += 16) {
+    const ks = encryptBlock(w, ctr)
+    for (let i = 0; i < 16 && off + i < p.length; i++) ct.push(p[off + i]! ^ ks[i]!)
+    ctr = inc32(ctr)
+  }
+  const s = ghash(h, toInts(aad), ct)
+  const ek = encryptBlock(w, j0)
+  const tag: int[] = []
+  for (let i = 0; i < 16; i++) tag.push(s[i]! ^ ek[i]!)
+  return toBytes(ct.concat(tag))
+}
+
+// The plaintext, or undefined when the tag does not match (wrong key, or the data was changed).
+export function gcmOpen(key: u8[], nonce: u8[], sealed: u8[], aad: u8[]): u8[] | undefined {
+  if (sealed.length < 16) return undefined
+  const all = toInts(sealed)
+  const ct = all.slice(0, all.length - 16)
+  const tag = all.slice(all.length - 16)
+  const w = expandKey(toInts(key))
+  const h = encryptBlock(w, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  const j0 = toInts(nonce).concat([0, 0, 0, 1])
+  const s = ghash(h, toInts(aad), ct)
+  const ek = encryptBlock(w, j0)
+  // constant-time comparison of the tag
+  let diff = 0
+  for (let i = 0; i < 16; i++) diff = diff | ((s[i]! ^ ek[i]!) ^ tag[i]!)
+  if (diff !== 0) return undefined
+  const out: int[] = []
+  let ctr = inc32(j0)
+  for (let off = 0; off < ct.length; off += 16) {
+    const ks = encryptBlock(w, ctr)
+    for (let i = 0; i < 16 && off + i < ct.length; i++) out.push(ct[off + i]! ^ ks[i]!)
+    ctr = inc32(ctr)
+  }
+  return toBytes(out)
+}
+
+// PBKDF2 with HMAC-SHA256: dkLen bytes from a password, a salt and an iteration count.
+export function pbkdf2Sha256(password: u8[], salt: u8[], iterations: int, dkLen: int): u8[] {
+  const out: u8[] = []
+  let block = 1
+  while (out.length < dkLen) {
+    const idx: u8[] = [u8((block >> 24) & 0xff), u8((block >> 16) & 0xff), u8((block >> 8) & 0xff), u8(block & 0xff)]
+    let u = hmacSha256(password, salt.concat(idx))
+    const t = toInts(u)
+    for (let i = 1; i < iterations; i++) {
+      u = hmacSha256(password, u)
+      const ui = toInts(u)
+      for (let j = 0; j < 32; j++) t[j] = t[j]! ^ ui[j]!
+    }
+    for (const x of t) out.push(u8(x))
+    block += 1
+  }
+  return out.slice(0, dkLen)
+}
+
+const HEXD = "0123456789abcdef"
+
+function hexBytes(s: string): u8[] {
+  const out: u8[] = []
+  for (let i = 0; i + 1 < s.byteLength; i += 2) {
+    const hi = HEXD.indexOf(s.slice(i, i + 1))
+    const lo = HEXD.indexOf(s.slice(i + 1, i + 2))
+    out.push(u8(hi * 16 + lo))
+  }
+  return out
+}
+
+function hexOf(b: u8[]): string {
+  let out = ""
+  for (const x of b) {
+    const v = int(x)
+    out += HEXD.slice(v >> 4, (v >> 4) + 1) + HEXD.slice(v & 15, (v & 15) + 1)
+  }
+  return out
+}
+
+test("aes-256 block matches FIPS 197 C.3", () => {
+  const key: int[] = []
+  for (let i = 0; i < 32; i++) key.push(i)
+  const w = expandKey(key)
+  const out = encryptBlock(w, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+  expect(hexOf(toBytes(out))).toBe("8ea2b7ca516745bfeafc49904b496089")
+  expect(SBOX[0]).toBe(0x63)
+  expect(SBOX[0x53]).toBe(0xed)
+})
+
+test("gcm matches the NIST AES-256 test vectors", () => {
+  // NIST SP 800-38D test case 13: zero key, 12-byte zero nonce, empty plaintext
+  const k0 = hexBytes("0000000000000000000000000000000000000000000000000000000000000000")
+  const n0 = hexBytes("000000000000000000000000")
+  expect(hexOf(gcmSeal(k0, n0, [], []))).toBe("530f8afbc74536b9a963b4f1c4cb738b")
+  // test case 14: zero key, one zero block
+  const t14 = gcmSeal(k0, n0, hexBytes("00000000000000000000000000000000"), [])
+  expect(hexOf(t14)).toBe("cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919")
+  const back = gcmOpen(k0, n0, t14, [])
+  expect(hexOf(back!)).toBe("00000000000000000000000000000000")
+})
+
+test("gcm rejects a wrong key, a changed byte and a changed AAD", () => {
+  const k = hexBytes("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308")
+  const n = hexBytes("cafebabefacedbaddecaf888")
+  const aad = utf8("ctx")
+  const sealed = gcmSeal(k, n, utf8("secret"), aad)
+  expect(hexOf(gcmOpen(k, n, sealed, aad)!)).toBe(hexOf(utf8("secret")))
+  const bad = k.slice()
+  bad[0] = u8(int(bad[0]!) ^ 1)
+  expect(gcmOpen(bad, n, sealed, aad) === undefined).toBe(true)
+  const flip = sealed.slice()
+  flip[2] = u8(int(flip[2]!) ^ 0x40)
+  expect(gcmOpen(k, n, flip, aad) === undefined).toBe(true)
+  expect(gcmOpen(k, n, sealed, utf8("other")) === undefined).toBe(true)
+})
+
+test("pbkdf2-hmac-sha256 matches RFC 7914 vectors", () => {
+  // RFC 7914 section 11: P="passwd", S="salt", c=1, dkLen=64 (first 32 bytes checked)
+  const d = pbkdf2Sha256(utf8("passwd"), utf8("salt"), 1, 32)
+  expect(hexOf(d)).toBe("55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc")
+})

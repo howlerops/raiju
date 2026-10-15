@@ -3,7 +3,7 @@
 
 Usage: tests/e2e.py  (builds both binaries into ./build first)
 """
-import base64, json, os, struct, subprocess, sys, time, urllib.request, urllib.error, urllib.parse, zlib
+import base64, json, os, struct, subprocess, sys, threading, time, urllib.request, urllib.error, urllib.parse, zlib
 
 B64 = base64  # main() imports base64 locally, which would shadow this module
 
@@ -130,10 +130,15 @@ def eventstream(data: bytes):
         i += total
     return out
 
+def background(x):
+    """Requests other gateways send on their own schedule: MCP handshakes and tool listings."""
+    return x["path"].startswith("/mcp") and any(m in x.get("body", "") for m in ('"tools/list"', '"initialize"', '"notifications/'))
+
 def seen(traces=False):
-    """What the mock received; trace exports arrive asynchronously, so they're left out unless asked for."""
+    """What the mock received; trace exports and background MCP listings arrive asynchronously,
+    so they're left out unless asked for."""
     got = json.loads(call("GET", "/_seen", base=MOCK)[2])
-    return [x for x in got if traces or x["path"] != "/v1/traces"]
+    return [x for x in got if traces or (x["path"] != "/v1/traces" and not background(x))]
 
 FAILS = []
 
@@ -215,6 +220,22 @@ def write_config():
     ]:
         sc = {"provider": "openai", "embedding_model": "text-embedding-3-small", "threshold": 0.95, "ttl": "5m", "vector_store_namespace": ns, **plugin}
         json.dump({**vbase, "plugins": [{"name": "semanticcache", "enabled": True, "config": sc}], "vector_store": vs}, open(os.path.join(BUILD, f"e2e.vs-{name}.json"), "w"))
+    # Bifrost's per-provider queue (one slot, one waiting request, shed past that), injected MCP tools, request path
+    # overrides, allowed_requests, disable_store and raw-payload storage. "queued" streams from the mock's slow route.
+    l80 = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "allow_per_request_content_storage_override": True, "drop_excess_requests": True, "mcp_disable_auto_tool_inject": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l80-logs")},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "mcp": {**cfg["mcp"], "client_configs": [c for c in cfg["mcp"]["client_configs"] if c["name"] == "weather"]},
+        "providers": {
+            "queued": {"keys": [{"name": "q", "value": "sk-queued", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": "http://127.0.0.1:18100", "max_retries": 0}, "concurrency_and_buffer_size": {"concurrency": 1, "buffer_size": 1}},
+            "inj": {"keys": [{"name": "i", "value": "sk-inj", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "injected_tools": [{"name": "weather-get_weather", "mcp_client_name": "weather", "tool_name": "get_weather"}]},
+            "pathov": {"keys": [{"name": "p", "value": "sk-path", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "custom_provider_config": {"base_provider_type": "openai", "request_path_overrides": {"chat_completion": "/pt/override-chat"}}},
+            "gated": {"keys": [{"name": "g", "value": "sk-gated", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "custom_provider_config": {"base_provider_type": "openai", "allowed_requests": {"embedding": True}}},
+            "nostore": {"keys": [{"name": "n", "value": "sk-nostore", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "openai_config": {"disable_store": True}},
+        },
+    }
+    json.dump(l80, open(os.path.join(BUILD, "e2e.l80.json"), "w"))
     return path
 
 def make_tls():
@@ -507,6 +528,7 @@ def main():
     shutil.rmtree(os.path.join(ROOT, "build/e2e-audit"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-wlogs"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-chromem"), ignore_errors=True)
+    shutil.rmtree(os.path.join(ROOT, "build/e2e-l80-logs"), ignore_errors=True)
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     qdrant = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/qdrant_mock.py"), "18089"])
@@ -539,6 +561,12 @@ def main():
                     "batch_size": 1, "flush_ms": 100, "metrics_enabled": True, "metrics_endpoint": f"127.0.0.1:{GRPC_COLLECTOR_PORT}", "metrics_push_interval": 1}
     json.dump(gcfg, open(os.path.join(BUILD, "e2e.grpc.json"), "w"))
     gw_g = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18116", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.grpc.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.grpc.log"), "w"))
+    # encryption at rest: its own file, which the store seals on the first save
+    enc_cfg = os.path.join(BUILD, "e2e.encrypt.json")
+    json.dump({"encryption_key": "e2e-passphrase-0123456789", "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+               "providers": {"openai": {"keys": [{"name": "e", "value": "sk-sealed-e2e-777", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}}, open(enc_cfg, "w"))
+    gw_l = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18101", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.l80.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.l80.log"), "w"))
+    gw_enc = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18102", "-host", "127.0.0.1", "-config", enc_cfg], env=env, stderr=open(os.path.join(BUILD, "e2e.encrypt.log"), "w"))
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
 
@@ -1553,7 +1581,7 @@ def main():
         s2, _, b2 = bchat("openai/custom-model", BK)
         check("pricing_overrides price an unknown model, so its budget runs down", s1 == 200 and s2 == 402, (s1, s2, b2))
         log = open(os.path.join(BUILD, "e2e.bifrost.log")).read()
-        check("unknown config keys are reported at startup", 'unknown key "server" is ignored' in log, log[:600])
+        check("unknown config keys are reported at startup", 'config: "server" is not used' in log, log[:600])
 
         # Bifrost's x-bifrost-* response headers
         _, h, _ = chat("openai/gpt-4o-mini", seed=1400, headers={"x-bf-mcp-include-clients": "none"})
@@ -1920,11 +1948,82 @@ def main():
         check("passthrough needs a virtual key when inference auth is enforced", s == 401, (s, b))
         s, _, b = call("POST", "/openai_passthrough/pt/echo", {}, headers={"x-bf-vk": "sk-bf-dialect"}, base=GW_BF)
         check("passthrough with a virtual key goes through", s == 200 and seen()[-1]["auth"] == "Bearer sk-from-env", (s, b))
+
+        # Bifrost keys with no Raiju counterpart are named at startup, not dropped silently
+        blog = open(os.path.join(BUILD, "e2e.bifrost.log")).read()
+        check("Bifrost sections Raiju does not use are noted at startup", 'config: "server" is not used' in blog, blog[:300])
+
+        # ---- L80: per-provider queue, injected tools, path overrides, allowed requests, disable_store, raw storage ----
+        GW_L = "http://127.0.0.1:18101"
+        GW_E = "http://127.0.0.1:18102"
+        wait(GW_L + "/health")
+        msg = [{"role": "user", "content": "hello"}]
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "nostore/gpt-4o", "messages": msg, "store": True}, base=GW_L)
+        check("openai_config.disable_store forces store to false", s == 200 and json.loads(seen()[-1]["body"]).get("store") is False, (s, b, seen()[-1:]))
+
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "pathov/gpt-4o", "messages": msg}, base=GW_L)
+        check("request_path_overrides sends chat to the configured path", s == 200 and seen()[-1]["path"] == "/pt/override-chat", (s, b, seen()[-1:]))
+
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "gated/gpt-4o", "messages": msg}, base=GW_L)
+        err = json.loads(b).get("error", {}) if s == 400 else {}
+        check("allowed_requests refuses a request type that is not allowed", s == 400 and err.get("code") == "unsupported_operation" and "chat_completion is not supported by gated provider" in err.get("message", ""), (s, b))
+
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "inj/agent-x", "messages": [{"role": "user", "content": "weather in Oslo?"}]}, {"x-bf-mcp-include-clients": "none"}, base=GW_L)
+        calls = [x for x in seen() if x["path"] == "/v1/chat/completions"][-2:]
+        r = json.loads(b) if s == 200 else {}
+        check("injected tools reach the provider and run in the gateway", s == 200 and r.get("choices", [{}])[0].get("message", {}).get("content") == "It is sunny in Oslo" and {k.lower(): v for k, v in h.items()}.get("x-bf-agent-tool-calls") == "1"
+              and '"name":"weather-get_weather"' in calls[0]["body"] and '"role":"tool"' in calls[1]["body"], (s, b, [c["body"][:200] for c in calls]))
+
+        results = []
+        def queued(i):
+            results.append(call("POST", "/v1/chat/completions", {"model": "queued/slow-x", "stream": True, "messages": msg}, base=GW_L)[0])
+        threads = []
+        for i in range(3):
+            t = threading.Thread(target=queued, args=(i,))
+            t.start()
+            threads.append(t)
+            time.sleep(0.15)
+        for t in threads:
+            t.join()
+        check("concurrency_and_buffer_size runs one, queues one and sheds the rest", sorted(results) == [200, 200, 503], results)
+
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "nostore/gpt-4o", "messages": [{"role": "user", "content": "tools-probe-7733"}]}, base=GW_L)
+        sent = [x for x in seen() if "tools-probe-7733" in x["body"]]
+        check("client.mcp_disable_auto_tool_inject leaves MCP tools out of a request that names no clients", s == 200 and len(sent) == 1 and "weather-get_weather" not in sent[0]["body"], (s, b, sent[:1]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "nostore/gpt-4o", "messages": [{"role": "user", "content": "tools-probe-7734"}]}, {"x-bf-mcp-include-clients": "weather"}, base=GW_L)
+        sent = [x for x in seen() if "tools-probe-7734" in x["body"]]
+        check("a request that names a client still gets its MCP tools", s == 200 and len(sent) == 1 and "weather-get_weather" in sent[0]["body"], (s, b, sent[:1]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "nostore/gpt-4o", "messages": [{"role": "user", "content": "raw-probe-7731"}]}, {"x-bf-store-raw-request-response": "true"}, base=GW_L)
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L)[2])["entries"]
+        mine = [e for e in entries if "raw-probe-7731" in (e.get("raw_request") or "")]
+        check("x-bf-store-raw-request-response keeps the raw request and response in the log", s == 200 and len(mine) == 1 and "Hello from" in (mine[0].get("raw_response") or ""), (s, b, mine[:1]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "nostore/gpt-4o", "messages": [{"role": "user", "content": "raw-probe-off-7732"}]}, base=GW_L)
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L)[2])["entries"]
+        raw_entries = [e for e in entries if e.get("raw_request") or e.get("raw_response")]
+        check("without the header a request's raw payloads are not logged", s == 200 and len(raw_entries) == 1 and "raw-probe-7731" in raw_entries[0].get("raw_request", ""), (s, raw_entries[:1]))
+
+        # encryption at rest: the saved file seals the secrets, the keys still reach the provider, and a wrong key stops the start
+        wait(GW_E + "/health")
+        s, _, b = call("PUT", "/api/providers/sealed2", {"keys": [{"name": "s2", "value": "sk-sealed-e2e-888", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}}, base=GW_E)
+        sealed_text = open(enc_cfg).read()
+        check("encryption_key seals provider key values in the saved file", s == 200 and "sk-sealed-e2e-777" not in sealed_text and "sk-sealed-e2e-888" not in sealed_text and "enc:v1:" in sealed_text, (s, b, sealed_text[:300]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o", "messages": msg}, base=GW_E)
+        check("sealed keys still reach the provider after a save", s == 200 and seen()[-1]["auth"] == "Bearer sk-sealed-e2e-777", (s, b, seen()[-1:]))
+        wrong = json.loads(sealed_text)
+        wrong["encryption_key"] = "a different passphrase entirely"
+        wrong_path = os.path.join(BUILD, "e2e.encrypt-wrong.json")
+        json.dump(wrong, open(wrong_path, "w"))
+        try:
+            p = subprocess.run([os.path.join(BUILD, "raiju"), "-port", "18102", "-host", "127.0.0.1", "-config", wrong_path], env=env, capture_output=True, timeout=30)
+            check("a wrong encryption_key stops the start", p.returncode == 1 and b"cannot be opened" in p.stderr, (p.returncode, p.stderr[-300:]))
+        except subprocess.TimeoutExpired:
+            check("a wrong encryption_key stops the start", False, "the gateway kept running")
         # cluster discovery and the identity-aware proxies (their own gateways and mocks)
         discovery_and_proxy()
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
+        gw_l.terminate(); gw_enc.terminate()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 

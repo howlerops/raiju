@@ -1,0 +1,94 @@
+// Per-provider concurrency and queue (Bifrost's concurrency_and_buffer_size). At most `limit`
+// upstream calls run at once and up to `buffer` more wait for a slot. When the queue is full and
+// client.drop_excess_requests is on, the request is shed at once with a 503; otherwise it waits.
+// Counts are per process: with several workers, each one has its own limit.
+
+export class Limiter {
+  active: int = 0
+  waiting: (() => void)[] = []
+
+  constructor(readonly limit: int, readonly buffer: int, readonly drop: bool) {}
+
+  // "ok" takes a slot now, "wait" means queue with wait(), "drop" sheds the request.
+  admit(): string {
+    if (this.active < this.limit) {
+      this.active += 1
+      return "ok"
+    }
+    if (this.drop && this.waiting.length >= this.buffer) return "drop"
+    return "wait"
+  }
+
+  // Queues for a slot and resolves when one is handed over. Call after admit() said "wait".
+  async wait(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.waiting.push(() => resolve())
+    })
+  }
+
+  // admit() and wait() together: false when the request is dropped.
+  async acquire(): Promise<bool> {
+    const d = this.admit()
+    if (d === "ok") return true
+    if (d === "drop") return false
+    await this.wait()
+    return true
+  }
+
+  // Gives the slot back. A queued request takes it over; otherwise the count goes down.
+  release(): void {
+    if (this.waiting.length > 0) {
+      const next = this.waiting[0]!
+      this.waiting = this.waiting.slice(1)
+      next()
+      return
+    }
+    if (this.active > 0) this.active -= 1
+  }
+
+  inFlight(): int {
+    return this.active
+  }
+
+  queued(): int {
+    return this.waiting.length
+  }
+}
+
+test("limiter admits up to the limit, then queues", () => {
+  const l = new Limiter(2, 5, false)
+  expect(l.admit()).toBe("ok")
+  expect(l.admit()).toBe("ok")
+  expect(l.admit()).toBe("wait")
+  expect(l.inFlight()).toBe(2)
+})
+
+test("limiter drops when the queue is full and drop is on", () => {
+  const l = new Limiter(1, 1, true)
+  expect(l.admit()).toBe("ok")
+  expect(l.admit()).toBe("wait")
+  // one waiter is queued and the buffer is 1: the next request is shed
+  l.waiting.push(() => {})
+  expect(l.admit()).toBe("drop")
+  // without drop it keeps waiting
+  const keep = new Limiter(1, 1, false)
+  keep.admit()
+  keep.waiting.push(() => {})
+  expect(keep.admit()).toBe("wait")
+})
+
+test("release frees a slot, or hands it to the next waiter", () => {
+  const l = new Limiter(1, 3, false)
+  expect(l.admit()).toBe("ok")
+  l.waiting.push(() => {})
+  expect(l.queued()).toBe(1)
+  l.release()
+  // the slot went to the waiter: still one in flight, nothing queued
+  expect(l.inFlight()).toBe(1)
+  expect(l.queued()).toBe(0)
+  l.release()
+  expect(l.inFlight()).toBe(0)
+  // releasing an idle limiter stays at zero
+  l.release()
+  expect(l.inFlight()).toBe(0)
+})

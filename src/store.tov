@@ -5,14 +5,15 @@
 // unchanged keeps the stored secret.
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
 import {
-  Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig,
+  Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
   ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig,
 } from "./config"
 import { setGlobalProxy } from "./providers/types"
-import { decode } from "./base64"
+import { decode, encode } from "./base64"
+import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
 import { Field, fields, find, isNull, quote, elements, decodeString } from "./json"
-import { secureHex } from "./crypto"
+import { secureHex, utf8 } from "./crypto"
 
 export type AdminAuth = AdminAuthConfig
 
@@ -596,16 +597,17 @@ function redactKey(k: KeyConfig): KeyConfig {
   }
 }
 
+// The whole provider with its secrets masked, so settings added later survive a GET then PUT.
 function redactProvider(p: ProviderConfig): ProviderConfig {
   const ks = p.keys
-  const px = p.proxy_config
-  return {
-    keys: ks === undefined ? undefined : ks.map((k) => redactKey(k)),
-    network_config: p.network_config,
-    proxy_config: px === undefined ? undefined : { type: px.type, url: px.url, username: px.username, password: maskOpt(px.password) },
-    custom_provider_config: p.custom_provider_config,
-    send_back_raw_response: p.send_back_raw_response,
+  let px = p.proxy_config
+  let n = p
+  n.keys = ks === undefined ? undefined : ks.map((k) => redactKey(k))
+  if (px !== undefined) {
+    px.password = maskOpt(px.password)
+    n.proxy_config = px
   }
+  return n
 }
 
 type ProviderView = {
@@ -769,10 +771,159 @@ function proxyRoute(store: ConfigStore, m: string, body: string): ApiReply {
   return reply(200, JSON.stringify({ message: "Proxy configuration updated successfully" }))
 }
 
+// Encryption at rest (Bifrost's encryption_key). The secrets in the saved file are sealed with
+// AES-256-GCM: provider key values, virtual key values, and the admin password and token. The
+// store keeps them as plain text in memory. The key is PBKDF2-HMAC-SHA256 of the passphrase with a
+// fixed salt and 100,000 rounds, derived once at startup. Bifrost derives its key with Argon2id,
+// so a file sealed here does not open in Bifrost, and the other way round.
+export type ConfigCipher = { key: u8[] }
+
+const KDF_ROUNDS = 100000
+const KDF_SALT = "raiju-config-encryption-v1"
+const SEALED = "enc:v1:"
+const NO_AAD: u8[] = []
+const HEXV = "0123456789abcdef"
+
+export function cipherFor(passphrase: string): ConfigCipher {
+  return { key: pbkdf2Sha256(utf8(passphrase), utf8(KDF_SALT), KDF_ROUNDS, 32) }
+}
+
+// The cipher for a config: its encryption_key (env.NAME is read), else the BIFROST_ENCRYPTION_KEY
+// variable. undefined when neither is set, so the file is saved in plain text as before.
+export function cipherFromConfig(c: Config): ConfigCipher | undefined throws Error {
+  const k = c.encryption_key ?? ""
+  if (k.startsWith("env.") && resolveEnv(k) === "") throw new Error(`encryption_key ${k} is not set in the environment`)
+  const pass = k !== "" ? resolveEnv(k) : (getEnv("BIFROST_ENCRYPTION_KEY") ?? "")
+  if (pass === "") return undefined
+  return cipherFor(pass)
+}
+
+// References are kept as written: env.NAME, vault.path and aws-sm.id are never sealed.
+function isReference(v: string): bool {
+  return v.startsWith("env.") || v.startsWith("vault.") || v.startsWith("aws-sm.")
+}
+
+function hexBytes(h: string): u8[] {
+  const out: u8[] = []
+  for (let i = 0; i + 1 < h.byteLength; i += 2) {
+    out.push(u8(HEXV.indexOf(h.slice(i, i + 1)) * 16 + HEXV.indexOf(h.slice(i + 1, i + 2))))
+  }
+  return out
+}
+
+// "enc:v1:" then base64 of the 12-byte nonce, the ciphertext and the 16-byte tag.
+function sealValue(c: ConfigCipher, v: string): string throws Error {
+  const nonce = hexBytes(try secureHex(24))
+  return SEALED + encode(nonce.concat(gcmSeal(c.key, nonce, utf8(v), NO_AAD)))
+}
+
+// The plain text of a value. A value that is not sealed is returned as it is; undefined means it
+// is sealed and cannot be opened (no key, another key, or a damaged value).
+function openValue(c: ConfigCipher | undefined, v: string): string | undefined {
+  if (!v.startsWith(SEALED)) return v
+  if (c === undefined) return undefined
+  let raw: u8[] = []
+  try {
+    raw = decode(v.slice(SEALED.byteLength))
+  } catch (e) {
+    return undefined
+  }
+  if (raw.length < 28) return undefined
+  const pt = gcmOpen(c.key, raw.slice(0, 12), raw.slice(12), NO_AAD)
+  if (pt === undefined) return undefined
+  try {
+    return new TextDecoder().decode(pt)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// One secret value, sealed (seal) or opened. A value that cannot be opened is kept and noted.
+function secretValue(cipher: ConfigCipher | undefined, seal: bool, v: string, path: string, inout errors: string[]): string throws Error {
+  if (v === "" || isReference(v)) return v
+  if (seal) {
+    if (cipher === undefined || v.startsWith(SEALED)) return v
+    return try sealValue(cipher, v)
+  }
+  const plain = openValue(cipher, v)
+  if (plain === undefined) {
+    errors.push(`config: "${path}" is sealed and cannot be opened: check encryption_key`)
+    return v
+  }
+  return plain
+}
+
+// The config with its secrets sealed (seal) or opened. The input is not changed.
+function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: bool, inout errors: string[]): Config throws Error {
+  const ps = c.providers
+  const gov = c.governance
+  let out = c
+  if (ps !== undefined) {
+    const np: Map<string, ProviderConfig> = new Map()
+    for (const name of ps.keys()) {
+      let p = ps.get(name)!
+      const keys = p.keys
+      if (keys !== undefined) {
+        let nk: KeyConfig[] = []
+        for (const k of keys) {
+          let kk = k
+          const v = kk.value
+          if (v !== undefined) kk.value = try secretValue(cipher, seal, v, `providers.${name}.keys.value`, &errors)
+          nk.push(kk)
+        }
+        p.keys = nk
+      }
+      np.set(name, p)
+    }
+    out.providers = np
+  }
+  if (gov !== undefined) {
+    let g = gov
+    const au = g.auth_config
+    if (au !== undefined) {
+      let a = au
+      const pw = a.password
+      const tok = a.token
+      if (pw !== undefined) a.password = try secretValue(cipher, seal, pw, "governance.auth_config.password", &errors)
+      if (tok !== undefined) a.token = try secretValue(cipher, seal, tok, "governance.auth_config.token", &errors)
+      g.auth_config = a
+    }
+    const vks = g.virtual_keys
+    if (vks !== undefined) {
+      let nv: VirtualKeyConfig[] = []
+      for (const vk of vks) {
+        let x = vk
+        x.value = try secretValue(cipher, seal, x.value, `governance.virtual_keys.${x.id}.value`, &errors)
+        nv.push(x)
+      }
+      g.virtual_keys = nv
+    }
+    out.governance = g
+  }
+  return out
+}
+
+// The config as it is saved: its secrets sealed. With no cipher it is returned unchanged.
+export function sealConfig(c: Config, cipher: ConfigCipher | undefined): Config throws Error {
+  if (cipher === undefined) return c
+  let errs: string[] = []
+  return try transformSecrets(c, cipher, true, &errs)
+}
+
+// A config as it was read from the file, its sealed secrets opened. errors names each value that
+// cannot be opened; the caller refuses to start when there are any.
+export function openConfig(c: Config, cipher: ConfigCipher | undefined): { cfg: Config, errors: string[] } throws Error {
+  let errs: string[] = []
+  const cfg = try transformSecrets(c, cipher, false, &errs)
+  return { cfg: cfg, errors: errs }
+}
+
 export class ConfigStore {
   cfg: Config
   version: int = 0
   onChange: ((c: Config) => void) | undefined = undefined
+  // encryption at rest: the saved file seals its secrets with this cipher (set at startup)
+  cipher: ConfigCipher | undefined = undefined
 
   // `initial` should be the config as written in the file (env.NAME references
   // unresolved), so save() writes the references and not their values.
@@ -800,7 +951,7 @@ export class ConfigStore {
   // Writes the config as JSON. node:fs has no rename, so the previous file is
   // kept as <path>.bak first; a crash mid-write leaves that copy behind.
   save(): void throws Error {
-    let text = JSON.stringify(this.cfg, undefined, 2)
+    let text = JSON.stringify(try sealConfig(this.cfg, this.cipher), undefined, 2)
     if (this.extras.length > 0) {
       const end = text.byteLength - 1
       const sep = text.trim() === "{}" ? "\n" : ",\n"
@@ -2331,4 +2482,68 @@ test("version, keys and models: masked keys, configured models in Bifrost's shap
   expect(handleApi(s, "GET", "/api/models/nope", "").status).toBe(404)
   expect(handleApi(s, "POST", "/api/models", "").status).toBe(405)
   cleanup(path)
+})
+
+test("sealed secrets: the saved text hides them, and opening restores them", () => {
+  const ps: Map<string, ProviderConfig> = new Map()
+  ps.set("openai", { keys: [{ value: "sk-plain-123456789" }, { value: "env.OPENAI_KEY_2" }] })
+  const c: Config = { providers: ps, governance: { auth_config: { username: "root", password: "pw-plain-123" } } }
+  const cipher = cipherFor("a passphrase of sixteen bytes")
+  const sealed = try sealConfig(c, cipher)
+  const text = JSON.stringify(sealed)
+  expect(text.includes("sk-plain-123456789")).toBe(false)
+  expect(text.includes("pw-plain-123")).toBe(false)
+  expect(text.includes("enc:v1:")).toBe(true)
+  // references are not sealed, and the username is not a secret
+  expect(text.includes("env.OPENAI_KEY_2")).toBe(true)
+  expect(text.includes(`"root"`)).toBe(true)
+  // the input is unchanged
+  expect(c.providers!.get("openai")!.keys![0]!.value).toBe("sk-plain-123456789")
+  const back = try openConfig(try JSON.parse(text) as Config, cipher)
+  expect(back.errors.length).toBe(0)
+  expect(back.cfg.providers!.get("openai")!.keys![0]!.value).toBe("sk-plain-123456789")
+  expect(back.cfg.governance!.auth_config!.password).toBe("pw-plain-123")
+})
+
+test("sealed secrets: a wrong or missing key is reported, and plain text still loads", () => {
+  const ps: Map<string, ProviderConfig> = new Map()
+  ps.set("openai", { keys: [{ value: "sk-plain-123456789" }] })
+  const sealed = try sealConfig({ providers: ps }, cipherFor("right passphrase here"))
+  const parsed = try JSON.parse(JSON.stringify(sealed)) as Config
+  const wrong = try openConfig(parsed, cipherFor("wrong passphrase here"))
+  expect(wrong.errors.length).toBe(1)
+  expect(wrong.errors[0]!.includes(`"providers.openai.keys.value" is sealed`)).toBe(true)
+  const none = try openConfig(parsed, undefined)
+  expect(none.errors.length).toBe(1)
+  const plain = try openConfig(try JSON.parse(`{"providers":{"openai":{"keys":[{"value":"sk-old"}]}}}`) as Config, cipherFor("right passphrase here"))
+  expect(plain.errors.length).toBe(0)
+  expect(plain.cfg.providers!.get("openai")!.keys![0]!.value).toBe("sk-old")
+  // no cipher: the config is saved as it is
+  expect(JSON.stringify(try sealConfig({ providers: ps }, undefined)).includes("sk-plain-123456789")).toBe(true)
+})
+
+test("sealed secrets: the store writes sealed secrets to the file", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  s.cipher = cipherFor("a passphrase of sixteen bytes")
+  expect(statusOf(s.upsertProvider("openai", { keys: [{ value: "sk-store-987654321" }] }))).toBe(200)
+  const text = try readFileSync(path, "utf8")
+  expect(text.includes("sk-store-987654321")).toBe(false)
+  expect(text.includes("enc:v1:")).toBe(true)
+  // the in-memory config keeps the plain value
+  expect(s.cfg.providers!.get("openai")!.keys![0]!.value).toBe("sk-store-987654321")
+  cleanup(path)
+})
+
+test("encryption_key: an unset env reference is an error, and no key means no cipher", () => {
+  const none = try cipherFromConfig({})
+  expect(none === undefined).toBe(true)
+  let threw = false
+  try {
+    cipherFromConfig({ encryption_key: "env.RAIJU_UNSET_KEY_FOR_TEST" })
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  expect((try cipherFromConfig({ encryption_key: "a literal passphrase" })) !== undefined).toBe(true)
 })
