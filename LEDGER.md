@@ -233,6 +233,11 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L101 | G43 | Secrets engine: capture groups for secretGroup, the entropy filter and gitleaks allowlists and stopwords; then enable generic-api-key | worker | done: regex captures (linear), secretGroup spans, entropy (above N, as gitleaks), global and per-rule allowlists and stopwords, trailing boundaries restored, generic-api-key on; unit + e2e. Open: gitleaks:allow comments not honoured (fail closed), keyword-dense 20 KB check ~35 ms |
 | L102 | G40 | WebSocket and live remainder: Responses socket streams events as they arrive (not after completion), response.cancel, /openai/responses aliases; live sessions for more providers, POST /v1/live/sessions (WebRTC create), session registry and /ws shared across workers, /ws heartbeat | worker | todo |
 | L97 | from L96 | Whatever the re-audit still lists as missing or partial and buildable | workers | todo |
+| L97a | (a) | Route families: /openai unversioned, /anthropic/v1/complete, /v1/completions bridge, POST /v1/realtime SDP, genai batch and Vertex regional paths, Bedrock job and file routes, /cursor, GET /mcp SSE | worker | assigned |
+| L97b | (a) | Management API: providers create and keys, config metadata, VK rotate and quota, team members, routing-rule and complexity APIs, users and /me, projects members, access-profile versions, permissions listings | worker | todo |
+| L97c | (a) | Management API: logs filters, by id, sessions, user/app/user-agent fields and histograms, delete and recalculate-cost; cache stats and clear; audit by id; session setup and ws-ticket; plugin listings | worker | assigned |
+| L97d | (a) | MCP auth: per_user_oauth and per_user_headers types and flows, MCP sessions, tool groups, OAuth config status, OpenAPI preview, oauth2 sessions and consent | worker | todo |
+| L97e | (a) | Media for the remaining providers (speech, transcription, image generation, edits, variations); GET /v1/models/{model} metadata | worker | assigned |
 
 ## UI track
 
