@@ -15,7 +15,12 @@ import * as cplx from "./complexity"
 import { AgentConfig, runAgent } from "./agent"
 import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
-import { GuardrailProvider, appliesTo, checkRequest, parseVerdict, extractText, completionText } from "./guardrail_providers"
+import { GuardrailProvider, Verdict, appliesTo, checkRequest, parseVerdictFor, isLocal, extractText, completionText } from "./guardrail_providers"
+import { judgeText } from "./guard_judge"
+import { CompiledRule } from "./guard_regex"
+import { compileLocal, localVerdict } from "./guard_local"
+import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
+import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias } from "./router"
 import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
@@ -721,6 +726,30 @@ class LazyChat {
   }
 }
 
+// The in-process rules of the regex and secrets providers, by provider id. A bad pattern is logged and its provider is skipped.
+function compileLocalRules(providers: GuardrailProvider[]): Map<string, CompiledRule[]> {
+  const out: Map<string, CompiledRule[]> = new Map()
+  for (const p of providers) {
+    if (p.kind !== "regex" && p.kind !== "secrets") continue
+    try {
+      out.set(p.id, try compileLocal(p))
+    } catch (e) {
+      console.error(`raiju: guardrail ${p.id}: ${e.message}`)
+    }
+  }
+  return out
+}
+
+// The guards that check MCP tool calls. A bad pattern is logged and the tool guards are left off.
+function compileGuards(providers: GuardrailProvider[]): ToolGuard[] {
+  try {
+    return try compileToolGuards(providers)
+  } catch (e) {
+    console.error(`raiju: MCP tool guardrails: ${e.message}`)
+    return []
+  }
+}
+
 export class Engine {
   gov: Governance
   health: Health
@@ -764,6 +793,9 @@ export class Engine {
   // set by the exporters loop: every logged request is queued for each exporter
   exportQueues: ExportQueue[] = []
   guardProviders: GuardrailProvider[] = []
+  // compiled regex and secrets providers, by id, and the guards on MCP tool calls
+  localRules: Map<string, CompiledRule[]> = new Map()
+  toolGuards: ToolGuard[] = []
   // per-provider concurrency and queue (concurrency_and_buffer_size)
   limiters: Map<string, Limiter> = new Map()
 
@@ -861,6 +893,8 @@ export class Engine {
     if (cfg.client?.drop_excess_requests === true && this.limiters.size === 0) console.error("raiju: client.drop_excess_requests has no effect: no provider sets concurrency_and_buffer_size, so no queue is full")
     if (injectedNames(cfg).length > 0 && (cfg.mcp?.client_configs ?? []).length === 0) console.error("raiju: injected_tools need MCP clients, and none are configured")
     this.guardProviders = cfg.guardrails?.providers ?? []
+    this.localRules = compileLocalRules(this.guardProviders)
+    this.toolGuards = compileGuards(this.guardProviders)
     const sa = cfg.session_affinity
     if (sa !== undefined && sa.enabled === true) {
       this.affinity = new AffinityStore({ enabled: true, ttl_ms: (sa.ttl_seconds ?? 3600) * 1000, max_sessions: sa.max_sessions ?? 100000 })
@@ -873,28 +907,21 @@ export class Engine {
   }
 
   // Asks every external guardrail that covers `source` about `text`; stops at the first block.
+  // Judges go through the chat path, regex and secrets run in-process, and HTTP providers make one request.
   async externalGuard(text: string, source: "input" | "output"): Promise<{ action: string, reason: string, text?: string }> {
     let out: { action: string, reason: string, text?: string } = { action: "allow", reason: "" }
     for (const p of this.guardProviders) {
       if (!appliesTo(p, source)) continue
-      let status = 0
-      let body = ""
-      try {
-        const r = checkRequest(p, text, source, Date.now())
-        const hs: Record<string, string> = r.headers
-        const dl = deadline(10000)
-        try {
-          const res = await fetch(r.url, { method: r.method, headers: hs, body: r.body, signal: dl.controller.signal })
-          status = res.status
-          body = await res.text()
-        } catch (e) {
-          status = 0
-        }
-        dl.finish()
-      } catch (e) {
-        status = 0
+      if (!(p.targets ?? ["llm"]).includes("llm")) continue
+      let v: Verdict = { action: "allow", reason: "" }
+      if (p.kind === "prompt_judge") {
+        v = await judgeText(p, text, source, (prov: string, b: string): Promise<string, Error> => this.judgeChat(prov, b))
+      } else if (isLocal(p)) {
+        const rules: CompiledRule[] = this.localRules.get(p.id) ?? []
+        v = localVerdict(rules, text)
+      } else {
+        v = await this.httpVerdict(p, text, source)
       }
-      const v = parseVerdict(p, status, body)
       metrics.inc("raiju_guardrail_checks_total", metrics.labels("", p.id, v.action), 1.0)
       if (v.action === "block") return { action: "block", reason: `${p.id}: ${v.reason}` }
       const red = v.text
@@ -904,6 +931,41 @@ export class Engine {
       }
     }
     return out
+  }
+
+  // One call to an HTTP guardrail; its verdict is read from the answer (a failed call follows the provider's on_error).
+  async httpVerdict(p: GuardrailProvider, text: string, source: "input" | "output"): Promise<Verdict> {
+    let status = 0
+    let body = ""
+    try {
+      const r = checkRequest(p, text, source, Date.now())
+      const hs: Record<string, string> = r.headers
+      const dl = deadline(10000)
+      try {
+        const res = await fetch(r.url, { method: r.method, headers: hs, body: r.body, signal: dl.controller.signal })
+        status = res.status
+        body = await res.text()
+      } catch (e) {
+        status = 0
+      }
+      dl.finish()
+    } catch (e) {
+      status = 0
+    }
+    return parseVerdictFor(p, text, status, body)
+  }
+
+  // Sends a judge's chat body through the chat path with guardrails off for that call, so a judge is not judged.
+  async judgeChat(provider: string, body: string): Promise<string, Error> {
+    let f = try fields(body)
+    const model = rawStr(f, "model") ?? ""
+    if (provider !== "" && !model.includes("/")) setField(&f, "model", quote(`${provider}/${model}`))
+    const hs: Record<string, string> = new Map()
+    hs.set("content-type", "application/json")
+    const req = new Request("http://127.0.0.1/v1/chat/completions", { method: "POST", headers: hs, body: build(f) })
+    const r = try await this.chatOnce(req, undefined, true)
+    if (r.status !== 200) throw new Error(`judge model returned ${r.status}`)
+    return try await r.text()
   }
 
   // Remembers the key that served a session, so its next requests go to the same key.
@@ -1234,6 +1296,8 @@ export class Engine {
     this.logRequests = fresh.logRequests
     this.complexity = fresh.complexity
     this.guardProviders = fresh.guardProviders
+    this.localRules = fresh.localRules
+    this.toolGuards = fresh.toolGuards
     this.agent = fresh.agent
     this.limiters = carryLimiters(fresh.limiters, this.limiters)
     if (fresh.affinity === undefined) this.affinity = undefined
@@ -1320,6 +1384,8 @@ export class Engine {
     const text = await req.text()
     try {
       const call = executeEndpointBody(text)
+      const tv = checkToolCall(this.toolGuards, call.name, call.argumentsJson)
+      if (!tv.allowed) return errorResponse(400, `tool call blocked by guardrails: ${tv.reason}`, "guardrail_violation", noHeaders())
       const t0 = performance.now()
       const result = await m.execute(call.name, call.argumentsJson)
       timedMcp(m, call.name, t0, result.isError)
@@ -1882,6 +1948,8 @@ export class Engine {
     }
     const exec = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
       const real = injectedChatName(this.cfg, name) ?? name
+      const tv = checkToolCall(this.toolGuards, real, args)
+      if (!tv.allowed) return { text: `blocked by guardrails: ${tv.reason}`, isError: true }
       const t0 = performance.now()
       const r = try await m.execute(real, args)
       timedMcp(m, real, t0, r.isError)
@@ -1901,12 +1969,18 @@ export class Engine {
     }
   }
 
-  async chatOnce(req: Request, sink?: StreamSink): Promise<Response> {
+  async chatOnce(req: Request, sink?: StreamSink, skipGuards?: bool): Promise<Response> {
     let text = await req.text()
     let body: Field[] = []
-    const guard = this.guard
+    const guardOn = skipGuards !== true
+    const guard = guardOn ? this.guard : undefined
+    // reversible redaction: one vault per request, so the response restores to this request's values
+    const vault = new Vault()
+    const reversible = guard !== undefined && guard.mode === "redact" && this.cfg.guardrails?.reversible === true
     try {
-      if (guard !== undefined && this.guardInput) {
+      if (guard !== undefined && this.guardInput && reversible) {
+        text = try tokenizeChatRequest(text, guard, vault)
+      } else if (guard !== undefined && this.guardInput) {
         const g = applyToChatRequest(text, guard)
         for (const f of g.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, guard.mode), 1.0)
         if (g.blocked) {
@@ -1918,7 +1992,7 @@ export class Engine {
         }
         text = g.body
       }
-      if (this.guardProviders.length > 0) {
+      if (guardOn && this.guardProviders.length > 0) {
         const v = await this.externalGuard(extractText(text), "input")
         if (v.action === "block") return errorResponse(400, `request blocked by guardrails: ${v.reason}`, "guardrail_violation", noHeaders())
         const red = v.text
@@ -2016,6 +2090,7 @@ export class Engine {
         const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
         let out = tr.body
         if (pluginChain !== undefined && pluginRun !== undefined) out = pluginChain.runPost(&pluginRun.ctx, 200, out).body
+        if (reversible) out = try restoreCompletion(out, vault)
         if (outGuard === undefined) return { body: out, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
         const g = try applyToCompletion(out, outGuard)
         for (const f of g.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, outGuard.mode), 1.0)
@@ -2039,7 +2114,7 @@ export class Engine {
     }
     const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
     // external output guardrails see the whole answer, so they apply to non-streamed answers
-    if (this.guardProviders.length === 0 || stream || res.status !== 200) return res
+    if (!guardOn || this.guardProviders.length === 0 || stream || res.status !== 200) return res
     let answer = ""
     try {
       answer = await res.text()

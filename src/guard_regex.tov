@@ -1,0 +1,294 @@
+// Regex guardrails (Bifrost's custom regex provider): each pattern has an action,
+// block, redact or detect_only. Patterns run on regex.tov.
+//
+// regex.tov's test() only says whether a pattern matches; it reports no
+// positions. So the match positions come from a bounded scan here:
+// - a match of up to WIN bytes is found inside a window that tests as a match;
+// - each start position is tried with \A(?:pattern), and the longest end within
+//   WIN with \A(?:pattern)\z is taken (a longer match is cut at WIN bytes);
+// - with a trailing or leading \b, a boundary is required at the slice edges too.
+// A match that cannot be located (only when a window matches) blocks a
+// redact rule, since its text cannot be replaced.
+// An engine API that returns spans would make this linear; see the report.
+
+import { compileRegex, Regex } from "./regex"
+import { Finding, GuardResult, redact } from "./guardrails"
+
+export type RegexRule = {
+  pattern: string,
+  description?: string,
+  entity_type?: string,
+  flags?: string,
+  action?: string,
+  allowed_values?: string[],
+  skip_containing?: string[],
+}
+
+// A rule ready to run. gate is the pattern alone; prefix and exact are anchored.
+export type CompiledRule = {
+  kind: string,
+  action: string,
+  allowed: string[],
+  skip: string[],
+  wordB: bool,
+  gate: Regex,
+  prefix: Regex,
+  exact: Regex,
+}
+
+type Span = { start: int, end: int }
+
+const enc = new TextEncoder()
+const WIN = 256
+const W = 512
+const STEP = 256
+
+function byteAt(b: u8[], i: int): int {
+  const v = b[i]
+  return v === undefined ? -1 : int(v)
+}
+
+function isCont(c: int): bool {
+  return c >= 128 && c < 192
+}
+
+function isWord(c: int): bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95
+}
+
+// Moves i forward to the next code point start (n counts as one).
+function cpAlign(b: u8[], i: int): int {
+  let j = i
+  while (j < b.length && isCont(byteAt(b, j))) j += 1
+  return j
+}
+
+function isCpStart(b: u8[], i: int): bool {
+  return i >= b.length || !isCont(byteAt(b, i))
+}
+
+// Flags accepted in a pattern: i, m, s. Anything else is an error.
+function flagsOf(f: string): string throws SyntaxError {
+  let out = ""
+  for (const c of ["i", "m", "s"]) {
+    if (f.includes(c)) out += c
+  }
+  if (out.byteLength !== f.byteLength) throw new SyntaxError(`regex flags "${f}" are not supported (use i, m or s)`)
+  return out
+}
+
+function kindOf(r: RegexRule): string {
+  const k = r.entity_type ?? r.description ?? "REGEX_MATCH"
+  return k.split(" ").join("_").toUpperCase()
+}
+
+// Compiles rules, or throws a SyntaxError naming the bad pattern.
+export function compileRules(rules: RegexRule[]): CompiledRule[] throws SyntaxError {
+  const out: CompiledRule[] = []
+  for (const r of rules) {
+    const fl = try flagsOf(r.flags ?? "")
+    const src = fl === "" ? r.pattern : `(?${fl})${r.pattern}`
+    const gate = try compileRegex(src)
+    const prefix = try compileRegex(`\\A(?:${src})`)
+    const exact = try compileRegex(`\\A(?:${src})\\z`)
+    const skip: string[] = []
+    for (const s of r.skip_containing ?? []) skip.push(s.toLowerCase())
+    out.push({
+      kind: kindOf(r),
+      action: r.action ?? "block",
+      allowed: (r.allowed_values ?? []).map((s: string) => s.toLowerCase()),
+      skip: skip,
+      wordB: r.pattern.includes("\\b"),
+      gate: gate,
+      prefix: prefix,
+      exact: exact,
+    })
+  }
+  return out
+}
+
+// Byte ranges that may hold a match: windows of W bytes, step STEP, that test as a match.
+// A match of up to WIN bytes starting in a window's first half lies inside that window.
+function hitRegions(re: Regex, text: string, b: u8[]): Span[] {
+  const n = b.length
+  const out: Span[] = []
+  let s = 0
+  while (s < n) {
+    const st = cpAlign(b, s)
+    const e = cpAlign(b, s + W < n ? s + W : n)
+    if (st >= e) break
+    if (re.test(text.slice(st, e))) out.push({ start: st, end: e })
+    if (e >= n) break
+    s += STEP
+  }
+  return out
+}
+
+// Non-overlapping matches inside the regions, leftmost first.
+function findSpans(r: CompiledRule, text: string, b: u8[], regions: Span[]): Span[] {
+  const n = b.length
+  const out: Span[] = []
+  let from = 0
+  for (const reg of regions) {
+    let p = cpAlign(b, reg.start > from ? reg.start : from)
+    while (p < reg.end && p < n) {
+      const hi = cpAlign(b, p + WIN < n ? p + WIN : n)
+      if (!r.prefix.test(text.slice(p, hi))) {
+        p = cpAlign(b, p + 1)
+        continue
+      }
+      if (r.wordB && p > 0 && isWord(byteAt(b, p - 1)) && isWord(byteAt(b, p))) {
+        p = cpAlign(b, p + 1)
+        continue
+      }
+      let e = hi
+      let found = -1
+      while (e > p) {
+        const endOk = !(r.wordB && e < n && isWord(byteAt(b, e - 1)) && isWord(byteAt(b, e)))
+        if (endOk && r.exact.test(text.slice(p, e))) {
+          found = e
+          break
+        }
+        e -= 1
+        while (e > p && !isCpStart(b, e)) e -= 1
+      }
+      if (found < 0) {
+        p = cpAlign(b, p + 1)
+        continue
+      }
+      out.push({ start: p, end: found })
+      p = found
+    }
+    from = p
+  }
+  return out
+}
+
+// A match is ignored when it equals an allowed value or contains a skip word, ignoring case.
+function ignored(r: CompiledRule, t: string): bool {
+  const low = t.toLowerCase()
+  if (r.allowed.includes(low)) return true
+  for (const s of r.skip) {
+    if (low.includes(s)) return true
+  }
+  return false
+}
+
+// Runs the rules over text. block rules set blocked; redact rules rewrite the body
+// with [REDACTED:KIND]; detect_only rules only report.
+export function applyRegex(text: string, rules: CompiledRule[]): GuardResult {
+  const b = enc.encode(text)
+  const findings: Finding[] = []
+  const redactions: Finding[] = []
+  let blocked = false
+  for (const r of rules) {
+    const regions = hitRegions(r.gate, text, b)
+    if (regions.length === 0) continue
+    const spans = findSpans(r, text, b, regions)
+    if (spans.length === 0) {
+      // the pattern matched but the span could not be placed
+      findings.push({ kind: r.kind, start: 0, end: 0, text: "" })
+      if (r.action !== "detect_only") blocked = true
+      continue
+    }
+    for (const s of spans) {
+      const t = text.slice(s.start, s.end)
+      if (ignored(r, t)) continue
+      const f: Finding = { kind: r.kind, start: s.start, end: s.end, text: t }
+      findings.push(f)
+      if (r.action === "block") blocked = true
+      else if (r.action === "redact") redactions.push(f)
+    }
+  }
+  if (blocked) return { body: text, findings: findings, blocked: true }
+  if (redactions.length > 0) return { body: redact(text, redactions), findings: findings, blocked: false }
+  return { body: text, findings: findings, blocked: false }
+}
+
+// ---- tests ----
+
+test("email pattern redacts with its entity type", () => {
+  const rules = try compileRules([{ pattern: "\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b", description: "Email address", entity_type: "EMAIL", flags: "i", action: "redact" }])
+  const r = applyRegex("write to jane.doe@example.com or x@y.io today", rules)
+  expect(r.body).toBe("write to [REDACTED:EMAIL] or [REDACTED:EMAIL] today")
+  expect(r.findings.length).toBe(2)
+  expect(r.findings[0]!.text).toBe("jane.doe@example.com")
+  expect(r.blocked).toBe(false)
+})
+
+test("block action sets blocked and keeps the body", () => {
+  const rules = try compileRules([{ pattern: "PROJ-\\d+", description: "Internal project code", action: "block" }])
+  const r = applyRegex("ticket PROJ-4411 is private", rules)
+  expect(r.blocked).toBe(true)
+  expect(r.body).toBe("ticket PROJ-4411 is private")
+  expect(r.findings[0]!.kind).toBe("INTERNAL_PROJECT_CODE")
+  expect(applyRegex("nothing here", rules).blocked).toBe(false)
+})
+
+test("detect_only reports without changing anything", () => {
+  const rules = try compileRules([{ pattern: "acme", flags: "i", action: "detect_only" }])
+  const r = applyRegex("ACME and acme", rules)
+  expect(r.blocked).toBe(false)
+  expect(r.body).toBe("ACME and acme")
+  expect(r.findings.length).toBe(2)
+})
+
+test("flags i and s and m", () => {
+  const ci = try compileRules([{ pattern: "secret", flags: "i", action: "detect_only" }])
+  expect(applyRegex("SeCrEt", ci).findings.length).toBe(1)
+  const cs = try compileRules([{ pattern: "secret", action: "detect_only" }])
+  expect(applyRegex("SeCrEt", cs).findings.length).toBe(0)
+  const dotall = try compileRules([{ pattern: "a.b", flags: "s", action: "detect_only" }])
+  expect(applyRegex("a\nb", dotall).findings.length).toBe(1)
+  const dot = try compileRules([{ pattern: "a.b", action: "detect_only" }])
+  expect(applyRegex("a\nb", dot).findings.length).toBe(0)
+  let msg = ""
+  try {
+    compileRules([{ pattern: "x", flags: "q" }])
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg.includes("flags")).toBe(true)
+})
+
+test("ssn word boundaries reject longer digit runs", () => {
+  const rules = try compileRules([{ pattern: "\\b\\d{3}-\\d{2}-\\d{4}\\b", entity_type: "SSN", action: "redact" }])
+  expect(applyRegex("ssn 123-45-6789 ok", rules).body).toBe("ssn [REDACTED:SSN] ok")
+  expect(applyRegex("id 123-45-67890", rules).findings.length).toBe(0)
+  expect(applyRegex("id 9123-45-6789", rules).findings.length).toBe(0)
+})
+
+test("allowed values skip exact matches only", () => {
+  const rules = try compileRules([{ pattern: "[a-z]+@[a-z.]+", entity_type: "EMAIL", action: "redact", allowed_values: ["support@acme.com"] }])
+  const r = applyRegex("ask support@acme.com or nosupport@acme.com", rules)
+  expect(r.body).toBe("ask support@acme.com or [REDACTED:EMAIL]")
+  expect(applyRegex("SUPPORT@acme.com", rules).findings.length).toBe(0)
+})
+
+test("skip_containing suppresses matches with a keyword", () => {
+  const rules = try compileRules([{ pattern: "tok_[a-z]{8}", entity_type: "TOKEN", action: "block", skip_containing: ["example"] }])
+  expect(applyRegex("tok_examples", rules).blocked).toBe(false)
+  expect(applyRegex("tok_realvals", rules).blocked).toBe(true)
+})
+
+test("matches in long text and after multibyte characters", () => {
+  const filler = "é".repeat(300)
+  const text = filler + " mail a@b.co " + "x".repeat(2000) + " and c@d.org"
+  const rules = try compileRules([{ pattern: "[a-z]@[a-z]\\.[a-z]{2,3}", entity_type: "EMAIL", action: "redact" }])
+  const r = applyRegex(text, rules)
+  expect(r.findings.length).toBe(2)
+  expect(r.findings[0]!.text).toBe("a@b.co")
+  expect(r.findings[1]!.text).toBe("c@d.org")
+  expect(r.body.includes("[REDACTED:EMAIL]")).toBe(true)
+  expect(r.body.startsWith(filler + " mail [REDACTED:EMAIL] ")).toBe(true)
+})
+
+test("a bad pattern is a SyntaxError", () => {
+  let threw = false
+  try {
+    compileRules([{ pattern: "(unclosed" }])
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

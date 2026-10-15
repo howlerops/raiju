@@ -5,13 +5,14 @@
 // equivalent comes back as a warning, so no part of a Bifrost config is dropped
 // silently.
 
-import { GuardrailsConfig, GuardrailProviderConfig, PatronusEvaluatorConfig, getEnv } from "./config"
+import { GuardrailsConfig, GuardrailProviderConfig, PatronusEvaluatorConfig, RegexRuleConfig, getEnv } from "./config"
 import { Field, fields, elements, find, rawStr, rawNum, rawBool, isNull, decodeString } from "./json"
 
 type Scope = "input" | "output" | "both"
 
 // A Bifrost rule after the rule-level checks; providerIds are the raw id texts.
-type BRule = { label: string, scope: Scope, providerIds: string[] }
+// target is "llm" or "mcp" (tool calls).
+type BRule = { label: string, scope: Scope, target: string, providerIds: string[] }
 
 // A Bifrost provider profile: top-level fields and the config object's fields.
 type BProvider = { id: string, label: string, kind: string, enabled: bool, top: Field[], cfg: Field[] }
@@ -22,6 +23,7 @@ class Build {
   providers: GuardrailProviderConfig[] = []
   detect: string[] = []
   modes: string[] = []
+  reversible: bool = false
 
   warn(msg: string): void {
     this.notes.push(msg)
@@ -148,8 +150,8 @@ function parseRules(raw: string | undefined, b: Build): BRule[] throws SyntaxErr
       continue
     }
     const target = rawStr(f, "target") ?? "llm"
-    if (target !== "llm") {
-      b.warn(`${label} targets ${target}; Raiju has no MCP guardrails, so it is not loaded`)
+    if (target !== "llm" && target !== "mcp") {
+      b.warn(`${label} targets ${target}, which Raiju does not know, so it is not loaded`)
       continue
     }
     const cel = (rawStr(f, "cel_expression") ?? "true").trim()
@@ -173,7 +175,7 @@ function parseRules(raw: string | undefined, b: Build): BRule[] throws SyntaxErr
       for (const e of try elements(pci)) providerIds.push(e.trim())
     }
     if (providerIds.length === 0) b.warn(`${label} links no providers, so it enforces nothing`)
-    out.push({ label: label, scope: scope, providerIds: providerIds })
+    out.push({ label: label, scope: scope, target: target, providerIds: providerIds })
   }
   return out
 }
@@ -318,40 +320,205 @@ function webhook(b: Build, label: string, pid: string, scope: Scope, cfg: Field[
 
 // Raiju's secret detectors cover API keys with known prefixes, AWS access keys,
 // JWTs and private keys. Gitleaks, which Bifrost uses, covers far more formats.
-function secrets(b: Build, label: string, top: Field[], cfg: Field[]): void {
-  b.warn(`${label}: Raiju detects API keys with known prefixes, AWS keys, JWTs and private keys; other secret formats are not detected`)
-  const kw = find(cfg, "ignored_secret_keywords")
-  if (kw !== undefined && kw !== "[]" && !isNull(kw)) b.warn(`${label}: ignored_secret_keywords not supported; matches with those words are still reported`)
-  for (const d of ["private_key", "jwt", "api_key", "aws_key"]) b.addDetect(d)
-  const action = rawStr(cfg, "action") ?? "block"
-  b.modes.push(actionMode(b, label, action))
-  redactNotes(b, label, cfg, action)
-  ignoreNote(b, label, setKeys(top, ["timeout"]))
+// Bifrost's action names as Raiju's per-rule actions. detect_only stays detect_only.
+function ruleAction(b: Build, label: string, action: string): string {
+  if (action === "detect_only" || action === "block" || action === "redact") return action
+  b.warn(`${label}: unknown action "${action}", treated as block`)
+  return "block"
 }
 
-function regex(b: Build, label: string, top: Field[], cfg: Field[]): void {
+// Flags a Bifrost redaction_mode: runtime_reversible turns on placeholders for the
+// request and their restoration in the response. logs_only is not supported.
+function reversibleMode(b: Build, label: string, cfg: Field[]): string {
+  const rm = rawStr(cfg, "redaction_mode") ?? "runtime"
+  if (rm === "runtime_reversible") {
+    b.reversible = true
+    return rm
+  }
+  if (rm === "logs_only") b.warn(`${label}: redaction_mode logs_only is not supported; Raiju redacts the live request and response`)
+  return rm
+}
+
+// The Gitleaks rule set (a curated subset in Raiju), run as a secrets provider on the
+// targets it is linked to. The built-in key and JWT detectors still run on LLM traffic.
+function secrets(b: Build, label: string, pid: string, scope: Scope, targets: string[], top: Field[], cfg: Field[]): GuardrailProviderConfig throws SyntaxError {
+  const action = ruleAction(b, label, rawStr(cfg, "action") ?? "block")
+  reversibleMode(b, label, cfg)
+  const kw: string[] = []
+  const raw = find(cfg, "ignored_secret_keywords")
+  if (raw !== undefined && raw.startsWith("[")) {
+    for (const el of try elements(raw)) kw.push(try decodeString(el))
+  }
+  if (targets.includes("llm")) {
+    for (const d of ["private_key", "jwt", "api_key", "aws_key"]) b.addDetect(d)
+    b.modes.push(actionMode(b, label, action))
+    redactNotes(b, label, cfg, action)
+  }
+  ignoreNote(b, label, setKeys(top, ["timeout"]))
+  return { id: pid, kind: "secrets", apply_to: scope, targets: targets, action: action, redaction_mode: rawStr(cfg, "redaction_mode") ?? "runtime", ignored_secret_keywords: kw }
+}
+
+// Bifrost's custom regex provider. A pattern that is one of Raiju's built-in PII
+// detectors (by its description or entity type) uses that detector; any other pattern
+// runs as a regex rule.
+function regex(b: Build, label: string, pid: string, scope: Scope, targets: string[], top: Field[], cfg: Field[]): GuardrailProviderConfig | undefined {
   const raw = find(cfg, "patterns")
   if (raw === undefined || !raw.startsWith("[")) {
     b.warn(`${label} has no patterns, so nothing is enforced`)
-    return
+    return undefined
   }
+  const custom: RegexRuleConfig[] = []
   for (const el of try elements(raw)) {
     const pf = try fields(el)
     const pattern = rawStr(pf, "pattern") ?? ""
     const desc = rawStr(pf, "description") ?? pattern
     const hint = (rawStr(pf, "description") ?? "") + " " + (rawStr(pf, "entity_type") ?? "")
+    const action = ruleAction(b, `${label} pattern "${desc}"`, rawStr(pf, "action") ?? "block")
+    reversibleMode(b, label, pf)
     const name = builtinFor(hint.toLowerCase())
-    if (name === undefined) {
-      b.warn(`${label}: pattern "${desc}" is a custom regex and cannot run in Raiju; not enforced`)
+    if (name !== undefined && pattern.includes("\\b")) {
+      if (targets.includes("llm")) {
+        b.addDetect(name)
+        b.modes.push(actionMode(b, `${label} pattern "${desc}"`, action))
+        redactNotes(b, label, pf, action)
+        ignoreNote(b, `${label} pattern "${desc}"`, setKeys(pf, ["allowed_values"]))
+      }
       continue
     }
-    b.addDetect(name)
-    const action = rawStr(pf, "action") ?? "block"
-    b.modes.push(actionMode(b, `${label} pattern "${desc}"`, action))
-    redactNotes(b, label, pf, action)
-    ignoreNote(b, `${label} pattern "${desc}"`, setKeys(pf, ["allowed_values"]))
+    const av: string[] = []
+    const avRaw = find(pf, "allowed_values")
+    if (avRaw !== undefined && avRaw.startsWith("[")) {
+      for (const el2 of try elements(avRaw)) av.push(try decodeString(el2))
+    }
+    const flags = rawStr(pf, "flags") ?? ""
+    custom.push({ pattern: pattern, description: desc, entity_type: rawStr(pf, "entity_type"), flags: flags, action: action, allowed_values: av })
   }
   ignoreNote(b, label, setKeys(top, ["timeout"]))
+  if (custom.length === 0) return undefined
+  return { id: pid, kind: "regex", apply_to: scope, targets: targets, patterns: custom }
+}
+
+// Presidio's analyzer. action defaults to detect_only, as in Bifrost.
+function presidio(b: Build, label: string, pid: string, scope: Scope, targets: string[], cfg: Field[]): GuardrailProviderConfig | undefined throws SyntaxError {
+  const url = need(b, label, "analyzer_url", envStr(b, label, cfg, "analyzer_url"))
+  if (url === undefined) return undefined
+  const action = ruleAction(b, label, rawStr(cfg, "action") ?? "detect_only")
+  reversibleMode(b, label, cfg)
+  const ents: string[] = []
+  const raw = find(cfg, "entities")
+  if (raw !== undefined && raw.startsWith("[")) {
+    for (const el of try elements(raw)) ents.push(try decodeString(el))
+  }
+  const thr = rawNum(cfg, "score_threshold")
+  ignoreNote(b, label, setKeys(cfg, ["timeout"]))
+  return {
+    id: pid,
+    kind: "presidio",
+    apply_to: scope,
+    targets: targets,
+    analyzer_url: url,
+    api_key: envStr(b, label, cfg, "api_key"),
+    language: rawStr(cfg, "language") ?? "en",
+    score_threshold: thr ?? 0.5,
+    entities: ents,
+    action: action,
+    redaction_mode: rawStr(cfg, "redaction_mode") ?? "runtime",
+  }
+}
+
+// Azure AI Language PII. Only API-key auth is supported.
+function azurePii(b: Build, label: string, pid: string, scope: Scope, targets: string[], cfg: Field[]): GuardrailProviderConfig | undefined throws SyntaxError {
+  const auth = rawStr(cfg, "auth_type") ?? "api_key"
+  if (auth !== "api_key") {
+    b.warn(`${label}: auth_type "${auth}" is not supported (Raiju uses an API key), so it is not loaded`)
+    return undefined
+  }
+  const endpoint = need(b, label, "endpoint", envStr(b, label, cfg, "endpoint"))
+  if (endpoint === undefined) return undefined
+  const key = need(b, label, "api_key", envStr(b, label, cfg, "api_key"))
+  if (key === undefined) return undefined
+  const action = ruleAction(b, label, rawStr(cfg, "action") ?? "detect_only")
+  reversibleMode(b, label, cfg)
+  const cats: string[] = []
+  const raw = find(cfg, "pii_categories")
+  if (raw !== undefined && raw.startsWith("[")) {
+    for (const el of try elements(raw)) cats.push(try decodeString(el))
+  }
+  ignoreNote(b, label, setKeys(cfg, ["client_id", "client_secret", "tenant_id", "scopes", "logging_opt_out", "string_index_type"]))
+  return {
+    id: pid,
+    kind: "azure_language_pii",
+    apply_to: scope,
+    targets: targets,
+    endpoint: endpoint,
+    api_key: key,
+    api_version: rawStr(cfg, "api_version"),
+    model_version: rawStr(cfg, "model_version") ?? "latest",
+    domain: rawStr(cfg, "domain") ?? "none",
+    language: rawStr(cfg, "language") ?? "en",
+    pii_categories: cats,
+    action: action,
+    redaction_mode: rawStr(cfg, "redaction_mode") ?? "runtime",
+  }
+}
+
+// Google Model Armor. Bifrost authenticates with ADC or a service account key; Raiju
+// takes a bearer token (access_token), so a profile without one is not loaded.
+function modelArmor(b: Build, label: string, pid: string, scope: Scope, targets: string[], cfg: Field[]): GuardrailProviderConfig | undefined {
+  const auth = rawStr(cfg, "auth_type") ?? "default_credential"
+  const project = need(b, label, "project_id", envStr(b, label, cfg, "project_id"))
+  const loc = need(b, label, "location", envStr(b, label, cfg, "location"))
+  const tmpl = need(b, label, "template_id", envStr(b, label, cfg, "template_id"))
+  if (project === undefined || loc === undefined || tmpl === undefined) return undefined
+  const tok = envStr(b, label, cfg, "access_token")
+  if (tok === undefined) {
+    b.warn(`${label}: auth_type "${auth}" needs ADC or a service account, which Raiju does not use; set access_token to a bearer token, or the profile is not loaded`)
+    return undefined
+  }
+  if (onKeys(cfg, ["images_enabled"]).length > 0) b.warn(`${label}: image screening is not supported by Raiju; text only`)
+  ignoreNote(b, label, setKeys(cfg, ["service_account_json"]))
+  return { id: pid, kind: "google_model_armor", apply_to: scope, targets: targets, project_id: project, location: loc, template_id: tmpl, access_token: tok }
+}
+
+// CrowdStrike AIDR: the collector token is required; the policy decides the action.
+function crowdstrike(b: Build, label: string, pid: string, scope: Scope, targets: string[], cfg: Field[]): GuardrailProviderConfig | undefined {
+  const key = need(b, label, "api_key", envStr(b, label, cfg, "api_key"))
+  if (key === undefined) return undefined
+  ignoreNote(b, label, setKeys(cfg, ["timeout"]))
+  return {
+    id: pid,
+    kind: "crowdstrike_aidr",
+    apply_to: scope,
+    targets: targets,
+    api_key: key,
+    base_url: envStr(b, label, cfg, "base_url"),
+    app_id: strField(cfg, "app_id"),
+    collector_instance_id: strField(cfg, "collector_instance_id"),
+  }
+}
+
+// Prompt guardrails: an LLM judge with a natural-language rule. judge_provider and
+// judge_model name the model the gateway calls.
+function promptJudge(b: Build, label: string, pid: string, scope: Scope, targets: string[], cfg: Field[]): GuardrailProviderConfig | undefined {
+  const rule = need(b, label, "rule", rawStr(cfg, "rule"))
+  if (rule === undefined) return undefined
+  const prov = need(b, label, "judge_provider", rawStr(cfg, "judge_provider"))
+  if (prov === undefined) return undefined
+  const model = need(b, label, "judge_model", rawStr(cfg, "judge_model"))
+  if (model === undefined) return undefined
+  if (targets.includes("mcp")) b.warn(`${label}: the judge runs on LLM traffic only, not on tool calls`)
+  ignoreNote(b, label, setKeys(cfg, ["timeout"]))
+  return {
+    id: pid,
+    kind: "prompt_judge",
+    apply_to: scope,
+    targets: ["llm"],
+    rule: rule,
+    judge_provider: prov,
+    judge_model: model,
+    system_prompt: rawStr(cfg, "system_prompt"),
+    max_output_tokens: Math.floor(rawNum(cfg, "max_output_tokens") ?? 1000.0),
+  }
 }
 
 // ---- entry points ----
@@ -371,9 +538,15 @@ export function fromBifrost(guardrailsConfigJson: string): { config: GuardrailsC
   for (const p of provs) known.add(p.id)
   const inputOf: Set<string> = new Set()
   const outputOf: Set<string> = new Set()
+  const mcpOf: Set<string> = new Set()
   for (const r of rules) {
     for (const pid of r.providerIds) {
       if (!known.has(pid)) b.warn(`${r.label} links provider ${pid}, which is not defined`)
+      if (r.target === "mcp") {
+        // tool arguments are input
+        mcpOf.add(pid)
+        continue
+      }
       if (r.scope !== "output") inputOf.add(pid)
       if (r.scope !== "input") outputOf.add(pid)
     }
@@ -389,12 +562,22 @@ export function fromBifrost(guardrailsConfigJson: string): { config: GuardrailsC
     }
     const inp = inputOf.has(p.id)
     const outp = outputOf.has(p.id)
-    if (!inp && !outp) {
+    const mcp = mcpOf.has(p.id)
+    if (!inp && !outp && !mcp) {
       b.warn(`${p.label} is not linked to any enabled rule, so it is not loaded`)
       continue
     }
-    const scope: Scope = inp && outp ? "both" : inp ? "input" : "output"
+    const scope: Scope = inp && outp ? "both" : inp || (mcp && !outp) ? "input" : "output"
+    const targets: string[] = []
+    if (inp || outp) targets.push("llm")
+    if (mcp) targets.push("mcp")
     const pid = "bifrost-" + p.id
+    const local = p.kind === "secrets" || p.kind === "regex"
+    if (!local && !(inp || outp)) {
+      b.warn(`${p.label} is linked only to MCP rules, and Raiju runs it on LLM traffic only; not enforced on tool calls`)
+      continue
+    }
+    if (!local && mcp) b.warn(`${p.label} is also linked to MCP rules, but Raiju runs it on LLM traffic only; the tool-call link is not enforced`)
     if (p.kind === "bedrock") {
       const g = bedrock(b, p.label, pid, scope, p.cfg)
       if (g !== undefined) b.providers.push(g)
@@ -408,15 +591,35 @@ export function fromBifrost(guardrailsConfigJson: string): { config: GuardrailsC
       const g = try webhook(b, p.label, pid, scope, p.cfg)
       if (g !== undefined) b.providers.push(g)
     } else if (p.kind === "secrets") {
-      secrets(b, p.label, p.top, p.cfg)
-      detScopes.push(scope)
-      if (scope !== "output") detIn = true
-      if (scope !== "input") detOut = true
+      b.providers.push(try secrets(b, p.label, pid, scope, targets, p.top, p.cfg))
+      if (targets.includes("llm")) {
+        detScopes.push(scope)
+        if (scope !== "output") detIn = true
+        if (scope !== "input") detOut = true
+      }
     } else if (p.kind === "regex") {
-      try regex(b, p.label, p.top, p.cfg)
-      detScopes.push(scope)
-      if (scope !== "output") detIn = true
-      if (scope !== "input") detOut = true
+      const g = try regex(b, p.label, pid, scope, targets, p.top, p.cfg)
+      if (g !== undefined) b.providers.push(g)
+      if (targets.includes("llm")) {
+        detScopes.push(scope)
+        if (scope !== "output") detIn = true
+        if (scope !== "input") detOut = true
+      }
+    } else if (p.kind === "presidio") {
+      const g = try presidio(b, p.label, pid, scope, targets, p.cfg)
+      if (g !== undefined) b.providers.push(g)
+    } else if (p.kind === "azure-pii") {
+      const g = try azurePii(b, p.label, pid, scope, targets, p.cfg)
+      if (g !== undefined) b.providers.push(g)
+    } else if (p.kind === "model-armor") {
+      const g = modelArmor(b, p.label, pid, scope, targets, p.cfg)
+      if (g !== undefined) b.providers.push(g)
+    } else if (p.kind === "crowdstrike-aidr") {
+      const g = crowdstrike(b, p.label, pid, scope, targets, p.cfg)
+      if (g !== undefined) b.providers.push(g)
+    } else if (p.kind === "prompt-guardrail") {
+      const g = promptJudge(b, p.label, pid, scope, targets, p.cfg)
+      if (g !== undefined) b.providers.push(g)
     } else {
       b.warn(`${p.label}: provider "${p.kind}" has no Raiju equivalent, so it is not enforced`)
     }
@@ -441,6 +644,7 @@ export function fromBifrost(guardrailsConfigJson: string): { config: GuardrailsC
     detect: b.detect,
     mode: mode,
     apply_to: detApply,
+    reversible: b.reversible,
   }
   return { config: config, warnings: b.notes }
 }
@@ -478,6 +682,7 @@ export function merge(own: GuardrailsConfig | undefined, fromBifrost: Guardrails
     mode: own.mode ?? fromBifrost.mode,
     custom: custom,
     apply_to: own.apply_to ?? fromBifrost.apply_to,
+    reversible: own.reversible === true || fromBifrost.reversible === true,
   }
 }
 
@@ -551,10 +756,18 @@ test("secrets and PII regex patterns map to built-in detectors", () => {
   expect(r.config.apply_to).toBe("both")
   // redact and block are both present, so the strictest, block, applies to every detector
   expect(r.config.mode).toBe("block")
-  expect(r.config.providers!.length).toBe(0)
-  expect(warned(r.warnings, "Internal project code")).toBe(true)
+  // the Gitleaks set and the custom pattern run as providers; the PII template pattern stays built in
+  const ps = r.config.providers ?? []
+  expect(ps.length).toBe(2)
+  expect(ps[0]!.kind).toBe("secrets")
+  expect(ps[0]!.ignored_secret_keywords).toEqual(["example", "dummy"])
+  expect(ps[0]!.targets).toEqual(["llm"])
+  expect(ps[1]!.kind).toBe("regex")
+  expect(ps[1]!.patterns!.length).toBe(1)
+  expect(ps[1]!.patterns![0]!.pattern).toBe("PROJ-\\d+")
+  expect(ps[1]!.patterns![0]!.action).toBe("block")
+  expect(warned(r.warnings, "Internal project code")).toBe(false)
   expect(warned(r.warnings, "redaction_mode")).toBe(true)
-  expect(warned(r.warnings, "ignored_secret_keywords")).toBe(true)
   expect(warned(r.warnings, "allowed_values")).toBe(true)
   expect(warned(r.warnings, "strictest")).toBe(true)
 })
@@ -583,7 +796,7 @@ test("unsupported providers, MCP rules and disabled items are warned, not droppe
     {"id":10,"provider_name":"grayswan","policy_name":"Unlinked","enabled":true,"config":{}}
   ]}`
   const r = try fromBifrost(text)
-  expect(warned(r.warnings, 'rule "Protect GitHub issue creation" targets mcp')).toBe(true)
+  expect(warned(r.warnings, "the tool-call link is not enforced")).toBe(true)
   expect(warned(r.warnings, "access_key refers to env.RAIJU_COMPAT_TEST_UNSET_VAR")).toBe(true)
   expect(warned(r.warnings, "CrowdStrike AIDR Production")).toBe(true)
   expect(warned(r.warnings, "Presidio PII")).toBe(true)
@@ -594,11 +807,12 @@ test("unsupported providers, MCP rules and disabled items are warned, not droppe
   expect(warned(r.warnings, "grayswan")).toBe(true)
   // the scoped rule still runs its patronus check, widened to all traffic
   const ps = r.config.providers ?? []
-  expect(ps.length).toBe(1)
-  expect(ps[0]!.kind).toBe("patronus")
-  expect(ps[0]!.apply_to).toBe("output")
-  expect(ps[0]!.evaluators!.length).toBe(2)
-  expect(ps[0]!.evaluators![1]!.criteria).toBe("patronus:is-concise")
+  expect(ps.length).toBe(2)
+  expect(ps[0]!.kind).toBe("crowdstrike_aidr")
+  expect(ps[1]!.kind).toBe("patronus")
+  expect(ps[1]!.apply_to).toBe("output")
+  expect(ps[1]!.evaluators!.length).toBe(2)
+  expect(ps[1]!.evaluators![1]!.criteria).toBe("patronus:is-concise")
 })
 
 test("a rule with no providers and an undefined provider link are warned", () => {
@@ -660,4 +874,78 @@ test("merge keeps both sides, unions detectors and lets own settings win", () =>
   expect(ps[1]!.id).toBe("bifrost-bifrost-3")
   expect(ps[1]!.kind).toBe("bedrock")
   expect(merge(own, undefined)!.mode).toBe("redact")
+})
+
+test("presidio, azure pii, model armor and aidr map to Raiju providers", () => {
+  const text = `{"guardrail_rules":[
+    {"id":1,"name":"in","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[1,2,3,4]},
+    {"id":2,"name":"out","enabled":true,"cel_expression":"true","apply_to":"output","provider_config_ids":[4]}
+  ],"guardrail_providers":[
+    {"id":1,"provider_name":"presidio","policy_name":"pres","enabled":true,"config":{"analyzer_url":"https://presidio.example.com","language":"en","score_threshold":0.75,"entities":["EMAIL_ADDRESS","PERSON"],"action":"redact","redaction_mode":"runtime_reversible"}},
+    {"id":2,"provider_name":"azure-pii","policy_name":"azpii","enabled":true,"config":{"endpoint":"https://lang.example.com","api_key":"k","pii_categories":["Email"],"action":"block"}},
+    {"id":3,"provider_name":"model-armor","policy_name":"armor","enabled":true,"config":{"project_id":"p","location":"us","template_id":"t","access_token":"tok"}},
+    {"id":4,"provider_name":"crowdstrike-aidr","policy_name":"aidr","enabled":true,"config":{"api_key":"tk","app_id":"bifrost"}}
+  ]}`
+  const r = try fromBifrost(text)
+  const ps = r.config.providers ?? []
+  expect(ps.length).toBe(4)
+  expect(ps[0]!.kind).toBe("presidio")
+  expect(ps[0]!.analyzer_url).toBe("https://presidio.example.com")
+  expect(ps[0]!.score_threshold).toBe(0.75)
+  expect(ps[0]!.entities).toEqual(["EMAIL_ADDRESS", "PERSON"])
+  expect(ps[0]!.action).toBe("redact")
+  expect(ps[0]!.apply_to).toBe("input")
+  expect(ps[1]!.kind).toBe("azure_language_pii")
+  expect(ps[1]!.action).toBe("block")
+  expect(ps[1]!.pii_categories).toEqual(["Email"])
+  expect(ps[1]!.model_version).toBe("latest")
+  expect(ps[2]!.kind).toBe("google_model_armor")
+  expect(ps[2]!.access_token).toBe("tok")
+  expect(ps[2]!.apply_to).toBe("input")
+  expect(ps[3]!.kind).toBe("crowdstrike_aidr")
+  expect(ps[3]!.app_id).toBe("bifrost")
+  expect(ps[3]!.apply_to).toBe("both")
+  // runtime_reversible turns the reversible restore on for the whole config
+  expect(r.config.reversible).toBe(true)
+  expect(r.warnings.length).toBe(0)
+})
+
+test("model armor without a token is not loaded, and an unknown kind is warned", () => {
+  const text = `{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[1,2]}],"guardrail_providers":[
+    {"id":1,"provider_name":"model-armor","policy_name":"adc","enabled":true,"config":{"project_id":"p","location":"us","template_id":"t","auth_type":"default_credential"}},
+    {"id":2,"provider_name":"prompt-guardrail","policy_name":"judge","enabled":true,"config":{"judge_provider":"openai","judge_model":"gpt-4o-mini","rule":"No diagnoses.","max_output_tokens":300}}
+  ]}`
+  const r = try fromBifrost(text)
+  expect(warned(r.warnings, "needs ADC or a service account")).toBe(true)
+  const ps = r.config.providers ?? []
+  expect(ps.length).toBe(1)
+  expect(ps[0]!.kind).toBe("prompt_judge")
+  expect(ps[0]!.judge_model).toBe("gpt-4o-mini")
+  expect(ps[0]!.max_output_tokens).toBe(300)
+  expect(ps[0]!.targets).toEqual(["llm"])
+})
+
+test("mcp rules turn their regex and secrets providers on for tool calls", () => {
+  const text = `{"guardrail_rules":[
+    {"id":1,"name":"tool args","enabled":true,"target":"mcp","cel_expression":"true","apply_to":"input","provider_config_ids":[1,2]},
+    {"id":2,"name":"prompt","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[1]}
+  ],"guardrail_providers":[
+    {"id":1,"provider_name":"regex","policy_name":"no-internal","enabled":true,"config":{"patterns":[{"pattern":"PROJ-\\\\d+","description":"Project","action":"block"}]}},
+    {"id":2,"provider_name":"secrets","policy_name":"mcp-only-keys","enabled":true,"config":{"action":"block"}}
+  ]}`
+  const r = try fromBifrost(text)
+  const ps = r.config.providers ?? []
+  expect(ps.length).toBe(2)
+  expect(ps[0]!.kind).toBe("regex")
+  expect(ps[0]!.targets).toEqual(["llm", "mcp"])
+  expect(ps[0]!.apply_to).toBe("input")
+  // the secrets provider is linked only to the MCP rule, so it has no LLM detectors
+  expect(ps[1]!.kind).toBe("secrets")
+  expect(ps[1]!.targets).toEqual(["mcp"])
+  expect(r.config.detect!.includes("jwt")).toBe(false)
+  const r2 = try fromBifrost(`{"guardrail_rules":[{"id":1,"name":"t","enabled":true,"target":"mcp","cel_expression":"true","apply_to":"input","provider_config_ids":[1]}],"guardrail_providers":[{"id":1,"provider_name":"secrets","policy_name":"k","enabled":true,"config":{"action":"block"}}]}`)
+  expect(r2.config.providers!.length).toBe(1)
+  expect(r2.config.providers![0]!.targets).toEqual(["mcp"])
+  expect(r2.config.detect!.includes("jwt")).toBe(false)
+  expect(r2.config.enabled).toBe(true)
 })

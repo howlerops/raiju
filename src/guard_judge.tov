@@ -1,0 +1,145 @@
+// Prompt guardrails: a configured LLM judges a text against a natural-language
+// rule and answers ALLOW or BLOCK. This module builds the judge's chat request
+// and reads its decision. It makes no call itself: judgeText takes the gateway's
+// chat path as a callback, so the judge goes through the same provider code as
+// any request (the gateway passes its own function).
+
+import { GuardrailProvider, Verdict, completionText } from "./guardrail_providers"
+import { fields, rawStr, quote } from "./json"
+
+// (provider, chat body) -> the chat completion body. The provider is judge_provider.
+export type JudgeCall = (provider: string, body: string) => Promise<string, Error>
+
+const enc = new TextEncoder()
+
+const DEFAULT_SYSTEM = `You are a content policy judge. The policy is: {{rule}}
+The user message is a JSON object whose content field is the text to judge. Block only clear violations of the policy. Allow text that is unrelated to the policy, ambiguous or uncertain. Answer with only a JSON object: {"action": "ALLOW" or "BLOCK", "reason": "a short reason"}`
+
+// The chat request that asks the judge model for a decision.
+export function judgeRequest(p: GuardrailProvider, text: string, source: string): string throws Error {
+  const rule = p.rule ?? ""
+  if (rule === "") throw new Error("prompt guardrail needs a rule")
+  const model = p.judge_model ?? ""
+  if (model === "") throw new Error("prompt guardrail needs a judge_model")
+  const sys = (p.system_prompt ?? DEFAULT_SYSTEM).split("{{rule}}").join(rule)
+  const user = `{"source":${quote(source)},"content":${quote(text)}}`
+  const max = p.max_output_tokens ?? 1000
+  return `{"model":${quote(model)},"max_tokens":${max},"messages":[{"role":"system","content":${quote(sys)}},{"role":"user","content":${quote(user)}}]}`
+}
+
+// Reads the decision from the judge's text. The first JSON object is used, so a
+// fenced or prefixed answer still parses. Anything else is an error.
+export function parseJudgeReply(content: string): Verdict throws Error {
+  const a = content.indexOf("{")
+  if (a < 0) throw new Error("no JSON object in the judge decision")
+  const b = enc.encode(content)
+  let z = b.length - 1
+  while (z >= a && int(b[z]!) !== 125) z -= 1
+  if (z < a) throw new Error("no JSON object in the judge decision")
+  const f = try fields(content.slice(a, z + 1))
+  const act = (rawStr(f, "action") ?? "").toUpperCase()
+  const reason = rawStr(f, "reason") ?? ""
+  if (act === "ALLOW") return { action: "allow", reason: reason }
+  if (act === "BLOCK") return { action: "block", reason: reason !== "" ? reason : "judge blocked the text" }
+  throw new Error("judge decision is not ALLOW or BLOCK")
+}
+
+// The verdict for a judge call that returned reply, or failed with err. A failed
+// call or an unreadable decision follows on_error (allow by default).
+export function judgeFinish(p: GuardrailProvider, reply: string | undefined, err: string | undefined): Verdict {
+  const onErr: "allow" | "block" = p.on_error ?? "allow"
+  if (err !== undefined) return { action: onErr, reason: `${p.id} judge error: ${err}` }
+  try {
+    return try parseJudgeReply(completionText(reply ?? ""))
+  } catch (e) {
+    return { action: onErr, reason: `${p.id} judge error: unreadable decision: ${e.message}` }
+  }
+}
+
+// Judges one text through the gateway's chat path. An empty text is allowed
+// without a call. (Async, so it has no unit test; judgeFinish has the decision logic.)
+export async function judgeText(p: GuardrailProvider, text: string, source: "input" | "output", call: JudgeCall): Promise<Verdict> {
+  if (text.trim() === "") return { action: "allow", reason: "" }
+  let body = ""
+  try {
+    body = try judgeRequest(p, text, source)
+  } catch (e) {
+    return judgeFinish(p, undefined, e.message)
+  }
+  try {
+    const reply = try await call(p.judge_provider ?? "", body)
+    return judgeFinish(p, reply, undefined)
+  } catch (e) {
+    return judgeFinish(p, undefined, e.message)
+  }
+}
+
+// ---- tests ----
+
+function judgeProvider(): GuardrailProvider {
+  return { id: "no-dx", kind: "prompt_judge", rule: "Block definitive medical diagnoses.", judge_provider: "openai", judge_model: "gpt-4o-mini", max_output_tokens: 300 }
+}
+
+test("judge request carries the rule, the text and the model", () => {
+  const body = try judgeRequest(judgeProvider(), "you have measles", "output")
+  expect(body.startsWith(`{"model":"gpt-4o-mini","max_tokens":300,"messages":[{"role":"system","content":"You are a content policy judge. The policy is: Block definitive medical diagnoses.`)).toBe(true)
+  expect(body.includes(`{\\"source\\":\\"output\\",\\"content\\":\\"you have measles\\"}`)).toBe(true)
+  expect(body.includes("{{rule}}")).toBe(false)
+  const p = judgeProvider()
+  p.system_prompt = "Policy: {{rule}}. Be strict."
+  expect((try judgeRequest(p, "x", "input")).includes(`"content":"Policy: Block definitive medical diagnoses.. Be strict."`)).toBe(true)
+})
+
+test("judge request needs a rule and a model", () => {
+  const p = judgeProvider()
+  p.rule = undefined
+  let msg = ""
+  try {
+    judgeRequest(p, "x", "input")
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("prompt guardrail needs a rule")
+  p.rule = "r"
+  p.judge_model = undefined
+  msg = ""
+  try {
+    judgeRequest(p, "x", "input")
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("prompt guardrail needs a judge_model")
+})
+
+test("decisions are read from the judge text, fenced or plain", () => {
+  expect(try parseJudgeReply(`{"action":"ALLOW","reason":"fine"}`)).toEqual({ action: "allow", reason: "fine" })
+  expect(try parseJudgeReply("```json\n{\"action\": \"block\", \"reason\": \"diagnosis\"}\n```")).toEqual({ action: "block", reason: "diagnosis" })
+  expect(try parseJudgeReply(`{"action":"BLOCK"}`)).toEqual({ action: "block", reason: "judge blocked the text" })
+  let msg = ""
+  try {
+    parseJudgeReply(`{"action":"MAYBE"}`)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("judge decision is not ALLOW or BLOCK")
+  msg = ""
+  try {
+    parseJudgeReply("I think it is fine")
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("no JSON object in the judge decision")
+})
+
+test("judgeFinish turns a reply or a failure into a verdict", () => {
+  const p = judgeProvider()
+  const blocked = `{"choices":[{"message":{"role":"assistant","content":"{\\"action\\":\\"BLOCK\\",\\"reason\\":\\"diagnosis\\"}"}}]}`
+  expect(judgeFinish(p, blocked, undefined)).toEqual({ action: "block", reason: "diagnosis" })
+  expect(judgeFinish(p, `{"choices":[{"message":{"content":"{\\"action\\":\\"ALLOW\\"}"}}]}`, undefined)).toEqual({ action: "allow", reason: "" })
+  expect(judgeFinish(p, undefined, "upstream down")).toEqual({ action: "allow", reason: "no-dx judge error: upstream down" })
+  p.on_error = "block"
+  expect(judgeFinish(p, undefined, "upstream down").action).toBe("block")
+  const g = judgeFinish(p, `{"choices":[{"message":{"content":"unsure"}}]}`, undefined)
+  expect(g.action).toBe("block")
+  expect(g.reason.startsWith("no-dx judge error: unreadable decision")).toBe(true)
+})

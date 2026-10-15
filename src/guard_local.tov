@@ -1,0 +1,73 @@
+// Local guardrail providers: regex and secrets. They run in-process and make no
+// HTTP request, so the gateway calls compileLocal once per config and localVerdict
+// per text, in the same loop as the HTTP providers.
+
+import { GuardrailProvider, Verdict } from "./guardrail_providers"
+import { CompiledRule, RegexRule, compileRules, applyRegex } from "./guard_regex"
+import { compileSecrets } from "./guard_secrets"
+
+// The compiled rules of a regex or secrets provider. Other kinds have none.
+export function compileLocal(p: GuardrailProvider): CompiledRule[] throws SyntaxError {
+  if (p.kind === "regex") {
+    const rules: RegexRule[] = []
+    for (const r of p.patterns ?? []) {
+      rules.push({ pattern: r.pattern, description: r.description, entity_type: r.entity_type, flags: r.flags, action: r.action, allowed_values: r.allowed_values })
+    }
+    return try compileRules(rules)
+  }
+  if (p.kind === "secrets") return try compileSecrets(p.ignored_secret_keywords ?? [], p.action ?? "block")
+  return []
+}
+
+// The verdict for a text. Any block rule blocks; redact rules rewrite the text
+// with [REDACTED:KIND]; detect_only findings are reported in the reason.
+export function localVerdict(rules: CompiledRule[], text: string): Verdict {
+  const r = applyRegex(text, rules)
+  if (r.findings.length === 0) return { action: "allow", reason: "" }
+  const kinds: string[] = []
+  for (const f of r.findings) {
+    if (!kinds.includes(f.kind)) kinds.push(f.kind)
+  }
+  const why = `found ${kinds.join(", ")}`
+  if (r.blocked) return { action: "block", reason: why }
+  if (r.body !== text) return { action: "redact", reason: why, text: r.body }
+  return { action: "allow", reason: why }
+}
+
+// ---- tests ----
+
+test("regex provider compiles its patterns and redacts", () => {
+  const p: GuardrailProvider = { id: "pii", kind: "regex", patterns: [{ pattern: "\\d{3}-\\d{4}", description: "Phone", action: "redact" }] }
+  const v = localVerdict(try compileLocal(p), "call 555-1234 now")
+  expect(v.action).toBe("redact")
+  expect(v.text).toBe("call [REDACTED:PHONE] now")
+  expect(v.reason).toBe("found PHONE")
+})
+
+test("secrets provider blocks and honours ignored keywords", () => {
+  const p: GuardrailProvider = { id: "sec", kind: "secrets", action: "block", ignored_secret_keywords: ["dummy"] }
+  const rules = try compileLocal(p)
+  expect(localVerdict(rules, "token ghp_abcdefghijklmnopqrstuvwxyz0123456789").action).toBe("block")
+  expect(localVerdict(rules, "token ghp_dummyabcdefghijklmnopqrstuvwxyz01234").action).toBe("allow")
+})
+
+test("detect_only leaves the text and allows", () => {
+  const p: GuardrailProvider = { id: "d", kind: "regex", patterns: [{ pattern: "acme", flags: "i", action: "detect_only" }] }
+  const v = localVerdict(try compileLocal(p), "ACME corp")
+  expect(v).toEqual({ action: "allow", reason: "found REGEX_MATCH" })
+})
+
+test("other kinds compile to no rules and clean text is allowed", () => {
+  const p: GuardrailProvider = { id: "w", kind: "webhook" }
+  expect((try compileLocal(p)).length).toBe(0)
+  const q: GuardrailProvider = { id: "r", kind: "regex", patterns: [{ pattern: "zzz", action: "block" }] }
+  expect(localVerdict(try compileLocal(q), "nothing")).toEqual({ action: "allow", reason: "" })
+  const bad: GuardrailProvider = { id: "b", kind: "regex", patterns: [{ pattern: "(" }] }
+  let threw = false
+  try {
+    compileLocal(bad)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

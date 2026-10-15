@@ -3,7 +3,7 @@
 // Nothing here does I/O. The gateway sends checkRequest's output, then feeds the
 // status and body back to parseVerdict. A failed call follows on_error.
 
-import { fields, elements, find, rawStr, rawNum, rawBool, quote, decodeString, isNull } from "./json"
+import { Field, fields, elements, find, rawStr, rawNum, rawBool, quote, decodeString, isNull } from "./json"
 import { sign, encodeSegment, Credentials } from "./providers/bedrock"
 import { GuardrailProviderConfig, PatronusEvaluatorConfig } from "./config"
 
@@ -14,6 +14,7 @@ export type GuardrailRequest = { url: string, method: string, headers: Map<strin
 
 export type Verdict = { action: "allow" | "block" | "redact", reason: string, text?: string }
 
+const enc = new TextEncoder()
 const BEDROCK_REGION = "us-east-1"
 const AZURE_API_VERSION = "2024-09-01"
 const AZURE_CATEGORIES = ["Hate", "SelfHarm", "Sexual", "Violence"]
@@ -105,13 +106,95 @@ function webhookRequest(p: GuardrailProvider, text: string, source: string): Gua
   return { url: url, method: "POST", headers: hs, body: body }
 }
 
+// Kinds that run in-process (regex, secrets) or through the gateway's chat path
+// (prompt_judge). They make no HTTP request, so checkRequest refuses them.
+export function isLocal(p: GuardrailProvider): bool {
+  return p.kind === "regex" || p.kind === "secrets" || p.kind === "prompt_judge"
+}
+
+// Presidio's /analyze. The analyzer does the detection; the redaction is done
+// from its offsets in parseVerdictFor.
+function presidioRequest(p: GuardrailProvider, text: string): GuardrailRequest throws Error {
+  const base = trimSlashes(try need(p.analyzer_url, "analyzer_url"))
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/json")
+  const key = p.api_key
+  if (key !== undefined && key !== "") hs.set("authorization", `Bearer ${key}`)
+  const lang = p.language ?? "en"
+  const thr = p.score_threshold ?? 0.5
+  let body = `{"text":${quote(text)},"language":${quote(lang)},"score_threshold":${thr}`
+  const ents = p.entities ?? []
+  if (ents.length > 0) body += `,"entities":[${ents.map((e: string) => quote(e)).join(",")}]`
+  body += "}"
+  return { url: `${base}/analyze`, method: "POST", headers: hs, body: body }
+}
+
+// Azure AI Language PII (entity recognition). The service returns the redacted
+// text itself, so no offsets are needed here.
+function azurePiiRequest(p: GuardrailProvider, text: string): GuardrailRequest throws Error {
+  const endpoint = trimSlashes(try need(p.endpoint, "endpoint"))
+  const key = try need(p.api_key, "api_key")
+  const ver = p.api_version ?? "2026-05-01"
+  let params = `"modelVersion":${quote(p.model_version ?? "latest")},"domain":${quote(p.domain ?? "none")},"stringIndexType":"UnicodeCodePoint"`
+  const cats = p.pii_categories ?? []
+  if (cats.length > 0) params += `,"piiCategories":[${cats.map((c: string) => quote(c)).join(",")}]`
+  const lang = p.language ?? "en"
+  const body = `{"kind":"PiiEntityRecognition","parameters":{${params}},"analysisInput":{"documents":[{"id":"1","language":${quote(lang)},"text":${quote(text)}}]}}`
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/json")
+  hs.set("Ocp-Apim-Subscription-Key", key)
+  return { url: `${endpoint}/language/:analyze-text?api-version=${ver}`, method: "POST", headers: hs, body: body }
+}
+
+// Google Model Armor sanitizeUserPrompt (input) or sanitizeModelResponse (output).
+function modelArmorRequest(p: GuardrailProvider, text: string, source: string): GuardrailRequest throws Error {
+  const loc = try need(p.location, "location")
+  const proj = try need(p.project_id, "project_id")
+  const tmpl = try need(p.template_id, "template_id")
+  const tok = try need(p.access_token, "access_token")
+  const input = source === "input"
+  const op = input ? "sanitizeUserPrompt" : "sanitizeModelResponse"
+  const data = input ? `{"userPromptData":{"text":${quote(text)}}}` : `{"modelResponseData":{"text":${quote(text)}}}`
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/json")
+  hs.set("authorization", `Bearer ${tok}`)
+  const host = trimSlashes(p.base_url ?? `https://modelarmor.${loc}.rep.googleapis.com`)
+  return { url: `${host}/v1/projects/${proj}/locations/${loc}/templates/${tmpl}:${op}`, method: "POST", headers: hs, body: data }
+}
+
+// CrowdStrike AIDR guard_chat_completions: one message carrying the text.
+const AIDR_BASE = "https://api.crowdstrike.com/aidr/aiguard"
+const AIDR_PATH = "/v1/guard_chat_completions"
+
+function aidrRequest(p: GuardrailProvider, text: string, source: string): GuardrailRequest throws Error {
+  const key = try need(p.api_key, "api_key")
+  let base = trimSlashes(p.base_url ?? AIDR_BASE)
+  if (base.endsWith(AIDR_PATH)) base = base.slice(0, base.byteLength - AIDR_PATH.byteLength)
+  const role = source === "input" ? "user" : "assistant"
+  let body = `{"event_type":${quote(source)},"guard_input":{"messages":[{"role":${quote(role)},"content":${quote(text)}}]}`
+  const app = p.app_id
+  if (app !== undefined && app !== "") body += `,"app_id":${quote(app)}`
+  const coll = p.collector_instance_id
+  if (coll !== undefined && coll !== "") body += `,"collector_instance_id":${quote(coll)}`
+  body += "}"
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/json")
+  hs.set("authorization", `Bearer ${key}`)
+  return { url: `${base}${AIDR_PATH}`, method: "POST", headers: hs, body: body }
+}
+
 // The HTTP request for checking one text. Throws when the provider config is
-// missing a field the kind needs.
+// missing a field the kind needs. Presidio's verdict needs the text too; see parseVerdictFor.
 export function checkRequest(p: GuardrailProvider, text: string, source: "input" | "output", nowMs: f64): GuardrailRequest throws Error {
   if (p.kind === "bedrock") return try bedrockRequest(p, text, source, nowMs)
   if (p.kind === "azure_content_safety") return try azureRequest(p, text)
   if (p.kind === "patronus") return try patronusRequest(p, text, source)
   if (p.kind === "webhook") return try webhookRequest(p, text, source)
+  if (p.kind === "presidio") return try presidioRequest(p, text)
+  if (p.kind === "azure_language_pii") return try azurePiiRequest(p, text)
+  if (p.kind === "google_model_armor") return try modelArmorRequest(p, text, source)
+  if (p.kind === "crowdstrike_aidr") return try aidrRequest(p, text, source)
+  if (isLocal(p)) throw new Error("local guardrail kinds run in-process, not over HTTP")
   throw new Error("unknown guardrail kind")
 }
 
@@ -212,15 +295,154 @@ function webhookVerdict(body: string): Verdict throws Error {
   return { action: "allow", reason: reason }
 }
 
+// Presidio returns entities with codepoint offsets. Offsets go to byte offsets
+// before the text is rewritten.
+function cpToByte(b: u8[], cp: f64): int {
+  let seen = 0.0
+  for (let i = 0; i < b.length; i++) {
+    const c = int(b[i]!)
+    if (c >= 128 && c < 192) continue
+    if (seen === cp) return i
+    seen += 1.0
+  }
+  return b.length
+}
+
+// Presidio's verdict. Entities below score_threshold are ignored. action block
+// stops the request, redact replaces each entity with <TYPE>, detect_only only reports.
+function presidioVerdict(p: GuardrailProvider, text: string, body: string): Verdict throws Error {
+  const thr = p.score_threshold ?? 0.5
+  const found: { type: string, start: f64, end: f64 }[] = []
+  for (const el of try elements(body)) {
+    const f = try fields(el)
+    const score = rawNum(f, "score") ?? 1.0
+    if (score < thr) continue
+    const s = rawNum(f, "start")
+    const e = rawNum(f, "end")
+    if (s === undefined || e === undefined) throw new Error("presidio result without offsets")
+    found.push({ type: rawStr(f, "entity_type") ?? "PII", start: s, end: e })
+  }
+  if (found.length === 0) return { action: "allow", reason: "" }
+  const types = found.map((x) => x.type).join(", ")
+  const action = p.action ?? "detect_only"
+  if (action === "block") return { action: "block", reason: `presidio found ${types}` }
+  if (action !== "redact") return { action: "allow", reason: `presidio found ${types}` }
+  const b = enc.encode(text)
+  found.sort((x: { type: string, start: f64, end: f64 }, y: { type: string, start: f64, end: f64 }) => x.start - y.start)
+  let out = ""
+  let pos = 0
+  for (const f of found) {
+    const s = cpToByte(b, f.start)
+    const e = cpToByte(b, f.end)
+    if (s < pos || e <= s) continue
+    out += text.slice(pos, s) + `<${f.type}>`
+    pos = e
+  }
+  return { action: "redact", reason: `presidio redacted ${types}`, text: out + text.slice(pos, text.byteLength) }
+}
+
+// Azure AI Language PII: any entity counts. redact uses Azure's redactedText.
+function azurePiiVerdict(p: GuardrailProvider, body: string): Verdict throws Error {
+  const results = find(try fields(body), "results")
+  if (results === undefined || !results.startsWith("{")) throw new Error("no results in response")
+  const docsRaw = find(try fields(results), "documents")
+  if (docsRaw === undefined || !docsRaw.startsWith("[")) throw new Error("no documents in response")
+  const docs = try elements(docsRaw)
+  if (docs.length === 0) throw new Error("no documents in response")
+  const doc = try fields(docs[0]!)
+  const entRaw = find(doc, "entities")
+  const ents = entRaw !== undefined && entRaw.startsWith("[") ? try elements(entRaw) : []
+  if (ents.length === 0) return { action: "allow", reason: "" }
+  const cats: string[] = []
+  for (const e of ents) cats.push(rawStr(try fields(e), "category") ?? "PII")
+  const action = p.action ?? "detect_only"
+  if (action === "block") return { action: "block", reason: `azure language pii found ${cats.join(", ")}` }
+  if (action === "redact") {
+    const red = rawStr(doc, "redactedText")
+    if (red === undefined) throw new Error("no redactedText in response")
+    return { action: "redact", reason: `azure language pii redacted ${cats.join(", ")}`, text: red }
+  }
+  return { action: "allow", reason: `azure language pii found ${cats.join(", ")}` }
+}
+
+// The Fields of an object-valued key, or undefined.
+// A value that is not an object, or does not parse, reads as undefined.
+function objectAt(fs: Field[], key: string): Field[] | undefined {
+  const raw = find(fs, key)
+  if (raw === undefined || !raw.startsWith("{")) return undefined
+  try {
+    return fields(raw)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Model Armor: NO_MATCH_FOUND allows. A match with SDP de-identified text
+// redacts to that text; a match without it blocks (the template's result is final).
+function modelArmorVerdict(body: string): Verdict throws Error {
+  const sr = objectAt(try fields(body), "sanitizationResult")
+  if (sr === undefined) throw new Error("no sanitizationResult in response")
+  const state = rawStr(sr, "filterMatchState") ?? ""
+  if (state === "NO_MATCH_FOUND") return { action: "allow", reason: "" }
+  if (state !== "MATCH_FOUND") throw new Error("unknown filterMatchState")
+  const fr = objectAt(sr, "filterResults")
+  const sdp = fr === undefined ? undefined : objectAt(fr, "sdp")
+  const dr = sdp === undefined ? undefined : objectAt(sdp, "sdpDeidentifyResult")
+  const data = dr === undefined ? undefined : objectAt(dr, "data")
+  const deid = data === undefined ? undefined : rawStr(data, "text")
+  if (deid !== undefined) return { action: "redact", reason: "model armor de-identified sensitive data", text: deid }
+  return { action: "block", reason: "model armor matched the template" }
+}
+
+// CrowdStrike AIDR: blocked stops the request (display_message or summary as the
+// reason); transformed replaces the text with guard_output. Otherwise allow.
+function aidrVerdict(body: string): Verdict throws Error {
+  const top = try fields(body)
+  const res = objectAt(top, "result")
+  if (res === undefined) throw new Error("no result in response")
+  const blocked = rawBool(res, "blocked") ?? false
+  const transformed = rawBool(res, "transformed") ?? false
+  if (blocked) {
+    const why = rawStr(res, "display_message") ?? rawStr(top, "display_message") ?? rawStr(top, "summary") ?? rawStr(res, "summary") ?? "CrowdStrike AIDR policy"
+    return { action: "block", reason: `blocked by CrowdStrike AIDR policy: ${why}` }
+  }
+  if (transformed) {
+    const go = objectAt(res, "guard_output")
+    const msgRaw = go === undefined ? undefined : find(go, "messages")
+    if (msgRaw === undefined || !msgRaw.startsWith("[")) throw new Error("transformed without guard_output")
+    const msgs = try elements(msgRaw)
+    if (msgs.length !== 1) throw new Error("transformed output count does not match")
+    const t = rawStr(try fields(msgs[0]!), "content")
+    if (t === undefined) throw new Error("transformed output has no content")
+    return { action: "redact", reason: "CrowdStrike AIDR transformed the text", text: t }
+  }
+  return { action: "allow", reason: "" }
+}
+
 // The verdict for a response. A non-2xx status or an unparsable body follows
-// on_error, and the reason says why.
+// on_error, and the reason says why. Presidio needs the request text; use parseVerdictFor.
 export function parseVerdict(p: GuardrailProvider, status: int, body: string): Verdict {
   if (status < 200 || status > 299) return onError(p, `HTTP ${status}`)
   try {
     if (p.kind === "bedrock") return bedrockVerdict(body)
     if (p.kind === "azure_content_safety") return azureVerdict(p, body)
     if (p.kind === "patronus") return patronusVerdict(body)
-    return webhookVerdict(body)
+    if (p.kind === "azure_language_pii") return azurePiiVerdict(p, body)
+    if (p.kind === "google_model_armor") return modelArmorVerdict(body)
+    if (p.kind === "crowdstrike_aidr") return aidrVerdict(body)
+    if (p.kind === "webhook") return webhookVerdict(body)
+    throw new Error("no HTTP verdict for this kind")
+  } catch (e) {
+    return onError(p, `unparsable response: ${e.message}`)
+  }
+}
+
+// parseVerdict with the request text, which Presidio's redaction needs.
+export function parseVerdictFor(p: GuardrailProvider, text: string, status: int, body: string): Verdict {
+  if (p.kind !== "presidio") return parseVerdict(p, status, body)
+  if (status < 200 || status > 299) return onError(p, `HTTP ${status}`)
+  try {
+    return presidioVerdict(p, text, body)
   } catch (e) {
     return onError(p, `unparsable response: ${e.message}`)
   }
@@ -523,4 +745,116 @@ test("completion text is the first choice", () => {
   expect(completionText(`{"choices":[{"message":{"content":null,"tool_calls":[]}}]}`)).toBe("")
   expect(completionText(`{"choices":[]}`)).toBe("")
   expect(completionText(`{"usage":{}}`)).toBe("")
+})
+
+function presidioProvider(): GuardrailProvider {
+  return { id: "pres", kind: "presidio", analyzer_url: "https://presidio.example.com/", api_key: "pk", action: "redact", score_threshold: 0.6 }
+}
+
+test("presidio request posts the text to /analyze", () => {
+  const p = presidioProvider()
+  const r = try checkRequest(p, "mail a@b.co", "input", 0.0)
+  expect(r.url).toBe("https://presidio.example.com/analyze")
+  expect(r.headers.get("authorization")).toBe("Bearer pk")
+  expect(r.body).toBe(`{"text":"mail a@b.co","language":"en","score_threshold":0.6}`)
+  p.entities = ["EMAIL_ADDRESS"]
+  expect((try checkRequest(p, "x", "input", 0.0)).body.endsWith(`,"entities":["EMAIL_ADDRESS"]}`)).toBe(true)
+})
+
+test("presidio redacts by codepoint offsets, after multibyte text", () => {
+  const p = presidioProvider()
+  // "é" is two bytes but one codepoint, so the offsets count it once
+  const text = "é mail a@b.co now"
+  const body = `[{"entity_type":"EMAIL_ADDRESS","start":7,"end":13,"score":0.95}]`
+  const v = parseVerdictFor(p, text, 200, body)
+  expect(v.action).toBe("redact")
+  expect(v.text).toBe("é mail <EMAIL_ADDRESS> now")
+  expect(v.reason).toBe("presidio redacted EMAIL_ADDRESS")
+})
+
+test("presidio thresholds, block and detect_only", () => {
+  const p = presidioProvider()
+  const low = `[{"entity_type":"PERSON","start":0,"end":4,"score":0.3}]`
+  expect(parseVerdictFor(p, "Anna went", 200, low)).toEqual({ action: "allow", reason: "" })
+  expect(parseVerdictFor(p, "Anna went", 200, "[]")).toEqual({ action: "allow", reason: "" })
+  p.action = "block"
+  const hit = `[{"entity_type":"PERSON","start":0,"end":4,"score":0.9}]`
+  expect(parseVerdictFor(p, "Anna went", 200, hit)).toEqual({ action: "block", reason: "presidio found PERSON" })
+  p.action = "detect_only"
+  expect(parseVerdictFor(p, "Anna went", 200, hit).action).toBe("allow")
+  expect(parseVerdictFor(p, "Anna went", 503, hit).reason).toBe("pres guardrail error: HTTP 503")
+  // an offset past the text is clamped, not a crash
+  p.action = "redact"
+  expect(parseVerdictFor(p, "hi", 200, `[{"entity_type":"X","start":1,"end":40,"score":0.9}]`).text).toBe("h<X>")
+})
+
+test("azure language pii request and verdicts", () => {
+  const p: GuardrailProvider = { id: "az", kind: "azure_language_pii", endpoint: "https://lang.example.com", api_key: "k", action: "redact", pii_categories: ["Email"] }
+  const r = try checkRequest(p, "a@b.co", "input", 0.0)
+  expect(r.url).toBe("https://lang.example.com/language/:analyze-text?api-version=2026-05-01")
+  expect(r.headers.get("Ocp-Apim-Subscription-Key")).toBe("k")
+  expect(r.body.includes(`"piiCategories":["Email"]`)).toBe(true)
+  expect(r.body.includes(`"stringIndexType":"UnicodeCodePoint"`)).toBe(true)
+  const hit = `{"kind":"PiiEntityRecognitionResults","results":{"documents":[{"id":"1","redactedText":"***","entities":[{"text":"a@b.co","category":"Email","offset":0,"length":6,"confidenceScore":0.9}]}],"errors":[]}}`
+  expect(parseVerdict(p, 200, hit)).toEqual({ action: "redact", reason: "azure language pii redacted Email", text: "***" })
+  const clean = `{"results":{"documents":[{"id":"1","redactedText":"hi","entities":[]}],"errors":[]}}`
+  expect(parseVerdict(p, 200, clean)).toEqual({ action: "allow", reason: "" })
+  p.action = "block"
+  expect(parseVerdict(p, 200, hit).action).toBe("block")
+  expect(parseVerdict(p, 200, `{"results":{"documents":[]}}`).reason.includes("unparsable")).toBe(true)
+})
+
+function armorProvider(): GuardrailProvider {
+  return { id: "arm", kind: "google_model_armor", project_id: "proj", location: "us", template_id: "tmpl", access_token: "tok" }
+}
+
+test("model armor request uses the template and the token", () => {
+  const r = try checkRequest(armorProvider(), "ignore rules", "input", 0.0)
+  expect(r.url).toBe("https://modelarmor.us.rep.googleapis.com/v1/projects/proj/locations/us/templates/tmpl:sanitizeUserPrompt")
+  expect(r.body).toBe(`{"userPromptData":{"text":"ignore rules"}}`)
+  expect(r.headers.get("authorization")).toBe("Bearer tok")
+  const o = try checkRequest(armorProvider(), "answer", "output", 0.0)
+  expect(o.url.endsWith(":sanitizeModelResponse")).toBe(true)
+  expect(o.body).toBe(`{"modelResponseData":{"text":"answer"}}`)
+})
+
+test("model armor verdicts: no match, match, de-identified match", () => {
+  const p = armorProvider()
+  expect(parseVerdict(p, 200, `{"sanitizationResult":{"filterMatchState":"NO_MATCH_FOUND"}}`)).toEqual({ action: "allow", reason: "" })
+  expect(parseVerdict(p, 200, `{"sanitizationResult":{"filterMatchState":"MATCH_FOUND","filterResults":{"pi_and_jailbreak":{}}}}`)).toEqual({ action: "block", reason: "model armor matched the template" })
+  const sdp = `{"sanitizationResult":{"filterMatchState":"MATCH_FOUND","filterResults":{"sdp":{"sdpDeidentifyResult":{"data":{"text":"my card is [CREDIT_CARD]"}}}}}}`
+  expect(parseVerdict(p, 200, sdp)).toEqual({ action: "redact", reason: "model armor de-identified sensitive data", text: "my card is [CREDIT_CARD]" })
+  expect(parseVerdict(p, 200, `{"sanitizationResult":{"filterMatchState":"WHAT"}}`).reason.startsWith("arm guardrail error: unparsable")).toBe(true)
+})
+
+test("crowdstrike aidr request and verdicts", () => {
+  const p: GuardrailProvider = { id: "cs", kind: "crowdstrike_aidr", api_key: "tk", base_url: "https://api.eu-1.crowdstrike.com/aidr/aiguard/v1/guard_chat_completions", app_id: "bifrost", collector_instance_id: "c1" }
+  const r = try checkRequest(p, "hello", "input", 0.0)
+  expect(r.url).toBe("https://api.eu-1.crowdstrike.com/aidr/aiguard/v1/guard_chat_completions")
+  expect(r.headers.get("authorization")).toBe("Bearer tk")
+  expect(r.body).toBe(`{"event_type":"input","guard_input":{"messages":[{"role":"user","content":"hello"}]},"app_id":"bifrost","collector_instance_id":"c1"}`)
+  const o = try checkRequest({ id: "cs", kind: "crowdstrike_aidr", api_key: "tk" }, "x", "output", 0.0)
+  expect(o.url).toBe("https://api.crowdstrike.com/aidr/aiguard/v1/guard_chat_completions")
+  expect(o.body.includes(`"role":"assistant"`)).toBe(true)
+  const blocked = `{"result":{"blocked":true,"display_message":"Malicious Prompt was detected and blocked."}}`
+  expect(parseVerdict(p, 200, blocked)).toEqual({ action: "block", reason: "blocked by CrowdStrike AIDR policy: Malicious Prompt was detected and blocked." })
+  const tr = `{"result":{"blocked":false,"transformed":true,"guard_output":{"messages":[{"role":"user","content":"my key is [X]"}]}}}`
+  expect(parseVerdict(p, 200, tr)).toEqual({ action: "redact", reason: "CrowdStrike AIDR transformed the text", text: "my key is [X]" })
+  expect(parseVerdict(p, 200, `{"result":{"blocked":false,"transformed":false}}`)).toEqual({ action: "allow", reason: "" })
+  // a transform without its output is a failed call, so on_error applies
+  expect(parseVerdict(p, 200, `{"result":{"blocked":false,"transformed":true}}`).action).toBe("allow")
+  expect(parseVerdict(p, 200, `{"nope":1}`).reason.startsWith("cs guardrail error: unparsable")).toBe(true)
+})
+
+test("local kinds are not sent over HTTP", () => {
+  const rx: GuardrailProvider = { id: "rx", kind: "regex", patterns: [] }
+  expect(isLocal(rx)).toBe(true)
+  expect(isLocal(webhookProvider())).toBe(false)
+  let msg = ""
+  try {
+    checkRequest(rx, "x", "input", 0.0)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("local guardrail kinds run in-process, not over HTTP")
 })

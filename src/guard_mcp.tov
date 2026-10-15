@@ -1,0 +1,73 @@
+// MCP tool-call guard: checks a tool call's name and arguments against the
+// regex and secrets providers whose targets include "mcp", before the call runs.
+// Bifrost's MCP guardrails are rules with target "mcp" that run the same kinds of
+// checks on tool arguments. Only regex and secrets run here: a judge call or an
+// external service for every tool call is left to the LLM path.
+// Tool arguments are not rewritten: a redact finding denies the call, as a block does.
+
+import { GuardrailProvider } from "./guardrail_providers"
+import { CompiledRule } from "./guard_regex"
+import { compileLocal, localVerdict } from "./guard_local"
+import { compileRegex, Regex } from "./regex"
+
+export type ToolGuard = { name: string, tool: Regex | undefined, rules: CompiledRule[] }
+
+export type ToolVerdict = { allowed: bool, reason: string }
+
+// The guards that cover tool calls, compiled once per config.
+export function compileToolGuards(providers: GuardrailProvider[]): ToolGuard[] throws SyntaxError {
+  const out: ToolGuard[] = []
+  for (const p of providers) {
+    if (!(p.targets ?? ["llm"]).includes("mcp")) continue
+    if (p.kind !== "regex" && p.kind !== "secrets") continue
+    const pat = p.tool_pattern ?? ""
+    const tool = pat === "" ? undefined : try compileRegex(`\\A(?:${pat})\\z`)
+    out.push({ name: p.id, tool: tool, rules: try compileLocal(p) })
+  }
+  return out
+}
+
+// Checks one tool call. The first guard that covers the tool and blocks or
+// redacts its arguments denies the call.
+export function checkToolCall(guards: ToolGuard[], tool: string, argumentsJson: string): ToolVerdict {
+  for (const g of guards) {
+    const t = g.tool
+    if (t !== undefined && !t.test(tool)) continue
+    const v = localVerdict(g.rules, argumentsJson)
+    if (v.action === "block" || v.action === "redact") return { allowed: false, reason: `${g.name}: ${v.reason}` }
+  }
+  return { allowed: true, reason: "" }
+}
+
+// ---- tests ----
+
+test("a tool guard blocks matching arguments and ignores other tools", () => {
+  const p: GuardrailProvider = { id: "no-prod-ids", kind: "regex", targets: ["mcp"], tool_pattern: "github-.*", patterns: [{ pattern: "PROJ-\\d+", description: "Project", action: "block" }] }
+  const guards = try compileToolGuards([p])
+  expect(guards.length).toBe(1)
+  const bad = checkToolCall(guards, "github-create_issue", `{"title":"fix PROJ-99"}`)
+  expect(bad.allowed).toBe(false)
+  expect(bad.reason).toBe("no-prod-ids: found PROJECT")
+  expect(checkToolCall(guards, "github-create_issue", `{"title":"fix the login"}`).allowed).toBe(true)
+  expect(checkToolCall(guards, "slack-post", `{"text":"PROJ-99"}`).allowed).toBe(true)
+})
+
+test("a tool guard with no tool pattern covers every tool and redact denies", () => {
+  const p: GuardrailProvider = { id: "keys", kind: "secrets", targets: ["mcp"], action: "redact" }
+  const guards = try compileToolGuards([p])
+  const v = checkToolCall(guards, "anything", `{"token":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`)
+  expect(v.allowed).toBe(false)
+  expect(v.reason.startsWith("keys: found GITHUB-PAT")).toBe(true)
+})
+
+test("providers without the mcp target are not tool guards", () => {
+  const llm: GuardrailProvider = { id: "llm-only", kind: "regex", patterns: [{ pattern: "x", action: "block" }] }
+  const hook: GuardrailProvider = { id: "hook", kind: "webhook", targets: ["mcp"], url: "https://x" }
+  expect((try compileToolGuards([llm, hook])).length).toBe(0)
+  expect(checkToolCall([], "t", "{}").allowed).toBe(true)
+})
+
+test("detect_only tool guards allow the call", () => {
+  const p: GuardrailProvider = { id: "watch", kind: "regex", targets: ["mcp"], patterns: [{ pattern: "rm -rf", action: "detect_only" }] }
+  expect(checkToolCall(try compileToolGuards([p]), "shell", `{"cmd":"rm -rf /tmp/x"}`).allowed).toBe(true)
+})

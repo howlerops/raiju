@@ -177,6 +177,7 @@ function gcsList(bucket: string, prefix: string): string {
 type Model = { model?: string, stream?: bool }
 type Rpc = { id?: int, method: string }
 type EmbedReq = { input?: string | string[] }
+type ChatMsgs = { messages?: { content?: string }[] }
 
 // A deterministic embedding: character bigrams hashed into 64 dimensions, so
 // near-identical texts score close to 1 and unrelated ones well below.
@@ -229,6 +230,21 @@ Bun.serve<string>({
           const sse = chunk(`{"role":"assistant","content":""}`, "null") + chunk(`{"content":"Hel"}`, "null") + chunk(`{"content":"lo"}`, "null") + chunk(`{}`, `"stop"`) +
             `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\ndata: [DONE]\n\n`
           return new Response(sse, { headers: { "content-type": "text/event-stream" } })
+        }
+        // "echo-*": answers with the last user message, so what the gateway wrote into the prompt comes back
+        if (model.startsWith("echo-")) {
+          const em = try JSON.parse(body) as ChatMsgs
+          const msgs = em.messages ?? []
+          const last = msgs.length > 0 ? (msgs[msgs.length - 1]!.content ?? "") : ""
+          return Response.json({ id: "c4", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: last }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 3, total_tokens: 6 } })
+        }
+        // "judge-*": the guardrail judge. Its answer is the ALLOW or BLOCK decision; the user text decides it
+        if (model.startsWith("judge-")) {
+          const jm = try JSON.parse(body) as ChatMsgs
+          const jmsgs = jm.messages ?? []
+          const judged = jmsgs.length > 0 && (jmsgs[jmsgs.length - 1]!.content ?? "").includes("unsafe")
+          const verdict = judged ? '{"action":"BLOCK","reason":"unsafe"}' : '{"action":"ALLOW","reason":"safe"}'
+          return Response.json({ id: "j1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: verdict }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 3, total_tokens: 6 } })
         }
         // "agent-*": asks for the MCP weather tool, then answers with what the tool said
         if (model.startsWith("agent-")) {
@@ -663,6 +679,42 @@ Bun.serve<string>({
         // image models (Titan and Nova Canvas: imageGenerationConfig; Stability: prompt) answer with one image
         if (body.includes("imageGenerationConfig") || body.includes(`"prompt"`)) return new Response(`{"images":["iVBORw0KGgo="]}`, { headers: { "content-type": "application/json" } })
         return new Response(`{"embedding":[0.5,0.25],"inputTextTokenCount":3}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    // guardrail providers, one endpoint each (not recorded). Presidio's analyzer: an email
+    // gets one EMAIL_ADDRESS entity. The request body starts with {"text":" (9 bytes).
+    "/guard/presidio/analyze": {
+      POST: async (req) => {
+        const body = await req.text()
+        const at = body.indexOf("a@b.co")
+        if (at < 0) return new Response("[]", { headers: { "content-type": "application/json" } })
+        return new Response(`[{"entity_type":"EMAIL_ADDRESS","start":${at - 9},"end":${at - 9 + 6},"score":0.95}]`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    // Azure AI Language PII: a US SSN is an entity; the service returns the redacted text.
+    "/guard/azure/language/:action": {
+      POST: async (req) => {
+        const body = await req.text()
+        if (!body.includes("123-45-6789")) return new Response(`{"kind":"PiiEntityRecognitionResults","results":{"documents":[{"id":"1","redactedText":"","entities":[]}],"errors":[]}}`, { headers: { "content-type": "application/json" } })
+        return new Response(`{"kind":"PiiEntityRecognitionResults","results":{"documents":[{"id":"1","redactedText":"ssn ***********","entities":[{"text":"123-45-6789","category":"USSocialSecurityNumber","offset":4,"length":11,"confidenceScore":0.9}]}],"errors":[]}}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    // Model Armor: the token must be the one configured; a prompt injection matches the template
+    "/guard/armor/v1/projects/:project/locations/:location/templates/:tmpl": {
+      POST: async (req) => {
+        if (req.headers.get("authorization") !== "Bearer tok-armor") return new Response(`{"error":"unauthenticated"}`, { status: 401, headers: { "content-type": "application/json" } })
+        const body = await req.text()
+        const hit = req.params.tmpl.endsWith(":sanitizeUserPrompt") && body.includes("ignore previous instructions")
+        return Response.json({ sanitizationResult: { filterMatchState: hit ? "MATCH_FOUND" : "NO_MATCH_FOUND" } })
+      },
+    },
+    // CrowdStrike AIDR guard_chat_completions: the collector token is checked; "aidr-block" is blocked
+    "/guard/aidr/v1/guard_chat_completions": {
+      POST: async (req) => {
+        if (req.headers.get("authorization") !== "Bearer tk-aidr") return new Response(`{"error":"unauthenticated"}`, { status: 401, headers: { "content-type": "application/json" } })
+        const body = await req.text()
+        if (body.includes("aidr-block")) return Response.json({ result: { blocked: true, display_message: "Malicious prompt detected" } })
+        return Response.json({ result: { blocked: false, transformed: false } })
       },
     },
     // an external guardrail (webhook kind): blocks "forbidden", redacts "secret-word"

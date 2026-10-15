@@ -1,0 +1,194 @@
+// Reversible redaction: each finding becomes a numbered placeholder such as
+// [EMAIL-1] in the request, and the response's placeholders are restored from
+// the same per-request vault. Bifrost's runtime_reversible mode does not restore
+// responses; it keeps the mapping for log reveal. Restoring here is Raiju's
+// extension, and it is opt-in (the gateway decides when to call restoreCompletion).
+
+import { Finding, GuardConfig, scan } from "./guardrails"
+import { fields, elements, find, rawStr, build, setField, quote, decodeString } from "./json"
+
+export type VaultItem = { token: string, value: string }
+
+// One vault per request. Placeholders for equal values are equal, so a value that
+// appears twice is one placeholder.
+export class Vault {
+  items: VaultItem[] = []
+  count: int = 0
+
+  tokenFor(kind: string, value: string): string {
+    const prefix = `[${kind}-`
+    for (const it of this.items) {
+      if (it.value === value && it.token.startsWith(prefix)) return it.token
+    }
+    let n = 1
+    for (const it of this.items) {
+      if (it.token.startsWith(prefix)) n += 1
+    }
+    const tok = `[${kind}-${n}]`
+    this.items.push({ token: tok, value: value })
+    this.count += 1
+    return tok
+  }
+
+  // Replaces each issued placeholder in text with its original value.
+  restore(text: string): string {
+    let out = text
+    for (const it of this.items) out = out.split(it.token).join(it.value)
+    return out
+  }
+}
+
+// Replaces findings with placeholders from the vault. Overlapping findings are skipped.
+export function tokenize(text: string, findings: Finding[], vault: Vault): string {
+  const sorted = findings.slice().sort((x: Finding, y: Finding) => x.start - y.start)
+  let out = ""
+  let pos = 0
+  for (const f of sorted) {
+    if (f.start < pos || f.end <= f.start) continue
+    out += text.slice(pos, f.start) + vault.tokenFor(f.kind.toUpperCase(), text.slice(f.start, f.end))
+    pos = f.end
+  }
+  return out + text.slice(pos, text.byteLength)
+}
+
+// Scans one text with the built-in detectors and tokenizes what it finds.
+export function tokenizeText(text: string, cfg: GuardConfig, vault: Vault): string {
+  const f = scan(text, cfg)
+  if (f.length === 0) return text
+  return tokenize(text, f, vault)
+}
+
+// Rebuilds one message's content with f applied to each text. Only a changed
+// message is rebuilt; other fields come back byte-identical.
+function mapMessage(m: string, f: (t: string) => string): string throws SyntaxError {
+  let fs = try fields(m)
+  const c = find(fs, "content")
+  if (c === undefined) return m
+  if (c.startsWith("\"")) {
+    const s = try decodeString(c)
+    const r = f(s)
+    if (r === s) return m
+    setField(&fs, "content", quote(r))
+    return build(fs)
+  }
+  if (c.startsWith("[")) {
+    const parts = try elements(c)
+    const out: string[] = []
+    let touched = false
+    for (const p of parts) {
+      let pfs = try fields(p)
+      const t = rawStr(pfs, "text")
+      if (t === undefined) {
+        out.push(p)
+        continue
+      }
+      const r = f(t)
+      if (r === t) {
+        out.push(p)
+        continue
+      }
+      setField(&pfs, "text", quote(r))
+      out.push(build(pfs))
+      touched = true
+    }
+    if (!touched) return m
+    setField(&fs, "content", "[" + out.join(",") + "]")
+    return build(fs)
+  }
+  return m
+}
+
+// Applies f to every message text of an OpenAI chat request body.
+export function mapChatTexts(body: string, f: (t: string) => string): string throws SyntaxError {
+  let fs = try fields(body)
+  const raw = find(fs, "messages")
+  if (raw === undefined || !raw.startsWith("[")) return body
+  const out: string[] = []
+  let changed = false
+  for (const m of try elements(raw)) {
+    const r = try mapMessage(m, f)
+    if (r !== m) changed = true
+    out.push(r)
+  }
+  if (!changed) return body
+  setField(&fs, "messages", "[" + out.join(",") + "]")
+  return build(fs)
+}
+
+// Tokenizes every message of a chat request body.
+export function tokenizeChatRequest(body: string, cfg: GuardConfig, vault: Vault): string throws SyntaxError {
+  return try mapChatTexts(body, (t: string) => tokenizeText(t, cfg, vault))
+}
+
+// Restores placeholders in the content of every choice of a chat completion.
+export function restoreCompletion(body: string, vault: Vault): string throws SyntaxError {
+  if (vault.items.length === 0) return body
+  let fs = try fields(body)
+  const raw = find(fs, "choices")
+  if (raw === undefined || !raw.startsWith("[")) return body
+  const out: string[] = []
+  let changed = false
+  for (const ch of try elements(raw)) {
+    let cf = try fields(ch)
+    const mraw = find(cf, "message")
+    if (mraw === undefined || !mraw.startsWith("{")) {
+      out.push(ch)
+      continue
+    }
+    const nm = try mapMessage(mraw, (t: string) => vault.restore(t))
+    if (nm === mraw) {
+      out.push(ch)
+      continue
+    }
+    setField(&cf, "message", nm)
+    out.push(build(cf))
+    changed = true
+  }
+  if (!changed) return body
+  setField(&fs, "choices", "[" + out.join(",") + "]")
+  return build(fs)
+}
+
+// ---- tests ----
+
+test("placeholders are numbered per kind and reused for equal values", () => {
+  const v = new Vault()
+  expect(v.tokenFor("EMAIL", "a@b.co")).toBe("[EMAIL-1]")
+  expect(v.tokenFor("SSN", "123-45-6789")).toBe("[SSN-1]")
+  expect(v.tokenFor("EMAIL", "c@d.org")).toBe("[EMAIL-2]")
+  expect(v.tokenFor("EMAIL", "a@b.co")).toBe("[EMAIL-1]")
+  expect(v.count).toBe(3)
+})
+
+test("request text is tokenized and the response is restored", () => {
+  const cfg: GuardConfig = { detect: ["email", "ssn"], mode: "redact" }
+  const v = new Vault()
+  const body = `{"model":"m","messages":[{"role":"user","content":"mail jane@example.com, ssn 123-45-6789"},{"role":"user","content":[{"type":"text","text":"again jane@example.com"},{"type":"image_url","image_url":{"url":"https://x"}}]}]}`
+  const sent = try tokenizeChatRequest(body, cfg, v)
+  expect(sent.includes("mail [EMAIL-1], ssn [SSN-1]")).toBe(true)
+  expect(sent.includes("again [EMAIL-1]")).toBe(true)
+  expect(sent.includes("jane@example.com")).toBe(false)
+  expect(sent.includes(`{"type":"image_url","image_url":{"url":"https://x"}}`)).toBe(true)
+  expect(sent.startsWith(`{"model":"m",`)).toBe(true)
+
+  const reply = `{"id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"I will write to [EMAIL-1] about [SSN-1]."},"finish_reason":"stop"}]}`
+  const back = try restoreCompletion(reply, v)
+  expect(back.includes("I will write to jane@example.com about 123-45-6789.")).toBe(true)
+  expect(back.includes(`"finish_reason":"stop"`)).toBe(true)
+})
+
+test("a clean request is unchanged and an empty vault restores nothing", () => {
+  const cfg: GuardConfig = { detect: ["email"], mode: "redact" }
+  const v = new Vault()
+  const body = `{"messages":[{"role":"user","content":"hello"}]}`
+  expect(try tokenizeChatRequest(body, cfg, v)).toBe(body)
+  expect(v.items.length).toBe(0)
+  const reply = `{"choices":[{"message":{"role":"assistant","content":"[EMAIL-1]"}}]}`
+  expect(try restoreCompletion(reply, v)).toBe(reply)
+})
+
+test("a placeholder the model did not get back is left as it is", () => {
+  const v = new Vault()
+  v.tokenFor("EMAIL", "a@b.co")
+  expect(v.restore("[EMAIL-2] and [EMAIL-1]")).toBe("[EMAIL-2] and a@b.co")
+})
