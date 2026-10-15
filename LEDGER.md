@@ -207,19 +207,36 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L81 | G36, G38 | Decisions API, typesafe provider, decision-model complexity classifier | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
-| L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
-| L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
-| L84 | G41 | Projects, business units, custom roles and data access scopes | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
+| L81 | G36, G38 | Decisions API, typesafe provider, decision-model complexity classifier | worker | assigned: resumed from handoff/patches |
+| L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | assigned: resumed from handoff/patches |
+| L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | assigned: resumed from handoff/patches |
+| L84 | G41 | Projects, business units, custom roles and data access scopes | worker | assigned: resumed from handoff/patches |
 | L85 | G42 | BigQuery, Kafka, Pub/Sub sinks; Parquet payloads; export retention | worker | done (wired by L89) |
 | L86 | G43 | Guardrails: regex, secrets rule set, reversible redaction, LLM judge, MCP tool-call guard, Presidio, Azure PII, Model Armor, CrowdStrike | worker | done (wired by L90) |
 | L87 | G44, G45 | Cluster discovery (Kubernetes, DNS, Consul, etcd, mDNS, UDP), leader election; auth proxies | worker | done except UDP/mDNS (Tov has no UDP: L92) and broker mode |
-| L88 | G46 | Prompt repository and deployments, webhooks, feature flags, notifications | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
+| L88 | G46 | Prompt repository and deployments, webhooks, feature flags, notifications | worker | assigned: resumed from handoff/patches |
 
 | L89 | G42 | Wire the sinks into ops (BigQuery, Pub/Sub, Kafka, Maxim, Parquet, retention) with gateway-level e2e | worker | done: unit + e2e (both servers) |
 | L90 | G43 | Wire the guardrails into the gateway (local engines, LLM judge, MCP tool guard, reversible) with e2e | worker | done: unit + e2e (both servers); Gitleaks set is a 35-rule subset |
-| L91 | G47, G22 | Circuit-breaker policy rerouting (persisted); MCP OAuth authorization-code flows | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
-| L92 | G29, G44 | Tov patches 0003 (TLS ALPN) and 0004 (UDP); TLS gRPC export; UDP and mDNS discovery | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
+| L91 | G47, G22 | Circuit-breaker policy rerouting (persisted); MCP OAuth authorization-code flows | worker | assigned: resumed from handoff/patches |
+| L92 | G29, G44 | Tov patches 0003 (TLS ALPN) and 0004 (UDP); TLS gRPC export; UDP and mDNS discovery | worker | assigned: resumed from handoff/patches |
+
+## Wave 13: what remains after wave 12
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L93 | G43 | Full Gitleaks rule set (from upstream gitleaks.toml, not memory) | worker | todo |
+| L94 | G44 | Broker-mode clustering (relay process) and lock-based leader election | worker | todo (after L92: shares discovery code) |
+| L95 | G4, cache | Owner switches, defaults unchanged: refuse unpriced models; exact-match cache scoped per virtual key | worker | todo |
+| L96 | G32, G33, all | Re-audit docs/parity.md (rows counted by script) and bring SCOPE.md and README in sync | worker | todo (after waves 12-13 merge) |
+| L97 | from L96 | Whatever the re-audit still lists as missing or partial and buildable | workers | todo |
+
+## UI track
+
+| ID | Work | Owner | Status |
+|---|---|---|---|
+| L98 | OpenAPI spec for the management API, checked against the routes | worker | todo |
+| L99 | Native client spike (providers list plus live logs) in gpui and Slint; compare | worker | todo (after L98) |
 
 Decision taken by the lead: models without a price stay a warning (cost 0), as in Bifrost;
 refusing them is a one-line switch if the owner wants it.
