@@ -133,8 +133,9 @@ def eventstream(data: bytes):
     return out
 
 def background(x):
-    """Requests gateways send on their own schedule: MCP handshakes and tool listings, vault reads."""
-    if x["path"] == "/v1/secret/data/raiju":
+    """Requests gateways send on their own schedule: MCP handshakes and tool listings, vault reads,
+    and log exporter flushes (a flush landing between a request and seen() would read as that request)."""
+    if x["path"] in ("/v1/secret/data/raiju", "/_bulk", "/export-hook"):
         return True
     return x["path"].startswith("/mcp") and any(m in x.get("body", "") for m in ('"tools/list"', '"initialize"', '"notifications/'))
 
@@ -1960,8 +1961,8 @@ def main():
         check("request logs are exported to object storage", puts and puts[0]["path"].endswith(".jsonl") and puts[0]["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") and any("gpt-4o-mini" in l.get("model", "") for l in lines), [p["path"] for p in puts][:3])
 
         # log exporters
-        hooks = [x for x in seen() if x["path"] == "/export-hook"]
-        bulk = [x for x in seen() if x["path"] == "/_bulk"]
+        hooks = [x for x in seen(traces=True) if x["path"] == "/export-hook"]
+        bulk = [x for x in seen(traces=True) if x["path"] == "/_bulk"]
         lines = [json.loads(l) for x in hooks for l in x["body"].strip().split("\n") if l]
         check("request logs reach an HTTP exporter as NDJSON", hooks and any("gpt-4o-mini" in l.get("model", "") for l in lines), [h["body"][:200] for h in hooks[:1]])
         bl = bulk[0]["body"].split("\n") if bulk else []
