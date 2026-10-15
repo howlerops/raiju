@@ -8,7 +8,8 @@ import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pus
 import { Engine } from "./gateway"
 import { LogStore, LogEntry, defaultLogStoreConfig, gridOf, filterFrom, selectAll, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
-import { parsePolicy, policyView } from "./health"
+import { parsePolicy, policyView, policyConfigOf } from "./health"
+import { CircuitPolicyConfig } from "./config"
 import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin } from "./store"
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, allowed, provisioned } from "./rbac"
@@ -23,7 +24,7 @@ import { notify, notifyOnce } from "./notify"
 import * as exporters from "./exporters"
 import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
-import { Field, fields, find, rawStr, isNull, elements } from "./json"
+import { Field, fields, find, rawStr, rawBool, isNull, elements } from "./json"
 import { trimSlash } from "./providers/types"
 import { snapshot, errorJson } from "./schemas"
 import { deadline } from "./deadline"
@@ -50,6 +51,14 @@ function epochParam(raw: string | undefined, fallback: f64): f64 {
 }
 
 // Ascending by name: the order of the model lists.
+// The index of the circuit policy called name in the config's list, or -1.
+function policyAt(list: CircuitPolicyConfig[], name: string): int {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i]!.name === name) return i
+  }
+  return -1
+}
+
 function byName(a: string, b: string): int {
   if (a === b) return 0
   return a < b ? -1 : 1
@@ -781,11 +790,14 @@ export class Ops {
   }
 
   // /api/circuit-breaker/policies (GET, POST) and /api/circuit-breaker/policies/{name} (PUT, DELETE).
+  // Writes go to the config (circuit_breaker_policies) and are saved, so they survive a restart and
+  // reach every worker through onChange; the live breakers are updated at once as well.
   circuitPoliciesRoute(method: string, path: string, body: string): Reply {
     const h = this.engine.health
     const rest = path.slice("/api/circuit-breaker/policies".byteLength)
     const one = rest.startsWith("/") ? rest.slice(1) : ""
     if (rest !== "" && one === "") return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
+    const cur: CircuitPolicyConfig[] = this.store.cfg.circuit_breaker_policies ?? []
     if (one === "") {
       if (method === "GET") {
         const rows: string[] = []
@@ -795,20 +807,44 @@ export class Ops {
       if (method !== "POST") return { status: 405, body: errorJson("use GET or POST", "invalid_request_error", undefined), contentType: "application/json" }
       const pr = parsePolicy(body, "")
       if (!pr.ok) return badRequest(pr.err)
-      if (!h.policyAdd(pr.p)) return { status: 409, body: errorJson(`a policy named ${pr.p.name} already exists`, "invalid_request_error", undefined), contentType: "application/json" }
+      if (h.policyFind(pr.p.name) !== undefined) return { status: 409, body: errorJson(`a policy named ${pr.p.name} already exists`, "invalid_request_error", undefined), contentType: "application/json" }
+      const saved = this.savePolicies(cur.concat([policyConfigOf(pr.p)]))
+      if (saved !== undefined) return saved
+      h.policyAdd(pr.p)
       return { status: 201, body: policyView(pr.p), contentType: "application/json" }
     }
     if (method === "PUT") {
       const pr = parsePolicy(body, one)
       if (!pr.ok) return badRequest(pr.err)
-      if (!h.policyReplace(one, pr.p)) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      const at = policyAt(cur, one)
+      if (at < 0) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      const next: CircuitPolicyConfig[] = []
+      for (let i = 0; i < cur.length; i++) next.push(i === at ? policyConfigOf(pr.p) : cur[i]!)
+      const saved = this.savePolicies(next)
+      if (saved !== undefined) return saved
+      h.policyReplace(one, pr.p)
       return okJson(policyView(pr.p))
     }
     if (method === "DELETE") {
-      if (!h.policyDelete(one)) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      const at = policyAt(cur, one)
+      if (at < 0) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      const next: CircuitPolicyConfig[] = []
+      for (const c of cur) {
+        if (c.name !== one) next.push(c)
+      }
+      const saved = this.savePolicies(next)
+      if (saved !== undefined) return saved
+      h.policyDelete(one)
       return okJson(JSON.stringify({ message: `policy ${one} deleted` }))
     }
     return { status: 405, body: errorJson("use PUT or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+  }
+
+  // Saves the policy list to the config. A reply to send back when the save fails.
+  private savePolicies(list: CircuitPolicyConfig[]): Reply | undefined {
+    const r = this.store.setCircuitPolicies(list)
+    if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "api_error", undefined), contentType: "application/json" }
+    return undefined
   }
 
   // ---- /api/session/*: login, logout and the auth state ----
@@ -910,6 +946,23 @@ export class Ops {
       parts.push(JSON.stringify(t.id) + ":" + JSON.stringify(t.state))
     }
     return { status: 200, body: `{"circuits":{${parts.join(",")}}}`, contentType: "application/json" }
+  }
+
+  // POST /api/circuit-breaker/reset: closes one circuit now, by its id (a target id as the state
+  // view lists it, or a policy name), or every circuit with {"all": true}. The cooldown is dropped.
+  circuitReset(body: string): Reply {
+    let fs: Field[] = []
+    try {
+      fs = try fields(body)
+    } catch (e) {
+      return badRequest("the body must be a JSON object")
+    }
+    const h = this.engine.health
+    if (rawBool(fs, "all") === true) return okJson(JSON.stringify({ message: "all circuits reset", circuits: h.resetAll() }))
+    const id = rawStr(fs, "id") ?? ""
+    if (id === "") return badRequest("reset needs an id (a target id or a policy name), or all: true")
+    if (!h.reset(id)) return { status: 404, body: errorJson(`no circuit named ${id}`, "not_found_error", undefined), contentType: "application/json" }
+    return okJson(JSON.stringify({ message: `circuit ${id} reset` }))
   }
 
   // GET /api/logs/histogram: request counts per time bucket, in Bifrost's shape. start_time and
@@ -1754,6 +1807,21 @@ test("circuit view lists only the circuits that are not closed", () => {
   expect(ops.circuitView().body).toBe(`{"circuits":{}}`)
   for (let i = 0; i < 20; i++) eng.health.record("openai#k1", false, 100.0, Date.now())
   expect(ops.circuitView().body.includes("\"openai#k1\":\"open\"")).toBe(true)
+})
+
+test("circuit reset closes one circuit by id, or all of them", () => {
+  const eng = new Engine({})
+  const ops = new Ops(eng, new ConfigStore("/tmp/raiju-ops-reset.json", {}))
+  for (let i = 0; i < 20; i++) eng.health.record("openai#k1", false, 100.0, Date.now())
+  for (let i = 0; i < 20; i++) eng.health.record("openai#k2", false, 100.0, Date.now())
+  expect(ops.circuitReset("not json").status).toBe(400)
+  expect(ops.circuitReset(`{}`).status).toBe(400)
+  expect(ops.circuitReset(`{"id":"nope"}`).status).toBe(404)
+  expect(ops.circuitReset(`{"id":"openai#k1"}`).status).toBe(200)
+  expect(ops.circuitView().body.includes("openai#k1")).toBe(false)
+  expect(ops.circuitView().body.includes("openai#k2")).toBe(true)
+  expect(ops.circuitReset(`{"all":true}`).status).toBe(200)
+  expect(ops.circuitView().body).toBe(`{"circuits":{}}`)
 })
 
 test("model parameters resolve qualified and bare names; the datasheet's keys are read as given", () => {

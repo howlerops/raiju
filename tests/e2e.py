@@ -15,6 +15,7 @@ MOCK = "http://127.0.0.1:18099"
 AWS_KEY = "AKIA" + "Z7Q3XW2MKLR5BNTE"
 GW_B = "http://127.0.0.1:18097"
 GW_D = "http://127.0.0.1:18092"
+GW_POL = "http://127.0.0.1:18121"  # circuit policies, and an MCP client authorized by the authorization code flow
 GW_G = "http://127.0.0.1:18116"  # exports OTLP over gRPC to tests/otlp_grpc_collector.py
 GW_C = "http://127.0.0.1:18118"  # compat: x-bf-compat only (no client.compat)
 GW_CC = "http://127.0.0.1:18119"  # compat: client.compat set
@@ -144,6 +145,18 @@ def background(x):
     if x["path"] in ("/v1/secret/data/raiju", "/_bulk", "/export-hook", "/alert-hook") or x["path"].startswith("/logs/"):
         return True
     return x["path"].startswith("/mcp") and any(m in x.get("body", "") for m in ('"tools/list"', '"initialize"', '"notifications/'))
+
+def wait_mcp_tools(base, names, tries=120):
+    """Waits until the gateway's MCP clients have listed their tools. Agent mode adds them to every
+    chat request, so a request sent before the listing finishes has a different body (and cache key)."""
+    s, h, _ = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-ready", "version": "1"}}}, base=base)
+    sid = {k.lower(): v for k, v in h.items()}.get("mcp-session-id", "")
+    for _ in range(tries):
+        _, _, b = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {"mcp-session-id": sid}, base=base)
+        if all(n in b for n in names):
+            return
+        time.sleep(0.25)
+    raise SystemExit(f"MCP tools {names} never listed on {base}")
 
 def seen(traces=False):
     """What the mock received; trace exports and background MCP listings arrive asynchronously,
@@ -294,6 +307,16 @@ def write_config():
     datasheet = {"url": MOCK + "/cdatasheet", "enabled": False}
     json.dump({"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "providers": compat_provider, "pricing_sync": datasheet}, open(os.path.join(BUILD, "e2e.compat.json"), "w"))
     json.dump({"client": {"enable_logging": False, "enforce_auth_on_inference": False, "compat": {}}, "providers": compat_provider, "pricing_sync": datasheet}, open(os.path.join(BUILD, "e2e.compat-cfg.json"), "w"))
+    # circuit breaker policies: the primary's quota header opens its circuit, and the next request goes to the fallback.
+    # Policies come from the file at start (circuit_breaker_policies); the API's writes are saved back to it.
+    pol = {"client": {"enable_logging": False, "enforce_auth_on_inference": False},
+           "providers": {
+               "polpri": {"keys": [{"name": "pp", "value": "sk-pol-primary", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
+               "openai": {"keys": [{"name": "fb", "value": "sk-pol-fallback", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+           "circuit_breaker_policies": [{"name": "quota", "primary_provider": "polpri", "primary_model": "policy-quota", "fallback_provider": "openai", "fallback_model": "gpt-4o-mini",
+                                         "condition": {"signals": [{"source": "response_header", "header_name": "x-quota-state", "header_value": "exhausted"}]}, "default_cooldown": "1m"}],
+           "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False}}
+    json.dump(pol, open(os.path.join(BUILD, "e2e.pol.json"), "w"))
     return path
 
 def make_tls():
@@ -529,8 +552,8 @@ def discovery_and_proxy():
         "dns": (18080, cluster("dns-a", {"enabled": True, "type": "dns", "dns_names": ["localhost"], "bind_port": 18084}, 18080)),
         "k8s": (18082, cluster("k8s-a", {"enabled": True, "type": "kubernetes", "k8s_label_selector": "app=bifrost", "bind_port": 18084, "api_url": "http://127.0.0.1:18086", "token_file": token_file}, 18082)),
         "etcd": (18090, cluster("etcd-a", {"enabled": True, "type": "etcd", "service_name": "bifrost", "etcd_endpoints": ["http://127.0.0.1:18088"], "bind_port": 18090, "advertise_address": "127.0.0.1"}, 18090)),
-        "udp": (18103, cluster("udp-a", {"enabled": True, "type": "udp", "service_name": "bifrost-udp", "udp_broadcast_port": UDP_BEACON_PORT, "allowed_address_space": ["127.0.0.0/8"], "bind_port": 18103}, 18103)),
-        "mdns": (18104, cluster("mdns-a", {"enabled": True, "type": "mdns", "mdns_service": MDNS_SERVICE, "bind_port": 18104, "advertise_address": "127.0.0.1"}, 18104)),
+        "udp": (18125, cluster("udp-a", {"enabled": True, "type": "udp", "service_name": "bifrost-udp", "udp_broadcast_port": UDP_BEACON_PORT, "allowed_address_space": ["127.0.0.0/8"], "bind_port": 18125}, 18125)),
+        "mdns": (18126, cluster("mdns-a", {"enabled": True, "type": "mdns", "mdns_service": MDNS_SERVICE, "bind_port": 18126, "advertise_address": "127.0.0.1"}, 18126)),
         "alb": (18091, {"client": {"enable_logging": False}, "governance": {"users": [{"name": "alice@example.com", "role": "editor"}]},
                         "auth_proxy": {"enabled": True, "provider": "aws-alb", "mode": "login_only", "expected_signer": ALB_ARN, "region": "us-east-1", "public_key_base_url": KEYS, "ca_cert_pem": ca_pem}}),
         "cf": (18078, {"client": {"enable_logging": False}, "governance": {"users": [{"name": "ops@example.com", "role": "viewer"}]},
@@ -961,8 +984,10 @@ def main():
     # the complexity classifiers that ask a model: one gateway per classifier (18103 decision, 18104 llm, 18105 semantic)
     gw_cls = {name: subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", os.path.join(BUILD, f"e2e.cls-{name}.json")], env=env, stderr=open(os.path.join(BUILD, f"e2e.cls-{name}.log"), "w"))
               for name, port in [("decision", 18103), ("llm", 18104), ("semantic", 18105)]}
+    gw_pol = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18121", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.pol.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.pol.log"), "w"))
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
+        wait_mcp_tools(GW, ["weather-get_weather", "secure-get_weather", "local-echo"])
 
         s, h, b = chat("openai/gpt-4o-mini")
         r = json.loads(b)
@@ -2389,6 +2414,90 @@ def main():
         s, _, b = call("DELETE", "/api/circuit-breaker/policies/quota-fallback")
         check("circuit policy delete of an unknown name is a 404", s == 404, (s, b))
 
+        # circuit policies on their own gateway: the quota header trips the policy, and the next request goes to the fallback
+        wait(GW_POL + "/health")
+        def upstream_calls():
+            out = []
+            for x in seen():
+                if x["path"] != "/v1/chat/completions":
+                    continue
+                try:
+                    out.append((json.loads(x["body"]).get("model"), x["auth"]))
+                except ValueError:
+                    pass
+            return out
+        before = upstream_calls()
+        pol_msg = {"model": "polpri/policy-quota", "messages": [{"role": "user", "content": "hi"}]}
+        s, _, b = call("POST", "/v1/chat/completions", pol_msg, base=GW_POL)
+        check("the primary answers while its circuit is closed", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "from the primary", (s, b))
+        s, _, b = call("POST", "/v1/chat/completions", pol_msg, base=GW_POL)
+        check("after the quota header, the next request goes to the fallback", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hello from gpt-4o-mini", (s, b))
+        mid = upstream_calls()[len(before):]
+        check("the fallback got the request with its own key, and the primary was not called again", mid == [("policy-quota", "Bearer sk-pol-primary"), ("gpt-4o-mini", "Bearer sk-pol-fallback")], mid)
+        s, _, b = call("GET", "/api/circuit-breaker/state", base=GW_POL)
+        check("the open policy circuit is in the state view", s == 200 and json.loads(b)["circuits"].get("quota") == "open", (s, b))
+        s, _, b = call("POST", "/api/circuit-breaker/reset", {"id": "nope"}, base=GW_POL)
+        check("a circuit reset of an unknown id is a 404", s == 404, (s, b))
+        s, _, b = call("POST", "/api/circuit-breaker/reset", {"id": "quota"}, base=GW_POL)
+        check("a circuit reset closes the policy's circuit", s == 200, (s, b))
+        s, _, b = call("GET", "/api/circuit-breaker/state", base=GW_POL)
+        check("a reset circuit leaves the state view", s == 200 and "quota" not in json.loads(b)["circuits"], (s, b))
+        s, _, b = call("POST", "/v1/chat/completions", pol_msg, base=GW_POL)
+        check("after the reset the primary answers again", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "from the primary", (s, b))
+        s, _, b = call("GET", "/api/circuit-breaker/policies", base=GW_POL)
+        check("the policy from the config file is listed", s == 200 and any(p["name"] == "quota" for p in json.loads(b)["policies"]), (s, b))
+        s, _, b = call("POST", "/api/circuit-breaker/policies", {"name": "second", "primary_provider": "polpri", "primary_model": "other", "fallback_provider": "openai", "fallback_model": "gpt-4o", "condition": {"signals": [{"source": "response_header", "header_name": "x-other"}]}}, base=GW_POL)
+        saved_names = [p["name"] for p in json.load(open(os.path.join(BUILD, "e2e.pol.json")))["circuit_breaker_policies"]]
+        check("a policy written through the API is saved to the config file", s == 201 and "second" in saved_names, (s, b, saved_names))
+        s, _, b = call("DELETE", "/api/circuit-breaker/policies/second", base=GW_POL)
+        saved_names = [p["name"] for p in json.load(open(os.path.join(BUILD, "e2e.pol.json")))["circuit_breaker_policies"]]
+        check("a deleted policy leaves the config file", s == 200 and "second" not in saved_names, (s, b, saved_names))
+
+        # MCP OAuth: authorization code with PKCE and dynamic client registration. The client is not connected until the
+        # browser flow returns to the callback; a revoked access token is refreshed on the next call.
+        s, _, b = call("POST", "/api/mcp/client", {"name": "authcode", "connection_type": "http", "connection_string": MOCK + "/mcp-oauth", "auth": {"type": "oauth"}}, base=GW_POL)
+        check("an OAuth client is created", s in (200, 201), (s, b))
+        st = json.loads(call("GET", "/api/mcp", base=GW_POL)[2])["clients"]
+        ac = [c for c in st if c["name"] == "authcode"]
+        check("before the flow the OAuth client is not connected", ac and not ac[0]["connected"], st)
+        s, _, b = call("POST", "/api/mcp/client/authcode/initiate-verification", base=GW_POL)
+        init = json.loads(b) if s == 200 else {}
+        auth_url = init.get("authorize_url", "")
+        check("initiate-verification returns a PKCE authorize URL", s == 200 and init.get("status") == "pending_oauth" and "code_challenge_method=S256" in auth_url and "client_id=raiju-dcr-client" in auth_url, (s, b))
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        loc = ""
+        try:
+            urllib.request.build_opener(NoRedirect).open(auth_url, timeout=10)
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("location", "")
+        lu = urllib.parse.urlparse(loc)
+        lq = dict(urllib.parse.parse_qsl(lu.query))
+        check("the authorization server redirects to the callback with a code and the state", lu.path == "/api/oauth/callback" and "code" in lq and lq.get("state") == init.get("oauth_config_id"), loc)
+        s, _, b = call("GET", lu.path + "?" + lu.query, base=GW_POL)
+        check("the callback exchanges the code and reports the client authorized", s == 200 and "is authorized" in b, (s, b))
+        s, _, b = call("POST", "/api/mcp/client/authcode/complete-oauth", base=GW_POL)
+        check("complete-oauth answers once the client is authorized", s == 200, (s, b))
+        ac = []
+        for _ in range(100):
+            ac = [c for c in json.loads(call("GET", "/api/mcp", base=GW_POL)[2])["clients"] if c["name"] == "authcode" and c["connected"]]
+            if ac:
+                break
+            time.sleep(0.1)
+        check("the authorized client connects with its token", ac and ac[0]["tools"] == 1, ac)
+        s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "call_oa1", "type": "function", "function": {"name": "authcode-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, base=GW_POL)
+        check("an OAuth MCP tool runs on the authorized token", s == 200 and "Sunny in Oslo" in b, (s, b))
+        saved = [c for c in json.load(open(os.path.join(BUILD, "e2e.pol.json")))["mcp"]["client_configs"] if c["name"] == "authcode"]
+        check("the tokens are saved on the client", saved and saved[0]["auth"].get("refresh_token") == "oauth-refresh-1" and saved[0]["auth"].get("access_token", "").startswith("oauth-access-"), saved)
+        call("POST", "/_oauth/revoke", base=MOCK)
+        s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "call_oa2", "type": "function", "function": {"name": "authcode-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, base=GW_POL)
+        check("a revoked access token is refreshed on the next call", s == 200 and "Sunny in Oslo" in b, (s, b))
+        grants = [x["body"] for x in seen() if x["path"] == "/oauth2/token"]
+        check("the code exchange sent its PKCE verifier", any("grant_type=authorization_code" in g and "code_verifier=" in g for g in grants), grants)
+        check("the refresh used the stored refresh token", any("grant_type=refresh_token" in g and "refresh_token=oauth-refresh-1" in g for g in grants), grants)
+
         # the log analytics: every histogram answers with buckets in the default day
         for hp in ["tokens", "cost", "models", "latency", "throughput", "cost/by-provider", "tokens/by-provider", "latency/by-provider", "throughput/by-provider"]:
             s, _, b = call("GET", "/api/logs/histogram/" + hp)
@@ -2577,7 +2686,7 @@ def main():
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
-        gw_l.terminate(); gw_enc.terminate(); gw_guard.terminate(); gw_rules.terminate()
+        gw_l.terminate(); gw_enc.terminate(); gw_guard.terminate(); gw_rules.terminate(); gw_pol.terminate()
         gw_c.terminate(); gw_cc.terminate()
         for p in gw_cls.values(): p.terminate()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")

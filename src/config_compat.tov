@@ -10,7 +10,7 @@ import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString, b
 // Raiju's top-level keys (the Config type in config.tov), plus the Bifrost
 // sections this module reads and the pricing_sync key it writes.
 function topKeys(): string[] {
-  return ["encryption_key", "client", "providers", "governance", "cache", "pricing", "prompt_cache", "health", "guardrails", "logs_store", "otel", "mcp", "plugins", "semantic_cache", "vector_store", "secrets", "audit", "alerts", "session_affinity", "complexity_router", "mcp_server", "virtual_mcps", "log_exports", "exporters", "cluster", "oidc", "framework", "auth_config", "alerting", "audit_logs", "cluster_config", "circuit_breaker_config", "load_balancer_config", "pricing_sync", "guardrails_config", "$schema", "auth_proxy", "scim_config", "prompt_repo", "webhooks", "feature_flags"]
+  return ["encryption_key", "client", "providers", "governance", "cache", "pricing", "prompt_cache", "health", "guardrails", "logs_store", "otel", "mcp", "plugins", "semantic_cache", "vector_store", "secrets", "audit", "alerts", "session_affinity", "complexity_router", "mcp_server", "virtual_mcps", "log_exports", "exporters", "cluster", "oidc", "framework", "auth_config", "alerting", "audit_logs", "cluster_config", "circuit_breaker_config", "load_balancer_config", "pricing_sync", "guardrails_config", "$schema", "auth_proxy", "circuit_breaker_policies", "scim_config", "prompt_repo", "webhooks", "feature_flags"]
 }
 
 // Raiju's keys one level down. client also takes the two keys normalize maps.
@@ -530,49 +530,33 @@ function mapAuthProxy(inout top: Field[], inout notes: string[]): void throws Sy
   put(&top, "auth_proxy", out)
 }
 
-// circuit_breaker_config and load_balancer_config both feed Raiju's health section.
-// Raiju's breaker opens on failures, not on Bifrost's response-header signals, and
-// it does not reroute to another provider. Adaptive balancing maps to key selection.
+// circuit_breaker_config.policies is Raiju's circuit_breaker_policies, the same shape: the header
+// signals, the cooldowns and the fallbacks are read by health.tov. load_balancer_config feeds the
+// health section as health.adaptive.
 function mapHealth(inout top: Field[], inout notes: string[]): void throws SyntaxError {
   const cbRaw = find(top, "circuit_breaker_config")
   const lbRaw = find(top, "load_balancer_config")
   if (cbRaw === undefined && lbRaw === undefined) return
   top = without(top, ["circuit_breaker_config", "load_balancer_config"])
+  if (cbRaw !== undefined) {
+    const pols = find(try members(cbRaw), "policies")
+    if (pols !== undefined && find(top, "circuit_breaker_policies") === undefined) {
+      notes.push(`config: "circuit_breaker_config" read as "circuit_breaker_policies"`)
+      setField(&top, "circuit_breaker_policies", pols)
+    }
+  }
+  if (lbRaw === undefined) return
   if (find(top, "health") !== undefined) {
-    if (cbRaw !== undefined) notes.push(`config: "circuit_breaker_config" is ignored: "health" is set, and it wins`)
-    if (lbRaw !== undefined) notes.push(`config: "load_balancer_config" is ignored: "health" is set, and it wins`)
+    notes.push(`config: "load_balancer_config" is ignored: "health" is set, and it wins`)
     return
   }
   let hc: Field[] = []
-  if (cbRaw !== undefined) {
-    notes.push(`config: "circuit_breaker_config" read as "health"`)
-    let on = false
-    let cooldown: string | undefined = undefined
-    for (const el of try items(find(try members(cbRaw), "policies"))) {
-      const pf = try members(el)
-      if (rawBool(pf, "enabled") !== true) continue
-      on = true
-      const name = rawStr(pf, "name") ?? ""
-      if (find(pf, "fallback_provider") !== undefined) notes.push(`config: circuit breaker "${name}" has a fallback provider; Raiju does not reroute to another provider, so the fallback is not applied`)
-      if (find(pf, "condition") !== undefined) notes.push(`config: circuit breaker "${name}" opens on response headers; Raiju opens on failures, so the header signal is not read`)
-      const cd = rawStr(pf, "default_cooldown")
-      if (cd !== undefined && cooldown === undefined) {
-        const secs = goSeconds(cd)
-        if (secs === undefined) notes.push(`config: circuit breaker "${name}" has an unreadable default_cooldown; Raiju's default is used`)
-        else cooldown = `${secs}`
-      }
-    }
-    if (on) add(&hc, "circuit_breaker", "true")
-    add(&hc, "open_seconds", cooldown)
-  }
-  if (lbRaw !== undefined) {
-    notes.push(`config: "load_balancer_config" read as "health.adaptive"`)
-    const lf = try members(lbRaw)
-    const on = rawBool(lf, "enabled") === true && rawBool(lf, "route_selection_enabled") !== false
-    add(&hc, "adaptive", on ? "true" : "false")
-    ignored("load_balancer_config", lf, ["direction_selection_enabled", "append_fallbacks_to_pinned", "reroute_failed_directions", "prune_failed_fallbacks", "tracker_config", "bootstrap"], &notes)
-  }
-  if (hc.length > 0) put(&top, "health", hc)
+  notes.push(`config: "load_balancer_config" read as "health.adaptive"`)
+  const lf = try members(lbRaw)
+  const on = rawBool(lf, "enabled") === true && rawBool(lf, "route_selection_enabled") !== false
+  add(&hc, "adaptive", on ? "true" : "false")
+  ignored("load_balancer_config", lf, ["direction_selection_enabled", "append_fallbacks_to_pinned", "reroute_failed_directions", "prune_failed_fallbacks", "tracker_config", "bootstrap"], &notes)
+  put(&top, "health", hc)
 }
 
 // framework.pricing's pricing_url and pricing_sync_interval become pricing_sync.
@@ -1295,7 +1279,7 @@ test("passes cluster discovery through and maps scim_config's authProxy", () => 
   expect(find(try fields(off.text), "auth_proxy")).toBe(undefined)
 })
 
-test("maps circuit_breaker_config and load_balancer_config into one health section", () => {
+test("maps circuit_breaker_config to circuit_breaker_policies and load_balancer_config to health", () => {
   const r = try normalize(`{
     "circuit_breaker_config": { "policies": [
       { "name": "spill", "enabled": true, "primary_provider": "azure", "primary_model": "gpt-4o", "fallback_provider": "azure", "fallback_model": "gpt-4o-paygo",
@@ -1305,14 +1289,15 @@ test("maps circuit_breaker_config and load_balancer_config into one health secti
     ] },
     "load_balancer_config": { "enabled": true, "direction_selection_enabled": true, "route_selection_enabled": true, "prune_failed_fallbacks": true }
   }`)
-  const h = try fields(find(try fields(r.text), "health")!)
-  expect(rawBool(h, "circuit_breaker")).toBe(true)
-  expect(find(h, "open_seconds")).toBe("30")
+  const top = try fields(r.text)
+  const h = try fields(find(top, "health")!)
   expect(rawBool(h, "adaptive")).toBe(true)
-  expect(find(try fields(r.text), "circuit_breaker_config")).toBeUndefined()
-  expect(find(try fields(r.text), "load_balancer_config")).toBeUndefined()
-  expect(r.notes.includes(`config: circuit breaker "spill" has a fallback provider; Raiju does not reroute to another provider, so the fallback is not applied`)).toBe(true)
-  expect(r.notes.includes(`config: circuit breaker "spill" opens on response headers; Raiju opens on failures, so the header signal is not read`)).toBe(true)
+  expect(find(h, "circuit_breaker")).toBeUndefined()
+  expect(find(top, "circuit_breaker_config")).toBeUndefined()
+  expect(find(top, "load_balancer_config")).toBeUndefined()
+  const pols = try elements(find(top, "circuit_breaker_policies")!)
+  expect(pols.length).toBe(2)
+  expect(r.notes.includes(`config: "circuit_breaker_config" read as "circuit_breaker_policies"`)).toBe(true)
   expect(r.notes.includes(`config: "load_balancer_config.direction_selection_enabled" is not supported by Raiju and is ignored`)).toBe(true)
   const lb = try normalize(`{ "load_balancer_config": { "enabled": true, "route_selection_enabled": false } }`)
   expect(rawBool(try fields(find(try fields(lb.text), "health")!), "adaptive")).toBe(false)
@@ -1523,6 +1508,7 @@ test("warnings formats renames and unknown keys", () => {
 // The shape Raiju reads from the normalized text, as the lead's typed parse sees it.
 type Probe = {
   health?: { circuit_breaker?: bool, adaptive?: bool, open_seconds?: int },
+  circuit_breaker_policies?: { name: string, default_cooldown?: string }[],
   alerts?: { channels?: { id: string, type: "webhook" | "slack", url: string }[], rules?: string[] },
   semantic_cache?: { provider: string, embedding_model: string, ttl?: int },
   pricing_sync?: { url?: string, interval_seconds?: int },
@@ -1539,9 +1525,9 @@ test("normalized text parses into the typed shape Raiju reads", () => {
   const p = try JSON.parse(r.text) as Probe
   expect(p.alerts!.channels![0]!.url).toBe("https://hooks.example/s")
   expect(p.alerts!.rules!.length).toBe(0)
-  expect(p.health!.circuit_breaker).toBe(true)
+  expect(p.circuit_breaker_policies![0]!.name).toBe("p")
+  expect(p.circuit_breaker_policies![0]!.default_cooldown).toBe("1m")
   expect(p.health!.adaptive).toBe(true)
-  expect(p.health!.open_seconds).toBe(60)
   expect(p.semantic_cache!.provider).toBe("openai")
   expect(p.semantic_cache!.ttl).toBe(3600)
   expect(p.pricing_sync!.interval_seconds).toBe(3600)

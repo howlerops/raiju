@@ -27,7 +27,7 @@ import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversibl
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
 import { CompatPlan, settingsOf, withHeader, responseToChat, chatToText } from "./compat"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias } from "./router"
-import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
+import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
 import { Governance, Grant, Denial, directKeyFrom } from "./governance"
 import { Pricing, PriceRow } from "./pricing"
 import { ResponseCache, cacheKey, parseTtl } from "./cache"
@@ -850,6 +850,12 @@ export class Engine {
       halfOpenProbes: d.halfOpenProbes,
     }
     this.health = new Health(bc)
+    // the circuit policies of the config (Bifrost's circuit_breaker_config.policies, kept as circuit_breaker_policies)
+    for (const pc of cfg.circuit_breaker_policies ?? []) {
+      const pr = parsePolicy(JSON.stringify(pc), "")
+      if (!pr.ok) console.error(`raiju: circuit_breaker_policies ${pc.name}: ${pr.err}`)
+      else this.health.policyAdd(pr.p)
+    }
     const ls = cfg.logs_store
     if (ls !== undefined && ls.enabled === true) {
       const d = defaultLogStoreConfig(ls.dir ?? "logs")
@@ -1176,6 +1182,14 @@ export class Engine {
           const px = proxyOf(p)
           const res = up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal, proxy: px, tls: tlsOf(t.cfg) }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal, proxy: px, tls: tlsOf(t.cfg) })
           status = res.status
+          // circuit policies: this response's headers may open the circuit of a policy for this primary
+          if (this.health.policyList().length > 0) {
+            const rh: Map<string, string> = new Map()
+            res.headers.forEach((v, k) => {
+              rh.set(k, v)
+            })
+            this.health.policyObserve(ref.provider, ref.model, t.key.id ?? "", rh, Date.now())
+          }
           const sink = ctx.sink
           const mk = ctx.makeConverter
           const conv = status >= 200 && status < 300 && sink !== undefined && mk !== undefined ? mk(t, ref.provider + "/" + ref.model) : undefined
@@ -1334,6 +1348,13 @@ export class Engine {
     const rows = this.catalogRows
     if (rows !== undefined) this.pricing.replaceCatalog(rows)
     this.rules = fresh.rules
+    // the breakers keep their state; the policies follow the config
+    this.health.replacePolicies(fresh.health.policyList())
+    // the MCP clients follow the config too: a client added since the start gets a session (main connects it)
+    const fm = fresh.mcp
+    if (fm === undefined) this.mcp = undefined
+    else if (this.mcp === undefined) this.mcp = fm
+    else this.mcp.follow(fm.sessions)
     this.guard = fresh.guard
     this.guardInput = fresh.guardInput
     this.guardOutput = fresh.guardOutput
@@ -1690,6 +1711,9 @@ export class Engine {
       ctx.error = "no provider for " + model
       return errorResponse(400, "could not auto resolve a provider for the request, please specify a provider explicitly", "invalid_request_error", out)
     }
+    // a circuit policy whose circuit is open sends the primary's requests to its fallback (the primary is not tried)
+    const open = this.health.policyFallback(refs[0]!.provider, refs[0]!.model, Date.now())
+    if (open !== undefined) refs = [{ provider: open.fallback_provider, model: open.fallback_model }].concat(refs.slice(1))
     const rules = this.rules
     if (rules !== undefined) {
       const routed = this.route(rules, op, refs, &h, body, tier)

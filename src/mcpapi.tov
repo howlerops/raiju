@@ -8,7 +8,9 @@
 import { readFileSync, unlinkSync } from "node:fs"
 import { Config } from "./config"
 import { ConfigStore, maskSecret, randomId } from "./store"
-import { McpAuthConfig } from "./mcpauth"
+import { McpAuthConfig, AuthEndpoints, discoveryUrls, registrationRequest, registrationResult, parseAuthEndpoints, codeTokenRequest, authorizeUrl, pkceVerifier, pkceChallenge, tokenFields } from "./mcpauth"
+import { deadline } from "./deadline"
+import { secureHex } from "./crypto"
 import { McpClientConfig, McpConfig, McpTlsConfig, sanitizeName } from "./mcp"
 import * as vmcp from "./vmcp"
 import { Field, fields, elements, find, quote } from "./json"
@@ -237,6 +239,18 @@ function keepAuth(incoming: McpAuthConfig, old: McpAuthConfig | undefined): McpA
   n.token = keepOpt(n.token, old === undefined ? undefined : old.token)
   n.client_secret = keepOpt(n.client_secret, old === undefined ? undefined : old.client_secret)
   n.refresh_token = keepOpt(n.refresh_token, old === undefined ? undefined : old.refresh_token)
+  n.access_token = keepOpt(n.access_token, old === undefined ? undefined : old.access_token)
+  // an authorization code client keeps what its flow saved (endpoints, the registered client, tokens) unless the body sends a value
+  if (n.type === "oauth" && old !== undefined && old.type === "oauth") {
+    n.authorize_url = n.authorize_url ?? old.authorize_url
+    n.token_url = n.token_url ?? old.token_url
+    n.registration_url = n.registration_url ?? old.registration_url
+    n.client_id = n.client_id ?? old.client_id
+    n.client_secret = n.client_secret ?? old.client_secret
+    n.access_token = n.access_token ?? old.access_token
+    n.refresh_token = n.refresh_token ?? old.refresh_token
+    n.token_expires_at = n.token_expires_at ?? old.token_expires_at
+  }
   return n
 }
 
@@ -251,6 +265,7 @@ function redactClient(c: McpClientConfig): McpClientConfig {
     na.token = maskOpt(na.token)
     na.client_secret = maskOpt(na.client_secret)
     na.refresh_token = maskOpt(na.refresh_token)
+    na.access_token = maskOpt(na.access_token)
     n.auth = na
   }
   const sc = n.stdio_config
@@ -281,7 +296,7 @@ function clientNameError(name: string): string {
   return ""
 }
 
-const AUTH_TYPES: string[] = ["none", "bearer", "headers", "oauth_client_credentials", "oauth_refresh_token"]
+const AUTH_TYPES: string[] = ["none", "bearer", "headers", "oauth_client_credentials", "oauth_refresh_token", "oauth"]
 
 // The auth object must have a type this gateway knows. "" when fine or absent.
 function authError(a: McpAuthConfig | undefined): string {
@@ -725,6 +740,216 @@ function virtualRoute(store: ConfigStore, m: string, segs: string[], body: strin
     return notAllowed(m)
   }
   return fail(404, `no route for ${p}`)
+}
+
+// ---- OAuth for clients of auth type "oauth": the authorization code flow with PKCE (Bifrost's
+// initiate-verification, complete-oauth, reauthorize and reregister). A flow's state (its verifier
+// and redirect URI) is held by this process until the callback returns, for FLOW_TTL_MS. The
+// callback saves the tokens on the client; the client connects with them.
+
+type OauthFlow = { client: string, verifier: string, redirect: string, expiresAt: number }
+
+const FLOW_TTL_MS = 900000
+const FLOW_TIMEOUT_MS = 10000
+const FLOWS: Map<string, OauthFlow> = new Map()
+
+// The auth of a client that uses the authorization code flow, else undefined.
+function oauthAuthOf(c: McpClientConfig): McpAuthConfig | undefined {
+  const a = c.auth
+  return a !== undefined && a.type === "oauth" ? a : undefined
+}
+
+// Whether the flow has saved a token on the client.
+function authorized(a: McpAuthConfig): bool {
+  return (a.refresh_token ?? "") !== "" || (a.access_token ?? "") !== ""
+}
+
+// The client with its auth replaced.
+function withAuth(c: McpClientConfig, a: McpAuthConfig): McpClientConfig {
+  let n = c
+  n.auth = a
+  return n
+}
+
+// The list with the client at index at replaced.
+function replaceAt(list: McpClientConfig[], at: int, c: McpClientConfig): McpClientConfig[] {
+  const out: McpClientConfig[] = []
+  for (let i = 0; i < list.length; i++) out.push(i === at ? c : list[i]!)
+  return out
+}
+
+// A request to an authorization server under a deadline: the body of a 2xx answer, else an error.
+async function callAuthServer(url: string, method: string, headers: Map<string, string>, body: string): Promise<string> throws Error {
+  const dl = deadline(FLOW_TIMEOUT_MS)
+  try {
+    const hs: Record<string, string> = headers
+    const r = method === "GET" ? await fetch(url, { signal: dl.controller.signal }) : await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+    const text = await r.text()
+    if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status} from ${url}`)
+    dl.finish()
+    return text
+  } catch (e) {
+    dl.finish()
+    throw new Error(`${url}: ${e.message}`)
+  }
+}
+
+// The authorization server's endpoints, from its metadata at the origin of the MCP server (RFC 8414).
+async function discover(serverUrl: string): Promise<AuthEndpoints> throws Error {
+  const urls = discoveryUrls(serverUrl)
+  if (urls.length < 2) throw new Error("connection_string must be an http or https URL")
+  const text = try await callAuthServer(urls[1]!, "GET", new Map(), "")
+  return try parseAuthEndpoints(text)
+}
+
+// Dynamic client registration (RFC 7591), with the gateway's callback as the redirect URI.
+async function register(url: string, redirect: string): Promise<{ client_id: string, client_secret: string }> throws Error {
+  const rq = try registrationRequest(url, redirect, "Raiju")
+  const text = try await callAuthServer(rq.url, "POST", rq.headers, rq.body)
+  return try registrationResult(text)
+}
+
+// Flows whose time is up, by state.
+function expiredFlows(now: f64): string[] {
+  const out: string[] = []
+  for (const k of FLOWS.keys()) {
+    const f = FLOWS.get(k)
+    if (f !== undefined && f.expiresAt < now) out.push(k)
+  }
+  return out
+}
+
+// Starts the authorization flow of a client. It finds the endpoints in the server's metadata and
+// registers a client when it has none; then it saves the client and returns the authorize URL.
+// mode is "initiate", "reauthorize" (the client must be authorized already) or "reregister" (a new
+// client is registered in place of the stored one).
+async function startFlow(store: ConfigStore, id: string, base: string, mode: string): Promise<McpReply> {
+  const list = clientsOf(store.cfg)
+  const at = clientIndex(list, id)
+  if (at < 0) return fail(404, `MCP client '${id}' not found`)
+  const c = list[at]!
+  const a0 = oauthAuthOf(c)
+  if (a0 === undefined) return fail(400, "OAuth flows apply to auth type oauth clients only")
+  if (mode === "reauthorize" && !authorized(a0)) return fail(400, "MCP client has not completed initial OAuth authorization yet; use initiate-verification instead")
+  const server = c.connection_string ?? ""
+  if (server === "") return fail(400, "MCP client connection_string is required to initiate OAuth discovery")
+  let a = a0
+  if (mode === "reregister") {
+    a.client_id = undefined
+    a.client_secret = undefined
+  }
+  if ((a.authorize_url ?? "") === "" || (a.token_url ?? "") === "") {
+    let meta: AuthEndpoints = { authorization_endpoint: "", token_endpoint: "", registration_endpoint: "" }
+    try {
+      meta = await discover(server)
+    } catch (e) {
+      return fail(502, `OAuth discovery failed: ${e.message}`)
+    }
+    if ((a.authorize_url ?? "") === "") a.authorize_url = meta.authorization_endpoint
+    if ((a.token_url ?? "") === "") a.token_url = meta.token_endpoint
+    if ((a.registration_url ?? "") === "") a.registration_url = meta.registration_endpoint
+  }
+  const redirect = base + "/api/oauth/callback"
+  if ((a.client_id ?? "") === "") {
+    const reg = a.registration_url ?? ""
+    if (reg === "") return fail(400, "MCP client has no client_id, and its authorization server has no registration endpoint: set client_id")
+    let got = { client_id: "", client_secret: "" }
+    try {
+      got = await register(reg, redirect)
+    } catch (e) {
+      return fail(502, `client registration failed: ${e.message}`)
+    }
+    a.client_id = got.client_id
+    a.client_secret = got.client_secret === "" ? undefined : got.client_secret
+  }
+  let verifier = ""
+  let state = ""
+  let authUrl = ""
+  try {
+    verifier = pkceVerifier()
+    state = secureHex(32)
+    authUrl = authorizeUrl(a, redirect, state, pkceChallenge(verifier))
+  } catch (e) {
+    return fail(500, `could not start the flow: ${e.message}`)
+  }
+  for (const k of expiredFlows(Date.now())) FLOWS.delete(k)
+  const expires = Date.now() + FLOW_TTL_MS
+  FLOWS.set(state, { client: id, verifier: verifier, redirect: redirect, expiresAt: expires })
+  const perr = persist(store, withClients(store.cfg, replaceAt(list, at, withAuth(c, a))))
+  if (perr !== undefined) return perr
+  const out = {
+    status: "pending_oauth",
+    oauth_config_id: state,
+    authorize_url: authUrl,
+    expires_at: expires,
+    mcp_client_id: id,
+    complete_url: `/api/mcp/client/${id}/complete-oauth`,
+    next_steps: ["1. Open authorize_url in a browser to approve access", "2. The authorization server returns to the gateway's callback, which saves the tokens", "3. POST complete_url to connect the MCP client"],
+  }
+  return reply(200, JSON.stringify(out))
+}
+
+// A page for the browser that came back to the callback.
+function callbackPage(status: int, msg: string): { status: int, html: string } {
+  const safe = msg.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll("\"", "&quot;")
+  return { status: status, html: `<!doctype html><html><head><meta charset="utf-8"><title>MCP authorization</title></head><body><p>${safe}</p></body></html>` }
+}
+
+// GET /api/oauth/callback: the browser returns from the authorization server with a code. The code
+// is exchanged for tokens (with the flow's PKCE verifier and redirect URI), the tokens are saved on
+// the client, and the page says what happened. A flow is single use.
+export async function oauthCallback(store: ConfigStore, query: URLSearchParams): Promise<{ status: int, html: string }> {
+  const state = query.get("state") ?? ""
+  const flow = FLOWS.get(state)
+  FLOWS.delete(state)
+  if (flow === undefined || flow.expiresAt < Date.now()) return callbackPage(400, "This authorization link is unknown or has expired. Start the flow again.")
+  const refused = query.get("error") ?? ""
+  if (refused !== "") return callbackPage(400, `The authorization server refused access: ${refused}`)
+  const code = query.get("code") ?? ""
+  if (code === "") return callbackPage(400, "The callback has no authorization code.")
+  const list = clientsOf(store.cfg)
+  const at = clientIndex(list, flow.client)
+  if (at < 0) return callbackPage(404, `MCP client '${flow.client}' no longer exists.`)
+  const c = list[at]!
+  const a = oauthAuthOf(c)
+  if (a === undefined) return callbackPage(400, "The MCP client does not use the OAuth flow.")
+  let tokens = { access: "", refresh: "", expiresAt: 0.0 }
+  try {
+    const tr = codeTokenRequest(a, code, flow.verifier, flow.redirect)
+    const text = await callAuthServer(tr.url, "POST", tr.headers, tr.body)
+    tokens = tokenFields(text, Date.now())
+  } catch (e) {
+    return callbackPage(502, `The token request failed: ${e.message}`)
+  }
+  let next = a
+  next.access_token = tokens.access
+  next.token_expires_at = tokens.expiresAt
+  if (tokens.refresh !== "") next.refresh_token = tokens.refresh
+  const perr = persist(store, withClients(store.cfg, replaceAt(list, at, withAuth(c, next))))
+  if (perr !== undefined) return callbackPage(500, "The tokens could not be saved.")
+  return callbackPage(200, `MCP client ${flow.client} is authorized. You can close this window.`)
+}
+
+// The OAuth routes of a client with auth type oauth. undefined for any other route or client, which
+// mcpApi answers. base is the gateway's origin, for the callback's redirect URI.
+export async function oauthRoute(store: ConfigStore, method: string, path: string, body: string, base: string): Promise<McpReply | undefined> {
+  const segs = path.split("/").filter((s) => s !== "")
+  if (segs.length !== 5 || segs[0] !== "api" || segs[1] !== "mcp" || segs[2] !== "client") return undefined
+  if (method !== "POST") return undefined
+  const id = segs[3]!
+  const sub = segs[4]!
+  if (sub !== "initiate-verification" && sub !== "reauthorize" && sub !== "reregister" && sub !== "complete-oauth") return undefined
+  const list = clientsOf(store.cfg)
+  const at = clientIndex(list, id)
+  if (at < 0) return undefined
+  const a = oauthAuthOf(list[at]!)
+  if (a === undefined) return undefined
+  if (sub === "complete-oauth") {
+    if (!authorized(a)) return fail(400, "OAuth not authorized yet. Current status: pending")
+    return { status: 200, body: `{"status":"success","message":"MCP client authorized"}`, action: "reconnect", id: id }
+  }
+  const mode = sub === "reregister" ? "reregister" : sub === "reauthorize" ? "reauthorize" : "initiate"
+  return await startFlow(store, id, base, mode)
 }
 
 // The MCP management route for method and path, or undefined when the path is not one of them.

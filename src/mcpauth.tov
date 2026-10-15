@@ -3,10 +3,13 @@
 // token request and the discovery URLs, parsers for the metadata and the 401
 // challenge, and a token cache. The HTTP calls are made by the caller.
 import { fields, rawStr, rawNum } from "./json"
-import { encode } from "./base64"
+import { encode, encodeUrl } from "./base64"
+import { sha256, utf8, secureHex } from "./crypto"
 
 export type McpAuthConfig = {
-  type: "none" | "bearer" | "headers" | "oauth_client_credentials" | "oauth_refresh_token",
+  // oauth: the authorization code grant with PKCE (Bifrost's auth_type "oauth"). Its endpoints, the
+  // client it registered and its tokens are filled in by the authorization flow (mcpapi.tov).
+  type: "none" | "bearer" | "headers" | "oauth_client_credentials" | "oauth_refresh_token" | "oauth",
   token?: string,
   headers?: Map<string, string>,
   token_url?: string,
@@ -16,6 +19,11 @@ export type McpAuthConfig = {
   scope?: string,
   audience?: string,
   auth_method?: "client_secret_basic" | "client_secret_post",
+  authorize_url?: string,
+  registration_url?: string,
+  access_token?: string,
+  // when the access token stops being valid, in epoch milliseconds
+  token_expires_at?: f64,
 }
 
 // A token this close to its expiry counts as expired, so a request never leaves
@@ -65,22 +73,50 @@ export function staticHeaders(a: McpAuthConfig): Map<string, string> {
   return h
 }
 
-// The POST that fetches an access token for an OAuth grant. A client secret
-// goes in a Basic header (client_secret_basic, the default) or in the body
-// (client_secret_post). With no secret the client is public: its id goes in the
-// body, which only the refresh grant allows.
-export function tokenRequest(a: McpAuthConfig): { url: string, headers: Map<string, string>, body: string } throws Error {
-  const isCC = a.type === "oauth_client_credentials"
-  if (!isCC && a.type !== "oauth_refresh_token") throw new Error(`auth type ${a.type} has no token request`)
-  const url = a.token_url ?? ""
-  if (!url.startsWith("https://") && !url.startsWith("http://")) throw new Error("token_url must be an http or https URL")
+// The client's credentials on a token request: a Basic header (client_secret_basic, the default) or
+// form fields. A public client has no secret and sends its id in the body, which only the refresh
+// and code grants allow.
+function clientCredentials(a: McpAuthConfig, inout parts: string[], inout headers: Map<string, string>): void throws Error {
   const clientId = a.client_id ?? ""
   if (clientId === "") throw new Error("client_id is required")
   const sec = a.client_secret ?? ""
-  const hasSecret = sec !== ""
-  if (isCC && !hasSecret) throw new Error("client_credentials needs a client_secret")
+  const idEnc = try formEncode(clientId)
+  if (sec !== "" && (a.auth_method ?? "client_secret_basic") === "client_secret_basic") {
+    const secEnc = try formEncode(sec)
+    headers.set("authorization", "Basic " + encode(new TextEncoder().encode(idEnc + ":" + secEnc)))
+    return
+  }
+  parts.push("client_id=" + idEnc)
+  if (sec !== "") {
+    const secEnc = try formEncode(sec)
+    parts.push("client_secret=" + secEnc)
+  }
+}
 
-  const parts: string[] = []
+// The token endpoint of a grant, which must be an http or https URL.
+function tokenUrlOf(a: McpAuthConfig): string throws Error {
+  const url = a.token_url ?? ""
+  if (!url.startsWith("https://") && !url.startsWith("http://")) throw new Error("token_url must be an http or https URL")
+  return url
+}
+
+function formHeaders(): Map<string, string> {
+  const headers: Map<string, string> = new Map()
+  headers.set("content-type", "application/x-www-form-urlencoded")
+  headers.set("accept", "application/json")
+  return headers
+}
+
+// The POST that fetches an access token for an OAuth grant: client credentials, or the refresh
+// token (oauth_refresh_token, and oauth once it has a refresh token).
+export function tokenRequest(a: McpAuthConfig): { url: string, headers: Map<string, string>, body: string } throws Error {
+  const isCC = a.type === "oauth_client_credentials"
+  if (!isCC && a.type !== "oauth_refresh_token" && a.type !== "oauth") throw new Error(`auth type ${a.type} has no token request`)
+  const url = try tokenUrlOf(a)
+  const sec = a.client_secret ?? ""
+  if (isCC && sec === "") throw new Error("client_credentials needs a client_secret")
+
+  let parts: string[] = []
   if (isCC) {
     parts.push("grant_type=client_credentials")
   } else {
@@ -99,24 +135,89 @@ export function tokenRequest(a: McpAuthConfig): { url: string, headers: Map<stri
     const audEnc = try formEncode(audience)
     parts.push("audience=" + audEnc)
   }
-
-  const headers: Map<string, string> = new Map()
-  headers.set("content-type", "application/x-www-form-urlencoded")
-  headers.set("accept", "application/json")
-  const method = a.auth_method ?? "client_secret_basic"
-  const idEnc = try formEncode(clientId)
-  if (hasSecret && method === "client_secret_basic") {
-    const secEnc = try formEncode(sec)
-    const cred = idEnc + ":" + secEnc
-    headers.set("authorization", "Basic " + encode(new TextEncoder().encode(cred)))
-  } else {
-    parts.push("client_id=" + idEnc)
-    if (hasSecret) {
-      const secEnc = try formEncode(sec)
-      parts.push("client_secret=" + secEnc)
-    }
-  }
+  let headers = formHeaders()
+  try clientCredentials(a, &parts, &headers)
   return { url: url, headers: headers, body: parts.join("&") }
+}
+
+// The POST that trades an authorization code for tokens (RFC 6749 section 4.1.3), with the PKCE
+// verifier that the authorize request's challenge was made from.
+export function codeTokenRequest(a: McpAuthConfig, code: string, verifier: string, redirectUri: string): { url: string, headers: Map<string, string>, body: string } throws Error {
+  const url = try tokenUrlOf(a)
+  if (code === "") throw new Error("the authorization code is empty")
+  const codeEnc = try formEncode(code)
+  const redirEnc = try formEncode(redirectUri)
+  const verEnc = try formEncode(verifier)
+  let parts = ["grant_type=authorization_code", "code=" + codeEnc, "redirect_uri=" + redirEnc, "code_verifier=" + verEnc]
+  let headers = formHeaders()
+  try clientCredentials(a, &parts, &headers)
+  return { url: url, headers: headers, body: parts.join("&") }
+}
+
+// The URL the user opens to authorize the client: the code response type, the client, the redirect
+// URI, the state, and the PKCE challenge (S256 of the verifier).
+export function authorizeUrl(a: McpAuthConfig, redirectUri: string, state: string, challenge: string): string throws Error {
+  const base = a.authorize_url ?? ""
+  if (!base.startsWith("https://") && !base.startsWith("http://")) throw new Error("authorize_url must be an http or https URL")
+  const idEnc = try formEncode(a.client_id ?? "")
+  const redirEnc = try formEncode(redirectUri)
+  const stateEnc = try formEncode(state)
+  const parts = ["response_type=code", "client_id=" + idEnc, "redirect_uri=" + redirEnc, "state=" + stateEnc, "code_challenge=" + challenge, "code_challenge_method=S256"]
+  const scope = a.scope ?? ""
+  if (scope !== "") {
+    const scopeEnc = try formEncode(scope)
+    parts.push("scope=" + scopeEnc)
+  }
+  return base + (base.includes("?") ? "&" : "?") + parts.join("&")
+}
+
+// A fresh PKCE verifier (RFC 7636): 64 hex characters, which are unreserved, and the S256 challenge of it.
+export function pkceVerifier(): string throws Error {
+  return try secureHex(64)
+}
+
+export function pkceChallenge(verifier: string): string {
+  return encodeUrl(sha256(utf8(verifier)))
+}
+
+// The dynamic client registration request (RFC 7591) for a public client of the authorization code grant.
+export function registrationRequest(url: string, redirectUri: string, clientName: string): { url: string, headers: Map<string, string>, body: string } throws Error {
+  if (!url.startsWith("https://") && !url.startsWith("http://")) throw new Error("registration_url must be an http or https URL")
+  const headers: Map<string, string> = new Map()
+  headers.set("content-type", "application/json")
+  headers.set("accept", "application/json")
+  const body = JSON.stringify({ client_name: clientName, redirect_uris: [redirectUri], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "none" })
+  return { url: url, headers: headers, body: body }
+}
+
+// The client id and secret (if any) that a registration response issued.
+export function registrationResult(json: string): { client_id: string, client_secret: string } throws SyntaxError {
+  const fs = try fields(json)
+  const id = rawStr(fs, "client_id") ?? ""
+  if (id === "") throw new SyntaxError("registration response has no client_id")
+  return { client_id: id, client_secret: rawStr(fs, "client_secret") ?? "" }
+}
+
+// The endpoints of authorization server metadata (RFC 8414) that the authorization code flow needs.
+export type AuthEndpoints = { authorization_endpoint: string, token_endpoint: string, registration_endpoint: string }
+
+export function parseAuthEndpoints(json: string): AuthEndpoints throws SyntaxError {
+  const fs = try fields(json)
+  const ae = rawStr(fs, "authorization_endpoint") ?? ""
+  const te = rawStr(fs, "token_endpoint") ?? ""
+  if (ae === "" || te === "") throw new SyntaxError("metadata needs authorization_endpoint and token_endpoint")
+  return { authorization_endpoint: ae, token_endpoint: te, registration_endpoint: rawStr(fs, "registration_endpoint") ?? "" }
+}
+
+// The tokens of a token response and when the access token expires (expires_in defaults to 3600 s).
+export function tokenFields(json: string, nowMs: number): { access: string, refresh: string, expiresAt: number } throws SyntaxError {
+  const fs = try fields(json)
+  const access = rawStr(fs, "access_token") ?? ""
+  if (access === "") throw new SyntaxError("token response has no access_token")
+  const expiresIn = rawNum(fs, "expires_in")
+  let secs: number = DEFAULT_EXPIRES_IN_S
+  if (expiresIn !== undefined && expiresIn > 0) secs = expiresIn
+  return { access: access, refresh: rawStr(fs, "refresh_token") ?? "", expiresAt: nowMs + secs * 1000 }
 }
 
 type Entry = { access: string, expiresAt: number, refresh: string }
@@ -147,6 +248,11 @@ export class TokenCache {
     const old = this.entries.get(serverName)
     if (refresh === "" && old !== undefined) refresh = old.refresh
     this.entries.set(serverName, { access: access, expiresAt: nowMs + secs * 1000, refresh: refresh })
+  }
+
+  // Starts with a token saved in the config (the authorization code grant's), valid until expiresAt.
+  seed(serverName: string, access: string, expiresAt: number, refresh: string): void {
+    this.entries.set(serverName, { access: access, expiresAt: expiresAt, refresh: refresh })
   }
 
   // The stored refresh token, if any.
@@ -431,4 +537,87 @@ test("reads resource_metadata from WWW-Authenticate", () => {
   expect(wwwAuthenticateResource('Bearer resource_metadata="unterminated')).toBe(undefined)
   expect(wwwAuthenticateResource('Bearer xresource_metadata="https://no", resource_metadata="https://yes"')).toBe("https://yes")
   expect(wwwAuthenticateResource("")).toBe(undefined)
+})
+
+test("authorization code flow: PKCE, authorize URL and the code exchange", () => {
+  // the RFC 7636 appendix B vector
+  expect(pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")).toBe("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
+  expect((try pkceVerifier()).byteLength).toBe(64)
+
+  const a: McpAuthConfig = { type: "oauth", authorize_url: "https://auth.example/authorize?tenant=x", token_url: "https://auth.example/token", client_id: "raiju", scope: "mcp:read" }
+  expect(try authorizeUrl(a, "http://gw.example/api/oauth/callback", "st", "CH")).toBe("https://auth.example/authorize?tenant=x&response_type=code&client_id=raiju&redirect_uri=http%3A%2F%2Fgw.example%2Fapi%2Foauth%2Fcallback&state=st&code_challenge=CH&code_challenge_method=S256&scope=mcp%3Aread")
+
+  // a public client sends its id in the body
+  const pub = try codeTokenRequest(a, "abc", "v1", "http://gw/cb")
+  expect(pub.body).toBe("grant_type=authorization_code&code=abc&redirect_uri=http%3A%2F%2Fgw%2Fcb&code_verifier=v1&client_id=raiju")
+  expect(pub.headers.get("authorization")).toBe(undefined)
+  expect(pub.url).toBe("https://auth.example/token")
+
+  // a confidential client sends a Basic header
+  const conf = try codeTokenRequest({ type: "oauth", token_url: "https://auth.example/token", client_id: "raiju", client_secret: "s" }, "abc", "v1", "http://gw/cb")
+  expect(conf.headers.get("authorization")).toBe("Basic cmFpanU6cw==")
+  expect(conf.body.includes("client_id")).toBe(false)
+
+  let threw = 0
+  const bad: McpAuthConfig[] = [{ type: "oauth", client_id: "c" }, { type: "oauth", token_url: "ftp://x/t", client_id: "c" }]
+  for (const b of bad) {
+    try {
+      codeTokenRequest(b, "abc", "v", "http://gw/cb")
+    } catch (e) {
+      threw += 1
+    }
+  }
+  try {
+    codeTokenRequest({ type: "oauth", token_url: "https://x/t" }, "abc", "v", "http://gw/cb")
+  } catch (e) {
+    threw += 1
+  }
+  try {
+    codeTokenRequest({ type: "oauth", token_url: "https://x/t", client_id: "c" }, "", "v", "http://gw/cb")
+  } catch (e) {
+    threw += 1
+  }
+  expect(threw).toBe(4)
+
+  // refreshing an oauth client uses its refresh token
+  const rf = try tokenRequest({ type: "oauth", token_url: "https://auth.example/token", client_id: "raiju", refresh_token: "r" })
+  expect(rf.body).toBe("grant_type=refresh_token&refresh_token=r&client_id=raiju")
+})
+
+test("dynamic registration and the token and metadata responses", () => {
+  const reg = try registrationRequest("https://auth.example/register", "http://gw/cb", "Raiju")
+  expect(reg.body.includes(`"token_endpoint_auth_method":"none"`)).toBe(true)
+  expect(reg.body.includes(`"redirect_uris":["http://gw/cb"]`)).toBe(true)
+  expect(reg.headers.get("content-type")).toBe("application/json")
+  expect((try registrationResult(`{"client_id":"c1"}`)).client_secret).toBe("")
+  expect((try registrationResult(`{"client_id":"c2","client_secret":"s2"}`)).client_secret).toBe("s2")
+  let threw = 0
+  for (const body of ["{}", "nope"]) {
+    try {
+      registrationResult(body)
+    } catch (e) {
+      threw += 1
+    }
+  }
+  try {
+    parseAuthEndpoints(`{"token_endpoint":"https://a/t"}`)
+  } catch (e) {
+    threw += 1
+  }
+  expect(threw).toBe(3)
+  const ep = try parseAuthEndpoints(`{"authorization_endpoint":"https://a/authorize","token_endpoint":"https://a/t","registration_endpoint":"https://a/register"}`)
+  expect(ep.registration_endpoint).toBe("https://a/register")
+
+  const tf = try tokenFields(`{"access_token":"a","refresh_token":"r","expires_in":60}`, 1000)
+  expect(tf.expiresAt).toBe(61000)
+  expect(tf.refresh).toBe("r")
+  expect((try tokenFields(`{"access_token":"a"}`, 0)).expiresAt).toBe(3600000)
+})
+
+test("a seeded token is handed out until it expires", () => {
+  const c = new TokenCache()
+  c.seed("s", "saved", 1000000, "r1")
+  expect(c.header("s", 0)).toBe("Bearer saved")
+  expect(c.header("s", 1000000)).toBe(undefined)
+  expect(c.refreshToken("s")).toBe("r1")
 })

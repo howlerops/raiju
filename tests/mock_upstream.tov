@@ -1,11 +1,14 @@
 import { listen } from "../src/http1"
 import { fields, find, rawStr } from "../src/json"
+import { sha256, utf8 } from "../src/crypto"
+import { encodeUrl } from "../src/base64"
 // A fake provider for end-to-end tests. Speaks enough of OpenAI, Anthropic,
 // Gemini and Bedrock to exercise translation, and fails on demand:
 //   model "flaky-*"   → 503 on every other call
 //   model "down-*"    → always 500
 //   model "limited-*" → always 429 with retry-after-ms: 2500
 //   key "bad-key"     → 401
+//   model "policy-quota" → 200 with x-quota-state: exhausted (trips a circuit policy)
 type Seen = { path: string, auth: string, body: string, team: string }
 
 const seen: Seen[] = []
@@ -13,6 +16,14 @@ const seen: Seen[] = []
 type Hook = { path: string, id: string, timestamp: string, signature: string, event: string, body: string }
 const hooks: Hook[] = []
 let flakyCalls = 0
+// the OAuth authorization server: codes by their PKCE challenge and redirect URI, and the access token the MCP server accepts
+const OAUTH_CLIENT = "raiju-dcr-client"
+const OAUTH_REFRESH = "oauth-refresh-1"
+const oauthCodes: Map<string, string> = new Map()
+const oauthRedirects: Map<string, string> = new Map()
+let oauthCodeN = 0
+let oauthTokenN = 0
+let oauthAccess = ""
 
 // Batch and file state for the Anthropic, OpenAI and Gemini batch and file APIs.
 // OpenAI's files hold their text; batches run at once, answering every line.
@@ -245,6 +256,8 @@ Bun.serve<string>({
         }
         // "tier-complex": a classifier that always names COMPLEX, in the JSON the complexity router asks for
         if (model === "tier-complex") return Response.json({ id: "c1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: `{"tier": "COMPLEX"}` }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
+        // a primary that reports its quota as spent: the header is what a circuit policy watches for
+        if (model === "policy-quota") return new Response(`{"id":"q1","object":"chat.completion","created":1,"model":"${model}","choices":[{"index":0,"message":{"role":"assistant","content":"from the primary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`, { headers: { "content-type": "application/json", "x-quota-state": "exhausted" } })
         if (m.stream === true) {
           const chunk = (delta: string, finish: string) => `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
           const sse = chunk(`{"role":"assistant","content":""}`, "null") + chunk(`{"content":"Hel"}`, "null") + chunk(`{"content":"lo"}`, "null") + chunk(`{}`, `"stop"`) +
@@ -834,6 +847,70 @@ Bun.serve<string>({
       },
     },
     "/_seen": () => Response.json(seen),
+    // OAuth metadata (RFC 8414), dynamic client registration (RFC 7591), the authorize step (PKCE S256) and the token endpoint
+    "/.well-known/oauth-authorization-server": {
+      GET: () => Response.json({ issuer: `http://127.0.0.1:${port}`, authorization_endpoint: `http://127.0.0.1:${port}/oauth2/authorize`, token_endpoint: `http://127.0.0.1:${port}/oauth2/token`, registration_endpoint: `http://127.0.0.1:${port}/oauth2/register`, code_challenge_methods_supported: ["S256"] }),
+    },
+    "/oauth2/register": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/oauth2/register", body)
+        const j = try JSON.parse(body) as { redirect_uris?: string[] }
+        return Response.json({ client_id: OAUTH_CLIENT, client_id_issued_at: 1, token_endpoint_auth_method: "none", redirect_uris: j.redirect_uris ?? [] }, { status: 201 })
+      },
+    },
+    "/oauth2/authorize": {
+      GET: (req) => {
+        const u = URL.parse(req.url)
+        const q = u === undefined ? new URLSearchParams("") : u.searchParams
+        record(req, "/oauth2/authorize", "")
+        const redirect = q.get("redirect_uri") ?? ""
+        if (q.get("client_id") !== OAUTH_CLIENT || q.get("response_type") !== "code" || q.get("code_challenge_method") !== "S256") return Response.json({ error: "invalid_request" }, { status: 400 })
+        oauthCodeN += 1
+        const code = "code-" + oauthCodeN
+        oauthCodes.set(code, q.get("code_challenge") ?? "")
+        oauthRedirects.set(code, redirect)
+        return new Response(undefined, { status: 302, headers: { location: redirect + "?code=" + code + "&state=" + (q.get("state") ?? "") } })
+      },
+    },
+    "/oauth2/token": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/oauth2/token", body)
+        const f = new URLSearchParams(body)
+        if (f.get("client_id") !== OAUTH_CLIENT) return Response.json({ error: "invalid_client" }, { status: 401 })
+        const grant = f.get("grant_type") ?? ""
+        if (grant === "authorization_code") {
+          const code = f.get("code") ?? ""
+          const challenge = oauthCodes.get(code)
+          if (challenge === undefined) return Response.json({ error: "invalid_grant" }, { status: 400 })
+          oauthCodes.delete(code)
+          // PKCE: the verifier must hash to the challenge sent at the authorize step, for the same redirect URI
+          if (encodeUrl(sha256(utf8(f.get("code_verifier") ?? ""))) !== challenge || f.get("redirect_uri") !== oauthRedirects.get(code)) return Response.json({ error: "invalid_grant", error_description: "PKCE or redirect mismatch" }, { status: 400 })
+        } else if (grant === "refresh_token") {
+          if (f.get("refresh_token") !== OAUTH_REFRESH) return Response.json({ error: "invalid_grant" }, { status: 400 })
+        } else {
+          return Response.json({ error: "unsupported_grant_type" }, { status: 400 })
+        }
+        oauthTokenN += 1
+        oauthAccess = "oauth-access-" + oauthTokenN
+        return Response.json({ access_token: oauthAccess, token_type: "Bearer", expires_in: 3600, refresh_token: OAUTH_REFRESH })
+      },
+    },
+    // the MCP server behind the authorization server: only the token it issued is accepted
+    "/mcp-oauth": {
+      POST: async (req) => {
+        if (oauthAccess === "" || (req.headers.get("authorization") ?? "") !== "Bearer " + oauthAccess) return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } })
+        return try await mcpServer(req)
+      },
+    },
+    // revokes the access token the MCP server accepts, so the next call must refresh
+    "/_oauth/revoke": {
+      POST: () => {
+        oauthAccess = ""
+        return Response.json({ revoked: true })
+      },
+    },
   },
   async fetch(req, server) {
     // the compat tests' model parameters datasheet

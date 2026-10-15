@@ -7,13 +7,14 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
-  ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig,
+  ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig, CircuitPolicyConfig,
   WebhookEndpoint,
 } from "./config"
 import { PromptRepoConfig } from "./prompts"
 import { FeatureFlagsConfig } from "./flags"
 import { notify } from "./notify"
 import { setGlobalProxy } from "./providers/types"
+import { McpClientConfig } from "./mcp"
 import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
 import { Field, fields, find, isNull, quote, elements, decodeString } from "./json"
@@ -861,6 +862,7 @@ function secretValue(cipher: ConfigCipher | undefined, seal: bool, v: string, pa
 function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: bool, inout errors: string[]): Config throws Error {
   const ps = c.providers
   const gov = c.governance
+  const mcp = c.mcp
   let out = c
   if (ps !== undefined) {
     const np: Map<string, ProviderConfig> = new Map()
@@ -920,6 +922,31 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
       g.virtual_keys = nv
     }
     out.governance = g
+  }
+  // the secrets of MCP clients: static tokens, client secrets, and the tokens an OAuth flow saved
+  if (mcp !== undefined && mcp.client_configs !== undefined) {
+    let nm = mcp
+    let nl: McpClientConfig[] = []
+    for (const cc of mcp.client_configs) {
+      let x = cc
+      const au = x.auth
+      if (au !== undefined) {
+        let a = au
+        const where = `mcp.client_configs.${x.name}.auth`
+        const tk = a.token
+        if (tk !== undefined && tk !== "") a.token = try secretValue(cipher, seal, tk, `${where}.token`, &errors)
+        const cs = a.client_secret
+        if (cs !== undefined && cs !== "") a.client_secret = try secretValue(cipher, seal, cs, `${where}.client_secret`, &errors)
+        const rt = a.refresh_token
+        if (rt !== undefined && rt !== "") a.refresh_token = try secretValue(cipher, seal, rt, `${where}.refresh_token`, &errors)
+        const at = a.access_token
+        if (at !== undefined && at !== "") a.access_token = try secretValue(cipher, seal, at, `${where}.access_token`, &errors)
+        x.auth = a
+      }
+      nl.push(x)
+    }
+    nm.client_configs = nl
+    out.mcp = nm
   }
   return out
 }
@@ -1052,6 +1079,13 @@ export class ConfigStore {
     let n: Config = this.cfg
     n.proxy_config = px
     return this.commit(n, "proxy-config")
+  }
+
+  // Replaces the circuit breaker policies (Bifrost's circuit_breaker_config.policies); see circuitPoliciesRoute.
+  setCircuitPolicies(list: CircuitPolicyConfig[]): Result {
+    let n: Config = this.cfg
+    n.circuit_breaker_policies = list
+    return this.commit(n, "circuit-breaker-policies")
   }
 
   // Replaces the client section (Bifrost's client_config); see putConfig.
@@ -2577,6 +2611,21 @@ test("sealed secrets: the store writes sealed secrets to the file", () => {
   // the in-memory config keeps the plain value
   expect(s.cfg.providers!.get("openai")!.keys![0]!.value).toBe("sk-store-987654321")
   cleanup(path)
+})
+
+test("MCP client secrets and OAuth tokens are sealed at rest", () => {
+  const cipher = cipherFor("a passphrase of sixteen bytes")
+  const c: Config = { mcp: { client_configs: [{ name: "m", connection_type: "http", connection_string: "https://m/mcp", auth: { type: "oauth", client_secret: "cs-plain-1", access_token: "at-plain-2", refresh_token: "rt-plain-3" } }] } }
+  const text = JSON.stringify(try sealConfig(c, cipher))
+  expect(text.includes("rt-plain-3")).toBe(false)
+  expect(text.includes("at-plain-2")).toBe(false)
+  expect(text.includes("cs-plain-1")).toBe(false)
+  const back = try openConfig(try JSON.parse(text) as Config, cipher)
+  expect(back.errors.length).toBe(0)
+  const a = back.cfg.mcp!.client_configs![0]!.auth!
+  expect(a.refresh_token).toBe("rt-plain-3")
+  expect(a.access_token).toBe("at-plain-2")
+  expect(a.client_secret).toBe("cs-plain-1")
 })
 
 test("encryption_key: an unset env reference is an error, and no key means no cipher", () => {
