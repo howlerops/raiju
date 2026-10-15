@@ -135,7 +135,7 @@ def eventstream(data: bytes):
 def background(x):
     """Requests gateways send on their own schedule: MCP handshakes and tool listings, vault reads,
     and log exporter flushes (a flush landing between a request and seen() would read as that request)."""
-    if x["path"] in ("/v1/secret/data/raiju", "/_bulk", "/export-hook"):
+    if x["path"] in ("/v1/secret/data/raiju", "/_bulk", "/export-hook", "/alert-hook") or x["path"].startswith("/logs/"):
         return True
     return x["path"].startswith("/mcp") and any(m in x.get("body", "") for m in ('"tools/list"', '"initialize"', '"notifications/'))
 
@@ -1703,7 +1703,7 @@ def main():
 
         # alerting: "any traffic" fires to the webhook within one interval
         time.sleep(1.5)
-        hooks = [json.loads(x["body"]) for x in seen() if x["path"] == "/alert-hook"]
+        hooks = [json.loads(x["body"]) for x in seen(traces=True) if x["path"] == "/alert-hook"]
         check("an alert fires to the webhook", any(x.get("kind") == "firing" and x.get("rule") == "any-traffic" for x in hooks), hooks)
         s, _, b = call("GET", "/api/alerts")
         check("alert state is visible", s == 200 and '"firing"' in b, b[:300])
@@ -1712,7 +1712,7 @@ def main():
         rid = json.loads(b).get("id", "") if s in (200, 201) else ""
         s2, _, _ = call("POST", "/api/alerting/rules", {"name": "bad", "enabled": True, "scope_type": "virtual_key", "scope_id": "vk-budget", "cel_expression": "budget_usage_percent >", "channel_ids": ["hook"]})
         time.sleep(2.5)
-        hooks = [x["body"] for x in seen() if x["path"] == "/alert-hook"]
+        hooks = [x["body"] for x in seen(traces=True) if x["path"] == "/alert-hook"]
         _, _, hb = call("GET", "/api/alerting/history")
         check("a Bifrost alert rule is created over the API and fires", s in (200, 201) and rid != "" and s2 == 400 and any(rid in h or "vk budget" in h for h in hooks) and rid in hb, (s, b, s2, hooks[-2:], hb[:300]))
         s, _, _ = call("DELETE", "/api/alerting/rules/" + rid)
@@ -1956,7 +1956,7 @@ def main():
 
         # log exports to S3-compatible storage
         time.sleep(1.5)
-        puts = [x for x in seen() if x["path"].startswith("/logs/raiju-logs/")]
+        puts = [x for x in seen(traces=True) if x["path"].startswith("/logs/raiju-logs/")]
         lines = [json.loads(l) for x in puts for l in x["body"].strip().split("\n") if l]
         check("request logs are exported to object storage", puts and puts[0]["path"].endswith(".jsonl") and puts[0]["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") and any("gpt-4o-mini" in l.get("model", "") for l in lines), [p["path"] for p in puts][:3])
 
