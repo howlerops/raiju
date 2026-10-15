@@ -1367,6 +1367,8 @@ export class Engine {
     const model = modelName ?? rawStr(body, "model")
     ctx.model = model ?? ""
     if (model === undefined) return errorResponse(400, "the request needs a model, e.g. \"openai/gpt-4o-mini\"", "invalid_request_error", out)
+    // overhead components (bifrost_overhead_component_microseconds): routing starts here
+    const tRoute = performance.now()
     // complexity tier: for routing rules (complexity_tier) and the tier map behind model "auto"
     let tier: Tier | undefined = undefined
     const cx = this.complexity
@@ -1394,8 +1396,11 @@ export class Engine {
         out.set("x-bf-routing-rule", h.get("x-bf-routing-rule") ?? "")
       }
     }
+    const routeUs = (performance.now() - tRoute) * 1000.0
     const primary = refs[0]!
+    const tGov = performance.now()
     const admitted = this.gov.admit(h, primary.provider, primary.model)
+    const govUs = (performance.now() - tGov) * 1000.0
     if (admitted.kind === "denial") {
       ctx.error = admitted.message
       return errorResponse(admitted.status, admitted.message, admitted.type, out)
@@ -1419,6 +1424,9 @@ export class Engine {
       rl.routingEngineUsed = "routing_rule"
     }
     if (tier !== undefined) rl.complexityTier = tier
+    if (tier !== undefined || (ruleName !== undefined && ruleName !== "")) {
+      metrics.observeRouting(ruleName !== undefined && ruleName !== "" ? "routing_rule" : "complexity", tier ?? "", ruleName ?? "")
+    }
     if (model !== primary.provider + "/" + primary.model && model !== primary.model) rl.alias = model
     rl.app = h.get("x-bf-app") ?? ""
     rl.custom = metrics.customValues(h)
@@ -1429,6 +1437,7 @@ export class Engine {
       if (this.gov.admit(h, r.provider, r.model).kind === "grant") allowed.push(r)
     }
 
+    const tCache = performance.now()
     const cache = this.cache
     let key = ""
     const noStore = h.get("x-bf-cache-no-store") === "true"
@@ -1477,10 +1486,15 @@ export class Engine {
       }
     }
 
+    // the cache plugin's time (lookups and the semantic embedding), for the overhead components
+    const cacheUs = (performance.now() - tCache) * 1000.0
     if (cache !== undefined || semVec.length > 0) out.set("x-bifrost-cache-hit", "false")
     ctx.outHeaders = out
     ctx.requested = model
+    const tAtt = performance.now()
     const r = try await this.attempt(allowed, h, build, translate, streamed, ctx)
+    // translation and retries: the attempt's time less the upstream calls
+    const convertUs = Math.max(0.0, (performance.now() - tAtt) * 1000.0 - r.upstreamMs * 1000.0)
     out.set("x-bf-attempts", "" + r.attempts)
     if (!r.ok) {
       ctx.error = r.body.byteLength > 2000 ? r.body.slice(0, 2000) : r.body
@@ -1537,6 +1551,12 @@ export class Engine {
     // Time spent in the gateway itself, upstream calls excluded (Bifrost's "overhead").
     const overheadUs = (performance.now() - started - r.upstreamMs) * 1000.0
     metrics.observeOverheadFor(ul, overheadUs)
+    // Bifrost's components: governance and the cache are plugins there; the rest of the overhead is
+    // miscellaneous, so the components sum to the overhead
+    metrics.observeOverheadComponent(ul, "plugins", govUs + cacheUs)
+    metrics.observeOverheadComponent(ul, "routing", routeUs)
+    metrics.observeOverheadComponent(ul, "conversion", convertUs)
+    metrics.observeOverheadComponent(ul, "miscellaneous", Math.max(0.0, overheadUs - (govUs + cacheUs + routeUs + convertUs)))
     out.set("x-bf-overhead-us", "" + Math.round(overheadUs))
     ctx.provider = r.provider
     ctx.promptTokens = r.promptTokens

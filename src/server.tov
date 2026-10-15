@@ -12,11 +12,11 @@ import * as gemini from "./providers/gemini"
 import { fields, find, elements, rawStr, rawBool } from "./json"
 import * as metrics from "./metrics"
 import { Session, prepare, onOpen, onMessage, onClose } from "./realtime"
-import { parseQuery } from "./logstore"
+import { parseQuery, filterFrom, selectAll, statsView } from "./logstore"
 import { matchRoute, handleMedia, deploymentRoute, deploymentRequest } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot } from "./schemas"
-import { handleApi } from "./store"
+import { handleApi, proxyWidening } from "./store"
 import { passthroughPath, passthroughRoute } from "./passthrough"
 import { mcpApi } from "./mcpapi"
 import { alertingRoute } from "./alertapi"
@@ -208,11 +208,18 @@ async function mcpAction(ops: Ops, action: string, id: string, ok: Reply): Promi
   return ok
 }
 
+// The /api/logs routes that ops.logsRoute answers (histograms, rankings, dashboard, filterdata, dropped),
+// and the MCP logs. The other /api/logs routes are not these.
+function logsAnalyticsPath(path: string): bool {
+  return path.startsWith("/api/logs/histogram") || path.startsWith("/api/logs/rankings") || path === "/api/logs/dashboard" || path === "/api/logs/filterdata" || path === "/api/logs/dropped" || path.startsWith("/api/mcp-logs")
+}
+
 // The management API, behind RBAC; every change lands in the audit log.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const gate = ops.gate(req, path)
   if (gate.kind === "deny") return gate.res
-  const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
+  // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
+  const body = req.method === "GET" ? "" : await req.text()
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
   if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body)
   else if (path === "/api/audit-logs" || path.startsWith("/api/audit-logs/")) r = ops.auditRoute(req, path)
@@ -230,7 +237,16 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path === "/api/alerts") r = req.method === "GET" ? ops.alertsView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
   else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/logs/histogram") r = ops.logsHistogram(req)
+  // the request-log analytics and the MCP logs (ops.logsRoute)
+  else if (logsAnalyticsPath(path)) r = ops.logsRoute(req, path, body)
+  else if (path === "/api/circuit-breaker/policies" || path.startsWith("/api/circuit-breaker/policies/")) r = ops.circuitPoliciesRoute(req.method, path, body)
+  else if (path === "/api/vault/flush-cache") r = req.method === "POST" ? ops.vaultFlush() : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path === "/api/models/parameters") r = req.method === "GET" ? await ops.modelParameters(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path === "/api/models/catalog") r = ops.catalogUpsert(req, body)
+  // changing the global proxy's URL, or turning skip_tls_verify on, needs a real admin session
+  else if (path === "/api/proxy-config" && req.method === "PUT" && !ops.authOn && proxyWidening(ops.store.cfg.proxy_config, body).length > 0) {
+    r = { status: 403, body: `{"error":{"message":"Changing the global proxy (url or skip_tls_verify) requires an authenticated admin session; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication first.","type":"permission_error"}}`, contentType: "application/json" }
+  }
   else if (path.startsWith("/api/providers/") && path.endsWith("/refresh-models")) {
     // /api/providers/{p}/refresh-models or /api/providers/{p}/keys/{id}/refresh-models
     const parts = path.split("/")
@@ -271,8 +287,11 @@ function logsView(engine: Engine, req: Request, stats: bool): Response {
   const u = URL.parse(req.url)
   const params = u === undefined ? new URLSearchParams("") : u.searchParams
   if (stats) {
-    const since = parseFloat(params.get("since") ?? "0") ?? 0.0
-    return Response.json(store.stats(since))
+    // Bifrost's totals over start_time..end_time (or since), with the filters the log list takes
+    const start = parseFloat(params.get("start_time") ?? params.get("since") ?? "0") ?? 0.0
+    const end = parseFloat(params.get("end_time") ?? "") ?? Date.now() + 1.0
+    const f = filterFrom(params, "llm", start, end)
+    return new Response(statsView(selectAll(store.viewSince(start - 1.0), f)), { headers: { "content-type": "application/json" } })
   }
   return Response.json(store.query(parseQuery(params)))
 }

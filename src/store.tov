@@ -7,8 +7,9 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
-  ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames,
+  ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig,
 } from "./config"
+import { setGlobalProxy } from "./providers/types"
 import { decode } from "./base64"
 import { Field, fields, find, isNull, quote, elements, decodeString } from "./json"
 import { secureHex } from "./crypto"
@@ -681,6 +682,93 @@ function redactConfig(c: Config): Config {
   return n
 }
 
+// ---- the global proxy: GET and PUT /api/proxy-config ----
+
+const REDACTED = "<redacted>"
+
+// The global proxy as GET returns it: the password masked, and Bifrost's defaults when none is set.
+function proxyView(px: GlobalProxyConfig | undefined): string {
+  const p: GlobalProxyConfig = px ?? { enabled: false, type: "http" }
+  return JSON.stringify({
+    enabled: p.enabled ?? false,
+    type: p.type ?? "http",
+    url: p.url ?? "",
+    username: p.username ?? "",
+    password: (p.password ?? "") === "" ? "" : REDACTED,
+    no_proxy: p.no_proxy ?? "",
+    timeout: p.timeout ?? 0,
+    skip_tls_verify: p.skip_tls_verify ?? false,
+    enable_for_scim: p.enable_for_scim ?? false,
+    enable_for_inference: p.enable_for_inference ?? false,
+    enable_for_api: p.enable_for_api ?? false,
+  })
+}
+
+type ProxyParse = { ok: bool, px: GlobalProxyConfig, err: string }
+
+function proxyFail(err: string): ProxyParse {
+  return { ok: false, px: {}, err: err }
+}
+
+// The proxy a PUT body sets, or why it is refused. A password of "<redacted>" keeps the stored one.
+function proxyBody(b: string, old: GlobalProxyConfig | undefined): ProxyParse {
+  let body: GlobalProxyConfig = {}
+  try {
+    body = JSON.parse(b) as GlobalProxyConfig
+  } catch (e) {
+    return proxyFail("Invalid request payload")
+  }
+  const type = (body.type ?? "http").toLowerCase()
+  const url = body.url ?? ""
+  if (body.enabled === true) {
+    if (type === "socks5" || type === "tcp") return proxyFail(`proxy type ${type} is not yet supported`)
+    if (type !== "http") return proxyFail(`invalid proxy type: ${type}`)
+    if (url === "") return proxyFail("proxy URL is required when proxy is enabled")
+    if (!url.startsWith("http://") && !url.startsWith("https://")) return proxyFail("Invalid proxy URL: must be an http or https URL")
+    // link-local and unspecified hosts are never allowed (Bifrost's ValidateExternalURL rule)
+    const host = url.slice(url.indexOf("://") + 3).split("/")[0]!.split(":")[0]!
+    if (host.startsWith("169.254.") || host === "0.0.0.0") return proxyFail("Invalid proxy URL: link-local and unspecified addresses are not allowed")
+  }
+  if ((body.timeout ?? 0) < 0) return proxyFail("proxy timeout must be non-negative")
+  let password = body.password ?? ""
+  if (password === REDACTED) password = old?.password ?? ""
+  const px: GlobalProxyConfig = {
+    enabled: body.enabled ?? false,
+    type: type,
+    url: url,
+    username: body.username ?? "",
+    password: password,
+    no_proxy: body.no_proxy ?? "",
+    timeout: body.timeout ?? 0,
+    skip_tls_verify: body.skip_tls_verify ?? false,
+    enable_for_scim: body.enable_for_scim ?? false,
+    enable_for_inference: body.enable_for_inference ?? false,
+    enable_for_api: body.enable_for_api ?? false,
+  }
+  return { ok: true, px: px, err: "" }
+}
+
+// The changes a PUT would make that need an authenticated admin: a new proxy URL, or skip_tls_verify
+// turned on. Bifrost refuses these while dashboard auth is off, since they let the proxy read traffic.
+export function proxyWidening(old: GlobalProxyConfig | undefined, body: string): string[] {
+  const b = proxyBody(body, old)
+  if (!b.ok) return []
+  const out: string[] = []
+  if (b.px.enabled === true && (b.px.url ?? "") !== (old?.url ?? "")) out.push("url")
+  if (b.px.skip_tls_verify === true && old?.skip_tls_verify !== true) out.push("skip_tls_verify")
+  return out
+}
+
+function proxyRoute(store: ConfigStore, m: string, body: string): ApiReply {
+  if (m === "GET") return reply(200, proxyView(store.cfg.proxy_config))
+  if (m !== "PUT") return notAllowed(m)
+  const b = proxyBody(body, store.cfg.proxy_config)
+  if (!b.ok) return reply(400, errorBody(b.err))
+  const r = store.setProxy(b.px)
+  if (r.kind === "error") return errReply(r)
+  return reply(200, JSON.stringify({ message: "Proxy configuration updated successfully" }))
+}
+
 export class ConfigStore {
   cfg: Config
   version: int = 0
@@ -694,6 +782,7 @@ export class ConfigStore {
 
   constructor(readonly path: string, initial: Config) {
     this.cfg = initial
+    setGlobalProxy(initial.proxy_config)
     try {
       if (existsSync(path)) {
         const known = fields(JSON.stringify(initial)).map((f) => f.key)
@@ -736,6 +825,7 @@ export class ConfigStore {
       return fail(500, `could not save config: ${e.message}`)
     }
     this.version += 1
+    setGlobalProxy(next.proxy_config)
     const f = this.onChange
     if (f !== undefined) f(next)
     return { kind: "ok", id: id }
@@ -760,6 +850,13 @@ export class ConfigStore {
     let g: GovernanceConfig = this.cfg.governance ?? {}
     g.users = users
     return this.commit(withGov(this.cfg, g), "users")
+  }
+
+  // Replaces the global proxy (Bifrost's proxy_config); see proxyRoute.
+  setProxy(px: GlobalProxyConfig | undefined): Result {
+    let n: Config = this.cfg
+    n.proxy_config = px
+    return this.commit(n, "proxy-config")
   }
 
   // Replaces the client section (Bifrost's client_config); see putConfig.
@@ -1707,12 +1804,58 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
     }
     return notFound(p)
   }
+  if (area === "proxy-config") {
+    if (segs.length !== 2) return notFound(p)
+    return proxyRoute(store, m, body)
+  }
   if (area === "providers") return providerRoute(store, m, segs, body, p)
   if (area === "governance" && segs.length >= 3) return governanceRoute(store, m, segs, body, p)
   return notFound(p)
 }
 
 // ---- tests ----
+
+test("proxy-config: defaults, validation, password kept on <redacted>, and widening", () => {
+  const path = tmpPath()
+  try {
+    const store = try new ConfigStore(path, {})
+    const dflt = handleApi(store, "GET", "/api/proxy-config", "")
+    expect(dflt.status).toBe(200)
+    expect(dflt.body.includes(`"enabled":false`)).toBe(true)
+    expect(dflt.body.includes(`"type":"http"`)).toBe(true)
+
+    expect(handleApi(store, "PUT", "/api/proxy-config", `{"enabled":true,"type":"socks5","url":"socks5://p:1080"}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/proxy-config", `{"enabled":true,"type":"http"}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/proxy-config", `{"enabled":true,"type":"http","url":"ftp://x"}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/proxy-config", `{"enabled":true,"type":"http","url":"http://169.254.169.254:80"}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/proxy-config", `{"enabled":true,"url":"http://x:1","timeout":-1}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/proxy-config", "not json").status).toBe(400)
+    expect(handleApi(store, "DELETE", "/api/proxy-config", "").status).toBe(405)
+
+    const put = handleApi(store, "PUT", "/api/proxy-config", `{"enabled":true,"type":"http","url":"http://egress:8080","username":"u","password":"secret-pw","enable_for_inference":true}`)
+    expect(put.status).toBe(200)
+    expect(store.cfg.proxy_config?.password).toBe("secret-pw")
+    const view = handleApi(store, "GET", "/api/proxy-config", "").body
+    expect(view.includes("secret-pw")).toBe(false)
+    expect(view.includes(`"password":"<redacted>"`)).toBe(true)
+
+    // a masked password sent back keeps the stored one
+    expect(handleApi(store, "PUT", "/api/proxy-config", `{"enabled":true,"type":"http","url":"http://egress:8080","username":"u","password":"<redacted>","enable_for_inference":true}`).status).toBe(200)
+    expect(store.cfg.proxy_config?.password).toBe("secret-pw")
+
+    // the gate: a new URL or skip_tls_verify widens; the stored URL with other fields does not
+    expect(proxyWidening(store.cfg.proxy_config, `{"enabled":true,"url":"http://other:1"}`).join(",")).toBe("url")
+    expect(proxyWidening(store.cfg.proxy_config, `{"enabled":true,"url":"http://egress:8080","timeout":5}`).length).toBe(0)
+    expect(proxyWidening(store.cfg.proxy_config, `{"enabled":true,"url":"http://egress:8080","skip_tls_verify":true}`).join(",")).toBe("skip_tls_verify")
+    expect(proxyWidening(store.cfg.proxy_config, `{"enabled":false}`).length).toBe(0)
+
+    // disabling clears the proxy for providers too
+    expect(handleApi(store, "PUT", "/api/proxy-config", `{"enabled":false}`).status).toBe(200)
+    expect(store.cfg.proxy_config?.enabled).toBe(false)
+  } finally {
+    cleanup(path)
+  }
+})
 
 function statusOf(r: Result): int {
   return r.kind === "error" ? r.status : 200

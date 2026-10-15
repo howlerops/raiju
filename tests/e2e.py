@@ -1775,6 +1775,108 @@ def main():
         check("pricing force-sync reports a failed datasheet fetch", s == 500 and "HTTP 404" in b, (s, b))
         s, _, b = call("GET", "/api/pricing/force-sync")
         check("pricing force-sync is POST only", s == 405, (s, b))
+
+        # the global proxy: defaults, validation, and a password that is kept but not shown
+        s, _, b = call("GET", "/api/proxy-config")
+        check("GET /api/proxy-config shows the default when none is set", s == 200 and json.loads(b).get("enabled") is False, (s, b))
+        s, _, b = call("PUT", "/api/proxy-config", {"enabled": True, "type": "socks5", "url": "socks5://127.0.0.1:1080"})
+        check("proxy-config refuses socks5 as not yet supported", s == 400 and "not yet supported" in b, (s, b))
+        s, _, b = call("PUT", "/api/proxy-config", {"enabled": False, "type": "http", "url": "http://127.0.0.1:1", "password": "pw-secret-9"})
+        s2, _, b2 = call("GET", "/api/proxy-config")
+        check("proxy-config saves a password but shows it redacted", s == 200 and s2 == 200 and "pw-secret-9" not in b2 and '"password":"<redacted>"' in b2, (s, b, b2))
+        s, _, b = call("PUT", "/api/proxy-config", {"enabled": False, "password": "<redacted>"})
+        check("a masked proxy password keeps the stored one", s == 200 and "pw-secret-9" in open(config).read(), b)
+
+        # the vault cache: POST only, and it answers once a vault is configured
+        s, _, b = call("GET", "/api/vault/flush-cache")
+        check("vault flush is POST only", s == 405, (s, b))
+        s, _, b = call("POST", "/api/vault/flush-cache")
+        check("vault flush clears the vault cache", s == 200 and json.loads(b)["message"] == "vault cache flushed", (s, b))
+
+        # circuit-breaker policies: CRUD in Bifrost's shape
+        pol = {"name": "quota-fallback", "primary_provider": "openai", "primary_model": "gpt-4o", "fallback_provider": "anthropic", "fallback_model": "claude-x", "condition": {"signals": [{"source": "response_header", "header_name": "x-quota", "header_value": "exhausted"}]}, "default_cooldown": "30s"}
+        s, _, b = call("POST", "/api/circuit-breaker/policies", pol)
+        check("circuit policy is created", s == 201 and json.loads(b)["default_cooldown"] == 30000000000, (s, b))
+        s, _, b = call("POST", "/api/circuit-breaker/policies", pol)
+        check("a second circuit policy with the same name is a conflict", s == 409, (s, b))
+        s, _, b = call("GET", "/api/circuit-breaker/policies")
+        check("circuit policies list the policy", s == 200 and any(p["name"] == "quota-fallback" for p in json.loads(b)["policies"]), (s, b))
+        s, _, b = call("PUT", "/api/circuit-breaker/policies/quota-fallback", dict(pol, default_cooldown="1m"))
+        check("circuit policy update takes effect", s == 200 and json.loads(b)["default_cooldown"] == 60000000000, (s, b))
+        s, _, b = call("PUT", "/api/circuit-breaker/policies/quota-fallback", dict(pol, name="other"))
+        check("circuit policy update refuses a body name that differs from the URL", s == 400, (s, b))
+        s, _, b = call("POST", "/api/circuit-breaker/policies", dict(pol, name="bad", condition={"signals": []}))
+        check("circuit policy needs a signal", s == 400, (s, b))
+        s, _, b = call("PUT", "/api/circuit-breaker/policies/nope", {k: v for k, v in pol.items() if k != "name"})
+        check("circuit policy update of an unknown name is a 404", s == 404, (s, b))
+        s, _, b = call("DELETE", "/api/circuit-breaker/policies/quota-fallback")
+        check("circuit policy delete", s == 200, (s, b))
+        s, _, b = call("DELETE", "/api/circuit-breaker/policies/quota-fallback")
+        check("circuit policy delete of an unknown name is a 404", s == 404, (s, b))
+
+        # the log analytics: every histogram answers with buckets in the default day
+        for hp in ["tokens", "cost", "models", "latency", "throughput", "cost/by-provider", "tokens/by-provider", "latency/by-provider", "throughput/by-provider"]:
+            s, _, b = call("GET", "/api/logs/histogram/" + hp)
+            hj = json.loads(b) if s == 200 else {}
+            check(f"/api/logs/histogram/{hp} answers with buckets", s == 200 and isinstance(hj.get("buckets"), list) and hj.get("bucket_size_seconds") == 3600, (s, b[:200]))
+        s, _, b = call("GET", "/api/logs/histogram/cost/by-dimension?dimension=team_id")
+        check("by-dimension refuses a dimension Raiju does not record", s == 400 and "Invalid dimension" in b, (s, b))
+        s, _, b = call("GET", "/api/logs/histogram/cost/by-dimension?dimension=provider")
+        check("by-dimension groups cost by provider", s == 200 and "openai" in json.loads(b)["dimension_values"], (s, b[:300]))
+        s, _, b = call("GET", "/api/logs/rankings")
+        rj = json.loads(b) if s == 200 else {"rankings": []}
+        check("model rankings carry trends", s == 200 and len(rj["rankings"]) > 0 and "trend" in rj["rankings"][0], (s, b[:300]))
+        s, _, b = call("GET", "/api/logs/rankings/by-dimension?dimension=provider")
+        check("dimension rankings", s == 200 and "rankings" in json.loads(b), (s, b[:300]))
+        s, _, b = call("GET", "/api/logs/dashboard")
+        dj = json.loads(b) if s == 200 else {}
+        check("dashboard carries every section", s == 200 and {"meta", "overview", "provider_usage", "model_rankings", "dimension_rankings", "mcp"} <= set(dj) and dj["overview"]["stats"]["total_requests"] > 0, (s, b[:200]))
+        s, _, b = call("GET", "/api/logs/filterdata")
+        check("log filter data lists models and providers", s == 200 and len(json.loads(b)["models"]) > 0 and "openai" in json.loads(b)["providers"], (s, b[:300]))
+        s, _, b = call("GET", "/api/logs/dropped")
+        check("dropped requests are counted", s == 200 and json.loads(b)["dropped_requests"] == 0, (s, b))
+        s, _, b = call("GET", "/api/logs/stats")
+        check("log stats carry Bifrost's totals", s == 200 and json.loads(b)["total_requests"] > 0 and "total_cost" in json.loads(b), (s, b[:200]))
+
+        # MCP tool executions in the log, and their routes
+        s, _, b = call("GET", "/api/mcp-logs")
+        mj = json.loads(b) if s == 200 else {"logs": [], "pagination": {"total_count": 0}}
+        check("MCP tool executions are logged", s == 200 and mj["pagination"]["total_count"] >= 2 and any(x["tool_name"] == "get_weather" for x in mj["logs"]), (s, b[:300]))
+        mcp_id = mj["logs"][0]["id"]
+        s, _, b = call("GET", "/api/mcp-logs/" + mcp_id)
+        check("an MCP log by id", s == 200 and json.loads(b)["id"] == mcp_id, (s, b[:200]))
+        s, _, b = call("GET", "/api/mcp-logs/stats")
+        check("MCP log stats", s == 200 and json.loads(b)["total_executions"] >= 2, (s, b))
+        s, _, b = call("GET", "/api/mcp-logs/histogram/top-tools")
+        check("MCP top tools", s == 200 and any(t["tool_name"] == "get_weather" for t in json.loads(b)["tools"]), (s, b[:200]))
+        s, _, b = call("GET", "/api/mcp-logs/histogram")
+        check("MCP histogram", s == 200 and "buckets" in json.loads(b), (s, b[:200]))
+        s, _, b = call("GET", "/api/mcp-logs/filterdata")
+        check("MCP filter data lists the tools", s == 200 and "get_weather" in json.loads(b)["tool_names"], (s, b[:200]))
+        s, _, b = call("DELETE", "/api/mcp-logs", {"ids": [mcp_id]})
+        check("MCP logs are deleted by id", s == 200, (s, b))
+        s, _, b = call("GET", "/api/mcp-logs/" + mcp_id)
+        check("a deleted MCP log is gone", s == 404, (s, b))
+
+        # model parameters and the writable catalog
+        s, _, b = call("GET", "/api/models/parameters?model=openai/gpt-4o")
+        check("model parameters resolve a provider-qualified id", s == 200 and json.loads(b).get("max_input_tokens") == 128000, (s, b[:200]))
+        s, _, b = call("GET", "/api/models/parameters?model=no-such-model")
+        check("model parameters are a 404 for an unknown model", s == 404, (s, b))
+        s, _, b = call("GET", "/api/models/parameters")
+        check("model parameters need the model", s == 400, (s, b))
+        s, _, b = call("PUT", "/api/models/catalog", [{"model": "no-such-model", "provider": "openai", "additional_attributes": {"tier": "x"}}])
+        check("catalog update refuses an entry outside the price catalog", s == 404, (s, b))
+        s, _, b = call("PUT", "/api/models/catalog", [{"model": "", "provider": "openai"}])
+        check("catalog update needs a model and a provider", s == 400, (s, b))
+        s, _, b = call("GET", "/api/models/details?provider=openai&limit=1")
+        catalog_row = json.loads(b)["models"][0]["name"]
+        s, _, b = call("PUT", "/api/models/catalog", [{"model": catalog_row, "provider": "openai", "additional_attributes": {"tier": "gold"}}])
+        check("catalog update stores attributes for a priced entry", s == 204, (s, b))
+        s, _, b = call("PUT", "/api/models/catalog", [{"model": catalog_row, "provider": "openai", "additional_attributes": {}}])
+        check("catalog update with empty attributes clears the entry", s == 204, (s, b))
+        s, _, b = call("GET", "/metrics")
+        check("overhead components and routing decisions are exported", s == 200 and 'bifrost_overhead_component_microseconds_bucket{' in b and 'overhead_component="routing"' in b and 'raiju_routing_decisions_total{' in b, b[:200])
         # the virtual-key gate, on the gateway that enforces inference auth
         GW_BF = "http://127.0.0.1:18093"
         s, _, b = call("POST", "/openai_passthrough/pt/echo", {}, base=GW_BF)

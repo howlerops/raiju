@@ -1,6 +1,7 @@
 // Circuit breakers and adaptive load balancing for upstream targets (Bifrost's
 // enterprise features). Pure logic: every call takes `now` in milliseconds, so
 // nothing here reads a clock or starts a timer and tests are deterministic.
+import { Field, fields, find, rawStr, rawBool, rawNum, elements, decodeString, quote } from "./json"
 
 export type BreakerConfig = {
   failureThreshold: int,
@@ -19,6 +20,27 @@ export type BreakerState = "closed" | "open" | "half_open"
 
 export type TargetStatus = { id: string, state: string, ewmaMs: f64, successRate: f64, requests: int }
 
+// A circuit policy (Bifrost's enterprise circuit breaker policies). A response-header signal
+// names a header and, optionally, the value or part of it that trips the policy. The operator
+// joins the signals: OR (any) or AND (all). cooldown_ms is how long the circuit stays open.
+export type PolicySignal = { header_name: string, header_value?: string, header_contains?: string }
+
+export type CircuitPolicy = {
+  name: string,
+  enabled: bool,
+  primary_provider: string,
+  primary_model: string,
+  primary_key_ids: string[],
+  fallback_provider: string,
+  fallback_model: string,
+  operator: string,
+  signals: PolicySignal[],
+  cooldown_ms: int,
+  cooldown_header: string,
+}
+
+export type PolicyParse = { ok: bool, p: CircuitPolicy, err: string }
+
 // Outcomes are counted per second, so the window keeps a few buckets, not every request.
 class Bucket {
   ok: int = 0
@@ -35,12 +57,15 @@ class Track {
   openedAt: f64 = 0.0
   probes: int = 0
   buckets: Bucket[] = []
+  // an open circuit from a policy keeps its own cooldown; 0 means the breaker's openMs
+  cooldownMs: int = 0
 }
 
 // The state a caller sees at `now`: an OPEN breaker whose timer has run out is
 // HALF_OPEN. Computed without mutating, so reads never start a probe.
 function effState(t: Track, now: f64, openMs: int): BreakerState {
-  if (t.state === "open" && now - t.openedAt >= openMs) return "half_open"
+  const span = t.cooldownMs > 0 ? t.cooldownMs : openMs
+  if (t.state === "open" && now - t.openedAt >= span) return "half_open"
   return t.state
 }
 
@@ -67,6 +92,7 @@ function closeBreaker(t: Track): void {
   t.consecutive = 0
   t.probes = 0
   t.buckets = []
+  t.cooldownMs = 0
 }
 
 function bucketAdd(t: Track, ok: bool, now: f64, windowMs: int): void {
@@ -111,6 +137,7 @@ function rateTripped(t: Track, now: f64, cfg: BreakerConfig): bool {
 
 export class Health {
   private tracks: Map<string, Track> = new Map()
+  private policies: CircuitPolicy[] = []
 
   readonly cfg: BreakerConfig
 
@@ -204,6 +231,94 @@ export class Health {
     return out
   }
 
+  // ---- circuit policies (Bifrost's /api/circuit-breaker/policies) ----
+
+  policyList(): CircuitPolicy[] {
+    return this.policies
+  }
+
+  policyFind(name: string): CircuitPolicy | undefined {
+    for (const p of this.policies) {
+      if (p.name === name) return p
+    }
+    return undefined
+  }
+
+  // False when a policy with the name already exists.
+  policyAdd(p: CircuitPolicy): bool {
+    if (this.policyFind(p.name) !== undefined) return false
+    this.policies.push(p)
+    return true
+  }
+
+  // Replaces the policy called name. False when there is none.
+  policyReplace(name: string, p: CircuitPolicy): bool {
+    for (let i = 0; i < this.policies.length; i++) {
+      if (this.policies[i]!.name !== name) continue
+      this.policies[i] = p
+      if (p.name !== name) this.reset(name)
+      return true
+    }
+    return false
+  }
+
+  // Removes a policy and discards its open circuit. False when there is none.
+  policyDelete(name: string): bool {
+    const keep: CircuitPolicy[] = []
+    let found = false
+    for (const p of this.policies) {
+      if (p.name === name) found = true
+      else keep.push(p)
+    }
+    if (!found) return false
+    this.policies = keep
+    this.reset(name)
+    return true
+  }
+
+  // Closes a circuit now, whatever its timer says. False when no circuit is tracked under id.
+  reset(id: string): bool {
+    const t = this.tracks.get(id)
+    if (t === undefined) return false
+    closeBreaker(t)
+    return true
+  }
+
+  // The policy whose open circuit reroutes requests for this primary provider and model, if any.
+  policyFallback(provider: string, model: string, now: f64): CircuitPolicy | undefined {
+    for (const p of this.policies) {
+      if (!p.enabled || p.primary_provider !== provider || p.primary_model !== model) continue
+      if (this.state(p.name, now) === "open") return p
+    }
+    return undefined
+  }
+
+  // Checks a response from this primary against each enabled policy for it, and opens the
+  // circuit of each policy whose condition matches the headers. The cooldown is the policy's
+  // default, or the cooldown_header value in milliseconds when the response carries one.
+  // Returns the names of the policies that tripped.
+  policyObserve(provider: string, model: string, keyId: string, headers: Map<string, string>, now: f64): string[] {
+    const tripped: string[] = []
+    for (const p of this.policies) {
+      if (!p.enabled || p.primary_provider !== provider || p.primary_model !== model) continue
+      if (p.primary_key_ids.length > 0 && !p.primary_key_ids.includes(keyId)) continue
+      // an open circuit takes no more trips; a half-open probe that matches trips it again
+      if (this.state(p.name, now) === "open") continue
+      if (!policyMatches(p, headers)) continue
+      let cool = p.cooldown_ms
+      if (p.cooldown_header !== "") {
+        const hv = headerGet(headers, p.cooldown_header)
+        const ms = hv === undefined ? -1.0 : (parseFloat(hv) ?? -1.0)
+        if (ms > 0.0) cool = Math.floor(ms)
+      }
+      const t = this.track(p.name)
+      t.cooldownMs = cool
+      openBreaker(t, now)
+      tripped.push(p.name)
+    }
+    return tripped
+  }
+
   private track(id: string): Track {
     const t = this.tracks.get(id)
     if (t !== undefined) return t
@@ -272,6 +387,229 @@ export function pickAdaptive(ids: string[], baseWeights: f64[], health: Health, 
   // r near 1 can leave target at the total because of rounding
   return last
 }
+
+function policyFail(err: string): PolicyParse {
+  return { ok: false, p: { name: "", enabled: true, primary_provider: "", primary_model: "", primary_key_ids: [], fallback_provider: "", fallback_model: "", operator: "OR", signals: [], cooldown_ms: 30000, cooldown_header: "" }, err: err }
+}
+
+// The string items of a JSON array; none when the value is missing or not an array.
+function strList(raw: string | undefined): string[] {
+  const out: string[] = []
+  if (raw === undefined || !raw.startsWith("[")) return out
+  try {
+    for (const el of elements(raw)) out.push(decodeString(el))
+  } catch (e) {
+    return []
+  }
+  return out
+}
+
+// A Go duration string ("30s", "5m", "250ms") in milliseconds, or -1 when it is not one.
+function durationMs(s: string): f64 {
+  const cuts: string[] = ["ns", "us", "ms", "h", "m", "s"]
+  const mults: f64[] = [0.000001, 0.001, 1.0, 3600000.0, 60000.0, 1000.0]
+  for (let i = 0; i < cuts.length; i++) {
+    const u = cuts[i]!
+    if (!s.endsWith(u)) continue
+    const n = parseFloat(s.slice(0, s.byteLength - u.byteLength)) ?? -1.0
+    if (n < 0.0) return -1.0
+    return n * mults[i]!
+  }
+  return -1.0
+}
+
+// Reads a policy from a request body, as Bifrost's POST and PUT take it. pathName is the name in
+// the URL for PUT (the body may omit it, or repeat it), and "" for POST.
+export function parsePolicy(body: string, pathName: string): PolicyParse {
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return policyFail("Invalid request payload")
+  }
+  const bodyName = rawStr(fs, "name") ?? ""
+  if (pathName !== "" && bodyName !== "" && bodyName !== pathName) return policyFail("the name in the body must match the name in the URL")
+  const name = pathName !== "" ? pathName : bodyName
+  if (name === "") return policyFail("name is required")
+  const pp = rawStr(fs, "primary_provider") ?? ""
+  const pm = rawStr(fs, "primary_model") ?? ""
+  const fp = rawStr(fs, "fallback_provider") ?? ""
+  const fm = rawStr(fs, "fallback_model") ?? ""
+  if (pp === "" || pm === "" || fp === "" || fm === "") return policyFail("primary and fallback provider and model are required")
+  const cfRaw = find(fs, "condition")
+  if (cfRaw === undefined) return policyFail("condition is required")
+  let cfs: Field[] = []
+  try {
+    cfs = fields(cfRaw)
+  } catch (e) {
+    return policyFail("condition must be an object")
+  }
+  const operator = rawStr(cfs, "operator") ?? "OR"
+  if (operator !== "OR" && operator !== "AND") return policyFail("condition.operator must be OR or AND")
+  let els: string[] = []
+  try {
+    els = elements(find(cfs, "signals") ?? "[]")
+  } catch (e) {
+    return policyFail("condition.signals must be an array")
+  }
+  if (els.length === 0) return policyFail("condition.signals needs at least one signal")
+  const signals: PolicySignal[] = []
+  for (const el of els) {
+    let sfs: Field[] = []
+    try {
+      sfs = fields(el)
+    } catch (e) {
+      return policyFail("each signal must be an object")
+    }
+    if ((rawStr(sfs, "source") ?? "") !== "response_header") return policyFail("signal source must be response_header")
+    const hn = rawStr(sfs, "header_name") ?? ""
+    if (hn === "") return policyFail("signal header_name is required")
+    const hv = rawStr(sfs, "header_value")
+    const hc = rawStr(sfs, "header_contains")
+    if (hv !== undefined && hc !== undefined) return policyFail("header_value and header_contains are mutually exclusive")
+    signals.push({ header_name: hn, header_value: hv, header_contains: hc })
+  }
+  // default_cooldown: a Go duration string on write, or nanoseconds; 30 seconds when absent
+  let cooldown: int = 30000
+  const cdRaw = find(fs, "default_cooldown")
+  if (cdRaw !== undefined && cdRaw.startsWith("\"")) {
+    let d = ""
+    try {
+      d = decodeString(cdRaw)
+    } catch (e) {
+      return policyFail("default_cooldown must be a duration")
+    }
+    const ms = durationMs(d)
+    if (ms < 0.0) return policyFail("default_cooldown must be a duration such as 30s")
+    cooldown = Math.floor(ms)
+  } else if (cdRaw !== undefined) {
+    const ns = rawNum(fs, "default_cooldown") ?? -1.0
+    if (ns < 0.0) return policyFail("default_cooldown must not be negative")
+    cooldown = Math.floor(ns / 1000000.0)
+  }
+  const p: CircuitPolicy = {
+    name: name,
+    enabled: rawBool(fs, "enabled") ?? true,
+    primary_provider: pp,
+    primary_model: pm,
+    primary_key_ids: strList(find(fs, "primary_key_ids")),
+    fallback_provider: fp,
+    fallback_model: fm,
+    operator: operator,
+    signals: signals,
+    cooldown_ms: cooldown,
+    cooldown_header: rawStr(fs, "cooldown_header") ?? "",
+  }
+  return { ok: true, p: p, err: "" }
+}
+
+// The policy as Bifrost's API shows it: default_cooldown in nanoseconds.
+export function policyView(p: CircuitPolicy): string {
+  const sig: string[] = []
+  for (const s of p.signals) {
+    let o = `{"source":"response_header","header_name":${quote(s.header_name)}`
+    if ((s.header_value ?? "") !== "") o += `,"header_value":${quote(s.header_value ?? "")}`
+    if ((s.header_contains ?? "") !== "") o += `,"header_contains":${quote(s.header_contains ?? "")}`
+    sig.push(o + "}")
+  }
+  const keys: string[] = []
+  for (const k of p.primary_key_ids) keys.push(quote(k))
+  const on = p.enabled ? "true" : "false"
+  return `{"name":${quote(p.name)},"enabled":${on},"primary_provider":${quote(p.primary_provider)},"primary_model":${quote(p.primary_model)},"primary_key_ids":[${keys.join(",")}],"fallback_provider":${quote(p.fallback_provider)},"fallback_model":${quote(p.fallback_model)},"condition":{"operator":${quote(p.operator)},"signals":[${sig.join(",")}]},"default_cooldown":${p.cooldown_ms * 1000000},"cooldown_header":${quote(p.cooldown_header)}}`
+}
+
+// Header lookup, case-insensitive.
+function headerGet(headers: Map<string, string>, name: string): string | undefined {
+  const want = name.toLowerCase()
+  for (const k of headers.keys()) {
+    if (k.toLowerCase() === want) return headers.get(k)
+  }
+  return undefined
+}
+
+function signalHits(s: PolicySignal, headers: Map<string, string>): bool {
+  const v = headerGet(headers, s.header_name)
+  if (v === undefined) return false
+  const hv = s.header_value ?? ""
+  if (hv !== "") return v.toLowerCase() === hv.toLowerCase()
+  const hc = s.header_contains ?? ""
+  if (hc !== "") return v.toLowerCase().includes(hc.toLowerCase())
+  return true
+}
+
+// Whether a response's headers satisfy the policy's condition (OR: any signal; AND: all).
+function policyMatches(p: CircuitPolicy, headers: Map<string, string>): bool {
+  const and = p.operator === "AND"
+  for (const s of p.signals) {
+    const hit = signalHits(s, headers)
+    if (and && !hit) return false
+    if (!and && hit) return true
+  }
+  return and && p.signals.length > 0
+}
+
+test("policy bodies parse, validate and show Bifrost's shape", () => {
+  const ok = parsePolicy(`{"name":"quota","primary_provider":"azure","primary_model":"gpt-4o","primary_key_ids":["k1"],"fallback_provider":"openai","fallback_model":"gpt-4o-mini","condition":{"signals":[{"source":"response_header","header_name":"x-quota","header_contains":"exceeded"}]},"default_cooldown":"5m"}`, "")
+  expect(ok.ok).toBe(true)
+  expect(ok.p.cooldown_ms).toBe(300000)
+  expect(ok.p.operator).toBe("OR")
+  expect(policyView(ok.p).includes(`"default_cooldown":300000000000`)).toBe(true)
+  expect(policyView(ok.p).includes(`"header_contains":"exceeded"`)).toBe(true)
+  // nanoseconds are accepted too, and PUT may omit or repeat the name
+  const ns = parsePolicy(`{"primary_provider":"a","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"operator":"AND","signals":[{"source":"response_header","header_name":"h"}]},"default_cooldown":2500000000}`, "quota")
+  expect(ns.ok).toBe(true)
+  expect(ns.p.name).toBe("quota")
+  expect(ns.p.cooldown_ms).toBe(2500)
+  expect(parsePolicy(`{"name":"other","primary_provider":"a","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"signals":[{"source":"response_header","header_name":"h"}]}}`, "quota").ok).toBe(false)
+  expect(parsePolicy(`{"primary_provider":"a","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"signals":[{"source":"body","header_name":"h"}]}}`, "").ok).toBe(false)
+  expect(parsePolicy(`{"name":"x","primary_provider":"a","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"signals":[]}}`, "").ok).toBe(false)
+  expect(parsePolicy(`{"name":"x","primary_provider":"a","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"signals":[{"source":"response_header","header_name":"h","header_value":"1","header_contains":"1"}]}}`, "").ok).toBe(false)
+  expect(parsePolicy(`{"name":"x","primary_provider":"a","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"signals":[{"source":"response_header","header_name":"h"}]},"default_cooldown":"soon"}`, "").ok).toBe(false)
+  expect(parsePolicy(`{"name":"x","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"signals":[{"source":"response_header","header_name":"h"}]}}`, "").ok).toBe(false)
+})
+
+test("a policy opens its primary's circuit on a matching header and reroutes until the cooldown", () => {
+  const h = new Health()
+  const pol = parsePolicy(`{"name":"p1","primary_provider":"azure","primary_model":"gpt-4o","fallback_provider":"openai","fallback_model":"gpt-4o","condition":{"signals":[{"source":"response_header","header_name":"X-Quota","header_value":"exhausted"}]},"default_cooldown":"10s"}`, "")
+  expect(h.policyAdd(pol.p)).toBe(true)
+  expect(h.policyAdd(pol.p)).toBe(false)
+  const hit: Map<string, string> = new Map()
+  hit.set("x-quota", "Exhausted")
+  const miss: Map<string, string> = new Map()
+  miss.set("x-quota", "ok")
+  expect(h.policyObserve("azure", "gpt-4o", "", miss, 500.0).length).toBe(0)
+  expect(h.policyObserve("azure", "gpt-4o", "", hit, 1000.0).join(",")).toBe("p1")
+  expect(h.policyFallback("azure", "gpt-4o", 5000.0)?.fallback_provider).toBe("openai")
+  expect(h.policyFallback("azure", "gpt-4o-mini", 5000.0) === undefined).toBe(true)
+  // after the 10 seconds the circuit is half-open: no reroute, and a matching probe trips it again
+  expect(h.policyFallback("azure", "gpt-4o", 11000.0) === undefined).toBe(true)
+  expect(h.policyObserve("azure", "gpt-4o", "", hit, 11000.0).join(",")).toBe("p1")
+  expect(h.reset("p1")).toBe(true)
+  expect(h.policyFallback("azure", "gpt-4o", 11001.0) === undefined).toBe(true)
+  expect(h.reset("nope")).toBe(false)
+  expect(h.policyReplace("p1", pol.p)).toBe(true)
+  expect(h.policyDelete("p1")).toBe(true)
+  expect(h.policyDelete("p1")).toBe(false)
+  expect(h.policyList().length).toBe(0)
+})
+
+test("a policy's cooldown header overrides its default, and AND needs every signal", () => {
+  const h = new Health()
+  const pol = parsePolicy(`{"name":"ra","primary_provider":"azure","primary_model":"m","fallback_provider":"openai","fallback_model":"n","cooldown_header":"x-retry-ms","condition":{"operator":"AND","signals":[{"source":"response_header","header_name":"x-a"},{"source":"response_header","header_name":"x-b"}]}}`, "")
+  expect(pol.ok).toBe(true)
+  expect(pol.p.cooldown_ms).toBe(30000)
+  h.policyAdd(pol.p)
+  const one: Map<string, string> = new Map()
+  one.set("x-a", "1")
+  expect(h.policyObserve("azure", "m", "", one, 0.0).length).toBe(0)
+  const both: Map<string, string> = new Map()
+  both.set("x-a", "1")
+  both.set("x-b", "2")
+  both.set("x-retry-ms", "2500")
+  expect(h.policyObserve("azure", "m", "", both, 0.0).join(",")).toBe("ra")
+  expect(h.policyFallback("azure", "m", 2000.0) === undefined).toBe(false)
+  expect(h.policyFallback("azure", "m", 2500.0) === undefined).toBe(true)
+})
 
 function tripConfig(failureThreshold: int): BreakerConfig {
   return { failureThreshold: failureThreshold, failureRateThreshold: 0.5, minRequests: 10, windowMs: 60000, openMs: 30000, halfOpenProbes: 1 }

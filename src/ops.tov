@@ -6,7 +6,10 @@ import { parseDatasheet } from "./pricing"
 import { OtelConfig, TlsOpts, otelTls } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { Engine } from "./gateway"
-import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
+import { LogStore, LogEntry, defaultLogStoreConfig, gridOf, filterFrom, selectAll, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { setMcpToolLog, McpToolCall } from "./mcp"
+import { parsePolicy, policyView } from "./health"
+import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin } from "./store"
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, allowed, provisioned } from "./rbac"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
@@ -18,7 +21,8 @@ import { handleProfiles } from "./profiles"
 import { ExportQueue } from "./exporters"
 import * as exporters from "./exporters"
 import { resolveAll } from "./secrets"
-import { fields, find, rawStr, isNull } from "./json"
+import { Field, fields, find, rawStr, isNull, elements } from "./json"
+import { trimSlash } from "./providers/types"
 import { snapshot, errorJson } from "./schemas"
 import { deadline } from "./deadline"
 import { secureHex, utf8 } from "./crypto"
@@ -43,19 +47,6 @@ function epochParam(raw: string | undefined, fallback: f64): f64 {
   return v >= 0.0 && v < 1e15 ? v : fallback
 }
 
-// Bifrost's histogram bucket size for a time span (logstore DefaultBucketSize), in seconds.
-function histogramBucketSeconds(spanMs: f64): f64 {
-  const day = 86400000.0
-  if (spanMs >= 365.0 * day) return 30.0 * 86400.0
-  if (spanMs >= 90.0 * day) return 7.0 * 86400.0
-  if (spanMs > 31.0 * day) return 3.0 * 86400.0
-  if (spanMs >= 7.0 * day) return 86400.0
-  if (spanMs >= 3.0 * day) return 8.0 * 3600.0
-  if (spanMs >= day) return 3600.0
-  if (spanMs >= 7200000.0) return 600.0
-  return 60.0
-}
-
 // Ascending by name: the order of the model lists.
 function byName(a: string, b: string): int {
   if (a === b) return 0
@@ -66,6 +57,70 @@ function json(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "application/json")
   return new Response(body, { status: status, headers: h })
+}
+
+// Model parameters by model key, each record as the JSON text it came in. The datasheet is keyed
+// inconsistently (bare names and provider-qualified ones), so lookups go through resolveParams.
+export function parseParams(text: string): Map<string, string> throws SyntaxError {
+  const out: Map<string, string> = new Map()
+  for (const f of try fields(text)) {
+    if (f.raw.startsWith("{")) out.set(f.key, f.raw)
+  }
+  return out
+}
+
+// The record for a model: its exact key; else its name without provider segments; else a qualified
+// key that ends in the bare name ("openrouter/openai/gpt-4o" for "gpt-4o"), the one with fewest segments.
+export function resolveParams(m: Map<string, string>, model: string): string | undefined {
+  const exact = m.get(model)
+  if (exact !== undefined) return exact
+  let bare = model
+  while (bare.includes("/")) {
+    bare = bare.slice(bare.indexOf("/") + 1)
+    const hit = m.get(bare)
+    if (hit !== undefined) return hit
+  }
+  let best = ""
+  let bestSegs = 1000
+  for (const k of m.keys()) {
+    if (!k.endsWith("/" + bare)) continue
+    const n = k.split("/").length
+    if (n < bestSegs) {
+      best = k
+      bestSegs = n
+    }
+  }
+  if (best === "") return undefined
+  return m.get(best)
+}
+
+// The embedded fallback: the context and output limits of a few common models. The live datasheet
+// (pricing_sync) replaces it. Values are the providers' published limits for these model names.
+const FALLBACK_PARAMS = `{
+  "gpt-4o": {"mode":"chat","max_input_tokens":128000,"max_output_tokens":16384,"supports_function_calling":true,"supports_vision":true},
+  "gpt-4o-mini": {"mode":"chat","max_input_tokens":128000,"max_output_tokens":16384,"supports_function_calling":true,"supports_vision":true},
+  "gpt-4.1": {"mode":"chat","max_input_tokens":1047576,"max_output_tokens":32768,"supports_function_calling":true,"supports_vision":true},
+  "claude-3-5-sonnet-20241022": {"mode":"chat","max_input_tokens":200000,"max_output_tokens":8192,"supports_function_calling":true,"supports_vision":true},
+  "claude-3-5-haiku-20241022": {"mode":"chat","max_input_tokens":200000,"max_output_tokens":8192,"supports_function_calling":true,"supports_vision":true},
+  "claude-sonnet-4-20250514": {"mode":"chat","max_input_tokens":200000,"max_output_tokens":64000,"supports_function_calling":true,"supports_vision":true},
+  "gemini-1.5-pro": {"mode":"chat","max_input_tokens":2097152,"max_output_tokens":8192,"supports_function_calling":true,"supports_vision":true},
+  "gemini-2.0-flash": {"mode":"chat","max_input_tokens":1048576,"max_output_tokens":8192,"supports_function_calling":true,"supports_vision":true}
+}`
+
+function fallbackParams(): Map<string, string> {
+  try {
+    return parseParams(FALLBACK_PARAMS)
+  } catch (e) {
+    return new Map()
+  }
+}
+
+function okJson(body: string): Reply {
+  return { status: 200, body: body, contentType: "application/json" }
+}
+
+function badRequest(message: string): Reply {
+  return { status: 400, body: errorJson(message, "invalid_request_error", undefined), contentType: "application/json" }
 }
 
 function denied(status: int, message: string): Response {
@@ -167,6 +222,11 @@ const DISCOVER_MS = 10000
 export class Ops {
   rbac: RbacConfig = { users: [] }
   authOn = false
+  // model parameters (GET /api/models/parameters), loaded when first asked and then daily
+  private params: Map<string, string> = new Map()
+  private paramsAt: f64 = -1.0
+  // catalog attributes (PUT /api/models/catalog): "provider/model" to the attributes' JSON text
+  private catalogAttrs: Map<string, string> = new Map()
   audit: AuditLog | undefined = undefined
   alerts: AlertEngine | undefined = undefined
   // Bifrost-style alert rules (CEL over a governance scope's usage)
@@ -210,6 +270,11 @@ export class Ops {
       this.nodeId = "node"
     }
     this.configure(engine.cfg)
+    this.loadCatalogAttrs()
+    // MCP tool executions go to the request log store (kind "mcp")
+    setMcpToolLog((c: McpToolCall) => {
+      this.recordMcp(c)
+    })
   }
 
   // Applies the parts of a (resolved) config that live here.
@@ -574,6 +639,165 @@ export class Ops {
     return { status: 200, body: JSON.stringify({ status: "success", message: "pricing synced successfully" }), contentType: "application/json" }
   }
 
+  // ---- model parameters and the writable catalog ----
+
+  // GET /api/models/parameters?model=...: the parameter record for a model, as the datasheet keys it.
+  // Provider-qualified ids resolve to the bare or qualified key (see resolveParams). The datasheet is
+  // fetched once a day when a pricing_sync section is set (from its URL, /model-parameters); otherwise
+  // and on any failure the embedded fallback answers.
+  async modelParameters(req: Request): Promise<Reply> {
+    if (req.method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    const u = URL.parse(req.url)
+    const sp = u === undefined ? new URLSearchParams("") : u.searchParams
+    const model = (sp.get("model") ?? "").trim()
+    if (model === "") return badRequest("model query parameter is required")
+    await this.loadParams()
+    const hit = resolveParams(this.params, model)
+    if (hit === undefined) return { status: 404, body: errorJson(`no parameters found for model ${model}`, "not_found_error", undefined), contentType: "application/json" }
+    return okJson(hit)
+  }
+
+  private async loadParams(): Promise<void> {
+    const now = Date.now()
+    if (this.paramsAt >= 0.0 && now - this.paramsAt < 86400000.0) return
+    if (this.params.size === 0) this.params = fallbackParams()
+    this.paramsAt = now
+    const ps = this.store.cfg.pricing_sync
+    if (ps === undefined) return
+    const base = trimSlash(ps.url ?? "https://getbifrost.ai/datasheet")
+    try {
+      const r = await getText(base + "/model-parameters")
+      if (r.status !== 200) throw new Error(`HTTP ${r.status}`)
+      const next = parseParams(r.body)
+      if (next.size > 0) this.params = next
+    } catch (e) {
+      console.error(`raiju: model parameters: ${e.message}`)
+      // try again within the hour
+      this.paramsAt = now - 82800000.0
+    }
+  }
+
+  // PUT /api/models/catalog: sets the additional attributes of catalog entries, each (model, provider)
+  // of which must be in the price catalog; the whole batch is refused when one is not. An empty
+  // attribute map clears the entry. Kept in <config>.catalog.json next to the config file.
+  catalogUpsert(req: Request, body: string): Reply {
+    if (req.method !== "PUT") return { status: 405, body: errorJson("use PUT", "invalid_request_error", undefined), contentType: "application/json" }
+    let items: string[] = []
+    try {
+      items = elements(body)
+    } catch (e) {
+      return badRequest("Invalid request payload")
+    }
+    const keys: string[] = []
+    const values: string[] = []
+    for (const it of items) {
+      let fs: Field[] = []
+      try {
+        fs = fields(it)
+      } catch (e) {
+        return badRequest("Invalid request payload")
+      }
+      const model = (rawStr(fs, "model") ?? "").trim()
+      const provider = (rawStr(fs, "provider") ?? "").trim()
+      if (model === "" || provider === "") return badRequest("model and provider are required for every catalog entry")
+      const key = provider + "/" + model
+      if (!this.catalogHas(provider, model)) return { status: 404, body: errorJson(`no catalog entry for ${key}; the batch was not applied`, "not_found_error", undefined), contentType: "application/json" }
+      const raw = find(fs, "additional_attributes")
+      const parts: string[] = []
+      if (raw !== undefined && raw !== "null") {
+        let attrs: Field[] = []
+        try {
+          attrs = fields(raw)
+        } catch (e) {
+          return badRequest("additional_attributes must be an object of strings")
+        }
+        for (const a of attrs) {
+          if (!a.raw.startsWith("\"")) return badRequest("additional_attributes must be an object of strings")
+          parts.push(JSON.stringify(a.key) + ":" + a.raw)
+        }
+      }
+      keys.push(key)
+      values.push(parts.length === 0 ? "" : jobj(parts))
+    }
+    for (let i = 0; i < keys.length; i++) {
+      if (values[i]! === "") this.catalogAttrs.delete(keys[i]!)
+      else this.catalogAttrs.set(keys[i]!, values[i]!)
+    }
+    try {
+      const pairs: string[] = []
+      for (const k of this.catalogAttrs.keys()) pairs.push(jkv(k, this.catalogAttrs.get(k)!))
+      writeFileSync(this.catalogFile(), jobj(pairs) + "\n")
+    } catch (e) {
+      return { status: 500, body: errorJson(`could not save the catalog: ${e.message}`, "api_error", undefined), contentType: "application/json" }
+    }
+    return { status: 204, body: "", contentType: "application/json" }
+  }
+
+  private catalogFile(): string {
+    return this.store.path + ".catalog.json"
+  }
+
+  // Whether the price catalog has the model for the provider: keyed "provider/model", or bare
+  // (catalogView lists the rows of the first provider that way).
+  private catalogHas(provider: string, model: string): bool {
+    const rows = this.engine.pricing.catalog.rows
+    if (rows.get(provider + "/" + model) !== undefined) return true
+    const bare = rows.get(model)
+    return bare !== undefined && bare.provider === provider
+  }
+
+  // The catalog attributes saved beside the config file, read once at startup.
+  private loadCatalogAttrs(): void {
+    const path = this.catalogFile()
+    if (!existsSync(path)) return
+    try {
+      for (const f of fields(readFileSync(path, "utf8"))) this.catalogAttrs.set(f.key, f.raw)
+    } catch (e) {
+      console.error(`raiju: could not read ${path}: ${e.message}`)
+    }
+  }
+
+  // ---- circuit breaker and vault ----
+
+  // POST /api/vault/flush-cache: drops the cached Vault values, so the next reference fetches them again.
+  vaultFlush(): Reply {
+    const v = this.store.cfg.secrets?.vault
+    if (v === undefined) return badRequest("vault is not enabled")
+    const n = flushVaultCache(v.address)
+    return okJson(JSON.stringify({ message: "vault cache flushed", entries: n }))
+  }
+
+  // /api/circuit-breaker/policies (GET, POST) and /api/circuit-breaker/policies/{name} (PUT, DELETE).
+  circuitPoliciesRoute(method: string, path: string, body: string): Reply {
+    const h = this.engine.health
+    const rest = path.slice("/api/circuit-breaker/policies".byteLength)
+    const one = rest.startsWith("/") ? rest.slice(1) : ""
+    if (rest !== "" && one === "") return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
+    if (one === "") {
+      if (method === "GET") {
+        const rows: string[] = []
+        for (const p of h.policyList()) rows.push(policyView(p))
+        return okJson(`{"policies":[${rows.join(",")}]}`)
+      }
+      if (method !== "POST") return { status: 405, body: errorJson("use GET or POST", "invalid_request_error", undefined), contentType: "application/json" }
+      const pr = parsePolicy(body, "")
+      if (!pr.ok) return badRequest(pr.err)
+      if (!h.policyAdd(pr.p)) return { status: 409, body: errorJson(`a policy named ${pr.p.name} already exists`, "invalid_request_error", undefined), contentType: "application/json" }
+      return { status: 201, body: policyView(pr.p), contentType: "application/json" }
+    }
+    if (method === "PUT") {
+      const pr = parsePolicy(body, one)
+      if (!pr.ok) return badRequest(pr.err)
+      if (!h.policyReplace(one, pr.p)) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      return okJson(policyView(pr.p))
+    }
+    if (method === "DELETE") {
+      if (!h.policyDelete(one)) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      return okJson(JSON.stringify({ message: `policy ${one} deleted` }))
+    }
+    return { status: 405, body: errorJson("use PUT or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+  }
+
   // ---- /api/session/*: login, logout and the auth state ----
 
   // Open routes (they run before the gate, since login is how a caller gets through it). Login
@@ -679,35 +903,227 @@ export class Ops {
   // end_time are epoch milliseconds (the log store's own clock); the default is the last 24 hours.
   // Buckets with no requests are included. success is 2xx, cancelled is 499, error is the rest.
   logsHistogram(req: Request): Reply {
-    if (req.method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    return this.logsRoute(req, "/api/logs/histogram", "")
+  }
+
+  // The request-log analytics (Bifrost's /api/logs/histogram*, rankings, dashboard, filterdata,
+  // dropped) and the MCP logs (/api/mcp-logs*). Every reply is JSON. Dimensions Raiju does not record
+  // (team, customer, user, business unit, project, app, user agent) are refused with a 400.
+  logsRoute(req: Request, path: string, body: string): Reply {
+    const m = req.method
     const store = this.engine.logStore
+    if (path.startsWith("/api/mcp-logs")) return this.mcpLogsRoute(req, path, body, store)
+    if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
+    if (m !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    const u = URL.parse(req.url)
+    const sp = u === undefined ? new URLSearchParams("") : u.searchParams
+    const now = Date.now()
+    if (path === "/api/logs/dropped") return okJson(`{"dropped_requests":${store.dropped}}`)
+    if (path === "/api/logs/filterdata") return okJson(this.logFilterData(store))
+    const end = epochParam(sp.get("end_time") ?? undefined, now)
+    const start = this.windowStart(sp, end)
+    if (start >= end) return badRequest("start_time must be before end_time")
+    const g = gridOf(start, end)
+    if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
+    const es = selectAll(store.viewSince(start - 1.0), filterFrom(sp, "llm", start, end))
+    // the same span just before the window, for the rankings' trends
+    const pf = filterFrom(sp, "llm", start - (end - start), start)
+    const prev = selectAll(store.viewSince(pf.since - 1.0), pf)
+    const dim = sp.get("dimension") ?? ""
+    const ranked = this.rankLimit(sp)
+    if (ranked < 0) return badRequest("Invalid limit. Expected a positive integer, or all=true for no limit")
+    if (path === "/api/logs/histogram") return okJson(requestsView(es, g))
+    if (path === "/api/logs/histogram/tokens") return okJson(tokensView(es, g))
+    if (path === "/api/logs/histogram/cost") return okJson(costView(es, g))
+    if (path === "/api/logs/histogram/models") return okJson(modelsView(es, g))
+    if (path === "/api/logs/histogram/latency") return okJson(latencyView(es, g))
+    if (path === "/api/logs/histogram/cost/by-provider") return okJson(providerView(es, g, "cost"))
+    if (path === "/api/logs/histogram/tokens/by-provider") return okJson(providerView(es, g, "tokens"))
+    if (path === "/api/logs/histogram/latency/by-provider") return okJson(providerView(es, g, "latency"))
+    if (path === "/api/logs/histogram/throughput") return okJson(throughputView(es, g))
+    if (path === "/api/logs/histogram/throughput/by-provider") return okJson(providerView(es, g, "throughput"))
+    if (path === "/api/logs/histogram/cost/by-dimension" || path === "/api/logs/histogram/tokens/by-dimension" || path === "/api/logs/histogram/latency/by-dimension") {
+      const bad = this.dimensionError(dim)
+      if (bad !== "") return badRequest(bad)
+      const what = path.includes("/cost/") ? "cost" : path.includes("/tokens/") ? "tokens" : "latency"
+      return okJson(dimensionView(es, g, what, dim))
+    }
+    if (path === "/api/logs/rankings") return okJson(modelRankingsView(es, prev, ranked))
+    if (path === "/api/logs/rankings/by-dimension") {
+      const bad = this.dimensionError(dim)
+      if (bad !== "") return badRequest(bad)
+      return okJson(dimensionRankingsView(es, prev, dim, ranked))
+    }
+    if (path === "/api/logs/dashboard") return okJson(this.dashboard(store, sp, es, prev, g, start, end, now))
+    return { status: 404, body: errorJson(`no route ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
+  }
+
+  // The window's start: start_time, or the end less period ("1h", "6h", "24h", "7d", "30d"), or 24 hours.
+  private windowStart(sp: URLSearchParams, end: f64): f64 {
+    const period = sp.get("period") ?? ""
+    let span = 86400000.0
+    if (period !== "") {
+      const unit = period.endsWith("d") ? 86400000.0 : period.endsWith("h") ? 3600000.0 : period.endsWith("m") ? 60000.0 : 0.0
+      const n = parseFloat(period.slice(0, period.byteLength - 1)) ?? 0.0
+      if (unit > 0.0 && n > 0.0) span = n * unit
+    }
+    return epochParam(sp.get("start_time") ?? undefined, end - span)
+  }
+
+  // The row limit of a ranking: limit (default 10), or 0 for no cap with all=true. -1 when invalid.
+  private rankLimit(sp: URLSearchParams): int {
+    if ((sp.get("all") ?? "") === "true") return 0
+    const raw = sp.get("limit") ?? ""
+    if (raw === "") return 10
+    const v = parseInt(raw) ?? -1
+    return v >= 1 ? v : -1
+  }
+
+  // "" when dim is a dimension the log store records, else the message for a 400.
+  private dimensionError(dim: string): string {
+    if (dim === "") return "Missing required query parameter: dimension. Valid values: provider, model, virtual_key"
+    if (!validDimension(dim)) return `Invalid dimension: ${dim}. Valid values: provider, model, virtual_key`
+    return ""
+  }
+
+  // GET /api/logs/dashboard: the overview, provider usage, model rankings, dimension rankings and MCP
+  // usage for one window, in one call (Bifrost's shape).
+  private dashboard(store: LogStore, sp: URLSearchParams, es: LogEntry[], prev: LogEntry[], g: Grid, start: f64, end: f64, now: f64): string {
+    const mf = filterFrom(sp, "mcp", start, end)
+    const mcp = selectAll(store.viewSince(start - 1.0), mf)
+    const dims: string[] = []
+    if (distinctDim(es, "virtual_key").length > 0) dims.push(jkv("virtual_key", dimensionRankingsView(es, prev, "virtual_key", 10)))
+    return jobj([
+      jkv("meta", jobj([jkv("generated_at", JSON.stringify(isoMs(now))), jkv("bucket_size_seconds", jn(g.sizeSec)), jkv("start_time", JSON.stringify(isoMs(start))), jkv("end_time", JSON.stringify(isoMs(end)))])),
+      jkv("overview", jobj([jkv("stats", statsView(es)), jkv("requests", requestsView(es, g)), jkv("tokens", tokensView(es, g)), jkv("cost", costView(es, g)), jkv("models", modelsView(es, g)), jkv("latency", latencyView(es, g)), jkv("throughput", throughputView(es, g))])),
+      jkv("provider_usage", jobj([jkv("cost", providerView(es, g, "cost")), jkv("tokens", providerView(es, g, "tokens")), jkv("latency", providerView(es, g, "latency")), jkv("throughput", providerView(es, g, "throughput"))])),
+      jkv("model_rankings", jobj([jkv("rankings", modelRankingsView(es, prev, 10)), jkv("histogram", modelsView(es, g))])),
+      jkv("dimension_rankings", jobj(dims)),
+      jkv("mcp", jobj([jkv("volume", requestsView(mcp, g)), jkv("cost", mcpCostView(mcp, g)), jkv("top_tools", topToolsView(mcp, 10))])),
+    ])
+  }
+
+  // GET /api/logs/filterdata: the values the log filters offer, from every entry in memory, and the
+  // virtual keys and routing rules of the config.
+  private logFilterData(store: LogStore): string {
+    const all = store.viewSince(0.0)
+    const llm: LogEntry[] = []
+    const mcp: LogEntry[] = []
+    for (const e of all) {
+      if (kindOf(e) === "mcp") mcp.push(e)
+      else llm.push(e)
+    }
+    const vks: string[] = []
+    for (const vk of this.store.cfg.governance?.virtual_keys ?? []) vks.push(jobj([jkv("id", JSON.stringify(vk.id)), jkv("name", JSON.stringify(vk.name ?? ""))]))
+    const rules: string[] = []
+    for (const r of this.store.cfg.governance?.routing_rules ?? []) rules.push(jobj([jkv("id", JSON.stringify(r.id)), jkv("name", JSON.stringify(r.name ?? ""))]))
+    return jobj([
+      jkv("models", jstrs(distinctDim(llm, "model"))),
+      jkv("providers", jstrs(distinctDim(llm, "provider"))),
+      jkv("virtual_keys", jarr(vks)),
+      jkv("selected_keys", "[]"),
+      jkv("routing_rules", jarr(rules)),
+      jkv("routing_engines", "[]"),
+      jkv("tool_call_names", jstrs(distinctDim(mcp, "tool"))),
+      jkv("projects", "[]"),
+    ])
+  }
+
+  // The MCP logs: GET lists, a single entry by id, and the stats, filter menus, histograms and top
+  // tools; DELETE removes entries by id.
+  private mcpLogsRoute(req: Request, path: string, body: string, store: LogStore | undefined): Reply {
     if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
-    const end = epochParam(sp.get("end_time") ?? undefined, Date.now())
-    const start = epochParam(sp.get("start_time") ?? undefined, end - 86400000.0)
-    if (start >= end) return { status: 400, body: errorJson("start_time must be before end_time", "invalid_request_error", undefined), contentType: "application/json" }
-    const sizeSec = histogramBucketSeconds(end - start)
-    const step = sizeSec * 1000.0
-    const first = Math.floor(start / step) * step
-    const n = Math.ceil((end - first) / step)
-    if (n > 10000) return { status: 400, body: errorJson("too many buckets; narrow the time range", "invalid_request_error", undefined), contentType: "application/json" }
-    const counts: { count: int, success: int, error: int, cancelled: int }[] = []
-    for (let i = 0; i < n; i++) counts.push({ count: 0, success: 0, error: 0, cancelled: 0 })
-    // counts are values in Tov: write through the index, not through a copy
-    for (const e of store.since(first - 1.0)) {
-      if (e.ts >= end) continue
-      const i = Math.floor((e.ts - first) / step)
-      if (i < 0 || i >= n) continue
-      counts[i]!.count += 1
-      if (e.status === 499) counts[i]!.cancelled += 1
-      else if (e.status >= 200 && e.status < 300) counts[i]!.success += 1
-      else counts[i]!.error += 1
+    const now = Date.now()
+    if (path === "/api/mcp-logs" && req.method === "DELETE") return this.deleteMcpLogs(store, body)
+    if (req.method !== "GET") return { status: 405, body: errorJson("use GET or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+    if (path === "/api/mcp-logs") {
+      const f = filterFrom(sp, "mcp", epochParam(sp.get("start_time") ?? undefined, 0.0), epochParam(sp.get("end_time") ?? undefined, now + 1.0))
+      const es = selectAll(store.viewSince(f.since - 1.0), f)
+      const limit = Math.min(1000, Math.max(1, parseInt(sp.get("limit") ?? "25") ?? 25))
+      const offset = Math.max(0, parseInt(sp.get("offset") ?? "0") ?? 0)
+      const rows: string[] = []
+      for (let i = es.length - 1 - offset; i >= 0 && rows.length < limit; i--) rows.push(mcpLogJson(es[i]!))
+      let hasLogs = false
+      for (const e of store.viewSince(0.0)) {
+        if (kindOf(e) === "mcp") hasLogs = true
+      }
+      const pg = jobj([jkv("limit", jn(limit)), jkv("offset", jn(offset)), jkv("sort_by", JSON.stringify("timestamp")), jkv("order", JSON.stringify("desc")), jkv("total_count", jn(es.length))])
+      return okJson(jobj([jkv("logs", jarr(rows)), jkv("pagination", pg), jkv("has_logs", hasLogs ? "true" : "false")]))
     }
-    const buckets: { timestamp: string, count: int, success: int, error: int, cancelled: int }[] = []
-    for (let i = 0; i < n; i++) buckets.push({ timestamp: isoMs(first + i * step), count: counts[i]!.count, success: counts[i]!.success, error: counts[i]!.error, cancelled: counts[i]!.cancelled })
-    return { status: 200, body: JSON.stringify({ buckets: buckets, bucket_size_seconds: sizeSec }), contentType: "application/json" }
+    if (path === "/api/mcp-logs/filterdata") {
+      const mcp: LogEntry[] = []
+      for (const e of store.viewSince(0.0)) {
+        if (kindOf(e) === "mcp") mcp.push(e)
+      }
+      return okJson(jobj([jkv("tool_names", jstrs(distinctDim(mcp, "tool"))), jkv("server_labels", jstrs(distinctDim(mcp, "server"))), jkv("virtual_keys", "[]")]))
+    }
+    if (path === "/api/mcp-logs/stats" || path === "/api/mcp-logs/histogram" || path === "/api/mcp-logs/histogram/cost" || path === "/api/mcp-logs/histogram/top-tools") {
+      const end = epochParam(sp.get("end_time") ?? undefined, now)
+      const start = this.windowStart(sp, end)
+      if (start >= end) return badRequest("start_time must be before end_time")
+      const g = gridOf(start, end)
+      if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
+      const es = selectAll(store.viewSince(start - 1.0), filterFrom(sp, "mcp", start, end))
+      if (path === "/api/mcp-logs/stats") return okJson(mcpStatsView(es))
+      if (path === "/api/mcp-logs/histogram") return okJson(requestsView(es, g))
+      if (path === "/api/mcp-logs/histogram/cost") return okJson(mcpCostView(es, g))
+      const lim = parseInt(sp.get("limit") ?? "10") ?? 10
+      return okJson(topToolsView(es, lim))
+    }
+    const id = path.slice("/api/mcp-logs/".byteLength)
+    if (id !== "" && !id.includes("/")) {
+      for (const e of store.viewSince(0.0)) {
+        if (e.id === id && kindOf(e) === "mcp") return okJson(mcpLogJson(e))
+      }
+      return { status: 404, body: errorJson("MCP log not found", "not_found_error", undefined), contentType: "application/json" }
+    }
+    return { status: 404, body: errorJson(`no route ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
   }
+
+  // DELETE /api/mcp-logs with {"ids": [...]}: removes the MCP entries among them.
+  private deleteMcpLogs(store: LogStore, body: string): Reply {
+    let ids: string[] = []
+    try {
+      ids = (JSON.parse(body) as { ids?: string[] }).ids ?? []
+    } catch (e) {
+      return badRequest("Invalid JSON")
+    }
+    if (ids.length === 0) return badRequest("No log IDs provided")
+    const doomed: string[] = []
+    for (const e of store.viewSince(0.0)) {
+      if (kindOf(e) === "mcp" && ids.includes(e.id)) doomed.push(e.id)
+    }
+    const removed = store.delete(doomed)
+    return okJson(JSON.stringify({ message: `deleted ${removed} MCP tool logs` }))
+  }
+
+  // A tool call made through the MCP clients, as a log entry of kind "mcp".
+  recordMcp(c: McpToolCall): void {
+    const store = this.engine.logStore
+    if (store === undefined) return
+    const now = Date.now()
+    store.add({
+      id: "mcp-" + now + "-" + Math.floor(Math.random() * 1000000000),
+      ts: now,
+      request_id: "",
+      op: "tool",
+      provider: "",
+      model: "",
+      status: c.ok ? 200 : 500,
+      latency_ms: c.latencyMs,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      cost: 0.0,
+      cache_hit: false,
+      error: c.error === "" ? undefined : c.error,
+      kind: "mcp",
+      tool: c.tool,
+      server: c.server,
+    })
+  }
+
 
   // ---- log exporters (Datadog, Splunk, Elasticsearch, HTTP) ----
 
@@ -1201,12 +1617,6 @@ test("epoch params and histogram bucket sizes follow the store's rule", () => {
   expect(epochParam("", 7.0)).toBe(7.0)
   expect(epochParam("abc", 7.0)).toBe(7.0)
   expect(epochParam("1500", 7.0)).toBe(1500.0)
-  expect(histogramBucketSeconds(30.0 * 60000.0)).toBe(60.0)
-  expect(histogramBucketSeconds(3.0 * 3600000.0)).toBe(600.0)
-  expect(histogramBucketSeconds(2.0 * 86400000.0)).toBe(3600.0)
-  expect(histogramBucketSeconds(8.0 * 86400000.0)).toBe(86400.0)
-  expect(histogramBucketSeconds(40.0 * 86400000.0)).toBe(3.0 * 86400.0)
-  expect(histogramBucketSeconds(100.0 * 86400000.0)).toBe(7.0 * 86400.0)
 })
 
 test("model catalog views list base models and priced rows, filtered and paged", () => {
@@ -1228,6 +1638,89 @@ test("circuit view lists only the circuits that are not closed", () => {
   expect(ops.circuitView().body).toBe(`{"circuits":{}}`)
   for (let i = 0; i < 20; i++) eng.health.record("openai#k1", false, 100.0, Date.now())
   expect(ops.circuitView().body.includes("\"openai#k1\":\"open\"")).toBe(true)
+})
+
+test("model parameters resolve qualified and bare names; the datasheet's keys are read as given", () => {
+  const m = fallbackParams()
+  expect(resolveParams(m, "gpt-4o") !== undefined).toBe(true)
+  expect(resolveParams(m, "openai/gpt-4o")).toBe(resolveParams(m, "gpt-4o"))
+  expect(resolveParams(m, "openrouter/openai/gpt-4o-mini")).toBe(resolveParams(m, "gpt-4o-mini"))
+  expect(resolveParams(m, "nope/none") === undefined).toBe(true)
+  const live = try parseParams(`{"openrouter/moonshotai/kimi-k2.5": {"max_input_tokens": 1}, "gpt-x": {"max_input_tokens": 2}, "junk": 3}`)
+  expect((resolveParams(live, "kimi-k2.5") ?? "").includes(`"max_input_tokens": 1`)).toBe(true)
+  expect((resolveParams(live, "gpt-x") ?? "").includes(`"max_input_tokens": 2`)).toBe(true)
+  expect(live.get("junk") === undefined).toBe(true)
+})
+
+test("the catalog takes attributes for priced entries only, and saves them beside the config", () => {
+  const path = "/tmp/raiju-ops-catalog-" + (try secureHex(6)) + ".json"
+  try {
+    const eng = new Engine({})
+    const ops = new Ops(eng, new ConfigStore(path, {}))
+    const put = (b: string): Reply => ops.catalogUpsert(new Request("http://raiju.test/api/models/catalog", { method: "PUT" }), b)
+    expect(put(`[{"model":"no-such-model","provider":"openai"}]`).status).toBe(404)
+    expect(put(`[{"model":"gpt-4o","provider":"openai"},{"model":"","provider":"openai"}]`).status).toBe(400)
+    expect(put(`[{"model":"gpt-4o","provider":"openai","additional_attributes":{"tier":3}}]`).status).toBe(400)
+    expect(ops.catalogUpsert(new Request("http://raiju.test/api/models/catalog"), "[]").status).toBe(405)
+    expect(put(`[{"model":"gpt-4o","provider":"openai","additional_attributes":{"tier":"gold"}}]`).status).toBe(204)
+    expect(existsSync(path + ".catalog.json")).toBe(true)
+    expect(try readFileSync(path + ".catalog.json", "utf8").includes(`"openai/gpt-4o":{"tier":"gold"}`)).toBe(true)
+    // a batch with one unknown entry changes nothing
+    expect(put(`[{"model":"gpt-4o-mini","provider":"openai","additional_attributes":{"tier":"x"}},{"model":"no-such-model","provider":"openai"}]`).status).toBe(404)
+    expect(try readFileSync(path + ".catalog.json", "utf8").includes("gpt-4o-mini")).toBe(false)
+    expect(put(`[{"model":"gpt-4o","provider":"openai","additional_attributes":{}}]`).status).toBe(204)
+    expect(try readFileSync(path + ".catalog.json", "utf8").includes("gpt-4o")).toBe(false)
+  } finally {
+    try rmSync(path + ".catalog.json", { force: true })
+  }
+})
+
+test("circuit policy routes: create, conflict, update, delete; a vault flush needs a vault", () => {
+  const eng = new Engine({})
+  const ops = new Ops(eng, new ConfigStore("/tmp/raiju-ops-policy.json", {}))
+  const body = `{"name":"p","primary_provider":"a","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"signals":[{"source":"response_header","header_name":"x"}]}}`
+  expect(ops.circuitPoliciesRoute("POST", "/api/circuit-breaker/policies", body).status).toBe(201)
+  expect(ops.circuitPoliciesRoute("POST", "/api/circuit-breaker/policies", body).status).toBe(409)
+  expect(ops.circuitPoliciesRoute("GET", "/api/circuit-breaker/policies", "").body.includes(`"name":"p"`)).toBe(true)
+  expect(ops.circuitPoliciesRoute("PUT", "/api/circuit-breaker/policies/p", body).status).toBe(200)
+  const nameless = `{"primary_provider":"a","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"signals":[{"source":"response_header","header_name":"x"}]}}`
+  expect(ops.circuitPoliciesRoute("PUT", "/api/circuit-breaker/policies/q", nameless).status).toBe(404)
+  expect(ops.circuitPoliciesRoute("DELETE", "/api/circuit-breaker/policies/p", "").status).toBe(200)
+  expect(ops.circuitPoliciesRoute("DELETE", "/api/circuit-breaker/policies/p", "").status).toBe(404)
+  expect(ops.circuitPoliciesRoute("PATCH", "/api/circuit-breaker/policies", "").status).toBe(405)
+  expect(ops.vaultFlush().status).toBe(400)
+})
+
+test("analytics and MCP routes answer from the store and refuse what is not recorded", () => {
+  const dir = "/tmp/raiju-ops-analytics-" + (try secureHex(6))
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const eng = new Engine({})
+    eng.logStore = try new LogStore(defaultLogStoreConfig(dir))
+    const now = Date.now()
+    eng.logStore!.add({ id: "d1", ts: now - 1000.0, request_id: "r1", op: "chat", provider: "openai", model: "gpt-4o", status: 200, latency_ms: 20.0, prompt_tokens: 3, completion_tokens: 4, cost: 0.5, cache_hit: false, virtual_key: "vk1" })
+    const ops = new Ops(eng, new ConfigStore("/tmp/raiju-ops-analytics.json", {}))
+    const get = (p: string): Reply => ops.logsRoute(new Request("http://raiju.test" + p), p.split("?")[0]!, "")
+    const dash = get("/api/logs/dashboard")
+    expect(dash.status).toBe(200)
+    expect(dash.body.includes(`"total_requests":1`)).toBe(true)
+    expect(dash.body.includes(`"virtual_key":{"rankings"`)).toBe(true)
+    expect(get("/api/logs/histogram/cost/by-dimension?dimension=team").status).toBe(400)
+    expect(get("/api/logs/histogram/cost/by-dimension?dimension=virtual_key").body.includes(`"dimension_values":["vk1"]`)).toBe(true)
+    expect(get("/api/logs/rankings?limit=0").status).toBe(400)
+    expect(get("/api/logs/nothing-here").status).toBe(404)
+    expect(get(`/api/logs/histogram?start_time=${now}&end_time=${now - 5.0}`).status).toBe(400)
+    expect(get("/api/logs/dropped").body).toBe(`{"dropped_requests":0}`)
+    expect(ops.logsRoute(new Request("http://raiju.test/api/mcp-logs"), "/api/mcp-logs", "").body.includes(`"total_count":0`)).toBe(true)
+    ops.recordMcp({ server: "weather", tool: "get_weather", latencyMs: 12.0, ok: false, error: "boom" })
+    const mcp = ops.logsRoute(new Request("http://raiju.test/api/mcp-logs"), "/api/mcp-logs", "")
+    expect(mcp.body.includes(`"tool_name":"get_weather"`)).toBe(true)
+    expect(mcp.body.includes(`"status":"error"`)).toBe(true)
+    // the LLM views leave the MCP entry out
+    expect(get("/api/logs/dashboard").body.includes(`"total_requests":1`)).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test("log histogram counts requests per bucket by status", () => {
