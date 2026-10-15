@@ -208,7 +208,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
 | L81 | G36, G38 | Decisions API, typesafe provider, decision-model complexity classifier | worker | assigned: resumed from handoff/patches |
-| L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | assigned: resumed from handoff/patches |
+| L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | done: unit (1,075) + e2e (both servers); limits moved to L100 |
 | L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | assigned: resumed from handoff/patches |
 | L84 | G41 | Projects, business units, custom roles and data access scopes | worker | assigned: resumed from handoff/patches |
 | L85 | G42 | BigQuery, Kafka, Pub/Sub sinks; Parquet payloads; export retention | worker | done (wired by L89) |
@@ -229,6 +229,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L94 | G44 | Broker-mode clustering (relay process) and lock-based leader election | worker | todo (after L92: shares discovery code) |
 | L95 | G4, cache | Owner switches, defaults unchanged: refuse unpriced models; exact-match cache scoped per virtual key | worker | todo |
 | L96 | G32, G33, all | Re-audit docs/parity.md (rows counted by script) and bring SCOPE.md and README in sync | worker | todo (after waves 12-13 merge) |
+| L100 | G37 | Compat remainder: stream conversions (text-to-chat, chat-to-responses), decision emulation (needs L81), azure_deepseek, reasoning budget scaling and min_output_tokens, summary fitting for Responses | worker | todo |
 | L97 | from L96 | Whatever the re-audit still lists as missing or partial and buildable | workers | todo |
 
 ## UI track

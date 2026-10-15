@@ -22,6 +22,7 @@ import { compileLocal, localVerdict } from "./guard_local"
 import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
 import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
+import { CompatPlan, settingsOf, withHeader, responseToChat, chatToText } from "./compat"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias } from "./router"
 import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
 import { Governance, Grant, Denial, directKeyFrom } from "./governance"
@@ -50,6 +51,8 @@ import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
+// a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
+type ChatSender = (t: Target, b: Field[], tc: LazyChat) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
 type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, retryMs?: f64 }
@@ -752,6 +755,8 @@ function compileGuards(providers: GuardrailProvider[]): ToolGuard[] {
 
 export class Engine {
   gov: Governance
+  // the model parameters row for a model (the datasheet, as GET /api/models/parameters serves it), for compat
+  paramsLookup: ((model: string) => Promise<string | undefined>) | undefined = undefined
   health: Health
   vertexTokens = new TokenCache()
   entraTokens: cloudAuth.TokenCache<string> = cloudAuth.stringCache()
@@ -1582,7 +1587,7 @@ export class Engine {
   }
 
   // Shared front half of every inference endpoint.
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory): Promise<Response> {
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan): Promise<Response> {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
     ctx.sink = sink
@@ -1601,7 +1606,7 @@ export class Engine {
     metrics.activeRequests(method, 1.0)
     let res: Response = new Response(undefined, { status: 500 })
     try {
-      res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed)
+      res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed, compat)
     } finally {
       metrics.activeRequests(method, -1.0)
     }
@@ -1610,7 +1615,7 @@ export class Engine {
     return res
   }
 
-  async serveInner(req: Request, h0: Hdrs, ctx: ReqCtx, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool): Promise<Response> {
+  async serveInner(req: Request, h0: Hdrs, ctx: ReqCtx, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, compat?: CompatPlan): Promise<Response> {
     const op = ctx.op
     const started = ctx.started
     let h = h0
@@ -1747,11 +1752,17 @@ export class Engine {
     if (cache !== undefined || semVec.length > 0) out.set("x-bifrost-cache-hit", "false")
     ctx.outHeaders = out
     ctx.requested = model
+    if (compat !== undefined && compat.enabled) await this.compatLoad(compat, allowed)
     const tAtt = performance.now()
     const r = try await this.attempt(allowed, h, build, translate, streamed, ctx)
     // translation and retries: the attempt's time less the upstream calls
     const convertUs = Math.max(0.0, (performance.now() - tAtt) * 1000.0 - r.upstreamMs * 1000.0)
     out.set("x-bf-attempts", "" + r.attempts)
+    if (compat !== undefined && compat.enabled) {
+      if (compat.dropped.length > 0) out.set("x-bifrost-dropped-compat-params", compat.dropped.join(","))
+      if (compat.toolDrops.length > 0) out.set("x-bifrost-dropped-unsupported-tools", compat.toolDrops.join(","))
+      if (compat.converted !== "") out.set("x-bifrost-converted-request-type", compat.converted)
+    }
     if (!r.ok) {
       ctx.error = r.body.byteLength > 2000 ? r.body.slice(0, 2000) : r.body
       out.set("content-type", "application/json")
@@ -1820,6 +1831,24 @@ export class Engine {
     ctx.cost = cost
     if (this.logStore !== undefined) ctx.output = r.body
     return respond(200, r.body, out)
+  }
+
+  // Reads the datasheet row of each target into the plan. A failed read leaves the row unknown.
+  async compatLoad(cp: CompatPlan, refs: ModelRef[]): Promise<void> {
+    const look = this.paramsLookup
+    for (const r of refs) {
+      const key = r.provider + "/" + r.model
+      if (cp.has(key)) continue
+      let rec: string | undefined = undefined
+      if (look !== undefined) {
+        try {
+          rec = await look(r.model)
+        } catch (e) {
+          rec = undefined
+        }
+      }
+      cp.put(key, rec)
+    }
   }
 
   // The best vector-store entry for a scope; a store error is a miss.
@@ -2061,33 +2090,46 @@ export class Engine {
       }
     }
     const autoCache = this.autoPromptCache || req.headers.get("x-bf-prompt-cache-auto-inject") === "true"
-    // Usage is always requested from streaming upstreams, for budgets and metrics.
-    let streamBody = body.slice()
-    if (stream) setField(&streamBody, "stream_options", `{"include_usage":true}`)
     const canPipe = stream && sink !== undefined
     // a provider's own prompt_cache.auto_inject turns the breakpoints on for its requests
     const autoFor = (t: Target): bool => autoCache || (t.cfg.prompt_cache?.auto_inject ?? false)
-    const build: Build = (t) => {
+    // compat: the request for each target, shaped in build (drops and fits, and Responses when the model needs it)
+    const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined), "chat", stream)
+    const sendChat: ChatSender = (t, b, tc) => {
+      // Usage is always requested from streaming upstreams, for budgets and metrics.
+      let streamBody = b.slice()
+      if (stream) setField(&streamBody, "stream_options", `{"include_usage":true}`)
       if (stream && providers.streamsNatively(t.kind)) return openai.chatRequest(t, try this.withInjected(t, streamBody))
       if (stream) {
         const plain = try this.withInjected(t, streamBody.filter((f) => f.key !== "stream" && f.key !== "stream_options"))
         // with a streaming client, Anthropic, Gemini and Bedrock stream too and are converted as they go
         if (canPipe) {
-          const su = try providers.streamUpstream(t, try typed.get(), plain, autoFor(t))
+          const su = try providers.streamUpstream(t, try tc.get(), plain, autoFor(t))
           if (su !== undefined) return su
         }
         // otherwise called without streaming and replayed as SSE below
-        return try providers.chatUpstream(t, try typed.get(), plain, autoFor(t))
+        return try providers.chatUpstream(t, try tc.get(), plain, autoFor(t))
       }
-      if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, try this.withInjected(t, body))
-      return try providers.chatUpstream(t, try typed.get(), try this.withInjected(t, body), autoFor(t))
+      if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, try this.withInjected(t, b))
+      return try providers.chatUpstream(t, try tc.get(), try this.withInjected(t, b), autoFor(t))
+    }
+    const build: Build = (t) => {
+      const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      if (sh.route === "responses") return openai.responsesRequest(t, sh.body)
+      return try sendChat(t, sh.body, sh.changed ? new LazyChat(sh.text) : typed)
     }
     const outGuard = this.guardOutput ? guard : undefined
     const pluginRun = run
     const pluginChain = chain
     const translate: Translate = (t, text, requested) => {
       if (!stream) {
-        const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        const sh = try cp.shape(t.provider, t.kind, t.model, body)
+        let src = text
+        if (sh.route === "responses") {
+          const rc = try responseToChat(text, requested)
+          src = rc.body
+        }
+        const tr = try providers.chatTranslate(t.kind, t.model, src, requested, false)
         let out = tr.body
         if (pluginChain !== undefined && pluginRun !== undefined) out = pluginChain.runPost(&pluginRun.ctx, 200, out).body
         if (reversible) out = try restoreCompletion(out, vault)
@@ -2112,7 +2154,7 @@ export class Engine {
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return conv
     }
-    const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
+    const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk, cp)
     // external output guardrails see the whole answer, so they apply to non-streamed answers
     if (!guardOn || this.guardProviders.length === 0 || stream || res.status !== 200) return res
     let answer = ""
@@ -2158,12 +2200,21 @@ export class Engine {
       return errorResponse(400, `invalid completions request: ${e.message}`, "invalid_request_error", noHeaders())
     }
     const stream = rawBool(body, "stream") ?? false
+    const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined), "completions", stream)
     const build: Build = (t) => {
+      const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      if (sh.route === "chat") return try providers.chatUpstream(t, try new LazyChat(sh.text).get(), sh.body, false)
       if (!providers.streamsNatively(t.kind)) throw new SyntaxError(`${t.provider} does not serve text completions`)
-      return openai.completionsRequest(t, body)
+      return openai.completionsRequest(t, sh.body)
     }
-    const translate: Translate = (t, text, requested) => stream ? openai.streamResponse(text, requested) : try openai.chatResponse(text, requested)
-    return try await this.serve(req, "completions", undefined, body, text, build, translate, stream)
+    const translate: Translate = (t, text, requested) => {
+      if (stream) return openai.streamResponse(text, requested)
+      const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      if (sh.route !== "chat") return try openai.chatResponse(text, requested)
+      const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+      return { body: try chatToText(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+    }
+    return try await this.serve(req, "completions", undefined, body, text, build, translate, stream, undefined, undefined, undefined, cp)
   }
 }
 

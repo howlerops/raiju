@@ -14,6 +14,8 @@ MOCK = "http://127.0.0.1:18099"
 GW_B = "http://127.0.0.1:18097"
 GW_D = "http://127.0.0.1:18092"
 GW_G = "http://127.0.0.1:18116"  # exports OTLP over gRPC to tests/otlp_grpc_collector.py
+GW_C = "http://127.0.0.1:18118"  # compat: x-bf-compat only (no client.compat)
+GW_CC = "http://127.0.0.1:18119"  # compat: client.compat set
 GRPC_COLLECTOR_PORT = 18317
 
 def build():
@@ -154,6 +156,10 @@ def chat(model, extra=None, headers=None, **kw):
     body = {"model": model, "messages": [{"role": "user", "content": "hello"}], **kw}
     return call("POST", "/v1/chat/completions", body, headers)
 
+def hdr(h, name):
+    """A response header by name, whatever case the gateway sent it in."""
+    return {k.lower(): v for k, v in h.items()}.get(name)
+
 def write_config():
     """The e2e config plus a Vertex provider whose service account uses the
     throwaway test key from src/jwt.tov's tests and a token URI on the mock."""
@@ -261,6 +267,11 @@ def write_config():
         },
     }
     json.dump(l80, open(os.path.join(BUILD, "e2e.l80.json"), "w"))
+    # Bifrost's compat plugin: a config without client.compat (the x-bf-compat header turns features on), and one with it
+    compat_provider = {"compat": {"keys": [{"name": "c", "value": "sk-compat", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}}}
+    datasheet = {"url": MOCK + "/cdatasheet", "enabled": False}
+    json.dump({"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "providers": compat_provider, "pricing_sync": datasheet}, open(os.path.join(BUILD, "e2e.compat.json"), "w"))
+    json.dump({"client": {"enable_logging": False, "enforce_auth_on_inference": False, "compat": {}}, "providers": compat_provider, "pricing_sync": datasheet}, open(os.path.join(BUILD, "e2e.compat-cfg.json"), "w"))
     return path
 
 def make_tls():
@@ -704,6 +715,8 @@ def main():
                "providers": {"openai": {"keys": [{"name": "e", "value": "sk-sealed-e2e-777", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}}, open(enc_cfg, "w"))
     gw_l = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18101", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.l80.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.l80.log"), "w"))
     gw_enc = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18102", "-host", "127.0.0.1", "-config", enc_cfg], env=env, stderr=open(os.path.join(BUILD, "e2e.encrypt.log"), "w"))
+    gw_c = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18118", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.compat.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.compat.log"), "w"))
+    gw_cc = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18119", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.compat-cfg.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.compat-cfg.log"), "w"))
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
 
@@ -2199,6 +2212,46 @@ def main():
             check("a wrong encryption_key stops the start", p.returncode == 1 and b"cannot be opened" in p.stderr, (p.returncode, p.stderr[-300:]))
         except subprocess.TimeoutExpired:
             check("a wrong encryption_key stops the start", False, "the gateway kept running")
+        # compat (Bifrost's compat plugin): the datasheet rows come from the mock's /cdatasheet, and strict-mini refuses what its row does not list
+        wait(GW_C + "/health")
+        wait(GW_CC + "/health")
+        msg_c = [{"role": "user", "content": "hello compat"}]
+        strict = {"model": "compat/strict-mini", "messages": msg_c, "temperature": 0.2, "top_p": 0.9, "max_tokens": 50}
+        s, h, b = call("POST", "/v1/chat/completions", strict, base=GW_C)
+        check("compat off: the strict model refuses an unlisted parameter", s == 400 and "temperature" in b and hdr(h, "x-bifrost-dropped-compat-params") is None, (s, b[:200]))
+        s, h, b = call("POST", "/v1/chat/completions", strict, headers={"x-bf-compat": '["should_drop_params"]'}, base=GW_C)
+        sent = json.loads(seen()[-1]["body"])
+        check("x-bf-compat drops unlisted parameters and names them in the header", s == 200 and "temperature" not in sent and "top_p" not in sent and sent.get("max_tokens") == 50 and hdr(h, "x-bifrost-dropped-compat-params") == "temperature,top_p", (s, hdr(h, "x-bifrost-dropped-compat-params"), sent))
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "compat/nodatasheet-model", "messages": msg_c, "temperature": 0.2}, headers={"x-bf-compat": "true"}, base=GW_C)
+        check("a model with no datasheet row keeps its parameters", s == 200 and json.loads(seen()[-1]["body"]).get("temperature") == 0.2 and hdr(h, "x-bifrost-dropped-compat-params") is None, (s, b[:200]))
+        s, h, b = call("POST", "/v1/completions", {"model": "compat/chatonly-mini", "prompt": "hi there", "max_tokens": 9000}, base=GW_C)
+        check("without x-bf-compat a text completion is not converted", s != 200 and "text_completion" not in b, (s, b[:200]))
+        s, h, b = call("POST", "/v1/completions", {"model": "compat/chatonly-mini", "prompt": "hi there", "max_tokens": 9000}, headers={"x-bf-compat": "true"}, base=GW_C)
+        out = json.loads(b)
+        sent = json.loads(seen()[-1]["body"])
+        check("a text completion reaches a chat-only model as chat, and comes back as text", s == 200 and out.get("object") == "text_completion" and out["choices"][0]["text"] == "Hello from chatonly-mini" and hdr(h, "x-bifrost-converted-request-type") == "chat_completion", (s, b[:300]))
+        check("the chat request carries the prompt as the user message, with the cap fitted to the row", seen()[-1]["path"] == "/v1/chat/completions" and sent.get("messages") == [{"role": "user", "content": "hi there"}] and sent.get("max_tokens") == 4096, sent)
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "compat/responses-only", "messages": msg_c, "max_completion_tokens": 300, "reasoning_effort": "low"}, headers={"x-bf-compat": "true"}, base=GW_C)
+        sent = json.loads(seen()[-1]["body"])
+        check("chat to a Responses-only model goes to /v1/responses with the fields Responses takes", seen()[-1]["path"] == "/v1/responses" and sent.get("max_output_tokens") == 300 and sent.get("reasoning") == {"effort": "low"} and "input" in sent, (seen()[-1]["path"], sent))
+        out = json.loads(b)
+        check("the Responses answer comes back as a chat completion", s == 200 and out.get("object") == "chat.completion" and out["choices"][0]["message"]["content"] == "native responses" and hdr(h, "x-bifrost-converted-request-type") == "responses", (s, b[:300]))
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+        reasoning_req = {"model": "compat/reasoning-tools", "messages": msg_c, "reasoning_effort": "high", "tools": tools}
+        s, h, b = call("POST", "/v1/chat/completions", reasoning_req, headers={"x-bf-compat": '["force_reasoning_only_models_to_responses"]'}, base=GW_C)
+        check("reasoning with tools on a model that refuses it goes to Responses", s == 200 and seen()[-1]["path"] == "/v1/responses", (s, seen()[-1]["path"]))
+        s, h, b = call("POST", "/v1/chat/completions", reasoning_req, headers={"x-bf-compat": '["should_drop_params"]'}, base=GW_C)
+        sent = json.loads(seen()[-1]["body"])
+        check("without that routing, reasoning is turned off for a request with tools", seen()[-1]["path"] == "/v1/chat/completions" and "reasoning_effort" not in sent and hdr(h, "x-bifrost-dropped-compat-params") == "reasoning", (seen()[-1]["path"], sent, hdr(h, "x-bifrost-dropped-compat-params")))
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "compat/strict-mini", "messages": msg_c, "max_tokens": 5000}, headers={"x-bf-compat": '["should_convert_params"]'}, base=GW_C)
+        check("an output cap above the row's limit is lowered", s == 200 and json.loads(seen()[-1]["body"]).get("max_tokens") == 1000, (s, b[:200]))
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "compat/strict-mini", "messages": msg_c, "temperature": 0.3, "stream": True}, headers={"x-bf-compat": '["should_drop_params"]'}, base=GW_C)
+        sent = json.loads(seen()[-1]["body"])
+        check("a streamed request is shaped the same way", s == 200 and "temperature" not in sent and sent.get("stream") is True, (s, b[:200]))
+        s, h, b = call("POST", "/v1/chat/completions", strict, base=GW_CC)
+        check("a client.compat section turns the features on by default", s == 200 and hdr(h, "x-bifrost-dropped-compat-params") == "temperature,top_p", (s, hdr(h, "x-bifrost-dropped-compat-params"), b[:200]))
+        s, h, b = call("POST", "/v1/completions", {"model": "compat/chatonly-mini", "prompt": "hi"}, base=GW_CC)
+        check("client.compat turns text to chat on by default", s == 200 and json.loads(b)["choices"][0]["text"] == "Hello from chatonly-mini", (s, b[:200]))
         # cluster discovery and the identity-aware proxies (their own gateways and mocks)
         discovery_and_proxy()
         # the log sinks: their own gateway, Kafka stub and Parquet bucket, run last so their traffic stays off the other checks
@@ -2207,6 +2260,7 @@ def main():
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
         gw_l.terminate(); gw_enc.terminate(); gw_guard.terminate(); gw_rules.terminate()
+        gw_c.terminate(); gw_cc.terminate()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 
