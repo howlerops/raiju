@@ -4,6 +4,7 @@
 import { mkdirSync, appendFileSync, readFileSync, existsSync, readdirSync, unlinkSync, writeFileSync, rmSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { isoMs } from "./exports"
+import { DataScope, inScope } from "./scope"
 
 // kind: "mcp" for an MCP tool execution (op "tool", with tool and server set); absent for an LLM request.
 export type LogEntry = {
@@ -20,6 +21,11 @@ export type LogEntry = {
   cost: f64,
   cache_hit: bool,
   virtual_key?: string,
+  // who the request is attributed to (governance's team, customer, business unit and project ids)
+  team_id?: string,
+  customer_id?: string,
+  business_unit_id?: string,
+  project_id?: string,
   error?: string,
   input?: string, // request body, only when content logging is on
   output?: string, // response body, only when content logging is on
@@ -44,6 +50,12 @@ export type LogQuery = {
   model?: string,
   status?: "success" | "error",
   virtual_key?: string,
+  team_id?: string,
+  customer_id?: string,
+  business_unit_id?: string,
+  project_id?: string,
+  // the entries the caller's data access scope may see (see scope.tov); all when absent
+  scope?: DataScope,
   since?: f64,
   until?: f64,
   text?: string, // substring of model, error or request_id
@@ -165,6 +177,11 @@ function matches(e: LogEntry, q: LogQuery): bool {
   if (q.model !== undefined && e.model !== q.model) return false
   if (q.status !== undefined && isSuccess(e) !== (q.status === "success")) return false
   if (q.virtual_key !== undefined && e.virtual_key !== q.virtual_key) return false
+  if (q.team_id !== undefined && e.team_id !== q.team_id) return false
+  if (q.customer_id !== undefined && e.customer_id !== q.customer_id) return false
+  if (q.business_unit_id !== undefined && e.business_unit_id !== q.business_unit_id) return false
+  if (q.project_id !== undefined && e.project_id !== q.project_id) return false
+  if (q.scope !== undefined && !visibleTo(e, q.scope)) return false
   if (q.since !== undefined && e.ts < q.since) return false
   if (q.until !== undefined && e.ts > q.until) return false
   if (q.text !== undefined && q.text !== "" && !mentions(e, q.text)) return false
@@ -386,6 +403,10 @@ export class LogStore {
       cost: e.cost,
       cache_hit: e.cache_hit,
       virtual_key: e.virtual_key,
+      team_id: e.team_id,
+      customer_id: e.customer_id,
+      business_unit_id: e.business_unit_id,
+      project_id: e.project_id,
       error: e.error,
       input: on ? clip(e.input, max) : undefined,
       output: on ? clip(e.output, max) : undefined,
@@ -464,6 +485,10 @@ export type Filter = {
   providers: string[],
   models: string[],
   virtual_keys: string[],
+  teams: string[],
+  customers: string[],
+  businessUnits: string[],
+  projects: string[],
   tools: string[],
   servers: string[],
   status: string, // "", "success", "error" or "cancelled"
@@ -500,6 +525,10 @@ export function filterFrom(sp: URLSearchParams, kind: string, since: f64, until:
     providers: listParam(sp.get("providers") ?? undefined),
     models: listParam(sp.get("models") ?? undefined),
     virtual_keys: listParam(sp.get("virtual_key_ids") ?? undefined),
+    teams: listParam(sp.get("team_ids") ?? undefined),
+    customers: listParam(sp.get("customer_ids") ?? undefined),
+    businessUnits: listParam(sp.get("business_unit_ids") ?? undefined),
+    projects: listParam(sp.get("project_ids") ?? undefined),
     tools: listParam(sp.get("tool_names") ?? undefined),
     servers: listParam(sp.get("server_labels") ?? undefined),
     status: sp.get("status") ?? "",
@@ -523,6 +552,10 @@ export function selects(e: LogEntry, f: Filter): bool {
   if (f.providers.length > 0 && !f.providers.includes(e.provider)) return false
   if (f.models.length > 0 && !f.models.includes(e.model)) return false
   if (f.virtual_keys.length > 0 && !f.virtual_keys.includes(e.virtual_key ?? "")) return false
+  if (f.teams.length > 0 && !f.teams.includes(e.team_id ?? "")) return false
+  if (f.customers.length > 0 && !f.customers.includes(e.customer_id ?? "")) return false
+  if (f.businessUnits.length > 0 && !f.businessUnits.includes(e.business_unit_id ?? "")) return false
+  if (f.projects.length > 0 && !f.projects.includes(e.project_id ?? "")) return false
   if (f.tools.length > 0 && !f.tools.includes(e.tool ?? "")) return false
   if (f.servers.length > 0 && !f.servers.includes(e.server ?? "")) return false
   if (f.status === "success" && !isSuccess(e)) return false
@@ -538,6 +571,22 @@ export function selects(e: LogEntry, f: Filter): bool {
   if (f.request_id !== "" && e.request_id !== f.request_id) return false
   if (f.text !== "" && !mentions(e, f.text)) return false
   return true
+}
+
+// Whether a data access scope may see an entry: by the team, business unit, customer or project it is attributed to.
+// An entry with no owner is seen by all-data scopes only.
+export function visibleTo(e: LogEntry, sc: DataScope): bool {
+  return inScope(sc, e.team_id ?? "", e.business_unit_id ?? "", e.customer_id ?? "", e.project_id ?? "")
+}
+
+// The entries a scope may see, in order.
+export function scopedEntries(es: LogEntry[], sc: DataScope): LogEntry[] {
+  if (sc.all) return es
+  const out: LogEntry[] = []
+  for (const e of es) {
+    if (visibleTo(e, sc)) out.push(e)
+  }
+  return out
 }
 
 export function selectAll(es: LogEntry[], f: Filter): LogEntry[] {
@@ -573,13 +622,17 @@ function bucketize(es: LogEntry[], g: Grid): LogEntry[][] {
 
 // The dimensions an entry can be grouped by. Others are not recorded for this gateway.
 export function validDimension(dim: string): bool {
-  return dim === "provider" || dim === "model" || dim === "virtual_key" || dim === "tool" || dim === "server"
+  return dim === "provider" || dim === "model" || dim === "virtual_key" || dim === "tool" || dim === "server" || dim === "team" || dim === "customer" || dim === "business_unit" || dim === "project"
 }
 
 export function dimValue(e: LogEntry, dim: string): string {
   if (dim === "provider") return e.provider
   if (dim === "model") return e.model
   if (dim === "virtual_key") return e.virtual_key ?? ""
+  if (dim === "team") return e.team_id ?? ""
+  if (dim === "customer") return e.customer_id ?? ""
+  if (dim === "business_unit") return e.business_unit_id ?? ""
+  if (dim === "project") return e.project_id ?? ""
   if (dim === "tool") return e.tool ?? ""
   if (dim === "server") return e.server ?? ""
   return ""
@@ -1328,7 +1381,8 @@ test("histograms count by status, sum tokens and cost, and split by model and pr
   const byDim = dimensionView(es, g, "cost", "provider")
   expect(byDim.includes(`"dimension":"provider"`)).toBe(true)
   expect(byDim.includes(`"dimension_values":["anthropic","openai"]`)).toBe(true)
-  expect(validDimension("team")).toBe(false)
+  expect(validDimension("team")).toBe(true)
+  expect(validDimension("widget")).toBe(false)
   expect(validDimension("provider")).toBe(true)
   const models = modelsView(es, g)
   expect(models.includes(`"A":{"total":2,"success":2,"error":0,"cancelled":0}`)).toBe(true)

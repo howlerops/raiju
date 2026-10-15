@@ -920,6 +920,123 @@ def l88_e2e(env):
         check("a saved config change adds a notice of its own", "Configuration changed" in titles and "Maintenance" in titles, titles)
     finally:
         gw.terminate()
+PR = "http://127.0.0.1:18122"  # projects, business units, custom roles and data access scopes
+PR_ROOT = {"authorization": "Bearer sk-admin-pr-root"}
+
+def projects_e2e(env):
+    """Projects and business units with their budgets, x-bf-project-id and x-bf-customer-id, custom roles, and a
+    team-scoped user that sees only its own logs and records. Its own gateway, started and stopped here."""
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-projects-logs")},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-pr-root")},
+                      {"name": "ann", "role": "log-reader", "teams": ["t-core"], "token_sha256": tok("sk-admin-pr-ann")}],
+            "roles": [{"name": "log-reader", "dac": "team-data", "permissions": [{"resource": "Logs", "operation": "View"}, {"resource": "Teams", "operation": "View"}, {"resource": "Teams", "operation": "Update"}, {"resource": "VirtualKeys", "operation": "View"}]}],
+            "budgets": [{"id": "b-proj", "max_limit": 0.000001, "reset_duration": "1d"}],
+            "customers": [{"id": "c-acme", "name": "Acme"}],
+            "teams": [{"id": "t-core", "name": "core", "customer_id": "c-acme"}, {"id": "t-other", "name": "other"}],
+            "virtual_keys": [{"id": "vk-core", "value": "sk-bf-core", "team_id": "t-core"}, {"id": "vk-other", "value": "sk-bf-other", "team_id": "t-other"}],
+            "projects": [{"id": "p-eval", "name": "claude-eval", "budget_id": "b-proj", "virtual_key_ids": ["vk-core"]}],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.projects.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18122", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.projects.log"), "w"))
+    def adm(method, p, body=None, headers=None):
+        return call(method, p, body, {**PR_ROOT, **(headers or {})}, base=PR, auth=False)
+    def user(token, method, p, body=None):
+        return call(method, p, body, {"authorization": "Bearer " + token}, base=PR, auth=False)
+    def inf(headers, seed):
+        return call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}], "seed": seed}, headers, base=PR, auth=False)
+    try:
+        wait(PR + "/health")
+        # a project's budget takes the requests tagged with its id; the same key without the tag is not charged to it
+        b1 = inf({"x-bf-vk": "sk-bf-core", "x-bf-project-id": "p-eval"}, 3001)[0]
+        b2 = inf({"x-bf-vk": "sk-bf-core", "x-bf-project-id": "p-eval"}, 3002)
+        b3 = inf({"x-bf-vk": "sk-bf-core"}, 3003)[0]
+        check("a request tagged with x-bf-project-id hits the project's budget, an untagged one does not", b1 == 200 and b2[0] == 402 and "budget" in b2[2] and b3 == 200, (b1, b2, b3))
+        s, _, b = inf({"x-bf-vk": "sk-bf-other", "x-bf-project-id": "p-eval"}, 3004)
+        check("a key the project does not admit is refused as not found", s == 403 and "does not admit" in b, (s, b))
+        s, _, b = inf({"x-bf-vk": "sk-bf-core", "x-bf-project-id": "nope"}, 3005)
+        check("an unknown project id is refused, not ignored", s == 403 and "not found" in b, (s, b))
+        s1, _, _ = inf({"x-bf-vk": "sk-bf-core", "x-bf-customer-id": "c-acme"}, 3006)
+        s2, _, b2 = inf({"x-bf-vk": "sk-bf-core", "x-bf-customer-id": "c-other"}, 3007)
+        check("x-bf-customer-id charges a customer the key reaches and refuses one it does not", s1 == 200 and s2 == 403, (s1, s2, b2))
+        # the other team's request is logged, so the scoped view has something to leave out
+        so = inf({"x-bf-vk": "sk-bf-other"}, 3012)[0]
+        check("a second team's key is served, and its request is logged under that team", so == 200, so)
+
+        # projects: Bifrost's shapes and defaults, validation, and the inactive and deleted states
+        s, _, b = adm("POST", "/api/governance/projects", {"name": "prod-x", "access_rule": "both"})
+        check("a project with an unknown access rule is refused", s == 400, (s, b))
+        s, _, b = adm("POST", "/api/governance/projects", {"name": "prod-x", "provider_configs": [{"provider": "openai"}]})
+        made = json.loads(b).get("project", {}) if s == 201 else {}
+        pid = made.get("id", "")
+        check("admin creates a project with Bifrost's defaults", s == 201 and pid != "" and made.get("access_rule") == "union" and made.get("accounting_mode") == "both" and made.get("membership_mode") == "explicit", (s, b))
+        s, _, b = adm("GET", "/api/governance/projects?search=prod")
+        check("projects are listed with search and a total count", s == 200 and json.loads(b)["pagination"]["total_count"] == 1, (s, b))
+        s, _, b = adm("PUT", "/api/governance/projects/" + pid, {"name": "prod-x", "is_active": False, "provider_configs": [{"provider": "openai"}]})
+        s2, _, b2 = inf({"x-bf-vk": "sk-bf-core", "x-bf-project-name": "prod-x"}, 3008)
+        check("an inactive project refuses the requests that name it", s == 200 and s2 == 403 and "not found" in b2, (s, s2, b2))
+        s, _, _ = adm("DELETE", "/api/governance/projects/" + pid)
+        s2, _, _ = adm("GET", "/api/governance/projects/" + pid)
+        check("a deleted project is gone", s == 200 and s2 == 404, (s, s2))
+
+        # business units: their teams show the unit, and the unit's budget takes the requests of its teams
+        s, _, b = adm("POST", "/api/governance/budgets", {"id": "b-bu", "max_limit": 0.000001, "reset_duration": "1d"})
+        s2, _, b2 = adm("POST", "/api/governance/business-units", {"id": "bu-emea", "name": "emea", "budget_id": "b-bu", "team_ids": ["t-core"]})
+        t = json.loads(adm("GET", "/api/governance/teams/t-core")[2])
+        check("a business unit takes its teams, and its budget is held while it uses it", s == 201 and s2 == 201 and t.get("business_unit_id") == "bu-emea", (s, s2, b2))
+        u1 = inf({"x-bf-vk": "sk-bf-core"}, 3009)[0]
+        u2 = inf({"x-bf-vk": "sk-bf-core"}, 3010)[0]
+        check("a team's requests count against its business unit's budget", u1 == 200 and u2 == 402, (u1, u2))
+        s, _, b = adm("DELETE", "/api/governance/budgets/b-bu")
+        check("a budget a business unit uses cannot be deleted", s == 409, (s, b))
+
+        # custom roles: a built-in name is refused; a role's permissions decide the routes it reaches
+        s, _, b = adm("POST", "/api/roles", {"name": "contractor", "dac": "own-data", "permissions": [{"resource": "Teams", "operation": "View"}]})
+        s2, _, b2 = adm("POST", "/api/roles", {"name": "admin"})
+        check("a custom role is created, and a built-in role name is refused", s == 201 and s2 == 400, (s, b, s2, b2))
+        s, _, b = adm("POST", "/api/users", {"name": "tom", "role": "contractor"})
+        tom = json.loads(b).get("token", "") if s == 201 else ""
+        s1, _, tb = user(tom, "GET", "/api/governance/teams")
+        check("a custom role reads the routes its permissions name, and its own-data scope shows none of the teams", s1 == 200 and json.loads(tb)["teams"] == [], (s1, tb))
+        s1, _, _ = user(tom, "GET", "/api/logs")
+        s2, _, _ = user(tom, "POST", "/api/governance/teams", {"id": "t-new", "name": "new"})
+        s3, _, _ = user(tom, "GET", "/api/users")
+        check("a custom role is denied the routes its permissions do not name", s1 == 403 and s2 == 403 and s3 == 403, (s1, s2, s3))
+
+        # ann: team-data over the log-reader role. Its team's logs and records only
+        A = "sk-admin-pr-ann"
+        s, _, b = user(A, "GET", "/api/logs")
+        entries = json.loads(b).get("entries", []) if s == 200 else []
+        keys = sorted(set(e.get("virtual_key", "") for e in entries))
+        check("a team-scoped user sees only its team's request logs", s == 200 and keys == ["vk-core"], (s, keys))
+        s, _, b = adm("GET", "/api/logs")
+        allkeys = sorted(set(e.get("virtual_key", "") for e in json.loads(b).get("entries", [])))
+        check("the admin sees the logs of every team", "vk-other" in allkeys and "vk-core" in allkeys, allkeys)
+        s, _, b = user(A, "GET", "/api/governance/teams")
+        teams = [x["id"] for x in json.loads(b)["teams"]] if s == 200 else []
+        check("a team-scoped user lists only its own teams", s == 200 and teams == ["t-core"], (s, b))
+        s, _, _ = user(A, "GET", "/api/governance/teams/t-other")
+        check("a team outside the scope looks absent to a scoped user", s == 404, s)
+        s, _, b = user(A, "GET", "/api/governance/virtual-keys")
+        vks = [x["id"] for x in json.loads(b)["virtual_keys"]] if s == 200 else []
+        check("a team-scoped user lists only its team's virtual keys", vks == ["vk-core"], (s, b))
+        s1, _, _ = user(A, "PUT", "/api/governance/teams/t-core", {"name": "core"})
+        s2, _, _ = user(A, "PUT", "/api/governance/teams/t-other", {"name": "other"})
+        s3, _, _ = user(A, "POST", "/api/governance/teams", {"id": "t-new", "name": "new"})
+        s4, _, _ = user(A, "GET", "/api/governance/budgets")
+        check("a team-scoped user edits its own team, not another, creates nothing, and budgets are out of its role", s1 == 200 and s2 == 404 and s3 == 403 and s4 == 403, (s1, s2, s3, s4))
+    finally:
+        gw.terminate()
+        gw.wait()
 
 def main():
     build()
@@ -2677,6 +2794,8 @@ def main():
         check("a client.compat section turns the features on by default", s == 200 and hdr(h, "x-bifrost-dropped-compat-params") == "temperature,top_p", (s, hdr(h, "x-bifrost-dropped-compat-params"), b[:200]))
         s, h, b = call("POST", "/v1/completions", {"model": "compat/chatonly-mini", "prompt": "hi"}, base=GW_CC)
         check("client.compat turns text to chat on by default", s == 200 and json.loads(b)["choices"][0]["text"] == "Hello from chatonly-mini", (s, b[:200]))
+        # projects, business units, custom roles and data access scopes (their own gateway)
+        projects_e2e(env)
         # cluster discovery and the identity-aware proxies (their own gateways and mocks)
         discovery_and_proxy()
         # the log sinks: their own gateway, Kafka stub and Parquet bucket, run last so their traffic stays off the other checks

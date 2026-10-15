@@ -3,13 +3,14 @@
 // a token is shown once, when its user is created, and never stored.
 import { sha256, toHex, utf8, secureHex } from "./crypto"
 import { decode, encode } from "./base64"
-import { AdminAuthConfig, AdminUserConfig } from "./config"
+import { AdminAuthConfig, AdminUserConfig, RoleConfig } from "./config"
 
-export type Role = "admin" | "editor" | "viewer" | "auditor"
+// A built-in role (admin, editor, viewer, auditor) or the name of a custom role under governance.roles.
+export type Role = string
 
 export type UserConfig = AdminUserConfig
 
-export type RbacConfig = { users: UserConfig[] }
+export type RbacConfig = { users: UserConfig[], roles?: RoleConfig[] }
 
 export type Identity = { kind: "user", name: string, role: Role } | { kind: "anonymous" } | { kind: "denied", reason: string }
 
@@ -156,14 +157,64 @@ export function allowed(role: Role, perm: Permission, path: string): bool {
   return !isSecret(segs)
 }
 
+// The Bifrost resource a management route is about, and the operation the method implies. Custom
+// roles hold (resource, operation) pairs; secret routes need Reveal, which only a custom role can hold.
+export function resourceOf(method: string, path: string): { resource: string, op: string } {
+  const segs = segmentsOf(path)
+  const m = method.toUpperCase()
+  let op = "View"
+  if (m === "POST") op = "Create"
+  else if (m === "PUT" || m === "PATCH") op = "Update"
+  else if (m === "DELETE") op = "Delete"
+  if (isSecret(segs)) op = "Reveal"
+  const area = segs[1] ?? ""
+  const coll = segs[2] ?? ""
+  let resource = "Settings"
+  if (area === "users") resource = "Users"
+  else if (area === "audit-logs") resource = "AuditLogs"
+  else if (area === "logs") resource = "Logs"
+  else if (area === "mcp-logs") resource = "MCPLogs"
+  else if (area === "providers" || area === "keys" || area === "models") resource = "ModelProvider"
+  else if (area === "mcp") resource = "MCPGateway"
+  else if (area === "cluster") resource = "Cluster"
+  else if (area === "alerting" || area === "alerts") resource = "Observability"
+  else if (area === "roles") resource = "RBAC"
+  else if (area === "governance") {
+    if (coll === "virtual-keys") resource = "VirtualKeys"
+    else if (coll === "teams") resource = "Teams"
+    else if (coll === "customers") resource = "Customers"
+    else if (coll === "business-units") resource = "BusinessUnits"
+    else if (coll === "projects") resource = "Projects"
+    else if (coll === "access-profiles") resource = "AccessProfiles"
+    else if (coll === "routing-rules") resource = "RoutingRules"
+    else resource = "Governance"
+  }
+  return { resource: resource, op: op }
+}
+
+// Whether a role may make this request. A built-in role keeps its fixed rules; a custom role needs its
+// (resource, operation) pair and only reaches the management API. Unknown roles are refused.
+export function roleAllows(roles: RoleConfig[] | undefined, role: string, method: string, path: string): bool {
+  const r = customRole(roles, role)
+  if (r === undefined) {
+    if (!isBuiltinRole(role)) return false
+    return allowed(role, required(method, path), path)
+  }
+  if (!isApi(segmentsOf(path))) return false
+  const need = resourceOf(method, path)
+  for (const p of r.permissions ?? []) {
+    if (p.resource === need.resource && p.operation === need.op) return true
+  }
+  return false
+}
+
 // The access decision for one request. 401 when the caller is not
 // authenticated, 403 when the role does not cover the request.
 export function authorize(cfg: RbacConfig, headers: Map<string, string>, method: string, path: string): Verdict {
   const who = authenticate(cfg, headers)
   if (who.kind === "anonymous") return { kind: "error", status: 401, message: "authentication required" }
   if (who.kind === "denied") return { kind: "error", status: 401, message: who.reason }
-  const perm = required(method, path)
-  if (!allowed(who.role, perm, path)) return { kind: "error", status: 403, message: `role ${who.role} may not ${perm} this route` }
+  if (!roleAllows(cfg.roles, who.role, method, path)) return { kind: "error", status: 403, message: `role ${who.role} may not ${required(method, path)} this route` }
   return { kind: "ok", actor: who.name }
 }
 
@@ -173,12 +224,23 @@ type UserBody = { name?: string, role?: string, disabled?: bool }
 
 type UserView = { name: string, role: Role, disabled: bool }
 
-function roleOf(s: string): Role | undefined {
-  if (s === "admin") return "admin"
-  if (s === "editor") return "editor"
-  if (s === "viewer") return "viewer"
-  if (s === "auditor") return "auditor"
+const BUILT_IN_ROLES = ["admin", "editor", "viewer", "auditor"]
+
+export function isBuiltinRole(s: string): bool {
+  return BUILT_IN_ROLES.includes(s)
+}
+
+// The custom role with this name, if one is defined.
+export function customRole(roles: RoleConfig[] | undefined, name: string): RoleConfig | undefined {
+  for (const r of roles ?? []) {
+    if (r.name === name) return r
+  }
   return undefined
+}
+
+// A role a user may hold: built-in, or defined under governance.roles.
+export function knownRole(roles: RoleConfig[] | undefined, s: string): bool {
+  return isBuiltinRole(s) || customRole(roles, s) !== undefined
 }
 
 // Names are Basic auth user names and path segments: lower-case letters, digits, "_", "-", and
@@ -258,8 +320,8 @@ function createUser(cfg: RbacConfig, body: string): UsersReply {
   if (b === undefined) return uerror(400, "body must be a JSON object with name and role", cfg)
   const name = b.name ?? ""
   if (!validName(name)) return uerror(400, "name must be 1 to 64 lower-case letters, digits, _, -, @, . or +", cfg)
-  const role = roleOf(b.role ?? "")
-  if (role === undefined) return uerror(400, "role must be admin, editor, viewer or auditor", cfg)
+  const role = b.role ?? ""
+  if (!knownRole(cfg.roles, role)) return uerror(400, "role must be admin, editor, viewer, auditor or a custom role", cfg)
   if (findUser(cfg.users, name) !== undefined) return uerror(409, `user ${name} already exists`, cfg)
   const token = newToken()
   if (token === undefined) return uerror(500, "no secure random source; the user was not created", cfg)
@@ -278,9 +340,8 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
   if (b === undefined) return uerror(400, "body must be a JSON object with role or disabled", cfg)
   let role: Role = old.role
   if (b.role !== undefined) {
-    const r = roleOf(b.role)
-    if (r === undefined) return uerror(400, "role must be admin, editor, viewer or auditor", cfg)
-    role = r
+    if (!knownRole(cfg.roles, b.role)) return uerror(400, "role must be admin, editor, viewer, auditor or a custom role", cfg)
+    role = b.role
   }
   const disabled = b.disabled === undefined ? old.disabled : b.disabled
   const next: UserConfig = {
@@ -598,4 +659,37 @@ test("sign-in identities can be users, and provisioned ones are found", () => {
   expect(u === undefined ? "" : u.role).toBe("editor")
   expect(provisioned(cfg, "bob@example.com") === undefined).toBe(true)
   expect(handleUsers(cfg, "POST", "/api/users", "{\"name\":\"a b@x\",\"role\":\"viewer\"}").status).toBe(400)
+})
+
+test("custom roles hold resource and operation pairs and reach only the management API", () => {
+  const roles: RoleConfig[] = [{ name: "ops", permissions: [{ resource: "VirtualKeys", operation: "View" }, { resource: "Logs", operation: "View" }, { resource: "Teams", operation: "Update" }] }]
+  expect(roleAllows(roles, "ops", "GET", "/api/governance/virtual-keys")).toBe(true)
+  expect(roleAllows(roles, "ops", "POST", "/api/governance/virtual-keys")).toBe(false)
+  expect(roleAllows(roles, "ops", "PUT", "/api/governance/teams/t1")).toBe(true)
+  expect(roleAllows(roles, "ops", "DELETE", "/api/governance/teams/t1")).toBe(false)
+  expect(roleAllows(roles, "ops", "GET", "/api/users")).toBe(false)
+  expect(roleAllows(roles, "ops", "GET", "/api/logs/histogram")).toBe(true)
+  expect(roleAllows(roles, "ops", "GET", "/api/roles")).toBe(false)
+  expect(roleAllows(roles, "ops", "GET", "/v1/chat/completions")).toBe(false)
+  expect(roleAllows(roles, "ghost", "GET", "/api/governance/teams")).toBe(false)
+  // built-in roles keep their fixed rules
+  expect(roleAllows(roles, "viewer", "GET", "/api/governance/teams")).toBe(true)
+  expect(roleAllows(roles, "viewer", "POST", "/api/governance/teams")).toBe(false)
+  expect(roleAllows(roles, "admin", "DELETE", "/api/governance/teams/t1")).toBe(true)
+})
+
+test("resourceOf names the Bifrost resource and the operation for a route", () => {
+  expect(resourceOf("GET", "/api/governance/projects").resource).toBe("Projects")
+  expect(resourceOf("POST", "/api/governance/projects").op).toBe("Create")
+  expect(resourceOf("PUT", "/api/governance/business-units/bu1").resource).toBe("BusinessUnits")
+  expect(resourceOf("DELETE", "/api/roles/ops").resource).toBe("RBAC")
+  expect(resourceOf("GET", "/api/governance/budgets").resource).toBe("Governance")
+  expect(resourceOf("GET", "/api/providers/openai/keys/k1/secrets").op).toBe("Reveal")
+})
+
+test("a custom role can be assigned to a user, and an unknown role cannot", () => {
+  const roles: RoleConfig[] = [{ name: "ops", permissions: [{ resource: "Teams", operation: "View" }] }]
+  const cfg: RbacConfig = { users: [], roles: roles }
+  expect(handleUsers(cfg, "POST", "/api/users", `{"name":"ann","role":"ops"}`).status).toBe(201)
+  expect(handleUsers(cfg, "POST", "/api/users", `{"name":"bob","role":"ghost"}`).status).toBe(400)
 })

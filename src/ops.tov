@@ -6,13 +6,14 @@ import { parseDatasheet } from "./pricing"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { Engine } from "./gateway"
-import { LogStore, LogEntry, defaultLogStoreConfig, gridOf, filterFrom, selectAll, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { LogStore, LogEntry, scopedEntries, defaultLogStoreConfig, gridOf, filterFrom, selectAll, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
 import { CircuitPolicyConfig } from "./config"
 import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin } from "./store"
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, allowed, provisioned } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned } from "./rbac"
+import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
@@ -181,12 +182,9 @@ export async function withSecrets(c: Config): Promise<Config> {
   }
 }
 
-function roleOf(s: string): Role | undefined {
-  if (s === "admin") return "admin"
-  if (s === "editor") return "editor"
-  if (s === "viewer") return "viewer"
-  if (s === "auditor") return "auditor"
-  return undefined
+// The log entries since a time that a data scope may see.
+function scopedView(store: LogStore, sc: DataScope, since: f64): LogEntry[] {
+  return scopedEntries(store.viewSince(since), sc)
 }
 
 async function getText(url: string): Promise<{ status: int, body: string }> {
@@ -303,7 +301,7 @@ export class Ops {
     } catch (e) {
       console.error(`raiju: admin credentials: ${e.message}`)
     }
-    this.rbac = { users: users.concat(legacy) }
+    this.rbac = { users: users.concat(legacy), roles: gov?.roles ?? [] }
     // admin credentials also count as inference auth, as in Bifrost
     const rb = this.rbac
     this.engine.gov.altAuth = (h) => rb.users.length > 0 && authenticate(rb, h).kind === "user"
@@ -974,27 +972,28 @@ export class Ops {
 
   // The request-log analytics (Bifrost's /api/logs/histogram*, rankings, dashboard, filterdata,
   // dropped) and the MCP logs (/api/mcp-logs*). Every reply is JSON. Dimensions Raiju does not record
-  // (team, customer, user, business unit, project, app, user agent) are refused with a 400.
-  logsRoute(req: Request, path: string, body: string): Reply {
+  // (user, app, user agent) are refused with a 400.
+  logsRoute(req: Request, path: string, body: string, scope?: DataScope): Reply {
     const m = req.method
     const store = this.engine.logStore
-    if (path.startsWith("/api/mcp-logs")) return this.mcpLogsRoute(req, path, body, store)
+    const sc: DataScope = scope ?? allScope()
+    if (path.startsWith("/api/mcp-logs")) return this.mcpLogsRoute(req, path, body, store, sc)
     if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
     if (m !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
     const now = Date.now()
     if (path === "/api/logs/dropped") return okJson(`{"dropped_requests":${store.dropped}}`)
-    if (path === "/api/logs/filterdata") return okJson(this.logFilterData(store))
+    if (path === "/api/logs/filterdata") return okJson(this.logFilterData(store, sc))
     const end = epochParam(sp.get("end_time") ?? undefined, now)
     const start = this.windowStart(sp, end)
     if (start >= end) return badRequest("start_time must be before end_time")
     const g = gridOf(start, end)
     if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
-    const es = selectAll(store.viewSince(start - 1.0), filterFrom(sp, "llm", start, end))
+    const es = selectAll(scopedView(store, sc, start - 1.0), filterFrom(sp, "llm", start, end))
     // the same span just before the window, for the rankings' trends
     const pf = filterFrom(sp, "llm", start - (end - start), start)
-    const prev = selectAll(store.viewSince(pf.since - 1.0), pf)
+    const prev = selectAll(scopedView(store, sc, pf.since - 1.0), pf)
     const dim = sp.get("dimension") ?? ""
     const ranked = this.rankLimit(sp)
     if (ranked < 0) return badRequest("Invalid limit. Expected a positive integer, or all=true for no limit")
@@ -1020,7 +1019,7 @@ export class Ops {
       if (bad !== "") return badRequest(bad)
       return okJson(dimensionRankingsView(es, prev, dim, ranked))
     }
-    if (path === "/api/logs/dashboard") return okJson(this.dashboard(store, sp, es, prev, g, start, end, now))
+    if (path === "/api/logs/dashboard") return okJson(this.dashboard(store, sp, es, prev, g, start, end, now, sc))
     return { status: 404, body: errorJson(`no route ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
   }
 
@@ -1054,9 +1053,9 @@ export class Ops {
 
   // GET /api/logs/dashboard: the overview, provider usage, model rankings, dimension rankings and MCP
   // usage for one window, in one call (Bifrost's shape).
-  private dashboard(store: LogStore, sp: URLSearchParams, es: LogEntry[], prev: LogEntry[], g: Grid, start: f64, end: f64, now: f64): string {
+  private dashboard(store: LogStore, sp: URLSearchParams, es: LogEntry[], prev: LogEntry[], g: Grid, start: f64, end: f64, now: f64, sc: DataScope): string {
     const mf = filterFrom(sp, "mcp", start, end)
-    const mcp = selectAll(store.viewSince(start - 1.0), mf)
+    const mcp = selectAll(scopedView(store, sc, start - 1.0), mf)
     const dims: string[] = []
     if (distinctDim(es, "virtual_key").length > 0) dims.push(jkv("virtual_key", dimensionRankingsView(es, prev, "virtual_key", 10)))
     return jobj([
@@ -1071,8 +1070,8 @@ export class Ops {
 
   // GET /api/logs/filterdata: the values the log filters offer, from every entry in memory, and the
   // virtual keys and routing rules of the config.
-  private logFilterData(store: LogStore): string {
-    const all = store.viewSince(0.0)
+  private logFilterData(store: LogStore, sc: DataScope): string {
+    const all = scopedView(store, sc, 0.0)
     const llm: LogEntry[] = []
     const mcp: LogEntry[] = []
     for (const e of all) {
@@ -1080,7 +1079,10 @@ export class Ops {
       else llm.push(e)
     }
     const vks: string[] = []
-    for (const vk of this.store.cfg.governance?.virtual_keys ?? []) vks.push(jobj([jkv("id", JSON.stringify(vk.id)), jkv("name", JSON.stringify(vk.name ?? ""))]))
+    for (const vk of this.store.cfg.governance?.virtual_keys ?? []) {
+      if (!inScope(sc, vk.team_id ?? "", "", vk.customer_id ?? "", "")) continue
+      vks.push(jobj([jkv("id", JSON.stringify(vk.id)), jkv("name", JSON.stringify(vk.name ?? ""))]))
+    }
     const rules: string[] = []
     for (const r of this.store.cfg.governance?.routing_rules ?? []) rules.push(jobj([jkv("id", JSON.stringify(r.id)), jkv("name", JSON.stringify(r.name ?? ""))]))
     return jobj([
@@ -1097,22 +1099,23 @@ export class Ops {
 
   // The MCP logs: GET lists, a single entry by id, and the stats, filter menus, histograms and top
   // tools; DELETE removes entries by id.
-  private mcpLogsRoute(req: Request, path: string, body: string, store: LogStore | undefined): Reply {
+  private mcpLogsRoute(req: Request, path: string, body: string, store: LogStore | undefined, sc: DataScope): Reply {
     if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
     const now = Date.now()
-    if (path === "/api/mcp-logs" && req.method === "DELETE") return this.deleteMcpLogs(store, body)
+    // deleting log entries is for all-data roles
+    if (path === "/api/mcp-logs" && req.method === "DELETE") return sc.all ? this.deleteMcpLogs(store, body) : { status: 403, body: errorJson("the data access scope of this role does not allow deleting logs", "permission_error", undefined), contentType: "application/json" }
     if (req.method !== "GET") return { status: 405, body: errorJson("use GET or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
     if (path === "/api/mcp-logs") {
       const f = filterFrom(sp, "mcp", epochParam(sp.get("start_time") ?? undefined, 0.0), epochParam(sp.get("end_time") ?? undefined, now + 1.0))
-      const es = selectAll(store.viewSince(f.since - 1.0), f)
+      const es = selectAll(scopedView(store, sc, f.since - 1.0), f)
       const limit = Math.min(1000, Math.max(1, parseInt(sp.get("limit") ?? "25") ?? 25))
       const offset = Math.max(0, parseInt(sp.get("offset") ?? "0") ?? 0)
       const rows: string[] = []
       for (let i = es.length - 1 - offset; i >= 0 && rows.length < limit; i--) rows.push(mcpLogJson(es[i]!))
       let hasLogs = false
-      for (const e of store.viewSince(0.0)) {
+      for (const e of scopedView(store, sc, 0.0)) {
         if (kindOf(e) === "mcp") hasLogs = true
       }
       const pg = jobj([jkv("limit", jn(limit)), jkv("offset", jn(offset)), jkv("sort_by", JSON.stringify("timestamp")), jkv("order", JSON.stringify("desc")), jkv("total_count", jn(es.length))])
@@ -1120,7 +1123,7 @@ export class Ops {
     }
     if (path === "/api/mcp-logs/filterdata") {
       const mcp: LogEntry[] = []
-      for (const e of store.viewSince(0.0)) {
+      for (const e of scopedView(store, sc, 0.0)) {
         if (kindOf(e) === "mcp") mcp.push(e)
       }
       return okJson(jobj([jkv("tool_names", jstrs(distinctDim(mcp, "tool"))), jkv("server_labels", jstrs(distinctDim(mcp, "server"))), jkv("virtual_keys", "[]")]))
@@ -1131,7 +1134,7 @@ export class Ops {
       if (start >= end) return badRequest("start_time must be before end_time")
       const g = gridOf(start, end)
       if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
-      const es = selectAll(store.viewSince(start - 1.0), filterFrom(sp, "mcp", start, end))
+      const es = selectAll(scopedView(store, sc, start - 1.0), filterFrom(sp, "mcp", start, end))
       if (path === "/api/mcp-logs/stats") return okJson(mcpStatsView(es))
       if (path === "/api/mcp-logs/histogram") return okJson(requestsView(es, g))
       if (path === "/api/mcp-logs/histogram/cost") return okJson(mcpCostView(es, g))
@@ -1140,7 +1143,7 @@ export class Ops {
     }
     const id = path.slice("/api/mcp-logs/".byteLength)
     if (id !== "" && !id.includes("/")) {
-      for (const e of store.viewSince(0.0)) {
+      for (const e of scopedView(store, sc, 0.0)) {
         if (e.id === id && kindOf(e) === "mcp") return okJson(mcpLogJson(e))
       }
       return { status: 404, body: errorJson("MCP log not found", "not_found_error", undefined), contentType: "application/json" }
@@ -1505,6 +1508,27 @@ export class Ops {
     }
   }
 
+  // The data scope of the actor a gate named. A stored user's custom role decides it; anyone else (the
+  // legacy admin, and sign-in and proxy identities, which hold built-in roles) sees all data.
+  scopeOfActor(actor: string): DataScope {
+    const name = actor.startsWith("proxy:") ? actor.slice(6) : actor
+    const gov = this.store.cfg.governance
+    for (const u of gov?.users ?? []) {
+      if (u.name !== name) continue
+      const r = customRole(gov?.roles, u.role)
+      if (r === undefined) return allScope()
+      return scopeOf(gov ?? {}, u, r.dac ?? "all-data")
+    }
+    return allScope()
+  }
+
+  // check() with the data scope of the caller, for the routes that read scoped data.
+  checkScope(req: Request, path: string): { res: Response | undefined, scope: DataScope } {
+    const g = this.gate(req, path)
+    if (g.kind === "deny") return { res: g.res, scope: noScope() }
+    return { res: undefined, scope: this.scopeOfActor(g.actor) }
+  }
+
   // Whether the caller may use this /api route; the actor names them in the audit log.
   gate(req: Request, path: string): Gate {
     const pg = this.proxyGate(req, path)
@@ -1512,10 +1536,11 @@ export class Ops {
     const auth = req.headers.get("authorization") ?? ""
     if (auth.startsWith("Bearer sk-sess-")) {
       const s = this.sessions.get(auth.slice(7), Date.now())
-      const role = s === undefined ? undefined : roleOf(s.role)
+      // a single sign-on session holds a built-in role
+      const role = s === undefined ? undefined : (isBuiltinRole(s.role) ? s.role : undefined)
       if (s === undefined || role === undefined) return { kind: "deny", res: denied(401, "the session expired; sign in again") }
       const perm = required(req.method, path)
-      if (!allowed(role, perm, path)) {
+      if (!roleAllows(this.store.cfg.governance?.roles, role, req.method, path)) {
         this.recordChange("sso:" + s.sub, req, path, 403, "")
         return { kind: "deny", res: denied(403, `role ${role} may not ${perm} this route`) }
       }
@@ -1581,7 +1606,7 @@ export class Ops {
         this.recordChange("proxy:" + c.identity, req, path, 403, "")
         return { kind: "deny", res: denied(403, "no role maps from the proxy token") }
       }
-      role = roleOf(mapped)
+      role = isBuiltinRole(mapped) ? mapped : undefined
     } else {
       // login only: the identity must already be an enabled user, and its role governs
       const u = provisioned(this.rbac, c.identity)
@@ -1593,7 +1618,7 @@ export class Ops {
     }
     if (role === undefined) return { kind: "deny", res: denied(403, "the mapped role is not known") }
     const perm = required(req.method, path)
-    if (!allowed(role, perm, path)) {
+    if (!roleAllows(this.store.cfg.governance?.roles, role, req.method, path)) {
       this.recordChange("proxy:" + c.identity, req, path, 403, "")
       return { kind: "deny", res: denied(403, `role ${role} may not ${perm} this route`) }
     }
@@ -1625,7 +1650,7 @@ export class Ops {
   users(method: string, path: string, body: string): Reply {
     // only stored users are managed here; legacy auth_config credentials stay in the config
     const stored: UserConfig[] = this.store.cfg.governance?.users ?? []
-    const r = handleUsers({ users: stored }, method, path, body)
+    const r = handleUsers({ users: stored, roles: this.store.cfg.governance?.roles ?? [] }, method, path, body)
     if (method !== "GET" && r.status < 300) {
       const saved = this.store.setUsers(r.cfg.users)
       if (saved.kind === "error") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
@@ -1889,7 +1914,7 @@ test("analytics and MCP routes answer from the store and refuse what is not reco
     expect(dash.status).toBe(200)
     expect(dash.body.includes(`"total_requests":1`)).toBe(true)
     expect(dash.body.includes(`"virtual_key":{"rankings"`)).toBe(true)
-    expect(get("/api/logs/histogram/cost/by-dimension?dimension=team").status).toBe(400)
+    expect(get("/api/logs/histogram/cost/by-dimension?dimension=user").status).toBe(400)
     expect(get("/api/logs/histogram/cost/by-dimension?dimension=virtual_key").body.includes(`"dimension_values":["vk1"]`)).toBe(true)
     expect(get("/api/logs/rankings?limit=0").status).toBe(400)
     expect(get("/api/logs/nothing-here").status).toBe(404)

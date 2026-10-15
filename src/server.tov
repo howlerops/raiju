@@ -12,7 +12,8 @@ import * as gemini from "./providers/gemini"
 import { fields, find, elements, rawStr, rawBool } from "./json"
 import * as metrics from "./metrics"
 import { Session, prepare, onOpen, onMessage, onClose } from "./realtime"
-import { parseQuery, filterFrom, selectAll, statsView } from "./logstore"
+import { parseQuery, filterFrom, selectAll, scopedEntries, statsView } from "./logstore"
+import { DataScope } from "./scope"
 import { matchRoute, handleMedia, deploymentRoute, deploymentRequest } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot } from "./schemas"
@@ -228,6 +229,8 @@ function savedReply(status: int, body: string, saved: Result | undefined): Reply
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const gate = ops.gate(req, path)
   if (gate.kind === "deny") return gate.res
+  // what this caller may see and change (data access scope)
+  const sc = ops.scopeOfActor(gate.actor)
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
@@ -248,7 +251,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
   else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   // the request-log analytics and the MCP logs (ops.logsRoute)
-  else if (logsAnalyticsPath(path)) r = ops.logsRoute(req, path, body)
+  else if (logsAnalyticsPath(path)) r = ops.logsRoute(req, path, body, sc)
   else if (path === "/api/circuit-breaker/policies" || path.startsWith("/api/circuit-breaker/policies/")) r = ops.circuitPoliciesRoute(req.method, path, body)
   else if (path === "/api/circuit-breaker/reset") r = req.method === "POST" ? ops.circuitReset(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/vault/flush-cache") r = req.method === "POST" ? ops.vaultFlush() : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
@@ -296,7 +299,9 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
       r = { status: mr.status, body: mr.body, contentType: "application/json" }
       if (mr.status === 200 && mr.action !== undefined) r = await mcpAction(ops, mr.action, mr.id ?? "", r)
     } else {
-      const a = handleApi(ops.store, req.method, path, body)
+      // the query (search, paging, is_active) reaches the handlers that read it
+      const qu = URL.parse(req.url)
+      const a = handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
       r = { status: a.status, body: a.body, contentType: "application/json" }
     }
   }
@@ -312,7 +317,7 @@ function mcpView(engine: Engine): Response {
   return Response.json({ clients: m.status() })
 }
 
-function logsView(engine: Engine, req: Request, stats: bool): Response {
+function logsView(engine: Engine, req: Request, stats: bool, sc: DataScope): Response {
   const store = engine.logStore
   if (store === undefined) return errorResponse(404, "request logs are off; enable logs_store in the config", "invalid_request_error", noHeaders())
   const u = URL.parse(req.url)
@@ -322,9 +327,11 @@ function logsView(engine: Engine, req: Request, stats: bool): Response {
     const start = parseFloat(params.get("start_time") ?? params.get("since") ?? "0") ?? 0.0
     const end = parseFloat(params.get("end_time") ?? "") ?? Date.now() + 1.0
     const f = filterFrom(params, "llm", start, end)
-    return new Response(statsView(selectAll(store.viewSince(start - 1.0), f)), { headers: { "content-type": "application/json" } })
+    return new Response(statsView(selectAll(scopedEntries(store.viewSince(start - 1.0), sc), f)), { headers: { "content-type": "application/json" } })
   }
-  return Response.json(store.query(parseQuery(params)))
+  const q = parseQuery(params)
+  q.scope = sc
+  return Response.json(store.query(q))
 }
 
 function cacheView(engine: Engine): Response {
@@ -446,8 +453,10 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
     const poll = asyncPoll(p)
     if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id)
     if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
-    if (p === "/api/logs") return ops.check(req, p) ?? logsView(engine, req, false)
-    if (p === "/api/logs/stats") return ops.check(req, p) ?? logsView(engine, req, true)
+    if (p === "/api/logs" || p === "/api/logs/stats") {
+      const cs = ops.checkScope(req, p)
+      return cs.res ?? logsView(engine, req, p === "/api/logs/stats", cs.scope)
+    }
     if (p === "/api/governance/usage") return ops.check(req, p) ?? Response.json({ budgets: engine.gov.budgetUsage() })
     if (p === "/api/mcp") return ops.check(req, p) ?? mcpView(engine)
     if (p === "/api/health") return ops.check(req, p) ?? Response.json({ targets: engine.health.snapshot(Date.now()) })

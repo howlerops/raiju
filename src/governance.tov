@@ -1,6 +1,6 @@
 // Virtual keys, budgets and rate limits, with Bifrost's Customer → Team → VK
 // hierarchy. State is in memory, per process.
-import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig, AccessProfile, ModelConfigGovernance, ProviderGovernance } from "./config"
+import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig, AccessProfile, ModelConfigGovernance, ProviderGovernance, ProjectConfig, ProviderConfigRef } from "./config"
 import { Effective, applyProfiles, modelAllowed } from "./profiles"
 import { Hdrs, hdrs } from "./schemas"
 import { BudgetUsage, RateUse, ScopeUsage } from "./alerts"
@@ -68,8 +68,16 @@ class Limits {
 
 export type Denial = { kind: "denial", status: int, type: string, message: string }
 
+// Who a request is attributed to: its team, customer, business unit and project, by id and name ("" when none).
+// Recorded on log entries and metric labels whether or not the project or customer charges anything.
+export type Attribution = { teamId: string, teamName: string, customerId: string, customerName: string, businessUnitId: string, businessUnitName: string, projectId: string, projectName: string }
+
+export function noAttribution(): Attribution {
+  return { teamId: "", teamName: "", customerId: "", customerName: "", businessUnitId: "", businessUnitName: "", projectId: "", projectName: "" }
+}
+
 // What a request is allowed to do once its virtual key checks out.
-export type Grant = { kind: "grant", vk: VirtualKeyConfig | undefined, budgets: string[], rateLimits: string[] }
+export type Grant = { kind: "grant", vk: VirtualKeyConfig | undefined, budgets: string[], rateLimits: string[], attr?: Attribution }
 
 // Bifrost's virtual key prefix: a key with it is a virtual key, never a provider key.
 const VK_PREFIX = "sk-bf-"
@@ -96,10 +104,15 @@ export class Governance {
   vks: Map<string, VirtualKeyConfig> = new Map()
   budgets: Map<string, Window> = new Map()
   limits: Map<string, Limits> = new Map()
-  teams: Map<string, { budget?: string, customer?: string }> = new Map()
+  teams: Map<string, { budget?: string, customer?: string, bu?: string }> = new Map()
   customers: Map<string, string | undefined> = new Map()
-  // team and customer names, for routing rules' team_name and customer_name
+  businessUnits: Map<string, { budget?: string, rate?: string, customers: string[] }> = new Map()
+  // governance.projects by id
+  projects: Map<string, ProjectConfig> = new Map()
+  // team, customer, business unit and project names, for routing rules' team_name and customer_name
   names: Map<string, string> = new Map()
+  // customers by name, for x-bf-customer-name
+  customerIds: Map<string, string> = new Map()
   enforce = false
   // other credentials accepted on inference when enforced (admin users and tokens, as Bifrost)
   altAuth: ((h: Hdrs) => bool) | undefined = undefined
@@ -146,12 +159,26 @@ export class Governance {
     }
     this.names = new Map()
     for (const t of g.teams ?? []) {
-      this.teams.set(t.id, { budget: t.budget_id, customer: t.customer_id })
+      this.teams.set(t.id, { budget: t.budget_id, customer: t.customer_id, bu: t.business_unit_id })
       this.names.set("team:" + t.id, t.name)
     }
     for (const c of g.customers ?? []) {
       this.customers.set(c.id, c.budget_id)
       this.names.set("customer:" + c.id, c.name)
+      this.customerIds.set(c.name, c.id)
+    }
+    // a team listed under a business unit joins it, unless the team names its unit itself
+    for (const b of g.business_units ?? []) {
+      this.businessUnits.set(b.id, { budget: b.budget_id, rate: b.rate_limit_id, customers: b.customer_ids ?? [] })
+      this.names.set("bu:" + b.id, b.name)
+      for (const tid of b.team_ids ?? []) {
+        const cur = this.teams.get(tid)
+        if (cur !== undefined && cur.bu === undefined) this.teams.set(tid, { budget: cur.budget, customer: cur.customer, bu: b.id })
+      }
+    }
+    for (const p of g.projects ?? []) {
+      this.projects.set(p.id, p)
+      this.names.set("project:" + p.id, p.name)
     }
   }
 
@@ -182,7 +209,9 @@ export class Governance {
     return undefined
   }
 
-  // Checks the key, the provider and model it may use, and every limit above it.
+  // Checks the key, the provider and model it may use, the project it names, and every limit above
+  // them. The caller's own access (its key's profile and provider configs) and the project's access
+  // combine by the project's access_rule: union when either allows, intersect when both do.
   admit(h: Hdrs, provider: string, model: string): Grant | Denial {
     const missing = missingHeader(h, this.required)
     if (missing !== undefined) return { kind: "denial", status: 400, type: "invalid_request_error", message: `the request needs the ${missing} header` }
@@ -192,58 +221,156 @@ export class Governance {
       // a direct provider key satisfies the auth requirement, as in Bifrost; provider and model limits still apply
       const direct = directKeyFrom(h, this.directKeys) !== undefined
       if (this.enforce && !direct && !(alt !== undefined && alt(h))) return { kind: "denial", status: 401, type: "authentication_error", message: "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)" }
-      // no key: model configs and provider governance still apply
-      const lim = this.modelLimits(undefined, provider, model)
-      return this.checkLimits(undefined, lim.budgets, lim.rateLimits)
+    } else if (vk.is_active === false) {
+      return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} is inactive` }
     }
-    if (vk.is_active === false) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} is inactive` }
-    const pol = this.policies.get(vk.id)
-    if (pol !== undefined) {
+    const pol = vk === undefined ? undefined : this.policies.get(vk.id)
+    if (vk !== undefined && pol !== undefined) {
       // fail closed: a profile that went missing must not lift its restrictions
       if (pol.errors.length > 0) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id}: ${pol.errors.join("; ")}` }
-      if (!modelAllowed(pol, provider, model)) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} may not use ${provider}/${model}` }
       const miss = missingHeader(h, pol.requiredHeaders)
       if (miss !== undefined) return { kind: "denial", status: 400, type: "invalid_request_error", message: `the request needs the ${miss} header` }
     }
+    // the project the request names: missing, inactive or not open to this key is refused as not found
+    const pr = this.projectOf(h)
+    let project: ProjectConfig | undefined = undefined
+    if (pr.requested) {
+      const p = pr.p
+      if (p === undefined || p.is_active === false || !this.projectAdmits(p, vk)) {
+        return { kind: "denial", status: 403, type: "access_blocked", message: `project "${pr.label}" not found. It does not exist or does not admit this request.` }
+      }
+      project = p
+    }
+    const callerNo = this.callerDenial(vk, pol, provider, model)
+    const pcs: ProviderConfigRef[] = project === undefined ? [] : (project.provider_configs ?? [])
+    const projectYes = project !== undefined && pcs.some((pc) => pc.provider === provider && pcMatches(pc, model))
+    if (project === undefined) {
+      if (callerNo !== undefined) return callerNo
+    } else {
+      const projectNo: Denial = { kind: "denial", status: 403, type: "permission_error", message: `project ${project.name} may not use ${provider}/${model}` }
+      const rule = project.access_rule ?? "union"
+      if (rule === "intersect") {
+        if (callerNo !== undefined) return callerNo
+        if (!projectYes) return projectNo
+      } else if (rule === "union") {
+        if (callerNo !== undefined && !projectYes) return callerNo
+      } else {
+        // an unrecognised access rule permits nothing
+        return projectNo
+      }
+    }
+    // accounting: which ledgers the request draws from
+    const acc = project?.accounting_mode ?? "both"
+    const useProject = project !== undefined && acc !== "principal_only"
+    const useCaller = callerNo === undefined && acc !== "project_only"
     const budgets: string[] = []
     const rateLimits: string[] = []
-    const pcs = vk.provider_configs ?? []
-    if (pcs.length > 0) {
-      let allowed = false
+    if (project !== undefined && useProject) {
+      if (project.budget_id !== undefined) budgets.push(project.budget_id)
+      if (project.rate_limit_id !== undefined) rateLimits.push(project.rate_limit_id)
       for (const pc of pcs) {
-        if (pc.provider !== provider) continue
-        const am = pc.allowed_models ?? []
-        if (am.length === 0 || am.includes(model) || am.includes("*")) {
-          allowed = true
-          if (pc.budget_id !== undefined) budgets.push(pc.budget_id)
-          if (pc.rate_limit_id !== undefined) rateLimits.push(pc.rate_limit_id)
-        }
-      }
-      if (!allowed) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} may not use ${provider}/${model}` }
-    }
-    if (vk.budget_id !== undefined) budgets.push(vk.budget_id)
-    if (vk.rate_limit_id !== undefined) rateLimits.push(vk.rate_limit_id)
-    let customer = vk.customer_id
-    if (vk.team_id !== undefined) {
-      const t = this.teams.get(vk.team_id)
-      if (t !== undefined) {
-        if (t.budget !== undefined) budgets.push(t.budget)
-        if (customer === undefined) customer = t.customer
+        if (pc.provider !== provider || !pcMatches(pc, model)) continue
+        if (pc.budget_id !== undefined) budgets.push(pc.budget_id)
+        if (pc.rate_limit_id !== undefined) rateLimits.push(pc.rate_limit_id)
       }
     }
-    if (customer !== undefined) {
-      const cb = this.customers.get(customer)
-      if (cb !== undefined) budgets.push(cb)
+    // the hierarchy above the key: team, business unit, and the customers it reaches
+    const teamId = vk === undefined ? undefined : vk.team_id
+    const team = teamId === undefined ? undefined : this.teams.get(teamId)
+    const buId = team?.bu
+    const bu = buId === undefined ? undefined : this.businessUnits.get(buId)
+    const primary = vk?.customer_id ?? team?.customer
+    const reach: string[] = []
+    if (primary !== undefined) reach.push(primary)
+    for (const c of bu?.customers ?? []) {
+      if (!reach.includes(c)) reach.push(c)
     }
-    // model configs and provider governance add their budgets and limits to the key's own
+    // x-bf-customer-id (or -name) charges only that customer; it must be one the key reaches
+    let charged: string[] = reach
+    const cid = (h.get("x-bf-customer-id") ?? "").trim()
+    const cname = (h.get("x-bf-customer-name") ?? "").trim()
+    if (vk !== undefined && (cid !== "" || cname !== "")) {
+      const want = cid !== "" ? cid : (this.customerIds.get(cname) ?? "")
+      if (want === "" || !reach.includes(want)) {
+        return { kind: "denial", status: 403, type: "permission_error", message: `customer ${cid !== "" ? cid : cname} is not reachable by virtual key ${vk.name ?? vk.id}` }
+      }
+      charged = [want]
+    }
+    if (vk !== undefined && useCaller) {
+      for (const pc of vk.provider_configs ?? []) {
+        if (pc.provider !== provider || !pcMatches(pc, model)) continue
+        if (pc.budget_id !== undefined) budgets.push(pc.budget_id)
+        if (pc.rate_limit_id !== undefined) rateLimits.push(pc.rate_limit_id)
+      }
+      if (vk.budget_id !== undefined) budgets.push(vk.budget_id)
+      if (vk.rate_limit_id !== undefined) rateLimits.push(vk.rate_limit_id)
+      if (team !== undefined && team.budget !== undefined) budgets.push(team.budget)
+      if (bu !== undefined) {
+        if (bu.budget !== undefined) budgets.push(bu.budget)
+        if (bu.rate !== undefined) rateLimits.push(bu.rate)
+      }
+      for (const c of charged) {
+        const cb = this.customers.get(c)
+        if (cb !== undefined) budgets.push(cb)
+      }
+    }
+    // model configs and provider governance add their budgets and limits to the request's own
     const lim = this.modelLimits(vk, provider, model)
     for (const id of lim.budgets) budgets.push(id)
     for (const id of lim.rateLimits) rateLimits.push(id)
-    return this.checkLimits(vk, budgets, rateLimits)
+    const cust = charged[0]
+    const attr: Attribution = {
+      teamId: teamId ?? "",
+      teamName: this.teamName(vk) ?? "",
+      customerId: cust ?? "",
+      customerName: cust === undefined ? "" : (this.names.get("customer:" + cust) ?? ""),
+      businessUnitId: buId ?? "",
+      businessUnitName: buId === undefined ? "" : (this.names.get("bu:" + buId) ?? ""),
+      projectId: project?.id ?? "",
+      projectName: project?.name ?? "",
+    }
+    return this.checkLimits(vk, budgets, rateLimits, attr)
+  }
+
+  // The project a request names: x-bf-project-id when present (even empty, which names none), else x-bf-project-name.
+  private projectOf(h: Hdrs): { requested: bool, p: ProjectConfig | undefined, label: string } {
+    const byId = h.get("x-bf-project-id")
+    if (byId !== undefined) {
+      const label = byId.trim()
+      return { requested: true, p: this.projects.get(label), label: label }
+    }
+    const byName = (h.get("x-bf-project-name") ?? "").trim()
+    if (byName === "") return { requested: false, p: undefined, label: "" }
+    return { requested: true, p: this.projectByName(byName), label: byName }
+  }
+
+  private projectByName(name: string): ProjectConfig | undefined {
+    for (const k of this.projects.keys()) {
+      const p = this.projects.get(k)
+      if (p !== undefined && p.name === name) return p
+    }
+    return undefined
+  }
+
+  // An open project admits any caller; an explicit one admits the virtual keys it lists.
+  private projectAdmits(p: ProjectConfig, vk: VirtualKeyConfig | undefined): bool {
+    if ((p.membership_mode ?? "explicit") === "open") return true
+    return vk !== undefined && (p.virtual_key_ids ?? []).includes(vk.id)
+  }
+
+  // The caller's own access to provider and model: its access profile's model rules, then its provider
+  // configs. Undefined when allowed (and always when there is no key).
+  private callerDenial(vk: VirtualKeyConfig | undefined, pol: Effective | undefined, provider: string, model: string): Denial | undefined {
+    if (vk === undefined) return undefined
+    const no: Denial = { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} may not use ${provider}/${model}` }
+    if (pol !== undefined && !modelAllowed(pol, provider, model)) return no
+    const pcs = vk.provider_configs ?? []
+    if (pcs.length > 0 && !pcs.some((pc) => pc.provider === provider && pcMatches(pc, model))) return no
+    return undefined
   }
 
   // Denies when a budget is used up (402) or a rate limit is reached (429); otherwise counts the request.
-  checkLimits(vk: VirtualKeyConfig | undefined, budgets: string[], rateLimits: string[]): Grant | Denial {
+  checkLimits(vk: VirtualKeyConfig | undefined, budgets: string[], rateLimits: string[], attr?: Attribution): Grant | Denial {
     const now = Date.now()
     for (const id of budgets) {
       const b = this.budgets.get(id)
@@ -261,7 +388,7 @@ export class Governance {
       const r = this.limits.get(id)?.requests
       if (r !== undefined) r.add(now, 1.0)
     }
-    return { kind: "grant", vk: vk, budgets: budgets, rateLimits: rateLimits }
+    return { kind: "grant", vk: vk, budgets: budgets, rateLimits: rateLimits, attr: attr }
   }
 
   // The budgets and rate limits that model configs and provider governance put on provider/model.
@@ -531,6 +658,12 @@ export class Governance {
   }
 }
 
+// Whether a provider config allows this model: an empty or "*" allowlist allows every model.
+function pcMatches(pc: ProviderConfigRef, model: string): bool {
+  const am = pc.allowed_models ?? []
+  return am.length === 0 || am.includes(model) || am.includes("*")
+}
+
 // The first of `names` the request lacks (or sends empty), if any.
 export function missingHeader(h: Hdrs, names: string[]): string | undefined {
   for (const n of names) {
@@ -738,4 +871,115 @@ test("scopeUsage gives a scope's budgets and most-used rate limits", () => {
   expect(g.scopeUsage("team", "t9", now)).toBeUndefined()
   expect(g.scopeUsage("customer", "c9", now)).toBeUndefined()
   expect(g.scopeUsage("widget", "vk1", now)).toBeUndefined()
+})
+
+function projCfg(): Config {
+  return {
+    governance: {
+      budgets: [
+        { id: "b-proj", max_limit: 1.0, reset_duration: "1d" },
+        { id: "b-bu", max_limit: 5.0, reset_duration: "1d" },
+        { id: "b-team", max_limit: 100.0, reset_duration: "1d" },
+        { id: "b-cust", max_limit: 100.0, reset_duration: "1d" },
+      ],
+      rate_limits: [{ id: "rl-proj", request_max_limit: 2, request_reset_duration: "1m" }],
+      customers: [{ id: "c1", name: "Acme", budget_id: "b-cust" }],
+      teams: [{ id: "t1", name: "core", customer_id: "c1", budget_id: "b-team", business_unit_id: "bu1" }],
+      business_units: [{ id: "bu1", name: "emea", budget_id: "b-bu" }],
+      virtual_keys: [
+        { id: "vk1", value: "sk-bf-one", team_id: "t1", provider_configs: [{ provider: "openai" }] },
+        { id: "vk2", value: "sk-bf-two" },
+      ],
+      projects: [
+        { id: "p-eval", name: "claude-eval", budget_id: "b-proj", rate_limit_id: "rl-proj", access_rule: "union", provider_configs: [{ provider: "anthropic" }], virtual_key_ids: ["vk1"] },
+        { id: "p-int", name: "narrow", membership_mode: "open", access_rule: "intersect", provider_configs: [{ provider: "openai", allowed_models: ["gpt-4o-mini"] }] },
+        { id: "p-only", name: "pays", membership_mode: "open", accounting_mode: "project_only", budget_id: "b-proj" },
+      ],
+    },
+  }
+}
+
+test("project budget: a project's own budget refuses 402 once spent", () => {
+  const g = new Governance(projCfg())
+  const h = hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-project-id", "p-eval"]])
+  const a = g.admit(h, "anthropic", "claude-sonnet")
+  expect(isDenial(a)).toBe(false)
+  expect((a as Grant).budgets).toEqual(["b-proj"])
+  expect((a as Grant).attr!.projectId).toBe("p-eval")
+  expect((a as Grant).attr!.teamId).toBe("t1")
+  g.record(a as Grant, 10, 1.5)
+  const d = g.admit(h, "anthropic", "claude-sonnet")
+  expect((d as Denial).status).toBe(402)
+  expect((d as Denial).type).toBe("budget_exceeded")
+})
+
+test("union project adds access the key lacks, and only for its own requests", () => {
+  const g = new Governance(projCfg())
+  // vk1 has no anthropic access of its own
+  expect((g.admit(hdrs([["x-bf-vk", "sk-bf-one"]]), "anthropic", "claude") as Denial).status).toBe(403)
+  // the same key, naming the project by name, reaches anthropic
+  const named = hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-project-name", "claude-eval"]])
+  expect(isDenial(g.admit(named, "anthropic", "claude"))).toBe(false)
+  // union keeps the key's own openai access inside the project too
+  expect(isDenial(g.admit(named, "openai", "gpt-4o"))).toBe(false)
+})
+
+test("project admission: non-members, unknown and empty project ids are refused as not found", () => {
+  const g = new Governance(projCfg())
+  const notMember = g.admit(hdrs([["x-bf-vk", "sk-bf-two"], ["x-bf-project-id", "p-eval"]]), "anthropic", "claude") as Denial
+  expect(notMember.status).toBe(403)
+  expect(notMember.type).toBe("access_blocked")
+  expect(notMember.message.includes("does not admit this request")).toBe(true)
+  const unknown = g.admit(hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-project-id", "nope"]]), "openai", "gpt-4o") as Denial
+  expect(unknown.status).toBe(403)
+  // an empty id names no project and is refused, rather than falling back to the key's own access
+  expect(isDenial(g.admit(hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-project-id", " "]]), "openai", "gpt-4o"))).toBe(true)
+  // the id header decides even when the name header is valid
+  expect(isDenial(g.admit(hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-project-id", "nope"], ["x-bf-project-name", "claude-eval"]]), "anthropic", "claude"))).toBe(true)
+})
+
+test("intersect project permits only what both the key and the project allow", () => {
+  const g = new Governance(projCfg())
+  const h = hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-project-id", "p-int"]])
+  expect(isDenial(g.admit(h, "openai", "gpt-4o-mini"))).toBe(false)
+  expect((g.admit(h, "openai", "gpt-4o") as Denial).status).toBe(403)
+  expect((g.admit(h, "anthropic", "claude") as Denial).status).toBe(403)
+  // a project with no provider configs permits nothing under intersect
+  const none = new Governance({ governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }], projects: [{ id: "p", name: "p", membership_mode: "open", access_rule: "intersect" }] } })
+  expect(isDenial(none.admit(hdrs([["x-bf-vk", "sk-bf-k"], ["x-bf-project-id", "p"]]), "openai", "m"))).toBe(true)
+})
+
+test("project_only accounting leaves the key, team, business unit and customer out of the ledgers", () => {
+  const g = new Governance(projCfg())
+  const pays = g.admit(hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-project-id", "p-only"]]), "openai", "gpt-4o")
+  expect((pays as Grant).budgets).toEqual(["b-proj"])
+  // attribution is still recorded
+  expect((pays as Grant).attr!.teamId).toBe("t1")
+  expect((pays as Grant).attr!.projectName).toBe("pays")
+  // without a project, the whole hierarchy is charged
+  const own = g.admit(hdrs([["x-bf-vk", "sk-bf-one"]]), "openai", "gpt-4o") as Grant
+  expect(own.budgets).toEqual(["b-team", "b-bu", "b-cust"])
+  expect(own.attr!.projectId).toBe("")
+  expect(own.attr!.businessUnitId).toBe("bu1")
+  expect(own.attr!.customerId).toBe("c1")
+})
+
+test("business unit budget applies to the teams in it", () => {
+  const g = new Governance(projCfg())
+  const h = hdrs([["x-bf-vk", "sk-bf-one"]])
+  g.record({ kind: "grant", vk: undefined, budgets: ["b-bu"], rateLimits: [] }, 0, 6.0)
+  const d = g.admit(h, "openai", "gpt-4o") as Denial
+  expect(d.status).toBe(402)
+  expect(d.message.includes("b-bu")).toBe(true)
+})
+
+test("x-bf-customer-id charges only a customer the key reaches", () => {
+  const g = new Governance(projCfg())
+  const ok = g.admit(hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-customer-id", "c1"]]), "openai", "gpt-4o") as Grant
+  expect(ok.budgets).toEqual(["b-team", "b-bu", "b-cust"])
+  expect(ok.attr!.customerId).toBe("c1")
+  expect(ok.attr!.customerName).toBe("Acme")
+  const byName = g.admit(hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-customer-name", "Acme"]]), "openai", "gpt-4o") as Grant
+  expect(byName.attr!.customerId).toBe("c1")
+  expect((g.admit(hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-customer-id", "c9"]]), "openai", "gpt-4o") as Denial).status).toBe(403)
 })
