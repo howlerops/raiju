@@ -1,0 +1,206 @@
+// gRPC unary calls over HTTP/2 (h2.tov). Each message carries a 5-byte prefix (a
+// compressed flag and a 4-byte length), the request goes out with te: trailers, and the
+// status comes back in the trailers. One HTTP/2 connection is kept per host:port.
+//
+// TLS is not here: a TLS gRPC call needs ALPN "h2" on the socket, which Tov's
+// Bun.connect does not offer. See the notes in otel.tov, which only sends over plaintext.
+
+import { H2Conn, H2Header, H2Response } from "./h2"
+
+export type GrpcResult = { status: int, message: string, body: u8[] }
+
+export const GRPC_OK: int = 0
+export const GRPC_UNKNOWN: int = 2
+
+let conns: Map<string, H2Conn> = new Map()
+
+// Closes every connection. An open socket keeps the process alive, so tests and shutdown
+// call this; the next call reconnects.
+export function grpcClose(): void {
+  for (const k of conns.keys()) {
+    const c = conns.get(k)!
+    c.close()
+  }
+  conns = new Map()
+}
+
+function connFor(host: string, port: int): H2Conn {
+  const key = host + ":" + port
+  const c = conns.get(key)
+  if (c !== undefined) return c
+  const n = new H2Conn(host, port)
+  conns.set(key, n)
+  return n
+}
+
+// A message with the uncompressed flag and its length.
+export function grpcFrame(msg: u8[]): u8[] {
+  const n = msg.length
+  const out: u8[] = [u8(0), u8((n >> 24) & 255), u8((n >> 16) & 255), u8((n >> 8) & 255), u8(n & 255)]
+  for (const b of msg) out.push(b)
+  return out
+}
+
+// The single message of a unary response. A compressed message is refused, since no
+// grpc-encoding is ever asked for.
+export function grpcUnframe(body: u8[]): u8[] throws Error {
+  if (body.length < 5) throw new Error("grpc: the response has no message")
+  if (int(body[0]!) !== 0) throw new Error("grpc: compressed responses are not supported")
+  const n = (int(body[1]!) << 24) | (int(body[2]!) << 16) | (int(body[3]!) << 8) | int(body[4]!)
+  if (body.length !== 5 + n) throw new Error("grpc: the response is not one message")
+  return body.slice(5, 5 + n)
+}
+
+export function headerValue(hs: H2Header[], name: string): string | undefined {
+  for (const h of hs) {
+    if (h.name === name) return h.value
+  }
+  return undefined
+}
+
+function hexVal(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 97 && c <= 102) return c - 87
+  if (c >= 65 && c <= 70) return c - 55
+  return -1
+}
+
+// grpc-message is percent-encoded UTF-8 (the spec's Percent-Encoded form). A bad escape is
+// kept as written.
+export function percentDecode(s: string): string throws Error {
+  const b = new TextEncoder().encode(s)
+  const out: u8[] = []
+  let i: int = 0
+  while (i < b.length) {
+    const c = int(b[i]!)
+    if (c === 37 && i + 2 < b.length) {
+      const hi = hexVal(int(b[i + 1]!))
+      const lo = hexVal(int(b[i + 2]!))
+      if (hi >= 0 && lo >= 0) {
+        out.push(u8(hi * 16 + lo))
+        i = i + 3
+        continue
+      }
+    }
+    out.push(u8(c))
+    i = i + 1
+  }
+  const d = try new TextDecoder()
+  return try d.decode(out)
+}
+
+function statusCode(s: string): int {
+  let v: int = 0
+  for (const b of new TextEncoder().encode(s)) {
+    const c = int(b)
+    if (c < 48 || c > 57) return GRPC_UNKNOWN
+    v = v * 10 + (c - 48)
+  }
+  if (s.byteLength === 0 || v > 16) return GRPC_UNKNOWN
+  return v
+}
+
+// The gRPC result of a finished call. The status is in the trailers, or in the headers
+// for a trailers-only response. A call with no grpc-status is UNKNOWN.
+export function grpcResult(r: H2Response): GrpcResult throws Error {
+  const tr = r.trailers.length > 0 ? r.trailers : r.headers
+  const msg = try percentDecode(headerValue(tr, "grpc-message") ?? "")
+  const st = headerValue(tr, "grpc-status")
+  if (st === undefined) {
+    const http = headerValue(r.headers, ":status") ?? "none"
+    return { status: GRPC_UNKNOWN, message: `no grpc-status (HTTP ${http})`, body: [] }
+  }
+  const code = statusCode(st)
+  if (code !== GRPC_OK) return { status: code, message: msg, body: [] }
+  return { status: GRPC_OK, message: msg, body: try grpcUnframe(r.body) }
+}
+
+// Metadata names are lowercase, and the transport's own headers are not overridden.
+function reservedMeta(name: string): bool {
+  if (name.startsWith(":")) return true
+  return name === "content-type" || name === "te" || name === "grpc-timeout" || name === "user-agent" || name === "host" || name === "connection" || name === "content-length"
+}
+
+// One unary call to path (for example /pkg.Service/Method) with the message as the body.
+// meta is the call's metadata. timeoutMs is the deadline, sent as grpc-timeout too.
+export async function grpcUnary(host: string, port: int, path: string, msg: u8[], meta: H2Header[], timeoutMs: int): Promise<GrpcResult, Error> throws Error {
+  const hs: H2Header[] = [
+    { name: ":method", value: "POST" },
+    { name: ":scheme", value: "http" },
+    { name: ":path", value: path },
+    { name: ":authority", value: host + ":" + port },
+    { name: "content-type", value: "application/grpc" },
+    { name: "te", value: "trailers" },
+    { name: "grpc-timeout", value: "" + timeoutMs + "m" },
+    { name: "user-agent", value: "raiju" },
+  ]
+  for (const h of meta) {
+    const name = h.name.toLowerCase()
+    if (!reservedMeta(name)) hs.push({ name: name, value: h.value })
+  }
+  const r = try await connFor(host, port).request(hs, grpcFrame(msg), timeoutMs)
+  return try grpcResult(r)
+}
+
+// ---- tests ----
+
+test("the message frame: flag, length, message", () => {
+  const f = grpcFrame([u8(7), u8(8)])
+  expect(f).toEqual([u8(0), u8(0), u8(0), u8(0), u8(2), u8(7), u8(8)])
+  expect(try grpcUnframe(f)).toEqual([u8(7), u8(8)])
+})
+
+test("a unary response must be exactly one uncompressed message", () => {
+  let compressed = false
+  try {
+    grpcUnframe([u8(1), u8(0), u8(0), u8(0), u8(0)])
+  } catch (e) {
+    compressed = true
+  }
+  expect(compressed).toBe(true)
+  let short = false
+  try {
+    grpcUnframe([u8(0), u8(0), u8(0), u8(0), u8(9), u8(1)])
+  } catch (e) {
+    short = true
+  }
+  expect(short).toBe(true)
+  let empty = false
+  try {
+    grpcUnframe([])
+  } catch (e) {
+    empty = true
+  }
+  expect(empty).toBe(true)
+})
+
+test("grpc-message is percent-decoded; bad escapes stay as written", () => {
+  expect(try percentDecode("hello%20w%C3%B6rld")).toBe("hello wörld")
+  expect(try percentDecode("100%")).toBe("100%")
+  expect(try percentDecode("50%zz")).toBe("50%zz")
+})
+
+test("status from trailers, from a trailers-only response, and UNKNOWN without one", () => {
+  const ok: H2Response = {
+    headers: [{ name: ":status", value: "200" }],
+    trailers: [{ name: "grpc-status", value: "0" }],
+    body: [u8(0), u8(0), u8(0), u8(0), u8(1), u8(42)],
+  }
+  const r = try grpcResult(ok)
+  expect(r.status).toBe(0)
+  expect(r.body).toEqual([u8(42)])
+
+  const only: H2Response = {
+    headers: [{ name: ":status", value: "200" }, { name: "grpc-status", value: "5" }, { name: "grpc-message", value: "not%20found" }],
+    trailers: [],
+    body: [],
+  }
+  const t = try grpcResult(only)
+  expect(t.status).toBe(5)
+  expect(t.message).toBe("not found")
+
+  const none: H2Response = { headers: [{ name: ":status", value: "503" }], trailers: [], body: [] }
+  const u = try grpcResult(none)
+  expect(u.status).toBe(GRPC_UNKNOWN)
+  expect(u.message).toBe("no grpc-status (HTTP 503)")
+})

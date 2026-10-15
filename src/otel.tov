@@ -4,9 +4,15 @@
 
 import { readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
+import { H2Header } from "./h2"
+import { grpcUnary, grpcClose } from "./grpc"
+import { encodeTraceRequest, encodeMetricsRequest } from "./protobuf"
 
 export type OtelConfig = {
+  // OTLP/HTTP URL, or host:port for protocol "grpc"
   endpoint: string,
+  // "http" (the default) or "grpc" (OTLP over HTTP/2 with prior knowledge, see grpc.tov)
+  protocol?: string,
   service_name?: string,
   headers?: Map<string, string>,
   batch_size?: int,
@@ -315,6 +321,14 @@ export class Tracer {
     }
     return JSON.stringify(payload)
   }
+
+  // The same batch as an ExportTraceServiceRequest, for protocol "grpc". It is encoded
+  // from the JSON above, so both transports send the same spans.
+  flushGrpc(): u8[] | undefined throws Error {
+    const json = this.flushPayload()
+    if (json === undefined) return undefined
+    return try encodeTraceRequest(json)
+  }
 }
 
 // OTLP/HTTP JSON wire types. Field names follow the spec exactly.
@@ -409,7 +423,135 @@ export function exportRequest(cfg: OtelConfig, payload: string): { url: string, 
   return { url: cfg.endpoint, headers: headers, body: payload, timeoutMs: exportTimeoutMs(cfg.export_timeout) }
 }
 
+// ---- OTLP over gRPC ----
+
+export const TRACE_RPC = "/opentelemetry.proto.collector.trace.v1.TraceService/Export"
+export const METRICS_RPC = "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"
+const DEFAULT_GRPC_PORT: int = 4317
+
+// Whether the signals go to the collector over gRPC. Any other protocol is OTLP/HTTP.
+export function usesGrpc(cfg: OtelConfig): bool {
+  return cfg.protocol === "grpc"
+}
+
+// host and port of a gRPC collector: host:port, or a URL with a scheme and a path (both
+// ignored). The port defaults to 4317. IPv6 literals are not handled.
+export function grpcTarget(addr: string): { host: string, port: int } | undefined {
+  let s = addr.trim()
+  const scheme = s.indexOf("://")
+  if (scheme >= 0) s = s.slice(scheme + 3)
+  const slash = s.indexOf("/")
+  if (slash >= 0) s = s.slice(0, slash)
+  let colon = s.indexOf(":")
+  let host = s
+  let port: int = DEFAULT_GRPC_PORT
+  if (colon >= 0) {
+    host = s.slice(0, colon)
+    const digits = s.slice(colon + 1)
+    if (digits === "") return undefined
+    port = 0
+    for (const b of new TextEncoder().encode(digits)) {
+      const c = int(b)
+      if (c < 48 || c > 57) return undefined
+      port = port * 10 + (c - 48)
+    }
+  }
+  if (host === "" || port < 1 || port > 65535) return undefined
+  return { host: host, port: port }
+}
+
+// gRPC is plaintext only for insecure: true without a CA file, as Bifrost's gRPC client
+// does. TLS needs ALPN "h2" on the socket, which Tov does not offer yet (see grpc.tov), so
+// a TLS collector is refused with a log line rather than sent to.
+export function grpcPlaintext(cfg: OtelConfig): bool {
+  return cfg.insecure === true && (cfg.tls_ca_cert ?? "") === ""
+}
+
+// One gRPC export. Failures are logged, never raised, as the HTTP export does.
+async function grpcSend(cfg: OtelConfig, target: string, rpc: string, headers: Map<string, string>, body: u8[], what: string): Promise<void> {
+  const t = grpcTarget(target)
+  if (t === undefined) {
+    console.error(`raiju: ${what} export: bad gRPC collector address ${target}`)
+    return
+  }
+  if (!grpcPlaintext(cfg)) {
+    console.error(`raiju: ${what} export: gRPC over TLS is not supported yet; set insecure: true for a plaintext collector`)
+    return
+  }
+  const meta: H2Header[] = []
+  for (const k of headers.keys()) meta.push({ name: k, value: headers.get(k)! })
+  try {
+    const r = try await grpcUnary(t.host, t.port, rpc, body, meta, exportTimeoutMs(cfg.export_timeout))
+    if (r.status !== 0) console.error(`raiju: ${what} export: gRPC status ${r.status}: ${r.message}`)
+  } catch (e) {
+    console.error(`raiju: ${what} export failed: ${e.message}`)
+  }
+}
+
+// Sends the queued spans over gRPC. The headers are the same set the HTTP export sends.
+export async function exportSpansGrpc(tracer: Tracer): Promise<void> {
+  let body: u8[] | undefined = undefined
+  try {
+    body = try tracer.flushGrpc()
+  } catch (e) {
+    console.error(`raiju: trace export failed: ${e.message}`)
+    return
+  }
+  const b = body
+  if (b === undefined) return
+  const req = exportRequest(tracer.cfg, "")
+  await grpcSend(tracer.cfg, tracer.cfg.endpoint, TRACE_RPC, req.headers, b, "trace")
+}
+
+// Sends one metrics snapshot (the OTLP/HTTP JSON body from exportMetricsRequest) as an
+// ExportMetricsServiceRequest. The target is metrics_endpoint, else the traces endpoint.
+export async function exportMetricsGrpc(cfg: OtelConfig, json: string, headers: Map<string, string>): Promise<void> {
+  let body: u8[] | undefined = undefined
+  try {
+    body = try encodeMetricsRequest(json)
+  } catch (e) {
+    console.error(`raiju: otel metrics export failed: ${e.message}`)
+    return
+  }
+  const b = body
+  if (b === undefined) return
+  const mep = cfg.metrics_endpoint ?? ""
+  const target = mep !== "" ? mep : cfg.endpoint
+  await grpcSend(cfg, target, METRICS_RPC, headers, b, "otel metrics")
+}
+
 // ---- tests ----
+
+test("gRPC targets: host:port, URLs with a scheme or path, and the default port", () => {
+  expect(grpcTarget("collector:4317")).toEqual({ host: "collector", port: 4317 })
+  expect(grpcTarget("http://collector:14317/x")).toEqual({ host: "collector", port: 14317 })
+  expect(grpcTarget("collector")).toEqual({ host: "collector", port: 4317 })
+  expect(grpcTarget("collector:")).toBeUndefined()
+  expect(grpcTarget("collector:abc")).toBeUndefined()
+  expect(grpcTarget("")).toBeUndefined()
+})
+
+test("gRPC is plaintext only with insecure and no CA file", () => {
+  expect(grpcPlaintext({ endpoint: "c:4317", insecure: true })).toBe(true)
+  expect(grpcPlaintext({ endpoint: "c:4317" })).toBe(false)
+  expect(grpcPlaintext({ endpoint: "c:4317", insecure: true, tls_ca_cert: "/ca.pem" })).toBe(false)
+  expect(usesGrpc({ endpoint: "c:4317", protocol: "grpc" })).toBe(true)
+  expect(usesGrpc({ endpoint: "http://c:4318" })).toBe(false)
+})
+
+test("the gRPC trace batch is the same spans as the JSON batch", () => {
+  const tr = new Tracer({ endpoint: "c:4317", protocol: "grpc", service_name: "gw" })
+  const span = tr.startRequest("chat", undefined, 1700000000123)
+  span.setStr("gen_ai.request.model", "m")
+  span.end(1700000000125)
+  tr.finish(span)
+  const b = try tr.flushGrpc()
+  expect(b).toBeDefined()
+  // one resource_spans field (tag 0x0a) holding the whole batch
+  expect(b![0]).toBe(u8(10))
+  expect(b!.length > 60).toBe(true)
+  expect(try tr.flushGrpc()).toBeUndefined()
+})
 
 test("parses a valid traceparent", () => {
   const t = parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")

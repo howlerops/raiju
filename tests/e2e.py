@@ -13,6 +13,8 @@ GW = "http://127.0.0.1:18098"
 MOCK = "http://127.0.0.1:18099"
 GW_B = "http://127.0.0.1:18097"
 GW_D = "http://127.0.0.1:18092"
+GW_G = "http://127.0.0.1:18116"  # exports OTLP over gRPC to tests/otlp_grpc_collector.py
+GRPC_COLLECTOR_PORT = 18317
 
 def build():
     os.makedirs(BUILD, exist_ok=True)
@@ -524,6 +526,19 @@ def main():
     gw_vw = vs_gateway("weaviate", 18110)
     gw_vp = vs_gateway("pinecone", 18111)
     gw_vc = vs_gateway("chromem", 18112)
+    # OTLP over gRPC: a gateway whose otel section speaks gRPC to the stdlib collector
+    grpc_out = os.path.join(BUILD, "e2e-grpc-exports.jsonl")
+    grpc_coll = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/otlp_grpc_collector.py"), str(GRPC_COLLECTOR_PORT), grpc_out], stdout=subprocess.DEVNULL)
+    gcfg = json.load(open(config))
+    # this gateway skips the OAuth MCP server, so the token count (one per gateway) stays as the MCP checks expect,
+    # and its background webhooks and log exports stay off the shared mock, whose request log other checks read
+    gcfg["mcp"]["client_configs"] = [c for c in gcfg["mcp"]["client_configs"] if c["name"] != "secure"]
+    gcfg["alerts"]["enabled"] = False
+    gcfg["log_exports"]["enabled"] = False
+    gcfg["otel"] = {"endpoint": f"127.0.0.1:{GRPC_COLLECTOR_PORT}", "protocol": "grpc", "insecure": True, "service_name": "raiju-grpc",
+                    "batch_size": 1, "flush_ms": 100, "metrics_enabled": True, "metrics_endpoint": f"127.0.0.1:{GRPC_COLLECTOR_PORT}", "metrics_push_interval": 1}
+    json.dump(gcfg, open(os.path.join(BUILD, "e2e.grpc.json"), "w"))
+    gw_g = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18116", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.grpc.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.grpc.log"), "w"))
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
 
@@ -925,6 +940,28 @@ def main():
         check("spans exported over OTLP/HTTP", len(traces) > 0 and '"resourceSpans"' in joined and "raiju-e2e" in joined, traces[:1])
         check("inbound traceparent continues the trace", "0af7651916cd43dd8448eb211c80319c" in joined and '"parentSpanId":"b7ad6b7169203331"' in joined, joined[:300])
         check("gen_ai attributes on spans", '"gen_ai.request.model"' in joined and '"gen_ai.usage.input_tokens"' in joined, joined[:300])
+
+        # OTLP over gRPC: the gRPC gateway's spans and metrics reach the gRPC collector
+        wait(GW_G + "/health")
+        call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}], "seed": 410}, base=GW_G)
+        def grpc_exports():
+            if not os.path.exists(grpc_out):
+                return []
+            return [json.loads(x) for x in open(grpc_out) if x.strip()]
+        def grpc_ready():
+            ex = grpc_exports()
+            return any(e["rpc"] == "trace" and "gen_ai.request.model" in e["span_attrs"] for e in ex) and any(e["rpc"] == "metrics" and "bifrost_upstream_requests_total" in e["metrics"] for e in ex)
+        for _ in range(60):
+            if grpc_ready():
+                break
+            time.sleep(0.1)
+        ex = grpc_exports()
+        tr_ex = [e for e in ex if e["rpc"] == "trace"]
+        mx_ex = [e for e in ex if e["rpc"] == "metrics"]
+        check("spans arrive over gRPC with gen_ai attributes", any("gen_ai.request.model" in e["span_attrs"] for e in tr_ex), ex[:2])
+        check("gRPC spans carry the service name and 16-byte trace ids", any(e["service"] == "raiju-grpc" and e["trace_id_lens"] and all(n == 16 for n in e["trace_id_lens"]) for e in tr_ex), tr_ex[:1])
+        check("metrics arrive over gRPC", any("bifrost_upstream_requests_total" in e["metrics"] and e["service"] == "raiju-grpc" for e in mx_ex), mx_ex[:1])
+        check("gRPC calls are unary gRPC over HTTP/2 with te: trailers", len(ex) > 0 and all(e["content_type"] == "application/grpc" and e["te"] == "trailers" and e["path"].endswith("/Export") for e in ex), ex[:1])
 
         # MCP: tools from connected servers are injected into chat requests and can be executed
         s, _, b = call("GET", "/api/mcp")
@@ -1886,7 +1923,7 @@ def main():
         # cluster discovery and the identity-aware proxies (their own gateways and mocks)
         discovery_and_proxy()
     finally:
-        gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
+        gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)

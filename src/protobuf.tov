@@ -1,0 +1,442 @@
+// Protocol Buffers wire encoding for the OTLP gRPC exporter. The gRPC path sends the
+// same data the OTLP/HTTP JSON path does: the JSON body that otel.tov and
+// otel_metrics.tov build is parsed here and encoded as ExportTraceServiceRequest or
+// ExportMetricsServiceRequest. Field numbers follow opentelemetry-proto. Fields are
+// written in ascending number order, and proto3 defaults are left out, so the bytes
+// match what the reference encoder writes (see the tests).
+
+const WIRE_VARINT: int = 0
+const WIRE_FIXED64: int = 1
+const WIRE_LEN: int = 2
+
+// Appends protobuf fields to a buffer. Each method writes its field; callers skip
+// fields at their proto3 default when the default is not wanted on the wire.
+export class PbWriter {
+  buf: u8[] = []
+
+  // A varint. Negative values take ten bytes, as int64 does.
+  varint(v: int): void {
+    let x = v
+    if (x >= 0) {
+      while (x >= 128) {
+        this.buf.push(u8((x & 127) | 128))
+        x = x >> 7
+      }
+      this.buf.push(u8(x))
+      return
+    }
+    for (let k = 0; k < 10; k++) {
+      if (k === 9) {
+        this.buf.push(u8(x & 1))
+      } else {
+        this.buf.push(u8((x & 127) | 128))
+        x = x >> 7
+      }
+    }
+  }
+
+  private key(field: int, wire: int): void {
+    this.varint((field << 3) | wire)
+  }
+
+  // A varint field (int32, int64, enum, bool) as given.
+  u(field: int, v: int): void {
+    this.key(field, WIRE_VARINT)
+    this.varint(v)
+  }
+
+  bool(field: int, v: bool): void {
+    this.u(field, v ? 1 : 0)
+  }
+
+  fixed64(field: int, bits: int): void {
+    this.key(field, WIRE_FIXED64)
+    for (let i = 0; i < 8; i++) this.buf.push(u8((bits >> (i * 8)) & 0xff))
+  }
+
+  double(field: int, v: f64): void {
+    this.fixed64(field, doubleBits(v))
+  }
+
+  bytes(field: int, data: u8[]): void {
+    this.key(field, WIRE_LEN)
+    this.varint(data.length)
+    for (const b of data) this.buf.push(b)
+  }
+
+  str(field: int, s: string): void {
+    this.bytes(field, new TextEncoder().encode(s))
+  }
+
+  // A repeated fixed64 field in packed form (proto3's default for scalars).
+  packedFixed64(field: int, vals: int[]): void {
+    const inner = new PbWriter()
+    for (const v of vals) {
+      for (let i = 0; i < 8; i++) inner.buf.push(u8((v >> (i * 8)) & 0xff))
+    }
+    this.bytes(field, inner.buf)
+  }
+
+  // A repeated double field in packed form.
+  packedDouble(field: int, vals: f64[]): void {
+    const ints: int[] = []
+    for (const v of vals) ints.push(doubleBits(v))
+    this.packedFixed64(field, ints)
+  }
+}
+
+// The IEEE 754 bit pattern of a finite double as an int (the sign is the top bit).
+// Exact for every finite value: m * 2^e with m in [1, 2) has at most 52 fraction bits.
+export function doubleBits(v: f64): int {
+  const neg = v < 0 || (v === 0 && 1 / v < 0)
+  const x = neg ? -v : v
+  const sign: int = neg ? -9223372036854775807 - 1 : 0
+  if (x === 0) return sign
+  let e: int = Math.floor(Math.log2(x))
+  let m = x / Math.pow(2, e)
+  while (m >= 2) {
+    m = m / 2
+    e = e + 1
+  }
+  while (m < 1) {
+    m = m * 2
+    e = e - 1
+  }
+  if (e < -1022) {
+    // subnormal: x is a whole number of 2^-1074 (the two halves keep each factor finite)
+    return sign | int(Math.round(x * Math.pow(2, 537) * Math.pow(2, 537)))
+  }
+  const frac: int = int(Math.round((m - 1) * 4503599627370496.0))
+  return sign | ((e + 1023) << 52) | frac
+}
+
+// Decimal text to an int, with an optional minus sign. OTLP JSON sends int64 and
+// uint64 this way, and ns timestamps are past 2^53, so a float is not used.
+export function decimal(s: string): int {
+  let neg = false
+  let v: int = 0
+  for (const b of new TextEncoder().encode(s)) {
+    const c = int(b)
+    if (c === 45) {
+      neg = true
+    } else if (c >= 48 && c <= 57) {
+      v = v * 10 + (c - 48)
+    }
+  }
+  return neg ? -v : v
+}
+
+function hexDigit(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 97 && c <= 102) return c - 87
+  if (c >= 65 && c <= 70) return c - 55
+  return 0
+}
+
+// Hex text (OTLP JSON ids) to bytes: trace ids are 16 bytes, span ids 8.
+export function hexBytes(s: string): u8[] {
+  const d = new TextEncoder().encode(s)
+  const out: u8[] = []
+  for (let i = 0; i + 1 < d.length; i += 2) {
+    out.push(u8(hexDigit(int(d[i]!)) * 16 + hexDigit(int(d[i + 1]!))))
+  }
+  return out
+}
+
+// ---- OTLP shapes: the JSON the encoder reads ----
+
+export type PbAny = { stringValue?: string, intValue?: string, doubleValue?: f64, boolValue?: bool }
+export type PbKv = { key: string, value: PbAny }
+export type PbSpan = {
+  traceId: string,
+  spanId: string,
+  parentSpanId?: string,
+  name: string,
+  kind: int,
+  startTimeUnixNano: string,
+  endTimeUnixNano: string,
+  attributes: PbKv[],
+  status: { code: int, message?: string },
+}
+export type PbTracePayload = {
+  resourceSpans: { resource: { attributes: PbKv[] }, scopeSpans: { scope: { name: string }, spans: PbSpan[] }[] }[],
+}
+export type PbNumberPoint = { attributes: PbKv[], startTimeUnixNano: string, timeUnixNano: string, asDouble: f64 }
+export type PbHistPoint = {
+  attributes: PbKv[],
+  startTimeUnixNano: string,
+  timeUnixNano: string,
+  count: string,
+  sum?: f64,
+  bucketCounts: string[],
+  explicitBounds: f64[],
+}
+export type PbSummaryPoint = {
+  attributes: PbKv[],
+  startTimeUnixNano: string,
+  timeUnixNano: string,
+  count: string,
+  sum: f64,
+  quantileValues: { quantile: f64, value: f64 }[],
+}
+export type PbMetric = {
+  name: string,
+  sum?: { dataPoints: PbNumberPoint[], aggregationTemporality: int, isMonotonic: bool },
+  gauge?: { dataPoints: PbNumberPoint[] },
+  histogram?: { dataPoints: PbHistPoint[], aggregationTemporality: int },
+  summary?: { dataPoints: PbSummaryPoint[] },
+}
+export type PbMetricsPayload = {
+  resourceMetrics: { resource: { attributes: PbKv[] }, scopeMetrics: { scope: { name: string }, metrics: PbMetric[] }[] }[],
+}
+
+// ---- encoders (each returns the message's bytes) ----
+
+function anyValue(v: PbAny): u8[] {
+  const w = new PbWriter()
+  // a oneof member is written when present, even at its zero value
+  const s = v.stringValue
+  if (s !== undefined) w.str(1, s)
+  const b = v.boolValue
+  if (b !== undefined) w.bool(2, b)
+  const i = v.intValue
+  if (i !== undefined) w.u(3, decimal(i))
+  const d = v.doubleValue
+  if (d !== undefined) w.double(4, d)
+  return w.buf
+}
+
+function keyValue(kv: PbKv): u8[] {
+  const w = new PbWriter()
+  if (kv.key !== "") w.str(1, kv.key)
+  w.bytes(2, anyValue(kv.value))
+  return w.buf
+}
+
+function kvList(w: PbWriter, field: int, kvs: PbKv[]): void {
+  for (const kv of kvs) w.bytes(field, keyValue(kv))
+}
+
+function resource(attrs: PbKv[]): u8[] {
+  const w = new PbWriter()
+  kvList(w, 1, attrs)
+  return w.buf
+}
+
+function scope(name: string): u8[] {
+  const w = new PbWriter()
+  if (name !== "") w.str(1, name)
+  return w.buf
+}
+
+function span(s: PbSpan): u8[] {
+  const w = new PbWriter()
+  w.bytes(1, hexBytes(s.traceId))
+  w.bytes(2, hexBytes(s.spanId))
+  const parent = s.parentSpanId
+  if (parent !== undefined && parent !== "") w.bytes(4, hexBytes(parent))
+  if (s.name !== "") w.str(5, s.name)
+  if (s.kind !== 0) w.u(6, s.kind)
+  const start = decimal(s.startTimeUnixNano)
+  if (start !== 0) w.fixed64(7, start)
+  const end = decimal(s.endTimeUnixNano)
+  if (end !== 0) w.fixed64(8, end)
+  kvList(w, 9, s.attributes)
+  const st = new PbWriter()
+  const msg = s.status.message
+  if (msg !== undefined && msg !== "") st.str(2, msg)
+  if (s.status.code !== 0) st.u(3, s.status.code)
+  w.bytes(15, st.buf)
+  return w.buf
+}
+
+// Encodes the OTLP/HTTP JSON trace export body as an ExportTraceServiceRequest.
+export function encodeTraceRequest(json: string): u8[] throws Error {
+  const p = try JSON.parse(json) as PbTracePayload
+  const req = new PbWriter()
+  for (const rs of p.resourceSpans) {
+    const w = new PbWriter()
+    w.bytes(1, resource(rs.resource.attributes))
+    for (const ss of rs.scopeSpans) {
+      const sw = new PbWriter()
+      sw.bytes(1, scope(ss.scope.name))
+      for (const sp of ss.spans) sw.bytes(2, span(sp))
+      w.bytes(2, sw.buf)
+    }
+    req.bytes(1, w.buf)
+  }
+  return req.buf
+}
+
+function numberPoint(p: PbNumberPoint): u8[] {
+  const w = new PbWriter()
+  const start = decimal(p.startTimeUnixNano)
+  if (start !== 0) w.fixed64(2, start)
+  const time = decimal(p.timeUnixNano)
+  if (time !== 0) w.fixed64(3, time)
+  w.double(4, p.asDouble)
+  kvList(w, 7, p.attributes)
+  return w.buf
+}
+
+function histPoint(p: PbHistPoint): u8[] {
+  const w = new PbWriter()
+  const start = decimal(p.startTimeUnixNano)
+  if (start !== 0) w.fixed64(2, start)
+  const time = decimal(p.timeUnixNano)
+  if (time !== 0) w.fixed64(3, time)
+  const count = decimal(p.count)
+  if (count !== 0) w.fixed64(4, count)
+  const sum = p.sum
+  if (sum !== undefined) w.double(5, sum)
+  const counts: int[] = []
+  for (const c of p.bucketCounts) counts.push(decimal(c))
+  if (counts.length > 0) w.packedFixed64(6, counts)
+  if (p.explicitBounds.length > 0) w.packedDouble(7, p.explicitBounds)
+  kvList(w, 9, p.attributes)
+  return w.buf
+}
+
+function summaryPoint(p: PbSummaryPoint): u8[] {
+  const w = new PbWriter()
+  const start = decimal(p.startTimeUnixNano)
+  if (start !== 0) w.fixed64(2, start)
+  const time = decimal(p.timeUnixNano)
+  if (time !== 0) w.fixed64(3, time)
+  const count = decimal(p.count)
+  if (count !== 0) w.fixed64(4, count)
+  if (p.sum !== 0) w.double(5, p.sum)
+  for (const q of p.quantileValues) {
+    const qw = new PbWriter()
+    if (q.quantile !== 0) qw.double(1, q.quantile)
+    if (q.value !== 0) qw.double(2, q.value)
+    w.bytes(6, qw.buf)
+  }
+  kvList(w, 7, p.attributes)
+  return w.buf
+}
+
+function metric(m: PbMetric): u8[] {
+  const w = new PbWriter()
+  if (m.name !== "") w.str(1, m.name)
+  const g = m.gauge
+  if (g !== undefined) {
+    const gw = new PbWriter()
+    for (const p of g.dataPoints) gw.bytes(1, numberPoint(p))
+    w.bytes(5, gw.buf)
+  }
+  const s = m.sum
+  if (s !== undefined) {
+    const sw = new PbWriter()
+    for (const p of s.dataPoints) sw.bytes(1, numberPoint(p))
+    if (s.aggregationTemporality !== 0) sw.u(2, s.aggregationTemporality)
+    if (s.isMonotonic) sw.bool(3, true)
+    w.bytes(7, sw.buf)
+  }
+  const h = m.histogram
+  if (h !== undefined) {
+    const hw = new PbWriter()
+    for (const p of h.dataPoints) hw.bytes(1, histPoint(p))
+    if (h.aggregationTemporality !== 0) hw.u(2, h.aggregationTemporality)
+    w.bytes(9, hw.buf)
+  }
+  const su = m.summary
+  if (su !== undefined) {
+    const uw = new PbWriter()
+    for (const p of su.dataPoints) uw.bytes(1, summaryPoint(p))
+    w.bytes(11, uw.buf)
+  }
+  return w.buf
+}
+
+// Encodes the OTLP/HTTP JSON metrics export body as an ExportMetricsServiceRequest.
+export function encodeMetricsRequest(json: string): u8[] throws Error {
+  const p = try JSON.parse(json) as PbMetricsPayload
+  const req = new PbWriter()
+  for (const rm of p.resourceMetrics) {
+    const w = new PbWriter()
+    w.bytes(1, resource(rm.resource.attributes))
+    for (const sm of rm.scopeMetrics) {
+      const sw = new PbWriter()
+      sw.bytes(1, scope(sm.scope.name))
+      for (const m of sm.metrics) sw.bytes(2, metric(m))
+      w.bytes(2, sw.buf)
+    }
+    req.bytes(1, w.buf)
+  }
+  return req.buf
+}
+
+// Lowercase hex of some bytes, for tests and logs.
+export function toHex(b: u8[]): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  for (const x of b) {
+    const v = int(x)
+    out += digits.slice(v >> 4, (v >> 4) + 1) + digits.slice(v & 15, (v & 15) + 1)
+  }
+  return out
+}
+
+// ---- tests ----
+// Expected bytes are from the opentelemetry-proto Python classes (ParseDict on the same
+// JSON, deterministic serialization).
+
+const TRACE_JSON = `{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"gw"}}]},"scopeSpans":[{"scope":{"name":"raiju"},"spans":[{"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7","parentSpanId":"b7ad6b7169203331","name":"chat","kind":2,"startTimeUnixNano":"1700000000123000000","endTimeUnixNano":"1700000000125000000","attributes":[{"key":"a","value":{"stringValue":"x"}},{"key":"b","value":{"intValue":"42"}},{"key":"c","value":{"doubleValue":1.5}},{"key":"d","value":{"boolValue":true}},{"key":"e","value":{"intValue":"-5"}},{"key":"f","value":{"doubleValue":0}},{"key":"g","value":{"stringValue":""}},{"key":"h","value":{"boolValue":false}}],"status":{"code":2,"message":"boom"}},{"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"1111111111111111","name":"upstream","kind":3,"startTimeUnixNano":"1700000000126000000","endTimeUnixNano":"1700000000126000000","attributes":[],"status":{"code":0}}]}]}]}`
+
+const TRACE_HEX = "0a8f020a160a140a0c736572766963652e6e616d6512040a02677712f4010a070a057261696a7512aa010a104bf92f3577b34da6a3ce929d0e0e4736120800f067aa0ba902b72208b7ad6b71692033312a0463686174300239c0d47e3dfe9c97174140599d3dfe9c97174a080a016112030a01784a070a01621202182a4a0e0a0163120921000000000000f83f4a070a0164120210014a100a0165120b18fbffffffffffffffff014a0e0a016612092100000000000000004a070a016712020a004a070a0168120210007a081204626f6f6d1802123c0a104bf92f3577b34da6a3ce929d0e0e4736120811111111111111112a08757073747265616d300339809bac3dfe9c971741809bac3dfe9c97177a00"
+
+const METRICS_JSON = `{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"raiju"}}]},"scopeMetrics":[{"scope":{"name":"raiju"},"metrics":[{"name":"bifrost_sessions","gauge":{"dataPoints":[{"attributes":[{"key":"x","value":{"stringValue":"y"}}],"startTimeUnixNano":"1700000000123000000","timeUnixNano":"1700000060000000000","asDouble":3.25}]}},{"name":"bifrost_requests_total","sum":{"dataPoints":[{"attributes":[],"startTimeUnixNano":"1700000000123000000","timeUnixNano":"1700000060000000000","asDouble":2}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"bifrost_latency","histogram":{"dataPoints":[{"attributes":[],"startTimeUnixNano":"1700000000123000000","timeUnixNano":"1700000060000000000","count":"5","sum":1.75,"bucketCounts":["2","1","2"],"explicitBounds":[0.5,1]}],"aggregationTemporality":2}},{"name":"x_summary","summary":{"dataPoints":[{"attributes":[],"startTimeUnixNano":"1700000000123000000","timeUnixNano":"1700000060000000000","count":"3","sum":0.1,"quantileValues":[]}]}}]}]}]}`
+
+const METRICS_HEX = "0abf020a190a170a0c736572766963652e6e616d6512070a057261696a7512a1020a070a057261696a75123b0a10626966726f73745f73657373696f6e732a270a2511c0d47e3dfe9c9717190058712e0c9d9717210000000000000a403a080a017812030a0179123b0a16626966726f73745f72657175657374735f746f74616c3a210a1b11c0d47e3dfe9c9717190058712e0c9d97172100000000000000401002180112670a0f626966726f73745f6c6174656e63794a540a5011c0d47e3dfe9c9717190058712e0c9d971721050000000000000029000000000000fc3f32180200000000000000010000000000000002000000000000003a10000000000000e03f000000000000f03f100212330a09785f73756d6d6172795a260a2411c0d47e3dfe9c9717190058712e0c9d9717210300000000000000299a9999999999b93f"
+
+test("varints: small, multi-byte and negative (ten bytes)", () => {
+  const w = new PbWriter()
+  w.varint(1)
+  w.varint(300)
+  expect(toHex(w.buf)).toBe("01ac02")
+  const n = new PbWriter()
+  n.varint(-1)
+  expect(toHex(n.buf)).toBe("ffffffffffffffffff01")
+})
+
+test("field keys and default-free scalars", () => {
+  const w = new PbWriter()
+  w.u(1, 150)
+  w.str(2, "hi")
+  w.fixed64(3, 1)
+  expect(toHex(w.buf)).toBe("089601" + "1202" + "6869" + "19" + "0100000000000000")
+})
+
+test("doubles match their IEEE 754 bit patterns", () => {
+  expect(doubleBits(1.5)).toBe(4609434218613702656)
+  expect(doubleBits(-2.5)).toBe(-4610560118520545280)
+  expect(doubleBits(0.1)).toBe(4591870180066957722)
+  expect(doubleBits(1e300)).toBe(9094988921128908188)
+  expect(doubleBits(5e-324)).toBe(1)
+  expect(doubleBits(2.2250738585072014e-308)).toBe(4503599627370496)
+  expect(doubleBits(0.0)).toBe(0)
+  expect(doubleBits(3.25)).toBe(4614500768194494464)
+  expect(doubleBits(1.75)).toBe(4610560118520545280)
+  expect(doubleBits(0.5)).toBe(4602678819172646912)
+  expect(doubleBits(2.0)).toBe(4611686018427387904)
+})
+
+test("decimal strings parse past 2^53 without float rounding", () => {
+  expect(decimal("1700000000123000000")).toBe(1700000000123000000)
+  expect(decimal("-5")).toBe(-5)
+  expect(decimal("")).toBe(0)
+})
+
+test("hex ids decode to bytes", () => {
+  expect(toHex(hexBytes("4bf92f3577b34da6a3ce929d0e0e4736"))).toBe("4bf92f3577b34da6a3ce929d0e0e4736")
+  expect(hexBytes("00f067aa0ba902b7").length).toBe(8)
+})
+
+test("trace export encodes to the reference bytes", () => {
+  expect(toHex(try encodeTraceRequest(TRACE_JSON))).toBe(TRACE_HEX)
+})
+
+test("metrics export encodes to the reference bytes", () => {
+  expect(toHex(try encodeMetricsRequest(METRICS_JSON))).toBe(METRICS_HEX)
+})
