@@ -1,0 +1,2141 @@
+diff --git a/src/config.tov b/src/config.tov
+index f9f0a19..b7ab0b6 100644
+--- a/src/config.tov
++++ b/src/config.tov
+@@ -14,6 +14,8 @@ import { VirtualMcp } from "./vmcp"
+ import { VectorStoreSettings } from "./vectorstore"
+ import { fields, elements, find, rawStr, rawBool, isNull } from "./json"
+ import { normalize } from "./config_compat"
++import { PromptRepoConfig } from "./prompts"
++import { FeatureFlagsConfig, FlagOverride } from "./flags"
+ 
+ // client_id, client_secret and tenant_id: Entra ID (service principal) instead of an API key
+ export type AzureKeyConfig = { endpoint: string, deployments?: Map<string, string>, api_version?: string, client_id?: string, client_secret?: string, tenant_id?: string, scopes?: string[] }
+@@ -442,6 +444,34 @@ export type Config = {
+   // identity-aware proxy in front of the API (Bifrost's authProxy under scim_config)
+   auth_proxy?: AuthProxyConfig,
+   proxy_config?: GlobalProxyConfig,
++  // Bifrost-style prompt repository (prompts.tov): prompts with their versions, and deployments
++  prompt_repo?: PromptRepoConfig,
++  // Bifrost's webhooks: endpoints that get signed async-job outcomes (webhooks.tov)
++  webhooks?: WebhookEndpoint[],
++  // Bifrost's feature_flags: boot-time overrides of the flags in flags.tov
++  feature_flags?: FeatureFlagsConfig,
++}
++
++// One endpoint. name is unique; id is assigned when the API creates one, and config entries
++// may leave it out (the API then matches them by name). secret is "whsec_" plus base64 of
++// the signing key; config may give it as env.NAME.
++export type WebhookEndpoint = {
++  id?: string,
++  name: string,
++  url: string,
++  events: string[],
++  secret?: string,
++  headers?: Map<string, string>,
++  include_response?: bool,
++  allow_private_network?: bool,
++  disabled?: bool,
++  max_retries?: int,
++  retry_backoff_initial_seconds?: int,
++  retry_backoff_max_seconds?: int,
++  attempt_timeout_seconds?: int,
++  max_response_payload_kbs?: int,
++  created_at?: int,
++  updated_at?: int,
+ }
+ 
+ // The process environment by name. Tov's process.env takes only names written
+@@ -576,6 +606,7 @@ function resolveKey(k: KeyConfig): KeyConfig {
+ 
+ // Replaces every "env.NAME" value in the config with the variable's value.
+ export function resolveConfig(inout c: Config): void {
++  resolveWebhooksAndFlags(&c)
+   const ps = c.providers
+   if (ps !== undefined) {
+     const resolved: Map<string, ProviderConfig> = new Map()
+@@ -660,6 +691,38 @@ export function resolveConfig(inout c: Config): void {
+   }
+ }
+ 
++// Webhook secrets and header values, and feature flag values, may be env.NAME references.
++function resolveWebhooksAndFlags(inout c: Config): void {
++  const wh = c.webhooks
++  if (wh !== undefined) {
++    const out: WebhookEndpoint[] = []
++    for (const w of wh) {
++      let n = w
++      if (n.secret !== undefined) n.secret = resolveEnv(n.secret)
++      const hs = n.headers
++      if (hs !== undefined) {
++        const m: Map<string, string> = new Map()
++        for (const k of hs.keys()) m.set(k, resolveEnv(hs.get(k) ?? ""))
++        n.headers = m
++      }
++      out.push(n)
++    }
++    c.webhooks = out
++  }
++  const ff = c.feature_flags
++  const fl = ff === undefined ? undefined : ff.flags
++  if (fl !== undefined) {
++    const m: Map<string, FlagOverride> = new Map()
++    for (const id of fl.keys()) {
++      const o = fl.get(id)!
++      const v = o.enabled
++      const enabled: bool | string = typeof v === "string" ? resolveEnv(v) : v
++      m.set(id, { enabled: enabled, source: o.source, updated_at: o.updated_at })
++    }
++    c.feature_flags = { flags: m }
++  }
++}
++
+ export function parseConfig(text: string): Config throws SyntaxError {
+   let c = try JSON.parse(text) as Config
+   resolveConfig(&c)
+diff --git a/src/config_compat.tov b/src/config_compat.tov
+index a72f119..dfa4962 100644
+--- a/src/config_compat.tov
++++ b/src/config_compat.tov
+@@ -10,7 +10,7 @@ import { Field, fields, elements, find, rawStr, rawBool, decodeString, build, qu
+ // Raiju's top-level keys (the Config type in config.tov), plus the Bifrost
+ // sections this module reads and the pricing_sync key it writes.
+ function topKeys(): string[] {
+-  return ["encryption_key", "client", "providers", "governance", "cache", "pricing", "prompt_cache", "health", "guardrails", "logs_store", "otel", "mcp", "plugins", "semantic_cache", "vector_store", "secrets", "audit", "alerts", "session_affinity", "complexity_router", "mcp_server", "virtual_mcps", "log_exports", "exporters", "cluster", "oidc", "framework", "auth_config", "alerting", "audit_logs", "cluster_config", "circuit_breaker_config", "load_balancer_config", "pricing_sync", "guardrails_config", "$schema", "auth_proxy", "scim_config"]
++  return ["encryption_key", "client", "providers", "governance", "cache", "pricing", "prompt_cache", "health", "guardrails", "logs_store", "otel", "mcp", "plugins", "semantic_cache", "vector_store", "secrets", "audit", "alerts", "session_affinity", "complexity_router", "mcp_server", "virtual_mcps", "log_exports", "exporters", "cluster", "oidc", "framework", "auth_config", "alerting", "audit_logs", "cluster_config", "circuit_breaker_config", "load_balancer_config", "pricing_sync", "guardrails_config", "$schema", "auth_proxy", "scim_config", "prompt_repo", "webhooks", "feature_flags"]
+ }
+ 
+ // Raiju's keys one level down. client also takes the two keys normalize maps.
+@@ -61,8 +61,6 @@ function noteTable(): Map<string, string> {
+     ["server", "is not used: Raiju takes -host and -port on the command line; read_buffer_size, a2a_* and plugin_download_* have no Raiju counterpart"],
+     ["websocket", "is accepted but not applied: Raiju's WebSocket limits are fixed in src/ws.tov"],
+     ["large_payload_optimization", "is not implemented: Raiju buffers request bodies up to client.max_request_body_size_mb"],
+-    ["feature_flags", "is not implemented: Raiju has no feature-flag registry"],
+-    ["webhooks", GEN],
+     ["agents", "is not implemented: Raiju has no agent gateway (A2A)"],
+     ["config_store", "is not used: Raiju saves its config to the file given by -config"],
+     ["skills_registry", GEN],
+@@ -73,7 +71,7 @@ function noteTable(): Map<string, string> {
+     ["client.retain_content_in_object_storage", "is not used: Raiju has no object storage"],
+     ["client.disable_db_pings_in_health", "is not used: Raiju has no database"],
+     ["client.dump_errors_in_console_logs", GEN],
+-    ["client.webhook_config", GEN],
++    ["client.webhook_config", "is not implemented: Raiju keeps the last 500 deliveries in memory, so there is no retention setting"],
+     ["client.dual_credential_conflict_behavior", GEN],
+     ["client.extra_fields_placement", GEN],
+     ["client.enforce_scim_auth", "is out of scope: SCIM (SCOPE.md)"],
+@@ -880,11 +878,11 @@ function mapCompat(f: Field[], pname: string, inout notes: string[]): void throw
+   ignored(path, cf, ["convert_text_to_chat", "convert_chat_to_responses", "should_drop_params", "should_convert_params", "azure_deepseek", "force_reasoning_only_models_to_responses", "convert_decision_to_responses"], &notes)
+ }
+ 
+-// Bifrost's prompts plugin serves prompts from its config store. Raiju has no prompt library,
+-// so the plugin is noted and not loaded, and each config key is noted too.
++// Bifrost's prompts plugin is Raiju's prompt repository (prompt_repo, prompts.tov), which is always on
++// for chat requests. The plugin's own config keys are not read, and each is noted.
+ function mapPrompts(f: Field[], pname: string, inout notes: string[]): void throws SyntaxError {
+   if (offPlugin(f, pname, &notes)) return
+-  notes.push(`config: plugin "${pname}" is not loaded: Raiju has no prompt library, so stored prompt versions are not added to chat and Responses requests`)
++  notes.push(`config: plugin "${pname}" is not loaded as a plugin: Raiju's prompt repository is always on (prompt_repo) and applies to chat requests only`)
+   for (const k of try members(find(f, "config"))) {
+     notes.push(`config: "plugins[${pname}].config.${k.key}" is not supported by Raiju and is ignored`)
+   }
+@@ -1633,7 +1631,7 @@ test("compat and prompts plugins are noted and not loaded, with each config key
+   expect(r.notes.some((n) => n.startsWith(`config: plugin "compat" is not loaded: Raiju has no text-to-chat`))).toBe(true)
+   expect(r.notes.includes(`config: "plugins[compat].config.convert_text_to_chat" is not supported by Raiju and is ignored`)).toBe(true)
+   expect(r.notes.includes(`config: "plugins[compat].config.should_drop_params" is not supported by Raiju and is ignored`)).toBe(true)
+-  expect(r.notes.some((n) => n.startsWith(`config: plugin "prompts" is not loaded: Raiju has no prompt library`))).toBe(true)
++  expect(r.notes.some((n) => n.startsWith(`config: plugin "prompts" is not loaded as a plugin: Raiju's prompt repository is always on`))).toBe(true)
+   expect(r.notes.includes(`config: "plugins[prompts].config.store_path" is not supported by Raiju and is ignored`)).toBe(true)
+ })
+ 
+diff --git a/src/flags.tov b/src/flags.tov
+new file mode 100644
+index 0000000..bffe228
+--- /dev/null
++++ b/src/flags.tov
+@@ -0,0 +1,111 @@
++// Feature flags (Bifrost's /api/feature-flags and the feature_flags config section).
++//
++// A flag is declared here with its default. Config can set it at boot, and such a value is
++// locked: a PUT answers 409, as Bifrost does for flags set in config.json. A value set through
++// the API is kept in the same section with source "api", and can be changed.
++//
++// Bifrost declares one flag, warp (its in-dashboard agent). Raiju does not build Warp, so no
++// flag here gates a Raiju behaviour yet. flagEnabled() is what a gate would call.
++import { find, rawBool, rawStr, fields, Field } from "./json"
++import { isoMs } from "./exports"
++
++export type FlagDef = { id: string, display_name: string, description: string, default: bool, enterprise_default?: bool, enterprise_only?: bool }
++
++// A flag's value: a boolean, or a string such as "true" (config may give env.NAME, resolved at load).
++// source is "api" for a value set through the API; any other override is from config and locked.
++export type FlagOverride = { enabled: bool | string, source?: string, updated_at?: int }
++
++export type FeatureFlagsConfig = { flags?: Map<string, FlagOverride> }
++
++export type FlagReply = { status: int, body: string, next?: FeatureFlagsConfig }
++
++// Bifrost's code-declared flags. Raiju's builds share the default.
++export const FLAG_DEFS: FlagDef[] = [
++  { id: "warp", display_name: "Warp", description: "Warp, the in-dashboard agent. Raiju does not build it, so the flag gates nothing.", default: true, enterprise_default: false },
++]
++
++// The value a flag's override carries, read as a boolean ("true", "1", "yes" and "on" are true).
++export function overrideValue(v: bool | string): bool {
++  if (typeof v === "string") {
++    const s = v.trim().toLowerCase()
++    return s === "true" || s === "1" || s === "yes" || s === "on"
++  }
++  return v
++}
++
++// Whether a flag is on: its override when config or the API set one, else its default for this build.
++export function flagEnabled(cfg: FeatureFlagsConfig | undefined, id: string, enterprise: bool): bool {
++  const o = overrideOf(cfg, id)
++  if (o !== undefined) return overrideValue(o.enabled)
++  for (const d of FLAG_DEFS) {
++    if (d.id === id) return enterprise && d.enterprise_default !== undefined ? d.enterprise_default : d.default
++  }
++  return false
++}
++
++// The override a config holds for a flag id, if any (no ?.get chains: see config.tov).
++function overrideOf(cfg: FeatureFlagsConfig | undefined, id: string): FlagOverride | undefined {
++  if (cfg === undefined) return undefined
++  const fl = cfg.flags
++  return fl === undefined ? undefined : fl.get(id)
++}
++
++function statusJson(def: FlagDef, o: FlagOverride | undefined): string {
++  const enabled = o === undefined ? (def.default) : overrideValue(o.enabled)
++  const source = o === undefined ? "default" : o.source === "api" ? "api" : "config"
++  const locked = source === "config"
++  const updated = o?.updated_at ?? 0
++  return `{"id":${JSON.stringify(def.id)},"display_name":${JSON.stringify(def.display_name)},"description":${JSON.stringify(def.description)},"default":${def.default},"enabled":${enabled},"source":${JSON.stringify(source)},"locked":${locked},"registered":true,"enterprise_only":${def.enterprise_only === true}${updated > 0 ? `,"updated_at":${JSON.stringify(isoMs(updated))}` : ""}}`
++}
++
++function fail(status: int, message: string): FlagReply {
++  return { status: status, body: JSON.stringify({ error: { message: message, type: "invalid_request_error" } }) }
++}
++
++function defOf(id: string): FlagDef | undefined {
++  for (const d of FLAG_DEFS) {
++    if (d.id === id) return d
++  }
++  return undefined
++}
++
++// Routes /api/feature-flags: GET lists the flags, PUT /{id} sets one through the API.
++export function flagRoute(cfg: FeatureFlagsConfig | undefined, method: string, path: string, body: string): FlagReply {
++  const cur: FeatureFlagsConfig = cfg ?? {}
++  const q = path.indexOf("?")
++  const p = q < 0 ? path : path.slice(0, q)
++  const segs = p.split("/").filter((s) => s !== "")
++  if (segs.length === 2) {
++    if (method !== "GET") return fail(405, `method ${method} is not allowed here`)
++    const items: string[] = []
++    for (const d of FLAG_DEFS) items.push(statusJson(d, overrideOf(cur, d.id)))
++    return { status: 200, body: `{"flags":[${items.join(",")}]}` }
++  }
++  if (segs.length !== 3) return fail(404, "no such route")
++  const id = segs[2] ?? ""
++  const def = defOf(id)
++  if (def === undefined) return fail(404, "Feature flag is not registered")
++  if (method !== "PUT") return fail(405, `method ${method} is not allowed here`)
++  let fs: Field[] = []
++  if (body.startsWith("{")) {
++    try {
++      fs = fields(body)
++    } catch (e) {
++      return fail(400, "Invalid request payload")
++    }
++  }
++  const enabled = rawBool(fs, "enabled")
++  if (enabled === undefined) return fail(400, "Missing required field: enabled")
++  const old = overrideOf(cur, id)
++  if (old !== undefined && old.source !== "api") return fail(409, "Feature flag is locked by config.json")
++  const next: Map<string, FlagOverride> = new Map()
++  const prior = cur.flags
++  if (prior !== undefined) {
++    for (const k of prior.keys()) next.set(k, prior.get(k)!)
++  }
++  const now = Math.floor(Date.now())
++  const set: FlagOverride = { enabled: enabled, source: "api", updated_at: now }
++  next.set(id, set)
++  const saved: FeatureFlagsConfig = { flags: next }
++  return { status: 200, body: statusJson(def, set), next: saved }
++}
+diff --git a/src/gateway.tov b/src/gateway.tov
+index 7cd1630..36de37c 100644
+--- a/src/gateway.tov
++++ b/src/gateway.tov
+@@ -1,6 +1,7 @@
+ // The request engine: governance, cache, the attempt loop (retries, key
+ // rotation, fallbacks), translation, accounting.
+ import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, providerOf } from "./config"
++import { applyPrompt } from "./prompts"
+ import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
+ import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
+ import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
+@@ -1931,6 +1932,16 @@ export class Engine {
+       }
+       text = try this.withMcpTools(text, snapshot(req.headers))
+       body = fields(text)
++      // the prompt named by x-bf-prompt-id goes before the messages (prompts.tov)
++      const ph = snapshot(req.headers)
++      if (ph.get("x-bf-prompt-id") !== undefined) {
++        const vk = this.gov.findKey(ph)
++        const applied = try applyPrompt(this.cfg.prompt_repo, ph, text, { budgetPercent: this.gov.budgetFraction(vk) * 100.0, tokensPercent: this.gov.rateFraction(vk, "token") * 100.0, requestsPercent: this.gov.rateFraction(vk, "request") * 100.0 })
++        if (applied.prompt_id !== undefined) {
++          text = applied.text
++          body = try fields(text)
++        }
++      }
+       // a key's access profile may cap max_tokens
+       const cap = this.gov.policyFor(snapshot(req.headers))?.maxTokens
+       if (cap !== undefined) {
+diff --git a/src/notify.tov b/src/notify.tov
+new file mode 100644
+index 0000000..5d20b19
+--- /dev/null
++++ b/src/notify.tov
+@@ -0,0 +1,164 @@
++// In-app notifications (Bifrost's /api/notifications): short notices for the dashboard about
++// alerts firing or resolving, budgets that are used up, and configuration changes.
++//
++// The dashboard keeps what was read or dismissed, as Bifrost does; the gateway holds only the
++// list. The list lives in memory: the newest 500 notices, each kept 30 days, and each worker
++// process has its own. Audience is always all, since Raiju has no per-role notices. Bifrost's
++// POST /api/notifications publishes one by hand, and it is refused unless the caller may
++// change the configuration (the management route gate).
++import { Field, fields, rawStr } from "./json"
++import { newId } from "./schemas"
++import { isoMs } from "./exports"
++
++export type Notice = {
++  id: string,
++  audience: string,
++  severity: string,
++  title: string,
++  message: string,
++  action_label?: string,
++  action_path?: string,
++  created_at: int,
++  expires_at: int,
++}
++
++// What a publisher gives: the text and, optionally, a link for the dashboard to show.
++export type NoticeInput = { severity: string, title: string, message: string, action_label?: string, action_path?: string }
++
++const RETENTION_MS = 30 * 24 * 3600 * 1000
++const CAP = 500
++const SEVERITIES = ["info", "success", "warning", "error"]
++
++export class NoticeList {
++  items: Notice[] = []
++  // when each key was last published, for once()
++  seen: Map<string, int> = new Map()
++
++  add(input: NoticeInput, now: int): Notice {
++    const n: Notice = { id: newId("nt_"), audience: "all", severity: input.severity, title: input.title, message: input.message, action_label: input.action_label, action_path: input.action_path, created_at: now, expires_at: now + RETENTION_MS }
++    this.items.push(n)
++    this.prune(now)
++    return n
++  }
++
++  // Drops the expired notices, then the oldest beyond the cap.
++  prune(now: int): void {
++    this.items = this.items.filter((x) => x.expires_at > now)
++    if (this.items.length > CAP) this.items = this.items.slice(this.items.length - CAP)
++  }
++
++  // Publishes unless the same key was published less than window ms ago (a check that runs on every
++  // tick would otherwise repeat a budget notice every tick).
++  once(key: string, window: int, input: NoticeInput, now: int): void {
++    const last = this.seen.get(key)
++    if (last !== undefined && now - last < window) return
++    this.seen.set(key, now)
++    this.add(input, now)
++  }
++
++  // One page, newest first. cursor is the offset the previous page ended at ("" for the first).
++  page(limit: int, cursor: int): { items: Notice[], next: int } {
++    const newest: Notice[] = this.items.slice().reverse()
++    const out = newest.slice(cursor, cursor + limit)
++    const next = cursor + out.length
++    return { items: out, next: next < newest.length ? next : -1 }
++  }
++}
++
++let listInstance: NoticeList | undefined = undefined
++
++// The process's notice list (created on first use: top-level statements in imported modules do not run).
++export function noticeList(): NoticeList {
++  let l = listInstance
++  if (l === undefined) {
++    l = new NoticeList()
++    listInstance = l
++  }
++  return l
++}
++
++// Publishes a notice now.
++export function notify(input: NoticeInput): void {
++  noticeList().add(input, Math.floor(Date.now()))
++}
++
++// Publishes a notice unless its key was published within the window.
++export function notifyOnce(key: string, windowMs: int, input: NoticeInput): void {
++  noticeList().once(key, windowMs, input, Math.floor(Date.now()))
++}
++
++function noticeJson(n: Notice): string {
++  const parts = [`"id":${JSON.stringify(n.id)}`, `"audience":${JSON.stringify(n.audience)}`, `"severity":${JSON.stringify(n.severity)}`, `"title":${JSON.stringify(n.title)}`, `"message":${JSON.stringify(n.message)}`]
++  if (n.action_label !== undefined && n.action_label !== "") parts.push(`"action_label":${JSON.stringify(n.action_label)}`)
++  if (n.action_path !== undefined && n.action_path !== "") parts.push(`"action_path":${JSON.stringify(n.action_path)}`)
++  parts.push(`"created_at":${JSON.stringify(isoMs(n.created_at))}`)
++  parts.push(`"expires_at":${JSON.stringify(isoMs(n.expires_at))}`)
++  return "{" + parts.join(",") + "}"
++}
++
++// The fields of a JSON object body, or undefined when it is not one.
++function objectFieldsOf(body: string): Field[] | undefined {
++  if (!body.startsWith("{")) return undefined
++  try {
++    return fields(body)
++  } catch (e) {
++    return undefined
++  }
++}
++
++function textOf(fs: Field[], key: string): string | undefined {
++  return rawStr(fs, key)
++}
++
++function fail(status: int, message: string): { status: int, body: string } {
++  return { status: status, body: JSON.stringify({ error: { message: message, type: "invalid_request_error" } }) }
++}
++
++// Parses the query's limit and cursor. limit is 1 to 50, default 50.
++function pageParams(query: string): { limit: int, cursor: int, error: string } {
++  const sp = new URLSearchParams(query)
++  const rawLimit = sp.get("limit") ?? ""
++  let limit = 50
++  if (rawLimit !== "") {
++    const n = parseInt(rawLimit)
++    if (n === undefined || n < 1) return { limit: 0, cursor: 0, error: "limit must be a positive integer" }
++    limit = Math.min(n, 50)
++  }
++  const rawCursor = sp.get("cursor") ?? ""
++  let cursor = 0
++  if (rawCursor !== "") {
++    const c = parseInt(rawCursor)
++    if (c === undefined || c < 0) return { limit: 0, cursor: 0, error: "cursor is not valid" }
++    cursor = c
++  }
++  return { limit: limit, cursor: cursor, error: "" }
++}
++
++// Routes /api/notifications: GET lists the notices, POST publishes one.
++export function notifyRoute(method: string, path: string, body: string): { status: int, body: string } {
++  const q = path.indexOf("?")
++  const query = q < 0 ? "" : path.slice(q + 1)
++  if (method === "GET") {
++    const pp = pageParams(query)
++    if (pp.error !== "") return fail(400, pp.error)
++    const page = noticeList().page(pp.limit, pp.cursor)
++    const items: string[] = []
++    for (const n of page.items) items.push(noticeJson(n))
++    const cursor = page.next < 0 ? "" : `,"next_cursor":"${page.next}"`
++    return { status: 200, body: `{"notifications":[${items.join(",")}]${cursor}}` }
++  }
++  if (method !== "POST") return fail(405, `method ${method} is not allowed here`)
++  const fs = objectFieldsOf(body)
++  if (fs === undefined) return fail(400, "invalid request payload")
++  const sev = textOf(fs, "severity")
++  const title = textOf(fs, "title")
++  const message = textOf(fs, "message")
++  if (sev === undefined || !SEVERITIES.includes(sev)) return fail(400, "severity must be info, success, warning or error")
++  if (title === undefined || title === "" || title.byteLength > 160) return fail(400, "title is required and at most 160 bytes")
++  if (message === undefined || message === "") return fail(400, "message is required")
++  const audience = textOf(fs, "audience") ?? "all"
++  if (audience !== "all") return fail(400, "audience must be all: Raiju has no per-role notices")
++  const input: NoticeInput = { severity: sev, title: title, message: message, action_label: textOf(fs, "action_label"), action_path: textOf(fs, "action_path") }
++  const made = noticeList().add(input, Math.floor(Date.now()))
++  return { status: 201, body: noticeJson(made) }
++}
+diff --git a/src/ops.tov b/src/ops.tov
+index fde8070..3bce3fb 100644
+--- a/src/ops.tov
++++ b/src/ops.tov
+@@ -19,6 +19,7 @@ import { ExposedTool, SessionStore, handleMcp } from "./mcpserver"
+ import * as vmcp from "./vmcp"
+ import { handleProfiles } from "./profiles"
+ import { ExportQueue } from "./exporters"
++import { notify, notifyOnce } from "./notify"
+ import * as exporters from "./exporters"
+ import { resolveAll } from "./secrets"
+ import { Field, fields, find, rawStr, isNull, elements } from "./json"
+@@ -1313,6 +1314,10 @@ export class Ops {
+   }
+ 
+   tick(eng: AlertEngine): void {
++    // a budget that is used up is noticed once an hour until it resets (notify.tov)
++    for (const b of this.engine.gov.budgetUsage()) {
++      if (b.limit > 0 && b.used >= b.limit) notifyOnce("budget:" + b.id, 3600000, { severity: "warning", title: "Budget used up", message: `Budget ${b.id} is used up until it resets.` })
++    }
+     const ring = this.engine.samples
+     if (ring === undefined) return
+     const now = Date.now()
+@@ -1326,6 +1331,7 @@ export class Ops {
+     for (const n of notes) {
+       const r = alerts.request(n)
+       sendAlert(r.url, r.headers, r.body, n.ruleId)
++      notify({ severity: n.kind === "firing" ? "warning" : "success", title: `Alert ${n.ruleId} ${n.kind}`, message: `Alert rule ${n.ruleId} is ${n.kind}.` })
+     }
+     const ce = this.cel
+     if (ce !== undefined) {
+@@ -1337,6 +1343,7 @@ export class Ops {
+       for (const n of ce.evaluate(scopes, now)) {
+         const r = alerts.request(n)
+         sendAlert(r.url, r.headers, r.body, n.ruleId)
++        notify({ severity: n.kind === "firing" ? "warning" : "success", title: `Alert ${n.ruleId} ${n.kind}`, message: `Alert rule ${n.ruleId} is ${n.kind}.` })
+       }
+     }
+   }
+diff --git a/src/prompts.tov b/src/prompts.tov
+new file mode 100644
+index 0000000..7857778
+--- /dev/null
++++ b/src/prompts.tov
+@@ -0,0 +1,709 @@
++// The prompt repository (Bifrost's /api/prompt-repo/*) and the prompts plugin's injection.
++//
++// A prompt has committed versions. Each version is immutable, numbered from 1, and holds
++// chat messages, model parameters and the names of its {{variables}}. A chat request names
++// a prompt with x-bf-prompt-id and may name a version with x-bf-prompt-version: the
++// version's messages go before the request's messages, and its model parameters fill in
++// what the request leaves out. Without a version the latest one is used.
++//
++// Deployments (Bifrost's enterprise prompt deployments) choose the version on the server: a
++// CEL expression over the request, then a weighted split across version numbers. Deployments
++// of the prompt are tried newest first, the first match wins, and it overrides the header.
++//
++// Raiju extension: variable values come from x-bf-prompt-var-<name> headers. Bifrost fills
++// its variables in the playground rather than at the gateway. A variable with no value
++// renders as "", as Jinja does by default.
++//
++// Messages are text only: a stored message is {role, content}. Other message fields (name,
++// tool calls) are not kept, and the prompt repository has no folders or sessions.
++import { compile, evaluate, Activation } from "./cel"
++import { Field, fields, elements, find, rawStr, rawNum, rawBool, build, setField, decodeString } from "./json"
++import { Hdrs, newId } from "./schemas"
++import { isoMs } from "./exports"
++
++// One chat message of a version.
++export type PromptMessage = { role: string, content: string }
++
++export type PromptVersion = {
++  id: string,
++  version_number: int,
++  commit_message?: string,
++  messages: PromptMessage[],
++  // the version's model parameters as JSON object text (defaults under the request's own)
++  model_params?: string,
++  provider?: string,
++  model?: string,
++  // the variable names: those given at commit and those the messages use
++  variables?: string[],
++  created_at: int,
++}
++
++export type Prompt = { id: string, name: string, created_at: int, updated_at: int, versions?: PromptVersion[] }
++
++// A version number as a string (Bifrost's shape) and its share of the traffic, in percent.
++export type TrafficShare = { version: string, percentage: int }
++
++export type Deployment = {
++  id: string,
++  prompt_id: string,
++  name: string,
++  description?: string,
++  // a CEL expression over the request (model, provider, request_type, headers, params, usage); empty matches all
++  cel_expression?: string,
++  traffic_distribution?: TrafficShare[],
++  created_at: int,
++  updated_at: int,
++}
++
++export type PromptRepoConfig = { prompts?: Prompt[], deployments?: Deployment[] }
++
++// A route's answer. next is the repository to save when the route changed it.
++export type PromptReply = { status: int, body: string, next?: PromptRepoConfig }
++
++const VAR_PREFIX = "x-bf-prompt-var-"
++const ROLES_NOTE = "a message needs a role and text content"
++
++function reply(status: int, body: string): PromptReply {
++  return { status: status, body: body }
++}
++
++function fail(status: int, message: string): PromptReply {
++  return reply(status, JSON.stringify({ error: { message: message, type: "invalid_request_error" } }))
++}
++
++function notAllowed(m: string): PromptReply {
++  return fail(405, `method ${m} is not allowed here`)
++}
++
++// The fields of a JSON object given as text, or undefined when it is not one.
++function objectFields(text: string): Field[] | undefined {
++  if (!text.startsWith("{")) return undefined
++  try {
++    return fields(text)
++  } catch (e) {
++    return undefined
++  }
++}
++
++// A parameter's value as text: strings unquoted, everything else as written.
++function plain(raw: string): string {
++  if (!raw.startsWith("\"")) return raw
++  try {
++    return decodeString(raw)
++  } catch (e) {
++    return raw
++  }
++}
++
++// The index of s in text at or after from, or -1 (indexOf takes no start in Tov).
++function indexFrom(text: string, s: string, from: int): int {
++  const r = text.slice(from).indexOf(s)
++  return r < 0 ? -1 : r + from
++}
++
++// The {{name}} placeholders in a text, in order (names trimmed; repeats kept).
++function placeholders(text: string): string[] {
++  const out: string[] = []
++  let i = 0
++  while (true) {
++    const open = indexFrom(text, "{{", i)
++    if (open < 0) break
++    const close = indexFrom(text, "}}", open + 2)
++    if (close < 0) break
++    out.push(text.slice(open + 2, close).trim())
++    i = close + 2
++  }
++  return out
++}
++
++// The text with each {{name}} replaced by its value (or "" when it has none).
++export function renderTemplate(text: string, vars: Map<string, string>): string {
++  let out = ""
++  let i = 0
++  while (true) {
++    const open = indexFrom(text, "{{", i)
++    if (open < 0) break
++    const close = indexFrom(text, "}}", open + 2)
++    if (close < 0) break
++    out += text.slice(i, open)
++    out += vars.get(text.slice(open + 2, close).trim()) ?? ""
++    i = close + 2
++  }
++  return out + text.slice(i)
++}
++
++// The variable values a request carries in x-bf-prompt-var-<name> headers.
++export function variablesOf(h: Hdrs): Map<string, string> {
++  const out: Map<string, string> = new Map()
++  for (const k of h.keys()) {
++    if (k.startsWith(VAR_PREFIX)) out.set(k.slice(VAR_PREFIX.byteLength), h.get(k) ?? "")
++  }
++  return out
++}
++
++// The messages of a JSON array of {role, content} objects, or why they are not valid.
++function messagesOf(raw: string | undefined): { msgs: PromptMessage[], error: string } {
++  const out: PromptMessage[] = []
++  if (raw === undefined || !raw.startsWith("[")) return { msgs: out, error: "messages must be an array" }
++  let els: string[] = []
++  try {
++    els = elements(raw)
++  } catch (e) {
++    return { msgs: out, error: "messages must be an array" }
++  }
++  for (const el of els) {
++    const f = objectFields(el)
++    if (f === undefined) return { msgs: out, error: ROLES_NOTE }
++    const role = rawStr(f, "role")
++    const content = rawStr(f, "content")
++    if (role === undefined || role === "" || content === undefined) return { msgs: out, error: ROLES_NOTE }
++    out.push({ role: role, content: content })
++  }
++  if (out.length === 0) return { msgs: out, error: "a version needs at least one message" }
++  return { msgs: out, error: "" }
++}
++
++// Every variable a version uses: the names given at commit, then any placeholder in its messages.
++function variableNames(given: string[], msgs: PromptMessage[]): string[] {
++  const out: string[] = []
++  for (const n of given) {
++    if (!out.includes(n)) out.push(n)
++  }
++  for (const m of msgs) {
++    for (const n of placeholders(m.content)) {
++      if (n !== "" && !out.includes(n)) out.push(n)
++    }
++  }
++  return out
++}
++
++// The version view of Bifrost's /api/prompt-repo responses.
++function versionJson(v: PromptVersion, promptId: string, latest: boolean): string {
++  const msgs = JSON.stringify(v.messages)
++  const names = JSON.stringify(v.variables ?? [])
++  return `{"id":${JSON.stringify(v.id)},"prompt_id":${JSON.stringify(promptId)},"version_number":${v.version_number},"commit_message":${JSON.stringify(v.commit_message ?? "")},"messages":${msgs},"model_params":${v.model_params ?? "{}"},"provider":${JSON.stringify(v.provider ?? "")},"model":${JSON.stringify(v.model ?? "")},"variables":${names},"is_latest":${latest},"created_at":${JSON.stringify(isoMs(v.created_at))}}`
++}
++
++// The newest version of a prompt (the highest number), if it has any.
++function latestOf(p: Prompt): PromptVersion | undefined {
++  let best: PromptVersion | undefined = undefined
++  for (const v of p.versions ?? []) {
++    if (best === undefined || v.version_number > best.version_number) best = v
++  }
++  return best
++}
++
++function promptJson(p: Prompt): string {
++  const latest = latestOf(p)
++  const lv = latest === undefined ? "null" : versionJson(latest, p.id, true)
++  return `{"id":${JSON.stringify(p.id)},"name":${JSON.stringify(p.name)},"created_at":${JSON.stringify(isoMs(p.created_at))},"updated_at":${JSON.stringify(isoMs(p.updated_at))},"version_count":${(p.versions ?? []).length},"latest_version":${lv}}`
++}
++
++function deploymentJson(d: Deployment): string {
++  const dist = JSON.stringify(d.traffic_distribution ?? [])
++  return `{"id":${JSON.stringify(d.id)},"prompt_id":${JSON.stringify(d.prompt_id)},"name":${JSON.stringify(d.name)},"description":${JSON.stringify(d.description ?? "")},"cel_expression":${JSON.stringify(d.cel_expression ?? "")},"traffic_distribution":${dist},"created_at":${JSON.stringify(isoMs(d.created_at))},"updated_at":${JSON.stringify(isoMs(d.updated_at))}}`
++}
++
++function promptIndex(list: Prompt[], id: string): int {
++  for (let i = 0; i < list.length; i++) {
++    if (list[i]!.id === id) return i
++  }
++  return -1
++}
++
++function deploymentIndex(list: Deployment[], id: string): int {
++  for (let i = 0; i < list.length; i++) {
++    if (list[i]!.id === id) return i
++  }
++  return -1
++}
++
++// The parsed body of a request, or undefined when it is not a JSON object.
++function bodyOf(body: string): Field[] | undefined {
++  return objectFields(body)
++}
++
++// A string from a field that may hold a string or a number (version numbers are strings in Bifrost).
++function textOrNum(fs: Field[], key: string): string | undefined {
++  const s = rawStr(fs, key)
++  if (s !== undefined) return s
++  const n = rawNum(fs, key)
++  return n === undefined ? undefined : "" + n
++}
++
++// The traffic distribution of a body, or why it is not valid.
++function distributionOf(raw: string | undefined): { dist: TrafficShare[], error: string } {
++  const out: TrafficShare[] = []
++  if (raw === undefined || raw === "null") return { dist: out, error: "" }
++  if (!raw.startsWith("[")) return { dist: out, error: "traffic_distribution must be an array" }
++  let els: string[] = []
++  try {
++    els = elements(raw)
++  } catch (e) {
++    return { dist: out, error: "traffic_distribution must be an array" }
++  }
++  for (const el of els) {
++    const f = objectFields(el)
++    if (f === undefined) return { dist: out, error: "each traffic_distribution entry needs a version and a percentage" }
++    const v = textOrNum(f, "version")
++    const p = rawNum(f, "percentage")
++    if (v === undefined || p === undefined) return { dist: out, error: "each traffic_distribution entry needs a version and a percentage" }
++    if (p % 1.0 !== 0.0 || p < 0.0 || p > 100.0) return { dist: out, error: "traffic distribution percentage must be between 0 and 100" }
++    out.push({ version: v, percentage: Math.round(p) })
++  }
++  return { dist: out, error: "" }
++}
++
++// The first problem with a deployment's name, expression or split, or "" when it is fine.
++function deploymentProblem(repo: PromptRepoConfig, prompt: Prompt, name: string, expr: string, dist: TrafficShare[], ownId: string | undefined): { status: int, message: string } | undefined {
++  for (const d of repo.deployments ?? []) {
++    if (d.name === name && d.id !== ownId) return { status: 409, message: "a deployment with that name already exists" }
++  }
++  const e = expr.trim()
++  if (e !== "" && e !== "true") {
++    try {
++      compile(e)
++    } catch (err) {
++      return { status: 400, message: `CEL compile error: ${err.message}` }
++    }
++  }
++  if (dist.length === 0) return undefined
++  const seen: string[] = []
++  let total = 0
++  for (const s of dist) {
++    if (seen.includes(s.version)) return { status: 400, message: `version ${s.version} appears more than once` }
++    seen.push(s.version)
++    const n = parseInt(s.version)
++    if (n === undefined || versionByNumber(prompt, n) === undefined) return { status: 400, message: `version ${s.version} is not a version of this prompt` }
++    total += s.percentage
++  }
++  if (total !== 100) return { status: 400, message: "traffic distribution percentages must sum to 100" }
++  return undefined
++}
++
++function versionByNumber(p: Prompt, n: int): PromptVersion | undefined {
++  for (const v of p.versions ?? []) {
++    if (v.version_number === n) return v
++  }
++  return undefined
++}
++
++// Routes one request under /api/prompt-repo/. path is the request's path and query.
++export function promptRoute(cfg: PromptRepoConfig | undefined, method: string, path: string, body: string): PromptReply {
++  const repo: PromptRepoConfig = cfg ?? {}
++  const q = path.indexOf("?")
++  const p = q < 0 ? path : path.slice(0, q)
++  const query = q < 0 ? "" : path.slice(q + 1)
++  const segs = p.split("/").filter((s) => s !== "")
++  // segs: api, prompt-repo, <area>, ...
++  const area = segs[2] ?? ""
++  if (area === "prompts") return promptsRoute(repo, method, segs, body)
++  if (area === "versions") return versionsRoute(repo, method, segs)
++  if (area === "deployments") return deploymentsRoute(repo, method, segs, body, query)
++  if (area === "folders" || area === "sessions") return fail(404, `Raiju's prompt repository has no ${area}`)
++  return fail(404, `no such route ${p}`)
++}
++
++function promptsRoute(repo: PromptRepoConfig, method: string, segs: string[], body: string): PromptReply {
++  const prompts = repo.prompts ?? []
++  if (segs.length === 3) {
++    if (method === "GET") {
++      const items: string[] = []
++      for (const pr of prompts) items.push(promptJson(pr))
++      return reply(200, `{"prompts":[${items.join(",")}],"total":${items.length}}`)
++    }
++    if (method !== "POST") return notAllowed(method)
++    const fs = bodyOf(body)
++    if (fs === undefined) return fail(400, "invalid request body")
++    const name = rawStr(fs, "name") ?? ""
++    if (name === "") return fail(400, "name is required")
++    const now = Date.now()
++    const made: Prompt = { id: newId("pr_"), name: name, created_at: Math.floor(now), updated_at: Math.floor(now), versions: [] }
++    const next: PromptRepoConfig = { prompts: prompts.concat([made]), deployments: repo.deployments ?? [] }
++    return { status: 200, body: `{"prompt":${promptJson(made)}}`, next: next }
++  }
++  const id = segs[3] ?? ""
++  const i = promptIndex(prompts, id)
++  if (i < 0) return fail(404, "prompt not found")
++  const old = prompts[i]!
++  if (segs.length === 4) {
++    if (method === "GET") return reply(200, `{"prompt":${promptJson(old)}}`)
++    if (method === "PUT") {
++      const fs = bodyOf(body)
++      if (fs === undefined) return fail(400, "invalid request body")
++      const name = rawStr(fs, "name") ?? old.name
++      if (name === "") return fail(400, "name is required")
++      const renamed: Prompt = { id: old.id, name: name, created_at: old.created_at, updated_at: Math.floor(Date.now()), versions: old.versions ?? [] }
++      const list = prompts.slice()
++      list[i] = renamed
++      return { status: 200, body: `{"prompt":${promptJson(renamed)}}`, next: { prompts: list, deployments: repo.deployments ?? [] } }
++    }
++    if (method === "DELETE") {
++      const list = prompts.filter((x) => x.id !== id)
++      const deps = (repo.deployments ?? []).filter((d) => d.prompt_id !== id)
++      return { status: 200, body: `{"message":"prompt deleted"}`, next: { prompts: list, deployments: deps } }
++    }
++    return notAllowed(method)
++  }
++  if (segs.length === 5 && segs[4] === "versions") {
++    if (method === "GET") {
++      const items: string[] = []
++      const latest = latestOf(old)
++      for (const v of old.versions ?? []) items.push(versionJson(v, id, latest !== undefined && latest.id === v.id))
++      return reply(200, `{"versions":[${items.join(",")}],"total":${items.length}}`)
++    }
++    if (method !== "POST") return notAllowed(method)
++    const fs = bodyOf(body)
++    if (fs === undefined) return fail(400, "invalid request body")
++    const got = messagesOf(find(fs, "messages"))
++    if (got.error !== "") return fail(400, got.error)
++    const paramsRaw = find(fs, "model_params")
++    let params: string | undefined = undefined
++    if (paramsRaw !== undefined && paramsRaw !== "null") {
++      if (!paramsRaw.startsWith("{")) return fail(400, "model_params must be an object")
++      params = paramsRaw
++    }
++    const given: string[] = []
++    const varsRaw = find(fs, "variables")
++    if (varsRaw !== undefined && varsRaw.startsWith("{")) {
++      for (const f of objectFields(varsRaw) ?? []) given.push(f.key)
++    }
++    const now = Math.floor(Date.now())
++    let top = 0
++    for (const v of old.versions ?? []) {
++      if (v.version_number > top) top = v.version_number
++    }
++    const made: PromptVersion = {
++      id: newId("pv_"),
++      version_number: top + 1,
++      commit_message: rawStr(fs, "commit_message") ?? "",
++      messages: got.msgs,
++      model_params: params,
++      provider: rawStr(fs, "provider") ?? "",
++      model: rawStr(fs, "model") ?? "",
++      variables: variableNames(given, got.msgs),
++      created_at: now,
++    }
++    const renamed: Prompt = { id: old.id, name: old.name, created_at: old.created_at, updated_at: now, versions: (old.versions ?? []).concat([made]) }
++    const list = prompts.slice()
++    list[i] = renamed
++    return { status: 200, body: `{"version":${versionJson(made, id, true)}}`, next: { prompts: list, deployments: repo.deployments ?? [] } }
++  }
++  return fail(404, "no such route")
++}
++
++function versionsRoute(repo: PromptRepoConfig, method: string, segs: string[]): PromptReply {
++  if (segs.length !== 4) return fail(404, "no such route")
++  const id = segs[3] ?? ""
++  const prompts = repo.prompts ?? []
++  for (let i = 0; i < prompts.length; i++) {
++    const p = prompts[i]!
++    for (const v of p.versions ?? []) {
++      if (v.id !== id) continue
++      if (method === "GET") {
++        const latest = latestOf(p)
++        return reply(200, `{"version":${versionJson(v, p.id, latest !== undefined && latest.id === v.id)}}`)
++      }
++      if (method !== "DELETE") return notAllowed(method)
++      for (const d of repo.deployments ?? []) {
++        for (const s of d.traffic_distribution ?? []) {
++          if (s.version === "" + v.version_number && d.prompt_id === p.id) return fail(409, `version ${v.version_number} is used by deployment ${d.name}`)
++        }
++      }
++      const kept = (p.versions ?? []).filter((x) => x.id !== id)
++      const list = prompts.slice()
++      list[i] = { id: p.id, name: p.name, created_at: p.created_at, updated_at: Math.floor(Date.now()), versions: kept }
++      return { status: 200, body: `{"message":"version deleted"}`, next: { prompts: list, deployments: repo.deployments ?? [] } }
++    }
++  }
++  return fail(404, "version not found")
++}
++
++function deploymentsRoute(repo: PromptRepoConfig, method: string, segs: string[], body: string, query: string): PromptReply {
++  const deps = repo.deployments ?? []
++  const prompts = repo.prompts ?? []
++  if (segs.length === 3) {
++    if (method === "GET") {
++      const want = new URLSearchParams(query).get("prompt_id") ?? ""
++      const items: string[] = []
++      for (const d of deps) {
++        if (want === "" || d.prompt_id === want) items.push(deploymentJson(d))
++      }
++      return reply(200, `{"deployments":[${items.join(",")}],"total":${items.length}}`)
++    }
++    if (method !== "POST") return notAllowed(method)
++    const fs = bodyOf(body)
++    if (fs === undefined) return fail(400, "invalid request body")
++    const pid = rawStr(fs, "prompt_id") ?? ""
++    const name = rawStr(fs, "name") ?? ""
++    if (pid === "") return fail(400, "prompt_id is required")
++    if (name === "") return fail(400, "name is required")
++    const pi = promptIndex(prompts, pid)
++    if (pi < 0) return fail(404, "prompt not found")
++    const expr = rawStr(fs, "cel_expression") ?? ""
++    const got = distributionOf(find(fs, "traffic_distribution"))
++    if (got.error !== "") return fail(400, got.error)
++    const bad = deploymentProblem(repo, prompts[pi]!, name, expr, got.dist, undefined)
++    if (bad !== undefined) return fail(bad.status, bad.message)
++    const now = Math.floor(Date.now())
++    const made: Deployment = { id: newId("pd_"), prompt_id: pid, name: name, description: rawStr(fs, "description") ?? "", cel_expression: expr, traffic_distribution: got.dist, created_at: now, updated_at: now }
++    return { status: 201, body: deploymentJson(made), next: { prompts: prompts, deployments: deps.concat([made]) } }
++  }
++  const id = segs[3] ?? ""
++  const i = deploymentIndex(deps, id)
++  if (i < 0) return fail(404, "deployment not found")
++  const old = deps[i]!
++  if (segs.length !== 4) return fail(404, "no such route")
++  if (method === "GET") return reply(200, deploymentJson(old))
++  if (method === "DELETE") {
++    const kept = deps.filter((d) => d.id !== id)
++    return { status: 200, body: `{"message":"deployment deleted"}`, next: { prompts: prompts, deployments: kept } }
++  }
++  if (method !== "PUT") return notAllowed(method)
++  const fs = bodyOf(body)
++  if (fs === undefined) return fail(400, "invalid request body")
++  const name = rawStr(fs, "name") ?? old.name
++  if (name === "") return fail(400, "name is required")
++  const expr = rawStr(fs, "cel_expression") ?? old.cel_expression ?? ""
++  let dist = old.traffic_distribution ?? []
++  const distRaw = find(fs, "traffic_distribution")
++  if (distRaw !== undefined) {
++    const got = distributionOf(distRaw)
++    if (got.error !== "") return fail(400, got.error)
++    dist = got.dist
++  }
++  const pi = promptIndex(prompts, old.prompt_id)
++  if (pi < 0) return fail(404, "prompt not found")
++  const bad = deploymentProblem(repo, prompts[pi]!, name, expr, dist, id)
++  if (bad !== undefined) return fail(bad.status, bad.message)
++  const updated: Deployment = { id: old.id, prompt_id: old.prompt_id, name: name, description: rawStr(fs, "description") ?? old.description ?? "", cel_expression: expr, traffic_distribution: dist, created_at: old.created_at, updated_at: Math.floor(Date.now()) }
++  const list = deps.slice()
++  list[i] = updated
++  return { status: 200, body: deploymentJson(updated), next: { prompts: prompts, deployments: list } }
++}
++
++// Whether a deployment's expression matches the request. An empty expression, or "true", matches.
++function matches(expr: string, act: Activation): bool {
++  const e = expr.trim()
++  if (e === "" || e === "true") return true
++  try {
++    return evaluate(compile(e), act) === true
++  } catch (err) {
++    return false
++  }
++}
++
++// The version a traffic split draws for a roll in [0, 1), or undefined when no entry names one.
++function drawVersion(p: Prompt, dist: TrafficShare[], roll: f64): PromptVersion | undefined {
++  let total = 0
++  for (const s of dist) {
++    if (s.percentage > 0) total += s.percentage
++  }
++  if (total <= 0) return undefined
++  const at = roll * total
++  let acc = 0
++  for (const s of dist) {
++    if (s.percentage <= 0) continue
++    acc += s.percentage
++    if (at < acc) return versionByNumber(p, parseInt(s.version) ?? -1)
++  }
++  return undefined
++}
++
++// The request facts a deployment's expression sees.
++export type PromptUsage = { budgetPercent: f64, tokensPercent: f64, requestsPercent: f64 }
++
++// The version a request gets: a matching deployment's draw first, then the x-bf-prompt-version
++// pin, then the latest. undefined when the prompt does not exist or has no version.
++export function resolveVersion(repo: PromptRepoConfig, promptId: string, act: Activation, pinned: int | undefined, roll: f64): { prompt: Prompt, version: PromptVersion } | undefined {
++  const prompts = repo.prompts ?? []
++  const pi = promptIndex(prompts, promptId)
++  if (pi < 0) return undefined
++  const prompt = prompts[pi]!
++  const deps = (repo.deployments ?? []).filter((d) => d.prompt_id === promptId)
++  deps.sort((a, b) => b.created_at - a.created_at)
++  for (const d of deps) {
++    const dist = d.traffic_distribution ?? []
++    if (dist.length === 0) continue
++    if (!matches(d.cel_expression ?? "", act)) continue
++    const v = drawVersion(prompt, dist, roll)
++    if (v !== undefined) return { prompt: prompt, version: v }
++  }
++  if (pinned !== undefined) {
++    const v = versionByNumber(prompt, pinned)
++    if (v !== undefined) return { prompt: prompt, version: v }
++  }
++  const latest = latestOf(prompt)
++  return latest === undefined ? undefined : { prompt: prompt, version: latest }
++}
++
++// The request body with the version's messages before its own and its parameters where the
++// request leaves them out. The messages are rendered with the variable values.
++export function injectVersion(text: string, version: PromptVersion, vars: Map<string, string>): string throws SyntaxError {
++  let fs = try fields(text)
++  const tmpl: string[] = []
++  for (const m of version.messages) {
++    tmpl.push(JSON.stringify({ role: m.role, content: renderTemplate(m.content, vars) }))
++  }
++  const cur = find(fs, "messages")
++  let old: string[] = []
++  if (cur !== undefined && cur.startsWith("[")) old = try elements(cur)
++  setField(&fs, "messages", "[" + tmpl.concat(old).join(",") + "]")
++  const pm = version.model_params
++  if (pm !== undefined && pm !== "") {
++    for (const f of try fields(pm)) {
++      if (find(fs, f.key) === undefined) setField(&fs, f.key, f.raw)
++    }
++  }
++  return build(fs)
++}
++
++// What the gateway learns from applying a prompt: the request body to use, and the prompt and
++// version that were applied (empty when none was).
++export type Applied = { text: string, prompt_id?: string, prompt_name?: string, version?: int }
++
++// Applies the prompt a chat request names with x-bf-prompt-id. A request without the header, or
++// naming no prompt that exists, comes back unchanged.
++export function applyPrompt(repo: PromptRepoConfig | undefined, h: Hdrs, text: string, usage: PromptUsage): Applied throws SyntaxError {
++  const pid = h.get("x-bf-prompt-id") ?? ""
++  if (pid === "" || repo === undefined) return { text: text }
++  const fs = try fields(text)
++  const model = rawStr(fs, "model") ?? ""
++  const stream = rawBool(fs, "stream") ?? false
++  const slash = model.indexOf("/")
++  const params: Map<string, string> = new Map()
++  for (const f of fs) {
++    if (!f.raw.startsWith("[") && !f.raw.startsWith("{")) params.set(f.key, plain(f.raw))
++  }
++  const act: Activation = {
++    model: slash < 0 ? model : model.slice(slash + 1),
++    provider: slash < 0 ? "" : model.slice(0, slash),
++    request_type: stream ? "chat_completion_stream" : "chat_completion",
++    budget_used: usage.budgetPercent,
++    tokens_used: usage.tokensPercent,
++    request_used: usage.requestsPercent,
++    headers: h,
++    params: params,
++  }
++  const pinRaw = h.get("x-bf-prompt-version")
++  const pin = pinRaw === undefined ? undefined : parseInt(pinRaw)
++  const sel = resolveVersion(repo, pid, act, pin, Math.random())
++  if (sel === undefined) return { text: text }
++  const out = try injectVersion(text, sel.version, variablesOf(h))
++  return { text: out, prompt_id: sel.prompt.id, prompt_name: sel.prompt.name, version: sel.version.version_number }
++}
++
++// ---- tests ----
++
++// The fields the tests read from route answers (all optional: a typed parse needs every
++// required field, and an error answer has none of these).
++type Shape = { prompt?: { id?: string }, version?: { id?: string, version_number?: int, variables?: string[], is_latest?: bool }, versions?: { version_number?: int, is_latest?: bool }[], total?: int, error?: { message?: string }, messages?: { role?: string, content?: string }[], temperature?: f64, max_tokens?: int }
++
++function jsonOf(text: string): Shape throws SyntaxError {
++  return try JSON.parse(text) as Shape
++}
++
++function headersOf2(pairs: string[][]): Hdrs {
++  const h: Hdrs = new Map()
++  for (const p of pairs) h.set(p[0]!, p[1]!)
++  return h
++}
++
++const NO_USAGE: PromptUsage = { budgetPercent: 0.0, tokensPercent: 0.0, requestsPercent: 0.0 }
++
++test("templates render named values and leave missing ones empty", () => {
++  const vars: Map<string, string> = new Map()
++  vars.set("name", "Ana")
++  expect(renderTemplate("Hi {{ name }}, {{missing}}! {{name}}", vars)).toBe("Hi Ana, ! Ana")
++  expect(renderTemplate("no braces", vars)).toBe("no braces")
++  expect(renderTemplate("open {{ never closed", vars)).toBe("open {{ never closed")
++})
++
++test("prompts, versions and their numbering follow the repository routes", () => {
++  const created = promptRoute(undefined, "POST", "/api/prompt-repo/prompts", `{"name":"greet"}`)
++  expect(created.status).toBe(200)
++  const pid = try jsonOf(created.body).prompt!.id! as string
++  expect(promptRoute(undefined, "POST", "/api/prompt-repo/prompts", `{}`).status).toBe(400)
++  const repo1 = created.next!
++  const body = `{"messages":[{"role":"system","content":"Be {{tone}}."}],"model_params":{"temperature":0.2},"variables":{"tone":""},"commit_message":"first"}`
++  const c1 = promptRoute(repo1, "POST", `/api/prompt-repo/prompts/${pid}/versions`, body)
++  expect(c1.status).toBe(200)
++  expect(try jsonOf(c1.body).version!.version_number!).toBe(1)
++  expect(try jsonOf(c1.body).version!.variables![0]!).toBe("tone")
++  const repo2 = c1.next!
++  const c2 = promptRoute(repo2, "POST", `/api/prompt-repo/prompts/${pid}/versions`, `{"messages":[{"role":"user","content":"Hi"}]}`)
++  expect(try jsonOf(c2.body).version!.version_number!).toBe(2)
++  const list = try jsonOf(promptRoute(c2.next!, "GET", `/api/prompt-repo/prompts/${pid}/versions`, "").body)
++  expect(list.versions!.length).toBe(2)
++  expect(list.versions![1]!.is_latest).toBe(true)
++  expect(list.versions![0]!.is_latest).toBe(false)
++  expect(promptRoute(c2.next!, "POST", `/api/prompt-repo/prompts/${pid}/versions`, `{"messages":[]}`).status).toBe(400)
++  expect(promptRoute(c2.next!, "POST", `/api/prompt-repo/prompts/nope/versions`, body).status).toBe(404)
++  expect(promptRoute(c2.next!, "GET", `/api/prompt-repo/prompts/${pid}/nope`, "").status).toBe(404)
++  expect(promptRoute(c2.next!, "PATCH", `/api/prompt-repo/prompts/${pid}`, "").status).toBe(405)
++  expect(promptRoute(c2.next!, "GET", `/api/prompt-repo/folders`, "").status).toBe(404)
++})
++
++test("a deployment's CEL and split are checked; a version in use cannot be deleted", () => {
++  const made = promptRoute(undefined, "POST", "/api/prompt-repo/prompts", `{"name":"p"}`)
++  const pid = try jsonOf(made.body).prompt!.id! as string
++  const v = promptRoute(made.next!, "POST", `/api/prompt-repo/prompts/${pid}/versions`, `{"messages":[{"role":"user","content":"a"}]}`)
++  const vid = try jsonOf(v.body).version!.id! as string
++  const repo = v.next!
++  const dep = `{"prompt_id":"${pid}","name":"canary","cel_expression":"model == \\"gpt-4o\\"","traffic_distribution":[{"version":"1","percentage":100}]}`
++  const bad = promptRoute(repo, "POST", "/api/prompt-repo/deployments", `{"prompt_id":"${pid}","name":"x","cel_expression":"nope == 1"}`)
++  expect(bad.status).toBe(400)
++  expect(try jsonOf(bad.body).error!.message!.startsWith("CEL compile error")).toBe(true)
++  expect(promptRoute(repo, "POST", "/api/prompt-repo/deployments", `{"prompt_id":"${pid}","name":"x","traffic_distribution":[{"version":"1","percentage":60}]}`).status).toBe(400)
++  expect(promptRoute(repo, "POST", "/api/prompt-repo/deployments", `{"prompt_id":"${pid}","name":"x","traffic_distribution":[{"version":"9","percentage":100}]}`).status).toBe(400)
++  const ok = promptRoute(repo, "POST", "/api/prompt-repo/deployments", dep)
++  expect(ok.status).toBe(201)
++  expect(promptRoute(ok.next!, "POST", "/api/prompt-repo/deployments", dep).status).toBe(409)
++  expect(promptRoute(ok.next!, "DELETE", `/api/prompt-repo/versions/${vid}`, "").status).toBe(409)
++  expect(promptRoute(ok.next!, "GET", "/api/prompt-repo/deployments?prompt_id=" + pid, "").body.includes(`"total":1`)).toBe(true)
++})
++
++test("resolution: a matching deployment draws its version, else the pin, else the latest", () => {
++  const repo: PromptRepoConfig = try JSON.parse(`{
++    "prompts": [{"id":"p1","name":"greet","created_at":1,"updated_at":1,"versions":[
++      {"id":"a","version_number":1,"messages":[{"role":"user","content":"one"}],"created_at":1},
++      {"id":"b","version_number":2,"messages":[{"role":"user","content":"two"}],"created_at":2},
++      {"id":"c","version_number":3,"messages":[{"role":"user","content":"three"}],"created_at":3}]}],
++    "deployments": [{"id":"d1","prompt_id":"p1","name":"gpt","cel_expression":"model == \\"gpt-4o\\"","created_at":5,
++      "updated_at":5,"traffic_distribution":[{"version":"1","percentage":10},{"version":"2","percentage":90}]}]
++  }`)
++  const act = (model: string): Activation => ({ model: model, provider: "openai", request_type: "chat_completion", budget_used: 0.0, tokens_used: 0.0, headers: new Map(), params: new Map() })
++  expect(resolveVersion(repo, "p1", act("gpt-4o"), undefined, 0.05)!.version!.version_number!).toBe(1)
++  expect(resolveVersion(repo, "p1", act("gpt-4o"), undefined, 0.5)!.version!.version_number!).toBe(2)
++  expect(resolveVersion(repo, "p1", act("gpt-4o-mini"), 1, 0.5)!.version!.version_number!).toBe(1)
++  expect(resolveVersion(repo, "p1", act("gpt-4o-mini"), undefined, 0.5)!.version!.version_number!).toBe(3)
++  expect(resolveVersion(repo, "p1", act("gpt-4o-mini"), 9, 0.5)!.version!.version_number!).toBe(3)
++  expect(resolveVersion(repo, "nope", act("gpt-4o"), undefined, 0.5)).toBeUndefined()
++})
++
++test("a chat request gets the version's messages first and its parameters where it leaves them out", () => {
++  const repo: PromptRepoConfig = try JSON.parse(`{
++    "prompts": [{"id":"p1","name":"greet","created_at":1,"updated_at":1,"versions":[
++      {"id":"a","version_number":1,"messages":[{"role":"system","content":"Greet {{name}} politely."}],
++       "model_params":"{\\"temperature\\":0.2,\\"max_tokens\\":50}","created_at":1}]}]
++  }`)
++  const h = headersOf2([["x-bf-prompt-id", "p1"], ["x-bf-prompt-var-name", "Ana"]])
++  const req = `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0.9}`
++  const out = try applyPrompt(repo, h, req, NO_USAGE)
++  expect(out.prompt_id).toBe("p1")
++  expect(out.version).toBe(1)
++  const got = try jsonOf(out.text)
++  expect(got.messages!.length).toBe(2)
++  expect(got.messages![0]!.content).toBe("Greet Ana politely.")
++  expect(got.messages![1]!.content).toBe("hi")
++  expect(got.temperature!).toBe(0.9)
++  expect(got.max_tokens!).toBe(50)
++  // without the header, or with an unknown prompt, the body is untouched
++  expect(try applyPrompt(repo, headersOf2([]), req, NO_USAGE).text).toBe(req)
++  const unknown = try applyPrompt(repo, headersOf2([["x-bf-prompt-id", "zzz"]]), req, NO_USAGE)
++  expect(unknown.text).toBe(req)
++  expect(unknown.prompt_id).toBeUndefined()
++  // a pinned version that does not exist falls back to the latest
++  const pinned = try applyPrompt(repo, headersOf2([["x-bf-prompt-id", "p1"], ["x-bf-prompt-version", "7"]]), req, NO_USAGE)
++  expect(pinned.version).toBe(1)
++})
+diff --git a/src/server.tov b/src/server.tov
+index 7929803..79781f4 100644
+--- a/src/server.tov
++++ b/src/server.tov
+@@ -16,9 +16,13 @@ import { parseQuery, filterFrom, selectAll, statsView } from "./logstore"
+ import { matchRoute, handleMedia, deploymentRoute, deploymentRequest } from "./media"
+ import { sdkRoute, anthropicSdk } from "./anthropic_batch"
+ import { snapshot } from "./schemas"
+-import { handleApi, proxyWidening } from "./store"
++import { handleApi, proxyWidening, Result } from "./store"
+ import { passthroughPath, passthroughRoute } from "./passthrough"
+ import { mcpApi } from "./mcpapi"
++import { promptRoute } from "./prompts"
++import { webhookApi, asyncSubmitHooked } from "./webhooks"
++import { flagRoute } from "./flags"
++import { notifyRoute } from "./notify"
+ import { alertingRoute } from "./alertapi"
+ import { McpSession } from "./mcp"
+ import { Ops, Reply } from "./ops"
+@@ -214,6 +218,12 @@ function logsAnalyticsPath(path: string): bool {
+   return path.startsWith("/api/logs/histogram") || path.startsWith("/api/logs/rankings") || path === "/api/logs/dashboard" || path === "/api/logs/filterdata" || path === "/api/logs/dropped" || path.startsWith("/api/mcp-logs")
+ }
+ 
++// A route's reply. A section it changed is saved first, and a failed save is the reply instead.
++function savedReply(status: int, body: string, saved: Result | undefined): Reply {
++  if (saved !== undefined && saved.kind !== "ok") return { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
++  return { status: status, body: body, contentType: "application/json" }
++}
++
+ // The management API, behind RBAC; every change lands in the audit log.
+ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
+   const gate = ops.gate(req, path)
+@@ -259,6 +269,23 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
+     if (req.method === "POST") r = await ops.forcePricing()
+     else r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
+   }
++  // prompt repository, webhooks, feature flags and notifications (their modules hold the logic)
++  else if (path.startsWith("/api/prompt-repo/")) {
++    const pr = promptRoute(ops.store.cfg.prompt_repo, req.method, req.url.slice(req.url.indexOf("/api/")), body)
++    r = savedReply(pr.status, pr.body, pr.next === undefined ? undefined : ops.store.setPromptRepo(pr.next))
++  }
++  else if (path === "/api/webhooks" || path.startsWith("/api/webhooks/")) {
++    const wr = await webhookApi(ops.store.cfg.webhooks, req.method, req.url.slice(req.url.indexOf("/api/")), body)
++    r = savedReply(wr.status, wr.body, wr.next === undefined ? undefined : ops.store.setWebhooks(wr.next))
++  }
++  else if (path === "/api/feature-flags" || path.startsWith("/api/feature-flags/")) {
++    const fr = flagRoute(ops.store.cfg.feature_flags, req.method, req.url.slice(req.url.indexOf("/api/")), body)
++    r = savedReply(fr.status, fr.body, fr.next === undefined ? undefined : ops.store.setFeatureFlags(fr.next))
++  }
++  else if (path === "/api/notifications") {
++    const nr = notifyRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body)
++    r = { status: nr.status, body: nr.body, contentType: "application/json" }
++  }
+   else {
+     const mr = mcpApi(ops.store, req.method, path, body)
+     if (mr !== undefined) {
+@@ -428,7 +455,7 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
+     if (p === "/cohere/v1/tokenize") return await cors(engine.cfg, req, await cohereTokenize(engine, req))
+     if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genai(engine, req, p.slice(GENAI.byteLength)))
+     if (p.startsWith("/bedrock/model/") && segs.length === 5) return await cors(engine.cfg, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
+-    if (p.startsWith("/v1/async/")) return await asyncSubmit(engine.jobs, req, p, dispatcher(engine))
++    if (p.startsWith("/v1/async/")) return await asyncSubmitHooked(engine.cfg.webhooks, engine.jobs, req, p, dispatcher(engine), (engine.cfg.client?.async_job_result_ttl ?? 3600) * 1000)
+   }
+   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
+   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
+diff --git a/src/store.tov b/src/store.tov
+index 4f82963..e172d44 100644
+--- a/src/store.tov
++++ b/src/store.tov
+@@ -8,7 +8,11 @@ import {
+   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
+   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
+   ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig,
++  WebhookEndpoint,
+ } from "./config"
++import { PromptRepoConfig } from "./prompts"
++import { FeatureFlagsConfig } from "./flags"
++import { notify } from "./notify"
+ import { setGlobalProxy } from "./providers/types"
+ import { decode, encode } from "./base64"
+ import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
+@@ -877,6 +881,23 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
+     }
+     out.providers = np
+   }
++  const whs = c.webhooks
++  if (whs !== undefined) {
++    let nw: WebhookEndpoint[] = []
++    for (const w of whs) {
++      let x = w
++      const sec = x.secret
++      if (sec !== undefined) x.secret = try secretValue(cipher, seal, sec, `webhooks.${x.name}.secret`, &errors)
++      const hs = x.headers
++      if (hs !== undefined) {
++        const hm: Map<string, string> = new Map()
++        for (const k of hs.keys()) hm.set(k, try secretValue(cipher, seal, hs.get(k) ?? "", `webhooks.${x.name}.headers.${k}`, &errors))
++        x.headers = hm
++      }
++      nw.push(x)
++    }
++    out.webhooks = nw
++  }
+   if (gov !== undefined) {
+     let g = gov
+     const au = g.auth_config
+@@ -977,11 +998,34 @@ export class ConfigStore {
+     }
+     this.version += 1
+     setGlobalProxy(next.proxy_config)
++    // the dashboard hears of every saved change (notify.tov)
++    notify({ severity: "info", title: "Configuration changed", message: `${id} was saved (configuration version ${this.version}).` })
+     const f = this.onChange
+     if (f !== undefined) f(next)
+     return { kind: "ok", id: id }
+   }
+ 
++  // Replaces the prompt repository (prompts with their versions, and deployments); see prompts.tov.
++  setPromptRepo(r: PromptRepoConfig): Result {
++    let n: Config = this.cfg
++    n.prompt_repo = r
++    return this.commit(n, "prompt-repo")
++  }
++
++  // Replaces the webhook endpoints; see webhooks.tov.
++  setWebhooks(w: WebhookEndpoint[]): Result {
++    let n: Config = this.cfg
++    n.webhooks = w
++    return this.commit(n, "webhooks")
++  }
++
++  // Replaces the feature flag overrides; see flags.tov.
++  setFeatureFlags(f: FeatureFlagsConfig): Result {
++    let n: Config = this.cfg
++    n.feature_flags = f
++    return this.commit(n, "feature-flags")
++  }
++
+   // Replaces the alerts section (rules, channels and Bifrost-style CEL rules); see alertapi.tov.
+   setAlerts(a: AlertsConfig): Result {
+     let n = this.cfg
+diff --git a/src/webhooks.tov b/src/webhooks.tov
+new file mode 100644
+index 0000000..deb1cce
+--- /dev/null
++++ b/src/webhooks.tov
+@@ -0,0 +1,738 @@
++// Webhooks (Bifrost's /api/webhooks and framework/webhooks): signed HTTP deliveries of an
++// async job's outcome, so a caller need not poll for it.
++//
++// A job is submitted with x-bf-async-webhook naming an enabled endpoint. When the job finishes,
++// the endpoint gets one POST whose body is {event, created_at, data}; event is async_job.completed
++// or async_job.failed, and the endpoint must subscribe to it. Each delivery carries Standard
++// Webhooks headers: webhook-id, webhook-timestamp and webhook-signature (v1,<base64> of
++// HMAC-SHA256 over "{id}.{timestamp}.{body}", keyed with the secret's bytes). A failed attempt is
++// retried with doubling backoff. Delivery is at least once, and every attempt of one delivery
++// keeps its webhook-id, so a receiver dedupes on it.
++//
++// Bifrost emits only these two events. Alerts, budgets and config changes reach the dashboard
++// through notify.tov, and alerting channels have their own webhook type (alerts.tov).
++//
++// Deliveries are kept in memory, the last 500 of them, per process. Endpoints are config (the
++// webhooks section), so they survive restarts.
++import { hmacSha256, utf8, secureHex } from "./crypto"
++import { encode, decode } from "./base64"
++import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString } from "./json"
++import { Hdrs, newId, errorJson } from "./schemas"
++import { isoMs } from "./exports"
++import { Job, JobStore } from "./jobs"
++import { asyncSubmit, Dispatch } from "./extras"
++import { deadline } from "./deadline"
++import { WebhookEndpoint } from "./config"
++
++// One delivery of one event to one endpoint. message_id is the webhook-id its attempts share;
++// a redelivery is a new row with the same message_id.
++export type Delivery = {
++  id: string,
++  message_id: string,
++  webhook_id: string,
++  webhook_name: string,
++  event: string,
++  status: string, // pending, delivered or failed
++  attempts: int,
++  status_code: int,
++  error: string,
++  body: string,
++  created_at: int,
++  updated_at: int,
++}
++
++export type WebhookReply = { status: int, body: string, next?: WebhookEndpoint[] }
++
++export const EVENTS: string[] = ["async_job.completed", "async_job.failed"]
++const SECRET_PREFIX = "whsec_"
++const MASK = "********"
++const KEEP = 500
++const PROTECTED: string[] = ["webhook-id", "webhook-timestamp", "webhook-signature", "x-bifrost-event", "content-type", "content-length", "user-agent", "host", "connection", "transfer-encoding"]
++
++// Deliveries of this process, newest last.
++export class DeliveryLog {
++  rows: Delivery[] = []
++
++  add(d: Delivery): void {
++    this.rows.push(d)
++    if (this.rows.length > KEEP) this.rows = this.rows.slice(this.rows.length - KEEP)
++  }
++
++  indexOf(id: string): int {
++    for (let i = 0; i < this.rows.length; i++) {
++      if (this.rows[i]!.id === id) return i
++    }
++    return -1
++  }
++
++  // Records one attempt's outcome on a row.
++  attempt(id: string, status: int, error: string, now: int): void {
++    const i = this.indexOf(id)
++    if (i < 0) return
++    this.rows[i]!.attempts += 1
++    this.rows[i]!.status_code = status
++    this.rows[i]!.error = error
++    this.rows[i]!.updated_at = now
++  }
++
++  settle(id: string, status: string, now: int): void {
++    const i = this.indexOf(id)
++    if (i < 0) return
++    this.rows[i]!.status = status
++    this.rows[i]!.updated_at = now
++  }
++}
++
++let logInstance: DeliveryLog | undefined = undefined
++
++// The process's delivery log (created on first use: top-level statements in imported modules do not run).
++export function deliveryLog(): DeliveryLog {
++  let l = logInstance
++  if (l === undefined) {
++    l = new DeliveryLog()
++    logInstance = l
++  }
++  return l
++}
++
++// A fresh signing secret: whsec_ plus the base64 of 32 random bytes.
++export function newSecret(): string throws Error {
++  const hex = try secureHex(32)
++  return SECRET_PREFIX + encode(utf8(hex))
++}
++
++// The HMAC key a secret carries; it must decode to 24 to 64 bytes.
++function keyOf(secret: string): u8[] throws Error {
++  if (!secret.startsWith(SECRET_PREFIX)) throw new Error("the signing secret must start with whsec_")
++  const key = try decode(secret.slice(SECRET_PREFIX.byteLength))
++  if (key.length < 24 || key.length > 64) throw new Error(`the signing secret must decode to 24-64 bytes, got ${key.length}`)
++  return key
++}
++
++// The Standard Webhooks signature of one delivery attempt, as the webhook-signature header carries it.
++export function sign(secret: string, id: string, timestamp: int, body: string): string throws Error {
++  const key = try keyOf(secret)
++  return "v1," + encode(hmacSha256(key, utf8(id + "." + timestamp + "." + body)))
++}
++
++// The reason an endpoint URL is refused, or "" when it may be used. Link-local and metadata
++// addresses are refused always; private addresses and plain http only with allow_private_network.
++export function urlProblem(raw: string, allowPrivate: bool): string {
++  const u = URL.parse(raw)
++  if (u === undefined) return "url is not a valid URL"
++  const host = u.hostname
++  if (host.startsWith("169.254.") || host === "0.0.0.0" || host === "metadata.google.internal" || host === "fd00:ec2::254") return "link-local and metadata addresses are not allowed"
++  if (u.protocol !== "https:" && !(u.protocol === "http:" && allowPrivate)) return "url must be https (http needs allow_private_network)"
++  if (!allowPrivate && isPrivateHost(host)) return "url points at a private address; set allow_private_network to deliver there"
++  return ""
++}
++
++function isPrivateHost(h: string): bool {
++  if (h === "localhost" || h.endsWith(".localhost") || h === "[::1]" || h === "::1") return true
++  if (h.startsWith("127.") || h.startsWith("10.") || h.startsWith("192.168.")) return true
++  if (h.startsWith("[fc") || h.startsWith("[fd") || h.startsWith("[fe80")) return true
++  if (h.startsWith("172.")) {
++    const second = parseInt(h.split(".")[1] ?? "")
++    if (second !== undefined && second >= 16 && second <= 31) return true
++  }
++  if (h.startsWith("100.")) {
++    const second = parseInt(h.split(".")[1] ?? "")
++    if (second !== undefined && second >= 64 && second <= 127) return true
++  }
++  return false
++}
++
++// Bifrost's request_type names for the async ops.
++function requestTypeOf(op: string): string {
++  if (op === "chat/completions") return "chat_completion"
++  if (op === "completions") return "text_completion"
++  if (op === "embeddings") return "embedding"
++  return op.split("/").join("_")
++}
++
++function headersFor(ep: WebhookEndpoint): Map<string, string> {
++  const out: Map<string, string> = new Map()
++  const hs = ep.headers
++  if (hs === undefined) return out
++  for (const k of hs.keys()) {
++    if (!PROTECTED.includes(k.toLowerCase())) out.set(k, hs.get(k) ?? "")
++  }
++  return out
++}
++
++// One POST of a body to an endpoint, signed now. status is 0 when no answer came.
++async function attemptOnce(ep: WebhookEndpoint, messageId: string, event: string, body: string): Promise<{ status: int, error: string }> {
++  const problem = urlProblem(ep.url, ep.allow_private_network === true)
++  if (problem !== "") return { status: 0, error: problem }
++  const secret = ep.secret ?? ""
++  const ts = Math.floor(Date.now() / 1000)
++  let sig = ""
++  try {
++    sig = sign(secret, messageId, ts, body)
++  } catch (e) {
++    return { status: 0, error: e.message }
++  }
++  const hm: Map<string, string> = headersFor(ep)
++  hm.set("content-type", "application/json")
++  hm.set("user-agent", "Raiju-Webhooks/1.0")
++  hm.set("webhook-id", messageId)
++  hm.set("webhook-timestamp", "" + ts)
++  hm.set("webhook-signature", sig)
++  hm.set("x-bifrost-event", event)
++  const hs: Record<string, string> = hm
++  const timeout = (ep.attempt_timeout_seconds ?? 10) * 1000
++  const dl = deadline(timeout)
++  try {
++    const r = await fetch(ep.url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
++    await r.text()
++    dl.finish()
++    return { status: r.status, error: "" }
++  } catch (e) {
++    dl.finish()
++    return { status: 0, error: e.message }
++  }
++}
++
++async function sleepMs(ms: int): Promise<void> {
++  await new Promise<void>((resolve) => {
++    setTimeout(() => resolve(), ms)
++  })
++}
++
++// Sends one delivery with its retries, recording each attempt in the log.
++async function deliver(ep: WebhookEndpoint, rowId: string, messageId: string, event: string, body: string): Promise<void> {
++  const log = deliveryLog()
++  const max = ep.max_retries ?? 4
++  const cap = ep.retry_backoff_max_seconds ?? 1800
++  let wait: f64 = ep.retry_backoff_initial_seconds ?? 30
++  let attempt = 0
++  while (true) {
++    attempt += 1
++    const r = await attemptOnce(ep, messageId, event, body)
++    log.attempt(rowId, r.status, r.error, Math.floor(Date.now()))
++    if (r.status >= 200 && r.status < 300) {
++      log.settle(rowId, "delivered", Math.floor(Date.now()))
++      return
++    }
++    if (attempt > max) {
++      log.settle(rowId, "failed", Math.floor(Date.now()))
++      return
++    }
++    await sleepMs(Math.floor(wait * 1000))
++    wait = Math.min(wait * 2.0, cap)
++  }
++}
++
++// The {event, created_at, data} envelope.
++function envelope(event: string, data: string): string {
++  return `{"event":${JSON.stringify(event)},"created_at":${JSON.stringify(isoMs(Date.now()))},"data":${data}}`
++}
++
++// The data of an async job's outcome: ids, status, times, the result URL, and the response or
++// error when the endpoint includes them and they fit its size cap.
++export function jobData(ep: WebhookEndpoint, j: Job, ttlMs: int): string {
++  const parts: string[] = [`"job_id":${JSON.stringify(j.id)}`, `"request_type":${JSON.stringify(requestTypeOf(j.op))}`, `"status":${JSON.stringify(j.status)}`]
++  const st = j.http_status
++  if (st !== undefined) parts.push(`"status_code":${st}`)
++  parts.push(`"created_at":${JSON.stringify(isoMs(j.created_at * 1000))}`)
++  const done = j.completed_at
++  if (done !== undefined) {
++    parts.push(`"completed_at":${JSON.stringify(isoMs(done * 1000))}`)
++    parts.push(`"result_expires_at":${JSON.stringify(isoMs(done * 1000 + ttlMs))}`)
++  }
++  parts.push(`"result_url":${JSON.stringify("/v1/async/" + j.op + "/" + j.id)}`)
++  const cap = (ep.max_response_payload_kbs ?? 256) * 1024
++  if (ep.include_response === true) {
++    const res = j.result
++    if (res !== undefined) {
++      if (res.byteLength <= cap) parts.push(`"response":${res}`)
++      else parts.push(`"response_omitted":true`)
++    }
++    const err = j.error
++    if (err !== undefined) {
++      const body = JSON.stringify({ message: err })
++      if (body.byteLength <= cap) parts.push(`"error":${body}`)
++      else parts.push(`"error_omitted":true`)
++    }
++  }
++  return "{" + parts.join(",") + "}"
++}
++
++// Starts a delivery of an event to an endpoint that subscribes to it. Returns the delivery's row
++// id, or "" when the endpoint does not take the event.
++export function enqueue(ep: WebhookEndpoint, event: string, body: string): string {
++  if (ep.disabled === true || !ep.events.includes(event)) return ""
++  const rowId = newId("dl_")
++  const messageId = newId("msg_")
++  const now = Math.floor(Date.now())
++  deliveryLog().add({ id: rowId, message_id: messageId, webhook_id: ep.id ?? "", webhook_name: ep.name, event: event, status: "pending", attempts: 0, status_code: 0, error: "", body: body, created_at: now, updated_at: now })
++  deliver(ep, rowId, messageId, event, body)
++  return rowId
++}
++
++// Waits for a job to finish and enqueues its outcome. Stops when the job expires unfinished.
++async function watchJob(jobs: JobStore, id: string, ep: WebhookEndpoint, ttlMs: int): Promise<void> {
++  while (true) {
++    await sleepMs(250)
++    const j = jobs.get(id, Math.floor(Date.now()))
++    if (j === undefined) return
++    if (j.status === "completed" || j.status === "failed") {
++      const event = j.status === "completed" ? "async_job.completed" : "async_job.failed"
++      enqueue(ep, event, envelope(event, jobData(ep, j, ttlMs)))
++      return
++    }
++  }
++}
++
++export function findEndpoint(list: WebhookEndpoint[], key: string): WebhookEndpoint | undefined {
++  for (const ep of list) {
++    if (ep.id === key || ep.name === key) return ep
++  }
++  return undefined
++}
++
++// The job id in an async submit's 202 body.
++function jobIdOf(text: string): string {
++  try {
++    const f = fields(text)
++    return rawStr(f, "id") ?? ""
++  } catch (e) {
++    return ""
++  }
++}
++
++// POST /v1/async/...: asyncSubmit, plus the webhook named by x-bf-async-webhook. A name that is
++// not an enabled endpoint fails the submit before any job is made.
++export async function asyncSubmitHooked(endpoints: WebhookEndpoint[] | undefined, jobs: JobStore, req: Request, path: string, dispatch: Dispatch, ttlMs: int): Promise<Response, Error> throws Error {
++  const name = req.headers.get("x-bf-async-webhook") ?? ""
++  if (name === "") return await asyncSubmit(jobs, req, path, dispatch)
++  const ep = findEndpoint(endpoints ?? [], name)
++  if (ep === undefined || ep.disabled === true) {
++    return new Response(errorJson(`no enabled webhook endpoint named ${name}`, "invalid_request_error", undefined), { status: 400, headers: { "content-type": "application/json" } })
++  }
++  const res = await asyncSubmit(jobs, req, path, dispatch)
++  if (res.status !== 202) return res
++  const text = try await res.text()
++  const id = jobIdOf(text)
++  if (id !== "") watchJob(jobs, id, ep, ttlMs)
++  return new Response(text, { status: 202, headers: { "content-type": "application/json" } })
++}
++
++// ---- the management API ----
++
++function reply(status: int, body: string): WebhookReply {
++  return { status: status, body: body }
++}
++
++function fail(status: int, message: string): WebhookReply {
++  return reply(status, JSON.stringify({ error: { message: message, type: "invalid_request_error" } }))
++}
++
++function objectFields(text: string): Field[] | undefined {
++  if (!text.startsWith("{")) return undefined
++  try {
++    return fields(text)
++  } catch (e) {
++    return undefined
++  }
++}
++
++// A string array's values, or undefined when the raw JSON is not one.
++function strings(raw: string): string[] | undefined {
++  if (!raw.startsWith("[")) return undefined
++  const out: string[] = []
++  try {
++    for (const el of elements(raw)) {
++      if (!el.startsWith("\"")) return undefined
++      out.push(decodeString(el))
++    }
++  } catch (e) {
++    return undefined
++  }
++  return out
++}
++
++// The headers object of a body, with string values only; undefined when it is not one.
++function headerMap(raw: string): Map<string, string> | undefined {
++  if (!raw.startsWith("{")) return undefined
++  const out: Map<string, string> = new Map()
++  try {
++    for (const f of fields(raw)) {
++      if (!f.raw.startsWith("\"")) return undefined
++      out.set(f.key, decodeString(f.raw))
++    }
++  } catch (e) {
++    return undefined
++  }
++  return out
++}
++
++// A whole number of at least 1 from a body field, or undefined when absent. "bad" is set when it is not one.
++function tuning(fs: Field[], key: string): { value: int | undefined, bad: bool } {
++  const n = rawNum(fs, key)
++  if (n === undefined) return { value: undefined, bad: false }
++  if (n % 1.0 !== 0.0 || n < 1.0) return { value: undefined, bad: true }
++  return { value: Math.round(n), bad: false }
++}
++
++// Endpoint view: no secret; header values masked, as Bifrost does.
++function endpointJson(ep: WebhookEndpoint): string {
++  const hp: string[] = []
++  const hm = ep.headers
++  if (hm !== undefined) {
++    for (const k of hm.keys()) hp.push(JSON.stringify(k) + ":" + JSON.stringify(MASK))
++  }
++  const view = {
++    id: ep.id ?? "",
++    name: ep.name,
++    url: ep.url,
++    events: ep.events,
++    headers: "{" + hp.join(",") + "}",
++    include_response: ep.include_response ?? false,
++    allow_private_network: ep.allow_private_network ?? false,
++    disabled: ep.disabled ?? false,
++    max_retries: ep.max_retries ?? 4,
++    retry_backoff_initial_seconds: ep.retry_backoff_initial_seconds ?? 30,
++    retry_backoff_max_seconds: ep.retry_backoff_max_seconds ?? 1800,
++    attempt_timeout_seconds: ep.attempt_timeout_seconds ?? 10,
++    max_response_payload_kbs: ep.max_response_payload_kbs ?? 256,
++    created_at: isoMs(ep.created_at ?? 0),
++    updated_at: isoMs(ep.updated_at ?? 0),
++  }
++  return JSON.stringify(view)
++}
++
++function deliveryJson(d: Delivery): string {
++  return JSON.stringify({ id: d.id, message_id: d.message_id, webhook_id: d.webhook_id, webhook_name: d.webhook_name, event: d.event, status: d.status, attempts: d.attempts, status_code: d.status_code, error: d.error, created_at: isoMs(d.created_at), updated_at: isoMs(d.updated_at) })
++}
++
++// Checks a whole endpoint body: the events it names, and its URL, headers and tuning. "" when fine.
++function problemWith(name: string, url: string, events: string[], allowPrivate: bool, headers: Map<string, string> | undefined): string {
++  if (name === "") return "name is required"
++  if (url === "") return "url is required"
++  const up = urlProblem(url, allowPrivate)
++  if (up !== "") return up
++  if (events.length === 0) return "events is required"
++  for (const e of events) {
++    if (!EVENTS.includes(e)) return `unknown event ${e}; the events are ${EVENTS.join(", ")}`
++  }
++  const hm = headers
++  if (hm !== undefined) {
++    for (const k of hm.keys()) {
++      if (PROTECTED.includes(k.toLowerCase())) return `header ${k} is reserved for the delivery`
++    }
++  }
++  return ""
++}
++
++// Routes one request under /api/webhooks. path is the request's path and query.
++export function webhookRoute(cfg: WebhookEndpoint[] | undefined, method: string, path: string, body: string): WebhookReply {
++  const list = cfg ?? []
++  const q = path.indexOf("?")
++  const p = q < 0 ? path : path.slice(0, q)
++  const query = q < 0 ? "" : path.slice(q + 1)
++  const segs = p.split("/").filter((s) => s !== "")
++  if (segs.length === 2) {
++    if (method === "GET") {
++      const items: string[] = []
++      for (const ep of list) items.push(endpointJson(ep))
++      return reply(200, `{"endpoints":[${items.join(",")}],"count":${items.length},"total_count":${items.length}}`)
++    }
++    if (method !== "POST") return fail(405, `method ${method} is not allowed here`)
++    return createEndpoint(list, body)
++  }
++  if (segs[2] === "deliveries") return deliveriesRoute(list, method, segs, query)
++  const key = segs[2] ?? ""
++  const i = endpointIndex(list, key)
++  if (i < 0) return fail(404, "webhook endpoint not found")
++  const old = list[i]!
++  if (segs.length === 3) {
++    if (method === "GET") return reply(200, `{"endpoint":${endpointJson(old)}}`)
++    if (method === "PUT") return updateEndpoint(list, i, body)
++    if (method === "DELETE") {
++      const kept = list.filter((x) => x !== old)
++      return { status: 200, body: `{"message":"webhook endpoint deleted"}`, next: kept }
++    }
++    return fail(405, `method ${method} is not allowed here`)
++  }
++  const action = segs[3] ?? ""
++  if (segs.length === 4 && action === "rotate-secret" && method === "POST") {
++    let secret = ""
++    try {
++      secret = newSecret()
++    } catch (e) {
++      return fail(500, `could not make a secret: ${e.message}`)
++    }
++    const renewed: WebhookEndpoint = { id: old.id, name: old.name, url: old.url, events: old.events, secret: secret, headers: old.headers, include_response: old.include_response, allow_private_network: old.allow_private_network, disabled: old.disabled, max_retries: old.max_retries, retry_backoff_initial_seconds: old.retry_backoff_initial_seconds, retry_backoff_max_seconds: old.retry_backoff_max_seconds, attempt_timeout_seconds: old.attempt_timeout_seconds, max_response_payload_kbs: old.max_response_payload_kbs, created_at: old.created_at, updated_at: Math.floor(Date.now()) }
++    const next = list.slice()
++    next[i] = renewed
++    return { status: 200, body: `{"endpoint":${endpointJson(renewed)},"secret":${JSON.stringify(secret)}}`, next: next }
++  }
++  if (segs.length === 4 && action === "deliveries" && method === "GET") {
++    return reply(200, deliveriesJson(old.id ?? "", old.name, query))
++  }
++  return fail(404, "no such route")
++}
++
++function endpointIndex(list: WebhookEndpoint[], key: string): int {
++  for (let i = 0; i < list.length; i++) {
++    const ep = list[i]!
++    if (ep.id === key || ep.name === key) return i
++  }
++  return -1
++}
++
++function createEndpoint(list: WebhookEndpoint[], body: string): WebhookReply {
++  const fs = objectFields(body)
++  if (fs === undefined) return fail(400, "invalid request body")
++  const name = rawStr(fs, "name") ?? ""
++  const url = rawStr(fs, "url") ?? ""
++  const evRaw = find(fs, "events")
++  const events: string[] = evRaw === undefined ? [] : strings(evRaw) ?? []
++  const allowPrivate = rawBool(fs, "allow_private_network") ?? false
++  const hRaw = find(fs, "headers")
++  const headers = hRaw === undefined || hRaw === "null" ? undefined : headerMap(hRaw)
++  if (hRaw !== undefined && hRaw !== "null" && headers === undefined) return fail(400, "headers must be an object of string values")
++  const bad = problemWith(name, url, events, allowPrivate, headers)
++  if (bad !== "") return fail(400, bad)
++  if (list.some((x) => x.name === name)) return fail(409, "A webhook endpoint with this name already exists")
++  const tunes = tunedFields(fs)
++  if (tunes.error !== "") return fail(400, tunes.error)
++  let secret = ""
++  try {
++    secret = newSecret()
++  } catch (e) {
++    return fail(500, `could not make a secret: ${e.message}`)
++  }
++  const now = Math.floor(Date.now())
++  const made: WebhookEndpoint = { id: newId("wh_"), name: name, url: url, events: events, secret: secret, headers: headers, include_response: rawBool(fs, "include_response") ?? false, allow_private_network: allowPrivate, disabled: rawBool(fs, "disabled") ?? false, max_retries: tunes.max_retries, retry_backoff_initial_seconds: tunes.initial, retry_backoff_max_seconds: tunes.max, attempt_timeout_seconds: tunes.timeout, max_response_payload_kbs: tunes.payload, created_at: now, updated_at: now }
++  return { status: 201, body: `{"endpoint":${endpointJson(made)},"secret":${JSON.stringify(secret)}}`, next: list.concat([made]) }
++}
++
++// The tuning knobs of a body. error names the first one that is not a whole number of 1 or more.
++function tunedFields(fs: Field[]): { error: string, max_retries: int | undefined, initial: int | undefined, max: int | undefined, timeout: int | undefined, payload: int | undefined } {
++  const a = tuning(fs, "max_retries")
++  const b = tuning(fs, "retry_backoff_initial_seconds")
++  const c = tuning(fs, "retry_backoff_max_seconds")
++  const d = tuning(fs, "attempt_timeout_seconds")
++  const e = tuning(fs, "max_response_payload_kbs")
++  let error = ""
++  if (a.bad || b.bad || c.bad || d.bad || e.bad) error = "retry, timeout and payload settings must be whole numbers of 1 or more (max_retries of 0 is the default retry count)"
++  return { error: error, max_retries: a.value, initial: b.value, max: c.value, timeout: d.value, payload: e.value }
++}
++
++function updateEndpoint(list: WebhookEndpoint[], i: int, body: string): WebhookReply {
++  const old = list[i]!
++  const fs = objectFields(body)
++  if (fs === undefined) return fail(400, "invalid request body")
++  const name = rawStr(fs, "name") ?? old.name
++  const url = rawStr(fs, "url") ?? old.url
++  const evRaw = find(fs, "events")
++  const events = evRaw === undefined ? old.events : strings(evRaw) ?? []
++  const allowPrivate = rawBool(fs, "allow_private_network") ?? old.allow_private_network ?? false
++  // header values sent back masked keep the stored value
++  let headers = old.headers
++  const hRaw = find(fs, "headers")
++  if (hRaw !== undefined && hRaw !== "null") {
++    const sent = headerMap(hRaw)
++    if (sent === undefined) return fail(400, "headers must be an object of string values")
++    const kept: Map<string, string> = new Map()
++    for (const k of sent.keys()) {
++      const v = sent.get(k) ?? ""
++      const prev = old.headers?.get(k)
++      kept.set(k, v === MASK && prev !== undefined ? prev : v)
++    }
++    headers = kept
++  } else if (hRaw === "null") {
++    headers = undefined
++  }
++  const bad = problemWith(name, url, events, allowPrivate, headers)
++  if (bad !== "") return fail(400, bad)
++  if (list.some((x) => x.name === name && x !== old)) return fail(409, "A webhook endpoint with this name already exists")
++  const tunes = tunedFields(fs)
++  if (tunes.error !== "") return fail(400, tunes.error)
++  const next: WebhookEndpoint = {
++    id: old.id,
++    name: name,
++    url: url,
++    events: events,
++    secret: old.secret,
++    headers: headers,
++    include_response: rawBool(fs, "include_response") ?? old.include_response,
++    allow_private_network: allowPrivate,
++    disabled: rawBool(fs, "disabled") ?? old.disabled,
++    max_retries: tunes.max_retries ?? old.max_retries,
++    retry_backoff_initial_seconds: tunes.initial ?? old.retry_backoff_initial_seconds,
++    retry_backoff_max_seconds: tunes.max ?? old.retry_backoff_max_seconds,
++    attempt_timeout_seconds: tunes.timeout ?? old.attempt_timeout_seconds,
++    max_response_payload_kbs: tunes.payload ?? old.max_response_payload_kbs,
++    created_at: old.created_at,
++    updated_at: Math.floor(Date.now()),
++  }
++  const list2 = list.slice()
++  list2[i] = next
++  return { status: 200, body: `{"endpoint":${endpointJson(next)}}`, next: list2 }
++}
++
++function deliveriesJson(webhookId: string, webhookName: string, query: string): string {
++  const sp = new URLSearchParams(query)
++  const limit = parseInt(sp.get("limit") ?? "50") ?? 50
++  const rows = deliveryLog().rows
++  const items: string[] = []
++  for (let i = rows.length - 1; i >= 0 && items.length < limit; i--) {
++    const d = rows[i]!
++    if (d.webhook_id === webhookId || d.webhook_name === webhookName) items.push(deliveryJson(d))
++  }
++  return `{"deliveries":[${items.join(",")}],"count":${items.length}}`
++}
++
++function deliveriesRoute(list: WebhookEndpoint[], method: string, segs: string[], query: string): WebhookReply {
++  if (segs.length === 3 && method === "GET") {
++    const sp = new URLSearchParams(query)
++    const status = sp.get("status") ?? ""
++    const limit = parseInt(sp.get("limit") ?? "50") ?? 50
++    const items: string[] = []
++    const rows = deliveryLog().rows
++    for (let i = rows.length - 1; i >= 0 && items.length < limit; i--) {
++      const d = rows[i]!
++      if (status === "" || d.status === status) items.push(deliveryJson(d))
++    }
++    return reply(200, `{"deliveries":[${items.join(",")}],"count":${items.length}}`)
++  }
++  if (segs.length === 5 && segs[4] === "redeliver" && method === "POST") {
++    const log = deliveryLog()
++    const i = log.indexOf(segs[3] ?? "")
++    if (i < 0) return fail(404, "delivery not found")
++    const old = log.rows[i]!
++    const ep = findEndpoint(list, old.webhook_id) ?? findEndpoint(list, old.webhook_name)
++    if (ep === undefined) return fail(404, "the endpoint of this delivery no longer exists")
++    const rowId = newId("dl_")
++    const now = Math.floor(Date.now())
++    log.add({ id: rowId, message_id: old.message_id, webhook_id: ep.id ?? "", webhook_name: ep.name, event: old.event, status: "pending", attempts: 0, status_code: 0, error: "", body: old.body, created_at: now, updated_at: now })
++    deliver(ep, rowId, old.message_id, old.event, old.body)
++    return { status: 202, body: JSON.stringify({ delivery_id: rowId }) }
++  }
++  return fail(404, "no such route")
++}
++
++// Routes one request under /api/webhooks, sending a sample event for the test route.
++export async function webhookApi(cfg: WebhookEndpoint[] | undefined, method: string, path: string, body: string): Promise<WebhookReply, Error> {
++  const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
++  if (segs.length === 4 && segs[3] === "test" && method === "POST") {
++    const ep = findEndpoint(cfg ?? [], segs[2] ?? "")
++    if (ep === undefined) return fail(404, "webhook endpoint not found")
++    if (ep.disabled === true) return fail(400, "webhook endpoint is disabled")
++    return await testEndpoint(ep, body)
++  }
++  return webhookRoute(cfg, method, path, body)
++}
++
++// Sends one sample event to an endpoint and reports the receiver's answer.
++async function testEndpoint(ep: WebhookEndpoint, body: string): Promise<WebhookReply, Error> {
++  const fs = objectFields(body === "" ? "{}" : body)
++  if (fs === undefined) return fail(400, "invalid request body")
++  const event = rawStr(fs, "event") ?? ep.events[0] ?? ""
++  if (!ep.events.includes(event)) return fail(400, `endpoint is not subscribed to event ${event}`)
++  const sample = envelope(event, `{"job_id":"job_test","status":"completed","test":true}`)
++  const r = await attemptOnce(ep, newId("msg_"), event, sample)
++  return reply(200, JSON.stringify({ delivered: r.status >= 200 && r.status < 300, receiver_status_code: r.status, error: r.error }))
++}
++
++// ---- tests ----
++
++// The id and secret of a create answer, for the tests.
++function jsonEndpoint(text: string): { id: string, secret: string } throws SyntaxError {
++  const f = try fields(text)
++  const ep = try fields(find(f, "endpoint") ?? "{}")
++  return { id: rawStr(ep, "id") ?? "", secret: rawStr(f, "secret") ?? "" }
++}
++
++test("the signature matches Standard Webhooks' reference vector", () => {
++  const sig = try sign("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", "msg_p5jXN8AQM9LWM0D4loKWxJek", 1614265330, `{"test": 2432232314}`)
++  expect(sig).toBe("v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=")
++})
++
++test("a secret must decode to 24-64 bytes", () => {
++  let refused = 0
++  for (const s of ["whsec_", "nope", "whsec_!!!!", "whsec_" + encode(utf8("x".repeat(10)))]) {
++    try {
++      sign(s, "m", 1, "b")
++    } catch (e) {
++      refused += 1
++    }
++  }
++  expect(refused).toBe(4)
++  const fresh = try newSecret()
++  expect(fresh.startsWith("whsec_")).toBe(true)
++  expect(try sign(fresh, "m", 1, "b").startsWith("v1,")).toBe(true)
++})
++
++test("urls: https is needed, private and metadata addresses are refused unless allowed", () => {
++  expect(urlProblem("https://hooks.example.com/x", false)).toBe("")
++  expect(urlProblem("http://hooks.example.com/x", false).startsWith("url must be https")).toBe(true)
++  expect(urlProblem("https://127.0.0.1:9/x", false).startsWith("url points at a private address")).toBe(true)
++  expect(urlProblem("http://127.0.0.1:9/x", true)).toBe("")
++  expect(urlProblem("https://10.1.2.3/x", false).startsWith("url points at a private address")).toBe(true)
++  expect(urlProblem("https://172.20.0.1/x", false).startsWith("url points at a private address")).toBe(true)
++  expect(urlProblem("https://172.40.0.1/x", false)).toBe("")
++  expect(urlProblem("https://169.254.169.254/latest", true).startsWith("link-local")).toBe(true)
++  expect(urlProblem("not a url", false)).toBe("url is not a valid URL")
++})
++
++const NO_ENDPOINTS: WebhookEndpoint[] = []
++
++// The endpoints a route answer leaves behind.
++function listOf(r: WebhookReply): WebhookEndpoint[] {
++  const n = r.next
++  if (n === undefined) return NO_ENDPOINTS.slice()
++  return n
++}
++
++test("an endpoint is created with a secret shown once, and listed without it", () => {
++  const made = webhookRoute(NO_ENDPOINTS, "POST", "/api/webhooks", `{"name":"ops","url":"https://hooks.example.com/a","events":["async_job.completed"],"headers":{"Authorization":"Bearer t"}}`)
++  expect(made.status).toBe(201)
++  expect(made.body.includes("whsec_")).toBe(true)
++  expect(made.body.includes("Bearer t")).toBe(false)
++  const after = listOf(made)
++  const list = webhookRoute(after, "GET", "/api/webhooks", "")
++  expect(list.body.includes("whsec_")).toBe(false)
++  expect(list.body.includes("********")).toBe(true)
++  expect(webhookRoute(after, "POST", "/api/webhooks", `{"name":"ops","url":"https://h.example.com/b","events":["async_job.failed"]}`).status).toBe(409)
++  expect(webhookRoute(after, "POST", "/api/webhooks", `{"name":"x","url":"https://h.example.com/b","events":["budget.exceeded"]}`).status).toBe(400)
++  expect(webhookRoute(after, "POST", "/api/webhooks", `{"name":"x","url":"https://h.example.com/b","events":["async_job.failed"],"headers":{"Webhook-Id":"1"}}`).status).toBe(400)
++  expect(webhookRoute(after, "POST", "/api/webhooks", `{"name":"x","url":"https://h.example.com/b","events":["async_job.failed"],"max_retries":-1}`).status).toBe(400)
++  expect(webhookRoute(after, "GET", "/api/webhooks/nope", "").status).toBe(404)
++})
++
++test("update keeps masked headers and the secret; rotation changes only the secret", () => {
++  const made = webhookRoute(NO_ENDPOINTS, "POST", "/api/webhooks", `{"name":"ops","url":"https://hooks.example.com/a","events":["async_job.completed"],"headers":{"X-Key":"abc"}}`)
++  const created = try jsonEndpoint(made.body)
++  const before = listOf(made)
++  const put = webhookRoute(before, "PUT", "/api/webhooks/" + created.id, `{"url":"https://hooks.example.com/b","headers":{"X-Key":"********"}}`)
++  expect(put.status).toBe(200)
++  const updated = listOf(put)
++  expect(updated.length).toBe(1)
++  expect(updated[0]!.url).toBe("https://hooks.example.com/b")
++  expect(updated[0]!.secret ?? "").toBe(created.secret)
++  const hs = updated[0]!.headers
++  expect(hs === undefined ? "" : (hs.get("X-Key") ?? "")).toBe("abc")
++  const rot = webhookRoute(updated, "POST", "/api/webhooks/" + created.id + "/rotate-secret", "")
++  expect(rot.status).toBe(200)
++  const rotated = listOf(rot)
++  const rs = rotated[0]!.secret ?? ""
++  expect(rs === created.secret).toBe(false)
++  expect(rs.startsWith("whsec_")).toBe(true)
++  expect(webhookRoute(rotated, "DELETE", "/api/webhooks/" + created.id, "").status).toBe(200)
++})
++
++test("a job's outcome payload carries the job, its times and the response only when asked", () => {
++  const ep: WebhookEndpoint = { name: "ops", url: "https://h.example.com", events: ["async_job.completed"], include_response: true }
++  const j: Job = { id: "job_1", op: "chat/completions", status: "completed", created_at: 1700000000, completed_at: 1700000002, http_status: 200, result: `{"ok":true}` }
++  const data = jobData(ep, j, 3600000)
++  expect(data.includes(`"job_id":"job_1"`)).toBe(true)
++  expect(data.includes(`"request_type":"chat_completion"`)).toBe(true)
++  expect(data.includes(`"result_url":"/v1/async/chat/completions/job_1"`)).toBe(true)
++  expect(data.includes(`"response":{"ok":true}`)).toBe(true)
++  const plain = jobData({ name: "p", url: "https://h.example.com", events: [] }, j, 3600000)
++  expect(plain.includes(`"response"`)).toBe(false)
++})
+diff --git a/tests/mock_upstream.tov b/tests/mock_upstream.tov
+index df2402b..874b85f 100644
+--- a/tests/mock_upstream.tov
++++ b/tests/mock_upstream.tov
+@@ -8,6 +8,9 @@ import { listen } from "../src/http1"
+ type Seen = { path: string, auth: string, body: string, team: string }
+ 
+ const seen: Seen[] = []
++// webhook deliveries received: the path, the Standard Webhooks headers and the body
++type Hook = { path: string, id: string, timestamp: string, signature: string, event: string, body: string }
++const hooks: Hook[] = []
+ let flakyCalls = 0
+ 
+ // Batch and file state for the Anthropic, OpenAI and Gemini batch and file APIs.
+@@ -695,6 +698,22 @@ Bun.serve<string>({
+         return Response.json({ ok: true })
+       },
+     },
++    // webhook receivers (webhooks.tov): one that answers 200, one that always fails with 503
++    "/webhook-receiver": {
++      POST: async (req) => {
++        const body = await req.text()
++        hooks.push({ path: "/webhook-receiver", id: req.headers.get("webhook-id") ?? "", timestamp: req.headers.get("webhook-timestamp") ?? "", signature: req.headers.get("webhook-signature") ?? "", event: req.headers.get("x-bifrost-event") ?? "", body: body })
++        return Response.json({ ok: true })
++      },
++    },
++    "/webhook-fail": {
++      POST: async (req) => {
++        const body = await req.text()
++        hooks.push({ path: "/webhook-fail", id: req.headers.get("webhook-id") ?? "", timestamp: req.headers.get("webhook-timestamp") ?? "", signature: req.headers.get("webhook-signature") ?? "", event: req.headers.get("x-bifrost-event") ?? "", body: body })
++        return Response.json({ error: { message: "receiver is down" } }, { status: 503 })
++      },
++    },
++    "/_hooks": () => Response.json(hooks),
+     // HashiCorp Vault KV v2
+     "/v1/secret/data/raiju": {
+       GET: (req) => {

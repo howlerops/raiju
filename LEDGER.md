@@ -207,19 +207,19 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L81 | G36, G38 | Decisions API, typesafe provider, decision-model complexity classifier | worker | assigned |
-| L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | assigned |
-| L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | assigned |
-| L84 | G41 | Projects, business units, custom roles and data access scopes | worker | assigned |
-| L85 | G42 | BigQuery, Kafka, Pub/Sub sinks; Parquet payloads; export retention | worker | module done; wiring and e2e in L89 |
+| L81 | G36, G38 | Decisions API, typesafe provider, decision-model complexity classifier | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
+| L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
+| L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
+| L84 | G41 | Projects, business units, custom roles and data access scopes | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
+| L85 | G42 | BigQuery, Kafka, Pub/Sub sinks; Parquet payloads; export retention | worker | done (wired by L89) |
 | L86 | G43 | Guardrails: regex, secrets rule set, reversible redaction, LLM judge, MCP tool-call guard, Presidio, Azure PII, Model Armor, CrowdStrike | worker | done (wired by L90) |
 | L87 | G44, G45 | Cluster discovery (Kubernetes, DNS, Consul, etcd, mDNS, UDP), leader election; auth proxies | worker | done except UDP/mDNS (Tov has no UDP: L92) and broker mode |
-| L88 | G46 | Prompt repository and deployments, webhooks, feature flags, notifications | worker | assigned |
+| L88 | G46 | Prompt repository and deployments, webhooks, feature flags, notifications | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
 
-| L89 | G42 | Wire the sinks into ops (BigQuery, Pub/Sub, Kafka, Maxim, Parquet, retention) with gateway-level e2e | worker | assigned |
+| L89 | G42 | Wire the sinks into ops (BigQuery, Pub/Sub, Kafka, Maxim, Parquet, retention) with gateway-level e2e | worker | done: unit + e2e (both servers) |
 | L90 | G43 | Wire the guardrails into the gateway (local engines, LLM judge, MCP tool guard, reversible) with e2e | worker | done: unit + e2e (both servers); Gitleaks set is a 35-rule subset |
-| L91 | G47, G22 | Circuit-breaker policy rerouting (persisted); MCP OAuth authorization-code flows | worker | assigned |
-| L92 | G29, G44 | Tov patches 0003 (TLS ALPN) and 0004 (UDP); TLS gRPC export; UDP and mDNS discovery | worker | assigned |
+| L91 | G47, G22 | Circuit-breaker policy rerouting (persisted); MCP OAuth authorization-code flows | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
+| L92 | G29, G44 | Tov patches 0003 (TLS ALPN) and 0004 (UDP); TLS gRPC export; UDP and mDNS discovery | worker | paused: weekly limit; unfinished work in handoff/patches (see HANDOFF.md) |
 
 Decision taken by the lead: models without a price stay a warning (cost 0), as in Bifrost;
 refusing them is a one-line switch if the owner wants it.

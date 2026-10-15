@@ -1,0 +1,1114 @@
+diff --git a/src/front.tov b/src/front.tov
+index f022502..637bef7 100644
+--- a/src/front.tov
++++ b/src/front.tov
+@@ -6,7 +6,7 @@ import { listen, Http1Request, Http1Response } from "./http1"
+ import { WsConnection } from "./ws"
+ import { Engine, StreamSink } from "./gateway"
+ import { Ops } from "./ops"
+-import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel } from "./server"
++import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel, http1Upgrade } from "./server"
+ import * as metrics from "./metrics"
+ import { relayHttp1 } from "./realtime"
+ 
+@@ -88,9 +88,12 @@ export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): string
+   const host = `${opts.hostname}:${opts.port}`
+   const onUpgrade = (req: Http1Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void): bool => {
+     const p = pathOf(req.path)
+-    if (p !== "/v1/realtime" && p !== "/openai/v1/realtime") return false
+-    relayHttp1(engine, toRequest(req, host), accept, reject)
+-    return true
++    if (p === "/v1/realtime" || p === "/openai/v1/realtime") {
++      relayHttp1(engine, toRequest(req, host), accept, reject)
++      return true
++    }
++    // the other WebSocket routes (server.tov's wsUpgrade)
++    return http1Upgrade(engine, ops, toRequest(req, host), accept, reject)
+   }
+   listen({ hostname: opts.hostname, port: opts.port, maxBodyBytes: opts.maxBodyBytes, onUpgrade: onUpgrade }, (req, res) => {
+     // runs as its own task; the response is finished from there
+diff --git a/src/live.tov b/src/live.tov
+new file mode 100644
+index 0000000..687a2c9
+--- /dev/null
++++ b/src/live.tov
+@@ -0,0 +1,316 @@
++// GPT Live over WebSockets, as Bifrost's wslive.go and livecontrol.go: /v1/live/sessions takes a
++// session.start frame that names the model, and relays the session to OpenAI's live endpoint.
++// The provider's session.started event gives the session's id, which is recorded under the
++// virtual key that opened it. An attach (/v1/live/sessions/{id}/attach) and the recording
++// (/v1/live/sessions/{id}/content) are refused to any other virtual key, as not found.
++//
++// Not here: billing, transcripts and delegation (Bifrost's livesession.go), the WebRTC create
++// (POST /v1/live/sessions), forks, and the registry's sharing between worker processes.
++import { Engine, errorResponse, noHeaders } from "./gateway"
++import { parseModel, target } from "./router"
++import { Target } from "./providers/types"
++import { trimSlash } from "./providers/types"
++import { Field, fields, find, rawStr, setField, build, quote } from "./json"
++import { Hdrs, snapshot } from "./schemas"
++import { SocketExt, upstreamFor, wsBase } from "./realtime"
++
++// How many sessions the registry holds. Past that a new session is refused, not left unrecorded.
++const MAX_RECORDS = 10000
++
++// The virtual key that opened each live session, by the provider's session id.
++export class LiveRegistry {
++  owners: Map<string, string> = new Map()
++
++  // Records the owner of a session. False when the registry is full. A session opened with no
++  // virtual key is not recorded, and anyone may reach it.
++  bind(id: string, owner: string): bool {
++    if (owner === "" || id === "") return true
++    if (this.owners.has(id)) return this.owners.get(id) === owner
++    if (this.owners.size >= MAX_RECORDS) return false
++    this.owners.set(id, owner)
++    return true
++  }
++
++  // Whether a caller with this virtual key ("" for none) may use the session.
++  allowed(id: string, caller: string): bool {
++    if (caller === "") return true
++    const o = this.owners.get(id)
++    return o === undefined || o === caller
++  }
++}
++
++// The virtual key of a request, "" when it has none.
++export function ownerOf(engine: Engine, h: Hdrs): string {
++  return engine.gov.findKey(h)?.id ?? ""
++}
++
++// Whether the request presents a credential the gateway accepts, when governance is enforced.
++// A provider key sent directly satisfies it too, as it does for inference.
++export function credentialOk(engine: Engine, h: Hdrs): bool {
++  if (!engine.gov.enforce) return true
++  if (engine.gov.findKey(h) !== undefined || h.get("x-bf-api-key") !== undefined) return true
++  const alt = engine.gov.altAuth
++  return alt !== undefined && alt(h)
++}
++
++// Session ids are the provider's: letters, digits, "_" and "-". Anything else is refused before it
++// reaches an upstream path.
++export function validId(id: string): bool {
++  if (id === "" || id.byteLength > 200) return false
++  const ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
++  for (let i = 0; i < id.byteLength; i++) {
++    if (!ok.includes(id.slice(i, i + 1))) return false
++  }
++  return true
++}
++
++// The id of a route /v1/live/sessions/{id}/attach, or "".
++export function attachId(p: string): string {
++  if (!p.startsWith("/v1/live/sessions/") || !p.endsWith("/attach")) return ""
++  return p.slice(18, p.byteLength - 7)
++}
++
++// The id of a route /v1/live/sessions/{id}/content, or "".
++export function contentId(p: string): string {
++  if (!p.startsWith("/v1/live/sessions/") || !p.endsWith("/content")) return ""
++  return p.slice(18, p.byteLength - 8)
++}
++
++// The OpenAI target the control routes use (attach and content name no model, so the openai
++// provider's key serves them, as in Bifrost).
++function controlTarget(engine: Engine, h: Hdrs): Target | undefined {
++  const sel = target(engine.cfg, { provider: "openai", model: "" }, new Set<int>(), h.get("x-bf-api-key") ?? undefined)
++  if (sel === undefined || sel.t.kind !== "openai") return undefined
++  return sel.t
++}
++
++function liveBase(t: Target): string {
++  return trimSlash(t.cfg.network_config?.base_url ?? "https://api.openai.com")
++}
++
++// The upstream URL and headers for an attach to a session, or undefined without an OpenAI key.
++export function attachUpstream(engine: Engine, h: Hdrs, id: string): { url: string, headers: Map<string, string> } | undefined {
++  const t = controlTarget(engine, h)
++  if (t === undefined) return undefined
++  const up = upstreamFor(t, undefined)
++  return { url: wsBase(liveBase(t)) + "/v1/live/sessions/" + id + "/attach", headers: up.headers }
++}
++
++// The type and message of a session's refusal, as Bifrost's realtime error event.
++function refusalEvent(type: string, message: string): string {
++  return JSON.stringify({ type: "error", error: { type: type, code: type, message: message } })
++}
++
++// Sets the session's model to the provider's name for it, leaving the rest of the frame as it is.
++export function rewriteStart(m: string, model: string): string throws SyntaxError {
++  let fs = try fields(m)
++  let sf: Field[] = []
++  const s = find(fs, "session")
++  if (s !== undefined) sf = try fields(s)
++  setField(&sf, "model", quote(model))
++  setField(&fs, "session", build(sf))
++  return build(fs)
++}
++
++// The session id of a session.started event, or "" for any other event.
++export function startedId(m: string): string {
++  if (!m.includes("session.started")) return ""
++  try {
++    const fs = fields(m)
++    if (rawStr(fs, "type") !== "session.started") return ""
++    const s = find(fs, "session")
++    if (s === undefined) return ""
++    return rawStr(fields(s), "id") ?? ""
++  } catch (e) {
++    return ""
++  }
++}
++
++// The upstream WebSocket, or undefined when it can't be made (a malformed URL, say).
++function openUpstream(url: string, hs: Record<string, string>): WebSocket | undefined {
++  try {
++    return new WebSocket(url, { headers: hs })
++  } catch (e) {
++    return undefined
++  }
++}
++
++// One live WebSocket: a primary (session.start first, then the session) or an attach (joined at
++// once, to a session another connection runs). Frames pass through unchanged.
++export class LiveSocket extends SocketExt {
++  started = false
++  upstream: WebSocket | undefined = undefined
++  sessionId = ""
++  constructor(readonly engine: Engine, readonly reg: LiveRegistry, readonly headers: Map<string, string>, readonly owner: string, readonly attachUrl: string, readonly attachHeaders: Map<string, string>) {
++    super()
++  }
++
++  onOpen(): void {
++    if (this.attachUrl !== "") {
++      this.started = true
++      this.dial(this.attachUrl, this.attachHeaders, "")
++    }
++  }
++
++  onMessage(m: string): void {
++    if (this.closed || this.ended) return
++    const up = this.upstream
++    if (up !== undefined) {
++      up.send(m)
++      return
++    }
++    if (!this.started) this.start(m)
++  }
++
++  onClose(): void {
++    this.closed = true
++    const up = this.upstream
++    if (up !== undefined && up.readyState < 2) up.close()
++  }
++
++  // The first frame of a primary: resolves the model, admits the session and dials the provider.
++  private start(m: string): void {
++    const cfg = this.engine.cfg
++    let model = ""
++    let frame = ""
++    try {
++      const fs = fields(m)
++      if (rawStr(fs, "type") !== "session.start") {
++        this.refuse("invalid_request_error", "the first event of a live session must be session.start")
++        return
++      }
++      const s = find(fs, "session")
++      if (s !== undefined) model = rawStr(fields(s), "model") ?? ""
++    } catch (e) {
++      this.refuse("invalid_request_error", "failed to parse session.start JSON")
++      return
++    }
++    if (model.trim() === "") {
++      this.refuse("invalid_request_error", "session.start requires session.model")
++      return
++    }
++    const ref = parseModel(cfg, model)
++    const admitted = this.engine.gov.admit(this.headers, ref.provider, ref.model)
++    if (admitted.kind === "denial") {
++      this.refuse(admitted.type, admitted.message)
++      return
++    }
++    const sel = target(cfg, ref, new Set<int>(), this.headers.get("x-bf-api-key") ?? undefined)
++    if (sel === undefined) {
++      this.refuse("invalid_request_error", `no key is configured for ${ref.provider}/${ref.model}`)
++      return
++    }
++    if (sel.t.kind !== "openai") {
++      this.refuse("invalid_request_error", `${ref.provider} has no live API this gateway can relay`)
++      return
++    }
++    const up = upstreamFor(sel.t, undefined)
++    try {
++      frame = rewriteStart(m, sel.t.model)
++    } catch (e) {
++      this.refuse("invalid_request_error", "failed to parse session.start JSON")
++      return
++    }
++    this.dial(wsBase(liveBase(sel.t)) + "/v1/live/sessions", up.headers, frame)
++  }
++
++  private dial(url: string, headers: Map<string, string>, first: string): void {
++    const hs: Record<string, string> = {}
++    for (const k of headers.keys()) hs.set(k, headers.get(k)!)
++    this.started = true
++    const up = openUpstream(url, hs)
++    if (up === undefined) {
++      this.refuse("server_error", "failed to open the live connection at the provider")
++      return
++    }
++    this.upstream = up
++    // the start frame goes first: the client socket sends anything later behind it
++    if (first !== "") up.send(first)
++    up.onmessage = (ev) => {
++      this.fromUpstream(ev.data)
++    }
++    up.onclose = (ev) => {
++      this.endWith(ev.code === 1005 || ev.code === 1006 ? 1011 : ev.code, ev.reason)
++    }
++    up.onerror = (ev) => {
++      this.endWith(1011, "upstream live connection failed")
++    }
++  }
++
++  private fromUpstream(d: string | u8[]): void {
++    if (this.closed || this.ended || typeof d !== "string") return
++    if (this.attachUrl === "") {
++      const id = startedId(d)
++      if (id !== "") {
++        this.sessionId = id
++        if (!this.reg.bind(id, this.owner)) {
++          this.refuse("server_error", "the live session could not be recorded for its virtual key and was not opened")
++          return
++        }
++      }
++    }
++    this.send(d)
++  }
++
++  // Tells the client why the session ends, then ends it. The upstream, if dialed, is closed too.
++  private refuse(type: string, message: string): void {
++    this.send(refusalEvent(type, message))
++    const up = this.upstream
++    if (up !== undefined && up.readyState < 2) up.close()
++    this.endWith(1008, "refused")
++  }
++}
++
++// GET /v1/live/sessions/{id}/content: the recording the provider kept, streamed as it sends it.
++export async function liveContent(engine: Engine, reg: LiveRegistry, req: Request, id: string): Promise<Response> {
++  const h = snapshot(req.headers)
++  if (!validId(id)) return errorResponse(400, "a session id is required", "invalid_request_error", noHeaders())
++  if (!credentialOk(engine, h)) return errorResponse(401, "authentication is required for live sessions", "authentication_error", noHeaders())
++  if (!reg.allowed(id, ownerOf(engine, h))) return errorResponse(404, "live session not found", "invalid_request_error", noHeaders())
++  const t = controlTarget(engine, h)
++  if (t === undefined) return errorResponse(404, "no OpenAI key is configured for live sessions", "invalid_request_error", noHeaders())
++  const up = upstreamFor(t, undefined)
++  const hs: Record<string, string> = {}
++  for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
++  try {
++    // buffered, as media.tov's files are: a streamed upstream body doesn't survive the Bun.serve path
++    const res = await fetch(liveBase(t) + "/v1/live/sessions/" + id + "/content", { method: "GET", headers: hs })
++    const bytes = await res.bytes()
++    const out: Record<string, string> = {}
++    out.set("content-type", res.headers.get("content-type") ?? "application/octet-stream")
++    return new Response(bytes, { status: res.status, headers: out })
++  } catch (e) {
++    console.error(`raiju: ${e.message}`)
++    return errorResponse(502, "failed to fetch the live session's recording", "api_error", noHeaders())
++  }
++}
++
++test("live session ids", () => {
++  expect(validId("sess_9aB-x")).toBe(true)
++  expect(validId("")).toBe(false)
++  expect(validId("a/b")).toBe(false)
++  expect(validId("a?x=1")).toBe(false)
++  expect(attachId("/v1/live/sessions/sess_1/attach")).toBe("sess_1")
++  expect(attachId("/v1/live/sessions/attach")).toBe("")
++  expect(contentId("/v1/live/sessions/sess_1/content")).toBe("sess_1")
++  expect(contentId("/v1/live/sessions/sess_1/attach")).toBe("")
++})
++
++test("live registry", () => {
++  const reg = new LiveRegistry()
++  expect(reg.bind("sess_a", "vk1")).toBe(true)
++  expect(reg.bind("sess_a", "vk2")).toBe(false)
++  expect(reg.allowed("sess_a", "vk1")).toBe(true)
++  expect(reg.allowed("sess_a", "vk2")).toBe(false)
++  expect(reg.allowed("sess_a", "")).toBe(true)
++  expect(reg.allowed("sess_unknown", "vk2")).toBe(true)
++  expect(reg.bind("sess_none", "")).toBe(true)
++  expect(reg.allowed("sess_none", "vk2")).toBe(true)
++})
++
++test("live start frames and ids", () => {
++  expect(try rewriteStart(`{"type":"session.start","session":{"model":"openai/gpt-live","voice":"alloy"}}`, "gpt-live")).toBe(`{"type":"session.start","session":{"model":"gpt-live","voice":"alloy"}}`)
++  expect(startedId(`{"type":"session.started","session":{"id":"sess_42"}}`)).toBe("sess_42")
++  expect(startedId(`{"type":"session.updated","session":{"id":"sess_42"}}`)).toBe("")
++  expect(startedId(`{"type":"response.audio.delta"}`)).toBe("")
++})
+diff --git a/src/ops.tov b/src/ops.tov
+index fde8070..ba82272 100644
+--- a/src/ops.tov
++++ b/src/ops.tov
+@@ -32,6 +32,8 @@ import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync
+ import { Counters, ClusterConfig, syncInterval } from "./cluster"
+ import * as cluster from "./cluster"
+ import { Discoverer } from "./discovery"
++import { SocketExt } from "./realtime"
++import { LiveRegistry } from "./live"
+ import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
+ import { ExportCursor, objectKey, putRequest, exportInterval, isoMs } from "./exports"
+ import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
+@@ -219,6 +221,75 @@ function trimPeer(p: string): string {
+ // How often discovery runs, in ms: it registers this node where the mechanism needs it, then lists the others.
+ const DISCOVER_MS = 10000
+ 
++// How often the UI socket looks for new request-log entries, in ms.
++const UI_TICK_MS = 1000
++
++// One dashboard client on /ws.
++export class UiSocket extends SocketExt {
++  constructor(readonly hub: UiHub) {
++    super()
++  }
++
++  onOpen(): void {
++    this.hub.add(this)
++  }
++
++  onClose(): void {
++    this.closed = true
++    this.hub.remove(this)
++  }
++}
++
++// The events /ws pushes, in Bifrost's envelope {"type": ..., "data": ...}: store_update after a
++// successful management write (tags name the resource changed), and log for each new request-log
++// entry while a client is connected. (Bifrost's socket at this version sends notifications and
++// store updates only; the log events are Raiju's.)
++export cyclic class UiHub {
++  clients: UiSocket[] = []
++  timer: int = -1
++  since: f64 = 0.0
++  constructor(readonly logs: () => LogStore | undefined) {}
++
++  add(c: UiSocket): void {
++    this.clients.push(c)
++    if (this.clients.length === 1) {
++      this.since = Date.now()
++      this.timer = setInterval(() => {
++        this.tick()
++      }, UI_TICK_MS)
++    }
++  }
++
++  remove(c: UiSocket): void {
++    this.clients = this.clients.filter((x) => x !== c)
++    if (this.clients.length === 0 && this.timer >= 0) {
++      clearInterval(this.timer)
++      this.timer = -1
++    }
++  }
++
++  send(text: string): void {
++    for (const c of this.clients) c.send(text)
++  }
++
++  // Pushes the request-log entries that arrived since the last tick.
++  tick(): void {
++    const store = this.logs()
++    if (store === undefined) return
++    for (const e of store.since(this.since)) {
++      this.send(JSON.stringify({ type: "log", data: logEventView(e) }))
++      this.since = e.ts
++    }
++  }
++}
++
++// The fields of a request-log entry that a dashboard shows live (no bodies, no raw payloads).
++type LogEvent = { id: string, ts: f64, request_id: string, op: string, provider: string, model: string, status: int, latency_ms: f64, prompt_tokens: int, completion_tokens: int, cost: f64, cache_hit: bool, virtual_key?: string, error?: string }
++
++function logEventView(e: LogEntry): LogEvent {
++  return { id: e.id, ts: e.ts, request_id: e.request_id, op: e.op, provider: e.provider, model: e.model, status: e.status, latency_ms: e.latency_ms, prompt_tokens: e.prompt_tokens, completion_tokens: e.completion_tokens, cost: e.cost, cache_hit: e.cache_hit, virtual_key: e.virtual_key, error: e.error }
++}
++
+ export class Ops {
+   rbac: RbacConfig = { users: [] }
+   authOn = false
+@@ -262,8 +333,12 @@ export class Ops {
+   discovery: Discovery | undefined = undefined
+   flows = new OidcFlows()
+   sessions = new UiSessions(28800)
++  // the /ws clients, and the virtual key that opened each live session (/v1/live/sessions)
++  ui: UiHub
++  liveSessions = new LiveRegistry()
+ 
+   constructor(readonly engine: Engine, readonly store: ConfigStore) {
++    this.ui = new UiHub(() => this.engine.logStore)
+     try {
+       this.nodeId = secureHex(6)
+     } catch (e) {
+@@ -1341,6 +1416,13 @@ export class Ops {
+     }
+   }
+ 
++  // The /ws event for a management write that succeeded: the resource it changed, as Bifrost's
++  // store_update tags (the first path segment under /api).
++  storeUpdated(path: string): void {
++    const seg = path.split("/")[2] ?? ""
++    this.ui.send(JSON.stringify({ type: "store_update", tags: [seg] }))
++  }
++
+   // Whether the caller may use this /api route; the actor names them in the audit log.
+   gate(req: Request, path: string): Gate {
+     const pg = this.proxyGate(req, path)
+diff --git a/src/realtime.tov b/src/realtime.tov
+index 00ee0ff..bfb53d6 100644
+--- a/src/realtime.tov
++++ b/src/realtime.tov
+@@ -11,12 +11,45 @@ import { errorJson } from "./schemas"
+ 
+ export class Session {
+   upstream: WebSocket | undefined = undefined
++  // the state of a WebSocket route other than the realtime relay (responses, live, the UI socket);
++  // undefined for the relay
++  ext: SocketExt | undefined = undefined
+   constructor(readonly url: string, readonly headers: Map<string, string>, readonly provider: string, readonly model: string) {}
+ }
+ 
++// What a WebSocket route sends through: the connection's send and close, as closures so the route
++// code is the same on Bun.serve and on the http1 server.
++export class Pipe {
++  constructor(readonly sendText: (s: string) => void, readonly closeWith: (code: int, reason: string) => void) {}
++}
++
++// The state of a WebSocket route other than /v1/realtime. The server attaches a Pipe, then calls
++// onOpen, and calls onMessage for each text frame and onClose once the socket is gone.
++export class SocketExt {
++  pipe: Pipe | undefined = undefined
++  // the client has gone
++  closed = false
++  // the route has closed the socket (sent its close frame)
++  ended = false
++  onOpen(): void {}
++  onMessage(m: string): void {}
++  onClose(): void {}
++  send(t: string): void {
++    const p = this.pipe
++    if (p !== undefined && !this.closed && !this.ended) p.sendText(t)
++  }
++  endWith(code: int, reason: string): void {
++    const p = this.pipe
++    if (p !== undefined && !this.ended) {
++      this.ended = true
++      p.closeWith(code, reason)
++    }
++  }
++}
++
+ export type Upgrade = { kind: "session", session: Session } | { kind: "refused", status: int, message: string }
+ 
+-function wsBase(url: string): string {
++export function wsBase(url: string): string {
+   if (url.startsWith("https://")) return "wss://" + url.slice(8)
+   if (url.startsWith("http://")) return "ws://" + url.slice(7)
+   return url
+@@ -26,6 +59,58 @@ function trim(s: string): string {
+   return s.endsWith("/") ? s.slice(0, s.byteLength - 1) : s
+ }
+ 
++// Bun.serve's open, message and close for a route with state in ext. Each returns false for the
++// realtime relay, which the caller then hands to onOpen, onMessage and onClose.
++export function extOpen(ws: ServerWebSocket<Session>): bool {
++  const s = ws.data
++  if (s === undefined) return false
++  const e = s.ext
++  if (e === undefined) return false
++  e.pipe = new Pipe((t) => {
++    ws.send(t)
++  }, (c, r) => {
++    ws.close(c, r)
++  })
++  e.onOpen()
++  return true
++}
++
++export function extMessage(ws: ServerWebSocket<Session>, m: string | u8[]): bool {
++  const s = ws.data
++  if (s === undefined) return false
++  const e = s.ext
++  if (e === undefined) return false
++  if (typeof m === "string") e.onMessage(m)
++  return true
++}
++
++export function extClose(ws: ServerWebSocket<Session>): bool {
++  const s = ws.data
++  if (s === undefined) return false
++  const e = s.ext
++  if (e === undefined) return false
++  e.closed = true
++  e.onClose()
++  return true
++}
++
++// The same for an accepted http1 connection.
++export function attachHttp1(e: SocketExt, client: WsConnection): void {
++  e.pipe = new Pipe((t) => {
++    client.send(t)
++  }, (c, r) => {
++    client.close(c, r)
++  })
++  client.onMessage = (m) => {
++    if (typeof m === "string") e.onMessage(m)
++  }
++  client.onClose = (c, r) => {
++    e.closed = true
++    e.onClose()
++  }
++  e.onOpen()
++}
++
+ export function upstreamFor(t: Target, beta: string | undefined): { url: string, headers: Map<string, string> } {
+   const h: Map<string, string> = new Map()
+   if (t.kind === "azure") {
+diff --git a/src/server.tov b/src/server.tov
+index 7929803..ac78e8f 100644
+--- a/src/server.tov
++++ b/src/server.tov
+@@ -11,17 +11,20 @@ import * as anthropic from "./providers/anthropic"
+ import * as gemini from "./providers/gemini"
+ import { fields, find, elements, rawStr, rawBool } from "./json"
+ import * as metrics from "./metrics"
+-import { Session, prepare, onOpen, onMessage, onClose } from "./realtime"
++import { Session, SocketExt, prepare, onOpen, onMessage, onClose, extOpen, extMessage, extClose, attachHttp1 } from "./realtime"
++import { ResponsesSocket } from "./wsresponses"
++import { LiveSocket, liveContent, contentId, attachId, attachUpstream, ownerOf, credentialOk, validId } from "./live"
++import { WsConnection } from "./ws"
+ import { parseQuery, filterFrom, selectAll, statsView } from "./logstore"
+ import { matchRoute, handleMedia, deploymentRoute, deploymentRequest } from "./media"
+ import { sdkRoute, anthropicSdk } from "./anthropic_batch"
+-import { snapshot } from "./schemas"
++import { snapshot, errorJson } from "./schemas"
+ import { handleApi, proxyWidening } from "./store"
+ import { passthroughPath, passthroughRoute } from "./passthrough"
+ import { mcpApi } from "./mcpapi"
+ import { alertingRoute } from "./alertapi"
+ import { McpSession } from "./mcp"
+-import { Ops, Reply } from "./ops"
++import { Ops, Reply, UiSocket } from "./ops"
+ import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, Dispatch } from "./extras"
+ import { asyncPoll } from "./jobs"
+ import { INDEX_HTML } from "./ui_assets"
+@@ -270,6 +273,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
+     }
+   }
+   ops.recordChange(gate.actor, req, path, r.status, body)
++  if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
+   const h: Record<string, string> = new Map()
+   h.set("content-type", r.contentType)
+   return new Response(r.body, { status: r.status, headers: h })
+@@ -394,6 +398,8 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
+   // the GenAI SDK's files, batches, cached contents, operations, :predict and rank
+   const gop = genaiIn.genaiRoute(m, p)
+   if (gop !== undefined) return await cors(engine.cfg, req, await genaiSdk(engine, req, gop.op, gop.model, gop.id))
++  const lc = contentId(p)
++  if (lc !== "" && m === "GET") return await liveContent(engine, ops.liveSessions, req, lc)
+   if (m === "GET" || m === "HEAD") {
+     if (p === "/health") return Response.json({ status: "ok" })
+     if (p === "/") return textResponse(INDEX_HTML, "text/html; charset=utf-8")
+@@ -564,6 +570,65 @@ async function chatStreamed(engine: Engine, req: Request, kind: string): Promise
+   return await cors(engine.cfg, req, await p)
+ }
+ 
++// What a WebSocket upgrade becomes: the session to open, a refusal (an HTTP answer), or no
++// WebSocket route at all.
++export type WsUpgrade = { kind: "none" } | { kind: "refused", status: int, message: string } | { kind: "session", session: Session }
++
++function wsSession(req: Request, ext: SocketExt): Session {
++  const s = new Session(req.url, snapshot(req.headers), "", "")
++  s.ext = ext
++  return s
++}
++
++// The WebSocket routes, for both servers: the realtime relay, the Responses API (GET /v1/responses),
++// GPT Live (/v1/live/sessions and its attach) and the UI socket (/ws). A refusal is decided before
++// the upgrade, so the client gets an HTTP status.
++export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
++  const u = URL.parse(req.url)
++  const p0 = u === undefined ? "" : u.pathname
++  const p = p0.startsWith("/openai/v1/") ? p0.slice(7) : p0
++  if (p === "/v1/realtime") {
++    const up = prepare(engine, req)
++    if (up.kind === "refused") return { kind: "refused", status: up.status, message: up.message }
++    return { kind: "session", session: up.session }
++  }
++  if (req.method !== "GET") return { kind: "none" }
++  const h = snapshot(req.headers)
++  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, new ResponsesSocket(engine, h)) }
++  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map())) }
++  const att = attachId(p)
++  if (att !== "") {
++    if (!validId(att)) return { kind: "refused", status: 400, message: "a session id is required" }
++    if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
++    const owner = ownerOf(engine, h)
++    if (!ops.liveSessions.allowed(att, owner)) return { kind: "refused", status: 404, message: "live session not found" }
++    const up = attachUpstream(engine, h, att)
++    if (up === undefined) return { kind: "refused", status: 404, message: "no OpenAI key is configured for live sessions" }
++    return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers)) }
++  }
++  if (p === "/ws") {
++    const g = ops.gate(req, "/ws")
++    if (g.kind === "deny") return { kind: "refused", status: g.res.status, message: g.res.status === 401 ? "authentication is required" : "this role may not open the UI socket" }
++    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui)) }
++  }
++  return { kind: "none" }
++}
++
++// The same routes on the http1 server (front.tov): an accepted socket runs its route's state, and a
++// refusal is answered over HTTP. False for a path that is no WebSocket route.
++export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void): bool {
++  const wu = wsUpgrade(engine, ops, req)
++  if (wu.kind === "none") return false
++  if (wu.kind === "refused") {
++    reject(wu.status, errorJson(wu.message, "invalid_request_error", undefined))
++    return true
++  }
++  const client = accept()
++  const ext = wu.session.ext
++  if (client !== undefined && ext !== undefined) attachHttp1(ext, client)
++  return true
++}
++
+ // The Bun.serve server (the default): streamed chat answers, Tov's multi-process workers,
+ // native WebSockets.
+ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
+@@ -572,14 +637,14 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
+     hostname: opts.hostname,
+     workers: opts.workers,
+     fetch(req, server) {
+-      const u = URL.parse(req.url)
+-      const p = u === undefined ? "" : u.pathname
+-      if (p === "/v1/realtime" || p === "/openai/v1/realtime") {
+-        const up = prepare(engine, req)
+-        if (up.kind === "refused") return errorResponse(up.status, up.message, "invalid_request_error", noHeaders())
+-        if (server.upgrade(req, { data: up.session })) return
++      const wu = wsUpgrade(engine, ops, req)
++      if (wu.kind === "refused") return errorResponse(wu.status, wu.message, "invalid_request_error", noHeaders())
++      if (wu.kind === "session") {
++        if (server.upgrade(req, { data: wu.session })) return
+         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
+       }
++      const u = URL.parse(req.url)
++      const p = u === undefined ? "" : u.pathname
+       const cp = compatPath(p)
+       const t0 = performance.now()
+       const reqBytes = parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0
+@@ -588,9 +653,15 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
+       return timed(p, req.method, t0, reqBytes, dispatch(engine, ops, req))
+     },
+     websocket: {
+-      open: (ws) => onOpen(ws),
+-      message: (ws, m) => onMessage(ws, m),
+-      close: (ws) => onClose(ws),
++      open: (ws) => {
++        if (!extOpen(ws)) onOpen(ws)
++      },
++      message: (ws, m) => {
++        if (!extMessage(ws, m)) onMessage(ws, m)
++      },
++      close: (ws) => {
++        if (!extClose(ws)) onClose(ws)
++      },
+     },
+   })
+   return server.url.href
+diff --git a/src/wsresponses.tov b/src/wsresponses.tov
+new file mode 100644
+index 0000000..ca48c60
+--- /dev/null
++++ b/src/wsresponses.tov
+@@ -0,0 +1,153 @@
++// The Responses API over a WebSocket (GET /v1/responses with an upgrade), as Bifrost's
++// wsresponses.go: each response.create event runs through the responses path, streamed, and the
++// events it produces go back over the socket as text messages, one per event. Events run one at a
++// time per connection. The gateway builds a streamed answer whole, so the events go out when the
++// upstream has finished, not as each one arrives.
++import { Engine } from "./gateway"
++import { responsesApi } from "./native"
++import { fields, find, rawStr, setField, without, build } from "./json"
++import { SocketExt } from "./realtime"
++
++// Headers of the WebSocket handshake, which the event's own request must not carry.
++const HANDSHAKE_HEADERS = ["upgrade", "connection", "host", "content-length", "transfer-encoding", "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "sec-websocket-protocol", "sec-websocket-accept"]
++
++// Bifrost's error event: {"type":"error","status":N,"error":{"code":..,"message":..}}.
++export function errorEvent(status: int, code: string, message: string): string {
++  return JSON.stringify({ type: "error", status: status, error: { code: code, message: message } })
++}
++
++// The error event for an upstream answer with a status of 400 or more, whose body is the usual
++// {"error":{...}}. A body that isn't one is sent as the message.
++export function upstreamErrorEvent(status: int, body: string): string {
++  let code = "server_error"
++  let message = body
++  try {
++    const e = find(try fields(body), "error")
++    if (e !== undefined) {
++      const ef = try fields(e)
++      code = rawStr(ef, "code") ?? rawStr(ef, "type") ?? code
++      message = rawStr(ef, "message") ?? message
++    }
++  } catch (e) {
++    message = body
++  }
++  return errorEvent(status, code, message)
++}
++
++// The request body for one response.create event: the event without its type, streamed.
++export function eventBody(text: string): string throws SyntaxError {
++  let fs = try fields(text)
++  fs = without(fs, ["type"])
++  setField(&fs, "stream", "true")
++  return build(fs)
++}
++
++// The data payloads of an event stream, in order, without [DONE].
++export function ssePayloads(text: string): string[] {
++  const out: string[] = []
++  for (const line of text.split("\n")) {
++    if (!line.startsWith("data:")) continue
++    const payload = line.slice(5).trim()
++    if (payload === "" || payload === "[DONE]") continue
++    out.push(payload)
++  }
++  return out
++}
++
++export class ResponsesSocket extends SocketExt {
++  queue: string[] = []
++  busy = false
++  constructor(readonly engine: Engine, readonly headers: Map<string, string>) {
++    super()
++  }
++
++  onMessage(m: string): void {
++    if (this.closed) return
++    let type = ""
++    try {
++      type = rawStr(fields(m), "type") ?? ""
++    } catch (e) {
++      this.send(errorEvent(400, "invalid_request_error", "failed to parse event JSON"))
++      return
++    }
++    if (type !== "response.create") {
++      this.send(errorEvent(400, "invalid_request_error", `unsupported event type: ${type}`))
++      return
++    }
++    this.queue.push(m)
++    if (!this.busy) {
++      this.busy = true
++      drain(this)
++    }
++  }
++
++  onClose(): void {
++    this.closed = true
++    this.queue = []
++  }
++
++  // Runs one response.create event and sends its events back.
++  async run(text: string): Promise<void> {
++    let body = ""
++    try {
++      body = eventBody(text)
++    } catch (e) {
++      this.send(errorEvent(400, "invalid_request_error", "failed to parse response.create event"))
++      return
++    }
++    const hs: Record<string, string> = {}
++    for (const k of this.headers.keys()) {
++      if (!HANDSHAKE_HEADERS.includes(k)) hs.set(k, this.headers.get(k)!)
++    }
++    hs.set("content-type", "application/json")
++    const req = new Request("http://localhost/v1/responses", { method: "POST", headers: hs, body: body })
++    let status = 500
++    let answer = ""
++    try {
++      const res = await responsesApi(this.engine, req)
++      status = res.status
++      answer = await res.text()
++    } catch (e) {
++      console.error(`raiju: ${e.message}`)
++      this.send(errorEvent(500, "server_error", "internal server error"))
++      return
++    }
++    if (status >= 400) {
++      this.send(upstreamErrorEvent(status, answer))
++      return
++    }
++    const payloads = ssePayloads(answer)
++    if (payloads.length === 0) {
++      if (answer !== "") this.send(answer)
++      return
++    }
++    for (const p of payloads) this.send(p)
++  }
++}
++
++// Runs the queued events of a connection, one after another.
++async function drain(s: ResponsesSocket): Promise<void> {
++  while (s.queue.length > 0 && !s.closed) {
++    const m = s.queue.shift()!
++    await s.run(m)
++  }
++  s.busy = false
++}
++
++test("error events", () => {
++  expect(upstreamErrorEvent(429, `{"error":{"message":"slow down","type":"rate_limit_error","code":"rate_limit"}}`)).toBe(`{"type":"error","status":429,"error":{"code":"rate_limit","message":"slow down"}}`)
++  expect(upstreamErrorEvent(502, "bad gateway")).toBe(`{"type":"error","status":502,"error":{"code":"server_error","message":"bad gateway"}}`)
++  expect(errorEvent(400, "invalid_request_error", "x")).toBe(`{"type":"error","status":400,"error":{"code":"invalid_request_error","message":"x"}}`)
++})
++
++test("event bodies drop the type and stream", () => {
++  expect(try eventBody(`{"type":"response.create","model":"openai/gpt-4o","input":"hi"}`)).toBe(`{"model":"openai/gpt-4o","input":"hi","stream":true}`)
++  expect(try eventBody(`{"type":"response.create","model":"m","stream":false}`)).toBe(`{"model":"m","stream":true}`)
++})
++
++test("sse payloads", () => {
++  const s = "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.completed\r\ndata: {\"type\":\"response.completed\"}\r\n\ndata: [DONE]\n\n"
++  expect(ssePayloads(s).length).toBe(2)
++  expect(ssePayloads(s)[1]).toBe(`{"type":"response.completed"}`)
++  expect(ssePayloads("").length).toBe(0)
++})
+diff --git a/tests/e2e.py b/tests/e2e.py
+index 771847c..b7d7b7e 100755
+--- a/tests/e2e.py
++++ b/tests/e2e.py
+@@ -79,6 +79,91 @@ def ws_roundtrip(path, message, headers=None):
+     sock.close()
+     return 101, data
+ 
++class WsClient:
++    """A WebSocket client for the gateway: the handshake (read byte by byte, so no frame is lost),
++    masked text frames out, and text frames in. status is the handshake's status; recv() is None
++    once the server closes."""
++    def __init__(self, path, headers=None, port=18098):
++        import base64 as b64m, os as _os, socket
++        self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
++        key = b64m.b64encode(_os.urandom(16)).decode()
++        extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
++        self.sock.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n".encode())
++        head = b""
++        while b"\r\n\r\n" not in head:
++            chunk = self.sock.recv(1)
++            if chunk == b"":
++                break
++            head += chunk
++        self.status = int(head.split(b" ")[1]) if head else 0
++        self.closed = self.status != 101
++
++    def _read(self, k):
++        buf = b""
++        while len(buf) < k:
++            part = self.sock.recv(k - len(buf))
++            if part == b"":
++                raise EOFError("connection closed")
++            buf += part
++        return buf
++
++    def send(self, text):
++        mask = os.urandom(4)
++        payload = text.encode()
++        n = len(payload)
++        hdr = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
++        self.sock.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
++
++    def recv(self):
++        """The next text message, or None when the server has closed the connection."""
++        if self.closed:
++            return None
++        message = b""
++        while True:
++            try:
++                b0, b1 = self._read(2)
++            except (EOFError, OSError):
++                self.closed = True
++                return None
++            ln = b1 & 0x7F
++            if ln == 126:
++                ln = struct.unpack(">H", self._read(2))[0]
++            elif ln == 127:
++                ln = struct.unpack(">Q", self._read(8))[0]
++            data = self._read(ln) if ln else b""
++            op = b0 & 0x0F
++            if op == 0x8:
++                self.closed = True
++                return None
++            if op in (0x9, 0xA):
++                continue
++            message += data
++            if b0 & 0x80:
++                return message.decode()
++
++    def recv_json(self):
++        text = self.recv()
++        return None if text is None else json.loads(text)
++
++    def until(self, kind, limit=50):
++        """The events up to and including the one of this type, as parsed JSON."""
++        out = []
++        for _ in range(limit):
++            ev = self.recv_json()
++            if ev is None:
++                break
++            out.append(ev)
++            if ev.get("type") == kind:
++                break
++        return out
++
++    def close(self):
++        try:
++            self.sock.close()
++        except OSError:
++            pass
++        self.closed = True
++
+ def call_bytes(method, path, body=None, headers=None, base=GW):
+     """Like call(), but returns the body as bytes (for binary streams); the headers are a Message."""
+     data = None if body is None else (body if isinstance(body, str) else json.dumps(body)).encode()
+@@ -896,6 +981,78 @@ def main():
+         st, _ = ws_roundtrip("/v1/realtime?model=anthropic/claude", "{}")
+         check("realtime refuses providers without a realtime API", st == 400, st)
+ 
++        # WebSocket mode of /v1/responses: response.create runs through the responses path, and its
++        # events come back one per message, on the same connection
++        rs = WsClient("/v1/responses")
++        check("responses WebSocket upgrades", rs.status == 101, rs.status)
++        rs.send(json.dumps({"type": "response.create", "model": "openai/gpt-4o-mini", "input": "hi"}))
++        evs = rs.until("response.completed")
++        check("responses WebSocket streams the events", [e.get("type") for e in evs] == ["response.created", "response.output_text.delta", "response.output_text.delta", "response.completed"], evs)
++        check("responses WebSocket deltas make the answer", "".join(e.get("delta", "") for e in evs) == "Hello", evs)
++        up = [x for x in seen() if x["path"] == "/v1/responses"][-1]
++        ub = json.loads(up["body"])
++        check("the upstream request streams, without the event type", ub.get("stream") is True and "type" not in ub and ub.get("model") == "gpt-4o-mini", up["body"])
++        rs.send('{"type":"response.cancel"}')
++        ev = rs.recv_json()
++        check("unsupported events are errors, and the socket stays up", ev.get("type") == "error" and ev.get("status") == 400 and "unsupported event type" in ev["error"]["message"], ev)
++        rs.send("not json")
++        ev = rs.recv_json()
++        check("unparsable events are errors", ev.get("type") == "error" and ev.get("status") == 400, ev)
++        rs.send(json.dumps({"type": "response.create", "model": "nope/gpt", "input": "hi"}))
++        ev = rs.recv_json()
++        check("an event the gateway refuses comes back as an error event", ev.get("type") == "error" and ev.get("status", 0) >= 400 and ev["error"]["message"], ev)
++        rs.send(json.dumps({"type": "response.create", "model": "openai/gpt-4o-mini", "input": "again"}))
++        evs = rs.until("response.completed")
++        check("a later event on the same socket still runs", evs and evs[-1].get("type") == "response.completed", evs)
++        rs.close()
++
++        # GPT Live: session.start names the model; the provider's id is recorded for the virtual key
++        # that opened it, so only that key may attach to it or read its recording
++        lv = WsClient("/v1/live/sessions", {"authorization": "Bearer sk-bf-openai"})
++        lv.send(json.dumps({"type": "session.start", "session": {"model": "openai/gpt-4o-mini", "voice": "alloy"}}))
++        started = lv.recv_json()
++        check("a live session starts at the provider and reports its id", started.get("type") == "session.started" and started["session"]["id"] == "sess_mock_1", started)
++        echo = lv.recv_json()
++        check("live frames reach the provider with its key, URL and backend model", echo and echo.get("type") == "echo" and "Bearer sk-from-env" in echo["auth"] and "/v1/live/sessions" in echo["auth"] and '"model":"gpt-4o-mini"' in echo["event"] and "openai/" not in echo["event"], echo)
++        lv.send('{"type":"session.update","session":{"instructions":"be brief"}}')
++        echo = lv.recv_json()
++        check("later live frames are relayed", echo and echo.get("type") == "echo" and "session.update" in echo["event"], echo)
++        lv.close()
++        bad = WsClient("/v1/live/sessions")
++        bad.send('{"type":"session.update"}')
++        ev = bad.recv_json()
++        check("a live session must open with session.start", ev and ev.get("type") == "error" and "session.start" in ev["error"]["message"] and bad.recv() is None, ev)
++        bad = WsClient("/v1/live/sessions")
++        bad.send('{"type":"session.start","session":{"model":"anthropic/claude"}}')
++        ev = bad.recv_json()
++        check("live sessions refuse providers without a live API", ev and ev.get("type") == "error" and "no live API" in ev["error"]["message"], ev)
++        at = WsClient("/v1/live/sessions/sess_mock_1/attach", {"authorization": "Bearer sk-bf-openai"})
++        check("the owner key may attach", at.status == 101, at.status)
++        at.send('{"type":"session.update"}')
++        echo = at.recv_json()
++        check("an attach relays to the session's attach route", echo and "/v1/live/sessions/sess_mock_1/attach" in echo["auth"], echo)
++        at.close()
++        check("another virtual key may not attach (not found)", WsClient("/v1/live/sessions/sess_mock_1/attach", {"authorization": "Bearer sk-bf-limited"}).status == 404)
++        check("a request with no key may attach, as in Bifrost", WsClient("/v1/live/sessions/sess_mock_1/attach").status == 101)
++        s, _, b = call("GET", "/v1/live/sessions/sess_mock_1/content", headers={"authorization": "Bearer sk-bf-openai"})
++        check("the owner key reads the recording", s == 200 and b == "RIFF-recording-sess_mock_1", (s, b))
++        s, _, b = call("GET", "/v1/live/sessions/sess_mock_1/content", headers={"authorization": "Bearer sk-bf-limited"})
++        check("another key does not read the recording", s == 404, (s, b))
++        s, _, b = call("GET", "/v1/live/sessions/bad%20id/content")
++        check("a malformed session id is refused", s == 400, (s, b))
++
++        # the UI socket: management auth on the upgrade, store updates after a write, request logs
++        check("the UI socket needs management auth", WsClient("/ws").status == 401)
++        ui = WsClient("/ws", ADMIN)
++        check("the UI socket upgrades with management auth", ui.status == 101, ui.status)
++        call("POST", "/api/mcp/client/local/refresh-tools")
++        evs = ui.until("store_update")
++        check("a management write goes out on the UI socket", evs and evs[-1].get("tags") == ["mcp"], evs[-1:] if evs else evs)
++        chat("openai/gpt-4o-mini", seed=4242)
++        evs = ui.until("log")
++        check("a new request-log entry goes out on the UI socket", evs and evs[-1].get("type") == "log" and evs[-1]["data"]["model"] == "gpt-4o-mini", evs[-1:] if evs else evs)
++        ui.close()
++
+         # Anthropic SDK route to a non-Anthropic provider
+         s, _, b = call("POST", "/anthropic/v1/messages", {"model": "openai/gpt-4o-mini", "max_tokens": 20, "system": "be brief", "messages": [{"role": "user", "content": "hi"}]})
+         r = json.loads(b)
+diff --git a/tests/mock_upstream.tov b/tests/mock_upstream.tov
+index df2402b..fee953f 100644
+--- a/tests/mock_upstream.tov
++++ b/tests/mock_upstream.tov
+@@ -560,6 +560,12 @@ Bun.serve<string>({
+       POST: async (req) => {
+         const body = await req.text()
+         record(req, "/v1/responses", body)
++        // a streamed answer: the Responses events (the WebSocket mode's tests read them)
++        if (body.includes(`"stream":true`)) {
++          const ev = (name: string, data: string): string => `event: ${name}\ndata: ${data}\n\n`
++          const sse = ev("response.created", `{"type":"response.created","sequence_number":0,"response":{"id":"resp_s1","status":"in_progress"}}`) + ev("response.output_text.delta", `{"type":"response.output_text.delta","sequence_number":1,"delta":"Hel"}`) + ev("response.output_text.delta", `{"type":"response.output_text.delta","sequence_number":2,"delta":"lo"}`) + ev("response.completed", `{"type":"response.completed","sequence_number":3,"response":{"id":"resp_s1","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`) + "data: [DONE]\n\n"
++          return new Response(sse, { headers: { "content-type": "text/event-stream" } })
++        }
+         return new Response(`{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"native responses","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`, { headers: { "content-type": "application/json" } })
+       },
+     },
+@@ -732,6 +738,13 @@ Bun.serve<string>({
+       oh.set("content-type", up.headers.get("content-type") ?? "application/json")
+       return new Response(out, { status: up.status, headers: oh })
+     }
++    // GPT Live's recording of a session
++    if (lp.startsWith("/v1/live/sessions/") && lp.endsWith("/content") && req.method === "GET") {
++      record(req, lp, "")
++      const hd: Record<string, string> = new Map()
++      hd.set("content-type", "audio/wav")
++      return new Response("RIFF-recording-" + lp.slice(18, lp.byteLength - 8), { headers: hd })
++    }
+     if (lp.startsWith("/v1/responses/") || lp === "/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions" || lp === "/v1/realtime/calls") {
+       const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
+       record(req, lp, req.method + " " + body)
+@@ -739,7 +752,7 @@ Bun.serve<string>({
+       return Response.json({ object: "ok", method: req.method, path: lp })
+     }
+     // realtime: echo each event back, tagged with the credentials and URL the gateway used
+-    if (req.url.includes("/v1/realtime")) {
++    if (req.url.includes("/v1/realtime") || req.url.includes("/v1/live/sessions")) {
+       const tag = (req.headers.get("authorization") ?? "") + " " + req.url
+       if (server.upgrade(req, { data: tag })) return
+     }
+@@ -846,7 +859,10 @@ Bun.serve<string>({
+   },
+   websocket: {
+     message(ws, m) {
+-      ws.send(JSON.stringify({ type: "echo", auth: ws.data ?? "", event: typeof m === "string" ? m : "binary" }))
++      const text = typeof m === "string" ? m : "binary"
++      // a live session starts with session.start; the provider answers with its id
++      if (text.includes(`"session.start"`)) ws.send(`{"type":"session.started","session":{"id":"sess_mock_1"}}`)
++      ws.send(JSON.stringify({ type: "echo", auth: ws.data ?? "", event: text }))
+     },
+   },
+ })
