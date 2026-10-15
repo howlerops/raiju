@@ -226,7 +226,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
 | L93 | G43 | Full Gitleaks rule set (from upstream gitleaks.toml, not memory) | worker | done: gitleaks v8.30.1, 220 rules (pkcs12-file is path-only; generic-api-key held back until L101), keyword prefilter (20 KB check 41 ms → 3 ms); unit + e2e |
-| L94 | G44 | Broker-mode clustering (relay process) and lock-based leader election | worker | assigned |
+| L94 | G44 | Broker-mode clustering (relay process) and lock-based leader election | worker | done: broker mode (HTTP relay process, `-mode broker`; Bifrost's is gRPC) and etcd lease leader lock (Raiju design; Bifrost elects by rank); unit + e2e |
 | L95 | G4, cache | Owner switches, defaults unchanged: refuse unpriced models; exact-match cache scoped per virtual key | worker | done: client.refuse_unpriced_models (budgeted requests to an unpriced model are refused, 403) and cache.scope_by_virtual_key, both off by default; unit + e2e |
 | L96 | G32, G33, all | Re-audit docs/parity.md (rows counted by script) and bring SCOPE.md and README in sync | worker | todo (after waves 12-13 merge) |
 | L100 | G37 | Compat remainder: stream conversions (text-to-chat, chat-to-responses), decision emulation (needs L81), azure_deepseek, reasoning budget scaling and min_output_tokens, summary fitting for Responses | worker | done: streamed text-to-chat and chat-to-responses, decision emulation, Azure DeepSeek reasoning drop, output and reasoning budget fitting, Responses-side drops; unit + e2e. Open: compat headers on streamed answers, native-decision model checks |

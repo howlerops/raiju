@@ -736,6 +736,109 @@ def discovery_and_proxy():
         for srv in servers:
             srv.shutdown()
 
+BROKER_URL = "http://127.0.0.1:18133"  # the broker process (cluster_config.broker.listen_port)
+BROKER_NODES = ["http://127.0.0.1:18134", "http://127.0.0.1:18135"]  # two nodes that have no peers
+LOCK_ETCD = "http://127.0.0.1:18136"  # tests/etcd_stub.py
+LOCK_NODES = ["http://127.0.0.1:18137", "http://127.0.0.1:18138"]  # two nodes electing on an etcd lease
+
+def cluster_sig(secret, body=""):
+    import hashlib, hmac
+    return hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+
+def cluster_leader(base, secret):
+    s, _, b = call("GET", "/api/cluster/leader", headers={"x-raiju-cluster-sig": cluster_sig(secret)}, base=base, auth=False)
+    return json.loads(b) if s == 200 else {"status": s, "body": b}
+
+def cluster_modes_e2e():
+    """Broker mode: a broker and two nodes with no peers share a rate limit through the broker only. Lock-based
+    leader election: an etcd stub holds the lease, one of two nodes leads, and the other takes over when the
+    leader stops renewing."""
+    d = os.path.join(BUILD, "e2e-cluster")
+    os.makedirs(d, exist_ok=True)
+    provider = {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}
+    def write(name, cfg):
+        path = os.path.join(d, name + ".json")
+        json.dump(cfg, open(path, "w"))
+        return path
+    broker_secret, lock_secret = "e2e-broker", "e2e-lock"
+    cfgs = {
+        "broker": write("broker", {"client": {"enable_logging": False}, "cluster": {"enabled": True, "secret": broker_secret, "peers": [], "type": "broker", "broker": {"address": "127.0.0.1:18133", "listen_port": 18133}}}),
+        "bn-a": write("bn-a", {"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "providers": provider,
+                               "governance": {"rate_limits": [{"id": "b-rl", "request_max_limit": 3, "request_reset_duration": "1h"}], "virtual_keys": [{"id": "vk-b", "value": "sk-bf-broker", "rate_limit_id": "b-rl"}]},
+                               "cluster": {"enabled": True, "type": "broker", "node_id": "bn-a", "secret": broker_secret, "interval_ms": 200, "peers": [], "broker": {"address": "127.0.0.1:18133"}}}),
+        "bn-b": write("bn-b", {"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "providers": provider,
+                               "governance": {"rate_limits": [{"id": "b-rl", "request_max_limit": 3, "request_reset_duration": "1h"}], "virtual_keys": [{"id": "vk-b", "value": "sk-bf-broker", "rate_limit_id": "b-rl"}]},
+                               "cluster": {"enabled": True, "type": "broker", "node_id": "bn-b", "secret": broker_secret, "interval_ms": 200, "peers": [], "broker": {"address": "127.0.0.1:18133"}}}),
+        "lk-a": write("lk-a", {"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "cluster": {"enabled": True, "node_id": "lk-a", "secret": lock_secret, "interval_ms": 200, "peers": [], "leader_lock": {"etcd_endpoints": [LOCK_ETCD], "ttl_seconds": 3}}}),
+        "lk-b": write("lk-b", {"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "cluster": {"enabled": True, "node_id": "lk-b", "secret": lock_secret, "interval_ms": 200, "peers": [], "leader_lock": {"etcd_endpoints": [LOCK_ETCD], "ttl_seconds": 3}}}),
+    }
+    def start(name, args):
+        return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju")] + args, env=os.environ.copy(), stderr=open(os.path.join(d, name + ".log"), "w"))
+    procs = {}
+    try:
+        procs["etcd"] = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/etcd_stub.py"), "18136"], stderr=subprocess.DEVNULL)
+        procs["broker"] = start("broker", ["-mode", "broker", "-host", "127.0.0.1", "-config", cfgs["broker"]])
+        procs["bn-a"] = start("bn-a", ["-port", "18134", "-host", "127.0.0.1", "-config", cfgs["bn-a"]])
+        procs["bn-b"] = start("bn-b", ["-port", "18135", "-host", "127.0.0.1", "-config", cfgs["bn-b"]])
+        procs["lk-a"] = start("lk-a", ["-port", "18137", "-host", "127.0.0.1", "-config", cfgs["lk-a"]])
+        procs["lk-b"] = start("lk-b", ["-port", "18138", "-host", "127.0.0.1", "-config", cfgs["lk-b"]])
+        for u in [BROKER_URL + "/health", LOCK_ETCD + "/", *[b + "/health" for b in BROKER_NODES + LOCK_NODES]]:
+            wait(u)
+
+        # broker: the two nodes, with no peers, share a limit of 3 requests
+        vk = {"x-bf-vk": "sk-bf-broker", "x-bf-mcp-include-clients": "none"}
+        body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+        r1 = [call("POST", "/v1/chat/completions", body, vk, base=BROKER_NODES[0])[0] for _ in range(2)]
+        time.sleep(0.8)
+        r2 = [call("POST", "/v1/chat/completions", body, vk, base=BROKER_NODES[1])[0] for _ in range(2)]
+        check("two nodes with no peers share a rate limit through the broker", r1 == [200, 200] and r2 == [200, 429], (r1, r2))
+        s, _, b = call("GET", "/api/cluster/broker", headers={"x-raiju-cluster-sig": cluster_sig(broker_secret)}, base=BROKER_URL, auth=False)
+        roster = json.loads(b).get("roster") if s == 200 else None
+        check("the broker lists both nodes as its roster", roster == ["bn-a", "bn-b"], (s, b[:200]))
+        s, _, b = call("GET", "/api/cluster/broker", headers={"x-raiju-cluster-sig": "00"}, base=BROKER_URL, auth=False)
+        check("the broker refuses a node that does not sign", s == 401, s)
+        la, lb = cluster_leader(BROKER_NODES[0], broker_secret), cluster_leader(BROKER_NODES[1], broker_secret)
+        check("the broker's roster decides leadership by rank: bn-a leads", la.get("leader") is True and lb.get("leader") is False and la.get("election") == "rank", (la, lb))
+        s, _, b = call("POST", "/api/cluster/broker", "{}", {"x-raiju-cluster-sig": "00"}, base=BROKER_URL, auth=False)
+        check("the broker's sync needs the cluster secret", s == 401, s)
+
+        # lock: exactly one node leads; when it stops renewing, the other takes the key
+        def leaders():
+            return {base: cluster_leader(base, lock_secret) for base in LOCK_NODES}
+        st = leaders()
+        for _ in range(60):
+            if sum(1 for v in st.values() if v.get("leader") is True) == 1:
+                break
+            time.sleep(0.2)
+            st = leaders()
+        held = [base for base in LOCK_NODES if st[base].get("leader") is True]
+        check("the etcd lock elects exactly one leader", len(held) == 1 and all(v.get("election") == "lock" for v in st.values()), st)
+        if len(held) != 1:
+            return
+        # the follower's first grant may land a round after the leader's: wait for both leases
+        for _ in range(25):
+            state = json.loads(urllib.request.urlopen(LOCK_ETCD + "/__state", timeout=5).read().decode())
+            if len(state["leases"]) == 2:
+                break
+            time.sleep(0.2)
+        check("the leader holds the key under one lease, and each node has its own", list(state["keys"]) == ["/raiju/leader"] and len(state["leases"]) == 2, state)
+        leader_name = "lk-a" if held[0] == LOCK_NODES[0] else "lk-b"
+        other = LOCK_NODES[1] if held[0] == LOCK_NODES[0] else LOCK_NODES[0]
+        procs[leader_name].terminate()
+        procs[leader_name].wait()
+        took = False
+        for _ in range(100):
+            if cluster_leader(other, lock_secret).get("leader") is True:
+                took = True
+                break
+            time.sleep(0.2)
+        check("when the leader stops renewing, the other node takes the lock", took, cluster_leader(other, lock_secret))
+        state = json.loads(urllib.request.urlopen(LOCK_ETCD + "/__state", timeout=5).read().decode())
+        check("the stopped leader's lease is gone from the store", len(state["leases"]) == 1 and list(state["keys"]) == ["/raiju/leader"], state)
+    finally:
+        for p in procs.values():
+            p.terminate()
+
 KAFKA_PORT = 18124
 GW_S = "http://127.0.0.1:18120"  # exports to the BigQuery, Pub/Sub, Maxim and Kafka sinks and writes Parquet, with retention
 
@@ -3039,6 +3142,8 @@ def main():
         projects_e2e(env)
         # cluster discovery and the identity-aware proxies (their own gateways and mocks)
         discovery_and_proxy()
+        # broker mode and the etcd leader lock: their own gateways and stub, with fixed ports
+        cluster_modes_e2e()
         # the log sinks: their own gateway, Kafka stub and Parquet bucket, run last so their traffic stays off the other checks
         sinks_e2e(env, json.load(open(config))["providers"]["vertex"]["keys"][0]["vertex_key_config"]["auth_credentials"])
         # prompts, webhooks, feature flags and notices: their own gateway, run after the sinks

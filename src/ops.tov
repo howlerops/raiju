@@ -33,11 +33,13 @@ import { secureHex, utf8 } from "./crypto"
 import * as b64 from "./base64"
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs"
-import { Counters, ClusterConfig, syncInterval } from "./cluster"
+import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
 import { SocketExt } from "./realtime"
 import { LiveRegistry } from "./live"
+import { BROKER_ROUTE } from "./broker"
+import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
 import { ExportCursor, objectKey, putRequest, putBytesRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs } from "./exports"
 import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
@@ -327,6 +329,11 @@ export class Ops {
   discovered: string[] = []
   discoverTimer: int = -1
   discoverErr = ""
+  // broker mode: the last error reported, so a down broker is logged once
+  brokerErr = ""
+  // lock-based leader election (cluster_config.leader_lock): the lease and its round timer
+  lock: LockElection | undefined = undefined
+  lockTimer: int = -1
   // identity-aware proxy: its settings and key cache, and the SSO settings its full mode maps roles with
   proxyCfg: AuthProxyConfig | undefined = undefined
   proxyKeys: ProxyKeys | undefined = undefined
@@ -429,6 +436,11 @@ export class Ops {
     if (old !== undefined) old.close()
     this.discoverer = undefined
     this.discovered = []
+    if (this.lockTimer >= 0) {
+      clearInterval(this.lockTimer)
+      this.lockTimer = -1
+    }
+    this.lock = undefined
     if (cc === undefined || !cc.enabled) {
       this.clusterCfg = undefined
       return
@@ -440,14 +452,33 @@ export class Ops {
     this.clusterTimer = setInterval(() => {
       this.syncCluster()
     }, Math.max(100, syncInterval(cc)))
+    // broker mode has no discovery: the broker is the rendezvous point
+    if (cluster.isBroker(cc) && cc.broker === undefined) console.error(`raiju: cluster: type "broker" needs cluster.broker.address; no cluster traffic until it is set`)
     const dc = cc.discovery
-    if (dc !== undefined && dc.enabled === true) {
+    if (!cluster.isBroker(cc) && dc !== undefined && dc.enabled === true) {
       this.discoverer = new Discoverer(dc, this.nodeId, getEnv)
       this.discoverTimer = setInterval(() => {
         this.discover()
       }, DISCOVER_MS)
       this.discover()
     }
+    const ll = cc.leader_lock
+    if (ll !== undefined) {
+      // the holder names this process, so the key shows which worker of which node leads
+      const le = new LockElection(ll, `${this.nodeId}/${process.pid}`)
+      this.lock = le
+      this.lockTimer = setInterval(() => {
+        this.electLock()
+      }, le.roundMs())
+      this.electLock()
+    }
+  }
+
+  // One leader-lock round. Leadership is read from the lock by isLeader(), so a failed round only ends it when the lease runs out.
+  async electLock(): Promise<void> {
+    const le = this.lock
+    if (le === undefined) return
+    await le.tick()
   }
 
   // One discovery round. The peers it finds are synced with from then on; on failure the last good list stays.
@@ -478,12 +509,14 @@ export class Ops {
     return out
   }
 
-  // Whether this node leads the cluster: the lowest live node id (Bifrost's rule). Without clustering it always does.
-  // Worker processes of one node share the node's answer, so the leader's workers all run leader-only tasks.
+  // Whether this node leads the cluster. Without clustering it always does. With leader_lock it holds the etcd
+  // lock. Otherwise the lowest live node id leads (Bifrost's rule), and the workers of that node share the answer.
   isLeader(): bool {
     const c = this.counters
     const cc = this.clusterCfg
     if (c === undefined || cc === undefined) return true
+    const lk = this.lock
+    if (lk !== undefined) return lk.leading(Date.now())
     const me = cluster.nodeOf(this.nodeId)
     const ids: string[] = [me]
     for (const p of c.peers(Date.now() - cluster.LEADER_WINDOW_MS)) ids.push(cluster.nodeOf(p.id))
@@ -615,8 +648,43 @@ export class Ops {
     const h: Map<string, string> = new Map()
     h.set("content-type", "application/json")
     h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
-    for (const p of this.peerUrls(cc)) this.pushTo(p + "/api/cluster/sync", h, body, c, cc.secret)
+    if (cluster.isBroker(cc)) {
+      // one outbound exchange with the broker, which relays to the other nodes
+      const b = cc.broker
+      if (b !== undefined) this.syncBroker(c, b, h, body)
+    } else {
+      for (const p of this.peerUrls(cc)) this.pushTo(p + "/api/cluster/sync", h, body, c, cc.secret)
+    }
     c.forget(Date.now() - 30.0 * syncInterval(cc))
+  }
+
+  // Broker mode: the broker answers with the joined state of all nodes and the roster, so this node learns
+  // the usage of nodes it has no link to, and which nodes are alive for leadership.
+  async syncBroker(c: Counters, b: BrokerConfig, h: Map<string, string>, body: string): Promise<void> {
+    const r = await postText(brokerUrl(b) + BROKER_ROUTE, h, body)
+    if (r.status !== 200) {
+      const why = r.status === 0 ? r.body : `HTTP ${r.status}`
+      if (why !== this.brokerErr) console.error(`raiju: cluster broker: ${why}`)
+      this.brokerErr = why
+      return
+    }
+    if (this.brokerErr !== "") console.error("raiju: cluster broker: connected again")
+    this.brokerErr = ""
+    try {
+      c.relay(r.body, Date.now())
+      this.applyRemote(c)
+    } catch (e) {
+      console.error(`raiju: cluster broker: bad answer: ${e.message}`)
+    }
+  }
+
+  // GET /api/cluster/leader: whether this node leads, and by which election. Signed like the sync route, over an empty body.
+  clusterLeader(req: Request): Response {
+    const cc = this.clusterCfg
+    if (cc === undefined) return json(404, errorJson("clustering is off", "invalid_request_error", undefined))
+    if (!cluster.verify(cc.secret, "", req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    const election = this.lock !== undefined ? "lock" : "rank"
+    return json(200, JSON.stringify({ node: this.nodeId, leader: this.isLeader(), election: election }))
   }
 
   async pushTo(url: string, h: Map<string, string>, body: string, c: Counters, secret: string): Promise<void> {

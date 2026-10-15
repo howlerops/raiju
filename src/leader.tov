@@ -1,0 +1,214 @@
+// Lock-based leader election (Raiju's cluster_config.leader_lock), over an etcd lease. One key is
+// created under a lease by whichever node gets there first, and that node leads: it renews the lease
+// every round. When it stops renewing, etcd expires the lease and deletes the key, and the next node
+// to campaign takes it. Leadership by rank (cluster.tov) needs no store; this variant needs one.
+//
+// Safety: a node counts itself leader only until ttl after the send time of the request that last
+// renewed its lease. etcd expires the lease ttl after it receives that request, which is no earlier
+// than the send time, so the old leader has stopped before another node can take the key.
+import { request, baseUrl } from "./discovery"
+import { utf8 } from "./crypto"
+import { encode } from "./base64"
+import { LeaderLockConfig } from "./cluster"
+
+export const LOCK_DEFAULT_KEY = "/raiju/leader"
+export const LOCK_DEFAULT_TTL_S: int = 15
+// deadline of one etcd request
+const LOCK_REQUEST_MS: int = 10000
+
+// The lease state, with no I/O. Times are the send times of the requests, in ms.
+export class LeaseState {
+  leaseId = ""
+  // whether the key holds this node's lease, as of the last campaign
+  holds = false
+  private renewedAt: f64 = 0.0
+
+  constructor(readonly ttlMs: f64) {}
+
+  // A lease was granted by a request sent at sentMs.
+  granted(id: string, sentMs: f64): void {
+    this.leaseId = id
+    this.renewedAt = sentMs
+  }
+
+  // A keepalive answered with the lease's TTL in seconds, sent at sentMs. Zero means etcd no longer has the lease.
+  renewed(ttlS: int, sentMs: f64): void {
+    if (ttlS <= 0) {
+      this.lost()
+      return
+    }
+    this.renewedAt = sentMs
+  }
+
+  // The lease is gone: this node holds nothing until it has a new lease and wins the key.
+  lost(): void {
+    this.leaseId = ""
+    this.holds = false
+  }
+
+  // The campaign answered: the key holds this node's lease (ours) or someone else's.
+  campaigned(ours: bool): void {
+    this.holds = ours
+  }
+
+  // Leads now: holds the key on a lease renewed within its TTL.
+  leading(nowMs: f64): bool {
+    return this.holds && this.leaseId !== "" && nowMs < this.renewedAt + this.ttlMs
+  }
+}
+
+type LockLease = { ID?: string }
+type LockKeepalive = { result?: { TTL?: string } }
+type LockKv = { lease?: string }
+type LockTxn = { succeeded?: bool, responses?: { response_range?: { kvs?: LockKv[] } }[] }
+
+// One node's campaign against the etcd endpoints. tick runs one round: renew the lease (or grant one),
+// then campaign for the key. Failures leave the state as it was; leading() then runs out by itself.
+export class LockElection {
+  private st: LeaseState
+  private key: string
+  private ttlS: int
+  private err = ""
+  private endpoints: string[]
+
+  constructor(cfg: LeaderLockConfig, readonly holder: string) {
+    let t = cfg.ttl_seconds ?? LOCK_DEFAULT_TTL_S
+    if (t < 1) t = 1
+    this.ttlS = t
+    this.st = new LeaseState(t * 1000.0)
+    this.key = cfg.key ?? LOCK_DEFAULT_KEY
+    this.endpoints = cfg.etcd_endpoints
+  }
+
+  leading(nowMs: f64): bool {
+    return this.st.leading(nowMs)
+  }
+
+  // The round length: a third of the TTL, so one missed round does not cost the lease.
+  roundMs(): f64 {
+    return Math.max(100.0, this.st.ttlMs / 3.0)
+  }
+
+  // One round against the first endpoint that answers. Errors are logged once per kind, never thrown.
+  async tick(): Promise<void> {
+    let lastErr = "etcd: no endpoints configured"
+    for (const ep of this.endpoints) {
+      try {
+        try await this.roundAt(baseUrl(ep))
+        this.err = ""
+        return
+      } catch (e) {
+        lastErr = e.message
+      }
+    }
+    if (lastErr !== this.err) console.error(`raiju: leader lock: ${lastErr}`)
+    this.err = lastErr
+  }
+
+  private async roundAt(base: string): Promise<void> throws Error {
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    const ms = LOCK_REQUEST_MS
+    if (this.st.leaseId !== "") {
+      const sent = Date.now()
+      const ka = try await request("POST", base + "/v3/lease/keepalive", h, JSON.stringify({ ID: this.st.leaseId }), "", ms)
+      if (ka.status === 200) {
+        const ttl = (try JSON.parse(ka.body) as LockKeepalive).result?.TTL ?? "0"
+        this.st.renewed(parseInt(ttl) ?? 0, sent)
+      } else {
+        this.st.lost()
+      }
+    }
+    if (this.st.leaseId === "") {
+      const sent = Date.now()
+      const g = try await request("POST", base + "/v3/lease/grant", h, JSON.stringify({ TTL: this.ttlS }), "", ms)
+      if (g.status !== 200) throw new Error(`etcd: lease grant: HTTP ${g.status}`)
+      const id = (try JSON.parse(g.body) as LockLease).ID ?? ""
+      if (id === "") throw new Error("etcd: lease grant returned no ID")
+      this.st.granted(id, sent)
+    }
+    // the campaign: create the key under our lease if it does not exist; otherwise read who holds it
+    const id = this.st.leaseId
+    const k = encode(utf8(this.key))
+    const txn = JSON.stringify({
+      compare: [{ key: k, result: "EQUAL", target: "CREATE", create_revision: "0" }],
+      success: [{ request_put: { key: k, value: encode(utf8(this.holder)), lease: id } }],
+      failure: [{ request_range: { key: k } }],
+    })
+    const t = try await request("POST", base + "/v3/kv/txn", h, txn, "", ms)
+    if (t.status !== 200) throw new Error(`etcd: txn: HTTP ${t.status}`)
+    const reply = try JSON.parse(t.body) as LockTxn
+    if (reply.succeeded === true) {
+      this.st.campaigned(true)
+      return
+    }
+    // the key exists: ours if it sits on our lease
+    let holder = ""
+    const rs = reply.responses ?? []
+    if (rs.length > 0) {
+      const kvs = rs[0]!.response_range?.kvs ?? []
+      if (kvs.length > 0) holder = kvs[0]!.lease ?? ""
+    }
+    this.st.campaigned(holder !== "" && holder === id)
+  }
+}
+
+test("a node leads from the grant until its lease is not renewed for one TTL", () => {
+  const st = new LeaseState(15000.0)
+  expect(st.leading(0.0)).toBe(false)
+  st.granted("7", 1000.0)
+  st.campaigned(true)
+  expect(st.leading(1000.0)).toBe(true)
+  expect(st.leading(15999.0)).toBe(true)
+  expect(st.leading(16000.0)).toBe(false)
+  // a renewal counts from the time its request was sent, not from when the answer came back
+  st.renewed(15, 10000.0)
+  expect(st.leading(24999.0)).toBe(true)
+  expect(st.leading(25000.0)).toBe(false)
+})
+
+test("a lost lease ends leadership at once, and a new grant does not restore it without winning the key", () => {
+  const st = new LeaseState(15000.0)
+  st.granted("7", 0.0)
+  st.campaigned(true)
+  st.renewed(0, 5000.0)
+  expect(st.leaseId).toBe("")
+  expect(st.leading(5001.0)).toBe(false)
+  st.granted("8", 6000.0)
+  expect(st.leading(6001.0)).toBe(false)
+  st.campaigned(true)
+  expect(st.leading(6001.0)).toBe(true)
+})
+
+test("losing the key to another lease means not leading, whatever the lease's age", () => {
+  const st = new LeaseState(15000.0)
+  st.granted("7", 0.0)
+  st.campaigned(false)
+  expect(st.leading(1.0)).toBe(false)
+  st.campaigned(true)
+  expect(st.leading(1.0)).toBe(true)
+  st.campaigned(false)
+  expect(st.leading(1.0)).toBe(false)
+})
+
+test("a failed renewal leaves the lease valid until its TTL, then the node stops leading", () => {
+  const st = new LeaseState(15000.0)
+  st.granted("7", 0.0)
+  st.campaigned(true)
+  // no renewed() call: the round failed in transport
+  expect(st.leading(14000.0)).toBe(true)
+  expect(st.leading(15000.0)).toBe(false)
+  // a later renewal that succeeds brings it back
+  st.renewed(15, 16000.0)
+  expect(st.leading(16500.0)).toBe(true)
+})
+
+test("the lock config defaults and the round length", () => {
+  const cfg: LeaderLockConfig = { etcd_endpoints: ["http://127.0.0.1:2379"] }
+  const le = new LockElection(cfg, "n1/2")
+  expect(le.roundMs()).toBe(5000.0)
+  expect(le.leading(0.0)).toBe(false)
+  // a TTL below one second is raised to one second
+  const short = new LockElection({ etcd_endpoints: [], ttl_seconds: 0 }, "n")
+  expect(Math.floor(short.roundMs())).toBe(333)
+})

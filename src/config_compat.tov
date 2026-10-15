@@ -460,9 +460,9 @@ function mapAudit(inout top: Field[], inout notes: string[]): void throws Syntax
   put(&top, "audit", out)
 }
 
-// cluster_config becomes cluster. Raiju signs cluster sync with cluster.secret,
-// which Bifrost does not have, and it syncs only mesh-style peers. So the cluster
-// stays off until a secret is set in the Raiju section.
+// cluster_config becomes cluster. Raiju signs cluster sync with cluster.secret, which Bifrost
+// does not have, so the cluster stays off until a secret is set. In broker mode the secret is the
+// broker's auth_token (Bifrost's shared secret), and the nodes sync through the broker, not peers.
 function mapCluster(inout top: Field[], inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "cluster_config")
   if (raw === undefined) return
@@ -474,18 +474,41 @@ function mapCluster(inout top: Field[], inout notes: string[]): void throws Synt
   notes.push(`config: "cluster_config" read as "cluster"`)
   const cf = try members(raw)
   let enabled = rawBool(cf, "enabled") === true
-  if (enabled && rawStr(cf, "type") === "broker") {
-    notes.push(`config: "cluster_config.type" is "broker", which Raiju does not support; cluster sync is off`)
-    enabled = false
+  const broker = rawStr(cf, "type") === "broker"
+  const bf = try members(find(cf, "broker"))
+  let secret: string | undefined = undefined
+  if (enabled && broker) {
+    for (const f of bf) {
+      if (!["address", "tls", "auth_token", "listen_port"].includes(f.key)) notes.push(`config: "cluster_config.broker.${f.key}" is not supported by Raiju and is ignored`)
+    }
+    const token = rawStr(bf, "auth_token")
+    if (token !== undefined && token !== "") {
+      secret = quote(token)
+      notes.push(`config: "cluster_config.broker.auth_token" is read as "cluster.secret"`)
+    }
+    if (strRaw(bf, "address") === undefined) {
+      notes.push(`config: "cluster_config.broker.address" is not set; cluster sync is off`)
+      enabled = false
+    }
   }
-  if (enabled) {
+  if (enabled && secret === undefined) {
     notes.push(`config: "cluster_config" has no shared secret, which Raiju needs for cluster sync; cluster sync is off until "cluster.secret" is set`)
     enabled = false
   }
-  ignored("cluster_config", cf, ["region", "gossip", "grpc", "broker"], &notes)
+  ignored("cluster_config", cf, ["region", "gossip", "grpc"], &notes)
+  if (!broker) ignored("cluster_config", cf, ["broker"], &notes)
   let out: Field[] = []
   add(&out, "enabled", enabled ? "true" : "false")
   add(&out, "peers", find(cf, "peers") ?? "[]")
+  if (enabled && broker) {
+    add(&out, "type", quote("broker"))
+    let bo: Field[] = []
+    add(&bo, "address", strRaw(bf, "address"))
+    add(&bo, "tls", find(bf, "tls"))
+    add(&bo, "listen_port", find(bf, "listen_port"))
+    add(&out, "broker", build(bo))
+  }
+  add(&out, "secret", secret)
   // the discovery block has the same names in both (kubernetes, dns, consul, etcd, udp, mdns)
   add(&out, "discovery", find(cf, "discovery"))
   put(&top, "cluster", out)
@@ -1262,8 +1285,29 @@ test("keeps the cluster off without a secret, and says why", () => {
   expect(rawBool(cl, "enabled")).toBe(false)
   expect(find(cl, "peers")).toBe(`["https://n2.example"]`)
   expect(r.notes.includes(`config: "cluster_config" has no shared secret, which Raiju needs for cluster sync; cluster sync is off until "cluster.secret" is set`)).toBe(true)
-  const b = try normalize(`{ "cluster_config": { "enabled": true, "type": "broker" } }`)
-  expect(b.notes.includes(`config: "cluster_config.type" is "broker", which Raiju does not support; cluster sync is off`)).toBe(true)
+  const b = try normalize(`{ "cluster_config": { "enabled": true, "type": "broker", "broker": { "address": "b.example:50051" } } }`)
+  const bl = try fields(find(try fields(b.text), "cluster")!)
+  expect(rawBool(bl, "enabled")).toBe(false)
+  expect(b.notes.includes(`config: "cluster_config" has no shared secret, which Raiju needs for cluster sync; cluster sync is off until "cluster.secret" is set`)).toBe(true)
+})
+
+test("maps a broker cluster_config to broker mode, with its auth_token as the secret", () => {
+  const r = try normalize(`{ "cluster_config": { "enabled": true, "type": "broker", "region": "us-east-1",
+    "broker": { "address": "broker.example.run.app:443", "tls": true, "auth_token": "b-secret", "listen_port": 50051, "futureKey": 1 } } }`)
+  const cl = try fields(find(try fields(r.text), "cluster")!)
+  expect(rawBool(cl, "enabled")).toBe(true)
+  expect(rawStr(cl, "type")).toBe("broker")
+  expect(rawStr(cl, "secret")).toBe("b-secret")
+  expect(find(cl, "peers")).toBe("[]")
+  const br = try fields(find(cl, "broker")!)
+  expect(rawStr(br, "address")).toBe("broker.example.run.app:443")
+  expect(rawBool(br, "tls")).toBe(true)
+  expect(find(br, "auth_token")).toBe(undefined)
+  expect(r.notes.includes(`config: "cluster_config.broker.auth_token" is read as "cluster.secret"`)).toBe(true)
+  expect(r.notes.includes(`config: "cluster_config.broker.futureKey" is not supported by Raiju and is ignored`)).toBe(true)
+  const noaddr = try normalize(`{ "cluster_config": { "enabled": true, "type": "broker", "broker": { "auth_token": "t" } } }`)
+  expect(rawBool(try fields(find(try fields(noaddr.text), "cluster")!), "enabled")).toBe(false)
+  expect(noaddr.notes.includes(`config: "cluster_config.broker.address" is not set; cluster sync is off`)).toBe(true)
 })
 
 test("passes cluster discovery through and maps scim_config's authProxy", () => {

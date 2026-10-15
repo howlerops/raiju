@@ -1,0 +1,120 @@
+// Broker mode (Bifrost's cluster_config.type "broker"): a relay for nodes that cannot reach each other.
+// Every node makes one outbound request per round to the broker. It posts its usage state, and the broker
+// merges it into the joined state of all nodes and answers with that state and the roster of nodes heard
+// from lately. The broker keeps no usage of its own: it only joins what the nodes send. A node merges the
+// answer with Counters.relay, so the other nodes' usage reaches it in two rounds at most.
+import { Counters, ClusterConfig, LEADER_WINDOW_MS, verify } from "./cluster"
+
+export const BROKER_ROUTE = "/api/cluster/broker"
+export const BROKER_PORT: int = 50051
+const BROKER_ID = "broker"
+
+// The broker's joined state. A node whose payload is bad is refused with nothing merged.
+export class Relay {
+  private state: Counters = new Counters(BROKER_ID)
+
+  // A node's state in; the joined state and the roster out. Nodes silent for a window are dropped.
+  exchange(body: string, nowMs: f64): string throws SyntaxError {
+    try this.state.merge(body, nowMs)
+    this.state.forget(nowMs - LEADER_WINDOW_MS)
+    return this.state.encode(this.roster())
+  }
+
+  // The node ids heard from in the last window, sorted.
+  roster(): string[] {
+    const out: string[] = []
+    for (const p of this.state.peers()) out.push(p.id)
+    return out
+  }
+}
+
+function reply(status: int, body: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  return new Response(body, { status: status, headers: h })
+}
+
+// The broker's routes. POST carries a node's state; GET lists the roster. Both are signed with the
+// cluster secret over the body (empty for GET), like the peer sync. GET /health is for readiness probes.
+export async function brokerRoute(relay: Relay, cc: ClusterConfig, req: Request): Promise<Response> {
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  if (p === "/health") return reply(200, `{"status":"ok"}`)
+  if (p !== BROKER_ROUTE) return reply(404, `{"error":"not found"}`)
+  if (req.method !== "POST" && req.method !== "GET") return reply(405, `{"error":"method not allowed"}`)
+  let body = ""
+  if (req.method === "POST") body = await req.text()
+  if (!verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return reply(401, `{"error":"bad cluster signature"}`)
+  if (req.method === "GET") return reply(200, JSON.stringify({ roster: relay.roster() }))
+  try {
+    return reply(200, try relay.exchange(body, Date.now()))
+  } catch (e) {
+    return reply(400, JSON.stringify({ error: e.message }))
+  }
+}
+
+// Serves the relay on cluster_config.broker.listen_port (default 50051). Returns the URL it listens on.
+export function startBroker(cc: ClusterConfig, hostname: string): string {
+  const b = cc.broker
+  const port: int = b === undefined ? BROKER_PORT : (b.listen_port ?? BROKER_PORT)
+  const relay = new Relay()
+  const server = Bun.serve({
+    port: port,
+    hostname: hostname,
+    fetch(req) {
+      return brokerRoute(relay, cc, req)
+    },
+  })
+  return server.url.href
+}
+
+test("the relay joins what the nodes send and lists them as the roster", () => {
+  const relay = new Relay()
+  const a = new Counters("a")
+  const b = new Counters("b")
+  a.add("budget:monthly", "2026-10", 1.5)
+  b.add("budget:monthly", "2026-10", 2)
+  b.add("rl:key:requests", "00:00", 3)
+  try relay.exchange(a.encode(), 1000)
+  const answer = try relay.exchange(b.encode(), 1000)
+  expect(relay.roster()).toEqual(["a", "b"])
+  // b's answer has the join of both nodes' state
+  const got = new Counters("b")
+  try got.relay(answer, 1000)
+  expect(got.total("budget:monthly", "2026-10")).toBe(3.5)
+  expect(got.total("rl:key:requests", "00:00")).toBe(3)
+  // the broker's own id is never a peer of the nodes
+  expect(got.peers().map((p) => p.id)).toEqual(["a"])
+})
+
+test("a node silent for a window leaves the roster and its usage", () => {
+  const relay = new Relay()
+  const a = new Counters("a")
+  const b = new Counters("b")
+  a.add("c", "w", 4)
+  b.add("c", "w", 1)
+  try relay.exchange(a.encode(), 1000)
+  const late = 1000 + LEADER_WINDOW_MS + 1
+  const answer = try relay.exchange(b.encode(), late)
+  expect(relay.roster()).toEqual(["b"])
+  const got = new Counters("b")
+  try got.relay(answer, late)
+  expect(got.total("c", "w")).toBe(1)
+})
+
+test("a bad payload is refused and the roster does not change", () => {
+  const relay = new Relay()
+  const a = new Counters("a")
+  a.add("c", "w", 2)
+  try relay.exchange(a.encode(), 1000)
+  let refused = 0
+  for (const text of ["not json", `{"node":"","ts":1,"counters":[]}`, `{"node":"x","ts":1,"counters":[{"name":"c","window":"w","slots":{"x":-1}}]}`]) {
+    try {
+      relay.exchange(text, 2000)
+    } catch (e) {
+      if (e instanceof SyntaxError) refused += 1
+    }
+  }
+  expect(refused).toBe(3)
+  expect(relay.roster()).toEqual(["a"])
+})
