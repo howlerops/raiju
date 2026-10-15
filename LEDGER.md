@@ -211,9 +211,9 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | todo |
 | L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | todo |
 | L84 | G41 | Projects, business units, custom roles and data access scopes | worker | todo |
-| L85 | G42 | BigQuery, Kafka, Pub/Sub sinks; Parquet payloads; export retention | worker | todo |
-| L86 | G43 | Guardrails: regex, secrets rule set, reversible redaction, LLM judge, MCP tool-call guard, Presidio, Azure PII, Model Armor, CrowdStrike | worker | todo |
-| L87 | G44, G45 | Cluster discovery (Kubernetes, DNS, Consul, etcd, mDNS, UDP), leader election; auth proxies | worker | todo |
+| L85 | G42 | BigQuery, Kafka, Pub/Sub sinks; Parquet payloads; export retention | worker | assigned |
+| L86 | G43 | Guardrails: regex, secrets rule set, reversible redaction, LLM judge, MCP tool-call guard, Presidio, Azure PII, Model Armor, CrowdStrike | worker | assigned |
+| L87 | G44, G45 | Cluster discovery (Kubernetes, DNS, Consul, etcd, mDNS, UDP), leader election; auth proxies | worker | assigned |
 | L88 | G46 | Prompt repository and deployments, webhooks, feature flags, notifications | worker | todo |
 
 Decision taken by the lead: models without a price stay a warning (cost 0), as in Bifrost;
