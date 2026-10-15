@@ -294,6 +294,207 @@ def start_idp():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, state
 
+def serve(port, routes, tls=False):
+    """A tiny HTTP(S) server on 127.0.0.1. routes(method, path, headers, body) -> (status, text, content type)."""
+    import http.server, threading, ssl
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def handle_any(self):
+            n = int(self.headers.get("content-length", "0") or 0)
+            body = self.rfile.read(n).decode() if n else ""
+            status, text, ctype = routes(self.command, self.path, self.headers, body)
+            data = text.encode()
+            self.send_response(status); self.send_header("content-type", ctype); self.send_header("content-length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        do_GET = do_POST = do_PUT = handle_any
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+    if tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        d = os.path.join(BUILD, "e2e-tls")
+        ctx.load_cert_chain(os.path.join(d, "srv.pem"), os.path.join(d, "srv.key"))
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+def b64u(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+def der_ints(der):
+    """r and s from a DER ECDSA signature (SEQUENCE of two INTEGERs)."""
+    i = 2 + (der[1] & 0x7f if der[1] & 0x80 else 0)
+    out = []
+    for _ in range(2):
+        ln = der[i + 1]
+        out.append(int.from_bytes(der[i + 2:i + 2 + ln], "big"))
+        i += 2 + ln
+    return out
+
+def jwt_es256(key, kid, claims):
+    head = b64u(json.dumps({"alg": "ES256", "kid": kid, "typ": "JWT"}).encode()) + "." + b64u(json.dumps(claims).encode())
+    der = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key], input=head.encode(), check=True, capture_output=True).stdout
+    r, s = der_ints(der)
+    return head + "." + b64u(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+
+def jwt_rs256(key, kid, claims):
+    head = b64u(json.dumps({"alg": "RS256", "kid": kid, "typ": "JWT"}).encode()) + "." + b64u(json.dumps(claims).encode())
+    sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key, "-binary"], input=head.encode(), check=True, capture_output=True).stdout
+    return head + "." + b64u(sig)
+
+def discovery_and_proxy():
+    """Cluster discovery (Consul, DNS, Kubernetes, etcd) against mock backends, and the identity-aware
+    proxies (AWS ALB with ES256, Cloudflare Access with RS256 in full mode) with throwaway keys."""
+    d = os.path.join(BUILD, "e2e-disc")
+    os.makedirs(d, exist_ok=True)
+    ca_pem = open(os.path.join(BUILD, "e2e-tls", "ca.pem")).read()
+    now = int(time.time())
+    # keys: P-256 for ALB, RSA for Cloudflare; the k8s service account token
+    ec_key, ec_pub, rsa_key = os.path.join(d, "ec.key"), os.path.join(d, "ec.pub"), os.path.join(d, "rsa.key")
+    subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", ec_key], check=True, capture_output=True)
+    subprocess.run(["openssl", "ec", "-in", ec_key, "-pubout", "-out", ec_pub], check=True, capture_output=True)
+    subprocess.run(["openssl", "genrsa", "-out", rsa_key, "2048"], check=True, capture_output=True)
+    mod = subprocess.run(["openssl", "rsa", "-in", rsa_key, "-noout", "-modulus"], check=True, capture_output=True, text=True).stdout.strip().split("=")[1]
+    jwks = json.dumps({"keys": [{"kty": "RSA", "kid": "e2e-rsa", "alg": "RS256", "use": "sig", "n": b64u(bytes.fromhex(mod)), "e": "AQAB"}]})
+    ec_pem = open(ec_pub).read()
+    token_file = os.path.join(d, "token")
+    open(token_file, "w").write("e2e-sa-token\n")
+    ALB_ARN = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/e2e-alb/50dc6c495c0c9188"
+    KEYS = "https://127.0.0.1:18083"
+
+    peer_nodes = []
+    def peer(method, path, headers, body):
+        if path == "/api/cluster/sync" and body:
+            peer_nodes.append(json.loads(body).get("node", "?"))
+        return 200, json.dumps({"node": "peer", "ts": 1, "counters": []}), "application/json"
+    consul_regs = []
+    def consul(method, path, headers, body):
+        if method == "PUT" and path == "/v1/agent/service/register":
+            consul_regs.append(json.loads(body))
+            return 200, "{}", "application/json"
+        if path.split("?")[0] == "/v1/health/service/bifrost":
+            entries = [{"Service": {"ID": "bifrost-consul-a", "Address": "127.0.0.1", "Port": 18081}, "Node": {"Address": "127.0.0.1"}},
+                       {"Service": {"ID": "bifrost-peer", "Address": "", "Port": 18084}, "Node": {"Address": "127.0.0.1"}}]
+            return 200, json.dumps(entries), "application/json"
+        return 404, "{}", "application/json"
+    k8s_seen = []
+    def k8s(method, path, headers, body):
+        if path.startswith("/api/v1/namespaces/default/pods"):
+            k8s_seen.append({"path": path, "auth": headers.get("authorization", "")})
+            pods = {"items": [{"metadata": {"name": "a"}, "status": {"phase": "Running", "podIP": "127.0.0.1"}},
+                              {"metadata": {"name": "b"}, "status": {"phase": "Pending", "podIP": "127.0.0.2"}}]}
+            return 200, json.dumps(pods), "application/json"
+        return 404, "{}", "application/json"
+    kv = {}
+    puts = []
+    kv[base64.b64encode(b"/raiju/bifrost/etcd-peer").decode()] = base64.b64encode(json.dumps({"addr": "127.0.0.1", "port": 18084}).encode()).decode()
+    def etcd(method, path, headers, body):
+        req = json.loads(body) if body else {}
+        j = lambda o: (200, json.dumps(o), "application/json")
+        if path == "/v3/lease/grant":
+            return j({"ID": "42", "TTL": "30"})
+        if path == "/v3/lease/keepalive":
+            return j({"result": {"ID": str(req.get("ID")), "TTL": "30" if req.get("ID") == "42" else "0"}})
+        if path == "/v3/kv/put":
+            kv[req["key"]] = req["value"]
+            puts.append(base64.b64decode(req["key"]).decode())
+            return j({})
+        if path == "/v3/kv/range":
+            lo = base64.b64decode(req["key"]).decode()
+            hi = base64.b64decode(req["range_end"]).decode()
+            hits = [{"key": k, "value": v} for k, v in kv.items() if lo <= base64.b64decode(k).decode() < hi]
+            return j({"kvs": hits, "count": str(len(hits))} if hits else {"count": "0"})
+        return 404, "{}", "application/json"
+    def keys(method, path, headers, body):
+        if path == "/e2e-ec":
+            return 200, ec_pem, "application/x-pem-file"
+        if path == "/cdn-cgi/access/certs":
+            return 200, jwks, "application/json"
+        return 404, "{}", "application/json"
+
+    servers = [serve(18084, peer), serve(18085, consul), serve(18086, k8s), serve(18088, etcd), serve(18083, keys, tls=True)]
+    cluster = lambda node, disc, port: {"client": {"enable_logging": False}, "cluster": {"enabled": True, "node_id": node, "secret": "e2e-disc", "interval_ms": 200, "peers": [], "discovery": disc}}
+    cfgs = {
+        "consul": (18081, cluster("consul-a", {"enabled": True, "type": "consul", "service_name": "bifrost", "consul_address": "127.0.0.1:18085", "bind_port": 18081, "advertise_address": "127.0.0.1"}, 18081)),
+        "dns": (18080, cluster("dns-a", {"enabled": True, "type": "dns", "dns_names": ["localhost"], "bind_port": 18084}, 18080)),
+        "k8s": (18082, cluster("k8s-a", {"enabled": True, "type": "kubernetes", "k8s_label_selector": "app=bifrost", "bind_port": 18084, "api_url": "http://127.0.0.1:18086", "token_file": token_file}, 18082)),
+        "etcd": (18090, cluster("etcd-a", {"enabled": True, "type": "etcd", "service_name": "bifrost", "etcd_endpoints": ["http://127.0.0.1:18088"], "bind_port": 18090, "advertise_address": "127.0.0.1"}, 18090)),
+        "alb": (18091, {"client": {"enable_logging": False}, "governance": {"users": [{"name": "alice@example.com", "role": "editor"}]},
+                        "auth_proxy": {"enabled": True, "provider": "aws-alb", "mode": "login_only", "expected_signer": ALB_ARN, "region": "us-east-1", "public_key_base_url": KEYS, "ca_cert_pem": ca_pem}}),
+        "cf": (18078, {"client": {"enable_logging": False}, "governance": {"users": [{"name": "ops@example.com", "role": "viewer"}]},
+                       "oidc": {"enabled": False, "issuer": KEYS, "client_id": "raiju", "redirect_uri": "http://127.0.0.1:18078/cb", "role_claim": "groups", "role_map": {"raiju-editors": "editor"}},
+                       "auth_proxy": {"enabled": True, "provider": "cloudflare-access", "mode": "full", "issuer_url": KEYS, "audience": "aud-e2e", "ca_cert_pem": ca_pem}}),
+    }
+    procs = []
+    gws = {}
+    try:
+        for name, (port, cfg) in cfgs.items():
+            path = os.path.join(d, name + ".json")
+            json.dump(cfg, open(path, "w"))
+            procs.append(subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", path], env=os.environ.copy(), stderr=open(os.path.join(d, name + ".log"), "w")))
+            gws[name] = f"http://127.0.0.1:{port}"
+        for name in gws:
+            wait(gws[name] + "/health")
+
+        # discovery: each node's sync reaches the peer (which records the sender's node id)
+        want = {"consul-a", "dns-a", "k8s-a", "etcd-a"}
+        for _ in range(60):
+            if want.issubset(set(peer_nodes)):
+                break
+            time.sleep(0.1)
+        check("consul discovery finds the peer and syncs with it", "consul-a" in peer_nodes, sorted(set(peer_nodes)))
+        check("dns discovery finds the peer and syncs with it", "dns-a" in peer_nodes, sorted(set(peer_nodes)))
+        check("kubernetes discovery finds the running pod and syncs with it", "k8s-a" in peer_nodes, sorted(set(peer_nodes)))
+        check("etcd discovery finds the registered peer and syncs with it", "etcd-a" in peer_nodes, sorted(set(peer_nodes)))
+        reg = [r for r in consul_regs if r.get("ID") == "bifrost-consul-a"]
+        check("consul: the node registers itself with a TCP check on its port", len(reg) > 0 and reg[0].get("Check", {}).get("TCP") == "127.0.0.1:18081" and reg[0].get("Port") == 18081, consul_regs[:1])
+        check("kubernetes: lists pods by label with the service account token", any(x["path"] == "/api/v1/namespaces/default/pods?labelSelector=app%3Dbifrost" and x["auth"] == "Bearer e2e-sa-token" for x in k8s_seen), k8s_seen[:2])
+        check("etcd: registers the node under a lease", base64.b64encode(b"/raiju/bifrost/etcd-a").decode() in kv and "/raiju/bifrost/etcd-a" in puts, puts[:3])
+
+        # ALB: an ES256 token from the regional key endpoint (fetched on first use, so the first try can wait)
+        alb = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "signer": ALB_ARN, "iss": "https://oidc.example", "email": "alice@example.com", "sub": "a1"})
+        hdr = {"x-amzn-oidc-data": alb}
+        first = call("GET", "/api/config", headers=hdr, base=gws["alb"], auth=False)[0]
+        s = first
+        for _ in range(50):
+            if s == 200:
+                break
+            time.sleep(0.1)
+            s = call("GET", "/api/config", headers=hdr, base=gws["alb"], auth=False)[0]
+        check("alb: the first request waits for the key, then the token opens the API", first == 401 and s == 200, (first, s))
+        s = call("GET", "/api/users", headers=hdr, base=gws["alb"], auth=False)[0]
+        check("alb: a provisioned editor may not manage users", s == 403, s)
+        other = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "signer": ALB_ARN.replace("e2e-alb", "other-alb"), "email": "alice@example.com"})
+        s = call("GET", "/api/config", headers={"x-amzn-oidc-data": other}, base=gws["alb"], auth=False)[0]
+        check("alb: a token signed for another load balancer is refused", s == 401, s)
+        bob = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "signer": ALB_ARN, "email": "bob@example.com"})
+        s, _, b = call("GET", "/api/config", headers={"x-amzn-oidc-data": bob}, base=gws["alb"], auth=False)
+        check("alb login only: an identity that is not provisioned gets 403", s == 403 and "not provisioned" in b, (s, b))
+        s = call("GET", "/api/config", base=gws["alb"], auth=False)[0]
+        check("alb: without the proxy header the normal sign-in applies", s == 401, s)
+
+        # Cloudflare Access, full mode: the role comes from the groups claim through the SSO role map
+        cf_ok = jwt_rs256(rsa_key, "e2e-rsa", {"exp": now + 600, "nbf": now - 10, "iss": KEYS, "aud": ["aud-e2e"], "email": "carol@example.com", "groups": ["raiju-editors"]})
+        cf_hdr = {"Cf-Access-Jwt-Assertion": cf_ok}
+        s = 0
+        for _ in range(50):
+            s = call("GET", "/api/config", headers=cf_hdr, base=gws["cf"], auth=False)[0]
+            if s == 200:
+                break
+            time.sleep(0.1)
+        check("cloudflare: an RS256 token from the team JWKS opens the API in full mode", s == 200, s)
+        s = call("GET", "/api/users", headers=cf_hdr, base=gws["cf"], auth=False)[0]
+        check("cloudflare full mode: the mapped editor may not manage users", s == 403, s)
+        nobody = jwt_rs256(rsa_key, "e2e-rsa", {"exp": now + 600, "iss": KEYS, "aud": ["aud-e2e"], "email": "dan@example.com", "groups": ["strangers"]})
+        s, _, b = call("GET", "/api/config", headers={"Cf-Access-Jwt-Assertion": nobody}, base=gws["cf"], auth=False)
+        check("cloudflare full mode: a group with no role mapping is refused", s == 403 and "no role maps" in b, (s, b))
+        wrong_aud = jwt_rs256(rsa_key, "e2e-rsa", {"exp": now + 600, "iss": KEYS, "aud": ["someone-else"], "email": "carol@example.com", "groups": ["raiju-editors"]})
+        s = call("GET", "/api/config", headers={"Cf-Access-Jwt-Assertion": wrong_aud}, base=gws["cf"], auth=False)[0]
+        check("cloudflare: a token for another audience is refused", s == 401, s)
+    finally:
+        for p in procs:
+            p.terminate()
+        for srv in servers:
+            srv.shutdown()
+
 def main():
     build()
     config = write_config()
@@ -1507,6 +1708,8 @@ def main():
         check("passthrough needs a virtual key when inference auth is enforced", s == 401, (s, b))
         s, _, b = call("POST", "/openai_passthrough/pt/echo", {}, headers={"x-bf-vk": "sk-bf-dialect"}, base=GW_BF)
         check("passthrough with a virtual key goes through", s == 200 and seen()[-1]["auth"] == "Bearer sk-from-env", (s, b))
+        # cluster discovery and the identity-aware proxies (their own gateways and mocks)
+        discovery_and_proxy()
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

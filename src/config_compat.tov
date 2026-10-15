@@ -10,7 +10,7 @@ import { Field, fields, elements, find, rawStr, rawBool, decodeString, build, qu
 // Raiju's top-level keys (the Config type in config.tov), plus the Bifrost
 // sections this module reads and the pricing_sync key it writes.
 function topKeys(): string[] {
-  return ["client", "providers", "governance", "cache", "pricing", "prompt_cache", "health", "guardrails", "logs_store", "otel", "mcp", "plugins", "semantic_cache", "vector_store", "secrets", "audit", "alerts", "session_affinity", "complexity_router", "mcp_server", "virtual_mcps", "log_exports", "exporters", "cluster", "oidc", "framework", "auth_config", "alerting", "audit_logs", "cluster_config", "circuit_breaker_config", "load_balancer_config", "pricing_sync", "guardrails_config", "$schema"]
+  return ["client", "providers", "governance", "cache", "pricing", "prompt_cache", "health", "guardrails", "logs_store", "otel", "mcp", "plugins", "semantic_cache", "vector_store", "secrets", "audit", "alerts", "session_affinity", "complexity_router", "mcp_server", "virtual_mcps", "log_exports", "exporters", "cluster", "oidc", "auth_proxy", "framework", "auth_config", "alerting", "audit_logs", "cluster_config", "circuit_breaker_config", "load_balancer_config", "pricing_sync", "guardrails_config", "scim_config", "$schema"]
 }
 
 // Raiju's keys one level down. client also takes the two keys normalize maps.
@@ -383,11 +383,49 @@ function mapCluster(inout top: Field[], inout notes: string[]): void throws Synt
     notes.push(`config: "cluster_config" has no shared secret, which Raiju needs for cluster sync; cluster sync is off until "cluster.secret" is set`)
     enabled = false
   }
-  ignored("cluster_config", cf, ["region", "gossip", "grpc", "discovery", "broker"], &notes)
+  ignored("cluster_config", cf, ["region", "gossip", "grpc", "broker"], &notes)
   let out: Field[] = []
   add(&out, "enabled", enabled ? "true" : "false")
   add(&out, "peers", find(cf, "peers") ?? "[]")
+  // the discovery block has the same names in both (kubernetes, dns, consul, etcd, udp, mdns)
+  add(&out, "discovery", find(cf, "discovery"))
   put(&top, "cluster", out)
+}
+
+// scim_config's authProxy becomes auth_proxy: Bifrost's camelCase names, Raiju's snake_case.
+// The rest of scim_config (the SCIM and SSO provider settings) is not read by Raiju.
+function mapAuthProxy(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const raw = find(top, "scim_config")
+  if (raw === undefined) return
+  top = without(top, ["scim_config"])
+  const sf = try members(raw)
+  if (rawBool(sf, "enabled") !== true) {
+    if (find(sf, "config") !== undefined) notes.push(`config: "scim_config" is off, so its authProxy is off too`)
+    return
+  }
+  notes.push(`config: "scim_config" is read for its authProxy only; SCIM and SSO provider settings are not supported by Raiju`)
+  const apRaw = find(try members(find(sf, "config")), "authProxy")
+  if (apRaw === undefined) return
+  const pf = try members(apRaw)
+  let out: Field[] = []
+  add(&out, "enabled", rawBool(pf, "enabled") === true ? "true" : "false")
+  add(&out, "provider", strRaw(pf, "provider") ?? "\"cloudflare-access\"")
+  add(&out, "mode", strRaw(pf, "mode") ?? "\"login_only\"")
+  const renames: string[][] = [["expectedSigner", "expected_signer"], ["region", "region"], ["publicKeyBaseUrl", "public_key_base_url"], ["issuerUrl", "issuer_url"], ["audience", "audience"], ["allowedAudiences", "allowed_audiences"], ["headerName", "header_name"], ["jwksUrl", "jwks_url"], ["userIdClaim", "user_id_claim"]]
+  for (const r of renames) {
+    const v = find(pf, r[0]!)
+    if (v === undefined) continue
+    if (v.includes("vault.") || v.includes("aws-sm.")) {
+      notes.push(`config: "authProxy.${r[0]}" uses a secret reference, which Raiju does not resolve; use env.VAR_NAME`)
+      continue
+    }
+    add(&out, r[1]!, v)
+  }
+  for (const f of pf) {
+    if (f.key === "enabled" || f.key === "provider" || f.key === "mode") continue
+    if (!renames.some((r) => r[0] === f.key)) notes.push(`config: "scim_config.config.authProxy.${f.key}" is not supported by Raiju and is ignored`)
+  }
+  put(&top, "auth_proxy", out)
 }
 
 // circuit_breaker_config and load_balancer_config both feed Raiju's health section.
@@ -824,6 +862,7 @@ export function normalize(configText: string): { text: string, notes: string[] }
   try mapAlerting(&top, &notes)
   try mapAudit(&top, &notes)
   try mapCluster(&top, &notes)
+  try mapAuthProxy(&top, &notes)
   try mapHealth(&top, &notes)
   try mapPricing(&top, &notes)
   try mapPlugins(&top, &notes)
@@ -940,6 +979,27 @@ test("keeps the cluster off without a secret, and says why", () => {
   expect(r.notes.includes(`config: "cluster_config" has no shared secret, which Raiju needs for cluster sync; cluster sync is off until "cluster.secret" is set`)).toBe(true)
   const b = try normalize(`{ "cluster_config": { "enabled": true, "type": "broker" } }`)
   expect(b.notes.includes(`config: "cluster_config.type" is "broker", which Raiju does not support; cluster sync is off`)).toBe(true)
+})
+
+test("passes cluster discovery through and maps scim_config's authProxy", () => {
+  const r = try normalize(`{
+    "cluster_config": { "enabled": true, "discovery": { "enabled": true, "type": "consul", "service_name": "bifrost", "consul_address": "consul:8500" } },
+    "scim_config": { "enabled": true, "provider": "okta", "config": { "clientId": "x", "authProxy": {
+      "enabled": true, "provider": "aws-alb", "mode": "full", "expectedSigner": "arn:aws:elasticloadbalancing:us-east-1:1:loadbalancer/app/a/1",
+      "headerName": "x-amzn-oidc-data", "userIdClaim": "email", "futureKey": 1 } } } }`)
+  const cl = try fields(find(try fields(r.text), "cluster")!)
+  expect(find(cl, "discovery")).toBe(`{ "enabled": true, "type": "consul", "service_name": "bifrost", "consul_address": "consul:8500" }`)
+  const ap = try fields(find(try fields(r.text), "auth_proxy")!)
+  expect(rawBool(ap, "enabled")).toBe(true)
+  expect(rawStr(ap, "provider")).toBe("aws-alb")
+  expect(rawStr(ap, "mode")).toBe("full")
+  expect(rawStr(ap, "expected_signer")).toBe("arn:aws:elasticloadbalancing:us-east-1:1:loadbalancer/app/a/1")
+  expect(rawStr(ap, "user_id_claim")).toBe("email")
+  expect(find(ap, "clientId")).toBe(undefined)
+  expect(r.notes.includes(`config: "scim_config.config.authProxy.futureKey" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(find(try fields(r.text), "scim_config")).toBe(undefined)
+  const off = try normalize(`{ "scim_config": { "enabled": false, "config": { "authProxy": { "enabled": true, "provider": "generic" } } } }`)
+  expect(find(try fields(off.text), "auth_proxy")).toBe(undefined)
 })
 
 test("maps circuit_breaker_config and load_balancer_config into one health section", () => {

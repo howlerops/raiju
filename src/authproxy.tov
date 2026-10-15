@@ -1,0 +1,690 @@
+// Identity-aware proxies in front of Raiju (Bifrost's auth-proxy docs): AWS ALB
+// (x-amzn-oidc-data, ES256 with the regional public key), Cloudflare Access
+// (Cf-Access-Jwt-Assertion, RS256 with the team's JWKS) and a generic OIDC proxy
+// (any header, RS256 or ES256, JWKS by URL or discovery). The proxy's token is
+// checked here; the identity it names is then mapped to a role. Tov has no ECDSA,
+// so P-256 verification is done here with bigint, as jwt.tov does RSA.
+import { Field, fields, elements, find, rawStr, rawNum, decodeString } from "./json"
+import { sha256, utf8 } from "./crypto"
+import { encodeUrl, decode } from "./base64"
+import { modPow } from "./jwt"
+import { request } from "./discovery"
+
+export type AuthProxyConfig = {
+  enabled: bool,
+  // "aws-alb", "cloudflare-access" or "generic"
+  provider: string,
+  // "login_only" (default: the user must already be provisioned) or "full" (the role comes from the token's claims)
+  mode?: string,
+  header_name?: string,
+  user_id_claim?: string,
+  // aws-alb: the load balancer's ARN; the token's signer must equal it
+  expected_signer?: string,
+  region?: string,
+  public_key_base_url?: string,
+  // cloudflare-access and generic: the issuer (https), the audience(s) and an explicit JWKS URL
+  issuer_url?: string,
+  audience?: string,
+  allowed_audiences?: string[],
+  jwks_url?: string,
+  // PEM of the CA that signs the key endpoint, for private CAs
+  ca_cert_pem?: string,
+}
+
+// A verified public key: P-256 (ES256) or RSA (RS256).
+export type ProxyKey = { kind: "ec", x: bigint, y: bigint } | { kind: "rsa", n: bigint, e: bigint }
+
+// The outcome of checking one proxy token. "unknown" names a key id to fetch before retrying.
+export type ProxyCheck = { kind: "ok", identity: string, claims: Field[] } | { kind: "unknown", kid: string } | { kind: "error", message: string }
+
+const ALB_HEADER = "x-amzn-oidc-data"
+const CF_HEADER = "Cf-Access-Jwt-Assertion"
+const CF_JWKS_PATH = "/cdn-cgi/access/certs"
+const SKEW_S = 60
+// Keys for an unknown id are fetched at most this often.
+const REFETCH_MS = 60000.0
+const KEY_TIMEOUT_MS = 10000
+
+// ---- DER and PEM ----
+
+type Tlv = { tag: int, value: u8[], next: int }
+
+function tlvAt(der: u8[], pos: int): Tlv throws SyntaxError {
+  if (pos + 2 > der.length) throw new SyntaxError("der: truncated")
+  const tag = int(der[pos]!)
+  let len = int(der[pos + 1]!)
+  let p = pos + 2
+  if (len >= 0x80) {
+    const n = len - 0x80
+    if (n < 1 || n > 4) throw new SyntaxError("der: unsupported length")
+    len = 0
+    for (let i = 0; i < n; i++) {
+      if (p >= der.length) throw new SyntaxError("der: truncated")
+      len = len * 256 + int(der[p]!)
+      p++
+    }
+  }
+  if (p + len > der.length) throw new SyntaxError("der: truncated")
+  return { tag: tag, value: der.slice(p, p + len), next: p + len }
+}
+
+function childOf(der: u8[], pos: int, tag: int): Tlv throws SyntaxError {
+  const t = try tlvAt(der, pos)
+  if (t.tag !== tag) throw new SyntaxError(`der: expected tag ${tag}, found ${t.tag}`)
+  return t
+}
+
+function bigOf(b: u8[]): bigint {
+  let v = 0n
+  for (const x of b) v = v * 256n + BigInt(int(x))
+  return v
+}
+
+function byteLen(x: bigint): int {
+  let n = 0
+  let v = x
+  while (v > 0n) {
+    v = v >> 8n
+    n++
+  }
+  return n
+}
+
+function sameBytes(a: u8[], b: int[]): bool {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < b.length; i++) {
+    if (int(a[i]!) !== b[i]!) return false
+  }
+  return true
+}
+
+// OID 1.2.840.10045.2.1 (ecPublicKey) and 1.2.840.10045.3.1.7 (prime256v1), as encoded.
+const EC_OID: int[] = [0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]
+const P256_OID: int[] = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]
+// OID 1.2.840.113549.1.1.1 (rsaEncryption).
+const RSA_OID: int[] = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]
+
+// A SubjectPublicKeyInfo (RFC 5280): an EC P-256 point or an RSA key.
+function keyFromSpki(der: u8[]): ProxyKey throws SyntaxError {
+  const top = (try childOf(der, 0, 0x30)).value
+  const alg = try childOf(top, 0, 0x30)
+  const bits = try childOf(top, alg.next, 0x03)
+  // the BIT STRING starts with the count of unused bits, always 0 here
+  const pk = bits.value.slice(1)
+  if (sameBytes(alg.value.slice(0, EC_OID.length), EC_OID)) {
+    if (!sameBytes(alg.value.slice(EC_OID.length), P256_OID)) throw new SyntaxError("spki: only the P-256 curve is supported")
+    if (pk.length !== 65 || int(pk[0]!) !== 4) throw new SyntaxError("spki: not an uncompressed P-256 point")
+    return try ecKey(bigOf(pk.slice(1, 33)), bigOf(pk.slice(33, 65)))
+  }
+  if (sameBytes(alg.value.slice(0, RSA_OID.length), RSA_OID)) {
+    const seq = (try childOf(pk, 0, 0x30)).value
+    const n = try childOf(seq, 0, 0x02)
+    const e = try childOf(seq, n.next, 0x02)
+    return { kind: "rsa", n: bigOf(n.value), e: bigOf(e.value) }
+  }
+  throw new SyntaxError("spki: key type is neither EC nor RSA")
+}
+
+// Reads a PEM public key ("BEGIN PUBLIC KEY").
+export function keyFromPem(pem: string): ProxyKey throws SyntaxError {
+  if (!pem.includes("-----BEGIN PUBLIC KEY-----")) throw new SyntaxError("pem: not a public key")
+  const lines: string[] = []
+  for (const line of pem.split("\n")) {
+    const l = line.trim()
+    if (l === "" || l.startsWith("-----")) continue
+    lines.push(l)
+  }
+  return try keyFromSpki(try decode(lines.join("")))
+}
+
+// ---- JWK ----
+
+// A JWK's key: EC P-256 ("kty":"EC","crv":"P-256") or RSA.
+function keyFromJwk(j: Field[]): ProxyKey throws Error {
+  const kty = rawStr(j, "kty") ?? ""
+  if (kty === "EC") {
+    if ((rawStr(j, "crv") ?? "") !== "P-256") throw new Error("jwk: only the P-256 curve is supported")
+    const x = rawStr(j, "x") ?? ""
+    const y = rawStr(j, "y") ?? ""
+    if (x === "" || y === "") throw new Error("jwk: EC key has no point")
+    return try ecKey(bigOf(try decode(x)), bigOf(try decode(y)))
+  }
+  if (kty === "RSA") {
+    const n = rawStr(j, "n") ?? ""
+    const e = rawStr(j, "e") ?? ""
+    if (n === "" || e === "") throw new Error("jwk: RSA key has no modulus or exponent")
+    return { kind: "rsa", n: bigOf(try decode(n)), e: bigOf(try decode(e)) }
+  }
+  throw new Error(`jwk: key type ${kty} is not supported`)
+}
+
+// The keys of a JWKS document, by kid. Keys that cannot be read are skipped.
+export function keysFromJwks(body: string): { kid: string, key: ProxyKey }[] throws SyntaxError {
+  const out: { kid: string, key: ProxyKey }[] = []
+  const raw = find(try fields(body), "keys")
+  if (raw === undefined) throw new SyntaxError("jwks: no keys")
+  for (const el of try elements(raw)) {
+    const j = try fields(el)
+    const kid = rawStr(j, "kid") ?? ""
+    try {
+      out.push({ kid: kid, key: try keyFromJwk(j) })
+    } catch (e) {
+      console.error(`raiju: auth proxy: skipped key ${kid}: ${e.message}`)
+    }
+  }
+  return out
+}
+
+// ---- P-256 (FIPS 186-4, ECDSA over prime256v1) ----
+
+const CURVE_P: bigint = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn
+const CURVE_N: bigint = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n
+const CURVE_B: bigint = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn
+const GX: bigint = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n
+const GY: bigint = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n
+
+// A point in Jacobian coordinates (x/z^2, y/z^3); inf is the point at infinity.
+type Pt = { x: bigint, y: bigint, z: bigint, inf: bool }
+
+const INF: Pt = { x: 0n, y: 1n, z: 0n, inf: true }
+
+function fp(a: bigint): bigint {
+  const r = a % CURVE_P
+  return r < 0n ? r + CURVE_P : r
+}
+
+function inv(a: bigint): bigint {
+  return modPow(fp(a), CURVE_P - 2n, CURVE_P)
+}
+
+// Checks y^2 = x^3 - 3x + b, then returns the key.
+function ecKey(x: bigint, y: bigint): ProxyKey throws SyntaxError {
+  if (x <= 0n || x >= CURVE_P || y <= 0n || y >= CURVE_P) throw new SyntaxError("ec: coordinate out of range")
+  const lhs = fp(y * y)
+  const rhs = fp(x * x * x - 3n * x + CURVE_B)
+  if (lhs !== rhs) throw new SyntaxError("ec: point is not on the curve")
+  return { kind: "ec", x: x, y: y }
+}
+
+// Doubling (dbl-2001-b, for a = -3).
+function dbl(p: Pt): Pt {
+  if (p.inf || p.y === 0n) return INF
+  const delta = fp(p.z * p.z)
+  const gamma = fp(p.y * p.y)
+  const beta = fp(p.x * gamma)
+  const alpha = fp(3n * (p.x - delta) * (p.x + delta))
+  const x3 = fp(alpha * alpha - 8n * beta)
+  const z3 = fp((p.y + p.z) * (p.y + p.z) - gamma - delta)
+  const y3 = fp(alpha * (4n * beta - x3) - 8n * gamma * gamma)
+  return { x: x3, y: y3, z: z3, inf: false }
+}
+
+// Adds an affine point (madd-2007-bl). Equal points double; opposite points give infinity.
+function addAffine(p: Pt, qx: bigint, qy: bigint): Pt {
+  if (p.inf) return { x: qx, y: qy, z: 1n, inf: false }
+  const z1z1 = fp(p.z * p.z)
+  const u2 = fp(qx * z1z1)
+  const s2 = fp(qy * p.z * z1z1)
+  const h = fp(u2 - p.x)
+  const r = fp(2n * (s2 - p.y))
+  if (h === 0n) {
+    if (r === 0n) return dbl(p)
+    return INF
+  }
+  const hh = fp(h * h)
+  const i = fp(4n * hh)
+  const j = fp(h * i)
+  const v = fp(p.x * i)
+  const x3 = fp(r * r - j - 2n * v)
+  const y3 = fp(r * (v - x3) - 2n * p.y * j)
+  const z3 = fp((p.z + h) * (p.z + h) - z1z1 - hh)
+  return { x: x3, y: y3, z: z3, inf: false }
+}
+
+// k times the affine point (x, y), most significant bit first.
+function scalarMul(k: bigint, x: bigint, y: bigint): Pt {
+  let acc: Pt = INF
+  let bits = 0
+  let t = k
+  while (t > 0n) {
+    t = t >> 1n
+    bits++
+  }
+  for (let i = bits - 1; i >= 0; i--) {
+    acc = dbl(acc)
+    if (((k >> BigInt(i)) & 1n) === 1n) acc = addAffine(acc, x, y)
+  }
+  return acc
+}
+
+// Affine coordinates of a Jacobian point, or undefined at infinity.
+function affine(p: Pt): { x: bigint, y: bigint } | undefined {
+  if (p.inf) return undefined
+  const zi = inv(p.z)
+  const zi2 = fp(zi * zi)
+  return { x: fp(p.x * zi2), y: fp(p.y * zi2 * zi) }
+}
+
+// ECDSA verification (SEC 1, section 4.1.4) of a SHA-256 digest with raw r and s.
+function ecVerify(key: { x: bigint, y: bigint }, digest: u8[], r: bigint, s: bigint): bool {
+  if (r <= 0n || r >= CURVE_N || s <= 0n || s >= CURVE_N) return false
+  const w = modPow(s, CURVE_N - 2n, CURVE_N)
+  const z = bigOf(digest) % CURVE_N
+  const u1 = (z * w) % CURVE_N
+  const u2 = (r * w) % CURVE_N
+  const p1 = scalarMul(u1, GX, GY)
+  const p2 = affine(scalarMul(u2, key.x, key.y))
+  let sum: Pt = p1
+  if (p2 !== undefined) sum = addAffine(p1, p2.x, p2.y)
+  const a = affine(sum)
+  if (a === undefined) return false
+  return a.x % CURVE_N === r
+}
+
+// ---- RSASSA-PKCS1-v1_5 with SHA-256 (RFC 8017) ----
+
+const SHA256_DIGEST_INFO: int[] = [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20]
+
+function expectedEm(hash: u8[], k: int): bigint throws Error {
+  const tLen = SHA256_DIGEST_INFO.length + hash.length
+  if (k < tLen + 11) throw new Error("auth proxy: RSA key too small for SHA-256")
+  const em: u8[] = [u8(0), u8(1)]
+  for (let i = 0; i < k - tLen - 3; i++) em.push(u8(0xff))
+  em.push(u8(0))
+  for (const b of SHA256_DIGEST_INFO) em.push(u8(b))
+  for (const b of hash) em.push(b)
+  return bigOf(em)
+}
+
+function rsaVerify(digest: u8[], sig: u8[], n: bigint, e: bigint): bool throws Error {
+  const k = byteLen(n)
+  if (k < 256) throw new Error("auth proxy: RSA key shorter than 2048 bits")
+  if (e < 3n || (e & 1n) === 0n) throw new Error("auth proxy: invalid RSA exponent")
+  if (sig.length !== k) return false
+  const s = bigOf(sig)
+  if (s >= n) return false
+  const want = try expectedEm(digest, k)
+  return modPow(s, e, n) === want
+}
+
+// ---- tokens ----
+
+// The alg each provider signs with; generic accepts either, as the key decides.
+function algOk(provider: string, alg: string, key: ProxyKey): bool {
+  if (provider === "aws-alb") return alg === "ES256" && key.kind === "ec"
+  if (provider === "cloudflare-access") return alg === "RS256" && key.kind === "rsa"
+  if (alg === "ES256") return key.kind === "ec"
+  if (alg === "RS256") return key.kind === "rsa"
+  return false
+}
+
+function stringsOf(raw: string | undefined): string[] throws SyntaxError {
+  const out: string[] = []
+  if (raw === undefined) return out
+  if (raw.startsWith("\"")) {
+    out.push(try decodeString(raw))
+  } else if (raw.startsWith("[")) {
+    for (const el of try elements(raw)) {
+      if (el.startsWith("\"")) out.push(try decodeString(el))
+    }
+  }
+  return out
+}
+
+// Where a token is read from: the configured header, else the provider's own.
+export function headerOf(cfg: AuthProxyConfig): string {
+  const h = cfg.header_name ?? ""
+  if (h !== "") return h
+  if (cfg.provider === "aws-alb") return ALB_HEADER
+  if (cfg.provider === "cloudflare-access") return CF_HEADER
+  return ""
+}
+
+// The base URL of the key endpoint: the regional one for ALB, the team's JWKS for Cloudflare.
+export function regionOf(arn: string): string {
+  const parts = arn.split(":")
+  return parts.length > 3 ? parts[3]! : ""
+}
+
+// The ALB key URL for a kid. Kids are short ids; anything that could change the path is refused.
+export function albKeyUrl(cfg: AuthProxyConfig, kid: string): string throws Error {
+  if (kid === "" || kid.includes("..")) throw new Error("auth proxy: bad key id")
+  for (const b of utf8(kid)) {
+    const c = int(b)
+    const ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45 || c === 95 || c === 61 || c === 43 || c === 46
+    if (!ok) throw new Error("auth proxy: bad key id")
+  }
+  const base = cfg.public_key_base_url ?? `https://public-keys.auth.elb.${cfg.region ?? regionOf(cfg.expected_signer ?? "")}.amazonaws.com`
+  return (base.endsWith("/") ? base.slice(0, base.byteLength - 1) : base) + "/" + kid
+}
+
+// The issuer without a trailing slash.
+function noSlash(s: string): string {
+  return s.endsWith("/") ? s.slice(0, s.byteLength - 1) : s
+}
+
+// Where a JWKS comes from: the explicit URL, else the team's Cloudflare path, else the issuer's discovery document.
+export function jwksUrl(cfg: AuthProxyConfig): string {
+  if (cfg.jwks_url !== undefined && cfg.jwks_url !== "") return cfg.jwks_url
+  if (cfg.provider === "cloudflare-access") return noSlash(cfg.issuer_url ?? "") + CF_JWKS_PATH
+  return noSlash(cfg.issuer_url ?? "") + "/.well-known/openid-configuration"
+}
+
+// The audiences a token may carry.
+function audiencesOf(cfg: AuthProxyConfig): string[] {
+  const out: string[] = []
+  if (cfg.audience !== undefined && cfg.audience !== "") out.push(cfg.audience)
+  for (const a of cfg.allowed_audiences ?? []) out.push(a)
+  return out
+}
+
+// Checks a token from the proxy: the signature with the key its kid names, then the claims the provider needs.
+export function checkProxyToken(cfg: AuthProxyConfig, keys: ProxyKeys, token: string, nowMs: f64): ProxyCheck {
+  try {
+    return try checkToken(cfg, keys, token, nowMs)
+  } catch (e) {
+    return { kind: "error", message: e.message }
+  }
+}
+
+function checkToken(cfg: AuthProxyConfig, keys: ProxyKeys, token: string, nowMs: f64): ProxyCheck throws Error {
+  const parts = token.split(".")
+  if (parts.length !== 3) throw new Error("auth proxy: token is not a JWS compact serialization")
+  const hfs = try fields(try decodeText(parts[0]!))
+  const alg = rawStr(hfs, "alg") ?? ""
+  const kid = rawStr(hfs, "kid") ?? ""
+  if (kid === "") throw new Error("auth proxy: token has no kid")
+  const key = keys.get(kid)
+  if (key === undefined) return { kind: "unknown", kid: kid }
+  if (!algOk(cfg.provider, alg, key)) throw new Error(`auth proxy: token alg ${alg} does not match the key`)
+  const input = utf8(parts[0]! + "." + parts[1]!)
+  const digest = sha256(input)
+  const sig = try decode(parts[2]!)
+  let ok = false
+  if (key.kind === "ec") {
+    if (sig.length !== 64) throw new Error("auth proxy: bad ES256 signature length")
+    ok = ecVerify({ x: key.x, y: key.y }, digest, bigOf(sig.slice(0, 32)), bigOf(sig.slice(32, 64)))
+  } else {
+    ok = try rsaVerify(digest, sig, key.n, key.e)
+  }
+  if (!ok) throw new Error("auth proxy: token signature is invalid")
+
+  const pfs = try fields(try decodeText(parts[1]!))
+  const nowS = nowMs / 1000.0
+  const exp = rawNum(pfs, "exp")
+  if (exp === undefined) throw new Error("auth proxy: token has no exp")
+  if (nowS > exp + SKEW_S) throw new Error("auth proxy: token has expired")
+  const nbf = rawNum(pfs, "nbf")
+  if (nbf !== undefined && nowS + SKEW_S < nbf) throw new Error("auth proxy: token is not valid yet")
+
+  if (cfg.provider === "aws-alb") {
+    if ((rawStr(pfs, "signer") ?? "") !== (cfg.expected_signer ?? "")) throw new Error("auth proxy: token signer is not this load balancer")
+  } else {
+    const iss = noSlash(cfg.issuer_url ?? "")
+    const tiss = noSlash(rawStr(pfs, "iss") ?? "")
+    if (tiss !== iss) throw new Error("auth proxy: token issuer does not match")
+    const auds = try stringsOf(find(pfs, "aud"))
+    let bound = false
+    for (const a of audiencesOf(cfg)) {
+      if (auds.includes(a)) bound = true
+    }
+    if (!bound) throw new Error("auth proxy: token audience does not match")
+  }
+
+  const who = rawStr(pfs, cfg.user_id_claim ?? "email") ?? ""
+  if (who === "") throw new Error(`auth proxy: token has no ${cfg.user_id_claim ?? "email"} claim`)
+  return { kind: "ok", identity: who, claims: pfs }
+}
+
+// Decodes a base64url segment as UTF-8 text.
+function decodeText(s: string): string throws Error {
+  return try new TextDecoder().decode(try decode(s))
+}
+
+// The role a verified token maps to in full mode, as the SSO login maps it: the first group
+// (in claim order) with a role_map entry; else default_role; else none.
+export function mappedRole(claims: Field[], roleClaim: string | undefined, roleMap: Record<string, string> | undefined, defaultRole: string | undefined): string | undefined throws SyntaxError {
+  const groups = try stringsOf(find(claims, roleClaim ?? "groups"))
+  if (roleMap !== undefined) {
+    for (const g of groups) {
+      const r = roleMap.get(g)
+      if (r !== undefined) return r
+    }
+  }
+  return defaultRole
+}
+
+// Checks the settings that cannot work; "" when they are usable.
+export function proxyProblem(cfg: AuthProxyConfig): string {
+  const mode = cfg.mode ?? "login_only"
+  if (mode !== "login_only" && mode !== "full") return `mode ${mode} is not login_only or full`
+  if (cfg.provider === "aws-alb") {
+    const arn = cfg.expected_signer ?? ""
+    if (!arn.startsWith("arn:")) return "aws-alb needs expected_signer, the load balancer's ARN"
+    if (regionOf(arn) === "" && (cfg.region ?? "") === "" && (cfg.public_key_base_url ?? "") === "") return "aws-alb: the region is not in the ARN"
+    const base = cfg.public_key_base_url ?? ""
+    if (base !== "" && !base.startsWith("https://")) return "aws-alb: public_key_base_url must be https"
+    return ""
+  }
+  if (cfg.provider === "cloudflare-access" || cfg.provider === "generic") {
+    if (cfg.provider === "generic" && (cfg.header_name ?? "") === "") return "generic: header_name is required"
+    const iss = cfg.issuer_url ?? ""
+    if (!iss.startsWith("https://")) return `${cfg.provider}: issuer_url must be https`
+    if (audiencesOf(cfg).length === 0) return `${cfg.provider}: audience or allowed_audiences is required`
+    const j = cfg.jwks_url ?? ""
+    if (j !== "" && !j.startsWith("https://")) return `${cfg.provider}: jwks_url must be https`
+    return ""
+  }
+  return `provider ${cfg.provider} is not aws-alb, cloudflare-access or generic`
+}
+
+// The keys of one proxy: fetched by kid (ALB) or as a whole JWKS, and kept.
+export class ProxyKeys {
+  private keys: Map<string, ProxyKey> = new Map()
+  private lastFetch: f64 = -1.0e15
+  private busy = false
+
+  constructor(readonly cfg: AuthProxyConfig) {}
+
+  get(kid: string): ProxyKey | undefined {
+    return this.keys.get(kid)
+  }
+
+  put(kid: string, key: ProxyKey): void {
+    this.keys.set(kid, key)
+  }
+
+  // Asks for a key that is not loaded yet, at most once a minute. A retried request then finds it.
+  want(kid: string, nowMs: f64): void {
+    if (this.busy || nowMs - this.lastFetch < REFETCH_MS) return
+    this.busy = true
+    this.lastFetch = nowMs
+    this.load(kid)
+  }
+
+  // Loads a JWKS at start-up, so the first request does not wait for it (ALB keys are per kid).
+  warm(nowMs: f64): void {
+    if (this.cfg.provider !== "aws-alb") this.want("", nowMs)
+  }
+
+  private async load(kid: string): Promise<void> {
+    try {
+      if (this.cfg.provider === "aws-alb") {
+        const r = try await request("GET", try albKeyUrl(this.cfg, kid), new Map(), undefined, this.cfg.ca_cert_pem ?? "", KEY_TIMEOUT_MS)
+        if (r.status !== 200) throw new Error(`auth proxy: key ${kid}: HTTP ${r.status}`)
+        this.keys.set(kid, try keyFromPem(r.body))
+      } else {
+        let src = jwksUrl(this.cfg)
+        // a generic proxy without a JWKS URL: its discovery document names one
+        if ((this.cfg.jwks_url ?? "") === "" && this.cfg.provider !== "cloudflare-access") {
+          const d = try await request("GET", src, new Map(), undefined, this.cfg.ca_cert_pem ?? "", KEY_TIMEOUT_MS)
+          if (d.status !== 200) throw new Error(`auth proxy: discovery: HTTP ${d.status}`)
+          src = rawStr(try fields(d.body), "jwks_uri") ?? ""
+          if (!src.startsWith("https://")) throw new Error("auth proxy: jwks_uri must be https")
+        }
+        const r = try await request("GET", src, new Map(), undefined, this.cfg.ca_cert_pem ?? "", KEY_TIMEOUT_MS)
+        if (r.status !== 200) throw new Error(`auth proxy: JWKS: HTTP ${r.status}`)
+        for (const k of try keysFromJwks(r.body)) {
+          if (k.kid !== "") this.put(k.kid, k.key)
+        }
+      }
+    } catch (e) {
+      console.error(`raiju: auth proxy keys: ${e.message}`)
+    }
+    this.busy = false
+  }
+}
+
+// ---- tests ----
+// The keys and tokens below were made with Python's cryptography package for these tests only.
+
+const EC_PEM = `-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEPQT1lEW7JZC0hFHLtxINn8NHAFR9
+10AZywjlJ7QrXsN+CqjBt8YQseCml4zf4C3SBKE7YSt0M4K+uZPsc929Yw==
+-----END PUBLIC KEY-----`
+const EC_X: bigint = 27599846077108969482735478679792027210003616044761040013528820836971215281859n
+const EC_Y: bigint = 57010252108148945031621947102177812533038713903682107994991377745564634299747n
+const EC_TOKEN = "eyJhbGciOiJFUzI1NiIsImtpZCI6ImVjLXRlc3QtMSIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3OTIwNzg0NDIsImlhdCI6MTc5MjA3Nzg0Miwic2lnbmVyIjoiYXJuOmF3czplbGFzdGljbG9hZGJhbGFuY2luZzp1cy1lYXN0LTE6MTIzNDU2Nzg5MDEyOmxvYWRiYWxhbmNlci9hcHAvbXktYWxiLzUwZGM2YzQ5NWMwYzkxODgiLCJpc3MiOiJodHRwczovL29pZGMuZXhhbXBsZSIsImVtYWlsIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJzdWIiOiJ1LTEifQ.fdE4u7_E3z2viRJgPXQeaWDTikonYXEhGnu2HmTXgxPrBOXdYMTGn_EKDMwT-1xj7ud3h4YP3t2UBDh20C7N1Q"
+const EC_NOW_MS: f64 = 1792077842000.0
+const ALB_ARN = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/my-alb/50dc6c495c0c9188"
+const RSA_TOKEN = "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS10ZXN0LTEiLCJ0eXAiOiJKV1QifQ.eyJleHAiOjE3OTIwNzg0NDIsIm5iZiI6MTc5MjA3NzgzMiwiaXNzIjoiaHR0cHM6Ly90ZWFtLmNsb3VkZmxhcmVhY2Nlc3MuY29tIiwiYXVkIjpbImF1ZC1hcHAtMSJdLCJlbWFpbCI6ImJvYkBleGFtcGxlLmNvbSIsImdyb3VwcyI6WyJlbmciLCJvcHMiXSwic3ViIjoidS0yIn0.LyX6gyXnjQ8lQ9wQqALcepAe9v09FunGtcNH4mvh6V20T1HCEe9JRRzQWCyeYZ2uUyodBbQmEYn6gsGmNroN95nOSl-TX13AidlsB2AT6ilHT9pVZpys2LrqTnv8jOYto_02kdA1UCy0Yjkmns6uP9_yzbhOg0ubdiatsToiXg0XrqVnEwFFQ4ggdLdejNHU93NCsspzM9C3FrAi5zh-3zsI0kXgJyQ0vpo8Dnz8IEUE_3uIdSsNW5uwInalffpa2B5aZL81JOlGr2hhUwCSHsc5CV-tjC-rqKjIaruc3_uN7c86tGRhf_wa4CmgLbSG2U4ko3WVHjkBnPoMWE8QPw"
+const RSA_JWKS = `{"keys":[{"kty":"RSA","kid":"rsa-test-1","alg":"RS256","use":"sig","n":"m1vvBb1AQThPXvJWNO2Tzpl-iMqVMQtKHblj65kEiQbgG3NWekGsIog9kXL_zbrLcuudf6CiVRmftbRZKBhjxQtU2Od4lbLf1eMjvraJuKj32NiImE4Q5hrXdUSIgl2DhrJpHR7-tybtUmBGlfNHp1IFatkPDu_Otmd7Kv2ZUB5yYtmy9ppThfvj51Ua0LZcU-MUPhqSAZ2dKC9CieDk6MrPy5mpxGpaUeF5zu_E6bO3PSolGjFw0hasnptzHZl7DPRA2278qH4bTYakWOSt9-v5ufEaBElKrmRMgIFmsJmr_hXMJJ5fWTza-Pi7xUZsINPaX1zyciILj1g-Ti82kw","e":"AQAB"}]}`
+const RSA_NOW_MS: f64 = 1792077842000.0
+
+function albCfg(): AuthProxyConfig {
+  return { enabled: true, provider: "aws-alb", expected_signer: ALB_ARN }
+}
+
+function cfCfg(): AuthProxyConfig {
+  return { enabled: true, provider: "cloudflare-access", issuer_url: "https://team.cloudflareaccess.com", audience: "aud-app-1" }
+}
+
+// A key store with the given keys preloaded (no network in tests).
+function loaded(cfg: AuthProxyConfig, kid: string, key: ProxyKey): ProxyKeys {
+  const ks = new ProxyKeys(cfg)
+  ks.put(kid, key)
+  return ks
+}
+
+test("reads an EC P-256 public key from PEM", () => {
+  const k = try keyFromPem(EC_PEM)
+  expect(k.kind).toBe("ec")
+  if (k.kind === "ec") {
+    expect(k.x).toBe(EC_X)
+    expect(k.y).toBe(EC_Y)
+  }
+})
+
+test("rejects a PEM that is not a public key", () => {
+  let threw = false
+  try {
+    const k = try keyFromPem("not a key")
+    expect(k.kind).toBe("ec")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("verifies an ES256 token and rejects a changed one", () => {
+  const cfg: AuthProxyConfig = albCfg()
+  const ks = loaded(cfg, "ec-test-1", { kind: "ec", x: EC_X, y: EC_Y })
+  const ok = checkProxyToken(cfg, ks, EC_TOKEN, EC_NOW_MS)
+  expect(ok.kind).toBe("ok")
+  if (ok.kind === "ok") expect(ok.identity).toBe("alice@example.com")
+  // a different payload under the same signature
+  const parts = EC_TOKEN.split(".")
+  const forged = parts[0]! + "." + parts[1]!.slice(0, 10) + "A" + parts[1]!.slice(11) + "." + parts[2]!
+  expect(checkProxyToken(cfg, ks, forged, EC_NOW_MS).kind).toBe("error")
+  // a different key rejects it
+  const other = loaded(cfg, "ec-test-1", { kind: "ec", x: EC_Y, y: EC_X })
+  expect(checkProxyToken(cfg, other, EC_TOKEN, EC_NOW_MS).kind).toBe("error")
+})
+
+test("ES256 checks the signer, expiry and not-before", () => {
+  const cfg = albCfg()
+  const ks = loaded(cfg, "ec-test-1", { kind: "ec", x: EC_X, y: EC_Y })
+  const wrong: AuthProxyConfig = { enabled: true, provider: "aws-alb", expected_signer: "arn:aws:elasticloadbalancing:us-east-1:1:loadbalancer/app/other/1" }
+  expect(checkProxyToken(wrong, ks, EC_TOKEN, EC_NOW_MS).kind).toBe("error")
+  expect(checkProxyToken(cfg, ks, EC_TOKEN, EC_NOW_MS + 3600000.0).kind).toBe("error")
+})
+
+test("an unknown kid asks for its key", () => {
+  const cfg = albCfg()
+  const ks = new ProxyKeys(cfg)
+  const r = checkProxyToken(cfg, ks, EC_TOKEN, EC_NOW_MS)
+  expect(r.kind).toBe("unknown")
+  if (r.kind === "unknown") expect(r.kid).toBe("ec-test-1")
+})
+
+test("builds the ALB key URL and refuses odd key ids", () => {
+  expect(regionOf(ALB_ARN)).toBe("us-east-1")
+  expect(try albKeyUrl(albCfg(), "ec-test-1")).toBe("https://public-keys.auth.elb.us-east-1.amazonaws.com/ec-test-1")
+  expect(try albKeyUrl({ enabled: true, provider: "aws-alb", region: "us-gov-west-1", expected_signer: ALB_ARN }, "k")).toBe("https://public-keys.auth.elb.us-gov-west-1.amazonaws.com/k")
+  let refused = false
+  try {
+    const u = try albKeyUrl(albCfg(), "../x")
+    expect(u).toBe("")
+  } catch (e) {
+    refused = true
+  }
+  expect(refused).toBe(true)
+})
+
+test("verifies an RS256 token from a JWKS", () => {
+  const cfg = cfCfg()
+  const ks = new ProxyKeys(cfg)
+  for (const k of try keysFromJwks(RSA_JWKS)) ks.put(k.kid, k.key)
+  const r = checkProxyToken(cfg, ks, RSA_TOKEN, RSA_NOW_MS)
+  expect(r.kind).toBe("ok")
+  if (r.kind === "ok") {
+    expect(r.identity).toBe("bob@example.com")
+    const rm: Record<string, string> = new Map()
+  rm.set("ops", "auditor")
+  expect(try mappedRole(r.claims, "groups", rm, undefined)).toBe("auditor")
+  }
+  const badAud: AuthProxyConfig = { enabled: true, provider: "cloudflare-access", issuer_url: "https://team.cloudflareaccess.com", audience: "other" }
+  expect(checkProxyToken(badAud, ks, RSA_TOKEN, RSA_NOW_MS).kind).toBe("error")
+  const badIss: AuthProxyConfig = { enabled: true, provider: "cloudflare-access", issuer_url: "https://evil.cloudflareaccess.com", audience: "aud-app-1" }
+  expect(checkProxyToken(badIss, ks, RSA_TOKEN, RSA_NOW_MS).kind).toBe("error")
+})
+
+test("the generic provider takes RS256 and ES256 by key", () => {
+  const gen: AuthProxyConfig = { enabled: true, provider: "generic", header_name: "X-Forwarded-Assertion", issuer_url: "https://team.cloudflareaccess.com", audience: "aud-app-1" }
+  const ks = new ProxyKeys(gen)
+  for (const k of try keysFromJwks(RSA_JWKS)) ks.put(k.kid, k.key)
+  expect(checkProxyToken(gen, ks, RSA_TOKEN, RSA_NOW_MS).kind).toBe("ok")
+  // an ES256 token against an RSA key is refused
+  const ec = loaded({ enabled: true, provider: "generic", header_name: "h", issuer_url: "https://x.example", audience: "a" }, "ec-test-1", { kind: "ec", x: EC_X, y: EC_Y })
+  expect(checkProxyToken({ enabled: true, provider: "generic", header_name: "h", issuer_url: "https://team.cloudflareaccess.com", audience: "aud-app-1" }, ec, RSA_TOKEN, RSA_NOW_MS).kind).toBe("unknown")
+})
+
+test("validates the proxy settings", () => {
+  expect(proxyProblem(albCfg())).toBe("")
+  expect(proxyProblem({ enabled: true, provider: "aws-alb" })).toBe("aws-alb needs expected_signer, the load balancer's ARN")
+  expect(proxyProblem({ enabled: true, provider: "aws-alb", expected_signer: ALB_ARN, public_key_base_url: "http://keys.example" })).toBe("aws-alb: public_key_base_url must be https")
+  expect(proxyProblem(cfCfg())).toBe("")
+  expect(proxyProblem({ enabled: true, provider: "cloudflare-access", issuer_url: "https://t.example" })).toBe("cloudflare-access: audience or allowed_audiences is required")
+  expect(proxyProblem({ enabled: true, provider: "generic", issuer_url: "https://t.example", audience: "a" })).toBe("generic: header_name is required")
+  expect(proxyProblem({ enabled: true, provider: "saml", issuer_url: "https://t.example", audience: "a" })).toBe("provider saml is not aws-alb, cloudflare-access or generic")
+  expect(proxyProblem({ enabled: true, provider: "aws-alb", expected_signer: ALB_ARN, mode: "admin" })).toBe("mode admin is not login_only or full")
+})
+
+test("picks the header and the JWKS URL", () => {
+  expect(headerOf(albCfg())).toBe("x-amzn-oidc-data")
+  expect(headerOf(cfCfg())).toBe("Cf-Access-Jwt-Assertion")
+  expect(jwksUrl(cfCfg())).toBe("https://team.cloudflareaccess.com/cdn-cgi/access/certs")
+  expect(jwksUrl({ enabled: true, provider: "generic", issuer_url: "https://auth.example/", audience: "a", header_name: "h" })).toBe("https://auth.example/.well-known/openid-configuration")
+})
+
+test("maps groups to roles, with a default", () => {
+  const claims = try fields(`{"groups":["eng","ops"],"email":"x"}`)
+  const map: Record<string, string> = new Map()
+  map.set("ops", "editor")
+  map.set("eng", "viewer")
+  // the first group in claim order that maps wins
+  expect(try mappedRole(claims, undefined, map, undefined)).toBe("viewer")
+  expect(try mappedRole(claims, "roles", map, "auditor")).toBe("auditor")
+  expect(try mappedRole(claims, "roles", map, undefined)).toBe(undefined)
+})
+

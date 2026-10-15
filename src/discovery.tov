@@ -1,0 +1,533 @@
+// Cluster discovery (Bifrost's cluster_config.discovery): finds the other nodes of a
+// cluster and turns them into sync URLs. Kubernetes (pods by label, or a service's
+// endpoints), DNS (A records), Consul (catalog, with this node registered) and etcd
+// (v3 JSON gateway: a leased key per node) are here. UDP broadcast and mDNS need UDP
+// sockets, which Tov does not have yet (node:dgram is a stub), so they report that
+// as an error and find no peers. Leader election is in cluster.tov.
+import * as dns from "node:dns"
+import { readFileSync } from "node:fs"
+import { encode, decode } from "./base64"
+import { utf8 } from "./crypto"
+import { deadline } from "./deadline"
+
+export type DiscoveryConfig = {
+  enabled?: bool,
+  type: string,
+  service_name?: string,
+  bind_port?: int,
+  dial_timeout?: string,
+  allowed_address_space?: string[],
+  k8s_namespace?: string,
+  k8s_label_selector?: string,
+  dns_names?: string[],
+  udp_broadcast_port?: int,
+  consul_address?: string,
+  etcd_endpoints?: string[],
+  mdns_service?: string,
+  // Raiju only: this node's address as the others reach it. Consul and etcd register it, and it is skipped when listing peers.
+  advertise_address?: string,
+  // Raiju only: "http" (default) or "https" for the sync URLs of the peers.
+  scheme?: string,
+  // Raiju only: the Kubernetes API base URL, and the token and CA files (defaults: in-cluster).
+  api_url?: string,
+  token_file?: string,
+  ca_file?: string,
+}
+
+// A discovered node before it becomes a URL.
+export type Hit = { host: string, port: int }
+
+// The result of one round. On failure peers is empty and the caller keeps the last good list.
+export type DiscoverOutcome = { ok: bool, peers: string[], error: string }
+
+// Bifrost's default bind port for the cluster listener, and its default dial timeout.
+const DEFAULT_PORT: int = 8080
+const DEFAULT_TIMEOUT_MS: int = 10000
+// A registration's lease lasts this long; the discovery round renews it every tick.
+const ETCD_TTL_S: int = 30
+const CONSUL_DEFAULT = "localhost:8500"
+const SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+const HEX = "0123456789ABCDEF"
+const UDP_MSG = "udp discovery needs UDP sockets, which Raiju does not have yet"
+const MDNS_MSG = "mdns discovery needs UDP sockets (multicast DNS), which Raiju does not have yet"
+
+// ---- pure helpers ----
+
+// UTF-8 bytes as text.
+function textOf(b: u8[]): string throws Error {
+  return try new TextDecoder().decode(b)
+}
+
+// The printable ASCII characters, from space (32) on.
+const PRINTABLE = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+// Percent-encodes a query value: RFC 3986 unreserved characters pass, the rest become %XX.
+export function pctEncode(s: string): string {
+  let out = ""
+  for (const b of utf8(s)) {
+    const c = int(b)
+    const plain = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45 || c === 46 || c === 95 || c === 126
+    if (plain) {
+      out += PRINTABLE.slice(c - 32, c - 31)
+    } else {
+      out += "%" + HEX.slice(c >> 4, (c >> 4) + 1) + HEX.slice(c & 15, (c & 15) + 1)
+    }
+  }
+  return out
+}
+
+// A peer's sync URL. IPv6 literals go in brackets.
+export function syncUrl(scheme: string, host: string, port: int): string {
+  const h = host.includes(":") ? `[${host}]` : host
+  return `${scheme}://${h}:${port}`
+}
+
+// An IPv4 address as a number, or undefined.
+export function ipv4Value(s: string): f64 | undefined {
+  const parts = s.split(".")
+  if (parts.length !== 4) return undefined
+  let v: f64 = 0.0
+  for (const p of parts) {
+    if (p.byteLength === 0 || p.byteLength > 3) return undefined
+    for (const b of utf8(p)) {
+      if (int(b) < 48 || int(b) > 57) return undefined
+    }
+    const n = parseInt(p) ?? -1
+    if (n < 0 || n > 255) return undefined
+    v = v * 256.0 + n
+  }
+  return v
+}
+
+// Whether host is an IPv4 address inside one of the CIDR ranges. An empty list allows every host;
+// a host name is not an address, so it is refused when a list is set.
+export function allowedHost(host: string, cidrs: string[]): bool {
+  if (cidrs.length === 0) return true
+  const addr = ipv4Value(host)
+  if (addr === undefined) return false
+  for (const c of cidrs) {
+    const slash = c.indexOf("/")
+    const base = ipv4Value(slash < 0 ? c : c.slice(0, slash))
+    const bits = slash < 0 ? 32 : (parseInt(c.slice(slash + 1)) ?? -1)
+    if (base === undefined || bits < 0 || bits > 32) continue
+    const block: f64 = Math.pow(2, 32 - bits)
+    if (Math.floor(addr / block) === Math.floor(base / block)) return true
+  }
+  return false
+}
+
+// A Go-style duration ("10s", "2m", "500ms") in milliseconds; the default when absent or unreadable.
+export function timeoutMs(s: string | undefined): int {
+  if (s === undefined || s === "") return DEFAULT_TIMEOUT_MS
+  let n = -1
+  let unit = 1
+  if (s.endsWith("ms")) {
+    n = parseInt(s.slice(0, s.byteLength - 2)) ?? -1
+  } else if (s.endsWith("s")) {
+    n = parseInt(s.slice(0, s.byteLength - 1)) ?? -1
+    unit = 1000
+  } else if (s.endsWith("m")) {
+    n = parseInt(s.slice(0, s.byteLength - 1)) ?? -1
+    unit = 60000
+  }
+  return n > 0 ? n * unit : DEFAULT_TIMEOUT_MS
+}
+
+// "env.NAME" reads an environment variable (empty when unset); anything else is the name itself.
+export function envName(raw: string, env: (name: string) => string | undefined): string {
+  if (!raw.startsWith("env.")) return raw
+  return env(raw.slice(4)) ?? ""
+}
+
+// An agent or endpoint address as a base URL: a scheme is added when missing, a trailing slash dropped.
+export function baseUrl(addr: string): string {
+  const base = addr.startsWith("http://") || addr.startsWith("https://") ? addr : "http://" + addr
+  return base.endsWith("/") ? base.slice(0, base.byteLength - 1) : base
+}
+
+// The Consul agent's base URL (its default when unset).
+export function consulBase(addr: string): string {
+  return baseUrl(addr === "" ? CONSUL_DEFAULT : addr)
+}
+
+// The etcd key prefix of one service's registrations, and the first key after it.
+export function etcdPrefix(service: string): string {
+  return `/raiju/${service}/`
+}
+
+export function etcdRangeEnd(prefix: string): string {
+  return prefix.slice(0, prefix.byteLength - 1) + "0"
+}
+
+type K8sPod = { status?: { phase?: string, podIP?: string } }
+type K8sList = { items?: K8sPod[] }
+type K8sEndpoints = { subsets?: { addresses?: { ip?: string }[] }[] }
+type ConsulEntry = { Service?: { ID?: string, Address?: string, Port?: int }, Node?: { Address?: string } }
+type EtcdKv = { key?: string, value?: string }
+type EtcdRange = { kvs?: EtcdKv[] }
+type EtcdValue = { addr?: string, port?: int }
+type EtcdLease = { ID?: string, TTL?: string }
+type EtcdKeepalive = { result?: { ID?: string, TTL?: string } }
+
+// Pods (Running, with an IP) matching the label selector.
+export function podHits(body: string, port: int): Hit[] throws SyntaxError {
+  const list = try JSON.parse(body) as K8sList
+  const items: K8sPod[] = list.items ?? []
+  const out: Hit[] = []
+  for (const pod of items) {
+    const ip = pod.status?.podIP ?? ""
+    if (pod.status?.phase === "Running" && ip !== "") out.push({ host: ip, port: port })
+  }
+  return out
+}
+
+// The addresses of a service's endpoints.
+export function endpointHits(body: string, port: int): Hit[] throws SyntaxError {
+  const ep = try JSON.parse(body) as K8sEndpoints
+  const out: Hit[] = []
+  for (const s of ep.subsets ?? []) {
+    for (const a of s.addresses ?? []) {
+      const ip = a.ip ?? ""
+      if (ip !== "") out.push({ host: ip, port: port })
+    }
+  }
+  return out
+}
+
+// Consul's health entries for a service, without this node's own registration. A
+// registration's own port wins over the default.
+export function consulHits(body: string, myId: string, port: int): Hit[] throws SyntaxError {
+  const entries = try JSON.parse(body) as ConsulEntry[]
+  const out: Hit[] = []
+  for (const e of entries) {
+    if ((e.Service?.ID ?? "") === myId) continue
+    const addr = e.Service?.Address ?? ""
+    const host = addr !== "" ? addr : (e.Node?.Address ?? "")
+    const p = e.Service?.Port ?? 0
+    if (host !== "") out.push({ host: host, port: p > 0 ? p : port })
+  }
+  return out
+}
+
+// The nodes under an etcd prefix, except this one (keys are "<prefix><node id>", values {"addr","port"}).
+export function etcdHits(body: string, selfId: string, prefix: string): Hit[] throws Error {
+  const r = try JSON.parse(body) as EtcdRange
+  const out: Hit[] = []
+  for (const kv of r.kvs ?? []) {
+    const key = try textOf(try decode(kv.key ?? ""))
+    if (key === prefix + selfId) continue
+    const v = try JSON.parse(try textOf(try decode(kv.value ?? ""))) as EtcdValue
+    const addr = v.addr ?? ""
+    if (addr !== "") out.push({ host: addr, port: v.port ?? DEFAULT_PORT })
+  }
+  return out
+}
+
+// ---- HTTP ----
+
+type Reply = { status: int, body: string }
+
+// One request with a deadline. Any transport failure is an Error naming the URL.
+export async function request(method: string, url: string, headers: Map<string, string>, body: string | undefined, ca: string, ms: int): Promise<Reply> throws Error {
+  const dl = deadline(ms)
+  const hs: Record<string, string> = headers
+  try {
+    const r = try await fetch(url, { method: method, headers: hs, body: body, tls: ca === "" ? undefined : { ca: ca }, signal: dl.controller.signal })
+    const text = try await r.text()
+    dl.finish()
+    return { status: r.status, body: text }
+  } catch (e) {
+    dl.finish()
+    throw new Error(`${url}: ${e.message}`)
+  }
+}
+
+// The file's text, or "" when it cannot be read.
+function readOr(path: string): string {
+  try {
+    return readFileSync(path, "utf8")
+  } catch (e) {
+    return ""
+  }
+}
+
+// ---- mechanisms ----
+
+async function k8sPeers(d: DiscoveryConfig, port: int, ms: int): Promise<Hit[]> throws Error {
+  const base = d.api_url ?? `https://${process.env.KUBERNETES_SERVICE_HOST ?? "kubernetes.default.svc"}:${process.env.KUBERNETES_SERVICE_PORT ?? "443"}`
+  let token = ""
+  try {
+    token = readFileSync(d.token_file ?? SA_DIR + "/token", "utf8").trim()
+  } catch (e) {
+    throw new Error(`kubernetes: no service account token: ${e.message}`)
+  }
+  const ca = readOr(d.ca_file ?? SA_DIR + "/ca.crt")
+  const ns = d.k8s_namespace ?? "default"
+  const sel = d.k8s_label_selector ?? ""
+  const svc = d.service_name ?? ""
+  const h: Map<string, string> = new Map()
+  h.set("authorization", "Bearer " + token)
+  h.set("accept", "application/json")
+  if (sel !== "") {
+    const r = try await request("GET", `${base}/api/v1/namespaces/${ns}/pods?labelSelector=${pctEncode(sel)}`, h, undefined, ca, ms)
+    if (r.status !== 200) throw new Error(`kubernetes: pods: HTTP ${r.status}`)
+    return try podHits(r.body, port)
+  }
+  if (svc === "") throw new Error("kubernetes discovery needs k8s_label_selector or service_name")
+  const r = try await request("GET", `${base}/api/v1/namespaces/${ns}/endpoints/${pctEncode(svc)}`, h, undefined, ca, ms)
+  if (r.status !== 200) throw new Error(`kubernetes: endpoints: HTTP ${r.status}`)
+  return try endpointHits(r.body, port)
+}
+
+async function dnsPeers(d: DiscoveryConfig, port: int, env: (name: string) => string | undefined): Promise<Hit[]> throws Error {
+  const out: Hit[] = []
+  const errs: string[] = []
+  for (const raw of d.dns_names ?? []) {
+    const name = envName(raw, env)
+    if (name === "") continue
+    try {
+      const addrs = try await dns.promises.lookup(name, { all: true, family: 4 }) as { address: string }[]
+      for (const a of addrs) out.push({ host: a.address, port: port })
+    } catch (e) {
+      errs.push(`${name}: ${e.message}`)
+    }
+  }
+  // one name that fails does not hide the others; only all failing is an error
+  if (errs.length > 0 && out.length === 0) throw new Error("dns: " + errs.join("; "))
+  return out
+}
+
+async function consulPeers(d: DiscoveryConfig, nodeId: string, port: int, ms: int): Promise<Hit[]> throws Error {
+  const svc = d.service_name ?? ""
+  if (svc === "") throw new Error("consul discovery needs service_name")
+  const base = consulBase(d.consul_address ?? "")
+  const myId = `${svc}-${nodeId}`
+  const tok = process.env.CONSUL_HTTP_TOKEN ?? ""
+  const h: Map<string, string> = new Map()
+  if (tok !== "") h.set("X-Consul-Token", tok)
+  const adv = d.advertise_address ?? ""
+  if (adv !== "") {
+    const reg = JSON.stringify({ ID: myId, Name: svc, Tags: ["raiju", "cluster"], Address: adv, Port: port, Check: { TCP: `${adv}:${port}`, Interval: "10s", Timeout: "5s" } })
+    const rh: Map<string, string> = new Map()
+    rh.set("content-type", "application/json")
+    if (tok !== "") rh.set("X-Consul-Token", tok)
+    const r = try await request("PUT", base + "/v1/agent/service/register", rh, reg, "", ms)
+    if (r.status !== 200) throw new Error(`consul: register: HTTP ${r.status}`)
+  }
+  const q = try await request("GET", `${base}/v1/health/service/${pctEncode(svc)}?passing=true`, h, undefined, "", ms)
+  if (q.status !== 200) throw new Error(`consul: catalog: HTTP ${q.status}`)
+  return try consulHits(q.body, myId, port)
+}
+
+// The etcd v3 JSON gateway. This node holds one key under a lease, renewed every round.
+class EtcdClient {
+  private lease = ""
+
+  constructor(readonly endpoints: string[], readonly service: string) {}
+
+  // Registers this node (when it has an address), then reads the others. Endpoints are tried in order.
+  async round(nodeId: string, adv: string, port: int, ms: int): Promise<Hit[]> throws Error {
+    let lastErr = "etcd: no endpoints configured"
+    for (const ep of this.endpoints) {
+      try {
+        return try await this.roundAt(ep, nodeId, adv, port, ms)
+      } catch (e) {
+        lastErr = e.message
+      }
+    }
+    throw new Error(lastErr)
+  }
+
+  private async roundAt(ep: string, nodeId: string, adv: string, port: int, ms: int): Promise<Hit[]> throws Error {
+    const base = baseUrl(ep)
+    const prefix = etcdPrefix(this.service)
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    if (adv !== "") {
+      if (this.lease !== "") {
+        // an expired lease answers with no TTL: register again below
+        const ka = try await request("POST", base + "/v3/lease/keepalive", h, JSON.stringify({ ID: this.lease }), "", ms)
+        let ttl = "0"
+        if (ka.status === 200) ttl = (try JSON.parse(ka.body) as EtcdKeepalive).result?.TTL ?? "0"
+        if (ttl === "0") this.lease = ""
+      }
+      if (this.lease === "") {
+        const g = try await request("POST", base + "/v3/lease/grant", h, JSON.stringify({ TTL: ETCD_TTL_S }), "", ms)
+        if (g.status !== 200) throw new Error(`etcd: lease grant: HTTP ${g.status}`)
+        const id = (try JSON.parse(g.body) as EtcdLease).ID ?? ""
+        if (id === "") throw new Error("etcd: lease grant returned no ID")
+        this.lease = id
+      }
+      const value = JSON.stringify({ addr: adv, port: port })
+      const put = JSON.stringify({ key: encode(utf8(prefix + nodeId)), value: encode(utf8(value)), lease: this.lease })
+      const p = try await request("POST", base + "/v3/kv/put", h, put, "", ms)
+      if (p.status !== 200) {
+        this.lease = ""
+        throw new Error(`etcd: put: HTTP ${p.status}`)
+      }
+    }
+    const end = etcdRangeEnd(prefix)
+    const range = JSON.stringify({ key: encode(utf8(prefix)), range_end: encode(utf8(end)) })
+    const rr = try await request("POST", base + "/v3/kv/range", h, range, "", ms)
+    if (rr.status !== 200) throw new Error(`etcd: range: HTTP ${rr.status}`)
+    return try etcdHits(rr.body, nodeId, prefix)
+  }
+}
+
+// ---- the discoverer ----
+
+// Runs the configured mechanism. Keep one per cluster: etcd keeps its lease in it.
+export class Discoverer {
+  private etcd: EtcdClient | undefined = undefined
+
+  constructor(readonly cfg: DiscoveryConfig, readonly nodeId: string, readonly env: (name: string) => string | undefined) {}
+
+  // One round: registers this node where the mechanism needs it, then lists the others.
+  async tick(): Promise<DiscoverOutcome> {
+    try {
+      const hits = try await this.find()
+      return { ok: true, peers: this.urls(hits), error: "" }
+    } catch (e) {
+      return { ok: false, peers: [], error: e.message }
+    }
+  }
+
+  private async find(): Promise<Hit[]> throws Error {
+    const d = this.cfg
+    const port: int = d.bind_port ?? DEFAULT_PORT
+    const ms = timeoutMs(d.dial_timeout)
+    const t = d.type
+    if (t === "kubernetes") return try await k8sPeers(d, port, ms)
+    if (t === "dns") return try await dnsPeers(d, port, this.env)
+    if (t === "consul") return try await consulPeers(d, this.nodeId, port, ms)
+    if (t === "etcd") {
+      let c = this.etcd
+      if (c === undefined) {
+        c = new EtcdClient(d.etcd_endpoints ?? [], d.service_name ?? "")
+        this.etcd = c
+      }
+      if ((d.service_name ?? "") === "") throw new Error("etcd discovery needs service_name")
+      return try await c.round(this.nodeId, d.advertise_address ?? "", port, ms)
+    }
+    if (t === "udp") throw new Error(UDP_MSG)
+    if (t === "mdns") throw new Error(MDNS_MSG)
+    throw new Error(`discovery type "${t}" is not one of kubernetes, dns, consul, etcd, udp, mdns`)
+  }
+
+  // Sync URLs of the hits: this node itself (its advertised address and its own port) and addresses
+  // outside allowed_address_space are left out; sorted, no repeats.
+  urls(hits: Hit[]): string[] {
+    const d = this.cfg
+    const scheme = d.scheme ?? "http"
+    const adv = d.advertise_address ?? ""
+    const selfPort: int = d.bind_port ?? DEFAULT_PORT
+    const allowed = d.allowed_address_space ?? []
+    const out: string[] = []
+    for (const h of hits) {
+      if (h.host === adv && h.port === selfPort) continue
+      if (!allowedHost(h.host, allowed)) continue
+      const u = syncUrl(scheme, h.host, h.port)
+      if (!out.includes(u)) out.push(u)
+    }
+    out.sort()
+    return out
+  }
+}
+
+test("percent-encodes a label selector", () => {
+  expect(pctEncode("app=bifrost")).toBe("app%3Dbifrost")
+  expect(pctEncode("a.b-c_d~e")).toBe("a.b-c_d~e")
+  expect(pctEncode("env in (prod,dev)")).toBe("env%20in%20%28prod%2Cdev%29")
+})
+
+test("builds sync URLs, with brackets for IPv6", () => {
+  expect(syncUrl("http", "10.0.0.2", 8080)).toBe("http://10.0.0.2:8080")
+  expect(syncUrl("https", "fd00::5", 443)).toBe("https://[fd00::5]:443")
+})
+
+test("checks IPv4 addresses against CIDR ranges", () => {
+  expect(ipv4Value("10.0.0.1")).toBe(167772161.0)
+  expect(ipv4Value("10.0.0")).toBe(undefined)
+  expect(ipv4Value("10.0.0.256")).toBe(undefined)
+  expect(allowedHost("10.1.2.3", [])).toBe(true)
+  expect(allowedHost("10.1.2.3", ["10.0.0.0/8"])).toBe(true)
+  expect(allowedHost("11.1.2.3", ["10.0.0.0/8"])).toBe(false)
+  expect(allowedHost("192.168.1.77", ["192.168.1.0/24", "10.0.0.0/8"])).toBe(true)
+  expect(allowedHost("192.168.2.77", ["192.168.1.0/24"])).toBe(false)
+  expect(allowedHost("192.168.1.77", ["192.168.1.77"])).toBe(true)
+  expect(allowedHost("node-a.internal", ["10.0.0.0/8"])).toBe(false)
+})
+
+test("reads Go durations for dial timeouts", () => {
+  expect(timeoutMs(undefined)).toBe(10000)
+  expect(timeoutMs("5s")).toBe(5000)
+  expect(timeoutMs("2m")).toBe(120000)
+  expect(timeoutMs("500ms")).toBe(500)
+  expect(timeoutMs("soon")).toBe(10000)
+})
+
+test("reads env. names for DNS entries", () => {
+  const env = (n: string): string | undefined => (n === "NODES" ? "nodes.internal" : undefined)
+  expect(envName("env.NODES", env)).toBe("nodes.internal")
+  expect(envName("env.MISSING", env)).toBe("")
+  expect(envName("plain.example", env)).toBe("plain.example")
+})
+
+test("parses Kubernetes pods and endpoints", () => {
+  const pods = `{"items":[
+    {"metadata":{"name":"a"},"status":{"phase":"Running","podIP":"10.0.0.4"}},
+    {"metadata":{"name":"b"},"status":{"phase":"Pending","podIP":""}},
+    {"metadata":{"name":"c"},"status":{"phase":"Running","podIP":"10.0.0.5"}}]}`
+  const ph = try podHits(pods, 8080)
+  expect(ph.length).toBe(2)
+  expect(ph[0]!.host).toBe("10.0.0.4")
+  expect(ph[1]!.port).toBe(8080)
+  const eps = `{"subsets":[{"addresses":[{"ip":"10.1.0.2"},{"ip":"10.1.0.3"}]},{}]}`
+  expect((try endpointHits(eps, 9000)).length).toBe(2)
+  expect((try endpointHits("{}", 9000)).length).toBe(0)
+})
+
+test("parses Consul health entries and drops this node", () => {
+  const body = `[
+    {"Service":{"ID":"raiju-n1","Address":"10.0.0.1","Port":8080},"Node":{"Address":"10.0.0.1"}},
+    {"Service":{"ID":"raiju-n2","Address":"","Port":9090},"Node":{"Address":"10.0.0.2"}},
+    {"Service":{"ID":"raiju-n3","Address":"","Port":0},"Node":{"Address":"10.0.0.3"}}]`
+  const hs = try consulHits(body, "raiju-n1", 8080)
+  expect(hs.length).toBe(2)
+  expect(hs[0]!.host).toBe("10.0.0.2")
+  expect(hs[0]!.port).toBe(9090)
+  expect(hs[1]!.host).toBe("10.0.0.3")
+  expect(hs[1]!.port).toBe(8080)
+})
+
+test("parses etcd range responses (base64 keys and values)", () => {
+  const k1 = encode(utf8("/raiju/svc/n1"))
+  const v1 = encode(utf8(`{"addr":"10.0.0.1","port":8080}`))
+  const k2 = encode(utf8("/raiju/svc/n2"))
+  const v2 = encode(utf8(`{"addr":"10.0.0.2","port":8081}`))
+  const body = `{"kvs":[{"key":"${k1}","value":"${v1}"},{"key":"${k2}","value":"${v2}"}],"count":"2"}`
+  const hs = try etcdHits(body, "n1", etcdPrefix("svc"))
+  expect(hs.length).toBe(1)
+  expect(hs[0]!.host).toBe("10.0.0.2")
+  expect(hs[0]!.port).toBe(8081)
+  expect((try etcdHits(`{"count":"0"}`, "n1", "/raiju/svc/")).length).toBe(0)
+  expect(etcdRangeEnd("/raiju/svc/")).toBe("/raiju/svc0")
+})
+
+test("sync URLs skip this node, outside ranges and repeats, and are sorted", () => {
+  const d: DiscoveryConfig = { type: "dns", advertise_address: "10.0.0.1", allowed_address_space: ["10.0.0.0/8"] }
+  const r = new Discoverer(d, "n1", (n: string) => undefined)
+  const urls = r.urls([
+    { host: "10.0.0.3", port: 8080 },
+    { host: "10.0.0.1", port: 8080 },
+    { host: "192.0.2.9", port: 8080 },
+    { host: "10.0.0.2", port: 8080 },
+    { host: "10.0.0.3", port: 8080 },
+    { host: "10.0.0.1", port: 9090 },
+  ])
+  // this node is skipped by address and port; another port on its address is a different node
+  expect(urls.length).toBe(3)
+  expect(urls[0]).toBe("http://10.0.0.1:9090")
+  expect(urls[1]).toBe("http://10.0.0.2:8080")
+  expect(urls[2]).toBe("http://10.0.0.3:8080")
+})

@@ -1,14 +1,14 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv } from "./config"
 import { parseDatasheet } from "./pricing"
 import { OtelConfig, TlsOpts, otelTls } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { Engine } from "./gateway"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { ConfigStore, checkAdmin } from "./store"
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, allowed } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, allowed, provisioned } from "./rbac"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
@@ -27,6 +27,8 @@ import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs"
 import { Counters, ClusterConfig, syncInterval } from "./cluster"
 import * as cluster from "./cluster"
+import { Discoverer } from "./discovery"
+import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
 import { ExportCursor, objectKey, putRequest, exportInterval, isoMs } from "./exports"
 import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 
@@ -159,6 +161,9 @@ function trimPeer(p: string): string {
   return p.endsWith("/") ? p.slice(0, p.byteLength - 1) : p
 }
 
+// How often discovery runs, in ms: it registers this node where the mechanism needs it, then lists the others.
+const DISCOVER_MS = 10000
+
 export class Ops {
   rbac: RbacConfig = { users: [] }
   authOn = false
@@ -173,6 +178,16 @@ export class Ops {
   counters: Counters | undefined = undefined
   clusterCfg: ClusterConfig | undefined = undefined
   clusterTimer: int = -1
+  // discovered peers (sync URLs), kept from the last good round
+  discoverer: Discoverer | undefined = undefined
+  discovered: string[] = []
+  discoverTimer: int = -1
+  discoverErr = ""
+  // identity-aware proxy: its settings and key cache, and the SSO settings its full mode maps roles with
+  proxyCfg: AuthProxyConfig | undefined = undefined
+  proxyKeys: ProxyKeys | undefined = undefined
+  proxyKey = ""
+  proxyRoles: OidcConfig | undefined = undefined
   pushed: Map<string, f64> = new Map()
   pushedWindow: Map<string, string> = new Map()
   exportCfg: LogExportsConfig | undefined = undefined
@@ -230,6 +245,7 @@ export class Ops {
     this.configureOtelMetrics(cfg.otel)
     this.configureAlerts(cfg.alerts)
     this.configureCluster(cfg.cluster)
+    this.configureProxy(cfg.auth_proxy, cfg.oidc)
     this.configureExports(cfg.log_exports)
     this.configureExporters(cfg.exporters ?? [])
     const oc = cfg.oidc
@@ -248,6 +264,12 @@ export class Ops {
       clearInterval(this.clusterTimer)
       this.clusterTimer = -1
     }
+    if (this.discoverTimer >= 0) {
+      clearInterval(this.discoverTimer)
+      this.discoverTimer = -1
+    }
+    this.discoverer = undefined
+    this.discovered = []
     if (cc === undefined || !cc.enabled) {
       this.clusterCfg = undefined
       return
@@ -259,6 +281,54 @@ export class Ops {
     this.clusterTimer = setInterval(() => {
       this.syncCluster()
     }, Math.max(100, syncInterval(cc)))
+    const dc = cc.discovery
+    if (dc !== undefined && dc.enabled === true) {
+      this.discoverer = new Discoverer(dc, this.nodeId, getEnv)
+      this.discoverTimer = setInterval(() => {
+        this.discover()
+      }, DISCOVER_MS)
+      this.discover()
+    }
+  }
+
+  // One discovery round. The peers it finds are synced with from then on; on failure the last good list stays.
+  async discover(): Promise<void> {
+    const d = this.discoverer
+    if (d === undefined) return
+    const r = await d.tick()
+    if (!r.ok) {
+      if (r.error !== this.discoverErr) console.error(`raiju: cluster discovery: ${r.error}`)
+      this.discoverErr = r.error
+      return
+    }
+    if (this.discoverErr !== "") console.error("raiju: cluster discovery: found peers again")
+    this.discoverErr = ""
+    this.discovered = r.peers
+  }
+
+  // The configured peers and the discovered ones, each once.
+  peerUrls(cc: ClusterConfig): string[] {
+    const out: string[] = []
+    for (const p of cc.peers) {
+      const u = trimPeer(p)
+      if (!out.includes(u)) out.push(u)
+    }
+    for (const u of this.discovered) {
+      if (!out.includes(u)) out.push(u)
+    }
+    return out
+  }
+
+  // Whether this node leads the cluster: the lowest live node id (Bifrost's rule). Without clustering it always does.
+  // Worker processes of one node share the node's answer, so the leader's workers all run leader-only tasks.
+  isLeader(): bool {
+    const c = this.counters
+    const cc = this.clusterCfg
+    if (c === undefined || cc === undefined) return true
+    const me = cluster.nodeOf(this.nodeId)
+    const ids: string[] = [me]
+    for (const p of c.peers(Date.now() - cluster.LEADER_WINDOW_MS)) ids.push(cluster.nodeOf(p.id))
+    return cluster.electLeader(ids) === me
   }
 
   // GET /metrics: with several workers, every worker's series summed.
@@ -386,7 +456,7 @@ export class Ops {
     const h: Map<string, string> = new Map()
     h.set("content-type", "application/json")
     h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
-    for (const p of cc.peers) this.pushTo(trimPeer(p) + "/api/cluster/sync", h, body, c, cc.secret)
+    for (const p of this.peerUrls(cc)) this.pushTo(p + "/api/cluster/sync", h, body, c, cc.secret)
     c.forget(Date.now() - 30.0 * syncInterval(cc))
   }
 
@@ -473,7 +543,7 @@ export class Ops {
     const every = Math.max(3600, ps.interval_seconds ?? 86400)
     this.syncPricing(url)
     this.pricingTimer = setInterval(() => {
-      this.syncPricing(url)
+      if (this.isLeader()) this.syncPricing(url)
     }, every * 1000)
   }
 
@@ -699,7 +769,7 @@ export class Ops {
     }
     this.exportCfg = ec
     this.exportTimer = setInterval(() => {
-      this.exportLogs()
+      if (this.isLeader()) this.exportLogs()
     }, Math.max(1, exportInterval(ec)) * 1000)
   }
 
@@ -817,7 +887,7 @@ export class Ops {
     if (this.engine.samples === undefined) this.engine.samples = new SampleRing(50000)
     const secs = Math.max(1, al.interval_seconds ?? 30)
     this.alertTimer = setInterval(() => {
-      this.tick(eng)
+      if (this.isLeader()) this.tick(eng)
     }, secs * 1000)
   }
 
@@ -852,6 +922,8 @@ export class Ops {
 
   // Whether the caller may use this /api route; the actor names them in the audit log.
   gate(req: Request, path: string): Gate {
+    const pg = this.proxyGate(req, path)
+    if (pg !== undefined) return pg
     const auth = req.headers.get("authorization") ?? ""
     if (auth.startsWith("Bearer sk-sess-")) {
       const s = this.sessions.get(auth.slice(7), Date.now())
@@ -869,6 +941,78 @@ export class Ops {
     if (v.kind === "ok") return { kind: "ok", actor: v.actor }
     this.recordChange("unauthenticated", req, path, v.status, "")
     return { kind: "deny", res: denied(v.status, v.message) }
+  }
+
+  // ---- identity-aware proxy (AWS ALB, Cloudflare Access, a generic JWT proxy) ----
+
+  configureProxy(ap: AuthProxyConfig | undefined, oc: OidcConfig | undefined): void {
+    this.proxyRoles = oc
+    const key = ap !== undefined && ap.enabled ? JSON.stringify(ap) : ""
+    if (key === this.proxyKey) return
+    this.proxyKey = key
+    this.proxyCfg = undefined
+    this.proxyKeys = undefined
+    if (ap === undefined || !ap.enabled) return
+    const problem = proxyProblem(ap)
+    if (problem !== "") {
+      console.error(`raiju: auth proxy: ${problem}; the proxy is off`)
+      return
+    }
+    const ks = new ProxyKeys(ap)
+    this.proxyCfg = ap
+    this.proxyKeys = ks
+    ks.warm(Date.now())
+  }
+
+  // The identity the proxy names for a request, as a gate. Undefined when the proxy header is absent,
+  // so the usual sign-in applies (as Bifrost does without its proxy header).
+  proxyGate(req: Request, path: string): Gate | undefined {
+    const pc = this.proxyCfg
+    const keys = this.proxyKeys
+    if (pc === undefined || keys === undefined) return undefined
+    const token = req.headers.get(headerOf(pc)) ?? ""
+    if (token === "") return undefined
+    const now = Date.now()
+    const c = checkProxyToken(pc, keys, token, now)
+    if (c.kind === "unknown") {
+      keys.want(c.kid, now)
+      return { kind: "deny", res: denied(401, "the proxy's signing key is not loaded yet; retry") }
+    }
+    if (c.kind === "error") {
+      this.recordChange("unauthenticated", req, path, 401, "")
+      return { kind: "deny", res: denied(401, c.message) }
+    }
+    let role: Role | undefined = undefined
+    if ((pc.mode ?? "login_only") === "full") {
+      // the SSO login's role mapping: role_claim, role_map and default_role of the provider
+      const oc = this.proxyRoles
+      let mapped: string | undefined = undefined
+      try {
+        mapped = try mappedRole(c.claims, oc?.role_claim, oc?.role_map, oc?.default_role)
+      } catch (e) {
+        mapped = undefined
+      }
+      if (mapped === undefined) {
+        this.recordChange("proxy:" + c.identity, req, path, 403, "")
+        return { kind: "deny", res: denied(403, "no role maps from the proxy token") }
+      }
+      role = roleOf(mapped)
+    } else {
+      // login only: the identity must already be an enabled user, and its role governs
+      const u = provisioned(this.rbac, c.identity)
+      if (u === undefined) {
+        this.recordChange("proxy:" + c.identity, req, path, 403, "")
+        return { kind: "deny", res: denied(403, `${c.identity} is not provisioned`) }
+      }
+      role = u.role
+    }
+    if (role === undefined) return { kind: "deny", res: denied(403, "the mapped role is not known") }
+    const perm = required(req.method, path)
+    if (!allowed(role, perm, path)) {
+      this.recordChange("proxy:" + c.identity, req, path, 403, "")
+      return { kind: "deny", res: denied(403, `role ${role} may not ${perm} this route`) }
+    }
+    return { kind: "ok", actor: "proxy:" + c.identity }
   }
 
   // The gate for read-only routes: undefined when allowed.
