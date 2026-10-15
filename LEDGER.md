@@ -225,11 +225,12 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L93 | G43 | Full Gitleaks rule set (from upstream gitleaks.toml, not memory) | worker | todo |
+| L93 | G43 | Full Gitleaks rule set (from upstream gitleaks.toml, not memory) | worker | done: gitleaks v8.30.1, 220 rules (pkcs12-file is path-only; generic-api-key held back until L101), keyword prefilter (20 KB check 41 ms → 3 ms); unit + e2e |
 | L94 | G44 | Broker-mode clustering (relay process) and lock-based leader election | worker | todo (after L92: shares discovery code) |
 | L95 | G4, cache | Owner switches, defaults unchanged: refuse unpriced models; exact-match cache scoped per virtual key | worker | todo |
 | L96 | G32, G33, all | Re-audit docs/parity.md (rows counted by script) and bring SCOPE.md and README in sync | worker | todo (after waves 12-13 merge) |
 | L100 | G37 | Compat remainder: stream conversions (text-to-chat, chat-to-responses), decision emulation (needs L81), azure_deepseek, reasoning budget scaling and min_output_tokens, summary fitting for Responses | worker | todo |
+| L101 | G43 | Secrets engine: capture groups for secretGroup, the entropy filter and gitleaks allowlists and stopwords; then enable generic-api-key | worker | todo |
 | L97 | from L96 | Whatever the re-audit still lists as missing or partial and buildable | workers | todo |
 
 ## UI track

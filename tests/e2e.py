@@ -11,6 +11,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 GW = "http://127.0.0.1:18098"
 MOCK = "http://127.0.0.1:18099"
+# fixtures that look like credentials are assembled, so the source holds none
+AWS_KEY = "AKIA" + "Z7Q3XW2MKLR5BNTE"
 GW_B = "http://127.0.0.1:18097"
 GW_D = "http://127.0.0.1:18092"
 GW_G = "http://127.0.0.1:18116"  # exports OTLP over gRPC to tests/otlp_grpc_collector.py
@@ -1860,9 +1862,13 @@ def main():
         s, _, b = rchat("open ticket-77 for me")
         up = seen()[-1]["body"]
         check("a regex guardrail redacts its match before the model call", s == 200 and "[REDACTED:TICKET]" in up and "ticket-77" not in up, (s, up[:200]))
-        s, _, b = rchat("my key is AKIAZ7Q3XW2MKLR5BNTE")
+        s, _, b = rchat("my key is " + AWS_KEY)
         up = seen()[-1]["body"]
-        check("secrets detection redacts an AWS key before the model call", s == 200 and "AKIAZ7Q3XW2MKLR5BNTE" not in up and "[REDACTED:" in up, (s, up[:200]))
+        check("secrets detection redacts an AWS key before the model call", s == 200 and AWS_KEY not in up and "[REDACTED:" in up, (s, up[:200]))
+        # a rule from the full Gitleaks set (not in the old 33-rule subset), with a keyword prefilter
+        s, _, b = rchat("linear " + "lin_api_" + "abcdefghij" * 3 + "0123456789" + " done")
+        up = seen()[-1]["body"]
+        check("secrets detection covers the full Gitleaks rule set", s == 200 and "[REDACTED:LINEAR-API-KEY]" in up and "lin_api_" not in up, (s, up[:200]))
         s, _, b = rchat("write to a@b.co", model="openai/echo-model")
         up = seen()[-1]["body"]
         check("reversible redaction sends a placeholder upstream", s == 200 and "[EMAIL-1]" in up and "a@b.co" not in up, (s, up[:200]))
