@@ -1112,11 +1112,12 @@ def projects_e2e(env):
         entries = json.loads(b).get("entries", []) if s == 200 else []
         keys = sorted(set(e.get("virtual_key", "") for e in entries))
         check("a team-scoped user sees only its team's request logs", s == 200 and keys == ["vk-core"], (s, keys))
-        # the live UI socket carries the same scope: ann's feed has her team's requests, not another team's
+        # the live UI socket carries the same scope: another team's request reaches the admin's feed, not ann's
+        # (t-core's business-unit budget is spent by now, so ann's own team has no successful request to show)
         ws_ann = WsClient("/ws", {"authorization": "Bearer " + A}, port=18122)
         ws_root = WsClient("/ws", {"authorization": "Bearer sk-admin-pr-root"}, port=18122)
         time.sleep(0.3)
-        inf({"x-bf-vk": "sk-bf-other"}, 3101); inf({"x-bf-vk": "sk-bf-core"}, 3102)
+        inf({"x-bf-vk": "sk-bf-other"}, 3101)
         def feed(ws, want):
             got = set()
             for _ in range(40):
@@ -1126,13 +1127,13 @@ def projects_e2e(env):
                 ev = json.loads(m)
                 if ev.get("type") == "log":
                     got.add(ev["data"].get("virtual_key", ""))
-                if want <= got:
+                if want and want <= got:
                     break
             return got
-        root_keys = feed(ws_root, {"vk-core", "vk-other"})
-        ann_keys = feed(ws_ann, {"vk-core"})
-        check("the /ws log feed follows the data scope: a team-scoped user gets only its team's requests",
-              ws_ann.status == 101 and ann_keys == {"vk-core"} and {"vk-core", "vk-other"} <= root_keys, (ws_ann.status, ann_keys, root_keys))
+        root_keys = feed(ws_root, {"vk-other"})
+        ann_keys = feed(ws_ann, set())
+        check("the /ws log feed follows the data scope: another team's request reaches the admin, not a team-scoped user",
+              ws_ann.status == 101 and "vk-other" in root_keys and "vk-other" not in ann_keys, (ws_ann.status, ann_keys, root_keys))
         s, _, b = adm("GET", "/api/logs")
         allkeys = sorted(set(e.get("virtual_key", "") for e in json.loads(b).get("entries", [])))
         check("the admin sees the logs of every team", "vk-other" in allkeys and "vk-core" in allkeys, allkeys)
