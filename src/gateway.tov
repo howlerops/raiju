@@ -17,11 +17,12 @@ import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
 import { GuardrailProvider, appliesTo, checkRequest, parseVerdict, extractText, completionText } from "./guardrail_providers"
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
-import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId } from "./router"
+import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias } from "./router"
 import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
 import { Governance, Grant, Denial, directKeyFrom } from "./governance"
 import { Pricing, PriceRow } from "./pricing"
 import { ResponseCache, cacheKey, parseTtl } from "./cache"
+import { sha256, toHex, utf8 } from "./crypto"
 import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
@@ -34,7 +35,7 @@ import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName } from "./mcp"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns } from "./mcp"
 import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, buildChain } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
@@ -45,7 +46,7 @@ import * as cloudAuth from "./cloud_auth"
 export type Build = (t: Target) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, retryMs?: f64 }
 
 // Where a streamed answer goes, when the server can stream (the http1 front end).
 export class StreamSink {
@@ -314,8 +315,9 @@ function requestType(op: string, streamed: bool): string {
 }
 
 // The routed identity, as Bifrost reports it (lib/responseheaders.go): who answered, what was
-// asked for, and whether it took a fallback.
-function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, model: string, idx: int, requested: string, upstreamMs: f64): void {
+// asked for, and whether it took a fallback. key is the key's name, alias the upstream name
+// the key's aliases mapped the request to ("" when none did).
+function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, model: string, idx: int, requested: string, upstreamMs: f64, key: string, alias: string): void {
   out.set("x-bifrost-provider", provider)
   out.set("x-bifrost-original-model", requested)
   out.set("x-bifrost-resolved-model", model)
@@ -323,6 +325,8 @@ function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, mod
   out.set("x-bifrost-upstream-latency-ms", "" + Math.round(upstreamMs))
   out.set("x-bifrost-routing-info-provider", provider)
   out.set("x-bifrost-routing-info-model", model)
+  if (key !== "") out.set("x-bifrost-routing-info-key", key)
+  if (alias !== "") out.set("x-bifrost-routing-info-alias-model-id", alias)
   out.set("x-bifrost-routing-info-is-fallback", idx > 0 ? "true" : "false")
   out.set("x-bifrost-routing-info-primary-provider", primary.provider)
   out.set("x-bifrost-routing-info-primary-model", primary.model)
@@ -331,14 +335,69 @@ function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, mod
   out.set("x-bifrost-routing-info-requested-model", slash > 0 ? requested.slice(slash + 1) : requested)
 }
 
-function cacheHeaders(inout out: Hdrs, kind: string, primary: ModelRef, similarity: f64 | undefined, threshold: f64 | undefined): void {
+// The upstream name a key's aliases map the request model to, or "" when they do not change it.
+function aliasTo(k: KeyConfig, model: string): string {
+  const to = resolveAlias(k, model).model
+  return to !== model ? to : ""
+}
+
+// The index of (provider, model) in the allowed chain: 0 for the primary, or when it is not there.
+function fallbackIndex(allowed: ModelRef[], provider: string, model: string): int {
+  for (let i = 0; i < allowed.length; i++) {
+    if (allowed[i]!.provider === provider && allowed[i]!.model === model) return i
+  }
+  return 0
+}
+
+// The cache id Bifrost reports for a direct entry: a hash of its cache key.
+function cacheId(key: string): string {
+  return toHex(sha256(utf8(key)))
+}
+
+// x-bifrost-cache-* for a lookup that ran. id is "" when the entry has none; latencyMs is the
+// time spent serving a hit (a miss has none).
+function cacheHeaders(inout out: Hdrs, kind: string, primary: ModelRef, similarity: f64 | undefined, threshold: f64 | undefined, id: string, latencyMs: f64 | undefined): void {
   out.set("x-bifrost-cache-hit", "true")
   out.set("x-bifrost-cache-hit-type", kind)
+  if (id !== "") out.set("x-bifrost-cache-id", id)
+  if (latencyMs !== undefined) out.set("x-bifrost-cache-hit-latency-ms", "" + Math.round(latencyMs))
   out.set("x-bifrost-cache-requested-provider", primary.provider)
   out.set("x-bifrost-cache-requested-model", primary.model)
   if (similarity !== undefined) out.set("x-bifrost-cache-similarity", similarity.toFixed(4))
   if (threshold !== undefined) out.set("x-bifrost-cache-threshold", "" + threshold)
 }
+
+// The retry hint of a failed upstream call, in milliseconds, as Bifrost reads it
+// (core/providers/utils/retryafter.go): retry-after-ms, else Retry-After in seconds or as an
+// seconds (an HTTP date is not read: Tov has no Date parsing). Clamped to 1s..5m. undefined when
+// the response gives no usable hint.
+export function retryHintMs(ms: string | undefined, after: string | undefined): f64 | undefined {
+  const a = (ms ?? "").trim()
+  if (a !== "") {
+    const v = parseFloat(a)
+    if (v !== undefined && v >= 0.0) return clampRetryMs(v)
+  }
+  const b = (after ?? "").trim()
+  if (b === "") return undefined
+  const s = parseFloat(b)
+  if (s !== undefined && s >= 0.0) return clampRetryMs(s * 1000.0)
+  return undefined
+}
+
+function clampRetryMs(ms: f64): f64 {
+  return Math.min(Math.max(Math.floor(ms), 1000), 300000)
+}
+
+test("retry hint: retry-after-ms first, then Retry-After seconds, clamped to 1s..5m", () => {
+  expect(retryHintMs("1500", "30")).toBe(1500)
+  expect(retryHintMs("abc", "2")).toBe(2000)
+  expect(retryHintMs(undefined, "0")).toBe(1000)
+  expect(retryHintMs(undefined, "3600")).toBe(300000)
+  expect(retryHintMs("5", undefined)).toBe(1000)
+  expect(retryHintMs(undefined, undefined)).toBe(undefined)
+  expect(retryHintMs(undefined, "")).toBe(undefined)
+  expect(retryHintMs(undefined, "Thu, 01 Jan 1970 00:00:10 GMT")).toBe(undefined)
+})
 
 // The error's type field, for x-bifrost-error-type.
 function errorType(body: string): string {
@@ -669,7 +728,7 @@ export class Engine {
     }
     const cx = cfg.complexity_router
     if (cx !== undefined && cx.enabled !== false) this.complexity = cx
-    const auto = cfg.client?.mcp_auto_execute ?? []
+    const auto = (cfg.client?.mcp_auto_execute ?? []).concat(autoExecutePatterns(cfg.mcp?.client_configs ?? []))
     if (auto.length > 0) this.agent = { max_depth: cfg.client?.mcp_agent_depth ?? 10, auto_execute: auto, parallel: true }
   }
 
@@ -843,6 +902,7 @@ export class Engine {
         let status = 0
         let text = ""
         let retryAfter: string | undefined = undefined
+        let hintMs: f64 | undefined = undefined
         let live: Deadline | undefined = undefined
         try {
           const hs: Record<string, string> = up.headers
@@ -861,7 +921,7 @@ export class Engine {
             ctx.outHeaders.set("content-type", conv.framed() ? "application/vnd.amazon.eventstream" : "text/event-stream")
             ctx.outHeaders.set("cache-control", "no-cache")
             ctx.outHeaders.set("x-bf-attempts", "" + attempts)
-            routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs)
+            routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs, t.key.name ?? t.key.id ?? "", aliasTo(t.key, ref.model))
             sink.started = true
             sink.open(200, ctx.outHeaders)
             const reader = stream.getReader()
@@ -924,6 +984,7 @@ export class Engine {
           }
           dl.finish()
           retryAfter = res.headers.get("retry-after") ?? undefined
+          hintMs = retryHintMs(res.headers.get("retry-after-ms") ?? undefined, retryAfter)
         } catch (e) {
           live?.finish()
           status = 0
@@ -953,16 +1014,19 @@ export class Engine {
             const tr = translate(t, text, requested)
             if (sel.keyIndex >= 0) this.stick(h, ref, t)
             // raw echo: not for streamed answers, whose body is not one JSON object
-            const echoReq = !streamed && up.body !== "" && sendBackRaw(h, this.cfg, p, "request")
-            const echoResp = !streamed && sendBackRaw(h, this.cfg, p, "response")
+            // extra_fields_placement "headers" keeps the body as the provider's (no extra_fields)
+            const inBody = this.cfg.client?.extra_fields_placement !== "headers"
+            const echoReq = inBody && !streamed && up.body !== "" && sendBackRaw(h, this.cfg, p, "request")
+            const echoResp = inBody && !streamed && sendBackRaw(h, this.cfg, p, "response")
             const rawBody = echoReq || echoResp ? withRawFields(tr.body, echoReq ? up.body : undefined, echoResp ? text : undefined) : tr.body
-            return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp }
+            return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model) }
           } catch (e) {
             last = { ok: false, status: 502, body: errorJson(`could not read ${ref.provider}'s response: ${e.message}`, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
             break
           }
         }
         last = { ok: false, status: status === 0 ? 502 : status, body: text.startsWith("{") ? text : errorJson(text === "" ? `${ref.provider} returned HTTP ${status}` : text, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+        last.retryMs = hintMs
         const d = status === 0 ? "retry" : try classify(status)
         if (d === "fail") return last
         if (d === "fallback") break
@@ -1046,13 +1110,9 @@ export class Engine {
   withMcpTools(text: string, h: Hdrs): string throws SyntaxError {
     const m = this.mcp
     if (m === undefined) return text
-    let tools = m.allTools()
-    // a key's access profile may limit the MCP tools it gets
-    const allowedTools = this.gov.policyFor(h)?.mcpTools
-    if (allowedTools !== undefined) {
-      const list: string[] = allowedTools
-      tools = tools.filter((t) => list.some((n) => toolNameMatches(t, n)))
-    }
+    // a key's access profile may limit the MCP tools it gets; clients it doesn't name
+    // count only with allow_by_default
+    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools)
     const only = h.get("x-bf-mcp-include-clients")
     if (only !== undefined) {
       if (only.trim() === "none") return text
@@ -1378,7 +1438,7 @@ export class Engine {
       if (hit !== undefined) {
         metrics.observeCacheHit(ctx.labels, "direct")
         out.set("x-bf-cache", "hit")
-        cacheHeaders(&out, "direct", primary, undefined, undefined)
+        cacheHeaders(&out, "direct", primary, undefined, undefined, cacheId(key), performance.now() - started)
         out.set("content-type", hit.contentType)
         ctx.cached = true
         ctx.output = hit.body
@@ -1405,7 +1465,7 @@ export class Engine {
             metrics.observeCacheHit(ctx.labels, "semantic")
             out.set("x-bf-cache", "semantic-hit")
             out.set("x-bf-cache-similarity", hit.score.toFixed(4))
-            cacheHeaders(&out, "semantic", primary, hit.score, th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold))
+            cacheHeaders(&out, "semantic", primary, hit.score, th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold), "", performance.now() - started)
             out.set("content-type", hit.contentType)
             ctx.cached = true
             return respond(200, hit.body, out)
@@ -1427,6 +1487,8 @@ export class Engine {
       out.set("content-type", "application/json")
       const et = errorType(r.body)
       if (et !== "") out.set("x-bifrost-error-type", et)
+      if (r.retryMs !== undefined) out.set("x-bifrost-retry-after-ms", "" + Math.round(r.retryMs))
+      if (r.provider !== "") routedHeaders(&out, primary, r.provider, r.model, fallbackIndex(allowed, r.provider, r.model), model, r.upstreamMs, r.key ?? "", r.alias ?? "")
       return respond(r.status, r.body, out)
     }
     const cost = this.pricing.cost(r.provider, r.model, r.promptTokens, r.completionTokens)
@@ -1461,14 +1523,14 @@ export class Engine {
       cache.set(key, r.body, r.contentType, ttl)
     }
     if (r.provider !== primary.provider || r.model !== primary.model) out.set("x-bf-fallback-used", r.provider + "/" + r.model)
-    let idx = 0
-    for (let i = 0; i < allowed.length; i++) {
-      if (allowed[i]!.provider === r.provider && allowed[i]!.model === r.model) {
-        idx = i
-        break
-      }
+    const idx = fallbackIndex(allowed, r.provider, r.model)
+    routedHeaders(&out, primary, r.provider, r.model, idx, model, r.upstreamMs, r.key ?? "", r.alias ?? "")
+    // a semantic lookup that missed still says which upstream answered and what it counted
+    if (sem !== undefined && semVec.length > 0) {
+      out.set("x-bifrost-cache-provider-used", r.provider)
+      out.set("x-bifrost-cache-model-used", r.model)
+      out.set("x-bifrost-cache-input-tokens", "" + r.promptTokens)
     }
-    routedHeaders(&out, primary, r.provider, r.model, idx, model, r.upstreamMs)
     out.set("x-bifrost-latency-ms", "" + Math.round(performance.now() - started))
     out.set("content-type", r.contentType)
     if (r.contentType === "text/event-stream") out.set("cache-control", "no-cache")

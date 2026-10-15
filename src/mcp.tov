@@ -189,12 +189,58 @@ function toolAllowed(name: string, cfg: McpClientConfig): bool {
   return !(cfg.tools_to_skip ?? []).includes(name)
 }
 
+// One OpenAI tool definition.
+function toolJson(name: string, t: McpTool): string {
+  return `{"type":"function","function":{"name":${quote(name)},"description":${quote(t.description)},"parameters":${t.inputSchemaRaw}}}`
+}
+
 // OpenAI tool definitions for the tools this server exposes.
 export function toolsForChat(server: string, tools: McpTool[], cfg: McpClientConfig): string[] {
   const out: string[] = []
   for (const t of tools) {
     if (!toolAllowed(t.name, cfg)) continue
-    out.push(`{"type":"function","function":{"name":${quote(chatName(server, t.name))},"description":${quote(t.description)},"parameters":${t.inputSchemaRaw}}}`)
+    out.push(toolJson(chatName(server, t.name), t))
+  }
+  return out
+}
+
+// Whether a chat tool name matches one pattern of an access profile: "*", "<server>-*" or "<server>-<tool>".
+export function patternMatches(name: string, pattern: string): bool {
+  if (pattern === "*") return true
+  if (pattern.endsWith("*")) return name.startsWith(pattern.slice(0, pattern.byteLength - 1))
+  return name === pattern
+}
+
+// Whether an access profile's tool patterns name a client at all: "*" names every client.
+export function namesClient(policy: string[], server: string): bool {
+  return policy.some((p) => p === "*" || p.startsWith(server + "-"))
+}
+
+// Seconds in a Go duration as tool_sync_interval takes it ("0", "90s", "10m", "1h30m"). 0 when unset.
+export function syncSeconds(s: string | undefined): int {
+  if (s === undefined) return 0
+  let total = 0
+  let digits = ""
+  for (const ch of s.chars()) {
+    if ("0123456789".includes(ch)) {
+      digits += ch
+      continue
+    }
+    const n = parseInt(digits) ?? 0
+    total += ch === "h" ? n * 3600 : ch === "m" ? n * 60 : n
+    digits = ""
+  }
+  return total + (parseInt(digits) ?? 0)
+}
+
+// The auto-execute patterns of every client's tools_to_auto_execute, for the MCP agent: "<server>-<tool>",
+// or "<server>-*" for "*". Clients add to the global client.mcp_auto_execute list.
+export function autoExecutePatterns(clients: McpClientConfig[]): string[] {
+  const out: string[] = []
+  for (const c of clients) {
+    for (const t of c.tools_to_auto_execute ?? []) {
+      out.push(t === "*" ? sanitizeName(c.name) + "-*" : chatName(c.name, t))
+    }
   }
   return out
 }
@@ -596,22 +642,7 @@ export class McpSession {
       // From here on the protocol version is sent with every request.
       this.version = PROTOCOL
       try await this.notify(initializedNotification())
-      const all: McpTool[] = []
-      let cursor: string | undefined = undefined
-      for (let page = 0; page < MAX_TOOL_PAGES; page++) {
-        const id = this.newId()
-        const raw = try await this.rpc(listToolsRequest(id, cursor), id, CONNECT_TIMEOUT_MS)
-        const got = try parseTools(raw)
-        for (const t of got.tools) all.push(t)
-        cursor = got.nextCursor
-        if (cursor === undefined) break
-      }
-      this.tools = all
-      const ex: Map<string, string> = new Map()
-      for (const t of all) {
-        if (toolAllowed(t.name, this.cfg)) ex.set(chatName(this.cfg.name, t.name), t.name)
-      }
-      this.exposed = ex
+      try await this.listAll()
       this.connected = true
     } catch (e) {
       this.connected = false
@@ -619,9 +650,51 @@ export class McpSession {
     }
   }
 
+  // Lists every page of the server's tools and sets the ones this session exposes.
+  private async listAll(): Promise<void> throws Error {
+    const all: McpTool[] = []
+    let cursor: string | undefined = undefined
+    for (let page = 0; page < MAX_TOOL_PAGES; page++) {
+      const id = this.newId()
+      const raw = try await this.rpc(listToolsRequest(id, cursor), id, CONNECT_TIMEOUT_MS)
+      const got = try parseTools(raw)
+      for (const t of got.tools) all.push(t)
+      cursor = got.nextCursor
+      if (cursor === undefined) break
+    }
+    this.tools = all
+    const ex: Map<string, string> = new Map()
+    for (const t of all) {
+      if (toolAllowed(t.name, this.cfg)) ex.set(chatName(this.cfg.name, t.name), t.name)
+    }
+    this.exposed = ex
+  }
+
+  // Lists the tools again (the periodic tool_sync_interval refresh). A failure keeps the tools it had.
+  async relist(): Promise<void> {
+    if (!this.connected) return
+    try {
+      try await this.listAll()
+    } catch (e) {
+      this.lastError = e.message
+    }
+  }
+
   // The chat tool definitions for this server's allowed tools.
   chatTools(): string[] {
     return toolsForChat(this.cfg.name, this.tools, this.cfg)
+  }
+
+  // The chat tool definitions of this server's allowed tools whose chat names keep accepts.
+  chatToolsWhere(keep: (name: string) => bool): string[] {
+    const out: string[] = []
+    for (const t of this.tools) {
+      if (!toolAllowed(t.name, this.cfg)) continue
+      const n = chatName(this.cfg.name, t.name)
+      if (!keep(n)) continue
+      out.push(toolJson(n, t))
+    }
+    return out
   }
 
   // The server's name for a chat tool name, if this session exposes it.
@@ -650,6 +723,8 @@ export class McpSession {
 // All configured MCP servers: connects them, offers their tools to chat and routes tool calls.
 export class McpManager {
   readonly sessions: McpSession[]
+  // the tool_sync_interval timers, one per client that has one
+  syncTimers: int[] = []
 
   constructor(cfg: McpConfig) {
     const secs = cfg.tool_execution_timeout_seconds
@@ -661,12 +736,54 @@ export class McpManager {
   // Connects every HTTP server. A server that fails is recorded in status(), not thrown.
   async connectAll(): Promise<void> {
     await Promise.all(this.sessions.filter((s) => s.cfg.connection_type !== "stdio").map((s) => s.connect()))
+    this.startToolSync()
   }
 
   // Starts and connects the stdio servers. Called once the process serves (in every worker
   // after the fork), so each worker talks to its own server process.
   async connectStdio(): Promise<void> {
     await Promise.all(this.sessions.filter((s) => s.cfg.connection_type === "stdio").map((s) => s.connect()))
+    this.startToolSync()
+  }
+
+  // Re-lists each connected client's tools every tool_sync_interval. Clears the timers it had,
+  // so a changed interval takes effect when this runs again.
+  startToolSync(): void {
+    this.stopToolSync()
+    for (const s of this.sessions) {
+      const secs = syncSeconds(s.cfg.tool_sync_interval)
+      if (secs <= 0) continue
+      this.syncTimers.push(setInterval(() => {
+        syncOnce(s)
+      }, secs * 1000))
+    }
+  }
+
+  // Clears every tool_sync_interval timer.
+  stopToolSync(): void {
+    for (const t of this.syncTimers) clearInterval(t)
+    this.syncTimers = []
+  }
+
+  // The chat tool definitions a key may see. policy is the key's access-profile tool patterns;
+  // undefined means the key has no list, so every connected client's tools are offered. A client
+  // the list names gets only the tools it names. A client it does not name gets its tools only
+  // when its allow_by_default is set (Bifrost: an explicit assignment decides for that caller).
+  allToolsFor(policy: string[] | undefined): string[] {
+    if (policy === undefined) return this.allTools()
+    const list: string[] = policy
+    const out: string[] = []
+    for (const s of this.sessions) {
+      if (!s.connected) continue
+      if (!namesClient(list, s.cfg.name)) {
+        if (s.cfg.allow_by_default === true) {
+          for (const t of s.chatTools()) out.push(t)
+        }
+        continue
+      }
+      for (const t of s.chatToolsWhere((n: string): bool => list.some((p) => patternMatches(n, p)))) out.push(t)
+    }
+    return out
   }
 
   // Chat tool definitions from every connected server.
@@ -706,6 +823,56 @@ export class McpManager {
     return this.sessions.map((s) => ({ name: s.cfg.name, connected: s.connected, tools: s.exposedCount(), error: s.lastError, stdio: s.cfg.connection_type === "stdio" }))
   }
 }
+
+// One periodic tool list for a client; a failure is kept on the session, never thrown.
+async function syncOnce(s: McpSession): Promise<void> {
+  await s.relist()
+}
+
+test("tool_sync_interval seconds and the timers it starts and clears", () => {
+  expect(syncSeconds(undefined)).toBe(0)
+  expect(syncSeconds("0")).toBe(0)
+  expect(syncSeconds("90s")).toBe(90)
+  expect(syncSeconds("10m")).toBe(600)
+  expect(syncSeconds("1h30m")).toBe(5400)
+  const m = new McpManager({ client_configs: [{ name: "fs", connection_type: "http", connection_string: "http://x/mcp", tool_sync_interval: "10m" }, { name: "git", connection_type: "http", connection_string: "http://y/mcp" }] })
+  m.startToolSync()
+  expect(m.syncTimers.length).toBe(1)
+  m.startToolSync()
+  expect(m.syncTimers.length).toBe(1)
+  m.stopToolSync()
+  expect(m.syncTimers.length).toBe(0)
+})
+
+test("allow_by_default and access-profile patterns decide which tools a key sees", () => {
+  const m = new McpManager({ client_configs: [
+    { name: "fs", connection_type: "http", connection_string: "http://x/mcp" },
+    { name: "git", connection_type: "http", connection_string: "http://y/mcp", allow_by_default: true },
+    { name: "web", connection_type: "http", connection_string: "http://z/mcp" },
+  ] })
+  for (const s of m.sessions) {
+    s.connected = true
+    s.tools = [{ name: "read", description: "", inputSchemaRaw: EMPTY_SCHEMA }, { name: "write", description: "", inputSchemaRaw: EMPTY_SCHEMA }]
+  }
+  const names = (list: string[]): string => list.map((t) => { const i = t.indexOf('"name":"'); return t.slice(i + 8).split('"')[0]! }).join(",")
+  expect(m.allToolsFor(undefined).length).toBe(6)
+  expect(names(m.allToolsFor(["fs-read"]))).toBe("fs-read,git-read,git-write")
+  expect(names(m.allToolsFor(["fs-*"]))).toBe("fs-read,fs-write,git-read,git-write")
+  expect(names(m.allToolsFor(["*"]))).toBe("fs-read,fs-write,git-read,git-write,web-read,web-write")
+  expect(names(m.allToolsFor(["web-write"]))).toBe("git-read,git-write,web-write")
+  expect(m.allToolsFor(["nothing-here"]).length).toBe(2)
+  expect(patternMatches("fs-read", "fs-*")).toBe(true)
+  expect(patternMatches("fs-read", "fs-re")).toBe(false)
+})
+
+test("tools_to_auto_execute becomes agent patterns per client", () => {
+  const p = autoExecutePatterns([
+    { name: "fs", connection_type: "http", tools_to_auto_execute: ["read"] },
+    { name: "git", connection_type: "http", tools_to_auto_execute: ["*"] },
+    { name: "web", connection_type: "http" },
+  ])
+  expect(p.join(",")).toBe("fs-read,git-*")
+})
 
 test("request bodies", () => {
   expect(initializeRequest(1)).toBe('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"raiju","version":"0.1.0"}}}')
