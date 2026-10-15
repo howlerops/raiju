@@ -1,15 +1,18 @@
-// Bedrock Mantle: Bedrock's OpenAI-compatible endpoint on bedrock-mantle.<region>.api.aws,
-// which serves gpt-*, Gemma and Grok models. The OpenAI body goes out with only the model
-// rewritten, so the reply is openai.tov's. Anthropic-family models use the native Messages
-// surface on the same host, which this module does not translate.
+// Bedrock Mantle: Bedrock's endpoint on bedrock-mantle.<region>.api.aws. gpt-*, Gemma and Grok
+// models use its OpenAI-compatible surface (the reply is openai.tov's). Anthropic-family models
+// use the native Messages surface on the same host, /anthropic/v1/messages with an
+// anthropic-version header (the reply is anthropic.tov's).
 import { Field, build, fields, quote, setField, without } from "../json"
 import { Target, Upstream, Translated, headers, addExtraHeaders } from "./types"
 import * as openai from "./openai"
+import * as anthropic from "./anthropic"
 import { AwsCreds, signV4 } from "../cloud_auth"
 import { BedrockKeyConfig } from "../config"
+import { ChatRequest } from "../schemas"
 
 const DEFAULT_REGION = "us-east-1"
 const SIGNING_SERVICE = "bedrock-mantle"
+const ANTHROPIC_VERSION = "2023-06-01"
 
 // A region name such as "us-west-2": lower-case letters and digits, hyphens, ending in a digit.
 function isRegion(s: string): bool {
@@ -44,6 +47,17 @@ export function isAnthropicFamily(model: string): bool {
   return m.startsWith("anthropic.") || m.includes("claude")
 }
 
+// The scheme and host for a region: the key's base_url when set (a proxy, or the mock in
+// tests), else the public Mantle host.
+function origin(t: Target, region: string): { sch: string, host: string } {
+  const b = t.cfg.network_config?.base_url
+  if (b !== undefined && b !== "") {
+    const u = URL.parse(b)
+    if (u !== undefined) return { sch: b.startsWith("http://") ? "http://" : "https://", host: u.host }
+  }
+  return { sch: "https://", host: `bedrock-mantle.${region}.api.aws` }
+}
+
 // The OpenAI body with gateway-only fields dropped and the model set to the name
 // Mantle knows (sent verbatim, with no regional prefix).
 function withModel(body: Field[], model: string): string {
@@ -52,24 +66,31 @@ function withModel(body: Field[], model: string): string {
   return build(fs)
 }
 
+// The OpenAI body as an Anthropic Messages body for an Anthropic-family model.
+function messagesText(body: Field[], model: string): string throws SyntaxError {
+  const req = try JSON.parse(build(body)) as ChatRequest
+  return try anthropic.messagesBody(req, body, model, false, false)
+}
+
 // The chat POST at a given time. Bearer auth when the key has a value; otherwise SigV4
 // with the key's access keys, signed for service "bedrock-mantle".
 export function chatRequestAt(t: Target, body: Field[], nowMs: f64): Upstream throws SyntaxError {
   const sel = splitRegion(t.model)
-  if (isAnthropicFamily(sel.model)) {
-    throw new SyntaxError("bedrock_mantle: Anthropic-family models use the native Messages surface, which this provider does not translate")
-  }
+  const anth = isAnthropicFamily(sel.model)
   const bk = t.key.bedrock_key_config
   const region = sel.region ?? bk?.region ?? DEFAULT_REGION
-  const host = `bedrock-mantle.${region}.api.aws`
-  const path = `/${basePath(sel.model)}/chat/completions`
-  const text = withModel(body, sel.model)
+  const at = origin(t, region)
+  const path = anth ? "/anthropic/v1/messages" : `/${basePath(sel.model)}/chat/completions`
+  let text = ""
+  if (anth) text = try messagesText(body, sel.model)
+  else text = withModel(body, sel.model)
   const extra = t.cfg.network_config?.extra_headers
   const bearer = t.key.value ?? ""
   if (bearer !== "") {
     let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + bearer]])
+    if (anth) h.set("anthropic-version", ANTHROPIC_VERSION)
     addExtraHeaders(&h, t.cfg)
-    return { url: `https://${host}${path}`, headers: h, body: text }
+    return { url: at.sch + at.host + path, headers: h, body: text }
   }
   const ak = bk?.access_key ?? ""
   if (ak === "") throw new SyntaxError("bedrock_mantle: the key needs a value (API key) or access_key and secret_key")
@@ -82,21 +103,24 @@ export function chatRequestAt(t: Target, body: Field[], nowMs: f64): Upstream th
     }
   }
   const creds: AwsCreds = { accessKey: ak, secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token ?? "" }
-  const h = signV4(creds, region, SIGNING_SERVICE, host, path, "application/json", text, nowMs, signedExtra)
+  const h = signV4(creds, region, SIGNING_SERVICE, at.host, path, "application/json", text, nowMs, signedExtra)
+  if (anth) h.set("anthropic-version", ANTHROPIC_VERSION)
   if (extra !== undefined) {
     for (const k of extra.keys()) {
       if (!k.toLowerCase().startsWith("x-amz-")) h.set(k, extra.get(k)!)
     }
   }
-  return { url: `https://${host}${path}`, headers: h, body: text }
+  return { url: at.sch + at.host + path, headers: h, body: text }
 }
 
 export function chatRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
   return try chatRequestAt(t, body, Date.now())
 }
 
-// Mantle answers in the OpenAI shape, so the reply is translated by openai.tov.
+// Mantle answers an OpenAI-family model in the OpenAI shape and a Claude model in the
+// Messages shape; the requested model tells them apart.
 export function chatResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  if (isAnthropicFamily(requestedModel)) return try anthropic.chatResponse(text, requestedModel)
   return try openai.chatResponse(text, requestedModel)
 }
 
@@ -145,16 +169,26 @@ test("sigv4 request is signed for bedrock-mantle in the key's region", () => {
   expect(auth.endsWith("Signature=f66fd317c719543a2834ca8cbe1b1c415802039f809c5dec4f4c45b47fecc151")).toBe(true)
 })
 
-test("claude-family and keyless requests are refused", () => {
+test("claude-family requests go to the native Messages path with anthropic-version", () => {
+  const body = try fields(`{"model":"gpt","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}],"max_tokens":9,"fallbacks":["x"]}`)
+  const up = try chatRequestAt(mantleTarget("anthropic.claude-haiku-4-5", "mk", undefined), body, 0.0)
+  expect(up.url).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages")
+  expect(up.headers.get("anthropic-version")).toBe("2023-06-01")
+  expect(up.headers.get("authorization")).toBe("Bearer mk")
+  expect(up.body.includes(`"model":"anthropic.claude-haiku-4-5"`)).toBe(true)
+  expect(up.body.includes(`"system":"be brief"`)).toBe(true)
+  expect(up.body.includes(`"max_tokens":9`)).toBe(true)
+  expect(up.body.includes(`"fallbacks"`)).toBe(false)
+  // SigV4 signs the same path for Claude
+  const sg = try chatRequestAt(mantleTarget("us-west-2/anthropic.claude-haiku-4-5", "", "us-west-2"), body, 1440938160000.0)
+  expect(sg.url).toBe("https://bedrock-mantle.us-west-2.api.aws/anthropic/v1/messages")
+  expect(sg.headers.get("anthropic-version")).toBe("2023-06-01")
+  expect(sg.headers.get("authorization")!.includes("/us-west-2/bedrock-mantle/aws4_request")).toBe(true)
+})
+
+test("keyless requests are refused", () => {
   const body = try fields(`{"model":"gpt","messages":[]}`)
   let msg = ""
-  try {
-    chatRequestAt(mantleTarget("anthropic.claude-haiku-4-5", "mk", undefined), body, 0.0)
-  } catch (e) {
-    msg = e.message
-  }
-  expect(msg.includes("native Messages surface")).toBe(true)
-  msg = ""
   try {
     chatRequestAt(mantleTarget("openai.gpt-5.5", "", undefined), body, 0.0)
   } catch (e) {
@@ -163,9 +197,23 @@ test("claude-family and keyless requests are refused", () => {
   expect(msg.includes("needs a value")).toBe(true)
 })
 
+test("the key's base_url replaces the Mantle host", () => {
+  const body = try fields(`{"model":"gpt","messages":[{"role":"user","content":"hi"}]}`)
+  const t: Target = { provider: "bedrock_mantle", kind: "bedrock_mantle", model: "openai.gpt-5.5", key: { value: "mk" }, cfg: { network_config: { base_url: "http://127.0.0.1:18099" } } }
+  const up = try chatRequestAt(t, body, 0.0)
+  expect(up.url).toBe("http://127.0.0.1:18099/openai/v1/chat/completions")
+})
+
 test("mantle chat reply is read as an OpenAI reply", () => {
   const r = try chatResponse(`{"id":"x","object":"chat.completion","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`, "bedrock_mantle/openai.gpt-5.5")
   expect(r.promptTokens).toBe(3)
   expect(r.completionTokens).toBe(4)
   expect(r.body.includes(`"model":"bedrock_mantle/openai.gpt-5.5"`)).toBe(true)
+})
+
+test("mantle Messages reply is read as an Anthropic reply", () => {
+  const r = try chatResponse(`{"id":"msg_1","type":"message","role":"assistant","model":"anthropic.claude-haiku-4-5","content":[{"type":"text","text":"hey"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":6}}`, "bedrock_mantle/anthropic.claude-haiku-4-5")
+  expect(r.promptTokens).toBe(5)
+  expect(r.completionTokens).toBe(6)
+  expect(r.body.includes(`"content":"hey"`)).toBe(true)
 })

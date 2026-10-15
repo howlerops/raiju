@@ -1,9 +1,11 @@
 // AWS Bedrock Converse API with SigV4 signing (or a Bedrock API key as a bearer token).
-import { Field, fields, elements, find, quote, rawStr, isNull, build } from "../json"
+import { Field, fields, elements, find, quote, rawStr, isNull, build, setField, without } from "../json"
 import { fromChat, bedrockReasoning } from "../reasoning"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, ContentPart, newId, nowSeconds } from "../schemas"
 import { sha256, hmacSha256, toHex, utf8 } from "../crypto"
+import * as openai from "./openai"
+import { BedrockKeyConfig, ProviderConfig } from "../config"
 
 // ---- SigV4 ----
 
@@ -196,6 +198,8 @@ function finishReason(r: string | undefined): string {
 
 export function chatResponse(text: string, requestedModel: string): Translated throws SyntaxError {
   const fs = try fields(text)
+  // the OpenAI-compatible endpoint answers in the OpenAI shape
+  if (find(fs, "choices") !== undefined) return try openai.chatResponse(text, requestedModel)
   const textParts: string[] = []
   const reasoning: string[] = []
   const calls: string[] = []
@@ -255,13 +259,15 @@ function modelId(t: Target): string {
   return id
 }
 
-function host(t: Target): string {
+// The host for an AWS service in a region. The key's base_url, when set, serves every
+// service (a proxy, or the mock in tests).
+function host(t: Target, service: string, reg: string): string {
   const b = t.cfg.network_config?.base_url
   if (b !== undefined && b !== "") {
     const u = URL.parse(b)
     if (u !== undefined) return u.host
   }
-  return `bedrock-runtime.${region(t)}.amazonaws.com`
+  return `${service}.${reg}.amazonaws.com`
 }
 
 function scheme(t: Target): string {
@@ -270,21 +276,137 @@ function scheme(t: Target): string {
   return "https://"
 }
 
-// A request to /model/{id}/{action}, signed with the key's AWS credentials,
-// or sent with its Bedrock API key as a bearer token.
-export function signedRequest(t: Target, action: string, body: string): Upstream {
-  const path = `/model/${encodeSegment(modelId(t))}/${action}`
-  const h = host(t)
+// The model's segment of a URL path. A key with an ARN (an inference profile) gets the
+// ARN joined to the model id, percent-encoded as one segment, as Bifrost builds it.
+function modelPath(t: Target): string {
+  const arn = t.key.bedrock_key_config?.arn ?? ""
+  return encodeSegment(arn === "" ? modelId(t) : `${arn}/${modelId(t)}`)
+}
+
+// A POST to a path on an AWS host, signed with the key's credentials for service bedrock
+// in reg, or sent with its Bedrock API key as a bearer token.
+function callTo(t: Target, reg: string, h: string, sch: string, path: string, body: string): Upstream {
   const bk = t.key.bedrock_key_config
   const ak = bk?.access_key ?? ""
   let hs: Map<string, string> = new Map()
   if (ak !== "") {
-    hs = sign({ accessKey: ak, secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token, region: region(t) }, "bedrock", h, path, body, Date.now())
+    hs = sign({ accessKey: ak, secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token, region: reg }, "bedrock", h, path, body, Date.now())
   } else {
     hs = headers([["content-type", "application/json"], ["authorization", "Bearer " + (t.key.value ?? "")]])
   }
   addExtraHeaders(&hs, t.cfg)
-  return { url: scheme(t) + h + path, headers: hs, body: body }
+  return { url: sch + h + path, headers: hs, body: body }
+}
+
+// A request to /model/{id}/{action} on bedrock-runtime.
+export function signedRequest(t: Target, action: string, body: string): Upstream {
+  return callTo(t, region(t), host(t, "bedrock-runtime", region(t)), scheme(t), `/model/${modelPath(t)}/${action}`, body)
+}
+
+// "us-west-2/model" names the region for one call; the model is the rest.
+function regionPrefix(model: string): { region: string | undefined, model: string } {
+  const slash = model.indexOf("/")
+  if (slash > 0 && isRegionName(model.slice(0, slash))) return { region: model.slice(0, slash), model: model.slice(slash + 1) }
+  return { region: undefined, model: model }
+}
+
+// A region name such as "us-west-2": lower-case letters and digits, hyphens, ending in a digit.
+function isRegionName(s: string): bool {
+  if (s.indexOf("-") < 0) return false
+  if (!"0123456789".includes(s.slice(s.byteLength - 1))) return false
+  for (const c of s.chars()) {
+    if (!"abcdefghijklmnopqrstuvwxyz0123456789-".includes(c)) return false
+  }
+  return true
+}
+
+// Bedrock's OpenAI-compatible endpoint serves the OpenAI and xAI families. gpt-oss is
+// served by Mantle, not here, so it stays on Converse.
+function openAIFamily(model: string): bool {
+  const m = model.toLowerCase()
+  if (m.includes("gpt-oss")) return false
+  return m.startsWith("openai.") || m.startsWith("xai.") || m.includes("grok")
+}
+
+// The chat call goes to the OpenAI-compatible endpoint when the key opts in
+// (use_openai_endpoints) and the model is in that family. Streaming stays on Converse.
+function usesOpenAIEndpoints(t: Target): bool {
+  if (t.key.bedrock_key_config?.use_openai_endpoints !== true) return false
+  return openAIFamily(regionPrefix(modelId(t)).model)
+}
+
+// The OpenAI body with gateway fields dropped and the bare model id, POSTed to
+// bedrock-runtime's /openai/v1/chat/completions.
+function openAIChatRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const sel = regionPrefix(modelId(t))
+  const reg = sel.region ?? region(t)
+  let fs = without(body, openai.GATEWAY_FIELDS)
+  setField(&fs, "model", quote(sel.model))
+  return callTo(t, reg, host(t, "bedrock-runtime", reg), scheme(t), "/openai/v1/chat/completions", build(fs))
+}
+
+// The foundation-model ARN a rerank body names, built from the region unless the model is
+// an ARN already.
+function rerankARN(model: string, reg: string): string {
+  if (model.startsWith("arn:")) return model
+  const part = reg.startsWith("us-gov-") ? "aws-us-gov" : (reg.startsWith("cn-") ? "aws-cn" : "aws")
+  return `arn:${part}:bedrock:${reg}::foundation-model/${model}`
+}
+
+// A Cohere-style rerank request (query, documents, top_n) as Bedrock Agent Runtime's
+// /rerank body, posted to bedrock-agent-runtime in the model's region. Rerank addresses
+// its model by ARN, as Bifrost does.
+export function rerankUpstream(t: Target, query: string, docs: string[], topN: int): Upstream throws SyntaxError {
+  if (docs.length === 0) throw new SyntaxError("documents are required for rerank")
+  if (topN < 1) throw new SyntaxError("top_n must be at least 1")
+  const sel = regionPrefix(modelId(t))
+  const reg = sel.region ?? region(t)
+  const srcs: string[] = docs.map((d) => `{"type":"INLINE","inlineDocumentSource":{"type":"TEXT","textDocument":{"text":${quote(d)}}}}`)
+  const text = `{"queries":[{"type":"TEXT","textQuery":{"text":${quote(query)}}}],"sources":[${srcs.join(",")}],` +
+    `"rerankingConfiguration":{"type":"BEDROCK_RERANKING_MODEL","bedrockRerankingConfiguration":{"modelConfiguration":{"modelArn":${quote(rerankARN(sel.model, reg))}},"numberOfResults":${topN}}}}`
+  return callTo(t, reg, host(t, "bedrock-agent-runtime", reg), scheme(t), "/rerank", text)
+}
+
+type WireRerank = {
+  queries?: { textQuery?: { text?: string } }[],
+  sources?: { inlineDocumentSource?: { textDocument?: { text?: string } } }[],
+  rerankingConfiguration?: { bedrockRerankingConfiguration?: { modelConfiguration?: { modelArn?: string }, numberOfResults?: int } },
+}
+
+// A Bedrock rerank body (the /bedrock/rerank wire) as the Cohere-style body the gateway
+// ranks. The model becomes "bedrock/<arn>", which reads back as a Bedrock model.
+export function rerankFromWire(text: string): string throws SyntaxError {
+  const w = try JSON.parse(text) as WireRerank
+  const arn = w.rerankingConfiguration?.bedrockRerankingConfiguration?.modelConfiguration?.modelArn ?? ""
+  if (arn === "") throw new SyntaxError("rerank needs rerankingConfiguration.bedrockRerankingConfiguration.modelConfiguration.modelArn")
+  const qs = w.queries ?? []
+  if (qs.length === 0) throw new SyntaxError("rerank needs a query")
+  const docs: string[] = []
+  for (const s of w.sources ?? []) {
+    const d = s.inlineDocumentSource?.textDocument?.text
+    if (d === undefined) throw new SyntaxError("rerank takes text sources only")
+    docs.push(quote(d))
+  }
+  const n = w.rerankingConfiguration?.bedrockRerankingConfiguration?.numberOfResults
+  const top = n === undefined ? "" : `,"top_n":${n}`
+  return `{"model":${quote("bedrock/" + arn)},"query":${quote(qs[0]!.textQuery?.text ?? "")},"documents":[${docs.join(",")}]${top}}`
+}
+
+type WireRerankReply = { results?: { index: int, relevanceScore: f64 }[] }
+
+// The scored results of Bedrock's rerank answer. The caller builds the reply.
+export function rerankResults(text: string): { index: int, score: f64 }[] throws SyntaxError {
+  const w = try JSON.parse(text) as WireRerankReply
+  return (w.results ?? []).map((r) => ({ index: r.index, score: r.relevanceScore }))
+}
+
+type GatewayRerankReply = { results?: { index: int, relevance_score: f64 }[] }
+
+// The gateway's rerank reply (relevance_score) as Bedrock's answer (relevanceScore).
+export function rerankWire(text: string): string throws SyntaxError {
+  const w = try JSON.parse(text) as GatewayRerankReply
+  const out = (w.results ?? []).map((r) => `{"index":${r.index},"relevanceScore":${JSON.stringify(r.relevance_score)}}`)
+  return `{"results":[${out.join(",")}]}`
 }
 
 export function streamRequest(t: Target, req: ChatRequest, body: Field[], autoCache: bool): Upstream throws SyntaxError {
@@ -292,6 +414,7 @@ export function streamRequest(t: Target, req: ChatRequest, body: Field[], autoCa
 }
 
 export function chatRequest(t: Target, req: ChatRequest, body: Field[], autoCache: bool): Upstream throws SyntaxError {
+  if (usesOpenAIEndpoints(t)) return try openAIChatRequest(t, body)
   return signedRequest(t, "converse", try converseBody(req, body, autoCache, t.model))
 }
 
@@ -333,4 +456,80 @@ test("reasoning_effort becomes Claude thinking fields; reasoning text comes back
   expect(out.includes(`"temperature"`)).toBe(false)
   const r = try chatResponse(`{"output":{"message":{"content":[{"reasoningContent":{"reasoningText":{"text":"why","signature":"s"}}},{"text":"ok"}]}},"stopReason":"end_turn"}`, "m")
   expect(r.body.includes(`"reasoning":"why","reasoning_content":"why"`)).toBe(true)
+})
+
+function keyed(model: string, bk: BedrockKeyConfig, base: string): Target {
+  const cfg: ProviderConfig = base === "" ? {} : { network_config: { base_url: base } }
+  return { provider: "bedrock", kind: "bedrock", model: model, key: { value: "", bedrock_key_config: bk }, cfg: cfg }
+}
+
+test("an ARN on the key joins the model in the path", () => {
+  const bk: BedrockKeyConfig = { access_key: "AKIDEXAMPLE", secret_key: "s", region: "us-east-1", arn: "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude" }
+  const up = signedRequest(keyed("anthropic.claude-3-haiku-20240307-v1:0", bk, ""), "converse", "{}")
+  expect(up.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Ainference-profile%2Fus.anthropic.claude%2Fanthropic.claude-3-haiku-20240307-v1%3A0/converse")
+  const plain = signedRequest(keyed("anthropic.claude-3-haiku-20240307-v1:0", { access_key: "AKIDEXAMPLE", secret_key: "s", region: "us-east-1" }, ""), "converse", "{}")
+  expect(plain.url.endsWith("/model/anthropic.claude-3-haiku-20240307-v1%3A0/converse")).toBe(true)
+})
+
+test("count-tokens is a signed bedrock-runtime call on the model", () => {
+  const bk: BedrockKeyConfig = { access_key: "AKIDEXAMPLE", secret_key: "s", region: "eu-west-1" }
+  const up = signedRequest(keyed("anthropic.claude-3-haiku-20240307-v1:0", bk, ""), "count-tokens", `{"input":{}}`)
+  expect(up.url).toBe("https://bedrock-runtime.eu-west-1.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1%3A0/count-tokens")
+  expect(up.headers.get("authorization")!.includes("/eu-west-1/bedrock/aws4_request")).toBe(true)
+})
+
+test("rerank gets a foundation-model ARN in the key's region and posts to agent-runtime", () => {
+  const bk: BedrockKeyConfig = { access_key: "AKIDEXAMPLE", secret_key: "s", region: "us-west-2" }
+  const up = try rerankUpstream(keyed("cohere.rerank-v3-5:0", bk, ""), "q", ["a", "b"], 1)
+  expect(up.url).toBe("https://bedrock-agent-runtime.us-west-2.amazonaws.com/rerank")
+  expect(up.body.includes(`"modelArn":"arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0"`)).toBe(true)
+  expect(up.body.includes(`"numberOfResults":1`)).toBe(true)
+  expect(up.body.includes(`"sources":[{"type":"INLINE","inlineDocumentSource":{"type":"TEXT","textDocument":{"text":"a"}}},`)).toBe(true)
+  expect(up.headers.get("authorization")!.includes("/us-west-2/bedrock/aws4_request")).toBe(true)
+})
+
+test("rerank ARNs follow the partition, and an ARN passes through", () => {
+  expect(rerankARN("x.y", "us-gov-west-1")).toBe("arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/x.y")
+  expect(rerankARN("x.y", "cn-north-1")).toBe("arn:aws-cn:bedrock:cn-north-1::foundation-model/x.y")
+  expect(rerankARN("arn:aws:bedrock:us-east-1::foundation-model/z", "us-west-2")).toBe("arn:aws:bedrock:us-east-1::foundation-model/z")
+  const bk: BedrockKeyConfig = { access_key: "AKIDEXAMPLE", secret_key: "s", region: "us-west-2" }
+  const up = try rerankUpstream(keyed("eu-central-1/cohere.rerank-v3-5:0", bk, ""), "q", ["a"], 1)
+  expect(up.url).toBe("https://bedrock-agent-runtime.eu-central-1.amazonaws.com/rerank")
+  expect(up.body.includes(`"modelArn":"arn:aws:bedrock:eu-central-1::foundation-model/cohere.rerank-v3-5:0"`)).toBe(true)
+})
+
+test("a Bedrock rerank body becomes the gateway's body, and the reply goes back in Bedrock's shape", () => {
+  const wire = `{"queries":[{"type":"TEXT","textQuery":{"text":"capital"}}],"sources":[{"type":"INLINE","inlineDocumentSource":{"type":"TEXT","textDocument":{"text":"Oslo"}}},{"type":"INLINE","inlineDocumentSource":{"type":"TEXT","textDocument":{"text":"Paris"}}}],"rerankingConfiguration":{"type":"BEDROCK_RERANKING_MODEL","bedrockRerankingConfiguration":{"modelConfiguration":{"modelArn":"arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0"},"numberOfResults":1}}}`
+  const cohere = try rerankFromWire(wire)
+  expect(cohere).toBe(`{"model":"bedrock/arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0","query":"capital","documents":["Oslo","Paris"],"top_n":1}`)
+  const back = try rerankWire(`{"results":[{"index":1,"relevance_score":0.75},{"index":0,"relevance_score":0.5}],"model":"m","usage":{"search_units":1}}`)
+  expect(back).toBe(`{"results":[{"index":1,"relevanceScore":0.75},{"index":0,"relevanceScore":0.5}]}`)
+  const results = try rerankResults(`{"results":[{"index":0,"relevanceScore":0.1},{"index":1,"relevanceScore":0.9}]}`)
+  expect(results[1]!.index).toBe(1)
+  expect(results[1]!.score).toBe(0.9)
+})
+
+test("use_openai_endpoints sends OpenAI families to bedrock-runtime's OpenAI route", () => {
+  const raw = `{"model":"openai/gpt-5.5","messages":[{"role":"user","content":"hi"}],"max_tokens":5,"fallbacks":["x"]}`
+  const req = try JSON.parse(raw) as ChatRequest
+  const body = try fields(raw)
+  const bearer = keyed("openai.gpt-5.5", { region: "us-east-1", use_openai_endpoints: true }, "")
+  bearer.key.value = "bk-1"
+  const up = try chatRequest(bearer, req, body, false)
+  expect(up.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/chat/completions")
+  expect(up.headers.get("authorization")).toBe("Bearer bk-1")
+  expect(up.body).toBe(`{"model":"openai.gpt-5.5","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`)
+  const off = try chatRequest(keyed("openai.gpt-5.5", { region: "us-east-1" }, ""), req, body, false)
+  expect(off.url.endsWith("/model/openai.gpt-5.5/converse")).toBe(true)
+  const oss = try chatRequest(keyed("openai.gpt-oss-120b", { region: "us-east-1", use_openai_endpoints: true }, ""), req, body, false)
+  expect(oss.url.endsWith("/converse")).toBe(true)
+  const claude = try chatRequest(keyed("anthropic.claude-3-haiku-20240307-v1:0", { region: "us-east-1", use_openai_endpoints: true }, ""), req, body, false)
+  expect(claude.url.endsWith("/converse")).toBe(true)
+})
+
+test("an OpenAI-shaped reply from the OpenAI route reads as a chat completion", () => {
+  const r = try chatResponse(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"yo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":2,"total_tokens":8}}`, "bedrock/openai.gpt-5.5")
+  expect(r.promptTokens).toBe(6)
+  expect(r.completionTokens).toBe(2)
+  expect(r.body.includes(`"content":"yo"`)).toBe(true)
 })

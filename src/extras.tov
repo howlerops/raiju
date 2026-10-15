@@ -10,6 +10,9 @@ import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
 import * as anthropicIn from "./providers/anthropic_in"
+import * as bedrock from "./providers/bedrock"
+import * as bedrockIn from "./bedrock_in"
+import { Translated } from "./providers/types"
 
 function json(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
@@ -23,42 +26,80 @@ function kindFor(engine: Engine, model: string): { provider: string, model: stri
   return { provider: ref.provider, model: ref.model, kind: p === undefined ? ref.provider : kindOf(ref.provider, p) }
 }
 
-// POST /v1/rerank: the provider's rerank API (Cohere, vLLM). Providers without one are an
-// error, as in Bifrost; model "raiju/lexical" (any name under "raiju/") asks for a local
+// POST /v1/rerank: the provider's rerank API (Cohere, vLLM, Bedrock). Providers without one are
+// an error, as in Bifrost; model "raiju/lexical" (any name under "raiju/") asks for a local
 // lexical (BM25) ranking instead.
 export async function rerank(engine: Engine, req: Request): Promise<Response> {
-  const text = await req.text()
+  return await rerankText(engine, req, await req.text(), false)
+}
+
+// POST /bedrock/rerank: Bedrock Agent Runtime's rerank body, served by Bedrock or by any
+// rerank provider, and answered in Bedrock's shape.
+export async function bedrockRerank(engine: Engine, req: Request): Promise<Response> {
+  let cohere = ""
+  try {
+    cohere = bedrock.rerankFromWire(await req.text())
+  } catch (e) {
+    return errorResponse(400, `invalid rerank request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  return await rerankText(engine, req, cohere, true)
+}
+
+// The reply in the route's shape: Bedrock's when wire is set.
+function rerankShape(o: Translated, wire: bool): Translated throws SyntaxError {
+  if (!wire) return o
+  return { body: try bedrock.rerankWire(o.body), promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+}
+
+// The rerank route for a body in Raiju's own shape (query, documents, top_n).
+async function rerankText(engine: Engine, req: Request, text: string, wire: bool): Promise<Response> {
   let body: Field[] = []
   let model = ""
+  let query = ""
+  let docs: string[] = []
+  let topN = 0
   try {
     body = fields(text)
     model = parseRerank(text).model
+    query = parseRerank(text).query
+    docs = parseRerank(text).documents
+    topN = parseRerank(text).topN
   } catch (e) {
     return errorResponse(400, `invalid rerank request: ${e.message}`, "invalid_request_error", noHeaders())
   }
   const k = kindFor(engine, model)
   if (k.kind === "cohere") {
     const b: Build = (t) => cohere.rerankRequest(t, body)
-    const tr: Translate = (t, text, requested) => try cohere.rerankResponse(text, requested)
+    const tr: Translate = (t, out, requested) => try rerankShape(try cohere.rerankResponse(out, requested), wire)
     return await engine.serve(req, "rerank", undefined, body, text, b, tr, false)
   }
   if (k.kind === "vllm") {
     const b: Build = (t) => openai.rerankRequest(t, body)
-    const tr: Translate = (t, text, requested) => try cohere.rerankResponse(text, requested)
+    const tr: Translate = (t, out, requested) => try rerankShape(try cohere.rerankResponse(out, requested), wire)
+    return await engine.serve(req, "rerank", undefined, body, text, b, tr, false)
+  }
+  if (k.kind === "bedrock") {
+    const ret = !wire && (rawBool(body, "return_documents") ?? true)
+    const b: Build = (t) => try bedrock.rerankUpstream(t, query, docs, topN)
+    const tr: Translate = (t, out, requested) => {
+      const scored = try bedrock.rerankResults(out)
+      const units = Math.ceil(docs.length / 100)
+      return try rerankShape({ body: rerankJson(scored, docs, ret, requested, units), promptTokens: 0, completionTokens: 0 }, wire)
+    }
     return await engine.serve(req, "rerank", undefined, body, text, b, tr, false)
   }
   if (!model.startsWith("raiju/")) {
-    return errorResponse(400, `rerank is not supported by provider ${k.provider}; use a provider with a rerank API (cohere, vllm), or model "raiju/lexical" for a local lexical ranking`, "unsupported_operation", noHeaders())
+    return errorResponse(400, `rerank is not supported by provider ${k.provider}; use a provider with a rerank API (cohere, vllm, bedrock), or model "raiju/lexical" for a local lexical ranking`, "unsupported_operation", noHeaders())
   }
   if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
     return errorResponse(401, "a virtual key is required", "authentication_error", noHeaders())
   }
   try {
-    const r = parseRerank(text)
-    const scored = lexicalRerank(r.query, r.documents)
+    const scored = lexicalRerank(query, docs)
     scored.sort((a, b) => b.score - a.score)
-    const top = scored.slice(0, r.topN)
-    return json(200, rerankJson(top, r.documents, rawBool(body, "return_documents") ?? true, model, 0))
+    const top = scored.slice(0, topN)
+    const out = rerankJson(top, docs, rawBool(body, "return_documents") ?? true, model, 0)
+    return json(200, (try rerankShape({ body: out, promptTokens: 0, completionTokens: 0 }, wire)).body)
   } catch (e) {
     return errorResponse(400, `invalid rerank request: ${e.message}`, "invalid_request_error", noHeaders())
   }
@@ -100,6 +141,37 @@ export async function countTokens(engine: Engine, req: Request, anthropicShape: 
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
+}
+
+// POST /bedrock/model/{id}/count-tokens. A Bedrock model is counted by Bedrock's CountTokens,
+// exactly. Another provider, or a model Bedrock cannot count, gets the estimate, marked
+// "exact": false.
+export async function bedrockCountTokens(engine: Engine, req: Request, id: string, text: string): Promise<Response> {
+  let est = 0
+  try {
+    est = estimateChatTokens(bedrockIn.countTokensToRaiju(text))
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const estimate = json(200, bedrockIn.countTokensResponse(est, false))
+  const full = id.includes("/") && !id.startsWith("arn:") ? id : "bedrock/" + id
+  if (kindFor(engine, full).kind !== "bedrock") return estimate
+  const b: Build = (t) => bedrock.signedRequest(t, "count-tokens", text)
+  const tr: Translate = (t, out, requested) => {
+    const u = try JSON.parse(out) as { inputTokens?: int }
+    return { body: bedrockIn.countTokensResponse(u.inputTokens ?? 0, true), promptTokens: 0, completionTokens: 0 }
+  }
+  const r = await engine.serve(req, "bedrock.count-tokens", full, [], text, b, tr, false)
+  if (r.status === 200) return r
+  let msg = ""
+  try {
+    msg = await r.text()
+  } catch (e) {
+    return errorResponse(502, `invalid upstream answer: ${e.message}`, "api_error", noHeaders())
+  }
+  // a model Bedrock cannot count: the estimate, as the other providers get
+  if (msg.includes("counting tokens")) return estimate
+  return json(r.status, msg)
 }
 
 export type Dispatch = (req: Request) => Promise<Response, Error>

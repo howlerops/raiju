@@ -164,6 +164,10 @@ def write_config():
         "keys": [{"name": "vx", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps(sa)}}],
         "network_config": {"base_url": MOCK},
     }
+    # Bedrock keys with an inference-profile ARN and with use_openai_endpoints, and a Mantle key, all on the mock
+    cfg["providers"]["bedrock_arn"] = {"custom_provider_config": {"base_provider_type": "bedrock"}, "keys": [{"name": "bk-arn", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1", "arn": "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"}}], "network_config": {"base_url": MOCK}}
+    cfg["providers"]["bedrock_oai"] = {"custom_provider_config": {"base_provider_type": "bedrock"}, "keys": [{"name": "bk-oai", "value": "bedrock-api-key", "models": [], "weight": 1.0, "bedrock_key_config": {"region": "us-east-1", "use_openai_endpoints": True}}], "network_config": {"base_url": MOCK}}
+    cfg["providers"]["bedrock_mantle"] = {"keys": [{"name": "mk", "value": "mantle-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK}}
     path = os.path.join(BUILD, "e2e.config.json")
     json.dump(cfg, open(path, "w"))
     # a second node of the same cluster, without the file-writing features
@@ -428,8 +432,13 @@ def main():
         meta = [json.loads(p) for hd, p in frames if hd.get(":event-type") == "metadata"]
         check("bedrock converse-stream frames have valid CRCs and events", s == 200 and h.get("content-type") == "application/vnd.amazon.eventstream" and names == ["messageStart", "contentBlockDelta", "contentBlockDelta", "contentBlockStop", "messageStop", "metadata"] and text == "Hello" and all(hd.get(":message-type") == "event" for hd, _ in frames) and meta and meta[0]["usage"]["inputTokens"] == 3, (s, names, raw[:80]))
         check("bedrock converse-stream asks the upstream to stream", json.loads(seen()[-1]["body"]).get("stream") is True, seen()[-1])
-        s, _, b = call("POST", BED + "count-tokens", {"input": {"converse": {"messages": [{"role": "user", "content": [{"text": "hello there, friend"}]}]}}})
-        check("bedrock count-tokens", s == 200 and json.loads(b).get("inputTokens", 0) > 0, b)
+        COUNT = {"input": {"converse": {"messages": [{"role": "user", "content": [{"text": "hello there, friend"}]}]}}}
+        s, _, b = call("POST", BED + "count-tokens", COUNT)
+        check("bedrock count-tokens (another provider: the estimate, inexact)", s == 200 and json.loads(b).get("inputTokens", 0) > 0 and json.loads(b).get("exact") is False, b)
+        s, _, b = call("POST", "/bedrock/model/claude/count-tokens", COUNT)
+        check("bedrock count-tokens is Bedrock's exact count", s == 200 and json.loads(b) == {"inputTokens": 17, "exact": True} and seen()[-1]["path"] == "/model/anthropic.claude-3-haiku-20240307-v1:0/count-tokens", (s, b, seen()[-1:]))
+        s, _, b = call("POST", "/bedrock/model/unsupported-model/count-tokens", COUNT)
+        check("bedrock count-tokens falls back to the estimate for a model Bedrock cannot count", s == 200 and json.loads(b).get("exact") is False and json.loads(b).get("inputTokens", 0) > 0, (s, b))
         s, h, raw = call_bytes("POST", BED + "invoke-with-response-stream", {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]})
         try:
             frames = eventstream(raw)
@@ -437,6 +446,34 @@ def main():
             frames = []
         events = [json.loads(B64.b64decode(json.loads(p)["bytes"])) for hd, p in frames if hd.get(":event-type") == "chunk"]
         check("bedrock invoke-with-response-stream wraps Messages events", s == 200 and events[:1] and events[0]["type"] == "message_start" and events[-1]["type"] == "message_stop" and any(e.get("delta", {}).get("text") == "Hel" for e in events), (s, raw[:80]))
+
+        # Bedrock rerank: /v1/rerank with a Bedrock model, in the caller's shape; and /bedrock/rerank in Bedrock's
+        s, _, b = call("POST", "/v1/rerank", {"model": "bedrock/cohere.rerank-v3-5:0", "query": "q", "documents": ["a", "b"], "top_n": 1})
+        r = json.loads(b) if s == 200 else {}
+        check("rerank through a Bedrock model", s == 200 and r.get("results", [{}])[0].get("index") == 1 and r["results"][0].get("relevance_score") == 0.9 and r["results"][0].get("document") == {"text": "b"}, (s, b[:300]))
+        check("rerank posts to agent-runtime with the model's ARN", seen()[-1]["path"] == "/rerank" and "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0" in seen()[-1]["body"], seen()[-1])
+        WIRE = {"queries": [{"type": "TEXT", "textQuery": {"text": "q"}}], "sources": [{"type": "INLINE", "inlineDocumentSource": {"type": "TEXT", "textDocument": {"text": t}}} for t in ["a", "b"]], "rerankingConfiguration": {"type": "BEDROCK_RERANKING_MODEL", "bedrockRerankingConfiguration": {"modelConfiguration": {"modelArn": "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0"}, "numberOfResults": 1}}}
+        s, _, b = call("POST", "/bedrock/rerank", WIRE)
+        check("bedrock rerank route answers in Bedrock's shape", s == 200 and json.loads(b) == {"results": [{"index": 1, "relevanceScore": 0.9}, {"index": 0, "relevanceScore": 0.2}]}, (s, b[:300]))
+
+        # an inference-profile ARN on the key: the ARN joins the model in the path
+        s, _, b = chat("bedrock_arn/anthropic.claude-3-haiku-20240307-v1:0")
+        check("bedrock key ARN reaches the converse path", s == 200 and "abc123" in seen()[-1]["path"] and seen()[-1]["path"].endswith("/converse") and "/us-east-1/bedrock/aws4_request" in seen()[-1]["auth"], (s, seen()[-1]))
+
+        # use_openai_endpoints: OpenAI-family chat goes to the OpenAI route with the key's bearer; other families stay on Converse
+        s, _, b = chat("bedrock_oai/openai.gpt-5.5")
+        r = json.loads(b) if s == 200 else {}
+        check("use_openai_endpoints sends an OpenAI model to the OpenAI route", s == 200 and r["choices"][0]["message"]["content"] == "Hello from openai.gpt-5.5" and seen()[-1]["path"] == "/openai/v1/chat/completions" and seen()[-1]["auth"] == "Bearer bedrock-api-key" and json.loads(seen()[-1]["body"])["model"] == "openai.gpt-5.5", (s, b[:200], seen()[-1:]))
+        s, _, b = chat("bedrock_oai/anthropic.claude-3-haiku-20240307-v1:0")
+        check("use_openai_endpoints leaves Claude on Converse", s == 200 and seen()[-1]["path"].endswith("/converse"), seen()[-1:])
+
+        # Bedrock Mantle: OpenAI-family models on the OpenAI surface, Claude on the native Messages surface
+        s, _, b = chat("bedrock_mantle/openai.gpt-5.5")
+        r = json.loads(b) if s == 200 else {}
+        check("mantle OpenAI-family chat", s == 200 and r["choices"][0]["message"]["content"] == "Hello from openai.gpt-5.5" and seen()[-1]["path"] == "/openai/v1/chat/completions" and seen()[-1]["auth"] == "Bearer mantle-key", (s, b[:200]))
+        s, _, b = chat("bedrock_mantle/anthropic.claude-haiku-4-5", max_tokens=20)
+        r = json.loads(b) if s == 200 else {}
+        check("mantle Anthropic-family chat goes to the native Messages path", s == 200 and r["choices"][0]["message"]["content"] == "Hi from mantle claude" and r["usage"]["prompt_tokens"] == 6 and seen()[-1]["path"] == "/anthropic/v1/messages" and json.loads(seen()[-1]["body"])["model"] == "anthropic.claude-haiku-4-5", (s, b[:200], seen()[-1:]))
 
         s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "openai"})
         ids = [m["id"] for m in json.loads(b)["data"]]
