@@ -729,6 +729,175 @@ def sinks_e2e(env, sa_text: str):
             gw.terminate()
         kafka.terminate()
 
+GW_L88 = "http://127.0.0.1:18132"  # the prompt repository, webhooks, feature flags and notifications; its own config file
+
+def l88_config():
+    """The L88 gateway's config: the mock as the OpenAI upstream, and a feature flag locked by config from an env reference."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l", "value": "sk-l88", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "feature_flags": {"flags": {"warp": {"enabled": "env.E2E_L88_WARP"}}},
+    }
+
+def l88_e2e(env):
+    """Prompts (versions, variables, deployments, pins) reach the upstream; webhooks sign, retry and record deliveries;
+    the flag is set through the API on the main gateway and locked by config on the L88 gateway; notices list and page."""
+    import base64, hashlib, hmac
+    cfg_path = os.path.join(BUILD, "e2e.l88.json")
+    json.dump(l88_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18132", "-host", "127.0.0.1", "-config", cfg_path], env={**env, "E2E_L88_WARP": "off"}, stderr=open(os.path.join(BUILD, "e2e.l88.log"), "w"))
+
+    def api(method, path, body=None, headers=None):
+        return call(method, path, body, headers, base=GW_L88, auth=False)
+
+    def upstream(marker):
+        return [x for x in seen() if marker in x["body"] and x["path"] == "/v1/chat/completions"]
+
+    def hooks():
+        return json.loads(call("GET", "/_hooks", base=MOCK, auth=False)[2])
+
+    def wait_for(fn, tries=60):
+        for _ in range(tries):
+            got = fn()
+            if got:
+                return got
+            time.sleep(0.5)
+        return None
+
+    try:
+        wait(GW_L88 + "/health")
+
+        # ---- feature flags set through the API on the main gateway (admin), then restored ----
+        s, _, b = call("PUT", "/api/feature-flags/warp", {"enabled": False})
+        check("a flag set through the API is saved as db-sourced", s == 200 and json.loads(b)["source"] == "db" and json.loads(b)["enabled"] is False, b)
+        s, _, b = call("GET", "/api/feature-flags")
+        check("the flag list shows the API's value", s == 200 and json.loads(b)["flags"][0]["enabled"] is False, b)
+        call("PUT", "/api/feature-flags/warp", {"enabled": True})
+
+        # ---- prompts ----
+        s, _, b = api("POST", "/api/prompt-repo/prompts", {"name": "greet"})
+        pid = json.loads(b)["prompt"]["id"]
+        check("a prompt is created", s == 200 and pid.startswith("pr_"), b)
+        s, _, b = api("POST", f"/api/prompt-repo/prompts/{pid}/versions", {"messages": [{"role": "system", "content": "Greet {{name}} politely."}], "model_params": {"temperature": 0.2}, "commit_message": "first"})
+        check("version 1 commits with its variable named", s == 200 and json.loads(b)["version"]["version_number"] == 1 and json.loads(b)["version"]["variables"] == ["name"], b)
+        s, _, b = api("POST", f"/api/prompt-repo/prompts/{pid}/versions", {"messages": [{"role": "system", "content": "Say hi, {{name}}."}]})
+        v2_id = json.loads(b)["version"]["id"]
+        check("version 2 is the latest", s == 200 and json.loads(b)["version"]["is_latest"] is True, b)
+
+        m1 = "l88-probe-prompt-1"
+        s, _, b = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": m1}], "temperature": 0.9}, headers={"x-bf-prompt-id": pid, "x-bf-prompt-version": "1", "x-bf-prompt-var-name": "Ana"})
+        got = upstream(m1)
+        up = json.loads(got[-1]["body"]) if got else {}
+        check("a pinned version's messages go first, rendered with the variable", s == 200 and up.get("messages", [{}])[0] == {"role": "system", "content": "Greet Ana politely."} and up["messages"][1]["content"] == m1, (s, up))
+        check("the request's own temperature wins over the version's", up.get("temperature") == 0.9, up)
+
+        m2 = "l88-probe-prompt-2"
+        api("POST", "/v1/chat/completions", {"model": "openai/gpt-4.1", "messages": [{"role": "user", "content": m2}]}, headers={"x-bf-prompt-id": pid, "x-bf-prompt-version": "1", "x-bf-prompt-var-name": "Bo"})
+        got = upstream(m2)
+        up = json.loads(got[-1]["body"]) if got else {}
+        check("a version's temperature fills in what the request leaves out", up.get("temperature") == 0.2 and up["messages"][0]["content"] == "Greet Bo politely.", up)
+
+        s, _, b = api("POST", "/api/prompt-repo/deployments", {"prompt_id": pid, "name": "mini", "cel_expression": 'model == "gpt-4o-mini"', "traffic_distribution": [{"version": "2", "percentage": 100}]})
+        check("a deployment routes a model to version 2", s == 201, b)
+        m3 = "l88-probe-prompt-3"
+        api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": m3}]}, headers={"x-bf-prompt-id": pid, "x-bf-prompt-version": "1", "x-bf-prompt-var-name": "Cy"})
+        got = upstream(m3)
+        up = json.loads(got[-1]["body"]) if got else {}
+        check("a matching deployment overrides the version header", up.get("messages", [{}])[0].get("content") == "Say hi, Cy.", up)
+
+        m4 = "l88-probe-prompt-4"
+        api("POST", "/v1/chat/completions", {"model": "openai/gpt-4.1", "messages": [{"role": "user", "content": m4}]}, headers={"x-bf-prompt-id": pid, "x-bf-prompt-version": "9"})
+        got = upstream(m4)
+        up = json.loads(got[-1]["body"]) if got else {}
+        check("a pin naming no version leaves the request unchanged", len(up.get("messages", [])) == 1 and up["messages"][0]["content"] == m4, up)
+
+        s, _, b = api("GET", f"/api/prompt-repo/prompts/{pid}/versions")
+        check("versions list with the latest marked", s == 200 and json.loads(b)["total"] == 2 and json.loads(b)["versions"][1]["is_latest"] is True, b)
+        s, _, b = api("DELETE", f"/api/prompt-repo/versions/{v2_id}")
+        check("a version a deployment uses cannot be deleted", s == 409, b)
+        s, _, b = api("GET", "/api/prompt-repo/folders")
+        check("folders are not built and say so", s == 404, b)
+
+        # ---- feature flags: locked by config through an env reference ----
+        s, _, b = api("GET", "/api/feature-flags")
+        fl = json.loads(b)["flags"][0]
+        check("a flag set by config shows as file-sourced and locked", s == 200 and fl["id"] == "warp" and fl["enabled"] is False and fl["source"] == "file" and fl["locked"] is True, b)
+        s, _, b = api("PUT", "/api/feature-flags/warp", {"enabled": True})
+        check("a locked flag refuses a change", s == 409, b)
+        s, _, b = api("PUT", "/api/feature-flags/nope", {"enabled": True})
+        check("an unregistered flag is not found", s == 404, b)
+
+        # ---- webhooks: signed deliveries, retries, a permanent refusal, redelivery, rotation ----
+        s, _, b = api("POST", "/api/webhooks", {"name": "l88-http", "url": "http://hooks.example.com/x", "events": ["async_job.completed"]})
+        check("a plain http receiver is refused", s == 400 and "must be https" in b, b)
+        s, _, b = api("POST", "/api/webhooks", {"name": "l88-creds", "url": "https://user:pw@hooks.example.com/x", "events": ["async_job.completed"]})
+        check("a receiver URL with credentials is refused", s == 400 and "credentials" in b, b)
+        s, _, b = api("POST", "/api/webhooks", {"name": "l88-ok", "url": MOCK + "/webhook-receiver", "events": ["async_job.completed", "async_job.failed"], "allow_private_network": True, "include_response": True, "retry_backoff_initial_seconds": 1, "retry_backoff_max_seconds": 1, "max_retries": 2})
+        made = json.loads(b)
+        ok_id, ok_secret = made["endpoint"]["id"], made["secret"]
+        check("an endpoint is created with its secret shown once", s == 201 and ok_secret.startswith("whsec_") and ok_id.startswith("wh_"), b)
+        s, _, b = api("GET", "/api/webhooks")
+        check("the list hides the secret", s == 200 and ok_secret not in b and "whsec_" not in b, b)
+        s, _, b = api("POST", "/api/webhooks", {"name": "l88-fail", "url": MOCK + "/webhook-fail", "events": ["async_job.completed"], "allow_private_network": True, "retry_backoff_initial_seconds": 1, "retry_backoff_max_seconds": 1, "max_retries": 2})
+        fail_id = json.loads(b)["endpoint"]["id"]
+        s, _, b = api("POST", "/api/webhooks", {"name": "l88-400", "url": MOCK + "/webhook-400", "events": ["async_job.completed"], "allow_private_network": True, "retry_backoff_initial_seconds": 1, "retry_backoff_max_seconds": 1, "max_retries": 2})
+        refuse_id = json.loads(b)["endpoint"]["id"]
+        check("the failing receivers are created too", fail_id.startswith("wh_") and refuse_id.startswith("wh_"), b)
+
+        s, _, b = api("POST", f"/api/webhooks/{ok_id}/test", {"event": "async_job.completed"})
+        check("a test delivery reaches the receiver and reports its answer", s == 200 and json.loads(b)["delivered"] is True and json.loads(b)["receiver_status_code"] == 200, b)
+
+        s, _, b = api("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l88-hook-nope"}]}, headers={"x-bf-async-webhook": "nope"})
+        check("a job naming no enabled endpoint is refused before it is made", s == 400 and "no enabled webhook endpoint named nope" in b, b)
+        s, _, b = api("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l88-hook-job"}]}, headers={"x-bf-async-webhook": "l88-ok"})
+        job_id = json.loads(b)["id"]
+        check("a job naming an enabled endpoint is accepted", s == 202 and job_id.startswith("job_"), b)
+        mine = wait_for(lambda: [x for x in hooks() if x["path"] == "/webhook-receiver" and job_id in x["body"] and x["event"] == "async_job.completed"])
+        check("the outcome is delivered to the receiver", mine is not None, job_id)
+        if mine:
+            hook = mine[0]
+            payload = json.loads(hook["body"])
+            key = base64.b64decode(ok_secret[len("whsec_"):])
+            signed = (hook["id"] + "." + hook["timestamp"] + "." + hook["body"]).encode()
+            want = "v1," + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+            check("the delivery carries Standard Webhooks headers and a signature the secret verifies", hook["id"].startswith("msg_") and hook["signature"] == want, (hook["signature"], want))
+            check("the payload names the event, the job and the inline response", payload["event"] == "async_job.completed" and payload["data"]["job_id"] == job_id and payload["data"]["response"]["choices"][0]["message"]["content"] == "Hello from gpt-4o-mini", payload)
+
+        s, _, b = api("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l88-hook-fail"}]}, headers={"x-bf-async-webhook": "l88-fail"})
+        fail_rows = wait_for(lambda: [d for d in json.loads(api("GET", f"/api/webhooks/{fail_id}/deliveries")[2])["deliveries"] if d["status"] == "failed"])
+        check("a 503 is retried to the limit, then the delivery is failed", fail_rows and fail_rows[0]["attempts"] == 3 and fail_rows[0]["status_code"] == 503, fail_rows)
+        s, _, b = api("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l88-hook-400"}]}, headers={"x-bf-async-webhook": "l88-400"})
+        refuse_rows = wait_for(lambda: [d for d in json.loads(api("GET", f"/api/webhooks/{refuse_id}/deliveries")[2])["deliveries"] if d["status"] == "failed"])
+        check("a 400 is a final answer: one attempt, then failed", refuse_rows and refuse_rows[0]["attempts"] == 1 and refuse_rows[0]["status_code"] == 400, refuse_rows)
+        s, _, b = api("GET", "/api/webhooks/deliveries?status=failed")
+        check("the fleet-wide deliveries list filters by status", s == 200 and json.loads(b)["count"] >= 2, b)
+        if refuse_rows:
+            s, _, b = api("POST", f"/api/webhooks/deliveries/{refuse_rows[0]['id']}/redeliver")
+            check("a delivery can be redelivered", s == 202 and json.loads(b)["delivery_id"].startswith("dl_"), b)
+        s, _, b = api("POST", f"/api/webhooks/{ok_id}/rotate-secret")
+        new_secret = json.loads(b)["secret"] if s == 200 else ""
+        check("rotating the secret gives a new one", s == 200 and new_secret.startswith("whsec_") and new_secret != ok_secret, b)
+        s, _, b = api("DELETE", f"/api/webhooks/{refuse_id}")
+        check("an endpoint is deleted", s == 200 and api("GET", f"/api/webhooks/{refuse_id}")[0] == 404, b)
+
+        # ---- notices ----
+        s, _, b = api("POST", "/api/notifications", {"severity": "info", "title": "Maintenance", "message": "A window at 02:00.", "action_label": "Open logs", "action_path": "/workspace/logs"})
+        check("a notice is published", s == 201 and json.loads(b)["audience"] == "all", b)
+        s, _, b = api("POST", "/api/notifications", {"severity": "info", "title": "x", "message": "y", "action_label": "Open", "action_path": "https://evil.example/"})
+        check("a notice cannot send the reader off the site", s == 400 and "internal absolute path" in b, b)
+        s, _, b = api("GET", "/api/notifications?limit=1")
+        page = json.loads(b)
+        check("a page is limited and points at the next", s == 200 and len(page["notifications"]) == 1 and page.get("next_cursor", "") != "", b)
+        s, _, b = api("GET", "/api/notifications?limit=0")
+        check("a page size of zero is refused", s == 400, b)
+        s, _, b = api("GET", "/api/notifications?limit=50")
+        titles = [n["title"] for n in json.loads(b)["notifications"]]
+        check("a saved config change adds a notice of its own", "Configuration changed" in titles and "Maintenance" in titles, titles)
+    finally:
+        gw.terminate()
+
 def main():
     build()
     config = write_config()
@@ -2403,6 +2572,8 @@ def main():
         discovery_and_proxy()
         # the log sinks: their own gateway, Kafka stub and Parquet bucket, run last so their traffic stays off the other checks
         sinks_e2e(env, json.load(open(config))["providers"]["vertex"]["keys"][0]["vertex_key_config"]["auth_credentials"])
+        # prompts, webhooks, feature flags and notices: their own gateway, run after the sinks
+        l88_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

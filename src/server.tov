@@ -16,9 +16,13 @@ import { parseQuery, filterFrom, selectAll, statsView } from "./logstore"
 import { matchRoute, handleMedia, deploymentRoute, deploymentRequest } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot } from "./schemas"
-import { handleApi, proxyWidening } from "./store"
+import { handleApi, proxyWidening, Result } from "./store"
 import { passthroughPath, passthroughRoute } from "./passthrough"
 import { mcpApi } from "./mcpapi"
+import { promptRoute } from "./prompts"
+import { webhookApi, asyncSubmitHooked } from "./webhooks"
+import { flagRoute } from "./flags"
+import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
 import { McpSession } from "./mcp"
 import { Ops, Reply } from "./ops"
@@ -214,6 +218,12 @@ function logsAnalyticsPath(path: string): bool {
   return path.startsWith("/api/logs/histogram") || path.startsWith("/api/logs/rankings") || path === "/api/logs/dashboard" || path === "/api/logs/filterdata" || path === "/api/logs/dropped" || path.startsWith("/api/mcp-logs")
 }
 
+// A route's reply. A section it changed is saved first, and a failed save is the reply instead.
+function savedReply(status: int, body: string, saved: Result | undefined): Reply {
+  if (saved !== undefined && saved.kind !== "ok") return { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
+  return { status: status, body: body, contentType: "application/json" }
+}
+
 // The management API, behind RBAC; every change lands in the audit log.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const gate = ops.gate(req, path)
@@ -258,6 +268,23 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path === "/api/pricing/force-sync") {
     if (req.method === "POST") r = await ops.forcePricing()
     else r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
+  }
+  // prompt repository, webhooks, feature flags and notifications (their modules hold the logic)
+  else if (path.startsWith("/api/prompt-repo/")) {
+    const pr = promptRoute(ops.store.cfg.prompt_repo, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    r = savedReply(pr.status, pr.body, pr.next === undefined ? undefined : ops.store.setPromptRepo(pr.next))
+  }
+  else if (path === "/api/webhooks" || path.startsWith("/api/webhooks/")) {
+    const wr = await webhookApi(ops.store.cfg.webhooks, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    r = savedReply(wr.status, wr.body, wr.next === undefined ? undefined : ops.store.setWebhooks(wr.next))
+  }
+  else if (path === "/api/feature-flags" || path.startsWith("/api/feature-flags/")) {
+    const fr = flagRoute(ops.store.cfg.feature_flags, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    r = savedReply(fr.status, fr.body, fr.next === undefined ? undefined : ops.store.setFeatureFlags(fr.next))
+  }
+  else if (path === "/api/notifications") {
+    const nr = notifyRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    r = { status: nr.status, body: nr.body, contentType: "application/json" }
   }
   else {
     const mr = mcpApi(ops.store, req.method, path, body)
@@ -439,7 +466,7 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
     if (p === "/cohere/v1/tokenize") return await cors(engine.cfg, req, await cohereTokenize(engine, req))
     if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genai(engine, req, p.slice(GENAI.byteLength)))
     if (p.startsWith("/bedrock/model/") && segs.length === 5) return await cors(engine.cfg, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
-    if (p.startsWith("/v1/async/")) return await asyncSubmit(engine.jobs, req, p, dispatcher(engine))
+    if (p.startsWith("/v1/async/")) return await asyncSubmitHooked(engine.cfg.webhooks, engine.jobs, req, p, dispatcher(engine), (engine.cfg.client?.async_job_result_ttl ?? 3600) * 1000)
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)

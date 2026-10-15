@@ -10,7 +10,7 @@ import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString, b
 // Raiju's top-level keys (the Config type in config.tov), plus the Bifrost
 // sections this module reads and the pricing_sync key it writes.
 function topKeys(): string[] {
-  return ["encryption_key", "client", "providers", "governance", "cache", "pricing", "prompt_cache", "health", "guardrails", "logs_store", "otel", "mcp", "plugins", "semantic_cache", "vector_store", "secrets", "audit", "alerts", "session_affinity", "complexity_router", "mcp_server", "virtual_mcps", "log_exports", "exporters", "cluster", "oidc", "framework", "auth_config", "alerting", "audit_logs", "cluster_config", "circuit_breaker_config", "load_balancer_config", "pricing_sync", "guardrails_config", "$schema", "auth_proxy", "scim_config"]
+  return ["encryption_key", "client", "providers", "governance", "cache", "pricing", "prompt_cache", "health", "guardrails", "logs_store", "otel", "mcp", "plugins", "semantic_cache", "vector_store", "secrets", "audit", "alerts", "session_affinity", "complexity_router", "mcp_server", "virtual_mcps", "log_exports", "exporters", "cluster", "oidc", "framework", "auth_config", "alerting", "audit_logs", "cluster_config", "circuit_breaker_config", "load_balancer_config", "pricing_sync", "guardrails_config", "$schema", "auth_proxy", "scim_config", "prompt_repo", "webhooks", "feature_flags"]
 }
 
 // Raiju's keys one level down. client also takes the two keys normalize maps.
@@ -61,8 +61,6 @@ function noteTable(): Map<string, string> {
     ["server", "is not used: Raiju takes -host and -port on the command line; read_buffer_size, a2a_* and plugin_download_* have no Raiju counterpart"],
     ["websocket", "is accepted but not applied: Raiju's WebSocket limits are fixed in src/ws.tov"],
     ["large_payload_optimization", "is not implemented: Raiju buffers request bodies up to client.max_request_body_size_mb"],
-    ["feature_flags", "is not implemented: Raiju has no feature-flag registry"],
-    ["webhooks", GEN],
     ["agents", "is not implemented: Raiju has no agent gateway (A2A)"],
     ["config_store", "is not used: Raiju saves its config to the file given by -config"],
     ["skills_registry", GEN],
@@ -73,7 +71,7 @@ function noteTable(): Map<string, string> {
     ["client.retain_content_in_object_storage", "is not used: Raiju has no object storage"],
     ["client.disable_db_pings_in_health", "is not used: Raiju has no database"],
     ["client.dump_errors_in_console_logs", GEN],
-    ["client.webhook_config", GEN],
+    ["client.webhook_config", "is not implemented: Raiju keeps the last 500 deliveries in memory, so there is no retention setting"],
     ["client.dual_credential_conflict_behavior", GEN],
     ["client.extra_fields_placement", GEN],
     ["client.enforce_scim_auth", "is out of scope: SCIM (SCOPE.md)"],
@@ -1022,11 +1020,11 @@ function mapCompat(f: Field[], pname: string, inout top: Field[], inout notes: s
   notes.push(`config: plugin "${pname}" read into "client": compat`)
 }
 
-// Bifrost's prompts plugin serves prompts from its config store. Raiju has no prompt library,
-// so the plugin is noted and not loaded, and each config key is noted too.
+// Bifrost's prompts plugin is Raiju's prompt repository (prompt_repo, prompts.tov), which is always on
+// for chat requests. The plugin's own config keys are not read, and each is noted.
 function mapPrompts(f: Field[], pname: string, inout notes: string[]): void throws SyntaxError {
   if (offPlugin(f, pname, &notes)) return
-  notes.push(`config: plugin "${pname}" is not loaded: Raiju has no prompt library, so stored prompt versions are not added to chat and Responses requests`)
+  notes.push(`config: plugin "${pname}" is not loaded as a plugin: Raiju's prompt repository is always on (prompt_repo) and applies to chat requests only`)
   for (const k of try members(find(f, "config"))) {
     notes.push(`config: "plugins[${pname}].config.${k.key}" is not supported by Raiju and is ignored`)
   }
@@ -1094,9 +1092,48 @@ function mapPlugins(inout top: Field[], inout notes: string[]): void throws Synt
 // original text for anything written back to the config store. notes says what
 // was renamed, what was kept because Raiju already had the section, and what
 // could not be mapped.
+// A webhook secret or header value in Bifrost's object form ({value, env_var, from_env}) as the
+// string Raiju reads: an env reference becomes "env.NAME", anything else its value. undefined when
+// the raw value is already a string.
+function plainValue(raw: string): string | undefined throws SyntaxError {
+  if (!raw.startsWith("{")) return undefined
+  const sf = try fields(raw)
+  const envVar = rawStr(sf, "env_var") ?? ""
+  if (rawBool(sf, "from_env") === true && envVar !== "") return quote("env." + envVar)
+  return quote(rawStr(sf, "value") ?? "")
+}
+
+// The webhooks section with its secrets and header values in the string form (see plainValue).
+function mapWebhooks(inout top: Field[]): void throws SyntaxError {
+  const raw = find(top, "webhooks")
+  if (raw === undefined || !raw.startsWith("[")) return
+  let out: string[] = []
+  for (const el of try items(raw)) {
+    let ef = try members(el)
+    const sec = find(ef, "secret")
+    if (sec !== undefined) {
+      const plain = try plainValue(sec)
+      if (plain !== undefined) setField(&ef, "secret", plain)
+    }
+    const hraw = find(ef, "headers")
+    if (hraw !== undefined && hraw.startsWith("{")) {
+      const orig = try members(hraw)
+      let hf = orig
+      for (const h of orig) {
+        const plain = try plainValue(h.raw)
+        if (plain !== undefined) setField(&hf, h.key, plain)
+      }
+      setField(&ef, "headers", build(hf))
+    }
+    out.push(build(ef))
+  }
+  setField(&top, "webhooks", "[" + out.join(",") + "]")
+}
+
 export function normalize(configText: string): { text: string, notes: string[] } throws SyntaxError {
   let top = try fields(configText)
   let notes: string[] = []
+  try mapWebhooks(&top)
   try mapAuth(&top, &notes)
   try mapClient(&top, &notes)
   try mapMcp(&top, &notes)
@@ -1814,7 +1851,7 @@ test("the compat plugin's features are read into client.compat; prompts are note
   expect(r.notes.some((n) => n.includes("no decision is emulated"))).toBe(true)
   expect(r.notes.includes(`config: "plugins[compat].config.retain_it" is not supported by Raiju and is ignored`)).toBe(true)
   expect(r.notes.some((n) => n.includes(`"plugins[compat].config.convert_text_to_chat"`))).toBe(false)
-  expect(r.notes.some((n) => n.startsWith(`config: plugin "prompts" is not loaded: Raiju has no prompt library`))).toBe(true)
+  expect(r.notes.some((n) => n.startsWith(`config: plugin "prompts" is not loaded as a plugin: Raiju's prompt repository is always on`))).toBe(true)
   expect(r.notes.includes(`config: "plugins[prompts].config.store_path" is not supported by Raiju and is ignored`)).toBe(true)
 })
 
@@ -1857,11 +1894,18 @@ test("notes name each Bifrost section Raiju does not read", () => {
   expect(w.includes(`config: "setup_token" is not used: Raiju has no setup-token gate for the first admin account`)).toBe(true)
   expect(w.includes(`config: "websocket" is accepted but not applied: Raiju's WebSocket limits are fixed in src/ws.tov`)).toBe(true)
   expect(w.includes(`config: "large_payload_optimization" is not implemented: Raiju buffers request bodies up to client.max_request_body_size_mb`)).toBe(true)
-  expect(w.includes(`config: "feature_flags" is not implemented: Raiju has no feature-flag registry`)).toBe(true)
+  expect(w.some((x) => x.includes(`"feature_flags"`))).toBe(false)
   expect(w.includes(`config: "version" has no effect: Raiju reads its config file as written`)).toBe(true)
   expect(w.some((x) => x.includes(`"client.compat"`))).toBe(false)
   expect(w.some((x) => x.includes(`"access_profiles" is not read`))).toBe(true)
   expect(w.some((x) => x.includes(`"encryption_key"`))).toBe(false)
+})
+
+test("webhook secrets and headers in Bifrost's object form become strings", () => {
+  const r = try normalize(`{ "webhooks": [{ "name": "a", "url": "https://h.example.com", "events": ["async_job.completed"], "secret": { "from_env": true, "env_var": "HOOK_SECRET" }, "headers": { "X-Key": { "value": "plain-value" }, "X-Plain": "kept" } }] }`)
+  expect(r.text.includes(`"secret":"env.HOOK_SECRET"`)).toBe(true)
+  expect(r.text.includes(`"X-Key":"plain-value"`)).toBe(true)
+  expect(r.text.includes(`"X-Plain":"kept"`)).toBe(true)
 })
 
 test("sink plugins become exporters: bigquery and pubsub fields, content, and the ignored rest", () => {

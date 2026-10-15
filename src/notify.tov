@@ -1,0 +1,210 @@
+// In-app notifications (Bifrost's /api/notifications): short notices for the dashboard.
+//
+// Bifrost publishes a notice by hand (POST /api/notifications, admins only) and from one
+// automatic source, the virtual key expiry cleanup, which Raiju does not have. Raiju adds three
+// automatic sources of its own: alerts firing or resolving (ops.tov tick), a budget found used
+// up (once an hour per budget) and each saved configuration change (store.tov commit).
+//
+// The dashboard keeps what was read or dismissed, as Bifrost does; the gateway holds only the
+// list. The list lives in memory: the newest 500 notices, each kept 30 days, and each worker
+// process has its own. Audience is always all, since Raiju has no per-role notices. POST is
+// behind the management route gate, which allows only admins to write.
+import { Field, fields, rawStr } from "./json"
+import { newId } from "./schemas"
+import { isoMs } from "./exports"
+
+export type Notice = {
+  id: string,
+  audience: string,
+  severity: string,
+  title: string,
+  message: string,
+  action_label?: string,
+  action_path?: string,
+  created_at: int,
+  expires_at: int,
+}
+
+// What a publisher gives: the text and, optionally, a link for the dashboard to show.
+export type NoticeInput = { severity: string, title: string, message: string, action_label?: string, action_path?: string }
+
+const RETENTION_MS = 30 * 24 * 3600 * 1000
+const CAP = 500
+const SEVERITIES = ["info", "success", "warning", "error"]
+
+export class NoticeList {
+  items: Notice[] = []
+  // when each key was last published, for once()
+  seen: Map<string, int> = new Map()
+
+  add(input: NoticeInput, now: int): Notice {
+    const n: Notice = { id: newId("nt_"), audience: "all", severity: input.severity, title: input.title, message: input.message, action_label: input.action_label, action_path: input.action_path, created_at: now, expires_at: now + RETENTION_MS }
+    this.items.push(n)
+    this.prune(now)
+    return n
+  }
+
+  // Drops the expired notices, then the oldest beyond the cap.
+  prune(now: int): void {
+    this.items = this.items.filter((x) => x.expires_at > now)
+    if (this.items.length > CAP) this.items = this.items.slice(this.items.length - CAP)
+  }
+
+  // Publishes unless the same key was published less than window ms ago (a check that runs on every
+  // tick would otherwise repeat a budget notice every tick).
+  once(key: string, window: int, input: NoticeInput, now: int): void {
+    const last = this.seen.get(key)
+    if (last !== undefined && now - last < window) return
+    this.seen.set(key, now)
+    this.add(input, now)
+  }
+
+  // One page, newest first. cursor is the offset the previous page ended at ("" for the first).
+  page(limit: int, cursor: int): { items: Notice[], next: int } {
+    const newest: Notice[] = this.items.slice().reverse()
+    const out = newest.slice(cursor, cursor + limit)
+    const next = cursor + out.length
+    return { items: out, next: next < newest.length ? next : -1 }
+  }
+}
+
+let listInstance: NoticeList | undefined = undefined
+
+// The process's notice list (created on first use: top-level statements in imported modules do not run).
+export function noticeList(): NoticeList {
+  let l = listInstance
+  if (l === undefined) {
+    l = new NoticeList()
+    listInstance = l
+  }
+  return l
+}
+
+// Publishes a notice now.
+export function notify(input: NoticeInput): void {
+  noticeList().add(input, Math.floor(Date.now()))
+}
+
+// Publishes a notice unless its key was published within the window.
+export function notifyOnce(key: string, windowMs: int, input: NoticeInput): void {
+  noticeList().once(key, windowMs, input, Math.floor(Date.now()))
+}
+
+function noticeJson(n: Notice): string {
+  const parts = [`"id":${JSON.stringify(n.id)}`, `"audience":${JSON.stringify(n.audience)}`, `"severity":${JSON.stringify(n.severity)}`, `"title":${JSON.stringify(n.title)}`, `"message":${JSON.stringify(n.message)}`]
+  if (n.action_label !== undefined && n.action_label !== "") parts.push(`"action_label":${JSON.stringify(n.action_label)}`)
+  if (n.action_path !== undefined && n.action_path !== "") parts.push(`"action_path":${JSON.stringify(n.action_path)}`)
+  parts.push(`"created_at":${JSON.stringify(isoMs(n.created_at))}`)
+  parts.push(`"expires_at":${JSON.stringify(isoMs(n.expires_at))}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// The fields of a JSON object body, or undefined when it is not one.
+function objectFieldsOf(body: string): Field[] | undefined {
+  if (!body.startsWith("{")) return undefined
+  try {
+    return fields(body)
+  } catch (e) {
+    return undefined
+  }
+}
+
+function textOf(fs: Field[], key: string): string | undefined {
+  return rawStr(fs, key)
+}
+
+// An action path must stay inside the dashboard: an absolute path with no leading "//", and no
+// backslash (browsers read "\" as "/", so "/\evil.example" would leave the site).
+function internalPath(p: string): bool {
+  if (!p.startsWith("/") || p.startsWith("//")) return false
+  return !p.includes("\\") && !p.toLowerCase().includes("%5c")
+}
+
+// The notice a publish body asks for, or why it is refused. The checks are Bifrost's: title and
+// message are required (judged trimmed) and capped in bytes, the action label and path come
+// together, and the path is internal.
+export function inputOf(body: string): { input: NoticeInput | undefined, error: string } {
+  const fs = objectFieldsOf(body)
+  if (fs === undefined) return { input: undefined, error: "invalid request payload" }
+  const sev = textOf(fs, "severity") ?? ""
+  const title = textOf(fs, "title") ?? ""
+  const message = textOf(fs, "message") ?? ""
+  const audience = textOf(fs, "audience") ?? "all"
+  const label = textOf(fs, "action_label") ?? ""
+  const apath = textOf(fs, "action_path") ?? ""
+  const bad = (m: string): { input: NoticeInput | undefined, error: string } => ({ input: undefined, error: m })
+  if (!SEVERITIES.includes(sev)) return bad("severity must be info, success, warning or error")
+  if (title.trim() === "" || title.byteLength > 160) return bad("title is required and at most 160 bytes")
+  if (message.trim() === "" || message.byteLength > 4000) return bad("message is required and at most 4000 bytes")
+  if (audience !== "all") return bad("audience must be all: Raiju has no per-role notices")
+  const hasLabel = label.trim() !== ""
+  const hasPath = apath.trim() !== ""
+  if (hasLabel !== hasPath) return bad("action_label and action_path must be provided together")
+  if (hasPath && !internalPath(apath)) return bad("action_path must be an internal absolute path")
+  const input: NoticeInput = { severity: sev, title: title, message: message, action_label: hasLabel ? label : undefined, action_path: hasPath ? apath : undefined }
+  return { input: input, error: "" }
+}
+
+function fail(status: int, message: string): { status: int, body: string } {
+  return { status: status, body: JSON.stringify({ error: { message: message, type: "invalid_request_error" } }) }
+}
+
+// Parses the query's limit and cursor. limit is 1 to 50, default 50.
+function pageParams(query: string): { limit: int, cursor: int, error: string } {
+  const sp = new URLSearchParams(query)
+  const rawLimit = sp.get("limit") ?? ""
+  let limit = 50
+  if (rawLimit !== "") {
+    const n = parseInt(rawLimit)
+    if (n === undefined || n < 1) return { limit: 0, cursor: 0, error: "limit must be a positive integer" }
+    limit = Math.min(n, 50)
+  }
+  const rawCursor = sp.get("cursor") ?? ""
+  let cursor = 0
+  if (rawCursor !== "") {
+    const c = parseInt(rawCursor)
+    if (c === undefined || c < 0) return { limit: 0, cursor: 0, error: "cursor is not valid" }
+    cursor = c
+  }
+  return { limit: limit, cursor: cursor, error: "" }
+}
+
+// Routes /api/notifications: GET lists the notices, POST publishes one.
+export function notifyRoute(method: string, path: string, body: string): { status: int, body: string } {
+  const q = path.indexOf("?")
+  const query = q < 0 ? "" : path.slice(q + 1)
+  if (method === "GET") {
+    const pp = pageParams(query)
+    if (pp.error !== "") return fail(400, pp.error)
+    const page = noticeList().page(pp.limit, pp.cursor)
+    const items: string[] = []
+    for (const n of page.items) items.push(noticeJson(n))
+    const cursor = page.next < 0 ? "" : `,"next_cursor":"${page.next}"`
+    return { status: 200, body: `{"notifications":[${items.join(",")}]${cursor}}` }
+  }
+  if (method !== "POST") return fail(405, `method ${method} is not allowed here`)
+  const got = inputOf(body)
+  if (got.input === undefined) return fail(400, got.error)
+  const made = noticeList().add(got.input, Math.floor(Date.now()))
+  return { status: 201, body: noticeJson(made) }
+}
+
+// ---- tests ----
+
+test("a publish body is checked as Bifrost checks it", () => {
+  const ok = inputOf(`{"severity":"info","title":"Heads up","message":"Done.","action_label":"Open","action_path":"/workspace/logs"}`)
+  expect(ok.error).toBe("")
+  expect(ok.input!.action_path).toBe("/workspace/logs")
+  expect(inputOf(`{"severity":"loud","title":"x","message":"y"}`).error).toBe("severity must be info, success, warning or error")
+  expect(inputOf(`{"severity":"info","title":"   ","message":"y"}`).error.startsWith("title is required")).toBe(true)
+  expect(inputOf(`{"severity":"info","title":"` + "t".repeat(161) + `","message":"y"}`).error.startsWith("title is required")).toBe(true)
+  expect(inputOf(`{"severity":"info","title":"x","message":"` + "m".repeat(4001) + `"}`).error.startsWith("message is required")).toBe(true)
+  expect(inputOf(`{"severity":"info","title":"x","message":"y","audience":"roles"}`).error.startsWith("audience must be all")).toBe(true)
+  expect(inputOf(`{"severity":"info","title":"x","message":"y","action_label":"Open"}`).error).toBe("action_label and action_path must be provided together")
+  expect(inputOf(`{"severity":"info","title":"x","message":"y","action_path":"/x"}`).error).toBe("action_label and action_path must be provided together")
+  expect(inputOf(`{"severity":"info","title":"x","message":"y","action_label":"A","action_path":"https://evil.example/x"}`).error.startsWith("action_path must be an internal")).toBe(true)
+  expect(inputOf(`{"severity":"info","title":"x","message":"y","action_label":"A","action_path":"//evil.example"}`).error.startsWith("action_path must be an internal")).toBe(true)
+  expect(inputOf(`{"severity":"info","title":"x","message":"y","action_label":"A","action_path":"/\\\\evil.example"}`).error.startsWith("action_path must be an internal")).toBe(true)
+  expect(inputOf(`{"severity":"info","title":"x","message":"y","action_label":"A","action_path":"/a%5Cb"}`).error.startsWith("action_path must be an internal")).toBe(true)
+  expect(inputOf("[]").error).toBe("invalid request payload")
+})
