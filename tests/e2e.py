@@ -168,6 +168,8 @@ def write_config():
     cfg["providers"]["bedrock_arn"] = {"custom_provider_config": {"base_provider_type": "bedrock"}, "keys": [{"name": "bk-arn", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1", "arn": "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"}}], "network_config": {"base_url": MOCK}}
     cfg["providers"]["bedrock_oai"] = {"custom_provider_config": {"base_provider_type": "bedrock"}, "keys": [{"name": "bk-oai", "value": "bedrock-api-key", "models": [], "weight": 1.0, "bedrock_key_config": {"region": "us-east-1", "use_openai_endpoints": True}}], "network_config": {"base_url": MOCK}}
     cfg["providers"]["bedrock_mantle"] = {"keys": [{"name": "mk", "value": "mantle-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK}}
+    # Bedrock files and batches: S3 and the job API on the mock, with a batch role and a default batch bucket
+    cfg["providers"]["bedrock_batch"] = {"custom_provider_config": {"base_provider_type": "bedrock"}, "keys": [{"name": "bk-batch", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1", "batch_role_arn": "arn:aws:iam::123456789012:role/batch", "batch_s3_config": {"buckets": [{"bucket_name": "e2e-files", "prefix": "jobs", "is_default": True}]}}}], "network_config": {"base_url": MOCK}}
     path = os.path.join(BUILD, "e2e.config.json")
     json.dump(cfg, open(path, "w"))
     # a second node of the same cluster, without the file-writing features
@@ -1064,6 +1066,77 @@ def main():
         s, _, b = call("GET", "/v1/batches/" + abid + "/results", headers={"x-bf-provider": "anthropic"})
         ares = json.loads(b) if s == 200 else {}
         check("anthropic batch results as Bifrost's results body", s == 200 and ares.get("batch_id") == abid and [x["custom_id"] for x in ares.get("results", [])] == ["c1"] and ares["results"][0]["response"]["status_code"] == 200 and ares["results"][0]["response"]["body"]["choices"][0]["message"]["content"] == "Batch reply from claude-sonnet-4", (s, b[:300]))
+
+        # Vertex files on Cloud Storage, and a Batch Prediction job that reads and writes the bucket
+        vg = {"x-bf-provider": "vertex"}
+        vin = bline("v1", "gemini-2.5-flash") + "\n" + bline("v2", "gemini-2.5-flash") + "\n"
+        s, b = multipart("/v1/files", "vertex.jsonl", vin.encode(), {"purpose": "batch", "gcs_bucket": "e2e-gcs", "gcs_prefix": "in"}, vg)
+        vf = jget(b) if s == 200 else {}
+        vfid = vf.get("id", "")
+        check("vertex file upload goes to Cloud Storage as a gs:// file", s == 200 and vfid.startswith("gs://e2e-gcs/in/vertex-files/") and vf.get("bytes") == len(vin.encode()) and vf.get("object") == "file", (s, b))
+        check("vertex files are uploaded as media with the service account's token", seen()[-1]["path"].startswith("/upload/storage/v1/b/e2e-gcs/o?uploadType=media&name=in%2Fvertex-files%2F") and seen()[-1]["auth"] == "Bearer ya29.test-token", seen()[-1])
+        vfq = urllib.parse.quote(vfid, safe="")
+        s, _, b = call("GET", "/v1/files/" + vfq, headers=vg)
+        check("vertex file retrieve reads the object's metadata", s == 200 and jget(b).get("id") == vfid and jget(b).get("filename") == "vertex.jsonl", (s, b))
+        s, _, b = call("GET", "/v1/files/" + vfq + "/content", headers=vg)
+        check("vertex file content is the uploaded bytes", s == 200 and b == vin, (s, b[:200]))
+        s, _, b = call("GET", "/v1/files?gcs_bucket=e2e-gcs&gcs_prefix=in", headers=vg)
+        check("vertex files list the bucket and prefix", s == 200 and any(x.get("id") == vfid for x in jget(b).get("data", [])), (s, b[:300]))
+        s, _, b = call("POST", "/v1/batches", {"input_file_id": vfid, "endpoint": "/v1/chat/completions", "completion_window": "24h", "output_folder": {"url": "gs://e2e-gcs-out/d"}, "display_name": "nightly"}, vg)
+        vb = jget(b) if s == 200 else {}
+        vbid = vb.get("id", "")
+        check("vertex batch creates a job on the uploaded file", s == 200 and vbid != "" and vb.get("status") == "validating" and vb.get("output_file_id") == "raiju-batch-output-" + vbid, (s, b))
+        ups = [x for x in seen() if x["path"].startswith("/upload/storage/v1/b/e2e-gcs/o?uploadType=media&name=vertex-batch-input%2F")]
+        check("vertex batch input is written to the bucket in Vertex's instance shape", ups and '"labels":{"bifrost_custom_id":"v1"}' in ups[-1]["body"] and '"bifrost_custom_id":"v2"' in ups[-1]["body"], ups[-1:])
+        jobs = [x for x in seen() if x["path"] == "/v1/projects/proj/locations/us-central1/batchPredictionJobs" and x["body"].startswith('{"displayName":"nightly"')]
+        check("vertex job reads the converted input and writes to output_folder", jobs and '"uris":["gs://e2e-gcs/vertex-batch-input/' in jobs[-1]["body"] and '"outputUriPrefix":"gs://e2e-gcs-out/d"' in jobs[-1]["body"] and '"model":"publishers/google/models/gemini-2.5-flash"' in jobs[-1]["body"], jobs[-1:])
+        s, _, b = call("GET", "/v1/batches/" + vbid, headers=vg)
+        check("vertex batch retrieve is completed with its counts", s == 200 and jget(b).get("status") == "completed" and jget(b).get("request_counts", {}).get("completed") == 2, (s, b))
+        s, _, b = call("GET", "/v1/files/raiju-batch-output-" + vbid + "/content", headers=vg)
+        vout = [json.loads(x) for x in b.split("\n") if x.strip()]
+        check("vertex batch output is OpenAI's batch output", s == 200 and [x["custom_id"] for x in vout] == ["v1", "v2"] and vout[0]["response"]["body"]["choices"][0]["message"]["content"] == "Batch reply from gemini", (s, b[:400]))
+        s, _, b = call("GET", "/v1/batches/" + vbid + "/results", headers=vg)
+        check("vertex batch results as Bifrost's results body", s == 200 and jget(b).get("batch_id") == vbid and len(jget(b).get("results", [])) == 2, (s, b[:300]))
+        s, _, b = call("GET", "/v1/batches?limit=5", headers=vg)
+        check("vertex batches list", s == 200 and any(x.get("id") == vbid for x in jget(b).get("data", [])), (s, b[:300]))
+        s, _, b = call("POST", "/v1/batches/" + vbid + "/cancel", headers=vg)
+        check("vertex batch cancel answers the job's new state", s == 200 and jget(b).get("status") == "cancelled", (s, b))
+        # Bedrock files on S3 under the key's default batch bucket, and a model invocation job
+        bg = {"x-bf-provider": "bedrock_batch"}
+        bin_ = bline("b1", "anthropic.claude-3-haiku-20240307-v1:0") + "\n"
+        s, b = multipart("/v1/files", "bedrock.jsonl", bin_.encode(), {"purpose": "batch"}, bg)
+        bf = jget(b) if s == 200 else {}
+        bfid = bf.get("id", "")
+        check("bedrock file upload goes to S3 under the batch bucket's prefix", s == 200 and bfid.startswith("s3://e2e-files/jobs/") and bf.get("bytes") == len(bin_.encode()), (s, b))
+        check("bedrock file upload is signed for S3", seen()[-1]["path"].startswith("/e2e-files/jobs/") and seen()[-1]["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") and "/us-east-1/s3/aws4_request" in seen()[-1]["auth"], seen()[-1])
+        bfq = urllib.parse.quote(bfid, safe="")
+        s, _, b = call("GET", "/v1/files/" + bfq, headers=bg)
+        check("bedrock file retrieve is the S3 object's metadata", s == 200 and jget(b).get("id") == bfid and jget(b).get("bytes") == len(bin_.encode()), (s, b))
+        s, _, b = call("GET", "/v1/files/" + bfq + "/content", headers=bg)
+        check("bedrock file content is the S3 object", s == 200 and b == bin_, (s, b[:200]))
+        s, _, b = call("GET", "/v1/files?s3_bucket=e2e-files&s3_prefix=jobs/", headers=bg)
+        check("bedrock files list the bucket's prefix", s == 200 and any(x.get("id") == bfid for x in jget(b).get("data", [])), (s, b[:300]))
+        s, _, b = call("POST", "/v1/batches", {"input_file_id": bfid, "endpoint": "/v1/chat/completions", "completion_window": "24h", "metadata": {"job_name": "e2e-job"}}, bg)
+        bb = jget(b) if s == 200 else {}
+        bbid = bb.get("id", "")
+        check("bedrock batch writes records to S3 and creates the job", s == 200 and bbid != "" and bb.get("status") == "completed" and bb.get("output_file_id") == "raiju-batch-output-" + bbid, (s, b))
+        jobs = [x for x in seen() if x["path"] == "/model-invocation-job" and '"jobName":"e2e-job"' in x["body"]]
+        check("bedrock job runs as the batch role, reads the records and writes under the default batch prefix", jobs and '"roleArn":"arn:aws:iam::123456789012:role/batch"' in jobs[-1]["body"] and '"s3Uri":"s3://e2e-files/jobs/"' in jobs[-1]["body"] and '"s3InputFormat":"JSONL"' in jobs[-1]["body"] and '"modelId":"anthropic.claude-3-haiku-20240307-v1:0"' in jobs[-1]["body"], jobs[-1:])
+        recs = [x for x in seen() if x["path"].startswith("/e2e-files/bedrock-batch-input/")]
+        check("bedrock records are Bedrock's shape with Claude's version, and no model", recs and '"recordId":"b1"' in recs[-1]["body"] and '"anthropic_version":"bedrock-2023-05-31"' in recs[-1]["body"] and '"model":' not in recs[-1]["body"], recs[-1:])
+        s, _, b = call("GET", "/v1/files/raiju-batch-output-" + bbid + "/content", headers=bg)
+        bout = [json.loads(x) for x in b.split("\n") if x.strip()]
+        check("bedrock batch output is OpenAI's batch output", s == 200 and [x["custom_id"] for x in bout] == ["b1"] and bout[0]["response"]["body"]["choices"][0]["message"]["content"] == "Batch reply from anthropic.claude-3-haiku-20240307-v1:0", (s, b[:400]))
+        s, _, b = call("GET", "/v1/batches/" + bbid, headers=bg)
+        check("bedrock batch retrieve", s == 200 and jget(b).get("id") == bbid and jget(b).get("status") == "completed", (s, b))
+        s, _, b = call("GET", "/v1/batches/" + bbid + "/results", headers=bg)
+        check("bedrock batch results as Bifrost's results body", s == 200 and jget(b).get("results", [{}])[0].get("custom_id") == "b1", (s, b[:300]))
+        s, _, b = call("GET", "/v1/batches", headers=bg)
+        check("bedrock batches list", s == 200 and any(x.get("id") == bbid for x in jget(b).get("data", [])), (s, b[:300]))
+        s, _, b = call("POST", "/v1/batches/" + bbid + "/cancel", headers=bg)
+        check("bedrock batch cancel stops the job", s == 200 and jget(b).get("status") == "cancelled", (s, b))
+        s, _, b = call("DELETE", "/v1/files/" + bfq, headers=bg)
+        check("bedrock file delete answers OpenAI's delete object", s == 200 and jget(b) == {"id": bfid, "object": "file", "deleted": True}, (s, b))
 
         # Management API: admin auth, CRUD, hot reload, secrets kept out of the file
         s, _, _ = call("GET", "/api/config", auth=False)

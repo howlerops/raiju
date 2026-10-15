@@ -9,11 +9,13 @@ import { Config, KeyConfig, providerOf } from "./config"
 import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf } from "./providers/types"
 import { isOpenAICompatible, modelsRequest } from "./providers/openai"
 import { parseModel, target, kindOf, pickKey, timeoutMs } from "./router"
-import { fields, find, rawStr, setField, build, quote } from "./json"
+import { Field, fields, find, rawStr, setField, build, quote } from "./json"
 import { errorJson, snapshot } from "./schemas"
 import { deadline } from "./deadline"
 import * as native from "./media_native"
 import * as cloud from "./media_cloud"
+import * as cloudAuth from "./cloud_auth"
+import { S3Creds } from "./exports"
 import { parseServiceAccount } from "./providers/vertex"
 
 export type MediaRoute = { op: string, method: string, upstreamPath: string, modelIn: "json" | "form" | "none" }
@@ -385,7 +387,7 @@ function lastPart(s: string): string {
 // The id in a route's path: "/files/{id}/content" and "/batches/{id}" both give it.
 function routeId(route: MediaRoute): string {
   const parts = route.upstreamPath.split("/")
-  return parts[2] ?? ""
+  return cloud.pctDecode(parts[2] ?? "")
 }
 
 // The model of the first request in a batch input file, without its provider prefix.
@@ -415,8 +417,8 @@ function filePart(form: FormData | undefined): File | undefined {
 async function nativeMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> {
   try {
     if (t.kind === "anthropic") return await anthropicMedia(t, route, qs, text, form)
-    if (t.kind === "vertex") return await vertexMedia(t, route, text)
-    if (t.kind === "bedrock") return await bedrockMedia(t, route, text)
+    if (t.kind === "vertex") return await vertexMedia(t, route, qs, text, form)
+    if (t.kind === "bedrock") return await bedrockMedia(t, route, qs, text, form)
     return await geminiMedia(t, route, qs, text, form)
   } catch (e) {
     return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
@@ -470,8 +472,374 @@ async function vertexBearer(t: Target): Promise<string> throws SyntaxError | Err
   return cloud.VERTEX_TOKENS.get(sa.client_email, now) ?? ""
 }
 
-// Vertex serves image generation here; its other media is not in this gateway yet.
-async function vertexMedia(t: Target, route: MediaRoute, text: string): Promise<Response> throws SyntaxError | Error {
+// Vertex's files are Cloud Storage objects (gs://bucket/object) and its batches are Batch
+// Prediction jobs. A batch's input is read from its bucket, converted to Vertex's instances and
+// written beside it; the job writes its predictions under output_folder. gcs_bucket and
+// gcs_prefix name the bucket of a new file or of a listing.
+async function vertexStore(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  const id = routeId(route)
+  const sp = new URLSearchParams(qs)
+  try {
+    const base = try cloud.vertexLocation(t)
+    if (base === "") return errorReply(400, "vertex: batch jobs need a location", "invalid_request_error")
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  let token = ""
+  try {
+    token = try await vertexBearer(t)
+  } catch (e) {
+    return errorReply(502, `vertex authentication failed: ${e.message}`, "authentication_error")
+  }
+  if (route.op === "files.create") {
+    const f = filePart(form)
+    if (f === undefined) return errorReply(400, "the request needs a \"file\" part", "invalid_request_error")
+    const bucket = formText(form, "gcs_bucket")
+    if (bucket === "") return errorReply(400, "gcs_bucket is required to store a Vertex file", "invalid_request_error")
+    const name = cloud.gcsObjectName(formText(form, "gcs_prefix"), f.name)
+    const up = await send(t, cloud.gcsUpload(t, token, bucket, name, try await f.text(), "application/jsonl"))
+    if (!up.ok) return up
+    return jsonReply(try cloud.gcsFileToOpenAI(try await up.text(), bucket))
+  }
+  if (route.op === "files.list") {
+    const bucket = sp.get("gcs_bucket") ?? ""
+    if (bucket === "") return errorReply(400, "gcs_bucket is required to list Vertex files", "invalid_request_error")
+    const up = await send(t, cloud.gcsList(t, token, bucket, sp.get("gcs_prefix") ?? "", sp.get("limit") ?? "", sp.get("after") ?? ""))
+    if (!up.ok) return up
+    return jsonReply(try cloud.gcsFileListToOpenAI(try await up.text(), bucket))
+  }
+  if (route.op === "files.content" && id.startsWith(OUTPUT_PREFIX)) return try await vertexBatchOutput(t, token, id.slice(OUTPUT_PREFIX.byteLength))
+  if (route.op === "files.retrieve" || route.op === "files.delete" || route.op === "files.content") {
+    let loc = { bucket: "", key: "" }
+    try {
+      loc = try cloud.gsParse(id)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (route.op === "files.content") return await send(t, cloud.gcsObject(t, token, loc.bucket, loc.key, "GET", true))
+    if (route.op === "files.delete") {
+      const del = await send(t, cloud.gcsObject(t, token, loc.bucket, loc.key, "DELETE", false))
+      if (!del.ok) return del
+      return jsonReply(cloud.deletedToOpenAI(id))
+    }
+    const meta = await send(t, cloud.gcsObject(t, token, loc.bucket, loc.key, "GET", false))
+    if (!meta.ok) return meta
+    return jsonReply(try cloud.gcsFileToOpenAI(try await meta.text(), loc.bucket))
+  }
+  if (route.op === "batches.create") return try await vertexBatchCreate(t, token, text)
+  if (route.op === "batches.list") {
+    const up = await send(t, try cloud.vertexJobList(t, token, sp.get("limit") ?? "", sp.get("after") ?? ""))
+    if (!up.ok) return up
+    return jsonReply(try cloud.vertexJobListToOpenAI(try await up.text()))
+  }
+  if (route.op === "batches.retrieve") {
+    const up = await send(t, try cloud.vertexJobGet(t, token, id))
+    if (!up.ok) return up
+    return jsonReply(try cloud.vertexJobToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
+  }
+  if (route.op === "batches.cancel") {
+    const cancel = await send(t, try cloud.vertexJobCancel(t, token, id))
+    if (!cancel.ok) return cancel
+    const up = await send(t, try cloud.vertexJobGet(t, token, id))
+    if (!up.ok) return up
+    return jsonReply(try cloud.vertexJobToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
+  }
+  if (route.op === "batches.results") {
+    const out = try await vertexBatchOutput(t, token, id)
+    if (!out.ok) return out
+    return jsonReply(try native.batchResultsDoc(id, try await out.text()))
+  }
+  return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
+}
+
+// POST /v1/batches on Vertex: the input file's lines become Vertex instances, which are written to
+// the input's bucket, and a Batch Prediction job reads them and writes to output_folder.
+async function vertexBatchCreate(t: Target, token: string, text: string): Promise<Response> throws SyntaxError | Error {
+  let fs: Field[] = []
+  try {
+    fs = try fields(text)
+  } catch (e) {
+    return errorReply(400, "the request body must be a JSON object", "invalid_request_error")
+  }
+  let inLoc = { bucket: "", key: "" }
+  try {
+    inLoc = try cloud.gsParse(rawStr(fs, "input_file_id") ?? "")
+  } catch (e) {
+    return errorReply(400, `input_file_id must be a gs:// file: ${e.message}`, "invalid_request_error")
+  }
+  const outputUri = rawStr(try fields(find(fs, "output_folder") ?? "{}"), "url") ?? ""
+  if (outputUri === "") return errorReply(400, "output_folder.url (a gs:// prefix) is required", "invalid_request_error")
+  try {
+    const checked = try cloud.gsParse(outputUri)
+    if (checked.bucket === "") return errorReply(400, "output_folder.url must be a gs:// prefix", "invalid_request_error")
+  } catch (e) {
+    return errorReply(400, `output_folder.url must be a gs:// prefix: ${e.message}`, "invalid_request_error")
+  }
+  const got = await send(t, cloud.gcsObject(t, token, inLoc.bucket, inLoc.key, "GET", true))
+  if (!got.ok) return got
+  const jsonl = try await got.text()
+  let model = ""
+  let instances = ""
+  try {
+    model = try firstModel(jsonl)
+    instances = try cloud.vertexInstances(jsonl, "")
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (model === "") return errorReply(400, "the batch input has no model", "invalid_request_error")
+  const inName = cloud.vertexInputName()
+  const put = await send(t, cloud.gcsUpload(t, token, inLoc.bucket, inName, instances, "application/jsonl"))
+  if (!put.ok) return put
+  const mr = try cloud.vertexJobCreate(t, token, cloud.jobName(rawStr(fs, "display_name") ?? ""), model, "gs://" + inLoc.bucket + "/" + inName, outputUri)
+  const up = await send(t, mr)
+  if (!up.ok) return up
+  const created = try await up.text()
+  const bid = lastPart(rawStr(try fields(created), "name") ?? "")
+  batchModels.set(bid, model)
+  return jsonReply(try cloud.vertexJobToOpenAI(created, OUTPUT_PREFIX + bid))
+}
+
+// The OpenAI output lines of a finished Vertex job: its prediction files, read in order.
+async function vertexBatchOutput(t: Target, token: string, bid: string): Promise<Response> throws SyntaxError | Error {
+  const got = await send(t, try cloud.vertexJobGet(t, token, bid))
+  if (!got.ok) return got
+  const raw = try await got.text()
+  const ended = try cloud.vertexJobEnded(raw)
+  if (!ended) return errorReply(400, `batch ${bid} has not ended`, "invalid_request_error")
+  const dir = try cloud.gsParse(try cloud.vertexOutputDir(raw))
+  let model = batchModels.get(bid) ?? ""
+  if (model === "") model = lastPart(rawStr(try fields(raw), "model") ?? "")
+  const prefix = dir.key === "" || dir.key.endsWith("/") ? dir.key : dir.key + "/"
+  const lst = await send(t, cloud.gcsList(t, token, dir.bucket, prefix, "", ""))
+  if (!lst.ok) return lst
+  let all = ""
+  for (const name of try cloud.gcsNames(try await lst.text())) {
+    if (!cloud.predictionName(name)) continue
+    const part = await send(t, cloud.gcsObject(t, token, dir.bucket, name, "GET", true))
+    if (!part.ok) return part
+    all += (try await part.text()) + "\n"
+  }
+  return jsonlReply(try cloud.vertexResultsToOpenAI(all, model))
+}
+
+// The Bedrock credentials of a key: its static keys, or temporary ones from AssumeRole when
+// the key has a role_arn (cached until they near expiry).
+async function bedrockCreds(t: Target): Promise<S3Creds> throws SyntaxError | Error {
+  const bk = t.key.bedrock_key_config
+  if (bk === undefined) throw new SyntaxError("bedrock: key has no bedrock_key_config")
+  const base = try cloud.staticCreds(bk)
+  const role = bk.role_arn ?? ""
+  if (role === "") return base
+  const session = bk.session_name ?? "bifrost-session"
+  const key = role + "|" + (bk.external_id ?? "") + "|" + session
+  const now = Date.now()
+  const cached = cloud.STS_CREDS.get(key, now)
+  if (cached !== undefined) return cloud.assumedCreds(cached, base.region)
+  const up = try cloudAuth.assumeRoleRequest({ accessKey: base.accessKey, secretKey: base.secretKey, sessionToken: base.sessionToken }, base.region, role, bk.external_id, session, 3600, now)
+  const hs: Record<string, string> = up.headers
+  const dl = deadline(10000)
+  let text = ""
+  try {
+    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg) })
+    text = try await res.text()
+  } catch (e) {
+    dl.finish()
+    throw e
+  }
+  dl.finish()
+  const creds = try cloudAuth.parseAssumeRole(text)
+  cloud.STS_CREDS.put(key, creds, creds.expiresAtMs)
+  return cloud.assumedCreds(creds, base.region)
+}
+
+// Bedrock's files are S3 objects (s3://bucket/key) and its batches are model invocation jobs
+// that read a converted input from S3 and write results under output_s3_uri. s3_bucket and
+// s3_prefix name the bucket of a new file or a listing; the key's batch bucket is the default.
+async function bedrockStore(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  const id = routeId(route)
+  const sp = new URLSearchParams(qs)
+  let c: S3Creds = { accessKey: "", secretKey: "", region: "" }
+  try {
+    c = try await bedrockCreds(t)
+  } catch (e) {
+    return errorReply(502, `bedrock authentication failed: ${e.message}`, "authentication_error")
+  }
+  const bk = t.key.bedrock_key_config
+  const def = bk === undefined ? undefined : cloud.batchBucket(bk)
+  const endpoint = cloud.s3Endpoint(t)
+  const origin = cloud.bedrockOrigin(t, "bedrock", c.region)
+  const now = Date.now()
+  if (route.op === "files.create") {
+    const f = filePart(form)
+    if (f === undefined) return errorReply(400, "the request needs a \"file\" part", "invalid_request_error")
+    let bucket = formText(form, "s3_bucket")
+    let prefix = formText(form, "s3_prefix")
+    if (bucket === "" && def !== undefined) {
+      bucket = def.bucket
+      if (prefix === "") prefix = def.prefix
+    }
+    if (bucket === "") return errorReply(400, "s3_bucket is required to store a Bedrock file", "invalid_request_error")
+    const body = try await f.text()
+    const key = cloud.s3KeyFor(prefix, f.name)
+    const up = await send(t, cloud.s3Object(c, endpoint, bucket, key, "PUT", body, "application/jsonl", now))
+    if (!up.ok) return up
+    return jsonReply(cloud.s3FileToOpenAI(bucket, key, body.byteLength, now / 1000.0))
+  }
+  if (route.op === "files.list") {
+    let bucket = sp.get("s3_bucket") ?? ""
+    let prefix = sp.get("s3_prefix") ?? ""
+    if (bucket === "" && def !== undefined) {
+      bucket = def.bucket
+      if (prefix === "") prefix = def.prefix
+    }
+    if (bucket === "") return errorReply(400, "s3_bucket is required to list Bedrock files", "invalid_request_error")
+    const up = await send(t, cloud.s3List(c, endpoint, bucket, prefix, sp.get("after") ?? "", sp.get("limit") ?? "", now))
+    if (!up.ok) return up
+    return jsonReply(cloud.s3ListToOpenAI(try await up.text(), bucket))
+  }
+  if (route.op === "files.content" && id.startsWith(OUTPUT_PREFIX)) return try await bedrockBatchOutput(t, c, id.slice(OUTPUT_PREFIX.byteLength))
+  if (route.op === "files.retrieve" || route.op === "files.delete" || route.op === "files.content") {
+    let loc = { bucket: "", key: "" }
+    try {
+      loc = try cloud.s3Parse(id)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (route.op === "files.content") return await send(t, cloud.s3Object(c, endpoint, loc.bucket, loc.key, "GET", "", "", now))
+    if (route.op === "files.delete") {
+      const del = await send(t, cloud.s3Object(c, endpoint, loc.bucket, loc.key, "DELETE", "", "", now))
+      if (!del.ok) return del
+      return jsonReply(cloud.deletedToOpenAI(id))
+    }
+    const up = await send(t, cloud.s3List(c, endpoint, loc.bucket, loc.key, "", "", now))
+    if (!up.ok) return up
+    const found = cloud.s3FileFromList(try await up.text(), loc.bucket, loc.key)
+    if (found === undefined) return errorReply(404, `no such file ${id}`, "invalid_request_error")
+    return jsonReply(found)
+  }
+  if (route.op === "batches.create") return try await bedrockBatchCreate(t, c, def, text)
+  if (route.op === "batches.list") {
+    const up = await send(t, cloud.bedrockJobList(origin, c, sp.get("limit") ?? "", sp.get("after") ?? "", now))
+    if (!up.ok) return up
+    return jsonReply(try cloud.bedrockJobListToOpenAI(try await up.text()))
+  }
+  if (route.op === "batches.retrieve") {
+    const up = await send(t, cloud.bedrockJobGet(origin, c, id, now))
+    if (!up.ok) return up
+    return jsonReply(try cloud.bedrockJobToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
+  }
+  if (route.op === "batches.cancel") {
+    const stop = await send(t, cloud.bedrockJobStop(origin, c, id, now))
+    if (!stop.ok) return stop
+    const up = await send(t, cloud.bedrockJobGet(origin, c, id, now))
+    if (!up.ok) return up
+    return jsonReply(try cloud.bedrockJobToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
+  }
+  if (route.op === "batches.results") {
+    const out = try await bedrockBatchOutput(t, c, id)
+    if (!out.ok) return out
+    return jsonReply(try native.batchResultsDoc(id, try await out.text()))
+  }
+  return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
+}
+
+// POST /v1/batches on Bedrock: the input file's lines become Bedrock records, written to the
+// input's bucket, and a model invocation job reads them and writes under output_s3_uri (or
+// the key's default batch bucket). The job's role is batch_role_arn, else the request's role_arn.
+async function bedrockBatchCreate(t: Target, c: S3Creds, def: { bucket: string, prefix: string } | undefined, text: string): Promise<Response> throws SyntaxError | Error {
+  let fs: Field[] = []
+  try {
+    fs = try fields(text)
+  } catch (e) {
+    return errorReply(400, "the request body must be a JSON object", "invalid_request_error")
+  }
+  let inLoc = { bucket: "", key: "" }
+  try {
+    inLoc = try cloud.s3Parse(rawStr(fs, "input_file_id") ?? "")
+  } catch (e) {
+    return errorReply(400, `input_file_id must be an s3:// file: ${e.message}`, "invalid_request_error")
+  }
+  const endpoint = cloud.s3Endpoint(t)
+  const now = Date.now()
+  const got = await send(t, cloud.s3Object(c, endpoint, inLoc.bucket, inLoc.key, "GET", "", "", now))
+  if (!got.ok) return got
+  const jsonl = try await got.text()
+  let model = ""
+  let records = ""
+  try {
+    model = try firstModel(jsonl)
+    records = try cloud.bedrockInputJsonl(jsonl, "")
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (model === "") return errorReply(400, "the batch input has no model", "invalid_request_error")
+  let outputUri = rawStr(fs, "output_s3_uri") ?? ""
+  if (outputUri === "" && def !== undefined) outputUri = cloud.defaultOutputUri(def.bucket, def.prefix)
+  if (outputUri === "") return errorReply(400, "output_s3_uri is required (or a default batch bucket in the key)", "invalid_request_error")
+  try {
+    const checked = try cloud.s3Parse(outputUri)
+    if (checked.bucket === "") return errorReply(400, "output_s3_uri must be an s3:// prefix", "invalid_request_error")
+  } catch (e) {
+    return errorReply(400, `output_s3_uri must be an s3:// prefix: ${e.message}`, "invalid_request_error")
+  }
+  const bk = t.key.bedrock_key_config
+  const role = cloud.bedrockRole(bk?.batch_role_arn, rawStr(fs, "role_arn") ?? "", bk?.role_arn)
+  if (role === "") return errorReply(400, "role_arn is required for Bedrock batch jobs (or batch_role_arn in the key)", "invalid_request_error")
+  const inKey = cloud.bedrockInputName()
+  const put = await send(t, cloud.s3Object(c, endpoint, inLoc.bucket, inKey, "PUT", records, "application/jsonl", now))
+  if (!put.ok) return put
+  const jobIn = rawStr(try fields(find(fs, "metadata") ?? "{}"), "job_name") ?? ""
+  const origin = cloud.bedrockOrigin(t, "bedrock", c.region)
+  const job = { name: cloud.jobName(jobIn), model: model, role: role, inputUri: "s3://" + inLoc.bucket + "/" + inKey, outputUri: outputUri, hours: cloud.windowHours(rawStr(fs, "completion_window") ?? "24h") }
+  const created = await send(t, cloud.bedrockJobCreate(origin, c, job, now))
+  if (!created.ok) return created
+  const bid = lastPart(rawStr(try fields(try await created.text()), "jobArn") ?? "")
+  batchModels.set(bid, model)
+  const back = await send(t, cloud.bedrockJobGet(origin, c, bid, now))
+  if (!back.ok) return back
+  return jsonReply(try cloud.bedrockJobToOpenAI(try await back.text(), OUTPUT_PREFIX + bid))
+}
+
+// The OpenAI output lines of a finished Bedrock job: the .jsonl.out files under its output
+// location (those named for the job first), converted record by record.
+async function bedrockBatchOutput(t: Target, c: S3Creds, bid: string): Promise<Response> throws SyntaxError | Error {
+  const endpoint = cloud.s3Endpoint(t)
+  const origin = cloud.bedrockOrigin(t, "bedrock", c.region)
+  const now = Date.now()
+  const got = await send(t, cloud.bedrockJobGet(origin, c, bid, now))
+  if (!got.ok) return got
+  const raw = try await got.text()
+  const ended = try cloud.bedrockJobEnded(raw)
+  if (!ended) return errorReply(400, `batch ${bid} has not ended`, "invalid_request_error")
+  const outUri = try cloud.bedrockOutputUri(raw)
+  if (outUri === "") return errorReply(400, `batch ${bid} has no output location`, "invalid_request_error")
+  const loc = try cloud.s3Parse(outUri)
+  const lst = await send(t, cloud.s3List(c, endpoint, loc.bucket, loc.key, "", "", now))
+  if (!lst.ok) return lst
+  const keys = cloud.s3Keys(try await lst.text())
+  const mine: string[] = []
+  for (const k of keys) {
+    if (k.endsWith(".jsonl.out") && k.includes(bid)) mine.push(k)
+  }
+  if (mine.length === 0) {
+    for (const k of keys) {
+      if (k.endsWith(".jsonl.out")) mine.push(k)
+    }
+  }
+  let all = ""
+  for (const k of mine) {
+    const part = await send(t, cloud.s3Object(c, endpoint, loc.bucket, k, "GET", "", "", now))
+    if (!part.ok) return part
+    all += (try await part.text()) + "\n"
+  }
+  let model = batchModels.get(bid) ?? ""
+  if (model === "") model = try cloud.bedrockJobModel(raw)
+  return jsonlReply(try cloud.bedrockResultsToOpenAI(all, model))
+}
+
+// Vertex: image generation here, and its files and batches (vertexStore).
+async function vertexMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  if (route.op.startsWith("files.") || route.op.startsWith("batches.")) return try await vertexStore(t, route, qs, text, form)
   if (route.op !== "images.generations") return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
   const fs = try fields(text)
   if ((rawStr(fs, "prompt") ?? "") === "") return errorReply(400, "the request needs a prompt", "invalid_request_error")
@@ -495,8 +863,9 @@ async function vertexMedia(t: Target, route: MediaRoute, text: string): Promise<
   return jsonReply(try native.geminiImageToOpenAI(raw))
 }
 
-// Bedrock serves image generation here (InvokeModel); its other media is not in this gateway yet.
-async function bedrockMedia(t: Target, route: MediaRoute, text: string): Promise<Response> throws SyntaxError | Error {
+// Bedrock: image generation here (InvokeModel), and its files and batches (bedrockStore).
+async function bedrockMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  if (route.op.startsWith("files.") || route.op.startsWith("batches.")) return try await bedrockStore(t, route, qs, text, form)
   if (route.op !== "images.generations") return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
   let mr: native.MediaRequest | undefined = undefined
   try {

@@ -74,6 +74,106 @@ function failure(model: string, auth: string): Response | undefined {
   return undefined
 }
 
+// ---- Cloud storage and batch jobs, for the Vertex and Bedrock file and batch tests ----
+// Objects by "bucket/key" (Cloud Storage objects and S3 objects alike), and the jobs each service
+// made, by id. A job runs when it is created: its answers are written where its output goes.
+const cloudObjects: Map<string, string> = new Map()
+const objectKeys: string[] = []
+const vertexJobs: Map<string, string> = new Map()
+const vertexIds: string[] = []
+const bedrockJobs: Map<string, string> = new Map()
+const bedrockIds: string[] = []
+const JOB_TIME = "2026-10-14T12:00:00Z"
+
+function putObject(k: string, body: string): void {
+  if (!cloudObjects.has(k)) objectKeys.push(k)
+  cloudObjects.set(k, body)
+}
+
+// "bucket/key" of a gs:// or s3:// URI (both schemes are five characters).
+function objectOf(uri: string): string {
+  return uri.slice(5)
+}
+
+function jsonBody(body: string, status: int): Response {
+  return new Response(body, { status: status, headers: { "content-type": "application/json" } })
+}
+
+// The Vertex answer for one instance line: a Claude message, or a Gemini candidate, each
+// echoing its request (and with it the custom id).
+function vertexPrediction(line: string): string throws SyntaxError {
+  const inst = try JSON.parse(line) as { custom_id?: string, request: { labels?: { bifrost_custom_id?: string } } }
+  const req = JSON.stringify(inst.request)
+  if (line.includes(`"anthropic_version"`)) {
+    return `{"custom_id":"${inst.custom_id ?? ""}","request":${req},"response":{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"Batch reply from claude"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":3}}}`
+  }
+  return `{"request":${req},"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Batch reply from gemini"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}},"status":""}`
+}
+
+// A Batch Prediction job: its predictions are written at once under output_folder, and the job
+// reads back as SUCCEEDED. The create answer is PENDING, as the API's is.
+function vertexCreate(body: string): Response throws SyntaxError {
+  const job = try JSON.parse(body) as { displayName: string, model: string, inputConfig: { gcsSource: { uris: string[] } }, outputConfig: { gcsDestination: { outputUriPrefix: string } } }
+  const id = nextId("")
+  const name = `projects/proj/locations/us-central1/batchPredictionJobs/${id}`
+  const models = job.model.split("/")
+  const dir = `${job.outputConfig.gcsDestination.outputUriPrefix}/prediction-${models[models.length - 1] ?? ""}-${id}`
+  const lines: string[] = []
+  for (const line of (cloudObjects.get(objectOf(job.inputConfig.gcsSource.uris[0] ?? "")) ?? "").split("\n")) {
+    if (line.trim() === "") continue
+    lines.push(try vertexPrediction(line))
+  }
+  putObject(objectOf(dir) + "/predictions_0001.jsonl", lines.join("\n") + "\n")
+  vertexJobs.set(id, `{"name":"${name}","displayName":"${job.displayName}","model":"${job.model}","state":"JOB_STATE_SUCCEEDED","createTime":"${JOB_TIME}","endTime":"${JOB_TIME}","completionStats":{"successfulCount":"${lines.length}","failedCount":"0","incompleteCount":"0"},"outputInfo":{"gcsOutputDirectory":"${dir}"}}`)
+  vertexIds.push(id)
+  return jsonBody(`{"name":"${name}","displayName":"${job.displayName}","state":"JOB_STATE_PENDING","createTime":"${JOB_TIME}"}`, 200)
+}
+
+// A model invocation job: each record is answered at once, and the answers are written under the
+// output location in a folder named for the job. The job reads back as Completed.
+function bedrockCreate(body: string): Response throws SyntaxError {
+  const job = try JSON.parse(body) as { jobName: string, modelId: string, inputDataConfig: { s3InputDataConfig: { s3Uri: string } }, outputDataConfig: { s3OutputDataConfig: { s3Uri: string } } }
+  const id = nextId("mockjob")
+  const arn = `arn:aws:bedrock:us-east-1:123456789012:model-invocation-job/${id}`
+  const outUri = job.outputDataConfig.s3OutputDataConfig.s3Uri
+  const lines: string[] = []
+  for (const line of (cloudObjects.get(objectOf(job.inputDataConfig.s3InputDataConfig.s3Uri)) ?? "").split("\n")) {
+    if (line.trim() === "") continue
+    const rec = try JSON.parse(line) as { recordId: string }
+    lines.push(`{"recordId":"${rec.recordId}","modelOutput":{"id":"msg_1","type":"message","role":"assistant","model":"${job.modelId}","content":[{"type":"text","text":"Batch reply from ${job.modelId}"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":3}}}`)
+  }
+  putObject(objectOf(outUri) + id + "/input.jsonl.out", lines.join("\n") + "\n")
+  bedrockJobs.set(id, `{"jobArn":"${arn}","jobName":"${job.jobName}","status":"Completed","modelId":"${job.modelId}","submitTime":"${JOB_TIME}","endTime":"${JOB_TIME}","inputDataConfig":{"s3InputDataConfig":{"s3Uri":"${job.inputDataConfig.s3InputDataConfig.s3Uri}"}},"outputDataConfig":{"s3OutputDataConfig":{"s3Uri":"${outUri}"}}}`)
+  bedrockIds.push(id)
+  return jsonBody(`{"jobArn":"${arn}"}`, 200)
+}
+
+// The objects of an S3 bucket under a prefix, as a ListObjectsV2 answer.
+function s3List(bucket: string, prefix: string): string {
+  let contents = ""
+  let n = 0
+  for (const k of objectKeys) {
+    if (!k.startsWith(bucket + "/") || !cloudObjects.has(k)) continue
+    const key = k.slice(bucket.byteLength + 1)
+    if (!key.startsWith(prefix)) continue
+    contents += `<Contents><Key>${key}</Key><Size>${(cloudObjects.get(k) ?? "").byteLength}</Size><LastModified>${JOB_TIME}</LastModified></Contents>`
+    n += 1
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>${bucket}</Name><Prefix>${prefix}</Prefix><KeyCount>${n}</KeyCount><IsTruncated>false</IsTruncated>${contents}</ListBucketResult>`
+}
+
+// The objects of a Cloud Storage bucket under a prefix, as an objects listing.
+function gcsList(bucket: string, prefix: string): string {
+  const items: string[] = []
+  for (const k of objectKeys) {
+    if (!k.startsWith(bucket + "/") || !cloudObjects.has(k)) continue
+    const name = k.slice(bucket.byteLength + 1)
+    if (!name.startsWith(prefix)) continue
+    items.push(`{"name":"${name}","size":"${(cloudObjects.get(k) ?? "").byteLength}","timeCreated":"${JOB_TIME}"}`)
+  }
+  return `{"kind":"storage#objects","items":[${items.join(",")}]}`
+}
+
 type Model = { model?: string, stream?: bool }
 type Rpc = { id?: int, method: string }
 type EmbedReq = { input?: string | string[] }
@@ -608,7 +708,9 @@ Bun.serve<string>({
     // S3-compatible object storage, for log exports
     if (req.method === "PUT") {
       const u = URL.parse(req.url)
-      record(req, u === undefined ? req.url : u.pathname, await req.text())
+      const put = await req.text()
+      record(req, u === undefined ? req.url : u.pathname, put)
+      if (u !== undefined) putObject(u.pathname.slice(1), put)
       return new Response("", { status: 200 })
     }
     // the Responses lifecycle and realtime REST: answer with what was asked
@@ -653,6 +755,92 @@ Bun.serve<string>({
         hv.push(k + "=" + v)
       })
       return Response.json({ method: req.method, path: lp, query: lu === undefined ? "" : lu.search, body: body, headers: hv })
+    }
+    // Cloud Storage's upload, and its JSON API for objects (the name's slashes come as %2F)
+    if (lp.startsWith("/upload/storage/v1/b/") && lu !== undefined && req.method === "POST") {
+      const bucket = lp.split("/")[5] ?? ""
+      const name = new URLSearchParams(lu.search).get("name") ?? ""
+      const body = await req.text()
+      record(req, lp + lu.search, body)
+      putObject(bucket + "/" + name, body)
+      return jsonBody(`{"name":"${name}","bucket":"${bucket}","size":"${body.byteLength}","timeCreated":"${JOB_TIME}"}`, 200)
+    }
+    if (lp.startsWith("/storage/v1/b/") && lu !== undefined) {
+      const parts = lp.split("/")
+      const bucket = parts[4] ?? ""
+      record(req, lp + lu.search, "")
+      if (parts.length === 6 && req.method === "GET") return new Response(gcsList(bucket, new URLSearchParams(lu.search).get("prefix") ?? ""), { headers: { "content-type": "application/json" } })
+      const name = parts.slice(6).join("/").replaceAll("%2F", "/")
+      const k = bucket + "/" + name
+      if (req.method === "DELETE") {
+        cloudObjects.delete(k)
+        return new Response(undefined, { status: 204 })
+      }
+      const obj = cloudObjects.get(k)
+      if (obj === undefined) return jsonBody(`{"error":{"code":404,"message":"No such object"}}`, 404)
+      if (new URLSearchParams(lu.search).get("alt") === "media") return new Response(obj, { headers: { "content-type": "application/octet-stream" } })
+      return jsonBody(`{"name":"${name}","bucket":"${bucket}","size":"${obj.byteLength}","timeCreated":"${JOB_TIME}"}`, 200)
+    }
+    // Vertex's Batch Prediction jobs
+    if (lp.includes("/batchPredictionJobs") && lu !== undefined) {
+      const tail = lp.slice(lp.indexOf("/batchPredictionJobs") + 20)
+      const body = req.method === "GET" ? "" : await req.text()
+      record(req, lp, body)
+      if (req.method === "POST" && tail === "") return try vertexCreate(body)
+      if (req.method === "GET" && tail === "") {
+        const jobs: string[] = []
+        for (const id of vertexIds) jobs.push(vertexJobs.get(id) ?? "")
+        return jsonBody(`{"batchPredictionJobs":[${jobs.join(",")}]}`, 200)
+      }
+      if (req.method === "POST" && tail.endsWith(":cancel")) {
+        const id = tail.slice(1, tail.byteLength - 7)
+        vertexJobs.set(id, (vertexJobs.get(id) ?? "").replace("JOB_STATE_SUCCEEDED", "JOB_STATE_CANCELLED"))
+        return jsonBody("{}", 200)
+      }
+      const got = vertexJobs.get(tail.slice(1))
+      if (got === undefined) return jsonBody(`{"error":{"code":404,"message":"no such job"}}`, 404)
+      return jsonBody(got, 200)
+    }
+    // Bedrock's model invocation jobs
+    if (lp === "/model-invocation-job" && req.method === "POST") {
+      const body = await req.text()
+      record(req, lp, body)
+      return try bedrockCreate(body)
+    }
+    if (lp === "/model-invocation-jobs" && req.method === "GET") {
+      record(req, lp, "")
+      const jobs: string[] = []
+      for (const id of bedrockIds) jobs.push(bedrockJobs.get(id) ?? "")
+      return jsonBody(`{"invocationJobSummaries":[${jobs.join(",")}]}`, 200)
+    }
+    if (lp.startsWith("/model-invocation-job/")) {
+      const rest = lp.slice(22)
+      const body = req.method === "POST" ? await req.text() : ""
+      record(req, lp, body)
+      if (rest.endsWith("/stop")) {
+        const id = rest.slice(0, rest.byteLength - 5)
+        bedrockJobs.set(id, (bedrockJobs.get(id) ?? "").replace(`"status":"Completed"`, `"status":"Stopped"`))
+        return jsonBody("{}", 200)
+      }
+      const got = bedrockJobs.get(rest)
+      if (got === undefined) return jsonBody(`{"message":"not found"}`, 404)
+      return jsonBody(got, 200)
+    }
+    // S3 objects of the test bucket, path style as the endpoint is set: listings, gets and deletes
+    if (lp === "/e2e-files" || lp.startsWith("/e2e-files/")) {
+      const bucket = "e2e-files"
+      record(req, lp + (lu === undefined ? "" : lu.search), "")
+      if (req.method === "GET" && lu !== undefined && lu.search.includes("list-type")) {
+        return new Response(s3List(bucket, new URLSearchParams(lu.search).get("prefix") ?? ""), { headers: { "content-type": "application/xml" } })
+      }
+      const k = bucket + "/" + lp.slice(bucket.byteLength + 2)
+      if (req.method === "DELETE") {
+        cloudObjects.delete(k)
+        return new Response(undefined, { status: 204 })
+      }
+      const obj = cloudObjects.get(k)
+      if (obj === undefined) return new Response("NoSuchKey", { status: 404 })
+      return new Response(obj, { headers: { "content-type": "application/octet-stream" } })
     }
     return new Response("not found", { status: 404 })
   },

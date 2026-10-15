@@ -95,25 +95,30 @@ function locate(cfg: ExportConfig, key: string): { scheme: string, host: string,
 // The shared bedrock signer only knows POST with three fixed headers, and S3
 // PUT signs the caller's own header set (x-amz-content-sha256, date, storage
 // class), so this signer takes the headers as given.
-type S3Creds = { accessKey: string, secretKey: string, sessionToken?: string, region: string }
+export type S3Creds = { accessKey: string, secretKey: string, sessionToken?: string, region: string }
 
-// Returns the Authorization header value. hs holds lower-case names and
-// values, including host; the payload hash is the hex SHA-256 of the body.
-function signS3(c: S3Creds, method: string, host: string, path: string, hs: string[][], payloadHash: string, date: string): string {
+// Returns the SigV4 Authorization value for any AWS service. hs holds lower-case
+// names and values, including host; query is the canonical query string (sorted
+// and encoded, "" for none); the payload hash is the hex SHA-256 of the body.
+export function signAws(c: S3Creds, service: string, method: string, path: string, query: string, hs: string[][], payloadHash: string, date: string): string {
   const day = date.slice(0, 8)
   const sorted = hs.slice().sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0))
   const canonicalHeaders = sorted.map((h) => `${h[0]!}:${h[1]!}\n`).join("")
   const signed = sorted.map((h) => h[0]!).join(";")
-  // no query string, so the empty line after the path is the query
-  const canonical = `${method}\n${path}\n\n${canonicalHeaders}\n${signed}\n${payloadHash}`
-  const scope = `${day}/${c.region}/s3/aws4_request`
+  const canonical = `${method}\n${path}\n${query}\n${canonicalHeaders}\n${signed}\n${payloadHash}`
+  const scope = `${day}/${c.region}/${service}/aws4_request`
   const toSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${toHex(sha256(utf8(canonical)))}`
   const kDate = hmacSha256(utf8("AWS4" + c.secretKey), utf8(day))
   const kRegion = hmacSha256(kDate, utf8(c.region))
-  const kService = hmacSha256(kRegion, utf8("s3"))
+  const kService = hmacSha256(kRegion, utf8(service))
   const kSigning = hmacSha256(kService, utf8("aws4_request"))
   const signature = toHex(hmacSha256(kSigning, utf8(toSign)))
   return `AWS4-HMAC-SHA256 Credential=${c.accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}`
+}
+
+// The S3 signer for the log exports: no query string, S3's own service name.
+function signS3(c: S3Creds, method: string, host: string, path: string, hs: string[][], payloadHash: string, date: string): string {
+  return signAws(c, "s3", method, path, "", hs, payloadHash, date)
 }
 
 // A signed PUT of body to key. nowMs sets the signing time, so pass the
@@ -134,6 +139,59 @@ export function putRequest(cfg: ExportConfig, key: string, body: string, nowMs: 
   }
   headers.set("authorization", auth)
   return { url: loc.scheme + loc.host + loc.path, method: "PUT", headers: headers, body: body }
+}
+
+// A signed AWS request, ready to send. An empty body means none.
+export type AwsRequest = { url: string, method: string, headers: Map<string, string>, body: string }
+
+// The canonical query string: names and values percent-encoded, sorted.
+export function canonicalQuery(pairs: string[][]): string {
+  const enc = pairs.map((p) => [encodeSegment(p[0]!), encodeSegment(p[1]!)])
+  enc.sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : a[1]! < b[1]! ? -1 : a[1]! > b[1]! ? 1 : 0))
+  return enc.map((p) => `${p[0]!}=${p[1]!}`).join("&")
+}
+
+// Signs and sets up one request. path is the canonical path the signer uses, and
+// the URL carries the same path and query. S3 also signs the payload hash.
+function awsRequest(c: S3Creds, service: string, scheme: string, host: string, method: string, path: string, canonicalPath: string, query: string, contentType: string, body: string, nowMs: number, s3: bool): AwsRequest {
+  const date = amzDate(nowMs)
+  const payloadHash = toHex(sha256(utf8(body)))
+  const hs: string[][] = [["host", host], ["x-amz-date", date]]
+  if (s3) hs.push(["x-amz-content-sha256", payloadHash])
+  if (contentType !== "") hs.push(["content-type", contentType])
+  const token = c.sessionToken
+  if (token !== undefined && token !== "") hs.push(["x-amz-security-token", token])
+  const auth = signAws(c, service, method, canonicalPath, query, hs, payloadHash, date)
+  const out: Map<string, string> = new Map()
+  for (const h of hs) {
+    if (h[0] !== "host") out.set(h[0]!, h[1]!)
+  }
+  out.set("authorization", auth)
+  return { url: scheme + host + path + (query === "" ? "" : "?" + query), method: method, headers: out, body: body }
+}
+
+// A signed S3 request on a bucket and key (key "" for the bucket). An empty
+// endpoint is AWS's virtual-hosted URL in the region; any other endpoint (a
+// MinIO, a mock) takes the bucket in its path. pairs are the query parameters.
+export function s3Call(c: S3Creds, endpoint: string, method: string, bucket: string, key: string, pairs: string[][], body: string, contentType: string, nowMs: number): AwsRequest {
+  const objPath = key === "" ? "" : "/" + key.split("/").map((s) => encodeSegment(s)).join("/")
+  const query = canonicalQuery(pairs)
+  if (endpoint !== "") {
+    const ep = parseEndpoint(endpoint)
+    const path = `${trimSlash(ep.base)}/${encodeSegment(bucket)}${objPath}`
+    return awsRequest(c, "s3", ep.scheme, ep.host, method, path, path, query, contentType, body, nowMs, true)
+  }
+  const host = `${bucket}.s3.${c.region}.amazonaws.com`
+  const path = objPath === "" ? "/" : objPath
+  return awsRequest(c, "s3", "https://", host, method, path, path, query, contentType, body, nowMs, true)
+}
+
+// A signed call to an AWS JSON service (Bedrock's control plane). The scheme and
+// host come from the caller; path is encoded once, and the signer encodes it again,
+// as SigV4 does for every service but S3.
+export function awsCall(c: S3Creds, service: string, scheme: string, host: string, method: string, path: string, pairs: string[][], body: string, nowMs: number): AwsRequest {
+  const canonicalPath = path.split("/").map((s) => encodeSegment(s)).join("/")
+  return awsRequest(c, service, scheme, host, method, path, canonicalPath, canonicalQuery(pairs), body === "" ? "" : "application/json", body, nowMs, false)
 }
 
 // Tracks the newest exported timestamp (ms). Entries at or before it are

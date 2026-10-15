@@ -2,15 +2,23 @@
 // to send and converters take the upstream body, as in media_native.tov, which
 // holds the Gemini and Anthropic side. Nothing here does HTTP: media.tov fetches
 // Vertex's bearer token and sends the requests.
-import { Field, fields, elements, find, rawStr, rawNum, quote } from "./json"
-import { Target, headers, addExtraHeaders, trimSlash } from "./providers/types"
-import { TokenCache } from "./providers/vertex"
+import { Field, fields, elements, find, rawStr, rawNum, quote, setField, build, without, isNull } from "./json"
+import { Target, Translated, headers, addExtraHeaders, trimSlash } from "./providers/types"
+import { TokenCache, isClaude } from "./providers/vertex"
 import * as bedrock from "./providers/bedrock"
+import * as anthropic from "./providers/anthropic"
+import * as gemini from "./providers/gemini"
 import * as native from "./media_native"
-import { nowSeconds } from "./schemas"
+import { ChatRequest, nowSeconds, newId } from "./schemas"
+import { S3Creds, AwsRequest, s3Call, awsCall, canonicalQuery } from "./exports"
+import { AssumedCreds, credsCache, parseIsoUtcMs, xmlTag } from "./cloud_auth"
+import { BedrockKeyConfig } from "./config"
 
 // Bearer tokens for Vertex calls, by service account. media.tov fetches into it.
 export const VERTEX_TOKENS: TokenCache = new TokenCache()
+
+// Temporary credentials from AssumeRole, by role. media.tov fetches into it.
+export const STS_CREDS = credsCache()
 
 // ---- Vertex AI ----
 
@@ -121,6 +129,721 @@ export function bedrockImagesToOpenAI(raw: string): string throws SyntaxError {
   return `{"created":${nowSeconds()},"data":[${items.join(",")}]}`
 }
 
+// ---- files and batches ----
+// Vertex's files are Google Cloud Storage objects and its batches are Batch Prediction
+// jobs that read and write GCS. Bedrock's files are S3 objects and its batches are
+// model invocation jobs that read and write S3. File ids are gs:// and s3:// URIs.
+// Each job's input is written to the bucket in the provider's own JSONL shape, then the
+// job is created; its output is read back and converted to OpenAI's batch output.
+
+// The Google Cloud Storage origin: the key's base_url when set (a proxy or the mock), else Google's.
+export function gcsOrigin(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b !== undefined && b !== "") return trimSlash(b)
+  return "https://storage.googleapis.com"
+}
+
+// The Vertex location that batch prediction jobs live under: ".../v1/projects/{p}/locations/{r}".
+export function vertexLocation(t: Target): string throws SyntaxError {
+  const vk = t.key.vertex_key_config
+  if (vk === undefined) throw new SyntaxError("vertex: key has no vertex_key_config")
+  if (vk.project_id === "" || vk.region === "") throw new SyntaxError("vertex: batch jobs need a project and a region")
+  return `${vertexOrigin(t, vk.region)}/v1/projects/${vk.project_id}/locations/${vk.region}`
+}
+
+// Headers for a Google call with a bearer token; json adds the content type.
+function bearer(t: Target, token: string, json: bool): Map<string, string> {
+  const pairs: string[][] = [["authorization", "Bearer " + token]]
+  if (json) pairs.push(["content-type", "application/json"])
+  let h = headers(pairs)
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+// The bucket and object key of a gs:// or s3:// URI. The key is "" for the bucket alone.
+function bucketKey(uri: string, scheme: string): { bucket: string, key: string } throws SyntaxError {
+  if (!uri.startsWith(scheme)) throw new SyntaxError(`invalid URI ${uri}: must start with ${scheme}`)
+  const rest = uri.slice(scheme.byteLength)
+  const slash = rest.indexOf("/")
+  const bucket = slash < 0 ? rest : rest.slice(0, slash)
+  if (bucket === "") throw new SyntaxError(`invalid URI ${uri}: no bucket`)
+  return { bucket: bucket, key: slash < 0 ? "" : rest.slice(slash + 1) }
+}
+
+export function gsParse(uri: string): { bucket: string, key: string } throws SyntaxError {
+  return try bucketKey(uri, "gs://")
+}
+
+export function s3Parse(uri: string): { bucket: string, key: string } throws SyntaxError {
+  return try bucketKey(uri, "s3://")
+}
+
+// The string with its %XX escapes decoded as UTF-8; a malformed escape is kept as it is.
+// Path ids arrive percent-encoded ("gs%3A%2F%2F..."), and Tov has no decodeURIComponent.
+export function pctDecode(s: string): string {
+  if (!s.includes("%")) return s
+  const b = new TextEncoder().encode(s)
+  const out: u8[] = []
+  let i = 0
+  while (i < b.length) {
+    const c = int(b[i]!)
+    if (c === 37 && i + 2 < b.length) {
+      const hi = hexDigit(int(b[i + 1]!))
+      const lo = hexDigit(int(b[i + 2]!))
+      if (hi >= 0 && lo >= 0) {
+        out.push(u8(hi * 16 + lo))
+        i += 3
+        continue
+      }
+    }
+    out.push(b[i]!)
+    i += 1
+  }
+  try {
+    return new TextDecoder().decode(out)
+  } catch (e) {
+    return s
+  }
+}
+
+// The value of one hex digit byte, or -1.
+function hexDigit(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 65 && c <= 70) return c - 55
+  if (c >= 97 && c <= 102) return c - 87
+  return -1
+}
+
+// The S3 prefix that batch output goes under by default: the batch bucket's prefix, with a trailing slash.
+export function defaultOutputUri(bucket: string, prefix: string): string {
+  const p = prefix.split("/").filter((x) => x !== "").join("/")
+  return "s3://" + bucket + "/" + (p === "" ? "" : p + "/")
+}
+
+// The object key for an uploaded file under a prefix (slashes at the ends are dropped).
+export function s3KeyFor(prefix: string, filename: string): string {
+  const p = prefix.split("/").filter((s) => s !== "").join("/")
+  return p === "" ? filename : p + "/" + filename
+}
+
+// The last part of a slash path: "a/b/c" gives "c".
+function lastSegment(s: string): string {
+  const parts = s.split("/")
+  return parts[parts.length - 1] ?? ""
+}
+
+// The non-blank lines of a JSONL text.
+function jsonlLines(text: string): string[] {
+  const out: string[] = []
+  for (const line of text.split("\n")) {
+    const s = line.trim()
+    if (s !== "") out.push(s)
+  }
+  return out
+}
+
+// The send-ready form of an AWS request: an empty body is no body.
+export function sendable(r: AwsRequest): native.MediaRequest {
+  return { method: r.method, url: r.url, headers: r.headers, body: r.body === "" ? undefined : r.body }
+}
+
+// An OpenAI file object for an object of a bucket (its scheme is "gs://" or "s3://").
+type OFile = { id: string, object: string, bytes: f64, created_at: f64, filename: string, purpose: string, status: string }
+
+function fileObject(scheme: string, bucket: string, key: string, bytes: f64, createdAt: f64): string {
+  const f: OFile = { id: scheme + bucket + "/" + key, object: "file", bytes: bytes, created_at: createdAt, filename: lastSegment(key), purpose: "batch", status: "processed" }
+  return JSON.stringify(f)
+}
+
+// The OpenAI list object. firstId and lastId are "" when there are none; a list with more
+// pages carries its next cursor as last_id, which the client sends back as "after".
+function listJson(items: string[], hasMore: string, firstId: string, lastId: string): string {
+  const first = firstId === "" ? "null" : quote(firstId)
+  const last = lastId === "" ? "null" : quote(lastId)
+  return `{"object":"list","data":[${items.join(",")}],"has_more":${hasMore},"first_id":${first},"last_id":${last}}`
+}
+
+// The seconds for a time that is either epoch seconds or an RFC 3339 string (0 when neither).
+function timeOf(fs: Field[], key: string): f64 {
+  const n = rawNum(fs, key)
+  if (n !== undefined) return n
+  const ms = parseIsoUtcMs(rawStr(fs, key) ?? "")
+  return ms === undefined ? 0 : ms / 1000.0
+}
+
+// The seconds of an RFC 3339 string, 0 when it does not parse.
+function isoSec(s: string): f64 {
+  const ms = parseIsoUtcMs(s)
+  return ms === undefined ? 0 : ms / 1000.0
+}
+
+// ---- Vertex: Google Cloud Storage objects ----
+
+// A new object name for an uploaded file: "<prefix>/vertex-files/<id>/<filename>".
+export function gcsObjectName(prefix: string, filename: string): string {
+  const p = prefix.split("/").filter((s) => s !== "").join("/")
+  const name = "vertex-files/" + newId("") + "/" + filename
+  return p === "" ? name : p + "/" + name
+}
+
+// POST the object's bytes (uploadType=media); the object name goes in the query.
+export function gcsUpload(t: Target, token: string, bucket: string, name: string, text: string, contentType: string): native.MediaRequest {
+  const url = `${gcsOrigin(t)}/upload/storage/v1/b/${bedrock.encodeSegment(bucket)}/o?uploadType=media&name=${bedrock.encodeSegment(name)}`
+  const h = bearer(t, token, false)
+  h.set("content-type", contentType)
+  return { method: "POST", url: url, headers: h, body: text }
+}
+
+// GET one object's metadata, or its bytes with media, or DELETE it.
+export function gcsObject(t: Target, token: string, bucket: string, name: string, method: string, media: bool): native.MediaRequest {
+  const alt = media ? "?alt=media" : ""
+  const url = `${gcsOrigin(t)}/storage/v1/b/${bedrock.encodeSegment(bucket)}/o/${bedrock.encodeSegment(name)}${alt}`
+  return { method: method, url: url, headers: bearer(t, token, false), body: undefined }
+}
+
+// GET the objects under a prefix, one page at a time.
+export function gcsList(t: Target, token: string, bucket: string, prefix: string, limit: string, cursor: string): native.MediaRequest {
+  const sp = new URLSearchParams()
+  sp.set("prefix", prefix)
+  if (limit !== "") sp.set("maxResults", limit)
+  if (cursor !== "") sp.set("pageToken", cursor)
+  return { method: "GET", url: `${gcsOrigin(t)}/storage/v1/b/${bedrock.encodeSegment(bucket)}/o?${sp.toString()}`, headers: bearer(t, token, false), body: undefined }
+}
+
+// The OpenAI file object for a GCS object resource (an upload's answer or a metadata GET).
+export function gcsFileToOpenAI(raw: string, bucket: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const size: f64 = parseInt(rawStr(fs, "size") ?? "") ?? 0
+  return fileObject("gs://", bucket, rawStr(fs, "name") ?? "", size, isoSec(rawStr(fs, "timeCreated") ?? ""))
+}
+
+// The OpenAI list object for a GCS object listing.
+export function gcsFileListToOpenAI(raw: string, bucket: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const items: string[] = []
+  const names: string[] = []
+  for (const el of try elements(find(fs, "items") ?? "[]")) {
+    items.push(try gcsFileToOpenAI(el, bucket))
+    names.push(rawStr(try fields(el), "name") ?? "")
+  }
+  const next = rawStr(fs, "nextPageToken") ?? ""
+  const firstId = names.length > 0 ? "gs://" + bucket + "/" + names[0]! : ""
+  const lastId = next !== "" ? next : names.length > 0 ? "gs://" + bucket + "/" + names[names.length - 1]! : ""
+  return listJson(items, next !== "" ? "true" : "false", firstId, lastId)
+}
+
+// The object names of a GCS listing, in order.
+export function gcsNames(raw: string): string[] throws SyntaxError {
+  const out: string[] = []
+  for (const el of try elements(find(try fields(raw), "items") ?? "[]")) out.push(rawStr(try fields(el), "name") ?? "")
+  return out
+}
+
+// Whether an object name is one of a batch's prediction files.
+export function predictionName(name: string): bool {
+  return lastSegment(name).startsWith("predictions")
+}
+
+// The OpenAI delete object, for a file of either provider.
+export function deletedToOpenAI(id: string): string {
+  return JSON.stringify({ id: id, object: "file", deleted: true })
+}
+
+// ---- Vertex: Batch Prediction jobs ----
+
+// One line of an OpenAI batch input: its custom id, its model (the provider prefix
+// dropped) and its body.
+type InLine = { id: string, model: string, body: Field[] }
+
+function inLine(line: string): InLine throws SyntaxError {
+  const fs = try fields(line)
+  const id = rawStr(fs, "custom_id") ?? ""
+  if (id === "") throw new SyntaxError("every batch line needs a custom_id")
+  if ((rawStr(fs, "url") ?? "") !== "/v1/chat/completions") throw new SyntaxError(`batch line ${id}: only /v1/chat/completions is supported`)
+  const bodyRaw = find(fs, "body")
+  if (bodyRaw === undefined || isNull(bodyRaw)) throw new SyntaxError(`batch line ${id}: body is required`)
+  const body = try fields(bodyRaw)
+  if (find(body, "messages") === undefined) throw new SyntaxError(`batch line ${id}: messages is required`)
+  return { id: id, model: lastSegment(rawStr(body, "model") ?? ""), body: body }
+}
+
+// The line's chat request with its model set (the typed shape needs one).
+function chatOf(l: InLine, model: string): ChatRequest throws SyntaxError {
+  let fs = l.body
+  setField(&fs, "model", quote(model))
+  return try JSON.parse(build(fs)) as ChatRequest
+}
+
+// The Vertex instances for an OpenAI batch input. A Claude instance is a Messages body
+// under "request" with its custom_id beside it; a Gemini instance is a GenerateContent
+// request whose labels carry the custom id (Bifrost's shapes). Model is the job's.
+export function vertexInstances(jsonl: string, model: string): string throws SyntaxError {
+  const out: string[] = []
+  for (const line of jsonlLines(jsonl)) {
+    const l = try inLine(line)
+    const m = l.model !== "" ? l.model : model
+    if (m === "") throw new SyntaxError(`batch line ${l.id}: model is required`)
+    if (isClaude(m)) {
+      let fs = try fields(try anthropic.messagesBody(try chatOf(l, m), l.body, m, false, false))
+      fs = without(fs, ["model"])
+      if (find(fs, "anthropic_version") === undefined) setField(&fs, "anthropic_version", quote("vertex-2023-10-16"))
+      out.push(`{"custom_id":${quote(l.id)},"request":${build(fs)}}`)
+    } else {
+      let fs = try fields(try gemini.generateBody(try chatOf(l, m), l.body))
+      setField(&fs, "labels", `{"bifrost_custom_id":${quote(l.id)}}`)
+      out.push(`{"request":${build(fs)}}`)
+    }
+  }
+  if (out.length === 0) throw new SyntaxError("the batch input has no requests")
+  return out.join("\n") + "\n"
+}
+
+// Vertex's job states as OpenAI's batch statuses (Bifrost's mapping).
+function jobStatus(state: string): string {
+  if (state === "JOB_STATE_QUEUED" || state === "JOB_STATE_PENDING") return "validating"
+  if (state === "JOB_STATE_RUNNING" || state === "JOB_STATE_UPDATING") return "in_progress"
+  if (state === "JOB_STATE_SUCCEEDED" || state === "JOB_STATE_PARTIALLY_SUCCEEDED") return "completed"
+  if (state === "JOB_STATE_FAILED") return "failed"
+  if (state === "JOB_STATE_CANCELLING") return "cancelling"
+  if (state === "JOB_STATE_CANCELLED") return "cancelled"
+  if (state === "JOB_STATE_EXPIRED") return "expired"
+  return "in_progress"
+}
+
+// The POST that creates a Batch Prediction job: it reads inputUri (gs://) and writes
+// under outputUri (gs://). The model is a publisher path, Anthropic's for Claude.
+export function vertexJobCreate(t: Target, token: string, displayName: string, model: string, inputUri: string, outputUri: string): native.MediaRequest throws SyntaxError {
+  const pub = isClaude(model) ? "anthropic" : "google"
+  const mdl = `publishers/${pub}/models/${model}`
+  const body = `{"displayName":${quote(displayName)},"model":${quote(mdl)},"inputConfig":{"instancesFormat":"jsonl","gcsSource":{"uris":[${quote(inputUri)}]}},"outputConfig":{"predictionsFormat":"jsonl","gcsDestination":{"outputUriPrefix":${quote(outputUri)}}}}`
+  const loc = try vertexLocation(t)
+  return { method: "POST", url: `${loc}/batchPredictionJobs`, headers: bearer(t, token, true), body: body }
+}
+
+export function vertexJobGet(t: Target, token: string, id: string): native.MediaRequest throws SyntaxError {
+  const loc = try vertexLocation(t)
+  return { method: "GET", url: `${loc}/batchPredictionJobs/${bedrock.encodeSegment(id)}`, headers: bearer(t, token, false), body: undefined }
+}
+
+export function vertexJobCancel(t: Target, token: string, id: string): native.MediaRequest throws SyntaxError {
+  const loc = try vertexLocation(t)
+  return { method: "POST", url: `${loc}/batchPredictionJobs/${bedrock.encodeSegment(id)}:cancel`, headers: bearer(t, token, true), body: "{}" }
+}
+
+// GET one page of the jobs: limit and cursor are OpenAI's, renamed for the API.
+export function vertexJobList(t: Target, token: string, limit: string, cursor: string): native.MediaRequest throws SyntaxError {
+  const sp = new URLSearchParams()
+  if (limit !== "") sp.set("pageSize", limit)
+  if (cursor !== "") sp.set("pageToken", cursor)
+  const qs = sp.toString()
+  const loc = try vertexLocation(t)
+  return { method: "GET", url: `${loc}/batchPredictionJobs${qs === "" ? "" : "?" + qs}`, headers: bearer(t, token, false), body: undefined }
+}
+
+// The OpenAI batch object (the shape shared by the batch converters). The times are
+// set for the status that ends the batch, and output_file_id only when given.
+type BatchOut = { id: string, status: string, createdAt: f64, endedAt: f64, outputFileId: string, total: f64, completed: f64, failed: f64 }
+
+type OBatch = {
+  id: string,
+  object: string,
+  endpoint: string,
+  completion_window: string,
+  status: string,
+  created_at: f64,
+  cancelling_at?: f64,
+  cancelled_at?: f64,
+  completed_at?: f64,
+  expired_at?: f64,
+  failed_at?: f64,
+  output_file_id?: string,
+  request_counts: { total: f64, completed: f64, failed: f64 },
+}
+
+function batchJson(b: BatchOut): string {
+  const o: OBatch = {
+    id: b.id,
+    object: "batch",
+    endpoint: "/v1/chat/completions",
+    completion_window: "24h",
+    status: b.status,
+    created_at: b.createdAt,
+    output_file_id: b.outputFileId === "" ? undefined : b.outputFileId,
+    request_counts: { total: b.total, completed: b.completed, failed: b.failed },
+  }
+  if (b.endedAt > 0) {
+    if (b.status === "completed") o.completed_at = b.endedAt
+    else if (b.status === "failed") o.failed_at = b.endedAt
+    else if (b.status === "expired") o.expired_at = b.endedAt
+    else if (b.status === "cancelled") o.cancelled_at = b.endedAt
+  }
+  return JSON.stringify(o)
+}
+
+// The OpenAI batch object for a Batch Prediction job (create, get and cancel).
+export function vertexJobToOpenAI(raw: string, outputFileId: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const stats = try fields(find(fs, "completionStats") ?? "{}")
+  const succeeded: f64 = parseInt(rawStr(stats, "successfulCount") ?? "") ?? 0
+  const failed: f64 = parseInt(rawStr(stats, "failedCount") ?? "") ?? 0
+  const incomplete: f64 = parseInt(rawStr(stats, "incompleteCount") ?? "") ?? 0
+  return batchJson({
+    id: lastSegment(rawStr(fs, "name") ?? ""),
+    status: jobStatus(rawStr(fs, "state") ?? ""),
+    createdAt: timeOf(fs, "createTime"),
+    endedAt: timeOf(fs, "endTime"),
+    outputFileId: outputFileId,
+    total: succeeded + failed + incomplete,
+    completed: succeeded,
+    failed: failed,
+  })
+}
+
+// The OpenAI list object for a page of Batch Prediction jobs.
+export function vertexJobListToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const items: string[] = []
+  const ids: string[] = []
+  for (const el of try elements(find(fs, "batchPredictionJobs") ?? "[]")) {
+    items.push(try vertexJobToOpenAI(el, ""))
+    ids.push(lastSegment(rawStr(try fields(el), "name") ?? ""))
+  }
+  const next = rawStr(fs, "nextPageToken") ?? ""
+  const firstId = ids.length > 0 ? ids[0]! : ""
+  const lastId = next !== "" ? next : ids.length > 0 ? ids[ids.length - 1]! : ""
+  return listJson(items, next !== "" ? "true" : "false", firstId, lastId)
+}
+
+// Whether a job has reached an end state (its output is final, or it will never have any).
+export function vertexJobEnded(raw: string): bool throws SyntaxError {
+  const s = rawStr(try fields(raw), "state") ?? ""
+  const st = jobStatus(s)
+  return s !== "" && st !== "validating" && st !== "in_progress" && st !== "cancelling"
+}
+
+// The gs:// directory a job writes its predictions under, "" when it has none yet.
+export function vertexOutputDir(raw: string): string throws SyntaxError {
+  return rawStr(try fields(find(try fields(raw), "outputInfo") ?? "{}"), "gcsOutputDirectory") ?? ""
+}
+
+// The OpenAI batch output JSONL for Vertex prediction lines. A line echoes its request,
+// which carries the custom id in its labels (Gemini) or at the top (Claude).
+export function vertexResultsToOpenAI(jsonl: string, model: string): string throws SyntaxError {
+  const out: string[] = []
+  for (const line of jsonlLines(jsonl)) {
+    const fs = try fields(line)
+    const req = try fields(find(fs, "request") ?? "{}")
+    const labels = try fields(find(req, "labels") ?? "{}")
+    const id = rawStr(fs, "custom_id") ?? rawStr(labels, "bifrost_custom_id") ?? ""
+    const resp = find(fs, "response")
+    if (resp !== undefined && !isNull(resp)) {
+      let done: Translated = { body: "", promptTokens: 0, completionTokens: 0 }
+      if (isClaude(model)) done = try anthropic.chatResponse(resp, model)
+      else done = try gemini.chatResponse(resp, model)
+      out.push(successLine(id, done.body))
+    } else {
+      const status = rawStr(fs, "status") ?? ""
+      out.push(errorLine(id, "request_failed", status !== "" ? status : "the request failed"))
+    }
+  }
+  return out.join("\n")
+}
+
+// One OpenAI batch output line, for a request that succeeded or did not.
+function successLine(customId: string, body: string): string {
+  return `{"id":${quote(newId("batch_req_"))},"custom_id":${quote(customId)},"response":{"status_code":200,"request_id":${quote(newId("req_"))},"body":${body}},"error":null}`
+}
+
+function errorLine(customId: string, code: string, message: string): string {
+  return `{"id":${quote(newId("batch_req_"))},"custom_id":${quote(customId)},"response":null,"error":{"code":${quote(code)},"message":${quote(message)}}}`
+}
+
+// The Vertex batch input location for a converted input: a sibling of the input file.
+export function vertexInputName(): string {
+  return "vertex-batch-input/" + newId("") + ".jsonl"
+}
+
+// ---- Bedrock: S3 objects ----
+
+// The static AWS credentials of a Bedrock key, or an error when it has none.
+export function staticCreds(bk: BedrockKeyConfig): S3Creds throws SyntaxError {
+  const ak = bk.access_key ?? ""
+  if (ak === "") throw new SyntaxError("bedrock: key has no access_key")
+  return { accessKey: ak, secretKey: bk.secret_key ?? "", sessionToken: bk.session_token, region: bedrockRegion(bk) }
+}
+
+// The credentials from an AssumeRole answer, in the key's region.
+export function assumedCreds(a: AssumedCreds, region: string): S3Creds {
+  return { accessKey: a.accessKey, secretKey: a.secretKey, sessionToken: a.sessionToken, region: region }
+}
+
+// The key's region, us-east-1 when it has none.
+export function bedrockRegion(bk: BedrockKeyConfig): string {
+  const r = bk.region ?? ""
+  return r === "" ? "us-east-1" : r
+}
+
+// The custom S3 endpoint of a key (its base_url), or "" for AWS's virtual-hosted URLs.
+export function s3Endpoint(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  return b === undefined ? "" : trimSlash(b)
+}
+
+// The scheme and host of a Bedrock service in a region: the key's base_url when set, else AWS's.
+export function bedrockOrigin(t: Target, service: string, region: string): { scheme: string, host: string } {
+  const b = t.cfg.network_config?.base_url
+  if (b !== undefined && b !== "") {
+    const u = URL.parse(b)
+    if (u !== undefined) return { scheme: b.startsWith("http://") ? "http://" : "https://", host: u.host }
+  }
+  return { scheme: "https://", host: `${service}.${region}.amazonaws.com` }
+}
+
+// The batch bucket and prefix of a key: its batch_s3_config default, else its first bucket.
+export function batchBucket(bk: BedrockKeyConfig): { bucket: string, prefix: string } | undefined {
+  const bs = bk.batch_s3_config?.buckets ?? []
+  let pick: { bucket_name: string, prefix?: string, is_default?: bool } | undefined = undefined
+  for (const b of bs) {
+    if (b.is_default === true) pick = b
+  }
+  if (pick === undefined && bs.length > 0) pick = bs[0]
+  if (pick === undefined) return undefined
+  return { bucket: pick.bucket_name, prefix: pick.prefix ?? "" }
+}
+
+// The service role a batch job runs as, in Bifrost's order: the key's batch_role_arn,
+// then the request's role_arn, then the key's role_arn.
+export function bedrockRole(batchRole: string | undefined, bodyRole: string, keyRole: string | undefined): string {
+  if (batchRole !== undefined && batchRole !== "") return batchRole
+  if (bodyRole !== "") return bodyRole
+  return keyRole ?? ""
+}
+
+// A signed S3 request for one object (GET, PUT or DELETE) of a bucket.
+export function s3Object(c: S3Creds, endpoint: string, bucket: string, key: string, method: string, body: string, contentType: string, nowMs: number): native.MediaRequest {
+  return sendable(s3Call(c, endpoint, method, bucket, key, [], body, contentType, nowMs))
+}
+
+// A signed ListObjectsV2 request for one page of a bucket under a prefix.
+export function s3List(c: S3Creds, endpoint: string, bucket: string, prefix: string, token: string, limit: string, nowMs: number): native.MediaRequest {
+  const pairs: string[][] = [["list-type", "2"]]
+  if (prefix !== "") pairs.push(["prefix", prefix])
+  if (token !== "") pairs.push(["continuation-token", token])
+  if (limit !== "") pairs.push(["max-keys", limit])
+  return sendable(s3Call(c, endpoint, "GET", bucket, "", pairs, "", "", nowMs))
+}
+
+// One object of a ListObjectsV2 answer.
+type S3Item = { key: string, size: f64, modified: f64 }
+
+// The objects of a ListObjectsV2 answer (keys are XML-unescaped).
+function s3Items(xml: string): S3Item[] {
+  const out: S3Item[] = []
+  let rest = xml
+  let start = rest.indexOf("<Contents>")
+  while (start >= 0) {
+    const from = rest.slice(start)
+    const end = from.indexOf("</Contents>")
+    if (end < 0) break
+    const block = from.slice(0, end)
+    const size: f64 = parseInt(xmlTag(block, "Size") ?? "") ?? 0
+    const ms = parseIsoUtcMs(xmlTag(block, "LastModified") ?? "")
+    out.push({ key: xmlTag(block, "Key") ?? "", size: size, modified: ms === undefined ? 0 : ms / 1000.0 })
+    rest = from.slice(end + "</Contents>".byteLength)
+    start = rest.indexOf("<Contents>")
+  }
+  return out
+}
+
+// The OpenAI file object for an S3 object.
+export function s3FileToOpenAI(bucket: string, key: string, bytes: f64, modified: f64): string {
+  return fileObject("s3://", bucket, key, bytes, modified)
+}
+
+// The OpenAI list object for a ListObjectsV2 answer.
+export function s3ListToOpenAI(xml: string, bucket: string): string {
+  const its = s3Items(xml)
+  const items: string[] = []
+  for (const i of its) items.push(fileObject("s3://", bucket, i.key, i.size, i.modified))
+  const truncated = xmlTag(xml, "IsTruncated") === "true"
+  const next = xmlTag(xml, "NextContinuationToken") ?? ""
+  const firstId = its.length > 0 ? "s3://" + bucket + "/" + its[0]!.key : ""
+  const lastId = truncated && next !== "" ? next : its.length > 0 ? "s3://" + bucket + "/" + its[its.length - 1]!.key : ""
+  return listJson(items, truncated ? "true" : "false", firstId, lastId)
+}
+
+// The OpenAI file object of one key in a ListObjectsV2 answer, or undefined when absent.
+export function s3FileFromList(xml: string, bucket: string, key: string): string | undefined {
+  for (const i of s3Items(xml)) {
+    if (i.key === key) return fileObject("s3://", bucket, i.key, i.size, i.modified)
+  }
+  return undefined
+}
+
+// The keys of a ListObjectsV2 answer, in order.
+export function s3Keys(xml: string): string[] {
+  const out: string[] = []
+  for (const i of s3Items(xml)) out.push(i.key)
+  return out
+}
+
+// ---- Bedrock: model invocation (batch) jobs ----
+
+// The fields of a job the create call sends.
+export type BedrockJob = { name: string, model: string, role: string, inputUri: string, outputUri: string, hours: int }
+
+// POST /model-invocation-job: the job reads inputUri (s3://) and writes under outputUri.
+export function bedrockJobCreate(o: { scheme: string, host: string }, c: S3Creds, j: BedrockJob, nowMs: number): native.MediaRequest {
+  const tail = j.hours > 0 ? `,"timeoutDurationInHours":${j.hours}` : ""
+  const body = `{"jobName":${quote(j.name)},"modelId":${quote(j.model)},"roleArn":${quote(j.role)},"inputDataConfig":{"s3InputDataConfig":{"s3Uri":${quote(j.inputUri)},"s3InputFormat":"JSONL"}},"outputDataConfig":{"s3OutputDataConfig":{"s3Uri":${quote(j.outputUri)}}}${tail}}`
+  return sendable(awsCall(c, "bedrock", o.scheme, o.host, "POST", "/model-invocation-job", [], body, nowMs))
+}
+
+export function bedrockJobGet(o: { scheme: string, host: string }, c: S3Creds, id: string, nowMs: number): native.MediaRequest {
+  return sendable(awsCall(c, "bedrock", o.scheme, o.host, "GET", "/model-invocation-job/" + bedrock.encodeSegment(id), [], "", nowMs))
+}
+
+// GET one page of the jobs: limit and cursor are OpenAI's, renamed for the API.
+export function bedrockJobList(o: { scheme: string, host: string }, c: S3Creds, limit: string, cursor: string, nowMs: number): native.MediaRequest {
+  const pairs: string[][] = []
+  if (limit !== "") pairs.push(["maxResults", limit])
+  if (cursor !== "") pairs.push(["nextToken", cursor])
+  return sendable(awsCall(c, "bedrock", o.scheme, o.host, "GET", "/model-invocation-jobs", pairs, "", nowMs))
+}
+
+export function bedrockJobStop(o: { scheme: string, host: string }, c: S3Creds, id: string, nowMs: number): native.MediaRequest {
+  return sendable(awsCall(c, "bedrock", o.scheme, o.host, "POST", "/model-invocation-job/" + bedrock.encodeSegment(id) + "/stop", [], "{}", nowMs))
+}
+
+// Bedrock's job statuses as OpenAI's batch statuses (Bifrost's mapping).
+function bedrockStatus(s: string): string {
+  if (s === "Submitted" || s === "Validating" || s === "Scheduled") return "validating"
+  if (s === "Completed") return "completed"
+  if (s === "Failed" || s === "PartiallyCompleted") return "failed"
+  if (s === "Stopping") return "cancelling"
+  if (s === "Stopped") return "cancelled"
+  if (s === "Expired") return "expired"
+  return "in_progress"
+}
+
+// The OpenAI batch object for a model invocation job. The id is the job's own id (the last
+// part of its ARN), which Bedrock also takes in place of the ARN.
+export function bedrockJobToOpenAI(raw: string, outputFileId: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  return batchJson({
+    id: lastSegment(rawStr(fs, "jobArn") ?? ""),
+    status: bedrockStatus(rawStr(fs, "status") ?? ""),
+    createdAt: timeOf(fs, "submitTime"),
+    endedAt: timeOf(fs, "endTime"),
+    outputFileId: outputFileId,
+    total: 0,
+    completed: 0,
+    failed: 0,
+  })
+}
+
+// The OpenAI list object for a page of model invocation jobs.
+export function bedrockJobListToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const items: string[] = []
+  const ids: string[] = []
+  for (const el of try elements(find(fs, "invocationJobSummaries") ?? "[]")) {
+    items.push(try bedrockJobToOpenAI(el, ""))
+    ids.push(lastSegment(rawStr(try fields(el), "jobArn") ?? ""))
+  }
+  const next = rawStr(fs, "nextToken") ?? ""
+  const firstId = ids.length > 0 ? ids[0]! : ""
+  const lastId = next !== "" ? next : ids.length > 0 ? ids[ids.length - 1]! : ""
+  return listJson(items, next !== "" ? "true" : "false", firstId, lastId)
+}
+
+// Whether a job has reached an end state.
+export function bedrockJobEnded(raw: string): bool throws SyntaxError {
+  const st = bedrockStatus(rawStr(try fields(raw), "status") ?? "")
+  return st === "completed" || st === "failed" || st === "cancelled" || st === "expired"
+}
+
+// The model a job runs on (its modelId).
+export function bedrockJobModel(raw: string): string throws SyntaxError {
+  return rawStr(try fields(raw), "modelId") ?? ""
+}
+
+// The S3 prefix a job writes its results under (its output URI), "" when it has none.
+export function bedrockOutputUri(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  return rawStr(try fields(find(try fields(find(fs, "outputDataConfig") ?? "{}"), "s3OutputDataConfig") ?? "{}"), "s3Uri") ?? ""
+}
+
+// The Bedrock batch input (JSONL records) for an OpenAI batch input file. A Claude record's
+// modelInput is a Messages body with Bedrock's version; other models take the body as given.
+// The model is not in the record: it is the job's.
+export function bedrockInputJsonl(jsonl: string, model: string): string throws SyntaxError {
+  const out: string[] = []
+  for (const line of jsonlLines(jsonl)) {
+    const l = try inLine(line)
+    const m = l.model !== "" ? l.model : model
+    if (m === "") throw new SyntaxError(`batch line ${l.id}: model is required`)
+    let mi = ""
+    if (m.includes("anthropic.")) {
+      let fs = try fields(try anthropic.messagesBody(try chatOf(l, m), l.body, m, false, false))
+      fs = without(fs, ["model"])
+      if (find(fs, "anthropic_version") === undefined) setField(&fs, "anthropic_version", quote("bedrock-2023-05-31"))
+      mi = build(fs)
+    } else {
+      mi = build(without(l.body, ["model"]))
+    }
+    out.push(`{"recordId":${quote(l.id)},"modelInput":${mi}}`)
+  }
+  if (out.length === 0) throw new SyntaxError("the batch input has no requests")
+  return out.join("\n") + "\n"
+}
+
+// The OpenAI batch output JSONL for Bedrock's result records. A Claude answer is converted
+// from its Messages body; other models must already answer in the chat shape.
+export function bedrockResultsToOpenAI(jsonl: string, model: string): string throws SyntaxError {
+  const out: string[] = []
+  for (const line of jsonlLines(jsonl)) {
+    const fs = try fields(line)
+    const id = rawStr(fs, "recordId") ?? ""
+    const errRaw = find(fs, "error")
+    if (errRaw !== undefined && !isNull(errRaw)) {
+      const ef = try fields(errRaw)
+      out.push(errorLine(id, `${rawNum(ef, "errorCode") ?? 0}`, rawStr(ef, "errorMessage") ?? "the request failed"))
+      continue
+    }
+    const mo = find(fs, "modelOutput")
+    if (mo === undefined || isNull(mo)) {
+      out.push(errorLine(id, "no_output", "the request has no model output"))
+      continue
+    }
+    if (model.includes("anthropic.")) {
+      const done = try anthropic.chatResponse(mo, model)
+      out.push(successLine(id, done.body))
+    } else if (mo.includes(`"choices"`)) {
+      out.push(successLine(id, mo))
+    } else {
+      out.push(errorLine(id, "unsupported_output", "this model's output is not converted to the chat shape"))
+    }
+  }
+  return out.join("\n")
+}
+
+// A job's name: the caller's (metadata job_name), else a fresh one.
+export function jobName(explicit: string): string {
+  return explicit !== "" ? explicit : "raiju-batch-" + newId("")
+}
+
+// The hours of a completion window such as "24h" (24 when it is not in hours).
+export function windowHours(w: string): int {
+  if (!w.endsWith("h")) return 24
+  return parseInt(w.slice(0, w.byteLength - 1)) ?? 24
+}
+
+// A fresh name for a batch input the gateway writes to a bucket.
+export function bedrockInputName(): string {
+  return "bedrock-batch-input/" + newId("") + ".jsonl"
+}
+
 // ---- tests ----
 
 const VX: Target = { provider: "vertex", kind: "vertex", model: "imagen-3.0-generate-002", key: { value: "", vertex_key_config: { project_id: "proj", region: "us-central1" } }, cfg: {} }
@@ -198,4 +921,353 @@ test("bedrock image answers become openai images bodies", () => {
     none = true
   }
   expect(none).toBe(true)
+})
+
+const GT: Target = { provider: "vertex", kind: "vertex", model: "gemini-2.5-flash", key: { value: "", vertex_key_config: { project_id: "proj", region: "us-central1" } }, cfg: {} }
+const S3K: S3Creds = { accessKey: "AKIAIOSFODNN7EXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-east-1" }
+const NOW = 1791979200000.0 // 2026-10-14T12:00:00Z
+
+test("sigv4 for list, stop and path-style put matches the independent reference", () => {
+  const list = s3Call(S3K, "", "GET", "bkt", "", [["prefix", "a b/c"], ["list-type", "2"]], "", "", NOW)
+  expect(list.url).toBe("https://bkt.s3.us-east-1.amazonaws.com/?list-type=2&prefix=a%20b%2Fc")
+  expect(list.headers.get("authorization")).toBe("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261014/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=cc64150c571d20e5b5d22cce68f67fd5bec9421c986a0d750787934ece61492f")
+  expect(list.headers.has("host")).toBe(false)
+  const stop = awsCall({ accessKey: "AKIAIOSFODNN7EXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-west-2" }, "bedrock", "https://", "bedrock.us-west-2.amazonaws.com", "POST", "/model-invocation-job/abc123/stop", [], "{}", NOW)
+  expect(stop.url).toBe("https://bedrock.us-west-2.amazonaws.com/model-invocation-job/abc123/stop")
+  expect(stop.headers.get("authorization")).toBe("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261014/us-west-2/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=b24e6cb706cfcc045c0b12dca7cc3faf7cfa4aece87e583135d901e78e824dcd")
+  expect(stop.headers.get("content-type")).toBe("application/json")
+  const put = s3Call(S3K, "http://mock.local:9000/", "PUT", "bkt", "a/b c.jsonl", [], "x", "application/jsonl", NOW)
+  expect(put.url).toBe("http://mock.local:9000/bkt/a/b%20c.jsonl")
+  expect(put.headers.get("authorization")).toBe("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261014/us-east-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=52e807089a3508c4af3a93cdb97e715ff8d4fd6c4abca8f87684390d4709ff8a")
+  expect(put.headers.get("content-type")).toBe("application/jsonl")
+})
+
+test("bucket and key parts of gs:// and s3:// URIs", () => {
+  const g = try gsParse("gs://bkt/out/dir/x.jsonl")
+  expect(g.bucket).toBe("bkt")
+  expect(g.key).toBe("out/dir/x.jsonl")
+  expect(try gsParse("gs://bkt").key).toBe("")
+  expect(try s3Parse("s3://b2/k").key).toBe("k")
+  let bad = 0
+  for (const u of ["s3://b/k", "gs://", "gs:///x", "http://x"]) {
+    try {
+      gsParse(u)
+    } catch (e) {
+      bad += 1
+    }
+  }
+  expect(bad).toBe(4)
+})
+
+test("gcs object names keep the prefix tidy and the filename last", () => {
+  const n = gcsObjectName("/p//q/", "a.jsonl")
+  expect(n.startsWith("p/q/vertex-files/")).toBe(true)
+  expect(n.endsWith("/a.jsonl")).toBe(true)
+  expect(gcsObjectName("", "b.jsonl").startsWith("vertex-files/")).toBe(true)
+})
+
+test("gcs upload, object and list requests", () => {
+  const up = gcsUpload(GT, "tok", "bkt", "a/b.jsonl", "{}\n", "application/jsonl")
+  expect(up.url).toBe("https://storage.googleapis.com/upload/storage/v1/b/bkt/o?uploadType=media&name=a%2Fb.jsonl")
+  expect(up.headers.get("authorization")).toBe("Bearer tok")
+  expect(up.headers.get("content-type")).toBe("application/jsonl")
+  expect(up.body).toBe("{}\n")
+  const meta = gcsObject(GT, "tok", "bkt", "a/b.jsonl", "GET", false)
+  expect(meta.url).toBe("https://storage.googleapis.com/storage/v1/b/bkt/o/a%2Fb.jsonl")
+  expect(gcsObject(GT, "tok", "bkt", "a/b.jsonl", "GET", true).url.endsWith("?alt=media")).toBe(true)
+  expect(gcsObject(GT, "tok", "bkt", "a/b.jsonl", "DELETE", false).method).toBe("DELETE")
+  const L = gcsList(GT, "tok", "bkt", "x/y", "2", "abc")
+  expect(L.url.includes("prefix=x%2Fy")).toBe(true)
+  expect(L.url.includes("maxResults=2")).toBe(true)
+  expect(L.url.includes("pageToken=abc")).toBe(true)
+  const over: Target = { provider: "vertex", kind: "vertex", model: "m", key: { value: "", vertex_key_config: { project_id: "p", region: "r" } }, cfg: { network_config: { base_url: "http://mock.local/" } } }
+  expect(gcsObject(over, "t", "b", "n", "GET", false).url).toBe("http://mock.local/storage/v1/b/b/o/n")
+})
+
+test("gcs objects and listings become openai file objects", () => {
+  const f = try JSON.parse(try gcsFileToOpenAI(`{"name":"p/vertex-files/1/a.jsonl","size":"12","timeCreated":"2026-10-14T12:00:00.000Z"}`, "bkt")) as { id: string, object: string, bytes: number, created_at: number, filename: string, purpose: string, status: string }
+  expect(f.id).toBe("gs://bkt/p/vertex-files/1/a.jsonl")
+  expect(f.bytes).toBe(12)
+  expect(f.created_at).toBe(1791979200)
+  expect(f.filename).toBe("a.jsonl")
+  expect(f.purpose).toBe("batch")
+  expect(f.status).toBe("processed")
+  const l = try JSON.parse(try gcsFileListToOpenAI(`{"items":[{"name":"x/1","size":"1","timeCreated":"2026-10-14T12:00:00Z"},{"name":"x/2","size":"2","timeCreated":"2026-10-14T12:00:00Z"}],"nextPageToken":"tok2"}`, "bkt")) as { object: string, data: { id: string }[], has_more: bool, first_id: string, last_id: string }
+  expect(l.object).toBe("list")
+  expect(l.data.length).toBe(2)
+  expect(l.first_id).toBe("gs://bkt/x/1")
+  expect(l.has_more).toBe(true)
+  expect(l.last_id).toBe("tok2")
+  const e = try JSON.parse(try gcsFileListToOpenAI(`{}`, "bkt")) as { data: string[], has_more: bool, first_id: string | undefined, last_id: string | undefined }
+  expect(e.data.length).toBe(0)
+  expect(e.has_more).toBe(false)
+  expect(e.first_id).toBe(undefined)
+  expect(try gcsNames(`{"items":[{"name":"o/predictions_1.jsonl"},{"name":"o/errors.json"}]}`).length).toBe(2)
+  expect(predictionName("o/predictions_1.jsonl")).toBe(true)
+  expect(predictionName("o/errors.json")).toBe(false)
+  expect(deletedToOpenAI("gs://bkt/x")).toBe(`{"id":"gs://bkt/x","object":"file","deleted":true}`)
+})
+
+test("vertex instances: gemini carries the custom id in labels, claude at the top", () => {
+  const jsonl = `{"custom_id":"c1","method":"POST","url":"/v1/chat/completions","body":{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]}}\n{"custom_id":"c2","method":"POST","url":"/v1/chat/completions","body":{"model":"anthropic/claude-sonnet-4-5","messages":[{"role":"user","content":"yo"}],"max_tokens":10}}\n`
+  const out = try vertexInstances(jsonl, "")
+  const ls = out.split("\n").filter((x) => x !== "")
+  expect(ls.length).toBe(2)
+  const g = try JSON.parse(ls[0]!) as { request: { labels: { bifrost_custom_id: string }, contents: { role: string }[] } }
+  expect(g.request.labels.bifrost_custom_id).toBe("c1")
+  expect(g.request.contents.length > 0).toBe(true)
+  const c = try JSON.parse(ls[1]!) as { custom_id: string, request: { anthropic_version: string, model?: string, max_tokens: number } }
+  expect(c.custom_id).toBe("c2")
+  expect(c.request.anthropic_version).toBe("vertex-2023-10-16")
+  expect(c.request.model === undefined).toBe(true)
+  expect(c.request.max_tokens).toBe(10)
+  let threw = 0
+  for (const bad of [`{"body":{"model":"m","messages":[]}}`, `{"custom_id":"x","url":"/v1/embeddings","body":{"messages":[]}}`, `{"custom_id":"x","url":"/v1/chat/completions","body":{"model":"m"}}`]) {
+    try {
+      vertexInstances(bad + "\n", "gemini-2.5-flash")
+    } catch (e) {
+      threw += 1
+    }
+  }
+  expect(threw).toBe(3)
+  let none = false
+  try {
+    vertexInstances("\n", "gemini-2.5-flash")
+  } catch (e) {
+    none = true
+  }
+  expect(none).toBe(true)
+})
+
+test("vertex jobs: create, get, list and cancel requests", () => {
+  const create = try vertexJobCreate(GT, "tok", "nightly", "gemini-2.5-flash", "gs://in/x.jsonl", "gs://out/d")
+  expect(create.url).toBe("https://us-central1-aiplatform.googleapis.com/v1/projects/proj/locations/us-central1/batchPredictionJobs")
+  expect((create.body as string).includes(`"model":"publishers/google/models/gemini-2.5-flash"`)).toBe(true)
+  expect((create.body as string).includes(`"uris":["gs://in/x.jsonl"]`)).toBe(true)
+  expect((create.body as string).includes(`"outputUriPrefix":"gs://out/d"`)).toBe(true)
+  expect(create.headers.get("content-type")).toBe("application/json")
+  const cl = try vertexJobCreate(GT, "tok", "n", "claude-sonnet-4-5", "gs://i", "gs://o")
+  expect((cl.body as string).includes(`"model":"publishers/anthropic/models/claude-sonnet-4-5"`)).toBe(true)
+  expect(try vertexJobGet(GT, "tok", "123").url).toBe("https://us-central1-aiplatform.googleapis.com/v1/projects/proj/locations/us-central1/batchPredictionJobs/123")
+  expect(try vertexJobCancel(GT, "tok", "123").url.endsWith("/batchPredictionJobs/123:cancel")).toBe(true)
+  expect(try vertexJobList(GT, "tok", "5", "t9").url.endsWith("/batchPredictionJobs?pageSize=5&pageToken=t9")).toBe(true)
+  expect(try vertexJobList(GT, "tok", "", "").url.endsWith("/batchPredictionJobs")).toBe(true)
+  const noRegion: Target = { provider: "vertex", kind: "vertex", model: "m", key: { value: "", vertex_key_config: { project_id: "p", region: "" } }, cfg: {} }
+  let threw = false
+  try {
+    vertexLocation(noRegion)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("vertex job answers become openai batch objects", () => {
+  const job = `{"name":"projects/p/locations/l/batchPredictionJobs/123","state":"JOB_STATE_SUCCEEDED","createTime":"2026-10-14T12:00:00Z","endTime":"2026-10-14T12:05:00Z","completionStats":{"successfulCount":"2","failedCount":"1","incompleteCount":"0"}}`
+  const b = try JSON.parse(try vertexJobToOpenAI(job, "raiju-batch-output-123")) as { id: string, object: string, status: string, output_file_id: string, created_at: number, completed_at: number, request_counts: { total: number, completed: number, failed: number } }
+  expect(b.id).toBe("123")
+  expect(b.object).toBe("batch")
+  expect(b.status).toBe("completed")
+  expect(b.output_file_id).toBe("raiju-batch-output-123")
+  expect(b.created_at).toBe(1791979200)
+  expect(b.completed_at).toBe(1791979500)
+  expect(b.request_counts.total).toBe(3)
+  expect(b.request_counts.completed).toBe(2)
+  expect(b.request_counts.failed).toBe(1)
+  expect(try vertexJobEnded(job)).toBe(true)
+  expect(try vertexJobEnded(`{"state":"JOB_STATE_RUNNING"}`)).toBe(false)
+  expect(try vertexOutputDir(`{"outputInfo":{"gcsOutputDirectory":"gs://out/d/prediction-x"}}`)).toBe("gs://out/d/prediction-x")
+  const cancelled = try JSON.parse(try vertexJobToOpenAI(`{"name":"projects/p/locations/l/batchPredictionJobs/9","state":"JOB_STATE_CANCELLED","endTime":"2026-10-14T12:00:00Z"}`, "")) as { status: string, cancelled_at: number, output_file_id?: string }
+  expect(cancelled.status).toBe("cancelled")
+  expect(cancelled.cancelled_at).toBe(1791979200)
+  expect(cancelled.output_file_id === undefined).toBe(true)
+  const list = try JSON.parse(try vertexJobListToOpenAI(`{"batchPredictionJobs":[${job}],"nextPageToken":"nx"}`)) as { data: { id: string }[], has_more: bool, last_id: string, first_id: string }
+  expect(list.data[0]!.id).toBe("123")
+  expect(list.first_id).toBe("123")
+  expect(list.has_more).toBe(true)
+  expect(list.last_id).toBe("nx")
+})
+
+test("vertex results: prediction lines become openai batch output", () => {
+  const gem = `{"request":{"contents":[],"labels":{"bifrost_custom_id":"c1"}},"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"hi there"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}},"status":""}`
+  const err = `{"request":{"labels":{"bifrost_custom_id":"c2"}},"status":"quota exceeded"}`
+  const lines = try vertexResultsToOpenAI(gem + "\n" + err + "\n", "gemini-2.5-flash")
+  const out = lines.split("\n")
+  expect(out.length).toBe(2)
+  const ok = try JSON.parse(out[0]!) as { custom_id: string, response: { status_code: number, body: { choices: { message: { content: string } }[] } }, error?: string }
+  expect(ok.custom_id).toBe("c1")
+  expect(ok.response.status_code).toBe(200)
+  expect(ok.response.body.choices[0]!.message.content).toBe("hi there")
+  const bad = try JSON.parse(out[1]!) as { custom_id: string, response?: string, error: { code: string, message: string } }
+  expect(bad.custom_id).toBe("c2")
+  expect(bad.error.message).toBe("quota exceeded")
+})
+
+test("bedrock jobs: create, get, list and stop requests", () => {
+  const o = { scheme: "http://", host: "mock.local:9" }
+  const req = bedrockJobCreate(o, S3K, { name: "j1", model: "anthropic.claude-3-haiku", role: "arn:aws:iam::1:role/r", inputUri: "s3://in/a.jsonl", outputUri: "s3://out/p/", hours: 24 }, NOW)
+  expect(req.url).toBe("http://mock.local:9/model-invocation-job")
+  expect(req.method).toBe("POST")
+  expect((req.body as string).includes(`"roleArn":"arn:aws:iam::1:role/r"`)).toBe(true)
+  expect((req.body as string).includes(`"s3InputDataConfig":{"s3Uri":"s3://in/a.jsonl","s3InputFormat":"JSONL"}`)).toBe(true)
+  expect((req.body as string).endsWith(`,"timeoutDurationInHours":24}`)).toBe(true)
+  expect(req.headers.get("authorization")!.includes("/us-east-1/bedrock/aws4_request")).toBe(true)
+  const noHours = bedrockJobCreate(o, S3K, { name: "j", model: "m", role: "r", inputUri: "s3://i/k", outputUri: "s3://o/", hours: 0 }, NOW)
+  expect((noHours.body as string).includes("timeoutDurationInHours")).toBe(false)
+  expect(bedrockJobGet(o, S3K, "abc123", NOW).url).toBe("http://mock.local:9/model-invocation-job/abc123")
+  expect(bedrockJobStop(o, S3K, "abc123", NOW).url).toBe("http://mock.local:9/model-invocation-job/abc123/stop")
+  expect(bedrockJobList(o, S3K, "3", "tk", NOW).url).toBe("http://mock.local:9/model-invocation-jobs?maxResults=3&nextToken=tk")
+})
+
+test("bedrock job answers become openai batch objects", () => {
+  const job = `{"jobArn":"arn:aws:bedrock:us-east-1:1:model-invocation-job/abc123def456","status":"Completed","submitTime":"2026-10-14T12:00:00Z","endTime":"2026-10-14T12:05:00Z","modelId":"anthropic.claude-3-haiku"}`
+  const b = try JSON.parse(try bedrockJobToOpenAI(job, "raiju-batch-output-abc123def456")) as { id: string, status: string, completed_at: number, output_file_id: string }
+  expect(b.id).toBe("abc123def456")
+  expect(b.status).toBe("completed")
+  expect(b.completed_at).toBe(1791979500)
+  expect(b.output_file_id).toBe("raiju-batch-output-abc123def456")
+  expect(try bedrockJobEnded(job)).toBe(true)
+  expect(try bedrockJobModel(job)).toBe("anthropic.claude-3-haiku")
+  expect(try bedrockOutputUri(`{"outputDataConfig":{"s3OutputDataConfig":{"s3Uri":"s3://bkt/out/"}}}`)).toBe("s3://bkt/out/")
+  expect(try bedrockOutputUri(`{}`)).toBe("")
+  const statuses = ["Submitted", "Validating", "InProgress", "Failed", "PartiallyCompleted", "Stopping", "Stopped", "Expired"]
+  const want = ["validating", "validating", "in_progress", "failed", "failed", "cancelling", "cancelled", "expired"]
+  for (let i = 0; i < statuses.length; i++) {
+    const s = try JSON.parse(try bedrockJobToOpenAI(`{"jobArn":"x/j${i}","status":"${statuses[i]!}"}`, "")) as { status: string }
+    expect(s.status).toBe(want[i]!)
+  }
+  const list = try JSON.parse(try bedrockJobListToOpenAI(`{"invocationJobSummaries":[${job}],"nextToken":"nt"}`)) as { data: { id: string }[], has_more: bool, last_id: string }
+  expect(list.data[0]!.id).toBe("abc123def456")
+  expect(list.has_more).toBe(true)
+  expect(list.last_id).toBe("nt")
+})
+
+test("bedrock input: claude records take a bedrock messages body, others pass through", () => {
+  const jsonl = `{"custom_id":"c1","method":"POST","url":"/v1/chat/completions","body":{"model":"anthropic.claude-3-haiku","messages":[{"role":"user","content":"hi"}],"max_tokens":8}}\n{"custom_id":"c2","method":"POST","url":"/v1/chat/completions","body":{"model":"amazon.nova-lite","messages":[{"role":"user","content":"yo"}]}}\n`
+  const out = try bedrockInputJsonl(jsonl, "")
+  const ls = out.split("\n").filter((x) => x !== "")
+  const a = try JSON.parse(ls[0]!) as { recordId: string, modelInput: { anthropic_version: string, max_tokens: number, model?: string } }
+  expect(a.recordId).toBe("c1")
+  expect(a.modelInput.anthropic_version).toBe("bedrock-2023-05-31")
+  expect(a.modelInput.max_tokens).toBe(8)
+  expect(a.modelInput.model === undefined).toBe(true)
+  const b = try JSON.parse(ls[1]!) as { recordId: string, modelInput: { messages: { role: string }[], model?: string } }
+  expect(b.recordId).toBe("c2")
+  expect(b.modelInput.messages.length).toBe(1)
+  expect(b.modelInput.model === undefined).toBe(true)
+  let none = false
+  try {
+    bedrockInputJsonl("", "")
+  } catch (e) {
+    none = true
+  }
+  expect(none).toBe(true)
+})
+
+test("bedrock results: claude answers convert, errors and chat-shaped answers pass", () => {
+  const msg = `{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}`
+  const jsonl = `{"recordId":"c1","modelInput":{},"modelOutput":${msg}}\n{"recordId":"c2","modelInput":{},"error":{"errorCode":500,"errorMessage":"throttled"}}\n`
+  const out = try bedrockResultsToOpenAI(jsonl, "anthropic.claude-3-haiku")
+  const ls = out.split("\n")
+  const ok = try JSON.parse(ls[0]!) as { custom_id: string, response: { body: { choices: { message: { content: string } }[] } } }
+  expect(ok.custom_id).toBe("c1")
+  expect(ok.response.body.choices[0]!.message.content).toBe("hello")
+  const bad = try JSON.parse(ls[1]!) as { custom_id: string, error: { code: string, message: string } }
+  expect(bad.custom_id).toBe("c2")
+  expect(bad.error.code).toBe("500")
+  expect(bad.error.message).toBe("throttled")
+  const chat = `{"recordId":"c3","modelOutput":{"id":"x","object":"chat.completion","choices":[]}}`
+  expect(try bedrockResultsToOpenAI(chat, "amazon.nova").includes(`"custom_id":"c3"`)).toBe(true)
+  expect(try bedrockResultsToOpenAI(`{"recordId":"c4","modelOutput":{"other":1}}`, "amazon.nova").includes("unsupported_output")).toBe(true)
+})
+
+test("bedrock roles, buckets, hours and names", () => {
+  expect(bedrockRole("batch-r", "body-r", "key-r")).toBe("batch-r")
+  expect(bedrockRole(undefined, "body-r", "key-r")).toBe("body-r")
+  expect(bedrockRole("", "", "key-r")).toBe("key-r")
+  expect(bedrockRole(undefined, "", undefined)).toBe("")
+  const bk: BedrockKeyConfig = { access_key: "AK", secret_key: "s", batch_s3_config: { buckets: [{ bucket_name: "first", prefix: "f/" }, { bucket_name: "dflt", prefix: "d", is_default: true }] } }
+  expect(batchBucket(bk)!.bucket).toBe("dflt")
+  expect(batchBucket(bk)!.prefix).toBe("d")
+  const first: BedrockKeyConfig = { batch_s3_config: { buckets: [{ bucket_name: "only" }] } }
+  expect(batchBucket(first)!.bucket).toBe("only")
+  expect(batchBucket(first)!.prefix).toBe("")
+  expect(batchBucket({ access_key: "AK" }) === undefined).toBe(true)
+  expect(windowHours("24h")).toBe(24)
+  expect(windowHours("48h")).toBe(48)
+  expect(windowHours("1d")).toBe(24)
+  expect(jobName("mine")).toBe("mine")
+  expect(jobName("").startsWith("raiju-batch-")).toBe(true)
+  expect(bedrockInputName().startsWith("bedrock-batch-input/")).toBe(true)
+  expect(vertexInputName().startsWith("vertex-batch-input/")).toBe(true)
+})
+
+test("bedrock credentials and origins", () => {
+  const c = try staticCreds({ access_key: "AK", secret_key: "sec", session_token: "tok", region: "eu-west-1" })
+  expect(c.region).toBe("eu-west-1")
+  expect(c.sessionToken).toBe("tok")
+  let noKey = false
+  try {
+    staticCreds({ region: "us-east-1" })
+  } catch (e) {
+    noKey = true
+  }
+  expect(noKey).toBe(true)
+  expect(bedrockRegion({})).toBe("us-east-1")
+  const over: Target = { provider: "bedrock", kind: "bedrock", model: "m", key: { value: "" }, cfg: { network_config: { base_url: "http://mock.local:1/" } } }
+  expect(bedrockOrigin(over, "bedrock", "us-east-1").host).toBe("mock.local:1")
+  expect(bedrockOrigin(over, "bedrock", "us-east-1").scheme).toBe("http://")
+  expect(s3Endpoint(over)).toBe("http://mock.local:1")
+  const plain: Target = { provider: "bedrock", kind: "bedrock", model: "m", key: { value: "" }, cfg: {} }
+  expect(bedrockOrigin(plain, "bedrock", "eu-west-1").host).toBe("bedrock.eu-west-1.amazonaws.com")
+  expect(s3Endpoint(plain)).toBe("")
+  expect(assumedCreds({ accessKey: "A", secretKey: "S", sessionToken: "T", expiresAtMs: 1.0 }, "us-west-2").region).toBe("us-west-2")
+})
+
+test("s3 objects, listings and the list answers", () => {
+  const put = s3Object(S3K, "", "bkt", "p/x.jsonl", "PUT", "{}\n", "application/jsonl", NOW)
+  expect(put.url).toBe("https://bkt.s3.us-east-1.amazonaws.com/p/x.jsonl")
+  expect(put.body).toBe("{}\n")
+  const get = s3Object(S3K, "", "bkt", "p/x.jsonl", "GET", "", "", NOW)
+  expect(get.body === undefined).toBe(true)
+  const ls = s3List(S3K, "http://mock.local:9", "bkt", "p/", "", "10", NOW)
+  expect(ls.url).toBe("http://mock.local:9/bkt?list-type=2&max-keys=10&prefix=p%2F")
+  const xml = `<?xml version="1.0"?><ListBucketResult><Name>bkt</Name><IsTruncated>true</IsTruncated><NextContinuationToken>ct1</NextContinuationToken><Contents><Key>p/a b.jsonl</Key><Size>5</Size><LastModified>2026-10-14T12:00:00.000Z</LastModified></Contents><Contents><Key>p/c&amp;d.jsonl</Key><Size>7</Size><LastModified>2026-10-14T12:00:00.000Z</LastModified></Contents></ListBucketResult>`
+  const l = try JSON.parse(s3ListToOpenAI(xml, "bkt")) as { data: { id: string, bytes: number, filename: string }[], has_more: bool, first_id: string, last_id: string }
+  expect(l.data.length).toBe(2)
+  expect(l.data[0]!.id).toBe("s3://bkt/p/a b.jsonl")
+  expect(l.data[1]!.id).toBe("s3://bkt/p/c&d.jsonl")
+  expect(l.data[1]!.bytes).toBe(7)
+  expect(l.data[1]!.filename).toBe("c&d.jsonl")
+  expect(l.has_more).toBe(true)
+  expect(l.last_id).toBe("ct1")
+  expect(s3Keys(xml).join("|")).toBe("p/a b.jsonl|p/c&d.jsonl")
+  const one = try JSON.parse(s3FileFromList(xml, "bkt", "p/c&d.jsonl") ?? "{}") as { id: string, bytes: number }
+  expect(one.id).toBe("s3://bkt/p/c&d.jsonl")
+  expect(one.bytes).toBe(7)
+  expect(s3FileFromList(xml, "bkt", "p/none") === undefined).toBe(true)
+  const f = try JSON.parse(s3FileToOpenAI("bkt", "k/z.jsonl", 3, 1791979200.0)) as { id: string, purpose: string, status: string, created_at: number }
+  expect(f.id).toBe("s3://bkt/k/z.jsonl")
+  expect(f.purpose).toBe("batch")
+  expect(f.status).toBe("processed")
+  expect(f.created_at).toBe(1791979200)
+})
+
+test("the sigv4 canonical query sorts and encodes", () => {
+  expect(canonicalQuery([["prefix", "a b"], ["list-type", "2"], ["prefix", "a"]])).toBe("list-type=2&prefix=a&prefix=a%20b")
+  expect(canonicalQuery([])).toBe("")
+})
+
+test("path ids decode their escapes, and s3 keys drop empty prefix parts", () => {
+  expect(pctDecode("gs%3A%2F%2Fb%2Fx%20y")).toBe("gs://b/x y")
+  expect(pctDecode("plain")).toBe("plain")
+  expect(pctDecode("bad%zz%2")).toBe("bad%zz%2")
+  expect(pctDecode("%C3%A9")).toBe("é")
+  expect(s3KeyFor("/p//q/", "a.jsonl")).toBe("p/q/a.jsonl")
+  expect(s3KeyFor("", "a.jsonl")).toBe("a.jsonl")
+})
+
+test("the default batch output is the bucket's prefix with a slash", () => {
+  expect(defaultOutputUri("bkt", "/jobs//out/")).toBe("s3://bkt/jobs/out/")
+  expect(defaultOutputUri("bkt", "")).toBe("s3://bkt/")
 })
