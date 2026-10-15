@@ -1,0 +1,316 @@
+// GPT Live over WebSockets, as Bifrost's wslive.go and livecontrol.go: /v1/live/sessions takes a
+// session.start frame that names the model, and relays the session to OpenAI's live endpoint.
+// The provider's session.started event gives the session's id, which is recorded under the
+// virtual key that opened it. An attach (/v1/live/sessions/{id}/attach) and the recording
+// (/v1/live/sessions/{id}/content) are refused to any other virtual key, as not found.
+//
+// Not here: billing, transcripts and delegation (Bifrost's livesession.go), the WebRTC create
+// (POST /v1/live/sessions), forks, and the registry's sharing between worker processes.
+import { Engine, errorResponse, noHeaders } from "./gateway"
+import { parseModel, target } from "./router"
+import { Target } from "./providers/types"
+import { trimSlash } from "./providers/types"
+import { Field, fields, find, rawStr, setField, build, quote } from "./json"
+import { Hdrs, snapshot } from "./schemas"
+import { SocketExt, upstreamFor, wsBase } from "./realtime"
+
+// How many sessions the registry holds. Past that a new session is refused, not left unrecorded.
+const MAX_RECORDS = 10000
+
+// The virtual key that opened each live session, by the provider's session id.
+export class LiveRegistry {
+  owners: Map<string, string> = new Map()
+
+  // Records the owner of a session. False when the registry is full. A session opened with no
+  // virtual key is not recorded, and anyone may reach it.
+  bind(id: string, owner: string): bool {
+    if (owner === "" || id === "") return true
+    if (this.owners.has(id)) return this.owners.get(id) === owner
+    if (this.owners.size >= MAX_RECORDS) return false
+    this.owners.set(id, owner)
+    return true
+  }
+
+  // Whether a caller with this virtual key ("" for none) may use the session.
+  allowed(id: string, caller: string): bool {
+    if (caller === "") return true
+    const o = this.owners.get(id)
+    return o === undefined || o === caller
+  }
+}
+
+// The virtual key of a request, "" when it has none.
+export function ownerOf(engine: Engine, h: Hdrs): string {
+  return engine.gov.findKey(h)?.id ?? ""
+}
+
+// Whether the request presents a credential the gateway accepts, when governance is enforced.
+// A provider key sent directly satisfies it too, as it does for inference.
+export function credentialOk(engine: Engine, h: Hdrs): bool {
+  if (!engine.gov.enforce) return true
+  if (engine.gov.findKey(h) !== undefined || h.get("x-bf-api-key") !== undefined) return true
+  const alt = engine.gov.altAuth
+  return alt !== undefined && alt(h)
+}
+
+// Session ids are the provider's: letters, digits, "_" and "-". Anything else is refused before it
+// reaches an upstream path.
+export function validId(id: string): bool {
+  if (id === "" || id.byteLength > 200) return false
+  const ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+  for (let i = 0; i < id.byteLength; i++) {
+    if (!ok.includes(id.slice(i, i + 1))) return false
+  }
+  return true
+}
+
+// The id of a route /v1/live/sessions/{id}/attach, or "".
+export function attachId(p: string): string {
+  if (!p.startsWith("/v1/live/sessions/") || !p.endsWith("/attach")) return ""
+  return p.slice(18, p.byteLength - 7)
+}
+
+// The id of a route /v1/live/sessions/{id}/content, or "".
+export function contentId(p: string): string {
+  if (!p.startsWith("/v1/live/sessions/") || !p.endsWith("/content")) return ""
+  return p.slice(18, p.byteLength - 8)
+}
+
+// The OpenAI target the control routes use (attach and content name no model, so the openai
+// provider's key serves them, as in Bifrost).
+function controlTarget(engine: Engine, h: Hdrs): Target | undefined {
+  const sel = target(engine.cfg, { provider: "openai", model: "" }, new Set<int>(), h.get("x-bf-api-key") ?? undefined)
+  if (sel === undefined || sel.t.kind !== "openai") return undefined
+  return sel.t
+}
+
+function liveBase(t: Target): string {
+  return trimSlash(t.cfg.network_config?.base_url ?? "https://api.openai.com")
+}
+
+// The upstream URL and headers for an attach to a session, or undefined without an OpenAI key.
+export function attachUpstream(engine: Engine, h: Hdrs, id: string): { url: string, headers: Map<string, string> } | undefined {
+  const t = controlTarget(engine, h)
+  if (t === undefined) return undefined
+  const up = upstreamFor(t, undefined)
+  return { url: wsBase(liveBase(t)) + "/v1/live/sessions/" + id + "/attach", headers: up.headers }
+}
+
+// The type and message of a session's refusal, as Bifrost's realtime error event.
+function refusalEvent(type: string, message: string): string {
+  return JSON.stringify({ type: "error", error: { type: type, code: type, message: message } })
+}
+
+// Sets the session's model to the provider's name for it, leaving the rest of the frame as it is.
+export function rewriteStart(m: string, model: string): string throws SyntaxError {
+  let fs = try fields(m)
+  let sf: Field[] = []
+  const s = find(fs, "session")
+  if (s !== undefined) sf = try fields(s)
+  setField(&sf, "model", quote(model))
+  setField(&fs, "session", build(sf))
+  return build(fs)
+}
+
+// The session id of a session.started event, or "" for any other event.
+export function startedId(m: string): string {
+  if (!m.includes("session.started")) return ""
+  try {
+    const fs = fields(m)
+    if (rawStr(fs, "type") !== "session.started") return ""
+    const s = find(fs, "session")
+    if (s === undefined) return ""
+    return rawStr(fields(s), "id") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// The upstream WebSocket, or undefined when it can't be made (a malformed URL, say).
+function openUpstream(url: string, hs: Record<string, string>): WebSocket | undefined {
+  try {
+    return new WebSocket(url, { headers: hs })
+  } catch (e) {
+    return undefined
+  }
+}
+
+// One live WebSocket: a primary (session.start first, then the session) or an attach (joined at
+// once, to a session another connection runs). Frames pass through unchanged.
+export class LiveSocket extends SocketExt {
+  started = false
+  upstream: WebSocket | undefined = undefined
+  sessionId = ""
+  constructor(readonly engine: Engine, readonly reg: LiveRegistry, readonly headers: Map<string, string>, readonly owner: string, readonly attachUrl: string, readonly attachHeaders: Map<string, string>) {
+    super()
+  }
+
+  onOpen(): void {
+    if (this.attachUrl !== "") {
+      this.started = true
+      this.dial(this.attachUrl, this.attachHeaders, "")
+    }
+  }
+
+  onMessage(m: string): void {
+    if (this.closed || this.ended) return
+    const up = this.upstream
+    if (up !== undefined) {
+      up.send(m)
+      return
+    }
+    if (!this.started) this.start(m)
+  }
+
+  onClose(): void {
+    this.closed = true
+    const up = this.upstream
+    if (up !== undefined && up.readyState < 2) up.close()
+  }
+
+  // The first frame of a primary: resolves the model, admits the session and dials the provider.
+  private start(m: string): void {
+    const cfg = this.engine.cfg
+    let model = ""
+    let frame = ""
+    try {
+      const fs = fields(m)
+      if (rawStr(fs, "type") !== "session.start") {
+        this.refuse("invalid_request_error", "the first event of a live session must be session.start")
+        return
+      }
+      const s = find(fs, "session")
+      if (s !== undefined) model = rawStr(fields(s), "model") ?? ""
+    } catch (e) {
+      this.refuse("invalid_request_error", "failed to parse session.start JSON")
+      return
+    }
+    if (model.trim() === "") {
+      this.refuse("invalid_request_error", "session.start requires session.model")
+      return
+    }
+    const ref = parseModel(cfg, model)
+    const admitted = this.engine.gov.admit(this.headers, ref.provider, ref.model)
+    if (admitted.kind === "denial") {
+      this.refuse(admitted.type, admitted.message)
+      return
+    }
+    const sel = target(cfg, ref, new Set<int>(), this.headers.get("x-bf-api-key") ?? undefined)
+    if (sel === undefined) {
+      this.refuse("invalid_request_error", `no key is configured for ${ref.provider}/${ref.model}`)
+      return
+    }
+    if (sel.t.kind !== "openai") {
+      this.refuse("invalid_request_error", `${ref.provider} has no live API this gateway can relay`)
+      return
+    }
+    const up = upstreamFor(sel.t, undefined)
+    try {
+      frame = rewriteStart(m, sel.t.model)
+    } catch (e) {
+      this.refuse("invalid_request_error", "failed to parse session.start JSON")
+      return
+    }
+    this.dial(wsBase(liveBase(sel.t)) + "/v1/live/sessions", up.headers, frame)
+  }
+
+  private dial(url: string, headers: Map<string, string>, first: string): void {
+    const hs: Record<string, string> = {}
+    for (const k of headers.keys()) hs.set(k, headers.get(k)!)
+    this.started = true
+    const up = openUpstream(url, hs)
+    if (up === undefined) {
+      this.refuse("server_error", "failed to open the live connection at the provider")
+      return
+    }
+    this.upstream = up
+    // the start frame goes first: the client socket sends anything later behind it
+    if (first !== "") up.send(first)
+    up.onmessage = (ev) => {
+      this.fromUpstream(ev.data)
+    }
+    up.onclose = (ev) => {
+      this.endWith(ev.code === 1005 || ev.code === 1006 ? 1011 : ev.code, ev.reason)
+    }
+    up.onerror = (ev) => {
+      this.endWith(1011, "upstream live connection failed")
+    }
+  }
+
+  private fromUpstream(d: string | u8[]): void {
+    if (this.closed || this.ended || typeof d !== "string") return
+    if (this.attachUrl === "") {
+      const id = startedId(d)
+      if (id !== "") {
+        this.sessionId = id
+        if (!this.reg.bind(id, this.owner)) {
+          this.refuse("server_error", "the live session could not be recorded for its virtual key and was not opened")
+          return
+        }
+      }
+    }
+    this.send(d)
+  }
+
+  // Tells the client why the session ends, then ends it. The upstream, if dialed, is closed too.
+  private refuse(type: string, message: string): void {
+    this.send(refusalEvent(type, message))
+    const up = this.upstream
+    if (up !== undefined && up.readyState < 2) up.close()
+    this.endWith(1008, "refused")
+  }
+}
+
+// GET /v1/live/sessions/{id}/content: the recording the provider kept, streamed as it sends it.
+export async function liveContent(engine: Engine, reg: LiveRegistry, req: Request, id: string): Promise<Response> {
+  const h = snapshot(req.headers)
+  if (!validId(id)) return errorResponse(400, "a session id is required", "invalid_request_error", noHeaders())
+  if (!credentialOk(engine, h)) return errorResponse(401, "authentication is required for live sessions", "authentication_error", noHeaders())
+  if (!reg.allowed(id, ownerOf(engine, h))) return errorResponse(404, "live session not found", "invalid_request_error", noHeaders())
+  const t = controlTarget(engine, h)
+  if (t === undefined) return errorResponse(404, "no OpenAI key is configured for live sessions", "invalid_request_error", noHeaders())
+  const up = upstreamFor(t, undefined)
+  const hs: Record<string, string> = {}
+  for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+  try {
+    // buffered, as media.tov's files are: a streamed upstream body doesn't survive the Bun.serve path
+    const res = await fetch(liveBase(t) + "/v1/live/sessions/" + id + "/content", { method: "GET", headers: hs })
+    const bytes = await res.bytes()
+    const out: Record<string, string> = {}
+    out.set("content-type", res.headers.get("content-type") ?? "application/octet-stream")
+    return new Response(bytes, { status: res.status, headers: out })
+  } catch (e) {
+    console.error(`raiju: ${e.message}`)
+    return errorResponse(502, "failed to fetch the live session's recording", "api_error", noHeaders())
+  }
+}
+
+test("live session ids", () => {
+  expect(validId("sess_9aB-x")).toBe(true)
+  expect(validId("")).toBe(false)
+  expect(validId("a/b")).toBe(false)
+  expect(validId("a?x=1")).toBe(false)
+  expect(attachId("/v1/live/sessions/sess_1/attach")).toBe("sess_1")
+  expect(attachId("/v1/live/sessions/attach")).toBe("")
+  expect(contentId("/v1/live/sessions/sess_1/content")).toBe("sess_1")
+  expect(contentId("/v1/live/sessions/sess_1/attach")).toBe("")
+})
+
+test("live registry", () => {
+  const reg = new LiveRegistry()
+  expect(reg.bind("sess_a", "vk1")).toBe(true)
+  expect(reg.bind("sess_a", "vk2")).toBe(false)
+  expect(reg.allowed("sess_a", "vk1")).toBe(true)
+  expect(reg.allowed("sess_a", "vk2")).toBe(false)
+  expect(reg.allowed("sess_a", "")).toBe(true)
+  expect(reg.allowed("sess_unknown", "vk2")).toBe(true)
+  expect(reg.bind("sess_none", "")).toBe(true)
+  expect(reg.allowed("sess_none", "vk2")).toBe(true)
+})
+
+test("live start frames and ids", () => {
+  expect(try rewriteStart(`{"type":"session.start","session":{"model":"openai/gpt-live","voice":"alloy"}}`, "gpt-live")).toBe(`{"type":"session.start","session":{"model":"gpt-live","voice":"alloy"}}`)
+  expect(startedId(`{"type":"session.started","session":{"id":"sess_42"}}`)).toBe("sess_42")
+  expect(startedId(`{"type":"session.updated","session":{"id":"sess_42"}}`)).toBe("")
+  expect(startedId(`{"type":"response.audio.delta"}`)).toBe("")
+})

@@ -1,0 +1,156 @@
+// The Responses API over a WebSocket (GET /v1/responses with an upgrade), as Bifrost's
+// wsresponses.go: each response.create event runs through the responses path, streamed, and the
+// events it produces go back over the socket as text messages, one per event. Events run one at a
+// time per connection. The gateway builds a streamed answer whole, so the events go out when the
+// upstream has finished, not as each one arrives.
+import { Engine } from "./gateway"
+import { responsesApi } from "./native"
+import { fields, find, rawStr, setField, without, build } from "./json"
+import { SocketExt } from "./realtime"
+
+// Headers of the WebSocket handshake, which the event's own request must not carry.
+const HANDSHAKE_HEADERS = ["upgrade", "connection", "host", "content-length", "transfer-encoding", "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "sec-websocket-protocol", "sec-websocket-accept"]
+
+// Bifrost's error event: {"type":"error","status":N,"error":{"code":..,"message":..}}.
+export function errorEvent(status: int, code: string, message: string): string {
+  return JSON.stringify({ type: "error", status: status, error: { code: code, message: message } })
+}
+
+// The error event for an upstream answer with a status of 400 or more, whose body is the usual
+// {"error":{...}}. A body that isn't one is sent as the message.
+export function upstreamErrorEvent(status: int, body: string): string {
+  let code = "server_error"
+  let message = body
+  try {
+    const e = find(try fields(body), "error")
+    if (e !== undefined) {
+      const ef = try fields(e)
+      code = rawStr(ef, "code") ?? rawStr(ef, "type") ?? code
+      message = rawStr(ef, "message") ?? message
+    }
+  } catch (e) {
+    message = body
+  }
+  return errorEvent(status, code, message)
+}
+
+// The request body for one response.create event: the event without its type, streamed. Stored
+// responses are on by default, whatever the client sent (Codex sends false and expects true); the
+// provider's disable_store turns them off again downstream.
+export function eventBody(text: string): string throws SyntaxError {
+  let fs = try fields(text)
+  fs = without(fs, ["type"])
+  setField(&fs, "stream", "true")
+  setField(&fs, "store", "true")
+  return build(fs)
+}
+
+// The data payloads of an event stream, in order, without [DONE].
+export function ssePayloads(text: string): string[] {
+  const out: string[] = []
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data:")) continue
+    const payload = line.slice(5).trim()
+    if (payload === "" || payload === "[DONE]") continue
+    out.push(payload)
+  }
+  return out
+}
+
+export class ResponsesSocket extends SocketExt {
+  queue: string[] = []
+  busy = false
+  constructor(readonly engine: Engine, readonly headers: Map<string, string>) {
+    super()
+  }
+
+  onMessage(m: string): void {
+    if (this.closed) return
+    let type = ""
+    try {
+      type = rawStr(fields(m), "type") ?? ""
+    } catch (e) {
+      this.send(errorEvent(400, "invalid_request_error", "failed to parse event JSON"))
+      return
+    }
+    if (type !== "response.create") {
+      this.send(errorEvent(400, "invalid_request_error", `unsupported event type: ${type}`))
+      return
+    }
+    this.queue.push(m)
+    if (!this.busy) {
+      this.busy = true
+      drain(this)
+    }
+  }
+
+  onClose(): void {
+    this.closed = true
+    this.queue = []
+  }
+
+  // Runs one response.create event and sends its events back.
+  async run(text: string): Promise<void> {
+    let body = ""
+    try {
+      body = eventBody(text)
+    } catch (e) {
+      this.send(errorEvent(400, "invalid_request_error", "failed to parse response.create event"))
+      return
+    }
+    const hs: Record<string, string> = {}
+    for (const k of this.headers.keys()) {
+      if (!HANDSHAKE_HEADERS.includes(k)) hs.set(k, this.headers.get(k)!)
+    }
+    hs.set("content-type", "application/json")
+    const req = new Request("http://localhost/v1/responses", { method: "POST", headers: hs, body: body })
+    let status = 500
+    let answer = ""
+    try {
+      const res = await responsesApi(this.engine, req)
+      status = res.status
+      answer = await res.text()
+    } catch (e) {
+      console.error(`raiju: ${e.message}`)
+      this.send(errorEvent(500, "server_error", "internal server error"))
+      return
+    }
+    if (status >= 400) {
+      this.send(upstreamErrorEvent(status, answer))
+      return
+    }
+    const payloads = ssePayloads(answer)
+    if (payloads.length === 0) {
+      if (answer !== "") this.send(answer)
+      return
+    }
+    for (const p of payloads) this.send(p)
+  }
+}
+
+// Runs the queued events of a connection, one after another.
+async function drain(s: ResponsesSocket): Promise<void> {
+  while (s.queue.length > 0 && !s.closed) {
+    const m = s.queue.shift()!
+    await s.run(m)
+  }
+  s.busy = false
+}
+
+test("error events", () => {
+  expect(upstreamErrorEvent(429, `{"error":{"message":"slow down","type":"rate_limit_error","code":"rate_limit"}}`)).toBe(`{"type":"error","status":429,"error":{"code":"rate_limit","message":"slow down"}}`)
+  expect(upstreamErrorEvent(502, "bad gateway")).toBe(`{"type":"error","status":502,"error":{"code":"server_error","message":"bad gateway"}}`)
+  expect(errorEvent(400, "invalid_request_error", "x")).toBe(`{"type":"error","status":400,"error":{"code":"invalid_request_error","message":"x"}}`)
+})
+
+test("event bodies drop the type and stream", () => {
+  expect(try eventBody(`{"type":"response.create","model":"openai/gpt-4o","input":"hi"}`)).toBe(`{"model":"openai/gpt-4o","input":"hi","stream":true,"store":true}`)
+  expect(try eventBody(`{"type":"response.create","model":"m","stream":false,"store":false}`)).toBe(`{"model":"m","stream":true,"store":true}`)
+})
+
+test("sse payloads", () => {
+  const s = "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.completed\r\ndata: {\"type\":\"response.completed\"}\r\n\ndata: [DONE]\n\n"
+  expect(ssePayloads(s).length).toBe(2)
+  expect(ssePayloads(s)[1]).toBe(`{"type":"response.completed"}`)
+  expect(ssePayloads("").length).toBe(0)
+})

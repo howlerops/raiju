@@ -88,6 +88,91 @@ def ws_roundtrip(path, message, headers=None):
     sock.close()
     return 101, data
 
+class WsClient:
+    """A WebSocket client for the gateway: the handshake (read byte by byte, so no frame is lost),
+    masked text frames out, and text frames in. status is the handshake's status; recv() is None
+    once the server closes."""
+    def __init__(self, path, headers=None, port=18098):
+        import base64 as b64m, os as _os, socket
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        key = b64m.b64encode(_os.urandom(16)).decode()
+        extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
+        self.sock.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n".encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(1)
+            if chunk == b"":
+                break
+            head += chunk
+        self.status = int(head.split(b" ")[1]) if head else 0
+        self.closed = self.status != 101
+
+    def _read(self, k):
+        buf = b""
+        while len(buf) < k:
+            part = self.sock.recv(k - len(buf))
+            if part == b"":
+                raise EOFError("connection closed")
+            buf += part
+        return buf
+
+    def send(self, text):
+        mask = os.urandom(4)
+        payload = text.encode()
+        n = len(payload)
+        hdr = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
+        self.sock.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def recv(self):
+        """The next text message, or None when the server has closed the connection."""
+        if self.closed:
+            return None
+        message = b""
+        while True:
+            try:
+                b0, b1 = self._read(2)
+            except (EOFError, OSError):
+                self.closed = True
+                return None
+            ln = b1 & 0x7F
+            if ln == 126:
+                ln = struct.unpack(">H", self._read(2))[0]
+            elif ln == 127:
+                ln = struct.unpack(">Q", self._read(8))[0]
+            data = self._read(ln) if ln else b""
+            op = b0 & 0x0F
+            if op == 0x8:
+                self.closed = True
+                return None
+            if op in (0x9, 0xA):
+                continue
+            message += data
+            if b0 & 0x80:
+                return message.decode()
+
+    def recv_json(self):
+        text = self.recv()
+        return None if text is None else json.loads(text)
+
+    def until(self, kind, limit=50):
+        """The events up to and including the one of this type, as parsed JSON."""
+        out = []
+        for _ in range(limit):
+            ev = self.recv_json()
+            if ev is None:
+                break
+            out.append(ev)
+            if ev.get("type") == kind:
+                break
+        return out
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.closed = True
+
 def call_bytes(method, path, body=None, headers=None, base=GW):
     """Like call(), but returns the body as bytes (for binary streams); the headers are a Message."""
     data = None if body is None else (body if isinstance(body, str) else json.dumps(body)).encode()
@@ -1018,6 +1103,27 @@ def projects_e2e(env):
         entries = json.loads(b).get("entries", []) if s == 200 else []
         keys = sorted(set(e.get("virtual_key", "") for e in entries))
         check("a team-scoped user sees only its team's request logs", s == 200 and keys == ["vk-core"], (s, keys))
+        # the live UI socket carries the same scope: ann's feed has her team's requests, not another team's
+        ws_ann = WsClient("/ws", {"authorization": "Bearer " + A}, port=18122)
+        ws_root = WsClient("/ws", {"authorization": "Bearer sk-admin-pr-root"}, port=18122)
+        time.sleep(0.3)
+        inf({"x-bf-vk": "sk-bf-other"}, 3101); inf({"x-bf-vk": "sk-bf-core"}, 3102)
+        def feed(ws, want):
+            got = set()
+            for _ in range(40):
+                m = ws.recv()
+                if m is None:
+                    break
+                ev = json.loads(m)
+                if ev.get("type") == "log":
+                    got.add(ev["data"].get("virtual_key", ""))
+                if want <= got:
+                    break
+            return got
+        root_keys = feed(ws_root, {"vk-core", "vk-other"})
+        ann_keys = feed(ws_ann, {"vk-core"})
+        check("the /ws log feed follows the data scope: a team-scoped user gets only its team's requests",
+              ws_ann.status == 101 and ann_keys == {"vk-core"} and {"vk-core", "vk-other"} <= root_keys, (ws_ann.status, ann_keys, root_keys))
         s, _, b = adm("GET", "/api/logs")
         allkeys = sorted(set(e.get("virtual_key", "") for e in json.loads(b).get("entries", [])))
         check("the admin sees the logs of every team", "vk-other" in allkeys and "vk-core" in allkeys, allkeys)
@@ -1431,6 +1537,78 @@ def main():
         check("realtime relays events with the provider key", st == 101 and r.get("event") == '{"type":"session.update"}' and r.get("auth", "").startswith("Bearer sk-from-env") and "model=gpt-realtime" in r.get("auth", ""), (st, reply))
         st, _ = ws_roundtrip("/v1/realtime?model=anthropic/claude", "{}")
         check("realtime refuses providers without a realtime API", st == 400, st)
+
+        # WebSocket mode of /v1/responses: response.create runs through the responses path, and its
+        # events come back one per message, on the same connection
+        rs = WsClient("/v1/responses")
+        check("responses WebSocket upgrades", rs.status == 101, rs.status)
+        rs.send(json.dumps({"type": "response.create", "model": "openai/gpt-4o-mini", "input": "hi"}))
+        evs = rs.until("response.completed")
+        check("responses WebSocket streams the events", [e.get("type") for e in evs] == ["response.created", "response.output_text.delta", "response.output_text.delta", "response.completed"], evs)
+        check("responses WebSocket deltas make the answer", "".join(e.get("delta", "") for e in evs) == "Hello", evs)
+        up = [x for x in seen() if x["path"] == "/v1/responses"][-1]
+        ub = json.loads(up["body"])
+        check("the upstream request streams, without the event type", ub.get("stream") is True and "type" not in ub and ub.get("model") == "gpt-4o-mini", up["body"])
+        rs.send('{"type":"response.cancel"}')
+        ev = rs.recv_json()
+        check("unsupported events are errors, and the socket stays up", ev.get("type") == "error" and ev.get("status") == 400 and "unsupported event type" in ev["error"]["message"], ev)
+        rs.send("not json")
+        ev = rs.recv_json()
+        check("unparsable events are errors", ev.get("type") == "error" and ev.get("status") == 400, ev)
+        rs.send(json.dumps({"type": "response.create", "model": "nope/gpt", "input": "hi"}))
+        ev = rs.recv_json()
+        check("an event the gateway refuses comes back as an error event", ev.get("type") == "error" and ev.get("status", 0) >= 400 and ev["error"]["message"], ev)
+        rs.send(json.dumps({"type": "response.create", "model": "openai/gpt-4o-mini", "input": "again"}))
+        evs = rs.until("response.completed")
+        check("a later event on the same socket still runs", evs and evs[-1].get("type") == "response.completed", evs)
+        rs.close()
+
+        # GPT Live: session.start names the model; the provider's id is recorded for the virtual key
+        # that opened it, so only that key may attach to it or read its recording
+        lv = WsClient("/v1/live/sessions", {"authorization": "Bearer sk-bf-openai"})
+        lv.send(json.dumps({"type": "session.start", "session": {"model": "openai/gpt-4o-mini", "voice": "alloy"}}))
+        started = lv.recv_json()
+        check("a live session starts at the provider and reports its id", started.get("type") == "session.started" and started["session"]["id"] == "sess_mock_1", started)
+        echo = lv.recv_json()
+        check("live frames reach the provider with its key, URL and backend model", echo and echo.get("type") == "echo" and "Bearer sk-from-env" in echo["auth"] and "/v1/live/sessions" in echo["auth"] and '"model":"gpt-4o-mini"' in echo["event"] and "openai/" not in echo["event"], echo)
+        lv.send('{"type":"session.update","session":{"instructions":"be brief"}}')
+        echo = lv.recv_json()
+        check("later live frames are relayed", echo and echo.get("type") == "echo" and "session.update" in echo["event"], echo)
+        lv.close()
+        bad = WsClient("/v1/live/sessions")
+        bad.send('{"type":"session.update"}')
+        ev = bad.recv_json()
+        check("a live session must open with session.start", ev and ev.get("type") == "error" and "session.start" in ev["error"]["message"] and bad.recv() is None, ev)
+        bad = WsClient("/v1/live/sessions")
+        bad.send('{"type":"session.start","session":{"model":"anthropic/claude"}}')
+        ev = bad.recv_json()
+        check("live sessions refuse providers without a live API", ev and ev.get("type") == "error" and "no live API" in ev["error"]["message"], ev)
+        at = WsClient("/v1/live/sessions/sess_mock_1/attach", {"authorization": "Bearer sk-bf-openai"})
+        check("the owner key may attach", at.status == 101, at.status)
+        at.send('{"type":"session.update"}')
+        echo = at.recv_json()
+        check("an attach relays to the session's attach route", echo and "/v1/live/sessions/sess_mock_1/attach" in echo["auth"], echo)
+        at.close()
+        check("another virtual key may not attach (not found)", WsClient("/v1/live/sessions/sess_mock_1/attach", {"authorization": "Bearer sk-bf-limited"}).status == 404)
+        check("a request with no key may attach, as in Bifrost", WsClient("/v1/live/sessions/sess_mock_1/attach").status == 101)
+        s, _, b = call("GET", "/v1/live/sessions/sess_mock_1/content", headers={"authorization": "Bearer sk-bf-openai"})
+        check("the owner key reads the recording", s == 200 and b == "RIFF-recording-sess_mock_1", (s, b))
+        s, _, b = call("GET", "/v1/live/sessions/sess_mock_1/content", headers={"authorization": "Bearer sk-bf-limited"})
+        check("another key does not read the recording", s == 404, (s, b))
+        s, _, b = call("GET", "/v1/live/sessions/bad%20id/content")
+        check("a malformed session id is refused", s == 400, (s, b))
+
+        # the UI socket: management auth on the upgrade, store updates after a write, request logs
+        check("the UI socket needs management auth", WsClient("/ws").status == 401)
+        ui = WsClient("/ws", ADMIN)
+        check("the UI socket upgrades with management auth", ui.status == 101, ui.status)
+        call("POST", "/api/mcp/client/local/refresh-tools")
+        evs = ui.until("store_update")
+        check("a management write goes out on the UI socket", evs and evs[-1].get("tags") == ["mcp"], evs[-1:] if evs else evs)
+        chat("openai/gpt-4o-mini", seed=4242)
+        evs = ui.until("log")
+        check("a new request-log entry goes out on the UI socket", evs and evs[-1].get("type") == "log" and evs[-1]["data"]["model"] == "openai/gpt-4o-mini", evs[-1:] if evs else evs)
+        ui.close()
 
         # Anthropic SDK route to a non-Anthropic provider
         s, _, b = call("POST", "/anthropic/v1/messages", {"model": "openai/gpt-4o-mini", "max_tokens": 20, "system": "be brief", "messages": [{"role": "user", "content": "hi"}]})

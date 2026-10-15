@@ -6,7 +6,7 @@ import { parseDatasheet } from "./pricing"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { Engine } from "./gateway"
-import { LogStore, LogEntry, scopedEntries, defaultLogStoreConfig, gridOf, filterFrom, selectAll, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, gridOf, filterFrom, selectAll, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
 import { CircuitPolicyConfig } from "./config"
@@ -36,6 +36,8 @@ import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync
 import { Counters, ClusterConfig, syncInterval } from "./cluster"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
+import { SocketExt } from "./realtime"
+import { LiveRegistry } from "./live"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
 import { ExportCursor, objectKey, putRequest, putBytesRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs } from "./exports"
 import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
@@ -228,6 +230,79 @@ function trimPeer(p: string): string {
 // How often discovery runs, in ms: it registers this node where the mechanism needs it, then lists the others.
 const DISCOVER_MS = 10000
 
+// How often the UI socket looks for new request-log entries, in ms.
+const UI_TICK_MS = 1000
+
+// One dashboard client on /ws.
+export class UiSocket extends SocketExt {
+  // log events reach this socket only for entries its user's data scope covers
+  constructor(readonly hub: UiHub, readonly scope: DataScope) {
+    super()
+  }
+
+  onOpen(): void {
+    this.hub.add(this)
+  }
+
+  onClose(): void {
+    this.closed = true
+    this.hub.remove(this)
+  }
+}
+
+// The events /ws pushes, in Bifrost's envelope {"type": ..., "data": ...}: store_update after a
+// successful management write (tags name the resource changed), and log for each new request-log
+// entry while a client is connected. (Bifrost's socket at this version sends notifications and
+// store updates only; the log events are Raiju's.)
+export cyclic class UiHub {
+  clients: UiSocket[] = []
+  timer: int = -1
+  since: f64 = 0.0
+  constructor(readonly logs: () => LogStore | undefined) {}
+
+  add(c: UiSocket): void {
+    this.clients.push(c)
+    if (this.clients.length === 1) {
+      this.since = Date.now()
+      this.timer = setInterval(() => {
+        this.tick()
+      }, UI_TICK_MS)
+    }
+  }
+
+  remove(c: UiSocket): void {
+    this.clients = this.clients.filter((x) => x !== c)
+    if (this.clients.length === 0 && this.timer >= 0) {
+      clearInterval(this.timer)
+      this.timer = -1
+    }
+  }
+
+  send(text: string): void {
+    for (const c of this.clients) c.send(text)
+  }
+
+  // Pushes the request-log entries that arrived since the last tick.
+  tick(): void {
+    const store = this.logs()
+    if (store === undefined) return
+    for (const e of store.since(this.since)) {
+      const text = JSON.stringify({ type: "log", data: logEventView(e) })
+      for (const c of this.clients) {
+        if (visibleTo(e, c.scope)) c.send(text)
+      }
+      this.since = e.ts
+    }
+  }
+}
+
+// The fields of a request-log entry that a dashboard shows live (no bodies, no raw payloads).
+type LogEvent = { id: string, ts: f64, request_id: string, op: string, provider: string, model: string, status: int, latency_ms: f64, prompt_tokens: int, completion_tokens: int, cost: f64, cache_hit: bool, virtual_key?: string, error?: string }
+
+function logEventView(e: LogEntry): LogEvent {
+  return { id: e.id, ts: e.ts, request_id: e.request_id, op: e.op, provider: e.provider, model: e.model, status: e.status, latency_ms: e.latency_ms, prompt_tokens: e.prompt_tokens, completion_tokens: e.completion_tokens, cost: e.cost, cache_hit: e.cache_hit, virtual_key: e.virtual_key, error: e.error }
+}
+
 export class Ops {
   rbac: RbacConfig = { users: [] }
   authOn = false
@@ -275,8 +350,12 @@ export class Ops {
   discovery: Discovery | undefined = undefined
   flows = new OidcFlows()
   sessions = new UiSessions(28800)
+  // the /ws clients, and the virtual key that opened each live session (/v1/live/sessions)
+  ui: UiHub
+  liveSessions = new LiveRegistry()
 
   constructor(readonly engine: Engine, readonly store: ConfigStore) {
+    this.ui = new UiHub(() => this.engine.logStore)
     try {
       this.nodeId = secureHex(6)
     } catch (e) {
@@ -1527,6 +1606,13 @@ export class Ops {
     const g = this.gate(req, path)
     if (g.kind === "deny") return { res: g.res, scope: noScope() }
     return { res: undefined, scope: this.scopeOfActor(g.actor) }
+  }
+
+  // The /ws event for a management write that succeeded: the resource it changed, as Bifrost's
+  // store_update tags (the first path segment under /api).
+  storeUpdated(path: string): void {
+    const seg = path.split("/")[2] ?? ""
+    this.ui.send(JSON.stringify({ type: "store_update", tags: [seg] }))
   }
 
   // Whether the caller may use this /api route; the actor names them in the audit log.

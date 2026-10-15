@@ -11,12 +11,15 @@ import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
 import { fields, find, elements, rawStr, rawBool } from "./json"
 import * as metrics from "./metrics"
-import { Session, prepare, onOpen, onMessage, onClose } from "./realtime"
+import { Session, SocketExt, prepare, onOpen, onMessage, onClose, extOpen, extMessage, extClose, attachHttp1 } from "./realtime"
+import { ResponsesSocket } from "./wsresponses"
+import { LiveSocket, liveContent, contentId, attachId, attachUpstream, ownerOf, credentialOk, validId } from "./live"
+import { WsConnection } from "./ws"
 import { parseQuery, filterFrom, selectAll, scopedEntries, statsView } from "./logstore"
 import { DataScope } from "./scope"
 import { matchRoute, handleMedia, deploymentRoute, deploymentRequest } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
-import { snapshot } from "./schemas"
+import { snapshot, errorJson } from "./schemas"
 import { handleApi, proxyWidening, Result } from "./store"
 import { passthroughPath, passthroughRoute } from "./passthrough"
 import { mcpApi, oauthRoute, oauthCallback } from "./mcpapi"
@@ -26,7 +29,7 @@ import { flagRoute } from "./flags"
 import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
 import { McpSession } from "./mcp"
-import { Ops, Reply } from "./ops"
+import { Ops, Reply, UiSocket } from "./ops"
 import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, decisionRoute, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
 import { INDEX_HTML } from "./ui_assets"
@@ -306,6 +309,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
     }
   }
   ops.recordChange(gate.actor, req, path, r.status, body)
+  if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)
   return new Response(r.body, { status: r.status, headers: h })
@@ -441,6 +445,8 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
   // the GenAI SDK's files, batches, cached contents, operations, :predict and rank
   const gop = genaiIn.genaiRoute(m, p)
   if (gop !== undefined) return await cors(engine.cfg, req, await genaiSdk(engine, req, gop.op, gop.model, gop.id))
+  const lc = contentId(p)
+  if (lc !== "" && m === "GET") return await liveContent(engine, ops.liveSessions, req, lc)
   if (m === "GET" || m === "HEAD") {
     if (p === "/health") return Response.json({ status: "ok" })
     if (p === "/") return textResponse(INDEX_HTML, "text/html; charset=utf-8")
@@ -621,6 +627,67 @@ async function chatStreamed(engine: Engine, req: Request, kind: string): Promise
   return await cors(engine.cfg, req, await p)
 }
 
+// What a WebSocket upgrade becomes: the session to open, a refusal (an HTTP answer), or no
+// WebSocket route at all.
+export type WsUpgrade = { kind: "none" } | { kind: "refused", status: int, message: string } | { kind: "session", session: Session }
+
+function wsSession(req: Request, ext: SocketExt): Session {
+  const s = new Session(req.url, snapshot(req.headers), "", "")
+  s.ext = ext
+  return s
+}
+
+// The WebSocket routes, for both servers: the realtime relay, the Responses API (GET /v1/responses),
+// GPT Live (/v1/live/sessions and its attach) and the UI socket (/ws). A refusal is decided before
+// the upgrade, so the client gets an HTTP status.
+export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
+  const u = URL.parse(req.url)
+  const p0 = u === undefined ? "" : u.pathname
+  const p = p0.startsWith("/openai/v1/") ? p0.slice(7) : p0
+  if (p === "/v1/realtime") {
+    const up = prepare(engine, req)
+    if (up.kind === "refused") return { kind: "refused", status: up.status, message: up.message }
+    return { kind: "session", session: up.session }
+  }
+  if (req.method !== "GET") return { kind: "none" }
+  const att = attachId(p)
+  if (p !== "/v1/responses" && p !== "/v1/live/sessions" && p !== "/ws" && att === "") return { kind: "none" }
+  const h = snapshot(req.headers)
+  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, new ResponsesSocket(engine, h)) }
+  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map())) }
+  if (att !== "") {
+    if (!validId(att)) return { kind: "refused", status: 400, message: "a session id is required" }
+    if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
+    const owner = ownerOf(engine, h)
+    if (!ops.liveSessions.allowed(att, owner)) return { kind: "refused", status: 404, message: "live session not found" }
+    const up = attachUpstream(engine, h, att)
+    if (up === undefined) return { kind: "refused", status: 404, message: "no OpenAI key is configured for live sessions" }
+    return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers)) }
+  }
+  if (p === "/ws") {
+    // the live feed is log data: whoever may read /api/logs may open it, and sees its own data scope
+    const g = ops.gate(req, "/api/logs")
+    if (g.kind === "deny") return { kind: "refused", status: g.res.status, message: g.res.status === 401 ? "authentication is required" : "this role may not open the UI socket" }
+    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(g.actor))) }
+  }
+  return { kind: "none" }
+}
+
+// The same routes on the http1 server (front.tov): an accepted socket runs its route's state, and a
+// refusal is answered over HTTP. False for a path that is no WebSocket route.
+export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void): bool {
+  const wu = wsUpgrade(engine, ops, req)
+  if (wu.kind === "none") return false
+  if (wu.kind === "refused") {
+    reject(wu.status, errorJson(wu.message, "invalid_request_error", undefined))
+    return true
+  }
+  const client = accept()
+  const ext = wu.session.ext
+  if (client !== undefined && ext !== undefined) attachHttp1(ext, client)
+  return true
+}
+
 // The Bun.serve server (the default): streamed chat answers, Tov's multi-process workers,
 // native WebSockets.
 export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
@@ -629,14 +696,14 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
     hostname: opts.hostname,
     workers: opts.workers,
     fetch(req, server) {
-      const u = URL.parse(req.url)
-      const p = u === undefined ? "" : u.pathname
-      if (p === "/v1/realtime" || p === "/openai/v1/realtime") {
-        const up = prepare(engine, req)
-        if (up.kind === "refused") return errorResponse(up.status, up.message, "invalid_request_error", noHeaders())
-        if (server.upgrade(req, { data: up.session })) return
+      const wu = wsUpgrade(engine, ops, req)
+      if (wu.kind === "refused") return errorResponse(wu.status, wu.message, "invalid_request_error", noHeaders())
+      if (wu.kind === "session") {
+        if (server.upgrade(req, { data: wu.session })) return
         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
       }
+      const u = URL.parse(req.url)
+      const p = u === undefined ? "" : u.pathname
       const cp = compatPath(p)
       const t0 = performance.now()
       const reqBytes = parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0
@@ -645,9 +712,15 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
       return timed(p, req.method, t0, reqBytes, dispatch(engine, ops, req))
     },
     websocket: {
-      open: (ws) => onOpen(ws),
-      message: (ws, m) => onMessage(ws, m),
-      close: (ws) => onClose(ws),
+      open: (ws) => {
+        if (!extOpen(ws)) onOpen(ws)
+      },
+      message: (ws, m) => {
+        if (!extMessage(ws, m)) onMessage(ws, m)
+      },
+      close: (ws) => {
+        if (!extClose(ws)) onClose(ws)
+      },
     },
   })
   return server.url.href

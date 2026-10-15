@@ -209,7 +209,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 |---|---|---|---|---|
 | L81 | G36, G38 | Decisions API, typesafe provider, decision-model complexity classifier | worker | done: unit (1,084) + e2e http1; Bun e2e re-run by lead after merge; unprefixed /decisions routes, decision pricing overrides, x-bf-passthrough-extra-params gate open |
 | L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | done: unit (1,075) + e2e (both servers); limits moved to L100 |
-| L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | assigned: resumed from handoff/patches |
+| L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | done: /v1/responses WebSocket mode (bridge), /v1/live/sessions with attach and content, /ws UI socket (log feed scoped by data access, lead fix); unit + e2e; limits moved to L102 |
 | L84 | G41 | Projects, business units, custom roles and data access scopes | worker | done: governance.projects and business_units, x-bf-project-id and x-bf-customer-id, custom roles (management API), data access scopes on logs and analytics; unit + e2e (both servers). Open: project members API and split policies, entity_dac overrides, Bifrost role-id API shape |
 | L85 | G42 | BigQuery, Kafka, Pub/Sub sinks; Parquet payloads; export retention | worker | done (wired by L89) |
 | L86 | G43 | Guardrails: regex, secrets rule set, reversible redaction, LLM judge, MCP tool-call guard, Presidio, Azure PII, Model Armor, CrowdStrike | worker | done (wired by L90) |
@@ -231,6 +231,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L96 | G32, G33, all | Re-audit docs/parity.md (rows counted by script) and bring SCOPE.md and README in sync | worker | todo (after waves 12-13 merge) |
 | L100 | G37 | Compat remainder: stream conversions (text-to-chat, chat-to-responses), decision emulation (needs L81), azure_deepseek, reasoning budget scaling and min_output_tokens, summary fitting for Responses | worker | assigned |
 | L101 | G43 | Secrets engine: capture groups for secretGroup, the entropy filter and gitleaks allowlists and stopwords; then enable generic-api-key | worker | assigned |
+| L102 | G40 | WebSocket and live remainder: Responses socket streams events as they arrive (not after completion), response.cancel, /openai/responses aliases; live sessions for more providers, POST /v1/live/sessions (WebRTC create), session registry and /ws shared across workers, /ws heartbeat | worker | todo |
 | L97 | from L96 | Whatever the re-audit still lists as missing or partial and buildable | workers | todo |
 
 ## UI track
