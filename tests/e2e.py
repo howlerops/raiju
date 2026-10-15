@@ -416,6 +416,142 @@ def main():
         r = json.loads(b) if s == 200 else {}
         check("genai model info", s == 200 and r.get("name") == "models/openai/rotate-me" and "generateContent" in r.get("supportedGenerationMethods", []), b[:300])
 
+        # GenAI SDK files, batches, cached contents, operations, :predict and rank
+        def lower(h):
+            return {k.lower(): v for k, v in h.items()}
+        def jget(b):
+            try:
+                return json.loads(b)
+            except ValueError:
+                return {}
+        UP = {"x-goog-upload-protocol": "resumable", "x-goog-upload-command": "start", "x-goog-upload-header-content-type": "application/jsonl"}
+        OAI = {"x-model-provider": "openai"}
+        # Gemini (the default): the resumable upload goes to Gemini with the key, and its URL is the gateway's
+        s, h, b = call("POST", "/genai/upload/v1beta/files", {"file": {"displayName": "resumable"}}, {**UP, "x-goog-upload-header-content-length": "5"})
+        up_url = lower(h).get("x-goog-upload-url", "")
+        check("genai gemini upload start answers with the gateway's upload URL", s == 200 and "/genai/upload/v1beta/files?upload_id=" in up_url, (s, h, b))
+        check("genai gemini upload start goes to Gemini with the key", seen()[-1]["path"] == "/upload/v1beta/files" and seen()[-1]["auth"] == "g-key" and seen()[-1]["body"] == "start", seen()[-1:])
+        s, h, b = call("POST", "/genai/upload/v1beta/files?upload_id=" + up_url.split("upload_id=")[1], "hello", {"x-goog-upload-command": "upload, finalize", "x-goog-upload-offset": "0", "content-type": "application/jsonl"})
+        gfile = jget(b).get("file", {})
+        check("genai gemini upload finishes at Gemini's answer", s == 200 and gfile.get("name", "").startswith("files/g-") and gfile.get("state") == "ACTIVE", (s, b))
+        check("genai gemini upload bytes go to the upload URL with the key", seen()[-1]["path"] == "/upload/v1beta/files" and seen()[-1]["auth"] == "g-key" and seen()[-1]["body"] == "finalize upload, finalize", seen()[-1:])
+        gname = gfile.get("name", "files/none")[len("files/"):]
+        s, _, b = call("GET", "/genai/v1beta/files")
+        check("genai gemini files list passes through", s == 200 and seen()[-1]["path"] == "/v1beta/files" and seen()[-1]["auth"] == "g-key" and "files" in jget(b), (s, b))
+        s, _, b = call("GET", "/genai/v1beta/files/" + gname)
+        check("genai gemini file retrieve passes through", s == 200 and seen()[-1]["path"] == "/v1beta/files/" + gname and jget(b).get("name") == "files/" + gname, (s, b))
+        s, _, b = call("DELETE", "/genai/v1beta/files/" + gname)
+        check("genai gemini file delete passes through", s == 200 and seen()[-1]["path"] == "/v1beta/files/" + gname and seen()[-1]["auth"] == "g-key", (s, b))
+
+        # OpenAI: the upload is one OpenAI file upload, answered as a Gemini File
+        s, h, b = call("POST", "/genai/upload/v1beta/files", {"file": {"displayName": "in.jsonl"}}, {**UP, **OAI, "x-goog-upload-header-content-length": "5"})
+        up_url = lower(h).get("x-goog-upload-url", "")
+        check("genai openai upload start answers with the gateway's upload URL", s == 200 and "/genai/upload/v1beta/files?upload_id=" in up_url, (s, h, b))
+        s, h, b = call("POST", "/genai/upload/v1beta/files?upload_id=" + up_url.split("upload_id=")[1], "hello", {"x-goog-upload-command": "upload, finalize", "content-type": "application/jsonl"})
+        ofile = jget(b).get("file", {})
+        check("genai openai upload answers a Gemini File with the final status", s == 200 and ofile.get("name", "").startswith("files/file-") and ofile.get("displayName") == "in.jsonl" and ofile.get("mimeType") == "application/jsonl" and ofile.get("sizeBytes") == "5" and lower(h).get("x-goog-upload-status") == "final", (s, h, b))
+        check("genai openai upload is one OpenAI file upload with purpose batch", seen()[-1]["path"] == "/v1/files" and '"purpose"' not in seen()[-1]["body"], seen()[-1:])
+        oname = ofile.get("name", "files/none")[len("files/"):]
+        s, _, b = call("GET", "/genai/v1beta/files/" + oname, None, OAI)
+        check("genai openai file retrieve is a Gemini File", s == 200 and jget(b).get("name") == "files/" + oname and jget(b).get("state") == "ACTIVE" and seen()[-1]["path"] == "/v1/files/" + oname, (s, b))
+        s, _, b = call("GET", "/genai/v1beta/files", None, OAI)
+        check("genai openai files list is Gemini's list", s == 200 and any(f.get("name") == "files/" + oname for f in jget(b).get("files", [])), (s, b[:300]))
+        s, _, b = call("DELETE", "/genai/v1beta/files/" + oname, None, OAI)
+        check("genai openai file delete answers an empty object", s == 200 and jget(b) == {} and seen()[-1]["path"] == "/v1/files/" + oname, (s, b))
+
+        # OpenAI batches: inline requests become a batch input file; its custom ids are the keys
+        inline = {"batch": {"displayName": "d", "inputConfig": {"requests": {"requests": [
+            {"request": {"contents": [{"role": "user", "parts": [{"text": "one"}]}]}, "metadata": {"key": "k1"}},
+            {"request": {"contents": [{"role": "user", "parts": [{"text": "two"}]}]}, "metadata": {"key": "k2"}}]}}}}
+        s, _, b = call("POST", "/genai/v1beta/models/openai/gpt-4o-mini:batchGenerateContent", inline)
+        op = jget(b)
+        check("genai batch to an OpenAI model is a finished operation", s == 200 and op.get("name", "").startswith("batches/batch_") and op.get("done") is True and op.get("metadata", {}).get("state") == "BATCH_STATE_SUCCEEDED", (s, b))
+        check("genai batch creates an OpenAI batch on the uploaded file", seen()[-1]["path"] == "/v1/batches" and json.loads(seen()[-1]["body"]).get("endpoint") == "/v1/chat/completions" and seen()[-2]["path"] == "/v1/files", seen()[-2:])
+        bname = op.get("name", "batches/none")[len("batches/"):]
+        outf = op.get("dest", {}).get("fileName", "")
+        s, _, b = call("GET", "/v1/files/" + outf + "/content")
+        outs = [json.loads(l) for l in b.split("\n") if l.strip()] if s == 200 else []
+        check("genai batch input lines are chat requests keyed by the metadata keys", sorted(o["custom_id"] for o in outs) == ["k1", "k2"], (s, b[:300]))
+        s, _, b = call("GET", "/genai/v1beta/batches/" + bname, None, OAI)
+        check("genai batch retrieve is a Gemini operation", s == 200 and jget(b).get("done") is True and jget(b).get("name") == "batches/" + bname and seen()[-1]["path"] == "/v1/batches/" + bname, (s, b))
+        s, _, b = call("GET", "/genai/v1beta/batches", None, OAI)
+        check("genai batch list answers operations", s == 200 and any(o.get("name") == "batches/" + bname for o in jget(b).get("operations", [])), (s, b[:300]))
+        # a batch that reads an uploaded file: the file's lines are the requests
+        s, h, b = call("POST", "/genai/upload/v1beta/files", {"file": {"displayName": "reqs.jsonl"}}, {**UP, **OAI})
+        fup = lower(h).get("x-goog-upload-url", "")
+        s, _, b = call("POST", "/genai/upload/v1beta/files?upload_id=" + fup.split("upload_id=")[1], '{"key":"f1","request":{"contents":[{"role":"user","parts":[{"text":"x"}]}]}}\n', {"x-goog-upload-command": "upload, finalize"})
+        fname = jget(b).get("file", {}).get("name", "files/none")
+        s, _, b = call("POST", "/genai/v1beta/models/openai/gpt-4o-mini:batchGenerateContent", {"batch": {"inputConfig": {"fileName": fname}}})
+        op2 = jget(b)
+        check("genai batch reads an uploaded file's lines", s == 200 and op2.get("done") is True, (s, b))
+        s, _, b = call("GET", "/v1/files/" + op2.get("dest", {}).get("fileName", "") + "/content")
+        check("genai batch from a file keeps its key as custom id", s == 200 and '"custom_id":"f1"' in b, (s, b[:300]))
+        s, _, b = call("POST", "/genai/v1beta/models/openai/gpt-4o-mini:batchGenerateContent", {"batch": {"inputConfig": {"fileName": "files/file-nope"}}})
+        check("genai batch from an unknown file is a 404", s == 404, (s, b))
+        s, _, b = call("POST", "/genai/v1beta/batches/" + bname + ":cancel", {}, OAI)
+        check("genai batch cancel on OpenAI answers an empty object", s == 200 and jget(b) == {} and seen()[-1]["path"] == "/v1/batches/" + bname + "/cancel", (s, b))
+        s, _, b = call("DELETE", "/genai/v1beta/batches/" + bname, None, OAI)
+        check("genai batch delete is Bifrost's unsupported error on OpenAI", s == 400 and "batch_delete is not supported by openai provider" in b, (s, b))
+
+        # Gemini batches pass through: create, poll, list, cancel and delete
+        s, _, b = call("POST", "/genai/v1beta/models/gemini-2.5-flash:batchGenerateContent", inline)
+        gop = jget(b)
+        check("genai gemini batch create passes through", s == 200 and seen()[-1]["path"] == "/v1beta/models/gemini-2.5-flash:batchGenerateContent" and seen()[-1]["auth"] == "g-key" and gop.get("done") is True, (s, b))
+        gb = gop.get("name", "batches/none")[len("batches/"):]
+        s, _, b = call("GET", "/genai/v1beta/batches/" + gb)
+        check("genai gemini batch retrieve passes through", s == 200 and seen()[-1]["path"] == "/v1beta/batches/" + gb and jget(b).get("done") is True, (s, b))
+        s, _, b = call("GET", "/genai/v1beta/batches")
+        check("genai gemini batch list passes through", s == 200 and seen()[-1]["path"] == "/v1beta/batches", (s, b))
+        s, _, b = call("POST", "/genai/v1beta/batches/" + gb + ":cancel", {})
+        check("genai gemini batch cancel passes through", s == 200 and seen()[-1]["path"] == "/v1beta/batches/" + gb + ":cancel", (s, b))
+        s, _, b = call("DELETE", "/genai/v1beta/batches/" + gb)
+        check("genai gemini batch delete passes through", s == 200 and seen()[-1]["path"] == "/v1beta/batches/" + gb and seen()[-1]["auth"] == "g-key", (s, b))
+
+        # cached contents: Gemini's, through; other providers answer Bifrost's error
+        cc = {"model": "models/gemini-2.5-flash", "contents": [{"role": "user", "parts": [{"text": "long context"}]}], "ttl": "600s"}
+        s, _, b = call("POST", "/genai/v1beta/cachedContents", cc)
+        check("genai cached content create passes through", s == 200 and seen()[-1]["path"] == "/v1beta/cachedContents" and json.loads(seen()[-1]["body"]).get("model") == "models/gemini-2.5-flash" and jget(b).get("name") == "cachedContents/c-1", (s, b))
+        s, _, b = call("GET", "/genai/v1beta/cachedContents")
+        check("genai cached content list passes through", s == 200 and seen()[-1]["path"] == "/v1beta/cachedContents", (s, b))
+        s, _, b = call("GET", "/genai/v1beta/cachedContents/c-1")
+        check("genai cached content retrieve passes through", s == 200 and seen()[-1]["path"] == "/v1beta/cachedContents/c-1", (s, b))
+        s, _, b = call("PATCH", "/genai/v1beta/cachedContents/c-1", {"ttl": "900s"})
+        check("genai cached content update passes through", s == 200 and seen()[-1]["path"] == "/v1beta/cachedContents/c-1" and json.loads(seen()[-1]["body"]).get("ttl") == "900s", (s, b))
+        s, _, b = call("DELETE", "/genai/v1beta/cachedContents/c-1")
+        check("genai cached content delete passes through", s == 200 and seen()[-1]["path"] == "/v1beta/cachedContents/c-1", (s, b))
+        s, _, b = call("POST", "/genai/v1beta/cachedContents", cc, OAI)
+        check("genai cached content on OpenAI is Bifrost's unsupported error", s == 400 and "cached_content_create is not supported by openai provider" in b, (s, b))
+
+        # operations: Gemini's pass through; OpenAI has no video operations here
+        s, _, b = call("GET", "/genai/v1beta/models/veo-3/operations/op-9")
+        check("genai operation retrieve passes through", s == 200 and seen()[-1]["path"] == "/v1beta/models/veo-3/operations/op-9" and seen()[-1]["auth"] == "g-key", (s, b))
+        s, _, b = call("GET", "/genai/v1beta/models/openai/veo-3/operations/op-9")
+        check("genai operation retrieve on OpenAI is Bifrost's unsupported error", s == 400 and "video_retrieve is not supported by openai provider" in b, (s, b))
+
+        # :predict: Gemini passes through; an embedding model embeds, an Imagen model makes images
+        s, _, b = call("POST", "/genai/v1beta/models/text-embedding-004:predict", {"instances": [{"content": "alpha"}]})
+        check("genai predict passes through to Gemini", s == 200 and seen()[-1]["path"] == "/v1beta/models/text-embedding-004:predict" and json.loads(seen()[-1]["body"])["instances"][0]["content"] == "alpha", (s, b))
+        s, _, b = call("POST", "/genai/v1beta/models/openai/text-embedding-3-small:predict", {"instances": [{"content": "alpha"}, {"content": "beta"}]})
+        preds = jget(b).get("predictions", []) if s == 200 else []
+        check("genai predict embeds on an OpenAI model", s == 200 and len(preds) == 2 and len(preds[0].get("embeddings", {}).get("values", [])) == 64, (s, b[:300]))
+        check("genai predict sends the texts as an embeddings input", seen()[-1]["path"] == "/v1/embeddings" and json.loads(seen()[-1]["body"])["input"] == ["alpha", "beta"], seen()[-1:])
+        s, _, b = call("POST", "/genai/v1beta/models/openai/imagen-3:predict", {"instances": [{"prompt": "a red fox"}], "parameters": {"sampleCount": 1}})
+        check("genai predict with an Imagen model makes images", s == 200 and jget(b).get("predictions", [{}])[0].get("bytesBase64Encoded") == "iVBORw0KGgo=" and seen()[-1]["path"] == "/v1/images/generations" and '"response_format":"b64_json"' in seen()[-1]["body"], (s, b[:300]))
+
+        # /genai/v1/rank: the rerank of a lexical model, in Vertex's rank shape
+        rk = {"model": "raiju/lexical", "query": "capital of France", "records": [{"id": "a", "content": "bananas are yellow"}, {"id": "b", "title": "Paris", "content": "Paris is the capital of France"}]}
+        s, _, b = call("POST", "/genai/v1/rank", rk)
+        recs = jget(b).get("records", []) if s == 200 else []
+        check("genai rank puts the best record first with its id", s == 200 and [r.get("id") for r in recs] == ["b", "a"] and recs[0].get("title") == "Paris", (s, b))
+        s, _, b = call("POST", "/genai/v1/rank", dict(rk, ignoreRecordDetailsInResponse=True))
+        check("genai rank can leave out the record details", s == 200 and "content" not in jget(b).get("records", [{}])[0], (s, b))
+        s, _, b = call("POST", "/genai/v1/rank", {"query": "q", "records": [{"id": "a", "content": "x"}]})
+        check("genai rank needs a model", s == 400, (s, b))
+
+        # the GenAI routes that stay with genai(): models and generateContent keep their answers
+        s, _, b = call("GET", "/genai/v1beta/models/openai/rotate-me")
+        check("genai model info still answers after the new routes", s == 200 and jget(b).get("name") == "models/openai/rotate-me", (s, b[:200]))
+
         BED = "/bedrock/model/openai%2Fgpt-4o-mini/"
         conv = {"messages": [{"role": "user", "content": [{"text": "hi"}]}]}
         s, _, b = call("POST", BED + "converse", conv)
@@ -1226,6 +1362,13 @@ def main():
         check("a virtual key in Authorization is not a direct key", s == 200 and seen()[-1]["auth"] == "Bearer sk-pool", (s, b, seen()[-1]))
         s, _, b = call("POST", "/v1/chat/completions", msg("direct-5"), {"x-bf-direct-key": "true", "authorization": "Bearer sk-caller"}, base=GW)
         check("direct keys are ignored unless client.allow_direct_keys is on", s == 200 and seen()[-1]["auth"] == "Bearer sk-from-env", (s, b, seen()[-1]))
+        # the GenAI routes need a virtual key while auth is enforced (the Gemini provider is not in this config)
+        s, _, b = call("GET", "/genai/v1beta/files", base=GW_D)
+        check("genai files need a virtual key when auth is enforced", s == 401, (s, b))
+        s, _, b = call("POST", "/genai/v1/rank", {"model": "raiju/lexical", "query": "q", "records": [{"id": "a", "content": "x"}]}, base=GW_D)
+        check("genai rank needs a virtual key when auth is enforced", s == 401, (s, b))
+        s, _, b = call("GET", "/genai/v1beta/files", None, {"authorization": "Bearer sk-bf-direct-vk"}, base=GW_D)
+        check("genai files with a virtual key get past the check", s != 401, (s, b))
 
         # Raw echo: the provider's send_back_raw_response, and per-request headers when allowed
         VK = {"authorization": "Bearer sk-bf-direct-vk"}

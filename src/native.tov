@@ -2,8 +2,13 @@
 // governance, retries, fallbacks across keys, metrics and cost tracking.
 import { Field, fields, find, quote, build, isNull, rawStr, rawBool, setField } from "./json"
 import { Engine, Build, Translate, StreamSink, StreamConverter, ConverterFactory, streamable, converterKind, errorResponse, noHeaders } from "./gateway"
-import { Target, Translated } from "./providers/types"
-import { ChatRequest, snapshot } from "./schemas"
+import { Target, Translated, trimSlash, proxyOf, tlsOf } from "./providers/types"
+import { ChatRequest, snapshot, newId, nowSeconds } from "./schemas"
+import { Config } from "./config"
+import { deadline } from "./deadline"
+import { secureHex } from "./crypto"
+import { handleMedia, matchRoute, providerTarget, send } from "./media"
+import { target, parseModel, timeoutMs } from "./router"
 import * as cohereIn from "./cohere_in"
 import * as genaiIn from "./genai_in"
 import * as bedrockIn from "./bedrock_in"
@@ -389,6 +394,366 @@ async function genaiEmbed(engine: Engine, req: Request, method: string, full: st
   return await engine.serve(req, "genai." + method, full, [], text, b, tr, false)
 }
 
+// ---- the GenAI SDK's files, batches, cached contents, operations, :predict and rank ----
+// A Gemini target is passed through with its key, as it came. Other providers take files and
+// batches through media.tov (OpenAI's shapes) and their answers are converted back to Gemini's.
+// Cached contents and video operations are Gemini (and Vertex) features: other providers get
+// Bifrost's unsupported-operation error for them.
+
+const GEMINI_HOST = "https://generativelanguage.googleapis.com"
+const UPLOAD_TTL = 60
+const UPLOAD_CAP = 256
+
+// A resumable upload begun here: Gemini's own upload URL, or (other providers) the provider
+// and the file's name and type, which the second step uploads to.
+type UploadSession = { provider: string, upstream: string, name: string, mime: string, at: int }
+const uploadSessions: Map<string, UploadSession> = new Map()
+const uploadOrder: string[] = []
+// The text of uploaded files for other providers, by the name the SDK knows them under.
+const uploadTexts: Map<string, string> = new Map()
+const uploadTextOrder: string[] = []
+
+function expiredUpload(s: UploadSession | undefined): bool {
+  if (s === undefined) return true
+  return nowSeconds() - s.at > UPLOAD_TTL
+}
+
+// Starts a session; the oldest, and any past their minute, are forgotten first.
+function startUpload(s: UploadSession): string throws Error {
+  while (uploadOrder.length > 0) {
+    const oldest = uploadOrder[0] ?? ""
+    if (uploadOrder.length < UPLOAD_CAP && !expiredUpload(uploadSessions.get(oldest))) break
+    uploadOrder.shift()
+    uploadSessions.delete(oldest)
+  }
+  const id = "upl_" + try secureHex(24)
+  uploadSessions.set(id, s)
+  uploadOrder.push(id)
+  return id
+}
+
+// A session by its id, taken: a second step can use it once. Undefined when it is gone or expired.
+function takeUpload(id: string): UploadSession | undefined {
+  const s = uploadSessions.get(id)
+  uploadSessions.delete(id)
+  if (expiredUpload(s)) return undefined
+  return s
+}
+
+function keepUploadText(name: string, text: string): void {
+  if (!uploadTexts.has(name)) uploadTextOrder.push(name)
+  uploadTexts.set(name, text)
+  while (uploadTextOrder.length > UPLOAD_CAP) {
+    const old = uploadTextOrder.shift() ?? ""
+    uploadTexts.delete(old)
+  }
+}
+
+// The provider of a route without a model: x-model-provider, Gemini by default (as Bifrost).
+function routeProvider(req: Request): string {
+  const h = req.headers.get("x-model-provider") ?? ""
+  return h === "" ? "gemini" : h
+}
+
+function geminiUrl(t: Target, path: string): string {
+  const b = t.cfg.network_config?.base_url ?? ""
+  return (b === "" ? GEMINI_HOST : trimSlash(b)) + path
+}
+
+// Bifrost's answer for an operation the provider does not have.
+function unsupported(op: string, provider: string): Response {
+  return errorResponse(400, `${op} is not supported by ${provider} provider`, "unsupported_operation", noHeaders())
+}
+
+function convertFailed(e: Error): Response {
+  return errorResponse(502, `invalid upstream answer: ${e.message}`, "api_error", noHeaders())
+}
+
+// The request goes to the Gemini target as it is, with its key, and the answer comes back as it came.
+async function passGemini(t: Target, method: string, path: string, query: string, body: string | undefined): Promise<Response> {
+  const url = geminiUrl(t, path) + (query === "" ? "" : "?" + query)
+  return await send(t, { method: method, url: url, headers: gemini.upstreamHeaders(t), body: body })
+}
+
+// A raw call (the resumable upload, whose answer header matters): the status, the body and the
+// upload URL header. A network failure is a 502.
+async function rawFetch(t: Target, method: string, url: string, headers: Map<string, string>, body: string | u8[] | undefined): Promise<Response> {
+  const dl = deadline(timeoutMs(t.cfg))
+  try {
+    const hs: Record<string, string> = headers
+    let res: Response
+    if (body === undefined) res = await fetch(url, { method: method, headers: hs, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg) })
+    else res = await fetch(url, { method: method, headers: hs, body: body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg) })
+    const bytes = await res.bytes()
+    const out: Record<string, string> = new Map()
+    out.set("content-type", res.headers.get("content-type") ?? "application/json")
+    const up = res.headers.get("x-goog-upload-url") ?? ""
+    if (up !== "") out.set("x-goog-upload-url", up)
+    dl.finish()
+    return new Response(bytes, { status: res.status, headers: out })
+  } catch (e) {
+    dl.finish()
+    return errorResponse(502, `${t.provider} request failed: ${e.message}`, "api_connection_error", noHeaders())
+  }
+}
+
+// One call through media.tov: for the provider named (its key and conversions), or for the
+// model in a JSON body when no provider is named.
+async function viaMedia(cfg: Config, provider: string, method: string, path: string, qs: string, body: string | FormData | undefined): Promise<Response> throws TypeError | Error {
+  const route = matchRoute(method, path)
+  if (route === undefined) return errorResponse(404, `no route for ${method} ${path}`, "invalid_request_error", noHeaders())
+  const hs = new Headers()
+  if (provider !== "") hs.set("x-bf-provider", provider)
+  const url = "http://gateway.internal" + path + (qs === "" ? "" : "?" + qs)
+  return try await handleMedia(cfg, new Request(url, { method: method, headers: hs, body: body }), route)
+}
+
+// The provider's list query for the GenAI one: pageSize becomes limit, pageToken after.
+function pagingQuery(sp: URLSearchParams): string {
+  const out = new URLSearchParams()
+  const size = sp.get("pageSize") ?? ""
+  if (size !== "") out.set("limit", size)
+  const after = sp.get("pageToken") ?? ""
+  if (after !== "") out.set("after", after)
+  return out.toString()
+}
+
+// The first step of a resumable upload: its answer carries the URL the bytes go to, here.
+function uploadStarted(origin: string, sid: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  h.set("x-goog-upload-url", origin + "/genai/upload/v1beta/files?upload_id=" + sid)
+  h.set("x-goog-upload-status", "active")
+  return new Response("{}", { headers: h })
+}
+
+// files.upload. The first step (JSON metadata) starts the upload; the second (the bytes, with
+// upload_id) finishes it. Gemini's two steps go to Gemini as they are. Other providers get one
+// OpenAI file upload at the second step, answered as Gemini's File.
+async function genaiUpload(engine: Engine, req: Request, origin: string, sp: URLSearchParams): Promise<Response> throws SyntaxError | TypeError | Error {
+  const sid = sp.get("upload_id") ?? ""
+  if (sid === "") {
+    const text = await req.text()
+    const name = try genaiIn.uploadName(text)
+    const mime = req.headers.get("x-goog-upload-header-content-type") ?? "application/octet-stream"
+    const provider = routeProvider(req)
+    const t = providerTarget(engine.cfg, provider)
+    if (t === undefined) return errorResponse(404, `provider "${provider}" is not configured or has no key`, "invalid_request_error", noHeaders())
+    if (t.kind !== "gemini") return uploadStarted(origin, try startUpload({ provider: t.provider, upstream: "", name: name, mime: mime, at: nowSeconds() }))
+    const hs = gemini.upstreamHeaders(t)
+    hs.set("x-goog-upload-protocol", "resumable")
+    hs.set("x-goog-upload-command", "start")
+    hs.set("x-goog-upload-header-content-type", mime)
+    const length = req.headers.get("x-goog-upload-header-content-length") ?? ""
+    if (length !== "") hs.set("x-goog-upload-header-content-length", length)
+    const up = await rawFetch(t, "POST", geminiUrl(t, "/upload/v1beta/files"), hs, text)
+    if (!up.ok) return up
+    const upstream = up.headers.get("x-goog-upload-url") ?? ""
+    if (upstream === "") return convertFailed(new Error("no upload URL"))
+    return uploadStarted(origin, try startUpload({ provider: t.provider, upstream: upstream, name: name, mime: mime, at: nowSeconds() }))
+  }
+  const s = takeUpload(sid)
+  if (s === undefined) return errorResponse(404, `no upload ${sid} (it may have expired)`, "invalid_request_error", noHeaders())
+  const bytes = await req.bytes()
+  const pt = providerTarget(engine.cfg, s.provider)
+  if (pt === undefined) return errorResponse(404, `provider "${s.provider}" is not configured or has no key`, "invalid_request_error", noHeaders())
+  if (s.upstream !== "") {
+    const hs = gemini.upstreamHeaders(pt)
+    hs.set("content-type", req.headers.get("content-type") ?? "application/octet-stream")
+    for (const k of ["x-goog-upload-command", "x-goog-upload-offset"]) {
+      const v = req.headers.get(k) ?? ""
+      if (v !== "") hs.set(k, v)
+    }
+    return await rawFetch(pt, "POST", s.upstream, hs, bytes)
+  }
+  const fd = new FormData()
+  fd.append("file", new File([bytes], s.name === "" ? "upload" : s.name, { type: s.mime }))
+  fd.append("purpose", "batch")
+  const up = try await viaMedia(engine.cfg, s.provider, "POST", "/v1/files", "", fd)
+  if (!up.ok) return up
+  const raw = try await up.text()
+  const fid = rawStr(try fields(raw), "id") ?? ""
+  keepUploadText("files/" + fid, try new TextDecoder().decode(bytes))
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  h.set("x-goog-upload-status", "final")
+  return new Response(`{"file":${try genaiIn.fileToGemini(raw, s.mime)}}`, { headers: h })
+}
+
+// A batch on a provider other than Gemini: the requests (inline, or an uploaded file's lines)
+// become an OpenAI batch input file, which is created as a batch there.
+async function batchCreate(cfg: Config, t: Target, text: string): Promise<Response> throws SyntaxError | TypeError | Error {
+  const name = try genaiIn.batchFileName(text)
+  let jsonl = ""
+  if (name === "") jsonl = try genaiIn.batchInputOfBody(text, t.model)
+  else {
+    const src = uploadTexts.get(name)
+    if (src === undefined) return errorResponse(404, `no uploaded file ${name}`, "invalid_request_error", noHeaders())
+    jsonl = try genaiIn.batchInputOfFile(src, t.model)
+  }
+  const fd = new FormData()
+  fd.append("file", new File([jsonl], "batch.jsonl", { type: "application/jsonl" }))
+  fd.append("purpose", "batch")
+  const up = try await viaMedia(cfg, t.provider, "POST", "/v1/files", "", fd)
+  if (!up.ok) return up
+  const fileId = rawStr(try fields(try await up.text()), "id") ?? ""
+  const made = try await viaMedia(cfg, t.provider, "POST", "/v1/batches", "", `{"input_file_id":${quote(fileId)},"endpoint":"/v1/chat/completions","completion_window":"24h"}`)
+  if (!made.ok) return made
+  try {
+    return jsonBody(genaiIn.batchToGemini(await made.text()))
+  } catch (e) {
+    return convertFailed(e)
+  }
+}
+
+// The routes that name a model: batches.create, :predict and operations. The model's provider
+// answers: Gemini is passed through, the others are converted.
+async function genaiModelRoute(engine: Engine, req: Request, op: string, model: string, id: string, query: string): Promise<Response> throws SyntaxError | TypeError | Error {
+  const full = model.includes("/") ? model : routeProvider(req) + "/" + model
+  const sel = target(engine.cfg, parseModel(engine.cfg, full), new Set<int>(), undefined)
+  if (sel === undefined) return errorResponse(404, `model ${model} not found: no provider or key serves it`, "invalid_request_error", noHeaders())
+  const t = sel.t
+  if (op === "operations.get") {
+    if (t.kind === "gemini") return await passGemini(t, "GET", `/v1beta/models/${t.model}/operations/${id}`, query, undefined)
+    return unsupported("video_retrieve", t.provider)
+  }
+  const text = await req.text()
+  if (op === "batches.create") {
+    if (t.kind === "gemini") return await passGemini(t, "POST", `/v1beta/models/${t.model}:batchGenerateContent`, "", text)
+    return try await batchCreate(engine.cfg, t, text)
+  }
+  if (t.kind === "gemini") return await passGemini(t, "POST", `/v1beta/models/${t.model}:predict`, "", text)
+  // Imagen models make images; any other model's :predict is an embedding, as in Bifrost
+  if (t.model.toLowerCase().includes("imagen")) {
+    const up = try await viaMedia(engine.cfg, "", "POST", "/v1/images/generations", "", try genaiIn.predictToImages(text, t.provider + "/" + t.model))
+    if (!up.ok) return up
+    try {
+      return jsonBody(genaiIn.imagesToPredict(await up.text()))
+    } catch (e) {
+      return convertFailed(e)
+    }
+  }
+  const conv = try genaiIn.predictToEmbeddings(text, t.provider + "/" + t.model)
+  const r = await engine.embeddings(internalRequest(req, "/v1/embeddings", conv))
+  if (r.status !== 200) return r
+  try {
+    return jsonBody(genaiIn.embeddingsToPredict(await r.text()))
+  } catch (e) {
+    return convertFailed(e)
+  }
+}
+
+// /genai/v1/rank: Raiju's rerank, in the shape of Vertex's rank API. The model's provider ranks
+// (Vertex by default, as Bifrost), so the same providers as /v1/rerank serve it.
+async function genaiRank(engine: Engine, req: Request): Promise<Response> throws SyntaxError | TypeError | Error {
+  const text = await req.text()
+  const model = rawStr(try fields(text), "model") ?? ""
+  if (model === "") return errorResponse(400, "the rank request needs a model", "invalid_request_error", noHeaders())
+  const hp = req.headers.get("x-model-provider") ?? ""
+  const full = model.includes("/") ? model : (hp === "" ? "vertex" : hp) + "/" + model
+  const conv = try genaiIn.rankToRaiju(text, full)
+  const r = await rerank(engine, internalRequest(req, "/v1/rerank", conv))
+  if (r.status !== 200) return r
+  try {
+    return jsonBody(genaiIn.rerankToRank(await r.text(), text))
+  } catch (e) {
+    return convertFailed(e)
+  }
+}
+
+// Files, batches and cached contents of the provider named by x-model-provider (Gemini by default).
+async function genaiStore(engine: Engine, req: Request, op: string, id: string, query: string, sp: URLSearchParams): Promise<Response> throws SyntaxError | TypeError | Error {
+  const cfg = engine.cfg
+  const provider = routeProvider(req)
+  const t = providerTarget(cfg, provider)
+  if (t === undefined) return errorResponse(404, `provider "${provider}" is not configured or has no key`, "invalid_request_error", noHeaders())
+  const gem = t.kind === "gemini"
+  const m = req.method
+  if (op.startsWith("cached.")) {
+    if (!gem) return unsupported(op.replace("cached.", "cached_content_"), t.provider)
+    const path = id === "" ? "/v1beta/cachedContents" : "/v1beta/cachedContents/" + id
+    const text = m === "GET" || m === "DELETE" ? "" : await req.text()
+    return await passGemini(t, m, path, query, text === "" ? undefined : text)
+  }
+  if (op === "files.list") {
+    if (gem) return await passGemini(t, "GET", "/v1beta/files", query, undefined)
+    const got = try await viaMedia(cfg, t.provider, "GET", "/v1/files", pagingQuery(sp), undefined)
+    if (!got.ok) return got
+    try {
+      return jsonBody(genaiIn.fileListToGemini(await got.text()))
+    } catch (e) {
+      return convertFailed(e)
+    }
+  }
+  if (op === "files.retrieve" || op === "files.delete") {
+    if (gem) return await passGemini(t, m, "/v1beta/files/" + id, query, undefined)
+    if (op === "files.delete") {
+      const del = try await viaMedia(cfg, t.provider, "DELETE", "/v1/files/" + id, "", undefined)
+      if (!del.ok) return del
+      return jsonBody("{}")
+    }
+    const got = try await viaMedia(cfg, t.provider, "GET", "/v1/files/" + id, "", undefined)
+    if (!got.ok) return got
+    try {
+      return jsonBody(genaiIn.fileToGemini(await got.text(), ""))
+    } catch (e) {
+      return convertFailed(e)
+    }
+  }
+  if (op === "batches.list") {
+    if (gem) return await passGemini(t, "GET", "/v1beta/batches", query, undefined)
+    const got = try await viaMedia(cfg, t.provider, "GET", "/v1/batches", pagingQuery(sp), undefined)
+    if (!got.ok) return got
+    try {
+      return jsonBody(genaiIn.batchListToGemini(await got.text()))
+    } catch (e) {
+      return convertFailed(e)
+    }
+  }
+  if (op === "batches.retrieve") {
+    if (gem) return await passGemini(t, "GET", "/v1beta/batches/" + id, query, undefined)
+    const got = try await viaMedia(cfg, t.provider, "GET", "/v1/batches/" + id, "", undefined)
+    if (!got.ok) return got
+    try {
+      return jsonBody(genaiIn.batchToGemini(await got.text()))
+    } catch (e) {
+      return convertFailed(e)
+    }
+  }
+  if (op === "batches.cancel") {
+    if (gem) return await passGemini(t, "POST", "/v1beta/batches/" + id + ":cancel", "", "{}")
+    const got = try await viaMedia(cfg, t.provider, "POST", "/v1/batches/" + id + "/cancel", "", undefined)
+    if (!got.ok) return got
+    return jsonBody("{}")
+  }
+  if (op === "batches.delete") {
+    if (gem) return await passGemini(t, "DELETE", "/v1beta/batches/" + id, "", undefined)
+    return unsupported("batch_delete", t.provider)
+  }
+  return errorResponse(404, `${op} isn't supported`, "invalid_request_error", noHeaders())
+}
+
+// One GenAI SDK route (genai_in.tov's genaiRoute). The second upload step carries no virtual
+// key (its upload_id is the credential, as in Bifrost), so only the other routes are checked.
+export async function genaiSdk(engine: Engine, req: Request, op: string, model: string, id: string): Promise<Response> {
+  const u = URL.parse(req.url)
+  const origin = u === undefined ? "http://localhost" : u.origin
+  const query = u === undefined ? "" : u.search.slice(1)
+  const sp = new URLSearchParams(query)
+  const chunk = op === "files.upload" && (sp.get("upload_id") ?? "") !== ""
+  if (!chunk && engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
+    return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
+  }
+  try {
+    if (op === "rank") return await genaiRank(engine, req)
+    if (op === "files.upload") return await genaiUpload(engine, req, origin, sp)
+    if (op === "batches.create" || op === "predict" || op === "operations.get") return await genaiModelRoute(engine, req, op, model, id, query)
+    return await genaiStore(engine, req, op, id, query, sp)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+}
+
 const BEDROCK_ACTIONS = ["converse", "converse-stream", "invoke", "invoke-with-response-stream", "count-tokens"]
 
 // Bedrock's event-stream answer (binary frames) from frames built here.
@@ -449,3 +814,33 @@ export async function bedrockModel(engine: Engine, req: Request, modelId: string
   }
   return eventStreamResponse(invoke ? bedrockIn.invokeFramesFromSse(sse, id) : bedrockIn.converseFramesFromSse(sse))
 }
+
+test("GenAI upload sessions are one-shot and expire after a minute", () => {
+  const id = try startUpload({ provider: "openai", upstream: "", name: "a.jsonl", mime: "application/jsonl", at: nowSeconds() })
+  expect(id.startsWith("upl_")).toBe(true)
+  expect(id.byteLength).toBe(4 + 24)
+  const s = takeUpload(id)
+  expect(s === undefined).toBe(false)
+  expect(s!.provider).toBe("openai")
+  expect(s!.name).toBe("a.jsonl")
+  expect(takeUpload(id) === undefined).toBe(true)
+  expect(takeUpload("upl_missing") === undefined).toBe(true)
+  const old = try startUpload({ provider: "gemini", upstream: "http://g/upload", name: "", mime: "", at: nowSeconds() - 120 })
+  expect(takeUpload(old) === undefined).toBe(true)
+})
+
+test("GenAI list queries become OpenAI's paging", () => {
+  expect(pagingQuery(new URLSearchParams("pageSize=5&pageToken=file-1"))).toBe("limit=5&after=file-1")
+  expect(pagingQuery(new URLSearchParams("pageSize=&other=1"))).toBe("")
+})
+
+test("the first upload step answers the gateway's own URL", () => {
+  const r = uploadStarted("http://gw.local:8080", "upl_1")
+  expect(r.headers.get("x-goog-upload-url")).toBe("http://gw.local:8080/genai/upload/v1beta/files?upload_id=upl_1")
+  expect(r.headers.get("x-goog-upload-status")).toBe("active")
+})
+
+test("the route provider comes from x-model-provider, Gemini by default", () => {
+  expect(routeProvider(new Request("http://gw.local/genai/v1beta/files"))).toBe("gemini")
+  expect(routeProvider(new Request("http://gw.local/genai/v1beta/files", { headers: { "x-model-provider": "openai" } }))).toBe("openai")
+})

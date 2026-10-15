@@ -3,6 +3,7 @@
 // Function arguments and responses are JSON, so they stay raw text where possible.
 import { Field, fields, elements, find, quote, rawStr, rawBool, rawNum, decodeString, build } from "./json"
 import { newId } from "./schemas"
+import { rfc3339 } from "./anthropic_batch"
 
 // A field's raw value, or undefined when it is absent or null.
 function present(fs: Field[], key: string): string | undefined {
@@ -506,6 +507,321 @@ export function modelsList(ids: string[]): string {
   return `{"models":[${models.join(",")}]}`
 }
 
+// ---- files, batches, cached contents, operations, :predict and rank ----
+
+export type GenAIRoute = { op: string, model: string, id: string }
+
+// A segment that names one thing: not empty, no "/".
+function oneSegment(s: string): bool {
+  return s !== "" && !s.includes("/")
+}
+
+// The GenAI SDK route for a method and a path (no query). Undefined for what genai() answers
+// itself (models/{model}:generateContent and the rest) and for paths that are not the SDK's.
+export function genaiRoute(method: string, path: string): GenAIRoute | undefined {
+  const m = method.toUpperCase()
+  if (path === "/genai/upload/v1beta/files") return m === "POST" ? { op: "files.upload", model: "", id: "" } : undefined
+  if (path === "/genai/v1/rank") return m === "POST" ? { op: "rank", model: "", id: "" } : undefined
+  const pre = "/genai/v1beta/"
+  if (!path.startsWith(pre)) return undefined
+  const rest = path.slice(pre.byteLength)
+  if (rest.startsWith("models/")) {
+    const body = rest.slice("models/".byteLength)
+    const parts = body.split("/")
+    const n = parts.length
+    if (m === "GET" && n >= 3 && parts[n - 2] === "operations" && oneSegment(parts[n - 1] ?? "")) {
+      return { op: "operations.get", model: parts.slice(0, n - 2).join("/"), id: parts[n - 1] ?? "" }
+    }
+    if (m !== "POST") return undefined
+    if (body.endsWith(":predict")) return { op: "predict", model: body.slice(0, body.byteLength - ":predict".byteLength), id: "" }
+    if (body.endsWith(":batchGenerateContent")) return { op: "batches.create", model: body.slice(0, body.byteLength - ":batchGenerateContent".byteLength), id: "" }
+    return undefined
+  }
+  if (rest === "files") return m === "GET" ? { op: "files.list", model: "", id: "" } : undefined
+  if (rest.startsWith("files/")) {
+    const id = rest.slice("files/".byteLength)
+    if (!oneSegment(id)) return undefined
+    if (m === "GET") return { op: "files.retrieve", model: "", id: id }
+    if (m === "DELETE") return { op: "files.delete", model: "", id: id }
+    return undefined
+  }
+  if (rest === "batches") return m === "GET" ? { op: "batches.list", model: "", id: "" } : undefined
+  if (rest.startsWith("batches/")) {
+    let id = rest.slice("batches/".byteLength)
+    if (m === "POST" && id.endsWith(":cancel")) {
+      id = id.slice(0, id.byteLength - ":cancel".byteLength)
+      return oneSegment(id) ? { op: "batches.cancel", model: "", id: id } : undefined
+    }
+    if (!oneSegment(id)) return undefined
+    if (m === "GET") return { op: "batches.retrieve", model: "", id: id }
+    if (m === "DELETE") return { op: "batches.delete", model: "", id: id }
+    return undefined
+  }
+  if (rest === "cachedContents") {
+    if (m === "POST") return { op: "cached.create", model: "", id: "" }
+    if (m === "GET") return { op: "cached.list", model: "", id: "" }
+    return undefined
+  }
+  if (rest.startsWith("cachedContents/")) {
+    const id = rest.slice("cachedContents/".byteLength)
+    if (!oneSegment(id)) return undefined
+    if (m === "GET") return { op: "cached.retrieve", model: "", id: id }
+    if (m === "PATCH") return { op: "cached.update", model: "", id: id }
+    if (m === "DELETE") return { op: "cached.delete", model: "", id: id }
+  }
+  return undefined
+}
+
+// Unix seconds in a raw field as a Gemini timestamp, or "" when it is absent or null.
+function stamp(fs: Field[], key: string): string {
+  const r = find(fs, key)
+  if (r === undefined || r === "null") return ""
+  const n = parseFloat(r)
+  return rfc3339(n ?? 0.0)
+}
+
+// The first of several unix-seconds fields that is set, as a Gemini timestamp.
+function firstStamp(fs: Field[], keys: string[]): string {
+  for (const k of keys) {
+    const s = stamp(fs, k)
+    if (s !== "") return s
+  }
+  return ""
+}
+
+// The page token of an OpenAI list (has_more, last_id), as a ",nextPageToken" member or "".
+function pageToken(fs: Field[]): string {
+  if (rawBool(fs, "has_more") !== true) return ""
+  const last = rawStr(fs, "last_id") ?? ""
+  return last === "" ? "" : `,"nextPageToken":${quote(last)}`
+}
+
+// An OpenAI file object as a Gemini File ("files/{id}"). mime is the upload's type, when known.
+export function fileToGemini(openai: string, mime: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const id = rawStr(fs, "id") ?? ""
+  const parts: string[] = [`"name":${quote("files/" + id)}`, `"displayName":${quote(rawStr(fs, "filename") ?? "")}`]
+  if (mime !== "") parts.push(`"mimeType":${quote(mime)}`)
+  parts.push(`"sizeBytes":${quote(find(fs, "bytes") ?? "0")}`)
+  const created = stamp(fs, "created_at")
+  parts.push(`"createTime":${quote(created)}`, `"updateTime":${quote(created)}`)
+  const exp = stamp(fs, "expires_at")
+  if (exp !== "") parts.push(`"expirationTime":${quote(exp)}`)
+  const status = rawStr(fs, "status") ?? ""
+  let state = "PROCESSING"
+  if (status === "processed") state = "ACTIVE"
+  if (status === "error") state = "FAILED"
+  parts.push(`"state":${quote(state)}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// An OpenAI file list as a Gemini file list.
+export function fileListToGemini(openai: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const items: string[] = []
+  for (const el of try elements(find(fs, "data") ?? "[]")) items.push(try fileToGemini(el, ""))
+  return `{"files":[${items.join(",")}]${pageToken(fs)}}`
+}
+
+// The Gemini state of an OpenAI batch status.
+function batchState(status: string): string {
+  if (status === "completed") return "BATCH_STATE_SUCCEEDED"
+  if (status === "failed") return "BATCH_STATE_FAILED"
+  if (status === "expired") return "BATCH_STATE_EXPIRED"
+  if (status === "cancelled") return "BATCH_STATE_CANCELLED"
+  if (status === "cancelling") return "BATCH_STATE_CANCELLING"
+  if (status === "in_progress" || status === "finalizing") return "BATCH_STATE_RUNNING"
+  return "BATCH_STATE_PENDING"
+}
+
+// An OpenAI batch as a Gemini batch operation: its name, state, counts, input and output.
+export function batchToGemini(openai: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const id = rawStr(fs, "id") ?? ""
+  const status = rawStr(fs, "status") ?? "validating"
+  const counts = try fields(find(fs, "request_counts") ?? "{}")
+  const total = rawNum(counts, "total") ?? 0.0
+  const completed = rawNum(counts, "completed") ?? 0.0
+  const failed = rawNum(counts, "failed") ?? 0.0
+  const pending = Math.max(0.0, total - completed - failed)
+  const meta: string[] = [
+    `"@type":"type.googleapis.com/google.ai.generativelanguage.v1beta.BatchPredictionJob"`,
+    `"name":${quote("batches/" + id)}`,
+    `"state":${quote(batchState(status))}`,
+    `"createTime":${quote(stamp(fs, "created_at"))}`,
+  ]
+  const end = firstStamp(fs, ["completed_at", "failed_at", "expired_at", "cancelled_at"])
+  if (end !== "") meta.push(`"endTime":${quote(end)}`)
+  meta.push(`"batchStats":{"requestCount":${quote(`${total}`)},"pendingRequestCount":${quote(`${pending}`)},"successfulRequestCount":${quote(`${completed}`)}}`)
+  const input = rawStr(fs, "input_file_id") ?? ""
+  if (input !== "") meta.push(`"inputConfig":{"fileName":${quote("files/" + input)}}`)
+  const out = rawStr(fs, "output_file_id") ?? ""
+  if (out !== "") meta.push(`"output":{"responsesFile":${quote(out)}}`)
+  const dest = out === "" ? "" : `,"dest":{"fileName":${quote(out)}}`
+  const done = ["completed", "failed", "expired", "cancelled"].includes(status)
+  return `{"name":${quote("batches/" + id)},"metadata":{${meta.join(",")}},"done":${done}${dest}}`
+}
+
+// An OpenAI batch list as a Gemini operations list.
+export function batchListToGemini(openai: string): string throws SyntaxError {
+  const fs = try fields(openai)
+  const items: string[] = []
+  for (const el of try elements(find(fs, "data") ?? "[]")) items.push(try batchToGemini(el))
+  return `{"operations":[${items.join(",")}]${pageToken(fs)}}`
+}
+
+// The batch's input_config (inputConfig or input_config) fields of a batch.create body.
+function inputConfig(body: string): Field[] throws SyntaxError {
+  const batch = try fields(find(try fields(body), "batch") ?? "{}")
+  const raw = find(batch, "inputConfig") ?? find(batch, "input_config")
+  if (raw === undefined || raw === "null") throw new SyntaxError("the batch needs an inputConfig")
+  return try fields(raw)
+}
+
+// The uploaded file a batch reads (its name, "files/{id}"), or "" when the requests are inline.
+export function batchFileName(body: string): string throws SyntaxError {
+  const input = try inputConfig(body)
+  return rawStr(input, "fileName") ?? rawStr(input, "file_name") ?? ""
+}
+
+// One chat completion line of an OpenAI batch input, for one GenAI request.
+function requestLine(key: string, request: string, model: string): string throws SyntaxError {
+  const chat = try generateToOpenAI(request, model, false)
+  return `{"custom_id":${quote(key)},"method":"POST","url":"/v1/chat/completions","body":${chat}}`
+}
+
+// A batch.create body's inline requests ({"requests": {"requests": [{request, metadata.key}]}})
+// as an OpenAI batch input file for the upstream model.
+export function batchInputOfBody(body: string, model: string): string throws SyntaxError {
+  const wrap = try fields(find(try inputConfig(body), "requests") ?? "{}")
+  const lines: string[] = []
+  let i = 0
+  for (const el of try elements(find(wrap, "requests") ?? "[]")) {
+    const r = try fields(el)
+    const request = find(r, "request")
+    if (request === undefined || request === "null") throw new SyntaxError(`request ${i} has no request`)
+    const key = rawStr(try fields(find(r, "metadata") ?? "{}"), "key") ?? `request-${i}`
+    lines.push(try requestLine(key, request, model))
+    i += 1
+  }
+  if (lines.length === 0) throw new SyntaxError("the batch has no requests")
+  return lines.join("\n") + "\n"
+}
+
+// An uploaded GenAI batch file ({"key", "request"} per line) as an OpenAI batch input file.
+export function batchInputOfFile(text: string, model: string): string throws SyntaxError {
+  const lines: string[] = []
+  let i = 0
+  for (const l of text.split("\n")) {
+    if (l.trim() === "") continue
+    const r = try fields(l)
+    const request = find(r, "request")
+    if (request === undefined || request === "null") throw new SyntaxError(`line ${i + 1} has no request`)
+    lines.push(try requestLine(rawStr(r, "key") ?? `request-${i}`, request, model))
+    i += 1
+  }
+  if (lines.length === 0) throw new SyntaxError("the file has no requests")
+  return lines.join("\n") + "\n"
+}
+
+// The display name in a files.upload's first step ({"file": {"displayName"}}), or "".
+export function uploadName(body: string): string throws SyntaxError {
+  if (body.trim() === "") return ""
+  const f = try fields(find(try fields(body), "file") ?? "{}")
+  return rawStr(f, "displayName") ?? rawStr(f, "display_name") ?? ""
+}
+
+// The "instances" of a :predict body, as its raw array.
+function instancesOf(body: string): string throws SyntaxError {
+  const raw = find(try fields(body), "instances")
+  if (raw === undefined || raw === "null") throw new SyntaxError("instances is required")
+  return raw
+}
+
+// A :predict embedding request (each instance's content is one text) as an OpenAI embeddings request.
+export function predictToEmbeddings(body: string, model: string): string throws SyntaxError {
+  const items: string[] = []
+  for (const el of try elements(try instancesOf(body))) {
+    const c = present(try fields(el), "content")
+    if (c === undefined) throw new SyntaxError("each instance needs content")
+    items.push(c.startsWith("\"") ? c : quote(try contentText(c)))
+  }
+  if (items.length === 0) throw new SyntaxError("instances must not be empty")
+  return `{"model":${quote(model)},"input":[${items.join(",")}]}`
+}
+
+// An OpenAI embeddings answer as a :predict answer: one prediction of values per input.
+export function embeddingsToPredict(resp: string): string throws SyntaxError {
+  const data = present(try fields(resp), "data")
+  const preds: string[] = []
+  if (data !== undefined) {
+    for (const el of try elements(data)) preds.push(`{"embeddings":{"values":${present(try fields(el), "embedding") ?? "[]"}}}`)
+  }
+  return `{"predictions":[${preds.join(",")}]}`
+}
+
+// An Imagen :predict request (its first instance's prompt, parameters.sampleCount) as an OpenAI image request.
+export function predictToImages(body: string, model: string): string throws SyntaxError {
+  const insts = try elements(try instancesOf(body))
+  const prompt = rawStr(try fields(insts[0] ?? "{}"), "prompt") ?? ""
+  if (prompt === "") throw new SyntaxError("the request needs a prompt")
+  const params = try fields(find(try fields(body), "parameters") ?? "{}")
+  const n = Math.max(1.0, Math.floor(rawNum(params, "sampleCount") ?? 1.0))
+  return `{"model":${quote(model)},"prompt":${quote(prompt)},"n":${n},"response_format":"b64_json"}`
+}
+
+// An OpenAI image answer (b64_json per image) as a :predict answer.
+export function imagesToPredict(resp: string): string throws SyntaxError {
+  const data = present(try fields(resp), "data")
+  const preds: string[] = []
+  if (data !== undefined) {
+    for (const el of try elements(data)) preds.push(`{"bytesBase64Encoded":${quote(rawStr(try fields(el), "b64_json") ?? "")},"mimeType":"image/png"}`)
+  }
+  return `{"predictions":[${preds.join(",")}]}`
+}
+
+// A GenAI rank request as a Raiju rerank request. Each record's text is its title and content.
+export function rankToRaiju(body: string, model: string): string throws SyntaxError {
+  const fs = try fields(body)
+  const query = rawStr(fs, "query") ?? ""
+  if (query === "") throw new SyntaxError("query is required")
+  const docs: string[] = []
+  for (const el of try elements(find(fs, "records") ?? "[]")) {
+    const r = try fields(el)
+    const title = rawStr(r, "title") ?? ""
+    const content = rawStr(r, "content") ?? ""
+    let text = title + content
+    if (title !== "" && content !== "") text = title + "\n" + content
+    docs.push(quote(text))
+  }
+  if (docs.length === 0) throw new SyntaxError("records must not be empty")
+  const topN = rawNum(fs, "topN") ?? 0.0
+  const top = topN > 0.0 ? Math.min(topN, docs.length * 1.0) : docs.length * 1.0
+  return `{"model":${quote(model)},"query":${quote(query)},"documents":[${docs.join(",")}],"top_n":${top},"return_documents":false}`
+}
+
+// A Raiju rerank answer as a GenAI rank answer, in the order it ranked: each record's id and
+// score and, unless ignoreRecordDetailsInResponse is set, its title and content.
+export function rerankToRank(raiju: string, body: string): string throws SyntaxError {
+  const fs = try fields(body)
+  const recs = try elements(find(fs, "records") ?? "[]")
+  const ignore = rawBool(fs, "ignoreRecordDetailsInResponse") === true
+  const out: string[] = []
+  for (const el of try elements(find(try fields(raiju), "results") ?? "[]")) {
+    const res = try fields(el)
+    const rec = try fields(recs[Math.floor(rawNum(res, "index") ?? 0.0)] ?? "{}")
+    const parts: string[] = [`"id":${quote(rawStr(rec, "id") ?? "")}`, `"score":${find(res, "relevance_score") ?? "0"}`]
+    if (!ignore) {
+      const t = find(rec, "title")
+      if (t !== undefined && t !== "null") parts.push(`"title":${t}`)
+      const c = find(rec, "content")
+      if (c !== undefined && c !== "null") parts.push(`"content":${c}`)
+    }
+    out.push("{" + parts.join(",") + "}")
+  }
+  return `{"records":[${out.join(",")}]}`
+}
+
 type WireMsg = { role: string, content?: string, tool_call_id?: string, tool_calls?: { id: string, function: { name: string, arguments: string } }[] }
 type WireReq = { messages: WireMsg[] }
 
@@ -699,4 +1015,133 @@ test("countTokens and models in the GenAI shape", () => {
     `{"name":"models/text-embedding-3-small","version":"001","displayName":"text-embedding-3-small","supportedGenerationMethods":["embedContent","batchEmbedContents"]}]}`)
   expect(modelInfo("openai/gpt-4o").startsWith(`{"name":"models/openai/gpt-4o"`)).toBe(true)
   expect(modelsList([])).toBe(`{"models":[]}`)
+})
+
+test("GenAI routes: files, batches, cached contents, operations, predict and rank", () => {
+  expect(genaiRoute("POST", "/genai/upload/v1beta/files")).toEqual({ op: "files.upload", model: "", id: "" })
+  expect(genaiRoute("GET", "/genai/upload/v1beta/files")).toBeUndefined()
+  expect(genaiRoute("POST", "/genai/v1/rank")!.op).toBe("rank")
+  expect(genaiRoute("GET", "/genai/v1beta/files")!.op).toBe("files.list")
+  expect(genaiRoute("GET", "/genai/v1beta/files/file-1")).toEqual({ op: "files.retrieve", model: "", id: "file-1" })
+  expect(genaiRoute("DELETE", "/genai/v1beta/files/files-x")!.op).toBe("files.delete")
+  expect(genaiRoute("PATCH", "/genai/v1beta/files/file-1")).toBeUndefined()
+  expect(genaiRoute("GET", "/genai/v1beta/files/a/b")).toBeUndefined()
+  expect(genaiRoute("GET", "/genai/v1beta/batches")!.op).toBe("batches.list")
+  expect(genaiRoute("GET", "/genai/v1beta/batches/batch_1")).toEqual({ op: "batches.retrieve", model: "", id: "batch_1" })
+  expect(genaiRoute("DELETE", "/genai/v1beta/batches/batch_1")!.op).toBe("batches.delete")
+  expect(genaiRoute("POST", "/genai/v1beta/batches/batch_1:cancel")).toEqual({ op: "batches.cancel", model: "", id: "batch_1" })
+  expect(genaiRoute("POST", "/genai/v1beta/batches/batch_1")).toBeUndefined()
+  expect(genaiRoute("POST", "/genai/v1beta/models/openai/gpt-4o-mini:batchGenerateContent")).toEqual({ op: "batches.create", model: "openai/gpt-4o-mini", id: "" })
+  expect(genaiRoute("POST", "/genai/v1beta/models/gemini-2.5-flash:predict")).toEqual({ op: "predict", model: "gemini-2.5-flash", id: "" })
+  expect(genaiRoute("GET", "/genai/v1beta/models/veo-3/operations/op-9")).toEqual({ op: "operations.get", model: "veo-3", id: "op-9" })
+  expect(genaiRoute("GET", "/genai/v1beta/models/openai/veo/operations/op-9")).toEqual({ op: "operations.get", model: "openai/veo", id: "op-9" })
+  expect(genaiRoute("POST", "/genai/v1beta/cachedContents")!.op).toBe("cached.create")
+  expect(genaiRoute("GET", "/genai/v1beta/cachedContents")!.op).toBe("cached.list")
+  expect(genaiRoute("PATCH", "/genai/v1beta/cachedContents/c1")!.op).toBe("cached.update")
+  expect(genaiRoute("DELETE", "/genai/v1beta/cachedContents/c1")!.op).toBe("cached.delete")
+  expect(genaiRoute("GET", "/genai/v1beta/cachedContents/c1")!.op).toBe("cached.retrieve")
+  // what genai() and the models list answer stay out
+  expect(genaiRoute("POST", "/genai/v1beta/models/openai/gpt-4o:generateContent")).toBeUndefined()
+  expect(genaiRoute("GET", "/genai/v1beta/models/openai/gpt-4o")).toBeUndefined()
+  expect(genaiRoute("GET", "/genai/v1beta/models")).toBeUndefined()
+  expect(genaiRoute("POST", "/v1/rank")).toBeUndefined()
+})
+
+test("files in the GenAI shape", () => {
+  const f = `{"id":"file-abc","object":"file","bytes":77,"created_at":1735689600,"filename":"in.jsonl","purpose":"batch","status":"processed","expires_at":1735776000}`
+  expect(try fileToGemini(f, "application/jsonl")).toBe(`{"name":"files/file-abc","displayName":"in.jsonl","mimeType":"application/jsonl","sizeBytes":"77","createTime":"2025-01-01T00:00:00Z","updateTime":"2025-01-01T00:00:00Z","expirationTime":"2025-01-02T00:00:00Z","state":"ACTIVE"}`)
+  expect(try fileToGemini(`{"id":"file-2","bytes":1,"created_at":0,"filename":"x","status":"error"}`, "")).toBe(`{"name":"files/file-2","displayName":"x","sizeBytes":"1","createTime":"1970-01-01T00:00:00Z","updateTime":"1970-01-01T00:00:00Z","state":"FAILED"}`)
+  const list = `{"object":"list","data":[${f}],"has_more":true,"first_id":"file-abc","last_id":"file-abc"}`
+  expect(try fileListToGemini(list)).toBe(`{"files":[${try fileToGemini(f, "")}],"nextPageToken":"file-abc"}`)
+  expect(try fileListToGemini(`{"object":"list","data":[],"has_more":false}`)).toBe(`{"files":[]}`)
+  expect(try uploadName(`{"file":{"displayName":"a.jsonl"}}`)).toBe("a.jsonl")
+  expect(try uploadName(`{"file":{"display_name":"b.jsonl"}}`)).toBe("b.jsonl")
+  expect(try uploadName("")).toBe("")
+  expect(try uploadName(`{"file":{}}`)).toBe("")
+  let threw = false
+  try {
+    uploadName("[1]")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("batches in the GenAI shape", () => {
+  const b = `{"id":"batch_1","object":"batch","endpoint":"/v1/chat/completions","input_file_id":"file-in","status":"completed","created_at":1735689600,"completed_at":1735693200,"output_file_id":"file-out","request_counts":{"total":3,"completed":2,"failed":1}}`
+  expect(try batchToGemini(b)).toBe(`{"name":"batches/batch_1","metadata":{"@type":"type.googleapis.com/google.ai.generativelanguage.v1beta.BatchPredictionJob","name":"batches/batch_1","state":"BATCH_STATE_SUCCEEDED","createTime":"2025-01-01T00:00:00Z","endTime":"2025-01-01T01:00:00Z","batchStats":{"requestCount":"3","pendingRequestCount":"0","successfulRequestCount":"2"},"inputConfig":{"fileName":"files/file-in"},"output":{"responsesFile":"file-out"}},"done":true,"dest":{"fileName":"file-out"}}`)
+  const running = try JSON.parse(try batchToGemini(`{"id":"batch_2","status":"in_progress","created_at":0,"request_counts":{"total":5,"completed":1,"failed":0}}`)) as { done: bool, metadata: { state: string, batchStats: { pendingRequestCount: string } } }
+  expect(running.done).toBe(false)
+  expect(running.metadata.state).toBe("BATCH_STATE_RUNNING")
+  expect(running.metadata.batchStats.pendingRequestCount).toBe("4")
+  expect(try batchToGemini(`{"id":"b3","status":"cancelled","created_at":0}`).includes(`"done":true`)).toBe(true)
+  const list = try batchListToGemini(`{"object":"list","data":[${b}],"has_more":false}`)
+  expect(list.startsWith(`{"operations":[{"name":"batches/batch_1"`)).toBe(true)
+  expect(list.endsWith(`}]}`)).toBe(true)
+})
+
+test("batch inputs: inline requests and uploaded lines become OpenAI chat lines", () => {
+  const inline = `{"batch":{"displayName":"d","inputConfig":{"requests":{"requests":[` +
+    `{"request":{"contents":[{"role":"user","parts":[{"text":"one"}]}]},"metadata":{"key":"k1"}},` +
+    `{"request":{"contents":[{"role":"user","parts":[{"text":"two"}]}]}}]}}}}`
+  const lines = try batchInputOfBody(inline, "gpt-4o-mini").split("\n")
+  expect(lines.length).toBe(3)
+  expect(lines[2]).toBe("")
+  expect(lines[0]!.startsWith(`{"custom_id":"k1","method":"POST","url":"/v1/chat/completions","body":`)).toBe(true)
+  expect(lines[0]!.includes(`"model":"gpt-4o-mini"`)).toBe(true)
+  expect(lines[0]!.includes(`"content":"one"`)).toBe(true)
+  expect(lines[1]!.startsWith(`{"custom_id":"request-1"`)).toBe(true)
+  expect(try batchFileName(`{"batch":{"inputConfig":{"fileName":"files/f1"}}}`)).toBe("files/f1")
+  expect(try batchFileName(inline)).toBe("")
+  expect(try batchFileName(`{"batch":{"input_config":{"file_name":"files/f2"}}}`)).toBe("files/f2")
+  const file = `{"key":"a","request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}}\n\n{"request":{"contents":[{"role":"user","parts":[{"text":"yo"}]}]}}\n`
+  const out = try batchInputOfFile(file, "m").split("\n")
+  expect(out.length).toBe(3)
+  expect(out[0]!.startsWith(`{"custom_id":"a"`)).toBe(true)
+  expect(out[1]!.startsWith(`{"custom_id":"request-1"`)).toBe(true)
+  let threw = false
+  try {
+    batchInputOfBody(`{"batch":{"inputConfig":{"requests":{"requests":[]}}}}`, "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    batchInputOfBody(`{"batch":{}}`, "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("predict: embeddings and Imagen images in both directions", () => {
+  expect(try predictToEmbeddings(`{"instances":[{"content":"alpha"},{"content":{"parts":[{"text":"beta"}]}}]}`, "te")).toBe(`{"model":"te","input":["alpha","beta"]}`)
+  let threw = false
+  try {
+    predictToEmbeddings(`{"parameters":{}}`, "te")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  expect(try embeddingsToPredict(`{"object":"list","data":[{"index":0,"embedding":[0.5,1]}]}`)).toBe(`{"predictions":[{"embeddings":{"values":[0.5,1]}}]}`)
+  expect(try predictToImages(`{"instances":[{"prompt":"a red fox"}],"parameters":{"sampleCount":2}}`, "openai/dall-e-3")).toBe(`{"model":"openai/dall-e-3","prompt":"a red fox","n":2,"response_format":"b64_json"}`)
+  expect(try predictToImages(`{"instances":[{"prompt":"fox"}]}`, "m").includes(`"n":1,`)).toBe(true)
+  expect(try imagesToPredict(`{"data":[{"b64_json":"iVBORw0KGgo="}]}`)).toBe(`{"predictions":[{"bytesBase64Encoded":"iVBORw0KGgo=","mimeType":"image/png"}]}`)
+})
+
+test("rank: records become documents and the ranked answer keeps their ids", () => {
+  const body = `{"query":"capital","records":[{"id":"a","content":"bananas"},{"id":"b","title":"Paris","content":"capital of France"}],"topN":1}`
+  expect(try rankToRaiju(body, "raiju/lexical")).toBe(`{"model":"raiju/lexical","query":"capital","documents":["bananas","Paris\\ncapital of France"],"top_n":1,"return_documents":false}`)
+  expect(try rankToRaiju(`{"query":"q","records":[{"id":"x","content":"y"}]}`, "m").includes(`"top_n":1,`)).toBe(true)
+  const raiju = `{"results":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.1}]}`
+  expect(try rerankToRank(raiju, body)).toBe(`{"records":[{"id":"b","score":0.9,"title":"Paris","content":"capital of France"},{"id":"a","score":0.1,"content":"bananas"}]}`)
+  expect(try rerankToRank(raiju, `{"records":[{"id":"a","content":"x"},{"id":"b","content":"y"}],"ignoreRecordDetailsInResponse":true}`)).toBe(`{"records":[{"id":"b","score":0.9},{"id":"a","score":0.1}]}`)
+  let threw = false
+  try {
+    rankToRaiju(`{"records":[{"id":"a"}]}`, "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
 })
