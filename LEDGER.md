@@ -192,6 +192,30 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L73 | G12, G25, G27 | /bedrock/rerank and Bedrock rerank, real count-tokens, inference-profile arn, use_openai_endpoints, Mantle Anthropic models | worker | done: unit + e2e; batch S3 open |
 | L74 | G47, G18 | Remaining management routes; remaining metric families | worker → lead (login audit) | done; enterprise-only routes skipped |
 
+## Wave 11: everything mechanical that's left
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L75 | G16, G25 | Vertex batches and files (GCS), Bedrock batches and files (S3) | worker | assigned |
+| L76 | G17, G22 | Remaining x-bifrost-* headers; MCP verification and OAuth routes, tool_sync_interval, allow_by_default | worker | assigned |
+| L77 | G30 | Weaviate, Pinecone, chromem; cache_tool_call_responses, disable_identity_scoping | worker | assigned |
+| L78 | G29 | OTLP over gRPC (protobuf, HTTP/2, gRPC on Tov sockets) | worker | assigned |
+| L79 | G47, G18 | Proxy config, breaker reset and policies, vault flush, log analytics, MCP logs, model parameters and catalog; overhead and routing metric families | worker | assigned |
+| L80 | G48, G39 | Every remaining config key (encryption_key, server.*, concurrency and queues, provider options, ...); raw payload storage | worker | assigned |
+
+## Wave 12: the P2 features (owner: "address ALL gaps")
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L81 | G36, G38 | Decisions API, typesafe provider, decision-model complexity classifier | worker | todo |
+| L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | todo |
+| L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | todo |
+| L84 | G41 | Projects, business units, custom roles and data access scopes | worker | todo |
+| L85 | G42 | BigQuery, Kafka, Pub/Sub sinks; Parquet payloads; export retention | worker | todo |
+| L86 | G43 | Guardrails: regex, secrets rule set, reversible redaction, LLM judge, MCP tool-call guard, Presidio, Azure PII, Model Armor, CrowdStrike | worker | todo |
+| L87 | G44, G45 | Cluster discovery (Kubernetes, DNS, Consul, etcd, mDNS, UDP), leader election; auth proxies | worker | todo |
+| L88 | G46 | Prompt repository and deployments, webhooks, feature flags, notifications | worker | todo |
+
 Decision taken by the lead: models without a price stay a warning (cost 0), as in Bifrost;
 refusing them is a one-line switch if the owner wants it.
 
