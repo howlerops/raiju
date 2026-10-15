@@ -743,7 +743,7 @@ Ordered by importance. Each gap says what to build and where Bifrost defines it.
 
 - **G6. Bedrock SDK streaming routes.** Add `POST /bedrock/model/{id}/converse-stream` and `/invoke-with-response-stream`, with event-stream framing. Reuse `bedrock.tov` `streamRequest` (`src/providers/index.tov:70`). Today `bedrockModel` returns 404 for any action other than converse or invoke (`src/native.tov:234`). Bifrost: `transports/bifrost-http/integrations/bedrock.go:68-125` and `118-200`. Ledger task. **Status: Done** (commit 0b03e53).
 
-- **G7. Config sections that load silently under a different name, or not at all.** Bifrost names and Raiju names differ for these, and Raiju ignores Bifrost's name without a warning: **Status: Partial.** Mapped: alerting, audit_logs, cluster_config, circuit_breaker_config, load_balancer_config, framework.pricing, mcp.virtual_mcps, and the otel and semanticcache plugin entries (commits 0c999ff, 0d269dd, d91ef07, abf4dbb). Remaining: the plugin names logging, telemetry, governance, compat, routing and prompts are reported as unknown and not loaded (`src/plugins.tov:381`).
+- **G7. Config sections that load silently under a different name, or not at all.** Bifrost names and Raiju names differ for these, and Raiju ignores Bifrost's name without a warning: **Status: Partial.** Mapped: alerting, audit_logs, cluster_config, circuit_breaker_config, load_balancer_config, framework.pricing, mcp.virtual_mcps, and the otel and semanticcache plugin entries (commits 0c999ff, 0d269dd, d91ef07, abf4dbb). The logging, telemetry and governance plugins map onto the client section; routing, compat and prompts load with a note for each setting Raiju doesn't implement (`src/config_compat.tov` mapPlugins). **Status now: Done** for config loading; the compat and prompts features themselves are G37 and G46.
   - `alerting` (Raiju: `alerts`), `audit_logs` (Raiju: `audit`), `cluster_config` (Raiju: `cluster`), `circuit_breaker_config` and `load_balancer_config` (Raiju: `health`), `framework.pricing` (Raiju: `pricing`), `mcp.virtual_mcps` (Raiju: top-level `virtual_mcps`), and `plugins[]` entries named `semanticcache`, `otel`, `logging`, `telemetry`, `governance`, `compat`, `routing`, `prompts` (only `header`, `mocker`, `jsonparser`, `blocklist` and `maxtokens` load).
   - Build a loader that maps the Bifrost names, and that reports every unrecognised key at startup. Bifrost: `transports/config.schema.json`. Raiju: `src/config.tov` loaders, `src/plugins.tov:347-372`. Ledger task.
 
@@ -841,17 +841,16 @@ Ordered by importance. Each gap says what to build and where Bifrost defines it.
 
 1. G4. Models outside the datasheet cost 0 and skip budgets; the response is a warning, not a refusal (P0).
 2. G5. Deployment variants for embeddings, images, audio, responses and models are not routed (P0).
-3. G7. Plugin names logging, telemetry, governance, compat, routing and prompts are not loaded (P0).
-4. G16. Files, batches and media for Vertex, Bedrock and Cohere, Gemini STT, and the batch results route (P1).
-5. G17. Remaining x-bifrost-* response headers, including retry-after-ms (P1).
-6. G18. Routing, key-rotation, active-request, provider-key-up, MCP-duration and overhead-component metric families; request_retries is always 0 (P1).
-7. G11. GenAI `:predict`, operations, files, batches, cachedContents and `/genai/v1/rank` (P1).
-8. G12. Bedrock count-tokens is an estimate, and `/bedrock/rerank` is missing (P1).
-9. G22. MCP verification and OAuth management routes answer 501; tool_sync_interval does nothing (P1).
-10. G25. Bedrock inference-profile arn, batch S3 settings and use_openai_endpoints (P1).
-11. G27. bedrock_mantle refuses Anthropic-family models (P1).
-12. G30. Semantic cache: two plugin fields ignored; Weaviate, Pinecone and chromem not supported (P1).
-13. G29. OpenTelemetry over gRPC is not spoken (P1).
-14. G32. SCOPE.md overstates parity in its wording; the doc is out of date (doc task).
+3. G16. Files, batches and media for Vertex, Bedrock and Cohere, Gemini STT, and the batch results route (P1).
+4. G17. Remaining x-bifrost-* response headers, including retry-after-ms (P1).
+5. G18. Routing, key-rotation, active-request, provider-key-up, MCP-duration and overhead-component metric families; request_retries is always 0 (P1).
+6. G11. GenAI `:predict`, operations, files, batches, cachedContents and `/genai/v1/rank` (P1).
+7. G12. Bedrock count-tokens is an estimate, and `/bedrock/rerank` is missing (P1).
+8. G22. MCP verification and OAuth management routes answer 501; tool_sync_interval does nothing (P1).
+9. G25. Bedrock inference-profile arn, batch S3 settings and use_openai_endpoints (P1).
+10. G27. bedrock_mantle refuses Anthropic-family models (P1).
+11. G30. Semantic cache: two plugin fields ignored; Weaviate, Pinecone and chromem not supported (P1).
+12. G29. OpenTelemetry over gRPC is not spoken (P1).
+13. G32. SCOPE.md overstates parity in its wording; the doc is out of date (doc task).
 
 P2 decisions still open: G36, G37, G40 to G46. Partial P2 items: G35, G39, G47, G48.

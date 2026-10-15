@@ -630,7 +630,126 @@ function mapOtelPlugin(f: Field[], pname: string, inout top: Field[], inout note
   notes.push(`config: plugin "${pname}" read as "otel"`)
 }
 
-// Takes the semantic cache and the otel plugin out of plugins[]; the other plugins stay in place.
+// True when the plugin entry is off in Bifrost; the note says it is not loaded.
+function offPlugin(f: Field[], pname: string, inout notes: string[]): bool {
+  if (rawBool(f, "enabled") !== false) return false
+  notes.push(`config: plugin "${pname}" is disabled in Bifrost and is not loaded`)
+  return true
+}
+
+// Sets client.<target> from a plugin config field, unless the client section already sets it.
+// A value that is taken goes into applied, for the note on the plugin.
+function toClient(inout cl: Field[], path: string, src: string, target: string, raw: string | undefined, inout applied: string[], inout notes: string[]): void {
+  if (raw === undefined) return
+  if (find(cl, target) !== undefined) {
+    notes.push(`config: "${path}.${src}" is ignored: "client.${target}" is set, and it wins`)
+    return
+  }
+  setField(&cl, target, raw)
+  applied.push(target)
+}
+
+// Bifrost's logging plugin: its content settings go to the client section, and an enabled
+// plugin turns request logging on (Raiju's default too).
+function mapLogging(f: Field[], pname: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  if (offPlugin(f, pname, &notes)) return
+  const path = `plugins[${pname}].config`
+  const cf = try members(find(f, "config"))
+  let cl = try members(find(top, "client"))
+  let applied: string[] = []
+  if (find(cl, "enable_logging") === undefined) {
+    setField(&cl, "enable_logging", "true")
+    applied.push("enable_logging")
+  }
+  toClient(&cl, path, "disable_content_logging", "disable_content_logging", find(cf, "disable_content_logging"), &applied, &notes)
+  toClient(&cl, path, "allow_per_request_content_storage_override", "allow_per_request_content_storage_override", find(cf, "allow_per_request_content_storage_override"), &applied, &notes)
+  ignored(path, cf, ["retain_content_in_object_storage", "logging_headers"], &notes)
+  if (applied.length > 0) {
+    put(&top, "client", cl)
+    notes.push(`config: plugin "${pname}" read into "client": ${applied.join(", ")}`)
+  }
+}
+
+// Bifrost's telemetry plugin: custom_labels become client.prometheus_labels. Raiju always
+// serves /metrics and has no overhead breakdown, user labels or Push Gateway.
+function mapTelemetry(f: Field[], pname: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  if (offPlugin(f, pname, &notes)) return
+  const path = `plugins[${pname}].config`
+  const cf = try members(find(f, "config"))
+  let cl = try members(find(top, "client"))
+  let applied: string[] = []
+  toClient(&cl, path, "custom_labels", "prometheus_labels", find(cf, "custom_labels"), &applied, &notes)
+  if (rawBool(cf, "metrics_enabled") === false) notes.push(`config: "${path}.metrics_enabled" is not supported by Raiju and is ignored: Raiju always serves /metrics`)
+  ignored(path, cf, ["overhead_breakdown_enabled", "user_labels_enabled", "push_gateway"], &notes)
+  if (applied.length > 0) {
+    put(&top, "client", cl)
+    notes.push(`config: plugin "${pname}" read into "client": ${applied.join(", ")}`)
+  }
+}
+
+// Bifrost's governance plugin: is_vk_mandatory becomes client.enforce_auth_on_inference, and
+// required_headers becomes client.required_headers.
+function mapGovernancePlugin(f: Field[], pname: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  if (offPlugin(f, pname, &notes)) return
+  const path = `plugins[${pname}].config`
+  const cf = try members(find(f, "config"))
+  let cl = try members(find(top, "client"))
+  let applied: string[] = []
+  const vk = find(cf, "is_vk_mandatory")
+  if (vk !== undefined) {
+    if (find(cl, "enforce_auth_on_inference") !== undefined || find(cl, "enforce_governance_header") !== undefined) {
+      notes.push(`config: "${path}.is_vk_mandatory" is ignored: "client.enforce_auth_on_inference" is set, and it wins`)
+    } else {
+      setField(&cl, "enforce_auth_on_inference", vk)
+      applied.push("enforce_auth_on_inference")
+    }
+  }
+  toClient(&cl, path, "required_headers", "required_headers", find(cf, "required_headers"), &applied, &notes)
+  ignored(path, cf, ["is_enterprise", "disable_auto_tool_inject"], &notes)
+  if (applied.length > 0) {
+    put(&top, "client", cl)
+    notes.push(`config: plugin "${pname}" read into "client": ${applied.join(", ")}`)
+  }
+}
+
+// Bifrost's routing plugin has no Raiju counterpart. Its chain depth and complexity analyzer
+// are noted. The analyzer's tier boundaries are on a 0 to 1 scale, and Raiju's complexity
+// router thresholds are on its own score scale, so they are not copied.
+function mapRouting(f: Field[], pname: string, inout notes: string[]): void throws SyntaxError {
+  if (offPlugin(f, pname, &notes)) return
+  const path = `plugins[${pname}].config`
+  const cf = try members(find(f, "config"))
+  notes.push(`config: plugin "${pname}" is not loaded: Raiju's routing rules do not chain (chain_rule), and its complexity router is set under "complexity_router"`)
+  ignored(path, cf, ["routing_chain_max_depth"], &notes)
+  const ca = `${path}.complexity_analyzer_config`
+  const af = try members(find(cf, "complexity_analyzer_config"))
+  ignored(ca, af, ["tier_boundaries", "keywords", "classifier", "semantic", "decision", "llm", "session"], &notes)
+  if (find(af, "tier_boundaries") !== undefined) notes.push(`config: "${ca}.tier_boundaries" is not copied to "complexity_router": they are on a 0 to 1 scale, and Raiju's simple_max_score and complex_min_score are on its own score scale`)
+}
+
+// Bifrost's compat plugin converts requests between API shapes and drops or converts
+// parameters. Raiju does none of that, so the plugin is noted and not loaded.
+function mapCompat(f: Field[], pname: string, inout notes: string[]): void throws SyntaxError {
+  if (offPlugin(f, pname, &notes)) return
+  const path = `plugins[${pname}].config`
+  const cf = try members(find(f, "config"))
+  notes.push(`config: plugin "${pname}" is not loaded: Raiju has no text-to-chat or chat-to-Responses conversion, no parameter dropping or conversion, no Azure DeepSeek fix, and no reasoning-only model routing to Responses`)
+  ignored(path, cf, ["convert_text_to_chat", "convert_chat_to_responses", "should_drop_params", "should_convert_params", "azure_deepseek", "force_reasoning_only_models_to_responses", "convert_decision_to_responses"], &notes)
+}
+
+// Bifrost's prompts plugin serves prompts from its config store. Raiju has no prompt library,
+// so the plugin is noted and not loaded, and each config key is noted too.
+function mapPrompts(f: Field[], pname: string, inout notes: string[]): void throws SyntaxError {
+  if (offPlugin(f, pname, &notes)) return
+  notes.push(`config: plugin "${pname}" is not loaded: Raiju has no prompt library, so stored prompt versions are not added to chat and Responses requests`)
+  for (const k of try members(find(f, "config"))) {
+    notes.push(`config: "plugins[${pname}].config.${k.key}" is not supported by Raiju and is ignored`)
+  }
+}
+
+// Takes the Bifrost plugins Raiju reads out of plugins[]: the semantic cache and otel become
+// their top-level sections, and logging, telemetry, governance, routing, compat and prompts
+// map to client settings or are noted. The other plugins stay in place.
 function mapPlugins(inout top: Field[], inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "plugins")
   if (raw === undefined || !raw.startsWith("[")) return
@@ -641,6 +760,30 @@ function mapPlugins(inout top: Field[], inout notes: string[]): void throws Synt
     const name = rawStr(f, "name") ?? ""
     if (name === "otel") {
       try mapOtelPlugin(f, name, &top, &notes)
+      continue
+    }
+    if (name === "logging") {
+      try mapLogging(f, name, &top, &notes)
+      continue
+    }
+    if (name === "telemetry") {
+      try mapTelemetry(f, name, &top, &notes)
+      continue
+    }
+    if (name === "governance") {
+      try mapGovernancePlugin(f, name, &top, &notes)
+      continue
+    }
+    if (name === "routing") {
+      try mapRouting(f, name, &notes)
+      continue
+    }
+    if (name === "compat") {
+      try mapCompat(f, name, &notes)
+      continue
+    }
+    if (name === "prompts") {
+      try mapPrompts(f, name, &notes)
       continue
     }
     if (name !== "semantic_cache" && name !== "semanticcache") {
@@ -1038,13 +1181,14 @@ test("a whole Bifrost example: what is mapped and what is left", () => {
   expect(p.logs_store!.retention_days).toBe(30)
   expect(p.governance!.auth_config!.username).toBe("env.ADMIN_USER")
   expect(p.governance!.auth_config!.password).toBe("env.ADMIN_PW")
-  expect(r.notes.length).toBe(3)
+  expect(r.notes.length).toBe(4)
+  expect(r.notes.includes(`config: "plugins[governance].config.is_vk_mandatory" is ignored: "client.enforce_auth_on_inference" is set, and it wins`)).toBe(true)
   const w = try warnings(text)
   expect(w.includes(`config: unknown key "config_store" is ignored`)).toBe(true)
   expect(w.includes(`config: unknown key "client.initial_pool_size" is ignored`)).toBe(true)
   expect(w.includes(`config: unknown key "mcp.tool_manager_config" is ignored`)).toBe(true)
   expect(w.includes(`config: unknown key "$schema" is ignored`)).toBe(false)
-  expect(w.length).toBe(3 + 3)
+  expect(w.length).toBe(4 + 3)
 })
 
 test("maps a flat otel plugin entry and drops it from plugins", () => {
@@ -1152,4 +1296,150 @@ test("auth_config.is_enabled: false is kept, so admin auth stays off", () => {
   const a2 = try fields(find(try fields(find(try fields(r2.text), "governance")!), "auth_config")!)
   expect(rawBool(a2, "disable_auth_on_inference")).toBe(true)
   expect(rawStr(au, "username")).toBe("root")
+})
+
+test("logging plugin: content settings and the on switch go to client, and the rest is noted", () => {
+  const r = try normalize(`{
+    "plugins": [ { "enabled": true, "name": "logging", "config": {
+      "disable_content_logging": true,
+      "allow_per_request_content_storage_override": true,
+      "retain_content_in_object_storage": true,
+      "logging_headers": ["X-Team"]
+    } } ]
+  }`)
+  expect(find(try fields(r.text), "plugins")).toBe("[]")
+  const p = try JSON.parse(r.text) as { client?: { enable_logging?: bool, disable_content_logging?: bool, allow_per_request_content_storage_override?: bool } }
+  expect(p.client!.enable_logging).toBe(true)
+  expect(p.client!.disable_content_logging).toBe(true)
+  expect(p.client!.allow_per_request_content_storage_override).toBe(true)
+  expect(r.notes.includes(`config: plugin "logging" read into "client": enable_logging, disable_content_logging, allow_per_request_content_storage_override`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[logging].config.retain_content_in_object_storage" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[logging].config.logging_headers" is not supported by Raiju and is ignored`)).toBe(true)
+})
+
+test("logging plugin: a client setting already in the file wins, with a note", () => {
+  const r = try normalize(`{
+    "client": { "disable_content_logging": false },
+    "plugins": [ { "enabled": true, "name": "logging", "config": { "disable_content_logging": true } } ]
+  }`)
+  const p = try JSON.parse(r.text) as { client?: { enable_logging?: bool, disable_content_logging?: bool } }
+  expect(p.client!.disable_content_logging).toBe(false)
+  expect(p.client!.enable_logging).toBe(true)
+  expect(r.notes.includes(`config: "plugins[logging].config.disable_content_logging" is ignored: "client.disable_content_logging" is set, and it wins`)).toBe(true)
+  expect(r.notes.includes(`config: plugin "logging" read into "client": enable_logging`)).toBe(true)
+})
+
+test("logging plugin that is off is not loaded and maps nothing", () => {
+  const r = try normalize(`{ "plugins": [ { "enabled": false, "name": "logging", "config": { "disable_content_logging": true } } ] }`)
+  expect(find(try fields(r.text), "client")).toBeUndefined()
+  expect(find(try fields(r.text), "plugins")).toBe("[]")
+  expect(r.notes.includes(`config: plugin "logging" is disabled in Bifrost and is not loaded`)).toBe(true)
+})
+
+test("telemetry plugin: custom_labels become client.prometheus_labels, and the Push Gateway and overhead settings are noted", () => {
+  const r = try normalize(`{
+    "plugins": [ { "enabled": true, "name": "telemetry", "config": {
+      "custom_labels": ["team", "env"],
+      "metrics_enabled": false,
+      "overhead_breakdown_enabled": true,
+      "user_labels_enabled": false,
+      "push_gateway": { "enabled": true, "push_gateway_url": "http://pushgateway:9091", "job_name": "bifrost", "push_interval": 15 }
+    } } ]
+  }`)
+  expect(find(try fields(r.text), "plugins")).toBe("[]")
+  const p = try JSON.parse(r.text) as { client?: { prometheus_labels?: string[] } }
+  expect(p.client!.prometheus_labels!.length).toBe(2)
+  expect(p.client!.prometheus_labels![0]).toBe("team")
+  expect(p.client!.prometheus_labels![1]).toBe("env")
+  expect(r.notes.includes(`config: "plugins[telemetry].config.metrics_enabled" is not supported by Raiju and is ignored: Raiju always serves /metrics`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[telemetry].config.overhead_breakdown_enabled" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[telemetry].config.user_labels_enabled" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[telemetry].config.push_gateway" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[telemetry].config.custom_labels" is not supported by Raiju and is ignored`)).toBe(false)
+})
+
+test("telemetry plugin: metrics_enabled true is Raiju's behaviour, so it is not noted", () => {
+  const r = try normalize(`{ "plugins": [ { "enabled": true, "name": "telemetry", "config": { "metrics_enabled": true } } ] }`)
+  expect(r.notes.some((n) => n.includes("metrics_enabled"))).toBe(false)
+  expect(find(try fields(r.text), "client")).toBeUndefined()
+})
+
+test("governance plugin: is_vk_mandatory enforces auth and required_headers carry over; the rest is noted", () => {
+  const r = try normalize(`{
+    "plugins": [ { "enabled": true, "name": "governance", "config": {
+      "is_vk_mandatory": true,
+      "required_headers": ["x-team", "x-cost-center"],
+      "is_enterprise": false,
+      "disable_auto_tool_inject": true
+    } } ]
+  }`)
+  expect(find(try fields(r.text), "plugins")).toBe("[]")
+  const p = try JSON.parse(r.text) as { client?: { enforce_auth_on_inference?: bool, required_headers?: string[] } }
+  expect(p.client!.enforce_auth_on_inference).toBe(true)
+  expect(p.client!.required_headers!.length).toBe(2)
+  expect(p.client!.required_headers![1]).toBe("x-cost-center")
+  expect(r.notes.includes(`config: plugin "governance" read into "client": enforce_auth_on_inference, required_headers`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[governance].config.is_enterprise" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[governance].config.disable_auto_tool_inject" is not supported by Raiju and is ignored`)).toBe(true)
+})
+
+test("governance plugin: an enforce flag already in the client section wins, and is_vk_mandatory false is kept", () => {
+  const taken = try normalize(`{ "client": { "enforce_governance_header": false }, "plugins": [ { "enabled": true, "name": "governance", "config": { "is_vk_mandatory": true } } ] }`)
+  const tc = try JSON.parse(taken.text) as { client?: { enforce_governance_header?: bool, enforce_auth_on_inference?: bool } }
+  expect(tc.client!.enforce_governance_header).toBe(false)
+  expect(tc.client!.enforce_auth_on_inference).toBeUndefined()
+  expect(taken.notes.includes(`config: "plugins[governance].config.is_vk_mandatory" is ignored: "client.enforce_auth_on_inference" is set, and it wins`)).toBe(true)
+  const off = try normalize(`{ "plugins": [ { "enabled": true, "name": "governance", "config": { "is_vk_mandatory": false } } ] }`)
+  const oc = try JSON.parse(off.text) as { client?: { enforce_auth_on_inference?: bool } }
+  expect(oc.client!.enforce_auth_on_inference).toBe(false)
+})
+
+test("routing plugin: chain depth and the analyzer's tier boundaries are noted; nothing is copied to complexity_router", () => {
+  const r = try normalize(`{
+    "plugins": [ { "enabled": true, "name": "routing", "config": {
+      "routing_chain_max_depth": 5,
+      "complexity_analyzer_config": {
+        "tier_boundaries": { "simple_medium": 0.2, "medium_complex": 0.4 },
+        "keywords": { "simple_keywords": ["hi"] },
+        "classifier": "semantic"
+      }
+    } } ]
+  }`)
+  expect(find(try fields(r.text), "plugins")).toBe("[]")
+  expect(find(try fields(r.text), "complexity_router")).toBeUndefined()
+  expect(r.notes.includes(`config: "plugins[routing].config.routing_chain_max_depth" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[routing].config.complexity_analyzer_config.tier_boundaries" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[routing].config.complexity_analyzer_config.keywords" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[routing].config.complexity_analyzer_config.classifier" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.some((n) => n.includes("0 to 1 scale"))).toBe(true)
+})
+
+test("compat and prompts plugins are noted and not loaded, with each config key named", () => {
+  const r = try normalize(`{
+    "plugins": [
+      { "enabled": true, "name": "compat", "config": { "convert_text_to_chat": true, "should_drop_params": true } },
+      { "enabled": true, "name": "prompts", "config": { "store_path": "/data/prompts" } }
+    ]
+  }`)
+  expect(find(try fields(r.text), "plugins")).toBe("[]")
+  expect(find(try fields(r.text), "client")).toBeUndefined()
+  expect(r.notes.some((n) => n.startsWith(`config: plugin "compat" is not loaded: Raiju has no text-to-chat`))).toBe(true)
+  expect(r.notes.includes(`config: "plugins[compat].config.convert_text_to_chat" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[compat].config.should_drop_params" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.some((n) => n.startsWith(`config: plugin "prompts" is not loaded: Raiju has no prompt library`))).toBe(true)
+  expect(r.notes.includes(`config: "plugins[prompts].config.store_path" is not supported by Raiju and is ignored`)).toBe(true)
+})
+
+test("a disabled governance plugin is not loaded, and an unknown plugin name is left in plugins", () => {
+  const r = try normalize(`{
+    "plugins": [
+      { "enabled": false, "name": "governance", "config": { "is_vk_mandatory": true } },
+      { "enabled": true, "name": "maxim", "config": { "api_key": "k" } }
+    ]
+  }`)
+  expect(find(try fields(r.text), "client")).toBeUndefined()
+  const plugins = try elements(find(try fields(r.text), "plugins")!)
+  expect(plugins.length).toBe(1)
+  expect(rawStr(try fields(plugins[0]!), "name")).toBe("maxim")
+  expect(r.notes.includes(`config: plugin "governance" is disabled in Bifrost and is not loaded`)).toBe(true)
 })
