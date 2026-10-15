@@ -330,6 +330,15 @@ def write_config():
           "vector_store": {"enabled": True, "type": "qdrant", "config": {"host": "127.0.0.1", "rest_port": 18089}},
           "server": {"port": 1}}
     json.dump(bf, open(os.path.join(BUILD, "e2e.bifrost.json"), "w"))
+    # the owner switches: refuse_unpriced_models and scope_by_virtual_key on one gateway, both off on the other
+    for name, on in [("owner", True), ("owner-off", False)]:
+        ow = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "refuse_unpriced_models": on},
+              "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+              "cache": {"enabled": True, "ttl_seconds": 60, "scope_by_virtual_key": on},
+              "governance": {"budgets": [{"id": "ob", "max_limit": 5, "reset_duration": "1d"}],
+                             "virtual_keys": [{"id": "vk-ob", "value": "sk-bf-owner-budget", "budget_id": "ob"}, {"id": "vk-oa", "value": "sk-bf-owner-a"}],
+                             "pricing_overrides": [{"id": "po-own", "name": "own", "scope_kind": "global", "match_type": "exact", "pattern": "priced-by-override", "request_types": ["chat_completion"], "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}]}}
+        json.dump(ow, open(os.path.join(BUILD, f"e2e.{name}.json"), "w"))
     # the guardrail providers over HTTP (Presidio, Azure Language PII, Model Armor, AIDR), one gateway
     gp = {"client": {"enable_logging": False, "enforce_auth_on_inference": False},
           "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
@@ -1144,7 +1153,16 @@ def projects_e2e(env):
         gw.terminate()
         gw.wait()
 
+def unique_ports():
+    """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
+    import re
+    ports = re.findall(r'Popen\([^\n]*"-port", "(\d+)"', open(__file__).read())
+    dup = sorted({p for p in ports if ports.count(p) > 1})
+    if dup:
+        raise SystemExit(f"e2e: gateways share ports {dup}; give each its own")
+
 def main():
+    unique_ports()
     build()
     config = write_config()
     import shutil
@@ -1208,6 +1226,8 @@ def main():
     gw_cls = {name: subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", os.path.join(BUILD, f"e2e.cls-{name}.json")], env=env, stderr=open(os.path.join(BUILD, f"e2e.cls-{name}.log"), "w"))
               for name, port in [("decision", 18103), ("llm", 18104), ("semantic", 18105)]}
     gw_pol = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18121", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.pol.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.pol.log"), "w"))
+    gw_own = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18127", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.owner.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.owner.log"), "w"))
+    gw_own_off = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18128", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.owner-off.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.owner-off.log"), "w"))
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
         wait_mcp_tools(GW, ["weather-get_weather", "secure-get_weather", "local-echo"])
@@ -2410,6 +2430,27 @@ def main():
         s1, _, _ = bchat("openai/custom-model", BK)
         s2, _, b2 = bchat("openai/custom-model", BK)
         check("pricing_overrides price an unknown model, so its budget runs down", s1 == 200 and s2 == 402, (s1, s2, b2))
+        # refuse_unpriced_models: a budgeted key is refused for an unpriced model only with the switch on
+        OWN, OFF = "http://127.0.0.1:18127", "http://127.0.0.1:18128"
+        wait(OWN + "/health"); wait(OFF + "/health")
+        def ochat(base, model, vk, content="owner check"):
+            return call("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": content}]}, {"x-bf-vk": vk}, base=base)
+        s, _, b = ochat(OWN, "openai/no-price-here", "sk-bf-owner-budget")
+        check("a budgeted key is refused for an unpriced model when refuse_unpriced_models is on", s == 403 and "no price" in b, (s, b[:200]))
+        s, _, _ = ochat(OWN, "openai/no-price-here", "sk-bf-owner-a")
+        check("a key with no budget still gets an unpriced model", s == 200, s)
+        s, _, _ = ochat(OWN, "openai/priced-by-override", "sk-bf-owner-budget")
+        check("a pricing override counts as a price for a budgeted key", s == 200, s)
+        s, _, b = ochat(OFF, "openai/no-price-here", "sk-bf-owner-budget")
+        check("with refuse_unpriced_models off a budgeted key passes an unpriced model", s == 200, (s, b[:200]))
+        # scope_by_virtual_key: two keys miss each other's exact-cache entries only with the switch on
+        _, c1, _ = ochat(OWN, "openai/gpt-4o-mini", "sk-bf-owner-budget", "owner cache check")
+        _, c2, _ = ochat(OWN, "openai/gpt-4o-mini", "sk-bf-owner-a", "owner cache check")
+        _, c3, _ = ochat(OWN, "openai/gpt-4o-mini", "sk-bf-owner-a", "owner cache check")
+        check("scope_by_virtual_key: the other key misses, and the same key hits", hl(c1).get("x-bf-cache") != "hit" and hl(c2).get("x-bf-cache") != "hit" and hl(c3).get("x-bf-cache") == "hit", (c1, c2, c3))
+        _, d1, _ = ochat(OFF, "openai/gpt-4o-mini", "sk-bf-owner-budget", "owner cache check")
+        _, d2, _ = ochat(OFF, "openai/gpt-4o-mini", "sk-bf-owner-a", "owner cache check")
+        check("with scope_by_virtual_key off the other key hits the shared entry", hl(d1).get("x-bf-cache") != "hit" and hl(d2).get("x-bf-cache") == "hit", (d1, d2))
         log = open(os.path.join(BUILD, "e2e.bifrost.log")).read()
         check("unknown config keys are reported at startup", 'config: "server" is not used' in log, log[:600])
 
@@ -2984,6 +3025,7 @@ def main():
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
         gw_l.terminate(); gw_enc.terminate(); gw_guard.terminate(); gw_rules.terminate(); gw_pol.terminate()
+        gw_own.terminate(); gw_own_off.terminate()
         gw_c.terminate(); gw_cc.terminate()
         for p in gw_cls.values(): p.terminate()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")

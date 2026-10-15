@@ -96,6 +96,17 @@ use (virtual keys, admin users or `auth_config`), and leaves it off otherwise. S
 `false` to serve anonymous inference with keys configured. `auth_config` takes Bifrost's
 `admin_username`, `admin_password` and `is_enabled`, at the top level or under `governance`.
 
+## Owner switches
+
+Two Raiju-only switches, both off by default (Bifrost's behaviour):
+
+- `client.refuse_unpriced_models`: a request subject to a budget (virtual key, team,
+  customer, provider or model budget) is refused with 403 when its model, or a fallback the
+  key may use, has no price (no datasheet row, pricing override or config price). Requests
+  with no budget pass as before, at cost 0. Settable through `PUT /api/config`.
+- `cache.scope_by_virtual_key`: the exact-match response cache keeps each virtual key's
+  entries apart, as the semantic cache does. Off, keys share exact-cache entries.
+
 ## Servers
 
 The default server is Tov's built-in `Bun.serve`. `-workers N` forks N
