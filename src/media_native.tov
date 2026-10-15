@@ -8,7 +8,7 @@ import { Target, headers, addExtraHeaders, trimSlash } from "./providers/types"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
 import { ChatRequest, newId, nowSeconds } from "./schemas"
-import { decode } from "./base64"
+import { decode, encode } from "./base64"
 
 // The request to send. A FormData body is a multipart upload; the caller leaves
 // its content type to fetch.
@@ -792,6 +792,77 @@ function le(inout out: u8[], v: int, n: int): void {
   }
 }
 
+// ---- Batch results ----
+
+// Bifrost's GET /v1/batches/{id}/results body: the batch's OpenAI output lines, one
+// result each. `jsonl` is the output file's text (or a converted one); every line
+// must be a JSON object.
+export function batchResultsDoc(batchId: string, jsonl: string): string throws SyntaxError {
+  const items: string[] = []
+  for (const line of jsonlLines(jsonl)) {
+    try fields(line)
+    items.push(line)
+  }
+  return `{"batch_id":${quote(batchId)},"results":[${items.join(",")}]}`
+}
+
+// ---- Speech-to-text (Gemini) ----
+
+// The MIME type Gemini takes for an audio file: its own audio/* type when it has
+// one, else from the file name's extension. "" when neither is a Gemini audio type.
+export function audioMime(fileType: string, fileName: string): string {
+  if (fileType.startsWith("audio/")) return fileType
+  const parts = fileName.toLowerCase().split(".")
+  const ext = parts.length > 1 ? (parts[parts.length - 1] ?? "") : ""
+  if (ext === "wav") return "audio/wav"
+  if (ext === "mp3") return "audio/mp3"
+  if (ext === "aiff" || ext === "aif") return "audio/aiff"
+  if (ext === "aac") return "audio/aac"
+  if (ext === "ogg") return "audio/ogg"
+  if (ext === "flac") return "audio/flac"
+  return ""
+}
+
+// The response_format of a transcription: "json" (the default) or "text". Gemini
+// gives no segments or timings, so the verbose and subtitle formats are refused.
+export function transcriptionFormat(format: string): string throws SyntaxError {
+  const f = format === "" ? "json" : format
+  if (f !== "json" && f !== "text") throw new SyntaxError(`Gemini transcription supports response_format json or text, not ${f}`)
+  return f
+}
+
+// generateContent with the audio inline, after the prompt. The prompt defaults to
+// Bifrost's instruction.
+export function geminiTranscription(t: Target, prompt: string, mime: string, audio: u8[]): MediaRequest {
+  const text = prompt === "" ? "Generate a transcript of the speech." : prompt
+  const payload = `{"contents":[{"parts":[{"text":${quote(text)}},{"inlineData":{"mimeType":${quote(mime)},"data":${quote(encode(audio))}}}]}]}`
+  return { method: "POST", url: `${geminiBase(t)}/v1beta/models/${t.model}:generateContent`, headers: geminiHeaders(t, true), body: payload }
+}
+
+// The transcript of a generateContent answer: the text parts of its first candidate,
+// without thought summaries.
+export function transcriptText(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const cands = try elements(find(fs, "candidates") ?? "[]")
+  if (cands.length === 0) throw new SyntaxError("no candidates in the transcription response")
+  const c = try fields(cands[0]!)
+  const content = find(c, "content")
+  let out = ""
+  if (content !== undefined && !isNull(content)) {
+    for (const p of try elements(find(try fields(content), "parts") ?? "[]")) {
+      const pf = try fields(p)
+      if (find(pf, "thought") === "true") continue
+      out += rawStr(pf, "text") ?? ""
+    }
+  }
+  return out
+}
+
+// The OpenAI transcription body for a transcript in JSON form.
+export function transcriptionJson(text: string): string {
+  return `{"text":${quote(text)}}`
+}
+
 // ---- tests ----
 
 const ANTHROPIC_T: Target = { provider: "anthropic", kind: "anthropic", model: "claude-opus", key: { value: "ak" }, cfg: {} }
@@ -1024,4 +1095,60 @@ test("iso times and pixel sizes", () => {
   expect(sizeConfig("1024x1536").aspect).toBe("")
   expect(sizeConfig("1024x1024").imageSize).toBe("1K")
   expect(sizeConfig("auto").aspect).toBe("")
+})
+
+test("batch results wrap the output lines as bifrost's results body", () => {
+  const out = try batchResultsDoc("batch_1", `{"id":"r1","custom_id":"a","response":{"status_code":200,"body":{"x":1}},"error":null}\n\n{"id":"r2","custom_id":"b","response":null,"error":{"code":"expired","message":"m"}}\n`)
+  expect(out).toBe(`{"batch_id":"batch_1","results":[{"id":"r1","custom_id":"a","response":{"status_code":200,"body":{"x":1}},"error":null},{"id":"r2","custom_id":"b","response":null,"error":{"code":"expired","message":"m"}}]}`)
+  expect(try batchResultsDoc("b", "")).toBe(`{"batch_id":"b","results":[]}`)
+  let threw = false
+  try {
+    batchResultsDoc("b", "not json\n")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("audio mime types come from the type or the extension", () => {
+  expect(audioMime("audio/mpeg", "x.bin")).toBe("audio/mpeg")
+  expect(audioMime("", "talk.WAV")).toBe("audio/wav")
+  expect(audioMime("application/octet-stream", "talk.mp3")).toBe("audio/mp3")
+  expect(audioMime("", "talk.flac")).toBe("audio/flac")
+  expect(audioMime("", "talk")).toBe("")
+  expect(audioMime("", "talk.m4a")).toBe("")
+})
+
+test("transcription formats: json and text only", () => {
+  expect(try transcriptionFormat("")).toBe("json")
+  expect(try transcriptionFormat("text")).toBe("text")
+  let refused = false
+  try {
+    transcriptionFormat("srt")
+  } catch (e) {
+    refused = true
+  }
+  expect(refused).toBe(true)
+})
+
+test("gemini transcription sends the audio inline after the prompt", () => {
+  const req = geminiTranscription(GEMINI_T, "", "audio/wav", [72, 105])
+  expect(req.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/:generateContent")
+  expect(req.body as string).toBe(`{"contents":[{"parts":[{"text":"Generate a transcript of the speech."},{"inlineData":{"mimeType":"audio/wav","data":"SGk="}}]}]}`)
+  const own = geminiTranscription(GEMINI_TTS, "Transcribe in English.", "audio/mp3", [1])
+  expect(own.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent")
+  expect((own.body as string).startsWith(`{"contents":[{"parts":[{"text":"Transcribe in English."},`)).toBe(true)
+})
+
+test("transcript text joins the answer's text parts, skipping thoughts", () => {
+  const raw = `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hel","thought":true},{"text":"Hello "},{"text":"world."}]},"finishReason":"STOP"}]}`
+  expect(try transcriptText(raw)).toBe("Hello world.")
+  expect(transcriptionJson("Hello world.")).toBe(`{"text":"Hello world."}`)
+  let none = false
+  try {
+    transcriptText(`{"candidates":[]}`)
+  } catch (e) {
+    none = true
+  }
+  expect(none).toBe(true)
 })

@@ -672,6 +672,43 @@ def main():
         # Gemini speech: a WAV file (RIFF header, 4 bytes of PCM from the mock)
         s, h, audio = call_bytes("POST", "/v1/audio/speech", {"model": "gemini/gemini-2.5-flash-preview-tts", "input": "hi", "voice": "Kore"})
         check("gemini speech returns a WAV", s == 200 and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE" and h.get("content-type") == "audio/wav" and struct.unpack("<I", audio[40:44])[0] == 4 and audio[44:] == bytes([0, 1, 2, 3]), (s, audio[:44]))
+        # Gemini speech-to-text: the audio inline in generateContent, the transcript as OpenAI's JSON or text
+        s, b = multipart("/v1/audio/transcriptions", "talk.wav", b"RIFF\x00\x00\x00\x00WAVEfmt ", {"model": "gemini/gemini-2.5-flash", "prompt": "Transcribe."})
+        check("gemini transcription returns OpenAI's JSON", s == 200 and json.loads(b) == {"text": "Hi from gemini"}, (s, b))
+        stt = seen()[-1]
+        check("gemini transcription sends the audio inline", stt["path"] == "/v1beta/models/gemini-2.5-flash:generateContent" and '"inlineData":{"mimeType":"audio/wav","data":"UklGRgAAAABXQVZFZm10IA=="}' in stt["body"] and '"text":"Transcribe."' in stt["body"], stt)
+        s, b = multipart("/v1/audio/transcriptions", "talk.mp3", b"ID3", {"model": "gemini/gemini-2.5-flash", "response_format": "text"})
+        check("gemini transcription as plain text", s == 200 and b == "Hi from gemini", (s, b))
+        s, b = multipart("/v1/audio/transcriptions", "talk.wav", b"RIFF", {"model": "gemini/gemini-2.5-flash", "response_format": "srt"})
+        check("gemini transcription refuses srt in OpenAI's error shape", s == 400 and json.loads(b)["error"]["type"] == "invalid_request_error", (s, b))
+        # Vertex images: Imagen's :predict with the service account's bearer token
+        s, _, b = call("POST", "/v1/images/generations", {"model": "vertex/imagen-3.0-generate-002", "prompt": "a red fox", "n": 1})
+        r = json.loads(b) if s == 200 else {}
+        vx = seen()[-1]
+        check("vertex imagen returns base64 image data", s == 200 and r.get("data", [{}])[0].get("b64_json") == "iVBORw0KGgo=" and vx["path"] == "/v1/projects/proj/locations/us-central1/publishers/google/models/imagen-3.0-generate-002:predict" and vx["auth"] == "Bearer ya29.test-token", (s, b, vx))
+        s, _, b = call("POST", "/v1/images/generations", {"model": "vertex/gemini-2.5-flash-image", "prompt": "a red fox"})
+        check("vertex gemini image model returns inline image data", s == 200 and json.loads(b)["data"][0]["b64_json"] == "iVBORw0KGgo=" and seen()[-1]["path"].endswith("/models/gemini-2.5-flash-image:generateContent"), (s, b))
+        s, _, b = call("POST", "/v1/images/generations", {"model": "vertex/imagen-3.0-generate-002"})
+        check("vertex images need a prompt", s == 400, (s, b))
+        # Bedrock images: Titan's TEXT_IMAGE body, signed with the key's credentials
+        s, _, b = call("POST", "/v1/images/generations", {"model": "bedrock/amazon.titan-image-generator-v2:0", "prompt": "a red fox", "size": "512x512", "quality": "high"})
+        r = json.loads(b) if s == 200 else {}
+        bx = seen()[-1]
+        check("bedrock titan returns base64 image data, signed", s == 200 and r.get("data", [{}])[0].get("b64_json") == "iVBORw0KGgo=" and bx["path"] == "/model/amazon.titan-image-generator-v2:0/invoke" and bx["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") and '"taskType":"TEXT_IMAGE"' in bx["body"] and '"quality":"premium"' in bx["body"], (s, b, bx))
+        # Batch results, as Bifrost's body: the output lines of an OpenAI-format batch, a Gemini batch and an Anthropic batch
+        s, b = multipart("/v1/files", "results.jsonl", (bline("o1", "gpt-4o-mini") + "\n").encode(), {"purpose": "batch"})
+        ofid = json.loads(b).get("id", "") if s == 200 else ""
+        s, _, b = call("POST", "/v1/batches", {"input_file_id": ofid, "endpoint": "/v1/chat/completions", "completion_window": "24h"})
+        obid = json.loads(b).get("id", "") if s == 200 else ""
+        s, _, b = call("GET", f"/v1/batches/{obid}/results")
+        ores = json.loads(b) if s == 200 else {}
+        check("openai batch results as Bifrost's results body", s == 200 and ores.get("batch_id") == obid and [x["custom_id"] for x in ores.get("results", [])] == ["o1"] and ores["results"][0]["response"]["body"]["choices"][0]["message"]["content"] == "Batch reply from gpt-4o-mini", (s, b[:300]))
+        s, _, b = call("GET", "/v1/batches/" + gbid + "/results", headers=gem)
+        gres = json.loads(b) if s == 200 else {}
+        check("gemini batch results as Bifrost's results body", s == 200 and gres.get("batch_id") == gbid and gres.get("results", [{}])[0].get("custom_id") == "g1", (s, b[:300]))
+        s, _, b = call("GET", "/v1/batches/" + abid + "/results", headers={"x-bf-provider": "anthropic"})
+        ares = json.loads(b) if s == 200 else {}
+        check("anthropic batch results as Bifrost's results body", s == 200 and ares.get("batch_id") == abid and [x["custom_id"] for x in ares.get("results", [])] == ["c1"] and ares["results"][0]["response"]["status_code"] == 200 and ares["results"][0]["response"]["body"]["choices"][0]["message"]["content"] == "Batch reply from claude-sonnet-4", (s, b[:300]))
 
         # Management API: admin auth, CRUD, hot reload, secrets kept out of the file
         s, _, _ = call("GET", "/api/config", auth=False)

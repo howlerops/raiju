@@ -1,0 +1,201 @@
+// Native image generation for Vertex AI and Bedrock. Builders return the request
+// to send and converters take the upstream body, as in media_native.tov, which
+// holds the Gemini and Anthropic side. Nothing here does HTTP: media.tov fetches
+// Vertex's bearer token and sends the requests.
+import { Field, fields, elements, find, rawStr, rawNum, quote } from "./json"
+import { Target, headers, addExtraHeaders, trimSlash } from "./providers/types"
+import { TokenCache } from "./providers/vertex"
+import * as bedrock from "./providers/bedrock"
+import * as native from "./media_native"
+import { nowSeconds } from "./schemas"
+
+// Bearer tokens for Vertex calls, by service account. media.tov fetches into it.
+export const VERTEX_TOKENS: TokenCache = new TokenCache()
+
+// ---- Vertex AI ----
+
+// The regional origin (or the key's base_url). The global location has no prefix.
+function vertexOrigin(t: Target, region: string): string {
+  const b = t.cfg.network_config?.base_url
+  if (b !== undefined && b !== "") return trimSlash(b)
+  const host = region === "global" ? "aiplatform.googleapis.com" : `${region}-aiplatform.googleapis.com`
+  return `https://${host}`
+}
+
+// The Gemini or Imagen request for an OpenAI images call, sent to Vertex's publisher
+// path with the bearer token. The body is the one media_native builds for Gemini
+// (the same shape on both), so only the URL and the auth differ.
+export function vertexImage(t: Target, body: Field[], token: string): native.MediaRequest throws SyntaxError {
+  const vk = t.key.vertex_key_config
+  if (vk === undefined) throw new SyntaxError("vertex: key has no vertex_key_config")
+  const g = try native.geminiImageGeneration(t, body)
+  const action = g.url.endsWith(":predict") ? "predict" : "generateContent"
+  const url = `${vertexOrigin(t, vk.region)}/v1/projects/${vk.project_id}/locations/${vk.region}/publishers/google/models/${t.model}:${action}`
+  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + token]])
+  addExtraHeaders(&h, t.cfg)
+  return { method: "POST", url: url, headers: h, body: g.body as string }
+}
+
+// ---- Bedrock ----
+
+// Bedrock's quality names: low and medium are standard, high is premium. Other
+// values pass through as given.
+function bedrockQuality(q: string): string {
+  const s = q.trim().toLowerCase()
+  if (s === "low" || s === "medium" || s === "standard") return "standard"
+  if (s === "high" || s === "premium") return "premium"
+  return q
+}
+
+// The two sides of a "WIDTHxHEIGHT" size. "auto" and "" give undefined.
+type Pixels = { w: int, h: int }
+
+function pixels(size: string): Pixels | undefined throws SyntaxError {
+  const s = size.trim().toLowerCase()
+  if (s === "" || s === "auto") return undefined
+  const parts = s.split("x")
+  if (parts.length !== 2) throw new SyntaxError(`invalid size format: expected 'WIDTHxHEIGHT', got ${size}`)
+  const w = parseInt(parts[0]!)
+  const h = parseInt(parts[1]!)
+  if (w === undefined || h === undefined) throw new SyntaxError(`invalid size ${size}`)
+  return { w: w, h: h }
+}
+
+// Titan Image Generator and Nova Canvas: the TEXT_IMAGE task with its text and
+// config. Bifrost's mapping (bedrock/images.go).
+function titanBody(prompt: string, body: Field[]): string throws SyntaxError {
+  const tp: string[] = [`"text":${quote(prompt)}`]
+  const neg = rawStr(body, "negative_prompt") ?? ""
+  if (neg !== "") tp.push(`"negativeText":${quote(neg)}`)
+  const style = rawStr(body, "style") ?? ""
+  if (style !== "") tp.push(`"style":${quote(style)}`)
+  const cfg: string[] = []
+  const n = rawNum(body, "n")
+  if (n !== undefined) cfg.push(`"numberOfImages":${n}`)
+  const px = try pixels(rawStr(body, "size") ?? "")
+  if (px !== undefined) {
+    cfg.push(`"width":${px.w}`)
+    cfg.push(`"height":${px.h}`)
+  }
+  const q = rawStr(body, "quality") ?? ""
+  if (q !== "") cfg.push(`"quality":${quote(bedrockQuality(q))}`)
+  const seed = rawNum(body, "seed")
+  if (seed !== undefined) cfg.push(`"seed":${seed}`)
+  return `{"taskType":"TEXT_IMAGE","textToImageParams":{${tp.join(",")}},"imageGenerationConfig":{${cfg.join(",")}}}`
+}
+
+// Stability AI's flat body: the prompt and the options it takes, when set.
+function stabilityBody(prompt: string, body: Field[]): string {
+  const fs: string[] = [`"prompt":${quote(prompt)}`]
+  for (const k of ["aspect_ratio", "output_format", "negative_prompt"]) {
+    const v = rawStr(body, k) ?? ""
+    if (v !== "") fs.push(`${quote(k)}:${quote(v)}`)
+  }
+  const seed = rawNum(body, "seed")
+  if (seed !== undefined) fs.push(`"seed":${seed}`)
+  return `{${fs.join(",")}}`
+}
+
+// The InvokeModel request for an image on a Bedrock model. Stability models
+// ("stability." in the id) take the flat body; the rest take TEXT_IMAGE. Signed with
+// the key's AWS credentials, or sent with its API key, as the chat path does.
+export function bedrockImage(t: Target, body: Field[]): native.MediaRequest throws SyntaxError {
+  const prompt = rawStr(body, "prompt") ?? ""
+  if (prompt === "") throw new SyntaxError("prompt is required")
+  let payload = ""
+  if (t.model.toLowerCase().includes("stability.")) payload = stabilityBody(prompt, body)
+  else payload = try titanBody(prompt, body)
+  const up = bedrock.signedRequest(t, "invoke", payload)
+  return { method: "POST", url: up.url, headers: up.headers, body: up.body }
+}
+
+// The OpenAI images body from a Bedrock InvokeModel answer ({"images": [...]}).
+// Bedrock's own error text (a content filter, say) becomes a SyntaxError.
+export function bedrockImagesToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const err = rawStr(fs, "error") ?? ""
+  if (err !== "") throw new SyntaxError(err)
+  const items: string[] = []
+  for (const el of try elements(find(fs, "images") ?? "[]")) items.push(`{"b64_json":${el}}`)
+  if (items.length === 0) throw new SyntaxError("no images in the response")
+  return `{"created":${nowSeconds()},"data":[${items.join(",")}]}`
+}
+
+// ---- tests ----
+
+const VX: Target = { provider: "vertex", kind: "vertex", model: "imagen-3.0-generate-002", key: { value: "", vertex_key_config: { project_id: "proj", region: "us-central1" } }, cfg: {} }
+
+test("vertex imagen uses :predict on the project's publisher path with the bearer token", () => {
+  const req = try vertexImage(VX, try fields(`{"prompt":"a fox","n":2,"size":"1024x1024"}`), "ya29.t")
+  expect(req.url).toBe("https://us-central1-aiplatform.googleapis.com/v1/projects/proj/locations/us-central1/publishers/google/models/imagen-3.0-generate-002:predict")
+  expect(req.headers.get("authorization")).toBe("Bearer ya29.t")
+  expect(req.headers.has("x-goog-api-key")).toBe(false)
+  expect((req.body as string).includes(`"parameters":{"sampleCount":2,"aspectRatio":"1:1","sampleImageSize":"1K"}`)).toBe(true)
+})
+
+test("vertex gemini image models use generateContent, and base_url overrides the origin", () => {
+  const gem: Target = { provider: "vertex", kind: "vertex", model: "gemini-2.5-flash-image", key: { value: "", vertex_key_config: { project_id: "p", region: "global" } }, cfg: { network_config: { base_url: "http://mock.local/" } } }
+  const req = try vertexImage(gem, try fields(`{"prompt":"a fox"}`), "tok")
+  expect(req.url).toBe("http://mock.local/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-flash-image:generateContent")
+  expect((req.body as string).includes(`"responseModalities":["IMAGE"]`)).toBe(true)
+  const noKey: Target = { provider: "vertex", kind: "vertex", model: "m", key: { value: "" }, cfg: {} }
+  let threw = false
+  try {
+    vertexImage(noKey, try fields(`{"prompt":"a"}`), "t")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+const BD: Target = { provider: "bedrock", kind: "bedrock", model: "amazon.titan-image-generator-v2:0", key: { value: "", bedrock_key_config: { access_key: "AKIDEXAMPLE", secret_key: "s", region: "us-east-1" } }, cfg: {} }
+
+test("bedrock titan and nova canvas: TEXT_IMAGE body, signed invoke", () => {
+  const req = try bedrockImage(BD, try fields(`{"prompt":"a fox","n":2,"size":"512x768","quality":"high","negative_prompt":"blur","style":"PHOTOREALISM","seed":7}`))
+  expect(req.url.endsWith("/invoke")).toBe(true)
+  expect(req.url.includes("/model/amazon.titan-image-generator-v2")).toBe(true)
+  expect(req.headers.get("authorization")!.startsWith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")).toBe(true)
+  expect(req.body as string).toBe(`{"taskType":"TEXT_IMAGE","textToImageParams":{"text":"a fox","negativeText":"blur","style":"PHOTOREALISM"},"imageGenerationConfig":{"numberOfImages":2,"width":512,"height":768,"quality":"premium","seed":7}}`)
+  expect(try bedrockImage(BD, try fields(`{"prompt":"x","size":"auto","quality":"low"}`)).body as string).toBe(`{"taskType":"TEXT_IMAGE","textToImageParams":{"text":"x"},"imageGenerationConfig":{"quality":"standard"}}`)
+  let bad = false
+  try {
+    bedrockImage(BD, try fields(`{"prompt":"x","size":"512"}`))
+  } catch (e) {
+    bad = true
+  }
+  expect(bad).toBe(true)
+  let noPrompt = false
+  try {
+    bedrockImage(BD, try fields(`{"n":1}`))
+  } catch (e) {
+    noPrompt = true
+  }
+  expect(noPrompt).toBe(true)
+})
+
+test("bedrock stability: the flat body", () => {
+  const st: Target = { provider: "bedrock", kind: "bedrock", model: "stability.stable-image-core-v1:1", key: { value: "", bedrock_key_config: { access_key: "AK", secret_key: "s", region: "us-west-2" } }, cfg: {} }
+  const req = try bedrockImage(st, try fields(`{"prompt":"a lake","size":"1024x1024","aspect_ratio":"16:9","output_format":"png","seed":3}`))
+  expect(req.body as string).toBe(`{"prompt":"a lake","aspect_ratio":"16:9","output_format":"png","seed":3}`)
+  expect(req.url.includes("/us-west-2") || req.url.includes("bedrock-runtime.us-west-2")).toBe(true)
+})
+
+test("bedrock image answers become openai images bodies", () => {
+  const ok = try JSON.parse(try bedrockImagesToOpenAI(`{"images":["QUJD","WFla"]}`)) as { data: { b64_json: string }[] }
+  expect(ok.data.length).toBe(2)
+  expect(ok.data[1]!.b64_json).toBe("WFla")
+  let filtered = false
+  try {
+    bedrockImagesToOpenAI(`{"error":"Content filtered"}`)
+  } catch (e) {
+    filtered = e.message === "Content filtered"
+  }
+  expect(filtered).toBe(true)
+  let none = false
+  try {
+    bedrockImagesToOpenAI(`{"images":[]}`)
+  } catch (e) {
+    none = true
+  }
+  expect(none).toBe(true)
+})

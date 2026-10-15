@@ -2,8 +2,8 @@
 // endpoints find the provider from the model ("provider/model" in a JSON field
 // or a form field). File and batch endpoints have no model, so the provider
 // comes from the x-bf-provider header or the provider query parameter. The
-// rest of each request goes upstream unchanged. Anthropic and Gemini providers
-// have their own APIs: media_native.tov builds those requests and the answers
+// rest of each request goes upstream unchanged. Anthropic, Gemini, Vertex and Bedrock
+// have their own APIs: media_native.tov and media_cloud.tov build those requests and the answers
 // are converted to OpenAI's shapes here.
 import { Config, KeyConfig, providerOf } from "./config"
 import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf } from "./providers/types"
@@ -13,6 +13,8 @@ import { fields, find, rawStr, setField, build, quote } from "./json"
 import { errorJson, snapshot } from "./schemas"
 import { deadline } from "./deadline"
 import * as native from "./media_native"
+import * as cloud from "./media_cloud"
+import { parseServiceAccount } from "./providers/vertex"
 
 export type MediaRoute = { op: string, method: string, upstreamPath: string, modelIn: "json" | "form" | "none" }
 
@@ -39,6 +41,7 @@ function patterns(): Pattern[] {
     { method: "GET", pattern: "/v1/batches", op: "batches.list", modelIn: "none" },
     { method: "GET", pattern: "/v1/batches/{id}", op: "batches.retrieve", modelIn: "none" },
     { method: "POST", pattern: "/v1/batches/{id}/cancel", op: "batches.cancel", modelIn: "none" },
+    { method: "GET", pattern: "/v1/batches/{id}/results", op: "batches.results", modelIn: "none" },
     // the Responses lifecycle (provider from x-bf-provider or ?provider=, default OpenAI, as Bifrost)
     { method: "POST", pattern: "/v1/responses/input_tokens", op: "responses.input_tokens", modelIn: "json" },
     { method: "POST", pattern: "/v1/responses/compact", op: "responses.compact", modelIn: "json" },
@@ -301,6 +304,7 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       if (typeof model !== "string") return errorReply(400, "the request needs a \"model\" field", "invalid_request_error")
       t = modelTarget(cfg, model)
       if (t === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
+      if (isNative(t.kind)) return await nativeMedia(t, route, qs, "", fd)
       body = formWithModel(fd, t.model)
     } else {
       const pt = providerTarget(cfg, provider)
@@ -322,6 +326,13 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
   }
   const tt: Target = t === undefined ? { provider: provider, kind: "", model: "", key: { value: "" }, cfg: {} } : t
   if (!supported(tt.kind)) return errorReply(400, `provider "${tt.provider}" does not support ${route.op}`, "invalid_request_error")
+  if (route.op === "batches.results") {
+    try {
+      return try await openaiBatchResults(tt, routeId(route))
+    } catch (e) {
+      return errorReply(502, `${tt.provider} batch results could not be read: ${e.message}`, "api_error")
+    }
+  }
   const hs = authHeaders(tt)
   if (contentType !== undefined) hs.set("content-type", contentType)
   return await send(tt, { method: route.method, url: upstreamUrl(tt, route, qs), headers: hs, body: body })
@@ -344,7 +355,7 @@ const uploadOrder: string[] = []
 const batchModels: Map<string, string> = new Map()
 
 function isNative(kind: string): bool {
-  return kind === "anthropic" || kind === "gemini"
+  return kind === "anthropic" || kind === "gemini" || kind === "vertex" || kind === "bedrock"
 }
 
 function remember(id: string, content: string): void {
@@ -400,14 +411,103 @@ function filePart(form: FormData | undefined): File | undefined {
   return f
 }
 
-// Serves a media, file or batch call for an Anthropic or Gemini provider.
+// Serves a media, file or batch call for an Anthropic, Gemini, Vertex or Bedrock provider.
 async function nativeMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> {
   try {
     if (t.kind === "anthropic") return await anthropicMedia(t, route, qs, text, form)
+    if (t.kind === "vertex") return await vertexMedia(t, route, text)
+    if (t.kind === "bedrock") return await bedrockMedia(t, route, text)
     return await geminiMedia(t, route, qs, text, form)
   } catch (e) {
     return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
   }
+}
+
+// A form field's text, or "" when it is absent or a file.
+function formText(form: FormData | undefined, key: string): string {
+  if (form === undefined) return ""
+  const v = form.get(key)
+  return typeof v === "string" ? v : ""
+}
+
+// A GET to the upstream URL of a route, with the provider's auth.
+function getRequest(t: Target, route: MediaRoute): native.MediaRequest {
+  return { method: "GET", url: upstreamUrl(t, route, ""), headers: authHeaders(t), body: undefined }
+}
+
+// GET /v1/batches/{id}/results for an OpenAI-format provider or Azure: the batch's
+// output file, as Bifrost's results body.
+async function openaiBatchResults(t: Target, bid: string): Promise<Response> throws SyntaxError | Error {
+  const got = await send(t, getRequest(t, { op: "batches.retrieve", method: "GET", upstreamPath: "/batches/" + bid, modelIn: "none" }))
+  if (!got.ok) return got
+  const outId = rawStr(try fields(try await got.text()), "output_file_id") ?? ""
+  if (outId === "") return errorReply(400, `batch results not available: output_file_id is empty (batch ${bid} may not be completed)`, "invalid_request_error")
+  const res = await send(t, getRequest(t, { op: "files.content", method: "GET", upstreamPath: "/files/" + outId + "/content", modelIn: "none" }))
+  if (!res.ok) return res
+  return jsonReply(try native.batchResultsDoc(bid, try await res.text()))
+}
+
+// The bearer token for a Vertex call: the cached one for its service account, else a
+// new one from its token endpoint (as gateway.tov's vertexToken fetches it).
+async function vertexBearer(t: Target): Promise<string> throws SyntaxError | Error {
+  const sa = try parseServiceAccount(t.key.vertex_key_config?.auth_credentials)
+  const now = Math.floor(Date.now() / 1000)
+  const cached = cloud.VERTEX_TOKENS.get(sa.client_email, now)
+  if (cached !== undefined) return cached
+  const up = try cloud.VERTEX_TOKENS.tokenRequest(sa, now)
+  const hs: Record<string, string> = up.headers
+  const dl = deadline(10000)
+  let text = ""
+  try {
+    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg) })
+    text = try await res.text()
+  } catch (e) {
+    dl.finish()
+    throw e
+  }
+  dl.finish()
+  try cloud.VERTEX_TOKENS.store(sa.client_email, text, now)
+  return cloud.VERTEX_TOKENS.get(sa.client_email, now) ?? ""
+}
+
+// Vertex serves image generation here; its other media is not in this gateway yet.
+async function vertexMedia(t: Target, route: MediaRoute, text: string): Promise<Response> throws SyntaxError | Error {
+  if (route.op !== "images.generations") return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
+  const fs = try fields(text)
+  if ((rawStr(fs, "prompt") ?? "") === "") return errorReply(400, "the request needs a prompt", "invalid_request_error")
+  let token = ""
+  try {
+    token = try await vertexBearer(t)
+  } catch (e) {
+    return errorReply(502, `vertex authentication failed: ${e.message}`, "authentication_error")
+  }
+  let mr: native.MediaRequest | undefined = undefined
+  try {
+    mr = try cloud.vertexImage(t, fs, token)
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+  const up = await send(t, mr)
+  if (!up.ok) return up
+  const raw = try await up.text()
+  if (t.model.toLowerCase().includes("imagen")) return jsonReply(try native.imagenToOpenAI(raw))
+  return jsonReply(try native.geminiImageToOpenAI(raw))
+}
+
+// Bedrock serves image generation here (InvokeModel); its other media is not in this gateway yet.
+async function bedrockMedia(t: Target, route: MediaRoute, text: string): Promise<Response> throws SyntaxError | Error {
+  if (route.op !== "images.generations") return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
+  let mr: native.MediaRequest | undefined = undefined
+  try {
+    mr = try cloud.bedrockImage(t, try fields(text))
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+  const up = await send(t, mr)
+  if (!up.ok) return up
+  return jsonReply(try cloud.bedrockImagesToOpenAI(try await up.text()))
 }
 
 async function anthropicMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
@@ -475,6 +575,11 @@ async function anthropicMedia(t: Target, route: MediaRoute, qs: string, text: st
     const up = await send(t, native.anthropicBatchGet(t, id))
     if (!up.ok) return up
     return jsonReply(try native.anthropicBatchToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
+  }
+  if (route.op === "batches.results") {
+    const out = try await anthropicBatchOutput(t, id)
+    if (!out.ok) return out
+    return jsonReply(try native.batchResultsDoc(id, try await out.text()))
   }
   if (route.op === "batches.cancel") {
     const up = await send(t, native.anthropicBatchCancel(t, id))
@@ -561,6 +666,11 @@ async function geminiMedia(t: Target, route: MediaRoute, qs: string, text: strin
     if (!up.ok) return up
     return jsonReply(try native.geminiBatchToOpenAI(try await up.text(), OUTPUT_PREFIX + id))
   }
+  if (route.op === "batches.results") {
+    const out = try await geminiBatchOutput(t, id)
+    if (!out.ok) return out
+    return jsonReply(try native.batchResultsDoc(id, try await out.text()))
+  }
   if (route.op === "batches.cancel") {
     const cancel = await send(t, native.geminiBatchCancel(t, id))
     if (!cancel.ok) return cancel
@@ -581,6 +691,25 @@ async function geminiMedia(t: Target, route: MediaRoute, qs: string, text: strin
     const raw = try await up.text()
     if (t.model.toLowerCase().includes("imagen")) return jsonReply(try native.imagenToOpenAI(raw))
     return jsonReply(try native.geminiImageToOpenAI(raw))
+  }
+  if (route.op === "audio.transcriptions") {
+    // Gemini's speech-to-text: the audio inline in generateContent (as Bifrost does)
+    let format = "json"
+    try {
+      format = native.transcriptionFormat(formText(form, "response_format"))
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    const f = filePart(form)
+    if (f === undefined) return errorReply(400, "the request needs a \"file\" part", "invalid_request_error")
+    const mime = native.audioMime(f.type, f.name)
+    if (mime === "") return errorReply(400, "the audio type is not one Gemini takes (wav, mp3, aiff, aac, ogg or flac)", "invalid_request_error")
+    const audio = try await f.bytes()
+    const up = await send(t, native.geminiTranscription(t, formText(form, "prompt"), mime, audio))
+    if (!up.ok) return up
+    const transcript = try native.transcriptText(try await up.text())
+    if (format === "text") return new Response(transcript, { headers: { "content-type": "text/plain; charset=utf-8" } })
+    return jsonReply(native.transcriptionJson(transcript))
   }
   if (route.op === "audio.speech") {
     let format = "wav"
@@ -751,4 +880,23 @@ test("native routes: batch and file ids, first model, upload copies", () => {
   for (let i = 0; i < UPLOAD_CAP + 2; i++) remember("f" + i, "x" + i)
   expect(uploads.has("f0")).toBe(false)
   expect(uploads.get("f" + (UPLOAD_CAP + 1))).toBe("x" + (UPLOAD_CAP + 1))
+})
+
+test("batch results route: matched, id kept, upstream url", () => {
+  const r = matchRoute("GET", "/v1/batches/b_1/results")
+  expect(r).toEqual({ op: "batches.results", method: "GET", upstreamPath: "/batches/b_1/results", modelIn: "none" })
+  expect(routeId(r!)).toBe("b_1")
+  expect(matchRoute("POST", "/v1/batches/b_1/results")).toBeUndefined()
+  expect(matchRoute("GET", "/v1/batches//results")).toBeUndefined()
+  const openai: Target = { provider: "openai", kind: "openai", model: "", key: { value: "k" }, cfg: {} }
+  expect(upstreamUrl(openai, r!, "")).toBe("https://api.openai.com/v1/batches/b_1/results")
+})
+
+test("native kinds: anthropic, gemini, vertex and bedrock", () => {
+  expect(isNative("vertex")).toBe(true)
+  expect(isNative("bedrock")).toBe(true)
+  expect(isNative("gemini")).toBe(true)
+  expect(isNative("cohere")).toBe(false)
+  expect(isNative("azure")).toBe(false)
+  expect(formText(undefined, "prompt")).toBe("")
 })
