@@ -249,210 +249,250 @@ Bifrost: `transports/bifrost-http/handlers/*.go`, documented in `docs/openapi/op
 
 ### b1. Request headers
 
-Bifrost: string literals in `transports/bifrost-http/lib/ctx.go`, `ConvertToBifrostContext` (about lines 419-766), and `lib/virtualkey.go`.
+Bifrost: string literals in `transports/bifrost-http/lib/ctx.go`, `ConvertToBifrostContext` (about lines 419-766), and `lib/virtualkey.go`. Constants in `core/schemas/bifrost.go` and `core/schemas/async.go`. Raiju: function names are given (`src/gateway.tov`, `src/governance.tov` and so on), not line numbers.
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| x-bf-vk | lib/ctx.go:421 | done | `governance.tov:124`. |
-| VK in Authorization Bearer, x-api-key, x-goog-api-key or api-key | docs/features/governance/virtual-keys.mdx; lib/ctx.go:419-422 | done | `governance.tov:126-130`. |
-| x-bf-api-key (pin a key by name or id) | lib/ctx.go:548 | done | `gateway.tov` (x-bf-api-key); `router.tov:63-70` (pickKey). |
-| x-bf-api-key-id | lib/ctx.go:554 | done | `gateway.tov` (x-bf-api-key-id). |
-| x-bf-direct-key (raw provider key from the caller) | lib/ctx.go:422, 900; lib/ctx.go:59-60 | done | `governance.tov:77-81`. Used only when `client.allow_direct_keys` is on (commit cbd6ad3). |
-| x-bf-session-id | lib/ctx.go:618 | done | `affinity.tov`. |
-| x-bf-session-ttl | lib/ctx.go:622 | done | `affinity.tov`. |
-| x-bf-session-affinity | lib/ctx.go:638 | done | `affinity.tov`. |
-| x-bf-project-id, x-bf-project-name | lib/ctx.go (project keys) | missing | No projects. P2. |
-| x-bf-customer-id, x-bf-customer-name | docs/features/governance/budget-and-limits.mdx | missing | Customer comes from the VK only. P2. |
-| x-bf-dim-* (custom metric and log dimensions) | lib/ctx.go:443 | partial | Prometheus labels only, through `client.prometheus_labels` (`metrics.tov:319-349`, commit cbd6ad3). Log dimensions are not recorded. |
+| x-bf-vk | lib/ctx.go:421 | done | `governance.tov` findKey. |
+| VK in Authorization Bearer, x-api-key, x-goog-api-key or api-key | docs/features/governance/virtual-keys.mdx; lib/ctx.go:419-422 | done | `governance.tov` findKey (Bearer first, then x-api-key, x-goog-api-key, api-key). |
+| x-bf-api-key (pin a key by name or id) | lib/ctx.go:548 | done | `gateway.tov` attempt (the pinned key); `router.tov` pickKey. |
+| x-bf-api-key-id | lib/ctx.go:554 | done | `gateway.tov` attempt. |
+| x-bf-direct-key (raw provider key from the caller) | lib/ctx.go:422, 900; lib/ctx.go:59-60 | done | `governance.tov` directKeyFrom. Used only when `client.allow_direct_keys` is on. |
+| x-bf-session-id | lib/ctx.go:618 | done | `affinity.tov` sessionHeaders. |
+| x-bf-session-ttl | lib/ctx.go:622 | done | `affinity.tov` sessionHeaders. |
+| x-bf-session-affinity | lib/ctx.go:638 | done | `affinity.tov` affinityMode. |
+| x-bf-project-id, x-bf-project-name | core/schemas/bifrost.go:643-644 | done | Projects (L84): `governance.tov` projectOf. The key must belong to the project. Members API and split policies are open (L84). |
+| x-bf-customer-id, x-bf-customer-name | docs/features/governance/budget-and-limits.mdx; core/schemas/bifrost.go:277 (set by Bifrost's enterprise governance plugin) | done | `governance.tov` admit: the charge goes to that customer, which the key must reach. |
+| x-bf-dim-* (custom metric and log dimensions) | lib/ctx.go:443; core/schemas/bifrost.go:454 | partial | Prometheus labels only, through `client.prometheus_labels` (`metrics.tov` customValues). Bifrost also forwards these to log rows; Raiju does not record them. |
 | x-bf-prom-* (custom Prometheus labels) | lib/ctx.go:449 | n/a | Removed upstream. Bifrost swallows it (`transports/bifrost-http/lib/ctx.go:449`). Use `x-bf-dim-*`, which is done. |
-| x-bf-maxim-* | lib/ctx.go:455; plugins/maxim | missing | Third-party plugin, not in `SCOPE.md`. Decide. |
-| x-bf-mcp-include-clients | lib/ctx.go:477 (x-bf-mcp- prefix) | done | `gateway.tov` (x-bf-mcp-include-clients). |
+| x-bf-maxim-* | lib/ctx.go:455; plugins/maxim | missing | Raiju has a Maxim log sink (L85), but the per-request header is not read. P2. |
+| x-bf-mcp-include-clients | lib/ctx.go:477 (x-bf-mcp- prefix) | done | `gateway.tov` withMcpTools. |
 | x-bf-mcp-include-tools | docs/mcp/filtering.mdx | missing | P2. |
 | x-bf-mcp-session-id | lib/ctx.go:504 | missing | P2. |
-| x-bf-eh-* (forward extra headers to the provider) | lib/ctx.go:651 | done | `gateway.tov` (x-bf-eh-). |
-| x-bf-cache-key | lib/ctx.go:561 | done | `gateway.tov`. |
-| x-bf-cache-ttl | lib/ctx.go:566 | done | `gateway.tov`. |
-| x-bf-cache-threshold | lib/ctx.go:587 | done | `gateway.tov`. |
-| x-bf-cache-type (direct or semantic) | lib/ctx.go:602 | done | `gateway.tov` (`gateway.tov:948`). |
-| x-bf-cache-no-store | lib/ctx.go:607 | done | `gateway.tov`. |
-| x-bf-prompt-cache-auto-inject | lib/ctx.go:725 | done | `gateway.tov`. |
-| x-bf-disable-content-logging | lib/ctx.go:743 | done | `gateway.tov:1503` (commit 12757de). |
-| x-bf-store-raw-request-response | lib/ctx.go:737 | missing | P2. |
-| x-bf-send-back-raw-request | lib/ctx.go:715 | done | `gateway.tov:404-412` (commit cbd6ad3). Per provider, or per request with `client.allow_per_request_raw_override`. |
-| x-bf-send-back-raw-response | lib/ctx.go:731 | done | `gateway.tov:404-412` (commit cbd6ad3). Per provider, or per request with `client.allow_per_request_raw_override`. |
+| x-bf-eh-* (forward extra headers to the provider) | lib/ctx.go:651 | done | `gateway.tov` forwardedHeaders. |
+| x-bf-cache-key | lib/ctx.go:561 | done | `gateway.tov` serveInner. |
+| x-bf-cache-ttl | lib/ctx.go:566 | done | `gateway.tov` serveInner. |
+| x-bf-cache-threshold | lib/ctx.go:587 | done | `gateway.tov` serveInner. |
+| x-bf-cache-type (direct or semantic) | lib/ctx.go:602 | done | `gateway.tov` serveInner. |
+| x-bf-cache-no-store | lib/ctx.go:607 | done | `gateway.tov` serveInner. |
+| x-bf-prompt-cache-auto-inject | lib/ctx.go:725 | done | `gateway.tov` chatOnce. |
+| x-bf-disable-content-logging | lib/ctx.go:743 | done | `gateway.tov` contentOff. Honoured only when `client.allow_per_request_content_storage_override` is on (commit 12757de). |
+| x-bf-store-raw-request-response | lib/ctx.go:737 | done | `gateway.tov` storeRawOn. Honoured only when `client.allow_per_request_content_storage_override` is on. Provider setting otherwise. |
+| x-bf-send-back-raw-request | lib/ctx.go:715 | done | `gateway.tov` sendBackRaw. Per provider, or per request with `client.allow_per_request_raw_override`. |
+| x-bf-send-back-raw-response | lib/ctx.go:731 | done | `gateway.tov` sendBackRaw. Per provider, or per request with `client.allow_per_request_raw_override`. |
 | x-bf-parent-request-id | lib/ctx.go:750 | missing | P2. |
-| x-bf-passthrough-extra-params | lib/ctx.go:757 | missing | P2. |
-| x-bf-compat | lib/ctx.go:766 | missing | P2. Compat plugin (G37). |
-| x-bf-async-webhook, x-bf-async-job-result-ttl | lib/ctx.go:675; docs/features/async-inference.mdx | missing | P2. |
-| x-bf-prompt-id, x-bf-prompt-version | plugins/prompts; docs/features/prompt-repository | missing | P2. Not in `SCOPE.md`. |
-| x-bf-model-provider | docs; server listing | done | `server.tov:76`. |
-| x-bf-list-models-provider | docs | done | `server.tov:76`. |
-| x-bf-agent-correlation-id, x-bf-agent-vk-id, x-bf-agent-auth | handlers/agentgateway.go | missing | P2. |
-| x-bf-lh-* (logging headers, `client.logging_headers`) | docs; config.schema.json client | missing | P2. |
-| x-bf-app, x-bf-user-id, x-bf-env, x-bf-tenant (attribution) | core/schemas/enrichment.go (app); docs | partial | Only `x-bf-app` is read, for the `app` metric and log label (`gateway.tov:1342`). `x-bf-user-id`, `x-bf-env` and `x-bf-tenant` are not read. |
-| x-bf-azure-endpoint, x-bf-bedrock-* | docs (removed in v1.5) | n/a | Removed upstream. |
-| x-request-id (incoming id reused as the request id) | lib/responseheaders.go | partial | `gateway.tov:867` reads it. It is not echoed back as a response header. |
-| x-bf-provider (media provider selection) | not in Bifrost | done (Raiju-only) | `media.tov:123-129`. |
-| x-bf-routing-rule | not in Bifrost | done (Raiju-only) | `gateway.tov`. |
-| x-bf-complexity-tier | not verified in Bifrost (complexity_tier is a routing-rule variable) | done (Raiju-only) | `gateway.tov`, `complexity.tov`. |
-| x-bf-mcp-agent (agent mode toggle) | not in Bifrost (Bifrost uses per-client tools_to_auto_execute) | done (Raiju-only) | `gateway.tov`. |
+| x-bf-passthrough-extra-params | lib/ctx.go:757 | missing | P2. The gate is open (L81). |
+| x-bf-compat | lib/ctx.go:766 | done | `compat.tov` withHeader, read by `gateway.tov` chatOnce and completions, `native.tov` responsesApi, and `extras.tov` decisionRoute. Compat headers on streamed answers are open (L100). |
+| x-bf-async-webhook | lib/ctx.go:675; docs/features/async-inference.mdx | done | `webhooks.tov` asyncSubmitHooked, on `/v1/async/*` only. |
+| x-bf-async (create) and x-bf-async-id (get) on integration routes | core/schemas/async.go:28-30; transports/bifrost-http/integrations/router.go | missing | P2. Raiju's async is path-based (`/v1/async/<op>`, `server.tov` dispatch and `jobs.tov` asyncPoll), not header-driven on SDK routes. |
+| x-bf-async-job-result-ttl | core/schemas/async.go:26 | missing | P2. The header is not read. `client.async_job_result_ttl` applies to every job. |
+| x-bf-prompt-id, x-bf-prompt-version | plugins/prompts/main.go:27; docs/features/prompt-repository/prompts-plugin.mdx | done | `prompts.tov` applyPrompt, applied before the messages in `gateway.tov` chatOnce (L88). |
+| x-bf-prompt-var-* (prompt variable values) | not in Bifrost | done (Raiju-only) | `prompts.tov`. |
+| x-bf-model-provider | docs; server listing | done | `server.tov` listModels; `extras.tov` typesafeModels. |
+| x-bf-list-models-provider | docs | done | `server.tov` listModels. |
+| x-bf-agent-correlation-id | plugins/logging/main.go:296 | missing | P2. Bifrost's logging plugin records it on log rows. |
+| x-bf-agent-vk-id, x-bf-agent-auth | cli/internal/client/client.go; handlers/agentgateway.go | out-of-scope | The agent gateway (A2A) is in SCOPE.md Out. |
+| x-bf-lh-* (logging headers, `client.logging_headers`) | plugins/logging/main.go:1728; config.schema.json client | missing | P2. `client.logging_headers` is reported as not implemented (`config_compat.tov` noteTable). |
+| x-bf-user-id, x-bf-env, x-bf-tenant | none: no Bifrost Go code reads these names | n/a | `x-bf-user-id` appears only in Bifrost's example config (`examples/configs/withcompat/config.json`, `required_headers` and `logging_headers`). Raiju's `client.required_headers` can require any header (`governance.tov`). Bifrost's tenant attribution appears in its tests as `x-bf-lh-tenant`, a logging header (see x-bf-lh-*). |
+| x-bf-app (Bifrost classifies the app from User-Agent) | core/schemas/useragents.go; core/schemas/enrichment.go (app); plugins/logging/main.go detectAppFromUserAgent | missing | Bifrost sets the `app` label from the User-Agent (Claude Code, Cursor, Warp and so on). Raiju does not classify User-Agent; it reads the header below. |
+| x-bf-app (Raiju's header) | not in Bifrost | done (Raiju-only) | `gateway.tov` serveInner sets the `app` label from this header. |
+| x-bf-forwarded-proto (request scheme behind a load balancer) | transports/bifrost-http/lib/ctx.go:928 | missing | P2. Raiju does not read it. |
+| x-request-id (incoming id reused as the request id) | lib/responseheaders.go:28 | partial | `gateway.tov` serveInner reuses it as the request id. It is not echoed back on the response, although `server.tov` lists it in Access-Control-Expose-Headers. Bifrost sets it (transports/bifrost-http/handlers/middlewares.go:119). |
+| x-bf-provider (media provider selection) | not in Bifrost | done (Raiju-only) | `media.tov` deploymentRequest and provider selection. |
+| x-bf-routing-rule | not in Bifrost | done (Raiju-only) | `gateway.tov` route and serveInner. |
+| x-bf-complexity-tier | not verified in Bifrost (complexity_tier is a routing-rule variable) | done (Raiju-only) | `gateway.tov` serveInner; `complexity.tov` overrideTier. |
+| x-bf-mcp-agent (agent mode toggle) | not in Bifrost (Bifrost uses per-client tools_to_auto_execute) | done (Raiju-only) | `gateway.tov` chat. |
 
 ### b2. Response headers
 
-Bifrost: `transports/bifrost-http/lib/responseheaders.go` (constants at lines 23-132) and `ExposedResponseHeaders`.
+Bifrost: `transports/bifrost-http/lib/responseheaders.go` (constants at lines 23-132) and `ExposedResponseHeaders`. Raiju: `src/gateway.tov` serveInner and routedHeaders, cacheHeaders and cacheView helpers, and `src/server.tov` EXPOSED.
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| x-bifrost-request-id | responseheaders.go:23 | done | `gateway.tov:886`. |
-| x-bifrost-trace-id | responseheaders.go:24 | done | `gateway.tov:1285`, when tracing is on (`otel.tov`). |
-| x-bifrost-provider | responseheaders.go:70 | done | `gateway.tov` `routedHeaders` (commit abf4a31). |
-| x-bifrost-original-model, x-bifrost-resolved-model | responseheaders.go:71-72 | done | `gateway.tov` `routedHeaders` (commit abf4a31). |
-| x-bifrost-request-type | responseheaders.go:74 | done | `gateway.tov:1283` (commit abf4a31). |
-| x-bifrost-fallback-index | responseheaders.go:73 | done | `gateway.tov` `routedHeaders` (commit abf4a31). |
-| x-bifrost-latency-ms, x-bifrost-upstream-latency-ms | responseheaders.go:79, 125 | done | `gateway.tov` (commit abf4a31). |
-| x-bifrost-routing-info-* (12 headers) | responseheaders.go:86-97 | partial | 7 of 12 sent (`gateway.tov` `routedHeaders`). Missing: key, alias-model-id, alias-model-name, alias-model-family and server-side-fallback-model. |
-| x-bifrost-cache-hit, -hit-type, -id, -hit-latency-ms, -similarity, -threshold, -provider-used, -model-used, -input-tokens, -requested-provider, -requested-model | responseheaders.go:106-116 | partial | Sent: hit, hit-type, requested provider and model, similarity, threshold (`gateway.tov` `cacheHeaders`). Missing: -id, -hit-latency-ms, -provider-used, -model-used, -input-tokens. |
-| x-bifrost-pricing-request-type, x-bifrost-converted-request-type | responseheaders.go:126-127 | missing | P2. |
-| x-bifrost-dropped-compat-params, x-bifrost-dropped-unsupported-tools | responseheaders.go:128-129 | missing | P2. |
+| x-bifrost-request-id | responseheaders.go:23 | done | `gateway.tov` serveInner. |
+| x-bifrost-trace-id | responseheaders.go:24 | done | `gateway.tov` serveInner, when tracing is on (`otel.tov`). |
+| x-bifrost-provider | responseheaders.go:70 | done | `gateway.tov` routedHeaders. |
+| x-bifrost-original-model, x-bifrost-resolved-model | responseheaders.go:71-72 | done | `gateway.tov` routedHeaders. |
+| x-bifrost-request-type | responseheaders.go:74 | done | `gateway.tov` serveInner. |
+| x-bifrost-fallback-index | responseheaders.go:73 | done | `gateway.tov` routedHeaders. |
+| x-bifrost-latency-ms, x-bifrost-upstream-latency-ms | responseheaders.go:79, 125 | done | `gateway.tov` serveInner (latency) and routedHeaders (upstream). |
+| x-bifrost-routing-info-* (12 headers) | responseheaders.go:86-97 | partial | 9 of 12 sent (`gateway.tov` routedHeaders): provider, model, requested-provider, requested-model, is-fallback, primary-provider, primary-model, and key and alias-model-id when known. Missing: alias-model-name, alias-model-family and server-side-fallback-model. |
+| x-bifrost-cache-hit, -hit-type, -requested-provider, -requested-model, -similarity, -threshold | responseheaders.go:106-116 | done | `gateway.tov` cacheHeaders (direct and semantic hits). |
+| x-bifrost-cache-hit-latency-ms | responseheaders.go:109 | done | `gateway.tov` cacheHeaders. |
+| x-bifrost-cache-id | responseheaders.go:107 | partial | Sent on direct-cache hits only. Semantic hits pass an empty id (`gateway.tov` serveInner). |
+| x-bifrost-cache-provider-used, -model-used, -input-tokens | responseheaders.go:114-116 | partial | Set only on an upstream answer after a semantic lookup missed (`gateway.tov` serveInner). Not set on cache hits. |
+| x-bifrost-pricing-request-type | responseheaders.go:126 | missing | P2. |
+| x-bifrost-converted-request-type | responseheaders.go:127 | done | `gateway.tov` serveInner (compat conversions). |
+| x-bifrost-dropped-compat-params, x-bifrost-dropped-unsupported-tools | responseheaders.go:128-129 | partial | Sent on non-streamed answers (`gateway.tov` serveInner). Streamed answers are open (L100). |
 | x-bifrost-passthrough-path | responseheaders.go:130 | missing | P2. |
-| x-bifrost-error-type, x-bifrost-retry-after-ms | responseheaders.go:131-132 | partial | x-bifrost-error-type is sent (`gateway.tov:1407`). x-bifrost-retry-after-ms is missing. Raiju reads upstream Retry-After internally. |
-| `extra_fields` in the body, or in headers with `client.extra_fields_placement` | lib/responseheaders.go:161-170; config.schema.json client | partial | Body only: raw request and response go in `extra_fields` when send-back is on (`gateway.tov`, `withRawFields`). `client.extra_fields_placement` is missing. |
-| Access-Control-Expose-Headers for the x-bifrost-* headers | lib/responseheaders.go ExposedResponseHeaders | done | `server.tov` `EXPOSED` (commit abf4a31). |
-| x-bf-attempts | not in Bifrost | done (Raiju-only) | `gateway.tov:593`, `973`. |
-| x-bf-fallback-used | not in Bifrost | done (Raiju-only) | `gateway.tov:1002`. |
-| x-bf-overhead-us | not in Bifrost | done (Raiju-only) | `gateway.tov:1008`. |
-| x-bf-plugin-short-circuit, x-bf-agent-steps, x-bf-agent-tool-calls | not in Bifrost | done (Raiju-only) | `gateway.tov`. |
+| x-bifrost-error-type | responseheaders.go:131 | done | `gateway.tov` serveInner. |
+| x-bifrost-retry-after-ms | responseheaders.go:132 | done | `gateway.tov` serveInner, on errors when the upstream gave a retry hint. |
+| `extra_fields` in the body, or in headers with `client.extra_fields_placement` | lib/responseheaders.go:161-170; config.schema.json client | partial | Body only: raw request and response go in `extra_fields` when send-back is on (`gateway.tov` withRawFields). `client.extra_fields_placement` is reported as not implemented (`config_compat.tov` noteTable). |
+| Access-Control-Expose-Headers for the x-bifrost-* headers | lib/responseheaders.go ExposedResponseHeaders | done | `server.tov` EXPOSED. |
+| Webhook delivery headers: webhook-id, webhook-timestamp, webhook-signature, x-bifrost-event | framework/configstore/tables/webhooks.go:100-101; framework/webhooks/client.go:115 | done | `webhooks.tov` (signed Standard Webhooks deliveries; these names cannot be overridden by custom headers). |
+| x-bf-attempts | not in Bifrost | done (Raiju-only) | `gateway.tov` attempt and serveInner. |
+| x-bf-fallback-used | not in Bifrost | done (Raiju-only) | `gateway.tov` serveInner. |
+| x-bf-overhead-us | not in Bifrost | done (Raiju-only) | `gateway.tov` serveInner. |
+| x-bf-cache (hit or semantic-hit) | not in Bifrost | done (Raiju-only) | `gateway.tov` serveInner. |
+| x-bf-plugin-short-circuit, x-bf-agent-steps, x-bf-agent-tool-calls | not in Bifrost | done (Raiju-only) | `gateway.tov` chatOnce and chat. |
 
 ## (c) config.json
 
 ### c1. Top-level sections
 
-Bifrost: top-level properties of `transports/config.schema.json`. Raiju: `Config` in `src/config.tov` (lines 280-300) and the loaders in `config.tov`.
+Bifrost: top-level properties of `transports/config.schema.json`. Raiju: `Config` in `src/config.tov`, the Bifrost-to-Raiju mapping in `src/config_compat.tov` (`normalize`), and the startup notes in `config_compat.tov` (`noteTable`, which says why each ignored key is ignored). Keys Raiju does not act on are reported at startup, so none are dropped silently.
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| version, $schema, source_of_truth, env_label | config.schema.json (top) | missing | Not read. No effect. P2. |
-| encryption_key | config.schema.json (top) | missing | Bifrost encrypts stored keys with it. Raiju resolves `env.` and vault references instead (`config.tov` resolveEnv). P2. |
-| setup_token | config.schema.json (top) | missing | Setup flow. P2. |
-| server.* (read_buffer_size, a2a_*, plugin_download_*) | config.schema.json server | missing | Raiju takes `-port` and `-workers` on the command line. P2. |
-| auth_config (admin_username, admin_password, is_enabled, disable_auth_on_inference) | config.schema.json auth_config | done | P0 (G2). All four are read (`config_compat.tov`, `config.tov` resolveConfig): `is_enabled: false` turns admin auth off, and `disable_auth_on_inference` leaves inference open unless `client.enforce_auth_on_inference` says otherwise. 
+| version, source_of_truth, env_label | config.schema.json (top) | missing | Reported as ignored at startup (`config_compat.tov` noteTable). No effect. P2. |
+| $schema | config.schema.json (top) | done | Accepted and skipped (`config_compat.tov` topKeys). |
+| encryption_key | config.schema.json (top) | partial | Done with a different key derivation: `store.tov` cipherFromConfig seals provider key values, virtual key values, and the admin password and token with AES-256-GCM. The key is PBKDF2-HMAC-SHA256 (100,000 rounds, fixed salt); Bifrost uses Argon2id, so sealed files do not open in the other product. `env.NAME` is allowed. (commits ae6f1db, G39) |
+| setup_token | config.schema.json (top) | missing | Reported as ignored: no setup-token gate for the first admin account. P2. |
+| server.* (read_buffer_size, a2a_*, plugin_download_*) | config.schema.json server | missing | Reported as ignored. Raiju takes `-host` and `-port` on the command line. P2. |
+| auth_config (admin_username, admin_password, is_enabled, disable_auth_on_inference) | config.schema.json auth_config | done | P0 (G2). `config_compat.tov` mapAuth; `config.tov` AdminAuthConfig. `is_enabled: false` turns admin auth off, and `disable_auth_on_inference` leaves inference open unless `client.enforce_auth_on_inference` says otherwise. |
 | client.* | config.schema.json client | partial | See c2. |
 | providers.* | config.schema.json providers | partial | See c3. |
 | governance.* | config.schema.json governance | partial | See c4. |
-| alerting | config.schema.json alerting | done | `config_compat.tov` `alerting` mapping, rules as CEL (commit 8e98ea5). |
-| webhooks[] | config.schema.json webhooks | missing | P2. |
-| agents[] | config.schema.json agents | missing | P2. Not in `SCOPE.md`. |
+| alerting | config.schema.json alerting | done | `config_compat.tov` mapAlerting; rules as CEL (commit 8e98ea5). history_retention_days and webhook_network are reported as ignored. |
+| webhooks[] | config.schema.json webhooks | done | `config.tov` WebhookEndpoint; `webhooks.tov` (Standard Webhooks signing, retries, `allow_private_network`). Deliveries are kept in memory (the last 500); `client.webhook_config` is reported as not implemented (L88). |
+| agents[] | config.schema.json agents | out-of-scope | The agent gateway (A2A) is in SCOPE.md Out. Reported as ignored (`config_compat.tov` noteTable). |
 | mcp.* | config.schema.json mcp | partial | See c5. |
-| vector_store | config.schema.json vector_store | partial | Redis and Qdrant are read (`config.tov`, `vectorstore.tov`, commit d91ef07). Weaviate, Pinecone and chromem are not supported. |
-| config_store (sqlite, postgres) | config.schema.json config_store | partial | Raiju stores config as a JSON file with `.bak` (`store.tov`). |
-| logs_store.* | config.schema.json logs_store | partial | `config.tov` LogsStoreConfig: enabled, dir, retention_days, max_memory_entries, content_logging; `logstore.tov` prunes by retention_days. Bifrost's type, config, writer and object_storage are ignored. |
-| skills_registry | config.schema.json skills_registry | missing | P2. Not in `SCOPE.md`. |
-| plugins[] | config.schema.json plugins | partial | `otel` and `semanticcache` entries are mapped (`config_compat.tov` `mapPlugins`, commits 0d269dd and d91ef07). Other names are reported as unknown and not loaded (`plugins.tov:381`). |
-| websocket | config.schema.json websocket | missing | P2. |
-| guardrails_config | config.schema.json guardrails_config | done | `guardrails_compat.tov`, `main.tov` `withBifrostGuardrails` (commit 0c999ff). |
-| audit_logs | config.schema.json audit_logs | partial | Read as `audit` (`config_compat.tov:342-358`). retention_days, omit_ip_addresses, archive_* and object_storage are reported as ignored. |
-| cluster_config | config.schema.json cluster_config | partial | Read as `cluster` (`config_compat.tov:362-384`). Type `broker` and discovery settings are not supported. |
-| load_balancer_config | config.schema.json load_balancer_config | partial | Mapped into `health.adaptive` (`config_compat.tov:391-431`). Tracker, bootstrap and other fields are reported as ignored. |
-| circuit_breaker_config | config.schema.json circuit_breaker_config | done | Mapped to `health.circuit_breaker` (`config_compat.tov:391-406`). |
-| large_payload_optimization | config.schema.json large_payload_optimization | missing | P2. |
-| scim_config | config.schema.json scim_config | out-of-scope | `SCOPE.md` Out: SCIM. |
-| access_profiles (top-level) | config.schema.json access_profiles | missing | Raiju reads `governance.access_profiles` only. P2. |
-| feature_flags | config.schema.json feature_flags | missing | P2. |
-| proxy_config (global outbound proxy) | config.schema.json proxy_config | missing | Raiju has per-provider proxies only (`config.tov` ProxyConfig). P2. |
-| framework.pricing (pricing_url, pricing_sync_interval) | config.schema.json framework; framework/modelcatalog/config.go:109 (default URL) | partial | `pricing_url` and `pricing_sync_interval` become `pricing_sync` (`config_compat.tov:436-451`). Sync runs only when a pricing section is set. Other fields are reported as ignored. |
-| Raiju-only top-level keys (cache, prompt_cache, health, pricing, otel, semantic_cache, session_affinity, complexity_router, mcp_server, virtual_mcps, log_exports, exporters, cluster, oidc, alerts, audit, secrets, guardrails) | not in Bifrost (several correspond to Bifrost sections above) | done (Raiju-only) | `config.tov` Config type. Bifrost configs that use the Bifrost names for these will not load into the Raiju fields. |
+| vector_store | config.schema.json vector_store | partial | Types qdrant, redis, weaviate, pinecone and chromem are mapped (`config_compat.tov` mapVectorStore; G30). Bifrost's connection-pool, timeout, gRPC and TLS fields are reported as ignored. A type outside this list is dropped, and the semantic cache keeps entries in memory. |
+| config_store (sqlite, postgres) | config.schema.json config_store | partial | Raiju saves its config as a JSON file (the file given by `-config`), with a `.bak` (`store.tov`). `config_store` is reported as not used. sqlite and postgres are missing. |
+| logs_store.* | config.schema.json logs_store | partial | Raiju's own block: enabled, dir, retention_days, max_memory_entries, content_logging (`config.tov` LogsStoreConfig; `logstore.tov` prunes by retention_days). Bifrost's `type` (sqlite, postgres, clickhouse) and `config` are not used. Log sinks are configured as plugins or Raiju's `log_exports` and `exporters` (see plugins[]). |
+| skills_registry | config.schema.json skills_registry | out-of-scope | The skills marketplace is in SCOPE.md Out (L88). Reported as ignored. |
+| plugins[] | config.schema.json plugins | partial | Mapped by `config_compat.tov` mapPlugins: otel, logging, telemetry, governance, routing, compat, prompts, semantic_cache (or semanticcache), and the sink plugins bigquery, pubsub, kafka and maxim (`mapSinkPlugin`, which turns them into exporters). Other names are reported as unknown and not loaded. |
+| websocket | config.schema.json websocket | missing | Reported as accepted but not applied: Raiju's WebSocket limits are fixed in `src/ws.tov`. L101/L102 in flight: the multi-worker live registry and /ws (L102) change this row when it merges. |
+| guardrails_config | config.schema.json guardrails_config | done | `guardrails_compat.tov`; `main.tov` withBifrostGuardrails (commit 0c999ff). L101/L102 in flight: the secrets engine (L101: capture groups, entropy filter, allowlists and generic-api-key) changes this row when it merges. The full Gitleaks set is in place from L93. |
+| audit_logs | config.schema.json audit_logs | partial | Read as `audit` (`config_compat.tov` mapAudit). retention_days, omit_ip_addresses, archive_interval, archive_grace_period, archive_max_object_bytes and object_storage are reported as ignored. |
+| cluster_config | config.schema.json cluster_config | partial | Read as `cluster` (`config_compat.tov` mapCluster). `type: broker` is supported as Raiju's HTTP relay (`-mode broker`, L94), not Bifrost's gRPC relay. Discovery and leader election are in (L87, L92, L94). region, gossip and grpc are reported as ignored. |
+| load_balancer_config | config.schema.json load_balancer_config | partial | Mapped into `health.adaptive` (`config_compat.tov` mapHealth). tracker_config, bootstrap, direction_selection_enabled, append_fallbacks_to_pinned, reroute_failed_directions and prune_failed_fallbacks are reported as ignored. |
+| circuit_breaker_config | config.schema.json circuit_breaker_config | done | Mapped to `health.circuit_breaker` (`config_compat.tov` mapHealth). Breaker policies (`circuit_breaker_policies`, L91) are Raiju's own. |
+| large_payload_optimization | config.schema.json large_payload_optimization | missing | Reported as not implemented: Raiju buffers request bodies up to `client.max_request_body_size_mb`. P2. |
+| scim_config | config.schema.json scim_config | out-of-scope | SCIM is in SCOPE.md Out. |
+| access_profiles (top-level) | config.schema.json access_profiles | missing | Reported as not read. Raiju reads `governance.access_profiles`, in its own shape (see c4). P2. |
+| feature_flags | config.schema.json feature_flags | done | `config.tov` FeatureFlagsConfig, boot-time overrides of the flags in `flags.tov` (L88). |
+| proxy_config (global outbound proxy) | config.schema.json proxy_config | done | `config.tov` GlobalProxyConfig; GET and PUT on `/api/proxy-config`. Used by a provider with no proxy of its own when `enable_for_inference` is set. Bifrost's schema allows only type `http`; other types give no proxy. Startup warning bug: see LIMITS. |
+| framework.pricing (pricing_url, pricing_sync_interval) | config.schema.json framework; framework/modelcatalog/config.go:109 (default URL) | partial | `pricing_url` and `pricing_sync_interval` become `pricing_sync` (`config_compat.tov` mapPricing). Sync runs only when a pricing section is set. model_parameters_url, mcp_library_url, mcp_library_sync_interval and live_models_sync_interval are reported as ignored. |
+| Raiju-only top-level keys (cache, prompt_cache, health, pricing, otel, semantic_cache, session_affinity, complexity_router, mcp_server, virtual_mcps, log_exports, exporters, cluster, oidc, alerts, audit, secrets, guardrails, circuit_breaker_policies, prompt_repo, auth_proxy) | not in Bifrost (several correspond to Bifrost sections above) | done (Raiju-only) | `config.tov` Config type. Bifrost configs that use the Bifrost names for these will not load into the Raiju fields. |
 
 ### c2. client.*
 
-Bifrost: `transports/config.schema.json` `$defs/client` (and `client.*` properties).
+Bifrost: `transports/config.schema.json` `$defs/client` (and `client.*` properties). Raiju: `ClientConfig` in `src/config.tov`, the mapping in `src/config_compat.tov` (`mapClient`, `mapGovernancePlugin`, `mapLogging`), and the consumers named below.
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| allowed_origins | client.allowed_origins | done | `server.tov:148-157`. |
-| enable_logging | client.enable_logging | done | `gateway.tov:448`. |
-| enforce_governance_header | client.enforce_governance_header | partial | `governance.tov:85`. Gates the VK requirement, default false. |
-| enforce_auth_on_inference | client.enforce_auth_on_inference | done | Read as the gate (`governance.tov:120-121`, commit 32da2e6). When unset, it is on when any credentials exist. |
-| required_headers | client.required_headers | done | `governance.tov:86`. |
-| max_request_body_size_mb | client.max_request_body_size_mb | done | `main.go:88`. |
-| async_job_result_ttl | client.async_job_result_ttl | done | `gateway.tov:400`. |
-| mcp_agent_depth | client.mcp_agent_depth | done | `gateway.tov:457`. |
-| mcp_tool_execution_timeout | client.mcp_tool_execution_timeout | partial | Raiju has `mcp.tool_execution_timeout_seconds` (`config.tov` McpConfig). |
-| mcp_tool_sync_interval | client.mcp_tool_sync_interval | missing | P2. Raiju has no periodic tool re-sync. |
-| mcp_auto_execute | not in Bifrost (Bifrost: per-client tools_to_auto_execute) | done (Raiju-only) | `gateway.tov:456`. |
-| disable_content_logging | client.disable_content_logging | done | `gateway.tov:1503-1504` (commit 12757de). |
-| prometheus_labels | client.prometheus_labels | done | `metrics.tov:319-349` (commit cbd6ad3). |
-| drop_excess_requests | client.drop_excess_requests | partial | Parsed. A startup note says it does nothing, since there is no queue (`config_compat.tov`, commit cbd6ad3). |
-| allow_direct_keys | client.allow_direct_keys | done | `governance.tov:107-108`. Gates `x-bf-direct-key` (commit cbd6ad3). |
-| allowed_headers, header_filter_config, logging_headers, whitelisted_routes | client.* | missing | P2. |
-| compat | client.compat | missing | P2 (G37). |
-| extra_fields_placement | client.extra_fields_placement | missing | P2. |
-| dual_credential_conflict_behavior | client.dual_credential_conflict_behavior | missing | P2. |
-| hide_deleted_virtual_keys_in_filters, delete_expired_virtual_keys, vk_rotation_cooldown, enforce_vk_object_ownership, hidden_request_types | client.* | missing | P2. |
-| routing_chain_max_depth | client.routing_chain_max_depth | missing | P2. |
-| mcp_server_auth_mode, oauth2_server_config, mcp_external_client_url, a2a_external_client_url, skills_external_client_url | client.* | missing | P2. |
-| log_retention_days | client.log_retention_days | partial | Raiju has `logs_store.retention_days` (`logstore.tov`). P2. |
+| allowed_origins | client.allowed_origins | done | `server.tov` cors. |
+| enable_logging | client.enable_logging | done | `config.tov` ClientConfig; read in `gateway.tov`. |
+| enforce_governance_header | client.enforce_governance_header | partial | `governance.tov` govConfig. Gates the VK requirement, default false. |
+| enforce_auth_on_inference | client.enforce_auth_on_inference | done | Read as the gate (`governance.tov` govConfig, commit 32da2e6). When unset, it is on when any credentials exist. |
+| required_headers | client.required_headers | done | `governance.tov` govConfig. |
+| max_request_body_size_mb | client.max_request_body_size_mb | partial | `main.tov` passes it to the http1 server only (`startFront`, `maxBodyBytes`). The default bun server (`server.tov` start) does not take it, so Bun's own default limit applies. Finding in LIMITS. |
+| async_job_result_ttl | client.async_job_result_ttl | done | `server.tov` dispatch (the `/v1/async/*` TTL). The per-request header is missing (see b1). |
+| mcp_agent_depth | client.mcp_agent_depth | done | `gateway.tov` Engine constructor; `agent.tov` (the depth limit for the tool loop). |
+| mcp_tool_execution_timeout | client.mcp_tool_execution_timeout | partial | Mapped to `mcp.tool_execution_timeout_seconds` (`config_compat.tov` mapClient). That is a single global timeout; per-client timeouts are missing. |
+| mcp_tool_sync_interval | client.mcp_tool_sync_interval | missing | Reported as not implemented. Per-client `tool_sync_interval` is done (c5). P2. |
+| mcp_auto_execute | not in Bifrost (Bifrost: per-client tools_to_auto_execute) | done (Raiju-only) | `gateway.tov` withMcpTools and chat. Per-client `tools_to_auto_execute` is in c5. |
+| disable_content_logging | client.disable_content_logging | done | `gateway.tov` contentOff (commit 12757de). |
+| prometheus_labels | client.prometheus_labels | done | `metrics.tov` baseValues and customValues (commit cbd6ad3). |
+| drop_excess_requests | client.drop_excess_requests | partial | `gateway.tov` limitersFor: when a provider sets `concurrency_and_buffer_size`, a full queue is dropped (the limiter is created with `drop`). With no such provider, the startup note says it has no effect. |
+| allow_direct_keys | client.allow_direct_keys | done | `governance.tov` directKeyFrom (gates `x-bf-direct-key`, commit cbd6ad3). |
+| allow_per_request_raw_override | client.allow_per_request_raw_override | done | `gateway.tov` sendBackRaw. |
+| allow_per_request_content_storage_override | client.allow_per_request_content_storage_override | done | `gateway.tov` contentOff and storeRawOn. |
+| compat | client.compat | partial | Compat plugin (G37, L82, L100): `compat.tov` settingsOf and withHeader. Streamed-answer headers and native-decision model checks are open (L100). |
+| log_retention_days | client.log_retention_days | partial | Read as `logs_store.retention_days` (`config_compat.tov` mapClient), and only when a `logs_store` section exists. P2. |
+| refuse_unpriced_models | client.refuse_unpriced_models (not in Bifrost) | done (Raiju-only) | Owner switch (L95): budgeted requests to an unpriced model are refused with 403. Off by default. `gateway.tov` serveInner. |
+| scope_by_virtual_key | cache.scope_by_virtual_key (not in Bifrost) | done (Raiju-only) | Owner switch (L95): the exact-match cache is scoped per virtual key. Off by default. `gateway.tov` serveInner. |
+| mcp_disable_auto_tool_inject | not in Bifrost | done (Raiju-only) | `gateway.tov` withMcpTools: MCP tools are added to a chat request only when it names its clients (`x-bf-mcp-include-clients`). |
+| extra_fields_placement | client.extra_fields_placement | missing | Reported as not implemented. Body only (see b2). P2. |
+| dual_credential_conflict_behavior | client.dual_credential_conflict_behavior | missing | Reported as not implemented. P2. |
+| allowed_headers, header_filter_config, logging_headers, whitelisted_routes | client.* | missing | Reported as not implemented. P2. |
+| hide_deleted_virtual_keys_in_filters, delete_expired_virtual_keys, vk_rotation_cooldown, enforce_vk_object_ownership, hidden_request_types | client.* | missing | Reported as not implemented. P2. |
+| routing_chain_max_depth | client.routing_chain_max_depth | missing | Reported as not implemented. P2. |
+| retain_content_in_object_storage, dump_errors_in_console_logs | client.* | missing | Reported as not implemented. Raiju has no object storage (the first). P2. |
+| webhook_config | client.webhook_config | partial | Deliveries are kept in memory (last 500, `webhooks.tov`). The setting is reported as not implemented. P2. |
+| mcp_server_auth_mode, mcp_enable_temp_token_auth, mcp_oauth_private_allowlist, oauth2_server_config | client.* | missing | Reported as not implemented. Raiju's MCP OAuth flow is client-side (L91). P2. |
+| mcp_external_client_url, skills_external_client_url | client.* | out-of-scope | The skills marketplace is in SCOPE.md Out (L88). MCP external URLs are reported as not implemented. |
+| a2a_external_client_url, a2a_store_raw_request_response | client.* | out-of-scope | A2A agent gateway is in SCOPE.md Out (L88). |
+| mcp_code_mode_binding_level, mcp_code_mode_limits | client.* | out-of-scope | MCP code mode is in SCOPE.md Out. Reported as not implemented. |
 | initial_pool_size | client.initial_pool_size | n/a | Go connection-pool setting. |
-| enforce_scim_auth | client.enforce_scim_auth | out-of-scope | SCIM. |
+| disable_db_pings_in_health | client.disable_db_pings_in_health | n/a | Raiju has no database. |
+| enforce_scim_auth | client.enforce_scim_auth | out-of-scope | SCIM (SCOPE.md Out). |
 
 ### c3. providers.*
 
-Bifrost: `$defs/provider`, `base_key`, `network_config`, `custom_provider_config`, `proxy_config`, `azure_key`, `bedrock_key`, `vertex_key`, `prompt_cache`. Raiju: `src/config.tov` (`KeyConfig`, `NetworkConfig`, `ProxyConfig`, `CustomProviderConfig`, `ProviderConfig`).
+Bifrost: `$defs/provider`, `base_key`, `network_config`, `custom_provider_config`, `proxy_config`, `azure_key`, `bedrock_key`, `vertex_key`, `openai_config`, `prompt_cache`. Raiju: `src/config.tov` (`KeyConfig`, `NetworkConfig`, `ProxyConfig`, `CustomProviderConfig`, `ProviderConfig`) and `src/config_compat.tov` (`providerChildKeys`, `keyChildKeys`).
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| keys[]: name, value, models, weight, aliases | base_key | done | `config.tov` KeyConfig; `router.tov`. |
-| keys[].use_for_batch_api | base_key | missing | P2. |
-| keys[].oauth_key_config | base_key | missing | P2. |
+| keys[]: name, value, models, weight, aliases | base_key | done | `config.tov` KeyConfig; `router.tov` pickKey. |
+| keys[].use_for_batch_api | base_key | partial | Read but not applied: batch routes do not check it (`config_compat.tov` noteTable). P2. |
+| keys[].oauth_key_config | base_key | missing | Reported as not implemented. P2. |
 | keys[].azure_key_config (endpoint, deployments, api_version) | azure_key | done | `config.tov` AzureKeyConfig. |
-| Azure Entra ID: client_id, client_secret, tenant_id, scopes | azure_key (docs/providers/supported-providers/azure.mdx) | done | `config.tov`, `cloud_auth.tov`. Client credentials, tokens cached (commit 6aeb7f2). |
-| bedrock_key_config (access key, secret key, session token, region, deployments) | bedrock_key | partial | `config.tov` BedrockKeyConfig. |
-| Bedrock: role_arn, external_id, session_name, arn, batch role and S3, use_openai_endpoints | bedrock_key | partial | role_arn, external_id and session_name assume a role through STS (`config.tov:467-471`, commit 6aeb7f2). Inference-profile arn, batch role and S3, and use_openai_endpoints are missing. |
+| Azure Entra ID: client_id, client_secret, tenant_id, scopes | azure_key (docs/providers/supported-providers/azure.mdx) | done | `config.tov`; `cloud_auth.tov`. Client credentials, tokens cached (commit 6aeb7f2). |
+| bedrock_key_config (access key, secret key, session token, region, deployments) | bedrock_key | done | `config.tov` BedrockKeyConfig. Mantle keys (`bedrock_mantle_key_config`) are read too (2c31e06). |
+| Bedrock: role_arn, external_id, session_name | bedrock_key | done | Assumed through STS (`config.tov`, commit 6aeb7f2). |
+| Bedrock: inference-profile arn, use_openai_endpoints | bedrock_key | done | `config.tov` BedrockKeyConfig; `providers/bedrock.tov` (the arn joins the model in the URL path; use_openai_endpoints selects OpenAI and xAI endpoints) (commit 2c31e06). |
+| Bedrock: batch role and S3 | bedrock_key | done | `media.tov` batch_role; batches and files over S3 (commit e572dc3). |
 | vertex_key_config (project_id, region, auth_credentials) | vertex_key | partial | `config.tov` VertexKeyConfig. No aws_workload_identity, service_account_email, audience or token_lifetime. |
 | watsonx_key_config | not in Bifrost | done (Raiju-only) | `config.tov`. |
 | network_config: base_url, extra_headers, default_request_timeout_in_seconds, max_retries, retry_backoff_initial, retry_backoff_max | network_config | done | `config.tov` NetworkConfig; `router.tov`. |
-| network_config: insecure_skip_verify, ca_cert_pem | network_config | done | `providers/types.tov:37-43` (commit b66cf96). |
-| network_config: enforce_http2, http2_ping_interval, keep_alive_timeout, max_conns_per_host, stream_idle_timeout, beta_header_overrides, allow_private_network | network_config | missing | P2. |
-| concurrency_and_buffer_size | provider.concurrency_and_buffer_size | missing | P2. |
-| proxy_config (provider): http with credentials | proxy_config | done | `config.tov` ProxyConfig; `providers/types.tov`. SOCKS5 and environment types are missing (Tov fetch is HTTP only; `SCOPE.md`). |
-| send_back_raw_request, send_back_raw_response, store_raw_request_response | provider.* | partial | Both send-back keys work per provider (`gateway.tov:404-412`, commit cbd6ad3). store_raw_request_response is missing. |
-| ignore_provider_cost | provider.ignore_provider_cost | missing | P2. |
-| injected_tools | provider.injected_tools | missing | P2. |
+| network_config: insecure_skip_verify, ca_cert_pem | network_config | done | `providers/types.tov` tlsOf (commit b66cf96). |
+| network_config: enforce_http2, http2_ping_interval, keep_alive_timeout, max_conns_per_host, stream_idle_timeout, beta_header_overrides, allow_private_network | network_config | missing | Reported as not implemented. P2. |
+| concurrency_and_buffer_size | provider.concurrency_and_buffer_size | done | `gateway.tov` limitersFor; `limiter.tov` (per-provider concurrency and queue). |
+| proxy_config (provider): http with credentials and ca_cert_pem | proxy_config | done | `config.tov` ProxyConfig; `providers/types.tov`. Bifrost's schema allows only type `http`. Other types give no proxy (`proxyOf`). |
+| send_back_raw_request, send_back_raw_response | provider.* | done | `gateway.tov` sendBackRaw (commit cbd6ad3). |
+| store_raw_request_response | provider.store_raw_request_response | done | `gateway.tov` storeRawOn; overridden per request when `client.allow_per_request_content_storage_override` is on. |
+| ignore_provider_cost | provider.ignore_provider_cost | missing | Accepted but has no effect: Raiju always prices from its own table (`config_compat.tov` noteTable). P2. |
+| injected_tools | provider.injected_tools | done | `gateway.tov` injectedNames and injectedDef: the provider's MCP tools join each chat request it serves. Needs MCP clients (startup note). |
 | custom_provider_config.base_provider_type, is_key_less | custom_provider_config | done | `config.tov`; `router.tov` kindOf. |
-| custom_provider_config: allowed_requests, request_path_overrides, does_not_send_done_marker, wait_for_usage, TLS | custom_provider_config | missing | P2. |
-| openai_config.disable_store | provider.openai_config | missing | P2. |
-| prompt_cache (provider): auto_inject, ttl, cache_control_injection_points | provider.prompt_cache | partial | Raiju has a top-level `prompt_cache.auto_inject` only (`config.tov` PromptCacheConfig). |
+| custom_provider_config: request_path_overrides | custom_provider_config | done | `providers/openai.tov` pathOverride. |
+| custom_provider_config: allowed_requests | custom_provider_config | done | `gateway.tov` allowedRequest; a fallback takes a request type the provider does not allow. |
+| custom_provider_config: does_not_send_done_marker, wait_for_usage | custom_provider_config | done | `gateway.tov` (the stream ends at finish_reason when `does_not_send_done_marker` is set without `wait_for_usage`). |
+| openai_config.disable_store | provider.openai_config | done | `providers/openai.tov` (store is forced to false when set). |
+| prompt_cache (provider): auto_inject, ttl, cache_control_injection_points | provider.prompt_cache | partial | Raiju has a top-level `prompt_cache.auto_inject` (`config.tov` PromptCacheConfig). Provider-level ttl and cache_control_injection_points are read but not applied (`config_compat.tov` noteTable). |
 
 ### c4. governance.*
 
-Bifrost: `config.schema.json` governance properties. Raiju: `GovernanceConfig` in `config.tov`.
+Bifrost: `config.schema.json` governance properties. Raiju: `GovernanceConfig` in `src/config.tov`, consumed by `src/governance.tov` and `src/store.tov`.
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| budgets, rate_limits, customers, teams, virtual_keys, routing_rules | governance.* | partial | Core fields done. VK `mcp_configs` and business-unit or project fields are missing. |
+| budgets, rate_limits, customers, teams, virtual_keys, routing_rules | governance.* | partial | Core fields done. VK `mcp_configs` (per-key MCP tool lists, `virtual_key_mcp_config`) is not read; Raiju's top-level `virtual_mcps` is a different shape. |
 | governance.auth_config | governance.auth_config | done | `config.tov` AdminAuthConfig. |
-| business_units, projects, roles | governance.* | missing | P2. |
-| pricing_overrides | governance.pricing_overrides | done | `store.tov` `pricingRoute`, config `governance.pricing_overrides` (commit 31f4aaa). |
-| model_configs | governance.model_configs | done | `store.tov` `modelConfigRoute` (commit 31f4aaa). |
-| providers (provider-level governance) | governance.providers | done | `store.tov` `providerGovRoute` (commit 31f4aaa). |
-| complexity_analyzer_config | governance.complexity_analyzer_config | partial | Raiju has top-level `complexity_router`. |
+| business_units, projects, roles | governance.* | partial | Business units and projects are done, with x-bf-project-id and x-bf-customer-id (L84). Custom roles are in the management API. Open: project members API, split policies, entity_dac overrides and Bifrost's role-id API shape (L84). |
+| access_profiles (governance) | not in Bifrost's governance schema (top-level access_profiles, see c1) | done (Raiju-only) | `profiles.tov` applyProfiles, validateProfile. Raiju's own shape. |
+| pricing_overrides | governance.pricing_overrides | done | `store.tov` pricingRoute; config `governance.pricing_overrides` (commit 31f4aaa). |
+| model_configs | governance.model_configs | done | `store.tov` modelConfigRoute (commit 31f4aaa). |
+| providers (provider-level governance) | governance.providers | done | `store.tov` providerGovRoute (commit 31f4aaa). |
+| complexity_analyzer_config | governance.complexity_analyzer_config | partial | Raiju has top-level `complexity_router` (`config_compat.tov` mapComplexityAnalyzer). The governance path is reported as not read. |
 
 ### c5. mcp.*
 
-Bifrost: `config.schema.json` `mcp` and `$defs/mcp_client_config`. Raiju: `src/mcp.tov` (`McpClientConfig`, `McpConfig`).
+Bifrost: `config.schema.json` `mcp` and `$defs/mcp_client_config`. Raiju: `src/mcp.tov` (`McpClientConfig`, `McpConfig`), `src/mcpapi.tov` (management routes), `src/mcpauth.tov` (auth).
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| client_configs[]: name, connection_type (stdio, http, sse), connection_string, headers, stdio_config, tools_to_execute | mcp_client_config | done | `mcp.tov:12-23`. |
-| connection_type inprocess, openapi | mcp_client_config.connection_type | missing | P2. |
-| auth_type: none, headers, oauth | mcp_client_config.auth_type | done | `mcpauth.tov`. |
-| auth_type: per_user_oauth, per_user_headers, token_exchange | mcp_client_config.auth_type | missing | P2. |
-| tools_to_auto_execute (per client) | mcp_client_config | partial | Raiju has a global `client.mcp_auto_execute` (`gateway.tov:456`). |
-| endpoint_slug, allow_by_default, allow_on_all_virtual_keys, disabled, is_ping_available, needs_session_stickiness | mcp_client_config | partial | Read by the management API (`mcpapi.tov`, commit 5c2c8af). is_ping_available and needs_session_stickiness are missing. |
-| require_public_target (SSRF guard), tls_config, allowed_extra_headers, tool_pricing, tool_execution_timeout, tool_sync_interval | mcp_client_config | missing | P2. No SSRF guard in `mcp.tov`. |
-| mcp.tool_groups | mcp.tool_groups | missing | P2. |
-| mcp.tool_manager_config | mcp.tool_manager_config | missing | P2. |
-| mcp.virtual_mcps | mcp.virtual_mcps | done | `config_compat.tov:234-260`, read as top-level `virtual_mcps` (commit 0c999ff). |
-| mcp.tool_sync_interval | mcp.tool_sync_interval | missing | P2. |
+| client_configs[]: name, connection_type (http, sse, stdio), connection_string, headers, stdio_config, tools_to_execute | mcp_client_config | done | `mcp.tov` McpClientConfig; `mcpapi.tov` validates connection_type. |
+| connection_type inprocess, openapi | mcp_client_config.connection_type | missing | P2. Raiju accepts http, sse and stdio only. |
+| openapi_config | mcp_client_config | missing | P2. |
+| auth_type: none, headers, oauth | mcp_client_config.auth_type | done | `mcpauth.tov`. oauth is the authorization-code flow with PKCE, dynamic registration and `client_id` (L91). |
+| auth_type: per_user_oauth, per_user_headers, token_exchange; per_user_header_keys | mcp_client_config.auth_type | missing | Routes refuse with Bifrost's messages (`mcpapi.tov` verifyRoute). L91 open for per_user_*. P2. |
+| tools_to_auto_execute (per client) | mcp_client_config | done | `mcp.tov` (per-client list; `*` for all). Global `client.mcp_auto_execute` is Raiju-only (c2). |
+| tools_to_execute | mcp_client_config | done | `mcp.tov` McpClientConfig. |
+| endpoint_slug, allow_by_default, allow_on_all_virtual_keys, disabled | mcp_client_config | done | `mcpapi.tov` (CLIENT_KINDS; management API); allow_by_default from L76. |
+| is_ping_available, needs_session_stickiness | mcp_client_config | missing | Not read. P2. |
+| require_public_target (SSRF guard) | mcp_client_config | missing | No SSRF guard in `mcp.tov`. P2. |
+| tls_config | mcp_client_config | done | `mcp.tov` McpTlsConfig. |
+| allowed_extra_headers | mcp_client_config | missing | P2. |
+| tool_pricing | mcp_client_config | missing | P2. |
+| tool_execution_timeout (per client) | mcp_client_config | partial | Only the global `mcp.tool_execution_timeout_seconds` is read. P2. |
+| tool_sync_interval (per client) | mcp_client_config | done | `mcp.tov` refresh timers, one per client (G22, L76). |
+| max_instructions_length, is_code_mode_client | mcp_client_config | out-of-scope | MCP code mode is in SCOPE.md Out. |
+| mcp.tool_groups | mcp.tool_groups | partial | Read as the deprecated name of `virtual_mcps` (`config_compat.tov` mapMcp). Bifrost's tool_manager and group semantics are not implemented. |
+| mcp.tool_manager_config | mcp.tool_manager_config | missing | Reported as not implemented. P2. |
+| mcp.virtual_mcps | mcp.virtual_mcps | done | `config_compat.tov` mapMcp; read as top-level `virtual_mcps` (commit 0c999ff). |
+| mcp.tool_sync_interval (global) | mcp.tool_sync_interval | partial | The per-client interval is done (above). The global setting is reported as not implemented. P2. |
 
 ## (d) Providers
 
