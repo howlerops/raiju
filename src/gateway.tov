@@ -12,6 +12,8 @@ import { StreamState } from "./providers/anthropic_in"
 import { AffinityStore, resolveSticky, sessionId, sessionTtl, affinityMode } from "./affinity"
 import { Tier, tierTarget, overrideTier } from "./complexity"
 import * as cplx from "./complexity"
+import { parseDecision } from "./decisions"
+import * as typesafe from "./providers/typesafe"
 import { AgentConfig, runAgent } from "./agent"
 import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
@@ -991,6 +993,44 @@ export class Engine {
     }
   }
 
+  // The complexity tier of a chat request: the configured classifier's, or the heuristic's when the
+  // classifier names none (no decision model, no embedding, a timeout, or an unparseable answer).
+  async tierFor(req: Request, text: string, cx: ComplexitySettings): Promise<Tier> {
+    const mode = cplx.classifierMode(cx.classifier)
+    if (mode === "heuristic") return this.tierOf(text, cx)
+    let t: Tier | undefined = undefined
+    if (mode === "decision") t = await cplx.decisionTier(text, cx.decision, async (b: string) => await this.classifierCall(req, "/v1/decisions", b))
+    else if (mode === "llm") t = await cplx.llmTier(text, cx.llm, async (b: string) => await this.classifierCall(req, "/v1/chat/completions", b))
+    else t = await cplx.semanticTier(text, cx.semantic, async (b: string) => await this.classifierCall(req, "/v1/embeddings", b))
+    return t ?? this.tierOf(text, cx)
+  }
+
+  // A classifier's own call, answered by the route it names with the caller's headers. The chat
+  // call is marked with a forced tier, so it is not classified in turn. undefined when it fails.
+  async classifierCall(req: Request, route: string, body: string): Promise<string | undefined> {
+    try {
+      const hs: Record<string, string> = snapshot(req.headers)
+      hs.set("x-bf-complexity-tier", "MEDIUM")
+      const inner = new Request("http://raiju.internal" + route, { method: "POST", headers: hs, body: body })
+      let res: Response = new Response(undefined, { status: 500 })
+      if (route === "/v1/decisions") {
+        const d = try parseDecision(body)
+        const build: Build = (t) => try typesafe.systemoneUpstream(t, d)
+        const tr: Translate = (t, out, requested) => try typesafe.translateDecision(out, d, requested)
+        res = try await this.serve(inner, "decisions", undefined, try fields(body), body, build, tr, false)
+      } else if (route === "/v1/embeddings") {
+        res = try await this.embeddings(inner)
+      } else {
+        res = try await this.chat(inner)
+      }
+      const out = try await res.text()
+      if (res.status !== 200) return undefined
+      return out
+    } catch (e) {
+      return undefined
+    }
+  }
+
   // Tries each model in order; within one, retries transient failures with
   // backoff and moves to another key on credential errors.
   async attempt(refs: ModelRef[], h: Hdrs, build: Build, translate: Translate, streamed: bool, ctx: ReqCtx): Promise<Outcome> {
@@ -1635,7 +1675,7 @@ export class Engine {
     const cx = this.complexity
     if (cx !== undefined && op === "chat") {
       const forced = overrideTier(h)
-      const t: Tier = forced !== undefined ? forced : this.tierOf(text, cx)
+      const t: Tier = forced !== undefined ? forced : await this.tierFor(req, text, cx)
       tier = t
       out.set("x-bf-complexity-tier", t)
     }

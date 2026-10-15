@@ -1,0 +1,302 @@
+// Bifrost's decision API (POST /v1/decisions). The request is read here into a provider-neutral
+// form: questions with their names settled, the input as the state a provider reads, and the
+// options as raw JSON so descriptions and instructions reach the provider untouched. Providers
+// convert that form to their own wire shape (providers/typesafe.tov), and the answers come back
+// in the canonical response rendered here.
+import { Field, fields, elements, find, rawStr, decodeString, quote } from "./json"
+
+// A choice option. desc is raw JSON: "null" when sent as null or absent.
+export type Choice = { key: string, bool: bool, desc: string }
+
+// A score level. desc is raw JSON: "null" when sent as null or absent.
+export type Level = { label: string, desc: string }
+
+export type Question = {
+  type: string, // predicate, choice or score
+  name: string, // the name answers carry; question_<position> when the request gave none
+  named: bool,
+  instructions: string, // raw JSON; "null" when absent
+  trueSide: string, // predicate criteria, raw JSON; "" when not sent
+  falseSide: string,
+  choices: Choice[],
+  levels: Level[],
+}
+
+// The decision as Raiju reads it. model is as sent ("typesafe/jev-latest"); state is the input as
+// the provider reads it (a string, an object, or null), raw JSON.
+// extra holds the top-level fields the request does not model (a provider's native extensions, such as a
+// Laya min_confidence). They reach the provider merged onto its body, as Bifrost forwards them.
+export type DecisionReq = { model: string, state: string, questions: Question[], extra?: Field[] }
+
+const TYPES: string[] = ["predicate", "choice", "score"]
+const MAX_CHOICES = 255
+// Top-level fields of the decision route that are not forwarded as extensions: its own fields, and
+// Bifrost's routing field (fallbacks), which is never sent upstream.
+const ROUTE_FIELDS: string[] = ["model", "input", "questions", "safety_identifier", "fallbacks"]
+
+// A raw JSON value a decision may carry where a string, object, array or null is allowed.
+function textLike(raw: string): bool {
+  return raw === "null" || raw.startsWith("\"") || raw.startsWith("{") || raw.startsWith("[")
+}
+
+// The text of a message content: a string, or an array of parts. Only input_text parts can be
+// read by a text provider; any other part is refused, so a fallback can serve the request.
+function contentText(raw: string | undefined): string throws SyntaxError {
+  if (raw === undefined || raw === "null") return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (!raw.startsWith("[")) throw new SyntaxError("decision message content must be a string or an array of parts")
+  const parts: string[] = []
+  for (const el of try elements(raw)) {
+    const pf = try fields(el)
+    const type = rawStr(pf, "type") ?? ""
+    if (type === "") throw new SyntaxError(`decision input carries an "untyped" part, which this provider cannot read; route the request to a provider that accepts it`)
+    if (type !== "input_text") throw new SyntaxError(`decision input carries an "${type}" part, which this provider cannot read; route the request to a provider that accepts it`)
+    parts.push(rawStr(pf, "text") ?? "")
+  }
+  return parts.join("\n")
+}
+
+// The input as the state a provider reads. A messages array becomes an array of {role, content}
+// with its text parts joined.
+export function stateOf(raw: string | undefined): string throws SyntaxError {
+  if (raw === undefined || raw === "null") return "null"
+  if (raw.startsWith("\"") || raw.startsWith("{")) return raw
+  if (!raw.startsWith("[")) throw new SyntaxError("decision input must be a string, an array of messages, or an object")
+  const msgs: string[] = []
+  for (const el of try elements(raw)) {
+    const mf = try fields(el)
+    const role = rawStr(mf, "role") ?? ""
+    const content = try contentText(find(mf, "content"))
+    msgs.push(`{"role":${quote(role)},"content":${quote(content)}}`)
+  }
+  return "[" + msgs.join(",") + "]"
+}
+
+// The name each question answers under, as Bifrost settles them: the name as sent, or
+// question_<position> (suffixed while taken). A name sent twice is an error.
+export function nameQuestions(sent: (string | undefined)[]): string[] throws SyntaxError {
+  const taken: string[] = []
+  for (const n of sent) {
+    if (n === undefined) continue
+    if (taken.includes(n)) throw new SyntaxError(`question name "${n}" is used more than once`)
+    taken.push(n)
+  }
+  const out: string[] = []
+  for (let i = 0; i < sent.length; i++) {
+    const n = sent[i]
+    if (n !== undefined) {
+      out.push(n)
+      continue
+    }
+    let cand = `question_${i + 1}`
+    for (let s = 2; taken.includes(cand); s++) {
+      cand = `question_${i + 1}_${s}`
+    }
+    taken.push(cand)
+    out.push(cand)
+  }
+  return out
+}
+
+function parseChoices(f: Field[], i: number): Choice[] throws SyntaxError {
+  const list = find(f, "choices")
+  if (list === undefined || !list.startsWith("[")) throw new SyntaxError(`question ${i + 1} has kind choice and requires choices`)
+  const out: Choice[] = []
+  for (const el of try elements(list)) {
+    const cf = try fields(el)
+    const value = find(cf, "value") ?? ""
+    let key = ""
+    let isBool = false
+    if (value.startsWith("\"")) {
+      key = try decodeString(value)
+    } else if (value === "true" || value === "false") {
+      key = value
+      isBool = true
+    } else {
+      throw new SyntaxError(`question ${i + 1} choice value must be a string or a boolean`)
+    }
+    if (out.some((c) => c.key === key)) throw new SyntaxError(`question ${i + 1} has more than one choice "${key}"`)
+    const desc = find(cf, "description") ?? "null"
+    if (!textLike(desc)) throw new SyntaxError(`question ${i + 1} choice description must be a string, object, or array`)
+    out.push({ key: key, bool: isBool, desc: desc })
+  }
+  if (out.length === 0) throw new SyntaxError(`question ${i + 1} has kind choice and requires choices`)
+  if (out.length > MAX_CHOICES) throw new SyntaxError(`question ${i + 1} has ${out.length} choices; at most ${MAX_CHOICES} are allowed`)
+  return out
+}
+
+function parseLevels(f: Field[], i: number): Level[] throws SyntaxError {
+  const list = find(f, "levels")
+  if (list === undefined || !list.startsWith("[")) throw new SyntaxError(`question ${i + 1} has kind score and requires levels`)
+  const out: Level[] = []
+  for (const el of try elements(list)) {
+    const lf = try fields(el)
+    const desc = find(lf, "description") ?? "null"
+    if (!textLike(desc)) throw new SyntaxError(`question ${i + 1} level description must be a string, object, or array`)
+    out.push({ label: rawStr(lf, "label") ?? `${out.length}`, desc: desc })
+  }
+  if (out.length === 0) throw new SyntaxError(`question ${i + 1} has kind score and requires levels`)
+  return out
+}
+
+// One question, read from its raw JSON. Its name is settled later, with the others.
+function parseQuestion(raw: string, i: number): Question throws SyntaxError {
+  const f = try fields(raw)
+  const type = rawStr(f, "type") ?? ""
+  if (!TYPES.includes(type)) throw new SyntaxError(`question ${i + 1} has unsupported type "${type}"; expected predicate, choice, or score`)
+  const sent = rawStr(f, "name")
+  const instructions = find(f, "instructions") ?? "null"
+  if (!textLike(instructions)) throw new SyntaxError(`question ${i + 1} instructions must be a string, object, or array`)
+  const q: Question = { type: type, name: sent ?? "", named: sent !== undefined, instructions: instructions, trueSide: "", falseSide: "", choices: [], levels: [] }
+  if (type === "predicate") {
+    const crit = find(f, "criteria")
+    if (crit !== undefined && crit !== "null") {
+      for (const side of try fields(crit)) {
+        if (side.key !== "true" && side.key !== "false") throw new SyntaxError(`question ${i + 1} predicate criteria allow only "true" and "false" keys, got "${side.key}"`)
+        if (!textLike(side.raw)) throw new SyntaxError(`question ${i + 1} criteria "${side.key}" must be a string, object, or array`)
+        if (side.key === "true") q.trueSide = side.raw
+        else q.falseSide = side.raw
+      }
+    }
+  } else if (type === "choice") {
+    q.choices = try parseChoices(f, i)
+  } else {
+    q.levels = try parseLevels(f, i)
+  }
+  return q
+}
+
+// A decision request body, in canonical form. Throws SyntaxError with the message to return as a 400.
+export function parseDecision(text: string): DecisionReq throws SyntaxError {
+  const top = try fields(text)
+  const model = rawStr(top, "model") ?? ""
+  if (model === "") throw new SyntaxError("model is required")
+  const state = try stateOf(find(top, "input"))
+  const list = find(top, "questions")
+  if (list === undefined || !list.startsWith("[")) throw new SyntaxError("questions must be a list")
+  const raws = try elements(list)
+  if (raws.length === 0) throw new SyntaxError("questions not provided for decision request")
+  const qs: Question[] = []
+  for (let i = 0; i < raws.length; i++) {
+    qs.push(try parseQuestion(raws[i]!, i))
+  }
+  const names = try nameQuestions(qs.map((q) => (q.named ? q.name : undefined)))
+  for (let i = 0; i < qs.length; i++) {
+    qs[i]!.name = names[i]!
+  }
+  const extra: Field[] = top.filter((f) => !ROUTE_FIELDS.includes(f.key))
+  return { model: model, state: state, questions: qs, extra: extra }
+}
+
+// One canonical answer. value is the raw JSON of the answer itself (a probability, a choice or a
+// score); probs and confidence are raw JSON or "".
+export function answerJson(q: Question, value: string, probs: string, confidence: string): string {
+  const parts: string[] = [`"type":"${q.type}"`]
+  if (q.named) parts.push(`"name":${quote(q.name)}`)
+  const key = q.type === "predicate" ? "probability" : q.type
+  parts.push(`"${key}":${value}`)
+  if (probs !== "") parts.push(`"probabilities":${probs}`)
+  if (confidence !== "") parts.push(`"confidence":${confidence}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// The canonical response: the answers in question order, usage, and the provider's routing report
+// (raw JSON, "" when none).
+export function renderResponse(model: string, answers: string[], prompt: int, completion: int, routing: string): string {
+  const parts: string[] = [
+    `"model":${quote(model)}`,
+    `"answers":[${answers.join(",")}]`,
+    `"usage":{"prompt_tokens":${prompt},"completion_tokens":${completion},"total_tokens":${prompt + completion}}`,
+  ]
+  if (routing !== "") parts.push(`"routing":${routing}`)
+  return "{" + parts.join(",") + "}"
+}
+
+test("a decision request is read into canonical form", () => {
+  const d = try parseDecision(`{"model":"typesafe/jev-latest","input":"hello","questions":[` +
+    `{"type":"predicate","name":"is_frustrated","instructions":"Is it?","criteria":{"true":"yes"}},` +
+    `{"type":"choice","instructions":"Pick","choices":[{"value":"billing","description":"money"},{"value":"bug"}]},` +
+    `{"type":"score","levels":[{"label":"0"},{"label":"1","description":"soon"}]}]}`)
+  expect(d.model).toBe("typesafe/jev-latest")
+  expect(d.state).toBe(`"hello"`)
+  expect(d.questions.length).toBe(3)
+  expect(d.questions[0]!.name).toBe("is_frustrated")
+  expect(d.questions[0]!.named).toBe(true)
+  expect(d.questions[0]!.trueSide).toBe(`"yes"`)
+  expect(d.questions[0]!.falseSide).toBe("")
+  expect(d.questions[1]!.name).toBe("question_2")
+  expect(d.questions[1]!.named).toBe(false)
+  expect(d.questions[1]!.choices[0]!.desc).toBe(`"money"`)
+  expect(d.questions[1]!.choices[1]!.desc).toBe("null")
+  expect(d.questions[2]!.levels[1]!.label).toBe("1")
+})
+
+test("fields the route does not model are kept as extensions", () => {
+  const d = try parseDecision(`{"model":"laya/english","input":"x","min_confidence":0.8,"fallbacks":["openai/gpt-4o"],"questions":[{"type":"predicate"}]}`)
+  const extra = d.extra ?? []
+  expect(extra.length).toBe(1)
+  expect(extra[0]!.key).toBe("min_confidence")
+  expect(extra[0]!.raw).toBe("0.8")
+})
+
+test("boolean choices keep their key and flag", () => {
+  const d = try parseDecision(`{"model":"m","input":null,"questions":[{"type":"choice","name":"ok","choices":[{"value":true},{"value":false}]}]}`)
+  expect(d.state).toBe("null")
+  expect(d.questions[0]!.choices[0]!.key).toBe("true")
+  expect(d.questions[0]!.choices[0]!.bool).toBe(true)
+  expect(d.questions[0]!.choices[1]!.key).toBe("false")
+})
+
+test("messages become role and content, and other parts are refused", () => {
+  const d = try parseDecision(`{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"a"},{"type":"input_text","text":"b"}]},{"role":"assistant","content":"c"}],"questions":[{"type":"predicate"}]}`)
+  expect(d.state).toBe(`[{"role":"user","content":"a\\nb"},{"role":"assistant","content":"c"}]`)
+  let msg = ""
+  try {
+    try parseDecision(`{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}],"questions":[{"type":"predicate"}]}`)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg.includes(`"input_image" part`)).toBe(true)
+})
+
+test("names: duplicates are refused, generated names avoid taken ones", () => {
+  const plain = try nameQuestions(["a", undefined, undefined])
+  expect(plain.join(",")).toBe("a,question_2,question_3")
+  const taken = try nameQuestions(["question_2", undefined])
+  expect(taken.join(",")).toBe("question_2,question_2_2")
+  let threw = false
+  try {
+    try nameQuestions(["a", "a"])
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("bad requests name their fault", () => {
+  const bad = [
+    `{"input":"x","questions":[{"type":"predicate"}]}`,
+    `{"model":"m","input":"x","questions":[]}`,
+    `{"model":"m","input":"x","questions":[{"type":"ranking"}]}`,
+    `{"model":"m","input":"x","questions":[{"type":"choice","choices":[]}]}`,
+    `{"model":"m","input":"x","questions":[{"type":"choice","choices":[{"value":1}]}]}`,
+    `{"model":"m","input":"x","questions":[{"type":"score"}]}`,
+    `{"model":"m","input":5,"questions":[{"type":"predicate"}]}`,
+    `{"model":"m","input":"x","questions":[{"type":"predicate","criteria":{"maybe":"x"}}]}`,
+  ]
+  for (const b of bad) {
+    let threw = false
+    try {
+      try parseDecision(b)
+    } catch (e) {
+      threw = true
+    }
+    expect(threw).toBe(true)
+  }
+})
+
+test("the canonical response renders answers and usage", () => {
+  const q: Question = { type: "predicate", name: "is_frustrated", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [] }
+  const body = renderResponse("jev-1.13.0", [answerJson(q, "0.75", "", "0.9")], 12, 3, "")
+  expect(body).toBe(`{"model":"jev-1.13.0","answers":[{"type":"predicate","name":"is_frustrated","probability":0.75,"confidence":0.9}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}`)
+})

@@ -919,7 +919,7 @@ function mapGovernancePlugin(f: Field[], pname: string, inout top: Field[], inou
 // Bifrost's routing plugin has no Raiju counterpart. Its chain depth and complexity analyzer
 // are noted. The analyzer's tier boundaries are on a 0 to 1 scale, and Raiju's complexity
 // router thresholds are on its own score scale, so they are not copied.
-function mapRouting(f: Field[], pname: string, inout notes: string[]): void throws SyntaxError {
+function mapRouting(f: Field[], pname: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
   if (offPlugin(f, pname, &notes)) return
   const path = `plugins[${pname}].config`
   const cf = try members(find(f, "config"))
@@ -927,8 +927,73 @@ function mapRouting(f: Field[], pname: string, inout notes: string[]): void thro
   ignored(path, cf, ["routing_chain_max_depth"], &notes)
   const ca = `${path}.complexity_analyzer_config`
   const af = try members(find(cf, "complexity_analyzer_config"))
-  ignored(ca, af, ["tier_boundaries", "keywords", "classifier", "semantic", "decision", "llm", "session"], &notes)
+  ignored(ca, af, ["tier_boundaries", "keywords", "semantic", "session"], &notes)
   if (find(af, "tier_boundaries") !== undefined) notes.push(`config: "${ca}.tier_boundaries" is not copied to "complexity_router": they are on a 0 to 1 scale, and Raiju's simple_max_score and complex_min_score are on its own score scale`)
+  try mapComplexityAnalyzer(af, ca, &top, &notes)
+}
+
+// A Bifrost duration as Raiju's milliseconds: a duration string ("1.5s"), or a number of
+// milliseconds. Raw JSON, or undefined when it is neither.
+function millisRaw(raw: string | undefined): string | undefined throws SyntaxError {
+  if (raw === undefined) return undefined
+  if (raw.startsWith("\"")) {
+    const secs = goSeconds(try decodeString(raw))
+    if (secs === undefined) return undefined
+    return `${Math.round(secs * 1000.0)}`
+  }
+  const n = parseFloat(raw) ?? -1.0
+  if (n < 0.0) return undefined
+  return raw
+}
+
+// The analyzer's classifier, decision model and LLM classifier, read into complexity_router. A decision classifier
+// takes the decision block; without one, an llm block is the classifier, since Bifrost uses it as the fallback of
+// the semantic classifier, which Raiju does not map. The semantic block and session retention are noted only.
+function mapComplexityAnalyzer(af: Field[], path: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  let classifier = ""
+  const craw = strRaw(af, "classifier")
+  if (craw !== undefined) classifier = try decodeString(craw)
+  if (classifier !== "" && classifier !== "decision") notes.push(`config: "${path}.classifier" is not supported by Raiju and is ignored`)
+  const decision = find(af, "decision")
+  const llm = find(af, "llm")
+  const useDecision = classifier === "decision" && decision !== undefined
+  const useLLM = !useDecision && llm !== undefined
+  if (decision !== undefined && !useDecision) notes.push(`config: "${path}.decision" is not used: Raiju reads it only when classifier is "decision"`)
+  if (!useDecision && !useLLM) return
+  if (find(top, "complexity_router") !== undefined) {
+    notes.push(`config: "${path}" is not copied: "complexity_router" is already set`)
+    return
+  }
+  let cr: Field[] = []
+  add(&cr, "enabled", "true")
+  if (useDecision) {
+    add(&cr, "classifier", quote("decision"))
+    const dm = try mappedModel(try members(decision), `${path}.decision`, true, &notes)
+    add(&cr, "decision", dm)
+  } else {
+    add(&cr, "classifier", quote("llm"))
+    const lm = try mappedModel(try members(llm), `${path}.llm`, false, &notes)
+    add(&cr, "llm", lm)
+  }
+  put(&top, "complexity_router", cr)
+  notes.push(`config: plugin "routing" complexity analyzer read into "complexity_router": classifier ${useDecision ? "decision" : "llm"}`)
+}
+
+// A decision or llm block as Raiju's: provider, model, timeout (ms), and the settings of that block. Criteria are
+// noted: Raiju uses its own tier definitions. Returns the object text.
+function mappedModel(bf: Field[], path: string, decisionBlock: bool, inout notes: string[]): string throws SyntaxError {
+  let out: Field[] = []
+  add(&out, "provider", strRaw(bf, "provider"))
+  add(&out, "model", strRaw(bf, "model"))
+  add(&out, "timeout_ms", try millisRaw(find(bf, "timeout")))
+  if (decisionBlock) {
+    add(&out, "previous_message_count", find(bf, "previous_message_count"))
+    ignored(path, bf, ["criteria"], &notes)
+  } else {
+    add(&out, "prompt", strRaw(bf, "prompt"))
+    add(&out, "message_history_count", find(bf, "message_history_count"))
+  }
+  return build(out)
 }
 
 // Bifrost's compat plugin: its features are read into client.compat (src/compat.tov), which the
@@ -999,7 +1064,7 @@ function mapPlugins(inout top: Field[], inout notes: string[]): void throws Synt
       continue
     }
     if (name === "routing") {
-      try mapRouting(f, name, &notes)
+      try mapRouting(f, name, &top, &notes)
       continue
     }
     if (name === "compat") {
@@ -1700,6 +1765,39 @@ test("routing plugin: chain depth and the analyzer's tier boundaries are noted; 
   expect(r.notes.includes(`config: "plugins[routing].config.complexity_analyzer_config.keywords" is not supported by Raiju and is ignored`)).toBe(true)
   expect(r.notes.includes(`config: "plugins[routing].config.complexity_analyzer_config.classifier" is not supported by Raiju and is ignored`)).toBe(true)
   expect(r.notes.some((n) => n.includes("0 to 1 scale"))).toBe(true)
+})
+
+test("routing plugin: a decision classifier and its model are read into complexity_router", () => {
+  const r = try normalize(`{
+    "plugins": [ { "enabled": true, "name": "routing", "config": {
+      "complexity_analyzer_config": {
+        "classifier": "decision",
+        "decision": { "provider": "typesafe", "model": "jev-latest", "timeout": "1.5s", "previous_message_count": 2, "criteria": {} }
+      }
+    } } ]
+  }`)
+  const cr = try fields(find(try fields(r.text), "complexity_router") ?? "{}")
+  expect(rawStr(cr, "classifier")).toBe("decision")
+  expect(rawBool(cr, "enabled")).toBe(true)
+  const dm = try fields(find(cr, "decision") ?? "{}")
+  expect(rawStr(dm, "provider")).toBe("typesafe")
+  expect(rawStr(dm, "model")).toBe("jev-latest")
+  expect(find(dm, "timeout_ms")).toBe("1500")
+  expect(find(dm, "previous_message_count")).toBe("2")
+  expect(r.notes.includes(`config: "plugins[routing].config.complexity_analyzer_config.decision.criteria" is not supported by Raiju and is ignored`)).toBe(true)
+})
+
+test("routing plugin: an llm block without a decision classifier is the llm classifier", () => {
+  const r = try normalize(`{
+    "plugins": [ { "enabled": true, "name": "routing", "config": {
+      "complexity_analyzer_config": { "llm": { "provider": "openai", "model": "gpt-4o-mini", "timeout": 4000, "message_history_count": 3 } }
+    } } ]
+  }`)
+  const cr = try fields(find(try fields(r.text), "complexity_router") ?? "{}")
+  expect(rawStr(cr, "classifier")).toBe("llm")
+  const lm = try fields(find(cr, "llm") ?? "{}")
+  expect(find(lm, "timeout_ms")).toBe("4000")
+  expect(find(lm, "message_history_count")).toBe("3")
 })
 
 test("the compat plugin's features are read into client.compat; prompts are noted and not loaded", () => {

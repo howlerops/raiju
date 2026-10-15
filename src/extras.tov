@@ -1,5 +1,5 @@
 // Rerank, token counting and async jobs: endpoints built on the jobs.tov helpers.
-import { Field, fields, rawStr, rawBool } from "./json"
+import { Field, fields, rawStr, rawBool, setField, build, quote } from "./json"
 import { Engine, Build, Translate, errorResponse, noHeaders } from "./gateway"
 import { ChatRequest, snapshot, errorJson } from "./schemas"
 import { parseModel, kindOf } from "./router"
@@ -12,7 +12,10 @@ import * as gemini from "./providers/gemini"
 import * as anthropicIn from "./providers/anthropic_in"
 import * as bedrock from "./providers/bedrock"
 import * as bedrockIn from "./bedrock_in"
-import { Translated } from "./providers/types"
+import { Translated, Target } from "./providers/types"
+import * as typesafe from "./providers/typesafe"
+import * as providers from "./providers/index"
+import { DecisionReq, parseDecision } from "./decisions"
 
 function json(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
@@ -172,6 +175,91 @@ export async function bedrockCountTokens(engine: Engine, req: Request, id: strin
   // a model Bedrock cannot count: the estimate, as the other providers get
   if (msg.includes("counting tokens")) return estimate
   return json(r.status, msg)
+}
+
+// Bifrost's decision API and TypeSafe's native routes. POST /v1/decisions (and /openai/v1/decisions) answers the
+// canonical decision request from TypeSafe and the custom providers on its base format; any other provider is
+// refused, as Bifrost refuses it. POST /typesafe/v1/systemone passes TypeSafe's own body through, and
+// GET /typesafe/v1/models lists its catalog in its own shape.
+export async function decisionRoute(engine: Engine, req: Request, p: string): Promise<Response> {
+  if (p === "/typesafe/v1/models") return await typesafeModels(engine, req)
+  if (p === "/typesafe/v1/systemone") return await typesafeSystemOne(engine, req)
+  const text = await req.text()
+  let d: DecisionReq = { model: "", state: "null", questions: [] }
+  let body: Field[] = []
+  try {
+    d = try parseDecision(text)
+    body = try fields(text)
+  } catch (e) {
+    return errorResponse(400, `invalid decision request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const decision: DecisionReq = d
+  const k = kindFor(engine, decision.model)
+  if (!providers.supportsDecisions(k.kind)) return json(400, errorJson(`decisions is not supported by ${k.provider} provider`, "invalid_request_error", "unsupported_operation"))
+  const mk: Build = (t) => try typesafe.systemoneUpstream(t, decision)
+  const tr: Translate = (t, out, requested) => try typesafe.translateDecision(out, decision, requested)
+  return await engine.serve(req, "decisions", undefined, body, text, mk, tr, false)
+}
+
+async function typesafeSystemOne(engine: Engine, req: Request): Promise<Response> {
+  const text = await req.text()
+  const provider = req.headers.get("x-bf-model-provider") ?? "typesafe"
+  let body: Field[] = []
+  let model = ""
+  try {
+    body = fields(text)
+    model = rawStr(body, "model") ?? ""
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const bare = model.startsWith("typesafe/") ? model.slice(9) : model
+  const k = kindFor(engine, provider + "/" + bare)
+  if (!providers.supportsDecisions(k.kind)) return errorResponse(400, `${provider} is not a TypeSafe provider`, "invalid_request_error", noHeaders())
+  setField(&body, "model", quote(provider + "/" + bare))
+  const text2 = build(body)
+  const b: Build = (t) => try typesafe.nativeUpstream(t, text2)
+  const tr: Translate = (t, out, requested) => ({ body: out, promptTokens: 0, completionTokens: 0 })
+  return await engine.serve(req, "decisions", undefined, body, text2, b, tr, false)
+}
+
+// GET /typesafe/v1/models: the provider's native catalog. On the default endpoint the pinned jev catalog is merged
+// into the live listing, and it stands in when the live call fails there; a custom endpoint's failure is reported.
+async function typesafeModels(engine: Engine, req: Request): Promise<Response> {
+  if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
+    return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
+  }
+  const name = req.headers.get("x-bf-model-provider") ?? "typesafe"
+  const p = providerOf(engine.cfg, name)
+  if (p === undefined) return errorResponse(404, `no provider ${name}`, "invalid_request_error", noHeaders())
+  const kind = kindOf(name, p)
+  if (!typesafe.isTypesafeKind(kind)) return errorResponse(400, `${name} is not a TypeSafe provider`, "invalid_request_error", noHeaders())
+  const key = (p.keys ?? [])[0] ?? { value: "" }
+  const t: Target = { provider: name, kind: kind, model: "", key: key, cfg: p }
+  const up = typesafe.modelsUpstream(t)
+  const dflt = typesafe.usesDefaultBase(t)
+  let live: string | undefined = undefined
+  try {
+    const hs = new Headers()
+    for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+    const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+    const text = await res.text()
+    if (res.ok) live = text
+  } catch (e) {
+    live = undefined
+  }
+  if (live === undefined) {
+    if (!dflt) return errorResponse(502, `${name} did not list its models`, "api_error", noHeaders())
+    return json(200, JSON.stringify({ models: typesafe.TYPESAFE_PINNED }))
+  }
+  if (!dflt) return json(200, live)
+  try {
+    const listing = try JSON.parse(live) as { models: typesafe.TypesafeModel[] }
+    const seen = listing.models.map((m) => m.name)
+    const merged = listing.models.concat(typesafe.TYPESAFE_PINNED.filter((m) => !seen.includes(m.name)))
+    return json(200, JSON.stringify({ models: merged }))
+  } catch (e) {
+    return errorResponse(502, `invalid model listing from ${name}: ${e.message}`, "api_error", noHeaders())
+  }
 }
 
 export type Dispatch = (req: Request) => Promise<Response, Error>

@@ -1,0 +1,261 @@
+// TypeSafe's System One API: POST /v1/systemone (the decision endpoint) and GET /v1/models. The
+// provider behind /v1/decisions and /typesafe/v1/*, and the base format of custom providers such
+// as Laya and Nimble. Questions go out keyed by name with noul, choice and score types; answers
+// come back keyed by name and are rendered in the canonical decision response (decisions.tov).
+import { Field, fields, find, rawStr, rawNum, decodeString, setField, build, quote } from "../json"
+import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
+import { DecisionReq, Question, answerJson, renderResponse } from "../decisions"
+
+export const TYPESAFE_DEFAULT_BASE = "https://api.typesafe.ai"
+
+// One entry of the native model listing.
+export type TypesafeModel = { name: string, description: string, release_date: string }
+
+// The pinned jev catalog. It is merged into the live listing on the default endpoint, and it is the
+// answer when that call fails there. Aliases resolve upstream: jev-latest and jev-preview are
+// jev-1.13.0 today.
+export const TYPESAFE_PINNED: TypesafeModel[] = [
+  { name: "jev-1.13.0", description: "TypeSafe's System One Model: Jev, version 1.13.0", release_date: "2026-09-10T18:38:01.391457+00:00" },
+  { name: "jev-latest", description: "The latest iteration of TypeSafe's System One Model: Jev", release_date: "2026-09-10T18:38:01.391457+00:00" },
+  { name: "jev-preview", description: "A preview version of `jev-latest`: should be better in most ways", release_date: "2026-09-10T18:39:06.057655+00:00" },
+]
+
+export function isTypesafeKind(kind: string): bool {
+  return kind === "typesafe"
+}
+
+// The endpoint's base URL: the provider's base_url, else the default.
+export function baseOf(t: Target): string {
+  return trimSlash(t.cfg.network_config?.base_url ?? TYPESAFE_DEFAULT_BASE)
+}
+
+// Whether the provider talks to the default endpoint, where the pinned catalog applies.
+export function usesDefaultBase(t: Target): bool {
+  return (t.cfg.network_config?.base_url ?? "") === ""
+}
+
+// Bearer auth from the key, unless the custom provider is keyless. Extra headers from the network config.
+export function authHeaders(t: Target): Map<string, string> {
+  let h = headers([["content-type", "application/json"]])
+  const v = t.key.value ?? ""
+  if (v !== "" && t.cfg.custom_provider_config?.is_key_less !== true) h.set("authorization", "Bearer " + v)
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+// The native type of a canonical question type: predicate is TypeSafe's noul.
+function nativeType(t: string): string {
+  return t === "predicate" ? "noul" : t
+}
+
+// One question as TypeSafe reads it. A choice's options are keyed by name; a score's levels are
+// an ordered list of descriptions, with a label other than the index folded in (as Bifrost does).
+function questionWire(q: Question): string throws SyntaxError {
+  const parts: string[] = [`"type":"${nativeType(q.type)}"`]
+  if (q.instructions !== "null") parts.push(`"instructions":${q.instructions}`)
+  if (q.type === "predicate") {
+    const sides: string[] = []
+    if (q.trueSide !== "") sides.push(`"true":${q.trueSide}`)
+    if (q.falseSide !== "") sides.push(`"false":${q.falseSide}`)
+    if (sides.length > 0) parts.push(`"criteria":{${sides.join(",")}}`)
+  } else if (q.type === "choice") {
+    const opts: string[] = []
+    for (const c of q.choices) opts.push(`${quote(c.key)}:${c.desc}`)
+    parts.push(`"criteria":{${opts.join(",")}}`)
+  } else {
+    const levels: string[] = []
+    for (let i = 0; i < q.levels.length; i++) {
+      const l = q.levels[i]!
+      if (l.label === `${i}`) levels.push(l.desc)
+      else if (l.desc.startsWith("\"")) {
+        const text = try decodeString(l.desc)
+        levels.push(quote(l.label + ": " + text))
+      } else levels.push(quote(l.label))
+    }
+    parts.push(`"criteria":[${levels.join(",")}]`)
+  }
+  return "{" + parts.join(",") + "}"
+}
+
+// The systemone body for a decision, with the model as the upstream names it.
+export function systemoneBody(d: DecisionReq, model: string): string throws SyntaxError {
+  const qs: string[] = []
+  for (const q of d.questions) qs.push(quote(q.name) + ":" + (try questionWire(q)))
+  const parts: string[] = [`"state":${d.state}`, `"model":${quote(model)}`, `"questions":{${qs.join(",")}}`]
+  // extensions follow the modelled fields; a key the gateway sets itself is not overridden
+  for (const f of d.extra ?? []) {
+    if (!["state", "model", "questions"].includes(f.key)) parts.push(quote(f.key) + ":" + f.raw)
+  }
+  return "{" + parts.join(",") + "}"
+}
+
+// The upstream call for a decision, against the provider's endpoint.
+export function systemoneUpstream(t: Target, d: DecisionReq): Upstream throws SyntaxError {
+  return { url: baseOf(t) + "/v1/systemone", headers: authHeaders(t), body: try systemoneBody(d, t.model) }
+}
+
+// The native route's body as TypeSafe reads it, with the model replaced by the upstream name.
+export function nativeUpstream(t: Target, text: string): Upstream throws SyntaxError {
+  let fs = try fields(text)
+  setField(&fs, "model", quote(t.model))
+  return { url: baseOf(t) + "/v1/systemone", headers: authHeaders(t), body: build(fs) }
+}
+
+// The native model listing.
+export function modelsUpstream(t: Target): Upstream {
+  return { url: baseOf(t) + "/v1/models", headers: authHeaders(t), body: "" }
+}
+
+// A probability distribution as canonical entries: a choice's by option, a score's by level, in
+// question order. "" when the answer carries none.
+function probabilitiesOf(q: Question, raw: string): string throws SyntaxError {
+  if (!raw.startsWith("{")) return ""
+  const pf = try fields(raw)
+  const out: string[] = []
+  if (q.type === "choice") {
+    for (const c of q.choices) {
+      const p = find(pf, c.key)
+      if (p === undefined) continue
+      out.push(`{"value":${c.bool ? c.key : quote(c.key)},"probability":${p}}`)
+    }
+  } else if (q.type === "score") {
+    for (let i = 0; i < q.levels.length; i++) {
+      const p = find(pf, `${i}`)
+      if (p === undefined) continue
+      out.push(`{"value":${i},"label":${quote(q.levels[i]!.label)},"probability":${p}}`)
+    }
+  }
+  if (out.length === 0) return ""
+  return `[${out.join(",")}]`
+}
+
+// One answer, in canonical form. It must be the type the question asked for, and carry its value.
+function answerOf(q: Question, raw: string): string throws SyntaxError {
+  const af = try fields(raw)
+  const want = nativeType(q.type)
+  const got = rawStr(af, "type") ?? ""
+  if (got !== want) throw new SyntaxError(`typesafe answered question "${q.name}" as "${got}"; expected "${want}"`)
+  const confidence = find(af, "confidence") ?? ""
+  const probs = try probabilitiesOf(q, find(af, "probabilities") ?? "")
+  if (q.type === "predicate") {
+    const v = find(af, "noul")
+    if (v === undefined) throw new SyntaxError(`typesafe noul answer for question "${q.name}" carries no value`)
+    const n = parseFloat(v) ?? -1.0
+    if (!(n >= 0 && n <= 1)) throw new SyntaxError(`typesafe noul answer for question "${q.name}" is outside [0,1]: ${v}`)
+    return answerJson(q, v, probs, confidence)
+  }
+  if (q.type === "choice") {
+    const c = find(af, "choice")
+    if (c === undefined) throw new SyntaxError(`typesafe choice answer for question "${q.name}" carries no value`)
+    let key = c
+    if (c.startsWith("\"")) key = try decodeString(c)
+    const opt = q.choices.find((x) => x.key === key)
+    if (opt === undefined) throw new SyntaxError(`typesafe chose "${key}" for question "${q.name}", which is not one of its choices`)
+    return answerJson(q, opt.bool ? opt.key : quote(opt.key), probs, confidence)
+  }
+  const s = find(af, "score")
+  if (s === undefined) throw new SyntaxError(`typesafe score answer for question "${q.name}" carries no value`)
+  return answerJson(q, s, probs, confidence)
+}
+
+// A systemone response in the canonical decision response. Every question must have its answer.
+// The usage counts input tokens as prompt tokens; TypeSafe bills nothing for output.
+export function translateDecision(out: string, d: DecisionReq, requested: string): Translated throws SyntaxError {
+  const top = try fields(out)
+  const model = rawStr(top, "model") ?? requested
+  const answersRaw = find(top, "answers")
+  if (answersRaw === undefined || !answersRaw.startsWith("{")) throw new SyntaxError("typesafe response has no answers")
+  const af = try fields(answersRaw)
+  const answers: string[] = []
+  for (const q of d.questions) {
+    const raw = find(af, q.name)
+    if (raw === undefined) throw new SyntaxError(`typesafe returned no answer for question "${q.name}"`)
+    answers.push(try answerOf(q, raw))
+  }
+  let prompt = 0
+  let completion = 0
+  const usage = find(top, "usage")
+  if (usage !== undefined && usage.startsWith("{")) {
+    const uf = try fields(usage)
+    prompt = Math.floor(rawNum(uf, "input_tokens") ?? 0)
+    completion = Math.floor(rawNum(uf, "output_tokens") ?? 0)
+  }
+  let routing = find(top, "routing") ?? ""
+  if (routing === "null") routing = ""
+  return { body: renderResponse(model, answers, prompt, completion, routing), promptTokens: prompt, completionTokens: completion }
+}
+
+test("a decision becomes a systemone body keyed by name", () => {
+  const d: DecisionReq = {
+    model: "typesafe/jev-latest",
+    state: `"hello"`,
+    questions: [
+      { type: "predicate", name: "is_frustrated", named: true, instructions: `"Is it?"`, trueSide: `"yes"`, falseSide: "", choices: [], levels: [] },
+      { type: "choice", name: "category", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [{ key: "billing", bool: false, desc: `"money"` }, { key: "bug", bool: false, desc: "null" }], levels: [] },
+      { type: "score", name: "question_3", named: false, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [{ label: "0", desc: `"calm"` }, { label: "x", desc: `"soon"` }] },
+    ],
+  }
+  const body = try systemoneBody(d, "jev-latest")
+  expect(body).toBe(`{"state":"hello","model":"jev-latest","questions":{"is_frustrated":{"type":"noul","instructions":"Is it?","criteria":{"true":"yes"}},"category":{"type":"choice","criteria":{"billing":"money","bug":null}},"question_3":{"type":"score","criteria":["calm","x: soon"]}}}`)
+})
+
+test("extensions are merged after the modelled fields", () => {
+  const d: DecisionReq = { model: "laya/english", state: `"hi"`, questions: [], extra: [{ key: "min_confidence", raw: "0.8" }, { key: "model", raw: `"other"` }] }
+  expect(try systemoneBody(d, "english")).toBe(`{"state":"hi","model":"english","questions":{},"min_confidence":0.8}`)
+})
+
+test("a systemone answer becomes the canonical response", () => {
+  const d: DecisionReq = {
+    model: "typesafe/jev-latest",
+    state: "null",
+    questions: [
+      { type: "predicate", name: "p", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [] },
+      { type: "choice", name: "c", named: false, instructions: "null", trueSide: "", falseSide: "", choices: [{ key: "true", bool: true, desc: "null" }, { key: "false", bool: true, desc: "null" }], levels: [] },
+      { type: "score", name: "s", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [{ label: "low", desc: "null" }, { label: "1", desc: "null" }] },
+    ],
+  }
+  const native = `{"model":"jev-1.13.0","answers":{"p":{"type":"noul","noul":0.8,"confidence":0.9},"c":{"type":"choice","choice":"true","probabilities":{"true":0.7,"false":0.3}},"s":{"type":"score","score":1.4,"probabilities":{"0":0.6,"1":0.4}}},"usage":{"input_tokens":20,"output_tokens":0}}`
+  const r = try translateDecision(native, d, "typesafe/jev-latest")
+  expect(r.promptTokens).toBe(20)
+  expect(r.body).toBe(`{"model":"jev-1.13.0","answers":[{"type":"predicate","name":"p","probability":0.8,"confidence":0.9},{"type":"choice","choice":true,"probabilities":[{"value":true,"probability":0.7},{"value":false,"probability":0.3}]},{"type":"score","name":"s","score":1.4,"probabilities":[{"value":0,"label":"low","probability":0.6},{"value":1,"label":"1","probability":0.4}]}],"usage":{"prompt_tokens":20,"completion_tokens":0,"total_tokens":20}}`)
+})
+
+test("a missing or mistyped answer is refused", () => {
+  const d: DecisionReq = { model: "m", state: "null", questions: [{ type: "predicate", name: "p", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [] }] }
+  let missing = ""
+  try {
+    try translateDecision(`{"answers":{}}`, d, "m")
+  } catch (e) {
+    missing = e.message
+  }
+  expect(missing.includes(`no answer for question "p"`)).toBe(true)
+  let wrong = ""
+  try {
+    try translateDecision(`{"answers":{"p":{"type":"score","score":1}}}`, d, "m")
+  } catch (e) {
+    wrong = e.message
+  }
+  expect(wrong.includes(`expected "noul"`)).toBe(true)
+  let range = ""
+  try {
+    try translateDecision(`{"answers":{"p":{"type":"noul","noul":1.5}}}`, d, "m")
+  } catch (e) {
+    range = e.message
+  }
+  expect(range.includes("outside [0,1]")).toBe(true)
+})
+
+test("the typesafe endpoint, its auth and the native body", () => {
+  const t: Target = { provider: "typesafe", kind: "typesafe", model: "jev-latest", key: { value: "ts-key" }, cfg: {} }
+  const up = try systemoneUpstream(t, { model: "typesafe/jev-latest", state: "null", questions: [] })
+  expect(up.url).toBe("https://api.typesafe.ai/v1/systemone")
+  expect(up.headers.get("authorization")).toBe("Bearer ts-key")
+  const keyless: Target = { provider: "laya", kind: "typesafe", model: "english", key: { value: "" }, cfg: { network_config: { base_url: "http://localhost:8000/" }, custom_provider_config: { base_provider_type: "typesafe", is_key_less: true } } }
+  const k = try systemoneUpstream(keyless, { model: "laya/english", state: "null", questions: [] })
+  expect(k.url).toBe("http://localhost:8000/v1/systemone")
+  expect(k.headers.has("authorization")).toBe(false)
+  const native = try nativeUpstream(t, `{"model":"typesafe/jev-latest","state":"x","questions":{}}`)
+  expect(native.body).toBe(`{"model":"jev-latest","state":"x","questions":{}}`)
+  expect(usesDefaultBase(t)).toBe(true)
+  expect(usesDefaultBase(keyless)).toBe(false)
+})

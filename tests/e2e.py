@@ -186,8 +186,23 @@ def write_config():
     cfg["providers"]["bedrock_mantle"] = {"keys": [{"name": "mk", "value": "mantle-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK}}
     # Bedrock files and batches: S3 and the job API on the mock, with a batch role and a default batch bucket
     cfg["providers"]["bedrock_batch"] = {"custom_provider_config": {"base_provider_type": "bedrock"}, "keys": [{"name": "bk-batch", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1", "batch_role_arn": "arn:aws:iam::123456789012:role/batch", "batch_s3_config": {"buckets": [{"bucket_name": "e2e-files", "prefix": "jobs", "is_default": True}]}}}], "network_config": {"base_url": MOCK}}
+    # TypeSafe's System One on the mock, under /ts (the decision API, its native routes, and the decision classifier)
+    cfg["providers"]["typesafe"] = {"keys": [{"name": "ts", "value": "ts-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/ts"}}
     path = os.path.join(BUILD, "e2e.config.json")
     json.dump(cfg, open(path, "w"))
+    # the complexity classifiers that ask a model: a decision model, a chat model, and embeddings (the exemplars are
+    # phrases the checks send, so their nearest match is exact)
+    cls_base = {"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "providers": {k: cfg["providers"][k] for k in ("openai", "anthropic", "typesafe")}}
+    cls_tiers = {"simple": "openai/gpt-4o-mini", "complex": "anthropic/claude-sonnet-4"}
+    cls_cfgs = {
+        "decision": {"classifier": "decision", "decision": {"provider": "typesafe", "model": "jev-latest", "timeout_ms": 1500}},
+        "llm": {"classifier": "llm", "llm": {"provider": "openai", "model": "tier-complex", "timeout_ms": 4000}},
+        "semantic": {"classifier": "semantic", "semantic": {"provider": "openai", "embedding_model": "text-embedding-3-small", "min_similarity": 0.0,
+                     "exemplars": {"simple": ["hi there", "say hello in french"], "medium": ["summarize this article in five bullet points"],
+                                   "complex": ["what is the capital of france", "plan a multi-region migration with strict constraints"]}}},
+    }
+    for name, cx in cls_cfgs.items():
+        json.dump({**cls_base, "complexity_router": {"enabled": True, **cx, "tiers": cls_tiers}}, open(os.path.join(BUILD, f"e2e.cls-{name}.json"), "w"))
     # a second node of the same cluster, without the file-writing features
     b = {k: v for k, v in cfg.items() if k not in ("audit", "logs_store", "alerts", "log_exports", "otel", "oidc")}
     b["cluster"] = {**cfg["cluster"], "node_id": "b", "peers": [GW]}
@@ -717,6 +732,9 @@ def main():
     gw_enc = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18102", "-host", "127.0.0.1", "-config", enc_cfg], env=env, stderr=open(os.path.join(BUILD, "e2e.encrypt.log"), "w"))
     gw_c = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18118", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.compat.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.compat.log"), "w"))
     gw_cc = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18119", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.compat-cfg.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.compat-cfg.log"), "w"))
+    # the complexity classifiers that ask a model: one gateway per classifier (18103 decision, 18104 llm, 18105 semantic)
+    gw_cls = {name: subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", os.path.join(BUILD, f"e2e.cls-{name}.json")], env=env, stderr=open(os.path.join(BUILD, f"e2e.cls-{name}.log"), "w"))
+              for name, port in [("decision", 18103), ("llm", 18104), ("semantic", 18105)]}
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
 
@@ -1522,6 +1540,60 @@ def main():
         s, h, b = chat("auto", headers={"x-bf-complexity-tier": "complex"}, seed=903)
         check("complexity tier override picks the complex tier", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hi from claude", b)
 
+        # ---- decisions: /v1/decisions (Bifrost's schema), TypeSafe's native routes, and the complexity classifiers ----
+        GW_CD, GW_CL, GW_CS = "http://127.0.0.1:18103", "http://127.0.0.1:18104", "http://127.0.0.1:18105"
+        for g in (GW_CD, GW_CL, GW_CS):
+            wait(g + "/health")
+        dq = [
+            {"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?", "criteria": {"true": "angry", "false": "calm"}},
+            {"type": "choice", "name": "category", "instructions": "Pick a category", "choices": [{"value": "billing", "description": "charges"}, {"value": "bug", "description": "defects"}]},
+            {"type": "score", "name": "urgency", "levels": [{"label": "0", "description": "can wait"}, {"label": "1", "description": "soon"}, {"label": "2"}]},
+        ]
+        dbody = {"model": "typesafe/jev-latest", "input": "Customer message: I was double charged.", "questions": dq}
+        s, _, b = call("POST", "/v1/decisions", dbody, base=GW)
+        r = json.loads(b) if s == 200 else {}
+        ans = r.get("answers", [])
+        check("decisions answer each question in order", s == 200 and [a.get("type") for a in ans] == ["predicate", "choice", "score"] and ans[0].get("probability") == 0.75
+              and ans[1].get("choice") == "billing" and ans[2].get("score") == 1.5 and ans[0].get("name") == "is_frustrated" and r.get("usage", {}).get("prompt_tokens") == 17, (s, b))
+        ts = [x for x in seen() if x["path"] == "/ts/v1/systemone"]
+        tb = json.loads(ts[-1]["body"]) if ts else {}
+        check("the TypeSafe body is keyed by question name, with the key and the upstream model",
+              bool(ts) and ts[-1]["auth"] == "Bearer ts-key" and tb.get("model") == "jev-latest" and tb["questions"]["is_frustrated"]["type"] == "noul"
+              and tb["questions"]["is_frustrated"]["criteria"] == {"true": "angry", "false": "calm"} and tb["questions"]["urgency"]["criteria"] == ["can wait", "soon", None], ts[-1:])
+        s, _, b = call("POST", "/openai/v1/decisions", dbody, base=GW)
+        check("the /openai/v1 path serves decisions too", s == 200 and json.loads(b)["answers"][1]["choice"] == "billing", (s, b))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "min_confidence": 0.8, "fallbacks": ["openai/gpt-4o"]}, base=GW)
+        ts = [x for x in seen() if x["path"] == "/ts/v1/systemone"]
+        tb = json.loads(ts[-1]["body"]) if ts else {}
+        check("a native field reaches TypeSafe's body, and the routing field does not", s == 200 and tb.get("min_confidence") == 0.8 and "fallbacks" not in tb and "input" not in tb, (s, b, ts[-1:]))
+        s, _, b = call("POST", "/v1/decisions", {"model": "openai/gpt-4o-mini", "input": "x", "questions": [{"type": "predicate", "name": "p"}]}, base=GW)
+        check("a provider without decisions is refused with Bifrost's error", s == 400 and json.loads(b)["error"]["code"] == "unsupported_operation" and "decisions is not supported by openai provider" in b, (s, b))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "questions": [{"type": "ranking", "name": "x"}]}, base=GW)
+        check("an unknown question type is a 400 before any call", s == 400 and "unsupported type" in b, (s, b))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "typesafe/jev-broken"}, base=GW)
+        check("an upstream refusal keeps its status", s == 422, (s, b))
+        s, _, b = call("GET", "/typesafe/v1/models", base=GW)
+        check("the native model listing is TypeSafe's shape", s == 200 and [m["name"] for m in json.loads(b)["models"]] == ["jev-1.13.0"], (s, b))
+        s, _, b = call("POST", "/typesafe/v1/systemone", {"model": "typesafe/jev-latest", "state": "Hello there", "questions": {"is_frustrated": {"type": "noul", "instructions": "x"}}}, base=GW)
+        check("the native systemone route answers in TypeSafe's shape", s == 200 and json.loads(b)["answers"]["is_frustrated"]["noul"] == 0.75 and json.loads(b)["model"] == "jev-1.13.0", (s, b))
+        s, _, b = chat("typesafe/jev-latest", seed=920)
+        check("a judgment model serves no chat completions", s >= 400, (s, b))
+
+        def cx_chat(base, text):
+            return call("POST", "/v1/chat/completions", {"model": "auto", "messages": [{"role": "user", "content": text}]}, base=base)
+        s, h, b = cx_chat(GW_CD, "design a distributed architecture with tradeoffs")
+        check("the decision model's COMPLEX answer routes the request", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hi from claude" and hl(h).get("x-bf-complexity-tier") == "COMPLEX", (h, b))
+        s, h, b = cx_chat(GW_CD, "hi there")
+        check("the decision model's SIMPLE answer routes the request", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hello from gpt-4o-mini" and hl(h).get("x-bf-complexity-tier") == "SIMPLE", (h, b))
+        s, h, b = cx_chat(GW_CL, "hi there")
+        check("the chat classifier's COMPLEX answer overrides the heuristic's SIMPLE", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hi from claude" and hl(h).get("x-bf-complexity-tier") == "COMPLEX", (h, b))
+        s, h, b = cx_chat(GW_CS, "what is the capital of france")
+        check("the nearest reference phrase gives its tier (the heuristic says SIMPLE)", s == 200 and json.loads(b)["choices"][0]["message"]["content"] == "Hi from claude" and hl(h).get("x-bf-complexity-tier") == "COMPLEX", (h, b))
+        s, h, b = cx_chat(GW_CS, "hi there")
+        check("the semantic classifier's SIMPLE phrase routes the request", s == 200 and hl(h).get("x-bf-complexity-tier") == "SIMPLE", (h, b))
+        s, h, b = cx_chat(GW_CD, "design a distributed architecture with tradeoffs")
+        check("the same prompt gets the same tier again", s == 200 and hl(h).get("x-bf-complexity-tier") == "COMPLEX", (h, b))
+
         attempts = []
         for i in range(6):
             s, h, _ = chat("openai/rotate-me", headers={"x-bf-session-id": "sess-42", "x-bf-mcp-include-clients": "none"}, seed=910 + i)
@@ -2261,6 +2333,7 @@ def main():
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
         gw_l.terminate(); gw_enc.terminate(); gw_guard.terminate(); gw_rules.terminate()
         gw_c.terminate(); gw_cc.terminate()
+        for p in gw_cls.values(): p.terminate()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 

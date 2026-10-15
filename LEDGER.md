@@ -207,7 +207,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L81 | G36, G38 | Decisions API, typesafe provider, decision-model complexity classifier | worker | assigned: resumed from handoff/patches |
+| L81 | G36, G38 | Decisions API, typesafe provider, decision-model complexity classifier | worker | done: unit (1,084) + e2e http1; Bun e2e re-run by lead after merge; unprefixed /decisions routes, decision pricing overrides, x-bf-passthrough-extra-params gate open |
 | L82 | G37 | Compat plugin (param dropping and conversion, text-to-chat, chat-to-responses, reasoning-only models) | worker | done: unit (1,075) + e2e (both servers); limits moved to L100 |
 | L83 | G40 | WebSocket responses, live sessions, the UI socket | worker | assigned: resumed from handoff/patches |
 | L84 | G41 | Projects, business units, custom roles and data access scopes | worker | assigned: resumed from handoff/patches |
