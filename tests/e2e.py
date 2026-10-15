@@ -2482,6 +2482,11 @@ def main():
         s, _, b = rchat("linear " + "lin_api_" + "abcdefghij" * 3 + "0123456789" + " done")
         up = seen()[-1]["body"]
         check("secrets detection covers the full Gitleaks rule set", s == 200 and "[REDACTED:LINEAR-API-KEY]" in up and "lin_api_" not in up, (s, up[:200]))
+        # generic-api-key: a plain word after "password" passes, and a high-entropy value is redacted alone
+        s, _, b = rchat("password = correcthorsebatterystaple and api_key = " + '"' + "k3Jd9xQ2" + "mL7vP0sWz8Rt" + '"')
+        up = seen()[-1]["body"]
+        flags = ("password = correcthorsebatterystaple" in up, "api_key = " in up, "[REDACTED:GENERIC-API-KEY]" in up, "k3Jd9xQ2mL7vP0sWz8Rt" not in up)
+        check("secrets detection passes a plain word and redacts only a generic key's value", s == 200 and all(flags), (s, flags, up[:300]))
         s, _, b = rchat("write to a@b.co", model="openai/echo-model")
         up = seen()[-1]["body"]
         check("reversible redaction sends a placeholder upstream", s == 200 and "[EMAIL-1]" in up and "a@b.co" not in up, (s, up[:200]))
