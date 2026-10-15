@@ -37,9 +37,9 @@ import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor, tracesOn,
 import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName } from "./mcp"
 import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, buildChain } from "./plugins"
-import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey } from "./semcache"
+import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline } from "./deadline"
-import { VectorStore, openVectorStore } from "./vectorstore"
+import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
@@ -590,6 +590,8 @@ export class Engine {
         exclude_system_prompt: sc.exclude_system_prompt ?? d.exclude_system_prompt,
         cache_by_model: sc.cache_by_model ?? d.cache_by_model,
         cache_by_provider: sc.cache_by_provider ?? d.cache_by_provider,
+        cache_tool_call_responses: sc.cache_tool_call_responses ?? d.cache_tool_call_responses,
+        disable_identity_scoping: sc.disable_identity_scoping ?? d.disable_identity_scoping,
       }
       this.semantic = new SemanticCache(this.semanticCfg)
       this.vsNs = sc.vector_store_namespace ?? "BifrostSemanticCachePlugin"
@@ -1394,7 +1396,8 @@ export class Engine {
         const pt = promptText(text, this.semanticCfg)
         if (pt !== undefined) {
           semVec = await this.embed(pt)
-          semScope = scopeKey(primary.provider, primary.model, semKey, this.semanticCfg)
+          // entries stay with the virtual key that wrote them unless disable_identity_scoping
+          semScope = identityScope(scopeKey(primary.provider, primary.model, semKey, this.semanticCfg), grant.vk?.id ?? "", this.semanticCfg)
           const th = h.get("x-bf-cache-threshold")
           const thr = th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold)
           const hit = this.vstore !== undefined ? await this.vectorLookup(semScope, semVec, thr) : sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : parseFloat(th))
@@ -1445,7 +1448,8 @@ export class Engine {
       return respond(200, "", out)
     }
     // a body with raw fields is for this caller only: it never enters a cache
-    if (sem !== undefined && semVec.length > 0 && !noStore && r.raw !== true) {
+    // a response with tool calls is replayed into someone else's agent loop, so it is kept only when opted in
+    if (sem !== undefined && semVec.length > 0 && !noStore && r.raw !== true && (this.semanticCfg.cache_tool_call_responses || !hasToolCalls(r.body))) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? undefined : parseTtl(ttlHeader)
       if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, r.body, r.contentType, ttl ?? this.semanticCfg.ttl_ms)
@@ -1489,7 +1493,7 @@ export class Engine {
         await vs.ensure(this.vsNs, this.cfg.semantic_cache?.dimension ?? v.length, ["scope"])
         this.vsReady = true
       }
-      const hit = await vs.search(this.vsNs, v, threshold, [{ key: "scope", eq: scope }])
+      const hit = await vs.search(this.vsNs, v, threshold, [{ key: "scope", eq: scopeTag(scope) }])
       if (hit === undefined) return undefined
       return { body: hit.payload.get("body") ?? "", contentType: hit.payload.get("contentType") ?? "application/json", score: hit.score }
     } catch (e) {
@@ -1502,7 +1506,7 @@ export class Engine {
     const vs = this.vstore
     if (vs === undefined || !this.vsReady) return
     const payload: Map<string, string> = new Map()
-    payload.set("scope", scope)
+    payload.set("scope", scopeTag(scope))
     payload.set("body", body)
     payload.set("contentType", contentType)
     try {

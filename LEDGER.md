@@ -198,7 +198,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 |---|---|---|---|---|
 | L75 | G16, G25 | Vertex batches and files (GCS), Bedrock batches and files (S3) | worker | assigned |
 | L76 | G17, G22 | Remaining x-bifrost-* headers; MCP verification and OAuth routes, tool_sync_interval, allow_by_default | worker | assigned |
-| L77 | G30 | Weaviate, Pinecone, chromem; cache_tool_call_responses, disable_identity_scoping | worker | assigned |
+| L77 | G30 | Weaviate, Pinecone, chromem; cache_tool_call_responses, disable_identity_scoping | worker | done: unit + e2e (Python mocks; not run against live Weaviate or Pinecone) |
 | L78 | G29 | OTLP over gRPC (protobuf, HTTP/2, gRPC on Tov sockets) | worker | assigned |
 | L79 | G47, G18 | Proxy config, breaker reset and policies, vault flush, log analytics, MCP logs, model parameters and catalog; overhead and routing metric families | worker | assigned |
 | L80 | G48, G39 | Every remaining config key (encryption_key, server.*, concurrency and queues, provider options, ...); raw payload storage | worker | assigned |

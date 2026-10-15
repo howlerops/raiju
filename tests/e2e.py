@@ -201,6 +201,16 @@ def write_config():
              "anthropic": {"keys": [{"name": "apool", "value": "sk-ant-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
          "governance": {"virtual_keys": [{"id": "vk-d", "value": "sk-bf-direct-vk"}]}}
     json.dump(d, open(os.path.join(BUILD, "e2e.direct.json"), "w"))
+    # the semantic cache on Weaviate, Pinecone and chromem, in Bifrost's dialect, with two virtual keys
+    vbase = {"client": {"enable_logging": False}, "providers": {"openai": cfg["providers"]["openai"]},
+             "governance": {"virtual_keys": [{"id": "vk-a", "value": "sk-bf-a"}, {"id": "vk-b", "value": "sk-bf-b"}]}}
+    for name, ns, vs, plugin in [
+        ("weaviate", "E2eSemWeaviate", {"enabled": True, "type": "weaviate", "config": {"scheme": "http", "host": "127.0.0.1:18114", "api_key": "wv-key"}}, {}),
+        ("pinecone", "e2e-sem-pinecone", {"enabled": True, "type": "pinecone", "config": {"api_key": "pc-key", "index_host": "127.0.0.1:18115"}}, {}),
+        ("chromem", "E2eSemChromem", {"enabled": True, "type": "chromem", "config": {"path": os.path.join(BUILD, "e2e-chromem")}}, {"disable_identity_scoping": True}),
+    ]:
+        sc = {"provider": "openai", "embedding_model": "text-embedding-3-small", "threshold": 0.95, "ttl": "5m", "vector_store_namespace": ns, **plugin}
+        json.dump({**vbase, "plugins": [{"name": "semanticcache", "enabled": True, "config": sc}], "vector_store": vs}, open(os.path.join(BUILD, f"e2e.vs-{name}.json"), "w"))
     return path
 
 def make_tls():
@@ -291,6 +301,7 @@ def main():
     shutil.rmtree(os.path.join(ROOT, "build/e2e-logs"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-audit"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-wlogs"), ignore_errors=True)
+    shutil.rmtree(os.path.join(ROOT, "build/e2e-chromem"), ignore_errors=True)
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     qdrant = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/qdrant_mock.py"), "18089"])
@@ -303,6 +314,13 @@ def main():
     gw_w = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18094", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.workers.json"), "-workers", "3"], env=env, stderr=subprocess.DEVNULL)
     gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18097", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.node-b.json")], env=env, stderr=subprocess.DEVNULL)
     gw_d = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18092", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.direct.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.direct.log"), "w"))
+    weav = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/weaviate_mock.py"), "18114"])
+    pine = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/pinecone_mock.py"), "18115"])
+    def vs_gateway(name, port):
+        return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", os.path.join(BUILD, f"e2e.vs-{name}.json")], env=env, stderr=open(os.path.join(BUILD, f"e2e.vs-{name}.log"), "w"))
+    gw_vw = vs_gateway("weaviate", 18110)
+    gw_vp = vs_gateway("pinecone", 18111)
+    gw_vc = vs_gateway("chromem", 18112)
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
 
@@ -1180,6 +1198,36 @@ def main():
         qc = json.loads(call("GET", "/_calls", base="http://127.0.0.1:18089")[2])
         check("the semantic cache plugin uses Bifrost's vector_store (Qdrant)", q1 == 200 and hl(h1).get("x-bf-cache") != "semantic-hit" and hl(h2).get("x-bf-cache") == "semantic-hit"
               and {"method": "PUT", "path": "/collections/e2e-ns/points"} in qc and {"method": "POST", "path": "/collections/e2e-ns/points/query"} in qc, (q1, qb, h1, h2, qc))
+        # the semantic cache on Weaviate, Pinecone and chromem: a near-duplicate is served from the store,
+        # entries stay with the virtual key that wrote them unless disable_identity_scoping, responses with
+        # tool calls are not kept, and chromem's entries survive a restart
+        for port in (18110, 18111, 18112):
+            wait(f"http://127.0.0.1:{port}/health")
+        def vs_chat(port, model, vk, content):
+            return call("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": content}]}, {"x-bf-vk": vk, "x-bf-cache-key": "vs-e2e"}, base=f"http://127.0.0.1:{port}")
+        _, vw1, _ = vs_chat(18110, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france")
+        _, vw2, _ = vs_chat(18110, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france?")
+        _, vw3, _ = vs_chat(18110, "openai/gpt-4o-mini", "sk-bf-b", "what is the capital of france?")
+        wc = json.loads(call("GET", "/_calls", base="http://127.0.0.1:18114")[2])
+        check("weaviate: a near-duplicate from the same key is served from the store", hl(vw2).get("x-bf-cache") == "semantic-hit" and hl(vw1).get("x-bf-cache") != "semantic-hit", (vw1, vw2))
+        check("weaviate: another virtual key does not see the entry (identity scoping)", hl(vw3).get("x-bf-cache") != "semantic-hit", vw3)
+        check("weaviate: the schema, objects and nearVector queries reach the server", {"method": "POST", "path": "/v1/schema"} in wc and {"method": "POST", "path": "/v1/objects"} in wc and {"method": "POST", "path": "/v1/graphql"} in wc, wc[-5:])
+        _, vp1, _ = vs_chat(18111, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france")
+        _, vp2, _ = vs_chat(18111, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france?")
+        check("pinecone: a near-duplicate is served from the index", hl(vp2).get("x-bf-cache") == "semantic-hit" and hl(vp1).get("x-bf-cache") != "semantic-hit", (vp1, vp2))
+        _, vt1, _ = vs_chat(18111, "openai/agent-weather", "sk-bf-a", "weather in oslo")
+        _, vt2, _ = vs_chat(18111, "openai/agent-weather", "sk-bf-a", "weather in oslo?")
+        check("pinecone: a response with tool calls is not kept", hl(vt1).get("x-bf-cache") != "semantic-hit" and hl(vt2).get("x-bf-cache") != "semantic-hit", (vt1, vt2))
+        pc = json.loads(call("GET", "/_calls", base="http://127.0.0.1:18115")[2])
+        check("pinecone: upserts and queries reach the index", {"method": "POST", "path": "/vectors/upsert"} in pc and {"method": "POST", "path": "/query"} in pc, pc[-5:])
+        _, vc1, _ = vs_chat(18112, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france")
+        _, vc2, _ = vs_chat(18112, "openai/gpt-4o-mini", "sk-bf-b", "what is the capital of france?")
+        check("chromem: with disable_identity_scoping another key's entry is served", hl(vc2).get("x-bf-cache") == "semantic-hit" and hl(vc1).get("x-bf-cache") != "semantic-hit", (vc1, vc2))
+        gw_vc.terminate(); gw_vc.wait()
+        gw_vc = vs_gateway("chromem", 18112)
+        wait("http://127.0.0.1:18112/health")
+        _, vc3, _ = vs_chat(18112, "openai/gpt-4o-mini", "sk-bf-b", "what is the capital of france?")
+        check("chromem: entries survive a restart from their file", hl(vc3).get("x-bf-cache") == "semantic-hit" and os.path.exists(os.path.join(BUILD, "e2e-chromem", "E2eSemChromem.jsonl")), vc3)
         s1, _, _ = bchat("openai/custom-model", BK)
         s2, _, b2 = bchat("openai/custom-model", BK)
         check("pricing_overrides price an unknown model, so its budget runs down", s1 == 200 and s2 == 402, (s1, s2, b2))
@@ -1445,6 +1493,7 @@ def main():
         check("passthrough with a virtual key goes through", s == 200 and seen()[-1]["auth"] == "Bearer sk-from-env", (s, b))
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
+        gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)
 

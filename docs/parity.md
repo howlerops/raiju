@@ -793,7 +793,7 @@ Ordered by importance. Each gap says what to build and where Bifrost defines it.
 
 - **G29. OpenTelemetry metrics and signal options.** Add metrics export, gRPC, per-signal headers, and span filters. Bifrost: `plugins/otel/main.go:90-200` (config), `metrics.go`, `grpc.go`. Raiju: `src/otel.tov` (traces only). Ledger task. **Status: Partial.** Plugin options, metrics push and per-signal headers are done (commits 0d269dd and abf4dbb). Remaining: the gRPC transport. Collector 4317 is rewritten to HTTP 4318.
 
-- **G30. Semantic cache config and backends.** Accept Bifrost's `semanticcache` plugin entry (`plugins[]`) with `dimension`, `vector_store_namespace`, `cache_tool_call_responses`, `disable_identity_scoping`. Add at least one external vector store (Redis, Qdrant, Weaviate or Pinecone). Bifrost: `plugins/semanticcache/main.go:32-61`, `docs/integrations/vector-databases/*.mdx`. Raiju: `src/semcache.tov` (in-process only). Ledger task. **Status: Partial.** Qdrant and Redis are done (commit d91ef07). Remaining: cache_tool_call_responses and disable_identity_scoping are ignored with a note. Weaviate, Pinecone and chromem are not supported.
+- **G30. Semantic cache config and backends.** Accept Bifrost's `semanticcache` plugin entry (`plugins[]`) with `dimension`, `vector_store_namespace`, `cache_tool_call_responses`, `disable_identity_scoping`. Add at least one external vector store (Redis, Qdrant, Weaviate or Pinecone). Bifrost: `plugins/semanticcache/main.go:32-61`, `docs/integrations/vector-databases/*.mdx`. Raiju: `src/semcache.tov` (in-process only). Ledger task. **Status: Done.** Qdrant, Redis, Weaviate, Pinecone and chromem (in-process, file-backed) stores; dimension, vector_store_namespace, cache_tool_call_responses and disable_identity_scoping (entries are scoped by virtual key by default, as Bifrost).
 
 - **G31. Alert channels and metrics.** Add Teams and PagerDuty channels, and budget and rate-limit usage percent metrics. Bifrost: `docs/enterprise/alerting/alert-channels.mdx`, `alert-rules.mdx`. Raiju: `src/alerts.tov:6, 22` (`error_rate`, `p95_latency_ms`, `avg_latency_ms`, `requests`, `cost`, `budget_used`, `breaker_open`; channels `webhook`, `slack`). Ledger task. **Status: Done** (commits abf4dbb and 8e98ea5).
 
@@ -843,9 +843,8 @@ Ordered by importance. Each gap says what to build and where Bifrost defines it.
 2. G16, G25. Vertex batches and files (GCS) and Bedrock batches and files (S3).
 3. G17. Remaining x-bifrost-* response headers, including retry-after-ms.
 4. G22. MCP verification and OAuth management routes answer 501; tool_sync_interval does nothing.
-5. G30. Semantic cache: two plugin fields ignored; Weaviate, Pinecone and chromem not supported.
-6. G29. OpenTelemetry over gRPC (Tov's fetch is HTTP/1.1 only).
-7. G18. Routing-classifier and overhead-component metric families.
-8. G47. Proxy-config, circuit-breaker reset, vault flush, the other log histograms, MCP logs.
+5. G29. OpenTelemetry over gRPC (Tov's fetch is HTTP/1.1 only).
+6. G18. Routing-classifier and overhead-component metric families.
+7. G47. Proxy-config, circuit-breaker reset, vault flush, the other log histograms, MCP logs.
 
 P2 decisions still open: G36, G37, G40 to G46. Partial P2 items: G35, G39, G47, G48.

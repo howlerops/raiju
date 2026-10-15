@@ -14,6 +14,10 @@ export type SemanticCacheConfig = {
   exclude_system_prompt: bool,
   cache_by_model: bool,
   cache_by_provider: bool,
+  // Bifrost's cache_tool_call_responses: a response with tool calls is stored only when set
+  cache_tool_call_responses: bool,
+  // Bifrost's disable_identity_scoping: entries are kept per virtual key unless set
+  disable_identity_scoping: bool,
 }
 
 export function defaultSemanticConfig(): SemanticCacheConfig {
@@ -25,6 +29,8 @@ export function defaultSemanticConfig(): SemanticCacheConfig {
     exclude_system_prompt: false,
     cache_by_model: true,
     cache_by_provider: true,
+    cache_tool_call_responses: false,
+    disable_identity_scoping: false,
   }
 }
 
@@ -89,6 +95,33 @@ export function scopeKey(provider: string, model: string, cacheKey: string, cfg:
   const p = cfg.cache_by_provider ? provider : ""
   const m = cfg.cache_by_model ? model : ""
   return p + "\u0000" + m + "\u0000" + cacheKey
+}
+
+// The scope with the caller's virtual key folded in (Bifrost's identity_scope), so an
+// entry is served only to the key that wrote it. With disable_identity_scoping every key
+// shares the scope. vk is "" for a request with no key; it still gets its own partition.
+export function identityScope(scope: string, vk: string, cfg: SemanticCacheConfig): string {
+  if (cfg.disable_identity_scoping) return scope
+  return scope + "\u0001vk=" + vk
+}
+
+// Whether a chat completion carries a tool call (in a message or a delta). A body that
+// does not parse counts as having one, so it is not stored.
+export function hasToolCalls(chatBody: string): bool {
+  try {
+    const choices = elements(find(fields(chatBody), "choices") ?? "[]")
+    for (const c of choices) {
+      for (const k of ["message", "delta"]) {
+        const m = find(fields(c), k)
+        if (m === undefined || !m.startsWith("{")) continue
+        const tc = find(fields(m), "tool_calls")
+        if (!isNull(tc) && tc !== "[]") return true
+      }
+    }
+  } catch (e) {
+    return true
+  }
+  return false
 }
 
 // Scales v to unit length; undefined for the zero vector.
@@ -508,4 +541,28 @@ test("semantic entries are shared through a directory", () => {
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch (e) {}
+})
+
+test("identity scope: per virtual key by default, shared when disabled", () => {
+  const cfg = defaultSemanticConfig()
+  expect(identityScope("s", "vk-a", cfg) !== identityScope("s", "vk-b", cfg)).toBe(true)
+  expect(identityScope("s", "vk-a", cfg) !== identityScope("s", "", cfg)).toBe(true)
+  expect(identityScope("s", "vk-a", cfg) !== "s").toBe(true)
+  let shared = defaultSemanticConfig()
+  shared.disable_identity_scoping = true
+  expect(identityScope("s", "vk-a", shared)).toBe("s")
+  expect(identityScope("s", "vk-b", shared)).toBe("s")
+})
+
+test("a chat response with tool calls is recognized", () => {
+  const plain = '{"id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}'
+  expect(hasToolCalls(plain)).toBe(false)
+  const empty = '{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[]}}]}'
+  expect(hasToolCalls(empty)).toBe(false)
+  const called = '{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function"}]}}]}'
+  expect(hasToolCalls(called)).toBe(true)
+  const delta = '{"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}'
+  expect(hasToolCalls(delta)).toBe(true)
+  expect(hasToolCalls("not json")).toBe(true)
+  expect(hasToolCalls('{"error":{"message":"x"}}')).toBe(false)
 })

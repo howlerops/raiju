@@ -476,7 +476,7 @@ function semanticCache(f: Field[], pname: string, inout top: Field[], inout note
   add(&out, "enabled", find(f, "enabled"))
   add(&out, "provider", provider)
   add(&out, "embedding_model", model)
-  for (const k of ["threshold", "conversation_history_threshold", "exclude_system_prompt", "cache_by_model", "cache_by_provider", "default_cache_key", "vector_store_namespace", "dimension"]) {
+  for (const k of ["threshold", "conversation_history_threshold", "exclude_system_prompt", "cache_by_model", "cache_by_provider", "cache_tool_call_responses", "disable_identity_scoping", "default_cache_key", "vector_store_namespace", "dimension"]) {
     add(&out, k, find(cf, k))
   }
   const ttl = find(cf, "ttl")
@@ -489,13 +489,12 @@ function semanticCache(f: Field[], pname: string, inout top: Field[], inout note
       add(&out, "ttl", ttl)
     }
   }
-  ignored(`plugins[${pname}].config`, cf, ["cache_tool_call_responses", "disable_identity_scoping"], &notes)
   put(&top, "semantic_cache", out)
 }
 
-// The top-level vector_store section, read for the two stores Raiju has a client for:
-// qdrant (over REST) and redis (over RESP). Any other type is dropped, and the
-// semantic cache keeps its entries in memory.
+// The top-level vector_store section, read for the stores Raiju has a client for: qdrant
+// (over REST), redis (over RESP), weaviate, pinecone, and chromem (in process). Any other
+// type is dropped, and the semantic cache keeps its entries in memory.
 function mapVectorStore(inout top: Field[], inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "vector_store")
   if (raw === undefined) return
@@ -504,7 +503,7 @@ function mapVectorStore(inout top: Field[], inout notes: string[]): void throws 
   const cf = try members(find(vf, "config"))
   let out: Field[] = []
   add(&out, "enabled", find(vf, "enabled"))
-  if (type !== "qdrant" && type !== "redis") {
+  if (type !== "qdrant" && type !== "redis" && type !== "weaviate" && type !== "pinecone" && type !== "chromem") {
     notes.push(`config: "vector_store.type" ${quote(type)} is not supported by Raiju; the semantic cache keeps its entries in memory`)
     top = without(top, ["vector_store"])
     return
@@ -518,6 +517,17 @@ function mapVectorStore(inout top: Field[], inout notes: string[]): void throws 
     add(&c, "use_tls", find(cf, "use_tls"))
     if (find(cf, "port") !== undefined) notes.push(`config: "vector_store.config.port" is the gRPC port in Bifrost, and Raiju uses Qdrant's REST API; the REST port is "vector_store.config.rest_port" (default 6333)`)
     ignored("vector_store.config", cf, ["max_recv_msg_size_mb"], &notes)
+  } else if (type === "weaviate") {
+    add(&c, "scheme", strRaw(cf, "scheme"))
+    add(&c, "host", strRaw(cf, "host"))
+    add(&c, "api_key", strRaw(cf, "api_key"))
+    ignored("vector_store.config", cf, ["grpc_config", "headers", "timeout"], &notes)
+  } else if (type === "pinecone") {
+    add(&c, "api_key", strRaw(cf, "api_key"))
+    add(&c, "index_host", strRaw(cf, "index_host"))
+  } else if (type === "chromem") {
+    add(&c, "path", strRaw(cf, "path"))
+    ignored("vector_store.config", cf, ["compress"], &notes)
   } else {
     add(&c, "addr", strRaw(cf, "addr"))
     add(&c, "username", strRaw(cf, "username"))
@@ -1041,7 +1051,36 @@ test("maps vector_store for qdrant and the semantic plugin's namespace and dimen
   const sc = try fields(find(try fields(r.text), "semantic_cache")!)
   expect(rawStr(sc, "vector_store_namespace")).toBe("mycache")
   expect(find(sc, "dimension")).toBe("1536")
-  expect(r.notes.includes(`config: "plugins[semantic_cache].config.disable_identity_scoping" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "plugins[semantic_cache].config.disable_identity_scoping" is not supported by Raiju and is ignored`)).toBe(false)
+  const scf = try fields(find(try fields(r.text), "semantic_cache")!)
+  expect(find(scf, "disable_identity_scoping")).toBe("true")
+})
+
+test("maps the semantic plugin's tool-call and identity flags", () => {
+  const r = try normalize(`{ "plugins": [ { "enabled": true, "name": "semanticcache", "config": { "provider": "openai", "embedding_model": "e", "cache_tool_call_responses": true } } ] }`)
+  const sc = try fields(find(try fields(r.text), "semantic_cache")!)
+  expect(find(sc, "cache_tool_call_responses")).toBe("true")
+  expect(find(sc, "disable_identity_scoping")).toBeUndefined()
+  expect(r.notes.some((n) => n.includes("cache_tool_call_responses"))).toBe(false)
+})
+
+test("maps weaviate, pinecone and chromem vector stores", () => {
+  const w = try normalize(`{ "vector_store": { "enabled": true, "type": "weaviate", "config": { "scheme": "https", "host": "w.internal:443", "api_key": "wk", "grpc_config": { "host": "w:50051" } } } }`)
+  const wc = try fields(find(try fields(find(try fields(w.text), "vector_store")!), "config")!)
+  expect(rawStr(wc, "scheme")).toBe("https")
+  expect(rawStr(wc, "host")).toBe("w.internal:443")
+  expect(rawStr(wc, "api_key")).toBe("wk")
+  expect(find(wc, "grpc_config")).toBeUndefined()
+  expect(w.notes.includes(`config: "vector_store.config.grpc_config" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(w.notes.some((n) => n.includes("vector_store.type"))).toBe(false)
+  const p = try normalize(`{ "vector_store": { "enabled": true, "type": "pinecone", "config": { "api_key": "pk", "index_host": "idx.svc.pinecone.io" } } }`)
+  const pc = try fields(find(try fields(find(try fields(p.text), "vector_store")!), "config")!)
+  expect(rawStr(pc, "index_host")).toBe("idx.svc.pinecone.io")
+  expect(rawStr(pc, "api_key")).toBe("pk")
+  const ch = try normalize(`{ "vector_store": { "enabled": true, "type": "chromem", "config": { "path": "/var/lib/raiju/vec", "compress": true } } }`)
+  const cc = try fields(find(try fields(find(try fields(ch.text), "vector_store")!), "config")!)
+  expect(rawStr(cc, "path")).toBe("/var/lib/raiju/vec")
+  expect(ch.notes.includes(`config: "vector_store.config.compress" is not supported by Raiju and is ignored`)).toBe(true)
 })
 
 test("maps a redis vector_store and drops types Raiju has no client for", () => {
@@ -1052,9 +1091,9 @@ test("maps a redis vector_store and drops types Raiju has no client for", () => 
   expect(find(c, "pool_size")).toBeUndefined()
   expect(rr.notes.includes(`config: "vector_store.config.pool_size" is not supported by Raiju and is ignored`)).toBe(true)
   expect(rr.notes.includes(`config: "vector_store.config.cluster_mode" is not supported by Raiju and is ignored: the store is read as a single node`)).toBe(true)
-  const wv = try normalize(`{ "vector_store": { "enabled": true, "type": "weaviate", "config": { "scheme": "http", "host": "w" } } }`)
+  const wv = try normalize(`{ "vector_store": { "enabled": true, "type": "milvus", "config": { "address": "m" } } }`)
   expect(find(try fields(wv.text), "vector_store")).toBeUndefined()
-  expect(wv.notes.includes(`config: "vector_store.type" "weaviate" is not supported by Raiju; the semantic cache keeps its entries in memory`)).toBe(true)
+  expect(wv.notes.includes(`config: "vector_store.type" "milvus" is not supported by Raiju; the semantic cache keeps its entries in memory`)).toBe(true)
 })
 
 test("existing Raiju sections win over Bifrost ones, with a note", () => {

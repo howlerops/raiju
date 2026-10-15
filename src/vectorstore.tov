@@ -1,5 +1,7 @@
 // External vector stores for the semantic cache (Bifrost's top-level vector_store):
-// Qdrant over its REST API, and Redis or Valkey over RESP with RediSearch. Each
+// Qdrant and Weaviate over their REST APIs, Pinecone over its index REST API, Redis or
+// Valkey over RESP with RediSearch, and chromem, an in-process store that can write
+// each namespace to a file. Each
 // entry is a vector, a payload of text fields, and an expiry (ms since the epoch).
 // Searches skip expired entries, so a stale answer is never returned even when the
 // server's own cleanup lags. The request builders and reply parsers are pure
@@ -9,7 +11,10 @@
 // expires_ms. Callers must not use them as field names.
 
 import { sha256, toHex, utf8 } from "./crypto"
-import { fields, elements, find, rawNum, decodeString, quote } from "./json"
+import { fields, elements, find, rawNum, rawStr, decodeString, quote, isNull } from "./json"
+import { encode, decode } from "./base64"
+import { VectorIndex } from "./semcache"
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 
 const ID_KEY = "entry_id"
 const EXP_KEY = "expires_ms"
@@ -20,8 +25,10 @@ export type Hit = { id: string, score: f64, payload: Map<string, string> }
 // Keeps entries whose payload field `key` equals `eq`.
 export type Cond = { key: string, eq: string }
 
-// The vector_store section. Only qdrant and redis are read; the others are ignored.
-// Qdrant is reached over REST (rest_port, default 6333), not gRPC.
+// The vector_store section: qdrant, redis, weaviate, pinecone or chromem. Qdrant is
+// reached over REST (rest_port, default 6333), not gRPC. Weaviate takes scheme and host
+// (host:port). Pinecone takes index_host. chromem keeps its entries in process, and
+// writes them to the directory path when it is set.
 export type VectorStoreSettings = {
   enabled?: bool,
   type: string,
@@ -34,6 +41,9 @@ export type VectorStoreSettings = {
     username?: string,
     password?: string,
     db?: int,
+    scheme?: string,
+    index_host?: string,
+    path?: string,
   },
 }
 
@@ -53,6 +63,19 @@ export function openVectorStore(s: VectorStoreSettings | undefined): VectorStore
     if (addr === "") throw new Error("vector_store: redis needs an addr")
     return new RedisStore(addr, c.username ?? "", c.password ?? "", c.db ?? 0, c.use_tls === true)
   }
+  if (s.type === "weaviate") {
+    const host = c.host ?? ""
+    if (host === "") throw new Error("vector_store: weaviate needs a host")
+    return new WeaviateStore(`${c.scheme ?? "http"}://${host}`, c.api_key ?? "")
+  }
+  if (s.type === "pinecone") {
+    const ih = c.index_host ?? ""
+    if (ih === "") throw new Error("vector_store: pinecone needs an index_host")
+    const key = c.api_key ?? ""
+    if (key === "") throw new Error("vector_store: pinecone needs an api_key")
+    return new PineconeStore(pineconeOrigin(ih), key)
+  }
+  if (s.type === "chromem") return new ChromemStore(c.path ?? "")
   return undefined
 }
 
@@ -573,7 +596,497 @@ export class RedisStore extends VectorStore {
   }
 }
 
+// The tag value a semantic-cache scope is stored and filtered under. A scope holds NUL and
+// control separators, which a server's filter may refuse, so the store gets its hash.
+export function scopeTag(scope: string): string {
+  return toHex(sha256(utf8(scope)))
+}
+
+// The tags of a namespace, or an error when it was not ensured.
+function tagsFor(m: Map<string, string[]>, ns: string): string[] throws Error {
+  const t = m.get(ns)
+  if (t === undefined) throw new Error(`vector store namespace "${ns}" is not ensured`)
+  return t
+}
+
+// ---- Weaviate (REST and GraphQL) ----
+
+// The class a namespace maps to. Weaviate would capitalize a lowercase class name without
+// saying so, and then the GraphQL reads would not find it, so a name that does not fit is
+// refused.
+export function weaviateClass(ns: string): string throws Error {
+  const word = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+  if (ns.byteLength === 0 || !"ABCDEFGHIJKLMNOPQRSTUVWXYZ".includes(ns.slice(0, 1))) {
+    throw new Error(`weaviate: class name "${ns}" must start with an uppercase letter (A-Z)`)
+  }
+  for (const ch of ns.chars()) {
+    if (!word.includes(ch)) throw new Error(`weaviate: class name "${ns}" may hold only letters, digits and underscores`)
+  }
+  return ns
+}
+
+// The class schema: a cosine HNSW index, the payload as one text property that is not
+// indexed, the expiry as a number, and each filter field as an exact-match text.
+export function weaviateSchemaBody(cls: string, tags: string[]): string {
+  const props: string[] = [`{"name":"p","dataType":["text"],"indexFilterable":false,"indexSearchable":false}`, `{"name":"${EXP_KEY}","dataType":["number"]}`]
+  for (const t of tags) props.push(`{"name":${quote(t)},"dataType":["text"],"tokenization":"field"}`)
+  return `{"class":${quote(cls)},"vectorizer":"none","vectorIndexType":"hnsw","vectorIndexConfig":{"distance":"cosine"},"properties":[${props.join(",")}]}`
+}
+
+// An object: its vector, the payload JSON in p, the expiry, and the tag values. The id is
+// a UUID, as Weaviate takes only those; the caller's id is in the payload.
+export function weaviateObjectBody(cls: string, id: string, v: f64[], payload: Map<string, string>, expiresMs: int, tags: string[]): string {
+  const props: string[] = [`"p":${quote(payloadJson(id, payload, expiresMs))}`, `"${EXP_KEY}":${expiresMs}`]
+  for (const t of tags) {
+    const val = payload.get(t)
+    if (val !== undefined) props.push(`${quote(t)}:${quote(val)}`)
+  }
+  return `{"class":${quote(cls)},"id":${quote(pointId(id))},"vector":${vectorJson(v)},"properties":{${props.join(",")}}}`
+}
+
+// The where-filter: not expired at nowMs, and each condition as an exact text match.
+export function weaviateWhere(filter: Cond[], nowMs: int): string {
+  const ops: string[] = [`{path:["${EXP_KEY}"],operator:GreaterThan,valueNumber:${nowMs}}`]
+  for (const c of filter) ops.push(`{path:[${quote(c.key)}],operator:Equal,valueText:${quote(c.eq)}}`)
+  return `{operator:And,operands:[${ops.join(",")}]}`
+}
+
+// The GraphQL query for the nearest entry within distance 1 - threshold (cosine distance).
+export function weaviateSearchQuery(cls: string, v: f64[], threshold: f64, filter: Cond[], nowMs: int): string {
+  const q = `{ Get { ${cls}(nearVector: {vector: ${vectorJson(v)}, distance: ${1.0 - threshold}}, where: ${weaviateWhere(filter, nowMs)}, limit: 1) { p _additional { id distance } } } }`
+  return `{"query":${quote(q)}}`
+}
+
+// The hit of a GraphQL reply ({"data":{"Get":{cls:[...]}}}). A reply with errors throws.
+export function parseWeaviateHit(body: string, cls: string): Hit | undefined throws Error {
+  const top = try fields(body)
+  const errs = find(top, "errors")
+  if (!isNull(errs)) throw new Error(`weaviate: ${errs}`)
+  const data = find(top, "data")
+  if (isNull(data)) return undefined
+  const get = find(try fields(data!), "Get")
+  if (isNull(get)) return undefined
+  const objs = try elements(find(try fields(get!), cls) ?? "[]")
+  if (objs.length === 0) return undefined
+  const o = try fields(objs[0]!)
+  const p = find(o, "p")
+  if (p === undefined || !p.startsWith("\"")) return undefined
+  const pl = try readPayload(try decodeString(p))
+  if (pl.id === "") return undefined
+  const add = try fields(find(o, "_additional") ?? "{}")
+  const dist = rawNum(add, "distance") ?? 1.0
+  return { id: pl.id, score: 1.0 - dist, payload: pl.payload }
+}
+
+export class WeaviateStore extends VectorStore {
+  private tags: Map<string, string[]> = new Map()
+
+  // base is the origin, e.g. "http://weaviate:8080".
+  constructor(readonly base: string, readonly apiKey: string) {
+    super()
+  }
+
+  private async call(method: string, path: string, body: string): Promise<{ status: int, text: string }, Error> {
+    const hs: Record<string, string> = this.apiKey === "" ? { "Content-Type": "application/json" } : { "Content-Type": "application/json", "Authorization": "Bearer " + this.apiKey }
+    let res: Response = new Response()
+    if (body === "") {
+      res = try await fetch(this.base + path, { method: method, headers: hs, signal: AbortSignal.timeout(10000) })
+    } else {
+      res = try await fetch(this.base + path, { method: method, headers: hs, body: body, signal: AbortSignal.timeout(10000) })
+    }
+    const text = try await res.text()
+    return { status: res.status, text: text }
+  }
+
+  async ensure(ns: string, dim: int, tags: string[]): Promise<void, Error> {
+    const cls = try weaviateClass(ns)
+    const r = try await this.call("GET", `/v1/schema/${cls}`, "")
+    if (r.status === 404) {
+      const c = try await this.call("POST", "/v1/schema", weaviateSchemaBody(cls, tags))
+      if (c.status < 200 || c.status >= 300) throw new Error(`weaviate: create ${cls}: HTTP ${c.status}: ${c.text}`)
+    } else if (r.status < 200 || r.status >= 300) {
+      throw new Error(`weaviate: schema ${cls}: HTTP ${r.status}: ${r.text}`)
+    }
+    this.tags.set(ns, tags)
+  }
+
+  async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
+    const cls = try weaviateClass(ns)
+    const tags = try tagsFor(this.tags, ns)
+    const expires = Math.trunc(Date.now()) + ttlMs
+    const body = weaviateObjectBody(cls, id, vector, payload, expires, tags)
+    const r = try await this.call("POST", "/v1/objects", body)
+    if (r.status >= 200 && r.status < 300) return
+    // a taken id is replaced, as the other stores overwrite
+    if (r.status === 422 && r.text.includes("already exists")) {
+      const u = try await this.call("PUT", `/v1/objects/${cls}/${pointId(id)}`, body)
+      if (u.status >= 200 && u.status < 300) return
+      throw new Error(`weaviate: replace: HTTP ${u.status}: ${u.text}`)
+    }
+    throw new Error(`weaviate: add: HTTP ${r.status}: ${r.text}`)
+  }
+
+  async search(ns: string, vector: f64[], threshold: f64, filter: Cond[]): Promise<Hit | undefined, Error> {
+    const cls = try weaviateClass(ns)
+    try tagsFor(this.tags, ns)
+    const r = try await this.call("POST", "/v1/graphql", weaviateSearchQuery(cls, vector, threshold, filter, Math.trunc(Date.now())))
+    if (r.status < 200 || r.status >= 300) throw new Error(`weaviate: search: HTTP ${r.status}: ${r.text}`)
+    const hit = try parseWeaviateHit(r.text, cls)
+    if (hit === undefined || hit.score < threshold) return undefined
+    return hit
+  }
+
+  async delete(ns: string, id: string): Promise<void, Error> {
+    const cls = try weaviateClass(ns)
+    try tagsFor(this.tags, ns)
+    const r = try await this.call("DELETE", `/v1/objects/${cls}/${pointId(id)}`, "")
+    if ((r.status < 200 || r.status >= 300) && r.status !== 404) throw new Error(`weaviate: delete: HTTP ${r.status}: ${r.text}`)
+  }
+}
+
+// ---- Pinecone (REST) ----
+
+// The base URL of an index host. Pinecone Local and loopback hosts get plain http, the
+// others https, as Bifrost does.
+export function pineconeOrigin(host: string): string {
+  if (host.startsWith("http://") || host.startsWith("https://")) return host
+  const local = host.startsWith("localhost") || host.startsWith("127.") || host.startsWith("[::1]")
+  return (local ? "http://" : "https://") + host
+}
+
+// The metadata filter: not expired at nowMs, and each condition as $eq.
+export function pineconeFilter(filter: Cond[], nowMs: int): string {
+  const parts: string[] = [`{"${EXP_KEY}":{"$gt":${nowMs}}}`]
+  for (const c of filter) parts.push(`{${quote(c.key)}:{"$eq":${quote(c.eq)}}}`)
+  return `{"$and":[${parts.join(",")}]}`
+}
+
+// An upsert of one vector. metadata is the payload JSON object.
+export function pineconeUpsertBody(ns: string, id: string, v: f64[], metadata: string): string {
+  return `{"vectors":[{"id":${quote(id)},"values":${vectorJson(v)},"metadata":${metadata}}],"namespace":${quote(ns)}}`
+}
+
+// A top-1 query with the filter applied by the index; the threshold is checked by the caller.
+export function pineconeQueryBody(ns: string, v: f64[], filter: Cond[], nowMs: int): string {
+  return `{"vector":${vectorJson(v)},"topK":1,"namespace":${quote(ns)},"includeMetadata":true,"filter":${pineconeFilter(filter, nowMs)}}`
+}
+
+export function pineconeDeleteBody(ns: string, id: string): string {
+  return `{"ids":[${quote(id)}],"namespace":${quote(ns)}}`
+}
+
+// The best match of a query reply ({"matches":[...]}), or undefined.
+export function parsePineconeHit(body: string): Hit | undefined throws Error {
+  const top = try fields(body)
+  const ms = find(top, "matches")
+  if (isNull(ms)) return undefined
+  const matches = try elements(ms!)
+  if (matches.length === 0) return undefined
+  const m = try fields(matches[0]!)
+  const pl = try readPayload(find(m, "metadata") ?? "{}")
+  if (pl.id === "") return undefined
+  return { id: pl.id, score: rawNum(m, "score") ?? 0.0, payload: pl.payload }
+}
+
+export class PineconeStore extends VectorStore {
+  private ready: Set<string> = new Set()
+
+  // base is the index origin from pineconeOrigin.
+  constructor(readonly base: string, readonly apiKey: string) {
+    super()
+  }
+
+  private need(ns: string): void throws Error {
+    if (!this.ready.has(ns)) throw new Error(`vector store namespace "${ns}" is not ensured`)
+  }
+
+  private async call(method: string, path: string, body: string): Promise<{ status: int, text: string }, Error> {
+    const hs: Record<string, string> = { "Content-Type": "application/json", "Api-Key": this.apiKey, "X-Pinecone-API-Version": "2025-04" }
+    let res: Response = new Response()
+    if (body === "") {
+      res = try await fetch(this.base + path, { method: method, headers: hs, signal: AbortSignal.timeout(10000) })
+    } else {
+      res = try await fetch(this.base + path, { method: method, headers: hs, body: body, signal: AbortSignal.timeout(10000) })
+    }
+    const text = try await res.text()
+    return { status: res.status, text: text }
+  }
+
+  // Checks the index and its dimension. Pinecone creates namespaces on first upsert.
+  async ensure(ns: string, dim: int, tags: string[]): Promise<void, Error> {
+    const r = try await this.call("POST", "/describe_index_stats", "{}")
+    if (r.status < 200 || r.status >= 300) throw new Error(`pinecone: index stats: HTTP ${r.status}: ${r.text}`)
+    const have = rawNum(try fields(r.text), "dimension")
+    if (have !== undefined && have > 0.0 && have !== dim) throw new Error(`pinecone: the index holds ${have}-dimension vectors, namespace ${ns} wants ${dim}`)
+    this.ready.add(ns)
+  }
+
+  async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
+    try this.need(ns)
+    const expires = Math.trunc(Date.now()) + ttlMs
+    const r = try await this.call("POST", "/vectors/upsert", pineconeUpsertBody(ns, id, vector, payloadJson(id, payload, expires)))
+    if (r.status < 200 || r.status >= 300) throw new Error(`pinecone: upsert: HTTP ${r.status}: ${r.text}`)
+  }
+
+  async search(ns: string, vector: f64[], threshold: f64, filter: Cond[]): Promise<Hit | undefined, Error> {
+    try this.need(ns)
+    const r = try await this.call("POST", "/query", pineconeQueryBody(ns, vector, filter, Math.trunc(Date.now())))
+    if (r.status < 200 || r.status >= 300) throw new Error(`pinecone: query: HTTP ${r.status}: ${r.text}`)
+    const hit = try parsePineconeHit(r.text)
+    if (hit === undefined || hit.score < threshold) return undefined
+    return hit
+  }
+
+  async delete(ns: string, id: string): Promise<void, Error> {
+    try this.need(ns)
+    const r = try await this.call("POST", "/vectors/delete", pineconeDeleteBody(ns, id))
+    if (r.status < 200 || r.status >= 300) throw new Error(`pinecone: delete: HTTP ${r.status}: ${r.text}`)
+  }
+}
+
+// ---- chromem (in process, with an optional file per namespace) ----
+
+// Reads f32 values from little-endian IEEE single bytes, the inverse of f32Bytes.
+export function f32Values(b: u8[]): f64[] {
+  const out: f64[] = []
+  for (let i = 0; i + 3 < b.length; i += 4) {
+    const bits = int(b[i]!) + int(b[i + 1]!) * 256 + int(b[i + 2]!) * 65536 + int(b[i + 3]!) * 16777216
+    const neg = bits >= 2147483648
+    const u = neg ? bits - 2147483648 : bits
+    const e = (u >> 23) & 255
+    const mant = u & 8388607
+    let x = 0.0
+    if (e === 0) x = mant * Math.pow(2.0, -149.0)
+    else x = (1.0 + mant / 8388608.0) * Math.pow(2.0, e - 127.0)
+    out.push(neg ? -x : x)
+  }
+  return out
+}
+
+// One line of a namespace file: an add, with the entry's payload JSON and its vector.
+function chromemAddLine(id: string, v: f64[], payload: Map<string, string>, expiresMs: int): string {
+  return `{"op":"add","entry":${payloadJson(id, payload, expiresMs)},"v":${quote(encode(vectorBytes(v)))}}\n`
+}
+
+// The entries of one partition: a tag combination, and the vector index over them.
+type ChromemPart = { vals: Map<string, string>, idx: VectorIndex }
+type ChromemEntry = { key: string, payload: Map<string, string>, expires: int, vec: f64[] }
+
+// Partitions are keyed by their tag values, so a filter on tags skips whole partitions
+// before any vector is compared. A filter on a field that is not a tag matches nothing.
+function partMatches(vals: Map<string, string>, filter: Cond[]): bool {
+  for (const c of filter) {
+    if (vals.get(c.key) !== c.eq) return false
+  }
+  return true
+}
+
+// A namespace held in memory. With a file, every add and delete is appended to it, and
+// load replays the file. The file is rewritten with the live entries at each load.
+class ChromemNs {
+  parts: Map<string, ChromemPart> = new Map()
+  meta: Map<string, ChromemEntry> = new Map()
+  lastSweep = 0
+  constructor(readonly dim: int, readonly tags: string[], readonly file: string) {}
+
+  private groupOf(payload: Map<string, string>): { key: string, vals: Map<string, string> } {
+    const vals: Map<string, string> = new Map()
+    const parts: string[] = []
+    for (const t of this.tags) {
+      const v = payload.get(t) ?? ""
+      vals.set(t, v)
+      parts.push(v)
+    }
+    return { key: parts.join("\u0000"), vals: vals }
+  }
+
+  drop(id: string): void {
+    const e = this.meta.get(id)
+    if (e === undefined) return
+    this.meta.delete(id)
+    const p = this.parts.get(e.key)
+    if (p === undefined) return
+    p.idx.remove(id)
+    if (p.idx.size() === 0) this.parts.delete(e.key)
+  }
+
+  // False for a wrong size, a zero vector or a non-finite value. A replaced id is dropped first.
+  put(id: string, v: f64[], payload: Map<string, string>, expires: int): bool {
+    if (v.length !== this.dim) return false
+    this.drop(id)
+    const g = this.groupOf(payload)
+    let p = this.parts.get(g.key)
+    if (p === undefined) {
+      p = { vals: g.vals, idx: new VectorIndex(this.dim) }
+      this.parts.set(g.key, p)
+    }
+    if (!p.idx.add(id, v)) {
+      if (p.idx.size() === 0) this.parts.delete(g.key)
+      return false
+    }
+    this.meta.set(id, { key: g.key, payload: payload, expires: expires, vec: v })
+    return true
+  }
+
+  // The best live entry at or above threshold whose tags match the filter, or undefined.
+  // Expired entries found on the way are dropped.
+  lookup(v: f64[], threshold: f64, filter: Cond[], nowMs: int): Hit | undefined {
+    while (true) {
+      let best: { id: string, score: f64 } | undefined = undefined
+      for (const k of this.parts.keys()) {
+        const p = this.parts.get(k)!
+        if (!partMatches(p.vals, filter)) continue
+        const r = p.idx.search(v, 1, threshold)
+        if (r.length === 0) continue
+        if (best === undefined || r[0]!.score > best.score) best = r[0]!
+      }
+      if (best === undefined) return undefined
+      const e = this.meta.get(best.id)
+      if (e === undefined) return undefined
+      if (nowMs >= e.expires) {
+        this.drop(best.id)
+        continue
+      }
+      return { id: best.id, score: best.score, payload: e.payload }
+    }
+  }
+
+  // Drops expired entries, at most once a minute.
+  sweep(nowMs: int): void {
+    if (nowMs - this.lastSweep < 60000) return
+    this.lastSweep = nowMs
+    const dead: string[] = []
+    for (const id of this.meta.keys()) {
+      if (nowMs >= this.meta.get(id)!.expires) dead.push(id)
+    }
+    for (const id of dead) this.drop(id)
+  }
+
+  append(line: string): void {
+    if (this.file === "") return
+    try {
+      appendFileSync(this.file, line)
+    } catch (e) {
+      console.error(`raiju: chromem: ${e.message}`)
+    }
+  }
+
+  // Replays the file: adds and deletes in order, with expired entries left out. Lines that
+  // do not parse (a write cut short by a crash) are skipped.
+  load(nowMs: int): void {
+    if (this.file === "") return
+    let text = ""
+    try {
+      text = readFileSync(this.file, "utf8")
+    } catch (e) {
+      return
+    }
+    for (const line of text.split("\n")) {
+      if (line.byteLength === 0) continue
+      try {
+        const f = fields(line)
+        const op = rawStr(f, "op") ?? ""
+        if (op === "del") {
+          this.drop(rawStr(f, "id") ?? "")
+        } else if (op === "add") {
+          const entry = find(f, "entry") ?? "{}"
+          const pl = readPayload(entry)
+          const expires = Math.trunc(rawNum(try fields(entry), EXP_KEY) ?? 0.0)
+          const vec = f32Values(decode(rawStr(f, "v") ?? ""))
+          if (pl.id === "") continue
+          if (nowMs < expires) this.put(pl.id, vec, pl.payload, expires)
+          else this.drop(pl.id)
+        }
+      } catch (e) {
+        continue
+      }
+    }
+    let out = ""
+    for (const id of this.meta.keys()) {
+      const e = this.meta.get(id)!
+      out += chromemAddLine(id, e.vec, e.payload, e.expires)
+    }
+    try {
+      writeFileSync(this.file, out)
+    } catch (e) {
+      console.error(`raiju: chromem: ${e.message}`)
+    }
+  }
+}
+
+// A file name for a namespace: characters other than letters, digits, - and _ become _.
+function safeFileName(ns: string): string {
+  const ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+  let out = ""
+  for (const ch of ns.chars()) out += ok.includes(ch) ? ch : "_"
+  return out
+}
+
+// The in-process store. dir is where each namespace's file goes (<dir>/<namespace>.jsonl);
+// "" keeps everything in memory. Each store entry is kept in a VectorIndex, as the semantic
+// cache keeps its own, so the cosine scan is the same code.
+export class ChromemStore extends VectorStore {
+  private nss: Map<string, ChromemNs> = new Map()
+
+  constructor(readonly dir: string) {
+    super()
+  }
+
+  private nsOf(ns: string): ChromemNs throws Error {
+    const st = this.nss.get(ns)
+    if (st === undefined) throw new Error(`vector store namespace "${ns}" is not ensured`)
+    return st
+  }
+
+  async ensure(ns: string, dim: int, tags: string[]): Promise<void, Error> {
+    const have = this.nss.get(ns)
+    if (have !== undefined) {
+      if (have.dim !== dim) throw new Error(`chromem: namespace ${ns} holds ${have.dim}-dimension vectors, not ${dim}`)
+      return
+    }
+    let file = ""
+    if (this.dir !== "") {
+      try {
+        mkdirSync(this.dir, { recursive: true })
+      } catch (e) {
+        throw new Error(`chromem: cannot create ${this.dir}: ${e.message}`)
+      }
+      file = this.dir + "/" + safeFileName(ns) + ".jsonl"
+    }
+    const st = new ChromemNs(dim, tags, file)
+    st.load(Math.trunc(Date.now()))
+    this.nss.set(ns, st)
+  }
+
+  async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
+    const st = try this.nsOf(ns)
+    const now = Math.trunc(Date.now())
+    const expires = now + ttlMs
+    if (!st.put(id, vector, payload, expires)) throw new Error(`chromem: the vector for ${id} has the wrong size or is zero`)
+    st.append(chromemAddLine(id, vector, payload, expires))
+    st.sweep(now)
+  }
+
+  async search(ns: string, vector: f64[], threshold: f64, filter: Cond[]): Promise<Hit | undefined, Error> {
+    const st = try this.nsOf(ns)
+    return st.lookup(vector, threshold, filter, Math.trunc(Date.now()))
+  }
+
+  async delete(ns: string, id: string): Promise<void, Error> {
+    const st = try this.nsOf(ns)
+    st.drop(id)
+    st.append(`{"op":"del","id":${quote(id)}}\n`)
+  }
+}
+
 // ---- tests (no network) ----
+
+test("scope tags are fixed-length hex, whatever the scope holds", () => {
+  const t = scopeTag("openai\u0000gpt\u0000key\u0001vk=sk-bf-a")
+  expect(t.byteLength).toBe(64)
+  expect(t).toBe(scopeTag("openai\u0000gpt\u0000key\u0001vk=sk-bf-a"))
+  expect(t !== scopeTag("openai\u0000gpt\u0000key\u0001vk=sk-bf-b")).toBe(true)
+})
 
 test("the same entry id always gets the same point id, shaped as a UUID", () => {
   const a = pointId("e1")
@@ -708,7 +1221,7 @@ test("a vector_store section parses into the settings type", () => {
 test("openVectorStore picks the configured backend", () => {
   expect(try openVectorStore(undefined)).toBeUndefined()
   expect(try openVectorStore({ enabled: false, type: "qdrant" })).toBeUndefined()
-  expect(try openVectorStore({ type: "weaviate" })).toBeUndefined()
+  expect(try openVectorStore({ type: "unknown" })).toBeUndefined()
   let threw = false
   try {
     try openVectorStore({ type: "qdrant", config: {} })
@@ -718,4 +1231,145 @@ test("openVectorStore picks the configured backend", () => {
   expect(threw).toBe(true)
   expect(try openVectorStore({ type: "qdrant", config: { host: "q" } })).toBeDefined()
   expect(try openVectorStore({ type: "redis", config: { addr: "r:6379", db: 2 } })).toBeDefined()
+  expect(try openVectorStore({ type: "weaviate", config: { host: "w:8080" } })).toBeDefined()
+  expect(try openVectorStore({ type: "chromem" })).toBeDefined()
+  expect(try openVectorStore({ type: "pinecone", config: { index_host: "localhost:5081", api_key: "pclocal" } })).toBeDefined()
+  let noKey = false
+  try {
+    try openVectorStore({ type: "pinecone", config: { index_host: "p.io" } })
+  } catch (e) {
+    noKey = true
+  }
+  expect(noKey).toBe(true)
+  let noHost = false
+  try {
+    try openVectorStore({ type: "weaviate", config: {} })
+  } catch (e) {
+    noHost = true
+  }
+  expect(noHost).toBe(true)
+})
+
+test("weaviate class names must start with an uppercase letter", () => {
+  expect(try weaviateClass("BifrostSemanticCachePlugin")).toBe("BifrostSemanticCachePlugin")
+  let low = false
+  try {
+    try weaviateClass("mycache")
+  } catch (e) {
+    low = true
+  }
+  expect(low).toBe(true)
+  let dash = false
+  try {
+    try weaviateClass("Bad-Name")
+  } catch (e) {
+    dash = true
+  }
+  expect(dash).toBe(true)
+})
+
+test("weaviate schema, object and query bodies", () => {
+  const s = weaviateSchemaBody("BifrostX", ["scope"])
+  expect(s.includes(`"distance":"cosine"`)).toBe(true)
+  expect(s.includes(`{"name":"scope","dataType":["text"],"tokenization":"field"}`)).toBe(true)
+  const pm: Map<string, string> = new Map()
+  pm.set("scope", "s1")
+  const o = weaviateObjectBody("BifrostX", "e1", [1.0, 0.0], pm, 77, ["scope"])
+  expect(o.startsWith(`{"class":"BifrostX","id":"${pointId("e1")}","vector":[1,0],"properties":{"p":`)).toBe(true)
+  expect(o.endsWith(`,"expires_ms":77,"scope":"s1"}}`)).toBe(true)
+  const q = weaviateSearchQuery("BifrostX", [1.0], 0.8, [{ key: "scope", eq: "a" }], 500)
+  expect(q.includes("distance: 0.19999")).toBe(true)
+  expect(q.includes("GreaterThan,valueNumber:500")).toBe(true)
+  expect(q.includes("Equal,valueText:")).toBe(true)
+})
+
+test("a weaviate reply gives the best hit with its payload and similarity", () => {
+  const pj = payloadJson("e5", new Map(), 9)
+  const reply = `{"data":{"Get":{"BifrostX":[{"p":${quote(pj)},"_additional":{"id":"u","distance":0.25}}]}}}`
+  const h = try parseWeaviateHit(reply, "BifrostX")
+  expect(h!.id).toBe("e5")
+  expect(h!.score).toBeCloseTo(0.75)
+  expect(try parseWeaviateHit(`{"data":{"Get":{"BifrostX":[]}}}`, "BifrostX")).toBeUndefined()
+  let threw = false
+  try {
+    try parseWeaviateHit(`{"errors":[{"message":"no"}]}`, "BifrostX")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("pinecone origin, filter, query and reply", () => {
+  expect(pineconeOrigin("localhost:5081")).toBe("http://localhost:5081")
+  expect(pineconeOrigin("idx-abc.svc.pinecone.io")).toBe("https://idx-abc.svc.pinecone.io")
+  expect(pineconeOrigin("https://x.example")).toBe("https://x.example")
+  expect(pineconeFilter([{ key: "scope", eq: "k" }], 1000)).toBe(`{"$and":[{"expires_ms":{"$gt":1000}},{"scope":{"$eq":"k"}}]}`)
+  expect(pineconeQueryBody("ns", [1.0], [], 5)).toBe(`{"vector":[1],"topK":1,"namespace":"ns","includeMetadata":true,"filter":{"$and":[{"expires_ms":{"$gt":5}}]}}`)
+  expect(pineconeDeleteBody("ns", "x")).toBe(`{"ids":["x"],"namespace":"ns"}`)
+  const pm: Map<string, string> = new Map()
+  pm.set("scope", "s")
+  const reply = `{"matches":[{"id":"sc-1","score":0.91,"metadata":${payloadJson("sc-1", pm, 9)}}],"namespace":"ns"}`
+  const h = try parsePineconeHit(reply)
+  expect(h!.id).toBe("sc-1")
+  expect(h!.score).toBeCloseTo(0.91)
+  expect(h!.payload.get("scope")!).toBe("s")
+  expect(try parsePineconeHit(`{"matches":[]}`)).toBeUndefined()
+})
+
+test("f32 values read back what f32Bytes wrote", () => {
+  expect(f32Values(f32Bytes(-2.0))[0]!).toBe(-2.0)
+  expect(f32Values(f32Bytes(0.1))[0]!).toBeCloseTo(0.1)
+  expect(f32Values(f32Bytes(1e-40))[0]!).toBeCloseTo(1e-40)
+})
+
+test("chromem keeps entries by tag, filters, and drops expired ones", () => {
+  const st = new ChromemNs(2, ["scope"], "")
+  const a: Map<string, string> = new Map()
+  a.set("scope", "x")
+  const b: Map<string, string> = new Map()
+  b.set("scope", "y")
+  expect(st.put("e1", [1.0, 0.0], a, 1000)).toBe(true)
+  expect(st.put("e2", [1.0, 0.1], b, 1000)).toBe(true)
+  expect(st.put("bad", [1.0], a, 1000)).toBe(false)
+  const hit = st.lookup([1.0, 0.0], 0.8, [{ key: "scope", eq: "y" }], 500)
+  expect(hit!.id).toBe("e2")
+  expect(hit!.payload.get("scope")!).toBe("y")
+  expect(st.lookup([1.0, 0.0], 0.8, [{ key: "scope", eq: "z" }], 500)).toBeUndefined()
+  expect(st.lookup([1.0, 0.0], 0.8, [{ key: "scope", eq: "x" }], 2000)).toBeUndefined()
+  expect(st.meta.size).toBe(1)
+  expect(st.put("e2", [0.0, 1.0], b, 5000)).toBe(true)
+  expect(st.meta.size).toBe(1)
+  expect(st.lookup([0.0, 1.0], 0.9, [{ key: "scope", eq: "y" }], 2000)!.id).toBe("e2")
+  st.drop("e2")
+  expect(st.meta.size).toBe(0)
+  expect(st.parts.size).toBe(0)
+})
+
+test("a chromem file replays adds and deletes, skips torn lines, and drops expired entries", () => {
+  const dir = "build/chromem-test-" + Math.floor(Math.random() * 1000000000)
+  try mkdirSync(dir, { recursive: true })
+  const file = dir + "/ns.jsonl"
+  const pm: Map<string, string> = new Map()
+  pm.set("scope", "s")
+  const st = new ChromemNs(2, ["scope"], file)
+  st.load(1000)
+  st.put("a", [1.0, 0.0], pm, 90000)
+  st.append(chromemAddLine("a", [1.0, 0.0], pm, 90000))
+  st.put("gone", [0.0, 1.0], pm, 90000)
+  st.append(chromemAddLine("gone", [0.0, 1.0], pm, 90000))
+  st.drop("gone")
+  st.append(`{"op":"del","id":"gone"}\n`)
+  st.put("old", [1.0, 1.0], pm, 500)
+  st.append(chromemAddLine("old", [1.0, 1.0], pm, 500))
+  try appendFileSync(file, `{"op":"add","entry":{"entry_id"`)
+  const again = new ChromemNs(2, ["scope"], file)
+  again.load(1000)
+  expect(again.meta.size).toBe(1)
+  const h = again.lookup([1.0, 0.0], 0.9, [{ key: "scope", eq: "s" }], 1000)
+  expect(h!.id).toBe("a")
+  expect(h!.score).toBeCloseTo(1.0)
+  expect((try readFileSync(file, "utf8")).split("\n").length).toBe(2)
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (e) {}
 })
