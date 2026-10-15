@@ -498,194 +498,201 @@ Bifrost: `config.schema.json` `mcp` and `$defs/mcp_client_config`. Raiju: `src/m
 
 ### d1. Provider list
 
-Bifrost: provider constants `core/schemas/bifrost.go:49-82`, and per-provider pages in `docs/providers/supported-providers/`. Raiju: `src/providers/openai.tov` (ENDPOINTS, lines 14-29), `longtail.tov` (lines 10-27), `index.tov`, `anthropic.tov`, `gemini.tov`, `bedrock.tov`, `vertex.tov`, `cohere.tov`, `watsonx.tov`.
+Bifrost: provider constants `core/schemas/bifrost.go:49-82`, and per-provider pages in `docs/providers/supported-providers/`. Raiju: `src/providers/openai.tov` (`makeEndpoints`), `longtail.tov` (`longtailTable`), `index.tov` (`supportsChat`, `supportsEmbeddings`, `supportsDecisions`, `CHAT_ONLY`), `anthropic.tov`, `gemini.tov`, `bedrock.tov`, `bedrock_mantle.tov`, `vertex.tov`, `cohere.tov`, `watsonx.tov`, `typesafe.tov`, `cloudflare.tov`, `databricks.tov`, `githubcopilot.tov`, `replicate.tov`. Routing of files, batches, images, speech and transcription is in `src/media.tov` (`matchRoute`, `providerTarget`, `nativeMedia`, `supported`), `media_native.tov` (Anthropic, Gemini), and `media_cloud.tov` (Vertex, Bedrock).
 
-The notes list only the operations that differ from the "Supported Operations" table in the Bifrost docs.
+The notes list only the operations that differ from the "Supported Operations" table in the Bifrost docs. Where a row says a media route is "passed through", the OpenAI-compatible media routes send the request to the provider's own endpoint for any OpenAI-format provider (`media.tov:supported`); that is not checked against each provider's API.
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| openai | supported-providers/openai.mdx: chat, responses, responses lifecycle, text, embeddings, decisions, speech, STT, images, image edit, files, batch, videos, compaction, models | partial | Raiju: chat, streaming, responses (lifecycle, compaction, input_tokens), text, embeddings, speech, STT, images, files, batch, realtime, models. Missing: decisions. Videos out-of-scope. Evidence `openai.tov:14`. |
-| azure | supported-providers/azure.mdx: chat, responses, embeddings, files, images, image edit, models, compaction, decisions, batch | partial | Raiju serves Azure through `openai.tov` and media (`media.tov`). Entra ID is done (commit 6aeb7f2). Missing: decisions. |
-| anthropic | supported-providers/anthropic.mdx: chat, responses, text, files, batch, models | partial | Raiju: chat, streaming, responses (bridged), count tokens, models, files and batches (commit c363369). Missing: legacy text. |
-| bedrock | supported-providers/bedrock.mdx: chat, responses, text, embeddings, files, batch, models, images, image edit and variation, count tokens | partial | Raiju: Converse chat and streaming, responses (bridged), embeddings (Titan and Cohere), role_arn. Count tokens are an estimate (`native.tov:408`). Missing: files, batch, images. |
-| bedrock_mantle | supported-providers/bedrock-mantle.mdx: chat (+stream), responses, tool calling, vision, reasoning, structured outputs, prompt caching, models, count tokens | partial | Chat through the Bedrock OpenAI-compatible endpoint (`providers/bedrock_mantle.tov`, commit 6aeb7f2). Anthropic-family models are refused (`bedrock_mantle.tov:60`). No model list or count tokens. |
-| cohere | supported-providers/cohere.mdx: chat, responses, embeddings, models | done | Raiju: chat, streaming, embeddings, native rerank (`extras.tov:38-41`), responses (bridged). Cohere SDK routes missing (a2). |
-| vertex | supported-providers/vertex.mdx: chat, responses, embeddings, images, image edit, video (out), models, text, batch and files through genai routes | partial | Raiju: chat, streaming, embeddings, responses, count tokens (`extras.tov:80-86`). Missing: images, image edit, batch, files, model list. |
-| mistral | supported-providers/mistral.mdx: chat, responses, STT, OCR, embeddings, models | done | Raiju: OpenAI-compatible (`openai.tov:16`); STT and OCR routed through media. |
-| ollama | supported-providers/ollama.mdx: chat, responses, text, embeddings, models, decisions | done | Raiju: `openai.tov:26`. Decisions missing (a1). |
-| opencode-go | supported-providers/opencode.mdx: chat, responses, models | done | OpenAI-compatible base (`longtail.tov`, commit d27a62e). |
-| opencode-zen | supported-providers/opencode.mdx: chat, responses, models | done | OpenAI-compatible base (`longtail.tov`, commit d27a62e). |
-| groq | supported-providers/groq.mdx: chat, responses, models | done | `openai.tov:15`. |
-| sgl | supported-providers/sgl.mdx: chat, responses, text, embeddings, models, count tokens | done | `openai.tov:28`. Count tokens estimated. |
-| parasail | supported-providers/parasail.mdx: chat, responses, models, embeddings | done | `openai.tov:23`. |
-| perplexity | supported-providers/perplexity.mdx: chat, responses, models, decisions | done | `openai.tov:25`. Decisions missing. |
-| cerebras | supported-providers/cerebras.mdx: chat, responses, text, models | done | `openai.tov:19`. |
-| deepseek | supported-providers/deepseek.mdx: chat, responses, text, models | done | `openai.tov:18`. |
-| gemini | supported-providers/gemini.mdx: chat, responses, speech, STT, images, image edit, video (out), embeddings, files, batch, models, count tokens | partial | Raiju: chat, streaming, responses, embeddings, count tokens (`extras.tov:80-86`), models, speech, images (Imagen), files and batch (commit c363369). Missing: STT. |
-| github-copilot | supported-providers/github-copilot.mdx: chat, responses, models | partial | Chat through a Copilot token or a GitHub App (`providers/githubcopilot.tov`, commit d27a62e). Model listing is missing (only OpenAI-compatible, Anthropic and Gemini are listed). |
-| huggingface | supported-providers/huggingface.mdx: routes to 19 inference backends (fal-ai, hf-inference, cerebras, sambanova and others) with chat, embeddings, speech, transcription and image operations | partial | Raiju uses only the single Hugging Face router as an OpenAI-compatible endpoint (`longtail.tov:10`). No multi-backend routing, no model aliasing, no speech, transcription or image operations. |
-| nebius | supported-providers/nebius.mdx: chat, responses, text, embeddings, images, models | done | `openai.tov:22`. |
-| xai | supported-providers/xai.mdx: chat, responses, text, images, compaction, models | partial | Raiju: `openai.tov:17`. Missing: xAI realtime (Raiju realtime is OpenAI and Azure only). Compaction missing. |
-| replicate | supported-providers/replicate.mdx: chat, responses, text, images, image edit, video (out), files, models | partial | Chat as synchronous predictions (`providers/replicate.tov`, commit d27a62e). Text, images, image edit, files and models are missing. |
-| vllm | supported-providers/vllm.mdx: chat, responses, text, embeddings, rerank, STT, count tokens, models, OCR | done | OpenAI-compatible (`openai.tov:27`). Rerank calls vLLM's rerank API (`extras.tov:38-41`, commit 12757de). Count tokens are estimated, as for sgl. |
+| openai | supported-providers/openai.mdx: chat, responses, responses lifecycle, text, embeddings, decisions, speech, STT, images, image edit, files, batch, videos, compaction, models | partial | Raiju: chat, streaming, responses (lifecycle, compaction, input_tokens), text, embeddings, speech, STT, images (generate, edit, variation), files, batch, realtime, models (`openai.tov:makeEndpoints`, `media.tov:matchRoute`). Decisions: no native OpenAI route. `extras.tov:decisionRoute` answers OpenAI only by emulation, and only when `client.compat.decisions` is on (off by default, `decision_emulate.tov`). Videos out-of-scope. |
+| azure | supported-providers/azure.mdx: chat, responses, embeddings, files, images, image edit, models, compaction, decisions, batch | partial | Raiju serves Azure through `openai.tov` and `media.tov` (deployment routes: `deploymentRoute`). Entra ID is done (commit 6aeb7f2). Decisions: emulation only, as for openai. |
+| anthropic | supported-providers/anthropic.mdx: chat, responses, text, files, batch, models | partial | Raiju: chat, streaming, responses (bridged), count tokens (exact, `extras.tov:countTokens`), models (`server.tov:upstreamModels`), files and batches (`media_native.tov`, routed by `media.tov:nativeMedia`). Missing: legacy text completions. |
+| bedrock | supported-providers/bedrock.mdx: chat, responses, text, embeddings, files, batch, models, images, image edit and variation, count tokens | partial | Raiju: Converse chat and streaming, responses (bridged), embeddings (Titan and Cohere), role_arn, count tokens (exact through Bedrock CountTokens, `extras.tov:bedrockCountTokens`; an estimate where Bedrock cannot count the model), rerank (`extras.tov:rerankText`), files and batches over S3 (`media_cloud.tov:s3Object`, `media.tov:nativeMedia`), image generation (Titan and Stability, `media_cloud.tov:bedrockImage`). Missing: legacy text, image edit and variation, model list. |
+| bedrock_mantle | supported-providers/bedrock-mantle.mdx: chat (+stream), responses, tool calling, vision, reasoning, structured outputs, prompt caching, models, count tokens | partial | Chat through the Bedrock OpenAI-compatible endpoint (`bedrock_mantle.tov`, commit 6aeb7f2). Anthropic-family models are refused in `bedrock_mantle.tov`. No model list or count tokens. |
+| cohere | supported-providers/cohere.mdx: chat, responses, embeddings, models | done | Raiju: chat, streaming, embeddings, native rerank (`extras.tov:rerankText`), responses (bridged). Cohere SDK routes missing (a2). |
+| vertex | supported-providers/vertex.mdx: chat, responses, embeddings, images, image edit, video (out), models, text, batch and files through genai routes | partial | Raiju: chat, streaming, embeddings, responses, images (Imagen and Gemini image models, `media_cloud.tov:vertexImage`), batches and files over GCS (`media_cloud.tov:vertexJobCreate`, `gcsUpload`). Count tokens are an estimate (`extras.tov:countTokens` counts exactly only for anthropic and gemini). Missing: image edit, model list. |
+| mistral | supported-providers/mistral.mdx: chat, responses, STT, OCR, embeddings, models | done | Raiju: OpenAI-compatible (`openai.tov:makeEndpoints`); STT and OCR routed through `media.tov`. |
+| ollama | supported-providers/ollama.mdx: chat, responses, text, embeddings, models, decisions | done | Raiju: `openai.tov:makeEndpoints`. Decisions by emulation only, under `client.compat.decisions`. |
+| opencode-go | supported-providers/opencode.mdx: chat, responses, models | done | OpenAI-compatible base (`longtail.tov:longtailTable`). |
+| opencode-zen | supported-providers/opencode.mdx: chat, responses, models | done | OpenAI-compatible base (`longtail.tov:longtailTable`). |
+| groq | supported-providers/groq.mdx: chat, responses, models | done | `openai.tov:makeEndpoints`. |
+| sgl | supported-providers/sgl.mdx: chat, responses, text, embeddings, models, count tokens | done | `openai.tov:makeEndpoints`. Count tokens estimated. |
+| parasail | supported-providers/parasail.mdx: chat, responses, models, embeddings | done | `openai.tov:makeEndpoints`. |
+| perplexity | supported-providers/perplexity.mdx: chat, responses, models, decisions | done | `openai.tov:makeEndpoints`. Decisions by emulation only, under `client.compat.decisions`. |
+| cerebras | supported-providers/cerebras.mdx: chat, responses, text, models | done | `openai.tov:makeEndpoints`. |
+| deepseek | supported-providers/deepseek.mdx: chat, responses, text, models | done | `openai.tov:makeEndpoints`. |
+| gemini | supported-providers/gemini.mdx: chat, responses, speech, STT, images, image edit, video (out), embeddings, files, batch, models, count tokens | partial | Raiju: chat, streaming, responses, embeddings, count tokens (exact), models (`server.tov:upstreamModels`), speech (`media_native.tov:geminiSpeech`), STT (`media_native.tov:geminiTranscription`, audio sent inline), images (`media_native.tov:geminiImageGeneration`, Imagen and Gemini image), files and batches (`media_native.tov`). Missing: image edit. Video out-of-scope. |
+| github-copilot | supported-providers/github-copilot.mdx: chat, responses, models | partial | Chat through a Copilot token or a GitHub App (`githubcopilot.tov`). Chat only (`CHAT_ONLY` in `index.tov`). Model listing is missing (`server.tov:upstreamModels` covers OpenAI-compatible, Anthropic and Gemini only). |
+| huggingface | supported-providers/huggingface.mdx: routes to 19 inference backends (fal-ai, hf-inference, cerebras, sambanova and others) with chat, embeddings, speech, transcription and image operations | partial | Raiju uses only the single Hugging Face router as an OpenAI-compatible endpoint (`longtail.tov:longtailTable`). No multi-backend routing and no model aliasing. Speech and images reach the router only through the OpenAI-compatible media routes. |
+| nebius | supported-providers/nebius.mdx: chat, responses, text, embeddings, images, models | done | `openai.tov:makeEndpoints`. |
+| xai | supported-providers/xai.mdx: chat, responses, text, images, compaction, models | partial | Raiju: `openai.tov:makeEndpoints`; images through the media routes. Missing: xAI realtime (Raiju realtime is OpenAI and Azure only, `realtime.tov`). Compaction missing. |
+| replicate | supported-providers/replicate.mdx: chat, responses, text, images, image edit, video (out), files, models | partial | Chat only, as synchronous predictions (`replicate.tov`, `CHAT_ONLY` in `index.tov`). Text, images, image edit, files and models are missing. |
+| openrouter | supported-providers/openrouter.mdx: chat, responses (beta), text, embeddings, models, decisions | partial | OpenAI-compatible base (`openai.tov:makeEndpoints`): chat, responses, text, embeddings, models. Decisions by emulation only, under `client.compat.decisions`; Bifrost's native decision route is not reached. Not in the table before this audit. |
+| vllm | supported-providers/vllm.mdx: chat, responses, text, embeddings, rerank, STT, count tokens, models, OCR | done | OpenAI-compatible (`openai.tov:makeEndpoints`). Rerank calls vLLM's rerank API (`extras.tov:rerankText`). Count tokens are estimated, as for sgl. |
 | runway | supported-providers/runway.mdx: video only | out-of-scope | `SCOPE.md` Out: videos, media providers. |
 | runware | supported-providers/runware.mdx: image, video, other media tasks | out-of-scope | `SCOPE.md` Out: media providers. |
-| fireworks | supported-providers/fireworks.mdx: chat, responses, text, embeddings, models, count tokens | done | `openai.tov:20`. |
-| sarvam | supported-providers/sarvam.mdx: chat, responses, speech, STT, models, text, embeddings | partial | Chat only, through the OpenAI-compatible endpoint (`longtail.tov`, commit d27a62e). Speech, STT, text, embeddings and models are missing. |
-| wafer | supported-providers/wafer.mdx: chat, responses, text, file upload, models | partial | Chat only (`longtail.tov`, commit d27a62e). File upload, text and models are missing. |
-| databricks | supported-providers/databricks.mdx: chat, responses, embeddings, models, decisions | partial | Chat and embeddings (`providers/databricks.tov`, commit d27a62e). Decisions and model listing are missing. |
-| cloudflare | supported-providers/cloudflare.mdx: chat, responses, embeddings, decisions, models, rerank | partial | Chat and embeddings (`providers/cloudflare.tov`, commit d27a62e). Rerank, decisions and model listing are missing. |
-| typesafe | supported-providers/typesafe.mdx: decisions, models | missing | P2 (G36). |
+| fireworks | supported-providers/fireworks.mdx: chat, responses, text, embeddings, models, count tokens | done | `openai.tov:makeEndpoints`. Count tokens are an estimate (`extras.tov:countTokens`), not Fireworks' own counter. |
+| sarvam | supported-providers/sarvam.mdx: chat, responses, speech, STT, models, text, embeddings | partial | Chat only, through the OpenAI-compatible endpoint (`longtail.tov:longtailTable`). Speech and STT are sent to that endpoint by the media routes, not checked against Sarvam's API. Text, embeddings and models are missing. |
+| wafer | supported-providers/wafer.mdx: chat, responses, text, file upload, models | partial | Chat only (`longtail.tov:longtailTable`, `CHAT_ONLY`). File upload, text and models are missing. |
+| databricks | supported-providers/databricks.mdx: chat, responses, embeddings, models, decisions | partial | Chat and embeddings (`databricks.tov`; `supportsChat`, `supportsEmbeddings`). Decisions by emulation only, under `client.compat.decisions`. Model listing missing. |
+| cloudflare | supported-providers/cloudflare.mdx: chat, responses, embeddings, decisions, models, rerank | partial | Chat and embeddings (`cloudflare.tov`). Rerank missing (`extras.tov:rerankText` takes cohere, vllm and bedrock natively). Decisions by emulation only. Model listing missing. |
+| typesafe | supported-providers/typesafe.mdx: decisions, models | done | `typesafe.tov`: `/v1/decisions` and `/typesafe/v1/systemone` (`extras.tov:decisionRoute`), and `/typesafe/v1/models`. Chat is refused (`index.tov`). Commit 4c6eacb (L81). |
 | elevenlabs | supported-providers/elevenlabs.mdx: speech, sound effects, STT, models, realtime | out-of-scope | `SCOPE.md` Out: media providers. |
-| Raiju-only providers: together, lmstudio, nvidia, sambanova, deepinfra, novita, hyperbolic, lambda, moonshot, zhipu, dashscope, ai21, upstage, baseten, featherless, inception, friendli, siliconflow, github (GitHub Models), watsonx | not Bifrost constants (Bifrost reaches OpenAI-compatible endpoints through custom providers) | done (Raiju-only) | `openai.tov:14-29`, `longtail.tov:10-27`, `watsonx.tov`. Each is an OpenAI-compatible base URL plus prefix. |
+| Raiju-only providers: together, lmstudio, nvidia, sambanova, deepinfra, novita, hyperbolic, lambda, moonshot, zhipu, dashscope, ai21, upstage, baseten, featherless, inception, friendli, siliconflow, github (GitHub Models), watsonx | not Bifrost constants (Bifrost reaches OpenAI-compatible endpoints through custom providers) | done (Raiju-only) | `openai.tov:makeEndpoints`, `longtail.tov:longtailTable`, `watsonx.tov`. Each is an OpenAI-compatible base URL plus prefix. |
 | custom OpenAI-compatible providers | custom_provider_config | done | `config.tov`, `router.tov`. See c3 for the missing options. |
 
 ### d2. Operations across providers
 
-Bifrost: `core/schemas/bifrost.go:135-200` (request types), `core/providers/<name>/` (implementations).
+Bifrost: `core/schemas/bifrost.go:135-200` (request types), `core/providers/<name>/` (implementations). Raiju: `src/providers/index.tov` (chat and embeddings dispatch), `src/extras.tov` (rerank, count tokens, decisions), `src/media.tov` and its cloud and native modules (files, batches, images, speech, transcription).
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| Chat completions (non-stream) | core/providers | done | `providers/index.tov:51-64`. |
-| Chat completions (stream) | core/providers | done | `providers/index.tov:67-74`; `server.tov:330`, `front.tov`. Native SSE for OpenAI-format and Azure; converted for Anthropic, Gemini, Bedrock, Cohere, Vertex (`streams.tov`, `streams_cohere.tov`). |
-| Text completions | ChatCompletion-style text (text_completion) | partial | OpenAI-format providers only (`gateway.tov:1289-1293`). |
-| Responses API (create) | responses | done | Native OpenAI, translated others (`native.tov:187-212`). |
-| Responses lifecycle (retrieve, delete, cancel, input_items) | responses_retrieve, responses_delete, responses_cancel, responses_input_items | done | `media.tov:45-48` (commit 12757de). OpenAI and Azure. |
-| Responses input_tokens and compaction | responses_* | done | `media.tov:43-44` (commit 12757de). |
-| Embeddings | embedding | done | `providers/index.tov:25-49`. Anthropic has no embeddings upstream in Bifrost either. |
-| Speech (TTS) | speech, speech_stream | partial | OpenAI-compatible, Azure and Gemini (commit c363369). Other providers are not routed. |
-| Transcription (STT) | transcription, transcription_stream | partial | OpenAI-compatible and Azure only. Gemini STT is missing. |
-| Images (generate, edit, variation) | image_generation, image_edit, image_variation | partial | Generation: OpenAI-compatible, Azure and Gemini (Imagen). Edits and variations: OpenAI-compatible and Azure only. |
-| Files | file_upload, file_list, file_retrieve, file_delete, file_content | partial | OpenAI-compatible, Azure, Anthropic and Gemini (commit c363369). Vertex, Bedrock and Cohere missing. |
-| Batches | batch_create, batch_list, batch_retrieve, batch_cancel, batch_results, batch_delete | partial | OpenAI-compatible, Azure, Anthropic and Gemini (commit c363369). The results route is missing (a1). |
-| Rerank | (provider rerank) | done | Cohere and vLLM natively. Others error, except `raiju/lexical` (`extras.tov:27-55`, commit 12757de). |
-| Count tokens | count_tokens | partial | Exact for Anthropic and Gemini (`extras.tov:80-86`). Estimated elsewhere, marked `"exact": false` (`extras.tov:69`). Bedrock is an estimate too. |
-| List models | list_models | partial | Upstream listing for OpenAI-format, Anthropic, Gemini (`server.tov:31-42`). Others return the configured models only. |
-| Retrieve model | model_retrieve | partial | Route exists (`server.tov` `retrieveModel`). Returns a stub with `listed`, not provider metadata. |
-| OCR | ocr | done | Mistral and OpenAI-compatible (`media.tov:40`). |
-| Realtime (WebSocket) | realtime (provider-specific) | partial | OpenAI and Azure only (`SCOPE.md`). |
-| Realtime (WebRTC, client secrets, sessions) | realtime calls and client secrets | done | `media.tov:50-52` (commit 12757de). OpenAI-compatible providers. |
+| Chat completions (non-stream) | core/providers | done | `index.tov:supportsChat` and the chat dispatch in `index.tov`. |
+| Chat completions (stream) | core/providers | done | `index.tov` dispatch; `server.tov` and `front.tov`. Native SSE for OpenAI-format and Azure; converted for Anthropic, Gemini, Bedrock, Cohere, Vertex (`streams.tov`, `streams_cohere.tov`). |
+| Text completions | ChatCompletion-style text (text_completion) | partial | OpenAI-format providers only (`gateway.tov`, text completion route). |
+| Responses API (create) | responses | done | Native OpenAI, translated others (`native.tov`). |
+| Responses lifecycle (retrieve, delete, cancel, input_items) | responses_retrieve, responses_delete, responses_cancel, responses_input_items | done | `media.tov:matchRoute` (commit 12757de). OpenAI and Azure. |
+| Responses input_tokens and compaction | responses_* | done | `media.tov:matchRoute` (commit 12757de). |
+| Responses over WebSocket (GET /v1/responses upgrade) | responses (wsresponses.go) | partial | `wsresponses.tov:ResponsesSocket`: each response.create runs the responses path; events go out after the upstream finishes, not as they arrive. response.cancel missing. L101/L102 in flight. |
+| Live sessions (WebSocket and WebRTC create) | livesession.go, livecontrol.go, wslive.go, webrtclive.go | partial | `live.tov:LiveSocket`: GPT Live over WebSocket, OpenAI only; attach and content restricted to the owning virtual key. Other providers, and POST /v1/live/sessions (WebRTC create), missing. L101/L102 in flight. |
+| Embeddings | embedding | done | `index.tov:supportsEmbeddings` and `embeddingsUpstream`. Anthropic has no embeddings upstream in Bifrost either. |
+| Speech (TTS) | speech, speech_stream | partial | OpenAI-compatible (pass-through), Azure and Gemini (`media_native.tov:geminiSpeech`). Other native providers are not routed. |
+| Transcription (STT) | transcription, transcription_stream | partial | OpenAI-compatible (pass-through), Azure and Gemini (`media_native.tov:geminiTranscription`). Streamed transcription missing. |
+| Images (generate, edit, variation) | image_generation, image_edit, image_variation | partial | Generation: OpenAI-compatible, Azure, Gemini (Imagen and Gemini image), Vertex (`media_cloud.tov:vertexImage`), Bedrock (`media_cloud.tov:bedrockImage`). Edits and variations: OpenAI-compatible and Azure only. |
+| Files | file_upload, file_list, file_retrieve, file_delete, file_content | partial | OpenAI-compatible, Azure, Anthropic, Gemini, Vertex (GCS) and Bedrock (S3) (`media.tov:nativeMedia`, `media_cloud.tov`). Cohere missing. |
+| Batches | batch_create, batch_list, batch_retrieve, batch_cancel, batch_results, batch_delete | partial | OpenAI-compatible, Azure, Anthropic, Gemini, Vertex and Bedrock. The results route is served (`media.tov:matchRoute`, `batches/{id}/results`). Cohere missing. batch_delete: not in the route table. |
+| Rerank | (provider rerank) | done | Cohere, vLLM and Bedrock natively (`extras.tov:rerankText`). `raiju/lexical` is a local lexical ranking (`extras.tov`). Others error. |
+| Count tokens | count_tokens | partial | Exact for Anthropic and Gemini (`extras.tov:countTokens`) and for Bedrock models Bedrock can count (`extras.tov:bedrockCountTokens`). Estimated elsewhere, including Vertex, marked `"exact": false`. G33. |
+| List models | list_models | partial | Upstream listing for OpenAI-format, Anthropic and Gemini (`server.tov:upstreamModels`). Typesafe lists its own models. Others return the configured models only. |
+| Retrieve model | model_retrieve | partial | Route exists (`server.tov:retrieveModel`). Returns a stub with `listed`, not provider metadata. |
+| OCR | ocr | done | Mistral and OpenAI-compatible (`media.tov`). |
+| Realtime (WebSocket) | realtime (provider-specific) | partial | OpenAI and Azure only (`realtime.tov`). L101/L102 in flight covers live sessions for more providers, not this route. |
+| Realtime (WebRTC, client secrets, sessions) | realtime calls and client secrets | partial | Client secrets, sessions and SDP calls are routed (`media.tov:matchRoute`, `/v1/realtime/*`, commit 12757de), OpenAI-compatible providers. WebRTC create on `/v1/live/sessions` is missing (L101/L102 in flight). |
 | Videos and containers | video_*, container_* | out-of-scope | `SCOPE.md` Out. |
-| Passthrough (raw upstream proxy) | Passthrough, PassthroughStream | partial | Six of seven prefixes (`passthrough.tov`, commit 6b82d47). `/runware_passthrough` is missing (media provider, out of scope). |
-| Decisions | Decision (typesafe, openai, openrouter, cloudflare, databricks, perplexity, ollama) | missing | P2 (G36). |
+| Passthrough (raw upstream proxy) | Passthrough, PassthroughStream | partial | Six of seven prefixes (`passthrough.tov:PASS_ROUTES`, commit 6b82d47). `/runware_passthrough` is missing (media provider, out of scope). |
+| Decisions | Decision (typesafe, openai, openrouter, cloudflare, databricks, perplexity, ollama) | partial | Native route for TypeSafe and custom providers on the TypeSafe base format (`extras.tov:decisionRoute`, `providers/typesafe.tov`, L81). Other providers answer only by emulation under `client.compat.decisions` (`decision_emulate.tov`, off by default). Unprefixed `/decisions` routes and decision pricing overrides open (L81). |
 | Async jobs | core/schemas/async.go | done | See a1. |
-| Prompt caching (automatic injection) | prompt_cache.auto_inject, cache_control_injection_points | partial | Anthropic and Bedrock auto-inject (`anthropic.tov`, `bedrock.tov`; SCOPE). `cache_control_injection_points` missing. |
+| Prompt caching (automatic injection) | prompt_cache.auto_inject, cache_control_injection_points | partial | Anthropic and Bedrock auto-inject (`anthropic.tov`, `bedrock.tov`; SCOPE). `cache_control_injection_points` is read and reported, not applied (`config_compat.tov`). |
 | Reasoning / thinking parameters | docs/providers/reasoning.mdx (provider conversions) | done | `reasoning.tov`, `providers/anthropic.tov`, `gemini.tov`, `bedrock.tov` (commit ac4bf4f). |
-| Retries with backoff and Retry-After | network_config.max_retries and backoff | done | `router.tov`, `gateway.tov:640`. |
+| Retries with backoff and Retry-After | network_config.max_retries and backoff | done | `router.tov`, `gateway.tov` (retry loop). |
 | Fallback chains | fallbacks in request, routing rules | done | `router.tov`, `cel.tov`, `gateway.tov`. |
-| Weighted key balancing and per-key model lists | keys[].weight, keys[].models | done | `router.tov:63-78`, `keyAllows` (`router.tov:51-60`). |
+| Weighted key balancing and per-key model lists | keys[].weight, keys[].models | done | `router.tov` (weighted pick), `keyAllows` (`router.tov`). |
 | Key pinning | x-bf-api-key, x-bf-api-key-id | done | `gateway.tov`. |
 | Session affinity | x-bf-session-* | done | `affinity.tov`. |
-| Model aliases (static, per key) | keys[].aliases | done | `config.tov` KeyConfig.aliases; `router.tov:45-49`. |
+| Model aliases (static, per key) | keys[].aliases | done | `config.tov` KeyConfig.aliases; `router.tov`. |
 | Model aliases (dynamic, scoped, chained) | docs/providers/aliasing-models.mdx | partial | Chained key aliases with cycle and depth checks (`aliases.tov`, commit ebc25c7). Dynamic and scoped aliases are missing. |
-| Default provider resolution for unprefixed names | docs/providers/provider-routing.mdx (model catalog) | done | `router.tov`: key model lists, then the model family, then the model catalog (commit ebc25c7). |
-| Custom pricing and model catalog sync | framework/modelcatalog; docs/providers/custom-pricing.mdx | partial | Built-in datasheet (`pricing_data.tov`, commit 0c999ff). Sync from a URL when configured (`ops.tov:436-470`). Pricing overrides exist. Models outside the datasheet still cost 0. |
+| Default provider resolution for unprefixed names | docs/providers/provider-routing.mdx (model catalog) | done | `router.tov`: key model lists, then the model family, then the model catalog (commit ebc25c7). Bifrost's modelcatalogresolver plugin is this behaviour (see e). |
+| Custom pricing and model catalog sync | framework/modelcatalog; docs/providers/custom-pricing.mdx | partial | Built-in datasheet (`pricing_data.tov`). Sync from a URL when configured (`ops.tov`). Pricing overrides exist (see f). Models outside the datasheet cost 0 with a warning; `client.refuse_unpriced_models` (L95) refuses budgeted requests to them, off by default. |
 
 ## (e) Plugins
 
-Bifrost: `plugins/<name>/main.go` (plugin names at `PluginName` constants). Raiju: `src/plugins.tov` `makePlugin` (lines 347-372) and the feature code in `src/`.
+Bifrost: `plugins/<name>/main.go` (plugin names at `PluginName` constants). Raiju: plugin chain and built-in plugins in `src/plugins.tov` (`makePlugin`, `buildChain`); Bifrost plugin config is mapped by `src/config_compat.tov` (`mapPlugins`); feature code in `src/`.
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| governance plugin | plugins/governance (store.go, resolver.go, tracker.go, mcp.go) | done (built in) | `governance.tov`, `profiles.tov`, `rbac.tov`. Built in rather than loaded as a plugin. |
-| logging plugin | plugins/logging (writer.go, costrecalc.go, live.go) | partial | `logstore.tov`, `gateway.tov:448`. No cost recalculation endpoint, no live socket, no SQL writer. |
-| telemetry plugin (Prometheus) | plugins/telemetry/main.go | partial | Families and labels follow Bifrost (`metrics.tov`, commit 202c6e6). See h1 for the missing families. |
-| otel plugin | plugins/otel (traces and metrics, gRPC or HTTP, span filters) | partial | Traces (OTLP HTTP), metrics push (`otel_metrics.tov`) and plugin options (commits 0d269dd and abf4dbb). No gRPC: collector 4317 is rewritten to HTTP 4318. |
-| maxim plugin | plugins/maxim | missing | Third-party observability. Not in `SCOPE.md`. Decide. |
-| mocker plugin | plugins/mocker/main.go | partial | `plugins.tov`: `rules` with `model` or `contains` only. Bifrost has conditions (providers, models, regex, request size), weighted responses, latency, probability, priority, default_behavior. |
-| jsonparser plugin | plugins/jsonparser | partial | `plugins.tov` JsonParserConfig: `strip_markdown_fences` only. Compare the Bifrost plugin options before claiming parity. |
-| compat plugin | plugins/compat (convertparams, dropparams, azure, requestcopy) | missing | P2 (G37). |
-| modelcatalogresolver plugin | plugins/modelcatalogresolver | missing | P2. |
-| prompts plugin | plugins/prompts | missing | P2. Not in `SCOPE.md`. |
-| routing plugin | plugins/routing (complexity classifiers, decision models) | partial | CEL variables and RE2 `matches` (`cel.tov`, `regex.tov`, commit abf4dbb). No decision-model classifier (G36). |
-| semanticcache plugin | plugins/semanticcache/main.go:32-61 | partial | `semcache.tov`, with Qdrant and Redis through `vectorstore.tov` (commit d91ef07). The plugin entry is mapped. cache_tool_call_responses and disable_identity_scoping are reported as ignored. |
+| governance plugin | plugins/governance (store.go, resolver.go, tracker.go, mcp.go) | done (built in) | `governance.tov`, `profiles.tov`, `rbac.tov`. Built in rather than loaded as a plugin; its config maps onto the client section. |
+| logging plugin | plugins/logging (writer.go, costrecalc.go, live.go) | partial | `logstore.tov` (JSONL files, in-memory index, analytics, MCP logs), `gateway.tov` (log writes). The live feed is the `/ws` UI socket (`ops.tov`, `ws.tov`), scoped by data access. Missing: cost recalculation (`POST /api/logs/recalculate-cost`, costrecalc.go) and a SQL store (Raiju's is files). The multi-worker /ws registry is L101/L102 in flight. |
+| telemetry plugin (Prometheus) | plugins/telemetry/main.go | partial | Families and labels follow Bifrost (`metrics.tov`). Enrichment labels are recorded. See h1 for the missing families and the push gateway. |
+| otel plugin | plugins/otel (traces and metrics, gRPC or HTTP, span filters) | partial | Traces and metrics over OTLP HTTP and OTLP gRPC (plaintext h2c; TLS through the ALPN patch, L92) (`otel.tov`, `otel_metrics.tov`, `grpc.tov`). Plugin options `excluded_attributes`, `request_headers` and `disable_content_logging` are applied. Ignored with a note (`config_compat.tov`): `plugin_span_filter`, `export_overhead_spans`, `trace_type`, `overhead_breakdown_enabled`, `group_traces_by_session`, `disable_root_span_content`. |
+| maxim plugin | plugins/maxim | partial | Mapped to the Maxim log sink (`sink_maxim.tov`, L89; `config_compat.tov` maps `plugins[maxim]`). Traces and generations are pushed to the SDK log endpoint. The plugin's own tracing hooks are not built. Not in `SCOPE.md`. |
+| mocker plugin | plugins/mocker/main.go | partial | `plugins.tov:MockerPlugin`: `rules` with `model` or `contains` match, `status`, `response` or `content`, and `latency_ms`. Missing: conditions beyond model and contains (providers, regex on messages, request size), weighted responses, probability, priority, default_behavior and global latency. |
+| jsonparser plugin | plugins/jsonparser | partial | `plugins.tov:JsonParserPlugin`: `strip_markdown_fences` only. Other Bifrost plugin options not checked. |
+| compat plugin | plugins/compat (convertparams, dropparams, azure, requestcopy) | done | `compat.tov` (settings, Bifrost defaults, x-bf-compat), `decision_emulate.tov`, stream converters in `gateway.tov`. Covers convertparams, dropparams, azure_deepseek, text-to-chat, chat-to-responses, reasoning-only models and decisions (L82, L100). requestcopy.go is an internal clone, not a feature. Open: compat headers on streamed answers, native-decision model checks (L100). |
+| modelcatalogresolver plugin | plugins/modelcatalogresolver | done (built in) | The unprefixed-model default provider lookup is in `router.tov` (key model lists, model family, catalog). Not loaded as a plugin. |
+| prompts plugin | plugins/prompts | done (built in) | Raiju's prompt repository and deployments (`prompts.tov`, L88). `config_compat.tov` maps Bifrost's prompts plugin onto it. |
+| routing plugin | plugins/routing (complexity classifiers, decision models) | partial | CEL variables and RE2 `matches` (`cel.tov`, `regex.tov`). Complexity classifiers heuristic, decision (decision-model, L81), llm and semantic (`complexity.tov`). Missing: chain_rule (Raiju's routing rules do not chain; `config_compat.tov:mapRouting` says so). |
+| semanticcache plugin | plugins/semanticcache/main.go | done | `semcache.tov`, with Qdrant, Redis, Weaviate, Pinecone and chromem through `vectorstore.tov` (commits d91ef07, 0d24b99). cache_tool_call_responses and disable_identity_scoping are applied (L77). Options are read by `config_compat.tov`. |
 | circuit-breaker (docs/features/plugins/circuit-breaker.mdx) | docs | done | `health.tov`. Config location differs (c1). |
 | header plugin (set_request_headers) | not in Bifrost | done (Raiju-only) | `plugins.tov` (`header`). |
 | blocklist plugin | not in Bifrost | done (Raiju-only) | `plugins.tov` (`blocklist`). |
 | maxtokens plugin | not in Bifrost | done (Raiju-only) | `plugins.tov` (`maxtokens`). |
 | Dynamic plugins (Go shared objects, WASM) | docs/plugins/getting-started.mdx, writing-go-plugin.mdx, writing-wasm-plugin.mdx | missing | Raiju plugins are compiled in (`SCOPE.md` notes). P2. |
-| Plugin ordering | docs/plugins/sequencing.mdx | partial | `plugins.tov` `buildChain`: config order. |
+| Plugin ordering | docs/plugins/sequencing.mdx | partial | `plugins.tov:buildChain`: config order. |
 
 ## (f) Governance
 
-Bifrost: `docs/features/governance/*.mdx`, `docs/enterprise/*.mdx`, and `handlers/governance.go`. Raiju: `src/governance.tov`, `src/profiles.tov`, `src/rbac.tov`, `src/pricing.tov`, `src/guardrails.tov`.
+Bifrost: `docs/features/governance/*.mdx`, `docs/enterprise/*.mdx`, and `handlers/governance.go`, `virtualkeyrotation.go`, `virtualkeyexpiry.go`, `logvisibility.go`. Raiju: `src/governance.tov`, `src/profiles.tov`, `src/rbac.tov`, `src/pricing.tov`, `src/guardrails.tov`, `src/store.tov` (management routes).
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| Virtual keys (create, list, update, delete) | features/governance/virtual-keys.mdx | done | `store.tov:924-941`, `governance.tov`. |
-| VK key rotation and cooldown | handlers/governance.go (rotate), vk_rotation_cooldown | missing | P2. |
-| VK budgets and rate limits per provider config | budget-and-limits.mdx "Provider-Level Governance" | done | `governance.tov:160-172`. |
-| VK allowed providers and models | routing.mdx "Provider/Model Restrictions" | done | `governance.tov:160-172`. |
-| Budgets (USD, reset durations) | budget-and-limits.mdx | done | `governance.tov:8, 24`, `durationMs`. |
-| Budget hierarchy: VK, team, customer | budget-and-limits.mdx | done | `governance.tov:174-186`. |
-| Budget hierarchy: business unit, project | enterprise/projects.mdx; teams-business-units-customers.mdx | missing | P2. |
-| Budget overrides per VK | handlers/governance.go (budget override) | missing | P2. |
-| Rate limits (request and token windows) | budget-and-limits.mdx | done | `governance.tov:115-117`, `governance.tov:189-201`. |
-| Model limits (model-level budgets and rate limits, scope system) | features/governance/model-limits.mdx | done | `model_configs` (commit 31f4aaa). |
-| Provider-level governance (global) | budget-and-limits.mdx | done | `governance.providers` and `/api/governance/providers` (commit 31f4aaa). |
-| Customers | teams-business-units-customers.mdx | done | `store.tov:33`. |
-| Teams | teams-business-units-customers.mdx | done | `store.tov:33`. |
-| Required headers (global and per profile) | features/governance/required-headers.mdx | done | `governance.tov:86`, `governance.tov:141-146`. |
+| Virtual keys (create, list, update, delete) | features/governance/virtual-keys.mdx | done | `store.tov` (`handleApi`, virtual-keys routes), `governance.tov`. |
+| VK key rotation and cooldown | handlers/governance.go (rotate), virtualkeyrotation.go, vk_rotation_cooldown | missing | No rotate routes (`POST /api/governance/virtual-keys/rotate`, `.../{vk_id}/rotate`) and no cooldown. `client.vk_rotation_cooldown` is reported as ignored (`config_compat.tov`). P2. |
+| VK expiry and expired-key cleanup | virtualkeyexpiry.go; client.delete_expired_virtual_keys | missing | No expiry field on virtual keys (`governance.tov`, `store.tov`). `client.delete_expired_virtual_keys` is reported as ignored (`config_compat.tov`). |
+| VK budgets and rate limits per provider config | budget-and-limits.mdx "Provider-Level Governance" | done | `governance.tov` (provider configs). |
+| VK allowed providers and models | routing.mdx "Provider/Model Restrictions" | done | `governance.tov` (provider and model checks). |
+| Budgets (USD, reset durations) | budget-and-limits.mdx | done | `governance.tov` (budgets, `durationMs`), `store.tov` (budgets routes). |
+| Budget hierarchy: VK, team, customer | budget-and-limits.mdx | done | `governance.tov` (team and customer budgets). |
+| Budget hierarchy: business unit, project | enterprise/projects.mdx; teams-business-units-customers.mdx | done | `governance.tov` (business unit and project budgets, L84); `store.tov` (projects and business-units routes). |
+| Budget overrides per VK | handlers/governance.go (budget override) | missing | No `/api/governance/virtual-keys/{vk_id}/budgets/{budget_id}/override` routes. P2. |
+| Rate limits (request and token windows) | budget-and-limits.mdx | done | `governance.tov` (rate-limit windows). |
+| Model limits (model-level budgets and rate limits, scope system) | features/governance/model-limits.mdx | done | `model_configs` (`store.tov`, commit 31f4aaa). |
+| Provider-level governance (global) | budget-and-limits.mdx | done | `governance.providers` and `/api/governance/providers` (`store.tov`, commit 31f4aaa). |
+| Customers | teams-business-units-customers.mdx | done | `store.tov`; attribution in `governance.tov` (`Attribution`). |
+| Teams | teams-business-units-customers.mdx | done | `store.tov`; attribution in `governance.tov`. |
+| Required headers (global and per profile) | features/governance/required-headers.mdx | done | `governance.tov` (required headers). |
 | Access profiles (reusable permission sets) | enterprise/access-profiles.mdx | partial | `profiles.tov`. No versions, clone, activate or deactivate, role binding, propagate. |
-| RBAC (fixed roles) | enterprise/rbac.mdx | partial | `rbac.tov`: admin, editor, viewer, auditor. |
-| RBAC (custom roles, permission editor) | handlers/governance.go (rbac roles and permissions) | missing | P2. |
-| Data access control (scopes per role) | enterprise/data-access-control.mdx | missing | P2. |
+| RBAC (fixed roles) | enterprise/rbac.mdx | partial | `rbac.tov`: built-in roles admin, editor, viewer, auditor. Bifrost's role-id API shape is open (L84). |
+| RBAC (custom roles, permission editor) | handlers/governance.go (rbac roles and permissions) | partial | Custom roles under `governance.roles`, holding (resource, operation) pairs (`rbac.tov`, L84), via the management API. Open: Bifrost's role-id API shape. Permission editor UI not checked. |
+| Data access control (scopes per role) | enterprise/data-access-control.mdx | partial | Data access scopes on logs and analytics (`logstore.tov`, `ops.tov`, L84). Open: project members API, split policies, entity_dac overrides. |
 | Users and tokens | enterprise/user-provisioning.mdx (SCIM excluded) | partial | `rbac.tov`, `ops.tov`. Basic and Bearer user tokens. |
 | SSO: generic OIDC (PKCE, groups to roles) | enterprise/setting-up-generic-oidc | done | `oidc.tov`. Provider guides (Okta, Entra, Keycloak, Auth0, Zitadel, Google Workspace) are configurations of the same protocol, not verified individually. |
 | SSO: Google and GitHub | features/sso-with-google-github.mdx | n/a | Bifrost marks it "Coming soon". |
 | SCIM and user provisioning | enterprise/user-provisioning.mdx | out-of-scope | `SCOPE.md` Out: SCIM. |
-| Audit logs (hash chain, HMAC, export, verify) | enterprise/audit-logs.mdx | partial | `audit.tov`. Missing: archive to object storage, retention, omit-IP option, per-entity routes. |
-| Pricing overrides | governance.pricing_overrides; docs/providers/custom-pricing.mdx | missing | P1 (G21). |
-| Cost tracking (price table) | docs/providers/custom-pricing.mdx; framework/modelcatalog | partial | Built-in datasheet, overrides and sync (see d2). Models outside it cost 0, and budgets skip them with a one-time warning (`gateway.tov`, `unpriced`). No refusal. |
-| Complexity analyzer config | governance.complexity_analyzer_config; docs/features/complexity-router.mdx | partial | `complexity.tov`, config only. |
+| Audit logs (hash chain, HMAC, export, verify) | enterprise/audit-logs.mdx | partial | `audit.tov` (`actionFor`, `maskDetail`, chain, export, verify). Missing: archive to object storage, retention, omit-IP option, per-entity routes. |
+| Pricing overrides | governance.pricing_overrides; docs/providers/custom-pricing.mdx | done | `pricing.tov` (installed from `governance.pricing_overrides`), `store.tov` (`/api/governance/pricing-overrides`). Was P1 (G21); the code has it on HEAD. |
+| Cost tracking (price table) | docs/providers/custom-pricing.mdx; framework/modelcatalog | partial | Built-in datasheet, overrides and sync (see d2). Models outside it cost 0, and budgets skip them with a one-time warning (`gateway.tov`, `unpriced`). `client.refuse_unpriced_models` (L95) refuses budgeted requests to them with 403; off by default. |
+| Complexity analyzer config | governance.complexity_analyzer_config; docs/features/complexity-router.mdx | partial | The routing plugin's analyzer maps to `complexity_router` (`config_compat.tov:mapRouting`). The governance key itself is not read. Classifiers are in `complexity.tov` (see e). |
 | Adaptive load balancing (weights, held keys, incidents, API) | enterprise/adaptive-load-balancing.mdx | partial | `health.tov`: weights. No held-keys or incidents API. |
-| Circuit breaker policies (API) | enterprise/circuit-breaker.mdx | partial | `health.tov`. Config only. |
+| Circuit breaker policies (API) | enterprise/circuit-breaker.mdx | partial | Policies in config and API, persisted, with breaker reset and policy rerouting (`health.tov`, `ops.tov`, L91). Open: per-key sub-circuits. |
 | Routing rules (CEL) | providers/routing-rules.mdx | done | `cel.tov` with Bifrost's variables, and RE2 `matches` (`regex.tov`, commit abf4dbb). |
-| Projects | enterprise/projects.mdx | missing | P2. |
-| Prompt deployments | enterprise/prompt-deployments.mdx | missing | P2. Not in `SCOPE.md`. |
+| Projects | enterprise/projects.mdx | done | `store.tov` (`/api/governance/projects`), `governance.tov` (access_rule, accounting_mode), `config.tov` (`ProjectConfig`), x-bf-project-id and x-bf-project-name (L84). Open: project members API and split policies. |
+| Prompt deployments | enterprise/prompt-deployments.mdx | done | `prompts.tov`: prompt repository and deployments (L88). |
 | Alerts on budget and rate-limit usage | enterprise/alerting/alert-rules.mdx (budget_usage_percent, rate_limit_*_usage_percent, cel_expression) | done | `alertapi.tov` and `alerts.tov`: CEL rules over budget and rate-limit usage (commit 8e98ea5). |
-| Governance per request: x-bf-customer-id | budget-and-limits.mdx | missing | P2. |
+| Governance per request: x-bf-customer-id | budget-and-limits.mdx | done | `governance.tov` (attribution from x-bf-customer-id, L84). |
+| Virtual key quota view (GET /api/governance/virtual-keys/quota) | handlers/governance.go | missing | No quota route. P2. |
 
 ## (g) MCP
 
-Bifrost: `docs/mcp/*.mdx`, `handlers/mcp*.go`, `core/mcp`, `config.schema.json` `mcp`. Raiju: `src/mcp.tov`, `src/mcpauth.tov`, `src/mcpserver.tov`, `src/agent.tov`, `src/vmcp.tov`, `src/ops.tov`.
+Bifrost: `docs/mcp/*.mdx`, `handlers/mcp*.go`, `core/mcp`, `config.schema.json` `mcp`. Raiju: `src/mcp.tov`, `src/mcpauth.tov`, `src/mcpapi.tov`, `src/mcpserver.tov`, `src/agent.tov`, `src/vmcp.tov`, `src/guard_mcp.tov`, `src/ops.tov`.
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
 | MCP client over HTTP (streamable) | mcp/connecting-to-servers.mdx | done | `mcp.tov`. |
 | MCP client over SSE | mcp/connections.mdx | done | `mcp.tov` ("sse" uses the POST transport). |
 | MCP client over stdio | mcp/connections.mdx | done | `mcp.tov` (`stdio_config`), one server per worker (SCOPE). |
-| MCP client inprocess and OpenAPI-defined servers | mcp/openapi-servers.mdx | missing | P2. |
+| MCP client inprocess and OpenAPI-defined servers | mcp/openapi-servers.mdx | missing | `mcpapi.tov` answers `openapi-spec` with 404 for non-OpenAPI clients. P2. |
 | Auth: bearer and static headers | mcp/auth | done | `mcpauth.tov`. |
 | Auth: OAuth client credentials and refresh token | mcp/auth | done | `mcpauth.tov` (SCOPE: L36). |
-| Auth: per-user OAuth (authorization code, consent) | mcp/gateway-auth.mdx; handlers/mcpoauth2*.go | missing | P2. |
-| Auth: per-user headers | handlers/mcpheaders.go | missing | P2. |
-| Auth: token exchange | mcp/auth; mcp_client_config.auth_type | missing | P2. |
-| Tool filtering: per client (`tools_to_execute`) | mcp/filtering.mdx Level 1 | done | `mcp.tov:17`. |
+| Auth: OAuth authorization code (client-level "oauth", PKCE, dynamic registration) | mcp/gateway-auth.mdx; handlers/mcpoauth2*.go | done | `mcpauth.tov`, `mcpapi.tov:oauthRoute` and `oauthCallback` (L91). Consent is for the client, not per user. |
+| Auth: per-user OAuth (per_user_oauth, consent per user) | handlers/mcpsessions.go (per-user flows), mcpoauth2consent.go | missing | No per_user_oauth type; `mcpapi.tov` refuses reauthorize for it. No `/api/oauth/per-user/flows` routes. P2. |
+| Auth: per-user headers | handlers/mcpheaders.go | missing | No per_user_headers type; `mcpapi.tov` refuses verify-headers. No `/api/mcp/per-user-headers/flows` routes. P2. |
+| Auth: token exchange | mcp/auth; mcp_client_config.auth_type | missing | No token_exchange type; `mcpapi.tov` refuses verify-exchange. P2. |
+| Temporary MCP tokens (client.mcp_enable_temp_token_auth) | handlers/temptokens.go | missing | Reported as ignored (`config_compat.tov`). P2. |
+| Tool filtering: per client (`tools_to_execute`) | mcp/filtering.mdx Level 1 | done | `mcp.tov`. |
 | Tool filtering: request headers (include clients) | mcp/filtering.mdx Level 2 | partial | x-bf-mcp-include-clients only. Missing: x-bf-mcp-include-tools. |
 | Tool filtering: virtual key allow-lists | mcp/filtering.mdx Level 3 | partial | Access profiles `mcp_tools` (`profiles.tov`, `config.tov`). |
-| Tool filtering: tool groups | config.schema.json mcp.tool_groups (no docs page) | missing | P2. |
-| Tool execution endpoint | handlers/mcpinference.go | done | `server.tov:220`. |
-| Agent mode (gateway runs allowed tool calls) | mcp/agent-mode.mdx | done | `agent.tov`; `gateway.tov:456-457`. Per-client config differs (client-level `mcp_auto_execute`). |
-| Tool execution timeout | mcp/tool-execution.mdx | partial | `mcp.tool_execution_timeout_seconds` (`config.tov`). |
-| Gateway as MCP server (POST /mcp) | mcp/overview.mdx; handlers/mcpserver.go | done | `ops.tov:645-700`, `mcpserver.tov`. |
-| Gateway as MCP server (SSE GET) | handlers/mcpserver.go | missing | P2. |
+| Tool filtering: tool groups | config.schema.json mcp.tool_groups (no docs page) | missing | `config_compat.tov` reads the deprecated mcp.tool_groups as virtual_mcps; no separate tool groups. P2. |
+| Tool execution endpoint | handlers/mcpinference.go | done | `server.tov` (`/mcp` tool execution), `ops.tov`. |
+| Agent mode (gateway runs allowed tool calls) | mcp/agent-mode.mdx | done | `agent.tov`; `gateway.tov` (agent loop). Per-client config differs (client-level `mcp_auto_execute`). |
+| Tool execution timeout | mcp/tool-execution.mdx | done | `mcp.tov` (`tool_execution_timeout_seconds`), `config.tov`. |
+| Gateway as MCP server (POST /mcp) | mcp/overview.mdx; handlers/mcpserver.go | done | `ops.tov` (`mcp`), `mcpserver.tov`. |
+| Gateway as MCP server (SSE GET) | handlers/mcpserver.go | missing | `mcpserver.tov` has no GET stream. P2. |
 | Virtual MCPs (named tool sets, renamed tools) | mcp/virtual-mcps.mdx | done | `vmcp.tov` (config-defined), `/mcp/{name}`. |
 | Virtual MCPs management API | handlers/virtualmcp.go | done | CRUD and virtual-key attach and detach at `/api/mcp/virtual-mcps` (`mcpapi.tov`, commit 5c2c8af). |
-| MCP sessions (list, reauth, revoke) | mcp/sessions.mdx | missing | P2. |
-| MCP logs (/api/mcp-logs) | handlers/logging.go | missing | P2. |
-| MCP client management API | handlers/mcp.go | partial | CRUD, reconnect and refresh-tools (`mcpapi.tov`, commit 5c2c8af). Verify, reauthorize and OAuth routes answer 501. |
+| MCP sessions (list, reauth, revoke) | mcp/sessions.mdx; handlers/mcpsessions.go | missing | No `/api/mcp/sessions` routes. P2. |
+| MCP logs (/api/mcp-logs) | handlers/logging.go | done | `logstore.tov` (MCP analytics), `ops.tov` (L79). |
+| MCP client management API | handlers/mcp.go | partial | CRUD, reconnect, refresh-tools and openapi-spec (`mcpapi.tov`, commit 5c2c8af). Verify, reauthorize and reregister answer Bifrost's refusal for client types they do not apply to; per_user_* and token exchange are missing. |
 | MCP OpenAPI import and preview | handlers/mcpopenapi.go | missing | P2. |
-| MCP tool sync interval (periodic re-list) | mcp_client_config.tool_sync_interval | missing | P2. |
-| MCP as an OAuth authorization server for MCP clients | mcp/gateway-auth.mdx; handlers/mcpoauth2issuance.go | missing | P2. |
-| MCP guardrails (tool-call guard) | enterprise/guardrails.mdx "MCP Guardrails" | missing | P2. Grep finds no MCP reference in `guardrails.tov` or `guardrail_providers.tov`. |
+| MCP tool sync interval (periodic re-list) | mcp_client_config.tool_sync_interval | done | `mcp.tov` (`syncSeconds`, `startToolSync`; L76). Set per client, not as a global default. |
+| MCP as an OAuth authorization server for MCP clients | mcp/gateway-auth.mdx; handlers/mcpoauth2issuance.go | missing | `mcpauth.tov` only consumes discovery documents; no issuance, consent or JWT routes. P2. |
+| MCP guardrails (tool-call guard) | enterprise/guardrails.mdx "MCP Guardrails" | done | `guard_mcp.tov`, wired into the gateway (L86, L90). |
 | MCP code mode | mcp/code-mode.mdx | out-of-scope | `SCOPE.md` Out: MCP code mode. |
-| MCP SSRF guard (require_public_target) | mcp_client_config.require_public_target | missing | P2. |
-| MCP pricing per tool | mcp_client_config.tool_pricing | missing | P2. |
+| MCP SSRF guard (require_public_target) | mcp_client_config.require_public_target | missing | Not read (no hit in `src`). P2. |
+| MCP pricing per tool | mcp_client_config.tool_pricing | missing | Not read. P2. |
 
 ## (h) Observability
 
-Bifrost: `plugins/telemetry/main.go` (metric definitions at lines 420-694), `core/schemas/enrichment.go` (label dimensions at lines 53-92), `docs/features/observability/*.mdx`. Raiju: `src/metrics.tov`, `src/gateway.tov` (call sites), `src/logstore.tov`, `src/otel.tov`, `src/exporters.tov`, `src/exports.tov`, `src/alerts.tov`.
+Bifrost: `plugins/telemetry/main.go` (metric definitions at lines 420-694), `core/schemas/enrichment.go` (label dimensions at lines 53-92), `docs/features/observability/*.mdx`. Raiju: `src/metrics.tov`, `src/gateway.tov` (call sites), `src/logstore.tov`, `src/otel.tov`, `src/otel_metrics.tov`, `src/exporters.tov`, `src/exports.tov`, `src/alerts.tov`.
 
 ### h1. Metrics
 
@@ -695,89 +702,93 @@ Bifrost: `plugins/telemetry/main.go` (metric definitions at lines 420-694), `cor
 | bifrost_upstream_latency_seconds | telemetry/main.go:467 | done | `gateway.tov`, with `is_success` and the enrichment labels (commit 202c6e6). |
 | bifrost_success_requests_total | telemetry/main.go:505 | done | `metrics.tov` (commit 202c6e6). |
 | bifrost_error_requests_total (status_code, error_type) | telemetry/main.go:517 | done | `metrics.tov`, with status_code and error_type (commit 202c6e6). |
-| bifrost_input_tokens_total | telemetry/main.go:525 | done | `gateway.tov:982`. |
-| bifrost_output_tokens_total | telemetry/main.go:533 | done | `gateway.tov:983`. |
+| bifrost_input_tokens_total | telemetry/main.go:525 | done | `gateway.tov` (token accounting). |
+| bifrost_output_tokens_total | telemetry/main.go:533 | done | `gateway.tov` (token accounting). |
 | bifrost_cache_hits_total (cache_type) | telemetry/main.go:541 | done | `metrics.tov` `cache_type` label (commit 202c6e6). |
 | bifrost_cache_read_input_tokens_total, bifrost_cache_write_input_tokens_total (_5m, _1h) | telemetry/main.go:551-575 | done | `metrics.tov` (commit 202c6e6). |
-| bifrost_cost_total | telemetry/main.go:583 | done | `gateway.tov:984`. Values depend on the price table (f). |
-| bifrost_routing_embedding_requests_total, bifrost_routing_embedding_cost_total, bifrost_routing_llm_requests_total, bifrost_routing_llm_cost_total | telemetry/main.go:598-627 | missing | P2. |
+| bifrost_cost_total | telemetry/main.go:583 | done | `gateway.tov` (cost recording). Values depend on the price table (f). |
+| bifrost_routing_embedding_requests_total, bifrost_routing_embedding_cost_total, bifrost_routing_llm_requests_total, bifrost_routing_llm_cost_total | telemetry/main.go:598-627 | missing | Not defined in `metrics.tov`. The decision and LLM classifiers (L81) do not record these. Raiju's own `raiju_routing_decisions_total` is a different family. P2. |
 | bifrost_stream_first_token_latency_seconds, bifrost_stream_inter_token_latency_seconds | telemetry/main.go:635-644 | done | `metrics.tov` (commit 202c6e6). |
 | bifrost_request_retries | telemetry/main.go:653 | done | `gateway.tov` records the retries spent on each provider. |
-| bifrost_key_rotation_events_total | telemetry/main.go:667 | missing | P2. |
-| bifrost_active_requests | telemetry/main.go:675 | missing | P2. |
-| bifrost_provider_key_up | telemetry/main.go:683 | missing | P2. |
-| bifrost_mcp_client_operation_duration_seconds | telemetry/main.go:694 | missing | P2. |
+| bifrost_key_rotation_events_total | telemetry/main.go:667 | done | `metrics.tov:observeRotation`, called from the retry loop in `gateway.tov` (L76 and the rotation work). |
+| bifrost_active_requests | telemetry/main.go:675 | done | `gateway.tov` (in flight from routing until the answer, `metrics.tov`). |
+| bifrost_provider_key_up | telemetry/main.go:683 | done | `metrics.tov:observeKeyUp`, called from `gateway.tov` after each attempt. |
+| bifrost_mcp_client_operation_duration_seconds | telemetry/main.go:694 | done | `gateway.tov` (per tool call, `metrics.tov`). |
 | bifrost_overhead_latency_microseconds | telemetry/main.go:479 | done | `metrics.tov`, with labels (commit 202c6e6). |
-| bifrost_overhead_component_microseconds | telemetry/main.go:496 | missing | P2. |
-| http_requests_total, http_request_duration_seconds, http_request_size_bytes, http_response_size_bytes (path, method, status) | telemetry/main.go:420-449 | done | Recorded by the front ends (`front.tov:70-75`, `server.tov:124`, commit 0b03e53). |
-| bifrost_request_duration_seconds | not defined by the Bifrost telemetry plugin | done (Raiju-only) | `gateway.tov:1021`. |
-| raiju_realtime_sessions, raiju_mcp_tool_calls_total, raiju_guardrail_checks_total, raiju_guardrail_findings_total | not in Bifrost | done (Raiju-only) | `realtime.tov`, `gateway.tov:483`, `776`, `1095`, `1118`, `1226`. |
-| Label dimensions: virtual_key_name, team_name, customer_name, selected_key_name, routing_rule_name, complexity_tier, alias, app, fallback_index, and the id variants | core/schemas/enrichment.go:53-92 (MetricSafeEnrichmentDimNames) | missing | P1 (G18). Raiju's labels are provider, model and status only (`metrics.tov:167-171`). |
-| Custom labels: x-bf-dim-*, x-bf-prom-*, client.prometheus_labels | lib/ctx.go:443-449; config.schema client.prometheus_labels | missing | P2. |
-| Default HTTP metric labels and the telemetry push gateway | telemetry/main.go; docs/features/telemetry.mdx | missing | P2. |
+| bifrost_overhead_component_microseconds | telemetry/main.go:496 | done | `gateway.tov` records the components into `metrics.tov`, with `overhead_component` (L79). |
+| http_requests_total, http_request_duration_seconds, http_request_size_bytes, http_response_size_bytes (path, method, status) | telemetry/main.go:420-449 | done | Recorded by the front ends (`front.tov`, `server.tov`, commit 0b03e53). |
+| bifrost_request_duration_seconds | not defined by the Bifrost telemetry plugin | done (Raiju-only) | `gateway.tov`. |
+| raiju_realtime_sessions, raiju_mcp_tool_calls_total, raiju_guardrail_checks_total, raiju_guardrail_findings_total, raiju_routing_decisions_total | not in Bifrost | done (Raiju-only) | `realtime.tov`, `gateway.tov`, `guard_*.tov`, `metrics.tov`. |
+| Label dimensions: virtual_key_name, team_name, customer_name, business_unit_name, project_name, selected_key_name, routing_rule_name, complexity_tier, alias, app, fallback_index, and the id variants | core/schemas/enrichment.go:53-92 (MetricSafeEnrichmentDimNames) | done | `metrics.tov:RequestLabels` (L79, L84). |
+| Custom labels: x-bf-dim-*, x-bf-prom-*, client.prometheus_labels | lib/ctx.go:443-449; config.schema client.prometheus_labels | done | `metrics.tov` custom labels (commit cbd6ad3, G49). |
+| Default HTTP metric labels and the telemetry push gateway | telemetry/main.go; docs/features/telemetry.mdx | missing | `push_gateway` is reported as ignored (`config_compat.tov`); no push loop. P2. |
+| Profiling endpoints (dev pprof) | handlers/devpprof.go | out-of-scope | Dev-only in Bifrost; not in `SCOPE.md`. |
 
 ### h2. Logs and traces
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| Request log store (queryable) | plugins/logging; handlers/logging.go | partial | `logstore.tov`: JSONL files and an in-memory index. Per worker (README "Known gaps"). |
-| Content logging: global switch | client.disable_content_logging | done | `logs_store.content_logging` and `client.disable_content_logging` (`gateway.tov:1503-1504`, commit 12757de). |
-| Content logging: per request | x-bf-disable-content-logging | done | `x-bf-disable-content-logging` (`gateway.tov:1503`, commit 12757de). |
+| Request log store (queryable) | plugins/logging; handlers/logging.go | partial | `logstore.tov`: JSONL files and an in-memory index, with analytics (histograms, stats, rankings). Per worker (README "Known gaps"). |
+| Content logging: global switch | client.disable_content_logging | done | `logs_store.content_logging` and `client.disable_content_logging` (`gateway.tov`, commit 12757de). |
+| Content logging: per request | x-bf-disable-content-logging | done | `gateway.tov` (commit 12757de). |
 | Log retention (days) | logs_store.retention_days; enterprise/log-exports.mdx | done | `logstore.tov`. |
 | Log sinks: Datadog, Splunk HEC, Elasticsearch, generic HTTP | docs/features/observability/datadog.mdx, splunk.mdx | done | `exporters.tov` (SCOPE). |
-| Log sinks: BigQuery, Kafka, Pub/Sub | docs/features/observability/bigquery.mdx, kafka.mdx, pubsub.mdx | missing | P2. |
-| Log sink: Maxim | docs/features/observability/maxim.mdx; plugins/maxim | missing | P2. Not in `SCOPE.md`. |
+| Log sinks: BigQuery, Kafka, Pub/Sub | docs/features/observability/bigquery.mdx, kafka.mdx, pubsub.mdx | done | `sink_gcp.tov` (BigQuery, Pub/Sub), `sink_kafka.tov`, wired by L89. |
+| Log sink: Maxim | docs/features/observability/maxim.mdx; plugins/maxim | done | `sink_maxim.tov`, wired by L89. |
 | Log exports to S3 and GCS | enterprise/log-exports.mdx | done | `exports.tov`. |
-| Log exports: Parquet payloads, retention policy, redaction on export | enterprise/log-exports.mdx | partial | `exports.tov` writes JSONL only. |
-| OpenTelemetry traces | plugins/otel; features/otel.mdx | partial | `otel.tov`: OTLP HTTP, sampling, batching, traceparent (commit 0d269dd). No gRPC. |
-| OpenTelemetry metrics export | plugins/otel/metrics.go | partial | OTLP/HTTP JSON push of four families: upstream requests and latency, overhead and sessions (`otel_metrics.tov`, commit abf4dbb). No gRPC. |
-| Latency breakdown (overhead components) | features/observability/latency-breakdown.mdx | partial | `x-bf-overhead-us` and `bifrost_overhead_latency_microseconds` only. |
-| Dashboards, histograms and rankings (management API) | handlers/logging.go | missing | P2. |
+| Log exports: Parquet payloads, retention policy, redaction on export | enterprise/log-exports.mdx | partial | Parquet (`sink_parquet.tov`) and export retention (L85) are done. No redaction on export (`exports.tov`). |
+| OpenTelemetry traces | plugins/otel; features/otel.mdx | partial | `otel.tov`: OTLP HTTP and gRPC (plaintext h2c; TLS through ALPN, L92), sampling, batching, traceparent (commits 0d269dd, ada3c7e). Span filters missing. |
+| OpenTelemetry metrics export | plugins/otel/metrics.go | partial | OTLP push (HTTP JSON and gRPC) of four families: upstream requests and latency, overhead and sessions (`otel_metrics.tov`, commit abf4dbb). Other families are not exported. |
+| Latency breakdown (overhead components) | features/observability/latency-breakdown.mdx | partial | `x-bf-overhead-us`, `bifrost_overhead_latency_microseconds` and `bifrost_overhead_component_microseconds` (h1). `overhead_breakdown_enabled` on the otel plugin is ignored (e). |
+| Dashboards, histograms and rankings (management API) | handlers/logging.go | done | `logstore.tov` (analytics: histogram, stats, rankings; L79). Routes in `ops.tov`. |
+| Cost recalculation (POST /api/logs/recalculate-cost and status routes) | plugins/logging/costrecalc.go; handlers/logging.go | missing | No recalculation route (`ops.tov`, `logstore.tov`). P2. |
 | Alerts: webhook and Slack | enterprise/alerting | done | `alerts.tov` (channel type is webhook or slack). |
-| Alerts: Microsoft Teams and PagerDuty channels | enterprise/alerting/alert-channels.mdx | done | `alerts.tov:41-51` (commit abf4dbb). |
+| Alerts: Microsoft Teams and PagerDuty channels | enterprise/alerting/alert-channels.mdx | done | `alerts.tov` (commit abf4dbb). |
 | Alert metrics: budget and rate-limit usage percent, CEL scoping | enterprise/alerting/alert-rules.mdx | done | CEL rules over budget and rate-limit usage (`alertapi.tov`, commit 8e98ea5). |
 
 ## (i) Enterprise
 
-Bifrost: `docs/enterprise/*.mdx`.
+Bifrost: `docs/enterprise/*.mdx`, `handlers/notifications.go`, `handlers/webhooks.go`, `handlers/featureflags.go`, `handlers/livesession.go`.
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
 | Audit logs | enterprise/audit-logs.mdx | partial | `audit.tov`. See f. |
-| RBAC | enterprise/rbac.mdx | partial | `rbac.tov`. Fixed roles. |
-| Custom roles and data access control | enterprise/data-access-control.mdx | missing | P2. |
+| RBAC | enterprise/rbac.mdx | partial | `rbac.tov`. Built-in roles and custom roles (L84). See f. |
+| Custom roles and data access control | enterprise/data-access-control.mdx | partial | Custom roles and data access scopes done (L84). Open: project members API, split policies, entity_dac overrides. See f. |
 | SSO: generic OIDC | enterprise/setting-up-generic-oidc | done | `oidc.tov`. |
 | SSO: Google, GitHub | features/sso-with-google-github.mdx ("Coming soon") | n/a | Not GA upstream. |
 | SCIM and user provisioning | enterprise/user-provisioning.mdx | out-of-scope | `SCOPE.md` Out: SCIM. |
 | Access profiles | enterprise/access-profiles.mdx | partial | `profiles.tov`. See f. |
-| Projects | enterprise/projects.mdx | missing | P2. |
-| Teams, business units, customers | enterprise/teams-business-units-customers.mdx | partial | Teams and customers done. Business units missing. |
-| Prompt deployments | enterprise/prompt-deployments.mdx | missing | P2. Not in `SCOPE.md`. |
+| Projects | enterprise/projects.mdx | done | `store.tov`, `governance.tov` (L84). See f. |
+| Teams, business units, customers | enterprise/teams-business-units-customers.mdx | done | Teams, customers and business units (`store.tov`, `governance.tov`, L84). |
+| Prompt deployments | enterprise/prompt-deployments.mdx | done | `prompts.tov` (L88). |
 | Virtual MCPs, enterprise access | enterprise/virtual-mcps.mdx | partial | `vmcp.tov`. Config and management API. No access-profile or project scoping. |
-| Guardrails: built-in PII detectors | enterprise/guardrails/custom-regex.mdx (PII template) | partial | `guardrails.tov`: email, phone, ssn, credit_card, ipv4, api_key, aws_key, jwt, private_key. Matching uses literal strings for custom entries, not regex. |
-| Guardrails: secrets detection (222 Gitleaks rules) | enterprise/guardrails/secrets-detection.mdx | partial | Raiju covers api_key, aws_key, jwt and private_key only. |
-| Guardrails: custom regex | enterprise/guardrails/custom-regex.mdx | partial | `guardrails.tov` custom: literal strings only. |
-| Guardrails: redaction modes (runtime, logs only, reversible reveal) | enterprise/guardrails/redaction.mdx | partial | `guardrails.tov`: redact, block, log. No reversible reveal. |
-| Guardrails: prompt guardrails (LLM judge) | enterprise/guardrails/prompt-guardrails.mdx | missing | P2. |
-| Guardrails: Presidio, Azure Language PII, Google Model Armor, CrowdStrike AIDR | enterprise/guardrails.mdx | missing | P2. |
+| Guardrails: built-in PII detectors | enterprise/guardrails/custom-regex.mdx (PII template) | done | `guardrails.tov` and `guard_regex.tov`: email, phone, ssn, credit_card, ipv4, api_key, aws_key, jwt, private_key (L86). |
+| Guardrails: secrets detection (Gitleaks rule set) | enterprise/guardrails/secrets-detection.mdx | partial | `guard_secrets.tov`, rules in `guard_gitleaks_data.tov` (generated from gitleaks v8.30.1, L93). 220 rules are in the table (pkcs12-file, path-only, is not among them). generic-api-key is in the table but skipped at runtime until L101/L102 in flight, so 219 run. The generated file's header says "221 of 222"; it disagrees with the 220 rows and needs regenerating. No entropy filter, allowlists, stopwords or secret-group extraction until L101/L102 in flight. |
+| Guardrails: custom regex | enterprise/guardrails/custom-regex.mdx | done | `guard_regex.tov` (`compileRules`, `applyRegex`), used by `guard_local.tov` (L86). |
+| Guardrails: redaction modes (runtime, logs only, reversible reveal) | enterprise/guardrails/redaction.mdx | done | `guardrails.tov` (redact, block, log); `guard_reversible.tov` for reversible reveal (L86). |
+| Guardrails: prompt guardrails (LLM judge) | enterprise/guardrails/prompt-guardrails.mdx | done | `guard_judge.tov` (L86, L90). |
+| Guardrails: Presidio, Azure Language PII, Google Model Armor, CrowdStrike AIDR | enterprise/guardrails.mdx | done | `guardrail_providers.tov` (Presidio `/analyze`, Azure Language PII, Model Armor, CrowdStrike AIDR `guard_chat_completions`; L86). |
 | Guardrails: AWS Bedrock Guardrails | integrations/guardrails/aws-bedrock | done | `guardrail_providers.tov`. |
 | Guardrails: Azure AI Content Safety | integrations/guardrails/azure-content-safety | done | `guardrail_providers.tov`. |
 | Guardrails: Patronus, generic webhook | not in Bifrost docs as listed here | done (Raiju-only) | `guardrail_providers.tov`. |
-| Guardrails: streaming output | enterprise/guardrails.mdx "Streaming Output Guardrails" | partial | Output guard on streamed responses (`gateway.tov:1226`). |
-| Guardrails: MCP tool-call guard | enterprise/guardrails.mdx "MCP Guardrails" | missing | P2. |
+| Guardrails: streaming output | enterprise/guardrails.mdx "Streaming Output Guardrails" | partial | Output guard on streamed responses (`gateway.tov`). Scope of checks on partial text not verified. |
+| Guardrails: MCP tool-call guard | enterprise/guardrails.mdx "MCP Guardrails" | done | `guard_mcp.tov`, wired into the gateway (L86, L90). |
 | Secret managers: Vault KV v2, AWS Secrets Manager | enterprise/secret-management.mdx | done | `secrets.tov` (SCOPE). |
-| Clustering | enterprise/clustering.mdx | partial | `cluster.tov`: static peers and HMAC-signed sync. No discovery (Kubernetes, DNS, Consul, etcd, mDNS, UDP), no leader election, no broker mode. |
+| Clustering | enterprise/clustering.mdx | partial | `cluster.tov` (CRDT budget and rate-limit state, HMAC-signed sync), `discovery.tov` (static peers, Kubernetes, DNS, Consul, etcd, mDNS, UDP; L87, L92), `leader.tov` (etcd lease leader lock; Bifrost elects by rank), broker mode (L94; Bifrost's is gRPC). The wire formats for UDP, mDNS and broker mode are Raiju's; Bifrost nodes cannot join a Raiju cluster. |
 | Adaptive load balancing | enterprise/adaptive-load-balancing.mdx | partial | See f. |
 | Circuit breakers | enterprise/circuit-breaker.mdx | partial | See f. |
-| Auth proxies: AWS ALB, Cloudflare ZTNA, generic proxy | enterprise/auth-proxy/*.mdx | missing | P2. |
+| Auth proxies: AWS ALB, Cloudflare ZTNA, generic proxy | enterprise/auth-proxy/*.mdx | done | `authproxy.tov` (`aws-alb`, `cloudflare-access`, `generic`; L87). |
 | InVPC deployments | enterprise/invpc-deployments.mdx | n/a | Managed offering. Raiju ships Docker, Helm and Terraform (SCOPE). |
 | Self-hosted deployment artifacts | deploy/ (Bifrost helm-charts, terraform) | done | Raiju `deploy/`, `Dockerfile`, `docker-compose.yml` (SCOPE). |
-| Warp (log-aware assistant) | features/warp.mdx | missing | P2. Not in `SCOPE.md`. |
-| Skills marketplace | features/skills-repository.mdx | missing | P2. Not in `SCOPE.md`. |
-| Webhooks (signed deliveries, retries, redeliver) | features/webhooks.mdx | missing | P2. Not in `SCOPE.md`. |
-| Agent gateway (A2A) | features/agent-gateway/* | missing | P2. Not in `SCOPE.md`. |
-| Feature flags | handlers/featureflags.go | missing | P2. |
-| Encryption of stored keys | encryption_key | missing | P2. |
+| Warp (log-aware assistant) | features/warp.mdx; handlers/warp*.go | out-of-scope | Not built (L88 decision). Not in `SCOPE.md` yet: add to Out. |
+| Skills marketplace | features/skills-repository.mdx; handlers/skills*.go | out-of-scope | Not built (L88 decision). Not in `SCOPE.md` yet: add to Out. |
+| Webhooks (signed deliveries, retries, redeliver) | features/webhooks.mdx; handlers/webhooks.go | partial | `webhooks.tov`: Standard Webhooks signing, retries, redeliver (`/redeliver`), async job completion events (L88). Deliveries are kept in memory, the last 500 per process. |
+| Notifications (in-app) | handlers/notifications.go | done | `notify.tov` (`notifyRoute`): list and create, plus Raiju's own sources (alerts, budget exhaustion, configuration saves). Bifrost's virtual-key-expiry source is absent, as there is no expiry (f). |
+| Feature flags | handlers/featureflags.go | done | `flags.tov` (`flagRoute`): config-set flags are locked (409), API values are kept (L88). |
+| Agent gateway (A2A) | features/agent-gateway/* | out-of-scope | Not built (L88 decision). Not in `SCOPE.md` yet: add to Out. |
+| Sidekiq (Bifrost queue integration) | handlers/sidekiq.go | out-of-scope | Not built (L88 decision). Not in `SCOPE.md` yet. |
+| Encryption of stored keys | encryption_key | done | `aesgcm.tov`: AES-256-GCM config encryption at rest (L80). |
 
 ## Gaps
 
