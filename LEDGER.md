@@ -185,12 +185,12 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L69 | G5 | /openai/deployments/{d}/* variants | worker | assigned |
-| L70 | G7 | Bifrost plugins: logging, telemetry, governance, compat, routing, prompts | worker | assigned |
-| L71 | G16 | Vertex, Bedrock, Cohere media/files/batches; Gemini STT; batch results route | worker | assigned |
-| L72 | G11 | GenAI files, batches, cachedContents, operations, :predict, /genai/v1/rank | worker | assigned |
-| L73 | G12, G25, G27 | /bedrock/rerank and Bedrock rerank, real count-tokens, inference-profile arn, use_openai_endpoints, Mantle Anthropic models | worker | assigned |
-| L74 | G47, G18 | Remaining management routes; remaining metric families | worker | assigned |
+| L69 | G5 | /openai/deployments/{d}/* variants | worker | done: unit + e2e (both servers) |
+| L70 | G7 | Bifrost plugins: logging, telemetry, governance, compat, routing, prompts | worker | done: unit + e2e |
+| L71 | G16 | Vertex, Bedrock, Cohere media/files/batches; Gemini STT; batch results route | worker | done except Vertex/Bedrock batches and files (GCS/S3) |
+| L72 | G11 | GenAI files, batches, cachedContents, operations, :predict, /genai/v1/rank | worker | done: unit + e2e |
+| L73 | G12, G25, G27 | /bedrock/rerank and Bedrock rerank, real count-tokens, inference-profile arn, use_openai_endpoints, Mantle Anthropic models | worker | done: unit + e2e; batch S3 open |
+| L74 | G47, G18 | Remaining management routes; remaining metric families | worker → lead (login audit) | done; enterprise-only routes skipped |
 
 Decision taken by the lead: models without a price stay a warning (cost 0), as in Bifrost;
 refusing them is a one-line switch if the owner wants it.
