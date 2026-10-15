@@ -181,6 +181,20 @@ OTel metrics, semantic cache plugin config and vector stores, alert channels, co
 Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 `flock /tmp/raiju-e2e.lock`; a worker's stray mock once broke another run.
 
+## Wave 10: the mechanical remainder (from the re-audit)
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L69 | G5 | /openai/deployments/{d}/* variants | worker | assigned |
+| L70 | G7 | Bifrost plugins: logging, telemetry, governance, compat, routing, prompts | worker | assigned |
+| L71 | G16 | Vertex, Bedrock, Cohere media/files/batches; Gemini STT; batch results route | worker | assigned |
+| L72 | G11 | GenAI files, batches, cachedContents, operations, :predict, /genai/v1/rank | worker | assigned |
+| L73 | G12, G25, G27 | /bedrock/rerank and Bedrock rerank, real count-tokens, inference-profile arn, use_openai_endpoints, Mantle Anthropic models | worker | assigned |
+| L74 | G47, G18 | Remaining management routes; remaining metric families | worker | assigned |
+
+Decision taken by the lead: models without a price stay a warning (cost 0), as in Bifrost;
+refusing them is a one-line switch if the owner wants it.
+
 ## UI track (after parity)
 
 The owner wants a native client for desktop and mobile in time, as fast as gpui. The
