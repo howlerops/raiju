@@ -3014,6 +3014,27 @@ def main():
         check("a client.compat section turns the features on by default", s == 200 and hdr(h, "x-bifrost-dropped-compat-params") == "temperature,top_p", (s, hdr(h, "x-bifrost-dropped-compat-params"), b[:200]))
         s, h, b = call("POST", "/v1/completions", {"model": "compat/chatonly-mini", "prompt": "hi"}, base=GW_CC)
         check("client.compat turns text to chat on by default", s == 200 and json.loads(b)["choices"][0]["text"] == "Hello from chatonly-mini", (s, b[:200]))
+        # compat, streamed: a text completion reaches a chat-only model as a chat stream and streams back as text chunks
+        s, h, b = call("POST", "/v1/completions", {"model": "compat/chatonly-mini", "prompt": "hi there", "stream": True}, headers={"x-bf-compat": "true"}, base=GW_C)
+        sent = json.loads(seen()[-1]["body"])
+        check("a streamed text completion goes to chat and streams back as text_completion chunks", s == 200 and seen()[-1]["path"] == "/v1/chat/completions" and sent.get("stream") is True and '"object":"text_completion"' in b and '"text":"Hel"' in b and '"text":"lo"' in b and "chat.completion.chunk" not in b and b.rstrip().endswith("data: [DONE]"), (s, seen()[-1]["path"], b[:300]))
+        # compat, streamed: a chat request on a Responses-only model streams back as chat chunks
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "compat/responses-only", "messages": msg_c, "max_completion_tokens": 300, "reasoning_effort": "low", "stream": True}, headers={"x-bf-compat": "true"}, base=GW_C)
+        sent = json.loads(seen()[-1]["body"])
+        check("a streamed chat request to a Responses-only model streams back as chat chunks", s == 200 and seen()[-1]["path"] == "/v1/responses" and sent.get("stream") is True and '"content":"native "' in b and '"content":"responses"' in b and '"object":"chat.completion.chunk"' in b and b.rstrip().endswith("data: [DONE]"), (s, seen()[-1]["path"], b[:300]))
+        # decision emulation: the model answers the questions as one forced call on its Responses API
+        dec = {"model": "compat/responses-only", "input": "my bill is wrong", "questions": [
+            {"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?"},
+            {"type": "choice", "name": "category", "choices": [{"value": "billing"}, {"value": "bug"}]},
+            {"type": "score", "name": "urgency", "levels": [{"label": "0"}, {"label": "1"}]}]}
+        s, h, b = call("POST", "/v1/decisions", dec, base=GW_C)
+        check("a decision for a model with no decisions endpoint is refused without the setting", s == 400 and "unsupported_operation" in b, (s, b[:200]))
+        s, h, b = call("POST", "/v1/decisions", dec, headers={"x-bf-compat": '["convert_decision_to_responses"]'}, base=GW_C)
+        out = json.loads(b) if s == 200 else {}
+        sent = json.loads(seen()[-1]["body"])
+        check("a decision is emulated as a forced emit_decision call on the model's Responses API", s == 200 and seen()[-1]["path"] == "/v1/responses" and sent.get("tool_choice") == "required" and sent["tools"][0]["name"] == "emit_decision" and "is_frustrated" in sent["tools"][0]["parameters"]["properties"], (s, seen()[-1]["path"], b[:300]))
+        answers = out.get("answers", [])
+        check("the emulated answers come back in the canonical decision shape", len(answers) == 3 and answers[0] == {"type": "predicate", "name": "is_frustrated", "probability": 0.8, "confidence": 0.9} and answers[1].get("choice") == "billing" and answers[2].get("score") == 0.25 and out.get("usage", {}).get("total_tokens") == 17 and hdr(h, "x-bifrost-converted-request-type") == "responses", (s, b[:400]))
         # projects, business units, custom roles and data access scopes (their own gateway)
         projects_e2e(env)
         # cluster discovery and the identity-aware proxies (their own gateways and mocks)

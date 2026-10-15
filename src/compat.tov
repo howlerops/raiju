@@ -1,12 +1,11 @@
-// Bifrost's compat plugin for the chat and text completion endpoints. Per request and per target, it
-// drops the parameters the model's datasheet row does not list, fits the output cap to the model's
-// limit, and sends the request to the endpoint the model serves: text to chat, or chat to Responses
-// (for models that serve only Responses, and for reasoning with tools on models whose row refuses it).
-// The row is the one GET /api/models/parameters serves (the gateway reads it through Engine.paramsLookup).
+// Bifrost's compat plugin for the chat, text completion and Responses endpoints. Per request and per target,
+// it drops the parameters the model's datasheet row does not list, fits the output caps and the reasoning
+// budget to the model's limits, and sends the request to the endpoint the model serves: text to chat, or chat
+// to Responses (for models that serve only Responses, and for reasoning with tools on models whose row refuses
+// it). Streams are converted as they arrive (the stream converters are in gateway.tov). The row is the one
+// GET /api/models/parameters serves (the gateway reads it through Engine.paramsLookup).
 // Settings: client.compat, read with Bifrost's defaults when the section is there, and x-bf-compat per
-// request, which adds features to the configured ones. Not here: the Responses endpoint's own drops
-// (native.tov), Azure DeepSeek's reasoning drop, reasoning budgets, and decision emulation (Raiju has
-// no decisions API).
+// request, which adds features to the configured ones. Decision emulation is in decision_emulate.tov.
 import { Field, fields, elements, find, rawStr, rawNum, quote, setField, without, build, decodeString, isNull } from "./json"
 import { CompatConfig } from "./config"
 import { Translated } from "./providers/types"
@@ -23,7 +22,8 @@ export type CompatSettings = {
 
 // What a model's datasheet row says it takes and serves. known is false when the row lists no
 // model_parameters: then nothing is dropped, which is Bifrost's behaviour without a parameter list.
-export type Support = { known: bool, params: string[], types: string[], maxOutput: f64 }
+// budget is the reasoning budget range [min, max] (max 0: none), or [] when the row names none.
+export type Support = { known: bool, params: string[], types: string[], maxOutput: f64, minOutput: f64, budget: f64[] }
 
 export type Dropped = { body: Field[], dropped: string[], toolDrops: string[] }
 
@@ -89,7 +89,7 @@ export function anyOn(s: CompatSettings): bool {
 }
 
 export function unknownSupport(): Support {
-  return { known: false, params: [], types: [], maxOutput: 0.0 }
+  return { known: false, params: [], types: [], maxOutput: 0.0, minOutput: 0.0, budget: [] }
 }
 
 function addOnce(inout list: string[], name: string): void {
@@ -132,6 +132,16 @@ export function supportOf(record: string): Support {
     }
   }
   s.maxOutput = rawNum(fs, "max_output_tokens") ?? 0.0
+  s.minOutput = rawNum(fs, "min_output_tokens") ?? 0.0
+  const rb = find(fs, "reasoning_budget")
+  if (rb !== undefined && rb.startsWith("{")) {
+    try {
+      const bf = fields(rb)
+      s.budget = [rawNum(bf, "min") ?? 0.0, rawNum(bf, "max") ?? 0.0]
+    } catch (e) {
+      s.budget = []
+    }
+  }
   const mp = find(fs, "model_parameters")
   s.types = types
   if (mp === undefined || !mp.startsWith("[")) return s
@@ -293,32 +303,34 @@ function dropChat(body: Field[], sup: Support, converted: bool): Dropped {
   dropUnlisted(&fs, L, "tool_choice", ["tool_choice"], &dropped)
   dropUnlisted(&fs, L, "verbosity", ["verbosity"], &dropped)
   dropUnlisted(&fs, L, "web_search_options", ["web_search_options"], &dropped)
-  // web search tools go when the model does not list web search, one tools[i] entry each
-  const tools = find(fs, "tools")
-  if (tools !== undefined && tools.startsWith("[") && L.includes("tools") && !L.includes("web_search")) {
-    let kept: string[] = []
-    let changed = false
-    let i = 0
-    try {
-      for (const el of elements(tools)) {
-        const tf = fields(el)
-        const ty = rawStr(tf, "type") ?? ""
-        if (ty === "web_search" || ty === "web_search_preview") {
-          toolDrops.push(`tools[${i}].${ty}`)
-          changed = true
-        } else {
-          kept.push(el)
-        }
-        i += 1
-      }
-    } catch (e) {
-      kept = []
-      changed = false
-    }
-    if (changed) setField(&fs, "tools", "[" + kept.join(",") + "]")
-  }
+  dropWebSearch(&fs, L, &toolDrops)
   dropUnlisted(&fs, L, "tools", ["tools"], &dropped)
   return { body: fs, dropped: dropped, toolDrops: toolDrops }
+}
+
+// The web search tools go when the model does not list web search, one tools[i] entry each.
+function dropWebSearch(inout fs: Field[], listed: string[], inout toolDrops: string[]): void {
+  const tools = find(fs, "tools")
+  if (tools === undefined || !tools.startsWith("[") || !listed.includes("tools") || listed.includes("web_search")) return
+  let kept: string[] = []
+  let changed = false
+  let i = 0
+  try {
+    for (const el of elements(tools)) {
+      const tf = fields(el)
+      const ty = rawStr(tf, "type") ?? ""
+      if (ty === "web_search" || ty === "web_search_preview") {
+        toolDrops.push(`tools[${i}].${ty}`)
+        changed = true
+      } else {
+        kept.push(el)
+      }
+      i += 1
+    }
+  } catch (e) {
+    return
+  }
+  if (changed) setField(&fs, "tools", "[" + kept.join(",") + "]")
 }
 
 // The text completion parameters a model does not list.
@@ -339,18 +351,122 @@ function dropText(body: Field[], sup: Support): Dropped {
   return { body: fs, dropped: dropped, toolDrops: [] }
 }
 
-// Caps the output-token fields the request sends at the model's output limit. Only fields present
-// are changed; the changes are "field: from -> to" entries.
-function fitCaps(body: Field[], maxOut: f64, inout changes: string[]): Field[] {
+// The reasoning budget range a model takes: the row's, else the built-in one for Claude and Gemini 2.5
+// (Bifrost's knownReasoningBudget), else none ([]).
+function budgetRange(sup: Support, model: string): f64[] {
+  if (sup.budget.length > 0) return sup.budget
+  if (model.includes("claude")) return [1024.0, 0.0]
+  const m = model.toLowerCase()
+  if (m.includes("gemini-2.5-flash-lite")) return [512.0, 24576.0]
+  if (m.includes("gemini-2.5-pro")) return [128.0, 32768.0]
+  if (m.includes("gemini-2.5-flash")) return [0.0, 24576.0]
+  return []
+}
+
+// Bifrost's FitOutputTokens on the output caps and the reasoning budget. A cap above the row's limit is
+// lowered to it, and a cap under the row's floor is raised to it. A budget that was sent with a lowered cap
+// keeps its share of the new cap; then the budget stays in the model's range and under the cap. Only fields
+// present are changed; each change is a "field: from -> to" entry.
+function fitCaps(body: Field[], sup: Support, model: string, inout changes: string[]): Field[] throws SyntaxError {
   let fs = body.slice()
-  if (maxOut <= 0.0) return fs
+  // the cap a budget must stay under; 0 when the caller's cap stands
+  let limit = sup.maxOutput
+  let capSent = 0.0
+  let lowered = false
+  let first = true
   for (const k of ["max_completion_tokens", "max_tokens", "max_output_tokens"]) {
     const n = rawNum(fs, k)
-    if (n === undefined || n <= maxOut) continue
-    setField(&fs, k, "" + Math.trunc(maxOut))
-    changes.push(`${k}: ${Math.trunc(n)} -> ${Math.trunc(maxOut)}`)
+    if (n === undefined) continue
+    let v = n
+    let hit = false
+    if (sup.maxOutput > 0.0 && v > sup.maxOutput) {
+      v = sup.maxOutput
+      hit = true
+    } else if (sup.minOutput > 0.0 && v < sup.minOutput) {
+      v = sup.minOutput
+    }
+    if (first) {
+      first = false
+      capSent = n
+      lowered = hit
+      limit = hit ? v : 0.0
+    }
+    if (v !== n) {
+      setField(&fs, k, "" + Math.trunc(v))
+      changes.push(`${k}: ${Math.trunc(n)} -> ${Math.trunc(v)}`)
+    }
+  }
+  const rf0 = find(fs, "reasoning")
+  if (rf0 === undefined || !rf0.startsWith("{")) return fs
+  let rf = try fields(rf0)
+  const budget = rawNum(rf, "max_tokens")
+  if (budget === undefined || !(budget > 0.0)) return fs
+  let b = budget
+  if (lowered) b = Math.max(1.0, Math.floor(budget * limit / capSent))
+  const range = budgetRange(sup, model)
+  const lo = range.length > 0 ? range[0]! : 0.0
+  const hi = range.length > 1 ? range[1]! : 0.0
+  if (range.length > 0) {
+    if (hi > 0.0 && b > hi) b = hi
+    if (b < lo) b = lo
+  }
+  if (limit > 1.0 && b >= limit && limit - 1.0 >= lo) b = limit - 1.0
+  if (b !== budget) {
+    setField(&rf, "max_tokens", "" + Math.trunc(b))
+    setField(&fs, "reasoning", build(rf))
+    changes.push(`reasoning.max_tokens: ${Math.trunc(budget)} -> ${Math.trunc(b)}`)
   }
   return fs
+}
+
+// The Responses parameters a model does not list (Bifrost's Responses branch of dropUnsupportedParams).
+// reasoning goes when the row does not list it, or when reasoningOff says the deployment refuses it (Azure
+// DeepSeek, unless the request is served as chat); otherwise its summary is fitted like a chat request's.
+function dropResponses(body: Field[], sup: Support, reasoningOff: bool): Dropped throws SyntaxError {
+  let fs = body.slice()
+  let dropped: string[] = []
+  let toolDrops: string[] = []
+  const L = sup.params
+  const capListed = L.includes("max_output_tokens") || L.includes("max_tokens") || L.includes("max_completion_tokens")
+  if (!capListed) dropUnlisted(&fs, [], "max_output_tokens", ["max_output_tokens"], &dropped)
+  dropUnlisted(&fs, L, "max_tool_calls", ["max_tool_calls"], &dropped)
+  dropUnlisted(&fs, L, "metadata", ["metadata"], &dropped)
+  dropUnlisted(&fs, L, "parallel_tool_calls", ["parallel_tool_calls"], &dropped)
+  dropUnlisted(&fs, L, "prompt_cache_key", ["prompt_cache_key"], &dropped)
+  if (present(fs, "reasoning")) {
+    if (!L.includes("reasoning") || reasoningOff) {
+      fs = without(fs, ["reasoning"])
+      dropped.push("reasoning")
+    } else {
+      fitSummary(&fs, L, &dropped)
+    }
+  }
+  dropUnlisted(&fs, L, "service_tier", ["service_tier"], &dropped)
+  dropUnlisted(&fs, L, "temperature", ["temperature"], &dropped)
+  dropUnlisted(&fs, L, "text", ["text"], &dropped)
+  dropUnlisted(&fs, L, "top_logprobs", ["top_logprobs"], &dropped)
+  dropUnlisted(&fs, L, "top_p", ["top_p"], &dropped)
+  dropUnlisted(&fs, L, "tool_choice", ["tool_choice"], &dropped)
+  dropWebSearch(&fs, L, &toolDrops)
+  dropUnlisted(&fs, L, "tools", ["tools"], &dropped)
+  return { body: fs, dropped: dropped, toolDrops: toolDrops }
+}
+
+// Whether a model is a DeepSeek model (Bifrost's IsDeepSeekModel).
+export function isDeepSeekModel(model: string): bool {
+  return model.toLowerCase().includes("deepseek")
+}
+
+// The coding harnesses Bifrost names by their User-Agent: Claude Code and Desktop, Codex, Cursor, OpenCode.
+const HARNESS_AGENTS: string[] = ["claude-cli", "claude-code", "claude-vscode", "claude-desktop", "claude/", "codex-cli", "codex-tui", "codex desktop/", "codex/", "cursor", "opencode"]
+
+// Whether a User-Agent names a coding harness (matched anywhere in it, case-insensitively).
+export function isCodingHarness(userAgent: string): bool {
+  const ua = userAgent.toLowerCase()
+  for (const id of HARNESS_AGENTS) {
+    if (ua.includes(id)) return true
+  }
+  return false
 }
 
 // The text of a message content, for a function call output: a string, or the text parts joined.
@@ -438,6 +554,52 @@ export function chatToText(chat: string): string throws SyntaxError {
   setField(&out, "object", quote("text_completion"))
   setField(&out, "choices", "[" + choices.join(",") + "]")
   return build(out)
+}
+
+// One chat.completion.chunk as a text_completion chunk: each choice's delta content becomes its text.
+// The usage-only chunk keeps its usage.
+export function chatChunkToText(chunk: string): string throws SyntaxError {
+  const fs = try fields(chunk)
+  let choices: string[] = []
+  for (const c of try elements(find(fs, "choices") ?? "[]")) {
+    const cf = try fields(c)
+    let text = ""
+    const d = find(cf, "delta")
+    if (d !== undefined && d.startsWith("{")) {
+      const df = try fields(d)
+      text = rawStr(df, "content") ?? ""
+    }
+    const idx = rawNum(cf, "index") ?? 0.0
+    const finish = find(cf, "finish_reason") ?? "null"
+    choices.push(`{"index":${Math.trunc(idx)},"text":${quote(text)},"logprobs":null,"finish_reason":${finish}}`)
+  }
+  let out = without(fs, ["choices", "object"])
+  setField(&out, "object", quote("text_completion"))
+  setField(&out, "choices", "[" + choices.join(",") + "]")
+  return build(out)
+}
+
+// One SSE frame of a chat stream ("data: ..." without its blank line) as a text completion frame. Error
+// frames and [DONE] pass as they are, and so does anything that is not a chunk.
+export function textFrame(frame: string): string {
+  if (!frame.startsWith("data:")) return frame
+  const payload = frame.slice(5).trim()
+  if (payload === "" || payload === "[DONE]" || payload.startsWith("{\"error\"")) return frame
+  try {
+    return "data: " + chatChunkToText(payload)
+  } catch (e) {
+    return frame
+  }
+}
+
+// A complete chat SSE body as text completion SSE, for a chat call the gateway made without streaming.
+export function chatSseToText(sse: string): string {
+  let out = ""
+  for (const ev of sse.split("\n\n")) {
+    if (ev === "") continue
+    out += textFrame(ev) + "\n\n"
+  }
+  return out
 }
 
 // Params a Responses request does not take. These are dropped and named in the dropped list.
@@ -590,6 +752,12 @@ export class CompatPlan {
   dropped: string[] = []
   toolDrops: string[] = []
   converted = ""
+  // the fits made by the last shape: "field: from -> to"
+  changes: string[] = []
+  // what the caller logs for the last shape: the fits, and a dropped service_tier (Bifrost's warnings)
+  warnings: string[] = []
+  // set for an Azure DeepSeek Responses request that is not served as chat: its reasoning goes
+  reasoningOff = false
   private known: Map<string, Support> = new Map()
   constructor(readonly settings: CompatSettings, readonly op: string, readonly stream: bool) {
     this.enabled = anyOn(settings)
@@ -611,20 +779,33 @@ export class CompatPlan {
 
   // The request for one target, as it is sent: the drops and the fits, then the endpoint change.
   // "chat" sends a text completion as chat, "responses" sends a chat request to Responses.
+  // The endpoint a target's request goes to instead of the one the caller used: "chat" for a text completion
+  // sent as chat, "responses" for a chat request sent to Responses, "" for none. Streams are converted too.
+  routeFor(provider: string, kind: string, model: string): string {
+    if (!this.enabled) return ""
+    const sup = this.known.get(provider + "/" + model) ?? unknownSupport()
+    const s = this.settings
+    if (this.op === "completions") {
+      return s.textToChat && !serves(sup, "text_completion") && serves(sup, "chat_completion") ? "chat" : ""
+    }
+    if (this.op !== "chat" || kind !== "openai") return ""
+    if (s.chatToResponses && !serves(sup, "chat_completion") && serves(sup, "responses")) return "responses"
+    if (s.reasoningOnly && sup.known && sup.params.includes("reasoning") && !sup.params.includes("reasoning_with_tool_calls")) return "responses"
+    return ""
+  }
+
+  // The request for one target, as it is sent: the drops and the fits, then the endpoint change.
+  // "chat" sends a text completion as chat, "responses" sends a chat request to Responses.
   shape(provider: string, kind: string, model: string, body: Field[]): Shaped throws SyntaxError {
     this.dropped = []
     this.toolDrops = []
     this.converted = ""
+    this.changes = []
+    this.warnings = []
     if (!this.enabled) return { body: body, route: "", changed: false, text: "" }
     const sup = this.known.get(provider + "/" + model) ?? unknownSupport()
     const s = this.settings
-    let route = ""
-    if (this.op === "completions") {
-      if (s.textToChat && !this.stream && !serves(sup, "text_completion") && serves(sup, "chat_completion")) route = "chat"
-    } else if (!this.stream && kind === "openai") {
-      if (s.chatToResponses && !serves(sup, "chat_completion") && serves(sup, "responses")) route = "responses"
-      else if (s.reasoningOnly && sup.known && sup.params.includes("reasoning") && !sup.params.includes("reasoning_with_tool_calls")) route = "responses"
-    }
+    const route = this.routeFor(provider, kind, model)
     let changes: string[] = []
     let cur = body
     if (this.op === "completions") {
@@ -633,11 +814,19 @@ export class CompatPlan {
         cur = d.body
         this.dropped = d.dropped
       }
-      if (s.convertParams) cur = fitCaps(cur, sup.maxOutput, &changes)
+      if (s.convertParams) cur = try fitCaps(cur, sup, model, &changes)
       if (route === "chat") {
         cur = try textToChatFields(cur)
         this.converted = "chat_completion"
       }
+    } else if (this.op === "responses") {
+      if (s.dropParams && sup.known) {
+        const d = try dropResponses(cur, sup, this.reasoningOff)
+        cur = d.body
+        this.dropped = d.dropped
+        this.toolDrops = d.toolDrops
+      }
+      if (s.convertParams) cur = try fitCaps(cur, sup, model, &changes)
     } else {
       if (s.dropParams && sup.known) {
         const d = dropChat(cur, sup, route === "responses")
@@ -645,13 +834,19 @@ export class CompatPlan {
         this.dropped = d.dropped
         this.toolDrops = d.toolDrops
       }
-      if (s.convertParams) cur = fitCaps(cur, sup.maxOutput, &changes)
+      if (s.convertParams) cur = try fitCaps(cur, sup, model, &changes)
       if (route === "responses") {
         const r = try chatToResponsesFields(cur)
         cur = r.body
         this.dropped = this.dropped.concat(r.dropped)
         this.converted = "responses"
       }
+    }
+    this.changes = changes
+    if (changes.length > 0) this.warnings.push(`converted param values for model ${model}: ${changes.join(", ")}`)
+    // service_tier decides what the caller is billed; dropping it moves the request to the default tier silently
+    if (this.dropped.includes("service_tier")) {
+      this.warnings.push(`dropped service_tier for model ${model}: the datasheet row does not list service_tier, so the request is served and billed at the provider's default tier`)
     }
     const changed = route !== "" || this.dropped.length > 0 || this.toolDrops.length > 0 || changes.length > 0
     return { body: cur, route: route, changed: changed, text: changed ? build(cur) : "" }
@@ -743,15 +938,77 @@ test("drop: reasoning.summary is kept, turned to auto, or dropped by the values 
 })
 
 test("fit: an output cap above the model's limit is lowered, and only present fields change", () => {
+  const sup = supportOf(`{"mode":"chat","max_output_tokens":1000,"model_parameters":[{"id":"max_tokens"}]}`)
   let changes: string[] = []
   const fs = try fields(`{"max_tokens":5000,"temperature":1}`)
-  const out = fitCaps(fs, 1000.0, &changes)
+  const out = try fitCaps(fs, sup, "m", &changes)
   expect(find(out, "max_tokens")).toBe("1000")
   expect(find(out, "max_completion_tokens") === undefined).toBe(true)
   expect(changes).toEqual(["max_tokens: 5000 -> 1000"])
   let none: string[] = []
-  expect(find(fitCaps(try fields(`{"max_tokens":5}`), 1000.0, &none), "max_tokens")).toBe("5")
+  expect(find(try fitCaps(try fields(`{"max_tokens":5}`), sup, "m", &none), "max_tokens")).toBe("5")
   expect(none.length).toBe(0)
+})
+
+test("fit: a lowered cap scales the reasoning budget, and a budget left with no room is held under the cap", () => {
+  const sup = supportOf(`{"mode":"chat","max_output_tokens":1000,"model_parameters":[{"id":"max_tokens"},{"id":"reasoning_effort"}]}`)
+  let changes: string[] = []
+  const out = try fitCaps(try fields(`{"max_tokens":2000,"reasoning":{"effort":"low","max_tokens":1000}}`), sup, "m", &changes)
+  expect(find(out, "reasoning")).toBe(`{"effort":"low","max_tokens":500}`)
+  expect(changes).toEqual(["max_tokens: 2000 -> 1000", "reasoning.max_tokens: 1000 -> 500"])
+  let held: string[] = []
+  const h = try fitCaps(try fields(`{"reasoning":{"max_tokens":1200}}`), sup, "m", &held)
+  expect(find(h, "reasoning")).toBe(`{"max_tokens":999}`)
+  expect(held).toEqual(["reasoning.max_tokens: 1200 -> 999"])
+})
+
+test("fit: a cap under the row's floor is raised, and a budget takes the row's range or the built-in one", () => {
+  const floor = supportOf(`{"mode":"chat","min_output_tokens":16,"model_parameters":[{"id":"max_tokens"}]}`)
+  let c1: string[] = []
+  expect(find(try fitCaps(try fields(`{"max_tokens":5}`), floor, "m", &c1), "max_tokens")).toBe("16")
+  expect(c1).toEqual(["max_tokens: 5 -> 16"])
+  const ranged = supportOf(`{"mode":"chat","reasoning_budget":{"min":1024,"max":8000},"model_parameters":[{"id":"reasoning_effort"}]}`)
+  let c2: string[] = []
+  expect(find(try fitCaps(try fields(`{"reasoning":{"max_tokens":20000}}`), ranged, "m", &c2), "reasoning")).toBe(`{"max_tokens":8000}`)
+  expect(c2).toEqual(["reasoning.max_tokens: 20000 -> 8000"])
+  let c3: string[] = []
+  expect(find(try fitCaps(try fields(`{"reasoning":{"max_tokens":100}}`), unknownSupport(), "claude-sonnet-4-5", &c3), "reasoning")).toBe(`{"max_tokens":1024}`)
+  let c4: string[] = []
+  expect(find(try fitCaps(try fields(`{"reasoning":{"max_tokens":30000}}`), unknownSupport(), "gemini-2.5-flash", &c4), "reasoning")).toBe(`{"max_tokens":24576}`)
+  let c5: string[] = []
+  expect(find(try fitCaps(try fields(`{"reasoning":{"max_tokens":30000}}`), unknownSupport(), "gpt-5", &c5), "reasoning")).toBe(`{"max_tokens":30000}`)
+})
+
+test("responses: unlisted parameters go, reasoning goes on an Azure DeepSeek refusal, and the cap is fitted", () => {
+  const row = `{"mode":"responses","max_output_tokens":4000,"model_parameters":[{"id":"max_output_tokens"},{"id":"reasoning_effort"},{"id":"tools"}]}`
+  const body = `{"model":"deepseek-r1","input":"hi","temperature":0.2,"max_output_tokens":9000,"reasoning":{"effort":"low"},"service_tier":"flex"}`
+  const p = new CompatPlan(settingsOf({}), "responses", false)
+  p.put("azure/deepseek-r1", row)
+  const r = try p.shape("azure", "azure", "deepseek-r1", try fields(body))
+  expect(find(r.body, "max_output_tokens")).toBe("4000")
+  expect(find(r.body, "temperature") === undefined).toBe(true)
+  expect(find(r.body, "reasoning")).toBe(`{"effort":"low"}`)
+  expect(p.dropped.includes("temperature") && p.dropped.includes("service_tier")).toBe(true)
+  expect(p.warnings.join("|").includes("dropped service_tier")).toBe(true)
+  const refused = new CompatPlan(settingsOf({}), "responses", false)
+  refused.put("azure/deepseek-r1", row)
+  refused.reasoningOff = true
+  const q = try refused.shape("azure", "azure", "deepseek-r1", try fields(body))
+  expect(find(q.body, "reasoning") === undefined).toBe(true)
+  expect(refused.dropped.includes("reasoning")).toBe(true)
+  expect(isDeepSeekModel("DeepSeek-V3")).toBe(true)
+  expect(isCodingHarness("claude-cli/2.1.168 (external, cli)") && isCodingHarness("Codex Desktop/1.0") && !isCodingHarness("curl/8.0")).toBe(true)
+})
+
+test("text to chat stream: a chunk's delta becomes the choice's text, and the usage chunk keeps its usage", () => {
+  const c = try chatChunkToText(`{"id":"c1","object":"chat.completion.chunk","created":3,"model":"m","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}`)
+  expect(c.includes(`"object":"text_completion"`)).toBe(true)
+  expect(c.includes(`"choices":[{"index":0,"text":"Hi","logprobs":null,"finish_reason":null}]`)).toBe(true)
+  const u = try chatChunkToText(`{"id":"c1","object":"chat.completion.chunk","created":3,"model":"m","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
+  expect(u.includes(`"choices":[]`) && u.includes(`"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}`)).toBe(true)
+  expect(textFrame("data: [DONE]")).toBe("data: [DONE]")
+  expect(textFrame(`data: {"error":{"message":"x"}}`)).toBe(`data: {"error":{"message":"x"}}`)
+  expect(chatSseToText("data: [DONE]\n\n")).toBe("data: [DONE]\n\n")
 })
 
 test("text to chat: the prompt becomes the user message, and back as text_completion", () => {
@@ -833,10 +1090,13 @@ test("plan: a text completion goes to chat only for a chat-only model; chat goes
   // a non-openai kind cannot be sent to Responses: it stays on chat
   const r3 = try c.shape("anth", "anthropic", "resp-only", fields(`{"model":"resp-only","messages":[]}`))
   expect(r3.route).toBe("")
-  // streams are not converted
+  // streams are converted too: the route is the same as for a whole request
   let s = new CompatPlan(all, "chat", true)
   s.put("openai/resp-only", respOnly)
-  expect((try s.shape("openai", "openai", "resp-only", fields(`{"model":"resp-only","messages":[]}`))).route).toBe("")
+  expect((try s.shape("openai", "openai", "resp-only", fields(`{"model":"resp-only","messages":[]}`))).route).toBe("responses")
+  let sc = new CompatPlan(all, "completions", true)
+  sc.put("openai/chat-only", chatOnly)
+  expect((try sc.shape("openai", "openai", "chat-only", fields(`{"model":"chat-only","prompt":"hi"}`))).route).toBe("chat")
   // a row that is not there changes nothing
   let u = new CompatPlan(all, "chat", false)
   u.put("openai/gone", undefined)

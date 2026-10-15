@@ -25,7 +25,8 @@ import { compileLocal, localVerdict } from "./guard_local"
 import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
 import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
-import { CompatPlan, settingsOf, withHeader, responseToChat, chatToText } from "./compat"
+import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText } from "./compat"
+import { ResponsesToChatStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias } from "./router"
 import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
@@ -79,6 +80,11 @@ export class StreamConverter {
   ge: GeminiToOpenAI | undefined = undefined
   br: BedrockEventStreamToOpenAI | undefined = undefined
   co: CohereToOpenAI | undefined = undefined
+  // a Responses stream (a chat request sent to Responses), read as chat chunks
+  rs: ResponsesToChatStream | undefined = undefined
+  // a chat stream answered to a text completion: each frame becomes a text_completion frame
+  txt = false
+  private txtPending = ""
   readonly dec: TextDecoder | undefined = utf8Decoder()
   // output converters: the client's own stream format (one is set, or none)
   gen: GenAIStream | undefined = undefined
@@ -93,6 +99,7 @@ export class StreamConverter {
     else if (kind === "gemini") this.ge = new GeminiToOpenAI(requested, includeUsage)
     else if (kind === "bedrock") this.br = new BedrockEventStreamToOpenAI(requested, includeUsage)
     else if (kind === "cohere") this.co = new CohereToOpenAI(requested, includeUsage)
+    else if (kind === "responses") this.rs = new ResponsesToChatStream(requested, includeUsage)
     else this.oa = new OpenAIPassthrough(requested, !includeUsage)
   }
 
@@ -201,7 +208,22 @@ export class StreamConverter {
     return tail
   }
 
+  // Whole frames only: a text completion frame is built from a complete chat frame.
+  private textPost(s: string): string {
+    this.txtPending += s
+    let res = ""
+    while (true) {
+      const i = this.txtPending.indexOf("\n\n")
+      if (i < 0) break
+      const ev = this.txtPending.slice(0, i)
+      this.txtPending = this.txtPending.slice(i + 2)
+      if (ev !== "") res += textFrame(ev) + "\n\n"
+    }
+    return res
+  }
+
   private post(s: string): string {
+    if (this.txt) return this.textPost(s)
     const st = this.out
     const g = this.gen
     const co = this.cohereOut
@@ -238,6 +260,8 @@ export class StreamConverter {
     if (br !== undefined) return br.push(bytes)
     const t = this.text(bytes)
     if (t === "") return ""
+    const rs = this.rs
+    if (rs !== undefined) return rs.push(t)
     const an = this.an
     if (an !== undefined) return an.push(t)
     const ge = this.ge
@@ -250,6 +274,8 @@ export class StreamConverter {
   }
 
   private innerEnd(): string {
+    const rs = this.rs
+    if (rs !== undefined) return rs.end()
     const an = this.an
     if (an !== undefined) return an.end()
     const ge = this.ge
@@ -264,11 +290,11 @@ export class StreamConverter {
   }
 
   promptTokens(): int {
-    return this.an?.inTokens ?? this.ge?.inTokens ?? this.br?.promptTokens ?? this.co?.inTokens ?? this.oa?.promptTokens ?? 0
+    return this.an?.inTokens ?? this.ge?.inTokens ?? this.br?.promptTokens ?? this.co?.inTokens ?? this.rs?.promptTokens ?? this.oa?.promptTokens ?? 0
   }
 
   completionTokens(): int {
-    return this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.co?.outTokens ?? this.oa?.completionTokens ?? 0
+    return this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.co?.outTokens ?? this.rs?.completionTokens ?? this.oa?.completionTokens ?? 0
   }
 }
 
@@ -735,6 +761,42 @@ class LazyChat {
     this.value = parsed
     return parsed
   }
+}
+
+// A converted Responses request's body, streamed when its answer is piped to the client.
+function streamedBody(fs: Field[], on: bool): Field[] {
+  if (!on) return fs
+  let out = fs.slice()
+  setField(&out, "stream", "true")
+  return out
+}
+
+// Whether a request asks for the usage chunk (stream_options.include_usage).
+function streamUsage(body: Field[]): bool {
+  const so = find(body, "stream_options")
+  if (so === undefined || !so.startsWith("{")) return false
+  try {
+    return rawBool(fields(so), "include_usage") ?? false
+  } catch (e) {
+    return false
+  }
+}
+
+// A text completion sent to a chat model: the chat request, streamed when the answer is piped.
+function textAsChat(t: Target, sh: Shaped, stream: bool, canPipe: bool): Upstream throws SyntaxError {
+  const req = try new LazyChat(sh.text).get()
+  if (!stream) return try providers.chatUpstream(t, req, sh.body, false)
+  if (providers.streamsNatively(t.kind)) {
+    let sb = sh.body.slice()
+    setField(&sb, "stream", "true")
+    setField(&sb, "stream_options", `{"include_usage":true}`)
+    return openai.chatRequest(t, sb)
+  }
+  if (canPipe) {
+    const su = try providers.streamUpstream(t, req, sh.body, false)
+    if (su !== undefined) return su
+  }
+  return try providers.chatUpstream(t, req, sh.body, false)
 }
 
 // The in-process rules of the regex and secrets providers, by provider id. A bad pattern is logged and its provider is skipped.
@@ -1851,6 +1913,8 @@ export class Engine {
     const convertUs = Math.max(0.0, (performance.now() - tAtt) * 1000.0 - r.upstreamMs * 1000.0)
     out.set("x-bf-attempts", "" + r.attempts)
     if (compat !== undefined && compat.enabled) {
+      // Bifrost logs these as warnings: the fitted values and a dropped service tier
+      for (const w of compat.warnings) console.error(`raiju: compat: ${w}`)
       if (compat.dropped.length > 0) out.set("x-bifrost-dropped-compat-params", compat.dropped.join(","))
       if (compat.toolDrops.length > 0) out.set("x-bifrost-dropped-unsupported-tools", compat.toolDrops.join(","))
       if (compat.converted !== "") out.set("x-bifrost-converted-request-type", compat.converted)
@@ -2221,7 +2285,7 @@ export class Engine {
     }
     const build: Build = (t) => {
       const sh = try cp.shape(t.provider, t.kind, t.model, body)
-      if (sh.route === "responses") return openai.responsesRequest(t, sh.body)
+      if (sh.route === "responses") return openai.responsesRequest(t, streamedBody(sh.body, canPipe))
       return try sendChat(t, sh.body, sh.changed ? new LazyChat(sh.text) : typed)
     }
     const outGuard = this.guardOutput ? guard : undefined
@@ -2245,6 +2309,12 @@ export class Engine {
         if (g.blocked) throw new SyntaxError("the response was blocked by guardrails")
         return { body: g.body, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
+      // a chat request converted to Responses, answered whole (not piped): its chat completion, as SSE
+      const shs = try cp.shape(t.provider, t.kind, t.model, body)
+      if (shs.route === "responses") {
+        const rc = try responseToChat(text, requested)
+        return { body: try completionToSse(rc.body, wantUsage), promptTokens: rc.promptTokens, completionTokens: rc.completionTokens }
+      }
       if (providers.streamsNatively(t.kind)) {
         const tr = openai.streamResponse(text, requested)
         return { body: wantUsage ? tr.body : dropUsageChunks(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
@@ -2256,6 +2326,8 @@ export class Engine {
     const dropUsage = !wantUsage
     const mk: ConverterFactory = (t, requested) => {
       if (!streamable(t)) return undefined
+      // a chat request converted to Responses: the Responses events come out as chat chunks
+      if (cp.routeFor(t.provider, t.kind, t.model) === "responses") return new StreamConverter("responses", requested, wantUsage)
       const conv = new StreamConverter(converterKind(t), requested, !dropUsage)
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return conv
@@ -2297,7 +2369,7 @@ export class Engine {
     return try await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
   }
 
-  async completions(req: Request): Promise<Response> {
+  async completions(req: Request, sink?: StreamSink): Promise<Response> {
     const text = await req.text()
     let body: Field[] = []
     try {
@@ -2306,21 +2378,40 @@ export class Engine {
       return errorResponse(400, `invalid completions request: ${e.message}`, "invalid_request_error", noHeaders())
     }
     const stream = rawBool(body, "stream") ?? false
+    const wantUsage = streamUsage(body)
+    const canPipe = stream && sink !== undefined
     const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined), "completions", stream)
     const build: Build = (t) => {
       const sh = try cp.shape(t.provider, t.kind, t.model, body)
-      if (sh.route === "chat") return try providers.chatUpstream(t, try new LazyChat(sh.text).get(), sh.body, false)
+      if (sh.route === "chat") return try textAsChat(t, sh, stream, canPipe)
       if (!providers.streamsNatively(t.kind)) throw new SyntaxError(`${t.provider} does not serve text completions`)
       return openai.completionsRequest(t, sh.body)
     }
     const translate: Translate = (t, text, requested) => {
-      if (stream) return openai.streamResponse(text, requested)
       const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      if (sh.route === "chat") {
+        // a chat answer read whole: a stream was sent as SSE (not piped), or a call made without streaming
+        if (text.startsWith("data:")) {
+          const sr = openai.streamResponse(text, requested)
+          return { body: chatSseToText(sr.body), promptTokens: sr.promptTokens, completionTokens: sr.completionTokens }
+        }
+        const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        if (!stream) return { body: try chatToText(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+        return { body: chatSseToText(try completionToSse(tr.body, wantUsage)), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+      }
+      if (stream) return openai.streamResponse(text, requested)
       if (sh.route !== "chat") return try openai.chatResponse(text, requested)
       const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
       return { body: try chatToText(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
     }
-    return try await this.serve(req, "completions", undefined, body, text, build, translate, stream, undefined, undefined, undefined, cp)
+    // a text completion sent to a chat model streams as text_completion chunks, converted as they arrive
+    const mk: ConverterFactory = (t, requested) => {
+      if (!streamable(t)) return undefined
+      const conv = new StreamConverter(converterKind(t), requested, wantUsage)
+      conv.txt = cp.routeFor(t.provider, t.kind, t.model) === "chat"
+      return conv
+    }
+    return try await this.serve(req, "completions", undefined, body, text, build, translate, stream, undefined, canPipe ? sink : undefined, mk, cp)
   }
 }
 
@@ -2415,6 +2506,20 @@ test("does_not_send_done_marker without wait_for_usage ends at finish_reason", (
   expect(all.includes("prompt_tokens")).toBe(false)
   expect(all.endsWith("data: [DONE]\n\n")).toBe(true)
   expect(conv.promptTokens()).toBe(0)
+})
+
+test("a Responses stream and a chat stream answering a text completion come out as their chunks", () => {
+  const rc = new StreamConverter("responses", "openai/m", false)
+  const rsse = "event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"response\":{}}\n\n"
+  const rout = rc.push(new TextEncoder().encode(rsse)) + rc.end()
+  expect(rout.includes(`"delta":{"content":"hi"}`)).toBe(true)
+  expect(rout.endsWith("data: [DONE]\n\n")).toBe(true)
+  const tc = new StreamConverter("openai", "openai/m", false)
+  tc.txt = true
+  const csse = `data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"yo"},"finish_reason":null}]}\n\n`
+  const tout = tc.push(new TextEncoder().encode(csse)) + tc.end()
+  expect(tout.includes(`"text":"yo"`) && tout.includes(`"object":"text_completion"`)).toBe(true)
+  expect(tout.endsWith("data: [DONE]\n\n")).toBe(true)
 })
 
 test("finishes sees a non-null finish_reason only", () => {

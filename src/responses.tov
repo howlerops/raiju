@@ -1,7 +1,8 @@
 // OpenAI Responses API (POST /v1/responses). OpenAI itself gets the request
 // passed through; other providers are called with chat completions, so the
 // request and the result are translated here, whole or as a stream.
-import { Field, elements, fields, find, quote, rawStr, isNull } from "./json"
+import { Field, elements, fields, find, quote, rawStr, rawNum, isNull } from "./json"
+import { SseSplitter } from "./streams"
 import { newId, nowSeconds } from "./schemas"
 
 // A chat message being built. A function_call that follows an assistant
@@ -426,7 +427,157 @@ export function toResponseStream(chatSse: string, model: string): string {
   return out + streamEnd(state)
 }
 
+// A Responses event stream as chat.completion.chunk events, for a chat request sent to Responses.
+// Text deltas become content, each function call a tool_calls entry, and the response.completed
+// (or incomplete) event the finish reason and the usage. Events it does not map are dropped.
+export class ResponsesToChatStream {
+  promptTokens: int = 0
+  completionTokens: int = 0
+  done = false
+  private split = new SseSplitter()
+  private id = "chatcmpl"
+  private created = "0"
+  private started = false
+  private calls: int = 0
+  private callIndex: Map<string, int> = new Map()
+
+  constructor(readonly requestedModel: string, readonly includeUsage: bool) {}
+
+  push(text: string): string {
+    let out = ""
+    for (const ev of this.split.push(text)) out += this.event(ev.event, ev.data)
+    return out
+  }
+
+  // Ends the stream: [DONE] is added if the upstream never finished it.
+  end(): string {
+    let out = ""
+    for (const ev of this.split.flush()) out += this.event(ev.event, ev.data)
+    if (!this.done) {
+      this.done = true
+      out += "data: [DONE]\n\n"
+    }
+    return out
+  }
+
+  private chunk(delta: string, finish: string): string {
+    return `data: {"id":${quote(this.id)},"object":"chat.completion.chunk","created":${this.created},"model":${quote(this.requestedModel)},"choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+  }
+
+  // The first chunk says the assistant speaks; it goes out before the first content.
+  private begin(): string {
+    if (this.started) return ""
+    this.started = true
+    return this.chunk(`{"role":"assistant","content":""}`, "null")
+  }
+
+  private event(name: string, data: string): string {
+    if (this.done) return ""
+    try {
+      return this.mapEvent(name, data)
+    } catch (e) {
+      return ""
+    }
+  }
+
+  private mapEvent(name: string, data: string): string throws SyntaxError {
+    const fs = try fields(data)
+    if (name === "response.created" || name === "response.in_progress") {
+      const resp = try fields(find(fs, "response") ?? "{}")
+      this.id = `${rawStr(resp, "id") ?? "chatcmpl"}`
+      this.created = find(resp, "created_at") ?? "0"
+      return ""
+    }
+    if (name === "response.output_text.delta") {
+      const d = rawStr(fs, "delta") ?? ""
+      if (d === "") return ""
+      return this.begin() + this.chunk(`{"content":${quote(d)}}`, "null")
+    }
+    if (name === "response.output_item.added") {
+      const item = try fields(find(fs, "item") ?? "{}")
+      if (rawStr(item, "type") !== "function_call") return ""
+      const idx = this.calls
+      this.calls += 1
+      this.callIndex.set(rawStr(item, "id") ?? "", idx)
+      const delta = `{"tool_calls":[{"index":${idx},"id":${quote(rawStr(item, "call_id") ?? "")},"type":"function","function":{"name":${quote(rawStr(item, "name") ?? "")},"arguments":""}}]}`
+      return this.begin() + this.chunk(delta, "null")
+    }
+    if (name === "response.function_call_arguments.delta") {
+      const idx = this.callIndex.get(rawStr(fs, "item_id") ?? "")
+      if (idx === undefined) return ""
+      const args = rawStr(fs, "delta") ?? ""
+      return this.chunk(`{"tool_calls":[{"index":${idx},"function":{"arguments":${quote(args)}}}]}`, "null")
+    }
+    if (name === "response.completed" || name === "response.incomplete") {
+      const resp = try fields(find(fs, "response") ?? "{}")
+      const inc = find(resp, "incomplete_details") ?? "null"
+      let finish = "stop"
+      if (this.calls > 0) finish = "tool_calls"
+      else if (inc.includes("max_output_tokens")) finish = "length"
+      let out = this.begin() + this.chunk("{}", quote(finish))
+      const u = find(resp, "usage")
+      if (u !== undefined && u.startsWith("{")) {
+        const uf = try fields(u)
+        this.promptTokens = Math.trunc(rawNum(uf, "input_tokens") ?? 0.0)
+        this.completionTokens = Math.trunc(rawNum(uf, "output_tokens") ?? 0.0)
+      }
+      if (this.includeUsage) {
+        const total = this.promptTokens + this.completionTokens
+        out += `data: {"id":${quote(this.id)},"object":"chat.completion.chunk","created":${this.created},"model":${quote(this.requestedModel)},"choices":[],"usage":{"prompt_tokens":${this.promptTokens},"completion_tokens":${this.completionTokens},"total_tokens":${total}}}\n\n`
+      }
+      this.done = true
+      return out + "data: [DONE]\n\n"
+    }
+    if (name === "response.failed" || name === "error") {
+      this.done = true
+      const msg = rawStr(fs, "message") ?? "the upstream response failed"
+      return `data: {"error":{"message":${quote(msg)},"type":"api_error"}}\n\ndata: [DONE]\n\n`
+    }
+    return ""
+  }
+}
+
 // ---- tests ----
+
+test("a Responses stream becomes chat chunks: text, a call, the finish and the usage", () => {
+  const s = new ResponsesToChatStream("openai/gpt", true)
+  const sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_9\",\"created_at\":42}}\n\n" +
+    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n" +
+    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n" +
+    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_9\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n"
+  const out = s.push(sse) + s.end()
+  const frames = out.split("\n\n").filter((e) => e !== "")
+  expect(frames[0]).toBe(`data: {"id":"resp_9","object":"chat.completion.chunk","created":42,"model":"openai/gpt","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`)
+  expect(frames[1]!.includes(`"delta":{"content":"Hel"}`)).toBe(true)
+  expect(frames[2]!.includes(`"delta":{"content":"lo"}`)).toBe(true)
+  expect(frames[3]!.includes(`"finish_reason":"stop"`)).toBe(true)
+  expect(frames[4]).toBe(`data: {"id":"resp_9","object":"chat.completion.chunk","created":42,"model":"openai/gpt","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}`)
+  expect(frames[5]).toBe("data: [DONE]")
+  expect(s.promptTokens).toBe(4)
+  expect(s.completionTokens).toBe(2)
+})
+
+test("a function call streams its name and arguments by index, and finishes as tool_calls", () => {
+  const s = new ResponsesToChatStream("m", false)
+  const sse = "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"f\"}}\n\n" +
+    "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"a\\\"\"}\n\n" +
+    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":null}}\n\n"
+  const out = s.push(sse) + s.end()
+  expect(out.includes(`"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"f","arguments":""}}]`)).toBe(true)
+  expect(out.includes(`"tool_calls":[{"index":0,"function":{"arguments":"{\\"a\\""}}]`)).toBe(true)
+  expect(out.includes(`"finish_reason":"tool_calls"`)).toBe(true)
+  expect(out.includes(`"usage"`)).toBe(false)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("an incomplete answer finishes as length, and a stream cut short still ends with [DONE]", () => {
+  const s = new ResponsesToChatStream("m", false)
+  const out = s.push("event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n")
+  expect(out.includes(`"finish_reason":"length"`)).toBe(true)
+  const cut = new ResponsesToChatStream("m", false)
+  cut.push("event: response.output_text.delta\ndata: {\"delta\":\"x\"}\n\n")
+  expect(cut.end().endsWith("data: [DONE]\n\n")).toBe(true)
+})
 
 function eventTypes(sse: string): string[] {
   const out: string[] = []

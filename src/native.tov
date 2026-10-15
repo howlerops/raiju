@@ -5,6 +5,7 @@ import { Engine, Build, Translate, StreamSink, StreamConverter, ConverterFactory
 import { Target, Translated, trimSlash, proxyOf, tlsOf } from "./providers/types"
 import { ChatRequest, snapshot, newId, nowSeconds } from "./schemas"
 import { Config } from "./config"
+import { CompatPlan, Shaped, settingsOf, withHeader, isCodingHarness, isDeepSeekModel } from "./compat"
 import { deadline } from "./deadline"
 import { secureHex } from "./crypto"
 import { handleMedia, matchRoute, providerTarget, send } from "./media"
@@ -197,27 +198,46 @@ function responsesUsage(text: string, stream: bool): Translated {
 export async function responsesApi(engine: Engine, req: Request): Promise<Response> {
   const reqText = await req.text()
   let body: Field[] = []
-  let bridge: Bridge | undefined = undefined
   try {
     body = fields(reqText)
-    bridge = chatBridge(responses.toChatRequest(reqText, rawStr(body, "model") ?? ""), rawBool(body, "stream") ?? false, false, false)
+    // the request as chat for the chat bridge, once for the client's model
+    responses.toChatRequest(reqText, rawStr(body, "model") ?? "")
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
-  const br = bridge!
   const stream = rawBool(body, "stream") ?? false
   const clientModel = rawStr(body, "model") ?? ""
+  // compat: each target's request is shaped (drops and fits) before it is sent
+  const settings = withHeader(settingsOf(engine.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined)
+  const harness = isCodingHarness(req.headers.get("user-agent") ?? "")
+  const cp = new CompatPlan(settings, "responses", stream)
   const b: Build = (t) => {
-    if (t.kind === "openai") return openai.responsesRequest(t, body)
+    const sh = try shapeTarget(cp, t, body, settings.azureDeepseek, harness)
+    if (t.kind === "openai") return openai.responsesRequest(t, try fields(shapedText(sh, reqText)))
+    const br = try chatBridge(responses.toChatRequest(shapedText(sh, reqText), clientModel), stream, false, false)
     return try br.build(t)
   }
   const tr: Translate = (t, text, requested) => {
     if (t.kind === "openai") return responsesUsage(text, stream)
+    const sh = try shapeTarget(cp, t, body, settings.azureDeepseek, harness)
+    const br = try chatBridge(responses.toChatRequest(shapedText(sh, reqText), clientModel), stream, false, false)
     const o = try br.toOpenAI(t, text, requested)
     const out = stream ? responses.toResponseStream(try asSse(o.body), clientModel) : try responses.toResponse(o.body, clientModel, reqText)
     return { body: out, promptTokens: o.promptTokens, completionTokens: o.completionTokens }
   }
-  return await engine.serve(req, "responses", undefined, body, reqText, b, tr, stream)
+  return await engine.serve(req, "responses", undefined, body, reqText, b, tr, stream, undefined, undefined, undefined, cp)
+}
+
+// One target's Responses request, shaped by compat. Azure DeepSeek refuses reasoning on Responses, so it
+// goes unless the request is a coding harness's and azure_deepseek serves it as chat.
+function shapeTarget(cp: CompatPlan, t: Target, body: Field[], azureOn: bool, harness: bool): Shaped throws SyntaxError {
+  cp.reasoningOff = t.kind === "azure" && isDeepSeekModel(t.model) && !(azureOn && harness)
+  return try cp.shape(t.provider, t.kind, t.model, body)
+}
+
+// The request text a target gets: the shaped one when compat changed it, else the caller's.
+function shapedText(sh: Shaped, reqText: string): string {
+  return sh.changed ? sh.text : reqText
 }
 
 function jsonBody(body: string): Response {

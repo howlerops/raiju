@@ -16,6 +16,9 @@ import { Translated, Target } from "./providers/types"
 import * as typesafe from "./providers/typesafe"
 import * as providers from "./providers/index"
 import { DecisionReq, parseDecision } from "./decisions"
+import { emulationBody, emulatedDecision } from "./decision_emulate"
+import { settingsOf, withHeader, responseToChat } from "./compat"
+import * as responses from "./responses"
 
 function json(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
@@ -195,10 +198,45 @@ export async function decisionRoute(engine: Engine, req: Request, p: string): Pr
   }
   const decision: DecisionReq = d
   const k = kindFor(engine, decision.model)
-  if (!providers.supportsDecisions(k.kind)) return json(400, errorJson(`decisions is not supported by ${k.provider} provider`, "invalid_request_error", "unsupported_operation"))
+  if (!providers.supportsDecisions(k.kind)) {
+    // compat's convert_decision_to_responses (off by default): the model answers the question itself
+    const settings = withHeader(settingsOf(engine.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined)
+    if (!settings.decisions) return json(400, errorJson(`decisions is not supported by ${k.provider} provider`, "invalid_request_error", "unsupported_operation"))
+    return await decisionByEmulation(engine, req, decision, k.kind, body, text)
+  }
   const mk: Build = (t) => try typesafe.systemoneUpstream(t, decision)
   const tr: Translate = (t, out, requested) => try typesafe.translateDecision(out, decision, requested)
   return await engine.serve(req, "decisions", undefined, body, text, mk, tr, false)
+}
+
+// A decision asked of a model with no decisions endpoint: the questions go as one forced function call
+// (decision_emulate.tov). An OpenAI model is asked through Responses, any other through its chat call; the
+// answer is rendered as the canonical decision, and the header says which request type the call was.
+async function decisionByEmulation(engine: Engine, req: Request, d: DecisionReq, kind: string, body: Field[], text: string): Promise<Response> {
+  const mk: Build = (t) => {
+    const eb = try emulationBody(d, t.model)
+    if (t.kind === "openai") return openai.responsesRequest(t, try fields(eb))
+    const chat = try responses.toChatRequest(eb, t.model)
+    return try providers.chatUpstream(t, try JSON.parse(chat) as ChatRequest, try fields(chat), false)
+  }
+  const tr: Translate = (t, out, requested) => {
+    const ch: Translated = t.kind === "openai" ? try responseToChat(out, requested) : try providers.chatTranslate(t.kind, t.model, out, requested, false)
+    return try emulatedDecision(ch.body, d, requested, ch.promptTokens, ch.completionTokens)
+  }
+  const r = await engine.serve(req, "decisions", undefined, body, text, mk, tr, false)
+  if (r.status !== 200) return r
+  let answer = ""
+  try {
+    answer = await r.text()
+  } catch (e) {
+    return errorResponse(502, `could not read the answer: ${e.message}`, "api_error", noHeaders())
+  }
+  const hs: Record<string, string> = new Map()
+  r.headers.forEach((v, key) => {
+    if (key !== "content-length") hs.set(key, v)
+  })
+  hs.set("x-bifrost-converted-request-type", kind === "openai" ? "responses" : "chat_completion")
+  return new Response(answer, { status: 200, headers: hs })
 }
 
 async function typesafeSystemOne(engine: Engine, req: Request): Promise<Response> {
