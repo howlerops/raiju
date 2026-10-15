@@ -1,9 +1,9 @@
 // The Responses API over a WebSocket (GET /v1/responses with an upgrade), as Bifrost's
 // wsresponses.go: each response.create event runs through the responses path, streamed, and the
-// events it produces go back over the socket as text messages, one per event. Events run one at a
-// time per connection. The gateway builds a streamed answer whole, so the events go out when the
-// upstream has finished, not as each one arrives.
-import { Engine } from "./gateway"
+// events it produces go back over the socket as text messages, one per event, as each arrives from
+// an OpenAI upstream. Events run one at a time per connection. response.cancel aborts the response in
+// flight. Other providers' answers are translated whole, so their events go out when they are done.
+import { Engine, StreamSink } from "./gateway"
 import { responsesApi } from "./native"
 import { fields, find, rawStr, setField, without, build } from "./json"
 import { SocketExt } from "./realtime"
@@ -45,14 +45,21 @@ export function eventBody(text: string): string throws SyntaxError {
   return build(fs)
 }
 
+// The payload of one event-stream line, or undefined for a line that carries none (an event name,
+// a blank line, [DONE]).
+export function ssePayloadOf(line: string): string | undefined {
+  if (!line.startsWith("data:")) return undefined
+  const payload = line.slice(5).trim()
+  if (payload === "" || payload === "[DONE]") return undefined
+  return payload
+}
+
 // The data payloads of an event stream, in order, without [DONE].
 export function ssePayloads(text: string): string[] {
   const out: string[] = []
   for (const line of text.split("\n")) {
-    if (!line.startsWith("data:")) continue
-    const payload = line.slice(5).trim()
-    if (payload === "" || payload === "[DONE]") continue
-    out.push(payload)
+    const p = ssePayloadOf(line)
+    if (p !== undefined) out.push(p)
   }
   return out
 }
@@ -60,6 +67,10 @@ export function ssePayloads(text: string): string[] {
 export class ResponsesSocket extends SocketExt {
   queue: string[] = []
   busy = false
+  // the response in flight, which response.cancel aborts
+  active: StreamSink | undefined = undefined
+  // the part of the stream after its last line end
+  private pending = ""
   constructor(readonly engine: Engine, readonly headers: Map<string, string>) {
     super()
   }
@@ -71,6 +82,10 @@ export class ResponsesSocket extends SocketExt {
       type = rawStr(fields(m), "type") ?? ""
     } catch (e) {
       this.send(errorEvent(400, "invalid_request_error", "failed to parse event JSON"))
+      return
+    }
+    if (type === "response.cancel") {
+      this.cancel()
       return
     }
     if (type !== "response.create") {
@@ -104,17 +119,37 @@ export class ResponsesSocket extends SocketExt {
     }
     hs.set("content-type", "application/json")
     const req = new Request("http://localhost/v1/responses", { method: "POST", headers: hs, body: body })
+    // the stream's events go out as each line arrives; a whole answer comes back in the Response
+    const sink = new StreamSink(
+      () => {},
+      (chunk) => {
+        this.feed(chunk)
+      },
+      () => {
+        this.flushLines()
+      },
+    )
+    this.active = sink
     let status = 500
     let answer = ""
     try {
-      const res = await responsesApi(this.engine, req)
-      status = res.status
-      answer = await res.text()
+      const res = await responsesApi(this.engine, req, sink)
+      if (!sink.started) {
+        status = res.status
+        answer = await res.text()
+      } else {
+        status = 200
+      }
     } catch (e) {
+      this.active = undefined
       console.error(`raiju: ${e.message}`)
       this.send(errorEvent(500, "server_error", "internal server error"))
       return
     }
+    this.active = undefined
+    this.flushLines()
+    // cancelled: the answer, if it was whole, is dropped with the response
+    if (sink.cancelled || sink.started) return
     if (status >= 400) {
       this.send(upstreamErrorEvent(status, answer))
       return
@@ -125,6 +160,36 @@ export class ResponsesSocket extends SocketExt {
       return
     }
     for (const p of payloads) this.send(p)
+  }
+
+  // Takes the stream as it comes: each complete data line is an event, sent at once.
+  private feed(chunk: string): void {
+    this.pending += chunk
+    const lines = this.pending.split("\n")
+    this.pending = lines.pop() ?? ""
+    for (const line of lines) this.line(line)
+  }
+
+  // The end of the stream: a last line without its line end is an event too.
+  private flushLines(): void {
+    const rest = this.pending
+    this.pending = ""
+    if (rest !== "") this.line(rest)
+  }
+
+  private line(l: string): void {
+    const p = ssePayloadOf(l)
+    if (p !== undefined) this.send(p)
+  }
+
+  // response.cancel: aborts the response in flight, which sends nothing back for it. With no response
+  // in flight it does nothing.
+  private cancel(): void {
+    const s = this.active
+    if (s === undefined) return
+    s.cancelled = true
+    const a = s.abort
+    if (a !== undefined) a()
   }
 }
 
@@ -146,6 +211,13 @@ test("error events", () => {
 test("event bodies drop the type and stream", () => {
   expect(try eventBody(`{"type":"response.create","model":"openai/gpt-4o","input":"hi"}`)).toBe(`{"model":"openai/gpt-4o","input":"hi","stream":true,"store":true}`)
   expect(try eventBody(`{"type":"response.create","model":"m","stream":false,"store":false}`)).toBe(`{"model":"m","stream":true,"store":true}`)
+})
+
+test("a stream line carries an event's payload", () => {
+  expect(ssePayloadOf(`data: {"type":"x"}\r`)).toBe(`{"type":"x"}`)
+  expect(ssePayloadOf("event: response.created")).toBe(undefined)
+  expect(ssePayloadOf("data: [DONE]")).toBe(undefined)
+  expect(ssePayloadOf("")).toBe(undefined)
 })
 
 test("sse payloads", () => {

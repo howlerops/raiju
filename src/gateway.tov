@@ -4,7 +4,7 @@ import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig
 import { applyPrompt } from "./prompts"
 import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
-import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
+import { OpenAIPassthrough, ResponsesPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
 import { CohereToOpenAI } from "./streams_cohere"
 import { CohereStream } from "./cohere_in"
 import { GenAIStream } from "./genai_in"
@@ -66,6 +66,8 @@ export class StreamSink {
   started = false
   // the client went away: stop reading the upstream
   cancelled = false
+  // set by the relay while it reads the upstream: aborts a read that is waiting for the next chunk
+  abort: (() => void) | undefined = undefined
   constructor(readonly open: (status: int, headers: Map<string, string>) => void, readonly write: (chunk: string) => void, readonly close: () => void) {}
   // binary event-stream frames (Bedrock's streaming routes); only the Bun.serve path sets it
   writeBytes: ((chunk: u8[]) => void) | undefined = undefined
@@ -94,8 +96,12 @@ export class StreamConverter {
   // binary frames for the client, taken with takeFrames()
   private frames: u8[] = []
 
+  // kind "responses-raw": a Responses stream from an OpenAI upstream, forwarded as it came
+  rp: ResponsesPassthrough | undefined = undefined
+
   constructor(readonly kind: string, requested: string, includeUsage: bool) {
-    if (kind === "anthropic") this.an = new AnthropicToOpenAI(requested, includeUsage)
+    if (kind === "responses-raw") this.rp = new ResponsesPassthrough()
+    else if (kind === "anthropic") this.an = new AnthropicToOpenAI(requested, includeUsage)
     else if (kind === "gemini") this.ge = new GeminiToOpenAI(requested, includeUsage)
     else if (kind === "bedrock") this.br = new BedrockEventStreamToOpenAI(requested, includeUsage)
     else if (kind === "cohere") this.co = new CohereToOpenAI(requested, includeUsage)
@@ -180,6 +186,8 @@ export class StreamConverter {
   }
 
   push(bytes: u8[]): string {
+    const rp = this.rp
+    if (rp !== undefined) return rp.push(this.text(bytes))
     if (this.raw) {
       const t = this.text(bytes)
       const an = this.an
@@ -190,6 +198,8 @@ export class StreamConverter {
   }
 
   end(): string {
+    const rp = this.rp
+    if (rp !== undefined) return rp.end()
     if (this.raw) {
       this.an?.end()
       return ""
@@ -290,11 +300,11 @@ export class StreamConverter {
   }
 
   promptTokens(): int {
-    return this.an?.inTokens ?? this.ge?.inTokens ?? this.br?.promptTokens ?? this.co?.inTokens ?? this.rs?.promptTokens ?? this.oa?.promptTokens ?? 0
+    return this.rp?.promptTokens ?? this.rs?.promptTokens ?? this.an?.inTokens ?? this.ge?.inTokens ?? this.br?.promptTokens ?? this.co?.inTokens ?? this.oa?.promptTokens ?? 0
   }
 
   completionTokens(): int {
-    return this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.co?.outTokens ?? this.rs?.completionTokens ?? this.oa?.completionTokens ?? 0
+    return this.rp?.completionTokens ?? this.rs?.completionTokens ?? this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.co?.outTokens ?? this.oa?.completionTokens ?? 0
   }
 }
 
@@ -1270,6 +1280,10 @@ export class Engine {
             sink.started = true
             sink.open(200, ctx.outHeaders)
             const reader = stream.getReader()
+            // a cancel while the upstream is silent aborts the pending read, not just the next one
+            sink.abort = () => {
+              dl.controller.abort()
+            }
             try {
               let chunkIndex = 0
               let lastAt = started
@@ -1297,7 +1311,8 @@ export class Engine {
               }
             } catch (e) {
               // a binary stream just ends: a text error would corrupt its frames
-              if (!conv.framed()) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
+              // (a client that cancelled is owed no error event)
+              if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
             }
             const tail = conv.end()
             if (tail !== "") sink.write(tail)

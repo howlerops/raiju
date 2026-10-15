@@ -235,6 +235,15 @@ const DISCOVER_MS = 10000
 // How often the UI socket looks for new request-log entries, in ms.
 const UI_TICK_MS = 1000
 
+// The UI socket's heartbeat, as Bifrost's: a ping every 30 s, and a client that has not answered for
+// 60 s is dropped.
+const UI_PING_MS = 30000
+const UI_PONG_MS = 60000
+
+// With several workers, a worker keeps its store updates in its share file; once the file grows past
+// this many bytes the older lines go.
+const UI_SHARE_MAX = 65536
+
 // One dashboard client on /ws.
 export class UiSocket extends SocketExt {
   // log events reach this socket only for entries its user's data scope covers
@@ -256,16 +265,26 @@ export class UiSocket extends SocketExt {
 // successful management write (tags name the resource changed), and log for each new request-log
 // entry while a client is connected. (Bifrost's socket at this version sends notifications and
 // store updates only; the log events are Raiju's.)
+//
+// With several workers, each client gets the events of every worker: log entries from the shared
+// day file (LogStore.viewSince), and store updates from the other workers' share files.
 export cyclic class UiHub {
   clients: UiSocket[] = []
   timer: int = -1
   since: f64 = 0.0
+  lastPing: f64 = 0.0
+  // the node's share directory, or "" for one process
+  shareDir = ""
+  // how far each other worker's share file has been read, by file name
+  offsets: Map<string, int> = new Map()
   constructor(readonly logs: () => LogStore | undefined) {}
 
   add(c: UiSocket): void {
+    c.pongAt = Date.now()
     this.clients.push(c)
     if (this.clients.length === 1) {
       this.since = Date.now()
+      this.lastPing = Date.now()
       this.timer = setInterval(() => {
         this.tick()
       }, UI_TICK_MS)
@@ -280,15 +299,97 @@ export cyclic class UiHub {
     }
   }
 
+  // Sends a store update to this worker's clients, and through the share file to the others.
   send(text: string): void {
     for (const c of this.clients) c.send(text)
+    if (this.shareDir !== "") this.share(text)
   }
 
-  // Pushes the request-log entries that arrived since the last tick.
+  // The share directory of the node's workers: each worker writes its own file.
+  setShare(dir: string): void {
+    try {
+      mkdirSync(dir, { recursive: true })
+      this.shareDir = dir
+    } catch (e) {
+      this.shareDir = ""
+    }
+  }
+
+  private shareFile(): string {
+    return this.shareDir + "/" + process.pid + ".jsonl"
+  }
+
+  // Appends a store update to this worker's file, keeping its last lines once it is large.
+  private share(text: string): void {
+    let old = ""
+    try {
+      old = readFileSync(this.shareFile(), "utf8")
+    } catch (e) {
+      old = ""
+    }
+    let out = old + text + "\n"
+    if (out.byteLength > UI_SHARE_MAX) {
+      const lines = out.split("\n")
+      out = lines.slice(Math.max(0, lines.length - 200)).join("\n")
+    }
+    try {
+      writeFileSync(this.shareFile(), out)
+    } catch (e) {
+      // the other workers miss this update
+    }
+  }
+
+  // Sends the store updates the other workers wrote since the last tick: whole lines only, so a line
+  // still being written waits for the next tick.
+  private fromShares(): void {
+    let names: string[] = []
+    try {
+      names = readdirSync(this.shareDir)
+    } catch (e) {
+      return
+    }
+    const mine = this.shareFile().slice(this.shareDir.byteLength + 1)
+    for (const f of names) {
+      if (f === mine || !f.endsWith(".jsonl")) continue
+      let text = ""
+      try {
+        text = readFileSync(this.shareDir + "/" + f, "utf8")
+      } catch (e) {
+        continue
+      }
+      let from = this.offsets.get(f) ?? 0
+      // a file rewritten shorter than it was is read again from its start
+      if (from > text.byteLength) from = 0
+      const parts = text.slice(from).split("\n")
+      let used = 0
+      for (let i = 0; i < parts.length - 1; i++) {
+        const line = parts[i]!
+        used += line.byteLength + 1
+        if (line !== "") {
+          for (const c of this.clients) c.send(line)
+        }
+      }
+      this.offsets.set(f, from + used)
+    }
+  }
+
+  // Pings the clients every 30 s, and drops the ones that have not answered for 60 s.
+  private beat(now: f64): void {
+    if (now - this.lastPing < UI_PING_MS) return
+    this.lastPing = now
+    for (const c of this.clients) {
+      if (now - c.pongAt > UI_PONG_MS) c.drop()
+      else c.ping()
+    }
+  }
+
+  // Pushes the request-log entries that arrived since the last tick, and the other workers' updates.
   tick(): void {
+    if (this.shareDir !== "") this.fromShares()
+    this.beat(Date.now())
     const store = this.logs()
     if (store === undefined) return
-    for (const e of store.since(this.since)) {
+    for (const e of store.viewSince(this.since)) {
       const text = JSON.stringify({ type: "log", data: logEventView(e) })
       for (const c of this.clients) {
         if (visibleTo(e, c.scope)) c.send(text)
@@ -574,6 +675,9 @@ export class Ops {
     if (sem !== undefined && this.engine.vstore === undefined) sem.share(this.shareDir + "/semantic")
     const ls = this.engine.logStore
     if (ls !== undefined) ls.shared = true
+    // live sessions (who opened each one) and the UI socket's store updates
+    this.liveSessions.share(this.shareDir + "/live")
+    this.ui.setShare(this.shareDir + "/ui")
     try {
       mkdirSync(this.shareDir + "/metrics", { recursive: true })
     } catch (e) {

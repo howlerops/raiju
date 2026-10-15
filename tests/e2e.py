@@ -19,6 +19,7 @@ GW_POL = "http://127.0.0.1:18121"  # circuit policies, and an MCP client authori
 GW_G = "http://127.0.0.1:18116"  # exports OTLP over gRPC to tests/otlp_grpc_collector.py
 GW_C = "http://127.0.0.1:18118"  # compat: x-bf-compat only (no client.compat)
 GW_CC = "http://127.0.0.1:18119"  # compat: client.compat set
+GW_WS = "http://127.0.0.1:18150"  # two workers (Bun only): live sessions, the UI socket and store updates across them
 GRPC_COLLECTOR_PORT = 18317
 GW_GT = "http://127.0.0.1:18117"  # exports OTLP over TLS gRPC (ALPN h2) to the TLS collector
 GRPC_TLS_COLLECTOR_PORT = 18318
@@ -1288,6 +1289,15 @@ def main():
     gw_rules = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18131", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.rules.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.rules.log"), "w"))
     gw_w = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18094", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.workers.json"), "-workers", "3"], env=env, stderr=subprocess.DEVNULL)
     gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18097", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.node-b.json")], env=env, stderr=subprocess.DEVNULL)
+    # the same config on two workers of one node (the worker share is Bun's; http1 is one process)
+    gw_ws = None
+    if os.environ.get("RAIJU_SERVER", "bun") != "http1":
+        # the main gateway's audit chain, alerts, exports, OTLP and OIDC stay with it, and so does the OAuth MCP token count
+        wsc = {k: v for k, v in json.load(open(config)).items() if k not in ("cluster", "audit", "alerts", "log_exports", "otel", "oidc")}
+        wsc["mcp"] = {**wsc["mcp"], "client_configs": [c for c in wsc["mcp"]["client_configs"] if c["name"] != "secure"]}
+        wsc["logs_store"] = {**wsc.get("logs_store", {}), "dir": os.path.join(BUILD, "e2e-wsw-logs")}
+        json.dump(wsc, open(os.path.join(BUILD, "e2e.wsworkers.json"), "w"))
+        gw_ws = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18150", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.wsworkers.json"), "-workers", "2"], env=env, stderr=subprocess.DEVNULL)
     gw_d = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18092", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.direct.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.direct.log"), "w"))
     weav = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/weaviate_mock.py"), "18114"])
     pine = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/pinecone_mock.py"), "18115"])
@@ -1334,6 +1344,8 @@ def main():
     gw_own_off = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18128", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.owner-off.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.owner-off.log"), "w"))
     try:
         wait(MOCK + "/_seen"); wait(GW + "/health"); wait(GW_B + "/health")
+        if gw_ws is not None:
+            wait(GW_WS + "/health")
         wait_mcp_tools(GW, ["weather-get_weather", "secure-get_weather", "local-echo"])
 
         s, h, b = chat("openai/gpt-4o-mini")
@@ -1673,7 +1685,7 @@ def main():
         up = [x for x in seen() if x["path"] == "/v1/responses"][-1]
         ub = json.loads(up["body"])
         check("the upstream request streams, without the event type", ub.get("stream") is True and "type" not in ub and ub.get("model") == "gpt-4o-mini", up["body"])
-        rs.send('{"type":"response.cancel"}')
+        rs.send('{"type":"session.update"}')
         ev = rs.recv_json()
         check("unsupported events are errors, and the socket stays up", ev.get("type") == "error" and ev.get("status") == 400 and "unsupported event type" in ev["error"]["message"], ev)
         rs.send("not json")
@@ -1686,6 +1698,44 @@ def main():
         evs = rs.until("response.completed")
         check("a later event on the same socket still runs", evs and evs[-1].get("type") == "response.completed", evs)
         rs.close()
+
+        # the events go out as they arrive: the slow upstream sends its first event, then pauses
+        sl = WsClient("/v1/responses")
+        sl.send(json.dumps({"type": "response.create", "model": "openai/gpt-4o-slow", "input": "hi"}))
+        t0 = time.time()
+        first = sl.recv_json()
+        check("responses WebSocket sends an event before the upstream finishes", first and first.get("type") == "response.created" and time.time() - t0 < 2.5, (first, time.time() - t0))
+        rest = sl.until("response.completed")
+        check("the rest of the slow stream follows", rest and rest[-1].get("type") == "response.completed" and rest[0].get("delta") == "late", rest)
+        sl.close()
+
+        # response.cancel aborts the upstream call: no further event comes, and the upstream sees the hang-up
+        cs = WsClient("/v1/responses")
+        cs.send(json.dumps({"type": "response.create", "model": "openai/gpt-4o-slow", "input": "hi"}))
+        head = cs.recv_json()
+        cs.send('{"type":"response.cancel"}')
+        after = cs.recv()
+        time.sleep(0.5)
+        # (the late delta, sent 3 s in, never reaches the client; the mock's own abort record is not required, since the
+        # runtime may keep the upstream socket open until the upstream ends)
+        check("response.cancel stops the in-flight response", head and head.get("type") == "response.created" and after is None, (head, after))
+        cs.close()
+
+        # the aliases Bifrost registers for the Responses socket
+        for alias in ("/openai/responses", "/openai/v1/responses"):
+            al = WsClient(alias)
+            al.send(json.dumps({"type": "response.create", "model": "openai/gpt-4o-mini", "input": "hi"}))
+            evs = al.until("response.completed")
+            check(f"the Responses socket alias {alias} runs the same route", al.status == 101 and evs and evs[-1].get("type") == "response.completed", (alias, al.status, evs[-1:] if evs else evs))
+            al.close()
+
+        # POST /v1/live/sessions: the WebRTC create is refused (no WebRTC peer here), after the checks Bifrost makes
+        s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, headers={"authorization": "Bearer sk-bf-openai"})
+        check("a WebRTC live create is refused with the reason", s == 501 and "WebSocket" in b, (s, b))
+        s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}})
+        check("a live create needs a WebRTC transport", s == 400 and "transport" in b, (s, b))
+        s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "anthropic/claude"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, headers={"authorization": "Bearer sk-bf-openai"})
+        check("a live create for a provider without a live API is refused", s == 400 and "no live API" in b, (s, b))
 
         # GPT Live: session.start names the model; the provider's id is recorded for the virtual key
         # that opened it, so only that key may attach to it or read its recording
@@ -1733,6 +1783,56 @@ def main():
         evs = ui.until("log")
         check("a new request-log entry goes out on the UI socket", evs and evs[-1].get("type") == "log" and evs[-1]["data"]["model"] == "openai/gpt-4o-mini", evs[-1:] if evs else evs)
         ui.close()
+
+        # the UI socket's heartbeat: a ping every 30 s, answered with a pong, and the socket stays up
+        hb = WsClient("/ws", ADMIN)
+        hb.sock.settimeout(45)
+        b0, b1 = hb._read(2)
+        check("the UI socket pings its client", b0 & 0x0F == 0x9, (b0, b1))
+        hb.sock.sendall(bytes([0x8A, 0x80]) + os.urandom(4))
+        hb.sock.settimeout(2)
+        try:
+            hb._read(2)
+            still_open = False
+        except socket.timeout:
+            still_open = True
+        check("a client that answers the ping stays connected", still_open)
+        hb.close()
+
+        # Bun's workers: a live session opened on one worker is attached to from any, the UI socket gets
+        # every worker's log entries and store updates, and the registry refuses other keys everywhere
+        if gw_ws is not None:
+            for _ in range(8):
+                lv = WsClient("/v1/live/sessions", {"authorization": "Bearer sk-bf-openai"}, port=18150)
+                lv.send(json.dumps({"type": "session.start", "session": {"model": "openai/gpt-4o-mini"}}))
+                lv.recv_json()
+                lv.close()
+            attach_ok, attach_refused = [], []
+            for _ in range(8):
+                at = WsClient("/v1/live/sessions/sess_mock_1/attach", {"authorization": "Bearer sk-bf-openai"}, port=18150)
+                attach_ok.append(at.status)
+                at.close()
+                # a refusal can race the server's close: a reset during the handshake is retried
+                for _try in range(3):
+                    try:
+                        attach_refused.append(WsClient("/v1/live/sessions/sess_mock_1/attach", {"authorization": "Bearer sk-bf-limited"}, port=18150).status)
+                        break
+                    except ConnectionResetError:
+                        time.sleep(0.2)
+                else:
+                    attach_refused.append(None)
+            check("an attach is accepted on every worker of the node", all(s == 101 for s in attach_ok), attach_ok)
+            check("another key is refused by every worker of the node", all(s == 404 for s in attach_refused), attach_refused)
+
+            uis = [WsClient("/ws", ADMIN, port=18150) for _ in range(6)]
+            s_refresh = call("POST", "/api/mcp/client/local/refresh-tools", headers=ADMIN, base=GW_WS)[0]
+            got = [u.until("store_update") for u in uis]
+            check("a store update reaches the UI socket on every worker", all(u.status == 101 for u in uis) and all(g and g[-1].get("tags") == ["mcp"] for g in got), ([u.status for u in uis], [g[-1:] for g in got], s_refresh))
+            s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "fan out"}]}, headers={"authorization": "Bearer sk-bf-openai"}, base=GW_WS)
+            logs = [u.until("log") for u in uis]
+            check("a request-log entry reaches the UI socket on every worker", s == 200 and all(l and l[-1].get("type") == "log" for l in logs), (s, [l[-1:] for l in logs]))
+            for u in uis:
+                u.close()
 
         # Anthropic SDK route to a non-Anthropic provider
         s, _, b = call("POST", "/anthropic/v1/messages", {"model": "openai/gpt-4o-mini", "max_tokens": 20, "system": "be brief", "messages": [{"role": "user", "content": "hi"}]})
@@ -3159,6 +3259,8 @@ def main():
         gw_l.terminate(); gw_enc.terminate(); gw_guard.terminate(); gw_rules.terminate(); gw_pol.terminate()
         gw_own.terminate(); gw_own_off.terminate()
         gw_c.terminate(); gw_cc.terminate()
+        if gw_ws is not None:
+            gw_ws.terminate()
         for p in gw_cls.values(): p.terminate()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)

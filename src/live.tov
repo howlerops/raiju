@@ -4,8 +4,11 @@
 // virtual key that opened it. An attach (/v1/live/sessions/{id}/attach) and the recording
 // (/v1/live/sessions/{id}/content) are refused to any other virtual key, as not found.
 //
-// Not here: billing, transcripts and delegation (Bifrost's livesession.go), the WebRTC create
-// (POST /v1/live/sessions), forks, and the registry's sharing between worker processes.
+// Not here: billing, transcripts and delegation (Bifrost's livesession.go), forks, and the WebRTC media.
+// POST /v1/live/sessions (the WebRTC create) is refused by liveCreate, since the gateway runs no WebRTC
+// peer. The registry is shared by the workers of one node through a directory (share).
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { sha256, toHex, utf8 } from "./crypto"
 import { Engine, errorResponse, noHeaders } from "./gateway"
 import { parseModel, target } from "./router"
 import { Target } from "./providers/types"
@@ -17,16 +20,72 @@ import { SocketExt, upstreamFor, wsBase } from "./realtime"
 // How many sessions the registry holds. Past that a new session is refused, not left unrecorded.
 const MAX_RECORDS = 10000
 
+// The hash a session's owner is recorded by: the owner's virtual key is not kept on disk.
+function ownerHash(owner: string): string {
+  return toHex(sha256(utf8(owner)))
+}
+
 // The virtual key that opened each live session, by the provider's session id.
 export class LiveRegistry {
   owners: Map<string, string> = new Map()
+  // With several workers, a directory of the node's: each session is a folder named by its id's hash,
+  // holding its owner's hash. mkdir claims the folder atomically, so the first worker to open a
+  // session records it for all of them. The folders stay until the directory is removed.
+  shareDir = ""
 
-  // Records the owner of a session. False when the registry is full. A session opened with no
-  // virtual key is not recorded, and anyone may reach it.
+  share(dir: string): void {
+    try {
+      mkdirSync(dir, { recursive: true })
+      this.shareDir = dir
+    } catch (e) {
+      this.shareDir = ""
+    }
+  }
+
+  private folder(id: string): string {
+    return this.shareDir + "/" + toHex(sha256(utf8(id)))
+  }
+
+  // Whether the session's recorded owner is the one with this hash.
+  private sharedOwnerIs(id: string, hash: string): bool {
+    try {
+      return readFileSync(this.folder(id) + "/owner", "utf8") === hash
+    } catch (e) {
+      return false
+    }
+  }
+
+  // Records the owner of a session. False when the registry is full, or the session belongs to
+  // another owner. A session opened with no virtual key is not recorded, and anyone may reach it.
   bind(id: string, owner: string): bool {
     if (owner === "" || id === "") return true
     if (this.owners.has(id)) return this.owners.get(id) === owner
     if (this.owners.size >= MAX_RECORDS) return false
+    if (this.shareDir === "") {
+      this.owners.set(id, owner)
+      return true
+    }
+    const dir = this.folder(id)
+    const hash = ownerHash(owner)
+    try {
+      mkdirSync(dir)
+    } catch (e) {
+      // another worker claimed the session: its owner is the record
+      if (!this.sharedOwnerIs(id, hash)) return false
+      this.owners.set(id, owner)
+      return true
+    }
+    try {
+      writeFileSync(dir + "/owner", hash)
+    } catch (e) {
+      // a claim without its owner would be reachable by every key: it is not kept
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch (e2) {
+        // the folder stays unclaimed by any owner: attaches to it are refused below
+      }
+      return false
+    }
     this.owners.set(id, owner)
     return true
   }
@@ -35,8 +94,38 @@ export class LiveRegistry {
   allowed(id: string, caller: string): bool {
     if (caller === "") return true
     const o = this.owners.get(id)
-    return o === undefined || o === caller
+    if (o !== undefined) return o === caller
+    if (this.shareDir === "") return true
+    // a session no worker recorded is open, as one with no owner
+    if (!existsSync(this.folder(id))) return true
+    return this.sharedOwnerIs(id, ownerHash(caller))
   }
+}
+
+// POST /v1/live/sessions: Bifrost's WebRTC create. Its answer is an SDP answer from the gateway's own
+// WebRTC peer, which relays the session's media and events, and this gateway runs no such peer. So after
+// the checks Bifrost makes (the body, the transport, the model, the credential) it refuses the create,
+// before anything is opened at the provider. Sessions open over the WebSocket (session.start) instead.
+export async function liveCreate(engine: Engine, req: Request): Promise<Response> {
+  let webrtc = false
+  let model = ""
+  try {
+    const fs = fields(await req.text())
+    const tr = find(fs, "transport")
+    if (tr !== undefined) {
+      const tf = fields(tr)
+      webrtc = rawStr(tf, "type") === "webrtc" && (rawStr(tf, "sdp") ?? "").trim() !== ""
+    }
+    const sf = find(fs, "session")
+    if (sf !== undefined) model = rawStr(fields(sf), "model") ?? ""
+  } catch (e) {
+    return errorResponse(400, "the request body must be JSON with session and transport", "invalid_request_error", noHeaders())
+  }
+  if (!webrtc) return errorResponse(400, `transport must be {"type": "webrtc", "sdp": "<SDP offer>"}`, "invalid_request_error", noHeaders())
+  if (model.trim() === "") return errorResponse(400, "session.model is required", "invalid_request_error", noHeaders())
+  if (!credentialOk(engine, snapshot(req.headers))) return errorResponse(401, "authentication is required for live sessions", "authentication_error", noHeaders())
+  if (parseModel(engine.cfg, model).provider !== "openai") return errorResponse(400, "this provider has no live API this gateway can relay", "invalid_request_error", noHeaders())
+  return errorResponse(501, "WebRTC live sessions need a WebRTC peer, which this gateway does not run; open the session over WebSocket with session.start", "invalid_request_error", noHeaders())
 }
 
 // The virtual key of a request, "" when it has none.
