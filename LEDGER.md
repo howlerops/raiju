@@ -238,6 +238,8 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L97c | (a) | Management API: logs filters, by id, sessions, user/app/user-agent fields and histograms, delete and recalculate-cost; cache stats and clear; audit by id; session setup and ws-ticket; plugin listings | worker | assigned |
 | L97d | (a) | MCP auth: per_user_oauth and per_user_headers types and flows, MCP sessions, tool groups, OAuth config status, OpenAPI preview, oauth2 sessions and consent | worker | todo |
 | L97e | (a) | Media for the remaining providers (speech, transcription, image generation, edits, variations); GET /v1/models/{model} metadata | worker | assigned |
+| L97f | (b) | Headers: x-bf-dim-* on logs, parent and correlation ids, x-bf-lh-*, app from User-Agent, x-bf-maxim-*, x-bf-mcp-include-tools, x-bf-mcp-session-id, passthrough-extra-params gate, SDK-route async headers, forwarded-proto; response headers (request id echo, cache hit details, pricing request type, passthrough path, compat on streams, extra_fields placement) | worker | assigned |
+| L97g | (c) | Config keys: body limit on bun, drop_excess_requests, governance header, retention without logs_store, use_for_batch_api, vertex SA options, provider prompt_cache, VK mcp_configs, global tool sync interval, vector_store timeouts, audit retention and omit_ip, load balancer and pricing URLs, setup_token, access_profiles alias, large payloads, credential conflict, header filters, VK lifecycle, routing chain depth, network_config extras, ignore_provider_cost | worker | todo |
 
 ## UI track
 
