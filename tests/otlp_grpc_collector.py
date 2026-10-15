@@ -1,17 +1,20 @@
 """An OTLP gRPC collector for e2e, standard library only.
 
 Serves HTTP/2 over plaintext with prior knowledge (h2c), the way OTLP insecure
-on port 4317 does. It answers unary TraceService/Export and MetricsService/Export
-calls with grpc-status 0 and records each export as one JSON line:
-{rpc, path, content_type, timeout, service, spans, span_attrs, trace_id_lens, metrics}.
+on port 4317 does. With a certificate and key it serves TLS instead, and only to
+clients that pick h2 in ALPN (the way a TLS collector on 4317 does). It answers unary
+TraceService/Export and MetricsService/Export calls with grpc-status 0 and records each
+export as one JSON line:
+{rpc, path, content_type, timeout, service, spans, span_attrs, trace_id_lens, metrics,
+ and for TLS: tls, alpn}.
 
 It reads what raiju's gRPC client sends: literal header fields without Huffman
 coding. Indexed fields and Huffman strings are refused, so a change to the client
 that uses them fails loudly here.
 
-Usage: otlp_grpc_collector.py PORT OUT.jsonl
+Usage: otlp_grpc_collector.py PORT OUT.jsonl [CERT.pem KEY.pem]
 """
-import json, socket, socketserver, struct, sys, threading
+import json, socket, socketserver, ssl, struct, sys, threading
 
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 T_DATA, T_HEADERS, T_RST, T_SETTINGS, T_PING, T_GOAWAY, T_WINDOW, T_CONT = 0, 1, 3, 4, 6, 7, 8, 9
@@ -204,6 +207,8 @@ class Handler(socketserver.BaseRequestHandler):
         n = struct.unpack(">I", raw[1:5])[0]
         msg = raw[5:5 + n]
         entry = {"path": path, "content_type": headers.get("content-type"), "te": headers.get("te"), "timeout": headers.get("grpc-timeout")}
+        if self.server.ctx is not None:
+            entry.update(tls=True, alpn=self.request.selected_alpn_protocol())
         if path == TRACE_PATH:
             entry.update(rpc="trace", **summarize_trace(msg))
         elif path == METRICS_PATH:
@@ -216,6 +221,10 @@ class Handler(socketserver.BaseRequestHandler):
 
     def handle(self):
         try:
+            if self.server.ctx is not None:
+                self.request = self.server.ctx.wrap_socket(self.request, server_side=True)
+                if self.request.selected_alpn_protocol() != "h2":
+                    return
             if self.recv_exact(len(PREFACE)) != PREFACE:
                 return
             self.send(frame(T_SETTINGS, 0, 0))
@@ -278,13 +287,20 @@ class Handler(socketserver.BaseRequestHandler):
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    ctx = None  # an SSLContext that offers h2 in ALPN, for TLS
 
 
 def main():
     global OUT
     port, OUT = int(sys.argv[1]), sys.argv[2]
     open(OUT, "w").close()
+    ctx = None
+    if len(sys.argv) > 4:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(sys.argv[3], sys.argv[4])
+        ctx.set_alpn_protocols(["h2"])
     with Server(("127.0.0.1", port), Handler) as srv:
+        srv.ctx = ctx
         print("ready", flush=True)
         srv.serve_forever()
 

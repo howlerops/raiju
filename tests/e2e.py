@@ -3,7 +3,7 @@
 
 Usage: tests/e2e.py  (builds both binaries into ./build first)
 """
-import base64, json, os, struct, subprocess, sys, threading, time, urllib.request, urllib.error, urllib.parse, zlib
+import base64, json, os, socket, struct, subprocess, sys, threading, time, urllib.request, urllib.error, urllib.parse, zlib
 
 B64 = base64  # main() imports base64 locally, which would shadow this module
 
@@ -17,6 +17,10 @@ GW_G = "http://127.0.0.1:18116"  # exports OTLP over gRPC to tests/otlp_grpc_col
 GW_C = "http://127.0.0.1:18118"  # compat: x-bf-compat only (no client.compat)
 GW_CC = "http://127.0.0.1:18119"  # compat: client.compat set
 GRPC_COLLECTOR_PORT = 18317
+GW_GT = "http://127.0.0.1:18117"  # exports OTLP over TLS gRPC (ALPN h2) to the TLS collector
+GRPC_TLS_COLLECTOR_PORT = 18318
+UDP_BEACON_PORT = 18193  # the udp discovery gateway's broadcast port
+MDNS_SERVICE = "_bifrost-e2e._tcp"
 
 def build():
     os.makedirs(BUILD, exist_ok=True)
@@ -417,8 +421,37 @@ def jwt_rs256(key, kid, claims):
     sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key, "-binary"], input=head.encode(), check=True, capture_output=True).stdout
     return head + "." + b64u(sig)
 
+def dns_name(name):
+    return b"".join(bytes([len(p)]) + p.encode() for p in name.split(".") if p) + b"\x00"
+
+def mdns_announce(label, addr, port):
+    """An mDNS response for a peer: PTR under the service type, SRV for its port, A for its address (RFC 6762)."""
+    svc = MDNS_SERVICE + ".local"
+    inst, host = f"{label}.{svc}", f"{label}.local"
+    def rr(name, typ, cls, rdata):
+        return dns_name(name) + struct.pack(">HHIH", typ, cls, 120, len(rdata)) + rdata
+    recs = [rr(svc, 12, 1, dns_name(inst)),
+            rr(inst, 33, 0x8001, struct.pack(">HHH", 0, 0, port) + dns_name(host)),
+            rr(host, 1, 0x8001, socket.inet_aton(addr))]
+    return struct.pack(">HHHHHH", 0, 0x8400, 0, len(recs), 0, 0) + b"".join(recs)
+
+def fake_peers(stop):
+    """Sends a beacon (udp) and an announcement (mdns) for a peer on 127.0.0.1:18084, the mock peer, until stop is set.
+    The beacon comes from 127.0.0.1 so the gateway syncs with the mock; the announcement goes to the mDNS group."""
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(("127.0.0.1", 0))
+    beacon = f"raiju-discovery beacon bifrost-udp udp-peer 18084".encode()
+    mc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    announce = mdns_announce("mdns-peer", "127.0.0.1", 18084)
+    while not stop.is_set():
+        udp.sendto(beacon, ("127.0.0.1", UDP_BEACON_PORT))
+        mc.sendto(announce, ("224.0.0.251", 5353))
+        stop.wait(0.2)
+    udp.close()
+    mc.close()
+
 def discovery_and_proxy():
-    """Cluster discovery (Consul, DNS, Kubernetes, etcd) against mock backends, and the identity-aware
+    """Cluster discovery (Consul, DNS, Kubernetes, etcd, UDP, mDNS) against mock backends, and the identity-aware
     proxies (AWS ALB with ES256, Cloudflare Access with RS256 in full mode) with throwaway keys."""
     d = os.path.join(BUILD, "e2e-disc")
     os.makedirs(d, exist_ok=True)
@@ -494,6 +527,8 @@ def discovery_and_proxy():
         "dns": (18080, cluster("dns-a", {"enabled": True, "type": "dns", "dns_names": ["localhost"], "bind_port": 18084}, 18080)),
         "k8s": (18082, cluster("k8s-a", {"enabled": True, "type": "kubernetes", "k8s_label_selector": "app=bifrost", "bind_port": 18084, "api_url": "http://127.0.0.1:18086", "token_file": token_file}, 18082)),
         "etcd": (18090, cluster("etcd-a", {"enabled": True, "type": "etcd", "service_name": "bifrost", "etcd_endpoints": ["http://127.0.0.1:18088"], "bind_port": 18090, "advertise_address": "127.0.0.1"}, 18090)),
+        "udp": (18103, cluster("udp-a", {"enabled": True, "type": "udp", "service_name": "bifrost-udp", "udp_broadcast_port": UDP_BEACON_PORT, "allowed_address_space": ["127.0.0.0/8"], "bind_port": 18103}, 18103)),
+        "mdns": (18104, cluster("mdns-a", {"enabled": True, "type": "mdns", "mdns_service": MDNS_SERVICE, "bind_port": 18104, "advertise_address": "127.0.0.1"}, 18104)),
         "alb": (18091, {"client": {"enable_logging": False}, "governance": {"users": [{"name": "alice@example.com", "role": "editor"}]},
                         "auth_proxy": {"enabled": True, "provider": "aws-alb", "mode": "login_only", "expected_signer": ALB_ARN, "region": "us-east-1", "public_key_base_url": KEYS, "ca_cert_pem": ca_pem}}),
         "cf": (18078, {"client": {"enable_logging": False}, "governance": {"users": [{"name": "ops@example.com", "role": "viewer"}]},
@@ -502,6 +537,8 @@ def discovery_and_proxy():
     }
     procs = []
     gws = {}
+    stop_fake = threading.Event()
+    threading.Thread(target=fake_peers, args=(stop_fake,), daemon=True).start()
     try:
         for name, (port, cfg) in cfgs.items():
             path = os.path.join(d, name + ".json")
@@ -525,6 +562,13 @@ def discovery_and_proxy():
         check("consul: the node registers itself with a TCP check on its port", len(reg) > 0 and reg[0].get("Check", {}).get("TCP") == "127.0.0.1:18081" and reg[0].get("Port") == 18081, consul_regs[:1])
         check("kubernetes: lists pods by label with the service account token", any(x["path"] == "/api/v1/namespaces/default/pods?labelSelector=app%3Dbifrost" and x["auth"] == "Bearer e2e-sa-token" for x in k8s_seen), k8s_seen[:2])
         check("etcd: registers the node under a lease", base64.b64encode(b"/raiju/bifrost/etcd-a").decode() in kv and "/raiju/bifrost/etcd-a" in puts, puts[:3])
+        # UDP broadcast and mDNS run on their own sockets and list peers at the next round (10 s), so they wait longer
+        for _ in range(300):
+            if {"udp-a", "mdns-a"}.issubset(set(peer_nodes)):
+                break
+            time.sleep(0.1)
+        check("udp discovery hears the peer's beacon and syncs with it", "udp-a" in peer_nodes, sorted(set(peer_nodes)))
+        check("mdns discovery hears the peer's announcement and syncs with it", "mdns-a" in peer_nodes, sorted(set(peer_nodes)))
 
         # ALB: an ES256 token from the regional key endpoint (fetched on first use, so the first try can wait)
         alb = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "signer": ALB_ARN, "iss": "https://oidc.example", "email": "alice@example.com", "sub": "a1"})
@@ -567,6 +611,7 @@ def discovery_and_proxy():
         s = call("GET", "/api/config", headers={"Cf-Access-Jwt-Assertion": wrong_aud}, base=gws["cf"], auth=False)[0]
         check("cloudflare: a token for another audience is refused", s == 401, s)
     finally:
+        stop_fake.set()
         for p in procs:
             p.terminate()
         for srv in servers:
@@ -725,6 +770,15 @@ def main():
                     "batch_size": 1, "flush_ms": 100, "metrics_enabled": True, "metrics_endpoint": f"127.0.0.1:{GRPC_COLLECTOR_PORT}", "metrics_push_interval": 1}
     json.dump(gcfg, open(os.path.join(BUILD, "e2e.grpc.json"), "w"))
     gw_g = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18116", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.grpc.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.grpc.log"), "w"))
+    # OTLP over TLS gRPC: the same gateway shape, to a TLS collector (srv.pem, which the e2e CA signed)
+    grpc_tls_out = os.path.join(BUILD, "e2e-grpc-tls-exports.jsonl")
+    tls_dir = os.path.join(BUILD, "e2e-tls")
+    grpc_tls_coll = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/otlp_grpc_collector.py"), str(GRPC_TLS_COLLECTOR_PORT), grpc_tls_out, os.path.join(tls_dir, "srv.pem"), os.path.join(tls_dir, "srv.key")], stdout=subprocess.DEVNULL)
+    tcfg = dict(gcfg)
+    tcfg["otel"] = {"endpoint": f"127.0.0.1:{GRPC_TLS_COLLECTOR_PORT}", "protocol": "grpc", "tls_ca_cert": os.path.join(tls_dir, "ca.pem"), "service_name": "raiju-grpc-tls",
+                    "batch_size": 1, "flush_ms": 100}
+    json.dump(tcfg, open(os.path.join(BUILD, "e2e.grpc-tls.json"), "w"))
+    gw_gt = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18117", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.grpc-tls.json")], env=env, stderr=open(os.path.join(BUILD, "e2e.grpc-tls.log"), "w"))
     # encryption at rest: its own file, which the store seals on the first save
     enc_cfg = os.path.join(BUILD, "e2e.encrypt.json")
     json.dump({"encryption_key": "e2e-passphrase-0123456789", "client": {"enable_logging": False, "enforce_auth_on_inference": False},
@@ -1159,6 +1213,20 @@ def main():
         check("gRPC spans carry the service name and 16-byte trace ids", any(e["service"] == "raiju-grpc" and e["trace_id_lens"] and all(n == 16 for n in e["trace_id_lens"]) for e in tr_ex), tr_ex[:1])
         check("metrics arrive over gRPC", any("bifrost_upstream_requests_total" in e["metrics"] and e["service"] == "raiju-grpc" for e in mx_ex), mx_ex[:1])
         check("gRPC calls are unary gRPC over HTTP/2 with te: trailers", len(ex) > 0 and all(e["content_type"] == "application/grpc" and e["te"] == "trailers" and e["path"].endswith("/Export") for e in ex), ex[:1])
+
+        # OTLP over TLS gRPC: spans reach the TLS collector, which only serves clients that pick h2
+        wait(GW_GT + "/health")
+        call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}], "seed": 411}, base=GW_GT)
+        def grpc_tls_exports():
+            if not os.path.exists(grpc_tls_out):
+                return []
+            return [json.loads(x) for x in open(grpc_tls_out) if x.strip()]
+        for _ in range(60):
+            if any(e["rpc"] == "trace" and "gen_ai.request.model" in e["span_attrs"] for e in grpc_tls_exports()):
+                break
+            time.sleep(0.1)
+        ex_tls = grpc_tls_exports()
+        check("spans arrive over TLS gRPC with ALPN h2 and the service name", any(e["rpc"] == "trace" and e.get("tls") and e.get("alpn") == "h2" and e["service"] == "raiju-grpc-tls" and "gen_ai.request.model" in e["span_attrs"] for e in ex_tls), ex_tls[:2])
 
         # MCP: tools from connected servers are injected into chat requests and can be executed
         s, _, b = call("GET", "/api/mcp")
@@ -2330,7 +2398,7 @@ def main():
         # the log sinks: their own gateway, Kafka stub and Parquet bucket, run last so their traffic stays off the other checks
         sinks_e2e(env, json.load(open(config))["providers"]["vertex"]["keys"][0]["vertex_key_config"]["auth_credentials"])
     finally:
-        gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
+        gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
         gw_l.terminate(); gw_enc.terminate(); gw_guard.terminate(); gw_rules.terminate()
         gw_c.terminate(); gw_cc.terminate()

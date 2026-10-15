@@ -1,0 +1,1157 @@
+From 59f12e1dabe0eae5afc525c1826cd110ea183ba8 Mon Sep 17 00:00:00 2001
+From: Raiju contributors <raiju@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:29:28 +0000
+Subject: [PATCH] feat: Bun.udpSocket for datagrams, and node:dgram over the
+ same sockets
+
+Tov had no datagram sockets, so node:dgram was a stub. Bun.udpSocket opens a UDP socket
+bound to hostname and port: its socket.data gets each datagram whole, with the sender's
+port and address, and send(text | bytes, port, address) returns whether the datagram went.
+Options (broadcast, reusePort, TTL, multicast loopback and interface) and multicast
+membership are as in Bun.
+
+A socket is an entry in the socket table of runtime/net.c, watched by the same loop as
+TCP and Unix sockets. It keeps the program running while it reads, unless it is unref'd.
+node:dgram's udp_wrap binding is implemented over the same natives (bind, send, connect,
+membership, options, names, recv start and stop, close).
+
+Tests: tests/run/native_udp.tov checks a datagram and its reply with the sender's port
+and address, the options, a multicast group joined and left, and that a closed socket
+sends nothing.
+---
+ crates/tov/src/check/builtins.rs           |  19 ++
+ crates/tov/src/driver.rs                   |   2 +-
+ crates/tov/src/std/http.tov                | 145 +++++++++
+ docs/spec.md                               |   2 +
+ runtime/net.c                              | 342 +++++++++++++++++++++
+ runtime/node.c                             | 139 +++++++++
+ runtime/node/internal/bindings/udp_wrap.js | 247 ++++++++++++++-
+ runtime/tov.h                              |  18 ++
+ tests/run/native_udp.stdout                |   8 +
+ tests/run/native_udp.tov                   |  89 ++++++
+ 10 files changed, 999 insertions(+), 12 deletions(-)
+ create mode 100644 tests/run/native_udp.stdout
+ create mode 100644 tests/run/native_udp.tov
+
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index 7089c48..be61dbd 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -98,6 +98,25 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "netAddress" => (vec![INT, INT], STR),
+         "netBuffered" | "netListenPort" => (vec![INT], INT),
+         "netAlpn" => (vec![INT], STR),
++        // UDP (runtime/net.c)
++        "udpOpen" => (vec![INT], INT),
++        "udpBind" => (vec![INT, STR, INT, BOOL], INT),
++        "udpEvents" => {
++            let p = |ty| FnParam { ty, inout: false, optional: false };
++            let bytes = types.array(U8);
++            let events = types.func(vec![p(INT), p(bytes), p(STR), p(INT)], VOID);
++            (vec![INT, events], VOID)
++        }
++        "udpRecv" | "udpRef" => (vec![INT, BOOL], VOID),
++        "udpSend" => {
++            let bytes = types.array(U8);
++            (vec![INT, bytes, STR, INT], INT)
++        }
++        "udpOption" => (vec![INT, STR, INT], INT),
++        "udpMembership" => (vec![INT, STR, STR, BOOL], INT),
++        "udpMulticastIf" => (vec![INT, STR], INT),
++        "udpAddress" => (vec![INT, INT], STR),
++        "udpClose" => (vec![INT], VOID),
+         "netError" => (vec![], STR),
+         "wsUpgrade" => (vec![STR, STR, INT], INT),
+         "wsConnect" => (vec![STR, INT, STR, BOOL, BOOL, STR, STR, STR, INT], INT),
+diff --git a/crates/tov/src/driver.rs b/crates/tov/src/driver.rs
+index d0f0fcd..af9bf8f 100644
+--- a/crates/tov/src/driver.rs
++++ b/crates/tov/src/driver.rs
+@@ -20,7 +20,7 @@ const STD_MODULES: &[(&str, &str, bool)] =
+ 
+ /// Globals that come from std/http, as in Bun.
+ pub(crate) const WEB_GLOBALS: &[&str] =
+-    &["Bun", "Request", "Response", "Headers", "URL", "URLSearchParams", "fetch", "AbortController", "AbortSignal", "DOMException", "FetchError", "ReadableStream", "TextEncoder", "TextDecoder", "Blob", "File", "FormData", "Socket", "SocketError", "TCPSocketListener", "WebSocket", "ServerWebSocket", "WebSocketEvent", "MessageEvent", "CloseEvent"];
++    &["Bun", "Request", "Response", "Headers", "URL", "URLSearchParams", "fetch", "AbortController", "AbortSignal", "DOMException", "FetchError", "ReadableStream", "TextEncoder", "TextDecoder", "Blob", "File", "FormData", "Socket", "SocketError", "TCPSocketListener", "UDPSocket", "WebSocket", "ServerWebSocket", "WebSocketEvent", "MessageEvent", "CloseEvent"];
+ 
+ /// The standard module an import names (`"node:fs"`, `"fs"`, `"std/http"`), if any.
+ fn std_module(spec: &str) -> Option<&'static (&'static str, &'static str, bool)> {
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index 7a97c56..7e60f2e 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -2065,6 +2065,147 @@ function connectSocket<T>(options: ConnectOptions<T>): Promise<Socket<T>, Error>
+   return p
+ }
+ 
++// Bun.udpSocket (Tov): a UDP socket. `data` gets each datagram, with the sender's port and address.
++export type UDPSocketHandler<T> = {
++  data?: (socket: UDPSocket<T>, data: u8[], port: int, address: string) => void throws Error
++  error?: (socket: UDPSocket<T>, error: Error) => void
++}
++
++export type UDPSocketOptions<T> = {
++  hostname?: string
++  port?: number
++  broadcast?: bool
++  reusePort?: bool
++  data?: T
++  socket: UDPSocketHandler<T>
++}
++
++export class UDPSocket<T = undefined> {
++  data: T | undefined
++  private id: int
++  private handlers: UDPSocketHandler<T>
++  private done: bool
++
++  constructor(id: int, handlers: UDPSocketHandler<T>, data: T | undefined) {
++    this.id = id
++    this.handlers = handlers
++    this.data = data
++    this.done = false
++  }
++
++  // Internal: a datagram arrived (the native's message event).
++  event(bytes: u8[], address: string, port: int): void {
++    try {
++      this.handle(bytes, address, port)
++    } catch (e) {
++      const f = this.handlers.error
++      if (f !== undefined) {
++        f(this, e)
++      } else {
++        console.error(`error: ${e.message}`)
++      }
++    }
++  }
++
++  private handle(bytes: u8[], address: string, port: int): void throws Error {
++    const f = this.handlers.data
++    if (f !== undefined) {
++      try f(this, bytes, port, address)
++    }
++  }
++
++  // Sends text (as UTF-8) or bytes to address:port. False if it didn't go (the socket is closed,
++  // or the kernel's send buffer is full: a datagram is not retried).
++  send(data: string | u8[], port: number, address: string): bool {
++    if (this.done) {
++      return false
++    }
++    const bytes = typeof data === "string" ? __native.stringToBytes(data) : data
++    return __native.udpSend(this.id, bytes, address, Math.trunc(port)) >= 0
++  }
++
++  // Closes now; datagrams not yet delivered are dropped.
++  close(): void {
++    this.done = true
++    __native.udpClose(this.id)
++  }
++
++  // The program can exit while the socket is open.
++  unref(): void {
++    __native.udpRef(this.id, false)
++  }
++
++  ref(): void {
++    __native.udpRef(this.id, true)
++  }
++
++  get closed(): bool {
++    return this.done
++  }
++
++  setBroadcast(on: bool): bool {
++    return __native.udpOption(this.id, "broadcast", on ? 1 : 0) === 0
++  }
++
++  setTTL(ttl: int): bool {
++    return __native.udpOption(this.id, "ttl", ttl) === 0
++  }
++
++  setMulticastTTL(ttl: int): bool {
++    return __native.udpOption(this.id, "multicastTTL", ttl) === 0
++  }
++
++  setMulticastLoopback(on: bool): bool {
++    return __native.udpOption(this.id, "multicastLoopback", on ? 1 : 0) === 0
++  }
++
++  // The interface (an address of this host) multicast packets are sent from.
++  setMulticastInterface(address: string): bool {
++    return __native.udpMulticastIf(this.id, address) === 0
++  }
++
++  // Joins or leaves a multicast group, on the interface at `iface` (default: the system's choice).
++  addMembership(group: string, iface?: string): bool {
++    return __native.udpMembership(this.id, group, iface ?? "", true) === 0
++  }
++
++  dropMembership(group: string, iface?: string): bool {
++    return __native.udpMembership(this.id, group, iface ?? "", false) === 0
++  }
++
++  get hostname(): string {
++    return __native.udpAddress(this.id, 2)
++  }
++
++  get port(): int {
++    return parseInt(__native.udpAddress(this.id, 3)) ?? 0
++  }
++}
++
++// Opens a UDP socket bound to hostname:port (IPv6 if the name has a colon). Resolves with the socket;
++// rejects with a SocketError when it can't be bound.
++function udpSocket<T>(options: UDPSocketOptions<T>): Promise<UDPSocket<T>, Error> {
++  const host = options.hostname ?? "0.0.0.0"
++  const port = Math.trunc(options.port ?? 0)
++  const family = host.includes(":") ? 6 : 4
++  const id = __native.udpOpen(family)
++  if (id < 0) {
++    return Promise.reject(new SocketError(`udp socket failed (errno ${-id})`, "ERR_SOCKET"))
++  }
++  const bound = __native.udpBind(id, host, port, options.reusePort ?? false)
++  if (bound < 0) {
++    __native.udpClose(id)
++    return Promise.reject(new SocketError(`bind ${host}:${port} failed (errno ${-bound})`, "ERR_SOCKET_BIND"))
++  }
++  if (options.broadcast ?? false) {
++    __native.udpOption(id, "broadcast", 1)
++  }
++  const s = new UDPSocket<T>(id, options.socket, options.data)
++  __native.udpEvents(id, (kind: int, bytes: u8[], text: string, code: int): void => s.event(bytes, text, code))
++  __native.udpRecv(id, true)
++  return Promise.resolve(s)
++}
++
+ export class TCPSocketListener<T = undefined> {
+   readonly hostname: string
+   data: T | undefined
+@@ -2564,4 +2705,8 @@ export class Bun {
+   static listen<T = undefined>(options: ListenOptions<T>): TCPSocketListener<T> {
+     return listenSockets(options)
+   }
++
++  static udpSocket<T = undefined>(options: UDPSocketOptions<T>): Promise<UDPSocket<T>, Error> {
++    return udpSocket(options)
++  }
+ }
+diff --git a/docs/spec.md b/docs/spec.md
+index 567fb81..3504c17 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -244,6 +244,8 @@ client.write("hello")
+ - `Socket`: `write(text | bytes)`, `end(data?)`, `flush()`, `terminate()`, `shutdown()`, `setNoDelay(on?)`, `ref()`, `unref()`, `data`, `remoteAddress`, `remotePort`, `localAddress`, `localPort`, `bufferedAmount`, `alpnProtocol` (Tov: the protocol the server picked for a TLS socket that offered `alpn`, or `""`). Unlike Bun's, `write` takes everything: what the kernel can't take yet is buffered (Bun returns a short count and drops the rest), and `drain` follows once it's out. Writes made in a handler go out together when it returns: one system call for many small writes.
+ - `end()` closes the socket once its data is out (`close` runs); with `allowHalfOpen` it shuts only the sending side, and the peer can keep sending. A handler that throws hands the error to `error`, else it's logged and the socket closes. A connect's `socket.data` is `T | undefined` (`T` from `data`, or the type argument: `Bun.listen<Session>(...)`).
+ 
++- `Bun.udpSocket(options)` (Tov) opens a UDP socket bound to `hostname` and `port` (`broadcast`, `reusePort` as options). Its `socket.data(socket, bytes, port, address)` gets each datagram (a `u8[]`) with the sender's port and address. It resolves with a `UDPSocket`: `send(text | bytes, port, address)` returns whether the datagram went; `addMembership(group, iface?)` and `dropMembership(group, iface?)` join and leave a multicast group; `setBroadcast`, `setTTL`, `setMulticastTTL`, `setMulticastLoopback`, `setMulticastInterface`; `hostname`, `port`, `ref()`, `unref()` and `close()`. A socket that reads keeps the program running unless it is unref'd. `node:dgram` runs on the same natives.
++
+ ## 8. Tests **[M0]**
+ ```ts
+ test("adds", () => {
+diff --git a/runtime/net.c b/runtime/net.c
+index 7968b23..19bfb3d 100644
+--- a/runtime/net.c
++++ b/runtime/net.c
+@@ -857,6 +857,348 @@ void tv_native_netListenRef(tv_int id, bool ref) {
+     tv_io_refs += ref ? 1 : -1;
+ }
+ 
++/* ---- UDP: datagram sockets on the loop (node:dgram's udp_wrap, Bun.udpSocket). A socket is a table
++ * entry named by id. Each datagram that arrives while it reads is one message event: kind 1, the
++ * bytes, the sender's address (text) and port. Events go to the Tov closure given to udpEvents, or
++ * to a C sink a host sets with tv_udp_set_sink (node.c's JS callbacks). A closed socket is freed
++ * once no event of its is being delivered, as the TCP sockets are. */
++
++enum { TV_UDP_MESSAGE = 1 };
++
++typedef struct tv_udp {
++    tv_io io;
++    int fd;
++    tv_int id;
++    int family;              /* 4 or 6 */
++    bool reading, registered, watch_read, refd, counted, closed, has_cb;
++    int busy;                /* events being delivered: free afterwards, not now */
++    tv_fn cb;                /* the Tov closure: (kind, bytes, address, port) */
++    tv_udp_sink sink;        /* or a host's sink, which takes precedence */
++    void *udata;
++} tv_udp;
++
++static tv_udp **tv_udp_tab;
++static tv_int tv_udp_cap, tv_udp_next = 1;
++static uint8_t tv_udp_buf[65536];
++
++static tv_udp *tv_udp_get(tv_int id) {
++    tv_udp *u = id > 0 && id < tv_udp_cap ? tv_udp_tab[id] : NULL;
++    return u && !u->closed ? u : NULL;
++}
++
++/* Watches the fd for reads while the socket reads, and keeps the program running (tv_io_refs)
++ * while it does and isn't unref'd. */
++static void tv_udp_update(tv_udp *u) {
++    if (u->closed || u->fd < 0) return;
++    if (!u->registered) {
++        u->registered = true;
++        u->watch_read = u->reading;
++        tv_io_add(u->fd, &u->io, u->reading, false);
++    } else if (u->watch_read != u->reading) {
++        u->watch_read = u->reading;
++        tv_io_set(u->fd, &u->io, u->reading, false);
++    }
++    bool active = u->refd && u->reading;
++    if (active != u->counted) {
++        tv_io_refs += active ? 1 : -1;
++        u->counted = active;
++    }
++}
++
++static void tv_udp_settle(tv_udp *u) {
++    if (!u->closed || u->busy) return;
++    tv_udp_tab[u->id] = NULL;
++    if (u->has_cb) tv_env_release(u->cb.env);
++    free(u);
++}
++
++static void tv_udp_emit(tv_udp *u, const uint8_t *data, size_t n, const char *addr, int port) {
++    if (u->sink) {
++        u->sink(u->udata, data, n, addr, port);
++        return;
++    }
++    if (!u->has_cb) return;
++    tv_arr bytes = TV_EMPTY_ARR;
++    if (n) {
++        bytes = tv_arr_with_capacity(&tv_type_u8, (tv_int)n);
++        memcpy(tv_arr_data(bytes), data, n);
++        bytes.len = (tv_int)n;
++    }
++    tv_str t = tv_str_from(addr, strlen(addr));
++    u->busy++;
++    ((void (*)(void *, tv_int, tv_arr, tv_str, tv_int))u->cb.fn)(u->cb.env, TV_UDP_MESSAGE, bytes, t, port);
++    u->busy--;
++    tv_arr_release(bytes, &tv_type_u8);
++    tv_str_release(t);
++}
++
++static void tv_udp_ready(tv_io *h, bool readable, bool writable, bool broken) {
++    (void)writable;
++    tv_udp *u = (tv_udp *)h;
++    if (u->closed || !u->reading || !(readable || broken)) return;
++    u->busy++;
++    for (int i = 0; i < 64 && u->reading && !u->closed; i++) {
++        struct sockaddr_storage ss;
++        socklen_t sl = sizeof ss;
++        ssize_t r = recvfrom(u->fd, tv_udp_buf, sizeof tv_udp_buf, 0, (struct sockaddr *)&ss, &sl);
++        if (r < 0) {
++            if (errno == EINTR) continue;
++            break;           /* drained (EAGAIN); an error that isn't a datagram isn't reported */
++        }
++        char addr[INET6_ADDRSTRLEN + 1] = "";
++        int port = 0;
++        if (ss.ss_family == AF_INET) {
++            struct sockaddr_in *v4 = (struct sockaddr_in *)&ss;
++            inet_ntop(AF_INET, &v4->sin_addr, addr, sizeof addr);
++            port = ntohs(v4->sin_port);
++        } else if (ss.ss_family == AF_INET6) {
++            struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&ss;
++            inet_ntop(AF_INET6, &v6->sin6_addr, addr, sizeof addr);
++            port = ntohs(v6->sin6_port);
++        }
++        tv_udp_emit(u, tv_udp_buf, (size_t)r, addr, port);
++    }
++    u->busy--;
++    tv_udp_settle(u);
++}
++
++/* The socket address of host (numeric, or a name looked up now; "" is the wildcard) and port, for
++ * a socket of family 4 or 6. 0, or -errno. */
++static int tv_udp_addr(const char *host, int port, int family, struct sockaddr_storage *ss, socklen_t *len) {
++    memset(ss, 0, sizeof *ss);
++    if (!*host) {
++        if (family == 6) {
++            struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)ss;
++            v6->sin6_family = AF_INET6;
++            v6->sin6_addr = in6addr_any;
++            v6->sin6_port = htons((uint16_t)port);
++            *len = sizeof *v6;
++        } else {
++            struct sockaddr_in *v4 = (struct sockaddr_in *)ss;
++            v4->sin_family = AF_INET;
++            v4->sin_addr.s_addr = htonl(INADDR_ANY);
++            v4->sin_port = htons((uint16_t)port);
++            *len = sizeof *v4;
++        }
++        return 0;
++    }
++    struct addrinfo hints, *res = NULL;
++    memset(&hints, 0, sizeof hints);
++    hints.ai_family = family == 6 ? AF_INET6 : AF_INET;
++    hints.ai_socktype = SOCK_DGRAM;
++    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -EADDRNOTAVAIL;
++    memcpy(ss, res->ai_addr, res->ai_addrlen);
++    *len = res->ai_addrlen;
++    freeaddrinfo(res);
++    if (ss->ss_family == AF_INET) ((struct sockaddr_in *)ss)->sin_port = htons((uint16_t)port);
++    else ((struct sockaddr_in6 *)ss)->sin6_port = htons((uint16_t)port);
++    return 0;
++}
++
++/* udpOpen(family) -> socket id (family 4 or 6), or -errno. */
++tv_int tv_native_udpOpen(tv_int family) {
++    int f = family == 6 ? AF_INET6 : AF_INET;
++    int fd = socket(f, SOCK_DGRAM, 0);
++    if (fd < 0) return -errno;
++    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
++    fcntl(fd, F_SETFD, FD_CLOEXEC);
++#ifdef SO_NOSIGPIPE
++    int one = 1;
++    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
++#endif
++    tv_udp *u = tv_alloc(sizeof *u);
++    memset(u, 0, sizeof *u);
++    u->io.ready = tv_udp_ready;
++    u->fd = fd;
++    u->family = family == 6 ? 6 : 4;
++    u->refd = true;
++    if (tv_udp_next >= tv_udp_cap) {
++        tv_int cap = tv_udp_cap ? tv_udp_cap * 2 : 16;
++        tv_udp_tab = tv_realloc(tv_udp_tab, (size_t)cap * sizeof *tv_udp_tab);
++        memset(tv_udp_tab + tv_udp_cap, 0, (size_t)(cap - tv_udp_cap) * sizeof *tv_udp_tab);
++        tv_udp_cap = cap;
++    }
++    u->id = tv_udp_next++;
++    tv_udp_tab[u->id] = u;
++    return u->id;
++}
++
++/* udpBind(id, host, port, reuse) -> 0, or -errno. reuse: SO_REUSEADDR and SO_REUSEPORT (several
++ * sockets may share the port, as multicast listeners do). */
++tv_int tv_native_udpBind(tv_int id, tv_str host, tv_int port, bool reuse) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return -EBADF;
++    struct sockaddr_storage ss;
++    socklen_t len;
++    int r = tv_udp_addr(host.p->data, (int)port, u->family, &ss, &len);
++    if (r) return r;
++    int one = 1;
++    if (reuse) {
++        setsockopt(u->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
++#ifdef SO_REUSEPORT
++        setsockopt(u->fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
++#endif
++    }
++    if (bind(u->fd, (struct sockaddr *)&ss, len) != 0) return -errno;
++    return 0;
++}
++
++/* udpEvents(id, events): the Tov closure for the socket's messages, events(kind, bytes, address,
++ * port). */
++void tv_native_udpEvents(tv_int id, tv_fn events) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return;
++    if (u->has_cb) tv_env_release(u->cb.env);
++    tv_env_retain(events.env);
++    u->cb = events;
++    u->has_cb = true;
++}
++
++/* udpRecv(id, on): starts or stops reading messages. */
++void tv_native_udpRecv(tv_int id, bool on) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return;
++    u->reading = on;
++    tv_udp_update(u);
++}
++
++/* For a host (node.c): messages go to sink(udata, bytes, n, address, port) instead of the closure. */
++void tv_udp_set_sink(tv_int id, tv_udp_sink sink, void *udata) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return;
++    u->sink = sink;
++    u->udata = udata;
++}
++
++/* udpSend(id, bytes, host, port) -> the bytes sent, or -errno (no waiting: a datagram the kernel
++ * can't take now fails with EAGAIN). */
++tv_int tv_udp_send_bytes(tv_int id, const uint8_t *data, size_t n, tv_str host, tv_int port) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return -EBADF;
++    struct sockaddr_storage ss;
++    socklen_t len;
++    int r = tv_udp_addr(host.p->data, (int)port, u->family, &ss, &len);
++    if (r) return r;
++    int flags = 0;
++#ifdef MSG_NOSIGNAL
++    flags = MSG_NOSIGNAL;
++#endif
++    ssize_t w;
++    do w = sendto(u->fd, data, n, flags, (struct sockaddr *)&ss, len); while (w < 0 && errno == EINTR);
++    return w < 0 ? -errno : (tv_int)w;
++}
++
++tv_int tv_native_udpSend(tv_int id, tv_arr bytes, tv_str host, tv_int port) {
++    return tv_udp_send_bytes(id, tv_arr_data(bytes), (size_t)bytes.len, host, port);
++}
++
++/* udpOption(id, name, value): broadcast (0/1), ttl, multicastTTL, multicastLoopback (0/1),
++ * recvBuffer and sendBuffer (a size; 0 reads it). Returns 0, the buffer size, or -errno. */
++tv_int tv_native_udpOption(tv_int id, tv_str name, tv_int value) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return -EBADF;
++    const char *k = name.p->data;
++    int fd = u->fd, v = (int)value, v6 = u->family == 6;
++    int lvl = v6 ? IPPROTO_IPV6 : IPPROTO_IP;
++    if (strcmp(k, "broadcast") == 0)
++        return setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &v, sizeof v) == 0 ? 0 : -errno;
++    if (strcmp(k, "ttl") == 0)
++        return setsockopt(fd, lvl, v6 ? IPV6_UNICAST_HOPS : IP_TTL, &v, sizeof v) == 0 ? 0 : -errno;
++    if (strcmp(k, "multicastTTL") == 0)
++        return setsockopt(fd, lvl, v6 ? IPV6_MULTICAST_HOPS : IP_MULTICAST_TTL, &v, sizeof v) == 0 ? 0 : -errno;
++    if (strcmp(k, "multicastLoopback") == 0)
++        return setsockopt(fd, lvl, v6 ? IPV6_MULTICAST_LOOP : IP_MULTICAST_LOOP, &v, sizeof v) == 0 ? 0 : -errno;
++    if (strcmp(k, "recvBuffer") == 0 || strcmp(k, "sendBuffer") == 0) {
++        int opt = k[0] == 'r' ? SO_RCVBUF : SO_SNDBUF;
++        if (v > 0 && setsockopt(fd, SOL_SOCKET, opt, &v, sizeof v) != 0) return -errno;
++        socklen_t sl = sizeof v;
++        if (getsockopt(fd, SOL_SOCKET, opt, &v, &sl) != 0) return -errno;
++        return v;
++    }
++    return -EINVAL;
++}
++
++/* udpMembership(id, group, iface, join): joins (or leaves) a multicast group on the interface at
++ * address iface ("" for the default). 0, or -errno. */
++tv_int tv_native_udpMembership(tv_int id, tv_str group, tv_str iface, bool join) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return -EBADF;
++    if (u->family == 6) {
++        struct ipv6_mreq m;
++        memset(&m, 0, sizeof m);
++        if (inet_pton(AF_INET6, group.p->data, &m.ipv6mr_multiaddr) != 1) return -EINVAL;
++        return setsockopt(u->fd, IPPROTO_IPV6, join ? IPV6_JOIN_GROUP : IPV6_LEAVE_GROUP, &m, sizeof m) == 0 ? 0 : -errno;
++    }
++    struct ip_mreq m;
++    memset(&m, 0, sizeof m);
++    if (inet_pton(AF_INET, group.p->data, &m.imr_multiaddr) != 1) return -EINVAL;
++    m.imr_interface.s_addr = htonl(INADDR_ANY);
++    if (iface.p->len && inet_pton(AF_INET, iface.p->data, &m.imr_interface) != 1) return -EINVAL;
++    return setsockopt(u->fd, IPPROTO_IP, join ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP, &m, sizeof m) == 0 ? 0 : -errno;
++}
++
++/* udpMulticastIf(id, iface): the interface multicast packets are sent from (an address of this
++ * host; for IPv6, its interface index). 0, or -errno. */
++tv_int tv_native_udpMulticastIf(tv_int id, tv_str iface) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return -EBADF;
++    if (u->family == 6) {
++        unsigned idx = (unsigned)atoi(iface.p->data);
++        return setsockopt(u->fd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &idx, sizeof idx) == 0 ? 0 : -errno;
++    }
++    struct in_addr a;
++    a.s_addr = htonl(INADDR_ANY);
++    if (iface.p->len && inet_pton(AF_INET, iface.p->data, &a) != 1) return -EINVAL;
++    return setsockopt(u->fd, IPPROTO_IP, IP_MULTICAST_IF, &a, sizeof a) == 0 ? 0 : -errno;
++}
++
++/* udpAddress(id, which): 2 the local address, 3 the local port, as text ("" if there is none). */
++tv_str tv_native_udpAddress(tv_int id, tv_int which) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return TV_EMPTY_STR;
++    struct sockaddr_storage ss;
++    socklen_t len = sizeof ss;
++    if (getsockname(u->fd, (struct sockaddr *)&ss, &len) != 0) return TV_EMPTY_STR;
++    char buf[INET6_ADDRSTRLEN + 8];
++    if (ss.ss_family == AF_INET) {
++        struct sockaddr_in *v4 = (struct sockaddr_in *)&ss;
++        if (which == 3) snprintf(buf, sizeof buf, "%d", ntohs(v4->sin_port));
++        else inet_ntop(AF_INET, &v4->sin_addr, buf, sizeof buf);
++    } else if (ss.ss_family == AF_INET6) {
++        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&ss;
++        if (which == 3) snprintf(buf, sizeof buf, "%d", ntohs(v6->sin6_port));
++        else inet_ntop(AF_INET6, &v6->sin6_addr, buf, sizeof buf);
++    } else {
++        return TV_EMPTY_STR;
++    }
++    return tv_str_from(buf, strlen(buf));
++}
++
++/* udpRef(id, on): whether an open, reading socket keeps the program running. */
++void tv_native_udpRef(tv_int id, bool on) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return;
++    u->refd = on;
++    tv_udp_update(u);
++}
++
++/* udpClose(id): closes now; a datagram not yet delivered is dropped. */
++void tv_native_udpClose(tv_int id) {
++    tv_udp *u = tv_udp_get(id);
++    if (!u) return;
++    u->closed = true;
++    u->reading = false;
++    if (u->fd >= 0) {
++        close(u->fd);   /* (removes it from the loop) */
++        u->fd = -1;
++    }
++    if (u->counted) {
++        tv_io_refs--;
++        u->counted = false;
++    }
++    tv_udp_settle(u);
++}
++
+ tv_str tv_native_netError(void) { return tv_str_from(tv_net_err, strlen(tv_net_err)); }
+ 
+ /* ---- the loop's hooks */
+diff --git a/runtime/node.c b/runtime/node.c
+index 416b291..b6ecb02 100644
+--- a/runtime/node.c
++++ b/runtime/node.c
+@@ -1787,6 +1787,133 @@ static void tv_node_queue(JSContextRef ctx, tv_node_job *job, JSValueRef callbac
+     pthread_mutex_unlock(&tv_node_work_mu);
+ }
+ 
++/* ------------------------------------------------------------------ udp (Node.js's udp_wrap.cc):
++ * datagram sockets (runtime/net.c) by id, for internal/bindings/udp_wrap.js. recv(id, cb) makes
++ * cb(bytes, address, port) run for each datagram until recv(id, null). The other natives return
++ * numbers, negative as -errno. */
++
++/* (defined further down this file) */
++static void tv_node_call_args(JSObjectRef fn, size_t n, const JSValueRef *args);
++static tv_str tv_node_arg_str(JSContextRef ctx, size_t n, const JSValueRef a[], size_t i);
++static JSValueRef tv_node_str_value(JSContextRef ctx, tv_str s);
++
++static JSObjectRef *tv_node_udp_cbs;     /* the recv callback of each socket id (protected) */
++static tv_int tv_node_udp_cap;
++
++static void tv_node_udp_cb_set(tv_int id, JSObjectRef cb) {
++    if (id <= 0) return;
++    if (id >= tv_node_udp_cap) {
++        if (!cb) return;
++        tv_int cap = id + 16;
++        tv_node_udp_cbs = realloc(tv_node_udp_cbs, (size_t)cap * sizeof *tv_node_udp_cbs);
++        memset(tv_node_udp_cbs + tv_node_udp_cap, 0, (size_t)(cap - tv_node_udp_cap) * sizeof *tv_node_udp_cbs);
++        tv_node_udp_cap = cap;
++    }
++    if (tv_node_udp_cbs[id]) JSValueUnprotect(tv_js_ctx, tv_node_udp_cbs[id]);
++    tv_node_udp_cbs[id] = cb;
++    if (cb) JSValueProtect(tv_js_ctx, cb);
++}
++
++static void tv_node_udp_sink(void *udata, const uint8_t *data, size_t n, const char *addr, int port) {
++    JSObjectRef cb = (JSObjectRef)udata;
++    JSValueRef args[3] = { tv_js_bytes_copy(data, n), tv_js_str(addr, strlen(addr)), JSValueMakeNumber(tv_js_ctx, port) };
++    tv_node_call_args(cb, 3, args);
++}
++
++/* open(family) -> id (4 or 6), or -errno */
++NATIVE(n_udp_open) {
++    UNUSED;
++    return num(ctx, (double)tv_native_udpOpen((tv_int)arg_num(ctx, n, a, 0, 4)));
++}
++
++/* bind(id, address, port, reuse) -> 0 or -errno */
++NATIVE(n_udp_bind) {
++    UNUSED;
++    tv_str host = tv_node_arg_str(ctx, n, a, 1);
++    tv_int r = tv_native_udpBind((tv_int)arg_num(ctx, n, a, 0, 0), host, (tv_int)arg_num(ctx, n, a, 2, 0), arg_num(ctx, n, a, 3, 0) != 0);
++    tv_str_release(host);
++    return num(ctx, (double)r);
++}
++
++/* recv(id, cb | null): cb(bytes, address, port) for each datagram; null stops */
++NATIVE(n_udp_recv) {
++    UNUSED;
++    tv_int id = (tv_int)arg_num(ctx, n, a, 0, 0);
++    if (n < 2 || !JSValueIsObject(ctx, a[1])) {
++        tv_native_udpRecv(id, false);
++        tv_udp_set_sink(id, NULL, NULL);
++        tv_node_udp_cb_set(id, NULL);
++        return undef(ctx);
++    }
++    tv_node_udp_cb_set(id, (JSObjectRef)a[1]);
++    tv_udp_set_sink(id, tv_node_udp_sink, tv_node_udp_cbs[id]);
++    tv_native_udpRecv(id, true);
++    return undef(ctx);
++}
++
++/* send(id, bytes, address, port) -> bytes sent, or -errno */
++NATIVE(n_udp_send) {
++    UNUSED;
++    uint8_t *p = NULL;
++    size_t len = 0;
++    if (n < 2 || !tv_js_bytes_view(a[1], &p, &len)) return num(ctx, -EINVAL);
++    tv_str host = tv_node_arg_str(ctx, n, a, 2);
++    tv_int r = tv_udp_send_bytes((tv_int)arg_num(ctx, n, a, 0, 0), p, len, host, (tv_int)arg_num(ctx, n, a, 3, 0));
++    tv_str_release(host);
++    return num(ctx, (double)r);
++}
++
++/* option(id, name, value) -> 0, a buffer size, or -errno */
++NATIVE(n_udp_option) {
++    UNUSED;
++    tv_str name = tv_node_arg_str(ctx, n, a, 1);
++    tv_int r = tv_native_udpOption((tv_int)arg_num(ctx, n, a, 0, 0), name, (tv_int)arg_num(ctx, n, a, 2, 0));
++    tv_str_release(name);
++    return num(ctx, (double)r);
++}
++
++/* membership(id, group, iface, join) -> 0 or -errno */
++NATIVE(n_udp_membership) {
++    UNUSED;
++    tv_str group = tv_node_arg_str(ctx, n, a, 1);
++    tv_str iface = tv_node_arg_str(ctx, n, a, 2);
++    tv_int r = tv_native_udpMembership((tv_int)arg_num(ctx, n, a, 0, 0), group, iface, arg_num(ctx, n, a, 3, 1) != 0);
++    tv_str_release(group);
++    tv_str_release(iface);
++    return num(ctx, (double)r);
++}
++
++/* multicastInterface(id, address) -> 0 or -errno */
++NATIVE(n_udp_multicast_if) {
++    UNUSED;
++    tv_str iface = tv_node_arg_str(ctx, n, a, 1);
++    tv_int r = tv_native_udpMulticastIf((tv_int)arg_num(ctx, n, a, 0, 0), iface);
++    tv_str_release(iface);
++    return num(ctx, (double)r);
++}
++
++/* address(id, which): 2 the local address, 3 the local port; "" if none */
++NATIVE(n_udp_address) {
++    UNUSED;
++    return tv_node_str_value(ctx, tv_native_udpAddress((tv_int)arg_num(ctx, n, a, 0, 0), (tv_int)arg_num(ctx, n, a, 1, 2)));
++}
++
++/* ref(id, on) */
++NATIVE(n_udp_ref) {
++    UNUSED;
++    tv_native_udpRef((tv_int)arg_num(ctx, n, a, 0, 0), n > 1 && JSValueToBoolean(ctx, a[1]));
++    return undef(ctx);
++}
++
++/* close(id): drops the socket and its callback */
++NATIVE(n_udp_close) {
++    UNUSED;
++    tv_int id = (tv_int)arg_num(ctx, n, a, 0, 0);
++    tv_native_udpClose(id);
++    tv_node_udp_cb_set(id, NULL);
++    return undef(ctx);
++}
++
+ /* ------------------------------------------------------------------ dns (Node.js's cares_wrap.cc):
+  * getaddrinfo and getnameinfo on the work queue, and DNS queries (the resolve* family) sent to a
+  * server over UDP, then TCP if the answer was truncated; internal/bindings/cares_wrap.js builds
+@@ -3597,6 +3724,18 @@ static void tv_node_streams_install(JSContextRef ctx, JSObjectRef native) {
+     tv_js_def(ctx, st, "name", n_net_name);
+     tv_js_def(ctx, st, "option", n_net_option);
+     set(ctx, native, "stream", st);
++    JSObjectRef udp = JSObjectMake(ctx, NULL, NULL);
++    tv_js_def(ctx, udp, "open", n_udp_open);
++    tv_js_def(ctx, udp, "bind", n_udp_bind);
++    tv_js_def(ctx, udp, "recv", n_udp_recv);
++    tv_js_def(ctx, udp, "send", n_udp_send);
++    tv_js_def(ctx, udp, "option", n_udp_option);
++    tv_js_def(ctx, udp, "membership", n_udp_membership);
++    tv_js_def(ctx, udp, "multicastInterface", n_udp_multicast_if);
++    tv_js_def(ctx, udp, "address", n_udp_address);
++    tv_js_def(ctx, udp, "ref", n_udp_ref);
++    tv_js_def(ctx, udp, "close", n_udp_close);
++    set(ctx, native, "udp", udp);
+     JSObjectRef pr = JSObjectMake(ctx, NULL, NULL);
+     tv_js_def(ctx, pr, "spawn", n_spawn);
+     tv_js_def(ctx, pr, "kill", n_proc_kill);
+diff --git a/runtime/node/internal/bindings/udp_wrap.js b/runtime/node/internal/bindings/udp_wrap.js
+index 187f2a5..e8771d6 100644
+--- a/runtime/node/internal/bindings/udp_wrap.js
++++ b/runtime/node/internal/bindings/udp_wrap.js
+@@ -1,13 +1,238 @@
+ 'use strict';
+ 
+-// internalBinding('udp_wrap'): not written yet. Loading it works; using it throws.
+-module.exports = new Proxy({}, {
+-  get(target, key) {
+-    if (typeof key === 'symbol' || key === 'then') return undefined;
+-    return target[key] ??= function notImplemented() {
+-      const e = new Error(`internalBinding('udp_wrap').${String(key)} is not implemented in Tov yet`);
+-      e.code = 'ERR_NOT_IMPLEMENTED';
+-      throw e;
+-    };
+-  },
+-});
++// internalBinding('udp_wrap'): UDP sockets (Node.js's src/udp_wrap.cc) over Tov's datagram sockets
++// (runtime/net.c, through __tov_native.udp): bind/bind6, send/send6, connect and disconnect,
++// recvStart/recvStop (onmessage(nread, handle, buf, rinfo)), membership, options, names, close.
++// Failures are negative errno numbers, as libuv's. A send that completes at once returns its
++// length plus one (dgram takes that as done); the callback is then called by dgram.
++
++const native = globalThis.__tov_native?.udp;
++
++const constants = { UV_UDP_IPV6ONLY: 1, UV_UDP_REUSEADDR: 4, UV_UDP_REUSEPORT: 8 };
++
++const EBADF = -9;
++const ENOTCONN = -107;
++const ENOSYS = -38;
++
++class SendWrap {}
++
++let nextAsyncId = 1000;
++
++class UDP {
++  constructor() {
++    this._id = -1;
++    this._family = 4;
++    this._peer = null;
++    this._ref = true;
++    this._asyncId = nextAsyncId++;
++  }
++
++  // (AsyncWrap's: dgram tags its events with it)
++  getAsyncId() {
++    return this._asyncId;
++  }
++
++  getProviderType() {
++    return 0;
++  }
++
++  // Opens the socket for family 4 or 6 (once; bind and send open it when needed).
++  _open(family) {
++    if (this._id >= 0) return 0;
++    const id = native.open(family);
++    if (id < 0) return id;
++    this._id = id;
++    this._family = family;
++    if (!this._ref) native.ref(id, false);
++    return 0;
++  }
++
++  bind(address, port, flags) {
++    return this._bind(4, address, port, flags);
++  }
++
++  bind6(address, port, flags) {
++    return this._bind(6, address, port, flags);
++  }
++
++  _bind(family, address, port, flags) {
++    const err = this._open(family);
++    if (err < 0) return err;
++    const reuse = (flags & (constants.UV_UDP_REUSEADDR | constants.UV_UDP_REUSEPORT)) !== 0;
++    return native.bind(this._id, address || '', port | 0, reuse ? 1 : 0);
++  }
++
++  connect(address, port) {
++    this._peer = { address, port: port | 0 };
++    return 0;
++  }
++
++  connect6(address, port) {
++    return this.connect(address, port);
++  }
++
++  disconnect() {
++    this._peer = null;
++    return 0;
++  }
++
++  send(req, list, count, port, address, hasCallback) {
++    return this._send(4, req, list, count, port, address, hasCallback);
++  }
++
++  send6(req, list, count, port, address, hasCallback) {
++    return this._send(6, req, list, count, port, address, hasCallback);
++  }
++
++  // (req, list, count, port, address, hasCallback), or without the address on a connected socket:
++  // (req, list, count, hasCallback)
++  _send(family, req, list, count, port, address, hasCallback) {
++    if (typeof port !== 'number') {
++      hasCallback = port;
++      if (!this._peer) return ENOTCONN;
++      address = this._peer.address;
++      port = this._peer.port;
++    }
++    const err = this._open(family);
++    if (err < 0) return err;
++    let bytes;
++    if (count === 1) {
++      bytes = list[0];
++    } else {
++      let total = 0;
++      for (let i = 0; i < count; i++) total += list[i].byteLength;
++      bytes = new Uint8Array(total);
++      let at = 0;
++      for (let i = 0; i < count; i++) {
++        bytes.set(list[i], at);
++        at += list[i].byteLength;
++      }
++    }
++    const sent = native.send(this._id, bytes, address || (family === 6 ? '::1' : '127.0.0.1'), port | 0);
++    return sent < 0 ? sent : sent + 1;
++  }
++
++  recvStart() {
++    if (this._id < 0) return EBADF;
++    const self = this;
++    native.recv(this._id, (bytes, address, port) => {
++      const family = address.indexOf(':') >= 0 ? 'IPv6' : 'IPv4';
++      const buf = globalThis.Buffer.from(bytes);
++      if (typeof self.onmessage === 'function') {
++        self.onmessage(buf.length, self, buf, { address, family, port });
++      }
++    });
++    return 0;
++  }
++
++  recvStop() {
++    if (this._id >= 0) native.recv(this._id, null);
++    return 0;
++  }
++
++  getsockname(out) {
++    if (this._id < 0) return EBADF;
++    out.address = native.address(this._id, 2);
++    out.port = Number(native.address(this._id, 3));
++    out.family = this._family === 6 ? 'IPv6' : 'IPv4';
++    return 0;
++  }
++
++  getpeername(out) {
++    if (!this._peer) return ENOTCONN;
++    out.address = this._peer.address;
++    out.port = this._peer.port;
++    out.family = this._peer.address.indexOf(':') >= 0 ? 'IPv6' : 'IPv4';
++    return 0;
++  }
++
++  _option(name, value) {
++    if (this._id < 0) return EBADF;
++    const r = native.option(this._id, name, value | 0);
++    return r < 0 ? r : 0;
++  }
++
++  setBroadcast(on) {
++    return this._option('broadcast', on);
++  }
++
++  setTTL(ttl) {
++    return this._option('ttl', ttl);
++  }
++
++  setMulticastTTL(ttl) {
++    return this._option('multicastTTL', ttl);
++  }
++
++  setMulticastLoopback(on) {
++    return this._option('multicastLoopback', on);
++  }
++
++  setMulticastInterface(address) {
++    if (this._id < 0) return EBADF;
++    return native.multicastInterface(this._id, address || '');
++  }
++
++  addMembership(group, iface) {
++    if (this._id < 0) return EBADF;
++    return native.membership(this._id, group, iface || '', 1);
++  }
++
++  dropMembership(group, iface) {
++    if (this._id < 0) return EBADF;
++    return native.membership(this._id, group, iface || '', 0);
++  }
++
++  addSourceSpecificMembership() {
++    return ENOSYS;
++  }
++
++  dropSourceSpecificMembership() {
++    return ENOSYS;
++  }
++
++  // (recv: true for the receive buffer, false for the send buffer; ctx unused)
++  bufferSize(size, recv) {
++    if (this._id < 0) return EBADF;
++    const r = native.option(this._id, recv ? 'recvBuffer' : 'sendBuffer', size | 0);
++    return r < 0 ? undefined : r;
++  }
++
++  getSendQueueSize() {
++    return 0;
++  }
++
++  getSendQueueCount() {
++    return 0;
++  }
++
++  open() {
++    return ENOSYS;
++  }
++
++  ref() {
++    this._ref = true;
++    if (this._id >= 0) native.ref(this._id, true);
++  }
++
++  unref() {
++    this._ref = false;
++    if (this._id >= 0) native.ref(this._id, false);
++  }
++
++  hasRef() {
++    return this._ref;
++  }
++
++  close(callback) {
++    if (this._id >= 0) {
++      native.close(this._id);
++      this._id = -1;
++    }
++    if (typeof callback === 'function') {
++      queueMicrotask(callback);
++    }
++  }
++}
++
++module.exports = { UDP, SendWrap, constants };
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 1d42d62..dd22723 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -885,6 +885,24 @@ tv_int tv_native_netListenPort(tv_int id);
+ void tv_native_netStop(tv_int id);
+ void tv_native_netListenRef(tv_int id, bool ref);
+ tv_str tv_native_netError(void);
++
++/* UDP (runtime/net.c): datagram sockets on the loop, for node:dgram and Bun.udpSocket. Natives
++ * return -errno on failure; messages go to udpEvents' closure (kind 1, bytes, address, port) or
++ * to the C sink a host sets. */
++typedef void (*tv_udp_sink)(void *udata, const uint8_t *data, size_t n, const char *addr, int port);
++void tv_udp_set_sink(tv_int id, tv_udp_sink sink, void *udata);
++tv_int tv_native_udpOpen(tv_int family);
++tv_int tv_native_udpBind(tv_int id, tv_str host, tv_int port, bool reuse);
++void tv_native_udpEvents(tv_int id, tv_fn events);
++void tv_native_udpRecv(tv_int id, bool on);
++tv_int tv_native_udpSend(tv_int id, tv_arr bytes, tv_str host, tv_int port);
++tv_int tv_udp_send_bytes(tv_int id, const uint8_t *data, size_t n, tv_str host, tv_int port);  /* (for node.c) */
++tv_int tv_native_udpOption(tv_int id, tv_str name, tv_int value);
++tv_int tv_native_udpMembership(tv_int id, tv_str group, tv_str iface, bool join);
++tv_int tv_native_udpMulticastIf(tv_int id, tv_str iface);
++tv_str tv_native_udpAddress(tv_int id, tv_int which);
++void tv_native_udpRef(tv_int id, bool on);
++void tv_native_udpClose(tv_int id);
+ /* WebSockets (runtime/ws.c): Bun.serve's websocket and the WebSocket client */
+ tv_int tv_native_wsUpgrade(tv_str key, tv_str headers, tv_int max_payload);
+ tv_int tv_native_wsConnect(tv_str host, tv_int port, tv_str path, bool tls, bool verify, tv_str ca, tv_str headers, tv_str protocols, tv_int max_payload);
+diff --git a/tests/run/native_udp.stdout b/tests/run/native_udp.stdout
+new file mode 100644
+index 0000000..b7e72b7
+--- /dev/null
++++ b/tests/run/native_udp.stdout
+@@ -0,0 +1,8 @@
++ok datagram arrives intact
++ok sender's address and port come with it
++ok bound port and hostname
++ok bytes reply
++ok broadcast and TTL options accepted
++ok multicast membership receives the group's datagrams
++ok multicast membership dropped
++ok a closed socket doesn't send
+diff --git a/tests/run/native_udp.tov b/tests/run/native_udp.tov
+new file mode 100644
+index 0000000..364c9ac
+--- /dev/null
++++ b/tests/run/native_udp.tov
+@@ -0,0 +1,89 @@
++// Bun.udpSocket: datagrams arrive whole with the sender's address and port, the options are
++// accepted, a multicast group's datagrams reach its member, and a closed socket sends nothing.
++// Prints "ok" or "FAIL" lines.
++async function pause(ms: int): Promise<void, Error> {
++  const p = new Promise<void, Error>((resolve, reject) => {
++    setTimeout(() => resolve(), ms)
++  })
++  try await p
++}
++
++function text(bytes: u8[]): string {
++  try {
++    return new TextDecoder().decode(bytes)
++  } catch (e) {
++    return ""
++  }
++}
++
++async function main(): Promise<int> {
++  let aGot = ""
++  let aFrom = ""
++  let aSeen = 0
++  let bGot = ""
++  let mcGot = ""
++  try {
++    const a = try await Bun.udpSocket({
++      hostname: "127.0.0.1",
++      port: 0,
++      socket: {
++        data(s, bytes, port, address) {
++          aGot = text(bytes)
++          aFrom = `${address}:${port}`
++          aSeen += 1
++        },
++      },
++    })
++    const b = try await Bun.udpSocket({
++      hostname: "127.0.0.1",
++      port: 0,
++      socket: {
++        data(s, bytes, port, address) {
++          bGot = text(bytes)
++        },
++      },
++    })
++    const sent = b.send("hello", a.port, "127.0.0.1")
++    await pause(100)
++    console.log(sent && aGot === "hello" ? "ok datagram arrives intact" : `FAIL got ${JSON.stringify(aGot)} sent=${sent}`)
++    console.log(aFrom === `127.0.0.1:${b.port}` ? "ok sender's address and port come with it" : `FAIL from ${aFrom}`)
++    console.log(b.port > 0 && a.hostname === "127.0.0.1" ? "ok bound port and hostname" : `FAIL names ${a.hostname}:${a.port}`)
++
++    // bytes both ways
++    a.send(new TextEncoder().encode("back"), b.port, "127.0.0.1")
++    await pause(100)
++    console.log(bGot === "back" ? "ok bytes reply" : `FAIL reply ${JSON.stringify(bGot)}`)
++
++    console.log(a.setBroadcast(true) && a.setTTL(8) && a.setMulticastTTL(1) ? "ok broadcast and TTL options accepted" : "FAIL options")
++
++    // multicast: a group joined on one socket receives what another sends to it
++    const group = "239.255.42.99"
++    const m = try await Bun.udpSocket({
++      hostname: "0.0.0.0",
++      port: 0,
++      reusePort: true,
++      socket: {
++        data(s, bytes, port, address) {
++          mcGot = text(bytes)
++        },
++      },
++    })
++    const joined = m.addMembership(group)
++    // (sent from a wildcard-bound socket: a loopback source can't reach a group on the LAN route)
++    const wild = try await Bun.udpSocket({ hostname: "0.0.0.0", port: 0, socket: {} })
++    wild.send("group", m.port, group)
++    wild.close()
++    await pause(100)
++    console.log(joined && mcGot === "group" ? "ok multicast membership receives the group's datagrams" : `FAIL multicast joined=${joined} got=${JSON.stringify(mcGot)}`)
++    console.log(m.dropMembership(group) ? "ok multicast membership dropped" : "FAIL drop membership")
++
++    // closed sockets send nothing and report it
++    b.close()
++    console.log(b.closed && !b.send("late", a.port, "127.0.0.1") ? "ok a closed socket doesn't send" : "FAIL closed socket sent")
++    a.close()
++    m.close()
++  } catch (e) {
++    console.log("FAIL " + e.message)
++  }
++  return 0
++}
+-- 
+2.43.0
+

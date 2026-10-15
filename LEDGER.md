@@ -219,7 +219,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L89 | G42 | Wire the sinks into ops (BigQuery, Pub/Sub, Kafka, Maxim, Parquet, retention) with gateway-level e2e | worker | done: unit + e2e (both servers) |
 | L90 | G43 | Wire the guardrails into the gateway (local engines, LLM judge, MCP tool guard, reversible) with e2e | worker | done: unit + e2e (both servers); Gitleaks set is a 35-rule subset |
 | L91 | G47, G22 | Circuit-breaker policy rerouting (persisted); MCP OAuth authorization-code flows | worker | assigned: resumed from handoff/patches |
-| L92 | G29, G44 | Tov patches 0003 (TLS ALPN) and 0004 (UDP); TLS gRPC export; UDP and mDNS discovery | worker | assigned: resumed from handoff/patches |
+| L92 | G29, G44 | Tov patches 0003 (TLS ALPN) and 0004 (UDP); TLS gRPC export; UDP and mDNS discovery | worker | done: Tov patches 0003 (ALPN) and 0004 (UDP) with upstream versions; TLS gRPC export; udp and mdns discovery (Raiju wire format: Bifrost's is not public); unit + e2e (both servers) |
 
 ## Wave 13: what remains after wave 12
 

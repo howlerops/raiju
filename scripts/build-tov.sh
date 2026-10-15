@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds Tov with the patches in tov-patches/ (streamed response bodies for
-# Bun.serve) into build/tov/target/release/tov. Raiju needs this build until
-# the patch is upstream. Usage: scripts/build-tov.sh  (needs git and cargo)
+# Bun.serve, child processes as sockets, TLS ALPN, UDP sockets) into
+# build/tov/target/release/tov, applied in name order. Raiju needs this build
+# until the patches are upstream. Usage: scripts/build-tov.sh  (needs git and cargo)
 set -eu
 REV=${TOV_REV:-c2048582de4e9468267f801313144d75c12e983f}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

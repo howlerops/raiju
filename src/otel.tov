@@ -4,7 +4,7 @@
 
 import { readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { H2Header } from "./h2"
+import { H2Header, H2Tls } from "./h2"
 import { grpcUnary, grpcClose } from "./grpc"
 import { encodeTraceRequest, encodeMetricsRequest } from "./protobuf"
 
@@ -461,10 +461,18 @@ export function grpcTarget(addr: string): { host: string, port: int } | undefine
 }
 
 // gRPC is plaintext only for insecure: true without a CA file, as Bifrost's gRPC client
-// does. TLS needs ALPN "h2" on the socket, which Tov does not offer yet (see grpc.tov), so
-// a TLS collector is refused with a log line rather than sent to.
+// does. Anything else is TLS with ALPN "h2".
 export function grpcPlaintext(cfg: OtelConfig): bool {
   return cfg.insecure === true && (cfg.tls_ca_cert ?? "") === ""
+}
+
+// The TLS settings of the gRPC connection: undefined for plaintext, else the CA (the file's
+// text, or "" for the system roots) and whether to verify, as the HTTP export does.
+export function grpcTls(cfg: OtelConfig): H2Tls | undefined {
+  if (grpcPlaintext(cfg)) return undefined
+  const t = otelTls(cfg)
+  if (t === undefined) return { ca: "", verify: true }
+  return { ca: t.ca ?? "", verify: t.rejectUnauthorized ?? true }
 }
 
 // One gRPC export. Failures are logged, never raised, as the HTTP export does.
@@ -474,14 +482,10 @@ async function grpcSend(cfg: OtelConfig, target: string, rpc: string, headers: M
     console.error(`raiju: ${what} export: bad gRPC collector address ${target}`)
     return
   }
-  if (!grpcPlaintext(cfg)) {
-    console.error(`raiju: ${what} export: gRPC over TLS is not supported yet; set insecure: true for a plaintext collector`)
-    return
-  }
   const meta: H2Header[] = []
   for (const k of headers.keys()) meta.push({ name: k, value: headers.get(k)! })
   try {
-    const r = try await grpcUnary(t.host, t.port, rpc, body, meta, exportTimeoutMs(cfg.export_timeout))
+    const r = try await grpcUnary(t.host, t.port, rpc, body, meta, exportTimeoutMs(cfg.export_timeout), grpcTls(cfg))
     if (r.status !== 0) console.error(`raiju: ${what} export: gRPC status ${r.status}: ${r.message}`)
   } catch (e) {
     console.error(`raiju: ${what} export failed: ${e.message}`)
@@ -537,6 +541,17 @@ test("gRPC is plaintext only with insecure and no CA file", () => {
   expect(grpcPlaintext({ endpoint: "c:4317", insecure: true, tls_ca_cert: "/ca.pem" })).toBe(false)
   expect(usesGrpc({ endpoint: "c:4317", protocol: "grpc" })).toBe(true)
   expect(usesGrpc({ endpoint: "http://c:4318" })).toBe(false)
+})
+
+test("gRPC TLS: system roots by default, skip-verify with insecure, the CA file with verification", () => {
+  expect(grpcTls({ endpoint: "c:4317", protocol: "grpc" })).toEqual({ ca: "", verify: true })
+  expect(grpcTls({ endpoint: "c:4317", protocol: "grpc", insecure: true })).toBeUndefined()
+  const path = `${try tmpdir()}/raiju-grpc-ca-test.pem`
+  try writeFileSync(path, "-----BEGIN CERTIFICATE-----\nGRPC\n-----END CERTIFICATE-----\n")
+  const withCa = grpcTls({ endpoint: "c:4317", protocol: "grpc", insecure: true, tls_ca_cert: path })
+  expect(withCa!.verify).toBe(true)
+  expect(withCa!.ca.includes("GRPC")).toBe(true)
+  expect(grpcTls({ endpoint: "c:4317", protocol: "grpc", tls_ca_cert: `${try tmpdir()}/raiju-no-such-grpc-ca.pem` })).toEqual({ ca: "", verify: true })
 })
 
 test("the gRPC trace batch is the same spans as the JSON batch", () => {

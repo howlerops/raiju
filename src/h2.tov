@@ -1,13 +1,16 @@
-// HTTP/2 client (RFC 9113) for unary gRPC, over plaintext with prior knowledge (h2c).
-// Tov's fetch speaks HTTP/1.1 only, so this runs on a raw socket. TLS needs ALPN "h2",
-// and Tov's sockets do not offer it: see the notes in grpc.tov. HPACK (RFC 7541) is
-// here too: the encoder writes literal fields with no Huffman coding and no indexing;
-// the decoder reads the static and dynamic tables and Huffman strings, since servers
-// index and Huffman-code their fields.
+// HTTP/2 client (RFC 9113) for unary gRPC, over plaintext with prior knowledge (h2c), or
+// over TLS with ALPN "h2" (the server must pick it). Tov's fetch speaks HTTP/1.1 only, so
+// this runs on a raw socket. HPACK (RFC 7541) is here too: the encoder writes literal
+// fields with no Huffman coding and no indexing; the decoder reads the static and dynamic
+// tables and Huffman strings, since servers index and Huffman-code their fields.
 
 export type H2Header = { name: string, value: string }
 
 export type H2Response = { headers: H2Header[], trailers: H2Header[], body: u8[] }
+
+// TLS for a connection: the CA certificate (PEM, "" for the system roots) and whether the
+// server's certificate is checked.
+export type H2Tls = { ca: string, verify: bool }
 
 const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
@@ -396,8 +399,10 @@ export class H2Conn {
   private contId: int = 0
   // the header block of a cancelled stream, until its END_HEADERS
   private orphan: u8[] = []
+  // set when the server did not pick h2 in ALPN: the connection is refused
+  private alpnRefused: bool = false
 
-  constructor(readonly host: string, readonly port: int) {}
+  constructor(readonly host: string, readonly port: int, readonly tls: H2Tls | undefined) {}
 
   // Sends one request and waits for its response. timeoutMs covers the whole call; past
   // it the stream is cancelled and the call fails with a deadline error.
@@ -447,14 +452,23 @@ export class H2Conn {
     }
   }
 
-  // The preface and our SETTINGS go out as soon as the socket is open.
+  // The preface and our SETTINGS go out as soon as the socket is open. Over TLS the socket
+  // must have picked h2 in ALPN, or it is closed and the connect fails.
   private async open(): Promise<void, Error> {
     const self = this
+    const t = this.tls
+    this.alpnRefused = false
     try await Bun.connect({
       hostname: this.host,
       port: this.port,
+      tls: t === undefined ? false : { rejectUnauthorized: t.verify, ca: t.ca, alpn: ["h2"] },
       socket: {
         open(s) {
+          if (t !== undefined && s.alpnProtocol !== "h2") {
+            self.alpnRefused = true
+            s.terminate()
+            return
+          }
           self.sock = s
           const pre = new TextEncoder().encode(PREFACE)
           const out: u8[] = []
@@ -474,6 +488,7 @@ export class H2Conn {
         },
       },
     })
+    if (this.alpnRefused) throw new Error("grpc: the collector did not pick h2 over TLS (ALPN)")
   }
 
   private write(bytes: u8[]): void {

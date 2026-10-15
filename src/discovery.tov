@@ -1,14 +1,16 @@
 // Cluster discovery (Bifrost's cluster_config.discovery): finds the other nodes of a
 // cluster and turns them into sync URLs. Kubernetes (pods by label, or a service's
 // endpoints), DNS (A records), Consul (catalog, with this node registered) and etcd
-// (v3 JSON gateway: a leased key per node) are here. UDP broadcast and mDNS need UDP
-// sockets, which Tov does not have yet (node:dgram is a stub), so they report that
-// as an error and find no peers. Leader election is in cluster.tov.
+// (v3 JSON gateway: a leased key per node) are here. UDP broadcast (beacons on
+// udp_broadcast_port, answered with acks) and mDNS (DNS-SD records on the local link,
+// see mdns.tov) keep a UDP socket open between rounds and list the nodes heard
+// recently. Leader election is in cluster.tov.
 import * as dns from "node:dns"
 import { readFileSync } from "node:fs"
 import { encode, decode } from "./base64"
 import { utf8 } from "./crypto"
 import { deadline } from "./deadline"
+import { MDNS_GROUP, MDNS_PORT, TYPE_A, TYPE_ANY, TYPE_PTR, TYPE_SRV, DnsQuestion, DnsRecord, encodeQuery, encodeResponse, parsePacket } from "./mdns"
 
 export type DiscoveryConfig = {
   enabled?: bool,
@@ -48,8 +50,11 @@ const ETCD_TTL_S: int = 30
 const CONSUL_DEFAULT = "localhost:8500"
 const SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 const HEX = "0123456789ABCDEF"
-const UDP_MSG = "udp discovery needs UDP sockets, which Raiju does not have yet"
-const MDNS_MSG = "mdns discovery needs UDP sockets (multicast DNS), which Raiju does not have yet"
+// A peer not heard from for this long is dropped: the beacons and announcements repeat each round.
+const HEARD_TTL_MS: f64 = 30000.0
+const BEACON_TAG = "raiju-discovery"
+const BROADCAST = "255.255.255.255"
+const MDNS_DEFAULT_SERVICE = "_bifrost._tcp"
 
 // ---- pure helpers ----
 
@@ -374,13 +379,290 @@ class EtcdClient {
   }
 }
 
+// ---- UDP and mDNS: sockets that stay open between rounds ----
+
+// A peer heard from: its address and cluster port, and when (ms) it was last heard.
+type Heard = { hit: Hit, at: f64 }
+
+// The beacon text: "raiju-discovery <beacon|ack> <service> <node id> <cluster port>".
+export function udpBeacon(kind: string, service: string, nodeId: string, port: int): string {
+  return `${BEACON_TAG} ${kind} ${service} ${nodeId} ${port}`
+}
+
+// A beacon or an ack for this service, read: its kind, node and cluster port. Anything else is undefined.
+export function parseBeacon(text: string, service: string): { kind: string, node: string, port: int } | undefined {
+  const parts = text.split(" ")
+  if (parts.length !== 5 || parts[0] !== BEACON_TAG || parts[2] !== service) return undefined
+  const kind = parts[1] ?? ""
+  if (kind !== "beacon" && kind !== "ack") return undefined
+  const node = parts[3] ?? ""
+  const port = parseInt(parts[4] ?? "") ?? -1
+  if (node === "" || port < 1 || port > 65535) return undefined
+  return { kind: kind, node: node, port: port }
+}
+
+// Why a udp discovery config can't run, or "". UDP needs a service name, the broadcast port, and
+// allowed_address_space (Bifrost's rule: discovery stays inside the local subnets).
+export function udpConfigError(d: DiscoveryConfig): string {
+  const svc = d.service_name ?? ""
+  if (svc === "" || svc.includes(" ")) return "udp discovery needs service_name, without spaces"
+  if ((d.udp_broadcast_port ?? 0) < 1) return "udp discovery needs udp_broadcast_port"
+  if ((d.allowed_address_space ?? []).length === 0) return "udp discovery needs allowed_address_space"
+  return ""
+}
+
+// Why an mdns discovery config can't run, or "". mdns_service is the service type (default
+// _bifrost._tcp). An advertise_address must be an IPv4 address (the A record); without one the node
+// only listens.
+export function mdnsConfigError(d: DiscoveryConfig): string {
+  const svc = d.mdns_service ?? MDNS_DEFAULT_SERVICE
+  if (!svc.startsWith("_") || !svc.includes("._")) return `mdns_service must look like _bifrost._tcp, not ${svc}`
+  const adv = d.advertise_address ?? ""
+  if (adv !== "" && ipv4Value(adv) === undefined) return "mdns discovery: advertise_address must be an IPv4 address"
+  return ""
+}
+
+// The records of a node for the service type: the PTR under it, the SRV for the cluster port, and the A record.
+export function serviceRecords(svc: string, label: string, addr: string, port: int): DnsRecord[] {
+  const inst = `${label}.${svc}.local`
+  const host = `${label}.local`
+  return [
+    { name: `${svc}.local`, type: TYPE_PTR, ttl: 120, target: inst, port: 0, addr: "" },
+    { name: inst, type: TYPE_SRV, ttl: 120, target: host, port: port, addr: "" },
+    { name: host, type: TYPE_A, ttl: 120, target: "", port: 0, addr: addr },
+  ]
+}
+
+// A node id as a DNS label: letters, digits and hyphens, anything else a hyphen; at most 63 bytes.
+export function mdnsLabel(id: string): string {
+  let out = ""
+  for (const b of utf8(id)) {
+    const c = int(b)
+    const plain = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45
+    out += plain ? PRINTABLE.slice(c - 32, c - 31) : "-"
+  }
+  const s = out.slice(0, 63)
+  return s === "" ? "raiju" : s
+}
+
+// Reads a datagram as text, or "" when it is not UTF-8.
+function datagramText(bytes: u8[]): string {
+  try {
+    return textOf(bytes)
+  } catch (e) {
+    return ""
+  }
+}
+
+// UDP discovery (Bifrost's "udp"). Each round broadcasts a beacon to udp_broadcast_port; every
+// node answers the beacons it hears with an ack, so each node learns the others from the sources
+// of the packets. Several nodes on one host share the port (SO_REUSEPORT), and each beacon reaches
+// all of them.
+export class UdpPeers {
+  private sock: UDPSocket<undefined> | undefined = undefined
+  private heard: Map<string, Heard> = new Map()
+
+  constructor(readonly service: string, readonly nodeId: string, readonly port: int, readonly clusterPort: int) {}
+
+  // Opens the socket on the broadcast port, once. It keeps the program running until it is closed.
+  private async open(): Promise<UDPSocket<undefined>> throws Error {
+    const have = this.sock
+    if (have !== undefined) return have
+    const self = this
+    const s = try await Bun.udpSocket({
+      hostname: "0.0.0.0",
+      port: this.port,
+      reusePort: true,
+      broadcast: true,
+      socket: {
+        data(sock, bytes, from, address) {
+          self.onDatagram(bytes, address, from, Date.now())
+        },
+      },
+    })
+    this.sock = s
+    return s
+  }
+
+  // A beacon from another node is recorded and answered with an ack to its port; an ack is recorded.
+  // Packets from this node, or for another service or of another shape, are ignored.
+  onDatagram(bytes: u8[], address: string, from: int, now: f64): void {
+    const b = parseBeacon(datagramText(bytes), this.service)
+    if (b === undefined || b.node === this.nodeId) return
+    this.heard.set(address + ":" + b.port, { hit: { host: address, port: b.port }, at: now })
+    const s = this.sock
+    if (b.kind === "beacon" && s !== undefined) {
+      s.send(udpBeacon("ack", this.service, this.nodeId, this.clusterPort), from, address)
+    }
+  }
+
+  // Sends this round's beacon and lists the peers heard within the TTL.
+  async round(): Promise<Hit[]> throws Error {
+    const s = try await this.open()
+    if (!s.send(udpBeacon("beacon", this.service, this.nodeId, this.clusterPort), this.port, BROADCAST)) {
+      throw new Error(`udp: the beacon was not sent to ${BROADCAST}:${this.port}`)
+    }
+    return this.peers(Date.now())
+  }
+
+  // The peers heard within the TTL. Expired ones are dropped.
+  peers(now: f64): Hit[] {
+    const out: Hit[] = []
+    for (const k of this.heard.keys()) {
+      const h = this.heard.get(k)!
+      if (now - h.at > HEARD_TTL_MS) {
+        this.heard.delete(k)
+      } else {
+        out.push(h.hit)
+      }
+    }
+    return out
+  }
+
+  close(): void {
+    const s = this.sock
+    if (s !== undefined) {
+      s.close()
+      this.sock = undefined
+    }
+  }
+}
+
+// mDNS discovery (Bifrost's "mdns"): this node announces its SRV and A records for the service on
+// the local link, when advertise_address is set, and answers queries for the service with them. The
+// nodes whose records it hears are listed: an SRV record gives the port, and the A record of its
+// target the address.
+export class MdnsPeers {
+  private sock: UDPSocket<undefined> | undefined = undefined
+  private srvs: Map<string, { target: string, port: int, at: f64 }> = new Map()
+  private addrs: Map<string, { addr: string, at: f64 }> = new Map()
+  // the service type's name, lower-cased for matching: "_bifrost._tcp.local"
+  private typeName: string
+
+  constructor(readonly svc: string, readonly label: string, readonly advertise: string, readonly clusterPort: int) {
+    this.typeName = (svc + ".local").toLowerCase()
+  }
+
+  // Opens the socket on the mDNS port and joins the group, once.
+  private async open(): Promise<UDPSocket<undefined>> throws Error {
+    const have = this.sock
+    if (have !== undefined) return have
+    const self = this
+    const s = try await Bun.udpSocket({
+      hostname: "0.0.0.0",
+      port: MDNS_PORT,
+      reusePort: true,
+      socket: {
+        data(sock, bytes, from, address) {
+          self.onPacket(bytes, Date.now())
+        },
+      },
+    })
+    if (!s.addMembership(MDNS_GROUP)) {
+      s.close()
+      throw new Error(`mdns: could not join ${MDNS_GROUP}`)
+    }
+    this.sock = s
+    return s
+  }
+
+  // Records the SRV and A records of the service, and answers a query for the service type with this
+  // node's records. Packets that are not DNS messages are ignored.
+  onPacket(bytes: u8[], now: f64): void {
+    const p = parsePacket(bytes)
+    if (p === undefined) return
+    if (!p.response) {
+      if (this.advertise !== "" && this.asksForService(p.questions)) {
+        try {
+          this.announce()
+        } catch (e) {
+          console.error(`raiju: mdns announce: ${e.message}`)
+        }
+      }
+      return
+    }
+    for (const r of p.records) {
+      const name = r.name.toLowerCase()
+      if (r.type === TYPE_SRV && name.endsWith("." + this.typeName)) {
+        this.srvs.set(name, { target: r.target.toLowerCase(), port: r.port, at: now })
+      } else if (r.type === TYPE_A) {
+        this.addrs.set(name, { addr: r.addr, at: now })
+      }
+    }
+  }
+
+  private asksForService(qs: DnsQuestion[]): bool {
+    for (const q of qs) {
+      if (q.name.toLowerCase() === this.typeName && (q.type === TYPE_PTR || q.type === TYPE_ANY)) return true
+    }
+    return false
+  }
+
+  // This node's records: the PTR under the service type, the SRV for the cluster port, and the A record.
+  private announce(): void throws Error {
+    const s = this.sock
+    if (s === undefined) return
+    const bytes = try encodeResponse(serviceRecords(this.svc, this.label, this.advertise, this.clusterPort))
+    s.send(bytes, MDNS_PORT, MDNS_GROUP)
+  }
+
+  // Announces this node (when it advertises), asks the group for the service, and lists the peers heard.
+  async round(): Promise<Hit[]> throws Error {
+    const s = try await this.open()
+    if (this.advertise !== "") {
+      try this.announce()
+    }
+    const q = try encodeQuery([{ name: `${this.svc}.local`, type: TYPE_PTR }])
+    if (!s.send(q, MDNS_PORT, MDNS_GROUP)) throw new Error("mdns: the query was not sent")
+    return this.peers(Date.now())
+  }
+
+  // The peers heard within the TTL: an SRV whose target has an address that is fresh too.
+  peers(now: f64): Hit[] {
+    const out: Hit[] = []
+    for (const k of this.srvs.keys()) {
+      const s = this.srvs.get(k)!
+      const a = this.addrs.get(s.target)
+      if (now - s.at > HEARD_TTL_MS) {
+        this.srvs.delete(k)
+      } else if (a !== undefined && now - a.at <= HEARD_TTL_MS) {
+        out.push({ host: a.addr, port: s.port })
+      }
+    }
+    for (const k of this.addrs.keys()) {
+      const a = this.addrs.get(k)!
+      if (now - a.at > HEARD_TTL_MS) this.addrs.delete(k)
+    }
+    return out
+  }
+
+  close(): void {
+    const s = this.sock
+    if (s !== undefined) {
+      s.close()
+      this.sock = undefined
+    }
+  }
+}
+
 // ---- the discoverer ----
 
-// Runs the configured mechanism. Keep one per cluster: etcd keeps its lease in it.
+// Runs the configured mechanism. Keep one per cluster: etcd keeps its lease in it, and the UDP and
+// mDNS sockets stay open in it (close them when the cluster is reconfigured).
 export class Discoverer {
   private etcd: EtcdClient | undefined = undefined
+  private udp: UdpPeers | undefined = undefined
+  private mdns: MdnsPeers | undefined = undefined
 
   constructor(readonly cfg: DiscoveryConfig, readonly nodeId: string, readonly env: (name: string) => string | undefined) {}
+
+  // Closes the sockets of the UDP and mDNS mechanisms.
+  close(): void {
+    const u = this.udp
+    if (u !== undefined) u.close()
+    const m = this.mdns
+    if (m !== undefined) m.close()
+  }
 
   // One round: registers this node where the mechanism needs it, then lists the others.
   async tick(): Promise<DiscoverOutcome> {
@@ -409,9 +691,33 @@ export class Discoverer {
       if ((d.service_name ?? "") === "") throw new Error("etcd discovery needs service_name")
       return try await c.round(this.nodeId, d.advertise_address ?? "", port, ms)
     }
-    if (t === "udp") throw new Error(UDP_MSG)
-    if (t === "mdns") throw new Error(MDNS_MSG)
+    if (t === "udp") return try await this.udpRound(d, port)
+    if (t === "mdns") return try await this.mdnsRound(d, port)
     throw new Error(`discovery type "${t}" is not one of kubernetes, dns, consul, etcd, udp, mdns`)
+  }
+
+  // UDP needs a service name, the broadcast port, and allowed_address_space (Bifrost's rule: discovery
+  // stays inside the local subnets).
+  private async udpRound(d: DiscoveryConfig, port: int): Promise<Hit[]> throws Error {
+    const bad = udpConfigError(d)
+    if (bad !== "") throw new Error(bad)
+    let u = this.udp
+    if (u === undefined) {
+      u = new UdpPeers(d.service_name ?? "", this.nodeId, d.udp_broadcast_port ?? 0, port)
+      this.udp = u
+    }
+    return try await u.round()
+  }
+
+  private async mdnsRound(d: DiscoveryConfig, port: int): Promise<Hit[]> throws Error {
+    const bad = mdnsConfigError(d)
+    if (bad !== "") throw new Error(bad)
+    let m = this.mdns
+    if (m === undefined) {
+      m = new MdnsPeers(d.mdns_service ?? MDNS_DEFAULT_SERVICE, mdnsLabel(this.nodeId), d.advertise_address ?? "", port)
+      this.mdns = m
+    }
+    return try await m.round()
   }
 
   // Sync URLs of the hits: this node itself (its advertised address and its own port) and addresses
@@ -530,4 +836,89 @@ test("sync URLs skip this node, outside ranges and repeats, and are sorted", () 
   expect(urls[0]).toBe("http://10.0.0.1:9090")
   expect(urls[1]).toBe("http://10.0.0.2:8080")
   expect(urls[2]).toBe("http://10.0.0.3:8080")
+})
+
+test("beacons carry the service, node and cluster port, and only well-formed ones parse", () => {
+  const text = udpBeacon("beacon", "bifrost", "n2", 8081)
+  expect(text).toBe("raiju-discovery beacon bifrost n2 8081")
+  expect(parseBeacon(text, "bifrost")).toEqual({ kind: "beacon", node: "n2", port: 8081 })
+  expect(parseBeacon(text, "other")).toBeUndefined()
+  expect(parseBeacon("raiju-discovery hello bifrost n2 8081", "bifrost")).toBeUndefined()
+  expect(parseBeacon("raiju-discovery ack bifrost n2 70000", "bifrost")).toBeUndefined()
+  expect(parseBeacon("raiju-discovery ack bifrost  8081", "bifrost")).toBeUndefined()
+  expect(parseBeacon("GET / HTTP/1.1", "bifrost")).toBeUndefined()
+})
+
+test("udp config needs a service name, the broadcast port and allowed address space", () => {
+  expect(udpConfigError({ type: "udp", service_name: "bifrost", udp_broadcast_port: 9999, allowed_address_space: ["10.0.0.0/8"] })).toBe("")
+  expect(udpConfigError({ type: "udp", udp_broadcast_port: 9999, allowed_address_space: ["10.0.0.0/8"] }) !== "").toBe(true)
+  expect(udpConfigError({ type: "udp", service_name: "bifrost", allowed_address_space: ["10.0.0.0/8"] }) !== "").toBe(true)
+  expect(udpConfigError({ type: "udp", service_name: "bifrost", udp_broadcast_port: 9999 }) !== "").toBe(true)
+})
+
+test("udp records the beacons of other nodes and expires them", () => {
+  const u = new UdpPeers("bifrost", "n1", 9999, 8080)
+  u.onDatagram(utf8(udpBeacon("beacon", "bifrost", "n1", 8080)), "10.0.0.1", 9999, 1000.0)
+  u.onDatagram(utf8(udpBeacon("beacon", "bifrost", "n2", 8081)), "10.0.0.2", 9999, 1000.0)
+  u.onDatagram(utf8(udpBeacon("ack", "bifrost", "n3", 8082)), "10.0.0.3", 9999, 1000.0)
+  u.onDatagram(utf8("hello"), "10.0.0.4", 9999, 1000.0)
+  u.onDatagram(utf8(udpBeacon("beacon", "other", "n5", 8083)), "10.0.0.5", 9999, 1000.0)
+  const hs = u.peers(1500.0)
+  // this node's own beacon, other packets and another service are left out
+  expect(hs.length).toBe(2)
+  expect(hs[0]!.host).toBe("10.0.0.2")
+  expect(hs[0]!.port).toBe(8081)
+  expect(hs[1]!.host).toBe("10.0.0.3")
+  expect(hs[1]!.port).toBe(8082)
+  expect(u.peers(1000.0 + 30001.0).length).toBe(0)
+})
+
+test("mdns config: the service type looks like _bifrost._tcp, and the advertised address is IPv4", () => {
+  expect(mdnsConfigError({ type: "mdns" })).toBe("")
+  expect(mdnsConfigError({ type: "mdns", mdns_service: "_myapp._tcp", advertise_address: "10.0.0.1" })).toBe("")
+  expect(mdnsConfigError({ type: "mdns", mdns_service: "bifrost" }) !== "").toBe(true)
+  expect(mdnsConfigError({ type: "mdns", advertise_address: "node-a.internal" }) !== "").toBe(true)
+})
+
+test("mdns labels are DNS-safe node ids", () => {
+  expect(mdnsLabel("node_a.1")).toBe("node-a-1")
+  expect(mdnsLabel("")).toBe("raiju")
+  let long = ""
+  for (let i = 0; i < 80; i++) long += "n"
+  expect(mdnsLabel(long).byteLength).toBe(63)
+})
+
+test("mdns lists the service records heard from other nodes, and drops the ones gone quiet", () => {
+  const m = new MdnsPeers("_bifrost._tcp", "n1", "10.0.0.1", 8080)
+  const n2 = try encodeResponse(serviceRecords("_bifrost._tcp", "n2", "10.0.0.2", 8081))
+  const other = try encodeResponse(serviceRecords("_other._tcp", "n9", "10.0.0.9", 9000))
+  const self = try encodeResponse(serviceRecords("_bifrost._tcp", "n1", "10.0.0.1", 8080))
+  m.onPacket(n2, 1000.0)
+  m.onPacket(other, 1000.0)
+  m.onPacket(self, 1000.0)
+  const hs = m.peers(1500.0)
+  // another service is left out; this node's own announcement is listed (urls() drops it)
+  expect(hs.length).toBe(2)
+  expect(hs[0]!.host).toBe("10.0.0.2")
+  expect(hs[0]!.port).toBe(8081)
+  expect(hs[1]!.host).toBe("10.0.0.1")
+  expect(m.peers(1000.0 + 30001.0).length).toBe(0)
+})
+
+test("mdns ignores queries it does not answer and packets that are not DNS messages", () => {
+  const m = new MdnsPeers("_bifrost._tcp", "n1", "", 8080)
+  const q = try encodeQuery([{ name: "_bifrost._tcp.local", type: TYPE_PTR }])
+  m.onPacket(q, 1000.0)
+  m.onPacket(utf8("hi"), 1000.0)
+  expect(m.peers(1000.0).length).toBe(0)
+})
+
+test("mdns needs the SRV's target to have an address too", () => {
+  const m = new MdnsPeers("_bifrost._tcp", "n1", "", 8080)
+  const srvOnly = try encodeResponse([{ name: "n2._bifrost._tcp.local", type: TYPE_SRV, ttl: 120, target: "n2.local", port: 8081, addr: "" }])
+  m.onPacket(srvOnly, 1000.0)
+  expect(m.peers(1500.0).length).toBe(0)
+  const aOnly = try encodeResponse([{ name: "n2.local", type: TYPE_A, ttl: 120, target: "", port: 0, addr: "10.0.0.2" }])
+  m.onPacket(aOnly, 1100.0)
+  expect(m.peers(1500.0).length).toBe(1)
 })
