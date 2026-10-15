@@ -34,7 +34,7 @@ import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage } from "./mcp"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName } from "./mcp"
 import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, buildChain } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey } from "./semcache"
@@ -289,6 +289,13 @@ class LastHeaders {
 }
 
 // Bifrost's request type names (core/schemas/bifrost.go), for x-bifrost-request-type.
+// bifrost_mcp_client_operation_duration_seconds for one tool call. The client is the server the
+// namespaced tool name belongs to; a name that does not split keeps an empty client.
+function timedMcp(m: McpManager, name: string, t0: f64, isError: bool): void {
+  const parts = splitToolName(name, m.status().map((s) => s.name))
+  metrics.observeMcp(parts?.server ?? "", parts?.tool ?? name, isError ? "tool_error" : "", (performance.now() - t0) / 1000.0)
+}
+
 // The integration an op came in on, for picking among providers that serve a bare model.
 function routeOf(op: string): string {
   const dot = op.indexOf(".")
@@ -935,6 +942,7 @@ export class Engine {
         if (sel.keyIndex >= 0) {
           const healthy = ok || (status >= 400 && status < 500 && status !== 429 && status !== 408)
           this.health.record(healthId(ref.provider, t.key, sel.keyIndex), healthy, tookMs, Date.now())
+          metrics.observeKeyUp(ref.provider, t.key.id ?? "", t.key.name ?? "", ok)
         }
         metrics.observeRequest(tl, { ok: ok, status: status, errorType: ok ? "" : status === 0 ? "provider_connection_failed" : metrics.errorTypeForStatus(status), retries: retry * 1.0 }, secs)
         const requested = ref.provider + "/" + ref.model
@@ -958,6 +966,7 @@ export class Engine {
         if (d === "fallback") break
         if (d === "rotate") {
           if (sel.keyIndex < 0 || pinned !== undefined) break
+          metrics.observeRotation(ref.provider, ref.model, t.key.id ?? "", t.key.name ?? "", metrics.errorTypeForStatus(status))
           if (soft !== undefined) {
             // the sticky key stopped working: drop the binding and pick normally
             soft = undefined
@@ -1059,7 +1068,9 @@ export class Engine {
     const text = await req.text()
     try {
       const call = executeEndpointBody(text)
+      const t0 = performance.now()
       const result = await m.execute(call.name, call.argumentsJson)
+      timedMcp(m, call.name, t0, result.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", call.name, result.isError ? "error" : "success"), 1.0)
       const r: Record<string, string> = new Map()
       r.set("content-type", "application/json")
@@ -1267,7 +1278,15 @@ export class Engine {
     }
     ctx.contentOff = this.contentOff(h)
     if (this.logStore !== undefined && !ctx.contentOff) ctx.input = text
-    const res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed)
+    // bifrost_active_requests: in flight from here until the answer (or the throw) is out
+    const method = requestType(op, streamed)
+    metrics.activeRequests(method, 1.0)
+    let res: Response = new Response(undefined, { status: 500 })
+    try {
+      res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed)
+    } finally {
+      metrics.activeRequests(method, -1.0)
+    }
     ctx.status = res.status
     this.record(ctx)
     return res
@@ -1580,7 +1599,9 @@ export class Engine {
       return { status: r.status, body: try await r.text() }
     }
     const exec = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
+      const t0 = performance.now()
       const r = try await m.execute(name, args)
+      timedMcp(m, name, t0, r.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", name, r.isError ? "error" : "success"), 1.0)
       return { text: r.text, isError: r.isError }
     }

@@ -79,6 +79,35 @@ async function providerModels(cfg: Config, provider: string): Promise<string[]> 
   return ids
 }
 
+// POST /api/providers/{p}/refresh-models (and .../keys/{id}/refresh-models): lists the models live
+// from the provider, trying each key (or the one named) until one answers, and refreshes the list
+// GET /v1/models serves from. Bifrost returns the keys with their discovery status; Raiju returns
+// the list, as {provider, models, total}.
+async function refreshModels(cfg: Config, provider: string, keyId: string | undefined): Promise<Reply> {
+  const p = providerOf(cfg, provider)
+  if (p === undefined) return { status: 404, body: JSON.stringify({ error: { message: `no provider ${provider}`, type: "invalid_request_error" } }), contentType: "application/json" }
+  const kind = kindOf(provider, p)
+  for (const key of p.keys ?? []) {
+    if (keyId !== undefined && key.id !== keyId) continue
+    const up = upstreamModels(provider, kind, { provider: provider, kind: kind, model: "", key: key, cfg: p })
+    if (up === undefined) continue
+    try {
+      const hs = new Headers()
+      for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+      const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+      const text = await res.text()
+      if (!res.ok) continue
+      const ids = openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/"))
+      modelCache.ids.set(provider, ids)
+      modelCache.fetchedAt.set(provider, Date.now())
+      return { status: 200, body: JSON.stringify({ provider: provider, models: ids, total: ids.length }), contentType: "application/json" }
+    } catch (e) {
+      continue
+    }
+  }
+  return { status: 502, body: JSON.stringify({ error: { message: `no key of ${provider} could list its models`, type: "api_error" } }), contentType: "application/json" }
+}
+
 // GET /v1/models/{model}: the entry from the provider's list, or for a configured provider a
 // minimal entry (some providers list only part of what they serve).
 async function retrieveModel(engine: Engine, req: Request, id: string): Promise<Response> {
@@ -199,6 +228,17 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
     }
   }
   else if (path === "/api/alerts") r = req.method === "GET" ? ops.alertsView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
+  else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path === "/api/logs/histogram") r = ops.logsHistogram(req)
+  else if (path.startsWith("/api/providers/") && path.endsWith("/refresh-models")) {
+    // /api/providers/{p}/refresh-models or /api/providers/{p}/keys/{id}/refresh-models
+    const parts = path.split("/")
+    const isKey = parts.length === 7 && parts[4] === "keys"
+    if (req.method !== "POST") r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
+    else if (!(parts.length === 5 || isKey)) r = { status: 404, body: `{"error":{"message":"no such route","type":"invalid_request_error"}}`, contentType: "application/json" }
+    else r = await refreshModels(ops.store.cfg, parts[3] ?? "", isKey ? parts[5] : undefined)
+  }
   else if (path === "/api/pricing/force-sync") {
     if (req.method === "POST") r = await ops.forcePricing()
     else r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
@@ -371,6 +411,8 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
   if (p.startsWith("/api/oidc/") && m === "GET") return await ops.oidcRoute(req, p)
+  // login and logout come before the gate: they are how a caller gets past it
+  if (p.startsWith("/api/session/")) return await ops.sessionRoute(req, p)
   if (p.startsWith("/api/")) return await manage(ops, req, p)
   // a provider's own API, raw: the key's auth, the rest as the caller sent it (passthrough.tov)
   if (passthroughPath(p)) {

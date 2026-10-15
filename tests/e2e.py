@@ -729,6 +729,25 @@ def main():
         check("provider added", s in (200, 201), b)
         s, _, b = chat("extra/some-model", seed=602)
         check("traffic routes to the new provider", s == 200 and seen()[-1]["auth"] == "Bearer sk-extra-secret", (s, b))
+        # provider refresh-models: the mock's /v1/models answers for the provider's key
+        s, _, b = call("POST", "/api/providers/extra/refresh-models")
+        check("refresh-models lists the provider's models live", s == 200 and "m-a" in b and "m-b" in b, (s, b[:300]))
+        kid = json.loads(call("GET", "/api/providers/extra")[2])["keys"][0]["id"]
+        s, _, b = call("POST", f"/api/providers/extra/keys/{kid}/refresh-models")
+        check("refresh-models for one key", s == 200 and "m-a" in b, (s, b[:300]))
+        s, _, b = call("POST", "/api/providers/nope/refresh-models")
+        check("refresh-models refuses an unknown provider", s == 404, (s, b[:200]))
+        s, _, b = call("GET", "/api/models/base?limit=5")
+        bj = json.loads(b) if s == 200 else {"models": [], "total": 0}
+        check("models/base lists distinct base models, paged", s == 200 and 0 < len(bj["models"]) <= 5 and bj["total"] >= len(bj["models"]), (s, b[:200]))
+        s, _, b = call("GET", "/api/models/details?provider=openai&limit=3")
+        dj = json.loads(b) if s == 200 else {"models": []}
+        check("models/details lists priced rows of one provider", s == 200 and 0 < len(dj["models"]) <= 3 and all(m["provider"] == "openai" for m in dj["models"]), (s, b[:200]))
+        s, _, b = call("GET", "/api/circuit-breaker/state")
+        check("circuit-breaker state is Bifrost's circuits map", s == 200 and b.startswith('{"circuits":{'), (s, b[:200]))
+        s, _, b = call("GET", "/api/logs/histogram")
+        hj = json.loads(b) if s == 200 else {"buckets": [], "bucket_size_seconds": 0}
+        check("log histogram counts the requests just made", s == 200 and sum(x["count"] for x in hj["buckets"]) > 0 and hj["bucket_size_seconds"] == 3600, (s, b[:200]))
         saved = open(config).read()
         check("saved config keeps env references and new keys", "env.E2E_OPENAI_KEY" in saved and "sk-from-env" not in saved and "sk-extra-secret" in saved, saved[:200])
         s, _, b = call("POST", "/api/governance/budgets", {"id": "b-bad", "max_limit": -1, "reset_duration": "1d"})
@@ -1003,6 +1022,20 @@ def main():
         check("Bifrost's auth_config admin credentials pass inference auth", s == 200, s)
         s, _, _ = call("GET", "/api/config", base=BGW, auth=False, headers={"authorization": "Basic YWRtaW46cHc="})
         check("Bifrost's auth_config guards the management API", s == 200 and call("GET", "/api/config", base=BGW, auth=False)[0] == 401, s)
+        # /api/session/*: login issues a UI session token, the token opens the API, logout drops it
+        s, _, b = call("POST", "/api/session/login", {"username": "admin", "password": "pw"}, base=BGW, auth=False)
+        stok = json.loads(b).get("token", "") if s == 200 else ""
+        check("session login issues a session token", s == 200 and stok.startswith("sk-sess-"), (s, b[:200]))
+        s2, _, b2 = call("POST", "/api/session/login", {"username": "admin", "password": "wrong"}, base=BGW, auth=False)
+        check("session login refuses a wrong password", s2 == 401, (s2, b2[:200]))
+        SH = {"authorization": "Bearer " + stok}
+        s3, _, b3 = call("GET", "/api/session/is-auth-enabled", base=BGW, auth=False, headers=SH)
+        check("is-auth-enabled reports the session token as valid", s3 == 200 and '"has_valid_token":true' in b3 and '"is_auth_enabled":true' in b3, (s3, b3[:300]))
+        s4, _, _ = call("GET", "/api/config", base=BGW, auth=False, headers=SH)
+        check("the session token opens the management API", s4 == 200, s4)
+        s5, _, _ = call("POST", "/api/session/logout", base=BGW, auth=False, headers=SH)
+        s6, _, _ = call("GET", "/api/config", base=BGW, auth=False, headers=SH)
+        check("logout drops the session token", s5 == 200 and s6 == 401, (s5, s6))
         s, _, b = bchat("openai/gpt-4o-mini", BK, "something forbidden")
         check("Bifrost's guardrails_config is enforced", s == 400 and "forbidden topic" in b, (s, b))
         SK = {**BK, "x-bf-cache-key": "e2e"}
@@ -1172,6 +1205,9 @@ def main():
               all(f in b for f in ["bifrost_success_requests_total{", "bifrost_error_requests_total{", "bifrost_stream_first_token_latency_seconds_bucket{", "http_requests_total{path=\"/v1/chat/completions\""])
               and _re.search(r'bifrost_success_requests_total\{[^}]*method="chat_completion"[^}]*virtual_key_id="', b) is not None
               and _re.search(r'bifrost_error_requests_total\{[^}]*status_code="5\d\d"', b) is not None, b[:800])
+        check("Bifrost gauge and key families",
+              "# TYPE bifrost_active_requests gauge" in b and 'bifrost_active_requests{method="chat_completion"} 0' in b
+              and _re.search(r'bifrost_provider_key_up\{provider="openai",key_id="[^"]*",key_name="[^"]*"\} [01]', b) is not None, b[:800])
 
         s, _, b = call("POST", "/v1/chat/completions", "{not json")
         check("bad JSON is a 400", s == 400, b)

@@ -6,6 +6,7 @@ import { parseDatasheet } from "./pricing"
 import { OtelConfig, TlsOpts, otelTls } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { Engine } from "./gateway"
+import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { ConfigStore, checkAdmin } from "./store"
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, allowed } from "./rbac"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
@@ -20,17 +21,44 @@ import { resolveAll } from "./secrets"
 import { fields, find, rawStr, isNull } from "./json"
 import { snapshot, errorJson } from "./schemas"
 import { deadline } from "./deadline"
-import { secureHex } from "./crypto"
+import { secureHex, utf8 } from "./crypto"
+import * as b64 from "./base64"
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs"
 import { Counters, ClusterConfig, syncInterval } from "./cluster"
 import * as cluster from "./cluster"
-import { ExportCursor, objectKey, putRequest, exportInterval } from "./exports"
+import { ExportCursor, objectKey, putRequest, exportInterval, isoMs } from "./exports"
 import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
 
 export type Reply = { status: int, body: string, contentType: string }
+
+// A query value as epoch milliseconds; the fallback when it is missing or not a number.
+function epochParam(raw: string | undefined, fallback: f64): f64 {
+  if (raw === undefined || raw === "") return fallback
+  const v: f64 = Number(raw) ?? -1.0
+  return v >= 0.0 && v < 1e15 ? v : fallback
+}
+
+// Bifrost's histogram bucket size for a time span (logstore DefaultBucketSize), in seconds.
+function histogramBucketSeconds(spanMs: f64): f64 {
+  const day = 86400000.0
+  if (spanMs >= 365.0 * day) return 30.0 * 86400.0
+  if (spanMs >= 90.0 * day) return 7.0 * 86400.0
+  if (spanMs > 31.0 * day) return 3.0 * 86400.0
+  if (spanMs >= 7.0 * day) return 86400.0
+  if (spanMs >= 3.0 * day) return 8.0 * 3600.0
+  if (spanMs >= day) return 3600.0
+  if (spanMs >= 7200000.0) return 600.0
+  return 60.0
+}
+
+// Ascending by name: the order of the model lists.
+function byName(a: string, b: string): int {
+  if (a === b) return 0
+  return a < b ? -1 : 1
+}
 
 function json(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
@@ -476,6 +504,141 @@ export class Ops {
     return { status: 200, body: JSON.stringify({ status: "success", message: "pricing synced successfully" }), contentType: "application/json" }
   }
 
+  // ---- /api/session/*: login, logout and the auth state ----
+
+  // Open routes (they run before the gate, since login is how a caller gets through it). Login
+  // checks a user's password and issues a UI session token, the kind SSO sign-in issues; the token
+  // goes in the body, where Bifrost sets a cookie. Logout drops a session token.
+  async sessionRoute(req: Request, path: string): Promise<Response> {
+    const m = req.method
+    const auth = req.headers.get("authorization") ?? ""
+    const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : ""
+    const now = Date.now()
+    if (path === "/api/session/is-auth-enabled") {
+      if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
+      const valid = bearer !== "" && this.sessions.get(bearer, now) !== undefined
+      const enforced = this.store.cfg.client?.enforce_auth_on_inference ?? false
+      return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: false, setup_token_configured: false }))
+    }
+    if (path === "/api/session/login") {
+      if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
+      if (!this.authOn) return json(403, errorJson("Authentication is not enabled", "invalid_request_error", undefined))
+      let who: { username?: string, password?: string } = {}
+      try {
+        who = JSON.parse(await req.text()) as { username?: string, password?: string }
+      } catch (e) {
+        return json(400, errorJson("Invalid request payload", "invalid_request_error", undefined))
+      }
+      const hs: Map<string, string> = new Map()
+      hs.set("authorization", "Basic " + b64.encode(utf8((who?.username ?? "") + ":" + (who?.password ?? ""))))
+      const id = authenticate(this.rbac, hs)
+      // audited without the body, which holds the password
+      if (id.kind !== "user") {
+        this.recordChange("unauthenticated", req, path, 401, "")
+        return json(401, errorJson("invalid username or password", "invalid_request_error", undefined))
+      }
+      this.recordChange(id.name, req, path, 200, "")
+      let token = ""
+      try {
+        token = this.sessions.create(id.name, id.role, now)
+      } catch (e) {
+        return json(500, errorJson("could not create a session", "api_error", undefined))
+      }
+      return json(200, JSON.stringify({ message: "Login successful", token: token, username: id.name, role: id.role, expires_in: this.sessions.ttlSeconds }))
+    }
+    if (path === "/api/session/logout") {
+      if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
+      if (bearer !== "") this.sessions.delete(bearer)
+      return json(200, JSON.stringify({ message: "Logged out successfully" }))
+    }
+    return json(404, errorJson(`no route ${path}`, "invalid_request_error", undefined))
+  }
+
+  // ---- the priced models, the circuit states and the log histogram ----
+
+  // GET /api/models/base (distinct base model names) and /api/models/details (one row per priced
+  // model with its prices), from the price datasheet. query filters by a case-insensitive
+  // substring; limit (default 20) and offset page the list.
+  catalogView(req: Request, path: string): Reply {
+    if (req.method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    const u = URL.parse(req.url)
+    const sp = u === undefined ? new URLSearchParams("") : u.searchParams
+    const lim: f64 = parseFloat(sp.get("limit") ?? "20") ?? 20.0
+    const off: f64 = parseFloat(sp.get("offset") ?? "0") ?? 0.0
+    const limit = lim >= 0 ? Math.floor(lim) : 20
+    const offset = off >= 0 ? Math.floor(off) : 0
+    const q = (sp.get("query") ?? "").toLowerCase()
+    const rows = this.engine.pricing.catalog.rows
+    if (path === "/api/models/base") {
+      const names: string[] = []
+      for (const k of rows.keys()) {
+        const b = rows.get(k)!.baseModel
+        if (b === "" || names.includes(b) || (q !== "" && !b.toLowerCase().includes(q))) continue
+        names.push(b)
+      }
+      names.sort(byName)
+      return { status: 200, body: JSON.stringify({ models: names.slice(offset, offset + limit), total: names.length }), contentType: "application/json" }
+    }
+    const provider = sp.get("provider") ?? ""
+    const out: { name: string, provider: string, input_cost_per_token: f64, output_cost_per_token: f64, cache_read_input_token_cost?: f64, cache_creation_input_token_cost?: f64 }[] = []
+    for (const k of rows.keys()) {
+      const r = rows.get(k)!
+      const pre = r.provider + "/"
+      const name = k.startsWith(pre) ? k.slice(pre.byteLength) : k
+      if (provider !== "" && r.provider !== provider) continue
+      if (q !== "" && !name.toLowerCase().includes(q)) continue
+      out.push({ name: name, provider: r.provider, input_cost_per_token: r.price.input, output_cost_per_token: r.price.output, cache_read_input_token_cost: r.price.cacheRead, cache_creation_input_token_cost: r.price.cacheWrite })
+    }
+    out.sort((a, b) => byName(a.provider + "/" + a.name, b.provider + "/" + b.name))
+    return { status: 200, body: JSON.stringify({ models: out.slice(offset, offset + limit), total: out.length }), contentType: "application/json" }
+  }
+
+  // GET /api/circuit-breaker/state: the targets whose breaker is open or half-open, keyed by target
+  // id (provider#key). Bifrost keys its circuits by policy; Raiju has one breaker per key. Closed
+  // circuits are left out, as Bifrost's snapshot leaves them out.
+  circuitView(): Reply {
+    const parts: string[] = []
+    for (const t of this.engine.health.snapshot(Date.now())) {
+      if (t.state === "closed") continue
+      parts.push(JSON.stringify(t.id) + ":" + JSON.stringify(t.state))
+    }
+    return { status: 200, body: `{"circuits":{${parts.join(",")}}}`, contentType: "application/json" }
+  }
+
+  // GET /api/logs/histogram: request counts per time bucket, in Bifrost's shape. start_time and
+  // end_time are epoch milliseconds (the log store's own clock); the default is the last 24 hours.
+  // Buckets with no requests are included. success is 2xx, cancelled is 499, error is the rest.
+  logsHistogram(req: Request): Reply {
+    if (req.method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    const store = this.engine.logStore
+    if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
+    const u = URL.parse(req.url)
+    const sp = u === undefined ? new URLSearchParams("") : u.searchParams
+    const end = epochParam(sp.get("end_time") ?? undefined, Date.now())
+    const start = epochParam(sp.get("start_time") ?? undefined, end - 86400000.0)
+    if (start >= end) return { status: 400, body: errorJson("start_time must be before end_time", "invalid_request_error", undefined), contentType: "application/json" }
+    const sizeSec = histogramBucketSeconds(end - start)
+    const step = sizeSec * 1000.0
+    const first = Math.floor(start / step) * step
+    const n = Math.ceil((end - first) / step)
+    if (n > 10000) return { status: 400, body: errorJson("too many buckets; narrow the time range", "invalid_request_error", undefined), contentType: "application/json" }
+    const counts: { count: int, success: int, error: int, cancelled: int }[] = []
+    for (let i = 0; i < n; i++) counts.push({ count: 0, success: 0, error: 0, cancelled: 0 })
+    // counts are values in Tov: write through the index, not through a copy
+    for (const e of store.since(first - 1.0)) {
+      if (e.ts >= end) continue
+      const i = Math.floor((e.ts - first) / step)
+      if (i < 0 || i >= n) continue
+      counts[i]!.count += 1
+      if (e.status === 499) counts[i]!.cancelled += 1
+      else if (e.status >= 200 && e.status < 300) counts[i]!.success += 1
+      else counts[i]!.error += 1
+    }
+    const buckets: { timestamp: string, count: int, success: int, error: int, cancelled: int }[] = []
+    for (let i = 0; i < n; i++) buckets.push({ timestamp: isoMs(first + i * step), count: counts[i]!.count, success: counts[i]!.success, error: counts[i]!.error, cancelled: counts[i]!.cancelled })
+    return { status: 200, body: JSON.stringify({ buckets: buckets, bucket_size_seconds: sizeSec }), contentType: "application/json" }
+  }
+
   // ---- log exporters (Datadog, Splunk, Elasticsearch, HTTP) ----
 
   configureExporters(list: LogExporterConfig[]): void {
@@ -890,3 +1053,64 @@ async function sendAlert(url: string, headers: Map<string, string>, body: string
   }
   dl.finish()
 }
+
+// ---- tests ----
+
+test("epoch params and histogram bucket sizes follow the store's rule", () => {
+  expect(epochParam(undefined, 7.0)).toBe(7.0)
+  expect(epochParam("", 7.0)).toBe(7.0)
+  expect(epochParam("abc", 7.0)).toBe(7.0)
+  expect(epochParam("1500", 7.0)).toBe(1500.0)
+  expect(histogramBucketSeconds(30.0 * 60000.0)).toBe(60.0)
+  expect(histogramBucketSeconds(3.0 * 3600000.0)).toBe(600.0)
+  expect(histogramBucketSeconds(2.0 * 86400000.0)).toBe(3600.0)
+  expect(histogramBucketSeconds(8.0 * 86400000.0)).toBe(86400.0)
+  expect(histogramBucketSeconds(40.0 * 86400000.0)).toBe(3.0 * 86400.0)
+  expect(histogramBucketSeconds(100.0 * 86400000.0)).toBe(7.0 * 86400.0)
+})
+
+test("model catalog views list base models and priced rows, filtered and paged", () => {
+  const ops = new Ops(new Engine({}), new ConfigStore("/tmp/raiju-ops-catalog.json", {}))
+  const base = ops.catalogView(new Request("http://raiju.test/api/models/base?query=gpt&limit=3"), "/api/models/base")
+  expect(base.status).toBe(200)
+  expect(base.body.includes("\"models\":[")).toBe(true)
+  expect(base.body.includes("gpt")).toBe(true)
+  const det = ops.catalogView(new Request("http://raiju.test/api/models/details?provider=openai&limit=2"), "/api/models/details")
+  expect(det.status).toBe(200)
+  expect(det.body.includes("\"provider\":\"openai\"")).toBe(true)
+  expect(det.body.includes("\"provider\":\"anthropic\"")).toBe(false)
+  expect(ops.catalogView(new Request("http://raiju.test/api/models/details", { method: "POST" }), "/api/models/details").status).toBe(405)
+})
+
+test("circuit view lists only the circuits that are not closed", () => {
+  const eng = new Engine({})
+  const ops = new Ops(eng, new ConfigStore("/tmp/raiju-ops-circuit.json", {}))
+  expect(ops.circuitView().body).toBe(`{"circuits":{}}`)
+  for (let i = 0; i < 20; i++) eng.health.record("openai#k1", false, 100.0, Date.now())
+  expect(ops.circuitView().body.includes("\"openai#k1\":\"open\"")).toBe(true)
+})
+
+test("log histogram counts requests per bucket by status", () => {
+  const dir = "/tmp/raiju-ops-hist-" + (try secureHex(6))
+  try mkdirSync(dir, { recursive: true })
+  const eng = new Engine({})
+  eng.logStore = try new LogStore(defaultLogStoreConfig(dir))
+  const t0 = Math.floor(Date.now() / 60000.0) * 60000.0
+  const entry = (ts: f64, status: int): LogEntry => ({ id: "l" + ts + "-" + status, ts: ts, request_id: "r", op: "chat", provider: "openai", model: "gpt-4o", status: status, latency_ms: 1.0, prompt_tokens: 1, completion_tokens: 1, cost: 0.0, cache_hit: false })
+  eng.logStore!.add(entry(t0 + 1000.0, 200))
+  eng.logStore!.add(entry(t0 + 2000.0, 200))
+  eng.logStore!.add(entry(t0 + 3000.0, 500))
+  eng.logStore!.add(entry(t0 + 61000.0, 499))
+  const ops = new Ops(eng, new ConfigStore("/tmp/raiju-ops-hist.json", {}))
+  const r = ops.logsHistogram(new Request(`http://raiju.test/api/logs/histogram?start_time=${t0}&end_time=${t0 + 120000.0}`))
+  expect(r.status).toBe(200)
+  const h = try JSON.parse(r.body) as { buckets: { count: int, success: int, error: int, cancelled: int }[], bucket_size_seconds: int }
+  expect(h.bucket_size_seconds).toBe(60)
+  expect(h.buckets.length).toBe(2)
+  expect(h.buckets[0]!.count).toBe(3)
+  expect(h.buckets[0]!.success).toBe(2)
+  expect(h.buckets[0]!.error).toBe(1)
+  expect(h.buckets[1]!.cancelled).toBe(1)
+  expect(ops.logsHistogram(new Request(`http://raiju.test/api/logs/histogram?start_time=${t0 + 5.0}&end_time=${t0}`)).status).toBe(400)
+  try rmSync(dir, { recursive: true, force: true })
+})

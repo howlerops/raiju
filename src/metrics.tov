@@ -38,6 +38,11 @@ const RETRY_BUCKETS: Buckets = {
   bounds: [0, 1, 2, 3, 5, 10],
   les: ["0", "1", "2", "3", "5", "10"],
 }
+// mcpOperationDurationBuckets: the OTel MCP semconv boundaries.
+const MCP_BUCKETS: Buckets = {
+  bounds: [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 120, 300],
+  les: ["0.01", "0.02", "0.05", "0.1", "0.2", "0.5", "1", "2", "5", "10", "30", "60", "120", "300"],
+}
 
 function bucketsFor(name: string): Buckets {
   if (name === "bifrost_upstream_latency_seconds" || name === "http_request_duration_seconds") return UPSTREAM_BUCKETS
@@ -46,6 +51,7 @@ function bucketsFor(name: string): Buckets {
   if (name === "bifrost_stream_inter_token_latency_seconds") return INTER_TOKEN_BUCKETS
   if (name === "http_request_size_bytes" || name === "http_response_size_bytes") return SIZE_BUCKETS
   if (name === "bifrost_request_retries") return RETRY_BUCKETS
+  if (name === "bifrost_mcp_client_operation_duration_seconds") return MCP_BUCKETS
   return RAIJU_BUCKETS
 }
 
@@ -72,6 +78,10 @@ const HELP: Help[] = [
   { name: "bifrost_stream_inter_token_latency_seconds", text: "Latency of the intermediate tokens of a stream response." },
   { name: "bifrost_stream_first_token_latency_seconds", text: "Latency of the first token of a stream response." },
   { name: "bifrost_request_retries", text: "Number of retries used per request (observed once per request)." },
+  { name: "bifrost_active_requests", text: "Number of LLM requests currently in-flight." },
+  { name: "bifrost_provider_key_up", text: "Health of a provider key. 1 = last attempt succeeded, 0 = last attempt failed." },
+  { name: "bifrost_key_rotation_events_total", text: "Number of key rotations, broken down by provider, key, and failure reason. One increment per per-key failure (rate limit, rejected credential, exhausted quota, model access, retired model, region block) that triggered a switch to a different key on the next retry." },
+  { name: "bifrost_mcp_client_operation_duration_seconds", text: "Duration of an MCP tool call as observed by Bifrost (the MCP client)." },
 ]
 
 function helpFor(name: string): string {
@@ -467,6 +477,46 @@ export function observeHttp(path: string, method: string, status: int, durationS
   observe("http_request_size_bytes", l, reqBytes)
   observe("http_response_size_bytes", l, respBytes)
 }
+
+// Labels of the per-key families (bifrost_provider_key_up, bifrost_key_rotation_events_total).
+export function keyLabels(provider: string, keyId: string, keyName: string): string {
+  return `provider="${esc(provider)}",key_id="${esc(keyId)}",key_name="${esc(keyName)}"`
+}
+
+// bifrost_provider_key_up: 1 when the key's last attempt succeeded, 0 when it failed.
+export function observeKeyUp(provider: string, keyId: string, keyName: string, ok: bool): void {
+  setGauge("bifrost_provider_key_up", keyLabels(provider, keyId, keyName), ok ? 1.0 : 0.0)
+}
+
+// bifrost_key_rotation_events_total: a failed attempt on one key that moved the request to another.
+export function observeRotation(provider: string, model: string, keyId: string, keyName: string, reason: string): void {
+  inc("bifrost_key_rotation_events_total", `provider="${esc(provider)}",requested_model="${esc(model)}",key_id="${esc(keyId)}",key_name="${esc(keyName)}",fail_reason="${esc(reason)}"`, 1.0)
+}
+
+// bifrost_active_requests: by is +1 when a request starts and -1 when it ends.
+export function activeRequests(method: string, by: f64): void {
+  addGauge("bifrost_active_requests", `method="${esc(method)}"`, by)
+}
+
+// bifrost_mcp_client_operation_duration_seconds: one MCP tool call, timed at the client.
+export function observeMcp(client: string, tool: string, errorType: string, seconds: f64): void {
+  observe("bifrost_mcp_client_operation_duration_seconds", `mcp_client="${esc(client)}",mcp_tool_name="${esc(tool)}",mcp_method="tools/call",error_type="${esc(errorType)}"`, seconds)
+}
+
+test("key, active-request, rotation and MCP families carry Bifrost names and labels", () => {
+  observeKeyUp("openai", "key-1", "primary", false)
+  observeRotation("openai", "gpt-4o", "key-1", "primary", "provider_rate_limited")
+  activeRequests("chat_completion", 1.0)
+  activeRequests("chat_completion", -1.0)
+  observeMcp("fs", "fs__read", "", 0.15)
+  const text = render()
+  expect(text.includes("# TYPE bifrost_provider_key_up gauge\n")).toBe(true)
+  expect(text.includes(`bifrost_provider_key_up{provider="openai",key_id="key-1",key_name="primary"} 0`)).toBe(true)
+  expect(text.includes(`bifrost_key_rotation_events_total{provider="openai",requested_model="gpt-4o",key_id="key-1",key_name="primary",fail_reason="provider_rate_limited"} 1`)).toBe(true)
+  expect(text.includes(`bifrost_active_requests{method="chat_completion"} 0`)).toBe(true)
+  expect(text.includes(`bifrost_mcp_client_operation_duration_seconds_bucket{mcp_client="fs",mcp_tool_name="fs__read",mcp_method="tools/call",error_type="",le="0.2"} 1`)).toBe(true)
+  expect(text.includes(`bifrost_mcp_client_operation_duration_seconds_count{mcp_client="fs"`)).toBe(true)
+})
 
 test("bifrost request family carries Bifrost names, labels and HELP", () => {
   let l = newLabels("openai", "gpt-4o", "chat_completion")
