@@ -739,7 +739,7 @@ Ordered by importance. Each gap says what to build and where Bifrost defines it.
 
 - **G4. Budgets and rate limits do not enforce for models outside the built-in price table.** `pricing.tov` covers 15 models. `cost()` returns 0 for any other model (`src/pricing.tov:56-58`), so a budget on those models never runs down. Add a Bifrost-compatible price catalog (default datasheet `framework/modelcatalog/config.go:109`, `pricing_url` and `pricing_sync_interval` in `config.schema.json` framework.pricing), plus `governance.pricing_overrides` (`docs/providers/custom-pricing.mdx`). Until then, refuse or warn when a budgeted request hits an unpriced model. Ledger task. **Status: Partial.** Built-in datasheet and opt-in sync are in place (commit 0c999ff). Models outside the datasheet still cost 0 and skip budgets. The only response is a one-time warning (`src/gateway.tov`, `unpriced`). No refusal.
 
-- **G5. OpenAI SDK route is incomplete.** Mount `/openai/v1/audio/*`, `/openai/v1/images/*`, `/openai/v1/files*`, `/openai/v1/batches*`, `/openai/v1/responses/{id}` (GET, DELETE, cancel, input_items), `/openai/v1/responses/input_tokens`, `/openai/v1/responses/compact`, `/openai/v1/models/{id}`, and the deployment variants for embeddings, images, audio, responses and models. `compatPath` should map `/openai/v1/` onto the `/v1/` routes, as it already does for `/litellm/` and `/langchain/`. Bifrost: `transports/bifrost-http/integrations/openai.go` (`CreateOpenAIRouteConfigs`, paths `/openai/v1/...`), `docs/openapi/openapi.json`. Raiju: `src/server.tov:167-202`, `171-194`, `src/media.tov:23-41`. Ledger task. **Status: Partial.** `/openai/v1` routes are done (commit 896b797). Deployment variants for embeddings, images, audio, responses and models are missing. Only chat is routed for deployments.
+- **G5. OpenAI SDK route is incomplete.** Mount `/openai/v1/audio/*`, `/openai/v1/images/*`, `/openai/v1/files*`, `/openai/v1/batches*`, `/openai/v1/responses/{id}` (GET, DELETE, cancel, input_items), `/openai/v1/responses/input_tokens`, `/openai/v1/responses/compact`, `/openai/v1/models/{id}`, and the deployment variants for embeddings, images, audio, responses and models. `compatPath` should map `/openai/v1/` onto the `/v1/` routes, as it already does for `/litellm/` and `/langchain/`. Bifrost: `transports/bifrost-http/integrations/openai.go` (`CreateOpenAIRouteConfigs`, paths `/openai/v1/...`), `docs/openapi/openapi.json`. Raiju: `src/server.tov:167-202`, `171-194`, `src/media.tov:23-41`. Ledger task. **Status: Done.** `/openai/deployments/{d}/*` for chat (streaming too), completions, embeddings, responses (input_tokens, compact), images (generations, edits, variations) and audio; the models variant is not registered by Bifrost either.
 
 - **G6. Bedrock SDK streaming routes.** Add `POST /bedrock/model/{id}/converse-stream` and `/invoke-with-response-stream`, with event-stream framing. Reuse `bedrock.tov` `streamRequest` (`src/providers/index.tov:70`). Today `bedrockModel` returns 404 for any action other than converse or invoke (`src/native.tov:234`). Bifrost: `transports/bifrost-http/integrations/bedrock.go:68-125` and `118-200`. Ledger task. **Status: Done** (commit 0b03e53).
 
@@ -840,17 +840,16 @@ Ordered by importance. Each gap says what to build and where Bifrost defines it.
 ## Top 15 gaps (after the re-audit)
 
 1. G4. Models outside the datasheet cost 0 and skip budgets; the response is a warning, not a refusal (P0).
-2. G5. Deployment variants for embeddings, images, audio, responses and models are not routed (P0).
-3. G16. Files, batches and media for Vertex, Bedrock and Cohere, Gemini STT, and the batch results route (P1).
-4. G17. Remaining x-bifrost-* response headers, including retry-after-ms (P1).
-5. G18. Routing, key-rotation, active-request, provider-key-up, MCP-duration and overhead-component metric families; request_retries is always 0 (P1).
-6. G11. GenAI `:predict`, operations, files, batches, cachedContents and `/genai/v1/rank` (P1).
-7. G12. Bedrock count-tokens is an estimate, and `/bedrock/rerank` is missing (P1).
-8. G22. MCP verification and OAuth management routes answer 501; tool_sync_interval does nothing (P1).
-9. G25. Bedrock inference-profile arn, batch S3 settings and use_openai_endpoints (P1).
-10. G27. bedrock_mantle refuses Anthropic-family models (P1).
-11. G30. Semantic cache: two plugin fields ignored; Weaviate, Pinecone and chromem not supported (P1).
-12. G29. OpenTelemetry over gRPC is not spoken (P1).
-13. G32. SCOPE.md overstates parity in its wording; the doc is out of date (doc task).
+2. G16. Files, batches and media for Vertex, Bedrock and Cohere, Gemini STT, and the batch results route (P1).
+3. G17. Remaining x-bifrost-* response headers, including retry-after-ms (P1).
+4. G18. Routing, key-rotation, active-request, provider-key-up, MCP-duration and overhead-component metric families; request_retries is always 0 (P1).
+5. G11. GenAI `:predict`, operations, files, batches, cachedContents and `/genai/v1/rank` (P1).
+6. G12. Bedrock count-tokens is an estimate, and `/bedrock/rerank` is missing (P1).
+7. G22. MCP verification and OAuth management routes answer 501; tool_sync_interval does nothing (P1).
+8. G25. Bedrock inference-profile arn, batch S3 settings and use_openai_endpoints (P1).
+9. G27. bedrock_mantle refuses Anthropic-family models (P1).
+10. G30. Semantic cache: two plugin fields ignored; Weaviate, Pinecone and chromem not supported (P1).
+11. G29. OpenTelemetry over gRPC is not spoken (P1).
+12. G32. SCOPE.md overstates parity in its wording; the doc is out of date (doc task).
 
 P2 decisions still open: G36, G37, G40 to G46. Partial P2 items: G35, G39, G47, G48.

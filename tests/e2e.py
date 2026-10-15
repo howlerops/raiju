@@ -977,6 +977,37 @@ def main():
         s, _, b = call("POST", "/v1/ocr", {"model": "openai/mistral-ocr-latest", "document": {"type": "document_url", "document_url": "https://example.com/a.pdf"}})
         check("OCR passes through", s == 200 and seen()[-1]["path"] == "/v1/ocr" and json.loads(seen()[-1]["body"])["model"] == "mistral-ocr-latest", (s, b, seen()[-1]))
 
+        # Azure-style deployment paths (Bifrost's /openai/deployments/{deployment}/{op}): the deployment is the
+        # model ("azure/{deployment}", or "{provider}/{deployment}"), the caller's api-version is ignored, and the
+        # call reaches the /v1 route of its operation. The mock records the deployment call, then the /v1 call.
+        DEP = "/openai/deployments/"
+        CHAT = [{"role": "user", "content": "hi"}]
+        s, _, b = call("POST", DEP + "prod-4o/chat/completions?api-version=2024-02-15-preview", {"model": "ignored", "messages": CHAT})
+        up = seen()
+        check("deployment chat: azure/{deployment} is the model, the caller's api-version is dropped", s == 200 and "Hello from prod-4o" in b and up[-2]["path"] == DEP + "prod-4o/chat/completions?api-version=2024-10-21" and up[-1]["path"] == "/v1/chat/completions" and json.loads(up[-1]["body"])["model"] == "prod-4o", (s, b, up[-2:]))
+        s, _, b = call("POST", DEP + "openai/gpt-4o-mini/chat/completions", {"model": "ignored", "messages": CHAT})
+        check("deployment chat: provider/deployment is the model", s == 200 and "Hello from gpt-4o-mini" in b and seen()[-1]["path"] == "/v1/chat/completions" and json.loads(seen()[-1]["body"])["model"] == "gpt-4o-mini", (s, b, seen()[-1]))
+        s, _, b = call("POST", DEP + "prod-4o/chat/completions", {"model": "ignored", "stream": True, "messages": CHAT})
+        check("deployment chat streams", s == 200 and '"content":"Hel"' in b and b.rstrip().endswith("data: [DONE]") and json.loads(seen()[-1]["body"])["model"] == "prod-4o", (s, b[:300]))
+        s, _, b = call("POST", DEP + "openai/gpt-4o-mini/chat/completions", {"model": "ignored", "stream": True, "messages": CHAT})
+        check("deployment chat with provider/deployment streams", s == 200 and '"content":"Hel"' in b and b.rstrip().endswith("data: [DONE]"), (s, b[:300]))
+        s, _, b = call("POST", DEP + "prod-emb/embeddings", {"model": "ignored", "input": "hello"})
+        check("deployment embeddings", s == 200 and '"embedding"' in b and seen()[-1]["path"] == "/v1/embeddings" and json.loads(seen()[-1]["body"])["model"] == "prod-emb", (s, b[:200], seen()[-1:]))
+        s, _, b = call("POST", DEP + "prod-img/images/generations", {"model": "ignored", "prompt": "a red fox", "n": 1})
+        check("deployment images", s == 200 and "fox.png" in b and seen()[-1]["path"] == "/v1/images/generations" and json.loads(seen()[-1]["body"])["model"] == "prod-img", (s, b, seen()[-1:]))
+        req = urllib.request.Request(GW + DEP + "prod-tts/audio/speech", data=json.dumps({"model": "ignored", "input": "hi", "voice": "alloy"}).encode(), method="POST", headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as res:
+            audio = res.read(); ctype = res.headers.get("content-type")
+        check("deployment speech returns the audio bytes", audio == bytes([0x49, 0x44, 0x33, 0xff, 0xfb, 0x90, 0x00, 0x80, 0xc3, 0x28]) and ctype == "audio/mpeg" and json.loads(seen()[-1]["body"])["model"] == "prod-tts", (audio, ctype, seen()[-1:]))
+        s, b = multipart(DEP + "prod-stt/audio/transcriptions", "clip.wav", b"RIFF-fake-audio", {"model": "whisper-1", "response_format": "json"})
+        check("deployment transcription: the deployment replaces the form's model", s == 200 and "transcribed by prod-stt" in b and seen()[-1]["path"] == "/v1/audio/transcriptions" and json.loads(seen()[-1]["body"])["model"] == "prod-stt", (s, b, seen()[-1:]))
+        s, _, b = call("POST", DEP + "openai/gpt-4o/responses", {"model": "ignored", "input": "hi"})
+        check("deployment responses", s == 200 and "native responses" in b and seen()[-1]["path"] == "/v1/responses" and json.loads(seen()[-1]["body"])["model"] == "gpt-4o", (s, b, seen()[-1:]))
+        s, _, b = call("POST", DEP + "prod-resp/responses", {"model": "ignored", "input": "hi"})
+        check("deployment responses through the chat bridge for azure", s == 200 and "Hello from prod-resp" in b, (s, b))
+        s, _, _ = call("GET", DEP + "prod-4o/models")
+        check("deployment models is not routed, as in Bifrost", s == 404, s)
+
         # the workers of one node share rate limits and the response cache
         if os.environ.get("RAIJU_SERVER", "bun") == "bun":
             wait("http://127.0.0.1:18094/health")
