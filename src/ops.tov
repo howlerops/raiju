@@ -1,12 +1,15 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, PluginSpec } from "./config"
+import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page } from "./logapi"
+import { WsTickets } from "./wsticket"
+import { entryStatus, PluginEntry } from "./plugins"
 import { parseDatasheet } from "./pricing"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { Engine } from "./gateway"
-import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, gridOf, filterFrom, selectAll, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
 import { CircuitPolicyConfig, VirtualKeyConfig } from "./config"
@@ -27,7 +30,7 @@ import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
 import { Field, fields, find, rawStr, rawBool, isNull, elements } from "./json"
 import { trimSlash } from "./providers/types"
-import { snapshot, errorJson, Hdrs } from "./schemas"
+import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { deadline } from "./deadline"
 import { secureHex, utf8 } from "./crypto"
 import * as b64 from "./base64"
@@ -47,6 +50,52 @@ import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discovery
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
 
 export type Reply = { status: int, body: string, contentType: string }
+
+// The last cost recalculation: its id, how many entries it priced and how many of them changed.
+export type RecalcRun = { id: string, processed: int, updated: int, startedAt: string, finishedAt: string }
+
+// The filters of POST /api/logs/recalculate-cost, in Bifrost's names.
+export type RecalcFilters = { providers?: string[], models?: string[], virtual_key_ids?: string[], user_ids?: string[], team_ids?: string[], period?: string, start_time?: string, end_time?: string, missing_cost_only?: bool }
+
+// One configured plugin as Bifrost's plugin response: its name, whether it is on, its config and its status.
+function pluginJson(sp: PluginSpec): string {
+  const config = sp.config_json ?? ""
+  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config })
+  const builtin = builtinPlugins().includes(sp.name)
+  return jobj([
+    jkv("name", JSON.stringify(sp.name)),
+    jkv("actualName", JSON.stringify(sp.name)),
+    jkv("enabled", sp.enabled === false ? "false" : "true"),
+    jkv("config", config.trim() === "" ? "{}" : config),
+    jkv("isCustom", builtin ? "false" : "true"),
+    jkv("path", "null"),
+    jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(["llm"]))])),
+  ])
+}
+
+// The names under /api/logs/ that are routes rather than log ids.
+const LOG_ROUTE_NAMES: string[] = ["stats", "histogram", "rankings", "dashboard", "filterdata", "dropped", "sessions", "recalculate-cost", "user-agent-mappings"]
+
+// The plugins this gateway provides under Bifrost's names (the ones it implements as built-in features).
+function builtinPlugins(): string[] {
+  return ["telemetry", "logging", "governance", "otel", "semanticcache", "routing"]
+}
+
+// The request body's filters as the query a list takes, so one filter reading serves both.
+function recalcQuery(f: RecalcFilters | undefined): URLSearchParams {
+  const sp = new URLSearchParams("")
+  if (f === undefined) return sp
+  if (f.providers !== undefined) sp.set("providers", f.providers.join(","))
+  if (f.models !== undefined) sp.set("models", f.models.join(","))
+  if (f.virtual_key_ids !== undefined) sp.set("virtual_key_ids", f.virtual_key_ids.join(","))
+  if (f.user_ids !== undefined) sp.set("user_ids", f.user_ids.join(","))
+  if (f.team_ids !== undefined) sp.set("team_ids", f.team_ids.join(","))
+  if (f.period !== undefined) sp.set("period", f.period)
+  if (f.start_time !== undefined) sp.set("start_time", f.start_time)
+  if (f.end_time !== undefined) sp.set("end_time", f.end_time)
+  if (f.missing_cost_only === true) sp.set("missing_cost_only", "true")
+  return sp
+}
 
 // A query value as epoch milliseconds; the fallback when it is missing or not a number.
 function epochParam(raw: string | undefined, fallback: f64): f64 {
@@ -461,6 +510,10 @@ export class Ops {
   // the /ws clients, and the virtual key that opened each live session (/v1/live/sessions)
   ui: UiHub
   liveSessions = new LiveRegistry()
+  // single-use tickets for /ws?ticket= (POST /api/session/ws-ticket)
+  wsTickets = new WsTickets()
+  // the last cost recalculation (POST /api/logs/recalculate-cost); the runs are synchronous, so there is at most one
+  recalc: RecalcRun | undefined = undefined
 
   constructor(readonly engine: Engine, readonly store: ConfigStore) {
     this.ui = new UiHub(() => this.engine.logStore)
@@ -1106,6 +1159,25 @@ export class Ops {
     const auth = req.headers.get("authorization") ?? ""
     const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : ""
     const now = Date.now()
+    // a short-lived, single-use ticket for the /ws socket, which cannot send an Authorization header
+    if (path === "/api/session/ws-ticket") {
+      if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
+      // the socket reads the logs, so the ticket needs the read permission on them (a GET for the gate)
+      const hs: Record<string, string> = snapshot(req.headers)
+      const g = this.gate(new Request(req.url, { method: "GET", headers: hs }), "/api/logs")
+      if (g.kind === "deny") return g.res
+      try {
+        return json(200, JSON.stringify({ ticket: try this.wsTickets.issue(g.actor, now) }))
+      } catch (e) {
+        return json(500, errorJson("failed to issue WebSocket ticket", "api_error", undefined))
+      }
+    }
+    // Bifrost's setup session is for the setup lock, which Raiju does not have: the answer is Bifrost's
+    // answer while the lock is not active
+    if (path === "/api/session/setup") {
+      if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
+      return json(409, errorJson("the setup lock is not active", "invalid_request_error", undefined))
+    }
     if (path === "/api/session/is-auth-enabled") {
       if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
       const valid = bearer !== "" && this.sessions.get(bearer, now) !== undefined
@@ -1229,13 +1301,26 @@ export class Ops {
     const store = this.engine.logStore
     const sc: DataScope = scope ?? allScope()
     if (path.startsWith("/api/mcp-logs")) return this.mcpLogsRoute(req, path, body, store, sc)
-    if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
-    if (m !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
     const now = Date.now()
+    // the User-Agent mappings are configuration: they work whether or not the request log is on
+    if (path === "/api/logs/user-agent-mappings" || path.startsWith("/api/logs/user-agent-mappings/")) return this.userAgentRoute(m, path, body)
+    if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
+    if (path === "/api/logs" && m === "DELETE") return this.deleteLogs(body, store, sc)
+    if (path === "/api/logs/recalculate-cost" && m === "POST") return this.recalculateCost(body, store, sc)
+    if (path === "/api/logs/recalculate-cost/status" && m === "GET") return okJson(this.recalcStatus())
+    if (path === "/api/logs/recalculate-cost/cancel" && m === "POST") return okJson(this.recalcStatus())
+    if (m !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    if (path === "/api/logs") return this.logList(sp, store, sc)
+    if (path === "/api/logs/stats") return this.logStats(sp, store, sc)
+    const sub = path.slice("/api/logs/".byteLength)
+    if (sub.startsWith("sessions/")) return this.sessionLogs(sub.slice("sessions/".byteLength), sp, store, sc)
     if (path === "/api/logs/dropped") return okJson(`{"dropped_requests":${store.dropped}}`)
     if (path === "/api/logs/filterdata") return okJson(this.logFilterData(store, sc))
+    // GET /api/logs/{id}: one log (the names of the other /api/logs routes are not ids)
+    const seg = path.slice("/api/logs/".byteLength)
+    if (seg !== "" && !seg.includes("/") && !LOG_ROUTE_NAMES.includes(seg)) return this.logById(seg, store, sc)
     const end = epochParam(sp.get("end_time") ?? undefined, now)
     const start = this.windowStart(sp, end)
     if (start >= end) return badRequest("start_time must be before end_time")
@@ -1265,6 +1350,7 @@ export class Ops {
       return okJson(dimensionView(es, g, what, dim))
     }
     if (path === "/api/logs/rankings") return okJson(modelRankingsView(es, prev, ranked))
+    if (path === "/api/logs/rankings/users") return okJson(dimensionRankingsView(es, prev, "user", ranked))
     if (path === "/api/logs/rankings/by-dimension") {
       const bad = this.dimensionError(dim)
       if (bad !== "") return badRequest(bad)
@@ -1272,6 +1358,163 @@ export class Ops {
     }
     if (path === "/api/logs/dashboard") return okJson(this.dashboard(store, sp, es, prev, g, start, end, now, sc))
     return { status: 404, body: errorJson(`no route ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
+  }
+
+  // GET /api/logs: the logs a filter selects, newest first unless sort_by and order say otherwise
+  // (Bifrost's getLogs). Raiju's entries and total ride along with Bifrost's logs, pagination and stats.
+  private logList(sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
+    const bad = unsupportedFilter(sp)
+    if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
+    const pg = pageOfQuery(sp, 50, 1000)
+    if (pg.error !== "") return badRequest(pg.error)
+    const f = listFilter(sp, Date.now())
+    const es = selectAll(scopedView(store, sc, f.since - 1.0), f)
+    return okJson(listJson(es, pg.page, scopedView(store, sc, 0.0).length > 0))
+  }
+
+  // GET /api/logs/stats: the totals of the logs a filter selects (Bifrost's SearchStats).
+  private logStats(sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
+    const bad = unsupportedFilter(sp)
+    if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
+    const f = listFilter(sp, Date.now())
+    return okJson(statsView(selectAll(scopedView(store, sc, f.since - 1.0), f)))
+  }
+
+  // GET /api/logs/{id}: one log, with its bodies and raw payloads when the store kept them.
+  private logById(id: string, store: LogStore, sc: DataScope): Reply {
+    for (const e of scopedView(store, sc, 0.0)) {
+      if (e.id === id && kindOf(e) === "llm") return okJson(detailJson(e))
+    }
+    return { status: 404, body: errorJson("log not found", "not_found_error", undefined), contentType: "application/json" }
+  }
+
+  // GET /api/logs/sessions/{id} (its logs, oldest first) and /api/logs/sessions/{id}/summary.
+  // rest is the path after "sessions/": the session id, or the id and "/summary".
+  private sessionLogs(rest: string, sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
+    const summary = rest.endsWith("/summary")
+    const raw = summary ? rest.slice(0, rest.byteLength - "/summary".byteLength) : rest
+    const sid = pctDecode(raw) ?? ""
+    if (sid === "" || sid.includes("/")) return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
+    const es = scopedView(store, sc, 0.0)
+    if (summary) return okJson(sessionSummaryJson(es, sid))
+    const pg = pageOfQuery(sp, 500, 500)
+    if (pg.error !== "") return badRequest(pg.error)
+    const page: Page = pg.page
+    if ((sp.get("order") ?? "") === "") page.order = "asc"
+    return okJson(sessionJson(es, sid, page))
+  }
+
+  // DELETE /api/logs with {"ids": [...]}: removes the LLM logs among them (Bifrost's deleteLogs). Deleting
+  // is for all-data roles, as deleting MCP logs is.
+  private deleteLogs(body: string, store: LogStore, sc: DataScope): Reply {
+    if (!sc.all) return { status: 403, body: errorJson("the data access scope of this role does not allow deleting logs", "permission_error", undefined), contentType: "application/json" }
+    let ids: string[] = []
+    try {
+      ids = (JSON.parse(body) as { ids?: string[] }).ids ?? []
+    } catch (e) {
+      return badRequest("Invalid JSON")
+    }
+    if (ids.length === 0) return badRequest("No log IDs provided")
+    const doomed: string[] = []
+    for (const e of scopedView(store, sc, 0.0)) {
+      if (kindOf(e) === "llm" && ids.includes(e.id)) doomed.push(e.id)
+    }
+    const removed = store.delete(doomed)
+    return okJson(JSON.stringify({ message: "Logs deleted successfully", removed: removed }))
+  }
+
+  // POST /api/logs/recalculate-cost: prices again the LLM logs that match the body's filters, at the
+  // current prices. It runs to the end before answering (Bifrost runs it as a background job).
+  private recalculateCost(body: string, store: LogStore, sc: DataScope): Reply {
+    let rb: { filters?: RecalcFilters } = {}
+    if (body.trim() !== "") {
+      try {
+        rb = JSON.parse(body) as { filters?: RecalcFilters }
+      } catch (e) {
+        return badRequest("Invalid JSON")
+      }
+    }
+    const sp = recalcQuery(rb.filters)
+    const f = listFilter(sp, Date.now())
+    const matched = selectAll(scopedView(store, sc, f.since - 1.0), f)
+    const pricing = this.engine.pricing
+    const updated = store.recost((e) => {
+      if (!visibleTo(e, sc) || !selects(e, f)) return undefined
+      return pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens)
+    })
+    const now = isoMs(Date.now())
+    this.recalc = { id: newId("recalc-"), processed: matched.length, updated: updated, startedAt: now, finishedAt: now }
+    return okJson(this.recalcStatus())
+  }
+
+  // The last recalculation, or idle when none has run since start.
+  private recalcStatus(): string {
+    const r = this.recalc
+    if (r === undefined) return JSON.stringify({ status: "idle" })
+    return jobj([jkv("id", JSON.stringify(r.id)), jkv("status", JSON.stringify("completed")), jkv("processed", jn(r.processed)), jkv("updated", jn(r.updated)), jkv("started_at", JSON.stringify(r.startedAt)), jkv("finished_at", JSON.stringify(r.finishedAt))])
+  }
+
+  // /api/logs/user-agent-mappings: the rules that name the app behind a User-Agent. Saved in the config.
+  private userAgentRoute(method: string, path: string, body: string): Reply {
+    const r = uaRoute(this.store.cfg.user_agent_mappings, method, path, body, isoMs(Date.now()))
+    const next = r.next
+    if (next !== undefined) {
+      const saved = this.store.setUserAgentMappings(next)
+      if (saved.kind !== "ok") return { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
+    }
+    return { status: r.status, body: r.body, contentType: "application/json" }
+  }
+
+  // DELETE /api/cache/clear/{id} and /api/cache/clear-by-key/{key}: drops entries from the exact-match and
+  // the semantic cache (Bifrost's cache handler). removed counts what went.
+  cacheClear(method: string, path: string): Reply {
+    if (method !== "DELETE") return { status: 405, body: errorJson("use DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+    const ex = this.engine.cache
+    const sem = this.engine.semantic
+    if (ex === undefined && sem === undefined) return { status: 400, body: errorJson("semantic_cache plugin is not loaded", "invalid_request_error", undefined), contentType: "application/json" }
+    let removed = 0
+    const rest = path.slice("/api/cache/".byteLength)
+    if (rest.startsWith("clear-by-key/")) {
+      const key = pctDecode(rest.slice("clear-by-key/".byteLength))
+      if (key === undefined) return badRequest("Invalid cache key encoding")
+      if (key === "") return badRequest("Invalid cache key")
+      if (ex !== undefined) removed += ex.clearKey(key)
+      if (sem !== undefined) removed += sem.clearKey(key)
+    } else if (rest.startsWith("clear/")) {
+      const id = rest.slice("clear/".byteLength)
+      if (id === "") return badRequest("Invalid cache ID")
+      if (ex !== undefined) removed += ex.clearId(id)
+      if (sem !== undefined && sem.clearId(id)) removed += 1
+    } else {
+      return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
+    }
+    return okJson(JSON.stringify({ message: "Cache cleared successfully", removed: removed }))
+  }
+
+  // GET /api/plugins (the configured plugins and their status), /api/plugins/{name}, /builtins and
+  // /loaded (the plugins in the live chain). Read-only: the plugin list changes through the config.
+  pluginsRoute(method: string, path: string): Reply {
+    if (method !== "GET") return { status: 405, body: errorJson("the plugin list is read-only here: change the plugins in the config", "invalid_request_error", undefined), contentType: "application/json" }
+    if (path === "/api/plugins/builtins") return okJson(JSON.stringify({ plugins: builtinPlugins() }))
+    if (path === "/api/plugins/loaded") {
+      const names: string[] = []
+      const chain = this.engine.plugins
+      if (chain !== undefined) {
+        for (const p of chain.plugins) names.push(p.name())
+      }
+      return okJson(JSON.stringify({ plugins: names }))
+    }
+    const specs = this.store.cfg.plugins ?? []
+    if (path === "/api/plugins") {
+      const rows: string[] = []
+      for (const sp of specs) rows.push(pluginJson(sp))
+      return okJson(jobj([jkv("plugins", jarr(rows)), jkv("count", jn(rows.length))]))
+    }
+    const name = path.slice("/api/plugins/".byteLength)
+    for (const sp of specs) {
+      if (sp.name === name) return okJson(pluginJson(sp))
+    }
+    return { status: 404, body: errorJson("plugin not found", "not_found_error", undefined), contentType: "application/json" }
   }
 
   // The window's start: start_time, or the end less period ("1h", "6h", "24h", "7d", "30d"), or 24 hours.
@@ -1345,6 +1588,9 @@ export class Ops {
       jkv("routing_engines", "[]"),
       jkv("tool_call_names", jstrs(distinctDim(mcp, "tool"))),
       jkv("projects", "[]"),
+      jkv("user_ids", jstrs(distinctDim(llm, "user"))),
+      jkv("apps", jstrs(distinctDim(llm, "app"))),
+      jkv("user_agents", jstrs(distinctDim(llm, "user_agent"))),
     ])
   }
 
@@ -1946,6 +2192,14 @@ export class Ops {
     } catch (e) {
       return { status: 500, body: errorJson(e.message, "api_error", undefined), contentType: "application/json" }
     }
+    if (p === "/api/audit-logs/filterdata") return { status: 200, body: JSON.stringify(log.filterData()), contentType: "application/json" }
+    // GET /api/audit-logs/{id}: one event, by its id (its sequence number), in Bifrost's {audit_log} wrapper
+    if (p.startsWith("/api/audit-logs/")) {
+      const seq = parseInt(p.slice("/api/audit-logs/".byteLength)) ?? -1
+      const ev = seq >= 0 ? log.find(seq) : undefined
+      if (ev === undefined) return { status: 404, body: errorJson("audit log not found", "not_found_error", undefined), contentType: "application/json" }
+      return { status: 200, body: JSON.stringify({ audit_log: ev }), contentType: "application/json" }
+    }
     if (p !== "/api/audit-logs") return { status: 404, body: errorJson(`no route for ${p}`, "invalid_request_error", undefined), contentType: "application/json" }
     const q: AuditQuery = {}
     const actor = params.get("actor")
@@ -2193,7 +2447,8 @@ test("analytics and MCP routes answer from the store and refuse what is not reco
     expect(dash.status).toBe(200)
     expect(dash.body.includes(`"total_requests":1`)).toBe(true)
     expect(dash.body.includes(`"virtual_key":{"rankings"`)).toBe(true)
-    expect(get("/api/logs/histogram/cost/by-dimension?dimension=user").status).toBe(400)
+    expect(get("/api/logs/histogram/cost/by-dimension?dimension=team_name").status).toBe(400)
+    expect(get("/api/logs/histogram/cost/by-dimension?dimension=user").status).toBe(200)
     expect(get("/api/logs/histogram/cost/by-dimension?dimension=virtual_key").body.includes(`"dimension_values":["vk1"]`)).toBe(true)
     expect(get("/api/logs/rankings?limit=0").status).toBe(400)
     expect(get("/api/logs/nothing-here").status).toBe(404)

@@ -32,6 +32,7 @@ import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./heal
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
 import { Pricing, PriceRow } from "./pricing"
 import { ResponseCache, CacheOrigin, cacheKey, keyScope, parseTtl } from "./cache"
+import { appOf } from "./logapi"
 import { sha256, toHex, utf8 } from "./crypto"
 import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
@@ -52,7 +53,6 @@ import { PluginChain, PluginContext, buildChain } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline } from "./deadline"
 import { logMetadata, correlationIds, maximAttrs } from "./reqlog"
-import { appFromUserAgent } from "./useragent"
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 
@@ -774,6 +774,10 @@ class ReqCtx {
   customerId = ""
   businessUnitId = ""
   projectId = ""
+  // the user the key is assigned to, the caller's session and its User-Agent, for the request log
+  userId = ""
+  sessionId = ""
+  userAgent = ""
   input = ""
   output = ""
   span: Span | undefined = undefined
@@ -797,7 +801,6 @@ class ReqCtx {
   parentId = ""
   agentId = ""
   app = ""
-  userAgent = ""
   maximIds: Record<string, string> | undefined = undefined
   maximTags: Record<string, string> | undefined = undefined
   // the compat plan of a chat or completions request: its drops and conversions go out with the stream headers
@@ -1826,7 +1829,6 @@ export class Engine {
     const cids = correlationIds(h)
     ctx.parentId = cids.parent
     ctx.agentId = cids.agent
-    ctx.userAgent = h.get("user-agent") ?? ""
     const ma = maximAttrs(h)
     ctx.maximIds = ma?.ids
     ctx.maximTags = ma?.tags
@@ -1838,6 +1840,8 @@ export class Engine {
       ctx.span = rs
     }
     ctx.contentOff = this.contentOff(h)
+    ctx.userAgent = h.get("user-agent") ?? ""
+    ctx.sessionId = sessionId(h) ?? ""
     if (this.logStore !== undefined && !ctx.contentOff) ctx.input = text
     // bifrost_active_requests: in flight from here until the answer (or the throw) is out
     const method = requestType(op, streamed)
@@ -1911,6 +1915,7 @@ export class Engine {
     }
     const grant: Grant = admitted
     ctx.virtualKey = grant.vk?.id ?? ""
+    ctx.userId = grant.vk?.user_id ?? ""
     ctx.provider = primary.provider
     let rl = metrics.newLabels(primary.provider, primary.model, requestType(op, streamed))
     const gvk = grant.vk
@@ -1942,9 +1947,10 @@ export class Engine {
       metrics.observeRouting(ruleName !== undefined && ruleName !== "" ? "routing_rule" : "complexity", tier ?? "", ruleName ?? "")
     }
     if (model !== primary.provider + "/" + primary.model && model !== primary.model) rl.alias = model
-    // the app: the caller's x-bf-app, else the one its User-Agent names (Bifrost's app label)
+    // the app: the caller's x-bf-app, else the one its User-Agent names (the operator's
+    // user_agent_mappings first, then Bifrost's built-in identifiers)
     const xApp = h.get("x-bf-app") ?? ""
-    rl.app = xApp !== "" ? xApp : appFromUserAgent(h.get("user-agent") ?? "")
+    rl.app = xApp !== "" ? xApp : appOf(h.get("user-agent") ?? "", this.cfg.user_agent_mappings ?? [])
     ctx.app = rl.app
     rl.custom = metrics.customValues(h)
     ctx.labels = rl
@@ -2067,12 +2073,12 @@ export class Engine {
       const ttl = ttlHeader === undefined ? undefined : parseTtl(ttlHeader)
       const origin: CacheOrigin = { provider: r.provider, model: r.model, inputTokens: r.promptTokens }
       if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, r.body, r.contentType, ttl ?? this.semanticCfg.ttl_ms, origin)
-      else sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttl, origin)
+      else sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttl, origin, semKey)
     }
     if (cache !== undefined && !noStore && r.raw !== true) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? this.cacheTtlMs : parseTtl(ttlHeader) ?? this.cacheTtlMs
-      cache.set(key, r.body, r.contentType, ttl, { provider: r.provider, model: r.model, inputTokens: r.promptTokens })
+      cache.set(key, r.body, r.contentType, ttl, { provider: r.provider, model: r.model, inputTokens: r.promptTokens }, h.get("x-bf-cache-key") ?? "")
     }
     if (r.provider !== primary.provider || r.model !== primary.model) out.set("x-bf-fallback-used", r.provider + "/" + r.model)
     const idx = fallbackIndex(allowed, r.provider, r.model)
@@ -2208,6 +2214,7 @@ export class Engine {
         virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, team_id: c.teamId === "" ? undefined : c.teamId,
         customer_id: c.customerId === "" ? undefined : c.customerId, business_unit_id: c.businessUnitId === "" ? undefined : c.businessUnitId,
         project_id: c.projectId === "" ? undefined : c.projectId, error: c.error === "" ? undefined : c.error,
+        session_id: c.sessionId === "" ? undefined : c.sessionId, user_id: c.userId === "" ? undefined : c.userId,
         input: c.input === "" || c.contentOff ? undefined : c.input, output: c.output === "" || c.contentOff ? undefined : c.output,
         metadata: c.meta, parent_request_id: c.parentId === "" ? undefined : c.parentId, agent_correlation_id: c.agentId === "" ? undefined : c.agentId,
         app: c.app === "" ? undefined : c.app, user_agent: c.userAgent === "" ? undefined : c.userAgent, maxim: c.maximIds, maxim_tags: c.maximTags,

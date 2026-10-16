@@ -16,7 +16,6 @@ import { Session, SocketExt, prepare, onOpen, onMessage, onClose, extOpen, extMe
 import { ResponsesSocket } from "./wsresponses"
 import { LiveSocket, liveContent, liveCreate, contentId, attachId, attachUpstream, ownerOf, credentialOk, validId } from "./live"
 import { WsConnection } from "./ws"
-import { parseQuery, filterFrom, selectAll, scopedEntries, statsView } from "./logstore"
 import { DataScope } from "./scope"
 import { matchRoute, handleMedia, deploymentRoute, deploymentRequest } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
@@ -248,7 +247,15 @@ async function mcpAction(ops: Ops, action: string, id: string, ok: Reply): Promi
 // The /api/logs routes that ops.logsRoute answers (histograms, rankings, dashboard, filterdata, dropped),
 // and the MCP logs. The other /api/logs routes are not these.
 function logsAnalyticsPath(path: string): bool {
-  return path.startsWith("/api/logs/histogram") || path.startsWith("/api/logs/rankings") || path === "/api/logs/dashboard" || path === "/api/logs/filterdata" || path === "/api/logs/dropped" || path.startsWith("/api/mcp-logs")
+  return path === "/api/logs" || path.startsWith("/api/logs/") || path.startsWith("/api/mcp-logs")
+}
+
+// The audit trail's path, with the alias (governance/audit-logs) mapped onto audit-logs; "" for any other path.
+function auditTarget(path: string): string {
+  const segs = path.split("/")
+  if (segs[1] === "api" && segs[2] === "audit-logs") return path
+  if (segs[1] === "api" && segs[2] === "governance" && segs[3] === "audit-logs") return ["", "api", "audit-logs"].concat(segs.slice(4)).join("/")
+  return ""
 }
 
 // A route's reply. A section it changed is saved first, and a failed save is the reply instead.
@@ -267,7 +274,10 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const body = req.method === "GET" ? "" : await req.text()
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
   if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body)
-  else if (path === "/api/audit-logs" || path.startsWith("/api/audit-logs/")) r = ops.auditRoute(req, path)
+  else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
+  // the cache clears (DELETE) and the read-only plugin listings
+  else if (path.startsWith("/api/cache/")) r = ops.cacheClear(req.method, path)
+  else if (path === "/api/plugins" || path.startsWith("/api/plugins/")) r = ops.pluginsRoute(req.method, path)
   else if (path === "/api/mcp/virtual") r = req.method === "GET" ? ops.virtualView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/governance/access-profiles" || path.startsWith("/api/governance/access-profiles/")) r = ops.profiles(req.method, path, body)
   else if (path.startsWith("/api/alerting/")) {
@@ -353,21 +363,11 @@ function mcpView(engine: Engine): Response {
   return Response.json({ clients: m.status() })
 }
 
-function logsView(engine: Engine, req: Request, stats: bool, sc: DataScope): Response {
-  const store = engine.logStore
-  if (store === undefined) return errorResponse(404, "request logs are off; enable logs_store in the config", "invalid_request_error", noHeaders())
-  const u = URL.parse(req.url)
-  const params = u === undefined ? new URLSearchParams("") : u.searchParams
-  if (stats) {
-    // Bifrost's totals over start_time..end_time (or since), with the filters the log list takes
-    const start = parseFloat(params.get("start_time") ?? params.get("since") ?? "0") ?? 0.0
-    const end = parseFloat(params.get("end_time") ?? "") ?? Date.now() + 1.0
-    const f = filterFrom(params, "llm", start, end)
-    return new Response(statsView(selectAll(scopedEntries(store.viewSince(start - 1.0), sc), f)), { headers: { "content-type": "application/json" } })
-  }
-  const q = parseQuery(params)
-  q.scope = sc
-  return Response.json(store.query(q))
+// A handler's reply as an HTTP response.
+function replyResponse(r: Reply): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", r.contentType)
+  return new Response(r.body, { status: r.status, headers: h })
 }
 
 function cacheView(engine: Engine): Response {
@@ -529,7 +529,7 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
     if (p === "/api/logs" || p === "/api/logs/stats") {
       const cs = ops.checkScope(req, p)
-      return cs.res ?? logsView(engine, req, p === "/api/logs/stats", cs.scope)
+      return cs.res ?? replyResponse(ops.logsRoute(req, p, "", cs.scope))
     }
     if (p === "/api/governance/usage") return ops.check(req, p) ?? Response.json({ budgets: engine.gov.budgetUsage() })
     if (p === "/api/mcp") return ops.check(req, p) ?? mcpView(engine)
@@ -745,6 +745,13 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
     return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers)) }
   }
   if (p === "/ws") {
+    // a ticket from POST /api/session/ws-ticket stands for the caller's credentials, once and briefly
+    const tk = u === undefined ? "" : u.searchParams.get("ticket") ?? ""
+    if (tk !== "") {
+      const actor = ops.wsTickets.consume(tk, Date.now())
+      if (actor === undefined) return { kind: "refused", status: 401, message: "the WebSocket ticket is invalid, used or expired" }
+      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(actor))) }
+    }
     // the live feed is log data: whoever may read /api/logs may open it, and sees its own data scope
     const g = ops.gate(req, "/api/logs")
     if (g.kind === "deny") return { kind: "refused", status: g.res.status, message: g.res.status === 401 ? "authentication is required" : "this role may not open the UI socket" }

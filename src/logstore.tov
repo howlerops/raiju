@@ -26,6 +26,12 @@ export type LogEntry = {
   customer_id?: string,
   business_unit_id?: string,
   project_id?: string,
+  // the caller's session (x-bf-session-id or a coding harness's session header), the user its key is
+  // assigned to, the raw User-Agent and the app that User-Agent maps to (logapi.tov)
+  session_id?: string,
+  user_id?: string,
+  user_agent?: string,
+  app?: string,
   error?: string,
   input?: string, // request body, only when content logging is on
   output?: string, // response body, only when content logging is on
@@ -40,9 +46,6 @@ export type LogEntry = {
   // the caller's parent request id and agent correlation id (x-bf-parent-request-id, x-bf-agent-correlation-id)
   parent_request_id?: string,
   agent_correlation_id?: string,
-  // the client app (x-bf-app, or the one the User-Agent names) and the User-Agent as sent
-  app?: string,
-  user_agent?: string,
   // Maxim trace attributes the caller named (x-bf-maxim-*): the reserved ids and names, and the tags
   maxim?: Record<string, string>,
   maxim_tags?: Record<string, string>,
@@ -94,7 +97,7 @@ const DAY_MS = 86400000
 
 // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
 // algorithm; the 400-year eras make it exact for every year, leap years included).
-function daysFromCivil(y0: int, m: int, d: int): int {
+export function daysFromCivil(y0: int, m: int, d: int): int {
   const y = m <= 2 ? y0 - 1 : y0
   const era = Math.floor(y / 400)
   const yoe = y - era * 400
@@ -378,6 +381,72 @@ export class LogStore {
     }
   }
 
+  // Replaces the cost of every entry that pick() prices (it returns the new cost, or undefined to keep
+  // the entry as it is), in memory and in the day files. Returns how many changed.
+  recost(pick: (e: LogEntry) => f64 | undefined): int {
+    // an entry can be in memory and in its file: counted once, by id
+    const changed: Set<string> = new Set()
+    for (let i = 0; i < this.ring.length; i++) {
+      const e = this.ring[i]!
+      const c = pick(e)
+      if (c === undefined || c === e.cost) continue
+      let n = this.ring[i]!
+      n.cost = c
+      this.ring[i] = n
+      changed.add(e.id)
+    }
+    this.viewSize = -1
+    let names: string[] = []
+    try {
+      names = readdirSync(this.cfg.dir)
+    } catch (err) {
+      return changed.size
+    }
+    for (const name of names) {
+      if (fileDay(name) === undefined) continue
+      const path = join(this.cfg.dir, name)
+      let lines: string[] = []
+      try {
+        lines = readFileSync(path, "utf8").split("\n")
+      } catch (err) {
+        continue
+      }
+      const out: string[] = []
+      let hit = 0
+      for (const line of lines) {
+        if (line === "") continue
+        let parsed: LogEntry | undefined = undefined
+        try {
+          parsed = JSON.parse(line) as LogEntry
+        } catch (err) {
+          out.push(line)
+          continue
+        }
+        if (parsed === undefined) {
+          out.push(line)
+          continue
+        }
+        const e: LogEntry = parsed
+        const c = pick(e)
+        if (c === undefined || c === e.cost) {
+          out.push(line)
+          continue
+        }
+        e.cost = c
+        out.push(JSON.stringify(e))
+        changed.add(e.id)
+        hit += 1
+      }
+      if (hit === 0) continue
+      try {
+        writeFileSync(path, out.length === 0 ? "" : out.join("\n") + "\n")
+      } catch (err) {
+        console.error(`logstore: could not rewrite ${name}: ${err.message}`)
+      }
+    }
+    return changed.size
+  }
+
   // Deletes the day files older than retention_days before now; returns how many.
   prune(now: f64): int throws Error {
     const cutoff = Math.floor(now / DAY_MS) - this.cfg.retention_days
@@ -418,6 +487,10 @@ export class LogStore {
       customer_id: e.customer_id,
       business_unit_id: e.business_unit_id,
       project_id: e.project_id,
+      session_id: e.session_id,
+      user_id: e.user_id,
+      user_agent: e.user_agent,
+      app: e.app,
       error: e.error,
       input: on ? clip(e.input, max) : undefined,
       output: on ? clip(e.output, max) : undefined,
@@ -431,8 +504,6 @@ export class LogStore {
       metadata: e.metadata,
       parent_request_id: e.parent_request_id,
       agent_correlation_id: e.agent_correlation_id,
-      app: e.app,
-      user_agent: e.user_agent,
       maxim: e.maxim,
       maxim_tags: e.maxim_tags,
     }
@@ -509,7 +580,13 @@ export type Filter = {
   projects: string[],
   tools: string[],
   servers: string[],
-  status: string, // "", "success", "error" or "cancelled"
+  statuses: string[], // "success", "error" or "cancelled"; any of them when the list is empty
+  users: string[],
+  sessionId: string,
+  userAgents: string[],
+  apps: string[],
+  objects: string[], // the request type (the entry's op)
+  missingCost: bool, // only entries with no cost
   since: f64, // ms, inclusive
   until: f64, // ms, exclusive
   min_latency: f64,
@@ -530,6 +607,14 @@ function listParam(v: string | undefined): string[] {
   return out
 }
 
+// The values of a comma list, or of a single value parameter, both (Raiju's singular names and Bifrost's plurals).
+function listOr(sp: URLSearchParams, plural: string, single: string): string[] {
+  const out = listParam(sp.get(plural) ?? undefined)
+  const one = sp.get(single) ?? ""
+  if (one !== "" && !out.includes(one)) out.push(one)
+  return out
+}
+
 function numParam(sp: URLSearchParams, name: string): f64 {
   const v = sp.get(name) ?? ""
   if (v === "") return -1.0
@@ -540,16 +625,22 @@ function numParam(sp: URLSearchParams, name: string): f64 {
 export function filterFrom(sp: URLSearchParams, kind: string, since: f64, until: f64): Filter {
   return {
     kind: kind,
-    providers: listParam(sp.get("providers") ?? undefined),
-    models: listParam(sp.get("models") ?? undefined),
-    virtual_keys: listParam(sp.get("virtual_key_ids") ?? undefined),
+    providers: listOr(sp, "providers", "provider"),
+    models: listOr(sp, "models", "model"),
+    virtual_keys: listOr(sp, "virtual_key_ids", "virtual_key"),
     teams: listParam(sp.get("team_ids") ?? undefined),
     customers: listParam(sp.get("customer_ids") ?? undefined),
     businessUnits: listParam(sp.get("business_unit_ids") ?? undefined),
     projects: listParam(sp.get("project_ids") ?? undefined),
     tools: listParam(sp.get("tool_names") ?? undefined),
     servers: listParam(sp.get("server_labels") ?? undefined),
-    status: sp.get("status") ?? "",
+    statuses: listParam(sp.get("status") ?? undefined),
+    users: listParam(sp.get("user_ids") ?? undefined),
+    sessionId: (sp.get("session_id") ?? "").trim(),
+    userAgents: listParam(sp.get("user_agents") ?? undefined),
+    apps: listParam(sp.get("apps") ?? undefined),
+    objects: listParam(sp.get("objects") ?? undefined),
+    missingCost: sp.get("missing_cost_only") === "true",
     since: since,
     until: until,
     min_latency: numParam(sp, "min_latency"),
@@ -558,9 +649,17 @@ export function filterFrom(sp: URLSearchParams, kind: string, since: f64, until:
     max_tokens: numParam(sp, "max_tokens"),
     min_cost: numParam(sp, "min_cost"),
     max_cost: numParam(sp, "max_cost"),
-    text: sp.get("content_search") ?? "",
+    text: sp.get("content_search") ?? sp.get("text") ?? "",
     request_id: sp.get("request_id") ?? "",
   }
+}
+
+// Whether an entry has one of the statuses a filter names: success (2xx), cancelled (499) or error (the rest).
+function statusMatches(e: LogEntry, st: string): bool {
+  if (st === "success") return isSuccess(e)
+  if (st === "cancelled") return e.status === 499
+  if (st === "error") return !isSuccess(e) && e.status !== 499
+  return false
 }
 
 // Whether an entry is in the filter's window and passes its filters.
@@ -576,9 +675,13 @@ export function selects(e: LogEntry, f: Filter): bool {
   if (f.projects.length > 0 && !f.projects.includes(e.project_id ?? "")) return false
   if (f.tools.length > 0 && !f.tools.includes(e.tool ?? "")) return false
   if (f.servers.length > 0 && !f.servers.includes(e.server ?? "")) return false
-  if (f.status === "success" && !isSuccess(e)) return false
-  if (f.status === "error" && (isSuccess(e) || e.status === 499)) return false
-  if (f.status === "cancelled" && e.status !== 499) return false
+  if (f.users.length > 0 && !f.users.includes(e.user_id ?? "")) return false
+  if (f.sessionId !== "" && e.session_id !== f.sessionId) return false
+  if (f.userAgents.length > 0 && !f.userAgents.includes(e.user_agent ?? "")) return false
+  if (f.apps.length > 0 && !f.apps.includes(e.app ?? "")) return false
+  if (f.objects.length > 0 && !f.objects.includes(e.op)) return false
+  if (f.missingCost && e.cost !== 0.0) return false
+  if (f.statuses.length > 0 && !f.statuses.some((st) => statusMatches(e, st))) return false
   const tokens = e.prompt_tokens + e.completion_tokens
   if (f.min_latency >= 0.0 && e.latency_ms < f.min_latency) return false
   if (f.max_latency >= 0.0 && e.latency_ms > f.max_latency) return false
@@ -640,7 +743,7 @@ function bucketize(es: LogEntry[], g: Grid): LogEntry[][] {
 
 // The dimensions an entry can be grouped by. Others are not recorded for this gateway.
 export function validDimension(dim: string): bool {
-  return dim === "provider" || dim === "model" || dim === "virtual_key" || dim === "tool" || dim === "server" || dim === "team" || dim === "customer" || dim === "business_unit" || dim === "project"
+  return dim === "provider" || dim === "model" || dim === "virtual_key" || dim === "tool" || dim === "server" || dim === "team" || dim === "customer" || dim === "business_unit" || dim === "project" || dim === "user" || dim === "app" || dim === "user_agent"
 }
 
 export function dimValue(e: LogEntry, dim: string): string {
@@ -653,6 +756,9 @@ export function dimValue(e: LogEntry, dim: string): string {
   if (dim === "project") return e.project_id ?? ""
   if (dim === "tool") return e.tool ?? ""
   if (dim === "server") return e.server ?? ""
+  if (dim === "user") return e.user_id ?? ""
+  if (dim === "app") return e.app ?? ""
+  if (dim === "user_agent") return e.user_agent ?? ""
   return ""
 }
 
@@ -1435,7 +1541,7 @@ test("stats views: Bifrost's totals with the older fields beside them, and ranki
 test("filters: status, providers, text, bounds and the window", () => {
   const sp = new URLSearchParams("status=error&providers=openai,anthropic&min_latency=50&content_search=upstream")
   const f = filterFrom(sp, "llm", 0.0, 1000.0)
-  expect(f.status).toBe("error")
+  expect(f.statuses.join(",")).toBe("error")
   expect(f.providers.join(",")).toBe("openai,anthropic")
   expect(f.min_latency).toBe(50.0)
   expect(f.max_latency).toBe(-1.0)

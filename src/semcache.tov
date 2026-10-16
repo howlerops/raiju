@@ -215,8 +215,10 @@ export class VectorIndex {
   }
 }
 
-type Entry = { scope: string, body: string, contentType: string, expires: f64, origin?: CacheOrigin }
-type SharedEntry = { scope: string, v: f64[], body: string, contentType: string, expires: f64, origin?: CacheOrigin }
+// key is the x-bf-cache-key the entry was stored under ("" for none), kept apart from the scope:
+// the scope's separators are NUL bytes, which Tov's split does not handle.
+type Entry = { scope: string, key: string, body: string, contentType: string, expires: f64, origin?: CacheOrigin }
+type SharedEntry = { scope: string, v: f64[], body: string, contentType: string, expires: f64, origin?: CacheOrigin, key?: string }
 
 // Partitioned by scope. Eviction is global FIFO: the oldest insert goes first,
 // whichever scope it is in.
@@ -260,7 +262,7 @@ export class SemanticCache {
         const x = JSON.parse(readFileSync(this.shareDir + "/" + n, "utf8")) as SharedEntry
         this.seen.add(n)
         this.shareExpiry.set(n, x.expires)
-        if (x.expires > nowMs && this.put(x.scope, x.v, x.body, x.contentType, x.expires, x.origin)) added += 1
+        if (x.expires > nowMs && this.put(x.scope, x.v, x.body, x.contentType, x.expires, x.key ?? "", x.origin)) added += 1
       } catch (e) {
         // being written; read again next time
         continue
@@ -330,17 +332,17 @@ export class SemanticCache {
   }
 
   // False when v is unusable (empty, zero, or wrong dimension for the scope).
-  store(scope: string, v: f64[], body: string, contentType: string, nowMs: f64, ttlOverride?: int, origin?: CacheOrigin): bool {
+  store(scope: string, v: f64[], body: string, contentType: string, nowMs: f64, ttlOverride?: int, origin?: CacheOrigin, key?: string): bool {
     let ttl = this.cfg.ttl_ms
     if (ttlOverride !== undefined) ttl = ttlOverride
     const expires = nowMs + ttl
-    if (!this.put(scope, v, body, contentType, expires, origin)) return false
+    if (!this.put(scope, v, body, contentType, expires, key ?? "", origin)) return false
     if (this.shareDir !== "") {
       const name = `${process.pid}-${this.seq}.json`
       this.seen.add(name)
       this.shareExpiry.set(name, expires)
       try {
-        writeFileSync(this.shareDir + "/" + name, JSON.stringify({ scope: scope, v: v, body: body, contentType: contentType, expires: expires, origin: origin }))
+        writeFileSync(this.shareDir + "/" + name, JSON.stringify({ scope: scope, v: v, body: body, contentType: contentType, expires: expires, origin: origin, key: key ?? "" }))
       } catch (e) {
         // the shared copy is a bonus
       }
@@ -348,7 +350,7 @@ export class SemanticCache {
     return true
   }
 
-  private put(scope: string, v: f64[], body: string, contentType: string, expires: f64, origin?: CacheOrigin): bool {
+  private put(scope: string, v: f64[], body: string, contentType: string, expires: f64, key: string, origin?: CacheOrigin): bool {
     if (v.length === 0 || this.cfg.max_entries < 1) return false
     let part = this.parts.get(scope)
     if (part !== undefined && part.dim !== v.length) return false
@@ -362,7 +364,7 @@ export class SemanticCache {
       if (part.size() === 0) this.parts.delete(scope)
       return false
     }
-    this.meta.set(id, { scope: scope, body: body, contentType: contentType, expires: expires, origin: origin })
+    this.meta.set(id, { scope: scope, key: key, body: body, contentType: contentType, expires: expires, origin: origin })
     this.queue.push(id)
     while (this.meta.size > this.cfg.max_entries) this.evictOldest()
     return true
@@ -370,6 +372,25 @@ export class SemanticCache {
 
   stats(): { entries: int, partitions: int, hits: int, misses: int } {
     return { entries: this.meta.size, partitions: this.parts.size, hits: this.hits, misses: this.misses }
+  }
+
+  // Removes the entries stored under an x-bf-cache-key, in this worker's memory. Returns how many went.
+  // Other workers' copies, and the entries of an external vector store, are not touched.
+  clearKey(cacheKey: string): int {
+    const dead: string[] = []
+    for (const id of this.meta.keys()) {
+      const e = this.meta.get(id)
+      if (e !== undefined && e.key === cacheKey) dead.push(id)
+    }
+    for (const id of dead) this.drop(id)
+    return dead.length
+  }
+
+  // Removes the entry with this id (e.g. "e7", the id this worker gave it). False when there is none.
+  clearId(id: string): bool {
+    if (!this.meta.has(id)) return false
+    this.drop(id)
+    return true
   }
 }
 
@@ -544,6 +565,20 @@ test("semantic entries are shared through a directory", () => {
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch (e) {}
+})
+
+test("semantic entries are cleared by their cache key and by id", () => {
+  const cfg = defaultSemanticConfig()
+  const c = new SemanticCache(cfg)
+  const scope = scopeKey("openai", "m", "team-a", cfg)
+  expect(c.store(identityScope(scope, "vk1", cfg), [1.0, 0.0], "{}", "application/json", 1000.0, undefined, undefined, "team-a")).toBe(true)
+  expect(c.store(identityScope(scopeKey("openai", "m", "team-b", cfg), "vk1", cfg), [0.0, 1.0], "{}", "application/json", 1000.0, undefined, undefined, "team-b")).toBe(true)
+  expect(c.clearKey("team-a")).toBe(1)
+  expect(c.lookup(identityScope(scope, "vk1", cfg), [1.0, 0.0], 1001.0)).toBeUndefined()
+  expect(c.lookup(identityScope(scopeKey("openai", "m", "team-b", cfg), "vk1", cfg), [0.0, 1.0], 1001.0)?.body).toBe("{}")
+  expect(c.clearId("e2")).toBe(true)
+  expect(c.clearId("e2")).toBe(false)
+  expect(c.stats().entries).toBe(0)
 })
 
 test("identity scope: per virtual key by default, shared when disabled", () => {

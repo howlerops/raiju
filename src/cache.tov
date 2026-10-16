@@ -10,7 +10,8 @@ import { sha256, toHex, utf8 } from "./crypto"
 // counted. A hit answers x-bifrost-cache-provider-used, -model-used and -input-tokens with them.
 export type CacheOrigin = { provider: string, model: string, inputTokens: int }
 
-type Entry = { body: string, contentType: string, expires: f64, origin?: CacheOrigin }
+// nameHex is the hex of the x-bf-cache-key the entry was stored under ("" for none).
+type Entry = { body: string, contentType: string, expires: f64, origin?: CacheOrigin, nameHex: string }
 
 export class ResponseCache {
   entries: Map<string, Entry> = new Map()
@@ -33,7 +34,7 @@ export class ResponseCache {
     return this.shareDir + "/" + toHex(sha256(utf8(key)))
   }
 
-  // A shared entry: "<expires>\t<body bytes>\t<provider>\t<model>\t<input tokens>\t<content type>\n<body>".
+  // A shared entry: "<expires>\t<body bytes>\t<provider>\t<model>\t<input tokens>\t<content type>\t<key name hex>\n<body>".
   // A file being written (no atomic rename in node:fs) has a short body and reads as a miss.
   private readShared(key: string): Entry | undefined {
     if (this.shareDir === "") return undefined
@@ -49,12 +50,12 @@ export class ResponseCache {
     const expires = parseFloat(head[0] ?? "")
     const len = parseInt(head[1] ?? "")
     const body = text.slice(nl + 1)
-    if (expires === undefined || len === undefined || head.length < 6 || body.byteLength !== len) return undefined
+    if (expires === undefined || len === undefined || head.length < 7 || body.byteLength !== len) return undefined
     if (expires < Date.now()) return undefined
     const provider = head[2] ?? ""
     const tokens = parseInt(head[4] ?? "") ?? 0
     const origin: CacheOrigin | undefined = provider === "" ? undefined : { provider: provider, model: head[3] ?? "", inputTokens: tokens }
-    return { body: body, contentType: head.slice(5).join("\t"), expires: expires, origin: origin }
+    return { body: body, contentType: head.slice(5, head.length - 1).join("\t"), expires: expires, origin: origin, nameHex: head[head.length - 1] ?? "" }
   }
 
   // Removes expired shared files; returns how many went.
@@ -104,21 +105,83 @@ export class ResponseCache {
     return e
   }
 
-  set(key: string, body: string, contentType: string, ttlMs: int, origin?: CacheOrigin): void {
+  // name is the request's x-bf-cache-key ("" for none), kept so the entries can be cleared by key.
+  set(key: string, body: string, contentType: string, ttlMs: int, origin?: CacheOrigin, name?: string): void {
     if (this.entries.size >= this.maxEntries) this.evict()
     const expires = Date.now() + ttlMs
-    this.entries.set(key, { body: body, contentType: contentType, expires: expires, origin: origin })
+    const nameHex = toHex(utf8(name ?? ""))
+    this.entries.set(key, { body: body, contentType: contentType, expires: expires, origin: origin, nameHex: nameHex })
     if (this.shareDir !== "") {
       const o = origin
       const prov = o === undefined ? "" : o.provider
       const model = o === undefined ? "" : o.model
       const tokens = o === undefined ? 0 : o.inputTokens
       try {
-        writeFileSync(this.file(key), `${expires}\t${body.byteLength}\t${prov}\t${model}\t${tokens}\t${contentType}\n${body}`)
+        writeFileSync(this.file(key), `${expires}\t${body.byteLength}\t${prov}\t${model}\t${tokens}\t${contentType}\t${nameHex}\n${body}`)
       } catch (e) {
         // the shared copy is a bonus; this worker still has the entry
       }
     }
+  }
+
+  // Removes the entry whose cache id is id (the hash of its key, the name of its shared file), here and
+  // as a shared file. Returns how many went. The id must be 64 hex digits: it becomes a file name.
+  clearId(id: string): int {
+    if (!isCacheId(id)) return 0
+    let n = 0
+    for (const k of this.entries.keys()) {
+      if (toHex(sha256(utf8(k))) !== id) continue
+      this.entries.delete(k)
+      n += 1
+    }
+    if (this.shareDir !== "") {
+      try {
+        unlinkSync(this.shareDir + "/" + id)
+        n += 1
+      } catch (e) {
+        // no shared copy
+      }
+    }
+    return n
+  }
+
+  // Removes the entries stored under an x-bf-cache-key, here and as shared files. Returns how many went.
+  // Other workers' copies in memory last until they expire.
+  clearKey(name: string): int {
+    const want = toHex(utf8(name))
+    let n = 0
+    for (const k of this.entries.keys()) {
+      const e = this.entries.get(k)
+      if (e === undefined || e.nameHex !== want) continue
+      this.entries.delete(k)
+      n += 1
+    }
+    if (this.shareDir !== "") {
+      let files: string[] = []
+      try {
+        files = readdirSync(this.shareDir)
+      } catch (e) {
+        files = []
+      }
+      for (const f of files) {
+        const p = this.shareDir + "/" + f
+        let first = ""
+        try {
+          first = readFileSync(p, "utf8").split("\n")[0] ?? ""
+        } catch (e) {
+          continue
+        }
+        const parts = first.split("\t")
+        if (parts.length < 7 || parts[parts.length - 1] !== want) continue
+        try {
+          unlinkSync(p)
+          n += 1
+        } catch (e) {
+          continue
+        }
+      }
+    }
+    return n
   }
 
   // Drops expired entries, then the oldest tenth if still full.
@@ -138,6 +201,17 @@ export class ResponseCache {
       n += 1
     }
   }
+}
+
+// Whether s is a cache id: 64 lowercase hex digits (the SHA-256 of a cache key).
+export function isCacheId(s: string): bool {
+  if (s.byteLength !== 64) return false
+  for (let i = 0; i < 64; i++) {
+    const c = s.slice(i, i + 1)
+    const hex = (c >= "0" && c <= "9") || (c >= "a" && c <= "f")
+    if (!hex) return false
+  }
+  return true
 }
 
 // "30s", "5m", "1h" or plain seconds.
@@ -209,6 +283,19 @@ test("a shared cache directory serves entries across instances", () => {
   b.set("old", "gone", "text/plain", -1000)
   expect(a.sweepShared(Date.now())).toBe(1)
   expect(a.get("old")).toBeUndefined()
+  // cleared by key: the memory copy and the shared file both go
+  a.set("kk", "tagged", "text/plain", 60000, undefined, "team-a")
+  expect(a.clearKey("team-a")).toBe(2)
+  expect(b.get("kk")).toBeUndefined()
+  expect(a.clearKey("team-a")).toBe(0)
+  // cleared by id: the id is the hash of the key, and the shared file has that name
+  a.set("kid", "by id", "text/plain", 60000)
+  const id = toHex(sha256(utf8("kid")))
+  expect(isCacheId(id)).toBe(true)
+  expect(a.clearId(id)).toBe(2)
+  expect(b.get("kid")).toBeUndefined()
+  // an id that is not a hash is refused: it would name a file
+  expect(a.clearId("../" + id)).toBe(0)
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch (e) {}
@@ -234,4 +321,19 @@ test("a cached answer keeps its origin, in memory and in a shared directory", ()
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch (e) {}
+})
+
+test("clearing by id and by key in memory", () => {
+  const c = new ResponseCache(60000, 10)
+  c.set("one", "1", "text/plain", 60000, undefined, "k1")
+  c.set("two", "2", "text/plain", 60000, undefined, "k1")
+  c.set("three", "3", "text/plain", 60000)
+  expect(c.clearKey("k1")).toBe(2)
+  expect(c.get("one")).toBeUndefined()
+  expect(c.get("three")?.body).toBe("3")
+  c.set("four", "4", "text/plain", 60000)
+  expect(c.clearId(toHex(sha256(utf8("four"))))).toBe(1)
+  expect(c.get("four")).toBeUndefined()
+  expect(isCacheId("abc")).toBe(false)
+  expect(isCacheId("A".repeat(64))).toBe(false)
 })

@@ -1425,6 +1425,219 @@ def mcp_keys_e2e(env):
         gw.terminate()
         gw.wait()
 
+
+L97C = "http://127.0.0.1:18141"  # the L97c gateway: request logs, sessions, User-Agent mappings, cache clears, audit, tickets, plugins
+
+def l97c_config():
+    """The L97c gateway's config: request logs and audit on, the exact-match cache, a header plugin and a plugin
+    entry that names nothing, and one governance user per role. Its own gateway, started and stopped by l97c_e2e."""
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l97c-logs")},
+        "audit": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l97c-audit"), "key": "e2e-l97c-audit-key"},
+        "cache": {"enabled": True, "ttl_seconds": 60},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l97", "value": "sk-l97", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l97")},
+                      {"name": "vic", "role": "viewer", "token_sha256": tok("sk-viewer-l97")},
+                      {"name": "aud", "role": "auditor", "token_sha256": tok("sk-auditor-l97")},
+                      {"name": "edi", "role": "editor", "token_sha256": tok("sk-editor-l97")}],
+            "virtual_keys": [{"id": "vk-l97", "value": "sk-bf-l97", "user_id": "user-ada"}],
+        },
+        "plugins": [{"name": "header", "enabled": True, "config": {"set_request_headers": {"x-l97": "1"}}}, {"name": "nosuch-plugin", "enabled": True}],
+    }
+
+def ws_status(path):
+    """The status a WebSocket handshake gets on the L97c gateway (101 when the socket opens)."""
+    import base64
+    sock = socket.create_connection(("127.0.0.1", 18141), timeout=5)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(1)
+            if not chunk:
+                break
+            head += chunk
+        return int(head.split(b" ")[1]) if head else 0
+    finally:
+        sock.close()
+
+def l97c_e2e(env):
+    """L97c: the request log in Bifrost's shapes (filters, paging, one log, sessions, user, user agent and app),
+    the User-Agent mappings, cost recalculation, deletes, cache clears by key and by id, audit by id and the alias,
+    WebSocket tickets, the setup answer, and the plugin listings, each for the roles that may read or change them."""
+    cfg_path = os.path.join(BUILD, "e2e.l97c.json")
+    with open(cfg_path, "w") as f:
+        json.dump(l97c_config(), f)
+    # a gateway loads today's log and audit files at start: each run starts from empty ones
+    import shutil
+    for d in ("e2e-l97c-logs", "e2e-l97c-audit"):
+        shutil.rmtree(os.path.join(BUILD, d), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18141", "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.l97c.log"), "w"))
+    ADM = {"authorization": "Bearer sk-admin-l97"}
+    VIC = {"authorization": "Bearer sk-viewer-l97"}
+    AUD = {"authorization": "Bearer sk-auditor-l97"}
+    EDI = {"authorization": "Bearer sk-editor-l97"}
+    def api(method, p, body=None, who=ADM, headers=None):
+        return call(method, p, body, {**who, **(headers or {})}, base=L97C, auth=False)
+    def chat(headers):
+        return call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}]}, {"authorization": "Bearer sk-bf-l97", **headers}, base=L97C, auth=False)
+    try:
+        wait(L97C + "/health")
+        c1 = chat({"x-bf-session-id": "sess-l97", "user-agent": "Cursor/0.45.1"})
+        c2 = chat({"x-bf-session-id": "sess-l97", "user-agent": "Cursor/0.45.1"})
+        c3 = chat({"x-bf-session-id": "sess-other", "user-agent": "internal-tool/2.1 (cli)"})
+        check("the requests behind the log are served", c1[0] == 200 and c2[0] == 200 and c3[0] == 200, (c1[0], c2[0], c3[0]))
+
+        s, _, b = api("GET", "/api/logs?user_ids=user-ada&session_id=sess-l97")
+        d = json.loads(b) if s == 200 else {}
+        logs = d.get("logs", [])
+        check("the list is in Bifrost's shape, with the user, session, User-Agent and app of each request",
+              s == 200 and len(logs) == 2 and all(x["user_id"] == "user-ada" and x["session_id"] == "sess-l97" and x["app"] == "Cursor" and x["user_agent"] == "Cursor/0.45.1" and x["status"] == "success" for x in logs)
+              and d.get("pagination", {}).get("total_count") == 2 and d.get("has_logs") is True and "stats" in d, (s, b[:300]))
+        check("the list keeps Raiju's entries and total", len(d.get("entries", [])) == 2 and d.get("total") == 2, (len(d.get("entries", [])), d.get("total")))
+        one = logs[0]["id"] if logs else ""
+
+        s, _, b = api("GET", "/api/logs/" + one)
+        check("one log by id, with its cost and tokens", s == 200 and json.loads(b).get("id") == one and "cost" in json.loads(b) and "total_tokens" in json.loads(b), (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/no-such-log")
+        check("an unknown log id is a 404", s == 404, (s, b[:200]))
+
+        s, _, b = api("GET", "/api/logs/sessions/sess-l97")
+        sess = json.loads(b) if s == 200 else {}
+        check("a session lists its requests, oldest first", s == 200 and sess.get("count") == 2 and len(sess.get("logs", [])) == 2 and sess["logs"][0]["timestamp"] <= sess["logs"][1]["timestamp"], (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/sessions/sess-l97/summary")
+        sm = json.loads(b) if s == 200 else {}
+        check("a session summary totals its requests", s == 200 and sm.get("count") == 2 and "total_cost" in sm and "duration_ms" in sm, (s, b[:200]))
+
+        s, _, b = api("GET", "/api/logs?apps=Cursor&status=success")
+        check("the app and status filters select", s == 200 and json.loads(b)["total"] == 2, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?sort_by=cost&limit=1&offset=1&order=asc")
+        page = json.loads(b) if s == 200 else {}
+        check("a page of the list, ordered as asked", s == 200 and len(page.get("logs", [])) == 1 and page.get("pagination", {}).get("order") == "asc", (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?limit=5000")
+        check("a limit above 1000 is refused", s == 400, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?selected_key_ids=k1")
+        check("a filter this gateway does not record is refused, not ignored", s == 400 and "selected_key_ids" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/stats?user_ids=user-ada")
+        # every chat so far went through the key, whose user is user-ada: the three before the mappings
+        check("the stats of the filtered logs, in Bifrost's shape", s == 200 and json.loads(b).get("total_requests") == 3, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/histogram/cost/by-dimension?dimension=user")
+        check("a cost histogram by user", s == 200 and "user-ada" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/histogram/cost/by-dimension?dimension=app")
+        check("a cost histogram by app", s == 200 and "Cursor" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/rankings/users")
+        check("user rankings", s == 200 and "user-ada" in b, (s, b[:200]))
+
+        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "internal-tool", "match_type": "starts_with", "app": "Internal Tool"})
+        um = json.loads(b) if s == 200 else {}
+        check("a User-Agent mapping is created", s == 200 and um.get("app") == "Internal Tool" and um.get("id", "").startswith("uam_"), (s, b[:200]))
+        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "x", "match_type": "regex", "app": "A"})
+        check("a regex mapping is refused: this gateway has no regular expression engine", s == 400 and "regex" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "x", "app": "A"}, who=VIC)
+        check("a viewer may not add a mapping", s == 403, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/user-agent-mappings")
+        check("the mappings are listed", s == 200 and len(json.loads(b)["mappings"]) == 1, (s, b[:200]))
+        c4 = chat({"x-bf-session-id": "sess-other", "user-agent": "internal-tool/2.1 (cli)"})
+        s, _, b = api("GET", "/api/logs?apps=Internal%20Tool")
+        check("a request from a mapped User-Agent gets the mapped app", c4[0] == 200 and s == 200 and json.loads(b)["total"] == 1, (c4[0], s, b[:200]))
+        mid = um.get("id", "")
+        s, _, b = api("PUT", "/api/logs/user-agent-mappings/" + mid, {"app": "Renamed"})
+        check("a mapping is updated", s == 200 and json.loads(b)["app"] == "Renamed", (s, b[:200]))
+        s, _, b = api("DELETE", "/api/logs/user-agent-mappings/" + mid)
+        check("a mapping is deleted", s == 200 and json.loads(b).get("success") is True, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/logs/user-agent-mappings/" + mid)
+        check("deleting a mapping that is gone is a 404", s == 404, (s, b[:200]))
+
+        s, _, b = api("POST", "/api/logs/recalculate-cost", {"filters": {"user_ids": ["user-ada"]}})
+        rc = json.loads(b) if s == 200 else {}
+        check("the cost recalculation runs to the end and reports", s == 200 and rc.get("status") == "completed" and rc.get("processed") == 4, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/recalculate-cost/status")
+        check("the recalculation's status", s == 200 and json.loads(b).get("id") == rc.get("id"), (s, b[:200]))
+        s, _, b = api("POST", "/api/logs/recalculate-cost/cancel")
+        check("cancelling after the run reports its status", s == 200, (s, b[:200]))
+
+        k1 = chat({"x-bf-cache-key": "k-l97", "x-bf-session-id": "sess-cache"})
+        k2 = chat({"x-bf-cache-key": "k-l97", "x-bf-session-id": "sess-cache"})
+        check("the second identical request is a cache hit", k1[0] == 200 and hdr(k2[1], "x-bf-cache") == "hit", k2[1])
+        s, _, b = api("DELETE", "/api/cache/clear-by-key/k-l97")
+        check("clear by key drops the entries under the key", s == 200 and json.loads(b).get("removed", 0) >= 1, (s, b[:200]))
+        k3 = chat({"x-bf-cache-key": "k-l97", "x-bf-session-id": "sess-cache"})
+        check("after the clear the request is a miss again", hdr(k3[1], "x-bf-cache") != "hit", k3[1])
+        k4 = chat({"x-bf-cache-key": "k-l97", "x-bf-session-id": "sess-cache"})
+        cid = hdr(k4[1], "x-bifrost-cache-id") or ""
+        s, _, b = api("DELETE", "/api/cache/clear/" + cid)
+        check("clear by cache id drops that entry", hdr(k4[1], "x-bf-cache") == "hit" and s == 200 and json.loads(b).get("removed") == 1, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/cache/clear/notahash")
+        check("a cache id that is not a hash clears nothing", s == 200 and json.loads(b).get("removed") == 0, (s, b[:200]))
+
+        s, _, b = api("GET", "/api/audit-logs/filterdata")
+        check("audit filter data lists the actors", s == 200 and "root" in json.loads(b).get("actors", []), (s, b[:200]))
+        s, _, b = api("GET", "/api/audit-logs")
+        ev = json.loads(b).get("events", []) if s == 200 else []
+        check("the audit trail has the writes", len(ev) > 0, (s, b[:200]))
+        seq = ev[0]["seq"] if ev else -1
+        s, _, b = api("GET", "/api/audit-logs/%d" % seq)
+        check("one audit event by id", s == 200 and json.loads(b)["audit_log"]["seq"] == seq, (s, b[:200]))
+        s, _, b = api("GET", "/api/audit-logs/999999")
+        check("an unknown audit id is a 404", s == 404, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/audit-logs", who=AUD)
+        check("the governance alias lists the audit trail for an auditor", s == 200 and "events" in json.loads(b), (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/audit-logs/%d" % seq, who=AUD)
+        check("the alias serves one event by id", s == 200 and json.loads(b)["audit_log"]["seq"] == seq, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/audit-logs/filterdata", who=AUD)
+        check("the alias serves the filter data", s == 200 and "actions" in json.loads(b), (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/audit-logs", who=VIC)
+        check("a viewer may not read the audit alias", s == 403, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/audit-logs", who=EDI)
+        check("an editor may not read the audit alias", s == 403, (s, b[:200]))
+
+        s, _, b = api("POST", "/api/session/ws-ticket", {})
+        tk = json.loads(b).get("ticket", "") if s == 200 else ""
+        check("a WebSocket ticket is issued to a caller who may read the logs", s == 200 and tk.startswith("wst_"), (s, b[:200]))
+        check("the socket opens with the ticket", ws_status("/ws?ticket=" + tk) == 101, tk)
+        check("a ticket works once", ws_status("/ws?ticket=" + tk) == 401, tk)
+        check("the socket still needs a ticket or credentials", ws_status("/ws") == 401, "no credentials")
+        s, _, b = api("POST", "/api/session/ws-ticket", {}, who={})
+        check("no ticket without credentials", s == 401, (s, b[:200]))
+        s, _, b = api("POST", "/api/session/setup", {})
+        check("the setup session answers as Bifrost does while no setup lock is active", s == 409, (s, b[:200]))
+
+        s, _, b = api("GET", "/api/plugins")
+        pl = json.loads(b) if s == 200 else {}
+        byname = {p["name"]: p for p in pl.get("plugins", [])}
+        check("the configured plugins are listed with their status", s == 200 and pl.get("count") == 2 and byname.get("header", {}).get("status", {}).get("status") == "active" and byname.get("nosuch-plugin", {}).get("status", {}).get("status") == "error", (s, b[:300]))
+        s, _, b = api("GET", "/api/plugins/builtins")
+        check("the built-in plugin names", s == 200 and "telemetry" in json.loads(b)["plugins"], (s, b[:200]))
+        s, _, b = api("GET", "/api/plugins/loaded")
+        check("the plugins in the live chain", s == 200 and json.loads(b)["plugins"] == ["header"], (s, b[:200]))
+        s, _, b = api("POST", "/api/plugins", {"name": "header"})
+        check("the plugin list is read-only over the API", s == 405, (s, b[:200]))
+        s, _, b = api("GET", "/api/plugins/nosuch")
+        check("an unknown plugin is a 404", s == 404, (s, b[:200]))
+
+        s, _, b = api("GET", "/api/logs", who=VIC)
+        check("a viewer reads the logs", s == 200, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/logs", {"ids": [one]}, who=VIC)
+        check("a viewer may not delete logs", s == 403, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/logs", {"ids": []})
+        check("deleting with no ids is refused", s == 400 and "No log IDs" in b, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/logs", {"ids": [one]})
+        check("an admin deletes a log by id", s == 200 and json.loads(b).get("removed") == 1, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/" + one)
+        check("the deleted log is gone", s == 404, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -3562,6 +3775,8 @@ def main():
         l97b_e2e(env)
         # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients: their own gateway
         mcp_keys_e2e(env)
+        # the request log in Bifrost's shapes, User-Agent mappings, cache clears, audit by id, tickets and plugin listings: its own gateway
+        l97c_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
