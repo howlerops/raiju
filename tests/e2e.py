@@ -1347,6 +1347,150 @@ def l97b_e2e(env):
     finally:
         gw.terminate()
 
+GW_L97J = "http://127.0.0.1:18148"  # self-service quota, budget overrides, VK users, routing rules, complexity config, user roles, the catalogue, PUT /api/config sections
+GW_L97J_AUTH = "http://127.0.0.1:18149"  # PUT /api/config auth_config on a gateway with dashboard credentials
+
+def l97j_e2e(env):
+    """The governance remainder: the self-service quota view (refused when expired), budget overrides per key, the key's
+    users, routing rules and the complexity analyzer config, a user's role, a custom role's permissions by id and the
+    signed-in user's own permissions, the RBAC catalogue, and PUT /api/config for framework_config and auth_config.
+    Their own gateways (18148 and 18149)."""
+    import base64
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l97j", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l97j-root")},
+                      {"name": "ann", "role": "viewer", "token_sha256": tok("sk-admin-l97j-ann")}],
+            "budgets": [{"id": "b-q", "max_limit": 10, "reset_duration": "1d"}, {"id": "b-other", "max_limit": 3, "reset_duration": "1d"}],
+            "rate_limits": [{"id": "rl-q", "request_max_limit": 100, "request_reset_duration": "1m"}],
+            "virtual_keys": [
+                {"id": "vk-q", "name": "quota-key", "value": "sk-bf-quota-0123456789abcdef", "budget_id": "b-q", "rate_limit_id": "rl-q", "user_id": "ann", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-exp", "value": "sk-bf-quexp-0123456789abcdef", "expires_at": "2001-01-01T00:00:00Z"},
+            ],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.l97j.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18148", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.l97j.log"), "w"))
+    auth_cfg = {"client": {"enable_logging": False}, "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False}, "governance": {"auth_config": {"admin_username": "boss", "admin_password": "pw-old-l97j"}}}
+    path_b = os.path.join(BUILD, "e2e.l97j-auth.json")
+    json.dump(auth_cfg, open(path_b, "w"))
+    gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18149", "-host", "127.0.0.1", "-config", path_b], env=env, stderr=open(os.path.join(BUILD, "e2e.l97j-auth.log"), "w"))
+    root = {"authorization": "Bearer sk-admin-l97j-root"}
+    def adm(method, p, body=None, who=root):
+        return call(method, p, body, who, base=GW_L97J, auth=False)
+    def quota(key=None):
+        return call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": key} if key else {}, base=GW_L97J, auth=False)
+    def basic(user, pw):
+        return {"authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
+    try:
+        wait(GW_L97J + "/health")
+        wait(GW_L97J_AUTH + "/health")
+        s, _, b = quota("sk-bf-quota-0123456789abcdef")
+        q = json.loads(b) if s == 200 else {}
+        check("the quota view answers for the key in the request, with no admin session", s == 200 and q.get("virtual_key_name") == "quota-key" and q.get("is_active") is True, (s, b[:300]))
+        check("the quota view lists the key's budget with its limit and usage", [x.get("max_limit") for x in q.get("budgets", [])] == [10] and q["budgets"][0].get("current_usage") == 0, (s, b[:300]))
+        check("the quota view lists the key's rate limit", [x.get("id") for x in q.get("rate_limits", [])] == ["rl-q"], (s, b[:300]))
+        s, _, b = quota()
+        check("the quota view needs a virtual key", s == 401, (s, b[:200]))
+        s, _, b = quota("sk-bf-quexp-0123456789abcdef")
+        check("the quota view refuses an expired key", s == 403 and "expired" in b, (s, b[:200]))
+
+        s, _, b = adm("PUT", "/api/governance/virtual-keys/vk-q/budgets/b-q/override", {"amount": 5, "mode": "forever"})
+        check("a forever override answers the effective limit", s == 200 and json.loads(b).get("effective_max_limit") == 15, (s, b[:300]))
+        s, _, b = quota("sk-bf-quota-0123456789abcdef")
+        check("the quota view shows the override", s == 200 and json.loads(b)["budgets"][0]["effective_max_limit"] == 15, (s, b[:300]))
+        s, _, b = adm("PUT", "/api/governance/virtual-keys/vk-q/budgets/b-other/override", {"amount": 5, "mode": "forever"})
+        check("an override of a budget the key does not draw on is a 404", s == 404, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/governance/virtual-keys/vk-q/budgets/b-q/override", {"amount": 5, "mode": "cycles", "cycles": 2})
+        check("a cycles override is refused", s == 400, (s, b[:200]))
+        s, _, b = adm("DELETE", "/api/governance/virtual-keys/vk-q/budgets/b-q/override")
+        s2, _, b2 = quota("sk-bf-quota-0123456789abcdef")
+        check("clearing the override restores the limit", s == 200 and s2 == 200 and json.loads(b2)["budgets"][0]["effective_max_limit"] == 10, (s, b2[:300]))
+        s, _, b = adm("GET", "/api/governance/virtual-keys/vk-q/users")
+        check("the key's users are the user it is assigned to", s == 200 and [u["user_id"] for u in json.loads(b)["users"]] == ["ann"], (s, b[:200]))
+        s, _, b = adm("PUT", "/api/governance/virtual-keys/quota", {"x": 1})
+        check("the quota path takes no PUT", s == 405, (s, b[:200]))
+
+        s, _, b = adm("POST", "/api/routing/rules", {"name": "big", "cel_expression": "request > 10", "targets": [{"provider": "openai"}]})
+        rid = json.loads(b).get("id", "") if s == 201 else ""
+        check("a routing rule is created with a generated id", s == 201 and rid != "", (s, b[:300]))
+        s, _, b = adm("GET", "/api/governance/routing-rules")
+        check("the routing rules are listed", s == 200 and json.loads(b)["total"] == 1, (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/routing-rules", {"cel_expression": "request >", "targets": [{"provider": "openai"}]})
+        check("a rule whose expression does not compile is refused", s == 400, (s, b[:200]))
+        s, _, b = adm("PUT", f"/api/governance/routing-rules/{rid}", {"cel_expression": "request > 20", "targets": [{"provider": "anthropic"}]})
+        check("a routing rule is replaced", s == 200 and "anthropic" in b, (s, b[:200]))
+        s, _, b = adm("DELETE", f"/api/routing/rules/{rid}")
+        check("a routing rule is deleted through the routing alias", s == 200, (s, b[:200]))
+        s, _, b = adm("GET", f"/api/governance/routing-rules/{rid}")
+        check("a deleted routing rule is a 404", s == 404, (s, b[:200]))
+
+        s, _, b = adm("GET", "/api/governance/complexity-analyzer-config")
+        check("the complexity analyzer config is {} when off", s == 200 and b.strip() == "{}", (s, b[:200]))
+        s, _, b = adm("PUT", "/api/routing/complexity-analyzer-config", {"enabled": True, "simple_max_score": 0.3, "complex_min_score": 0.7})
+        check("the complexity analyzer config is replaced", s == 200 and json.loads(b).get("enabled") is True, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/governance/complexity-analyzer-config", {"enabled": "yes"})
+        check("a complexity analyzer config with a bad type is refused", s == 400, (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/complexity-analyzer-config/reset")
+        s2, _, b2 = adm("GET", "/api/governance/complexity-analyzer-config")
+        check("the complexity analyzer config resets to off", s == 200 and s2 == 200 and b2.strip() == "{}", (s, b2[:200]))
+
+        s, _, b = adm("GET", "/api/users/ann/role")
+        check("a user's role is read", s == 200 and json.loads(b)["role"] == "viewer", (s, b[:200]))
+        s, _, b = adm("PUT", "/api/users/ann/role", {"role": "editor"})
+        check("a user's role is set", s == 200 and json.loads(b)["role"] == "editor", (s, b[:200]))
+        s, _, b = adm("PUT", "/api/users/ann/role", {"role": "owner"})
+        check("an unknown role is refused", s == 400, (s, b[:200]))
+        s, _, b = adm("POST", "/api/roles", {"name": "ops", "permissions": []})
+        check("a custom role is created", s == 201, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/roles/ops/permissions", {"permission_ids": [1, 2]})
+        check("a role takes its permissions by id", s == 200 and '"resource":"Logs"' in b and '"operation":"Create"' in b, (s, b[:300]))
+        s, _, b = adm("GET", "/api/roles/ops/permissions")
+        check("a role's permissions are listed with their ids", s == 200 and sorted(p["id"] for p in json.loads(b)["permissions"]) == [1, 2], (s, b[:300]))
+        s, _, b = adm("PUT", "/api/roles/ops/permissions", {"permission_ids": [0]})
+        check("an unknown permission id is refused", s == 400, (s, b[:200]))
+        s, _, b = adm("POST", "/api/users", {"name": "carl", "role": "ops"})
+        token = json.loads(b).get("token", "") if s == 201 else ""
+        check("a user with a custom role is created", s == 201 and token != "", (s, b[:200]))
+        s, _, b = call("GET", "/api/users/me/permissions", None, {"authorization": "Bearer " + token}, base=GW_L97J, auth=False)
+        check("a signed-in user reads its own permissions, custom role included", s == 200 and json.loads(b)["role"] == "ops" and [p["id"] for p in json.loads(b)["permissions"]] == [1, 2], (s, b[:300]))
+        s, _, b = adm("GET", "/api/users/me/permissions")
+        check("the admin's permissions name the built-in role", s == 200 and json.loads(b)["built_in"] is True and json.loads(b)["role"] == "admin", (s, b[:200]))
+
+        s, _, b = adm("GET", "/api/resources")
+        check("the resources are listed", s == 200 and '"name":"VirtualKeys"' in b, (s, b[:200]))
+        s, _, b = adm("GET", "/api/governance/rbac/operations")
+        check("the operations are listed under the RBAC path", s == 200 and '"name":"RunInference"' in b, (s, b[:200]))
+        s, _, b = adm("GET", "/api/permissions")
+        check("the permission pairs carry their ids", s == 200 and json.loads(b)["permissions"][0]["id"] == 1, (s, b[:200]))
+        s, _, b = adm("POST", "/api/permissions", {})
+        check("the catalogue is read only", s == 405, (s, b[:200]))
+
+        s, _, b = adm("PUT", "/api/config", {"client_config": {"delete_expired_virtual_keys": True, "hide_deleted_virtual_keys_in_filters": True}, "framework_config": {"pricing_url": MOCK + "/nodatasheet", "pricing_sync_interval": 3600}})
+        check("PUT /api/config takes client_config and framework_config together", s == 200 and json.loads(b)["framework_config"]["pricing_sync_interval"] == 3600, (s, b[:300]))
+        s, _, b = adm("GET", "/api/config")
+        check("the client and framework settings are read back", s == 200 and '"delete_expired_virtual_keys":true' in b.replace(" ", "") and "3600" in b, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/config", {"framework_config": {"pricing_sync_interval": -5}})
+        check("a negative pricing sync interval is refused", s == 400, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/config", {"auth_config": {"admin_username": "x"}})
+        check("an auth_config without a password is refused", s == 400, (s, b[:200]))
+
+        boss_old = basic("boss", "pw-old-l97j")
+        s, _, b = call("PUT", "/api/config", {"auth_config": {"admin_username": "boss", "admin_password": "pw-new-l97j"}}, boss_old, base=GW_L97J_AUTH, auth=False)
+        check("PUT /api/config changes the dashboard password", s == 200, (s, b[:200]))
+        s, _, _ = call("GET", "/api/config", None, boss_old, base=GW_L97J_AUTH, auth=False)
+        check("the old dashboard password stops working", s == 401, s)
+        s, _, b = call("GET", "/api/config", None, basic("boss", "pw-new-l97j"), base=GW_L97J_AUTH, auth=False)
+        check("the new dashboard password works, and the config shows none", s == 200 and "pw-new-l97j" not in b and "pw-old-l97j" not in b, (s, b[:200]))
+    finally:
+        gw.terminate(); gw_b.terminate()
+
 MCP_KEYS = "http://127.0.0.1:18123"  # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients
 
 MCP_KEYS_SPEC = json.dumps({"openapi": "3.0.3", "info": {"title": "Raiju self", "version": "1"}, "paths": {"/api/version": {"get": {"operationId": "version", "summary": "The gateway's version"}}}})
@@ -4232,6 +4376,8 @@ def main():
         l97i_e2e(env)
         # provider model lists, Vertex count tokens and OpenRouter's native decisions: their own gateway
         l97h_e2e(env)
+        # the governance remainder: quota, budget overrides, routing rules, roles, catalogue and PUT /api/config sections
+        l97j_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

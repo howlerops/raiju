@@ -9,7 +9,10 @@ import {
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
   ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig, CircuitPolicyConfig,
   WebhookEndpoint, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping,
+  BudgetOverride, PricingSyncConfig, ComplexitySettings,
 } from "./config"
+import { RoutingRule, RuleTarget } from "./cel"
+import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom } from "./govapi"
 import { PromptRepoConfig } from "./prompts"
 import { FeatureFlagsConfig } from "./flags"
 import { notify } from "./notify"
@@ -19,10 +22,10 @@ import { setGlobalProxy } from "./providers/types"
 import { McpClientConfig, McpUserCredential } from "./mcp"
 import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
-import { Field, fields, find, isNull, quote, elements, decodeString, rawStr } from "./json"
+import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum } from "./json"
 import { secureHex, utf8 } from "./crypto"
 import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
-import { durationMs } from "./governance"
+import { durationMs, effectiveBudgetLimit } from "./governance"
 
 export type AdminAuth = AdminAuthConfig
 
@@ -51,8 +54,8 @@ type BusinessUnitBody = { id?: string, name?: string, budget_id?: string, rate_l
 type RoleBody = { name?: string, description?: string, dac?: string, permissions?: PermissionPair[] }
 
 // The resources a custom role may name, the operations on them, and the data access scopes.
-const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster"]
-const OPERATIONS = ["View", "Create", "Update", "Delete", "Download", "Reveal", "RunInference"]
+export const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster"]
+export const OPERATIONS = ["View", "Create", "Update", "Delete", "Download", "Reveal", "RunInference"]
 const DACS = ["own-data", "team-data", "business-unit-data", "customer-data", "all-data"]
 // The governance collections a scoped user (see scope.tov) may read and change, record by record.
 const SCOPED_COLLECTIONS = ["virtual-keys", "teams", "customers", "business-units", "projects"]
@@ -1158,6 +1161,58 @@ export class ConfigStore {
     return this.commit(n, "client")
   }
 
+  // Replaces the pricing sync section (Bifrost's framework.pricing); see putConfig.
+  setPricingSync(ps: PricingSyncConfig | undefined): Result {
+    let n: Config = this.cfg
+    n.pricing_sync = ps
+    return this.commit(n, "framework-config")
+  }
+
+  // Replaces the admin credential (governance.auth_config); see putConfig.
+  setAdminAuth(a: AdminAuthConfig): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    g.auth_config = a
+    return this.commit(withGov(this.cfg, g), "auth-config")
+  }
+
+  // Sets or clears (undefined) a budget's override. The budget must be one the key draws on (keyBudgetIds).
+  setBudgetOverride(vkId: string, budgetId: string, o: BudgetOverride | undefined): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const vk = findById(g.virtual_keys, vkId)
+    if (vk === undefined) return fail(404, `no virtual-keys ${vkId}`)
+    if (!keyBudgetIds(vk).includes(budgetId)) return fail(404, `budget ${budgetId} is not on virtual key ${vkId}`)
+    const budgets: BudgetConfig[] = g.budgets ?? []
+    const b = findById(budgets, budgetId)
+    if (b === undefined) return fail(404, `no budgets ${budgetId}`)
+    const nb: BudgetConfig = { id: b.id, max_limit: b.max_limit, reset_duration: b.reset_duration, current_usage: b.current_usage, override: o }
+    g.budgets = putById(budgets, nb)
+    return this.commit(withGov(this.cfg, g), "budget-override")
+  }
+
+  // Adds or replaces a routing rule (by id), after ruleError.
+  upsertRoutingRule(rule: RoutingRule): Result {
+    const err = ruleError(rule)
+    if (err !== "") return fail(400, err)
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    g.routing_rules = putById(g.routing_rules ?? [], rule)
+    return this.commit(withGov(this.cfg, g), "routing-rules")
+  }
+
+  deleteRoutingRule(id: string): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const rules: RoutingRule[] = g.routing_rules ?? []
+    if (findById(rules, id) === undefined) return fail(404, `no routing rule ${id}`)
+    g.routing_rules = dropById(rules, id)
+    return this.commit(withGov(this.cfg, g), "routing-rules")
+  }
+
+  // Replaces the complexity analyzer config (complexity_router); undefined turns it off.
+  setComplexity(cs: ComplexitySettings | undefined): Result {
+    let n: Config = this.cfg
+    n.complexity_router = cs
+    return this.commit(n, "complexity-analyzer-config")
+  }
+
   private putProvider(name: string, np: ProviderConfig, id: string): Result {
     const ps = copyProviders(this.cfg)
     ps.set(name, np)
@@ -2121,6 +2176,21 @@ function governanceRoute(store: ConfigStore, m: string, segs: string[], body: st
   if (coll === "virtual-keys" && (segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate")) {
     return rotateVkRoute(store, m, segs, body, path, scope)
   }
+  // the quota view is served before the admin gate (server.tov); here only its method is judged
+  if (coll === "virtual-keys" && segs.length === 4 && segs[3] === "quota") return notAllowed(m)
+  if (coll === "virtual-keys" && segs.length === 5 && segs[4] === "users") return vkUsers(store, m, segs[3] ?? "", scope)
+  if (coll === "virtual-keys" && segs.length === 7 && segs[4] === "budgets" && segs[6] === "override") {
+    return budgetOverrideRoute(store, m, segs[3] ?? "", segs[5] ?? "", body, scope)
+  }
+  if (coll === "routing-rules") return routingRulesRoute(store, m, segs, body, path, scope)
+  if (coll === "complexity-analyzer-config") return complexityRoute(store, m, segs, body, path, scope)
+  // Bifrost's RBAC routes: /api/governance/rbac/roles is /api/roles, the rest are the catalogue
+  if (coll === "rbac") {
+    const sub = segs[3] ?? ""
+    if (sub === "roles") return roleRoute(store, m, ["api", "roles"].concat(segs.slice(4)), body, path, scope)
+    if (sub === "resources" || sub === "operations" || sub === "permissions") return segs.length === 4 ? rbacListing(sub, m) : notFound(path)
+    return notFound(path)
+  }
   if (coll === "model-configs") return modelConfigRoute(store, m, segs, body, path)
   if (coll === "providers") return providerGovRoute(store, m, segs, body, path)
   if (coll === "pricing-overrides") return pricingRoute(store, m, segs, body, path)
@@ -2380,9 +2450,10 @@ function businessUnitFrom(id: string, b: BusinessUnitBody): BusinessUnitConfig {
 
 // /api/roles[/{name}]: custom roles, as Bifrost's role routes name them. Built-in roles are not listed here.
 function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
-  if (segs.length > 3) return notFound(path)
+  if (segs.length > 4 || segs.length === 4 && segs[3] !== "permissions") return notFound(path)
   if (!scope.all && m !== "GET") return scopeDenied()
   const name = segs[2]
+  if (segs.length === 4 && name !== undefined) return rolePermissions(store, m, name, body)
   if (name === undefined) {
     if (m === "GET") return reply(200, JSON.stringify({ roles: gov(store.cfg).roles ?? [] }))
     if (m !== "POST") return notAllowed(m)
@@ -2408,6 +2479,40 @@ function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, 
     return reply(200, JSON.stringify({ deleted: name }))
   }
   return notAllowed(m)
+}
+
+// GET and PUT /api/roles/{name}/permissions. Bifrost names permissions by id: GET lists the role's
+// pairs with their ids, and PUT {"permission_ids": [...]} replaces the pairs with the ones those ids name.
+function rolePermissions(store: ConfigStore, m: string, name: string, body: string): ApiReply {
+  const cur = customRole(gov(store.cfg).roles, name)
+  if (cur === undefined) return reply(404, errorBody(`no role ${name}`))
+  if (m === "GET") {
+    const ids = permissionIds(RESOURCES, OPERATIONS, cur.permissions ?? [])
+    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+    return reply(200, JSON.stringify({ role: name, permissions: docs }))
+  }
+  if (m !== "PUT") return notAllowed(m)
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return badBody()
+  }
+  const raw = find(fs, "permission_ids") ?? ""
+  const pairs: PermissionPair[] = []
+  try {
+    for (const el of elements(raw)) {
+      const id = parseFloat(el)
+      const pair = id === undefined ? undefined : pairOfId(RESOURCES, OPERATIONS, Math.floor(id))
+      if (pair === undefined) return reply(400, errorBody(`unknown permission id ${el}`))
+      pairs.push(pair)
+    }
+  } catch (e) {
+    return reply(400, errorBody("permission_ids must be a list of permission ids"))
+  }
+  const r = store.upsertRole({ name: name, description: cur.description, dac: cur.dac, permissions: pairs })
+  if (r.kind === "error") return errReply(r)
+  return rolePermissions(store, "GET", name, "")
 }
 
 function roleFrom(name: string, b: RoleBody): RoleConfig {
@@ -2518,7 +2623,7 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
 const RAIJU_VERSION = "0.1.0"
 
 // The client section's settings by JSON type, for PUT /api/config. Any other name is refused.
-const CLIENT_BOOL = ["drop_excess_requests", "disable_content_logging", "allow_per_request_content_storage_override", "enable_logging", "enable_governance", "enforce_governance_header", "enforce_auth_on_inference", "allow_direct_keys", "refuse_unpriced_models"]
+const CLIENT_BOOL = ["drop_excess_requests", "disable_content_logging", "allow_per_request_content_storage_override", "enable_logging", "enable_governance", "enforce_governance_header", "enforce_auth_on_inference", "allow_direct_keys", "refuse_unpriced_models", "delete_expired_virtual_keys", "hide_deleted_virtual_keys_in_filters", "enforce_vk_object_ownership"]
 const CLIENT_INT = ["max_request_body_size_mb", "async_job_result_ttl", "mcp_agent_depth"]
 const CLIENT_LIST = ["required_headers", "allowed_origins", "prometheus_labels", "mcp_auto_execute"]
 
@@ -2555,8 +2660,66 @@ function digitsOnly(s: string): bool {
   return true
 }
 
-// PUT /api/config: replaces the client section, given as client_config (Bifrost) or client.
-// The rest of the config is saved as it was.
+// The framework_config section (Bifrost's TableFrameworkConfig): pricing_url and pricing_sync_interval
+// become pricing_sync. An empty pricing_url resets to the default; model_parameters_url is read and
+// not used (Raiju serves its parameters from the embedded table or the pricing datasheet).
+type FrameworkPlan = { kind: "ok", ps: PricingSyncConfig | undefined } | { kind: "error", message: string }
+
+function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): FrameworkPlan {
+  let fs: Field[] = []
+  try {
+    fs = fields(raw)
+  } catch (e) {
+    return { kind: "error", message: "framework_config must be a JSON object" }
+  }
+  let url: string | undefined = cur?.url
+  const given = rawStr(fs, "pricing_url")
+  if (find(fs, "pricing_url") !== undefined && given === undefined) return { kind: "error", message: "pricing_url must be a string" }
+  if (given !== undefined) url = given === "" ? undefined : given
+  if (url !== undefined && !url.startsWith("https://") && !url.startsWith("http://")) return { kind: "error", message: "pricing_url must be an http or https URL" }
+  let interval: int | undefined = cur?.interval_seconds
+  const iv = rawNum(fs, "pricing_sync_interval")
+  if (find(fs, "pricing_sync_interval") !== undefined && iv === undefined) return { kind: "error", message: "pricing_sync_interval must be a number of seconds" }
+  if (iv !== undefined) {
+    if (iv <= 0.0) return { kind: "error", message: "pricing_sync_interval must be positive" }
+    interval = Math.floor(iv)
+  }
+  if (url === undefined && interval === undefined && cur?.enabled === undefined) return { kind: "ok", ps: undefined }
+  return { kind: "ok", ps: { url: url, interval_seconds: interval, enabled: cur?.enabled } }
+}
+
+// The auth_config section (Bifrost's auth config, as PUT /api/config takes it): admin_username and
+// admin_password replace the stored credential ("<redacted>" keeps the stored password), is_enabled false
+// clears it, and disable_auth_on_inference sets client.enforce_auth_on_inference. The token is kept.
+type AuthPlan = { kind: "ok", auth: AdminAuthConfig, disable: bool | undefined } | { kind: "error", message: string }
+
+function authPlan(raw: string, cur: AdminAuthConfig | undefined): AuthPlan {
+  let fs: Field[] = []
+  try {
+    fs = fields(raw)
+  } catch (e) {
+    return { kind: "error", message: "auth_config must be a JSON object" }
+  }
+  const enabledRaw = find(fs, "is_enabled")
+  if (enabledRaw !== undefined && rawBool(fs, "is_enabled") === undefined) return { kind: "error", message: "is_enabled must be true or false" }
+  const disableRaw = find(fs, "disable_auth_on_inference")
+  if (disableRaw !== undefined && rawBool(fs, "disable_auth_on_inference") === undefined) return { kind: "error", message: "disable_auth_on_inference must be true or false" }
+  const disable = rawBool(fs, "disable_auth_on_inference")
+  if (rawBool(fs, "is_enabled") === false) return { kind: "ok", auth: { token: cur?.token }, disable: disable }
+  let user: string | undefined = cur?.username
+  const u = rawStr(fs, "admin_username")
+  if (u !== undefined) user = u
+  let pw: string | undefined = cur?.password
+  const p = rawStr(fs, "admin_password")
+  if (p !== undefined && p !== REDACTED) pw = p
+  if (user === undefined || user === "" || pw === undefined || pw === "") {
+    return { kind: "error", message: "admin_username and admin_password are required to turn admin auth on" }
+  }
+  return { kind: "ok", auth: { username: user, password: pw, token: cur?.token }, disable: disable }
+}
+
+// PUT /api/config: the sections Bifrost's handler takes, each given section replaced and the rest kept:
+// client_config (or client), framework_config and auth_config. Every section is checked before any is saved.
 function putConfig(store: ConfigStore, body: string): ApiReply {
   let fs: Field[] = []
   try {
@@ -2564,19 +2727,178 @@ function putConfig(store: ConfigStore, body: string): ApiReply {
   } catch (e) {
     return badBody()
   }
-  const raw = find(fs, "client_config") ?? find(fs, "client")
-  if (raw === undefined) return reply(400, errorBody("the body needs a client_config (or client) object"))
-  const problem = clientProblem(raw)
-  if (problem !== "") return reply(400, errorBody(problem))
-  let c: ClientConfig = {}
-  try {
-    c = JSON.parse(raw) as ClientConfig
-  } catch (e) {
-    return badBody()
+  const rawClient = find(fs, "client_config") ?? find(fs, "client")
+  const rawFramework = find(fs, "framework_config")
+  const rawAuth = find(fs, "auth_config")
+  if (rawClient === undefined && rawFramework === undefined && rawAuth === undefined) {
+    return reply(400, errorBody("the body needs a client_config, framework_config or auth_config object"))
   }
-  const r = store.setClient(c)
+  let c: ClientConfig | undefined = undefined
+  if (rawClient !== undefined) {
+    const problem = clientProblem(rawClient)
+    if (problem !== "") return reply(400, errorBody(problem))
+    try {
+      c = JSON.parse(rawClient) as ClientConfig
+    } catch (e) {
+      return badBody()
+    }
+  }
+  let fp: FrameworkPlan = { kind: "ok", ps: store.cfg.pricing_sync }
+  if (rawFramework !== undefined) fp = frameworkPlan(rawFramework, store.cfg.pricing_sync)
+  if (fp.kind === "error") return reply(400, errorBody(fp.message))
+  let ap: AuthPlan | undefined = undefined
+  if (rawAuth !== undefined) {
+    ap = authPlan(rawAuth, store.cfg.governance?.auth_config ?? store.cfg.auth_config)
+    if (ap.kind === "error") return reply(400, errorBody(ap.message))
+  }
+  // disable_auth_on_inference is client.enforce_auth_on_inference, inverted
+  let disable: bool | undefined = undefined
+  if (ap !== undefined && ap.kind === "ok") disable = ap.disable
+  if (c !== undefined || disable !== undefined) {
+    let cl: ClientConfig = c ?? store.cfg.client ?? {}
+    if (disable !== undefined) cl.enforce_auth_on_inference = !disable
+    const r = store.setClient(cl)
+    if (r.kind === "error") return errReply(r)
+  }
+  if (rawFramework !== undefined) {
+    const r = store.setPricingSync(fp.ps)
+    if (r.kind === "error") return errReply(r)
+  }
+  if (ap !== undefined && ap.kind === "ok") {
+    const r = store.setAdminAuth(ap.auth)
+    if (r.kind === "error") return errReply(r)
+  }
+  const pf = store.cfg.pricing_sync
+  const au = store.cfg.governance?.auth_config
+  const view = JSON.stringify({
+    status: "success",
+    message: "config updated successfully",
+    client: store.cfg.client ?? {},
+    framework_config: { pricing_url: pf?.url ?? "", pricing_sync_interval: pf?.interval_seconds ?? 0 },
+    auth_config: { admin_username: au?.username ?? "", is_enabled: au?.username !== undefined, disable_auth_on_inference: store.cfg.client?.enforce_auth_on_inference === false },
+  })
+  return reply(200, view)
+}
+
+// ---- routing rules, complexity analyzer, budget overrides, expired keys ----
+
+// PUT /api/governance/virtual-keys/{vk}/budgets/{budget}/override and DELETE on the same path.
+function budgetOverrideRoute(store: ConfigStore, m: string, vkId: string, budgetId: string, body: string, scope: DataScope): ApiReply {
+  if (m !== "PUT" && m !== "DELETE") return notAllowed(m)
+  if (!scope.all) return scopeDenied()
+  if (!recordInScope(store.cfg, "virtual-keys", vkId, scope)) return reply(404, errorBody(`no virtual-keys ${vkId}`))
+  let o: BudgetOverride | undefined = undefined
+  if (m === "PUT") {
+    const pr = parseOverride(body)
+    if (pr.kind === "error") return reply(400, errorBody(pr.message))
+    o = pr.override
+  }
+  const r = store.setBudgetOverride(vkId, budgetId, o)
   if (r.kind === "error") return errReply(r)
-  return reply(200, JSON.stringify({ status: "success", message: "config updated successfully", client: store.cfg.client ?? {} }))
+  const b = findById(gov(store.cfg).budgets, budgetId)
+  return reply(200, JSON.stringify({ budget: b, effective_max_limit: b === undefined ? 0.0 : effectiveBudgetLimit(b) }))
+}
+
+// GET /api/governance/virtual-keys/{vk}/users. A key has one assigned user (its user_id).
+function vkUsers(store: ConfigStore, m: string, id: string, scope: DataScope): ApiReply {
+  if (m !== "GET") return notAllowed(m)
+  const vk = findById(gov(store.cfg).virtual_keys, id)
+  if (vk === undefined || !recordInScope(store.cfg, "virtual-keys", id, scope)) return reply(404, errorBody(`no virtual-keys ${id}`))
+  const users: { user_id: string, user_name: string, user_email: string, source: string }[] = []
+  const u = vk.user_id ?? ""
+  if (u !== "") users.push({ user_id: u, user_name: u, user_email: "", source: "assigned" })
+  return reply(200, JSON.stringify({ users: users }))
+}
+
+// GET /api/resources, /api/operations and /api/permissions (and the /api/governance/rbac/ forms).
+function rbacListing(what: string, m: string): ApiReply {
+  if (m !== "GET") return notAllowed(m)
+  if (what === "resources") return reply(200, JSON.stringify({ resources: RESOURCES.map((r, i) => ({ id: i + 1, name: r })) }))
+  if (what === "operations") return reply(200, JSON.stringify({ operations: OPERATIONS.map((o, i) => ({ id: i + 1, name: o })) }))
+  return reply(200, JSON.stringify({ permissions: permissionDocs(RESOURCES, OPERATIONS) }))
+}
+
+// A routing rule as a request body gives it: every field optional, so ruleError names what is missing.
+type RuleBody = { id?: string, name?: string, cel_expression?: string, targets?: RuleTarget[], fallbacks?: string[], scope?: "global" | "virtual_key" | "team" | "customer", scope_id?: string, priority?: int, enabled?: bool }
+
+// The routing rule in a request body. The id comes from the path or is generated; the rest is taken as given.
+function parseRule(b: string, id: string): RoutingRule | undefined {
+  try {
+    const r = JSON.parse(b) as RuleBody
+    const given = r.id ?? ""
+    return { id: given === "" ? id : given, name: r.name, cel_expression: r.cel_expression ?? "", targets: r.targets ?? [], fallbacks: r.fallbacks, scope: r.scope, scope_id: r.scope_id, priority: r.priority, enabled: r.enabled }
+  } catch (e) {
+    return undefined
+  }
+}
+
+// /api/governance/routing-rules[/{id}] (and /api/routing/rules): the CEL routing rules, as Raiju stores them.
+function routingRulesRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+  if (!scope.all && m !== "GET") return scopeDenied()
+  const rules: RoutingRule[] = gov(store.cfg).routing_rules ?? []
+  if (segs.length === 3) {
+    if (m === "GET") return reply(200, JSON.stringify({ rules: rules, total: rules.length }))
+    if (m !== "POST") return notAllowed(m)
+    const rule = parseRule(body, randomId("rule"))
+    if (rule === undefined) return badBody()
+    if (findById(rules, rule.id) !== undefined) return reply(409, errorBody(`routing rule ${rule.id} exists`))
+    const r = store.upsertRoutingRule(rule)
+    if (r.kind === "error") return errReply(r)
+    return reply(201, JSON.stringify(findById(gov(store.cfg).routing_rules, rule.id)))
+  }
+  if (segs.length !== 4) return notFound(path)
+  const id = segs[3] ?? ""
+  const cur = findById(rules, id)
+  if (cur === undefined) return reply(404, errorBody(`no routing rule ${id}`))
+  if (m === "GET") return reply(200, JSON.stringify(cur))
+  if (m === "PUT") {
+    const rule = parseRule(body, id)
+    if (rule === undefined) return badBody()
+    const r = store.upsertRoutingRule(rule)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify(findById(gov(store.cfg).routing_rules, id)))
+  }
+  if (m === "DELETE") {
+    const r = store.deleteRoutingRule(id)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: id }))
+  }
+  return notAllowed(m)
+}
+
+// /api/governance/complexity-analyzer-config (and /api/routing/...): Raiju's complexity_router, read,
+// replaced, or reset to none.
+function complexityRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+  if (!scope.all && m !== "GET") return scopeDenied()
+  const reset = segs.length === 4 && segs[3] === "reset"
+  if (segs.length === 3 && m === "GET") return reply(200, JSON.stringify(store.cfg.complexity_router ?? {}))
+  if (segs.length === 3 && m === "PUT") {
+    const problem = complexityProblem(body)
+    if (problem !== "") return reply(400, errorBody(problem))
+    const cs = complexityFrom(body)
+    if (cs === undefined) return badBody()
+    const r = store.setComplexity(cs)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify(store.cfg.complexity_router ?? {}))
+  }
+  if (reset && m === "POST") {
+    const r = store.setComplexity(undefined)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({}))
+  }
+  if (segs.length === 3 || reset) return notAllowed(m)
+  return notFound(path)
+}
+
+// The expired-key cleanup (Bifrost's daily vk_expiry_cleanup): deletes the keys expiredToDelete names.
+// Returns the ids deleted. Run by the supervisor on a timer (ops.tov sweepExpiredKeys).
+export function sweepExpiredKeys(store: ConfigStore, nowMs: number): string[] {
+  const done: string[] = []
+  for (const id of expiredToDelete(store.cfg.governance, store.cfg.client, nowMs)) {
+    const r = store.deleteVirtualKey(id)
+    if (r.kind === "ok") done.push(id)
+  }
+  return done
 }
 
 // POST /api/config/metadata: merges the body's keys into the metadata map; null removes a key.
@@ -2662,6 +2984,16 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   const segs = p.split("/").filter((s) => s !== "")
   if (segs.length === 0 || segs[0] !== "api") return notFound(p)
   const area = segs[1] ?? ""
+  // Bifrost's /api/routing/... are the governance routes
+  if (area === "routing" && segs.length >= 3) {
+    const sub = segs[2] === "rules" ? "routing-rules" : segs[2] ?? ""
+    return governanceRoute(store, m, ["api", "governance", sub].concat(segs.slice(3)), body, p, qp, sc)
+  }
+  // Bifrost's RBAC catalogue: the resources, operations and permission pairs (read only)
+  if (area === "resources" || area === "operations" || area === "permissions") {
+    if (segs.length !== 2) return notFound(p)
+    return rbacListing(area, m)
+  }
   if (area === "config") {
     if (segs.length === 3 && segs[2] === "metadata") return m === "POST" ? postMetadata(store, body) : notAllowed(m)
     if (segs.length !== 2) return notFound(p)
@@ -2738,6 +3070,115 @@ test("proxy-config: defaults, validation, password kept on <redacted>, and widen
     // disabling clears the proxy for providers too
     expect(handleApi(store, "PUT", "/api/proxy-config", `{"enabled":false}`).status).toBe(200)
     expect(store.cfg.proxy_config?.enabled).toBe(false)
+  } finally {
+    cleanup(path)
+  }
+})
+
+test("sweepExpiredKeys deletes the expired keys that opted in and keeps the others", () => {
+  const path = tmpPath()
+  try {
+    const store = try new ConfigStore(path, { governance: { virtual_keys: [
+      { id: "x", value: "vx", expires_at: "2001-01-01T00:00:00Z", delete_after_expire: true },
+      { id: "y", value: "vy", expires_at: "2001-01-01T00:00:00Z" },
+      { id: "z", value: "vz", expires_at: "2999-01-01T00:00:00Z", delete_after_expire: true },
+    ] } })
+    expect(sweepExpiredKeys(store, Date.now()).join(",")).toBe("x")
+    const left = store.cfg.governance?.virtual_keys ?? []
+    expect(left.map((v) => v.id).join(",")).toBe("y,z")
+  } finally {
+    cleanup(path)
+  }
+})
+
+test("PUT /api/config: framework_config and auth_config are checked, then saved, and the rest is kept", () => {
+  const path = tmpPath()
+  try {
+    const store = try new ConfigStore(path, { governance: { auth_config: { username: "root", password: "pw1" } } })
+    expect(handleApi(store, "PUT", "/api/config", `{}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/config", `{"framework_config":{"pricing_url":"ftp://x"}}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/config", `{"framework_config":{"pricing_sync_interval":0}}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"admin_username":"","admin_password":"x"}}`).status).toBe(400)
+    // a bad section saves nothing, the good one included
+    expect(handleApi(store, "PUT", "/api/config", `{"client_config":{"bogus":1},"auth_config":{"is_enabled":false}}`).status).toBe(400)
+    expect(store.cfg.governance?.auth_config?.username).toBe("root")
+
+    const ok = handleApi(store, "PUT", "/api/config", `{"framework_config":{"pricing_url":"https://prices.example/x.json","pricing_sync_interval":7200}}`)
+    expect(ok.status).toBe(200)
+    expect(store.cfg.pricing_sync?.url).toBe("https://prices.example/x.json")
+    expect(store.cfg.pricing_sync?.interval_seconds).toBe(7200)
+    expect(handleApi(store, "PUT", "/api/config", `{"framework_config":{"pricing_url":""}}`).status).toBe(200)
+    expect(store.cfg.pricing_sync?.url).toBeUndefined()
+
+    // a redacted password keeps the stored one; disable_auth_on_inference sets client.enforce_auth_on_inference
+    expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"admin_username":"root","admin_password":"<redacted>","disable_auth_on_inference":true}}`).status).toBe(200)
+    expect(store.cfg.governance?.auth_config?.password).toBe("pw1")
+    expect(store.cfg.client?.enforce_auth_on_inference).toBe(false)
+    expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"admin_username":"ops","admin_password":"pw2","disable_auth_on_inference":false}}`).status).toBe(200)
+    expect(store.cfg.governance?.auth_config?.username).toBe("ops")
+    expect(store.cfg.client?.enforce_auth_on_inference).toBe(true)
+    expect(handleApi(store, "PUT", "/api/config", `{"client_config":{"max_request_body_size_mb":5}}`).status).toBe(200)
+    expect(store.cfg.governance?.auth_config?.username).toBe("ops")
+    expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"is_enabled":false}}`).status).toBe(200)
+    expect(store.cfg.governance?.auth_config?.username).toBeUndefined()
+  } finally {
+    cleanup(path)
+  }
+})
+
+test("governance: budget overrides, VK users, routing rules, complexity config, role permission ids and the catalogue", () => {
+  const path = tmpPath()
+  try {
+    const store = try new ConfigStore(path, { governance: {
+      budgets: [{ id: "b1", max_limit: 10, reset_duration: "1d" }],
+      virtual_keys: [{ id: "vk1", value: "v1", budget_id: "b1", user_id: "alice" }, { id: "vk2", value: "v2" }],
+    } })
+    // budget override: forever adds to the limit; a key only reaches its own budgets; cycles are refused
+    const ov = handleApi(store, "PUT", "/api/governance/virtual-keys/vk1/budgets/b1/override", `{"amount": 5, "mode": "forever"}`)
+    expect(ov.status).toBe(200)
+    expect(ov.body.includes(`"effective_max_limit":15`)).toBe(true)
+    expect(handleApi(store, "PUT", "/api/governance/virtual-keys/vk2/budgets/b1/override", `{"amount": 5, "mode": "forever"}`).status).toBe(404)
+    expect(handleApi(store, "PUT", "/api/governance/virtual-keys/vk1/budgets/b1/override", `{"amount": 5, "mode": "cycles", "cycles": 2}`).status).toBe(400)
+    expect(handleApi(store, "DELETE", "/api/governance/virtual-keys/vk1/budgets/b1/override", "").status).toBe(200)
+    const bs = store.cfg.governance?.budgets ?? []
+    expect(bs[0]!.override).toBeUndefined()
+
+    expect(handleApi(store, "GET", "/api/governance/virtual-keys/vk1/users", "").body.includes(`"user_id":"alice"`)).toBe(true)
+    expect(handleApi(store, "GET", "/api/governance/virtual-keys/vk2/users", "").body.includes(`"users":[]`)).toBe(true)
+
+    // routing rules: CRUD on the CEL rules, through both route families
+    const made = handleApi(store, "POST", "/api/routing/rules", `{"name":"big","cel_expression":"request > 10","targets":[{"provider":"openai"}]}`)
+    expect(made.status).toBe(201)
+    const rrs = store.cfg.governance?.routing_rules ?? []
+    const id = rrs[0]?.id ?? ""
+    expect(id !== "").toBe(true)
+    expect(handleApi(store, "GET", "/api/governance/routing-rules", "").body.includes(`"total":1`)).toBe(true)
+    expect(handleApi(store, "POST", "/api/governance/routing-rules", `{"cel_expression":"request >","targets":[{"provider":"openai"}]}`).status).toBe(400)
+    expect(handleApi(store, "PUT", `/api/governance/routing-rules/${id}`, `{"cel_expression":"true","targets":[]}`).status).toBe(400)
+    expect(handleApi(store, "PUT", `/api/governance/routing-rules/${id}`, `{"cel_expression":"request > 20","targets":[{"provider":"anthropic"}]}`).status).toBe(200)
+    expect(handleApi(store, "GET", `/api/routing/rules/${id}`, "").body.includes("anthropic")).toBe(true)
+    expect(handleApi(store, "DELETE", `/api/routing/rules/${id}`, "").status).toBe(200)
+    expect(handleApi(store, "GET", `/api/routing/rules/${id}`, "").status).toBe(404)
+
+    // complexity analyzer config
+    expect(handleApi(store, "GET", "/api/governance/complexity-analyzer-config", "").body).toBe("{}")
+    expect(handleApi(store, "PUT", "/api/governance/complexity-analyzer-config", `{"enabled":"yes"}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/governance/complexity-analyzer-config", `{"enabled":true,"simple_max_score":0.3}`).status).toBe(200)
+    expect(store.cfg.complexity_router?.enabled).toBe(true)
+    expect(handleApi(store, "POST", "/api/governance/complexity-analyzer-config/reset", "").status).toBe(200)
+    expect(store.cfg.complexity_router).toBeUndefined()
+
+    // roles by id, and the catalogue
+    expect(handleApi(store, "POST", "/api/roles", `{"name":"ops","permissions":[]}`).status).toBe(201)
+    const put = handleApi(store, "PUT", "/api/roles/ops/permissions", `{"permission_ids":[1,2]}`)
+    expect(put.status).toBe(200)
+    expect(put.body.includes(`"resource":"Logs","operation":"View"`)).toBe(true)
+    expect(put.body.includes(`"operation":"Create"`)).toBe(true)
+    expect(handleApi(store, "PUT", "/api/roles/ops/permissions", `{"permission_ids":[0]}`).status).toBe(400)
+    expect(handleApi(store, "GET", "/api/roles/nope/permissions", "").status).toBe(404)
+    expect(handleApi(store, "GET", "/api/resources", "").body.includes(`"name":"VirtualKeys"`)).toBe(true)
+    expect(handleApi(store, "GET", "/api/governance/rbac/permissions", "").body.includes(`"id":1`)).toBe(true)
+    expect(handleApi(store, "POST", "/api/operations", "").status).toBe(405)
   } finally {
     cleanup(path)
   }

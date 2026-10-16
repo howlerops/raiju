@@ -17,7 +17,13 @@ import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
 import { CircuitPolicyConfig, VirtualKeyConfig } from "./config"
 import { flushVaultCache } from "./secrets"
-import { ConfigStore, checkAdmin } from "./store"
+import { ConfigStore, checkAdmin, sweepExpiredKeys, RESOURCES, OPERATIONS } from "./store"
+import { keyBudgetIds, permissionDocs, permissionIds } from "./govapi"
+
+// The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
+type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
+type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
+type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
@@ -2206,6 +2212,59 @@ export class Ops {
   }
 
   // /api/users*: the reply, after saving any change through the config store.
+  // GET /api/governance/virtual-keys/quota: the calling key's own budgets, rate limits and provider
+  // configs with their usage. Self-service, as Bifrost's: the key in the request is the credential, and
+  // an expired key is refused. model_configs is not reported (Raiju lists them under governance).
+  vkQuota(req: Request): Reply {
+    const vk = this.engine.gov.findKey(snapshot(req.headers))
+    if (vk === undefined) return { status: 401, body: errorJson("a valid virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", undefined), contentType: "application/json" }
+    if (this.engine.gov.expired(vk)) return { status: 403, body: errorJson("Virtual key has expired", "permission_error", undefined), contentType: "application/json" }
+    const g = this.store.cfg.governance
+    const now = Date.now()
+    const usage = this.engine.gov.budgetUsage()
+    const limits = this.engine.gov.rateLimitUsage(now)
+    const ids = keyBudgetIds(vk)
+    const budgets: QuotaBudget[] = []
+    for (const b of g?.budgets ?? []) {
+      if (!ids.includes(b.id)) continue
+      const u = usage.find((x) => x.id === b.id)
+      budgets.push({ id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 })
+    }
+    const rateLimits: QuotaRate[] = []
+    for (const rl of g?.rate_limits ?? []) {
+      if (rl.id !== vk.rate_limit_id) continue
+      const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
+      rateLimits.push({ id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used })
+    }
+    const noModels: string[] = []
+    const body = JSON.stringify({ virtual_key_name: vk.name ?? "", is_active: vk.is_active !== false, budgets: budgets, rate_limits: rateLimits, provider_configs: vk.provider_configs ?? [], model_configs: noModels })
+    return { status: 200, body: body, contentType: "application/json" }
+  }
+
+  // The expired-key cleanup, hourly (Bifrost runs it daily). Only one process runs it: a worker's copy
+  // of the config may be behind the file, and saving that copy would undo the workers' changes.
+  startExpirySweep(): void {
+    setInterval(() => {
+      const done = sweepExpiredKeys(this.store, Date.now())
+      if (done.length > 0) console.error(`raiju: deleted ${done.length} expired virtual key${done.length === 1 ? "" : "s"}`)
+    }, 3600000)
+  }
+
+  // /api/users/me/permissions: the caller's custom role as (resource, operation) pairs with their ids.
+  // Built-in roles hold fixed rules (rbac.tov) and are reported by name, with no pairs.
+  mePermissions(actor: string): Reply {
+    // a caller with no stored user (the legacy admin credential) is the admin
+    let role = "admin"
+    for (const u of this.store.cfg.governance?.users ?? []) {
+      if (u.name === actor) role = u.role
+    }
+    const custom = customRole(this.store.cfg.governance?.roles ?? [], role)
+    const pairs = custom?.permissions ?? []
+    const ids = permissionIds(RESOURCES, OPERATIONS, pairs)
+    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+    return { status: 200, body: JSON.stringify({ user: actor, role: role, built_in: custom === undefined, permissions: docs }), contentType: "application/json" }
+  }
+
   users(method: string, path: string, body: string, setupToken: string): Reply {
     // Bifrost's setup gate: while no admin exists, the first account needs the operator's setup_token
     const want = resolveEnv(this.store.cfg.setup_token ?? "")
