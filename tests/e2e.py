@@ -425,7 +425,9 @@ def write_config():
                "openai": {"keys": [{"name": "fb", "value": "sk-pol-fallback", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
            "circuit_breaker_policies": [{"name": "quota", "primary_provider": "polpri", "primary_model": "policy-quota", "fallback_provider": "openai", "fallback_model": "gpt-4o-mini",
                                          "condition": {"signals": [{"source": "response_header", "header_name": "x-quota-state", "header_value": "exhausted"}]}, "default_cooldown": "1m"}],
-           "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False}}
+           "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+           # the authorization code client below is registered with auth off, so it must reach the local mock (Bifrost's allowlist)
+           "mcp": {"oauth_private_allowlist": ["127.0.0.1"]}}
     json.dump(pol, open(os.path.join(BUILD, "e2e.pol.json"), "w"))
     return path
 
@@ -1345,6 +1347,83 @@ def l97b_e2e(env):
     finally:
         gw.terminate()
 
+MCP_KEYS = "http://127.0.0.1:18123"  # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients
+
+MCP_KEYS_SPEC = json.dumps({"openapi": "3.0.3", "info": {"title": "Raiju self", "version": "1"}, "paths": {"/api/version": {"get": {"operationId": "version", "summary": "The gateway's version"}}}})
+
+def mcp_keys_e2e(env):
+    """Virtual keys' MCP allow-lists (mcp_configs), tool pricing charged to a budget, allowed_extra_headers, the
+    require_public_target guard, tool groups, OAuth config status and revoke, and an OpenAPI client from config.
+    Its own gateway, started and stopped here."""
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"tool_sync_interval": "1h", "client_configs": [
+            {"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp", "tool_pricing": {"get_weather": 0.25}, "allowed_extra_headers": ["x-tenant"], "tool_execution_timeout": "20s"},
+            {"name": "pubonly", "connection_type": "http", "connection_string": MOCK + "/mcp", "require_public_target": True},
+            {"name": "petapi", "connection_type": "openapi", "openapi_config": {"spec": MCP_KEYS_SPEC, "base_url": MCP_KEYS}},
+        ]},
+        "governance": {
+            "budgets": [{"id": "b-mcp", "max_limit": 0.6, "reset_duration": "1d"}],
+            "teams": [{"id": "t-mcp", "name": "mcp"}],
+            "virtual_keys": [
+                {"id": "vk-none", "value": "sk-bf-none", "mcp_configs": []},
+                {"id": "vk-all", "value": "sk-bf-all", "team_id": "t-mcp", "mcp_configs": [{"mcp_client_name": "weather", "tools_to_execute": ["*"]}]},
+                {"id": "vk-budget", "value": "sk-bf-budget", "budget_id": "b-mcp", "mcp_configs": [{"mcp_client_name": "weather", "tools_to_execute": ["get_weather"]}]},
+            ],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.mcpkeys.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18123", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.mcpkeys.log"), "w"))
+    def tool(key, extra=None):
+        h = {"authorization": "Bearer " + key, **(extra or {})}
+        return call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "weather-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, h, base=MCP_KEYS, auth=False)
+    try:
+        wait(MCP_KEYS + "/health")
+        wait_mcp_tools(MCP_KEYS, ["weather-get_weather", "petapi-version"])
+        s, _, b = tool("sk-bf-none")
+        check("a key that declares an empty mcp_configs may run no MCP tool", s == 403 and "not allowed for this key" in b, (s, b[:200]))
+        s, _, b = tool("sk-bf-all", {"x-tenant": "acme"})
+        check("a key whose mcp_configs allow every tool runs it", s == 200 and "Sunny in Oslo" in b, (s, b[:200]))
+        upstream = [x for x in seen() if x["path"] == "/mcp" and "tools/call" in x["body"]]
+        check("allowed_extra_headers forwards the allowed request header to the server", upstream and upstream[-1]["tenant"] == "acme", upstream[-1:])
+        tool("sk-bf-all")
+        upstream = [x for x in seen() if x["path"] == "/mcp" and "tools/call" in x["body"]]
+        check("a header the client does not allow is not forwarded", upstream and upstream[-1]["tenant"] == "", upstream[-1:])
+        # 0.25 a call on a 0.6 budget: three calls fit (0.75 is the last one that starts under the limit), the fourth is refused
+        codes = [tool("sk-bf-budget")[0] for _ in range(4)]
+        check("tool pricing is charged to the key's budget", codes == [200, 200, 200, 402], codes)
+        st = json.loads(call("GET", "/api/mcp", base=MCP_KEYS, auth=False)[2])["clients"]
+        pub = [c for c in st if c["name"] == "pubonly"]
+        check("require_public_target refuses a private server address", pub and not pub[0]["connected"] and "private address" in pub[0]["error"], pub)
+        s, _, b = call("POST", "/api/mcp/tool-groups", {"name": "ops", "enabled": True, "tools": [{"mcp_client_name": "weather", "tool_names": ["*"]}], "team_ids": ["t-mcp"]}, base=MCP_KEYS, auth=False)
+        check("a tool group is created", s == 201 and json.loads(b)["mcp_tool_group"]["name"] == "ops", (s, b[:200]))
+        s, _, b = call("GET", "/api/mcp/virtual-mcps/ops", base=MCP_KEYS, auth=False)
+        vks = json.loads(b)["virtual_mcp"]["virtual_key_ids"] if s == 200 else []
+        check("a tool group reaches the keys of the teams it names", vks == ["vk-all"], (s, vks))
+        s, _, b = call("GET", "/api/mcp/tool-groups", base=MCP_KEYS, auth=False)
+        check("tool groups are listed", s == 200 and any(g["name"] == "ops" for g in json.loads(b)["mcp_tool_groups"]), (s, b[:200]))
+        s, _, b = call("DELETE", "/api/mcp/tool-groups/ops", base=MCP_KEYS, auth=False)
+        check("a tool group is deleted", s == 200 and json.loads(b)["success"] is True, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/client", {"name": "oa", "connection_type": "http", "connection_string": MOCK + "/mcp-oauth", "auth": {"type": "oauth"}}, base=MCP_KEYS, auth=False)
+        s1, _, b1 = call("GET", "/api/oauth/config/oa/status", base=MCP_KEYS, auth=False)
+        check("an OAuth config without a token is pending", s == 201 and s1 == 200 and json.loads(b1) == {"id": "oa", "status": "pending"}, (s, s1, b1[:200]))
+        s2, _, _ = call("GET", "/api/oauth/config/weather/status", base=MCP_KEYS, auth=False)
+        check("a client that is not an OAuth config has no status", s2 == 404, s2)
+        s3, _, _ = call("DELETE", "/api/oauth/config/oa", base=MCP_KEYS, auth=False)
+        check("an OAuth config can be revoked", s3 == 200, s3)
+        s4, _, b4 = call("POST", "/api/mcp/openapi/preview", {"spec": MCP_KEYS_SPEC}, base=MCP_KEYS, auth=False)
+        pv = json.loads(b4) if s4 == 200 else {}
+        check("an OpenAPI document previews as tools", s4 == 200 and pv.get("tool_count") == 1 and pv["tools"][0]["name"] == "version", (s4, b4[:200]))
+        s5, _, b5 = call("GET", "/api/mcp/client/petapi/openapi-spec", base=MCP_KEYS, auth=False)
+        check("an OpenAPI client serves its stored document", s5 == 200 and json.loads(b5)["openapi"] == "3.0.3", (s5, b5[:120]))
+        s6, _, b6 = call("POST", "/v1/mcp/tool/execute", {"id": "c2", "type": "function", "function": {"name": "petapi-version", "arguments": "{}"}}, base=MCP_KEYS, auth=False)
+        check("an OpenAPI tool call goes over HTTP to the operation", s6 == 200 and '"role":"tool"' in b6 and '"content":"' in b6, (s6, b6[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
 
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
@@ -3481,6 +3560,8 @@ def main():
         headers_e2e(env)
         # provider create and key reads, config metadata, virtual key rotation and expiry, team members: their own gateway
         l97b_e2e(env)
+        # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients: their own gateway
+        mcp_keys_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

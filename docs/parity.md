@@ -199,14 +199,14 @@ Bifrost: `transports/bifrost-http/handlers/*.go`, documented in `docs/openapi/op
 | GET/DELETE /api/mcp-logs and sub-routes (get by id, filterdata, stats, histogram, cost, top-tools) | handlers/logging.go | done | `ops.tov` `logsRoute` → `mcpLogsRoute`. |
 | GET /api/mcp (status) and GET /api/mcp/clients | handlers/mcp.go | done | `server.tov` `mcpView`; `/api/mcp/clients` in `mcpapi.tov` `mcpApi`. |
 | /api/mcp/client CRUD; reconnect, refresh-tools, verify-headers, verify-exchange, reauthorize, reregister, initiate-verification, complete-oauth | handlers/mcp.go | partial | `mcpapi.tov` `mcpApi` and `verifyRoute`; `server.tov` `mcpAction` for reconnect and refresh. Authorization-code OAuth clients are done (L91). Missing: per_user_oauth and per_user_headers flows. |
-| GET /api/mcp/client/{id}/openapi-spec | handlers/mcp.go | missing | P2. Answers 404 (Raiju has no OpenAPI MCP clients, `mcpapi.tov`). |
-| /api/mcp/library (and force-sync, filterdata); POST /api/mcp/openapi/preview | handlers/mcp.go | missing | P2. |
+| GET /api/mcp/client/{id}/openapi-spec | handlers/mcp.go | partial | `mcpapi.tov` openapiSpec: returns the stored inline spec of an openapi client, else 404. A spec_url client keeps only the URL. |
+| /api/mcp/library (and force-sync, filterdata); POST /api/mcp/openapi/preview | handlers/mcp.go | partial | Preview done: `mcpapi.tov` openapiRoute. The library routes are missing. |
 | /api/mcp/virtual-mcps CRUD, virtual-key attach and detach | handlers/virtualmcp.go | done | `mcpapi.tov` `virtualRoute`; `vmcp.tov`. |
-| /api/mcp/tool-groups CRUD | openapi | missing | P2. |
+| /api/mcp/tool-groups CRUD | openapi | done | `mcpapi.tov` toolGroupRoute: an alias of the virtual MCPs with the group's shape (`mcp_tool_groups`, `mcp_tool_group`). user_ids and api_key_ids are refused. |
 | /api/mcp/sessions (list, reauth, revoke); /api/oauth/per-user/flows/* | handlers/mcpsessions.go | missing | P2. |
 | /api/mcp/per-user-headers flows and credential revoke | handlers/mcpheaders.go | missing | P2. |
 | /api/oauth/callback | handlers/mcpoauth2.go | done | `server.tov` `dispatch` → `mcpapi.tov` `oauthCallback` (MCP authorization-code flow, PKCE). |
-| /api/oauth/config/{id}/status, DELETE /api/oauth/config/{id} | handlers/mcpoauth2.go | missing | P2. |
+| /api/oauth/config/{id}/status, DELETE /api/oauth/config/{id} | handlers/mcpoauth2.go | partial | `mcpapi.tov` oauthConfigRoute (the config is the MCP client of auth type oauth). Status is pending or authorized; the flow_id form, failed and expired are not done. DELETE drops the tokens; a live session keeps its token until it reconnects. |
 | /api/oauth2/sessions; /api/oauth2/consent/flows/* | handlers/mcpoauth2sessions.go, mcpoauth2consent.go | missing | P2. |
 | /.well-known/oauth-protected-resource, /.well-known/oauth-authorization-server, /.well-known/jwks.json, /oauth2/register, /oauth2/authorize, /oauth2/token | handlers/mcpoauth2discovery.go, mcpoauth2issuance.go | missing | P2. Raiju is an OAuth client only (`mcpauth.tov`, `oidc.tov`); it does not issue tokens. |
 | /api/session/login, logout, is-auth-enabled | handlers/session.go | done | `ops.tov` `sessionRoute`. |
@@ -392,7 +392,7 @@ Bifrost: `transports/config.schema.json` `$defs/client` (and `client.*` properti
 | async_job_result_ttl | client.async_job_result_ttl | done | `server.tov` dispatch (the `/v1/async/*` TTL). The per-request header is missing (see b1). |
 | mcp_agent_depth | client.mcp_agent_depth | done | `gateway.tov` Engine constructor; `agent.tov` (the depth limit for the tool loop). |
 | mcp_tool_execution_timeout | client.mcp_tool_execution_timeout | partial | Mapped to `mcp.tool_execution_timeout_seconds` (`config_compat.tov` mapClient). That is a single global timeout; per-client timeouts are missing. |
-| mcp_tool_sync_interval | client.mcp_tool_sync_interval | missing | Reported as not implemented. Per-client `tool_sync_interval` is done (c5). P2. |
+| mcp_tool_sync_interval | client.mcp_tool_sync_interval | done | Read as `mcp.tool_sync_interval` (`config_compat.tov` mapClient), the global default (c5). |
 | mcp_auto_execute | not in Bifrost (Bifrost: per-client tools_to_auto_execute) | done (Raiju-only) | `gateway.tov` withMcpTools and chat. Per-client `tools_to_auto_execute` is in c5. |
 | disable_content_logging | client.disable_content_logging | done | `gateway.tov` contentOff (commit 12757de). |
 | prometheus_labels | client.prometheus_labels | done | `metrics.tov` baseValues and customValues (commit cbd6ad3). |
@@ -459,7 +459,7 @@ Bifrost: `config.schema.json` governance properties. Raiju: `GovernanceConfig` i
 
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
-| budgets, rate_limits, customers, teams, virtual_keys, routing_rules | governance.* | partial | Core fields done. VK `mcp_configs` (per-key MCP tool lists, `virtual_key_mcp_config`) is not read; Raiju's top-level `virtual_mcps` is a different shape. |
+| budgets, rate_limits, customers, teams, virtual_keys, routing_rules | governance.* | partial | Core fields done. VK `mcp_configs` (`virtual_key_mcp_config`) is read and enforced: `config.tov` VirtualKeyConfig, `mcp.tov` keyRuleAllows and McpManager.allToolsFor/mayRun. A key without the field is not limited, as before. |
 | governance.auth_config | governance.auth_config | done | `config.tov` AdminAuthConfig. |
 | business_units, projects, roles | governance.* | partial | Business units and projects are done, with x-bf-project-id and x-bf-customer-id (L84). Custom roles are in the management API. Open: project members API, split policies, entity_dac overrides and Bifrost's role-id API shape (L84). |
 | access_profiles (governance) | not in Bifrost's governance schema (top-level access_profiles, see c1) | done (Raiju-only) | `profiles.tov` applyProfiles, validateProfile. Raiju's own shape. |
@@ -475,25 +475,25 @@ Bifrost: `config.schema.json` `mcp` and `$defs/mcp_client_config`. Raiju: `src/m
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
 | client_configs[]: name, connection_type (http, sse, stdio), connection_string, headers, stdio_config, tools_to_execute | mcp_client_config | done | `mcp.tov` McpClientConfig; `mcpapi.tov` validates connection_type. |
-| connection_type inprocess, openapi | mcp_client_config.connection_type | missing | P2. Raiju accepts http, sse and stdio only. |
-| openapi_config | mcp_client_config | missing | P2. |
+| connection_type inprocess, openapi | mcp_client_config.connection_type | partial | openapi done: `openapi.tov` and `mcp.tov` McpSession `loadOpenApi`/`callOpenApi`. inprocess is missing. |
+| openapi_config | mcp_client_config | partial | `openapi.tov` parseSpec, inputSchema, requestFor, callOperation. JSON 3.x documents from `spec` or `spec_url`; each operation is a tool, with `security_credentials` applied. `$ref` is not resolved, YAML and Swagger 2.0 are refused, and per-operation security and the framework's schema flattening are not done. |
 | auth_type: none, headers, oauth | mcp_client_config.auth_type | done | `mcpauth.tov`. oauth is the authorization-code flow with PKCE, dynamic registration and `client_id` (L91). |
 | auth_type: per_user_oauth, per_user_headers, token_exchange; per_user_header_keys | mcp_client_config.auth_type | missing | Routes refuse with Bifrost's messages (`mcpapi.tov` verifyRoute). L91 open for per_user_*. P2. |
 | tools_to_auto_execute (per client) | mcp_client_config | done | `mcp.tov` (per-client list; `*` for all). Global `client.mcp_auto_execute` is Raiju-only (c2). |
 | tools_to_execute | mcp_client_config | done | `mcp.tov` McpClientConfig. |
 | endpoint_slug, allow_by_default, allow_on_all_virtual_keys, disabled | mcp_client_config | done | `mcpapi.tov` (CLIENT_KINDS; management API); allow_by_default from L76. |
-| is_ping_available, needs_session_stickiness | mcp_client_config | missing | Not read. P2. |
-| require_public_target (SSRF guard) | mcp_client_config | missing | No SSRF guard in `mcp.tov`. P2. |
+| is_ping_available, needs_session_stickiness | mcp_client_config | partial | Stored and returned (`mcpapi.tov` CLIENT_KINDS). needs_session_stickiness false makes an http client connect fresh before each call (`mcp.tov` McpSession.callTool); new http clients default to false, as Bifrost. No ping health check runs, so is_ping_available changes nothing. |
+| require_public_target (SSRF guard) | mcp_client_config | done | `netguard.tov` targetProblem (private and metadata hosts, shared with webhooks' `urlProblem`), checked in `mcp.tov` McpSession.send and callOpenApi. The host allow list is `mcp.oauth_private_allowlist` (exact hosts; CIDR ranges are not matched). A client registered over the API while dashboard auth is off gets it set (`mcpapi.tov` createClient, `server.tov` passes `!ops.authOn`). |
 | tls_config | mcp_client_config | done | `mcp.tov` McpTlsConfig. |
-| allowed_extra_headers | mcp_client_config | missing | P2. |
-| tool_pricing | mcp_client_config | missing | P2. |
-| tool_execution_timeout (per client) | mcp_client_config | partial | Only the global `mcp.tool_execution_timeout_seconds` is read. P2. |
+| allowed_extra_headers | mcp_client_config | done | `mcp.tov` McpSession.forwardable: the request headers the allow list names (`*` for all) reach the server on a tool call; `gateway.tov` toolGate and `ops.tov` `mcp` pass the request's headers into McpManager.execute. Framing headers are never forwarded. |
+| tool_pricing | mcp_client_config | partial | `mcp.tov` McpManager.priceOf; `gateway.tov` chargeTool debits the caller's budgets (`governance.tov` record) after each successful call, and a tool call is refused with 402 when those budgets are used up (`governance.tov` admitTool). The cost is not written to the MCP log entry (`mcp.tov` McpToolCall has no cost field), and team and customer budgets are debited only when the key is known. |
+| tool_execution_timeout (per client) | mcp_client_config | done | `mcp.tov` `durationMsOf` (Go durations, or a bare number of seconds); McpSession's constructor uses it over the global `mcp.tool_execution_timeout_seconds`. Integers are turned into duration strings in `config_compat.tov` clientItems. |
 | tool_sync_interval (per client) | mcp_client_config | done | `mcp.tov` refresh timers, one per client (G22, L76). |
 | max_instructions_length, is_code_mode_client | mcp_client_config | out-of-scope | MCP code mode is in SCOPE.md Out. |
-| mcp.tool_groups | mcp.tool_groups | partial | Read as the deprecated name of `virtual_mcps` (`config_compat.tov` mapMcp). Bifrost's tool_manager and group semantics are not implemented. |
-| mcp.tool_manager_config | mcp.tool_manager_config | missing | Reported as not implemented. P2. |
+| mcp.tool_groups | mcp.tool_groups | done | Bifrost's OSS schema calls these enterprise and stores them as virtual MCPs. `config_compat.tov` mapMcp reads each group as a virtual MCP, and its team_ids, customer_ids and provider_names reach the virtual keys they name (groupKeyIds). user_ids and api_key_ids are noted as not applied (Raiju's keys have no user or API key ids). |
+| mcp.tool_manager_config | mcp.tool_manager_config | partial | `config_compat.tov` mapToolManager: tool_execution_timeout, oauth_private_allowlist, max_agent_depth and disable_auto_tool_inject are applied. max_instructions_* is noted as not implemented (no instruction forwarding) and code_mode_* as out of scope. |
 | mcp.virtual_mcps | mcp.virtual_mcps | done | `config_compat.tov` mapMcp; read as top-level `virtual_mcps` (commit 0c999ff). |
-| mcp.tool_sync_interval (global) | mcp.tool_sync_interval | partial | The per-client interval is done (above). The global setting is reported as not implemented. P2. |
+| mcp.tool_sync_interval (global) | mcp.tool_sync_interval | done | `mcp.tov` McpManager.startToolSync: a client's own interval, else this default (`config_compat.tov` also maps the legacy client.mcp_tool_sync_interval). Deviation: with neither set there is no periodic re-list; Bifrost falls back to 10 minutes. |
 
 ## (d) Providers
 
@@ -661,7 +661,7 @@ Bifrost: `docs/mcp/*.mdx`, `handlers/mcp*.go`, `core/mcp`, `config.schema.json` 
 | MCP client over HTTP (streamable) | mcp/connecting-to-servers.mdx | done | `mcp.tov`. |
 | MCP client over SSE | mcp/connections.mdx | done | `mcp.tov` ("sse" uses the POST transport). |
 | MCP client over stdio | mcp/connections.mdx | done | `mcp.tov` (`stdio_config`), one server per worker (SCOPE). |
-| MCP client inprocess and OpenAPI-defined servers | mcp/openapi-servers.mdx | missing | `mcpapi.tov` answers `openapi-spec` with 404 for non-OpenAPI clients. P2. |
+| MCP client inprocess and OpenAPI-defined servers | mcp/openapi-servers.mdx | partial | OpenAPI done (`openapi.tov`, `mcp.tov` loadOpenApi and callOpenApi, `mcpapi.tov` openapiSpec for GET /api/mcp/client/{name}/openapi-spec). inprocess is missing. |
 | Auth: bearer and static headers | mcp/auth | done | `mcpauth.tov`. |
 | Auth: OAuth client credentials and refresh token | mcp/auth | done | `mcpauth.tov` (SCOPE: L36). |
 | Auth: OAuth authorization code (client-level "oauth", PKCE, dynamic registration) | mcp/gateway-auth.mdx; handlers/mcpoauth2*.go | done | `mcpauth.tov`, `mcpapi.tov:oauthRoute` and `oauthCallback` (L91). Consent is for the client, not per user. |
@@ -671,8 +671,8 @@ Bifrost: `docs/mcp/*.mdx`, `handlers/mcp*.go`, `core/mcp`, `config.schema.json` 
 | Temporary MCP tokens (client.mcp_enable_temp_token_auth) | handlers/temptokens.go | missing | Reported as ignored (`config_compat.tov`). P2. |
 | Tool filtering: per client (`tools_to_execute`) | mcp/filtering.mdx Level 1 | done | `mcp.tov`. |
 | Tool filtering: request headers (include clients) | mcp/filtering.mdx Level 2 | partial | x-bf-mcp-include-clients only. Missing: x-bf-mcp-include-tools. |
-| Tool filtering: virtual key allow-lists | mcp/filtering.mdx Level 3 | partial | Access profiles `mcp_tools` (`profiles.tov`, `config.tov`). |
-| Tool filtering: tool groups | config.schema.json mcp.tool_groups (no docs page) | missing | `config_compat.tov` reads the deprecated mcp.tool_groups as virtual_mcps; no separate tool groups. P2. |
+| Tool filtering: virtual key allow-lists | mcp/filtering.mdx Level 3 | partial | VK `mcp_configs` enforced in the tool list and at execution (`mcp.tov` mayRun, `gateway.tov` toolGate). A key that declares no mcp_configs is not limited (Bifrost denies it by default; kept as before). Access profiles take `mcp_configs` and `virtual_mcps`; projects' mcp_configs are not applied. Access profiles also keep `mcp_tools` (`profiles.tov`, `config.tov`). |
+| Tool filtering: tool groups | config.schema.json mcp.tool_groups (no docs page) | done | `config_compat.tov` mapMcp and `mcpapi.tov` toolGroupRoute (`/api/mcp/tool-groups`, an alias of the virtual MCPs with the group's association fields). |
 | Tool execution endpoint | handlers/mcpinference.go | done | `server.tov` (`/mcp` tool execution), `ops.tov`. |
 | Agent mode (gateway runs allowed tool calls) | mcp/agent-mode.mdx | done | `agent.tov`; `gateway.tov` (agent loop). Per-client config differs (client-level `mcp_auto_execute`). |
 | Tool execution timeout | mcp/tool-execution.mdx | done | `mcp.tov` (`tool_execution_timeout_seconds`), `config.tov`. |
@@ -683,13 +683,13 @@ Bifrost: `docs/mcp/*.mdx`, `handlers/mcp*.go`, `core/mcp`, `config.schema.json` 
 | MCP sessions (list, reauth, revoke) | mcp/sessions.mdx; handlers/mcpsessions.go | missing | No `/api/mcp/sessions` routes. P2. |
 | MCP logs (/api/mcp-logs) | handlers/logging.go | done | `logstore.tov` (MCP analytics), `ops.tov` (L79). |
 | MCP client management API | handlers/mcp.go | partial | CRUD, reconnect, refresh-tools and openapi-spec (`mcpapi.tov`, commit 5c2c8af). Verify, reauthorize and reregister answer Bifrost's refusal for client types they do not apply to; per_user_* and token exchange are missing. |
-| MCP OpenAPI import and preview | handlers/mcpopenapi.go | missing | P2. |
-| MCP tool sync interval (periodic re-list) | mcp_client_config.tool_sync_interval | done | `mcp.tov` (`syncSeconds`, `startToolSync`; L76). Set per client, not as a global default. |
+| MCP OpenAPI import and preview | handlers/mcpopenapi.go | partial | `openapi.tov` and `mcpapi.tov` openapiRoute (POST /api/mcp/openapi/preview). JSON 3.x only; the library and the framework's schema flattening are not done. |
+| MCP tool sync interval (periodic re-list) | mcp_client_config.tool_sync_interval | done | `mcp.tov` (`syncSeconds`, `startToolSync`; L76). Per client, and the global `mcp.tool_sync_interval` as the default. |
 | MCP as an OAuth authorization server for MCP clients | mcp/gateway-auth.mdx; handlers/mcpoauth2issuance.go | missing | `mcpauth.tov` only consumes discovery documents; no issuance, consent or JWT routes. P2. |
 | MCP guardrails (tool-call guard) | enterprise/guardrails.mdx "MCP Guardrails" | done | `guard_mcp.tov`, wired into the gateway (L86, L90). |
 | MCP code mode | mcp/code-mode.mdx | out-of-scope | `SCOPE.md` Out: MCP code mode. |
-| MCP SSRF guard (require_public_target) | mcp_client_config.require_public_target | missing | Not read (no hit in `src`). P2. |
-| MCP pricing per tool | mcp_client_config.tool_pricing | missing | Not read. P2. |
+| MCP SSRF guard (require_public_target) | mcp_client_config.require_public_target | done | `netguard.tov` targetProblem, used by `mcp.tov` McpSession.send and callOpenApi (see c5). |
+| MCP pricing per tool | mcp_client_config.tool_pricing | partial | Charged to the key's budgets (see c5, tool_pricing). The cost is not in the MCP log. |
 
 ## (h) Observability
 

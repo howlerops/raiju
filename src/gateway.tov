@@ -1567,7 +1567,7 @@ export class Engine {
     if (this.cfg.client?.mcp_disable_auto_tool_inject === true && !named) return text
     // a key's access profile may limit the MCP tools it gets; clients it doesn't name
     // count only with allow_by_default
-    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools)
+    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs)
     const only = h.get("x-bf-mcp-include-clients")
     if (only !== undefined) {
       if (only.trim() === "none") return text
@@ -1590,6 +1590,23 @@ export class Engine {
     return try injectTools(text, tools)
   }
 
+  // The gate of one MCP tool call: the key's MCP rules (access profile patterns and mcp_configs) must
+  // allow the tool, and the key's budgets must have room. A tool the gateway does not expose is left to
+  // execution, which reports it as unknown.
+  toolGate(m: McpManager, h: Hdrs, name: string): Grant | Denial {
+    if (m.hasTool(name) && !m.mayRun(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, name)) {
+      return { kind: "denial", status: 403, type: "permission_error", message: `tool ${name} is not allowed for this key` }
+    }
+    return this.gov.admitTool(h)
+  }
+
+  // Debits the tool's tool_pricing cost from the grant's budgets after a call ran. Free tools, and calls
+  // with no key, debit nothing.
+  chargeTool(m: McpManager, g: Grant | Denial, name: string): void {
+    const cost = m.priceOf(name)
+    if (cost > 0 && g.kind === "grant") this.gov.record(g, 0, cost)
+  }
+
   // POST /v1/mcp/tool/execute: runs one tool call and answers with the tool message.
   async executeTool(req: Request): Promise<Response> {
     const m = this.mcp
@@ -1599,8 +1616,12 @@ export class Engine {
       const call = executeEndpointBody(text)
       const tv = checkToolCall(this.toolGuards, call.name, call.argumentsJson)
       if (!tv.allowed) return errorResponse(400, `tool call blocked by guardrails: ${tv.reason}`, "guardrail_violation", noHeaders())
+      const h = snapshot(req.headers)
+      const gate = this.toolGate(m, h, call.name)
+      if (gate.kind === "denial") return errorResponse(gate.status, gate.message, gate.type, noHeaders())
       const t0 = performance.now()
-      const result = await m.execute(call.name, call.argumentsJson)
+      const result = await m.execute(call.name, call.argumentsJson, h)
+      this.chargeTool(m, gate, call.name)
       timedMcp(m, call.name, t0, result.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", call.name, result.isError ? "error" : "success"), 1.0)
       const r: Record<string, string> = new Map()
@@ -2248,8 +2269,12 @@ export class Engine {
       const real = injectedChatName(this.cfg, name) ?? name
       const tv = checkToolCall(this.toolGuards, real, args)
       if (!tv.allowed) return { text: `blocked by guardrails: ${tv.reason}`, isError: true }
+      const h = snapshot(req.headers)
+      const gate = this.toolGate(m, h, real)
+      if (gate.kind === "denial") return { text: gate.message, isError: true }
       const t0 = performance.now()
-      const r = try await m.execute(real, args)
+      const r = try await m.execute(real, args, h)
+      this.chargeTool(m, gate, real)
       timedMcp(m, real, t0, r.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", real, r.isError ? "error" : "success"), 1.0)
       return { text: r.text, isError: r.isError }

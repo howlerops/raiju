@@ -9,7 +9,7 @@ import { Engine } from "./gateway"
 import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, gridOf, filterFrom, selectAll, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
-import { CircuitPolicyConfig } from "./config"
+import { CircuitPolicyConfig, VirtualKeyConfig } from "./config"
 import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin } from "./store"
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned } from "./rbac"
@@ -27,7 +27,7 @@ import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
 import { Field, fields, find, rawStr, rawBool, isNull, elements } from "./json"
 import { trimSlash } from "./providers/types"
-import { snapshot, errorJson } from "./schemas"
+import { snapshot, errorJson, Hdrs } from "./schemas"
 import { deadline } from "./deadline"
 import { secureHex, utf8 } from "./crypto"
 import * as b64 from "./base64"
@@ -1976,6 +1976,22 @@ export class Ops {
     return { status: 200, body: vmcp.listView(this.engine.cfg.virtual_mcps ?? [], all), contentType: "application/json" }
   }
 
+  // Whether a key reaches a virtual MCP through the project its request names or through its access
+  // profiles (the profiles' virtual_mcps names). Its own allowed_keys are checked by the caller.
+  private grantedVirtual(h: Hdrs, vk: VirtualKeyConfig | undefined, name: string): bool {
+    const proj = this.engine.gov.projectFor(h)
+    if (proj !== undefined && (proj.virtual_mcps ?? []).includes(name)) return true
+    if (vk === undefined) return false
+    const pol = this.engine.gov.policyFor(h)
+    const pids: string[] = pol === undefined ? (vk.access_profile_ids ?? []) : (pol.vk.access_profile_ids ?? [])
+    const profiles = this.engine.cfg.governance?.access_profiles ?? []
+    for (const p of profiles) {
+      if (p.is_active === false || !pids.includes(p.id)) continue
+      if ((p.virtual_mcps ?? []).includes(name)) return true
+    }
+    return false
+  }
+
   // POST /mcp (every connected tool) and /mcp/{name} (a virtual MCP's tool set).
   async mcp(req: Request, virtualName: string | undefined): Promise<Response> {
     const m = this.engine.mcp
@@ -1985,7 +2001,7 @@ export class Ops {
     if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)")
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
-    let tools = exposedTools(m.allToolsFor(allowedTools))
+    let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs))
     // virtual names → the source tool and its argument defaults
     let mapping: Map<string, { source: string, defaults: string }> = new Map()
     if (virtualName !== undefined) {
@@ -1994,7 +2010,7 @@ export class Ops {
         if (x.name === virtualName) v = x
       }
       if (v === undefined) return json(404, errorJson(`no virtual MCP ${virtualName}`, "invalid_request_error", undefined))
-      if (!vmcp.keyAllowed(v, vk?.id)) return denied(403, `this key may not use the virtual MCP ${virtualName}`)
+      if (!vmcp.keyAllowed(v, vk?.id) && !this.grantedVirtual(h, vk, v.name)) return denied(403, `this key may not use the virtual MCP ${virtualName}`)
       const r = vmcp.resolve(v, tools)
       for (const e of r.errors) console.error(`raiju: virtual MCP ${virtualName}: ${e}`)
       tools = r.tools
@@ -2010,20 +2026,25 @@ export class Ops {
     const body = await req.text()
     const now = Date.now()
     this.mcpSessions.expire(now)
+    // each call passes the key's MCP rules and budgets, forwards the allowed request headers, and
+    // is charged its tool_pricing cost; a virtual MCP's call is judged by the tool it runs
     const run = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
-      if (!virtual) {
-        const r = try await m.execute(name, args)
-        return { text: r.text, isError: r.isError }
-      }
-      const target = mapping.get(name)
-      if (target === undefined) throw new Error(`unknown tool ${name}`)
+      let real = name
       let merged = args
-      try {
-        merged = vmcp.mergeArgs(target.defaults, args)
-      } catch (e) {
-        return { text: `bad arguments: ${e.message}`, isError: true }
+      if (virtual) {
+        const target = mapping.get(name)
+        if (target === undefined) throw new Error(`unknown tool ${name}`)
+        real = target.source
+        try {
+          merged = vmcp.mergeArgs(target.defaults, args)
+        } catch (e) {
+          return { text: `bad arguments: ${e.message}`, isError: true }
+        }
       }
-      const r = try await m.execute(target.source, merged)
+      const gate = this.engine.toolGate(m, h, real)
+      if (gate.kind === "denial") return { text: gate.message, isError: true }
+      const r = try await m.execute(real, merged, h)
+      this.engine.chargeTool(m, gate, real)
       return { text: r.text, isError: r.isError }
     }
     const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now)

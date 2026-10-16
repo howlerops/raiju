@@ -11,9 +11,10 @@ import { ConfigStore, maskSecret, randomId } from "./store"
 import { McpAuthConfig, AuthEndpoints, discoveryUrls, registrationRequest, registrationResult, parseAuthEndpoints, codeTokenRequest, authorizeUrl, pkceVerifier, pkceChallenge, tokenFields } from "./mcpauth"
 import { deadline } from "./deadline"
 import { secureHex } from "./crypto"
-import { McpClientConfig, McpConfig, McpTlsConfig, sanitizeName } from "./mcp"
+import { McpClientConfig, McpConfig, McpTlsConfig, sanitizeName, durationMsOf } from "./mcp"
+import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, parseSpec, inputSchema } from "./openapi"
 import * as vmcp from "./vmcp"
-import { Field, fields, elements, find, quote } from "./json"
+import { Field, fields, elements, find, quote, rawStr, rawNum, rawBool } from "./json"
 
 // The reply. action asks the lead to run a step on the live manager after sending body:
 // "reconnect" or "refresh" for the client named by id. For a refresh the lead answers with
@@ -36,6 +37,10 @@ type ClientBody = {
   disabled?: bool,
   tool_sync_interval?: string,
   tls_config?: McpTlsConfig,
+  is_ping_available?: bool,
+  needs_session_stickiness?: bool,
+  allowed_extra_headers?: string[],
+  openapi_config?: OpenApiConfig,
 }
 
 // A tool in a virtual MCP's tools: Bifrost's {mcp_client_id, tool_names} or Raiju's native form.
@@ -44,10 +49,11 @@ type ToolBody = { mcp_client_id?: string, tool_names?: string[], source?: string
 type VmcpBody = { name?: string, endpoint_slug?: string, description?: string, enabled?: bool }
 
 // The JSON kind each body field must have: s string, b bool, a array, o object.
-const CLIENT_KINDS: string[] = ["name:s", "connection_type:s", "connection_string:s", "auth_type:s", "headers:o", "auth:o", "stdio_config:o", "tools_to_execute:a", "tools_to_skip:a", "tools_to_auto_execute:a", "allow_by_default:b", "allow_on_all_virtual_keys:b", "disabled:b", "tool_sync_interval:s", "tls_config:o"]
+const CLIENT_KINDS: string[] = ["name:s", "connection_type:s", "connection_string:s", "auth_type:s", "headers:o", "auth:o", "stdio_config:o", "tools_to_execute:a", "tools_to_skip:a", "tools_to_auto_execute:a", "allow_by_default:b", "allow_on_all_virtual_keys:b", "disabled:b", "tool_sync_interval:s", "tls_config:o", "is_ping_available:b", "needs_session_stickiness:b", "allowed_extra_headers:a", "tool_pricing:o", "openapi_config:o"]
 const VMCP_KINDS: string[] = ["name:s", "endpoint_slug:s", "description:s", "enabled:b", "tools:a"]
 const TOOL_KINDS: string[] = ["mcp_client_id:s", "tool_names:a", "source:s", "as:s", "description:s", "defaults:s"]
-const VERIFY_ROUTES: string[] = ["complete-oauth", "initiate-verification", "reauthorize", "reregister", "verify-headers", "verify-exchange"]
+const CONNECT_MS = 15000
+const VERIFY_ROUTES: string[] =["complete-oauth", "initiate-verification", "reauthorize", "reregister", "verify-headers", "verify-exchange"]
 
 function reply(status: int, body: string): McpReply {
   return { status: status, body: body }
@@ -274,6 +280,42 @@ function redactClient(c: McpClientConfig): McpClientConfig {
     ns.env = maskMap(ns.env)
     n.stdio_config = ns
   }
+  const oc = n.openapi_config
+  if (oc !== undefined) {
+    let no = oc
+    no.security_credentials = maskCreds(no.security_credentials)
+    n.openapi_config = no
+  }
+  return n
+}
+
+// The security credentials of an openapi client with their secrets masked.
+function maskCreds(m: Map<string, OpenApiCred> | undefined): Map<string, OpenApiCred> | undefined {
+  if (m === undefined) return undefined
+  const out: Map<string, OpenApiCred> = new Map()
+  for (const k of m.keys()) {
+    const c = m.get(k)!
+    out.set(k, { value: maskOpt(c.value), username: c.username, password: maskOpt(c.password) })
+  }
+  return out
+}
+
+// An openapi_config update: a masked secret sent back unchanged keeps the stored one.
+function keepOpenApi(incoming: OpenApiConfig | undefined, old: OpenApiConfig | undefined): OpenApiConfig | undefined {
+  if (incoming === undefined) return undefined
+  let n = incoming
+  const oldCreds = old === undefined ? undefined : old.security_credentials
+  if (n.security_credentials !== undefined) {
+    const out: Map<string, OpenApiCred> = new Map()
+    for (const k of n.security_credentials.keys()) {
+      const c = n.security_credentials.get(k)!
+      const prev = oldCreds === undefined ? undefined : oldCreds.get(k)
+      const value = keepOpt(c.value, prev === undefined ? undefined : prev.value)
+      const password = keepOpt(c.password, prev === undefined ? undefined : prev.password)
+      out.set(k, { value: value, username: c.username, password: password })
+    }
+    n.security_credentials = out
+  }
   return n
 }
 
@@ -307,6 +349,12 @@ function authError(a: McpAuthConfig | undefined): string {
 
 // The connection fields a new client needs for its transport. "" when fine.
 function connectionError(b: ClientBody, ct: string): string {
+  if (ct === "openapi") {
+    const oc = b.openapi_config
+    if (oc === undefined || ((oc.spec ?? "") === "" && (oc.spec_url ?? "") === "")) return "openapi_config needs spec or spec_url for openapi connections"
+    if ((b.connection_string ?? "") !== "") return "connection_string must not be set for openapi connections"
+    return ""
+  }
   if (ct === "stdio") {
     if ((b.stdio_config?.command ?? "") === "") return "stdio_config.command is required for stdio connections"
     if ((b.connection_string ?? "") !== "") return "connection_string must not be set for stdio connections"
@@ -363,7 +411,42 @@ function clientFields(fs: Field[], b: ClientBody): ClientBody {
   n.disabled = present(fs, "disabled", n.disabled)
   n.tool_sync_interval = present(fs, "tool_sync_interval", n.tool_sync_interval)
   n.tls_config = present(fs, "tls_config", n.tls_config)
+  n.is_ping_available = present(fs, "is_ping_available", n.is_ping_available)
+  n.needs_session_stickiness = present(fs, "needs_session_stickiness", n.needs_session_stickiness)
+  n.allowed_extra_headers = present(fs, "allowed_extra_headers", n.allowed_extra_headers)
+  n.openapi_config = present(fs, "openapi_config", n.openapi_config)
   return n
+}
+
+// tool_execution_timeout: a Go duration string, or a bare number of seconds (Bifrost takes both).
+// The stored form is always a duration string. error is "" when fine or absent.
+function timeoutFrom(fs: Field[]): { value: string | undefined, error: string } {
+  const raw = find(fs, "tool_execution_timeout")
+  if (raw === undefined || raw === "null") return { value: undefined, error: "" }
+  const bad = "tool_execution_timeout must be a duration such as \"30s\" or \"2m\", or a number of seconds"
+  if (!raw.startsWith("\"")) {
+    const n = rawNum(fs, "tool_execution_timeout") ?? 0.0
+    if (n <= 0.0) return { value: undefined, error: bad }
+    return { value: `${Math.floor(n)}s`, error: "" }
+  }
+  const s = rawStr(fs, "tool_execution_timeout") ?? ""
+  if (durationMsOf(s) <= 0) return { value: undefined, error: bad }
+  return { value: s, error: "" }
+}
+
+// tool_pricing: an object of costs per tool, each at least 0. error is "" when fine or absent.
+function pricingFrom(fs: Field[]): { value: Map<string, f64> | undefined, error: string } {
+  const raw = find(fs, "tool_pricing")
+  if (raw === undefined || raw === "null") return { value: undefined, error: "" }
+  const inner = objectFields(raw)
+  if (inner === undefined) return { value: undefined, error: "tool_pricing must be an object of costs per tool" }
+  const out: Map<string, f64> = new Map()
+  for (const f of inner) {
+    const n = parseFloat(f.raw)
+    if (n === undefined || n < 0.0) return { value: undefined, error: `tool_pricing "${f.key}" must be a number of at least 0` }
+    out.set(f.key, n)
+  }
+  return { value: out, error: "" }
 }
 
 function listClients(store: ConfigStore): McpReply {
@@ -373,9 +456,9 @@ function listClients(store: ConfigStore): McpReply {
   return reply(200, `{"clients":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
 }
 
-function createClient(store: ConfigStore, body: string): McpReply {
+function createClient(store: ConfigStore, body: string, publicOnly: bool): McpReply {
   const fs = checkedFields(body, CLIENT_KINDS)
-  if (fs === undefined || !strArrayOk(find(fs, "tools_to_execute")) || !strArrayOk(find(fs, "tools_to_skip")) || !strArrayOk(find(fs, "tools_to_auto_execute")) || !strMapOk(find(fs, "headers"))) {
+  if (fs === undefined || !strArrayOk(find(fs, "tools_to_execute")) || !strArrayOk(find(fs, "tools_to_skip")) || !strArrayOk(find(fs, "tools_to_auto_execute")) || !strArrayOk(find(fs, "allowed_extra_headers")) || !strMapOk(find(fs, "headers"))) {
     return fail(400, "Invalid request payload")
   }
   let parsed: ClientBody = {}
@@ -393,7 +476,16 @@ function createClient(store: ConfigStore, body: string): McpReply {
     return fail(409, "an MCP client or virtual MCP with this name already exists")
   }
   const ct = b.connection_type ?? ""
-  if (ct !== "http" && ct !== "sse" && ct !== "stdio") return fail(400, `Invalid connection_type "${ct}": must be one of http, sse, stdio`)
+  if (ct !== "http" && ct !== "sse" && ct !== "stdio" && ct !== "openapi") return fail(400, `Invalid connection_type "${ct}": must be one of http, sse, stdio, openapi`)
+  // an inline spec is checked now; a spec_url is fetched when the client connects
+  const specText = b.openapi_config?.spec ?? ""
+  if (specText !== "") {
+    try {
+      parseSpec(specText, b.openapi_config?.include_deprecated === true)
+    } catch (e) {
+      return fail(400, `openapi_config.spec: ${e.message}`)
+    }
+  }
   const auth = b.auth_type ?? "none"
   if (auth !== "none" && auth !== "headers") return fail(400, `auth_type "${auth}" is not supported by this gateway: use none or headers`)
   const cp = connectionError(b, ct)
@@ -402,9 +494,24 @@ function createClient(store: ConfigStore, body: string): McpReply {
   if (ae !== "") return fail(400, ae)
   const syncErr = durationError(b.tool_sync_interval ?? "0")
   if (syncErr !== "") return fail(400, syncErr)
+  const to = timeoutFrom(fs)
+  if (to.error !== "") return fail(400, to.error)
+  const pr = pricingFrom(fs)
+  if (pr.error !== "") return fail(400, pr.error)
+  // Bifrost: a new http client connects fresh for each call unless it says it needs a session
+  const sticky = rawBool(fs, "needs_session_stickiness")
+  if (ct !== "http" && sticky === false) return fail(400, "needs_session_stickiness false applies only to http connections: sse and stdio stay sticky")
 
   let c: McpClientConfig = { name: name, connection_type: ct }
-  if (ct !== "stdio") c.connection_string = b.connection_string
+  if (ct === "openapi") c.openapi_config = b.openapi_config
+  c.tool_execution_timeout = to.value
+  c.is_ping_available = b.is_ping_available ?? true
+  c.needs_session_stickiness = ct === "http" ? (sticky ?? false) : undefined
+  c.allowed_extra_headers = b.allowed_extra_headers
+  c.tool_pricing = pr.value
+  // registered while dashboard auth is off: every dial must reach a public address
+  c.require_public_target = publicOnly ? true : undefined
+  if (ct === "http" || ct === "sse") c.connection_string = b.connection_string
   c.headers = b.headers
   c.auth = b.auth
   c.stdio_config = b.stdio_config
@@ -423,12 +530,12 @@ function createClient(store: ConfigStore, body: string): McpReply {
   return reply(201, clientJson(c))
 }
 
-function updateClient(store: ConfigStore, id: string, body: string): McpReply {
+function updateClient(store: ConfigStore, id: string, body: string, publicOnly: bool): McpReply {
   const list = clientsOf(store.cfg)
   const at = clientIndex(list, id)
   if (at < 0) return fail(404, "MCP client not found")
   const fs = checkedFields(body, CLIENT_KINDS)
-  if (fs === undefined || !strArrayOk(find(fs, "tools_to_execute")) || !strArrayOk(find(fs, "tools_to_skip")) || !strArrayOk(find(fs, "tools_to_auto_execute")) || !strMapOk(find(fs, "headers"))) {
+  if (fs === undefined || !strArrayOk(find(fs, "tools_to_execute")) || !strArrayOk(find(fs, "tools_to_skip")) || !strArrayOk(find(fs, "tools_to_auto_execute")) || !strArrayOk(find(fs, "allowed_extra_headers")) || !strMapOk(find(fs, "headers"))) {
     return fail(400, "Invalid request payload")
   }
   let parsed: ClientBody = {}
@@ -449,6 +556,29 @@ function updateClient(store: ConfigStore, id: string, body: string): McpReply {
 
   const cur = list[at]!
   let c = cur
+  if (has(fs, "tool_execution_timeout")) {
+    const to = timeoutFrom(fs)
+    if (to.error !== "") return fail(400, to.error)
+    c.tool_execution_timeout = to.value
+  }
+  if (has(fs, "tool_pricing")) {
+    const pr = pricingFrom(fs)
+    if (pr.error !== "") return fail(400, pr.error)
+    c.tool_pricing = pr.value
+  }
+  if (has(fs, "needs_session_stickiness")) {
+    const sticky = rawBool(fs, "needs_session_stickiness")
+    if ((c.connection_type ?? "") !== "http" && sticky === false) return fail(400, "needs_session_stickiness false applies only to http connections: sse and stdio stay sticky")
+    c.needs_session_stickiness = sticky
+  }
+  if (has(fs, "openapi_config")) {
+    if (c.connection_type !== "openapi") return fail(400, "openapi_config applies only to openapi connections")
+    c.openapi_config = keepOpenApi(b.openapi_config, c.openapi_config)
+  }
+  if (has(fs, "is_ping_available")) c.is_ping_available = b.is_ping_available
+  if (has(fs, "allowed_extra_headers")) c.allowed_extra_headers = b.allowed_extra_headers
+  // can be turned on, never off (Bifrost's require_public_target)
+  if (publicOnly) c.require_public_target = true
   if (has(fs, "disabled")) c.disabled = b.disabled
   if (has(fs, "allow_by_default") || has(fs, "allow_on_all_virtual_keys")) c.allow_by_default = allowFlag(fs, b, c.allow_by_default ?? false)
   if (has(fs, "tools_to_execute")) c.tools_to_execute = b.tools_to_execute
@@ -492,11 +622,22 @@ function runClient(store: ConfigStore, id: string, step: string): McpReply {
   return { status: 200, body: `{"status":"success","message":"MCP client tools refreshed successfully"}`, action: "refresh", id: id }
 }
 
-function clientRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string): McpReply {
-  if (segs.length === 3) return m === "POST" ? createClient(store, body) : notAllowed(m)
+// The inline OpenAPI document of an openapi client, as it was stored. A spec_url client keeps only the URL.
+function openapiSpec(store: ConfigStore, id: string): McpReply {
+  const list = clientsOf(store.cfg)
+  const at = clientIndex(list, id)
+  if (at < 0) return fail(404, "OpenAPI MCP client not found")
+  const c = list[at]!
+  const spec = c.openapi_config?.spec ?? ""
+  if (c.connection_type !== "openapi" || spec === "") return fail(404, "OpenAPI MCP client not found")
+  return reply(200, spec)
+}
+
+function clientRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string, publicOnly: bool): McpReply {
+  if (segs.length === 3) return m === "POST" ? createClient(store, body, publicOnly) : notAllowed(m)
   const id = segs[3]!
   if (segs.length === 4) {
-    if (m === "PUT") return updateClient(store, id, body)
+    if (m === "PUT") return updateClient(store, id, body, publicOnly)
     if (m === "DELETE") return deleteClient(store, id)
     return notAllowed(m)
   }
@@ -507,7 +648,7 @@ function clientRoute(store: ConfigStore, m: string, segs: string[], body: string
     return runClient(store, id, sub === "reconnect" ? "reconnect" : "refresh")
   }
   // Bifrost's GET: no client here is an OpenAPI one, so none has a spec to return
-  if (sub === "openapi-spec") return m === "GET" ? fail(404, "OpenAPI MCP client not found") : notAllowed(m)
+  if (sub === "openapi-spec") return m === "GET" ? openapiSpec(store, id) : notAllowed(m)
   if (VERIFY_ROUTES.includes(sub)) return m === "POST" ? verifyRoute(store, id, sub) : notAllowed(m)
   return fail(404, `no route for ${p}`)
 }
@@ -742,6 +883,215 @@ function virtualRoute(store: ConfigStore, m: string, segs: string[], body: strin
   return fail(404, `no route for ${p}`)
 }
 
+// ---- OpenAPI preview: POST /api/mcp/openapi/preview ----
+
+// The preview of a document: its info, servers and security schemes, and the tool each operation makes.
+function previewJson(text: string, includeDeprecated: bool, base: string): string throws SyntaxError {
+  const doc = try parseSpec(text, includeDeprecated)
+  const servers: string[] = doc.servers.map((s: string): string => quote(s))
+  const resolved = base !== "" ? base : doc.servers.length > 0 ? doc.servers[0]! : ""
+  const schemes: string[] = doc.schemes.map((s: OpScheme): string => `{"name":${quote(s.name)},"type":${quote(s.type)},"in":${quote(s.in)},"param_name":${quote(s.param_name)},"scheme":${quote(s.scheme)}}`)
+  const tools: string[] = doc.ops.map((o: OpenApiOp): string => `{"name":${quote(o.name)},"description":${quote(o.description)},"method":${quote(o.method)},"path":${quote(o.path)},"deprecated":${o.deprecated},"input_schema":${inputSchema(o)}}`)
+  return `{"title":${quote(doc.title)},"version":${quote(doc.version)},"openapi_version":${quote(doc.openapi_version)},"description":${quote(doc.description)},"servers":[${servers.join(",")}],"base_url":${quote(resolved)},"operation_servers":false,"security_schemes":[${schemes.join(",")}],"tools":[${tools.join(",")}],"tool_count":${doc.ops.length}}`
+}
+
+// The preview route. The document is the spec, or spec_url fetched now (the client is not created).
+export async function openapiRoute(method: string, path: string, body: string): Promise<McpReply | undefined> {
+  const q = path.indexOf("?")
+  const pure = q < 0 ? path : path.slice(0, q)
+  if (pure !== "/api/mcp/openapi/preview") return undefined
+  if (method.toUpperCase() !== "POST") return notAllowed(method)
+  const fs = objectFields(body)
+  if (fs === undefined) return fail(400, "Invalid request payload")
+  let text = rawStr(fs, "spec") ?? ""
+  const url = rawStr(fs, "spec_url") ?? ""
+  if (text === "" && url === "") return fail(400, "spec or spec_url is required")
+  if (text === "") {
+    const dl = deadline(CONNECT_MS)
+    try {
+      const r = try await fetch(url, { signal: dl.controller.signal })
+      if (r.status < 200 || r.status >= 300) return fail(400, `could not fetch the spec: HTTP ${r.status}`)
+      text = try await r.text()
+    } catch (e) {
+      return fail(400, `could not fetch the spec: ${e.message}`)
+    } finally {
+      dl.finish()
+    }
+  }
+  let out = ""
+  try {
+    out = try previewJson(text, rawBool(fs, "include_deprecated") ?? false, rawStr(fs, "base_url") ?? "")
+  } catch (e) {
+    return fail(400, `invalid OpenAPI document: ${e.message}`)
+  }
+  return reply(200, out)
+}
+
+// ---- tool groups: /api/mcp/tool-groups, Bifrost's deprecated alias of the virtual MCPs ----
+// The same store, with the group's shape. Its governance associations (team_ids, customer_ids and
+// provider_names) reach the virtual keys they name, and virtual_key_ids are attached keys; the
+// keys are stored as the virtual MCP's allowed_keys. A create must send enabled: true, since a virtual MCP cannot be disabled here.
+// user_ids and api_key_ids have no Raiju counterpart, so a body that sends them is refused.
+
+// The string list a JSON array holds, or [] when it is absent or not one.
+function stringList(raw: string | undefined): string[] {
+  if (raw === undefined || !raw.startsWith("[")) return []
+  try {
+    return JSON.parse(raw) as string[]
+  } catch (e) {
+    return []
+  }
+}
+
+// The virtual keys a tool group reaches: its virtual_key_ids, and every key of the teams, customers
+// and providers its associations name.
+function groupKeys(store: ConfigStore, fs: Field[]): string[] {
+  const out: string[] = []
+  for (const k of stringList(find(fs, "virtual_key_ids"))) {
+    if (!out.includes(k)) out.push(k)
+  }
+  const teams = stringList(find(fs, "team_ids"))
+  const customers = stringList(find(fs, "customer_ids"))
+  const providers = stringList(find(fs, "provider_names"))
+  if (teams.length + customers.length + providers.length === 0) return out
+  for (const vk of store.cfg.governance?.virtual_keys ?? []) {
+    const tid: string = vk.team_id ?? ""
+    const cid: string = vk.customer_id ?? ""
+    let hit = (tid !== "" && teams.includes(tid)) || (cid !== "" && customers.includes(cid))
+    for (const pc of vk.provider_configs ?? []) {
+      if (providers.includes(pc.provider)) hit = true
+    }
+    if (hit && !out.includes(vk.id)) out.push(vk.id)
+  }
+  return out
+}
+
+// The virtual MCP body a tool group body means: tools read as {mcp_client_id, tool_names}, and enabled
+// false on create unless the body enables it.
+function groupVirtualBody(fs: Field[], name: string, creating: bool): string throws SyntaxError {
+  const parts: string[] = [`"name":${quote(name)}`]
+  const desc = find(fs, "description")
+  if (desc !== undefined && desc !== "null") parts.push(`"description":${desc}`)
+  const en = find(fs, "enabled")
+  if (en !== undefined && en !== "null") parts.push(`"enabled":${en}`)
+  const tools: string[] = []
+  const raw = find(fs, "tools")
+  if (raw !== undefined && raw.startsWith("[")) {
+    for (const el of try elements(raw)) {
+      const tf = try fields(el)
+      const client = rawStr(tf, "mcp_client_name") ?? rawStr(tf, "mcp_client_id") ?? ""
+      const names = find(tf, "tool_names")
+      const tn = names === undefined || names === "null" ? "" : `,"tool_names":${names}`
+      tools.push(`{"mcp_client_id":${quote(client)}${tn}}`)
+    }
+  }
+  parts.push(`"tools":[${tools.join(",")}]`)
+  return `{${parts.join(",")}}`
+}
+
+// The stored virtual MCP with its allowed keys set to keys (undefined when there is no such virtual MCP).
+function setVirtualKeys(store: ConfigStore, id: string, keys: string[]): McpReply | undefined {
+  const list = virtualsOf(store.cfg)
+  const at = virtualIndex(list, id)
+  if (at < 0) return fail(404, "virtual MCP not found")
+  let next: vmcp.VirtualMcp[] = list
+  let v = next[at]!
+  v.allowed_keys = keys
+  next[at] = v
+  return persist(store, withVirtuals(store.cfg, next))
+}
+
+// POST (id "") and PUT of a tool group. A write that names association fields sets the keys afresh.
+function toolGroupWrite(store: ConfigStore, id: string, body: string): McpReply {
+  const creating = id === ""
+  const fs = objectFields(body)
+  if (fs === undefined) return fail(400, "Invalid request payload")
+  for (const k of ["user_ids", "api_key_ids"]) {
+    if (has(fs, k)) return fail(400, `${k} has no Raiju equivalent: attach the tool group to virtual keys with virtual_key_ids or team_ids, customer_ids and provider_names`)
+  }
+  // Raiju's virtual MCPs are always served, so a group cannot be created disabled (Bifrost's default)
+  if (creating && rawBool(fs, "enabled") !== true) return fail(400, "enabled must be true: Raiju serves every virtual MCP, so a tool group cannot be created disabled")
+  const name = creating ? (rawStr(fs, "name") ?? "") : id
+  if (!creating && rawStr(fs, "name") !== undefined && rawStr(fs, "name") !== id) return fail(400, "renaming a tool group is not supported: its name is its id")
+  let vb = ""
+  try {
+    vb = groupVirtualBody(fs, name, creating)
+  } catch (e) {
+    return fail(400, "Invalid request payload")
+  }
+  const assoc = has(fs, "virtual_key_ids") || has(fs, "team_ids") || has(fs, "customer_ids") || has(fs, "provider_names")
+  const r = creating ? createVirtual(store, vb) : updateVirtual(store, id, vb)
+  if (r.status >= 300) return r
+  if (creating || assoc) {
+    const kr = setVirtualKeys(store, name, groupKeys(store, fs))
+    if (kr !== undefined && kr.status >= 300) return kr
+  }
+  const at = virtualIndex(virtualsOf(store.cfg), name)
+  if (at < 0) return fail(404, "virtual MCP not found")
+  return reply(creating ? 201 : 200, `{"mcp_tool_group":${virtualJson(virtualsOf(store.cfg)[at]!, virtualKeyIds(store.cfg))}}`)
+}
+
+function toolGroupRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string): McpReply {
+  if (segs.length === 3) {
+    if (m === "GET") {
+      const list = virtualsOf(store.cfg)
+      const keyIds = virtualKeyIds(store.cfg)
+      const parts: string[] = []
+      for (const v of list) parts.push(virtualJson(v, keyIds))
+      return reply(200, `{"mcp_tool_groups":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
+    }
+    return m === "POST" ? toolGroupWrite(store, "", body) : notAllowed(m)
+  }
+  if (segs.length !== 4) return fail(404, `no route for ${p}`)
+  const id = segs[3]!
+  if (m === "GET") {
+    const at = virtualIndex(virtualsOf(store.cfg), id)
+    if (at < 0) return fail(404, "tool group not found")
+    return reply(200, `{"mcp_tool_group":${virtualJson(virtualsOf(store.cfg)[at]!, virtualKeyIds(store.cfg))}}`)
+  }
+  if (m === "PUT") return toolGroupWrite(store, id, body)
+  if (m === "DELETE") {
+    const r = deleteVirtual(store, id)
+    return r.status === 200 ? reply(200, `{"success":true}`) : r
+  }
+  return notAllowed(m)
+}
+
+// ---- OAuth configs: /api/oauth/config/{id}/status and DELETE /api/oauth/config/{id} ----
+// An OAuth config is the MCP client of auth type "oauth" with that name. Its status is "authorized"
+// when the client holds a token and "pending" otherwise. DELETE revokes: the tokens are dropped and the
+// client stays. A live session keeps the token it had until the client next connects (see LIMITS).
+export function oauthConfigRoute(store: ConfigStore, method: string, path: string): McpReply | undefined {
+  const q = path.indexOf("?")
+  const pure = q < 0 ? path : path.slice(0, q)
+  const segs = pure.split("/").filter((s) => s !== "")
+  if (segs.length < 4 || segs[0] !== "api" || segs[1] !== "oauth" || segs[2] !== "config") return undefined
+  const id = segs[3]!
+  const isStatus = segs.length === 5 && segs[4] === "status"
+  if (!isStatus && segs.length !== 4) return undefined
+  const list = clientsOf(store.cfg)
+  const at = clientIndex(list, id)
+  const a = at < 0 ? undefined : oauthAuthOf(list[at]!)
+  if (isStatus) {
+    if (method !== "GET") return notAllowed(method)
+    if (a === undefined) return fail(404, "OAuth config not found")
+    const st = authorized(a) ? "authorized" : "pending"
+    return reply(200, `{"id":${quote(id)},"status":"${st}"}`)
+  }
+  if (method !== "DELETE") return notAllowed(method)
+  if (a === undefined) return fail(404, "OAuth config not found")
+  let na = a
+  na.access_token = undefined
+  na.refresh_token = undefined
+  na.token_expires_at = undefined
+  const revoked = withAuth(list[at]!, na)
+  let next: McpClientConfig[] = list
+  next[at] = revoked
+  const err = persist(store, withClients(store.cfg, next))
+  if (err !== undefined) return err
+  return reply(200, `{"status":"success","message":"OAuth config revoked"}`)
+}
+
 // ---- OAuth for clients of auth type "oauth": the authorization code flow with PKCE (Bifrost's
 // initiate-verification, complete-oauth, reauthorize and reregister). A flow's state (its verifier
 // and redirect URI) is held by this process until the callback returns, for FLOW_TTL_MS. The
@@ -955,7 +1305,7 @@ export async function oauthRoute(store: ConfigStore, method: string, path: strin
 // The MCP management route for method and path, or undefined when the path is not one of them.
 // The caller passes every /api/mcp path that is not handled elsewhere (the /api/mcp view and the
 // library are not).
-export function mcpApi(store: ConfigStore, method: string, path: string, body: string): McpReply | undefined {
+export function mcpApi(store: ConfigStore, method: string, path: string, body: string, publicOnly?: bool): McpReply | undefined {
   const m = method.toUpperCase()
   const q = path.indexOf("?")
   const p = q < 0 ? path : path.slice(0, q)
@@ -963,8 +1313,9 @@ export function mcpApi(store: ConfigStore, method: string, path: string, body: s
   if (segs.length < 3 || segs[0] !== "api" || segs[1] !== "mcp") return undefined
   const area = segs[2]!
   if (area === "clients") return m === "GET" ? listClients(store) : notAllowed(m)
-  if (area === "client") return clientRoute(store, m, segs, body, p)
+  if (area === "client") return clientRoute(store, m, segs, body, p, publicOnly ?? false)
   if (area === "virtual-mcps") return virtualRoute(store, m, segs, body, p)
+  if (area === "tool-groups") return toolGroupRoute(store, m, segs, body, p)
   return undefined
 }
 
@@ -1205,5 +1556,31 @@ test("attach and detach change which virtual keys may use a virtual MCP", () => 
   expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/nope/virtual-keys/vk1", "")!.status).toBe(404)
   expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/nope/virtual-keys/vk1", "")!.status).toBe(404)
   expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/dev/virtual-keys/vk1", "")!.status).toBe(405)
+  cleanupFile(s.path)
+})
+
+test("tool groups alias virtual MCPs, OAuth configs report status and revoke, and openapi needs a spec it can read", () => {
+  const s = fixture()
+  expect(mcpApi(s, "POST", "/api/mcp/tool-groups", "{\"name\":\"ops\",\"tools\":[{\"mcp_client_name\":\"fs\",\"tool_names\":[\"read\"]}],\"virtual_key_ids\":[\"vk2\"]}")!.status).toBe(400)
+  const g = mcpApi(s, "POST", "/api/mcp/tool-groups", "{\"name\":\"ops\",\"enabled\":true,\"tools\":[{\"mcp_client_name\":\"fs\",\"tool_names\":[\"read\"]}],\"virtual_key_ids\":[\"vk2\"]}")!
+  expect(g.status).toBe(201)
+  expect(g.body.includes("\"virtual_key_ids\":[\"vk2\"]")).toBe(true)
+  expect(mcpApi(s, "GET", "/api/mcp/tool-groups/ops", "")!.status).toBe(200)
+  expect(mcpApi(s, "GET", "/api/mcp/tool-groups", "")!.body.includes("\"mcp_tool_groups\":[")).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/tool-groups", "{\"name\":\"x\",\"tools\":[],\"user_ids\":[\"u1\"]}")!.status).toBe(400)
+  expect(mcpApi(s, "DELETE", "/api/mcp/tool-groups/ops", "")!.status).toBe(200)
+  expect(mcpApi(s, "GET", "/api/mcp/tool-groups/ops", "")!.status).toBe(404)
+
+  const oa = mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"gh\",\"connection_type\":\"http\",\"connection_string\":\"https://gh.example/mcp\",\"auth\":{\"type\":\"oauth\",\"authorize_url\":\"https://gh.example/authorize\",\"token_url\":\"https://gh.example/token\"}}")!
+  expect(oa.status).toBe(201)
+  expect(oauthConfigRoute(s, "GET", "/api/oauth/config/gh/status")!.body).toBe("{\"id\":\"gh\",\"status\":\"pending\"}")
+  expect(oauthConfigRoute(s, "GET", "/api/oauth/config/fs/status")!.status).toBe(404)
+  expect(oauthConfigRoute(s, "DELETE", "/api/oauth/config/gh")!.status).toBe(200)
+  expect(oauthConfigRoute(s, "POST", "/api/oauth/config/gh/status")!.status).toBe(405)
+
+  const bad = mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"api\",\"connection_type\":\"openapi\",\"openapi_config\":{\"spec\":\"{\\\"swagger\\\":\\\"2.0\\\"}\"}}")!
+  expect(bad.status).toBe(400)
+  const none = mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"api\",\"connection_type\":\"openapi\"}")!
+  expect(none.status).toBe(400)
   cleanupFile(s.path)
 })

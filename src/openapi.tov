@@ -1,0 +1,288 @@
+// OpenAPI-defined MCP clients (Bifrost's connection_type "openapi"): each operation of a JSON OpenAPI
+// 3.x document becomes a tool, and a call sends the HTTP request the operation describes. Parameters
+// and the JSON request body are the tool's arguments; $ref is kept as written and not resolved, and
+// YAML and Swagger 2.0 documents are refused (see LIMITS in the ledger report).
+import { Field, fields, elements, find, rawStr, rawBool, isNull, quote } from "./json"
+import * as b64 from "./base64"
+import { deadline } from "./deadline"
+
+// Bifrost's openapi_config. spec holds the document as text; spec_url is fetched when spec is not set.
+export type OpenApiCred = { value?: string, username?: string, password?: string }
+export type OpenApiConfig = {
+  spec?: string,
+  spec_url?: string,
+  base_url?: string,
+  security_credentials?: Map<string, OpenApiCred>,
+  include_deprecated?: bool,
+  max_response_bytes?: int,
+}
+
+export type OpParam = { name: string, in: string, required: bool, schema: string }
+export type OpBody = { required: bool, schema: string }
+export type OpScheme = { name: string, type: string, in: string, param_name: string, scheme: string }
+export type OpenApiOp = { name: string, method: string, path: string, description: string, deprecated: bool, params: OpParam[], body?: OpBody }
+export type OpenApiDoc = { title: string, version: string, openapi_version: string, description: string, servers: string[], ops: OpenApiOp[], schemes: OpScheme[] }
+export type OpRequest = { method: string, url: string, headers: Map<string, string>, body?: string }
+
+const METHODS: string[] = ["get", "post", "put", "patch", "delete"]
+const NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+const MAX_RESPONSE_BYTES = 65536
+
+// Bifrost's tool names: the operationId, else the method and path, with each byte outside [a-zA-Z0-9_-] as "_".
+function safeName(s: string): string {
+  const bytes = new TextEncoder().encode(s)
+  let out = ""
+  for (let i = 0; i < bytes.length; i++) {
+    const c = int(bytes[i]!)
+    const ch = s.slice(i, i + 1)
+    out += c < 128 && NAME_CHARS.includes(ch) ? ch : "_"
+  }
+  return out
+}
+
+// The parameters of an operation, its path-level ones first; an operation's own parameter of the same
+// name and place replaces the path-level one.
+function paramsOf(pathFields: Field[], opFields: Field[]): OpParam[] throws SyntaxError {
+  const out: OpParam[] = []
+  for (const list of [pathFields, opFields]) {
+    const raw = find(list, "parameters")
+    if (raw === undefined || !raw.startsWith("[")) continue
+    for (const el of try elements(raw)) {
+      const pf = try fields(el)
+      const name = rawStr(pf, "name") ?? ""
+      const where = rawStr(pf, "in") ?? ""
+      if (name === "" || where === "") continue
+      const schema = find(pf, "schema")
+      const p: OpParam = { name: name, in: where, required: rawBool(pf, "required") ?? (where === "path"), schema: schema === undefined || isNull(schema) ? "{\"type\":\"string\"}" : schema }
+      let at = -1
+      for (let i = 0; i < out.length; i++) {
+        if (out[i]!.name === name && out[i]!.in === where) at = i
+      }
+      if (at >= 0) out[at] = p
+      else out.push(p)
+    }
+  }
+  return out
+}
+
+// The JSON request body schema, when the operation has one that is JSON.
+function bodyOf(opFields: Field[]): OpBody | undefined throws SyntaxError {
+  const raw = find(opFields, "requestBody")
+  if (raw === undefined || !raw.startsWith("{")) return undefined
+  const rf = try fields(raw)
+  const content = find(rf, "content")
+  if (content === undefined || !content.startsWith("{")) return undefined
+  const media = find(try fields(content), "application/json")
+  if (media === undefined || !media.startsWith("{")) return undefined
+  const schema = find(try fields(media), "schema") ?? "{}"
+  return { required: rawBool(rf, "required") ?? false, schema: schema }
+}
+
+// Parses a JSON OpenAPI 3.x document. Operations marked deprecated are left out unless include_deprecated.
+export function parseSpec(text: string, includeDeprecated: bool): OpenApiDoc throws SyntaxError {
+  const root = try fields(text.trim())
+  const version = rawStr(root, "openapi") ?? ""
+  if (!version.startsWith("3.")) throw new SyntaxError(version === "" ? "the document has no openapi version (only OpenAPI 3.x JSON is supported)" : `OpenAPI ${version} is not supported (only OpenAPI 3.x JSON)`)
+  const info = try fields(find(root, "info") ?? "{}")
+  const servers: string[] = []
+  for (const sv of try elements(find(root, "servers") ?? "[]")) {
+    const u = rawStr(try fields(sv), "url") ?? ""
+    if (u !== "") servers.push(u)
+  }
+  const ops: OpenApiOp[] = []
+  const paths = try fields(find(root, "paths") ?? "{}")
+  for (const pf of paths) {
+    if (!pf.raw.startsWith("{")) continue
+    const pathFields = try fields(pf.raw)
+    for (const method of METHODS) {
+      const ofRaw = find(pathFields, method)
+      if (ofRaw === undefined || !ofRaw.startsWith("{")) continue
+      const of = try fields(ofRaw)
+      const deprecated = rawBool(of, "deprecated") ?? false
+      if (deprecated && !includeDeprecated) continue
+      const opId = rawStr(of, "operationId") ?? ""
+      const name = opId !== "" ? safeName(opId) : safeName(`${method}_${pf.key}`)
+      const desc = rawStr(of, "summary") ?? rawStr(of, "description") ?? ""
+      const op: OpenApiOp = { name: name, method: method.toUpperCase(), path: pf.key, description: desc, deprecated: deprecated, params: try paramsOf(pathFields, of) }
+      const body = try bodyOf(of)
+      if (body !== undefined) op.body = body
+      ops.push(op)
+    }
+  }
+  const schemes: OpScheme[] = []
+  const comps = find(root, "components")
+  const secRaw = comps === undefined ? undefined : find(try fields(comps), "securitySchemes")
+  if (secRaw !== undefined && secRaw.startsWith("{")) {
+    for (const sf of try fields(secRaw)) {
+      if (!sf.raw.startsWith("{")) continue
+      const f = try fields(sf.raw)
+      schemes.push({ name: sf.key, type: rawStr(f, "type") ?? "", in: rawStr(f, "in") ?? "", param_name: rawStr(f, "name") ?? "", scheme: rawStr(f, "scheme") ?? "" })
+    }
+  }
+  return { title: rawStr(info, "title") ?? "", version: rawStr(info, "version") ?? "", openapi_version: version, description: rawStr(info, "description") ?? "", servers: servers, ops: ops, schemes: schemes }
+}
+
+// The tool's input schema: one property per parameter, and "body" for the JSON request body.
+export function inputSchema(op: OpenApiOp): string {
+  const props: string[] = []
+  const required: string[] = []
+  for (const p of op.params) {
+    props.push(`${quote(p.name)}:${p.schema}`)
+    if (p.required) required.push(quote(p.name))
+  }
+  const body = op.body
+  if (body !== undefined) {
+    props.push(`"body":${body.schema}`)
+    if (body.required) required.push(quote("body"))
+  }
+  return `{"type":"object","properties":{${props.join(",")}},"required":[${required.join(",")}]}`
+}
+
+const UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+const HEX = "0123456789ABCDEF"
+
+// Percent-encodes a value for a URL path or query: every byte outside the unreserved set.
+export function pctEncode(s: string): string {
+  const bytes = new TextEncoder().encode(s)
+  let out = ""
+  for (let i = 0; i < bytes.length; i++) {
+    const b = int(bytes[i]!)
+    const ch = s.slice(i, i + 1)
+    if (b < 128 && UNRESERVED.includes(ch)) {
+      out += ch
+      continue
+    }
+    const hi = Math.floor(b / 16)
+    const lo = b % 16
+    out += "%" + HEX.slice(hi, hi + 1) + HEX.slice(lo, lo + 1)
+  }
+  return out
+}
+
+// The decoded value of a JSON string literal (the quotes removed, escapes read).
+function strValue(raw: string): string throws SyntaxError {
+  const fs = try fields(`{"v":${raw}}`)
+  return rawStr(fs, "v") ?? ""
+}
+
+// A JSON argument as the text a path, query or header takes: strings without quotes, other values as JSON.
+function plain(raw: string): string throws SyntaxError {
+  if (raw.startsWith("\"")) return try strValue(raw)
+  return raw
+}
+
+// The HTTP request one call of an operation makes. args is the tool's arguments object (JSON text).
+// Configured credentials go out with the request: apiKey in a header, query or cookie, http bearer and http basic.
+export function requestFor(op: OpenApiOp, base: string, args: string, doc: OpenApiDoc, creds: Map<string, OpenApiCred>): OpRequest throws SyntaxError {
+  const fs = try fields(args.trim() === "" ? "{}" : args.trim())
+  let path = op.path
+  const query: string[] = []
+  const headers: Map<string, string> = new Map()
+  headers.set("accept", "application/json")
+  for (const p of op.params) {
+    const raw = find(fs, p.name)
+    if (raw === undefined || isNull(raw)) {
+      if (p.required) throw new SyntaxError(`missing required argument ${p.name}`)
+      continue
+    }
+    const v = try plain(raw)
+    if (p.in === "path") path = path.split(`{${p.name}}`).join(pctEncode(v))
+    else if (p.in === "query") query.push(`${pctEncode(p.name)}=${pctEncode(v)}`)
+    else if (p.in === "header") headers.set(p.name.toLowerCase(), v)
+  }
+  let body: string | undefined = undefined
+  const bodyRaw = find(fs, "body")
+  if (op.body !== undefined && bodyRaw !== undefined && !isNull(bodyRaw)) {
+    body = bodyRaw
+    headers.set("content-type", "application/json")
+  }
+  if (op.body !== undefined && op.body.required && body === undefined) throw new SyntaxError("missing required argument body")
+  // credentials for the schemes the document declares
+  for (const s of doc.schemes) {
+    const c = creds.get(s.name)
+    if (c === undefined) continue
+    const cv = c.value ?? ""
+    if (s.type === "apiKey" && cv !== "") {
+      if (s.in === "header") headers.set(s.param_name.toLowerCase(), cv)
+      else if (s.in === "query") query.push(`${pctEncode(s.param_name)}=${pctEncode(cv)}`)
+      else if (s.in === "cookie") headers.set("cookie", `${s.param_name}=${cv}`)
+    } else if (s.type === "http" && s.scheme.toLowerCase() === "bearer" && cv !== "") {
+      headers.set("authorization", `Bearer ${cv}`)
+    } else if (s.type === "http" && s.scheme.toLowerCase() === "basic") {
+      const pair = `${c.username ?? ""}:${c.password ?? ""}`
+      headers.set("authorization", "Basic " + b64.encode(new TextEncoder().encode(pair)))
+    }
+  }
+  const root = base.endsWith("/") ? base.slice(0, base.byteLength - 1) : base
+  const qs = query.length > 0 ? "?" + query.join("&") : ""
+  return { method: op.method, url: root + path + qs, headers: headers, body: body }
+}
+
+// The status and text of an operation's answer, cut to max bytes (0 is the default cap).
+export async function callOperation(req: OpRequest, timeoutMs: int, max: int): Promise<{ status: int, text: string }> throws Error {
+  const dl = deadline(timeoutMs)
+  try {
+    const hs: Record<string, string> = req.headers
+    const body: string = req.body ?? ""
+    let res: Response = new Response()
+    if (req.body !== undefined) {
+      res = try await fetch(req.url, { method: req.method, headers: hs, body: body, signal: dl.controller.signal })
+    } else {
+      res = try await fetch(req.url, { method: req.method, headers: hs, signal: dl.controller.signal })
+    }
+    const text = try await res.text()
+    const cap = max > 0 ? max : MAX_RESPONSE_BYTES
+    return { status: res.status, text: text.byteLength > cap ? text.slice(0, cap) : text }
+  } finally {
+    dl.finish()
+  }
+}
+
+test("operations become tools with a schema", () => {
+  const spec = `{"openapi":"3.0.3","info":{"title":"Pets","version":"1.2"},"servers":[{"url":"https://api.example.com/v1/"}],
+    "paths":{"/pets/{id}":{"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get":{"operationId":"get_pet","summary":"One pet","parameters":[{"name":"verbose","in":"query","schema":{"type":"boolean"}}]},
+      "delete":{"operationId":"drop pet","deprecated":true}},
+     "/pets":{"post":{"summary":"Add","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object"}}}}}}},
+    "components":{"securitySchemes":{"key":{"type":"apiKey","in":"header","name":"X-Key"},"basic":{"type":"http","scheme":"basic"}}}}`
+  const doc = try parseSpec(spec, false)
+  expect(doc.title).toBe("Pets")
+  expect(doc.servers.length).toBe(1)
+  expect(doc.ops.length).toBe(2)
+  expect(doc.ops[0]!.name).toBe("get_pet")
+  expect(doc.ops[0]!.params.length).toBe(2)
+  expect(doc.ops[1]!.name).toBe("post__pets")
+  expect(doc.ops[1]!.body!.required).toBe(true)
+  expect(doc.schemes.length).toBe(2)
+  const all = try parseSpec(spec, true)
+  expect(all.ops.length).toBe(3)
+  expect(inputSchema(doc.ops[0]!)).toBe('{"type":"object","properties":{"id":{"type":"string"},"verbose":{"type":"boolean"}},"required":["id"]}')
+  let threw = false
+  try {
+    parseSpec('{"swagger":"2.0"}', false)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("calls build the URL, the query, the body and the credentials", () => {
+  const doc = try parseSpec(`{"openapi":"3.0.0","info":{"title":"t","version":"1"},"paths":{"/pets/{id}":{"get":{"operationId":"g","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"q","in":"query","schema":{"type":"string"}}]}},"/pets":{"post":{"operationId":"p","requestBody":{"content":{"application/json":{"schema":{"type":"object"}}}}}}},"components":{"securitySchemes":{"key":{"type":"apiKey","in":"query","name":"api_key"}}}}`, false)
+  const creds: Map<string, OpenApiCred> = new Map()
+  creds.set("key", { value: "k 1" })
+  const g = try requestFor(doc.ops[0]!, "https://api.example.com/v1/", '{"id":"a b","q":"x&y"}', doc, creds)
+  expect(g.url).toBe("https://api.example.com/v1/pets/a%20b?q=x%26y&api_key=k%201")
+  expect(g.method).toBe("GET")
+  const p = try requestFor(doc.ops[1]!, "https://api.example.com", '{"body":{"name":"rex"}}', doc, new Map())
+  expect(p.url).toBe("https://api.example.com/pets")
+  expect(p.body).toBe('{"name":"rex"}')
+  expect(p.headers.get("content-type")).toBe("application/json")
+  let threw = false
+  try {
+    requestFor(doc.ops[0]!, "https://x", "{}", doc, creds)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  expect(pctEncode("a/b~c")).toBe("a%2Fb~c")
+})

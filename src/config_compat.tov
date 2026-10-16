@@ -5,7 +5,8 @@
 // dropped silently. Both work on the raw text, and fields this module does not
 // model stay as they are.
 
-import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString, build, quote, setField, without } from "./json"
+import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString, build, quote, setField, without, isNull } from "./json"
+import { durationMsOf } from "./mcp"
 
 // Raiju's top-level keys (the Config type in config.tov), plus the Bifrost
 // sections this module reads and the pricing_sync key it writes.
@@ -27,7 +28,12 @@ function governanceKeys(): string[] {
 }
 
 function mcpKeys(): string[] {
-  return ["client_configs", "tool_execution_timeout_seconds", "virtual_mcps", "tool_groups"]
+  return ["client_configs", "tool_execution_timeout_seconds", "virtual_mcps", "tool_groups", "tool_manager_config", "tool_sync_interval", "oauth_private_allowlist"]
+}
+
+// The mcp.tool_manager_config keys Raiju reads (mapToolManager in mapMcp, and the notes for the rest).
+function toolManagerKeys(): string[] {
+  return ["tool_execution_timeout", "oauth_private_allowlist", "max_agent_depth", "disable_auto_tool_inject", "max_instructions_per_client", "max_instructions_total", "code_mode_binding_level", "code_mode_limits"]
 }
 
 // Keys of the provider sections Raiju reads one level down (checked as providers.<name>.<section>).
@@ -82,10 +88,8 @@ function noteTable(): Map<string, string> {
     ["client.delete_expired_virtual_keys", GEN],
     ["client.enforce_vk_object_ownership", GEN],
     ["client.routing_chain_max_depth", GEN],
-    ["client.mcp_tool_sync_interval", "is not implemented as a global default: set tool_sync_interval on each MCP client"],
     ["client.mcp_code_mode_binding_level", GEN],
     ["client.mcp_code_mode_limits", GEN],
-    ["client.mcp_oauth_private_allowlist", GEN],
     ["client.mcp_enable_temp_token_auth", GEN],
     ["client.mcp_server_auth_mode", GEN],
     ["client.oauth2_server_config", GEN],
@@ -95,8 +99,6 @@ function noteTable(): Map<string, string> {
     ["client.a2a_store_raw_request_response", "is not implemented: Raiju has no A2A gateway"],
     // governance and mcp
     ["governance.complexity_analyzer_config", "is not read: Raiju's complexity router is the top-level complexity_router"],
-    ["mcp.tool_manager_config", "is not implemented: Raiju has no tool manager settings"],
-    ["mcp.tool_sync_interval", "is not implemented as a global default: set tool_sync_interval on each MCP client"],
     // providers, written as providers.*
     ["providers.*.keys.use_for_batch_api", "is read but not applied yet: batch routes do not check it"],
     ["providers.*.keys.oauth_key_config", GEN],
@@ -257,6 +259,21 @@ function mapClient(inout top: Field[], inout notes: string[]): void throws Synta
     }
   }
 
+  // the older client-level MCP keys: the global sync interval and the private-host allowlist
+  for (const pair of [["mcp_tool_sync_interval", "tool_sync_interval"], ["mcp_oauth_private_allowlist", "oauth_private_allowlist"]]) {
+    const v = find(cf, pair[0]!)
+    if (v === undefined) continue
+    cf = without(cf, [pair[0]!])
+    clientChanged = true
+    if (find(mcp, pair[1]!) === undefined && !isNull(v)) {
+      setField(&mcp, pair[1]!, v)
+      mcpChanged = true
+      notes.push(`config: "client.${pair[0]}" read as "mcp.${pair[1]}"`)
+    } else {
+      notes.push(`config: "client.${pair[0]}" is ignored: "mcp.${pair[1]}" is set, and it wins`)
+    }
+  }
+
   const retention = find(cf, "log_retention_days")
   if (retention !== undefined) {
     cf = without(cf, ["log_retention_days"])
@@ -293,7 +310,7 @@ function clientNames(mf: Field[]): Map<string, string> throws SyntaxError {
 }
 
 // One Bifrost virtual MCP as a Raiju VirtualMcp (src/vmcp.tov), or undefined when it is not loaded.
-function virtualMcp(el: string, names: Map<string, string>, inout notes: string[]): string | undefined throws SyntaxError {
+function virtualMcp(el: string, names: Map<string, string>, extraKeys: string[], inout notes: string[]): string | undefined throws SyntaxError {
   const f = try members(el)
   const name = rawStr(f, "endpoint_slug") ?? rawStr(f, "name")
   if (name === undefined || name === "") {
@@ -325,37 +342,174 @@ function virtualMcp(el: string, names: Map<string, string>, inout notes: string[
     }
   }
   vf.push({ key: "tools", raw: "[" + tools.join(",") + "]" })
-  add(&vf, "allowed_keys", find(f, "virtual_key_ids"))
+  // the keys the entry names, plus those its governance associations reach (tool groups)
+  const ids = try strings(find(f, "virtual_key_ids"))
+  for (const k of extraKeys) {
+    if (!ids.includes(k)) ids.push(k)
+  }
+  if (find(f, "virtual_key_ids") !== undefined || extraKeys.length > 0) vf.push({ key: "allowed_keys", raw: "[" + ids.map((x: string): string => quote(x)).join(",") + "]" })
   return build(vf)
 }
 
-// mcp.virtual_mcps becomes the top-level virtual_mcps list. mcp.tool_groups is the
-// deprecated Bifrost name for the same list, with the same tool entries.
+// A Go duration or a bare number of seconds, as Bifrost's tool_execution_timeout and tool_sync_interval
+// take them, as whole seconds (a number of nanoseconds, the legacy form of tool_sync_interval, is
+// converted too when nanos is set).
+function secondsOf(raw: string, nanos: bool): int throws SyntaxError {
+  if (raw.startsWith("\"")) return Math.floor(durationMsOf(try decodeString(raw)) / 1000)
+  const n = parseFloat(raw) ?? 0.0
+  return Math.floor(nanos ? n / 1000000000.0 : n)
+}
+
+// The client_configs entries with their durations as Go duration strings ("45s"): a bare
+// tool_execution_timeout is seconds, and a tool_sync_interval number is nanoseconds.
+function clientItems(raw: string | undefined): string[] throws SyntaxError {
+  const out: string[] = []
+  for (const el of try items(raw)) {
+    let f = try members(el)
+    const to = find(f, "tool_execution_timeout")
+    if (to !== undefined && !to.startsWith("\"") && !isNull(to)) {
+      const toSecs = try secondsOf(to, false)
+      setField(&f, "tool_execution_timeout", quote(`${toSecs}s`))
+    }
+    const ts = find(f, "tool_sync_interval")
+    if (ts !== undefined && !ts.startsWith("\"") && !isNull(ts)) {
+      const tsSecs = try secondsOf(ts, true)
+      setField(&f, "tool_sync_interval", quote(`${tsSecs}s`))
+    }
+    out.push(build(f))
+  }
+  return out
+}
+
+// The keys a tool group's governance associations reach (Bifrost's deprecated team_ids, customer_ids and
+// provider_names): every virtual key of those teams, customers or providers.
+function groupKeyIds(f: Field[], top: Field[]): string[] throws SyntaxError {
+  const teams = try strings(find(f, "team_ids"))
+  const customers = try strings(find(f, "customer_ids"))
+  const providers = try strings(find(f, "provider_names"))
+  const out: string[] = []
+  if (teams.length === 0 && customers.length === 0 && providers.length === 0) return out
+  const gov = try members(find(top, "governance"))
+  for (const vr of try items(find(gov, "virtual_keys"))) {
+    const vf = try members(vr)
+    const id = rawStr(vf, "id")
+    if (id === undefined) continue
+    const team = rawStr(vf, "team_id") ?? ""
+    const cust = rawStr(vf, "customer_id") ?? ""
+    let hit = (team !== "" && teams.includes(team)) || (cust !== "" && customers.includes(cust))
+    for (const pc of try items(find(vf, "provider_configs"))) {
+      const p = rawStr(try members(pc), "provider")
+      if (p !== undefined && providers.includes(p)) hit = true
+    }
+    if (hit) out.push(id)
+  }
+  return out
+}
+
+// mcp.tool_manager_config: Bifrost's runtime settings. Each one Raiju keeps under its own name is moved
+// there when that name is unset; the rest are reported.
+function mapToolManager(inout top: Field[], inout mf: Field[], inout notes: string[]): void throws SyntaxError {
+  const tm = find(mf, "tool_manager_config")
+  if (tm === undefined) return
+  mf = without(mf, ["tool_manager_config"])
+  const tf = try members(tm)
+  const to = find(tf, "tool_execution_timeout")
+  if (to !== undefined && !isNull(to)) {
+    if (find(mf, "tool_execution_timeout_seconds") === undefined) {
+      const toSecs = try secondsOf(to, false)
+      setField(&mf, "tool_execution_timeout_seconds", `${toSecs}`)
+      notes.push(`config: "mcp.tool_manager_config.tool_execution_timeout" read as "mcp.tool_execution_timeout_seconds"`)
+    } else {
+      notes.push(`config: "mcp.tool_manager_config.tool_execution_timeout" is ignored: "mcp.tool_execution_timeout_seconds" is set, and it wins`)
+    }
+  }
+  const allow = find(tf, "oauth_private_allowlist")
+  if (allow !== undefined && !isNull(allow)) {
+    if (find(mf, "oauth_private_allowlist") === undefined) setField(&mf, "oauth_private_allowlist", allow)
+  }
+  const depth = find(tf, "max_agent_depth")
+  const dis = find(tf, "disable_auto_tool_inject")
+  if (depth !== undefined || dis !== undefined) {
+    let cl = try members(find(top, "client"))
+    let changed = false
+    if (depth !== undefined && !isNull(depth) && find(cl, "mcp_agent_depth") === undefined) {
+      setField(&cl, "mcp_agent_depth", depth)
+      changed = true
+    }
+    if (dis !== undefined && !isNull(dis) && find(cl, "mcp_disable_auto_tool_inject") === undefined) {
+      setField(&cl, "mcp_disable_auto_tool_inject", dis)
+      changed = true
+    }
+    if (changed) put(&top, "client", cl)
+    notes.push(`config: "mcp.tool_manager_config" max_agent_depth and disable_auto_tool_inject are read as "client.mcp_agent_depth" and "client.mcp_disable_auto_tool_inject"`)
+  }
+  for (const k of ["max_instructions_per_client", "max_instructions_total"]) {
+    if (find(tf, k) !== undefined) notes.push(`config: "mcp.tool_manager_config.${k}" is not implemented: Raiju does not forward MCP server instructions`)
+  }
+  for (const k of ["code_mode_binding_level", "code_mode_limits"]) {
+    if (find(tf, k) !== undefined) notes.push(`config: "mcp.tool_manager_config.${k}" is out of scope: MCP code mode (SCOPE.md)`)
+  }
+  const known = toolManagerKeys()
+  for (const f of tf) {
+    if (!known.includes(f.key)) notes.push(`config: "mcp.tool_manager_config.${f.key}" is not implemented: Raiju has no such tool manager setting`)
+  }
+}
+
+// mcp.virtual_mcps becomes the top-level virtual_mcps list. mcp.tool_groups is the deprecated Bifrost
+// name for the same list (enterprise tool groups): each group also reaches the virtual keys of the teams,
+// customers and providers it names, as its governance associations do.
 function mapMcp(inout top: Field[], inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "mcp")
   if (raw === undefined) return
-  const mf = try members(raw)
+  let mf = try members(raw)
+  let changed = false
+  const cc = find(mf, "client_configs")
+  if (cc !== undefined) {
+    const citems = try clientItems(cc)
+    setField(&mf, "client_configs", "[" + citems.join(",") + "]")
+    changed = true
+  }
+  const ts = find(mf, "tool_sync_interval")
+  if (ts !== undefined && !ts.startsWith("\"") && !isNull(ts)) {
+    const tsSecs = try secondsOf(ts, true)
+    setField(&mf, "tool_sync_interval", quote(`${tsSecs}s`))
+    changed = true
+  }
+  if (find(mf, "tool_manager_config") !== undefined) changed = true
+  try mapToolManager(&top, &mf, &notes)
   const vraw = find(mf, "virtual_mcps")
   const graw = find(mf, "tool_groups")
-  if (vraw === undefined && graw === undefined) return
-  put(&top, "mcp", without(mf, ["virtual_mcps", "tool_groups"]))
-  if (find(top, "virtual_mcps") !== undefined) {
-    notes.push(`config: "mcp.virtual_mcps" is ignored: "virtual_mcps" is set, and it wins`)
-    return
+  if (vraw !== undefined || graw !== undefined) {
+    mf = without(mf, ["virtual_mcps", "tool_groups"])
+    changed = true
+    if (find(top, "virtual_mcps") !== undefined) {
+      notes.push(`config: "mcp.virtual_mcps" is ignored: "virtual_mcps" is set, and it wins`)
+    } else {
+      if (vraw !== undefined) {
+        notes.push(`config: "mcp.virtual_mcps" read as "virtual_mcps"`)
+        if (graw !== undefined) notes.push(`config: "mcp.tool_groups" is ignored: "mcp.virtual_mcps" is set, and it wins`)
+      } else {
+        notes.push(`config: "mcp.tool_groups" read as "virtual_mcps" (deprecated in Bifrost)`)
+      }
+      const names = try clientNames(try members(raw))
+      let vms: string[] = []
+      for (const el of try items(vraw ?? graw)) {
+        const f = try members(el)
+        let extra: string[] = []
+        if (vraw === undefined) {
+          extra = try groupKeyIds(f, top)
+          for (const u of ["user_ids", "api_key_ids"]) {
+            const uv = find(f, u)
+            if (uv !== undefined && !isNull(uv)) notes.push(`config: "mcp.tool_groups" ${u} is not applied: Raiju's virtual keys have no ${u === "user_ids" ? "user" : "API key"} ids`)
+          }
+        }
+        const vm = try virtualMcp(el, names, extra, &notes)
+        if (vm !== undefined) vms.push(vm)
+      }
+      setField(&top, "virtual_mcps", "[" + vms.join(",") + "]")
+    }
   }
-  if (vraw !== undefined) {
-    notes.push(`config: "mcp.virtual_mcps" read as "virtual_mcps"`)
-    if (graw !== undefined) notes.push(`config: "mcp.tool_groups" is ignored: "mcp.virtual_mcps" is set, and it wins`)
-  } else {
-    notes.push(`config: "mcp.tool_groups" read as "virtual_mcps" (deprecated in Bifrost)`)
-  }
-  const names = try clientNames(mf)
-  let vms: string[] = []
-  for (const el of try items(vraw ?? graw)) {
-    const vm = try virtualMcp(el, names, &notes)
-    if (vm !== undefined) vms.push(vm)
-  }
-  setField(&top, "virtual_mcps", "[" + vms.join(",") + "]")
+  if (changed) put(&top, "mcp", mf)
 }
 
 // alerting becomes alerts. Raiju's metric rules are separate, so Bifrost's CEL rules
@@ -1169,7 +1323,11 @@ export function unknownKeys(configText: string): string[] throws SyntaxError {
     }
     if (f.key === "client") try checkChildren("client", f.raw, clientKeys(), &out)
     if (f.key === "governance") try checkChildren("governance", f.raw, governanceKeys(), &out)
-    if (f.key === "mcp") try checkChildren("mcp", f.raw, mcpKeys(), &out)
+    if (f.key === "mcp") {
+      try checkChildren("mcp", f.raw, mcpKeys(), &out)
+      const tmRaw = find(try members(f.raw), "tool_manager_config")
+      if (tmRaw !== undefined) try checkChildren("mcp.tool_manager_config", tmRaw, toolManagerKeys(), &out)
+    }
     if (f.key === "providers") {
       for (const p of try members(f.raw)) {
         const base = `providers.${p.key}`
@@ -1539,7 +1697,6 @@ test("unknownKeys lists ignored keys and the accepted-but-unused ones", () => {
   }`)
   expect(keys).toEqual([
     "server",
-    "mcp.tool_manager_config",
   ])
 })
 
@@ -1609,12 +1766,12 @@ test("a whole Bifrost example: what is mapped and what is left", () => {
   expect(p.logs_store!.retention_days).toBe(30)
   expect(p.governance!.auth_config!.username).toBe("env.ADMIN_USER")
   expect(p.governance!.auth_config!.password).toBe("env.ADMIN_PW")
-  expect(r.notes.length).toBe(4)
+  expect(r.notes.length).toBe(5)
   expect(r.notes.includes(`config: "plugins[governance].config.is_vk_mandatory" is ignored: "client.enforce_auth_on_inference" is set, and it wins`)).toBe(true)
   const w = try warnings(text)
   expect(w.includes(`config: "config_store" is not used: Raiju saves its config to the file given by -config`)).toBe(true)
   expect(w.includes(`config: "client.initial_pool_size" is a Go connection-pool setting that Raiju does not use`)).toBe(true)
-  expect(w.includes(`config: "mcp.tool_manager_config" is not implemented: Raiju has no tool manager settings`)).toBe(true)
+  expect(w.includes(`config: "mcp.tool_manager_config.server_instructions_mode" is not implemented: Raiju has no such tool manager setting`)).toBe(true)
   expect(w.includes(`config: unknown key "$schema" is ignored`)).toBe(false)
   expect(w.length).toBe(4 + 3)
 })
@@ -2011,5 +2168,42 @@ test("maxim plugin: api key and log repo id; a disabled sink is not loaded", () 
   expect(rawStr(m, "api_key")).toBe("mk")
   expect(rawStr(m, "log_repo_id")).toBe("repo")
   expect(rawStr(m, "kind")).toBe("maxim")
+})
+
+test("MCP client durations, tool manager settings and tool group associations", () => {
+  const r = try normalize(`{
+    "client": { "mcp_tool_sync_interval": 300000000000 },
+    "mcp": {
+      "tool_sync_interval": "5m",
+      "tool_manager_config": { "tool_execution_timeout": 45, "max_agent_depth": 4, "disable_auto_tool_inject": true, "oauth_private_allowlist": ["10.0.0.1"] },
+      "client_configs": [ { "name": "git", "connection_type": "http", "connection_string": "https://g.example/mcp", "tool_execution_timeout": 90, "tool_sync_interval": 90000000000 } ],
+      "tool_groups": [ { "name": "ops", "enabled": true, "team_ids": ["t1"], "tools": [ { "mcp_client_name": "git", "tool_names": ["*"] } ] } ]
+    },
+    "governance": { "virtual_keys": [ { "id": "vk-a", "team_id": "t1", "value": "env.A" }, { "id": "vk-b", "team_id": "t2", "value": "env.B" } ] }
+  }`)
+  const mcp = try fields(find(try fields(r.text), "mcp")!)
+  expect(find(mcp, "tool_sync_interval")).toBe('"5m"')
+  expect(find(mcp, "tool_manager_config")).toBeUndefined()
+  expect(find(mcp, "tool_execution_timeout_seconds")).toBe("45")
+  expect(find(mcp, "oauth_private_allowlist")).toBe('["10.0.0.1"]')
+  const cl = try fields(find(try fields(r.text), "client")!)
+  expect(find(cl, "mcp_agent_depth")).toBe("4")
+  expect(find(cl, "mcp_disable_auto_tool_inject")).toBe("true")
+  expect(find(cl, "mcp_tool_sync_interval")).toBeUndefined()
+  const cc = try elements(find(mcp, "client_configs")!)
+  const g = try fields(cc[0]!)
+  expect(rawStr(g, "tool_execution_timeout")).toBe("90s")
+  expect(rawStr(g, "tool_sync_interval")).toBe("90s")
+  const vm = try elements(find(try fields(r.text), "virtual_mcps")!)
+  expect(vm.length).toBe(1)
+  expect(find(try fields(vm[0]!), "allowed_keys")).toBe('["vk-a"]')
+  expect(r.notes.includes(`config: "client.mcp_tool_sync_interval" is ignored: "mcp.tool_sync_interval" is set, and it wins`)).toBe(true)
+})
+
+test("the older client-level tool sync interval becomes the global default when mcp sets none", () => {
+  const r = try normalize(`{ "client": { "mcp_tool_sync_interval": 300000000000 }, "mcp": { "client_configs": [] } }`)
+  const mcp = try fields(find(try fields(r.text), "mcp")!)
+  expect(find(mcp, "tool_sync_interval")).toBe('"300s"')
+  expect(r.notes.includes(`config: "client.mcp_tool_sync_interval" read as "mcp.tool_sync_interval"`)).toBe(true)
 })
 
