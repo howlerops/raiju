@@ -59,6 +59,7 @@ import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
 import { ExportCursor, objectKey, putRequest, putBytesRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs } from "./exports"
 import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
+import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode } from "./mcpissuer"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
 
@@ -231,10 +232,11 @@ function badRequest(message: string): Reply {
   return { status: 400, body: errorJson(message, "invalid_request_error", undefined), contentType: "application/json" }
 }
 
-function denied(status: int, message: string): Response {
+// challenge is the WWW-Authenticate value of a 401 (the MCP authorization server's, when it is on).
+function denied(status: int, message: string, challenge?: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "application/json")
-  if (status === 401) h.set("www-authenticate", `Bearer realm="raiju", Basic realm="raiju"`)
+  if (status === 401) h.set("www-authenticate", challenge ?? `Bearer realm="raiju", Basic realm="raiju"`)
   return new Response(errorJson(message, status === 401 ? "authentication_error" : "permission_error", undefined), { status: status, headers: h })
 }
 
@@ -2694,8 +2696,21 @@ export class Ops {
     const m = this.engine.mcp
     if (m === undefined || this.engine.cfg.mcp_server?.enabled === false) return json(404, errorJson("no MCP servers are connected", "invalid_request_error", undefined))
     const h = snapshot(req.headers)
+    // client.mcp_server_auth_mode: a Bifrost-issued JWT stands for the virtual key its sub names; in oauth
+    // mode nothing else is accepted. The 401s name the protected resource when the authorization server is on.
+    const iss = issuerOf(this.engine.cfg)
+    const challenge = iss === undefined ? undefined : challengeOf(iss)
+    const caller = callerOf(iss, h.get("authorization"), Date.now())
+    if (caller.kind === "error") return denied(401, caller.message, challenge)
+    if (caller.kind === "vk") {
+      const named = keyById(this.engine.cfg, caller.vk)
+      if (!keyUsable(named, Date.now()) || named === undefined) return denied(401, "the virtual key this token names is not active", challenge)
+      h.set("x-bf-vk", named.value)
+    } else if (serverAuthMode(this.engine.cfg) === "oauth") {
+      return denied(401, "this server requires OAuth JWT authentication; header credentials are not accepted in oauth mode", challenge)
+    }
     const vk = this.engine.gov.findKey(h)
-    if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)")
+    if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
     let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs))

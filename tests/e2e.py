@@ -1734,7 +1734,7 @@ def mcp_po_e2e(env):
         return call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "po-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, h, base=MCP_PO, auth=False)
 
     def consent_of(body):
-        m = re.search(r"flows/([0-9a-f]+)/start#t=([0-9a-f]+)", body)
+        m = re.search(r"flow=([0-9a-f]+)#t=([0-9a-f]+)", body)
         return (m.group(1), m.group(2)) if m else ("", "")
 
     def sessions(q=""):
@@ -1761,6 +1761,8 @@ def mcp_po_e2e(env):
 
         s, _, b = tool("sk-bf-po-a")
         fid_a, tok_a = consent_of(b)
+        ps, ph, page = raw("GET", MCP_PO + "/workspace/mcp-sessions/auth?flow=" + fid_a + "#t=" + tok_a)
+        check("the consent link opens the connect page as HTML, with a content security policy", ps == 200 and "text/html" in ph.get("content-type", "") and "Connect an MCP client" in page and "default-src 'none'" in ph.get("content-security-policy", ""), (ps, page[:200]))
         check("a caller without a token gets the consent link, with its temp token", s == 401 and "Authentication required for po" in b and fid_a != "" and tok_a != "", (s, b[:300]))
         s, _, b = call("GET", "/api/oauth/per-user/flows/" + fid_a + "/start", base=MCP_PO, headers={"x-bifrost-temp-token": tok_a}, auth=False)
         check("the flow's start URL answers the upstream authorize URL with PKCE", s == 200 and "code_challenge_method=S256" in json.loads(b)["authorize_url"], (s, b[:200]))
@@ -1783,7 +1785,7 @@ def mcp_po_e2e(env):
         check("the sessions list shows the caller's token row without its tokens", s == 200 and len(mine) == 1 and mine[0]["auth_mode"] == "vk" and mine[0]["status"] == "active" and "oauth-access-" not in b, (s, b[:300]))
         row_a = mine[0]["id"] if mine else ""
         s, _, b = call("POST", "/api/mcp/sessions/" + row_a + "/reauth", base=MCP_PO, auth=False)
-        check("reauth opens a new consent link for the row", s == 200 and "/api/oauth/per-user/flows/" in json.loads(b)["url"], (s, b[:200]))
+        check("reauth opens a new consent link for the row", s == 200 and "/workspace/mcp-sessions/auth?flow=" in json.loads(b)["url"], (s, b[:200]))
 
         call("POST", "/_oauth/expire-all", base=MOCK, auth=False)
         s, _, b = tool("sk-bf-po-a")
@@ -1801,6 +1803,198 @@ def mcp_po_e2e(env):
         check("the revoked row is gone from the sessions list", not [r for r in rows if r["virtual_key_id"] == "vk-po-a"], b[:200])
     finally:
         gw.terminate()
+
+MCP_AS = "http://127.0.0.1:18165"  # MCP as an OAuth authorization server (client.mcp_server_auth_mode both): registration, consent, tokens, /mcp with a token
+MCP_AS_STRICT = "http://127.0.0.1:18166"  # the same authorization server in oauth mode: /mcp takes JWTs only
+AS_REDIRECT = "http://127.0.0.1:8080/cb"  # a loopback callback: registered, never called
+
+class NoFollow(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def raw(method, url, body=None, headers=None):
+    """One request that does not follow redirects: (status, headers, body text). A str body is sent as it is (a form)."""
+    data = None
+    if isinstance(body, str):
+        data = body.encode()
+    elif body is not None:
+        data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.build_opener(NoFollow).open(req, timeout=10) as r:
+            return r.status, r.headers, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read().decode()
+
+def as_register(base):
+    s, _, b = raw("POST", base + "/oauth2/register", {"client_name": "e2e-client", "redirect_uris": [AS_REDIRECT]}, {"content-type": "application/json"})
+    return json.loads(b)["client_id"] if s == 201 else ""
+
+def as_pkce():
+    import hashlib
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    return verifier, challenge
+
+def as_authorize(base, cid, challenge, state):
+    """The authorize redirect to the consent page: (flow id, consent temp token), or empty strings."""
+    q = urllib.parse.urlencode({"client_id": cid, "redirect_uri": AS_REDIRECT, "response_type": "code", "state": state, "code_challenge": challenge, "code_challenge_method": "S256", "scope": "mcp"})
+    s, h, _ = raw("GET", base + "/oauth2/authorize?" + q)
+    loc = h.get("location", "")
+    if s != 302 or "/oauth/consent?flow=" not in loc:
+        return "", ""
+    return loc.split("flow=")[1].split("#")[0], loc.split("#t=")[1]
+
+def as_approve(base, fid, tok, value):
+    """Approves a request with a virtual key: (status, redirect URL)."""
+    s, _, b = raw("PUT", base + "/api/oauth2/consent/flows/" + fid, {"mode": "vk", "value": value}, {"content-type": "application/json", "x-bifrost-temp-token": tok})
+    return s, (json.loads(b).get("redirect_url", "") if s == 200 else "")
+
+def as_token(base, cid, redirect_url, verifier):
+    """The code exchange for the code in a redirect URL: (status, body dict)."""
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(redirect_url).query)
+    form = urllib.parse.urlencode({"grant_type": "authorization_code", "code": q.get("code", [""])[0], "code_verifier": verifier, "client_id": cid, "redirect_uri": AS_REDIRECT, "resource": base + "/mcp"})
+    s, _, b = raw("POST", base + "/oauth2/token", form, {"content-type": "application/x-www-form-urlencoded"})
+    return s, json.loads(b)
+
+def as_mcp(base, token=None, vk=None):
+    """initialize and tools/list on /mcp with a Bearer token or a virtual key header: (initialize status, tools/list status, tools/list body)."""
+    h = {"content-type": "application/json"}
+    if token is not None:
+        h["authorization"] = "Bearer " + token
+    if vk is not None:
+        h["x-bf-vk"] = vk
+    s, hh, _ = raw("POST", base + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-as", "version": "1"}}}, h)
+    sid = {k.lower(): v for k, v in hh.items()}.get("mcp-session-id", "")
+    s2, _, b2 = raw("POST", base + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**h, "mcp-session-id": sid})
+    return s, s2, b2
+
+def as_wait_tools(base, token=None, vk=None, tries=100):
+    """Polls tools/list until the weather client's tool shows (its listing runs in the background)."""
+    b = ""
+    for _ in range(tries):
+        s, s2, b = as_mcp(base, token, vk)
+        if "weather-get_weather" in b:
+            return s, s2, b
+        time.sleep(0.1)
+    return 0, 0, b
+
+def mcp_as_e2e(env):
+    """MCP as an OAuth authorization server: the discovery documents and JWKS, dynamic registration, the authorize redirect
+    to the consent page, the consent API (the detail, a key that does not exist, approval, single use), the code exchange
+    with PKCE, /mcp with the token (its key's tools only), a 401 with WWW-Authenticate, rotation and family revocation on
+    reuse, a token past its expiry, and the oauth mode on its own gateway (JWTs only on /mcp). Two gateways, started and
+    stopped here."""
+    pem_path = os.path.join(BUILD, "e2e.mcpas.key.pem")
+    subprocess.run(["openssl", "genrsa", "-out", pem_path, "2048"], check=True, capture_output=True)
+    pem = open(pem_path).read()
+    def config(base, mode, ttl):
+        return {
+            "client": {"enable_logging": False, "enforce_auth_on_inference": True, "mcp_server_auth_mode": mode,
+                       "oauth2_server_config": {"issuer_url": base, "signing_key": pem, "access_token_ttl": ttl}},
+            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+            "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+            "mcp": {"tool_sync_interval": "1h", "client_configs": [{"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp"}]},
+            "governance": {"virtual_keys": [
+                {"id": "vk-as-a", "value": "sk-bf-as-a", "mcp_configs": [{"mcp_client_name": "weather", "tools_to_execute": ["*"]}]},
+                {"id": "vk-as-b", "value": "sk-bf-as-b", "mcp_configs": []},
+            ]},
+        }
+    gws = []
+    for name, base, port, mode, ttl in [("both", MCP_AS, "18165", "both", 5), ("strict", MCP_AS_STRICT, "18166", "oauth", 600)]:
+        path = os.path.join(BUILD, "e2e.mcpas." + name + ".json")
+        json.dump(config(base, mode, ttl), open(path, "w"))
+        gws.append(subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", port, "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.mcpas." + name + ".log"), "w")))
+    try:
+        wait(MCP_AS + "/health")
+        wait(MCP_AS_STRICT + "/health")
+        s, _, b = raw("GET", MCP_AS + "/.well-known/oauth-authorization-server")
+        meta = json.loads(b) if s == 200 else {}
+        check("the authorization server metadata names its endpoints (RFC 8414)", meta.get("token_endpoint") == MCP_AS + "/oauth2/token" and "S256" in meta.get("code_challenge_methods_supported", []), (s, b[:200]))
+        s, _, b = raw("GET", MCP_AS + "/.well-known/oauth-protected-resource/mcp")
+        prm = json.loads(b) if s == 200 else {}
+        check("the protected resource metadata names /mcp and its server", prm.get("resource") == MCP_AS + "/mcp" and prm.get("authorization_servers") == [MCP_AS], (s, b[:200]))
+        s, _, b = raw("GET", MCP_AS + "/.well-known/jwks.json")
+        keys = json.loads(b).get("keys", []) if s == 200 else []
+        check("the JWKS publishes the RS256 key under its kid", len(keys) == 1 and keys[0].get("alg") == "RS256" and keys[0].get("e") == "AQAB", (s, b[:200]))
+        s, _, _ = raw("POST", MCP_AS + "/oauth2/register", {"redirect_uris": ["http://example.com/cb"]}, {"content-type": "application/json"})
+        check("registration refuses a remote plain-http callback", s == 400, s)
+        # the weather client's tool is listed before any token is issued, so the token's lifetime is not spent waiting
+        s, s2, b = as_wait_tools(MCP_AS, vk="sk-bf-as-a")
+        check("the MCP client's tool is listed for a key", s2 == 200 and "weather-get_weather" in b, (s, s2, b[:200]))
+
+        cid = as_register(MCP_AS)
+        check("dynamic registration answers a client_id", cid != "", cid)
+        verifier, challenge = as_pkce()
+        fid, tok = as_authorize(MCP_AS, cid, challenge, "st-a")
+        check("the authorize redirect opens the consent page with a temp token", fid != "" and tok != "", (fid, tok))
+        s, h, b = raw("GET", MCP_AS + "/oauth/consent?flow=" + fid + "#t=" + tok)
+        check("the consent page is served as HTML with a content security policy", s == 200 and "text/html" in h.get("content-type", "") and "default-src 'none'" in h.get("content-security-policy", ""), (s, h.get("content-type")))
+        s, _, b = raw("GET", MCP_AS + "/api/oauth2/consent/flows/" + fid, None, {"x-bifrost-temp-token": "not-the-token"})
+        check("the consent API refuses another token", s == 401, (s, b[:200]))
+        s, _, b = raw("GET", MCP_AS + "/api/oauth2/consent/flows/" + fid, None, {"x-bifrost-temp-token": tok})
+        detail = json.loads(b) if s == 200 else {}
+        check("the consent detail names the client and offers the virtual key mode", detail.get("client_name") == "e2e-client" and detail.get("available_modes") == ["vk"], (s, b[:200]))
+        s, b = as_approve(MCP_AS, fid, tok, "sk-bf-as-zzz")
+        check("a virtual key that does not exist is refused", s == 400, (s, b[:200]))
+        s, redirect = as_approve(MCP_AS, fid, tok, "sk-bf-as-a")
+        rq = urllib.parse.parse_qs(urllib.parse.urlparse(redirect).query)
+        check("the approval answers the redirect URL with the code, the state and the issuer", s == 200 and rq.get("state") == ["st-a"] and rq.get("iss") == [MCP_AS] and "code" in rq, (s, redirect[:200]))
+        s, b = as_approve(MCP_AS, fid, tok, "sk-bf-as-a")
+        check("the consent link is single use", s == 401, (s, b[:200]))
+        s, tokens = as_token(MCP_AS, cid, redirect, "x" * 10 + verifier)
+        check("a code with the wrong verifier is refused", s == 400 and tokens.get("error") == "invalid_grant", (s, tokens))
+        s, tokens = as_token(MCP_AS, cid, redirect, verifier)
+        check("the code exchanges once for an access token and a refresh token", s == 200 and tokens.get("access_token", "").count(".") == 2 and tokens.get("refresh_token", "") != "" and tokens.get("token_type") == "Bearer", (s, tokens))
+        access, refresh = tokens.get("access_token", ""), tokens.get("refresh_token", "")
+        s, tokens2 = as_token(MCP_AS, cid, redirect, verifier)
+        check("a used code is refused", s == 400, (s, tokens2))
+        s, s2, b = as_mcp(MCP_AS, token=access)
+        check("the token runs /mcp as its virtual key: the key's tools are listed", s == 200 and s2 == 200 and "weather-get_weather" in b, (s, s2, b[:200]))
+        s, h, b = raw("POST", MCP_AS + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize"}, {"content-type": "application/json"})
+        check("/mcp without credentials answers 401", s == 401, (s, b[:200]))
+        check("the 401 carries WWW-Authenticate with resource_metadata", "resource_metadata=\"" + MCP_AS + "/.well-known/oauth-protected-resource/mcp\"" in (h.get("www-authenticate") or ""), h.get("www-authenticate"))
+        s, _, b = raw("POST", MCP_AS + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize"}, {"content-type": "application/json", "authorization": "Bearer " + access[:-4] + "AAAA"})
+        check("a forged token is refused with 401", s == 401, (s, b[:200]))
+        s, _, b = raw("POST", MCP_AS + "/oauth2/token", urllib.parse.urlencode({"grant_type": "refresh_token", "client_id": cid}), {"content-type": "application/x-www-form-urlencoded"})
+        check("a refresh without its token is refused", s == 400, (s, b[:200]))
+
+        form = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": cid, "resource": MCP_AS + "/mcp"})
+        s, _, b = raw("POST", MCP_AS + "/oauth2/token", form, {"content-type": "application/x-www-form-urlencoded"})
+        fresh = json.loads(b) if s == 200 else {}
+        check("a refresh rotates the tokens", s == 200 and fresh.get("refresh_token", "") not in ("", refresh), (s, b[:200]))
+        s, _, b = raw("POST", MCP_AS + "/oauth2/token", form, {"content-type": "application/x-www-form-urlencoded"})
+        check("a reused refresh token is refused", s == 400 and "revoked" in b, (s, b[:200]))
+        form2 = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": fresh.get("refresh_token", ""), "client_id": cid})
+        s, _, b = raw("POST", MCP_AS + "/oauth2/token", form2, {"content-type": "application/x-www-form-urlencoded"})
+        check("reuse revokes the whole family, the newest token included", s == 400, (s, b[:200]))
+
+        ver_b, ch_b = as_pkce()
+        fid_b, tok_b = as_authorize(MCP_AS, cid, ch_b, "st-b")
+        s, redirect_b = as_approve(MCP_AS, fid_b, tok_b, "sk-bf-as-b")
+        s_t, tb = as_token(MCP_AS, cid, redirect_b, ver_b)
+        si, st, bb = as_mcp(MCP_AS, token=tb.get("access_token", ""))
+        check("a token for a key without MCP rules lists no tools", s_t == 200 and st == 200 and "weather-get_weather" not in bb, (s_t, st, bb[:200]))
+
+        time.sleep(6)
+        s, _, b = raw("POST", MCP_AS + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize"}, {"content-type": "application/json", "authorization": "Bearer " + access})
+        check("a token past its access_token_ttl is refused with 401", s == 401, (s, b[:200]))
+
+        # oauth mode on the strict gateway: header credentials are refused, JWTs are not
+        cid2 = as_register(MCP_AS_STRICT)
+        ver3, ch3 = as_pkce()
+        fid3, tok3 = as_authorize(MCP_AS_STRICT, cid2, ch3, "st-c")
+        s3, redirect3 = as_approve(MCP_AS_STRICT, fid3, tok3, "sk-bf-as-a")
+        s_t3, t3 = as_token(MCP_AS_STRICT, cid2, redirect3, ver3)
+        s, _, b = raw("POST", MCP_AS_STRICT + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize"}, {"content-type": "application/json", "x-bf-vk": "sk-bf-as-a"})
+        check("oauth mode refuses a virtual key header on /mcp", s == 401 and "requires OAuth JWT" in b, (s, b[:200]))
+        s, _, b = raw("POST", MCP_AS_STRICT + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize"}, {"content-type": "application/json", "authorization": "Bearer " + t3.get("access_token", "")})
+        check("oauth mode takes the token on /mcp", s_t3 == 200 and s == 200, (s, b[:200]))
+        s, s2, b = as_wait_tools(MCP_AS_STRICT, token=t3.get("access_token", ""))
+        check("the strict gateway lists the key's tools for the token", s2 == 200 and "weather-get_weather" in b, (s2, b[:200]))
+    finally:
+        for gw in gws:
+            gw.terminate()
 
 MCP_PU = "http://127.0.0.1:18151"  # per_user_headers: each virtual key submits its own header values for an MCP client
 
@@ -5035,6 +5229,8 @@ def main():
         mcp_peruser_e2e(env)
         # MCP per-user OAuth: consent links, each caller's own tokens, refresh, sessions list, reauth and revoke: its own gateway
         mcp_po_e2e(env)
+        # MCP as an OAuth authorization server: discovery, registration, consent, tokens, /mcp with a token, and oauth mode: its own gateways
+        mcp_as_e2e(env)
         # the request log in Bifrost's shapes, User-Agent mappings, cache clears, audit by id, tickets and plugin listings: its own gateway
         l97c_e2e(env)
         # client limits, header filters, setup_token, batch keys and alias depth: their own gateways

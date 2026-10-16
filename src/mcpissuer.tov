@@ -1,0 +1,767 @@
+// The MCP authorization server (Bifrost's discovery documents, /oauth2/register, /oauth2/authorize,
+// /oauth2/token and the consent page), on when client.mcp_server_auth_mode is "both" or "oauth". An MCP
+// client registers (RFC 7591), sends its user to the consent page, and the user approves the request with a
+// virtual key. The client then trades the one-time code (PKCE S256) for an access token and a refresh token.
+// The access token is an RS256 JWT whose sub is the virtual key's id and whose bf_mode is "vk", so a /mcp call
+// that carries it runs as that key (Bifrost's vk mode). Registrations, requests, codes and refresh tokens are
+// process-local, as the other OAuth flows are.
+import { Config, OAuth2ServerConfig, VirtualKeyConfig } from "./config"
+import { pkceChallenge } from "./mcpauth"
+import { secureHex, sha256, utf8, toHex } from "./crypto"
+import { encodeUrl, decode } from "./base64"
+import { signRs256, verifyRs256, publicKeyId, publicJwk } from "./jwt"
+import { Field, fields, elements, find, rawStr, rawNum, decodeString, isNull } from "./json"
+import { Hdrs, errorJson } from "./schemas"
+import { rfc3339Ms } from "./vkexpiry"
+import { rfc3339 } from "./anthropic_batch"
+import { connectPageHtml, consentPageHtml } from "./mcpconsent"
+
+// The lifetimes and limits of Bifrost's defaults (mcpoauth2issuance.go and the table constants).
+const DEFAULT_CODE_TTL_S: f64 = 300.0
+const MAX_CODE_TTL_S: f64 = 900.0
+const DEFAULT_ACCESS_TTL_S: f64 = 600.0
+const MAX_CLIENT_NAME = 2048
+const MAX_SCOPE = 4096
+const MAX_STATE = 8192
+const MAX_CHALLENGE = 128
+const MAX_REDIRECTS = 32
+const MAX_REDIRECT = 2048
+
+// A registered client (RFC 7591) and what a request needs from it.
+export type OAuthClientRow = { client_id: string, client_name: string, redirect_uris: string[], grant_types: string[], scope: string, created_at: f64 }
+
+// An authorization request: pending until the consent page approves it ("consented", with the key it names),
+// then "used" once its code is exchanged. code_hash is the SHA-256 of the code, which is never stored.
+export type AuthRequest = { id: string, client_id: string, redirect_uri: string, state: string, scope: string, resource: string, challenge: string, expires_at: f64, status: string, vk_id: string, code_hash: string }
+
+// A refresh token by its SHA-256. Rotation marks the old row revoked and issues a row of the same family; a
+// revoked row presented again revokes the whole family (RFC 9700, section 2.2.2).
+export type RefreshRow = { hash: string, family: string, client_id: string, vk_id: string, scope: string, resource: string, created_at: f64, revoked: bool }
+
+// The settings the endpoints read. kid names the signing key in the token headers.
+export type Issuer = { issuer: string, resource: string, pem: string, kid: string, codeTtl: f64, accessTtl: f64, allowed: string[] }
+
+// What an endpoint answers. The headers that differ by route are optional.
+export type Answer = { status: int, body: string, contentType: string, location?: string, challenge?: string }
+
+// What a request's Bearer token names: a virtual key, a rejected token, or nothing (no JWT was sent).
+export type Caller = { kind: "none" } | { kind: "vk", vk: string } | { kind: "error", message: string }
+
+const CLIENTS: Map<string, OAuthClientRow> = new Map()
+const REQUESTS: Map<string, AuthRequest> = new Map()
+const CODES: Map<string, string> = new Map()
+const REFRESH: Map<string, RefreshRow> = new Map()
+// The consent temp tokens: each opens one request's consent page until the request's expiry.
+const CONSENT_TOKENS: Map<string, { id: string, expires_at: f64 }> = new Map()
+
+// Whether the problem note has been printed for the current misconfiguration.
+let warned = false
+
+// client.mcp_server_auth_mode: "headers" (default), "both" or "oauth". Any other value is refused.
+export function serverAuthMode(c: Config): string {
+  return c.client?.mcp_server_auth_mode ?? "headers"
+}
+
+// Why the authorization server cannot run with this config, or "" when it can (or when it is off).
+export function issuerProblem(c: Config): string {
+  const mode = serverAuthMode(c)
+  if (mode !== "headers" && mode !== "both" && mode !== "oauth") return `client.mcp_server_auth_mode is ${mode}, not headers, both or oauth`
+  if (mode === "headers") return ""
+  const oc: OAuth2ServerConfig = c.client?.oauth2_server_config ?? {}
+  const iss = trimSlash(oc.issuer_url ?? "")
+  if (iss === "") return "client.oauth2_server_config.issuer_url is required when MCP OAuth is on"
+  if (!iss.startsWith("https://") && !iss.startsWith("http://")) return "client.oauth2_server_config.issuer_url must be an http or https URL"
+  const pem = oc.signing_key ?? ""
+  if (pem === "") return "client.oauth2_server_config.signing_key (an RSA private key in PEM) is required when MCP OAuth is on"
+  try {
+    const kid = try publicKeyId(pem)
+    if (kid === "") return "signing_key is not usable"
+  } catch (e) {
+    return "client.oauth2_server_config.signing_key is not an RSA private key in PEM"
+  }
+  return ""
+}
+
+// The authorization server's settings, or undefined when it is off or cannot run (the problem is printed once).
+export function issuerOf(c: Config): Issuer | undefined {
+  if (serverAuthMode(c) === "headers") return undefined
+  const problem = issuerProblem(c)
+  if (problem !== "") {
+    if (!warned) {
+      warned = true
+      console.error(`raiju: mcp oauth: ${problem}; the MCP authorization server is off`)
+    }
+    return undefined
+  }
+  warned = false
+  const oc: OAuth2ServerConfig = c.client?.oauth2_server_config ?? {}
+  const base = trimSlash(oc.issuer_url ?? "")
+  const pem = oc.signing_key ?? ""
+  let kid = ""
+  try {
+    kid = try publicKeyId(pem)
+  } catch (e) {
+    return undefined
+  }
+  const codeTtl = oc.auth_code_ttl ?? 0
+  const accessTtl = oc.access_token_ttl ?? 0
+  return {
+    issuer: base,
+    resource: base + "/mcp",
+    pem: pem,
+    kid: kid,
+    codeTtl: codeTtl <= 0 ? DEFAULT_CODE_TTL_S : Math.min(codeTtl * 1.0, MAX_CODE_TTL_S),
+    accessTtl: accessTtl <= 0 ? DEFAULT_ACCESS_TTL_S : accessTtl * 1.0,
+    allowed: oc.allowed_redirect_uris ?? [],
+  }
+}
+
+// The virtual key with this id in the config, or undefined.
+export function keyById(c: Config, id: string): VirtualKeyConfig | undefined {
+  for (const vk of c.governance?.virtual_keys ?? []) {
+    if (vk.id === id) return vk
+  }
+  return undefined
+}
+
+// Whether a virtual key can still be used: active, and not past its expiry.
+export function keyUsable(vk: VirtualKeyConfig | undefined, nowMs: f64): bool {
+  if (vk === undefined || vk.is_active === false) return false
+  const exp = rfc3339Ms(vk.expires_at ?? "")
+  return exp === undefined || nowMs < exp
+}
+
+// The WWW-Authenticate value that points a client at the protected resource's metadata (RFC 9728, section 5).
+export function challengeOf(iss: Issuer): string {
+  return `Bearer resource_metadata="${iss.issuer}/.well-known/oauth-protected-resource/mcp"`
+}
+
+// What a request's Authorization header names. A token that is not a JWT is left to the virtual-key path.
+export function callerOf(iss: Issuer | undefined, authorization: string | undefined, nowMs: f64): Caller {
+  if (iss === undefined) return { kind: "none" }
+  const auth = (authorization ?? "").trim()
+  if (!auth.toLowerCase().startsWith("bearer ")) return { kind: "none" }
+  const tok = auth.slice(7).trim()
+  if (!tok.startsWith("eyJ")) return { kind: "none" }
+  return verifyBearer(tok, iss, nowMs)
+}
+
+function bad(message: string): Caller {
+  return { kind: "error", message: message }
+}
+
+// Checks an access token: the RS256 signature under our key, the issuer, the audience (this resource), the
+// expiry, and that it is a virtual-key token. Its sub is the key's id.
+function verifyBearer(tok: string, iss: Issuer, nowMs: f64): Caller {
+  const parts = tok.split(".")
+  if (parts.length !== 3) return bad("invalid token: not a JWS compact serialization")
+  let header: Field[] = []
+  let claims: Field[] = []
+  try {
+    header = try fields(try b64text(parts[0]!))
+    claims = try fields(try b64text(parts[1]!))
+  } catch (e) {
+    return bad("invalid token: malformed")
+  }
+  if (rawStr(header, "alg") !== "RS256") return bad("invalid token: alg is not RS256")
+  if (rawStr(header, "kid") !== iss.kid) return bad("invalid token: unknown key id")
+  let ok = false
+  try {
+    ok = try verifyRs256(iss.pem, parts[0]! + "." + parts[1]!, parts[2]!)
+  } catch (e) {
+    ok = false
+  }
+  if (!ok) return bad("invalid token: signature")
+  if (rawStr(claims, "iss") !== iss.issuer) return bad("invalid token: issuer does not match")
+  if (!audienceIs(find(claims, "aud"), iss.resource)) return bad("invalid token: audience does not match this resource")
+  const exp = rawNum(claims, "exp")
+  if (exp === undefined || nowMs / 1000.0 >= exp) return bad("invalid token: expired")
+  if (rawNum(claims, "iat") === undefined) return bad("invalid token: missing iat")
+  const nbf = rawNum(claims, "nbf")
+  if (nbf !== undefined && nowMs / 1000.0 < nbf) return bad("invalid token: not valid yet")
+  const sub = rawStr(claims, "sub") ?? ""
+  if (sub === "") return bad("invalid token: missing sub")
+  if (rawStr(claims, "bf_mode") !== "vk") return bad("invalid token: only virtual-key tokens are accepted")
+  return { kind: "vk", vk: sub }
+}
+
+// Whether an aud claim (a string, or an array of strings) names the resource.
+function audienceIs(raw: string | undefined, want: string): bool {
+  if (raw === undefined || isNull(raw)) return false
+  try {
+    if (raw.startsWith("[")) {
+      for (const e of try elements(raw)) {
+        if (try decodeString(e) === want) return true
+      }
+      return false
+    }
+    return (try decodeString(raw)) === want
+  } catch (e) {
+    return false
+  }
+}
+
+// A base64url segment of a JWT as text.
+function b64text(s: string): string throws Error {
+  const bytes = try decode(s)
+  return try new TextDecoder().decode(bytes)
+}
+
+// ---- endpoints ----
+
+// The protected resource metadata (RFC 9728): /mcp and the server it names.
+export function resourceMetadata(iss: Issuer): string {
+  return JSON.stringify({ resource: iss.resource, authorization_servers: [iss.issuer], scopes_supported: ["mcp"], bearer_methods_supported: ["header"] })
+}
+
+// The authorization server metadata (RFC 8414).
+export function authServerMetadata(iss: Issuer): string {
+  return JSON.stringify({
+    issuer: iss.issuer,
+    authorization_endpoint: iss.issuer + "/oauth2/authorize",
+    token_endpoint: iss.issuer + "/oauth2/token",
+    registration_endpoint: iss.issuer + "/oauth2/register",
+    jwks_uri: iss.issuer + "/.well-known/jwks.json",
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    scopes_supported: ["mcp"],
+    authorization_response_iss_parameter_supported: true,
+  })
+}
+
+// POST /oauth2/register (RFC 7591): a public client with its redirect URIs, answered with its client_id.
+export function register(body: string, iss: Issuer, nowMs: f64): Answer {
+  const fs = objectOf(body)
+  if (fs === undefined) return oauthErr(400, "invalid_request", "malformed request body")
+  let uris: string[] = []
+  let grants: string[] = []
+  let responses: string[] = []
+  try {
+    uris = try strsOf(find(fs, "redirect_uris"))
+    grants = try strsOf(find(fs, "grant_types"))
+    responses = try strsOf(find(fs, "response_types"))
+  } catch (e) {
+    return oauthErr(400, "invalid_request", "malformed request body")
+  }
+  const name = rawStr(fs, "client_name") ?? ""
+  const scope = rawStr(fs, "scope") ?? ""
+  const method = rawStr(fs, "token_endpoint_auth_method") ?? ""
+  if (uris.length === 0) return oauthErr(400, "invalid_redirect_uri", "redirect_uris is required")
+  if (uris.length > MAX_REDIRECTS) return oauthErr(400, "invalid_redirect_uri", `at most ${MAX_REDIRECTS} redirect_uris are allowed`)
+  if (name.byteLength > MAX_CLIENT_NAME) return oauthErr(400, "invalid_client_metadata", `client_name exceeds ${MAX_CLIENT_NAME} bytes`)
+  if (scope.byteLength > MAX_SCOPE) return oauthErr(400, "invalid_client_metadata", `scope exceeds ${MAX_SCOPE} bytes`)
+  for (const u of uris) {
+    if (!redirectAllowed(u, iss.allowed)) return oauthErr(400, "invalid_redirect_uri", "redirect_uri must be a valid local callback or an administrator-approved remote callback")
+  }
+  if (method !== "" && method !== "none") return oauthErr(400, "invalid_client_metadata", "only token_endpoint_auth_method=none is supported")
+  const gs: string[] = grants.length === 0 ? ["authorization_code"] : grants
+  for (const g of gs) {
+    if (g !== "authorization_code" && g !== "refresh_token") return oauthErr(400, "invalid_client_metadata", "unsupported grant_type")
+  }
+  const rs: string[] = responses.length === 0 ? ["code"] : responses
+  for (const r of rs) {
+    if (r !== "code") return oauthErr(400, "invalid_client_metadata", "unsupported response_type")
+  }
+  const granted = scope === "" ? "mcp" : scope
+  let id = ""
+  try {
+    id = try secureHex(16)
+  } catch (e) {
+    return oauthErr(500, "server_error", "failed to register client")
+  }
+  CLIENTS.set(id, { client_id: id, client_name: name, redirect_uris: uris, grant_types: gs, scope: granted, created_at: nowMs })
+  return {
+    status: 201,
+    body: JSON.stringify({ client_id: id, client_id_issued_at: Math.floor(nowMs / 1000.0), grant_types: gs, response_types: rs, redirect_uris: uris, token_endpoint_auth_method: "none", scope: granted }),
+    contentType: "application/json",
+  }
+}
+
+// GET /oauth2/authorize: checks the request, stores it pending, and answers with the consent page's address. A
+// problem the client can act on is sent to its redirect URI; a bad client or redirect URI is answered here.
+export function authorize(q: URLSearchParams, iss: Issuer, nowMs: f64): Answer {
+  const clientId = q.get("client_id") ?? ""
+  const redirect = q.get("redirect_uri") ?? ""
+  const state = q.get("state") ?? ""
+  const scope = q.get("scope") ?? ""
+  const challenge = q.get("code_challenge") ?? ""
+  if (state.byteLength > MAX_STATE || scope.byteLength > MAX_SCOPE || challenge.byteLength > MAX_CHALLENGE) {
+    return oauthErr(400, "invalid_request", "state, scope or code_challenge exceeds the maximum length")
+  }
+  const client = CLIENTS.get(clientId)
+  if (client === undefined) return oauthErr(400, "invalid_client", "unknown client_id")
+  if (!redirectAllowed(redirect, iss.allowed) || !registeredRedirect(client, redirect)) {
+    return oauthErr(400, "invalid_redirect_uri", "redirect_uri not registered for this client")
+  }
+  const refuse = (code: string, desc: string): Answer => {
+    return { status: 302, body: "", contentType: "text/plain; charset=utf-8", location: withParams(redirect, [["error", code], ["error_description", desc], ["state", state]]) }
+  }
+  const registered = client.scope === "" ? "mcp" : client.scope
+  let want = scope
+  if (want === "") {
+    want = registered
+  } else if (!scopeWithin(want, registered)) {
+    return refuse("invalid_scope", "requested scope exceeds the scope registered for this client")
+  }
+  if ((q.get("response_type") ?? "") !== "code") return refuse("unsupported_response_type", "only response_type=code is supported")
+  if ((q.get("code_challenge_method") ?? "") !== "S256") return refuse("invalid_request", "code_challenge_method must be S256")
+  if (challenge === "") return refuse("invalid_request", "code_challenge is required")
+  const resource = q.get("resource") ?? ""
+  if (resource !== "" && resource !== iss.resource) return refuse("invalid_target", "resource does not identify this MCP server")
+  const expires = nowMs + iss.codeTtl * 1000.0
+  let id = ""
+  let tok = ""
+  try {
+    id = try secureHex(16)
+    tok = try secureHex(32)
+  } catch (e) {
+    return refuse("server_error", "failed to create authorization request")
+  }
+  REQUESTS.set(id, { id: id, client_id: client.client_id, redirect_uri: redirect, state: state, scope: want, resource: iss.resource, challenge: challenge, expires_at: expires, status: "pending", vk_id: "", code_hash: "" })
+  CONSENT_TOKENS.set(tok, { id: id, expires_at: expires })
+  return { status: 302, body: "", contentType: "text/plain; charset=utf-8", location: iss.issuer + "/oauth/consent?flow=" + id + "#t=" + tok }
+}
+
+// GET /api/oauth2/consent/flows/{id}: what the consent page shows for a pending request.
+export function consentDetail(id: string, token: string, nowMs: f64): Answer {
+  const r = consentRequest(id, token, nowMs)
+  if (r === undefined) return apiErr(401, "this consent link is invalid or has expired")
+  if (r.status !== "pending") return apiErr(410, "authorization flow has already been completed")
+  const client = CLIENTS.get(r.client_id)
+  const name = client === undefined ? "" : client.client_name
+  return {
+    status: 200,
+    body: JSON.stringify({ redirect_uri: r.redirect_uri, client_name: name, available_modes: ["vk"], expires_at: rfc3339(r.expires_at / 1000.0) }),
+    contentType: "application/json",
+  }
+}
+
+// PUT /api/oauth2/consent/flows/{id}: approves the request with a virtual key (mode "vk"), mints the one-time
+// code and answers the redirect URL with it. The key is the one the token will name.
+export function consentSubmit(id: string, token: string, body: string, iss: Issuer, nowMs: f64, lookup: (value: string) => VirtualKeyConfig | undefined): Answer {
+  const r = consentRequest(id, token, nowMs)
+  if (r === undefined) return apiErr(401, "this consent link is invalid or has expired")
+  if (r.status !== "pending") return apiErr(410, "authorization flow has already been completed")
+  const fs = objectOf(body)
+  if (fs === undefined) return apiErr(400, "invalid request body")
+  const mode = rawStr(fs, "mode") ?? ""
+  if (mode !== "vk") return apiErr(400, `mode "${mode}" is not available`)
+  const value = (rawStr(fs, "value") ?? "").trim()
+  if (value === "") return apiErr(400, "virtual key value is required")
+  const vk = lookup(value)
+  if (vk === undefined) return apiErr(400, "virtual key not found")
+  if (vk.value !== value) return apiErr(400, "this virtual key value has been rotated; use the key's current value")
+  if (!keyUsable(vk, nowMs)) return apiErr(400, "virtual key is inactive or expired")
+  let code = ""
+  try {
+    code = try secureHex(32)
+  } catch (e) {
+    return apiErr(500, "failed to generate authorization code")
+  }
+  const hash = toHex(sha256(utf8(code)))
+  REQUESTS.set(id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "consented", vk_id: vk.id, code_hash: hash })
+  CODES.set(hash, id)
+  CONSENT_TOKENS.delete(token)
+  const url = withParams(r.redirect_uri, [["code", code], ["state", r.state], ["iss", iss.issuer]])
+  return { status: 200, body: JSON.stringify({ redirect_url: url }), contentType: "application/json" }
+}
+
+// POST /oauth2/token: the authorization_code grant (PKCE, bound to the request's client, redirect URI and
+// resource) and the refresh_token grant (rotation, with family revocation on reuse).
+export function tokenEndpoint(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: string) => VirtualKeyConfig | undefined): Answer {
+  const grant = form.get("grant_type") ?? ""
+  try {
+    if (grant === "authorization_code") return codeGrant(form, iss, nowMs, byId)
+    if (grant === "refresh_token") return refreshGrant(form, iss, nowMs, byId)
+  } catch (e) {
+    return oauthErr(500, "server_error", "failed to issue token")
+  }
+  return oauthErr(400, "unsupported_grant_type", `grant_type ${grant} not supported`)
+}
+
+function codeGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: string) => VirtualKeyConfig | undefined): Answer throws Error {
+  const code = form.get("code") ?? ""
+  const verifier = form.get("code_verifier") ?? ""
+  const clientId = form.get("client_id") ?? ""
+  if (code === "" || verifier === "" || clientId === "") return oauthErr(400, "invalid_request", "code, code_verifier and client_id are required")
+  const hash = toHex(sha256(utf8(code)))
+  const rid = CODES.get(hash)
+  const r = rid === undefined ? undefined : REQUESTS.get(rid)
+  if (r === undefined || r.status !== "consented") return oauthErr(400, "invalid_grant", "authorization code not found or already used")
+  if (nowMs >= r.expires_at) return oauthErr(400, "invalid_grant", "authorization code expired")
+  if (r.client_id !== clientId) return oauthErr(400, "invalid_grant", "client_id mismatch")
+  if (r.redirect_uri !== (form.get("redirect_uri") ?? "")) return oauthErr(400, "invalid_grant", "redirect_uri mismatch")
+  const resource = form.get("resource") ?? ""
+  if (resource !== "" && resource !== r.resource) return oauthErr(400, "invalid_grant", "resource mismatch")
+  if (verifier.byteLength < 43 || verifier.byteLength > 128 || pkceChallenge(verifier) !== r.challenge) return oauthErr(400, "invalid_grant", "PKCE verification failed")
+  if (!keyUsable(byId(r.vk_id), nowMs)) return oauthErr(400, "invalid_grant", "virtual key is no longer active")
+  // single use: the code is spent before the tokens leave
+  REQUESTS.set(r.id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "used", vk_id: r.vk_id, code_hash: hash })
+  CODES.delete(hash)
+  const family = try secureHex(16)
+  return try issuePair(iss, family, clientId, r.vk_id, r.scope, r.resource, nowMs)
+}
+
+function refreshGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: string) => VirtualKeyConfig | undefined): Answer throws Error {
+  const rt = form.get("refresh_token") ?? ""
+  const clientId = form.get("client_id") ?? ""
+  if (rt === "" || clientId === "") return oauthErr(400, "invalid_request", "refresh_token and client_id are required")
+  const hash = toHex(sha256(utf8(rt)))
+  const row = REFRESH.get(hash)
+  if (row === undefined) return oauthErr(400, "invalid_grant", "refresh token not found or revoked")
+  if (row.revoked) {
+    revokeFamily(row.family)
+    return oauthErr(400, "invalid_grant", "refresh token not found or revoked")
+  }
+  if (row.client_id !== clientId) return oauthErr(400, "invalid_grant", "client_id mismatch")
+  if (!keyUsable(byId(row.vk_id), nowMs)) return oauthErr(400, "invalid_grant", "virtual key is no longer active")
+  const resource = form.get("resource") ?? ""
+  if (resource !== "" && resource !== row.resource) return oauthErr(400, "invalid_grant", "resource mismatch")
+  REFRESH.set(hash, { hash: row.hash, family: row.family, client_id: row.client_id, vk_id: row.vk_id, scope: row.scope, resource: row.resource, created_at: row.created_at, revoked: true })
+  return try issuePair(iss, row.family, clientId, row.vk_id, row.scope, row.resource, nowMs)
+}
+
+// Mints an access token and a refresh token for one grant, and records the refresh token.
+function issuePair(iss: Issuer, family: string, clientId: string, vkId: string, scope: string, resource: string, nowMs: f64): Answer throws Error {
+  const refresh = try secureHex(32)
+  const hash = toHex(sha256(utf8(refresh)))
+  REFRESH.set(hash, { hash: hash, family: family, client_id: clientId, vk_id: vkId, scope: scope, resource: resource, created_at: nowMs, revoked: false })
+  const access = try accessToken(iss, vkId, scope, resource, nowMs)
+  return { status: 200, body: JSON.stringify({ access_token: access, token_type: "Bearer", expires_in: iss.accessTtl, refresh_token: refresh, scope: scope }), contentType: "application/json" }
+}
+
+// An RS256 JWT: iss, aud (the resource), sub (the virtual key's id), bf_mode "vk", scope, iat, nbf, exp.
+function accessToken(iss: Issuer, vkId: string, scope: string, resource: string, nowMs: f64): string throws SyntaxError {
+  const now = Math.floor(nowMs / 1000.0)
+  const header = encodeUrl(utf8(JSON.stringify({ alg: "RS256", typ: "JWT", kid: iss.kid })))
+  const claims = JSON.stringify({ iss: iss.issuer, aud: resource, sub: vkId, bf_mode: "vk", scope: scope, iat: now, nbf: now, exp: now + iss.accessTtl })
+  const input = header + "." + encodeUrl(utf8(claims))
+  const sig = try signRs256(iss.pem, input)
+  return input + "." + sig
+}
+
+// Marks every refresh token of a family revoked.
+function revokeFamily(family: string): void {
+  for (const k of REFRESH.keys()) {
+    const x = REFRESH.get(k)
+    if (x !== undefined && x.family === family && !x.revoked) REFRESH.set(k, { hash: x.hash, family: x.family, client_id: x.client_id, vk_id: x.vk_id, scope: x.scope, resource: x.resource, created_at: x.created_at, revoked: true })
+  }
+}
+
+// The live request a consent token opens, bound to its flow id, or undefined.
+function consentRequest(id: string, token: string, nowMs: f64): AuthRequest | undefined {
+  if (token === "") return undefined
+  const bound = CONSENT_TOKENS.get(token)
+  if (bound === undefined || bound.id !== id || nowMs >= bound.expires_at) return undefined
+  const r = REQUESTS.get(id)
+  if (r === undefined || nowMs >= r.expires_at) return undefined
+  return r
+}
+
+// ---- helpers ----
+
+// Whether a redirect URI may be used at all: a loopback callback over http or https, the cursor client's
+// callback, an exact entry of allowed_redirect_uris, or any https callback when "*" is among them.
+export function redirectAllowed(uri: string, allowed: string[]): bool {
+  if (uri === "" || uri.byteLength > MAX_REDIRECT) return false
+  const u = URL.parse(uri)
+  if (u === undefined) return false
+  if (u.protocol === "cursor:" && u.host === "anysphere.cursor-mcp") return true
+  if (allowed.includes(uri)) return true
+  if (u.protocol === "https:" && allowed.includes("*")) return true
+  return (u.protocol === "http:" || u.protocol === "https:") && loopbackHost(u.hostname)
+}
+
+// Whether a request's redirect URI is one the client registered. A loopback callback matches on any port (RFC 8252, section 7.3).
+function registeredRedirect(c: OAuthClientRow, uri: string): bool {
+  if (c.redirect_uris.includes(uri)) return true
+  const u = URL.parse(uri)
+  if (u === undefined || !(u.protocol === "http:" || u.protocol === "https:") || !loopbackHost(u.hostname)) return false
+  for (const r of c.redirect_uris) {
+    const v = URL.parse(r)
+    if (v === undefined) continue
+    if (v.protocol === u.protocol && v.hostname === u.hostname && v.pathname === u.pathname) return true
+  }
+  return false
+}
+
+function loopbackHost(host: string): bool {
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]"
+}
+
+// Whether every scope a request asks for is one the client registered.
+function scopeWithin(requested: string, registered: string): bool {
+  const have = registered.split(" ")
+  for (const s of requested.split(" ")) {
+    if (s !== "" && !have.includes(s)) return false
+  }
+  return true
+}
+
+// The URL with these parameters added to its query (set, not appended to the same name).
+function withParams(base: string, pairs: string[][]): string {
+  const sp = new URLSearchParams("")
+  for (const p of pairs) sp.set(p[0]!, p[1]!)
+  const q = sp.toString()
+  return base + (base.includes("?") ? "&" : "?") + q
+}
+
+// A JSON object from a request body, or undefined when it is not one.
+function objectOf(text: string): Field[] | undefined {
+  try {
+    const fs = try fields(text)
+    return fs
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The strings of a JSON array field, or none when the field is absent.
+function strsOf(raw: string | undefined): string[] throws SyntaxError {
+  const out: string[] = []
+  if (raw === undefined || isNull(raw)) return out
+  for (const e of try elements(raw)) out.push(try decodeString(e))
+  return out
+}
+
+function trimSlash(s: string): string {
+  let t = s.trim()
+  while (t.endsWith("/")) t = t.slice(0, t.byteLength - 1)
+  return t
+}
+
+function oauthErr(status: int, code: string, desc: string): Answer {
+  return { status: status, body: JSON.stringify({ error: code, error_description: desc }), contentType: "application/json" }
+}
+
+function apiErr(status: int, message: string): Answer {
+  return { status: status, body: errorJson(message, "invalid_request_error", undefined), contentType: "application/json" }
+}
+
+function page(html: string): Answer {
+  return { status: 200, body: html, contentType: "text/html; charset=utf-8" }
+}
+
+function okJson(body: string): Answer {
+  return { status: 200, body: body, contentType: "application/json" }
+}
+
+// The HTTP response of an answer: no-store on every one, and the page headers on HTML.
+function respond(a: Answer): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", a.contentType)
+  h.set("cache-control", "no-store")
+  if (a.contentType.startsWith("text/html")) {
+    h.set("content-security-policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+    h.set("referrer-policy", "no-referrer")
+  }
+  const loc = a.location
+  if (loc !== undefined) h.set("location", loc)
+  const ch = a.challenge
+  if (ch !== undefined) h.set("www-authenticate", ch)
+  return new Response(a.status === 302 ? undefined : a.body, { status: a.status, headers: h })
+}
+
+// The routes of the authorization server and its pages, or undefined for any other path. lookup finds the
+// virtual key a value names (the rotation cooldown included); byId finds a key by its id.
+export async function issuerRoute(c: Config, req: Request, path: string, lookup: (value: string) => VirtualKeyConfig | undefined, byId: (id: string) => VirtualKeyConfig | undefined, nowMs: f64): Promise<Response | undefined> {
+  const m = req.method
+  if (path === "/workspace/mcp-sessions/auth" && m === "GET") return respond(page(connectPageHtml()))
+  const consentPrefix = "/api/oauth2/consent/flows/"
+  if (path.startsWith(consentPrefix) && (m === "GET" || m === "PUT")) {
+    const id = path.slice(consentPrefix.byteLength)
+    const iss = issuerOf(c)
+    if (id === "" || id.includes("/")) return undefined
+    // the route is always registered, as in Bifrost: it answers 404 while the authorization server is off
+    if (iss === undefined) return respond(apiErr(404, "the MCP authorization server is off: set client.mcp_server_auth_mode to both or oauth"))
+    const token = req.headers.get("x-bifrost-temp-token") ?? ""
+    if (m === "GET") return respond(consentDetail(id, token, nowMs))
+    const body = await req.text()
+    return respond(consentSubmit(id, token, body, iss, nowMs, lookup))
+  }
+  const wellKnown = path === "/.well-known/oauth-protected-resource" || path.startsWith("/.well-known/oauth-protected-resource/") || path === "/.well-known/oauth-authorization-server" || path.startsWith("/.well-known/oauth-authorization-server/") || path === "/.well-known/jwks.json"
+  const oauth = path === "/oauth2/register" || path === "/oauth2/authorize" || path === "/oauth2/token" || path === "/oauth/consent"
+  if (!wellKnown && !oauth) return undefined
+  if (m !== "GET" && m !== "POST") return undefined
+  const iss = issuerOf(c)
+  if (iss === undefined) return undefined
+  if (path.startsWith("/.well-known/oauth-protected-resource")) return respond(okJson(resourceMetadata(iss)))
+  if (path.startsWith("/.well-known/oauth-authorization-server")) return respond(okJson(authServerMetadata(iss)))
+  if (path === "/.well-known/jwks.json") {
+    try {
+      const jwk = try publicJwk(iss.pem, iss.kid)
+      return respond(okJson(`{"keys":[${jwk}]}`))
+    } catch (e) {
+      return respond(oauthErr(500, "server_error", "failed to load signing key"))
+    }
+  }
+  if (path === "/oauth/consent" && m === "GET") return respond(page(consentPageHtml()))
+  if (path === "/oauth2/register" && m === "POST") return respond(register(await req.text(), iss, Date.now()))
+  if (path === "/oauth2/authorize" && m === "GET") {
+    const u = URL.parse(req.url)
+    return respond(authorize(u === undefined ? new URLSearchParams("") : u.searchParams, iss, Date.now()))
+  }
+  if (path === "/oauth2/token" && m === "POST") {
+    const form = new URLSearchParams(await req.text())
+    return respond(tokenEndpoint(form, iss, Date.now(), byId))
+  }
+  return undefined
+}
+
+test("a registration needs redirect URIs that are loopback, https or approved, and answers a client_id", () => {
+  const iss = testIssuer()
+  expect(register("{\"client_name\":\"c\"}", iss, 1000.0).status).toBe(400)
+  expect(register("{\"redirect_uris\":[\"http://example.com/cb\"]}", iss, 1000.0).status).toBe(400)
+  expect(register("{\"redirect_uris\":[\"javascript:alert(1)\"]}", iss, 1000.0).status).toBe(400)
+  const ok = register("{\"client_name\":\"c\",\"redirect_uris\":[\"http://127.0.0.1:8080/cb\"]}", iss, 1000.0)
+  expect(ok.status).toBe(201)
+  expect(ok.body.includes("\"token_endpoint_auth_method\":\"none\"")).toBe(true)
+  expect(register("{\"redirect_uris\":[\"https://app.example/cb\"],\"token_endpoint_auth_method\":\"client_secret_basic\"}", iss, 1000.0).status).toBe(400)
+  expect(register("{\"redirect_uris\":[\"https://app.example/cb\"],\"grant_types\":[\"client_credentials\"]}", iss, 1000.0).status).toBe(400)
+  expect(register("{\"redirect_uris\":[\"https://app.example/cb\"],\"response_types\":[\"token\"]}", iss, 1000.0).status).toBe(400)
+  expect(redirectAllowed("https://app.example/cb", [])).toBe(false)
+  expect(redirectAllowed("https://app.example/cb", ["https://app.example/cb"])).toBe(true)
+  expect(redirectAllowed("https://app.example/cb", ["*"])).toBe(true)
+  expect(redirectAllowed("http://app.example/cb", ["*"])).toBe(false)
+  expect(redirectAllowed("http://localhost:9/cb", [])).toBe(true)
+})
+
+test("an authorization request is checked, and approved with a key into a code that exchanges once with PKCE", () => {
+  const iss = testIssuer()
+  const reg = register("{\"client_name\":\"c\",\"redirect_uris\":[\"http://127.0.0.1:8080/cb\"]}", iss, 1000.0)
+  const cid = try clientIdOf(reg.body)
+  const verifier = "v".repeat(50)
+  const challenge = pkceChallenge(verifier)
+  const q = (extra: string[][]): URLSearchParams => {
+    const sp = new URLSearchParams("")
+    sp.set("client_id", cid)
+    sp.set("redirect_uri", "http://127.0.0.1:8080/cb")
+    sp.set("response_type", "code")
+    sp.set("state", "st-1")
+    sp.set("code_challenge", challenge)
+    sp.set("code_challenge_method", "S256")
+    for (const p of extra) sp.set(p[0]!, p[1]!)
+    return sp
+  }
+  expect(authorize(q([["code_challenge_method", "plain"]]), iss, 2000.0).location!.includes("error=invalid_request")).toBe(true)
+  expect(authorize(q([["scope", "admin"]]), iss, 2000.0).location!.includes("error=invalid_scope")).toBe(true)
+  expect(authorize(q([["resource", "https://elsewhere.example/mcp"]]), iss, 2000.0).location!.includes("error=invalid_target")).toBe(true)
+  expect(authorize(q([["redirect_uri", "http://127.0.0.1:8080/other"]]), iss, 2000.0).status).toBe(400)
+  const go = authorize(q([]), iss, 2000.0)
+  expect(go.status).toBe(302)
+  const loc = go.location!
+  const hashAt = loc.indexOf("#t=")
+  const flow = loc.slice(loc.indexOf("flow=") + 5, loc.indexOf("#t="))
+  const tok = loc.slice(hashAt + 3)
+  expect(consentDetail(flow, "wrong", 2500.0).status).toBe(401)
+  expect(consentDetail(flow, tok, 2500.0).status).toBe(200)
+  const key: VirtualKeyConfig = { id: "vk-x", value: "sk-bf-test-x" }
+  const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-bf-test-x" ? key : undefined
+  const bad = consentSubmit(flow, tok, "{\"mode\":\"session\",\"value\":\"\"}", iss, 2500.0, lookup)
+  expect(bad.status).toBe(400)
+  const done = consentSubmit(flow, tok, "{\"mode\":\"vk\",\"value\":\"sk-bf-test-x\"}", iss, 2500.0, lookup)
+  expect(done.status).toBe(200)
+  const url = try JSON.parse(done.body) as { redirect_url: string }
+  const code = url.redirect_url.slice(url.redirect_url.indexOf("code=") + 5, url.redirect_url.indexOf("&state="))
+  expect(consentSubmit(flow, tok, "{\"mode\":\"vk\",\"value\":\"sk-bf-test-x\"}", iss, 2500.0, lookup).status).toBe(401)
+  const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-x" ? key : undefined
+  const badVerifier = tokenEndpoint(new URLSearchParams(`grant_type=authorization_code&code=${code}&code_verifier=${"w".repeat(50)}&client_id=${cid}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fcb`), iss, 3000.0, byId)
+  expect(badVerifier.body.includes("PKCE verification failed")).toBe(true)
+  const form = `grant_type=authorization_code&code=${code}&code_verifier=${verifier}&client_id=${cid}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fcb`
+  const t = tokenEndpoint(new URLSearchParams(form), iss, 3000.0, byId)
+  expect(t.status).toBe(200)
+  const access = (try JSON.parse(t.body) as { access_token: string }).access_token
+  expect(callerOf(iss, "Bearer " + access, 3000.0)).toEqual({ kind: "vk", vk: "vk-x" })
+  expect(tokenEndpoint(new URLSearchParams(form), iss, 3000.0, byId).status).toBe(400)
+})
+
+test("a key that is inactive or past its expiry is not usable", () => {
+  expect(keyUsable({ id: "a", value: "v", is_active: false }, 1000.0)).toBe(false)
+  expect(keyUsable({ id: "a", value: "v", expires_at: "2000-01-01T00:00:00Z" }, 1000000000000.0)).toBe(false)
+  expect(keyUsable({ id: "a", value: "v", expires_at: "2100-01-01T00:00:00Z" }, 1000000000000.0)).toBe(true)
+  expect(keyUsable({ id: "a", value: "v" }, 1000.0)).toBe(true)
+  expect(keyUsable(undefined, 1000.0)).toBe(false)
+})
+
+test("a token with another audience, another key or a bad signature is refused", () => {
+  const iss = testIssuer()
+  expect(callerOf(iss, undefined, 0.0).kind).toBe("none")
+  expect(callerOf(iss, "Bearer sk-bf-plain", 0.0).kind).toBe("none")
+  expect(callerOf(undefined, "Bearer eyJhbGciOiJSUzI1NiJ9.a.b", 0.0).kind).toBe("none")
+  expect(callerOf(iss, "Bearer eyJhbGciOiJSUzI1NiJ9.a.b", 0.0).kind).toBe("error")
+})
+
+test("a signed token is accepted for this resource while it lives, and refused for another audience or after expiry", () => {
+  const iss = testIssuer()
+  const mine = try accessToken(iss, "vk-x", "mcp", iss.resource, 3000.0)
+  expect(callerOf(iss, "Bearer " + mine, 3000.0)).toEqual({ kind: "vk", vk: "vk-x" })
+  expect(callerOf(iss, "bearer " + mine, 3000.0)).toEqual({ kind: "vk", vk: "vk-x" })
+  expect(callerOf(iss, "Bearer " + mine, 3000.0 + 700000.0).kind).toBe("error")
+  const other = try accessToken(iss, "vk-x", "mcp", "https://other.example/mcp", 3000.0)
+  expect(callerOf(iss, "Bearer " + other, 3000.0).kind).toBe("error")
+  const forged = mine.slice(0, mine.byteLength - 4) + "AAAA"
+  expect(callerOf(iss, "Bearer " + forged, 3000.0).kind).toBe("error")
+})
+
+test("the metadata names the endpoints and the protected resource", () => {
+  const iss = testIssuer()
+  expect(authServerMetadata(iss).includes("\"token_endpoint\":\"https://gw.example/oauth2/token\"")).toBe(true)
+  expect(resourceMetadata(iss).includes("\"resource\":\"https://gw.example/mcp\"")).toBe(true)
+  expect(challengeOf(iss)).toBe("Bearer resource_metadata=\"https://gw.example/.well-known/oauth-protected-resource/mcp\"")
+})
+
+test("the issuer is off without a usable config", () => {
+  const off: Config = { client: { mcp_server_auth_mode: "headers" } }
+  expect(issuerOf(off)).toBe(undefined)
+  const noIssuer: Config = { client: { mcp_server_auth_mode: "both", oauth2_server_config: { signing_key: TEST_KEY } } }
+  expect(issuerProblem(noIssuer).includes("issuer_url")).toBe(true)
+  expect(issuerOf(noIssuer)).toBe(undefined)
+  const good: Config = { client: { mcp_server_auth_mode: "oauth", oauth2_server_config: { issuer_url: "https://gw.example/", signing_key: TEST_KEY, auth_code_ttl: 99999 } } }
+  expect(issuerProblem(good)).toBe("")
+  const iss = issuerOf(good)!
+  expect(iss.issuer).toBe("https://gw.example")
+  expect(iss.codeTtl).toBe(900.0)
+  expect(iss.accessTtl).toBe(600.0)
+  expect(issuerOf({ client: { mcp_server_auth_mode: "nope" } })).toBe(undefined)
+})
+
+// The test issuer: the throwaway key the jwt tests use, under a fixed issuer.
+function testIssuer(): Issuer {
+  return { issuer: "https://gw.example", resource: "https://gw.example/mcp", pem: TEST_KEY, kid: "test-kid", codeTtl: 300.0, accessTtl: 600.0, allowed: [] }
+}
+
+function clientIdOf(body: string): string throws SyntaxError {
+  return rawStr(try fields(body), "client_id") ?? ""
+}
+
+// A throwaway RSA key for these tests. It guards nothing.
+const TEST_KEY = `-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDj9J2gXuzZMwiv
+9cYgjR8yatcwrNAurcSExxAHJnAl6yCKzB2UxZ5M4faf+KbN7cOTguxG1puIS24t
+F4XpIPdhV84E59/73dKPEpQmy35eB0u9NBHKJz6ZlhE/glzC4uQGCMIvY8YXd9kK
+HUFWSp6adBUZKf+eXQTJpAy333HallSwrqCFCqopFrUC1TM1CBAxWxgpx/GBz+G2
+8PgESS3G0fhugSAp2qtlpYOf/AvHjfhmJKnG7hI0BjFFXT+av4QB12VSA+TGuacQ
+yiXJqnvf6gtRYXlj5QDZUxq1k8u56uHK8iLgYoFac44MFnKeBwmaYOKevoCF4upD
+6Bed9Rx3AgMBAAECggEANt8ZmFJxQeE6fJy1Of2uXkUAkqtum2XhsbJ3Jbl3cnE0
+TqTOlBKzxb74zk4c3OIYW2g+9thO7RJ3LWyFo/X3BlwL7/te27JsLltjBSmju/+W
+mC8x/w7OT0sj0L1RFepmyBsQnzatptWHDZu4MAzbO8OolnuZF+Y9MkqGczZaoips
+XQQRebUSgrB3zC4oisDI8lhzomRrq82D2DbQcXdrRZkzhxWoudbKZwofnhNWkzQ+
+MMieMDl0crk5WirMqzxn/9BoPLfuy+1HDC6S8aU/hFsQl1FHwlobfmYWfv3b8FbS
+ZlkNbzRge+VlGq0MJtpi7wREMWLpJ3U37XOGzMDNUQKBgQD1bI/Hl9+K1TBziGxa
+XmKGE/pjRNw5aXbrSJ+Gf2WcbgRkRLYyOFM22m9bzxxyxhOCGU83iU+sOwzyiuAv
+BkPvJ5CePCYSW5xuUU2JYzp7scm3lTdaC0/HL+SuE9BFkmWHiw1+Qh2W0MvrLvgA
+g//OKXrKY1mtK8oIM99wgna7kQKBgQDtx1jL7oO67DiWUn+N1/bBgYEY8MQfXVH/
+oNk+ClC2HEYwZhumKxziUZxlRFehqZ3Q27zrJc91wEeEoYtKfv79UJorxKLRW5dV
+4q7Ctc3Vr6/WayZdTzByFd8gnKmZ9xXKl1Y7eY6eifs5nBmnOYJlT16AMTent8Hl
+d7rBeQ2DhwKBgQDZXEPe9wBR2kymFi44vx0tOGZrIuKUqnZbHZ/Do/MfX0TedQiU
+Y9Q3YbB8tGqysAE5GSdSvXblyArIiPzSSQ9DsVvg+M6TNbXO8ozkYBC82pIX2L0E
+L76BYEZ9cijkZSssp5fUucOw/c2MxrV4529YbN5Gf0U+HOk66I48/B8iMQKBgQDZ
+jxhUH3wwP4rXH8zNv9hq3U99vm30NLKeLlIXTeDjf6NJDWQm+jOHcBylG48Cv+tB
++ow0q3fSyYemdxi3pNMye9lUSqqe3CrvzmUQisA20HUWvxtvLNGq0RBDCpSz5zvt
+DeM8r9Aqhx1ybL2cICaLA7/3kxDVSHEEwDQEafpPaQKBgGCywYXgnaDnBvD5m75q
+cWt/9/+cPCoc9tkxp1qhNrwQbrTKuCsbaoq29dgClLqvoXv7g/jGMFsN3k8OMTbY
+igljKrc6DaVhqHLClkHqT4YKtkbcD1PHdJxoTLpDjg/pcfmE1Jh7xAwZyK5WeDHb
+E4OKLanX+blm6HOEeyMmCSU8
+-----END PRIVATE KEY-----`
