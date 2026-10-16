@@ -2431,6 +2431,82 @@ def l97m_e2e(env):
 
 
 
+GW_L97S_A = "http://127.0.0.1:18167"  # streamed output guards on text completion and Responses streams: redact and block
+GW_L97S_B = "http://127.0.0.1:18168"  # a streamed answer built whole: the cache and the log keep the redacted text
+
+
+def l97s_config_a() -> dict:
+    """The L97s gateway A: the mock as OpenAI and Anthropic, and regex output rules that redact a phone number and block a word."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "m", "value": "sk-l97s", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-l97s", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "guardrails": {"enabled": True, "apply_to": "both", "detect": [], "providers": [
+            {"id": "pii", "kind": "regex", "apply_to": "output", "patterns": [{"pattern": "\\d{3}-\\d{4}", "description": "Phone", "action": "redact"}]},
+            {"id": "words", "kind": "regex", "apply_to": "output", "patterns": [{"pattern": "forbidden", "description": "Word", "action": "block"}]}]},
+    }
+
+
+def l97s_config_b() -> dict:
+    """The L97s gateway B: the mock as Anthropic, with the cache, the log, and raw bodies kept for the provider."""
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l97s-logs"), "content_logging": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "cache": {"enabled": True, "ttl_seconds": 60},
+        "providers": {"anthropic": {"keys": [{"name": "a", "value": "sk-ant-l97s-b", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "store_raw_request_response": True}},
+        "guardrails": {"enabled": True, "apply_to": "both", "detect": [], "providers": [
+            {"id": "pii", "kind": "regex", "apply_to": "output", "patterns": [{"pattern": "\\d{3}-\\d{4}", "description": "Phone", "action": "redact"}]}]},
+    }
+
+
+def l97s_e2e(env):
+    """Streamed text completions and Responses answers under the output guards: a phone number is redacted as the
+    stream goes, a forbidden word ends the stream with the format's error event, and an answer built whole is
+    redacted before the cache and the log keep it. Their own gateways."""
+    cfg_a = os.path.join(BUILD, "e2e.l97s.a.json")
+    cfg_b = os.path.join(BUILD, "e2e.l97s.b.json")
+    json.dump(l97s_config_a(), open(cfg_a, "w"))
+    json.dump(l97s_config_b(), open(cfg_b, "w"))
+    gw_a = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18167", "-host", "127.0.0.1", "-config", cfg_a, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97s.a.log"), "w"))
+    gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18168", "-host", "127.0.0.1", "-config", cfg_b, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97s.b.log"), "w"))
+    try:
+        wait(GW_L97S_A + "/health")
+        wait(GW_L97S_B + "/health")
+        msgs = [{"role": "user", "content": "hi"}]
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/pii-chat", "stream": True, "messages": msgs}, None, base=GW_L97S_A, auth=False)
+        check("a streamed chat answer has its phone number redacted before the finish", s == 200 and "555-1234" not in b and '"content":"call [REDACTED:PHONE] now"' in b and "[DONE]" in b, (s, b[:400]))
+        s, _, b = call("POST", "/v1/completions", {"model": "openai/pii-text", "stream": True, "prompt": "hi"}, None, base=GW_L97S_A, auth=False)
+        check("a streamed text completion has its phone number redacted", s == 200 and "555-1234" not in b and '"text":"call [REDACTED:PHONE] now"' in b and "[DONE]" in b, (s, b[:400]))
+        s, _, b = call("POST", "/v1/completions", {"model": "openai/block-text", "stream": True, "prompt": "hi"}, None, base=GW_L97S_A, auth=False)
+        check("a forbidden word ends a streamed text completion with the error event", s == 200 and "guardrail_violation" in b and "forbidden" not in b and "[DONE]" in b, (s, b[:400]))
+        s, _, b = call("POST", "/v1/responses", {"model": "openai/pii-responses", "stream": True, "input": "hi"}, None, base=GW_L97S_A, auth=False)
+        check("a streamed Responses answer has its phone number redacted in the deltas and the summary events", s == 200 and "555-1234" not in b and b.count("[REDACTED:PHONE]") == 3, (s, b[:600]))
+        s, _, b = call("POST", "/v1/responses", {"model": "openai/block-responses", "stream": True, "input": "hi"}, None, base=GW_L97S_A, auth=False)
+        check("a forbidden word ends a streamed Responses answer with a Responses error event", s == 200 and "event: error" in b and "guardrail_violation" in b and "forbidden" not in b, (s, b[:400]))
+        s, _, b = call("POST", "/v1/responses", {"model": "anthropic/pii-anthropic", "stream": True, "input": "hi"}, None, base=GW_L97S_A, auth=False)
+        check("a streamed Responses answer built from another provider's whole answer is redacted too", s == 200 and "555-1234" not in b and "[REDACTED:PHONE]" in b, (s, b[:600]))
+
+        t0 = time.time() * 1000
+        probe = {"model": "anthropic/pii-anthropic", "stream": True, "input": "cache-probe-l97s"}
+        s1, _, b1 = call("POST", "/v1/responses", probe, None, base=GW_L97S_B, auth=False)
+        s2, _, b2 = call("POST", "/v1/responses", probe, None, base=GW_L97S_B, auth=False)
+        upstream = [x for x in seen() if "cache-probe-l97s" in x["body"]]
+        check("a cached streamed answer replays the redacted text", s1 == 200 and s2 == 200 and "555-1234" not in b2 and "[REDACTED:PHONE]" in b2 and len(upstream) == 1, (s1, s2, len(upstream), b2[:300]))
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L97S_B)[2])["entries"]
+        mine = [e for e in entries if e.get("model") == "anthropic/pii-anthropic" and e.get("ts", 0) >= t0]
+        details = [json.loads(call("GET", "/api/logs/" + e["id"], base=GW_L97S_B)[2]) for e in mine]
+        check("the log keeps the redacted answer, for the call and the cached replay, and no raw upstream stream", len(details) == 2 and all("[REDACTED:PHONE]" in json.dumps(d) and "555-1234" not in json.dumps(d) and not d.get("raw_response") for d in details), [{k: str(d.get(k))[:200] for k in ("cache_hit", "output", "raw_response")} for d in details])
+    finally:
+        gw_a.terminate()
+        gw_b.terminate()
+
+
 def chunked_post(port: int, path: str, total: int) -> int | None:
     """A POST with no Content-Length, streamed in 64 KB chunks; the status it got back (None when the connection was cut first)."""
     import http.client
@@ -5249,6 +5325,8 @@ def main():
         l97m_e2e(env)
         # the governance last part: project rosters and caps, entity_dac, access profile versions, user-held profiles, cycles overrides, audit IPs and adaptive routing views
         l97p_e2e(env)
+        # streamed text completion and Responses answers under the output guards, and a cached stream: their own gateways
+        l97s_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

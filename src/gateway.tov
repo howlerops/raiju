@@ -20,10 +20,10 @@ import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
 import { GuardrailProvider, Verdict, appliesTo, checkRequest, parseVerdictFor, isLocal, extractText, completionText } from "./guardrail_providers"
 import { judgeText } from "./guard_judge"
-import { CompiledRule } from "./guard_regex"
+import { CompiledRule, applyRegex } from "./guard_regex"
 import { compileLocal, localVerdict } from "./guard_local"
 import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
-import { OutputStreamGuard, GuardedProvider } from "./guard_stream"
+import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream"
 import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText } from "./compat"
@@ -110,6 +110,8 @@ export class StreamConverter {
   jsonFix: JsonStreamFixer | undefined = undefined
   guard: OutputStreamGuard | undefined = undefined
   halted = false
+  // the guard's redaction kinds already counted in the metrics
+  private reportedKinds = 0
 
   constructor(readonly kind: string, requested: string, includeUsage: bool) {
     if (kind === "responses-raw") this.rp = new ResponsesPassthrough()
@@ -246,6 +248,8 @@ export class StreamConverter {
       this.halted = true
       metrics.inc("raiju_guardrail_checks_total", metrics.labels("", g.blockedBy, "block"), 1.0)
     }
+    for (let k = this.reportedKinds; k < g.kinds.length; k++) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", g.kinds[k]!, "redact"), 1.0)
+    this.reportedKinds = g.kinds.length
     return out
   }
 
@@ -1171,6 +1175,32 @@ export class Engine {
     return out
   }
 
+  // The local output guards (regex and secrets providers that cover the LLM output) that check a streamed answer.
+  streamGuards(guardOn: bool): GuardedProvider[] {
+    const out: GuardedProvider[] = []
+    if (!guardOn) return out
+    for (const p of this.guardProviders) {
+      if (!appliesTo(p, "output") || !(p.targets ?? ["llm"]).includes("llm")) continue
+      if (p.kind === "regex" || p.kind === "secrets") out.push({ id: p.id, rules: this.localRules.get(p.id) ?? [] })
+    }
+    return out
+  }
+
+  // A streamed answer that is built whole (not sent as it arrives) goes through the same guards, so what is
+  // cached and logged is the redacted text. A block throws, as a blocked answer does.
+  guardWhole(body: string, format: StreamFormat, guardOn: bool): string throws SyntaxError {
+    const gs = this.streamGuards(guardOn)
+    if (gs.length === 0) return body
+    const g = new OutputStreamGuard(gs, format)
+    const out = g.finish(body)
+    for (const k of g.kinds) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", k, "redact"), 1.0)
+    if (g.stopped) {
+      metrics.inc("raiju_guardrail_checks_total", metrics.labels("", g.blockedBy, "block"), 1.0)
+      throw new SyntaxError("the response was blocked by guardrails")
+    }
+    return out
+  }
+
   // One call to an HTTP guardrail; its verdict is read from the answer (a failed call follows the provider's on_error).
   async httpVerdict(p: GuardrailProvider, text: string, source: "input" | "output"): Promise<Verdict> {
     let status = 0
@@ -1497,7 +1527,9 @@ export class Engine {
             return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true }
           }
           text = await res.text()
-          if (storeRaw) ctx.rawResponse = text
+          // a streamed upstream body is not kept when local output guards apply: a match can be split across its events,
+          // so the guards cannot redact it (the answer the client got is in the log's output, redacted)
+          if (storeRaw) ctx.rawResponse = streamed && this.streamGuards(true).length > 0 ? "" : text
           // client.dump_errors_in_console_logs: the full upstream error goes to the server console
           if (status >= 400 && this.cfg.client?.dump_errors_in_console_logs === true) console.error(`raiju: upstream error from ${ref.provider} (${status}) for ${ref.model}: ${text}`)
           // follow-up calls of a multi-call request (one embedding input per call)
@@ -2435,13 +2467,20 @@ export class Engine {
     return cl?.disable_content_logging === true
   }
 
-  // Request duration metric, stdout log line, log store entry and trace span for one request.
   // The raw upstream bodies that logs and log exports keep get the guardrail redaction too, as the
-  // content fields do (Bifrost: stored log fields and exports carry the redacted payload).
-  redactRaw(raw: string): string {
+  // content fields do (Bifrost: stored log fields and exports carry the redacted payload). A response
+  // also gets the local output rules that redact, the same rules that rewrite a streamed answer.
+  redactRaw(raw: string, response: bool): string {
+    let body = raw
     const g = this.guard
-    if (g === undefined || g.mode !== "redact") return raw
-    return applyToText(raw, g).body
+    if (g !== undefined && g.mode === "redact") body = applyToText(body, g).body
+    if (response) {
+      for (const p of this.guardProviders) {
+        if (!appliesTo(p, "output") || !(p.kind === "regex" || p.kind === "secrets")) continue
+        body = applyRegex(body, this.localRules.get(p.id) ?? []).body
+      }
+    }
+    return body
   }
 
   record(c: ReqCtx): void {
@@ -2488,8 +2527,8 @@ export class Engine {
         selected_prompt_id: c.promptId === "" ? undefined : c.promptId,
         selected_prompt_name: c.promptName === "" ? undefined : c.promptName,
         selected_prompt_version: c.promptVersion,
-        raw_request: c.contentOff || c.rawRequest === "" ? undefined : this.redactRaw(c.rawRequest),
-        raw_response: c.contentOff || c.rawResponse === "" ? undefined : this.redactRaw(c.rawResponse),
+        raw_request: c.contentOff || c.rawRequest === "" ? undefined : this.redactRaw(c.rawRequest, false),
+        raw_response: c.contentOff || c.rawResponse === "" ? undefined : this.redactRaw(c.rawResponse, true),
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
         latency_ms: ms, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, cache_hit: c.cached,
         virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, team_id: c.teamId === "" ? undefined : c.teamId,
@@ -2753,28 +2792,22 @@ export class Engine {
       const shs = try cp.shape(t.provider, t.kind, t.model, body)
       if (shs.route === "responses") {
         const rc = try responseToChat(text, requested)
-        return { body: try completionToSse(rc.body, wantUsage), promptTokens: rc.promptTokens, completionTokens: rc.completionTokens }
+        return { body: try this.guardWhole(try completionToSse(rc.body, wantUsage), "chat", guardOn), promptTokens: rc.promptTokens, completionTokens: rc.completionTokens }
       }
       if (providers.streamsNatively(t.kind)) {
         const tr = openai.streamResponse(text, requested)
-        return { body: wantUsage ? tr.body : dropUsageChunks(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+        return { body: try this.guardWhole(wantUsage ? tr.body : dropUsageChunks(tr.body), "chat", guardOn), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
       const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
-      return { body: try completionToSse(tr.body, wantUsage), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+      return { body: try this.guardWhole(try completionToSse(tr.body, wantUsage), "chat", guardOn), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
     }
     // With a sink, OpenAI-format upstreams stream straight through as chunks arrive.
     const dropUsage = !wantUsage
     // local output guardrails (regex and secrets) check the stream as it accumulates (guard_stream.tov)
-    const outGuards: GuardedProvider[] = []
-    if (guardOn && stream) {
-      for (const p of this.guardProviders) {
-        if (!appliesTo(p, "output") || !(p.targets ?? ["llm"]).includes("llm")) continue
-        if (p.kind === "regex" || p.kind === "secrets") outGuards.push({ id: p.id, rules: this.localRules.get(p.id) ?? [] })
-      }
-    }
+    const outGuards = stream ? this.streamGuards(guardOn) : []
     const jsonOn = stream && this.jsonStreamOn
     const guardedConv = (c: StreamConverter): StreamConverter => {
-      if (outGuards.length > 0) c.guard = new OutputStreamGuard(outGuards)
+      if (outGuards.length > 0) c.guard = new OutputStreamGuard(outGuards, "chat")
       if (jsonOn) c.jsonFix = new JsonStreamFixer()
       return c
     }
@@ -2847,22 +2880,28 @@ export class Engine {
         // a chat answer read whole: a stream was sent as SSE (not piped), or a call made without streaming
         if (text.startsWith("data:")) {
           const sr = openai.streamResponse(text, requested)
-          return { body: chatSseToText(sr.body), promptTokens: sr.promptTokens, completionTokens: sr.completionTokens }
+          return { body: try this.guardWhole(chatSseToText(sr.body), "text", stream), promptTokens: sr.promptTokens, completionTokens: sr.completionTokens }
         }
         const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
         if (!stream) return { body: try chatToText(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
-        return { body: chatSseToText(try completionToSse(tr.body, wantUsage)), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+        return { body: try this.guardWhole(chatSseToText(try completionToSse(tr.body, wantUsage)), "text", true), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
-      if (stream) return openai.streamResponse(text, requested)
+      if (stream) {
+        const sr = openai.streamResponse(text, requested)
+        return { body: try this.guardWhole(sr.body, "text", true), promptTokens: sr.promptTokens, completionTokens: sr.completionTokens }
+      }
       if (sh.route !== "chat") return try openai.chatResponse(text, requested)
       const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
       return { body: try chatToText(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
     }
     // a text completion sent to a chat model streams as text_completion chunks, converted as they arrive
+    // the local output guards check the streamed text (guard_stream.tov), in the text completion frames
+    const tg = stream ? this.streamGuards(true) : []
     const mk: ConverterFactory = (t, requested) => {
       if (!streamable(t)) return undefined
       const conv = new StreamConverter(converterKind(t), requested, wantUsage)
       conv.txt = cp.routeFor(t.provider, t.kind, t.model) === "chat"
+      if (tg.length > 0) conv.guard = new OutputStreamGuard(tg, "text")
       return conv
     }
     return try await this.serve(req, "completions", undefined, body, text, build, translate, stream, undefined, canPipe ? sink : undefined, mk, cp)

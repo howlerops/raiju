@@ -324,6 +324,11 @@ Bun.serve<string>({
         if (body.includes("l97t-tools")) return new Response(`{"id":"c5","object":"chat.completion","created":1,"model":"${model}","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{}"}},{"id":"call_b","type":"function","function":{"name":"lookup_city","arguments":"{}"}},{"id":"call_c","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}`, { headers: { "content-type": "application/json" } })
         // a primary that reports its quota as spent: the header is what a circuit policy watches for
         if (model === "policy-quota") return new Response(`{"id":"q1","object":"chat.completion","created":1,"model":"${model}","choices":[{"index":0,"message":{"role":"assistant","content":"from the primary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`, { headers: { "content-type": "application/json", "x-quota-state": "exhausted" } })
+        // "pii-chat" streams a phone number split across two chunks (the L97s redaction checks)
+        if (model === "pii-chat" && m.stream === true) {
+          const piiChunk = (delta: string, finish: string) => `data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          return new Response(piiChunk(`{"role":"assistant","content":""}`, "null") + piiChunk(`{"content":"call 555-"}`, "null") + piiChunk(`{"content":"1234 now"}`, "null") + piiChunk(`{}`, `"stop"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
         if (m.stream === true) {
           const chunk = (delta: string, finish: string) => `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
           const sse = chunk(`{"role":"assistant","content":""}`, "null") + chunk(`{"content":"Hel"}`, "null") + chunk(`{"content":"lo"}`, "null") + chunk(`{}`, `"stop"`) +
@@ -435,6 +440,25 @@ Bun.serve<string>({
       GET: (req) => {
         record(req, "/ts/v1/models", "")
         return Response.json({ models: [{ name: "jev-1.13.0", description: "Mock jev", release_date: STAMP }] })
+      },
+    },
+    // text completions: "pii-text" streams a phone number split across chunks, "block-text" a forbidden word (the L97s checks)
+    "/v1/completions": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v1/completions", body)
+        const m = try JSON.parse(body) as Model
+        const model = m.model ?? ""
+        // only the L97s models have a text completion here; the others are not served (the compat tests read that)
+        if (model !== "pii-text" && model !== "block-text") return Response.json({ error: { message: `The model '${model}' does not exist`, type: "invalid_request_error", code: "model_not_found" } }, { status: 404 })
+        const parts = model === "block-text" ? ["a forbidden", " word"] : ["call 555-", "1234 now"]
+        if (m.stream === true) {
+          const chunk = (text: string, finish: string) => `data: {"id":"tc1","object":"text_completion","created":1,"model":"${model}","choices":[{"index":0,"text":${JSON.stringify(text)},"finish_reason":${finish}}]}\n\n`
+          let sse = ""
+          for (const p of parts) sse += chunk(p, "null")
+          return new Response(sse + chunk("", `"stop"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
+        return Response.json({ id: "tc1", object: "text_completion", created: 1, model: model, choices: [{ index: 0, text: parts.join(""), finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
       },
     },
     "/v1/embeddings": {
@@ -633,7 +657,9 @@ Bun.serve<string>({
         if (m.stream === true) {
           return new Response(`event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`, { headers: { "content-type": "text/event-stream" } })
         }
-        return Response.json({ id: "msg_1", type: "message", role: "assistant", model: m.model ?? "", content: [{ type: "text", text: "Hi from claude" }], stop_reason: "end_turn", usage: { input_tokens: 11, output_tokens: 5 } })
+        // "pii-anthropic" answers with a phone number (the L97s checks of a Responses answer built from this call)
+        const answer = m.model === "pii-anthropic" ? "call 555-1234 now" : "Hi from claude"
+        return Response.json({ id: "msg_1", type: "message", role: "assistant", model: m.model ?? "", content: [{ type: "text", text: answer }], stop_reason: "end_turn", usage: { input_tokens: 11, output_tokens: 5 } })
       },
     },
     "/v1beta/models/:modelAction": {
@@ -803,6 +829,21 @@ Bun.serve<string>({
             },
           })
           return new Response(stream, { headers: hd })
+        }
+        // "pii-responses" and "block-responses" stream text the L97s checks redact or block: deltas, the done event and the completed response
+        if (body.includes(`"stream":true`) && (body.includes(`"pii-responses"`) || body.includes(`"block-responses"`))) {
+          const sev = (name: string, data: string): string => `event: ${name}\ndata: ${data}\n\n`
+          const parts = body.includes(`"block-responses"`) ? ["a forbidden", " word"] : ["call 555-", "1234 now"]
+          let sse = sev("response.created", `{"type":"response.created","sequence_number":0,"response":{"id":"resp_p1","status":"in_progress"}}`)
+          let n = 1
+          for (const p of parts) {
+            sse += sev("response.output_text.delta", `{"type":"response.output_text.delta","sequence_number":${n},"item_id":"msg_1","output_index":0,"content_index":0,"delta":${JSON.stringify(p)}}`)
+            n += 1
+          }
+          const full = JSON.stringify(parts.join(""))
+          sse += sev("response.output_text.done", `{"type":"response.output_text.done","sequence_number":${n},"item_id":"msg_1","output_index":0,"content_index":0,"text":${full}}`)
+          sse += sev("response.completed", `{"type":"response.completed","sequence_number":${n + 1},"response":{"id":"resp_p1","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":${full}}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+          return new Response(sse, { headers: { "content-type": "text/event-stream" } })
         }
         // a streamed answer: Responses events. The compat tests' Responses-only model streams "native responses";
         // everything else (the WebSocket mode's tests) streams "Hello" with sequence numbers
