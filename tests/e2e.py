@@ -1830,6 +1830,69 @@ def l97i_e2e(env):
             gw_b.terminate()
 
 
+GW_L97H = "http://127.0.0.1:18144"  # provider model lists (Bedrock, Vertex, Cloudflare), Vertex count tokens, OpenRouter decisions
+
+
+def l97h_config() -> dict:
+    """Bedrock (SigV4 keys), Vertex (a service account whose token comes from the mock), Cloudflare and OpenRouter,
+    each with its base URL on the mock."""
+    import re
+    src = open(os.path.join(ROOT, "src/jwt.tov")).read()
+    pem = re.search(r"const TEST_PKCS8 = `(.*?)`", src, re.S).group(1)
+    sa = {"type": "service_account", "client_email": "e2e@test.iam.gserviceaccount.com", "private_key": pem, "token_uri": MOCK + "/token"}
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "bedrock": {"keys": [{"name": "bk-l97h", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "vertex": {"keys": [{"name": "vx-l97h", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps(sa)}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "cloudflare": {"keys": [{"name": "cf-l97h", "value": "cf-tok", "models": [], "weight": 1.0, "cloudflare_key_config": {"account_id": "acc123"}}], "network_config": {"base_url": MOCK + "/client/v4", "max_retries": 0}},
+            "openrouter": {"keys": [{"name": "or-l97h", "value": "or-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/or", "max_retries": 0}},
+        },
+    }
+
+
+def l97h_e2e(env):
+    """GET /v1/models for Bedrock, Vertex and Cloudflare (their own listings), Vertex count tokens through countTokens
+    and count-tokens:rawPredict, and OpenRouter's native decision with the safety identifier as user."""
+    cfg_path = os.path.join(BUILD, "e2e.l97h.json")
+    json.dump(l97h_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18144", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97h.log"), "w"))
+    try:
+        wait(GW_L97H + "/health")
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "bedrock"}, base=GW_L97H, auth=False)
+        ids = [m["id"] for m in json.loads(b)["data"]] if s == 200 else []
+        check("bedrock models: foundation models and inference profiles", "bedrock/anthropic.claude-3-haiku-20240307-v1:0" in ids and "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0" in ids, (s, b[:300]))
+        fm = [x for x in seen() if x["path"] == "/foundation-models"]
+        check("bedrock listing is SigV4 signed with the key's access key", len(fm) > 0 and fm[-1]["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"), fm[-1:])
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "vertex"}, base=GW_L97H, auth=False)
+        ids = [m["id"] for m in json.loads(b)["data"]] if s == 200 else []
+        check("vertex models: every page of the google publisher, with the bearer token", "vertex/gemini-2.5-flash" in ids and "vertex/gemini-2.5-pro" in ids, (s, b[:300]))
+        vp = [x for x in seen() if x["path"] == "/v1beta1/publishers/google/models"]
+        check("vertex listing follows nextPageToken", any(x["body"] == "page-2" for x in vp) and all(x["auth"] == "Bearer ya29.test-token" for x in vp), vp[-2:])
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "cloudflare"}, base=GW_L97H, auth=False)
+        ids = [m["id"] for m in json.loads(b)["data"]] if s == 200 else []
+        check("cloudflare models: text generation and embeddings only", "cloudflare/@cf/meta/llama-3.1-8b-instruct" in ids and "cloudflare/@cf/baai/bge-base-en-v1.5" in ids and not any("stable-diffusion" in i for i in ids), (s, b[:300]))
+        s, _, b = call("POST", "/v1/count_tokens", {"model": "vertex/gemini-2.5-flash", "messages": [{"role": "user", "content": "hello there"}]}, base=GW_L97H, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        check("vertex gemini counts tokens exactly through :countTokens", s == 200 and r.get("input_tokens") == 11 and r.get("exact") is True, (s, b[:300]))
+        ct = [x for x in seen() if x["path"].endswith(":countTokens")]
+        check("vertex countTokens carries the bearer token and the contents", len(ct) > 0 and ct[-1]["auth"] == "Bearer ya29.test-token" and '"contents"' in ct[-1]["body"], ct[-1:])
+        s, _, b = call("POST", "/v1/count_tokens", {"model": "vertex/claude-sonnet-4", "messages": [{"role": "user", "content": "hello there"}]}, base=GW_L97H, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        check("vertex claude counts tokens through count-tokens:rawPredict", s == 200 and r.get("input_tokens") == 9 and r.get("exact") is True, (s, b[:300]))
+        dq = [{"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?", "criteria": {"true": "angry", "false": "calm"}}]
+        dbody = {"model": "openrouter/openai/gpt-4o-mini", "input": "Customer message: I was double charged.", "questions": dq, "safety_identifier": "end-user-7"}
+        s, _, b = call("POST", "/v1/decisions", dbody, base=GW_L97H, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        check("openrouter decisions go to the native /alpha/decisions path", s == 200 and r.get("model") == "openai/gpt-4o-mini", (s, b[:300]))
+        od = [x for x in seen() if x["path"] == "/or/alpha/decisions"]
+        check("openrouter decision carries the safety identifier as user", len(od) > 0 and od[-1]["auth"] == "Bearer or-key" and '"user":"end-user-7"' in od[-1]["body"], od[-1:])
+    finally:
+        gw.terminate()
+
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -4057,6 +4120,8 @@ def main():
         l97g_e2e(env)
         # mocker rules in Bifrost's shape, telemetry's push gateway, redaction in stored rows, and webhook deliveries after a restart: their own gateways
         l97i_e2e(env)
+        # provider model lists, Vertex count tokens and OpenRouter's native decisions: their own gateway
+        l97h_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

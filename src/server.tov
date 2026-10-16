@@ -5,10 +5,14 @@ import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
 import { kindOf } from "./router"
-import { Target, Upstream } from "./providers/types"
+import { Target, Upstream, addExtraHeaders } from "./providers/types"
 import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
+import * as bedrock from "./providers/bedrock"
+import * as vertex from "./providers/vertex"
+import * as cloudflare from "./providers/cloudflare"
+import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath } from "./model_list"
 import { retrieveRequest, retrieveBody } from "./model_retrieve"
 import { fields, find, elements, rawStr, rawBool } from "./json"
 import * as metrics from "./metrics"
@@ -17,7 +21,7 @@ import { ResponsesSocket } from "./wsresponses"
 import { LiveSocket, liveContent, liveCreate, contentId, attachId, attachUpstream, ownerOf, credentialOk, validId } from "./live"
 import { WsConnection } from "./ws"
 import { DataScope } from "./scope"
-import { matchRoute, handleMedia, deploymentRoute, deploymentRequest, realtimeSdp, nativeRoute, nativeCloud } from "./media"
+import { matchRoute, handleMedia, deploymentRoute, deploymentRequest, realtimeSdp, nativeRoute, nativeCloud, vertexBearer } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson } from "./schemas"
 import { handleApi, proxyWidening, Result } from "./store"
@@ -56,7 +60,90 @@ function upstreamModels(provider: string, kind: string, t: Target): Upstream | u
   return undefined
 }
 
-async function providerModels(cfg: Config, provider: string): Promise<string[]> {
+// The kinds whose listing is not OpenAI's shape, read by nativeModelIds. Databricks lists nothing, as
+// Bifrost's does: its workspace inventory does not match the inference ids (databricks/models.go).
+function nativeList(kind: string): bool {
+  return kind === "bedrock" || kind === "vertex" || kind === "cloudflare" || kind === "databricks"
+}
+
+// One GET on a provider listing: the body when the answer is 2xx, else undefined.
+async function getListing(up: Upstream): Promise<string | undefined> throws Error {
+  const hs = new Headers()
+  for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+  const res = try await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+  const text = try await res.text()
+  return res.ok ? text : undefined
+}
+
+// The model ids (as provider/model) of a provider whose listing nativeList names. undefined when the
+// listing could not be read. Bedrock: the foundation models and the inference profiles, signed as
+// Bedrock's control plane takes them. Vertex: the Model Garden publishers google, anthropic and
+// mistralai, every page, with a bearer token (Bifrost's list: vertex/vertex.go). Cloudflare: the
+// Workers AI search, every page, keeping the text generation and embeddings models (cloudflare/models.go).
+async function nativeModelIds(engine: Engine | undefined, provider: string, t: Target): Promise<string[] | undefined> {
+  const ids: string[] = []
+  try {
+    if (t.kind === "databricks") return ids
+    if (t.kind === "bedrock") {
+      const fm = try await getListing(bedrock.listRequest(t, "/foundation-models"))
+      if (fm === undefined) return undefined
+      for (const id of try bedrockIds(fm, "modelSummaries", "modelId")) ids.push(provider + "/" + id)
+      const ip = try await getListing(bedrock.listRequest(t, "/inference-profiles"))
+      if (ip !== undefined) {
+        for (const id of try bedrockIds(ip, "inferenceProfileSummaries", "inferenceProfileId")) ids.push(provider + "/" + id)
+      }
+      return ids
+    }
+    if (t.kind === "vertex") {
+      // the gateway's token cache when there is one, so a listing and a chat call share a token
+      let token = ""
+      if (engine !== undefined) {
+        const tok = await engine.vertexToken(t)
+        if (tok.error !== "") return undefined
+        token = tok.token
+      } else {
+        token = try await vertexBearer(t)
+      }
+      const hdr = new Map<string, string>()
+      hdr.set("authorization", "Bearer " + token)
+      let any = false
+      for (const pub of ["google", "anthropic", "mistralai"]) {
+        let page = ""
+        for (let i = 0; i < 20; i++) {
+          const text = try await getListing({ url: try vertex.publisherListUrl(t, pub, page), headers: hdr, body: "" })
+          if (text === undefined) break
+          any = true
+          const pp = try publisherPage(text)
+          for (const id of pp.ids) ids.push(provider + "/" + id)
+          if (pp.next === "") break
+          page = pp.next
+        }
+      }
+      return any ? ids : undefined
+    }
+    if (t.kind === "cloudflare") {
+      const base = try cloudflare.accountBase(t)
+      let hs = new Map<string, string>()
+      hs.set("authorization", "Bearer " + (t.key.value ?? ""))
+      addExtraHeaders(&hs, t.cfg)
+      let any = false
+      for (let page = 1; page <= 20; page++) {
+        const text = try await getListing({ url: base + cloudflareSearchPath(page), headers: hs, body: "" })
+        if (text === undefined) break
+        any = true
+        const cp = try cloudflarePage(text)
+        for (const id of cp.ids) ids.push(provider + "/" + id)
+        if (!cp.full) break
+      }
+      return any ? ids : undefined
+    }
+  } catch (e) {
+    return undefined
+  }
+  return undefined
+}
+
+async function providerModels(engine: Engine | undefined, cfg: Config, provider: string): Promise<string[]> {
   const p = providerOf(cfg, provider)
   if (p === undefined) return []
   const listed: string[] = []
@@ -70,17 +157,22 @@ async function providerModels(cfg: Config, provider: string): Promise<string[]> 
   if (Date.now() - cachedAt < 300000.0) return modelCache.ids.get(provider) ?? []
   const kind = kindOf(provider, p)
   const key = (p.keys ?? [])[0] ?? { value: "" }
-  const up = upstreamModels(provider, kind, { provider: provider, kind: kind, model: "", key: key, cfg: p })
-  if (up === undefined) return []
+  const t: Target = { provider: provider, kind: kind, model: "", key: key, cfg: p }
   let ids: string[] = []
-  try {
-    const hs = new Headers()
-    for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
-    const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
-    const text = await res.text()
-    if (res.ok) ids = openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/"))
-  } catch (e) {
-    ids = []
+  if (nativeList(kind)) {
+    ids = (await nativeModelIds(engine, provider, t)) ?? []
+  } else {
+    const up = upstreamModels(provider, kind, t)
+    if (up === undefined) return []
+    try {
+      const hs = new Headers()
+      for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+      const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+      const text = await res.text()
+      if (res.ok) ids = openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/"))
+    } catch (e) {
+      ids = []
+    }
   }
   modelCache.ids.set(provider, ids)
   modelCache.fetchedAt.set(provider, Date.now())
@@ -91,13 +183,21 @@ async function providerModels(cfg: Config, provider: string): Promise<string[]> 
 // from the provider, trying each key (or the one named) until one answers, and refreshes the list
 // GET /v1/models serves from. Bifrost returns the keys with their discovery status; Raiju returns
 // the list, as {provider, models, total}.
-async function refreshModels(cfg: Config, provider: string, keyId: string | undefined): Promise<Reply> {
+async function refreshModels(engine: Engine | undefined, cfg: Config, provider: string, keyId: string | undefined): Promise<Reply> {
   const p = providerOf(cfg, provider)
   if (p === undefined) return { status: 404, body: JSON.stringify({ error: { message: `no provider ${provider}`, type: "invalid_request_error" } }), contentType: "application/json" }
   const kind = kindOf(provider, p)
   for (const key of p.keys ?? []) {
     if (keyId !== undefined && key.id !== keyId) continue
-    const up = upstreamModels(provider, kind, { provider: provider, kind: kind, model: "", key: key, cfg: p })
+    const t: Target = { provider: provider, kind: kind, model: "", key: key, cfg: p }
+    if (nativeList(kind)) {
+      const nids = await nativeModelIds(engine, provider, t)
+      if (nids === undefined) continue
+      modelCache.ids.set(provider, nids)
+      modelCache.fetchedAt.set(provider, Date.now())
+      return { status: 200, body: JSON.stringify({ provider: provider, models: nids, total: nids.length }), contentType: "application/json" }
+    }
+    const up = upstreamModels(provider, kind, t)
     if (up === undefined) continue
     try {
       const hs = new Headers()
@@ -126,7 +226,7 @@ async function retrieveModel(engine: Engine, req: Request, id: string): Promise<
   const provider = id.slice(0, slash)
   if (!providerNames(engine.cfg).includes(provider)) return errorResponse(404, `no provider ${provider}`, "invalid_request_error", noHeaders())
   const model = id.slice(slash + 1)
-  const known = await providerModels(engine.cfg, provider)
+  const known = await providerModels(engine, engine.cfg, provider)
   const listed = known.includes(id) || known.includes(model)
   const p = providerOf(engine.cfg, provider)
   if (p !== undefined) {
@@ -162,7 +262,7 @@ const GENAI = "/genai/v1beta/models/"
 async function genaiModels(engine: Engine, id: string): Promise<Response> {
   const ids: string[] = []
   for (const n of providerNames(engine.cfg)) {
-    for (const m of await providerModels(engine.cfg, n)) ids.push(m)
+    for (const m of await providerModels(engine, engine.cfg, n)) ids.push(m)
   }
   if (id === "") return new Response(genaiIn.modelsList(ids), { headers: { "content-type": "application/json" } })
   const name = new URLSearchParams("id=" + id).get("id") ?? id
@@ -173,7 +273,7 @@ async function genaiModels(engine: Engine, id: string): Promise<Response> {
 async function listModels(engine: Engine, req: Request): Promise<Response> {
   const only = req.headers.get("x-bf-list-models-provider") ?? req.headers.get("x-bf-model-provider") ?? "all"
   const names = providerNames(engine.cfg).filter((n) => only === "all" || n === only)
-  const lists = await Promise.all(names.map((n) => providerModels(engine.cfg, n)))
+  const lists = await Promise.all(names.map((n) => providerModels(engine, engine.cfg, n)))
   const data: ModelEntry[] = []
   for (let i = 0; i < names.length; i++) {
     for (const id of lists[i]!) data.push({ id: id, object: "model", created: 0, owned_by: names[i]! })
@@ -309,7 +409,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
     const isKey = parts.length === 7 && parts[4] === "keys"
     if (req.method !== "POST") r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
     else if (!(parts.length === 5 || isKey)) r = { status: 404, body: `{"error":{"message":"no such route","type":"invalid_request_error"}}`, contentType: "application/json" }
-    else r = await refreshModels(ops.store.cfg, parts[3] ?? "", isKey ? parts[5] : undefined)
+    else r = await refreshModels(undefined, ops.store.cfg, parts[3] ?? "", isKey ? parts[5] : undefined)
   }
   else if (path === "/api/pricing/force-sync") {
     if (req.method === "POST") r = await ops.forcePricing()
