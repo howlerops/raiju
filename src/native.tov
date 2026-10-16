@@ -1,6 +1,6 @@
 // Drop-in SDK routes: requests in a provider's own format, forwarded with
 // governance, retries, fallbacks across keys, metrics and cost tracking.
-import { Field, fields, find, quote, build, isNull, rawStr, rawBool, setField } from "./json"
+import { Field, fields, elements, find, quote, build, isNull, rawStr, rawBool, setField } from "./json"
 import { Engine, Build, Translate, StreamSink, StreamConverter, ConverterFactory, streamable, converterKind, errorResponse, noHeaders } from "./gateway"
 import { Target, Translated, trimSlash, proxyOf, tlsOf } from "./providers/types"
 import { ChatRequest, snapshot, newId, nowSeconds } from "./schemas"
@@ -246,6 +246,107 @@ function jsonBody(body: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "application/json")
   return new Response(body, { headers: h })
+}
+
+// POST /cursor/v1/chat/completions (and /cursor/chat/completions). Cursor sends a Responses-shaped body
+// ("input") and reads a chat completion back: such a body goes through /v1/responses and the answer is
+// converted to a chat completion. A messages body is plain chat. Streamed Responses-shaped requests are
+// not served (400); streamed chat is.
+export async function cursorChat(engine: Engine, req: Request): Promise<Response> {
+  const text = await req.text()
+  let body: Field[] = []
+  try {
+    body = fields(text)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  if (find(body, "input") === undefined || find(body, "messages") !== undefined) {
+    return await engine.chat(internalRequest(req, "/v1/chat/completions", text))
+  }
+  if (find(body, "stream") === "true") return errorResponse(400, "a streamed Responses-shaped /cursor request is not served; send messages", "invalid_request_error", noHeaders())
+  const r = await responsesApi(engine, internalRequest(req, "/v1/responses", text))
+  if (r.status !== 200) return r
+  try {
+    const out = fields(await r.text())
+    let answer = ""
+    for (const item of elements(find(out, "output") ?? "[]")) {
+      const itf = fields(item)
+      if (rawStr(itf, "type") !== "message") continue
+      for (const c of elements(find(itf, "content") ?? "[]")) {
+        const cf = fields(c)
+        if (rawStr(cf, "type") === "output_text") answer += rawStr(cf, "text") ?? ""
+      }
+    }
+    const fs: Field[] = [
+      { key: "id", raw: quote(rawStr(out, "id") ?? "") },
+      { key: "object", raw: quote("chat.completion") },
+      { key: "created", raw: find(out, "created_at") ?? "0" },
+      { key: "model", raw: quote(rawStr(out, "model") ?? "") },
+      { key: "choices", raw: "[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":" + quote(answer) + "},\"finish_reason\":\"stop\"}]" },
+    ]
+    const u = find(out, "usage")
+    if (u !== undefined) {
+      const uf = fields(u)
+      const pt = find(uf, "input_tokens") ?? "0"
+      const ct = find(uf, "output_tokens") ?? "0"
+      const total: f64 = (parseFloat(pt) ?? 0.0) + (parseFloat(ct) ?? 0.0)
+      fs.push({ key: "usage", raw: `{"prompt_tokens":${pt},"completion_tokens":${ct},"total_tokens":${total}}` })
+    }
+    return jsonBody(build(fs))
+  } catch (e) {
+    return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+  }
+}
+
+// POST /anthropic/v1/complete: Anthropic's legacy text completion, served by any provider through the
+// messages bridge. The prompt becomes one user turn (the "Human:" and "Assistant:" markers go). The answer
+// keeps the legacy shape: {id, type: "completion", completion, stop_reason, model, usage}. Streaming is
+// not served here (Bifrost streams it; use /anthropic/v1/messages).
+export async function anthropicLegacy(engine: Engine, req: Request): Promise<Response> {
+  const text = await req.text()
+  let body: Field[] = []
+  try {
+    body = fields(text)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  if (find(body, "stream") === "true") return errorResponse(400, "streaming is not served on /anthropic/v1/complete; use /anthropic/v1/messages", "invalid_request_error", noHeaders())
+  const model = rawStr(body, "model")
+  if (model === undefined) return errorResponse(400, "the request needs a \"model\" field", "invalid_request_error", noHeaders())
+  const maxTokens = find(body, "max_tokens_to_sample")
+  if (maxTokens === undefined || maxTokens === "null") return errorResponse(400, "max_tokens_to_sample is required", "invalid_request_error", noHeaders())
+  // the legacy prompt: "\n\nHuman: ... \n\nAssistant:"; the markers are not part of the user's turn
+  let turn = (rawStr(body, "prompt") ?? "").trim()
+  if (turn.endsWith("Assistant:")) turn = turn.slice(0, turn.byteLength - 10).trim()
+  if (turn.startsWith("Human:")) turn = turn.slice(6).trim()
+  const parts: string[] = ["\"model\":" + quote(model), "\"max_tokens\":" + maxTokens, "\"messages\":[{\"role\":\"user\",\"content\":" + quote(turn) + "}]"]
+  for (const k of ["temperature", "top_p", "top_k", "stop_sequences"]) {
+    const v = find(body, k)
+    if (v !== undefined && v !== "null") parts.push("\"" + k + "\":" + v)
+  }
+  const r = await anthropicMessages(engine, internalRequest(req, "/anthropic/v1/messages", "{" + parts.join(",") + "}"))
+  if (r.status !== 200) return r
+  try {
+    const out = fields(await r.text())
+    let answer = ""
+    for (const c of elements(find(out, "content") ?? "[]")) {
+      const cf = fields(c)
+      if (rawStr(cf, "type") === "text") answer += rawStr(cf, "text") ?? ""
+    }
+    const stop = rawStr(out, "stop_reason") === "max_tokens" ? "max_tokens" : "stop_sequence"
+    const fs: Field[] = [
+      { key: "id", raw: quote(rawStr(out, "id") ?? "") },
+      { key: "type", raw: quote("completion") },
+      { key: "completion", raw: quote(answer) },
+      { key: "stop_reason", raw: quote(stop) },
+      { key: "model", raw: quote(rawStr(out, "model") ?? model) },
+    ]
+    const usage = find(out, "usage")
+    if (usage !== undefined) fs.push({ key: "usage", raw: usage })
+    return jsonBody(build(fs))
+  } catch (e) {
+    return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+  }
 }
 
 // An internal POST to the gateway's own route, with the caller's headers (so its virtual key).

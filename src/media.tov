@@ -15,7 +15,7 @@ import { deadline } from "./deadline"
 import * as native from "./media_native"
 import * as cloud from "./media_cloud"
 import * as cloudAuth from "./cloud_auth"
-import { S3Creds } from "./exports"
+import { S3Creds, awsCall } from "./exports"
 import { parseServiceAccount } from "./providers/vertex"
 
 export type MediaRoute = { op: string, method: string, upstreamPath: string, modelIn: "json" | "form" | "none" }
@@ -320,7 +320,8 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       if (form !== undefined) body = form
       else if (text !== "") {
         body = text
-        contentType = "application/json"
+        // an SDP offer goes up as the caller sent it (application/sdp, or the multipart boundary)
+        contentType = route.op === "realtime.calls" ? (req.headers.get("content-type") ?? "application/sdp") : "application/json"
       }
     }
   } catch (e) {
@@ -338,6 +339,223 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
   const hs = authHeaders(tt)
   if (contentType !== undefined) hs.set("content-type", contentType)
   return await send(tt, { method: route.method, url: upstreamUrl(tt, route, qs), headers: hs, body: body })
+}
+
+// ---- Native cloud routes: the provider's own job, file and cache APIs ----
+// Bedrock's model-invocation jobs and S3-style files (/bedrock/...), and Vertex's regional
+// batchPredictionJobs and cachedContents (/genai/v1/projects/... and /genai/v1beta/projects/...).
+// The body goes up as the caller sent it; the key picks the account, region and project.
+
+// A native route: kind is "bedrock.*" or "vertex.*"; id is the job or cache id (raw), and bucket
+// and key are the S3 object's.
+export type NativeRoute = { kind: string, method: string, id: string, bucket: string, key: string }
+
+function nativeOf(kind: string, method: string, id: string, bucket: string, key: string): NativeRoute {
+  return { kind: kind, method: method, id: id, bucket: bucket, key: key }
+}
+
+// The native route of a request (no query string), or undefined.
+export function nativeRoute(method: string, path: string): NativeRoute | undefined {
+  const m = method.toUpperCase()
+  if (path === "/bedrock/model-invocation-job") return m === "POST" ? nativeOf("bedrock.create", m, "", "", "") : undefined
+  if (path === "/bedrock/model-invocation-jobs") return m === "GET" ? nativeOf("bedrock.list", m, "", "", "") : undefined
+  const jobPre = "/bedrock/model-invocation-job/"
+  if (path.startsWith(jobPre)) {
+    const rest = path.slice(jobPre.byteLength)
+    if (m === "POST" && rest.endsWith("/stop")) {
+      const id = cloud.pctDecode(rest.slice(0, rest.byteLength - 5))
+      return id === "" ? undefined : nativeOf("bedrock.stop", m, id, "", "")
+    }
+    if (m === "GET" && rest !== "" && !rest.includes("/")) return nativeOf("bedrock.get", m, cloud.pctDecode(rest), "", "")
+    return undefined
+  }
+  const filePre = "/bedrock/files/"
+  if (path.startsWith(filePre)) {
+    const rest = path.slice(filePre.byteLength)
+    const i = rest.indexOf("/")
+    if (i < 0) return m === "GET" && rest !== "" ? nativeOf("bedrock.files.list", m, "", cloud.pctDecode(rest), "") : undefined
+    const bucket = cloud.pctDecode(rest.slice(0, i))
+    const key = cloud.pctDecode(rest.slice(i + 1))
+    if (bucket === "" || key === "") return undefined
+    if (m === "PUT" || m === "GET" || m === "HEAD" || m === "DELETE") return nativeOf("bedrock.files.object", m, "", bucket, key)
+    return undefined
+  }
+  const bp = "/genai/v1/projects/"
+  const cp = "/genai/v1beta/projects/"
+  if (path.startsWith(bp) || path.startsWith(cp)) {
+    const cache = path.startsWith(cp)
+    const segs = path.slice(cache ? cp.byteLength : bp.byteLength).split("/")
+    // project/locations/location/<collection>[/id]
+    if (segs.length < 4 || segs.length > 5 || segs[1] !== "locations") return undefined
+    if (segs[3] !== (cache ? "cachedContents" : "batchPredictionJobs")) return undefined
+    const v = cache ? "vertex.cache." : "vertex."
+    if (segs.length === 4) {
+      if (m === "POST") return nativeOf(v + "create", m, "", "", "")
+      if (m === "GET") return nativeOf(v + "list", m, "", "", "")
+      return undefined
+    }
+    const id = segs[4] ?? ""
+    if (id === "") return undefined
+    if (!cache && m === "POST" && id.endsWith(":cancel")) return nativeOf("vertex.cancel", m, id.slice(0, id.byteLength - 7), "", "")
+    if (m === "GET") return nativeOf(v + "get", m, id, "", "")
+    if (m === "DELETE") return nativeOf(v + "delete", m, id, "", "")
+    if (cache && m === "PATCH") return nativeOf("vertex.cache.update", m, id, "", "")
+    return undefined
+  }
+  return undefined
+}
+
+// Serves a native cloud route for the key's account: Bedrock (jobs and S3 files) or Vertex (jobs and
+// cached contents). The provider is the x-model-provider header, else bedrock or vertex.
+export async function nativeCloud(cfg: Config, req: Request, nr: NativeRoute): Promise<Response> throws TypeError {
+  const url = try new URL(req.url)
+  const sp = new URLSearchParams(url.search)
+  const qs = sp.toString()
+  const isBedrock = nr.kind.startsWith("bedrock.")
+  const provider = req.headers.get("x-model-provider") ?? (isBedrock ? "bedrock" : "vertex")
+  const t = providerTarget(cfg, provider)
+  if (t === undefined) return errorReply(404, `provider "${provider}" is not configured or has no key`, "invalid_request_error")
+  if (t.kind !== (isBedrock ? "bedrock" : "vertex")) return errorReply(400, `provider "${t.provider}" does not serve ${nr.kind}`, "invalid_request_error")
+  const text = nr.method === "POST" || nr.method === "PATCH" || nr.method === "PUT" ? try await req.text() : ""
+  if (isBedrock) {
+    let c: S3Creds = { accessKey: "", secretKey: "", region: "" }
+    try {
+      c = try await bedrockCreds(t)
+    } catch (e) {
+      return errorReply(502, `bedrock authentication failed: ${e.message}`, "authentication_error")
+    }
+    const mr = bedrockNativeRequest(t, c, nr, sp, text, req.headers.get("content-type") ?? "application/octet-stream")
+    if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+    return await send(t, mr)
+  }
+  let token = ""
+  try {
+    token = try await vertexBearer(t)
+  } catch (e) {
+    return errorReply(502, `vertex authentication failed: ${e.message}`, "authentication_error")
+  }
+  let mr: native.MediaRequest | undefined = undefined
+  try {
+    mr = try vertexNativeRequest(t, token, nr, qs, text)
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+  return await send(t, mr)
+}
+
+// The Bedrock request for a native route. Jobs are AWS calls to the account's Bedrock endpoint; S3
+// files go to the key's S3 endpoint.
+function bedrockNativeRequest(t: Target, c: S3Creds, nr: NativeRoute, sp: URLSearchParams, text: string, contentType: string): native.MediaRequest | undefined {
+  const now = Date.now()
+  const o = cloud.bedrockOrigin(t, "bedrock", c.region)
+  if (nr.kind === "bedrock.files.list") return cloud.s3List(c, cloud.s3Endpoint(t), nr.bucket, sp.get("prefix") ?? "", sp.get("continuation-token") ?? "", sp.get("max-keys") ?? "", now)
+  if (nr.kind === "bedrock.files.object") return cloud.s3Object(c, cloud.s3Endpoint(t), nr.bucket, nr.key, nr.method, text, contentType, now)
+  if (nr.kind === "bedrock.create") return cloud.sendable(awsCall(c, "bedrock", o.scheme, o.host, "POST", "/model-invocation-job", [], text, now))
+  if (nr.kind === "bedrock.list") {
+    const pairs: string[][] = []
+    sp.forEach((v, k) => {
+      pairs.push([k, v])
+    })
+    return cloud.sendable(awsCall(c, "bedrock", o.scheme, o.host, "GET", "/model-invocation-jobs", pairs, "", now))
+  }
+  if (nr.kind === "bedrock.get") return cloud.bedrockJobGet(o, c, nr.id, now)
+  if (nr.kind === "bedrock.stop") return cloud.bedrockJobStop(o, c, nr.id, now)
+  return undefined
+}
+
+// The Vertex request for a native route: the key's project and region, the body as sent.
+function vertexNativeRequest(t: Target, token: string, nr: NativeRoute, qs: string, text: string): native.MediaRequest | undefined throws SyntaxError {
+  const cache = nr.kind.startsWith("vertex.cache.")
+  let base = ""
+  if (cache) base = try cloud.vertexCacheUrl(t)
+  else base = try cloud.vertexLocation(t) + "/batchPredictionJobs"
+  const item = nr.id === "" ? "" : "/" + nr.id
+  const q = qs === "" ? "" : "?" + qs
+  let method = "GET"
+  let url = base + q
+  let body: string | undefined = undefined
+  if (nr.kind.endsWith(".create")) {
+    method = "POST"
+    url = base
+    body = text
+  } else if (nr.kind.endsWith(".list")) {
+    method = "GET"
+  } else if (nr.kind.endsWith(".get")) {
+    url = base + item
+  } else if (nr.kind.endsWith(".delete")) {
+    method = "DELETE"
+    url = base + item
+  } else if (nr.kind === "vertex.cancel") {
+    method = "POST"
+    url = base + item + ":cancel"
+    body = "{}"
+  } else if (nr.kind === "vertex.cache.update") {
+    method = "PATCH"
+    url = base + item + q
+    body = text
+  } else return undefined
+  let hs = headers([["authorization", "Bearer " + token]])
+  if (body !== undefined) hs.set("content-type", "application/json")
+  addExtraHeaders(&hs, t.cfg)
+  return { method: method, url: url, headers: hs, body: body }
+}
+
+// POST /v1/realtime with a WebRTC SDP offer (Bifrost accepts it at the base path as well as at
+// /realtime/calls). The model is the session's (the multipart "session" field, or ?model=), and it picks
+// the provider; the call goes up as /v1/realtime/calls of that provider with the model's bare name.
+export async function realtimeSdp(cfg: Config, req: Request): Promise<Response> throws TypeError {
+  const url = try new URL(req.url)
+  const sp = new URLSearchParams(url.search)
+  const ct = req.headers.get("content-type") ?? ""
+  let model = sp.get("model") ?? ""
+  let form: FormData | undefined = undefined
+  let sdp = ""
+  let session = ""
+  try {
+    if (ct.includes("multipart/form-data")) {
+      const fd = try await req.formData()
+      form = fd
+      const s = fd.get("session")
+      if (typeof s === "string") {
+        session = s
+        if (model === "") model = rawStr(try fields(s), "model") ?? ""
+      }
+    } else {
+      sdp = try await req.text()
+    }
+  } catch (e) {
+    return errorReply(400, `invalid request body: ${e.message}`, "invalid_request_error")
+  }
+  if (model === "") return errorReply(400, "session.model is required", "invalid_request_error")
+  const mt = modelTarget(cfg, model)
+  if (mt === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
+  if (!supported(mt.kind)) return errorReply(400, `provider "${mt.provider}" does not support realtime calls`, "invalid_request_error")
+  sp.delete("provider")
+  sp.set("model", mt.model)
+  const origin = url.origin
+  const hs: Map<string, string> = snapshot(req.headers)
+  hs.set("x-bf-provider", mt.provider)
+  let next: Request
+  try {
+    if (form !== undefined) {
+      // the session with its model replaced by the bare name (Bifrost strips the provider prefix)
+      const newSession = session === "" ? "" : try rewriteJsonModel(session, mt.model)
+      const out = new FormData()
+      form.forEach((value, key) => {
+        if (key === "session" && typeof value === "string") out.append(key, newSession === "" ? value : newSession)
+        else out.append(key, value)
+      })
+      hs.delete("content-type")
+      next = new Request(origin + "/v1/realtime/calls?" + sp.toString(), { method: "POST", headers: hs, body: out })
+    } else {
+      next = new Request(origin + "/v1/realtime/calls?" + sp.toString(), { method: "POST", headers: hs, body: sdp })
+    }
+  } catch (e) {
+    return errorReply(400, `invalid session: ${e.message}`, "invalid_request_error")
+  }
+  const route = matchRoute("POST", "/v1/realtime/calls") ?? { op: "realtime.calls", method: "POST", upstreamPath: "/realtime/calls", modelIn: "none" }
+  return try await handleMedia(cfg, next, route)
 }
 
 // ---- Anthropic and Gemini ----
@@ -1441,4 +1659,21 @@ test("native kinds: anthropic, gemini, vertex and bedrock", () => {
   expect(isNative("cohere")).toBe(false)
   expect(isNative("azure")).toBe(false)
   expect(formText(undefined, "prompt")).toBe("")
+})
+
+test("native cloud routes: Bedrock jobs and files, Vertex regional batches and caches", () => {
+  expect(nativeRoute("POST", "/bedrock/model-invocation-job")?.kind).toBe("bedrock.create")
+  expect(nativeRoute("GET", "/bedrock/model-invocation-jobs")?.kind).toBe("bedrock.list")
+  expect(nativeRoute("GET", "/bedrock/model-invocation-job/arn%3Aaws%3Ajob-1")?.id).toBe("arn:aws:job-1")
+  expect(nativeRoute("POST", "/bedrock/model-invocation-job/job-1/stop")?.kind).toBe("bedrock.stop")
+  expect(nativeRoute("PUT", "/bedrock/files/b1/jobs/in.jsonl")?.key).toBe("jobs/in.jsonl")
+  expect(nativeRoute("GET", "/bedrock/files/b1")?.kind).toBe("bedrock.files.list")
+  expect(nativeRoute("PUT", "/bedrock/files/b1")).toBe(undefined)
+  expect(nativeRoute("POST", "/genai/v1/projects/p/locations/us/batchPredictionJobs")?.kind).toBe("vertex.create")
+  expect(nativeRoute("GET", "/genai/v1/projects/p/locations/us/batchPredictionJobs/123")?.id).toBe("123")
+  expect(nativeRoute("POST", "/genai/v1/projects/p/locations/us/batchPredictionJobs/123:cancel")?.kind).toBe("vertex.cancel")
+  expect(nativeRoute("POST", "/genai/v1beta/projects/p/locations/us/cachedContents")?.kind).toBe("vertex.cache.create")
+  expect(nativeRoute("PATCH", "/genai/v1beta/projects/p/locations/us/cachedContents/c1")?.kind).toBe("vertex.cache.update")
+  expect(nativeRoute("POST", "/genai/v1beta/projects/p/locations/us/cachedContents/c1")).toBe(undefined)
+  expect(nativeRoute("GET", "/genai/v1/projects/p/locations/us/endpoints")).toBe(undefined)
 })

@@ -2726,6 +2726,75 @@ def main():
         s2, _, b2 = call("POST", "/v1/realtime/sessions", {"model": "openai/gpt-realtime"})
         check("realtime client_secrets and sessions pass through", s == 200 and s2 == 200 and seen()[-1]["path"] == "/v1/realtime/sessions", (s, b, s2, b2))
 
+        # the unversioned /openai family, as Bifrost mounts it (without the /v1 segment)
+        s, _, b = call("POST", "/openai/responses", {"model": "openai/gpt-4o", "input": "unversioned hello"})
+        check("/openai/responses serves the Responses API", s == 200 and seen()[-1]["path"] == "/v1/responses", (s, b[:200]))
+        s, _, b = call("GET", "/openai/responses/resp_3?provider=openai")
+        check("/openai/responses/{id} is the retrieve route", s == 200 and seen()[-1]["path"] == "/v1/responses/resp_3", (s, b[:200]))
+        s, _, b = call("GET", "/openai/models")
+        check("/openai/models lists models", s == 200 and jget(b).get("object") == "list", (s, b[:200]))
+        s, _, b = call("POST", "/openai/embeddings", {"model": "openai/text-embedding-3-small", "input": "hi"})
+        check("/openai/embeddings serves embeddings", s == 200 and seen()[-1]["path"] == "/v1/embeddings", (s, b[:200]))
+        s, _, b = call("POST", "/openai/realtime/calls", "v=0\r\no=- offer\r\n", {"x-bf-provider": "openai", "content-type": "application/sdp"})
+        check("/openai/realtime/calls passes the SDP offer to OpenAI", s == 201 and seen()[-1]["path"] == "/v1/realtime/calls" and "offer" in seen()[-1]["body"], (s, b[:200]))
+
+        # POST /v1/realtime with an SDP offer at the base path (Bifrost accepts both)
+        rq = urllib.request.Request(GW + "/v1/realtime?model=openai/gpt-realtime", data=b"v=0\r\no=- offer\r\n", method="POST", headers={"content-type": "application/sdp"})
+        try:
+            with urllib.request.urlopen(rq, timeout=10) as r:
+                rs, rb = r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            rs, rb = e.code, e.read().decode()
+        check("POST /v1/realtime with an SDP offer goes to the calls route", rs == 201 and seen()[-1]["path"] == "/v1/realtime/calls" and "offer" in seen()[-1]["body"], (rs, rb[:200]))
+
+        # Anthropic's legacy text completion, through the messages bridge
+        s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-3-haiku-20240307", "prompt": "\n\nHuman: hi\n\nAssistant:", "max_tokens_to_sample": 50, "temperature": 0.2})
+        lg = jget(b) if s == 200 else {}
+        up = seen()[-1]
+        check("/anthropic/v1/complete answers in the legacy shape", s == 200 and lg.get("type") == "completion" and lg.get("completion") == "Hi from claude" and lg.get("stop_reason") == "stop_sequence" and up["path"] == "/v1/messages" and '"max_tokens":50' in up["body"], (s, b[:300], up))
+        s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-3-haiku-20240307", "prompt": "hi", "max_tokens_to_sample": 5, "stream": True})
+        check("the legacy completion route refuses streaming", s == 400, (s, b[:200]))
+
+        # Cursor: chat in both shapes, and its model list
+        s, _, b = call("POST", "/cursor/v1/chat/completions", {"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]})
+        check("/cursor chat with messages answers a chat completion", s == 200 and jget(b).get("object") == "chat.completion", (s, b[:200]))
+        s, _, b = call("POST", "/cursor/v1/chat/completions", '{"model":"openai/gpt-4o","input":"cursor hello"}')
+        cb = jget(b) if s == 200 else {}
+        check("/cursor chat with a Responses-shaped body answers a chat completion", s == 200 and cb.get("object") == "chat.completion" and cb.get("choices", [{}])[0].get("message", {}).get("role") == "assistant", (s, b[:200]))
+        s, _, b = call("GET", "/cursor/v1/models")
+        check("/cursor/v1/models lists models", s == 200 and jget(b).get("object") == "list", (s, b[:200]))
+
+        # GET /mcp: the server-to-client stream (a connection event)
+        s, h, b = call("GET", "/mcp")
+        check("GET /mcp answers the connection event as an event stream", s == 200 and {k.lower(): v for k, v in h.items()}.get("content-type", "").startswith("text/event-stream") and "connection/opened" in b, (s, h, b[:200]))
+        s, _, b = call("GET", "/mcp/no-such-mcp")
+        check("GET /mcp/{name} for an unknown virtual MCP is not found", s == 404, (s, b[:200]))
+
+        # native cloud routes: Vertex's regional jobs and cached contents, and Bedrock's jobs and S3 files
+        VH = {"x-model-provider": "vertex"}
+        VB = "/genai/v1/projects/proj/locations/us-central1/batchPredictionJobs"
+        s, _, b = call("POST", VB, '{"displayName":"native-job","model":"publishers/google/models/gemini-2.5-flash","inputConfig":{"instancesFormat":"jsonl","gcsSource":{"uris":["gs://e2e-gcs/native-input.jsonl"]}},"outputConfig":{"predictionsFormat":"jsonl","gcsDestination":{"outputUriPrefix":"gs://e2e-gcs-out/native"}}}', VH)
+        vj = jget(b) if s == 200 else {}
+        vjid = vj.get("name", "").split("/")[-1]
+        check("the Vertex regional batch collection takes the job as sent", s == 200 and vjid != "" and seen()[-1]["path"] == "/v1/projects/proj/locations/us-central1/batchPredictionJobs" and '"displayName":"native-job"' in seen()[-1]["body"], (s, b[:200]))
+        s, _, b = call("GET", VB + "/" + vjid, None, VH)
+        check("the Vertex regional job is read by id", s == 200 and seen()[-1]["path"].endswith("/batchPredictionJobs/" + vjid), (s, b[:200]))
+        s, _, b = call("POST", VB + "/" + vjid + ":cancel", None, VH)
+        check("the Vertex regional job cancels", s == 200 and seen()[-1]["path"].endswith("/batchPredictionJobs/" + vjid + ":cancel"), (s, b[:200]))
+        s, _, b = call("GET", VB, None, VH)
+        check("the Vertex regional jobs list", s == 200 and "batchPredictionJobs" in b, (s, b[:200]))
+        s, _, b = call("POST", "/genai/v1beta/projects/proj/locations/us-central1/cachedContents", '{"model":"publishers/google/models/gemini-2.5-flash","displayName":"regional"}', VH)
+        check("the Vertex regional cached contents go to v1beta1", s == 200 and seen()[-1]["path"] == "/v1beta1/projects/proj/locations/us-central1/cachedContents" and '"displayName":"regional"' in seen()[-1]["body"], (s, b[:200]))
+        BH = {"x-model-provider": "bedrock_batch"}
+        s, _, b = call("POST", "/bedrock/model-invocation-job", '{"jobName":"native-job","modelId":"anthropic.claude-3-haiku-20240307-v1:0","roleArn":"arn:aws:iam::123456789012:role/batch","inputDataConfig":{"s3InputDataConfig":{"s3Uri":"s3://e2e-files/jobs/in.jsonl","s3InputFormat":"JSONL"}},"outputDataConfig":{"s3OutputDataConfig":{"s3Uri":"s3://e2e-files/jobs/out/"}}}', BH)
+        check("/bedrock/model-invocation-job creates the job as sent", s == 200 and seen()[-1]["path"] == "/model-invocation-job" and '"jobName":"native-job"' in seen()[-1]["body"], (s, b[:200]))
+        s, _, b = call("GET", "/bedrock/model-invocation-jobs", None, BH)
+        check("/bedrock/model-invocation-jobs lists the jobs", s == 200 and seen()[-1]["path"] == "/model-invocation-jobs" and "invocationJobSummaries" in b, (s, b[:200]))
+        s, _, b = call("PUT", "/bedrock/files/e2e-files/native/note.txt", "native file body", {**BH, "content-type": "text/plain"})
+        check("/bedrock/files PUT writes the object to S3", s == 200 and seen()[-1]["path"] == "/e2e-files/native/note.txt" and seen()[-1]["body"] == "native file body", (s, b[:200], seen()[-1:]))
+        s, _, b = call("GET", "/bedrock/files/e2e-files/native/note.txt", None, BH)
+        check("/bedrock/files GET reads the object back", s == 200 and b == "native file body", (s, b[:200]))
+
         # Rerank: a provider without a rerank API is an error, as in Bifrost
         s, _, b = call("POST", "/v1/rerank", {"model": "openai/any", "query": "q", "documents": ["a"]})
         check("rerank on a provider without a rerank API is an error", s == 400 and "not supported" in b, (s, b))

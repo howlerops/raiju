@@ -2,7 +2,7 @@
 // metrics, health and a read-only management API.
 import { Config, providerOf, providerNames } from "./config"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
-import { anthropicMessages, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
+import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
 import { kindOf } from "./router"
 import { Target, Upstream } from "./providers/types"
@@ -17,7 +17,7 @@ import { ResponsesSocket } from "./wsresponses"
 import { LiveSocket, liveContent, liveCreate, contentId, attachId, attachUpstream, ownerOf, credentialOk, validId } from "./live"
 import { WsConnection } from "./ws"
 import { DataScope } from "./scope"
-import { matchRoute, handleMedia, deploymentRoute, deploymentRequest } from "./media"
+import { matchRoute, handleMedia, deploymentRoute, deploymentRequest, realtimeSdp, nativeRoute, nativeCloud } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson } from "./schemas"
 import { handleApi, proxyWidening, Result } from "./store"
@@ -420,12 +420,25 @@ export function compatPath(p: string): string {
   if (p.startsWith("/litellm/")) return compatPath(p.slice(8))
   if (p.startsWith("/langchain/")) return compatPath(p.slice(10))
   if (p.startsWith("/pydanticai/")) return compatPath(p.slice(11))
+  // Cursor's routes are the same families under /cursor (its chat is served by dispatch: cursorChat)
+  if (p.startsWith("/cursor/") && !isCursorChat(p)) return compatPath(p.slice(7))
   // the OpenAI SDK pointed at /openai: every /v1 route under /openai/v1
   if (p.startsWith("/openai/v1/") && p !== "/openai/v1/realtime") return p.slice(7)
   // Azure-style deployments: the /v1 route of the operation (dispatch sets the model)
   const dep = deploymentRoute(p)
   if (dep !== undefined) return dep.path
+  // the same family mounted without the version segment (Bifrost mounts both): /openai/responses is /v1/responses
+  if (isUnversionedOpenAI(p)) return "/v1" + p.slice(7)
   return p
+}
+
+function isCursorChat(p: string): bool {
+  return p === "/cursor/v1/chat/completions" || p === "/cursor/chat/completions"
+}
+
+// /openai/{responses, embeddings, completions, models, files, batches, realtime, ...} with no /v1 segment.
+function isUnversionedOpenAI(p: string): bool {
+  return p.startsWith("/openai/") && p.byteLength > 8 && !p.startsWith("/openai/v1/") && !p.startsWith("/openai/deployments/")
 }
 
 async function unprefixed(req: Request, p: string): Promise<Request> {
@@ -509,6 +522,14 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   // the GenAI SDK's files, batches, cached contents, operations, :predict and rank
   const gop = genaiIn.genaiRoute(m, p)
   if (gop !== undefined) return await cors(engine.cfg, req, await genaiSdk(engine, req, gop.op, gop.model, gop.id))
+  // Bedrock's jobs and S3 files, and Vertex's regional batch and cache paths: the provider's own bodies
+  const nr = nativeRoute(m, p)
+  if (nr !== undefined) {
+    if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
+      return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
+    }
+    return try await cors(engine.cfg, req, try await nativeCloud(engine.cfg, req, nr))
+  }
   const lc = contentId(p)
   if (lc !== "" && m === "GET") return await liveContent(engine, ops.liveSessions, req, lc)
   if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine.cfg, req, await liveCreate(engine, req))
@@ -546,6 +567,9 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     if (p === "/v1/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, false))
     if (p === "/anthropic/v1/messages/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, true))
     if (p === "/anthropic/v1/messages") return await cors(engine.cfg, req, await anthropicMessages(engine, req))
+    if (p === "/anthropic/v1/complete") return await cors(engine.cfg, req, await anthropicLegacy(engine, req))
+    if (isCursorChat(p)) return await cors(engine.cfg, req, await cursorChat(engine, req))
+    if (p === "/v1/realtime") return try await cors(engine.cfg, req, try await realtimeSdp(engine.cfg, req))
     if (p === "/v1/mcp/tool/execute") return await cors(engine.cfg, req, await engine.executeTool(req))
     if (p === "/cohere/v2/chat") return await cors(engine.cfg, req, await cohereChat(engine, req))
     if (p === "/cohere/v2/embed") return await cors(engine.cfg, req, await cohereEmbed(engine, req))
@@ -704,6 +728,8 @@ export function wsBasePath(p: string): string {
   if (p.startsWith("/openai/v1/")) return p.slice(7)
   if (p.startsWith("/openai/live/")) return "/v1" + p.slice(7)
   if (p === "/openai/responses" || p === "/openai/openai/responses") return "/v1/responses"
+  // the rest of the unversioned /openai family (/openai/realtime and the others)
+  if (isUnversionedOpenAI(p)) return "/v1" + p.slice(7)
   return p
 }
 
@@ -724,7 +750,7 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
   const u = URL.parse(req.url)
   const p0 = u === undefined ? "" : u.pathname
   const p = wsBasePath(p0)
-  if (p === "/v1/realtime") {
+  if (p === "/v1/realtime" && req.method === "GET") {
     const up = prepare(engine, req)
     if (up.kind === "refused") return { kind: "refused", status: up.status, message: up.message }
     return { kind: "session", session: up.session }
@@ -817,3 +843,20 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
   })
   return server.url.href
 }
+
+test("compat paths: the unversioned OpenAI family and the Cursor prefix", () => {
+  expect(compatPath("/openai/responses")).toBe("/v1/responses")
+  expect(compatPath("/openai/responses/resp_1/cancel")).toBe("/v1/responses/resp_1/cancel")
+  expect(compatPath("/openai/embeddings")).toBe("/v1/embeddings")
+  expect(compatPath("/openai/models/openai/gpt-4o")).toBe("/v1/models/openai/gpt-4o")
+  expect(compatPath("/openai/files")).toBe("/v1/files")
+  expect(compatPath("/openai/batches/b1")).toBe("/v1/batches/b1")
+  expect(compatPath("/openai/realtime/calls")).toBe("/v1/realtime/calls")
+  expect(compatPath("/openai/v1/responses")).toBe("/v1/responses")
+  expect(compatPath("/openai/v1/realtime")).toBe("/openai/v1/realtime")
+  expect(compatPath("/openai/deployments/d/completions")).toBe("/v1/completions")
+  expect(compatPath("/cursor/v1/models")).toBe("/v1/models")
+  expect(compatPath("/cursor/anthropic/v1/messages")).toBe("/anthropic/v1/messages")
+  expect(compatPath("/cursor/v1/chat/completions")).toBe("/cursor/v1/chat/completions")
+  expect(compatPath("/v1/chat/completions")).toBe("/v1/chat/completions")
+})
