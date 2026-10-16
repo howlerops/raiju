@@ -2017,6 +2017,10 @@ def main():
         res = [json.loads(x) for x in b.split("\n") if x.strip()]
         check("anthropic batch results pass through", s == 200 and len(res) == 1 and res[0]["custom_id"] == "c1" and res[0]["result"]["message"]["content"][0]["text"] == "Batch reply from claude-sonnet-4", (s, b))
         # Anthropic files: upload and list pass through
+        # binary file parts arrive byte for byte (the http1 front end once decoded bodies as UTF-8)
+        png = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0x00, 0x80, 0xC3, 0x28])
+        s, b = multipart("/v1/files", "pixel.png", png, {"purpose": "assistants"})
+        check("a binary file upload reaches the provider byte for byte", s == 200 and jget(b).get("bytes") == len(png), (s, b[:200]))
         s, b = multipart("/anthropic/v1/files", "batch.jsonl", b'{"custom_id":"f1"}\n', {"purpose": "batch"})
         af = json.loads(b) if s == 200 else {}
         check("anthropic file upload passes through", s == 200 and af.get("id", "").startswith("file_") and af.get("type") == "file" and seen()[-1]["auth"] == "sk-ant", (s, b))
