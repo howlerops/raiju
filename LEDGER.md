@@ -250,6 +250,9 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L97o | (g) | MCP per-user OAuth: consent, token rows by key or x-bf-mcp-session-id, /api/oauth/per-user/flows, /api/mcp/sessions list/reauth/revoke, temporary MCP tokens | worker | partial: per_user_oauth flows, sealed token rows by key or x-bf-mcp-session-id, consent with temporary MCP tokens, /api/mcp/sessions list/reauth/revoke; unit + e2e. HTML consent page and MCP-as-OAuth-server open |
 | L97p | (f), (i) | Governance last part: project members and split policies, entity_dac, access-profile versions/clone/deactivate/propagate, audit retention/omit-IP/archive, adaptive LB API, per-key sub-circuits, budget override cycles, vk-creation-policy, VK access-profile links | worker | assigned |
 | L97q | (d) | Providers last part: Replicate predictions (text, images, edits, files, models), scoped and object-form aliases with the alias-model-name/family headers, Bedrock Stability edits and variations, Wafer file upload, OpenRouter chat usage.cost | worker | assigned |
+| L97r | (g) | MCP OAuth remainder: HTML consent page for per-user OAuth and temporary tokens, Raiju as an OAuth authorization server for MCP clients (metadata, register, authorize, token) | worker | assigned |
+| L97s | (e), (i) | Streamed guardrails remainder: output guards on text completion and Responses streams, stream redaction and replay | worker | assigned |
+| L97t | (a) | Log filters Raiju still refuses: agent_names, tool_call_names, complexity score bounds, prompt filters (record what they need) | worker | assigned |
 | L96d | G32, G33 | Final docs: scripts/parity_count.py and Summary, Gaps and Remaining gaps, SCOPE.md and README.md in sync (after L97) | worker | todo |
 
 ## UI track
@@ -257,7 +260,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | ID | Work | Owner | Status |
 |---|---|---|---|
 | L98 | OpenAPI spec for the management API, checked against the routes | worker | done: docs/openapi/management.yaml (203 operations), `make openapi-check` probes a gateway both ways; found /api/mcp/virtual answering any method (fixed) |
-| L99 | Native client spike (providers list plus live logs) in gpui and Slint; compare | worker | todo (after L98) |
+| L99 | Native client spike (providers list plus live logs) in gpui and Slint; compare | worker | assigned |
 
 Decision taken by the lead: models without a price stay a warning (cost 0), as in Bifrost;
 refusing them is a one-line switch if the owner wants it.
