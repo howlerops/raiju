@@ -3,6 +3,10 @@
 // the tool calls the model makes. The protocol lives in pure functions that test
 // without a network; McpSession and McpManager wrap them around fetch.
 import { McpAuthConfig, TokenCache, staticHeaders, tokenRequest, discoveryUrls, parseAuthServerMetadata } from "./mcpauth"
+import { McpUserToken } from "./mcpuser"
+
+// one reply of a per-user call: its status, content type, body and the session id it carries
+type UserReply = { status: int, contentType: string, body: string, sid: string }
 import { fields, elements, find, rawStr, rawBool, rawNum, quote, build, setField, isNull, decodeString } from "./json"
 import { deadline } from "./deadline"
 import { targetProblem } from "./netguard"
@@ -68,6 +72,8 @@ export type McpConfig = {
   oauth_private_allowlist?: string[],
   user_credentials?: McpUserCredential[],
   header_flows?: McpHeaderFlow[],
+  // the tokens each caller obtained for the per_user_oauth clients (src/mcpuser.tov); sealed at rest
+  user_tokens?: McpUserToken[],
 }
 
 // The per-user headers a virtual key submitted for one client; undefined when it has submitted none.
@@ -77,6 +83,15 @@ export function userHeadersOf(creds: McpUserCredential[] | undefined, client: st
     if (c.mcp_client_name === client && c.virtual_key_id === vk) return c.headers
   }
   return undefined
+}
+
+// The names of the clients whose auth_type is per_user_oauth.
+export function perUserOAuthNames(list: McpClientConfig[] | undefined): string[] {
+  const out: string[] = []
+  for (const c of list ?? []) {
+    if (c.auth_type === "per_user_oauth") out.push(c.name)
+  }
+  return out
 }
 
 // The names of the clients whose auth_type is per_user_headers.
@@ -952,6 +967,64 @@ export class McpSession {
     return this.exposed.size
   }
 
+  // A tool call of a per_user_oauth client with the calling key's own token. Each call opens a fresh session
+  // (initialize with that token), so no session id is shared between callers and the admin's token is not
+  // sent. A 401 throws "HTTP 401", which the gateway answers by refreshing the caller's token.
+  async callAsUser(name: string, argsJson: string, extra: Map<string, string> | undefined, bearer: string): Promise<ToolText> throws Error {
+    if (!this.connected) throw new Error(`${this.cfg.name}: not connected: ${this.lastError}`)
+    const hs: Map<string, string> = new Map()
+    const cfgHeaders = this.cfg.headers
+    if (cfgHeaders !== undefined) {
+      for (const k of cfgHeaders.keys()) hs.set(k.toLowerCase(), cfgHeaders.get(k)!)
+    }
+    const fwd = this.forwardable(extra)
+    if (fwd !== undefined) {
+      for (const k of fwd.keys()) hs.set(k, fwd.get(k)!)
+    }
+    hs.set("authorization", "Bearer " + bearer)
+    hs.set("content-type", "application/json")
+    hs.set("accept", "application/json, text/event-stream")
+    const initId = this.newId()
+    const init = try await this.postAs(hs, initializeRequest(initId), CONNECT_TIMEOUT_MS, initId)
+    const sid = init.sid
+    hs.set("mcp-protocol-version", PROTOCOL)
+    if (sid !== "") hs.set("mcp-session-id", sid)
+    try await this.postAs(hs, initializedNotification(), CONNECT_TIMEOUT_MS, -1)
+    const id = this.newId()
+    const body = try callToolRequest(id, name, argsJson)
+    const reply = try await this.postAs(hs, body, this.timeoutMs, id)
+    const r = parseRpcResponse(reply.contentType, reply.body, id)
+    if (r.kind === "error") throw new Error(`${this.cfg.name}: ${r.message} (code ${r.code})`)
+    return try toolResultText(r.raw)
+  }
+
+  // One POST for callAsUser under the given headers. A non-2xx answer throws "HTTP <status>". id is the
+  // request whose reply is parsed (-1 for a notification, which has none).
+  private async postAs(base: Map<string, string>, body: string, timeoutMs: int, id: int): Promise<UserReply> throws Error {
+    if (this.cfg.require_public_target === true) {
+      const pr = targetProblem(this.cfg.connection_string ?? "", this.allow)
+      if (pr !== "") throw new Error(`${this.cfg.name}: ${pr}`)
+    }
+    const hs: Record<string, string> = base
+    const dl = deadline(timeoutMs)
+    let out: UserReply = { status: 0, contentType: "", body: "", sid: "" }
+    try {
+      const res = await fetch(this.cfg.connection_string ?? "", { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+      const text = await res.text()
+      out = { status: res.status, contentType: res.headers.get("content-type") ?? "", body: text, sid: res.headers.get("mcp-session-id") ?? "" }
+    } catch (e) {
+      throw new Error(`${this.cfg.name}: request failed: ${e.message}`)
+    } finally {
+      dl.finish()
+    }
+    if (out.status < 200 || out.status >= 300) throw new Error(`${this.cfg.name}: HTTP ${out.status}`)
+    if (id >= 0) {
+      const r = parseRpcResponse(out.contentType, out.body, id)
+      if (r.kind === "error") throw new Error(`${this.cfg.name}: ${r.message} (code ${r.code})`)
+    }
+    return out
+  }
+
   // Calls a tool by its name on the server. Tool failures come back as isError; protocol failures throw.
   // extra holds the caller's request headers; only those allowed_extra_headers names are sent. An http
   // client with needs_session_stickiness false opens a fresh session (initialize) before each call.
@@ -1160,7 +1233,8 @@ export class McpManager {
   }
 
   // Runs a tool by its chat name ("<server>-<tool>"). Every run is reported to the tool log.
-  async execute(fullToolName: string, argsJson: string, extra?: Map<string, string>, user?: Map<string, string>): Promise<ToolText> throws Error {
+  // bearer is the calling key's own token for a per_user_oauth client (undefined for other clients).
+  async execute(fullToolName: string, argsJson: string, extra?: Map<string, string>, user?: Map<string, string>, bearer?: string): Promise<ToolText> throws Error {
     for (const s of this.sessions) {
       if (!s.connected) continue
       const original = s.original(fullToolName)
@@ -1168,7 +1242,12 @@ export class McpManager {
         const t0 = Date.now()
         let r: ToolText = { text: "", isError: false }
         try {
-          r = await s.callTool(original, argsJson, extra, user)
+          if (s.cfg.auth_type === "per_user_oauth") {
+            if (bearer === undefined) throw new Error(`${s.cfg.name}: the caller has no token for this server: complete the consent link first`)
+            r = await s.callAsUser(original, argsJson, extra, bearer)
+          } else {
+            r = await s.callTool(original, argsJson, extra, user)
+          }
         } catch (e) {
           reportTool({ server: s.cfg.name, tool: original, latencyMs: Date.now() - t0, ok: false, error: e.message })
           throw e

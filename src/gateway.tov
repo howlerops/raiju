@@ -48,7 +48,9 @@ import { GuardConfig, applyToChatRequest, applyToCompletion, applyToText } from 
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, userHeadersOf } from "./mcp"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, userHeadersOf, ToolText } from "./mcp"
+import { McpAuthConfig } from "./mcpauth"
+import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, consentLink, startUserFlow, refreshUserRow } from "./mcpuser"
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, PluginEntry, buildChain, jsonStreamEnabled, JsonStreamFixer } from "./plugins"
@@ -926,6 +928,30 @@ function compileGuards(providers: GuardrailProvider[]): ToolGuard[] {
   }
 }
 
+// The outcome of userAuth: kind is "none" (not a per-user tool), "bearer" (call with token) or "denial" (answer
+// with message and status, the consent link the caller must open).
+type UserAuth = { kind: string, token: string, status: int, type: string, message: string }
+
+function userAuthOf(kind: string, token: string, status: int, type: string, message: string): UserAuth {
+  return { kind: kind, token: token, status: status, type: type, message: message }
+}
+
+// The registration (auth) of an MCP client by name, or undefined.
+function authOfClient(cfg: Config, name: string): McpAuthConfig | undefined {
+  for (const c of cfg.mcp?.client_configs ?? []) {
+    if (c.name === name) return c.auth
+  }
+  return undefined
+}
+
+// The gateway's origin as the caller reached it, for the consent links: the Host header and the forwarded
+// protocol. "" when the request names no host (the links are then relative).
+function originOf(h: Hdrs): string {
+  const host = h.get("host") ?? ""
+  if (host === "") return ""
+  return (h.get("x-forwarded-proto") ?? "http") + "://" + host
+}
+
 export class Engine {
   gov: Governance
   // the model parameters row for a model (the datasheet, as GET /api/models/parameters serves it), for compat
@@ -959,6 +985,8 @@ export class Engine {
   // the latest synced datasheet, when one was fetched
   catalogRows: Map<string, PriceRow> | undefined = undefined
   private unpriced: Set<string> = new Set()
+  // keeps a token row the gateway obtained (a refresh); the server saves it to the config file
+  userTokenSaved: ((r: McpUserToken) => void) | undefined = undefined
   cache: ResponseCache | undefined = undefined
   cacheTtlMs = 300000
   autoPromptCache = false
@@ -1688,6 +1716,59 @@ export class Engine {
     return userHeadersOf(this.cfg.mcp?.user_credentials, client, this.gov.findKey(h)?.id ?? "")
   }
 
+  // The caller's token for a tool of a per_user_oauth client. "none" for other tools; "bearer" with the token to
+  // call with (an expiring token is refreshed first and saved); "denial" with the consent link the caller must
+  // open. force refreshes the token whatever its expiry (used after the server answered 401).
+  async userAuth(name: string, h: Hdrs, force: bool): Promise<UserAuth> {
+    const hit = splitToolName(name, perUserOAuthNames(this.cfg.mcp?.client_configs))
+    if (hit === undefined) return userAuthOf("none", "", 0, "", "")
+    const client = hit.server
+    const vk = this.gov.findKey(h)?.id ?? ""
+    const ident = identityOf(h.get("x-bf-mcp-session-id"), vk)
+    if (ident.vk === "" && ident.session === "") return userAuthOf("denial", "", 401, "authentication_error", `per-user OAuth for MCP client ${client} needs a virtual key (x-bf-vk) or an x-bf-mcp-session-id header`)
+    const now = Date.now()
+    const row = userTokenOf(this.cfg.mcp?.user_tokens, client, ident.vk, ident.session)
+    const act = force && row !== undefined && row.refresh_token !== "" ? "refresh" : tokenAction(row, now)
+    const a = authOfClient(this.cfg, client)
+    if (act === "valid" && row !== undefined) return userAuthOf("bearer", row.access_token, 0, "", "")
+    if (act === "refresh" && a !== undefined && row !== undefined) {
+      try {
+        const fresh = try await refreshUserRow(a, row, now)
+        this.saveUserRow(fresh)
+        return userAuthOf("bearer", fresh.access_token, 0, "", "")
+      } catch (e) {
+        // the refresh failed: the caller has to consent again
+      }
+    }
+    const base = originOf(h)
+    const tempOn = this.cfg.client?.mcp_enable_temp_token_auth === true
+    const start: McpAuthConfig = a ?? { type: "oauth" }
+    const r = startUserFlow(start, client, ident.vk, ident.session, base, tempOn, now)
+    if (r.flow === undefined) return userAuthOf("denial", "", 401, "authentication_error", r.error)
+    const f = r.flow!
+    return userAuthOf("denial", "", 401, "authentication_error", consentMessage(client, consentLink(base, f.id, f.temp_token), tempOn))
+  }
+
+  // Keeps a token row the gateway obtained; the server's saver writes it to the config file.
+  saveUserRow(row: McpUserToken): void {
+    const f = this.userTokenSaved
+    if (f !== undefined) f(row)
+  }
+
+  // Runs one tool call with the caller's bearer. A 401 from the server on a per-user call refreshes the token once
+  // and runs the call again.
+  async runUser(m: McpManager, name: string, args: string, h: Hdrs, ua: UserAuth): Promise<ToolText> throws Error {
+    const bearer = ua.kind === "bearer" ? ua.token : undefined
+    try {
+      return try await m.execute(name, args, h, this.userHeaders(name, h), bearer)
+    } catch (e) {
+      if (bearer === undefined || !e.message.includes("HTTP 401")) throw e
+      const again = try await this.userAuth(name, h, true)
+      if (again.kind !== "bearer") throw e
+      return try await m.execute(name, args, h, this.userHeaders(name, h), again.token)
+    }
+  }
+
   // Debits the tool's tool_pricing cost from the grant's budgets after a call ran. Free tools, and calls
   // with no key, debit nothing.
   chargeTool(m: McpManager, g: Grant | Denial, name: string): void {
@@ -1707,8 +1788,10 @@ export class Engine {
       const h = snapshot(req.headers)
       const gate = this.toolGate(m, h, call.name)
       if (gate.kind === "denial") return errorResponse(gate.status, gate.message, gate.type, noHeaders())
+      const ua = try await this.userAuth(call.name, h, false)
+      if (ua.kind === "denial") return errorResponse(ua.status, ua.message, ua.type, noHeaders())
       const t0 = performance.now()
-      const result = await m.execute(call.name, call.argumentsJson, h, this.userHeaders(call.name, h))
+      const result = try await this.runUser(m, call.name, call.argumentsJson, h, ua)
       this.chargeTool(m, gate, call.name)
       timedMcp(m, call.name, t0, result.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", call.name, result.isError ? "error" : "success"), 1.0)
@@ -2439,8 +2522,10 @@ export class Engine {
       const h = snapshot(req.headers)
       const gate = this.toolGate(m, h, real)
       if (gate.kind === "denial") return { text: gate.message, isError: true }
+      const ua = try await this.userAuth(real, h, false)
+      if (ua.kind === "denial") return { text: ua.message, isError: true }
       const t0 = performance.now()
-      const r = try await m.execute(real, args, h, this.userHeaders(real, h))
+      const r = try await this.runUser(m, real, args, h, ua)
       this.chargeTool(m, gate, real)
       timedMcp(m, real, t0, r.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", real, r.isError ? "error" : "success"), 1.0)

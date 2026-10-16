@@ -12,6 +12,7 @@ import { McpAuthConfig, AuthEndpoints, discoveryUrls, registrationRequest, regis
 import { deadline } from "./deadline"
 import { secureHex } from "./crypto"
 import { McpClientConfig, McpConfig, McpTlsConfig, McpUserCredential, McpHeaderFlow, McpSession, sanitizeName, durationMsOf, userHeadersOf } from "./mcp"
+import { McpUserToken, UserFlow, userFlowById, userFlowsLive, takeUserFlow, forgetUserFlows, dropUserFlow, startUserFlow, exchangeUserCode, rowFromTokens, upsertUserRow, dropUserRow, userTokenIndex, tokenAction, flowIdOfPath, consentLink } from "./mcpuser"
 import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, parseSpec, inputSchema } from "./openapi"
 import * as vmcp from "./vmcp"
 import { Field, fields, elements, find, quote, rawStr, rawNum, rawBool } from "./json"
@@ -489,7 +490,7 @@ function createClient(store: ConfigStore, body: string, publicOnly: bool): McpRe
     }
   }
   const auth = b.auth_type ?? "none"
-  const pue = perUserError(auth, ct, b.auth !== undefined, b.per_user_header_keys)
+  const pue = perUserError(auth, ct, b.auth?.type ?? "", b.per_user_header_keys)
   if (pue !== "") return fail(400, pue)
   const cp = connectionError(b, ct)
   if (cp !== "") return fail(400, cp)
@@ -521,6 +522,7 @@ function createClient(store: ConfigStore, body: string, publicOnly: bool): McpRe
     c.auth_type = auth
     c.per_user_header_keys = normalKeys(b.per_user_header_keys)
   }
+  if (auth === "per_user_oauth") c.auth_type = auth
   c.stdio_config = b.stdio_config
   c.tools_to_execute = b.tools_to_execute
   c.tools_to_skip = b.tools_to_skip
@@ -598,9 +600,9 @@ function updateClient(store: ConfigStore, id: string, body: string, publicOnly: 
   if (has(fs, "auth_type") || has(fs, "per_user_header_keys")) {
     const t = b.auth_type ?? (c.auth_type ?? "none")
     const keys = has(fs, "per_user_header_keys") ? b.per_user_header_keys : c.per_user_header_keys
-    const pue = perUserError(t, c.connection_type, c.auth !== undefined, keys)
+    const pue = perUserError(t, c.connection_type, c.auth?.type ?? "", keys)
     if (pue !== "") return fail(400, pue)
-    c.auth_type = t === "per_user_headers" ? t : undefined
+    c.auth_type = t === "per_user_headers" || t === "per_user_oauth" ? t : undefined
     c.per_user_header_keys = t === "per_user_headers" ? normalKeys(keys) : undefined
   }
 
@@ -699,10 +701,15 @@ const HEADER_FLOW_TTL_MS: f64 = 1800000.0
 
 // auth_type per_user_headers applies to http and sse clients with per_user_header_keys, and the client
 // carries no auth object. "" when the combination is fine.
-function perUserError(t: string, ct: string, hasAuth: bool, keys: string[] | undefined): string {
-  if (t !== "none" && t !== "headers" && t !== "per_user_headers") return `auth_type "${t}" is not supported by this gateway: use none, headers or per_user_headers`
+function perUserError(t: string, ct: string, authT: string, keys: string[] | undefined): string {
+  if (t !== "none" && t !== "headers" && t !== "per_user_headers" && t !== "per_user_oauth") return `auth_type "${t}" is not supported by this gateway: use none, headers, per_user_headers or per_user_oauth`
+  if (t === "per_user_oauth") {
+    if (ct !== "http" && ct !== "sse") return "auth_type per_user_oauth applies to http and sse connections"
+    if (authT !== "oauth") return "auth_type per_user_oauth needs an auth object of type oauth (the client's OAuth registration)"
+    return ""
+  }
   if (t !== "per_user_headers") return ""
-  if (hasAuth) return "auth and auth_type per_user_headers cannot be set together"
+  if (authT !== "") return "auth and auth_type per_user_headers cannot be set together"
   if (ct !== "http" && ct !== "sse") return "auth_type per_user_headers applies to http and sse connections"
   const ks = keys ?? []
   if (ks.length === 0) return "per_user_header_keys is required (non-empty) for per_user_headers auth type"
@@ -1538,6 +1545,9 @@ function callbackPage(status: int, msg: string): { status: int, html: string } {
 // the client, and the page says what happened. A flow is single use.
 export async function oauthCallback(store: ConfigStore, query: URLSearchParams): Promise<{ status: int, html: string }> {
   const state = query.get("state") ?? ""
+  // a per-user consent flow (auth_type per_user_oauth): the caller's own token row is saved
+  const pf = takeUserFlow(state, Date.now())
+  if (pf !== undefined) return await userCallback(store, pf, query)
   const flow = FLOWS.get(state)
   FLOWS.delete(state)
   if (flow === undefined || flow.expiresAt < Date.now()) return callbackPage(400, "This authorization link is unknown or has expired. Start the flow again.")
@@ -1606,6 +1616,190 @@ export function mcpApi(store: ConfigStore, method: string, path: string, body: s
   if (area === "tool-groups") return toolGroupRoute(store, m, segs, body, p)
   if (area === "per-user-headers") return headersRoute(store, m, segs, body, p)
   return undefined
+}
+
+// ---- per-user OAuth (auth_type per_user_oauth): the callers' consent flows, their token rows and the sessions ----
+
+// The config with the per-user token rows set.
+function withUserTokens(c: Config, list: McpUserToken[]): Config {
+  let n = c
+  let m: McpConfig = n.mcp ?? {}
+  m.user_tokens = list
+  n.mcp = m
+  return n
+}
+
+// Saves a token row the gateway refreshed. A failed save is logged: the next call refreshes again.
+export function saveUserToken(store: ConfigStore, row: McpUserToken): void {
+  const next = upsertUserRow(store.cfg.mcp?.user_tokens ?? [], row)
+  const err = persist(store, withUserTokens(store.cfg, next))
+  if (err !== undefined) console.error(`raiju: the MCP token of ${row.mcp_client_name} could not be saved`)
+}
+
+// The index of a token row by id, or -1.
+function tokenRowIndex(list: McpUserToken[], id: string): int {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i]!.id === id) return i
+  }
+  return -1
+}
+
+// The callback of a per-user flow: the code is exchanged for the caller's tokens, which become its row (the
+// row keeps its id; a refresh token the server did not return keeps the old one).
+async function userCallback(store: ConfigStore, f: UserFlow, query: URLSearchParams): Promise<{ status: int, html: string }> {
+  const refused = query.get("error") ?? ""
+  if (refused !== "") return callbackPage(400, `The authorization server refused access: ${refused}`)
+  const code = query.get("code") ?? ""
+  if (code === "") return callbackPage(400, "The callback has no authorization code.")
+  const clients = clientsOf(store.cfg)
+  const ci = clientIndex(clients, f.client)
+  if (ci < 0) return callbackPage(404, `MCP client '${f.client}' no longer exists.`)
+  const a = oauthAuthOf(clients[ci]!)
+  if (a === undefined) return callbackPage(400, "The MCP client does not use the OAuth flow.")
+  const now = Date.now()
+  try {
+    const list = store.cfg.mcp?.user_tokens ?? []
+    const ui = userTokenIndex(list, f.client, f.virtual_key_id, f.session_id)
+    let id = ""
+    let oldRefresh = ""
+    if (ui >= 0) {
+      id = list[ui]!.id
+      oldRefresh = list[ui]!.refresh_token
+    } else {
+      id = try secureHex(12)
+    }
+    const text = await exchangeUserCode(a, code, f.verifier, f.redirect, now)
+    const row = try rowFromTokens(text, now, f.client, f.virtual_key_id, f.session_id, id, oldRefresh)
+    const perr = persist(store, withUserTokens(store.cfg, upsertUserRow(list, row)))
+    if (perr !== undefined) return callbackPage(500, "The tokens could not be saved.")
+  } catch (e) {
+    return callbackPage(502, `The token request failed: ${e.message}`)
+  }
+  return callbackPage(200, `MCP client ${f.client} is authorized for this caller. You can close this window.`)
+}
+
+// The per-user OAuth routes: GET /api/oauth/per-user/flows/{id} (the flow), GET .../{id}/start (its upstream
+// authorize URL) and /api/mcp/sessions (list; DELETE {id}; POST {id}/reauth). base is the gateway's origin, the
+// redirect URI of a flow started here. undefined for any other route.
+export function perUserApi(store: ConfigStore, method: string, path: string, body: string, base: string): McpReply | undefined {
+  const m = method.toUpperCase()
+  const q = path.indexOf("?")
+  const pure = q < 0 ? path : path.slice(0, q)
+  const fid = flowIdOfPath(path)
+  if (fid !== "") return perUserFlowRoute(m, fid, pure)
+  const segs = pure.split("/").filter((s) => s !== "")
+  if (segs.length >= 3 && segs[0] === "api" && segs[1] === "mcp" && segs[2] === "sessions") return sessionRoute(store, m, segs, path, base)
+  return undefined
+}
+
+// The flow's detail, or its start URL (the upstream authorize URL, with the flow's state).
+function perUserFlowRoute(m: string, id: string, pure: string): McpReply {
+  if (m !== "GET") return notAllowed(m)
+  const f = userFlowById(id, Date.now())
+  if (f === undefined) return fail(404, "Per-user OAuth flow not found or expired")
+  if (pure.endsWith("/start")) return reply(200, JSON.stringify({ authorize_url: f.authorize_url }))
+  return reply(200, JSON.stringify({ id: f.id, status: "pending", mcp_client: { name: f.client }, virtual_key_id: f.virtual_key_id, session_id: f.session_id, expires_at: f.expires_at, created_at: f.created_at }))
+}
+
+// One row of the sessions list: a token row ("token"), a pending consent flow ("flow") or a per-user header
+// credential ("header"). Fields that do not apply are "" (or 0 and false).
+type SessionRow = { id: string, kind: string, auth_kind: string, auth_mode: string, virtual_key_id: string, session_id: string, mcp_client: { name: string }, status: string, expires_at: f64, created_at: f64, has_refresh_token: bool, can_reauth: bool }
+
+function sessionRows(cfg: Config, now: f64): SessionRow[] {
+  const out: SessionRow[] = []
+  for (const t of cfg.mcp?.user_tokens ?? []) {
+    const st = tokenAction(t, now) === "consent" ? "needs_reauth" : "active"
+    out.push({ id: t.id, kind: "token", auth_kind: "oauth", auth_mode: t.session_id !== "" ? "session" : "vk", virtual_key_id: t.virtual_key_id, session_id: t.session_id, mcp_client: { name: t.mcp_client_name }, status: st, expires_at: t.token_expires_at, created_at: t.created_at, has_refresh_token: t.refresh_token !== "", can_reauth: true })
+  }
+  for (const f of userFlowsLive(now)) {
+    out.push({ id: f.id, kind: "flow", auth_kind: "oauth", auth_mode: f.session_id !== "" ? "session" : "vk", virtual_key_id: f.virtual_key_id, session_id: f.session_id, mcp_client: { name: f.client }, status: "pending", expires_at: f.expires_at, created_at: f.created_at, has_refresh_token: false, can_reauth: false })
+  }
+  for (const c of cfg.mcp?.user_credentials ?? []) {
+    out.push({ id: c.id, kind: "header", auth_kind: "headers", auth_mode: "vk", virtual_key_id: c.virtual_key_id, session_id: "", mcp_client: { name: c.mcp_client_name }, status: "active", expires_at: 0.0, created_at: c.updated_at, has_refresh_token: false, can_reauth: false })
+  }
+  return out
+}
+
+// The value of one query parameter of a path, or "".
+function queryParam(path: string, key: string): string {
+  const q = path.indexOf("?")
+  if (q < 0) return ""
+  for (const kv of path.slice(q + 1).split("&")) {
+    const eq = kv.indexOf("=")
+    if (eq > 0 && kv.slice(0, eq) === key) return kv.slice(eq + 1)
+  }
+  return ""
+}
+
+// GET /api/mcp/sessions: the rows, filtered by kind (token, flow or header), paged by limit (default 50, at
+// most 500) and offset.
+function sessionsList(store: ConfigStore, path: string): McpReply {
+  const kind = queryParam(path, "kind")
+  let limit = 50
+  const lp = parseInt(queryParam(path, "limit"))
+  if (lp !== undefined && lp >= 1) limit = lp > 500 ? 500 : lp
+  let offset = 0
+  const op = parseInt(queryParam(path, "offset"))
+  if (op !== undefined && op >= 0) offset = op
+  const rows: SessionRow[] = []
+  for (const r of sessionRows(store.cfg, Date.now())) {
+    if (kind === "" || r.kind === kind) rows.push(r)
+  }
+  const page: SessionRow[] = []
+  for (let i = offset; i < rows.length && page.length < limit; i++) page.push(rows[i]!)
+  return reply(200, JSON.stringify({ sessions: page, count: page.length, total_count: rows.length, limit: limit, offset: offset }))
+}
+
+function sessionRoute(store: ConfigStore, m: string, segs: string[], path: string, base: string): McpReply {
+  if (segs.length === 3) return m === "GET" ? sessionsList(store, path) : notAllowed(m)
+  if (segs.length === 4) return m === "DELETE" ? revokeSession(store, segs[3]!) : notAllowed(m)
+  if (segs.length === 5 && segs[4] === "reauth") return m === "POST" ? reauthSession(store, segs[3]!, base) : notAllowed(m)
+  return fail(404, `no route for ${path}`)
+}
+
+// DELETE /api/mcp/sessions/{id}: revokes a token row (its pending flows go with it), a pending flow, or a header
+// credential. The client stays, and a live session keeps its token until the next call refreshes or fails.
+function revokeSession(store: ConfigStore, id: string): McpReply {
+  const cfg = store.cfg
+  const toks = cfg.mcp?.user_tokens ?? []
+  const ti = tokenRowIndex(toks, id)
+  if (ti >= 0) {
+    const row = toks[ti]!
+    forgetUserFlows(row.mcp_client_name, row.virtual_key_id, row.session_id)
+    const err = persist(store, withUserTokens(cfg, dropUserRow(toks, id)))
+    if (err !== undefined) return err
+    return reply(200, `{"status":"success","message":"session revoked"}`)
+  }
+  if (userFlowById(id, Date.now()) !== undefined) {
+    dropUserFlow(id)
+    return reply(200, `{"status":"success","message":"session revoked"}`)
+  }
+  if ((cfg.mcp?.user_credentials ?? []).some((c) => c.id === id)) return revokeCredential(store, id)
+  return fail(404, "session not found")
+}
+
+// POST /api/mcp/sessions/{id}/reauth: opens a new consent flow for a token row's caller, which replaces its
+// pending flows. The answer carries the flow's link (with its temp token when that is on).
+function reauthSession(store: ConfigStore, id: string, base: string): McpReply {
+  const cfg = store.cfg
+  const toks = cfg.mcp?.user_tokens ?? []
+  const ti = tokenRowIndex(toks, id)
+  if (ti < 0) {
+    if ((cfg.mcp?.user_credentials ?? []).some((c) => c.id === id)) return fail(400, "header credentials are renewed through their submission flow, not reauth")
+    return fail(404, "session not found")
+  }
+  const row = toks[ti]!
+  const clients = clientsOf(cfg)
+  const ci = clientIndex(clients, row.mcp_client_name)
+  if (ci < 0) return fail(404, `MCP client '${row.mcp_client_name}' not found`)
+  const a = oauthAuthOf(clients[ci]!)
+  if (a === undefined) return fail(400, "reauth applies to per_user_oauth clients only")
+  forgetUserFlows(row.mcp_client_name, row.virtual_key_id, row.session_id)
+  const tempOn = cfg.client?.mcp_enable_temp_token_auth === true
+  const r = startUserFlow(a, row.mcp_client_name, row.virtual_key_id, row.session_id, base, tempOn, Date.now())
+  if (r.flow === undefined) return fail(400, r.error)
+  const f = r.flow!
+  return reply(200, JSON.stringify({ status: "pending_oauth", id: f.id, mcp_client: { name: f.client }, url: consentLink(base, f.id, f.temp_token), expires_at: f.expires_at }))
 }
 
 // ---- tests ----
@@ -1921,5 +2115,70 @@ test("per-user headers: flows are opened per key, read, and revoked with their p
   expect(mcpApi(s, "DELETE", "/api/mcp/per-user-headers/credential/uc1", "")!.status).toBe(200)
   expect(s.cfg.mcp!.user_credentials!.length).toBe(0)
   expect(mcpApi(s, "GET", "/api/mcp/per-user-headers/flows/" + id, "")!.status).toBe(404)
+  cleanupFile(s.path)
+})
+
+test("per_user_oauth clients need an oauth registration over http or sse", () => {
+  const s = fixture()
+  const bare = mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"po\",\"connection_type\":\"http\",\"connection_string\":\"http://127.0.0.1:1/mcp\",\"auth_type\":\"per_user_oauth\"}")!
+  expect(bare.status).toBe(400)
+  expect(bare.body.includes("needs an auth object of type oauth")).toBe(true)
+  const bearer = mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"po\",\"connection_type\":\"http\",\"connection_string\":\"http://127.0.0.1:1/mcp\",\"auth_type\":\"per_user_oauth\",\"auth\":{\"type\":\"bearer\",\"token\":\"tok-123456789\"}}")!
+  expect(bearer.status).toBe(400)
+  const ok = mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"po\",\"connection_type\":\"http\",\"connection_string\":\"http://127.0.0.1:1/mcp\",\"auth_type\":\"per_user_oauth\",\"auth\":{\"type\":\"oauth\",\"client_id\":\"cid\",\"authorize_url\":\"https://auth.example/authorize\",\"token_url\":\"https://auth.example/token\"}}")!
+  expect(ok.status).toBe(201)
+  expect(ok.body.includes("\"auth_type\":\"per_user_oauth\"")).toBe(true)
+  cleanupFile(s.path)
+})
+
+// The OAuth registration of a client in the store's config, by name.
+function registrationOf(s: ConfigStore, name: string): McpAuthConfig {
+  for (const c of clientsOf(s.cfg)) {
+    if (c.name === name) return c.auth!
+  }
+  return { type: "oauth" }
+}
+
+test("per-user flows answer their start URL, sessions list, reauth and revoke", () => {
+  const s = fixture()
+  mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"po\",\"connection_type\":\"http\",\"connection_string\":\"http://127.0.0.1:1/mcp\",\"auth_type\":\"per_user_oauth\",\"auth\":{\"type\":\"oauth\",\"client_id\":\"cid\",\"authorize_url\":\"https://auth.example/authorize\",\"token_url\":\"https://auth.example/token\"}}")
+  const started = startUserFlow(registrationOf(s, "po"), "po", "vk-flow", "", "http://gw.example", true, Date.now())
+  const f = started.flow!
+  expect(started.error).toBe("")
+  const st = perUserApi(s, "GET", "/api/oauth/per-user/flows/" + f.id + "/start", "", "")!
+  expect(st.status).toBe(200)
+  expect(st.body.includes("code_challenge_method=S256")).toBe(true)
+  expect(st.body.includes("state=" + f.state)).toBe(true)
+  const det = perUserApi(s, "GET", "/api/oauth/per-user/flows/" + f.id, "", "")!
+  expect(det.body.includes("\"status\":\"pending\"")).toBe(true)
+  expect(perUserApi(s, "GET", "/api/oauth/per-user/flows/nope/start", "", "")!.status).toBe(404)
+  expect(perUserApi(s, "DELETE", "/api/oauth/per-user/flows/" + f.id, "", "")!.status).toBe(405)
+  const listed = perUserApi(s, "GET", "/api/mcp/sessions?kind=flow", "", "")!
+  expect(listed.body.includes("\"id\":\"" + f.id + "\"")).toBe(true)
+  const row: McpUserToken = { id: "ut-t1", mcp_client_name: "po", virtual_key_id: "vk-flow", session_id: "", access_token: "at-1", refresh_token: "rt-1", token_expires_at: Date.now() + 3600000.0, scopes: [], created_at: Date.now(), last_refreshed_at: Date.now() }
+  saveUserToken(s, row)
+  expect(s.cfg.mcp!.user_tokens!.length).toBe(1)
+  const all = perUserApi(s, "GET", "/api/mcp/sessions", "", "")!
+  expect(all.body.includes("\"kind\":\"token\"")).toBe(true)
+  expect(all.body.includes("\"status\":\"active\"")).toBe(true)
+  expect(all.body.includes("at-1")).toBe(false)
+  const re = perUserApi(s, "POST", "/api/mcp/sessions/ut-t1/reauth", "", "http://gw.example")!
+  expect(re.status).toBe(200)
+  expect(re.body.includes("/api/oauth/per-user/flows/")).toBe(true)
+  const del = perUserApi(s, "DELETE", "/api/mcp/sessions/ut-t1", "", "")!
+  expect(del.status).toBe(200)
+  expect(s.cfg.mcp!.user_tokens!.length).toBe(0)
+  expect(perUserApi(s, "DELETE", "/api/mcp/sessions/ut-t1", "", "")!.status).toBe(404)
+  expect(perUserApi(s, "POST", "/api/mcp/sessions/ut-t1/reauth", "", "")!.status).toBe(404)
+  expect(perUserApi(s, "GET", "/api/mcp/clients", "", "")).toBe(undefined)
+  cleanupFile(s.path)
+})
+
+test("the session list pages", () => {
+  const s = fixture()
+  const page = perUserApi(s, "GET", "/api/mcp/sessions?limit=1&offset=0", "", "")!
+  expect(page.status).toBe(200)
+  expect(page.body.includes("\"limit\":1")).toBe(true)
+  expect(page.body.includes("\"total_count\":0")).toBe(true)
   cleanupFile(s.path)
 })

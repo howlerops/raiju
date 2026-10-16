@@ -1,0 +1,350 @@
+// Per-user OAuth for MCP clients of auth_type per_user_oauth (Bifrost's per-user consent). Each caller
+// (a virtual key, or an x-bf-mcp-session-id in session mode) holds its own token row per client. A caller
+// without a usable token is sent a consent link; the flow it opens is held here until the callback
+// returns, and the callback saves the row. Temp tokens (client.mcp_enable_temp_token_auth) let the link's
+// owner open the flow's start route without a dashboard session.
+import { McpAuthConfig, authorizeUrl, pkceVerifier, pkceChallenge, codeTokenRequest, tokenRequest, tokenFields } from "./mcpauth"
+import { secureHex } from "./crypto"
+import { deadline } from "./deadline"
+
+// One caller's tokens for one per_user_oauth client. Exactly one of virtual_key_id and session_id is set:
+// session_id in session mode (the x-bf-mcp-session-id header), else virtual_key_id. The tokens are sealed
+// in the saved file.
+export type McpUserToken = {
+  id: string,
+  mcp_client_name: string,
+  virtual_key_id: string,
+  session_id: string,
+  access_token: string,
+  refresh_token: string,
+  // when the access token stops being valid, in epoch milliseconds
+  token_expires_at: f64,
+  scopes: string[],
+  created_at: f64,
+  last_refreshed_at: f64,
+}
+
+// A consent flow a caller opened: its state is the authorize request's state, and the link it was given
+// names its id. It lives FLOW_TTL_MS, as Bifrost's does.
+export type UserFlow = {
+  id: string,
+  state: string,
+  client: string,
+  virtual_key_id: string,
+  session_id: string,
+  verifier: string,
+  redirect: string,
+  authorize_url: string,
+  temp_token: string,
+  expires_at: f64,
+  created_at: f64,
+}
+
+// A token this close to its expiry counts as expired, as TokenCache does (60 s).
+const USER_EXPIRY_MARGIN_MS: f64 = 60000.0
+const FLOW_TTL_MS: f64 = 900000.0
+const TEMP_TTL_MS: f64 = 900000.0
+const FLOW_TIMEOUT_MS: int = 10000
+
+// Flows by state (the callback's key) and temp tokens by value. Process-local, as the OAuth flows of the
+// authorization code grant are.
+const USER_FLOWS: Map<string, UserFlow> = new Map()
+const TEMP_TOKENS: Map<string, string> = new Map()
+const TEMP_EXPIRY: Map<string, f64> = new Map()
+
+// What a tool call needs from its caller's token at time nowMs.
+// "valid": use access_token. "refresh": expired or about to expire, and a refresh_token exists.
+// "consent": no row, or expired with no refresh_token; the caller must complete a consent flow.
+export function tokenAction(t: McpUserToken | undefined, nowMs: number): string {
+  if (t === undefined) return "consent"
+  if (t.access_token !== "" && t.token_expires_at - nowMs > USER_EXPIRY_MARGIN_MS) return "valid"
+  if (t.refresh_token !== "") return "refresh"
+  return "consent"
+}
+
+// The index of a caller's row for a client in the list, or -1. Session mode keys by session_id when it is
+// set; otherwise by virtual key.
+export function userTokenIndex(list: McpUserToken[], client: string, vk: string, sessionId: string): int {
+  for (let i = 0; i < list.length; i++) {
+    const t = list[i]!
+    if (t.mcp_client_name !== client) continue
+    if (sessionId !== "" && t.session_id === sessionId) return i
+    if (sessionId === "" && t.session_id === "" && vk !== "" && t.virtual_key_id === vk) return i
+  }
+  return -1
+}
+
+// The row of one caller for one client, or undefined.
+export function userTokenOf(list: McpUserToken[] | undefined, client: string, vk: string, sessionId: string): McpUserToken | undefined {
+  const all = list ?? []
+  const i = userTokenIndex(all, client, vk, sessionId)
+  return i < 0 ? undefined : all[i]
+}
+
+// The identity a request is keyed by: the x-bf-mcp-session-id header when present, else the virtual key.
+export function identityOf(sessionHeader: string | undefined, vk: string): { vk: string, session: string } {
+  const s = (sessionHeader ?? "").trim()
+  if (s !== "") return { vk: "", session: s }
+  return { vk: vk, session: "" }
+}
+
+// The consent wording of a tool call that needs the caller's login. The link is the flow's start URL;
+// when temp tokens are on, the link carries the #t= fragment and the reminder to keep it.
+export function consentMessage(client: string, link: string, tempToken: bool): string {
+  let m = `Authentication required for ${client}. Visit ${link} to connect your account.`
+  if (tempToken) m += " IMPORTANT: this link includes a required fragment after the '#' character (a one-time auth token). Copy and share the ENTIRE URL exactly as given, including everything after the '#' — the link will not work without it."
+  return m
+}
+
+// The start URL of a per-user flow, relative to the gateway's origin; the temp token rides in the fragment.
+export function consentLink(base: string, flowId: string, tempToken: string): string {
+  const u = `${base}/api/oauth/per-user/flows/${flowId}/start`
+  return tempToken === "" ? u : `${u}#t=${tempToken}`
+}
+
+// Drops the flows and temp tokens whose time is up.
+function prune(nowMs: f64): void {
+  for (const k of USER_FLOWS.keys()) {
+    const f = USER_FLOWS.get(k)
+    if (f !== undefined && f.expires_at <= nowMs) USER_FLOWS.delete(k)
+  }
+  for (const k of TEMP_EXPIRY.keys()) {
+    const e = TEMP_EXPIRY.get(k)
+    if (e !== undefined && e <= nowMs) {
+      TEMP_EXPIRY.delete(k)
+      TEMP_TOKENS.delete(k)
+    }
+  }
+}
+
+// Opens a consent flow for a caller of a per_user_oauth client. a is the client's registration (its
+// authorize endpoint and client_id, set by the admin's verification). The flow's temp token is minted when
+// tempOn is set. error says why no flow was opened.
+export function startUserFlow(a: McpAuthConfig, client: string, vk: string, sessionId: string, base: string, tempOn: bool, nowMs: f64): { flow: UserFlow | undefined, error: string } {
+  if ((a.client_id ?? "") === "" || (a.authorize_url ?? "") === "") return { flow: undefined, error: `MCP client ${client} is not verified yet: an admin runs initiate-verification first` }
+  prune(nowMs)
+  try {
+    const state = secureHex(32)
+    const id = secureHex(16)
+    const verifier = pkceVerifier()
+    const redirect = base + "/api/oauth/callback"
+    const url = authorizeUrl(a, redirect, state, pkceChallenge(verifier))
+    const temp = tempOn ? secureHex(32) : ""
+    const flow: UserFlow = { id: id, state: state, client: client, virtual_key_id: vk, session_id: sessionId, verifier: verifier, redirect: redirect, authorize_url: url, temp_token: temp, expires_at: nowMs + FLOW_TTL_MS, created_at: nowMs }
+    USER_FLOWS.set(state, flow)
+    if (temp !== "") {
+      TEMP_TOKENS.set(temp, id)
+      TEMP_EXPIRY.set(temp, nowMs + TEMP_TTL_MS)
+    }
+    return { flow: flow, error: "" }
+  } catch (e) {
+    return { flow: undefined, error: `could not start the flow: ${e.message}` }
+  }
+}
+
+// The live flow with this id, or undefined.
+export function userFlowById(id: string, nowMs: f64): UserFlow | undefined {
+  for (const f of USER_FLOWS.values()) {
+    if (f.id === id && f.expires_at > nowMs) return f
+  }
+  return undefined
+}
+
+// All live flows, for the sessions list.
+export function userFlowsLive(nowMs: f64): UserFlow[] {
+  const out: UserFlow[] = []
+  for (const f of USER_FLOWS.values()) {
+    if (f.expires_at > nowMs) out.push(f)
+  }
+  return out
+}
+
+// Takes the flow of a callback's state out of the table (single use). undefined when unknown or expired.
+export function takeUserFlow(state: string, nowMs: f64): UserFlow | undefined {
+  const f = USER_FLOWS.get(state)
+  USER_FLOWS.delete(state)
+  if (f === undefined || f.expires_at <= nowMs) return undefined
+  return f
+}
+
+// Drops one pending flow by id (a revoked session's flow).
+export function dropUserFlow(id: string): void {
+  for (const k of USER_FLOWS.keys()) {
+    const f = USER_FLOWS.get(k)
+    if (f !== undefined && f.id === id) USER_FLOWS.delete(k)
+  }
+}
+
+// Drops the pending flows of one caller for one client (revoke, or a new flow replacing them).
+export function forgetUserFlows(client: string, vk: string, sessionId: string): void {
+  for (const k of USER_FLOWS.keys()) {
+    const f = USER_FLOWS.get(k)
+    if (f === undefined) continue
+    if (f.client !== client) continue
+    if ((sessionId !== "" && f.session_id === sessionId) || (sessionId === "" && f.session_id === "" && f.virtual_key_id === vk)) USER_FLOWS.delete(k)
+  }
+}
+
+// Whether a temp token may call a flow route: it must be live, GET, and name the flow in the path.
+// The temp token is only honoured when the caller has client.mcp_enable_temp_token_auth on (checked by the caller).
+export function tempTokenAllows(token: string, method: string, path: string, nowMs: f64): bool {
+  if (token === "" || method !== "GET") return false
+  const flowId = flowIdOfPath(path)
+  if (flowId === "") return false
+  const bound = TEMP_TOKENS.get(token)
+  if (bound === undefined || bound !== flowId) return false
+  const e = TEMP_EXPIRY.get(token)
+  return e !== undefined && e > nowMs
+}
+
+// The flow id of /api/oauth/per-user/flows/{id} and /api/oauth/per-user/flows/{id}/start, else "".
+export function flowIdOfPath(path: string): string {
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  const segs = p.split("/").filter((s) => s !== "")
+  if (segs.length < 5 || segs[0] !== "api" || segs[1] !== "oauth" || segs[2] !== "per-user" || segs[3] !== "flows") return ""
+  if (segs.length === 5) return segs[4]!
+  if (segs.length === 6 && segs[5] === "start") return segs[4]!
+  return ""
+}
+
+// Issues a token response's tokens as a row for the caller (a fresh id, or the given row's id).
+export function rowFromTokens(json: string, nowMs: f64, client: string, vk: string, sessionId: string, id: string, oldRefresh: string): McpUserToken throws SyntaxError {
+  const t = try tokenFields(json, nowMs)
+  const refresh = t.refresh !== "" ? t.refresh : oldRefresh
+  return { id: id, mcp_client_name: client, virtual_key_id: vk, session_id: sessionId, access_token: t.access, refresh_token: refresh, token_expires_at: t.expiresAt, scopes: [], created_at: nowMs, last_refreshed_at: nowMs }
+}
+
+// Trades a callback's code for the caller's tokens, with the flow's PKCE verifier.
+export async function exchangeUserCode(a: McpAuthConfig, code: string, verifier: string, redirect: string, nowMs: f64): Promise<string> throws Error {
+  const tr = try codeTokenRequest(a, code, verifier, redirect)
+  return try await postForm(tr.url, tr.headers, tr.body)
+}
+
+// Refreshes a caller's access token with its refresh token. The result is the new row (same id).
+export async function refreshUserRow(a: McpAuthConfig, row: McpUserToken, nowMs: f64): Promise<McpUserToken> throws Error {
+  if (row.refresh_token === "") throw new Error("no refresh token")
+  let req = a
+  req.refresh_token = row.refresh_token
+  const tr = try tokenRequest(req)
+  const text = try await postForm(tr.url, tr.headers, tr.body)
+  return try rowFromTokens(text, nowMs, row.mcp_client_name, row.virtual_key_id, row.session_id, row.id, row.refresh_token)
+}
+
+// One form POST to an authorization server under a deadline: the body of a 2xx answer, else an error.
+async function postForm(url: string, headers: Map<string, string>, body: string): Promise<string> throws Error {
+  const dl = deadline(FLOW_TIMEOUT_MS)
+  try {
+    const hs: Record<string, string> = headers
+    const r = await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+    const text = await r.text()
+    if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status} from ${url}`)
+    dl.finish()
+    return text
+  } catch (e) {
+    dl.finish()
+    throw new Error(`${url}: ${e.message}`)
+  }
+}
+
+// The list with the row of the same id replaced, or the row appended when it is new.
+export function upsertUserRow(list: McpUserToken[], row: McpUserToken): McpUserToken[] {
+  const out: McpUserToken[] = []
+  let done = false
+  for (const t of list) {
+    if (t.id === row.id) {
+      out.push(row)
+      done = true
+    } else {
+      out.push(t)
+    }
+  }
+  if (!done) out.push(row)
+  return out
+}
+
+// The list without the row of this id.
+export function dropUserRow(list: McpUserToken[], id: string): McpUserToken[] {
+  const out: McpUserToken[] = []
+  for (const t of list) {
+    if (t.id !== id) out.push(t)
+  }
+  return out
+}
+
+test("a valid token is used, an expiring one is refreshed, and a missing one needs consent", () => {
+  const now = 1000000.0
+  expect(tokenAction(rowOf("u1", "vk1", "", now + 3600000.0, "r"), now)).toBe("valid")
+  expect(tokenAction(rowOf("u1", "vk1", "", now + 30000.0, "r"), now)).toBe("refresh")
+  expect(tokenAction(rowOf("u1", "vk1", "", now - 1.0, ""), now)).toBe("consent")
+  expect(tokenAction(undefined, now)).toBe("consent")
+})
+
+test("rows are keyed by virtual key, or by session id in session mode", () => {
+  const list = [rowOf("u1", "vk1", "", 0.0, ""), rowOf("u2", "", "s-9", 0.0, "")]
+  expect(userTokenOf(list, "m", "vk1", "")!.id).toBe("u1")
+  expect(userTokenOf(list, "m", "vk2", "")).toBe(undefined)
+  expect(userTokenOf(list, "m", "vk1", "s-9")!.id).toBe("u2")
+  expect(userTokenOf(list, "other", "vk1", "")).toBe(undefined)
+  expect(userTokenIndex(list, "m", "vk1", "")).toBe(0)
+  expect(userTokenIndex(list, "m", "", "s-9")).toBe(1)
+  expect(userTokenIndex(list, "m", "", "s-x")).toBe(-1)
+})
+
+test("the session header takes precedence over the virtual key, and blank headers are ignored", () => {
+  expect(identityOf("abc", "vk1").session).toBe("abc")
+  expect(identityOf("abc", "vk1").vk).toBe("")
+  expect(identityOf("  ", "vk1").vk).toBe("vk1")
+  expect(identityOf(undefined, "vk1").session).toBe("")
+})
+
+test("the consent message and link carry the flow and the temp-token fragment when on", () => {
+  expect(consentLink("http://gw.example", "f1", "")).toBe("http://gw.example/api/oauth/per-user/flows/f1/start")
+  expect(consentLink("http://gw.example", "f1", "tk")).toBe("http://gw.example/api/oauth/per-user/flows/f1/start#t=tk")
+  expect(consentMessage("m", "http://gw.example/x", false)).toBe("Authentication required for m. Visit http://gw.example/x to connect your account.")
+  expect(consentMessage("m", "http://gw.example/x#t=tk", true).includes("ENTIRE URL")).toBe(true)
+})
+
+test("a flow needs a verified client, and an opened flow answers its start URL with PKCE", () => {
+  const unverified: McpAuthConfig = { type: "oauth" }
+  expect(startUserFlow(unverified, "m", "vk1", "", "http://gw", false, 1000.0).error.includes("initiate-verification")).toBe(true)
+  const a: McpAuthConfig = { type: "oauth", client_id: "cid", authorize_url: "https://auth.example/authorize" }
+  const r = startUserFlow(a, "m", "vk1", "", "http://gw", true, 1000.0)
+  expect(r.error).toBe("")
+  const f = r.flow!
+  expect(f.redirect).toBe("http://gw/api/oauth/callback")
+  expect(f.authorize_url.includes("code_challenge_method=S256")).toBe(true)
+  expect(f.authorize_url.includes("state=" + f.state)).toBe(true)
+  expect(userFlowById(f.id, 2000.0)!.state).toBe(f.state)
+  expect(userFlowById(f.id, 1000.0 + FLOW_TTL_MS + 1.0)).toBe(undefined)
+  expect(tempTokenAllows(f.temp_token, "GET", "/api/oauth/per-user/flows/" + f.id + "/start", 2000.0)).toBe(true)
+  expect(tempTokenAllows(f.temp_token, "GET", "/api/oauth/per-user/flows/other/start", 2000.0)).toBe(false)
+  expect(tempTokenAllows(f.temp_token, "PUT", "/api/oauth/per-user/flows/" + f.id, 2000.0)).toBe(false)
+  expect(tempTokenAllows("", "GET", "/api/oauth/per-user/flows/" + f.id, 2000.0)).toBe(false)
+  const taken = takeUserFlow(f.state, 2000.0)
+  expect(taken!.id).toBe(f.id)
+  expect(takeUserFlow(f.state, 2000.0)).toBe(undefined)
+})
+
+test("the flow id is read from the flow routes only", () => {
+  expect(flowIdOfPath("/api/oauth/per-user/flows/abc")).toBe("abc")
+  expect(flowIdOfPath("/api/oauth/per-user/flows/abc/start?x=1")).toBe("abc")
+  expect(flowIdOfPath("/api/oauth/per-user/flows/abc/other")).toBe("")
+  expect(flowIdOfPath("/api/oauth/callback")).toBe("")
+})
+
+test("rows are replaced by id and dropped by id", () => {
+  const a = rowOf("u1", "vk1", "", 0.0, "")
+  const b = rowOf("u2", "vk2", "", 0.0, "")
+  const a2 = rowOf("u1", "vk1", "", 5.0, "r2")
+  expect(upsertUserRow([a, b], a2).length).toBe(2)
+  expect(upsertUserRow([a, b], a2)[0]!.refresh_token).toBe("r2")
+  expect(upsertUserRow([a], b).length).toBe(2)
+  expect(dropUserRow([a, b], "u1").length).toBe(1)
+  expect(dropUserRow([a, b], "u1")[0]!.id).toBe("u2")
+})
+
+// A row for the tests, with the given expiry, refresh token and identity.
+function rowOf(id: string, vk: string, sid: string, expires: f64, refresh: string): McpUserToken {
+  return { id: id, mcp_client_name: "m", virtual_key_id: vk, session_id: sid, access_token: "a", refresh_token: refresh, token_expires_at: expires, scopes: [], created_at: 0.0, last_refreshed_at: 0.0 }
+}

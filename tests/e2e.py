@@ -1570,6 +1570,116 @@ def mcp_keys_e2e(env):
         gw.wait()
 
 
+MCP_PO = "http://127.0.0.1:18159"  # per_user_oauth: each caller consents with its own tokens, refreshed on expiry, with sessions
+
+def mcp_po_e2e(env):
+    """auth_type per_user_oauth: the admin's verification flow, a caller's consent link (with its temp token), the
+    callback saving the caller's own token row, tool calls with that token, the session-mode identity, the sessions
+    list, a refresh after the server expires the token, reauth and revoke. Its own gateway, started and stopped here."""
+    import re
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "mcp_enable_temp_token_auth": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"tool_sync_interval": "1h", "oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
+            {"name": "po", "connection_type": "http", "connection_string": MOCK + "/mcp-peruser-oauth", "auth_type": "per_user_oauth", "auth": {"type": "oauth"}},
+        ]},
+        "governance": {
+            "virtual_keys": [
+                {"id": "vk-po-a", "value": "sk-bf-po-a", "mcp_configs": [{"mcp_client_name": "po", "tools_to_execute": ["*"]}]},
+                {"id": "vk-po-b", "value": "sk-bf-po-b", "mcp_configs": [{"mcp_client_name": "po", "tools_to_execute": ["*"]}]},
+            ],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.mcppo.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18159", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.mcppo.log"), "w"))
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    def authorize(auth_url):
+        loc = ""
+        try:
+            urllib.request.build_opener(NoRedirect).open(auth_url, timeout=10)
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("location", "")
+        return loc
+
+    def tool(key, extra=None):
+        h = {"authorization": "Bearer " + key, **(extra or {})}
+        return call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "po-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, h, base=MCP_PO, auth=False)
+
+    def consent_of(body):
+        m = re.search(r"flows/([0-9a-f]+)/start#t=([0-9a-f]+)", body)
+        return (m.group(1), m.group(2)) if m else ("", "")
+
+    def sessions(q=""):
+        s, _, b = call("GET", "/api/mcp/sessions" + q, base=MCP_PO, auth=False)
+        return s, b, (json.loads(b)["sessions"] if s == 200 else [])
+
+    try:
+        wait(MCP_PO + "/health")
+        s, _, b = call("POST", "/api/mcp/client/po/initiate-verification", base=MCP_PO, auth=False)
+        init = json.loads(b) if s == 200 else {}
+        check("the admin's verification starts an authorization code flow", s == 200 and "code_challenge_method=S256" in init.get("authorize_url", ""), (s, b[:200]))
+        lu = urllib.parse.urlparse(authorize(init.get("authorize_url", "")))
+        s, _, b = call("GET", lu.path + "?" + lu.query, base=MCP_PO, auth=False)
+        check("the admin's callback authorizes the client", s == 200 and "is authorized" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/client/po/complete-oauth", base=MCP_PO, auth=False)
+        check("complete-oauth answers once the client is authorized", s == 200, (s, b[:200]))
+        ready = []
+        for _ in range(100):
+            ready = [c for c in json.loads(call("GET", "/api/mcp", base=MCP_PO, auth=False)[2])["clients"] if c["name"] == "po" and c["connected"]]
+            if ready:
+                break
+            time.sleep(0.1)
+        check("the per-user client connects with the admin's token to list its tools", ready and ready[0]["tools"] == 1, ready)
+
+        s, _, b = tool("sk-bf-po-a")
+        fid_a, tok_a = consent_of(b)
+        check("a caller without a token gets the consent link, with its temp token", s == 401 and "Authentication required for po" in b and fid_a != "" and tok_a != "", (s, b[:300]))
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + fid_a + "/start", base=MCP_PO, headers={"x-bifrost-temp-token": tok_a}, auth=False)
+        check("the flow's start URL answers the upstream authorize URL with PKCE", s == 200 and "code_challenge_method=S256" in json.loads(b)["authorize_url"], (s, b[:200]))
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + fid_a, base=MCP_PO, headers={"x-bifrost-temp-token": tok_a}, auth=False)
+        check("the flow's detail names its client and caller", s == 200 and json.loads(b)["virtual_key_id"] == "vk-po-a", (s, b[:200]))
+        lu = urllib.parse.urlparse(authorize(json.loads(call("GET", "/api/oauth/per-user/flows/" + fid_a + "/start", base=MCP_PO, headers={"x-bifrost-temp-token": tok_a}, auth=False)[2])["authorize_url"]))
+        s, _, b = call("GET", lu.path + "?" + lu.query, base=MCP_PO, auth=False)
+        check("the callback saves the caller's own token", s == 200 and "for this caller" in b, (s, b[:200]))
+        s, _, b = tool("sk-bf-po-a")
+        tok_calls = [x["auth"] for x in seen() if x["path"] == "/mcp" and "tools/call" in x["body"]]
+        check("the caller's tool call runs with its own token", s == 200 and "Sunny in Oslo" in b and tok_calls[-1:] != [] and tok_calls[-1].startswith("Bearer oauth-access-"), (s, b[:200], tok_calls[-1:]))
+        s, _, b = tool("sk-bf-po-b")
+        fid_b, _ = consent_of(b)
+        check("another caller still needs its own consent", s == 401 and fid_b != "" and fid_b != fid_a, (s, b[:200]))
+        s, _, b = tool("sk-bf-po-a", {"x-bf-mcp-session-id": "s-1"})
+        check("a session without a consent gets its own link", s == 401 and "Authentication required for po" in b, (s, b[:200]))
+
+        s, b, rows = sessions("?kind=token")
+        mine = [r for r in rows if r["virtual_key_id"] == "vk-po-a"]
+        check("the sessions list shows the caller's token row without its tokens", s == 200 and len(mine) == 1 and mine[0]["auth_mode"] == "vk" and mine[0]["status"] == "active" and "oauth-access-" not in b, (s, b[:300]))
+        row_a = mine[0]["id"] if mine else ""
+        s, _, b = call("POST", "/api/mcp/sessions/" + row_a + "/reauth", base=MCP_PO, auth=False)
+        check("reauth opens a new consent link for the row", s == 200 and "/api/oauth/per-user/flows/" in json.loads(b)["url"], (s, b[:200]))
+
+        call("POST", "/_oauth/expire-all", base=MOCK, auth=False)
+        s, _, b = tool("sk-bf-po-a")
+        check("an expired token is refreshed on the next call", s == 200 and "Sunny in Oslo" in b, (s, b[:200]))
+        grants = [x["body"] for x in seen() if x["path"] == "/oauth2/token"]
+        check("the refresh used the caller's refresh token", any("grant_type=refresh_token" in g for g in grants), grants[-1:])
+        saved = [t for t in json.load(open(path))["mcp"].get("user_tokens", []) if t["virtual_key_id"] == "vk-po-a"]
+        check("the refreshed token is saved to the config file", saved and saved[0]["access_token"].startswith("oauth-access-"), saved[:1])
+
+        s, _, b = call("DELETE", "/api/mcp/sessions/" + row_a, base=MCP_PO, auth=False)
+        check("revoke removes the caller's token row", s == 200, (s, b[:200]))
+        s, _, b = tool("sk-bf-po-a")
+        check("a revoked caller needs consent again", s == 401 and "Authentication required for po" in b, (s, b[:200]))
+        s, b, rows = sessions("?kind=token")
+        check("the revoked row is gone from the sessions list", not [r for r in rows if r["virtual_key_id"] == "vk-po-a"], b[:200])
+    finally:
+        gw.terminate()
+
 MCP_PU = "http://127.0.0.1:18151"  # per_user_headers: each virtual key submits its own header values for an MCP client
 
 
@@ -4676,6 +4786,8 @@ def main():
         # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients: their own gateway
         mcp_keys_e2e(env)
         mcp_peruser_e2e(env)
+        # MCP per-user OAuth: consent links, each caller's own tokens, refresh, sessions list, reauth and revoke: its own gateway
+        mcp_po_e2e(env)
         # the request log in Bifrost's shapes, User-Agent mappings, cache clears, audit by id, tickets and plugin listings: its own gateway
         l97c_e2e(env)
         # client limits, header filters, setup_token, batch keys and alias depth: their own gateways
