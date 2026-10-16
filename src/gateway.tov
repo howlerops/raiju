@@ -28,6 +28,7 @@ import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/ty
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText } from "./compat"
 import { ResponsesToChatStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias } from "./router"
+import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
 import { Pricing, PriceRow } from "./pricing"
@@ -439,8 +440,8 @@ function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, mod
 }
 
 // The upstream name a key's aliases map the request model to, or "" when they do not change it.
-function aliasTo(k: KeyConfig, model: string): string {
-  const to = resolveAlias(k, model).model
+function aliasTo(k: KeyConfig, model: string, maxDepth?: int): string {
+  const to = resolveAlias(k, model, maxDepth).model
   return to !== model ? to : ""
 }
 
@@ -568,15 +569,6 @@ function respond(status: int, body: string, h: Hdrs): Response {
   return new Response(body, { status: status, headers: r })
 }
 
-// Headers the caller sends as x-bf-eh-<name> go upstream as <name>.
-function forwardedHeaders(h: Hdrs): Map<string, string> {
-  const m: Map<string, string> = new Map()
-  for (const key of h.keys()) {
-    if (key.startsWith("x-bf-eh-")) m.set(key.slice(8), h.get(key)!)
-  }
-  return m
-}
-
 // Bifrost's send_back_raw_request / send_back_raw_response: the provider's setting, which the
 // x-bf-send-back-raw-request / -response header overrides when client.allow_per_request_raw_override is on.
 function sendBackRaw(h: Hdrs, cfg: Config, p: ProviderConfig, which: string): bool {
@@ -626,7 +618,14 @@ function finishes(data: string): bool {
   }
 }
 
-// One limiter per provider that sets concurrency_and_buffer_size (Bifrost's per-provider queue).
+// Bifrost's default queue (core/schemas/provider.go), for a provider with no concurrency_and_buffer_size.
+const DEFAULT_CONCURRENCY: int = 1000
+const DEFAULT_BUFFER: int = 5000
+
+// One limiter per provider (Bifrost's per-provider queue). A provider that sets
+// concurrency_and_buffer_size gets that queue. With client.drop_excess_requests on, a provider
+// without one gets Bifrost's default queue, so a full queue sheds requests there too; with it
+// off, such a provider has no queue and its requests are never held or shed.
 function limitersFor(cfg: Config): Map<string, Limiter> {
   const out: Map<string, Limiter> = new Map()
   const ps = cfg.providers
@@ -634,7 +633,10 @@ function limitersFor(cfg: Config): Map<string, Limiter> {
   const drop = cfg.client?.drop_excess_requests === true
   for (const name of ps.keys()) {
     const c = ps.get(name)!.concurrency_and_buffer_size
-    if (c === undefined) continue
+    if (c === undefined) {
+      if (drop) out.set(name, new Limiter(DEFAULT_CONCURRENCY, DEFAULT_BUFFER, true))
+      continue
+    }
     out.set(name, new Limiter(c.concurrency < 1 ? 1 : c.concurrency, c.buffer_size < 1 ? 1 : c.buffer_size, drop))
   }
   return out
@@ -1033,7 +1035,6 @@ export class Engine {
     this.logRequests = cfg.client?.enable_logging ?? true
     metrics.setCustomLabels(cfg.client?.prometheus_labels ?? [])
     this.limiters = limitersFor(cfg)
-    if (cfg.client?.drop_excess_requests === true && this.limiters.size === 0) console.error("raiju: client.drop_excess_requests has no effect: no provider sets concurrency_and_buffer_size, so no queue is full")
     if (injectedNames(cfg).length > 0 && (cfg.mcp?.client_configs ?? []).length === 0) console.error("raiju: injected_tools need MCP clients, and none are configured")
     this.guardProviders = cfg.guardrails?.providers ?? []
     this.localRules = compileLocalRules(this.guardProviders)
@@ -1172,7 +1173,8 @@ export class Engine {
   async attempt(refs: ModelRef[], h: Hdrs, build: Build, translate: Translate, streamed: bool, ctx: ReqCtx): Promise<Outcome> {
     const pinned = h.get("x-bf-api-key") ?? h.get("x-bf-api-key-id") ?? undefined
     const direct = directKeyFrom(h, this.cfg.client?.allow_direct_keys === true)
-    const extra = forwardedHeaders(h)
+    // x-bf-eh-* headers and allowlisted headers go upstream, as client.header_filter_config allows (headerfilter.tov)
+    const extra = forwardedHeaders(h, headerFilterOf(this.cfg.client?.header_filter_config))
     let last: Outcome = { ok: false, status: 404, body: errorJson("no provider is configured for this model", "invalid_request_error", "model_not_found"), contentType: "application/json", provider: "", model: "", promptTokens: 0, completionTokens: 0, attempts: 0, upstreamMs: 0.0 }
     let attempts = 0
     let upstreamMs = 0.0
@@ -1328,7 +1330,7 @@ export class Engine {
             ctx.outHeaders.set("content-type", conv.framed() ? "application/vnd.amazon.eventstream" : "text/event-stream")
             ctx.outHeaders.set("cache-control", "no-cache")
             ctx.outHeaders.set("x-bf-attempts", "" + attempts)
-            routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs, t.key.name ?? t.key.id ?? "", aliasTo(t.key, ref.model))
+            routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs, t.key.name ?? t.key.id ?? "", aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth))
             // the compat drops and conversions of this target are decided by now (build shaped it): they go out with the stream's headers
             compatHeaders(&ctx.outHeaders, ctx.compat)
             sink.started = true
@@ -1382,6 +1384,8 @@ export class Engine {
           }
           text = await res.text()
           if (storeRaw) ctx.rawResponse = text
+          // client.dump_errors_in_console_logs: the full upstream error goes to the server console
+          if (status >= 400 && this.cfg.client?.dump_errors_in_console_logs === true) console.error(`raiju: upstream error from ${ref.provider} (${status}) for ${ref.model}: ${text}`)
           // follow-up calls of a multi-call request (one embedding input per call)
           const more = up.extra
           if (more !== undefined && status >= 200 && status < 300) {
@@ -1436,7 +1440,7 @@ export class Engine {
             const echoReq = inBody && !streamed && up.body !== "" && sendBackRaw(h, this.cfg, p, "request")
             const echoResp = inBody && !streamed && sendBackRaw(h, this.cfg, p, "response")
             const rawBody = echoReq || echoResp ? withRawFields(tr.body, echoReq ? up.body : undefined, echoResp ? text : undefined) : tr.body
-            return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model), served: tr.served ?? "" }
+            return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), served: tr.served ?? "" }
           } catch (e) {
             last = { ok: false, status: 502, body: errorJson(`could not read ${ref.provider}'s response: ${e.message}`, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
             break
@@ -2681,12 +2685,19 @@ test("finishes sees a non-null finish_reason only", () => {
 })
 
 test("per-provider limiters follow concurrency_and_buffer_size and carry over unchanged", () => {
+  const off: Map<string, ProviderConfig> = new Map()
+  off.set("plain", {})
+  expect(limitersFor({ providers: off, client: { drop_excess_requests: true } }).size).toBe(1)
+  expect(limitersFor({ providers: off }).size).toBe(0)
   const ps: Map<string, ProviderConfig> = new Map()
   ps.set("slow", { concurrency_and_buffer_size: { concurrency: 2, buffer_size: 4 } })
   ps.set("plain", {})
   const cfg: Config = { providers: ps, client: { drop_excess_requests: true } }
   const made = limitersFor(cfg)
-  expect(made.size).toBe(1)
+  // with drop on, the provider without a queue gets Bifrost's default one
+  expect(made.size).toBe(2)
+  expect(made.get("plain")!.limit).toBe(1000)
+  expect(made.get("plain")!.buffer).toBe(5000)
   expect(made.get("slow")!.limit).toBe(2)
   expect(made.get("slow")!.buffer).toBe(4)
   expect(made.get("slow")!.drop).toBe(true)

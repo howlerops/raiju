@@ -1,11 +1,12 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, PluginSpec } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec } from "./config"
 import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page } from "./logapi"
 import { WsTickets } from "./wsticket"
 import { entryStatus, PluginEntry } from "./plugins"
 import { parseDatasheet } from "./pricing"
+import { deliveryLog } from "./webhooks"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { Engine } from "./gateway"
@@ -532,6 +533,7 @@ export class Ops {
 
   // Applies the parts of a (resolved) config that live here.
   configure(cfg: Config): void {
+    deliveryLog().setRetentionDays(cfg.client?.webhook_config?.delivery_history_retention_days)
     const gov = cfg.governance
     const users: UserConfig[] = gov?.users ?? []
     const auth = gov?.auth_config
@@ -1182,7 +1184,7 @@ export class Ops {
       if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
       const valid = bearer !== "" && this.sessions.get(bearer, now) !== undefined
       const enforced = this.store.cfg.client?.enforce_auth_on_inference ?? false
-      return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: false, setup_token_configured: false }))
+      return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: !this.authOn, setup_token_configured: resolveEnv(this.store.cfg.setup_token ?? "") !== "" }))
     }
     if (path === "/api/session/login") {
       if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
@@ -2035,6 +2037,8 @@ export class Ops {
 
   // Whether the caller may use this /api route; the actor names them in the audit log.
   gate(req: Request, path: string): Gate {
+    // client.whitelisted_routes: these exact paths skip authentication (Bifrost)
+    if ((this.store.cfg.client?.whitelisted_routes ?? []).includes(path)) return { kind: "ok", actor: "anonymous" }
     const pg = this.proxyGate(req, path)
     if (pg !== undefined) return pg
     const auth = req.headers.get("authorization") ?? ""
@@ -2151,7 +2155,12 @@ export class Ops {
   }
 
   // /api/users*: the reply, after saving any change through the config store.
-  users(method: string, path: string, body: string): Reply {
+  users(method: string, path: string, body: string, setupToken: string): Reply {
+    // Bifrost's setup gate: while no admin exists, the first account needs the operator's setup_token
+    const want = resolveEnv(this.store.cfg.setup_token ?? "")
+    if (method === "POST" && !this.authOn && want !== "" && setupToken !== want) {
+      return { status: 403, body: errorJson("the setup token is required to create the first admin account", "invalid_request_error", undefined), contentType: "application/json" }
+    }
     // only stored users are managed here; legacy auth_config credentials stay in the config
     const stored: UserConfig[] = this.store.cfg.governance?.users ?? []
     const r = handleUsers({ users: stored, roles: this.store.cfg.governance?.roles ?? [] }, method, path, body)

@@ -273,7 +273,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
-  if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body)
+  if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body, req.headers.get("x-bifrost-setup-token") ?? "")
   else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
   // the cache clears (DELETE) and the read-only plugin listings
   else if (path.startsWith("/api/cache/")) r = ops.cacheClear(req.method, path)
@@ -404,7 +404,28 @@ async function cors(cfg: Config, req: Request, res: Response): Promise<Response>
   return new Response(res.status === 204 ? undefined : bytes, { status: res.status, headers: h })
 }
 
-export type ServeOptions = { port: int, hostname: string, workers: int }
+export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int }
+
+// Bun.serve has no body limit of its own, so client.max_request_body_size_mb is checked here:
+// a declared length over the limit is refused unread, and a body with no length is read once
+// and refused when it is over. undefined means refused; otherwise the request to dispatch
+// (rebuilt around its bytes when they were read here).
+export async function limitedBody(req: Request, maxBytes: int): Promise<Request | undefined> {
+  if (req.method === "GET" || req.method === "HEAD") return req
+  const declared = req.headers.get("content-length")
+  if (declared !== undefined) {
+    const n = parseFloat(declared) ?? 0.0
+    return n > maxBytes ? undefined : req
+  }
+  let body: u8[] = []
+  try {
+    body = await req.bytes()
+  } catch (e) {
+    body = []
+  }
+  if (body.length > maxBytes) return undefined
+  return new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body })
+}
 
 function textResponse(body: string, contentType: string): Response {
   const h: Record<string, string> = new Map()
@@ -801,6 +822,23 @@ export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: () 
   return true
 }
 
+// One HTTP request on the Bun.serve server: the body limit, then the streamed or whole route.
+async function bunHttp(engine: Engine, ops: Ops, req0: Request, limit: int): Promise<Response, TypeError> {
+  const within = try await limitedBody(req0, limit)
+  if (within === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
+  const req = within
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  const cp = compatPath(p)
+  const t0 = performance.now()
+  const reqBytes = parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0
+  // an x-bf-async request runs as a job through dispatch, not as a stream
+  const asyncReq = (req.headers.get("x-bf-async") ?? "") !== ""
+  const kind = req.method === "POST" && !asyncReq ? streamKind(cp) : ""
+  if (kind !== "") return try await timed(p, req.method, t0, reqBytes, chatStreamed(engine, req, kind))
+  return try await timed(p, req.method, t0, reqBytes, dispatch(engine, ops, req))
+}
+
 // The Bun.serve server (the default): streamed chat answers, Tov's multi-process workers,
 // native WebSockets.
 export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
@@ -808,23 +846,14 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
     port: opts.port,
     hostname: opts.hostname,
     workers: opts.workers,
-    fetch(req, server) {
-      const wu = wsUpgrade(engine, ops, req)
+    fetch(req0, server) {
+      const wu = wsUpgrade(engine, ops, req0)
       if (wu.kind === "refused") return errorResponse(wu.status, wu.message, "invalid_request_error", noHeaders())
       if (wu.kind === "session") {
-        if (server.upgrade(req, { data: wu.session })) return
+        if (server.upgrade(req0, { data: wu.session })) return
         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
       }
-      const u = URL.parse(req.url)
-      const p = u === undefined ? "" : u.pathname
-      const cp = compatPath(p)
-      const t0 = performance.now()
-      const reqBytes = parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0
-      // an x-bf-async request runs as a job through dispatch, not as a stream
-      const asyncReq = (req.headers.get("x-bf-async") ?? "") !== ""
-      const kind = req.method === "POST" && !asyncReq ? streamKind(cp) : ""
-      if (kind !== "") return timed(p, req.method, t0, reqBytes, chatStreamed(engine, req, kind))
-      return timed(p, req.method, t0, reqBytes, dispatch(engine, ops, req))
+      return bunHttp(engine, ops, req0, opts.maxBodyBytes ?? 100 * 1048576)
     },
     websocket: {
       open: (ws) => {

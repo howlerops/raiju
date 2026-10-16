@@ -344,7 +344,7 @@ def write_config():
                                 "guardrail_providers": [{"id": 1, "provider_name": "webhook", "policy_name": "hook", "enabled": True, "config": {"url": MOCK + "/guard-hook"}}]},
           "plugins": [{"name": "semantic_cache", "enabled": True, "config": {"provider": "openai", "embedding_model": "text-embedding-3-small", "threshold": 0.95, "ttl": "5m", "vector_store_namespace": "e2e-ns"}}],
           "vector_store": {"enabled": True, "type": "qdrant", "config": {"host": "127.0.0.1", "rest_port": 18089}},
-          "server": {"port": 1}}
+          "large_payload_optimization": {"request_threshold_bytes": 1048576}}
     json.dump(bf, open(os.path.join(BUILD, "e2e.bifrost.json"), "w"))
     # the owner switches: refuse_unpriced_models and scope_by_virtual_key on one gateway, both off on the other
     for name, on in [("owner", True), ("owner-off", False)]:
@@ -1638,6 +1638,99 @@ def l97c_e2e(env):
         gw.wait()
 
 
+GW_L97G = "http://127.0.0.1:18142"  # client limits and header filters, setup_token, batch keys, alias depth (no admin login)
+GW_L97G_AUTH = "http://127.0.0.1:18143"  # the same mock upstream, with admin login on and a whitelisted route
+
+
+def l97g_config(auth: bool) -> dict:
+    """The L97g gateways: the mock as the OpenAI upstream; one provider with an unflagged key, one with an alias chain."""
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 1},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "l97", "value": "sk-l97g", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "plain": {"keys": [{"name": "unflagged", "value": "sk-l97g-plain", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "chainp": {"keys": [{"name": "chain", "value": "sk-l97g-chain", "models": [], "weight": 1.0, "aliases": {"c1": "c2", "c2": "gpt-4o-mini"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+    if auth:
+        cfg["client"] = {"enable_logging": False, "enforce_auth_on_inference": False, "whitelisted_routes": ["/api/alerts"],
+                         "header_filter_config": {"allowlist": ["x-team"]}}
+        cfg["governance"] = {"auth_config": {"username": "root", "password": "l97g-admin"}}
+    else:
+        cfg["client"]["header_filter_config"] = {"denylist": ["x-team"]}
+        cfg["setup_token"] = "l97g-setup"
+        cfg["client"]["routing_chain_max_depth"] = 1
+    return cfg
+
+
+def chunked_post(port: int, path: str, total: int) -> int | None:
+    """A POST with no Content-Length, streamed in 64 KB chunks; the status it got back (None when the connection was cut first)."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.putrequest("POST", path)
+    conn.putheader("content-type", "application/json")
+    conn.putheader("transfer-encoding", "chunked")
+    conn.endheaders()
+    chunk = b"x" * 65536
+    try:
+        for _ in range(total // 65536 + 1):
+            conn.send(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+        conn.send(b"0\r\n\r\n")
+    except OSError:
+        pass
+    try:
+        return conn.getresponse().status
+    except Exception:
+        return None
+
+
+def l97g_e2e(env):
+    """client.max_request_body_size_mb on the default server (declared and chunked bodies), header_filter_config,
+    setup_token, use_for_batch_api, routing_chain_max_depth, and whitelisted_routes with admin login on."""
+    cfg_a = os.path.join(BUILD, "e2e.l97g.json")
+    cfg_b = os.path.join(BUILD, "e2e.l97g-auth.json")
+    json.dump(l97g_config(False), open(cfg_a, "w"))
+    json.dump(l97g_config(True), open(cfg_b, "w"))
+    gw_a = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18142", "-host", "127.0.0.1", "-config", cfg_a, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97g.log"), "w"))
+    gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18143", "-host", "127.0.0.1", "-config", cfg_b, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97g-auth.log"), "w"))
+    try:
+        wait(GW_L97G + "/api/session/is-auth-enabled")
+        wait(GW_L97G_AUTH + "/api/session/is-auth-enabled")
+        chat_body = lambda model, n: json.dumps({"model": model, "messages": [{"role": "user", "content": "x" * n}]})
+        s, _, b = call("POST", "/v1/chat/completions", chat_body("openai/gpt-4o-mini", 1100000), base=GW_L97G, auth=False)
+        check("a declared body over max_request_body_size_mb is refused with 413", s == 413, (s, b[:200]))
+        st = chunked_post(18142, "/v1/chat/completions", 2 * 1048576)
+        check("a chunked body over max_request_body_size_mb is refused with 413", st == 413, st)
+        s, _, b = call("POST", "/v1/chat/completions", chat_body("openai/gpt-4o-mini", 100), base=GW_L97G, auth=False)
+        check("a body under the limit still reaches the provider", s == 200, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, {"x-bf-eh-x-team": "alpha"}, base=GW_L97G, auth=False)
+        check("header_filter_config denylist keeps x-bf-eh-x-team from the provider", s == 200 and seen()[-1]["team"] == "", (s, seen()[-1:]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, {"x-team": "direct"}, base=GW_L97G_AUTH, auth=False)
+        check("header_filter_config allowlist forwards a listed plain header as it is", s == 200 and seen()[-1]["team"] == "direct", (s, seen()[-1:]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "chainp/c1", "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97G, auth=False)
+        check("routing_chain_max_depth 1 refuses a two-hop alias chain", s == 404 and "no provider is configured" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "chainp/c2", "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97G, auth=False)
+        check("routing_chain_max_depth 1 still serves a one-hop alias", s == 200, (s, b[:200]))
+        s, _, b = call("POST", "/genai/upload/v1beta/files", {"file": {"displayName": "x"}}, {"x-goog-upload-protocol": "resumable", "x-goog-upload-command": "start", "x-goog-upload-header-content-length": "5", "x-goog-upload-header-content-type": "application/jsonl", "x-model-provider": "plain"}, base=GW_L97G, auth=False)
+        check("a provider whose keys are not use_for_batch_api serves no file uploads", s == 404, (s, b[:200]))
+        s, _, b = call("GET", "/api/session/is-auth-enabled", None, None, base=GW_L97G, auth=False)
+        st_json = json.loads(b)
+        check("setup_token is reported as configured, with setup required", st_json.get("setup_token_configured") is True and st_json.get("setup_required") is True, b[:300])
+        s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, None, base=GW_L97G, auth=False)
+        check("the first admin account needs the setup token", s == 403 and "setup token" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"x-bifrost-setup-token": "l97g-setup"}, base=GW_L97G, auth=False)
+        check("the first admin account is created with the setup token", s != 403, (s, b[:200]))
+        s, _, b = call("GET", "/api/providers", None, None, base=GW_L97G_AUTH, auth=False)
+        check("with admin login on, a provider list needs a login", s == 401, (s, b[:200]))
+        s, _, b = call("GET", "/api/alerts", None, None, base=GW_L97G_AUTH, auth=False)
+        check("a whitelisted route answers without a login", s == 200, (s, b[:200]))
+    finally:
+        gw_a.terminate()
+        gw_b.terminate()
+
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -1721,10 +1814,25 @@ def headers_e2e(env):
     finally:
         gw.terminate()
 
+
+def flag_batch_keys(path):
+    """Keys serve files and batches only with use_for_batch_api (Bifrost's rule); the fixtures flag every key,
+    and the checks that need an unflagged key build their own."""
+    cfg = json.load(open(path))
+    for p in (cfg.get("providers") or {}).values():
+        for k in p.get("keys") or []:
+            k.setdefault("use_for_batch_api", True)
+    json.dump(cfg, open(path, "w"))
+
+
+
 def main():
     unique_ports()
     build()
     config = write_config()
+    for name in sorted(os.listdir(BUILD)):
+        if name.startswith("e2e") and name.endswith(".json"):
+            flag_batch_keys(os.path.join(BUILD, name))
     import shutil
     shutil.rmtree(os.path.join(ROOT, "build/e2e-logs"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-audit"), ignore_errors=True)
@@ -3241,7 +3349,7 @@ def main():
         _, d2, _ = ochat(OFF, "openai/gpt-4o-mini", "sk-bf-owner-a", "owner cache check")
         check("with scope_by_virtual_key off the other key hits the shared entry", hl(d1).get("x-bf-cache") != "hit" and hl(d2).get("x-bf-cache") == "hit", (d1, d2))
         log = open(os.path.join(BUILD, "e2e.bifrost.log")).read()
-        check("unknown config keys are reported at startup", 'config: "server" is not used' in log, log[:600])
+        check("unknown config keys are reported at startup", 'config: "large_payload_optimization" is not implemented' in log, log[:600])
 
         # Bifrost's x-bifrost-* response headers
         _, h, _ = chat("openai/gpt-4o-mini", seed=1400, headers={"x-bf-mcp-include-clients": "none"})
@@ -3453,7 +3561,7 @@ def main():
         s, _, b = call("POST", "/v1/chat/completions", msg("labels-1"), {**VK, "x-bf-dim-env": "prod"}, base=GW_D)
         _, _, m = call("GET", "/metrics", base=GW_D)
         check("prometheus_labels are filled from x-bf-dim headers", s == 200 and _re.search(r'bifrost_upstream_requests_total\{[^}]*env="prod",team=""\}', m) is not None, m[:400])
-        check("drop_excess_requests logs that it has no effect", "drop_excess_requests has no effect" in open(os.path.join(BUILD, "e2e.direct.log")).read(), "")
+        check("drop_excess_requests no longer logs that it has no effect (providers get the default queue)", "drop_excess_requests has no effect" not in open(os.path.join(BUILD, "e2e.direct.log")).read(), "")
 
         # ---- provider passthroughs (passthrough.tov) ----
         s, ph, b = call("POST", "/openai_passthrough/pt/echo?x=1", {"a": 1}, headers={"authorization": "Bearer caller-key", "x-bf-vk": "sk-bf-nope", "anthropic-beta": "beta-1"})
@@ -3699,7 +3807,7 @@ def main():
 
         # Bifrost keys with no Raiju counterpart are named at startup, not dropped silently
         blog = open(os.path.join(BUILD, "e2e.bifrost.log")).read()
-        check("Bifrost sections Raiju does not use are noted at startup", 'config: "server" is not used' in blog, blog[:300])
+        check("Bifrost sections Raiju does not use are noted at startup", 'config: "large_payload_optimization" is not implemented' in blog, blog[:300])
 
         # ---- L80: per-provider queue, injected tools, path overrides, allowed requests, disable_store, raw storage ----
         GW_L = "http://127.0.0.1:18101"
@@ -3846,6 +3954,8 @@ def main():
         mcp_keys_e2e(env)
         # the request log in Bifrost's shapes, User-Agent mappings, cache clears, audit by id, tickets and plugin listings: its own gateway
         l97c_e2e(env)
+        # client limits, header filters, setup_token, batch keys and alias depth: their own gateways
+        l97g_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

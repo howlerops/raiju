@@ -2,6 +2,7 @@
 import { Field, fields, elements, find, quote, rawStr, isNull, build } from "../json"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, Message, ContentPart, newId, nowSeconds } from "../schemas"
+import { ProviderPromptCacheConfig } from "../config"
 import { fromChat, anthropicThinking, anthropicReasoning } from "../reasoning"
 
 const DEFAULT_MAX_TOKENS = 4096
@@ -103,20 +104,60 @@ function toolChoiceJson(raw: string): string | undefined throws SyntaxError {
   return undefined
 }
 
+// The cache_control value of a breakpoint: Anthropic's default lifetime (5 minutes), or 1 hour
+// when the provider's prompt_cache.ttl says "1h".
+function cacheMarker(ttl: string | undefined): string {
+  return ttl === "1h" ? `{"type":"ephemeral","ttl":"1h"}` : `{"type":"ephemeral"}`
+}
+
 // Adds cache_control to a raw content block.
-function cached(block: string): string {
-  return block.slice(0, block.byteLength - 1) + `,"cache_control":{"type":"ephemeral"}}`
+function cached(block: string, marker: string): string {
+  return block.slice(0, block.byteLength - 1) + `,"cache_control":${marker}}`
+}
+
+// The message positions a prompt_cache.cache_control_injection_points entry names (Bifrost):
+// a "message" point matches by role, by index (negative counts from the end), or both.
+// Nothing is injected into a request that already carries cache_control of its own.
+function injectedIndexes(messages: Message[], points: { location?: string, role?: string, index?: int }[], on: bool): Set<int> {
+  const out: Set<int> = new Set()
+  if (!on) return out
+  const n = messages.length
+  for (const pt of points) {
+    if (pt.location !== undefined && pt.location !== "message") continue
+    const hasRole = pt.role !== undefined && pt.role !== ""
+    const hasIdx = pt.index !== undefined
+    if (!hasRole && !hasIdx) continue
+    const want = pt.index === undefined ? -1 : (pt.index < 0 ? n + pt.index : pt.index)
+    for (let i = 0; i < n; i++) {
+      if (hasRole && messages[i]!.role !== pt.role) continue
+      if (hasIdx && i !== want) continue
+      out.add(i)
+    }
+  }
+  return out
 }
 
 // autoCache marks the system prompt and the newest turn as cache breakpoints,
-// so repeated prefixes (agents, long chats) are billed at cache-read rates.
-export function messagesBody(req: ChatRequest, body: Field[], model: string, stream: bool, autoCache: bool): string throws SyntaxError {
+// so repeated prefixes (agents, long chats) are billed at cache-read rates. cache (the
+// provider's prompt_cache) sets the lifetime and adds the injection points.
+export function messagesBody(req: ChatRequest, body: Field[], model: string, stream: bool, autoCache: bool, cache?: ProviderPromptCacheConfig): string throws SyntaxError {
+  const marker = cacheMarker(cache?.ttl)
+  const selfCached = (find(body, "messages") ?? "").includes("cache_control")
+  const marked = injectedIndexes(req.messages, cache?.cache_control_injection_points ?? [], !selfCached)
+  let sysMarked = false
   let turns: Turn[] = []
+  let idx = -1
   for (const m of req.messages) {
-    if (m.role === "system" || m.role === "developer") continue
+    idx += 1
+    if (m.role === "system" || m.role === "developer") {
+      if (marked.has(idx)) sysMarked = true
+      continue
+    }
     if (m.role === "tool") {
       const text = m.content === undefined ? "" : (typeof m.content === "string" ? m.content : m.content.map((p) => p.text ?? "").join(""))
-      pushTurn(&turns, "user", [`{"type":"tool_result","tool_use_id":${quote(m.tool_call_id ?? "")},"content":${quote(text)}}`])
+      let tr = `{"type":"tool_result","tool_use_id":${quote(m.tool_call_id ?? "")},"content":${quote(text)}}`
+      if (marked.has(idx)) tr = cached(tr, marker)
+      pushTurn(&turns, "user", [tr])
       continue
     }
     const role = m.role === "assistant" ? "assistant" : "user"
@@ -127,18 +168,19 @@ export function messagesBody(req: ChatRequest, body: Field[], model: string, str
         blocks.push(`{"type":"tool_use","id":${quote(c.id)},"name":${quote(c.function.name)},"input":${argumentsObject(c.function.arguments)}}`)
       }
     }
+    if (marked.has(idx) && blocks.length > 0) blocks[blocks.length - 1] = cached(blocks[blocks.length - 1]!, marker)
     pushTurn(&turns, role, blocks)
   }
   if (autoCache && turns.length > 0) {
     const last = turns[turns.length - 1]!
     const blocks = last.blocks.slice()
-    blocks[blocks.length - 1] = cached(blocks[blocks.length - 1]!)
+    blocks[blocks.length - 1] = cached(blocks[blocks.length - 1]!, marker)
     turns[turns.length - 1] = { role: last.role, blocks: blocks }
   }
   const parts: string[] = [`"model":${quote(model)}`]
   const sys = systemText(req.messages)
   if (sys !== "") {
-    if (autoCache) parts.push(`"system":[${cached(`{"type":"text","text":${quote(sys)}}`)}]`)
+    if (autoCache || sysMarked) parts.push(`"system":[${cached(`{"type":"text","text":${quote(sys)}}`, marker)}]`)
     else parts.push(`"system":${quote(sys)}`)
   }
   parts.push(`"messages":[${turns.map((t) => `{"role":"${t.role}","content":[${t.blocks.join(",")}]}`).join(",")}]`)
@@ -182,11 +224,11 @@ export function upstreamHeaders(t: Target): Map<string, string> {
 }
 
 export function chatRequest(t: Target, req: ChatRequest, body: Field[], autoCache: bool): Upstream throws SyntaxError {
-  return { url: apiBase(t) + "/v1/messages", headers: upstreamHeaders(t), body: try messagesBody(req, body, t.model, false, autoCache) }
+  return { url: apiBase(t) + "/v1/messages", headers: upstreamHeaders(t), body: try messagesBody(req, body, t.model, false, autoCache, t.cfg.prompt_cache) }
 }
 
 export function streamRequest(t: Target, req: ChatRequest, body: Field[], autoCache: bool): Upstream throws SyntaxError {
-  return { url: apiBase(t) + "/v1/messages", headers: upstreamHeaders(t), body: try messagesBody(req, body, t.model, true, autoCache) }
+  return { url: apiBase(t) + "/v1/messages", headers: upstreamHeaders(t), body: try messagesBody(req, body, t.model, true, autoCache, t.cfg.prompt_cache) }
 }
 
 // Native passthrough for /anthropic/v1/messages: only the model changes.
@@ -300,6 +342,22 @@ test("translates an OpenAI chat request", () => {
   expect(out.includes(`"tool_choice":{"type":"any"}`)).toBe(true)
   expect(out.includes(`"max_tokens":4096`)).toBe(true)
   expect(out.includes(`"stop_sequences":["END"]`)).toBe(true)
+})
+
+test("prompt cache injection points mark messages, with the 1h lifetime", () => {
+  const raw = `{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"}]}`
+  const cache: ProviderPromptCacheConfig = { ttl: "1h", cache_control_injection_points: [{ location: "message", role: "assistant" }, { location: "message", index: -1 }] }
+  const out = try messagesBody(try JSON.parse(raw) as ChatRequest, try fields(raw), "m", false, false, cache)
+  expect(out.includes(`{"type":"text","text":"b","cache_control":{"type":"ephemeral","ttl":"1h"}}`)).toBe(true)
+  expect(out.includes(`{"type":"text","text":"c","cache_control":{"type":"ephemeral","ttl":"1h"}}`)).toBe(true)
+  expect(out.includes(`"text":"a","cache_control"`)).toBe(false)
+  expect(out.includes(`"system":"rules"`)).toBe(true)
+  const sys = try messagesBody(try JSON.parse(raw) as ChatRequest, try fields(raw), "m", false, false, { cache_control_injection_points: [{ role: "system" }] })
+  expect(sys.includes(`"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]`)).toBe(true)
+  // a request that carries its own cache_control gets no injected marker (its own blocks are not carried over here)
+  const own = `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}]}`
+  const kept = try messagesBody(try JSON.parse(own) as ChatRequest, try fields(own), "m", false, false, { cache_control_injection_points: [{ role: "user" }] })
+  expect(kept.includes(`"content":[{"type":"text","text":"x"}]}]`)).toBe(true)
 })
 
 test("auto prompt caching marks system and the newest turn", () => {
