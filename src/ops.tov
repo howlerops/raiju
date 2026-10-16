@@ -17,10 +17,11 @@ import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_C
 import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
-import { CircuitPolicyConfig, VirtualKeyConfig } from "./config"
+import { AccessProfile, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
+import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin, sweepExpiredKeys, RESOURCES, OPERATIONS } from "./store"
-import { keyBudgetIds, permissionDocs, permissionIds } from "./govapi"
+import { keyBudgetIds, permissionDocs, permissionIds, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
 type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
@@ -1375,6 +1376,57 @@ export class Ops {
     return { status: 200, body: `{"circuits":{${parts.join(",")}}}`, contentType: "application/json" }
   }
 
+  // GET /api/adaptive-routing/held-keys: the keys (provider#key targets) held out of rotation by an open
+  // circuit, with when each was held and when it next gets a check. Raiju holds a key for its breaker's
+  // cooldown; it does not classify the provider's refusal, so there is no reason or wait ladder.
+  adaptiveHeldKeys(): Reply {
+    const rows: string[] = []
+    for (const c of this.engine.health.openCircuits(Date.now())) {
+      if (c.id.indexOf("#") < 0) continue
+      rows.push(JSON.stringify({ target: c.id, state: c.state, held_since: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    }
+    return { status: 200, body: `{"held_keys":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
+  }
+
+  // GET /api/adaptive-routing/incidents: the circuits open now (keys, policies, and a policy's key
+  // sub-circuits), each with when it opened. Resolved incidents are not kept.
+  adaptiveIncidents(): Reply {
+    const rows: string[] = []
+    for (const c of this.engine.health.openCircuits(Date.now())) {
+      const kind = c.id.indexOf("#") >= 0 ? "key" : c.id.indexOf("/") >= 0 ? "policy_key" : "policy"
+      const status = c.state === "half_open" ? "Recovering" : "Needs attention"
+      rows.push(JSON.stringify({ target: c.id, kind: kind, status: status, opened_at: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    }
+    return { status: 200, body: `{"incidents":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
+  }
+
+  // POST /api/adaptive-routing/conditions/clear: releases the held keys named by {"keys": [...]} (target
+  // ids as the held-keys view lists them), or every circuit with no body or {"all": true}. count is how
+  // many circuits were closed.
+  adaptiveRelease(body: string): Reply {
+    const h = this.engine.health
+    let all = body.trim() === ""
+    let ids: string[] = []
+    if (!all) {
+      try {
+        const req = JSON.parse(body) as { keys?: string[], all?: bool }
+        if (req.all === true) all = true
+        ids = req.keys ?? []
+      } catch (e) {
+        return badRequest("the body must be a JSON object")
+      }
+    }
+    if (all) return okJson(JSON.stringify({ message: "held keys released", count: h.resetAll() }))
+    // only circuits that are open now count as released
+    const open: string[] = []
+    for (const c of h.openCircuits(Date.now())) open.push(c.id)
+    let n = 0
+    for (const id of ids) {
+      if (open.includes(id) && h.reset(id)) n += 1
+    }
+    return okJson(JSON.stringify({ message: "held keys released", count: n }))
+  }
+
   // POST /api/circuit-breaker/reset: closes one circuit now, by its id (a target id as the state
   // view lists it, or a policy name), or every circuit with {"all": true}. The cooldown is dropped.
   circuitReset(body: string): Reply {
@@ -2202,13 +2254,23 @@ export class Ops {
   // The data scope of the actor a gate named. A stored user's custom role decides it; anyone else (the
   // legacy admin, and sign-in and proxy identities, which hold built-in roles) sees all data.
   scopeOfActor(actor: string): DataScope {
+    return this.scopeOfActorFor(actor, "")
+  }
+
+  // The same for one resource: the role's entity_dac entry for it (Bifrost's per-resource override) wins
+  // over the role's dac.
+  scopeOfActorFor(actor: string, resource: string): DataScope {
     const name = actor.startsWith("proxy:") ? actor.slice(6) : actor
     const gov = this.store.cfg.governance
     for (const u of gov?.users ?? []) {
       if (u.name !== name) continue
       const r = customRole(gov?.roles, u.role)
       if (r === undefined) return allScope()
-      return scopeOf(gov ?? {}, u, r.dac ?? "all-data")
+      let dac = r.dac ?? "all-data"
+      for (const e of r.entity_dac ?? []) {
+        if (e.resource === resource) dac = e.dac
+      }
+      return scopeOf(gov ?? {}, u, dac)
     }
     return allScope()
   }
@@ -2342,7 +2404,9 @@ export class Ops {
     const ip = req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip") ?? undefined
     const detail = maskDetail(body)
     try {
-      log.record(actor, a.action, a.target, m, path, status, ip, detail === "" ? undefined : detail, Date.now())
+      // omit_ip_addresses: the event keeps no client address
+      const kept = this.store.cfg.audit?.omit_ip_addresses === true ? undefined : ip
+      log.record(actor, a.action, a.target, m, path, status, kept, detail === "" ? undefined : detail, Date.now())
     } catch (e) {
       console.error(`raiju: audit write failed: ${e.message}`)
     }
@@ -2384,7 +2448,70 @@ export class Ops {
     setInterval(() => {
       const done = sweepExpiredKeys(this.store, Date.now())
       if (done.length > 0) console.error(`raiju: deleted ${done.length} expired virtual key${done.length === 1 ? "" : "s"}`)
+      this.auditRetention()
     }, 3600000)
+    // the audit archive copies each closed window every archive interval (five minutes at least)
+    const every = Math.max(300, this.store.cfg.audit?.archive?.interval_seconds ?? 3600) * 1000
+    setInterval(() => {
+      this.auditArchive()
+    }, every)
+  }
+
+  // Retention: deletes the audit events older than audit.retention_days (AuditLog.pruneBefore).
+  auditRetention(): void {
+    const days = this.store.cfg.audit?.retention_days ?? 0
+    const log = this.audit
+    if (log === undefined || days <= 0) return
+    try {
+      const n = log.pruneBefore(Date.now() - days * 86400000)
+      if (n > 0) console.error(`raiju: audit retention removed ${n} event${n === 1 ? "" : "s"}`)
+    } catch (e) {
+      console.error(`raiju: audit retention failed: ${e.message}`)
+    }
+  }
+
+  // The archive copy: the events in each window that has closed (archive_grace_seconds before now) since
+  // the last copy go to object storage as one JSONL object. The first run only sets the mark, so events
+  // written before archiving was turned on are not copied. Rows are never deleted here.
+  async auditArchive(): Promise<void> {
+    const log = this.audit
+    const ac = this.store.cfg.audit?.archive
+    if (log === undefined || ac === undefined || !ac.enabled) return
+    try {
+      const now = Date.now()
+      const mark = log.archiveMark()
+      if (mark === undefined) {
+        log.setArchiveMark({ seq: log.lastSequence(), until: now })
+        return
+      }
+      const grace = this.store.cfg.audit?.archive_grace_seconds ?? 900
+      const end = now - grace * 1000
+      if (end <= mark.until) return
+      const w = log.exportWindow(mark.seq, end)
+      if (w.count === 0) {
+        log.setArchiveMark({ seq: mark.seq, until: end })
+        return
+      }
+      const ec: LogExportsConfig = {
+        enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix ?? "audit", region: ac.region, endpoint: ac.endpoint,
+        access_key_id: ac.access_key_id, secret_access_key: ac.secret_access_key, session_token: ac.session_token,
+        interval_seconds: ac.interval_seconds, path_style: ac.path_style, format: ac.format, retention_days: ac.retention_days,
+      }
+      const put = putRequest(ec, objectKey(ec, mark.until, end, this.nodeId, "jsonl"), w.body, now)
+      const hs: Record<string, string> = put.headers
+      const dl = deadline(30000)
+      try {
+        const r = await fetch(put.url, { method: "PUT", headers: hs, body: put.body, signal: dl.controller.signal })
+        await r.text()
+        if (r.status >= 200 && r.status < 300) log.setArchiveMark({ seq: w.last, until: end })
+        else console.error(`raiju: audit archive: HTTP ${r.status} from ${put.url}`)
+      } catch (e) {
+        console.error(`raiju: audit archive: ${e.message}`)
+      }
+      dl.finish()
+    } catch (e) {
+      console.error(`raiju: audit archive failed: ${e.message}`)
+    }
   }
 
   // /api/users/me/permissions: the caller's custom role as (resource, operation) pairs with their ids.
@@ -2400,6 +2527,62 @@ export class Ops {
     const ids = permissionIds(RESOURCES, OPERATIONS, pairs)
     const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
     return { status: 200, body: JSON.stringify({ user: actor, role: role, built_in: custom === undefined, permissions: docs }), contentType: "application/json" }
+  }
+
+  // POST /api/governance/access-profiles/{id}/propagate ({"fields": [...]}; all of them when unset): the
+  // profile's chosen fields go onto every virtual key that holds it (propagateProfileKeys).
+  propagateProfile(id: string, body: string): Reply {
+    const g = this.store.cfg.governance
+    let prof: AccessProfile | undefined = undefined
+    for (const x of g?.access_profiles ?? []) {
+      if (x.id === id) prof = x
+    }
+    if (prof === undefined) return { status: 404, body: errorJson(`no access profile ${id}`, "invalid_request_error", undefined), contentType: "application/json" }
+    let chosen: string[] = PROPAGATED_FIELDS
+    if (body.trim() !== "") {
+      try {
+        const req = JSON.parse(body) as { fields?: string[] }
+        if (req.fields !== undefined) chosen = req.fields
+      } catch (e) {
+        return { status: 400, body: errorJson("body must be a JSON object", "invalid_request_error", undefined), contentType: "application/json" }
+      }
+    }
+    for (const f of chosen) {
+      if (!PROPAGATED_FIELDS.includes(f)) return { status: 400, body: errorJson(`unknown field ${f}; use ${PROPAGATED_FIELDS.join(", ")}`, "invalid_request_error", undefined), contentType: "application/json" }
+    }
+    const r = propagateProfileKeys(g?.virtual_keys ?? [], prof, chosen)
+    const saved = this.store.replaceVirtualKeys(r.vks)
+    if (saved.kind === "error") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
+    return { status: 200, body: JSON.stringify({ access_profile_id: id, updated: r.updated, fields: chosen }), contentType: "application/json" }
+  }
+
+  // GET /api/users/me/vk-creation-policy: the access profile that governs keys the caller creates.
+  vkCreationPolicy(actor: string): Reply {
+    const g = this.store.cfg.governance
+    return { status: 200, body: creationPolicy(g?.users, g?.access_profiles, actor), contentType: "application/json" }
+  }
+
+  // /api/users/{name}/access-profiles: GET lists the profiles the user holds; PUT and DELETE
+  // .../{profile_id} add and remove one; PUT and DELETE .../{profile_id}/virtual-keys/{vk_id} link
+  // the profile to one of the user's virtual keys.
+  userProfiles(method: string, path: string): Reply {
+    const segs = path.split("/").filter((s) => s !== "")
+    const name = segs[2] ?? ""
+    const pid = segs[4] ?? ""
+    const notFound: Reply = { status: 404, body: errorJson(`no route for ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
+    if (segs.length < 4 || segs.length > 7 || segs[3] !== "access-profiles") return notFound
+    const g = this.store.cfg.governance
+    if (segs.length === 4) {
+      if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+      const held = heldProfiles(g?.users, g?.access_profiles, name)
+      return { status: 200, body: JSON.stringify({ access_profiles: held }), contentType: "application/json" }
+    }
+    const add = method === "PUT"
+    if (method !== "PUT" && method !== "DELETE") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+    const r = segs.length === 5 ? this.store.setUserProfile(name, pid, add) : segs.length === 7 && segs[5] === "virtual-keys" ? this.store.setVkProfile(name, segs[6] ?? "", pid, add) : undefined
+    if (r === undefined) return notFound
+    if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+    return { status: 200, body: JSON.stringify({ user: name, access_profile_id: pid, linked: add }), contentType: "application/json" }
   }
 
   // setupToken is the X-Bifrost-Setup-Token header and setupSession the setup session cookie (POST /api/session/setup).
@@ -2423,6 +2606,8 @@ export class Ops {
   // /api/governance/access-profiles[/{id}]. A profile that keys still use can't be deleted.
   profiles(method: string, path: string, body: string): Reply {
     const gov = this.store.cfg.governance
+    const segs0 = path.split("/").filter((s) => s !== "")
+    if (method === "POST" && segs0.length === 5 && segs0[4] === "propagate") return this.propagateProfile(segs0[3] ?? "", body)
     const r = handleProfiles(gov?.access_profiles ?? [], method, path, body)
     if (method === "GET" || r.status >= 300) return { status: r.status, body: r.body, contentType: "application/json" }
     if (method === "DELETE") {

@@ -9,7 +9,7 @@ import {
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
   ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig, CircuitPolicyConfig,
   WebhookEndpoint, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping, PluginSpec,
-  BudgetOverride, PricingSyncConfig, ComplexitySettings,
+  BudgetOverride, PricingSyncConfig, ComplexitySettings, ProjectMember, MemberShare, EntityDac,
 } from "./config"
 import { RoutingRule, RuleTarget } from "./cel"
 import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom } from "./govapi"
@@ -50,9 +50,13 @@ type ProviderBody = { description?: string, budget?: BudgetBody, budgets?: Budge
 type PricingBody = { name?: string, scope_kind?: string, provider_id?: string, provider_key_id?: string, virtual_key_id?: string, user_id?: string, request_types?: string[], match_type?: string, pattern?: string }
 // Bifrost's projects, business units and custom roles. Projects and business units are written whole
 // (a PUT replaces the record); a role is keyed by its name.
-type ProjectBody = { id?: string, name?: string, description?: string, is_active?: bool, access_rule?: string, accounting_mode?: string, membership_mode?: string, virtual_key_ids?: string[], budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[] }
+type ProjectBody = { id?: string, name?: string, description?: string, is_active?: bool, access_rule?: string, accounting_mode?: string, membership_mode?: string, virtual_key_ids?: string[], budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], split_policy?: string }
+type MemberBody = { members?: { user_id?: string }[] }
+type MemberCapsBody = { budget_shares?: MemberShare[] }
 type BusinessUnitBody = { id?: string, name?: string, budget_id?: string, rate_limit_id?: string, team_ids?: string[], customer_ids?: string[] }
 type RoleBody = { name?: string, description?: string, dac?: string, permissions?: PermissionPair[] }
+// entity_dac arrives as an object and is read by entityDacFrom
+
 
 // The resources a custom role may name, the operations on them, and the data access scopes.
 export const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster"]
@@ -1154,6 +1158,50 @@ export class ConfigStore {
     return this.commit(withGov(this.cfg, g), "users")
   }
 
+  // Adds or removes one access profile a user holds (users API); the profile must exist.
+  setUserProfile(name: string, profileId: string, add: bool): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    if (findById(g.access_profiles, profileId) === undefined) return fail(404, `no access profile ${profileId}`)
+    const users: AdminUserConfig[] = []
+    let found = false
+    for (const u of g.users ?? []) {
+      if (u.name !== name) {
+        users.push(u)
+        continue
+      }
+      found = true
+      let nu = u
+      const held: string[] = (u.access_profile_ids ?? []).filter((id) => id !== profileId)
+      if (add) held.push(profileId)
+      nu.access_profile_ids = held
+      users.push(nu)
+    }
+    if (!found) return fail(404, `no user ${name}`)
+    g.users = users
+    return this.commit(withGov(this.cfg, g), "user-profiles")
+  }
+
+  // Links or unlinks an access profile on a virtual key the user is assigned (users API).
+  setVkProfile(name: string, vkId: string, profileId: string, add: bool): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const vk = findById(g.virtual_keys, vkId)
+    if (vk === undefined || (vk.user_id ?? "") !== name) return fail(404, `no virtual key ${vkId} assigned to user ${name}`)
+    if (findById(g.access_profiles, profileId) === undefined) return fail(404, `no access profile ${profileId}`)
+    let nvk = vk
+    const held: string[] = (vk.access_profile_ids ?? []).filter((id) => id !== profileId)
+    if (add) held.push(profileId)
+    nvk.access_profile_ids = held
+    g.virtual_keys = putById(g.virtual_keys ?? [], nvk)
+    return this.commit(withGov(this.cfg, g), "virtual-key-profiles")
+  }
+
+  // Replaces the virtual keys as a whole (a propagate changes several at once).
+  replaceVirtualKeys(vks: VirtualKeyConfig[]): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    g.virtual_keys = vks
+    return this.commit(withGov(this.cfg, g), "propagate")
+  }
+
   // Replaces the global proxy (Bifrost's proxy_config); see proxyRoute.
   setProxy(px: GlobalProxyConfig | undefined): Result {
     let n: Config = this.cfg
@@ -1491,10 +1539,18 @@ export class ConfigStore {
       budget_id: p.budget_id,
       rate_limit_id: p.rate_limit_id,
       provider_configs: p.provider_configs,
+      split_policy: p.split_policy ?? "none",
     }
     const err = projectError(this.cfg, next)
     if (err !== "") return fail(400, err)
     const g = gov(this.cfg)
+    // the roster stays with the project; under an equal split the hand-written member caps are dropped
+    const kept: ProjectMember[] = []
+    const prior = findById(g.projects, p.id)
+    if (prior !== undefined) {
+      for (const m of prior.members ?? []) kept.push(next.split_policy === "equal" ? { id: m.id, user_id: m.user_id } : m)
+    }
+    next.members = kept
     g.projects = putById(g.projects ?? [], next)
     return this.commit(withGov(this.cfg, g), next.id)
   }
@@ -1504,6 +1560,72 @@ export class ConfigStore {
     if (findById(g.projects, id) === undefined) return fail(404, `no project ${id}`)
     g.projects = dropById(g.projects ?? [], id)
     return this.commit(withGov(this.cfg, g), id)
+  }
+
+  // Adds members to a project, each user once. A user must be a stored user.
+  addProjectMembers(pid: string, users: string[]): Result {
+    const g = gov(this.cfg)
+    const pj = findById(g.projects, pid)
+    if (pj === undefined) return fail(404, `no project ${pid}`)
+    const members: ProjectMember[] = []
+    for (const m of pj.members ?? []) members.push(m)
+    for (const u of users) {
+      let known = false
+      for (const su of g.users ?? []) {
+        if (su.name === u) known = true
+      }
+      if (!known) return fail(400, `unknown user ${u}`)
+      let dup = false
+      for (const m of members) {
+        if (m.user_id === u) dup = true
+      }
+      if (!dup) members.push({ id: resolveId(undefined, undefined, "pm-"), user_id: u })
+    }
+    let np = pj
+    np.members = members
+    g.projects = putById(g.projects ?? [], np)
+    return this.commit(withGov(this.cfg, g), pid)
+  }
+
+  // Removes a member from a project; the member's caps go with it.
+  removeProjectMember(pid: string, mid: string): Result {
+    const g = gov(this.cfg)
+    const pj = findById(g.projects, pid)
+    if (pj === undefined) return fail(404, `no project ${pid}`)
+    if (findById(pj.members, mid) === undefined) return fail(404, `no member ${mid}`)
+    const members: ProjectMember[] = []
+    for (const m of pj.members ?? []) {
+      if (m.id !== mid) members.push(m)
+    }
+    let np = pj
+    np.members = members
+    g.projects = putById(g.projects ?? [], np)
+    return this.commit(withGov(this.cfg, g), pid)
+  }
+
+  // Replaces a member's own caps (the complete statement, as Bifrost's): only under split_policy none, and
+  // each share names a budget the project holds.
+  setMemberShares(pid: string, mid: string, shares: MemberShare[]): Result {
+    const g = gov(this.cfg)
+    const pj = findById(g.projects, pid)
+    if (pj === undefined) return fail(404, `no project ${pid}`)
+    if (pj.split_policy === "equal") return fail(400, "the project splits its caps equally, so member caps are not set by hand; use split_policy none")
+    if (findById(pj.members, mid) === undefined) return fail(404, `no member ${mid}`)
+    const held = projectBudgetIds(pj)
+    for (const s of shares) {
+      if (!held.includes(s.source_budget_id)) return fail(400, `budget ${s.source_budget_id} is not held by project ${pid}`)
+      if (s.share_type !== "percent" && s.share_type !== "amount") return fail(400, "share_type must be percent or amount")
+      if (!(s.share_value > 0.0)) return fail(400, "share_value must be positive")
+      if (s.share_type === "percent" && s.share_value > 100.0) return fail(400, "a percent share cannot be over 100")
+    }
+    const members: ProjectMember[] = []
+    for (const m of pj.members ?? []) {
+      members.push(m.id === mid ? { id: m.id, user_id: m.user_id, budget_shares: shares } : m)
+    }
+    let np = pj
+    np.members = members
+    g.projects = putById(g.projects ?? [], np)
+    return this.commit(withGov(this.cfg, g), pid)
   }
 
   // Saves a business unit whole. Its teams follow it: the listed teams join the unit, and teams it
@@ -1544,7 +1666,7 @@ export class ConfigStore {
   upsertRole(r: RoleConfig): Result {
     const err = roleError(r)
     if (err !== "") return fail(400, err)
-    const next: RoleConfig = { name: r.name, description: r.description, dac: r.dac ?? "all-data", permissions: r.permissions ?? [] }
+    const next: RoleConfig = { name: r.name, description: r.description, dac: r.dac ?? "all-data", permissions: r.permissions ?? [], entity_dac: r.entity_dac ?? [] }
     const g = gov(this.cfg)
     const out: RoleConfig[] = []
     let found = false
@@ -2249,6 +2371,8 @@ function projectError(c: Config, p: ProjectConfig): string {
   if (acc !== "both" && acc !== "project_only" && acc !== "principal_only") return "accounting_mode must be both, project_only or principal_only"
   const mode = p.membership_mode ?? "explicit"
   if (mode !== "explicit" && mode !== "open") return "membership_mode must be explicit or open"
+  const split = p.split_policy ?? "none"
+  if (split !== "none" && split !== "equal") return "split_policy must be none or equal"
   const b = p.budget_id
   if (b !== undefined && findById(g.budgets, b) === undefined) return `unknown budget ${b}`
   const r = p.rate_limit_id
@@ -2296,6 +2420,10 @@ function roleError(r: RoleConfig): string {
     if (!RESOURCES.includes(p.resource)) return `unknown resource ${p.resource}`
     if (!OPERATIONS.includes(p.operation)) return `unknown operation ${p.operation}`
   }
+  for (const e of r.entity_dac ?? []) {
+    if (!RESOURCES.includes(e.resource)) return `unknown resource ${e.resource} in entity_dac`
+    if (!DACS.includes(e.dac)) return `entity_dac ${e.resource} must be one of ${DACS.join(", ")}`
+  }
   return ""
 }
 
@@ -2342,6 +2470,7 @@ function projectFrom(id: string, b: ProjectBody): ProjectConfig {
     budget_id: b.budget_id,
     rate_limit_id: b.rate_limit_id,
     provider_configs: b.provider_configs,
+    split_policy: b.split_policy,
   }
 }
 
@@ -2388,7 +2517,7 @@ function projectsView(c: Config, sp: URLSearchParams, scope: DataScope): string 
 // /api/governance/projects[/{id}]: Bifrost's shapes. Creating needs all-data; a scoped user may
 // change the projects in its scope.
 function projectRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
-  if (segs.length > 4) return notFound(path)
+  if (segs.length > 6) return notFound(path)
   const id = segs[3]
   if (id === undefined) {
     if (m === "GET") return reply(200, projectsView(store.cfg, sp, scope))
@@ -2403,6 +2532,7 @@ function projectRoute(store: ConfigStore, m: string, segs: string[], body: strin
   }
   const cur = findById(gov(store.cfg).projects, id)
   if (cur === undefined || !recordInScope(store.cfg, "projects", id, scope)) return reply(404, errorBody(`no project ${id}`))
+  if (segs.length >= 5) return projectMembersRoute(store, m, id, segs, body, path, scope)
   if (m === "GET") return reply(200, JSON.stringify({ project: cur }))
   if (m === "PUT") {
     const b = parseProjectBody(body)
@@ -2415,6 +2545,75 @@ function projectRoute(store: ConfigStore, m: string, segs: string[], body: strin
     const r = store.deleteProject(id)
     if (r.kind === "error") return errReply(r)
     return reply(200, JSON.stringify({ deleted: id }))
+  }
+  return notAllowed(m)
+}
+
+// The budgets a project holds: its own and each provider config's.
+function projectBudgetIds(pj: ProjectConfig): string[] {
+  const out: string[] = []
+  if (pj.budget_id !== undefined) out.push(pj.budget_id)
+  for (const pc of pj.provider_configs ?? []) {
+    const b = pc.budget_id
+    if (b !== undefined && !out.includes(b)) out.push(b)
+  }
+  return out
+}
+
+// /api/governance/projects/{id}/members[/{member_id}]: the roster and, under split_policy none, a member's
+// own caps. Changing the roster or the caps needs all-data.
+function projectMembersRoute(store: ConfigStore, m: string, pid: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+  if (segs.length > 6 || segs[4] !== "members") return notFound(path)
+  const pj = findById(gov(store.cfg).projects, pid)
+  if (pj === undefined) return reply(404, errorBody(`no project ${pid}`))
+  const mid = segs[5]
+  if (mid === undefined) {
+    if (m === "GET") return reply(200, JSON.stringify({ members: pj.members ?? [], total_count: (pj.members ?? []).length }))
+    if (m !== "POST") return notAllowed(m)
+    if (!scope.all) return scopeDenied()
+    let b: MemberBody = {}
+    try {
+      b = JSON.parse(body) as MemberBody
+    } catch (e) {
+      return badBody()
+    }
+    const users: string[] = []
+    for (const x of b.members ?? []) {
+      const u = x.user_id ?? ""
+      if (u === "") return reply(400, errorBody("each member needs a user_id"))
+      users.push(u)
+    }
+    const r = store.addProjectMembers(pid, users)
+    if (r.kind === "error") return errReply(r)
+    const after = findById(gov(store.cfg).projects, pid)
+    const roster: ProjectMember[] = after === undefined ? [] : after.members ?? []
+    return reply(201, JSON.stringify({ members: roster }))
+  }
+  if (m === "GET") {
+    const one = findById(pj.members, mid)
+    if (one === undefined) return reply(404, errorBody(`no member ${mid}`))
+    return reply(200, JSON.stringify({ member: one }))
+  }
+  if (!scope.all) return scopeDenied()
+  if (m === "PUT") {
+    let c: MemberCapsBody = {}
+    if (body.trim() !== "") {
+      try {
+        c = JSON.parse(body) as MemberCapsBody
+      } catch (e) {
+        return badBody()
+      }
+    }
+    const r = store.setMemberShares(pid, mid, c.budget_shares ?? [])
+    if (r.kind === "error") return errReply(r)
+    const after = findById(gov(store.cfg).projects, pid)
+    const kept: ProjectMember | undefined = after === undefined ? undefined : findById(after.members, mid)
+    return reply(200, JSON.stringify({ member: kept }))
+  }
+  if (m === "DELETE") {
+    const r = store.removeProjectMember(pid, mid)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: mid }))
   }
   return notAllowed(m)
 }
@@ -2476,23 +2675,35 @@ function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, 
   const name = segs[2]
   if (segs.length === 4 && name !== undefined) return rolePermissions(store, m, name, body)
   if (name === undefined) {
-    if (m === "GET") return reply(200, JSON.stringify({ roles: gov(store.cfg).roles ?? [] }))
+    if (m === "GET") {
+      const parts: string[] = []
+      for (const r of gov(store.cfg).roles ?? []) parts.push(roleJson(r))
+      return reply(200, `{"roles":[${parts.join(",")}]}`)
+    }
     if (m !== "POST") return notAllowed(m)
     const b = parseRoleBody(body)
     if (b === undefined) return badBody()
-    const r = store.upsertRole(roleFrom(b.name ?? "", b))
+    const ed = entityDacFrom(body)
+    if (ed.error !== "") return reply(400, errorBody(ed.error))
+    const r = store.upsertRole(roleFrom(b.name ?? "", b, ed.list))
     if (r.kind === "error") return errReply(r)
-    return reply(201, JSON.stringify(customRole(gov(store.cfg).roles, b.name ?? "")))
+    const made = customRole(gov(store.cfg).roles, b.name ?? "")
+    if (made === undefined) return serverError()
+    return reply(201, roleJson(made))
   }
   const cur = customRole(gov(store.cfg).roles, name)
   if (cur === undefined) return reply(404, errorBody(`no role ${name}`))
-  if (m === "GET") return reply(200, JSON.stringify(cur))
+  if (m === "GET") return reply(200, roleJson(cur))
   if (m === "PUT") {
     const b = parseRoleBody(body)
     if (b === undefined) return badBody()
-    const r = store.upsertRole(roleFrom(name, b))
+    const ed = entityDacFrom(body)
+    if (ed.error !== "") return reply(400, errorBody(ed.error))
+    const r = store.upsertRole(roleFrom(name, b, ed.list))
     if (r.kind === "error") return errReply(r)
-    return reply(200, JSON.stringify(customRole(gov(store.cfg).roles, name)))
+    const saved = customRole(gov(store.cfg).roles, name)
+    if (saved === undefined) return serverError()
+    return reply(200, roleJson(saved))
   }
   if (m === "DELETE") {
     const r = store.deleteRole(name)
@@ -2536,8 +2747,52 @@ function rolePermissions(store: ConfigStore, m: string, name: string, body: stri
   return rolePermissions(store, "GET", name, "")
 }
 
-function roleFrom(name: string, b: RoleBody): RoleConfig {
-  return { name: name, description: b.description, dac: b.dac, permissions: b.permissions }
+function roleFrom(name: string, b: RoleBody, entity: EntityDac[]): RoleConfig {
+  return { name: name, description: b.description, dac: b.dac, permissions: b.permissions, entity_dac: entity }
+}
+
+// A role body's entity_dac, read from Bifrost's object form ({"Logs": "own-data"}). Undefined keys
+// count as no overrides; a value that is not a string is an error.
+function entityDacFrom(body: string): { list: EntityDac[], error: string } {
+  const out: EntityDac[] = []
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return { list: out, error: "" }
+  }
+  const raw = find(fs, "entity_dac")
+  if (raw === undefined || raw === "null") return { list: out, error: "" }
+  if (!raw.startsWith("{")) return { list: out, error: "entity_dac must be an object" }
+  let inner: Field[] = []
+  try {
+    inner = fields(raw)
+  } catch (e) {
+    return { list: out, error: "entity_dac must be an object" }
+  }
+  for (const f of inner) {
+    if (!f.raw.startsWith("\"")) return { list: out, error: `entity_dac ${f.key} must be a data access scope` }
+    let dac = ""
+    try {
+      dac = decodeString(f.raw)
+    } catch (e) {
+      return { list: out, error: `entity_dac ${f.key} must be a data access scope` }
+    }
+    out.push({ resource: f.key, dac: dac })
+  }
+  return { list: out, error: "" }
+}
+
+// A custom role as the management API shows it: entity_dac as Bifrost's object, dac only when set.
+function roleJson(r: RoleConfig): string {
+  const parts: string[] = [`"name":${quote(r.name)}`]
+  if (r.description !== undefined) parts.push(`"description":${quote(r.description)}`)
+  if (r.dac !== undefined) parts.push(`"dac":${quote(r.dac)}`)
+  parts.push(`"permissions":${JSON.stringify(r.permissions ?? [])}`)
+  const ed: string[] = []
+  for (const e of r.entity_dac ?? []) ed.push(`${quote(e.resource)}:${quote(e.dac)}`)
+  parts.push(`"entity_dac":{${ed.join(",")}}`)
+  return "{" + parts.join(",") + "}"
 }
 
 // Saves a provider under name from a provider body (PUT upserts, POST creates) and reads it back masked.
@@ -2817,7 +3072,14 @@ function budgetOverrideRoute(store: ConfigStore, m: string, vkId: string, budget
   const r = store.setBudgetOverride(vkId, budgetId, o)
   if (r.kind === "error") return errReply(r)
   const b = findById(gov(store.cfg).budgets, budgetId)
-  return reply(200, JSON.stringify({ budget: b, effective_max_limit: b === undefined ? 0.0 : effectiveBudgetLimit(b) }))
+  // a cycles override adds to the limit for its cycles, so the view counts it while it runs
+  let eff = 0.0
+  if (b !== undefined) {
+    eff = effectiveBudgetLimit(b)
+    const o = b.override
+    if (o !== undefined && o.mode === "cycles") eff += o.amount
+  }
+  return reply(200, JSON.stringify({ budget: b, effective_max_limit: eff }))
 }
 
 // GET /api/governance/virtual-keys/{vk}/users. A key has one assigned user (its user_id).
@@ -3154,12 +3416,15 @@ test("governance: budget overrides, VK users, routing rules, complexity config, 
       budgets: [{ id: "b1", max_limit: 10, reset_duration: "1d" }],
       virtual_keys: [{ id: "vk1", value: "v1", budget_id: "b1", user_id: "alice" }, { id: "vk2", value: "v2" }],
     } })
-    // budget override: forever adds to the limit; a key only reaches its own budgets; cycles are refused
+    // budget override: forever adds to the limit; a key only reaches its own budgets; cycles add for their cycles
     const ov = handleApi(store, "PUT", "/api/governance/virtual-keys/vk1/budgets/b1/override", `{"amount": 5, "mode": "forever"}`)
     expect(ov.status).toBe(200)
     expect(ov.body.includes(`"effective_max_limit":15`)).toBe(true)
     expect(handleApi(store, "PUT", "/api/governance/virtual-keys/vk2/budgets/b1/override", `{"amount": 5, "mode": "forever"}`).status).toBe(404)
-    expect(handleApi(store, "PUT", "/api/governance/virtual-keys/vk1/budgets/b1/override", `{"amount": 5, "mode": "cycles", "cycles": 2}`).status).toBe(400)
+    const cyc = handleApi(store, "PUT", "/api/governance/virtual-keys/vk1/budgets/b1/override", `{"amount": 5, "mode": "cycles", "cycles": 2}`)
+    expect(cyc.status).toBe(200)
+    expect(cyc.body.includes(`"effective_max_limit":15`)).toBe(true)
+    expect(handleApi(store, "PUT", "/api/governance/virtual-keys/vk1/budgets/b1/override", `{"amount": 5, "mode": "weekly"}`).status).toBe(400)
     expect(handleApi(store, "DELETE", "/api/governance/virtual-keys/vk1/budgets/b1/override", "").status).toBe(200)
     const bs = store.cfg.governance?.budgets ?? []
     expect(bs[0]!.override).toBeUndefined()
@@ -3999,5 +4264,56 @@ test("team members: the users whose teams name the team", () => {
   expect(body.body.includes("bo")).toBe(false)
   expect(handleApi(s, "GET", "/api/governance/teams/nope/members", "").status).toBe(404)
   expect(handleApi(s, "POST", "/api/governance/teams/t1/members", "{}").status).toBe(405)
+  cleanup(path)
+})
+
+test("project members: the roster, member caps under split none, and refusals under equal", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, { governance: {
+    budgets: [{ id: "b-pm", max_limit: 100.0, reset_duration: "1M" }],
+    users: [{ name: "ana", role: "editor" }, { name: "bo", role: "viewer" }],
+  } })
+  expect(handleApi(s, "POST", "/api/governance/projects", `{"id":"pm","name":"pm","budget_id":"b-pm"}`).status).toBe(201)
+  const add = handleApi(s, "POST", "/api/governance/projects/pm/members", `{"members":[{"user_id":"ana"},{"user_id":"ana"},{"user_id":"bo"}]}`)
+  expect(add.status).toBe(201)
+  expect(add.body.includes(`"user_id":"ana"`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/governance/projects/pm/members", `{"members":[{"user_id":"nobody"}]}`).status).toBe(400)
+  const list = handleApi(s, "GET", "/api/governance/projects/pm/members", "")
+  expect(list.body.includes(`"total_count":2`)).toBe(true)
+  const mid = (s.cfg.governance?.projects ?? [])[0]!.members![0]!.id
+  // a member's own cap: a percent of a budget the project holds
+  expect(handleApi(s, "PUT", `/api/governance/projects/pm/members/${mid}`, `{"budget_shares":[{"source_budget_id":"b-other","share_value":10,"share_type":"percent"}]}`).status).toBe(400)
+  expect(handleApi(s, "PUT", `/api/governance/projects/pm/members/${mid}`, `{"budget_shares":[{"source_budget_id":"b-pm","share_value":150,"share_type":"percent"}]}`).status).toBe(400)
+  const cap = handleApi(s, "PUT", `/api/governance/projects/pm/members/${mid}`, `{"budget_shares":[{"source_budget_id":"b-pm","share_value":25,"share_type":"percent"}]}`)
+  expect(cap.status).toBe(200)
+  expect(cap.body.includes(`"share_value":25`)).toBe(true)
+  // a project edit keeps the roster and the caps
+  expect(handleApi(s, "PUT", "/api/governance/projects/pm", `{"name":"pm","budget_id":"b-pm"}`).status).toBe(200)
+  expect((s.cfg.governance?.projects ?? [])[0]!.members!.length).toBe(2)
+  // equal split: the hand-written caps go, and caps are refused
+  expect(handleApi(s, "PUT", "/api/governance/projects/pm", `{"name":"pm","budget_id":"b-pm","split_policy":"equal"}`).status).toBe(200)
+  expect((s.cfg.governance?.projects ?? [])[0]!.members![0]!.budget_shares).toBeUndefined()
+  expect(handleApi(s, "PUT", `/api/governance/projects/pm/members/${mid}`, `{"budget_shares":[]}`).status).toBe(400)
+  expect(handleApi(s, "PUT", "/api/governance/projects/pm", `{"name":"pm","split_policy":"weekly"}`).status).toBe(400)
+  // removing a member takes the member away
+  expect(handleApi(s, "DELETE", `/api/governance/projects/pm/members/${mid}`, "").status).toBe(200)
+  expect(handleApi(s, "GET", `/api/governance/projects/pm/members/${mid}`, "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/governance/projects/pm/members", "").body.includes(`"total_count":1`)).toBe(true)
+  cleanup(path)
+})
+
+test("roles: entity_dac is read as Bifrost's object and shown the same way", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const made = handleApi(s, "POST", "/api/roles", `{"name":"acct","dac":"team-data","entity_dac":{"Projects":"all-data","Logs":"own-data"},"permissions":[]}`)
+  expect(made.status).toBe(201)
+  expect(made.body.includes(`"entity_dac":{"Projects":"all-data","Logs":"own-data"}`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"bad","entity_dac":{"Projects":"weekly"}}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"bad2","entity_dac":{"Nope":"all-data"}}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"bad3","entity_dac":{"Logs":5}}`).status).toBe(400)
+  const put = handleApi(s, "PUT", "/api/roles/acct", `{"dac":"own-data"}`)
+  expect(put.status).toBe(200)
+  expect(put.body.includes(`"entity_dac":{}`)).toBe(true)
+  expect(handleApi(s, "GET", "/api/roles", "").body.includes(`"name":"acct"`)).toBe(true)
   cleanup(path)
 })

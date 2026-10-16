@@ -42,6 +42,11 @@ export type CircuitPolicy = {
 
 export type PolicyParse = { ok: bool, p: CircuitPolicy, err: string }
 
+// The id of one key's sub-circuit under a policy.
+function subCircuit(policy: string, key: string): string {
+  return policy + "/" + key
+}
+
 // Outcomes are counted per second, so the window keeps a few buckets, not every request.
 class Bucket {
   ok: int = 0
@@ -279,7 +284,25 @@ export class Health {
     if (!found) return false
     this.policies = keep
     this.reset(name)
+    // the policy's per-key sub-circuits go with it
+    for (const id of this.tracks.keys()) {
+      if (id.startsWith(name + "/")) this.tracks.delete(id)
+    }
     return true
+  }
+
+  // The circuits open or half-open now, with when each opened and when it next lets a check through
+  // (epoch ms). Policy sub-circuits are listed as "policy/key".
+  openCircuits(now: f64): { id: string, state: string, openedAt: f64, nextCheck: f64 }[] {
+    const out: { id: string, state: string, openedAt: f64, nextCheck: f64 }[] = []
+    for (const id of this.tracks.keys()) {
+      const t = this.tracks.get(id)!
+      const st = this.state(id, now)
+      if (st === "closed") continue
+      const cool = t.cooldownMs > 0 ? t.cooldownMs : this.cfg.openMs
+      out.push({ id: id, state: st, openedAt: t.openedAt, nextCheck: t.openedAt + cool })
+    }
+    return out
   }
 
   // Closes a circuit now, whatever its timer says. False when no circuit is tracked under id.
@@ -326,6 +349,18 @@ export class Health {
         const hv = headerGet(headers, p.cooldown_header)
         const ms = hv === undefined ? -1.0 : (parseFloat(hv) ?? -1.0)
         if (ms > 0.0) cool = Math.floor(ms)
+      }
+      // per-key sub-circuits (Bifrost's primary_key_ids): this key trips its own circuit, and the policy
+      // opens only once every listed key's circuit is open at the same time
+      if (p.primary_key_ids.length > 0) {
+        const kt = this.track(subCircuit(p.name, keyId))
+        kt.cooldownMs = cool
+        openBreaker(kt, now)
+        let every = true
+        for (const k of p.primary_key_ids) {
+          if (this.state(subCircuit(p.name, k), now) !== "open") every = false
+        }
+        if (!every) continue
       }
       const t = this.track(p.name)
       t.cooldownMs = cool
@@ -583,6 +618,24 @@ function policyMatches(p: CircuitPolicy, headers: Map<string, string>): bool {
   }
   return and && p.signals.length > 0
 }
+
+test("a policy over several keys opens only once every listed key has tripped", () => {
+  const h = new Health()
+  const p: CircuitPolicy = { name: "quota", enabled: true, primary_provider: "azure", primary_model: "gpt", primary_key_ids: ["k1", "k2"], fallback_provider: "openai", fallback_model: "gpt", operator: "OR", signals: [{ header_name: "x-quota", header_contains: "exceeded" }], cooldown_ms: 60000, cooldown_header: "" }
+  expect(h.policyAdd(p)).toBe(true)
+  const hd = new Map<string, string>()
+  hd.set("x-quota", "exceeded")
+  const now = Date.now()
+  expect(h.policyObserve("azure", "gpt", "k1", hd, now).length).toBe(0)
+  expect(h.policyFallback("azure", "gpt", now) === undefined).toBe(true)
+  expect(h.policyObserve("azure", "gpt", "k2", hd, now).join(",")).toBe("quota")
+  expect(h.policyFallback("azure", "gpt", now)!.name).toBe("quota")
+  expect(h.openCircuits(now).some((c) => c.id === "quota/k1")).toBe(true)
+  expect(h.openCircuits(now).some((c) => c.id === "quota")).toBe(true)
+  // deleting the policy drops its sub-circuits too
+  expect(h.policyDelete("quota")).toBe(true)
+  expect(h.openCircuits(now).length).toBe(0)
+})
 
 test("policy bodies parse, validate and show Bifrost's shape", () => {
   const ok = parsePolicy(`{"name":"quota","primary_provider":"azure","primary_model":"gpt-4o","primary_key_ids":["k1"],"fallback_provider":"openai","fallback_model":"gpt-4o-mini","condition":{"signals":[{"source":"response_header","header_name":"x-quota","header_contains":"exceeded"}]},"default_cooldown":"5m"}`, "")

@@ -1,6 +1,6 @@
 // Management API logic that needs no store: the RBAC listings, budget overrides, the expired-key
 // cleanup, routing rule checks and the complexity analyzer config. store.tov and ops.tov route to these.
-import { BudgetOverride, ClientConfig, ComplexitySettings, GovernanceConfig, PermissionPair, VirtualKeyConfig } from "./config"
+import { AccessProfile, AdminUserConfig, BudgetOverride, ClientConfig, ComplexitySettings, GovernanceConfig, PermissionPair, VirtualKeyConfig } from "./config"
 import { RoutingRule, compile } from "./cel"
 import { fields, Field, find } from "./json"
 import { rfc3339Ms } from "./vkexpiry"
@@ -49,8 +49,9 @@ export function permissionIds(resources: string[], operations: string[], pairs: 
 
 export type OverrideResult = { kind: "ok", override: BudgetOverride } | { kind: "error", message: string }
 
-// Reads a PUT .../override body: {"amount": n, "mode": "forever"}. Only the forever mode is kept
-// (a cycles override needs the reset-cycle lifecycle, which Raiju does not run).
+// Reads a PUT .../override body: {"amount": n, "mode": "forever"} or {"amount": n, "mode": "cycles",
+// "cycles": k}. A cycles override adds amount to the limit for k reset windows, the current one
+// counted as the first (Bifrost's cycles); k defaults to 1.
 export function parseOverride(body: string): OverrideResult {
   let fs: Field[] = []
   try {
@@ -62,9 +63,11 @@ export function parseOverride(body: string): OverrideResult {
   const n = parseFloat(amount)
   if (n === undefined || n <= 0.0) return { kind: "error", message: "amount must be a positive number" }
   const mode = find(fs, "mode") ?? ""
-  if (mode === "cycles") return { kind: "error", message: "cycles overrides are not supported; use mode forever" }
-  if (mode !== "\"forever\"") return { kind: "error", message: "mode must be forever" }
-  return { kind: "ok", override: { amount: n, mode: "forever" } }
+  if (mode === "\"forever\"") return { kind: "ok", override: { amount: n, mode: "forever" } }
+  if (mode !== "\"cycles\"") return { kind: "error", message: "mode must be forever or cycles" }
+  const k = parseInt(find(fs, "cycles") ?? "1") ?? 0
+  if (k < 1 || k > 1000) return { kind: "error", message: "cycles must be a whole number from 1 to 1000" }
+  return { kind: "ok", override: { amount: n, mode: "cycles", cycles: k } }
 }
 
 // The budgets a virtual key draws on: its own budget and the ones on its provider configs.
@@ -152,6 +155,68 @@ export function complexityFrom(text: string): ComplexitySettings | undefined {
   }
 }
 
+// ---- user access profiles and virtual-key creation ----
+
+function profileNamed(profiles: AccessProfile[] | undefined, id: string): AccessProfile | undefined {
+  for (const p of profiles ?? []) {
+    if (p.id === id) return p
+  }
+  return undefined
+}
+
+// GET /api/users/me/vk-creation-policy: the active access profile the caller holds that governs the
+// keys it creates (the first one held, highest-ranked). A caller with no stored user, or no active
+// profile, gets {"has_access_profile": false}; creating a key stays allowed, ungoverned.
+export function creationPolicy(users: AdminUserConfig[] | undefined, profiles: AccessProfile[] | undefined, actor: string): string {
+  for (const u of users ?? []) {
+    if (u.name !== actor) continue
+    for (const id of u.access_profile_ids ?? []) {
+      const p = profileNamed(profiles, id)
+      if (p !== undefined && p.is_active !== false) return JSON.stringify({ has_access_profile: true, profile_name: p.name ?? p.id })
+    }
+  }
+  return JSON.stringify({ has_access_profile: false })
+}
+
+// ---- access profile propagation ----
+
+// The fields a propagate call may push from a profile onto the keys that hold it.
+export const PROPAGATED_FIELDS = ["provider_configs", "budgets", "rate_limit", "mcp_configs"]
+
+// The keys after a propagate: each key that holds the profile takes the chosen fields from it. A field
+// the profile leaves unset is not pushed. Budgets and rate limits are matched by id, so usage is kept.
+export function propagateProfileKeys(vks: VirtualKeyConfig[], p: AccessProfile, chosen: string[]): { vks: VirtualKeyConfig[], updated: int } {
+  const out: VirtualKeyConfig[] = []
+  let updated = 0
+  for (const vk of vks) {
+    if (!(vk.access_profile_ids ?? []).includes(p.id)) {
+      out.push(vk)
+      continue
+    }
+    let nv = vk
+    if (chosen.includes("provider_configs") && p.provider_configs !== undefined) nv.provider_configs = p.provider_configs
+    if (chosen.includes("budgets") && p.budget_id !== undefined) nv.budget_id = p.budget_id
+    if (chosen.includes("rate_limit") && p.rate_limit_id !== undefined) nv.rate_limit_id = p.rate_limit_id
+    if (chosen.includes("mcp_configs") && p.mcp_configs !== undefined) nv.mcp_configs = p.mcp_configs
+    out.push(nv)
+    updated += 1
+  }
+  return { vks: out, updated: updated }
+}
+
+// The access profiles a user holds, in rank order, as the users API lists them.
+export function heldProfiles(users: AdminUserConfig[] | undefined, profiles: AccessProfile[] | undefined, name: string): AccessProfile[] {
+  const out: AccessProfile[] = []
+  for (const u of users ?? []) {
+    if (u.name !== name) continue
+    for (const id of u.access_profile_ids ?? []) {
+      const p = profileNamed(profiles, id)
+      if (p !== undefined) out.push(p)
+    }
+  }
+  return out
+}
+
 // ---- tests ----
 
 test("permissionDocs numbers pairs resource-major from 1, and pairOfId reads them back", () => {
@@ -170,12 +235,17 @@ test("permissionDocs numbers pairs resource-major from 1, and pairOfId reads the
   expect(permissionIds(rs, ops, [{ resource: "VirtualKeys", operation: "Create" }, { resource: "Logs", operation: "View" }]).join(",")).toBe("1,5")
 })
 
-test("parseOverride keeps forever overrides and refuses the rest", () => {
+test("parseOverride keeps forever and cycles overrides and refuses the rest", () => {
   const ok = parseOverride(`{"amount": 25, "mode": "forever"}`)
   expect(ok.kind).toBe("ok")
+  const cy = parseOverride(`{"amount": 40, "mode": "cycles", "cycles": 3}`)
+  expect(cy.kind === "ok" && cy.override.cycles === 3).toBe(true)
+  const cy1 = parseOverride(`{"amount": 40, "mode": "cycles"}`)
+  expect(cy1.kind === "ok" && cy1.override.cycles === 1).toBe(true)
+  expect(parseOverride(`{"amount": 40, "mode": "cycles", "cycles": 0}`).kind).toBe("error")
   const bad1 = parseOverride(`{"amount": 0, "mode": "forever"}`)
   expect(bad1.kind).toBe("error")
-  const bad2 = parseOverride(`{"amount": 5, "mode": "cycles"}`)
+  const bad2 = parseOverride(`{"amount": 5, "mode": "weekly"}`)
   expect(bad2.kind).toBe("error")
   const bad3 = parseOverride(`{"amount": 5}`)
   expect(bad3.kind).toBe("error")
@@ -218,4 +288,39 @@ test("complexityProblem checks types and refuses unknown settings", () => {
   expect(complexityProblem(`{"tiers": 3}`)).toBe("tiers must be an object")
   expect(complexityProblem(`{"colour": 1}`)).toBe("unknown complexity analyzer setting colour")
   expect(complexityProblem("[]")).toBe("the body must be a JSON object")
+})
+
+test("creationPolicy names the first active profile a user holds", () => {
+  const users: AdminUserConfig[] = [{ name: "ana", role: "editor", access_profile_ids: ["p-off", "p-on", "p-two"] }, { name: "bo", role: "viewer" }]
+  const profiles: AccessProfile[] = [{ id: "p-off", name: "Off", is_active: false }, { id: "p-on", name: "Engineer" }, { id: "p-two" }]
+  expect(creationPolicy(users, profiles, "ana")).toBe(`{"has_access_profile":true,"profile_name":"Engineer"}`)
+  expect(creationPolicy(users, profiles, "bo")).toBe(`{"has_access_profile":false}`)
+  expect(creationPolicy(users, profiles, "nobody")).toBe(`{"has_access_profile":false}`)
+  expect(creationPolicy(users, [], "ana")).toBe(`{"has_access_profile":false}`)
+})
+
+test("propagateProfileKeys pushes the chosen set fields to the keys that hold the profile", () => {
+  const p: AccessProfile = { id: "p1", budget_id: "b-new", rate_limit_id: "rl-new", provider_configs: [{ provider: "openai" }] }
+  const vks: VirtualKeyConfig[] = [
+    { id: "k1", value: "v1", access_profile_ids: ["p1"], budget_id: "b-old", rate_limit_id: "rl-old" },
+    { id: "k2", value: "v2", access_profile_ids: ["p2"], budget_id: "b-old" },
+  ]
+  const r = propagateProfileKeys(vks, p, ["budgets"])
+  expect(r.updated).toBe(1)
+  expect(r.vks[0]!.budget_id).toBe("b-new")
+  expect(r.vks[0]!.rate_limit_id).toBe("rl-old")
+  expect(r.vks[1]!.budget_id).toBe("b-old")
+  const all = propagateProfileKeys(vks, p, PROPAGATED_FIELDS)
+  expect(all.vks[0]!.rate_limit_id).toBe("rl-new")
+  expect(all.vks[0]!.provider_configs!.length).toBe(1)
+  // a field the profile leaves unset does not clear the key's own
+  const bare: AccessProfile = { id: "p1" }
+  expect(propagateProfileKeys(vks, bare, PROPAGATED_FIELDS).vks[0]!.budget_id).toBe("b-old")
+})
+
+test("heldProfiles lists a user's profiles in rank order and skips unknown ids", () => {
+  const users: AdminUserConfig[] = [{ name: "ana", role: "editor", access_profile_ids: ["p-b", "gone", "p-a"] }]
+  const profiles: AccessProfile[] = [{ id: "p-a" }, { id: "p-b" }]
+  expect(heldProfiles(users, profiles, "ana").map((p) => p.id).join(",")).toBe("p-b,p-a")
+  expect(heldProfiles(users, profiles, "bo").length).toBe(0)
 })

@@ -1,6 +1,6 @@
 // Virtual keys, budgets and rate limits, with Bifrost's Customer → Team → VK
 // hierarchy. State is in memory, per process.
-import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig, AccessProfile, ModelConfigGovernance, ProviderGovernance, ProjectConfig, ProviderConfigRef } from "./config"
+import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig, AccessProfile, ModelConfigGovernance, ProviderGovernance, ProjectConfig, ProviderConfigRef, GovernanceConfig } from "./config"
 import { Effective, applyProfiles, modelAllowed } from "./profiles"
 import { Hdrs, hdrs } from "./schemas"
 import { BudgetUsage, RateUse, ScopeUsage } from "./alerts"
@@ -30,6 +30,11 @@ class Window {
   remote = 0.0
   // clustered windows start on multiples of the period, so every node agrees on them
   aligned = false
+  // a cycles budget override: extra adds to the limit for extraCycles more windows (the current one
+  // counts). extraSig names the override it came from, so a config reload keeps the count it has run.
+  extra = 0.0
+  extraCycles = 0
+  extraSig = ""
   constructor(readonly limit: f64, readonly periodMs: int) {}
   roll(now: f64): void {
     if (this.aligned) {
@@ -38,17 +43,24 @@ class Window {
         this.start = s
         this.used = 0.0
         this.remote = 0.0
+        this.endCycle()
       }
       return
     }
     if (now - this.start >= this.periodMs) {
       this.start = now
       this.used = 0.0
+      this.endCycle()
     }
+  }
+  // A new window began: a cycles override runs out after its last cycle.
+  private endCycle(): void {
+    if (this.extraCycles > 0) this.extraCycles -= 1
+    if (this.extraCycles <= 0) this.extra = 0.0
   }
   remaining(now: f64): f64 {
     this.roll(now)
-    return this.limit - this.used - this.remote
+    return this.limit + this.extra - this.used - this.remote
   }
   // The window's id across nodes: its index, zero-padded so ids sort as strings.
   id(now: f64): string {
@@ -108,6 +120,14 @@ export function effectiveBudgetLimit(b: BudgetConfig): f64 {
   return b.max_limit + o.amount
 }
 
+// The configured budget with this id, or undefined.
+function budgetConfigOf(g: GovernanceConfig, id: string): BudgetConfig | undefined {
+  for (const b of g.budgets ?? []) {
+    if (b.id === id) return b
+  }
+  return undefined
+}
+
 export class Governance {
   vks: Map<string, VirtualKeyConfig> = new Map()
   budgets: Map<string, Window> = new Map()
@@ -136,6 +156,8 @@ export class Governance {
   // governance.model_configs and governance.providers, applied to every request by modelLimits()
   modelConfigs: ModelConfigGovernance[] = []
   providerGovs: ProviderGovernance[] = []
+  // a project member's slices of the project's budgets, by "project/user": the derived budget ids
+  memberCaps: Map<string, string[]> = new Map()
 
   constructor(cfg: Config) {
     const g0 = cfg.governance
@@ -154,8 +176,15 @@ export class Governance {
       const w = new Window(effectiveBudgetLimit(b), durationMs(b.reset_duration))
       w.used = b.current_usage ?? 0.0
       w.start = Date.now()
+      const o = b.override
+      if (o !== undefined && o.mode === "cycles") {
+        w.extra = o.amount
+        w.extraCycles = o.cycles ?? 1
+        w.extraSig = `${o.amount}/${w.extraCycles}`
+      }
       this.budgets.set(b.id, w)
     }
+    this.addMemberCaps(g)
     for (const r of g.rate_limits ?? []) this.addRateLimit(r)
     const profiles: Map<string, AccessProfile> = new Map()
     for (const p of g.access_profiles ?? []) profiles.set(p.id, p)
@@ -308,6 +337,11 @@ export class Governance {
         if (pc.budget_id !== undefined) budgets.push(pc.budget_id)
         if (pc.rate_limit_id !== undefined) rateLimits.push(pc.rate_limit_id)
       }
+      // the member's own slices of the project's budgets
+      const uid = vk === undefined ? undefined : vk.user_id
+      if (uid !== undefined) {
+        for (const id of this.memberCaps.get(project.id + "/" + uid) ?? []) budgets.push(id)
+      }
     }
     // the hierarchy above the key: team, business unit, and the customers it reaches
     const teamId = vk === undefined ? undefined : vk.team_id
@@ -390,7 +424,11 @@ export class Governance {
   // An open project admits any caller; an explicit one admits the virtual keys it lists.
   private projectAdmits(p: ProjectConfig, vk: VirtualKeyConfig | undefined): bool {
     if ((p.membership_mode ?? "explicit") === "open") return true
-    return vk !== undefined && (p.virtual_key_ids ?? []).includes(vk.id)
+    if (vk === undefined) return false
+    if ((p.virtual_key_ids ?? []).includes(vk.id)) return true
+    // a key assigned to a member user is admitted as that member
+    const uid = vk.user_id
+    return uid !== undefined && (p.members ?? []).some((m) => m.user_id === uid)
   }
 
   // The caller's own access to provider and model: its access profile's model rules, then its provider
@@ -402,6 +440,48 @@ export class Governance {
     const pcs = vk.provider_configs ?? []
     if (pcs.length > 0 && !pcs.some((pc) => pc.provider === provider && pcMatches(pc, model))) return no
     return undefined
+  }
+
+  // A member's slice of each budget its project holds (the project's own and each provider's): under an
+  // equal split an equal part of every budget, otherwise the member's own shares. A slice is a window of
+  // its own, checked with the budget it divides and debited with it (admit). Redivision on a roster change
+  // comes with the config reload, and the slices keep the spend they have counted (carryUsage).
+  private addMemberCaps(g: GovernanceConfig): void {
+    for (const pj of g.projects ?? []) {
+      const members = pj.members ?? []
+      if (members.length === 0) continue
+      const sources: string[] = []
+      if (pj.budget_id !== undefined) sources.push(pj.budget_id)
+      for (const pc of pj.provider_configs ?? []) {
+        const b = pc.budget_id
+        if (b !== undefined && !sources.includes(b)) sources.push(b)
+      }
+      const equal = pj.split_policy === "equal"
+      for (const m of members) {
+        const ids: string[] = []
+        for (const src of sources) {
+          const sb = budgetConfigOf(g, src)
+          if (sb === undefined) continue
+          const base = effectiveBudgetLimit(sb)
+          let amount = 0.0
+          if (equal) {
+            amount = base / members.length
+          } else {
+            for (const s of m.budget_shares ?? []) {
+              if (s.source_budget_id !== src) continue
+              amount = s.share_type === "percent" ? base * s.share_value / 100.0 : s.share_value
+            }
+          }
+          if (!(amount > 0.0)) continue
+          const id = `${src}@${pj.id}/${m.user_id}`
+          const w = new Window(amount, durationMs(sb.reset_duration))
+          w.start = Date.now()
+          this.budgets.set(id, w)
+          ids.push(id)
+        }
+        this.memberCaps.set(pj.id + "/" + m.user_id, ids)
+      }
+    }
   }
 
   // Denies when a budget is used up (402) or a rate limit is reached (429); otherwise counts the request.
@@ -514,6 +594,11 @@ export class Governance {
         now.used = was.used
         now.start = was.start
         now.remote = was.remote
+        // the same cycles override keeps the cycles it has run; a changed or new one starts fresh
+        if (now.extraSig === was.extraSig) {
+          now.extra = was.extra
+          now.extraCycles = was.extraCycles
+        }
       }
     }
     for (const id of old.limits.keys()) {
@@ -713,9 +798,12 @@ export class Governance {
 
   budgetUsage(): { id: string, used: f64, limit: f64 }[] {
     const out: { id: string, used: f64, limit: f64 }[] = []
+    const now = Date.now()
     for (const id of this.budgets.keys()) {
       const b = this.budgets.get(id)!
-      out.push({ id: id, used: b.used, limit: b.limit })
+      // a cycles override adds to the limit while its cycles run (rolled to now first)
+      b.roll(now)
+      out.push({ id: id, used: b.used, limit: b.limit + b.extra })
     }
     return out
   }
@@ -1067,4 +1155,73 @@ test("x-bf-customer-id charges only a customer the key reaches", () => {
   const byName = g.admit(hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-customer-name", "Acme"]]), "openai", "gpt-4o") as Grant
   expect(byName.attr!.customerId).toBe("c1")
   expect((g.admit(hdrs([["x-bf-vk", "sk-bf-one"], ["x-bf-customer-id", "c9"]]), "openai", "gpt-4o") as Denial).status).toBe(403)
+})
+
+test("a cycles budget override adds to the limit for its cycles and then runs out", () => {
+  const cfg: Config = { governance: { budgets: [{ id: "b-cy", max_limit: 10.0, reset_duration: "1d", override: { amount: 5.0, mode: "cycles", cycles: 2 } }] } }
+  const g = new Governance(cfg)
+  const w = g.budgets.get("b-cy")!
+  const day = 86400000
+  const now = Date.now()
+  expect(w.remaining(now)).toBe(15.0)
+  // the first reset: one cycle of the two is left, so the extra still counts
+  w.start = now - day - 1
+  expect(w.remaining(now)).toBe(15.0)
+  // the second reset: the override has run its cycles
+  w.start = now - day - 1
+  expect(w.remaining(now)).toBe(10.0)
+  // a reload keeps the cycles a same override has run; a changed override starts again
+  const g2 = new Governance(cfg)
+  const w2 = g2.budgets.get("b-cy")!
+  w2.start = now - day - 1
+  w2.remaining(now)
+  const g3 = new Governance(cfg)
+  g3.carryUsage(g2)
+  expect(g3.budgets.get("b-cy")!.extraCycles).toBe(1)
+  expect(g3.budgets.get("b-cy")!.extra).toBe(5.0)
+  const other: Config = { governance: { budgets: [{ id: "b-cy", max_limit: 10.0, reset_duration: "1d", override: { amount: 7.0, mode: "cycles", cycles: 2 } }] } }
+  const g4 = new Governance(other)
+  g4.carryUsage(g2)
+  expect(g4.budgets.get("b-cy")!.extra).toBe(7.0)
+  expect(g4.budgets.get("b-cy")!.extraCycles).toBe(2)
+})
+
+test("an equal split gives each member a slice of the project budget, checked with it", () => {
+  const cfg: Config = { governance: {
+    budgets: [{ id: "b-pj", max_limit: 100.0, reset_duration: "1M" }],
+    virtual_keys: [{ id: "k-a", value: "sk-bf-a", user_id: "ana" }, { id: "k-b", value: "sk-bf-b", user_id: "bo" }, { id: "k-c", value: "sk-bf-c", user_id: "cy" }],
+    projects: [{ id: "p-eq", name: "eq", budget_id: "b-pj", split_policy: "equal", members: [{ id: "m1", user_id: "ana" }, { id: "m2", user_id: "bo" }] }],
+  } }
+  const g = new Governance(cfg)
+  const ha = hdrs([["x-bf-vk", "sk-bf-a"], ["x-bf-project-id", "p-eq"]])
+  const a1 = g.admit(ha, "openai", "gpt-4o") as Grant
+  expect(a1.kind).toBe("grant")
+  g.record(a1, 0, 40.0)
+  const a2 = g.admit(ha, "openai", "gpt-4o") as Grant
+  expect(a2.kind).toBe("grant")
+  g.record(a2, 0, 15.0)
+  // ana's slice is 50 and she has spent 55: refused, though the project has 100 left
+  const a3 = g.admit(ha, "openai", "gpt-4o") as Denial
+  expect(a3.status).toBe(402)
+  // bo has a slice of her own
+  const hb = hdrs([["x-bf-vk", "sk-bf-b"], ["x-bf-project-id", "p-eq"]])
+  expect((g.admit(hb, "openai", "gpt-4o") as Grant).kind).toBe("grant")
+  // cy is not a member: the project does not admit the key
+  const hc = hdrs([["x-bf-vk", "sk-bf-c"], ["x-bf-project-id", "p-eq"]])
+  expect((g.admit(hc, "openai", "gpt-4o") as Denial).status).toBe(403)
+})
+
+test("a member's own percent share caps the member under split none", () => {
+  const cfg: Config = { governance: {
+    budgets: [{ id: "b-pj", max_limit: 200.0, reset_duration: "1M" }],
+    virtual_keys: [{ id: "k-a", value: "sk-bf-a", user_id: "ana" }],
+    projects: [{ id: "p-none", name: "none", budget_id: "b-pj", members: [{ id: "m1", user_id: "ana", budget_shares: [{ source_budget_id: "b-pj", share_value: 25, share_type: "percent" }] }] }],
+  } }
+  const g = new Governance(cfg)
+  const h = hdrs([["x-bf-vk", "sk-bf-a"], ["x-bf-project-id", "p-none"]])
+  const a1 = g.admit(h, "openai", "gpt-4o") as Grant
+  g.record(a1, 0, 49.0)
+  expect((g.admit(h, "openai", "gpt-4o") as Grant).kind).toBe("grant")
+  g.record(g.admit(h, "openai", "gpt-4o") as Grant, 0, 5.0)
+  expect((g.admit(h, "openai", "gpt-4o") as Denial).status).toBe(402)
 })

@@ -1408,7 +1408,7 @@ def l97j_e2e(env):
         s, _, b = adm("PUT", "/api/governance/virtual-keys/vk-q/budgets/b-other/override", {"amount": 5, "mode": "forever"})
         check("an override of a budget the key does not draw on is a 404", s == 404, (s, b[:200]))
         s, _, b = adm("PUT", "/api/governance/virtual-keys/vk-q/budgets/b-q/override", {"amount": 5, "mode": "cycles", "cycles": 2})
-        check("a cycles override is refused", s == 400, (s, b[:200]))
+        check("a cycles override answers the limit it adds to", s == 200 and json.loads(b).get("effective_max_limit") == 15, (s, b[:200]))
         s, _, b = adm("DELETE", "/api/governance/virtual-keys/vk-q/budgets/b-q/override")
         s2, _, b2 = quota("sk-bf-quota-0123456789abcdef")
         check("clearing the override restores the limit", s == 200 and s2 == 200 and json.loads(b2)["budgets"][0]["effective_max_limit"] == 10, (s, b2[:300]))
@@ -1490,6 +1490,128 @@ def l97j_e2e(env):
         check("the new dashboard password works, and the config shows none", s == 200 and "pw-new-l97j" not in b and "pw-old-l97j" not in b, (s, b[:200]))
     finally:
         gw.terminate(); gw_b.terminate()
+
+GW_L97P = "http://127.0.0.1:18161"  # project members and caps, entity_dac, access profile versions, user-held profiles, cycles budgets, audit IPs, adaptive routing views
+
+def l97p_e2e(env):
+    """The governance last part: a project's roster, equal and per-member caps, admission of a member, entity_dac on a
+    role, access profile versions, clone, deactivate and propagate, the profiles a user holds and their links to the
+    user's keys, the creation policy, cycles budget overrides, audit events without IP addresses, and the adaptive
+    routing views. Its own gateway (18161)."""
+    import hashlib
+    import shutil
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    audit_dir = os.path.join(BUILD, "e2e.l97p-audit")
+    shutil.rmtree(audit_dir, ignore_errors=True)
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l97p", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "audit": {"enabled": True, "dir": audit_dir, "omit_ip_addresses": True, "retention_days": 365},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l97p-root")},
+                      {"name": "ann", "role": "editor", "token_sha256": tok("sk-admin-l97p-ann")},
+                      {"name": "bo", "role": "viewer", "token_sha256": tok("sk-admin-l97p-bo")}],
+            "budgets": [{"id": "b-pj", "max_limit": 100, "reset_duration": "1M"}, {"id": "b-ann", "max_limit": 10, "reset_duration": "1d"}],
+            "access_profiles": [{"id": "eng", "name": "Engineer", "provider_configs": [{"provider": "openai"}]}],
+            "virtual_keys": [
+                {"id": "vk-a", "name": "ann-key", "value": "sk-bf-l97p-ann-0123456789abcdef", "user_id": "ann", "budget_id": "b-ann", "provider_configs": [{"provider": "openai"}], "access_profile_ids": ["eng"]},
+                {"id": "vk-b", "name": "bo-key", "value": "sk-bf-l97p-bo-0123456789abcdef", "user_id": "bo", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-c", "name": "cy-key", "value": "sk-bf-l97p-cy-0123456789abcdef", "provider_configs": [{"provider": "openai"}]},
+            ],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.l97p.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18161", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.l97p.log"), "w"))
+    root = {"authorization": "Bearer sk-admin-l97p-root"}
+    ann = {"authorization": "Bearer sk-admin-l97p-ann"}
+    def adm(method, p, body=None, who=root, headers=None):
+        h = dict(who)
+        h.update(headers or {})
+        return call(method, p, body, h, base=GW_L97P, auth=False)
+    try:
+        wait(GW_L97P + "/health")
+        s, _, b = adm("POST", "/api/governance/projects", {"id": "pj", "name": "eval", "access_rule": "union", "budget_id": "b-pj", "membership_mode": "explicit"})
+        check("a project is created for the roster", s == 201, (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/projects/pj/members", {"members": [{"user_id": "ann"}, {"user_id": "bo"}, {"user_id": "ann"}]})
+        check("members are added, each user once", s == 201 and json.loads(b)["members"].__len__() == 2, (s, b[:300]))
+        s, _, b = adm("POST", "/api/governance/projects/pj/members", {"members": [{"user_id": "nobody"}]})
+        check("a member who is not a stored user is refused", s == 400, (s, b[:200]))
+        s, _, b = adm("GET", "/api/governance/projects/pj/members")
+        members = json.loads(b)["members"] if s == 200 else []
+        check("the roster lists two members", s == 200 and json.loads(b)["total_count"] == 2, (s, b[:200]))
+        mid = members[0]["id"] if members else "none"
+        s, _, b = adm("PUT", f"/api/governance/projects/pj/members/{mid}", {"budget_shares": [{"source_budget_id": "b-pj", "share_value": 50, "share_type": "percent"}]})
+        check("a member's own cap is set under split none", s == 200 and json.loads(b)["member"]["budget_shares"][0]["share_value"] == 50, (s, b[:300]))
+        s, _, b = adm("PUT", f"/api/governance/projects/pj/members/{mid}", {"budget_shares": [{"source_budget_id": "b-other", "share_value": 5, "share_type": "amount"}]})
+        check("a cap on a budget the project does not hold is refused", s == 400, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, {"x-bf-vk": "sk-bf-l97p-cy-0123456789abcdef", "x-bf-project-id": "pj"}, base=GW_L97P, auth=False)
+        check("a key that is not on the roster is refused the project", s == 403 and "access_blocked" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, {"x-bf-vk": "sk-bf-l97p-ann-0123456789abcdef", "x-bf-project-id": "pj"}, base=GW_L97P, auth=False)
+        check("a member's key is admitted to the project", "access_blocked" not in b, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/governance/projects/pj", {"name": "eval", "budget_id": "b-pj", "split_policy": "equal"})
+        check("a project splits equally", s == 200 and json.loads(b)["project"]["split_policy"] == "equal", (s, b[:200]))
+        s, _, b = adm("PUT", f"/api/governance/projects/pj/members/{mid}", {"budget_shares": []})
+        check("member caps are refused under an equal split", s == 400, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/governance/projects/pj", {"name": "eval", "split_policy": "weekly"})
+        check("an unknown split policy is refused", s == 400, (s, b[:200]))
+
+        s, _, b = adm("POST", "/api/roles", {"name": "acct", "dac": "team-data", "entity_dac": {"Projects": "all-data"}, "permissions": []})
+        check("a role's entity_dac is created as Bifrost's object", s == 201 and '"entity_dac":{"Projects":"all-data"}' in b, (s, b[:300]))
+        s, _, b = adm("POST", "/api/roles", {"name": "bad", "entity_dac": {"Projects": "weekly"}})
+        check("an entity_dac with an unknown scope is refused", s == 400, (s, b[:200]))
+
+        s, _, b = adm("POST", "/api/governance/access-profiles/eng/deactivate")
+        check("an access profile is deactivated", s == 200 and json.loads(b).get("is_active") is False, (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/access-profiles/eng/activate")
+        check("an access profile is activated again", s == 200 and json.loads(b).get("is_active") is True, (s, b[:200]))
+        s, _, b = adm("GET", "/api/governance/access-profiles/eng/versions")
+        check("the profile's versions record each change", s == 200 and '"action":"deactivate"' in b and '"action":"activate"' in b, (s, b[:300]))
+        s, _, b = adm("POST", "/api/governance/access-profiles/eng/clone", {"id": "eng-2", "name": "Engineer copy"})
+        check("a profile is cloned under a new id", s == 201 and json.loads(b).get("name") == "Engineer copy", (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/access-profiles/eng/propagate", {"fields": ["provider_configs"]})
+        check("propagate reaches the keys that hold the profile", s == 200 and json.loads(b).get("updated") == 1, (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/access-profiles/eng/propagate", {"fields": ["nope"]})
+        check("propagate refuses an unknown field", s == 400, (s, b[:200]))
+
+        s, _, b = call("GET", "/api/users/me/vk-creation-policy", None, ann, base=GW_L97P, auth=False)
+        check("a user with no profile has no creation policy", s == 200 and json.loads(b) == {"has_access_profile": False}, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/users/ann/access-profiles/eng")
+        check("a user is given an access profile", s == 200, (s, b[:200]))
+        s, _, b = adm("GET", "/api/users/ann/access-profiles")
+        check("the user's profiles are listed", s == 200 and "Engineer" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/users/me/vk-creation-policy", None, ann, base=GW_L97P, auth=False)
+        check("the creation policy names the profile the user holds", s == 200 and json.loads(b) == {"has_access_profile": True, "profile_name": "Engineer"}, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/users/ann/access-profiles/eng/virtual-keys/vk-b")
+        check("a profile cannot link a key the user does not hold", s == 404, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/users/ann/access-profiles/eng/virtual-keys/vk-a")
+        check("a profile links to the user's own key", s == 200, (s, b[:200]))
+        s, _, b = adm("GET", "/api/users/me/vk-creation-policy", None, root)
+        check("the admin has no per-user creation policy", s == 200 and json.loads(b) == {"has_access_profile": False}, (s, b[:200]))
+
+        s, _, b = adm("PUT", "/api/governance/virtual-keys/vk-a/budgets/b-ann/override", {"amount": 5, "mode": "cycles", "cycles": 2})
+        check("a cycles override adds to the budget for its cycles", s == 200 and json.loads(b).get("effective_max_limit") == 15, (s, b[:200]))
+        s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-l97p-ann-0123456789abcdef"}, base=GW_L97P, auth=False)
+        check("the quota view shows the cycles override", s == 200 and json.loads(b)["budgets"][0]["effective_max_limit"] == 15, (s, b[:300]))
+        s, _, b = adm("PUT", "/api/governance/virtual-keys/vk-a/budgets/b-ann/override", {"amount": 5, "mode": "weekly"})
+        check("an override mode other than forever or cycles is refused", s == 400, (s, b[:200]))
+
+        s, _, b = adm("POST", "/api/governance/budgets", {"id": "b-audit", "max_limit": 1, "reset_duration": "1d"}, headers={"x-forwarded-for": "10.9.8.7"})
+        s2, _, b2 = adm("GET", "/api/audit-logs?limit=100")
+        check("audit events are recorded without client addresses", s == 201 and s2 == 200 and "/api/governance/budgets" in b2 and "10.9.8.7" not in b2, (s2, b2[:300]))
+
+        s, _, b = adm("GET", "/api/adaptive-routing/held-keys")
+        check("no keys are held when nothing has tripped", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = adm("GET", "/api/adaptive-routing/incidents")
+        check("no incidents when no circuit is open", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = adm("POST", "/api/adaptive-routing/conditions/clear", {"keys": ["openai#pool"]})
+        check("releasing a key that is not held closes nothing", s == 200 and json.loads(b)["count"] == 0, (s, b[:200]))
+        s, _, b = adm("GET", "/api/adaptive-routing/conditions/clear")
+        check("the release route takes POST", s == 405, (s, b[:200]))
+    finally:
+        gw.terminate()
 
 MCP_KEYS = "http://127.0.0.1:18123"  # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients
 
@@ -4802,6 +4924,8 @@ def main():
         l97l_e2e(env)
         # span filters, session traces, chain rules, jsonparser streams and streamed output guardrails: their own gateways
         l97m_e2e(env)
+        # the governance last part: project rosters and caps, entity_dac, access profile versions, user-held profiles, cycles overrides, audit IPs and adaptive routing views
+        l97p_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

@@ -593,8 +593,40 @@ function mapAudit(inout top: Field[], inout notes: string[]): void throws Syntax
   const key = strRaw(af, "hmac_key")
   add(&out, "key", key)
   if (key === undefined || key === "\"\"") notes.push(`config: "audit_logs.hmac_key" is not set, so audit entries are signed with an empty key`)
-  ignored("audit_logs", af, ["retention_days", "omit_ip_addresses", "archive_interval", "archive_grace_period", "archive_max_object_bytes", "object_storage"], &notes)
+  add(&out, "retention_days", find(af, "retention_days"))
+  add(&out, "omit_ip_addresses", find(af, "omit_ip_addresses"))
+  const grace = try durationSecondsRaw(find(af, "archive_grace_period"))
+  add(&out, "archive_grace_seconds", grace)
+  // object_storage archives the events (archive_interval is the window): the S3 or GCS fields as LogExportsConfig reads them
+  const os = find(af, "object_storage")
+  if (os !== undefined) {
+    const of = try members(os)
+    let ar: Field[] = []
+    add(&ar, "enabled", "true")
+    add(&ar, "kind", find(of, "type") ?? "\"s3\"")
+    add(&ar, "bucket", find(of, "bucket"))
+    add(&ar, "prefix", find(of, "prefix"))
+    add(&ar, "region", find(of, "region"))
+    add(&ar, "endpoint", find(of, "endpoint"))
+    add(&ar, "access_key_id", find(of, "access_key_id"))
+    add(&ar, "secret_access_key", find(of, "secret_access_key"))
+    add(&ar, "session_token", find(of, "session_token"))
+    add(&ar, "path_style", find(of, "path_style"))
+    const interval = try durationSecondsRaw(find(af, "archive_interval"))
+    add(&ar, "interval_seconds", interval)
+    add(&out, "archive", build(ar))
+    if (find(of, "compress") !== undefined) notes.push(`config: "audit_logs.object_storage.compress" is ignored: archive objects are plain JSONL`)
+  }
+  ignored("audit_logs", af, ["archive_max_object_bytes"], &notes)
   put(&top, "audit", out)
+}
+
+// A Go duration (a JSON string) as a raw number of seconds; undefined when it is not one.
+function durationSecondsRaw(raw: string | undefined): string | undefined throws SyntaxError {
+  if (raw === undefined || !raw.startsWith("\"")) return undefined
+  const ms = durationMsOf(try decodeString(raw))
+  if (ms <= 0) return undefined
+  return `${Math.floor(ms / 1000)}`
 }
 
 // cluster_config becomes cluster. Raiju signs cluster sync with cluster.secret, which Bifrost
@@ -1301,11 +1333,44 @@ function mapWebhooks(inout top: Field[]): void throws SyntaxError {
   setField(&top, "webhooks", "[" + out.join(",") + "]")
 }
 
+// governance.roles[].entity_dac: Bifrost's object form ({"Logs": "own-data"}) becomes the list Raiju keeps
+// ([{"resource": "Logs", "dac": "own-data"}]). Any other shape is left for the typed read to refuse.
+function mapRoleDac(inout top: Field[]): void throws SyntaxError {
+  const gRaw = find(top, "governance")
+  if (gRaw === undefined) return
+  let gov = try members(gRaw)
+  const rRaw = find(gov, "roles")
+  if (rRaw === undefined || !rRaw.startsWith("[")) return
+  const roles = try elements(rRaw)
+  let outRoles: string[] = []
+  for (const role of roles) {
+    if (!role.startsWith("{")) {
+      outRoles.push(role)
+      continue
+    }
+    let rf = try members(role)
+    const ed = find(rf, "entity_dac")
+    if (ed === undefined || !ed.startsWith("{")) {
+      outRoles.push(role)
+      continue
+    }
+    let list: string[] = []
+    for (const f of try members(ed)) {
+      list.push(build([{ key: "resource", raw: quote(f.key) }, { key: "dac", raw: f.raw }]))
+    }
+    setField(&rf, "entity_dac", "[" + list.join(",") + "]")
+    outRoles.push(build(rf))
+  }
+  setField(&gov, "roles", "[" + outRoles.join(",") + "]")
+  put(&top, "governance", gov)
+}
+
 export function normalize(configText: string): { text: string, notes: string[] } throws SyntaxError {
   let top = try fields(configText)
   let notes: string[] = []
   try mapWebhooks(&top)
   try mapAuth(&top, &notes)
+  try mapRoleDac(&top)
   try mapClient(&top, &notes)
   try mapMcp(&top, &notes)
   try mapAlerting(&top, &notes)
@@ -1443,11 +1508,40 @@ test("maps audit_logs to audit and flags an empty signing key", () => {
   const au = try fields(find(try fields(r.text), "audit")!)
   expect(rawBool(au, "enabled")).toBe(true)
   expect(rawStr(au, "key")).toBe("env.AUDIT_KEY")
-  expect(r.notes.includes(`config: "audit_logs.retention_days" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(rawNum(au, "retention_days")).toBe(30)
+  expect(r.notes.includes(`config: "audit_logs.retention_days" is not supported by Raiju and is ignored`)).toBe(false)
   const off = try normalize(`{ "audit_logs": { "disabled": true } }`)
   const af = try fields(find(try fields(off.text), "audit")!)
   expect(rawBool(af, "enabled")).toBe(false)
   expect(off.notes.includes(`config: "audit_logs.hmac_key" is not set, so audit entries are signed with an empty key`)).toBe(true)
+})
+
+test("governance roles: entity_dac in Bifrost's object form is read as the list Raiju keeps", () => {
+  const r = try normalize(`{ "governance": { "roles": [ { "name": "acct", "dac": "team-data", "entity_dac": { "Logs": "own-data" } }, { "name": "plain" } ] } }`)
+  const roles = try elements(find(try members(find(try fields(r.text), "governance")), "roles") ?? "[]")
+  expect(roles.length).toBe(2)
+  const acct = try fields(roles[0]!)
+  const list = try elements(find(acct, "entity_dac") ?? "[]")
+  expect(list.length).toBe(1)
+  const e = try fields(list[0]!)
+  expect(rawStr(e, "resource")).toBe("Logs")
+  expect(rawStr(e, "dac")).toBe("own-data")
+})
+
+test("audit_logs: omit_ip_addresses, the grace period and object_storage map to audit, and are no longer ignored", () => {
+  const r = try normalize(`{ "audit_logs": { "hmac_key": "k", "omit_ip_addresses": true, "archive_grace_period": "15m", "archive_interval": "6h", "archive_max_object_bytes": 1048576,
+    "object_storage": { "type": "s3", "bucket": "audit-bkt", "prefix": "acme", "region": "eu-west-1", "access_key_id": "AKIA", "secret_access_key": "s", "compress": true } } }`)
+  const au = try fields(find(try fields(r.text), "audit")!)
+  expect(rawBool(au, "omit_ip_addresses")).toBe(true)
+  expect(rawNum(au, "archive_grace_seconds")).toBe(900)
+  const ar = try fields(find(au, "archive")!)
+  expect(rawBool(ar, "enabled")).toBe(true)
+  expect(rawStr(ar, "kind")).toBe("s3")
+  expect(rawStr(ar, "bucket")).toBe("audit-bkt")
+  expect(rawNum(ar, "interval_seconds")).toBe(21600)
+  expect(r.notes.includes(`config: "audit_logs.archive_max_object_bytes" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "audit_logs.object_storage.compress" is ignored: archive objects are plain JSONL`)).toBe(true)
+  expect(r.notes.includes(`config: "audit_logs.omit_ip_addresses" is not supported by Raiju and is ignored`)).toBe(false)
 })
 
 test("keeps the cluster off without a secret, and says why", () => {
