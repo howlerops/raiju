@@ -9,6 +9,8 @@ import { parseDatasheet } from "./pricing"
 import { deliveryLog } from "./webhooks"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
+import { PushGatewayConfig, pushProblem, pushUrl, pushHeaders, pushInterval } from "./pushgateway"
+import { join } from "node:path"
 import { Engine } from "./gateway"
 import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
@@ -259,6 +261,20 @@ async function postText(url: string, headers: Map<string, string>, body: string,
   try {
     const hs: Record<string, string> = headers
     const r = await fetch(url, { method: "POST", headers: hs, body: body, tls: tls, signal: dl.controller.signal })
+    const b = await r.text()
+    dl.finish()
+    return { status: r.status, body: b }
+  } catch (e) {
+    dl.finish()
+    return { status: 0, body: e.message }
+  }
+}
+
+async function putText(url: string, headers: Map<string, string>, body: string): Promise<{ status: int, body: string }> {
+  const dl = deadline(10000)
+  try {
+    const hs: Record<string, string> = headers
+    const r = await fetch(url, { method: "PUT", headers: hs, body: body, signal: dl.controller.signal })
     const b = await r.text()
     dl.finish()
     return { status: r.status, body: b }
@@ -534,6 +550,9 @@ export class Ops {
   // Applies the parts of a (resolved) config that live here.
   configure(cfg: Config): void {
     deliveryLog().setRetentionDays(cfg.client?.webhook_config?.delivery_history_retention_days)
+    // deliveries survive restarts in the logs_store folder, when that store is on
+    const lsw = cfg.logs_store
+    if (lsw !== undefined && lsw.enabled === true) deliveryLog().persistTo(join(lsw.dir ?? "logs", "webhook-deliveries.jsonl"))
     const gov = cfg.governance
     const users: UserConfig[] = gov?.users ?? []
     const auth = gov?.auth_config
@@ -563,6 +582,7 @@ export class Ops {
     }
     this.configurePricing(cfg.pricing_sync)
     this.configureOtelMetrics(cfg.otel)
+    this.configurePushGateway(cfg.telemetry?.push_gateway)
     this.configureAlerts(cfg.alerts)
     this.configureCluster(cfg.cluster)
     this.configureProxy(cfg.auth_proxy, cfg.oidc)
@@ -908,6 +928,37 @@ export class Ops {
       }
       this.pushOtel(r.url, r.headers, r.body, tls)
     }, pushIntervalSeconds(s) * 1000)
+  }
+
+  // ---- Prometheus Push Gateway (Bifrost's telemetry push_gateway) ----
+
+  pushTimer: int = -1
+  pushKey = ""
+
+  configurePushGateway(pc: PushGatewayConfig | undefined): void {
+    const key = pc === undefined || pc.enabled !== true ? "" : JSON.stringify(pc)
+    if (key === this.pushKey) return
+    this.pushKey = key
+    if (this.pushTimer >= 0) {
+      clearInterval(this.pushTimer)
+      this.pushTimer = -1
+    }
+    if (pc === undefined || key === "") return
+    const problem = pushProblem(pc)
+    if (problem !== undefined) {
+      console.error(`raiju: push gateway: ${problem}`)
+      return
+    }
+    const url = pushUrl(pc)
+    const h = pushHeaders(pc)
+    this.pushTimer = setInterval(() => {
+      this.pushMetrics(url, h)
+    }, pushInterval(pc) * 1000)
+  }
+
+  async pushMetrics(url: string, h: Map<string, string>): Promise<void> {
+    const r = await putText(url, h, this.metricsText())
+    if (r.status < 200 || r.status >= 300) console.error(`raiju: push gateway: HTTP ${r.status} from ${url}`)
   }
 
   async pushOtel(url: string, h: Map<string, string>, body: string, tls: TlsOpts | undefined): Promise<void> {

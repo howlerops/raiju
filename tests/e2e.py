@@ -1731,6 +1731,105 @@ def l97g_e2e(env):
         gw_b.terminate()
 
 
+GW_L97I = "http://127.0.0.1:18146"  # the L97i gateway: mocker rules, the push gateway, redacted log rows, webhook deliveries kept
+GW_L97I_B = "http://127.0.0.1:18147"  # the same config restarted, to read the deliveries back
+
+def l97i_config():
+    """The L97i gateway's config: the mock as OpenAI, Bifrost-shaped mocker rules, telemetry's push gateway at the mock,
+    email redaction with raw bodies kept in the log store, and webhook deliveries kept in the log store's folder."""
+    return {
+        "client": {"enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l97i-logs")},
+        "guardrails": {"enabled": True, "detect": ["email"], "mode": "redact"},
+        "providers": {"openai": {"keys": [{"name": "i", "value": "sk-l97i", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "store_raw_request_response": True}},
+        "plugins": [
+            {"name": "telemetry", "enabled": True, "config": {"push_gateway": {"enabled": True, "push_gateway_url": MOCK, "job_name": "l97i", "instance_id": "e2e", "push_interval": 1}}},
+            {"name": "mocker", "enabled": True, "config": {"rules": [
+                {"name": "cond", "conditions": {"models": ["l97i-mock"]}, "responses": [{"type": "success", "content": {"message": "l97i mocked"}}]},
+                {"name": "err", "priority": 5, "conditions": {"models": ["l97i-err"]}, "responses": [{"type": "error", "error": {"message": "l97i refused", "type": "rate_limit", "status_code": 429}}]},
+                {"name": "off", "enabled": False, "conditions": {"models": ["l97i-off"]}, "responses": [{"type": "success", "content": {"message": "should not answer"}}]},
+            ]}},
+        ],
+    }
+
+def l97i_e2e(env):
+    """Mocker rules in Bifrost's shape (conditions, priority, enabled, weighted responses); telemetry pushes /metrics to a
+    push gateway under its job and instance; email is redacted before the upstream and in the stored log row; webhook
+    deliveries are still listed after a restart."""
+    import shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l97i-logs"), ignore_errors=True)
+    cfg = os.path.join(BUILD, "e2e.l97i.json")
+    json.dump(l97i_config(), open(cfg, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18146", "-host", "127.0.0.1", "-config", cfg, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97i.log"), "w"))
+    gw_b = None
+    try:
+        wait(GW_L97I + "/health")
+        def api(method, path, body=None, headers=None, base=GW_L97I):
+            return call(method, path, body, headers, base=base, auth=False)
+        def hooks():
+            return json.loads(call("GET", "/_hooks", base=MOCK, auth=False)[2])
+        chat = lambda model, text: api("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": text}]})
+
+        before = len(seen())
+        s, _, b = chat("openai/l97i-mock", "hi")
+        check("a mocker rule with conditions answers its model without the upstream", s == 200 and "l97i mocked" in b and len(seen()) == before, (s, b[:200]))
+        s, _, b = chat("openai/l97i-err", "hi")
+        check("a mocker error response carries its status_code and message", s == 429 and "l97i refused" in b, (s, b[:200]))
+        s, _, b = chat("openai/l97i-off", "hi")
+        check("a disabled mocker rule is skipped", s == 200 and "should not answer" not in b, (s, b[:200]))
+
+        got = []
+        for _ in range(40):
+            got = [x for x in hooks() if x["event"] == "pushgateway" and x["path"] == "/metrics/job/l97i/instance/e2e"]
+            if got:
+                break
+            time.sleep(0.5)
+        check("telemetry pushes /metrics to the push gateway under its job and instance", bool(got) and "http_requests_total" in got[-1]["body"], len(got))
+
+        s, _, b = chat("openai/echo-l97i", "write to a.person@example.com please")
+        upstream_chat = [x for x in seen() if x["path"] == "/v1/chat/completions"]
+        check("the upstream gets the email redacted", s == 200 and "[REDACTED:EMAIL]" in upstream_chat[-1]["body"] and "a.person@example.com" not in upstream_chat[-1]["body"], (s, b[:200]))
+        rows = []
+        for _ in range(40):
+            rows = []
+            for name in os.listdir(os.path.join(BUILD, "e2e-l97i-logs")):
+                if not name.endswith(".jsonl") or name.startswith("webhook"):
+                    continue
+                for line in open(os.path.join(BUILD, "e2e-l97i-logs", name)):
+                    if "echo-l97i" in line:
+                        rows.append(line)
+            if rows:
+                break
+            time.sleep(0.5)
+        check("the stored log row keeps no raw email, in the request or the raw bodies", bool(rows) and all("a.person@example.com" not in r for r in rows), len(rows))
+
+        s, _, b = api("POST", "/api/webhooks", {"name": "l97i-hook", "url": MOCK + "/webhook-receiver", "events": ["async_job.completed"], "allow_private_network": True, "retry_backoff_initial_seconds": 1, "retry_backoff_max_seconds": 1, "max_retries": 1})
+        hook_id = json.loads(b)["endpoint"]["id"]
+        s, _, b = api("POST", "/v1/async/chat/completions", {"model": "openai/echo-l97i", "messages": [{"role": "user", "content": "l97i-job"}]}, headers={"x-bf-async-webhook": "l97i-hook"})
+        job_id = json.loads(b)["id"]
+        delivered = []
+        for _ in range(60):
+            delivered = [d for d in json.loads(api("GET", f"/api/webhooks/{hook_id}/deliveries")[2])["deliveries"] if d["status"] == "delivered"]
+            if delivered:
+                break
+            time.sleep(0.5)
+        check("the job's outcome is delivered", len(delivered) == 1 and any(job_id in h["body"] for h in hooks() if h["path"] == "/webhook-receiver"), len(delivered))
+
+        gw.terminate()
+        gw.wait()
+        gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18147", "-host", "127.0.0.1", "-config", cfg, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97i-b.log"), "w"))
+        wait(GW_L97I_B + "/health")
+        s, _, b = api("GET", "/api/webhooks/deliveries", base=GW_L97I_B)
+        after = json.loads(b)["deliveries"] if s == 200 else []
+        check("a webhook delivery is still listed after a restart", any(d["id"] == delivered[0]["id"] and d["status"] == "delivered" for d in after), (s, b[:200]))
+    finally:
+        gw.terminate()
+        if gw_b is not None:
+            gw_b.terminate()
+
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -3956,6 +4055,8 @@ def main():
         l97c_e2e(env)
         # client limits, header filters, setup_token, batch keys and alias depth: their own gateways
         l97g_e2e(env)
+        # mocker rules in Bifrost's shape, telemetry's push gateway, redaction in stored rows, and webhook deliveries after a restart: their own gateways
+        l97i_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

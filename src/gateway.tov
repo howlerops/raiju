@@ -43,7 +43,7 @@ import * as databricks from "./providers/databricks"
 import * as copilot from "./providers/githubcopilot"
 import * as metrics from "./metrics"
 import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
-import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails"
+import { GuardConfig, applyToChatRequest, applyToCompletion, applyToText } from "./guardrails"
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
@@ -313,6 +313,13 @@ export class StreamConverter {
 
 // The chat body with its only message's text replaced, or undefined when there isn't exactly
 // one message with string content.
+// "provider/model" split at the first slash; a bare name has no provider.
+function splitModel(m: string): { provider: string, model: string } {
+  const i = m.indexOf("/")
+  if (i < 0) return { provider: "", model: m }
+  return { provider: m.slice(0, i), model: m.slice(i + 1) }
+}
+
 function singleTextMessage(chatBody: string, replacement: string): string | undefined {
   try {
     let fs = fields(chatBody)
@@ -1136,15 +1143,15 @@ export class Engine {
     const mode = cplx.classifierMode(cx.classifier)
     if (mode === "heuristic") return this.tierOf(text, cx)
     let t: Tier | undefined = undefined
-    if (mode === "decision") t = await cplx.decisionTier(text, cx.decision, async (b: string) => await this.classifierCall(req, "/v1/decisions", b))
-    else if (mode === "llm") t = await cplx.llmTier(text, cx.llm, async (b: string) => await this.classifierCall(req, "/v1/chat/completions", b))
-    else t = await cplx.semanticTier(text, cx.semantic, async (b: string) => await this.classifierCall(req, "/v1/embeddings", b))
+    if (mode === "decision") t = await cplx.decisionTier(text, cx.decision, async (b: string, ph: string) => await this.classifierCall(req, "/v1/decisions", b, ph))
+    else if (mode === "llm") t = await cplx.llmTier(text, cx.llm, async (b: string, ph: string) => await this.classifierCall(req, "/v1/chat/completions", b, ph))
+    else t = await cplx.semanticTier(text, cx.semantic, async (b: string, ph: string) => await this.classifierCall(req, "/v1/embeddings", b, ph))
     return t ?? this.tierOf(text, cx)
   }
 
   // A classifier's own call, answered by the route it names with the caller's headers. The chat
   // call is marked with a forced tier, so it is not classified in turn. undefined when it fails.
-  async classifierCall(req: Request, route: string, body: string): Promise<string | undefined> {
+  async classifierCall(req: Request, route: string, body: string, phase: string): Promise<string | undefined> {
     try {
       const hs: Record<string, string> = snapshot(req.headers)
       hs.set("x-bf-complexity-tier", "MEDIUM")
@@ -1162,9 +1169,24 @@ export class Engine {
       }
       const out = try await res.text()
       if (res.status !== 200) return undefined
+      if (route !== "/v1/decisions") this.recordClassifier(route, body, out, phase)
       return out
     } catch (e) {
       return undefined
+    }
+  }
+
+  // bifrost_routing_embedding_* and bifrost_routing_llm_*: the classifier's own call and its cost.
+  recordClassifier(route: string, body: string, out: string, phase: string): void {
+    try {
+      const sent = try JSON.parse(body) as { model?: string }
+      const at = splitModel(sent.model ?? "")
+      const u = try JSON.parse(out) as { usage?: { prompt_tokens?: int, completion_tokens?: int } }
+      const cost = this.pricing.cost(at.provider, at.model, u.usage?.prompt_tokens ?? 0, u.usage?.completion_tokens ?? 0)
+      if (route === "/v1/embeddings") metrics.observeRoutingEmbedding(at.provider, at.model, phase, cost)
+      else metrics.observeRoutingLLM(at.provider, at.model, cost)
+    } catch (e) {
+      return
     }
   }
 
@@ -2187,6 +2209,14 @@ export class Engine {
   }
 
   // Request duration metric, stdout log line, log store entry and trace span for one request.
+  // The raw upstream bodies that logs and log exports keep get the guardrail redaction too, as the
+  // content fields do (Bifrost: stored log fields and exports carry the redacted payload).
+  redactRaw(raw: string): string {
+    const g = this.guard
+    if (g === undefined || g.mode !== "redact") return raw
+    return applyToText(raw, g).body
+  }
+
   record(c: ReqCtx): void {
     const ms = performance.now() - c.started
     const ok = c.status >= 200 && c.status < 300
@@ -2211,8 +2241,8 @@ export class Engine {
     }
     if (store !== undefined) {
       store.add({
-        raw_request: c.contentOff || c.rawRequest === "" ? undefined : c.rawRequest,
-        raw_response: c.contentOff || c.rawResponse === "" ? undefined : c.rawResponse,
+        raw_request: c.contentOff || c.rawRequest === "" ? undefined : this.redactRaw(c.rawRequest),
+        raw_response: c.contentOff || c.rawResponse === "" ? undefined : this.redactRaw(c.rawResponse),
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
         latency_ms: ms, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, cache_hit: c.cached,
         virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, team_id: c.teamId === "" ? undefined : c.teamId,

@@ -12,8 +12,10 @@
 // Bifrost emits only these two events. Alerts, budgets and config changes reach the dashboard
 // through notify.tov, and alerting channels have their own webhook type (alerts.tov).
 //
-// Deliveries are kept in memory, the last 500 of them, per process. Endpoints are config (the
+// Deliveries are the last 500 of them: kept in memory, and written to webhook-deliveries.jsonl in the
+// logs_store folder when that store is on, so they survive a restart. Endpoints are config (the
 // webhooks section), so they survive restarts.
+import { readFileSync, writeFileSync, existsSync } from "node:fs"
 import { hmacSha256, utf8, secureHex } from "./crypto"
 import { encode, decode } from "./base64"
 import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString } from "./json"
@@ -50,21 +52,57 @@ const MASK = "********"
 const KEEP = 500
 const PROTECTED: string[] = ["webhook-id", "webhook-timestamp", "webhook-signature", "x-bifrost-event", "content-type", "content-length", "user-agent", "host", "connection", "transfer-encoding"]
 
-// Deliveries of this process, newest last.
+// Deliveries, newest last. With a file set (persistTo), every change is written to it, so the
+// history survives a restart; without one they live in memory only.
 export class DeliveryLog {
   rows: Delivery[] = []
   // webhook_config.delivery_history_retention_days in ms: older deliveries are dropped on the next add
   retentionMs: int = 30 * 86400000
+  file = ""
 
   add(d: Delivery): void {
     this.rows.push(d)
     const cutoff = Math.floor(Date.now()) - this.retentionMs
     this.rows = this.rows.filter((r) => r.created_at >= cutoff)
     if (this.rows.length > KEEP) this.rows = this.rows.slice(this.rows.length - KEEP)
+    this.save()
   }
 
   setRetentionDays(days: int | undefined): void {
     this.retentionMs = Math.floor((days ?? 30) * 86400000)
+  }
+
+  // Loads the rows kept in path (one JSON object per line; unreadable lines are skipped) and writes
+  // every later change there. A missing file starts empty.
+  persistTo(path: string): void {
+    this.file = path
+    if (!existsSync(path)) return
+    try {
+      const loaded: Delivery[] = []
+      for (const line of try readFileSync(path, "utf8").split("\n")) {
+        if (line === "") continue
+        try {
+          const d = try JSON.parse(line) as Delivery
+          loaded.push(d)
+        } catch (e) {
+          continue
+        }
+      }
+      this.rows = loaded.slice(Math.max(0, loaded.length - KEEP))
+    } catch (e) {
+      console.error(`raiju: webhook deliveries: could not read ${path}: ${e.message}`)
+    }
+  }
+
+  save(): void {
+    if (this.file === "") return
+    try {
+      let text = ""
+      for (const r of this.rows) text += JSON.stringify(r) + "\n"
+      try writeFileSync(this.file, text)
+    } catch (e) {
+      console.error(`raiju: webhook deliveries: could not write ${this.file}: ${e.message}`)
+    }
   }
 
   indexOf(id: string): int {
@@ -82,6 +120,7 @@ export class DeliveryLog {
     this.rows[i]!.status_code = status
     this.rows[i]!.error = error
     this.rows[i]!.updated_at = now
+    this.save()
   }
 
   settle(id: string, status: string, now: int): void {
@@ -89,6 +128,7 @@ export class DeliveryLog {
     if (i < 0) return
     this.rows[i]!.status = status
     this.rows[i]!.updated_at = now
+    this.save()
   }
 }
 
