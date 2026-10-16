@@ -1922,6 +1922,89 @@ def declared_post(port: int, path: str, total: int) -> int | None:
         return None
 
 
+GW_L97M_A = "http://127.0.0.1:18155"  # OTel span filter, session traces, overhead spans, chain rules, user labels, JSON stream completion
+GW_L97M_B = "http://127.0.0.1:18156"  # streamed output guardrails: a block ends the stream with the error event
+
+
+def l97m_config_a() -> dict:
+    """The L97m gateway A: the mock as OpenAI, a two-step routing chain, OTel options, telemetry switches and jsonparser."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "prometheus_labels": ["team"]},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "m", "value": "sk-l97m", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"routing_rules": [
+            {"id": "chain-1", "name": "normalize", "cel_expression": "model == 'chain-a'", "targets": [{"provider": "openai", "model": "chain-b", "weight": 1.0}], "chain_rule": True, "enabled": True},
+            {"id": "chain-2", "name": "final", "cel_expression": "model == 'chain-b'", "targets": [{"provider": "openai", "model": "gpt-4o-mini", "weight": 1.0}], "enabled": True},
+        ]},
+        "otel": {"endpoint": MOCK + "/v1/traces", "service_name": "raiju-l97m", "flush_ms": 100, "group_traces_by_session": True,
+                 "plugin_span_filter": {"mode": "exclude", "plugins": ["governance"]}, "export_overhead_spans": True, "disable_root_span_content": True},
+        "telemetry": {"overhead_breakdown_enabled": True, "user_labels_enabled": True},
+        "plugins": [{"name": "jsonparser", "enabled": True, "placement": "builtin", "order": 0, "config": {"usage": "all_requests"}}],
+    }
+
+
+def l97m_config_b() -> dict:
+    """The L97m gateway B: the mock as OpenAI, and a regex output rule that blocks a greeting as it streams."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "m", "value": "sk-l97m-b", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "guardrails": {"enabled": True, "apply_to": "both", "detect": [], "providers": [
+            {"id": "greeting", "kind": "regex", "apply_to": "output", "patterns": [{"pattern": "Hello", "description": "Greeting", "action": "block"}]}]},
+    }
+
+
+def l97m_e2e(env):
+    """Span filters, session traces, overhead spans and the overhead and user-label switches; chain rules; jsonparser
+    streams; and streamed output guardrails that end the stream with the error event. Their own gateways."""
+    import hashlib
+    cfg_a = os.path.join(BUILD, "e2e.l97m.a.json")
+    cfg_b = os.path.join(BUILD, "e2e.l97m.b.json")
+    json.dump(l97m_config_a(), open(cfg_a, "w"))
+    json.dump(l97m_config_b(), open(cfg_b, "w"))
+    gw_a = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18155", "-host", "127.0.0.1", "-config", cfg_a, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97m.a.log"), "w"))
+    gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18156", "-host", "127.0.0.1", "-config", cfg_b, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97m.b.log"), "w"))
+    try:
+        wait(GW_L97M_A + "/health")
+        wait(GW_L97M_B + "/health")
+        msgs = [{"role": "user", "content": "hi"}]
+        sess = "l97m-sess"
+        tid = hashlib.sha256(sess.encode()).hexdigest()[:32]
+        for _ in range(2):
+            s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msgs}, {"x-bf-session-id": sess, "x-bf-dim-team": "core"}, base=GW_L97M_A, auth=False)
+            check("a session's requests answer", s == 200, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/chain-a", "messages": msgs}, None, base=GW_L97M_A, auth=False)
+        up = [x for x in seen() if x["path"] == "/v1/chat/completions"][-1]
+        check("a chain rule re-routes the model before the upstream call", s == 200 and json.loads(up["body"])["model"] == "gpt-4o-mini", (s, up["body"][:200]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": msgs}, None, base=GW_L97M_A, auth=False)
+        check("jsonparser completes a stream, and text that is not JSON ends it with an error event", "Invalid JSON in streaming response" in b and "[DONE]" in b, b[:300])
+
+        mine = ""
+        for _ in range(40):
+            # the tracer flushes when the next request finishes, so each poll sends one
+            call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msgs}, None, base=GW_L97M_A, auth=False)
+            mine = "".join(x["body"] for x in seen(traces=True) if x["path"] == "/v1/traces" and tid in x["body"])
+            if mine.count(f'"traceId":"{tid}"') >= 4:
+                break
+            time.sleep(0.25)
+        check("requests of one session share the session's trace", mine.count(f'"traceId":"{tid}"') >= 4, mine[:200])
+        check("the governance plugin span is filtered out", "plugin.governance.prehook" not in mine and "plugin.routing.prehook" in mine, mine[:200])
+        check("overhead spans and the overhead attribute are exported", '"name":"convertor"' in mine and "bifrost.overhead.duration_ms" in mine, mine[:200])
+        check("the request span carries session.id", '"session.id"' in mine, mine[:200])
+        s, _, m = call("GET", "/metrics", base=GW_L97M_A, auth=False)
+        check("custom labels reach the http families, and the overhead split and user labels are exported", s == 200 and 'team="core"' in m and 'user_id=""' in m and 'overhead_component="routing"' in m, m[:200])
+
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": msgs}, None, base=GW_L97M_B, auth=False)
+        check("a streamed block ends the stream with the error event before the blocked text", '"content":"Hel"' in b and '"content":"lo"' not in b and "guardrail_violation" in b and "[DONE]" in b, b[:400])
+    finally:
+        gw_a.terminate()
+        gw_b.terminate()
+
+
+
+
 def chunked_post(port: int, path: str, total: int) -> int | None:
     """A POST with no Content-Length, streamed in 64 KB chunks; the status it got back (None when the connection was cut first)."""
     import http.client
@@ -4605,6 +4688,8 @@ def main():
         l97j_e2e(env)
         # the setup session, the log filters the gateway records, the background cost recalculation and plugin CRUD: their own gateways
         l97l_e2e(env)
+        # span filters, session traces, chain rules, jsonparser streams and streamed output guardrails: their own gateways
+        l97m_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

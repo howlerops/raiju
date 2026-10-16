@@ -1,0 +1,148 @@
+// Local output guardrails (regex and secrets) on a streamed chat answer. The answer is checked as
+// it accumulates: each complete event adds its text, and the whole answer so far is checked again.
+// A block ends the stream with the error event Bifrost sends for a failed stream, in place of the
+// event that completed the match and everything after it. Text already sent stays sent, so the
+// earliest a block can land is the event that completes the match. Redact rules are not applied to
+// a stream (the text is already out); they are checked on the completed answer only.
+
+import { CompiledRule } from "./guard_regex"
+import { compileLocal, localVerdict } from "./guard_local"
+import { fields, elements, find, decodeString } from "./json"
+import { errorJson } from "./schemas"
+
+export type GuardedProvider = { id: string, rules: CompiledRule[] }
+
+type GuardHit = { id: string, reason: string }
+
+// The text one OpenAI chat chunk adds: choices[0].delta.content. "" for anything else, such as
+// [DONE], a role-only delta or an event that does not parse.
+export function deltaText(ev: string): string {
+  if (!ev.startsWith("data: ")) return ""
+  const body = ev.slice(6, ev.byteLength).trim()
+  if (body === "" || body === "[DONE]") return ""
+  try {
+    const choices = find(try fields(body), "choices")
+    if (choices === undefined) return ""
+    const first = (try elements(choices))[0]
+    if (first === undefined) return ""
+    const delta = find(try fields(first), "delta")
+    if (delta === undefined) return ""
+    const content = find(try fields(delta), "content")
+    if (content === undefined || !content.startsWith("\"")) return ""
+    return try decodeString(content)
+  } catch (e) {
+    return ""
+  }
+}
+
+export class OutputStreamGuard {
+  // set when a block has ended the stream
+  stopped = false
+  // the provider whose block ended the stream
+  blockedBy = ""
+  private answer = ""
+  private pending = ""
+
+  constructor(readonly providers: GuardedProvider[]) {}
+
+  // The client's text for what the converter produced. Events pass through until a block; the
+  // block's error event replaces the rest of the stream.
+  filter(s: string): string {
+    if (this.stopped) return ""
+    this.pending += s
+    let out = ""
+    while (true) {
+      const i = this.pending.indexOf("\n\n")
+      if (i < 0) break
+      const ev = this.pending.slice(0, i + 2)
+      this.pending = this.pending.slice(i + 2, this.pending.byteLength)
+      const piece = deltaText(ev)
+      if (piece !== "") {
+        this.answer += piece
+        const hit = this.check()
+        if (hit !== undefined) return out + this.block(hit)
+      }
+      out += ev
+    }
+    return out
+  }
+
+  // The stream's last text: what is still pending goes out unless a block has ended the stream.
+  finish(s: string): string {
+    const out = this.filter(s)
+    if (this.stopped) return out
+    const rest = this.pending
+    this.pending = ""
+    return out + rest
+  }
+
+  private check(): GuardHit | undefined {
+    for (const p of this.providers) {
+      const v = localVerdict(p.rules, this.answer)
+      if (v.action === "block") return { id: p.id, reason: `${p.id}: ${v.reason}` }
+    }
+    return undefined
+  }
+
+  private block(hit: GuardHit): string {
+    this.stopped = true
+    this.blockedBy = hit.id
+    this.pending = ""
+    return `data: ${errorJson(`response blocked by guardrails: ${hit.reason}`, "guardrail_violation", undefined)}\n\ndata: [DONE]\n\n`
+  }
+}
+
+// ---- tests ----
+
+function rx(pattern: string, action: "block" | "redact"): CompiledRule[] throws SyntaxError {
+  return try compileLocal({ id: "t", kind: "regex", patterns: [{ pattern: pattern, action: action }] })
+}
+
+function chunk(content: string): string {
+  return `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":${JSON.stringify(content)}},"finish_reason":null}]}\n\n`
+}
+
+test("deltaText reads the content of a chat chunk and nothing else", () => {
+  expect(deltaText(chunk("Hi there"))).toBe("Hi there")
+  expect(deltaText(chunk("a \"quoted\" word"))).toBe("a \"quoted\" word")
+  expect(deltaText(`data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n`)).toBe("")
+  expect(deltaText(`data: {"choices":[{"index":0,"delta":{"content":null},"finish_reason":"stop"}]}\n\n`)).toBe("")
+  expect(deltaText("data: [DONE]\n\n")).toBe("")
+  expect(deltaText("event: ping\n\n")).toBe("")
+  expect(deltaText("data: {not json\n\n")).toBe("")
+})
+
+test("a regex block that completes across events ends the stream with the error event", () => {
+  const p: GuardedProvider = { id: "words", rules: try rx("forbidden", "block") }
+  const g = new OutputStreamGuard([p])
+  const first = g.filter(chunk("This is for"))
+  expect(first).toBe(chunk("This is for"))
+  const second = g.filter(chunk("bidden fruit"))
+  expect(second.includes(`"content":"bidden`)).toBe(false)
+  expect(second.includes(`"type":"guardrail_violation"`)).toBe(true)
+  expect(second.includes(`response blocked by guardrails: words: found REGEX_MATCH`)).toBe(true)
+  expect(second.endsWith("data: [DONE]\n\n")).toBe(true)
+  expect(g.stopped).toBe(true)
+  expect(g.blockedBy).toBe("words")
+  expect(g.filter(chunk("more"))).toBe("")
+  expect(g.finish("")).toBe("")
+})
+
+test("a clean stream passes through, and finish sends what is still pending", () => {
+  const p: GuardedProvider = { id: "words", rules: try rx("forbidden", "block") }
+  const g = new OutputStreamGuard([p])
+  const ev = chunk("all clear")
+  expect(g.filter(ev.slice(0, 20))).toBe("")
+  expect(g.filter(ev.slice(20))).toBe(ev)
+  expect(g.stopped).toBe(false)
+  expect(g.finish("data: [DONE]\n\n")).toBe("data: [DONE]\n\n")
+})
+
+test("a redact rule does not stop a stream, and a secret is blocked", () => {
+  const redact = new OutputStreamGuard([{ id: "pii", rules: try rx("\\d{3}-\\d{4}", "redact") }])
+  expect(redact.filter(chunk("call 555-1234"))).toBe(chunk("call 555-1234"))
+  expect(redact.stopped).toBe(false)
+  const sec = new OutputStreamGuard([{ id: "sec", rules: try compileLocal({ id: "sec", kind: "secrets", action: "block" }) }])
+  expect(sec.filter(chunk("token ghp_qmzkpaxrtnbcwdhsyuvgjfleio0123456789")).includes("guardrail_violation")).toBe(true)
+  expect(sec.blockedBy).toBe("sec")
+})

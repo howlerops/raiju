@@ -16,6 +16,8 @@ export type OtelMetricsSettings = {
   metrics_push_interval?: int,
   headers?: Map<string, string>,
   traces_endpoint?: string,
+  // exports bifrost_overhead_component_microseconds; off by default, as in Bifrost
+  overhead_breakdown_enabled?: bool,
 }
 
 // Bifrost's plugin_span_filter. Plugin names are the span owners.
@@ -362,6 +364,13 @@ function summaryPoint(pt: Point, start: string, now: string): OtlpSummaryPoint |
   }
 }
 
+// The name a family is pushed under. Bifrost's OTel exporter names the MCP client
+// histogram by the semantic convention; the Prometheus name is kept on /metrics.
+function otelName(name: string): string {
+  if (name === "bifrost_mcp_client_operation_duration_seconds") return "mcp.client.operation.duration"
+  return name
+}
+
 // counter -> Sum (cumulative, monotonic), gauge and untyped -> Gauge,
 // histogram -> Histogram, summary -> Summary.
 function toMetrics(fams: Map<string, Family>, startMs: f64, nowMs: f64): OtlpMetric[] {
@@ -370,20 +379,21 @@ function toMetrics(fams: Map<string, Family>, startMs: f64, nowMs: f64): OtlpMet
   const out: OtlpMetric[] = []
   for (const name of fams.keys()) {
     const fam = fams.get(name)!
+    const nm = otelName(name)
     if (fam.kind === "histogram") {
       const dps: OtlpHistPoint[] = []
       for (const pt of fam.pts.values()) {
         const hp = histPoint(pt, start, now)
         if (hp !== undefined) dps.push(hp)
       }
-      out.push({ name: name, histogram: { dataPoints: dps, aggregationTemporality: CUMULATIVE } })
+      out.push({ name: nm, histogram: { dataPoints: dps, aggregationTemporality: CUMULATIVE } })
     } else if (fam.kind === "summary") {
       const dps: OtlpSummaryPoint[] = []
       for (const pt of fam.pts.values()) {
         const sp = summaryPoint(pt, start, now)
         if (sp !== undefined) dps.push(sp)
       }
-      out.push({ name: name, summary: { dataPoints: dps } })
+      out.push({ name: nm, summary: { dataPoints: dps } })
     } else {
       const dps: OtlpNumberPoint[] = []
       for (const pt of fam.pts.values()) {
@@ -391,9 +401,9 @@ function toMetrics(fams: Map<string, Family>, startMs: f64, nowMs: f64): OtlpMet
         if (np !== undefined) dps.push(np)
       }
       if (fam.kind === "counter") {
-        out.push({ name: name, sum: { dataPoints: dps, aggregationTemporality: CUMULATIVE, isMonotonic: true } })
+        out.push({ name: nm, sum: { dataPoints: dps, aggregationTemporality: CUMULATIVE, isMonotonic: true } })
       } else {
-        out.push({ name: name, gauge: { dataPoints: dps } })
+        out.push({ name: nm, gauge: { dataPoints: dps } })
       }
     }
   }
@@ -407,6 +417,8 @@ function toMetrics(fams: Map<string, Family>, startMs: f64, nowMs: f64): OtlpMet
 // does the fetch, as exportRequest does for traces.
 export function exportMetricsRequest(cfg: OtelMetricsSettings, promText: string, startMs: f64, nowMs: f64, resource: Map<string, string>): { url: string, headers: Map<string, string>, body: string } {
   const fams = parseExposition(promText)
+  // the overhead split is pushed only when the profile asks for it, as Bifrost's exporter does
+  if (cfg.overhead_breakdown_enabled !== true) fams.delete("bifrost_overhead_component_microseconds")
   const metrics = toMetrics(fams, startMs, nowMs)
   const attrs: OtlpKv[] = []
   for (const k of resource.keys()) attrs.push({ key: k, value: { stringValue: resource.get(k)! } })
@@ -423,6 +435,26 @@ export function exportMetricsRequest(cfg: OtelMetricsSettings, promText: string,
 }
 
 // ---- tests ----
+
+test("OTLP push: the overhead split needs overhead_breakdown_enabled, and the MCP histogram takes its semconv name", () => {
+  const prom = "# TYPE bifrost_overhead_component_microseconds histogram\n" +
+    "bifrost_overhead_component_microseconds_bucket{overhead_component=\"routing\",le=\"+Inf\"} 1\n" +
+    "bifrost_overhead_component_microseconds_sum{overhead_component=\"routing\"} 5\n" +
+    "bifrost_overhead_component_microseconds_count{overhead_component=\"routing\"} 1\n" +
+    "# TYPE bifrost_mcp_client_operation_duration_seconds histogram\n" +
+    "bifrost_mcp_client_operation_duration_seconds_bucket{mcp_client=\"fs\",le=\"+Inf\"} 1\n" +
+    "bifrost_mcp_client_operation_duration_seconds_sum{mcp_client=\"fs\"} 0.2\n" +
+    "bifrost_mcp_client_operation_duration_seconds_count{mcp_client=\"fs\"} 1\n" +
+    "# TYPE bifrost_cost_total counter\n" +
+    "bifrost_cost_total 0.5\n"
+  const off = exportMetricsRequest({ metrics_enabled: true, traces_endpoint: "http://c:4318/v1/traces" }, prom, 0.0, 1000.0, new Map())
+  expect(off.body.includes("bifrost_overhead_component_microseconds")).toBe(false)
+  expect(off.body.includes("bifrost_cost_total")).toBe(true)
+  expect(off.body.includes(`"name":"mcp.client.operation.duration"`)).toBe(true)
+  expect(off.body.includes("bifrost_mcp_client_operation_duration_seconds")).toBe(false)
+  const on = exportMetricsRequest({ metrics_enabled: true, traces_endpoint: "http://c:4318/v1/traces", overhead_breakdown_enabled: true }, prom, 0.0, 1000.0, new Map())
+  expect(on.body.includes(`"name":"bifrost_overhead_component_microseconds"`)).toBe(true)
+})
 
 const SAMPLE = [
   "# TYPE bifrost_upstream_requests_total counter",

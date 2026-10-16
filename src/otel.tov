@@ -7,6 +7,8 @@ import { tmpdir } from "node:os"
 import { H2Header, H2Tls } from "./h2"
 import { grpcUnary, grpcClose } from "./grpc"
 import { encodeTraceRequest, encodeMetricsRequest } from "./protobuf"
+import { PluginSpanFilter, spanAllowed } from "./otel_metrics"
+import { sha256, toHex, utf8 } from "./crypto"
 
 export type OtelConfig = {
   // OTLP/HTTP URL, or host:port for protocol "grpc"
@@ -38,7 +40,22 @@ export type OtelConfig = {
   tls_ca_cert?: string,
   // skip certificate verification for the collector
   insecure?: bool,
+  // Bifrost's plugin_span_filter: include keeps only the listed plugins' spans, exclude drops them
+  plugin_span_filter?: PluginSpanFilter,
+  // overhead spans (internal children of the request span) are exported only when true
+  export_overhead_spans?: bool,
+  // requests with the same x-bf-session-id share one trace (an inbound traceparent still wins)
+  group_traces_by_session?: bool,
+  // exports bifrost_overhead_component_microseconds with the metrics push
+  overhead_breakdown_enabled?: bool,
+  // content attributes are dropped from the request's root span only; child spans keep them
+  disable_root_span_content?: bool,
 }
+
+// A stage of the request that ran inside the gateway, timed by the gateway. startMs is epoch
+// milliseconds and durUs microseconds. name is the span name: plugin.<name>.<stage> for a
+// plugin, or an internal name such as convertor for overhead.
+export type StageTiming = { name: string, startMs: f64, durUs: f64 }
 
 // TLS options for Tov's fetch.
 export type TlsOpts = { rejectUnauthorized?: bool, ca?: string }
@@ -243,6 +260,27 @@ function keepAttr(cfg: OtelConfig, k: string): bool {
   return true
 }
 
+// The plugin a span belongs to, from a name of the form plugin.<name>.<stage> (Bifrost's
+// contract). undefined for any other name, and for a malformed one, which is exported.
+export function pluginOf(name: string): string | undefined {
+  if (!name.startsWith("plugin.")) return undefined
+  const rest = name.slice(7, name.byteLength)
+  const dot = rest.indexOf(".")
+  if (dot <= 0) return undefined
+  return rest.slice(0, dot)
+}
+
+// group_traces_by_session IDs, as Bifrost derives them: the trace ID is the first 16 bytes of
+// SHA-256 over the session ID, and the synthetic parent of each root span is bytes 16 to 24.
+// The parent is never exported.
+export function sessionTraceId(session: string): string {
+  return toHex(sha256(utf8(session)).slice(0, 16))
+}
+
+export function sessionParentSpanId(session: string): string {
+  return toHex(sha256(utf8(session)).slice(16, 24))
+}
+
 // Spans are queued when they finish and sent in batches. A caller that has
 // nothing to flush can ignore the tracer entirely.
 export class Tracer {
@@ -279,13 +317,17 @@ export class Tracer {
   }
 
   // The inbound sampled flag wins when a valid traceparent came in. Otherwise
-  // the ratio decides for a new trace.
-  startRequest(name: string, traceparent: string | undefined, nowMs: f64): Span {
+  // the ratio decides for a new trace, and group_traces_by_session puts the
+  // request into its session's trace.
+  startRequest(name: string, traceparent: string | undefined, nowMs: f64, session?: string): Span {
     const inbound = parseTraceparent(traceparent)
     if (inbound !== undefined) {
       return new Span(inbound.traceId, newSpanId(), inbound.parentId, name, 2, msToNs(nowMs), inbound.sampled)
     }
     const sampled = Math.random() < this.ratio
+    if (this.cfg.group_traces_by_session === true && session !== undefined && session !== "") {
+      return new Span(sessionTraceId(session), newSpanId(), sessionParentSpanId(session), name, 2, msToNs(nowMs), sampled)
+    }
     return new Span(newTraceId(), newSpanId(), undefined, name, 2, msToNs(nowMs), sampled)
   }
 
@@ -294,8 +336,31 @@ export class Tracer {
     return new Span(parent.traceId, newSpanId(), parent.spanId, name, 3, msToNs(nowMs), parent.sampled)
   }
 
+  // Whether a finished span is exported. Plugin spans follow plugin_span_filter; overhead spans
+  // (internal, under the request span) follow export_overhead_spans. Everything else is kept.
+  keepSpan(span: Span): bool {
+    const pn = pluginOf(span.name)
+    if (pn !== undefined) return spanAllowed(this.cfg.plugin_span_filter, pn)
+    if (span.kind === 1 && span.parentSpanId !== undefined) return this.cfg.export_overhead_spans === true
+    return true
+  }
+
   finish(span: Span): void {
-    if (span.sampled) this.pending.push(span)
+    if (!span.sampled || !this.keepSpan(span)) return
+    // disable_root_span_content: the request span drops content, and child spans keep it
+    if (span.kind === 2 && this.cfg.disable_root_span_content === true) {
+      for (const k of CONTENT_ATTRS) span.attributes.delete(k)
+    }
+    this.pending.push(span)
+  }
+
+  // Child spans for the stages the gateway timed in a request. They share the request's trace.
+  addStages(root: Span, stages: StageTiming[]): void {
+    for (const st of stages) {
+      const s = new Span(root.traceId, newSpanId(), root.spanId, st.name, 1, msToNs(st.startMs), root.sampled)
+      s.endNs = msToNs(st.startMs + st.durUs / 1000.0)
+      this.finish(s)
+    }
   }
 
   // A full batch goes now. Otherwise a non-empty queue goes once flush_ms has
@@ -862,4 +927,69 @@ test("tls: insecure skips verification, a CA file keeps it on, unreadable CA fal
   expect(ca?.ca?.includes("BEGIN CERTIFICATE")).toBe(true)
   expect(otelTls({ endpoint: "https://c", tls_ca_cert: `${try tmpdir()}/raiju-no-such-ca.pem` })).toBeUndefined()
   expect(new Tracer({ endpoint: "https://c", insecure: true }).tls).toEqual({ rejectUnauthorized: false })
+})
+
+test("plugin span names and the session trace IDs follow Bifrost", () => {
+  expect(pluginOf("plugin.governance.prehook")).toBe("governance")
+  expect(pluginOf("plugin.semantic_cache.mcp_posthook")).toBe("semantic_cache")
+  expect(pluginOf("plugin.x")).toBeUndefined()
+  expect(pluginOf("chat")).toBeUndefined()
+  expect(sessionTraceId("sess-42")).toBe("e7b943c95b7c054617f88518249b8fe0")
+  expect(sessionParentSpanId("sess-42")).toBe("ec87d152d6eb6a04")
+})
+
+test("group_traces_by_session puts a session's requests in one trace; a traceparent still wins", () => {
+  const t = new Tracer({ endpoint: "x", group_traces_by_session: true })
+  const a = t.startRequest("chat", undefined, 1700000000000, "sess-42")
+  const b = t.startRequest("chat", undefined, 1700000000000, "sess-42")
+  expect(a.traceId).toBe("e7b943c95b7c054617f88518249b8fe0")
+  expect(b.traceId).toBe(a.traceId)
+  expect(a.parentSpanId).toBe("ec87d152d6eb6a04")
+  const none = t.startRequest("chat", undefined, 1700000000000)
+  expect(none.traceId === a.traceId).toBe(false)
+  expect(none.parentSpanId).toBeUndefined()
+  const inbound = t.startRequest("chat", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", 1700000000000, "sess-42")
+  expect(inbound.traceId).toBe("0af7651916cd43dd8448eb211c80319c")
+  const off = new Tracer({ endpoint: "x" })
+  expect(off.startRequest("chat", undefined, 1700000000000, "sess-42").parentSpanId).toBeUndefined()
+})
+
+test("plugin_span_filter and export_overhead_spans decide which stage spans leave", () => {
+  const stages: StageTiming[] = [
+    { name: "plugin.governance.prehook", startMs: 1700000000001.0, durUs: 500.0 },
+    { name: "plugin.routing.prehook", startMs: 1700000000002.0, durUs: 200.0 },
+    { name: "convertor", startMs: 1700000000003.0, durUs: 100.0 },
+  ]
+  const run = (cfg: OtelConfig): string => {
+    const t = new Tracer(cfg)
+    const root = t.startRequest("chat", undefined, 1700000000000)
+    root.end(1700000000010)
+    t.finish(root)
+    t.addStages(root, stages)
+    return t.flushPayload()!
+  }
+  const dflt = run({ endpoint: "x" })
+  expect(dflt.includes(`"name":"plugin.governance.prehook"`)).toBe(true)
+  expect(dflt.includes(`"name":"convertor"`)).toBe(false)
+  const incl = run({ endpoint: "x", plugin_span_filter: { mode: "include", plugins: ["governance"] } })
+  expect(incl.includes(`"name":"plugin.governance.prehook"`)).toBe(true)
+  expect(incl.includes(`"name":"plugin.routing.prehook"`)).toBe(false)
+  const excl = run({ endpoint: "x", plugin_span_filter: { mode: "exclude", plugins: ["governance"] }, export_overhead_spans: true })
+  expect(excl.includes(`"name":"plugin.governance.prehook"`)).toBe(false)
+  expect(excl.includes(`"name":"plugin.routing.prehook"`)).toBe(true)
+  expect(excl.includes(`"name":"convertor"`)).toBe(true)
+})
+
+test("disable_root_span_content drops content from the request span only", () => {
+  const t = new Tracer({ endpoint: "x", disable_root_span_content: true })
+  const root = t.startRequest("chat", undefined, 1700000000000)
+  root.setStr("gen_ai.input.messages", "hi")
+  root.end(1700000000001)
+  t.finish(root)
+  const child = t.startChild(root, "openai gpt", 1700000000000)
+  child.setStr("gen_ai.input.messages", "hi")
+  child.end(1700000000001)
+  t.finish(child)
+  const text = t.flushPayload()!
+  expect(text.split("gen_ai.input.messages").length).toBe(2)
 })

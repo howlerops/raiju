@@ -871,9 +871,9 @@ function mapOtelPlugin(f: Field[], pname: string, inout top: Field[], inout note
     }
     if (en.length > 1) notes.push(`config: plugin "${pname}" has ${en.length - 1} more enabled profile(s); Raiju exports the first only`)
     prof = en[0]!
-    ignored(path, cf, ["plugin_span_filter", "export_overhead_spans"], &notes)
   }
-  ignored(path, prof, ["trace_type", "overhead_breakdown_enabled", "export_raw_payloads", "group_traces_by_session", "disable_root_span_content", "plugin_span_filter", "export_overhead_spans"], &notes)
+  // trace_type has no effect in Bifrost either (only the genai_extension value exists)
+  ignored(path, prof, ["trace_type", "export_raw_payloads"], &notes)
 
   const traces = rawBool(prof, "traces_enabled") !== false
   const grpc = rawStr(prof, "protocol") === "grpc"
@@ -901,6 +901,12 @@ function mapOtelPlugin(f: Field[], pname: string, inout top: Field[], inout note
   add(&out, "request_headers", find(prof, "request_headers"))
   add(&out, "excluded_attributes", find(prof, "excluded_attributes"))
   add(&out, "disable_content_logging", find(prof, "disable_content_logging"))
+  // Bifrost reads the span filter and export_overhead_spans from the wrapper, or hoists them from the profile
+  add(&out, "plugin_span_filter", find(cf, "plugin_span_filter") ?? find(prof, "plugin_span_filter"))
+  add(&out, "export_overhead_spans", find(cf, "export_overhead_spans") ?? find(prof, "export_overhead_spans"))
+  add(&out, "group_traces_by_session", find(prof, "group_traces_by_session"))
+  add(&out, "disable_root_span_content", find(prof, "disable_root_span_content"))
+  add(&out, "overhead_breakdown_enabled", find(prof, "overhead_breakdown_enabled"))
   add(&out, "tls_ca_cert", strRaw(prof, "tls_ca_cert"))
   const ins = find(prof, "insecure")
   if (ins !== undefined) {
@@ -1025,13 +1031,17 @@ function mapTelemetry(f: Field[], pname: string, inout top: Field[], inout notes
   toClient(&cl, path, "custom_labels", "prometheus_labels", find(cf, "custom_labels"), &applied, &notes)
   if (rawBool(cf, "metrics_enabled") === false) notes.push(`config: "${path}.metrics_enabled" is not supported by Raiju and is ignored: Raiju always serves /metrics`)
   // push_gateway keeps Bifrost's shape under telemetry.push_gateway (pushgateway.tov)
+  // the overhead split and user labels are telemetry's own switches (metrics.tov setTelemetry)
   const pg = find(cf, "push_gateway")
-  if (pg !== undefined) {
+  const ob = find(cf, "overhead_breakdown_enabled")
+  const ul = find(cf, "user_labels_enabled")
+  if (pg !== undefined || ob !== undefined || ul !== undefined) {
     let tel = try members(find(top, "telemetry"))
-    setField(&tel, "push_gateway", pg)
+    if (pg !== undefined) setField(&tel, "push_gateway", pg)
+    if (ob !== undefined) setField(&tel, "overhead_breakdown_enabled", ob)
+    if (ul !== undefined) setField(&tel, "user_labels_enabled", ul)
     put(&top, "telemetry", tel)
   }
-  ignored(path, cf, ["overhead_breakdown_enabled", "user_labels_enabled"], &notes)
   if (applied.length > 0) {
     put(&top, "client", cl)
     notes.push(`config: plugin "${pname}" read into "client": ${applied.join(", ")}`)
@@ -1182,6 +1192,16 @@ function mapPrompts(f: Field[], pname: string, inout notes: string[]): void thro
 // Takes the Bifrost plugins Raiju reads out of plugins[]: the semantic cache and otel become
 // their top-level sections, and logging, telemetry, governance, routing, compat and prompts
 // map to client settings or are noted. The other plugins stay in place.
+// jsonparser keeps its place: usage all_requests completes the JSON of streams (plugins.tov JsonStreamFixer).
+// per_request needs a per-request context key, which Raiju does not have; cleanup_interval and max_age
+// have nothing to clean up, since Raiju keeps the accumulated text per stream.
+function noteJsonParser(f: Field[], pname: string, inout notes: string[]): void throws SyntaxError {
+  const path = `plugins[${pname}].config`
+  const cf = try members(find(f, "config"))
+  if (rawStr(cf, "usage") === "per_request") notes.push(`config: "${path}.usage" per_request is not supported by Raiju (it has no per-request context key), so streamed JSON completion stays off`)
+  ignored(path, cf, ["cleanup_interval", "max_age"], &notes)
+}
+
 function mapPlugins(inout top: Field[], inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "plugins")
   if (raw === undefined || !raw.startsWith("[")) return
@@ -1221,6 +1241,9 @@ function mapPlugins(inout top: Field[], inout notes: string[]): void throws Synt
     if (name === "prompts") {
       try mapPrompts(f, name, &notes)
       continue
+    }
+    if (name === "jsonparser") {
+      try noteJsonParser(f, name, &notes)
     }
     if (name !== "semantic_cache" && name !== "semanticcache") {
       keep.push(el)
@@ -1817,6 +1840,20 @@ test("maps a flat otel plugin entry and drops it from plugins", () => {
   expect(r.notes.includes(`config: "plugins[otel].config.trace_type" is not supported by Raiju and is ignored`)).toBe(true)
 })
 
+test("otel span, session and overhead options map to Raiju keys; a profile-level filter is hoisted", () => {
+  const r = try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": {
+    "collector_url": "http://c:4318", "protocol": "http", "overhead_breakdown_enabled": true,
+    "group_traces_by_session": true, "disable_root_span_content": true, "export_overhead_spans": true,
+    "plugin_span_filter": { "mode": "include", "plugins": ["governance"] } } } ] }`)
+  const o = try fields(find(try fields(r.text), "otel")!)
+  expect(find(o, "plugin_span_filter")).toBe(`{ "mode": "include", "plugins": ["governance"] }`)
+  expect(find(o, "export_overhead_spans")).toBe("true")
+  expect(find(o, "group_traces_by_session")).toBe("true")
+  expect(find(o, "disable_root_span_content")).toBe("true")
+  expect(find(o, "overhead_breakdown_enabled")).toBe("true")
+  expect(r.notes.some((n) => n.includes("plugin_span_filter") || n.includes("overhead"))).toBe(false)
+})
+
 test("otel defaults: bifrost service name, 5 second export timeout, and no insecure unless set", () => {
   const r = try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": { "collector_url": "https://c.example:4318/custom", "protocol": "http" } } ] }`)
   const o = try fields(find(try fields(r.text), "otel")!)
@@ -1850,8 +1887,8 @@ test("otel profiles: the first enabled profile is read and the rest are noted", 
   expect(rawStr(o, "endpoint")).toBe("http://first:4318/x")
   expect(rawStr(o, "service_name")).toBe("one")
   expect(r.notes.includes(`config: plugin "otel" has 1 more enabled profile(s); Raiju exports the first only`)).toBe(true)
-  expect(r.notes.includes(`config: "plugins[otel].config.plugin_span_filter" is not supported by Raiju and is ignored`)).toBe(true)
-  const none = try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": { "profiles": [ { "enabled": false, "collector_url": "http://x" } ] } } ] }`)
+  expect(find(o, "plugin_span_filter")).toBe(`{ "mode": "exclude", "plugins": ["governance"] }`)
+  const none =try normalize(`{ "plugins": [ { "enabled": true, "name": "otel", "config": { "profiles": [ { "enabled": false, "collector_url": "http://x" } ] } } ] }`)
   expect(find(try fields(none.text), "otel")).toBeUndefined()
 })
 
@@ -1947,8 +1984,10 @@ test("telemetry plugin: custom_labels become client.prometheus_labels, and the P
   expect(p.client!.prometheus_labels![0]).toBe("team")
   expect(p.client!.prometheus_labels![1]).toBe("env")
   expect(r.notes.includes(`config: "plugins[telemetry].config.metrics_enabled" is not supported by Raiju and is ignored: Raiju always serves /metrics`)).toBe(true)
-  expect(r.notes.includes(`config: "plugins[telemetry].config.overhead_breakdown_enabled" is not supported by Raiju and is ignored`)).toBe(true)
-  expect(r.notes.includes(`config: "plugins[telemetry].config.user_labels_enabled" is not supported by Raiju and is ignored`)).toBe(true)
+  const tel = try JSON.parse(r.text) as { telemetry?: { overhead_breakdown_enabled?: bool, user_labels_enabled?: bool } }
+  expect(tel.telemetry!.overhead_breakdown_enabled).toBe(true)
+  expect(tel.telemetry!.user_labels_enabled).toBe(false)
+  expect(r.notes.some((n) => n.includes("overhead_breakdown_enabled") && n.includes("ignored"))).toBe(false)
   expect(r.notes.includes(`config: "plugins[telemetry].config.push_gateway" is not supported by Raiju and is ignored`)).toBe(false)
   const pgw = try JSON.parse(r.text) as { telemetry?: { push_gateway?: { push_gateway_url?: string, job_name?: string } } }
   expect(pgw.telemetry!.push_gateway!.push_gateway_url).toBe("http://pushgateway:9091")

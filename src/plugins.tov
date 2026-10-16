@@ -6,6 +6,7 @@
 import { Field, fields, find, elements, rawStr, rawNum, isNull, quote, build, setField } from "./json"
 import { errorJson, newId, nowSeconds } from "./schemas"
 import { compileRegex } from "./regex"
+import { deltaText } from "./guard_stream"
 
 // Hooks take the context by inout: plugins add headers and share values
 // through ctx.headers and ctx.values, which parameters can't change.
@@ -334,7 +335,9 @@ export class MockerPlugin extends BasePlugin {
 
 // ---- jsonparser ----
 
-export type JsonParserConfig = { strip_markdown_fences: bool }
+// strip_markdown_fences is Raiju's own option. usage, cleanup_interval and max_age are Bifrost's
+// streaming options (see JsonStreamFixer): usage all_requests completes the JSON of every stream.
+export type JsonParserConfig = { strip_markdown_fences?: bool, usage?: string, cleanup_interval?: string, max_age?: string }
 
 // Whether a fence's first line is a language tag (json, JSON, json5, ...).
 function isLangTag(tag: string): bool {
@@ -400,7 +403,7 @@ export class JsonParserPlugin extends BasePlugin {
   }
 
   postResponse(inout ctx: PluginContext, status: int, body: string): PostResult {
-    if (!this.config.strip_markdown_fences) return { kind: "continue", body: body }
+    if (this.config.strip_markdown_fences !== true) return { kind: "continue", body: body }
     // Bodies that aren't chat completions JSON pass through untouched.
     try {
       return { kind: "continue", body: try stripFencesIn(body) }
@@ -408,6 +411,309 @@ export class JsonParserPlugin extends BasePlugin {
       return { kind: "continue", body: body }
     }
   }
+}
+
+// ---- streamed JSON completion (jsonparser, usage all_requests) ----
+
+// A strict JSON syntax scan (RFC 8259) over bytes: values nest up to a depth limit, and the
+// text is one value with only whitespace around it. JSON.parse cannot check arrays against a type.
+class JsonScan {
+  i = 0
+  constructor(readonly b: u8[]) {}
+
+  private at(): int {
+    return this.i < this.b.length ? int(this.b[this.i]!) : -1
+  }
+
+  private ws(): void {
+    while (this.at() === 32 || this.at() === 9 || this.at() === 10 || this.at() === 13) this.i++
+  }
+
+  private digits(): bool {
+    if (!(this.at() >= 48 && this.at() <= 57)) return false
+    while (this.at() >= 48 && this.at() <= 57) this.i++
+    return true
+  }
+
+  private word(w: string): bool {
+    for (const c of new TextEncoder().encode(w)) {
+      if (this.at() !== int(c)) return false
+      this.i++
+    }
+    return true
+  }
+
+  private number(): bool {
+    if (this.at() === 45) this.i++
+    if (this.at() === 48) this.i++
+    else if (!this.digits()) return false
+    if (this.at() === 46) {
+      this.i++
+      if (!this.digits()) return false
+    }
+    if (this.at() === 101 || this.at() === 69) {
+      this.i++
+      if (this.at() === 43 || this.at() === 45) this.i++
+      if (!this.digits()) return false
+    }
+    return true
+  }
+
+  private string(): bool {
+    this.i++
+    while (this.i < this.b.length) {
+      const c = this.at()
+      this.i++
+      if (c === 34) return true
+      if (c < 32) return false
+      if (c !== 92) continue
+      const e = this.at()
+      this.i++
+      if (e === 117) {
+        for (let k = 0; k < 4; k++) {
+          const h = this.at()
+          const hex = (h >= 48 && h <= 57) || (h >= 65 && h <= 70) || (h >= 97 && h <= 102)
+          if (!hex) return false
+          this.i++
+        }
+      } else if (e !== 34 && e !== 92 && e !== 47 && e !== 98 && e !== 102 && e !== 110 && e !== 114 && e !== 116) {
+        return false
+      }
+    }
+    return false
+  }
+
+  // Only whitespace may follow the value.
+  whole(): bool {
+    this.ws()
+    return this.i === this.b.length
+  }
+
+  value(depth: int): bool {
+    if (depth > 512) return false
+    this.ws()
+    const c = this.at()
+    if (c === 123) return this.object(depth)
+    if (c === 91) return this.array(depth)
+    if (c === 34) return this.string()
+    if (c === 116) return this.word("true")
+    if (c === 102) return this.word("false")
+    if (c === 110) return this.word("null")
+    if (c === 45 || (c >= 48 && c <= 57)) return this.number()
+    return false
+  }
+
+  private object(depth: int): bool {
+    this.i++
+    this.ws()
+    if (this.at() === 125) {
+      this.i++
+      return true
+    }
+    while (true) {
+      this.ws()
+      if (this.at() !== 34 || !this.string()) return false
+      this.ws()
+      if (this.at() !== 58) return false
+      this.i++
+      if (!this.value(depth + 1)) return false
+      this.ws()
+      if (this.at() === 44) {
+        this.i++
+        continue
+      }
+      if (this.at() === 125) {
+        this.i++
+        return true
+      }
+      return false
+    }
+  }
+
+  private array(depth: int): bool {
+    this.i++
+    this.ws()
+    if (this.at() === 93) {
+      this.i++
+      return true
+    }
+    while (true) {
+      if (!this.value(depth + 1)) return false
+      this.ws()
+      if (this.at() === 44) {
+        this.i++
+        continue
+      }
+      if (this.at() === 93) {
+        this.i++
+        return true
+      }
+      return false
+    }
+  }
+}
+
+// Whether s is one JSON value, arrays included (Bifrost's isValidJSON).
+function validJson(s: string): bool {
+  if (s.trim() === "") return false
+  const scan = new JsonScan(new TextEncoder().encode(s))
+  return scan.value(0) && scan.whole()
+}
+
+function decodeBytes(b: u8[]): string {
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+// Closes the strings, arrays and objects that a partial JSON text leaves open (Bifrost's completeJSON).
+function closeBytes(s: string): u8[] {
+  const bs = new TextEncoder().encode(s)
+  const res: u8[] = []
+  const stack: int[] = []
+  let inStr = false
+  let esc = false
+  for (const c of bs) {
+    const v = int(c)
+    res.push(c)
+    if (esc) {
+      esc = false
+      continue
+    }
+    if (v === 92) {
+      esc = true
+      continue
+    }
+    if (v === 34) {
+      inStr = !inStr
+      continue
+    }
+    if (inStr) continue
+    if (v === 123) stack.push(125)
+    else if (v === 91) stack.push(93)
+    else if ((v === 125 || v === 93) && stack.length > 0 && stack[stack.length - 1] === v) stack.pop()
+  }
+  if (inStr) {
+    if (esc && res.length > 0) res.pop()
+    res.push(34)
+  }
+  for (let i = stack.length - 1; i >= 0; i--) res.push(u8(stack[i]!))
+  return res
+}
+
+// The longest prefix of full that is valid JSON, found by bisection as Bifrost does; original when none is.
+function truncateTo(full: u8[], original: string): string {
+  let left = 0
+  let right = full.length
+  while (left < right) {
+    const mid = Math.floor((left + right) / 2)
+    if (validJson(decodeBytes(full.slice(0, mid)))) left = mid + 1
+    else right = mid
+  }
+  if (left > 0) {
+    const cand = decodeBytes(full.slice(0, left - 1))
+    if (validJson(cand)) return cand
+  }
+  return original
+}
+
+// A streamed answer so far, made valid JSON when it is an object or an array (Bifrost's parsePartialJSON).
+// Other text comes back trimmed and unchanged.
+export function completePartialJson(input: string): string {
+  const s = input.trim()
+  if (s === "") return "{}"
+  if (!s.startsWith("{") && !s.startsWith("[")) return s
+  if (validJson(s)) return s
+  const full = closeBytes(s)
+  const done = decodeBytes(full)
+  if (validJson(done)) return done
+  return truncateTo(full, s)
+}
+
+// The event with its chat chunk's content replaced by text (the chunk's first choice).
+function withContent(ev: string, text: string): string {
+  try {
+    const body = ev.slice(6, ev.byteLength).trim()
+    let fs = try fields(body)
+    const raw = find(fs, "choices")
+    if (raw === undefined) return ev
+    const choices: string[] = []
+    for (const el of try elements(raw)) choices.push(el)
+    if (choices.length === 0) return ev
+    let cf = try fields(choices[0]!)
+    let df = try fields(find(cf, "delta") ?? "{}")
+    setField(&df, "content", quote(text))
+    setField(&cf, "delta", build(df))
+    choices[0] = build(cf)
+    setField(&fs, "choices", "[" + choices.join(",") + "]")
+    return `data: ${build(fs)}\n\n`
+  } catch (e) {
+    return ev
+  }
+}
+
+// Bifrost's jsonparser on a stream: each chunk's content is added to the answer so far, and the chunk
+// carries that answer completed as JSON. Text that cannot be completed ends the stream with an error
+// event, as Bifrost's SkipStream error does. Events are passed on whole, as the converter produced them.
+export class JsonStreamFixer {
+  // set when the text could not be completed and the stream has ended
+  stopped = false
+  private acc = ""
+  private pending = ""
+
+  // The client's text for what the converter produced.
+  filter(s: string): string {
+    if (this.stopped) return ""
+    this.pending += s
+    let out = ""
+    while (true) {
+      const i = this.pending.indexOf("\n\n")
+      if (i < 0) break
+      const ev = this.pending.slice(0, i + 2)
+      this.pending = this.pending.slice(i + 2, this.pending.byteLength)
+      const piece = deltaText(ev)
+      if (piece === "") {
+        out += ev
+        continue
+      }
+      this.acc += piece
+      const fixed = completePartialJson(this.acc)
+      if (!validJson(fixed)) {
+        this.stopped = true
+        this.pending = ""
+        return out + `data: ${errorJson("Invalid JSON in streaming response", "api_error", undefined)}\n\ndata: [DONE]\n\n`
+      }
+      out += withContent(ev, fixed)
+    }
+    return out
+  }
+
+  // The stream's last text: what is still pending goes through the same way.
+  finish(s: string): string {
+    const out = this.filter(s)
+    if (this.stopped) return out
+    const rest = this.pending
+    this.pending = ""
+    return out + rest
+  }
+}
+
+// Whether Bifrost's jsonparser runs on streams: an enabled jsonparser entry with usage all_requests.
+// per_request needs a per-request context key, which Raiju does not have, so it stays off.
+export function jsonStreamEnabled(entries: PluginEntry[]): bool {
+  for (const e of entries) {
+    if (e.enabled === false || e.name !== "jsonparser") continue
+    const text = e.configJson.trim() === "" ? "{}" : e.configJson
+    try {
+      const cfg = try JSON.parse(text) as JsonParserConfig
+      if (cfg.usage === "all_requests") return true
+    } catch (err) {
+      continue
+    }
+  }
+  return false
 }
 
 // ---- blocklist ----
@@ -500,7 +806,18 @@ export class MaxTokensPlugin extends BasePlugin {
 
 // ---- configuration ----
 
-export type PluginEntry = { name: string, enabled?: bool, configJson: string }
+export type PluginEntry = { name: string, enabled?: bool, configJson: string, placement?: string, order?: int }
+
+// Bifrost's placement groups, in run order. Pre-hooks run in this order and post-hooks in reverse.
+// A plugin with no placement is post_builtin, as in Bifrost. undefined for any other value.
+export function placementRank(p: string | undefined): int | undefined {
+  if (p === undefined || p === "post_builtin") return 2
+  if (p === "pre_builtin") return 0
+  if (p === "builtin") return 1
+  return undefined
+}
+
+type Sequenced = { p: BasePlugin, rank: int, order: int, at: int }
 
 // Builds the plugin for one name from its raw JSON config. Throws SyntaxError
 // on a bad config; returns undefined for a name nothing provides.
@@ -528,22 +845,36 @@ function makePlugin(name: string, text: string): BasePlugin | undefined throws S
   return undefined
 }
 
-// The chain for the enabled entries, in config order. Unknown names and bad
-// configs are reported in errors and left out; they don't throw.
+// The chain for the enabled entries, sorted by placement group and then by order (lower first);
+// entries with the same group and order keep config order. Unknown names, bad configs and bad
+// placements are reported in errors and left out; they don't throw.
 export function buildChain(entries: PluginEntry[]): { chain: PluginChain, errors: string[] } {
-  const plugins: BasePlugin[] = []
+  const seq: Sequenced[] = []
   const errors: string[] = []
-  for (const e of entries) {
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i]!
     if (e.enabled === false) continue
+    const rank = placementRank(e.placement)
+    if (rank === undefined) {
+      errors.push(`plugin "${e.name}": placement "${e.placement ?? ""}" must be pre_builtin, builtin or post_builtin`)
+      continue
+    }
     const text = e.configJson.trim() === "" ? "{}" : e.configJson
     try {
       const p = makePlugin(e.name, text)
       if (p === undefined) errors.push(`unknown plugin "${e.name}"`)
-      else plugins.push(p)
+      else seq.push({ p: p, rank: rank, order: e.order ?? 0, at: i })
     } catch (err) {
       errors.push(`plugin "${e.name}": ${err.message}`)
     }
   }
+  seq.sort((a, b) => {
+    if (a.rank !== b.rank) return a.rank - b.rank
+    if (a.order !== b.order) return a.order - b.order
+    return a.at - b.at
+  })
+  const plugins: BasePlugin[] = []
+  for (const s of seq) plugins.push(s.p)
   return { chain: new PluginChain(plugins), errors: errors }
 }
 
@@ -774,6 +1105,74 @@ test("buildChain keeps enabled plugins in order and reports bad entries", () => 
   expect(built.chain.plugins[2]!.name()).toBe("jsonparser")
   expect(built.errors.length).toBe(3)
   expect(built.errors[0]!.indexOf("nosuch") >= 0).toBe(true)
+})
+
+test("the JSON check accepts RFC 8259 values and refuses broken ones", () => {
+  expect(validJson(`[1,"a",{"b":null,"c":[true,false]}]`)).toBe(true)
+  expect(validJson(`"\\u00e9 \\n"`)).toBe(true)
+  expect(validJson(`-1.5e+3`)).toBe(true)
+  expect(validJson(`  {}  `)).toBe(true)
+  expect(validJson(`[1,2`)).toBe(false)
+  expect(validJson(`{"a":}`)).toBe(false)
+  expect(validJson(`01`)).toBe(false)
+  expect(validJson(`tru`)).toBe(false)
+  expect(validJson(`{} x`)).toBe(false)
+  expect(validJson(`"bad \\x"`)).toBe(false)
+  expect(validJson(``)).toBe(false)
+})
+
+test("partial JSON is completed: objects, arrays and strings close, other text passes", () => {
+  expect(completePartialJson(`{"a":1`)).toBe(`{"a":1}`)
+  expect(completePartialJson(`[1,2`)).toBe(`[1,2]`)
+  expect(completePartialJson(`{"a":"x`)).toBe(`{"a":"x"}`)
+  expect(completePartialJson(`{"a":1}`)).toBe(`{"a":1}`)
+  expect(completePartialJson("  ")).toBe("{}")
+  expect(completePartialJson("hello")).toBe("hello")
+})
+
+function jsonChunk(c: string): string {
+  return `data: {"choices":[{"index":0,"delta":{"content":${JSON.stringify(c)}}}]}\n\n`
+}
+
+test("JsonStreamFixer completes the answer so far, and text that cannot be completed ends the stream", () => {
+  const f = new JsonStreamFixer()
+  const one = f.filter(jsonChunk(`{"a":1`))
+  expect(one.includes(`"content":${JSON.stringify(`{"a":1}`)}`)).toBe(true)
+  const two = f.filter(jsonChunk(`,"b":2}`))
+  expect(two.includes(`"content":${JSON.stringify(`{"a":1,"b":2}`)}`)).toBe(true)
+  expect(two.startsWith(`data: {"choices":[{"index":0,`)).toBe(true)
+  expect(f.stopped).toBe(false)
+  const bad = new JsonStreamFixer()
+  const out = bad.filter(jsonChunk("not json"))
+  expect(bad.stopped).toBe(true)
+  expect(out.includes("Invalid JSON in streaming response")).toBe(true)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("jsonparser streams only with usage all_requests", () => {
+  expect(jsonStreamEnabled([{ name: "jsonparser", configJson: `{"usage":"all_requests"}` }])).toBe(true)
+  expect(jsonStreamEnabled([{ name: "jsonparser", configJson: `{"usage":"per_request"}` }])).toBe(false)
+  expect(jsonStreamEnabled([{ name: "jsonparser", enabled: false, configJson: `{"usage":"all_requests"}` }])).toBe(false)
+  expect(jsonStreamEnabled([{ name: "header", configJson: "{}" }])).toBe(false)
+})
+
+test("buildChain sorts by placement group, then order, then config position", () => {
+  const built = buildChain([
+    { name: "blocklist", configJson: "{\"words\":[\"a\"]}" },
+    { name: "maxtokens", configJson: "{}", placement: "pre_builtin", order: 1 },
+    { name: "header", configJson: "{}", placement: "pre_builtin", order: 0 },
+    { name: "jsonparser", configJson: "{\"strip_markdown_fences\":true}", placement: "builtin" },
+    { name: "blocklist", configJson: "{\"words\":[\"b\"]}", placement: "post_builtin", order: -1 },
+    { name: "maxtokens", configJson: "{}", placement: "pre_builtin", order: 0 },
+  ])
+  const names: string[] = []
+  for (const p of built.chain.plugins) names.push(p.name())
+  expect(names.join(",")).toBe("header,maxtokens,maxtokens,jsonparser,blocklist,blocklist")
+  expect(built.errors.length).toBe(0)
+  const bad = buildChain([{ name: "header", configJson: "{}", placement: "middle" }])
+  expect(bad.chain.plugins.length).toBe(0)
+  expect(bad.errors[0]!.includes("placement \"middle\"")).toBe(true)
+  expect(placementRank(undefined)).toBe(2)
 })
 
 test("buildChain treats an empty config as an empty object", () => {

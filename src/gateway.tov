@@ -23,6 +23,7 @@ import { judgeText } from "./guard_judge"
 import { CompiledRule } from "./guard_regex"
 import { compileLocal, localVerdict } from "./guard_local"
 import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
+import { OutputStreamGuard, GuardedProvider } from "./guard_stream"
 import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText } from "./compat"
@@ -46,11 +47,11 @@ import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
 import { GuardConfig, applyToChatRequest, applyToCompletion, applyToText } from "./guardrails"
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
-import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
+import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
 import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, userHeadersOf } from "./mcp"
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
-import { PluginChain, PluginContext, buildChain } from "./plugins"
+import { PluginChain, PluginContext, PluginEntry, buildChain, jsonStreamEnabled, JsonStreamFixer } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline } from "./deadline"
 import { logMetadata, correlationIds, maximAttrs, stopReasonOf } from "./reqlog"
@@ -101,6 +102,12 @@ export class StreamConverter {
 
   // kind "responses-raw": a Responses stream from an OpenAI upstream, forwarded as it came
   rp: ResponsesPassthrough | undefined = undefined
+
+  // the client's text is completed as JSON (jsonparser) and checked by the local output guardrails
+  // (set by chatOnce); halted once either ends the stream
+  jsonFix: JsonStreamFixer | undefined = undefined
+  guard: OutputStreamGuard | undefined = undefined
+  halted = false
 
   constructor(readonly kind: string, requested: string, includeUsage: bool) {
     if (kind === "responses-raw") this.rp = new ResponsesPassthrough()
@@ -219,6 +226,25 @@ export class StreamConverter {
     const co = this.cohereOut
     if (co !== undefined) return tail + co.end()
     return tail
+  }
+
+  // The client's text after the local output guardrails. A block halts the converter, and the
+  // relay stops reading the upstream.
+  guarded(s: string, last: bool): string {
+    const jf = this.jsonFix
+    const text = jf === undefined ? s : last ? jf.finish(s) : jf.filter(s)
+    if (jf !== undefined && jf.stopped) {
+      this.halted = true
+      return text
+    }
+    const g = this.guard
+    if (g === undefined) return text
+    const out = last ? g.finish(text) : g.filter(text)
+    if (g.stopped && !this.halted) {
+      this.halted = true
+      metrics.inc("raiju_guardrail_checks_total", metrics.labels("", g.blockedBy, "block"), 1.0)
+    }
+    return out
   }
 
   // Whole frames only: a text completion frame is built from a complete chat frame.
@@ -790,6 +816,9 @@ class ReqCtx {
   input = ""
   output = ""
   span: Span | undefined = undefined
+  // the request's overhead and the stages it timed, for the otel plugin's spans
+  overheadUs: f64 | undefined = undefined
+  stages: StageTiming[] = []
   // the model as the caller named it
   requested = ""
   // headers plugins asked to send upstream
@@ -916,6 +945,8 @@ export class Engine {
   mcp: McpManager | undefined = undefined
   jobs: JobStore
   plugins: PluginChain | undefined = undefined
+  // jsonparser with usage all_requests: the JSON of each stream is completed (plugins.tov JsonStreamFixer)
+  jsonStreamOn = false
   semantic: SemanticCache | undefined = undefined
   semanticCfg: SemanticCacheConfig = defaultSemanticConfig()
   // an external vector store for the semantic cache (Bifrost's vector_store), shared by all workers
@@ -953,9 +984,11 @@ export class Engine {
     if (cfg.cluster?.enabled === true) this.gov.alignWindows()
     const specs = cfg.plugins ?? []
     if (specs.length > 0) {
-      const built = buildChain(specs.map((p) => ({ name: p.name, enabled: p.enabled, configJson: p.config_json ?? "{}" })))
+      const entries: PluginEntry[] = specs.map((p) => ({ name: p.name, enabled: p.enabled, configJson: p.config_json ?? "{}", placement: p.placement, order: p.order }))
+      const built = buildChain(entries)
       for (const e of built.errors) console.error(`raiju: plugin: ${e}`)
       this.plugins = built.chain
+      this.jsonStreamOn = jsonStreamEnabled(entries)
     }
     const sc = cfg.semantic_cache
     if (sc !== undefined && sc.enabled !== false && sc.embedding_model !== "") {
@@ -1044,6 +1077,7 @@ export class Engine {
     this.autoPromptCache = cfg.prompt_cache?.auto_inject ?? false
     this.logRequests = cfg.client?.enable_logging ?? true
     metrics.setCustomLabels(cfg.client?.prometheus_labels ?? [])
+    metrics.setTelemetry(cfg.telemetry?.overhead_breakdown_enabled === true, cfg.telemetry?.user_labels_enabled === true)
     this.limiters = limitersFor(cfg)
     if (injectedNames(cfg).length > 0 && (cfg.mcp?.client_configs ?? []).length === 0) console.error("raiju: injected_tools need MCP clients, and none are configured")
     this.guardProviders = cfg.guardrails?.providers ?? []
@@ -1372,7 +1406,7 @@ export class Engine {
               let chunkIndex = 0
               let lastAt = started
               while (true) {
-                if (sink.cancelled) {
+                if (sink.cancelled || conv.halted) {
                   await reader.cancel()
                   break
                 }
@@ -1380,7 +1414,7 @@ export class Engine {
                 if (c.done) break
                 const v = c.value
                 if (v !== undefined) {
-                  const out = conv.push(v)
+                  const out = conv.guarded(conv.push(v), false)
                   if (out !== "") {
                     const at = performance.now()
                     metrics.observeStreamChunk(tl, chunkIndex, (at - lastAt) / 1000.0)
@@ -1398,7 +1432,7 @@ export class Engine {
               // (a client that cancelled is owed no error event)
               if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
             }
-            const tail = conv.end()
+            const tail = conv.guarded(conv.end(), true)
             if (tail !== "") sink.write(tail)
             const fe = conv.takeFrames()
             const we = sink.writeBytes
@@ -1528,6 +1562,7 @@ export class Engine {
     this.guardOutput = fresh.guardOutput
     this.autoPromptCache = fresh.autoPromptCache
     this.plugins = fresh.plugins
+    this.jsonStreamOn = fresh.jsonStreamOn
     this.logRequests = fresh.logRequests
     this.complexity = fresh.complexity
     this.guardProviders = fresh.guardProviders
@@ -1855,17 +1890,35 @@ export class Engine {
       headers: h,
       params: params,
     }
-    const m = rules.match(act, { virtual_key: vk?.id, team: vk?.team_id, customer: vk?.customer_id })
-    if (m === undefined) return undefined
-    const i = pickTarget(m.targets, Math.random())
-    if (i < 0) return undefined
-    const tg = m.targets[i]!
-    const out: ModelRef[] = [{ provider: tg.provider, model: tg.model ?? first.model }]
-    if (tg.key_id !== undefined) h.set("x-bf-api-key", tg.key_id)
-    h.set("x-bf-routing-rule", m.rule)
-    for (const f of m.fallbacks) out.push(parseModel(this.cfg, f))
-    for (const r of refs.slice(1)) out.push(r)
-    return out
+    // chain_rule: a matched rule with chain_rule sends its target back through the rules as the new
+    // context. The chain ends on a terminal rule, at the depth limit, when nothing matches, or when a step
+    // changes neither provider nor model. The last matched rule decides (Bifrost's accumulation).
+    const maxDepth = this.cfg.client?.routing_chain_max_depth ?? 10
+    let cur: ModelRef = first
+    let decided: ModelRef[] | undefined = undefined
+    let steps = 0
+    while (true) {
+      act.model = cur.model
+      act.provider = cur.provider
+      const m = rules.match(act, { virtual_key: vk?.id, team: vk?.team_id, customer: vk?.customer_id })
+      if (m === undefined) break
+      const i = pickTarget(m.targets, Math.random())
+      if (i < 0) break
+      const tg = m.targets[i]!
+      const next: ModelRef = { provider: tg.provider, model: tg.model ?? cur.model }
+      const out: ModelRef[] = [next]
+      for (const f of m.fallbacks) out.push(parseModel(this.cfg, f))
+      decided = out
+      if (tg.key_id !== undefined) h.set("x-bf-api-key", tg.key_id)
+      h.set("x-bf-routing-rule", m.rule)
+      if (!m.chain || steps >= maxDepth) break
+      steps += 1
+      if (next.provider === cur.provider && next.model === cur.model) break
+      cur = next
+    }
+    if (decided === undefined) return undefined
+    for (const r of refs.slice(1)) decided.push(r)
+    return decided
   }
 
   // Shared front half of every inference endpoint.
@@ -1885,8 +1938,10 @@ export class Engine {
     if (upstreamHeaders !== undefined) ctx.upstreamHeaders = upstreamHeaders
     const tracer = this.tracer
     if (tracer !== undefined) {
-      const rs = tracer.startRequest(op, h.get("traceparent"), Date.now())
+      const sid = sessionId(h)
+      const rs = tracer.startRequest(op, h.get("traceparent"), Date.now(), sid)
       tracer.recordRequestHeaders(rs, h)
+      if (sid !== undefined) rs.setStr("session.id", sid)
       ctx.span = rs
     }
     ctx.contentOff = this.contentOff(h)
@@ -2014,6 +2069,7 @@ export class Engine {
     const xApp = h.get("x-bf-app") ?? ""
     rl.app = xApp !== "" ? xApp : appOf(h.get("user-agent") ?? "", this.cfg.user_agent_mappings ?? [])
     ctx.app = rl.app
+    rl.userId = ctx.userId
     rl.custom = metrics.customValues(h)
     ctx.labels = rl
     // Fallbacks the key may not use are dropped.
@@ -2171,6 +2227,15 @@ export class Engine {
     metrics.observeOverheadComponent(ul, "conversion", convertUs)
     metrics.observeOverheadComponent(ul, "miscellaneous", Math.max(0.0, overheadUs - (govUs + cacheUs + routeUs + convertUs)))
     out.set("x-bf-overhead-us", "" + Math.round(overheadUs))
+    // the same measurements as spans for the otel plugin: the request span's overhead, and each stage
+    const epochAt = (p: f64): f64 => Date.now() - (performance.now() - p)
+    ctx.overheadUs = overheadUs
+    ctx.stages = [
+      { name: "plugin.routing.prehook", startMs: epochAt(tRoute), durUs: routeUs },
+      { name: "plugin.governance.prehook", startMs: epochAt(tGov), durUs: govUs },
+      { name: "convertor", startMs: epochAt(tAtt), durUs: convertUs },
+    ]
+    if (cache !== undefined) ctx.stages.push({ name: "plugin.semantic_cache.prehook", startMs: epochAt(tCache), durUs: cacheUs })
     ctx.provider = r.provider
     ctx.promptTokens = r.promptTokens
     ctx.completionTokens = r.completionTokens
@@ -2318,8 +2383,11 @@ export class Engine {
       genAiAttributes(span, { system: c.provider, operation: c.op, requestModel: c.model, inputTokens: c.promptTokens, outputTokens: c.completionTokens })
       span.setInt("http.response.status_code", c.status)
       span.setBool("raiju.cache_hit", c.cached)
+      const ov = c.overheadUs
+      if (ov !== undefined) span.setNum("bifrost.overhead.duration_ms", ov / 1000.0)
       if (!ok) span.fail(c.error === "" ? `HTTP ${c.status}` : c.error)
       span.end(Date.now())
+      tracer.addStages(span, c.stages)
       tracer.finish(span)
       if (tracer.shouldFlush(Date.now())) this.flushTraces(tracer)
     }
@@ -2567,13 +2635,27 @@ export class Engine {
     }
     // With a sink, OpenAI-format upstreams stream straight through as chunks arrive.
     const dropUsage = !wantUsage
+    // local output guardrails (regex and secrets) check the stream as it accumulates (guard_stream.tov)
+    const outGuards: GuardedProvider[] = []
+    if (guardOn && stream) {
+      for (const p of this.guardProviders) {
+        if (!appliesTo(p, "output") || !(p.targets ?? ["llm"]).includes("llm")) continue
+        if (p.kind === "regex" || p.kind === "secrets") outGuards.push({ id: p.id, rules: this.localRules.get(p.id) ?? [] })
+      }
+    }
+    const jsonOn = stream && this.jsonStreamOn
+    const guardedConv = (c: StreamConverter): StreamConverter => {
+      if (outGuards.length > 0) c.guard = new OutputStreamGuard(outGuards)
+      if (jsonOn) c.jsonFix = new JsonStreamFixer()
+      return c
+    }
     const mk: ConverterFactory = (t, requested) => {
       if (!streamable(t)) return undefined
       // a chat request converted to Responses: the Responses events come out as chat chunks
-      if (cp.routeFor(t.provider, t.kind, t.model) === "responses") return new StreamConverter("responses", requested, wantUsage)
+      if (cp.routeFor(t.provider, t.kind, t.model) === "responses") return guardedConv(new StreamConverter("responses", requested, wantUsage))
       const conv = new StreamConverter(converterKind(t), requested, !dropUsage)
       conv.stopAtFinish = quirkStopsAtFinish(t)
-      return conv
+      return guardedConv(conv)
     }
     const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk, cp)
     // external output guardrails see the whole answer, so they apply to non-streamed answers
