@@ -4,7 +4,7 @@ import { Engine, Build, Translate, errorResponse, noHeaders } from "./gateway"
 import { ChatRequest, snapshot, errorJson } from "./schemas"
 import { parseModel, kindOf } from "./router"
 import { providerOf } from "./config"
-import { JobStore, jobJson, asyncOp, estimateChatTokens, anthropicCountRequest, geminiCountRequest, countResponse, countTokensJson, parseRerank, rerankJson, lexicalRerank } from "./jobs"
+import { JobStore, jobJson, resultTtlMs, asyncOp, estimateChatTokens, anthropicCountRequest, geminiCountRequest, countResponse, countTokensJson, parseRerank, rerankJson, lexicalRerank } from "./jobs"
 import * as cohere from "./providers/cohere"
 import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
@@ -318,7 +318,7 @@ export async function asyncSubmit(jobs: JobStore, req: Request, path: string, di
   const target = asyncOp(path)
   if (target === undefined) return errorResponse(404, `no async operation for ${path}`, "invalid_request_error", noHeaders())
   // the op as Bifrost names it ("chat/completions"), which its poll path repeats
-  const job = jobs.create(path.slice("/v1/async/".byteLength, path.byteLength), Math.floor(Date.now()))
+  const job = jobs.create(path.slice("/v1/async/".byteLength, path.byteLength), Math.floor(Date.now()), resultTtlMs(snapshot(req.headers)))
   if (job === undefined) return errorResponse(503, "too many async jobs are running; retry later", "api_error", noHeaders())
   const text = await req.text()
   const h: Record<string, string> = snapshot(req.headers)
@@ -334,4 +334,31 @@ export function asyncGet(jobs: JobStore, op: string, id: string): Response {
   const j = jobs.get(id, Math.floor(Date.now()))
   if (j === undefined || (op !== "jobs" && j.op !== op)) return errorResponse(404, `no job ${id} (it may have expired)`, "invalid_request_error", noHeaders())
   return json(200, jobJson(j, jobs.ttlMs))
+}
+
+// x-bf-async on an SDK route (Bifrost's integration routes): the same request runs as a job, and the
+// caller gets the job at once. op is the route's path without its leading slash (the prefix-free route),
+// which a poll on that route repeats.
+export async function sdkAsyncSubmit(jobs: JobStore, req: Request, dispatch: Dispatch, op: string): Promise<Response> {
+  const job = jobs.create(op, Math.floor(Date.now()), resultTtlMs(snapshot(req.headers)))
+  if (job === undefined) return errorResponse(503, "too many async jobs are running; retry later", "api_error", noHeaders())
+  const text = await req.text()
+  // the job runs the plain request: the async flag and its poll id are not forwarded
+  const h: Record<string, string> = snapshot(req.headers)
+  h.delete("x-bf-async")
+  h.delete("x-bf-async-id")
+  const inner = new Request(req.url, { method: "POST", headers: h, body: text })
+  // not awaited: runs as its own task after this response goes out
+  runJob(jobs, job.id, inner, dispatch)
+  return json(202, jobJson(job, jobs.ttlMs))
+}
+
+// GET on an SDK route with x-bf-async-id: the job while it runs (202), then the route's own answer
+// or error once it is done. undefined when the id is not a job of that route.
+export function sdkAsyncPoll(jobs: JobStore, op: string, id: string): Response {
+  const j = jobs.get(id, Math.floor(Date.now()))
+  if (j === undefined || j.op !== op) return errorResponse(404, `job not found or expired`, "invalid_request_error", noHeaders())
+  if (j.status === "pending" || j.status === "processing") return json(202, jobJson(j, jobs.ttlMs))
+  const st = j.http_status ?? (j.status === "failed" ? 500 : 200)
+  return new Response(j.raw ?? "", { status: st, headers: { "content-type": "application/json" } })
 }

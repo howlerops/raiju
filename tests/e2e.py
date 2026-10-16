@@ -1281,6 +1281,81 @@ def unique_ports():
     if dup:
         raise SystemExit(f"e2e: gateways share ports {dup}; give each its own")
 
+def headers_config():
+    """The header gateway's config: logging headers, extra_fields in the headers, a job TTL, and the mock as OpenAI with raw responses sent back."""
+    return {
+        "client": {"enforce_auth_on_inference": False, "logging_headers": ["x-team", "x-custom-*"], "extra_fields_placement": "headers", "async_job_result_ttl": 600},
+        "alerts": {"enabled": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-hdrs-logs")},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "h", "value": "sk-hdrs", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "send_back_raw_response": True}},
+    }
+
+def headers_e2e(env):
+    """Request headers reach the log rows (dimensions, logging headers, correlation ids, app, Maxim attributes);
+    x-bf-async runs an SDK route as a job with its own TTL; extra_fields_placement "headers" keeps extra_fields out
+    of the body; x-bf-passthrough-extra-params merges extra_params; x-request-id is echoed."""
+    import shutil
+    from datetime import datetime
+    GW_H = "http://127.0.0.1:18139"
+    cfg_path = os.path.join(BUILD, "e2e.hdrs.json")
+    shutil.rmtree(os.path.join(BUILD, "e2e-hdrs-logs"), ignore_errors=True)
+    json.dump(headers_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18139", "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.hdrs.log"), "w"))
+
+    def api(method, path, body=None, headers=None):
+        return call(method, path, body, headers, base=GW_H, auth=False)
+
+    def row_for(rid):
+        rows = [e for e in json.loads(api("GET", "/api/logs?limit=100")[2])["entries"] if e.get("request_id") == rid]
+        return rows[0] if rows else {}
+
+    try:
+        wait(GW_H + "/health")
+        _, h, _ = api("GET", "/health", headers={"x-request-id": "rid-echo-1"})
+        check("x-request-id is echoed on every response", hdr(h, "x-request-id") == "rid-echo-1", h)
+
+        ua = {"user-agent": "claude-cli/2.1.168 (external, cli)", "x-bf-dim-env": "prod", "x-bf-dim-path": "ignored", "x-team": "search", "x-custom-a": "1", "x-bf-lh-tenant": "acme", "x-bf-parent-request-id": "parent-9", "x-bf-agent-correlation-id": "agent-9", "x-bf-maxim-trace-id": "tr-e2e", "x-bf-maxim-customer": "acme-co", "x-request-id": "rid-row-1"}
+        s, _, b = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "row metadata"}]}, headers=ua)
+        check("the request with row headers is answered", s == 200 and "Hello from gpt-4o-mini" in b, (s, b[:200]))
+        r = row_for("rid-row-1")
+        md = r.get("metadata", {})
+        check("x-bf-dim-* and logging headers are recorded on the log row", md.get("env") == "prod" and md.get("x-team") == "search" and md.get("x-custom-a") == "1" and md.get("tenant") == "acme" and "path" not in md, r)
+        check("parent and agent correlation ids are log columns", r.get("parent_request_id") == "parent-9" and r.get("agent_correlation_id") == "agent-9", r)
+        check("the app comes from the User-Agent when x-bf-app is absent", r.get("app") == "Claude Code" and r.get("user_agent", "").startswith("claude-cli/"), r)
+        check("x-bf-maxim-* attributes are kept for the Maxim sink", r.get("maxim", {}).get("trace-id") == "tr-e2e" and r.get("maxim_tags", {}).get("customer") == "acme-co", r)
+        api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "app override"}]}, headers={"x-bf-app": "Mine", "user-agent": "claude-cli/1.0", "x-request-id": "rid-row-2"})
+        check("x-bf-app wins over the User-Agent", row_for("rid-row-2").get("app") == "Mine", row_for("rid-row-2"))
+
+        # x-bf-async on an SDK route: the request runs as a job; a poll on that route answers the route's own body
+        s, _, b = api("POST", "/openai/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "async sdk route"}]}, headers={"x-bf-async": "true", "x-bf-async-job-result-ttl": "5"})
+        created = json.loads(b) if s == 202 else {}
+        job_id = created.get("id", "")
+        check("x-bf-async answers 202 with a job", s == 202 and job_id.startswith("job_"), (s, b[:200]))
+        polled = (0, {}, "")
+        for _ in range(100):
+            polled = api("GET", "/openai/v1/chat/completions", headers={"x-bf-async-id": job_id})
+            if polled[0] != 202:
+                break
+            time.sleep(0.1)
+        check("a poll on the SDK route answers the route's own body once done", polled[0] == 200 and json.loads(polled[2]).get("object") == "chat.completion" and "Hello from gpt-4o-mini" in polled[2], polled)
+        jb = json.loads(api("GET", "/v1/async/jobs/" + job_id)[2])
+        ttl = datetime.strptime(jb.get("expires_at", ""), "%Y-%m-%dT%H:%M:%S.%fZ").timestamp() - datetime.strptime(jb.get("completed_at", ""), "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+        check("x-bf-async-job-result-ttl sets the job's own expiry", round(ttl) == 5, jb)
+        s, _, b = api("GET", "/openai/v1/chat/completions", headers={"x-bf-async-id": "job_nope"})
+        check("a poll with an unknown job id is 404 on the SDK route", s == 404, (s, b[:200]))
+
+        # extra_fields_placement "headers": the raw response stays out of the body; the latency goes out as a header
+        s, h, b = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "placement"}]})
+        check("extra_fields_placement headers keeps extra_fields out of the body", s == 200 and "extra_fields" not in json.loads(b) and hdr(h, "x-bifrost-latency-ms") is not None, (s, b[:200]))
+
+        # x-bf-passthrough-extra-params: the body's extra_params reach the provider
+        s, _, b = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "extra params"}], "extra_params": {"custom_flag": True}}, headers={"x-bf-passthrough-extra-params": "true"})
+        sent = json.loads(seen()[-1]["body"])
+        check("x-bf-passthrough-extra-params merges extra_params into the request", s == 200 and sent.get("custom_flag") is True and "extra_params" not in sent, sent)
+    finally:
+        gw.terminate()
+
 def main():
     unique_ports()
     build()
@@ -1967,6 +2042,11 @@ def main():
         check("mcp tools injected into chat", any(t["function"]["name"] == "weather-get_weather" and t["function"]["parameters"]["required"] == ["city"] for t in tools), tools)
         chat("openai/gpt-4o-mini", headers={"x-bf-mcp-include-clients": "none"}, seed=501)
         check("x-bf-mcp-include-clients none skips injection", "tools" not in json.loads(seen()[-1]["body"]), seen()[-1]["body"][:200])
+        chat("openai/gpt-4o-mini", headers={"x-bf-mcp-include-tools": "weather-get_weather"}, seed=502)
+        names = [t["function"]["name"] for t in json.loads(seen()[-1]["body"]).get("tools", [])]
+        check("x-bf-mcp-include-tools keeps only the named tools", names == ["weather-get_weather"], names)
+        chat("openai/gpt-4o-mini", headers={"x-bf-mcp-include-tools": ""}, seed=503)
+        check("an empty x-bf-mcp-include-tools includes no tool", "tools" not in json.loads(seen()[-1]["body"]), seen()[-1]["body"][:200])
         s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "call_1", "type": "function", "function": {"name": "weather-get_weather", "arguments": "{\"city\":\"Oslo\"}"}})
         r = json.loads(b)
         check("mcp tool execution", s == 200 and r == {"role": "tool", "tool_call_id": "call_1", "content": "Sunny in Oslo"}, b)
@@ -2737,6 +2817,9 @@ def main():
         H = hl(h)
         check("cache headers on a hit", H.get("x-bifrost-cache-hit") == "true" and H.get("x-bifrost-cache-hit-type") == "direct", H)
         check("cache id and hit latency on a direct hit", H.get("x-bifrost-cache-id", "") != "" and "x-bifrost-cache-hit-latency-ms" in H, H)
+        check("a hit names the provider, model and prompt tokens that first served the answer", H.get("x-bifrost-cache-provider-used") == "openai" and H.get("x-bifrost-cache-model-used") == "gpt-4o-mini" and H.get("x-bifrost-cache-input-tokens", "").isdigit(), H)
+        _, h, _ = call("GET", "/health", headers={"x-request-id": "rid-echo-main"})
+        check("x-request-id is echoed on a non-inference route too", hdr(h, "x-request-id") == "rid-echo-main", h)
         _, h, _ = chat("openai/down-model", extra=None, fallbacks=["anthropic/claude-fallback"], seed=1401)
         H = hl(h)
         check("fallback headers", H.get("x-bifrost-fallback-index") == "1" and H.get("x-bifrost-routing-info-is-fallback") == "true" and H.get("x-bifrost-provider") == "anthropic", H)
@@ -2939,7 +3022,8 @@ def main():
         check("drop_excess_requests logs that it has no effect", "drop_excess_requests has no effect" in open(os.path.join(BUILD, "e2e.direct.log")).read(), "")
 
         # ---- provider passthroughs (passthrough.tov) ----
-        s, _, b = call("POST", "/openai_passthrough/pt/echo?x=1", {"a": 1}, headers={"authorization": "Bearer caller-key", "x-bf-vk": "sk-bf-nope", "anthropic-beta": "beta-1"})
+        s, ph, b = call("POST", "/openai_passthrough/pt/echo?x=1", {"a": 1}, headers={"authorization": "Bearer caller-key", "x-bf-vk": "sk-bf-nope", "anthropic-beta": "beta-1"})
+        check("a passthrough answer names the provider path it was forwarded to", hdr(ph, "x-bifrost-passthrough-path") == "/pt/echo", ph)
         pe = json.loads(b) if s == 200 else {}
         check("openai passthrough: POST, query and body reach the provider unchanged", s == 200 and pe.get("method") == "POST" and pe.get("path") == "/pt/echo" and pe.get("query") == "?x=1" and json.loads(pe.get("body", "{}")) == {"a": 1}, (s, b))
         check("openai passthrough: the key's auth replaces the caller's, gateway headers stay home, caller headers go", seen()[-1]["auth"] == "Bearer sk-from-env" and "anthropic-beta=beta-1" in pe.get("headers", []) and "authorization=Bearer caller-key" not in pe.get("headers", []) and not any(x.startswith("x-bf-vk=") for x in pe.get("headers", [])), (seen()[-1], pe))
@@ -3296,6 +3380,7 @@ def main():
         s, h, b = call("POST", "/v1/chat/completions", {"model": "compat/responses-only", "messages": msg_c, "max_completion_tokens": 300, "reasoning_effort": "low", "stream": True}, headers={"x-bf-compat": "true"}, base=GW_C)
         sent = json.loads(seen()[-1]["body"])
         check("a streamed chat request to a Responses-only model streams back as chat chunks", s == 200 and seen()[-1]["path"] == "/v1/responses" and sent.get("stream") is True and '"content":"native "' in b and '"content":"responses"' in b and '"object":"chat.completion.chunk"' in b and b.rstrip().endswith("data: [DONE]"), (s, seen()[-1]["path"], b[:300]))
+        check("the compat headers go out with the stream's headers", hdr(h, "x-bifrost-converted-request-type") == "responses", h)
         # decision emulation: the model answers the questions as one forced call on its Responses API
         dec = {"model": "compat/responses-only", "input": "my bill is wrong", "questions": [
             {"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?"},
@@ -3319,6 +3404,8 @@ def main():
         sinks_e2e(env, json.load(open(config))["providers"]["vertex"]["keys"][0]["vertex_key_config"]["auth_credentials"])
         # prompts, webhooks, feature flags and notices: their own gateway, run after the sinks
         l88_e2e(env)
+        # request headers on log rows and SDK-route jobs, extra_fields placement: their own gateway
+        headers_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

@@ -5,6 +5,8 @@
 // cost and latency. The line envelope (entity, id, action, data) follows the
 // action names maxim-go commits; its Serialize method was not readable, so the
 // envelope keys are inferred and not verified against a live repository.
+// The x-bf-maxim-* headers of a request set the trace and generation ids and
+// names, the session and the tags, as Bifrost's Maxim plugin reads them (reqlog.tov).
 import { LogEntry } from "./logstore"
 import { isoMs } from "./exports"
 import { trimSlash } from "./providers/types"
@@ -28,24 +30,60 @@ type MaximData = {
   latency_ms?: f64,
   cache_hit?: bool,
   error?: string,
+  // the trace's session and tags, and the trace a generation belongs to
+  session_id?: string,
+  tags?: Record<string, string>,
+  traceId?: string,
 }
 
 type MaximLine = { entity: string, id: string, action: string, data: MaximData }
 
+// One x-bf-maxim-* attribute the row carries, if the caller sent it.
+function attr(e: LogEntry, name: string): string | undefined {
+  const m = e.maxim
+  if (m === undefined) return undefined
+  return m.get(name)
+}
+
+// The log repo a row goes to: the x-bf-maxim-log-repo-id it named, else the exporter's own.
+export function repoOf(e: LogEntry, dflt: string): string {
+  return attr(e, "log-repo-id") ?? dflt
+}
+
+// The trace tags: the row's metadata (logging headers and dimensions), then the x-bf-maxim-* tags.
+function tagsOf(e: LogEntry): Record<string, string> {
+  const out: Record<string, string> = new Map()
+  const md = e.metadata
+  if (md !== undefined) {
+    for (const k of md.keys()) out.set(k, md.get(k) ?? "")
+  }
+  const mt = e.maxim_tags
+  if (mt !== undefined) {
+    for (const k of mt.keys()) out.set(k, mt.get(k) ?? "")
+  }
+  return out
+}
+
 // The envelope lines for one entry: a trace with its request tags, then a
 // generation with the usage numbers.
 export function maximLines(e: LogEntry): string[] {
+  const traceId = attr(e, "trace-id") ?? e.request_id
   const trace: MaximLine = {
     entity: "trace",
-    id: e.request_id,
+    id: traceId,
     action: "create",
-    data: { id: e.request_id, name: e.op, startTimestamp: isoMs(e.ts), provider: e.provider, model: e.model, status: e.status, virtual_key: e.virtual_key ?? "" },
+    data: {
+      id: traceId, name: attr(e, "trace-name") ?? e.op, startTimestamp: isoMs(e.ts), provider: e.provider, model: e.model, status: e.status,
+      virtual_key: e.virtual_key ?? "", session_id: attr(e, "session-id"), tags: tagsOf(e),
+    },
   }
   const gen: MaximLine = {
     entity: "generation",
-    id: e.id,
+    id: attr(e, "generation-id") ?? e.id,
     action: "result",
     data: {
+      name: attr(e, "generation-name"),
+      traceId: traceId,
       provider: e.provider,
       model: e.model,
       prompt_tokens: e.prompt_tokens,
@@ -119,4 +157,32 @@ test("maxim: two newline-separated JSON lines per entry, no content", () => {
   expect(g.entity).toBe("generation")
   expect(g.id).toBe("a")
   expect(r.body.includes("secret")).toBe(false)
+})
+
+test("maxim: x-bf-maxim attributes name the trace and generation, and tag the trace", () => {
+  const e = sample("c")
+  const ids: Record<string, string> = new Map()
+  ids.set("trace-id", "tr-9")
+  ids.set("generation-name", "answer")
+  ids.set("session-id", "sess-1")
+  ids.set("log-repo-id", "repo-2")
+  const tags: Record<string, string> = new Map()
+  tags.set("customer", "acme")
+  e.maxim = ids
+  e.maxim_tags = tags
+  const md: Record<string, string> = new Map()
+  md.set("env", "prod")
+  e.metadata = md
+  const lines = maximLines(e)
+  const t = try JSON.parse(lines[0]!) as MaximLine
+  expect(t.id).toBe("tr-9")
+  expect(t.data.session_id).toBe("sess-1")
+  expect(t.data.tags!.get("customer")).toBe("acme")
+  expect(t.data.tags!.get("env")).toBe("prod")
+  const g = try JSON.parse(lines[1]!) as MaximLine
+  expect(g.id).toBe("c")
+  expect(g.data.traceId).toBe("tr-9")
+  expect(g.data.name).toBe("answer")
+  expect(repoOf(e, "repo-1")).toBe("repo-2")
+  expect(repoOf(sample("d"), "repo-1")).toBe("repo-1")
 })

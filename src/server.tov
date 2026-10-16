@@ -31,7 +31,7 @@ import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
 import { McpSession } from "./mcp"
 import { Ops, Reply, UiSocket } from "./ops"
-import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, decisionRoute, Dispatch } from "./extras"
+import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
 import { INDEX_HTML } from "./ui_assets"
 
@@ -444,7 +444,33 @@ async function unprefixed(req: Request, p: string): Promise<Request> {
 
 // Every HTTP route except the WebSocket upgrade, in one function so both
 // servers (http1 for streaming, Bun.serve as the fallback) share it.
+// Bifrost's tracing middleware answers with the caller's x-request-id. Inference routes set it from the
+// id they log under; every other route echoes the caller's id here.
+async function echoRequestId(req: Request, res: Response): Promise<Response> {
+  const id = req.headers.get("x-request-id") ?? ""
+  if (id === "" || (res.headers.get("x-request-id") ?? "") !== "") return res
+  const h: Record<string, string> = new Map()
+  res.headers.forEach((v, k) => {
+    if (k !== "content-length") h.set(k, v)
+  })
+  h.set("x-request-id", id)
+  const st = res.body
+  if (st !== undefined && st.pushed) return new Response(st, { status: res.status, headers: h })
+  let bytes: u8[] = []
+  try {
+    bytes = await res.bytes()
+  } catch (e) {
+    bytes = []
+  }
+  return new Response(res.status === 204 ? undefined : bytes, { status: res.status, headers: h })
+}
+
 export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
+  const res = try await routes(engine, ops, req)
+  return await echoRequestId(req, res)
+}
+
+async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
   // the compat plugin reads a model's datasheet row through the same handler as GET /api/models/parameters
   if (engine.paramsLookup === undefined) {
     engine.paramsLookup = async (model: string): Promise<string | undefined> => {
@@ -457,6 +483,12 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   const m = req.method
+  // x-bf-async on an inference route: the request runs as a job, and the caller polls it (Bifrost's integration routes)
+  if (m === "POST" && (req.headers.get("x-bf-async") ?? "") !== "" && !p.startsWith("/api/") && !p.startsWith("/v1/async/") && p !== "/mcp") {
+    const again: Dispatch = async (r) => try await dispatch(engine, ops, r)
+    const route = compatPath(p)
+    return await sdkAsyncSubmit(engine.jobs, req, again, route.slice(1, route.byteLength))
+  }
   const dep = deploymentRoute(p)
   if (dep !== undefined && m === "POST") return try await dispatch(engine, ops, await deploymentRequest(req, dep))
   const cp = compatPath(p)
@@ -478,6 +510,9 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
   if (lc !== "" && m === "GET") return await liveContent(engine, ops.liveSessions, req, lc)
   if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine.cfg, req, await liveCreate(engine, req))
   if (m === "GET" || m === "HEAD") {
+    // x-bf-async-id on an inference route: poll the job that route created
+    const aid = req.headers.get("x-bf-async-id") ?? ""
+    if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid)
     if (p === "/health") return Response.json({ status: "ok" })
     if (p === "/") return textResponse(INDEX_HTML, "text/html; charset=utf-8")
     if (p === "/metrics") return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
@@ -749,7 +784,9 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
       const cp = compatPath(p)
       const t0 = performance.now()
       const reqBytes = parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0
-      const kind = req.method === "POST" ? streamKind(cp) : ""
+      // an x-bf-async request runs as a job through dispatch, not as a stream
+      const asyncReq = (req.headers.get("x-bf-async") ?? "") !== ""
+      const kind = req.method === "POST" && !asyncReq ? streamKind(cp) : ""
       if (kind !== "") return timed(p, req.method, t0, reqBytes, chatStreamed(engine, req, kind))
       return timed(p, req.method, t0, reqBytes, dispatch(engine, ops, req))
     },

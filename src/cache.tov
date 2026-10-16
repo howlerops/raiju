@@ -6,7 +6,11 @@
 import { readFileSync, writeFileSync, readdirSync, unlinkSync, mkdirSync, rmSync } from "node:fs"
 import { sha256, toHex, utf8 } from "./crypto"
 
-type Entry = { body: string, contentType: string, expires: f64 }
+// Where a cached answer came from: the provider and model that served it and the prompt tokens it
+// counted. A hit answers x-bifrost-cache-provider-used, -model-used and -input-tokens with them.
+export type CacheOrigin = { provider: string, model: string, inputTokens: int }
+
+type Entry = { body: string, contentType: string, expires: f64, origin?: CacheOrigin }
 
 export class ResponseCache {
   entries: Map<string, Entry> = new Map()
@@ -29,8 +33,8 @@ export class ResponseCache {
     return this.shareDir + "/" + toHex(sha256(utf8(key)))
   }
 
-  // A shared entry: "<expires>\t<body bytes>\t<content type>\n<body>". A file being written
-  // (no atomic rename in node:fs) has a short body and reads as a miss.
+  // A shared entry: "<expires>\t<body bytes>\t<provider>\t<model>\t<input tokens>\t<content type>\n<body>".
+  // A file being written (no atomic rename in node:fs) has a short body and reads as a miss.
   private readShared(key: string): Entry | undefined {
     if (this.shareDir === "") return undefined
     let text = ""
@@ -45,9 +49,12 @@ export class ResponseCache {
     const expires = parseFloat(head[0] ?? "")
     const len = parseInt(head[1] ?? "")
     const body = text.slice(nl + 1)
-    if (expires === undefined || len === undefined || head.length < 3 || body.byteLength !== len) return undefined
+    if (expires === undefined || len === undefined || head.length < 6 || body.byteLength !== len) return undefined
     if (expires < Date.now()) return undefined
-    return { body: body, contentType: head.slice(2).join("\t"), expires: expires }
+    const provider = head[2] ?? ""
+    const tokens = parseInt(head[4] ?? "") ?? 0
+    const origin: CacheOrigin | undefined = provider === "" ? undefined : { provider: provider, model: head[3] ?? "", inputTokens: tokens }
+    return { body: body, contentType: head.slice(5).join("\t"), expires: expires, origin: origin }
   }
 
   // Removes expired shared files; returns how many went.
@@ -97,13 +104,17 @@ export class ResponseCache {
     return e
   }
 
-  set(key: string, body: string, contentType: string, ttlMs: int): void {
+  set(key: string, body: string, contentType: string, ttlMs: int, origin?: CacheOrigin): void {
     if (this.entries.size >= this.maxEntries) this.evict()
     const expires = Date.now() + ttlMs
-    this.entries.set(key, { body: body, contentType: contentType, expires: expires })
+    this.entries.set(key, { body: body, contentType: contentType, expires: expires, origin: origin })
     if (this.shareDir !== "") {
+      const o = origin
+      const prov = o === undefined ? "" : o.provider
+      const model = o === undefined ? "" : o.model
+      const tokens = o === undefined ? 0 : o.inputTokens
       try {
-        writeFileSync(this.file(key), `${expires}\t${body.byteLength}\t${contentType}\n${body}`)
+        writeFileSync(this.file(key), `${expires}\t${body.byteLength}\t${prov}\t${model}\t${tokens}\t${contentType}\n${body}`)
       } catch (e) {
         // the shared copy is a bonus; this worker still has the entry
       }
@@ -198,6 +209,28 @@ test("a shared cache directory serves entries across instances", () => {
   b.set("old", "gone", "text/plain", -1000)
   expect(a.sweepShared(Date.now())).toBe(1)
   expect(a.get("old")).toBeUndefined()
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (e) {}
+})
+
+test("a cached answer keeps its origin, in memory and in a shared directory", () => {
+  const dir = "/tmp/raiju-cache-origin-" + Math.floor(Math.random() * 1000000000)
+  const a = new ResponseCache(1000, 10)
+  const b = new ResponseCache(1000, 10)
+  a.share(dir)
+  b.share(dir)
+  a.set("k", "{}", "application/json", 60000, { provider: "openai", model: "gpt-4o", inputTokens: 12 })
+  a.set("plain", "{}", "application/json", 60000)
+  const mem = a.get("k")!
+  expect(mem.origin!.provider).toBe("openai")
+  expect(mem.origin!.model).toBe("gpt-4o")
+  expect(mem.origin!.inputTokens).toBe(12)
+  const shared = b.get("k")!
+  expect(shared.body).toBe("{}")
+  expect(shared.origin!.provider).toBe("openai")
+  expect(shared.origin!.inputTokens).toBe(12)
+  expect(b.get("plain")!.origin === undefined).toBe(true)
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch (e) {}

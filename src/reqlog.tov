@@ -1,0 +1,162 @@
+// What a request's headers add to its log row and to the Maxim sink: the row metadata
+// (client.logging_headers, x-bf-lh-* and x-bf-dim-*), the parent and agent correlation
+// ids, and the x-bf-maxim-* trace attributes. Names follow Bifrost's logging plugin
+// (plugins/logging/main.go captureLoggingHeaders) and its Maxim plugin.
+import { Hdrs } from "./schemas"
+import { isSensitiveHeader } from "./otel"
+
+// Bifrost's agent correlation column is cut to this many bytes (plugins/logging/writer.go).
+const MAX_AGENT_ID = 255
+
+const MAXIM_IDS: string[] = ["trace-id", "trace-name", "generation-id", "generation-name", "session-id", "log-repo-id"]
+
+// A client.logging_headers entry: an exact header name, or a prefix ending in "*", or "*" for all.
+export function patternMatches(name: string, pattern: string): bool {
+  const p = pattern.trim().toLowerCase()
+  if (p === "") return false
+  if (p === "*") return true
+  if (p.endsWith("*")) return name.startsWith(p.slice(0, p.byteLength - 1))
+  return name === p
+}
+
+// The value a logged header carries: credential-bearing ones are recorded as REDACTED.
+function loggedValue(name: string, value: string): string {
+  return isSensitiveHeader(name) ? "REDACTED" : value
+}
+
+// The row metadata a request's headers give: the client.logging_headers patterns, then
+// x-bf-lh-<name>, then x-bf-dim-<name> for any name not already set (as Bifrost merges them).
+// undefined when none is set.
+export function logMetadata(h: Hdrs, names: string[]): Record<string, string> | undefined {
+  const out: Record<string, string> = new Map()
+  for (const pattern of names) {
+    for (const k of h.keys()) {
+      if (patternMatches(k, pattern)) out.set(k, loggedValue(k, h.get(k) ?? ""))
+    }
+  }
+  for (const k of h.keys()) {
+    if (!k.startsWith("x-bf-lh-")) continue
+    const label = k.slice(8, k.byteLength)
+    if (label !== "") out.set(label, loggedValue(k, h.get(k) ?? ""))
+  }
+  for (const k of h.keys()) {
+    if (!k.startsWith("x-bf-dim-")) continue
+    const label = k.slice(9, k.byteLength)
+    // path and method are reserved dimension names in Bifrost
+    if (label === "" || label === "path" || label === "method" || out.has(label)) continue
+    out.set(label, h.get(k) ?? "")
+  }
+  return out.size === 0 ? undefined : out
+}
+
+// Cuts s to at most max bytes without splitting a UTF-8 character.
+function clipBytes(s: string, max: int): string {
+  if (s.byteLength <= max) return s
+  const bytes = new TextEncoder().encode(s)
+  let end = Math.max(0, max)
+  while (end > 0 && (int(bytes[end]!) & 0xc0) === 0x80) end -= 1
+  try {
+    return new TextDecoder().decode(bytes.slice(0, end))
+  } catch (err) {
+    return ""
+  }
+}
+
+// The parent request id (x-bf-parent-request-id) and agent correlation id
+// (x-bf-agent-correlation-id); "" when absent. The agent id is cut to 255 bytes.
+export function correlationIds(h: Hdrs): { parent: string, agent: string } {
+  const parent = (h.get("x-bf-parent-request-id") ?? "").trim()
+  const agent = clipBytes((h.get("x-bf-agent-correlation-id") ?? "").trim(), MAX_AGENT_ID)
+  return { parent: parent, agent: agent }
+}
+
+// The x-bf-maxim-* attributes: the reserved names (trace and generation ids and names, the
+// session, the log repo) in ids, every other name as a tag. undefined when none is sent.
+export function maximAttrs(h: Hdrs): { ids: Record<string, string>, tags: Record<string, string> } | undefined {
+  const ids: Record<string, string> = new Map()
+  const tags: Record<string, string> = new Map()
+  for (const k of h.keys()) {
+    if (!k.startsWith("x-bf-maxim-")) continue
+    const name = k.slice(11, k.byteLength)
+    const v = (h.get(k) ?? "").trim()
+    if (name === "") continue
+    if (MAXIM_IDS.includes(name)) {
+      if (v !== "") ids.set(name, v)
+    } else {
+      tags.set(name, v)
+    }
+  }
+  if (ids.size === 0 && tags.size === 0) return undefined
+  return { ids: ids, tags: tags }
+}
+
+test("logging patterns: exact names, prefixes and the wildcard", () => {
+  expect(patternMatches("x-team", "X-Team")).toBe(true)
+  expect(patternMatches("x-team-id", "x-team")).toBe(false)
+  expect(patternMatches("x-custom-a", "x-custom-*")).toBe(true)
+  expect(patternMatches("x-other", "x-custom-*")).toBe(false)
+  expect(patternMatches("anything", "*")).toBe(true)
+  expect(patternMatches("anything", "  ")).toBe(false)
+})
+
+test("row metadata: configured headers, x-bf-lh-*, and x-bf-dim-* that do not clash", () => {
+  const h: Hdrs = new Map()
+  h.set("x-team", "search")
+  h.set("x-custom-a", "1")
+  h.set("x-bf-lh-tenant", "acme")
+  h.set("x-bf-lh-team", "override")
+  h.set("x-bf-dim-env", "prod")
+  h.set("x-bf-dim-team", "dim")
+  h.set("x-bf-dim-path", "/v1/chat")
+  h.set("x-other", "no")
+  const m = logMetadata(h, ["x-team", "x-custom-*"])!
+  expect(m.get("x-team")).toBe("search")
+  expect(m.get("x-custom-a")).toBe("1")
+  expect(m.get("tenant")).toBe("acme")
+  expect(m.get("team")).toBe("override")
+  expect(m.get("env")).toBe("prod")
+  expect(m.has("path")).toBe(false)
+  expect(m.has("other")).toBe(false)
+  expect(m.has("x-other")).toBe(false)
+})
+
+test("row metadata: a credential-bearing logging header is recorded as REDACTED", () => {
+  const h: Hdrs = new Map()
+  h.set("authorization", "Bearer sk-live-secret")
+  h.set("x-bf-lh-api-key", "k")
+  const m = logMetadata(h, ["authorization"])!
+  expect(m.get("authorization")).toBe("REDACTED")
+  expect(m.get("api-key")).toBe("REDACTED")
+})
+
+test("row metadata: nothing sent gives undefined", () => {
+  expect(logMetadata(new Map(), ["x-team"])).toBeUndefined()
+})
+
+test("correlation ids: trimmed, and the agent id cut to 255 bytes", () => {
+  const h: Hdrs = new Map()
+  h.set("x-bf-parent-request-id", "  req-1 ")
+  let long = ""
+  for (let i = 0; i < 300; i++) long += "a"
+  h.set("x-bf-agent-correlation-id", long)
+  const c = correlationIds(h)
+  expect(c.parent).toBe("req-1")
+  expect(c.agent.byteLength).toBe(255)
+  const none = correlationIds(new Map())
+  expect(none.parent).toBe("")
+  expect(none.agent).toBe("")
+})
+
+test("maxim attributes: reserved names are ids, the rest are tags", () => {
+  const h: Hdrs = new Map()
+  h.set("x-bf-maxim-trace-id", "tr-1")
+  h.set("x-bf-maxim-generation-name", "gen")
+  h.set("x-bf-maxim-log-repo-id", "")
+  h.set("x-bf-maxim-customer", "acme")
+  const a = maximAttrs(h)!
+  expect(a.ids.get("trace-id")).toBe("tr-1")
+  expect(a.ids.get("generation-name")).toBe("gen")
+  expect(a.ids.has("log-repo-id")).toBe(false)
+  expect(a.tags.get("customer")).toBe("acme")
+  expect(maximAttrs(new Map())).toBeUndefined()
+})
