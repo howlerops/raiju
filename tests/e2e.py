@@ -1894,7 +1894,7 @@ def main():
         st = json.loads(b)
         check("log stats", s == 200 and st["requests"] > 10 and st["tokens"] > 0, b[:300])
         files = os.listdir(os.path.join(ROOT, "build/e2e-logs"))
-        check("logs persisted as daily JSONL", len(files) == 1 and files[0].startswith("requests-") and files[0].endswith(".jsonl"), files)
+        check("logs persisted as daily JSONL", 1 <= len(files) <= 2 and all(f.startswith("requests-") and f.endswith(".jsonl") for f in files), files)  # two when the run crosses midnight UTC
 
         # Traces: a server span per request and a client span per upstream attempt, honoring traceparent
         tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
