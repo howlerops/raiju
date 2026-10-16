@@ -260,7 +260,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | ID | Work | Owner | Status |
 |---|---|---|---|
 | L98 | OpenAPI spec for the management API, checked against the routes | worker | done: docs/openapi/management.yaml (203 operations), `make openapi-check` probes a gateway both ways; found /api/mcp/virtual answering any method (fixed) |
-| L99 | Native client spike (providers list plus live logs) in gpui and Slint; compare | worker | assigned |
+| L99 | Native client spike (providers list plus live logs) in gpui and Slint; compare | worker | done: clients/gpui-spike and clients/slint-spike build, share one data layer (GET /api/providers, /ws live log feed) checked headless against a gateway; Slint frame rendered to clients/slint-spike/screenshot.png; clients/README.md compares and recommends Slint (smaller graph, faster build, headless render, mobile targets), licence choice left to the owner. No display here: windows not launched |
 
 Decision taken by the lead: models without a price stay a warning (cost 0), as in Bifrost;
 refusing them is a one-line switch if the owner wants it.
