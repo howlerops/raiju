@@ -1749,6 +1749,31 @@ def l97g_config(auth: bool) -> dict:
     return cfg
 
 
+def declared_post(port: int, path: str, total: int) -> int | None:
+    """A POST declaring a Content-Length of total bytes, sent in 64 KB pieces. A server that refuses on the declared
+    length may answer and close before the body is all out, so a broken pipe while sending is expected; the status
+    is read afterwards (None when there is none)."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.putrequest("POST", path)
+    conn.putheader("content-type", "application/json")
+    conn.putheader("content-length", str(total))
+    conn.endheaders()
+    chunk = b"x" * 65536
+    try:
+        sent = 0
+        while sent < total:
+            n = min(65536, total - sent)
+            conn.send(chunk[:n])
+            sent += n
+    except OSError:
+        pass
+    try:
+        return conn.getresponse().status
+    except Exception:
+        return None
+
+
 def chunked_post(port: int, path: str, total: int) -> int | None:
     """A POST with no Content-Length, streamed in 64 KB chunks; the status it got back (None when the connection was cut first)."""
     import http.client
@@ -1783,8 +1808,8 @@ def l97g_e2e(env):
         wait(GW_L97G + "/api/session/is-auth-enabled")
         wait(GW_L97G_AUTH + "/api/session/is-auth-enabled")
         chat_body = lambda model, n: json.dumps({"model": model, "messages": [{"role": "user", "content": "x" * n}]})
-        s, _, b = call("POST", "/v1/chat/completions", chat_body("openai/gpt-4o-mini", 1100000), base=GW_L97G, auth=False)
-        check("a declared body over max_request_body_size_mb is refused with 413", s == 413, (s, b[:200]))
+        st = declared_post(18142, "/v1/chat/completions", 1100000)
+        check("a declared body over max_request_body_size_mb is refused with 413", st == 413, st)
         st = chunked_post(18142, "/v1/chat/completions", 2 * 1048576)
         check("a chunked body over max_request_body_size_mb is refused with 413", st == 413, st)
         s, _, b = call("POST", "/v1/chat/completions", chat_body("openai/gpt-4o-mini", 100), base=GW_L97G, auth=False)
