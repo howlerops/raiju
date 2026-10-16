@@ -19,8 +19,10 @@ import { setGlobalProxy } from "./providers/types"
 import { McpClientConfig } from "./mcp"
 import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
-import { Field, fields, find, isNull, quote, elements, decodeString } from "./json"
+import { Field, fields, find, isNull, quote, elements, decodeString, rawStr } from "./json"
 import { secureHex, utf8 } from "./crypto"
+import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
+import { durationMs } from "./governance"
 
 export type AdminAuth = AdminAuthConfig
 
@@ -33,7 +35,7 @@ type HasId = { id: string }
 
 // Request bodies: the server fills the id, and a missing required field is
 // caught by the store's validation instead of by JSON.parse's type check.
-type VkBody = { id?: string, name?: string, value?: string, description?: string, is_active?: bool, team_id?: string, customer_id?: string, budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], key_ids?: string[] }
+type VkBody = { id?: string, name?: string, value?: string, description?: string, is_active?: bool, team_id?: string, customer_id?: string, budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], key_ids?: string[], expires_at?: string }
 type BudgetBody = { id?: string, max_limit?: f64, reset_duration?: string, current_usage?: f64 }
 type RateBody = { id?: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string }
 type NamedBody = { id?: string, name?: string, customer_id?: string, budget_id?: string, business_unit_id?: string }
@@ -1120,6 +1122,13 @@ export class ConfigStore {
     return this.commit(n, "circuit-breaker-policies")
   }
 
+  // Replaces the UI and admin metadata map; see postMetadata.
+  setMetadata(m: Map<string, string | f64 | bool>): Result {
+    let n: Config = this.cfg
+    n.metadata = m
+    return this.commit(n, "metadata")
+  }
+
   // Replaces the client section (Bifrost's client_config); see putConfig.
   setClient(c: ClientConfig): Result {
     let n: Config = this.cfg
@@ -1210,6 +1219,8 @@ export class ConfigStore {
     }
     const refErr = vkRefError(this.cfg, vk)
     if (refErr !== "") return fail(400, refErr)
+    const exp = vk.expires_at
+    if (exp !== undefined && exp !== "" && rfc3339Ms(exp) === undefined) return fail(400, "expires_at must be an RFC 3339 time")
     const next: VirtualKeyConfig = {
       id: id,
       name: vk.name,
@@ -1222,6 +1233,44 @@ export class ConfigStore {
       rate_limit_id: vk.rate_limit_id,
       provider_configs: vk.provider_configs,
       key_ids: vk.key_ids,
+      expires_at: exp === undefined || exp === "" ? undefined : exp,
+      // a rotation's grace period is not set by a write; it stays until it ends or the next rotation
+      previous_value: value === old?.value ? old?.previous_value : undefined,
+      previous_value_expires_at: value === old?.value ? old?.previous_value_expires_at : undefined,
+      rotated_at: old?.rotated_at,
+    }
+    g.virtual_keys = putById(g.virtual_keys ?? [], next)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  // Gives a key a new value (Bifrost's rotation). The old value keeps working for cooldownMs
+  // when that is positive; otherwise it stops at once.
+  rotateVirtualKey(id: string, cooldownMs: number): Result {
+    const g = gov(this.cfg)
+    const old = findById(g.virtual_keys, id)
+    if (old === undefined) return fail(404, `no virtual key ${id}`)
+    let value = newVkValue()
+    while (value === old.value) value = newVkValue()
+    const now = Date.now()
+    const grace = cooldownMs > 0
+    const next: VirtualKeyConfig = {
+      id: old.id,
+      name: old.name,
+      value: value,
+      disable_content_logging: old.disable_content_logging,
+      description: old.description,
+      is_active: old.is_active,
+      team_id: old.team_id,
+      customer_id: old.customer_id,
+      budget_id: old.budget_id,
+      rate_limit_id: old.rate_limit_id,
+      provider_configs: old.provider_configs,
+      key_ids: old.key_ids,
+      access_profile_ids: old.access_profile_ids,
+      expires_at: old.expires_at,
+      previous_value: grace ? old.value : undefined,
+      previous_value_expires_at: grace ? rfc3339Of(now + cooldownMs) : undefined,
+      rotated_at: rfc3339Of(now),
     }
     g.virtual_keys = putById(g.virtual_keys ?? [], next)
     return this.commit(withGov(this.cfg, g), id)
@@ -1772,6 +1821,7 @@ function putGov(store: ConfigStore, coll: string, pathId: string | undefined, bo
       rate_limit_id: b.rate_limit_id,
       provider_configs: b.provider_configs,
       key_ids: b.key_ids,
+      expires_at: b.expires_at,
     }
     const r = store.upsertVirtualKey(vk)
     if (r.kind === "error") return errReply(r)
@@ -1966,13 +2016,92 @@ function pricingRoute(store: ConfigStore, m: string, segs: string[], body: strin
   return notAllowed(m)
 }
 
+// GET /api/governance/teams/{team}/members: the users whose teams list names the team, in Bifrost's
+// {members} shape. Users here have a name and no email, so the name stands for both id and name.
+function teamMembers(store: ConfigStore, m: string, team: string, scope: DataScope): ApiReply {
+  if (m !== "GET") return notAllowed(m)
+  const g = gov(store.cfg)
+  if (!recordInScope(store.cfg, "teams", team, scope) || findById(g.teams, team) === undefined) return reply(404, errorBody(`no teams ${team}`))
+  const out: { user_id: string, user_name: string, user_email: string, source: string }[] = []
+  for (const u of g.users ?? []) {
+    if ((u.teams ?? []).includes(team)) out.push({ user_id: u.name, user_name: u.name, user_email: "", source: "manual" })
+  }
+  return reply(200, JSON.stringify({ members: out }))
+}
+
+// The grace period for a rotated key's old value, from client.vk_rotation_cooldown (0 when unset).
+function rotationCooldownMs(c: Config): number {
+  const s = c.client?.vk_rotation_cooldown ?? ""
+  if (s === "") return 0.0
+  const ms: number = durationMs(s)
+  return ms
+}
+
+// POST /api/governance/virtual-keys/rotate ({"ids": [...]}) and POST .../{id}/rotate. The reply
+// carries the new value, as Bifrost's does; it is the only time the caller sees it in full.
+function rotateVkRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+  if (m !== "POST") return notAllowed(m)
+  const cooldown = rotationCooldownMs(store.cfg)
+  if (segs.length === 5) {
+    const id = segs[3] ?? ""
+    if (!recordInScope(store.cfg, "virtual-keys", id, scope)) return reply(404, errorBody(`no virtual-keys ${id}`))
+    const r = store.rotateVirtualKey(id, cooldown)
+    if (r.kind === "error") return errReply(r)
+    const stored = findById(gov(store.cfg).virtual_keys, id)
+    if (stored === undefined) return serverError()
+    return reply(200, JSON.stringify({ message: "Virtual key rotated successfully", virtual_key: stored }))
+  }
+  if (segs.length !== 4) return notFound(path)
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return badBody()
+  }
+  const raw = find(fs, "ids") ?? ""
+  const ids: string[] = []
+  try {
+    for (const el of elements(raw)) {
+      const id = decodeString(el).trim()
+      if (id === "") return reply(400, errorBody("Virtual key ID cannot be empty"))
+      if (!ids.includes(id)) ids.push(id)
+    }
+  } catch (e) {
+    return reply(400, errorBody("ids must be a list of virtual key IDs"))
+  }
+  if (ids.length === 0) return reply(400, errorBody("At least one virtual key ID is required"))
+  const done: VirtualKeyConfig[] = []
+  const failures: Map<string, string> = new Map()
+  for (const id of ids) {
+    if (!recordInScope(store.cfg, "virtual-keys", id, scope)) {
+      failures.set(id, "virtual key not found")
+      continue
+    }
+    const r = store.rotateVirtualKey(id, cooldown)
+    if (r.kind === "error") {
+      failures.set(id, r.message)
+      continue
+    }
+    const stored = findById(gov(store.cfg).virtual_keys, id)
+    if (stored !== undefined) done.push(stored)
+  }
+  if (done.length === 0) return reply(500, JSON.stringify({ message: "Failed to rotate virtual keys", virtual_keys: done, errors: failures }))
+  const out: { message: string, virtual_keys: VirtualKeyConfig[], errors?: Map<string, string> } = { message: "Virtual keys rotated successfully", virtual_keys: done }
+  if (failures.size > 0) out.errors = failures
+  return reply(200, JSON.stringify(out))
+}
+
 function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
   const coll = segs[2] ?? ""
+  if (coll === "virtual-keys" && (segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate")) {
+    return rotateVkRoute(store, m, segs, body, path, scope)
+  }
   if (coll === "model-configs") return modelConfigRoute(store, m, segs, body, path)
   if (coll === "providers") return providerGovRoute(store, m, segs, body, path)
   if (coll === "pricing-overrides") return pricingRoute(store, m, segs, body, path)
   if (coll === "projects") return projectRoute(store, m, segs, body, path, sp, scope)
   if (coll === "business-units") return businessUnitRoute(store, m, segs, body, path, sp, scope)
+  if (coll === "teams" && segs.length === 5 && segs[4] === "members") return teamMembers(store, m, segs[3] ?? "", scope)
   if (!COLLECTIONS.includes(coll) || segs.length > 4) return notFound(path)
   // a scoped user reaches the teams, customers and keys in its scope; budgets and rate limits are all-data
   if (!scope.all && !SCOPED_COLLECTIONS.includes(coll)) return reply(403, errorBody(`the data access scope of this role does not cover ${coll}`))
@@ -2260,9 +2389,54 @@ function roleFrom(name: string, b: RoleBody): RoleConfig {
   return { name: name, description: b.description, dac: b.dac, permissions: b.permissions }
 }
 
+// Saves a provider under name from a provider body (PUT upserts, POST creates) and reads it back masked.
+function saveProvider(store: ConfigStore, name: string, body: string): ApiReply {
+  const p = parseProvider(body)
+  if (p === undefined) return badBody()
+  const r = store.upsertProvider(name, p)
+  if (r.kind === "error") return errReply(r)
+  const saved = providerOf(store.cfg, name)
+  if (saved === undefined) return serverError()
+  return reply(200, JSON.stringify(redactProvider(saved)))
+}
+
+// POST /api/providers: adds the provider named by the body's provider field (Bifrost's shape); 409 when it exists.
+function createProvider(store: ConfigStore, body: string): ApiReply {
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return badBody()
+  }
+  const name = rawStr(fs, "provider") ?? ""
+  if (name === "") return reply(400, errorBody("provider is required"))
+  if (!validProviderName(name)) return reply(400, errorBody(`invalid provider name ${name}`))
+  if (providerOf(store.cfg, name) !== undefined) return reply(409, errorBody(`provider ${name} already exists`))
+  return saveProvider(store, name, body)
+}
+
+// GET /api/providers/{p}/keys: the keys with secrets masked, in Bifrost's {keys, total} shape.
+function listProviderKeys(store: ConfigStore, name: string): ApiReply {
+  const p = providerOf(store.cfg, name)
+  if (p === undefined) return reply(404, errorBody(`no provider ${name}`))
+  const ks: KeyConfig[] = []
+  for (const k of p.keys ?? []) ks.push(redactKey(k))
+  return reply(200, JSON.stringify({ keys: ks, total: ks.length }))
+}
+
+// GET /api/providers/{p}/keys/{id}: one key, masked.
+function getProviderKey(store: ConfigStore, name: string, keyId: string): ApiReply {
+  const p = providerOf(store.cfg, name)
+  if (p === undefined) return reply(404, errorBody(`no provider ${name}`))
+  const k = findKey(p.keys ?? [], keyId)
+  if (k === undefined) return reply(404, errorBody(`no key ${keyId} on provider ${name}`))
+  return reply(200, JSON.stringify(redactKey(k)))
+}
+
 function providerRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string): ApiReply {
   if (segs.length === 2) {
     if (m === "GET") return reply(200, providerList(store.cfg))
+    if (m === "POST") return createProvider(store, body)
     return notAllowed(m)
   }
   const name = segs[2] ?? ""
@@ -2272,15 +2446,7 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
       if (p === undefined) return reply(404, errorBody(`no provider ${name}`))
       return reply(200, JSON.stringify(redactProvider(p)))
     }
-    if (m === "PUT") {
-      const p = parseProvider(body)
-      if (p === undefined) return badBody()
-      const r = store.upsertProvider(name, p)
-      if (r.kind === "error") return errReply(r)
-      const saved = providerOf(store.cfg, name)
-      if (saved === undefined) return serverError()
-      return reply(200, JSON.stringify(redactProvider(saved)))
-    }
+    if (m === "PUT") return saveProvider(store, name, body)
     if (m === "DELETE") {
       const r = store.deleteProvider(name)
       if (r.kind === "error") return errReply(r)
@@ -2290,6 +2456,7 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
   }
   if (segs[3] !== "keys" || segs.length > 5) return notFound(path)
   if (segs.length === 4) {
+    if (m === "GET") return listProviderKeys(store, name)
     if (m !== "POST") return notAllowed(m)
     const k = parseKey(body)
     if (k === undefined) return badBody()
@@ -2302,6 +2469,7 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
     return reply(201, JSON.stringify(redactKey(saved)))
   }
   const keyId = segs[4] ?? ""
+  if (m === "GET") return getProviderKey(store, name, keyId)
   if (m === "PUT") {
     const k = parseKey(body)
     if (k === undefined) return badBody()
@@ -2347,6 +2515,8 @@ function clientProblem(text: string): string {
       if (!digitsOnly(raw)) return `${f.key} must be a whole number`
     } else if (CLIENT_LIST.includes(f.key)) {
       if (!raw.startsWith("[")) return `${f.key} must be a list`
+    } else if (f.key === "vk_rotation_cooldown") {
+      if (!raw.startsWith("\"")) return "vk_rotation_cooldown must be a duration string such as 1h"
     } else return `unknown client setting ${f.key}`
   }
   return ""
@@ -2382,6 +2552,46 @@ function putConfig(store: ConfigStore, body: string): ApiReply {
   const r = store.setClient(c)
   if (r.kind === "error") return errReply(r)
   return reply(200, JSON.stringify({ status: "success", message: "config updated successfully", client: store.cfg.client ?? {} }))
+}
+
+// POST /api/config/metadata: merges the body's keys into the metadata map; null removes a key.
+// Values are strings, numbers or booleans (Bifrost takes any JSON value; objects and lists are refused).
+function postMetadata(store: ConfigStore, body: string): ApiReply {
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return reply(400, errorBody("Invalid request payload"))
+  }
+  if (fs.length === 0) return reply(400, errorBody("patch body must contain at least one key"))
+  const m: Map<string, string | f64 | bool> = new Map()
+  const cur = store.cfg.metadata
+  if (cur !== undefined) {
+    for (const k of cur.keys()) m.set(k, cur.get(k)!)
+  }
+  for (const f of fs) {
+    const raw = f.raw
+    if (raw === "null") {
+      m.delete(f.key)
+    } else if (raw.startsWith("\"")) {
+      let s = ""
+      try {
+        s = decodeString(raw)
+      } catch (e) {
+        return reply(400, errorBody(`metadata ${f.key} is not a valid string`))
+      }
+      m.set(f.key, s)
+    } else if (raw === "true" || raw === "false") {
+      m.set(f.key, raw === "true")
+    } else {
+      const n = parseFloat(raw)
+      if (n === undefined) return reply(400, errorBody(`metadata ${f.key} must be a string, number, boolean or null`))
+      m.set(f.key, n)
+    }
+  }
+  const r = store.setMetadata(m)
+  if (r.kind === "error") return errReply(r)
+  return reply(200, JSON.stringify({ success: true }))
 }
 
 // GET /api/keys: every provider key in one list, secrets masked (Bifrost's shape).
@@ -2428,6 +2638,7 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   if (segs.length === 0 || segs[0] !== "api") return notFound(p)
   const area = segs[1] ?? ""
   if (area === "config") {
+    if (segs.length === 3 && segs[2] === "metadata") return m === "POST" ? postMetadata(store, body) : notAllowed(m)
     if (segs.length !== 2) return notFound(p)
     if (m === "PUT") return putConfig(store, body)
     return m === "GET" ? reply(200, store.redacted()) : notAllowed(m)
@@ -2803,7 +3014,7 @@ test("handleApi routes, methods and status codes", () => {
   expect(put.status).toBe(200)
   expect(put.body.includes("sk-abcdefghijkl")).toBe(false)
   expect(handleApi(s, "GET", "/api/providers", "").body.includes("sk-a…ijkl")).toBe(true)
-  expect(handleApi(s, "GET", "/api/providers/openai/keys", "").status).toBe(405)
+  expect(handleApi(s, "GET", "/api/providers/openai/keys", "").status).toBe(200)
   expect(handleApi(s, "POST", "/api/providers/openai/keys", "{\"value\":\"sk-zzzzzzzzzzzz\"}").status).toBe(201)
   expect(handleApi(s, "PUT", "/api/providers/openai/keys/nope", "{}").status).toBe(404)
   expect(handleApi(s, "POST", "/api/providers/nope/keys", "{\"value\":\"x\"}").status).toBe(404)
@@ -3180,5 +3391,99 @@ test("data access scope: projects and business units are listed by their own mem
   expect(projects.includes(`"id":"p1"`)).toBe(true)
   expect(projects.includes(`"id":"p2"`)).toBe(false)
   expect(handleApi(s, "GET", "/api/governance/business-units", "", scope).body.includes(`"total_count":0`)).toBe(true)
+  cleanup(path)
+})
+
+test("providers: POST creates by the body's name (409 when taken), keys list and get", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const made = handleApi(s, "POST", "/api/providers", `{"provider":"groq","keys":[{"id":"k1","value":"gsk-example0123456789"}]}`)
+  expect(made.status).toBe(200)
+  expect(made.body.includes("example0123456789")).toBe(false)
+  expect(handleApi(s, "POST", "/api/providers", `{"provider":"groq"}`).status).toBe(409)
+  expect(handleApi(s, "POST", "/api/providers", `{"keys":[]}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/providers", `{"provider":"Bad Name"}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/providers", `[1]`).status).toBe(400)
+  const list = handleApi(s, "GET", "/api/providers/groq/keys", "")
+  expect(list.status).toBe(200)
+  expect(list.body.includes(`"total":1`)).toBe(true)
+  expect(list.body.includes("example0123456789")).toBe(false)
+  expect(handleApi(s, "GET", "/api/providers/groq/keys/k1", "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/providers/groq/keys/nope", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/providers/nope/keys", "").status).toBe(404)
+  expect(handleApi(s, "DELETE", "/api/providers", "").status).toBe(405)
+  cleanup(path)
+})
+
+test("config metadata: merge, typed values, null removes, bad values refused", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(handleApi(s, "POST", "/api/config/metadata", `{"onboarding_dismissed":true,"tip":"x","n":3}`).status).toBe(200)
+  expect(handleApi(s, "POST", "/api/config/metadata", `{"tip":null}`).status).toBe(200)
+  const red = handleApi(s, "GET", "/api/config", "").body
+  expect(s.cfg.metadata!.get("onboarding_dismissed")).toBe(true)
+  expect(red.includes(`"onboarding_dismissed"`)).toBe(true)
+  expect(red.includes(`"tip"`)).toBe(false)
+  expect(red.includes(`"n"`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/config/metadata", `{"o":{"a":1}}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/config/metadata", `{}`).status).toBe(400)
+  expect(handleApi(s, "GET", "/api/config/metadata", "").status).toBe(405)
+  cleanup(path)
+})
+
+test("virtual key rotation: new value, grace for the old one, bulk and 404s", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "dev", value: "sk-bf-" + "1".repeat(32) }))).toBe(200)
+  const old = findById(gov(s.cfg).virtual_keys, "vk1")!.value
+  expect(statusOf(s.rotateVirtualKey("vk1", 0))).toBe(200)
+  const cur = findById(gov(s.cfg).virtual_keys, "vk1")!
+  expect(cur.value === old).toBe(false)
+  expect(cur.previous_value === undefined).toBe(true)
+  expect(cur.rotated_at !== undefined).toBe(true)
+  expect(statusOf(s.rotateVirtualKey("vk1", 3600000))).toBe(200)
+  const again = findById(gov(s.cfg).virtual_keys, "vk1")!
+  expect(again.previous_value === cur.value).toBe(true)
+  expect(rfc3339Ms(again.previous_value_expires_at ?? "") !== undefined).toBe(true)
+  expect(statusOf(s.rotateVirtualKey("nope", 0))).toBe(404)
+  // a plain write with a new value drops the grace period; the same value keeps it
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "dev", value: "" }))).toBe(200)
+  expect(findById(gov(s.cfg).virtual_keys, "vk1")!.previous_value === again.previous_value).toBe(true)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "dev", value: "sk-bf-" + "2".repeat(32) }))).toBe(200)
+  expect(findById(gov(s.cfg).virtual_keys, "vk1")!.previous_value === undefined).toBe(true)
+  // expires_at is an RFC 3339 time, kept on writes
+  expect(statusOf(s.upsertVirtualKey({ id: "vk2", name: "x", value: "sk-bf-" + "3".repeat(32), expires_at: "tomorrow" }))).toBe(400)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk2", name: "x", value: "sk-bf-" + "3".repeat(32), expires_at: "2030-01-01T00:00:00Z" }))).toBe(200)
+  expect(findById(gov(s.cfg).virtual_keys, "vk2")!.expires_at).toBe("2030-01-01T00:00:00Z")
+  // the HTTP route: bulk ids and the single form, with the new value in the reply
+  const bulk = handleApi(s, "POST", "/api/governance/virtual-keys/rotate", `{"ids":["vk1","vk2"]}`)
+  expect(bulk.status).toBe(200)
+  expect(bulk.body.includes("Virtual keys rotated successfully")).toBe(true)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys/rotate", `{"ids":[]}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys/rotate", `{"ids":[""]}`).status).toBe(400)
+  const one = handleApi(s, "POST", "/api/governance/virtual-keys/vk2/rotate", "")
+  expect(one.status).toBe(200)
+  expect(one.body.includes("Virtual key rotated successfully")).toBe(true)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys/nope/rotate", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/governance/virtual-keys/vk1/rotate", "").status).toBe(405)
+  cleanup(path)
+})
+
+test("team members: the users whose teams name the team", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertTeam({ id: "t1", name: "core" }))).toBe(200)
+  const cfg = s.cfg
+  let g = gov(cfg)
+  g.users = [{ name: "ana", role: "editor", teams: ["t1"] }, { name: "bo", role: "viewer", teams: [] }]
+  let n: Config = s.cfg
+  n.governance = g
+  s.cfg = n
+  const body = handleApi(s, "GET", "/api/governance/teams/t1/members", "")
+  expect(body.status).toBe(200)
+  expect(body.body.includes(`"user_id":"ana"`)).toBe(true)
+  expect(body.body.includes("bo")).toBe(false)
+  expect(handleApi(s, "GET", "/api/governance/teams/nope/members", "").status).toBe(404)
+  expect(handleApi(s, "POST", "/api/governance/teams/t1/members", "{}").status).toBe(405)
   cleanup(path)
 })

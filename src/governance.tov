@@ -4,6 +4,7 @@ import { Config, VirtualKeyConfig, BudgetConfig, RateLimitConfig, AccessProfile,
 import { Effective, applyProfiles, modelAllowed } from "./profiles"
 import { Hdrs, hdrs } from "./schemas"
 import { BudgetUsage, RateUse, ScopeUsage } from "./alerts"
+import { rfc3339Ms } from "./vkexpiry"
 
 // "30s", "5m", "1h", "1d", "1w", "1M" (30 days), "1Q", "1Y" in milliseconds.
 export function durationMs(s: string): int {
@@ -121,6 +122,10 @@ export class Governance {
   directKeys = false
   // the effective policy of each key that uses access profiles, by key id
   policies: Map<string, Effective> = new Map()
+  // when each key expires (epoch ms), by key id
+  expiry: Map<string, number> = new Map()
+  // a rotated key's retired value, by value: it keeps working until its grace period ends
+  prevVks: Map<string, { vk: VirtualKeyConfig, until: number }> = new Map()
   // governance.model_configs and governance.providers, applied to every request by modelLimits()
   modelConfigs: ModelConfigGovernance[] = []
   providerGovs: ProviderGovernance[] = []
@@ -148,6 +153,7 @@ export class Governance {
     const profiles: Map<string, AccessProfile> = new Map()
     for (const p of g.access_profiles ?? []) profiles.set(p.id, p)
     for (const vk of g.virtual_keys ?? []) {
+      this.trackGrace(vk)
       const ids = vk.access_profile_ids ?? []
       if (ids.length === 0) {
         this.vks.set(vk.value, vk)
@@ -206,7 +212,27 @@ export class Governance {
       const vk = this.vks.get(c.trim())
       if (vk !== undefined) return vk
     }
+    // a rotated key's old value works until its grace period ends
+    const now = Date.now()
+    for (const c of candidates) {
+      const p = this.prevVks.get(c.trim())
+      if (p !== undefined && p.until > now) return this.vks.get(p.vk.value) ?? p.vk
+    }
     return undefined
+  }
+
+  // Records a key's expiry and its retired value's grace period, as read from the config.
+  trackGrace(vk: VirtualKeyConfig): void {
+    const exp = rfc3339Ms(vk.expires_at ?? "")
+    if (exp !== undefined) this.expiry.set(vk.id, exp)
+    const pv = vk.previous_value ?? ""
+    const until = rfc3339Ms(vk.previous_value_expires_at ?? "")
+    if (pv !== "" && until !== undefined) this.prevVks.set(pv, { vk: vk, until: until })
+  }
+
+  expired(vk: VirtualKeyConfig): bool {
+    const at = this.expiry.get(vk.id)
+    return at !== undefined && at <= Date.now()
   }
 
   // Checks the key, the provider and model it may use, the project it names, and every limit above
@@ -223,6 +249,8 @@ export class Governance {
       if (this.enforce && !direct && !(alt !== undefined && alt(h))) return { kind: "denial", status: 401, type: "authentication_error", message: "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)" }
     } else if (vk.is_active === false) {
       return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} is inactive` }
+    } else if (this.expired(vk)) {
+      return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} has expired` }
     }
     const pol = vk === undefined ? undefined : this.policies.get(vk.id)
     if (vk !== undefined && pol !== undefined) {
@@ -691,6 +719,28 @@ function govConfig(): Config {
     },
   }
 }
+
+test("virtual keys: a rotated value works during its grace period, an expired key is refused", () => {
+  const future = "2999-01-01T00:00:00Z"
+  const cfg: Config = {
+    client: { enforce_governance_header: true },
+    governance: {
+      virtual_keys: [
+        { id: "vkA", value: "sk-bf-new", previous_value: "sk-bf-old", previous_value_expires_at: future },
+        { id: "vkB", value: "sk-bf-b-new", previous_value: "sk-bf-b-old", previous_value_expires_at: "2000-01-01T00:00:00Z" },
+        { id: "vkC", value: "sk-bf-c", expires_at: "2000-01-01T00:00:00Z" },
+        { id: "vkD", value: "sk-bf-d", expires_at: future },
+      ],
+    },
+  }
+  const g = new Governance(cfg)
+  expect(g.findKey(hdrs([["authorization", "Bearer sk-bf-old"]]))?.id).toBe("vkA")
+  expect(g.findKey(hdrs([["x-bf-vk", "sk-bf-new"]]))?.id).toBe("vkA")
+  expect(g.findKey(hdrs([["x-bf-vk", "sk-bf-b-old"]]))).toBe(undefined)
+  expect(isDenial(g.admit(hdrs([["x-bf-vk", "sk-bf-c"]]), "openai", "gpt-4o"))).toBe(true)
+  expect(isDenial(g.admit(hdrs([["x-bf-vk", "sk-bf-d"]]), "openai", "gpt-4o"))).toBe(false)
+  expect(isDenial(g.admit(hdrs([["x-bf-vk", "sk-bf-old"]]), "openai", "gpt-4o"))).toBe(false)
+})
 
 test("durations", () => {
   expect(durationMs("30s")).toBe(30000)

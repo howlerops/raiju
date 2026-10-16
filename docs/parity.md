@@ -161,22 +161,23 @@ Bifrost: `transports/bifrost-http/handlers/*.go`, documented in `docs/openapi/op
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
 | GET /api/config | handlers/config.go | done | `store.tov` `handleApi` → `ConfigStore.redacted`. Secrets are masked in every section. |
-| PUT /api/config (client section), POST /api/config/metadata | handlers/config.go | partial | `store.tov` `putConfig` takes the `client` section only (and refuses unknown settings). POST /api/config/metadata is missing. |
+| PUT /api/config (client section), POST /api/config/metadata | handlers/config.go | partial | `store.tov` `putConfig` takes the `client` section only (and refuses unknown settings); POST /api/config/metadata is `store.tov` `postMetadata` (L97b), stored as the top-level `metadata` map (strings, numbers, bools; null removes; objects and lists refused). Open: PUT /api/config for the other sections Bifrost's config.go accepts. |
 | GET /api/version | handlers/config.go | done | `store.tov` `handleApi`. |
 | GET and PUT /api/proxy-config | handlers/config.go | done | `store.tov` `handleApi` → `proxyRoute`; the gate for widening the global proxy is in `server.tov` `manage`. |
 | POST /api/pricing/force-sync | handlers/config.go | done | `server.tov` `manage` → `ops.forcePricing`. |
 | GET /api/providers (list), GET/PUT/DELETE /api/providers/{p} | handlers/providers.go | done | `store.tov` `providerRoute`. PUT upserts. |
 | POST/PUT/DELETE /api/providers/{p}/keys[/{id}] | handlers/providers.go | done | `store.tov` `providerRoute`. |
-| POST /api/providers (create) | handlers/providers.go | partial | Create by POST answers 405 (`store.tov` `providerRoute`). Upsert is through PUT /api/providers/{p}. |
-| GET /api/providers/{p}/keys (list) and GET /api/providers/{p}/keys/{id} | handlers/providers.go | missing | P2. `store.tov` `providerRoute` answers 405 to GET on the keys path. Keys are visible through GET /api/keys. |
+| POST /api/providers (create) | handlers/providers.go | done | `store.tov` `createProvider` (L97b): the body's provider field names it, 409 when it exists; then `saveProvider`, as PUT. |
+| GET /api/providers/{p}/keys (list) and GET /api/providers/{p}/keys/{id} | handlers/providers.go | done | `store.tov` `listProviderKeys` and `getProviderKey` (L97b): {keys, total} and one key, values masked. |
 | POST /api/providers/{p}/refresh-models, POST /api/providers/{p}/keys/{id}/refresh-models | handlers/providers.go | done | `server.tov` `manage` → `refreshModels`. |
 | GET /api/keys | handlers/providers.go | done | `store.tov` `handleApi` → `keyList` (masked). |
 | GET /api/models (list), /api/models/{provider}, /details, /base, /parameters; PUT /api/models/catalog | handlers/providers.go | done | `store.tov` `modelList` (list); `ops.tov` `catalogView` (details, base), `modelParameters` (parameters), `catalogUpsert` (PUT catalog). |
 | /api/governance/virtual-keys CRUD | handlers/governance.go | done | `store.tov` `governanceRoute` (COLLECTIONS). |
-| VK rotate (collection and per key), GET /virtual-keys/quota, budget override PUT/DELETE | handlers/governance.go | missing | P2. None of these routes exists in `store.tov` `governanceRoute`. |
+| VK rotate (collection and per key) | handlers/governance.go, virtualkeyrotation.go | partial | `store.tov` `rotateVkRoute` and `rotateVirtualKey` (L97b): new value in the reply, old value kept for client.vk_rotation_cooldown (`governance.tov` `prevVks`). Open: revoking the key's MCP OAuth grants on rotate. |
+| GET /virtual-keys/quota, budget override PUT/DELETE | handlers/governance.go | missing | P2. Not routed (L97b did not reach them). |
 | GET /api/governance/virtual-keys/{vk}/users (VK users) | handlers/governance.go | missing | P2. |
 | /api/governance/budgets, rate-limits, customers, teams CRUD | handlers/governance.go | done | `store.tov` `governanceRoute` (COLLECTIONS, scoped by data access). Raiju exposes CRUD; the Bifrost documented routes for budgets and rate limits are read-only. |
-| GET /api/governance/teams/{team}/members | handlers/governance.go | missing | P2. Team membership is not routed. |
+| GET /api/governance/teams/{team}/members | handlers/governance.go | done | `store.tov` `teamMembers` (L97b): users whose `teams` name the team, as {members}; users have no email or id of their own, so the name stands for both. |
 | /api/governance/model-configs CRUD | handlers/governance.go | done | `store.tov` `modelConfigRoute`. |
 | /api/governance/providers (provider-level budgets and limits) | handlers/governance.go | done | `store.tov` `providerGovRoute`. |
 | /api/governance/pricing-overrides CRUD | handlers/governance.go | done | `store.tov` `pricingRoute`. |
@@ -616,8 +617,8 @@ Bifrost: `docs/features/governance/*.mdx`, `docs/enterprise/*.mdx`, and `handler
 | Feature | Bifrost | Raiju status | Notes |
 |---|---|---|---|
 | Virtual keys (create, list, update, delete) | features/governance/virtual-keys.mdx | done | `store.tov` (`handleApi`, virtual-keys routes), `governance.tov`. |
-| VK key rotation and cooldown | handlers/governance.go (rotate), virtualkeyrotation.go, vk_rotation_cooldown | missing | No rotate routes (`POST /api/governance/virtual-keys/rotate`, `.../{vk_id}/rotate`) and no cooldown. `client.vk_rotation_cooldown` is reported as ignored (`config_compat.tov`). P2. |
-| VK expiry and expired-key cleanup | virtualkeyexpiry.go; client.delete_expired_virtual_keys | missing | No expiry field on virtual keys (`governance.tov`, `store.tov`). `client.delete_expired_virtual_keys` is reported as ignored (`config_compat.tov`). |
+| VK key rotation and cooldown | handlers/governance.go (rotate), virtualkeyrotation.go, vk_rotation_cooldown | partial | Rotate routes and `client.vk_rotation_cooldown` (duration string) done (L97b, see a3). Open: MCP OAuth grant revocation on rotate. |
+| VK expiry and expired-key cleanup | virtualkeyexpiry.go; client.delete_expired_virtual_keys | partial | `expires_at` (RFC 3339) on virtual keys, refused with 403 from then on (`governance.tov` `expired`, L97b). Open: the cleanup tick that deletes expired keys (client.delete_expired_virtual_keys is still reported as ignored). |
 | VK budgets and rate limits per provider config | budget-and-limits.mdx "Provider-Level Governance" | done | `governance.tov` (provider configs). |
 | VK allowed providers and models | routing.mdx "Provider/Model Restrictions" | done | `governance.tov` (provider and model checks). |
 | Budgets (USD, reset durations) | budget-and-limits.mdx | done | `governance.tov` (budgets, `durationMs`), `store.tov` (budgets routes). |
@@ -649,7 +650,7 @@ Bifrost: `docs/features/governance/*.mdx`, `docs/enterprise/*.mdx`, and `handler
 | Prompt deployments | enterprise/prompt-deployments.mdx | done | `prompts.tov`: prompt repository and deployments (L88). |
 | Alerts on budget and rate-limit usage | enterprise/alerting/alert-rules.mdx (budget_usage_percent, rate_limit_*_usage_percent, cel_expression) | done | `alertapi.tov` and `alerts.tov`: CEL rules over budget and rate-limit usage (commit 8e98ea5). |
 | Governance per request: x-bf-customer-id | budget-and-limits.mdx | done | `governance.tov` (attribution from x-bf-customer-id, L84). |
-| Virtual key quota view (GET /api/governance/virtual-keys/quota) | handlers/governance.go | missing | No quota route. P2. |
+| Virtual key quota view (GET /api/governance/virtual-keys/quota) | handlers/governance.go | missing | No quota route. P2 (open after L97b). |
 
 ## (g) MCP
 

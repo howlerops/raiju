@@ -1273,6 +1273,79 @@ def projects_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L97B = "http://127.0.0.1:18140"  # provider create and key reads, config metadata, virtual key rotation and expiry, team members
+
+
+def l97b_e2e(env):
+    """POST /api/providers and the key reads; POST /api/config/metadata; virtual key rotation with the old value kept
+    for client.vk_rotation_cooldown; an expired key refused; the team members list. Its own gateway."""
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "vk_rotation_cooldown": "1h"},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l97b", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l97b-root")},
+                      {"name": "ann", "role": "viewer", "teams": ["t-core"], "token_sha256": tok("sk-admin-l97b-ann")}],
+            "teams": [{"id": "t-core", "name": "core"}],
+            "virtual_keys": [{"id": "vk-rot", "value": "sk-bf-rot-old-0123456789abcdef"}, {"id": "vk-exp", "value": "sk-bf-exp-0123456789abcdef", "expires_at": "2001-01-01T00:00:00Z"}],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.l97b.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18140", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.l97b.log"), "w"))
+    root = {"authorization": "Bearer sk-admin-l97b-root"}
+    def adm(method, p, body=None):
+        return call(method, p, body, root, base=GW_L97B, auth=False)
+    def inf(key, seed):
+        return call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}], "seed": seed}, {"x-bf-vk": key}, base=GW_L97B, auth=False)
+    try:
+        wait(GW_L97B + "/health")
+        s, _, b = adm("POST", "/api/providers", {"provider": "groq", "keys": [{"id": "gk1", "name": "gk1", "value": "gsk-example-l97b-0001", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}})
+        check("POST /api/providers creates a provider", s == 200 and "gsk-example-l97b-0001" not in b, (s, b[:300]))
+        s, _, b = adm("POST", "/api/providers", {"provider": "groq"})
+        check("creating a provider that exists is a 409", s == 409, (s, b[:200]))
+        s, _, b = adm("GET", "/api/providers/groq/keys")
+        check("the key list is Bifrost's {keys, total} with values masked", s == 200 and json.loads(b)["total"] == 1 and "gsk-example-l97b-0001" not in b, (s, b[:300]))
+        s, _, b = adm("GET", "/api/providers/groq/keys/gk1")
+        check("one key is read by id, masked", s == 200 and json.loads(b)["id"] == "gk1" and "gsk-example-l97b-0001" not in b, (s, b[:200]))
+        s, _, b = adm("GET", "/api/providers/groq/keys/nope")
+        check("an unknown key id is a 404", s == 404, (s, b[:200]))
+        s, _, b = inf("sk-bf-exp-0123456789abcdef", 4100)
+        check("an expired virtual key is refused", s == 403 and "expired" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/config/metadata", {"onboarding_dismissed": True, "tip": "x"}, root, base=GW_L97B, auth=False)
+        check("config metadata merges and answers success", s == 200 and json.loads(b) == {"success": True}, (s, b[:200]))
+        s, _, b = adm("GET", "/api/config")
+        check("config metadata is read back in GET /api/config", s == 200 and "onboarding_dismissed" in b and '"tip"' in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/config/metadata", {"tip": None}, root, base=GW_L97B, auth=False)
+        s2, _, b2 = adm("GET", "/api/config")
+        check("a null metadata value removes its key", s == 200 and '"tip"' not in b2, (s, b2[:200]))
+        old = "sk-bf-rot-old-0123456789abcdef"
+        s, _, _ = inf(old, 4101)
+        check("the virtual key works before rotation", s == 200, s)
+        s, _, b = adm("POST", "/api/governance/virtual-keys/vk-rot/rotate")
+        new = json.loads(b).get("virtual_key", {}).get("value", "") if s == 200 else ""
+        check("rotate answers the new value once", s == 200 and new.startswith("sk-bf-") and new != old, (s, b[:200]))
+        s, _, _ = inf(old, 4102)
+        check("the old value keeps working for client.vk_rotation_cooldown", s == 200, s)
+        s, _, _ = inf(new, 4103)
+        check("the new value works", s == 200, s)
+        s, _, b = adm("GET", "/api/governance/virtual-keys")
+        check("the rotated value is masked on read", new not in b and old not in b, b[:200])
+        s, _, b = adm("POST", "/api/governance/virtual-keys/rotate", {"ids": ["vk-rot", "nope"]})
+        jb = json.loads(b) if s == 200 else {}
+        check("bulk rotate rotates what it can and names the rest", s == 200 and len(jb.get("virtual_keys", [])) == 1 and "nope" in jb.get("errors", {}), (s, b[:300]))
+        s, _, b = adm("GET", "/api/governance/teams/t-core/members")
+        mem = json.loads(b) if s == 200 else {"members": []}
+        check("team members lists the users whose teams name it", s == 200 and [m["user_id"] for m in mem["members"]] == ["ann"], (s, b[:200]))
+        s, _, b = adm("GET", "/api/governance/teams/nope/members")
+        check("team members of an unknown team is a 404", s == 404, (s, b[:200]))
+    finally:
+        gw.terminate()
+
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -3406,6 +3479,8 @@ def main():
         l88_e2e(env)
         # request headers on log rows and SDK-route jobs, extra_fields placement: their own gateway
         headers_e2e(env)
+        # provider create and key reads, config metadata, virtual key rotation and expiry, team members: their own gateway
+        l97b_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
