@@ -5,12 +5,29 @@
 // whatever order payloads arrive in and however often they repeat.
 // HTTP transport and the sync timer live in the server; this file is pure state.
 import { hmacSha256, toHex, utf8 } from "./crypto"
-import { DiscoveryConfig } from "./discovery"
+import { DiscoveryConfig, baseUrl } from "./discovery"
 
-export type ClusterConfig = { enabled: bool, node_id?: string, peers: string[], secret: string, interval_ms?: int, discovery?: DiscoveryConfig }
+// Bifrost's cluster_config.broker (type "broker"): where the nodes reach the broker, and the port it serves on.
+export type BrokerConfig = { address: string, tls?: bool, listen_port?: int }
+
+// Raiju only: the etcd lock behind leader election (leader.tov). Without it, leadership is by rank.
+export type LeaderLockConfig = { etcd_endpoints: string[], key?: string, ttl_seconds?: int }
+
+export type ClusterConfig = { enabled: bool, node_id?: string, peers: string[], secret: string, interval_ms?: int, discovery?: DiscoveryConfig, type?: string, broker?: BrokerConfig, leader_lock?: LeaderLockConfig }
 
 export function syncInterval(cfg: ClusterConfig): int {
   return cfg.interval_ms ?? 1000
+}
+
+// Broker mode is type "broker"; anything else is the default mesh.
+export function isBroker(cfg: ClusterConfig): bool {
+  return cfg.type === "broker"
+}
+
+// The broker's base URL. An address with a scheme keeps it; otherwise tls picks https.
+export function brokerUrl(b: BrokerConfig): string {
+  const a = b.address.includes("://") ? b.address : (b.tls === true ? "https://" : "http://") + b.address
+  return baseUrl(a)
 }
 
 // A node counts as alive while its payloads arrive within this window (Bifrost re-evaluates membership every 30 s).
@@ -33,7 +50,8 @@ export function electLeader(ids: string[]): string {
 }
 
 type WireCounter = { name: string, window: string, slots: Record<string, f64> }
-type Wire = { node: string, ts: f64, counters: WireCounter[] }
+// roster: only in a broker's answer, the ids of the nodes it has heard from.
+type Wire = { node: string, ts: f64, counters: WireCounter[], roster?: string[] }
 
 // Slot values must be finite; NaN and infinities would poison every total.
 // Far above any budget or token count, and below the f64 limit.
@@ -43,6 +61,9 @@ const MAX_SLOT: f64 = 1.0e300
 function parseWire(text: string): Wire throws SyntaxError {
   const w = try JSON.parse(text) as Wire
   if (w.node.byteLength === 0) throw new SyntaxError("cluster payload has no node id")
+  for (const id of w.roster ?? []) {
+    if (id.byteLength === 0) throw new SyntaxError("cluster payload has an empty id in its roster")
+  }
   for (const c of w.counters) {
     if (c.name.byteLength === 0) throw new SyntaxError("cluster payload has an empty counter name")
     for (const id of c.slots.keys()) {
@@ -90,6 +111,21 @@ export class Counters {
   // nowMs is the local receipt time used for peer liveness; the payload's ts is the sender's clock.
   merge(remote: string, nowMs?: f64): void throws SyntaxError {
     const w = try parseWire(remote)
+    this.apply(w)
+    if (w.node !== this.nodeId) this.seen.set(w.node, nowMs ?? Date.now())
+  }
+
+  // A broker's answer: the joined state, and the nodes it has heard from (its roster), all heard at nowMs.
+  // The broker is not a peer, so its own id is never tracked.
+  relay(remote: string, nowMs: f64): void throws SyntaxError {
+    const w = try parseWire(remote)
+    this.apply(w)
+    for (const id of w.roster ?? []) {
+      if (id !== this.nodeId) this.seen.set(id, nowMs)
+    }
+  }
+
+  private apply(w: Wire): void {
     for (const rc of w.counters) {
       const cur = this.counters.get(rc.name)
       if (cur === undefined || rc.window > cur.window) {
@@ -103,11 +139,10 @@ export class Counters {
         }
       }
     }
-    if (w.node !== this.nodeId) this.seen.set(w.node, nowMs ?? Date.now())
   }
 
-  // Full state, so a node relays what it learned from others too.
-  encode(): string {
+  // Full state, so a node relays what it learned from others too. A broker adds its roster.
+  encode(roster?: string[]): string {
     const names = this.counters.keys()
     names.sort()
     const counters: WireCounter[] = []
@@ -115,7 +150,7 @@ export class Counters {
       const c = this.counters.get(name)!
       counters.push({ name, window: c.window, slots: c.slots })
     }
-    const w: Wire = { node: this.nodeId, ts: Date.now(), counters }
+    const w: Wire = { node: this.nodeId, ts: Date.now(), counters: counters, roster: roster }
     return JSON.stringify(w)
   }
 
@@ -290,4 +325,61 @@ test("the leader is the lexicographically-first live node", () => {
   expect(nodeOf("node-a/4242")).toBe("node-a")
   expect(nodeOf("node-a")).toBe("node-a")
   expect(electLeader(["node-b", nodeOf("node-a/1"), nodeOf("node-a/2")])).toBe("node-a")
+})
+
+test("a relayed state joins the slots and counts the roster as heard, never the broker", () => {
+  // a broker's answer: the state of two nodes, its own id, and the roster
+  const b = new Counters("b")
+  const c = new Counters("c")
+  b.add("budget:monthly", "2026-10", 2)
+  c.add("budget:monthly", "2026-10", 3)
+  const hub = new Counters("broker")
+  try hub.merge(b.encode(), 1000)
+  try hub.merge(c.encode(), 1000)
+  const answer = hub.encode(["b", "c"])
+  const a = new Counters("a")
+  a.add("budget:monthly", "2026-10", 1)
+  try a.relay(answer, 5000)
+  expect(a.total("budget:monthly", "2026-10")).toBe(6)
+  expect(a.peers().map((p) => p.id)).toEqual(["b", "c"])
+  expect(a.peers().find((p) => p.id === "broker")).toBe(undefined)
+  // a node's own id in the roster is not a peer of itself
+  try a.relay(hub.encode(["a", "b"]), 6000)
+  expect(a.peers(6000).map((p) => p.id)).toEqual(["b"])
+  // an answer without a roster carries state only
+  const plain = new Counters("x")
+  plain.add("budget:monthly", "2026-10", 1)
+  try a.relay(plain.encode(), 7000)
+  expect(a.peers(7000).length).toBe(0)
+  expect(a.total("budget:monthly", "2026-10")).toBe(7)
+})
+
+test("the roster is only in answers that ask for it, and a bad roster changes nothing", () => {
+  const a = new Counters("a")
+  a.add("c", "w", 1)
+  expect(a.encode().includes("roster")).toBe(false)
+  expect(a.encode(["b"]).includes(`"roster":["b"]`)).toBe(true)
+  let threw = 0
+  for (const text of [`{"node":"broker","ts":1,"counters":[],"roster":[""]}`, `{"node":"broker","ts":1,"counters":[{"name":"c","window":"w","slots":{"b":9}}],"roster":["b",""]}`]) {
+    try {
+      a.relay(text, 1000)
+    } catch (e) {
+      if (e instanceof SyntaxError) threw += 1
+    }
+  }
+  expect(threw).toBe(2)
+  expect(a.total("c", "w")).toBe(1)
+  expect(a.peers().length).toBe(0)
+})
+
+test("broker mode and the broker URL", () => {
+  const broker: ClusterConfig = { enabled: true, peers: [], secret: "s", type: "broker" }
+  const mesh: ClusterConfig = { enabled: true, peers: [], secret: "s", type: "mesh" }
+  const plain: ClusterConfig = { enabled: true, peers: [], secret: "s" }
+  expect(isBroker(broker)).toBe(true)
+  expect(isBroker(mesh)).toBe(false)
+  expect(isBroker(plain)).toBe(false)
+  expect(brokerUrl({ address: "broker.example.run.app:443", tls: true })).toBe("https://broker.example.run.app:443")
+  expect(brokerUrl({ address: "10.0.0.5:50051" })).toBe("http://10.0.0.5:50051")
+  expect(brokerUrl({ address: "https://b.example/" })).toBe("https://b.example")
 })

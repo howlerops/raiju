@@ -1,0 +1,326 @@
+// Management API logic that needs no store: the RBAC listings, budget overrides, the expired-key
+// cleanup, routing rule checks and the complexity analyzer config. store.tov and ops.tov route to these.
+import { AccessProfile, AdminUserConfig, BudgetOverride, ClientConfig, ComplexitySettings, GovernanceConfig, PermissionPair, VirtualKeyConfig } from "./config"
+import { RoutingRule, compile } from "./cel"
+import { fields, Field, find } from "./json"
+import { rfc3339Ms } from "./vkexpiry"
+
+// ---- RBAC listings ----
+
+// A (resource, operation) pair with its id. Ids number the pairs resource-major from 1, so they
+// hold for as long as the resource and operation lists keep their order (Bifrost's permission_ids).
+export type PermissionDoc = { id: int, resource: string, operation: string }
+
+export function permissionDocs(resources: string[], operations: string[]): PermissionDoc[] {
+  const out: PermissionDoc[] = []
+  let id = 0
+  for (const r of resources) {
+    for (const op of operations) {
+      id += 1
+      out.push({ id: id, resource: r, operation: op })
+    }
+  }
+  return out
+}
+
+// The pair an id names, or undefined when no pair has it.
+export function pairOfId(resources: string[], operations: string[], id: int): PermissionPair | undefined {
+  if (id < 1) return undefined
+  const n = operations.length
+  if (n === 0) return undefined
+  const ri = Math.floor((id - 1) / n)
+  const oi = (id - 1) % n
+  const r = resources[ri]
+  const op = operations[oi]
+  if (r === undefined || op === undefined) return undefined
+  return { resource: r, operation: op }
+}
+
+// The ids of a role's pairs, in the catalog's order.
+export function permissionIds(resources: string[], operations: string[], pairs: PermissionPair[]): int[] {
+  const out: int[] = []
+  for (const d of permissionDocs(resources, operations)) {
+    if (pairs.some((p) => p.resource === d.resource && p.operation === d.operation)) out.push(d.id)
+  }
+  return out
+}
+
+// ---- budget overrides ----
+
+export type OverrideResult = { kind: "ok", override: BudgetOverride } | { kind: "error", message: string }
+
+// Reads a PUT .../override body: {"amount": n, "mode": "forever"} or {"amount": n, "mode": "cycles",
+// "cycles": k}. A cycles override adds amount to the limit for k reset windows, the current one
+// counted as the first (Bifrost's cycles); k defaults to 1.
+export function parseOverride(body: string): OverrideResult {
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return { kind: "error", message: "invalid request body" }
+  }
+  const amount = find(fs, "amount") ?? ""
+  const n = parseFloat(amount)
+  if (n === undefined || n <= 0.0) return { kind: "error", message: "amount must be a positive number" }
+  const mode = find(fs, "mode") ?? ""
+  if (mode === "\"forever\"") return { kind: "ok", override: { amount: n, mode: "forever" } }
+  if (mode !== "\"cycles\"") return { kind: "error", message: "mode must be forever or cycles" }
+  const k = parseInt(find(fs, "cycles") ?? "1") ?? 0
+  if (k < 1 || k > 1000) return { kind: "error", message: "cycles must be a whole number from 1 to 1000" }
+  return { kind: "ok", override: { amount: n, mode: "cycles", cycles: k } }
+}
+
+// The budgets a virtual key draws on: its own budget and the ones on its provider configs.
+export function keyBudgetIds(vk: VirtualKeyConfig): string[] {
+  const out: string[] = []
+  if (vk.budget_id !== undefined) out.push(vk.budget_id)
+  for (const pc of vk.provider_configs ?? []) {
+    const b = pc.budget_id
+    if (b !== undefined && !out.includes(b)) out.push(b)
+  }
+  return out
+}
+
+// ---- expired virtual keys ----
+
+// The keys the cleanup deletes now: expired ones that opted in, by delete_after_expire or, when that
+// is unset, client.delete_expired_virtual_keys.
+export function expiredToDelete(g: GovernanceConfig | undefined, c: ClientConfig | undefined, nowMs: number): string[] {
+  const out: string[] = []
+  const inherit = c?.delete_expired_virtual_keys === true
+  for (const vk of g?.virtual_keys ?? []) {
+    const at = rfc3339Ms(vk.expires_at ?? "")
+    if (at === undefined || at > nowMs) continue
+    const opted = vk.delete_after_expire ?? inherit
+    if (opted) out.push(vk.id)
+  }
+  return out
+}
+
+// ---- routing rules ----
+
+const RULE_SCOPES = ["global", "virtual_key", "team", "customer"]
+
+// "" when a routing rule is usable, else what is wrong with it. The expression must compile as CEL.
+export function ruleError(r: RoutingRule): string {
+  if (r.id === "") return "id is required"
+  if (r.cel_expression.trim() === "") return "cel_expression is required"
+  try {
+    compile(r.cel_expression)
+  } catch (e) {
+    return `cel_expression does not compile: ${e.message}`
+  }
+  if (r.targets.length === 0) return "at least one target is required"
+  for (const t of r.targets) {
+    if (t.provider === "") return "every target needs a provider"
+  }
+  const s = r.scope
+  if (s !== undefined && !RULE_SCOPES.includes(s)) return `scope must be one of ${RULE_SCOPES.join(", ")}`
+  if (s !== undefined && s !== "global" && (r.scope_id ?? "") === "") return `scope ${s} needs scope_id`
+  return ""
+}
+
+// ---- complexity analyzer config ----
+
+// "" when the body is a complexity analyzer config this module accepts, else what is wrong with it.
+export function complexityProblem(text: string): string {
+  if (!text.trim().startsWith("{")) return "the body must be a JSON object"
+  let fs: Field[] = []
+  try {
+    fs = fields(text)
+  } catch (e) {
+    return "the body must be a JSON object"
+  }
+  for (const f of fs) {
+    const raw = f.raw
+    if (f.key === "enabled") {
+      if (raw !== "true" && raw !== "false") return "enabled must be true or false"
+    } else if (f.key === "simple_max_score" || f.key === "complex_min_score") {
+      if (parseFloat(raw) === undefined) return `${f.key} must be a number`
+    } else if (f.key === "model" || f.key === "classifier") {
+      if (!raw.startsWith("\"")) return `${f.key} must be a string`
+    } else if (f.key === "tiers" || f.key === "decision" || f.key === "llm" || f.key === "semantic") {
+      if (!raw.startsWith("{")) return `${f.key} must be an object`
+    } else return `unknown complexity analyzer setting ${f.key}`
+  }
+  return ""
+}
+
+// The settings a complexity analyzer config body holds, as Raiju stores them.
+export function complexityFrom(text: string): ComplexitySettings | undefined {
+  try {
+    return JSON.parse(text) as ComplexitySettings
+  } catch (e) {
+    return undefined
+  }
+}
+
+// ---- user access profiles and virtual-key creation ----
+
+function profileNamed(profiles: AccessProfile[] | undefined, id: string): AccessProfile | undefined {
+  for (const p of profiles ?? []) {
+    if (p.id === id) return p
+  }
+  return undefined
+}
+
+// GET /api/users/me/vk-creation-policy: the active access profile the caller holds that governs the
+// keys it creates (the first one held, highest-ranked). A caller with no stored user, or no active
+// profile, gets {"has_access_profile": false}; creating a key stays allowed, ungoverned.
+export function creationPolicy(users: AdminUserConfig[] | undefined, profiles: AccessProfile[] | undefined, actor: string): string {
+  for (const u of users ?? []) {
+    if (u.name !== actor) continue
+    for (const id of u.access_profile_ids ?? []) {
+      const p = profileNamed(profiles, id)
+      if (p !== undefined && p.is_active !== false) return JSON.stringify({ has_access_profile: true, profile_name: p.name ?? p.id })
+    }
+  }
+  return JSON.stringify({ has_access_profile: false })
+}
+
+// ---- access profile propagation ----
+
+// The fields a propagate call may push from a profile onto the keys that hold it.
+export const PROPAGATED_FIELDS = ["provider_configs", "budgets", "rate_limit", "mcp_configs"]
+
+// The keys after a propagate: each key that holds the profile takes the chosen fields from it. A field
+// the profile leaves unset is not pushed. Budgets and rate limits are matched by id, so usage is kept.
+export function propagateProfileKeys(vks: VirtualKeyConfig[], p: AccessProfile, chosen: string[]): { vks: VirtualKeyConfig[], updated: int } {
+  const out: VirtualKeyConfig[] = []
+  let updated = 0
+  for (const vk of vks) {
+    if (!(vk.access_profile_ids ?? []).includes(p.id)) {
+      out.push(vk)
+      continue
+    }
+    let nv = vk
+    if (chosen.includes("provider_configs") && p.provider_configs !== undefined) nv.provider_configs = p.provider_configs
+    if (chosen.includes("budgets") && p.budget_id !== undefined) nv.budget_id = p.budget_id
+    if (chosen.includes("rate_limit") && p.rate_limit_id !== undefined) nv.rate_limit_id = p.rate_limit_id
+    if (chosen.includes("mcp_configs") && p.mcp_configs !== undefined) nv.mcp_configs = p.mcp_configs
+    out.push(nv)
+    updated += 1
+  }
+  return { vks: out, updated: updated }
+}
+
+// The access profiles a user holds, in rank order, as the users API lists them.
+export function heldProfiles(users: AdminUserConfig[] | undefined, profiles: AccessProfile[] | undefined, name: string): AccessProfile[] {
+  const out: AccessProfile[] = []
+  for (const u of users ?? []) {
+    if (u.name !== name) continue
+    for (const id of u.access_profile_ids ?? []) {
+      const p = profileNamed(profiles, id)
+      if (p !== undefined) out.push(p)
+    }
+  }
+  return out
+}
+
+// ---- tests ----
+
+test("permissionDocs numbers pairs resource-major from 1, and pairOfId reads them back", () => {
+  const rs = ["Logs", "VirtualKeys"]
+  const ops = ["View", "Create", "Update"]
+  const docs = permissionDocs(rs, ops)
+  expect(docs.length).toBe(6)
+  expect(docs[0]!.id).toBe(1)
+  expect(docs[5]!.resource).toBe("VirtualKeys")
+  expect(docs[5]!.operation).toBe("Update")
+  const p = pairOfId(rs, ops, 4)!
+  expect(p.resource).toBe("VirtualKeys")
+  expect(p.operation).toBe("View")
+  expect(pairOfId(rs, ops, 7)).toBeUndefined()
+  expect(pairOfId(rs, ops, 0)).toBeUndefined()
+  expect(permissionIds(rs, ops, [{ resource: "VirtualKeys", operation: "Create" }, { resource: "Logs", operation: "View" }]).join(",")).toBe("1,5")
+})
+
+test("parseOverride keeps forever and cycles overrides and refuses the rest", () => {
+  const ok = parseOverride(`{"amount": 25, "mode": "forever"}`)
+  expect(ok.kind).toBe("ok")
+  const cy = parseOverride(`{"amount": 40, "mode": "cycles", "cycles": 3}`)
+  expect(cy.kind === "ok" && cy.override.cycles === 3).toBe(true)
+  const cy1 = parseOverride(`{"amount": 40, "mode": "cycles"}`)
+  expect(cy1.kind === "ok" && cy1.override.cycles === 1).toBe(true)
+  expect(parseOverride(`{"amount": 40, "mode": "cycles", "cycles": 0}`).kind).toBe("error")
+  const bad1 = parseOverride(`{"amount": 0, "mode": "forever"}`)
+  expect(bad1.kind).toBe("error")
+  const bad2 = parseOverride(`{"amount": 5, "mode": "weekly"}`)
+  expect(bad2.kind).toBe("error")
+  const bad3 = parseOverride(`{"amount": 5}`)
+  expect(bad3.kind).toBe("error")
+  const bad4 = parseOverride("not json")
+  expect(bad4.kind).toBe("error")
+})
+
+test("expiredToDelete honours delete_after_expire and the client default", () => {
+  const past = "2020-01-01T00:00:00Z"
+  const future = "2099-01-01T00:00:00Z"
+  const g: GovernanceConfig = { virtual_keys: [
+    { id: "a", value: "v1", expires_at: past },
+    { id: "b", value: "v2", expires_at: past, delete_after_expire: false },
+    { id: "c", value: "v3", expires_at: past, delete_after_expire: true },
+    { id: "d", value: "v4", expires_at: future, delete_after_expire: true },
+    { id: "e", value: "v5" },
+  ] }
+  expect(expiredToDelete(g, undefined, Date.now()).join(",")).toBe("c")
+  expect(expiredToDelete(g, { delete_expired_virtual_keys: true }, Date.now()).join(",")).toBe("a,c")
+  expect(expiredToDelete(undefined, { delete_expired_virtual_keys: true }, Date.now()).length).toBe(0)
+})
+
+test("keyBudgetIds lists the key's budget and its provider budgets once each", () => {
+  const vk: VirtualKeyConfig = { id: "k", value: "v", budget_id: "b1", provider_configs: [{ provider: "openai", budget_id: "b2" }, { provider: "anthropic", budget_id: "b1" }] }
+  expect(keyBudgetIds(vk).join(",")).toBe("b1,b2")
+})
+
+test("ruleError accepts a usable rule and names what is wrong with the others", () => {
+  const good: RoutingRule = { id: "r1", cel_expression: "request > 10", targets: [{ provider: "openai" }] }
+  expect(ruleError(good)).toBe("")
+  expect(ruleError({ id: "r1", cel_expression: "request >", targets: [{ provider: "openai" }] }) !== "").toBe(true)
+  expect(ruleError({ id: "r1", cel_expression: "true", targets: [] })).toBe("at least one target is required")
+  expect(ruleError({ id: "r1", cel_expression: "true", targets: [{ provider: "openai" }], scope: "team" })).toBe("scope team needs scope_id")
+})
+
+test("complexityProblem checks types and refuses unknown settings", () => {
+  expect(complexityProblem(`{"enabled": true, "simple_max_score": 0.3, "complex_min_score": 0.7}`)).toBe("")
+  expect(complexityProblem(`{"enabled": "yes"}`)).toBe("enabled must be true or false")
+  expect(complexityProblem(`{"simple_max_score": "low"}`)).toBe("simple_max_score must be a number")
+  expect(complexityProblem(`{"tiers": 3}`)).toBe("tiers must be an object")
+  expect(complexityProblem(`{"colour": 1}`)).toBe("unknown complexity analyzer setting colour")
+  expect(complexityProblem("[]")).toBe("the body must be a JSON object")
+})
+
+test("creationPolicy names the first active profile a user holds", () => {
+  const users: AdminUserConfig[] = [{ name: "ana", role: "editor", access_profile_ids: ["p-off", "p-on", "p-two"] }, { name: "bo", role: "viewer" }]
+  const profiles: AccessProfile[] = [{ id: "p-off", name: "Off", is_active: false }, { id: "p-on", name: "Engineer" }, { id: "p-two" }]
+  expect(creationPolicy(users, profiles, "ana")).toBe(`{"has_access_profile":true,"profile_name":"Engineer"}`)
+  expect(creationPolicy(users, profiles, "bo")).toBe(`{"has_access_profile":false}`)
+  expect(creationPolicy(users, profiles, "nobody")).toBe(`{"has_access_profile":false}`)
+  expect(creationPolicy(users, [], "ana")).toBe(`{"has_access_profile":false}`)
+})
+
+test("propagateProfileKeys pushes the chosen set fields to the keys that hold the profile", () => {
+  const p: AccessProfile = { id: "p1", budget_id: "b-new", rate_limit_id: "rl-new", provider_configs: [{ provider: "openai" }] }
+  const vks: VirtualKeyConfig[] = [
+    { id: "k1", value: "v1", access_profile_ids: ["p1"], budget_id: "b-old", rate_limit_id: "rl-old" },
+    { id: "k2", value: "v2", access_profile_ids: ["p2"], budget_id: "b-old" },
+  ]
+  const r = propagateProfileKeys(vks, p, ["budgets"])
+  expect(r.updated).toBe(1)
+  expect(r.vks[0]!.budget_id).toBe("b-new")
+  expect(r.vks[0]!.rate_limit_id).toBe("rl-old")
+  expect(r.vks[1]!.budget_id).toBe("b-old")
+  const all = propagateProfileKeys(vks, p, PROPAGATED_FIELDS)
+  expect(all.vks[0]!.rate_limit_id).toBe("rl-new")
+  expect(all.vks[0]!.provider_configs!.length).toBe(1)
+  // a field the profile leaves unset does not clear the key's own
+  const bare: AccessProfile = { id: "p1" }
+  expect(propagateProfileKeys(vks, bare, PROPAGATED_FIELDS).vks[0]!.budget_id).toBe("b-old")
+})
+
+test("heldProfiles lists a user's profiles in rank order and skips unknown ids", () => {
+  const users: AdminUserConfig[] = [{ name: "ana", role: "editor", access_profile_ids: ["p-b", "gone", "p-a"] }]
+  const profiles: AccessProfile[] = [{ id: "p-a" }, { id: "p-b" }]
+  expect(heldProfiles(users, profiles, "ana").map((p) => p.id).join(",")).toBe("p-b,p-a")
+  expect(heldProfiles(users, profiles, "bo").length).toBe(0)
+})

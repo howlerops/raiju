@@ -1,14 +1,31 @@
 import { listen } from "../src/http1"
+import { fields, find, rawStr } from "../src/json"
+import { sha256, utf8 } from "../src/crypto"
+import { encodeUrl } from "../src/base64"
 // A fake provider for end-to-end tests. Speaks enough of OpenAI, Anthropic,
 // Gemini and Bedrock to exercise translation, and fails on demand:
 //   model "flaky-*"   → 503 on every other call
 //   model "down-*"    → always 500
 //   model "limited-*" → always 429 with retry-after-ms: 2500
 //   key "bad-key"     → 401
-type Seen = { path: string, auth: string, body: string, team: string }
+//   model "policy-quota" → 200 with x-quota-state: exhausted (trips a circuit policy)
+type Seen = { path: string, auth: string, body: string, team: string, tenant: string }
 
 const seen: Seen[] = []
+// webhook deliveries received: the path, the Standard Webhooks headers and the body
+type Hook = { path: string, id: string, timestamp: string, signature: string, event: string, body: string }
+const hooks: Hook[] = []
 let flakyCalls = 0
+// the OAuth authorization server: codes by their PKCE challenge and redirect URI, and the access token the MCP server accepts
+const OAUTH_CLIENT = "raiju-dcr-client"
+const OAUTH_REFRESH = "oauth-refresh-1"
+const oauthCodes: Map<string, string> = new Map()
+const oauthRedirects: Map<string, string> = new Map()
+let oauthCodeN = 0
+let oauthTokenN = 0
+let oauthAccess = ""
+// every access token the token endpoint issued and the per-user MCP path still accepts (expire-all clears it)
+let oauthLive: string[] = []
 
 // Batch and file state for the Anthropic, OpenAI and Gemini batch and file APIs.
 // OpenAI's files hold their text; batches run at once, answering every line.
@@ -60,7 +77,7 @@ function anthropicRequests(body: string): { id: string, model: string }[] throws
 
 function record(req: Request, path: string, body: string): void {
   const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? req.headers.get("x-goog-api-key") ?? req.headers.get("api-key") ?? ""
-  seen.push({ path: path, auth: auth, body: body, team: req.headers.get("x-team") ?? "" })
+  seen.push({ path: path, auth: auth, body: body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "" })
 }
 
 function failure(model: string, auth: string): Response | undefined {
@@ -84,6 +101,14 @@ const vertexIds: string[] = []
 const bedrockJobs: Map<string, string> = new Map()
 const bedrockIds: string[] = []
 const JOB_TIME = "2026-10-14T12:00:00Z"
+
+// The model parameters datasheet the compat tests read (e2e.compat.json's pricing_sync url is /cdatasheet)
+const COMPAT_ROWS = `{
+  "strict-mini": {"mode":"chat","max_output_tokens":1000,"model_parameters":[{"id":"max_tokens"},{"id":"max_completion_tokens"},{"id":"tools"},{"id":"tool_choice"},{"id":"stop"}]},
+  "chatonly-mini": {"mode":"chat","max_output_tokens":4096,"model_parameters":[{"id":"max_tokens"},{"id":"temperature"},{"id":"top_p"},{"id":"stop"}]},
+  "responses-only": {"mode":"responses","supported_endpoints":["/v1/responses"],"max_output_tokens":8000,"model_parameters":[{"id":"max_output_tokens"},{"id":"reasoning_effort"},{"id":"tools"},{"id":"temperature"}]},
+  "reasoning-tools": {"mode":"chat","max_output_tokens":8000,"model_parameters":[{"id":"reasoning_effort"},{"id":"tools"},{"id":"max_tokens"},{"id":"max_completion_tokens"}],"supports_reasoning_with_tool_calls":false}
+}`
 
 function putObject(k: string, body: string): void {
   if (!cloudObjects.has(k)) objectKeys.push(k)
@@ -193,6 +218,68 @@ function embedText(s: string): string {
 }
 
 // A Streamable HTTP MCP server with one tool.
+// Replicate, under /replicate (its base_url): predictions answer at once as succeeded, with the
+// image URLs when the input names a count (num_outputs), the text otherwise; a prompt of "fail" fails.
+// Files answer with their record, and the deployments listing has two pages. The key is r8_e2e.
+type RepInput = { input?: { prompt?: string, num_outputs?: int } }
+
+async function replicateMock(req: Request, path: string, lu: URL | undefined): Promise<Response> throws SyntaxError | Error {
+  const body = req.method === "GET" ? "" : await req.text()
+  record(req, path + (lu === undefined ? "" : lu.search), body)
+  if (req.headers.get("authorization") !== "Bearer r8_e2e") return jsonBody(JSON.stringify({ detail: "You did not provide a valid API token" }), 401)
+  const now = "2026-10-14T13:00:00.123Z"
+  if (path === "/v1/deployments") {
+    const second = lu !== undefined && lu.search.includes("cursor=2")
+    const base = "http://127.0.0.1:18099/replicate/v1/deployments"
+    if (second) return jsonBody(`{"next":null,"previous":"${base}","results":[{"owner":"acme","name":"model-c"}]}`, 200)
+    return jsonBody(`{"next":"${base}?cursor=2","previous":null,"results":[{"owner":"acme","name":"model-a"},{"owner":"acme","name":"model-b"}]}`, 200)
+  }
+  if (path === "/v1/files" && req.method === "POST") {
+    const fd = try await req.formData()
+    const f = fd.get("content") ?? undefined
+    if (f === undefined || typeof f === "string") return jsonBody(JSON.stringify({ detail: "content is required" }), 422)
+    return Response.json({ id: "file-e2e-1", name: f.name, content_type: f.type, size: f.size, created_at: now, urls: { get: "http://127.0.0.1:18099/replicate/files/file-e2e-1" } })
+  }
+  if ((path.startsWith("/v1/models/") && path.endsWith("/predictions")) || path === "/v1/predictions") {
+    const doc = try JSON.parse(body) as RepInput
+    const prompt = doc.input?.prompt ?? ""
+    const id = "pred-e2e-" + seen.length
+    if (prompt === "fail") return Response.json({ id: id, status: "failed", created_at: now, error: "the model refused the prompt" })
+    const n = doc.input?.num_outputs
+    if (n !== undefined) {
+      const urls: string[] = []
+      for (let i = 0; i < n; i++) urls.push("http://127.0.0.1:18099/replicate/out/" + i + ".png")
+      return Response.json({ id: id, status: "succeeded", created_at: now, output: urls })
+    }
+    const pieces = ["Replicate says: ", prompt]
+    return Response.json({ id: id, status: "succeeded", created_at: now, output: pieces, logs: "Input token count: 7\nOutput token count: 4" })
+  }
+  return jsonBody(JSON.stringify({ detail: "not found" }), 404)
+}
+
+// The answers a TypeSafe-shaped decision gets: noul 0.75, a choice its first option (SIMPLE, MEDIUM or
+// COMPLEX by the state's wording), a score 1.5. Shared by the TypeSafe and the OpenRouter decision routes.
+function systemoneAnswers(body: string): string throws SyntaxError {
+  const top = try fields(body)
+  const state = (find(top, "state") ?? "null").toLowerCase()
+  const answers: string[] = []
+  for (const q of try fields(find(top, "questions") ?? "{}")) {
+    const qf = try fields(q.raw)
+    const type = rawStr(qf, "type") ?? ""
+    if (type === "noul") {
+      answers.push(`"${q.key}":{"type":"noul","noul":0.75,"confidence":0.9}`)
+    } else if (type === "choice") {
+      const opts = try fields(find(qf, "criteria") ?? "{}")
+      let pick = opts.length > 0 ? opts[0]!.key : "none"
+      if (opts.some((o) => o.key === "SIMPLE")) pick = state.includes("architect") ? "COMPLEX" : state.includes("explain") ? "MEDIUM" : "SIMPLE"
+      answers.push(`"${q.key}":{"type":"choice","choice":"${pick}","probabilities":{"${pick}":1.0}}`)
+    } else {
+      answers.push(`"${q.key}":{"type":"score","score":1.5}`)
+    }
+  }
+  return answers.join(",")
+}
+
 async function mcpServer(req: Request): Promise<Response> {
   const body = await req.text()
   record(req, "/mcp", body)
@@ -225,6 +312,23 @@ Bun.serve<string>({
         const model = m.model ?? ""
         const f = failure(model, req.headers.get("authorization") ?? "")
         if (f !== undefined) return f
+        // "strict-*" refuses the sampling parameters its datasheet row does not list (the compat tests)
+        if (model.startsWith("strict-")) {
+          for (const p of ["temperature", "top_p", "seed", "presence_penalty"]) {
+            if (body.includes(`"${p}"`)) return Response.json({ error: { message: `Unsupported parameter: '${p}' is not supported with this model.`, type: "invalid_request_error", param: p, code: "unsupported_parameter" } }, { status: 400 })
+          }
+        }
+        // "tier-complex": a classifier that always names COMPLEX, in the JSON the complexity router asks for
+        if (model === "tier-complex") return Response.json({ id: "c1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: `{"tier": "COMPLEX"}` }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
+        // a request whose text names "l97t-tools": answers with three tool calls, one name twice (the log filters)
+        if (body.includes("l97t-tools")) return new Response(`{"id":"c5","object":"chat.completion","created":1,"model":"${model}","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{}"}},{"id":"call_b","type":"function","function":{"name":"lookup_city","arguments":"{}"}},{"id":"call_c","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}`, { headers: { "content-type": "application/json" } })
+        // a primary that reports its quota as spent: the header is what a circuit policy watches for
+        if (model === "policy-quota") return new Response(`{"id":"q1","object":"chat.completion","created":1,"model":"${model}","choices":[{"index":0,"message":{"role":"assistant","content":"from the primary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`, { headers: { "content-type": "application/json", "x-quota-state": "exhausted" } })
+        // "pii-chat" streams a phone number split across two chunks (the L97s redaction checks)
+        if (model === "pii-chat" && m.stream === true) {
+          const piiChunk = (delta: string, finish: string) => `data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          return new Response(piiChunk(`{"role":"assistant","content":""}`, "null") + piiChunk(`{"content":"call 555-"}`, "null") + piiChunk(`{"content":"1234 now"}`, "null") + piiChunk(`{}`, `"stop"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
         if (m.stream === true) {
           const chunk = (delta: string, finish: string) => `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
           const sse = chunk(`{"role":"assistant","content":""}`, "null") + chunk(`{"content":"Hel"}`, "null") + chunk(`{"content":"lo"}`, "null") + chunk(`{}`, `"stop"`) +
@@ -257,6 +361,106 @@ Bun.serve<string>({
         return Response.json({ id: "c1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "Hello from " + model }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
       },
     },
+    // TypeSafe's System One under /ts, with the key "ts-key" and the model "jev-broken" refused. A noul answers 0.75,
+    // a score 1.5, and a choice its first option, except the complexity question (one with a SIMPLE option), which
+    // answers by the wording of the state: "architect" is COMPLEX, "explain" MEDIUM, anything else SIMPLE.
+    "/ts/v1/systemone": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/ts/v1/systemone", body)
+        if ((req.headers.get("authorization") ?? "") !== "Bearer ts-key") return Response.json({ detail: { error_type: "auth", message: "invalid api key" } }, { status: 401 })
+        const top = try fields(body)
+        if ((rawStr(top, "model") ?? "") === "jev-broken") return Response.json({ detail: "unknown model" }, { status: 422 })
+        const tsAnswers = try systemoneAnswers(body)
+        return new Response(`{"model":"jev-1.13.0","answers":{${tsAnswers}},"usage":{"input_tokens":17,"output_tokens":0}}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    // OpenRouter's chat under /or: the answer's usage carries the billed cost (usage.cost)
+    "/or/v1/chat/completions": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/or/v1/chat/completions", body)
+        return Response.json({ id: "or-chat-1", object: "chat.completion", created: 1, model: "openai/gpt-4o-mini", choices: [{ index: 0, message: { role: "assistant", content: "billed hello" }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, cost: 0.00123 } })
+      },
+    },
+    // Wafer's file upload under /wafer: the raw bytes arrive with the purpose, filename and MIME type as headers,
+    // and the file record goes back
+    "/wafer/v1/files": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/wafer/v1/files", body)
+        return Response.json({ id: "wf-e2e-1", purpose: req.headers.get("x-wafer-purpose") ?? "", filename: req.headers.get("x-wafer-filename") ?? "", mime_type: req.headers.get("content-type") ?? "", bytes: body.byteLength, status: "pending", created_at: "2026-10-14T13:00:00Z" })
+      },
+    },
+    // OpenRouter's native decisions (/alpha/decisions under the mock root /or): the key is checked, the
+    // answers are TypeSafe's, and the usage carries OpenRouter's billed cost
+    "/or/alpha/decisions": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/or/alpha/decisions", body)
+        if ((req.headers.get("authorization") ?? "") !== "Bearer or-key") return Response.json({ error: { message: "invalid api key", code: 401 } }, { status: 401 })
+        const orAnswers = try systemoneAnswers(body)
+        return new Response(`{"id":"gen-or-1","model":"openai/gpt-4o-mini","answers":{${orAnswers}},"usage":{"input_tokens":12,"output_tokens":3,"cost":0.00002}}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    // Bedrock's control plane listings (SigV4 GET): foundation models and inference profiles
+    "/foundation-models": {
+      GET: (req) => {
+        record(req, "/foundation-models", "")
+        return Response.json({ modelSummaries: [{ modelId: "anthropic.claude-3-haiku-20240307-v1:0", modelName: "Claude 3 Haiku", providerName: "Anthropic" }, { modelId: "amazon.titan-embed-text-v2:0", modelName: "Titan" }] })
+      },
+    },
+    "/inference-profiles": {
+      GET: (req) => {
+        record(req, "/inference-profiles", "")
+        return Response.json({ inferenceProfileSummaries: [{ inferenceProfileId: "us.anthropic.claude-sonnet-4-20250514-v1:0", status: "ACTIVE" }] })
+      },
+    },
+    // Vertex's Model Garden: google answers in two pages, anthropic and mistralai are empty
+    "/v1beta1/publishers/:publisher/models": {
+      GET: (req) => {
+        const pu = URL.parse(req.url)
+        const page = pu === undefined ? "" : pu.searchParams.get("pageToken") ?? ""
+        record(req, `/v1beta1/publishers/${req.params.publisher}/models`, page)
+        if ((req.headers.get("authorization") ?? "") !== "Bearer ya29.test-token") return Response.json({ error: { message: "unauthenticated" } }, { status: 401 })
+        if (req.params.publisher !== "google") return Response.json({ publisherModels: ([] as string[]) })
+        if (page === "") return Response.json({ publisherModels: [{ name: "publishers/google/models/gemini-2.5-flash" }], nextPageToken: "page-2" })
+        return Response.json({ publisherModels: [{ name: "publishers/google/models/gemini-2.5-pro" }] })
+      },
+    },
+    // Workers AI model search: text generation and embeddings are listed, text-to-image is not
+    "/client/v4/accounts/:account/ai/models/search": {
+      GET: (req) => {
+        record(req, `/client/v4/accounts/${req.params.account}/ai/models/search`, "")
+        if ((req.headers.get("authorization") ?? "") !== "Bearer cf-tok") return Response.json({ success: false, result: ([] as string[]) }, { status: 403 })
+        return Response.json({ success: true, result: [{ name: "@cf/meta/llama-3.1-8b-instruct", description: "Llama", task: { name: "Text Generation" } }, { name: "@cf/baai/bge-base-en-v1.5", description: "BGE", task: { name: "Text Embeddings" } }, { name: "@cf/stabilityai/stable-diffusion-xl-base-1.0", description: "SDXL", task: { name: "Text-to-Image" } }] })
+      },
+    },
+    "/ts/v1/models": {
+      GET: (req) => {
+        record(req, "/ts/v1/models", "")
+        return Response.json({ models: [{ name: "jev-1.13.0", description: "Mock jev", release_date: STAMP }] })
+      },
+    },
+    // text completions: "pii-text" streams a phone number split across chunks, "block-text" a forbidden word (the L97s checks)
+    "/v1/completions": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v1/completions", body)
+        const m = try JSON.parse(body) as Model
+        const model = m.model ?? ""
+        // only the L97s models have a text completion here; the others are not served (the compat tests read that)
+        if (model !== "pii-text" && model !== "block-text") return Response.json({ error: { message: `The model '${model}' does not exist`, type: "invalid_request_error", code: "model_not_found" } }, { status: 404 })
+        const parts = model === "block-text" ? ["a forbidden", " word"] : ["call 555-", "1234 now"]
+        if (m.stream === true) {
+          const chunk = (text: string, finish: string) => `data: {"id":"tc1","object":"text_completion","created":1,"model":"${model}","choices":[{"index":0,"text":${JSON.stringify(text)},"finish_reason":${finish}}]}\n\n`
+          let sse = ""
+          for (const p of parts) sse += chunk(p, "null")
+          return new Response(sse + chunk("", `"stop"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
+        return Response.json({ id: "tc1", object: "text_completion", created: 1, model: model, choices: [{ index: 0, text: parts.join(""), finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
+      },
+    },
     "/v1/embeddings": {
       POST: async (req) => {
         const body = await req.text()
@@ -278,6 +482,17 @@ Bun.serve<string>({
       if (isAnthropic(req)) return Response.json({ data: [{ type: "model", id: "claude-sonnet-4", display_name: "Claude Sonnet 4", created_at: STAMP }], has_more: false, first_id: "claude-sonnet-4", last_id: "claude-sonnet-4" })
       return Response.json({ object: "list", data: [{ id: "m-a", object: "model", created: 1735689600 }, { id: "m-b", object: "model" }] })
     },
+    // one model: Anthropic's shape for an x-api-key client, OpenAI's otherwise. "missing" is a 404, and so is
+    // "rotate-me", a model the OpenAI provider lists from its keys, on a server with no retrieve route
+    "/v1/models/:id": {
+      GET: (req) => {
+        const id = req.params.id
+        record(req, "/v1/models/" + id, "")
+        if (id === "missing" || id === "rotate-me") return Response.json({ error: { message: "The model 'missing' does not exist", type: "invalid_request_error", code: "model_not_found" } }, { status: 404 })
+        if (isAnthropic(req)) return Response.json({ type: "model", id: id, display_name: "Claude " + id, created_at: STAMP, max_input_tokens: 200000, max_tokens: 64000 })
+        return Response.json({ id: id, object: "model", created: 1735689600, owned_by: "mock-owner" })
+      },
+    },
     // Anthropic files (x-api-key) and OpenAI files (bearer) share the path
     "/v1/files": {
       POST: async (req) => {
@@ -285,6 +500,7 @@ Bun.serve<string>({
         const fd = try await req.formData()
         const f = fd.get("file")
         if (typeof f === "string" || f === undefined) return Response.json({ error: { message: "no file part", type: "invalid_request_error" } }, { status: 400 })
+        const raw = try await f.bytes()
         const text = try await f.text()
         const id = nextId(isAnthropic(req) ? "file_" : "file-")
         mockFiles.set(id, text)
@@ -294,7 +510,7 @@ Bun.serve<string>({
           return new Response(meta, { headers: { "content-type": "application/json" } })
         }
         const purpose = fd.get("purpose")
-        const meta = `{"id":"${id}","object":"file","bytes":${text.byteLength},"created_at":1735689600,"filename":"${f.name}","purpose":"${typeof purpose === "string" ? purpose : "batch"}","status":"processed"}`
+        const meta = `{"id":"${id}","object":"file","bytes":${raw.length},"created_at":1735689600,"filename":"${f.name}","purpose":"${typeof purpose === "string" ? purpose : "batch"}","status":"processed"}`
         openaiFiles.push(meta)
         return new Response(meta, { headers: { "content-type": "application/json" } })
       },
@@ -441,10 +657,19 @@ Bun.serve<string>({
         if (m.stream === true) {
           return new Response(`event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`, { headers: { "content-type": "text/event-stream" } })
         }
-        return Response.json({ id: "msg_1", type: "message", role: "assistant", model: m.model ?? "", content: [{ type: "text", text: "Hi from claude" }], stop_reason: "end_turn", usage: { input_tokens: 11, output_tokens: 5 } })
+        // "pii-anthropic" answers with a phone number (the L97s checks of a Responses answer built from this call)
+        const answer = m.model === "pii-anthropic" ? "call 555-1234 now" : "Hi from claude"
+        return Response.json({ id: "msg_1", type: "message", role: "assistant", model: m.model ?? "", content: [{ type: "text", text: answer }], stop_reason: "end_turn", usage: { input_tokens: 11, output_tokens: 5 } })
       },
     },
     "/v1beta/models/:modelAction": {
+      // one model's metadata (Gemini's shape); "missing" is a 404
+      GET: (req) => {
+        const id = req.params.modelAction
+        record(req, "/v1beta/models/" + id, "")
+        if (id === "missing") return Response.json({ error: { code: 404, message: "models/missing is not found", status: "NOT_FOUND" } }, { status: 404 })
+        return Response.json({ name: "models/" + id, displayName: "Gemini " + id, description: "Mock " + id, inputTokenLimit: 1048576, outputTokenLimit: 65536, supportedGenerationMethods: ["generateContent", "countTokens"] })
+      },
       POST: async (req) => {
         const body = await req.text()
         record(req, "/v1beta/models/" + req.params.modelAction, body)
@@ -576,6 +801,63 @@ Bun.serve<string>({
       POST: async (req) => {
         const body = await req.text()
         record(req, "/v1/responses", body)
+        // a decision asked as the emit_decision call: the answers the decision e2e checks
+        if (body.includes(`"emit_decision"`)) {
+          const args = '{"is_frustrated":{"value":0.8,"confidence":0.9},"category":{"choice":"billing","confidence":0.7,"probabilities":{"billing":0.6,"bug":0.4}},"urgency":{"value":0.25,"confidence":0.5,"probabilities":{"0":0.75,"1":0.25}}}'
+          return Response.json({ id: "resp_d", object: "response", status: "completed", model: "decider", output: [{ type: "function_call", id: "fc_1", call_id: "call_d", name: "emit_decision", arguments: args }], usage: { input_tokens: 11, output_tokens: 6, total_tokens: 17 } })
+        }
+        // a slow stream: the first event, then a pause, then the rest. A client that cancels (or hangs up)
+        // is recorded, so the tests see the upstream call abort.
+        if (body.includes(`"gpt-4o-slow"`)) {
+          const hd: Record<string, string> = new Map()
+          hd.set("content-type", "text/event-stream")
+          const first = `event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"id":"resp_slow","status":"in_progress"}}\n\n`
+          const rest = `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":1,"delta":"late"}\n\nevent: response.completed\ndata: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_slow","status":"completed","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n`
+          const stream = new ReadableStream({
+            start: async (c) => {
+              c.enqueue(new TextEncoder().encode(first))
+              await new Promise((done) => setTimeout(done, 3000))
+              try {
+                c.enqueue(new TextEncoder().encode(rest))
+                c.close()
+              } catch (e) {
+                // the client cancelled
+              }
+            },
+            cancel: () => {
+              record(req, "/v1/responses/aborted", "")
+            },
+          })
+          return new Response(stream, { headers: hd })
+        }
+        // "pii-responses" and "block-responses" stream text the L97s checks redact or block: deltas, the done event and the completed response
+        if (body.includes(`"stream":true`) && (body.includes(`"pii-responses"`) || body.includes(`"block-responses"`))) {
+          const sev = (name: string, data: string): string => `event: ${name}\ndata: ${data}\n\n`
+          const parts = body.includes(`"block-responses"`) ? ["a forbidden", " word"] : ["call 555-", "1234 now"]
+          let sse = sev("response.created", `{"type":"response.created","sequence_number":0,"response":{"id":"resp_p1","status":"in_progress"}}`)
+          let n = 1
+          for (const p of parts) {
+            sse += sev("response.output_text.delta", `{"type":"response.output_text.delta","sequence_number":${n},"item_id":"msg_1","output_index":0,"content_index":0,"delta":${JSON.stringify(p)}}`)
+            n += 1
+          }
+          const full = JSON.stringify(parts.join(""))
+          sse += sev("response.output_text.done", `{"type":"response.output_text.done","sequence_number":${n},"item_id":"msg_1","output_index":0,"content_index":0,"text":${full}}`)
+          sse += sev("response.completed", `{"type":"response.completed","sequence_number":${n + 1},"response":{"id":"resp_p1","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":${full}}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+          return new Response(sse, { headers: { "content-type": "text/event-stream" } })
+        }
+        // a streamed answer: Responses events. The compat tests' Responses-only model streams "native responses";
+        // everything else (the WebSocket mode's tests) streams "Hello" with sequence numbers
+        if (body.includes(`"stream":true`)) {
+          const ev = (name: string, data: string): string => `event: ${name}\ndata: ${data}\n\n`
+          let sse = ev("response.created", `{"type":"response.created","sequence_number":0,"response":{"id":"resp_s1","status":"in_progress"}}`) + ev("response.output_text.delta", `{"type":"response.output_text.delta","sequence_number":1,"delta":"Hel"}`) + ev("response.output_text.delta", `{"type":"response.output_text.delta","sequence_number":2,"delta":"lo"}`) + ev("response.completed", `{"type":"response.completed","sequence_number":3,"response":{"id":"resp_s1","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`) + "data: [DONE]\n\n"
+          if (body.includes(`"responses-only"`)) {
+            sse = ev("response.created", `{"type":"response.created","response":{"id":"resp_s1","created_at":5}}`) +
+              ev("response.output_text.delta", `{"type":"response.output_text.delta","item_id":"msg_1","delta":"native "}`) +
+              ev("response.output_text.delta", `{"type":"response.output_text.delta","item_id":"msg_1","delta":"responses"}`) +
+              ev("response.completed", `{"type":"response.completed","response":{"id":"resp_s1","created_at":5,"status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`)
+          }
+          return new Response(sse, { headers: { "content-type": "text/event-stream" } })
+        }
         return new Response(`{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"native responses","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`, { headers: { "content-type": "application/json" } })
       },
     },
@@ -592,6 +874,9 @@ Bun.serve<string>({
         const body = await req.text()
         record(req, `/v1/projects/${req.params.project}/locations/${req.params.location}/publishers/${req.params.publisher}/models/${req.params.modelAction}`, body)
         // Imagen's :predict and a Gemini image model's generateContent answer with inline images
+        // countTokens (Gemini) and count-tokens:rawPredict (Claude on Vertex) count the request
+        if (req.params.modelAction.endsWith(":countTokens")) return Response.json({ totalTokens: 11 })
+        if (req.params.modelAction === "count-tokens:rawPredict") return Response.json({ input_tokens: 9 })
         if (req.params.modelAction.endsWith(":predict")) return Response.json({ predictions: [{ bytesBase64Encoded: "iVBORw0KGgo=" }] })
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
         return Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "Hi from vertex" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 3, totalTokenCount: 7 } })
@@ -619,6 +904,15 @@ Bun.serve<string>({
     "/mcp-secure": {
       POST: async (req) => {
         if ((req.headers.get("authorization") ?? "") !== "Bearer mcp-token") return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } })
+        return try await mcpServer(req)
+      },
+    },
+    // the MCP server for per_user_headers clients: each virtual key sends its own x-tenant value, and only
+    // the two tenants of the e2e test are accepted
+    "/mcp-peruser": {
+      POST: async (req) => {
+        const k = req.headers.get("x-tenant") ?? ""
+        if (k !== "tenant-a-key-example" && k !== "tenant-b-key-example") return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } })
         return try await mcpServer(req)
       },
     },
@@ -676,8 +970,9 @@ Bun.serve<string>({
       POST: async (req) => {
         const body = await req.text()
         record(req, "/model/" + req.params.modelId + "/invoke", body)
-        // image models (Titan and Nova Canvas: imageGenerationConfig; Stability: prompt) answer with one image
-        if (body.includes("imageGenerationConfig") || body.includes(`"prompt"`)) return new Response(`{"images":["iVBORw0KGgo="]}`, { headers: { "content-type": "application/json" } })
+        // image models (Titan and Nova Canvas: imageGenerationConfig or an image task; Stability: prompt) answer with one image
+        const imageTask = ["INPAINTING", "OUTPAINTING", "BACKGROUND_REMOVAL", "IMAGE_VARIATION"].some((t) => body.includes(`"taskType":"${t}"`))
+        if (body.includes("imageGenerationConfig") || body.includes(`"prompt"`) || imageTask) return new Response(`{"images":["iVBORw0KGgo="]}`, { headers: { "content-type": "application/json" } })
         return new Response(`{"embedding":[0.5,0.25],"inputTextTokenCount":3}`, { headers: { "content-type": "application/json" } })
       },
     },
@@ -747,6 +1042,30 @@ Bun.serve<string>({
         return Response.json({ ok: true })
       },
     },
+    // webhook receivers (webhooks.tov): one that answers 200, one that always fails with 503
+    "/webhook-receiver": {
+      POST: async (req) => {
+        const body = await req.text()
+        hooks.push({ path: "/webhook-receiver", id: req.headers.get("webhook-id") ?? "", timestamp: req.headers.get("webhook-timestamp") ?? "", signature: req.headers.get("webhook-signature") ?? "", event: req.headers.get("x-bifrost-event") ?? "", body: body })
+        return Response.json({ ok: true })
+      },
+    },
+    "/webhook-fail": {
+      POST: async (req) => {
+        const body = await req.text()
+        hooks.push({ path: "/webhook-fail", id: req.headers.get("webhook-id") ?? "", timestamp: req.headers.get("webhook-timestamp") ?? "", signature: req.headers.get("webhook-signature") ?? "", event: req.headers.get("x-bifrost-event") ?? "", body: body })
+        return Response.json({ error: { message: "receiver is down" } }, { status: 503 })
+      },
+    },
+    // a receiver that refuses the payload for good: a 400 is not retried
+    "/webhook-400": {
+      POST: async (req) => {
+        const body = await req.text()
+        hooks.push({ path: "/webhook-400", id: req.headers.get("webhook-id") ?? "", timestamp: req.headers.get("webhook-timestamp") ?? "", signature: req.headers.get("webhook-signature") ?? "", event: req.headers.get("x-bifrost-event") ?? "", body: body })
+        return Response.json({ error: { message: "payload refused" } }, { status: 400 })
+      },
+    },
+    "/_hooks": () => Response.json(hooks),
     // HashiCorp Vault KV v2
     "/v1/secret/data/raiju": {
       GET: (req) => {
@@ -755,8 +1074,96 @@ Bun.serve<string>({
       },
     },
     "/_seen": () => Response.json(seen),
+    // OAuth metadata (RFC 8414), dynamic client registration (RFC 7591), the authorize step (PKCE S256) and the token endpoint
+    "/.well-known/oauth-authorization-server": {
+      GET: () => Response.json({ issuer: `http://127.0.0.1:${port}`, authorization_endpoint: `http://127.0.0.1:${port}/oauth2/authorize`, token_endpoint: `http://127.0.0.1:${port}/oauth2/token`, registration_endpoint: `http://127.0.0.1:${port}/oauth2/register`, code_challenge_methods_supported: ["S256"] }),
+    },
+    "/oauth2/register": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/oauth2/register", body)
+        const j = try JSON.parse(body) as { redirect_uris?: string[] }
+        return Response.json({ client_id: OAUTH_CLIENT, client_id_issued_at: 1, token_endpoint_auth_method: "none", redirect_uris: j.redirect_uris ?? [] }, { status: 201 })
+      },
+    },
+    "/oauth2/authorize": {
+      GET: (req) => {
+        const u = URL.parse(req.url)
+        const q = u === undefined ? new URLSearchParams("") : u.searchParams
+        record(req, "/oauth2/authorize", "")
+        const redirect = q.get("redirect_uri") ?? ""
+        if (q.get("client_id") !== OAUTH_CLIENT || q.get("response_type") !== "code" || q.get("code_challenge_method") !== "S256") return Response.json({ error: "invalid_request" }, { status: 400 })
+        oauthCodeN += 1
+        const code = "code-" + oauthCodeN
+        oauthCodes.set(code, q.get("code_challenge") ?? "")
+        oauthRedirects.set(code, redirect)
+        return new Response(undefined, { status: 302, headers: { location: redirect + "?code=" + code + "&state=" + (q.get("state") ?? "") } })
+      },
+    },
+    "/oauth2/token": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/oauth2/token", body)
+        const f = new URLSearchParams(body)
+        if (f.get("client_id") !== OAUTH_CLIENT) return Response.json({ error: "invalid_client" }, { status: 401 })
+        const grant = f.get("grant_type") ?? ""
+        if (grant === "authorization_code") {
+          const code = f.get("code") ?? ""
+          const challenge = oauthCodes.get(code)
+          if (challenge === undefined) return Response.json({ error: "invalid_grant" }, { status: 400 })
+          oauthCodes.delete(code)
+          // PKCE: the verifier must hash to the challenge sent at the authorize step, for the same redirect URI
+          if (encodeUrl(sha256(utf8(f.get("code_verifier") ?? ""))) !== challenge || f.get("redirect_uri") !== oauthRedirects.get(code)) return Response.json({ error: "invalid_grant", error_description: "PKCE or redirect mismatch" }, { status: 400 })
+        } else if (grant === "refresh_token") {
+          if (f.get("refresh_token") !== OAUTH_REFRESH) return Response.json({ error: "invalid_grant" }, { status: 400 })
+        } else {
+          return Response.json({ error: "unsupported_grant_type" }, { status: 400 })
+        }
+        oauthTokenN += 1
+        oauthAccess = "oauth-access-" + oauthTokenN
+        oauthLive.push(oauthAccess)
+        return Response.json({ access_token: oauthAccess, token_type: "Bearer", expires_in: 3600, refresh_token: OAUTH_REFRESH })
+      },
+    },
+    // the MCP server behind the authorization server: only the token it issued is accepted
+    "/mcp-oauth": {
+      POST: async (req) => {
+        if (oauthAccess === "" || (req.headers.get("authorization") ?? "") !== "Bearer " + oauthAccess) return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } })
+        return try await mcpServer(req)
+      },
+    },
+    // the per-user OAuth MCP server: any live access token of the token endpoint is accepted
+    "/mcp-peruser-oauth": {
+      POST: async (req) => {
+        const auth = req.headers.get("authorization") ?? ""
+        if (!auth.startsWith("Bearer ") || !oauthLive.includes(auth.slice(7))) return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } })
+        return try await mcpServer(req)
+      },
+    },
+    // expires every issued access token, so each caller's next call must refresh
+    "/_oauth/expire-all": {
+      POST: () => {
+        oauthLive = []
+        return Response.json({ expired: true })
+      },
+    },
+    // revokes the access token the MCP server accepts, so the next call must refresh
+    "/_oauth/revoke": {
+      POST: () => {
+        oauthAccess = ""
+        return Response.json({ revoked: true })
+      },
+    },
   },
   async fetch(req, server) {
+    // the compat tests' model parameters datasheet
+    const cu = URL.parse(req.url)
+    if (cu !== undefined && cu.pathname === "/cdatasheet/model-parameters") return new Response(COMPAT_ROWS, { headers: { "content-type": "application/json" } })
+    // a Prometheus push gateway (PUT /metrics/job/<job>/instance/<instance>): the push is kept with the hooks, as event "pushgateway"
+    if (req.method === "PUT" && cu !== undefined && cu.pathname.startsWith("/metrics/job/")) {
+      hooks.push({ path: cu.pathname, id: "", timestamp: "", signature: "", event: "pushgateway", body: await req.text() })
+      return new Response(undefined, { status: 200 })
+    }
     // S3-compatible object storage, for log exports
     if (req.method === "PUT") {
       const u = URL.parse(req.url)
@@ -779,6 +1186,8 @@ Bun.serve<string>({
     // the Responses lifecycle and realtime REST: answer with what was asked
     const lu = URL.parse(req.url)
     const lp = lu === undefined ? "" : lu.pathname
+    // Replicate's API (see replicateMock)
+    if (lp.startsWith("/replicate/")) return try await replicateMock(req, lp.slice(10), lu)
     // Azure-style deployments: the call is recorded as sent, then answered by the /v1 route of its operation
     if (lp.startsWith("/openai/deployments/") && lu !== undefined) {
       const rest = lp.slice(20)
@@ -795,6 +1204,13 @@ Bun.serve<string>({
       oh.set("content-type", up.headers.get("content-type") ?? "application/json")
       return new Response(out, { status: up.status, headers: oh })
     }
+    // GPT Live's recording of a session
+    if (lp.startsWith("/v1/live/sessions/") && lp.endsWith("/content") && req.method === "GET") {
+      record(req, lp, "")
+      const hd: Record<string, string> = new Map()
+      hd.set("content-type", "audio/wav")
+      return new Response("RIFF-recording-" + lp.slice(18, lp.byteLength - 8), { headers: hd })
+    }
     if (lp.startsWith("/v1/responses/") || lp === "/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions" || lp === "/v1/realtime/calls") {
       const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
       record(req, lp, req.method + " " + body)
@@ -802,7 +1218,7 @@ Bun.serve<string>({
       return Response.json({ object: "ok", method: req.method, path: lp })
     }
     // realtime: echo each event back, tagged with the credentials and URL the gateway used
-    if (req.url.includes("/v1/realtime")) {
+    if (req.url.includes("/v1/realtime") || req.url.includes("/v1/live/sessions")) {
       const tag = (req.headers.get("authorization") ?? "") + " " + req.url
       if (server.upgrade(req, { data: tag })) return
     }
@@ -843,6 +1259,12 @@ Bun.serve<string>({
       if (obj === undefined) return jsonBody(`{"error":{"code":404,"message":"No such object"}}`, 404)
       if (new URLSearchParams(lu.search).get("alt") === "media") return new Response(obj, { headers: { "content-type": "application/octet-stream" } })
       return jsonBody(`{"name":"${name}","bucket":"${bucket}","size":"${obj.byteLength}","timeCreated":"${JOB_TIME}"}`, 200)
+    }
+    // Vertex's regional cached contents (v1beta1), passed through as sent
+    if (lp.startsWith("/v1beta1/projects/") && lp.includes("/cachedContents")) {
+      const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
+      record(req, lp, req.method + " " + body)
+      return Response.json({ name: lp, model: "publishers/google/models/gemini-2.5-flash", displayName: "regional" })
     }
     // Vertex's Batch Prediction jobs
     if (lp.includes("/batchPredictionJobs") && lu !== undefined) {
@@ -933,7 +1355,10 @@ Bun.serve<string>({
   },
   websocket: {
     message(ws, m) {
-      ws.send(JSON.stringify({ type: "echo", auth: ws.data ?? "", event: typeof m === "string" ? m : "binary" }))
+      const text = typeof m === "string" ? m : "binary"
+      // a live session starts with session.start; the provider answers with its id
+      if (text.includes(`"session.start"`)) ws.send(`{"type":"session.started","session":{"id":"sess_mock_1"}}`)
+      ws.send(JSON.stringify({ type: "echo", auth: ws.data ?? "", event: text }))
     },
   },
 })

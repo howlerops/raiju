@@ -1,0 +1,85 @@
+// The setup session of POST /api/session/setup (Bifrost's setup session cookie). While no admin account
+// exists, the operator's setup token is traded once for a signed cookie that stands in for it, so the
+// dashboard need not keep the token. The cookie is stateless: an HMAC over its expiry and a nonce, keyed
+// from the token, so changing the token invalidates every cookie issued under the old one.
+import { sha256, hmacSha256, toHex, utf8, secureHex } from "./crypto"
+
+export const SETUP_COOKIE = "bifrost_setup_session"
+// Bifrost's SetupSessionTTL: twelve hours.
+export const SETUP_TTL_MS = 43200000.0
+const VERSION = "v1"
+
+function sign(token: string, payload: string): string {
+  return toHex(hmacSha256(sha256(utf8("bifrost-setup-session:" + token)), utf8(payload)))
+}
+
+// A new setup session value and its expiry (epoch ms). Empty token: no session can be issued.
+export function issueSetupSession(token: string, now: f64): { value: string, expires: f64 } throws Error {
+  const expires = now + SETUP_TTL_MS
+  const nonce = try secureHex(16)
+  const payload = VERSION + "." + Math.floor(expires / 1000.0) + "." + nonce
+  return { value: payload + "." + sign(token, payload), expires: expires }
+}
+
+// Whether a cookie value is an unexpired setup session issued under this token.
+export function validSetupSession(value: string, token: string, now: f64): bool {
+  if (token === "" || value === "") return false
+  const parts = value.split(".")
+  if (parts.length !== 4 || parts[0] !== VERSION) return false
+  const payload = parts[0]! + "." + parts[1]! + "." + parts[2]!
+  const want = utf8(sign(token, payload))
+  const got = utf8(parts[3]!)
+  if (want.length !== got.length) return false
+  let diff = 0
+  for (let i = 0; i < want.length; i++) {
+    if (want[i] !== got[i]) diff = 1
+  }
+  if (diff !== 0) return false
+  const exp = (parseInt(parts[1]!) ?? 0) * 1000.0
+  return exp > now
+}
+
+// The value of one cookie in a Cookie header, or "" when it is not there.
+export function cookieValue(header: string, name: string): string {
+  for (const part of header.split(";")) {
+    const p = part.trim()
+    if (p.startsWith(name + "=")) return p.slice(name.byteLength + 1)
+  }
+  return ""
+}
+
+// The Set-Cookie value that gives a setup session to the browser: HttpOnly, SameSite=Strict, Secure over TLS.
+export function setupCookie(value: string, secure: bool): string {
+  return `${SETUP_COOKIE}=${value}; Path=/; Max-Age=${Math.floor(SETUP_TTL_MS / 1000.0)}; HttpOnly; SameSite=Strict` + (secure ? "; Secure" : "")
+}
+
+test("a setup session validates under its token until it expires", () => {
+  const now = 1800000000000.0
+  const s = try issueSetupSession("tok-setup-1", now)
+  expect(validSetupSession(s.value, "tok-setup-1", now)).toBe(true)
+  expect(validSetupSession(s.value, "tok-setup-2", now)).toBe(false)
+  expect(validSetupSession(s.value, "tok-setup-1", s.expires + 1000.0)).toBe(false)
+  expect(validSetupSession("", "tok-setup-1", now)).toBe(false)
+  expect(validSetupSession(s.value, "", now)).toBe(false)
+})
+
+test("a tampered or malformed setup session does not validate", () => {
+  const now = 1800000000000.0
+  const s = try issueSetupSession("tok-setup-1", now)
+  const parts = s.value.split(".")
+  expect(validSetupSession(parts[0]! + "." + parts[1]! + "." + parts[2]! + ".00", "tok-setup-1", now)).toBe(false)
+  expect(validSetupSession("v2." + parts[1]! + "." + parts[2]! + "." + parts[3]!, "tok-setup-1", now)).toBe(false)
+  expect(validSetupSession("v1.1.2", "tok-setup-1", now)).toBe(false)
+})
+
+test("the setup cookie is read from a Cookie header and written HttpOnly", () => {
+  expect(cookieValue("a=1; bifrost_setup_session=v1.x.y.z; b=2", SETUP_COOKIE)).toBe("v1.x.y.z")
+  expect(cookieValue("bifrost_setup_session_other=1", SETUP_COOKIE)).toBe("")
+  expect(cookieValue("", SETUP_COOKIE)).toBe("")
+  const c = setupCookie("v1.x.y.z", true)
+  expect(c.startsWith("bifrost_setup_session=v1.x.y.z;")).toBe(true)
+  expect(c.includes("HttpOnly")).toBe(true)
+  expect(c.includes("SameSite=Strict")).toBe(true)
+  expect(c.endsWith("; Secure")).toBe(true)
+  expect(setupCookie("v", false).includes("Secure")).toBe(false)
+})

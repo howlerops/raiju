@@ -37,6 +37,44 @@ export type VerifyResult = { ok: bool, checked: int, firstBad?: int, reason?: st
 
 const KEY_FILE = "audit.key"
 const LOG_FILE = "audit.jsonl"
+// Written by a retention prune: the last event it removed, so the chain verifies from the first event kept.
+const ANCHOR_FILE = "audit-anchor.json"
+// The object-storage archive's progress (archiveMark).
+const MARK_FILE = "audit-archive.json"
+
+type Anchor = { seq: int, hash: string }
+
+// How far the archive copy has got: the last sequence number copied, and the end of its window (epoch ms).
+export type ArchiveMark = { seq: int, until: f64 }
+
+function readOptional(p: string): string | undefined {
+  if (!existsSync(p)) return undefined
+  try {
+    return readFileSync(p, "utf8")
+  } catch (e) {
+    return undefined
+  }
+}
+
+function readAnchor(dir: string): Anchor | undefined {
+  const t = readOptional(join(dir, ANCHOR_FILE))
+  if (t === undefined) return undefined
+  try {
+    return JSON.parse(t) as Anchor
+  } catch (e) {
+    return undefined
+  }
+}
+
+function readMark(dir: string): ArchiveMark | undefined {
+  const t = readOptional(join(dir, MARK_FILE))
+  if (t === undefined) return undefined
+  try {
+    return JSON.parse(t) as ArchiveMark
+  } catch (e) {
+    return undefined
+  }
+}
 const SECRET_FIELDS = ["value", "secret_key", "session_token", "auth_credentials", "password", "token"]
 
 function genesis(): string {
@@ -119,6 +157,12 @@ export class AuditLog {
     try mkdirSync(dir, { recursive: true })
     const k = key === "" ? try loadOrCreateKey(dir) : key
     this.keyBytes = utf8(k)
+    // after a prune the file may start past sequence 1: the anchor says where the chain stands
+    const a = readAnchor(dir)
+    if (a !== undefined) {
+      this.lastSeq = a.seq
+      this.lastHash = a.hash
+    }
     if (existsSync(this.file)) {
       for (const line of try readFileSync(this.file, "utf8").split("\n")) {
         const e = parseLine(line)
@@ -157,6 +201,63 @@ export class AuditLog {
     return e
   }
 
+  // The sequence number of the newest event (0 when there are none), which a prune does not lower.
+  lastSequence(): int {
+    return this.lastSeq
+  }
+
+  // Deletes the events older than cutoffMs, from the file and from memory, as a retention prune does. The
+  // last one removed goes into the anchor file, so verify starts from the first event kept. Returns how
+  // many were removed.
+  pruneBefore(cutoffMs: f64): int throws Error {
+    if (!existsSync(this.file)) return 0
+    const keep: string[] = []
+    let removed: int = 0
+    let last: Anchor = { seq: 0, hash: "" }
+    for (const line of try readFileSync(this.file, "utf8").split("\n")) {
+      if (line === "") continue
+      const e = parseLine(line)
+      if (keep.length === 0 && e !== undefined && e.ts < cutoffMs) {
+        removed += 1
+        last = { seq: e.seq, hash: e.hash }
+        continue
+      }
+      keep.push(line)
+    }
+    if (removed === 0) return 0
+    // the anchor is written before the file shrinks, so a crash between the two leaves a longer file
+    try writeFileSync(join(this.dir, ANCHOR_FILE), JSON.stringify(last))
+    try writeFileSync(this.file, keep.length === 0 ? "" : keep.join("\n") + "\n")
+    this.mem = this.mem.filter((e) => e.seq > last.seq)
+    return removed
+  }
+
+  // The events after sequence afterSeq and before beforeMs, as JSONL, with the last sequence number they
+  // reach (afterSeq when none). The archive copies these.
+  exportWindow(afterSeq: int, beforeMs: f64): { body: string, count: int, last: int } throws Error {
+    let body = ""
+    let count: int = 0
+    let last: int = afterSeq
+    if (!existsSync(this.file)) return { body: body, count: count, last: last }
+    for (const line of try readFileSync(this.file, "utf8").split("\n")) {
+      const e = parseLine(line)
+      if (e === undefined || e.seq <= afterSeq || e.ts >= beforeMs) continue
+      body += line + "\n"
+      count += 1
+      last = e.seq
+    }
+    return { body: body, count: count, last: last }
+  }
+
+  // The archive copy's progress, or undefined before it has run.
+  archiveMark(): ArchiveMark | undefined {
+    return readMark(this.dir)
+  }
+
+  setArchiveMark(m: ArchiveMark): void throws Error {
+    try writeFileSync(join(this.dir, MARK_FILE), JSON.stringify(m))
+  }
+
   // Re-reads the whole file and checks each event in order: seq runs 1, 2, 3 ...;
   // prev is the hash before it; hash is the digest of its content; sig is the
   // HMAC of the hash under this log's key. Stops at the first failure.
@@ -166,6 +267,11 @@ export class AuditLog {
     let checked: int = 0
     let seq: int = 0
     let prev = genesis()
+    const start = readAnchor(this.dir)
+    if (start !== undefined) {
+      seq = start.seq
+      prev = start.hash
+    }
     for (const line of try readFileSync(this.file, "utf8").split("\n")) {
       if (line === "") continue
       const want = seq + 1
@@ -196,6 +302,33 @@ export class AuditLog {
       total += 1
     }
     return { events: events, total: total }
+  }
+
+  // The event with this id (its sequence number), from memory.
+  find(seq: int): AuditEvent | undefined {
+    for (const e of this.mem) {
+      if (e.seq === seq) return e
+    }
+    return undefined
+  }
+
+  // The distinct values the audit filters offer, from the events in memory, sorted.
+  filterData(): { actors: string[], actions: string[], methods: string[], paths: string[], ips: string[] } {
+    const actors: string[] = []
+    const actions: string[] = []
+    const methods: string[] = []
+    const paths: string[] = []
+    const ips: string[] = []
+    for (const e of this.mem) {
+      if (!actors.includes(e.actor)) actors.push(e.actor)
+      if (!actions.includes(e.action)) actions.push(e.action)
+      if (!methods.includes(e.method)) methods.push(e.method)
+      if (!paths.includes(e.path)) paths.push(e.path)
+      const ip = e.ip ?? ""
+      if (ip !== "" && !ips.includes(ip)) ips.push(ip)
+    }
+    const byName = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0)
+    return { actors: actors.sort(byName), actions: actions.sort(byName), methods: methods.sort(byName), paths: paths.sort(byName), ips: ips.sort(byName) }
   }
 
   // The file's lines, unchanged, so each one still verifies on its own. With a
@@ -320,6 +453,36 @@ function expectAction(method: string, path: string, action: string, target: stri
 }
 
 const TEST_KEY = "test-key-0123456789"
+
+test("a retention prune keeps the chain verifiable from the first event kept, across a reload", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    try log.record("alice", "provider.upsert", "openai", "PUT", "/api/providers/openai", 200, undefined, undefined, 1000.0)
+    try log.record("alice", "provider.upsert", "openai", "PUT", "/api/providers/openai", 200, undefined, undefined, 2000.0)
+    try log.record("alice", "provider.upsert", "openai", "PUT", "/api/providers/openai", 200, undefined, undefined, 3000.0)
+    expect(try log.pruneBefore(2500.0)).toBe(2)
+    expect(try log.verify().ok).toBe(true)
+    expect(try log.verify().checked).toBe(1)
+    expect(log.query({}).total).toBe(1)
+    // a reload reads the anchor, so numbering and the chain go on
+    const again = try new AuditLog(dir, TEST_KEY, 100)
+    expect(again.lastSequence()).toBe(3)
+    const e4 = try again.record("alice", "provider.upsert", "openai", "PUT", "/api/providers/openai", 200, undefined, undefined, 4000.0)
+    expect(e4.seq).toBe(4)
+    expect(try again.verify().checked).toBe(2)
+    // the archive copy takes what is after its mark and before its window's end
+    expect(again.archiveMark()).toBeUndefined()
+    try again.setArchiveMark({ seq: 3, until: 3500.0 })
+    expect(again.archiveMark()!.seq).toBe(3)
+    const w = try again.exportWindow(3, 9000.0)
+    expect(w.count).toBe(1)
+    expect(w.last).toBe(4)
+    expect(w.body.includes(`"seq":4`)).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test("records chain: each event links to the hash before it", () => {
   const dir = try tmpDir()

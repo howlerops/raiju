@@ -5,17 +5,18 @@
 // rest of each request goes upstream unchanged. Anthropic, Gemini, Vertex and Bedrock
 // have their own APIs: media_native.tov and media_cloud.tov build those requests and the answers
 // are converted to OpenAI's shapes here.
-import { Config, KeyConfig, providerOf } from "./config"
+import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
 import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf } from "./providers/types"
 import { isOpenAICompatible, modelsRequest } from "./providers/openai"
+import * as replicate from "./providers/replicate"
 import { parseModel, target, kindOf, pickKey, timeoutMs } from "./router"
-import { Field, fields, find, rawStr, setField, build, quote } from "./json"
-import { errorJson, snapshot } from "./schemas"
+import { Field, fields, find, rawStr, rawNum, setField, build, quote } from "./json"
+import { errorJson, snapshot, nowSeconds } from "./schemas"
 import { deadline } from "./deadline"
 import * as native from "./media_native"
 import * as cloud from "./media_cloud"
 import * as cloudAuth from "./cloud_auth"
-import { S3Creds } from "./exports"
+import { S3Creds, awsCall } from "./exports"
 import { parseServiceAccount } from "./providers/vertex"
 
 export type MediaRoute = { op: string, method: string, upstreamPath: string, modelIn: "json" | "form" | "none" }
@@ -216,11 +217,15 @@ function modelTarget(cfg: Config, model: string): Target | undefined {
 
 // The target for a file or batch request. These have no model, so keys that
 // are limited to certain models are used only when no unrestricted key exists.
+// As Bifrost, only keys with use_for_batch_api serve these; when a provider has keys but
+// none is flagged, it has no target (the route answers 404).
 export function providerTarget(cfg: Config, provider: string): Target | undefined {
   const p = providerOf(cfg, provider)
   if (p === undefined) return undefined
   const kind = kindOf(provider, p)
-  const ks = p.keys ?? []
+  const all = p.keys ?? []
+  const ks = all.filter((k) => k.use_for_batch_api === true)
+  if (all.length > 0 && ks.length === 0) return undefined
   let key: KeyConfig = { value: "" }
   if (ks.length > 0) {
     const pool = ks.filter((k) => (k.models ?? []).length === 0)
@@ -316,11 +321,13 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       let form: FormData | undefined = undefined
       if (route.op === "files.create") form = try await req.formData()
       else if (route.method === "POST") text = try await req.text()
+      if (pt.kind === "wafer" && route.op === "files.create") return await waferUpload(pt, form)
       if (isNative(pt.kind)) return await nativeMedia(pt, route, qs, text, form)
       if (form !== undefined) body = form
       else if (text !== "") {
         body = text
-        contentType = "application/json"
+        // an SDP offer goes up as the caller sent it (application/sdp, or the multipart boundary)
+        contentType = route.op === "realtime.calls" ? (req.headers.get("content-type") ?? "application/sdp") : "application/json"
       }
     }
   } catch (e) {
@@ -340,6 +347,223 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
   return await send(tt, { method: route.method, url: upstreamUrl(tt, route, qs), headers: hs, body: body })
 }
 
+// ---- Native cloud routes: the provider's own job, file and cache APIs ----
+// Bedrock's model-invocation jobs and S3-style files (/bedrock/...), and Vertex's regional
+// batchPredictionJobs and cachedContents (/genai/v1/projects/... and /genai/v1beta/projects/...).
+// The body goes up as the caller sent it; the key picks the account, region and project.
+
+// A native route: kind is "bedrock.*" or "vertex.*"; id is the job or cache id (raw), and bucket
+// and key are the S3 object's.
+export type NativeRoute = { kind: string, method: string, id: string, bucket: string, key: string }
+
+function nativeOf(kind: string, method: string, id: string, bucket: string, key: string): NativeRoute {
+  return { kind: kind, method: method, id: id, bucket: bucket, key: key }
+}
+
+// The native route of a request (no query string), or undefined.
+export function nativeRoute(method: string, path: string): NativeRoute | undefined {
+  const m = method.toUpperCase()
+  if (path === "/bedrock/model-invocation-job") return m === "POST" ? nativeOf("bedrock.create", m, "", "", "") : undefined
+  if (path === "/bedrock/model-invocation-jobs") return m === "GET" ? nativeOf("bedrock.list", m, "", "", "") : undefined
+  const jobPre = "/bedrock/model-invocation-job/"
+  if (path.startsWith(jobPre)) {
+    const rest = path.slice(jobPre.byteLength)
+    if (m === "POST" && rest.endsWith("/stop")) {
+      const id = cloud.pctDecode(rest.slice(0, rest.byteLength - 5))
+      return id === "" ? undefined : nativeOf("bedrock.stop", m, id, "", "")
+    }
+    if (m === "GET" && rest !== "" && !rest.includes("/")) return nativeOf("bedrock.get", m, cloud.pctDecode(rest), "", "")
+    return undefined
+  }
+  const filePre = "/bedrock/files/"
+  if (path.startsWith(filePre)) {
+    const rest = path.slice(filePre.byteLength)
+    const i = rest.indexOf("/")
+    if (i < 0) return m === "GET" && rest !== "" ? nativeOf("bedrock.files.list", m, "", cloud.pctDecode(rest), "") : undefined
+    const bucket = cloud.pctDecode(rest.slice(0, i))
+    const key = cloud.pctDecode(rest.slice(i + 1))
+    if (bucket === "" || key === "") return undefined
+    if (m === "PUT" || m === "GET" || m === "HEAD" || m === "DELETE") return nativeOf("bedrock.files.object", m, "", bucket, key)
+    return undefined
+  }
+  const bp = "/genai/v1/projects/"
+  const cp = "/genai/v1beta/projects/"
+  if (path.startsWith(bp) || path.startsWith(cp)) {
+    const cache = path.startsWith(cp)
+    const segs = path.slice(cache ? cp.byteLength : bp.byteLength).split("/")
+    // project/locations/location/<collection>[/id]
+    if (segs.length < 4 || segs.length > 5 || segs[1] !== "locations") return undefined
+    if (segs[3] !== (cache ? "cachedContents" : "batchPredictionJobs")) return undefined
+    const v = cache ? "vertex.cache." : "vertex."
+    if (segs.length === 4) {
+      if (m === "POST") return nativeOf(v + "create", m, "", "", "")
+      if (m === "GET") return nativeOf(v + "list", m, "", "", "")
+      return undefined
+    }
+    const id = segs[4] ?? ""
+    if (id === "") return undefined
+    if (!cache && m === "POST" && id.endsWith(":cancel")) return nativeOf("vertex.cancel", m, id.slice(0, id.byteLength - 7), "", "")
+    if (m === "GET") return nativeOf(v + "get", m, id, "", "")
+    if (m === "DELETE") return nativeOf(v + "delete", m, id, "", "")
+    if (cache && m === "PATCH") return nativeOf("vertex.cache.update", m, id, "", "")
+    return undefined
+  }
+  return undefined
+}
+
+// Serves a native cloud route for the key's account: Bedrock (jobs and S3 files) or Vertex (jobs and
+// cached contents). The provider is the x-model-provider header, else bedrock or vertex.
+export async function nativeCloud(cfg: Config, req: Request, nr: NativeRoute): Promise<Response> throws TypeError {
+  const url = try new URL(req.url)
+  const sp = new URLSearchParams(url.search)
+  const qs = sp.toString()
+  const isBedrock = nr.kind.startsWith("bedrock.")
+  const provider = req.headers.get("x-model-provider") ?? (isBedrock ? "bedrock" : "vertex")
+  const t = providerTarget(cfg, provider)
+  if (t === undefined) return errorReply(404, `provider "${provider}" is not configured or has no key`, "invalid_request_error")
+  if (t.kind !== (isBedrock ? "bedrock" : "vertex")) return errorReply(400, `provider "${t.provider}" does not serve ${nr.kind}`, "invalid_request_error")
+  const text = nr.method === "POST" || nr.method === "PATCH" || nr.method === "PUT" ? try await req.text() : ""
+  if (isBedrock) {
+    let c: S3Creds = { accessKey: "", secretKey: "", region: "" }
+    try {
+      c = try await bedrockCreds(t)
+    } catch (e) {
+      return errorReply(502, `bedrock authentication failed: ${e.message}`, "authentication_error")
+    }
+    const mr = bedrockNativeRequest(t, c, nr, sp, text, req.headers.get("content-type") ?? "application/octet-stream")
+    if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+    return await send(t, mr)
+  }
+  let token = ""
+  try {
+    token = try await vertexBearer(t)
+  } catch (e) {
+    return errorReply(502, `vertex authentication failed: ${e.message}`, "authentication_error")
+  }
+  let mr: native.MediaRequest | undefined = undefined
+  try {
+    mr = try vertexNativeRequest(t, token, nr, qs, text)
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+  return await send(t, mr)
+}
+
+// The Bedrock request for a native route. Jobs are AWS calls to the account's Bedrock endpoint; S3
+// files go to the key's S3 endpoint.
+function bedrockNativeRequest(t: Target, c: S3Creds, nr: NativeRoute, sp: URLSearchParams, text: string, contentType: string): native.MediaRequest | undefined {
+  const now = Date.now()
+  const o = cloud.bedrockOrigin(t, "bedrock", c.region)
+  if (nr.kind === "bedrock.files.list") return cloud.s3List(c, cloud.s3Endpoint(t), nr.bucket, sp.get("prefix") ?? "", sp.get("continuation-token") ?? "", sp.get("max-keys") ?? "", now)
+  if (nr.kind === "bedrock.files.object") return cloud.s3Object(c, cloud.s3Endpoint(t), nr.bucket, nr.key, nr.method, text, contentType, now)
+  if (nr.kind === "bedrock.create") return cloud.sendable(awsCall(c, "bedrock", o.scheme, o.host, "POST", "/model-invocation-job", [], text, now))
+  if (nr.kind === "bedrock.list") {
+    const pairs: string[][] = []
+    sp.forEach((v, k) => {
+      pairs.push([k, v])
+    })
+    return cloud.sendable(awsCall(c, "bedrock", o.scheme, o.host, "GET", "/model-invocation-jobs", pairs, "", now))
+  }
+  if (nr.kind === "bedrock.get") return cloud.bedrockJobGet(o, c, nr.id, now)
+  if (nr.kind === "bedrock.stop") return cloud.bedrockJobStop(o, c, nr.id, now)
+  return undefined
+}
+
+// The Vertex request for a native route: the key's project and region, the body as sent.
+function vertexNativeRequest(t: Target, token: string, nr: NativeRoute, qs: string, text: string): native.MediaRequest | undefined throws SyntaxError {
+  const cache = nr.kind.startsWith("vertex.cache.")
+  let base = ""
+  if (cache) base = try cloud.vertexCacheUrl(t)
+  else base = try cloud.vertexLocation(t) + "/batchPredictionJobs"
+  const item = nr.id === "" ? "" : "/" + nr.id
+  const q = qs === "" ? "" : "?" + qs
+  let method = "GET"
+  let url = base + q
+  let body: string | undefined = undefined
+  if (nr.kind.endsWith(".create")) {
+    method = "POST"
+    url = base
+    body = text
+  } else if (nr.kind.endsWith(".list")) {
+    method = "GET"
+  } else if (nr.kind.endsWith(".get")) {
+    url = base + item
+  } else if (nr.kind.endsWith(".delete")) {
+    method = "DELETE"
+    url = base + item
+  } else if (nr.kind === "vertex.cancel") {
+    method = "POST"
+    url = base + item + ":cancel"
+    body = "{}"
+  } else if (nr.kind === "vertex.cache.update") {
+    method = "PATCH"
+    url = base + item + q
+    body = text
+  } else return undefined
+  let hs = headers([["authorization", "Bearer " + token]])
+  if (body !== undefined) hs.set("content-type", "application/json")
+  addExtraHeaders(&hs, t.cfg)
+  return { method: method, url: url, headers: hs, body: body }
+}
+
+// POST /v1/realtime with a WebRTC SDP offer (Bifrost accepts it at the base path as well as at
+// /realtime/calls). The model is the session's (the multipart "session" field, or ?model=), and it picks
+// the provider; the call goes up as /v1/realtime/calls of that provider with the model's bare name.
+export async function realtimeSdp(cfg: Config, req: Request): Promise<Response> throws TypeError {
+  const url = try new URL(req.url)
+  const sp = new URLSearchParams(url.search)
+  const ct = req.headers.get("content-type") ?? ""
+  let model = sp.get("model") ?? ""
+  let form: FormData | undefined = undefined
+  let sdp = ""
+  let session = ""
+  try {
+    if (ct.includes("multipart/form-data")) {
+      const fd = try await req.formData()
+      form = fd
+      const s = fd.get("session")
+      if (typeof s === "string") {
+        session = s
+        if (model === "") model = rawStr(try fields(s), "model") ?? ""
+      }
+    } else {
+      sdp = try await req.text()
+    }
+  } catch (e) {
+    return errorReply(400, `invalid request body: ${e.message}`, "invalid_request_error")
+  }
+  if (model === "") return errorReply(400, "session.model is required", "invalid_request_error")
+  const mt = modelTarget(cfg, model)
+  if (mt === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
+  if (!supported(mt.kind)) return errorReply(400, `provider "${mt.provider}" does not support realtime calls`, "invalid_request_error")
+  sp.delete("provider")
+  sp.set("model", mt.model)
+  const origin = url.origin
+  const hs: Map<string, string> = snapshot(req.headers)
+  hs.set("x-bf-provider", mt.provider)
+  let next: Request
+  try {
+    if (form !== undefined) {
+      // the session with its model replaced by the bare name (Bifrost strips the provider prefix)
+      const newSession = session === "" ? "" : try rewriteJsonModel(session, mt.model)
+      const out = new FormData()
+      form.forEach((value, key) => {
+        if (key === "session" && typeof value === "string") out.append(key, newSession === "" ? value : newSession)
+        else out.append(key, value)
+      })
+      hs.delete("content-type")
+      next = new Request(origin + "/v1/realtime/calls?" + sp.toString(), { method: "POST", headers: hs, body: out })
+    } else {
+      next = new Request(origin + "/v1/realtime/calls?" + sp.toString(), { method: "POST", headers: hs, body: sdp })
+    }
+  } catch (e) {
+    return errorReply(400, `invalid session: ${e.message}`, "invalid_request_error")
+  }
+  const route = matchRoute("POST", "/v1/realtime/calls") ?? { op: "realtime.calls", method: "POST", upstreamPath: "/realtime/calls", modelIn: "none" }
+  return try await handleMedia(cfg, next, route)
+}
+
 // ---- Anthropic and Gemini ----
 // Their answers are converted to OpenAI's shapes (media_native.tov builds the
 // requests). An upstream error comes back as the upstream sent it.
@@ -357,7 +581,7 @@ const uploadOrder: string[] = []
 const batchModels: Map<string, string> = new Map()
 
 function isNative(kind: string): bool {
-  return kind === "anthropic" || kind === "gemini" || kind === "vertex" || kind === "bedrock"
+  return kind === "anthropic" || kind === "gemini" || kind === "vertex" || kind === "bedrock" || kind === "replicate"
 }
 
 function remember(id: string, content: string): void {
@@ -405,6 +629,42 @@ function responsesFileOf(raw: string): string throws SyntaxError {
   return rawStr(try fields(find(fs, "dest") ?? "{}"), "fileName") ?? ""
 }
 
+// Wafer's file upload (Bifrost's wafer FileUpload): the raw bytes are the body, and the MIME type,
+// purpose and filename are headers. Its answer is converted to OpenAI's file object.
+async function waferUpload(t: Target, form: FormData | undefined): Promise<Response> {
+  const f = filePart(form)
+  if (f === undefined) return errorReply(400, "the request needs a \"file\" part", "invalid_request_error")
+  const purpose = formText(form, "purpose")
+  if (purpose === "") return errorReply(400, "purpose is required", "invalid_request_error")
+  const mime = f.type.trim()
+  if (mime === "") return errorReply(400, "the file part needs a MIME type: Wafer checks it against the purpose", "invalid_request_error")
+  const hs = authHeaders(t)
+  hs.set("content-type", mime)
+  hs.set("x-wafer-purpose", purpose)
+  if (f.name !== "") hs.set("x-wafer-filename", f.name)
+  const up = await send(t, { method: "POST", url: openaiBase(t) + "/files", headers: hs, body: try await f.bytes() })
+  if (!up.ok) return up
+  try {
+    return jsonReply(try waferFileToOpenAI(try await up.text()))
+  } catch (e) {
+    return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
+  }
+}
+
+// Wafer's file object as OpenAI's: ready is processed and pending is uploaded (Bifrost's ToBifrostFileStatus).
+export function waferFileToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const status = rawStr(fs, "status") ?? ""
+  let st = status
+  if (status === "ready") st = "processed"
+  else if (status === "pending" || status === "") st = "uploaded"
+  const created = cloudAuth.parseIsoUtcMs(rawStr(fs, "created_at") ?? "")
+  const at = created === undefined ? nowSeconds() : Math.floor(created / 1000.0)
+  const expires = cloudAuth.parseIsoUtcMs(rawStr(fs, "expires_at") ?? "")
+  const exp = expires === undefined ? "" : `,"expires_at":${Math.floor(expires / 1000.0)}`
+  return `{"id":${quote(rawStr(fs, "id") ?? "")},"object":"file","bytes":${rawNum(fs, "bytes") ?? 0},"created_at":${at},"filename":${quote(rawStr(fs, "filename") ?? "")},"purpose":${quote(rawStr(fs, "purpose") ?? "")},"status":${quote(st)}${exp}}`
+}
+
 // The uploaded file of a files.create form, or undefined when there is none.
 function filePart(form: FormData | undefined): File | undefined {
   if (form === undefined) return undefined
@@ -419,6 +679,7 @@ async function nativeMedia(t: Target, route: MediaRoute, qs: string, text: strin
     if (t.kind === "anthropic") return await anthropicMedia(t, route, qs, text, form)
     if (t.kind === "vertex") return await vertexMedia(t, route, qs, text, form)
     if (t.kind === "bedrock") return await bedrockMedia(t, route, qs, text, form)
+    if (t.kind === "replicate") return await replicateMedia(t, route, text, form)
     return await geminiMedia(t, route, qs, text, form)
   } catch (e) {
     return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
@@ -430,6 +691,109 @@ function formText(form: FormData | undefined, key: string): string {
   if (form === undefined) return ""
   const v = form.get(key)
   return typeof v === "string" ? v : ""
+}
+
+// A form field's integer, undefined when absent. A value that is not an integer is a SyntaxError.
+function formInt(form: FormData, key: string): int | undefined throws SyntaxError {
+  const s = formText(form, key)
+  if (s === "") return undefined
+  const v = parseInt(s)
+  if (v === undefined) throw new SyntaxError(`${key} must be an integer`)
+  return v
+}
+
+// A form field's number, undefined when absent. A value that is not a number is a SyntaxError.
+function formNum(form: FormData, key: string): f64 | undefined throws SyntaxError {
+  const s = formText(form, key)
+  if (s === "") return undefined
+  const v = parseFloat(s)
+  if (v === undefined) throw new SyntaxError(`${key} must be a number`)
+  return v
+}
+
+// The file under a form key, or undefined.
+function formFile(form: FormData, key: string): File | undefined {
+  const f = form.get(key) ?? undefined
+  if (f === undefined || typeof f === "string") return undefined
+  return f
+}
+
+// The files under a form key, in the order sent (the image[] key, then image when image[] is absent,
+// as Bifrost reads them).
+function formFiles(form: FormData, key: string): File[] {
+  const out: File[] = []
+  form.forEach((value, k) => {
+    if (k === key && typeof value !== "string") out.push(value)
+  })
+  return out
+}
+
+// The images of an images/edits or images/variations form, as bytes.
+async function imageBytes(form: FormData): Promise<u8[][]> throws TypeError {
+  let files = formFiles(form, "image[]")
+  if (files.length === 0) files = formFiles(form, "image")
+  const out: u8[][] = []
+  for (const f of files) out.push(try await f.bytes())
+  return out
+}
+
+// An images/edits form for the native builders: the images, the mask and the options.
+async function readEdit(form: FormData): Promise<native.EditInput> throws SyntaxError | TypeError {
+  const images = try await imageBytes(form)
+  const m = formFile(form, "mask")
+  let mask: u8[] | undefined = undefined
+  if (m !== undefined) mask = try await m.bytes()
+  return {
+    prompt: formText(form, "prompt"),
+    images: images,
+    mask: mask,
+    n: try formInt(form, "n"),
+    size: formText(form, "size"),
+    editType: formText(form, "type"),
+    outputFormat: formText(form, "output_format"),
+    compression: try formInt(form, "output_compression"),
+    quality: formText(form, "quality"),
+    negative: formText(form, "negative_prompt"),
+    seed: try formInt(form, "seed"),
+    maskPrompt: formText(form, "mask_prompt"),
+    extra: formExtras(form),
+  }
+}
+
+// The Stability options the form sent, by name.
+function formExtras(form: FormData): Map<string, string> {
+  const extra: Map<string, string> = new Map()
+  for (const k of cloud.stabilityFormFields()) {
+    const v = formText(form, k)
+    if (v !== "") extra.set(k, v)
+  }
+  return extra
+}
+
+// An images/variations form for Bedrock: the images (the first is the primary one) and the values
+// Bifrost takes from the form (prompt, negativeText, similarityStrength, cfgScale, quality, n, size).
+async function readVariation(form: FormData): Promise<native.VariationInput> throws SyntaxError | TypeError {
+  return {
+    images: try await imageBytes(form),
+    prompt: formText(form, "prompt"),
+    negative: formText(form, "negativeText"),
+    similarity: try formNum(form, "similarityStrength"),
+    n: try formInt(form, "n"),
+    size: formText(form, "size"),
+    quality: formText(form, "quality"),
+    cfgScale: try formNum(form, "cfgScale"),
+  }
+}
+
+// Sends an image request on a native provider and converts the answer to OpenAI's images body:
+// Imagen's predictions or a Gemini image model's inline data (by the model name), or Bedrock's images.
+async function imageReply(t: Target, mr: native.MediaRequest, bedrockAnswer: bool): Promise<Response> throws SyntaxError | Error {
+  const up = await send(t, mr)
+  if (!up.ok) return up
+  const raw = try await up.text()
+  if (bedrockAnswer) return jsonReply(try cloud.bedrockImagesToOpenAI(raw))
+  if (t.model.toLowerCase().includes("imagen")) return jsonReply(try native.imagenToOpenAI(raw))
+  return jsonReply(try native.geminiImageToOpenAI(raw))
 }
 
 // A GET to the upstream URL of a route, with the provider's auth.
@@ -451,7 +815,7 @@ async function openaiBatchResults(t: Target, bid: string): Promise<Response> thr
 
 // The bearer token for a Vertex call: the cached one for its service account, else a
 // new one from its token endpoint (as gateway.tov's vertexToken fetches it).
-async function vertexBearer(t: Target): Promise<string> throws SyntaxError | Error {
+export async function vertexBearer(t: Target): Promise<string> throws SyntaxError | Error {
   const sa = try parseServiceAccount(t.key.vertex_key_config?.auth_credentials)
   const now = Math.floor(Date.now() / 1000)
   const cached = cloud.VERTEX_TOKENS.get(sa.client_email, now)
@@ -837,9 +1201,33 @@ async function bedrockBatchOutput(t: Target, c: S3Creds, bid: string): Promise<R
   return jsonlReply(try cloud.bedrockResultsToOpenAI(all, model))
 }
 
-// Vertex: image generation here, and its files and batches (vertexStore).
+// Replicate: image generations as predictions (the output URLs), and file uploads. Other operations
+// answer 400: Replicate has no image edits here, and its files are not listed or fetched.
+async function replicateMedia(t: Target, route: MediaRoute, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  if (route.op === "images.generations") {
+    const up = try replicate.imageRequest(t, try fields(text))
+    const r = await send(t, { method: "POST", url: up.url, headers: up.headers, body: up.body })
+    if (!r.ok) return r
+    return jsonReply(try replicate.imageResponse(try await r.text()))
+  }
+  if (route.op === "files.create") {
+    const f = filePart(form)
+    if (f === undefined) return errorReply(400, "the request needs a \"file\" part", "invalid_request_error")
+    const fd = new FormData()
+    fd.append("content", f)
+    fd.append("type", f.type)
+    if (f.name !== "") fd.append("filename", f.name)
+    const r = await send(t, { method: "POST", url: replicate.rootOf(t) + "/v1/files", headers: authHeaders(t), body: fd })
+    if (!r.ok) return r
+    return jsonReply(try replicate.fileToOpenAI(try await r.text(), formText(form, "purpose")))
+  }
+  return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
+}
+
+// Vertex: image generation and edits here, and its files and batches (vertexStore).
 async function vertexMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
   if (route.op.startsWith("files.") || route.op.startsWith("batches.")) return try await vertexStore(t, route, qs, text, form)
+  if (route.op === "images.edits") return try await vertexEdit(t, form)
   if (route.op !== "images.generations") return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
   const fs = try fields(text)
   if ((rawStr(fs, "prompt") ?? "") === "") return errorReply(400, "the request needs a prompt", "invalid_request_error")
@@ -863,9 +1251,36 @@ async function vertexMedia(t: Target, route: MediaRoute, qs: string, text: strin
   return jsonReply(try native.geminiImageToOpenAI(raw))
 }
 
-// Bedrock: image generation here (InvokeModel), and its files and batches (bedrockStore).
+// Vertex's image edit: the form read, then the Gemini or Imagen body on the publisher path with the bearer token.
+async function vertexEdit(t: Target, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  if (form === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+  let ed: native.EditInput | undefined = undefined
+  try {
+    ed = try await readEdit(form)
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (ed === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+  let token = ""
+  try {
+    token = try await vertexBearer(t)
+  } catch (e) {
+    return errorReply(502, `vertex authentication failed: ${e.message}`, "authentication_error")
+  }
+  let mr: native.MediaRequest | undefined = undefined
+  try {
+    mr = try cloud.vertexImageEdit(t, ed, token)
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+  return try await imageReply(t, mr, false)
+}
+
+// Bedrock: image generation, edits and variations here (InvokeModel), and its files and batches (bedrockStore).
 async function bedrockMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
   if (route.op.startsWith("files.") || route.op.startsWith("batches.")) return try await bedrockStore(t, route, qs, text, form)
+  if (route.op === "images.edits" || route.op === "images.variations") return try await bedrockImageForm(t, route, form)
   if (route.op !== "images.generations") return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
   let mr: native.MediaRequest | undefined = undefined
   try {
@@ -874,9 +1289,43 @@ async function bedrockMedia(t: Target, route: MediaRoute, qs: string, text: stri
     return errorReply(400, e.message, "invalid_request_error")
   }
   if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
-  const up = await send(t, mr)
-  if (!up.ok) return up
-  return jsonReply(try cloud.bedrockImagesToOpenAI(try await up.text()))
+  return try await imageReply(t, mr, true)
+}
+
+// Bedrock's image edit (inpainting, outpainting, background removal) or variation: the form read, then
+// the InvokeModel request built and its answer converted.
+async function bedrockImageForm(t: Target, route: MediaRoute, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  if (form === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+  let mr: native.MediaRequest | undefined = undefined
+  if (route.op === "images.edits") {
+    let ed: native.EditInput | undefined = undefined
+    try {
+      ed = try await readEdit(form)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (ed === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    try {
+      mr = try cloud.bedrockImageEdit(t, ed)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+  } else {
+    let v: native.VariationInput | undefined = undefined
+    try {
+      v = try await readVariation(form)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (v === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    try {
+      mr = try cloud.bedrockImageVariation(t, v)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+  }
+  if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+  return try await imageReply(t, mr, true)
 }
 
 async function anthropicMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
@@ -1061,6 +1510,25 @@ async function geminiMedia(t: Target, route: MediaRoute, qs: string, text: strin
     if (t.model.toLowerCase().includes("imagen")) return jsonReply(try native.imagenToOpenAI(raw))
     return jsonReply(try native.geminiImageToOpenAI(raw))
   }
+  if (route.op === "images.edits") {
+    // Gemini's image edit: the images inline in generateContent, or Imagen's edit through :predict
+    if (form === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    let ed: native.EditInput | undefined = undefined
+    try {
+      ed = try await readEdit(form)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (ed === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    let mr: native.MediaRequest | undefined = undefined
+    try {
+      mr = try native.geminiImageEdit(t, ed)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (mr === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    return try await imageReply(t, mr, false)
+  }
   if (route.op === "audio.transcriptions") {
     // Gemini's speech-to-text: the audio inline in generateContent (as Bifrost does)
     let format = "json"
@@ -1115,6 +1583,15 @@ async function geminiBatchOutput(t: Target, bid: string): Promise<Response> thro
   }
   return jsonlReply(try native.geminiInlinedToOpenAI(raw, model))
 }
+
+test("batch and file targets use only keys flagged use_for_batch_api", () => {
+  const ps: Map<string, ProviderConfig> = new Map()
+  ps.set("openai", { keys: [{ value: "plain" }, { value: "batch", use_for_batch_api: true }] })
+  ps.set("anthropic", { keys: [{ value: "unflagged" }] })
+  const cfg: Config = { providers: ps }
+  expect(providerTarget(cfg, "openai")!.key.value).toBe("batch")
+  expect(providerTarget(cfg, "anthropic")).toBeUndefined()
+})
 
 test("matches every media route", () => {
   const speech = matchRoute("POST", "/v1/audio/speech")
@@ -1268,4 +1745,27 @@ test("native kinds: anthropic, gemini, vertex and bedrock", () => {
   expect(isNative("cohere")).toBe(false)
   expect(isNative("azure")).toBe(false)
   expect(formText(undefined, "prompt")).toBe("")
+})
+
+test("native cloud routes: Bedrock jobs and files, Vertex regional batches and caches", () => {
+  expect(nativeRoute("POST", "/bedrock/model-invocation-job")?.kind).toBe("bedrock.create")
+  expect(nativeRoute("GET", "/bedrock/model-invocation-jobs")?.kind).toBe("bedrock.list")
+  expect(nativeRoute("GET", "/bedrock/model-invocation-job/arn%3Aaws%3Ajob-1")?.id).toBe("arn:aws:job-1")
+  expect(nativeRoute("POST", "/bedrock/model-invocation-job/job-1/stop")?.kind).toBe("bedrock.stop")
+  expect(nativeRoute("PUT", "/bedrock/files/b1/jobs/in.jsonl")?.key).toBe("jobs/in.jsonl")
+  expect(nativeRoute("GET", "/bedrock/files/b1")?.kind).toBe("bedrock.files.list")
+  expect(nativeRoute("PUT", "/bedrock/files/b1")).toBe(undefined)
+  expect(nativeRoute("POST", "/genai/v1/projects/p/locations/us/batchPredictionJobs")?.kind).toBe("vertex.create")
+  expect(nativeRoute("GET", "/genai/v1/projects/p/locations/us/batchPredictionJobs/123")?.id).toBe("123")
+  expect(nativeRoute("POST", "/genai/v1/projects/p/locations/us/batchPredictionJobs/123:cancel")?.kind).toBe("vertex.cancel")
+  expect(nativeRoute("POST", "/genai/v1beta/projects/p/locations/us/cachedContents")?.kind).toBe("vertex.cache.create")
+  expect(nativeRoute("PATCH", "/genai/v1beta/projects/p/locations/us/cachedContents/c1")?.kind).toBe("vertex.cache.update")
+  expect(nativeRoute("POST", "/genai/v1beta/projects/p/locations/us/cachedContents/c1")).toBe(undefined)
+  expect(nativeRoute("GET", "/genai/v1/projects/p/locations/us/endpoints")).toBe(undefined)
+})
+
+test("wafer file objects read as OpenAI's: ready is processed, dates are seconds", () => {
+  const f = try waferFileToOpenAI(`{"id":"file_1","purpose":"fine-tune","filename":"a.jsonl","mime_type":"application/jsonl","bytes":12,"status":"ready","created_at":"2026-10-14T13:00:00.123Z","expires_at":"2026-11-14T13:00:00Z"}`)
+  expect(f).toBe(`{"id":"file_1","object":"file","bytes":12,"created_at":1791982800,"filename":"a.jsonl","purpose":"fine-tune","status":"processed","expires_at":1794661200}`)
+  expect(try waferFileToOpenAI(`{"id":"file_2","status":"pending"}`).includes(`"status":"uploaded"`)).toBe(true)
 })

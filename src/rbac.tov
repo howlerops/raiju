@@ -3,13 +3,14 @@
 // a token is shown once, when its user is created, and never stored.
 import { sha256, toHex, utf8, secureHex } from "./crypto"
 import { decode, encode } from "./base64"
-import { AdminAuthConfig, AdminUserConfig } from "./config"
+import { AdminAuthConfig, AdminUserConfig, RoleConfig } from "./config"
 
-export type Role = "admin" | "editor" | "viewer" | "auditor"
+// A built-in role (admin, editor, viewer, auditor) or the name of a custom role under governance.roles.
+export type Role = string
 
 export type UserConfig = AdminUserConfig
 
-export type RbacConfig = { users: UserConfig[] }
+export type RbacConfig = { users: UserConfig[], roles?: RoleConfig[] }
 
 export type Identity = { kind: "user", name: string, role: Role } | { kind: "anonymous" } | { kind: "denied", reason: string }
 
@@ -112,9 +113,14 @@ function isApi(segs: string[]): bool {
   return (segs[0] ?? "") === "api"
 }
 
+// The audit trail, at /api/audit-logs and its alias /api/governance/audit-logs, and the request logs.
 function isAudit(segs: string[]): bool {
   const a = segs[1] ?? ""
-  return a === "audit-logs" || a === "logs"
+  return a === "audit-logs" || a === "logs" || auditAlias(segs)
+}
+
+function auditAlias(segs: string[]): bool {
+  return (segs[1] ?? "") === "governance" && (segs[2] ?? "") === "audit-logs"
 }
 
 function isSecret(segs: string[]): bool {
@@ -149,11 +155,63 @@ export function allowed(role: Role, perm: Permission, path: string): bool {
   if (perm === "manage_users") return false
   if (perm === "audit" && !isAudit(segs)) return false
   // the audit trail is for admins and auditors only
-  if (perm === "audit" && (segs[1] ?? "") === "audit-logs" && role !== "auditor") return false
+  if (perm === "audit" && ((segs[1] ?? "") === "audit-logs" || auditAlias(segs)) && role !== "auditor") return false
   if (role === "auditor") return perm === "audit"
   if (perm === "write") return role === "editor" && editorWrites(segs)
   if (role === "editor") return true
   return !isSecret(segs)
+}
+
+// The Bifrost resource a management route is about, and the operation the method implies. Custom
+// roles hold (resource, operation) pairs; secret routes need Reveal, which only a custom role can hold.
+export function resourceOf(method: string, path: string): { resource: string, op: string } {
+  const segs = segmentsOf(path)
+  const m = method.toUpperCase()
+  let op = "View"
+  if (m === "POST") op = "Create"
+  else if (m === "PUT" || m === "PATCH") op = "Update"
+  else if (m === "DELETE") op = "Delete"
+  if (isSecret(segs)) op = "Reveal"
+  const area = segs[1] ?? ""
+  const coll = segs[2] ?? ""
+  let resource = "Settings"
+  if (area === "users") resource = "Users"
+  else if (area === "audit-logs") resource = "AuditLogs"
+  else if (area === "logs") resource = "Logs"
+  else if (area === "mcp-logs") resource = "MCPLogs"
+  else if (area === "providers" || area === "keys" || area === "models") resource = "ModelProvider"
+  else if (area === "mcp") resource = "MCPGateway"
+  else if (area === "cluster") resource = "Cluster"
+  else if (area === "alerting" || area === "alerts") resource = "Observability"
+  else if (area === "roles") resource = "RBAC"
+  else if (area === "governance") {
+    if (coll === "virtual-keys") resource = "VirtualKeys"
+    else if (coll === "teams") resource = "Teams"
+    else if (coll === "customers") resource = "Customers"
+    else if (coll === "business-units") resource = "BusinessUnits"
+    else if (coll === "projects") resource = "Projects"
+    else if (coll === "access-profiles") resource = "AccessProfiles"
+    else if (coll === "routing-rules") resource = "RoutingRules"
+    else if (coll === "audit-logs") resource = "AuditLogs"
+    else resource = "Governance"
+  }
+  return { resource: resource, op: op }
+}
+
+// Whether a role may make this request. A built-in role keeps its fixed rules; a custom role needs its
+// (resource, operation) pair and only reaches the management API. Unknown roles are refused.
+export function roleAllows(roles: RoleConfig[] | undefined, role: string, method: string, path: string): bool {
+  const r = customRole(roles, role)
+  if (r === undefined) {
+    if (!isBuiltinRole(role)) return false
+    return allowed(role, required(method, path), path)
+  }
+  if (!isApi(segmentsOf(path))) return false
+  const need = resourceOf(method, path)
+  for (const p of r.permissions ?? []) {
+    if (p.resource === need.resource && p.operation === need.op) return true
+  }
+  return false
 }
 
 // The access decision for one request. 401 when the caller is not
@@ -162,8 +220,9 @@ export function authorize(cfg: RbacConfig, headers: Map<string, string>, method:
   const who = authenticate(cfg, headers)
   if (who.kind === "anonymous") return { kind: "error", status: 401, message: "authentication required" }
   if (who.kind === "denied") return { kind: "error", status: 401, message: who.reason }
-  const perm = required(method, path)
-  if (!allowed(who.role, perm, path)) return { kind: "error", status: 403, message: `role ${who.role} may not ${perm} this route` }
+  // every signed-in user reads their own permissions (Bifrost's /users/me/permissions)
+  if (method.toUpperCase() === "GET" && (path === "/api/users/me/permissions" || path === "/api/users/me/vk-creation-policy")) return { kind: "ok", actor: who.name }
+  if (!roleAllows(cfg.roles, who.role, method, path))return { kind: "error", status: 403, message: `role ${who.role} may not ${required(method, path)} this route` }
   return { kind: "ok", actor: who.name }
 }
 
@@ -173,12 +232,23 @@ type UserBody = { name?: string, role?: string, disabled?: bool }
 
 type UserView = { name: string, role: Role, disabled: bool }
 
-function roleOf(s: string): Role | undefined {
-  if (s === "admin") return "admin"
-  if (s === "editor") return "editor"
-  if (s === "viewer") return "viewer"
-  if (s === "auditor") return "auditor"
+const BUILT_IN_ROLES = ["admin", "editor", "viewer", "auditor"]
+
+export function isBuiltinRole(s: string): bool {
+  return BUILT_IN_ROLES.includes(s)
+}
+
+// The custom role with this name, if one is defined.
+export function customRole(roles: RoleConfig[] | undefined, name: string): RoleConfig | undefined {
+  for (const r of roles ?? []) {
+    if (r.name === name) return r
+  }
   return undefined
+}
+
+// A role a user may hold: built-in, or defined under governance.roles.
+export function knownRole(roles: RoleConfig[] | undefined, s: string): bool {
+  return isBuiltinRole(s) || customRole(roles, s) !== undefined
 }
 
 // Names are Basic auth user names and path segments: lower-case letters, digits, "_", "-", and
@@ -258,8 +328,8 @@ function createUser(cfg: RbacConfig, body: string): UsersReply {
   if (b === undefined) return uerror(400, "body must be a JSON object with name and role", cfg)
   const name = b.name ?? ""
   if (!validName(name)) return uerror(400, "name must be 1 to 64 lower-case letters, digits, _, -, @, . or +", cfg)
-  const role = roleOf(b.role ?? "")
-  if (role === undefined) return uerror(400, "role must be admin, editor, viewer or auditor", cfg)
+  const role = b.role ?? ""
+  if (!knownRole(cfg.roles, role)) return uerror(400, "role must be admin, editor, viewer, auditor or a custom role", cfg)
   if (findUser(cfg.users, name) !== undefined) return uerror(409, `user ${name} already exists`, cfg)
   const token = newToken()
   if (token === undefined) return uerror(500, "no secure random source; the user was not created", cfg)
@@ -278,9 +348,8 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
   if (b === undefined) return uerror(400, "body must be a JSON object with role or disabled", cfg)
   let role: Role = old.role
   if (b.role !== undefined) {
-    const r = roleOf(b.role)
-    if (r === undefined) return uerror(400, "role must be admin, editor, viewer or auditor", cfg)
-    role = r
+    if (!knownRole(cfg.roles, b.role)) return uerror(400, "role must be admin, editor, viewer, auditor or a custom role", cfg)
+    role = b.role
   }
   const disabled = b.disabled === undefined ? old.disabled : b.disabled
   const next: UserConfig = {
@@ -315,9 +384,16 @@ function deleteUser(cfg: RbacConfig, name: string): UsersReply {
 // checked by authorize() first (manage_users).
 export function handleUsers(cfg: RbacConfig, method: string, path: string, body: string): UsersReply {
   const segs = segmentsOf(path)
-  if (!isApi(segs) || (segs[1] ?? "") !== "users" || segs.length > 3) return uerror(404, "no route for this path", cfg)
+  if (!isApi(segs) || (segs[1] ?? "") !== "users" || segs.length > 4 || segs.length === 4 && segs[3] !== "role") return uerror(404, "no route for this path", cfg)
   const m = method.toUpperCase()
   const name = segs[2]
+  // /api/users/{name}/role: the role alone (Bifrost's role endpoint); PUT takes {"role": ...}
+  if (segs.length === 4 && name !== undefined) {
+    const u = findUser(cfg.users, name)
+    if (m === "GET") return u === undefined ? uerror(404, `no user ${name}`, cfg) : ureply(200, JSON.stringify({ name: u.name, role: u.role }), cfg)
+    if (m === "PUT") return updateUser(cfg, name, body)
+    return uerror(405, `method ${m} is not allowed on this route`, cfg)
+  }
   if (name === undefined) {
     if (m === "GET") return ureply(200, JSON.stringify({ users: cfg.users.map((u) => view(u)) }), cfg)
     if (m === "POST") return createUser(cfg, body)
@@ -598,4 +674,37 @@ test("sign-in identities can be users, and provisioned ones are found", () => {
   expect(u === undefined ? "" : u.role).toBe("editor")
   expect(provisioned(cfg, "bob@example.com") === undefined).toBe(true)
   expect(handleUsers(cfg, "POST", "/api/users", "{\"name\":\"a b@x\",\"role\":\"viewer\"}").status).toBe(400)
+})
+
+test("custom roles hold resource and operation pairs and reach only the management API", () => {
+  const roles: RoleConfig[] = [{ name: "ops", permissions: [{ resource: "VirtualKeys", operation: "View" }, { resource: "Logs", operation: "View" }, { resource: "Teams", operation: "Update" }] }]
+  expect(roleAllows(roles, "ops", "GET", "/api/governance/virtual-keys")).toBe(true)
+  expect(roleAllows(roles, "ops", "POST", "/api/governance/virtual-keys")).toBe(false)
+  expect(roleAllows(roles, "ops", "PUT", "/api/governance/teams/t1")).toBe(true)
+  expect(roleAllows(roles, "ops", "DELETE", "/api/governance/teams/t1")).toBe(false)
+  expect(roleAllows(roles, "ops", "GET", "/api/users")).toBe(false)
+  expect(roleAllows(roles, "ops", "GET", "/api/logs/histogram")).toBe(true)
+  expect(roleAllows(roles, "ops", "GET", "/api/roles")).toBe(false)
+  expect(roleAllows(roles, "ops", "GET", "/v1/chat/completions")).toBe(false)
+  expect(roleAllows(roles, "ghost", "GET", "/api/governance/teams")).toBe(false)
+  // built-in roles keep their fixed rules
+  expect(roleAllows(roles, "viewer", "GET", "/api/governance/teams")).toBe(true)
+  expect(roleAllows(roles, "viewer", "POST", "/api/governance/teams")).toBe(false)
+  expect(roleAllows(roles, "admin", "DELETE", "/api/governance/teams/t1")).toBe(true)
+})
+
+test("resourceOf names the Bifrost resource and the operation for a route", () => {
+  expect(resourceOf("GET", "/api/governance/projects").resource).toBe("Projects")
+  expect(resourceOf("POST", "/api/governance/projects").op).toBe("Create")
+  expect(resourceOf("PUT", "/api/governance/business-units/bu1").resource).toBe("BusinessUnits")
+  expect(resourceOf("DELETE", "/api/roles/ops").resource).toBe("RBAC")
+  expect(resourceOf("GET", "/api/governance/budgets").resource).toBe("Governance")
+  expect(resourceOf("GET", "/api/providers/openai/keys/k1/secrets").op).toBe("Reveal")
+})
+
+test("a custom role can be assigned to a user, and an unknown role cannot", () => {
+  const roles: RoleConfig[] = [{ name: "ops", permissions: [{ resource: "Teams", operation: "View" }] }]
+  const cfg: RbacConfig = { users: [], roles: roles }
+  expect(handleUsers(cfg, "POST", "/api/users", `{"name":"ann","role":"ops"}`).status).toBe(201)
+  expect(handleUsers(cfg, "POST", "/api/users", `{"name":"bob","role":"ghost"}`).status).toBe(400)
 })

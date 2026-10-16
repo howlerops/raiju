@@ -1,45 +1,145 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec } from "./config"
+import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page } from "./logapi"
+import { WsTickets } from "./wsticket"
+import { entryStatus, PluginEntry } from "./plugins"
 import { parseDatasheet } from "./pricing"
+import { deliveryLog } from "./webhooks"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
+import { PushGatewayConfig, pushProblem, pushUrl, pushHeaders, pushInterval } from "./pushgateway"
+import { join } from "node:path"
 import { Engine } from "./gateway"
-import { LogStore, LogEntry, defaultLogStoreConfig, gridOf, filterFrom, selectAll, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { CostRecalc, RecalcStatus } from "./costrecalc"
+import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE } from "./setupsession"
+import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
-import { parsePolicy, policyView } from "./health"
+import { parsePolicy, policyView, policyConfigOf } from "./health"
+import { AccessProfile, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
+import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
-import { ConfigStore, checkAdmin } from "./store"
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, allowed, provisioned } from "./rbac"
+import { ConfigStore, checkAdmin, sweepExpiredKeys, RESOURCES, OPERATIONS } from "./store"
+import { keyBudgetIds, permissionDocs, permissionIds, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
+
+// The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
+type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
+type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
+type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned } from "./rbac"
+import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp } from "./mcpserver"
+import { tempTokenAllows } from "./mcpuser"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
 import { ExportQueue, SinkSender } from "./exporters"
+import { notify, notifyOnce } from "./notify"
 import * as exporters from "./exporters"
 import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
-import { Field, fields, find, rawStr, isNull, elements } from "./json"
+import { Field, fields, find, rawStr, rawBool, isNull, elements } from "./json"
 import { trimSlash } from "./providers/types"
-import { snapshot, errorJson } from "./schemas"
+import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { deadline } from "./deadline"
 import { secureHex, utf8 } from "./crypto"
 import * as b64 from "./base64"
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs"
-import { Counters, ClusterConfig, syncInterval } from "./cluster"
+import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
+import { SocketExt } from "./realtime"
+import { LiveRegistry } from "./live"
+import { BROKER_ROUTE } from "./broker"
+import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
 import { ExportCursor, objectKey, putRequest, putBytesRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs } from "./exports"
 import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
+import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode } from "./mcpissuer"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
 
 export type Reply = { status: int, body: string, contentType: string }
+
+// The filters of POST /api/logs/recalculate-cost, in Bifrost's names.
+export type RecalcFilters = { providers?: string[], models?: string[], virtual_key_ids?: string[], user_ids?: string[], team_ids?: string[], period?: string, start_time?: string, end_time?: string, missing_cost_only?: bool }
+
+// An error reply for the plugin routes.
+function pluginError(status: int, message: string): Reply {
+  return { status: status, body: errorJson(message, status === 404 ? "not_found_error" : "invalid_request_error", undefined), contentType: "application/json" }
+}
+
+// The raw config a body names, or dflt when it names none (or null).
+function configOf(fs: Field[], dflt: string): string {
+  const raw = find(fs, "config")
+  return raw === undefined || isNull(raw) ? dflt : raw
+}
+
+// Why a plugin cannot be built from its config: "" when it can. Checked as enabled, so a disabled plugin is
+// still checked for its name and config.
+function badPlugin(spec: PluginSpec): string {
+  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}" })
+  return st.status === "error" ? st.error : ""
+}
+
+// One configured plugin as Bifrost's plugin response: its name, whether it is on, its config and its status.
+function pluginJson(sp: PluginSpec): string {
+  const config = sp.config_json ?? ""
+  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config })
+  const builtin = builtinPlugins().includes(sp.name)
+  return jobj([
+    jkv("name", JSON.stringify(sp.name)),
+    jkv("actualName", JSON.stringify(sp.name)),
+    jkv("enabled", sp.enabled === false ? "false" : "true"),
+    jkv("config", config.trim() === "" ? "{}" : config),
+    jkv("isCustom", builtin ? "false" : "true"),
+    jkv("path", "null"),
+    jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(["llm"]))])),
+  ])
+}
+
+// The names under /api/logs/ that are routes rather than log ids.
+const LOG_ROUTE_NAMES: string[] = ["stats", "histogram", "rankings", "dashboard", "filterdata", "dropped", "sessions", "recalculate-cost", "user-agent-mappings"]
+
+// The plugins this gateway provides under Bifrost's names (the ones it implements as built-in features).
+function builtinPlugins(): string[] {
+  return ["telemetry", "logging", "governance", "otel", "semanticcache", "routing"]
+}
+
+// The request body's filters as the query a list takes, so one filter reading serves both.
+function recalcQuery(f: RecalcFilters | undefined): URLSearchParams {
+  const sp = new URLSearchParams("")
+  if (f === undefined) return sp
+  if (f.providers !== undefined) sp.set("providers", f.providers.join(","))
+  if (f.models !== undefined) sp.set("models", f.models.join(","))
+  if (f.virtual_key_ids !== undefined) sp.set("virtual_key_ids", f.virtual_key_ids.join(","))
+  if (f.user_ids !== undefined) sp.set("user_ids", f.user_ids.join(","))
+  if (f.team_ids !== undefined) sp.set("team_ids", f.team_ids.join(","))
+  if (f.period !== undefined) sp.set("period", f.period)
+  if (f.start_time !== undefined) sp.set("start_time", f.start_time)
+  if (f.end_time !== undefined) sp.set("end_time", f.end_time)
+  if (f.missing_cost_only === true) sp.set("missing_cost_only", "true")
+  return sp
+}
+
+// A cost recalculation job in Bifrost's status fields.
+function recalcJson(s: RecalcStatus): string {
+  return jobj([
+    jkv("id", JSON.stringify(s.id)),
+    jkv("status", JSON.stringify(s.status)),
+    jkv("total", jn(s.total)),
+    jkv("processed", jn(s.processed)),
+    jkv("updated", jn(s.updated)),
+    jkv("skipped", jn(s.skipped)),
+    jkv("message", JSON.stringify(s.message)),
+    jkv("started_at", JSON.stringify(s.started_at)),
+    jkv("updated_at", JSON.stringify(s.updated_at)),
+  ])
+}
 
 // A query value as epoch milliseconds; the fallback when it is missing or not a number.
 function epochParam(raw: string | undefined, fallback: f64): f64 {
@@ -49,6 +149,14 @@ function epochParam(raw: string | undefined, fallback: f64): f64 {
 }
 
 // Ascending by name: the order of the model lists.
+// The index of the circuit policy called name in the config's list, or -1.
+function policyAt(list: CircuitPolicyConfig[], name: string): int {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i]!.name === name) return i
+  }
+  return -1
+}
+
 function byName(a: string, b: string): int {
   if (a === b) return 0
   return a < b ? -1 : 1
@@ -124,10 +232,11 @@ function badRequest(message: string): Reply {
   return { status: 400, body: errorJson(message, "invalid_request_error", undefined), contentType: "application/json" }
 }
 
-function denied(status: int, message: string): Response {
+// challenge is the WWW-Authenticate value of a 401 (the MCP authorization server's, when it is on).
+function denied(status: int, message: string, challenge?: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "application/json")
-  if (status === 401) h.set("www-authenticate", `Bearer realm="raiju", Basic realm="raiju"`)
+  if (status === 401) h.set("www-authenticate", challenge ?? `Bearer realm="raiju", Basic realm="raiju"`)
   return new Response(errorJson(message, status === 401 ? "authentication_error" : "permission_error", undefined), { status: status, headers: h })
 }
 
@@ -171,12 +280,9 @@ export async function withSecrets(c: Config): Promise<Config> {
   }
 }
 
-function roleOf(s: string): Role | undefined {
-  if (s === "admin") return "admin"
-  if (s === "editor") return "editor"
-  if (s === "viewer") return "viewer"
-  if (s === "auditor") return "auditor"
-  return undefined
+// The log entries since a time that a data scope may see.
+function scopedView(store: LogStore, sc: DataScope, since: f64): LogEntry[] {
+  return scopedEntries(store.viewSince(since), sc)
 }
 
 async function getText(url: string): Promise<{ status: int, body: string }> {
@@ -206,6 +312,20 @@ async function postText(url: string, headers: Map<string, string>, body: string,
   }
 }
 
+async function putText(url: string, headers: Map<string, string>, body: string): Promise<{ status: int, body: string }> {
+  const dl = deadline(10000)
+  try {
+    const hs: Record<string, string> = headers
+    const r = await fetch(url, { method: "PUT", headers: hs, body: body, signal: dl.controller.signal })
+    const b = await r.text()
+    dl.finish()
+    return { status: r.status, body: b }
+  } catch (e) {
+    dl.finish()
+    return { status: 0, body: e.message }
+  }
+}
+
 function html(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "text/html; charset=utf-8")
@@ -219,6 +339,180 @@ function trimPeer(p: string): string {
 
 // How often discovery runs, in ms: it registers this node where the mechanism needs it, then lists the others.
 const DISCOVER_MS = 10000
+
+// How often the UI socket looks for new request-log entries, in ms.
+const UI_TICK_MS = 1000
+
+// The UI socket's heartbeat, as Bifrost's: a ping every 30 s, and a client that has not answered for
+// 60 s is dropped.
+const UI_PING_MS = 30000
+const UI_PONG_MS = 60000
+
+// With several workers, a worker keeps its store updates in its share file; once the file grows past
+// this many bytes the older lines go.
+const UI_SHARE_MAX = 65536
+
+// One dashboard client on /ws.
+export class UiSocket extends SocketExt {
+  // log events reach this socket only for entries its user's data scope covers
+  constructor(readonly hub: UiHub, readonly scope: DataScope) {
+    super()
+  }
+
+  onOpen(): void {
+    this.hub.add(this)
+  }
+
+  onClose(): void {
+    this.closed = true
+    this.hub.remove(this)
+  }
+}
+
+// The events /ws pushes, in Bifrost's envelope {"type": ..., "data": ...}: store_update after a
+// successful management write (tags name the resource changed), and log for each new request-log
+// entry while a client is connected. (Bifrost's socket at this version sends notifications and
+// store updates only; the log events are Raiju's.)
+//
+// With several workers, each client gets the events of every worker: log entries from the shared
+// day file (LogStore.viewSince), and store updates from the other workers' share files.
+export cyclic class UiHub {
+  clients: UiSocket[] = []
+  timer: int = -1
+  since: f64 = 0.0
+  lastPing: f64 = 0.0
+  // the node's share directory, or "" for one process
+  shareDir = ""
+  // how far each other worker's share file has been read, by file name
+  offsets: Map<string, int> = new Map()
+  constructor(readonly logs: () => LogStore | undefined) {}
+
+  add(c: UiSocket): void {
+    c.pongAt = Date.now()
+    this.clients.push(c)
+    if (this.clients.length === 1) {
+      this.since = Date.now()
+      this.lastPing = Date.now()
+      this.timer = setInterval(() => {
+        this.tick()
+      }, UI_TICK_MS)
+    }
+  }
+
+  remove(c: UiSocket): void {
+    this.clients = this.clients.filter((x) => x !== c)
+    if (this.clients.length === 0 && this.timer >= 0) {
+      clearInterval(this.timer)
+      this.timer = -1
+    }
+  }
+
+  // Sends a store update to this worker's clients, and through the share file to the others.
+  send(text: string): void {
+    for (const c of this.clients) c.send(text)
+    if (this.shareDir !== "") this.share(text)
+  }
+
+  // The share directory of the node's workers: each worker writes its own file.
+  setShare(dir: string): void {
+    try {
+      mkdirSync(dir, { recursive: true })
+      this.shareDir = dir
+    } catch (e) {
+      this.shareDir = ""
+    }
+  }
+
+  private shareFile(): string {
+    return this.shareDir + "/" + process.pid + ".jsonl"
+  }
+
+  // Appends a store update to this worker's file, keeping its last lines once it is large.
+  private share(text: string): void {
+    let old = ""
+    try {
+      old = readFileSync(this.shareFile(), "utf8")
+    } catch (e) {
+      old = ""
+    }
+    let out = old + text + "\n"
+    if (out.byteLength > UI_SHARE_MAX) {
+      const lines = out.split("\n")
+      out = lines.slice(Math.max(0, lines.length - 200)).join("\n")
+    }
+    try {
+      writeFileSync(this.shareFile(), out)
+    } catch (e) {
+      // the other workers miss this update
+    }
+  }
+
+  // Sends the store updates the other workers wrote since the last tick: whole lines only, so a line
+  // still being written waits for the next tick.
+  private fromShares(): void {
+    let names: string[] = []
+    try {
+      names = readdirSync(this.shareDir)
+    } catch (e) {
+      return
+    }
+    const mine = this.shareFile().slice(this.shareDir.byteLength + 1)
+    for (const f of names) {
+      if (f === mine || !f.endsWith(".jsonl")) continue
+      let text = ""
+      try {
+        text = readFileSync(this.shareDir + "/" + f, "utf8")
+      } catch (e) {
+        continue
+      }
+      let from = this.offsets.get(f) ?? 0
+      // a file rewritten shorter than it was is read again from its start
+      if (from > text.byteLength) from = 0
+      const parts = text.slice(from).split("\n")
+      let used = 0
+      for (let i = 0; i < parts.length - 1; i++) {
+        const line = parts[i]!
+        used += line.byteLength + 1
+        if (line !== "") {
+          for (const c of this.clients) c.send(line)
+        }
+      }
+      this.offsets.set(f, from + used)
+    }
+  }
+
+  // Pings the clients every 30 s, and drops the ones that have not answered for 60 s.
+  private beat(now: f64): void {
+    if (now - this.lastPing < UI_PING_MS) return
+    this.lastPing = now
+    for (const c of this.clients) {
+      if (now - c.pongAt > UI_PONG_MS) c.drop()
+      else c.ping()
+    }
+  }
+
+  // Pushes the request-log entries that arrived since the last tick, and the other workers' updates.
+  tick(): void {
+    if (this.shareDir !== "") this.fromShares()
+    this.beat(Date.now())
+    const store = this.logs()
+    if (store === undefined) return
+    for (const e of store.viewSince(this.since)) {
+      const text = JSON.stringify({ type: "log", data: logEventView(e) })
+      for (const c of this.clients) {
+        if (visibleTo(e, c.scope)) c.send(text)
+      }
+      this.since = e.ts
+    }
+  }
+}
+
+// The fields of a request-log entry that a dashboard shows live (no bodies, no raw payloads).
+type LogEvent = { id: string, ts: f64, request_id: string, op: string, provider: string, model: string, status: int, latency_ms: f64, prompt_tokens: int, completion_tokens: int, cost: f64, cache_hit: bool, virtual_key?: string, error?: string }
+
+function logEventView(e: LogEntry): LogEvent {
+  return { id: e.id, ts: e.ts, request_id: e.request_id, op: e.op, provider: e.provider, model: e.model, status: e.status, latency_ms: e.latency_ms, prompt_tokens: e.prompt_tokens, completion_tokens: e.completion_tokens, cost: e.cost, cache_hit: e.cache_hit, virtual_key: e.virtual_key, error: e.error }
+}
 
 export class Ops {
   rbac: RbacConfig = { users: [] }
@@ -244,6 +538,11 @@ export class Ops {
   discovered: string[] = []
   discoverTimer: int = -1
   discoverErr = ""
+  // broker mode: the last error reported, so a down broker is logged once
+  brokerErr = ""
+  // lock-based leader election (cluster_config.leader_lock): the lease and its round timer
+  lock: LockElection | undefined = undefined
+  lockTimer: int = -1
   // identity-aware proxy: its settings and key cache, and the SSO settings its full mode maps roles with
   proxyCfg: AuthProxyConfig | undefined = undefined
   proxyKeys: ProxyKeys | undefined = undefined
@@ -267,8 +566,16 @@ export class Ops {
   discovery: Discovery | undefined = undefined
   flows = new OidcFlows()
   sessions = new UiSessions(28800)
+  // the /ws clients, and the virtual key that opened each live session (/v1/live/sessions)
+  ui: UiHub
+  liveSessions = new LiveRegistry()
+  // single-use tickets for /ws?ticket= (POST /api/session/ws-ticket)
+  wsTickets = new WsTickets()
+  // the last cost recalculation job (POST /api/logs/recalculate-cost); a job walks the logs between timer ticks
+  recalc: CostRecalc | undefined = undefined
 
   constructor(readonly engine: Engine, readonly store: ConfigStore) {
+    this.ui = new UiHub(() => this.engine.logStore)
     try {
       this.nodeId = secureHex(6)
     } catch (e) {
@@ -284,6 +591,10 @@ export class Ops {
 
   // Applies the parts of a (resolved) config that live here.
   configure(cfg: Config): void {
+    deliveryLog().setRetentionDays(cfg.client?.webhook_config?.delivery_history_retention_days)
+    // deliveries survive restarts in the logs_store folder, when that store is on
+    const lsw = cfg.logs_store
+    if (lsw !== undefined && lsw.enabled === true) deliveryLog().persistTo(join(lsw.dir ?? "logs", "webhook-deliveries.jsonl"))
     const gov = cfg.governance
     const users: UserConfig[] = gov?.users ?? []
     const auth = gov?.auth_config
@@ -293,7 +604,7 @@ export class Ops {
     } catch (e) {
       console.error(`raiju: admin credentials: ${e.message}`)
     }
-    this.rbac = { users: users.concat(legacy) }
+    this.rbac = { users: users.concat(legacy), roles: gov?.roles ?? [] }
     // admin credentials also count as inference auth, as in Bifrost
     const rb = this.rbac
     this.engine.gov.altAuth = (h) => rb.users.length > 0 && authenticate(rb, h).kind === "user"
@@ -313,6 +624,7 @@ export class Ops {
     }
     this.configurePricing(cfg.pricing_sync)
     this.configureOtelMetrics(cfg.otel)
+    this.configurePushGateway(cfg.telemetry?.push_gateway)
     this.configureAlerts(cfg.alerts)
     this.configureCluster(cfg.cluster)
     this.configureProxy(cfg.auth_proxy, cfg.oidc)
@@ -338,8 +650,15 @@ export class Ops {
       clearInterval(this.discoverTimer)
       this.discoverTimer = -1
     }
+    const old = this.discoverer
+    if (old !== undefined) old.close()
     this.discoverer = undefined
     this.discovered = []
+    if (this.lockTimer >= 0) {
+      clearInterval(this.lockTimer)
+      this.lockTimer = -1
+    }
+    this.lock = undefined
     if (cc === undefined || !cc.enabled) {
       this.clusterCfg = undefined
       return
@@ -351,14 +670,33 @@ export class Ops {
     this.clusterTimer = setInterval(() => {
       this.syncCluster()
     }, Math.max(100, syncInterval(cc)))
+    // broker mode has no discovery: the broker is the rendezvous point
+    if (cluster.isBroker(cc) && cc.broker === undefined) console.error(`raiju: cluster: type "broker" needs cluster.broker.address; no cluster traffic until it is set`)
     const dc = cc.discovery
-    if (dc !== undefined && dc.enabled === true) {
+    if (!cluster.isBroker(cc) && dc !== undefined && dc.enabled === true) {
       this.discoverer = new Discoverer(dc, this.nodeId, getEnv)
       this.discoverTimer = setInterval(() => {
         this.discover()
       }, DISCOVER_MS)
       this.discover()
     }
+    const ll = cc.leader_lock
+    if (ll !== undefined) {
+      // the holder names this process, so the key shows which worker of which node leads
+      const le = new LockElection(ll, `${this.nodeId}/${process.pid}`)
+      this.lock = le
+      this.lockTimer = setInterval(() => {
+        this.electLock()
+      }, le.roundMs())
+      this.electLock()
+    }
+  }
+
+  // One leader-lock round. Leadership is read from the lock by isLeader(), so a failed round only ends it when the lease runs out.
+  async electLock(): Promise<void> {
+    const le = this.lock
+    if (le === undefined) return
+    await le.tick()
   }
 
   // One discovery round. The peers it finds are synced with from then on; on failure the last good list stays.
@@ -389,12 +727,14 @@ export class Ops {
     return out
   }
 
-  // Whether this node leads the cluster: the lowest live node id (Bifrost's rule). Without clustering it always does.
-  // Worker processes of one node share the node's answer, so the leader's workers all run leader-only tasks.
+  // Whether this node leads the cluster. Without clustering it always does. With leader_lock it holds the etcd
+  // lock. Otherwise the lowest live node id leads (Bifrost's rule), and the workers of that node share the answer.
   isLeader(): bool {
     const c = this.counters
     const cc = this.clusterCfg
     if (c === undefined || cc === undefined) return true
+    const lk = this.lock
+    if (lk !== undefined) return lk.leading(Date.now())
     const me = cluster.nodeOf(this.nodeId)
     const ids: string[] = [me]
     for (const p of c.peers(Date.now() - cluster.LEADER_WINDOW_MS)) ids.push(cluster.nodeOf(p.id))
@@ -452,6 +792,9 @@ export class Ops {
     if (sem !== undefined && this.engine.vstore === undefined) sem.share(this.shareDir + "/semantic")
     const ls = this.engine.logStore
     if (ls !== undefined) ls.shared = true
+    // live sessions (who opened each one) and the UI socket's store updates
+    this.liveSessions.share(this.shareDir + "/live")
+    this.ui.setShare(this.shareDir + "/ui")
     try {
       mkdirSync(this.shareDir + "/metrics", { recursive: true })
     } catch (e) {
@@ -526,8 +869,43 @@ export class Ops {
     const h: Map<string, string> = new Map()
     h.set("content-type", "application/json")
     h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
-    for (const p of this.peerUrls(cc)) this.pushTo(p + "/api/cluster/sync", h, body, c, cc.secret)
+    if (cluster.isBroker(cc)) {
+      // one outbound exchange with the broker, which relays to the other nodes
+      const b = cc.broker
+      if (b !== undefined) this.syncBroker(c, b, h, body)
+    } else {
+      for (const p of this.peerUrls(cc)) this.pushTo(p + "/api/cluster/sync", h, body, c, cc.secret)
+    }
     c.forget(Date.now() - 30.0 * syncInterval(cc))
+  }
+
+  // Broker mode: the broker answers with the joined state of all nodes and the roster, so this node learns
+  // the usage of nodes it has no link to, and which nodes are alive for leadership.
+  async syncBroker(c: Counters, b: BrokerConfig, h: Map<string, string>, body: string): Promise<void> {
+    const r = await postText(brokerUrl(b) + BROKER_ROUTE, h, body)
+    if (r.status !== 200) {
+      const why = r.status === 0 ? r.body : `HTTP ${r.status}`
+      if (why !== this.brokerErr) console.error(`raiju: cluster broker: ${why}`)
+      this.brokerErr = why
+      return
+    }
+    if (this.brokerErr !== "") console.error("raiju: cluster broker: connected again")
+    this.brokerErr = ""
+    try {
+      c.relay(r.body, Date.now())
+      this.applyRemote(c)
+    } catch (e) {
+      console.error(`raiju: cluster broker: bad answer: ${e.message}`)
+    }
+  }
+
+  // GET /api/cluster/leader: whether this node leads, and by which election. Signed like the sync route, over an empty body.
+  clusterLeader(req: Request): Response {
+    const cc = this.clusterCfg
+    if (cc === undefined) return json(404, errorJson("clustering is off", "invalid_request_error", undefined))
+    if (!cluster.verify(cc.secret, "", req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    const election = this.lock !== undefined ? "lock" : "rank"
+    return json(200, JSON.stringify({ node: this.nodeId, leader: this.isLeader(), election: election }))
   }
 
   async pushTo(url: string, h: Map<string, string>, body: string, c: Counters, secret: string): Promise<void> {
@@ -574,7 +952,7 @@ export class Ops {
       this.otelTimer = -1
     }
     if (oc === undefined || key === "") return
-    const s: OtelMetricsSettings = { metrics_enabled: true, metrics_endpoint: oc.metrics_endpoint, metrics_headers: oc.metrics_headers, metrics_push_interval: oc.metrics_push_interval, headers: oc.headers, traces_endpoint: oc.endpoint }
+    const s: OtelMetricsSettings = { metrics_enabled: true, metrics_endpoint: oc.metrics_endpoint, metrics_headers: oc.metrics_headers, metrics_push_interval: oc.metrics_push_interval, headers: oc.headers, traces_endpoint: oc.endpoint, overhead_breakdown_enabled: oc.overhead_breakdown_enabled }
     const problem = validateMetricsSettings(s)
     if (problem !== undefined) {
       console.error(`raiju: otel metrics: ${problem}`)
@@ -592,6 +970,37 @@ export class Ops {
       }
       this.pushOtel(r.url, r.headers, r.body, tls)
     }, pushIntervalSeconds(s) * 1000)
+  }
+
+  // ---- Prometheus Push Gateway (Bifrost's telemetry push_gateway) ----
+
+  pushTimer: int = -1
+  pushKey = ""
+
+  configurePushGateway(pc: PushGatewayConfig | undefined): void {
+    const key = pc === undefined || pc.enabled !== true ? "" : JSON.stringify(pc)
+    if (key === this.pushKey) return
+    this.pushKey = key
+    if (this.pushTimer >= 0) {
+      clearInterval(this.pushTimer)
+      this.pushTimer = -1
+    }
+    if (pc === undefined || key === "") return
+    const problem = pushProblem(pc)
+    if (problem !== undefined) {
+      console.error(`raiju: push gateway: ${problem}`)
+      return
+    }
+    const url = pushUrl(pc)
+    const h = pushHeaders(pc)
+    this.pushTimer = setInterval(() => {
+      this.pushMetrics(url, h)
+    }, pushInterval(pc) * 1000)
+  }
+
+  async pushMetrics(url: string, h: Map<string, string>): Promise<void> {
+    const r = await putText(url, h, this.metricsText())
+    if (r.status < 200 || r.status >= 300) console.error(`raiju: push gateway: HTTP ${r.status} from ${url}`)
   }
 
   async pushOtel(url: string, h: Map<string, string>, body: string, tls: TlsOpts | undefined): Promise<void> {
@@ -778,11 +1187,14 @@ export class Ops {
   }
 
   // /api/circuit-breaker/policies (GET, POST) and /api/circuit-breaker/policies/{name} (PUT, DELETE).
+  // Writes go to the config (circuit_breaker_policies) and are saved, so they survive a restart and
+  // reach every worker through onChange; the live breakers are updated at once as well.
   circuitPoliciesRoute(method: string, path: string, body: string): Reply {
     const h = this.engine.health
     const rest = path.slice("/api/circuit-breaker/policies".byteLength)
     const one = rest.startsWith("/") ? rest.slice(1) : ""
     if (rest !== "" && one === "") return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
+    const cur: CircuitPolicyConfig[] = this.store.cfg.circuit_breaker_policies ?? []
     if (one === "") {
       if (method === "GET") {
         const rows: string[] = []
@@ -792,20 +1204,44 @@ export class Ops {
       if (method !== "POST") return { status: 405, body: errorJson("use GET or POST", "invalid_request_error", undefined), contentType: "application/json" }
       const pr = parsePolicy(body, "")
       if (!pr.ok) return badRequest(pr.err)
-      if (!h.policyAdd(pr.p)) return { status: 409, body: errorJson(`a policy named ${pr.p.name} already exists`, "invalid_request_error", undefined), contentType: "application/json" }
+      if (h.policyFind(pr.p.name) !== undefined) return { status: 409, body: errorJson(`a policy named ${pr.p.name} already exists`, "invalid_request_error", undefined), contentType: "application/json" }
+      const saved = this.savePolicies(cur.concat([policyConfigOf(pr.p)]))
+      if (saved !== undefined) return saved
+      h.policyAdd(pr.p)
       return { status: 201, body: policyView(pr.p), contentType: "application/json" }
     }
     if (method === "PUT") {
       const pr = parsePolicy(body, one)
       if (!pr.ok) return badRequest(pr.err)
-      if (!h.policyReplace(one, pr.p)) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      const at = policyAt(cur, one)
+      if (at < 0) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      const next: CircuitPolicyConfig[] = []
+      for (let i = 0; i < cur.length; i++) next.push(i === at ? policyConfigOf(pr.p) : cur[i]!)
+      const saved = this.savePolicies(next)
+      if (saved !== undefined) return saved
+      h.policyReplace(one, pr.p)
       return okJson(policyView(pr.p))
     }
     if (method === "DELETE") {
-      if (!h.policyDelete(one)) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      const at = policyAt(cur, one)
+      if (at < 0) return { status: 404, body: errorJson(`no policy named ${one}`, "not_found_error", undefined), contentType: "application/json" }
+      const next: CircuitPolicyConfig[] = []
+      for (const c of cur) {
+        if (c.name !== one) next.push(c)
+      }
+      const saved = this.savePolicies(next)
+      if (saved !== undefined) return saved
+      h.policyDelete(one)
       return okJson(JSON.stringify({ message: `policy ${one} deleted` }))
     }
     return { status: 405, body: errorJson("use PUT or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+  }
+
+  // Saves the policy list to the config. A reply to send back when the save fails.
+  private savePolicies(list: CircuitPolicyConfig[]): Reply | undefined {
+    const r = this.store.setCircuitPolicies(list)
+    if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "api_error", undefined), contentType: "application/json" }
+    return undefined
   }
 
   // ---- /api/session/*: login, logout and the auth state ----
@@ -818,11 +1254,44 @@ export class Ops {
     const auth = req.headers.get("authorization") ?? ""
     const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : ""
     const now = Date.now()
+    // a short-lived, single-use ticket for the /ws socket, which cannot send an Authorization header
+    if (path === "/api/session/ws-ticket") {
+      if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
+      // the socket reads the logs, so the ticket needs the read permission on them (a GET for the gate)
+      const hs: Record<string, string> = snapshot(req.headers)
+      const g = this.gate(new Request(req.url, { method: "GET", headers: hs }), "/api/logs")
+      if (g.kind === "deny") return g.res
+      try {
+        return json(200, JSON.stringify({ ticket: try this.wsTickets.issue(g.actor, now) }))
+      } catch (e) {
+        return json(500, errorJson("failed to issue WebSocket ticket", "api_error", undefined))
+      }
+    }
+    // POST /api/session/setup: while no admin exists, the operator's setup token (X-Bifrost-Setup-Token) is
+    // traded for a setup session cookie, which stands in for the token on POST /api/users (see users). Once an
+    // admin exists the setup lock is not active and the answer is 409, as Bifrost's.
+    if (path === "/api/session/setup") {
+      if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
+      if (this.authOn) return json(409, errorJson("the setup lock is not active", "invalid_request_error", undefined))
+      const token = resolveEnv(this.store.cfg.setup_token ?? "")
+      const given = req.headers.get("x-bifrost-setup-token") ?? ""
+      if (token === "" || given !== token) return json(403, errorJson("invalid setup token", "invalid_request_error", undefined))
+      try {
+        const s = try issueSetupSession(token, now)
+        const secure = req.url.startsWith("https:") || (req.headers.get("x-forwarded-proto") ?? "") === "https"
+        const hs: Record<string, string> = new Map()
+        hs.set("content-type", "application/json")
+        hs.set("set-cookie", setupCookie(s.value, secure))
+        return new Response(JSON.stringify({ expires_at: isoMs(s.expires) }), { status: 200, headers: hs })
+      } catch (e) {
+        return json(500, errorJson("failed to start setup session", "api_error", undefined))
+      }
+    }
     if (path === "/api/session/is-auth-enabled") {
       if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
       const valid = bearer !== "" && this.sessions.get(bearer, now) !== undefined
       const enforced = this.store.cfg.client?.enforce_auth_on_inference ?? false
-      return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: false, setup_token_configured: false }))
+      return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: !this.authOn, setup_token_configured: resolveEnv(this.store.cfg.setup_token ?? "") !== "" }))
     }
     if (path === "/api/session/login") {
       if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
@@ -909,6 +1378,74 @@ export class Ops {
     return { status: 200, body: `{"circuits":{${parts.join(",")}}}`, contentType: "application/json" }
   }
 
+  // GET /api/adaptive-routing/held-keys: the keys (provider#key targets) held out of rotation by an open
+  // circuit, with when each was held and when it next gets a check. Raiju holds a key for its breaker's
+  // cooldown; it does not classify the provider's refusal, so there is no reason or wait ladder.
+  adaptiveHeldKeys(): Reply {
+    const rows: string[] = []
+    for (const c of this.engine.health.openCircuits(Date.now())) {
+      if (c.id.indexOf("#") < 0) continue
+      rows.push(JSON.stringify({ target: c.id, state: c.state, held_since: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    }
+    return { status: 200, body: `{"held_keys":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
+  }
+
+  // GET /api/adaptive-routing/incidents: the circuits open now (keys, policies, and a policy's key
+  // sub-circuits), each with when it opened. Resolved incidents are not kept.
+  adaptiveIncidents(): Reply {
+    const rows: string[] = []
+    for (const c of this.engine.health.openCircuits(Date.now())) {
+      const kind = c.id.indexOf("#") >= 0 ? "key" : c.id.indexOf("/") >= 0 ? "policy_key" : "policy"
+      const status = c.state === "half_open" ? "Recovering" : "Needs attention"
+      rows.push(JSON.stringify({ target: c.id, kind: kind, status: status, opened_at: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    }
+    return { status: 200, body: `{"incidents":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
+  }
+
+  // POST /api/adaptive-routing/conditions/clear: releases the held keys named by {"keys": [...]} (target
+  // ids as the held-keys view lists them), or every circuit with no body or {"all": true}. count is how
+  // many circuits were closed.
+  adaptiveRelease(body: string): Reply {
+    const h = this.engine.health
+    let all = body.trim() === ""
+    let ids: string[] = []
+    if (!all) {
+      try {
+        const req = JSON.parse(body) as { keys?: string[], all?: bool }
+        if (req.all === true) all = true
+        ids = req.keys ?? []
+      } catch (e) {
+        return badRequest("the body must be a JSON object")
+      }
+    }
+    if (all) return okJson(JSON.stringify({ message: "held keys released", count: h.resetAll() }))
+    // only circuits that are open now count as released
+    const open: string[] = []
+    for (const c of h.openCircuits(Date.now())) open.push(c.id)
+    let n = 0
+    for (const id of ids) {
+      if (open.includes(id) && h.reset(id)) n += 1
+    }
+    return okJson(JSON.stringify({ message: "held keys released", count: n }))
+  }
+
+  // POST /api/circuit-breaker/reset: closes one circuit now, by its id (a target id as the state
+  // view lists it, or a policy name), or every circuit with {"all": true}. The cooldown is dropped.
+  circuitReset(body: string): Reply {
+    let fs: Field[] = []
+    try {
+      fs = try fields(body)
+    } catch (e) {
+      return badRequest("the body must be a JSON object")
+    }
+    const h = this.engine.health
+    if (rawBool(fs, "all") === true) return okJson(JSON.stringify({ message: "all circuits reset", circuits: h.resetAll() }))
+    const id = rawStr(fs, "id") ?? ""
+    if (id === "") return badRequest("reset needs an id (a target id or a policy name), or all: true")
+    if (!h.reset(id)) return { status: 404, body: errorJson(`no circuit named ${id}`, "not_found_error", undefined), contentType: "application/json" }
+    return okJson(JSON.stringify({ message: `circuit ${id} reset` }))
+  }
+
   // GET /api/logs/histogram: request counts per time bucket, in Bifrost's shape. start_time and
   // end_time are epoch milliseconds (the log store's own clock); the default is the last 24 hours.
   // Buckets with no requests are included. success is 2xx, cancelled is 499, error is the rest.
@@ -918,27 +1455,41 @@ export class Ops {
 
   // The request-log analytics (Bifrost's /api/logs/histogram*, rankings, dashboard, filterdata,
   // dropped) and the MCP logs (/api/mcp-logs*). Every reply is JSON. Dimensions Raiju does not record
-  // (team, customer, user, business unit, project, app, user agent) are refused with a 400.
-  logsRoute(req: Request, path: string, body: string): Reply {
+  // (user, app, user agent) are refused with a 400.
+  logsRoute(req: Request, path: string, body: string, scope?: DataScope): Reply {
     const m = req.method
     const store = this.engine.logStore
-    if (path.startsWith("/api/mcp-logs")) return this.mcpLogsRoute(req, path, body, store)
-    if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
-    if (m !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    const sc: DataScope = scope ?? allScope()
+    if (path.startsWith("/api/mcp-logs")) return this.mcpLogsRoute(req, path, body, store, sc)
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
     const now = Date.now()
+    // the User-Agent mappings are configuration: they work whether or not the request log is on
+    if (path === "/api/logs/user-agent-mappings" || path.startsWith("/api/logs/user-agent-mappings/")) return this.userAgentRoute(m, path, body)
+    if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
+    if (path === "/api/logs" && m === "DELETE") return this.deleteLogs(body, store, sc)
+    if (path === "/api/logs/recalculate-cost" && m === "POST") return this.recalculateCost(body, store, sc)
+    if (path === "/api/logs/recalculate-cost/status" && m === "GET") return this.recalcStatus(sp)
+    if (path === "/api/logs/recalculate-cost/cancel" && m === "POST") return this.cancelRecalc(sp)
+    if (m !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    if (path === "/api/logs") return this.logList(sp, store, sc)
+    if (path === "/api/logs/stats") return this.logStats(sp, store, sc)
+    const sub = path.slice("/api/logs/".byteLength)
+    if (sub.startsWith("sessions/")) return this.sessionLogs(sub.slice("sessions/".byteLength), sp, store, sc)
     if (path === "/api/logs/dropped") return okJson(`{"dropped_requests":${store.dropped}}`)
-    if (path === "/api/logs/filterdata") return okJson(this.logFilterData(store))
+    if (path === "/api/logs/filterdata") return okJson(this.logFilterData(store, sc))
+    // GET /api/logs/{id}: one log (the names of the other /api/logs routes are not ids)
+    const seg = path.slice("/api/logs/".byteLength)
+    if (seg !== "" && !seg.includes("/") && !LOG_ROUTE_NAMES.includes(seg)) return this.logById(seg, store, sc)
     const end = epochParam(sp.get("end_time") ?? undefined, now)
     const start = this.windowStart(sp, end)
     if (start >= end) return badRequest("start_time must be before end_time")
     const g = gridOf(start, end)
     if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
-    const es = selectAll(store.viewSince(start - 1.0), filterFrom(sp, "llm", start, end))
+    const es = selectAll(scopedView(store, sc, start - 1.0), filterFrom(sp, "llm", start, end))
     // the same span just before the window, for the rankings' trends
     const pf = filterFrom(sp, "llm", start - (end - start), start)
-    const prev = selectAll(store.viewSince(pf.since - 1.0), pf)
+    const prev = selectAll(scopedView(store, sc, pf.since - 1.0), pf)
     const dim = sp.get("dimension") ?? ""
     const ranked = this.rankLimit(sp)
     if (ranked < 0) return badRequest("Invalid limit. Expected a positive integer, or all=true for no limit")
@@ -959,13 +1510,259 @@ export class Ops {
       return okJson(dimensionView(es, g, what, dim))
     }
     if (path === "/api/logs/rankings") return okJson(modelRankingsView(es, prev, ranked))
+    if (path === "/api/logs/rankings/users") return okJson(dimensionRankingsView(es, prev, "user", ranked))
     if (path === "/api/logs/rankings/by-dimension") {
       const bad = this.dimensionError(dim)
       if (bad !== "") return badRequest(bad)
       return okJson(dimensionRankingsView(es, prev, dim, ranked))
     }
-    if (path === "/api/logs/dashboard") return okJson(this.dashboard(store, sp, es, prev, g, start, end, now))
+    if (path === "/api/logs/dashboard") return okJson(this.dashboard(store, sp, es, prev, g, start, end, now, sc))
     return { status: 404, body: errorJson(`no route ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
+  }
+
+  // GET /api/logs: the logs a filter selects, newest first unless sort_by and order say otherwise
+  // (Bifrost's getLogs). Raiju's entries and total ride along with Bifrost's logs, pagination and stats.
+  private logList(sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
+    const bad = unsupportedFilter(sp)
+    if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
+    const pg = pageOfQuery(sp, 50, 1000)
+    if (pg.error !== "") return badRequest(pg.error)
+    const f = listFilter(sp, Date.now())
+    const es = applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)
+    return okJson(listJson(es, pg.page, scopedView(store, sc, 0.0).length > 0))
+  }
+
+  // GET /api/logs/stats: the totals of the logs a filter selects (Bifrost's SearchStats).
+  private logStats(sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
+    const bad = unsupportedFilter(sp)
+    if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
+    const f = listFilter(sp, Date.now())
+    return okJson(statsView(applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)))
+  }
+
+  // GET /api/logs/{id}: one log, with its bodies and raw payloads when the store kept them.
+  private logById(id: string, store: LogStore, sc: DataScope): Reply {
+    for (const e of scopedView(store, sc, 0.0)) {
+      if (e.id === id && kindOf(e) === "llm") return okJson(detailJson(e))
+    }
+    return { status: 404, body: errorJson("log not found", "not_found_error", undefined), contentType: "application/json" }
+  }
+
+  // GET /api/logs/sessions/{id} (its logs, oldest first) and /api/logs/sessions/{id}/summary.
+  // rest is the path after "sessions/": the session id, or the id and "/summary".
+  private sessionLogs(rest: string, sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
+    const summary = rest.endsWith("/summary")
+    const raw = summary ? rest.slice(0, rest.byteLength - "/summary".byteLength) : rest
+    const sid = pctDecode(raw) ?? ""
+    if (sid === "" || sid.includes("/")) return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
+    const es = scopedView(store, sc, 0.0)
+    if (summary) return okJson(sessionSummaryJson(es, sid))
+    const pg = pageOfQuery(sp, 500, 500)
+    if (pg.error !== "") return badRequest(pg.error)
+    const page: Page = pg.page
+    if ((sp.get("order") ?? "") === "") page.order = "asc"
+    return okJson(sessionJson(es, sid, page))
+  }
+
+  // DELETE /api/logs with {"ids": [...]}: removes the LLM logs among them (Bifrost's deleteLogs). Deleting
+  // is for all-data roles, as deleting MCP logs is.
+  private deleteLogs(body: string, store: LogStore, sc: DataScope): Reply {
+    if (!sc.all) return { status: 403, body: errorJson("the data access scope of this role does not allow deleting logs", "permission_error", undefined), contentType: "application/json" }
+    let ids: string[] = []
+    try {
+      ids = (JSON.parse(body) as { ids?: string[] }).ids ?? []
+    } catch (e) {
+      return badRequest("Invalid JSON")
+    }
+    if (ids.length === 0) return badRequest("No log IDs provided")
+    const doomed: string[] = []
+    for (const e of scopedView(store, sc, 0.0)) {
+      if (kindOf(e) === "llm" && ids.includes(e.id)) doomed.push(e.id)
+    }
+    const removed = store.delete(doomed)
+    return okJson(JSON.stringify({ message: "Logs deleted successfully", removed: removed }))
+  }
+
+  // POST /api/logs/recalculate-cost: starts a background job that prices again the LLM logs the body's
+  // filters select, at the current prices (Bifrost's enqueue). 202 with the job; 409 with the job when one is
+  // already in flight, so the caller polls that one.
+  private recalculateCost(body: string, store: LogStore, sc: DataScope): Reply {
+    let rb: { filters?: RecalcFilters } = {}
+    if (body.trim() !== "") {
+      try {
+        rb = JSON.parse(body) as { filters?: RecalcFilters }
+      } catch (e) {
+        return badRequest("Invalid JSON")
+      }
+    }
+    const cur = this.recalc
+    if (cur !== undefined && cur.inFlight()) return { status: 409, body: recalcJson(cur.snapshot()), contentType: "application/json" }
+    const f = listFilter(recalcQuery(rb.filters), Date.now())
+    const pricing = this.engine.pricing
+    const job = new CostRecalc(
+      (e) => pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens),
+      (costs) => store.recost((e) => costs.get(e.id))
+    )
+    job.begin(selectAll(scopedView(store, sc, f.since - 1.0), f), Date.now())
+    this.recalc = job
+    job.start()
+    return { status: 202, body: recalcJson(job.snapshot()), contentType: "application/json" }
+  }
+
+  // GET /api/logs/recalculate-cost/status: the job with ?id=, else the one in flight, else idle (Bifrost's status).
+  private recalcStatus(sp: URLSearchParams): Reply {
+    const job = this.recalc
+    const id = (sp.get("id") ?? "").trim()
+    if (id !== "") {
+      if (job === undefined || job.id() !== id) return { status: 404, body: errorJson("Job not found", "not_found_error", undefined), contentType: "application/json" }
+      return okJson(recalcJson(job.snapshot()))
+    }
+    if (job === undefined || !job.inFlight()) return okJson(JSON.stringify({ status: "idle" }))
+    return okJson(recalcJson(job.snapshot()))
+  }
+
+  // POST /api/logs/recalculate-cost/cancel: stops the job with ?id= (else the one in flight) and answers with its
+  // status. Costs already written stay. A job that finished is answered as it is.
+  private cancelRecalc(sp: URLSearchParams): Reply {
+    const job = this.recalc
+    const id = (sp.get("id") ?? "").trim()
+    if (job === undefined || (id !== "" && job.id() !== id) || (id === "" && !job.inFlight())) {
+      return { status: 404, body: errorJson("No recalculation job to cancel", "not_found_error", undefined), contentType: "application/json" }
+    }
+    return okJson(recalcJson(job.cancel()))
+  }
+
+  // /api/logs/user-agent-mappings: the rules that name the app behind a User-Agent. Saved in the config.
+  private userAgentRoute(method: string, path: string, body: string): Reply {
+    const r = uaRoute(this.store.cfg.user_agent_mappings, method, path, body, isoMs(Date.now()))
+    const next = r.next
+    if (next !== undefined) {
+      const saved = this.store.setUserAgentMappings(next)
+      if (saved.kind !== "ok") return { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
+    }
+    return { status: r.status, body: r.body, contentType: "application/json" }
+  }
+
+  // DELETE /api/cache/clear/{id} and /api/cache/clear-by-key/{key}: drops entries from the exact-match and
+  // the semantic cache (Bifrost's cache handler). removed counts what went.
+  cacheClear(method: string, path: string): Reply {
+    if (method !== "DELETE") return { status: 405, body: errorJson("use DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+    const ex = this.engine.cache
+    const sem = this.engine.semantic
+    if (ex === undefined && sem === undefined) return { status: 400, body: errorJson("semantic_cache plugin is not loaded", "invalid_request_error", undefined), contentType: "application/json" }
+    let removed = 0
+    const rest = path.slice("/api/cache/".byteLength)
+    if (rest.startsWith("clear-by-key/")) {
+      const key = pctDecode(rest.slice("clear-by-key/".byteLength))
+      if (key === undefined) return badRequest("Invalid cache key encoding")
+      if (key === "") return badRequest("Invalid cache key")
+      if (ex !== undefined) removed += ex.clearKey(key)
+      if (sem !== undefined) removed += sem.clearKey(key)
+    } else if (rest.startsWith("clear/")) {
+      const id = rest.slice("clear/".byteLength)
+      if (id === "") return badRequest("Invalid cache ID")
+      if (ex !== undefined) removed += ex.clearId(id)
+      if (sem !== undefined && sem.clearId(id)) removed += 1
+    } else {
+      return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
+    }
+    return okJson(JSON.stringify({ message: "Cache cleared successfully", removed: removed }))
+  }
+
+  // /api/plugins: the configured plugins and their status (GET), one by name, /builtins and /loaded (the plugins
+  // in the live chain). POST adds a plugin to the config, PUT /api/plugins/{name} changes it and DELETE removes
+  // it; each save hands the config to engine.reload, which rebuilds the live chain.
+  pluginsRoute(method: string, path: string, body: string): Reply {
+    if (path === "/api/plugins/builtins" || path === "/api/plugins/loaded") {
+      if (method !== "GET") return pluginError(405, "use GET")
+      if (path === "/api/plugins/builtins") return okJson(JSON.stringify({ plugins: builtinPlugins() }))
+      const names: string[] = []
+      const chain = this.engine.plugins
+      if (chain !== undefined) {
+        for (const p of chain.plugins) names.push(p.name())
+      }
+      return okJson(JSON.stringify({ plugins: names }))
+    }
+    if (path === "/api/plugins") {
+      if (method === "POST") return this.createPlugin(body)
+      if (method !== "GET") return pluginError(405, "use GET or POST")
+      const rows: string[] = []
+      for (const sp of this.store.cfg.plugins ?? []) rows.push(pluginJson(sp))
+      return okJson(jobj([jkv("plugins", jarr(rows)), jkv("count", jn(rows.length))]))
+    }
+    const name = pctDecode(path.slice("/api/plugins/".byteLength)) ?? ""
+    if (name === "" || name.includes("/")) return pluginError(404, "plugin not found")
+    if (method === "PUT") return this.updatePlugin(name, body)
+    if (method === "DELETE") return this.deletePlugin(name)
+    if (method !== "GET") return pluginError(405, "use GET, PUT or DELETE")
+    for (const sp of this.store.cfg.plugins ?? []) {
+      if (sp.name === name) return okJson(pluginJson(sp))
+    }
+    return pluginError(404, "plugin not found")
+  }
+
+  // POST /api/plugins: {name, enabled, config}. 201 with the plugin; 409 when the name is taken; 400 when the name
+  // is missing, the config does not build, or a custom plugin path is given (this gateway has none).
+  private createPlugin(body: string): Reply {
+    let fs: Field[] = []
+    try {
+      fs = fields(body)
+    } catch (e) {
+      return pluginError(400, "Invalid request body")
+    }
+    const name = (rawStr(fs, "name") ?? "").trim()
+    if (name === "") return pluginError(400, "Plugin name is required")
+    if ((rawStr(fs, "path") ?? "") !== "") return pluginError(400, "custom plugin paths are not supported by this gateway")
+    const specs = this.store.cfg.plugins ?? []
+    for (const sp of specs) {
+      if (sp.name === name) return pluginError(409, "Plugin already exists")
+    }
+    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}") }
+    const bad = badPlugin(spec)
+    if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
+    const next: PluginSpec[] = specs.slice()
+    next.push(spec)
+    return this.savePlugins(next, 201, "Plugin created successfully", spec)
+  }
+
+  // PUT /api/plugins/{name}: changes the fields the body names (enabled, config). 404 when there is no such plugin.
+  private updatePlugin(name: string, body: string): Reply {
+    let fs: Field[] = []
+    try {
+      fs = fields(body)
+    } catch (e) {
+      return pluginError(400, "Invalid request body")
+    }
+    const specs = this.store.cfg.plugins ?? []
+    let at = -1
+    for (let i = 0; i < specs.length; i++) {
+      if (specs[i]!.name === name) at = i
+    }
+    if (at < 0) return pluginError(404, "plugin not found")
+    const cur = specs[at]!
+    const en = rawBool(fs, "enabled")
+    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}") }
+    const bad = badPlugin(spec)
+    if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
+    const next: PluginSpec[] = []
+    for (let i = 0; i < specs.length; i++) next.push(i === at ? spec : specs[i]!)
+    return this.savePlugins(next, 200, "Plugin updated successfully", spec)
+  }
+
+  // DELETE /api/plugins/{name}: removes the plugin from the config. 404 when there is no such plugin.
+  private deletePlugin(name: string): Reply {
+    const specs = this.store.cfg.plugins ?? []
+    const next = specs.filter((sp) => sp.name !== name)
+    if (next.length === specs.length) return pluginError(404, "plugin not found")
+    return this.savePlugins(next, 200, "Plugin deleted successfully", undefined)
+  }
+
+  // Saves the plugin list; the reply carries the message and, when there is one, the plugin as listed.
+  private savePlugins(next: PluginSpec[], status: int, message: string, spec: PluginSpec | undefined): Reply {
+    const saved = this.store.setPlugins(next)
+    if (saved.kind !== "ok") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
+    if (spec === undefined) return { status: status, body: JSON.stringify({ message: message }), contentType: "application/json" }
+    return { status: status, body: jobj([jkv("message", JSON.stringify(message)), jkv("plugin", pluginJson(spec))]), contentType: "application/json" }
   }
 
   // The window's start: start_time, or the end less period ("1h", "6h", "24h", "7d", "30d"), or 24 hours.
@@ -998,9 +1795,9 @@ export class Ops {
 
   // GET /api/logs/dashboard: the overview, provider usage, model rankings, dimension rankings and MCP
   // usage for one window, in one call (Bifrost's shape).
-  private dashboard(store: LogStore, sp: URLSearchParams, es: LogEntry[], prev: LogEntry[], g: Grid, start: f64, end: f64, now: f64): string {
+  private dashboard(store: LogStore, sp: URLSearchParams, es: LogEntry[], prev: LogEntry[], g: Grid, start: f64, end: f64, now: f64, sc: DataScope): string {
     const mf = filterFrom(sp, "mcp", start, end)
-    const mcp = selectAll(store.viewSince(start - 1.0), mf)
+    const mcp = selectAll(scopedView(store, sc, start - 1.0), mf)
     const dims: string[] = []
     if (distinctDim(es, "virtual_key").length > 0) dims.push(jkv("virtual_key", dimensionRankingsView(es, prev, "virtual_key", 10)))
     return jobj([
@@ -1015,8 +1812,8 @@ export class Ops {
 
   // GET /api/logs/filterdata: the values the log filters offer, from every entry in memory, and the
   // virtual keys and routing rules of the config.
-  private logFilterData(store: LogStore): string {
-    const all = store.viewSince(0.0)
+  private logFilterData(store: LogStore, sc: DataScope): string {
+    const all = scopedView(store, sc, 0.0)
     const llm: LogEntry[] = []
     const mcp: LogEntry[] = []
     for (const e of all) {
@@ -1024,7 +1821,10 @@ export class Ops {
       else llm.push(e)
     }
     const vks: string[] = []
-    for (const vk of this.store.cfg.governance?.virtual_keys ?? []) vks.push(jobj([jkv("id", JSON.stringify(vk.id)), jkv("name", JSON.stringify(vk.name ?? ""))]))
+    for (const vk of this.store.cfg.governance?.virtual_keys ?? []) {
+      if (!inScope(sc, vk.team_id ?? "", "", vk.customer_id ?? "", "")) continue
+      vks.push(jobj([jkv("id", JSON.stringify(vk.id)), jkv("name", JSON.stringify(vk.name ?? ""))]))
+    }
     const rules: string[] = []
     for (const r of this.store.cfg.governance?.routing_rules ?? []) rules.push(jobj([jkv("id", JSON.stringify(r.id)), jkv("name", JSON.stringify(r.name ?? ""))]))
     return jobj([
@@ -1036,27 +1836,31 @@ export class Ops {
       jkv("routing_engines", "[]"),
       jkv("tool_call_names", jstrs(distinctDim(mcp, "tool"))),
       jkv("projects", "[]"),
+      jkv("user_ids", jstrs(distinctDim(llm, "user"))),
+      jkv("apps", jstrs(distinctDim(llm, "app"))),
+      jkv("user_agents", jstrs(distinctDim(llm, "user_agent"))),
     ])
   }
 
   // The MCP logs: GET lists, a single entry by id, and the stats, filter menus, histograms and top
   // tools; DELETE removes entries by id.
-  private mcpLogsRoute(req: Request, path: string, body: string, store: LogStore | undefined): Reply {
+  private mcpLogsRoute(req: Request, path: string, body: string, store: LogStore | undefined, sc: DataScope): Reply {
     if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
     const now = Date.now()
-    if (path === "/api/mcp-logs" && req.method === "DELETE") return this.deleteMcpLogs(store, body)
+    // deleting log entries is for all-data roles
+    if (path === "/api/mcp-logs" && req.method === "DELETE") return sc.all ? this.deleteMcpLogs(store, body) : { status: 403, body: errorJson("the data access scope of this role does not allow deleting logs", "permission_error", undefined), contentType: "application/json" }
     if (req.method !== "GET") return { status: 405, body: errorJson("use GET or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
     if (path === "/api/mcp-logs") {
       const f = filterFrom(sp, "mcp", epochParam(sp.get("start_time") ?? undefined, 0.0), epochParam(sp.get("end_time") ?? undefined, now + 1.0))
-      const es = selectAll(store.viewSince(f.since - 1.0), f)
+      const es = selectAll(scopedView(store, sc, f.since - 1.0), f)
       const limit = Math.min(1000, Math.max(1, parseInt(sp.get("limit") ?? "25") ?? 25))
       const offset = Math.max(0, parseInt(sp.get("offset") ?? "0") ?? 0)
       const rows: string[] = []
       for (let i = es.length - 1 - offset; i >= 0 && rows.length < limit; i--) rows.push(mcpLogJson(es[i]!))
       let hasLogs = false
-      for (const e of store.viewSince(0.0)) {
+      for (const e of scopedView(store, sc, 0.0)) {
         if (kindOf(e) === "mcp") hasLogs = true
       }
       const pg = jobj([jkv("limit", jn(limit)), jkv("offset", jn(offset)), jkv("sort_by", JSON.stringify("timestamp")), jkv("order", JSON.stringify("desc")), jkv("total_count", jn(es.length))])
@@ -1064,7 +1868,7 @@ export class Ops {
     }
     if (path === "/api/mcp-logs/filterdata") {
       const mcp: LogEntry[] = []
-      for (const e of store.viewSince(0.0)) {
+      for (const e of scopedView(store, sc, 0.0)) {
         if (kindOf(e) === "mcp") mcp.push(e)
       }
       return okJson(jobj([jkv("tool_names", jstrs(distinctDim(mcp, "tool"))), jkv("server_labels", jstrs(distinctDim(mcp, "server"))), jkv("virtual_keys", "[]")]))
@@ -1075,7 +1879,7 @@ export class Ops {
       if (start >= end) return badRequest("start_time must be before end_time")
       const g = gridOf(start, end)
       if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
-      const es = selectAll(store.viewSince(start - 1.0), filterFrom(sp, "mcp", start, end))
+      const es = selectAll(scopedView(store, sc, start - 1.0), filterFrom(sp, "mcp", start, end))
       if (path === "/api/mcp-logs/stats") return okJson(mcpStatsView(es))
       if (path === "/api/mcp-logs/histogram") return okJson(requestsView(es, g))
       if (path === "/api/mcp-logs/histogram/cost") return okJson(mcpCostView(es, g))
@@ -1084,7 +1888,7 @@ export class Ops {
     }
     const id = path.slice("/api/mcp-logs/".byteLength)
     if (id !== "" && !id.includes("/")) {
-      for (const e of store.viewSince(0.0)) {
+      for (const e of scopedView(store, sc, 0.0)) {
         if (e.id === id && kindOf(e) === "mcp") return okJson(mcpLogJson(e))
       }
       return { status: 404, body: errorJson("MCP log not found", "not_found_error", undefined), contentType: "application/json" }
@@ -1415,6 +2219,10 @@ export class Ops {
   }
 
   tick(eng: AlertEngine): void {
+    // a budget that is used up is noticed once an hour until it resets (notify.tov)
+    for (const b of this.engine.gov.budgetUsage()) {
+      if (b.limit > 0 && b.used >= b.limit) notifyOnce("budget:" + b.id, 3600000, { severity: "warning", title: "Budget used up", message: `Budget ${b.id} is used up until it resets.` })
+    }
     const ring = this.engine.samples
     if (ring === undefined) return
     const now = Date.now()
@@ -1428,6 +2236,7 @@ export class Ops {
     for (const n of notes) {
       const r = alerts.request(n)
       sendAlert(r.url, r.headers, r.body, n.ruleId)
+      notify({ severity: n.kind === "firing" ? "warning" : "success", title: `Alert ${n.ruleId} ${n.kind}`, message: `Alert rule ${n.ruleId} is ${n.kind}.` })
     }
     const ce = this.cel
     if (ce !== undefined) {
@@ -1439,27 +2248,71 @@ export class Ops {
       for (const n of ce.evaluate(scopes, now)) {
         const r = alerts.request(n)
         sendAlert(r.url, r.headers, r.body, n.ruleId)
+        notify({ severity: n.kind === "firing" ? "warning" : "success", title: `Alert ${n.ruleId} ${n.kind}`, message: `Alert rule ${n.ruleId} is ${n.kind}.` })
       }
     }
   }
 
+  // The data scope of the actor a gate named. A stored user's custom role decides it; anyone else (the
+  // legacy admin, and sign-in and proxy identities, which hold built-in roles) sees all data.
+  scopeOfActor(actor: string): DataScope {
+    return this.scopeOfActorFor(actor, "")
+  }
+
+  // The same for one resource: the role's entity_dac entry for it (Bifrost's per-resource override) wins
+  // over the role's dac.
+  scopeOfActorFor(actor: string, resource: string): DataScope {
+    const name = actor.startsWith("proxy:") ? actor.slice(6) : actor
+    const gov = this.store.cfg.governance
+    for (const u of gov?.users ?? []) {
+      if (u.name !== name) continue
+      const r = customRole(gov?.roles, u.role)
+      if (r === undefined) return allScope()
+      let dac = r.dac ?? "all-data"
+      for (const e of r.entity_dac ?? []) {
+        if (e.resource === resource) dac = e.dac
+      }
+      return scopeOf(gov ?? {}, u, dac)
+    }
+    return allScope()
+  }
+
+  // check() with the data scope of the caller, for the routes that read scoped data.
+  checkScope(req: Request, path: string): { res: Response | undefined, scope: DataScope } {
+    const g = this.gate(req, path)
+    if (g.kind === "deny") return { res: g.res, scope: noScope() }
+    return { res: undefined, scope: this.scopeOfActor(g.actor) }
+  }
+
+  // The /ws event for a management write that succeeded: the resource it changed, as Bifrost's
+  // store_update tags (the first path segment under /api).
+  storeUpdated(path: string): void {
+    const seg = path.split("/")[2] ?? ""
+    this.ui.send(JSON.stringify({ type: "store_update", tags: [seg] }))
+  }
+
   // Whether the caller may use this /api route; the actor names them in the audit log.
   gate(req: Request, path: string): Gate {
+    // client.whitelisted_routes: these exact paths skip authentication (Bifrost)
+    if ((this.store.cfg.client?.whitelisted_routes ?? []).includes(path)) return { kind: "ok", actor: "anonymous" }
     const pg = this.proxyGate(req, path)
     if (pg !== undefined) return pg
     const auth = req.headers.get("authorization") ?? ""
     if (auth.startsWith("Bearer sk-sess-")) {
       const s = this.sessions.get(auth.slice(7), Date.now())
-      const role = s === undefined ? undefined : roleOf(s.role)
+      // a single sign-on session holds a built-in role
+      const role = s === undefined ? undefined : (isBuiltinRole(s.role) ? s.role : undefined)
       if (s === undefined || role === undefined) return { kind: "deny", res: denied(401, "the session expired; sign in again") }
       const perm = required(req.method, path)
-      if (!allowed(role, perm, path)) {
+      if (!roleAllows(this.store.cfg.governance?.roles, role, req.method, path)) {
         this.recordChange("sso:" + s.sub, req, path, 403, "")
         return { kind: "deny", res: denied(403, `role ${role} may not ${perm} this route`) }
       }
       return { kind: "ok", actor: "sso:" + s.sub }
     }
     if (!this.authOn) return { kind: "ok", actor: "anonymous" }
+    // a temp token (client.mcp_enable_temp_token_auth) opens the per-user consent flow it was minted for
+    if (this.store.cfg.client?.mcp_enable_temp_token_auth === true && tempTokenAllows(req.headers.get("x-bifrost-temp-token") ?? "", req.method, path, Date.now())) return { kind: "ok", actor: "temp-token" }
     const v = authorize(this.rbac, snapshot(req.headers), req.method, path)
     if (v.kind === "ok") return { kind: "ok", actor: v.actor }
     this.recordChange("unauthenticated", req, path, v.status, "")
@@ -1519,7 +2372,7 @@ export class Ops {
         this.recordChange("proxy:" + c.identity, req, path, 403, "")
         return { kind: "deny", res: denied(403, "no role maps from the proxy token") }
       }
-      role = roleOf(mapped)
+      role = isBuiltinRole(mapped) ? mapped : undefined
     } else {
       // login only: the identity must already be an enabled user, and its role governs
       const u = provisioned(this.rbac, c.identity)
@@ -1531,7 +2384,7 @@ export class Ops {
     }
     if (role === undefined) return { kind: "deny", res: denied(403, "the mapped role is not known") }
     const perm = required(req.method, path)
-    if (!allowed(role, perm, path)) {
+    if (!roleAllows(this.store.cfg.governance?.roles, role, req.method, path)) {
       this.recordChange("proxy:" + c.identity, req, path, 403, "")
       return { kind: "deny", res: denied(403, `role ${role} may not ${perm} this route`) }
     }
@@ -1553,17 +2406,198 @@ export class Ops {
     const ip = req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip") ?? undefined
     const detail = maskDetail(body)
     try {
-      log.record(actor, a.action, a.target, m, path, status, ip, detail === "" ? undefined : detail, Date.now())
+      // omit_ip_addresses: the event keeps no client address
+      const kept = this.store.cfg.audit?.omit_ip_addresses === true ? undefined : ip
+      log.record(actor, a.action, a.target, m, path, status, kept, detail === "" ? undefined : detail, Date.now())
     } catch (e) {
       console.error(`raiju: audit write failed: ${e.message}`)
     }
   }
 
   // /api/users*: the reply, after saving any change through the config store.
-  users(method: string, path: string, body: string): Reply {
+  // GET /api/governance/virtual-keys/quota: the calling key's own budgets, rate limits and provider
+  // configs with their usage. Self-service, as Bifrost's: the key in the request is the credential, and
+  // an expired key is refused. model_configs is not reported (Raiju lists them under governance).
+  vkQuota(req: Request): Reply {
+    const vk = this.engine.gov.findKey(snapshot(req.headers))
+    if (vk === undefined) return { status: 401, body: errorJson("a valid virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", undefined), contentType: "application/json" }
+    if (this.engine.gov.expired(vk)) return { status: 403, body: errorJson("Virtual key has expired", "permission_error", undefined), contentType: "application/json" }
+    const g = this.store.cfg.governance
+    const now = Date.now()
+    const usage = this.engine.gov.budgetUsage()
+    const limits = this.engine.gov.rateLimitUsage(now)
+    const ids = keyBudgetIds(vk)
+    const budgets: QuotaBudget[] = []
+    for (const b of g?.budgets ?? []) {
+      if (!ids.includes(b.id)) continue
+      const u = usage.find((x) => x.id === b.id)
+      budgets.push({ id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 })
+    }
+    const rateLimits: QuotaRate[] = []
+    for (const rl of g?.rate_limits ?? []) {
+      if (rl.id !== vk.rate_limit_id) continue
+      const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
+      rateLimits.push({ id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used })
+    }
+    const noModels: string[] = []
+    const body = JSON.stringify({ virtual_key_name: vk.name ?? "", is_active: vk.is_active !== false, budgets: budgets, rate_limits: rateLimits, provider_configs: vk.provider_configs ?? [], model_configs: noModels })
+    return { status: 200, body: body, contentType: "application/json" }
+  }
+
+  // The expired-key cleanup, hourly (Bifrost runs it daily). Only one process runs it: a worker's copy
+  // of the config may be behind the file, and saving that copy would undo the workers' changes.
+  startExpirySweep(): void {
+    setInterval(() => {
+      const done = sweepExpiredKeys(this.store, Date.now())
+      if (done.length > 0) console.error(`raiju: deleted ${done.length} expired virtual key${done.length === 1 ? "" : "s"}`)
+      this.auditRetention()
+    }, 3600000)
+    // the audit archive copies each closed window every archive interval (five minutes at least)
+    const every = Math.max(300, this.store.cfg.audit?.archive?.interval_seconds ?? 3600) * 1000
+    setInterval(() => {
+      this.auditArchive()
+    }, every)
+  }
+
+  // Retention: deletes the audit events older than audit.retention_days (AuditLog.pruneBefore).
+  auditRetention(): void {
+    const days = this.store.cfg.audit?.retention_days ?? 0
+    const log = this.audit
+    if (log === undefined || days <= 0) return
+    try {
+      const n = log.pruneBefore(Date.now() - days * 86400000)
+      if (n > 0) console.error(`raiju: audit retention removed ${n} event${n === 1 ? "" : "s"}`)
+    } catch (e) {
+      console.error(`raiju: audit retention failed: ${e.message}`)
+    }
+  }
+
+  // The archive copy: the events in each window that has closed (archive_grace_seconds before now) since
+  // the last copy go to object storage as one JSONL object. The first run only sets the mark, so events
+  // written before archiving was turned on are not copied. Rows are never deleted here.
+  async auditArchive(): Promise<void> {
+    const log = this.audit
+    const ac = this.store.cfg.audit?.archive
+    if (log === undefined || ac === undefined || !ac.enabled) return
+    try {
+      const now = Date.now()
+      const mark = log.archiveMark()
+      if (mark === undefined) {
+        log.setArchiveMark({ seq: log.lastSequence(), until: now })
+        return
+      }
+      const grace = this.store.cfg.audit?.archive_grace_seconds ?? 900
+      const end = now - grace * 1000
+      if (end <= mark.until) return
+      const w = log.exportWindow(mark.seq, end)
+      if (w.count === 0) {
+        log.setArchiveMark({ seq: mark.seq, until: end })
+        return
+      }
+      const ec: LogExportsConfig = {
+        enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix ?? "audit", region: ac.region, endpoint: ac.endpoint,
+        access_key_id: ac.access_key_id, secret_access_key: ac.secret_access_key, session_token: ac.session_token,
+        interval_seconds: ac.interval_seconds, path_style: ac.path_style, format: ac.format, retention_days: ac.retention_days,
+      }
+      const put = putRequest(ec, objectKey(ec, mark.until, end, this.nodeId, "jsonl"), w.body, now)
+      const hs: Record<string, string> = put.headers
+      const dl = deadline(30000)
+      try {
+        const r = await fetch(put.url, { method: "PUT", headers: hs, body: put.body, signal: dl.controller.signal })
+        await r.text()
+        if (r.status >= 200 && r.status < 300) log.setArchiveMark({ seq: w.last, until: end })
+        else console.error(`raiju: audit archive: HTTP ${r.status} from ${put.url}`)
+      } catch (e) {
+        console.error(`raiju: audit archive: ${e.message}`)
+      }
+      dl.finish()
+    } catch (e) {
+      console.error(`raiju: audit archive failed: ${e.message}`)
+    }
+  }
+
+  // /api/users/me/permissions: the caller's custom role as (resource, operation) pairs with their ids.
+  // Built-in roles hold fixed rules (rbac.tov) and are reported by name, with no pairs.
+  mePermissions(actor: string): Reply {
+    // a caller with no stored user (the legacy admin credential) is the admin
+    let role = "admin"
+    for (const u of this.store.cfg.governance?.users ?? []) {
+      if (u.name === actor) role = u.role
+    }
+    const custom = customRole(this.store.cfg.governance?.roles ?? [], role)
+    const pairs = custom?.permissions ?? []
+    const ids = permissionIds(RESOURCES, OPERATIONS, pairs)
+    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+    return { status: 200, body: JSON.stringify({ user: actor, role: role, built_in: custom === undefined, permissions: docs }), contentType: "application/json" }
+  }
+
+  // POST /api/governance/access-profiles/{id}/propagate ({"fields": [...]}; all of them when unset): the
+  // profile's chosen fields go onto every virtual key that holds it (propagateProfileKeys).
+  propagateProfile(id: string, body: string): Reply {
+    const g = this.store.cfg.governance
+    let prof: AccessProfile | undefined = undefined
+    for (const x of g?.access_profiles ?? []) {
+      if (x.id === id) prof = x
+    }
+    if (prof === undefined) return { status: 404, body: errorJson(`no access profile ${id}`, "invalid_request_error", undefined), contentType: "application/json" }
+    let chosen: string[] = PROPAGATED_FIELDS
+    if (body.trim() !== "") {
+      try {
+        const req = JSON.parse(body) as { fields?: string[] }
+        if (req.fields !== undefined) chosen = req.fields
+      } catch (e) {
+        return { status: 400, body: errorJson("body must be a JSON object", "invalid_request_error", undefined), contentType: "application/json" }
+      }
+    }
+    for (const f of chosen) {
+      if (!PROPAGATED_FIELDS.includes(f)) return { status: 400, body: errorJson(`unknown field ${f}; use ${PROPAGATED_FIELDS.join(", ")}`, "invalid_request_error", undefined), contentType: "application/json" }
+    }
+    const r = propagateProfileKeys(g?.virtual_keys ?? [], prof, chosen)
+    const saved = this.store.replaceVirtualKeys(r.vks)
+    if (saved.kind === "error") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
+    return { status: 200, body: JSON.stringify({ access_profile_id: id, updated: r.updated, fields: chosen }), contentType: "application/json" }
+  }
+
+  // GET /api/users/me/vk-creation-policy: the access profile that governs keys the caller creates.
+  vkCreationPolicy(actor: string): Reply {
+    const g = this.store.cfg.governance
+    return { status: 200, body: creationPolicy(g?.users, g?.access_profiles, actor), contentType: "application/json" }
+  }
+
+  // /api/users/{name}/access-profiles: GET lists the profiles the user holds; PUT and DELETE
+  // .../{profile_id} add and remove one; PUT and DELETE .../{profile_id}/virtual-keys/{vk_id} link
+  // the profile to one of the user's virtual keys.
+  userProfiles(method: string, path: string): Reply {
+    const segs = path.split("/").filter((s) => s !== "")
+    const name = segs[2] ?? ""
+    const pid = segs[4] ?? ""
+    const notFound: Reply = { status: 404, body: errorJson(`no route for ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
+    if (segs.length < 4 || segs.length > 7 || segs[3] !== "access-profiles") return notFound
+    const g = this.store.cfg.governance
+    if (segs.length === 4) {
+      if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+      const held = heldProfiles(g?.users, g?.access_profiles, name)
+      return { status: 200, body: JSON.stringify({ access_profiles: held }), contentType: "application/json" }
+    }
+    const add = method === "PUT"
+    if (method !== "PUT" && method !== "DELETE") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+    const r = segs.length === 5 ? this.store.setUserProfile(name, pid, add) : segs.length === 7 && segs[5] === "virtual-keys" ? this.store.setVkProfile(name, segs[6] ?? "", pid, add) : undefined
+    if (r === undefined) return notFound
+    if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+    return { status: 200, body: JSON.stringify({ user: name, access_profile_id: pid, linked: add }), contentType: "application/json" }
+  }
+
+  // setupToken is the X-Bifrost-Setup-Token header and setupSession the setup session cookie (POST /api/session/setup).
+  users(method: string, path: string, body: string, setupToken: string, setupSession: string): Reply {
+    // Bifrost's setup gate: while no admin exists, the first account needs the operator's setup_token, given
+    // as the header or as a setup session from POST /api/session/setup
+    const want = resolveEnv(this.store.cfg.setup_token ?? "")
+    if (method === "POST" && !this.authOn && want !== "" && setupToken !== want && !validSetupSession(setupSession, want, Date.now())) {
+      return { status: 403, body: errorJson("the setup token is required to create the first admin account", "invalid_request_error", undefined), contentType: "application/json" }
+    }
     // only stored users are managed here; legacy auth_config credentials stay in the config
     const stored: UserConfig[] = this.store.cfg.governance?.users ?? []
-    const r = handleUsers({ users: stored }, method, path, body)
+    const r = handleUsers({ users: stored, roles: this.store.cfg.governance?.roles ?? [] }, method, path, body)
     if (method !== "GET" && r.status < 300) {
       const saved = this.store.setUsers(r.cfg.users)
       if (saved.kind === "error") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
@@ -1574,6 +2608,8 @@ export class Ops {
   // /api/governance/access-profiles[/{id}]. A profile that keys still use can't be deleted.
   profiles(method: string, path: string, body: string): Reply {
     const gov = this.store.cfg.governance
+    const segs0 = path.split("/").filter((s) => s !== "")
+    if (method === "POST" && segs0.length === 5 && segs0[4] === "propagate") return this.propagateProfile(segs0[3] ?? "", body)
     const r = handleProfiles(gov?.access_profiles ?? [], method, path, body)
     if (method === "GET" || r.status >= 300) return { status: r.status, body: r.body, contentType: "application/json" }
     if (method === "DELETE") {
@@ -1600,6 +2636,14 @@ export class Ops {
       if (p === "/api/audit-logs/export") return { status: 200, body: log.exportJsonl(num(params, "since"), num(params, "until")), contentType: "application/x-ndjson" }
     } catch (e) {
       return { status: 500, body: errorJson(e.message, "api_error", undefined), contentType: "application/json" }
+    }
+    if (p === "/api/audit-logs/filterdata") return { status: 200, body: JSON.stringify(log.filterData()), contentType: "application/json" }
+    // GET /api/audit-logs/{id}: one event, by its id (its sequence number), in Bifrost's {audit_log} wrapper
+    if (p.startsWith("/api/audit-logs/")) {
+      const seq = parseInt(p.slice("/api/audit-logs/".byteLength)) ?? -1
+      const ev = seq >= 0 ? log.find(seq) : undefined
+      if (ev === undefined) return { status: 404, body: errorJson("audit log not found", "not_found_error", undefined), contentType: "application/json" }
+      return { status: 200, body: JSON.stringify({ audit_log: ev }), contentType: "application/json" }
     }
     if (p !== "/api/audit-logs") return { status: 404, body: errorJson(`no route for ${p}`, "invalid_request_error", undefined), contentType: "application/json" }
     const q: AuditQuery = {}
@@ -1631,16 +2675,45 @@ export class Ops {
     return { status: 200, body: vmcp.listView(this.engine.cfg.virtual_mcps ?? [], all), contentType: "application/json" }
   }
 
+  // Whether a key reaches a virtual MCP through the project its request names or through its access
+  // profiles (the profiles' virtual_mcps names). Its own allowed_keys are checked by the caller.
+  private grantedVirtual(h: Hdrs, vk: VirtualKeyConfig | undefined, name: string): bool {
+    const proj = this.engine.gov.projectFor(h)
+    if (proj !== undefined && (proj.virtual_mcps ?? []).includes(name)) return true
+    if (vk === undefined) return false
+    const pol = this.engine.gov.policyFor(h)
+    const pids: string[] = pol === undefined ? (vk.access_profile_ids ?? []) : (pol.vk.access_profile_ids ?? [])
+    const profiles = this.engine.cfg.governance?.access_profiles ?? []
+    for (const p of profiles) {
+      if (p.is_active === false || !pids.includes(p.id)) continue
+      if ((p.virtual_mcps ?? []).includes(name)) return true
+    }
+    return false
+  }
+
   // POST /mcp (every connected tool) and /mcp/{name} (a virtual MCP's tool set).
   async mcp(req: Request, virtualName: string | undefined): Promise<Response> {
     const m = this.engine.mcp
     if (m === undefined || this.engine.cfg.mcp_server?.enabled === false) return json(404, errorJson("no MCP servers are connected", "invalid_request_error", undefined))
     const h = snapshot(req.headers)
+    // client.mcp_server_auth_mode: a Bifrost-issued JWT stands for the virtual key its sub names; in oauth
+    // mode nothing else is accepted. The 401s name the protected resource when the authorization server is on.
+    const iss = issuerOf(this.engine.cfg)
+    const challenge = iss === undefined ? undefined : challengeOf(iss)
+    const caller = callerOf(iss, h.get("authorization"), Date.now())
+    if (caller.kind === "error") return denied(401, caller.message, challenge)
+    if (caller.kind === "vk") {
+      const named = keyById(this.engine.cfg, caller.vk)
+      if (!keyUsable(named, Date.now()) || named === undefined) return denied(401, "the virtual key this token names is not active", challenge)
+      h.set("x-bf-vk", named.value)
+    } else if (serverAuthMode(this.engine.cfg) === "oauth") {
+      return denied(401, "this server requires OAuth JWT authentication; header credentials are not accepted in oauth mode", challenge)
+    }
     const vk = this.engine.gov.findKey(h)
-    if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)")
+    if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
-    let tools = exposedTools(m.allToolsFor(allowedTools))
+    let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs))
     // virtual names → the source tool and its argument defaults
     let mapping: Map<string, { source: string, defaults: string }> = new Map()
     if (virtualName !== undefined) {
@@ -1649,7 +2722,7 @@ export class Ops {
         if (x.name === virtualName) v = x
       }
       if (v === undefined) return json(404, errorJson(`no virtual MCP ${virtualName}`, "invalid_request_error", undefined))
-      if (!vmcp.keyAllowed(v, vk?.id)) return denied(403, `this key may not use the virtual MCP ${virtualName}`)
+      if (!vmcp.keyAllowed(v, vk?.id) && !this.grantedVirtual(h, vk, v.name)) return denied(403, `this key may not use the virtual MCP ${virtualName}`)
       const r = vmcp.resolve(v, tools)
       for (const e of r.errors) console.error(`raiju: virtual MCP ${virtualName}: ${e}`)
       tools = r.tools
@@ -1661,24 +2734,39 @@ export class Ops {
       if (sid !== undefined) this.mcpSessions.delete(sid)
       return new Response(undefined, { status: 204 })
     }
+    // GET is the server-to-client stream (Bifrost's SSE handler): a connection event, and then the
+    // stream ends, since this server sends nothing on its own. Clients reopen it as they need.
+    if (req.method === "GET") {
+      const sh: Record<string, string> = new Map()
+      sh.set("content-type", "text/event-stream")
+      sh.set("cache-control", "no-cache")
+      return new Response("data: {\"jsonrpc\":\"2.0\",\"method\":\"connection/opened\"}\n\n", { headers: sh })
+    }
     if (req.method !== "POST") return json(405, errorJson("use POST for MCP requests", "invalid_request_error", undefined))
     const body = await req.text()
     const now = Date.now()
     this.mcpSessions.expire(now)
+    // each call passes the key's MCP rules and budgets, forwards the allowed request headers, and
+    // is charged its tool_pricing cost; a virtual MCP's call is judged by the tool it runs
     const run = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
-      if (!virtual) {
-        const r = try await m.execute(name, args)
-        return { text: r.text, isError: r.isError }
-      }
-      const target = mapping.get(name)
-      if (target === undefined) throw new Error(`unknown tool ${name}`)
+      let real = name
       let merged = args
-      try {
-        merged = vmcp.mergeArgs(target.defaults, args)
-      } catch (e) {
-        return { text: `bad arguments: ${e.message}`, isError: true }
+      if (virtual) {
+        const target = mapping.get(name)
+        if (target === undefined) throw new Error(`unknown tool ${name}`)
+        real = target.source
+        try {
+          merged = vmcp.mergeArgs(target.defaults, args)
+        } catch (e) {
+          return { text: `bad arguments: ${e.message}`, isError: true }
+        }
       }
-      const r = try await m.execute(target.source, merged)
+      const gate = this.engine.toolGate(m, h, real)
+      if (gate.kind === "denial") return { text: gate.message, isError: true }
+      const ua = try await this.engine.userAuth(real, h, false)
+      if (ua.kind === "denial") return { text: ua.message, isError: true }
+      const r = try await this.engine.runUser(m, real, merged, h, ua)
+      this.engine.chargeTool(m, gate, real)
       return { text: r.text, isError: r.isError }
     }
     const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now)
@@ -1747,6 +2835,21 @@ test("circuit view lists only the circuits that are not closed", () => {
   expect(ops.circuitView().body.includes("\"openai#k1\":\"open\"")).toBe(true)
 })
 
+test("circuit reset closes one circuit by id, or all of them", () => {
+  const eng = new Engine({})
+  const ops = new Ops(eng, new ConfigStore("/tmp/raiju-ops-reset.json", {}))
+  for (let i = 0; i < 20; i++) eng.health.record("openai#k1", false, 100.0, Date.now())
+  for (let i = 0; i < 20; i++) eng.health.record("openai#k2", false, 100.0, Date.now())
+  expect(ops.circuitReset("not json").status).toBe(400)
+  expect(ops.circuitReset(`{}`).status).toBe(400)
+  expect(ops.circuitReset(`{"id":"nope"}`).status).toBe(404)
+  expect(ops.circuitReset(`{"id":"openai#k1"}`).status).toBe(200)
+  expect(ops.circuitView().body.includes("openai#k1")).toBe(false)
+  expect(ops.circuitView().body.includes("openai#k2")).toBe(true)
+  expect(ops.circuitReset(`{"all":true}`).status).toBe(200)
+  expect(ops.circuitView().body).toBe(`{"circuits":{}}`)
+})
+
 test("model parameters resolve qualified and bare names; the datasheet's keys are read as given", () => {
   const m = fallbackParams()
   expect(resolveParams(m, "gpt-4o") !== undefined).toBe(true)
@@ -1812,7 +2915,8 @@ test("analytics and MCP routes answer from the store and refuse what is not reco
     expect(dash.status).toBe(200)
     expect(dash.body.includes(`"total_requests":1`)).toBe(true)
     expect(dash.body.includes(`"virtual_key":{"rankings"`)).toBe(true)
-    expect(get("/api/logs/histogram/cost/by-dimension?dimension=team").status).toBe(400)
+    expect(get("/api/logs/histogram/cost/by-dimension?dimension=team_name").status).toBe(400)
+    expect(get("/api/logs/histogram/cost/by-dimension?dimension=user").status).toBe(200)
     expect(get("/api/logs/histogram/cost/by-dimension?dimension=virtual_key").body.includes(`"dimension_values":["vk1"]`)).toBe(true)
     expect(get("/api/logs/rankings?limit=0").status).toBe(400)
     expect(get("/api/logs/nothing-here").status).toBe(404)

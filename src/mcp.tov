@@ -3,8 +3,14 @@
 // the tool calls the model makes. The protocol lives in pure functions that test
 // without a network; McpSession and McpManager wrap them around fetch.
 import { McpAuthConfig, TokenCache, staticHeaders, tokenRequest, discoveryUrls, parseAuthServerMetadata } from "./mcpauth"
+import { McpUserToken } from "./mcpuser"
+
+// one reply of a per-user call: its status, content type, body and the session id it carries
+type UserReply = { status: int, contentType: string, body: string, sid: string }
 import { fields, elements, find, rawStr, rawBool, rawNum, quote, build, setField, isNull, decodeString } from "./json"
 import { deadline } from "./deadline"
+import { targetProblem } from "./netguard"
+import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpRequest, parseSpec, inputSchema, requestFor, callOperation } from "./openapi"
 
 // Bifrost's client config. "http" is Streamable HTTP ("sse" uses the same POST
 // transport); "stdio" runs stdio_config.command and speaks newline-delimited
@@ -27,13 +33,118 @@ export type McpClientConfig = {
   tools_to_auto_execute?: string[],
   tool_sync_interval?: string,
   tls_config?: McpTlsConfig,
+  // Bifrost's per-client settings. tool_execution_timeout is a Go duration that overrides the global
+  // timeout for this server. needs_session_stickiness false (http only) connects fresh for each call.
+  // require_public_target keeps every dial to a public address. allowed_extra_headers lists the request
+  // headers that may be forwarded to this server on a tool call ("*" for all). tool_pricing is the cost
+  // per execution by server tool name. is_ping_available is stored; no ping health check runs.
+  tool_execution_timeout?: string,
+  is_ping_available?: bool,
+  needs_session_stickiness?: bool,
+  require_public_target?: bool,
+  allowed_extra_headers?: string[],
+  tool_pricing?: Map<string, f64>,
+  // connection_type "openapi": each operation of the document is a tool (src/openapi.tov)
+  openapi_config?: OpenApiConfig,
+  // auth_type "per_user_headers": each virtual key submits its own values of per_user_header_keys, and
+  // those values go with its tool calls. headers then holds the sample the verification checked, which
+  // the client connects with to list its tools.
+  auth_type?: string,
+  per_user_header_keys?: string[],
 }
 
 export type McpTlsConfig = { insecure_skip_verify?: bool, ca_cert_pem?: string }
 
+// The header values one virtual key submitted for one per_user_headers client (Bifrost's per-user
+// headers credential). Its values are sealed in the saved file.
+export type McpUserCredential = { id: string, mcp_client_name: string, virtual_key_id: string, headers: Map<string, string>, updated_at: f64 }
+
+// A pending submission of those values (Bifrost's per-user headers flow). It expires at expires_at, in
+// epoch milliseconds, and is removed once submitted or revoked.
+export type McpHeaderFlow = { id: string, mcp_client_name: string, virtual_key_id: string, expires_at: f64, created_at: f64 }
+
 export type McpConfig = {
   client_configs?: McpClientConfig[],
   tool_execution_timeout_seconds?: int,
+  // the default tool_sync_interval of clients that have none (Bifrost's mcp.tool_sync_interval)
+  tool_sync_interval?: string,
+  // hosts that may be reached although private, by clients with require_public_target (oauth_private_allowlist)
+  oauth_private_allowlist?: string[],
+  user_credentials?: McpUserCredential[],
+  header_flows?: McpHeaderFlow[],
+  // the tokens each caller obtained for the per_user_oauth clients (src/mcpuser.tov); sealed at rest
+  user_tokens?: McpUserToken[],
+}
+
+// The per-user headers a virtual key submitted for one client; undefined when it has submitted none.
+export function userHeadersOf(creds: McpUserCredential[] | undefined, client: string, vk: string): Map<string, string> | undefined {
+  const list = creds ?? []
+  for (const c of list) {
+    if (c.mcp_client_name === client && c.virtual_key_id === vk) return c.headers
+  }
+  return undefined
+}
+
+// The names of the clients whose auth_type is per_user_oauth.
+export function perUserOAuthNames(list: McpClientConfig[] | undefined): string[] {
+  const out: string[] = []
+  for (const c of list ?? []) {
+    if (c.auth_type === "per_user_oauth") out.push(c.name)
+  }
+  return out
+}
+
+// The names of the clients whose auth_type is per_user_headers.
+export function perUserClientNames(list: McpClientConfig[] | undefined): string[] {
+  const out: string[] = []
+  for (const c of list ?? []) {
+    if (c.auth_type === "per_user_headers") out.push(c.name)
+  }
+  return out
+}
+
+// A virtual key's MCP tool allow-list for one client (Bifrost's virtual_key_mcp_config). tools_to_execute:
+// ["*"] every tool, [] none, a list only those tools.
+export type McpKeyConfig = { mcp_client_name: string, tools_to_execute?: string[] }
+
+// Milliseconds in a Go duration ("30s", "2m", "1m30s", "500ms"). A bare number counts seconds, as Bifrost
+// reads it. 0 when unset or not a duration.
+export function durationMsOf(s: string | undefined): int {
+  if (s === undefined || s.trim() === "") return 0
+  const cs = s.trim().chars()
+  let i = 0
+  let total = 0.0
+  while (i < cs.length) {
+    let num = ""
+    while (i < cs.length && "0123456789.".includes(cs[i]!)) {
+      num += cs[i]!
+      i++
+    }
+    let unit = ""
+    while (i < cs.length && !"0123456789.".includes(cs[i]!)) {
+      unit += cs[i]!
+      i++
+    }
+    const n = parseFloat(num)
+    if (n === undefined) return 0
+    const mult: f64 = unit === "" || unit === "s" ? 1000.0 : unit === "m" ? 60000.0 : unit === "h" ? 3600000.0 : unit === "ms" ? 1.0 : -1.0
+    if (mult < 0.0) return 0
+    total += n * mult
+  }
+  return Math.floor(total)
+}
+
+// Whether a key's mcp_configs lets it run a tool of one server. A key that declares no mcp_configs
+// (undefined) is not limited here. A declared list judges the server by its entry; a server it does not
+// name is allowed only when the server is allow_by_default.
+export function keyRuleAllows(keys: McpKeyConfig[] | undefined, server: string, tool: string, allowByDefault: bool): bool {
+  if (keys === undefined) return true
+  for (const k of keys) {
+    if (k.mcp_client_name !== server) continue
+    const allow = k.tools_to_execute ?? []
+    return allow.includes("*") || allow.includes(tool)
+  }
+  return allowByDefault
 }
 
 export type McpTool = { name: string, description: string, inputSchemaRaw: string }
@@ -50,6 +161,8 @@ const MAX_TOOL_PAGES = 100
 const EMPTY_SCHEMA = '{"type":"object","properties":{}}'
 const NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
 const MAX_NAME = 64
+// Request headers never forwarded to an MCP server, whatever its allowed_extra_headers says.
+const FRAMING_HEADERS: string[] = ["host", "content-length", "connection", "transfer-encoding", "content-type", "accept", "mcp-session-id", "mcp-protocol-version"]
 
 // Request ids are plain ints; a notification has no id.
 export function initializeRequest(id: int): string {
@@ -231,6 +344,21 @@ export function syncSeconds(s: string | undefined): int {
     digits = ""
   }
   return total + (parseInt(digits) ?? 0)
+}
+
+// The chat-name patterns of a list of mcp_configs: "<client>-*" for "*", "<client>-<tool>" for each
+// listed tool. An entry with no tools contributes nothing.
+export function keyPatterns(keys: McpKeyConfig[]): string[] {
+  const out: string[] = []
+  for (const k of keys) {
+    for (const t of k.tools_to_execute ?? []) out.push(t === "*" ? `${k.mcp_client_name}-*` : `${k.mcp_client_name}-${t}`)
+  }
+  return out
+}
+
+// Whether a key's mcp_configs has an entry for the client.
+export function keyNamesClient(keys: McpKeyConfig[], server: string): bool {
+  return keys.some((k) => k.mcp_client_name === server)
 }
 
 // The auto-execute patterns of every client's tools_to_auto_execute, for the MCP agent: "<server>-<tool>",
@@ -474,9 +602,20 @@ export class McpSession {
   // the OAuth token endpoint, from auth.token_url or the server's metadata
   private tokenUrl = ""
 
-  // timeoutMs bounds each tool call.
-  constructor(readonly cfg: McpClientConfig, timeoutMs?: int) {
-    this.timeoutMs = timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS
+  // the hosts require_public_target lets through (oauth_private_allowlist)
+  private allow: string[] = []
+  // an openapi client: its document and the base URL its calls go to
+  private openapi: OpenApiDoc | undefined = undefined
+  private opBase = ""
+
+  // timeoutMs bounds each tool call unless the client has its own tool_execution_timeout.
+  constructor(readonly cfg: McpClientConfig, timeoutMs?: int, allowList?: string[]) {
+    const own = durationMsOf(cfg.tool_execution_timeout)
+    this.timeoutMs = own > 0 ? own : timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS
+    this.allow = allowList ?? []
+    // the tokens the authorization code flow saved on the client
+    const a = cfg.auth
+    if (a !== undefined && a.type === "oauth" && (a.access_token ?? "") !== "") this.tokens.seed(cfg.name, a.access_token ?? "", a.token_expires_at ?? 0.0, a.refresh_token ?? "")
   }
 
   private newId(): int {
@@ -485,12 +624,30 @@ export class McpSession {
     return id
   }
 
+  // The request headers a tool call may forward to this server: those its allowed_extra_headers names
+  // ("*" for all). The headers that frame the HTTP exchange or the protocol are never forwarded.
+  private forwardable(extra: Map<string, string> | undefined): Map<string, string> | undefined {
+    if (extra === undefined) return undefined
+    const allowed = this.cfg.allowed_extra_headers ?? []
+    if (allowed.length === 0) return undefined
+    const out: Map<string, string> = new Map()
+    for (const k of extra.keys()) {
+      const lk = k.toLowerCase()
+      if (FRAMING_HEADERS.includes(lk)) continue
+      if (allowed.includes("*") || allowed.some((a) => a.toLowerCase() === lk)) out.set(lk, extra.get(k)!)
+    }
+    return out
+  }
+
   // Headers for one POST. The configured headers go first so the protocol headers win.
-  private headers(): Map<string, string> {
+  private headers(extra?: Map<string, string>): Map<string, string> {
     const h: Map<string, string> = new Map()
-    const extra = this.cfg.headers
+    const cfgHeaders = this.cfg.headers
+    if (cfgHeaders !== undefined) {
+      for (const k of cfgHeaders.keys()) h.set(k.toLowerCase(), cfgHeaders.get(k)!)
+    }
     if (extra !== undefined) {
-      for (const k of extra.keys()) h.set(k.toLowerCase(), extra.get(k)!)
+      for (const k of extra.keys()) h.set(k, extra.get(k)!)
     }
     const a = this.cfg.auth
     if (a !== undefined) {
@@ -508,7 +665,7 @@ export class McpSession {
 
   private isOAuth(): bool {
     const t = this.cfg.auth?.type
-    return t === "oauth_client_credentials" || t === "oauth_refresh_token"
+    return t === "oauth_client_credentials" || t === "oauth_refresh_token" || t === "oauth"
   }
 
   // Gets an OAuth access token (client credentials, or the refresh token), finding the
@@ -530,8 +687,10 @@ export class McpSession {
         dl.finish()
       }
     }
-    const refresh = a.type === "oauth_refresh_token"
+    const refresh = a.type === "oauth_refresh_token" || a.type === "oauth"
     const rt = this.tokens.refreshToken(this.cfg.name)
+    // an authorization code client has no grant of its own: the flow must run first
+    if (a.type === "oauth" && rt === undefined) throw new Error(`${this.cfg.name}: not authorized yet: run the OAuth flow (initiate-verification)`)
     let req = a
     req.token_url = this.tokenUrl
     if (refresh && rt !== undefined) req.refresh_token = rt
@@ -552,21 +711,26 @@ export class McpSession {
 
   // POSTs one message, with an OAuth token when the server needs one: fetched first if
   // missing, and once more after a 401.
-  private async exchange(body: string, timeoutMs: int): Promise<Reply> throws Error {
+  private async exchange(body: string, timeoutMs: int, extra?: Map<string, string>): Promise<Reply> throws Error {
     if (this.isOAuth() && this.tokens.header(this.cfg.name, Date.now()) === undefined) try await this.fetchToken()
-    const first = try await this.send(body, timeoutMs)
+    const first = try await this.send(body, timeoutMs, extra)
     if (first.status !== 401 || !this.isOAuth()) return first
     this.tokens.invalidate(this.cfg.name)
     try await this.fetchToken()
-    return try await this.send(body, timeoutMs)
+    return try await this.send(body, timeoutMs, extra)
   }
 
   // POSTs one message under a deadline. The session id from the server is kept for later requests.
-  private async send(body: string, timeoutMs: int): Promise<Reply> throws Error {
+  private async send(body: string, timeoutMs: int, extra?: Map<string, string>): Promise<Reply> throws Error {
+    // require_public_target: every dial must reach a public address, checked on each request
+    if (this.cfg.require_public_target === true) {
+      const pr = targetProblem(this.cfg.connection_string ?? "", this.allow)
+      if (pr !== "") throw new Error(`${this.cfg.name}: ${pr}`)
+    }
     const dl = deadline(timeoutMs)
     let reply: Reply = { status: 0, contentType: "", body: "" }
     try {
-      const hs: Record<string, string> = this.headers()
+      const hs: Record<string, string> = this.headers(extra)
       const res = await fetch(this.cfg.connection_string ?? "", { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
       const sid = res.headers.get("mcp-session-id") ?? ""
       if (sid !== "") this.sessionId = sid
@@ -581,7 +745,7 @@ export class McpSession {
   }
 
   // A request: returns the raw result, or throws on HTTP and JSON-RPC errors.
-  private async rpc(body: string, id: int, timeoutMs: int): Promise<string> throws Error {
+  private async rpc(body: string, id: int, timeoutMs: int, extra?: Map<string, string>): Promise<string> throws Error {
     const ch = this.stdio
     if (ch !== undefined) {
       let line = ""
@@ -594,7 +758,7 @@ export class McpSession {
       if (r.kind === "error") throw new Error(`${this.cfg.name}: ${r.message} (code ${r.code})`)
       return r.raw
     }
-    const reply = try await this.exchange(body, timeoutMs)
+    const reply = try await this.exchange(body, timeoutMs, extra)
     if (reply.status < 200 || reply.status >= 300) throw new Error(`${this.cfg.name}: HTTP ${reply.status}`)
     const r = parseRpcResponse(reply.contentType, reply.body, id)
     if (r.kind === "error") throw new Error(`${this.cfg.name}: ${r.message} (code ${r.code})`)
@@ -602,7 +766,7 @@ export class McpSession {
   }
 
   // A notification: no reply body is expected.
-  private async notify(body: string): Promise<void> throws Error {
+  private async notify(body: string, extra?: Map<string, string>): Promise<void> throws Error {
     const ch = this.stdio
     if (ch !== undefined) {
       try {
@@ -612,7 +776,7 @@ export class McpSession {
       }
       return
     }
-    const reply = try await this.exchange(body, CONNECT_TIMEOUT_MS)
+    const reply = try await this.exchange(body, CONNECT_TIMEOUT_MS, extra)
     if (reply.status < 200 || reply.status >= 300) throw new Error(`${this.cfg.name}: HTTP ${reply.status} for notification`)
   }
 
@@ -627,7 +791,12 @@ export class McpSession {
     }
     try {
       const transport = this.cfg.connection_type
-      if (transport !== "http" && transport !== "sse" && transport !== "stdio") throw new Error(`unsupported connection type ${transport}`)
+      if (transport !== "http" && transport !== "sse" && transport !== "stdio" && transport !== "openapi") throw new Error(`unsupported connection type ${transport}`)
+      if (transport === "openapi") {
+        await this.loadOpenApi()
+        this.connected = true
+        return
+      }
       if (transport === "stdio") {
         const sc = this.cfg.stdio_config
         if (sc === undefined || sc.command === "") throw new Error("stdio needs stdio_config.command")
@@ -670,11 +839,83 @@ export class McpSession {
     this.exposed = ex
   }
 
+  // Reads an openapi client's document (its spec, or spec_url fetched now) and makes each operation a tool.
+  private async loadOpenApi(): Promise<void> throws Error {
+    const oc = this.cfg.openapi_config
+    if (oc === undefined) throw new Error(`${this.cfg.name}: openapi_config is required for an openapi connection`)
+    let text = oc.spec ?? ""
+    const specUrl = oc.spec_url ?? ""
+    if (text === "" && specUrl !== "") {
+      if (this.cfg.require_public_target === true) {
+        const pr = targetProblem(specUrl, this.allow)
+        if (pr !== "") throw new Error(`${this.cfg.name}: ${pr}`)
+      }
+      const dl = deadline(CONNECT_TIMEOUT_MS)
+      try {
+        const r = await fetch(specUrl, { signal: dl.controller.signal })
+        if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`)
+        text = await r.text()
+      } catch (e) {
+        throw new Error(`${this.cfg.name}: OpenAPI spec: ${e.message}`)
+      } finally {
+        dl.finish()
+      }
+    }
+    if (text === "") throw new Error(`${this.cfg.name}: openapi_config needs spec or spec_url`)
+    let doc: OpenApiDoc = { title: "", version: "", openapi_version: "", description: "", servers: [], ops: [], schemes: [] }
+    try {
+      doc = try parseSpec(text, oc.include_deprecated === true)
+    } catch (e) {
+      throw new Error(`${this.cfg.name}: ${e.message}`)
+    }
+    let base = oc.base_url ?? ""
+    if (base === "" && doc.servers.length > 0) base = doc.servers[0]!
+    this.openapi = doc
+    this.opBase = base
+    const ts: McpTool[] = []
+    const ex: Map<string, string> = new Map()
+    for (const op of doc.ops) {
+      ts.push({ name: op.name, description: op.description, inputSchemaRaw: inputSchema(op) })
+      if (toolAllowed(op.name, this.cfg)) ex.set(chatName(this.cfg.name, op.name), op.name)
+    }
+    this.tools = ts
+    this.exposed = ex
+  }
+
+  // Calls one operation of an openapi client: the HTTP request it describes, with the configured credentials.
+  private async callOpenApi(name: string, argsJson: string): Promise<ToolText> throws Error {
+    const doc = this.openapi
+    if (doc === undefined) throw new Error(`${this.cfg.name}: no OpenAPI document loaded`)
+    let op: OpenApiOp | undefined = undefined
+    for (const o of doc.ops) {
+      if (o.name === name) op = o
+    }
+    if (op === undefined) throw new Error(`${this.cfg.name}: no operation ${name}`)
+    const oc = this.cfg.openapi_config
+    const creds: Map<string, OpenApiCred> = oc?.security_credentials ?? new Map()
+    let req: OpRequest | undefined = undefined
+    try {
+      req = try requestFor(op, this.opBase, argsJson, doc, creds)
+    } catch (e) {
+      return { text: e.message, isError: true }
+    }
+    if (this.cfg.require_public_target === true) {
+      const pr = targetProblem(req!.url, this.allow)
+      if (pr !== "") return { text: `${this.cfg.name}: ${pr}`, isError: true }
+    }
+    const r = try await callOperation(req!, this.timeoutMs, oc?.max_response_bytes ?? 0)
+    return { text: r.text, isError: r.status >= 400 }
+  }
+
   // Lists the tools again (the periodic tool_sync_interval refresh). A failure keeps the tools it had.
   async relist(): Promise<void> {
     if (!this.connected) return
     try {
-      try await this.listAll()
+      if (this.cfg.connection_type === "openapi") {
+        try await this.loadOpenApi()
+      } else {
+        try await this.listAll()
+      }
     } catch (e) {
       this.lastError = e.message
     }
@@ -683,6 +924,19 @@ export class McpSession {
   // The chat tool definitions for this server's allowed tools.
   chatTools(): string[] {
     return toolsForChat(this.cfg.name, this.tools, this.cfg)
+  }
+
+  // The chat tool definitions of this server's allowed tools that keep accepts, given the server's
+  // name for the tool and its chat name.
+  toolsWhere(keep: (orig: string, chat: string) => bool): string[] {
+    const out: string[] = []
+    for (const t of this.tools) {
+      if (!toolAllowed(t.name, this.cfg)) continue
+      const n = chatName(this.cfg.name, t.name)
+      if (!keep(t.name, n)) continue
+      out.push(toolJson(n, t))
+    }
+    return out
   }
 
   // The chat tool definitions of this server's allowed tools whose chat names keep accepts.
@@ -699,7 +953,10 @@ export class McpSession {
 
   // The server's name for a chat tool name, if this session exposes it.
   original(chatToolName: string): string | undefined {
-    return this.exposed.get(chatToolName)
+    for (const t of this.tools) {
+      if (toolAllowed(t.name, this.cfg) && chatName(this.cfg.name, t.name) === chatToolName) return t.name
+    }
+    return undefined
   }
 
   exposedNames(): string[] {
@@ -710,12 +967,90 @@ export class McpSession {
     return this.exposed.size
   }
 
-  // Calls a tool by its name on the server. Tool failures come back as isError; protocol failures throw.
-  async callTool(name: string, argsJson: string): Promise<ToolText> throws Error {
+  // A tool call of a per_user_oauth client with the calling key's own token. Each call opens a fresh session
+  // (initialize with that token), so no session id is shared between callers and the admin's token is not
+  // sent. A 401 throws "HTTP 401", which the gateway answers by refreshing the caller's token.
+  async callAsUser(name: string, argsJson: string, extra: Map<string, string> | undefined, bearer: string): Promise<ToolText> throws Error {
     if (!this.connected) throw new Error(`${this.cfg.name}: not connected: ${this.lastError}`)
+    const hs: Map<string, string> = new Map()
+    const cfgHeaders = this.cfg.headers
+    if (cfgHeaders !== undefined) {
+      for (const k of cfgHeaders.keys()) hs.set(k.toLowerCase(), cfgHeaders.get(k)!)
+    }
+    const fwd = this.forwardable(extra)
+    if (fwd !== undefined) {
+      for (const k of fwd.keys()) hs.set(k, fwd.get(k)!)
+    }
+    hs.set("authorization", "Bearer " + bearer)
+    hs.set("content-type", "application/json")
+    hs.set("accept", "application/json, text/event-stream")
+    const initId = this.newId()
+    const init = try await this.postAs(hs, initializeRequest(initId), CONNECT_TIMEOUT_MS, initId)
+    const sid = init.sid
+    hs.set("mcp-protocol-version", PROTOCOL)
+    if (sid !== "") hs.set("mcp-session-id", sid)
+    try await this.postAs(hs, initializedNotification(), CONNECT_TIMEOUT_MS, -1)
     const id = this.newId()
     const body = try callToolRequest(id, name, argsJson)
-    const raw = try await this.rpc(body, id, this.timeoutMs)
+    const reply = try await this.postAs(hs, body, this.timeoutMs, id)
+    const r = parseRpcResponse(reply.contentType, reply.body, id)
+    if (r.kind === "error") throw new Error(`${this.cfg.name}: ${r.message} (code ${r.code})`)
+    return try toolResultText(r.raw)
+  }
+
+  // One POST for callAsUser under the given headers. A non-2xx answer throws "HTTP <status>". id is the
+  // request whose reply is parsed (-1 for a notification, which has none).
+  private async postAs(base: Map<string, string>, body: string, timeoutMs: int, id: int): Promise<UserReply> throws Error {
+    if (this.cfg.require_public_target === true) {
+      const pr = targetProblem(this.cfg.connection_string ?? "", this.allow)
+      if (pr !== "") throw new Error(`${this.cfg.name}: ${pr}`)
+    }
+    const hs: Record<string, string> = base
+    const dl = deadline(timeoutMs)
+    let out: UserReply = { status: 0, contentType: "", body: "", sid: "" }
+    try {
+      const res = await fetch(this.cfg.connection_string ?? "", { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+      const text = await res.text()
+      out = { status: res.status, contentType: res.headers.get("content-type") ?? "", body: text, sid: res.headers.get("mcp-session-id") ?? "" }
+    } catch (e) {
+      throw new Error(`${this.cfg.name}: request failed: ${e.message}`)
+    } finally {
+      dl.finish()
+    }
+    if (out.status < 200 || out.status >= 300) throw new Error(`${this.cfg.name}: HTTP ${out.status}`)
+    if (id >= 0) {
+      const r = parseRpcResponse(out.contentType, out.body, id)
+      if (r.kind === "error") throw new Error(`${this.cfg.name}: ${r.message} (code ${r.code})`)
+    }
+    return out
+  }
+
+  // Calls a tool by its name on the server. Tool failures come back as isError; protocol failures throw.
+  // extra holds the caller's request headers; only those allowed_extra_headers names are sent. An http
+  // client with needs_session_stickiness false opens a fresh session (initialize) before each call.
+  // user holds the calling virtual key's per-user headers. A per_user_headers client takes only those, and
+  // a call without them is refused.
+  async callTool(name: string, argsJson: string, extra?: Map<string, string>, user?: Map<string, string>): Promise<ToolText> throws Error {
+    if (!this.connected) throw new Error(`${this.cfg.name}: not connected: ${this.lastError}`)
+    if (this.cfg.connection_type === "openapi") return try await this.callOpenApi(name, argsJson)
+    let sent = this.forwardable(extra)
+    if (this.cfg.auth_type === "per_user_headers") {
+      if (user === undefined) throw new Error(`${this.cfg.name}: the per-user headers of this key are not submitted`)
+      const own: Map<string, string> = sent ?? new Map()
+      for (const k of user.keys()) own.set(k, user.get(k)!)
+      sent = own
+    }
+    if (this.cfg.connection_type === "http" && this.cfg.needs_session_stickiness === false) {
+      this.sessionId = ""
+      this.version = ""
+      const initId = this.newId()
+      try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS, sent)
+      this.version = PROTOCOL
+      try await this.notify(initializedNotification(), sent)
+    }
+    const id = this.newId()
+    const body = try callToolRequest(id, name, argsJson)
+    const raw = try await this.rpc(body, id, this.timeoutMs, sent)
     return try toolResultText(raw)
   }
 }
@@ -742,15 +1077,44 @@ function reportTool(c: McpToolCall): void {
 
 // All configured MCP servers: connects them, offers their tools to chat and routes tool calls.
 export class McpManager {
-  readonly sessions: McpSession[]
+  sessions: McpSession[]
   // the tool_sync_interval timers, one per client that has one
   syncTimers: int[] = []
+
+  // Follows a changed config. Each client takes the session of list, which carries the new config
+  // (and the tokens an OAuth flow saved); connectNew() connects those. A stdio client keeps its
+  // running process; a client removed from the config is dropped.
+  follow(list: McpSession[]): void {
+    const keep: McpSession[] = []
+    for (const n of list) {
+      let kept: McpSession | undefined = undefined
+      for (const s of this.sessions) {
+        if (s.cfg.name !== n.cfg.name) continue
+        // a stdio server keeps its process; an unchanged HTTP client keeps its connection and tools,
+        // so a config write elsewhere doesn't empty the tool list while it reconnects
+        if (s.cfg.connection_type === "stdio" || JSON.stringify(s.cfg) === JSON.stringify(n.cfg)) kept = s
+      }
+      keep.push(kept ?? n)
+    }
+    this.sessions = keep
+  }
+
+  // Connects the sessions that have not been tried yet (the clients added by a config change).
+  async connectNew(): Promise<void> {
+    await Promise.all(this.sessions.filter((s) => s.cfg.connection_type !== "stdio" && !s.connected && s.lastError === "").map((s) => s.connect()))
+  }
+
+  // the global tool_sync_interval, for clients with none of their own (0: no periodic re-list)
+  private defaultSyncSecs: int = 0
+  private allow: string[] = []
 
   constructor(cfg: McpConfig) {
     const secs = cfg.tool_execution_timeout_seconds
     const ms: int = secs === undefined ? DEFAULT_TOOL_TIMEOUT_MS : secs * 1000
     const list = cfg.client_configs ?? []
-    this.sessions = list.map((c) => new McpSession(c, ms))
+    this.allow = cfg.oauth_private_allowlist ?? []
+    this.defaultSyncSecs = syncSeconds(cfg.tool_sync_interval)
+    this.sessions = list.map((c) => new McpSession(c, ms, this.allow))
   }
 
   // Connects every HTTP server. A server that fails is recorded in status(), not thrown.
@@ -771,7 +1135,9 @@ export class McpManager {
   startToolSync(): void {
     this.stopToolSync()
     for (const s of this.sessions) {
-      const secs = syncSeconds(s.cfg.tool_sync_interval)
+      // the client's own interval, else the global default
+      const own = syncSeconds(s.cfg.tool_sync_interval)
+      const secs = own > 0 ? own : this.defaultSyncSecs
       if (secs <= 0) continue
       this.syncTimers.push(setInterval(() => {
         syncOnce(s)
@@ -789,21 +1155,71 @@ export class McpManager {
   // undefined means the key has no list, so every connected client's tools are offered. A client
   // the list names gets only the tools it names. A client it does not name gets its tools only
   // when its allow_by_default is set (Bifrost: an explicit assignment decides for that caller).
-  allToolsFor(policy: string[] | undefined): string[] {
-    if (policy === undefined) return this.allTools()
-    const list: string[] = policy
+  // The chat tool definitions one caller may see: the access profile's patterns (policy) and the key's
+  // mcp_configs (keys). Each filter judges a client it names by its entry, and a client it does not name
+  // only when that client is allow_by_default. Undefined filters do not restrict.
+  allToolsFor(policy: string[] | undefined, keys?: McpKeyConfig[]): string[] {
+    if (policy === undefined && keys === undefined) return this.allTools()
     const out: string[] = []
     for (const s of this.sessions) {
       if (!s.connected) continue
-      if (!namesClient(list, s.cfg.name)) {
-        if (s.cfg.allow_by_default === true) {
-          for (const t of s.chatTools()) out.push(t)
-        }
-        continue
-      }
-      for (const t of s.chatToolsWhere((n: string): bool => list.some((p) => patternMatches(n, p)))) out.push(t)
+      const name = s.cfg.name
+      const byDefault = s.cfg.allow_by_default === true
+      const ks: McpKeyConfig[] = keys ?? []
+      const pol: string[] = policy ?? []
+      const keyNamed = keys !== undefined && keyNamesClient(ks, name)
+      let polNamed = false
+      if (policy !== undefined) polNamed = namesClient(pol, name)
+      const pass = s.toolsWhere((orig: string, chat: string): bool => {
+        const keyOk = keys === undefined || (keyNamed ? keyRuleAllows(ks, name, orig, byDefault) : byDefault)
+        const polOk = policy === undefined || (polNamed ? pol.some((p) => patternMatches(chat, p)) : byDefault)
+        return keyOk && polOk
+      })
+      for (const t of pass) out.push(t)
     }
     return out
+  }
+
+  // Whether a caller may run one chat tool ("<server>-<tool>"), by the same rules that decide which
+  // tools it is offered. false when the tool is not exposed.
+  mayRun(policy: string[] | undefined, keys: McpKeyConfig[] | undefined, fullToolName: string): bool {
+    for (const s of this.sessions) {
+      if (!s.connected) continue
+      const orig = s.original(fullToolName)
+      if (orig === undefined) continue
+      const name = s.cfg.name
+      const byDefault = s.cfg.allow_by_default === true
+      if (keys !== undefined) {
+        const ok = keyNamesClient(keys, name) ? keyRuleAllows(keys, name, orig, byDefault) : byDefault
+        if (!ok) return false
+      }
+      if (policy !== undefined) {
+        const ok = namesClient(policy, name) ? policy.some((p) => patternMatches(fullToolName, p)) : byDefault
+        if (!ok) return false
+      }
+      return true
+    }
+    return false
+  }
+
+  // Whether a connected server exposes the chat tool.
+  hasTool(fullToolName: string): bool {
+    for (const s of this.sessions) {
+      if (s.connected && s.original(fullToolName) !== undefined) return true
+    }
+    return false
+  }
+
+  // The tool_pricing cost of one execution of a chat tool, 0 when it has none.
+  priceOf(fullToolName: string): f64 {
+    for (const s of this.sessions) {
+      const orig = s.original(fullToolName)
+      if (orig === undefined) continue
+      const pm = s.cfg.tool_pricing
+      if (pm === undefined) return 0.0
+      return pm.get(orig) ?? 0.0
+    }
+    return 0.0
   }
 
   // Chat tool definitions from every connected server.
@@ -817,7 +1233,8 @@ export class McpManager {
   }
 
   // Runs a tool by its chat name ("<server>-<tool>"). Every run is reported to the tool log.
-  async execute(fullToolName: string, argsJson: string): Promise<ToolText> throws Error {
+  // bearer is the calling key's own token for a per_user_oauth client (undefined for other clients).
+  async execute(fullToolName: string, argsJson: string, extra?: Map<string, string>, user?: Map<string, string>, bearer?: string): Promise<ToolText> throws Error {
     for (const s of this.sessions) {
       if (!s.connected) continue
       const original = s.original(fullToolName)
@@ -825,7 +1242,12 @@ export class McpManager {
         const t0 = Date.now()
         let r: ToolText = { text: "", isError: false }
         try {
-          r = await s.callTool(original, argsJson)
+          if (s.cfg.auth_type === "per_user_oauth") {
+            if (bearer === undefined) throw new Error(`${s.cfg.name}: the caller has no token for this server: complete the consent link first`)
+            r = await s.callAsUser(original, argsJson, extra, bearer)
+          } else {
+            r = await s.callTool(original, argsJson, extra, user)
+          }
         } catch (e) {
           reportTool({ server: s.cfg.name, tool: original, latencyMs: Date.now() - t0, ok: false, error: e.message })
           throw e
@@ -1064,4 +1486,74 @@ test("parses tool execute bodies and builds tool messages", () => {
   const msg = toolMessage("call_1", 'a "quoted" line')
   expect(msg).toBe('{"role":"tool","tool_call_id":"call_1","content":"a \\"quoted\\" line"}')
   expect(rawStr(try fields(msg), "role")).toBe("tool")
+})
+
+test("a config change keeps unchanged HTTP clients with their tools and replaces changed ones", () => {
+  const a: McpClientConfig = { name: "a", connection_type: "http", connection_string: "http://127.0.0.1:1/mcp" }
+  const b: McpClientConfig = { name: "b", connection_type: "http", connection_string: "http://127.0.0.1:2/mcp" }
+  const m = new McpManager({ client_configs: [a, b] })
+  const oldA = m.sessions[0]!
+  oldA.tools = [{ name: "t", description: "", inputSchemaRaw: EMPTY_SCHEMA }]
+  const b2: McpClientConfig = { name: "b", connection_type: "http", connection_string: "http://127.0.0.1:3/mcp" }
+  const next = new McpManager({ client_configs: [a, b2] })
+  m.follow(next.sessions)
+  expect(m.sessions[0]! === oldA).toBe(true)
+  expect(m.sessions[0]!.tools.length).toBe(1)
+  expect(m.sessions[1]!.cfg.connection_string).toBe("http://127.0.0.1:3/mcp")
+})
+
+test("per-client durations and virtual key allow-lists", () => {
+  expect(durationMsOf(undefined)).toBe(0)
+  expect(durationMsOf("30s")).toBe(30000)
+  expect(durationMsOf("2m")).toBe(120000)
+  expect(durationMsOf("1m30s")).toBe(90000)
+  expect(durationMsOf("500ms")).toBe(500)
+  expect(durationMsOf("45")).toBe(45000)
+  expect(durationMsOf("soon")).toBe(0)
+
+  // a key that declares no mcp_configs is not limited; a declared list judges the clients it names
+  expect(keyRuleAllows(undefined, "git", "push", false)).toBe(true)
+  const keys: McpKeyConfig[] = [{ mcp_client_name: "fs", tools_to_execute: ["read"] }, { mcp_client_name: "web", tools_to_execute: ["*"] }, { mcp_client_name: "db", tools_to_execute: [] }]
+  expect(keyRuleAllows(keys, "fs", "read", false)).toBe(true)
+  expect(keyRuleAllows(keys, "fs", "write", false)).toBe(false)
+  expect(keyRuleAllows(keys, "web", "anything", false)).toBe(true)
+  expect(keyRuleAllows(keys, "db", "query", true)).toBe(false)
+  expect(keyRuleAllows(keys, "git", "push", false)).toBe(false)
+  expect(keyRuleAllows(keys, "git", "push", true)).toBe(true)
+
+  const prices: Map<string, f64> = new Map()
+  prices.set("read", 0.5)
+  const m = new McpManager({ client_configs: [
+    { name: "fs", connection_type: "http", connection_string: "http://x/mcp", tool_pricing: prices },
+    { name: "git", connection_type: "http", connection_string: "http://y/mcp", allow_by_default: true },
+    { name: "web", connection_type: "http", connection_string: "http://z/mcp" },
+  ] })
+  for (const s of m.sessions) {
+    s.connected = true
+    s.tools = [{ name: "read", description: "", inputSchemaRaw: EMPTY_SCHEMA }, { name: "write", description: "", inputSchemaRaw: EMPTY_SCHEMA }]
+  }
+  const names = (list: string[]): string => list.map((t) => { const i = t.indexOf('"name":"'); return t.slice(i + 8).split('"')[0]! }).join(",")
+  // the key limits fs to read and names no web tools; git is allow_by_default
+  const onlyFs: McpKeyConfig[] = [{ mcp_client_name: "fs", tools_to_execute: ["read"] }]
+  expect(names(m.allToolsFor(undefined, onlyFs))).toBe("fs-read,git-read,git-write")
+  expect(names(m.allToolsFor(["*"], [{ mcp_client_name: "web", tools_to_execute: [] }]))).toBe("git-read,git-write")
+  expect(m.allToolsFor(undefined, []).length).toBe(2)
+  expect(m.mayRun(undefined, onlyFs, "fs-read")).toBe(true)
+  expect(m.mayRun(undefined, onlyFs, "fs-write")).toBe(false)
+  expect(m.mayRun(["fs-*"], undefined, "web-read")).toBe(false)
+  expect(m.mayRun(undefined, undefined, "web-read")).toBe(true)
+  expect(m.mayRun(undefined, undefined, "nothing-here")).toBe(false)
+  expect(m.priceOf("fs-read")).toBe(0.5)
+  expect(m.priceOf("fs-write")).toBe(0.0)
+  expect(m.priceOf("git-read")).toBe(0.0)
+})
+
+test("the global tool_sync_interval is the default for clients without their own", () => {
+  const m = new McpManager({ tool_sync_interval: "5m", client_configs: [
+    { name: "fs", connection_type: "http", connection_string: "http://x/mcp", tool_sync_interval: "90s" },
+    { name: "git", connection_type: "http", connection_string: "http://y/mcp" },
+  ] })
+  m.startToolSync()
+  expect(m.syncTimers.length).toBe(2)
+  m.stopToolSync()
 })

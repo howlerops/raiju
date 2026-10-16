@@ -5,6 +5,8 @@
 
 import { Field, fields, find, elements, rawStr, rawNum, isNull, quote, build, setField } from "./json"
 import { errorJson, newId, nowSeconds } from "./schemas"
+import { compileRegex } from "./regex"
+import { deltaText } from "./guard_stream"
 
 // Hooks take the context by inout: plugins add headers and share values
 // through ctx.headers and ctx.values, which parameters can't change.
@@ -119,6 +121,16 @@ export class HeaderPlugin extends BasePlugin {
 
 // ---- mocker ----
 
+// Bifrost's mocker shape: rules have name, enabled, priority, conditions, responses (weighted),
+// latency and probability; the config has default_behavior and global_latency. Durations are Go
+// strings ("500ms", "2s"). Integer nanoseconds are not read.
+export type MockConditions = { providers?: string[], models?: string[], message_regex?: string, request_size?: { min?: int, max?: int } }
+export type MockLatency = { min?: string, max?: string, type?: string }
+export type MockUsage = { prompt_tokens?: int, completion_tokens?: int, total_tokens?: int }
+export type MockContent = { message?: string, message_template?: string, model?: string, finish_reason?: string, usage?: MockUsage }
+export type MockError = { message?: string, type?: string, code?: string, status_code?: int }
+export type MockResponse = { type?: string, weight?: f64, content?: MockContent, error?: MockError }
+
 export type MockRule = {
   model?: string,
   contains?: string,
@@ -126,12 +138,145 @@ export type MockRule = {
   response?: string,
   content?: string,
   latency_ms?: int,
+  name?: string,
+  enabled?: bool,
+  priority?: int,
+  probability?: f64,
+  conditions?: MockConditions,
+  responses?: MockResponse[],
+  latency?: MockLatency,
 }
-export type MockerConfig = { rules: MockRule[] }
+export type MockerConfig = { rules: MockRule[], default_behavior?: string, global_latency?: MockLatency }
 
-// An OpenAI chat.completion with one assistant message and zero usage.
+// An OpenAI chat.completion with one assistant message.
+function completionFull(model: string, content: string, usage: MockUsage, finish: string): string {
+  const p = usage.prompt_tokens ?? 10
+  const c = usage.completion_tokens ?? 20
+  const t = usage.total_tokens ?? p + c
+  return `{"id":${quote(newId("mock-"))},"object":"chat.completion","created":${nowSeconds()},"model":${quote(model)},"choices":[{"index":0,"message":{"role":"assistant","content":${quote(content)}},"finish_reason":${quote(finish)}}],"usage":{"prompt_tokens":${p},"completion_tokens":${c},"total_tokens":${t}}}`
+}
+
+// Raiju's own rules answer with zero usage.
 function completionJson(model: string, content: string): string {
-  return `{"id":${quote(newId("mock-"))},"object":"chat.completion","created":${nowSeconds()},"model":${quote(model)},"choices":[{"index":0,"message":{"role":"assistant","content":${quote(content)}},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
+  return completionFull(model, content, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, "stop")
+}
+
+// A Go duration ("500ms", "2s", "1m30s") in milliseconds; undefined when it does not parse.
+export function goDurationMs(s: string): f64 | undefined {
+  const t = s.trim()
+  if (t === "") return undefined
+  let total = 0.0
+  let i = 0
+  const n = t.byteLength
+  while (i < n) {
+    const start = i
+    while (i < n && "0123456789.".indexOf(t.slice(i, i + 1)) >= 0) i++
+    if (i === start) return undefined
+    const num = parseFloat(t.slice(start, i))
+    if (num === undefined) return undefined
+    const ustart = i
+    while (i < n && "0123456789.".indexOf(t.slice(i, i + 1)) < 0) i++
+    const per = unitMs(t.slice(ustart, i))
+    if (per === undefined) return undefined
+    total += num * per
+  }
+  return total
+}
+
+function unitMs(u: string): f64 | undefined {
+  if (u === "ns") return 0.000001
+  if (u === "us" || u === "µs") return 0.001
+  if (u === "ms") return 1.0
+  if (u === "s") return 1000.0
+  if (u === "m") return 60000.0
+  if (u === "h") return 3600000.0
+  return undefined
+}
+
+// The delay of one request: fixed at min, or uniform between min and max.
+function latencyMs(l: MockLatency): int {
+  const min = goDurationMs(l.min ?? "") ?? 0.0
+  const max = goDurationMs(l.max ?? "") ?? min
+  if (l.type === "uniform" && max > min) return Math.floor(min + Math.random() * (max - min))
+  return Math.floor(min)
+}
+
+// Rules in Bifrost's order: higher priority first, config order among equal priorities.
+function byPriority(rules: MockRule[]): MockRule[] {
+  return rules.slice().sort((a: MockRule, b: MockRule) => (b.priority ?? 0) - (a.priority ?? 0))
+}
+
+// The text of the messages' string contents: what message_regex is matched against.
+function messageText(body: string): string {
+  let out = ""
+  try {
+    const raw = find(try fields(body), "messages")
+    if (raw === undefined) return ""
+    for (const el of try elements(raw)) {
+      const c = rawStr(try fields(el), "content")
+      if (c !== undefined) out += c + "\n"
+    }
+  } catch (e) {
+    return out
+  }
+  return out
+}
+
+// Whether the request meets a rule's conditions. A provider is taken from a "provider/model" name.
+function conditionsMatch(c: MockConditions | undefined, model: string, body: string): bool {
+  if (c === undefined) return true
+  const slash = model.indexOf("/")
+  const provider = slash < 0 ? "" : model.slice(0, slash)
+  const bare = slash < 0 ? model : model.slice(slash + 1)
+  const ps = c.providers ?? []
+  if (ps.length > 0 && !ps.includes(provider)) return false
+  const ms = c.models ?? []
+  if (ms.length > 0 && !ms.includes(bare) && !ms.includes(model)) return false
+  const re = c.message_regex ?? ""
+  if (re !== "") {
+    try {
+      if (!compileRegex(re).test(messageText(body))) return false
+    } catch (e) {
+      return false
+    }
+  }
+  const rs = c.request_size
+  if (rs !== undefined) {
+    const size = body.byteLength
+    if (size < (rs.min ?? 0) || (rs.max !== undefined && size > rs.max)) return false
+  }
+  return true
+}
+
+// The response a weighted pick chooses. A missing weight counts as 1; a weight of 0 never wins.
+function pickResponse(rs: MockResponse[]): MockResponse {
+  let total = 0.0
+  for (const r of rs) total += Math.max(0.0, r.weight ?? 1.0)
+  if (total <= 0.0) return rs[0]!
+  let x = Math.random() * total
+  for (const r of rs) {
+    const w = Math.max(0.0, r.weight ?? 1.0)
+    if (x < w) return r
+    x -= w
+  }
+  return rs[rs.length - 1]!
+}
+
+// A success answer built from Bifrost's content fields. {{model}} and {{provider}} are filled in.
+function contentShort(c: MockContent | undefined, model: string, status: int): PreResult {
+  const at = model.indexOf("/")
+  const provider = at < 0 ? "" : model.slice(0, at)
+  const bare = at < 0 ? model : model.slice(at + 1)
+  const text = (c?.message_template ?? c?.message ?? "").replaceAll("{{model}}", bare).replaceAll("{{provider}}", provider)
+  const usage = c?.usage ?? {}
+  const out = completionFull(c?.model ?? bare, text, usage, c?.finish_reason ?? "stop")
+  return { kind: "short_circuit", status: status, body: out, contentType: "application/json" }
+}
+
+// An error answer: Bifrost's status_code, 500 when none is given.
+function errorShort(e: MockError | undefined): PreResult {
+  const status = e?.status_code ?? 500
+  return { kind: "short_circuit", status: status, body: errorJson(e?.message ?? "", e?.type ?? "", e?.code), contentType: "application/json" }
 }
 
 // model: exact match or "*"; contains: substring of the request body. A missing
@@ -144,8 +289,10 @@ function matchesRule(r: MockRule, model: string, body: string): bool {
   return true
 }
 
-// Short-circuits the first matching rule. A rule with no response or content
-// answers with an empty completion.
+// Short-circuits the first matching rule, in priority order. A rule with no response or content
+// answers with an empty completion. A rule whose probability roll fails passes the request on
+// (Bifrost stops at that rule). With no rule matching, default_behavior decides: passthrough
+// (the default), error or success.
 export class MockerPlugin extends BasePlugin {
   constructor(readonly config: MockerConfig) {
     super()
@@ -156,10 +303,19 @@ export class MockerPlugin extends BasePlugin {
   }
 
   preRequest(inout ctx: PluginContext, body: string): PreResult {
-    for (const r of this.config.rules) {
-      if (!matchesRule(r, ctx.model, body)) continue
-      const latency = r.latency_ms
-      if (latency !== undefined) ctx.values.set("mock_latency_ms", `${latency}`)
+    for (const r of byPriority(this.config.rules)) {
+      if (r.enabled === false) continue
+      if (!matchesRule(r, ctx.model, body) || !conditionsMatch(r.conditions, ctx.model, body)) continue
+      if (r.probability !== undefined && r.probability > 0.0 && Math.random() > r.probability) return { kind: "continue", body: body }
+      const lat = r.latency ?? (r.latency_ms === undefined ? this.config.global_latency : undefined)
+      const delay = lat !== undefined ? latencyMs(lat) : (r.latency_ms ?? 0)
+      if (delay > 0) ctx.values.set("mock_latency_ms", `${delay}`)
+      if (r.responses !== undefined && r.responses.length > 0) {
+        const pick = pickResponse(r.responses)
+        if (pick.type === "error") return errorShort(pick.error)
+        if (pick.type === "success") return contentShort(pick.content, ctx.model, 200)
+        return { kind: "continue", body: body }
+      }
       const status = r.status ?? 200
       const raw = r.response
       if (raw !== undefined) {
@@ -168,13 +324,20 @@ export class MockerPlugin extends BasePlugin {
       const out = completionJson(ctx.model, r.content ?? "")
       return { kind: "short_circuit", status: status, body: out, contentType: "application/json" }
     }
+    const model = ctx.model
+    if (this.config.default_behavior === "error") return errorShort({ message: "Mock plugin default error" })
+    if (this.config.default_behavior === "success") {
+      return contentShort({ message: "Mock plugin default response", usage: { prompt_tokens: 5, completion_tokens: 10, total_tokens: 15 } }, model, 200)
+    }
     return { kind: "continue", body: body }
   }
 }
 
 // ---- jsonparser ----
 
-export type JsonParserConfig = { strip_markdown_fences: bool }
+// strip_markdown_fences is Raiju's own option. usage, cleanup_interval and max_age are Bifrost's
+// streaming options (see JsonStreamFixer): usage all_requests completes the JSON of every stream.
+export type JsonParserConfig = { strip_markdown_fences?: bool, usage?: string, cleanup_interval?: string, max_age?: string }
 
 // Whether a fence's first line is a language tag (json, JSON, json5, ...).
 function isLangTag(tag: string): bool {
@@ -240,7 +403,7 @@ export class JsonParserPlugin extends BasePlugin {
   }
 
   postResponse(inout ctx: PluginContext, status: int, body: string): PostResult {
-    if (!this.config.strip_markdown_fences) return { kind: "continue", body: body }
+    if (this.config.strip_markdown_fences !== true) return { kind: "continue", body: body }
     // Bodies that aren't chat completions JSON pass through untouched.
     try {
       return { kind: "continue", body: try stripFencesIn(body) }
@@ -248,6 +411,309 @@ export class JsonParserPlugin extends BasePlugin {
       return { kind: "continue", body: body }
     }
   }
+}
+
+// ---- streamed JSON completion (jsonparser, usage all_requests) ----
+
+// A strict JSON syntax scan (RFC 8259) over bytes: values nest up to a depth limit, and the
+// text is one value with only whitespace around it. JSON.parse cannot check arrays against a type.
+class JsonScan {
+  i = 0
+  constructor(readonly b: u8[]) {}
+
+  private at(): int {
+    return this.i < this.b.length ? int(this.b[this.i]!) : -1
+  }
+
+  private ws(): void {
+    while (this.at() === 32 || this.at() === 9 || this.at() === 10 || this.at() === 13) this.i++
+  }
+
+  private digits(): bool {
+    if (!(this.at() >= 48 && this.at() <= 57)) return false
+    while (this.at() >= 48 && this.at() <= 57) this.i++
+    return true
+  }
+
+  private word(w: string): bool {
+    for (const c of new TextEncoder().encode(w)) {
+      if (this.at() !== int(c)) return false
+      this.i++
+    }
+    return true
+  }
+
+  private number(): bool {
+    if (this.at() === 45) this.i++
+    if (this.at() === 48) this.i++
+    else if (!this.digits()) return false
+    if (this.at() === 46) {
+      this.i++
+      if (!this.digits()) return false
+    }
+    if (this.at() === 101 || this.at() === 69) {
+      this.i++
+      if (this.at() === 43 || this.at() === 45) this.i++
+      if (!this.digits()) return false
+    }
+    return true
+  }
+
+  private string(): bool {
+    this.i++
+    while (this.i < this.b.length) {
+      const c = this.at()
+      this.i++
+      if (c === 34) return true
+      if (c < 32) return false
+      if (c !== 92) continue
+      const e = this.at()
+      this.i++
+      if (e === 117) {
+        for (let k = 0; k < 4; k++) {
+          const h = this.at()
+          const hex = (h >= 48 && h <= 57) || (h >= 65 && h <= 70) || (h >= 97 && h <= 102)
+          if (!hex) return false
+          this.i++
+        }
+      } else if (e !== 34 && e !== 92 && e !== 47 && e !== 98 && e !== 102 && e !== 110 && e !== 114 && e !== 116) {
+        return false
+      }
+    }
+    return false
+  }
+
+  // Only whitespace may follow the value.
+  whole(): bool {
+    this.ws()
+    return this.i === this.b.length
+  }
+
+  value(depth: int): bool {
+    if (depth > 512) return false
+    this.ws()
+    const c = this.at()
+    if (c === 123) return this.object(depth)
+    if (c === 91) return this.array(depth)
+    if (c === 34) return this.string()
+    if (c === 116) return this.word("true")
+    if (c === 102) return this.word("false")
+    if (c === 110) return this.word("null")
+    if (c === 45 || (c >= 48 && c <= 57)) return this.number()
+    return false
+  }
+
+  private object(depth: int): bool {
+    this.i++
+    this.ws()
+    if (this.at() === 125) {
+      this.i++
+      return true
+    }
+    while (true) {
+      this.ws()
+      if (this.at() !== 34 || !this.string()) return false
+      this.ws()
+      if (this.at() !== 58) return false
+      this.i++
+      if (!this.value(depth + 1)) return false
+      this.ws()
+      if (this.at() === 44) {
+        this.i++
+        continue
+      }
+      if (this.at() === 125) {
+        this.i++
+        return true
+      }
+      return false
+    }
+  }
+
+  private array(depth: int): bool {
+    this.i++
+    this.ws()
+    if (this.at() === 93) {
+      this.i++
+      return true
+    }
+    while (true) {
+      if (!this.value(depth + 1)) return false
+      this.ws()
+      if (this.at() === 44) {
+        this.i++
+        continue
+      }
+      if (this.at() === 93) {
+        this.i++
+        return true
+      }
+      return false
+    }
+  }
+}
+
+// Whether s is one JSON value, arrays included (Bifrost's isValidJSON).
+function validJson(s: string): bool {
+  if (s.trim() === "") return false
+  const scan = new JsonScan(new TextEncoder().encode(s))
+  return scan.value(0) && scan.whole()
+}
+
+function decodeBytes(b: u8[]): string {
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+// Closes the strings, arrays and objects that a partial JSON text leaves open (Bifrost's completeJSON).
+function closeBytes(s: string): u8[] {
+  const bs = new TextEncoder().encode(s)
+  const res: u8[] = []
+  const stack: int[] = []
+  let inStr = false
+  let esc = false
+  for (const c of bs) {
+    const v = int(c)
+    res.push(c)
+    if (esc) {
+      esc = false
+      continue
+    }
+    if (v === 92) {
+      esc = true
+      continue
+    }
+    if (v === 34) {
+      inStr = !inStr
+      continue
+    }
+    if (inStr) continue
+    if (v === 123) stack.push(125)
+    else if (v === 91) stack.push(93)
+    else if ((v === 125 || v === 93) && stack.length > 0 && stack[stack.length - 1] === v) stack.pop()
+  }
+  if (inStr) {
+    if (esc && res.length > 0) res.pop()
+    res.push(34)
+  }
+  for (let i = stack.length - 1; i >= 0; i--) res.push(u8(stack[i]!))
+  return res
+}
+
+// The longest prefix of full that is valid JSON, found by bisection as Bifrost does; original when none is.
+function truncateTo(full: u8[], original: string): string {
+  let left = 0
+  let right = full.length
+  while (left < right) {
+    const mid = Math.floor((left + right) / 2)
+    if (validJson(decodeBytes(full.slice(0, mid)))) left = mid + 1
+    else right = mid
+  }
+  if (left > 0) {
+    const cand = decodeBytes(full.slice(0, left - 1))
+    if (validJson(cand)) return cand
+  }
+  return original
+}
+
+// A streamed answer so far, made valid JSON when it is an object or an array (Bifrost's parsePartialJSON).
+// Other text comes back trimmed and unchanged.
+export function completePartialJson(input: string): string {
+  const s = input.trim()
+  if (s === "") return "{}"
+  if (!s.startsWith("{") && !s.startsWith("[")) return s
+  if (validJson(s)) return s
+  const full = closeBytes(s)
+  const done = decodeBytes(full)
+  if (validJson(done)) return done
+  return truncateTo(full, s)
+}
+
+// The event with its chat chunk's content replaced by text (the chunk's first choice).
+function withContent(ev: string, text: string): string {
+  try {
+    const body = ev.slice(6, ev.byteLength).trim()
+    let fs = try fields(body)
+    const raw = find(fs, "choices")
+    if (raw === undefined) return ev
+    const choices: string[] = []
+    for (const el of try elements(raw)) choices.push(el)
+    if (choices.length === 0) return ev
+    let cf = try fields(choices[0]!)
+    let df = try fields(find(cf, "delta") ?? "{}")
+    setField(&df, "content", quote(text))
+    setField(&cf, "delta", build(df))
+    choices[0] = build(cf)
+    setField(&fs, "choices", "[" + choices.join(",") + "]")
+    return `data: ${build(fs)}\n\n`
+  } catch (e) {
+    return ev
+  }
+}
+
+// Bifrost's jsonparser on a stream: each chunk's content is added to the answer so far, and the chunk
+// carries that answer completed as JSON. Text that cannot be completed ends the stream with an error
+// event, as Bifrost's SkipStream error does. Events are passed on whole, as the converter produced them.
+export class JsonStreamFixer {
+  // set when the text could not be completed and the stream has ended
+  stopped = false
+  private acc = ""
+  private pending = ""
+
+  // The client's text for what the converter produced.
+  filter(s: string): string {
+    if (this.stopped) return ""
+    this.pending += s
+    let out = ""
+    while (true) {
+      const i = this.pending.indexOf("\n\n")
+      if (i < 0) break
+      const ev = this.pending.slice(0, i + 2)
+      this.pending = this.pending.slice(i + 2, this.pending.byteLength)
+      const piece = deltaText(ev)
+      if (piece === "") {
+        out += ev
+        continue
+      }
+      this.acc += piece
+      const fixed = completePartialJson(this.acc)
+      if (!validJson(fixed)) {
+        this.stopped = true
+        this.pending = ""
+        return out + `data: ${errorJson("Invalid JSON in streaming response", "api_error", undefined)}\n\ndata: [DONE]\n\n`
+      }
+      out += withContent(ev, fixed)
+    }
+    return out
+  }
+
+  // The stream's last text: what is still pending goes through the same way.
+  finish(s: string): string {
+    const out = this.filter(s)
+    if (this.stopped) return out
+    const rest = this.pending
+    this.pending = ""
+    return out + rest
+  }
+}
+
+// Whether Bifrost's jsonparser runs on streams: an enabled jsonparser entry with usage all_requests.
+// per_request needs a per-request context key, which Raiju does not have, so it stays off.
+export function jsonStreamEnabled(entries: PluginEntry[]): bool {
+  for (const e of entries) {
+    if (e.enabled === false || e.name !== "jsonparser") continue
+    const text = e.configJson.trim() === "" ? "{}" : e.configJson
+    try {
+      const cfg = try JSON.parse(text) as JsonParserConfig
+      if (cfg.usage === "all_requests") return true
+    } catch (err) {
+      continue
+    }
+  }
+  return false
 }
 
 // ---- blocklist ----
@@ -340,7 +806,18 @@ export class MaxTokensPlugin extends BasePlugin {
 
 // ---- configuration ----
 
-export type PluginEntry = { name: string, enabled?: bool, configJson: string }
+export type PluginEntry = { name: string, enabled?: bool, configJson: string, placement?: string, order?: int }
+
+// Bifrost's placement groups, in run order. Pre-hooks run in this order and post-hooks in reverse.
+// A plugin with no placement is post_builtin, as in Bifrost. undefined for any other value.
+export function placementRank(p: string | undefined): int | undefined {
+  if (p === undefined || p === "post_builtin") return 2
+  if (p === "pre_builtin") return 0
+  if (p === "builtin") return 1
+  return undefined
+}
+
+type Sequenced = { p: BasePlugin, rank: int, order: int, at: int }
 
 // Builds the plugin for one name from its raw JSON config. Throws SyntaxError
 // on a bad config; returns undefined for a name nothing provides.
@@ -368,23 +845,51 @@ function makePlugin(name: string, text: string): BasePlugin | undefined throws S
   return undefined
 }
 
-// The chain for the enabled entries, in config order. Unknown names and bad
-// configs are reported in errors and left out; they don't throw.
+// The chain for the enabled entries, sorted by placement group and then by order (lower first);
+// entries with the same group and order keep config order. Unknown names, bad configs and bad
+// placements are reported in errors and left out; they don't throw.
 export function buildChain(entries: PluginEntry[]): { chain: PluginChain, errors: string[] } {
-  const plugins: BasePlugin[] = []
+  const seq: Sequenced[] = []
   const errors: string[] = []
-  for (const e of entries) {
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i]!
     if (e.enabled === false) continue
+    const rank = placementRank(e.placement)
+    if (rank === undefined) {
+      errors.push(`plugin "${e.name}": placement "${e.placement ?? ""}" must be pre_builtin, builtin or post_builtin`)
+      continue
+    }
     const text = e.configJson.trim() === "" ? "{}" : e.configJson
     try {
       const p = makePlugin(e.name, text)
       if (p === undefined) errors.push(`unknown plugin "${e.name}"`)
-      else plugins.push(p)
+      else seq.push({ p: p, rank: rank, order: e.order ?? 0, at: i })
     } catch (err) {
       errors.push(`plugin "${e.name}": ${err.message}`)
     }
   }
+  seq.sort((a, b) => {
+    if (a.rank !== b.rank) return a.rank - b.rank
+    if (a.order !== b.order) return a.order - b.order
+    return a.at - b.at
+  })
+  const plugins: BasePlugin[] = []
+  for (const s of seq) plugins.push(s.p)
   return { chain: new PluginChain(plugins), errors: errors }
+}
+
+// The status of one configured entry, as the plugin list reports it: disabled, active, or error with
+// the reason it was left out of the chain.
+export function entryStatus(e: PluginEntry): { status: string, error: string } {
+  if (e.enabled === false) return { status: "disabled", error: "" }
+  const text = e.configJson.trim() === "" ? "{}" : e.configJson
+  try {
+    const p = makePlugin(e.name, text)
+    if (p === undefined) return { status: "error", error: `unknown plugin "${e.name}"` }
+    return { status: "active", error: "" }
+  } catch (err) {
+    return { status: "error", error: `plugin "${e.name}": ${err.message}` }
+  }
 }
 
 // ---- tests ----
@@ -602,8 +1107,150 @@ test("buildChain keeps enabled plugins in order and reports bad entries", () => 
   expect(built.errors[0]!.indexOf("nosuch") >= 0).toBe(true)
 })
 
+test("the JSON check accepts RFC 8259 values and refuses broken ones", () => {
+  expect(validJson(`[1,"a",{"b":null,"c":[true,false]}]`)).toBe(true)
+  expect(validJson(`"\\u00e9 \\n"`)).toBe(true)
+  expect(validJson(`-1.5e+3`)).toBe(true)
+  expect(validJson(`  {}  `)).toBe(true)
+  expect(validJson(`[1,2`)).toBe(false)
+  expect(validJson(`{"a":}`)).toBe(false)
+  expect(validJson(`01`)).toBe(false)
+  expect(validJson(`tru`)).toBe(false)
+  expect(validJson(`{} x`)).toBe(false)
+  expect(validJson(`"bad \\x"`)).toBe(false)
+  expect(validJson(``)).toBe(false)
+})
+
+test("partial JSON is completed: objects, arrays and strings close, other text passes", () => {
+  expect(completePartialJson(`{"a":1`)).toBe(`{"a":1}`)
+  expect(completePartialJson(`[1,2`)).toBe(`[1,2]`)
+  expect(completePartialJson(`{"a":"x`)).toBe(`{"a":"x"}`)
+  expect(completePartialJson(`{"a":1}`)).toBe(`{"a":1}`)
+  expect(completePartialJson("  ")).toBe("{}")
+  expect(completePartialJson("hello")).toBe("hello")
+})
+
+function jsonChunk(c: string): string {
+  return `data: {"choices":[{"index":0,"delta":{"content":${JSON.stringify(c)}}}]}\n\n`
+}
+
+test("JsonStreamFixer completes the answer so far, and text that cannot be completed ends the stream", () => {
+  const f = new JsonStreamFixer()
+  const one = f.filter(jsonChunk(`{"a":1`))
+  expect(one.includes(`"content":${JSON.stringify(`{"a":1}`)}`)).toBe(true)
+  const two = f.filter(jsonChunk(`,"b":2}`))
+  expect(two.includes(`"content":${JSON.stringify(`{"a":1,"b":2}`)}`)).toBe(true)
+  expect(two.startsWith(`data: {"choices":[{"index":0,`)).toBe(true)
+  expect(f.stopped).toBe(false)
+  const bad = new JsonStreamFixer()
+  const out = bad.filter(jsonChunk("not json"))
+  expect(bad.stopped).toBe(true)
+  expect(out.includes("Invalid JSON in streaming response")).toBe(true)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("jsonparser streams only with usage all_requests", () => {
+  expect(jsonStreamEnabled([{ name: "jsonparser", configJson: `{"usage":"all_requests"}` }])).toBe(true)
+  expect(jsonStreamEnabled([{ name: "jsonparser", configJson: `{"usage":"per_request"}` }])).toBe(false)
+  expect(jsonStreamEnabled([{ name: "jsonparser", enabled: false, configJson: `{"usage":"all_requests"}` }])).toBe(false)
+  expect(jsonStreamEnabled([{ name: "header", configJson: "{}" }])).toBe(false)
+})
+
+test("buildChain sorts by placement group, then order, then config position", () => {
+  const built = buildChain([
+    { name: "blocklist", configJson: "{\"words\":[\"a\"]}" },
+    { name: "maxtokens", configJson: "{}", placement: "pre_builtin", order: 1 },
+    { name: "header", configJson: "{}", placement: "pre_builtin", order: 0 },
+    { name: "jsonparser", configJson: "{\"strip_markdown_fences\":true}", placement: "builtin" },
+    { name: "blocklist", configJson: "{\"words\":[\"b\"]}", placement: "post_builtin", order: -1 },
+    { name: "maxtokens", configJson: "{}", placement: "pre_builtin", order: 0 },
+  ])
+  const names: string[] = []
+  for (const p of built.chain.plugins) names.push(p.name())
+  expect(names.join(",")).toBe("header,maxtokens,maxtokens,jsonparser,blocklist,blocklist")
+  expect(built.errors.length).toBe(0)
+  const bad = buildChain([{ name: "header", configJson: "{}", placement: "middle" }])
+  expect(bad.chain.plugins.length).toBe(0)
+  expect(bad.errors[0]!.includes("placement \"middle\"")).toBe(true)
+  expect(placementRank(undefined)).toBe(2)
+})
+
 test("buildChain treats an empty config as an empty object", () => {
   const built = buildChain([{ name: "maxtokens", configJson: "" }])
   expect(built.errors.length).toBe(0)
   expect(built.chain.plugins.length).toBe(1)
+})
+
+function mockCtx(model: string): PluginContext {
+  return { requestId: "r", op: "chat", model: model, provider: "", headers: new Map(), values: new Map() }
+}
+
+test("go durations parse to milliseconds", () => {
+  expect(goDurationMs("500ms")).toBe(500.0)
+  expect(goDurationMs("2s")).toBe(2000.0)
+  expect(goDurationMs("1m30s")).toBe(90000.0)
+  expect(goDurationMs("5")).toBe(undefined)
+  expect(goDurationMs("")).toBe(undefined)
+})
+
+test("mocker priority picks the highest rule first, and enabled false skips a rule", () => {
+  const cfg = try JSON.parse(`{"rules":[
+    {"name":"low","priority":1,"responses":[{"type":"success","content":{"message":"low"}}]},
+    {"name":"off","enabled":false,"priority":9,"responses":[{"type":"success","content":{"message":"off"}}]},
+    {"name":"high","priority":5,"responses":[{"type":"success","content":{"message":"high"}}]}
+  ]}`) as MockerConfig
+  const p = new MockerPlugin(cfg)
+  let ctx = mockCtx("openai/gpt-4o")
+  const r = p.preRequest(&ctx, "{}")
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") expect(r.body.includes(`"content":"high"`)).toBe(true)
+})
+
+test("mocker conditions match provider, model and message regex", () => {
+  const cfg = try JSON.parse(`{"rules":[
+    {"responses":[{"type":"success","content":{"message":"anthropic"}}],"conditions":{"providers":["anthropic"]}},
+    {"responses":[{"type":"success","content":{"message":"gpt"}}],"conditions":{"models":["gpt-4o"],"message_regex":"^hello"}}
+  ]}`) as MockerConfig
+  const p = new MockerPlugin(cfg)
+  const body = `{"messages":[{"role":"user","content":"hello there"}]}`
+  let a = mockCtx("anthropic/claude")
+  const ra = p.preRequest(&a, body)
+  if (ra.kind === "short_circuit") expect(ra.body.includes(`"content":"anthropic"`)).toBe(true)
+  let g = mockCtx("openai/gpt-4o")
+  const rg = p.preRequest(&g, body)
+  if (rg.kind === "short_circuit") expect(rg.body.includes(`"content":"gpt"`)).toBe(true)
+  let miss = mockCtx("openai/gpt-4o")
+  expect(p.preRequest(&miss, `{"messages":[{"role":"user","content":"bye"}]}`).kind).toBe("continue")
+})
+
+test("mocker error responses carry status_code, and default_behavior applies when nothing matches", () => {
+  const cfg = try JSON.parse(`{"default_behavior":"error","rules":[
+    {"model":"gpt-4o","responses":[{"type":"error","error":{"message":"slow down","type":"rate_limit","status_code":429}}]}
+  ]}`) as MockerConfig
+  const p = new MockerPlugin(cfg)
+  let hit = mockCtx("gpt-4o")
+  const r = p.preRequest(&hit, "{}")
+  if (r.kind === "short_circuit") {
+    expect(r.status).toBe(429)
+    expect(r.body.includes("slow down")).toBe(true)
+  }
+  let other = mockCtx("other")
+  const d = p.preRequest(&other, "{}")
+  if (d.kind === "short_circuit") expect(d.status).toBe(500)
+  const ok = try JSON.parse(`{"default_behavior":"success","rules":[]}`) as MockerConfig
+  let s = mockCtx("m")
+  const sr = new MockerPlugin(ok).preRequest(&s, "{}")
+  if (sr.kind === "short_circuit") expect(sr.body.includes("Mock plugin default response")).toBe(true)
+  expect(new MockerPlugin({ rules: [] }).preRequest(&s, "{}").kind).toBe("continue")
+})
+
+test("mocker weights pick a response, and global latency sets the delay", () => {
+  const cfg = try JSON.parse(`{"global_latency":{"min":"250ms","type":"fixed"},"rules":[
+    {"responses":[{"type":"success","weight":0,"content":{"message":"never"}},{"type":"success","weight":1,"content":{"message":"always"}}]}
+  ]}`) as MockerConfig
+  const p = new MockerPlugin(cfg)
+  let ctx = mockCtx("m")
+  const r = p.preRequest(&ctx, "{}")
+  expect(ctx.values.get("mock_latency_ms")).toBe("250")
+  if (r.kind === "short_circuit") expect(r.body.includes(`"content":"always"`)).toBe(true)
 })

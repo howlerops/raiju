@@ -1,0 +1,719 @@
+// The prompt repository (Bifrost's /api/prompt-repo/*) and the prompts plugin's injection.
+//
+// A prompt has committed versions. Each version is immutable, numbered from 1, and holds
+// chat messages, model parameters and the names of its {{variables}}. A chat request names
+// a prompt with x-bf-prompt-id and may name a version with x-bf-prompt-version: the
+// version's messages go before the request's messages, and its model parameters fill in
+// what the request leaves out. Without a version the latest one is used.
+//
+// Deployments (Bifrost's enterprise prompt deployments) choose the version on the server: a
+// CEL expression over the request, then a weighted split across version numbers. Deployments
+// of the prompt are tried newest first, the first match wins, and it overrides the header.
+//
+// Raiju extension: variable values come from x-bf-prompt-var-<name> headers. Bifrost fills
+// its variables in the playground rather than at the gateway. A variable with no value
+// renders as "", as Jinja does by default.
+//
+// Messages are text only: a stored message is {role, content}. Other message fields (name,
+// tool calls) are not kept, and the prompt repository has no folders or sessions.
+import { compile, evaluate, Activation } from "./cel"
+import { Field, fields, elements, find, rawStr, rawNum, rawBool, build, setField, decodeString } from "./json"
+import { Hdrs, newId } from "./schemas"
+import { isoMs } from "./exports"
+
+// One chat message of a version.
+export type PromptMessage = { role: string, content: string }
+
+export type PromptVersion = {
+  id: string,
+  version_number: int,
+  commit_message?: string,
+  messages: PromptMessage[],
+  // the version's model parameters as JSON object text (defaults under the request's own)
+  model_params?: string,
+  provider?: string,
+  model?: string,
+  // the variable names: those given at commit and those the messages use
+  variables?: string[],
+  created_at: int,
+}
+
+export type Prompt = { id: string, name: string, created_at: int, updated_at: int, versions?: PromptVersion[] }
+
+// A version number as a string (Bifrost's shape) and its share of the traffic, in percent.
+export type TrafficShare = { version: string, percentage: int }
+
+export type Deployment = {
+  id: string,
+  prompt_id: string,
+  name: string,
+  description?: string,
+  // a CEL expression over the request (model, provider, request_type, headers, params, usage); empty matches all
+  cel_expression?: string,
+  traffic_distribution?: TrafficShare[],
+  created_at: int,
+  updated_at: int,
+}
+
+export type PromptRepoConfig = { prompts?: Prompt[], deployments?: Deployment[] }
+
+// A route's answer. next is the repository to save when the route changed it.
+export type PromptReply = { status: int, body: string, next?: PromptRepoConfig }
+
+const VAR_PREFIX = "x-bf-prompt-var-"
+const ROLES_NOTE = "a message needs a role and text content"
+
+function reply(status: int, body: string): PromptReply {
+  return { status: status, body: body }
+}
+
+function fail(status: int, message: string): PromptReply {
+  return reply(status, JSON.stringify({ error: { message: message, type: "invalid_request_error" } }))
+}
+
+function notAllowed(m: string): PromptReply {
+  return fail(405, `method ${m} is not allowed here`)
+}
+
+// The fields of a JSON object given as text, or undefined when it is not one.
+function objectFields(text: string): Field[] | undefined {
+  if (!text.startsWith("{")) return undefined
+  try {
+    return fields(text)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// A parameter's value as text: strings unquoted, everything else as written.
+function plain(raw: string): string {
+  if (!raw.startsWith("\"")) return raw
+  try {
+    return decodeString(raw)
+  } catch (e) {
+    return raw
+  }
+}
+
+// The index of s in text at or after from, or -1 (indexOf takes no start in Tov).
+function indexFrom(text: string, s: string, from: int): int {
+  const r = text.slice(from).indexOf(s)
+  return r < 0 ? -1 : r + from
+}
+
+// The {{name}} placeholders in a text, in order (names trimmed; repeats kept).
+function placeholders(text: string): string[] {
+  const out: string[] = []
+  let i = 0
+  while (true) {
+    const open = indexFrom(text, "{{", i)
+    if (open < 0) break
+    const close = indexFrom(text, "}}", open + 2)
+    if (close < 0) break
+    out.push(text.slice(open + 2, close).trim())
+    i = close + 2
+  }
+  return out
+}
+
+// The text with each {{name}} replaced by its value (or "" when it has none).
+export function renderTemplate(text: string, vars: Map<string, string>): string {
+  let out = ""
+  let i = 0
+  while (true) {
+    const open = indexFrom(text, "{{", i)
+    if (open < 0) break
+    const close = indexFrom(text, "}}", open + 2)
+    if (close < 0) break
+    out += text.slice(i, open)
+    out += vars.get(text.slice(open + 2, close).trim()) ?? ""
+    i = close + 2
+  }
+  return out + text.slice(i)
+}
+
+// The variable values a request carries in x-bf-prompt-var-<name> headers.
+export function variablesOf(h: Hdrs): Map<string, string> {
+  const out: Map<string, string> = new Map()
+  for (const k of h.keys()) {
+    if (k.startsWith(VAR_PREFIX)) out.set(k.slice(VAR_PREFIX.byteLength), h.get(k) ?? "")
+  }
+  return out
+}
+
+// The messages of a JSON array of {role, content} objects, or why they are not valid.
+function messagesOf(raw: string | undefined): { msgs: PromptMessage[], error: string } {
+  const out: PromptMessage[] = []
+  if (raw === undefined || !raw.startsWith("[")) return { msgs: out, error: "messages must be an array" }
+  let els: string[] = []
+  try {
+    els = elements(raw)
+  } catch (e) {
+    return { msgs: out, error: "messages must be an array" }
+  }
+  for (const el of els) {
+    const f = objectFields(el)
+    if (f === undefined) return { msgs: out, error: ROLES_NOTE }
+    const role = rawStr(f, "role")
+    const content = rawStr(f, "content")
+    if (role === undefined || role === "" || content === undefined) return { msgs: out, error: ROLES_NOTE }
+    out.push({ role: role, content: content })
+  }
+  if (out.length === 0) return { msgs: out, error: "a version needs at least one message" }
+  return { msgs: out, error: "" }
+}
+
+// Every variable a version uses: the names given at commit, then any placeholder in its messages.
+function variableNames(given: string[], msgs: PromptMessage[]): string[] {
+  const out: string[] = []
+  for (const n of given) {
+    if (!out.includes(n)) out.push(n)
+  }
+  for (const m of msgs) {
+    for (const n of placeholders(m.content)) {
+      if (n !== "" && !out.includes(n)) out.push(n)
+    }
+  }
+  return out
+}
+
+// The version view of Bifrost's /api/prompt-repo responses.
+function versionJson(v: PromptVersion, promptId: string, latest: boolean): string {
+  const msgs = JSON.stringify(v.messages)
+  const names = JSON.stringify(v.variables ?? [])
+  return `{"id":${JSON.stringify(v.id)},"prompt_id":${JSON.stringify(promptId)},"version_number":${v.version_number},"commit_message":${JSON.stringify(v.commit_message ?? "")},"messages":${msgs},"model_params":${v.model_params ?? "{}"},"provider":${JSON.stringify(v.provider ?? "")},"model":${JSON.stringify(v.model ?? "")},"variables":${names},"is_latest":${latest},"created_at":${JSON.stringify(isoMs(v.created_at))}}`
+}
+
+// The newest version of a prompt (the highest number), if it has any.
+function latestOf(p: Prompt): PromptVersion | undefined {
+  let best: PromptVersion | undefined = undefined
+  for (const v of p.versions ?? []) {
+    if (best === undefined || v.version_number > best.version_number) best = v
+  }
+  return best
+}
+
+function promptJson(p: Prompt): string {
+  const latest = latestOf(p)
+  const lv = latest === undefined ? "null" : versionJson(latest, p.id, true)
+  return `{"id":${JSON.stringify(p.id)},"name":${JSON.stringify(p.name)},"created_at":${JSON.stringify(isoMs(p.created_at))},"updated_at":${JSON.stringify(isoMs(p.updated_at))},"version_count":${(p.versions ?? []).length},"latest_version":${lv}}`
+}
+
+function deploymentJson(d: Deployment): string {
+  const dist = JSON.stringify(d.traffic_distribution ?? [])
+  return `{"id":${JSON.stringify(d.id)},"prompt_id":${JSON.stringify(d.prompt_id)},"name":${JSON.stringify(d.name)},"description":${JSON.stringify(d.description ?? "")},"cel_expression":${JSON.stringify(d.cel_expression ?? "")},"traffic_distribution":${dist},"created_at":${JSON.stringify(isoMs(d.created_at))},"updated_at":${JSON.stringify(isoMs(d.updated_at))}}`
+}
+
+function promptIndex(list: Prompt[], id: string): int {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i]!.id === id) return i
+  }
+  return -1
+}
+
+function deploymentIndex(list: Deployment[], id: string): int {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i]!.id === id) return i
+  }
+  return -1
+}
+
+// The parsed body of a request, or undefined when it is not a JSON object.
+function bodyOf(body: string): Field[] | undefined {
+  return objectFields(body)
+}
+
+// A string from a field that may hold a string or a number (version numbers are strings in Bifrost).
+function textOrNum(fs: Field[], key: string): string | undefined {
+  const s = rawStr(fs, key)
+  if (s !== undefined) return s
+  const n = rawNum(fs, key)
+  return n === undefined ? undefined : "" + n
+}
+
+// The traffic distribution of a body, or why it is not valid.
+function distributionOf(raw: string | undefined): { dist: TrafficShare[], error: string } {
+  const out: TrafficShare[] = []
+  if (raw === undefined || raw === "null") return { dist: out, error: "" }
+  if (!raw.startsWith("[")) return { dist: out, error: "traffic_distribution must be an array" }
+  let els: string[] = []
+  try {
+    els = elements(raw)
+  } catch (e) {
+    return { dist: out, error: "traffic_distribution must be an array" }
+  }
+  for (const el of els) {
+    const f = objectFields(el)
+    if (f === undefined) return { dist: out, error: "each traffic_distribution entry needs a version and a percentage" }
+    const v = textOrNum(f, "version")
+    const p = rawNum(f, "percentage")
+    if (v === undefined || p === undefined) return { dist: out, error: "each traffic_distribution entry needs a version and a percentage" }
+    if (p % 1.0 !== 0.0 || p < 0.0 || p > 100.0) return { dist: out, error: "traffic distribution percentage must be between 0 and 100" }
+    out.push({ version: v, percentage: Math.round(p) })
+  }
+  return { dist: out, error: "" }
+}
+
+// The first problem with a deployment's name, expression or split, or "" when it is fine.
+function deploymentProblem(repo: PromptRepoConfig, prompt: Prompt, name: string, expr: string, dist: TrafficShare[], ownId: string | undefined): { status: int, message: string } | undefined {
+  for (const d of repo.deployments ?? []) {
+    if (d.name === name && d.id !== ownId) return { status: 409, message: "a deployment with that name already exists" }
+  }
+  const e = expr.trim()
+  if (e !== "" && e !== "true") {
+    try {
+      compile(e)
+    } catch (err) {
+      return { status: 400, message: `CEL compile error: ${err.message}` }
+    }
+  }
+  if (dist.length === 0) return undefined
+  const seen: string[] = []
+  let total = 0
+  for (const s of dist) {
+    if (seen.includes(s.version)) return { status: 400, message: `version ${s.version} appears more than once` }
+    seen.push(s.version)
+    const n = parseInt(s.version)
+    if (n === undefined || versionByNumber(prompt, n) === undefined) return { status: 400, message: `version ${s.version} is not a version of this prompt` }
+    total += s.percentage
+  }
+  if (total !== 100) return { status: 400, message: "traffic distribution percentages must sum to 100" }
+  return undefined
+}
+
+function versionByNumber(p: Prompt, n: int): PromptVersion | undefined {
+  for (const v of p.versions ?? []) {
+    if (v.version_number === n) return v
+  }
+  return undefined
+}
+
+// Routes one request under /api/prompt-repo/. path is the request's path and query.
+export function promptRoute(cfg: PromptRepoConfig | undefined, method: string, path: string, body: string): PromptReply {
+  const repo: PromptRepoConfig = cfg ?? {}
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  const query = q < 0 ? "" : path.slice(q + 1)
+  const segs = p.split("/").filter((s) => s !== "")
+  // segs: api, prompt-repo, <area>, ...
+  const area = segs[2] ?? ""
+  if (area === "prompts") return promptsRoute(repo, method, segs, body)
+  if (area === "versions") return versionsRoute(repo, method, segs)
+  if (area === "deployments") return deploymentsRoute(repo, method, segs, body, query)
+  if (area === "folders" || area === "sessions") return fail(404, `Raiju's prompt repository has no ${area}`)
+  return fail(404, `no such route ${p}`)
+}
+
+function promptsRoute(repo: PromptRepoConfig, method: string, segs: string[], body: string): PromptReply {
+  const prompts = repo.prompts ?? []
+  if (segs.length === 3) {
+    if (method === "GET") {
+      const items: string[] = []
+      for (const pr of prompts) items.push(promptJson(pr))
+      return reply(200, `{"prompts":[${items.join(",")}],"total":${items.length}}`)
+    }
+    if (method !== "POST") return notAllowed(method)
+    const fs = bodyOf(body)
+    if (fs === undefined) return fail(400, "invalid request body")
+    const name = rawStr(fs, "name") ?? ""
+    if (name === "") return fail(400, "name is required")
+    const now = Date.now()
+    const made: Prompt = { id: newId("pr_"), name: name, created_at: Math.floor(now), updated_at: Math.floor(now), versions: [] }
+    const next: PromptRepoConfig = { prompts: prompts.concat([made]), deployments: repo.deployments ?? [] }
+    return { status: 200, body: `{"prompt":${promptJson(made)}}`, next: next }
+  }
+  const id = segs[3] ?? ""
+  const i = promptIndex(prompts, id)
+  if (i < 0) return fail(404, "prompt not found")
+  const old = prompts[i]!
+  if (segs.length === 4) {
+    if (method === "GET") return reply(200, `{"prompt":${promptJson(old)}}`)
+    if (method === "PUT") {
+      const fs = bodyOf(body)
+      if (fs === undefined) return fail(400, "invalid request body")
+      const name = rawStr(fs, "name") ?? old.name
+      if (name === "") return fail(400, "name is required")
+      const renamed: Prompt = { id: old.id, name: name, created_at: old.created_at, updated_at: Math.floor(Date.now()), versions: old.versions ?? [] }
+      const list = prompts.slice()
+      list[i] = renamed
+      return { status: 200, body: `{"prompt":${promptJson(renamed)}}`, next: { prompts: list, deployments: repo.deployments ?? [] } }
+    }
+    if (method === "DELETE") {
+      const list = prompts.filter((x) => x.id !== id)
+      const deps = (repo.deployments ?? []).filter((d) => d.prompt_id !== id)
+      return { status: 200, body: `{"message":"prompt deleted"}`, next: { prompts: list, deployments: deps } }
+    }
+    return notAllowed(method)
+  }
+  if (segs.length === 5 && segs[4] === "versions") {
+    if (method === "GET") {
+      const items: string[] = []
+      const latest = latestOf(old)
+      for (const v of old.versions ?? []) items.push(versionJson(v, id, latest !== undefined && latest.id === v.id))
+      return reply(200, `{"versions":[${items.join(",")}],"total":${items.length}}`)
+    }
+    if (method !== "POST") return notAllowed(method)
+    const fs = bodyOf(body)
+    if (fs === undefined) return fail(400, "invalid request body")
+    const got = messagesOf(find(fs, "messages"))
+    if (got.error !== "") return fail(400, got.error)
+    const paramsRaw = find(fs, "model_params")
+    let params: string | undefined = undefined
+    if (paramsRaw !== undefined && paramsRaw !== "null") {
+      if (!paramsRaw.startsWith("{")) return fail(400, "model_params must be an object")
+      params = paramsRaw
+    }
+    const given: string[] = []
+    const varsRaw = find(fs, "variables")
+    if (varsRaw !== undefined && varsRaw.startsWith("{")) {
+      for (const f of objectFields(varsRaw) ?? []) given.push(f.key)
+    }
+    const now = Math.floor(Date.now())
+    let top = 0
+    for (const v of old.versions ?? []) {
+      if (v.version_number > top) top = v.version_number
+    }
+    const made: PromptVersion = {
+      id: newId("pv_"),
+      version_number: top + 1,
+      commit_message: rawStr(fs, "commit_message") ?? "",
+      messages: got.msgs,
+      model_params: params,
+      provider: rawStr(fs, "provider") ?? "",
+      model: rawStr(fs, "model") ?? "",
+      variables: variableNames(given, got.msgs),
+      created_at: now,
+    }
+    const renamed: Prompt = { id: old.id, name: old.name, created_at: old.created_at, updated_at: now, versions: (old.versions ?? []).concat([made]) }
+    const list = prompts.slice()
+    list[i] = renamed
+    return { status: 200, body: `{"version":${versionJson(made, id, true)}}`, next: { prompts: list, deployments: repo.deployments ?? [] } }
+  }
+  return fail(404, "no such route")
+}
+
+function versionsRoute(repo: PromptRepoConfig, method: string, segs: string[]): PromptReply {
+  if (segs.length !== 4) return fail(404, "no such route")
+  const id = segs[3] ?? ""
+  const prompts = repo.prompts ?? []
+  for (let i = 0; i < prompts.length; i++) {
+    const p = prompts[i]!
+    for (const v of p.versions ?? []) {
+      if (v.id !== id) continue
+      if (method === "GET") {
+        const latest = latestOf(p)
+        return reply(200, `{"version":${versionJson(v, p.id, latest !== undefined && latest.id === v.id)}}`)
+      }
+      if (method !== "DELETE") return notAllowed(method)
+      for (const d of repo.deployments ?? []) {
+        for (const s of d.traffic_distribution ?? []) {
+          if (s.version === "" + v.version_number && d.prompt_id === p.id) return fail(409, `version ${v.version_number} is used by deployment ${d.name}`)
+        }
+      }
+      const kept = (p.versions ?? []).filter((x) => x.id !== id)
+      const list = prompts.slice()
+      list[i] = { id: p.id, name: p.name, created_at: p.created_at, updated_at: Math.floor(Date.now()), versions: kept }
+      return { status: 200, body: `{"message":"version deleted"}`, next: { prompts: list, deployments: repo.deployments ?? [] } }
+    }
+  }
+  return fail(404, "version not found")
+}
+
+function deploymentsRoute(repo: PromptRepoConfig, method: string, segs: string[], body: string, query: string): PromptReply {
+  const deps = repo.deployments ?? []
+  const prompts = repo.prompts ?? []
+  if (segs.length === 3) {
+    if (method === "GET") {
+      const want = new URLSearchParams(query).get("prompt_id") ?? ""
+      const items: string[] = []
+      for (const d of deps) {
+        if (want === "" || d.prompt_id === want) items.push(deploymentJson(d))
+      }
+      return reply(200, `{"deployments":[${items.join(",")}],"total":${items.length}}`)
+    }
+    if (method !== "POST") return notAllowed(method)
+    const fs = bodyOf(body)
+    if (fs === undefined) return fail(400, "invalid request body")
+    const pid = rawStr(fs, "prompt_id") ?? ""
+    const name = rawStr(fs, "name") ?? ""
+    if (pid === "") return fail(400, "prompt_id is required")
+    if (name === "") return fail(400, "name is required")
+    const pi = promptIndex(prompts, pid)
+    if (pi < 0) return fail(404, "prompt not found")
+    const expr = rawStr(fs, "cel_expression") ?? ""
+    const got = distributionOf(find(fs, "traffic_distribution"))
+    if (got.error !== "") return fail(400, got.error)
+    const bad = deploymentProblem(repo, prompts[pi]!, name, expr, got.dist, undefined)
+    if (bad !== undefined) return fail(bad.status, bad.message)
+    const now = Math.floor(Date.now())
+    const made: Deployment = { id: newId("pd_"), prompt_id: pid, name: name, description: rawStr(fs, "description") ?? "", cel_expression: expr, traffic_distribution: got.dist, created_at: now, updated_at: now }
+    return { status: 201, body: deploymentJson(made), next: { prompts: prompts, deployments: deps.concat([made]) } }
+  }
+  const id = segs[3] ?? ""
+  const i = deploymentIndex(deps, id)
+  if (i < 0) return fail(404, "deployment not found")
+  const old = deps[i]!
+  if (segs.length !== 4) return fail(404, "no such route")
+  if (method === "GET") return reply(200, deploymentJson(old))
+  if (method === "DELETE") {
+    const kept = deps.filter((d) => d.id !== id)
+    return { status: 200, body: `{"message":"deployment deleted"}`, next: { prompts: prompts, deployments: kept } }
+  }
+  if (method !== "PUT") return notAllowed(method)
+  const fs = bodyOf(body)
+  if (fs === undefined) return fail(400, "invalid request body")
+  const name = rawStr(fs, "name") ?? old.name
+  if (name === "") return fail(400, "name is required")
+  const expr = rawStr(fs, "cel_expression") ?? old.cel_expression ?? ""
+  let dist = old.traffic_distribution ?? []
+  const distRaw = find(fs, "traffic_distribution")
+  if (distRaw !== undefined) {
+    const got = distributionOf(distRaw)
+    if (got.error !== "") return fail(400, got.error)
+    dist = got.dist
+  }
+  const pi = promptIndex(prompts, old.prompt_id)
+  if (pi < 0) return fail(404, "prompt not found")
+  const bad = deploymentProblem(repo, prompts[pi]!, name, expr, dist, id)
+  if (bad !== undefined) return fail(bad.status, bad.message)
+  const updated: Deployment = { id: old.id, prompt_id: old.prompt_id, name: name, description: rawStr(fs, "description") ?? old.description ?? "", cel_expression: expr, traffic_distribution: dist, created_at: old.created_at, updated_at: Math.floor(Date.now()) }
+  const list = deps.slice()
+  list[i] = updated
+  return { status: 200, body: deploymentJson(updated), next: { prompts: prompts, deployments: list } }
+}
+
+// Whether a deployment's expression matches the request. An empty expression, or "true", matches.
+function matches(expr: string, act: Activation): bool {
+  const e = expr.trim()
+  if (e === "" || e === "true") return true
+  try {
+    return evaluate(compile(e), act) === true
+  } catch (err) {
+    return false
+  }
+}
+
+// The version a traffic split draws for a roll in [0, 1), or undefined when no entry names one.
+function drawVersion(p: Prompt, dist: TrafficShare[], roll: f64): PromptVersion | undefined {
+  let total = 0
+  for (const s of dist) {
+    if (s.percentage > 0) total += s.percentage
+  }
+  if (total <= 0) return undefined
+  const at = roll * total
+  let acc = 0
+  for (const s of dist) {
+    if (s.percentage <= 0) continue
+    acc += s.percentage
+    if (at < acc) return versionByNumber(p, parseInt(s.version) ?? -1)
+  }
+  return undefined
+}
+
+// The request facts a deployment's expression sees.
+export type PromptUsage = { budgetPercent: f64, tokensPercent: f64, requestsPercent: f64 }
+
+// The version a request gets: a matching deployment's draw first, then the x-bf-prompt-version
+// pin, then the latest. A pin names a version number; 0 means latest, as in Bifrost, and a pin
+// that names no version (or is not a number, given as -1) gets nothing: the request passes
+// through unchanged. undefined when the prompt does not exist or has no version to use.
+export function resolveVersion(repo: PromptRepoConfig, promptId: string, act: Activation, pinned: int | undefined, roll: f64): { prompt: Prompt, version: PromptVersion } | undefined {
+  const prompts = repo.prompts ?? []
+  const pi = promptIndex(prompts, promptId)
+  if (pi < 0) return undefined
+  const prompt = prompts[pi]!
+  const deps = (repo.deployments ?? []).filter((d) => d.prompt_id === promptId)
+  deps.sort((a, b) => b.created_at - a.created_at)
+  for (const d of deps) {
+    const dist = d.traffic_distribution ?? []
+    if (dist.length === 0) continue
+    if (!matches(d.cel_expression ?? "", act)) continue
+    const v = drawVersion(prompt, dist, roll)
+    if (v !== undefined) return { prompt: prompt, version: v }
+  }
+  if (pinned !== undefined && pinned !== 0) {
+    const v = versionByNumber(prompt, pinned)
+    return v === undefined ? undefined : { prompt: prompt, version: v }
+  }
+  const latest = latestOf(prompt)
+  return latest === undefined ? undefined : { prompt: prompt, version: latest }
+}
+
+// The request body with the version's messages before its own and its parameters where the
+// request leaves them out. The messages are rendered with the variable values.
+export function injectVersion(text: string, version: PromptVersion, vars: Map<string, string>): string throws SyntaxError {
+  let fs = try fields(text)
+  const tmpl: string[] = []
+  for (const m of version.messages) {
+    tmpl.push(JSON.stringify({ role: m.role, content: renderTemplate(m.content, vars) }))
+  }
+  const cur = find(fs, "messages")
+  let old: string[] = []
+  if (cur !== undefined && cur.startsWith("[")) old = try elements(cur)
+  setField(&fs, "messages", "[" + tmpl.concat(old).join(",") + "]")
+  const pm = version.model_params
+  if (pm !== undefined && pm !== "") {
+    for (const f of try fields(pm)) {
+      if (find(fs, f.key) === undefined) setField(&fs, f.key, f.raw)
+    }
+  }
+  return build(fs)
+}
+
+// What the gateway learns from applying a prompt: the request body to use, and the prompt and
+// version that were applied (empty when none was).
+export type Applied = { text: string, prompt_id?: string, prompt_name?: string, version?: int }
+
+// Applies the prompt a chat request names with x-bf-prompt-id. A request without the header, or
+// naming no prompt that exists, comes back unchanged.
+export function applyPrompt(repo: PromptRepoConfig | undefined, h: Hdrs, text: string, usage: PromptUsage): Applied throws SyntaxError {
+  const pid = (h.get("x-bf-prompt-id") ?? "").trim()
+  if (pid === "" || repo === undefined) return { text: text }
+  const fs = try fields(text)
+  const model = rawStr(fs, "model") ?? ""
+  const stream = rawBool(fs, "stream") ?? false
+  const slash = model.indexOf("/")
+  const params: Map<string, string> = new Map()
+  for (const f of fs) {
+    if (!f.raw.startsWith("[") && !f.raw.startsWith("{")) params.set(f.key, plain(f.raw))
+  }
+  const act: Activation = {
+    model: slash < 0 ? model : model.slice(slash + 1),
+    provider: slash < 0 ? "" : model.slice(0, slash),
+    request_type: stream ? "chat_completion_stream" : "chat_completion",
+    budget_used: usage.budgetPercent,
+    tokens_used: usage.tokensPercent,
+    request_used: usage.requestsPercent,
+    headers: h,
+    params: params,
+  }
+  // an empty pin is no pin; one that is not a number names no version (-1 never matches)
+  const pinRaw = (h.get("x-bf-prompt-version") ?? "").trim()
+  let pin: int | undefined = undefined
+  if (pinRaw !== "") pin = parseInt(pinRaw) ?? -1
+  const sel = resolveVersion(repo, pid, act, pin, Math.random())
+  if (sel === undefined) return { text: text }
+  const out = try injectVersion(text, sel.version, variablesOf(h))
+  return { text: out, prompt_id: sel.prompt.id, prompt_name: sel.prompt.name, version: sel.version.version_number }
+}
+
+// ---- tests ----
+
+// The fields the tests read from route answers (all optional: a typed parse needs every
+// required field, and an error answer has none of these).
+type Shape = { prompt?: { id?: string }, version?: { id?: string, version_number?: int, variables?: string[], is_latest?: bool }, versions?: { version_number?: int, is_latest?: bool }[], total?: int, error?: { message?: string }, messages?: { role?: string, content?: string }[], temperature?: f64, max_tokens?: int }
+
+function jsonOf(text: string): Shape throws SyntaxError {
+  return try JSON.parse(text) as Shape
+}
+
+function headersOf2(pairs: string[][]): Hdrs {
+  const h: Hdrs = new Map()
+  for (const p of pairs) h.set(p[0]!, p[1]!)
+  return h
+}
+
+const NO_USAGE: PromptUsage = { budgetPercent: 0.0, tokensPercent: 0.0, requestsPercent: 0.0 }
+
+test("templates render named values and leave missing ones empty", () => {
+  const vars: Map<string, string> = new Map()
+  vars.set("name", "Ana")
+  expect(renderTemplate("Hi {{ name }}, {{missing}}! {{name}}", vars)).toBe("Hi Ana, ! Ana")
+  expect(renderTemplate("no braces", vars)).toBe("no braces")
+  expect(renderTemplate("open {{ never closed", vars)).toBe("open {{ never closed")
+})
+
+test("prompts, versions and their numbering follow the repository routes", () => {
+  const created = promptRoute(undefined, "POST", "/api/prompt-repo/prompts", `{"name":"greet"}`)
+  expect(created.status).toBe(200)
+  const pid = try jsonOf(created.body).prompt!.id! as string
+  expect(promptRoute(undefined, "POST", "/api/prompt-repo/prompts", `{}`).status).toBe(400)
+  const repo1 = created.next!
+  const body = `{"messages":[{"role":"system","content":"Be {{tone}}."}],"model_params":{"temperature":0.2},"variables":{"tone":""},"commit_message":"first"}`
+  const c1 = promptRoute(repo1, "POST", `/api/prompt-repo/prompts/${pid}/versions`, body)
+  expect(c1.status).toBe(200)
+  expect(try jsonOf(c1.body).version!.version_number!).toBe(1)
+  expect(try jsonOf(c1.body).version!.variables![0]!).toBe("tone")
+  const repo2 = c1.next!
+  const c2 = promptRoute(repo2, "POST", `/api/prompt-repo/prompts/${pid}/versions`, `{"messages":[{"role":"user","content":"Hi"}]}`)
+  expect(try jsonOf(c2.body).version!.version_number!).toBe(2)
+  const list = try jsonOf(promptRoute(c2.next!, "GET", `/api/prompt-repo/prompts/${pid}/versions`, "").body)
+  expect(list.versions!.length).toBe(2)
+  expect(list.versions![1]!.is_latest).toBe(true)
+  expect(list.versions![0]!.is_latest).toBe(false)
+  expect(promptRoute(c2.next!, "POST", `/api/prompt-repo/prompts/${pid}/versions`, `{"messages":[]}`).status).toBe(400)
+  expect(promptRoute(c2.next!, "POST", `/api/prompt-repo/prompts/nope/versions`, body).status).toBe(404)
+  expect(promptRoute(c2.next!, "GET", `/api/prompt-repo/prompts/${pid}/nope`, "").status).toBe(404)
+  expect(promptRoute(c2.next!, "PATCH", `/api/prompt-repo/prompts/${pid}`, "").status).toBe(405)
+  expect(promptRoute(c2.next!, "GET", `/api/prompt-repo/folders`, "").status).toBe(404)
+})
+
+test("a deployment's CEL and split are checked; a version in use cannot be deleted", () => {
+  const made = promptRoute(undefined, "POST", "/api/prompt-repo/prompts", `{"name":"p"}`)
+  const pid = try jsonOf(made.body).prompt!.id! as string
+  const v = promptRoute(made.next!, "POST", `/api/prompt-repo/prompts/${pid}/versions`, `{"messages":[{"role":"user","content":"a"}]}`)
+  const vid = try jsonOf(v.body).version!.id! as string
+  const repo = v.next!
+  const dep = `{"prompt_id":"${pid}","name":"canary","cel_expression":"model == \\"gpt-4o\\"","traffic_distribution":[{"version":"1","percentage":100}]}`
+  const bad = promptRoute(repo, "POST", "/api/prompt-repo/deployments", `{"prompt_id":"${pid}","name":"x","cel_expression":"nope == 1"}`)
+  expect(bad.status).toBe(400)
+  expect(try jsonOf(bad.body).error!.message!.startsWith("CEL compile error")).toBe(true)
+  expect(promptRoute(repo, "POST", "/api/prompt-repo/deployments", `{"prompt_id":"${pid}","name":"x","traffic_distribution":[{"version":"1","percentage":60}]}`).status).toBe(400)
+  expect(promptRoute(repo, "POST", "/api/prompt-repo/deployments", `{"prompt_id":"${pid}","name":"x","traffic_distribution":[{"version":"9","percentage":100}]}`).status).toBe(400)
+  const ok = promptRoute(repo, "POST", "/api/prompt-repo/deployments", dep)
+  expect(ok.status).toBe(201)
+  expect(promptRoute(ok.next!, "POST", "/api/prompt-repo/deployments", dep).status).toBe(409)
+  expect(promptRoute(ok.next!, "DELETE", `/api/prompt-repo/versions/${vid}`, "").status).toBe(409)
+  expect(promptRoute(ok.next!, "GET", "/api/prompt-repo/deployments?prompt_id=" + pid, "").body.includes(`"total":1`)).toBe(true)
+})
+
+test("resolution: a matching deployment draws its version, else the pin, else the latest", () => {
+  const repo: PromptRepoConfig = try JSON.parse(`{
+    "prompts": [{"id":"p1","name":"greet","created_at":1,"updated_at":1,"versions":[
+      {"id":"a","version_number":1,"messages":[{"role":"user","content":"one"}],"created_at":1},
+      {"id":"b","version_number":2,"messages":[{"role":"user","content":"two"}],"created_at":2},
+      {"id":"c","version_number":3,"messages":[{"role":"user","content":"three"}],"created_at":3}]}],
+    "deployments": [{"id":"d1","prompt_id":"p1","name":"gpt","cel_expression":"model == \\"gpt-4o\\"","created_at":5,
+      "updated_at":5,"traffic_distribution":[{"version":"1","percentage":10},{"version":"2","percentage":90}]}]
+  }`)
+  const act = (model: string): Activation => ({ model: model, provider: "openai", request_type: "chat_completion", budget_used: 0.0, tokens_used: 0.0, headers: new Map(), params: new Map() })
+  expect(resolveVersion(repo, "p1", act("gpt-4o"), undefined, 0.05)!.version!.version_number!).toBe(1)
+  expect(resolveVersion(repo, "p1", act("gpt-4o"), undefined, 0.5)!.version!.version_number!).toBe(2)
+  expect(resolveVersion(repo, "p1", act("gpt-4o-mini"), 1, 0.5)!.version!.version_number!).toBe(1)
+  expect(resolveVersion(repo, "p1", act("gpt-4o-mini"), undefined, 0.5)!.version!.version_number!).toBe(3)
+  expect(resolveVersion(repo, "p1", act("gpt-4o-mini"), 9, 0.5)).toBeUndefined()
+  expect(resolveVersion(repo, "p1", act("gpt-4o-mini"), 0, 0.5)!.version!.version_number!).toBe(3)
+  expect(resolveVersion(repo, "nope", act("gpt-4o"), undefined, 0.5)).toBeUndefined()
+})
+
+test("a chat request gets the version's messages first and its parameters where it leaves them out", () => {
+  const repo: PromptRepoConfig = try JSON.parse(`{
+    "prompts": [{"id":"p1","name":"greet","created_at":1,"updated_at":1,"versions":[
+      {"id":"a","version_number":1,"messages":[{"role":"system","content":"Greet {{name}} politely."}],
+       "model_params":"{\\"temperature\\":0.2,\\"max_tokens\\":50}","created_at":1}]}]
+  }`)
+  const h = headersOf2([["x-bf-prompt-id", "p1"], ["x-bf-prompt-var-name", "Ana"]])
+  const req = `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0.9}`
+  const out = try applyPrompt(repo, h, req, NO_USAGE)
+  expect(out.prompt_id).toBe("p1")
+  expect(out.version).toBe(1)
+  const got = try jsonOf(out.text)
+  expect(got.messages!.length).toBe(2)
+  expect(got.messages![0]!.content).toBe("Greet Ana politely.")
+  expect(got.messages![1]!.content).toBe("hi")
+  expect(got.temperature!).toBe(0.9)
+  expect(got.max_tokens!).toBe(50)
+  // without the header, or with an unknown prompt, the body is untouched
+  expect(try applyPrompt(repo, headersOf2([]), req, NO_USAGE).text).toBe(req)
+  const unknown = try applyPrompt(repo, headersOf2([["x-bf-prompt-id", "zzz"]]), req, NO_USAGE)
+  expect(unknown.text).toBe(req)
+  expect(unknown.prompt_id).toBeUndefined()
+  // a pin that names no version leaves the request unchanged, as Bifrost's plugin does
+  const pinned = try applyPrompt(repo, headersOf2([["x-bf-prompt-id", "p1"], ["x-bf-prompt-version", "7"]]), req, NO_USAGE)
+  expect(pinned.text).toBe(req)
+  expect(pinned.prompt_id).toBeUndefined()
+  expect(try applyPrompt(repo, headersOf2([["x-bf-prompt-id", "p1"], ["x-bf-prompt-version", "x"]]), req, NO_USAGE).text).toBe(req)
+  // an empty pin is no pin, and pin 0 is the latest
+  expect(try applyPrompt(repo, headersOf2([["x-bf-prompt-id", "p1"], ["x-bf-prompt-version", ""]]), req, NO_USAGE).version).toBe(1)
+  expect(try applyPrompt(repo, headersOf2([["x-bf-prompt-id", " p1 "], ["x-bf-prompt-version", "0"]]), req, NO_USAGE).version).toBe(1)
+})

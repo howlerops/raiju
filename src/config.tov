@@ -4,7 +4,8 @@
 import { readFileSync, existsSync } from "node:fs"
 import { RoutingRule } from "./cel"
 import { OtelConfig } from "./otel"
-import { McpConfig } from "./mcp"
+import { PushGatewayConfig } from "./pushgateway"
+import { McpConfig, McpKeyConfig } from "./mcp"
 import { AlertRule, CelRule, Channel } from "./alerts"
 import { TierMap } from "./complexity"
 import { ClusterConfig } from "./cluster"
@@ -12,8 +13,10 @@ import { AuthProxyConfig } from "./authproxy"
 import { OidcConfig } from "./oidc"
 import { VirtualMcp } from "./vmcp"
 import { VectorStoreSettings } from "./vectorstore"
-import { fields, elements, find, rawStr, rawBool, isNull } from "./json"
+import { fields, elements, find, rawStr, rawBool, rawNum, isNull } from "./json"
 import { normalize } from "./config_compat"
+import { PromptRepoConfig } from "./prompts"
+import { FeatureFlagsConfig, FlagOverride } from "./flags"
 
 // client_id, client_secret and tenant_id: Entra ID (service principal) instead of an API key
 export type AzureKeyConfig = { endpoint: string, deployments?: Map<string, string>, api_version?: string, client_id?: string, client_secret?: string, tenant_id?: string, scopes?: string[] }
@@ -37,14 +40,19 @@ export type BatchS3Bucket = { bucket_name: string, prefix?: string, is_default?:
 // batch_s3_config: the buckets batch input and output live in; the default one is used when a request names none.
 export type BedrockKeyConfig = { access_key?: string, secret_key?: string, session_token?: string, region?: string, deployments?: Map<string, string>, role_arn?: string, external_id?: string, session_name?: string, arn?: string, use_openai_endpoints?: bool, batch_role_arn?: string, batch_s3_config?: { buckets?: BatchS3Bucket[] } }
 
+// Bifrost's alias object form: model_id is the wire name; model_name is the canonical name that
+// pricing and logs use; model_family is the family enum (aliases.tov ALIAS_FAMILIES).
+export type AliasTarget = { model_id: string, model_name?: string, model_family?: string, description?: string }
+
 export type KeyConfig = {
   id?: string,
   name?: string,
   value?: string,
   models?: string[],
   weight?: f64,
-  // request model name → the name this key's provider knows it by
-  aliases?: Map<string, string>,
+  // request model name → the name this key's provider knows it by: a plain model id, or
+  // Bifrost's object form (aliases.tov AliasTarget)
+  aliases?: Map<string, string | AliasTarget>,
   azure_key_config?: AzureKeyConfig,
   vertex_key_config?: VertexKeyConfig,
   bedrock_key_config?: BedrockKeyConfig,
@@ -68,6 +76,9 @@ export type NetworkConfig = {
   // TLS to the provider: skip certificate checks, or trust these PEM certificates as well
   insecure_skip_verify?: bool,
   ca_cert_pem?: string,
+  // Bifrost's network_config extras. Raiju does not guard provider addresses, so private
+  // addresses are always reachable and allow_private_network has no effect.
+  allow_private_network?: bool,
 }
 
 // ca_cert_pem: the proxy's certificate authority, for a TLS-intercepting proxy
@@ -115,12 +126,14 @@ export type ProviderConfig = {
   openai_config?: OpenAIProviderConfig,
   prompt_cache?: ProviderPromptCacheConfig,
   injected_tools?: InjectedTool[],
-  // Bifrost: cost always comes from Raiju's pricing table, never the provider's usage.cost
+  // Bifrost: when true, cost comes from the pricing table even if the provider reports usage.cost
   ignore_provider_cost?: bool,
 }
 
 export type ClientConfig = {
   drop_excess_requests?: bool,
+  // how long a rotated virtual key's old value keeps working, as a duration ("0" or unset: at once)
+  vk_rotation_cooldown?: string,
   // "body" (default) or "headers": where Bifrost's extra_fields (raw request/response) go
   extra_fields_placement?: string,
   // Bifrost's content-logging controls: keep request and response bodies out of the log
@@ -138,6 +151,10 @@ export type ClientConfig = {
   required_headers?: string[],
   // callers may send their own provider key (x-bf-direct-key: true + Authorization / x-api-key)
   allow_direct_keys?: bool,
+  // Raiju only: refuse a request that is subject to a budget when its model has no price
+  // (no datasheet row, override or config price). Off, the request passes and its cost is 0,
+  // as in Bifrost.
+  refuse_unpriced_models?: bool,
   // x-bf-send-back-raw-request / -response headers override the provider's send_back_raw_* settings
   allow_per_request_raw_override?: bool,
   allowed_origins?: string[],
@@ -149,9 +166,71 @@ export type ClientConfig = {
   mcp_auto_execute?: string[],
   // Bifrost: MCP tools are not added to chat requests unless a request names its clients (x-bf-mcp-include-clients)
   mcp_disable_auto_tool_inject?: bool,
+  // request headers copied into each log row's metadata: exact names, or prefixes ending in "*" (reqlog.tov)
+  logging_headers?: string[],
+  // Bifrost's compat plugin settings (src/compat.tov); absent means the plugin is off unless a request's x-bf-compat turns features on
+  compat?: CompatConfig,
+  // Bifrost's header controls. header_filter_config filters the x-bf-eh-* headers sent upstream
+  // (an allowlist, when set, is the only way in; the denylist always blocks). allowed_headers adds
+  // to the CORS allow list. whitelisted_routes skip the admin login (exact paths).
+  header_filter_config?: HeaderFilterConfig,
+  allowed_headers?: string[],
+  whitelisted_routes?: string[],
+  // Bifrost: an inference request with both an identity token and x-bf-vk: "error" (400),
+  // "prefer_vk" (the token is dropped) or "prefer_idp" (default). Raiju's identity is OIDC (oidc.tov).
+  dual_credential_conflict_behavior?: string,
+  // Bifrost: full error details go to the server console (never to the client)
+  dump_errors_in_console_logs?: bool,
+  // Bifrost: the deepest model alias chain a key may follow (default 10)
+  routing_chain_max_depth?: int,
+  // Bifrost: request types left out of the log and dashboard reads (logs are still stored)
+  hidden_request_types?: string[],
+  // Bifrost's virtual key lifecycle settings (read and kept; vk_rotation_cooldown is above)
+  hide_deleted_virtual_keys_in_filters?: bool,
+  delete_expired_virtual_keys?: bool,
+  enforce_vk_object_ownership?: bool,
+  // Bifrost: scoped temp tokens may open the per-user MCP consent flows (src/mcpuser.tov)
+  mcp_enable_temp_token_auth?: bool,
+  // Bifrost's MCP server auth for /mcp: "headers" (default; virtual keys only), "both" (keys and
+  // Bifrost-issued JWTs) or "oauth" (JWTs only). Raiju is the authorization server (src/mcpissuer.tov).
+  mcp_server_auth_mode?: string,
+  oauth2_server_config?: OAuth2ServerConfig,
+  // Bifrost's webhook settings: deliveries older than this many days are dropped (default 30)
+  webhook_config?: WebhookConfigSettings,
 }
 
-export type BudgetConfig = { id: string, max_limit: f64, reset_duration: string, current_usage?: f64 }
+// Bifrost's oauth2_server_config. issuer_url is the authorization server's identity (the iss claim and the
+// discovery documents) and is required when client.mcp_server_auth_mode is "both" or "oauth". signing_key is
+// the RS256 private key (PEM, PKCS#1 or PKCS#8) that signs the tokens; Bifrost generates and stores its own
+// key, Raiju reads the operator's. issuer_url and signing_key may be env.NAME references.
+export type OAuth2ServerConfig = {
+  issuer_url?: string,
+  auth_code_ttl?: int,
+  access_token_ttl?: int,
+  allowed_redirect_uris?: string[],
+  disable_vk_identity?: bool,
+  signing_key?: string,
+}
+
+export type HeaderFilterConfig = { allowlist?: string[], denylist?: string[] }
+export type WebhookConfigSettings = { delivery_history_retention_days?: int }
+
+// Bifrost's compat features. A section that is there turns every feature on, except convert_decision_to_responses.
+export type CompatConfig = {
+  convert_text_to_chat?: bool,
+  convert_chat_to_responses?: bool,
+  should_drop_params?: bool,
+  should_convert_params?: bool,
+  azure_deepseek?: bool,
+  force_reasoning_only_models_to_responses?: bool,
+  convert_decision_to_responses?: bool,
+}
+
+// A budget override adds amount to max_limit while it is set. Raiju keeps the "forever" mode only:
+// it stays until it is cleared (Bifrost's budget override, PUT and DELETE .../budgets/{id}/override).
+// mode "forever" adds amount to the limit; "cycles" adds it for cycles reset windows (the current one counts).
+export type BudgetOverride = { amount: f64, mode: string, cycles?: int }
+export type BudgetConfig = { id: string, max_limit: f64, reset_duration: string, current_usage?: f64, override?: BudgetOverride }
 export type RateLimitConfig = {
   id: string,
   token_max_limit?: int,
@@ -175,6 +254,20 @@ export type VirtualKeyConfig = {
   provider_configs?: ProviderConfigRef[],
   key_ids?: string[],
   access_profile_ids?: string[],
+  // RFC 3339; the key is refused from this time on (Bifrost's expires_at)
+  expires_at?: string,
+  // the value a rotation retired, accepted until previous_value_expires_at (client.vk_rotation_cooldown)
+  previous_value?: string,
+  previous_value_expires_at?: string,
+  rotated_at?: string,
+  // Bifrost's virtual_key_mcp_config list: the MCP tools this key may run, per client. Absent means
+  // no list (the key is not limited); a list, even an empty one, is judged as Bifrost judges it.
+  mcp_configs?: McpKeyConfig[],
+  // the user this key is assigned to (Bifrost's governance user); recorded on the key's log entries
+  user_id?: string,
+  // Bifrost's delete_after_expire: the cleanup deletes the key once it has expired. Absent inherits
+  // client.delete_expired_virtual_keys.
+  delete_after_expire?: bool,
 }
 // A reusable permission set that virtual keys reference (access_profile_ids); see profiles.tov.
 export type AccessProfile = {
@@ -188,10 +281,19 @@ export type AccessProfile = {
   budget_id?: string,
   rate_limit_id?: string,
   mcp_tools?: string[],
+  // the MCP tools per client, and the virtual MCPs (by name) the profile grants
+  mcp_configs?: McpKeyConfig[],
+  virtual_mcps?: string[],
   required_headers?: string[],
   max_tokens?: int,
   is_active?: bool,
+  // the change history, oldest first (Bifrost's versions); see profiles.tov
+  versions?: ProfileVersion[],
 }
+
+// One entry of a profile's history: the change (create, update, activate, deactivate or clone), when it
+// was made, and the profile as JSON text without its own versions.
+export type ProfileVersion = { version: int, action: string, at: string, snapshot: string }
 
 export type PricingOverrideConfig = {
   id?: string,
@@ -229,8 +331,51 @@ export type ProviderGovernance = { id?: string, name: string, description?: stri
 // every interval_seconds (at least an hour); the built-in copy is used until then.
 export type PricingSyncConfig = { url?: string, interval_seconds?: int, enabled?: bool }
 
-export type TeamConfig = { id: string, name: string, customer_id?: string, budget_id?: string }
+export type TeamConfig = { id: string, name: string, customer_id?: string, budget_id?: string, business_unit_id?: string }
 export type CustomerConfig = { id: string, name: string, budget_id?: string }
+
+// Bifrost's governance.business_units: a group of teams and customers with its own budget and rate
+// limit. A team's spend also counts against its business unit (team_ids or the team's business_unit_id).
+export type BusinessUnitConfig = { id: string, name: string, budget_id?: string, rate_limit_id?: string, team_ids?: string[], customer_ids?: string[] }
+
+// Bifrost's governance.projects: a scope a request opts into with x-bf-project-id or x-bf-project-name.
+// access_rule "union" (default) adds the project's provider configs to the caller's own access;
+// "intersect" allows only what both allow. accounting_mode "both" (default) charges the project and
+// the caller, "project_only" charges only the project, "principal_only" only the caller.
+// membership_mode "explicit" (default) admits the virtual keys in virtual_key_ids; "open" admits any caller.
+export type ProjectConfig = {
+  id: string,
+  name: string,
+  description?: string,
+  is_active?: bool,
+  access_rule?: string,
+  accounting_mode?: string,
+  membership_mode?: string,
+  virtual_key_ids?: string[],
+  budget_id?: string,
+  rate_limit_id?: string,
+  provider_configs?: ProviderConfigRef[],
+  // the MCP tools the project may run, per client, and the virtual MCPs (by name) it is assigned
+  mcp_configs?: McpKeyConfig[],
+  virtual_mcps?: string[],
+  // "none" (default) holds the members together in the project's caps; "equal" gives each member an equal
+  // slice of every budget the project holds (governance.tov addMemberCaps)
+  split_policy?: string,
+  members?: ProjectMember[],
+}
+
+// A member of a project (Bifrost's project member, here a user by name). budget_shares are the member's
+// own caps under split_policy none: a percent or an amount of a budget the project holds.
+export type MemberShare = { source_budget_id: string, share_value: f64, share_type: string }
+export type ProjectMember = { id: string, user_id: string, budget_shares?: MemberShare[] }
+
+// Bifrost's governance.roles entry: a named set of resource and operation permissions, and the data
+// access scope (dac) of its users. The built-in roles admin, editor, viewer and auditor are not listed here.
+export type PermissionPair = { resource: string, operation: string }
+// entity_dac: a data access scope for one resource, overriding the role's dac on that resource (Bifrost's
+// entity_dac object, kept as a list here; the management API reads and writes it as an object).
+export type EntityDac = { resource: string, dac: string }
+export type RoleConfig = { name: string, description?: string, dac?: string, permissions?: PermissionPair[], entity_dac?: EntityDac[] }
 
 // Credentials for the management API and UI (Bifrost's governance.auth_config, or its
 // deprecated top-level auth_config): admin_username/admin_password/is_enabled as Bifrost
@@ -239,11 +384,18 @@ export type AdminAuthConfig = { username?: string, password?: string, token?: st
 
 export type AdminUserConfig = {
   name: string,
-  role: "admin" | "editor" | "viewer" | "auditor",
+  // a built-in role (admin, editor, viewer, auditor) or the name of a custom role under governance.roles
+  role: string,
   token_sha256?: string,
   password_sha256?: string,
   salt?: string,
   disabled?: bool,
+  // the teams, business units and projects the user belongs to: the data they may see (see governance.tov)
+  teams?: string[],
+  business_units?: string[],
+  projects?: string[],
+  // the access profiles the user holds, the first ranked highest (Bifrost's user access profiles)
+  access_profile_ids?: string[],
 }
 
 export type GovernanceConfig = {
@@ -257,12 +409,17 @@ export type GovernanceConfig = {
   virtual_keys?: VirtualKeyConfig[],
   teams?: TeamConfig[],
   customers?: CustomerConfig[],
+  business_units?: BusinessUnitConfig[],
+  projects?: ProjectConfig[],
+  roles?: RoleConfig[],
   routing_rules?: RoutingRule[],
   model_configs?: ModelConfigGovernance[],
   providers?: ProviderGovernance[],
 }
 
-export type CacheConfig = { enabled?: bool, ttl_seconds?: int, max_entries?: int, cache_by_model?: bool, cache_by_provider?: bool }
+// scope_by_virtual_key (Raiju only): the exact-match cache keeps each virtual key's entries apart,
+// as the semantic cache does; off, keys share exact entries.
+export type CacheConfig = { enabled?: bool, ttl_seconds?: int, max_entries?: int, cache_by_model?: bool, cache_by_provider?: bool, scope_by_virtual_key?: bool }
 
 // Circuit breakers and adaptive load balancing across keys.
 export type HealthConfig = {
@@ -273,6 +430,22 @@ export type HealthConfig = {
   min_requests?: int,
   window_seconds?: int,
   open_seconds?: int,
+}
+
+// A circuit policy as the config file keeps it: Bifrost's circuit_breaker_config.policies entry.
+// default_cooldown is a Go duration ("30s"); health.tov reads it and writes it back.
+export type CircuitSignalConfig = { source: string, header_name: string, header_value?: string, header_contains?: string }
+export type CircuitPolicyConfig = {
+  name: string,
+  enabled?: bool,
+  primary_provider: string,
+  primary_model: string,
+  primary_key_ids?: string[],
+  fallback_provider: string,
+  fallback_model: string,
+  condition: { operator?: string, signals: CircuitSignalConfig[] },
+  default_cooldown?: string,
+  cooldown_header?: string,
 }
 
 // Native guardrails: which detectors run, what happens on a finding, and where.
@@ -376,7 +549,9 @@ export type LogsStoreConfig = {
 
 // A plugin from the config's plugins list. Its "config" object can hold any JSON,
 // which typed parsing can't, so it's kept as raw text in config_json.
-export type PluginSpec = { name: string, enabled?: bool, config_json?: string }
+// placement and order are Bifrost's sequencing fields: the placement group (pre_builtin, builtin or
+// post_builtin, default post_builtin) and the position within it (lower runs first, default 0).
+export type PluginSpec = { name: string, enabled?: bool, config_json?: string, placement?: string, order?: int }
 
 // Semantic caching (Bifrost's semantic_cache plugin): on an exact-cache miss the
 // prompt is embedded and a stored answer to a similar prompt is returned.
@@ -409,7 +584,10 @@ export type SecretsConfig = {
   aws?: { region: string, access_key?: string, secret_key?: string, session_token?: string },
 }
 
-export type AuditConfig = { enabled?: bool, dir?: string, key?: string, max_memory?: int }
+// retention_days deletes events older than that (0 or unset keeps them); omit_ip_addresses stops recording
+// client IPs; archive copies the events to object storage (LogExportsConfig's S3 or GCS fields) one window
+// at a time, a window ending archive_grace_seconds before now.
+export type AuditConfig = { enabled?: bool, dir?: string, key?: string, max_memory?: int, retention_days?: int, omit_ip_addresses?: bool, archive?: LogExportsConfig, archive_grace_seconds?: int }
 
 // rules are metric thresholds; cel_rules are Bifrost's CEL alert rules (alertapi.tov).
 export type AlertsConfig = { enabled?: bool, interval_seconds?: int, rules?: AlertRule[], cel_rules?: CelRule[], channels?: Channel[] }
@@ -469,11 +647,21 @@ export type LogExporterConfig = {
 
 export type AffinitySettings = { enabled?: bool, ttl_seconds?: int, max_sessions?: int }
 
-export type ComplexitySettings = { enabled?: bool, model?: string, simple_max_score?: f64, complex_min_score?: f64, tiers?: TierMap }
+// The complexity classifier: "heuristic" (the default), or "decision", "llm" or "semantic" (or "embedding"),
+// which ask a model. Timeouts are in milliseconds. See complexity.tov.
+export type ComplexityDecisionSettings = { provider?: string, model?: string, timeout_ms?: int, previous_message_count?: int }
+export type ComplexityLLMSettings = { provider?: string, model?: string, timeout_ms?: int, prompt?: string, message_history_count?: int }
+export type ComplexityExemplars = { simple?: string[], medium?: string[], complex?: string[] }
+export type ComplexitySemanticSettings = { provider?: string, embedding_model?: string, timeout_ms?: int, min_similarity?: f64, message_history_count?: int, exemplars?: ComplexityExemplars }
+
+export type ComplexitySettings = { enabled?: bool, model?: string, simple_max_score?: f64, complex_min_score?: f64, tiers?: TierMap, classifier?: string, decision?: ComplexityDecisionSettings, llm?: ComplexityLLMSettings, semantic?: ComplexitySemanticSettings }
 
 export type Config = {
   // Bifrost's encryption_key: saved provider key values are encrypted with it (env.NAME allowed)
   encryption_key?: string,
+  // Bifrost's setup_token: the operator's secret for the first admin account (env.NAME allowed);
+  // while no admin exists, POST /api/users needs it in the X-Bifrost-Setup-Token header
+  setup_token?: string,
   client?: ClientConfig,
   providers?: Map<string, ProviderConfig>,
   governance?: GovernanceConfig,
@@ -481,9 +669,13 @@ export type Config = {
   pricing?: Map<string, PricingEntry>,
   prompt_cache?: PromptCacheConfig,
   health?: HealthConfig,
+  // circuit breaker policies: a primary's circuit opens on response headers and reroutes to a fallback
+  circuit_breaker_policies?: CircuitPolicyConfig[],
   guardrails?: GuardrailsConfig,
   logs_store?: LogsStoreConfig,
   otel?: OtelConfig,
+  // Bifrost's telemetry plugin config (push_gateway; mapped from plugins[telemetry] by config_compat)
+  telemetry?: { push_gateway?: PushGatewayConfig, overhead_breakdown_enabled?: bool, user_labels_enabled?: bool },
   mcp?: McpConfig,
   plugins?: PluginSpec[],
   semantic_cache?: SemanticCacheSettings,
@@ -507,6 +699,41 @@ export type Config = {
   // identity-aware proxy in front of the API (Bifrost's authProxy under scim_config)
   auth_proxy?: AuthProxyConfig,
   proxy_config?: GlobalProxyConfig,
+  // Bifrost-style prompt repository (prompts.tov): prompts with their versions, and deployments
+  prompt_repo?: PromptRepoConfig,
+  // Bifrost's POST /api/config/metadata: UI and admin preferences (string, number or bool values)
+  metadata?: Map<string, string | f64 | bool>,
+  // Bifrost's webhooks: endpoints that get signed async-job outcomes (webhooks.tov)
+  webhooks?: WebhookEndpoint[],
+  // Bifrost's feature_flags: boot-time overrides of the flags in flags.tov
+  feature_flags?: FeatureFlagsConfig,
+  // User-Agent to app mappings for the request logs (logapi.tov); edited through /api/logs/user-agent-mappings
+  user_agent_mappings?: UserAgentMapping[],
+}
+
+// A rule that names the app a request's User-Agent belongs to. match_type is contains, starts_with or exact.
+export type UserAgentMapping = { id: string, pattern: string, match_type: string, app: string, is_active?: bool, created_at?: string, updated_at?: string }
+
+// One endpoint. name is unique; id is assigned when the API creates one, and config entries
+// may leave it out (the API then matches them by name). secret is "whsec_" plus base64 of
+// the signing key; config may give it as env.NAME.
+export type WebhookEndpoint = {
+  id?: string,
+  name: string,
+  url: string,
+  events: string[],
+  secret?: string,
+  headers?: Map<string, string>,
+  include_response?: bool,
+  allow_private_network?: bool,
+  disabled?: bool,
+  max_retries?: int,
+  retry_backoff_initial_seconds?: int,
+  retry_backoff_max_seconds?: int,
+  attempt_timeout_seconds?: int,
+  max_response_payload_kbs?: int,
+  created_at?: int,
+  updated_at?: int,
 }
 
 // The process environment by name. Tov's process.env takes only names written
@@ -641,6 +868,8 @@ function resolveKey(k: KeyConfig): KeyConfig {
 
 // Replaces every "env.NAME" value in the config with the variable's value.
 export function resolveConfig(inout c: Config): void {
+  resolveWebhooksAndFlags(&c)
+  if (c.setup_token !== undefined) c.setup_token = resolveEnv(c.setup_token)
   const ps = c.providers
   if (ps !== undefined) {
     const resolved: Map<string, ProviderConfig> = new Map()
@@ -682,6 +911,16 @@ export function resolveConfig(inout c: Config): void {
     let g: GovernanceConfig = c.governance ?? {}
     g.auth_config = eff
     c.governance = g
+  }
+  // the MCP authorization server's settings may name the environment (issuer_url, signing_key)
+  const oc = c.client?.oauth2_server_config
+  if (oc !== undefined) {
+    let o: OAuth2ServerConfig = oc
+    o.issuer_url = opt(o.issuer_url)
+    o.signing_key = opt(o.signing_key)
+    let cl: ClientConfig = c.client ?? {}
+    cl.oauth2_server_config = o
+    c.client = cl
   }
   const au = c.audit
   if (au !== undefined && au.key !== undefined) {
@@ -747,6 +986,38 @@ export function resolveConfig(inout c: Config): void {
   }
 }
 
+// Webhook secrets and header values, and feature flag values, may be env.NAME references.
+function resolveWebhooksAndFlags(inout c: Config): void {
+  const wh = c.webhooks
+  if (wh !== undefined) {
+    const out: WebhookEndpoint[] = []
+    for (const w of wh) {
+      let n = w
+      if (n.secret !== undefined) n.secret = resolveEnv(n.secret)
+      const hs = n.headers
+      if (hs !== undefined) {
+        const m: Map<string, string> = new Map()
+        for (const k of hs.keys()) m.set(k, resolveEnv(hs.get(k) ?? ""))
+        n.headers = m
+      }
+      out.push(n)
+    }
+    c.webhooks = out
+  }
+  const ff = c.feature_flags
+  const fl = ff === undefined ? undefined : ff.flags
+  if (fl !== undefined) {
+    const m: Map<string, FlagOverride> = new Map()
+    for (const id of fl.keys()) {
+      const o = fl.get(id)!
+      const v = o.enabled
+      const enabled: bool | string = typeof v === "string" ? resolveEnv(v) : v
+      m.set(id, { enabled: enabled, source: o.source, updated_at: o.updated_at })
+    }
+    c.feature_flags = { flags: m }
+  }
+}
+
 export function parseConfig(text: string): Config throws SyntaxError {
   let c = try JSON.parse(text) as Config
   resolveConfig(&c)
@@ -783,7 +1054,8 @@ export function pluginSpecs(configText: string): PluginSpec[] throws SyntaxError
     if (name === undefined) continue
     const conf = find(f, "config")
     const saved = rawStr(f, "config_json")
-    out.push({ name: name, enabled: rawBool(f, "enabled"), config_json: conf !== undefined && !isNull(conf) ? conf : saved })
+    const ord = rawNum(f, "order")
+    out.push({ name: name, enabled: rawBool(f, "enabled"), config_json: conf !== undefined && !isNull(conf) ? conf : saved, placement: rawStr(f, "placement"), order: ord === undefined ? undefined : Math.trunc(ord) })
   }
   return out
 }
@@ -814,6 +1086,15 @@ export function fromEnv(): Config {
   if (ollama !== undefined && ollama !== "") ps.set("ollama", { keys: [{ value: "", models: [], weight: 1.0 }], network_config: { base_url: ollama } })
   return { providers: ps }
 }
+
+test("the owner switches parse and default off", () => {
+  const on = try parseConfig(`{ "client": { "refuse_unpriced_models": true }, "cache": { "enabled": true, "scope_by_virtual_key": true } }`)
+  expect(on.client!.refuse_unpriced_models).toBe(true)
+  expect(on.cache!.scope_by_virtual_key).toBe(true)
+  const off = try parseConfig(`{ "cache": { "enabled": true } }`)
+  expect(off.client?.refuse_unpriced_models === true).toBe(false)
+  expect(off.cache?.scope_by_virtual_key === true).toBe(false)
+})
 
 test("parses a Bifrost config and resolves env values", () => {
   const c = try parseConfig(`{

@@ -1,5 +1,10 @@
 // Key-level model aliases: case-insensitive lookup, chained resolution with a
-// depth limit and cycle detection, and validation of an aliases map.
+// depth limit and cycle detection, and validation of an aliases map. A value is a
+// plain model id or Bifrost's object form (config.tov AliasTarget).
+import { AliasTarget } from "./config"
+
+// Bifrost's model_family enum (docs/providers/aliasing-models.mdx).
+const ALIAS_FAMILIES = ["anthropic", "openai", "mistral", "cohere", "gemini", "gemma", "llama", "imagen", "veo", "nova", "titan"]
 
 // Bifrost's DefaultChainMaxDepth for routing-rule chains.
 export const MAX_ALIAS_DEPTH: int = 10
@@ -8,14 +13,27 @@ export const MAX_ALIAS_DEPTH: int = 10
 export type AliasResult = { model: string, error: string }
 
 // Exact match first, then case-insensitive (Bifrost matches aliases without regard to case).
-export function aliasLookup(a: Map<string, string>, name: string): string | undefined {
+export function aliasLookup(a: Map<string, string | AliasTarget>, name: string): string | undefined {
+  const e = aliasEntry(a, name)
+  return e === undefined ? undefined : e.model_id
+}
+
+// The entry an alias name matches, in object form (a plain target reads as {model_id}).
+export function aliasEntry(a: Map<string, string | AliasTarget>, name: string): AliasTarget | undefined {
   const exact = a.get(name)
-  if (exact !== undefined) return exact
+  if (exact !== undefined) return asTarget(exact)
   const low = name.toLowerCase()
   for (const k of a.keys()) {
-    if (k.toLowerCase() === low) return a.get(k)
+    if (k.toLowerCase() === low) {
+      const v = a.get(k)
+      return v === undefined ? undefined : asTarget(v)
+    }
   }
   return undefined
+}
+
+function asTarget(v: string | AliasTarget): AliasTarget {
+  return typeof v === "string" ? { model_id: v } : v
 }
 
 // Follows step from start until it yields no new name. A step that returns the
@@ -45,31 +63,49 @@ export function resolveChain(start: string, step: (name: string) => string | und
 }
 
 // Resolves a request model through one key's aliases.
-export function resolveKeyAlias(a: Map<string, string>, model: string): AliasResult {
-  return resolveChain(model, (n: string): string | undefined => aliasLookup(a, n), MAX_ALIAS_DEPTH)
+// maxDepth is client.routing_chain_max_depth (default MAX_ALIAS_DEPTH).
+export function resolveKeyAlias(a: Map<string, string | AliasTarget>, model: string, maxDepth?: int): AliasResult {
+  return resolveChain(model, (n: string): string | undefined => aliasLookup(a, n), maxDepth ?? MAX_ALIAS_DEPTH)
 }
 
 // Why an aliases map is unusable: empty or padded names and targets, names that
 // differ only by case, or a chain that loops or runs too long. "" when it is fine.
-export function aliasProblem(a: Map<string, string>): string {
+export function aliasProblem(a: Map<string, string | AliasTarget>, maxDepth?: int): string {
   const seen: Set<string> = new Set()
   for (const k of a.keys()) {
-    const v = a.get(k)!
+    const t = asTarget(a.get(k)!)
+    const v = t.model_id
     if (k.trim() === "" || v.trim() === "") return "alias names and targets must not be empty"
     if (k.trim() !== k || v.trim() !== v) return "alias " + k + " has leading or trailing whitespace"
     const low = k.toLowerCase()
     if (seen.has(low)) return "alias " + k + " repeats a name that differs only by case"
     seen.add(low)
+    const fam = t.model_family
+    if (fam !== undefined && fam !== "" && !ALIAS_FAMILIES.includes(fam)) return "alias " + k + " has an unknown model_family " + fam
+    const name = t.model_name
+    if (name !== undefined && name.trim() !== name) return "alias " + k + " has leading or trailing whitespace"
   }
   for (const k of a.keys()) {
-    const r = resolveKeyAlias(a, k)
+    const r = resolveKeyAlias(a, k, maxDepth)
     if (r.error !== "") return r.error
   }
   return ""
 }
 
+test("client.routing_chain_max_depth sets how long a chain may run", () => {
+  const a: Map<string, string | AliasTarget> = new Map()
+  a.set("m0", "m1")
+  a.set("m1", "m2")
+  a.set("m2", "m3")
+  expect(resolveKeyAlias(a, "m0", 2).error).toBe("alias chain longer than 2: m0 -> m1 -> m2 -> m3")
+  expect(resolveKeyAlias(a, "m0", 3).model).toBe("m3")
+  expect(resolveKeyAlias(a, "m0").error).toBe("")
+  expect(aliasProblem(a, 2) !== "").toBe(true)
+  expect(aliasProblem(a, 3)).toBe("")
+})
+
 test("lookup is exact first, then case-insensitive", () => {
-  const a: Map<string, string> = new Map()
+  const a: Map<string, string | AliasTarget> = new Map()
   a.set("Best-Model", "gpt-4o")
   expect(aliasLookup(a, "Best-Model")).toBe("gpt-4o")
   expect(aliasLookup(a, "best-model")).toBe("gpt-4o")
@@ -78,7 +114,7 @@ test("lookup is exact first, then case-insensitive", () => {
 })
 
 test("chained aliases resolve to the last name", () => {
-  const a: Map<string, string> = new Map()
+  const a: Map<string, string | AliasTarget> = new Map()
   a.set("a", "b")
   a.set("b", "c")
   expect(resolveKeyAlias(a, "a").model).toBe("c")
@@ -88,7 +124,7 @@ test("chained aliases resolve to the last name", () => {
 })
 
 test("an identity alias ends the chain without an error", () => {
-  const a: Map<string, string> = new Map()
+  const a: Map<string, string | AliasTarget> = new Map()
   a.set("gpt-4o", "gpt-4o")
   a.set("fast", "GPT-4o")
   expect(resolveKeyAlias(a, "gpt-4o").model).toBe("gpt-4o")
@@ -97,7 +133,7 @@ test("an identity alias ends the chain without an error", () => {
 })
 
 test("a cycle is an error that names the loop", () => {
-  const a: Map<string, string> = new Map()
+  const a: Map<string, string | AliasTarget> = new Map()
   a.set("a", "b")
   a.set("b", "c")
   a.set("c", "a")
@@ -107,9 +143,9 @@ test("a cycle is an error that names the loop", () => {
 })
 
 test("a chain longer than the depth limit is an error", () => {
-  const a: Map<string, string> = new Map()
+  const a: Map<string, string | AliasTarget> = new Map()
   for (let i = 0; i < 12; i++) a.set("m" + i, "m" + (i + 1))
-  const r = resolveChain("m0", (n: string): string | undefined => a.get(n), 3)
+  const r = resolveChain("m0", (n: string): string | undefined => aliasLookup(a, n), 3)
   expect(r.error).toBe("alias chain longer than 3: m0 -> m1 -> m2 -> m3 -> m4")
   expect(r.model).toBe("m3")
   expect(resolveKeyAlias(a, "m0").error).toBe("alias chain longer than 10: m0 -> m1 -> m2 -> m3 -> m4 -> m5 -> m6 -> m7 -> m8 -> m9 -> m10 -> m11")
@@ -119,17 +155,42 @@ test("a chain longer than the depth limit is an error", () => {
 })
 
 test("validation rejects empty, padded and case-duplicate names", () => {
-  const ok: Map<string, string> = new Map()
+  const ok: Map<string, string | AliasTarget> = new Map()
   ok.set("fast", "gpt-4o-mini")
   expect(aliasProblem(ok)).toBe("")
-  const empty: Map<string, string> = new Map()
+  const empty: Map<string, string | AliasTarget> = new Map()
   empty.set("fast", "")
   expect(aliasProblem(empty)).toBe("alias names and targets must not be empty")
-  const padded: Map<string, string> = new Map()
+  const padded: Map<string, string | AliasTarget> = new Map()
   padded.set("fast ", "gpt-4o-mini")
   expect(aliasProblem(padded)).toBe("alias fast  has leading or trailing whitespace")
-  const dup: Map<string, string> = new Map()
+  const dup: Map<string, string | AliasTarget> = new Map()
   dup.set("GPT-4o", "x")
   dup.set("gpt-4o", "y")
   expect(aliasProblem(dup)).toBe("alias gpt-4o repeats a name that differs only by case")
+})
+
+test("the object form resolves to its model_id and keeps its name and family", () => {
+  const a: Map<string, string | AliasTarget> = new Map()
+  a.set("best-model", { model_id: "12345-azure-deployment", model_name: "claude-sonnet-4-5", model_family: "anthropic" })
+  a.set("fast", "gpt-4o-mini")
+  expect(aliasLookup(a, "best-model")).toBe("12345-azure-deployment")
+  expect(aliasLookup(a, "BEST-MODEL")).toBe("12345-azure-deployment")
+  expect(aliasEntry(a, "best-model")!.model_name).toBe("claude-sonnet-4-5")
+  expect(aliasEntry(a, "fast")!.model_id).toBe("gpt-4o-mini")
+  expect(aliasEntry(a, "fast")!.model_name).toBeUndefined()
+  expect(resolveKeyAlias(a, "best-model").model).toBe("12345-azure-deployment")
+  expect(aliasProblem(a)).toBe("")
+})
+
+test("object-form validation: an empty model_id, an unknown family and a padded name are refused", () => {
+  const empty: Map<string, string | AliasTarget> = new Map()
+  empty.set("x", { model_id: "" })
+  expect(aliasProblem(empty)).toBe("alias names and targets must not be empty")
+  const fam: Map<string, string | AliasTarget> = new Map()
+  fam.set("x", { model_id: "m", model_family: "robot" })
+  expect(aliasProblem(fam)).toBe("alias x has an unknown model_family robot")
+  const pad: Map<string, string | AliasTarget> = new Map()
+  pad.set("x", { model_id: "m", model_name: " n" })
+  expect(aliasProblem(pad)).toBe("alias x has leading or trailing whitespace")
 })

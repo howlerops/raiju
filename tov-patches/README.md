@@ -2,10 +2,11 @@
 
 Raiju builds against [Tov](https://github.com/richiemcilroy/Tov) at commit
 `c2048582de4e9468267f801313144d75c12e983f` plus the patches here, applied in
-order by `scripts/build-tov.sh` (`make tov`). Each patch is self-contained and
-written to be offered upstream. `tests/run.sh` checks both with the patched
-compiler: `TOV=build/tov/target/release/tov tov-patches/tests/run.sh` (or
-`make tov-test`).
+order by `scripts/build-tov.sh` (`make tov`). Each patch is written to be offered
+upstream. `tests/run.sh` checks all four with the patched compiler:
+`TOV=build/tov/target/release/tov tov-patches/tests/run.sh` (or `make tov-test`).
+Patch 0004 is written on top of 0003 (its hunks include the ALPN signatures), so the
+patches apply in order only.
 
 ## Submitting upstream
 
@@ -106,3 +107,82 @@ sock.write("request\n")       // to the child's stdin
 **Not covered.** There is no exit status, no
 separate stderr pipe and no Windows support. A Bun-compatible `Bun.spawn` with
 `stdout: "pipe"` could be built on the same native later.
+
+## 0003 — TLS ALPN on client sockets (`tls.alpn`)
+
+**Problem.** A TLS client couldn't offer application protocols, so it couldn't ask a server for
+HTTP/2. gRPC over TLS needs `h2` in ALPN, so an OTLP exporter could only send to a plaintext
+collector (h2c). Tov's `fetch` is HTTP/1.1 only, so the gRPC client runs on a raw socket.
+
+**API (Bun's, on `Bun.connect`).**
+
+```ts
+const s = try await Bun.connect({
+  hostname: "collector",
+  port: 4317,
+  tls: { alpn: ["h2"], rejectUnauthorized: true, ca: pem },
+  socket: {},
+})
+if (s.alpnProtocol !== "h2") s.terminate()   // "" when the server picked none
+```
+
+**Design.**
+- `tls.alpn` is the list of protocols offered (`SSL_set_alpn_protos`, as a length-prefixed list).
+  Without it the TLS context keeps its default, as before. Resumed sessions are keyed by the list
+  too, so a session from one offer is not reused for another.
+- `socket.alpnProtocol` reads `SSL_get0_alpn_selected` once the handshake is done. It is `""` for
+  plaintext sockets, for no offer, and when the server picks nothing.
+
+**Files.**
+- `runtime/tls.c`, `runtime/tov.h`: the offer, the protocol read, and the `alpn` slot in the TLS ops.
+- `runtime/net.c`, `runtime/tov.c`, `runtime/ws.c`: `netConnect` takes the offer; `netAlpn` reads it.
+- `crates/tov/src/check/builtins.rs`, `crates/tov/src/std/http.tov`: the signatures, `SocketTLSOptions.alpn`,
+  and `Socket.alpnProtocol`.
+
+**Not covered.** Tov's listeners don't pick a protocol (a TLS server can't offer ALPN), so the
+test checks the offer and the empty answer; a server that picks is in the Raiju e2e only.
+
+## 0004 — UDP sockets (`Bun.udpSocket` and `node:dgram`)
+
+**Problem.** Tov had no datagram sockets, so `node:dgram` was a stub. Cluster discovery by UDP
+broadcast and by mDNS, and any UDP protocol, were out of reach.
+
+**API (Tov, as in Bun's `Bun.udpSocket`).**
+
+```ts
+const sock = await Bun.udpSocket({
+  hostname: "0.0.0.0",
+  port: 9999,
+  broadcast: true,
+  reusePort: true,            // several sockets may share the port (multicast listeners)
+  socket: {
+    data(s, bytes, port, address) {   // u8[], the sender's port and address
+      s.send("ack", port, address)
+    },
+  },
+})
+sock.send("hello", 9999, "255.255.255.255")
+sock.addMembership("239.255.42.99")
+```
+
+`send` takes text or bytes and returns whether the datagram went (a full kernel buffer is not
+retried). `setBroadcast`, `setTTL`, `setMulticastTTL`, `setMulticastLoopback`, `setMulticastInterface`,
+`addMembership`, `dropMembership`, `hostname`, `port`, `ref`, `unref` and `close` are as in Bun.
+
+**Design.**
+- A socket is a table entry on the same loop as TCP and Unix sockets (`runtime/net.c`), so it
+  runs with no thread and keeps the program alive while it reads, unless it is unref'd.
+- `node:dgram` runs on the same natives: `runtime/node/internal/bindings/udp_wrap.js` replaces its
+  stub with bind, send (with the connected form), membership, options, names and close, and
+  `runtime/node.c` adds the natives it calls.
+- A datagram that arrives is delivered whole, with the sender's address and port. Failures are
+  `-errno` numbers in the natives and a `SocketError` (`ERR_SOCKET`, `ERR_SOCKET_BIND`) from the API.
+
+**Files.**
+- `runtime/net.c`, `runtime/tov.h`: the UDP table and natives.
+- `runtime/node.c`, `runtime/node/internal/bindings/udp_wrap.js`: `node:dgram`.
+- `crates/tov/src/check/builtins.rs`, `crates/tov/src/std/http.tov`: the signatures and `Bun.udpSocket`.
+
+**Not covered.** No source-specific multicast (IGMPv3), no `connect` on the Tov API (send takes
+the address), and no `dgram` buffer sizes beyond the kernel's limits. `node:dgram` tests run
+through `tov-patches/tests/udp_dgram.tov`.

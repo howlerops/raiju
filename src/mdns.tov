@@ -1,0 +1,295 @@
+// DNS messages for multicast DNS (RFC 6762), the packets cluster discovery sends and
+// reads. Names are dotted text. Packets are written without name compression, and read
+// with it. Malformed packets are undefined, never an error: any host on the group can send
+// one.
+
+export type DnsQuestion = { name: string, type: int }
+
+// A resource record. target is a PTR's or an SRV's name, port an SRV's port, addr an A record's
+// IPv4 address. The fields a record type does not use are "" or 0.
+export type DnsRecord = { name: string, type: int, ttl: int, target: string, port: int, addr: string }
+
+export type DnsPacket = { response: bool, questions: DnsQuestion[], records: DnsRecord[] }
+
+export const MDNS_GROUP = "224.0.0.251"
+export const MDNS_PORT: int = 5353
+export const TYPE_A: int = 1
+export const TYPE_PTR: int = 12
+export const TYPE_SRV: int = 33
+export const TYPE_ANY: int = 255
+
+const CLASS_IN: int = 1
+// the cache-flush bit: this node's SRV and A records replace the older ones
+const CACHE_FLUSH: int = 0x8000
+const FLAG_RESPONSE: int = 0x8400
+
+const enc = new TextEncoder()
+
+function put16(inout out: u8[], v: int): void {
+  out.push(u8((v >> 8) & 255))
+  out.push(u8(v & 255))
+}
+
+function put32(inout out: u8[], v: int): void {
+  put16(&out, (v >> 16) & 0xffff)
+  put16(&out, v & 0xffff)
+}
+
+// The bytes of a name: labels of 1 to 63 bytes, ended by the zero length. A trailing dot is
+// allowed. A label that is too long is an error (it can't be sent).
+export function encodeName(name: string): u8[] throws Error {
+  const out: u8[] = []
+  for (const label of name.split(".")) {
+    if (label === "") continue
+    const b = enc.encode(label)
+    if (b.length > 63) throw new Error(`dns: label too long: ${label}`)
+    out.push(u8(b.length))
+    for (const c of b) out.push(c)
+  }
+  out.push(u8(0))
+  return out
+}
+
+// A dotted IPv4 address as its four bytes, or an error.
+function ipv4Bytes(addr: string): u8[] throws Error {
+  const parts = addr.split(".")
+  if (parts.length !== 4) throw new Error(`dns: not an IPv4 address: ${addr}`)
+  const out: u8[] = []
+  for (const p of parts) {
+    const n = parseInt(p) ?? -1
+    if (n < 0 || n > 255) throw new Error(`dns: not an IPv4 address: ${addr}`)
+    out.push(u8(n))
+  }
+  return out
+}
+
+// A query for the questions (QM, class IN).
+export function encodeQuery(questions: DnsQuestion[]): u8[] throws Error {
+  let out: u8[] = []
+  put16(&out, 0)
+  put16(&out, 0)
+  put16(&out, questions.length)
+  put16(&out, 0)
+  put16(&out, 0)
+  put16(&out, 0)
+  for (const q of questions) {
+    for (const b of try encodeName(q.name)) out.push(b)
+    put16(&out, q.type)
+    put16(&out, CLASS_IN)
+  }
+  return out
+}
+
+// The record's data (RDATA) as bytes. Only PTR, SRV and A records are written.
+function rdataOf(r: DnsRecord): u8[] throws Error {
+  let out: u8[] = []
+  if (r.type === TYPE_PTR) {
+    for (const b of try encodeName(r.target)) out.push(b)
+  } else if (r.type === TYPE_SRV) {
+    put16(&out, 0)
+    put16(&out, 0)
+    put16(&out, r.port)
+    for (const b of try encodeName(r.target)) out.push(b)
+  } else if (r.type === TYPE_A) {
+    for (const b of try ipv4Bytes(r.addr)) out.push(b)
+  } else {
+    throw new Error(`dns: cannot write record type ${r.type}`)
+  }
+  return out
+}
+
+// An unsolicited response (or a reply) carrying the records as answers.
+export function encodeResponse(records: DnsRecord[]): u8[] throws Error {
+  let out: u8[] = []
+  put16(&out, 0)
+  put16(&out, FLAG_RESPONSE)
+  put16(&out, 0)
+  put16(&out, records.length)
+  put16(&out, 0)
+  put16(&out, 0)
+  for (const r of records) {
+    for (const b of try encodeName(r.name)) out.push(b)
+    put16(&out, r.type)
+    put16(&out, r.type === TYPE_PTR ? CLASS_IN : CLASS_IN | CACHE_FLUSH)
+    put32(&out, r.ttl)
+    const data = try rdataOf(r)
+    put16(&out, data.length)
+    for (const b of data) out.push(b)
+  }
+  return out
+}
+
+// The name at pos and the position after it in the packet. A compression pointer ends the
+// name where it is written; the name it points to is followed for the text only.
+function readName(buf: u8[], pos: int): { name: string, next: int } | undefined {
+  const labels: string[] = []
+  let p = pos
+  let next = -1
+  let hops = 0
+  while (true) {
+    if (p >= buf.length) return undefined
+    const len = int(buf[p]!)
+    if (len === 0) {
+      if (next < 0) next = p + 1
+      break
+    }
+    if ((len & 0xc0) === 0xc0) {
+      if (p + 1 >= buf.length) return undefined
+      if (next < 0) next = p + 2
+      hops++
+      if (hops > 32) return undefined
+      p = ((len & 0x3f) << 8) | int(buf[p + 1]!)
+      continue
+    }
+    if ((len & 0xc0) !== 0) return undefined
+    if (p + 1 + len > buf.length) return undefined
+    labels.push(readText(buf.slice(p + 1, p + 1 + len)))
+    p = p + 1 + len
+  }
+  return { name: labels.join("."), next: next }
+}
+
+// A label's bytes as text (invalid UTF-8 is replaced, never an error).
+function readText(b: u8[]): string {
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+function get16(buf: u8[], pos: int): int {
+  return (int(buf[pos]!) << 8) | int(buf[pos + 1]!)
+}
+
+function get32(buf: u8[], pos: int): int {
+  return (get16(buf, pos) << 16) | get16(buf, pos + 2)
+}
+
+// The record of one resource record at pos, and the position after it.
+function readRecord(buf: u8[], pos: int): { rec: DnsRecord, next: int } | undefined {
+  const nm = readName(buf, pos)
+  if (nm === undefined) return undefined
+  const at = nm.next
+  if (at + 10 > buf.length) return undefined
+  const type = get16(buf, at)
+  const ttl = get32(buf, at + 4)
+  const rdlen = get16(buf, at + 8)
+  const start = at + 10
+  if (start + rdlen > buf.length) return undefined
+  let rec: DnsRecord = { name: nm.name, type: type, ttl: ttl, target: "", port: 0, addr: "" }
+  if (type === TYPE_PTR) {
+    const t = readName(buf, start)
+    if (t === undefined) return undefined
+    rec.target = t.name
+  } else if (type === TYPE_SRV) {
+    if (rdlen < 7) return undefined
+    const t = readName(buf, start + 6)
+    if (t === undefined) return undefined
+    rec.port = get16(buf, start + 4)
+    rec.target = t.name
+  } else if (type === TYPE_A) {
+    if (rdlen !== 4) return undefined
+    rec.addr = `${int(buf[start]!)}.${int(buf[start + 1]!)}.${int(buf[start + 2]!)}.${int(buf[start + 3]!)}`
+  }
+  return { rec: rec, next: start + rdlen }
+}
+
+// A packet read in full: its questions, and the records of its answer, authority and
+// additional sections. Undefined when it is not a DNS message.
+export function parsePacket(buf: u8[]): DnsPacket | undefined {
+  if (buf.length < 12) return undefined
+  const flags = get16(buf, 2)
+  const qd = get16(buf, 4)
+  const total = get16(buf, 6) + get16(buf, 8) + get16(buf, 10)
+  let pos = 12
+  const questions: DnsQuestion[] = []
+  for (let i = 0; i < qd; i++) {
+    const nm = readName(buf, pos)
+    if (nm === undefined) return undefined
+    if (nm.next + 4 > buf.length) return undefined
+    questions.push({ name: nm.name, type: get16(buf, nm.next) })
+    pos = nm.next + 4
+  }
+  const records: DnsRecord[] = []
+  for (let i = 0; i < total; i++) {
+    const r = readRecord(buf, pos)
+    if (r === undefined) return undefined
+    records.push(r.rec)
+    pos = r.next
+  }
+  return { response: (flags & 0x8000) !== 0, questions: questions, records: records }
+}
+
+// ---- tests ----
+
+test("names are length-prefixed labels, and a label over 63 bytes is refused", () => {
+  expect(try encodeName("a.b.")).toEqual([u8(1), u8(97), u8(1), u8(98), u8(0)])
+  expect((try encodeName("_x.local")).length).toBe(3 + 6 + 1)
+  let long = ""
+  for (let i = 0; i < 64; i++) long += "x"
+  let refused = false
+  try {
+    encodeName(long)
+  } catch (e) {
+    refused = true
+  }
+  expect(refused).toBe(true)
+})
+
+test("a query round-trips with its question", () => {
+  const b = try encodeQuery([{ name: "_bifrost._tcp.local", type: TYPE_PTR }])
+  const p = parsePacket(b)
+  expect(p).toBeDefined()
+  expect(p!.response).toBe(false)
+  expect(p!.questions).toEqual([{ name: "_bifrost._tcp.local", type: TYPE_PTR }])
+  expect(p!.records.length).toBe(0)
+})
+
+test("the announcement's PTR, SRV and A records round-trip", () => {
+  const recs: DnsRecord[] = [
+    { name: "_bifrost._tcp.local", type: TYPE_PTR, ttl: 120, target: "node-a._bifrost._tcp.local", port: 0, addr: "" },
+    { name: "node-a._bifrost._tcp.local", type: TYPE_SRV, ttl: 120, target: "node-a.local", port: 8080, addr: "" },
+    { name: "node-a.local", type: TYPE_A, ttl: 120, target: "", port: 0, addr: "10.0.0.7" },
+  ]
+  const p = parsePacket(try encodeResponse(recs))
+  expect(p).toBeDefined()
+  expect(p!.response).toBe(true)
+  expect(p!.records.length).toBe(3)
+  expect(p!.records[0]!.target).toBe("node-a._bifrost._tcp.local")
+  expect(p!.records[1]!.port).toBe(8080)
+  expect(p!.records[1]!.target).toBe("node-a.local")
+  expect(p!.records[2]!.addr).toBe("10.0.0.7")
+  expect(p!.records[2]!.ttl).toBe(120)
+})
+
+test("names with compression pointers are read, and a pointer loop is refused", () => {
+  // "a.local" at offset 12; a second record name is a pointer to it (0xC00C)
+  const bytes: u8[] = []
+  for (const x of [0, 0, 0x84, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 97, 5, 108, 111, 99, 97, 108, 0, 0, 1, 0, 1, 0, 0, 0, 120, 0, 4, 10, 0, 0, 9, 0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 120, 0, 4, 10, 0, 0, 10]) {
+    bytes.push(u8(x))
+  }
+  const p = parsePacket(bytes)
+  expect(p).toBeDefined()
+  expect(p!.records.length).toBe(2)
+  expect(p!.records[1]!.name).toBe("a.local")
+  expect(p!.records[1]!.addr).toBe("10.0.0.10")
+  const loop: u8[] = []
+  for (const x of [0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0xc0, 12, 0, 12, 0, 1, 0, 0, 0, 1, 0, 2, 0xc0, 12]) {
+    loop.push(u8(x))
+  }
+  expect(parsePacket(loop)).toBeUndefined()
+})
+
+test("truncated and oversized packets are undefined, not errors", () => {
+  expect(parsePacket([u8(0), u8(0)])).toBeUndefined()
+  const good = try encodeResponse([{ name: "n.local", type: TYPE_A, ttl: 1, target: "", port: 0, addr: "1.2.3.4" }])
+  expect(parsePacket(good.slice(0, good.length - 1))).toBeUndefined()
+  let refused = false
+  try {
+    encodeResponse([{ name: "n.local", type: TYPE_A, ttl: 1, target: "", port: 0, addr: "1.2.3" }])
+  } catch (e) {
+    refused = true
+  }
+  expect(refused).toBe(true)
+})

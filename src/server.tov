@@ -1,28 +1,45 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
-import { Config, providerOf, providerNames } from "./config"
+import { Config, VirtualKeyConfig, providerOf, providerNames } from "./config"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
-import { anthropicMessages, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
+import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
 import { kindOf } from "./router"
-import { Target, Upstream } from "./providers/types"
+import { Target, Upstream, addExtraHeaders } from "./providers/types"
 import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
+import * as bedrock from "./providers/bedrock"
+import * as vertex from "./providers/vertex"
+import * as cloudflare from "./providers/cloudflare"
+import * as replicate from "./providers/replicate"
+import * as openrouter from "./providers/openrouter"
+import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath } from "./model_list"
+import { retrieveRequest, retrieveBody } from "./model_retrieve"
 import { fields, find, elements, rawStr, rawBool } from "./json"
 import * as metrics from "./metrics"
-import { Session, prepare, onOpen, onMessage, onClose } from "./realtime"
-import { parseQuery, filterFrom, selectAll, statsView } from "./logstore"
-import { matchRoute, handleMedia, deploymentRoute, deploymentRequest } from "./media"
+import { Session, SocketExt, prepare, onOpen, onMessage, onClose, extOpen, extMessage, extClose, extPong, attachHttp1 } from "./realtime"
+import { ResponsesSocket } from "./wsresponses"
+import { LiveSocket, liveContent, liveCreate, contentId, attachId, attachUpstream, ownerOf, credentialOk, validId } from "./live"
+import { WsConnection } from "./ws"
+import { DataScope } from "./scope"
+import { resourceOf } from "./rbac"
+import { matchRoute, handleMedia, deploymentRoute, deploymentRequest, realtimeSdp, nativeRoute, nativeCloud, vertexBearer } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
-import { snapshot } from "./schemas"
-import { handleApi, proxyWidening } from "./store"
+import { snapshot, errorJson, Hdrs } from "./schemas"
+import { handleApi, proxyWidening, Result } from "./store"
 import { passthroughPath, passthroughRoute } from "./passthrough"
-import { mcpApi } from "./mcpapi"
+import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, headersRouteAsync, perUserApi, McpReply } from "./mcpapi"
+import { issuerRoute, keyById } from "./mcpissuer"
+import { promptRoute } from "./prompts"
+import { webhookApi, asyncSubmitHooked } from "./webhooks"
+import { flagRoute } from "./flags"
+import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
 import { McpSession } from "./mcp"
-import { Ops, Reply } from "./ops"
-import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, Dispatch } from "./extras"
+import { Ops, Reply, UiSocket } from "./ops"
+import { cookieValue, SETUP_COOKIE } from "./setupsession"
+import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
 import { INDEX_HTML } from "./ui_assets"
 
@@ -48,7 +65,149 @@ function upstreamModels(provider: string, kind: string, t: Target): Upstream | u
   return undefined
 }
 
-async function providerModels(cfg: Config, provider: string): Promise<string[]> {
+// The kinds whose listing is not OpenAI's shape, read by nativeModelIds. Databricks lists nothing, as
+// Bifrost's does: its workspace inventory does not match the inference ids (databricks/models.go).
+function nativeList(kind: string): bool {
+  return kind === "bedrock" || kind === "vertex" || kind === "cloudflare" || kind === "databricks" || kind === "replicate"
+}
+
+// One GET on a provider listing: the body when the answer is 2xx, else undefined.
+async function getListing(up: Upstream): Promise<string | undefined> throws Error {
+  const hs = new Headers()
+  for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+  const res = try await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+  const text = try await res.text()
+  return res.ok ? text : undefined
+}
+
+// OpenRouter's /v1/models leaves out its decision models, which are listed under the root at
+// /v1/models?output_modalities=decisions (Bifrost's openRouterDecisionModelsPath). Best-effort, as
+// Bifrost's: a failed read adds nothing, and an id already listed is not repeated.
+async function withDecisionModels(provider: string, t: Target, ids: string[]): Promise<string[]> {
+  if (t.kind !== "openrouter") return ids
+  const req = openai.modelsRequest(t)
+  const up: Upstream = { url: openrouter.rootOf(t) + "/v1/models?output_modalities=decisions", headers: req.headers, body: "" }
+  try {
+    const text = try await getListing(up)
+    if (text === undefined) return ids
+    const out = ids.slice()
+    for (const id of try openai.modelIds(text, provider)) {
+      const name = id.replace(provider + "/models/", provider + "/")
+      if (!out.includes(name)) out.push(name)
+    }
+    return out
+  } catch (e) {
+    return ids
+  }
+}
+
+// The model ids (as provider/model) of a provider whose listing nativeList names. undefined when the
+// listing could not be read. Bedrock: the foundation models and the inference profiles, signed as
+// Bedrock's control plane takes them. Vertex: the Model Garden publishers google, anthropic and
+// mistralai, every page, with a bearer token (Bifrost's list: vertex/vertex.go). Cloudflare: the
+// Workers AI search, every page, keeping the text generation and embeddings models (cloudflare/models.go).
+// Every page of a Bedrock control-plane listing: each answer's nextToken is sent back as the next
+// page's query until none is left (capped, so a provider that never ends cannot hold the listing).
+// undefined when the first page cannot be read; a later page that fails keeps the ids read so far.
+async function bedrockPages(t: Target, path: string, field: string, idKey: string): Promise<string[] | undefined> {
+  const out: string[] = []
+  let token = ""
+  for (let page = 0; page < 50; page++) {
+    const query = token === "" ? "" : "nextToken=" + bedrock.encodeSegment(token)
+    let body: string | undefined = undefined
+    try {
+      body = await getListing(bedrock.listRequest(t, path, query))
+      if (body === undefined) return page === 0 ? undefined : out
+      for (const id of try bedrockIds(body, field, idKey)) out.push(id)
+      token = rawStr(try fields(body), "nextToken") ?? ""
+    } catch (e) {
+      return page === 0 ? undefined : out
+    }
+    if (token === "") break
+  }
+  return out
+}
+
+async function nativeModelIds(engine: Engine | undefined, provider: string, t: Target): Promise<string[] | undefined> {
+  const ids: string[] = []
+  try {
+    if (t.kind === "databricks") return ids
+    if (t.kind === "replicate") {
+      // the account's deployments, every page: each answer's next is the full URL of the following page
+      const first = replicate.deploymentsRequest(t)
+      let next = first.url
+      let any = false
+      for (let page = 0; page < 20; page++) {
+        const text = await getListing({ url: next, headers: first.headers, body: "" })
+        if (text === undefined) break
+        any = true
+        const pp = try replicate.deploymentsPage(text)
+        for (const id of pp.ids) ids.push(provider + "/" + id)
+        if (pp.next === "") break
+        next = pp.next
+      }
+      return any ? ids : undefined
+    }
+    if (t.kind === "bedrock") {
+      const fm = await bedrockPages(t, "/foundation-models", "modelSummaries", "modelId")
+      if (fm === undefined) return undefined
+      for (const id of fm) ids.push(provider + "/" + id)
+      const ip = await bedrockPages(t, "/inference-profiles", "inferenceProfileSummaries", "inferenceProfileId")
+      if (ip !== undefined) {
+        for (const id of ip) ids.push(provider + "/" + id)
+      }
+      return ids
+    }
+    if (t.kind === "vertex") {
+      // the gateway's token cache when there is one, so a listing and a chat call share a token
+      let token = ""
+      if (engine !== undefined) {
+        const tok = await engine.vertexToken(t)
+        if (tok.error !== "") return undefined
+        token = tok.token
+      } else {
+        token = try await vertexBearer(t)
+      }
+      const hdr = new Map<string, string>()
+      hdr.set("authorization", "Bearer " + token)
+      let any = false
+      for (const pub of ["google", "anthropic", "mistralai"]) {
+        let page = ""
+        for (let i = 0; i < 20; i++) {
+          const text = try await getListing({ url: try vertex.publisherListUrl(t, pub, page), headers: hdr, body: "" })
+          if (text === undefined) break
+          any = true
+          const pp = try publisherPage(text)
+          for (const id of pp.ids) ids.push(provider + "/" + id)
+          if (pp.next === "") break
+          page = pp.next
+        }
+      }
+      return any ? ids : undefined
+    }
+    if (t.kind === "cloudflare") {
+      const base = try cloudflare.accountBase(t)
+      let hs = new Map<string, string>()
+      hs.set("authorization", "Bearer " + (t.key.value ?? ""))
+      addExtraHeaders(&hs, t.cfg)
+      let any = false
+      for (let page = 1; page <= 20; page++) {
+        const text = try await getListing({ url: base + cloudflareSearchPath(page), headers: hs, body: "" })
+        if (text === undefined) break
+        any = true
+        const cp = try cloudflarePage(text)
+        for (const id of cp.ids) ids.push(provider + "/" + id)
+        if (!cp.full) break
+      }
+      return any ? ids : undefined
+    }
+  } catch (e) {
+    return undefined
+  }
+  return undefined
+}
+
+async function providerModels(engine: Engine | undefined, cfg: Config, provider: string): Promise<string[]> {
   const p = providerOf(cfg, provider)
   if (p === undefined) return []
   const listed: string[] = []
@@ -62,17 +221,22 @@ async function providerModels(cfg: Config, provider: string): Promise<string[]> 
   if (Date.now() - cachedAt < 300000.0) return modelCache.ids.get(provider) ?? []
   const kind = kindOf(provider, p)
   const key = (p.keys ?? [])[0] ?? { value: "" }
-  const up = upstreamModels(provider, kind, { provider: provider, kind: kind, model: "", key: key, cfg: p })
-  if (up === undefined) return []
+  const t: Target = { provider: provider, kind: kind, model: "", key: key, cfg: p }
   let ids: string[] = []
-  try {
-    const hs = new Headers()
-    for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
-    const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
-    const text = await res.text()
-    if (res.ok) ids = openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/"))
-  } catch (e) {
-    ids = []
+  if (nativeList(kind)) {
+    ids = (await nativeModelIds(engine, provider, t)) ?? []
+  } else {
+    const up = upstreamModels(provider, kind, t)
+    if (up === undefined) return []
+    try {
+      const hs = new Headers()
+      for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+      const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+      const text = await res.text()
+      if (res.ok) ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
+    } catch (e) {
+      ids = []
+    }
   }
   modelCache.ids.set(provider, ids)
   modelCache.fetchedAt.set(provider, Date.now())
@@ -83,13 +247,21 @@ async function providerModels(cfg: Config, provider: string): Promise<string[]> 
 // from the provider, trying each key (or the one named) until one answers, and refreshes the list
 // GET /v1/models serves from. Bifrost returns the keys with their discovery status; Raiju returns
 // the list, as {provider, models, total}.
-async function refreshModels(cfg: Config, provider: string, keyId: string | undefined): Promise<Reply> {
+async function refreshModels(engine: Engine | undefined, cfg: Config, provider: string, keyId: string | undefined): Promise<Reply> {
   const p = providerOf(cfg, provider)
   if (p === undefined) return { status: 404, body: JSON.stringify({ error: { message: `no provider ${provider}`, type: "invalid_request_error" } }), contentType: "application/json" }
   const kind = kindOf(provider, p)
   for (const key of p.keys ?? []) {
     if (keyId !== undefined && key.id !== keyId) continue
-    const up = upstreamModels(provider, kind, { provider: provider, kind: kind, model: "", key: key, cfg: p })
+    const t: Target = { provider: provider, kind: kind, model: "", key: key, cfg: p }
+    if (nativeList(kind)) {
+      const nids = await nativeModelIds(engine, provider, t)
+      if (nids === undefined) continue
+      modelCache.ids.set(provider, nids)
+      modelCache.fetchedAt.set(provider, Date.now())
+      return { status: 200, body: JSON.stringify({ provider: provider, models: nids, total: nids.length }), contentType: "application/json" }
+    }
+    const up = upstreamModels(provider, kind, t)
     if (up === undefined) continue
     try {
       const hs = new Headers()
@@ -97,7 +269,7 @@ async function refreshModels(cfg: Config, provider: string, keyId: string | unde
       const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
       const text = await res.text()
       if (!res.ok) continue
-      const ids = openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/"))
+      const ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
       modelCache.ids.set(provider, ids)
       modelCache.fetchedAt.set(provider, Date.now())
       return { status: 200, body: JSON.stringify({ provider: provider, models: ids, total: ids.length }), contentType: "application/json" }
@@ -108,15 +280,43 @@ async function refreshModels(cfg: Config, provider: string, keyId: string | unde
   return { status: 502, body: JSON.stringify({ error: { message: `no key of ${provider} could list its models`, type: "api_error" } }), contentType: "application/json" }
 }
 
-// GET /v1/models/{model}: the entry from the provider's list, or for a configured provider a
-// minimal entry (some providers list only part of what they serve).
+// GET /v1/models/{model}: the provider's own model object where the provider has a retrieve API
+// (model_retrieve.tov), as Bifrost's modelRetrieve reads it. Other providers, and a retrieve that
+// cannot reach the provider, answer with the entry from the list: some providers list only part of
+// what they serve, so a configured provider gets a minimal entry.
 async function retrieveModel(engine: Engine, req: Request, id: string): Promise<Response> {
   const slash = id.indexOf("/")
   if (slash <= 0) return errorResponse(404, `model ${id} not found: use provider/model`, "invalid_request_error", noHeaders())
   const provider = id.slice(0, slash)
   if (!providerNames(engine.cfg).includes(provider)) return errorResponse(404, `no provider ${provider}`, "invalid_request_error", noHeaders())
-  const known = await providerModels(engine.cfg, provider)
-  const listed = known.includes(id) || known.includes(id.slice(slash + 1))
+  const model = id.slice(slash + 1)
+  const known = await providerModels(engine, engine.cfg, provider)
+  const listed = known.includes(id) || known.includes(model)
+  const p = providerOf(engine.cfg, provider)
+  if (p !== undefined) {
+    const kind = kindOf(provider, p)
+    const key = (p.keys ?? [])[0] ?? { value: "" }
+    const up = retrieveRequest({ provider: provider, kind: kind, model: model, key: key, cfg: p }, model)
+    if (up !== undefined) {
+      const hs = new Headers()
+      for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+      try {
+        const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+        const text = await res.text()
+        // a 404 is the answer for a model the provider does not have; a listed model whose server has no
+        // retrieve route (some OpenAI-compatible servers) keeps the list entry
+        if (res.status === 404) {
+          if (listed) return Response.json({ id: id, object: "model", created: 0, owned_by: provider, listed: listed })
+          return errorResponse(404, `model ${model} not found at ${provider}`, "invalid_request_error", noHeaders())
+        }
+        if (!res.ok) return new Response(text, { status: res.status, headers: { "content-type": "application/json" } })
+        const body = try retrieveBody(provider, kind, text, listed)
+        return new Response(body, { headers: { "content-type": "application/json" } })
+      } catch (e) {
+        return errorResponse(502, `${provider} could not return model ${model}: ${e.message}`, "api_error", noHeaders())
+      }
+    }
+  }
   return Response.json({ id: id, object: "model", created: 0, owned_by: provider, listed: listed })
 }
 
@@ -126,7 +326,7 @@ const GENAI = "/genai/v1beta/models/"
 async function genaiModels(engine: Engine, id: string): Promise<Response> {
   const ids: string[] = []
   for (const n of providerNames(engine.cfg)) {
-    for (const m of await providerModels(engine.cfg, n)) ids.push(m)
+    for (const m of await providerModels(engine, engine.cfg, n)) ids.push(m)
   }
   if (id === "") return new Response(genaiIn.modelsList(ids), { headers: { "content-type": "application/json" } })
   const name = new URLSearchParams("id=" + id).get("id") ?? id
@@ -137,7 +337,7 @@ async function genaiModels(engine: Engine, id: string): Promise<Response> {
 async function listModels(engine: Engine, req: Request): Promise<Response> {
   const only = req.headers.get("x-bf-list-models-provider") ?? req.headers.get("x-bf-model-provider") ?? "all"
   const names = providerNames(engine.cfg).filter((n) => only === "all" || n === only)
-  const lists = await Promise.all(names.map((n) => providerModels(engine.cfg, n)))
+  const lists = await Promise.all(names.map((n) => providerModels(engine, engine.cfg, n)))
   const data: ModelEntry[] = []
   for (let i = 0; i < names.length; i++) {
     for (const id of lists[i]!) data.push({ id: id, object: "model", created: 0, owned_by: names[i]! })
@@ -147,10 +347,10 @@ async function listModels(engine: Engine, req: Request): Promise<Response> {
 
 
 // Bifrost's http_* metrics for one request. A streamed body counts as 0 bytes.
-async function timed(path: string, method: string, t0: f64, reqBytes: f64, p: Promise<Response, TypeError>): Promise<Response, TypeError> {
+async function timed(path: string, method: string, t0: f64, reqBytes: f64, headers: Headers, p: Promise<Response, TypeError>): Promise<Response, TypeError> {
   const res = try await p
   const len = parseFloat(res.headers.get("content-length") ?? "0") ?? 0.0
-  metrics.observeHttp(pathLabel(path), method, res.status, (performance.now() - t0) / 1000.0, reqBytes, len)
+  metrics.observeHttp(pathLabel(path), method, res.status, (performance.now() - t0) / 1000.0, reqBytes, len, metrics.httpCustomValues(headers))
   return res
 }
 
@@ -211,19 +411,41 @@ async function mcpAction(ops: Ops, action: string, id: string, ok: Reply): Promi
 // The /api/logs routes that ops.logsRoute answers (histograms, rankings, dashboard, filterdata, dropped),
 // and the MCP logs. The other /api/logs routes are not these.
 function logsAnalyticsPath(path: string): bool {
-  return path.startsWith("/api/logs/histogram") || path.startsWith("/api/logs/rankings") || path === "/api/logs/dashboard" || path === "/api/logs/filterdata" || path === "/api/logs/dropped" || path.startsWith("/api/mcp-logs")
+  return path === "/api/logs" || path.startsWith("/api/logs/") || path.startsWith("/api/mcp-logs")
+}
+
+// The audit trail's path, with the alias (governance/audit-logs) mapped onto audit-logs; "" for any other path.
+function auditTarget(path: string): string {
+  const segs = path.split("/")
+  if (segs[1] === "api" && segs[2] === "audit-logs") return path
+  if (segs[1] === "api" && segs[2] === "governance" && segs[3] === "audit-logs") return ["", "api", "audit-logs"].concat(segs.slice(4)).join("/")
+  return ""
+}
+
+// A route's reply. A section it changed is saved first, and a failed save is the reply instead.
+function savedReply(status: int, body: string, saved: Result | undefined): Reply {
+  if (saved !== undefined && saved.kind !== "ok") return { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
+  return { status: status, body: body, contentType: "application/json" }
 }
 
 // The management API, behind RBAC; every change lands in the audit log.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const gate = ops.gate(req, path)
   if (gate.kind === "deny") return gate.res
+  // what this caller may see and change (data access scope)
+  const sc = ops.scopeOfActorFor(gate.actor, resourceOf(req.method, path).resource)
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
-  if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body)
-  else if (path === "/api/audit-logs" || path.startsWith("/api/audit-logs/")) r = ops.auditRoute(req, path)
-  else if (path === "/api/mcp/virtual") r = ops.virtualView()
+  if (path === "/api/users/me/permissions") r = req.method === "GET" ? ops.mePermissions(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path === "/api/users/me/vk-creation-policy") r = req.method === "GET" ? ops.vkCreationPolicy(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path.startsWith("/api/users/") && path.split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, path)
+  else if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
+  else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
+  // the cache clears (DELETE) and the read-only plugin listings
+  else if (path.startsWith("/api/cache/")) r = ops.cacheClear(req.method, path)
+  else if (path === "/api/plugins" || path.startsWith("/api/plugins/")) r = ops.pluginsRoute(req.method, path, body)
+  else if (path === "/api/mcp/virtual") r = req.method === "GET" ? ops.virtualView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/governance/access-profiles" || path.startsWith("/api/governance/access-profiles/")) r = ops.profiles(req.method, path, body)
   else if (path.startsWith("/api/alerting/")) {
     const ar = alertingRoute(ops.store.cfg.alerts ?? {}, { usage: (t, id) => ops.engine.gov.scopeUsage(t, id, Date.now()), history: () => ops.cel?.history() ?? [] }, req.method, req.url.slice(req.url.indexOf("/api/")), body)
@@ -238,8 +460,13 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
   else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   // the request-log analytics and the MCP logs (ops.logsRoute)
-  else if (logsAnalyticsPath(path)) r = ops.logsRoute(req, path, body)
+  else if (logsAnalyticsPath(path)) r = ops.logsRoute(req, path, body, sc)
   else if (path === "/api/circuit-breaker/policies" || path.startsWith("/api/circuit-breaker/policies/")) r = ops.circuitPoliciesRoute(req.method, path, body)
+  else if (path === "/api/circuit-breaker/reset") r = req.method === "POST" ? ops.circuitReset(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
+  // adaptive load balancing: the keys held out of rotation, their incidents, and releasing them
+  else if (path === "/api/adaptive-routing/held-keys") r = req.method === "GET" ? ops.adaptiveHeldKeys() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path === "/api/adaptive-routing/incidents") r = req.method === "GET" ? ops.adaptiveIncidents() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path === "/api/adaptive-routing/conditions/clear") r = req.method === "POST" ? ops.adaptiveRelease(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/vault/flush-cache") r = req.method === "POST" ? ops.vaultFlush() : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/models/parameters") r = req.method === "GET" ? await ops.modelParameters(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/models/catalog") r = ops.catalogUpsert(req, body)
@@ -253,23 +480,51 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
     const isKey = parts.length === 7 && parts[4] === "keys"
     if (req.method !== "POST") r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
     else if (!(parts.length === 5 || isKey)) r = { status: 404, body: `{"error":{"message":"no such route","type":"invalid_request_error"}}`, contentType: "application/json" }
-    else r = await refreshModels(ops.store.cfg, parts[3] ?? "", isKey ? parts[5] : undefined)
+    else r = await refreshModels(undefined, ops.store.cfg, parts[3] ?? "", isKey ? parts[5] : undefined)
   }
   else if (path === "/api/pricing/force-sync") {
     if (req.method === "POST") r = await ops.forcePricing()
     else r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   }
+  // prompt repository, webhooks, feature flags and notifications (their modules hold the logic)
+  else if (path.startsWith("/api/prompt-repo/")) {
+    const pr = promptRoute(ops.store.cfg.prompt_repo, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    r = savedReply(pr.status, pr.body, pr.next === undefined ? undefined : ops.store.setPromptRepo(pr.next))
+  }
+  else if (path === "/api/webhooks" || path.startsWith("/api/webhooks/")) {
+    const wr = await webhookApi(ops.store.cfg.webhooks, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    r = savedReply(wr.status, wr.body, wr.next === undefined ? undefined : ops.store.setWebhooks(wr.next))
+  }
+  else if (path === "/api/feature-flags" || path.startsWith("/api/feature-flags/")) {
+    const fr = flagRoute(ops.store.cfg.feature_flags, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    r = savedReply(fr.status, fr.body, fr.next === undefined ? undefined : ops.store.setFeatureFlags(fr.next))
+  }
+  else if (path === "/api/notifications") {
+    const nr = notifyRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    r = { status: nr.status, body: nr.body, contentType: "application/json" }
+  }
   else {
-    const mr = mcpApi(ops.store, req.method, path, body)
+    // the OAuth routes of auth type oauth clients need the gateway's origin (the callback's redirect URI)
+    const mu = URL.parse(req.url)
+    let oa: McpReply | undefined = oauthConfigRoute(ops.store, req.method, path)
+    if (oa === undefined) oa = await oauthRoute(ops.store, req.method, path, body, mu === undefined ? "" : mu.origin)
+    if (oa === undefined) oa = perUserApi(ops.store, req.method, mu === undefined ? path : path + mu.search, body, mu === undefined ? "" : mu.origin)
+    if (oa === undefined) oa = await headersRouteAsync(ops.store, req.method, path, body)
+    if (oa === undefined) oa = await openapiRoute(req.method, path, body)
+    // with dashboard auth off, clients registered here must reach public addresses only
+    const mr = oa ?? mcpApi(ops.store, req.method, path, body, !ops.authOn)
     if (mr !== undefined) {
       r = { status: mr.status, body: mr.body, contentType: "application/json" }
       if (mr.status === 200 && mr.action !== undefined) r = await mcpAction(ops, mr.action, mr.id ?? "", r)
     } else {
-      const a = handleApi(ops.store, req.method, path, body)
+      // the query (search, paging, is_active) reaches the handlers that read it
+      const qu = URL.parse(req.url)
+      const a = handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
       r = { status: a.status, body: a.body, contentType: "application/json" }
     }
   }
   ops.recordChange(gate.actor, req, path, r.status, body)
+  if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)
   return new Response(r.body, { status: r.status, headers: h })
@@ -281,19 +536,11 @@ function mcpView(engine: Engine): Response {
   return Response.json({ clients: m.status() })
 }
 
-function logsView(engine: Engine, req: Request, stats: bool): Response {
-  const store = engine.logStore
-  if (store === undefined) return errorResponse(404, "request logs are off; enable logs_store in the config", "invalid_request_error", noHeaders())
-  const u = URL.parse(req.url)
-  const params = u === undefined ? new URLSearchParams("") : u.searchParams
-  if (stats) {
-    // Bifrost's totals over start_time..end_time (or since), with the filters the log list takes
-    const start = parseFloat(params.get("start_time") ?? params.get("since") ?? "0") ?? 0.0
-    const end = parseFloat(params.get("end_time") ?? "") ?? Date.now() + 1.0
-    const f = filterFrom(params, "llm", start, end)
-    return new Response(statsView(selectAll(store.viewSince(start - 1.0), f)), { headers: { "content-type": "application/json" } })
-  }
-  return Response.json(store.query(parseQuery(params)))
+// A handler's reply as an HTTP response.
+function replyResponse(r: Reply): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", r.contentType)
+  return new Response(r.body, { status: r.status, headers: h })
 }
 
 function cacheView(engine: Engine): Response {
@@ -330,7 +577,28 @@ async function cors(cfg: Config, req: Request, res: Response): Promise<Response>
   return new Response(res.status === 204 ? undefined : bytes, { status: res.status, headers: h })
 }
 
-export type ServeOptions = { port: int, hostname: string, workers: int }
+export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int }
+
+// Bun.serve has no body limit of its own, so client.max_request_body_size_mb is checked here:
+// a declared length over the limit is refused unread, and a body with no length is read once
+// and refused when it is over. undefined means refused; otherwise the request to dispatch
+// (rebuilt around its bytes when they were read here).
+export async function limitedBody(req: Request, maxBytes: int): Promise<Request | undefined> {
+  if (req.method === "GET" || req.method === "HEAD") return req
+  const declared = req.headers.get("content-length")
+  if (declared !== undefined) {
+    const n = parseFloat(declared) ?? 0.0
+    return n > maxBytes ? undefined : req
+  }
+  let body: u8[] = []
+  try {
+    body = await req.bytes()
+  } catch (e) {
+    body = []
+  }
+  if (body.length > maxBytes) return undefined
+  return new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body })
+}
 
 function textResponse(body: string, contentType: string): Response {
   const h: Record<string, string> = new Map()
@@ -346,12 +614,25 @@ export function compatPath(p: string): string {
   if (p.startsWith("/litellm/")) return compatPath(p.slice(8))
   if (p.startsWith("/langchain/")) return compatPath(p.slice(10))
   if (p.startsWith("/pydanticai/")) return compatPath(p.slice(11))
+  // Cursor's routes are the same families under /cursor (its chat is served by dispatch: cursorChat)
+  if (p.startsWith("/cursor/") && !isCursorChat(p)) return compatPath(p.slice(7))
   // the OpenAI SDK pointed at /openai: every /v1 route under /openai/v1
   if (p.startsWith("/openai/v1/") && p !== "/openai/v1/realtime") return p.slice(7)
   // Azure-style deployments: the /v1 route of the operation (dispatch sets the model)
   const dep = deploymentRoute(p)
   if (dep !== undefined) return dep.path
+  // the same family mounted without the version segment (Bifrost mounts both): /openai/responses is /v1/responses
+  if (isUnversionedOpenAI(p)) return "/v1" + p.slice(7)
   return p
+}
+
+function isCursorChat(p: string): bool {
+  return p === "/cursor/v1/chat/completions" || p === "/cursor/chat/completions"
+}
+
+// /openai/{responses, embeddings, completions, models, files, batches, realtime, ...} with no /v1 segment.
+function isUnversionedOpenAI(p: string): bool {
+  return p.startsWith("/openai/") && p.byteLength > 8 && !p.startsWith("/openai/v1/") && !p.startsWith("/openai/deployments/")
 }
 
 async function unprefixed(req: Request, p: string): Promise<Request> {
@@ -373,10 +654,51 @@ async function unprefixed(req: Request, p: string): Promise<Request> {
 
 // Every HTTP route except the WebSocket upgrade, in one function so both
 // servers (http1 for streaming, Bun.serve as the fallback) share it.
+// Bifrost's tracing middleware answers with the caller's x-request-id. Inference routes set it from the
+// id they log under; every other route echoes the caller's id here.
+async function echoRequestId(req: Request, res: Response): Promise<Response> {
+  const id = req.headers.get("x-request-id") ?? ""
+  if (id === "" || (res.headers.get("x-request-id") ?? "") !== "") return res
+  const h: Record<string, string> = new Map()
+  res.headers.forEach((v, k) => {
+    if (k !== "content-length") h.set(k, v)
+  })
+  h.set("x-request-id", id)
+  const st = res.body
+  if (st !== undefined && st.pushed) return new Response(st, { status: res.status, headers: h })
+  let bytes: u8[] = []
+  try {
+    bytes = await res.bytes()
+  } catch (e) {
+    bytes = []
+  }
+  return new Response(res.status === 204 ? undefined : bytes, { status: res.status, headers: h })
+}
+
 export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
+  const res = try await routes(engine, ops, req)
+  return await echoRequestId(req, res)
+}
+
+async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
+  // the compat plugin reads a model's datasheet row through the same handler as GET /api/models/parameters
+  if (engine.paramsLookup === undefined) {
+    engine.paramsLookup = async (model: string): Promise<string | undefined> => {
+      const sp = new URLSearchParams("")
+      sp.set("model", model)
+      const r = await ops.modelParameters(new Request("http://raiju.internal/api/models/parameters?" + sp.toString()))
+      return r.status === 200 ? r.body : undefined
+    }
+  }
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   const m = req.method
+  // x-bf-async on an inference route: the request runs as a job, and the caller polls it (Bifrost's integration routes)
+  if (m === "POST" && (req.headers.get("x-bf-async") ?? "") !== "" && !p.startsWith("/api/") && !p.startsWith("/v1/async/") && p !== "/mcp") {
+    const again: Dispatch = async (r) => try await dispatch(engine, ops, r)
+    const route = compatPath(p)
+    return await sdkAsyncSubmit(engine.jobs, req, again, route.slice(1, route.byteLength))
+  }
   const dep = deploymentRoute(p)
   if (dep !== undefined && m === "POST") return try await dispatch(engine, ops, await deploymentRequest(req, dep))
   const cp = compatPath(p)
@@ -394,19 +716,38 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
   // the GenAI SDK's files, batches, cached contents, operations, :predict and rank
   const gop = genaiIn.genaiRoute(m, p)
   if (gop !== undefined) return await cors(engine.cfg, req, await genaiSdk(engine, req, gop.op, gop.model, gop.id))
+  // Bedrock's jobs and S3 files, and Vertex's regional batch and cache paths: the provider's own bodies
+  const nr = nativeRoute(m, p)
+  if (nr !== undefined) {
+    if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
+      return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
+    }
+    return try await cors(engine.cfg, req, try await nativeCloud(engine.cfg, req, nr))
+  }
+  const lc = contentId(p)
+  if (lc !== "" && m === "GET") return await liveContent(engine, ops.liveSessions, req, lc)
+  if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine.cfg, req, await liveCreate(engine, req))
   if (m === "GET" || m === "HEAD") {
+    // x-bf-async-id on an inference route: poll the job that route created
+    const aid = req.headers.get("x-bf-async-id") ?? ""
+    if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid)
     if (p === "/health") return Response.json({ status: "ok" })
     if (p === "/") return textResponse(INDEX_HTML, "text/html; charset=utf-8")
     if (p === "/metrics") return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
     if (p === "/v1/models" || p === "/openai/v1/models") return await cors(engine.cfg, req, await listModels(engine, req))
     if (p.startsWith("/v1/models/")) return await cors(engine.cfg, req, await retrieveModel(engine, req, p.slice(11)))
+    if (p === "/typesafe/v1/models") return await cors(engine.cfg, req, await decisionRoute(engine, req, p))
     if (p === "/genai/v1beta/models") return await cors(engine.cfg, req, await genaiModels(engine, ""))
     if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genaiModels(engine, p.slice(GENAI.byteLength)))
     const poll = asyncPoll(p)
     if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id)
     if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
-    if (p === "/api/logs") return ops.check(req, p) ?? logsView(engine, req, false)
-    if (p === "/api/logs/stats") return ops.check(req, p) ?? logsView(engine, req, true)
+    if (p === "/api/logs" || p === "/api/logs/stats") {
+      const cs = ops.checkScope(req, p)
+      return cs.res ?? replyResponse(ops.logsRoute(req, p, "", cs.scope))
+    }
+    // self-service: the virtual key in the request is the credential, so no admin session is checked
+    if (p === "/api/governance/virtual-keys/quota") return replyResponse(ops.vkQuota(req))
     if (p === "/api/governance/usage") return ops.check(req, p) ?? Response.json({ budgets: engine.gov.budgetUsage() })
     if (p === "/api/mcp") return ops.check(req, p) ?? mcpView(engine)
     if (p === "/api/health") return ops.check(req, p) ?? Response.json({ targets: engine.health.snapshot(Date.now()) })
@@ -417,10 +758,14 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
     if (p === "/v1/completions" || p === "/openai/v1/completions") return await cors(engine.cfg, req, await engine.completions(req))
     if (p === "/v1/responses" || p === "/openai/v1/responses") return await cors(engine.cfg, req, await responsesApi(engine, req))
     if (p === "/v1/rerank") return await cors(engine.cfg, req, await rerank(engine, req))
+    if (p === "/v1/decisions" || p === "/openai/v1/decisions" || p === "/typesafe/v1/systemone") return await cors(engine.cfg, req, await decisionRoute(engine, req, p))
     if (p === "/bedrock/rerank") return await cors(engine.cfg, req, await bedrockRerank(engine, req))
     if (p === "/v1/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, false))
     if (p === "/anthropic/v1/messages/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, true))
     if (p === "/anthropic/v1/messages") return await cors(engine.cfg, req, await anthropicMessages(engine, req))
+    if (p === "/anthropic/v1/complete") return await cors(engine.cfg, req, await anthropicLegacy(engine, req))
+    if (isCursorChat(p)) return await cors(engine.cfg, req, await cursorChat(engine, req))
+    if (p === "/v1/realtime") return try await cors(engine.cfg, req, try await realtimeSdp(engine.cfg, req))
     if (p === "/v1/mcp/tool/execute") return await cors(engine.cfg, req, await engine.executeTool(req))
     if (p === "/cohere/v2/chat") return await cors(engine.cfg, req, await cohereChat(engine, req))
     if (p === "/cohere/v2/embed") return await cors(engine.cfg, req, await cohereEmbed(engine, req))
@@ -428,11 +773,22 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
     if (p === "/cohere/v1/tokenize") return await cors(engine.cfg, req, await cohereTokenize(engine, req))
     if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genai(engine, req, p.slice(GENAI.byteLength)))
     if (p.startsWith("/bedrock/model/") && segs.length === 5) return await cors(engine.cfg, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
-    if (p.startsWith("/v1/async/")) return await asyncSubmit(engine.jobs, req, p, dispatcher(engine))
+    if (p.startsWith("/v1/async/")) return await asyncSubmitHooked(engine.cfg.webhooks, engine.jobs, req, p, dispatcher(engine), (engine.cfg.client?.async_job_result_ttl ?? 3600) * 1000)
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
+  if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
   if (p.startsWith("/api/oidc/") && m === "GET") return await ops.oidcRoute(req, p)
+  // the MCP OAuth callback: the browser comes back here from the authorization server, with no session
+  if (p === "/api/oauth/callback" && m === "GET") {
+    const cu = URL.parse(req.url)
+    const cb = await oauthCallback(ops.store, cu === undefined ? new URLSearchParams("") : cu.searchParams)
+    return new Response(cb.html, { status: cb.status, headers: { "content-type": "text/html; charset=utf-8" } })
+  }
+  // the MCP authorization server (client.mcp_server_auth_mode both or oauth): discovery, registration, the
+  // authorize and token endpoints, the consent pages, and the per-user connect page
+  const ia = await issuerRoute(engine.cfg, req, p, (v) => keyByValue(engine, v), (id) => keyById(engine.cfg, id), Date.now())
+  if (ia !== undefined) return ia
   // login and logout come before the gate: they are how a caller gets past it
   if (p.startsWith("/api/session/")) return await ops.sessionRoute(req, p)
   if (p.startsWith("/api/")) return await manage(ops, req, p)
@@ -458,6 +814,13 @@ export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<
   return errorResponse(404, `no route for ${m} ${p}`, "invalid_request_error", noHeaders())
 }
 
+// The virtual key a value names, its rotation cooldown included (the governance lookup of a header value).
+function keyByValue(engine: Engine, value: string): VirtualKeyConfig | undefined {
+  const h: Hdrs = new Map()
+  h.set("x-bf-vk", value)
+  return engine.gov.findKey(h)
+}
+
 // Holds what a streamed chat answer needs before its head is known.
 class StreamHead {
   resolve: ((r: Response) => void) | undefined = undefined
@@ -476,6 +839,8 @@ class StreamHead {
 // The routes that can stream, by kind: the kind picks the handler (routeStream).
 export function streamKind(p: string): string {
   if (CHAT_PATHS.includes(p)) return "openai"
+  if (p === "/v1/completions") return "completions"
+  if (p === "/v1/responses") return "responses"
   if (p === "/anthropic/v1/messages") return "anthropic"
   if (p === "/cohere/v2/chat") return "cohere"
   if (p.startsWith(GENAI) && p.endsWith(":streamGenerateContent")) return "genai"
@@ -509,6 +874,8 @@ export async function routeStream(engine: Engine, req: Request, kind: string, si
     const segs = p.split("/")
     return await bedrockModel(engine, req, segs[3]!, segs[4]!, sink)
   }
+  if (kind === "completions") return await engine.completions(req, sink)
+  if (kind === "responses") return await responsesApi(engine, req, sink)
   return await engine.chat(req, sink)
 }
 
@@ -564,6 +931,102 @@ async function chatStreamed(engine: Engine, req: Request, kind: string): Promise
   return await cors(engine.cfg, req, await p)
 }
 
+// The base path of a WebSocket route. The OpenAI integration prefixes Bifrost registers for these
+// routes map to the base path: /openai/v1/..., /openai/live/... and the Responses aliases.
+export function wsBasePath(p: string): string {
+  if (p.startsWith("/openai/v1/")) return p.slice(7)
+  if (p.startsWith("/openai/live/")) return "/v1" + p.slice(7)
+  if (p === "/openai/responses" || p === "/openai/openai/responses") return "/v1/responses"
+  // the rest of the unversioned /openai family (/openai/realtime and the others)
+  if (isUnversionedOpenAI(p)) return "/v1" + p.slice(7)
+  return p
+}
+
+// What a WebSocket upgrade becomes: the session to open, a refusal (an HTTP answer), or no
+// WebSocket route at all.
+export type WsUpgrade = { kind: "none" } | { kind: "refused", status: int, message: string } | { kind: "session", session: Session }
+
+function wsSession(req: Request, ext: SocketExt): Session {
+  const s = new Session(req.url, snapshot(req.headers), "", "")
+  s.ext = ext
+  return s
+}
+
+// The WebSocket routes, for both servers: the realtime relay, the Responses API (GET /v1/responses),
+// GPT Live (/v1/live/sessions and its attach) and the UI socket (/ws). A refusal is decided before
+// the upgrade, so the client gets an HTTP status.
+export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
+  const u = URL.parse(req.url)
+  const p0 = u === undefined ? "" : u.pathname
+  const p = wsBasePath(p0)
+  if (p === "/v1/realtime" && req.method === "GET") {
+    const up = prepare(engine, req)
+    if (up.kind === "refused") return { kind: "refused", status: up.status, message: up.message }
+    return { kind: "session", session: up.session }
+  }
+  if (req.method !== "GET") return { kind: "none" }
+  const att = attachId(p)
+  if (p !== "/v1/responses" && p !== "/v1/live/sessions" && p !== "/ws" && att === "") return { kind: "none" }
+  const h = snapshot(req.headers)
+  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, new ResponsesSocket(engine, h)) }
+  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map())) }
+  if (att !== "") {
+    if (!validId(att)) return { kind: "refused", status: 400, message: "a session id is required" }
+    if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
+    const owner = ownerOf(engine, h)
+    if (!ops.liveSessions.allowed(att, owner)) return { kind: "refused", status: 404, message: "live session not found" }
+    const up = attachUpstream(engine, h, att)
+    if (up === undefined) return { kind: "refused", status: 404, message: "no OpenAI key is configured for live sessions" }
+    return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers)) }
+  }
+  if (p === "/ws") {
+    // a ticket from POST /api/session/ws-ticket stands for the caller's credentials, once and briefly
+    const tk = u === undefined ? "" : u.searchParams.get("ticket") ?? ""
+    if (tk !== "") {
+      const actor = ops.wsTickets.consume(tk, Date.now())
+      if (actor === undefined) return { kind: "refused", status: 401, message: "the WebSocket ticket is invalid, used or expired" }
+      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(actor))) }
+    }
+    // the live feed is log data: whoever may read /api/logs may open it, and sees its own data scope
+    const g = ops.gate(req, "/api/logs")
+    if (g.kind === "deny") return { kind: "refused", status: g.res.status, message: g.res.status === 401 ? "authentication is required" : "this role may not open the UI socket" }
+    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(g.actor))) }
+  }
+  return { kind: "none" }
+}
+
+// The same routes on the http1 server (front.tov): an accepted socket runs its route's state, and a
+// refusal is answered over HTTP. False for a path that is no WebSocket route.
+export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void): bool {
+  const wu = wsUpgrade(engine, ops, req)
+  if (wu.kind === "none") return false
+  if (wu.kind === "refused") {
+    reject(wu.status, errorJson(wu.message, "invalid_request_error", undefined))
+    return true
+  }
+  const client = accept()
+  const ext = wu.session.ext
+  if (client !== undefined && ext !== undefined) attachHttp1(ext, client)
+  return true
+}
+
+// One HTTP request on the Bun.serve server: the body limit, then the streamed or whole route.
+async function bunHttp(engine: Engine, ops: Ops, req0: Request, limit: int): Promise<Response, TypeError> {
+  const within = try await limitedBody(req0, limit)
+  if (within === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
+  const req = within
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  const cp = compatPath(p)
+  const t0 = performance.now()
+  const reqBytes = parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0
+  // an x-bf-async request runs as a job through dispatch, not as a stream
+  const asyncReq = (req.headers.get("x-bf-async") ?? "") !== ""
+  const kind = req.method === "POST" && !asyncReq ? streamKind(cp) : ""
+  if (kind !== "") return try await timed(p, req.method, t0, reqBytes, req.headers, chatStreamed(engine, req, kind))
+  return try await timed(p, req.method, t0, reqBytes, req.headers, dispatch(engine, ops, req))
+}
+
 // The Bun.serve server (the default): streamed chat answers, Tov's multi-process workers,
 // native WebSockets.
 export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
@@ -571,27 +1034,52 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
     port: opts.port,
     hostname: opts.hostname,
     workers: opts.workers,
-    fetch(req, server) {
-      const u = URL.parse(req.url)
-      const p = u === undefined ? "" : u.pathname
-      if (p === "/v1/realtime" || p === "/openai/v1/realtime") {
-        const up = prepare(engine, req)
-        if (up.kind === "refused") return errorResponse(up.status, up.message, "invalid_request_error", noHeaders())
-        if (server.upgrade(req, { data: up.session })) return
+    fetch(req0, server) {
+      const wu = wsUpgrade(engine, ops, req0)
+      if (wu.kind === "refused") return errorResponse(wu.status, wu.message, "invalid_request_error", noHeaders())
+      if (wu.kind === "session") {
+        if (server.upgrade(req0, { data: wu.session })) return
         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
       }
-      const cp = compatPath(p)
-      const t0 = performance.now()
-      const reqBytes = parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0
-      const kind = req.method === "POST" ? streamKind(cp) : ""
-      if (kind !== "") return timed(p, req.method, t0, reqBytes, chatStreamed(engine, req, kind))
-      return timed(p, req.method, t0, reqBytes, dispatch(engine, ops, req))
+      return bunHttp(engine, ops, req0, opts.maxBodyBytes ?? 100 * 1048576)
     },
     websocket: {
-      open: (ws) => onOpen(ws),
-      message: (ws, m) => onMessage(ws, m),
-      close: (ws) => onClose(ws),
+      open: (ws) => {
+        if (!extOpen(ws)) onOpen(ws)
+      },
+      message: (ws, m) => {
+        if (!extMessage(ws, m)) onMessage(ws, m)
+      },
+      close: (ws) => {
+        if (!extClose(ws)) onClose(ws)
+      },
+      pong: (ws) => {
+        extPong(ws)
+      },
     },
   })
   return server.url.href
 }
+
+test("compat paths: the unversioned OpenAI family and the Cursor prefix", () => {
+  expect(compatPath("/openai/responses")).toBe("/v1/responses")
+  expect(compatPath("/openai/responses/resp_1/cancel")).toBe("/v1/responses/resp_1/cancel")
+  expect(compatPath("/openai/embeddings")).toBe("/v1/embeddings")
+  expect(compatPath("/openai/models/openai/gpt-4o")).toBe("/v1/models/openai/gpt-4o")
+  expect(compatPath("/openai/files")).toBe("/v1/files")
+  expect(compatPath("/openai/batches/b1")).toBe("/v1/batches/b1")
+  expect(compatPath("/openai/realtime/calls")).toBe("/v1/realtime/calls")
+  expect(compatPath("/openai/v1/responses")).toBe("/v1/responses")
+  expect(compatPath("/openai/v1/realtime")).toBe("/openai/v1/realtime")
+  expect(compatPath("/openai/deployments/d/completions")).toBe("/v1/completions")
+  expect(compatPath("/cursor/v1/models")).toBe("/v1/models")
+  expect(compatPath("/cursor/anthropic/v1/messages")).toBe("/anthropic/v1/messages")
+  expect(compatPath("/cursor/v1/chat/completions")).toBe("/cursor/v1/chat/completions")
+  expect(compatPath("/v1/chat/completions")).toBe("/v1/chat/completions")
+})
+
+test("the Responses route streams through the sink when the request asks for a stream", () => {
+  expect(streamKind("/v1/responses")).toBe("responses")
+  expect(streamsRequest("responses", `{"model":"m","stream":true}`)).toBe(true)
+  expect(streamsRequest("responses", `{"model":"m"}`)).toBe(false)
+})

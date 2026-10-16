@@ -4,6 +4,7 @@
 import { mkdirSync, appendFileSync, readFileSync, existsSync, readdirSync, unlinkSync, writeFileSync, rmSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { isoMs } from "./exports"
+import { DataScope, inScope } from "./scope"
 
 // kind: "mcp" for an MCP tool execution (op "tool", with tool and server set); absent for an LLM request.
 export type LogEntry = {
@@ -20,6 +21,17 @@ export type LogEntry = {
   cost: f64,
   cache_hit: bool,
   virtual_key?: string,
+  // who the request is attributed to (governance's team, customer, business unit and project ids)
+  team_id?: string,
+  customer_id?: string,
+  business_unit_id?: string,
+  project_id?: string,
+  // the caller's session (x-bf-session-id or a coding harness's session header), the user its key is
+  // assigned to, the raw User-Agent and the app that User-Agent maps to (logapi.tov)
+  session_id?: string,
+  user_id?: string,
+  user_agent?: string,
+  app?: string,
   error?: string,
   input?: string, // request body, only when content logging is on
   output?: string, // response body, only when content logging is on
@@ -29,6 +41,33 @@ export type LogEntry = {
   // the raw upstream request and response, when store_raw_request_response (or its header) keeps them
   raw_request?: string,
   raw_response?: string,
+  // the request's row metadata (client.logging_headers, x-bf-lh-*, x-bf-dim-*; reqlog.tov)
+  metadata?: Record<string, string>,
+  // the caller's parent request id and agent correlation id (x-bf-parent-request-id, x-bf-agent-correlation-id)
+  parent_request_id?: string,
+  agent_correlation_id?: string,
+  // Maxim trace attributes the caller named (x-bf-maxim-*): the reserved ids and names, and the tags
+  maxim?: Record<string, string>,
+  maxim_tags?: Record<string, string>,
+  // how the request was routed: the key that served it, the routing rule that matched (its id) and the
+  // engine that chose the target, the model alias the caller named, the complexity tier and how it was
+  // classified, the local cache hit ("direct" or "semantic") and the stop reason of the answer
+  selected_key_id?: string,
+  selected_key_name?: string,
+  routing_rule_id?: string,
+  routing_engine_used?: string,
+  alias?: string,
+  complexity_tier?: string,
+  complexity_mechanism?: string,
+  cache_hit_type?: string,
+  stop_reason?: string,
+  // the names of the tools the answer called (reqlog.tov toolCallNamesOf), the heuristic complexity score
+  // behind the tier (heuristic mechanism only) and the prompt the request named with x-bf-prompt-id
+  tool_call_names?: string[],
+  complexity_score?: f64,
+  selected_prompt_id?: string,
+  selected_prompt_name?: string,
+  selected_prompt_version?: int,
 }
 
 export type LogStoreConfig = {
@@ -44,6 +83,12 @@ export type LogQuery = {
   model?: string,
   status?: "success" | "error",
   virtual_key?: string,
+  team_id?: string,
+  customer_id?: string,
+  business_unit_id?: string,
+  project_id?: string,
+  // the entries the caller's data access scope may see (see scope.tov); all when absent
+  scope?: DataScope,
   since?: f64,
   until?: f64,
   text?: string, // substring of model, error or request_id
@@ -71,7 +116,7 @@ const DAY_MS = 86400000
 
 // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
 // algorithm; the 400-year eras make it exact for every year, leap years included).
-function daysFromCivil(y0: int, m: int, d: int): int {
+export function daysFromCivil(y0: int, m: int, d: int): int {
   const y = m <= 2 ? y0 - 1 : y0
   const era = Math.floor(y / 400)
   const yoe = y - era * 400
@@ -165,6 +210,11 @@ function matches(e: LogEntry, q: LogQuery): bool {
   if (q.model !== undefined && e.model !== q.model) return false
   if (q.status !== undefined && isSuccess(e) !== (q.status === "success")) return false
   if (q.virtual_key !== undefined && e.virtual_key !== q.virtual_key) return false
+  if (q.team_id !== undefined && e.team_id !== q.team_id) return false
+  if (q.customer_id !== undefined && e.customer_id !== q.customer_id) return false
+  if (q.business_unit_id !== undefined && e.business_unit_id !== q.business_unit_id) return false
+  if (q.project_id !== undefined && e.project_id !== q.project_id) return false
+  if (q.scope !== undefined && !visibleTo(e, q.scope)) return false
   if (q.since !== undefined && e.ts < q.since) return false
   if (q.until !== undefined && e.ts > q.until) return false
   if (q.text !== undefined && q.text !== "" && !mentions(e, q.text)) return false
@@ -350,6 +400,72 @@ export class LogStore {
     }
   }
 
+  // Replaces the cost of every entry that pick() prices (it returns the new cost, or undefined to keep
+  // the entry as it is), in memory and in the day files. Returns how many changed.
+  recost(pick: (e: LogEntry) => f64 | undefined): int {
+    // an entry can be in memory and in its file: counted once, by id
+    const changed: Set<string> = new Set()
+    for (let i = 0; i < this.ring.length; i++) {
+      const e = this.ring[i]!
+      const c = pick(e)
+      if (c === undefined || c === e.cost) continue
+      let n = this.ring[i]!
+      n.cost = c
+      this.ring[i] = n
+      changed.add(e.id)
+    }
+    this.viewSize = -1
+    let names: string[] = []
+    try {
+      names = readdirSync(this.cfg.dir)
+    } catch (err) {
+      return changed.size
+    }
+    for (const name of names) {
+      if (fileDay(name) === undefined) continue
+      const path = join(this.cfg.dir, name)
+      let lines: string[] = []
+      try {
+        lines = readFileSync(path, "utf8").split("\n")
+      } catch (err) {
+        continue
+      }
+      const out: string[] = []
+      let hit = 0
+      for (const line of lines) {
+        if (line === "") continue
+        let parsed: LogEntry | undefined = undefined
+        try {
+          parsed = JSON.parse(line) as LogEntry
+        } catch (err) {
+          out.push(line)
+          continue
+        }
+        if (parsed === undefined) {
+          out.push(line)
+          continue
+        }
+        const e: LogEntry = parsed
+        const c = pick(e)
+        if (c === undefined || c === e.cost) {
+          out.push(line)
+          continue
+        }
+        e.cost = c
+        out.push(JSON.stringify(e))
+        changed.add(e.id)
+        hit += 1
+      }
+      if (hit === 0) continue
+      try {
+        writeFileSync(path, out.length === 0 ? "" : out.join("\n") + "\n")
+      } catch (err) {
+        console.error(`logstore: could not rewrite ${name}: ${err.message}`)
+      }
+    }
+    return changed.size
+  }
+
   // Deletes the day files older than retention_days before now; returns how many.
   prune(now: f64): int throws Error {
     const cutoff = Math.floor(now / DAY_MS) - this.cfg.retention_days
@@ -386,6 +502,14 @@ export class LogStore {
       cost: e.cost,
       cache_hit: e.cache_hit,
       virtual_key: e.virtual_key,
+      team_id: e.team_id,
+      customer_id: e.customer_id,
+      business_unit_id: e.business_unit_id,
+      project_id: e.project_id,
+      session_id: e.session_id,
+      user_id: e.user_id,
+      user_agent: e.user_agent,
+      app: e.app,
       error: e.error,
       input: on ? clip(e.input, max) : undefined,
       output: on ? clip(e.output, max) : undefined,
@@ -396,6 +520,25 @@ export class LogStore {
       // truncated_log_bytes default of 1 MiB
       raw_request: clip(e.raw_request, RAW_MAX),
       raw_response: clip(e.raw_response, RAW_MAX),
+      metadata: e.metadata,
+      parent_request_id: e.parent_request_id,
+      agent_correlation_id: e.agent_correlation_id,
+      maxim: e.maxim,
+      maxim_tags: e.maxim_tags,
+      selected_key_id: e.selected_key_id,
+      selected_key_name: e.selected_key_name,
+      routing_rule_id: e.routing_rule_id,
+      routing_engine_used: e.routing_engine_used,
+      alias: e.alias,
+      complexity_tier: e.complexity_tier,
+      complexity_mechanism: e.complexity_mechanism,
+      cache_hit_type: e.cache_hit_type,
+      stop_reason: e.stop_reason,
+      tool_call_names: e.tool_call_names,
+      complexity_score: e.complexity_score,
+      selected_prompt_id: e.selected_prompt_id,
+      selected_prompt_name: e.selected_prompt_name,
+      selected_prompt_version: e.selected_prompt_version,
     }
   }
 
@@ -464,9 +607,19 @@ export type Filter = {
   providers: string[],
   models: string[],
   virtual_keys: string[],
+  teams: string[],
+  customers: string[],
+  businessUnits: string[],
+  projects: string[],
   tools: string[],
   servers: string[],
-  status: string, // "", "success", "error" or "cancelled"
+  statuses: string[], // "success", "error" or "cancelled"; any of them when the list is empty
+  users: string[],
+  sessionId: string,
+  userAgents: string[],
+  apps: string[],
+  objects: string[], // the request type (the entry's op)
+  missingCost: bool, // only entries with no cost
   since: f64, // ms, inclusive
   until: f64, // ms, exclusive
   min_latency: f64,
@@ -477,6 +630,23 @@ export type Filter = {
   max_cost: f64,
   text: string,
   request_id: string,
+  selectedKeys: string[],
+  routingRules: string[],
+  routingEngines: string[],
+  stopReasons: string[],
+  aliases: string[],
+  complexityTiers: string[],
+  complexityMechanisms: string[],
+  minComplexity: f64, // -1 when no bound; the heuristic score must be at least this
+  maxComplexity: f64, // -1 when no bound; and at most this
+  cacheHitTypes: string[],
+  toolCallNames: string[], // the answer called any of these tools
+  promptIds: string[],
+  promptNames: string[],
+  parentId: string, // exact parent_request_id
+  correlationId: string, // exact agent_correlation_id
+  rootsOnly: bool, // see applyChains
+  groupSessions: bool, // see applyChains
 }
 
 function listParam(v: string | undefined): string[] {
@@ -484,6 +654,14 @@ function listParam(v: string | undefined): string[] {
   for (const x of (v ?? "").split(",")) {
     if (x !== "") out.push(x)
   }
+  return out
+}
+
+// The values of a comma list, or of a single value parameter, both (Raiju's singular names and Bifrost's plurals).
+function listOr(sp: URLSearchParams, plural: string, single: string): string[] {
+  const out = listParam(sp.get(plural) ?? undefined)
+  const one = sp.get(single) ?? ""
+  if (one !== "" && !out.includes(one)) out.push(one)
   return out
 }
 
@@ -497,12 +675,22 @@ function numParam(sp: URLSearchParams, name: string): f64 {
 export function filterFrom(sp: URLSearchParams, kind: string, since: f64, until: f64): Filter {
   return {
     kind: kind,
-    providers: listParam(sp.get("providers") ?? undefined),
-    models: listParam(sp.get("models") ?? undefined),
-    virtual_keys: listParam(sp.get("virtual_key_ids") ?? undefined),
+    providers: listOr(sp, "providers", "provider"),
+    models: listOr(sp, "models", "model"),
+    virtual_keys: listOr(sp, "virtual_key_ids", "virtual_key"),
+    teams: listParam(sp.get("team_ids") ?? undefined),
+    customers: listParam(sp.get("customer_ids") ?? undefined),
+    businessUnits: listParam(sp.get("business_unit_ids") ?? undefined),
+    projects: listParam(sp.get("project_ids") ?? undefined),
     tools: listParam(sp.get("tool_names") ?? undefined),
     servers: listParam(sp.get("server_labels") ?? undefined),
-    status: sp.get("status") ?? "",
+    statuses: listParam(sp.get("status") ?? undefined),
+    users: listParam(sp.get("user_ids") ?? undefined),
+    sessionId: (sp.get("session_id") ?? "").trim(),
+    userAgents: listParam(sp.get("user_agents") ?? undefined),
+    apps: listParam(sp.get("apps") ?? undefined),
+    objects: listParam(sp.get("objects") ?? undefined),
+    missingCost: sp.get("missing_cost_only") === "true",
     since: since,
     until: until,
     min_latency: numParam(sp, "min_latency"),
@@ -511,9 +699,50 @@ export function filterFrom(sp: URLSearchParams, kind: string, since: f64, until:
     max_tokens: numParam(sp, "max_tokens"),
     min_cost: numParam(sp, "min_cost"),
     max_cost: numParam(sp, "max_cost"),
-    text: sp.get("content_search") ?? "",
+    text: sp.get("content_search") ?? sp.get("text") ?? "",
     request_id: sp.get("request_id") ?? "",
+    selectedKeys: listParam(sp.get("selected_key_ids") ?? undefined),
+    routingRules: listParam(sp.get("routing_rule_ids") ?? undefined),
+    routingEngines: listParam(sp.get("routing_engine_used") ?? undefined),
+    stopReasons: listParam(sp.get("stop_reasons") ?? undefined),
+    aliases: listParam(sp.get("aliases") ?? undefined),
+    complexityTiers: listParam(sp.get("complexity_tiers") ?? undefined),
+    complexityMechanisms: listParam(sp.get("complexity_mechanisms") ?? undefined),
+    minComplexity: numParam(sp, "min_complexity_score"),
+    maxComplexity: numParam(sp, "max_complexity_score"),
+    cacheHitTypes: listParam(sp.get("cache_hit_types") ?? undefined),
+    toolCallNames: listParam(sp.get("tool_call_names") ?? undefined),
+    promptIds: listParam(sp.get("selected_prompt_ids") ?? undefined),
+    promptNames: listParam(sp.get("prompt_names") ?? undefined),
+    parentId: (sp.get("parent_request_id") ?? "").trim(),
+    correlationId: (sp.get("agent_correlation_id") ?? "").trim(),
+    rootsOnly: sp.get("roots_only") === "true",
+    groupSessions: sp.get("group_sessions") === "true",
   }
+}
+
+// How a request was answered from the local cache: "direct" or "semantic". Entries logged before
+// cache_hit_type was recorded and marked as hits were exact-match hits.
+export function hitTypeOf(e: LogEntry): string {
+  if (e.cache_hit_type !== undefined && e.cache_hit_type !== "") return e.cache_hit_type
+  return e.cache_hit ? "direct" : ""
+}
+
+// Whether an entry has one of the statuses a filter names: success (2xx), cancelled (499) or error (the rest).
+function statusMatches(e: LogEntry, st: string): bool {
+  if (st === "success") return isSuccess(e)
+  if (st === "cancelled") return e.status === 499
+  if (st === "error") return !isSuccess(e) && e.status !== 499
+  return false
+}
+
+// Whether an answer called any of the named tools.
+function calledAny(called: string[] | undefined, want: string[]): bool {
+  if (called === undefined) return false
+  for (const n of called) {
+    if (want.includes(n)) return true
+  }
+  return false
 }
 
 // Whether an entry is in the filter's window and passes its filters.
@@ -523,11 +752,19 @@ export function selects(e: LogEntry, f: Filter): bool {
   if (f.providers.length > 0 && !f.providers.includes(e.provider)) return false
   if (f.models.length > 0 && !f.models.includes(e.model)) return false
   if (f.virtual_keys.length > 0 && !f.virtual_keys.includes(e.virtual_key ?? "")) return false
+  if (f.teams.length > 0 && !f.teams.includes(e.team_id ?? "")) return false
+  if (f.customers.length > 0 && !f.customers.includes(e.customer_id ?? "")) return false
+  if (f.businessUnits.length > 0 && !f.businessUnits.includes(e.business_unit_id ?? "")) return false
+  if (f.projects.length > 0 && !f.projects.includes(e.project_id ?? "")) return false
   if (f.tools.length > 0 && !f.tools.includes(e.tool ?? "")) return false
   if (f.servers.length > 0 && !f.servers.includes(e.server ?? "")) return false
-  if (f.status === "success" && !isSuccess(e)) return false
-  if (f.status === "error" && (isSuccess(e) || e.status === 499)) return false
-  if (f.status === "cancelled" && e.status !== 499) return false
+  if (f.users.length > 0 && !f.users.includes(e.user_id ?? "")) return false
+  if (f.sessionId !== "" && e.session_id !== f.sessionId) return false
+  if (f.userAgents.length > 0 && !f.userAgents.includes(e.user_agent ?? "")) return false
+  if (f.apps.length > 0 && !f.apps.includes(e.app ?? "")) return false
+  if (f.objects.length > 0 && !f.objects.includes(e.op)) return false
+  if (f.missingCost && e.cost !== 0.0) return false
+  if (f.statuses.length > 0 && !f.statuses.some((st) => statusMatches(e, st))) return false
   const tokens = e.prompt_tokens + e.completion_tokens
   if (f.min_latency >= 0.0 && e.latency_ms < f.min_latency) return false
   if (f.max_latency >= 0.0 && e.latency_ms > f.max_latency) return false
@@ -537,7 +774,78 @@ export function selects(e: LogEntry, f: Filter): bool {
   if (f.max_cost >= 0.0 && e.cost > f.max_cost) return false
   if (f.request_id !== "" && e.request_id !== f.request_id) return false
   if (f.text !== "" && !mentions(e, f.text)) return false
+  if (f.selectedKeys.length > 0 && !f.selectedKeys.includes(e.selected_key_id ?? "")) return false
+  if (f.routingRules.length > 0 && !f.routingRules.includes(e.routing_rule_id ?? "")) return false
+  if (f.routingEngines.length > 0 && !f.routingEngines.includes(e.routing_engine_used ?? "")) return false
+  if (f.stopReasons.length > 0 && !f.stopReasons.includes(e.stop_reason ?? "")) return false
+  if (f.aliases.length > 0 && !f.aliases.includes(e.alias ?? "")) return false
+  if (f.complexityTiers.length > 0 && !f.complexityTiers.includes(e.complexity_tier ?? "")) return false
+  if (f.complexityMechanisms.length > 0 && !f.complexityMechanisms.includes(e.complexity_mechanism ?? "")) return false
+  if (f.cacheHitTypes.length > 0 && !f.cacheHitTypes.includes(hitTypeOf(e))) return false
+  if (f.toolCallNames.length > 0 && !calledAny(e.tool_call_names, f.toolCallNames)) return false
+  if (f.minComplexity >= 0.0 && (e.complexity_score === undefined || e.complexity_score < f.minComplexity)) return false
+  if (f.maxComplexity >= 0.0 && (e.complexity_score === undefined || e.complexity_score > f.maxComplexity)) return false
+  if (f.promptIds.length > 0 && !f.promptIds.includes(e.selected_prompt_id ?? "")) return false
+  if (f.promptNames.length > 0 && !f.promptNames.includes(e.selected_prompt_name ?? "")) return false
+  if (f.parentId !== "" && e.parent_request_id !== f.parentId) return false
+  if (f.correlationId !== "" && e.agent_correlation_id !== f.correlationId) return false
   return true
+}
+
+// Chains and sessions (Bifrost's roots_only and group_sessions). roots_only hides a row whose
+// parent_request_id names another row of the same selection, so a chain lists as its root. group_sessions,
+// with roots_only, keeps one row per session: the session's earliest root. A parent filter ends roots_only,
+// as Bifrost's does, and a session or request id filter ends group_sessions.
+export function applyChains(es: LogEntry[], f: Filter): LogEntry[] {
+  if (!f.rootsOnly || f.parentId !== "") return es
+  const ids: Set<string> = new Set()
+  for (const e of es) ids.add(e.request_id)
+  const roots: LogEntry[] = []
+  for (const e of es) {
+    const p = e.parent_request_id ?? ""
+    if (p !== "" && ids.has(p)) continue
+    roots.push(e)
+  }
+  if (!f.groupSessions || f.sessionId !== "" || f.request_id !== "") return roots
+  // the earliest root of each session, by its id and time
+  const firstId: Map<string, string> = new Map()
+  const firstTs: Map<string, f64> = new Map()
+  for (const e of roots) {
+    const s = e.session_id ?? ""
+    if (s === "") continue
+    const ts = firstTs.get(s)
+    if (ts === undefined || e.ts < ts) {
+      firstTs.set(s, e.ts)
+      firstId.set(s, e.id)
+    }
+  }
+  const out: LogEntry[] = []
+  for (const e of roots) {
+    const s = e.session_id ?? ""
+    if (s === "") {
+      out.push(e)
+      continue
+    }
+    const keep = firstId.get(s)
+    if (keep !== undefined && keep === e.id) out.push(e)
+  }
+  return out
+}
+
+// Whether a data access scope may see an entry: by the team, business unit, customer or project it is attributed to.
+// An entry with no owner is seen by all-data scopes only.
+export function visibleTo(e: LogEntry, sc: DataScope): bool {
+  return inScope(sc, e.team_id ?? "", e.business_unit_id ?? "", e.customer_id ?? "", e.project_id ?? "")
+}
+
+// The entries a scope may see, in order.
+export function scopedEntries(es: LogEntry[], sc: DataScope): LogEntry[] {
+  if (sc.all) return es
+  const out: LogEntry[] = []
+  for (const e of es) {
+    if (visibleTo(e, sc)) out.push(e)
+  }
+  return out
 }
 
 export function selectAll(es: LogEntry[], f: Filter): LogEntry[] {
@@ -573,15 +881,22 @@ function bucketize(es: LogEntry[], g: Grid): LogEntry[][] {
 
 // The dimensions an entry can be grouped by. Others are not recorded for this gateway.
 export function validDimension(dim: string): bool {
-  return dim === "provider" || dim === "model" || dim === "virtual_key" || dim === "tool" || dim === "server"
+  return dim === "provider" || dim === "model" || dim === "virtual_key" || dim === "tool" || dim === "server" || dim === "team" || dim === "customer" || dim === "business_unit" || dim === "project" || dim === "user" || dim === "app" || dim === "user_agent"
 }
 
 export function dimValue(e: LogEntry, dim: string): string {
   if (dim === "provider") return e.provider
   if (dim === "model") return e.model
   if (dim === "virtual_key") return e.virtual_key ?? ""
+  if (dim === "team") return e.team_id ?? ""
+  if (dim === "customer") return e.customer_id ?? ""
+  if (dim === "business_unit") return e.business_unit_id ?? ""
+  if (dim === "project") return e.project_id ?? ""
   if (dim === "tool") return e.tool ?? ""
   if (dim === "server") return e.server ?? ""
+  if (dim === "user") return e.user_id ?? ""
+  if (dim === "app") return e.app ?? ""
+  if (dim === "user_agent") return e.user_agent ?? ""
   return ""
 }
 
@@ -840,7 +1155,8 @@ export function statsView(es: LogEntry[]): string {
   let completion = 0
   let cost = 0.0
   let latency = 0.0
-  let cached = 0
+  let direct = 0
+  let semantic = 0
   for (const e of es) {
     n += 1
     if (!isSuccess(e)) errors += 1
@@ -849,7 +1165,9 @@ export function statsView(es: LogEntry[]): string {
     tokens += e.prompt_tokens + e.completion_tokens
     cost += e.cost
     latency += e.latency_ms
-    if (e.cache_hit) cached += 1
+    const hit = hitTypeOf(e)
+    if (hit === "direct") direct += 1
+    else if (hit === "semantic") semantic += 1
   }
   const rate = n > 0 ? (100.0 * (n - errors)) / n : 0.0
   const avg = n > 0 ? latency / n : 0.0
@@ -864,7 +1182,9 @@ export function statsView(es: LogEntry[]): string {
     jkv("prompt_tokens", jn(prompt)),
     jkv("completion_tokens", jn(completion)),
     jkv("total_cost", jn(cost)),
-    jkv("direct_cache_hits", jn(cached)),
+    jkv("cache_hit_rate_total_requests", jn(n)),
+    jkv("direct_cache_hits", jn(direct)),
+    jkv("semantic_cache_hits", jn(semantic)),
     jkv("requests", jn(n)),
     jkv("errors", jn(errors)),
     jkv("tokens", jn(tokens)),
@@ -1328,7 +1648,8 @@ test("histograms count by status, sum tokens and cost, and split by model and pr
   const byDim = dimensionView(es, g, "cost", "provider")
   expect(byDim.includes(`"dimension":"provider"`)).toBe(true)
   expect(byDim.includes(`"dimension_values":["anthropic","openai"]`)).toBe(true)
-  expect(validDimension("team")).toBe(false)
+  expect(validDimension("team")).toBe(true)
+  expect(validDimension("widget")).toBe(false)
   expect(validDimension("provider")).toBe(true)
   const models = modelsView(es, g)
   expect(models.includes(`"A":{"total":2,"success":2,"error":0,"cancelled":0}`)).toBe(true)
@@ -1363,7 +1684,7 @@ test("stats views: Bifrost's totals with the older fields beside them, and ranki
 test("filters: status, providers, text, bounds and the window", () => {
   const sp = new URLSearchParams("status=error&providers=openai,anthropic&min_latency=50&content_search=upstream")
   const f = filterFrom(sp, "llm", 0.0, 1000.0)
-  expect(f.status).toBe("error")
+  expect(f.statuses.join(",")).toBe("error")
   expect(f.providers.join(",")).toBe("openai,anthropic")
   expect(f.min_latency).toBe(50.0)
   expect(f.max_latency).toBe(-1.0)
@@ -1379,6 +1700,112 @@ test("filters: status, providers, text, bounds and the window", () => {
   mcp.kind = "mcp"
   expect(selects(mcp, f)).toBe(false)
   expect(selects(mcp, filterFrom(new URLSearchParams(""), "mcp", 0.0, 1000.0))).toBe(true)
+})
+
+test("routing, cache, stop and chain filters select the recorded fields", () => {
+  const a = sample("c1", 500.0, "m", 200, { provider: "openai" })
+  a.request_id = "r1"
+  a.selected_key_id = "key-1"
+  a.routing_rule_id = "rule-x"
+  a.routing_engine_used = "routing-rule"
+  a.alias = "fast"
+  a.complexity_tier = "SIMPLE"
+  a.complexity_mechanism = "heuristic"
+  a.cache_hit_type = "semantic"
+  a.stop_reason = "stop"
+  a.parent_request_id = "p0"
+  a.agent_correlation_id = "agent-7"
+  const b = sample("c2", 600.0, "m", 200, { provider: "openai" })
+  b.request_id = "r2"
+  b.selected_key_id = "key-2"
+  b.parent_request_id = "r1"
+  b.session_id = "s1"
+  a.session_id = "s1"
+  const es: LogEntry[] = [a, b]
+  expect(idsOf(es, "selected_key_ids=key-1").join(",")).toBe("c1")
+  expect(idsOf(es, "routing_rule_ids=rule-x").join(",")).toBe("c1")
+  expect(idsOf(es, "routing_engine_used=loadbalancing").length).toBe(0)
+  expect(idsOf(es, "stop_reasons=stop,length").join(",")).toBe("c1")
+  expect(idsOf(es, "aliases=fast").join(",")).toBe("c1")
+  expect(idsOf(es, "complexity_tiers=SIMPLE").join(",")).toBe("c1")
+  expect(idsOf(es, "complexity_mechanisms=heuristic").join(",")).toBe("c1")
+  expect(idsOf(es, "cache_hit_types=semantic").join(",")).toBe("c1")
+  expect(idsOf(es, "cache_hit_types=direct").length).toBe(0)
+  expect(idsOf(es, "parent_request_id=p0").join(",")).toBe("c1")
+  expect(idsOf(es, "agent_correlation_id=agent-7").join(",")).toBe("c1")
+  expect(idsOf(es, "agent_correlation_id=agent").length).toBe(0)
+})
+
+// The ids of the entries a query selects, in order (a top-level helper, so the tests capture nothing).
+function idsOf(es: LogEntry[], q: string): string[] {
+  return selectAll(es, filterFrom(new URLSearchParams(q), "llm", 0.0, 1000.0)).map((e) => e.id)
+}
+
+test("tool call, complexity score and prompt filters select the recorded fields", () => {
+  const a = sample("t1", 500.0, "m", 200, { provider: "openai" })
+  a.tool_call_names = ["get_weather", "lookup_city"]
+  a.complexity_score = 2.5
+  a.selected_prompt_id = "pr-1"
+  a.selected_prompt_name = "greet"
+  a.selected_prompt_version = 2
+  const b = sample("t2", 600.0, "m", 200, { provider: "openai" })
+  b.tool_call_names = ["search"]
+  b.complexity_score = 9.0
+  const c = sample("t3", 700.0, "m", 200, { provider: "openai" })
+  const es: LogEntry[] = [a, b, c]
+  expect(idsOf(es, "tool_call_names=lookup_city").join(",")).toBe("t1")
+  expect(idsOf(es, "tool_call_names=search,nothing").join(",")).toBe("t2")
+  expect(idsOf(es, "tool_call_names=nothing").length).toBe(0)
+  expect(idsOf(es, "min_complexity_score=0").join(",")).toBe("t1,t2")
+  expect(idsOf(es, "min_complexity_score=5").join(",")).toBe("t2")
+  expect(idsOf(es, "max_complexity_score=5").join(",")).toBe("t1")
+  expect(idsOf(es, "min_complexity_score=2&max_complexity_score=9").join(",")).toBe("t1,t2")
+  expect(idsOf(es, "min_complexity_score=10").length).toBe(0)
+  expect(idsOf(es, "selected_prompt_ids=pr-1").join(",")).toBe("t1")
+  expect(idsOf(es, "prompt_names=greet").join(",")).toBe("t1")
+  expect(idsOf(es, "prompt_names=other").length).toBe(0)
+  expect(idsOf(es, "selected_prompt_ids=pr-1&prompt_names=other").length).toBe(0)
+})
+
+test("a cache hit without a recorded type is a direct hit, and the stats count both kinds", () => {
+  const old = sample("h1", 500.0, "m", 200, {})
+  old.cache_hit = true
+  const sem = sample("h2", 500.0, "m", 200, {})
+  sem.cache_hit = true
+  sem.cache_hit_type = "semantic"
+  const miss = sample("h3", 500.0, "m", 200, {})
+  expect(hitTypeOf(old)).toBe("direct")
+  expect(hitTypeOf(sem)).toBe("semantic")
+  expect(hitTypeOf(miss)).toBe("")
+  const v = statsView([old, sem, miss])
+  expect(v.includes(`"cache_hit_rate_total_requests":3`)).toBe(true)
+  expect(v.includes(`"direct_cache_hits":1`)).toBe(true)
+  expect(v.includes(`"semantic_cache_hits":1`)).toBe(true)
+})
+
+test("roots_only hides chained rows; group_sessions keeps each session's earliest root", () => {
+  const root = sample("g1", 100.0, "m", 200, {})
+  root.request_id = "R1"
+  root.session_id = "S"
+  const child = sample("g2", 200.0, "m", 200, {})
+  child.request_id = "R2"
+  child.parent_request_id = "R1"
+  child.session_id = "S"
+  const root2 = sample("g3", 300.0, "m", 200, {})
+  root2.request_id = "R3"
+  root2.session_id = "S"
+  const other = sample("g4", 400.0, "m", 200, {})
+  other.request_id = "R4"
+  const all = [root, child, root2, other]
+  const plain = filterFrom(new URLSearchParams(""), "llm", 0.0, 1000.0)
+  expect(applyChains(all, plain).length).toBe(4)
+  const roots = filterFrom(new URLSearchParams("roots_only=true"), "llm", 0.0, 1000.0)
+  expect(applyChains(all, roots).map((e) => e.id).join(",")).toBe("g1,g3,g4")
+  const grouped = filterFrom(new URLSearchParams("roots_only=true&group_sessions=true"), "llm", 0.0, 1000.0)
+  expect(applyChains(all, grouped).map((e) => e.id).join(",")).toBe("g1,g4")
+  // a parent filter ends roots_only: the chain's children are listed
+  const kids = filterFrom(new URLSearchParams("roots_only=true&parent_request_id=R1"), "llm", 0.0, 1000.0)
+  expect(applyChains(selectAll(all, kids), kids).map((e) => e.id).join(",")).toBe("g2")
 })
 
 test("MCP tool executions share the store but not the LLM views", () => {

@@ -2,7 +2,12 @@
 // so many keys share one policy. A key's own settings win; profiles fill what
 // the key leaves unset, and lists from several profiles narrow each other.
 // Pure functions: the caller stores the profile list and passes it in.
-import { VirtualKeyConfig, ProviderConfigRef, AccessProfile } from "./config"
+import { VirtualKeyConfig, ProviderConfigRef, AccessProfile, ProfileVersion } from "./config"
+import { keyPatterns, McpKeyConfig } from "./mcp"
+import { rfc3339Of } from "./vkexpiry"
+
+// The history keeps this many versions; the oldest go first.
+const VERSIONS_KEPT = 100
 
 
 // The effective policy for one key. Any entry in errors means the request must
@@ -15,6 +20,19 @@ export type Effective = {
   deniedModels: string[],
   allowedModels: string[] | undefined,
   errors: string[],
+}
+
+// A profile's MCP tool patterns: its mcp_tools, plus the patterns of its mcp_configs (a client with an
+// empty tool list adds none, so a profile that lists only such clients allows no tools). undefined when
+// the profile sets neither.
+function profileMcp(p: AccessProfile): string[] | undefined {
+  const mt = p.mcp_tools
+  const mc = p.mcp_configs
+  if (mt === undefined && mc === undefined) return undefined
+  const out: string[] = []
+  for (const x of mt ?? []) out.push(x)
+  for (const x of keyPatterns(mc ?? [])) out.push(x)
+  return out
 }
 
 // ---- entry patterns ----
@@ -162,7 +180,7 @@ export function applyProfiles(vk: VirtualKeyConfig, profileIds: string[], profil
   for (const p of found) {
     const al = p.allowed_models
     if (al !== undefined) allowed = allowed === undefined ? intersectLists(al, al, false) : intersectLists(allowed, al, false)
-    const ml = p.mcp_tools
+    const ml = profileMcp(p)
     if (ml !== undefined) mcp = mcp === undefined ? intersectLists(ml, ml, true) : intersectLists(mcp, ml, true)
     for (const e of p.denied_models ?? []) {
       if (!denied.includes(e)) denied.push(e)
@@ -349,6 +367,8 @@ type ProfileInput = {
   budget_id?: string,
   rate_limit_id?: string,
   mcp_tools?: string[],
+  mcp_configs?: McpKeyConfig[],
+  virtual_mcps?: string[],
   required_headers?: string[],
   max_tokens?: int,
   is_active?: bool,
@@ -377,16 +397,37 @@ function toProfile(b: ProfileInput, id: string): AccessProfile {
     budget_id: b.budget_id,
     rate_limit_id: b.rate_limit_id,
     mcp_tools: b.mcp_tools,
+    mcp_configs: b.mcp_configs,
+    virtual_mcps: b.virtual_mcps,
     required_headers: b.required_headers,
     max_tokens: b.max_tokens,
     is_active: b.is_active,
   }
 }
 
+// The profile as its history stores it: its fields as JSON text, without the history itself.
+function snapshotOf(p: AccessProfile): string {
+  let c = p
+  c.versions = undefined
+  return JSON.stringify(c)
+}
+
+// The profile with one more version appended for the action that changed it.
+function withVersion(p: AccessProfile, action: string, prior: ProfileVersion[] | undefined): AccessProfile {
+  const vs: ProfileVersion[] = (prior ?? []).slice(0)
+  const last = vs[vs.length - 1]
+  const n = last === undefined ? 1 : last.version + 1
+  vs.push({ version: n, action: action, at: rfc3339Of(Date.now()), snapshot: snapshotOf(p) })
+  const kept = vs.length > VERSIONS_KEPT ? vs.slice(vs.length - VERSIONS_KEPT) : vs
+  let out = p
+  out.versions = kept
+  return out
+}
+
 function createProfile(profiles: AccessProfile[], body: string): ProfilesReply {
   const b = parseBody(body)
   if (b === undefined) return perror(400, "body must be a JSON object with an id", profiles)
-  const p = toProfile(b, b.id ?? "")
+  const p = withVersion(toProfile(b, b.id ?? ""), "create", [])
   const why = validateProfile(p)
   if (why !== "") return perror(400, why, profiles)
   if (indexOfProfile(profiles, p.id) >= 0) return perror(409, `access profile ${p.id} already exists`, profiles)
@@ -402,7 +443,7 @@ function updateProfile(profiles: AccessProfile[], id: string, body: string): Pro
   const b = parseBody(body)
   if (b === undefined) return perror(400, "body must be a JSON object", profiles)
   if (b.id !== undefined && b.id !== id) return perror(400, "the id in the body must match the id in the path", profiles)
-  const p = toProfile(b, id)
+  const p = withVersion(toProfile(b, id), "update", profiles[i]!.versions)
   const why = validateProfile(p)
   if (why !== "") return perror(400, why, profiles)
   const next: AccessProfile[] = []
@@ -421,13 +462,70 @@ function deleteProfile(profiles: AccessProfile[], id: string): ProfilesReply {
   return preply(200, JSON.stringify({ deleted: id }), next)
 }
 
+// A fresh copy of a profile, read back from its JSON text (the copy is what gets changed).
+function copyOf(p: AccessProfile): AccessProfile {
+  try {
+    return JSON.parse(JSON.stringify(p)) as AccessProfile
+  } catch (e) {
+    return p
+  }
+}
+
+// The routes under one profile: activate, deactivate, clone (POST), and the version history
+// (GET .../versions and .../versions/{n}). Each change adds a version.
+function profileAction(profiles: AccessProfile[], m: string, id: string, action: string, sub: string | undefined, body: string): ProfilesReply {
+  if (action !== "versions" && action !== "activate" && action !== "deactivate" && action !== "clone") return perror(404, `no route for ${action}`, profiles)
+  const i = indexOfProfile(profiles, id)
+  if (i < 0) return perror(404, `no access profile ${id}`, profiles)
+  const cur = profiles[i]!
+  if (action === "versions") {
+    if (m !== "GET") return perror(405, `method ${m} is not allowed on this route`, profiles)
+    const vs: ProfileVersion[] = cur.versions ?? []
+    if (sub === undefined) return preply(200, JSON.stringify({ versions: vs }), profiles)
+    const n = parseInt(sub) ?? -1
+    for (const v of vs) {
+      if (v.version === n) return preply(200, JSON.stringify(v), profiles)
+    }
+    return perror(404, `no version ${sub} of access profile ${id}`, profiles)
+  }
+  if (action !== "activate" && action !== "deactivate" && action !== "clone") return perror(404, `no route for ${action}`, profiles)
+  if (m !== "POST") return perror(405, `method ${m} is not allowed on this route`, profiles)
+  if (sub !== undefined) return perror(404, "no route for this path", profiles)
+  if (action === "activate" || action === "deactivate") {
+    const p = copyOf(cur)
+    p.is_active = action === "activate"
+    const saved = withVersion(p, action, cur.versions)
+    const next: AccessProfile[] = []
+    for (let j = 0; j < profiles.length; j++) {
+      next.push(j === i ? saved : profiles[j]!)
+    }
+    return preply(200, JSON.stringify(saved), next)
+  }
+  if (action === "clone") {
+    const b: ProfileInput = parseBody(body) ?? {}
+    const nid = b.id ?? `${id}-copy`
+    if (nid === "") return perror(400, "the clone needs an id", profiles)
+    if (indexOfProfile(profiles, nid) >= 0) return perror(409, `access profile ${nid} already exists`, profiles)
+    const c = copyOf(cur)
+    c.id = nid
+    c.name = b.name ?? `${cur.name ?? cur.id} (copy)`
+    const made = withVersion(c, "clone", [])
+    const why = validateProfile(made)
+    if (why !== "") return perror(400, why, profiles)
+    const next = profiles.slice(0)
+    next.push(made)
+    return preply(201, JSON.stringify(made), next)
+  }
+  return perror(404, `no route for ${action}`, profiles)
+}
+
 // GET /api/governance/access-profiles, POST the same (201, 409 when the id
 // exists), and GET, PUT (replaces the whole profile) or DELETE
 // /api/governance/access-profiles/{id}. Pure: the caller stores the returned
 // profiles. Access is checked by the caller first.
 export function handleProfiles(profiles: AccessProfile[], method: string, path: string, body: string): ProfilesReply {
   const segs = segmentsOf(path)
-  if (segs.length < 3 || segs.length > 4 || (segs[0] ?? "") !== "api" || (segs[1] ?? "") !== "governance" || (segs[2] ?? "") !== "access-profiles") {
+  if (segs.length < 3 || segs.length > 6 || (segs[0] ?? "") !== "api" || (segs[1] ?? "") !== "governance" || (segs[2] ?? "") !== "access-profiles") {
     return perror(404, "no route for this path", profiles)
   }
   const m = method.toUpperCase()
@@ -437,6 +535,8 @@ export function handleProfiles(profiles: AccessProfile[], method: string, path: 
     if (m === "POST") return createProfile(profiles, body)
     return perror(405, `method ${m} is not allowed on this route`, profiles)
   }
+  const action = segs[4]
+  if (action !== undefined) return profileAction(profiles, m, id, action, segs[5], body)
   if (m === "GET") {
     const i = indexOfProfile(profiles, id)
     if (i < 0) return perror(404, `no access profile ${id}`, profiles)
@@ -853,4 +953,33 @@ test("wrong methods are 405 and other paths are 404", () => {
   expect(handleProfiles(ps, "GET", "/api/governance/virtual-keys", "").status).toBe(404)
   expect(handleProfiles(ps, "GET", "/api/governance/access-profiles/a/extra", "").status).toBe(404)
   expect(handleProfiles(ps, "GET", "/api/users", "").status).toBe(404)
+  expect(handleProfiles(ps, "GET", rootOf() + "/a/activate", "").status).toBe(405)
+})
+
+test("activate, deactivate and clone each add a version, and the history reads back", () => {
+  let ps: AccessProfile[] = [{ id: "a", name: "Engineer", budget_id: "b1", versions: [] }]
+  const off = handleProfiles(ps, "POST", rootOf() + "/a/deactivate", "")
+  expect(off.status).toBe(200)
+  ps = off.profiles
+  expect(ps[0]!.is_active).toBe(false)
+  const on = handleProfiles(ps, "POST", rootOf() + "/a/activate", "")
+  expect(on.status).toBe(200)
+  ps = on.profiles
+  expect(ps[0]!.is_active).toBe(true)
+  const list = handleProfiles(ps, "GET", rootOf() + "/a/versions", "")
+  expect(list.status).toBe(200)
+  expect(list.body.includes(`"action":"deactivate"`)).toBe(true)
+  expect(list.body.includes(`"action":"activate"`)).toBe(true)
+  const one = handleProfiles(ps, "GET", rootOf() + "/a/versions/1", "")
+  expect(one.status).toBe(200)
+  expect(one.body.includes(`"version":1`)).toBe(true)
+  expect(handleProfiles(ps, "GET", rootOf() + "/a/versions/99", "").status).toBe(404)
+  const cl = handleProfiles(ps, "POST", rootOf() + "/a/clone", `{"id":"a2","name":"Engineer copy"}`)
+  expect(cl.status).toBe(201)
+  expect(cl.profiles.length).toBe(2)
+  expect(cl.profiles[1]!.name).toBe("Engineer copy")
+  expect(cl.profiles[1]!.budget_id).toBe("b1")
+  expect(cl.profiles[1]!.versions![0]!.action).toBe("clone")
+  expect(handleProfiles(cl.profiles, "POST", rootOf() + "/a/clone", `{"id":"a2"}`).status).toBe(409)
+  expect(handleProfiles(ps, "POST", rootOf() + "/nope/clone", "").status).toBe(404)
 })

@@ -1,0 +1,150 @@
+// Feature flags (Bifrost's /api/feature-flags and the feature_flags config section).
+//
+// A flag is declared here with its default. Config can set it at boot, and such a value is
+// locked: a PUT answers 409, as Bifrost does for flags set in config.json. A value set through
+// the API is kept in the same section with source "api", and can be changed.
+//
+// Bifrost declares one flag, warp (its in-dashboard feature). Raiju does not build Warp, so no
+// flag here gates a Raiju behaviour yet. flagEnabled() is what a gate would call.
+import { find, rawBool, rawStr, fields, Field } from "./json"
+
+export type FlagDef = { id: string, display_name: string, description: string, default: bool, enterprise_default?: bool, enterprise_only?: bool }
+
+// A flag's value: a boolean, or a string such as "true" (config may give env.NAME, resolved at load).
+// source is "api" for a value set through the API; any other override is from config and locked.
+export type FlagOverride = { enabled: bool | string, source?: string, updated_at?: int }
+
+export type FeatureFlagsConfig = { flags?: Map<string, FlagOverride> }
+
+export type FlagReply = { status: int, body: string, next?: FeatureFlagsConfig }
+
+// Bifrost's code-declared flags. Raiju's builds share the default.
+export const FLAG_DEFS: FlagDef[] = [
+  { id: "warp", display_name: "Warp", description: "Warp, the in-dashboard feature. Raiju does not build it, so the flag gates nothing.", default: true, enterprise_default: false },
+]
+
+// The value a flag's override carries, read as a boolean ("true", "1", "yes" and "on" are true).
+export function overrideValue(v: bool | string): bool {
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase()
+    return s === "true" || s === "1" || s === "yes" || s === "on"
+  }
+  return v
+}
+
+// Whether a flag is on: its override when config or the API set one, else its default for this build.
+export function flagEnabled(cfg: FeatureFlagsConfig | undefined, id: string, enterprise: bool): bool {
+  const o = overrideOf(cfg, id)
+  if (o !== undefined) return overrideValue(o.enabled)
+  for (const d of FLAG_DEFS) {
+    if (d.id === id) return enterprise && d.enterprise_default !== undefined ? d.enterprise_default : d.default
+  }
+  return false
+}
+
+// The override a config holds for a flag id, if any (no ?.get chains: see config.tov).
+function overrideOf(cfg: FeatureFlagsConfig | undefined, id: string): FlagOverride | undefined {
+  if (cfg === undefined) return undefined
+  const fl = cfg.flags
+  return fl === undefined ? undefined : fl.get(id)
+}
+
+// A flag's status as Bifrost's API shows it: source is default, db (set through the API) or
+// file (set by config, which locks it); updated_at is Unix nanoseconds, as Bifrost writes it.
+function statusJson(def: FlagDef, o: FlagOverride | undefined): string {
+  const enabled = o === undefined ? (def.default) : overrideValue(o.enabled)
+  const source = o === undefined ? "default" : o.source === "api" ? "db" : "file"
+  const locked = source === "file"
+  const updated = o?.updated_at ?? 0
+  return `{"id":${JSON.stringify(def.id)},"display_name":${JSON.stringify(def.display_name)},"description":${JSON.stringify(def.description)},"default":${def.default},"enabled":${enabled},"source":${JSON.stringify(source)},"locked":${locked},"registered":true,"enterprise_only":${def.enterprise_only === true}${updated > 0 ? `,"updated_at":${updated * 1000000}` : ""}}`
+}
+
+function fail(status: int, message: string): FlagReply {
+  return { status: status, body: JSON.stringify({ error: { message: message, type: "invalid_request_error" } }) }
+}
+
+function defOf(id: string): FlagDef | undefined {
+  for (const d of FLAG_DEFS) {
+    if (d.id === id) return d
+  }
+  return undefined
+}
+
+// Routes /api/feature-flags: GET lists the flags, PUT /{id} sets one through the API.
+export function flagRoute(cfg: FeatureFlagsConfig | undefined, method: string, path: string, body: string): FlagReply {
+  const cur: FeatureFlagsConfig = cfg ?? {}
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  const segs = p.split("/").filter((s) => s !== "")
+  if (segs.length === 2) {
+    if (method !== "GET") return fail(405, `method ${method} is not allowed here`)
+    const items: string[] = []
+    for (const d of FLAG_DEFS) items.push(statusJson(d, overrideOf(cur, d.id)))
+    return { status: 200, body: `{"flags":[${items.join(",")}]}` }
+  }
+  if (segs.length !== 3) return fail(404, "no such route")
+  const id = segs[2] ?? ""
+  const def = defOf(id)
+  if (def === undefined) return fail(404, "Feature flag is not registered")
+  if (method !== "PUT") return fail(405, `method ${method} is not allowed here`)
+  let fs: Field[] = []
+  if (body.startsWith("{")) {
+    try {
+      fs = fields(body)
+    } catch (e) {
+      return fail(400, "Invalid request payload")
+    }
+  }
+  const enabled = rawBool(fs, "enabled")
+  if (enabled === undefined) return fail(400, "Missing required field: enabled")
+  const old = overrideOf(cur, id)
+  if (old !== undefined && old.source !== "api") return fail(409, "Feature flag is locked by config.json")
+  const next: Map<string, FlagOverride> = new Map()
+  const prior = cur.flags
+  if (prior !== undefined) {
+    for (const k of prior.keys()) next.set(k, prior.get(k)!)
+  }
+  const now = Math.floor(Date.now())
+  const set: FlagOverride = { enabled: enabled, source: "api", updated_at: now }
+  next.set(id, set)
+  const saved: FeatureFlagsConfig = { flags: next }
+  return { status: 200, body: statusJson(def, set), next: saved }
+}
+
+// ---- tests ----
+
+test("a flag is on or off by its default until an override sets it", () => {
+  expect(flagEnabled(undefined, "warp", false)).toBe(true)
+  expect(flagEnabled(undefined, "warp", true)).toBe(false)
+  expect(flagEnabled(undefined, "nope", false)).toBe(false)
+  const m1: Map<string, FlagOverride> = new Map()
+  m1.set("warp", { enabled: "off" })
+  const cfg: FeatureFlagsConfig = { flags: m1 }
+  expect(flagEnabled(cfg, "warp", false)).toBe(false)
+  expect(overrideValue("YES")).toBe(true)
+  expect(overrideValue("0")).toBe(false)
+})
+
+test("the API sets a flag as db, config locks it as file, and unknown flags are not registered", () => {
+  const list = flagRoute(undefined, "GET", "/api/feature-flags", "")
+  expect(list.status).toBe(200)
+  expect(list.body.includes(`"id":"warp"`)).toBe(true)
+  expect(list.body.includes(`"source":"default"`)).toBe(true)
+  const set = flagRoute(undefined, "PUT", "/api/feature-flags/warp", `{"enabled":false}`)
+  expect(set.status).toBe(200)
+  expect(set.body.includes(`"source":"db"`)).toBe(true)
+  expect(set.body.includes(`"enabled":false`)).toBe(true)
+  expect(set.next!.flags!.get("warp")!.source).toBe("api")
+  const again = flagRoute(set.next, "PUT", "/api/feature-flags/warp", `{"enabled":true}`)
+  expect(again.status).toBe(200)
+  expect(again.body.includes(`"enabled":true`)).toBe(true)
+  const m2: Map<string, FlagOverride> = new Map()
+  m2.set("warp", { enabled: true, source: "config" })
+  const locked: FeatureFlagsConfig = { flags: m2 }
+  expect(flagRoute(locked, "PUT", "/api/feature-flags/warp", `{"enabled":false}`).status).toBe(409)
+  expect(flagRoute(locked, "GET", "/api/feature-flags", "").body.includes(`"locked":true`)).toBe(true)
+  expect(flagRoute(undefined, "PUT", "/api/feature-flags/nope", `{"enabled":true}`).status).toBe(404)
+  expect(flagRoute(undefined, "PUT", "/api/feature-flags/warp", `{}`).status).toBe(400)
+  expect(flagRoute(undefined, "PUT", "/api/feature-flags/warp", `not json`).status).toBe(400)
+  expect(flagRoute(undefined, "DELETE", "/api/feature-flags/warp", "").status).toBe(405)
+})

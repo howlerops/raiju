@@ -1,9 +1,10 @@
 // The request engine: governance, cache, the attempt loop (retries, key
 // rotation, fallbacks), translation, accounting.
 import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, providerOf } from "./config"
-import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField } from "./json"
+import { applyPrompt, Applied } from "./prompts"
+import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField, without } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
-import { OpenAIPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
+import { OpenAIPassthrough, ResponsesPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
 import { CohereToOpenAI } from "./streams_cohere"
 import { CohereStream } from "./cohere_in"
 import { GenAIStream } from "./genai_in"
@@ -12,21 +13,28 @@ import { StreamState } from "./providers/anthropic_in"
 import { AffinityStore, resolveSticky, sessionId, sessionTtl, affinityMode } from "./affinity"
 import { Tier, tierTarget, overrideTier } from "./complexity"
 import * as cplx from "./complexity"
+import { parseDecision } from "./decisions"
+import * as typesafe from "./providers/typesafe"
 import { AgentConfig, runAgent } from "./agent"
 import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
 import { GuardrailProvider, Verdict, appliesTo, checkRequest, parseVerdictFor, isLocal, extractText, completionText } from "./guardrail_providers"
 import { judgeText } from "./guard_judge"
-import { CompiledRule } from "./guard_regex"
+import { CompiledRule, applyRegex } from "./guard_regex"
 import { compileLocal, localVerdict } from "./guard_local"
 import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
+import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream"
 import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
-import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias } from "./router"
-import { Health, BreakerConfig, defaultBreakerConfig } from "./health"
-import { Governance, Grant, Denial, directKeyFrom } from "./governance"
+import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText } from "./compat"
+import { ResponsesToChatStream } from "./responses"
+import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias } from "./router"
+import { forwardedHeaders, headerFilterOf } from "./headerfilter"
+import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
+import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
 import { Pricing, PriceRow } from "./pricing"
-import { ResponseCache, cacheKey, parseTtl } from "./cache"
+import { ResponseCache, CacheOrigin, cacheKey, keyScope, parseTtl } from "./cache"
+import { appOf } from "./logapi"
 import { sha256, toHex, utf8 } from "./crypto"
 import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
@@ -36,29 +44,36 @@ import * as databricks from "./providers/databricks"
 import * as copilot from "./providers/githubcopilot"
 import * as metrics from "./metrics"
 import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
-import { GuardConfig, applyToChatRequest, applyToCompletion } from "./guardrails"
+import { GuardConfig, applyToChatRequest, applyToCompletion, applyToText } from "./guardrails"
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
-import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName } from "./mcp"
+import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, userHeadersOf, ToolText } from "./mcp"
+import { McpAuthConfig } from "./mcpauth"
+import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, consentLink, startUserFlow, refreshUserRow } from "./mcpuser"
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
-import { PluginChain, PluginContext, buildChain } from "./plugins"
+import { PluginChain, PluginContext, PluginEntry, buildChain, jsonStreamEnabled, JsonStreamFixer } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline } from "./deadline"
+import { logMetadata, correlationIds, maximAttrs, stopReasonOf, toolCallNamesOf } from "./reqlog"
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
+// a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
+type ChatSender = (t: Target, b: Field[], tc: LazyChat) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, retryMs?: f64 }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64 }
 
 // Where a streamed answer goes, when the server can stream (the http1 front end).
 export class StreamSink {
   started = false
   // the client went away: stop reading the upstream
   cancelled = false
+  // set by the relay while it reads the upstream: aborts a read that is waiting for the next chunk
+  abort: (() => void) | undefined = undefined
   constructor(readonly open: (status: int, headers: Map<string, string>) => void, readonly write: (chunk: string) => void, readonly close: () => void) {}
   // binary event-stream frames (Bedrock's streaming routes); only the Bun.serve path sets it
   writeBytes: ((chunk: u8[]) => void) | undefined = undefined
@@ -73,6 +88,11 @@ export class StreamConverter {
   ge: GeminiToOpenAI | undefined = undefined
   br: BedrockEventStreamToOpenAI | undefined = undefined
   co: CohereToOpenAI | undefined = undefined
+  // a Responses stream (a chat request sent to Responses), read as chat chunks
+  rs: ResponsesToChatStream | undefined = undefined
+  // a chat stream answered to a text completion: each frame becomes a text_completion frame
+  txt = false
+  private txtPending = ""
   readonly dec: TextDecoder | undefined = utf8Decoder()
   // output converters: the client's own stream format (one is set, or none)
   gen: GenAIStream | undefined = undefined
@@ -82,11 +102,24 @@ export class StreamConverter {
   // binary frames for the client, taken with takeFrames()
   private frames: u8[] = []
 
+  // kind "responses-raw": a Responses stream from an OpenAI upstream, forwarded as it came
+  rp: ResponsesPassthrough | undefined = undefined
+
+  // the client's text is completed as JSON (jsonparser) and checked by the local output guardrails
+  // (set by chatOnce); halted once either ends the stream
+  jsonFix: JsonStreamFixer | undefined = undefined
+  guard: OutputStreamGuard | undefined = undefined
+  halted = false
+  // the guard's redaction kinds already counted in the metrics
+  private reportedKinds = 0
+
   constructor(readonly kind: string, requested: string, includeUsage: bool) {
-    if (kind === "anthropic") this.an = new AnthropicToOpenAI(requested, includeUsage)
+    if (kind === "responses-raw") this.rp = new ResponsesPassthrough()
+    else if (kind === "anthropic") this.an = new AnthropicToOpenAI(requested, includeUsage)
     else if (kind === "gemini") this.ge = new GeminiToOpenAI(requested, includeUsage)
     else if (kind === "bedrock") this.br = new BedrockEventStreamToOpenAI(requested, includeUsage)
     else if (kind === "cohere") this.co = new CohereToOpenAI(requested, includeUsage)
+    else if (kind === "responses") this.rs = new ResponsesToChatStream(requested, includeUsage)
     else this.oa = new OpenAIPassthrough(requested, !includeUsage)
   }
 
@@ -167,6 +200,8 @@ export class StreamConverter {
   }
 
   push(bytes: u8[]): string {
+    const rp = this.rp
+    if (rp !== undefined) return rp.push(this.text(bytes))
     if (this.raw) {
       const t = this.text(bytes)
       const an = this.an
@@ -177,6 +212,8 @@ export class StreamConverter {
   }
 
   end(): string {
+    const rp = this.rp
+    if (rp !== undefined) return rp.end()
     if (this.raw) {
       this.an?.end()
       return ""
@@ -195,7 +232,43 @@ export class StreamConverter {
     return tail
   }
 
+  // The client's text after the local output guardrails. A block halts the converter, and the
+  // relay stops reading the upstream.
+  guarded(s: string, last: bool): string {
+    const jf = this.jsonFix
+    const text = jf === undefined ? s : last ? jf.finish(s) : jf.filter(s)
+    if (jf !== undefined && jf.stopped) {
+      this.halted = true
+      return text
+    }
+    const g = this.guard
+    if (g === undefined) return text
+    const out = last ? g.finish(text) : g.filter(text)
+    if (g.stopped && !this.halted) {
+      this.halted = true
+      metrics.inc("raiju_guardrail_checks_total", metrics.labels("", g.blockedBy, "block"), 1.0)
+    }
+    for (let k = this.reportedKinds; k < g.kinds.length; k++) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", g.kinds[k]!, "redact"), 1.0)
+    this.reportedKinds = g.kinds.length
+    return out
+  }
+
+  // Whole frames only: a text completion frame is built from a complete chat frame.
+  private textPost(s: string): string {
+    this.txtPending += s
+    let res = ""
+    while (true) {
+      const i = this.txtPending.indexOf("\n\n")
+      if (i < 0) break
+      const ev = this.txtPending.slice(0, i)
+      this.txtPending = this.txtPending.slice(i + 2)
+      if (ev !== "") res += textFrame(ev) + "\n\n"
+    }
+    return res
+  }
+
   private post(s: string): string {
+    if (this.txt) return this.textPost(s)
     const st = this.out
     const g = this.gen
     const co = this.cohereOut
@@ -232,6 +305,8 @@ export class StreamConverter {
     if (br !== undefined) return br.push(bytes)
     const t = this.text(bytes)
     if (t === "") return ""
+    const rs = this.rs
+    if (rs !== undefined) return rs.push(t)
     const an = this.an
     if (an !== undefined) return an.push(t)
     const ge = this.ge
@@ -244,6 +319,8 @@ export class StreamConverter {
   }
 
   private innerEnd(): string {
+    const rs = this.rs
+    if (rs !== undefined) return rs.end()
     const an = this.an
     if (an !== undefined) return an.end()
     const ge = this.ge
@@ -258,16 +335,23 @@ export class StreamConverter {
   }
 
   promptTokens(): int {
-    return this.an?.inTokens ?? this.ge?.inTokens ?? this.br?.promptTokens ?? this.co?.inTokens ?? this.oa?.promptTokens ?? 0
+    return this.rp?.promptTokens ?? this.rs?.promptTokens ?? this.an?.inTokens ?? this.ge?.inTokens ?? this.br?.promptTokens ?? this.co?.inTokens ?? this.oa?.promptTokens ?? 0
   }
 
   completionTokens(): int {
-    return this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.co?.outTokens ?? this.oa?.completionTokens ?? 0
+    return this.rp?.completionTokens ?? this.rs?.completionTokens ?? this.an?.outTokens ?? this.ge?.outTokens ?? this.br?.completionTokens ?? this.co?.outTokens ?? this.oa?.completionTokens ?? 0
   }
 }
 
 // The chat body with its only message's text replaced, or undefined when there isn't exactly
 // one message with string content.
+// "provider/model" split at the first slash; a bare name has no provider.
+function splitModel(m: string): { provider: string, model: string } {
+  const i = m.indexOf("/")
+  if (i < 0) return { provider: "", model: m }
+  return { provider: m.slice(0, i), model: m.slice(i + 1) }
+}
+
 function singleTextMessage(chatBody: string, replacement: string): string | undefined {
   try {
     let fs = fields(chatBody)
@@ -306,6 +390,35 @@ function replaceFirstContent(completion: string, text: string): string {
   } catch (e) {
     return completion
   }
+}
+
+// The compat headers of a request's plan: the params and tools it dropped, and the request type it converted to.
+function compatHeaders(inout out: Hdrs, cp: CompatPlan | undefined): void {
+  if (cp === undefined || !cp.enabled) return
+  if (cp.dropped.length > 0) out.set("x-bifrost-dropped-compat-params", cp.dropped.join(","))
+  if (cp.toolDrops.length > 0) out.set("x-bifrost-dropped-unsupported-tools", cp.toolDrops.join(","))
+  if (cp.converted !== "") out.set("x-bifrost-converted-request-type", cp.converted)
+}
+
+// The entries of an x-bf-mcp-include-tools value: "<client>-<tool>" or "<client>-*", comma-separated.
+export function includeToolNames(value: string): string[] {
+  const out: string[] = []
+  for (const part of value.split(",")) {
+    const n = part.trim()
+    if (n !== "") out.push(n)
+  }
+  return out
+}
+
+// Whether a chat tool definition is listed: by its exact name, or by "<client>-*" for its client.
+export function toolInList(toolJson: string, want: string[]): bool throws SyntaxError {
+  const name = try toolFnName(toolJson)
+  if (name === undefined) return false
+  for (const w of want) {
+    if (w === name) return true
+    if (w.endsWith("-*") && name.startsWith(w.slice(0, w.byteLength - 1))) return true
+  }
+  return false
 }
 
 // Whether a chat tool definition's name is `pattern` ("<server>-<tool>", or "<server>-*").
@@ -347,7 +460,8 @@ function requestType(op: string, streamed: bool): string {
 // The routed identity, as Bifrost reports it (lib/responseheaders.go): who answered, what was
 // asked for, and whether it took a fallback. key is the key's name, alias the upstream name
 // the key's aliases mapped the request to ("" when none did).
-function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, model: string, idx: int, requested: string, upstreamMs: f64, key: string, alias: string): void {
+// name and family are the alias config's canonical name and family ("" when unset).
+function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, model: string, idx: int, requested: string, upstreamMs: f64, key: string, alias: string, name: string, family: string): void {
   out.set("x-bifrost-provider", provider)
   out.set("x-bifrost-original-model", requested)
   out.set("x-bifrost-resolved-model", model)
@@ -357,6 +471,8 @@ function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, mod
   out.set("x-bifrost-routing-info-model", model)
   if (key !== "") out.set("x-bifrost-routing-info-key", key)
   if (alias !== "") out.set("x-bifrost-routing-info-alias-model-id", alias)
+  if (name !== "") out.set("x-bifrost-routing-info-alias-model-name", name)
+  if (family !== "") out.set("x-bifrost-routing-info-alias-model-family", family)
   out.set("x-bifrost-routing-info-is-fallback", idx > 0 ? "true" : "false")
   out.set("x-bifrost-routing-info-primary-provider", primary.provider)
   out.set("x-bifrost-routing-info-primary-model", primary.model)
@@ -366,9 +482,22 @@ function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, mod
 }
 
 // The upstream name a key's aliases map the request model to, or "" when they do not change it.
-function aliasTo(k: KeyConfig, model: string): string {
-  const to = resolveAlias(k, model).model
+function aliasTo(k: KeyConfig, model: string, maxDepth?: int): string {
+  const to = resolveAlias(k, model, maxDepth).model
   return to !== model ? to : ""
+}
+
+// The canonical name and family the matching alias sets, or "" for each.
+function aliasNameOf(k: KeyConfig, model: string): string {
+  const e = matchedAlias(k, model)
+  if (e === undefined || e.model_name === undefined) return ""
+  return e.model_name
+}
+
+function aliasFamilyOf(k: KeyConfig, model: string): string {
+  const e = matchedAlias(k, model)
+  if (e === undefined || e.model_family === undefined) return ""
+  return e.model_family
 }
 
 // The index of (provider, model) in the allowed chain: 0 for the primary, or when it is not there.
@@ -382,6 +511,14 @@ function fallbackIndex(allowed: ModelRef[], provider: string, model: string): in
 // The cache id Bifrost reports for a direct entry: a hash of its cache key.
 function cacheId(key: string): string {
   return toHex(sha256(utf8(key)))
+}
+
+// On a hit, the provider, model and prompt tokens of the answer as it was first served.
+function originHeaders(inout out: Hdrs, o: CacheOrigin | undefined): void {
+  if (o === undefined) return
+  out.set("x-bifrost-cache-provider-used", o.provider)
+  out.set("x-bifrost-cache-model-used", o.model)
+  out.set("x-bifrost-cache-input-tokens", "" + o.inputTokens)
 }
 
 // x-bifrost-cache-* for a lookup that ran. id is "" when the entry has none; latencyMs is the
@@ -487,15 +624,6 @@ function respond(status: int, body: string, h: Hdrs): Response {
   return new Response(body, { status: status, headers: r })
 }
 
-// Headers the caller sends as x-bf-eh-<name> go upstream as <name>.
-function forwardedHeaders(h: Hdrs): Map<string, string> {
-  const m: Map<string, string> = new Map()
-  for (const key of h.keys()) {
-    if (key.startsWith("x-bf-eh-")) m.set(key.slice(8), h.get(key)!)
-  }
-  return m
-}
-
 // Bifrost's send_back_raw_request / send_back_raw_response: the provider's setting, which the
 // x-bf-send-back-raw-request / -response header overrides when client.allow_per_request_raw_override is on.
 function sendBackRaw(h: Hdrs, cfg: Config, p: ProviderConfig, which: string): bool {
@@ -545,7 +673,14 @@ function finishes(data: string): bool {
   }
 }
 
-// One limiter per provider that sets concurrency_and_buffer_size (Bifrost's per-provider queue).
+// Bifrost's default queue (core/schemas/provider.go), for a provider with no concurrency_and_buffer_size.
+const DEFAULT_CONCURRENCY: int = 1000
+const DEFAULT_BUFFER: int = 5000
+
+// One limiter per provider (Bifrost's per-provider queue). A provider that sets
+// concurrency_and_buffer_size gets that queue. With client.drop_excess_requests on, a provider
+// without one gets Bifrost's default queue, so a full queue sheds requests there too; with it
+// off, such a provider has no queue and its requests are never held or shed.
 function limitersFor(cfg: Config): Map<string, Limiter> {
   const out: Map<string, Limiter> = new Map()
   const ps = cfg.providers
@@ -553,7 +688,10 @@ function limitersFor(cfg: Config): Map<string, Limiter> {
   const drop = cfg.client?.drop_excess_requests === true
   for (const name of ps.keys()) {
     const c = ps.get(name)!.concurrency_and_buffer_size
-    if (c === undefined) continue
+    if (c === undefined) {
+      if (drop) out.set(name, new Limiter(DEFAULT_CONCURRENCY, DEFAULT_BUFFER, true))
+      continue
+    }
     out.set(name, new Limiter(c.concurrency < 1 ? 1 : c.concurrency, c.buffer_size < 1 ? 1 : c.buffer_size, drop))
   }
   return out
@@ -688,9 +826,21 @@ class ReqCtx {
   cached = false
   error = ""
   virtualKey = ""
+  // the team, customer, business unit and project the request is attributed to ("" when none)
+  teamId = ""
+  customerId = ""
+  businessUnitId = ""
+  projectId = ""
+  // the user the key is assigned to, the caller's session and its User-Agent, for the request log
+  userId = ""
+  sessionId = ""
+  userAgent = ""
   input = ""
   output = ""
   span: Span | undefined = undefined
+  // the request's overhead and the stages it timed, for the otel plugin's spans
+  overheadUs: f64 | undefined = undefined
+  stages: StageTiming[] = []
   // the model as the caller named it
   requested = ""
   // headers plugins asked to send upstream
@@ -706,6 +856,24 @@ class ReqCtx {
   rawResponse = ""
   // Bifrost's metric labels for this request, filled once it is routed and admitted
   labels: metrics.RequestLabels = metrics.newLabels("", "", "")
+  // the log row's extra columns, read from the request's headers (reqlog.tov)
+  meta: Record<string, string> | undefined = undefined
+  parentId = ""
+  agentId = ""
+  // the local cache hit ("direct" or "semantic") and the stop reason of the answer, for the request log
+  cacheType = ""
+  stopReason = ""
+  // the tools the answer called, the heuristic complexity score and the prompt the request named
+  toolNames: string[] = []
+  complexityScore: f64 | undefined = undefined
+  promptId = ""
+  promptName = ""
+  promptVersion: int | undefined = undefined
+  app = ""
+  maximIds: Record<string, string> | undefined = undefined
+  maximTags: Record<string, string> | undefined = undefined
+  // the compat plan of a chat or completions request: its drops and conversions go out with the stream headers
+  compat: CompatPlan | undefined = undefined
   constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
 }
 
@@ -724,6 +892,42 @@ class LazyChat {
     this.value = parsed
     return parsed
   }
+}
+
+// A converted Responses request's body, streamed when its answer is piped to the client.
+function streamedBody(fs: Field[], on: bool): Field[] {
+  if (!on) return fs
+  let out = fs.slice()
+  setField(&out, "stream", "true")
+  return out
+}
+
+// Whether a request asks for the usage chunk (stream_options.include_usage).
+function streamUsage(body: Field[]): bool {
+  const so = find(body, "stream_options")
+  if (so === undefined || !so.startsWith("{")) return false
+  try {
+    return rawBool(fields(so), "include_usage") ?? false
+  } catch (e) {
+    return false
+  }
+}
+
+// A text completion sent to a chat model: the chat request, streamed when the answer is piped.
+function textAsChat(t: Target, sh: Shaped, stream: bool, canPipe: bool): Upstream throws SyntaxError {
+  const req = try new LazyChat(sh.text).get()
+  if (!stream) return try providers.chatUpstream(t, req, sh.body, false)
+  if (providers.streamsNatively(t.kind)) {
+    let sb = sh.body.slice()
+    setField(&sb, "stream", "true")
+    setField(&sb, "stream_options", `{"include_usage":true}`)
+    return openai.chatRequest(t, sb)
+  }
+  if (canPipe) {
+    const su = try providers.streamUpstream(t, req, sh.body, false)
+    if (su !== undefined) return su
+  }
+  return try providers.chatUpstream(t, req, sh.body, false)
 }
 
 // The in-process rules of the regex and secrets providers, by provider id. A bad pattern is logged and its provider is skipped.
@@ -750,8 +954,34 @@ function compileGuards(providers: GuardrailProvider[]): ToolGuard[] {
   }
 }
 
+// The outcome of userAuth: kind is "none" (not a per-user tool), "bearer" (call with token) or "denial" (answer
+// with message and status, the consent link the caller must open).
+type UserAuth = { kind: string, token: string, status: int, type: string, message: string }
+
+function userAuthOf(kind: string, token: string, status: int, type: string, message: string): UserAuth {
+  return { kind: kind, token: token, status: status, type: type, message: message }
+}
+
+// The registration (auth) of an MCP client by name, or undefined.
+function authOfClient(cfg: Config, name: string): McpAuthConfig | undefined {
+  for (const c of cfg.mcp?.client_configs ?? []) {
+    if (c.name === name) return c.auth
+  }
+  return undefined
+}
+
+// The gateway's origin as the caller reached it, for the consent links: the Host header and the forwarded
+// protocol. "" when the request names no host (the links are then relative).
+function originOf(h: Hdrs): string {
+  const host = h.get("host") ?? ""
+  if (host === "") return ""
+  return (h.get("x-forwarded-proto") ?? "http") + "://" + host
+}
+
 export class Engine {
   gov: Governance
+  // the model parameters row for a model (the datasheet, as GET /api/models/parameters serves it), for compat
+  paramsLookup: ((model: string) => Promise<string | undefined>) | undefined = undefined
   health: Health
   vertexTokens = new TokenCache()
   entraTokens: cloudAuth.TokenCache<string> = cloudAuth.stringCache()
@@ -767,6 +997,8 @@ export class Engine {
   mcp: McpManager | undefined = undefined
   jobs: JobStore
   plugins: PluginChain | undefined = undefined
+  // jsonparser with usage all_requests: the JSON of each stream is completed (plugins.tov JsonStreamFixer)
+  jsonStreamOn = false
   semantic: SemanticCache | undefined = undefined
   semanticCfg: SemanticCacheConfig = defaultSemanticConfig()
   // an external vector store for the semantic cache (Bifrost's vector_store), shared by all workers
@@ -779,6 +1011,8 @@ export class Engine {
   // the latest synced datasheet, when one was fetched
   catalogRows: Map<string, PriceRow> | undefined = undefined
   private unpriced: Set<string> = new Set()
+  // keeps a token row the gateway obtained (a refresh); the server saves it to the config file
+  userTokenSaved: ((r: McpUserToken) => void) | undefined = undefined
   cache: ResponseCache | undefined = undefined
   cacheTtlMs = 300000
   autoPromptCache = false
@@ -804,9 +1038,11 @@ export class Engine {
     if (cfg.cluster?.enabled === true) this.gov.alignWindows()
     const specs = cfg.plugins ?? []
     if (specs.length > 0) {
-      const built = buildChain(specs.map((p) => ({ name: p.name, enabled: p.enabled, configJson: p.config_json ?? "{}" })))
+      const entries: PluginEntry[] = specs.map((p) => ({ name: p.name, enabled: p.enabled, configJson: p.config_json ?? "{}", placement: p.placement, order: p.order }))
+      const built = buildChain(entries)
       for (const e of built.errors) console.error(`raiju: plugin: ${e}`)
       this.plugins = built.chain
+      this.jsonStreamOn = jsonStreamEnabled(entries)
     }
     const sc = cfg.semantic_cache
     if (sc !== undefined && sc.enabled !== false && sc.embedding_model !== "") {
@@ -842,6 +1078,12 @@ export class Engine {
       halfOpenProbes: d.halfOpenProbes,
     }
     this.health = new Health(bc)
+    // the circuit policies of the config (Bifrost's circuit_breaker_config.policies, kept as circuit_breaker_policies)
+    for (const pc of cfg.circuit_breaker_policies ?? []) {
+      const pr = parsePolicy(JSON.stringify(pc), "")
+      if (!pr.ok) console.error(`raiju: circuit_breaker_policies ${pc.name}: ${pr.err}`)
+      else this.health.policyAdd(pr.p)
+    }
     const ls = cfg.logs_store
     if (ls !== undefined && ls.enabled === true) {
       const d = defaultLogStoreConfig(ls.dir ?? "logs")
@@ -889,8 +1131,8 @@ export class Engine {
     this.autoPromptCache = cfg.prompt_cache?.auto_inject ?? false
     this.logRequests = cfg.client?.enable_logging ?? true
     metrics.setCustomLabels(cfg.client?.prometheus_labels ?? [])
+    metrics.setTelemetry(cfg.telemetry?.overhead_breakdown_enabled === true, cfg.telemetry?.user_labels_enabled === true)
     this.limiters = limitersFor(cfg)
-    if (cfg.client?.drop_excess_requests === true && this.limiters.size === 0) console.error("raiju: client.drop_excess_requests has no effect: no provider sets concurrency_and_buffer_size, so no queue is full")
     if (injectedNames(cfg).length > 0 && (cfg.mcp?.client_configs ?? []).length === 0) console.error("raiju: injected_tools need MCP clients, and none are configured")
     this.guardProviders = cfg.guardrails?.providers ?? []
     this.localRules = compileLocalRules(this.guardProviders)
@@ -929,6 +1171,32 @@ export class Engine {
         text = red
         out = { action: "redact", reason: `${p.id}: ${v.reason}`, text: red }
       }
+    }
+    return out
+  }
+
+  // The local output guards (regex and secrets providers that cover the LLM output) that check a streamed answer.
+  streamGuards(guardOn: bool): GuardedProvider[] {
+    const out: GuardedProvider[] = []
+    if (!guardOn) return out
+    for (const p of this.guardProviders) {
+      if (!appliesTo(p, "output") || !(p.targets ?? ["llm"]).includes("llm")) continue
+      if (p.kind === "regex" || p.kind === "secrets") out.push({ id: p.id, rules: this.localRules.get(p.id) ?? [] })
+    }
+    return out
+  }
+
+  // A streamed answer that is built whole (not sent as it arrives) goes through the same guards, so what is
+  // cached and logged is the redacted text. A block throws, as a blocked answer does.
+  guardWhole(body: string, format: StreamFormat, guardOn: bool): string throws SyntaxError {
+    const gs = this.streamGuards(guardOn)
+    if (gs.length === 0) return body
+    const g = new OutputStreamGuard(gs, format)
+    const out = g.finish(body)
+    for (const k of g.kinds) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", k, "redact"), 1.0)
+    if (g.stopped) {
+      metrics.inc("raiju_guardrail_checks_total", metrics.labels("", g.blockedBy, "block"), 1.0)
+      throw new SyntaxError("the response was blocked by guardrails")
     }
     return out
   }
@@ -978,11 +1246,67 @@ export class Engine {
     aff.bind(sid, ref.provider, ref.model, kid, sessionTtl(h, aff.cfg), Date.now())
   }
 
-  tierOf(text: string, cx: ComplexitySettings): Tier {
+  // The heuristic's tier and score; the score is undefined when the text cannot be scored.
+  heuristicTier(text: string, cx: ComplexitySettings): { tier: Tier, mechanism: string, score: f64 | undefined } {
     try {
-      return cplx.classify(text, { simple_max_score: cx.simple_max_score ?? 3.0, complex_min_score: cx.complex_min_score ?? 8.0 }).tier
+      const c = cplx.classify(text, { simple_max_score: cx.simple_max_score ?? 3.0, complex_min_score: cx.complex_min_score ?? 8.0 })
+      return { tier: c.tier, mechanism: "heuristic", score: c.score }
     } catch (e) {
-      return "MEDIUM"
+      return { tier: "MEDIUM", mechanism: "heuristic", score: undefined }
+    }
+  }
+
+  // The complexity tier of a chat request: the configured classifier's, or the heuristic's when the
+  // classifier names none (no decision model, no embedding, a timeout, or an unparseable answer).
+  async tierFor(req: Request, text: string, cx: ComplexitySettings): Promise<{ tier: Tier, mechanism: string, score: f64 | undefined }> {
+    const mode = cplx.classifierMode(cx.classifier)
+    if (mode === "heuristic") return this.heuristicTier(text, cx)
+    let t: Tier | undefined = undefined
+    if (mode === "decision") t = await cplx.decisionTier(text, cx.decision, async (b: string, ph: string) => await this.classifierCall(req, "/v1/decisions", b, ph))
+    else if (mode === "llm") t = await cplx.llmTier(text, cx.llm, async (b: string, ph: string) => await this.classifierCall(req, "/v1/chat/completions", b, ph))
+    else t = await cplx.semanticTier(text, cx.semantic, async (b: string, ph: string) => await this.classifierCall(req, "/v1/embeddings", b, ph))
+    if (t !== undefined) return { tier: t, mechanism: mode, score: undefined }
+    return this.heuristicTier(text, cx)
+  }
+
+  // A classifier's own call, answered by the route it names with the caller's headers. The chat
+  // call is marked with a forced tier, so it is not classified in turn. undefined when it fails.
+  async classifierCall(req: Request, route: string, body: string, phase: string): Promise<string | undefined> {
+    try {
+      const hs: Record<string, string> = snapshot(req.headers)
+      hs.set("x-bf-complexity-tier", "MEDIUM")
+      const inner = new Request("http://raiju.internal" + route, { method: "POST", headers: hs, body: body })
+      let res: Response = new Response(undefined, { status: 500 })
+      if (route === "/v1/decisions") {
+        const d = try parseDecision(body)
+        const build: Build = (t) => try typesafe.systemoneUpstream(t, d)
+        const tr: Translate = (t, out, requested) => try typesafe.translateDecision(out, d, requested)
+        res = try await this.serve(inner, "decisions", undefined, try fields(body), body, build, tr, false)
+      } else if (route === "/v1/embeddings") {
+        res = try await this.embeddings(inner)
+      } else {
+        res = try await this.chat(inner)
+      }
+      const out = try await res.text()
+      if (res.status !== 200) return undefined
+      if (route !== "/v1/decisions") this.recordClassifier(route, body, out, phase)
+      return out
+    } catch (e) {
+      return undefined
+    }
+  }
+
+  // bifrost_routing_embedding_* and bifrost_routing_llm_*: the classifier's own call and its cost.
+  recordClassifier(route: string, body: string, out: string, phase: string): void {
+    try {
+      const sent = try JSON.parse(body) as { model?: string }
+      const at = splitModel(sent.model ?? "")
+      const u = try JSON.parse(out) as { usage?: { prompt_tokens?: int, completion_tokens?: int } }
+      const cost = this.pricing.cost(at.provider, at.model, u.usage?.prompt_tokens ?? 0, u.usage?.completion_tokens ?? 0)
+      if (route === "/v1/embeddings") metrics.observeRoutingEmbedding(at.provider, at.model, phase, cost)
+      else metrics.observeRoutingLLM(at.provider, at.model, cost)
+    } catch (e) {
+      return
     }
   }
 
@@ -991,7 +1315,8 @@ export class Engine {
   async attempt(refs: ModelRef[], h: Hdrs, build: Build, translate: Translate, streamed: bool, ctx: ReqCtx): Promise<Outcome> {
     const pinned = h.get("x-bf-api-key") ?? h.get("x-bf-api-key-id") ?? undefined
     const direct = directKeyFrom(h, this.cfg.client?.allow_direct_keys === true)
-    const extra = forwardedHeaders(h)
+    // x-bf-eh-* headers and allowlisted headers go upstream, as client.header_filter_config allows (headerfilter.tov)
+    const extra = forwardedHeaders(h, headerFilterOf(this.cfg.client?.header_filter_config))
     let last: Outcome = { ok: false, status: 404, body: errorJson("no provider is configured for this model", "invalid_request_error", "model_not_found"), contentType: "application/json", provider: "", model: "", promptTokens: 0, completionTokens: 0, attempts: 0, upstreamMs: 0.0 }
     let attempts = 0
     let upstreamMs = 0.0
@@ -1027,6 +1352,8 @@ export class Engine {
         tl.fallbackIndex = "" + Math.max(0, refIndex)
         tl.selectedKeyId = t.key.id ?? ""
         tl.selectedKeyName = t.key.name ?? ""
+        // labels are values: the copy with the key goes back to the request, for the metrics and the request log
+        ctx.labels = tl
         if (t.kind === "watsonx") {
           const tok = await this.watsonxToken(t)
           if (tok.error !== "") {
@@ -1130,6 +1457,14 @@ export class Engine {
           const px = proxyOf(p)
           const res = up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal, proxy: px, tls: tlsOf(t.cfg) }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal, proxy: px, tls: tlsOf(t.cfg) })
           status = res.status
+          // circuit policies: this response's headers may open the circuit of a policy for this primary
+          if (this.health.policyList().length > 0) {
+            const rh: Map<string, string> = new Map()
+            res.headers.forEach((v, k) => {
+              rh.set(k, v)
+            })
+            this.health.policyObserve(ref.provider, ref.model, t.key.id ?? "", rh, Date.now())
+          }
           const sink = ctx.sink
           const mk = ctx.makeConverter
           const conv = status >= 200 && status < 300 && sink !== undefined && mk !== undefined ? mk(t, ref.provider + "/" + ref.model) : undefined
@@ -1139,15 +1474,21 @@ export class Engine {
             ctx.outHeaders.set("content-type", conv.framed() ? "application/vnd.amazon.eventstream" : "text/event-stream")
             ctx.outHeaders.set("cache-control", "no-cache")
             ctx.outHeaders.set("x-bf-attempts", "" + attempts)
-            routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs, t.key.name ?? t.key.id ?? "", aliasTo(t.key, ref.model))
+            routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs, t.key.name ?? t.key.id ?? "", aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasNameOf(t.key, ref.model), aliasFamilyOf(t.key, ref.model))
+            // the compat drops and conversions of this target are decided by now (build shaped it): they go out with the stream's headers
+            compatHeaders(&ctx.outHeaders, ctx.compat)
             sink.started = true
             sink.open(200, ctx.outHeaders)
             const reader = stream.getReader()
+            // a cancel while the upstream is silent aborts the pending read, not just the next one
+            sink.abort = () => {
+              dl.controller.abort()
+            }
             try {
               let chunkIndex = 0
               let lastAt = started
               while (true) {
-                if (sink.cancelled) {
+                if (sink.cancelled || conv.halted) {
                   await reader.cancel()
                   break
                 }
@@ -1155,7 +1496,7 @@ export class Engine {
                 if (c.done) break
                 const v = c.value
                 if (v !== undefined) {
-                  const out = conv.push(v)
+                  const out = conv.guarded(conv.push(v), false)
                   if (out !== "") {
                     const at = performance.now()
                     metrics.observeStreamChunk(tl, chunkIndex, (at - lastAt) / 1000.0)
@@ -1170,9 +1511,10 @@ export class Engine {
               }
             } catch (e) {
               // a binary stream just ends: a text error would corrupt its frames
-              if (!conv.framed()) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
+              // (a client that cancelled is owed no error event)
+              if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
             }
-            const tail = conv.end()
+            const tail = conv.guarded(conv.end(), true)
             if (tail !== "") sink.write(tail)
             const fe = conv.takeFrames()
             const we = sink.writeBytes
@@ -1185,7 +1527,11 @@ export class Engine {
             return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true }
           }
           text = await res.text()
-          if (storeRaw) ctx.rawResponse = text
+          // a streamed upstream body is not kept when local output guards apply: a match can be split across its events,
+          // so the guards cannot redact it (the answer the client got is in the log's output, redacted)
+          if (storeRaw) ctx.rawResponse = streamed && this.streamGuards(true).length > 0 ? "" : text
+          // client.dump_errors_in_console_logs: the full upstream error goes to the server console
+          if (status >= 400 && this.cfg.client?.dump_errors_in_console_logs === true) console.error(`raiju: upstream error from ${ref.provider} (${status}) for ${ref.model}: ${text}`)
           // follow-up calls of a multi-call request (one embedding input per call)
           const more = up.extra
           if (more !== undefined && status >= 200 && status < 300) {
@@ -1240,7 +1586,7 @@ export class Engine {
             const echoReq = inBody && !streamed && up.body !== "" && sendBackRaw(h, this.cfg, p, "request")
             const echoResp = inBody && !streamed && sendBackRaw(h, this.cfg, p, "response")
             const rawBody = echoReq || echoResp ? withRawFields(tr.body, echoReq ? up.body : undefined, echoResp ? text : undefined) : tr.body
-            return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model) }
+            return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasName: aliasNameOf(t.key, ref.model), aliasFamily: aliasFamilyOf(t.key, ref.model), served: tr.served ?? "", billed: t.cfg.ignore_provider_cost === true ? undefined : tr.billed }
           } catch (e) {
             last = { ok: false, status: 502, body: errorJson(`could not read ${ref.provider}'s response: ${e.message}`, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
             break
@@ -1288,11 +1634,19 @@ export class Engine {
     const rows = this.catalogRows
     if (rows !== undefined) this.pricing.replaceCatalog(rows)
     this.rules = fresh.rules
+    // the breakers keep their state; the policies follow the config
+    this.health.replacePolicies(fresh.health.policyList())
+    // the MCP clients follow the config too: a client added since the start gets a session (main connects it)
+    const fm = fresh.mcp
+    if (fm === undefined) this.mcp = undefined
+    else if (this.mcp === undefined) this.mcp = fm
+    else this.mcp.follow(fm.sessions)
     this.guard = fresh.guard
     this.guardInput = fresh.guardInput
     this.guardOutput = fresh.guardOutput
     this.autoPromptCache = fresh.autoPromptCache
     this.plugins = fresh.plugins
+    this.jsonStreamOn = fresh.jsonStreamOn
     this.logRequests = fresh.logRequests
     this.complexity = fresh.complexity
     this.guardProviders = fresh.guardProviders
@@ -1362,19 +1716,120 @@ export class Engine {
   withMcpTools(text: string, h: Hdrs): string throws SyntaxError {
     const m = this.mcp
     if (m === undefined) return text
-    // Bifrost's client.mcp_disable_auto_tool_inject: tools are added only when the request names its clients
-    if (this.cfg.client?.mcp_disable_auto_tool_inject === true && h.get("x-bf-mcp-include-clients") === undefined) return text
+    // Bifrost's client.mcp_disable_auto_tool_inject: tools are added only when the request names its clients or tools
+    const named = h.get("x-bf-mcp-include-clients") !== undefined || h.get("x-bf-mcp-include-tools") !== undefined
+    if (this.cfg.client?.mcp_disable_auto_tool_inject === true && !named) return text
     // a key's access profile may limit the MCP tools it gets; clients it doesn't name
     // count only with allow_by_default
-    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools)
+    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs)
     const only = h.get("x-bf-mcp-include-clients")
     if (only !== undefined) {
       if (only.trim() === "none") return text
       const names = only.split(",").map((n) => n.trim() + "-")
       tools = tools.filter((t) => names.some((n) => t.includes(`"name":"${n}`)))
     }
+    // x-bf-mcp-include-tools: "<client>-<tool>" or "<client>-*" entries; the request's tool list
+    // is narrowed to them (Bifrost's MCPContextKeyIncludeTools; an empty list includes no tool)
+    const onlyTools = h.get("x-bf-mcp-include-tools")
+    if (onlyTools !== undefined) {
+      const want = includeToolNames(onlyTools)
+      const kept: string[] = []
+      for (const t of tools) {
+        const listed = try toolInList(t, want)
+        if (listed) kept.push(t)
+      }
+      tools = kept
+    }
     if (tools.length === 0) return text
     return try injectTools(text, tools)
+  }
+
+  // The gate of one MCP tool call: the key's MCP rules (access profile patterns and mcp_configs) must
+  // allow the tool, and the key's budgets must have room. A tool the gateway does not expose is left to
+  // execution, which reports it as unknown.
+  toolGate(m: McpManager, h: Hdrs, name: string): Grant | Denial {
+    if (m.hasTool(name) && !m.mayRun(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, name)) {
+      return { kind: "denial", status: 403, type: "permission_error", message: `tool ${name} is not allowed for this key` }
+    }
+    const client = this.perUserClient(name)
+    if (client !== undefined && this.userHeaders(name, h) === undefined) {
+      return { kind: "denial", status: 401, type: "authentication_error", message: `the per-user headers of MCP client ${client} are not submitted for this key: open a submission with POST /api/mcp/per-user-headers/flows` }
+    }
+    return this.gov.admitTool(h)
+  }
+
+  // The per_user_headers client a tool belongs to; undefined for the tools of any other client.
+  perUserClient(name: string): string | undefined {
+    const hit = splitToolName(name, perUserClientNames(this.cfg.mcp?.client_configs))
+    return hit === undefined ? undefined : hit.server
+  }
+
+  // The header values the calling key submitted for the tool's per_user_headers client; undefined when the
+  // tool belongs to no such client or the key has submitted none.
+  userHeaders(name: string, h: Hdrs): Map<string, string> | undefined {
+    const client = this.perUserClient(name)
+    if (client === undefined) return undefined
+    return userHeadersOf(this.cfg.mcp?.user_credentials, client, this.gov.findKey(h)?.id ?? "")
+  }
+
+  // The caller's token for a tool of a per_user_oauth client. "none" for other tools; "bearer" with the token to
+  // call with (an expiring token is refreshed first and saved); "denial" with the consent link the caller must
+  // open. force refreshes the token whatever its expiry (used after the server answered 401).
+  async userAuth(name: string, h: Hdrs, force: bool): Promise<UserAuth> {
+    const hit = splitToolName(name, perUserOAuthNames(this.cfg.mcp?.client_configs))
+    if (hit === undefined) return userAuthOf("none", "", 0, "", "")
+    const client = hit.server
+    const vk = this.gov.findKey(h)?.id ?? ""
+    const ident = identityOf(h.get("x-bf-mcp-session-id"), vk)
+    if (ident.vk === "" && ident.session === "") return userAuthOf("denial", "", 401, "authentication_error", `per-user OAuth for MCP client ${client} needs a virtual key (x-bf-vk) or an x-bf-mcp-session-id header`)
+    const now = Date.now()
+    const row = userTokenOf(this.cfg.mcp?.user_tokens, client, ident.vk, ident.session)
+    const act = force && row !== undefined && row.refresh_token !== "" ? "refresh" : tokenAction(row, now)
+    const a = authOfClient(this.cfg, client)
+    if (act === "valid" && row !== undefined) return userAuthOf("bearer", row.access_token, 0, "", "")
+    if (act === "refresh" && a !== undefined && row !== undefined) {
+      try {
+        const fresh = try await refreshUserRow(a, row, now)
+        this.saveUserRow(fresh)
+        return userAuthOf("bearer", fresh.access_token, 0, "", "")
+      } catch (e) {
+        // the refresh failed: the caller has to consent again
+      }
+    }
+    const base = originOf(h)
+    const tempOn = this.cfg.client?.mcp_enable_temp_token_auth === true
+    const start: McpAuthConfig = a ?? { type: "oauth" }
+    const r = startUserFlow(start, client, ident.vk, ident.session, base, tempOn, now)
+    if (r.flow === undefined) return userAuthOf("denial", "", 401, "authentication_error", r.error)
+    const f = r.flow!
+    return userAuthOf("denial", "", 401, "authentication_error", consentMessage(client, consentLink(base, f.id, f.temp_token), tempOn))
+  }
+
+  // Keeps a token row the gateway obtained; the server's saver writes it to the config file.
+  saveUserRow(row: McpUserToken): void {
+    const f = this.userTokenSaved
+    if (f !== undefined) f(row)
+  }
+
+  // Runs one tool call with the caller's bearer. A 401 from the server on a per-user call refreshes the token once
+  // and runs the call again.
+  async runUser(m: McpManager, name: string, args: string, h: Hdrs, ua: UserAuth): Promise<ToolText> throws Error {
+    const bearer = ua.kind === "bearer" ? ua.token : undefined
+    try {
+      return try await m.execute(name, args, h, this.userHeaders(name, h), bearer)
+    } catch (e) {
+      if (bearer === undefined || !e.message.includes("HTTP 401")) throw e
+      const again = try await this.userAuth(name, h, true)
+      if (again.kind !== "bearer") throw e
+      return try await m.execute(name, args, h, this.userHeaders(name, h), again.token)
+    }
+  }
+
+  // Debits the tool's tool_pricing cost from the grant's budgets after a call ran. Free tools, and calls
+  // with no key, debit nothing.
+  chargeTool(m: McpManager, g: Grant | Denial, name: string): void {
+    const cost = m.priceOf(name)
+    if (cost > 0 && g.kind === "grant") this.gov.record(g, 0, cost)
   }
 
   // POST /v1/mcp/tool/execute: runs one tool call and answers with the tool message.
@@ -1386,8 +1841,14 @@ export class Engine {
       const call = executeEndpointBody(text)
       const tv = checkToolCall(this.toolGuards, call.name, call.argumentsJson)
       if (!tv.allowed) return errorResponse(400, `tool call blocked by guardrails: ${tv.reason}`, "guardrail_violation", noHeaders())
+      const h = snapshot(req.headers)
+      const gate = this.toolGate(m, h, call.name)
+      if (gate.kind === "denial") return errorResponse(gate.status, gate.message, gate.type, noHeaders())
+      const ua = try await this.userAuth(call.name, h, false)
+      if (ua.kind === "denial") return errorResponse(ua.status, ua.message, ua.type, noHeaders())
       const t0 = performance.now()
-      const result = await m.execute(call.name, call.argumentsJson)
+      const result = try await this.runUser(m, call.name, call.argumentsJson, h, ua)
+      this.chargeTool(m, gate, call.name)
       timedMcp(m, call.name, t0, result.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", call.name, result.isError ? "error" : "success"), 1.0)
       const r: Record<string, string> = new Map()
@@ -1568,40 +2029,75 @@ export class Engine {
       headers: h,
       params: params,
     }
-    const m = rules.match(act, { virtual_key: vk?.id, team: vk?.team_id, customer: vk?.customer_id })
-    if (m === undefined) return undefined
-    const i = pickTarget(m.targets, Math.random())
-    if (i < 0) return undefined
-    const tg = m.targets[i]!
-    const out: ModelRef[] = [{ provider: tg.provider, model: tg.model ?? first.model }]
-    if (tg.key_id !== undefined) h.set("x-bf-api-key", tg.key_id)
-    h.set("x-bf-routing-rule", m.rule)
-    for (const f of m.fallbacks) out.push(parseModel(this.cfg, f))
-    for (const r of refs.slice(1)) out.push(r)
-    return out
+    // chain_rule: a matched rule with chain_rule sends its target back through the rules as the new
+    // context. The chain ends on a terminal rule, at the depth limit, when nothing matches, or when a step
+    // changes neither provider nor model. The last matched rule decides (Bifrost's accumulation).
+    const maxDepth = this.cfg.client?.routing_chain_max_depth ?? 10
+    let cur: ModelRef = first
+    let decided: ModelRef[] | undefined = undefined
+    let steps = 0
+    while (true) {
+      act.model = cur.model
+      act.provider = cur.provider
+      const m = rules.match(act, { virtual_key: vk?.id, team: vk?.team_id, customer: vk?.customer_id })
+      if (m === undefined) break
+      const i = pickTarget(m.targets, Math.random())
+      if (i < 0) break
+      const tg = m.targets[i]!
+      const next: ModelRef = { provider: tg.provider, model: tg.model ?? cur.model }
+      const out: ModelRef[] = [next]
+      for (const f of m.fallbacks) out.push(parseModel(this.cfg, f))
+      decided = out
+      if (tg.key_id !== undefined) h.set("x-bf-api-key", tg.key_id)
+      h.set("x-bf-routing-rule", m.rule)
+      if (!m.chain || steps >= maxDepth) break
+      steps += 1
+      if (next.provider === cur.provider && next.model === cur.model) break
+      cur = next
+    }
+    if (decided === undefined) return undefined
+    for (const r of refs.slice(1)) decided.push(r)
+    return decided
   }
 
   // Shared front half of every inference endpoint.
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory): Promise<Response> {
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied): Promise<Response> {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
     ctx.sink = sink
     ctx.makeConverter = makeConverter
+    ctx.compat = compat
+    if (prompt !== undefined && prompt.prompt_id !== undefined) {
+      ctx.promptId = prompt.prompt_id
+      ctx.promptName = prompt.prompt_name ?? ""
+      ctx.promptVersion = prompt.version
+    }
+    ctx.meta = logMetadata(h, this.cfg.client?.logging_headers ?? [])
+    const cids = correlationIds(h)
+    ctx.parentId = cids.parent
+    ctx.agentId = cids.agent
+    const ma = maximAttrs(h)
+    ctx.maximIds = ma?.ids
+    ctx.maximTags = ma?.tags
     if (upstreamHeaders !== undefined) ctx.upstreamHeaders = upstreamHeaders
     const tracer = this.tracer
     if (tracer !== undefined) {
-      const rs = tracer.startRequest(op, h.get("traceparent"), Date.now())
+      const sid = sessionId(h)
+      const rs = tracer.startRequest(op, h.get("traceparent"), Date.now(), sid)
       tracer.recordRequestHeaders(rs, h)
+      if (sid !== undefined) rs.setStr("session.id", sid)
       ctx.span = rs
     }
     ctx.contentOff = this.contentOff(h)
+    ctx.userAgent = h.get("user-agent") ?? ""
+    ctx.sessionId = sessionId(h) ?? ""
     if (this.logStore !== undefined && !ctx.contentOff) ctx.input = text
     // bifrost_active_requests: in flight from here until the answer (or the throw) is out
     const method = requestType(op, streamed)
     metrics.activeRequests(method, 1.0)
     let res: Response = new Response(undefined, { status: 500 })
     try {
-      res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed)
+      res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed, compat)
     } finally {
       metrics.activeRequests(method, -1.0)
     }
@@ -1610,13 +2106,15 @@ export class Engine {
     return res
   }
 
-  async serveInner(req: Request, h0: Hdrs, ctx: ReqCtx, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool): Promise<Response> {
+  async serveInner(req: Request, h0: Hdrs, ctx: ReqCtx, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, compat?: CompatPlan): Promise<Response> {
     const op = ctx.op
     const started = ctx.started
     let h = h0
     const rid = ctx.rid
     let out: Hdrs = new Map()
     out.set("x-bifrost-request-id", rid)
+    // Bifrost's tracing middleware echoes the request id as x-request-id too
+    out.set("x-request-id", rid)
     out.set("x-bifrost-request-type", requestType(op, streamed))
     const span = ctx.span
     if (span !== undefined) out.set("x-bifrost-trace-id", span.traceId)
@@ -1627,12 +2125,21 @@ export class Engine {
     const tRoute = performance.now()
     // complexity tier: for routing rules (complexity_tier) and the tier map behind model "auto"
     let tier: Tier | undefined = undefined
+    // how the tier was decided, for the request log: a classifier's name, "heuristic" or "override"
+    let mechanism = ""
     const cx = this.complexity
     if (cx !== undefined && op === "chat") {
       const forced = overrideTier(h)
-      const t: Tier = forced !== undefined ? forced : this.tierOf(text, cx)
-      tier = t
-      out.set("x-bf-complexity-tier", t)
+      if (forced !== undefined) {
+        tier = forced
+        mechanism = "override"
+      } else {
+        const d = await this.tierFor(req, text, cx)
+        tier = d.tier
+        mechanism = d.mechanism
+        ctx.complexityScore = d.score
+      }
+      out.set("x-bf-complexity-tier", tier ?? "MEDIUM")
     }
     // a bare model name resolves through keys, then the catalog, preferring the SDK route's provider
     let refs = [parseModelVia(this.cfg, model, routeOf(op))].concat(fallbackRefs(this.cfg, body))
@@ -1644,6 +2151,9 @@ export class Engine {
       ctx.error = "no provider for " + model
       return errorResponse(400, "could not auto resolve a provider for the request, please specify a provider explicitly", "invalid_request_error", out)
     }
+    // a circuit policy whose circuit is open sends the primary's requests to its fallback (the primary is not tried)
+    const open = this.health.policyFallback(refs[0]!.provider, refs[0]!.model, Date.now())
+    if (open !== undefined) refs = [{ provider: open.fallback_provider, model: open.fallback_model }].concat(refs.slice(1))
     const rules = this.rules
     if (rules !== undefined) {
       const routed = this.route(rules, op, refs, &h, body, tier)
@@ -1663,28 +2173,48 @@ export class Engine {
     }
     const grant: Grant = admitted
     ctx.virtualKey = grant.vk?.id ?? ""
+    ctx.userId = grant.vk?.user_id ?? ""
     ctx.provider = primary.provider
     let rl = metrics.newLabels(primary.provider, primary.model, requestType(op, streamed))
     const gvk = grant.vk
     if (gvk !== undefined) {
       rl.virtualKeyId = gvk.id
       rl.virtualKeyName = gvk.name ?? ""
-      rl.teamId = gvk.team_id ?? ""
-      rl.teamName = this.gov.teamName(gvk) ?? ""
-      rl.customerId = gvk.customer_id ?? this.gov.teams.get(gvk.team_id ?? "")?.customer ?? ""
-      rl.customerName = this.gov.customerName(gvk) ?? ""
     }
+    // team, customer, business unit and project, as governance attributed them
+    const at: Attribution = grant.attr ?? noAttribution()
+    ctx.teamId = at.teamId
+    ctx.customerId = at.customerId
+    ctx.businessUnitId = at.businessUnitId
+    ctx.projectId = at.projectId
+    rl.teamId = at.teamId
+    rl.teamName = at.teamName
+    rl.customerId = at.customerId
+    rl.customerName = at.customerName
+    rl.businessUnitId = at.businessUnitId
+    rl.businessUnitName = at.businessUnitName
+    rl.projectId = at.projectId
+    rl.projectName = at.projectName
     const ruleName = out.get("x-bf-routing-rule")
     if (ruleName !== undefined && ruleName !== "") {
       rl.routingRuleName = ruleName
+      rl.routingRuleId = ruleName
       rl.routingEngineUsed = "routing_rule"
     }
-    if (tier !== undefined) rl.complexityTier = tier
+    if (tier !== undefined) {
+      rl.complexityTier = tier
+      rl.complexityMechanism = mechanism
+    }
     if (tier !== undefined || (ruleName !== undefined && ruleName !== "")) {
       metrics.observeRouting(ruleName !== undefined && ruleName !== "" ? "routing_rule" : "complexity", tier ?? "", ruleName ?? "")
     }
     if (model !== primary.provider + "/" + primary.model && model !== primary.model) rl.alias = model
-    rl.app = h.get("x-bf-app") ?? ""
+    // the app: the caller's x-bf-app, else the one its User-Agent names (the operator's
+    // user_agent_mappings first, then Bifrost's built-in identifiers)
+    const xApp = h.get("x-bf-app") ?? ""
+    rl.app = xApp !== "" ? xApp : appOf(h.get("user-agent") ?? "", this.cfg.user_agent_mappings ?? [])
+    ctx.app = rl.app
+    rl.userId = ctx.userId
     rl.custom = metrics.customValues(h)
     ctx.labels = rl
     // Fallbacks the key may not use are dropped.
@@ -1693,19 +2223,37 @@ export class Engine {
       if (this.gov.admit(h, r.provider, r.model).kind === "grant") allowed.push(r)
     }
 
+    // Budgets cannot count the cost of a model with no price, so with client.refuse_unpriced_models
+    // a budgeted request is refused for any unpriced model it may reach (fallbacks included).
+    if (grant.budgets.length > 0 && this.cfg.client?.refuse_unpriced_models === true) {
+      const no = this.pricing.unpriced(allowed)
+      if (no !== undefined) {
+        const msg = `model ${no.provider}/${no.model} has no price, so the budget on this key cannot count it: add a pricing override, or turn off client.refuse_unpriced_models`
+        ctx.error = msg
+        return errorResponse(403, msg, "permission_error", out)
+      }
+    }
+
     const tCache = performance.now()
     const cache = this.cache
     let key = ""
     const noStore = h.get("x-bf-cache-no-store") === "true"
     if (cache !== undefined) {
-      key = cacheKey(op + (h.get("x-bf-cache-key") ?? ""), model, text)
+      const scope = keyScope(op + (h.get("x-bf-cache-key") ?? ""), grant.vk?.id ?? "", this.cfg.cache?.scope_by_virtual_key === true)
+      key = cacheKey(scope, model, text)
       const hit = cache.get(key)
       if (hit !== undefined) {
         metrics.observeCacheHit(ctx.labels, "direct")
         out.set("x-bf-cache", "hit")
         cacheHeaders(&out, "direct", primary, undefined, undefined, cacheId(key), performance.now() - started)
+        originHeaders(&out, hit.origin)
         out.set("content-type", hit.contentType)
         ctx.cached = true
+        ctx.cacheType = "direct"
+        if (this.logStore !== undefined) {
+          ctx.stopReason = stopReasonOf(hit.body)
+          ctx.toolNames = toolCallNamesOf(hit.body)
+        }
         ctx.output = hit.body
         return respond(200, hit.body, out)
       }
@@ -1730,9 +2278,11 @@ export class Engine {
             metrics.observeCacheHit(ctx.labels, "semantic")
             out.set("x-bf-cache", "semantic-hit")
             out.set("x-bf-cache-similarity", hit.score.toFixed(4))
-            cacheHeaders(&out, "semantic", primary, hit.score, th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold), "", performance.now() - started)
+            cacheHeaders(&out, "semantic", primary, hit.score, th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold), hit.id, performance.now() - started)
+            originHeaders(&out, hit.origin)
             out.set("content-type", hit.contentType)
             ctx.cached = true
+            ctx.cacheType = "semantic"
             return respond(200, hit.body, out)
           }
         }
@@ -1747,24 +2297,33 @@ export class Engine {
     if (cache !== undefined || semVec.length > 0) out.set("x-bifrost-cache-hit", "false")
     ctx.outHeaders = out
     ctx.requested = model
+    if (compat !== undefined && compat.enabled) await this.compatLoad(compat, allowed)
     const tAtt = performance.now()
     const r = try await this.attempt(allowed, h, build, translate, streamed, ctx)
     // translation and retries: the attempt's time less the upstream calls
     const convertUs = Math.max(0.0, (performance.now() - tAtt) * 1000.0 - r.upstreamMs * 1000.0)
     out.set("x-bf-attempts", "" + r.attempts)
+    if (compat !== undefined && compat.enabled) {
+      // Bifrost logs these as warnings: the fitted values and a dropped service tier
+      for (const w of compat.warnings) console.error(`raiju: compat: ${w}`)
+      compatHeaders(&out, compat)
+    }
     if (!r.ok) {
       ctx.error = r.body.byteLength > 2000 ? r.body.slice(0, 2000) : r.body
       out.set("content-type", "application/json")
       const et = errorType(r.body)
       if (et !== "") out.set("x-bifrost-error-type", et)
       if (r.retryMs !== undefined) out.set("x-bifrost-retry-after-ms", "" + Math.round(r.retryMs))
-      if (r.provider !== "") routedHeaders(&out, primary, r.provider, r.model, fallbackIndex(allowed, r.provider, r.model), model, r.upstreamMs, r.key ?? "", r.alias ?? "")
+      if (r.provider !== "") routedHeaders(&out, primary, r.provider, r.model, fallbackIndex(allowed, r.provider, r.model), model, r.upstreamMs, r.key ?? "", r.alias ?? "", r.aliasName ?? "", r.aliasFamily ?? "")
       return respond(r.status, r.body, out)
     }
-    const cost = this.pricing.cost(r.provider, r.model, r.promptTokens, r.completionTokens)
-    if (grant.budgets.length > 0 && !this.pricing.known(r.provider, r.model) && !this.unpriced.has(r.provider + "/" + r.model)) {
-      this.unpriced.add(r.provider + "/" + r.model)
-      console.error(`raiju: no price for ${r.provider}/${r.model}: budgets don't count its requests; add a pricing override`)
+    // a provider's billed cost (OpenRouter's usage.cost) replaces the datasheet estimate
+    // an alias's model_name (Bifrost's canonical name) is the model priced when it is set
+    const priced = r.aliasName !== undefined && r.aliasName !== "" ? r.aliasName : r.model
+    const cost = r.billed !== undefined && r.billed > 0 ? r.billed : this.pricing.cost(r.provider, priced, r.promptTokens, r.completionTokens)
+    if (grant.budgets.length > 0 && !this.pricing.known(r.provider, priced) && !this.unpriced.has(r.provider + "/" + priced)) {
+      this.unpriced.add(r.provider + "/" + priced)
+      console.error(`raiju: no price for ${r.provider}/${priced}: budgets don't count its requests; add a pricing override`)
     }
     this.gov.record(grant, r.promptTokens + r.completionTokens, cost)
     let ul = ctx.labels
@@ -1784,17 +2343,21 @@ export class Engine {
     if (sem !== undefined && semVec.length > 0 && !noStore && r.raw !== true && (this.semanticCfg.cache_tool_call_responses || !hasToolCalls(r.body))) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? undefined : parseTtl(ttlHeader)
-      if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, r.body, r.contentType, ttl ?? this.semanticCfg.ttl_ms)
-      else sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttl)
+      const origin: CacheOrigin = { provider: r.provider, model: r.model, inputTokens: r.promptTokens }
+      if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, r.body, r.contentType, ttl ?? this.semanticCfg.ttl_ms, origin)
+      else sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttl, origin, semKey)
     }
     if (cache !== undefined && !noStore && r.raw !== true) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? this.cacheTtlMs : parseTtl(ttlHeader) ?? this.cacheTtlMs
-      cache.set(key, r.body, r.contentType, ttl)
+      cache.set(key, r.body, r.contentType, ttl, { provider: r.provider, model: r.model, inputTokens: r.promptTokens }, h.get("x-bf-cache-key") ?? "")
     }
     if (r.provider !== primary.provider || r.model !== primary.model) out.set("x-bf-fallback-used", r.provider + "/" + r.model)
     const idx = fallbackIndex(allowed, r.provider, r.model)
-    routedHeaders(&out, primary, r.provider, r.model, idx, model, r.upstreamMs, r.key ?? "", r.alias ?? "")
+    routedHeaders(&out, primary, r.provider, r.model, idx, model, r.upstreamMs, r.key ?? "", r.alias ?? "", r.aliasName ?? "", r.aliasFamily ?? "")
+    // the model a provider's server-side fallback answered with (Anthropic usage iterations)
+    const served = r.served ?? ""
+    if (served !== "") out.set("x-bifrost-routing-info-server-side-fallback-model", served)
     // a semantic lookup that missed still says which upstream answered and what it counted
     if (sem !== undefined && semVec.length > 0) {
       out.set("x-bifrost-cache-provider-used", r.provider)
@@ -1814,16 +2377,47 @@ export class Engine {
     metrics.observeOverheadComponent(ul, "conversion", convertUs)
     metrics.observeOverheadComponent(ul, "miscellaneous", Math.max(0.0, overheadUs - (govUs + cacheUs + routeUs + convertUs)))
     out.set("x-bf-overhead-us", "" + Math.round(overheadUs))
+    // the same measurements as spans for the otel plugin: the request span's overhead, and each stage
+    const epochAt = (p: f64): f64 => Date.now() - (performance.now() - p)
+    ctx.overheadUs = overheadUs
+    ctx.stages = [
+      { name: "plugin.routing.prehook", startMs: epochAt(tRoute), durUs: routeUs },
+      { name: "plugin.governance.prehook", startMs: epochAt(tGov), durUs: govUs },
+      { name: "convertor", startMs: epochAt(tAtt), durUs: convertUs },
+    ]
+    if (cache !== undefined) ctx.stages.push({ name: "plugin.semantic_cache.prehook", startMs: epochAt(tCache), durUs: cacheUs })
     ctx.provider = r.provider
     ctx.promptTokens = r.promptTokens
     ctx.completionTokens = r.completionTokens
     ctx.cost = cost
-    if (this.logStore !== undefined) ctx.output = r.body
+    if (this.logStore !== undefined) {
+      ctx.output = r.body
+      ctx.stopReason = stopReasonOf(r.body)
+      ctx.toolNames = toolCallNamesOf(r.body)
+    }
     return respond(200, r.body, out)
   }
 
+  // Reads the datasheet row of each target into the plan. A failed read leaves the row unknown.
+  async compatLoad(cp: CompatPlan, refs: ModelRef[]): Promise<void> {
+    const look = this.paramsLookup
+    for (const r of refs) {
+      const key = r.provider + "/" + r.model
+      if (cp.has(key)) continue
+      let rec: string | undefined = undefined
+      if (look !== undefined) {
+        try {
+          rec = await look(r.model)
+        } catch (e) {
+          rec = undefined
+        }
+      }
+      cp.put(key, rec)
+    }
+  }
+
   // The best vector-store entry for a scope; a store error is a miss.
-  async vectorLookup(scope: string, v: f64[], threshold: f64): Promise<{ body: string, contentType: string, score: f64 } | undefined> {
+  async vectorLookup(scope: string, v: f64[], threshold: f64): Promise<{ id: string, body: string, contentType: string, score: f64, origin?: CacheOrigin } | undefined> {
     const vs = this.vstore
     if (vs === undefined) return undefined
     try {
@@ -1833,20 +2427,28 @@ export class Engine {
       }
       const hit = await vs.search(this.vsNs, v, threshold, [{ key: "scope", eq: scopeTag(scope) }])
       if (hit === undefined) return undefined
-      return { body: hit.payload.get("body") ?? "", contentType: hit.payload.get("contentType") ?? "application/json", score: hit.score }
+      const pl = hit.payload
+      const provider = pl.get("origin_provider") ?? ""
+      const origin: CacheOrigin | undefined = provider === "" ? undefined : { provider: provider, model: pl.get("origin_model") ?? "", inputTokens: parseInt(pl.get("origin_input_tokens") ?? "") ?? 0 }
+      return { id: hit.id, body: pl.get("body") ?? "", contentType: pl.get("contentType") ?? "application/json", score: hit.score, origin: origin }
     } catch (e) {
       console.error(`raiju: vector_store search: ${e.message}`)
       return undefined
     }
   }
 
-  async vectorStore(scope: string, v: f64[], body: string, contentType: string, ttlMs: int): Promise<void> {
+  async vectorStore(scope: string, v: f64[], body: string, contentType: string, ttlMs: int, origin?: CacheOrigin): Promise<void> {
     const vs = this.vstore
     if (vs === undefined || !this.vsReady) return
     const payload: Map<string, string> = new Map()
     payload.set("scope", scopeTag(scope))
     payload.set("body", body)
     payload.set("contentType", contentType)
+    if (origin !== undefined) {
+      payload.set("origin_provider", origin.provider)
+      payload.set("origin_model", origin.model)
+      payload.set("origin_input_tokens", "" + origin.inputTokens)
+    }
     try {
       await vs.add(this.vsNs, newId("sc-"), v, payload, ttlMs)
     } catch (e) {
@@ -1865,7 +2467,22 @@ export class Engine {
     return cl?.disable_content_logging === true
   }
 
-  // Request duration metric, stdout log line, log store entry and trace span for one request.
+  // The raw upstream bodies that logs and log exports keep get the guardrail redaction too, as the
+  // content fields do (Bifrost: stored log fields and exports carry the redacted payload). A response
+  // also gets the local output rules that redact, the same rules that rewrite a streamed answer.
+  redactRaw(raw: string, response: bool): string {
+    let body = raw
+    const g = this.guard
+    if (g !== undefined && g.mode === "redact") body = applyToText(body, g).body
+    if (response) {
+      for (const p of this.guardProviders) {
+        if (!appliesTo(p, "output") || !(p.kind === "regex" || p.kind === "secrets")) continue
+        body = applyRegex(body, this.localRules.get(p.id) ?? []).body
+      }
+    }
+    return body
+  }
+
   record(c: ReqCtx): void {
     const ms = performance.now() - c.started
     const ok = c.status >= 200 && c.status < 300
@@ -1879,19 +2496,48 @@ export class Engine {
       const e: LogEntry = {
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
         latency_ms: ms, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, cache_hit: c.cached,
-        virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, error: c.error === "" ? undefined : c.error,
+        virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, team_id: c.teamId === "" ? undefined : c.teamId,
+        customer_id: c.customerId === "" ? undefined : c.customerId, business_unit_id: c.businessUnitId === "" ? undefined : c.businessUnitId,
+        project_id: c.projectId === "" ? undefined : c.projectId, error: c.error === "" ? undefined : c.error,
         input: c.input === "" || c.contentOff ? undefined : c.input, output: c.output === "" || c.contentOff ? undefined : c.output,
+        metadata: c.meta, parent_request_id: c.parentId === "" ? undefined : c.parentId, agent_correlation_id: c.agentId === "" ? undefined : c.agentId,
+        app: c.app === "" ? undefined : c.app, user_agent: c.userAgent === "" ? undefined : c.userAgent, maxim: c.maximIds, maxim_tags: c.maximTags,
       }
       for (const q of this.exportQueues) q.add(e)
     }
     if (store !== undefined) {
+      // the routing the request took (the labels hold the key, the rule and the tier; the engine is the rule's
+      // when one matched, else the key picked by weight)
+      const lb = c.labels
+      // a key configured without an id is recorded by its name
+      const keyRef = lb.selectedKeyId !== "" ? lb.selectedKeyId : lb.selectedKeyName
+      const engine = lb.routingRuleId !== "" ? "routing-rule" : keyRef !== "" ? "loadbalancing" : ""
       store.add({
-        raw_request: c.contentOff || c.rawRequest === "" ? undefined : c.rawRequest,
-        raw_response: c.contentOff || c.rawResponse === "" ? undefined : c.rawResponse,
+        selected_key_id: keyRef === "" ? undefined : keyRef,
+        selected_key_name: lb.selectedKeyName === "" ? undefined : lb.selectedKeyName,
+        routing_rule_id: lb.routingRuleId === "" ? undefined : lb.routingRuleId,
+        routing_engine_used: engine === "" ? undefined : engine,
+        alias: lb.alias === "" ? undefined : lb.alias,
+        complexity_tier: lb.complexityTier === "" ? undefined : lb.complexityTier,
+        complexity_mechanism: lb.complexityMechanism === "" ? undefined : lb.complexityMechanism,
+        cache_hit_type: c.cacheType === "" ? undefined : c.cacheType,
+        stop_reason: c.stopReason === "" ? undefined : c.stopReason,
+        tool_call_names: c.toolNames.length === 0 ? undefined : c.toolNames,
+        complexity_score: c.complexityScore,
+        selected_prompt_id: c.promptId === "" ? undefined : c.promptId,
+        selected_prompt_name: c.promptName === "" ? undefined : c.promptName,
+        selected_prompt_version: c.promptVersion,
+        raw_request: c.contentOff || c.rawRequest === "" ? undefined : this.redactRaw(c.rawRequest, false),
+        raw_response: c.contentOff || c.rawResponse === "" ? undefined : this.redactRaw(c.rawResponse, true),
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
         latency_ms: ms, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, cache_hit: c.cached,
-        virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, error: c.error === "" ? undefined : c.error,
+        virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, team_id: c.teamId === "" ? undefined : c.teamId,
+        customer_id: c.customerId === "" ? undefined : c.customerId, business_unit_id: c.businessUnitId === "" ? undefined : c.businessUnitId,
+        project_id: c.projectId === "" ? undefined : c.projectId, error: c.error === "" ? undefined : c.error,
+        session_id: c.sessionId === "" ? undefined : c.sessionId, user_id: c.userId === "" ? undefined : c.userId,
         input: c.input === "" || c.contentOff ? undefined : c.input, output: c.output === "" || c.contentOff ? undefined : c.output,
+        metadata: c.meta, parent_request_id: c.parentId === "" ? undefined : c.parentId, agent_correlation_id: c.agentId === "" ? undefined : c.agentId,
+        app: c.app === "" ? undefined : c.app, user_agent: c.userAgent === "" ? undefined : c.userAgent, maxim: c.maximIds, maxim_tags: c.maximTags,
       })
     }
     const tracer = this.tracer
@@ -1900,8 +2546,11 @@ export class Engine {
       genAiAttributes(span, { system: c.provider, operation: c.op, requestModel: c.model, inputTokens: c.promptTokens, outputTokens: c.completionTokens })
       span.setInt("http.response.status_code", c.status)
       span.setBool("raiju.cache_hit", c.cached)
+      const ov = c.overheadUs
+      if (ov !== undefined) span.setNum("bifrost.overhead.duration_ms", ov / 1000.0)
       if (!ok) span.fail(c.error === "" ? `HTTP ${c.status}` : c.error)
       span.end(Date.now())
+      tracer.addStages(span, c.stages)
       tracer.finish(span)
       if (tracer.shouldFlush(Date.now())) this.flushTraces(tracer)
     }
@@ -1950,8 +2599,14 @@ export class Engine {
       const real = injectedChatName(this.cfg, name) ?? name
       const tv = checkToolCall(this.toolGuards, real, args)
       if (!tv.allowed) return { text: `blocked by guardrails: ${tv.reason}`, isError: true }
+      const h = snapshot(req.headers)
+      const gate = this.toolGate(m, h, real)
+      if (gate.kind === "denial") return { text: gate.message, isError: true }
+      const ua = try await this.userAuth(real, h, false)
+      if (ua.kind === "denial") return { text: ua.message, isError: true }
       const t0 = performance.now()
-      const r = try await m.execute(real, args)
+      const r = try await this.runUser(m, real, args, h, ua)
+      this.chargeTool(m, gate, real)
       timedMcp(m, real, t0, r.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", real, r.isError ? "error" : "success"), 1.0)
       return { text: r.text, isError: r.isError }
@@ -1977,6 +2632,8 @@ export class Engine {
     // reversible redaction: one vault per request, so the response restores to this request's values
     const vault = new Vault()
     const reversible = guard !== undefined && guard.mode === "redact" && this.cfg.guardrails?.reversible === true
+    // the prompt the request named and the version it got, for the request log
+    let promptUsed: Applied | undefined = undefined
     try {
       if (guard !== undefined && this.guardInput && reversible) {
         text = try tokenizeChatRequest(text, guard, vault)
@@ -2005,6 +2662,17 @@ export class Engine {
       }
       text = try this.withMcpTools(text, snapshot(req.headers))
       body = fields(text)
+      // the prompt named by x-bf-prompt-id goes before the messages (prompts.tov)
+      const ph = snapshot(req.headers)
+      if (ph.get("x-bf-prompt-id") !== undefined) {
+        const vk = this.gov.findKey(ph)
+        const applied = try applyPrompt(this.cfg.prompt_repo, ph, text, { budgetPercent: this.gov.budgetFraction(vk) * 100.0, tokensPercent: this.gov.rateFraction(vk, "token") * 100.0, requestsPercent: this.gov.rateFraction(vk, "request") * 100.0 })
+        if (applied.prompt_id !== undefined) {
+          text = applied.text
+          body = try fields(text)
+          promptUsed = applied
+        }
+      }
       // a key's access profile may cap max_tokens
       const cap = this.gov.policyFor(snapshot(req.headers))?.maxTokens
       if (cap !== undefined) {
@@ -2020,6 +2688,16 @@ export class Engine {
           }
         }
         if (changed) text = build(body)
+      }
+      // x-bf-passthrough-extra-params: true merges the body's extra_params object into the request, so
+      // provider fields that are not in the chat schema reach the provider (Bifrost's SDK gate)
+      if (req.headers.get("x-bf-passthrough-extra-params") === "true") {
+        const ep = find(body, "extra_params")
+        if (ep !== undefined && ep.startsWith("{")) {
+          for (const f of try fields(ep)) setField(&body, f.key, f.raw)
+          body = without(body, ["extra_params"])
+          text = build(body)
+        }
       }
     } catch (e) {
       return errorResponse(400, `invalid chat request: ${e.message}`, "invalid_request_error", noHeaders())
@@ -2061,58 +2739,87 @@ export class Engine {
       }
     }
     const autoCache = this.autoPromptCache || req.headers.get("x-bf-prompt-cache-auto-inject") === "true"
-    // Usage is always requested from streaming upstreams, for budgets and metrics.
-    let streamBody = body.slice()
-    if (stream) setField(&streamBody, "stream_options", `{"include_usage":true}`)
     const canPipe = stream && sink !== undefined
     // a provider's own prompt_cache.auto_inject turns the breakpoints on for its requests
     const autoFor = (t: Target): bool => autoCache || (t.cfg.prompt_cache?.auto_inject ?? false)
-    const build: Build = (t) => {
+    // compat: the request for each target, shaped in build (drops and fits, and Responses when the model needs it)
+    const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined), "chat", stream)
+    const sendChat: ChatSender = (t, b, tc) => {
+      // Usage is always requested from streaming upstreams, for budgets and metrics.
+      let streamBody = b.slice()
+      if (stream) setField(&streamBody, "stream_options", `{"include_usage":true}`)
       if (stream && providers.streamsNatively(t.kind)) return openai.chatRequest(t, try this.withInjected(t, streamBody))
       if (stream) {
         const plain = try this.withInjected(t, streamBody.filter((f) => f.key !== "stream" && f.key !== "stream_options"))
         // with a streaming client, Anthropic, Gemini and Bedrock stream too and are converted as they go
         if (canPipe) {
-          const su = try providers.streamUpstream(t, try typed.get(), plain, autoFor(t))
+          const su = try providers.streamUpstream(t, try tc.get(), plain, autoFor(t))
           if (su !== undefined) return su
         }
         // otherwise called without streaming and replayed as SSE below
-        return try providers.chatUpstream(t, try typed.get(), plain, autoFor(t))
+        return try providers.chatUpstream(t, try tc.get(), plain, autoFor(t))
       }
-      if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, try this.withInjected(t, body))
-      return try providers.chatUpstream(t, try typed.get(), try this.withInjected(t, body), autoFor(t))
+      if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, try this.withInjected(t, b))
+      return try providers.chatUpstream(t, try tc.get(), try this.withInjected(t, b), autoFor(t))
+    }
+    const build: Build = (t) => {
+      const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      if (sh.route === "responses") return openai.responsesRequest(t, streamedBody(sh.body, canPipe))
+      return try sendChat(t, sh.body, sh.changed ? new LazyChat(sh.text) : typed)
     }
     const outGuard = this.guardOutput ? guard : undefined
     const pluginRun = run
     const pluginChain = chain
     const translate: Translate = (t, text, requested) => {
       if (!stream) {
-        const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        const sh = try cp.shape(t.provider, t.kind, t.model, body)
+        let src = text
+        if (sh.route === "responses") {
+          const rc = try responseToChat(text, requested)
+          src = rc.body
+        }
+        const tr = try providers.chatTranslate(t.kind, t.model, src, requested, false)
         let out = tr.body
         if (pluginChain !== undefined && pluginRun !== undefined) out = pluginChain.runPost(&pluginRun.ctx, 200, out).body
         if (reversible) out = try restoreCompletion(out, vault)
-        if (outGuard === undefined) return { body: out, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+        if (outGuard === undefined) return { body: out, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served, billed: tr.billed }
         const g = try applyToCompletion(out, outGuard)
         for (const f of g.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, outGuard.mode), 1.0)
         if (g.blocked) throw new SyntaxError("the response was blocked by guardrails")
-        return { body: g.body, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+        return { body: g.body, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served, billed: tr.billed }
+      }
+      // a chat request converted to Responses, answered whole (not piped): its chat completion, as SSE
+      const shs = try cp.shape(t.provider, t.kind, t.model, body)
+      if (shs.route === "responses") {
+        const rc = try responseToChat(text, requested)
+        return { body: try this.guardWhole(try completionToSse(rc.body, wantUsage), "chat", guardOn), promptTokens: rc.promptTokens, completionTokens: rc.completionTokens }
       }
       if (providers.streamsNatively(t.kind)) {
         const tr = openai.streamResponse(text, requested)
-        return { body: wantUsage ? tr.body : dropUsageChunks(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+        return { body: try this.guardWhole(wantUsage ? tr.body : dropUsageChunks(tr.body), "chat", guardOn), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
       const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
-      return { body: try completionToSse(tr.body, wantUsage), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+      return { body: try this.guardWhole(try completionToSse(tr.body, wantUsage), "chat", guardOn), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
     }
     // With a sink, OpenAI-format upstreams stream straight through as chunks arrive.
     const dropUsage = !wantUsage
+    // local output guardrails (regex and secrets) check the stream as it accumulates (guard_stream.tov)
+    const outGuards = stream ? this.streamGuards(guardOn) : []
+    const jsonOn = stream && this.jsonStreamOn
+    const guardedConv = (c: StreamConverter): StreamConverter => {
+      if (outGuards.length > 0) c.guard = new OutputStreamGuard(outGuards, "chat")
+      if (jsonOn) c.jsonFix = new JsonStreamFixer()
+      return c
+    }
     const mk: ConverterFactory = (t, requested) => {
       if (!streamable(t)) return undefined
+      // a chat request converted to Responses: the Responses events come out as chat chunks
+      if (cp.routeFor(t.provider, t.kind, t.model) === "responses") return guardedConv(new StreamConverter("responses", requested, wantUsage))
       const conv = new StreamConverter(converterKind(t), requested, !dropUsage)
       conv.stopAtFinish = quirkStopsAtFinish(t)
-      return conv
+      return guardedConv(conv)
     }
-    const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk)
+    const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk, cp, promptUsed)
     // external output guardrails see the whole answer, so they apply to non-streamed answers
     if (!guardOn || this.guardProviders.length === 0 || stream || res.status !== 200) return res
     let answer = ""
@@ -2149,7 +2856,7 @@ export class Engine {
     return try await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
   }
 
-  async completions(req: Request): Promise<Response> {
+  async completions(req: Request, sink?: StreamSink): Promise<Response> {
     const text = await req.text()
     let body: Field[] = []
     try {
@@ -2158,12 +2865,46 @@ export class Engine {
       return errorResponse(400, `invalid completions request: ${e.message}`, "invalid_request_error", noHeaders())
     }
     const stream = rawBool(body, "stream") ?? false
+    const wantUsage = streamUsage(body)
+    const canPipe = stream && sink !== undefined
+    const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined), "completions", stream)
     const build: Build = (t) => {
+      const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      if (sh.route === "chat") return try textAsChat(t, sh, stream, canPipe)
       if (!providers.streamsNatively(t.kind)) throw new SyntaxError(`${t.provider} does not serve text completions`)
-      return openai.completionsRequest(t, body)
+      return openai.completionsRequest(t, sh.body)
     }
-    const translate: Translate = (t, text, requested) => stream ? openai.streamResponse(text, requested) : try openai.chatResponse(text, requested)
-    return try await this.serve(req, "completions", undefined, body, text, build, translate, stream)
+    const translate: Translate = (t, text, requested) => {
+      const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      if (sh.route === "chat") {
+        // a chat answer read whole: a stream was sent as SSE (not piped), or a call made without streaming
+        if (text.startsWith("data:")) {
+          const sr = openai.streamResponse(text, requested)
+          return { body: try this.guardWhole(chatSseToText(sr.body), "text", stream), promptTokens: sr.promptTokens, completionTokens: sr.completionTokens }
+        }
+        const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        if (!stream) return { body: try chatToText(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+        return { body: try this.guardWhole(chatSseToText(try completionToSse(tr.body, wantUsage)), "text", true), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+      }
+      if (stream) {
+        const sr = openai.streamResponse(text, requested)
+        return { body: try this.guardWhole(sr.body, "text", true), promptTokens: sr.promptTokens, completionTokens: sr.completionTokens }
+      }
+      if (sh.route !== "chat") return try openai.chatResponse(text, requested)
+      const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+      return { body: try chatToText(tr.body), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+    }
+    // a text completion sent to a chat model streams as text_completion chunks, converted as they arrive
+    // the local output guards check the streamed text (guard_stream.tov), in the text completion frames
+    const tg = stream ? this.streamGuards(true) : []
+    const mk: ConverterFactory = (t, requested) => {
+      if (!streamable(t)) return undefined
+      const conv = new StreamConverter(converterKind(t), requested, wantUsage)
+      conv.txt = cp.routeFor(t.provider, t.kind, t.model) === "chat"
+      if (tg.length > 0) conv.guard = new OutputStreamGuard(tg, "text")
+      return conv
+    }
+    return try await this.serve(req, "completions", undefined, body, text, build, translate, stream, undefined, canPipe ? sink : undefined, mk, cp)
   }
 }
 
@@ -2260,6 +3001,20 @@ test("does_not_send_done_marker without wait_for_usage ends at finish_reason", (
   expect(conv.promptTokens()).toBe(0)
 })
 
+test("a Responses stream and a chat stream answering a text completion come out as their chunks", () => {
+  const rc = new StreamConverter("responses", "openai/m", false)
+  const rsse = "event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"response\":{}}\n\n"
+  const rout = rc.push(new TextEncoder().encode(rsse)) + rc.end()
+  expect(rout.includes(`"delta":{"content":"hi"}`)).toBe(true)
+  expect(rout.endsWith("data: [DONE]\n\n")).toBe(true)
+  const tc = new StreamConverter("openai", "openai/m", false)
+  tc.txt = true
+  const csse = `data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"yo"},"finish_reason":null}]}\n\n`
+  const tout = tc.push(new TextEncoder().encode(csse)) + tc.end()
+  expect(tout.includes(`"text":"yo"`) && tout.includes(`"object":"text_completion"`)).toBe(true)
+  expect(tout.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
 test("finishes sees a non-null finish_reason only", () => {
   expect(finishes(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`)).toBe(true)
   expect(finishes(`{"choices":[{"delta":{"content":"a"},"finish_reason":null}]}`)).toBe(false)
@@ -2268,12 +3023,19 @@ test("finishes sees a non-null finish_reason only", () => {
 })
 
 test("per-provider limiters follow concurrency_and_buffer_size and carry over unchanged", () => {
+  const off: Map<string, ProviderConfig> = new Map()
+  off.set("plain", {})
+  expect(limitersFor({ providers: off, client: { drop_excess_requests: true } }).size).toBe(1)
+  expect(limitersFor({ providers: off }).size).toBe(0)
   const ps: Map<string, ProviderConfig> = new Map()
   ps.set("slow", { concurrency_and_buffer_size: { concurrency: 2, buffer_size: 4 } })
   ps.set("plain", {})
   const cfg: Config = { providers: ps, client: { drop_excess_requests: true } }
   const made = limitersFor(cfg)
-  expect(made.size).toBe(1)
+  // with drop on, the provider without a queue gets Bifrost's default one
+  expect(made.size).toBe(2)
+  expect(made.get("plain")!.limit).toBe(1000)
+  expect(made.get("plain")!.buffer).toBe(5000)
   expect(made.get("slow")!.limit).toBe(2)
   expect(made.get("slow")!.buffer).toBe(4)
   expect(made.get("slow")!.drop).toBe(true)
@@ -2301,4 +3063,19 @@ test("injected tools are named as configured and point at their MCP tool", () =>
   expect(injectedNames({ providers: ps }).includes("forecast")).toBe(true)
   expect(injectedChatName({ providers: ps }, "forecast")).toBe("weather-get_weather")
   expect(injectedChatName({ providers: ps }, "other") === undefined).toBe(true)
+})
+
+test("x-bf-mcp-include-tools: a list of client-tool names, client-* wildcards, and an empty list", () => {
+  const search = `{"type":"function","function":{"name":"search-find","parameters":{"type":"object"}}}`
+  const fetchTool = `{"type":"function","function":{"name":"search-fetch","parameters":{"type":"object"}}}`
+  const weather = `{"type":"function","function":{"name":"weather-get","parameters":{"type":"object"}}}`
+  expect(includeToolNames(" search-find, weather-* ,").join("|")).toBe("search-find|weather-*")
+  expect(includeToolNames("").length).toBe(0)
+  const one = ["search-find"]
+  expect(try toolInList(search, one)).toBe(true)
+  expect(try toolInList(fetchTool, one)).toBe(false)
+  expect(try toolInList(weather, ["weather-*"])).toBe(true)
+  expect(try toolInList(search, ["weather-*"])).toBe(false)
+  expect(try toolInList(search, ["search"])).toBe(false)
+  expect(try toolInList(search, [])).toBe(false)
 })

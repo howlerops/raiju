@@ -1,0 +1,107 @@
+// Which request headers go upstream to a provider: the x-bf-eh-<name> headers (as <name>) and,
+// when an allowlist is set, the listed headers as they are (Bifrost's header_filter_config).
+// Names are matched without regard to case; a trailing "*" matches a prefix and "*" every name.
+// The security denylist is always enforced, whatever the config says.
+
+import { Hdrs, hdrs } from "./schemas"
+import { HeaderFilterConfig } from "./config"
+
+// Headers that never go upstream from a caller, as Bifrost's securityDenylist (lib/ctx.go).
+const SECURITY_DENY: string[] = ["proxy-authorization", "cookie", "host", "content-length", "connection", "transfer-encoding", "x-api-key", "x-goog-api-key", "x-bf-api-key", "x-bf-api-key-id", "x-bf-vk", "x-bf-direct-key"]
+
+// One compiled pattern list: exact names, prefixes (from "x*") and the "*" wildcard.
+export type PatternSet = { exact: string[], prefixes: string[], all: bool }
+
+export function patternSet(list: string[] | undefined): PatternSet {
+  let out: PatternSet = { exact: [], prefixes: [], all: false }
+  for (const raw of list ?? []) {
+    const p = raw.trim().toLowerCase()
+    if (p === "") continue
+    if (p === "*") out.all = true
+    else if (p.endsWith("*")) out.prefixes.push(p.slice(0, p.byteLength - 1))
+    else out.exact.push(p)
+  }
+  return out
+}
+
+export function patternHas(ps: PatternSet, name: string): bool {
+  if (ps.all) return true
+  if (ps.exact.includes(name)) return true
+  for (const pre of ps.prefixes) {
+    if (name.startsWith(pre)) return true
+  }
+  return false
+}
+
+export function patternEmpty(ps: PatternSet): bool {
+  return !ps.all && ps.exact.length === 0 && ps.prefixes.length === 0
+}
+
+// The filter a config sets: its allowlist and denylist, lower-cased.
+export type HeaderFilter = { allow: PatternSet, deny: PatternSet }
+
+export function headerFilterOf(c: HeaderFilterConfig | undefined): HeaderFilter {
+  return { allow: patternSet(c?.allowlist), deny: patternSet(c?.denylist) }
+}
+
+// Bifrost's ShouldAllow: an allowlist, when set, must name the header; the denylist always wins.
+export function filterAllows(f: HeaderFilter, name: string): bool {
+  const n = name.toLowerCase()
+  if (SECURITY_DENY.includes(n)) return false
+  if (!patternEmpty(f.allow) && !patternHas(f.allow, n)) return false
+  if (patternHas(f.deny, n)) return false
+  return true
+}
+
+// The headers to send upstream, by their upstream name. x-bf-* headers other than x-bf-eh-*
+// are never forwarded, even when the allowlist names them.
+export function forwardedHeaders(h: Hdrs, f: HeaderFilter | undefined): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  const flt: HeaderFilter = f ?? { allow: patternSet(undefined), deny: patternSet(undefined) }
+  for (const key of h.keys()) {
+    const v = h.get(key)!
+    if (key.startsWith("x-bf-eh-")) {
+      const name = key.slice(8)
+      if (name !== "" && filterAllows(flt, name)) m.set(name, v)
+      continue
+    }
+    if (key.startsWith("x-bf-")) continue
+    if (!patternEmpty(flt.allow) && patternHas(flt.allow, key) && filterAllows(flt, key)) m.set(key, v)
+  }
+  return m
+}
+
+test("the x-bf-eh headers forward under their own name", () => {
+  const h: Hdrs = hdrs([["x-bf-eh-anthropic-beta", "a"], ["x-bf-eh-x-team", "t"], ["accept", "json"]])
+  const m = forwardedHeaders(h, undefined)
+  expect(m.get("anthropic-beta")).toBe("a")
+  expect(m.get("x-team")).toBe("t")
+  expect(m.has("accept")).toBe(false)
+})
+
+test("the security denylist is enforced whatever the config says", () => {
+  const h: Hdrs = hdrs([["x-bf-eh-x-bf-vk", "sk-bf-x"], ["x-bf-eh-cookie", "c"], ["x-bf-eh-x-api-key", "k"]])
+  const f = headerFilterOf({ allowlist: ["*"], denylist: [] })
+  expect(forwardedHeaders(h, f).size).toBe(0)
+})
+
+test("an allowlist limits x-bf-eh headers and a denylist removes names", () => {
+  const h: Hdrs = hdrs([["x-bf-eh-x-team", "t"], ["x-bf-eh-x-debug", "d"], ["x-bf-eh-x-trace-id", "i"]])
+  const f = headerFilterOf({ allowlist: ["x-team", "x-trace*"], denylist: ["X-Trace-ID"] })
+  const m = forwardedHeaders(h, f)
+  expect(m.has("x-team")).toBe(true)
+  expect(m.has("x-debug")).toBe(false)
+  expect(m.has("x-trace-id")).toBe(false)
+  expect(filterAllows(f, "X-TEAM")).toBe(true)
+})
+
+test("with an allowlist, listed plain headers forward as they are", () => {
+  const h: Hdrs = hdrs([["anthropic-beta", "b"], ["accept", "json"], ["x-bf-vk", "sk-bf-x"], ["x-bf-cache", "1"]])
+  const f = headerFilterOf({ allowlist: ["anthropic-beta", "x-bf-cache"] })
+  const m = forwardedHeaders(h, f)
+  expect(m.get("anthropic-beta")).toBe("b")
+  expect(m.has("accept")).toBe(false)
+  // reserved x-bf-* headers never forward directly
+  expect(m.has("x-bf-cache")).toBe(false)
+  expect(m.has("x-bf-vk")).toBe(false)
+})

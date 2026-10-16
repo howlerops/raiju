@@ -2,6 +2,7 @@
 // enterprise features). Pure logic: every call takes `now` in milliseconds, so
 // nothing here reads a clock or starts a timer and tests are deterministic.
 import { Field, fields, find, rawStr, rawBool, rawNum, elements, decodeString, quote } from "./json"
+import { CircuitPolicyConfig } from "./config"
 
 export type BreakerConfig = {
   failureThreshold: int,
@@ -40,6 +41,11 @@ export type CircuitPolicy = {
 }
 
 export type PolicyParse = { ok: bool, p: CircuitPolicy, err: string }
+
+// The id of one key's sub-circuit under a policy.
+function subCircuit(policy: string, key: string): string {
+  return policy + "/" + key
+}
 
 // Outcomes are counted per second, so the window keeps a few buckets, not every request.
 class Bucket {
@@ -251,6 +257,11 @@ export class Health {
     return true
   }
 
+  // Swaps in the policies of a config (its circuit_breaker_policies). Open circuits keep their state.
+  replacePolicies(list: CircuitPolicy[]): void {
+    this.policies = list
+  }
+
   // Replaces the policy called name. False when there is none.
   policyReplace(name: string, p: CircuitPolicy): bool {
     for (let i = 0; i < this.policies.length; i++) {
@@ -273,7 +284,25 @@ export class Health {
     if (!found) return false
     this.policies = keep
     this.reset(name)
+    // the policy's per-key sub-circuits go with it
+    for (const id of this.tracks.keys()) {
+      if (id.startsWith(name + "/")) this.tracks.delete(id)
+    }
     return true
+  }
+
+  // The circuits open or half-open now, with when each opened and when it next lets a check through
+  // (epoch ms). Policy sub-circuits are listed as "policy/key".
+  openCircuits(now: f64): { id: string, state: string, openedAt: f64, nextCheck: f64 }[] {
+    const out: { id: string, state: string, openedAt: f64, nextCheck: f64 }[] = []
+    for (const id of this.tracks.keys()) {
+      const t = this.tracks.get(id)!
+      const st = this.state(id, now)
+      if (st === "closed") continue
+      const cool = t.cooldownMs > 0 ? t.cooldownMs : this.cfg.openMs
+      out.push({ id: id, state: st, openedAt: t.openedAt, nextCheck: t.openedAt + cool })
+    }
+    return out
   }
 
   // Closes a circuit now, whatever its timer says. False when no circuit is tracked under id.
@@ -282,6 +311,16 @@ export class Health {
     if (t === undefined) return false
     closeBreaker(t)
     return true
+  }
+
+  // Closes every circuit now. Returns how many circuits are tracked.
+  resetAll(): int {
+    const ids = this.tracks.keys()
+    for (const id of ids) {
+      const t = this.tracks.get(id)
+      if (t !== undefined) closeBreaker(t)
+    }
+    return ids.length
   }
 
   // The policy whose open circuit reroutes requests for this primary provider and model, if any.
@@ -310,6 +349,18 @@ export class Health {
         const hv = headerGet(headers, p.cooldown_header)
         const ms = hv === undefined ? -1.0 : (parseFloat(hv) ?? -1.0)
         if (ms > 0.0) cool = Math.floor(ms)
+      }
+      // per-key sub-circuits (Bifrost's primary_key_ids): this key trips its own circuit, and the policy
+      // opens only once every listed key's circuit is open at the same time
+      if (p.primary_key_ids.length > 0) {
+        const kt = this.track(subCircuit(p.name, keyId))
+        kt.cooldownMs = cool
+        openBreaker(kt, now)
+        let every = true
+        for (const k of p.primary_key_ids) {
+          if (this.state(subCircuit(p.name, k), now) !== "open") every = false
+        }
+        if (!every) continue
       }
       const t = this.track(p.name)
       t.cooldownMs = cool
@@ -503,6 +554,26 @@ export function parsePolicy(body: string, pathName: string): PolicyParse {
   return { ok: true, p: p, err: "" }
 }
 
+// The policy as the config file keeps it (Bifrost's shape, default_cooldown as a Go duration in ms).
+export function policyConfigOf(p: CircuitPolicy): CircuitPolicyConfig {
+  const signals: { source: string, header_name: string, header_value?: string, header_contains?: string }[] = []
+  for (const s of p.signals) {
+    signals.push({ source: "response_header", header_name: s.header_name, header_value: s.header_value, header_contains: s.header_contains })
+  }
+  return {
+    name: p.name,
+    enabled: p.enabled,
+    primary_provider: p.primary_provider,
+    primary_model: p.primary_model,
+    primary_key_ids: p.primary_key_ids,
+    fallback_provider: p.fallback_provider,
+    fallback_model: p.fallback_model,
+    condition: { operator: p.operator, signals: signals },
+    default_cooldown: `${p.cooldown_ms}ms`,
+    cooldown_header: p.cooldown_header,
+  }
+}
+
 // The policy as Bifrost's API shows it: default_cooldown in nanoseconds.
 export function policyView(p: CircuitPolicy): string {
   const sig: string[] = []
@@ -547,6 +618,24 @@ function policyMatches(p: CircuitPolicy, headers: Map<string, string>): bool {
   }
   return and && p.signals.length > 0
 }
+
+test("a policy over several keys opens only once every listed key has tripped", () => {
+  const h = new Health()
+  const p: CircuitPolicy = { name: "quota", enabled: true, primary_provider: "azure", primary_model: "gpt", primary_key_ids: ["k1", "k2"], fallback_provider: "openai", fallback_model: "gpt", operator: "OR", signals: [{ header_name: "x-quota", header_contains: "exceeded" }], cooldown_ms: 60000, cooldown_header: "" }
+  expect(h.policyAdd(p)).toBe(true)
+  const hd = new Map<string, string>()
+  hd.set("x-quota", "exceeded")
+  const now = Date.now()
+  expect(h.policyObserve("azure", "gpt", "k1", hd, now).length).toBe(0)
+  expect(h.policyFallback("azure", "gpt", now) === undefined).toBe(true)
+  expect(h.policyObserve("azure", "gpt", "k2", hd, now).join(",")).toBe("quota")
+  expect(h.policyFallback("azure", "gpt", now)!.name).toBe("quota")
+  expect(h.openCircuits(now).some((c) => c.id === "quota/k1")).toBe(true)
+  expect(h.openCircuits(now).some((c) => c.id === "quota")).toBe(true)
+  // deleting the policy drops its sub-circuits too
+  expect(h.policyDelete("quota")).toBe(true)
+  expect(h.openCircuits(now).length).toBe(0)
+})
 
 test("policy bodies parse, validate and show Bifrost's shape", () => {
   const ok = parsePolicy(`{"name":"quota","primary_provider":"azure","primary_model":"gpt-4o","primary_key_ids":["k1"],"fallback_provider":"openai","fallback_model":"gpt-4o-mini","condition":{"signals":[{"source":"response_header","header_name":"x-quota","header_contains":"exceeded"}]},"default_cooldown":"5m"}`, "")
@@ -756,4 +845,28 @@ test("pickAdaptive selection is deterministic for a given r", () => {
   expect(pickAdaptive(ids, ws, h, 1000.0, 0.81)).toBe(1)
   expect(pickAdaptive(ids, ws, h, 1000.0, 0.9)).toBe(1)
   expect(pickAdaptive(ids, ws, h, 1000.0, 0.9)).toBe(1)
+})
+
+test("a policy round-trips through the config shape", () => {
+  const pol = parsePolicy(`{"name":"rt","primary_provider":"azure","primary_model":"m","primary_key_ids":["k1"],"fallback_provider":"openai","fallback_model":"n","condition":{"operator":"AND","signals":[{"source":"response_header","header_name":"X-A","header_contains":"full"},{"source":"response_header","header_name":"X-B","header_value":"1"}]},"default_cooldown":"5m","cooldown_header":"retry-after-ms"}`, "")
+  expect(pol.ok).toBe(true)
+  const c = policyConfigOf(pol.p)
+  expect(c.default_cooldown).toBe("300000ms")
+  const back = parsePolicy(JSON.stringify(c), "")
+  expect(back.ok).toBe(true)
+  expect(policyView(back.p)).toBe(policyView(pol.p))
+  expect(back.p.primary_key_ids.length).toBe(1)
+})
+
+test("replacePolicies swaps the list and keeps the open circuits", () => {
+  const h = new Health()
+  const pol = parsePolicy(`{"name":"keep","primary_provider":"a","primary_model":"m","fallback_provider":"b","fallback_model":"n","condition":{"signals":[{"source":"response_header","header_name":"x"}]},"default_cooldown":"10s"}`, "")
+  h.policyAdd(pol.p)
+  const hit: Map<string, string> = new Map()
+  hit.set("x", "1")
+  expect(h.policyObserve("a", "m", "", hit, 0.0).join(",")).toBe("keep")
+  h.replacePolicies([])
+  expect(h.policyList().length).toBe(0)
+  h.replacePolicies([pol.p])
+  expect(h.policyFallback("a", "m", 1000.0)?.name).toBe("keep")
 })

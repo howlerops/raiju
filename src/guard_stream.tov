@@ -1,0 +1,391 @@
+// Local output guardrails (regex and secrets) on a streamed answer: chat chunks, text completion chunks
+// or Responses events. The answer is checked as it accumulates: each text event adds its text, and the
+// whole answer so far is checked again. A block ends the stream with the error event the format uses,
+// in place of the event that completed the match and everything after it. Text already sent stays
+// sent, so the earliest a block can land is the event that completes the match.
+// A redact rule rewrites the text before it goes out. Text is released up to the last whitespace that
+// is at least HOLD bytes behind the newest text, so a match is seen whole unless it spans a release
+// point. Text still held goes out in an event built on the last text event, ahead of the next event
+// that carries no text (a finish chunk, a done event) or at the end of the stream. A Responses stream's
+// summary events repeat the whole answer, so they get the released text in place of the answer.
+
+import { CompiledRule, applyRegex } from "./guard_regex"
+import { compileLocal, localVerdict } from "./guard_local"
+import { Field, fields, elements, find, decodeString, quote, rawStr } from "./json"
+import { errorJson } from "./schemas"
+
+export type GuardedProvider = { id: string, rules: CompiledRule[] }
+
+// the format of a streamed answer on the wire
+export type StreamFormat = "chat" | "text" | "responses"
+
+// bytes of the newest text that are held back from release, and how far back a release point is looked for
+const HOLD = 256
+const SEARCH = 512
+
+type GuardHit = { id: string, reason: string }
+
+// The text of one event: the JSON string that holds it (raw, under key) and its decoded text.
+export type Piece = { key: string, raw: string, text: string }
+
+// The text of one event in the stream's format. undefined for an event that carries no text: a role, a
+// finish, a usage or a done event.
+export function pieceOf(ev: string, format: StreamFormat): Piece | undefined {
+  let body = ""
+  for (const line of ev.split("\n")) {
+    if (line.startsWith("data:")) body = line.slice(5).trim()
+  }
+  if (body === "" || body === "[DONE]") return undefined
+  try {
+    const fs = fields(body)
+    if (format === "responses") {
+      if (rawStr(fs, "type") !== "response.output_text.delta") return undefined
+      return stringPiece(fs, "delta")
+    }
+    const choices = find(fs, "choices")
+    if (choices === undefined) return undefined
+    const first = (try elements(choices))[0]
+    if (first === undefined) return undefined
+    const cf = try fields(first)
+    if (format === "text") return stringPiece(cf, "text")
+    const delta = find(cf, "delta")
+    if (delta === undefined) return undefined
+    return stringPiece(try fields(delta), "content")
+  } catch (e) {
+    return undefined
+  }
+}
+
+function stringPiece(fs: Field[], key: string): Piece | undefined {
+  const raw = find(fs, key)
+  if (raw === undefined || !raw.startsWith("\"")) return undefined
+  const text = try decodeString(raw)
+  return { key: key, raw: raw, text: text }
+}
+
+// The event with the JSON string `raw` under `key` replaced by `text`. undefined when the event does not
+// hold `raw` under that key.
+export function spliceText(ev: string, key: string, raw: string, text: string): string | undefined {
+  const at = ev.indexOf(`"${key}"`)
+  if (at < 0) return undefined
+  let rest = ev.slice(at + key.byteLength + 2, ev.byteLength)
+  while (rest.startsWith(":") || rest.startsWith(" ") || rest.startsWith("\t")) {
+    rest = rest.slice(1, rest.byteLength)
+  }
+  if (!rest.startsWith(raw)) return undefined
+  const head = ev.slice(0, ev.byteLength - rest.byteLength)
+  return head + quote(text) + rest.slice(raw.byteLength, rest.byteLength)
+}
+
+// The text one OpenAI chat chunk adds: choices[0].delta.content. "" for anything else, such as
+// [DONE], a role-only delta or an event that does not parse.
+export function deltaText(ev: string): string {
+  const p = pieceOf(ev, "chat")
+  return p === undefined ? "" : p.text
+}
+
+export class OutputStreamGuard {
+  // set when a block has ended the stream
+  stopped = false
+  // the provider whose block ended the stream
+  blockedBy = ""
+  // the kinds of the spans that redact rules rewrote, in order (for the findings metric)
+  kinds: string[] = []
+  private answer = ""
+  // bytes of the answer released so far (the text after them is held)
+  private cut = 0
+  // the redacted text released so far
+  private emitted = ""
+  private pending = ""
+  private redacting = false
+  // the last text event, the template for held text that goes out in an event of its own
+  private tpl: Piece | undefined = undefined
+  private tplEv = ""
+
+  constructor(readonly providers: GuardedProvider[], readonly format: StreamFormat) {
+    for (const p of providers) {
+      for (const r of p.rules) {
+        if (r.action === "redact") this.redacting = true
+      }
+    }
+  }
+
+  // The client's text for what the converter produced. Events pass through until a block; the
+  // block's error event replaces the rest of the stream.
+  filter(s: string): string {
+    if (this.stopped) return ""
+    this.pending += s
+    let out = ""
+    while (true) {
+      const i = this.pending.indexOf("\n\n")
+      if (i < 0) break
+      const ev = this.pending.slice(0, i + 2)
+      this.pending = this.pending.slice(i + 2, this.pending.byteLength)
+      const piece = pieceOf(ev, this.format)
+      if (piece === undefined) {
+        const held = this.release()
+        if (held === undefined) return out + this.block("redact", "the text could not be rewritten")
+        out += held + this.summary(ev)
+        continue
+      }
+      this.answer += piece.text
+      const hit = this.check()
+      if (hit !== undefined) return out + this.block(hit.id, hit.reason)
+      if (!this.redacting) {
+        out += ev
+        continue
+      }
+      // a finish event releases all the held text, so it goes out before the finish
+      const end = ev.includes("\"finish_reason\":\"") ? this.answer.byteLength : this.cutPoint()
+      const seg = this.answer.slice(this.cut, end)
+      this.cut = end
+      const built = this.emit(seg, ev, piece)
+      if (built === undefined) return out + this.block("redact", "the text could not be rewritten")
+      this.tpl = piece
+      this.tplEv = ev
+      out += built
+    }
+    return out
+  }
+
+  // The stream's last text: what is still pending goes out unless a block has ended the stream.
+  finish(s: string): string {
+    const out = this.filter(s)
+    if (this.stopped) return out
+    const rest = this.pending
+    this.pending = ""
+    const held = this.release()
+    if (held === undefined) return out + this.block("redact", "the text could not be rewritten")
+    return out + held + rest
+  }
+
+  private check(): GuardHit | undefined {
+    for (const p of this.providers) {
+      const v = localVerdict(p.rules, this.answer)
+      if (v.action === "block") return { id: p.id, reason: `${p.id}: ${v.reason}` }
+    }
+    return undefined
+  }
+
+  // The release point: the last whitespace at least HOLD bytes behind the newest text, looked for no
+  // further back than SEARCH bytes. The cut stays where it is when there is none.
+  private cutPoint(): int {
+    const limit = this.answer.byteLength - HOLD
+    let i = limit
+    while (i > this.cut && i > limit - SEARCH) {
+      const c = this.answer.slice(i - 1, i)
+      if (c === " " || c === "\n" || c === "\t" || c === "\r") return i
+      i -= 1
+    }
+    return this.cut
+  }
+
+  // The text still held, as an event built on the last text event ("" when nothing is held).
+  // undefined when that event cannot carry it.
+  private release(): string | undefined {
+    const tpl = this.tpl
+    if (!this.redacting || tpl === undefined || this.cut >= this.answer.byteLength) return ""
+    const seg = this.answer.slice(this.cut, this.answer.byteLength)
+    this.cut = this.answer.byteLength
+    return this.emit(seg, this.tplEv, tpl)
+  }
+
+  // The segment redacted and put in the text of `ev` (undefined when `ev` does not hold that text).
+  private emit(seg: string, ev: string, piece: Piece): string | undefined {
+    let red = seg
+    for (const p of this.providers) {
+      const r = applyRegex(red, p.rules)
+      if (r.body !== red) {
+        for (const f of r.findings) this.kinds.push(f.kind)
+      }
+      red = r.body
+    }
+    this.emitted += red
+    return spliceText(ev, piece.key, piece.raw, red)
+  }
+
+  // A Responses summary event repeats the whole answer: once the answer is redacted, it carries the
+  // redacted text.
+  private summary(ev: string): string {
+    if (!this.redacting || this.format !== "responses" || this.answer === "") return ev
+    const full = quote(this.answer)
+    if (!ev.includes(full)) return ev
+    return ev.split(full).join(quote(this.emitted))
+  }
+
+  private block(id: string, reason: string): string {
+    this.stopped = true
+    this.blockedBy = id
+    this.pending = ""
+    const msg = `response blocked by guardrails: ${reason}`
+    if (this.format === "responses") return `event: error\ndata: {"type":"error","code":"guardrail_violation","message":${quote(msg)},"param":null}\n\n`
+    return `data: ${errorJson(msg, "guardrail_violation", undefined)}\n\ndata: [DONE]\n\n`
+  }
+}
+
+// ---- tests ----
+
+function rx(pattern: string, action: "block" | "redact"): CompiledRule[] throws SyntaxError {
+  return try compileLocal({ id: "t", kind: "regex", patterns: [{ pattern: pattern, action: action }] })
+}
+
+// a phone rule with a description, so its redaction reads [REDACTED:PHONE]
+function phone(): CompiledRule[] throws SyntaxError {
+  return try compileLocal({ id: "pii", kind: "regex", patterns: [{ pattern: "\\d{3}-\\d{4}", description: "Phone", action: "redact" }] })
+}
+
+function chunk(content: string): string {
+  return `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":${JSON.stringify(content)}},"finish_reason":null}]}\n\n`
+}
+
+function textChunk(text: string): string {
+  return `data: {"id":"t1","object":"text_completion","choices":[{"index":0,"text":${JSON.stringify(text)},"finish_reason":null}]}\n\n`
+}
+
+function deltaEv(delta: string): string {
+  return `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":1,"delta":${JSON.stringify(delta)}}\n\n`
+}
+
+// The text the events of a stream carry, joined.
+function joined(out: string, format: StreamFormat): string {
+  let s = ""
+  for (const ev of out.split("\n\n")) {
+    const p = pieceOf(ev + "\n\n", format)
+    if (p !== undefined) s += p.text
+  }
+  return s
+}
+
+// The text of one event in a format, "<none>" when it carries none.
+function textOf(ev: string, format: StreamFormat): string {
+  const p = pieceOf(ev, format)
+  return p === undefined ? "<none>" : p.text
+}
+
+test("deltaText reads the content of a chat chunk and nothing else", () => {
+  expect(deltaText(chunk("Hi there"))).toBe("Hi there")
+  expect(deltaText(chunk("a \"quoted\" word"))).toBe("a \"quoted\" word")
+  expect(deltaText(`data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n`)).toBe("")
+  expect(deltaText(`data: {"choices":[{"index":0,"delta":{"content":null},"finish_reason":"stop"}]}\n\n`)).toBe("")
+  expect(deltaText("data: [DONE]\n\n")).toBe("")
+  expect(deltaText("event: ping\n\n")).toBe("")
+  expect(deltaText("data: {not json\n\n")).toBe("")
+})
+
+test("the text of a text completion chunk and of a Responses delta, and no text in other events", () => {
+  expect(textOf(textChunk("Hi"), "text")).toBe("Hi")
+  expect(textOf(textChunk("Hi"), "chat")).toBe("<none>")
+  expect(textOf(deltaEv("ok"), "responses")).toBe("ok")
+  expect(textOf(`event: response.created\ndata: {"type":"response.created","response":{"id":"r"}}\n\n`, "responses")).toBe("<none>")
+  expect(textOf(`event: response.output_text.done\ndata: {"type":"response.output_text.done","text":"ok"}\n\n`, "responses")).toBe("<none>")
+})
+
+test("spliceText replaces one JSON string and fails when the string is not there", () => {
+  const ev = `data: {"choices":[{"text": "Hel", "finish_reason":null}]}\n\n`
+  expect(spliceText(ev, "text", `"Hel"`, "[X]")).toBe(`data: {"choices":[{"text": "[X]", "finish_reason":null}]}\n\n`)
+  expect(spliceText(ev, "text", `"Nope"`, "[X]")).toBe(undefined)
+  expect(spliceText(ev, "delta", `"Hel"`, "[X]")).toBe(undefined)
+})
+
+test("a regex block that completes across events ends the stream with the error event", () => {
+  const p: GuardedProvider = { id: "words", rules: try rx("forbidden", "block") }
+  const g = new OutputStreamGuard([p], "chat")
+  const first = g.filter(chunk("This is for"))
+  expect(first).toBe(chunk("This is for"))
+  const second = g.filter(chunk("bidden fruit"))
+  expect(second.includes(`"content":"bidden`)).toBe(false)
+  expect(second.includes(`"type":"guardrail_violation"`)).toBe(true)
+  expect(second.includes(`response blocked by guardrails: words: found REGEX_MATCH`)).toBe(true)
+  expect(second.endsWith("data: [DONE]\n\n")).toBe(true)
+  expect(g.stopped).toBe(true)
+  expect(g.blockedBy).toBe("words")
+  expect(g.filter(chunk("more"))).toBe("")
+  expect(g.finish("")).toBe("")
+})
+
+test("a block in a text completion stream and in a Responses stream uses that format's error event", () => {
+  const p: GuardedProvider = { id: "words", rules: try rx("forbidden", "block") }
+  const t = new OutputStreamGuard([p], "text")
+  const tout = t.filter(textChunk("a forbidden word"))
+  expect(tout.includes(`"type":"guardrail_violation"`)).toBe(true)
+  expect(tout.endsWith("data: [DONE]\n\n")).toBe(true)
+  expect(tout.includes(`"text":"a forbidden`)).toBe(false)
+  const r = new OutputStreamGuard([p], "responses")
+  const rout = r.filter(deltaEv("a forbidden word"))
+  expect(rout.startsWith("event: error\ndata: {\"type\":\"error\",\"code\":\"guardrail_violation\"")).toBe(true)
+  expect(rout.includes("forbidden")).toBe(false)
+  expect(rout.endsWith("data: {\"type\":\"error\",\"code\":\"guardrail_violation\",\"message\":\"response blocked by guardrails: words: found REGEX_MATCH\",\"param\":null}\n\n")).toBe(true)
+})
+
+test("a clean stream passes through, and finish sends what is still pending", () => {
+  const p: GuardedProvider = { id: "words", rules: try rx("forbidden", "block") }
+  const g = new OutputStreamGuard([p], "chat")
+  const ev = chunk("all clear")
+  expect(g.filter(ev.slice(0, 20))).toBe("")
+  expect(g.filter(ev.slice(20))).toBe(ev)
+  expect(g.stopped).toBe(false)
+  expect(g.finish("data: [DONE]\n\n")).toBe("data: [DONE]\n\n")
+})
+
+test("a secret is blocked, and a redact rule does not stop the stream", () => {
+  const sec = new OutputStreamGuard([{ id: "sec", rules: try compileLocal({ id: "sec", kind: "secrets", action: "block" }) }], "chat")
+  expect(sec.filter(chunk("token ghp_qmzkpaxrtnbcwdhsyuvgjfleio0123456789")).includes("guardrail_violation")).toBe(true)
+  expect(sec.blockedBy).toBe("sec")
+  const red = new OutputStreamGuard([{ id: "pii", rules: try phone() }], "chat")
+  const out = red.filter(chunk("call 555-1234 now"))
+  expect(out.includes("555-1234")).toBe(false)
+  expect(red.stopped).toBe(false)
+  expect(joined(out + red.finish(""), "chat")).toBe("call [REDACTED:PHONE] now")
+})
+
+test("a redacted match split across events is redacted in the text the client gets", () => {
+  const g = new OutputStreamGuard([{ id: "pii", rules: try phone() }], "chat")
+  let out = ""
+  for (const piece of ["call 555-", "1234 now", " please"]) out += g.filter(chunk(piece))
+  out += g.finish("data: [DONE]\n\n")
+  expect(out.includes("555-1234")).toBe(false)
+  expect(joined(out, "chat")).toBe("call [REDACTED:PHONE] now please")
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+  expect(g.kinds).toEqual(["PHONE"])
+  expect(g.stopped).toBe(false)
+})
+
+test("a finish event that carries text releases the held text in its own text", () => {
+  const g = new OutputStreamGuard([{ id: "pii", rules: try phone() }], "text")
+  let out = g.filter(textChunk("call 555-")) + g.filter(textChunk("1234"))
+  out += g.filter(`data: {"id":"t1","object":"text_completion","choices":[{"index":0,"text":" now","finish_reason":"stop"}]}\n\n`)
+  out += g.finish("data: [DONE]\n\n")
+  expect(joined(out, "text")).toBe("call [REDACTED:PHONE] now")
+  expect(out.includes("555-1234")).toBe(false)
+  // the held text rides in the finish event itself, which is the last text event before the done event
+  expect(out.includes(`"text":"call [REDACTED:PHONE] now","finish_reason":"stop"`)).toBe(true)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("a long text stream releases text as it goes, and every match is redacted in order", () => {
+  const g = new OutputStreamGuard([{ id: "pii", rules: try phone() }], "text")
+  const words = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor "
+  let raw = ""
+  let out = ""
+  for (let k = 0; k < 40; k++) {
+    const piece = words.slice(0, 40) + (k === 10 ? "555-1234 " : k === 30 ? "999-0000 " : "")
+    raw += piece
+    out += g.filter(textChunk(piece))
+  }
+  // text went out before the stream ended
+  expect(joined(out, "text").byteLength > 0).toBe(true)
+  expect(out.includes("555-1234")).toBe(false)
+  out += g.finish("")
+  expect(joined(out, "text")).toBe(raw.split("555-1234").join("[REDACTED:PHONE]").split("999-0000").join("[REDACTED:PHONE]"))
+})
+
+test("a Responses stream redacts its deltas and the summary event that repeats the answer", () => {
+  const g = new OutputStreamGuard([{ id: "pii", rules: try phone() }], "responses")
+  let out = g.filter(deltaEv("call 555-")) + g.filter(deltaEv("1234 now"))
+  out += g.filter(`event: response.output_text.done\ndata: {"type":"response.output_text.done","text":"call 555-1234 now"}\n\n`)
+  out += g.finish(`event: response.completed\ndata: {"type":"response.completed","response":{"output":[]}}\n\n`)
+  expect(out.includes("555-1234")).toBe(false)
+  expect(joined(out, "responses")).toBe("call [REDACTED:PHONE] now")
+  expect(out.includes(`"text":"call [REDACTED:PHONE] now"`)).toBe(true)
+  expect(out.includes("event: response.completed")).toBe(true)
+})

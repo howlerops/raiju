@@ -6,7 +6,7 @@ import { listen, Http1Request, Http1Response } from "./http1"
 import { WsConnection } from "./ws"
 import { Engine, StreamSink } from "./gateway"
 import { Ops } from "./ops"
-import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel } from "./server"
+import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel, http1Upgrade } from "./server"
 import * as metrics from "./metrics"
 import { relayHttp1 } from "./realtime"
 
@@ -30,7 +30,8 @@ function toRequest(req: Http1Request, host: string): Request {
   const h: Record<string, string> = req.headers
   const url = "http://" + (req.headers.get("host") ?? host) + req.path
   if (req.method === "GET" || req.method === "HEAD") return new Request(url, { method: req.method, headers: h })
-  return new Request(url, { method: req.method, headers: h, body: req.body })
+  // the bytes, not the decoded text: a multipart upload carries binary files
+  return new Request(url, { method: req.method, headers: h, body: req.bytes })
 }
 
 async function write(res: Http1Response, r: Response): Promise<int> {
@@ -54,7 +55,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
   const request = toRequest(req, host)
   const t0 = performance.now()
   const label = pathLabel(pathOf(req.path))
-  const inBytes = req.body.byteLength * 1.0
+  const inBytes = req.bytes.length * 1.0
   try {
     const kind = streamingKind(req)
     if (kind !== "") {
@@ -67,12 +68,12 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       // Bifrost's http_* metrics; a streamed body counts as 0 bytes
       let n = 0
       if (!sink.started) n = await write(res, r)
-      metrics.observeHttp(label, req.method, r.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0)
+      metrics.observeHttp(label, req.method, r.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
       return
     }
     const r = await dispatch(engine, ops, request)
     const n = await write(res, r)
-    metrics.observeHttp(label, req.method, r.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0)
+    metrics.observeHttp(label, req.method, r.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
   } catch (e) {
     if (!res.finished) {
       const h: Map<string, string> = new Map()
@@ -88,9 +89,12 @@ export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): string
   const host = `${opts.hostname}:${opts.port}`
   const onUpgrade = (req: Http1Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void): bool => {
     const p = pathOf(req.path)
-    if (p !== "/v1/realtime" && p !== "/openai/v1/realtime") return false
-    relayHttp1(engine, toRequest(req, host), accept, reject)
-    return true
+    if ((p === "/v1/realtime" || p === "/openai/v1/realtime") && req.method === "GET") {
+      relayHttp1(engine, toRequest(req, host), accept, reject)
+      return true
+    }
+    // the other WebSocket routes (server.tov's wsUpgrade)
+    return http1Upgrade(engine, ops, toRequest(req, host), accept, reject)
   }
   listen({ hostname: opts.hostname, port: opts.port, maxBodyBytes: opts.maxBodyBytes, onUpgrade: onUpgrade }, (req, res) => {
     // runs as its own task; the response is finished from there

@@ -1,0 +1,347 @@
+// Decision emulation (Bifrost's convert_decision_to_responses): a decision for a model with no native
+// decisions endpoint is asked as one forced function call, emit_decision. Its parameters hold one object
+// per question, with the value (or choice or score), the probabilities and a confidence. The call's
+// arguments are read back into the canonical answers (decisions.tov), validated the way the native
+// answers are. Wording and schema follow Bifrost's core/providers/utils/decisionemulation.go.
+import { Field, fields, elements, find, rawStr, decodeString, quote, isNull, build } from "./json"
+import { DecisionReq, Question, Level, answerJson, renderResponse } from "./decisions"
+import { Translated } from "./providers/types"
+
+// The function the model is forced to call, and its description.
+export const EMIT_TOOL = "emit_decision"
+const EMIT_DESCRIPTION = "Emit the decision for every question. Fill each field from the given state."
+const SYSTEM_PROMPT = "You are a judgment engine. Read the given state and answer every question by calling the provided function exactly once. For each question emit the requested value and your confidence from 0 to 1. For every choice and score question also report the full probability distribution over its options or levels; the probabilities must sum to 1. For choice, select an option with the highest probability. Base every answer only on the state; do not invent facts."
+
+// A raw JSON value as prompt text: a string as it is, nothing for null, other JSON as it is.
+function textOf(raw: string): string throws SyntaxError {
+  if (raw === "null") return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  return raw
+}
+
+// The state as the user message: a string as it is, other states as their JSON.
+export function stateText(state: string): string throws SyntaxError {
+  if (state === "null") return ""
+  if (state.startsWith("\"")) return try decodeString(state)
+  return state
+}
+
+function confidenceSchema(): string {
+  return `{"type":"number","description":"Your confidence in this answer, from 0 to 1.","minimum":0,"maximum":1}`
+}
+
+// A closed object of one probability per key, each from 0 to 1, all of them required.
+function probabilitiesSchema(desc: string, keys: string[]): string {
+  let props: string[] = []
+  let req: string[] = []
+  for (const k of keys) {
+    props.push(quote(k) + `:{"type":"number","minimum":0,"maximum":1}`)
+    req.push(quote(k))
+  }
+  return `{"type":"object","description":${quote(desc)},"properties":{${props.join(",")}},"required":[${req.join(",")}],"additionalProperties":false}`
+}
+
+// A score level as the prompt names it: its meaning, with its label when the label is not the index.
+function levelText(i: int, l: Level): string throws SyntaxError {
+  const d = try textOf(l.desc)
+  if (l.label === `${i}`) return d
+  return d === "" ? l.label : l.label + ": " + d
+}
+
+// One question's property in the emitted schema.
+function questionSchema(q: Question): string throws SyntaxError {
+  const desc = try textOf(q.instructions)
+  if (q.type === "predicate") {
+    let sides: string[] = []
+    const t = try textOf(q.trueSide)
+    const f = try textOf(q.falseSide)
+    if (t !== "") sides.push("true=" + t)
+    if (f !== "") sides.push("false=" + f)
+    let meaning = ""
+    if (sides.length > 0) meaning = " Meaning (answer: meaning): " + sides.join(", ")
+    return `{"type":"object","properties":{"value":{"type":"number","description":${quote("Probability from 0 to 1. " + desc + meaning)},"minimum":0,"maximum":1},"confidence":${confidenceSchema()}},"required":["value"],"additionalProperties":false}`
+  }
+  if (q.type === "choice") {
+    let keys: string[] = []
+    let rubric = ""
+    for (const c of q.choices) {
+      keys.push(quote(c.key))
+      const d = try textOf(c.desc)
+      if (d !== "") rubric += (rubric === "" ? " Options (option: meaning): " : ", ") + c.key + "=" + d
+    }
+    const choiceDesc = desc + " Select an option with the highest probability." + rubric
+    const probs = probabilitiesSchema("Required. Probability for each option; values must sum to 1.", q.choices.map((c) => c.key))
+    return `{"type":"object","properties":{"choice":{"type":"string","enum":[${keys.join(",")}],"description":${quote(choiceDesc)}},"confidence":${confidenceSchema()},"probabilities":${probs}},"required":["choice","confidence","probabilities"],"additionalProperties":false}`
+  }
+  let parts: string[] = []
+  for (let i = 0; i < q.levels.length; i++) {
+    parts.push(`${i}=` + (try levelText(i, q.levels[i]!)))
+  }
+  const scoreDesc = desc + " Score levels (index -> meaning): " + parts.join(", ")
+  const probs = probabilitiesSchema("Required. Probability for each level index (\"0\", \"1\", ...); values must sum to 1.", indexKeys(q.levels.length))
+  return `{"type":"object","properties":{"value":{"type":"number","description":${quote(scoreDesc)},"minimum":0,"maximum":${q.levels.length - 1}},"confidence":${confidenceSchema()},"probabilities":${probs}},"required":["value","confidence","probabilities"],"additionalProperties":false}`
+}
+
+// "0", "1", ... for a score's levels: the keys of its probability map.
+function indexKeys(n: int): string[] {
+  let out: string[] = []
+  for (let i = 0; i < n; i++) out.push(`${i}`)
+  return out
+}
+
+// The parameters of emit_decision: one object property per question, named as the question is.
+export function emitParameters(d: DecisionReq): string throws SyntaxError {
+  let props: string[] = []
+  let req: string[] = []
+  for (const q of d.questions) {
+    props.push(quote(q.name) + ":" + (try questionSchema(q)))
+    req.push(quote(q.name))
+  }
+  return `{"type":"object","properties":{${props.join(",")}},"required":[${req.join(",")}]}`
+}
+
+// The Responses request that asks the model the decision: the state as the input, the judgment as the
+// instructions, emit_decision as the one tool, and a required tool call. Chat-only providers take it
+// through the chat conversion (responses.tov).
+export function emulationBody(d: DecisionReq, model: string): string throws SyntaxError {
+  const tool = `{"type":"function","name":${quote(EMIT_TOOL)},"description":${quote(EMIT_DESCRIPTION)},"parameters":${try emitParameters(d)}}`
+  return `{"model":${quote(model)},"instructions":${quote(SYSTEM_PROMPT)},"input":${quote(try stateText(d.state))},"tools":[${tool}],"tool_choice":"required"}`
+}
+
+// The arguments of the emit_decision call in a chat completion. A text answer that is a JSON object is
+// taken too, for models that answer without the call. More than one emit_decision call is refused.
+export function argumentsOf(chat: string): string throws SyntaxError {
+  const top = try fields(chat)
+  for (const c of try elements(find(top, "choices") ?? "[]")) {
+    const cf = try fields(c)
+    const msg = find(cf, "message")
+    if (msg === undefined || !msg.startsWith("{")) continue
+    const mf = try fields(msg)
+    const calls = find(mf, "tool_calls")
+    if (calls !== undefined && calls.startsWith("[")) {
+      let named: string[] = []
+      let all: string[] = []
+      for (const cl of try elements(calls)) {
+        const clf = try fields(cl)
+        const ff = try fields(find(clf, "function") ?? "{}")
+        const args = rawStr(ff, "arguments") ?? "{}"
+        all.push(args)
+        if (rawStr(ff, "name") === EMIT_TOOL) named.push(args)
+      }
+      if (named.length > 1) throw new SyntaxError(`model returned ${named.length} ${EMIT_TOOL} calls; expected exactly one`)
+      if (named.length === 1) return named[0]!
+      if (all.length === 1) return all[0]!
+      if (all.length > 1) throw new SyntaxError(`model returned ${all.length} tool calls with no ${EMIT_TOOL} call`)
+    }
+    const content = rawStr(mf, "content")
+    if (content !== undefined && content.trim().startsWith("{")) return content
+  }
+  throw new SyntaxError("model returned no decision function call or structured output")
+}
+
+// The probabilities of one answer, read in the order of the keys. Every key is required and nothing else
+// is allowed; the values must sum to about 1 and are normalized when they miss it by rounding.
+function distribution(name: string, raw: string | undefined, keys: string[]): number[] throws SyntaxError {
+  if (raw === undefined || !raw.startsWith("{")) throw new SyntaxError(`answer for "${name}" is missing probabilities`)
+  const pf = try fields(raw)
+  for (const f of pf) {
+    if (!keys.includes(f.key)) throw new SyntaxError(`probabilities for "${name}" contain unknown key "${f.key}"`)
+  }
+  let ps: number[] = []
+  let sum = 0.0
+  for (const k of keys) {
+    const p = find(pf, k)
+    if (p === undefined) throw new SyntaxError(`probabilities for "${name}" are missing key "${k}"`)
+    const n = parseFloat(p) ?? -1.0
+    if (!(n >= 0 && n <= 1)) throw new SyntaxError(`probability for "${name}" key "${k}" is outside [0,1]: ${p}`)
+    ps.push(n)
+    sum += n
+  }
+  if (!(Math.abs(sum - 1) <= 0.05 + 1e-12)) throw new SyntaxError(`probabilities for "${name}" sum to ${sum}, expected about 1`)
+  if (Math.abs(sum - 1) > 1e-12) {
+    for (let i = 0; i < ps.length; i++) ps[i] = ps[i]! / sum
+  }
+  return ps
+}
+
+// The canonical probability entries of a choice (by option) or a score (by level), in order.
+function choiceEntries(q: Question, ps: number[]): string {
+  let out: string[] = []
+  for (let i = 0; i < q.choices.length; i++) {
+    const c = q.choices[i]!
+    out.push(`{"value":${c.bool ? c.key : quote(c.key)},"probability":${ps[i]!}}`)
+  }
+  return "[" + out.join(",") + "]"
+}
+
+function scoreEntries(q: Question, ps: number[]): string {
+  let out: string[] = []
+  for (let i = 0; i < q.levels.length; i++) {
+    out.push(`{"value":${i},"label":${quote(q.levels[i]!.label)},"probability":${ps[i]!}}`)
+  }
+  return "[" + out.join(",") + "]"
+}
+
+// The confidence of an answer as raw JSON: required for choice and score, optional for a predicate.
+function confidenceOf(q: Question, af: Field[]): string throws SyntaxError {
+  const raw = find(af, "confidence")
+  if (raw === undefined || isNull(raw)) {
+    if (q.type !== "predicate") throw new SyntaxError(`answer for "${q.name}" is missing confidence`)
+    return ""
+  }
+  const c = parseFloat(raw) ?? -1.0
+  if (!(c >= 0 && c <= 1)) throw new SyntaxError(`confidence for "${q.name}" is outside [0,1]: ${raw}`)
+  return raw
+}
+
+// One answer, validated against its question and rendered in the canonical shape.
+function answerOf(q: Question, raw: string): string throws SyntaxError {
+  const af = try fields(raw)
+  const confidence = try confidenceOf(q, af)
+  if (q.type === "predicate") {
+    const v = find(af, "value")
+    const n = parseFloat(v ?? "") ?? -1.0
+    if (!(n >= 0 && n <= 1)) throw new SyntaxError(`answer for "${q.name}" carries no probability in [0,1]`)
+    return answerJson(q, v ?? "0", "", confidence)
+  }
+  if (q.type === "choice") {
+    const cv = find(af, "choice")
+    if (cv === undefined || !cv.startsWith("\"")) throw new SyntaxError(`choice answer for "${q.name}" carries no choice`)
+    const key = try decodeString(cv)
+    let idx = -1
+    for (let i = 0; i < q.choices.length; i++) {
+      if (q.choices[i]!.key === key) idx = i
+    }
+    if (idx < 0) throw new SyntaxError(`choice answer "${key}" for "${q.name}" is not an allowed option`)
+    const keys = q.choices.map((c) => c.key)
+    const ps = try distribution(q.name, find(af, "probabilities"), keys)
+    for (let i = 0; i < ps.length; i++) {
+      if (ps[i]! > ps[idx]!) throw new SyntaxError(`choice answer "${key}" for "${q.name}" does not have the highest probability`)
+    }
+    const opt = q.choices[idx]!
+    return answerJson(q, opt.bool ? opt.key : quote(opt.key), choiceEntries(q, ps), confidence)
+  }
+  const sv = find(af, "value")
+  if (sv === undefined || parseFloat(sv) === undefined) throw new SyntaxError(`score answer for "${q.name}" is not a number`)
+  const ps = try distribution(q.name, find(af, "probabilities"), indexKeys(q.levels.length))
+  // the score is the probability-weighted level index, so it cannot disagree with its own distribution
+  let derived = 0.0
+  for (let i = 0; i < ps.length; i++) derived += i * ps[i]!
+  return answerJson(q, `${derived}`, scoreEntries(q, ps), confidence)
+}
+
+// The answers to the decision's questions, in question order, from the emit_decision arguments.
+export function answersOf(args: string, d: DecisionReq): string[] throws SyntaxError {
+  const top = try fields(args)
+  let out: string[] = []
+  for (const q of d.questions) {
+    const raw = find(top, q.name)
+    if (raw === undefined || !raw.startsWith("{")) throw new SyntaxError(`model returned no answer for question "${q.name}"`)
+    out.push(try answerOf(q, raw))
+  }
+  return out
+}
+
+// The canonical decision response for an emulated answer. The chat completion is the model's reply (already
+// in chat shape); the usage is the call's own.
+export function emulatedDecision(chat: string, d: DecisionReq, requested: string, prompt: int, completion: int): Translated throws SyntaxError {
+  const answers = try answersOf(try argumentsOf(chat), d)
+  return { body: renderResponse(requested, answers, prompt, completion, ""), promptTokens: prompt, completionTokens: completion }
+}
+
+test("the emit_decision parameters: one object per question, named as the question is", () => {
+  const d: DecisionReq = {
+    model: "m",
+    state: `"hi"`,
+    questions: [
+      { type: "predicate", name: "is_frustrated", named: true, instructions: `"Is it?"`, trueSide: `"yes"`, falseSide: "", choices: [], levels: [] },
+      { type: "choice", name: "category", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [{ key: "billing", bool: false, desc: `"money"` }, { key: "bug", bool: false, desc: "null" }], levels: [] },
+    ],
+  }
+  const p = try emitParameters(d)
+  expect(p.startsWith(`{"type":"object","properties":{"is_frustrated":{"type":"object"`)).toBe(true)
+  expect(p.includes(`"required":["is_frustrated","category"]`)).toBe(true)
+  expect(p.includes(`"enum":["billing","bug"]`)).toBe(true)
+  expect(p.includes(`Options (option: meaning): billing=money`)).toBe(true)
+  expect(p.includes(`"true=yes"`) || p.includes(`true=yes`)).toBe(true)
+})
+
+test("the body is a Responses request with the state, the judgment and a required call", () => {
+  const d: DecisionReq = { model: "m", state: `[{"role":"user","content":"a"}]`, questions: [{ type: "predicate", name: "p", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [] }] }
+  const b = try emulationBody(d, "gpt-4o")
+  expect(b.startsWith(`{"model":"gpt-4o","instructions":"You are a judgment engine.`)).toBe(true)
+  expect(b.includes(`"input":"[{\\"role\\":\\"user\\",\\"content\\":\\"a\\"}]"`)).toBe(true)
+  expect(b.includes(`"tools":[{"type":"function","name":"emit_decision"`)).toBe(true)
+  expect(b.endsWith(`"tool_choice":"required"}`)).toBe(true)
+  const s: DecisionReq = { model: "m", state: `"plain text"`, questions: [] }
+  expect(try stateText(s.state)).toBe("plain text")
+})
+
+test("arguments: the emit_decision call is read, and a lone or a JSON text answer too", () => {
+  const call = `{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"emit_decision","arguments":"{\\"p\\":{\\"value\\":0.8}}"}}]}}]}`
+  expect(try argumentsOf(call)).toBe(`{"p":{"value":0.8}}`)
+  const text = `{"choices":[{"message":{"role":"assistant","content":"{\\"p\\":{\\"value\\":0.1}}"}}]}`
+  expect(try argumentsOf(text)).toBe(`{"p":{"value":0.1}}`)
+  const two = `{"choices":[{"message":{"tool_calls":[{"function":{"name":"emit_decision","arguments":"{}"}},{"function":{"name":"emit_decision","arguments":"{}"}}]}}]}`
+  let threw = ""
+  try {
+    try argumentsOf(two)
+  } catch (e) {
+    threw = e.message
+  }
+  expect(threw.includes("2 emit_decision calls")).toBe(true)
+  let none = ""
+  try {
+    try argumentsOf(`{"choices":[{"message":{"content":"plain"}}]}`)
+  } catch (e) {
+    none = e.message
+  }
+  expect(none.includes("no decision")).toBe(true)
+})
+
+test("answers: a predicate, a choice and a score come back canonical, and bad ones are refused", () => {
+  const d: DecisionReq = {
+    model: "m",
+    state: "null",
+    questions: [
+      { type: "predicate", name: "p", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [] },
+      { type: "choice", name: "c", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [{ key: "billing", bool: false, desc: "null" }, { key: "bug", bool: false, desc: "null" }], levels: [] },
+      { type: "score", name: "s", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [{ label: "0", desc: "null" }, { label: "1", desc: "null" }] },
+    ],
+  }
+  const args = `{"p":{"value":0.75,"confidence":0.9},"c":{"choice":"billing","confidence":0.8,"probabilities":{"billing":0.7,"bug":0.3}},"s":{"value":0.4,"confidence":0.5,"probabilities":{"0":0.6,"1":0.4}}}`
+  const out = try answersOf(args, d)
+  expect(out[0]).toBe(`{"type":"predicate","name":"p","probability":0.75,"confidence":0.9}`)
+  expect(out[1]).toBe(`{"type":"choice","name":"c","choice":"billing","probabilities":[{"value":"billing","probability":0.7},{"value":"bug","probability":0.3}],"confidence":0.8}`)
+  expect(out[2]).toBe(`{"type":"score","name":"s","score":0.4,"probabilities":[{"value":0,"label":"0","probability":0.6},{"value":1,"label":"1","probability":0.4}],"confidence":0.5}`)
+  const notHighest = `{"p":{"value":0.1},"c":{"choice":"bug","confidence":0.8,"probabilities":{"billing":0.7,"bug":0.3}},"s":{"value":0,"confidence":0.5,"probabilities":{"0":1,"1":0}}}`
+  let msg = ""
+  try {
+    try answersOf(notHighest, d)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg.includes("highest probability")).toBe(true)
+  let missing = ""
+  try {
+    try answersOf(`{"p":{"value":0.1,"confidence":0.5}}`, d)
+  } catch (e) {
+    missing = e.message
+  }
+  expect(missing.includes(`no answer for question "c"`)).toBe(true)
+  let badConf = ""
+  try {
+    try answersOf(`{"p":{"value":0.1,"confidence":2}}`, d)
+  } catch (e) {
+    badConf = e.message
+  }
+  expect(badConf.includes("outside [0,1]")).toBe(true)
+})
+
+test("an emulated decision renders the canonical response with the call's usage", () => {
+  const d: DecisionReq = { model: "m", state: "null", questions: [{ type: "predicate", name: "p", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [] }] }
+  const chat = `{"choices":[{"message":{"tool_calls":[{"function":{"name":"emit_decision","arguments":"{\\"p\\":{\\"value\\":0.5}}"}}]}}]}`
+  const r = try emulatedDecision(chat, d, "openai/gpt-4o", 12, 3)
+  expect(r.body).toBe(`{"model":"openai/gpt-4o","answers":[{"type":"predicate","name":"p","probability":0.5}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}`)
+  expect(r.promptTokens).toBe(12)
+})

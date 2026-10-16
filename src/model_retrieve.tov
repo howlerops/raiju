@@ -1,0 +1,97 @@
+// GET /v1/models/{model}: the provider's own model object, read as Bifrost's modelRetrieve
+// reads it. OpenAI-compatible providers, Anthropic and Gemini have a retrieve API. For the
+// others retrieveRequest is undefined, and server.tov keeps the entry from the model list.
+import { Target, Upstream, trimSlash } from "./providers/types"
+import * as openai from "./providers/openai"
+import * as anthropic from "./providers/anthropic"
+import * as gemini from "./providers/gemini"
+import { fields, find, elements, rawStr, rawNum, quote } from "./json"
+import { isoSeconds } from "./media_native"
+import { pctEncode } from "./cloud_auth"
+
+// The GET for one model on the provider's API, or undefined when the provider has no retrieve API.
+// The model is the id after the provider prefix; Gemini also takes "models/{id}".
+export function retrieveRequest(t: Target, model: string): Upstream | undefined {
+  if (openai.isOpenAICompatible(t.kind)) {
+    const list = openai.modelsRequest(t)
+    return { url: list.url + "/" + pctEncode(model), headers: list.headers, body: "" }
+  }
+  if (t.kind === "anthropic") {
+    const base = t.cfg.network_config?.base_url ?? "https://api.anthropic.com"
+    return { url: trimSlash(base) + "/v1/models/" + pctEncode(model), headers: anthropic.upstreamHeaders(t), body: "" }
+  }
+  if (t.kind === "gemini") {
+    const base = t.cfg.network_config?.base_url ?? "https://generativelanguage.googleapis.com"
+    const bare = model.startsWith("models/") ? model.slice(7) : model
+    return { url: trimSlash(base) + "/v1beta/models/" + pctEncode(bare), headers: gemini.upstreamHeaders(t), body: "" }
+  }
+  return undefined
+}
+
+// A ",key":value pair for an optional field, or "" when the value is absent.
+function opt(key: string, raw: string | undefined): string {
+  return raw === undefined ? "" : `,${quote(key)}:${raw}`
+}
+
+// The model object in Bifrost's shape from the provider's answer: the id as "provider/model", and the
+// metadata the provider gives (owner, name, description, token limits, supported methods). listed says
+// whether the model is in the list the gateway serves. Throws SyntaxError when the answer is not JSON.
+export function retrieveBody(provider: string, kind: string, text: string, listed: bool): string throws SyntaxError {
+  const fs = try fields(text)
+  const tail = `,"listed":${listed}}`
+  if (kind === "anthropic") {
+    const id = rawStr(fs, "id") ?? ""
+    const created = isoSeconds(rawStr(fs, "created_at") ?? "") ?? 0
+    const name = rawStr(fs, "display_name")
+    const maxIn = rawNum(fs, "max_input_tokens")
+    const maxOut = rawNum(fs, "max_tokens")
+    return `{"id":${quote(provider + "/" + id)},"object":"model","created":${created},"owned_by":${quote(provider)}` + opt("name", name === undefined ? undefined : quote(name)) + opt("max_input_tokens", maxIn === undefined ? undefined : `${maxIn}`) + opt("max_output_tokens", maxOut === undefined ? undefined : `${maxOut}`) + tail
+  }
+  if (kind === "gemini") {
+    const rawName = rawStr(fs, "name") ?? ""
+    const name = rawName.startsWith("models/") ? rawName.slice(7) : rawName
+    const display = rawStr(fs, "displayName")
+    const desc = rawStr(fs, "description")
+    const inTok = rawNum(fs, "inputTokenLimit")
+    const outTok = rawNum(fs, "outputTokenLimit")
+    const methods = find(fs, "supportedGenerationMethods")
+    return `{"id":${quote(provider + "/" + name)},"object":"model","owned_by":${quote(provider)}` + opt("name", display === undefined ? undefined : quote(display)) + opt("description", desc === undefined ? undefined : quote(desc)) + opt("context_length", inTok === undefined ? undefined : `${inTok}`) + opt("max_input_tokens", inTok === undefined ? undefined : `${inTok}`) + opt("max_output_tokens", outTok === undefined ? undefined : `${outTok}`) + opt("supported_methods", methods) + tail
+  }
+  // OpenAI's shape: {id, object, created, owned_by}; the owner defaults to the provider
+  const id = rawStr(fs, "id") ?? ""
+  const created = rawNum(fs, "created")
+  const owner = rawStr(fs, "owned_by") ?? provider
+  return `{"id":${quote(provider + "/" + id)},"object":"model"` + opt("created", created === undefined ? undefined : `${created}`) + `,"owned_by":${quote(owner)}` + tail
+}
+
+test("the GET for one model: OpenAI-compatible, Anthropic and Gemini; none for the rest", () => {
+  const oa: Target = { provider: "openai", kind: "openai", model: "", key: { value: "sk" }, cfg: {} }
+  const r = retrieveRequest(oa, "gpt-4o-mini")
+  expect(r === undefined ? "" : r.url).toBe("https://api.openai.com/v1/models/gpt-4o-mini")
+  expect(r === undefined ? "" : r.headers.get("authorization") ?? "").toBe("Bearer sk")
+  const an: Target = { provider: "anthropic", kind: "anthropic", model: "", key: { value: "ak" }, cfg: {} }
+  expect(retrieveRequest(an, "claude-sonnet-4")!.url).toBe("https://api.anthropic.com/v1/models/claude-sonnet-4")
+  expect(retrieveRequest(an, "claude-sonnet-4")!.headers.get("x-api-key")).toBe("ak")
+  const gm: Target = { provider: "gemini", kind: "gemini", model: "", key: { value: "gk" }, cfg: {} }
+  expect(retrieveRequest(gm, "models/gemini-2.5-flash")!.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash")
+  const bd: Target = { provider: "bedrock", kind: "bedrock", model: "", key: { value: "" }, cfg: {} }
+  expect(retrieveRequest(bd, "amazon.titan-text")).toBe(undefined)
+})
+
+test("a retrieved model in Bifrost's shape, with the provider's metadata", () => {
+  const oa = try retrieveBody("openai", "openai", `{"id":"gpt-4o","object":"model","created":1715367049,"owned_by":"system"}`, true)
+  expect(oa).toBe(`{"id":"openai/gpt-4o","object":"model","created":1715367049,"owned_by":"system","listed":true}`)
+  const bare = try retrieveBody("m", "openai", `{"id":"m-b","object":"model"}`, false)
+  expect(bare).toBe(`{"id":"m/m-b","object":"model","owned_by":"m","listed":false}`)
+  const an = try retrieveBody("anthropic", "anthropic", `{"type":"model","id":"claude-sonnet-4","display_name":"Claude Sonnet 4","created_at":"2025-05-22T00:00:00Z","max_input_tokens":200000,"max_tokens":64000}`, true)
+  expect(an).toBe(`{"id":"anthropic/claude-sonnet-4","object":"model","created":1747872000,"owned_by":"anthropic","name":"Claude Sonnet 4","max_input_tokens":200000,"max_output_tokens":64000,"listed":true}`)
+  const gm = try retrieveBody("gemini", "gemini", `{"name":"models/gemini-2.5-flash","displayName":"Gemini 2.5 Flash","description":"Fast","inputTokenLimit":1048576,"outputTokenLimit":65536,"supportedGenerationMethods":["generateContent","countTokens"]}`, true)
+  expect(gm).toBe(`{"id":"gemini/gemini-2.5-flash","object":"model","owned_by":"gemini","name":"Gemini 2.5 Flash","description":"Fast","context_length":1048576,"max_input_tokens":1048576,"max_output_tokens":65536,"supported_methods":["generateContent","countTokens"],"listed":true}`)
+  let bad = false
+  try {
+    retrieveBody("openai", "openai", "not json", true)
+  } catch (e) {
+    bad = true
+  }
+  expect(bad).toBe(true)
+})

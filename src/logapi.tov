@@ -1,0 +1,552 @@
+// Bifrost's log API shapes over Raiju's request log (handlers/logging.go): the list page, one log,
+// the session views, the User-Agent to app mappings, and the parsing their query strings need.
+// The views are pure: the handlers pass in the entries a caller may see and the filter applied.
+import { LogEntry, Filter, filterFrom, statsView, kindOf, daysFromCivil, jobj, jarr, jkv, jn, hitTypeOf } from "./logstore"
+import { UserAgentMapping } from "./config"
+import { isoMs } from "./exports"
+import { newId } from "./schemas"
+
+// Bifrost names an entry's status success, error or cancelled (499).
+export function statusName(e: LogEntry): string {
+  if (e.status >= 200 && e.status < 300) return "success"
+  return e.status === 499 ? "cancelled" : "error"
+}
+
+// A string as JSON, or null when it is missing or empty.
+function opt(v: string | undefined): string {
+  return v === undefined || v === "" ? "null" : JSON.stringify(v)
+}
+
+// One log in Bifrost's field names. The detail adds the bodies and the raw payloads the store keeps.
+export function logJson(e: LogEntry, detail: bool): string {
+  const pairs: string[] = [
+    jkv("id", JSON.stringify(e.id)),
+    jkv("timestamp", JSON.stringify(isoMs(e.ts))),
+    jkv("object", JSON.stringify(e.op)),
+    jkv("provider", JSON.stringify(e.provider)),
+    jkv("model", JSON.stringify(e.model)),
+    jkv("status", JSON.stringify(statusName(e))),
+    jkv("latency", jn(e.latency_ms)),
+    jkv("prompt_tokens", jn(e.prompt_tokens)),
+    jkv("completion_tokens", jn(e.completion_tokens)),
+    jkv("total_tokens", jn(e.prompt_tokens + e.completion_tokens)),
+    jkv("cost", jn(e.cost)),
+    jkv("cache_hit", e.cache_hit ? "true" : "false"),
+    jkv("request_id", JSON.stringify(e.request_id)),
+    jkv("virtual_key_id", opt(e.virtual_key)),
+    jkv("team_id", opt(e.team_id)),
+    jkv("customer_id", opt(e.customer_id)),
+    jkv("business_unit_id", opt(e.business_unit_id)),
+    jkv("project_id", opt(e.project_id)),
+    jkv("user_id", opt(e.user_id)),
+    jkv("session_id", opt(e.session_id)),
+    jkv("user_agent", opt(e.user_agent)),
+    jkv("app", opt(e.app)),
+    jkv("error_details", e.error === undefined || e.error === "" ? "null" : jobj([jkv("message", JSON.stringify(e.error))])),
+    jkv("selected_key_id", opt(e.selected_key_id)),
+    jkv("selected_key_name", opt(e.selected_key_name)),
+    jkv("routing_rule_id", opt(e.routing_rule_id)),
+    jkv("routing_engine_used", opt(e.routing_engine_used)),
+    jkv("alias", opt(e.alias)),
+    jkv("complexity_tier", opt(e.complexity_tier)),
+    jkv("complexity_mechanism", opt(e.complexity_mechanism)),
+    jkv("cache_hit_type", opt(hitTypeOf(e))),
+    jkv("stop_reason", opt(e.stop_reason)),
+    jkv("tool_call_names", e.tool_call_names === undefined || e.tool_call_names.length === 0 ? "null" : JSON.stringify(e.tool_call_names)),
+    jkv("complexity_score", e.complexity_score === undefined ? "null" : jn(e.complexity_score)),
+    jkv("selected_prompt_id", opt(e.selected_prompt_id)),
+    jkv("selected_prompt_name", opt(e.selected_prompt_name)),
+    jkv("selected_prompt_version", e.selected_prompt_version === undefined ? "null" : jn(e.selected_prompt_version)),
+    jkv("parent_request_id", opt(e.parent_request_id)),
+    jkv("agent_correlation_id", opt(e.agent_correlation_id)),
+  ]
+  if (detail) {
+    pairs.push(jkv("input", opt(e.input)))
+    pairs.push(jkv("output", opt(e.output)))
+    pairs.push(jkv("raw_request", opt(e.raw_request)))
+    pairs.push(jkv("raw_response", opt(e.raw_response)))
+  }
+  return jobj(pairs)
+}
+
+// A page of a list: the offset and limit, and the field the rows are ordered by.
+export type Page = { limit: int, offset: int, sortBy: string, order: string }
+
+// The entries in the order a page asks for: timestamp (the default), latency, tokens or cost.
+function ordered(es: LogEntry[], sortBy: string, order: string): LogEntry[] {
+  const out: LogEntry[] = es.slice()
+  const key = (e: LogEntry): f64 => {
+    if (sortBy === "latency") return e.latency_ms
+    if (sortBy === "tokens") return e.prompt_tokens + e.completion_tokens
+    if (sortBy === "cost") return e.cost
+    return e.ts
+  }
+  out.sort((a, b) => {
+    const d = key(a) - key(b)
+    return order === "asc" ? d : -d
+  })
+  return out
+}
+
+function pageJson(page: Page, total: int): string {
+  return jobj([jkv("limit", jn(page.limit)), jkv("offset", jn(page.offset)), jkv("sort_by", JSON.stringify(page.sortBy)), jkv("order", JSON.stringify(page.order)), jkv("total_count", jn(total))])
+}
+
+// GET /api/logs: Bifrost's logs, pagination, stats and has_logs. entries and total are Raiju's own
+// fields for the same page, kept for the clients that read them.
+export function listJson(es: LogEntry[], page: Page, hasLogs: bool): string {
+  const sorted = ordered(es, page.sortBy, page.order)
+  const rows: string[] = []
+  const entries: string[] = []
+  for (let i = page.offset; i < sorted.length && rows.length < page.limit; i++) {
+    rows.push(logJson(sorted[i]!, false))
+    entries.push(JSON.stringify(sorted[i]!))
+  }
+  return jobj([
+    jkv("logs", jarr(rows)),
+    jkv("pagination", pageJson(page, es.length)),
+    jkv("stats", statsView(es)),
+    jkv("has_logs", hasLogs ? "true" : "false"),
+    jkv("entries", jarr(entries)),
+    jkv("total", jn(es.length)),
+  ])
+}
+
+// Only the LLM requests of one session, from the entries a caller may see.
+function sessionOf(es: LogEntry[], sessionId: string): LogEntry[] {
+  return es.filter((e) => e.session_id === sessionId && kindOf(e) === "llm")
+}
+
+// GET /api/logs/sessions/{id}: the session's logs in Bifrost's SessionDetailResult shape (oldest first by default).
+export function sessionJson(es: LogEntry[], sessionId: string, page: Page): string {
+  const mine = sessionOf(es, sessionId)
+  const sorted = ordered(mine, "timestamp", page.order)
+  const rows: string[] = []
+  for (let i = page.offset; i < sorted.length && rows.length < page.limit; i++) rows.push(logJson(sorted[i]!, false))
+  const more = page.offset + rows.length < sorted.length
+  return jobj([
+    jkv("session_id", JSON.stringify(sessionId)),
+    jkv("logs", jarr(rows)),
+    jkv("pagination", pageJson(page, mine.length)),
+    jkv("count", jn(mine.length)),
+    jkv("returned_count", jn(rows.length)),
+    jkv("has_more", more ? "true" : "false"),
+  ])
+}
+
+// GET /api/logs/sessions/{id}/summary: the session's totals (Bifrost's SessionSummaryResult).
+export function sessionSummaryJson(es: LogEntry[], sessionId: string): string {
+  const mine = sessionOf(es, sessionId)
+  let cost = 0.0
+  let tokens = 0
+  let first = 0.0
+  let last = 0.0
+  for (let i = 0; i < mine.length; i++) {
+    const e = mine[i]!
+    cost += e.cost
+    tokens += e.prompt_tokens + e.completion_tokens
+    if (i === 0 || e.ts < first) first = e.ts
+    if (i === 0 || e.ts > last) last = e.ts
+  }
+  const pairs: string[] = [
+    jkv("session_id", JSON.stringify(sessionId)),
+    jkv("count", jn(mine.length)),
+    jkv("total_cost", jn(cost)),
+    jkv("total_tokens", jn(tokens)),
+  ]
+  if (mine.length > 0) {
+    pairs.push(jkv("started_at", JSON.stringify(isoMs(first))))
+    pairs.push(jkv("latest_at", JSON.stringify(isoMs(last))))
+  }
+  pairs.push(jkv("duration_ms", jn(mine.length > 0 ? last - first : 0.0)))
+  return jobj(pairs)
+}
+
+// One log by id, in Bifrost's shape with the detail fields.
+export function detailJson(e: LogEntry): string {
+  return logJson(e, true)
+}
+
+// ---- User-Agent to app ----
+
+// Bifrost's built-in app identifiers, in its match order (core/schemas/useragents.go).
+function builtinApps(): { app: string, ids: string[] }[] {
+  return [
+    { app: "Claude Chat Web", ids: ["claude-chat-web", "claude-web"] },
+    { app: "Claude Desktop", ids: ["claude-desktop", "claude/"] },
+    { app: "Claude Cowork", ids: ["claude-cowork"] },
+    { app: "Claude Code", ids: ["claude-cli", "claude-code", "claude-vscode"] },
+    { app: "Warp", ids: ["bifrost-warp"] },
+    { app: "API", ids: ["fasthttp"] },
+    { app: "Codex CLI", ids: ["codex-cli", "codex-tui"] },
+    { app: "Codex Desktop", ids: ["codex-desktop", "codex desktop/", "codex/"] },
+    { app: "Cursor", ids: ["cursor"] },
+    { app: "Kilo Code", ids: ["kilo"] },
+    { app: "Roo Code", ids: ["roo"] },
+    { app: "Cline", ids: ["cline"] },
+    { app: "OpenCode", ids: ["opencode"] },
+    { app: "Windsurf", ids: ["windsurf"] },
+    { app: "Antigravity CLI", ids: ["antigravity-cli"] },
+    { app: "Antigravity Desktop", ids: ["antigravity-desktop", "antigravity/"] },
+    { app: "Gemini CLI", ids: ["gemini-cli", "geminicli", "gemini"] },
+    { app: "Qwen Code", ids: ["qwen-code", "qwencode", "qwen"] },
+  ]
+}
+
+// Whether a pattern matches a User-Agent under a mapping's match type. regex needs a regular
+// expression engine, which Raiju does not have, so it never matches (the API refuses it).
+export function uaMatches(ua: string, pattern: string, matchType: string): bool {
+  const u = ua.trim().toLowerCase()
+  const p = pattern.trim().toLowerCase()
+  if (u === "" || p === "") return false
+  if (matchType === "exact") return u === p
+  if (matchType === "starts_with") return u.startsWith(p)
+  if (matchType === "contains" || matchType === "") return u.includes(p)
+  return false
+}
+
+// The app a User-Agent belongs to: the first active mapping that matches, then Bifrost's built-in
+// identifiers, else "Other". "" when there is no User-Agent.
+export function appOf(ua: string, mappings: UserAgentMapping[]): string {
+  if (ua.trim() === "") return ""
+  for (const m of mappings) {
+    if (m.is_active === false || m.app === "" || m.app === undefined) continue
+    if (uaMatches(ua, m.pattern, m.match_type)) return m.app
+  }
+  const lower = ua.toLowerCase()
+  for (const b of builtinApps()) {
+    if (b.ids.some((id) => lower.includes(id))) return b.app
+  }
+  return "Other"
+}
+
+const UA_MATCH_TYPES = ["contains", "starts_with", "exact"]
+
+export type UaReply = { status: int, body: string, next?: UserAgentMapping[] }
+
+function uaError(status: int, message: string): UaReply {
+  return { status: status, body: JSON.stringify({ error: { message: message, type: "invalid_request_error" } }), next: undefined }
+}
+
+// The fields a create or update names. A bad mapping gives a message instead.
+type UaBody = { pattern?: string, match_type?: string, app?: string, is_active?: bool }
+
+type UaCheck = { kind: "ok", m: UserAgentMapping } | { kind: "error", error: string }
+
+function checkUa(b: UaBody, cur: UserAgentMapping | undefined): UaCheck {
+  const pattern = (b.pattern ?? cur?.pattern ?? "").trim()
+  const app = (b.app ?? cur?.app ?? "").trim()
+  const matchType = (b.match_type ?? cur?.match_type ?? "").trim()
+  if (pattern === "") return { kind: "error", error: "failed to create user agent mapping: pattern cannot be empty" }
+  if (app === "") return { kind: "error", error: "failed to create user agent mapping: app cannot be empty" }
+  if (matchType === "regex") return { kind: "error", error: "failed to create user agent mapping: regex match_type is not supported by this gateway" }
+  if (!UA_MATCH_TYPES.includes(matchType)) return { kind: "error", error: `failed to create user agent mapping: unsupported match_type "${matchType}"` }
+  const m: UserAgentMapping = { id: cur?.id ?? "", pattern: pattern, match_type: matchType, app: app, is_active: b.is_active ?? cur?.is_active ?? true, created_at: cur?.created_at, updated_at: cur?.updated_at }
+  return { kind: "ok", m: m }
+}
+
+function uaJson(m: UserAgentMapping): string {
+  return jobj([
+    jkv("id", JSON.stringify(m.id)),
+    jkv("pattern", JSON.stringify(m.pattern)),
+    jkv("match_type", JSON.stringify(m.match_type)),
+    jkv("app", JSON.stringify(m.app)),
+    jkv("is_active", m.is_active === false ? "false" : "true"),
+    jkv("created_at", JSON.stringify(m.created_at ?? "")),
+    jkv("updated_at", JSON.stringify(m.updated_at ?? "")),
+  ])
+}
+
+// /api/logs/user-agent-mappings: list, create (POST), update and delete (by id). next is the list to save.
+export function uaRoute(list: UserAgentMapping[] | undefined, method: string, path: string, body: string, nowIso: string): UaReply {
+  const cur: UserAgentMapping[] = list ?? []
+  const base = "/api/logs/user-agent-mappings"
+  const id = path.startsWith(base + "/") ? path.slice(base.byteLength + 1) : ""
+  if (path !== base && id === "") return uaError(404, "no such route")
+  if (method === "GET" && id === "") return { status: 200, body: jobj([jkv("mappings", jarr(cur.map((m) => uaJson(m))))]), next: undefined }
+  if (method === "POST" && id === "") {
+    let b: UaBody = {}
+    try {
+      b = JSON.parse(body) as UaBody
+    } catch (e) {
+      return uaError(400, "invalid request format")
+    }
+    const c = checkUa(b, undefined)
+    if (c.kind === "error") return uaError(400, c.error)
+    const m: UserAgentMapping = c.m
+    m.id = newId("uam_")
+    m.created_at = nowIso
+    m.updated_at = nowIso
+    const next: UserAgentMapping[] = cur.slice()
+    next.push(m)
+    return { status: 200, body: uaJson(m), next: next }
+  }
+  if ((method === "PUT" || method === "DELETE") && id !== "") {
+    const at = cur.findIndex((m) => m.id === id)
+    if (at < 0) return uaError(404, "user agent mapping not found")
+    if (method === "DELETE") {
+      const rest: UserAgentMapping[] = []
+      for (const m of cur) {
+        if (m.id !== id) rest.push(m)
+      }
+      return { status: 200, body: JSON.stringify({ success: true }), next: rest }
+    }
+    let b: UaBody = {}
+    try {
+      b = JSON.parse(body) as UaBody
+    } catch (e) {
+      return uaError(400, "invalid request format")
+    }
+    const old = cur[at]!
+    const c = checkUa(b, old)
+    if (c.kind === "error") return uaError(400, c.error)
+    const m: UserAgentMapping = c.m
+    m.id = id
+    m.created_at = old.created_at
+    m.updated_at = nowIso
+    const next: UserAgentMapping[] = []
+    for (const x of cur) next.push(x.id === id ? m : x)
+    return { status: 200, body: uaJson(m), next: next }
+  }
+  return { status: 405, body: JSON.stringify({ error: { message: `method ${method} is not allowed on this route`, type: "invalid_request_error" } }), next: undefined }
+}
+
+// ---- query values ----
+
+// A time bound: epoch milliseconds, or RFC 3339 (2026-10-14T12:00:00Z, with optional fraction and offset).
+// undefined when it is neither.
+export function timeOf(raw: string): f64 | undefined {
+  if (raw === "") return undefined
+  if (!raw.includes("T")) return parseFloat(raw)
+  if (raw.byteLength < 19) return undefined
+  const y = parseInt(raw.slice(0, 4))
+  const mo = parseInt(raw.slice(5, 7))
+  const d = parseInt(raw.slice(8, 10))
+  const h = parseInt(raw.slice(11, 13))
+  const mi = parseInt(raw.slice(14, 16))
+  const s = parseInt(raw.slice(17, 19))
+  if (y === undefined || mo === undefined || d === undefined || h === undefined || mi === undefined || s === undefined) return undefined
+  if (raw.slice(4, 5) !== "-" || raw.slice(7, 8) !== "-" || raw.slice(10, 11) !== "T" || raw.slice(13, 14) !== ":" || raw.slice(16, 17) !== ":") return undefined
+  let i = 19
+  let frac = 0.0
+  if (raw.slice(19, 20) === ".") {
+    i = 20
+    let scale = 100.0
+    while (i < raw.byteLength && raw.slice(i, i + 1) >= "0" && raw.slice(i, i + 1) <= "9") {
+      frac += (parseInt(raw.slice(i, i + 1)) ?? 0) * scale
+      scale = scale / 10.0
+      i += 1
+    }
+  }
+  const tz = raw.slice(i)
+  let off = 0.0
+  if (tz === "Z" || tz === "z") off = 0.0
+  else if (tz.byteLength === 6 && (tz.startsWith("+") || tz.startsWith("-"))) {
+    const oh = parseInt(tz.slice(1, 3))
+    const om = parseInt(tz.slice(4, 6))
+    if (oh === undefined || om === undefined) return undefined
+    off = (tz.startsWith("-") ? -1.0 : 1.0) * (oh * 60.0 + om) * 60000.0
+  } else return undefined
+  const day = daysFromCivil(y, mo, d)
+  return day * 86400000.0 + h * 3600000.0 + mi * 60000.0 + s * 1000.0 + frac - off
+}
+
+// The window of a query: start_time, end_time, or period (1h, 6h, 24h, 7d, 30d, ...), resolved to
+// epoch milliseconds. Defaults: the last 24 hours before now, and now.
+export function windowOf(sp: URLSearchParams, now: f64): { start: f64, end: f64 } {
+  const end = timeOf(sp.get("end_time") ?? "") ?? now
+  const period = sp.get("period") ?? ""
+  let span = 86400000.0
+  if (period !== "") {
+    const unit = period.endsWith("d") ? 86400000.0 : period.endsWith("h") ? 3600000.0 : period.endsWith("m") ? 60000.0 : 0.0
+    const n = parseFloat(period.slice(0, period.byteLength - 1)) ?? 0.0
+    if (unit > 0.0 && n > 0.0) span = n * unit
+  }
+  const start = timeOf(sp.get("start_time") ?? "") ?? end - span
+  return { start: start, end: end }
+}
+
+// The filter a list, stats or recalculation query names: Bifrost's filters for the fields Raiju
+// records. A period or a start_time/end_time bounds the window; without one, every entry counts.
+export function listFilter(sp: URLSearchParams, now: f64): Filter {
+  let since = 0.0
+  let until = now + 1.0
+  if ((sp.get("period") ?? "") !== "" || (sp.get("start_time") ?? "") !== "" || (sp.get("end_time") ?? "") !== "") {
+    const w = windowOf(sp, now)
+    since = w.start
+    until = w.end
+  }
+  since = timeOf(sp.get("since") ?? "") ?? since
+  until = timeOf(sp.get("until") ?? "") ?? until
+  return filterFrom(sp, "llm", since, until)
+}
+
+// The query names Bifrost filters on that Raiju does not record: the first one present, or "".
+// Agent names need Bifrost's registered agents (A2A), which Raiju does not have. Every other log filter
+// is recorded when the request is logged (gateway.tov record).
+const UNRECORDED = ["agent_names"]
+
+export function unsupportedFilter(sp: URLSearchParams): string {
+  for (const name of UNRECORDED) {
+    const v = sp.get(name) ?? ""
+    if (v !== "") return name
+  }
+  return ""
+}
+
+// The page a list query names: limit (default and maximum given), offset, sort_by and order. error
+// is Bifrost's message for a bad limit or offset.
+export function pageOfQuery(sp: URLSearchParams, defaultLimit: int, maxLimit: int): { page: Page, error: string } {
+  // a value that is not a number is ignored, as Bifrost ignores it
+  let limit = defaultLimit
+  const lim = parseInt(sp.get("limit") ?? "")
+  if (lim !== undefined) {
+    if (lim <= 0) return { page: { limit: 0, offset: 0, sortBy: "timestamp", order: "desc" }, error: "limit must be greater than 0" }
+    if (lim > maxLimit) return { page: { limit: 0, offset: 0, sortBy: "timestamp", order: "desc" }, error: `limit cannot exceed ${maxLimit}` }
+    limit = lim
+  }
+  let offset = 0
+  const off = parseInt(sp.get("offset") ?? "")
+  if (off !== undefined) {
+    if (off < 0) return { page: { limit: 0, offset: 0, sortBy: "timestamp", order: "desc" }, error: "offset cannot be negative" }
+    offset = off
+  }
+  let sortBy = "timestamp"
+  const sb = sp.get("sort_by") ?? ""
+  if (sb === "latency" || sb === "tokens" || sb === "cost") sortBy = sb
+  let order = "desc"
+  if ((sp.get("order") ?? "") === "asc") order = "asc"
+  return { page: { limit: limit, offset: offset, sortBy: sortBy, order: order }, error: "" }
+}
+
+// Percent-decoding of a path segment (Bifrost's url.PathUnescape). undefined for a bad escape or
+// bytes that are not UTF-8.
+export function pctDecode(s: string): string | undefined {
+  if (!s.includes("%")) return s
+  const bytes = new TextEncoder().encode(s)
+  const out: u8[] = []
+  let i = 0
+  while (i < bytes.length) {
+    const c = int(bytes[i]!)
+    if (c !== 37) {
+      out.push(u8(c))
+      i += 1
+      continue
+    }
+    if (i + 2 >= bytes.length) return undefined
+    const hi = hexDigit(int(bytes[i + 1]!))
+    const lo = hexDigit(int(bytes[i + 2]!))
+    if (hi < 0 || lo < 0) return undefined
+    out.push(u8(hi * 16 + lo))
+    i += 3
+  }
+  try {
+    return new TextDecoder().decode(out)
+  } catch (e) {
+    return undefined
+  }
+}
+
+function hexDigit(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 97 && c <= 102) return c - 87
+  if (c >= 65 && c <= 70) return c - 55
+  return -1
+}
+
+function entryWithStatus(status: int): LogEntry {
+  return { id: "a", ts: 0.0, request_id: "", op: "chat", provider: "", model: "", status: status, latency_ms: 0.0, prompt_tokens: 0, completion_tokens: 0, cost: 0.0, cache_hit: false }
+}
+
+test("status names follow Bifrost: success, error, cancelled", () => {
+  expect(statusName(entryWithStatus(200))).toBe("success")
+  expect(statusName(entryWithStatus(500))).toBe("error")
+  expect(statusName(entryWithStatus(499))).toBe("cancelled")
+})
+
+test("a user agent maps to the first matching mapping, then the built-in identifiers, then Other", () => {
+  const maps: UserAgentMapping[] = [{ id: "m1", pattern: "internal-tool", match_type: "contains", app: "Internal", is_active: true }]
+  expect(appOf("internal-tool/2.0 claude-cli/1.0", maps)).toBe("Internal")
+  expect(appOf("claude-cli/1.0.3 (external, cli)", [])).toBe("Claude Code")
+  expect(appOf("Cursor/0.45", [])).toBe("Cursor")
+  expect(appOf("some-random-client/1.0", [])).toBe("Other")
+  expect(appOf("", maps)).toBe("")
+  // an inactive mapping does not apply
+  const off: UserAgentMapping = { id: "m2", pattern: "internal-tool", match_type: "contains", app: "Internal", is_active: false }
+  expect(appOf("internal-tool", [off])).toBe("Other")
+})
+
+test("user agent match types: exact, starts_with, contains; regex never matches here", () => {
+  expect(uaMatches("Foo/1", "foo/1", "exact")).toBe(true)
+  expect(uaMatches("Foo/1 x", "foo/1", "exact")).toBe(false)
+  expect(uaMatches("Foo/1 x", "foo/", "starts_with")).toBe(true)
+  expect(uaMatches("x Foo/1", "foo/", "starts_with")).toBe(false)
+  expect(uaMatches("x Foo/1", "foo/", "contains")).toBe(true)
+  expect(uaMatches("x Foo/1", "^x", "regex")).toBe(false)
+})
+
+test("RFC 3339 and epoch milliseconds parse to epoch milliseconds; bad values are undefined", () => {
+  expect(timeOf("1970-01-01T00:00:00Z")).toBe(0.0)
+  expect(timeOf("1970-01-01T00:00:01.5Z")).toBe(1500.0)
+  expect(timeOf("1970-01-01T01:00:00+01:00")).toBe(0.0)
+  expect(timeOf("1234")).toBe(1234.0)
+  expect(timeOf("1h")).toBeUndefined()
+  expect(timeOf("2026-10-14 12:00:00")).toBeUndefined()
+  expect(timeOf("")).toBeUndefined()
+})
+
+test("the filters Raiju records are accepted; the ones it does not record are named", () => {
+  expect(unsupportedFilter(new URLSearchParams("selected_key_ids=k1&routing_rule_ids=r&stop_reasons=stop&cache_hit_types=semantic&roots_only=true&parent_request_id=p"))).toBe("")
+  expect(unsupportedFilter(new URLSearchParams("status=error&agent_names=bot"))).toBe("agent_names")
+  expect(unsupportedFilter(new URLSearchParams("tool_call_names=get_weather&min_complexity_score=1&max_complexity_score=9&selected_prompt_ids=p1&prompt_names=greet"))).toBe("")
+  const e = entryWithStatus(200)
+  e.selected_key_id = "k1"
+  e.stop_reason = "stop"
+  e.cache_hit_type = "semantic"
+  e.tool_call_names = ["get_weather"]
+  e.complexity_score = 2.5
+  e.selected_prompt_id = "p1"
+  e.selected_prompt_name = "greet"
+  e.selected_prompt_version = 3
+  const row = logJson(e, false)
+  expect(row.includes(`"selected_key_id":"k1"`)).toBe(true)
+  expect(row.includes(`"stop_reason":"stop"`)).toBe(true)
+  expect(row.includes(`"cache_hit_type":"semantic"`)).toBe(true)
+  expect(row.includes(`"routing_rule_id":null`)).toBe(true)
+  expect(row.includes(`"tool_call_names":["get_weather"]`)).toBe(true)
+  expect(row.includes(`"complexity_score":2.5`)).toBe(true)
+  expect(row.includes(`"selected_prompt_id":"p1","selected_prompt_name":"greet","selected_prompt_version":3`)).toBe(true)
+  const bare = logJson(entryWithStatus(200), false)
+  expect(bare.includes(`"tool_call_names":null`)).toBe(true)
+  expect(bare.includes(`"complexity_score":null`)).toBe(true)
+})
+
+test("percent-decoding of a cache key segment", () => {
+  expect(pctDecode("plain")).toBe("plain")
+  expect(pctDecode("a%20b%3Ac%2Fd")).toBe("a b:c/d")
+  expect(pctDecode("%E2%82%AC")).toBe("€")
+  expect(pctDecode("bad%zz")).toBeUndefined()
+  expect(pctDecode("cut%2")).toBeUndefined()
+})
+
+test("the user agent mapping routes validate, create, update and delete", () => {
+  const created = uaRoute([], "POST", "/api/logs/user-agent-mappings", `{"pattern":"tool/","match_type":"starts_with","app":"Tool"}`, "2026-10-14T00:00:00.000Z")
+  expect(created.status).toBe(200)
+  const list = created.next ?? []
+  expect(list.length).toBe(1)
+  const id = list[0]!.id
+  expect(created.body.includes(`"app":"Tool"`)).toBe(true)
+  expect(uaRoute([], "POST", "/api/logs/user-agent-mappings", `{"pattern":"x","match_type":"regex","app":"A"}`, "t").status).toBe(400)
+  expect(uaRoute([], "POST", "/api/logs/user-agent-mappings", `{"pattern":"x","match_type":"fuzzy","app":"A"}`, "t").status).toBe(400)
+  expect(uaRoute([], "POST", "/api/logs/user-agent-mappings", `{"pattern":"","match_type":"exact","app":"A"}`, "t").status).toBe(400)
+  expect(uaRoute([], "POST", "/api/logs/user-agent-mappings", `not json`, "t").status).toBe(400)
+  const upd = uaRoute(list, "PUT", "/api/logs/user-agent-mappings/" + id, `{"app":"Renamed"}`, "2026-10-14T01:00:00.000Z")
+  expect(upd.status).toBe(200)
+  expect(upd.body.includes(`"app":"Renamed"`)).toBe(true)
+  expect(upd.body.includes(`"pattern":"tool/"`)).toBe(true)
+  expect(uaRoute(list, "PUT", "/api/logs/user-agent-mappings/nope", `{}`, "t").status).toBe(404)
+  const del = uaRoute(upd.next, "DELETE", "/api/logs/user-agent-mappings/" + id, "", "t")
+  expect(del.status).toBe(200)
+  expect((del.next ?? []).length).toBe(0)
+  expect(uaRoute(list, "GET", "/api/logs/user-agent-mappings", "", "t").body.includes(`"mappings":[{`)).toBe(true)
+})

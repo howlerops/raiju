@@ -1,0 +1,165 @@
+// Data access control (Bifrost's data-access-control): which teams, business units, customers and
+// projects a stored user may see and edit in the management API and the request logs. Pure functions
+// over the governance config. The role's dac decides how far the user's memberships reach:
+//   own-data           the user's projects only
+//   team-data          plus the user's teams and business units
+//   business-unit-data plus the teams of those business units
+//   customer-data      plus the customers of those teams and business units
+//   all-data           everything (built-in admin, editor, viewer and auditor roles are all-data)
+import { GovernanceConfig, AdminUserConfig } from "./config"
+
+export type DataScope = { all: bool, teams: string[], businessUnits: string[], customers: string[], projects: string[] }
+
+export function allScope(): DataScope {
+  return { all: true, teams: [], businessUnits: [], customers: [], projects: [] }
+}
+
+// Sees nothing. Used when a user's scope cannot be worked out.
+export function noScope(): DataScope {
+  return { all: false, teams: [], businessUnits: [], customers: [], projects: [] }
+}
+
+// 0 for own-data (and any unknown value, which fails closed), 1 team, 2 business unit, 3 customer, 4 all.
+export function dacLevel(dac: string): int {
+  if (dac === "all-data") return 4
+  if (dac === "customer-data") return 3
+  if (dac === "business-unit-data") return 2
+  if (dac === "team-data") return 1
+  return 0
+}
+
+// The business unit a team belongs to: its own business_unit_id, else a business unit listing it.
+export function buOfTeam(g: GovernanceConfig, teamId: string): string | undefined {
+  for (const t of g.teams ?? []) {
+    if (t.id === teamId && t.business_unit_id !== undefined && t.business_unit_id !== "") return t.business_unit_id
+  }
+  for (const b of g.business_units ?? []) {
+    if ((b.team_ids ?? []).includes(teamId)) return b.id
+  }
+  return undefined
+}
+
+// Whether a team is in a business unit (by either link).
+function teamInBu(g: GovernanceConfig, teamId: string, buId: string): bool {
+  return buOfTeam(g, teamId) === buId
+}
+
+function pushUnique(inout xs: string[], x: string): void {
+  if (x !== "" && !xs.includes(x)) xs.push(x)
+}
+
+// The scope of a stored user under a role with this dac.
+export function scopeOf(g: GovernanceConfig, u: AdminUserConfig, dac: string): DataScope {
+  const level = dacLevel(dac)
+  if (level === 4) return allScope()
+  let projects: string[] = []
+  let teams: string[] = []
+  let bus: string[] = []
+  let customers: string[] = []
+  for (const p of u.projects ?? []) pushUnique(&projects, p)
+  if (level === 0) return { all: false, teams: teams, businessUnits: bus, customers: customers, projects: projects }
+  // the user's own teams and business units
+  for (const t of u.teams ?? []) pushUnique(&teams, t)
+  for (const b of u.business_units ?? []) pushUnique(&bus, b)
+  if (level >= 2) {
+    // a team's business unit counts as one the user is in
+    for (const t of u.teams ?? []) {
+      const b = buOfTeam(g, t)
+      if (b !== undefined) pushUnique(&bus, b)
+    }
+    // and so do the teams of those business units
+    for (const t of g.teams ?? []) {
+      for (const b of bus) {
+        if (teamInBu(g, t.id, b)) pushUnique(&teams, t.id)
+      }
+    }
+  }
+  if (level >= 3) {
+    for (const t of g.teams ?? []) {
+      if (!teams.includes(t.id)) continue
+      if (t.customer_id !== undefined) pushUnique(&customers, t.customer_id)
+    }
+    for (const b of g.business_units ?? []) {
+      if (!bus.includes(b.id)) continue
+      for (const c of b.customer_ids ?? []) pushUnique(&customers, c)
+    }
+  }
+  return { all: false, teams: teams, businessUnits: bus, customers: customers, projects: projects }
+}
+
+// Whether a record with these owners is in the scope. An empty owner matches nothing; a record with
+// no owner is seen by all-data scopes only.
+export function inScope(s: DataScope, team: string, bu: string, customer: string, project: string): bool {
+  if (s.all) return true
+  if (project !== "" && s.projects.includes(project)) return true
+  if (team !== "" && s.teams.includes(team)) return true
+  if (bu !== "" && s.businessUnits.includes(bu)) return true
+  if (customer !== "" && s.customers.includes(customer)) return true
+  return false
+}
+
+test("dac levels: unknown values fail closed to own-data", () => {
+  expect(dacLevel("all-data")).toBe(4)
+  expect(dacLevel("customer-data")).toBe(3)
+  expect(dacLevel("team-data")).toBe(1)
+  expect(dacLevel("nonsense")).toBe(0)
+})
+
+test("own-data sees only its projects", () => {
+  const g: GovernanceConfig = { teams: [{ id: "t1", name: "core" }] }
+  const u: AdminUserConfig = { name: "ann", role: "lead", teams: ["t1"], projects: ["p1"] }
+  const s = scopeOf(g, u, "own-data")
+  expect(s.teams.length).toBe(0)
+  expect(inScope(s, "t1", "", "", "")).toBe(false)
+  expect(inScope(s, "", "", "", "p1")).toBe(true)
+})
+
+test("team-data sees its teams and business units, not other teams", () => {
+  const g: GovernanceConfig = {
+    teams: [{ id: "t1", name: "a", customer_id: "c1", business_unit_id: "bu1" }, { id: "t2", name: "b", customer_id: "c2" }],
+    business_units: [{ id: "bu1", name: "emea" }],
+  }
+  const u: AdminUserConfig = { name: "ann", role: "lead", teams: ["t1"] }
+  const s = scopeOf(g, u, "team-data")
+  expect(s.teams.join(",")).toBe("t1")
+  // team-data lists the business units the user is in, not those of their teams
+  expect(s.businessUnits.length).toBe(0)
+  expect(inScope(s, "t1", "", "", "")).toBe(true)
+  expect(inScope(s, "t2", "", "", "")).toBe(false)
+  expect(inScope(s, "", "", "c1", "")).toBe(false)
+})
+
+test("business-unit-data adds the teams of the user's business units", () => {
+  const g: GovernanceConfig = {
+    teams: [{ id: "t1", name: "a", business_unit_id: "bu1" }, { id: "t2", name: "b", business_unit_id: "bu1" }, { id: "t3", name: "c", business_unit_id: "bu2" }],
+    business_units: [{ id: "bu1", name: "emea" }, { id: "bu2", name: "apac" }],
+  }
+  const u: AdminUserConfig = { name: "ann", role: "lead", teams: ["t1"] }
+  const s = scopeOf(g, u, "business-unit-data")
+  expect(s.teams.includes("t2")).toBe(true)
+  expect(s.teams.includes("t3")).toBe(false)
+  expect(inScope(s, "", "bu1", "", "")).toBe(true)
+  expect(inScope(s, "", "bu2", "", "")).toBe(false)
+})
+
+test("customer-data reaches the customers of its teams and business units", () => {
+  const g: GovernanceConfig = {
+    teams: [{ id: "t1", name: "a", customer_id: "c1" }, { id: "t2", name: "b", customer_id: "c9" }],
+    business_units: [{ id: "bu1", name: "emea", customer_ids: ["c2"] }],
+  }
+  const u: AdminUserConfig = { name: "ann", role: "lead", teams: ["t1"], business_units: ["bu1"] }
+  const s = scopeOf(g, u, "customer-data")
+  expect(s.customers.includes("c1")).toBe(true)
+  expect(s.customers.includes("c2")).toBe(true)
+  expect(s.customers.includes("c9")).toBe(false)
+  expect(inScope(s, "", "", "c2", "")).toBe(true)
+  expect(inScope(s, "", "", "c9", "")).toBe(false)
+})
+
+test("all-data sees records with no owner, scoped users do not", () => {
+  const g: GovernanceConfig = {}
+  const u: AdminUserConfig = { name: "root", role: "admin" }
+  expect(inScope(scopeOf(g, u, "all-data"), "", "", "", "")).toBe(true)
+  expect(inScope(scopeOf(g, u, "team-data"), "", "", "", "")).toBe(false)
+  expect(inScope(noScope(), "t1", "", "", "")).toBe(false)
+})

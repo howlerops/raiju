@@ -14,7 +14,7 @@ import { fields, elements, find, quote, rawStr, rawNum, setField, without, build
 import { Target, Upstream, trimSlash } from "./providers/types"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
-import { newId } from "./schemas"
+import { newId, Hdrs } from "./schemas"
 import { isoMs } from "./exports"
 
 export type Job = {
@@ -26,6 +26,10 @@ export type Job = {
   http_status?: int,
   result?: string,
   error?: string,
+  // this job's own result TTL in ms, when its request set x-bf-async-job-result-ttl; the store's otherwise
+  ttl_ms?: int,
+  // the answer's body as the route sent it, for a poll on an SDK route (x-bf-async-id)
+  raw?: string,
 }
 
 // The store's own bookkeeping: `at` is the ms the expiry clock started
@@ -34,6 +38,16 @@ type Slot = { job: Job, at: int }
 
 function isFinished(j: Job): bool {
   return j.status === "completed" || j.status === "failed"
+}
+
+// The result TTL a request asks for (x-bf-async-job-result-ttl, in seconds), in ms. undefined when it is
+// absent or not a positive whole number of seconds: the store's TTL applies then, as in Bifrost.
+export function resultTtlMs(h: Hdrs): int | undefined {
+  const v = h.get("x-bf-async-job-result-ttl")
+  if (v === undefined) return undefined
+  const secs = parseInt(v)
+  if (secs === undefined || secs <= 0) return undefined
+  return secs * 1000
 }
 
 // True when `text` is exactly one JSON value. The scanner only reports the
@@ -68,7 +82,8 @@ export class JobStore {
   constructor(readonly ttlMs: int, readonly maxJobs: int) {}
 
   private expired(slot: Slot, nowMs: int): bool {
-    return nowMs >= slot.at + this.ttlMs
+    const ttl = slot.job.ttl_ms ?? this.ttlMs
+    return nowMs >= slot.at + ttl
   }
 
   // Removes the oldest finished job; unfinished jobs are never evicted.
@@ -84,12 +99,13 @@ export class JobStore {
   }
 
   // Returns undefined when the store is full of unfinished jobs.
-  create(op: string, nowMs: int): Job | undefined {
+  // ttlMs, when set, is the job's own result TTL (x-bf-async-job-result-ttl); the store's applies otherwise.
+  create(op: string, nowMs: int, ttlMs?: int): Job | undefined {
     if (this.jobs.size >= this.maxJobs) {
       this.sweep(nowMs)
       if (this.jobs.size >= this.maxJobs && !this.evictOne()) return undefined
     }
-    const job: Job = { id: newId("job_"), op: op, status: "pending", created_at: Math.floor(nowMs / 1000) }
+    const job: Job = { id: newId("job_"), op: op, status: "pending", created_at: Math.floor(nowMs / 1000), ttl_ms: ttlMs }
     this.jobs.set(job.id, { job: job, at: nowMs })
     return job
   }
@@ -97,7 +113,7 @@ export class JobStore {
   start(id: string): bool {
     const slot = this.jobs.get(id)
     if (slot === undefined || slot.job.status !== "pending") return false
-    const job: Job = { id: slot.job.id, op: slot.job.op, status: "processing", created_at: slot.job.created_at }
+    const job: Job = { id: slot.job.id, op: slot.job.op, status: "processing", created_at: slot.job.created_at, ttl_ms: slot.job.ttl_ms }
     this.jobs.set(id, { job: job, at: slot.at })
     return true
   }
@@ -112,10 +128,10 @@ export class JobStore {
     if (httpStatus >= 200 && httpStatus < 300) {
       const text = body.trim()
       const result = isJsonValue(text) ? text : quote(body)
-      job = { id: cur.id, op: cur.op, status: "completed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, result: result }
+      job = { id: cur.id, op: cur.op, status: "completed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, result: result, ttl_ms: cur.ttl_ms, raw: body }
     } else {
       const msg = errorMessage(body) ?? `upstream returned HTTP ${httpStatus}`
-      job = { id: cur.id, op: cur.op, status: "failed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, error: msg }
+      job = { id: cur.id, op: cur.op, status: "failed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, error: msg, ttl_ms: cur.ttl_ms, raw: body }
     }
     this.jobs.set(id, { job: job, at: nowMs })
     return true
@@ -156,8 +172,9 @@ export function jobJson(j: Job, ttlMs: int): string {
   const parts = [`"id":${quote(j.id)}`, `"object":"async.job"`, `"op":${quote(j.op)}`, `"status":${quote(j.status)}`, `"created_at":${quote(isoMs(j.created_at * 1000))}`]
   const done = j.completed_at
   if (done !== undefined) {
+    const ttl = j.ttl_ms ?? ttlMs
     parts.push(`"completed_at":${quote(isoMs(done * 1000))}`)
-    parts.push(`"expires_at":${quote(isoMs(done * 1000 + ttlMs))}`)
+    parts.push(`"expires_at":${quote(isoMs(done * 1000 + ttl))}`)
   }
   const st = j.http_status
   if (st !== undefined) parts.push(`"status_code":${st}`)

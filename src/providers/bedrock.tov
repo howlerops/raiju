@@ -53,6 +53,12 @@ export type Credentials = { accessKey: string, secretKey: string, sessionToken?:
 // Signs a POST. `path` is already percent-encoded once; SigV4 for non-S3
 // services encodes each segment again in the canonical request.
 export function sign(creds: Credentials, service: string, host: string, path: string, body: string, nowMs: f64): Map<string, string> {
+  return signRequest("POST", creds, service, host, path, "", body, nowMs)
+}
+
+// Signs a request with the given method. `query` is the canonical query string (names and values
+// already percent-encoded, sorted), "" for none.
+export function signRequest(method: string, creds: Credentials, service: string, host: string, path: string, query: string, body: string, nowMs: f64): Map<string, string> {
   const date = amzDate(nowMs)
   const day = date.slice(0, 8)
   const canonicalPath = path.split("/").map((seg) => encodeSegment(seg)).join("/")
@@ -62,7 +68,7 @@ export function sign(creds: Credentials, service: string, host: string, path: st
   if (token !== undefined && token !== "") hs.push(["x-amz-security-token", token])
   const canonicalHeaders = hs.map((h) => `${h[0]!}:${h[1]!}\n`).join("")
   const signed = hs.map((h) => h[0]!).join(";")
-  const canonical = `POST\n${canonicalPath}\n\n${canonicalHeaders}\n${signed}\n${payloadHash}`
+  const canonical = `${method}\n${canonicalPath}\n${query}\n${canonicalHeaders}\n${signed}\n${payloadHash}`
   const scope = `${day}/${creds.region}/${service}/aws4_request`
   const toSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${toHex(sha256(utf8(canonical)))}`
   const kDate = hmacSha256(utf8("AWS4" + creds.secretKey), utf8(day))
@@ -296,6 +302,25 @@ function callTo(t: Target, reg: string, h: string, sch: string, path: string, bo
   }
   addExtraHeaders(&hs, t.cfg)
   return { url: sch + h + path, headers: hs, body: body }
+}
+
+// A GET on Bedrock's control plane (the "bedrock" service, not bedrock-runtime) for a model listing
+// (/foundation-models, /inference-profiles). Signed as callTo signs, or sent with the Bedrock API key.
+// `query` is the raw query string for the page (nextToken=...), "" for the first page.
+export function listRequest(t: Target, path: string, query?: string): Upstream {
+  const q = query ?? ""
+  const reg = region(t)
+  const h = host(t, "bedrock", reg)
+  const bk = t.key.bedrock_key_config
+  const ak = bk?.access_key ?? ""
+  let hs: Map<string, string> = new Map()
+  if (ak !== "") {
+    hs = signRequest("GET", { accessKey: ak, secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token, region: reg }, "bedrock", h, path, q, "", Date.now())
+  } else {
+    hs = headers([["authorization", "Bearer " + (t.key.value ?? "")]])
+  }
+  addExtraHeaders(&hs, t.cfg)
+  return { url: scheme(t) + h + path + (q === "" ? "" : "?" + q), headers: hs, body: "" }
 }
 
 // A request to /model/{id}/{action} on bedrock-runtime.
@@ -532,4 +557,16 @@ test("an OpenAI-shaped reply from the OpenAI route reads as a chat completion", 
   expect(r.promptTokens).toBe(6)
   expect(r.completionTokens).toBe(2)
   expect(r.body.includes(`"content":"yo"`)).toBe(true)
+})
+
+test("a listing page is a signed GET with its nextToken in the query", () => {
+  const t: Target = { provider: "bedrock", kind: "bedrock", model: "", key: { value: "", bedrock_key_config: { access_key: "AKIAIOSFODNN7EXAMPLE", secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-west-2" } }, cfg: {} }
+  const first = listRequest(t, "/foundation-models")
+  expect(first.url.endsWith("/foundation-models")).toBe(true)
+  const next = listRequest(t, "/foundation-models", "nextToken=" + encodeSegment("a+b/c="))
+  expect(next.url.endsWith("/foundation-models?nextToken=a%2Bb%2Fc%3D")).toBe(true)
+  const creds: Credentials = { accessKey: "AKIAIOSFODNN7EXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-west-2" }
+  const post = sign(creds, "bedrock", "bedrock.us-west-2.amazonaws.com", "/foundation-models", "", 0)
+  const get = signRequest("GET", creds, "bedrock", "bedrock.us-west-2.amazonaws.com", "/foundation-models", "", "", 0)
+  expect(get.get("authorization") !== post.get("authorization")).toBe(true)
 })

@@ -1,0 +1,207 @@
+// Cost recalculation as a background job (Bifrost's cost recalculation job): the logs a filter selects are
+// priced again at the current prices, a slice at a time between timer ticks, so the request that started it
+// answers at once and a poll reports progress. A cancel stops the walk; the costs already written stay.
+import { LogEntry } from "./logstore"
+import { isoMs } from "./exports"
+import { newId } from "./schemas"
+
+// Logs priced per slice. A slice rewrites the day files that hold its changed logs, so slices are not tiny.
+export const RECALC_SLICE = 500
+
+// The job as the status routes report it, in Bifrost's field names.
+export type RecalcStatus = {
+  id: string,
+  status: string, // pending, running, completed, cancelled
+  total: int,
+  processed: int,
+  updated: int,
+  skipped: int,
+  message: string,
+  started_at: string,
+  updated_at: string,
+}
+
+// One job. price gives a log's cost at the current prices; apply writes the changed costs (by log id) to the
+// store and returns how many logs it changed.
+export class CostRecalc {
+  private st: RecalcStatus
+  private rows: LogEntry[] = []
+  private at: int = 0
+
+  constructor(readonly price: (e: LogEntry) => f64, readonly apply: (costs: Map<string, f64>) => int) {
+    this.st = { id: newId("recalc-"), status: "pending", total: 0, processed: 0, updated: 0, skipped: 0, message: "", started_at: "", updated_at: "" }
+  }
+
+  // Sets the logs to walk (the scope is fixed here, as Bifrost fixes its window at enqueue).
+  begin(entries: LogEntry[], now: f64): void {
+    const at = isoMs(now)
+    this.rows = entries.slice()
+    this.at = 0
+    let s = this.st
+    s.total = entries.length
+    s.started_at = at
+    s.updated_at = at
+    this.st = s
+  }
+
+  // The job's status now.
+  snapshot(): RecalcStatus {
+    return this.st
+  }
+
+  id(): string {
+    return this.st.id
+  }
+
+  // Whether the job is still walking (pending or running).
+  inFlight(): bool {
+    return this.st.status === "pending" || this.st.status === "running"
+  }
+
+  // Starts the walk: the first slice runs on the next timer tick, and the rest one tick after another.
+  start(): void {
+    setTimeout(() => this.tick(), 0)
+  }
+
+  private tick(): void {
+    if (!this.inFlight()) return
+    if (this.advance()) setTimeout(() => this.tick(), 0)
+  }
+
+  // Prices one slice and writes its changed costs. Returns true when logs remain to walk.
+  advance(): bool {
+    if (!this.inFlight()) return false
+    let s = this.st
+    s.status = "running"
+    this.st = s
+    if (this.at >= this.rows.length) {
+      this.finish()
+      return false
+    }
+    const end = Math.min(this.rows.length, this.at + RECALC_SLICE)
+    const costs: Map<string, f64> = new Map()
+    let updated = 0
+    let skipped = 0
+    for (let i = this.at; i < end; i++) {
+      const e = this.rows[i]!
+      const c = this.price(e)
+      if (c === e.cost) {
+        skipped += 1
+        continue
+      }
+      costs.set(e.id, c)
+      updated += 1
+    }
+    if (costs.size > 0) this.apply(costs)
+    this.at = end
+    let t = this.st
+    t.processed = end
+    t.updated += updated
+    t.skipped += skipped
+    t.updated_at = isoMs(Date.now())
+    this.st = t
+    if (this.at >= this.rows.length) {
+      this.finish()
+      return false
+    }
+    return true
+  }
+
+  // Stops the walk: the logs not yet priced keep their costs. A job already finished is left as it is.
+  cancel(): RecalcStatus {
+    if (!this.inFlight()) return this.st
+    let s = this.st
+    s.status = "cancelled"
+    s.updated_at = isoMs(Date.now())
+    s.message = `Stopped early after checking ${s.processed} log(s): ${s.updated} cost value(s) recalculated, ${s.skipped} skipped.` + (s.total > s.processed ? ` ${s.total - s.processed} log(s) in the selected window were not checked.` : "")
+    this.st = s
+    this.rows = []
+    return this.st
+  }
+
+  private finish(): void {
+    let s = this.st
+    s.status = "completed"
+    s.updated_at = isoMs(Date.now())
+    s.message = `Recalculated ${s.updated} cost value(s); ${s.skipped} skipped.`
+    this.st = s
+    this.rows = []
+  }
+}
+
+// ---- tests ----
+
+function entry(id: string, cost: f64): LogEntry {
+  return { id: id, ts: 1000.0, request_id: id, op: "chat", provider: "openai", model: "gpt-4o", status: 200, latency_ms: 1.0, prompt_tokens: 1, completion_tokens: 1, cost: cost, cache_hit: false }
+}
+
+function many(n: int, cost: f64): LogEntry[] {
+  const out: LogEntry[] = []
+  for (let i = 0; i < n; i++) out.push(entry("l" + i, cost))
+  return out
+}
+
+test("a recalculation prices every log and reports the changed and unchanged ones", () => {
+  const job = new CostRecalc((e) => (e.id === "b" ? 1.0 : 2.0), (costs) => costs.size)
+  job.begin([entry("a", 1.0), entry("b", 1.0), entry("c", 2.0)], 5000.0)
+  expect(job.snapshot().status).toBe("pending")
+  expect(job.inFlight()).toBe(true)
+  expect(job.advance()).toBe(false)
+  const s = job.snapshot()
+  expect(s.status).toBe("completed")
+  expect(s.total).toBe(3)
+  expect(s.processed).toBe(3)
+  expect(s.updated).toBe(1)
+  expect(s.skipped).toBe(2)
+  expect(s.message).toBe("Recalculated 1 cost value(s); 2 skipped.")
+  expect(job.inFlight()).toBe(false)
+})
+
+test("the walk goes a slice at a time, and the costs of each slice are written together", () => {
+  const writes: int[] = []
+  const job = new CostRecalc((e) => 9.0, (costs) => {
+    writes.push(costs.size)
+    return costs.size
+  })
+  job.begin(many(RECALC_SLICE + 10, 1.0), 5000.0)
+  expect(job.advance()).toBe(true)
+  expect(job.snapshot().processed).toBe(RECALC_SLICE)
+  expect(job.snapshot().status).toBe("running")
+  expect(job.advance()).toBe(false)
+  expect(job.snapshot().processed).toBe(RECALC_SLICE + 10)
+  expect(writes.length).toBe(2)
+  expect(writes[0]!).toBe(RECALC_SLICE)
+  expect(writes[1]!).toBe(10)
+})
+
+test("a cancel stops the walk, keeps the progress made and says what was not checked", () => {
+  let written = 0
+  const job = new CostRecalc((e) => 9.0, (costs) => {
+    written += costs.size
+    return costs.size
+  })
+  job.begin(many(RECALC_SLICE * 2 + 30, 1.0), 5000.0)
+  job.advance()
+  const s = job.cancel()
+  expect(s.status).toBe("cancelled")
+  expect(s.processed).toBe(RECALC_SLICE)
+  expect(s.message).toBe(`Stopped early after checking ${RECALC_SLICE} log(s): ${RECALC_SLICE} cost value(s) recalculated, 0 skipped. ${RECALC_SLICE + 30} log(s) in the selected window were not checked.`)
+  expect(job.advance()).toBe(false)
+  expect(written).toBe(RECALC_SLICE)
+  expect(job.snapshot().processed).toBe(RECALC_SLICE)
+})
+
+test("a cancel after the walk ended changes nothing", () => {
+  const job = new CostRecalc((e) => e.cost, (costs) => costs.size)
+  job.begin([entry("a", 1.0)], 5000.0)
+  job.advance()
+  expect(job.cancel().status).toBe("completed")
+})
+
+test("an empty selection completes at once with nothing recalculated", () => {
+  const job = new CostRecalc((e) => e.cost, (costs) => costs.size)
+  job.begin([], 5000.0)
+  expect(job.advance()).toBe(false)
+  expect(job.snapshot().status).toBe("completed")
+  expect(job.snapshot().message).toBe("Recalculated 0 cost value(s); 0 skipped.")
+})

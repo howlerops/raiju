@@ -7,13 +7,26 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
-  ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig,
+  ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig, CircuitPolicyConfig,
+  WebhookEndpoint, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping, PluginSpec,
+  BudgetOverride, PricingSyncConfig, ComplexitySettings, ProjectMember, MemberShare, EntityDac,
 } from "./config"
+import { RoutingRule, RuleTarget } from "./cel"
+import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom } from "./govapi"
+import { PromptRepoConfig } from "./prompts"
+import { FeatureFlagsConfig } from "./flags"
+import { notify } from "./notify"
+import { isBuiltinRole, customRole } from "./rbac"
+import { DataScope, allScope, inScope, scopeOf } from "./scope"
 import { setGlobalProxy } from "./providers/types"
+import { McpClientConfig, McpUserCredential } from "./mcp"
+import { McpUserToken } from "./mcpuser"
 import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
-import { Field, fields, find, isNull, quote, elements, decodeString } from "./json"
+import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum } from "./json"
 import { secureHex, utf8 } from "./crypto"
+import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
+import { durationMs, effectiveBudgetLimit } from "./governance"
 
 export type AdminAuth = AdminAuthConfig
 
@@ -26,15 +39,31 @@ type HasId = { id: string }
 
 // Request bodies: the server fills the id, and a missing required field is
 // caught by the store's validation instead of by JSON.parse's type check.
-type VkBody = { id?: string, name?: string, value?: string, description?: string, is_active?: bool, team_id?: string, customer_id?: string, budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], key_ids?: string[] }
+type VkBody = { id?: string, name?: string, value?: string, description?: string, is_active?: bool, team_id?: string, customer_id?: string, user_id?: string, budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], key_ids?: string[], expires_at?: string }
 type BudgetBody = { id?: string, max_limit?: f64, reset_duration?: string, current_usage?: f64 }
 type RateBody = { id?: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string }
-type NamedBody = { id?: string, name?: string, customer_id?: string, budget_id?: string }
+type NamedBody = { id?: string, name?: string, customer_id?: string, budget_id?: string, business_unit_id?: string }
 // Bifrost's model config, provider governance and pricing override requests. Budgets and rate
 // limits come inline; the store keeps them under ids the owner derives.
 type ModelConfigBody = { id?: string, model_name?: string, provider?: string, scope?: string, scope_id?: string, calendar_aligned?: bool, budgets?: BudgetBody[], rate_limit?: RateBody }
 type ProviderBody = { description?: string, budget?: BudgetBody, budgets?: BudgetBody[], rate_limit?: RateBody }
 type PricingBody = { name?: string, scope_kind?: string, provider_id?: string, provider_key_id?: string, virtual_key_id?: string, user_id?: string, request_types?: string[], match_type?: string, pattern?: string }
+// Bifrost's projects, business units and custom roles. Projects and business units are written whole
+// (a PUT replaces the record); a role is keyed by its name.
+type ProjectBody = { id?: string, name?: string, description?: string, is_active?: bool, access_rule?: string, accounting_mode?: string, membership_mode?: string, virtual_key_ids?: string[], budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], split_policy?: string }
+type MemberBody = { members?: { user_id?: string }[] }
+type MemberCapsBody = { budget_shares?: MemberShare[] }
+type BusinessUnitBody = { id?: string, name?: string, budget_id?: string, rate_limit_id?: string, team_ids?: string[], customer_ids?: string[] }
+type RoleBody = { name?: string, description?: string, dac?: string, permissions?: PermissionPair[] }
+// entity_dac arrives as an object and is read by entityDacFrom
+
+
+// The resources a custom role may name, the operations on them, and the data access scopes.
+export const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster"]
+export const OPERATIONS = ["View", "Create", "Update", "Delete", "Download", "Reveal", "RunInference"]
+const DACS = ["own-data", "team-data", "business-unit-data", "customer-data", "all-data"]
+// The governance collections a scoped user (see scope.tov) may read and change, record by record.
+const SCOPED_COLLECTIONS = ["virtual-keys", "teams", "customers", "business-units", "projects"]
 
 const HEX = "0123456789abcdef"
 const DIGITS = "0123456789"
@@ -537,6 +566,15 @@ function budgetUsers(c: Config, id: string): string {
   for (const cu of g.customers ?? []) {
     if (cu.budget_id === id) return `customer ${cu.id}`
   }
+  for (const b of g.business_units ?? []) {
+    if (b.budget_id === id) return `business unit ${b.id}`
+  }
+  for (const pj of g.projects ?? []) {
+    if (pj.budget_id === id) return `project ${pj.id}`
+    for (const pc of pj.provider_configs ?? []) {
+      if (pc.budget_id === id) return `project ${pj.id}`
+    }
+  }
   return ""
 }
 
@@ -551,6 +589,15 @@ function rateLimitUsers(c: Config, id: string): string {
     if (vk.rate_limit_id === id) return `virtual key ${vk.id}`
     for (const pc of vk.provider_configs ?? []) {
       if (pc.rate_limit_id === id) return `virtual key ${vk.id}`
+    }
+  }
+  for (const b of gov(c).business_units ?? []) {
+    if (b.rate_limit_id === id) return `business unit ${b.id}`
+  }
+  for (const pj of gov(c).projects ?? []) {
+    if (pj.rate_limit_id === id) return `project ${pj.id}`
+    for (const pc of pj.provider_configs ?? []) {
+      if (pc.rate_limit_id === id) return `project ${pj.id}`
     }
   }
   return ""
@@ -655,6 +702,7 @@ function redactVk(vk: VirtualKeyConfig): VirtualKeyConfig {
     is_active: vk.is_active,
     team_id: vk.team_id,
     customer_id: vk.customer_id,
+    user_id: vk.user_id,
     budget_id: vk.budget_id,
     rate_limit_id: vk.rate_limit_id,
     provider_configs: vk.provider_configs,
@@ -857,6 +905,7 @@ function secretValue(cipher: ConfigCipher | undefined, seal: bool, v: string, pa
 function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: bool, inout errors: string[]): Config throws Error {
   const ps = c.providers
   const gov = c.governance
+  const mcp = c.mcp
   let out = c
   if (ps !== undefined) {
     const np: Map<string, ProviderConfig> = new Map()
@@ -876,6 +925,23 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
       np.set(name, p)
     }
     out.providers = np
+  }
+  const whs = out.webhooks
+  if (whs !== undefined) {
+    let nw: WebhookEndpoint[] = []
+    for (const w of whs) {
+      let x = w
+      const sec = x.secret
+      if (sec !== undefined) x.secret = try secretValue(cipher, seal, sec, `webhooks.${x.name}.secret`, &errors)
+      const hs = x.headers
+      if (hs !== undefined) {
+        const hm: Map<string, string> = new Map()
+        for (const k of hs.keys()) hm.set(k, try secretValue(cipher, seal, hs.get(k) ?? "", `webhooks.${x.name}.headers.${k}`, &errors))
+        x.headers = hm
+      }
+      nw.push(x)
+    }
+    out.webhooks = nw
   }
   if (gov !== undefined) {
     let g = gov
@@ -899,6 +965,58 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
       g.virtual_keys = nv
     }
     out.governance = g
+  }
+  // the secrets of MCP clients: static tokens, client secrets, and the tokens an OAuth flow saved
+  if (mcp !== undefined && mcp.client_configs !== undefined) {
+    let nm = mcp
+    let nl: McpClientConfig[] = []
+    for (const cc of mcp.client_configs) {
+      let x = cc
+      const au = x.auth
+      if (au !== undefined) {
+        let a = au
+        const where = `mcp.client_configs.${x.name}.auth`
+        const tk = a.token
+        if (tk !== undefined && tk !== "") a.token = try secretValue(cipher, seal, tk, `${where}.token`, &errors)
+        const cs = a.client_secret
+        if (cs !== undefined && cs !== "") a.client_secret = try secretValue(cipher, seal, cs, `${where}.client_secret`, &errors)
+        const rt = a.refresh_token
+        if (rt !== undefined && rt !== "") a.refresh_token = try secretValue(cipher, seal, rt, `${where}.refresh_token`, &errors)
+        const at = a.access_token
+        if (at !== undefined && at !== "") a.access_token = try secretValue(cipher, seal, at, `${where}.access_token`, &errors)
+        x.auth = a
+      }
+      nl.push(x)
+    }
+    nm.client_configs = nl
+    out.mcp = nm
+  }
+  // the per-user OAuth tokens (per_user_oauth clients): the access and refresh tokens are secrets
+  if (out.mcp !== undefined && out.mcp.user_tokens !== undefined) {
+    let nt: McpUserToken[] = []
+    for (const ut of out.mcp.user_tokens) {
+      let x = ut
+      x.access_token = try secretValue(cipher, seal, x.access_token, `mcp.user_tokens.${x.id}.access_token`, &errors)
+      x.refresh_token = try secretValue(cipher, seal, x.refresh_token, `mcp.user_tokens.${x.id}.refresh_token`, &errors)
+      nt.push(x)
+    }
+    let mt = out.mcp
+    mt.user_tokens = nt
+    out.mcp = mt
+  }
+  // the per-user headers each virtual key submitted (per_user_headers clients): their values are secrets
+  if (out.mcp !== undefined && out.mcp.user_credentials !== undefined) {
+    let nu: McpUserCredential[] = []
+    for (const uc of out.mcp.user_credentials) {
+      let x = uc
+      const hs: Map<string, string> = new Map()
+      for (const k of x.headers.keys()) hs.set(k, try secretValue(cipher, seal, x.headers.get(k) ?? "", `mcp.user_credentials.${x.id}.headers.${k}`, &errors))
+      x.headers = hs
+      nu.push(x)
+    }
+    let mo = out.mcp
+    mo.user_credentials = nu
+    out.mcp = mo
   }
   return out
 }
@@ -977,9 +1095,46 @@ export class ConfigStore {
     }
     this.version += 1
     setGlobalProxy(next.proxy_config)
+    // the dashboard hears of every saved change (notify.tov)
+    notify({ severity: "info", title: "Configuration changed", message: `${id} was saved (configuration version ${this.version}).` })
     const f = this.onChange
     if (f !== undefined) f(next)
     return { kind: "ok", id: id }
+  }
+
+  // Replaces the prompt repository (prompts with their versions, and deployments); see prompts.tov.
+  setPromptRepo(r: PromptRepoConfig): Result {
+    let n: Config = this.cfg
+    n.prompt_repo = r
+    return this.commit(n, "prompt-repo")
+  }
+
+  // Replaces the webhook endpoints; see webhooks.tov.
+  setWebhooks(w: WebhookEndpoint[]): Result {
+    let n: Config = this.cfg
+    n.webhooks = w
+    return this.commit(n, "webhooks")
+  }
+
+  // Replaces the feature flag overrides; see flags.tov.
+  setFeatureFlags(f: FeatureFlagsConfig): Result {
+    let n: Config = this.cfg
+    n.feature_flags = f
+    return this.commit(n, "feature-flags")
+  }
+
+  // Replaces the User-Agent to app mappings of the request logs (logapi.tov).
+  setUserAgentMappings(m: UserAgentMapping[]): Result {
+    let n: Config = this.cfg
+    n.user_agent_mappings = m
+    return this.commit(n, "user-agent-mappings")
+  }
+
+  // Replaces the plugin list (plugins[]); the save rebuilds the live plugin chain (see /api/plugins in ops.tov).
+  setPlugins(list: PluginSpec[]): Result {
+    let n: Config = this.cfg
+    n.plugins = list
+    return this.commit(n, "plugins")
   }
 
   // Replaces the alerts section (rules, channels and Bifrost-style CEL rules); see alertapi.tov.
@@ -1003,6 +1158,50 @@ export class ConfigStore {
     return this.commit(withGov(this.cfg, g), "users")
   }
 
+  // Adds or removes one access profile a user holds (users API); the profile must exist.
+  setUserProfile(name: string, profileId: string, add: bool): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    if (findById(g.access_profiles, profileId) === undefined) return fail(404, `no access profile ${profileId}`)
+    const users: AdminUserConfig[] = []
+    let found = false
+    for (const u of g.users ?? []) {
+      if (u.name !== name) {
+        users.push(u)
+        continue
+      }
+      found = true
+      let nu = u
+      const held: string[] = (u.access_profile_ids ?? []).filter((id) => id !== profileId)
+      if (add) held.push(profileId)
+      nu.access_profile_ids = held
+      users.push(nu)
+    }
+    if (!found) return fail(404, `no user ${name}`)
+    g.users = users
+    return this.commit(withGov(this.cfg, g), "user-profiles")
+  }
+
+  // Links or unlinks an access profile on a virtual key the user is assigned (users API).
+  setVkProfile(name: string, vkId: string, profileId: string, add: bool): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const vk = findById(g.virtual_keys, vkId)
+    if (vk === undefined || (vk.user_id ?? "") !== name) return fail(404, `no virtual key ${vkId} assigned to user ${name}`)
+    if (findById(g.access_profiles, profileId) === undefined) return fail(404, `no access profile ${profileId}`)
+    let nvk = vk
+    const held: string[] = (vk.access_profile_ids ?? []).filter((id) => id !== profileId)
+    if (add) held.push(profileId)
+    nvk.access_profile_ids = held
+    g.virtual_keys = putById(g.virtual_keys ?? [], nvk)
+    return this.commit(withGov(this.cfg, g), "virtual-key-profiles")
+  }
+
+  // Replaces the virtual keys as a whole (a propagate changes several at once).
+  replaceVirtualKeys(vks: VirtualKeyConfig[]): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    g.virtual_keys = vks
+    return this.commit(withGov(this.cfg, g), "propagate")
+  }
+
   // Replaces the global proxy (Bifrost's proxy_config); see proxyRoute.
   setProxy(px: GlobalProxyConfig | undefined): Result {
     let n: Config = this.cfg
@@ -1010,11 +1209,77 @@ export class ConfigStore {
     return this.commit(n, "proxy-config")
   }
 
+  // Replaces the circuit breaker policies (Bifrost's circuit_breaker_config.policies); see circuitPoliciesRoute.
+  setCircuitPolicies(list: CircuitPolicyConfig[]): Result {
+    let n: Config = this.cfg
+    n.circuit_breaker_policies = list
+    return this.commit(n, "circuit-breaker-policies")
+  }
+
+  // Replaces the UI and admin metadata map; see postMetadata.
+  setMetadata(m: Map<string, string | f64 | bool>): Result {
+    let n: Config = this.cfg
+    n.metadata = m
+    return this.commit(n, "metadata")
+  }
+
   // Replaces the client section (Bifrost's client_config); see putConfig.
   setClient(c: ClientConfig): Result {
     let n: Config = this.cfg
     n.client = c
     return this.commit(n, "client")
+  }
+
+  // Replaces the pricing sync section (Bifrost's framework.pricing); see putConfig.
+  setPricingSync(ps: PricingSyncConfig | undefined): Result {
+    let n: Config = this.cfg
+    n.pricing_sync = ps
+    return this.commit(n, "framework-config")
+  }
+
+  // Replaces the admin credential (governance.auth_config); see putConfig.
+  setAdminAuth(a: AdminAuthConfig): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    g.auth_config = a
+    return this.commit(withGov(this.cfg, g), "auth-config")
+  }
+
+  // Sets or clears (undefined) a budget's override. The budget must be one the key draws on (keyBudgetIds).
+  setBudgetOverride(vkId: string, budgetId: string, o: BudgetOverride | undefined): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const vk = findById(g.virtual_keys, vkId)
+    if (vk === undefined) return fail(404, `no virtual-keys ${vkId}`)
+    if (!keyBudgetIds(vk).includes(budgetId)) return fail(404, `budget ${budgetId} is not on virtual key ${vkId}`)
+    const budgets: BudgetConfig[] = g.budgets ?? []
+    const b = findById(budgets, budgetId)
+    if (b === undefined) return fail(404, `no budgets ${budgetId}`)
+    const nb: BudgetConfig = { id: b.id, max_limit: b.max_limit, reset_duration: b.reset_duration, current_usage: b.current_usage, override: o }
+    g.budgets = putById(budgets, nb)
+    return this.commit(withGov(this.cfg, g), "budget-override")
+  }
+
+  // Adds or replaces a routing rule (by id), after ruleError.
+  upsertRoutingRule(rule: RoutingRule): Result {
+    const err = ruleError(rule)
+    if (err !== "") return fail(400, err)
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    g.routing_rules = putById(g.routing_rules ?? [], rule)
+    return this.commit(withGov(this.cfg, g), "routing-rules")
+  }
+
+  deleteRoutingRule(id: string): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const rules: RoutingRule[] = g.routing_rules ?? []
+    if (findById(rules, id) === undefined) return fail(404, `no routing rule ${id}`)
+    g.routing_rules = dropById(rules, id)
+    return this.commit(withGov(this.cfg, g), "routing-rules")
+  }
+
+  // Replaces the complexity analyzer config (complexity_router); undefined turns it off.
+  setComplexity(cs: ComplexitySettings | undefined): Result {
+    let n: Config = this.cfg
+    n.complexity_router = cs
+    return this.commit(n, "complexity-analyzer-config")
   }
 
   private putProvider(name: string, np: ProviderConfig, id: string): Result {
@@ -1100,6 +1365,8 @@ export class ConfigStore {
     }
     const refErr = vkRefError(this.cfg, vk)
     if (refErr !== "") return fail(400, refErr)
+    const exp = vk.expires_at
+    if (exp !== undefined && exp !== "" && rfc3339Ms(exp) === undefined) return fail(400, "expires_at must be an RFC 3339 time")
     const next: VirtualKeyConfig = {
       id: id,
       name: vk.name,
@@ -1112,6 +1379,46 @@ export class ConfigStore {
       rate_limit_id: vk.rate_limit_id,
       provider_configs: vk.provider_configs,
       key_ids: vk.key_ids,
+      expires_at: exp === undefined || exp === "" ? undefined : exp,
+      // a rotation's grace period is not set by a write; it stays until it ends or the next rotation
+      previous_value: value === old?.value ? old?.previous_value : undefined,
+      previous_value_expires_at: value === old?.value ? old?.previous_value_expires_at : undefined,
+      rotated_at: old?.rotated_at,
+      mcp_configs: vk.mcp_configs,
+    }
+    g.virtual_keys = putById(g.virtual_keys ?? [], next)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  // Gives a key a new value (Bifrost's rotation). The old value keeps working for cooldownMs
+  // when that is positive; otherwise it stops at once.
+  rotateVirtualKey(id: string, cooldownMs: number): Result {
+    const g = gov(this.cfg)
+    const old = findById(g.virtual_keys, id)
+    if (old === undefined) return fail(404, `no virtual key ${id}`)
+    let value = newVkValue()
+    while (value === old.value) value = newVkValue()
+    const now = Date.now()
+    const grace = cooldownMs > 0
+    const next: VirtualKeyConfig = {
+      id: old.id,
+      name: old.name,
+      value: value,
+      disable_content_logging: old.disable_content_logging,
+      description: old.description,
+      is_active: old.is_active,
+      team_id: old.team_id,
+      customer_id: old.customer_id,
+      budget_id: old.budget_id,
+      rate_limit_id: old.rate_limit_id,
+      provider_configs: old.provider_configs,
+      key_ids: old.key_ids,
+      access_profile_ids: old.access_profile_ids,
+      expires_at: old.expires_at,
+      previous_value: grace ? old.value : undefined,
+      previous_value_expires_at: grace ? rfc3339Of(now + cooldownMs) : undefined,
+      rotated_at: rfc3339Of(now),
+      mcp_configs: old.mcp_configs,
     }
     g.virtual_keys = putById(g.virtual_keys ?? [], next)
     return this.commit(withGov(this.cfg, g), id)
@@ -1182,7 +1489,9 @@ export class ConfigStore {
     if (cu !== undefined && findById(g.customers, cu) === undefined) return fail(400, `unknown customer ${cu}`)
     const b = t.budget_id
     if (b !== undefined && findById(g.budgets, b) === undefined) return fail(400, `unknown budget ${b}`)
-    const next: TeamConfig = { id: id, name: t.name, customer_id: cu, budget_id: b }
+    const bu = t.business_unit_id
+    if (bu !== undefined && bu !== "" && findById(g.business_units, bu) === undefined) return fail(400, `unknown business unit ${bu}`)
+    const next: TeamConfig = { id: id, name: t.name, customer_id: cu, budget_id: b, business_unit_id: bu === "" ? undefined : bu }
     g.teams = putById(g.teams ?? [], next)
     return this.commit(withGov(this.cfg, g), id)
   }
@@ -1214,6 +1523,179 @@ export class ConfigStore {
     if (user !== "") return fail(409, `customer ${id} is used by ${user}`)
     g.customers = dropById(g.customers ?? [], id)
     return this.commit(withGov(this.cfg, g), id)
+  }
+
+  // Saves a project whole (its id is decided by the caller). Defaults fill in the rules left out.
+  upsertProject(p: ProjectConfig): Result {
+    const next: ProjectConfig = {
+      id: p.id,
+      name: p.name,
+      description: p.description,
+      is_active: p.is_active ?? true,
+      access_rule: p.access_rule ?? "union",
+      accounting_mode: p.accounting_mode ?? "both",
+      membership_mode: p.membership_mode ?? "explicit",
+      virtual_key_ids: p.virtual_key_ids,
+      budget_id: p.budget_id,
+      rate_limit_id: p.rate_limit_id,
+      provider_configs: p.provider_configs,
+      split_policy: p.split_policy ?? "none",
+    }
+    const err = projectError(this.cfg, next)
+    if (err !== "") return fail(400, err)
+    const g = gov(this.cfg)
+    // the roster stays with the project; under an equal split the hand-written member caps are dropped
+    const kept: ProjectMember[] = []
+    const prior = findById(g.projects, p.id)
+    if (prior !== undefined) {
+      for (const m of prior.members ?? []) kept.push(next.split_policy === "equal" ? { id: m.id, user_id: m.user_id } : m)
+    }
+    next.members = kept
+    g.projects = putById(g.projects ?? [], next)
+    return this.commit(withGov(this.cfg, g), next.id)
+  }
+
+  deleteProject(id: string): Result {
+    const g = gov(this.cfg)
+    if (findById(g.projects, id) === undefined) return fail(404, `no project ${id}`)
+    g.projects = dropById(g.projects ?? [], id)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  // Adds members to a project, each user once. A user must be a stored user.
+  addProjectMembers(pid: string, users: string[]): Result {
+    const g = gov(this.cfg)
+    const pj = findById(g.projects, pid)
+    if (pj === undefined) return fail(404, `no project ${pid}`)
+    const members: ProjectMember[] = []
+    for (const m of pj.members ?? []) members.push(m)
+    for (const u of users) {
+      let known = false
+      for (const su of g.users ?? []) {
+        if (su.name === u) known = true
+      }
+      if (!known) return fail(400, `unknown user ${u}`)
+      let dup = false
+      for (const m of members) {
+        if (m.user_id === u) dup = true
+      }
+      if (!dup) members.push({ id: resolveId(undefined, undefined, "pm-"), user_id: u })
+    }
+    let np = pj
+    np.members = members
+    g.projects = putById(g.projects ?? [], np)
+    return this.commit(withGov(this.cfg, g), pid)
+  }
+
+  // Removes a member from a project; the member's caps go with it.
+  removeProjectMember(pid: string, mid: string): Result {
+    const g = gov(this.cfg)
+    const pj = findById(g.projects, pid)
+    if (pj === undefined) return fail(404, `no project ${pid}`)
+    if (findById(pj.members, mid) === undefined) return fail(404, `no member ${mid}`)
+    const members: ProjectMember[] = []
+    for (const m of pj.members ?? []) {
+      if (m.id !== mid) members.push(m)
+    }
+    let np = pj
+    np.members = members
+    g.projects = putById(g.projects ?? [], np)
+    return this.commit(withGov(this.cfg, g), pid)
+  }
+
+  // Replaces a member's own caps (the complete statement, as Bifrost's): only under split_policy none, and
+  // each share names a budget the project holds.
+  setMemberShares(pid: string, mid: string, shares: MemberShare[]): Result {
+    const g = gov(this.cfg)
+    const pj = findById(g.projects, pid)
+    if (pj === undefined) return fail(404, `no project ${pid}`)
+    if (pj.split_policy === "equal") return fail(400, "the project splits its caps equally, so member caps are not set by hand; use split_policy none")
+    if (findById(pj.members, mid) === undefined) return fail(404, `no member ${mid}`)
+    const held = projectBudgetIds(pj)
+    for (const s of shares) {
+      if (!held.includes(s.source_budget_id)) return fail(400, `budget ${s.source_budget_id} is not held by project ${pid}`)
+      if (s.share_type !== "percent" && s.share_type !== "amount") return fail(400, "share_type must be percent or amount")
+      if (!(s.share_value > 0.0)) return fail(400, "share_value must be positive")
+      if (s.share_type === "percent" && s.share_value > 100.0) return fail(400, "a percent share cannot be over 100")
+    }
+    const members: ProjectMember[] = []
+    for (const m of pj.members ?? []) {
+      members.push(m.id === mid ? { id: m.id, user_id: m.user_id, budget_shares: shares } : m)
+    }
+    let np = pj
+    np.members = members
+    g.projects = putById(g.projects ?? [], np)
+    return this.commit(withGov(this.cfg, g), pid)
+  }
+
+  // Saves a business unit whole. Its teams follow it: the listed teams join the unit, and teams it
+  // stops listing leave it (the team's own business_unit_id is kept in step).
+  upsertBusinessUnit(b: BusinessUnitConfig): Result {
+    const err = businessUnitError(this.cfg, b)
+    if (err !== "") return fail(400, err)
+    const g = gov(this.cfg)
+    const teams = b.team_ids ?? []
+    const next: BusinessUnitConfig = { id: b.id, name: b.name, budget_id: b.budget_id, rate_limit_id: b.rate_limit_id, team_ids: teams, customer_ids: b.customer_ids }
+    const out: TeamConfig[] = []
+    for (const t of g.teams ?? []) {
+      const nt: TeamConfig = { id: t.id, name: t.name, customer_id: t.customer_id, budget_id: t.budget_id, business_unit_id: t.business_unit_id }
+      if (teams.includes(t.id)) nt.business_unit_id = b.id
+      else if (t.business_unit_id === b.id) nt.business_unit_id = undefined
+      out.push(nt)
+    }
+    g.teams = out
+    g.business_units = putById(g.business_units ?? [], next)
+    return this.commit(withGov(this.cfg, g), next.id)
+  }
+
+  deleteBusinessUnit(id: string): Result {
+    const g = gov(this.cfg)
+    if (findById(g.business_units, id) === undefined) return fail(404, `no business unit ${id}`)
+    const out: TeamConfig[] = []
+    for (const t of g.teams ?? []) {
+      const nt: TeamConfig = { id: t.id, name: t.name, customer_id: t.customer_id, budget_id: t.budget_id, business_unit_id: t.business_unit_id }
+      if (t.business_unit_id === id) nt.business_unit_id = undefined
+      out.push(nt)
+    }
+    g.teams = out
+    g.business_units = dropById(g.business_units ?? [], id)
+    return this.commit(withGov(this.cfg, g), id)
+  }
+
+  // Saves a custom role. Built-in role names are refused; a role's users keep it when it changes.
+  upsertRole(r: RoleConfig): Result {
+    const err = roleError(r)
+    if (err !== "") return fail(400, err)
+    const next: RoleConfig = { name: r.name, description: r.description, dac: r.dac ?? "all-data", permissions: r.permissions ?? [], entity_dac: r.entity_dac ?? [] }
+    const g = gov(this.cfg)
+    const out: RoleConfig[] = []
+    let found = false
+    for (const x of g.roles ?? []) {
+      if (x.name === next.name) {
+        out.push(next)
+        found = true
+      } else {
+        out.push(x)
+      }
+    }
+    if (!found) out.push(next)
+    g.roles = out
+    return this.commit(withGov(this.cfg, g), next.name)
+  }
+
+  // Removes a custom role, unless a user still holds it.
+  deleteRole(name: string): Result {
+    const g = gov(this.cfg)
+    if (customRole(g.roles, name) === undefined) return fail(404, `no role ${name}`)
+    for (const u of g.users ?? []) {
+      if (u.role === name) return fail(409, `role ${name} is used by user ${u.name}`)
+    }
+    const out: RoleConfig[] = []
+    for (const x of g.roles ?? []) {
+      if (x.name !== name) out.push(x)
+    }
+    g.roles = out
+    return this.commit(withGov(this.cfg, g), name)
   }
 
   // A model config for one model (or "*"), provider and scope. Inline budgets and rate limit replace
@@ -1530,13 +2012,13 @@ function parseCustomer(b: string): NamedBody | undefined {
   }
 }
 
-function listBody(c: Config, coll: string): string {
+function listBody(c: Config, coll: string, scope: DataScope): string {
   const g = gov(c)
-  if (coll === "virtual-keys") return JSON.stringify({ virtual_keys: (g.virtual_keys ?? []).map((vk) => redactVk(vk)) })
+  if (coll === "virtual-keys") return JSON.stringify({ virtual_keys: (g.virtual_keys ?? []).filter((vk) => recordInScope(c, coll, vk.id, scope)).map((vk) => redactVk(vk)) })
   if (coll === "budgets") return JSON.stringify({ budgets: g.budgets ?? [] })
   if (coll === "rate-limits") return JSON.stringify({ rate_limits: g.rate_limits ?? [] })
-  if (coll === "teams") return JSON.stringify({ teams: g.teams ?? [] })
-  return JSON.stringify({ customers: g.customers ?? [] })
+  if (coll === "teams") return JSON.stringify({ teams: (g.teams ?? []).filter((t) => recordInScope(c, coll, t.id, scope)) })
+  return JSON.stringify({ customers: (g.customers ?? []).filter((cu) => recordInScope(c, coll, cu.id, scope)) })
 }
 
 // POST (pathId undefined) and PUT on the governance collections. Returns the
@@ -1557,10 +2039,12 @@ function putGov(store: ConfigStore, coll: string, pathId: string | undefined, bo
       is_active: b.is_active,
       team_id: b.team_id,
       customer_id: b.customer_id,
+      user_id: b.user_id,
       budget_id: b.budget_id,
       rate_limit_id: b.rate_limit_id,
       provider_configs: b.provider_configs,
       key_ids: b.key_ids,
+      expires_at: b.expires_at,
     }
     const r = store.upsertVirtualKey(vk)
     if (r.kind === "error") return errReply(r)
@@ -1597,7 +2081,7 @@ function putGov(store: ConfigStore, coll: string, pathId: string | undefined, bo
     if (b === undefined) return badBody()
     const id = resolveId(pathId, b.id, "team-")
     const created = findById(g.teams, id) === undefined
-    const r = store.upsertTeam({ id: id, name: b.name ?? "", customer_id: b.customer_id, budget_id: b.budget_id })
+    const r = store.upsertTeam({ id: id, name: b.name ?? "", customer_id: b.customer_id, budget_id: b.budget_id, business_unit_id: b.business_unit_id })
     if (r.kind === "error") return errReply(r)
     return storedReply(findById(gov(store.cfg).teams, id), created ? 201 : 200)
   }
@@ -1608,6 +2092,18 @@ function putGov(store: ConfigStore, coll: string, pathId: string | undefined, bo
   const r = store.upsertCustomer({ id: id, name: b.name ?? "", budget_id: b.budget_id })
   if (r.kind === "error") return errReply(r)
   return storedReply(findById(gov(store.cfg).customers, id), created ? 201 : 200)
+}
+
+// GET /api/governance/{collection}/{id}: one stored record (a key's value stays masked).
+function getGov(c: Config, coll: string, id: string): ApiReply {
+  const g = gov(c)
+  if (coll === "virtual-keys") {
+    const vk = findById(g.virtual_keys, id)
+    return vk === undefined ? reply(404, errorBody(`no virtual key ${id}`)) : reply(200, JSON.stringify(redactVk(vk)))
+  }
+  if (coll === "budgets" || coll === "rate-limits") return notAllowed("GET")
+  if (coll === "teams") return storedReply(findById(g.teams, id), 200)
+  return storedReply(findById(g.customers, id), 200)
 }
 
 function deleteGov(store: ConfigStore, coll: string, id: string): ApiReply {
@@ -1743,31 +2239,610 @@ function pricingRoute(store: ConfigStore, m: string, segs: string[], body: strin
   return notAllowed(m)
 }
 
-function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string): ApiReply {
+// GET /api/governance/teams/{team}/members: the users whose teams list names the team, in Bifrost's
+// {members} shape. Users here have a name and no email, so the name stands for both id and name.
+function teamMembers(store: ConfigStore, m: string, team: string, scope: DataScope): ApiReply {
+  if (m !== "GET") return notAllowed(m)
+  const g = gov(store.cfg)
+  if (!recordInScope(store.cfg, "teams", team, scope) || findById(g.teams, team) === undefined) return reply(404, errorBody(`no teams ${team}`))
+  const out: { user_id: string, user_name: string, user_email: string, source: string }[] = []
+  for (const u of g.users ?? []) {
+    if ((u.teams ?? []).includes(team)) out.push({ user_id: u.name, user_name: u.name, user_email: "", source: "manual" })
+  }
+  return reply(200, JSON.stringify({ members: out }))
+}
+
+// The grace period for a rotated key's old value, from client.vk_rotation_cooldown (0 when unset).
+function rotationCooldownMs(c: Config): number {
+  const s = c.client?.vk_rotation_cooldown ?? ""
+  if (s === "") return 0.0
+  const ms: number = durationMs(s)
+  return ms
+}
+
+// POST /api/governance/virtual-keys/rotate ({"ids": [...]}) and POST .../{id}/rotate. The reply
+// carries the new value, as Bifrost's does; it is the only time the caller sees it in full.
+function rotateVkRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+  if (m !== "POST") return notAllowed(m)
+  const cooldown = rotationCooldownMs(store.cfg)
+  if (segs.length === 5) {
+    const id = segs[3] ?? ""
+    if (!recordInScope(store.cfg, "virtual-keys", id, scope)) return reply(404, errorBody(`no virtual-keys ${id}`))
+    const r = store.rotateVirtualKey(id, cooldown)
+    if (r.kind === "error") return errReply(r)
+    const stored = findById(gov(store.cfg).virtual_keys, id)
+    if (stored === undefined) return serverError()
+    return reply(200, JSON.stringify({ message: "Virtual key rotated successfully", virtual_key: stored }))
+  }
+  if (segs.length !== 4) return notFound(path)
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return badBody()
+  }
+  const raw = find(fs, "ids") ?? ""
+  const ids: string[] = []
+  try {
+    for (const el of elements(raw)) {
+      const id = decodeString(el).trim()
+      if (id === "") return reply(400, errorBody("Virtual key ID cannot be empty"))
+      if (!ids.includes(id)) ids.push(id)
+    }
+  } catch (e) {
+    return reply(400, errorBody("ids must be a list of virtual key IDs"))
+  }
+  if (ids.length === 0) return reply(400, errorBody("At least one virtual key ID is required"))
+  const done: VirtualKeyConfig[] = []
+  const failures: Map<string, string> = new Map()
+  for (const id of ids) {
+    if (!recordInScope(store.cfg, "virtual-keys", id, scope)) {
+      failures.set(id, "virtual key not found")
+      continue
+    }
+    const r = store.rotateVirtualKey(id, cooldown)
+    if (r.kind === "error") {
+      failures.set(id, r.message)
+      continue
+    }
+    const stored = findById(gov(store.cfg).virtual_keys, id)
+    if (stored !== undefined) done.push(stored)
+  }
+  if (done.length === 0) return reply(500, JSON.stringify({ message: "Failed to rotate virtual keys", virtual_keys: done, errors: failures }))
+  const out: { message: string, virtual_keys: VirtualKeyConfig[], errors?: Map<string, string> } = { message: "Virtual keys rotated successfully", virtual_keys: done }
+  if (failures.size > 0) out.errors = failures
+  return reply(200, JSON.stringify(out))
+}
+
+function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
   const coll = segs[2] ?? ""
+  if (coll === "virtual-keys" && (segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate")) {
+    return rotateVkRoute(store, m, segs, body, path, scope)
+  }
+  // the quota view is served before the admin gate (server.tov); here only its method is judged
+  if (coll === "virtual-keys" && segs.length === 4 && segs[3] === "quota") return notAllowed(m)
+  if (coll === "virtual-keys" && segs.length === 5 && segs[4] === "users") return vkUsers(store, m, segs[3] ?? "", scope)
+  if (coll === "virtual-keys" && segs.length === 7 && segs[4] === "budgets" && segs[6] === "override") {
+    return budgetOverrideRoute(store, m, segs[3] ?? "", segs[5] ?? "", body, scope)
+  }
+  if (coll === "routing-rules") return routingRulesRoute(store, m, segs, body, path, scope)
+  if (coll === "complexity-analyzer-config") return complexityRoute(store, m, segs, body, path, scope)
+  // Bifrost's RBAC routes: /api/governance/rbac/roles is /api/roles, the rest are the catalogue
+  if (coll === "rbac") {
+    const sub = segs[3] ?? ""
+    if (sub === "roles") return roleRoute(store, m, ["api", "roles"].concat(segs.slice(4)), body, path, scope)
+    if (sub === "resources" || sub === "operations" || sub === "permissions") return segs.length === 4 ? rbacListing(sub, m) : notFound(path)
+    return notFound(path)
+  }
   if (coll === "model-configs") return modelConfigRoute(store, m, segs, body, path)
   if (coll === "providers") return providerGovRoute(store, m, segs, body, path)
   if (coll === "pricing-overrides") return pricingRoute(store, m, segs, body, path)
+  if (coll === "projects") return projectRoute(store, m, segs, body, path, sp, scope)
+  if (coll === "business-units") return businessUnitRoute(store, m, segs, body, path, sp, scope)
+  if (coll === "teams" && segs.length === 5 && segs[4] === "members") return teamMembers(store, m, segs[3] ?? "", scope)
   if (!COLLECTIONS.includes(coll) || segs.length > 4) return notFound(path)
+  // a scoped user reaches the teams, customers and keys in its scope; budgets and rate limits are all-data
+  if (!scope.all && !SCOPED_COLLECTIONS.includes(coll)) return reply(403, errorBody(`the data access scope of this role does not cover ${coll}`))
   if (segs.length === 3) {
-    if (m === "GET") return reply(200, listBody(store.cfg, coll))
-    if (m === "POST") return putGov(store, coll, undefined, body)
+    if (m === "GET") return reply(200, listBody(store.cfg, coll, scope))
+    if (m === "POST") return scope.all ? putGov(store, coll, undefined, body) : scopeDenied()
     return notAllowed(m)
   }
   const id = segs[3] ?? ""
+  if (!recordInScope(store.cfg, coll, id, scope)) return reply(404, errorBody(`no ${coll} ${id}`))
   if (m === "PUT") return putGov(store, coll, id, body)
   if (m === "DELETE") return deleteGov(store, coll, id)
-  if (m === "GET" && coll === "virtual-keys") {
-    const vk = findById(gov(store.cfg).virtual_keys, id)
-    if (vk === undefined) return reply(404, errorBody(`no virtual key ${id}`))
-    return reply(200, JSON.stringify(redactVk(vk)))
+  if (m === "GET") return getGov(store.cfg, coll, id)
+  return notAllowed(m)
+}
+
+// ---- projects, business units and custom roles ----
+
+// The error for a project, or "". The rules are checked against the config as it is now.
+function projectError(c: Config, p: ProjectConfig): string {
+  const g = gov(c)
+  if (p.name === "") return "project name is required"
+  for (const o of g.projects ?? []) {
+    if (o.id !== p.id && o.name === p.name) return `project name ${p.name} is already used`
+  }
+  const rule = p.access_rule ?? "union"
+  if (rule !== "union" && rule !== "intersect") return "access_rule must be union or intersect"
+  const acc = p.accounting_mode ?? "both"
+  if (acc !== "both" && acc !== "project_only" && acc !== "principal_only") return "accounting_mode must be both, project_only or principal_only"
+  const mode = p.membership_mode ?? "explicit"
+  if (mode !== "explicit" && mode !== "open") return "membership_mode must be explicit or open"
+  const split = p.split_policy ?? "none"
+  if (split !== "none" && split !== "equal") return "split_policy must be none or equal"
+  const b = p.budget_id
+  if (b !== undefined && findById(g.budgets, b) === undefined) return `unknown budget ${b}`
+  const r = p.rate_limit_id
+  if (r !== undefined && findById(g.rate_limits, r) === undefined) return `unknown rate limit ${r}`
+  const seen: string[] = []
+  for (const pc of p.provider_configs ?? []) {
+    if (pc.provider === "") return "each provider config needs a provider"
+    if (seen.includes(pc.provider)) return `provider ${pc.provider} is listed twice`
+    seen.push(pc.provider)
+    const pb = pc.budget_id
+    if (pb !== undefined && findById(g.budgets, pb) === undefined) return `unknown budget ${pb}`
+    const pr = pc.rate_limit_id
+    if (pr !== undefined && findById(g.rate_limits, pr) === undefined) return `unknown rate limit ${pr}`
+  }
+  for (const vk of p.virtual_key_ids ?? []) {
+    if (findById(g.virtual_keys, vk) === undefined) return `unknown virtual key ${vk}`
+  }
+  return ""
+}
+
+// The error for a business unit, or "".
+function businessUnitError(c: Config, b: BusinessUnitConfig): string {
+  const g = gov(c)
+  if (b.name === "") return "business unit name is required"
+  const bud = b.budget_id
+  if (bud !== undefined && findById(g.budgets, bud) === undefined) return `unknown budget ${bud}`
+  const rl = b.rate_limit_id
+  if (rl !== undefined && findById(g.rate_limits, rl) === undefined) return `unknown rate limit ${rl}`
+  for (const t of b.team_ids ?? []) {
+    if (findById(g.teams, t) === undefined) return `unknown team ${t}`
+  }
+  for (const cu of b.customer_ids ?? []) {
+    if (findById(g.customers, cu) === undefined) return `unknown customer ${cu}`
+  }
+  return ""
+}
+
+// The error for a custom role, or "". Built-in names are reserved.
+function roleError(r: RoleConfig): string {
+  if (r.name === "") return "role name is required"
+  if (isBuiltinRole(r.name)) return `${r.name} is a built-in role and cannot be changed`
+  const dac = r.dac ?? "all-data"
+  if (!DACS.includes(dac)) return `dac must be one of ${DACS.join(", ")}`
+  for (const p of r.permissions ?? []) {
+    if (!RESOURCES.includes(p.resource)) return `unknown resource ${p.resource}`
+    if (!OPERATIONS.includes(p.operation)) return `unknown operation ${p.operation}`
+  }
+  for (const e of r.entity_dac ?? []) {
+    if (!RESOURCES.includes(e.resource)) return `unknown resource ${e.resource} in entity_dac`
+    if (!DACS.includes(e.dac)) return `entity_dac ${e.resource} must be one of ${DACS.join(", ")}`
+  }
+  return ""
+}
+
+// Whether a record of a scoped collection is in the user's scope (see scope.tov).
+function recordInScope(c: Config, coll: string, id: string, scope: DataScope): bool {
+  if (scope.all) return true
+  if (coll === "teams") return inScope(scope, id, "", "", "")
+  if (coll === "customers") return inScope(scope, "", "", id, "")
+  if (coll === "business-units") return inScope(scope, "", id, "", "")
+  if (coll === "projects") return inScope(scope, "", "", "", id)
+  if (coll === "virtual-keys") {
+    const vk = findById(gov(c).virtual_keys, id)
+    return vk !== undefined && inScope(scope, vk.team_id ?? "", "", vk.customer_id ?? "", "")
+  }
+  return false
+}
+
+function scopeDenied(): ApiReply {
+  return reply(403, errorBody("the data access scope of this role does not allow this change"))
+}
+
+// One page of a list: limit (default 25, at most 100), offset or page (counted from 1).
+function pageOf<T>(xs: T[], sp: URLSearchParams): { items: T[], limit: int, offset: int, total: int } {
+  let limit: int = parseInt(sp.get("limit") ?? "25") ?? 25
+  if (limit < 1) limit = 25
+  if (limit > 100) limit = 100
+  let offset: int = parseInt(sp.get("offset") ?? "0") ?? 0
+  const page: int = parseInt(sp.get("page") ?? "0") ?? 0
+  if (offset === 0 && page > 1) offset = (page - 1) * limit
+  if (offset < 0) offset = 0
+  return { items: xs.slice(offset, offset + limit), limit: limit, offset: offset, total: xs.length }
+}
+
+function projectFrom(id: string, b: ProjectBody): ProjectConfig {
+  return {
+    id: id,
+    name: b.name ?? "",
+    description: b.description,
+    is_active: b.is_active,
+    access_rule: b.access_rule,
+    accounting_mode: b.accounting_mode,
+    membership_mode: b.membership_mode,
+    virtual_key_ids: b.virtual_key_ids,
+    budget_id: b.budget_id,
+    rate_limit_id: b.rate_limit_id,
+    provider_configs: b.provider_configs,
+    split_policy: b.split_policy,
+  }
+}
+
+function parseProjectBody(b: string): ProjectBody | undefined {
+  try {
+    return JSON.parse(b) as ProjectBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseBusinessUnitBody(b: string): BusinessUnitBody | undefined {
+  try {
+    return JSON.parse(b) as BusinessUnitBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+function parseRoleBody(b: string): RoleBody | undefined {
+  try {
+    return JSON.parse(b) as RoleBody
+  } catch (e) {
+    return undefined
+  }
+}
+
+// GET /api/governance/projects: search by name or description, is_active, and the scope.
+function projectsView(c: Config, sp: URLSearchParams, scope: DataScope): string {
+  const q = (sp.get("search") ?? "").toLowerCase()
+  const active = sp.get("is_active") ?? ""
+  const all: ProjectConfig[] = []
+  for (const p of gov(c).projects ?? []) {
+    if (!recordInScope(c, "projects", p.id, scope)) continue
+    if (q !== "" && !p.name.toLowerCase().includes(q) && !(p.description ?? "").toLowerCase().includes(q)) continue
+    if (active === "true" && p.is_active === false) continue
+    if (active === "false" && p.is_active !== false) continue
+    all.push(p)
+  }
+  const pg = pageOf(all, sp)
+  return JSON.stringify({ projects: pg.items, pagination: { limit: pg.limit, offset: pg.offset, total_count: pg.total } })
+}
+
+// /api/governance/projects[/{id}]: Bifrost's shapes. Creating needs all-data; a scoped user may
+// change the projects in its scope.
+function projectRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
+  if (segs.length > 6) return notFound(path)
+  const id = segs[3]
+  if (id === undefined) {
+    if (m === "GET") return reply(200, projectsView(store.cfg, sp, scope))
+    if (m !== "POST") return notAllowed(m)
+    if (!scope.all) return scopeDenied()
+    const b = parseProjectBody(body)
+    if (b === undefined) return badBody()
+    const pid = resolveId(undefined, b.id, "project-")
+    const r = store.upsertProject(projectFrom(pid, b))
+    if (r.kind === "error") return errReply(r)
+    return reply(201, JSON.stringify({ project: findById(gov(store.cfg).projects, pid) }))
+  }
+  const cur = findById(gov(store.cfg).projects, id)
+  if (cur === undefined || !recordInScope(store.cfg, "projects", id, scope)) return reply(404, errorBody(`no project ${id}`))
+  if (segs.length >= 5) return projectMembersRoute(store, m, id, segs, body, path, scope)
+  if (m === "GET") return reply(200, JSON.stringify({ project: cur }))
+  if (m === "PUT") {
+    const b = parseProjectBody(body)
+    if (b === undefined) return badBody()
+    const r = store.upsertProject(projectFrom(id, b))
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ project: findById(gov(store.cfg).projects, id) }))
+  }
+  if (m === "DELETE") {
+    const r = store.deleteProject(id)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: id }))
   }
   return notAllowed(m)
+}
+
+// The budgets a project holds: its own and each provider config's.
+function projectBudgetIds(pj: ProjectConfig): string[] {
+  const out: string[] = []
+  if (pj.budget_id !== undefined) out.push(pj.budget_id)
+  for (const pc of pj.provider_configs ?? []) {
+    const b = pc.budget_id
+    if (b !== undefined && !out.includes(b)) out.push(b)
+  }
+  return out
+}
+
+// /api/governance/projects/{id}/members[/{member_id}]: the roster and, under split_policy none, a member's
+// own caps. Changing the roster or the caps needs all-data.
+function projectMembersRoute(store: ConfigStore, m: string, pid: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+  if (segs.length > 6 || segs[4] !== "members") return notFound(path)
+  const pj = findById(gov(store.cfg).projects, pid)
+  if (pj === undefined) return reply(404, errorBody(`no project ${pid}`))
+  const mid = segs[5]
+  if (mid === undefined) {
+    if (m === "GET") return reply(200, JSON.stringify({ members: pj.members ?? [], total_count: (pj.members ?? []).length }))
+    if (m !== "POST") return notAllowed(m)
+    if (!scope.all) return scopeDenied()
+    let b: MemberBody = {}
+    try {
+      b = JSON.parse(body) as MemberBody
+    } catch (e) {
+      return badBody()
+    }
+    const users: string[] = []
+    for (const x of b.members ?? []) {
+      const u = x.user_id ?? ""
+      if (u === "") return reply(400, errorBody("each member needs a user_id"))
+      users.push(u)
+    }
+    const r = store.addProjectMembers(pid, users)
+    if (r.kind === "error") return errReply(r)
+    const after = findById(gov(store.cfg).projects, pid)
+    const roster: ProjectMember[] = after === undefined ? [] : after.members ?? []
+    return reply(201, JSON.stringify({ members: roster }))
+  }
+  if (m === "GET") {
+    const one = findById(pj.members, mid)
+    if (one === undefined) return reply(404, errorBody(`no member ${mid}`))
+    return reply(200, JSON.stringify({ member: one }))
+  }
+  if (!scope.all) return scopeDenied()
+  if (m === "PUT") {
+    let c: MemberCapsBody = {}
+    if (body.trim() !== "") {
+      try {
+        c = JSON.parse(body) as MemberCapsBody
+      } catch (e) {
+        return badBody()
+      }
+    }
+    const r = store.setMemberShares(pid, mid, c.budget_shares ?? [])
+    if (r.kind === "error") return errReply(r)
+    const after = findById(gov(store.cfg).projects, pid)
+    const kept: ProjectMember | undefined = after === undefined ? undefined : findById(after.members, mid)
+    return reply(200, JSON.stringify({ member: kept }))
+  }
+  if (m === "DELETE") {
+    const r = store.removeProjectMember(pid, mid)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: mid }))
+  }
+  return notAllowed(m)
+}
+
+// GET /api/governance/business-units: the same paging as Bifrost, with count and total_count.
+function businessUnitsView(c: Config, sp: URLSearchParams, scope: DataScope): string {
+  const q = (sp.get("search") ?? "").toLowerCase()
+  const all: BusinessUnitConfig[] = []
+  for (const b of gov(c).business_units ?? []) {
+    if (!recordInScope(c, "business-units", b.id, scope)) continue
+    if (q !== "" && !b.name.toLowerCase().includes(q)) continue
+    all.push(b)
+  }
+  const pg = pageOf(all, sp)
+  return JSON.stringify({ business_units: pg.items, count: pg.items.length, total_count: pg.total, limit: pg.limit, offset: pg.offset })
+}
+
+// /api/governance/business-units[/{id}]
+function businessUnitRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
+  if (segs.length > 4) return notFound(path)
+  const id = segs[3]
+  if (id === undefined) {
+    if (m === "GET") return reply(200, businessUnitsView(store.cfg, sp, scope))
+    if (m !== "POST") return notAllowed(m)
+    if (!scope.all) return scopeDenied()
+    const b = parseBusinessUnitBody(body)
+    if (b === undefined) return badBody()
+    const bid = resolveId(undefined, b.id, "bu-")
+    const r = store.upsertBusinessUnit(businessUnitFrom(bid, b))
+    if (r.kind === "error") return errReply(r)
+    return reply(201, JSON.stringify(findById(gov(store.cfg).business_units, bid)))
+  }
+  const cur = findById(gov(store.cfg).business_units, id)
+  if (cur === undefined || !recordInScope(store.cfg, "business-units", id, scope)) return reply(404, errorBody(`no business unit ${id}`))
+  if (m === "GET") return reply(200, JSON.stringify(cur))
+  if (m === "PUT") {
+    const b = parseBusinessUnitBody(body)
+    if (b === undefined) return badBody()
+    const r = store.upsertBusinessUnit(businessUnitFrom(id, b))
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify(findById(gov(store.cfg).business_units, id)))
+  }
+  if (m === "DELETE") {
+    const r = store.deleteBusinessUnit(id)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: id }))
+  }
+  return notAllowed(m)
+}
+
+function businessUnitFrom(id: string, b: BusinessUnitBody): BusinessUnitConfig {
+  return { id: id, name: b.name ?? "", budget_id: b.budget_id, rate_limit_id: b.rate_limit_id, team_ids: b.team_ids, customer_ids: b.customer_ids }
+}
+
+// /api/roles[/{name}]: custom roles, as Bifrost's role routes name them. Built-in roles are not listed here.
+function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+  if (segs.length > 4 || segs.length === 4 && segs[3] !== "permissions") return notFound(path)
+  if (!scope.all && m !== "GET") return scopeDenied()
+  const name = segs[2]
+  if (segs.length === 4 && name !== undefined) return rolePermissions(store, m, name, body)
+  if (name === undefined) {
+    if (m === "GET") {
+      const parts: string[] = []
+      for (const r of gov(store.cfg).roles ?? []) parts.push(roleJson(r))
+      return reply(200, `{"roles":[${parts.join(",")}]}`)
+    }
+    if (m !== "POST") return notAllowed(m)
+    const b = parseRoleBody(body)
+    if (b === undefined) return badBody()
+    const ed = entityDacFrom(body)
+    if (ed.error !== "") return reply(400, errorBody(ed.error))
+    const r = store.upsertRole(roleFrom(b.name ?? "", b, ed.list))
+    if (r.kind === "error") return errReply(r)
+    const made = customRole(gov(store.cfg).roles, b.name ?? "")
+    if (made === undefined) return serverError()
+    return reply(201, roleJson(made))
+  }
+  const cur = customRole(gov(store.cfg).roles, name)
+  if (cur === undefined) return reply(404, errorBody(`no role ${name}`))
+  if (m === "GET") return reply(200, roleJson(cur))
+  if (m === "PUT") {
+    const b = parseRoleBody(body)
+    if (b === undefined) return badBody()
+    const ed = entityDacFrom(body)
+    if (ed.error !== "") return reply(400, errorBody(ed.error))
+    const r = store.upsertRole(roleFrom(name, b, ed.list))
+    if (r.kind === "error") return errReply(r)
+    const saved = customRole(gov(store.cfg).roles, name)
+    if (saved === undefined) return serverError()
+    return reply(200, roleJson(saved))
+  }
+  if (m === "DELETE") {
+    const r = store.deleteRole(name)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: name }))
+  }
+  return notAllowed(m)
+}
+
+// GET and PUT /api/roles/{name}/permissions. Bifrost names permissions by id: GET lists the role's
+// pairs with their ids, and PUT {"permission_ids": [...]} replaces the pairs with the ones those ids name.
+function rolePermissions(store: ConfigStore, m: string, name: string, body: string): ApiReply {
+  const cur = customRole(gov(store.cfg).roles, name)
+  if (cur === undefined) return reply(404, errorBody(`no role ${name}`))
+  if (m === "GET") {
+    const ids = permissionIds(RESOURCES, OPERATIONS, cur.permissions ?? [])
+    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+    return reply(200, JSON.stringify({ role: name, permissions: docs }))
+  }
+  if (m !== "PUT") return notAllowed(m)
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return badBody()
+  }
+  const raw = find(fs, "permission_ids") ?? ""
+  const pairs: PermissionPair[] = []
+  try {
+    for (const el of elements(raw)) {
+      const id = parseFloat(el)
+      const pair = id === undefined ? undefined : pairOfId(RESOURCES, OPERATIONS, Math.floor(id))
+      if (pair === undefined) return reply(400, errorBody(`unknown permission id ${el}`))
+      pairs.push(pair)
+    }
+  } catch (e) {
+    return reply(400, errorBody("permission_ids must be a list of permission ids"))
+  }
+  const r = store.upsertRole({ name: name, description: cur.description, dac: cur.dac, permissions: pairs })
+  if (r.kind === "error") return errReply(r)
+  return rolePermissions(store, "GET", name, "")
+}
+
+function roleFrom(name: string, b: RoleBody, entity: EntityDac[]): RoleConfig {
+  return { name: name, description: b.description, dac: b.dac, permissions: b.permissions, entity_dac: entity }
+}
+
+// A role body's entity_dac, read from Bifrost's object form ({"Logs": "own-data"}). Undefined keys
+// count as no overrides; a value that is not a string is an error.
+function entityDacFrom(body: string): { list: EntityDac[], error: string } {
+  const out: EntityDac[] = []
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return { list: out, error: "" }
+  }
+  const raw = find(fs, "entity_dac")
+  if (raw === undefined || raw === "null") return { list: out, error: "" }
+  if (!raw.startsWith("{")) return { list: out, error: "entity_dac must be an object" }
+  let inner: Field[] = []
+  try {
+    inner = fields(raw)
+  } catch (e) {
+    return { list: out, error: "entity_dac must be an object" }
+  }
+  for (const f of inner) {
+    if (!f.raw.startsWith("\"")) return { list: out, error: `entity_dac ${f.key} must be a data access scope` }
+    let dac = ""
+    try {
+      dac = decodeString(f.raw)
+    } catch (e) {
+      return { list: out, error: `entity_dac ${f.key} must be a data access scope` }
+    }
+    out.push({ resource: f.key, dac: dac })
+  }
+  return { list: out, error: "" }
+}
+
+// A custom role as the management API shows it: entity_dac as Bifrost's object, dac only when set.
+function roleJson(r: RoleConfig): string {
+  const parts: string[] = [`"name":${quote(r.name)}`]
+  if (r.description !== undefined) parts.push(`"description":${quote(r.description)}`)
+  if (r.dac !== undefined) parts.push(`"dac":${quote(r.dac)}`)
+  parts.push(`"permissions":${JSON.stringify(r.permissions ?? [])}`)
+  const ed: string[] = []
+  for (const e of r.entity_dac ?? []) ed.push(`${quote(e.resource)}:${quote(e.dac)}`)
+  parts.push(`"entity_dac":{${ed.join(",")}}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// Saves a provider under name from a provider body (PUT upserts, POST creates) and reads it back masked.
+function saveProvider(store: ConfigStore, name: string, body: string): ApiReply {
+  const p = parseProvider(body)
+  if (p === undefined) return badBody()
+  const r = store.upsertProvider(name, p)
+  if (r.kind === "error") return errReply(r)
+  const saved = providerOf(store.cfg, name)
+  if (saved === undefined) return serverError()
+  return reply(200, JSON.stringify(redactProvider(saved)))
+}
+
+// POST /api/providers: adds the provider named by the body's provider field (Bifrost's shape); 409 when it exists.
+function createProvider(store: ConfigStore, body: string): ApiReply {
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return badBody()
+  }
+  const name = rawStr(fs, "provider") ?? ""
+  if (name === "") return reply(400, errorBody("provider is required"))
+  if (!validProviderName(name)) return reply(400, errorBody(`invalid provider name ${name}`))
+  if (providerOf(store.cfg, name) !== undefined) return reply(409, errorBody(`provider ${name} already exists`))
+  return saveProvider(store, name, body)
+}
+
+// GET /api/providers/{p}/keys: the keys with secrets masked, in Bifrost's {keys, total} shape.
+function listProviderKeys(store: ConfigStore, name: string): ApiReply {
+  const p = providerOf(store.cfg, name)
+  if (p === undefined) return reply(404, errorBody(`no provider ${name}`))
+  const ks: KeyConfig[] = []
+  for (const k of p.keys ?? []) ks.push(redactKey(k))
+  return reply(200, JSON.stringify({ keys: ks, total: ks.length }))
+}
+
+// GET /api/providers/{p}/keys/{id}: one key, masked.
+function getProviderKey(store: ConfigStore, name: string, keyId: string): ApiReply {
+  const p = providerOf(store.cfg, name)
+  if (p === undefined) return reply(404, errorBody(`no provider ${name}`))
+  const k = findKey(p.keys ?? [], keyId)
+  if (k === undefined) return reply(404, errorBody(`no key ${keyId} on provider ${name}`))
+  return reply(200, JSON.stringify(redactKey(k)))
 }
 
 function providerRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string): ApiReply {
   if (segs.length === 2) {
     if (m === "GET") return reply(200, providerList(store.cfg))
+    if (m === "POST") return createProvider(store, body)
     return notAllowed(m)
   }
   const name = segs[2] ?? ""
@@ -1777,15 +2852,7 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
       if (p === undefined) return reply(404, errorBody(`no provider ${name}`))
       return reply(200, JSON.stringify(redactProvider(p)))
     }
-    if (m === "PUT") {
-      const p = parseProvider(body)
-      if (p === undefined) return badBody()
-      const r = store.upsertProvider(name, p)
-      if (r.kind === "error") return errReply(r)
-      const saved = providerOf(store.cfg, name)
-      if (saved === undefined) return serverError()
-      return reply(200, JSON.stringify(redactProvider(saved)))
-    }
+    if (m === "PUT") return saveProvider(store, name, body)
     if (m === "DELETE") {
       const r = store.deleteProvider(name)
       if (r.kind === "error") return errReply(r)
@@ -1795,6 +2862,7 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
   }
   if (segs[3] !== "keys" || segs.length > 5) return notFound(path)
   if (segs.length === 4) {
+    if (m === "GET") return listProviderKeys(store, name)
     if (m !== "POST") return notAllowed(m)
     const k = parseKey(body)
     if (k === undefined) return badBody()
@@ -1807,6 +2875,7 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
     return reply(201, JSON.stringify(redactKey(saved)))
   }
   const keyId = segs[4] ?? ""
+  if (m === "GET") return getProviderKey(store, name, keyId)
   if (m === "PUT") {
     const k = parseKey(body)
     if (k === undefined) return badBody()
@@ -1830,7 +2899,7 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
 const RAIJU_VERSION = "0.1.0"
 
 // The client section's settings by JSON type, for PUT /api/config. Any other name is refused.
-const CLIENT_BOOL = ["drop_excess_requests", "disable_content_logging", "allow_per_request_content_storage_override", "enable_logging", "enable_governance", "enforce_governance_header", "enforce_auth_on_inference", "allow_direct_keys"]
+const CLIENT_BOOL = ["drop_excess_requests", "disable_content_logging", "allow_per_request_content_storage_override", "enable_logging", "enable_governance", "enforce_governance_header", "enforce_auth_on_inference", "allow_direct_keys", "refuse_unpriced_models", "delete_expired_virtual_keys", "hide_deleted_virtual_keys_in_filters", "enforce_vk_object_ownership", "mcp_enable_temp_token_auth"]
 const CLIENT_INT = ["max_request_body_size_mb", "async_job_result_ttl", "mcp_agent_depth"]
 const CLIENT_LIST = ["required_headers", "allowed_origins", "prometheus_labels", "mcp_auto_execute"]
 
@@ -1852,6 +2921,8 @@ function clientProblem(text: string): string {
       if (!digitsOnly(raw)) return `${f.key} must be a whole number`
     } else if (CLIENT_LIST.includes(f.key)) {
       if (!raw.startsWith("[")) return `${f.key} must be a list`
+    } else if (f.key === "vk_rotation_cooldown") {
+      if (!raw.startsWith("\"")) return "vk_rotation_cooldown must be a duration string such as 1h"
     } else return `unknown client setting ${f.key}`
   }
   return ""
@@ -1865,8 +2936,66 @@ function digitsOnly(s: string): bool {
   return true
 }
 
-// PUT /api/config: replaces the client section, given as client_config (Bifrost) or client.
-// The rest of the config is saved as it was.
+// The framework_config section (Bifrost's TableFrameworkConfig): pricing_url and pricing_sync_interval
+// become pricing_sync. An empty pricing_url resets to the default; model_parameters_url is read and
+// not used (Raiju serves its parameters from the embedded table or the pricing datasheet).
+type FrameworkPlan = { kind: "ok", ps: PricingSyncConfig | undefined } | { kind: "error", message: string }
+
+function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): FrameworkPlan {
+  let fs: Field[] = []
+  try {
+    fs = fields(raw)
+  } catch (e) {
+    return { kind: "error", message: "framework_config must be a JSON object" }
+  }
+  let url: string | undefined = cur?.url
+  const given = rawStr(fs, "pricing_url")
+  if (find(fs, "pricing_url") !== undefined && given === undefined) return { kind: "error", message: "pricing_url must be a string" }
+  if (given !== undefined) url = given === "" ? undefined : given
+  if (url !== undefined && !url.startsWith("https://") && !url.startsWith("http://")) return { kind: "error", message: "pricing_url must be an http or https URL" }
+  let interval: int | undefined = cur?.interval_seconds
+  const iv = rawNum(fs, "pricing_sync_interval")
+  if (find(fs, "pricing_sync_interval") !== undefined && iv === undefined) return { kind: "error", message: "pricing_sync_interval must be a number of seconds" }
+  if (iv !== undefined) {
+    if (iv <= 0.0) return { kind: "error", message: "pricing_sync_interval must be positive" }
+    interval = Math.floor(iv)
+  }
+  if (url === undefined && interval === undefined && cur?.enabled === undefined) return { kind: "ok", ps: undefined }
+  return { kind: "ok", ps: { url: url, interval_seconds: interval, enabled: cur?.enabled } }
+}
+
+// The auth_config section (Bifrost's auth config, as PUT /api/config takes it): admin_username and
+// admin_password replace the stored credential ("<redacted>" keeps the stored password), is_enabled false
+// clears it, and disable_auth_on_inference sets client.enforce_auth_on_inference. The token is kept.
+type AuthPlan = { kind: "ok", auth: AdminAuthConfig, disable: bool | undefined } | { kind: "error", message: string }
+
+function authPlan(raw: string, cur: AdminAuthConfig | undefined): AuthPlan {
+  let fs: Field[] = []
+  try {
+    fs = fields(raw)
+  } catch (e) {
+    return { kind: "error", message: "auth_config must be a JSON object" }
+  }
+  const enabledRaw = find(fs, "is_enabled")
+  if (enabledRaw !== undefined && rawBool(fs, "is_enabled") === undefined) return { kind: "error", message: "is_enabled must be true or false" }
+  const disableRaw = find(fs, "disable_auth_on_inference")
+  if (disableRaw !== undefined && rawBool(fs, "disable_auth_on_inference") === undefined) return { kind: "error", message: "disable_auth_on_inference must be true or false" }
+  const disable = rawBool(fs, "disable_auth_on_inference")
+  if (rawBool(fs, "is_enabled") === false) return { kind: "ok", auth: { token: cur?.token }, disable: disable }
+  let user: string | undefined = cur?.username
+  const u = rawStr(fs, "admin_username")
+  if (u !== undefined) user = u
+  let pw: string | undefined = cur?.password
+  const p = rawStr(fs, "admin_password")
+  if (p !== undefined && p !== REDACTED) pw = p
+  if (user === undefined || user === "" || pw === undefined || pw === "") {
+    return { kind: "error", message: "admin_username and admin_password are required to turn admin auth on" }
+  }
+  return { kind: "ok", auth: { username: user, password: pw, token: cur?.token }, disable: disable }
+}
+
+// PUT /api/config: the sections Bifrost's handler takes, each given section replaced and the rest kept:
+// client_config (or client), framework_config and auth_config. Every section is checked before any is saved.
 function putConfig(store: ConfigStore, body: string): ApiReply {
   let fs: Field[] = []
   try {
@@ -1874,19 +3003,225 @@ function putConfig(store: ConfigStore, body: string): ApiReply {
   } catch (e) {
     return badBody()
   }
-  const raw = find(fs, "client_config") ?? find(fs, "client")
-  if (raw === undefined) return reply(400, errorBody("the body needs a client_config (or client) object"))
-  const problem = clientProblem(raw)
-  if (problem !== "") return reply(400, errorBody(problem))
-  let c: ClientConfig = {}
-  try {
-    c = JSON.parse(raw) as ClientConfig
-  } catch (e) {
-    return badBody()
+  const rawClient = find(fs, "client_config") ?? find(fs, "client")
+  const rawFramework = find(fs, "framework_config")
+  const rawAuth = find(fs, "auth_config")
+  if (rawClient === undefined && rawFramework === undefined && rawAuth === undefined) {
+    return reply(400, errorBody("the body needs a client_config, framework_config or auth_config object"))
   }
-  const r = store.setClient(c)
+  let c: ClientConfig | undefined = undefined
+  if (rawClient !== undefined) {
+    const problem = clientProblem(rawClient)
+    if (problem !== "") return reply(400, errorBody(problem))
+    try {
+      c = JSON.parse(rawClient) as ClientConfig
+    } catch (e) {
+      return badBody()
+    }
+  }
+  let fp: FrameworkPlan = { kind: "ok", ps: store.cfg.pricing_sync }
+  if (rawFramework !== undefined) fp = frameworkPlan(rawFramework, store.cfg.pricing_sync)
+  if (fp.kind === "error") return reply(400, errorBody(fp.message))
+  let ap: AuthPlan | undefined = undefined
+  if (rawAuth !== undefined) {
+    ap = authPlan(rawAuth, store.cfg.governance?.auth_config ?? store.cfg.auth_config)
+    if (ap.kind === "error") return reply(400, errorBody(ap.message))
+  }
+  // disable_auth_on_inference is client.enforce_auth_on_inference, inverted
+  let disable: bool | undefined = undefined
+  if (ap !== undefined && ap.kind === "ok") disable = ap.disable
+  if (c !== undefined || disable !== undefined) {
+    let cl: ClientConfig = c ?? store.cfg.client ?? {}
+    if (disable !== undefined) cl.enforce_auth_on_inference = !disable
+    const r = store.setClient(cl)
+    if (r.kind === "error") return errReply(r)
+  }
+  if (rawFramework !== undefined) {
+    const r = store.setPricingSync(fp.ps)
+    if (r.kind === "error") return errReply(r)
+  }
+  if (ap !== undefined && ap.kind === "ok") {
+    const r = store.setAdminAuth(ap.auth)
+    if (r.kind === "error") return errReply(r)
+  }
+  const pf = store.cfg.pricing_sync
+  const au = store.cfg.governance?.auth_config
+  const view = JSON.stringify({
+    status: "success",
+    message: "config updated successfully",
+    client: store.cfg.client ?? {},
+    framework_config: { pricing_url: pf?.url ?? "", pricing_sync_interval: pf?.interval_seconds ?? 0 },
+    auth_config: { admin_username: au?.username ?? "", is_enabled: au?.username !== undefined, disable_auth_on_inference: store.cfg.client?.enforce_auth_on_inference === false },
+  })
+  return reply(200, view)
+}
+
+// ---- routing rules, complexity analyzer, budget overrides, expired keys ----
+
+// PUT /api/governance/virtual-keys/{vk}/budgets/{budget}/override and DELETE on the same path.
+function budgetOverrideRoute(store: ConfigStore, m: string, vkId: string, budgetId: string, body: string, scope: DataScope): ApiReply {
+  if (m !== "PUT" && m !== "DELETE") return notAllowed(m)
+  if (!scope.all) return scopeDenied()
+  if (!recordInScope(store.cfg, "virtual-keys", vkId, scope)) return reply(404, errorBody(`no virtual-keys ${vkId}`))
+  let o: BudgetOverride | undefined = undefined
+  if (m === "PUT") {
+    const pr = parseOverride(body)
+    if (pr.kind === "error") return reply(400, errorBody(pr.message))
+    o = pr.override
+  }
+  const r = store.setBudgetOverride(vkId, budgetId, o)
   if (r.kind === "error") return errReply(r)
-  return reply(200, JSON.stringify({ status: "success", message: "config updated successfully", client: store.cfg.client ?? {} }))
+  const b = findById(gov(store.cfg).budgets, budgetId)
+  // a cycles override adds to the limit for its cycles, so the view counts it while it runs
+  let eff = 0.0
+  if (b !== undefined) {
+    eff = effectiveBudgetLimit(b)
+    const o = b.override
+    if (o !== undefined && o.mode === "cycles") eff += o.amount
+  }
+  return reply(200, JSON.stringify({ budget: b, effective_max_limit: eff }))
+}
+
+// GET /api/governance/virtual-keys/{vk}/users. A key has one assigned user (its user_id).
+function vkUsers(store: ConfigStore, m: string, id: string, scope: DataScope): ApiReply {
+  if (m !== "GET") return notAllowed(m)
+  const vk = findById(gov(store.cfg).virtual_keys, id)
+  if (vk === undefined || !recordInScope(store.cfg, "virtual-keys", id, scope)) return reply(404, errorBody(`no virtual-keys ${id}`))
+  const users: { user_id: string, user_name: string, user_email: string, source: string }[] = []
+  const u = vk.user_id ?? ""
+  if (u !== "") users.push({ user_id: u, user_name: u, user_email: "", source: "assigned" })
+  return reply(200, JSON.stringify({ users: users }))
+}
+
+// GET /api/resources, /api/operations and /api/permissions (and the /api/governance/rbac/ forms).
+function rbacListing(what: string, m: string): ApiReply {
+  if (m !== "GET") return notAllowed(m)
+  if (what === "resources") return reply(200, JSON.stringify({ resources: RESOURCES.map((r, i) => ({ id: i + 1, name: r })) }))
+  if (what === "operations") return reply(200, JSON.stringify({ operations: OPERATIONS.map((o, i) => ({ id: i + 1, name: o })) }))
+  return reply(200, JSON.stringify({ permissions: permissionDocs(RESOURCES, OPERATIONS) }))
+}
+
+// A routing rule as a request body gives it: every field optional, so ruleError names what is missing.
+type RuleBody = { id?: string, name?: string, cel_expression?: string, targets?: RuleTarget[], fallbacks?: string[], scope?: "global" | "virtual_key" | "team" | "customer", scope_id?: string, priority?: int, enabled?: bool }
+
+// The routing rule in a request body. The id comes from the path or is generated; the rest is taken as given.
+function parseRule(b: string, id: string): RoutingRule | undefined {
+  try {
+    const r = JSON.parse(b) as RuleBody
+    const given = r.id ?? ""
+    return { id: given === "" ? id : given, name: r.name, cel_expression: r.cel_expression ?? "", targets: r.targets ?? [], fallbacks: r.fallbacks, scope: r.scope, scope_id: r.scope_id, priority: r.priority, enabled: r.enabled }
+  } catch (e) {
+    return undefined
+  }
+}
+
+// /api/governance/routing-rules[/{id}] (and /api/routing/rules): the CEL routing rules, as Raiju stores them.
+function routingRulesRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+  if (!scope.all && m !== "GET") return scopeDenied()
+  const rules: RoutingRule[] = gov(store.cfg).routing_rules ?? []
+  if (segs.length === 3) {
+    if (m === "GET") return reply(200, JSON.stringify({ rules: rules, total: rules.length }))
+    if (m !== "POST") return notAllowed(m)
+    const rule = parseRule(body, randomId("rule"))
+    if (rule === undefined) return badBody()
+    if (findById(rules, rule.id) !== undefined) return reply(409, errorBody(`routing rule ${rule.id} exists`))
+    const r = store.upsertRoutingRule(rule)
+    if (r.kind === "error") return errReply(r)
+    return reply(201, JSON.stringify(findById(gov(store.cfg).routing_rules, rule.id)))
+  }
+  if (segs.length !== 4) return notFound(path)
+  const id = segs[3] ?? ""
+  const cur = findById(rules, id)
+  if (cur === undefined) return reply(404, errorBody(`no routing rule ${id}`))
+  if (m === "GET") return reply(200, JSON.stringify(cur))
+  if (m === "PUT") {
+    const rule = parseRule(body, id)
+    if (rule === undefined) return badBody()
+    const r = store.upsertRoutingRule(rule)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify(findById(gov(store.cfg).routing_rules, id)))
+  }
+  if (m === "DELETE") {
+    const r = store.deleteRoutingRule(id)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: id }))
+  }
+  return notAllowed(m)
+}
+
+// /api/governance/complexity-analyzer-config (and /api/routing/...): Raiju's complexity_router, read,
+// replaced, or reset to none.
+function complexityRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+  if (!scope.all && m !== "GET") return scopeDenied()
+  const reset = segs.length === 4 && segs[3] === "reset"
+  if (segs.length === 3 && m === "GET") return reply(200, JSON.stringify(store.cfg.complexity_router ?? {}))
+  if (segs.length === 3 && m === "PUT") {
+    const problem = complexityProblem(body)
+    if (problem !== "") return reply(400, errorBody(problem))
+    const cs = complexityFrom(body)
+    if (cs === undefined) return badBody()
+    const r = store.setComplexity(cs)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify(store.cfg.complexity_router ?? {}))
+  }
+  if (reset && m === "POST") {
+    const r = store.setComplexity(undefined)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({}))
+  }
+  if (segs.length === 3 || reset) return notAllowed(m)
+  return notFound(path)
+}
+
+// The expired-key cleanup (Bifrost's daily vk_expiry_cleanup): deletes the keys expiredToDelete names.
+// Returns the ids deleted. Run by the supervisor on a timer (ops.tov sweepExpiredKeys).
+export function sweepExpiredKeys(store: ConfigStore, nowMs: number): string[] {
+  const done: string[] = []
+  for (const id of expiredToDelete(store.cfg.governance, store.cfg.client, nowMs)) {
+    const r = store.deleteVirtualKey(id)
+    if (r.kind === "ok") done.push(id)
+  }
+  return done
+}
+
+// POST /api/config/metadata: merges the body's keys into the metadata map; null removes a key.
+// Values are strings, numbers or booleans (Bifrost takes any JSON value; objects and lists are refused).
+function postMetadata(store: ConfigStore, body: string): ApiReply {
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return reply(400, errorBody("Invalid request payload"))
+  }
+  if (fs.length === 0) return reply(400, errorBody("patch body must contain at least one key"))
+  const m: Map<string, string | f64 | bool> = new Map()
+  const cur = store.cfg.metadata
+  if (cur !== undefined) {
+    for (const k of cur.keys()) m.set(k, cur.get(k)!)
+  }
+  for (const f of fs) {
+    const raw = f.raw
+    if (raw === "null") {
+      m.delete(f.key)
+    } else if (raw.startsWith("\"")) {
+      let s = ""
+      try {
+        s = decodeString(raw)
+      } catch (e) {
+        return reply(400, errorBody(`metadata ${f.key} is not a valid string`))
+      }
+      m.set(f.key, s)
+    } else if (raw === "true" || raw === "false") {
+      m.set(f.key, raw === "true")
+    } else {
+      const n = parseFloat(raw)
+      if (n === undefined) return reply(400, errorBody(`metadata ${f.key} must be a string, number, boolean or null`))
+      m.set(f.key, n)
+    }
+  }
+  const r = store.setMetadata(m)
+  if (r.kind === "error") return errReply(r)
+  return reply(200, JSON.stringify({ success: true }))
 }
 
 // GET /api/keys: every provider key in one list, secrets masked (Bifrost's shape).
@@ -1922,14 +3257,28 @@ function modelList(c: Config, only: string, query: string, limit: f64, offset: f
   return JSON.stringify({ models: all.slice(from, from + n), total: all.length })
 }
 
-export function handleApi(store: ConfigStore, method: string, path: string, body: string): ApiReply {
+// scope is what the caller may see and change (see scope.tov); all data when it is not given.
+export function handleApi(store: ConfigStore, method: string, path: string, body: string, scope?: DataScope): ApiReply {
   const m = method.toUpperCase()
   const q = path.indexOf("?")
   const p = q < 0 ? path : path.slice(0, q)
+  const sc: DataScope = scope ?? allScope()
+  const qp = new URLSearchParams(q < 0 ? "" : path.slice(q + 1))
   const segs = p.split("/").filter((s) => s !== "")
   if (segs.length === 0 || segs[0] !== "api") return notFound(p)
   const area = segs[1] ?? ""
+  // Bifrost's /api/routing/... are the governance routes
+  if (area === "routing" && segs.length >= 3) {
+    const sub = segs[2] === "rules" ? "routing-rules" : segs[2] ?? ""
+    return governanceRoute(store, m, ["api", "governance", sub].concat(segs.slice(3)), body, p, qp, sc)
+  }
+  // Bifrost's RBAC catalogue: the resources, operations and permission pairs (read only)
+  if (area === "resources" || area === "operations" || area === "permissions") {
+    if (segs.length !== 2) return notFound(p)
+    return rbacListing(area, m)
+  }
   if (area === "config") {
+    if (segs.length === 3 && segs[2] === "metadata") return m === "POST" ? postMetadata(store, body) : notAllowed(m)
     if (segs.length !== 2) return notFound(p)
     if (m === "PUT") return putConfig(store, body)
     return m === "GET" ? reply(200, store.redacted()) : notAllowed(m)
@@ -1960,7 +3309,8 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
     return proxyRoute(store, m, body)
   }
   if (area === "providers") return providerRoute(store, m, segs, body, p)
-  if (area === "governance" && segs.length >= 3) return governanceRoute(store, m, segs, body, p)
+  if (area === "governance" && segs.length >= 3) return governanceRoute(store, m, segs, body, p, qp, sc)
+  if (area === "roles") return roleRoute(store, m, segs, body, p, sc)
   return notFound(p)
 }
 
@@ -2003,6 +3353,118 @@ test("proxy-config: defaults, validation, password kept on <redacted>, and widen
     // disabling clears the proxy for providers too
     expect(handleApi(store, "PUT", "/api/proxy-config", `{"enabled":false}`).status).toBe(200)
     expect(store.cfg.proxy_config?.enabled).toBe(false)
+  } finally {
+    cleanup(path)
+  }
+})
+
+test("sweepExpiredKeys deletes the expired keys that opted in and keeps the others", () => {
+  const path = tmpPath()
+  try {
+    const store = try new ConfigStore(path, { governance: { virtual_keys: [
+      { id: "x", value: "vx", expires_at: "2001-01-01T00:00:00Z", delete_after_expire: true },
+      { id: "y", value: "vy", expires_at: "2001-01-01T00:00:00Z" },
+      { id: "z", value: "vz", expires_at: "2999-01-01T00:00:00Z", delete_after_expire: true },
+    ] } })
+    expect(sweepExpiredKeys(store, Date.now()).join(",")).toBe("x")
+    const left = store.cfg.governance?.virtual_keys ?? []
+    expect(left.map((v) => v.id).join(",")).toBe("y,z")
+  } finally {
+    cleanup(path)
+  }
+})
+
+test("PUT /api/config: framework_config and auth_config are checked, then saved, and the rest is kept", () => {
+  const path = tmpPath()
+  try {
+    const store = try new ConfigStore(path, { governance: { auth_config: { username: "root", password: "pw1" } } })
+    expect(handleApi(store, "PUT", "/api/config", `{}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/config", `{"framework_config":{"pricing_url":"ftp://x"}}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/config", `{"framework_config":{"pricing_sync_interval":0}}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"admin_username":"","admin_password":"x"}}`).status).toBe(400)
+    // a bad section saves nothing, the good one included
+    expect(handleApi(store, "PUT", "/api/config", `{"client_config":{"bogus":1},"auth_config":{"is_enabled":false}}`).status).toBe(400)
+    expect(store.cfg.governance?.auth_config?.username).toBe("root")
+
+    const ok = handleApi(store, "PUT", "/api/config", `{"framework_config":{"pricing_url":"https://prices.example/x.json","pricing_sync_interval":7200}}`)
+    expect(ok.status).toBe(200)
+    expect(store.cfg.pricing_sync?.url).toBe("https://prices.example/x.json")
+    expect(store.cfg.pricing_sync?.interval_seconds).toBe(7200)
+    expect(handleApi(store, "PUT", "/api/config", `{"framework_config":{"pricing_url":""}}`).status).toBe(200)
+    expect(store.cfg.pricing_sync?.url).toBeUndefined()
+
+    // a redacted password keeps the stored one; disable_auth_on_inference sets client.enforce_auth_on_inference
+    expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"admin_username":"root","admin_password":"<redacted>","disable_auth_on_inference":true}}`).status).toBe(200)
+    expect(store.cfg.governance?.auth_config?.password).toBe("pw1")
+    expect(store.cfg.client?.enforce_auth_on_inference).toBe(false)
+    expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"admin_username":"ops","admin_password":"pw2","disable_auth_on_inference":false}}`).status).toBe(200)
+    expect(store.cfg.governance?.auth_config?.username).toBe("ops")
+    expect(store.cfg.client?.enforce_auth_on_inference).toBe(true)
+    expect(handleApi(store, "PUT", "/api/config", `{"client_config":{"max_request_body_size_mb":5}}`).status).toBe(200)
+    expect(store.cfg.governance?.auth_config?.username).toBe("ops")
+    expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"is_enabled":false}}`).status).toBe(200)
+    expect(store.cfg.governance?.auth_config?.username).toBeUndefined()
+  } finally {
+    cleanup(path)
+  }
+})
+
+test("governance: budget overrides, VK users, routing rules, complexity config, role permission ids and the catalogue", () => {
+  const path = tmpPath()
+  try {
+    const store = try new ConfigStore(path, { governance: {
+      budgets: [{ id: "b1", max_limit: 10, reset_duration: "1d" }],
+      virtual_keys: [{ id: "vk1", value: "v1", budget_id: "b1", user_id: "alice" }, { id: "vk2", value: "v2" }],
+    } })
+    // budget override: forever adds to the limit; a key only reaches its own budgets; cycles add for their cycles
+    const ov = handleApi(store, "PUT", "/api/governance/virtual-keys/vk1/budgets/b1/override", `{"amount": 5, "mode": "forever"}`)
+    expect(ov.status).toBe(200)
+    expect(ov.body.includes(`"effective_max_limit":15`)).toBe(true)
+    expect(handleApi(store, "PUT", "/api/governance/virtual-keys/vk2/budgets/b1/override", `{"amount": 5, "mode": "forever"}`).status).toBe(404)
+    const cyc = handleApi(store, "PUT", "/api/governance/virtual-keys/vk1/budgets/b1/override", `{"amount": 5, "mode": "cycles", "cycles": 2}`)
+    expect(cyc.status).toBe(200)
+    expect(cyc.body.includes(`"effective_max_limit":15`)).toBe(true)
+    expect(handleApi(store, "PUT", "/api/governance/virtual-keys/vk1/budgets/b1/override", `{"amount": 5, "mode": "weekly"}`).status).toBe(400)
+    expect(handleApi(store, "DELETE", "/api/governance/virtual-keys/vk1/budgets/b1/override", "").status).toBe(200)
+    const bs = store.cfg.governance?.budgets ?? []
+    expect(bs[0]!.override).toBeUndefined()
+
+    expect(handleApi(store, "GET", "/api/governance/virtual-keys/vk1/users", "").body.includes(`"user_id":"alice"`)).toBe(true)
+    expect(handleApi(store, "GET", "/api/governance/virtual-keys/vk2/users", "").body.includes(`"users":[]`)).toBe(true)
+
+    // routing rules: CRUD on the CEL rules, through both route families
+    const made = handleApi(store, "POST", "/api/routing/rules", `{"name":"big","cel_expression":"request > 10","targets":[{"provider":"openai"}]}`)
+    expect(made.status).toBe(201)
+    const rrs = store.cfg.governance?.routing_rules ?? []
+    const id = rrs[0]?.id ?? ""
+    expect(id !== "").toBe(true)
+    expect(handleApi(store, "GET", "/api/governance/routing-rules", "").body.includes(`"total":1`)).toBe(true)
+    expect(handleApi(store, "POST", "/api/governance/routing-rules", `{"cel_expression":"request >","targets":[{"provider":"openai"}]}`).status).toBe(400)
+    expect(handleApi(store, "PUT", `/api/governance/routing-rules/${id}`, `{"cel_expression":"true","targets":[]}`).status).toBe(400)
+    expect(handleApi(store, "PUT", `/api/governance/routing-rules/${id}`, `{"cel_expression":"request > 20","targets":[{"provider":"anthropic"}]}`).status).toBe(200)
+    expect(handleApi(store, "GET", `/api/routing/rules/${id}`, "").body.includes("anthropic")).toBe(true)
+    expect(handleApi(store, "DELETE", `/api/routing/rules/${id}`, "").status).toBe(200)
+    expect(handleApi(store, "GET", `/api/routing/rules/${id}`, "").status).toBe(404)
+
+    // complexity analyzer config
+    expect(handleApi(store, "GET", "/api/governance/complexity-analyzer-config", "").body).toBe("{}")
+    expect(handleApi(store, "PUT", "/api/governance/complexity-analyzer-config", `{"enabled":"yes"}`).status).toBe(400)
+    expect(handleApi(store, "PUT", "/api/governance/complexity-analyzer-config", `{"enabled":true,"simple_max_score":0.3}`).status).toBe(200)
+    expect(store.cfg.complexity_router?.enabled).toBe(true)
+    expect(handleApi(store, "POST", "/api/governance/complexity-analyzer-config/reset", "").status).toBe(200)
+    expect(store.cfg.complexity_router).toBeUndefined()
+
+    // roles by id, and the catalogue
+    expect(handleApi(store, "POST", "/api/roles", `{"name":"ops","permissions":[]}`).status).toBe(201)
+    const put = handleApi(store, "PUT", "/api/roles/ops/permissions", `{"permission_ids":[1,2]}`)
+    expect(put.status).toBe(200)
+    expect(put.body.includes(`"resource":"Logs","operation":"View"`)).toBe(true)
+    expect(put.body.includes(`"operation":"Create"`)).toBe(true)
+    expect(handleApi(store, "PUT", "/api/roles/ops/permissions", `{"permission_ids":[0]}`).status).toBe(400)
+    expect(handleApi(store, "GET", "/api/roles/nope/permissions", "").status).toBe(404)
+    expect(handleApi(store, "GET", "/api/resources", "").body.includes(`"name":"VirtualKeys"`)).toBe(true)
+    expect(handleApi(store, "GET", "/api/governance/rbac/permissions", "").body.includes(`"id":1`)).toBe(true)
+    expect(handleApi(store, "POST", "/api/operations", "").status).toBe(405)
   } finally {
     cleanup(path)
   }
@@ -2304,7 +3766,7 @@ test("handleApi routes, methods and status codes", () => {
   expect(put.status).toBe(200)
   expect(put.body.includes("sk-abcdefghijkl")).toBe(false)
   expect(handleApi(s, "GET", "/api/providers", "").body.includes("sk-a…ijkl")).toBe(true)
-  expect(handleApi(s, "GET", "/api/providers/openai/keys", "").status).toBe(405)
+  expect(handleApi(s, "GET", "/api/providers/openai/keys", "").status).toBe(200)
   expect(handleApi(s, "POST", "/api/providers/openai/keys", "{\"value\":\"sk-zzzzzzzzzzzz\"}").status).toBe(201)
   expect(handleApi(s, "PUT", "/api/providers/openai/keys/nope", "{}").status).toBe(404)
   expect(handleApi(s, "POST", "/api/providers/nope/keys", "{\"value\":\"x\"}").status).toBe(404)
@@ -2460,6 +3922,11 @@ test("config put replaces only the client section", () => {
   expect(handleApi(s, "PUT", "/api/config", `{"client": {"enable_logging": 1}}`).status).toBe(400)
   expect(handleApi(s, "PUT", "/api/config", `{"other": {}}`).status).toBe(400)
   expect(handleApi(s, "PUT", "/api/config", `not json`).status).toBe(400)
+  const on = handleApi(s, "PUT", "/api/config", `{"client": {"refuse_unpriced_models": true}}`)
+  expect(on.status).toBe(200)
+  expect(s.cfg.client?.refuse_unpriced_models).toBe(true)
+  expect(handleApi(s, "GET", "/api/config", "").body.includes("\"refuse_unpriced_models\":true")).toBe(true)
+  expect(handleApi(s, "PUT", "/api/config", `{"client": {"refuse_unpriced_models": "yes"}}`).status).toBe(400)
   cleanup(path)
 })
 
@@ -2535,6 +4002,48 @@ test("sealed secrets: the store writes sealed secrets to the file", () => {
   cleanup(path)
 })
 
+test("MCP client secrets and OAuth tokens are sealed at rest", () => {
+  const cipher = cipherFor("a passphrase of sixteen bytes")
+  const c: Config = { mcp: { client_configs: [{ name: "m", connection_type: "http", connection_string: "https://m/mcp", auth: { type: "oauth", client_secret: "cs-plain-1", access_token: "at-plain-2", refresh_token: "rt-plain-3" } }] } }
+  const text = JSON.stringify(try sealConfig(c, cipher))
+  expect(text.includes("rt-plain-3")).toBe(false)
+  expect(text.includes("at-plain-2")).toBe(false)
+  expect(text.includes("cs-plain-1")).toBe(false)
+  const back = try openConfig(try JSON.parse(text) as Config, cipher)
+  expect(back.errors.length).toBe(0)
+  const a = back.cfg.mcp!.client_configs![0]!.auth!
+  expect(a.refresh_token).toBe("rt-plain-3")
+  expect(a.access_token).toBe("at-plain-2")
+  expect(a.client_secret).toBe("cs-plain-1")
+})
+
+test("per-user MCP header values are sealed at rest", () => {
+  const cipher = cipherFor("a passphrase of sixteen bytes")
+  const hs: Map<string, string> = new Map()
+  hs.set("x-tenant-key", "tenant-a-key-example")
+  const c: Config = { mcp: { user_credentials: [{ id: "uc1", mcp_client_name: "m", virtual_key_id: "vk1", headers: hs, updated_at: 1.0 }] } }
+  const text = JSON.stringify(try sealConfig(c, cipher))
+  expect(text.includes("tenant-a-key-example")).toBe(false)
+  expect(text.includes("enc:v1:")).toBe(true)
+  const back = try openConfig(try JSON.parse(text) as Config, cipher)
+  expect(back.errors.length).toBe(0)
+  expect(back.cfg.mcp!.user_credentials![0]!.headers.get("x-tenant-key")).toBe("tenant-a-key-example")
+  expect(c.mcp!.user_credentials![0]!.headers.get("x-tenant-key")).toBe("tenant-a-key-example")
+})
+
+test("per-user OAuth tokens are sealed at rest", () => {
+  const cipher = cipherFor("a passphrase of sixteen bytes")
+  const row: McpUserToken = { id: "ut1", mcp_client_name: "m", virtual_key_id: "vk1", session_id: "", access_token: "acc-example-token", refresh_token: "ref-example-token", token_expires_at: 5.0, scopes: [], created_at: 1.0, last_refreshed_at: 1.0 }
+  const c: Config = { mcp: { user_tokens: [row] } }
+  const text = JSON.stringify(try sealConfig(c, cipher))
+  expect(text.includes("acc-example-token")).toBe(false)
+  expect(text.includes("ref-example-token")).toBe(false)
+  const back = try openConfig(try JSON.parse(text) as Config, cipher)
+  expect(back.errors.length).toBe(0)
+  expect(back.cfg.mcp!.user_tokens![0]!.refresh_token).toBe("ref-example-token")
+  expect(back.cfg.mcp!.user_tokens![0]!.access_token).toBe("acc-example-token")
+})
+
 test("encryption_key: an unset env reference is an error, and no key means no cipher", () => {
   const none = try cipherFromConfig({})
   expect(none === undefined).toBe(true)
@@ -2546,4 +4055,265 @@ test("encryption_key: an unset env reference is an error, and no key means no ci
   }
   expect(threw).toBe(true)
   expect((try cipherFromConfig({ encryption_key: "a literal passphrase" })) !== undefined).toBe(true)
+})
+
+test("projects: Bifrost's shapes, validation and paging", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(handleApi(s, "POST", "/api/governance/budgets", `{"id":"b-proj","max_limit":5,"reset_duration":"1M"}`).status).toBe(201)
+  const bad = handleApi(s, "POST", "/api/governance/projects", `{"name":"eval","access_rule":"both"}`)
+  expect(bad.status).toBe(400)
+  expect(handleApi(s, "POST", "/api/governance/projects", `{"name":"eval","budget_id":"nope"}`).status).toBe(400)
+  const made = handleApi(s, "POST", "/api/governance/projects", `{"id":"p1","name":"eval","budget_id":"b-proj","provider_configs":[{"provider":"anthropic"}]}`)
+  expect(made.status).toBe(201)
+  expect(made.body.includes(`"project":{`)).toBe(true)
+  expect(made.body.includes(`"access_rule":"union"`)).toBe(true)
+  expect(made.body.includes(`"accounting_mode":"both"`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/governance/projects", `{"id":"p2","name":"eval"}`).status).toBe(400)
+  const list = handleApi(s, "GET", "/api/governance/projects?limit=1", "")
+  expect(list.body.includes(`"projects":[{"id":"p1"`)).toBe(true)
+  expect(list.body.includes(`"pagination":{"limit":1,"offset":0,"total_count":1}`)).toBe(true)
+  expect(handleApi(s, "GET", "/api/governance/projects?search=zzz", "").body.includes(`"total_count":0`)).toBe(true)
+  expect(handleApi(s, "GET", "/api/governance/projects/p1", "").status).toBe(200)
+  expect(handleApi(s, "PUT", "/api/governance/projects/p1", `{"name":"eval","budget_id":"b-proj","is_active":false}`).status).toBe(200)
+  expect(handleApi(s, "GET", "/api/governance/projects?is_active=true", "").body.includes(`"total_count":0`)).toBe(true)
+  // the project's budget cannot be deleted while the project uses it
+  expect(handleApi(s, "DELETE", "/api/governance/budgets/b-proj", "").status).toBe(409)
+  expect(handleApi(s, "DELETE", "/api/governance/projects/p1", "").status).toBe(200)
+  expect(handleApi(s, "DELETE", "/api/governance/budgets/b-proj", "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/governance/projects/p1", "").status).toBe(404)
+  cleanup(path)
+})
+
+test("business units: teams follow the unit, and the unit's budget is protected", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(handleApi(s, "POST", "/api/governance/budgets", `{"id":"b-bu","max_limit":5,"reset_duration":"1M"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t1","name":"core"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t2","name":"data"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/business-units", `{"id":"bu1","name":"emea","team_ids":["nope"]}`).status).toBe(400)
+  const made = handleApi(s, "POST", "/api/governance/business-units", `{"id":"bu1","name":"emea","budget_id":"b-bu","team_ids":["t1"]}`)
+  expect(made.status).toBe(201)
+  expect(handleApi(s, "GET", "/api/governance/teams/t1", "").body.includes(`"business_unit_id":"bu1"`)).toBe(true)
+  expect(handleApi(s, "DELETE", "/api/governance/budgets/b-bu", "").status).toBe(409)
+  // moving the unit's teams: t2 joins, t1 leaves
+  expect(handleApi(s, "PUT", "/api/governance/business-units/bu1", `{"name":"emea","budget_id":"b-bu","team_ids":["t2"]}`).status).toBe(200)
+  expect(handleApi(s, "GET", "/api/governance/teams/t1", "").body.includes(`"business_unit_id"`)).toBe(false)
+  expect(handleApi(s, "GET", "/api/governance/teams/t2", "").body.includes(`"business_unit_id":"bu1"`)).toBe(true)
+  const list = handleApi(s, "GET", "/api/governance/business-units", "")
+  expect(list.body.includes(`"business_units":[{"id":"bu1"`)).toBe(true)
+  expect(list.body.includes(`"count":1,"total_count":1,"limit":25,"offset":0`)).toBe(true)
+  expect(handleApi(s, "DELETE", "/api/governance/business-units/bu1", "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/governance/teams/t2", "").body.includes(`"business_unit_id"`)).toBe(false)
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t3","name":"x","business_unit_id":"nope"}`).status).toBe(400)
+  cleanup(path)
+})
+
+test("custom roles: built-in names are reserved, dac and permissions are checked, held roles stay", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"admin"}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"x","dac":"galaxy-data"}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"x","permissions":[{"resource":"Widgets","operation":"View"}]}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"x","permissions":[{"resource":"Logs","operation":"Fly"}]}`).status).toBe(400)
+  const made = handleApi(s, "POST", "/api/roles", `{"name":"ops","dac":"team-data","permissions":[{"resource":"Teams","operation":"View"}]}`)
+  expect(made.status).toBe(201)
+  expect(made.body.includes(`"dac":"team-data"`)).toBe(true)
+  expect(handleApi(s, "GET", "/api/roles", "").body.includes(`"roles":[{"name":"ops"`)).toBe(true)
+  expect(handleApi(s, "GET", "/api/roles/ops", "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/roles/admin", "").status).toBe(404)
+  expect(handleApi(s, "PUT", "/api/roles/ops", `{"dac":"all-data","permissions":[{"resource":"Teams","operation":"Update"}]}`).status).toBe(200)
+  expect(handleApi(s, "GET", "/api/roles/ops", "").body.includes(`"operation":"Update"`)).toBe(true)
+  expect(handleApi(s, "DELETE", "/api/roles/ops", "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/roles/ops", "").status).toBe(404)
+  cleanup(path)
+})
+
+test("data access scope: a scoped user lists, reads and edits only its own teams, customers and keys", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(handleApi(s, "POST", "/api/governance/customers", `{"id":"c1","name":"acme"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/customers", `{"id":"c2","name":"globex"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t1","name":"core","customer_id":"c1"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t2","name":"other","customer_id":"c2"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk1","name":"one","team_id":"t1"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk2","name":"two","team_id":"t2"}`).status).toBe(201)
+  const scope = scopeOf(s.cfg.governance ?? {}, { name: "ann", role: "ops", teams: ["t1"] }, "team-data")
+  // lists
+  const teams = handleApi(s, "GET", "/api/governance/teams", "", scope).body
+  expect(teams.includes(`"id":"t1"`)).toBe(true)
+  expect(teams.includes(`"id":"t2"`)).toBe(false)
+  const keys = handleApi(s, "GET", "/api/governance/virtual-keys", "", scope).body
+  expect(keys.includes(`"id":"vk1"`)).toBe(true)
+  expect(keys.includes(`"id":"vk2"`)).toBe(false)
+  // one record it does not own looks absent
+  expect(handleApi(s, "GET", "/api/governance/teams/t2", "", scope).status).toBe(404)
+  expect(handleApi(s, "DELETE", "/api/governance/virtual-keys/vk2", "", scope).status).toBe(404)
+  expect(handleApi(s, "GET", "/api/governance/customers", "", scope).body.includes(`"id":"c2"`)).toBe(false)
+  // it edits its own team, and creates nothing
+  expect(handleApi(s, "PUT", "/api/governance/teams/t1", `{"name":"core-2"}`, scope).status).toBe(200)
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t9","name":"new"}`, scope).status).toBe(403)
+  expect(handleApi(s, "GET", "/api/governance/budgets", "", scope).status).toBe(403)
+  // all data sees everything
+  expect(handleApi(s, "GET", "/api/governance/teams", "", allScope()).body.includes(`"id":"t2"`)).toBe(true)
+  cleanup(path)
+})
+
+test("data access scope: projects and business units are listed by their own membership", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(handleApi(s, "POST", "/api/governance/projects", `{"id":"p1","name":"eval"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/projects", `{"id":"p2","name":"prod"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/business-units", `{"id":"bu1","name":"emea"}`).status).toBe(201)
+  const scope = scopeOf(s.cfg.governance ?? {}, { name: "bo", role: "ops", projects: ["p1"], business_units: ["bu1"] }, "own-data")
+  const projects = handleApi(s, "GET", "/api/governance/projects", "", scope).body
+  expect(projects.includes(`"id":"p1"`)).toBe(true)
+  expect(projects.includes(`"id":"p2"`)).toBe(false)
+  expect(handleApi(s, "GET", "/api/governance/business-units", "", scope).body.includes(`"total_count":0`)).toBe(true)
+  cleanup(path)
+})
+
+test("providers: POST creates by the body's name (409 when taken), keys list and get", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const made = handleApi(s, "POST", "/api/providers", `{"provider":"groq","keys":[{"id":"k1","value":"gsk-example0123456789"}]}`)
+  expect(made.status).toBe(200)
+  expect(made.body.includes("example0123456789")).toBe(false)
+  expect(handleApi(s, "POST", "/api/providers", `{"provider":"groq"}`).status).toBe(409)
+  expect(handleApi(s, "POST", "/api/providers", `{"keys":[]}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/providers", `{"provider":"Bad Name"}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/providers", `[1]`).status).toBe(400)
+  const list = handleApi(s, "GET", "/api/providers/groq/keys", "")
+  expect(list.status).toBe(200)
+  expect(list.body.includes(`"total":1`)).toBe(true)
+  expect(list.body.includes("example0123456789")).toBe(false)
+  expect(handleApi(s, "GET", "/api/providers/groq/keys/k1", "").status).toBe(200)
+  expect(handleApi(s, "GET", "/api/providers/groq/keys/nope", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/providers/nope/keys", "").status).toBe(404)
+  expect(handleApi(s, "DELETE", "/api/providers", "").status).toBe(405)
+  cleanup(path)
+})
+
+test("config metadata: merge, typed values, null removes, bad values refused", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(handleApi(s, "POST", "/api/config/metadata", `{"onboarding_dismissed":true,"tip":"x","n":3}`).status).toBe(200)
+  expect(handleApi(s, "POST", "/api/config/metadata", `{"tip":null}`).status).toBe(200)
+  const red = handleApi(s, "GET", "/api/config", "").body
+  expect(s.cfg.metadata!.get("onboarding_dismissed")).toBe(true)
+  expect(red.includes(`"onboarding_dismissed"`)).toBe(true)
+  expect(red.includes(`"tip"`)).toBe(false)
+  expect(red.includes(`"n"`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/config/metadata", `{"o":{"a":1}}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/config/metadata", `{}`).status).toBe(400)
+  expect(handleApi(s, "GET", "/api/config/metadata", "").status).toBe(405)
+  cleanup(path)
+})
+
+test("virtual key rotation: new value, grace for the old one, bulk and 404s", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "dev", value: "sk-bf-" + "1".repeat(32) }))).toBe(200)
+  const old = findById(gov(s.cfg).virtual_keys, "vk1")!.value
+  expect(statusOf(s.rotateVirtualKey("vk1", 0))).toBe(200)
+  const cur = findById(gov(s.cfg).virtual_keys, "vk1")!
+  expect(cur.value === old).toBe(false)
+  expect(cur.previous_value === undefined).toBe(true)
+  expect(cur.rotated_at !== undefined).toBe(true)
+  expect(statusOf(s.rotateVirtualKey("vk1", 3600000))).toBe(200)
+  const again = findById(gov(s.cfg).virtual_keys, "vk1")!
+  expect(again.previous_value === cur.value).toBe(true)
+  expect(rfc3339Ms(again.previous_value_expires_at ?? "") !== undefined).toBe(true)
+  expect(statusOf(s.rotateVirtualKey("nope", 0))).toBe(404)
+  // a plain write with a new value drops the grace period; the same value keeps it
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "dev", value: "" }))).toBe(200)
+  expect(findById(gov(s.cfg).virtual_keys, "vk1")!.previous_value === again.previous_value).toBe(true)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "dev", value: "sk-bf-" + "2".repeat(32) }))).toBe(200)
+  expect(findById(gov(s.cfg).virtual_keys, "vk1")!.previous_value === undefined).toBe(true)
+  // expires_at is an RFC 3339 time, kept on writes
+  expect(statusOf(s.upsertVirtualKey({ id: "vk2", name: "x", value: "sk-bf-" + "3".repeat(32), expires_at: "tomorrow" }))).toBe(400)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk2", name: "x", value: "sk-bf-" + "3".repeat(32), expires_at: "2030-01-01T00:00:00Z" }))).toBe(200)
+  expect(findById(gov(s.cfg).virtual_keys, "vk2")!.expires_at).toBe("2030-01-01T00:00:00Z")
+  // the HTTP route: bulk ids and the single form, with the new value in the reply
+  const bulk = handleApi(s, "POST", "/api/governance/virtual-keys/rotate", `{"ids":["vk1","vk2"]}`)
+  expect(bulk.status).toBe(200)
+  expect(bulk.body.includes("Virtual keys rotated successfully")).toBe(true)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys/rotate", `{"ids":[]}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys/rotate", `{"ids":[""]}`).status).toBe(400)
+  const one = handleApi(s, "POST", "/api/governance/virtual-keys/vk2/rotate", "")
+  expect(one.status).toBe(200)
+  expect(one.body.includes("Virtual key rotated successfully")).toBe(true)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys/nope/rotate", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/governance/virtual-keys/vk1/rotate", "").status).toBe(405)
+  cleanup(path)
+})
+
+test("team members: the users whose teams name the team", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertTeam({ id: "t1", name: "core" }))).toBe(200)
+  const cfg = s.cfg
+  let g = gov(cfg)
+  g.users = [{ name: "ana", role: "editor", teams: ["t1"] }, { name: "bo", role: "viewer", teams: [] }]
+  let n: Config = s.cfg
+  n.governance = g
+  s.cfg = n
+  const body = handleApi(s, "GET", "/api/governance/teams/t1/members", "")
+  expect(body.status).toBe(200)
+  expect(body.body.includes(`"user_id":"ana"`)).toBe(true)
+  expect(body.body.includes("bo")).toBe(false)
+  expect(handleApi(s, "GET", "/api/governance/teams/nope/members", "").status).toBe(404)
+  expect(handleApi(s, "POST", "/api/governance/teams/t1/members", "{}").status).toBe(405)
+  cleanup(path)
+})
+
+test("project members: the roster, member caps under split none, and refusals under equal", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, { governance: {
+    budgets: [{ id: "b-pm", max_limit: 100.0, reset_duration: "1M" }],
+    users: [{ name: "ana", role: "editor" }, { name: "bo", role: "viewer" }],
+  } })
+  expect(handleApi(s, "POST", "/api/governance/projects", `{"id":"pm","name":"pm","budget_id":"b-pm"}`).status).toBe(201)
+  const add = handleApi(s, "POST", "/api/governance/projects/pm/members", `{"members":[{"user_id":"ana"},{"user_id":"ana"},{"user_id":"bo"}]}`)
+  expect(add.status).toBe(201)
+  expect(add.body.includes(`"user_id":"ana"`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/governance/projects/pm/members", `{"members":[{"user_id":"nobody"}]}`).status).toBe(400)
+  const list = handleApi(s, "GET", "/api/governance/projects/pm/members", "")
+  expect(list.body.includes(`"total_count":2`)).toBe(true)
+  const mid = (s.cfg.governance?.projects ?? [])[0]!.members![0]!.id
+  // a member's own cap: a percent of a budget the project holds
+  expect(handleApi(s, "PUT", `/api/governance/projects/pm/members/${mid}`, `{"budget_shares":[{"source_budget_id":"b-other","share_value":10,"share_type":"percent"}]}`).status).toBe(400)
+  expect(handleApi(s, "PUT", `/api/governance/projects/pm/members/${mid}`, `{"budget_shares":[{"source_budget_id":"b-pm","share_value":150,"share_type":"percent"}]}`).status).toBe(400)
+  const cap = handleApi(s, "PUT", `/api/governance/projects/pm/members/${mid}`, `{"budget_shares":[{"source_budget_id":"b-pm","share_value":25,"share_type":"percent"}]}`)
+  expect(cap.status).toBe(200)
+  expect(cap.body.includes(`"share_value":25`)).toBe(true)
+  // a project edit keeps the roster and the caps
+  expect(handleApi(s, "PUT", "/api/governance/projects/pm", `{"name":"pm","budget_id":"b-pm"}`).status).toBe(200)
+  expect((s.cfg.governance?.projects ?? [])[0]!.members!.length).toBe(2)
+  // equal split: the hand-written caps go, and caps are refused
+  expect(handleApi(s, "PUT", "/api/governance/projects/pm", `{"name":"pm","budget_id":"b-pm","split_policy":"equal"}`).status).toBe(200)
+  expect((s.cfg.governance?.projects ?? [])[0]!.members![0]!.budget_shares).toBeUndefined()
+  expect(handleApi(s, "PUT", `/api/governance/projects/pm/members/${mid}`, `{"budget_shares":[]}`).status).toBe(400)
+  expect(handleApi(s, "PUT", "/api/governance/projects/pm", `{"name":"pm","split_policy":"weekly"}`).status).toBe(400)
+  // removing a member takes the member away
+  expect(handleApi(s, "DELETE", `/api/governance/projects/pm/members/${mid}`, "").status).toBe(200)
+  expect(handleApi(s, "GET", `/api/governance/projects/pm/members/${mid}`, "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/governance/projects/pm/members", "").body.includes(`"total_count":1`)).toBe(true)
+  cleanup(path)
+})
+
+test("roles: entity_dac is read as Bifrost's object and shown the same way", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const made = handleApi(s, "POST", "/api/roles", `{"name":"acct","dac":"team-data","entity_dac":{"Projects":"all-data","Logs":"own-data"},"permissions":[]}`)
+  expect(made.status).toBe(201)
+  expect(made.body.includes(`"entity_dac":{"Projects":"all-data","Logs":"own-data"}`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"bad","entity_dac":{"Projects":"weekly"}}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"bad2","entity_dac":{"Nope":"all-data"}}`).status).toBe(400)
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"bad3","entity_dac":{"Logs":5}}`).status).toBe(400)
+  const put = handleApi(s, "PUT", "/api/roles/acct", `{"dac":"own-data"}`)
+  expect(put.status).toBe(200)
+  expect(put.body.includes(`"entity_dac":{}`)).toBe(true)
+  expect(handleApi(s, "GET", "/api/roles", "").body.includes(`"name":"acct"`)).toBe(true)
+  cleanup(path)
 })

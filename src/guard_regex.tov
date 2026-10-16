@@ -1,18 +1,27 @@
 // Regex guardrails (Bifrost's custom regex provider): each pattern has an action,
 // block, redact or detect_only. Patterns run on regex.tov.
 //
-// regex.tov's test() only says whether a pattern matches; it reports no
-// positions. So the match positions come from a bounded scan here:
-// - a match of up to WIN bytes is found inside a window that tests as a match;
-// - each start position is tried with \A(?:pattern), and the longest end within
-//   WIN with \A(?:pattern)\z is taken (a longer match is cut at WIN bytes);
-// - with a trailing or leading \b, a boundary is required at the slice edges too.
-// A match that cannot be located (only when a window matches) blocks a
-// redact rule, since its text cannot be replaced.
-// An engine API that returns spans would make this linear; see the report.
+// The text is scanned in windows. A window of W bytes that tests as a match (gate,
+// regex.tov's test()) is searched with exec(), which gives the leftmost-first match
+// and its groups, as Perl and RE2 choose them. Matches that start in a window's first
+// STEP bytes and are at most W - STEP (256) bytes long lie inside it, so they are found
+// exactly; a longer match is cut there. A slice starts where the search resumes, so
+// assertions at its left edge (\b, ^) see no text before it. The wordB check looks at
+// the real bytes there. A match that cannot be located (only when a window matches)
+// blocks a rule that does not redact, since its text cannot be replaced.
 
 import { compileRegex, Regex } from "./regex"
 import { Finding, GuardResult, redact } from "./guardrails"
+
+// A Gitleaks-style allowlist. target is "" (the secret), "match" (the whole match) or
+// "line" (the line of the match). regexes and stopwords are alternatives, or, when
+// all is set, every check present must hold.
+export type AllowRule = {
+  target?: string,
+  all?: bool,
+  regexes?: string[],
+  stopwords?: string[],
+}
 
 export type RegexRule = {
   pattern: string,
@@ -22,24 +31,48 @@ export type RegexRule = {
   action?: string,
   allowed_values?: string[],
   skip_containing?: string[],
+  // Prefilter: the rule runs only on text containing one of these, ignoring case.
+  keywords?: string[],
+  // The span reported and redacted: a numbered group, or 0 for the first group that
+  // took part (the whole match when the pattern has none).
+  secret_group?: int,
+  // A finding is kept only when the Shannon entropy of its secret is above this.
+  entropy?: number,
+  allow?: AllowRule[],
 }
 
-// A rule ready to run. gate is the pattern alone; prefix and exact are anchored.
+export type CompiledAllow = {
+  target: string,
+  all: bool,
+  regexes: Regex[],
+  stops: string[],
+}
+
+// A rule ready to run. gate is the pattern alone: test() finds the windows, exec()
+// the matches in them.
 export type CompiledRule = {
   kind: string,
   action: string,
   allowed: string[],
   skip: string[],
+  keys: string[],
   wordB: bool,
+  secretGroup: int,
+  entropy: number,
+  allow: CompiledAllow[],
   gate: Regex,
-  prefix: Regex,
-  exact: Regex,
 }
 
 type Span = { start: int, end: int }
 
+// One match: m is the whole match (newlines trimmed, as gitleaks trims them), s the
+// span reported for it.
+type Found = { m: Span, s: Span }
+
+// The matches of one rule in the text, and whether the pattern matched a window at all.
+type Scan = { found: Found[], placed: bool }
+
 const enc = new TextEncoder()
-const WIN = 256
 const W = 512
 const STEP = 256
 
@@ -63,10 +96,6 @@ function cpAlign(b: u8[], i: int): int {
   return j
 }
 
-function isCpStart(b: u8[], i: int): bool {
-  return i >= b.length || !isCont(byteAt(b, i))
-}
-
 // Flags accepted in a pattern: i, m, s. Anything else is an error.
 function flagsOf(f: string): string throws SyntaxError {
   let out = ""
@@ -82,6 +111,15 @@ function kindOf(r: RegexRule): string {
   return k.split(" ").join("_").toUpperCase()
 }
 
+// Compiles one allowlist, or throws a SyntaxError naming the bad pattern.
+function compileAllow(a: AllowRule): CompiledAllow throws SyntaxError {
+  const res: Regex[] = []
+  for (const s of a.regexes ?? []) res.push(try compileRegex(s))
+  const stops: string[] = []
+  for (const s of a.stopwords ?? []) stops.push(s.toLowerCase())
+  return { target: a.target ?? "", all: a.all ?? false, regexes: res, stops: stops }
+}
+
 // Compiles rules, or throws a SyntaxError naming the bad pattern.
 export function compileRules(rules: RegexRule[]): CompiledRule[] throws SyntaxError {
   const out: CompiledRule[] = []
@@ -89,26 +127,30 @@ export function compileRules(rules: RegexRule[]): CompiledRule[] throws SyntaxEr
     const fl = try flagsOf(r.flags ?? "")
     const src = fl === "" ? r.pattern : `(?${fl})${r.pattern}`
     const gate = try compileRegex(src)
-    const prefix = try compileRegex(`\\A(?:${src})`)
-    const exact = try compileRegex(`\\A(?:${src})\\z`)
     const skip: string[] = []
     for (const s of r.skip_containing ?? []) skip.push(s.toLowerCase())
+    const keys: string[] = []
+    for (const s of r.keywords ?? []) keys.push(s.toLowerCase())
+    const allow: CompiledAllow[] = []
+    for (const a of r.allow ?? []) allow.push(try compileAllow(a))
     out.push({
       kind: kindOf(r),
       action: r.action ?? "block",
       allowed: (r.allowed_values ?? []).map((s: string) => s.toLowerCase()),
       skip: skip,
+      keys: keys,
       wordB: r.pattern.includes("\\b"),
+      secretGroup: r.secret_group ?? 0,
+      entropy: r.entropy ?? 0,
+      allow: allow,
       gate: gate,
-      prefix: prefix,
-      exact: exact,
     })
   }
   return out
 }
 
 // Byte ranges that may hold a match: windows of W bytes, step STEP, that test as a match.
-// A match of up to WIN bytes starting in a window's first half lies inside that window.
+// A match of up to W - STEP bytes starting in a window's first half lies inside that window.
 function hitRegions(re: Regex, text: string, b: u8[]): Span[] {
   const n = b.length
   const out: Span[] = []
@@ -124,44 +166,72 @@ function hitRegions(re: Regex, text: string, b: u8[]): Span[] {
   return out
 }
 
-// Non-overlapping matches inside the regions, leftmost first.
-function findSpans(r: CompiledRule, text: string, b: u8[], regions: Span[]): Span[] {
+// Non-overlapping matches inside the regions, leftmost first. Each window is searched
+// from where the last match ended; a match that starts in the second half of a window
+// is left for the next window, which holds it in its first half.
+function findSpans(r: CompiledRule, text: string, b: u8[], regions: Span[]): Scan {
   const n = b.length
-  const out: Span[] = []
+  const out: Found[] = []
+  let placed = false
   let from = 0
   for (const reg of regions) {
     let p = cpAlign(b, reg.start > from ? reg.start : from)
     while (p < reg.end && p < n) {
-      const hi = cpAlign(b, p + WIN < n ? p + WIN : n)
-      if (!r.prefix.test(text.slice(p, hi))) {
+      const hi = cpAlign(b, p + W < n ? p + W : n)
+      const m = r.gate.exec(text.slice(p, hi))
+      if (m === undefined) {
+        if (hi >= n) break
+        p = cpAlign(b, p + STEP)
+        continue
+      }
+      placed = true
+      const ms = p + m[0]!
+      if (ms >= p + STEP && hi < n) {
+        p = cpAlign(b, p + STEP)
+        continue
+      }
+      // a \b at the slice edge sees no text before it, so the real byte decides
+      if (r.wordB && ms === p && p > 0 && isWord(byteAt(b, p - 1)) && isWord(byteAt(b, p))) {
         p = cpAlign(b, p + 1)
         continue
       }
-      if (r.wordB && p > 0 && isWord(byteAt(b, p - 1)) && isWord(byteAt(b, p))) {
-        p = cpAlign(b, p + 1)
-        continue
-      }
-      let e = hi
-      let found = -1
-      while (e > p) {
-        const endOk = !(r.wordB && e < n && isWord(byteAt(b, e - 1)) && isWord(byteAt(b, e)))
-        if (endOk && r.exact.test(text.slice(p, e))) {
-          found = e
-          break
-        }
-        e -= 1
-        while (e > p && !isCpStart(b, e)) e -= 1
-      }
-      if (found < 0) {
-        p = cpAlign(b, p + 1)
-        continue
-      }
-      out.push({ start: p, end: found })
-      p = found
+      const me = p + m[1]!
+      // gitleaks trims newlines from a match before anything else sees it
+      let a = ms
+      let z = me
+      while (a < z && byteAt(b, a) === 10) a += 1
+      while (z > a && byteAt(b, z - 1) === 10) z -= 1
+      const whole: Span = { start: a, end: z }
+      out.push({ m: whole, s: secretSpan(r, m, p, whole) })
+      p = cpAlign(b, me > ms ? me : ms + 1)
     }
     from = p
   }
-  return out
+  return { found: out, placed: placed }
+}
+
+// The span of group g of a window match that starts at p (m holds offsets relative to p),
+// or undefined when the group did not take part or matched nothing.
+function groupSpan(m: int[], p: int, g: int): Span | undefined {
+  const s = m[2 * g]
+  const e = m[2 * g + 1]
+  if (s === undefined || e === undefined || s < 0 || e <= s) return undefined
+  return { start: p + s, end: p + e }
+}
+
+// The span reported for a match: the rule's secret group, or else the first group that
+// took part (gitleaks), or else the whole match.
+function secretSpan(r: CompiledRule, m: int[], p: int, whole: Span): Span {
+  if (r.secretGroup > 0) {
+    const g = groupSpan(m, p, r.secretGroup)
+    return g === undefined ? whole : g
+  }
+  const groups = (m.length >> 1) - 1
+  for (let k = 1; k <= groups; k++) {
+    const g = groupSpan(m, p, k)
+    if (g !== undefined) return g
+  }
+  return whole
 }
 
 // A match is ignored when it equals an allowed value or contains a skip word, ignoring case.
@@ -174,30 +244,117 @@ function ignored(r: CompiledRule, t: string): bool {
   return false
 }
 
+// Shannon entropy in bits per character, as gitleaks computes it: the counts are per code
+// point, and the frequencies divide by the byte length.
+export function shannon(s: string): number {
+  const n = s.byteLength
+  if (n === 0) return 0
+  const counts = new Map<string, int>()
+  for (const c of s.chars()) {
+    counts.set(c, (counts.get(c) ?? 0) + 1)
+  }
+  let e = 0.0
+  for (const k of counts.values()) {
+    const f = k / n
+    e -= f * Math.log2(f)
+  }
+  return e
+}
+
+// The line of text that holds the byte span [s, e), without its newline. Built from
+// native string operations: the text is not scanned byte by byte.
+function lineOf(text: string, s: int, e: int): string {
+  const parts = text.slice(0, s).split("\n")
+  const head = parts[parts.length - 1]!
+  const rest = text.slice(e)
+  const k = rest.indexOf("\n")
+  const tail = k < 0 ? rest : rest.slice(0, k)
+  return head + text.slice(s, e) + tail
+}
+
+// Whether an allowlist's regexes match a target text. Findings on one line share the line
+// target, so the answer is memoized per text for the call (id names the allowlist). A
+// target too long for a regex's step budget is not tested, so it does not allow.
+function regexHit(a: CompiledAllow, target: string, inout memo: Map<string, bool>, id: string): bool {
+  const key = id + "|" + target
+  const seen = memo.get(key)
+  if (seen !== undefined) return seen
+  let hit = false
+  for (const re of a.regexes) {
+    if (re.fits(target.byteLength) && re.test(target)) hit = true
+  }
+  memo.set(key, hit)
+  return hit
+}
+
+// True when one allowlist covers a finding. Its regexes test the target: the secret, the
+// whole match or the line. Its stopwords test the secret. With all set, every check the
+// allowlist has must hold; otherwise one is enough.
+function allowedBy(a: CompiledAllow, secret: string, match: string, line: string, inout memo: Map<string, bool>, id: string): bool {
+  const target = a.target === "match" ? match : a.target === "line" ? line : secret
+  const hitRe = target !== "" && regexHit(a, target, &memo, id)
+  const low = secret.toLowerCase()
+  let hitStop = false
+  for (const w of a.stops) {
+    if (low.includes(w)) hitStop = true
+  }
+  if (a.all) {
+    if (a.regexes.length === 0 && a.stops.length === 0) return false
+    if (a.regexes.length > 0 && !hitRe) return false
+    if (a.stops.length > 0 && !hitStop) return false
+    return true
+  }
+  return hitRe || hitStop
+}
+
+function allowedFinding(r: CompiledRule, secret: string, text: string, m: Span, inout memo: Map<string, bool>): bool {
+  const match = text.slice(m.start, m.end)
+  // the line is only needed by an allowlist that targets it
+  let line = ""
+  for (const a of r.allow) {
+    if (a.target === "line") {
+      line = lineOf(text, m.start, m.end)
+      break
+    }
+  }
+  for (let k = 0; k < r.allow.length; k++) {
+    if (allowedBy(r.allow[k]!, secret, match, line, &memo, r.kind + "#" + k)) return true
+  }
+  return false
+}
+
 // Runs the rules over text. block rules set blocked; redact rules rewrite the body
-// with [REDACTED:KIND]; detect_only rules only report.
+// with [REDACTED:KIND]; detect_only rules only report. A finding is reported for the
+// secret span of a match; with an entropy floor, a finding must be above it, and an
+// allowlist that covers it drops it.
 export function applyRegex(text: string, rules: CompiledRule[]): GuardResult {
   const b = enc.encode(text)
   const findings: Finding[] = []
   const redactions: Finding[] = []
   let blocked = false
+  const low = text.toLowerCase()
+  let memo = new Map<string, bool>()
   for (const r of rules) {
+    // a rule with keywords runs only when one of them occurs, which is far cheaper than its regex
+    if (r.keys.length > 0 && !r.keys.some((k: string) => low.includes(k))) continue
     const regions = hitRegions(r.gate, text, b)
     if (regions.length === 0) continue
-    const spans = findSpans(r, text, b, regions)
-    if (spans.length === 0) {
+    const scan = findSpans(r, text, b, regions)
+    if (!scan.placed) {
       // the pattern matched but the span could not be placed
       findings.push({ kind: r.kind, start: 0, end: 0, text: "" })
       if (r.action !== "detect_only") blocked = true
       continue
     }
-    for (const s of spans) {
-      const t = text.slice(s.start, s.end)
+    for (const f of scan.found) {
+      const t = text.slice(f.s.start, f.s.end)
+      if (r.entropy !== 0 && shannon(t) <= r.entropy) continue
       if (ignored(r, t)) continue
-      const f: Finding = { kind: r.kind, start: s.start, end: s.end, text: t }
-      findings.push(f)
+      if (r.allow.length > 0 && allowedFinding(r, t, text, f.m, &memo)) continue
+      const fd: Finding = { kind: r.kind, start: f.s.start, end: f.s.end, text: t }
+      findings.push(fd)
       if (r.action === "block") blocked = true
-      else if (r.action === "redact") redactions.push(f)
+      else if (r.action === "redact") redactions.push(fd)
     }
   }
   if (blocked) return { body: text, findings: findings, blocked: true }
@@ -291,4 +448,71 @@ test("a bad pattern is a SyntaxError", () => {
     threw = true
   }
   expect(threw).toBe(true)
+})
+
+test("keywords gate a rule: its regex runs only when a keyword is present", () => {
+  const rules = try compileRules([{ pattern: "zz[0-9]", keywords: ["Needle"], action: "block" }])
+  expect(applyRegex("zz1 alone", rules).blocked).toBe(false)
+  expect(applyRegex("a NEEDLE here, zz1", rules).blocked).toBe(true)
+  expect(applyRegex("needle but no match", rules).findings.length).toBe(0)
+})
+
+test("secret_group: the finding and the redaction cover the named group", () => {
+  const rules = try compileRules([{ pattern: "key=(\\w+);", secret_group: 1, action: "redact" }])
+  const r = applyRegex("set key=abc123; ok", rules)
+  expect(r.body).toBe("set key=[REDACTED:REGEX_MATCH]; ok")
+  expect(r.findings[0]!.text).toBe("abc123")
+})
+
+test("secret_group 0 takes the first group that took part, else the whole match", () => {
+  const first = try compileRules([{ pattern: "x(a)?(bb)", action: "detect_only" }])
+  expect(applyRegex("xbb", first).findings[0]!.text).toBe("bb")
+  expect(applyRegex("xabb", first).findings[0]!.text).toBe("a")
+  const none = try compileRules([{ pattern: "xy+", action: "detect_only" }])
+  expect(applyRegex("xyy", none).findings[0]!.text).toBe("xyy")
+  // a named group that did not take part falls back to the whole match
+  const unset = try compileRules([{ pattern: "x(a)?b", secret_group: 1, action: "detect_only" }])
+  expect(applyRegex("xb", unset).findings[0]!.text).toBe("xb")
+})
+
+test("shannon entropy as gitleaks computes it", () => {
+  expect(shannon("aabb")).toBe(1.0)
+  expect(shannon("")).toBe(0.0)
+  expect(shannon("abcdefgh")).toBe(3.0)
+  // one code point of two bytes: the frequency divides by the byte length
+  expect(shannon("é")).toBe(0.5)
+})
+
+test("entropy: a finding must be above the floor", () => {
+  const rules = try compileRules([{ pattern: "tok_([a-z]+)", secret_group: 1, entropy: 3, action: "detect_only" }])
+  // exactly 3 bits does not pass, as gitleaks skips an entropy at or below its floor
+  expect(applyRegex("tok_abcdefgh", rules).findings.length).toBe(0)
+  expect(applyRegex("tok_abcdefghi", rules).findings.length).toBe(1)
+  expect(applyRegex("tok_aaaaaaaaaaaa", rules).findings.length).toBe(0)
+})
+
+test("allowlist stopwords drop a match that contains one", () => {
+  const rules = try compileRules([{ pattern: "tok_[a-z0-9]{8}", action: "block", allow: [{ stopwords: ["DEMO"] }] }])
+  expect(applyRegex("tok_demo1234", rules).blocked).toBe(false)
+  expect(applyRegex("tok_real1234", rules).blocked).toBe(true)
+})
+
+test("allowlist regexTarget: secret, match or line", () => {
+  const bySecret = try compileRules([{ pattern: "id=(\\w+)", secret_group: 1, action: "block", allow: [{ regexes: ["^abc"] }] }])
+  expect(applyRegex("id=abc123", bySecret).blocked).toBe(false)
+  expect(applyRegex("id=xyz123", bySecret).blocked).toBe(true)
+  // the secret is "abc123", so a regex on the match "id=..." does not see it
+  const byMatch = try compileRules([{ pattern: "id=(\\w+)", secret_group: 1, action: "block", allow: [{ target: "match", regexes: ["^id=abc"] }] }])
+  expect(applyRegex("id=abc123", byMatch).blocked).toBe(false)
+  expect(applyRegex("id=xyz123", byMatch).blocked).toBe(true)
+  const byLine = try compileRules([{ pattern: "tok_[a-z]+", action: "block", allow: [{ target: "line", regexes: ["^note:"] }] }])
+  expect(applyRegex("note: tok_abc", byLine).blocked).toBe(false)
+  expect(applyRegex("tok_abc", byLine).blocked).toBe(true)
+})
+
+test("an AND allowlist needs every check it has", () => {
+  const rules = try compileRules([{ pattern: "tok_[a-z0-9]{6}", action: "block", allow: [{ all: true, regexes: ["^tok_a"], stopwords: ["zz"] }] }])
+  // the regex holds but the stopword does not
+  expect(applyRegex("tok_abc123", rules).blocked).toBe(true)
+  expect(applyRegex("tok_azz123", rules).blocked).toBe(false)
 })

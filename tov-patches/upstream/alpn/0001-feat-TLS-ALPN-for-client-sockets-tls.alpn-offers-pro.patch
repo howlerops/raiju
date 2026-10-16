@@ -1,0 +1,388 @@
+From 8307999cc0376a1ce6dfe70ad6da738cdad82044 Mon Sep 17 00:00:00 2001
+From: Raiju contributors <raiju@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:30:34 +0000
+Subject: [PATCH] feat: TLS ALPN for client sockets: tls.alpn offers protocols,
+ socket.alpnProtocol reads the one picked
+
+A TLS client could not offer application protocols, so a client that needs one (gRPC
+needs h2 in ALPN) could only reach a plaintext server. Bun.connect's tls option takes
+alpn, the list of protocols offered, and the socket's alpnProtocol is the one the server
+picked, or "" when it picked none (and for plaintext sockets). Without alpn the TLS
+context keeps its default protocols, as before.
+
+The offer is set on the SSL object before the handshake. Resumed sessions are keyed by the
+offer too, so a session from one offer is not used for another.
+
+Tests: tests/run/native_alpn.tov offers h2 and http/1.1, and offers nothing, to a TLS
+listener and checks that the handshake succeeds and alpnProtocol reads "".
+---
+ crates/tov/src/check/builtins.rs |  3 +-
+ crates/tov/src/std/http.tov      | 12 ++++++--
+ docs/spec.md                     |  4 +--
+ runtime/net.c                    | 25 ++++++++++++---
+ runtime/tls.c                    | 42 ++++++++++++++++++++++++--
+ runtime/tov.c                    |  2 +-
+ runtime/tov.h                    |  7 +++--
+ runtime/ws.c                     |  2 +-
+ tests/run/native_alpn.stdout     |  2 ++
+ tests/run/native_alpn.tov        | 52 ++++++++++++++++++++++++++++++++
+ 10 files changed, 135 insertions(+), 16 deletions(-)
+ create mode 100644 tests/run/native_alpn.stdout
+ create mode 100644 tests/run/native_alpn.tov
+
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index 2584eb7..7089c48 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -80,7 +80,7 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "multipartParse" => (vec![STR, STR], str_arr),
+         "headerEntries" => (vec![STR], str_arr),
+         // sockets (runtime/net.c)
+-        "netConnect" => (vec![STR, INT, INT, BOOL, STR, STR], INT),
++        "netConnect" => (vec![STR, INT, INT, BOOL, STR, STR, STR], INT),
+         "netBind" => {
+             let p = |ty| FnParam { ty, inout: false, optional: false };
+             let bytes = types.array(U8);
+@@ -97,6 +97,7 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "netNoDelay" => (vec![INT, BOOL], BOOL),
+         "netAddress" => (vec![INT, INT], STR),
+         "netBuffered" | "netListenPort" => (vec![INT], INT),
++        "netAlpn" => (vec![INT], STR),
+         "netError" => (vec![], STR),
+         "wsUpgrade" => (vec![STR, STR, INT], INT),
+         "wsConnect" => (vec![STR, INT, STR, BOOL, BOOL, STR, STR, STR, INT], INT),
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index 4504dcf..7a97c56 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -1797,7 +1797,7 @@ export type SocketHandler<T> = {
+   handshake?: (socket: Socket<T>, success: bool, authorizationError?: Error) => void throws Error
+ }
+ 
+-export type SocketTLSOptions = { rejectUnauthorized?: bool, ca?: string, serverName?: string }
++export type SocketTLSOptions = { rejectUnauthorized?: bool, ca?: string, serverName?: string, alpn?: string[] }
+ export type ServerTLSOptions = { cert: string, key: string }
+ 
+ export type ConnectOptions<T> = {
+@@ -2023,6 +2023,11 @@ export class Socket<T = undefined> {
+   get bufferedAmount(): int {
+     return __native.netBuffered(this.id)
+   }
++
++  // The ALPN protocol the server picked (TLS sockets offering `alpn`), or "" (Tov).
++  get alpnProtocol(): string {
++    return __native.netAlpn(this.id)
++  }
+ }
+ 
+ // Opens a TCP (or TLS, or Unix socket) connection: resolves once it's open (TLS: once the
+@@ -2035,6 +2040,7 @@ function connectSocket<T>(options: ConnectOptions<T>): Promise<Socket<T>, Error>
+   let verify = true
+   let ca = ""
+   let serverName = hostname
++  let alpn = ""
+   const t = options.tls
+   if (t !== undefined) {
+     if (typeof t === "boolean") {
+@@ -2044,10 +2050,12 @@ function connectSocket<T>(options: ConnectOptions<T>): Promise<Socket<T>, Error>
+       verify = t.rejectUnauthorized ?? true
+       ca = t.ca ?? ""
+       serverName = t.serverName ?? hostname
++      const protos = t.alpn ?? []
++      alpn = protos.join("\u0000")
+     }
+   }
+   const unix = options.unix ?? ""
+-  const id = __native.netConnect(serverName, port, tls, verify, ca, unix)
++  const id = __native.netConnect(serverName, port, tls, verify, ca, unix, alpn)
+   __native.netHalfOpen(id, options.allowHalfOpen ?? false)
+   const socket = new Socket<T>(id, options.socket, options.data)
+   const p = new Promise<Socket<T>, Error>((resolve, reject) => {
+diff --git a/docs/spec.md b/docs/spec.md
+index d283c84..567fb81 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -226,7 +226,7 @@ const user = try (await res.json()) as User
+ - Not yet: request bodies as streams, client certificates, `https:` proxies.
+ 
+ ## 7e. TCP and TLS sockets (Bun's API)
+-`Bun.connect(options)` and `Bun.listen(options)`, as in Bun: `hostname`, `port` (or `unix`), `tls` (`true`, or `{ ca?, rejectUnauthorized?, serverName? }` to connect; `{ cert, key }`, PEM text, to listen), `data` (the sockets' starting `socket.data`), `allowHalfOpen`, and `socket`, the handlers: `open(socket)`, `data(socket, bytes)` (a `u8[]`), `drain(socket)`, `end(socket)` (the peer finished sending), `close(socket, error?)`, `error(socket, error)`, `connectError(socket, error)`, `handshake(socket, success, authorizationError?)`.
++`Bun.connect(options)` and `Bun.listen(options)`, as in Bun: `hostname`, `port` (or `unix`), `tls` (`true`, or `{ ca?, rejectUnauthorized?, serverName?, alpn? }` to connect, where `alpn` is the list of protocols offered (Tov); `{ cert, key }`, PEM text, to listen), `data` (the sockets' starting `socket.data`), `allowHalfOpen`, and `socket`, the handlers: `open(socket)`, `data(socket, bytes)` (a `u8[]`), `drain(socket)`, `end(socket)` (the peer finished sending), `close(socket, error?)`, `error(socket, error)`, `connectError(socket, error)`, `handshake(socket, success, authorizationError?)`.
+ ```ts
+ type Session = { name: string }
+ const server = Bun.listen<Session>({
+@@ -241,7 +241,7 @@ const client = try await Bun.connect({ hostname: "localhost", port: 7000, socket
+ client.write("hello")
+ ```
+ - `Bun.connect` resolves once the socket is open (with TLS, once the handshake is done and the certificate checked) and rejects with a `SocketError` (`code`: `ECONNREFUSED`, `ENOTFOUND`, `CERT_HAS_EXPIRED`, ...) when it can't connect. `Bun.listen` returns a `TCPSocketListener` (`port`, `hostname`, `stop(closeActive?)`, `ref`, `unref`); a port that can't be bound prints the error and exits, as an uncaught error does in Bun.
+-- `Socket`: `write(text | bytes)`, `end(data?)`, `flush()`, `terminate()`, `shutdown()`, `setNoDelay(on?)`, `ref()`, `unref()`, `data`, `remoteAddress`, `remotePort`, `localAddress`, `localPort`, `bufferedAmount` (Tov). Unlike Bun's, `write` takes everything: what the kernel can't take yet is buffered (Bun returns a short count and drops the rest), and `drain` follows once it's out. Writes made in a handler go out together when it returns: one system call for many small writes.
++- `Socket`: `write(text | bytes)`, `end(data?)`, `flush()`, `terminate()`, `shutdown()`, `setNoDelay(on?)`, `ref()`, `unref()`, `data`, `remoteAddress`, `remotePort`, `localAddress`, `localPort`, `bufferedAmount`, `alpnProtocol` (Tov: the protocol the server picked for a TLS socket that offered `alpn`, or `""`). Unlike Bun's, `write` takes everything: what the kernel can't take yet is buffered (Bun returns a short count and drops the rest), and `drain` follows once it's out. Writes made in a handler go out together when it returns: one system call for many small writes.
+ - `end()` closes the socket once its data is out (`close` runs); with `allowHalfOpen` it shuts only the sending side, and the peer can keep sending. A handler that throws hands the error to `error`, else it's logged and the socket closes. A connect's `socket.data` is `T | undefined` (`T` from `data`, or the type argument: `Bun.listen<Session>(...)`).
+ 
+ ## 8. Tests **[M0]**
+diff --git a/runtime/net.c b/runtime/net.c
+index 69ef748..7968b23 100644
+--- a/runtime/net.c
++++ b/runtime/net.c
+@@ -42,6 +42,8 @@ typedef struct tv_ns {
+     char *host;              /* the name connected to (TLS: SNI and verification) */
+     char *ca;
+     size_t ca_len;
++    char *alpn;              /* TLS: the protocols offered, NUL-separated (see netConnect) */
++    size_t alpn_len;
+     tv_addrs addrs;
+     int ai, port;
+     char *out;
+@@ -105,6 +107,7 @@ static void tv_ns_free(tv_ns *s) {
+     free(s->out);
+     free(s->host);
+     free(s->ca);
++    free(s->alpn);
+     tv_ns_tab[s->id] = NULL;
+     free(s);
+ }
+@@ -387,7 +390,7 @@ static void tv_ns_connected(tv_ns *s) {
+         }
+         char key[300];
+         snprintf(key, sizeof key, "tcp|%s|%d", s->host, s->port);
+-        s->tls = tv_tls_impl->open(s->fd, s->host, key, s->verify, s->ca ? s->ca : "", s->ca_len);
++        s->tls = tv_tls_impl->open(s->fd, s->host, key, s->verify, s->ca ? s->ca : "", s->ca_len, s->alpn ? s->alpn : "", s->alpn_len);
+         if (!s->tls) {
+             tv_ns_close(s, "ERR_TLS_INIT");
+             return;
+@@ -486,9 +489,10 @@ static void tv_ns_resolved(tv_ns *s, const tv_addrs *addrs, bool failed) {
+ 
+ /* ---- natives */
+ 
+-/* netConnect(host, port, tls, verify, ca, unix) -> socket id; events follow (open, or
+- * connectError). tls: 0 plain, 1 TLS. */
+-tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path) {
++/* netConnect(host, port, tls, verify, ca, unix, alpn) -> socket id; events follow (open, or
++ * connectError). tls: 0 plain, 1 TLS. alpn: the TLS protocols offered, NUL-separated ("" for the
++ * default). */
++tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path, tv_str alpn) {
+     tv_ns *s = tv_ns_new();
+     s->io.ready = tv_ns_ready;
+     s->port = (int)port;
+@@ -503,10 +507,23 @@ tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, t
+             memcpy(s->ca, ca.p->data, (size_t)ca.p->len + 1);
+             s->ca_len = (size_t)ca.p->len;
+         }
++        if (alpn.p->len) {
++            s->alpn = tv_alloc((size_t)alpn.p->len + 1);
++            memcpy(s->alpn, alpn.p->data, (size_t)alpn.p->len + 1);
++            s->alpn_len = (size_t)alpn.p->len;
++        }
+     }
+     return s->id;
+ }
+ 
++/* netAlpn(id): the ALPN protocol the server picked for a TLS socket ("" for none or not TLS). */
++tv_str tv_native_netAlpn(tv_int id) {
++    tv_ns *s = tv_ns_get(id);
++    char buf[256];
++    size_t n = s && s->tls ? tv_tls_impl->alpn(s->tls, buf, sizeof buf) : 0;
++    return n ? tv_str_from(buf, n) : TV_EMPTY_STR;
++}
++
+ /* (connecting starts once the Socket has bound its events: a failure is reported to it) */
+ static void tv_ns_start(tv_ns *s, tv_str host, tv_str unix_path) {
+     tv_addrs addrs;
+diff --git a/runtime/tls.c b/runtime/tls.c
+index 1f1dd2f..ca32f2b 100644
+--- a/runtime/tls.c
++++ b/runtime/tls.c
+@@ -347,7 +347,26 @@ static tv_tls_conf *tv_tls_conf_for(bool verify, const char *ca, size_t ca_len)
+ 
+ /* ---- operations */
+ 
+-static tv_tls *tv_tls_open(int fd, const char *host, const char *key, bool verify, const char *ca, size_t ca_len) {
++/* The ALPN protocols as a ClientHello list: NUL-separated names in, length-prefixed out (RFC 7301).
++ * Returns the list's length, 0 when there are none or one is unusable. */
++static size_t tv_tls_alpn_wire(const char *alpn, size_t alpn_len, uint8_t *wire, size_t cap) {
++    size_t wl = 0;
++    for (size_t i = 0; i < alpn_len;) {
++        size_t j = i;
++        while (j < alpn_len && alpn[j]) j++;
++        size_t l = j - i;
++        if (l == 0 || l > 255 || wl + 1 + l > cap) return 0;
++        wire[wl++] = (uint8_t)l;
++        memcpy(wire + wl, alpn + i, l);
++        wl += l;
++        i = j + 1;
++    }
++    return wl;
++}
++
++/* alpn: the protocols this connection offers (NUL-separated, "" for none); the context's default
++ * (http/1.1) is kept when none are given. */
++static tv_tls *tv_tls_open(int fd, const char *host, const char *key, bool verify, const char *ca, size_t ca_len, const char *alpn, size_t alpn_len) {
+     tv_tls_init();
+     const char *off = getenv("NODE_TLS_REJECT_UNAUTHORIZED");
+     if (off && strcmp(off, "0") == 0) verify = false;
+@@ -358,9 +377,15 @@ static tv_tls *tv_tls_open(int fd, const char *host, const char *key, bool verif
+     tv_tls *t = calloc(1, sizeof *t);
+     t->ssl = ssl;
+     t->conf = conf;
+-    snprintf(t->key, sizeof t->key, "%s|%d|%p", key, verify, (void *)conf);
++    /* sessions resume only for the same protocols offered (a hash of the list) */
++    unsigned long ah = 0;
++    for (size_t i = 0; i < alpn_len; i++) ah = ah * 131 + (unsigned char)alpn[i];
++    snprintf(t->key, sizeof t->key, "%s|%d|%p|%lx", key, verify, (void *)conf, ah);
+     SSL_set_ex_data(ssl, tv_tls_index, t);
+     tv_tls_attach(t, fd);
++    uint8_t wire[512];
++    size_t wl = tv_tls_alpn_wire(alpn, alpn_len, wire, sizeof wire);
++    if (wl) SSL_set_alpn_protos(ssl, wire, wl); /* (returns 0 on success, as BoringSSL's does) */
+     SSL_set_connect_state(ssl);
+     /* the name the certificate must match; SNI unless it's an IP address */
+     char name[256];
+@@ -526,9 +551,20 @@ static tv_tls *tv_tls_accept(int fd, void *server) {
+ 
+ static bool tv_tls_verified(tv_tls *t) { return SSL_get_verify_result(t->ssl) == X509_V_OK; }
+ 
++/* The protocol the server picked (SSL_get0_alpn_selected), copied to out: its length, 0 for none. */
++static size_t tv_tls_alpn(tv_tls *t, char *out, size_t n) {
++    const uint8_t *p = NULL;
++    unsigned len = 0;
++    SSL_get0_alpn_selected(t->ssl, &p, &len);
++    if (!p || !len || n == 0) return 0;
++    if (len > n) len = (unsigned)n;
++    memcpy(out, p, len);
++    return len;
++}
++
+ static const tv_tls_ops tv_tls_table = {
+     tv_tls_open, tv_tls_handshake, tv_tls_read, tv_tls_write, tv_tls_pending, tv_tls_why, tv_tls_close,
+-    tv_tls_server, tv_tls_accept, tv_tls_verified,
++    tv_tls_server, tv_tls_accept, tv_tls_verified, tv_tls_alpn,
+ };
+ 
+ void tv_tls_install(void) {
+diff --git a/runtime/tov.c b/runtime/tov.c
+index 2bc9474..60d86db 100644
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -6666,7 +6666,7 @@ static void tv_fc_connected(tv_fc *c) {
+ 
+ static void tv_fc_start_tls(tv_fc *c) {
+     tv_fr *r = c->r;
+-    c->tls = tv_tls_impl->open(c->fd, r->host, r->key, !r->insecure, r->ca.p->data, (size_t)r->ca.p->len);
++    c->tls = tv_tls_impl->open(c->fd, r->host, r->key, !r->insecure, r->ca.p->data, (size_t)r->ca.p->len, "", 0);
+     if (!c->tls) { tv_fr_fail(r, "ERR_SSL", "TLS setup failed"); return; }
+     c->handshaking = true;
+     tv_fc_handshake(c);
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 6dfe8fc..1d42d62 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -778,7 +778,7 @@ void tv_native_timerUnref(tv_int id);
+ typedef struct tv_tls tv_tls;
+ typedef struct tv_tls_ops {
+     /* A client for `host` on connected socket fd; `key` names the origin (sessions resume per key). */
+-    tv_tls *(*open)(int fd, const char *host, const char *key, bool verify, const char *ca, size_t ca_len);
++    tv_tls *(*open)(int fd, const char *host, const char *key, bool verify, const char *ca, size_t ca_len, const char *alpn, size_t alpn_len);
+     int (*handshake)(tv_tls *t);                          /* 0 done, 1 wants read, 2 wants write, -1 failed */
+     long (*read)(tv_tls *t, void *buf, size_t n);         /* > 0 bytes, 0 ended, -1 wants read, -2 write, -3 failed */
+     long (*write)(tv_tls *t, const void *buf, size_t n);  /* as read */
+@@ -791,6 +791,8 @@ typedef struct tv_tls_ops {
+     tv_tls *(*accept)(int fd, void *server);
+     /* the peer's certificate checked out (a client with verification on) */
+     bool (*verified)(tv_tls *t);
++    /* the ALPN protocol the server picked, copied to out (its length; 0 when none was picked) */
++    size_t (*alpn)(tv_tls *t, char *out, size_t n);
+ } tv_tls_ops;
+ extern const tv_tls_ops *tv_tls_impl;
+ /* Streaming body decoders (runtime/codecs.c, in the same archive): set by tv_tls_install too.
+@@ -865,7 +867,8 @@ tv_str tv_native_headerGet(tv_str block, tv_str name);        /* values joined w
+ tv_arr tv_native_headerEntries(tv_str block);                  /* sorted [name, value, ...] */
+ tv_arr tv_native_headerValues(tv_str block, tv_str name);
+ /* sockets (runtime/net.c): Bun.connect, Bun.listen */
+-tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path);
++tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path, tv_str alpn);
++tv_str tv_native_netAlpn(tv_int id);
+ void tv_native_netBind(tv_int id, tv_fn events, tv_str host, tv_str unix_path);
+ tv_int tv_native_netWrite(tv_int id, tv_arr bytes);
+ tv_int tv_native_netWriteText(tv_int id, tv_str text);
+diff --git a/runtime/ws.c b/runtime/ws.c
+index 38d6e65..e85271a 100644
+--- a/runtime/ws.c
++++ b/runtime/ws.c
+@@ -589,7 +589,7 @@ tv_int tv_native_wsUpgrade(tv_str key, tv_str headers, tv_int max_payload) {
+ /* wsConnect(host, port, path, tls, verify, ca, headers, protocols, maxPayload): a client socket
+  * (netBind starts it); it opens once the server's 101 is in. */
+ tv_int tv_native_wsConnect(tv_str host, tv_int port, tv_str path, bool tls, bool verify, tv_str ca, tv_str headers, tv_str protocols, tv_int max_payload) {
+-    tv_int id = tv_native_netConnect(host, port, tls ? 1 : 0, verify, ca, TV_EMPTY_STR);
++    tv_int id = tv_native_netConnect(host, port, tls ? 1 : 0, verify, ca, TV_EMPTY_STR, TV_EMPTY_STR);
+     tv_ns *s = tv_ns_get(id);
+     tv_ws *w = tv_ws_new(s, true, max_payload);
+     uint8_t nonce[16];
+diff --git a/tests/run/native_alpn.stdout b/tests/run/native_alpn.stdout
+new file mode 100644
+index 0000000..ce08483
+--- /dev/null
++++ b/tests/run/native_alpn.stdout
+@@ -0,0 +1,2 @@
++alpn: the server picked none
++no alpn offered: none picked
+diff --git a/tests/run/native_alpn.tov b/tests/run/native_alpn.tov
+new file mode 100644
+index 0000000..4027dbf
+--- /dev/null
++++ b/tests/run/native_alpn.tov
+@@ -0,0 +1,52 @@
++// Socket ALPN (tls.alpn): a client offers protocols, and socket.alpnProtocol reads the one the
++// server picked, or "" when none. Bun.listen has no ALPN, so the server here picks none: the
++// offer must not break the handshake, and the property reads "" with or without an offer.
++// (A TLS server that picks a protocol is not in this change.)
++// a self-signed certificate for localhost (valid until 2126)
++const CERT =
++  "-----BEGIN CERTIFICATE-----\n" +
++  "MIIBmzCCAUGgAwIBAgIUZjNqwvmDx0AFEZs3WzHRZLdKZHcwCgYIKoZIzj0EAwIw\n" +
++  "FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTAxMzE1NTMxMVoYDzIxMjYwOTE5\n" +
++  "MTU1MzExWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\n" +
++  "PQMBBwNCAAT/DfwMLFYj9PLIyg1PC81HMZU/6n+3fByOfxg4IQkY54dwjhBV/fT4\n" +
++  "DbCdoA4csLhOq+DIgrZkoZ1aqdf6w8D9o28wbTAdBgNVHQ4EFgQU/TlQgBrrt581\n" +
++  "MZU2lYeoX9hLUncwHwYDVR0jBBgwFoAU/TlQgBrrt581MZU2lYeoX9hLUncwDwYD\n" +
++  "VR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZI\n" +
++  "zj0EAwIDSAAwRQIgZb9ivhJBJ/12nmZIUhILt1WneywedKruJRYEeEnxyooCIQD1\n" +
++  "umOuIMt9FIL0Q5RZXoJNr/KfZFotEBSI6g0K/Lz7fQ==\n" +
++  "-----END CERTIFICATE-----\n"
++const KEY =
++  "-----BEGIN PRIVATE KEY-----\n" +
++  "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgHqb65r9XoBrDM6Gg\n" +
++  "1cpLM5oKkJPrQWKkMRiflxO9uTyhRANCAAT/DfwMLFYj9PLIyg1PC81HMZU/6n+3\n" +
++  "fByOfxg4IQkY54dwjhBV/fT4DbCdoA4csLhOq+DIgrZkoZ1aqdf6w8D9\n" +
++  "-----END PRIVATE KEY-----\n"
++
++// connects over TLS, offering the protocols (or none), and reads what the server picked
++async function offer(port: int, alpn: string[] | undefined): Promise<string, Error> {
++  const s = try await Bun.connect({
++    hostname: "127.0.0.1",
++    port: port,
++    tls: alpn === undefined ? { rejectUnauthorized: false } : { rejectUnauthorized: false, alpn: alpn },
++    socket: {},
++  })
++  const picked = s.alpnProtocol
++  s.terminate()
++  return picked
++}
++
++const server = Bun.listen({
++  hostname: "127.0.0.1",
++  port: 0,
++  tls: { cert: CERT, key: KEY },
++  socket: {
++    data(socket, data) {
++      socket.write(data)
++    },
++  },
++})
++const offered = try await offer(server.port, ["h2", "http/1.1"])
++console.log(offered === "" ? "alpn: the server picked none" : `alpn: picked ${offered}`)
++const none = try await offer(server.port, undefined)
++console.log(none === "" ? "no alpn offered: none picked" : `FAIL picked ${none}`)
++server.stop()
+-- 
+2.43.0
+
