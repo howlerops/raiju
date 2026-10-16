@@ -31,11 +31,11 @@ Priority: P0 means a Bifrost user would hit it on the first day of switching, or
 
 ## Summary
 
-Parity rows (one per feature or route family): **498**. Status counts: done 195, partial 133, missing 152, out-of-scope 11, n/a 7. Raiju-only extras (not parity items, listed for context): 25.
+Parity rows (one per feature or route family): **498**. Status counts: done 201, partial 127, missing 152, out-of-scope 11, n/a 7 (the table below; the L97e media rows moved four partial rows to done). Raiju-only extras (not parity items, listed for context): 25.
 
 | Section | done | partial | missing | out-of-scope | n/a | Parity rows | Raiju-only extras |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| (a) HTTP routes | 54 | 32 | 46 | 2 | 1 | 135 | 7 |
+| (a) HTTP routes | 58 | 28 | 46 | 2 | 1 | 135 | 7 |
 | (b) Headers | 29 | 7 | 16 | 0 | 2 | 54 | 8 |
 | (c) config.json | 28 | 25 | 35 | 2 | 1 | 91 | 3 |
 | (d) Providers | 33 | 29 | 2 | 4 | 0 | 68 | 1 |
@@ -44,7 +44,7 @@ Parity rows (one per feature or route family): **498**. Status counts: done 195,
 | (g) MCP | 11 | 4 | 14 | 1 | 0 | 30 | 0 |
 | (h) Observability | 21 | 5 | 12 | 0 | 0 | 38 | 2 |
 | (i) Enterprise | 5 | 13 | 13 | 1 | 2 | 34 | 1 |
-| **Total** | **197** | **131** | **152** | **11** | **7** | **498** | **25** |
+| **Total** | **201** | **127** | **152** | **11** | **7** | **498** | **25** |
 
 The original summary counted 497 parity rows. The tables hold 498, because section (i) was one row short. The re-audit recount fixes this. The `n/a` rows are features Bifrost has removed (x-bf-azure-endpoint, x-bf-bedrock-*, x-bf-prom-*), features Bifrost has not shipped (Google and GitHub SSO), a managed offering (InVPC), or Go-runtime settings with no HTTP or config meaning. The `out-of-scope` rows are the SCOPE.md "Out" items: videos, containers, SCIM, MCP code mode and media providers.
 
@@ -84,12 +84,12 @@ Bifrost: `transports/bifrost-http/handlers/inference.go`, `asyncinference.go`, `
 | POST /v1/embeddings | handlers/inference.go | done | `server.tov` `dispatch` → `gateway.tov` `Engine.embeddings`. |
 | POST /v1/rerank | handlers/inference.go | done | `extras.tov` `rerank` and `rerankText`. Cohere, vLLM and Bedrock answer natively; model `raiju/lexical` asks for the local BM25 ranking. Other providers return an error. |
 | POST /v1/ocr | handlers/inference.go; supported-providers/mistral.mdx | done | `media.tov` `PATTERNS` → `handleMedia` (ocr). OpenAI-format and Azure only. |
-| POST /v1/audio/speech | handlers/inference.go | partial | `media.tov` `PATTERNS` → `handleMedia`. OpenAI-compatible, Azure and Gemini (WAV or PCM, `media_native.tov`). Other providers are not routed. |
-| POST /v1/audio/transcriptions | handlers/inference.go | partial | `media.tov` `handleMedia`. OpenAI-compatible, Azure and Gemini (speech-to-text through generateContent, `media.tov` `geminiMedia`). Other providers are not routed. |
+| POST /v1/audio/speech | handlers/inference.go; supported-providers/gemini.mdx | done | `media.tov` `PATTERNS` → `handleMedia`. OpenAI-compatible and Azure pass through; Gemini (WAV or PCM, `media_native.tov` `geminiSpeech`). Vertex, Bedrock and Anthropic answer 400: Bifrost has no speech for them either (vertex.mdx, bedrock.mdx). |
+| POST /v1/audio/transcriptions | handlers/inference.go; supported-providers/gemini.mdx | done | `media.tov` `handleMedia`. OpenAI-compatible and Azure pass through; Gemini (speech-to-text through generateContent, `media.tov` `geminiMedia`). Vertex and Bedrock answer 400, as Bifrost does. |
 | POST /v1/audio/translations | not in Bifrost openapi | done (Raiju-only) | `media.tov` `PATTERNS`. |
-| POST /v1/images/generations | handlers/inference.go | partial | `media.tov` `PATTERNS` → `handleMedia`. OpenAI-compatible, Azure, Gemini (Imagen and image models), Vertex and Bedrock (`media_cloud.tov`). Anthropic has no image API. |
-| POST /v1/images/edits | handlers/inference.go | partial | `media.tov` `PATTERNS`. OpenAI-compatible and Azure only. |
-| POST /v1/images/variations | handlers/inference.go | partial | `media.tov` `PATTERNS`. OpenAI-compatible and Azure only. |
+| POST /v1/images/generations | handlers/inference.go | done | `media.tov` `PATTERNS` → `handleMedia`. OpenAI-compatible and Azure pass through. Gemini (Imagen and image models, `media_native.tov` `geminiImageGeneration`), Vertex and Bedrock (`media_cloud.tov` `vertexImage`, `bedrockImage`). Anthropic has no image API. |
+| POST /v1/images/edits | handlers/inference.go; supported-providers/gemini.mdx, bedrock.mdx | partial | `media.tov` `PATTERNS`; the form is read by `media.tov` `readEdit`. OpenAI-compatible and Azure pass through. Gemini (`media_native.tov` `geminiImageEdit`: the images inline on generateContent, or Imagen's :predict with reference images, mask and edit mode), Vertex (`media_cloud.tov` `vertexImageEdit`), Bedrock (`media_cloud.tov` `bedrockImageEdit`: inpainting, outpainting, background removal). Missing: Bedrock Stability AI edits (`stability.*` models; Bifrost's `ToStabilityAIImageEditRequest`). |
+| POST /v1/images/variations | handlers/inference.go; supported-providers/bedrock.mdx | done | `media.tov` `PATTERNS`. OpenAI-compatible and Azure pass through. Bedrock (`media_cloud.tov` `bedrockImageVariation`, IMAGE_VARIATION on Titan and Nova Canvas, read by `media.tov` `readVariation`). Gemini and Vertex answer 400, as Bifrost has no variation for them. |
 | /v1/videos (create, edits, list, get, content, delete, remix) | handlers/inference.go | out-of-scope | `SCOPE.md` Out: videos. |
 | /v1/containers (and /files) | handlers/inference.go | out-of-scope | `SCOPE.md` Out: containers. |
 | POST /v1/files, GET /v1/files | handlers/inference.go | done | `media.tov` `PATTERNS` → `handleMedia`; native for Anthropic, Gemini, Vertex (GCS) and Bedrock (S3) in `media.tov` `vertexStore` and `bedrockStore`. Cohere has no files API upstream (Bifrost's Cohere page lists Files as unsupported). |
@@ -98,7 +98,7 @@ Bifrost: `transports/bifrost-http/handlers/inference.go`, `asyncinference.go`, `
 | GET /v1/batches/{id}, POST /v1/batches/{id}/cancel | handlers/inference.go | done | `media.tov` `PATTERNS` → `handleMedia`. Same providers as the batch list. |
 | GET /v1/batches/{id}/results | handlers/inference.go | done | `media.tov` `PATTERNS` → `handleMedia` (batches.results in each provider branch). Anthropic and Gemini output is also readable through `/v1/files/{id}/content`. |
 | GET /v1/models | handlers/inference.go | done | `server.tov` `listModels`. Upstream listing for OpenAI-format, Anthropic and Gemini. |
-| GET /v1/models/{model} | handlers/inference.go (modelRetrieve) | partial | `server.tov` `retrieveModel`. Returns `{id, owned_by, listed}` from the known model list. No provider metadata is fetched. |
+| GET /v1/models/{model} | handlers/inference.go (modelRetrieve) | partial | `server.tov` `retrieveModel` → `model_retrieve.tov` `retrieveRequest` and `retrieveBody`. OpenAI-compatible providers (`/v1/models/{id}`), Anthropic and Gemini (`/v1beta/models/{id}`) return the provider's model object in Bifrost's shape; an upstream 404 is a 404 and a failed call a 502. Other providers keep the stub `{id, owned_by, listed}` from the known list. Missing: Bedrock, Vertex, Cohere and Azure retrieve (Bifrost has a ModelRetrieve for each). |
 | POST /v1/mcp/tool/execute | handlers/mcpinference.go | done | `server.tov` `dispatch` → `gateway.tov` `Engine.executeTool`. |
 | GET /v1/realtime (WebSocket upgrade) | handlers/wsrealtime.go | done (OpenAI, Azure) | `server.tov` `wsUpgrade` → `realtime.tov` `prepare`; `front.tov` (http1). xAI and ElevenLabs realtime are not wired. |
 | POST /v1/realtime/calls (WebRTC SDP) | handlers/webrtcrealtime.go | done | `media.tov` `PATTERNS` → `handleMedia`. Passed through to OpenAI-compatible providers. |

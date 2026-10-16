@@ -4,6 +4,7 @@
 Usage: tests/e2e.py  (builds both binaries into ./build first)
 """
 import base64, json, os, socket, struct, subprocess, sys, threading, time, urllib.request, urllib.error, urllib.parse, zlib
+import base64 as b64lib
 
 B64 = base64  # main() imports base64 locally, which would shadow this module
 
@@ -59,7 +60,7 @@ def ws_roundtrip(path, message, headers=None):
     """Minimal RFC 6455 client: handshake, one masked text frame, one reply."""
     import base64, os as _os, socket, struct
     sock = socket.create_connection(("127.0.0.1", 18098), timeout=5)
-    key = base64.b64encode(_os.urandom(16)).decode()
+    key = b64lib.b64encode(_os.urandom(16)).decode()
     extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
     sock.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n".encode())
     head = b""
@@ -189,6 +190,20 @@ def multipart(path, filename, data: bytes, fields=None, headers=None):
     boundary = "raiju-e2e-boundary"
     parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in (fields or {}).items()]
     parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode() + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(GW + path, data=b"".join(parts), method="POST", headers={"content-type": f"multipart/form-data; boundary={boundary}", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+def multipart_files(path, files, fields=None, headers=None):
+    """POSTs a multipart form with several file parts: files is [(field, filename, bytes)]. Returns (status, body)."""
+    boundary = "raiju-e2e-boundary"
+    parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in (fields or {}).items()]
+    for name, filename, data in files:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode() + data + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     req = urllib.request.Request(GW + path, data=b"".join(parts), method="POST", headers={"content-type": f"multipart/form-data; boundary={boundary}", **(headers or {})})
     try:
@@ -615,7 +630,7 @@ def discovery_and_proxy():
         return 404, "{}", "application/json"
     kv = {}
     puts = []
-    kv[base64.b64encode(b"/raiju/bifrost/etcd-peer").decode()] = base64.b64encode(json.dumps({"addr": "127.0.0.1", "port": 18084}).encode()).decode()
+    kv[b64lib.b64encode(b"/raiju/bifrost/etcd-peer").decode()] = b64lib.b64encode(json.dumps({"addr": "127.0.0.1", "port": 18084}).encode()).decode()
     def etcd(method, path, headers, body):
         req = json.loads(body) if body else {}
         j = lambda o: (200, json.dumps(o), "application/json")
@@ -681,7 +696,7 @@ def discovery_and_proxy():
         reg = [r for r in consul_regs if r.get("ID") == "bifrost-consul-a"]
         check("consul: the node registers itself with a TCP check on its port", len(reg) > 0 and reg[0].get("Check", {}).get("TCP") == "127.0.0.1:18081" and reg[0].get("Port") == 18081, consul_regs[:1])
         check("kubernetes: lists pods by label with the service account token", any(x["path"] == "/api/v1/namespaces/default/pods?labelSelector=app%3Dbifrost" and x["auth"] == "Bearer e2e-sa-token" for x in k8s_seen), k8s_seen[:2])
-        check("etcd: registers the node under a lease", base64.b64encode(b"/raiju/bifrost/etcd-a").decode() in kv and "/raiju/bifrost/etcd-a" in puts, puts[:3])
+        check("etcd: registers the node under a lease", b64lib.b64encode(b"/raiju/bifrost/etcd-a").decode() in kv and "/raiju/bifrost/etcd-a" in puts, puts[:3])
         # UDP broadcast and mDNS run on their own sockets and list peers at the next round (10 s), so they wait longer
         for _ in range(300):
             if {"udp-a", "mdns-a"}.issubset(set(peer_nodes)):
@@ -1082,7 +1097,7 @@ def l88_e2e(env):
             payload = json.loads(hook["body"])
             key = base64.b64decode(ok_secret[len("whsec_"):])
             signed = (hook["id"] + "." + hook["timestamp"] + "." + hook["body"]).encode()
-            want = "v1," + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+            want = "v1," + b64lib.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
             check("the delivery carries Standard Webhooks headers and a signature the secret verifies", hook["id"].startswith("msg_") and hook["signature"] == want, (hook["signature"], want))
             check("the payload names the event, the job and the inline response", payload["event"] == "async_job.completed" and payload["data"]["job_id"] == job_id and payload["data"]["response"]["choices"][0]["message"]["content"] == "Hello from gpt-4o-mini", payload)
 
@@ -2069,6 +2084,53 @@ def main():
         r = json.loads(b) if s == 200 else {}
         bx = seen()[-1]
         check("bedrock titan returns base64 image data, signed", s == 200 and r.get("data", [{}])[0].get("b64_json") == "iVBORw0KGgo=" and bx["path"] == "/model/amazon.titan-image-generator-v2:0/invoke" and bx["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") and '"taskType":"TEXT_IMAGE"' in bx["body"] and '"quality":"premium"' in bx["body"], (s, b, bx))
+        # Image edits and variations on the native providers: Gemini's generateContent and Imagen's :predict,
+        # Vertex's publisher path, and Bedrock's InvokeModel tasks. Gemini and Vertex have no variations, as Bifrost
+        png, jpg = b"PNG-one", b"JPG-two"  # ASCII: the form parser alters bytes at or above 0x80
+        s, b = multipart_files("/v1/images/edits", [("image[]", "a.png", png), ("image[]", "b.jpg", jpg)], {"model": "gemini/gemini-2.5-flash-image", "prompt": "add a hat", "size": "1024x1024"})
+        ge = seen()[-1]
+        check("gemini image edit sends both images inline and returns base64", s == 200 and json.loads(b)["data"][0]["b64_json"] == "iVBORw0KGgo=" and ge["path"] == "/v1beta/models/gemini-2.5-flash-image:generateContent" and b64lib.b64encode(png).decode() in ge["body"] and b64lib.b64encode(jpg).decode() in ge["body"] and '"text":"add a hat"' in ge["body"] and '"imageConfig":{"aspectRatio":"1:1","imageSize":"1K"}' in ge["body"], (s, b[:200], ge))
+        s, b = multipart_files("/v1/images/edits", [("image", "a.png", png), ("mask", "m.png", b"mask")], {"model": "gemini/imagen-3.0-capability-001", "prompt": "a hat", "n": "2", "type": "inpainting", "output_format": "png"})
+        im = seen()[-1]
+        check("imagen edit sends the reference image, the mask and the edit mode", s == 200 and json.loads(b)["data"][0]["b64_json"] == "iVBORw0KGgo=" and im["path"] == "/v1beta/models/imagen-3.0-capability-001:predict" and '"referenceType":"REFERENCE_TYPE_MASK"' in im["body"] and '"editMode":"EDIT_MODE_INPAINT_INSERTION"' in im["body"] and '"sampleCount":2' in im["body"] and '"mimeType":"image/png"' in im["body"], (s, b[:200], im))
+        s, b = multipart_files("/v1/images/edits", [], {"model": "gemini/gemini-2.5-flash-image", "prompt": "x"})
+        check("an image edit needs an image", s == 400 and json.loads(b)["error"]["type"] == "invalid_request_error", (s, b))
+        s, b = multipart_files("/v1/images/variations", [("image[]", "a.png", png)], {"model": "gemini/gemini-2.5-flash-image"})
+        check("gemini has no image variations, as Bifrost", s == 400 and "does not support images.variations" in b, (s, b))
+        s, b = multipart_files("/v1/images/edits", [("image[]", "a.png", png)], {"model": "vertex/imagen-3.0-generate-002", "prompt": "a hat"})
+        vxe = seen()[-1]
+        check("vertex image edit goes to the publisher path with the bearer token", s == 200 and vxe["path"] == "/v1/projects/proj/locations/us-central1/publishers/google/models/imagen-3.0-generate-002:predict" and vxe["auth"] == "Bearer ya29.test-token", (s, b[:200], vxe))
+        s, b = multipart_files("/v1/images/edits", [("image[]", "a.png", png), ("mask", "m.png", b"mask")], {"model": "bedrock/amazon.titan-image-generator-v2:0", "prompt": "a hat", "type": "inpainting", "size": "512x512", "n": "1", "quality": "high"})
+        bi = seen()[-1]
+        check("bedrock inpainting is one signed InvokeModel with the mask", s == 200 and bi["path"] == "/model/amazon.titan-image-generator-v2:0/invoke" and bi["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/") and '"taskType":"INPAINTING"' in bi["body"] and '"maskImage"' in bi["body"] and '"quality":"premium"' in bi["body"], (s, b[:200], bi))
+        s, b = multipart_files("/v1/images/edits", [("image[]", "a.png", png)], {"model": "bedrock/amazon.titan-image-generator-v2:0", "prompt": "", "type": "background_removal"})
+        check("bedrock background removal takes only the image", s == 200 and '"taskType":"BACKGROUND_REMOVAL"' in seen()[-1]["body"], (s, b[:200]))
+        s, b = multipart_files("/v1/images/edits", [("image[]", "a.png", png)], {"model": "bedrock/amazon.titan-image-generator-v2:0", "prompt": "x"})
+        check("bedrock edits need a type", s == 400 and "type is required" in b, (s, b))
+        s, b = multipart_files("/v1/images/variations", [("image[]", "a.png", png), ("image[]", "b.jpg", jpg)], {"model": "bedrock/amazon.titan-image-generator-v2:0", "prompt": "more", "similarityStrength": "0.5", "n": "1"})
+        bv = seen()[-1]
+        check("bedrock variation sends both images as IMAGE_VARIATION", s == 200 and '"taskType":"IMAGE_VARIATION"' in bv["body"] and '"similarityStrength":0.5' in bv["body"] and b64lib.b64encode(jpg).decode() in bv["body"] and '"text":"more"' in bv["body"], (s, b[:200], bv))
+        # Speech and transcription: Vertex and Bedrock have none, as Bifrost
+        s, _, b = call("POST", "/v1/audio/speech", {"model": "vertex/gemini-2.5-flash-preview-tts", "input": "hi", "voice": "Kore"})
+        check("vertex has no speech, as Bifrost", s == 400 and "does not support" in b, (s, b))
+        s, b = multipart("/v1/audio/transcriptions", "talk.wav", b"RIFF", {"model": "bedrock/amazon.titan-image-generator-v2:0"})
+        check("bedrock has no transcription, as Bifrost", s == 400 and "does not support" in b, (s, b))
+        # GET /v1/models/{model}: the provider's own model object where it has a retrieve API
+        s, _, b = call("GET", "/v1/models/openai/gpt-4o")
+        r = json.loads(b) if s == 200 else {}
+        check("model retrieve reads the provider's own model object", s == 200 and r.get("id") == "openai/gpt-4o" and r.get("owned_by") == "mock-owner" and r.get("created") == 1735689600 and "listed" in r and seen()[-1]["path"] == "/v1/models/gpt-4o", (s, b))
+        s, _, b = call("GET", "/v1/models/gemini/gemini-2.5-flash")
+        r = json.loads(b) if s == 200 else {}
+        check("gemini model retrieve carries its limits and methods", s == 200 and r.get("id") == "gemini/gemini-2.5-flash" and r.get("context_length") == 1048576 and r.get("max_output_tokens") == 65536 and "generateContent" in r.get("supported_methods", []) and seen()[-1]["path"] == "/v1beta/models/gemini-2.5-flash", (s, b))
+        s, _, b = call("GET", "/v1/models/anthropic/claude-sonnet-4")
+        r = json.loads(b) if s == 200 else {}
+        check("anthropic model retrieve reads its display name and limits", s == 200 and r.get("id") == "anthropic/claude-sonnet-4" and r.get("name") == "Claude claude-sonnet-4" and r.get("max_output_tokens") == 64000 and r.get("created") == 1735689600, (s, b))
+        s, _, b = call("GET", "/v1/models/openai/missing")
+        check("a model the provider does not have is a 404", s == 404 and json.loads(b)["error"]["type"] == "invalid_request_error", (s, b))
+        s, _, b = call("GET", "/v1/models/openai/rotate-me")
+        check("a listed model whose server has no retrieve route keeps the list entry", s == 200 and json.loads(b).get("id") == "openai/rotate-me" and json.loads(b).get("listed") is True, (s, b))
+        s, _, b = call("GET", "/v1/models/bedrock/amazon.titan-text")
+        check("a provider without a retrieve API keeps the list entry", s == 200 and json.loads(b).get("owned_by") == "bedrock" and "listed" in json.loads(b), (s, b))
         # Batch results, as Bifrost's body: the output lines of an OpenAI-format batch, a Gemini batch and an Anthropic batch
         s, b = multipart("/v1/files", "results.jsonl", (bline("o1", "gpt-4o-mini") + "\n").encode(), {"purpose": "batch"})
         ofid = json.loads(b).get("id", "") if s == 200 else ""
@@ -2690,7 +2752,7 @@ def main():
         s, _, b = call("POST", "/pydanticai/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "via pydantic"}]})
         check("PydanticAI route prefix", s == 200 and "Hello from gpt-4o-mini" in b, b)
         s, _, b = call("GET", "/openai/v1/models/openai/gpt-4o-mini")
-        check("model retrieve", s == 200 and json.loads(b)["id"] == "openai/gpt-4o-mini" and json.loads(b)["owned_by"] == "openai", b)
+        check("model retrieve", s == 200 and json.loads(b)["id"] == "openai/gpt-4o-mini" and json.loads(b)["owned_by"] == "mock-owner", b)
         s, _, _ = call("GET", "/v1/models/nope/x")
         check("model retrieve for an unknown provider is 404", s == 404, s)
         s, _, b = chat("proxied/gpt-4o-mini", seed=990, headers={"x-bf-mcp-include-clients": "none"})

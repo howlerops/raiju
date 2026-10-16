@@ -92,7 +92,7 @@ function pageQuery(query: string, limitKey: string, cursorIn: string, cursorOut:
 
 // Unix seconds for an RFC 3339 time ("2026-10-14T12:00:00Z"; fractions and a
 // +hh:mm offset are allowed), or undefined when it does not parse.
-function isoSeconds(s: string): f64 | undefined {
+export function isoSeconds(s: string): f64 | undefined {
   if (s.byteLength < 20) return undefined
   const y = parseInt(s.slice(0, 4))
   const mo = parseInt(s.slice(5, 7))
@@ -708,6 +708,95 @@ export function geminiImageToOpenAI(raw: string): string throws SyntaxError {
   return `{"created":${nowSeconds()},"data":[${items.join(",")}]}`
 }
 
+// ---- Image edits and variations ----
+
+// An images/edits call as the builders take it: the uploaded images in order (the first is the
+// primary one), the mask file if any, and the form's values ("" or undefined when absent).
+export type EditInput = { prompt: string, images: u8[][], mask: u8[] | undefined, n: int | undefined, size: string, editType: string, outputFormat: string, compression: int | undefined, quality: string, negative: string, seed: int | undefined, maskPrompt: string }
+
+// An images/variations call (Bedrock): the image files in order and the form's values.
+export type VariationInput = { images: u8[][], prompt: string, negative: string, similarity: f64 | undefined, n: int | undefined, size: string, quality: string, cfgScale: f64 | undefined }
+
+function sigAt(b: u8[], off: int, sig: int[]): bool {
+  if (b.length < off + sig.length) return false
+  for (let i = 0; i < sig.length; i++) {
+    if (int(b[off + i]!) !== sig[i]!) return false
+  }
+  return true
+}
+
+// The MIME type of image bytes from their signature, as Bifrost detects it; PNG when unknown.
+export function imageMime(b: u8[]): string {
+  if (sigAt(b, 0, [137, 80, 78, 71])) return "image/png"
+  if (sigAt(b, 0, [255, 216, 255])) return "image/jpeg"
+  if (sigAt(b, 0, [71, 73, 70, 56])) return "image/gif"
+  if (sigAt(b, 0, [82, 73, 70, 70]) && sigAt(b, 8, [87, 69, 66, 80])) return "image/webp"
+  return "image/png"
+}
+
+// Imagen's MIME type for an output_format ("png", "jpeg" or "webp"); "" when unset or unknown.
+function outputMime(f: string): string {
+  const s = f.toLowerCase()
+  if (s === "png") return "image/png"
+  if (s === "jpeg" || s === "jpg") return "image/jpeg"
+  if (s === "webp") return "image/webp"
+  return ""
+}
+
+// Imagen's edit mode for an edit type, as Bifrost maps it; "" for other types.
+function imagenEditMode(t: string): string {
+  if (t === "inpainting") return "EDIT_MODE_INPAINT_INSERTION"
+  if (t === "outpainting") return "EDIT_MODE_OUTPAINT"
+  if (t === "inpaint_removal") return "EDIT_MODE_INPAINT_REMOVAL"
+  if (t === "bgswap") return "EDIT_MODE_BGSWAP"
+  return ""
+}
+
+// The image edit on a Gemini model: the prompt and the images inline in generateContent, with IMAGE
+// output. An Imagen model (name contains "imagen") edits through :predict: the images are reference
+// images, the mask is a user-provided mask reference, and the edit type becomes the edit mode.
+export function geminiImageEdit(t: Target, ed: EditInput): MediaRequest throws SyntaxError {
+  if (ed.images.length === 0) throw new SyntaxError("at least one image is required")
+  const base = geminiBase(t)
+  const sc = sizeConfig(ed.size)
+  if (t.model.toLowerCase().includes("imagen")) {
+    const n: int = ed.n ?? 1
+    if (n < 1 || n > 4) throw new SyntaxError("n must be between 1 and 4 for Imagen models")
+    const refs: string[] = []
+    let id = 1
+    for (const img of ed.images) {
+      refs.push(`{"referenceType":"REFERENCE_TYPE_RAW","referenceId":${id},"referenceImage":{"bytesBase64Encoded":${quote(encode(img))}}}`)
+      id++
+    }
+    const mask = ed.mask
+    if (mask !== undefined) refs.push(`{"referenceType":"REFERENCE_TYPE_MASK","referenceId":${id},"referenceImage":{"bytesBase64Encoded":${quote(encode(mask))}},"maskImageConfig":{"maskMode":"MASK_MODE_USER_PROVIDED"}}`)
+    const params: string[] = [`"sampleCount":${n}`]
+    if (sc.aspect !== "") params.push(`"aspectRatio":${quote(sc.aspect)}`)
+    if (sc.imageSize !== "") params.push(`"sampleImageSize":${quote(sc.imageSize)}`)
+    const om = outputMime(ed.outputFormat)
+    const comp = ed.compression
+    if (om !== "" || comp !== undefined) {
+      const oo: string[] = []
+      if (om !== "") oo.push(`"mimeType":${quote(om)}`)
+      if (comp !== undefined) oo.push(`"compressionQuality":${comp}`)
+      params.push(`"outputOptions":{${oo.join(",")}}`)
+    }
+    const mode = imagenEditMode(ed.editType.toLowerCase())
+    if (mode !== "") params.push(`"editMode":${quote(mode)}`)
+    const payload = `{"instances":[{"prompt":${quote(ed.prompt)},"referenceImages":[${refs.join(",")}]}],"parameters":{${params.join(",")}}}`
+    return { method: "POST", url: `${base}/v1beta/models/${t.model}:predict`, headers: geminiHeaders(t, true), body: payload }
+  }
+  const parts: string[] = [`{"text":${quote(ed.prompt)}}`]
+  for (const img of ed.images) parts.push(`{"inlineData":{"mimeType":${quote(imageMime(img))},"data":${quote(encode(img))}}}`)
+  const gen: string[] = [`"responseModalities":["IMAGE"]`]
+  const ic: string[] = []
+  if (sc.aspect !== "") ic.push(`"aspectRatio":${quote(sc.aspect)}`)
+  if (sc.imageSize !== "") ic.push(`"imageSize":${quote(sc.imageSize)}`)
+  if (ic.length > 0) gen.push(`"imageConfig":{${ic.join(",")}}`)
+  const payload = `{"contents":[{"role":"user","parts":[${parts.join(",")}]}],"generationConfig":{${gen.join(",")}}}`
+  return { method: "POST", url: `${base}/v1beta/models/${t.model}:generateContent`, headers: geminiHeaders(t, true), body: payload }
+}
+
 // ---- Speech ----
 
 // The output format of an OpenAI speech request: "wav" (the default here, where
@@ -868,6 +957,65 @@ export function transcriptionJson(text: string): string {
 const ANTHROPIC_T: Target = { provider: "anthropic", kind: "anthropic", model: "claude-opus", key: { value: "ak" }, cfg: {} }
 const GEMINI_T: Target = { provider: "gemini", kind: "gemini", model: "", key: { value: "gk" }, cfg: {} }
 const GEMINI_TTS: Target = { provider: "gemini", kind: "gemini", model: "gemini-2.5-flash-preview-tts", key: { value: "gk" }, cfg: {} }
+const EDIT_T: Target = { provider: "gemini", kind: "gemini", model: "gemini-2.5-flash-image", key: { value: "gk" }, cfg: {} }
+const IMAGEN_EDIT_T: Target = { provider: "gemini", kind: "gemini", model: "imagen-3.0-capability-001", key: { value: "gk" }, cfg: {} }
+const EDIT_JPEG: u8[] = [255, 216, 255, 224, 0]
+
+function editOf(images: u8[][], mask: u8[] | undefined, n: int | undefined, size: string, editType: string): EditInput {
+  return { prompt: "add a hat", images: images, mask: mask, n: n, size: size, editType: editType, outputFormat: "", compression: undefined, quality: "", negative: "", seed: undefined, maskPrompt: "" }
+}
+
+test("image mime from the signature, PNG when unknown", () => {
+  expect(imageMime([137, 80, 78, 71, 13, 10])).toBe("image/png")
+  expect(imageMime(EDIT_JPEG)).toBe("image/jpeg")
+  expect(imageMime([71, 73, 70, 56, 57, 97])).toBe("image/gif")
+  expect(imageMime(new TextEncoder().encode("RIFF\x00\x00\x00\x00WEBPVP8 "))).toBe("image/webp")
+  expect(imageMime(new TextEncoder().encode("not an image"))).toBe("image/png")
+})
+
+test("a Gemini image edit sends the images inline and asks for an image", () => {
+  const img = new TextEncoder().encode("PNG-edit")
+  const req = try geminiImageEdit(EDIT_T, editOf([img], undefined, undefined, "1024x1024", ""))
+  expect(req.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent")
+  const body = req.body as string
+  expect(body.includes(`{"text":"add a hat"}`)).toBe(true)
+  expect(body.includes(`{"inlineData":{"mimeType":"image/png","data":"${encode(img)}"}}`)).toBe(true)
+  expect(body.includes(`"responseModalities":["IMAGE"]`)).toBe(true)
+  expect(body.includes(`"imageConfig":{"aspectRatio":"1:1","imageSize":"1K"}`)).toBe(true)
+})
+
+test("an Imagen edit sends reference images, the mask and the edit mode", () => {
+  const img = new TextEncoder().encode("raw-bytes")
+  const mask = new TextEncoder().encode("mask-bytes")
+  let ed = editOf([EDIT_JPEG, img], mask, 2, "", "inpainting")
+  ed.outputFormat = "jpeg"
+  const req = try geminiImageEdit(IMAGEN_EDIT_T, ed)
+  expect(req.url.endsWith("/v1beta/models/imagen-3.0-capability-001:predict")).toBe(true)
+  const body = req.body as string
+  expect(body.includes(`{"referenceType":"REFERENCE_TYPE_RAW","referenceId":1,"referenceImage":{"bytesBase64Encoded":"${encode(EDIT_JPEG)}"}}`)).toBe(true)
+  expect(body.includes(`{"referenceType":"REFERENCE_TYPE_RAW","referenceId":2,"referenceImage":{"bytesBase64Encoded":"${encode(img)}"}}`)).toBe(true)
+  expect(body.includes(`{"referenceType":"REFERENCE_TYPE_MASK","referenceId":3,"referenceImage":{"bytesBase64Encoded":"${encode(mask)}"},"maskImageConfig":{"maskMode":"MASK_MODE_USER_PROVIDED"}}`)).toBe(true)
+  expect(body.includes(`"parameters":{"sampleCount":2,"outputOptions":{"mimeType":"image/jpeg"},"editMode":"EDIT_MODE_INPAINT_INSERTION"}`)).toBe(true)
+})
+
+test("image edits refuse a missing image or a bad Imagen count, and send no mode for an unknown type", () => {
+  let none = false
+  try {
+    geminiImageEdit(EDIT_T, editOf([], undefined, undefined, "", ""))
+  } catch (e) {
+    none = true
+  }
+  expect(none).toBe(true)
+  let many = false
+  try {
+    geminiImageEdit(IMAGEN_EDIT_T, editOf([EDIT_JPEG], undefined, 5, "", ""))
+  } catch (e) {
+    many = true
+  }
+  expect(many).toBe(true)
+  const req = try geminiImageEdit(IMAGEN_EDIT_T, editOf([EDIT_JPEG], undefined, undefined, "", "unknown"))
+  expect((req.body as string).includes("editMode")).toBe(false)
+})
 
 test("anthropic batch create maps each line to a message request", () => {
   const jsonl = [

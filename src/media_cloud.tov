@@ -10,6 +10,7 @@ import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
 import * as native from "./media_native"
 import { ChatRequest, nowSeconds, newId } from "./schemas"
+import { encode } from "./base64"
 import { S3Creds, AwsRequest, s3Call, awsCall, canonicalQuery } from "./exports"
 import { AssumedCreds, credsCache, parseIsoUtcMs, xmlTag } from "./cloud_auth"
 import { BedrockKeyConfig } from "./config"
@@ -34,9 +35,19 @@ function vertexOrigin(t: Target, region: string): string {
 // path with the bearer token. The body is the one media_native builds for Gemini
 // (the same shape on both), so only the URL and the auth differ.
 export function vertexImage(t: Target, body: Field[], token: string): native.MediaRequest throws SyntaxError {
+  return try vertexPublisher(t, try native.geminiImageGeneration(t, body), token)
+}
+
+// The image edit on Vertex: the same Gemini or Imagen body, sent to the publisher path.
+export function vertexImageEdit(t: Target, ed: native.EditInput, token: string): native.MediaRequest throws SyntaxError {
+  return try vertexPublisher(t, try native.geminiImageEdit(t, ed), token)
+}
+
+// A Gemini or Imagen request (media_native builds the body) moved to Vertex's publisher path,
+// with the bearer token. Only the URL and the auth differ from the Gemini API.
+function vertexPublisher(t: Target, g: native.MediaRequest, token: string): native.MediaRequest throws SyntaxError {
   const vk = t.key.vertex_key_config
   if (vk === undefined) throw new SyntaxError("vertex: key has no vertex_key_config")
-  const g = try native.geminiImageGeneration(t, body)
   const action = g.url.endsWith(":predict") ? "predict" : "generateContent"
   const url = `${vertexOrigin(t, vk.region)}/v1/projects/${vk.project_id}/locations/${vk.region}/publishers/google/models/${t.model}:${action}`
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + token]])
@@ -127,6 +138,78 @@ export function bedrockImagesToOpenAI(raw: string): string throws SyntaxError {
   for (const el of try elements(find(fs, "images") ?? "[]")) items.push(`{"b64_json":${el}}`)
   if (items.length === 0) throw new SyntaxError("no images in the response")
   return `{"created":${nowSeconds()},"data":[${items.join(",")}]}`
+}
+
+// Stability AI's edit and variation bodies are not built here (Bifrost has them; this gateway does not).
+function noStability(t: Target): void throws SyntaxError {
+  if (t.model.toLowerCase().includes("stability.")) throw new SyntaxError("Stability AI image edits and variations are not supported by this gateway")
+}
+
+// The imageGenerationConfig of an edit or a variation: the count, size, quality, seed and cfgScale
+// that are set. Edits pass no cfgScale; variations pass no seed.
+function editConfig(n: int | undefined, size: string, quality: string, seed: int | undefined, cfg: f64 | undefined): string throws SyntaxError {
+  const cs: string[] = []
+  if (n !== undefined) cs.push(`"numberOfImages":${n}`)
+  const px = try pixels(size)
+  if (px !== undefined) {
+    cs.push(`"width":${px.w}`)
+    cs.push(`"height":${px.h}`)
+  }
+  if (quality !== "") cs.push(`"quality":${quote(bedrockQuality(quality))}`)
+  if (seed !== undefined) cs.push(`"seed":${seed}`)
+  if (cfg !== undefined) cs.push(`"cfgScale":${cfg}`)
+  return `{${cs.join(",")}}`
+}
+
+// The InvokeModel request for an image edit on a Bedrock model (Titan and Nova Canvas, as Bifrost
+// maps them): inpainting or outpainting with the prompt, the mask and its settings, or background
+// removal, which takes only the image. The type is required.
+export function bedrockImageEdit(t: Target, ed: native.EditInput): native.MediaRequest throws SyntaxError {
+  try noStability(t)
+  if (ed.images.length === 0) throw new SyntaxError("at least one image is required")
+  const kind = ed.editType.toLowerCase()
+  const img = quote(encode(ed.images[0]!))
+  let payload = ""
+  if (kind === "inpainting" || kind === "outpainting") {
+    const ps: string[] = [`"image":${img}`, `"text":${quote(ed.prompt)}`]
+    if (ed.negative !== "") ps.push(`"negativeText":${quote(ed.negative)}`)
+    if (ed.maskPrompt !== "") ps.push(`"maskPrompt":${quote(ed.maskPrompt)}`)
+    const mask = ed.mask
+    if (mask !== undefined) ps.push(`"maskImage":${quote(encode(mask))}`)
+    const task = kind === "inpainting" ? "INPAINTING" : "OUTPAINTING"
+    const key = kind === "inpainting" ? "inPaintingParams" : "outPaintingParams"
+    const cfg = try editConfig(ed.n, ed.size, ed.quality, ed.seed, undefined)
+    payload = `{"taskType":"${task}","${key}":{${ps.join(",")}},"imageGenerationConfig":${cfg}}`
+  } else if (kind === "background_removal") {
+    payload = `{"taskType":"BACKGROUND_REMOVAL","backgroundRemovalParams":{"image":${img}}}`
+  } else if (kind === "") {
+    throw new SyntaxError("type is required (inpainting, outpainting or background_removal)")
+  } else {
+    throw new SyntaxError(`unsupported type for Bedrock: ${kind} (must be inpainting, outpainting or background_removal)`)
+  }
+  const up = bedrock.signedRequest(t, "invoke", payload)
+  return { method: "POST", url: up.url, headers: up.headers, body: up.body }
+}
+
+// The InvokeModel request for an image variation (IMAGE_VARIATION, Titan and Nova Canvas): the
+// images, the optional prompt and negative text, the similarity strength (0.2 to 1.0) and the config.
+export function bedrockImageVariation(t: Target, v: native.VariationInput): native.MediaRequest throws SyntaxError {
+  try noStability(t)
+  if (v.images.length === 0) throw new SyntaxError("at least one image is required")
+  const imgs: string[] = []
+  for (const b of v.images) imgs.push(quote(encode(b)))
+  const ps: string[] = [`"images":[${imgs.join(",")}]`]
+  if (v.prompt !== "") ps.push(`"text":${quote(v.prompt)}`)
+  if (v.negative !== "") ps.push(`"negativeText":${quote(v.negative)}`)
+  const sim = v.similarity
+  if (sim !== undefined) {
+    if (sim < 0.2 || sim > 1.0) throw new SyntaxError(`similarityStrength must be between 0.2 and 1.0, got ${sim}`)
+    ps.push(`"similarityStrength":${sim}`)
+  }
+  const cfg = try editConfig(v.n, v.size, v.quality, undefined, v.cfgScale)
+  const payload = `{"taskType":"IMAGE_VARIATION","imageVariationParams":{${ps.join(",")}},"imageGenerationConfig":${cfg}}`
+  const up = bedrock.signedRequest(t, "invoke", payload)
+  return { method: "POST", url: up.url, headers: up.headers, body: up.body }
 }
 
 // ---- files and batches ----
@@ -926,6 +1009,71 @@ test("bedrock image answers become openai images bodies", () => {
 const GT: Target = { provider: "vertex", kind: "vertex", model: "gemini-2.5-flash", key: { value: "", vertex_key_config: { project_id: "proj", region: "us-central1" } }, cfg: {} }
 const S3K: S3Creds = { accessKey: "AKIAIOSFODNN7EXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-east-1" }
 const NOW = 1791979200000.0 // 2026-10-14T12:00:00Z
+
+function bdEdit(editType: string, mask: u8[] | undefined): native.EditInput {
+  return { prompt: "a red fox", images: [new TextEncoder().encode("img")], mask: mask, n: 2, size: "512x512", editType: editType, outputFormat: "", compression: undefined, quality: "high", negative: "", seed: undefined, maskPrompt: "" }
+}
+
+test("bedrock inpainting and background removal bodies, signed for the Titan model", () => {
+  const mask = new TextEncoder().encode("msk")
+  const inp = try bedrockImageEdit(BD, bdEdit("inpainting", mask))
+  expect(inp.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/amazon.titan-image-generator-v2%3A0/invoke")
+  const body = inp.body as string
+  expect(body.startsWith(`{"taskType":"INPAINTING","inPaintingParams":{"image":"${encode(new TextEncoder().encode("img"))}","text":"a red fox","maskImage":"${encode(mask)}"},"imageGenerationConfig":{"numberOfImages":2,"width":512,"height":512,"quality":"premium"}}`)).toBe(true)
+  expect(inp.headers.get("authorization")!.startsWith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")).toBe(true)
+  const bg = try bedrockImageEdit(BD, bdEdit("background_removal", undefined))
+  expect(bg.body as string).toBe(`{"taskType":"BACKGROUND_REMOVAL","backgroundRemovalParams":{"image":"${encode(new TextEncoder().encode("img"))}"}}`)
+  const out = try bedrockImageEdit(BD, bdEdit("outpainting", undefined))
+  expect((out.body as string).includes(`"taskType":"OUTPAINTING","outPaintingParams":{"image"`)).toBe(true)
+})
+
+test("bedrock edits refuse a missing or unknown type and Stability models", () => {
+  let none = false
+  try {
+    bedrockImageEdit(BD, bdEdit("", undefined))
+  } catch (e) {
+    none = true
+  }
+  expect(none).toBe(true)
+  let unknown = false
+  try {
+    bedrockImageEdit(BD, bdEdit("erase", undefined))
+  } catch (e) {
+    unknown = true
+  }
+  expect(unknown).toBe(true)
+  const st: Target = { provider: "bedrock", kind: "bedrock", model: "stability.stable-image-inpaint-v1:0", key: BD.key, cfg: {} }
+  let stability = false
+  try {
+    bedrockImageEdit(st, bdEdit("inpainting", undefined))
+  } catch (e) {
+    stability = true
+  }
+  expect(stability).toBe(true)
+})
+
+test("bedrock image variation body: images, text, similarity and config", () => {
+  let v: native.VariationInput = { images: [new TextEncoder().encode("a"), new TextEncoder().encode("b")], prompt: "more", negative: "", similarity: 0.7, n: 1, size: "", quality: "", cfgScale: undefined }
+  const req = try bedrockImageVariation(BD, v)
+  const body = req.body as string
+  expect(body.startsWith(`{"taskType":"IMAGE_VARIATION","imageVariationParams":{"images":["${encode(new TextEncoder().encode("a"))}","${encode(new TextEncoder().encode("b"))}"],"text":"more","similarityStrength":0.7},"imageGenerationConfig":{"numberOfImages":1}}`)).toBe(true)
+  let low = false
+  v.similarity = 0.1
+  try {
+    bedrockImageVariation(BD, v)
+  } catch (e) {
+    low = true
+  }
+  expect(low).toBe(true)
+})
+
+test("vertex image edit goes to the publisher path with the bearer token", () => {
+  const ed: native.EditInput = { prompt: "a red fox", images: [new TextEncoder().encode("p")], mask: undefined, n: 1, size: "", editType: "", outputFormat: "", compression: undefined, quality: "", negative: "", seed: undefined, maskPrompt: "" }
+  const req = try vertexImageEdit(VX, ed, "tok")
+  expect(req.url).toBe("https://us-central1-aiplatform.googleapis.com/v1/projects/proj/locations/us-central1/publishers/google/models/imagen-3.0-generate-002:predict")
+  expect(req.headers.get("authorization")).toBe("Bearer tok")
+  expect((req.body as string).includes(`"sampleCount":1`)).toBe(true)
+})
 
 test("sigv4 for list, stop and path-style put matches the independent reference", () => {
   const list = s3Call(S3K, "", "GET", "bkt", "", [["prefix", "a b/c"], ["list-type", "2"]], "", "", NOW)

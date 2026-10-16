@@ -432,6 +432,98 @@ function formText(form: FormData | undefined, key: string): string {
   return typeof v === "string" ? v : ""
 }
 
+// A form field's integer, undefined when absent. A value that is not an integer is a SyntaxError.
+function formInt(form: FormData, key: string): int | undefined throws SyntaxError {
+  const s = formText(form, key)
+  if (s === "") return undefined
+  const v = parseInt(s)
+  if (v === undefined) throw new SyntaxError(`${key} must be an integer`)
+  return v
+}
+
+// A form field's number, undefined when absent. A value that is not a number is a SyntaxError.
+function formNum(form: FormData, key: string): f64 | undefined throws SyntaxError {
+  const s = formText(form, key)
+  if (s === "") return undefined
+  const v = parseFloat(s)
+  if (v === undefined) throw new SyntaxError(`${key} must be a number`)
+  return v
+}
+
+// The file under a form key, or undefined.
+function formFile(form: FormData, key: string): File | undefined {
+  const f = form.get(key) ?? undefined
+  if (f === undefined || typeof f === "string") return undefined
+  return f
+}
+
+// The files under a form key, in the order sent (the image[] key, then image when image[] is absent,
+// as Bifrost reads them).
+function formFiles(form: FormData, key: string): File[] {
+  const out: File[] = []
+  form.forEach((value, k) => {
+    if (k === key && typeof value !== "string") out.push(value)
+  })
+  return out
+}
+
+// The images of an images/edits or images/variations form, as bytes.
+async function imageBytes(form: FormData): Promise<u8[][]> throws TypeError {
+  let files = formFiles(form, "image[]")
+  if (files.length === 0) files = formFiles(form, "image")
+  const out: u8[][] = []
+  for (const f of files) out.push(try await f.bytes())
+  return out
+}
+
+// An images/edits form for the native builders: the images, the mask and the options.
+async function readEdit(form: FormData): Promise<native.EditInput> throws SyntaxError | TypeError {
+  const images = try await imageBytes(form)
+  const m = formFile(form, "mask")
+  let mask: u8[] | undefined = undefined
+  if (m !== undefined) mask = try await m.bytes()
+  return {
+    prompt: formText(form, "prompt"),
+    images: images,
+    mask: mask,
+    n: try formInt(form, "n"),
+    size: formText(form, "size"),
+    editType: formText(form, "type"),
+    outputFormat: formText(form, "output_format"),
+    compression: try formInt(form, "output_compression"),
+    quality: formText(form, "quality"),
+    negative: formText(form, "negative_prompt"),
+    seed: try formInt(form, "seed"),
+    maskPrompt: formText(form, "mask_prompt"),
+  }
+}
+
+// An images/variations form for Bedrock: the images (the first is the primary one) and the values
+// Bifrost takes from the form (prompt, negativeText, similarityStrength, cfgScale, quality, n, size).
+async function readVariation(form: FormData): Promise<native.VariationInput> throws SyntaxError | TypeError {
+  return {
+    images: try await imageBytes(form),
+    prompt: formText(form, "prompt"),
+    negative: formText(form, "negativeText"),
+    similarity: try formNum(form, "similarityStrength"),
+    n: try formInt(form, "n"),
+    size: formText(form, "size"),
+    quality: formText(form, "quality"),
+    cfgScale: try formNum(form, "cfgScale"),
+  }
+}
+
+// Sends an image request on a native provider and converts the answer to OpenAI's images body:
+// Imagen's predictions or a Gemini image model's inline data (by the model name), or Bedrock's images.
+async function imageReply(t: Target, mr: native.MediaRequest, bedrockAnswer: bool): Promise<Response> throws SyntaxError | Error {
+  const up = await send(t, mr)
+  if (!up.ok) return up
+  const raw = try await up.text()
+  if (bedrockAnswer) return jsonReply(try cloud.bedrockImagesToOpenAI(raw))
+  if (t.model.toLowerCase().includes("imagen")) return jsonReply(try native.imagenToOpenAI(raw))
+  return jsonReply(try native.geminiImageToOpenAI(raw))
+}
+
 // A GET to the upstream URL of a route, with the provider's auth.
 function getRequest(t: Target, route: MediaRoute): native.MediaRequest {
   return { method: "GET", url: upstreamUrl(t, route, ""), headers: authHeaders(t), body: undefined }
@@ -837,9 +929,10 @@ async function bedrockBatchOutput(t: Target, c: S3Creds, bid: string): Promise<R
   return jsonlReply(try cloud.bedrockResultsToOpenAI(all, model))
 }
 
-// Vertex: image generation here, and its files and batches (vertexStore).
+// Vertex: image generation and edits here, and its files and batches (vertexStore).
 async function vertexMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
   if (route.op.startsWith("files.") || route.op.startsWith("batches.")) return try await vertexStore(t, route, qs, text, form)
+  if (route.op === "images.edits") return try await vertexEdit(t, form)
   if (route.op !== "images.generations") return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
   const fs = try fields(text)
   if ((rawStr(fs, "prompt") ?? "") === "") return errorReply(400, "the request needs a prompt", "invalid_request_error")
@@ -863,9 +956,36 @@ async function vertexMedia(t: Target, route: MediaRoute, qs: string, text: strin
   return jsonReply(try native.geminiImageToOpenAI(raw))
 }
 
-// Bedrock: image generation here (InvokeModel), and its files and batches (bedrockStore).
+// Vertex's image edit: the form read, then the Gemini or Imagen body on the publisher path with the bearer token.
+async function vertexEdit(t: Target, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  if (form === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+  let ed: native.EditInput | undefined = undefined
+  try {
+    ed = try await readEdit(form)
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (ed === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+  let token = ""
+  try {
+    token = try await vertexBearer(t)
+  } catch (e) {
+    return errorReply(502, `vertex authentication failed: ${e.message}`, "authentication_error")
+  }
+  let mr: native.MediaRequest | undefined = undefined
+  try {
+    mr = try cloud.vertexImageEdit(t, ed, token)
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+  return try await imageReply(t, mr, false)
+}
+
+// Bedrock: image generation, edits and variations here (InvokeModel), and its files and batches (bedrockStore).
 async function bedrockMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
   if (route.op.startsWith("files.") || route.op.startsWith("batches.")) return try await bedrockStore(t, route, qs, text, form)
+  if (route.op === "images.edits" || route.op === "images.variations") return try await bedrockImageForm(t, route, form)
   if (route.op !== "images.generations") return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
   let mr: native.MediaRequest | undefined = undefined
   try {
@@ -874,9 +994,43 @@ async function bedrockMedia(t: Target, route: MediaRoute, qs: string, text: stri
     return errorReply(400, e.message, "invalid_request_error")
   }
   if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
-  const up = await send(t, mr)
-  if (!up.ok) return up
-  return jsonReply(try cloud.bedrockImagesToOpenAI(try await up.text()))
+  return try await imageReply(t, mr, true)
+}
+
+// Bedrock's image edit (inpainting, outpainting, background removal) or variation: the form read, then
+// the InvokeModel request built and its answer converted.
+async function bedrockImageForm(t: Target, route: MediaRoute, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  if (form === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+  let mr: native.MediaRequest | undefined = undefined
+  if (route.op === "images.edits") {
+    let ed: native.EditInput | undefined = undefined
+    try {
+      ed = try await readEdit(form)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (ed === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    try {
+      mr = try cloud.bedrockImageEdit(t, ed)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+  } else {
+    let v: native.VariationInput | undefined = undefined
+    try {
+      v = try await readVariation(form)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (v === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    try {
+      mr = try cloud.bedrockImageVariation(t, v)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+  }
+  if (mr === undefined) return errorReply(400, "the request could not be built", "invalid_request_error")
+  return try await imageReply(t, mr, true)
 }
 
 async function anthropicMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
@@ -1060,6 +1214,25 @@ async function geminiMedia(t: Target, route: MediaRoute, qs: string, text: strin
     const raw = try await up.text()
     if (t.model.toLowerCase().includes("imagen")) return jsonReply(try native.imagenToOpenAI(raw))
     return jsonReply(try native.geminiImageToOpenAI(raw))
+  }
+  if (route.op === "images.edits") {
+    // Gemini's image edit: the images inline in generateContent, or Imagen's edit through :predict
+    if (form === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    let ed: native.EditInput | undefined = undefined
+    try {
+      ed = try await readEdit(form)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (ed === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    let mr: native.MediaRequest | undefined = undefined
+    try {
+      mr = try native.geminiImageEdit(t, ed)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (mr === undefined) return errorReply(400, "the request needs image files", "invalid_request_error")
+    return try await imageReply(t, mr, false)
   }
   if (route.op === "audio.transcriptions") {
     // Gemini's speech-to-text: the audio inline in generateContent (as Bifrost does)

@@ -9,6 +9,7 @@ import { Target, Upstream } from "./providers/types"
 import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
+import { retrieveRequest, retrieveBody } from "./model_retrieve"
 import { fields, find, elements, rawStr, rawBool } from "./json"
 import * as metrics from "./metrics"
 import { Session, SocketExt, prepare, onOpen, onMessage, onClose, extOpen, extMessage, extClose, extPong, attachHttp1 } from "./realtime"
@@ -116,15 +117,43 @@ async function refreshModels(cfg: Config, provider: string, keyId: string | unde
   return { status: 502, body: JSON.stringify({ error: { message: `no key of ${provider} could list its models`, type: "api_error" } }), contentType: "application/json" }
 }
 
-// GET /v1/models/{model}: the entry from the provider's list, or for a configured provider a
-// minimal entry (some providers list only part of what they serve).
+// GET /v1/models/{model}: the provider's own model object where the provider has a retrieve API
+// (model_retrieve.tov), as Bifrost's modelRetrieve reads it. Other providers, and a retrieve that
+// cannot reach the provider, answer with the entry from the list: some providers list only part of
+// what they serve, so a configured provider gets a minimal entry.
 async function retrieveModel(engine: Engine, req: Request, id: string): Promise<Response> {
   const slash = id.indexOf("/")
   if (slash <= 0) return errorResponse(404, `model ${id} not found: use provider/model`, "invalid_request_error", noHeaders())
   const provider = id.slice(0, slash)
   if (!providerNames(engine.cfg).includes(provider)) return errorResponse(404, `no provider ${provider}`, "invalid_request_error", noHeaders())
+  const model = id.slice(slash + 1)
   const known = await providerModels(engine.cfg, provider)
-  const listed = known.includes(id) || known.includes(id.slice(slash + 1))
+  const listed = known.includes(id) || known.includes(model)
+  const p = providerOf(engine.cfg, provider)
+  if (p !== undefined) {
+    const kind = kindOf(provider, p)
+    const key = (p.keys ?? [])[0] ?? { value: "" }
+    const up = retrieveRequest({ provider: provider, kind: kind, model: model, key: key, cfg: p }, model)
+    if (up !== undefined) {
+      const hs = new Headers()
+      for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+      try {
+        const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+        const text = await res.text()
+        // a 404 is the answer for a model the provider does not have; a listed model whose server has no
+        // retrieve route (some OpenAI-compatible servers) keeps the list entry
+        if (res.status === 404) {
+          if (listed) return Response.json({ id: id, object: "model", created: 0, owned_by: provider, listed: listed })
+          return errorResponse(404, `model ${model} not found at ${provider}`, "invalid_request_error", noHeaders())
+        }
+        if (!res.ok) return new Response(text, { status: res.status, headers: { "content-type": "application/json" } })
+        const body = try retrieveBody(provider, kind, text, listed)
+        return new Response(body, { headers: { "content-type": "application/json" } })
+      } catch (e) {
+        return errorResponse(502, `${provider} could not return model ${model}: ${e.message}`, "api_error", noHeaders())
+      }
+    }
+  }
   return Response.json({ id: id, object: "model", created: 0, owned_by: provider, listed: listed })
 }
 
