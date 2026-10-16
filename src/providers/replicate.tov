@@ -3,7 +3,7 @@
 // request asks for a synchronous answer (Prefer: wait). A prediction still running when
 // that wait ends is an error here: the gateway does not poll (see the notes in INTEGRATION).
 // Replicate's wire format is not OpenAI's, so this translates both ways.
-import { fields, find, rawStr, decodeString, elements, quote } from "../json"
+import { Field, fields, find, rawStr, rawNum, decodeString, elements, quote } from "../json"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, ContentPart, textOf, nowSeconds } from "../schemas"
 import { parseIsoUtcMs } from "../cloud_auth"
@@ -137,6 +137,98 @@ export function chatResponse(text: string, requestedModel: string): Translated t
   return { body: body, promptTokens: pt, completionTokens: ct }
 }
 
+// Image generation as one prediction: the prompt, the count as num_outputs, and the negative prompt
+// and seed when set, in the model's input. The answer is the prediction's output URLs.
+export function imageRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const key = t.key.value ?? ""
+  if (key === "") throw new SyntaxError("replicate: the key needs a value: an API token")
+  const prompt = rawStr(body, "prompt") ?? ""
+  if (prompt === "") throw new SyntaxError("prompt is required")
+  const input: string[] = [`"prompt":${quote(prompt)}`]
+  const n = rawNum(body, "n")
+  if (n !== undefined) input.push(`"num_outputs":${n}`)
+  const neg = rawStr(body, "negative_prompt") ?? ""
+  if (neg !== "") input.push(`"negative_prompt":${quote(neg)}`)
+  const seed = rawNum(body, "seed")
+  if (seed !== undefined) input.push(`"seed":${seed}`)
+  const b = t.cfg.network_config?.base_url ?? ""
+  const root = b === "" ? DEFAULT_BASE : trimSlash(b)
+  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
+  addExtraHeaders(&h, t.cfg)
+  const head = isVersion(t.model) ? `"version":${quote(t.model)},` : ""
+  return { url: root + predictionPath(t.model), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
+}
+
+// The images answer: the output URLs (one string or an array) as OpenAI's data list. A prediction
+// that has not succeeded by the end of the wait is an error here, as for chat.
+export function imageResponse(text: string): string throws SyntaxError {
+  const fs = try fields(text)
+  const status = rawStr(fs, "status") ?? ""
+  if (status === "failed" || status === "canceled") {
+    throw new SyntaxError(`replicate: prediction ${status}: ${rawStr(fs, "error") ?? "no error given"}`)
+  }
+  if (status !== "succeeded") {
+    throw new SyntaxError(`replicate: prediction is ${status === "" ? "unknown" : status}; the wait for a synchronous answer ended first`)
+  }
+  const items: string[] = []
+  const out = find(fs, "output") ?? "null"
+  if (out.startsWith("[")) {
+    for (const el of try elements(out)) {
+      if (el.startsWith("\"")) {
+        const u = try decodeString(el)
+        items.push(`{"url":${quote(u)}}`)
+      }
+    }
+  } else if (out.startsWith("\"")) {
+    const u = try decodeString(out)
+    items.push(`{"url":${quote(u)}}`)
+  }
+  if (items.length === 0) throw new SyntaxError("replicate: the prediction has no output")
+  const created = parseIsoUtcMs(rawStr(fs, "created_at") ?? "")
+  const at = created === undefined ? nowSeconds() : Math.floor(created / 1000.0)
+  return `{"created":${at},"data":[${items.join(",")}]}`
+}
+
+// A file upload's answer as OpenAI's file object. Replicate keeps no purpose; the caller's is echoed,
+// or "batch" (Bifrost's default). A file with bytes is processed.
+export function fileToOpenAI(text: string, purpose: string): string throws SyntaxError {
+  const fs = try fields(text)
+  const size = rawNum(fs, "size") ?? 0
+  const status = rawStr(fs, "id") !== undefined && size > 0 ? "processed" : "uploaded"
+  const created = parseIsoUtcMs(rawStr(fs, "created_at") ?? "")
+  const at = created === undefined ? nowSeconds() : Math.floor(created / 1000.0)
+  const expires = parseIsoUtcMs(rawStr(fs, "expires_at") ?? "")
+  const exp = expires === undefined ? "" : `,"expires_at":${Math.floor(expires / 1000.0)}`
+  const pur = purpose === "" ? "batch" : purpose
+  return `{"id":${quote(rawStr(fs, "id") ?? "")},"object":"file","bytes":${size},"created_at":${at},"filename":${quote(rawStr(fs, "name") ?? "")},"purpose":${quote(pur)},"status":${quote(status)}${exp}}`
+}
+
+// One page of the deployments listing: the owner/name ids, and the URL of the next page ("" when none).
+export function deploymentsPage(text: string): { ids: string[], next: string } throws SyntaxError {
+  const fs = try fields(text)
+  const ids: string[] = []
+  for (const el of try elements(find(fs, "results") ?? "[]")) {
+    const ef = try fields(el)
+    const owner = rawStr(ef, "owner") ?? ""
+    const name = rawStr(ef, "name") ?? ""
+    if (owner !== "" && name !== "") ids.push(owner + "/" + name)
+  }
+  return { ids: ids, next: rawStr(fs, "next") ?? "" }
+}
+
+// The API root: the provider's base_url, or Replicate's.
+export function rootOf(t: Target): string {
+  const b = t.cfg.network_config?.base_url ?? ""
+  return b === "" ? DEFAULT_BASE : trimSlash(b)
+}
+
+// The deployments listing of a key's account: the first page (later pages come from each "next").
+export function deploymentsRequest(t: Target): Upstream {
+  let h = headers([["authorization", "Bearer " + (t.key.value ?? "")]])
+  addExtraHeaders(&h, t.cfg)
+  return { url: rootOf(t) + "/v1/deployments", headers: h, body: "" }
+}
+
 // ---- tests ----
 
 test("prediction path for a model name and for a version", () => {
@@ -189,4 +281,45 @@ test("a string output and a failed prediction", () => {
     threw = true
   }
   expect(threw).toBe(true)
+})
+
+test("an image prediction posts the prompt as input and reads the output URLs", () => {
+  const t: Target = { provider: "replicate", kind: "replicate", model: "black-forest-labs/flux-schnell", key: { value: "r8_x" }, cfg: {} }
+  const body = try fields(`{"prompt":"a fox","n":2,"seed":4}`)
+  const up = try imageRequest(t, body)
+  expect(up.url).toBe("https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions")
+  expect(up.headers.get("prefer")).toBe("wait")
+  expect(up.body).toBe(`{"input":{"prompt":"a fox","num_outputs":2,"seed":4}}`)
+  const v = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  const vt: Target = { provider: "replicate", kind: "replicate", model: v, key: { value: "r8_x" }, cfg: {} }
+  expect((try imageRequest(vt, try fields(`{"prompt":"p"}`))).body).toBe(`{"version":"${v}","input":{"prompt":"p"}}`)
+  let missing = false
+  try {
+    imageRequest(t, try fields(`{"n":1}`))
+  } catch (e) {
+    missing = true
+  }
+  expect(missing).toBe(true)
+  const out = try imageResponse(`{"id":"p3","status":"succeeded","created_at":"2026-10-14T13:00:00.123Z","output":["https://r.example/a.png","https://r.example/b.png"]}`)
+  expect(out).toBe(`{"created":1791982800,"data":[{"url":"https://r.example/a.png"},{"url":"https://r.example/b.png"}]}`)
+  expect(try imageResponse(`{"status":"succeeded","output":"https://r.example/c.png"}`).includes(`{"url":"https://r.example/c.png"}`)).toBe(true)
+  let failed = false
+  try {
+    imageResponse(`{"status":"failed","error":"nsfw"}`)
+  } catch (e) {
+    failed = true
+  }
+  expect(failed).toBe(true)
+})
+
+test("a file upload answer is an OpenAI file; deployments give owner/name ids and the next page", () => {
+  const f = try fileToOpenAI(`{"id":"file-1","name":"a.png","content_type":"image/png","size":9,"created_at":"2026-10-14T13:00:00.123Z","urls":{"get":"https://x"}}`, "")
+  expect(f).toBe(`{"id":"file-1","object":"file","bytes":9,"created_at":1791982800,"filename":"a.png","purpose":"batch","status":"processed"}`)
+  expect(try fileToOpenAI(`{"id":"file-2","size":0}`, "vision").includes(`"purpose":"vision","status":"uploaded"`)).toBe(true)
+  const page = try deploymentsPage(`{"next":"https://api.replicate.com/v1/deployments?cursor=2","results":[{"owner":"acme","name":"model-a"},{"owner":"acme","name":"model-b"}]}`)
+  expect(page.ids.join(",")).toBe("acme/model-a,acme/model-b")
+  expect(page.next).toBe("https://api.replicate.com/v1/deployments?cursor=2")
+  expect(try deploymentsPage(`{"next":null,"results":[]}`).next).toBe("")
+  const dt: Target = { provider: "replicate", kind: "replicate", model: "", key: { value: "r8_x" }, cfg: {} }
+  expect(deploymentsRequest(dt).url).toBe("https://api.replicate.com/v1/deployments")
 })

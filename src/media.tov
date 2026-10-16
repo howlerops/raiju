@@ -8,9 +8,10 @@
 import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
 import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf } from "./providers/types"
 import { isOpenAICompatible, modelsRequest } from "./providers/openai"
+import * as replicate from "./providers/replicate"
 import { parseModel, target, kindOf, pickKey, timeoutMs } from "./router"
-import { Field, fields, find, rawStr, setField, build, quote } from "./json"
-import { errorJson, snapshot } from "./schemas"
+import { Field, fields, find, rawStr, rawNum, setField, build, quote } from "./json"
+import { errorJson, snapshot, nowSeconds } from "./schemas"
 import { deadline } from "./deadline"
 import * as native from "./media_native"
 import * as cloud from "./media_cloud"
@@ -320,6 +321,7 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       let form: FormData | undefined = undefined
       if (route.op === "files.create") form = try await req.formData()
       else if (route.method === "POST") text = try await req.text()
+      if (pt.kind === "wafer" && route.op === "files.create") return await waferUpload(pt, form)
       if (isNative(pt.kind)) return await nativeMedia(pt, route, qs, text, form)
       if (form !== undefined) body = form
       else if (text !== "") {
@@ -579,7 +581,7 @@ const uploadOrder: string[] = []
 const batchModels: Map<string, string> = new Map()
 
 function isNative(kind: string): bool {
-  return kind === "anthropic" || kind === "gemini" || kind === "vertex" || kind === "bedrock"
+  return kind === "anthropic" || kind === "gemini" || kind === "vertex" || kind === "bedrock" || kind === "replicate"
 }
 
 function remember(id: string, content: string): void {
@@ -627,6 +629,42 @@ function responsesFileOf(raw: string): string throws SyntaxError {
   return rawStr(try fields(find(fs, "dest") ?? "{}"), "fileName") ?? ""
 }
 
+// Wafer's file upload (Bifrost's wafer FileUpload): the raw bytes are the body, and the MIME type,
+// purpose and filename are headers. Its answer is converted to OpenAI's file object.
+async function waferUpload(t: Target, form: FormData | undefined): Promise<Response> {
+  const f = filePart(form)
+  if (f === undefined) return errorReply(400, "the request needs a \"file\" part", "invalid_request_error")
+  const purpose = formText(form, "purpose")
+  if (purpose === "") return errorReply(400, "purpose is required", "invalid_request_error")
+  const mime = f.type.trim()
+  if (mime === "") return errorReply(400, "the file part needs a MIME type: Wafer checks it against the purpose", "invalid_request_error")
+  const hs = authHeaders(t)
+  hs.set("content-type", mime)
+  hs.set("x-wafer-purpose", purpose)
+  if (f.name !== "") hs.set("x-wafer-filename", f.name)
+  const up = await send(t, { method: "POST", url: openaiBase(t) + "/files", headers: hs, body: try await f.bytes() })
+  if (!up.ok) return up
+  try {
+    return jsonReply(try waferFileToOpenAI(try await up.text()))
+  } catch (e) {
+    return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
+  }
+}
+
+// Wafer's file object as OpenAI's: ready is processed and pending is uploaded (Bifrost's ToBifrostFileStatus).
+export function waferFileToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const status = rawStr(fs, "status") ?? ""
+  let st = status
+  if (status === "ready") st = "processed"
+  else if (status === "pending" || status === "") st = "uploaded"
+  const created = cloudAuth.parseIsoUtcMs(rawStr(fs, "created_at") ?? "")
+  const at = created === undefined ? nowSeconds() : Math.floor(created / 1000.0)
+  const expires = cloudAuth.parseIsoUtcMs(rawStr(fs, "expires_at") ?? "")
+  const exp = expires === undefined ? "" : `,"expires_at":${Math.floor(expires / 1000.0)}`
+  return `{"id":${quote(rawStr(fs, "id") ?? "")},"object":"file","bytes":${rawNum(fs, "bytes") ?? 0},"created_at":${at},"filename":${quote(rawStr(fs, "filename") ?? "")},"purpose":${quote(rawStr(fs, "purpose") ?? "")},"status":${quote(st)}${exp}}`
+}
+
 // The uploaded file of a files.create form, or undefined when there is none.
 function filePart(form: FormData | undefined): File | undefined {
   if (form === undefined) return undefined
@@ -641,6 +679,7 @@ async function nativeMedia(t: Target, route: MediaRoute, qs: string, text: strin
     if (t.kind === "anthropic") return await anthropicMedia(t, route, qs, text, form)
     if (t.kind === "vertex") return await vertexMedia(t, route, qs, text, form)
     if (t.kind === "bedrock") return await bedrockMedia(t, route, qs, text, form)
+    if (t.kind === "replicate") return await replicateMedia(t, route, text, form)
     return await geminiMedia(t, route, qs, text, form)
   } catch (e) {
     return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
@@ -717,7 +756,18 @@ async function readEdit(form: FormData): Promise<native.EditInput> throws Syntax
     negative: formText(form, "negative_prompt"),
     seed: try formInt(form, "seed"),
     maskPrompt: formText(form, "mask_prompt"),
+    extra: formExtras(form),
   }
+}
+
+// The Stability options the form sent, by name.
+function formExtras(form: FormData): Map<string, string> {
+  const extra: Map<string, string> = new Map()
+  for (const k of cloud.stabilityFormFields()) {
+    const v = formText(form, k)
+    if (v !== "") extra.set(k, v)
+  }
+  return extra
 }
 
 // An images/variations form for Bedrock: the images (the first is the primary one) and the values
@@ -1149,6 +1199,29 @@ async function bedrockBatchOutput(t: Target, c: S3Creds, bid: string): Promise<R
   let model = batchModels.get(bid) ?? ""
   if (model === "") model = try cloud.bedrockJobModel(raw)
   return jsonlReply(try cloud.bedrockResultsToOpenAI(all, model))
+}
+
+// Replicate: image generations as predictions (the output URLs), and file uploads. Other operations
+// answer 400: Replicate has no image edits here, and its files are not listed or fetched.
+async function replicateMedia(t: Target, route: MediaRoute, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  if (route.op === "images.generations") {
+    const up = try replicate.imageRequest(t, try fields(text))
+    const r = await send(t, { method: "POST", url: up.url, headers: up.headers, body: up.body })
+    if (!r.ok) return r
+    return jsonReply(try replicate.imageResponse(try await r.text()))
+  }
+  if (route.op === "files.create") {
+    const f = filePart(form)
+    if (f === undefined) return errorReply(400, "the request needs a \"file\" part", "invalid_request_error")
+    const fd = new FormData()
+    fd.append("content", f)
+    fd.append("type", f.type)
+    if (f.name !== "") fd.append("filename", f.name)
+    const r = await send(t, { method: "POST", url: replicate.rootOf(t) + "/v1/files", headers: authHeaders(t), body: fd })
+    if (!r.ok) return r
+    return jsonReply(try replicate.fileToOpenAI(try await r.text(), formText(form, "purpose")))
+  }
+  return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
 }
 
 // Vertex: image generation and edits here, and its files and batches (vertexStore).
@@ -1689,4 +1762,10 @@ test("native cloud routes: Bedrock jobs and files, Vertex regional batches and c
   expect(nativeRoute("PATCH", "/genai/v1beta/projects/p/locations/us/cachedContents/c1")?.kind).toBe("vertex.cache.update")
   expect(nativeRoute("POST", "/genai/v1beta/projects/p/locations/us/cachedContents/c1")).toBe(undefined)
   expect(nativeRoute("GET", "/genai/v1/projects/p/locations/us/endpoints")).toBe(undefined)
+})
+
+test("wafer file objects read as OpenAI's: ready is processed, dates are seconds", () => {
+  const f = try waferFileToOpenAI(`{"id":"file_1","purpose":"fine-tune","filename":"a.jsonl","mime_type":"application/jsonl","bytes":12,"status":"ready","created_at":"2026-10-14T13:00:00.123Z","expires_at":"2026-11-14T13:00:00Z"}`)
+  expect(f).toBe(`{"id":"file_1","object":"file","bytes":12,"created_at":1791982800,"filename":"a.jsonl","purpose":"fine-tune","status":"processed","expires_at":1794661200}`)
+  expect(try waferFileToOpenAI(`{"id":"file_2","status":"pending"}`).includes(`"status":"uploaded"`)).toBe(true)
 })

@@ -2465,6 +2465,96 @@ def l97h_e2e(env):
         gw.terminate()
 
 
+GW_L97Q = "http://127.0.0.1:18163"  # Replicate (images, files, models), Bedrock Stability edits, Wafer files, OpenRouter's billed chat cost, object-form aliases
+
+
+def mp_form(base, path, parts, headers=None):
+    """POSTs a multipart form to base. parts: [(name, filename or None, content type, bytes or text)]. Returns (status, body)."""
+    boundary = "raiju-e2e-q-boundary"
+    out = []
+    for name, filename, ctype, data in parts:
+        raw = data if isinstance(data, bytes) else data.encode()
+        if filename is None:
+            out.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'.encode() + raw + b"\r\n")
+        else:
+            out.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\nContent-Type: {ctype}\r\n\r\n'.encode() + raw + b"\r\n")
+    out.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(base + path, data=b"".join(out), method="POST", headers={"content-type": f"multipart/form-data; boundary={boundary}", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, dict(r.headers), r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read().decode()
+
+
+def l97q_config() -> dict:
+    """Replicate (its own API on the mock), Bedrock (SigV4 keys), Wafer, OpenRouter, and an OpenAI-compatible provider
+    whose key maps one alias in object form and one as a plain target."""
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l97q-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "replicate": {"keys": [{"name": "rp-l97q", "value": "r8_e2e", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK + "/replicate", "max_retries": 0}},
+            "bedrock": {"keys": [{"name": "bk-l97q", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "wafer": {"keys": [{"name": "wf-l97q", "value": "wf-key", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK + "/wafer", "max_retries": 0}},
+            "openrouter": {"keys": [{"name": "or-l97q", "value": "or-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/or", "max_retries": 0}},
+            "aliased": {"keys": [{"name": "al-l97q", "value": "sk-alias", "models": [], "weight": 1.0, "aliases": {"house-best": {"model_id": "gpt-4o-mini", "model_name": "gpt-4o", "model_family": "openai"}, "plain": "gpt-4o-mini"}}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+
+
+def l97q_e2e(env):
+    """Replicate's images as predictions, files and the deployments listing; Bedrock Stability's inpainting with its
+    options; Wafer's raw file upload; OpenRouter's billed cost on a chat answer; object-form and plain aliases."""
+    cfg_path = os.path.join(BUILD, "e2e.l97q.json")
+    json.dump(l97q_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18163", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l97q.log"), "w"))
+    png = b"PNG-fake-image-bytes"
+    try:
+        wait(GW_L97Q + "/health")
+        s, _, b = call("POST", "/v1/images/generations", {"model": "replicate/acme/model-a", "prompt": "a fox", "n": 2}, base=GW_L97Q, auth=False)
+        d = json.loads(b) if s == 200 else {}
+        urls = [x.get("url", "") for x in d.get("data", [])]
+        check("replicate images: the prediction's output URLs come back as data", s == 200 and len(urls) == 2 and urls[0].endswith("/out/0.png") and urls[1].endswith("/out/1.png"), (s, b[:300]))
+        rp = [x for x in seen() if x["path"] == "/v1/models/acme/model-a/predictions"]
+        check("replicate images post the prompt and the count as input, with the token and a synchronous wait", len(rp) > 0 and rp[-1]["auth"] == "Bearer r8_e2e" and json.loads(rp[-1]["body"])["input"] == {"prompt": "a fox", "num_outputs": 2}, rp[-1:])
+        s, _, b = call("POST", "/v1/images/generations", {"model": "replicate/acme/model-a", "prompt": "fail"}, base=GW_L97Q, auth=False)
+        check("replicate: a failed prediction is an error with its reason", s == 502 and "the model refused the prompt" in b, (s, b[:300]))
+        s, _, b = mp_form(GW_L97Q, "/v1/files?provider=replicate", [("purpose", None, "text/plain", "batch"), ("file", "pic.png", "image/png", png)])
+        f = json.loads(b) if s == 200 else {}
+        check("replicate files: the upload answers as an OpenAI file", s == 200 and f.get("id") == "file-e2e-1" and f.get("bytes") == len(png) and f.get("filename") == "pic.png" and f.get("object") == "file", (s, b[:300]))
+        up = [x for x in seen() if x["path"] == "/v1/files"]
+        check("replicate files are sent as multipart with the content part", len(up) > 0 and "pic.png" in up[-1]["body"] and up[-1]["auth"] == "Bearer r8_e2e", up[-1:])
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "replicate"}, base=GW_L97Q, auth=False)
+        ids = [m["id"] for m in json.loads(b)["data"]] if s == 200 else []
+        check("replicate models: the deployments of every page, as provider/owner/name", "replicate/acme/model-a" in ids and "replicate/acme/model-b" in ids and "replicate/acme/model-c" in ids, (s, b[:300]))
+        s, _, b = mp_form(GW_L97Q, "/v1/images/edits", [("model", None, "text/plain", "bedrock/stability.stable-image-inpaint-v1:0"), ("prompt", None, "text/plain", "a red fox"), ("type", None, "text/plain", "inpainting"), ("grow_mask", None, "text/plain", "5"), ("image", "in.png", "image/png", png), ("mask", "m.png", "image/png", png)])
+        d = json.loads(b) if s == 200 else {}
+        check("bedrock stability inpainting answers with the image", s == 200 and d.get("data", [{}])[0].get("b64_json") == "iVBORw0KGgo=", (s, b[:300]))
+        st = [x for x in seen() if x["path"].startswith("/model/stability.stable-image-inpaint")]
+        check("bedrock stability sends the flat body with grow_mask and no Titan task", len(st) > 0 and '"grow_mask":5' in st[-1]["body"] and '"taskType"' not in st[-1]["body"] and '"mask"' in st[-1]["body"], st[-1:])
+        s, _, b = mp_form(GW_L97Q, "/v1/files?provider=wafer", [("purpose", None, "text/plain", "fine-tune"), ("file", "data.jsonl", "application/jsonl", '{"a":1}\n')])
+        f = json.loads(b) if s == 200 else {}
+        check("wafer files: the raw upload answers as an OpenAI file with its purpose and status", s == 200 and f.get("id") == "wf-e2e-1" and f.get("purpose") == "fine-tune" and f.get("status") == "uploaded", (s, b[:300]))
+        wf = [x for x in seen() if x["path"] == "/wafer/v1/files"]
+        check("wafer uploads send the bytes, the bearer key and the MIME type", len(wf) > 0 and wf[-1]["body"] == '{"a":1}\n' and wf[-1]["auth"] == "Bearer wf-key", wf[-1:])
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openrouter/openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
+        check("openrouter chat answers", s == 200 and "billed hello" in b, (s, b[:300]))
+        s, _, b = call("GET", "/api/logs?providers=openrouter", base=GW_L97Q, auth=False)
+        logs = json.loads(b).get("logs", []) if s == 200 else []
+        check("openrouter chat is billed at usage.cost, not the datasheet price", any(abs(float(x.get("cost") or 0) - 0.00123) < 1e-9 for x in logs), (s, b[:300]))
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "aliased/house-best", "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
+        check("an object-form alias answers and reports its model id, name and family", s == 200 and hdr(h, "x-bifrost-routing-info-alias-model-id") == "gpt-4o-mini" and hdr(h, "x-bifrost-routing-info-alias-model-name") == "gpt-4o" and hdr(h, "x-bifrost-routing-info-alias-model-family") == "openai", (s, h))
+        al = [x for x in seen() if x["path"] == "/v1/chat/completions" and "gpt-4o-mini" in x["body"]]
+        check("an object-form alias sends its model_id upstream", len(al) > 0 and json.loads(al[-1]["body"])["model"] == "gpt-4o-mini", al[-1:])
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "aliased/plain", "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
+        check("a plain alias reports its model id and no name or family", s == 200 and hdr(h, "x-bifrost-routing-info-alias-model-id") == "gpt-4o-mini" and hdr(h, "x-bifrost-routing-info-alias-model-name") is None and hdr(h, "x-bifrost-routing-info-alias-model-family") is None, (s, h))
+    finally:
+        gw.terminate()
+
+
 GW_L97L = "http://127.0.0.1:18154"  # the L97l gateway: log filters and their recording, the background cost recalculation, plugin CRUD
 GW_L97L_SETUP = "http://127.0.0.1:18153"  # the setup session: the setup token traded for a cookie, then the first admin with it
 
@@ -4953,6 +5043,8 @@ def main():
         l97i_e2e(env)
         # provider model lists, Vertex count tokens and OpenRouter's native decisions: their own gateway
         l97h_e2e(env)
+        # Replicate, Bedrock Stability edits, Wafer files, OpenRouter's billed cost and object-form aliases: their own gateway
+        l97q_e2e(env)
         # the governance remainder: quota, budget overrides, routing rules, roles, catalogue and PUT /api/config sections
         l97j_e2e(env)
         # the setup session, the log filters the gateway records, the background cost recalculation and plugin CRUD: their own gateways

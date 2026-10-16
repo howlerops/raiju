@@ -28,7 +28,7 @@ import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversibl
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText } from "./compat"
 import { ResponsesToChatStream } from "./responses"
-import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias } from "./router"
+import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias } from "./router"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
@@ -65,7 +65,7 @@ export type Build = (t: Target) => Upstream throws SyntaxError
 type ChatSender = (t: Target, b: Field[], tc: LazyChat) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, retryMs?: f64, served?: string, billed?: f64 }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64 }
 
 // Where a streamed answer goes, when the server can stream (the http1 front end).
 export class StreamSink {
@@ -456,7 +456,8 @@ function requestType(op: string, streamed: bool): string {
 // The routed identity, as Bifrost reports it (lib/responseheaders.go): who answered, what was
 // asked for, and whether it took a fallback. key is the key's name, alias the upstream name
 // the key's aliases mapped the request to ("" when none did).
-function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, model: string, idx: int, requested: string, upstreamMs: f64, key: string, alias: string): void {
+// name and family are the alias config's canonical name and family ("" when unset).
+function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, model: string, idx: int, requested: string, upstreamMs: f64, key: string, alias: string, name: string, family: string): void {
   out.set("x-bifrost-provider", provider)
   out.set("x-bifrost-original-model", requested)
   out.set("x-bifrost-resolved-model", model)
@@ -466,6 +467,8 @@ function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, mod
   out.set("x-bifrost-routing-info-model", model)
   if (key !== "") out.set("x-bifrost-routing-info-key", key)
   if (alias !== "") out.set("x-bifrost-routing-info-alias-model-id", alias)
+  if (name !== "") out.set("x-bifrost-routing-info-alias-model-name", name)
+  if (family !== "") out.set("x-bifrost-routing-info-alias-model-family", family)
   out.set("x-bifrost-routing-info-is-fallback", idx > 0 ? "true" : "false")
   out.set("x-bifrost-routing-info-primary-provider", primary.provider)
   out.set("x-bifrost-routing-info-primary-model", primary.model)
@@ -478,6 +481,19 @@ function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, mod
 function aliasTo(k: KeyConfig, model: string, maxDepth?: int): string {
   const to = resolveAlias(k, model, maxDepth).model
   return to !== model ? to : ""
+}
+
+// The canonical name and family the matching alias sets, or "" for each.
+function aliasNameOf(k: KeyConfig, model: string): string {
+  const e = matchedAlias(k, model)
+  if (e === undefined || e.model_name === undefined) return ""
+  return e.model_name
+}
+
+function aliasFamilyOf(k: KeyConfig, model: string): string {
+  const e = matchedAlias(k, model)
+  if (e === undefined || e.model_family === undefined) return ""
+  return e.model_family
 }
 
 // The index of (provider, model) in the allowed chain: 0 for the primary, or when it is not there.
@@ -1428,7 +1444,7 @@ export class Engine {
             ctx.outHeaders.set("content-type", conv.framed() ? "application/vnd.amazon.eventstream" : "text/event-stream")
             ctx.outHeaders.set("cache-control", "no-cache")
             ctx.outHeaders.set("x-bf-attempts", "" + attempts)
-            routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs, t.key.name ?? t.key.id ?? "", aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth))
+            routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs, t.key.name ?? t.key.id ?? "", aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasNameOf(t.key, ref.model), aliasFamilyOf(t.key, ref.model))
             // the compat drops and conversions of this target are decided by now (build shaped it): they go out with the stream's headers
             compatHeaders(&ctx.outHeaders, ctx.compat)
             sink.started = true
@@ -1538,7 +1554,7 @@ export class Engine {
             const echoReq = inBody && !streamed && up.body !== "" && sendBackRaw(h, this.cfg, p, "request")
             const echoResp = inBody && !streamed && sendBackRaw(h, this.cfg, p, "response")
             const rawBody = echoReq || echoResp ? withRawFields(tr.body, echoReq ? up.body : undefined, echoResp ? text : undefined) : tr.body
-            return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), served: tr.served ?? "", billed: tr.billed }
+            return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasName: aliasNameOf(t.key, ref.model), aliasFamily: aliasFamilyOf(t.key, ref.model), served: tr.served ?? "", billed: t.cfg.ignore_provider_cost === true ? undefined : tr.billed }
           } catch (e) {
             last = { ok: false, status: 502, body: errorJson(`could not read ${ref.provider}'s response: ${e.message}`, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
             break
@@ -2266,14 +2282,16 @@ export class Engine {
       const et = errorType(r.body)
       if (et !== "") out.set("x-bifrost-error-type", et)
       if (r.retryMs !== undefined) out.set("x-bifrost-retry-after-ms", "" + Math.round(r.retryMs))
-      if (r.provider !== "") routedHeaders(&out, primary, r.provider, r.model, fallbackIndex(allowed, r.provider, r.model), model, r.upstreamMs, r.key ?? "", r.alias ?? "")
+      if (r.provider !== "") routedHeaders(&out, primary, r.provider, r.model, fallbackIndex(allowed, r.provider, r.model), model, r.upstreamMs, r.key ?? "", r.alias ?? "", r.aliasName ?? "", r.aliasFamily ?? "")
       return respond(r.status, r.body, out)
     }
     // a provider's billed cost (OpenRouter's usage.cost) replaces the datasheet estimate
-    const cost = r.billed !== undefined && r.billed > 0 ? r.billed : this.pricing.cost(r.provider, r.model, r.promptTokens, r.completionTokens)
-    if (grant.budgets.length > 0 && !this.pricing.known(r.provider, r.model) && !this.unpriced.has(r.provider + "/" + r.model)) {
-      this.unpriced.add(r.provider + "/" + r.model)
-      console.error(`raiju: no price for ${r.provider}/${r.model}: budgets don't count its requests; add a pricing override`)
+    // an alias's model_name (Bifrost's canonical name) is the model priced when it is set
+    const priced = r.aliasName !== undefined && r.aliasName !== "" ? r.aliasName : r.model
+    const cost = r.billed !== undefined && r.billed > 0 ? r.billed : this.pricing.cost(r.provider, priced, r.promptTokens, r.completionTokens)
+    if (grant.budgets.length > 0 && !this.pricing.known(r.provider, priced) && !this.unpriced.has(r.provider + "/" + priced)) {
+      this.unpriced.add(r.provider + "/" + priced)
+      console.error(`raiju: no price for ${r.provider}/${priced}: budgets don't count its requests; add a pricing override`)
     }
     this.gov.record(grant, r.promptTokens + r.completionTokens, cost)
     let ul = ctx.labels
@@ -2304,7 +2322,7 @@ export class Engine {
     }
     if (r.provider !== primary.provider || r.model !== primary.model) out.set("x-bf-fallback-used", r.provider + "/" + r.model)
     const idx = fallbackIndex(allowed, r.provider, r.model)
-    routedHeaders(&out, primary, r.provider, r.model, idx, model, r.upstreamMs, r.key ?? "", r.alias ?? "")
+    routedHeaders(&out, primary, r.provider, r.model, idx, model, r.upstreamMs, r.key ?? "", r.alias ?? "", r.aliasName ?? "", r.aliasFamily ?? "")
     // the model a provider's server-side fallback answered with (Anthropic usage iterations)
     const served = r.served ?? ""
     if (served !== "") out.set("x-bifrost-routing-info-server-side-fallback-model", served)
@@ -2725,11 +2743,11 @@ export class Engine {
         let out = tr.body
         if (pluginChain !== undefined && pluginRun !== undefined) out = pluginChain.runPost(&pluginRun.ctx, 200, out).body
         if (reversible) out = try restoreCompletion(out, vault)
-        if (outGuard === undefined) return { body: out, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served }
+        if (outGuard === undefined) return { body: out, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served, billed: tr.billed }
         const g = try applyToCompletion(out, outGuard)
         for (const f of g.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, outGuard.mode), 1.0)
         if (g.blocked) throw new SyntaxError("the response was blocked by guardrails")
-        return { body: g.body, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served }
+        return { body: g.body, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served, billed: tr.billed }
       }
       // a chat request converted to Responses, answered whole (not piped): its chat completion, as SSE
       const shs = try cp.shape(t.provider, t.kind, t.model, body)

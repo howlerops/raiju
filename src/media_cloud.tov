@@ -140,9 +140,9 @@ export function bedrockImagesToOpenAI(raw: string): string throws SyntaxError {
   return `{"created":${nowSeconds()},"data":[${items.join(",")}]}`
 }
 
-// Stability AI's edit and variation bodies are not built here (Bifrost has them; this gateway does not).
+// Stability AI models take no variation body: Bifrost sends the Titan body to them and Bedrock rejects it.
 function noStability(t: Target): void throws SyntaxError {
-  if (t.model.toLowerCase().includes("stability.")) throw new SyntaxError("Stability AI image edits and variations are not supported by this gateway")
+  if (t.model.toLowerCase().includes("stability.")) throw new SyntaxError("Stability AI models take no image variations; use an edit")
 }
 
 // The imageGenerationConfig of an edit or a variation: the count, size, quality, seed and cfgScale
@@ -161,11 +161,159 @@ function editConfig(n: int | undefined, size: string, quality: string, seed: int
   return `{${cs.join(",")}}`
 }
 
+// The form fields a Stability edit reads beyond the common ones (media.tov readEdit keeps them).
+export function stabilityFormFields(): string[] {
+  return ["select_prompt", "search_prompt", "grow_mask", "style_preset", "creativity", "control_strength", "aspect_ratio", "fidelity", "style_strength", "composition_fidelity", "change_strength", "left", "right", "up", "down"]
+}
+
+// The Stability task a form's type names (Bifrost's getStabilityAITaskTypeFromParams), or "".
+function stabilityType(kind: string): string {
+  const k = kind.toLowerCase()
+  if (k === "inpainting" || k === "inpaint") return "inpaint"
+  if (k === "outpainting" || k === "outpaint") return "outpaint"
+  if (k === "background_removal" || k === "remove_background") return "remove-bg"
+  if (k === "erase_object") return "erase-object"
+  if (k === "upscale_fast") return "upscale-fast"
+  if (k === "upscale_creative") return "upscale-creative"
+  if (k === "upscale_conservative") return "upscale-conservative"
+  if (k === "recolor") return "recolor"
+  if (k === "search_replace") return "search-replace"
+  if (k === "control_sketch") return "control-sketch"
+  if (k === "control_structure") return "control-structure"
+  if (k === "style_guide") return "style-guide"
+  if (k === "style_transfer") return "style-transfer"
+  return ""
+}
+
+// The Stability task a model id names, for a form that gives no type (Bifrost's getStabilityAIEditTaskType).
+function stabilityTaskOfModel(model: string): string {
+  const m = model.toLowerCase()
+  const names = ["stable-creative-upscale", "stable-conservative-upscale", "stable-fast-upscale", "stable-image-inpaint", "stable-outpaint", "stable-image-search-recolor", "stable-image-search-replace", "stable-image-erase-object", "stable-image-remove-background", "stable-image-control-sketch", "stable-image-control-structure", "stable-image-style-guide", "stable-style-transfer"]
+  const tasks = ["upscale-creative", "upscale-conservative", "upscale-fast", "inpaint", "outpaint", "recolor", "search-replace", "erase-object", "remove-bg", "control-sketch", "control-structure", "style-guide", "style-transfer"]
+  for (let i = 0; i < names.length; i++) {
+    if (m.includes(names[i]!)) return tasks[i]!
+  }
+  return ""
+}
+
+// Which of a Stability edit's options each task takes (Bifrost's allowlists, images.go).
+function taskTakes(task: string, group: string): bool {
+  if (group === "prompt") return ["inpaint", "recolor", "search-replace", "control-sketch", "control-structure", "style-guide", "upscale-creative", "upscale-conservative", "outpaint", "style-transfer"].includes(task)
+  if (group === "negative") return ["inpaint", "outpaint", "recolor", "search-replace", "control-sketch", "control-structure", "style-guide", "upscale-creative", "upscale-conservative", "style-transfer"].includes(task)
+  if (group === "seed") return ["inpaint", "outpaint", "recolor", "search-replace", "erase-object", "control-sketch", "control-structure", "style-guide", "upscale-creative", "upscale-conservative", "style-transfer"].includes(task)
+  if (group === "mask") return task === "inpaint" || task === "erase-object"
+  if (group === "style_preset") return ["inpaint", "outpaint", "recolor", "search-replace", "control-sketch", "control-structure", "style-guide", "upscale-creative"].includes(task)
+  if (group === "grow_mask") return ["inpaint", "recolor", "search-replace", "erase-object"].includes(task)
+  if (group === "outpaint") return task === "outpaint"
+  if (group === "creativity") return ["upscale-creative", "upscale-conservative", "outpaint"].includes(task)
+  if (group === "control") return task === "control-sketch" || task === "control-structure"
+  if (group === "style_guide") return task === "style-guide"
+  if (group === "style_transfer") return task === "style-transfer"
+  return false
+}
+
+// An extra form option's text, or "" when the form did not send it.
+function extraOf(ed: native.EditInput, key: string): string {
+  const m = ed.extra
+  if (m === undefined) return ""
+  return m.get(key) ?? ""
+}
+
+// A form's integer or number option, or undefined when absent. A value that does not parse is a SyntaxError.
+function optInt(ed: native.EditInput, key: string): int | undefined throws SyntaxError {
+  const s = extraOf(ed, key)
+  if (s === "") return undefined
+  const v = parseInt(s)
+  if (v === undefined) throw new SyntaxError(`${key} must be an integer`)
+  return v
+}
+
+function optNum(ed: native.EditInput, key: string): f64 | undefined throws SyntaxError {
+  const s = extraOf(ed, key)
+  if (s === "") return undefined
+  const v = parseFloat(s)
+  if (v === undefined) throw new SyntaxError(`${key} must be a number`)
+  return v
+}
+
+function optStr(ed: native.EditInput, key: string): string {
+  return extraOf(ed, key)
+}
+
+// The flat InvokeModel body of a Stability edit task (Bifrost's ToStabilityAIImageEditRequest). Only
+// the fields the task takes are set; style transfer takes an init image and a style image.
+export function stabilityEditBody(task: string, ed: native.EditInput): string throws SyntaxError {
+  const fs: string[] = []
+  if (task === "") throw new SyntaxError("cannot determine the Stability task from the type or the model name")
+  if (task === "style-transfer") {
+    if (ed.images.length !== 2) throw new SyntaxError("style-transfer requires exactly two images: init_image and style_image")
+    fs.push(`"init_image":${quote(encode(ed.images[0]!))}`)
+    fs.push(`"style_image":${quote(encode(ed.images[1]!))}`)
+  } else {
+    if (ed.images.length === 0) throw new SyntaxError("at least one image is required")
+    fs.push(`"image":${quote(encode(ed.images[0]!))}`)
+  }
+  if (taskTakes(task, "prompt")) fs.push(`"prompt":${quote(ed.prompt)}`)
+  if (ed.negative !== "" && taskTakes(task, "negative")) fs.push(`"negative_prompt":${quote(ed.negative)}`)
+  if (ed.seed !== undefined && taskTakes(task, "seed")) fs.push(`"seed":${ed.seed}`)
+  if (ed.mask !== undefined && taskTakes(task, "mask")) fs.push(`"mask":${quote(encode(ed.mask))}`)
+  if (ed.outputFormat !== "") fs.push(`"output_format":${quote(ed.outputFormat)}`)
+  if (taskTakes(task, "style_preset") && optStr(ed, "style_preset") !== "") fs.push(`"style_preset":${quote(optStr(ed, "style_preset"))}`)
+  if (taskTakes(task, "grow_mask")) {
+    const g = try optInt(ed, "grow_mask")
+    if (g !== undefined) fs.push(`"grow_mask":${g}`)
+  }
+  if (taskTakes(task, "outpaint")) {
+    for (const k of ["left", "right", "up", "down"]) {
+      const v = try optInt(ed, k)
+      if (v !== undefined) fs.push(`"${k}":${v}`)
+    }
+  }
+  if (taskTakes(task, "creativity")) {
+    const c = try optNum(ed, "creativity")
+    if (c !== undefined) fs.push(`"creativity":${c}`)
+  }
+  if (task === "recolor") {
+    if (optStr(ed, "select_prompt") === "") throw new SyntaxError("select_prompt is required for stability ai recolor task")
+    fs.push(`"select_prompt":${quote(optStr(ed, "select_prompt"))}`)
+  }
+  if (task === "search-replace") {
+    if (optStr(ed, "search_prompt") === "") throw new SyntaxError("search_prompt is required for stability ai search-replace task")
+    fs.push(`"search_prompt":${quote(optStr(ed, "search_prompt"))}`)
+  }
+  if (taskTakes(task, "control")) {
+    const c = try optNum(ed, "control_strength")
+    if (c !== undefined) fs.push(`"control_strength":${c}`)
+  }
+  if (taskTakes(task, "style_guide")) {
+    if (optStr(ed, "aspect_ratio") !== "") fs.push(`"aspect_ratio":${quote(optStr(ed, "aspect_ratio"))}`)
+    const f = try optNum(ed, "fidelity")
+    if (f !== undefined) fs.push(`"fidelity":${f}`)
+  }
+  if (taskTakes(task, "style_transfer")) {
+    for (const k of ["style_strength", "composition_fidelity", "change_strength"]) {
+      const v = try optNum(ed, k)
+      if (v !== undefined) fs.push(`"${k}":${v}`)
+    }
+  }
+  return "{" + fs.join(",") + "}"
+}
+
+// The InvokeModel request for a Stability edit: the task from the form's type, else from the model id.
+export function stabilityImageEdit(t: Target, ed: native.EditInput): native.MediaRequest throws SyntaxError {
+  let task = stabilityType(ed.editType)
+  if (ed.editType !== "" && task === "") throw new SyntaxError(`unsupported type for Stability AI: ${ed.editType}`)
+  if (task === "") task = stabilityTaskOfModel(t.model)
+  const payload = try stabilityEditBody(task, ed)
+  const up = bedrock.signedRequest(t, "invoke", payload)
+  return { method: "POST", url: up.url, headers: up.headers, body: up.body }
+}
+
 // The InvokeModel request for an image edit on a Bedrock model (Titan and Nova Canvas, as Bifrost
 // maps them): inpainting or outpainting with the prompt, the mask and its settings, or background
-// removal, which takes only the image. The type is required.
+// removal, which takes only the image. The type is required. Stability models take their own bodies.
 export function bedrockImageEdit(t: Target, ed: native.EditInput): native.MediaRequest throws SyntaxError {
-  try noStability(t)
+  if (t.model.toLowerCase().includes("stability.")) return try stabilityImageEdit(t, ed)
   if (ed.images.length === 0) throw new SyntaxError("at least one image is required")
   const kind = ed.editType.toLowerCase()
   const img = quote(encode(ed.images[0]!))
@@ -1053,11 +1201,59 @@ test("bedrock edits refuse a missing or unknown type and Stability models", () =
   const st: Target = { provider: "bedrock", kind: "bedrock", model: "stability.stable-image-inpaint-v1:0", key: BD.key, cfg: {} }
   let stability = false
   try {
-    bedrockImageEdit(st, bdEdit("inpainting", undefined))
+    bedrockImageEdit(st, bdEdit("erase", undefined))
   } catch (e) {
     stability = true
   }
   expect(stability).toBe(true)
+})
+
+test("stability edits: the task comes from the type or the model, and each task takes its own options", () => {
+  const img = new TextEncoder().encode("img")
+  const msk = new TextEncoder().encode("msk")
+  const st: Target = { provider: "bedrock", kind: "bedrock", model: "stability.stable-image-inpaint-v1:0", key: BD.key, cfg: {} }
+  const ed = bdEdit("inpainting", msk)
+  ed.negative = "blur"
+  ed.seed = 7
+  const ex: Map<string, string> = new Map()
+  ex.set("grow_mask", "5")
+  ex.set("select_prompt", "ignored")
+  ed.extra = ex
+  const body = try stabilityEditBody("inpaint", ed)
+  expect(body).toBe(`{"image":"${encode(img)}","prompt":"a red fox","negative_prompt":"blur","seed":7,"mask":"${encode(msk)}","grow_mask":5}`)
+  const up = try bedrockImageEdit(st, bdEdit("", undefined))
+  expect((up.body as string).startsWith(`{"image":"${encode(img)}","prompt":"a red fox"`)).toBe(true)
+  expect(up.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/stability.stable-image-inpaint-v1%3A0/invoke")
+  const bg = try stabilityEditBody("remove-bg", bdEdit("remove_background", undefined))
+  expect(bg).toBe(`{"image":"${encode(img)}"}`)
+  const rc = bdEdit("recolor", undefined)
+  let missing = false
+  try {
+    stabilityEditBody("recolor", rc)
+  } catch (e) {
+    missing = true
+  }
+  expect(missing).toBe(true)
+  const rx: Map<string, string> = new Map()
+  rx.set("select_prompt", "sky")
+  rc.extra = rx
+  expect(try stabilityEditBody("recolor", rc)).toBe(`{"image":"${encode(img)}","prompt":"a red fox","select_prompt":"sky"}`)
+  const sx = bdEdit("style_transfer", undefined)
+  sx.images = [img]
+  let two = false
+  try {
+    stabilityEditBody("style-transfer", sx)
+  } catch (e) {
+    two = true
+  }
+  expect(two).toBe(true)
+  let varRefused = false
+  try {
+    bedrockImageVariation(st, { images: [img], prompt: "", negative: "", similarity: undefined, n: undefined, size: "", quality: "", cfgScale: undefined })
+  } catch (e) {
+    varRefused = true
+  }
+  expect(varRefused).toBe(true)
 })
 
 test("bedrock image variation body: images, text, similarity and config", () => {
