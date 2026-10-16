@@ -47,7 +47,7 @@ import { GuardConfig, applyToChatRequest, applyToCompletion, applyToText } from 
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { Tracer, Span, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName } from "./mcp"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, userHeadersOf } from "./mcp"
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, buildChain } from "./plugins"
@@ -1626,7 +1626,25 @@ export class Engine {
     if (m.hasTool(name) && !m.mayRun(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, name)) {
       return { kind: "denial", status: 403, type: "permission_error", message: `tool ${name} is not allowed for this key` }
     }
+    const client = this.perUserClient(name)
+    if (client !== undefined && this.userHeaders(name, h) === undefined) {
+      return { kind: "denial", status: 401, type: "authentication_error", message: `the per-user headers of MCP client ${client} are not submitted for this key: open a submission with POST /api/mcp/per-user-headers/flows` }
+    }
     return this.gov.admitTool(h)
+  }
+
+  // The per_user_headers client a tool belongs to; undefined for the tools of any other client.
+  perUserClient(name: string): string | undefined {
+    const hit = splitToolName(name, perUserClientNames(this.cfg.mcp?.client_configs))
+    return hit === undefined ? undefined : hit.server
+  }
+
+  // The header values the calling key submitted for the tool's per_user_headers client; undefined when the
+  // tool belongs to no such client or the key has submitted none.
+  userHeaders(name: string, h: Hdrs): Map<string, string> | undefined {
+    const client = this.perUserClient(name)
+    if (client === undefined) return undefined
+    return userHeadersOf(this.cfg.mcp?.user_credentials, client, this.gov.findKey(h)?.id ?? "")
   }
 
   // Debits the tool's tool_pricing cost from the grant's budgets after a call ran. Free tools, and calls
@@ -1649,7 +1667,7 @@ export class Engine {
       const gate = this.toolGate(m, h, call.name)
       if (gate.kind === "denial") return errorResponse(gate.status, gate.message, gate.type, noHeaders())
       const t0 = performance.now()
-      const result = await m.execute(call.name, call.argumentsJson, h)
+      const result = await m.execute(call.name, call.argumentsJson, h, this.userHeaders(call.name, h))
       this.chargeTool(m, gate, call.name)
       timedMcp(m, call.name, t0, result.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", call.name, result.isError ? "error" : "success"), 1.0)
@@ -2314,7 +2332,7 @@ export class Engine {
       const gate = this.toolGate(m, h, real)
       if (gate.kind === "denial") return { text: gate.message, isError: true }
       const t0 = performance.now()
-      const r = try await m.execute(real, args, h)
+      const r = try await m.execute(real, args, h, this.userHeaders(real, h))
       this.chargeTool(m, gate, real)
       timedMcp(m, real, t0, r.isError)
       metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", real, r.isError ? "error" : "success"), 1.0)

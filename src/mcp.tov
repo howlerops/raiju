@@ -42,9 +42,22 @@ export type McpClientConfig = {
   tool_pricing?: Map<string, f64>,
   // connection_type "openapi": each operation of the document is a tool (src/openapi.tov)
   openapi_config?: OpenApiConfig,
+  // auth_type "per_user_headers": each virtual key submits its own values of per_user_header_keys, and
+  // those values go with its tool calls. headers then holds the sample the verification checked, which
+  // the client connects with to list its tools.
+  auth_type?: string,
+  per_user_header_keys?: string[],
 }
 
 export type McpTlsConfig = { insecure_skip_verify?: bool, ca_cert_pem?: string }
+
+// The header values one virtual key submitted for one per_user_headers client (Bifrost's per-user
+// headers credential). Its values are sealed in the saved file.
+export type McpUserCredential = { id: string, mcp_client_name: string, virtual_key_id: string, headers: Map<string, string>, updated_at: f64 }
+
+// A pending submission of those values (Bifrost's per-user headers flow). It expires at expires_at, in
+// epoch milliseconds, and is removed once submitted or revoked.
+export type McpHeaderFlow = { id: string, mcp_client_name: string, virtual_key_id: string, expires_at: f64, created_at: f64 }
 
 export type McpConfig = {
   client_configs?: McpClientConfig[],
@@ -53,6 +66,26 @@ export type McpConfig = {
   tool_sync_interval?: string,
   // hosts that may be reached although private, by clients with require_public_target (oauth_private_allowlist)
   oauth_private_allowlist?: string[],
+  user_credentials?: McpUserCredential[],
+  header_flows?: McpHeaderFlow[],
+}
+
+// The per-user headers a virtual key submitted for one client; undefined when it has submitted none.
+export function userHeadersOf(creds: McpUserCredential[] | undefined, client: string, vk: string): Map<string, string> | undefined {
+  const list = creds ?? []
+  for (const c of list) {
+    if (c.mcp_client_name === client && c.virtual_key_id === vk) return c.headers
+  }
+  return undefined
+}
+
+// The names of the clients whose auth_type is per_user_headers.
+export function perUserClientNames(list: McpClientConfig[] | undefined): string[] {
+  const out: string[] = []
+  for (const c of list ?? []) {
+    if (c.auth_type === "per_user_headers") out.push(c.name)
+  }
+  return out
 }
 
 // A virtual key's MCP tool allow-list for one client (Bifrost's virtual_key_mcp_config). tools_to_execute:
@@ -718,7 +751,7 @@ export class McpSession {
   }
 
   // A notification: no reply body is expected.
-  private async notify(body: string): Promise<void> throws Error {
+  private async notify(body: string, extra?: Map<string, string>): Promise<void> throws Error {
     const ch = this.stdio
     if (ch !== undefined) {
       try {
@@ -728,7 +761,7 @@ export class McpSession {
       }
       return
     }
-    const reply = try await this.exchange(body, CONNECT_TIMEOUT_MS)
+    const reply = try await this.exchange(body, CONNECT_TIMEOUT_MS, extra)
     if (reply.status < 200 || reply.status >= 300) throw new Error(`${this.cfg.name}: HTTP ${reply.status} for notification`)
   }
 
@@ -922,20 +955,29 @@ export class McpSession {
   // Calls a tool by its name on the server. Tool failures come back as isError; protocol failures throw.
   // extra holds the caller's request headers; only those allowed_extra_headers names are sent. An http
   // client with needs_session_stickiness false opens a fresh session (initialize) before each call.
-  async callTool(name: string, argsJson: string, extra?: Map<string, string>): Promise<ToolText> throws Error {
+  // user holds the calling virtual key's per-user headers. A per_user_headers client takes only those, and
+  // a call without them is refused.
+  async callTool(name: string, argsJson: string, extra?: Map<string, string>, user?: Map<string, string>): Promise<ToolText> throws Error {
     if (!this.connected) throw new Error(`${this.cfg.name}: not connected: ${this.lastError}`)
     if (this.cfg.connection_type === "openapi") return try await this.callOpenApi(name, argsJson)
+    let sent = this.forwardable(extra)
+    if (this.cfg.auth_type === "per_user_headers") {
+      if (user === undefined) throw new Error(`${this.cfg.name}: the per-user headers of this key are not submitted`)
+      const own: Map<string, string> = sent ?? new Map()
+      for (const k of user.keys()) own.set(k, user.get(k)!)
+      sent = own
+    }
     if (this.cfg.connection_type === "http" && this.cfg.needs_session_stickiness === false) {
       this.sessionId = ""
       this.version = ""
       const initId = this.newId()
-      try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS)
+      try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS, sent)
       this.version = PROTOCOL
-      try await this.notify(initializedNotification())
+      try await this.notify(initializedNotification(), sent)
     }
     const id = this.newId()
     const body = try callToolRequest(id, name, argsJson)
-    const raw = try await this.rpc(body, id, this.timeoutMs, this.forwardable(extra))
+    const raw = try await this.rpc(body, id, this.timeoutMs, sent)
     return try toolResultText(raw)
   }
 }
@@ -1118,7 +1160,7 @@ export class McpManager {
   }
 
   // Runs a tool by its chat name ("<server>-<tool>"). Every run is reported to the tool log.
-  async execute(fullToolName: string, argsJson: string, extra?: Map<string, string>): Promise<ToolText> throws Error {
+  async execute(fullToolName: string, argsJson: string, extra?: Map<string, string>, user?: Map<string, string>): Promise<ToolText> throws Error {
     for (const s of this.sessions) {
       if (!s.connected) continue
       const original = s.original(fullToolName)
@@ -1126,7 +1168,7 @@ export class McpManager {
         const t0 = Date.now()
         let r: ToolText = { text: "", isError: false }
         try {
-          r = await s.callTool(original, argsJson, extra)
+          r = await s.callTool(original, argsJson, extra, user)
         } catch (e) {
           reportTool({ server: s.cfg.name, tool: original, latencyMs: Date.now() - t0, ok: false, error: e.message })
           throw e

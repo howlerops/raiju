@@ -203,8 +203,8 @@ Bifrost: `transports/bifrost-http/handlers/*.go`, documented in `docs/openapi/op
 | /api/mcp/library (and force-sync, filterdata); POST /api/mcp/openapi/preview | handlers/mcp.go | partial | Preview done: `mcpapi.tov` openapiRoute. The library routes are missing. |
 | /api/mcp/virtual-mcps CRUD, virtual-key attach and detach | handlers/virtualmcp.go | done | `mcpapi.tov` `virtualRoute`; `vmcp.tov`. |
 | /api/mcp/tool-groups CRUD | openapi | done | `mcpapi.tov` toolGroupRoute: an alias of the virtual MCPs with the group's shape (`mcp_tool_groups`, `mcp_tool_group`). user_ids and api_key_ids are refused. |
-| /api/mcp/sessions (list, reauth, revoke); /api/oauth/per-user/flows/* | handlers/mcpsessions.go | missing | P2. |
-| /api/mcp/per-user-headers flows and credential revoke | handlers/mcpheaders.go | missing | P2. |
+| /api/mcp/sessions (list, reauth, revoke); /api/oauth/per-user/flows/* | handlers/mcpsessions.go | missing | P2. L97k did not reach per_user_oauth (see the auth-type row). |
+| /api/mcp/per-user-headers flows and credential revoke | handlers/mcpheaders.go | partial | L97k: `mcpapi.tov` `createFlow`, `flowDetail`, `submitFlow` (async `headersRouteAsync`), `revokeCredential`. Flows are opened through POST /api/mcp/per-user-headers/flows (Bifrost opens them from the inference error); credentials are per virtual key in `cfg.mcp.user_credentials`, sealed by `store.tov` `transformSecrets`. Missing: the flow link on the auth page, the admin-credential retention of Bifrost's tool sync, and per-user (user_id) identity. |
 | /api/oauth/callback | handlers/mcpoauth2.go | done | `server.tov` `dispatch` → `mcpapi.tov` `oauthCallback` (MCP authorization-code flow, PKCE). |
 | /api/oauth/config/{id}/status, DELETE /api/oauth/config/{id} | handlers/mcpoauth2.go | partial | `mcpapi.tov` oauthConfigRoute (the config is the MCP client of auth type oauth). Status is pending or authorized; the flow_id form, failed and expired are not done. DELETE drops the tokens; a live session keeps its token until it reconnects. |
 | /api/oauth2/sessions; /api/oauth2/consent/flows/* | handlers/mcpoauth2sessions.go, mcpoauth2consent.go | missing | P2. |
@@ -481,7 +481,7 @@ Bifrost: `config.schema.json` `mcp` and `$defs/mcp_client_config`. Raiju: `src/m
 | connection_type inprocess, openapi | mcp_client_config.connection_type | partial | openapi done: `openapi.tov` and `mcp.tov` McpSession `loadOpenApi`/`callOpenApi`. inprocess is missing. |
 | openapi_config | mcp_client_config | partial | `openapi.tov` parseSpec, inputSchema, requestFor, callOperation. JSON 3.x documents from `spec` or `spec_url`; each operation is a tool, with `security_credentials` applied. `$ref` is not resolved, YAML and Swagger 2.0 are refused, and per-operation security and the framework's schema flattening are not done. |
 | auth_type: none, headers, oauth | mcp_client_config.auth_type | done | `mcpauth.tov`. oauth is the authorization-code flow with PKCE, dynamic registration and `client_id` (L91). |
-| auth_type: per_user_oauth, per_user_headers, token_exchange; per_user_header_keys | mcp_client_config.auth_type | missing | Routes refuse with Bifrost's messages (`mcpapi.tov` verifyRoute). L91 open for per_user_*. P2. |
+| auth_type: per_user_oauth, per_user_headers, token_exchange; per_user_header_keys | mcp_client_config.auth_type | partial | per_user_headers done in L97k (`mcpapi.tov` perUserError, headersRouteAsync). per_user_oauth and token_exchange refused with Bifrost's messages (`mcpapi.tov` verifyRoute); open. P2. |
 | tools_to_auto_execute (per client) | mcp_client_config | done | `mcp.tov` (per-client list; `*` for all). Global `client.mcp_auto_execute` is Raiju-only (c2). |
 | tools_to_execute | mcp_client_config | done | `mcp.tov` McpClientConfig. |
 | endpoint_slug, allow_by_default, allow_on_all_virtual_keys, disabled | mcp_client_config | done | `mcpapi.tov` (CLIENT_KINDS; management API); allow_by_default from L76. |
@@ -668,8 +668,8 @@ Bifrost: `docs/mcp/*.mdx`, `handlers/mcp*.go`, `core/mcp`, `config.schema.json` 
 | Auth: bearer and static headers | mcp/auth | done | `mcpauth.tov`. |
 | Auth: OAuth client credentials and refresh token | mcp/auth | done | `mcpauth.tov` (SCOPE: L36). |
 | Auth: OAuth authorization code (client-level "oauth", PKCE, dynamic registration) | mcp/gateway-auth.mdx; handlers/mcpoauth2*.go | done | `mcpauth.tov`, `mcpapi.tov:oauthRoute` and `oauthCallback` (L91). Consent is for the client, not per user. |
-| Auth: per-user OAuth (per_user_oauth, consent per user) | handlers/mcpsessions.go (per-user flows), mcpoauth2consent.go | missing | No per_user_oauth type; `mcpapi.tov` refuses reauthorize for it. No `/api/oauth/per-user/flows` routes. P2. |
-| Auth: per-user headers | handlers/mcpheaders.go | missing | No per_user_headers type; `mcpapi.tov` refuses verify-headers. No `/api/mcp/per-user-headers/flows` routes. P2. |
+| Auth: per-user OAuth (per_user_oauth, consent per user) | handlers/mcpsessions.go (per-user flows), mcpoauth2consent.go | missing | No per_user_oauth type; `mcpapi.tov` refuses reauthorize for it. No `/api/oauth/per-user/flows` routes. P2. L97k left it open. |
+| Auth: per-user headers | handlers/mcpheaders.go | partial | L97k: auth_type per_user_headers with per_user_header_keys (`mcp.tov` `McpSession.callTool`, `gateway.tov` `toolGate` and `userHeaders`), per-key sealed values, flows, verify-headers (`mcpapi.tov` `verifyClient`) and revoke. Tool calls without submitted values are refused with 401. Gaps: user-identity flows, the auth page, and the admin credential kept for tool sync is the client's headers. |
 | Auth: token exchange | mcp/auth; mcp_client_config.auth_type | missing | No token_exchange type; `mcpapi.tov` refuses verify-exchange. P2. |
 | Temporary MCP tokens (client.mcp_enable_temp_token_auth) | handlers/temptokens.go | missing | Reported as ignored (`config_compat.tov`). P2. |
 | Tool filtering: per client (`tools_to_execute`) | mcp/filtering.mdx Level 1 | done | `mcp.tov`. |

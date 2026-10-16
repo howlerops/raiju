@@ -1426,6 +1426,90 @@ def mcp_keys_e2e(env):
         gw.wait()
 
 
+MCP_PU = "http://127.0.0.1:18151"  # per_user_headers: each virtual key submits its own header values for an MCP client
+
+
+def mcp_peruser_e2e(env):
+    """auth_type per_user_headers: the verification of sample values, the per-key submission flow (open, read,
+    submit, reject a wrong value, consume), each virtual key's values going with its own tool calls, and revoke.
+    Its own gateway, started and stopped here."""
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"tool_sync_interval": "1h", "oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
+            {"name": "tenant", "connection_type": "http", "connection_string": MOCK + "/mcp-peruser", "auth_type": "per_user_headers", "per_user_header_keys": ["x-tenant"]},
+        ]},
+        "governance": {
+            "virtual_keys": [
+                {"id": "vk-a", "value": "sk-bf-tenant-a", "mcp_configs": [{"mcp_client_name": "tenant", "tools_to_execute": ["*"]}]},
+                {"id": "vk-b", "value": "sk-bf-tenant-b", "mcp_configs": [{"mcp_client_name": "tenant", "tools_to_execute": ["*"]}]},
+            ],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.mcpperuser.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18151", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.mcpperuser.log"), "w"))
+
+    def tool(key):
+        h = {"authorization": "Bearer " + key}
+        return call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "tenant-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, h, base=MCP_PU, auth=False)
+
+    def sent_tenants():
+        return [x["tenant"] for x in seen() if x["path"] == "/mcp" and "tools/call" in x["body"]]
+
+    try:
+        wait(MCP_PU + "/health")
+        s, _, b = call("POST", "/api/mcp/client/tenant/verify-headers", {}, base=MCP_PU, auth=False)
+        check("verify-headers needs every declared header", s == 400 and "missing values for required keys: x-tenant" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/client/tenant/verify-headers", {"headers": {"X-Tenant": "not-a-tenant"}}, base=MCP_PU, auth=False)
+        check("verify-headers refuses values the server rejects", s == 422 and "Verification failed" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/client/tenant/verify-headers", {"headers": {"X-Tenant": "tenant-a-key-example"}}, base=MCP_PU, auth=False)
+        check("verify-headers accepts the sample and lists the tools", s == 200 and json.loads(b)["tools_count"] == 1, (s, b[:200]))
+        wait_mcp_tools(MCP_PU, ["tenant-get_weather"])
+        s, _, b = call("GET", "/api/mcp/clients", base=MCP_PU, auth=False)
+        check("the sample is masked on read", s == 200 and "tenant-a-key-example" not in b and "tenant" in b, (s, b[:200]))
+        s, _, b = tool("sk-bf-tenant-a")
+        check("a key with no submitted values is refused before the call", s == 401 and "not submitted" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/per-user-headers/flows", {"mcp_client_name": "tenant", "virtual_key_id": "vk-a"}, base=MCP_PU, auth=False)
+        check("a flow opens for a key and client", s == 201 and json.loads(b)["status"] == "pending", (s, b[:200]))
+        fid = json.loads(b)["id"]
+        s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + fid, base=MCP_PU, auth=False)
+        check("a flow shows the header names it asks for", s == 200 and json.loads(b)["required_header_keys"] == ["x-tenant"] and json.loads(b)["has_active_credential"] is False, (s, b[:200]))
+        s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + fid, {"headers": {}}, base=MCP_PU, auth=False)
+        check("a submission without the required header is refused", s == 400 and "missing values for required keys: x-tenant" in b, (s, b[:200]))
+        s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + fid, {"headers": {"X-Tenant": "not-a-tenant"}}, base=MCP_PU, auth=False)
+        check("a submission the server rejects is refused and the flow stays open", s == 422 and "Verification failed" in b, (s, b[:200]))
+        s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + fid, {"headers": {"X-Tenant": "tenant-a-key-example"}}, base=MCP_PU, auth=False)
+        check("a verified submission is stored for the key", s == 200 and json.loads(b)["status"] == "success", (s, b[:200]))
+        cred_a = json.loads(b)["credential_id"]
+        s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + fid, {"headers": {"X-Tenant": "tenant-a-key-example"}}, base=MCP_PU, auth=False)
+        check("a submitted flow is closed", s == 404, (s, b[:200]))
+        s, _, b = tool("sk-bf-tenant-a")
+        check("the key's own values go with its tool call", s == 200 and "Sunny in Oslo" in b and sent_tenants()[-1:] == ["tenant-a-key-example"], (s, b[:200], sent_tenants()[-1:]))
+        s, _, b = tool("sk-bf-tenant-b")
+        check("a second key with no values is still refused", s == 401 and "not submitted" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/per-user-headers/flows", {"mcp_client_name": "tenant", "virtual_key_id": "vk-b"}, base=MCP_PU, auth=False)
+        fb = json.loads(b)["id"]
+        s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + fb, {"headers": {"X-Tenant": "tenant-b-key-example"}}, base=MCP_PU, auth=False)
+        cred_b = json.loads(b)["credential_id"]
+        s, _, b = tool("sk-bf-tenant-b")
+        check("each key sends its own values", s == 200 and sent_tenants()[-1:] == ["tenant-b-key-example"], (s, b[:200], sent_tenants()[-1:]))
+        s, _, b = tool("sk-bf-tenant-a")
+        check("the other key's values are not used for the first key", s == 200 and sent_tenants()[-1:] == ["tenant-a-key-example"], (s, b[:200]))
+        s, _, b = call("DELETE", "/api/mcp/per-user-headers/credential/" + cred_b, base=MCP_PU, auth=False)
+        check("a credential can be revoked", s == 200, (s, b[:200]))
+        s, _, b = tool("sk-bf-tenant-b")
+        check("a revoked credential is no longer used", s == 401 and "not submitted" in b, (s, b[:200]))
+        s, _, b = tool("sk-bf-tenant-a")
+        check("revoking one key leaves the others", s == 200, (s, b[:200]))
+        s, _, b = call("DELETE", "/api/mcp/per-user-headers/credential/" + cred_a, base=MCP_PU, auth=False)
+        check("the remaining credential is revoked too", s == 200, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 L97C = "http://127.0.0.1:18141"  # the L97c gateway: request logs, sessions, User-Agent mappings, cache clears, audit, tickets, plugins
 
 def l97c_config():
@@ -4114,6 +4198,7 @@ def main():
         l97b_e2e(env)
         # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients: their own gateway
         mcp_keys_e2e(env)
+        mcp_peruser_e2e(env)
         # the request log in Bifrost's shapes, User-Agent mappings, cache clears, audit by id, tickets and plugin listings: its own gateway
         l97c_e2e(env)
         # client limits, header filters, setup_token, batch keys and alias depth: their own gateways
