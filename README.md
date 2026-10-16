@@ -29,10 +29,12 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 ## What works
 
 - **API:** `/v1/chat/completions` (tools, vision, JSON mode, reasoning, streaming),
-  `/v1/responses` (and its retrieve, delete, cancel, input_items, input_tokens, compact),
-  `/v1/embeddings`, `/v1/completions`, `/v1/models`, `/v1/realtime` (WebSocket relay; WebRTC
-  calls, client secrets and sessions), `/v1/rerank`, `/v1/count_tokens`, `/v1/async/*` jobs,
-  audio, images, files and batches.
+  `/v1/responses` (and its retrieve, delete, cancel, input_items, input_tokens, compact;
+  WebSocket mode for OpenAI), `/v1/embeddings`, `/v1/completions` (OpenAI-format providers),
+  `/v1/models`, `/v1/realtime` (WebSocket relay for OpenAI and Azure; client secrets, sessions
+  and SDP calls are routed; `POST /v1/live/sessions` answers 501 for WebRTC create),
+  `/v1/rerank`, `/v1/count_tokens`, `/v1/async/*` jobs, and audio, images, files and batches
+  (which providers serve each one is in [SCOPE.md](SCOPE.md)).
 - **Drop-in SDK routes:** `/openai/v1/*`; `/anthropic/v1/messages` (to any provider),
   models, message batches and files; `/genai/v1beta/models/{model}:{method}` to any
   provider; `/bedrock/model/{id}/{converse|invoke}` and their streaming forms (AWS
@@ -41,12 +43,16 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 - **Bifrost compatibility:** reads Bifrost's `config.json` (section names, plugins,
   guardrails, alerting, vector store, otel) and reports what it ignores; sends the
   `x-bifrost-*` response headers and Bifrost's Prometheus families and labels.
-- **Count tokens** are exact for Anthropic and Gemini (their APIs) and estimated for
-  everyone else; estimates are marked `"exact": false`.
+- **Count tokens** are exact for Anthropic, Gemini and Vertex (their APIs) and for the Bedrock
+  models Bedrock can count; everyone else gets an estimate, marked `"exact": false`. The
+  management API spec (`docs/openapi/management.yaml`) does not cover `/v1/count_tokens`.
 - **Gateway features:** routing rules (CEL), circuit breakers and adaptive load
   balancing, guardrails (PII and secret redaction), semantic cache, MCP gateway,
   plugins, request log store, OpenTelemetry, management API with admin auth,
   web UI at `/`. Deployment: Dockerfile, compose and a Helm chart in `deploy/`.
+  The management API is specified in [`docs/openapi/management.yaml`](docs/openapi/management.yaml),
+  and `make openapi-check` checks the routes against it. `clients/` holds a native client spike
+  (gpui and Slint) that reads the same API; see [clients/README.md](clients/README.md).
 - **Enterprise:** RBAC for the management API (admin, editor, viewer, auditor;
   `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), a hash-chained
   HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting
@@ -128,17 +134,21 @@ small enough to send upstream.
 but runs in one process. It stays as a fallback.
 
 The workers of one node share budgets, rate limits, the response and semantic
-caches, request-log queries and `/metrics` (summed) through `/tmp/raiju-<pid>` (the clustering CRDT, one slot per worker). Usage
+caches and `/metrics` (summed) through `/tmp/raiju-<pid>` (the clustering CRDT, one slot per worker).
+Request-log queries are shared only when the log store is shared; otherwise each worker answers from its own log. Usage
 reaches the other workers within about 200 ms, so a burst spread over several
 workers can pass a limit by a few requests, as across cluster nodes. Each
 worker starts its own stdio MCP servers.
 
 ## Known gaps
 
-- SOCKS5 proxies: Tov's `fetch` supports HTTP proxies only. OTLP export is HTTP only (no gRPC).
-- Open product decisions and remaining gaps: [SCOPE.md](SCOPE.md) and [docs/parity.md](docs/parity.md).
-- Out of scope (from the scoping form): videos and containers, the edge device
-  agent, SCIM, MCP code mode and media providers.
+- SOCKS5 proxies: Tov's `fetch` supports HTTP proxies only. OTLP export uses plaintext h2c
+  for gRPC; TLS gRPC goes through the ALPN patch.
+- Open items, and the partial parts of each feature: [SCOPE.md](SCOPE.md) and the
+  "Remaining gaps" section of [docs/parity.md](docs/parity.md).
+- Out of scope ([SCOPE.md](SCOPE.md), Out table): videos and containers, the edge device
+  agent, SCIM, MCP code mode, media providers (Runware included), Warp, the skills
+  marketplace, A2A agents, and Sidekiq.
 - See [LEDGER.md](LEDGER.md) for the history.
 
 ## Performance
@@ -177,8 +187,10 @@ measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
 make check   # tov check --json on every file, applying "safe" fixes
 make tov     # Tov with the patches in tov-patches/
 make tov-test # the patches' own tests
-make unit    # tov test (522 tests)
+make unit    # tov test
 make e2e     # gateway against a mock upstream, on both servers
+make openapi-check # docs/openapi/management.yaml against a probe gateway
+make parity-count  # recount docs/parity.md and refresh its Summary table
 make ui      # the web UI in headless Chromium against a real gateway
 make bench
 ```
