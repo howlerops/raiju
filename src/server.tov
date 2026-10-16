@@ -12,6 +12,7 @@ import * as gemini from "./providers/gemini"
 import * as bedrock from "./providers/bedrock"
 import * as vertex from "./providers/vertex"
 import * as cloudflare from "./providers/cloudflare"
+import * as openrouter from "./providers/openrouter"
 import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath } from "./model_list"
 import { retrieveRequest, retrieveBody } from "./model_retrieve"
 import { fields, find, elements, rawStr, rawBool } from "./json"
@@ -76,22 +77,65 @@ async function getListing(up: Upstream): Promise<string | undefined> throws Erro
   return res.ok ? text : undefined
 }
 
+// OpenRouter's /v1/models leaves out its decision models, which are listed under the root at
+// /v1/models?output_modalities=decisions (Bifrost's openRouterDecisionModelsPath). Best-effort, as
+// Bifrost's: a failed read adds nothing, and an id already listed is not repeated.
+async function withDecisionModels(provider: string, t: Target, ids: string[]): Promise<string[]> {
+  if (t.kind !== "openrouter") return ids
+  const req = openai.modelsRequest(t)
+  const up: Upstream = { url: openrouter.rootOf(t) + "/v1/models?output_modalities=decisions", headers: req.headers, body: "" }
+  try {
+    const text = try await getListing(up)
+    if (text === undefined) return ids
+    const out = ids.slice()
+    for (const id of try openai.modelIds(text, provider)) {
+      const name = id.replace(provider + "/models/", provider + "/")
+      if (!out.includes(name)) out.push(name)
+    }
+    return out
+  } catch (e) {
+    return ids
+  }
+}
+
 // The model ids (as provider/model) of a provider whose listing nativeList names. undefined when the
 // listing could not be read. Bedrock: the foundation models and the inference profiles, signed as
 // Bedrock's control plane takes them. Vertex: the Model Garden publishers google, anthropic and
 // mistralai, every page, with a bearer token (Bifrost's list: vertex/vertex.go). Cloudflare: the
 // Workers AI search, every page, keeping the text generation and embeddings models (cloudflare/models.go).
+// Every page of a Bedrock control-plane listing: each answer's nextToken is sent back as the next
+// page's query until none is left (capped, so a provider that never ends cannot hold the listing).
+// undefined when the first page cannot be read; a later page that fails keeps the ids read so far.
+async function bedrockPages(t: Target, path: string, field: string, idKey: string): Promise<string[] | undefined> {
+  const out: string[] = []
+  let token = ""
+  for (let page = 0; page < 50; page++) {
+    const query = token === "" ? "" : "nextToken=" + bedrock.encodeSegment(token)
+    let body: string | undefined = undefined
+    try {
+      body = await getListing(bedrock.listRequest(t, path, query))
+      if (body === undefined) return page === 0 ? undefined : out
+      for (const id of try bedrockIds(body, field, idKey)) out.push(id)
+      token = rawStr(try fields(body), "nextToken") ?? ""
+    } catch (e) {
+      return page === 0 ? undefined : out
+    }
+    if (token === "") break
+  }
+  return out
+}
+
 async function nativeModelIds(engine: Engine | undefined, provider: string, t: Target): Promise<string[] | undefined> {
   const ids: string[] = []
   try {
     if (t.kind === "databricks") return ids
     if (t.kind === "bedrock") {
-      const fm = try await getListing(bedrock.listRequest(t, "/foundation-models"))
+      const fm = await bedrockPages(t, "/foundation-models", "modelSummaries", "modelId")
       if (fm === undefined) return undefined
-      for (const id of try bedrockIds(fm, "modelSummaries", "modelId")) ids.push(provider + "/" + id)
-      const ip = try await getListing(bedrock.listRequest(t, "/inference-profiles"))
+      for (const id of fm) ids.push(provider + "/" + id)
+      const ip = await bedrockPages(t, "/inference-profiles", "inferenceProfileSummaries", "inferenceProfileId")
       if (ip !== undefined) {
-        for (const id of try bedrockIds(ip, "inferenceProfileSummaries", "inferenceProfileId")) ids.push(provider + "/" + id)
+        for (const id of ip) ids.push(provider + "/" + id)
       }
       return ids
     }
@@ -170,7 +214,7 @@ async function providerModels(engine: Engine | undefined, cfg: Config, provider:
       for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
       const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
       const text = await res.text()
-      if (res.ok) ids = openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/"))
+      if (res.ok) ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
     } catch (e) {
       ids = []
     }
@@ -206,7 +250,7 @@ async function refreshModels(engine: Engine | undefined, cfg: Config, provider: 
       const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
       const text = await res.text()
       if (!res.ok) continue
-      const ids = openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/"))
+      const ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
       modelCache.ids.set(provider, ids)
       modelCache.fetchedAt.set(provider, Date.now())
       return { status: 200, body: JSON.stringify({ provider: provider, models: ids, total: ids.length }), contentType: "application/json" }
