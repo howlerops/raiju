@@ -232,7 +232,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L100 | G37 | Compat remainder: stream conversions (text-to-chat, chat-to-responses), decision emulation (needs L81), azure_deepseek, reasoning budget scaling and min_output_tokens, summary fitting for Responses | worker | done: streamed text-to-chat and chat-to-responses, decision emulation, Azure DeepSeek reasoning drop, output and reasoning budget fitting, Responses-side drops; unit + e2e. Open: compat headers on streamed answers, native-decision model checks |
 | L101 | G43 | Secrets engine: capture groups for secretGroup, the entropy filter and gitleaks allowlists and stopwords; then enable generic-api-key | worker | done: regex captures (linear), secretGroup spans, entropy (above N, as gitleaks), global and per-rule allowlists and stopwords, trailing boundaries restored, generic-api-key on; unit + e2e. Open: gitleaks:allow comments not honoured (fail closed), keyword-dense 20 KB check ~35 ms |
 | L102 | G40 | WebSocket and live remainder: Responses socket streams events as they arrive (not after completion), response.cancel, /openai/responses aliases; live sessions for more providers, POST /v1/live/sessions (WebRTC create), session registry and /ws shared across workers, /ws heartbeat | worker | done: Responses socket streams OpenAI events as they arrive, response.cancel (Raiju extension: Bifrost rejects it), /openai aliases, POST /v1/live/sessions validated then 501 (no WebRTC peer), live registry and /ws shared across workers, /ws heartbeat; unit + e2e |
-| L97 | from L96 | Whatever the re-audit still lists as missing or partial and buildable | workers | todo |
+| L97 | from L96 | Whatever the re-audit still lists as missing or partial and buildable | workers | done: split into L97a to L97t below; remainders queued as wave 14 |
 | L97a | (a) | Route families: /openai unversioned, /anthropic/v1/complete, /v1/completions bridge, POST /v1/realtime SDP, genai batch and Vertex regional paths, Bedrock job and file routes, /cursor, GET /mcp SSE | worker | done: unversioned /openai family, /anthropic/v1/complete, POST /v1/realtime SDP, Vertex regional batch and cachedContents paths, Bedrock job and file routes, /cursor, GET /mcp SSE; /v1/completions keeps Bifrost's default (bridge only with compat); unit + e2e. Open: legacy complete streaming, cursor Responses streaming |
 | L97b | (a) | Management API: providers create and keys, config metadata, VK rotate and quota, team members, routing-rule and complexity APIs, users and /me, projects members, access-profile versions, permissions listings | worker | partial: provider create and key reads, config metadata, VK rotate with cooldown, VK expires_at, team members (parts 1-3 in part); parts 4-9 moved to L97j |
 | L97c | (a) | Management API: logs filters, by id, sessions, user/app/user-agent fields and histograms, delete and recalculate-cost; cache stats and clear; audit by id; session setup and ws-ticket; plugin listings | worker | done: logs in Bifrost shapes with its filters, log by id, sessions and summary, user and user-agent fields, user-agent mappings, delete and recalculate-cost, cache stats and clears, audit by id and filterdata, ws-ticket, plugin listings; unit + e2e. Open (L97l): background cost recalculation, setup flow, plugin CRUD, unrecorded log filters |
@@ -254,6 +254,25 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L97s | (e), (i) | Streamed guardrails remainder: output guards on text completion and Responses streams, stream redaction and replay | worker | partial: local regex and secrets output guards on streamed text completions and Responses (converted and passthrough), redaction with holdback, guarded raw_response and cached replays; unit + e2e. Open: built-in guard on streams, replay pacing, matches spanning a release point |
 | L97t | (a) | Log filters Raiju still refuses: agent_names, tool_call_names, complexity score bounds, prompt filters (record what they need) | worker | done: tool_call_names, min/max_complexity_score, selected_prompt_ids and prompt_names recorded and filtered on every log route; unit + e2e. agent_names stays refused (no registered agents); tool names not recorded for streamed answers |
 | L96d | G32, G33 | Final docs: scripts/parity_count.py and Summary, Gaps and Remaining gaps, SCOPE.md and README.md in sync (after L97) | worker | done: scripts/parity_count.py (--write, --check; make parity-count), Summary regenerated (560 parity rows: done 368, partial 144, missing 11, out-of-scope 28, n/a 9; 34 Raiju-only), gap statuses and remaining gaps rewritten, SCOPE.md and README.md in sync, Out table extended; G32 and G33 closed |
+
+## Wave 14 (queued, not started)
+
+Consolidated from the "Open:" notes above and docs/parity.md "Remaining gaps". Older "Open:"
+notes on L84, L91, L97f and L97m were finished by later rows (L97p, L97k/L97o, L97q, L97s).
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L103 | G41 | Governance remainder: rate-limit shares split across project members, access-profile role binding, user-held profiles governing requests, Bifrost role-id API shape, budget-override cycle count kept across restarts | worker | todo |
+| L104 | G41, G42 | Audit and adaptive LB remainder: archive manifest, gzip and archive_max_object_bytes splitting; adaptive refusal classification, wait ladder and incident history | worker | todo |
+| L105 | G14, G17, (d) | Providers remainder: Replicate text, image edits, polling past Prefer: wait, file list/retrieve/delete/content; usage.cost on streamed answers; model retrieve for Cohere and Azure; server-side-fallback-model on streamed Anthropic answers; Stability extra params | worker | todo |
+| L106 | (g) | MCP OAuth remainder: session and user consent modes, /api/oauth2/sessions list and revoke, grants persisted across restarts, generated and stored signing key, Bifrost's redirect scheme list | worker | todo |
+| L107 | G43, G37 | Streams remainder: built-in guard (guardrails.detect) on streams, replay pacing (stream_replay_event_interval_ms), redaction across a release point, tool names recorded on streamed answers, compat headers on streamed answers, legacy completions and cursor Responses streaming (L97a) | worker | todo |
+| L108 | G40 | Live sessions for providers other than OpenAI; POST /v1/live/sessions (WebRTC create, now 501) | worker | todo |
+| L109 | G36, G37 | Unprefixed /decisions routes, decision pricing overrides, native-decision model checks | worker | todo |
+| L110 | G39, G47, G48, G22 | x-bf-store-raw-request-response; the a3 histograms and rankings still partial; websocket config keys, large_payload_optimization, top-level access_profiles, network_config knobs, keys[].oauth_key_config; token_exchange auth and inprocess MCP connections | worker | todo |
+| L111 | G43 | Honour `gitleaks:allow` comments; bring the keyword-dense 20 KB secrets check under 35 ms | worker | todo |
+| L112 | — | Re-read the 11 "missing" rows in docs/parity.md; build the buildable ones or mark them out of scope with the owner | lead | todo |
+| L113 | UI | Native client: after the owner picks Slint or gpui (licence), grow the spike into the admin client (providers, keys, logs, live feed) | worker | blocked: owner decision |
 
 ## UI track
 
@@ -282,4 +301,4 @@ keys). See docs/parity.md.
 
 ## Next
 
-Everything in SCOPE.md is done except the five "Out" items. Remaining limits are in the README's Known gaps.
+Wave 14 above. The handoff for a new lead is HANDOFF.md plus handoff/leader-prompt.md.
