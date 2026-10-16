@@ -2488,6 +2488,7 @@ def l97l_config():
             "routing_rules": [{"id": "rule-l97l", "cel_expression": "true", "targets": [{"provider": "openai", "model": "gpt-4o-mini", "weight": 1.0}]}],
         },
         "plugins": [{"name": "header", "enabled": True, "config": {"set_request_headers": {"x-l97l": "1"}}}],
+        "complexity_router": {"enabled": True},
     }
 
 def l97l_setup_config():
@@ -2594,10 +2595,44 @@ def l97l_e2e(env):
         grouped = json.loads(b).get("logs", []) if s == 200 else []
         mine = [r for r in grouped if r.get("session_id") == "sess-l97l"]
         check("group_sessions keeps one row per session: its earliest root", len(mine) == 1 and mine[0].get("request_id") == "root-l97l-1", (s, len(mine), b[:200]))
-        s, _, b = api("GET", "/api/logs?complexity_tiers=SIMPLE&complexity_mechanisms=heuristic")
-        check("the complexity filters are accepted (no complexity router here: none recorded)", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?complexity_tiers=SIMPLE&complexity_mechanisms=heuristic&session_id=sess-l97l")
+        check("the complexity tier and mechanism filters select the heuristic's requests", s == 200 and json.loads(b)["total"] == 4, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?min_complexity_score=0&max_complexity_score=100000&session_id=sess-l97l")
+        scored = json.loads(b).get("logs", []) if s == 200 else []
+        check("the complexity score bounds select the scored requests, and each row carries its score", s == 200 and len(scored) == 4 and all(isinstance(r.get("complexity_score"), (int, float)) for r in scored), (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?min_complexity_score=100000&session_id=sess-l97l")
+        check("a complexity score bound no request reaches selects nothing", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
         s, _, b = api("GET", "/api/logs?agent_names=bot")
         check("agent names are still refused: this gateway has no registered agents", s == 400 and "agent_names" in b, (s, b[:200]))
+        # a tool-calling answer: its names are recorded whether or not content is logged
+        tc1 = l97l_chat("l97t-tools please", {"x-bf-session-id": "sess-l97t"})
+        tc2 = l97l_chat("l97t-tools please", {"x-bf-session-id": "sess-l97t", "x-bf-cache-key": "k-l97t"})
+        tc3 = l97l_chat("l97t-tools please", {"x-bf-session-id": "sess-l97t", "x-bf-cache-key": "k-l97t"})
+        check("the tool-calling answers are served, and the third identical one is a cache hit", tc1[0] == 200 and tc2[0] == 200 and tc3[0] == 200 and hdr(tc3[1], "x-bf-cache") == "hit", (tc1[0], tc2[0], tc3[0]))
+        s, _, b = api("GET", "/api/logs?session_id=sess-l97t")
+        called = json.loads(b).get("logs", []) if s == 200 else []
+        check("the answers' tool names are listed on their rows, first seen first, repeats dropped", len(called) == 3 and all(r.get("tool_call_names") == ["get_weather", "lookup_city"] for r in called), (s, b[:300]))
+        s, _, b = api("GET", "/api/logs?tool_call_names=lookup_city&session_id=sess-l97t")
+        check("the tool call name filter selects the answers that called the tool", s == 200 and json.loads(b)["total"] == 3, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?tool_call_names=no_such_tool&session_id=sess-l97t")
+        check("a tool no answer called selects nothing", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?tool_call_names=nothing,lookup_city&session_id=sess-l97l")
+        check("the session without tool calls selects nothing for a tool name", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        # the prompt the request named with x-bf-prompt-id and x-bf-prompt-version
+        s, _, b = api("POST", "/api/prompt-repo/prompts", {"name": "greet-l97t"})
+        ppid = json.loads(b)["prompt"]["id"] if s == 200 else ""
+        check("a prompt is created for the prompt filters", s == 200 and ppid.startswith("pr_"), (s, b[:200]))
+        s, _, b = api("POST", "/api/prompt-repo/prompts/" + ppid + "/versions", {"messages": [{"role": "system", "content": "Be brief."}]})
+        check("the prompt's version 1 is committed", s == 200 and json.loads(b)["version"]["version_number"] == 1, (s, b[:200]))
+        pc = l97l_chat("prompt request l97t", {"x-bf-session-id": "sess-l97t", "x-bf-prompt-id": ppid, "x-bf-prompt-version": "1"})
+        check("the prompt request is served", pc[0] == 200, (pc[0], pc[2][:200]))
+        s, _, b = api("GET", "/api/logs?selected_prompt_ids=" + ppid + "&session_id=sess-l97t")
+        prow = json.loads(b).get("logs", []) if s == 200 else []
+        check("the prompt id filter selects the request that named the prompt, with its version", s == 200 and len(prow) == 1 and prow[0].get("selected_prompt_version") == 1 and prow[0].get("selected_prompt_name") == "greet-l97t", (s, b[:300]))
+        s, _, b = api("GET", "/api/logs?prompt_names=greet-l97t&session_id=sess-l97t")
+        check("the prompt name filter selects the same request", s == 200 and json.loads(b)["total"] == 1, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?prompt_names=other-prompt&session_id=sess-l97t")
+        check("a prompt name no request used selects nothing", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
         s, _, b = api("GET", "/api/logs/stats?session_id=sess-l97l")
         st = json.loads(b) if s == 200 else {}
         check("the stats count the cache hit rate's requests and the hits by type", st.get("cache_hit_rate_total_requests") == 4 and st.get("direct_cache_hits") == 1 and st.get("semantic_cache_hits") == 0, (s, b[:300]))

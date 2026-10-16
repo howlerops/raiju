@@ -61,6 +61,13 @@ export type LogEntry = {
   complexity_mechanism?: string,
   cache_hit_type?: string,
   stop_reason?: string,
+  // the names of the tools the answer called (reqlog.tov toolCallNamesOf), the heuristic complexity score
+  // behind the tier (heuristic mechanism only) and the prompt the request named with x-bf-prompt-id
+  tool_call_names?: string[],
+  complexity_score?: f64,
+  selected_prompt_id?: string,
+  selected_prompt_name?: string,
+  selected_prompt_version?: int,
 }
 
 export type LogStoreConfig = {
@@ -527,6 +534,11 @@ export class LogStore {
       complexity_mechanism: e.complexity_mechanism,
       cache_hit_type: e.cache_hit_type,
       stop_reason: e.stop_reason,
+      tool_call_names: e.tool_call_names,
+      complexity_score: e.complexity_score,
+      selected_prompt_id: e.selected_prompt_id,
+      selected_prompt_name: e.selected_prompt_name,
+      selected_prompt_version: e.selected_prompt_version,
     }
   }
 
@@ -625,7 +637,12 @@ export type Filter = {
   aliases: string[],
   complexityTiers: string[],
   complexityMechanisms: string[],
+  minComplexity: f64, // -1 when no bound; the heuristic score must be at least this
+  maxComplexity: f64, // -1 when no bound; and at most this
   cacheHitTypes: string[],
+  toolCallNames: string[], // the answer called any of these tools
+  promptIds: string[],
+  promptNames: string[],
   parentId: string, // exact parent_request_id
   correlationId: string, // exact agent_correlation_id
   rootsOnly: bool, // see applyChains
@@ -691,7 +708,12 @@ export function filterFrom(sp: URLSearchParams, kind: string, since: f64, until:
     aliases: listParam(sp.get("aliases") ?? undefined),
     complexityTiers: listParam(sp.get("complexity_tiers") ?? undefined),
     complexityMechanisms: listParam(sp.get("complexity_mechanisms") ?? undefined),
+    minComplexity: numParam(sp, "min_complexity_score"),
+    maxComplexity: numParam(sp, "max_complexity_score"),
     cacheHitTypes: listParam(sp.get("cache_hit_types") ?? undefined),
+    toolCallNames: listParam(sp.get("tool_call_names") ?? undefined),
+    promptIds: listParam(sp.get("selected_prompt_ids") ?? undefined),
+    promptNames: listParam(sp.get("prompt_names") ?? undefined),
     parentId: (sp.get("parent_request_id") ?? "").trim(),
     correlationId: (sp.get("agent_correlation_id") ?? "").trim(),
     rootsOnly: sp.get("roots_only") === "true",
@@ -711,6 +733,15 @@ function statusMatches(e: LogEntry, st: string): bool {
   if (st === "success") return isSuccess(e)
   if (st === "cancelled") return e.status === 499
   if (st === "error") return !isSuccess(e) && e.status !== 499
+  return false
+}
+
+// Whether an answer called any of the named tools.
+function calledAny(called: string[] | undefined, want: string[]): bool {
+  if (called === undefined) return false
+  for (const n of called) {
+    if (want.includes(n)) return true
+  }
   return false
 }
 
@@ -751,6 +782,11 @@ export function selects(e: LogEntry, f: Filter): bool {
   if (f.complexityTiers.length > 0 && !f.complexityTiers.includes(e.complexity_tier ?? "")) return false
   if (f.complexityMechanisms.length > 0 && !f.complexityMechanisms.includes(e.complexity_mechanism ?? "")) return false
   if (f.cacheHitTypes.length > 0 && !f.cacheHitTypes.includes(hitTypeOf(e))) return false
+  if (f.toolCallNames.length > 0 && !calledAny(e.tool_call_names, f.toolCallNames)) return false
+  if (f.minComplexity >= 0.0 && (e.complexity_score === undefined || e.complexity_score < f.minComplexity)) return false
+  if (f.maxComplexity >= 0.0 && (e.complexity_score === undefined || e.complexity_score > f.maxComplexity)) return false
+  if (f.promptIds.length > 0 && !f.promptIds.includes(e.selected_prompt_id ?? "")) return false
+  if (f.promptNames.length > 0 && !f.promptNames.includes(e.selected_prompt_name ?? "")) return false
   if (f.parentId !== "" && e.parent_request_id !== f.parentId) return false
   if (f.correlationId !== "" && e.agent_correlation_id !== f.correlationId) return false
   return true
@@ -1704,6 +1740,32 @@ test("routing, cache, stop and chain filters select the recorded fields", () => 
 function idsOf(es: LogEntry[], q: string): string[] {
   return selectAll(es, filterFrom(new URLSearchParams(q), "llm", 0.0, 1000.0)).map((e) => e.id)
 }
+
+test("tool call, complexity score and prompt filters select the recorded fields", () => {
+  const a = sample("t1", 500.0, "m", 200, { provider: "openai" })
+  a.tool_call_names = ["get_weather", "lookup_city"]
+  a.complexity_score = 2.5
+  a.selected_prompt_id = "pr-1"
+  a.selected_prompt_name = "greet"
+  a.selected_prompt_version = 2
+  const b = sample("t2", 600.0, "m", 200, { provider: "openai" })
+  b.tool_call_names = ["search"]
+  b.complexity_score = 9.0
+  const c = sample("t3", 700.0, "m", 200, { provider: "openai" })
+  const es: LogEntry[] = [a, b, c]
+  expect(idsOf(es, "tool_call_names=lookup_city").join(",")).toBe("t1")
+  expect(idsOf(es, "tool_call_names=search,nothing").join(",")).toBe("t2")
+  expect(idsOf(es, "tool_call_names=nothing").length).toBe(0)
+  expect(idsOf(es, "min_complexity_score=0").join(",")).toBe("t1,t2")
+  expect(idsOf(es, "min_complexity_score=5").join(",")).toBe("t2")
+  expect(idsOf(es, "max_complexity_score=5").join(",")).toBe("t1")
+  expect(idsOf(es, "min_complexity_score=2&max_complexity_score=9").join(",")).toBe("t1,t2")
+  expect(idsOf(es, "min_complexity_score=10").length).toBe(0)
+  expect(idsOf(es, "selected_prompt_ids=pr-1").join(",")).toBe("t1")
+  expect(idsOf(es, "prompt_names=greet").join(",")).toBe("t1")
+  expect(idsOf(es, "prompt_names=other").length).toBe(0)
+  expect(idsOf(es, "selected_prompt_ids=pr-1&prompt_names=other").length).toBe(0)
+})
 
 test("a cache hit without a recorded type is a direct hit, and the stats count both kinds", () => {
   const old = sample("h1", 500.0, "m", 200, {})

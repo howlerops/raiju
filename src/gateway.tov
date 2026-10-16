@@ -1,7 +1,7 @@
 // The request engine: governance, cache, the attempt loop (retries, key
 // rotation, fallbacks), translation, accounting.
 import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, providerOf } from "./config"
-import { applyPrompt } from "./prompts"
+import { applyPrompt, Applied } from "./prompts"
 import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField, without } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
 import { OpenAIPassthrough, ResponsesPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
@@ -56,7 +56,7 @@ import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, PluginEntry, buildChain, jsonStreamEnabled, JsonStreamFixer } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline } from "./deadline"
-import { logMetadata, correlationIds, maximAttrs, stopReasonOf } from "./reqlog"
+import { logMetadata, correlationIds, maximAttrs, stopReasonOf, toolCallNamesOf } from "./reqlog"
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 
@@ -843,6 +843,12 @@ class ReqCtx {
   // the local cache hit ("direct" or "semantic") and the stop reason of the answer, for the request log
   cacheType = ""
   stopReason = ""
+  // the tools the answer called, the heuristic complexity score and the prompt the request named
+  toolNames: string[] = []
+  complexityScore: f64 | undefined = undefined
+  promptId = ""
+  promptName = ""
+  promptVersion: int | undefined = undefined
   app = ""
   maximIds: Record<string, string> | undefined = undefined
   maximTags: Record<string, string> | undefined = undefined
@@ -1194,25 +1200,27 @@ export class Engine {
     aff.bind(sid, ref.provider, ref.model, kid, sessionTtl(h, aff.cfg), Date.now())
   }
 
-  tierOf(text: string, cx: ComplexitySettings): Tier {
+  // The heuristic's tier and score; the score is undefined when the text cannot be scored.
+  heuristicTier(text: string, cx: ComplexitySettings): { tier: Tier, mechanism: string, score: f64 | undefined } {
     try {
-      return cplx.classify(text, { simple_max_score: cx.simple_max_score ?? 3.0, complex_min_score: cx.complex_min_score ?? 8.0 }).tier
+      const c = cplx.classify(text, { simple_max_score: cx.simple_max_score ?? 3.0, complex_min_score: cx.complex_min_score ?? 8.0 })
+      return { tier: c.tier, mechanism: "heuristic", score: c.score }
     } catch (e) {
-      return "MEDIUM"
+      return { tier: "MEDIUM", mechanism: "heuristic", score: undefined }
     }
   }
 
   // The complexity tier of a chat request: the configured classifier's, or the heuristic's when the
   // classifier names none (no decision model, no embedding, a timeout, or an unparseable answer).
-  async tierFor(req: Request, text: string, cx: ComplexitySettings): Promise<{ tier: Tier, mechanism: string }> {
+  async tierFor(req: Request, text: string, cx: ComplexitySettings): Promise<{ tier: Tier, mechanism: string, score: f64 | undefined }> {
     const mode = cplx.classifierMode(cx.classifier)
-    if (mode === "heuristic") return { tier: this.tierOf(text, cx), mechanism: "heuristic" }
+    if (mode === "heuristic") return this.heuristicTier(text, cx)
     let t: Tier | undefined = undefined
     if (mode === "decision") t = await cplx.decisionTier(text, cx.decision, async (b: string, ph: string) => await this.classifierCall(req, "/v1/decisions", b, ph))
     else if (mode === "llm") t = await cplx.llmTier(text, cx.llm, async (b: string, ph: string) => await this.classifierCall(req, "/v1/chat/completions", b, ph))
     else t = await cplx.semanticTier(text, cx.semantic, async (b: string, ph: string) => await this.classifierCall(req, "/v1/embeddings", b, ph))
-    if (t !== undefined) return { tier: t, mechanism: mode }
-    return { tier: this.tierOf(text, cx), mechanism: "heuristic" }
+    if (t !== undefined) return { tier: t, mechanism: mode, score: undefined }
+    return this.heuristicTier(text, cx)
   }
 
   // A classifier's own call, answered by the route it names with the caller's headers. The chat
@@ -2005,12 +2013,17 @@ export class Engine {
   }
 
   // Shared front half of every inference endpoint.
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan): Promise<Response> {
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied): Promise<Response> {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
     ctx.sink = sink
     ctx.makeConverter = makeConverter
     ctx.compat = compat
+    if (prompt !== undefined && prompt.prompt_id !== undefined) {
+      ctx.promptId = prompt.prompt_id
+      ctx.promptName = prompt.prompt_name ?? ""
+      ctx.promptVersion = prompt.version
+    }
     ctx.meta = logMetadata(h, this.cfg.client?.logging_headers ?? [])
     const cids = correlationIds(h)
     ctx.parentId = cids.parent
@@ -2076,6 +2089,7 @@ export class Engine {
         const d = await this.tierFor(req, text, cx)
         tier = d.tier
         mechanism = d.mechanism
+        ctx.complexityScore = d.score
       }
       out.set("x-bf-complexity-tier", tier ?? "MEDIUM")
     }
@@ -2188,7 +2202,10 @@ export class Engine {
         out.set("content-type", hit.contentType)
         ctx.cached = true
         ctx.cacheType = "direct"
-        if (this.logStore !== undefined) ctx.stopReason = stopReasonOf(hit.body)
+        if (this.logStore !== undefined) {
+          ctx.stopReason = stopReasonOf(hit.body)
+          ctx.toolNames = toolCallNamesOf(hit.body)
+        }
         ctx.output = hit.body
         return respond(200, hit.body, out)
       }
@@ -2326,6 +2343,7 @@ export class Engine {
     if (this.logStore !== undefined) {
       ctx.output = r.body
       ctx.stopReason = stopReasonOf(r.body)
+      ctx.toolNames = toolCallNamesOf(r.body)
     }
     return respond(200, r.body, out)
   }
@@ -2447,6 +2465,11 @@ export class Engine {
         complexity_mechanism: lb.complexityMechanism === "" ? undefined : lb.complexityMechanism,
         cache_hit_type: c.cacheType === "" ? undefined : c.cacheType,
         stop_reason: c.stopReason === "" ? undefined : c.stopReason,
+        tool_call_names: c.toolNames.length === 0 ? undefined : c.toolNames,
+        complexity_score: c.complexityScore,
+        selected_prompt_id: c.promptId === "" ? undefined : c.promptId,
+        selected_prompt_name: c.promptName === "" ? undefined : c.promptName,
+        selected_prompt_version: c.promptVersion,
         raw_request: c.contentOff || c.rawRequest === "" ? undefined : this.redactRaw(c.rawRequest),
         raw_response: c.contentOff || c.rawResponse === "" ? undefined : this.redactRaw(c.rawResponse),
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
@@ -2552,6 +2575,8 @@ export class Engine {
     // reversible redaction: one vault per request, so the response restores to this request's values
     const vault = new Vault()
     const reversible = guard !== undefined && guard.mode === "redact" && this.cfg.guardrails?.reversible === true
+    // the prompt the request named and the version it got, for the request log
+    let promptUsed: Applied | undefined = undefined
     try {
       if (guard !== undefined && this.guardInput && reversible) {
         text = try tokenizeChatRequest(text, guard, vault)
@@ -2588,6 +2613,7 @@ export class Engine {
         if (applied.prompt_id !== undefined) {
           text = applied.text
           body = try fields(text)
+          promptUsed = applied
         }
       }
       // a key's access profile may cap max_tokens
@@ -2742,7 +2768,7 @@ export class Engine {
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return guardedConv(conv)
     }
-    const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk, cp)
+    const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk, cp, promptUsed)
     // external output guardrails see the whole answer, so they apply to non-streamed answers
     if (!guardOn || this.guardProviders.length === 0 || stream || res.status !== 200) return res
     let answer = ""

@@ -252,7 +252,7 @@ Process note: e2e uses fixed ports, so every run (workers and lead) goes through
 | L97q | (d) | Providers last part: Replicate predictions (text, images, edits, files, models), scoped and object-form aliases with the alias-model-name/family headers, Bedrock Stability edits and variations, Wafer file upload, OpenRouter chat usage.cost | worker | assigned |
 | L97r | (g) | MCP OAuth remainder: HTML consent page for per-user OAuth and temporary tokens, Raiju as an OAuth authorization server for MCP clients (metadata, register, authorize, token) | worker | assigned |
 | L97s | (e), (i) | Streamed guardrails remainder: output guards on text completion and Responses streams, stream redaction and replay | worker | assigned |
-| L97t | (a) | Log filters Raiju still refuses: agent_names, tool_call_names, complexity score bounds, prompt filters (record what they need) | worker | assigned |
+| L97t | (a) | Log filters Raiju still refuses: agent_names, tool_call_names, complexity score bounds, prompt filters (record what they need) | worker | done: tool_call_names, min/max_complexity_score, selected_prompt_ids and prompt_names recorded and filtered on every log route; unit + e2e. agent_names stays refused (no registered agents); tool names not recorded for streamed answers |
 | L96d | G32, G33 | Final docs: scripts/parity_count.py and Summary, Gaps and Remaining gaps, SCOPE.md and README.md in sync (after L97) | worker | todo |
 
 ## UI track
