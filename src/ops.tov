@@ -12,7 +12,9 @@ import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pus
 import { PushGatewayConfig, pushProblem, pushUrl, pushHeaders, pushInterval } from "./pushgateway"
 import { join } from "node:path"
 import { Engine } from "./gateway"
-import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { CostRecalc, RecalcStatus } from "./costrecalc"
+import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE } from "./setupsession"
+import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
 import { CircuitPolicyConfig, VirtualKeyConfig } from "./config"
@@ -60,11 +62,26 @@ export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response
 
 export type Reply = { status: int, body: string, contentType: string }
 
-// The last cost recalculation: its id, how many entries it priced and how many of them changed.
-export type RecalcRun = { id: string, processed: int, updated: int, startedAt: string, finishedAt: string }
-
 // The filters of POST /api/logs/recalculate-cost, in Bifrost's names.
 export type RecalcFilters = { providers?: string[], models?: string[], virtual_key_ids?: string[], user_ids?: string[], team_ids?: string[], period?: string, start_time?: string, end_time?: string, missing_cost_only?: bool }
+
+// An error reply for the plugin routes.
+function pluginError(status: int, message: string): Reply {
+  return { status: status, body: errorJson(message, status === 404 ? "not_found_error" : "invalid_request_error", undefined), contentType: "application/json" }
+}
+
+// The raw config a body names, or dflt when it names none (or null).
+function configOf(fs: Field[], dflt: string): string {
+  const raw = find(fs, "config")
+  return raw === undefined || isNull(raw) ? dflt : raw
+}
+
+// Why a plugin cannot be built from its config: "" when it can. Checked as enabled, so a disabled plugin is
+// still checked for its name and config.
+function badPlugin(spec: PluginSpec): string {
+  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}" })
+  return st.status === "error" ? st.error : ""
+}
 
 // One configured plugin as Bifrost's plugin response: its name, whether it is on, its config and its status.
 function pluginJson(sp: PluginSpec): string {
@@ -104,6 +121,21 @@ function recalcQuery(f: RecalcFilters | undefined): URLSearchParams {
   if (f.end_time !== undefined) sp.set("end_time", f.end_time)
   if (f.missing_cost_only === true) sp.set("missing_cost_only", "true")
   return sp
+}
+
+// A cost recalculation job in Bifrost's status fields.
+function recalcJson(s: RecalcStatus): string {
+  return jobj([
+    jkv("id", JSON.stringify(s.id)),
+    jkv("status", JSON.stringify(s.status)),
+    jkv("total", jn(s.total)),
+    jkv("processed", jn(s.processed)),
+    jkv("updated", jn(s.updated)),
+    jkv("skipped", jn(s.skipped)),
+    jkv("message", JSON.stringify(s.message)),
+    jkv("started_at", JSON.stringify(s.started_at)),
+    jkv("updated_at", JSON.stringify(s.updated_at)),
+  ])
 }
 
 // A query value as epoch milliseconds; the fallback when it is missing or not a number.
@@ -535,8 +567,8 @@ export class Ops {
   liveSessions = new LiveRegistry()
   // single-use tickets for /ws?ticket= (POST /api/session/ws-ticket)
   wsTickets = new WsTickets()
-  // the last cost recalculation (POST /api/logs/recalculate-cost); the runs are synchronous, so there is at most one
-  recalc: RecalcRun | undefined = undefined
+  // the last cost recalculation job (POST /api/logs/recalculate-cost); a job walks the logs between timer ticks
+  recalc: CostRecalc | undefined = undefined
 
   constructor(readonly engine: Engine, readonly store: ConfigStore) {
     this.ui = new UiHub(() => this.engine.logStore)
@@ -1231,11 +1263,25 @@ export class Ops {
         return json(500, errorJson("failed to issue WebSocket ticket", "api_error", undefined))
       }
     }
-    // Bifrost's setup session is for the setup lock, which Raiju does not have: the answer is Bifrost's
-    // answer while the lock is not active
+    // POST /api/session/setup: while no admin exists, the operator's setup token (X-Bifrost-Setup-Token) is
+    // traded for a setup session cookie, which stands in for the token on POST /api/users (see users). Once an
+    // admin exists the setup lock is not active and the answer is 409, as Bifrost's.
     if (path === "/api/session/setup") {
       if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
-      return json(409, errorJson("the setup lock is not active", "invalid_request_error", undefined))
+      if (this.authOn) return json(409, errorJson("the setup lock is not active", "invalid_request_error", undefined))
+      const token = resolveEnv(this.store.cfg.setup_token ?? "")
+      const given = req.headers.get("x-bifrost-setup-token") ?? ""
+      if (token === "" || given !== token) return json(403, errorJson("invalid setup token", "invalid_request_error", undefined))
+      try {
+        const s = try issueSetupSession(token, now)
+        const secure = req.url.startsWith("https:") || (req.headers.get("x-forwarded-proto") ?? "") === "https"
+        const hs: Record<string, string> = new Map()
+        hs.set("content-type", "application/json")
+        hs.set("set-cookie", setupCookie(s.value, secure))
+        return new Response(JSON.stringify({ expires_at: isoMs(s.expires) }), { status: 200, headers: hs })
+      } catch (e) {
+        return json(500, errorJson("failed to start setup session", "api_error", undefined))
+      }
     }
     if (path === "/api/session/is-auth-enabled") {
       if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
@@ -1368,8 +1414,8 @@ export class Ops {
     if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
     if (path === "/api/logs" && m === "DELETE") return this.deleteLogs(body, store, sc)
     if (path === "/api/logs/recalculate-cost" && m === "POST") return this.recalculateCost(body, store, sc)
-    if (path === "/api/logs/recalculate-cost/status" && m === "GET") return okJson(this.recalcStatus())
-    if (path === "/api/logs/recalculate-cost/cancel" && m === "POST") return okJson(this.recalcStatus())
+    if (path === "/api/logs/recalculate-cost/status" && m === "GET") return this.recalcStatus(sp)
+    if (path === "/api/logs/recalculate-cost/cancel" && m === "POST") return this.cancelRecalc(sp)
     if (m !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
     if (path === "/api/logs") return this.logList(sp, store, sc)
     if (path === "/api/logs/stats") return this.logStats(sp, store, sc)
@@ -1427,7 +1473,7 @@ export class Ops {
     const pg = pageOfQuery(sp, 50, 1000)
     if (pg.error !== "") return badRequest(pg.error)
     const f = listFilter(sp, Date.now())
-    const es = selectAll(scopedView(store, sc, f.since - 1.0), f)
+    const es = applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)
     return okJson(listJson(es, pg.page, scopedView(store, sc, 0.0).length > 0))
   }
 
@@ -1436,7 +1482,7 @@ export class Ops {
     const bad = unsupportedFilter(sp)
     if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
     const f = listFilter(sp, Date.now())
-    return okJson(statsView(selectAll(scopedView(store, sc, f.since - 1.0), f)))
+    return okJson(statsView(applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)))
   }
 
   // GET /api/logs/{id}: one log, with its bodies and raw payloads when the store kept them.
@@ -1482,8 +1528,9 @@ export class Ops {
     return okJson(JSON.stringify({ message: "Logs deleted successfully", removed: removed }))
   }
 
-  // POST /api/logs/recalculate-cost: prices again the LLM logs that match the body's filters, at the
-  // current prices. It runs to the end before answering (Bifrost runs it as a background job).
+  // POST /api/logs/recalculate-cost: starts a background job that prices again the LLM logs the body's
+  // filters select, at the current prices (Bifrost's enqueue). 202 with the job; 409 with the job when one is
+  // already in flight, so the caller polls that one.
   private recalculateCost(body: string, store: LogStore, sc: DataScope): Reply {
     let rb: { filters?: RecalcFilters } = {}
     if (body.trim() !== "") {
@@ -1493,24 +1540,41 @@ export class Ops {
         return badRequest("Invalid JSON")
       }
     }
-    const sp = recalcQuery(rb.filters)
-    const f = listFilter(sp, Date.now())
-    const matched = selectAll(scopedView(store, sc, f.since - 1.0), f)
+    const cur = this.recalc
+    if (cur !== undefined && cur.inFlight()) return { status: 409, body: recalcJson(cur.snapshot()), contentType: "application/json" }
+    const f = listFilter(recalcQuery(rb.filters), Date.now())
     const pricing = this.engine.pricing
-    const updated = store.recost((e) => {
-      if (!visibleTo(e, sc) || !selects(e, f)) return undefined
-      return pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens)
-    })
-    const now = isoMs(Date.now())
-    this.recalc = { id: newId("recalc-"), processed: matched.length, updated: updated, startedAt: now, finishedAt: now }
-    return okJson(this.recalcStatus())
+    const job = new CostRecalc(
+      (e) => pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens),
+      (costs) => store.recost((e) => costs.get(e.id))
+    )
+    job.begin(selectAll(scopedView(store, sc, f.since - 1.0), f), Date.now())
+    this.recalc = job
+    job.start()
+    return { status: 202, body: recalcJson(job.snapshot()), contentType: "application/json" }
   }
 
-  // The last recalculation, or idle when none has run since start.
-  private recalcStatus(): string {
-    const r = this.recalc
-    if (r === undefined) return JSON.stringify({ status: "idle" })
-    return jobj([jkv("id", JSON.stringify(r.id)), jkv("status", JSON.stringify("completed")), jkv("processed", jn(r.processed)), jkv("updated", jn(r.updated)), jkv("started_at", JSON.stringify(r.startedAt)), jkv("finished_at", JSON.stringify(r.finishedAt))])
+  // GET /api/logs/recalculate-cost/status: the job with ?id=, else the one in flight, else idle (Bifrost's status).
+  private recalcStatus(sp: URLSearchParams): Reply {
+    const job = this.recalc
+    const id = (sp.get("id") ?? "").trim()
+    if (id !== "") {
+      if (job === undefined || job.id() !== id) return { status: 404, body: errorJson("Job not found", "not_found_error", undefined), contentType: "application/json" }
+      return okJson(recalcJson(job.snapshot()))
+    }
+    if (job === undefined || !job.inFlight()) return okJson(JSON.stringify({ status: "idle" }))
+    return okJson(recalcJson(job.snapshot()))
+  }
+
+  // POST /api/logs/recalculate-cost/cancel: stops the job with ?id= (else the one in flight) and answers with its
+  // status. Costs already written stay. A job that finished is answered as it is.
+  private cancelRecalc(sp: URLSearchParams): Reply {
+    const job = this.recalc
+    const id = (sp.get("id") ?? "").trim()
+    if (job === undefined || (id !== "" && job.id() !== id) || (id === "" && !job.inFlight())) {
+      return { status: 404, body: errorJson("No recalculation job to cancel", "not_found_error", undefined), contentType: "application/json" }
+    }
+    return okJson(recalcJson(job.cancel()))
   }
 
   // /api/logs/user-agent-mappings: the rules that name the app behind a User-Agent. Saved in the config.
@@ -1550,12 +1614,13 @@ export class Ops {
     return okJson(JSON.stringify({ message: "Cache cleared successfully", removed: removed }))
   }
 
-  // GET /api/plugins (the configured plugins and their status), /api/plugins/{name}, /builtins and
-  // /loaded (the plugins in the live chain). Read-only: the plugin list changes through the config.
-  pluginsRoute(method: string, path: string): Reply {
-    if (method !== "GET") return { status: 405, body: errorJson("the plugin list is read-only here: change the plugins in the config", "invalid_request_error", undefined), contentType: "application/json" }
-    if (path === "/api/plugins/builtins") return okJson(JSON.stringify({ plugins: builtinPlugins() }))
-    if (path === "/api/plugins/loaded") {
+  // /api/plugins: the configured plugins and their status (GET), one by name, /builtins and /loaded (the plugins
+  // in the live chain). POST adds a plugin to the config, PUT /api/plugins/{name} changes it and DELETE removes
+  // it; each save hands the config to engine.reload, which rebuilds the live chain.
+  pluginsRoute(method: string, path: string, body: string): Reply {
+    if (path === "/api/plugins/builtins" || path === "/api/plugins/loaded") {
+      if (method !== "GET") return pluginError(405, "use GET")
+      if (path === "/api/plugins/builtins") return okJson(JSON.stringify({ plugins: builtinPlugins() }))
       const names: string[] = []
       const chain = this.engine.plugins
       if (chain !== undefined) {
@@ -1563,17 +1628,86 @@ export class Ops {
       }
       return okJson(JSON.stringify({ plugins: names }))
     }
-    const specs = this.store.cfg.plugins ?? []
     if (path === "/api/plugins") {
+      if (method === "POST") return this.createPlugin(body)
+      if (method !== "GET") return pluginError(405, "use GET or POST")
       const rows: string[] = []
-      for (const sp of specs) rows.push(pluginJson(sp))
+      for (const sp of this.store.cfg.plugins ?? []) rows.push(pluginJson(sp))
       return okJson(jobj([jkv("plugins", jarr(rows)), jkv("count", jn(rows.length))]))
     }
-    const name = path.slice("/api/plugins/".byteLength)
-    for (const sp of specs) {
+    const name = pctDecode(path.slice("/api/plugins/".byteLength)) ?? ""
+    if (name === "" || name.includes("/")) return pluginError(404, "plugin not found")
+    if (method === "PUT") return this.updatePlugin(name, body)
+    if (method === "DELETE") return this.deletePlugin(name)
+    if (method !== "GET") return pluginError(405, "use GET, PUT or DELETE")
+    for (const sp of this.store.cfg.plugins ?? []) {
       if (sp.name === name) return okJson(pluginJson(sp))
     }
-    return { status: 404, body: errorJson("plugin not found", "not_found_error", undefined), contentType: "application/json" }
+    return pluginError(404, "plugin not found")
+  }
+
+  // POST /api/plugins: {name, enabled, config}. 201 with the plugin; 409 when the name is taken; 400 when the name
+  // is missing, the config does not build, or a custom plugin path is given (this gateway has none).
+  private createPlugin(body: string): Reply {
+    let fs: Field[] = []
+    try {
+      fs = fields(body)
+    } catch (e) {
+      return pluginError(400, "Invalid request body")
+    }
+    const name = (rawStr(fs, "name") ?? "").trim()
+    if (name === "") return pluginError(400, "Plugin name is required")
+    if ((rawStr(fs, "path") ?? "") !== "") return pluginError(400, "custom plugin paths are not supported by this gateway")
+    const specs = this.store.cfg.plugins ?? []
+    for (const sp of specs) {
+      if (sp.name === name) return pluginError(409, "Plugin already exists")
+    }
+    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}") }
+    const bad = badPlugin(spec)
+    if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
+    const next: PluginSpec[] = specs.slice()
+    next.push(spec)
+    return this.savePlugins(next, 201, "Plugin created successfully", spec)
+  }
+
+  // PUT /api/plugins/{name}: changes the fields the body names (enabled, config). 404 when there is no such plugin.
+  private updatePlugin(name: string, body: string): Reply {
+    let fs: Field[] = []
+    try {
+      fs = fields(body)
+    } catch (e) {
+      return pluginError(400, "Invalid request body")
+    }
+    const specs = this.store.cfg.plugins ?? []
+    let at = -1
+    for (let i = 0; i < specs.length; i++) {
+      if (specs[i]!.name === name) at = i
+    }
+    if (at < 0) return pluginError(404, "plugin not found")
+    const cur = specs[at]!
+    const en = rawBool(fs, "enabled")
+    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}") }
+    const bad = badPlugin(spec)
+    if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
+    const next: PluginSpec[] = []
+    for (let i = 0; i < specs.length; i++) next.push(i === at ? spec : specs[i]!)
+    return this.savePlugins(next, 200, "Plugin updated successfully", spec)
+  }
+
+  // DELETE /api/plugins/{name}: removes the plugin from the config. 404 when there is no such plugin.
+  private deletePlugin(name: string): Reply {
+    const specs = this.store.cfg.plugins ?? []
+    const next = specs.filter((sp) => sp.name !== name)
+    if (next.length === specs.length) return pluginError(404, "plugin not found")
+    return this.savePlugins(next, 200, "Plugin deleted successfully", undefined)
+  }
+
+  // Saves the plugin list; the reply carries the message and, when there is one, the plugin as listed.
+  private savePlugins(next: PluginSpec[], status: int, message: string, spec: PluginSpec | undefined): Reply {
+    const saved = this.store.setPlugins(next)
+    if (saved.kind !== "ok") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
+    if (spec === undefined) return { status: status, body: JSON.stringify({ message: message }), contentType: "application/json" }
+    return { status: status, body: jobj([jkv("message", JSON.stringify(message)), jkv("plugin", pluginJson(spec))]), contentType: "application/json" }
   }
 
   // The window's start: start_time, or the end less period ("1h", "6h", "24h", "7d", "30d"), or 24 hours.
@@ -2265,10 +2399,12 @@ export class Ops {
     return { status: 200, body: JSON.stringify({ user: actor, role: role, built_in: custom === undefined, permissions: docs }), contentType: "application/json" }
   }
 
-  users(method: string, path: string, body: string, setupToken: string): Reply {
-    // Bifrost's setup gate: while no admin exists, the first account needs the operator's setup_token
+  // setupToken is the X-Bifrost-Setup-Token header and setupSession the setup session cookie (POST /api/session/setup).
+  users(method: string, path: string, body: string, setupToken: string, setupSession: string): Reply {
+    // Bifrost's setup gate: while no admin exists, the first account needs the operator's setup_token, given
+    // as the header or as a setup session from POST /api/session/setup
     const want = resolveEnv(this.store.cfg.setup_token ?? "")
-    if (method === "POST" && !this.authOn && want !== "" && setupToken !== want) {
+    if (method === "POST" && !this.authOn && want !== "" && setupToken !== want && !validSetupSession(setupSession, want, Date.now())) {
       return { status: 403, body: errorJson("the setup token is required to create the first admin account", "invalid_request_error", undefined), contentType: "application/json" }
     }
     // only stored users are managed here; legacy auth_config credentials stay in the config

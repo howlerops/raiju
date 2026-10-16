@@ -1752,8 +1752,8 @@ def l97c_e2e(env):
         check("a page of the list, ordered as asked", s == 200 and len(page.get("logs", [])) == 1 and page.get("pagination", {}).get("order") == "asc", (s, b[:200]))
         s, _, b = api("GET", "/api/logs?limit=5000")
         check("a limit above 1000 is refused", s == 400, (s, b[:200]))
-        s, _, b = api("GET", "/api/logs?selected_key_ids=k1")
-        check("a filter this gateway does not record is refused, not ignored", s == 400 and "selected_key_ids" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?agent_names=bot")
+        check("a filter this gateway does not record is refused, not ignored", s == 400 and "agent_names" in b, (s, b[:200]))
         s, _, b = api("GET", "/api/logs/stats?user_ids=user-ada")
         # every chat so far went through the key, whose user is user-ada: the three before the mappings
         check("the stats of the filtered logs, in Bifrost's shape", s == 200 and json.loads(b).get("total_requests") == 3, (s, b[:200]))
@@ -1785,12 +1785,16 @@ def l97c_e2e(env):
         check("deleting a mapping that is gone is a 404", s == 404, (s, b[:200]))
 
         s, _, b = api("POST", "/api/logs/recalculate-cost", {"filters": {"user_ids": ["user-ada"]}})
-        rc = json.loads(b) if s == 200 else {}
-        check("the cost recalculation runs to the end and reports", s == 200 and rc.get("status") == "completed" and rc.get("processed") == 4, (s, b[:200]))
+        rc = json.loads(b) if s == 202 else {}
+        check("the cost recalculation starts as a background job", s == 202 and rc.get("status") in ("pending", "running") and rc.get("id", "").startswith("recalc-"), (s, b[:200]))
+        done = poll_recalc(L97C, rc.get("id", ""), ADM)
+        check("the job walks the logs to the end and reports its counts", done.get("status") == "completed" and done.get("processed") == 4 and done.get("total") == 4, done)
+        s, _, b = api("GET", "/api/logs/recalculate-cost/status?id=" + rc.get("id", ""))
+        check("the job's status by id", s == 200 and json.loads(b).get("status") == "completed", (s, b[:200]))
         s, _, b = api("GET", "/api/logs/recalculate-cost/status")
-        check("the recalculation's status", s == 200 and json.loads(b).get("id") == rc.get("id"), (s, b[:200]))
+        check("with no job in flight the status is idle", s == 200 and json.loads(b).get("status") == "idle", (s, b[:200]))
         s, _, b = api("POST", "/api/logs/recalculate-cost/cancel")
-        check("cancelling after the run reports its status", s == 200, (s, b[:200]))
+        check("cancelling with no job in flight is a 404", s == 404, (s, b[:200]))
 
         k1 = chat({"x-bf-cache-key": "k-l97", "x-bf-session-id": "sess-cache"})
         k2 = chat({"x-bf-cache-key": "k-l97", "x-bf-session-id": "sess-cache"})
@@ -1847,7 +1851,7 @@ def l97c_e2e(env):
         s, _, b = api("GET", "/api/plugins/loaded")
         check("the plugins in the live chain", s == 200 and json.loads(b)["plugins"] == ["header"], (s, b[:200]))
         s, _, b = api("POST", "/api/plugins", {"name": "header"})
-        check("the plugin list is read-only over the API", s == 405, (s, b[:200]))
+        check("a plugin name that is already configured is a conflict", s == 409, (s, b[:200]))
         s, _, b = api("GET", "/api/plugins/nosuch")
         check("an unknown plugin is a 404", s == 404, (s, b[:200]))
 
@@ -2144,6 +2148,227 @@ def l97h_e2e(env):
         check("openrouter decision carries the safety identifier as user", len(od) > 0 and od[-1]["auth"] == "Bearer or-key" and '"user":"end-user-7"' in od[-1]["body"], od[-1:])
     finally:
         gw.terminate()
+
+
+GW_L97L = "http://127.0.0.1:18154"  # the L97l gateway: log filters and their recording, the background cost recalculation, plugin CRUD
+GW_L97L_SETUP = "http://127.0.0.1:18153"  # the setup session: the setup token traded for a cookie, then the first admin with it
+
+def l97l_config():
+    """The L97l gateway: request logs, the exact-match cache, a routing rule that sends every request to gpt-4o-mini,
+    a viewer and an admin, and a header plugin. Plugins are added and removed over the API."""
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    return {
+        "client": {"enable_logging": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l97l-logs")},
+        "cache": {"enabled": True, "ttl_seconds": 60},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l97l", "value": "sk-l97l", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l97l")},
+                      {"name": "vic", "role": "viewer", "token_sha256": tok("sk-viewer-l97l")}],
+            "virtual_keys": [{"id": "vk-l97l", "value": "sk-bf-l97l", "user_id": "user-ada"}],
+            "routing_rules": [{"id": "rule-l97l", "cel_expression": "true", "targets": [{"provider": "openai", "model": "gpt-4o-mini", "weight": 1.0}]}],
+        },
+        "plugins": [{"name": "header", "enabled": True, "config": {"set_request_headers": {"x-l97l": "1"}}}],
+    }
+
+def l97l_setup_config():
+    """The setup gateway: no admin account yet, and the setup token the first admin needs."""
+    return {
+        "setup_token": "l97l-setup",
+        "client": {"enable_logging": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l97l-s", "value": "sk-l97l-s", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+
+def l97l_chat(text, headers=None, key="sk-bf-l97l"):
+    """A chat through the L97l gateway's virtual key, with the given text (distinct texts miss the cache)."""
+    body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": text}]}
+    return call("POST", "/v1/chat/completions", body, {"authorization": "Bearer " + key, **(headers or {})}, base=GW_L97L, auth=False)
+
+def poll_recalc(base, job_id, who):
+    """Polls a cost recalculation job until it is no longer running; returns its last status (a dict, {} on error)."""
+    last = {}
+    for _ in range(600):
+        s, _, b = call("GET", "/api/logs/recalculate-cost/status?id=" + job_id, None, who, base=base, auth=False)
+        last = json.loads(b) if s == 200 else {}
+        if last.get("status") in ("completed", "cancelled", "failed"):
+            return last
+        time.sleep(0.05)
+    return last
+
+def l97l_e2e(env):
+    """L97l: the setup session (the setup token traded for a cookie that creates the first admin), the log filters
+    the gateway now records (selected key, routing rule, routing engine, stop reason, alias, parent and correlation ids,
+    roots and sessions, complexity tier, cache hit type) and the stats that count them, the background cost
+    recalculation with progress, status and cancel, and plugin CRUD that changes the live chain."""
+    cfg_a = os.path.join(BUILD, "e2e.l97l.json")
+    cfg_b = os.path.join(BUILD, "e2e.l97l-setup.json")
+    with open(cfg_a, "w") as f:
+        json.dump(l97l_config(), f)
+    with open(cfg_b, "w") as f:
+        json.dump(l97l_setup_config(), f)
+    import shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l97l-logs"), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18154", "-host", "127.0.0.1", "-config", cfg_a], env=env, stderr=open(os.path.join(BUILD, "e2e.l97l.log"), "w"))
+    gw_s = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18153", "-host", "127.0.0.1", "-config", cfg_b], env=env, stderr=open(os.path.join(BUILD, "e2e.l97l-setup.log"), "w"))
+    ADM = {"authorization": "Bearer sk-admin-l97l"}
+    VIC = {"authorization": "Bearer sk-viewer-l97l"}
+    def api(method, p, body=None, who=ADM):
+        return call(method, p, body, who, base=GW_L97L, auth=False)
+    try:
+        wait(GW_L97L + "/health")
+        wait(GW_L97L_SETUP + "/health")
+
+        # ---- the setup session ----
+        s, _, b = call("POST", "/api/session/setup", None, None, base=GW_L97L_SETUP, auth=False)
+        check("the setup session needs the setup token", s == 403 and "setup token" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/session/setup", None, {"x-bifrost-setup-token": "wrong"}, base=GW_L97L_SETUP, auth=False)
+        check("a wrong setup token gets no session", s == 403, (s, b[:200]))
+        s, h, b = call("POST", "/api/session/setup", None, {"x-bifrost-setup-token": "l97l-setup"}, base=GW_L97L_SETUP, auth=False)
+        cookie = hdr(h, "set-cookie") or ""
+        check("the setup token trades for an HttpOnly setup session cookie with an expiry", s == 200 and cookie.startswith("bifrost_setup_session=") and "HttpOnly" in cookie and "SameSite=Strict" in cookie and "expires_at" in b, (s, cookie[:120], b[:200]))
+        value = cookie.split(";")[0].split("=", 1)[1] if cookie != "" else ""
+        s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
+        check("the setup session cookie creates the first admin without the token", s in (200, 201), (s, b[:200]))
+        s, _, b = call("POST", "/api/session/setup", None, {"x-bifrost-setup-token": "l97l-setup"}, base=GW_L97L_SETUP, auth=False)
+        check("once an admin exists the setup lock is not active", s == 409, (s, b[:200]))
+        s, _, b = call("GET", "/api/session/is-auth-enabled", None, None, base=GW_L97L_SETUP, auth=False)
+        check("the setup gateway now reports that setup is done", json.loads(b).get("setup_required") is False, b[:200])
+
+        # ---- logs with the fields the filters name ----
+        c1 = l97l_chat("first request", {"x-request-id": "root-l97l-1", "x-bf-session-id": "sess-l97l", "x-bf-agent-correlation-id": "agent-l97l"})
+        c2 = l97l_chat("child request", {"x-bf-session-id": "sess-l97l", "x-bf-parent-request-id": "root-l97l-1"})
+        c3 = l97l_chat("cached request", {"x-bf-cache-key": "k-l97l", "x-bf-session-id": "sess-l97l"})
+        c4 = l97l_chat("cached request", {"x-bf-cache-key": "k-l97l", "x-bf-session-id": "sess-l97l"})
+        check("the requests behind the log are served, and the second identical one is a cache hit", c1[0] == 200 and c2[0] == 200 and c3[0] == 200 and c4[0] == 200 and hdr(c4[1], "x-bf-cache") == "hit", (c1[0], c2[0], c3[0], c4[0]))
+        s, _, b = api("GET", "/api/logs?session_id=sess-l97l&limit=100")
+        rows = json.loads(b).get("logs", []) if s == 200 else []
+        check("the session's requests are listed with their recorded routing fields", s == 200 and len(rows) == 4 and all(r.get("routing_rule_id") == "rule-l97l" and r.get("routing_engine_used") == "routing-rule" for r in rows), (s, b[:300]))
+        # the cache hit answered without a key: only the three requests that reached the provider have one
+        kid = next((r.get("selected_key_id") for r in rows if not r.get("cache_hit")), None)
+        check("the selected key is recorded on each request that reached the provider", isinstance(kid, str) and kid != "", (kid, b[:200]))
+        s, _, b = api("GET", "/api/logs?selected_key_ids=" + str(kid) + "&session_id=sess-l97l")
+        check("the selected key filter selects the rows that key served", s == 200 and json.loads(b)["total"] == 3, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?selected_key_ids=no-such-key&session_id=sess-l97l")
+        check("a selected key no request used selects nothing", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?routing_rule_ids=rule-l97l&routing_engine_used=routing-rule&session_id=sess-l97l")
+        check("the routing rule and engine filters select the rule's requests", s == 200 and json.loads(b)["total"] == 4, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?routing_engine_used=loadbalancing&session_id=sess-l97l")
+        check("the routing engine filter excludes other engines", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?stop_reasons=stop&session_id=sess-l97l")
+        check("the stop reason filter selects the answers that stopped", s == 200 and json.loads(b)["total"] == 4, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?stop_reasons=length&session_id=sess-l97l")
+        check("a stop reason no answer has selects nothing", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?cache_hit_types=direct&session_id=sess-l97l")
+        check("the cache hit type filter selects the direct hit", s == 200 and json.loads(b)["total"] == 1, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?cache_hit_types=semantic&session_id=sess-l97l")
+        check("no semantic hit was recorded", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?parent_request_id=root-l97l-1")
+        check("the parent request filter selects the child", s == 200 and json.loads(b)["total"] == 1, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?agent_correlation_id=agent-l97l")
+        check("the agent correlation filter selects the request that named it", s == 200 and json.loads(b)["total"] == 1, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?roots_only=true&session_id=sess-l97l")
+        roots = json.loads(b).get("logs", []) if s == 200 else []
+        check("roots_only lists the root and hides the child of a row in the selection", s == 200 and any(r.get("request_id") == "root-l97l-1" for r in roots) and not any(r.get("parent_request_id") == "root-l97l-1" for r in roots), (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?roots_only=true&group_sessions=true&limit=1000")
+        grouped = json.loads(b).get("logs", []) if s == 200 else []
+        mine = [r for r in grouped if r.get("session_id") == "sess-l97l"]
+        check("group_sessions keeps one row per session: its earliest root", len(mine) == 1 and mine[0].get("request_id") == "root-l97l-1", (s, len(mine), b[:200]))
+        s, _, b = api("GET", "/api/logs?complexity_tiers=SIMPLE&complexity_mechanisms=heuristic")
+        check("the complexity filters are accepted (no complexity router here: none recorded)", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs?agent_names=bot")
+        check("agent names are still refused: this gateway has no registered agents", s == 400 and "agent_names" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/logs/stats?session_id=sess-l97l")
+        st = json.loads(b) if s == 200 else {}
+        check("the stats count the cache hit rate's requests and the hits by type", st.get("cache_hit_rate_total_requests") == 4 and st.get("direct_cache_hits") == 1 and st.get("semantic_cache_hits") == 0, (s, b[:300]))
+
+        # ---- background cost recalculation ----
+        bulk_fail = 0
+        for i in range(1030):
+            r = l97l_chat("bulk %d" % i, {"x-bf-session-id": "sess-bulk-l97l"})
+            if r[0] != 200:
+                bulk_fail += 1
+        check("a batch of requests is served for the recalculation to walk", bulk_fail == 0, bulk_fail)
+        s, _, b = api("GET", "/api/logs/stats")
+        total = json.loads(b).get("total_requests", -1) if s == 200 else -1
+        s, _, b = api("POST", "/api/logs/recalculate-cost", {"filters": {"providers": ["openai"]}})
+        job = json.loads(b) if s == 202 else {}
+        check("the cost recalculation answers at once with a job", s == 202 and job.get("status") in ("pending", "running") and job.get("id", "").startswith("recalc-") and job.get("total") == total, (s, b[:200], total))
+        done = poll_recalc(GW_L97L, job.get("id", ""), ADM)
+        check("the job walks every log to the end, with its counts", done.get("status") == "completed" and done.get("processed") == total and done.get("updated", 0) + done.get("skipped", 0) == total and done.get("message", "").startswith("Recalculated"), (done,))
+        s, _, b = api("POST", "/api/logs/recalculate-cost", {"filters": {"user_ids": ["nobody-l97l"]}})
+        empty = json.loads(b) if s == 202 else {}
+        done = poll_recalc(GW_L97L, empty.get("id", ""), ADM)
+        check("a selection with no logs completes with nothing recalculated", s == 202 and done.get("status") == "completed" and done.get("total") == 0 and done.get("message") == "Recalculated 0 cost value(s); 0 skipped.", (s, done))
+        s, _, b = api("POST", "/api/logs/recalculate-cost", {"filters": {"providers": ["openai"]}})
+        again = json.loads(b) if s == 202 else {}
+        s, _, b = api("POST", "/api/logs/recalculate-cost/cancel?id=" + again.get("id", ""))
+        cancelled = json.loads(b) if s == 200 else {}
+        check("a cancel answers with the job's status, whether it stopped or had finished", s == 200 and cancelled.get("id") == again.get("id") and cancelled.get("status") in ("cancelled", "completed"), (s, b[:200]))
+        done = poll_recalc(GW_L97L, again.get("id", ""), ADM)
+        check("a cancelled job stays cancelled and a finished one stays finished", done.get("status") == cancelled.get("status") and done.get("status") in ("cancelled", "completed"), (done, cancelled))
+        s, _, b = api("GET", "/api/logs/recalculate-cost/status?id=recalc-nope")
+        check("the status of an unknown job is a 404", s == 404, (s, b[:200]))
+        s, _, b = api("POST", "/api/logs/recalculate-cost", "{not json")
+        check("a recalculation body that is not JSON is refused", s == 400 and "Invalid JSON" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/logs/recalculate-cost", {"filters": {"providers": ["openai"]}}, who=VIC)
+        check("a viewer may not start a recalculation", s == 403, (s, b[:200]))
+
+        # ---- plugin CRUD and the live chain ----
+        s, _, b = api("GET", "/api/plugins")
+        check("the configured plugins at start: the header plugin only", s == 200 and json.loads(b).get("count") == 1, (s, b[:200]))
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True, "config": {"words": ["forbidden-l97l"]}})
+        created = json.loads(b) if s == 201 else {}
+        check("a plugin is added to the config and the live chain", s == 201 and created.get("plugin", {}).get("name") == "blocklist" and created.get("plugin", {}).get("status", {}).get("status") == "active", (s, b[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True})
+        check("adding a plugin twice is a conflict", s == 409, (s, b[:200]))
+        s, _, b = api("POST", "/api/plugins", {"name": "nosuch-l97l", "enabled": True})
+        check("a plugin this gateway does not build is refused", s == 400 and "unknown plugin" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/plugins", {"enabled": True})
+        check("a plugin needs a name", s == 400 and "name" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/plugins", {"name": "x-l97l", "path": "/tmp/x.so"})
+        check("a custom plugin path is refused", s == 400 and "custom plugin" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True}, who=VIC)
+        check("a viewer may not add a plugin", s == 403, (s, b[:200]))
+        s, _, b = api("GET", "/api/plugins/loaded")
+        check("the live chain has the new plugin", s == 200 and "blocklist" in json.loads(b)["plugins"] and "header" in json.loads(b)["plugins"], (s, b[:200]))
+        blocked = l97l_chat("a forbidden-l97l word")
+        check("the new plugin refuses a request with a blocked word", blocked[0] == 400 and "blocked" in blocked[2], (blocked[0], blocked[2][:200]))
+        with open(cfg_a) as f:
+            saved = json.load(f)
+        check("the plugin is persisted in the config file", any(p.get("name") == "blocklist" for p in saved.get("plugins", [])), [p.get("name") for p in saved.get("plugins", [])])
+        s, _, b = api("PUT", "/api/plugins/blocklist", {"enabled": False})
+        check("a plugin is switched off", s == 200 and json.loads(b).get("plugin", {}).get("enabled") is False, (s, b[:200]))
+        passed = l97l_chat("a forbidden-l97l word, switched off")
+        check("a switched-off plugin no longer refuses", passed[0] == 200, (passed[0], passed[2][:200]))
+        s, _, b = api("GET", "/api/plugins/loaded")
+        check("a switched-off plugin leaves the live chain", s == 200 and "blocklist" not in json.loads(b)["plugins"], (s, b[:200]))
+        s, _, b = api("PUT", "/api/plugins/blocklist", {"enabled": True})
+        blocked = l97l_chat("a forbidden-l97l word, switched on again")
+        check("a switched-on plugin refuses again", s == 200 and blocked[0] == 400, (s, blocked[0]))
+        s, _, b = api("PUT", "/api/plugins/nosuch-l97l", {"enabled": True})
+        check("changing a plugin that is not configured is a 404", s == 404, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/plugins/blocklist")
+        check("a plugin is removed", s == 200, (s, b[:200]))
+        s, _, b = api("GET", "/api/plugins/blocklist")
+        check("a removed plugin is gone", s == 404, (s, b[:200]))
+        after = l97l_chat("a forbidden-l97l word, after the removal")
+        check("a removed plugin no longer refuses", after[0] == 200, (after[0], after[2][:200]))
+        with open(cfg_a) as f:
+            saved = json.load(f)
+        check("the removal is persisted", all(p.get("name") != "blocklist" for p in saved.get("plugins", [])), [p.get("name") for p in saved.get("plugins", [])])
+        s, _, b = api("DELETE", "/api/plugins/blocklist")
+        check("removing a plugin twice is a 404", s == 404, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+        gw_s.terminate()
+        gw_s.wait()
 
 
 def unique_ports():
@@ -4378,6 +4603,8 @@ def main():
         l97h_e2e(env)
         # the governance remainder: quota, budget overrides, routing rules, roles, catalogue and PUT /api/config sections
         l97j_e2e(env)
+        # the setup session, the log filters the gateway records, the background cost recalculation and plugin CRUD: their own gateways
+        l97l_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

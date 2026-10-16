@@ -53,7 +53,7 @@ import { JobStore } from "./jobs"
 import { PluginChain, PluginContext, buildChain } from "./plugins"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline } from "./deadline"
-import { logMetadata, correlationIds, maximAttrs } from "./reqlog"
+import { logMetadata, correlationIds, maximAttrs, stopReasonOf } from "./reqlog"
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 
@@ -809,6 +809,9 @@ class ReqCtx {
   meta: Record<string, string> | undefined = undefined
   parentId = ""
   agentId = ""
+  // the local cache hit ("direct" or "semantic") and the stop reason of the answer, for the request log
+  cacheType = ""
+  stopReason = ""
   app = ""
   maximIds: Record<string, string> | undefined = undefined
   maximTags: Record<string, string> | undefined = undefined
@@ -1139,14 +1142,15 @@ export class Engine {
 
   // The complexity tier of a chat request: the configured classifier's, or the heuristic's when the
   // classifier names none (no decision model, no embedding, a timeout, or an unparseable answer).
-  async tierFor(req: Request, text: string, cx: ComplexitySettings): Promise<Tier> {
+  async tierFor(req: Request, text: string, cx: ComplexitySettings): Promise<{ tier: Tier, mechanism: string }> {
     const mode = cplx.classifierMode(cx.classifier)
-    if (mode === "heuristic") return this.tierOf(text, cx)
+    if (mode === "heuristic") return { tier: this.tierOf(text, cx), mechanism: "heuristic" }
     let t: Tier | undefined = undefined
     if (mode === "decision") t = await cplx.decisionTier(text, cx.decision, async (b: string, ph: string) => await this.classifierCall(req, "/v1/decisions", b, ph))
     else if (mode === "llm") t = await cplx.llmTier(text, cx.llm, async (b: string, ph: string) => await this.classifierCall(req, "/v1/chat/completions", b, ph))
     else t = await cplx.semanticTier(text, cx.semantic, async (b: string, ph: string) => await this.classifierCall(req, "/v1/embeddings", b, ph))
-    return t ?? this.tierOf(text, cx)
+    if (t !== undefined) return { tier: t, mechanism: mode }
+    return { tier: this.tierOf(text, cx), mechanism: "heuristic" }
   }
 
   // A classifier's own call, answered by the route it names with the caller's headers. The chat
@@ -1232,6 +1236,8 @@ export class Engine {
         tl.fallbackIndex = "" + Math.max(0, refIndex)
         tl.selectedKeyId = t.key.id ?? ""
         tl.selectedKeyName = t.key.name ?? ""
+        // labels are values: the copy with the key goes back to the request, for the metrics and the request log
+        ctx.labels = tl
         if (t.kind === "watsonx") {
           const tok = await this.watsonxToken(t)
           if (tok.error !== "") {
@@ -1920,12 +1926,20 @@ export class Engine {
     const tRoute = performance.now()
     // complexity tier: for routing rules (complexity_tier) and the tier map behind model "auto"
     let tier: Tier | undefined = undefined
+    // how the tier was decided, for the request log: a classifier's name, "heuristic" or "override"
+    let mechanism = ""
     const cx = this.complexity
     if (cx !== undefined && op === "chat") {
       const forced = overrideTier(h)
-      const t: Tier = forced !== undefined ? forced : await this.tierFor(req, text, cx)
-      tier = t
-      out.set("x-bf-complexity-tier", t)
+      if (forced !== undefined) {
+        tier = forced
+        mechanism = "override"
+      } else {
+        const d = await this.tierFor(req, text, cx)
+        tier = d.tier
+        mechanism = d.mechanism
+      }
+      out.set("x-bf-complexity-tier", tier ?? "MEDIUM")
     }
     // a bare model name resolves through keys, then the catalog, preferring the SDK route's provider
     let refs = [parseModelVia(this.cfg, model, routeOf(op))].concat(fallbackRefs(this.cfg, body))
@@ -1984,9 +1998,13 @@ export class Engine {
     const ruleName = out.get("x-bf-routing-rule")
     if (ruleName !== undefined && ruleName !== "") {
       rl.routingRuleName = ruleName
+      rl.routingRuleId = ruleName
       rl.routingEngineUsed = "routing_rule"
     }
-    if (tier !== undefined) rl.complexityTier = tier
+    if (tier !== undefined) {
+      rl.complexityTier = tier
+      rl.complexityMechanism = mechanism
+    }
     if (tier !== undefined || (ruleName !== undefined && ruleName !== "")) {
       metrics.observeRouting(ruleName !== undefined && ruleName !== "" ? "routing_rule" : "complexity", tier ?? "", ruleName ?? "")
     }
@@ -2030,6 +2048,8 @@ export class Engine {
         originHeaders(&out, hit.origin)
         out.set("content-type", hit.contentType)
         ctx.cached = true
+        ctx.cacheType = "direct"
+        if (this.logStore !== undefined) ctx.stopReason = stopReasonOf(hit.body)
         ctx.output = hit.body
         return respond(200, hit.body, out)
       }
@@ -2058,6 +2078,7 @@ export class Engine {
             originHeaders(&out, hit.origin)
             out.set("content-type", hit.contentType)
             ctx.cached = true
+            ctx.cacheType = "semantic"
             return respond(200, hit.body, out)
           }
         }
@@ -2153,7 +2174,10 @@ export class Engine {
     ctx.promptTokens = r.promptTokens
     ctx.completionTokens = r.completionTokens
     ctx.cost = cost
-    if (this.logStore !== undefined) ctx.output = r.body
+    if (this.logStore !== undefined) {
+      ctx.output = r.body
+      ctx.stopReason = stopReasonOf(r.body)
+    }
     return respond(200, r.body, out)
   }
 
@@ -2258,7 +2282,22 @@ export class Engine {
       for (const q of this.exportQueues) q.add(e)
     }
     if (store !== undefined) {
+      // the routing the request took (the labels hold the key, the rule and the tier; the engine is the rule's
+      // when one matched, else the key picked by weight)
+      const lb = c.labels
+      // a key configured without an id is recorded by its name
+      const keyRef = lb.selectedKeyId !== "" ? lb.selectedKeyId : lb.selectedKeyName
+      const engine = lb.routingRuleId !== "" ? "routing-rule" : keyRef !== "" ? "loadbalancing" : ""
       store.add({
+        selected_key_id: keyRef === "" ? undefined : keyRef,
+        selected_key_name: lb.selectedKeyName === "" ? undefined : lb.selectedKeyName,
+        routing_rule_id: lb.routingRuleId === "" ? undefined : lb.routingRuleId,
+        routing_engine_used: engine === "" ? undefined : engine,
+        alias: lb.alias === "" ? undefined : lb.alias,
+        complexity_tier: lb.complexityTier === "" ? undefined : lb.complexityTier,
+        complexity_mechanism: lb.complexityMechanism === "" ? undefined : lb.complexityMechanism,
+        cache_hit_type: c.cacheType === "" ? undefined : c.cacheType,
+        stop_reason: c.stopReason === "" ? undefined : c.stopReason,
         raw_request: c.contentOff || c.rawRequest === "" ? undefined : this.redactRaw(c.rawRequest),
         raw_response: c.contentOff || c.rawResponse === "" ? undefined : this.redactRaw(c.rawResponse),
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,

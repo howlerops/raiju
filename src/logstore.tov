@@ -49,6 +49,18 @@ export type LogEntry = {
   // Maxim trace attributes the caller named (x-bf-maxim-*): the reserved ids and names, and the tags
   maxim?: Record<string, string>,
   maxim_tags?: Record<string, string>,
+  // how the request was routed: the key that served it, the routing rule that matched (its id) and the
+  // engine that chose the target, the model alias the caller named, the complexity tier and how it was
+  // classified, the local cache hit ("direct" or "semantic") and the stop reason of the answer
+  selected_key_id?: string,
+  selected_key_name?: string,
+  routing_rule_id?: string,
+  routing_engine_used?: string,
+  alias?: string,
+  complexity_tier?: string,
+  complexity_mechanism?: string,
+  cache_hit_type?: string,
+  stop_reason?: string,
 }
 
 export type LogStoreConfig = {
@@ -506,6 +518,15 @@ export class LogStore {
       agent_correlation_id: e.agent_correlation_id,
       maxim: e.maxim,
       maxim_tags: e.maxim_tags,
+      selected_key_id: e.selected_key_id,
+      selected_key_name: e.selected_key_name,
+      routing_rule_id: e.routing_rule_id,
+      routing_engine_used: e.routing_engine_used,
+      alias: e.alias,
+      complexity_tier: e.complexity_tier,
+      complexity_mechanism: e.complexity_mechanism,
+      cache_hit_type: e.cache_hit_type,
+      stop_reason: e.stop_reason,
     }
   }
 
@@ -597,6 +618,18 @@ export type Filter = {
   max_cost: f64,
   text: string,
   request_id: string,
+  selectedKeys: string[],
+  routingRules: string[],
+  routingEngines: string[],
+  stopReasons: string[],
+  aliases: string[],
+  complexityTiers: string[],
+  complexityMechanisms: string[],
+  cacheHitTypes: string[],
+  parentId: string, // exact parent_request_id
+  correlationId: string, // exact agent_correlation_id
+  rootsOnly: bool, // see applyChains
+  groupSessions: bool, // see applyChains
 }
 
 function listParam(v: string | undefined): string[] {
@@ -651,7 +684,26 @@ export function filterFrom(sp: URLSearchParams, kind: string, since: f64, until:
     max_cost: numParam(sp, "max_cost"),
     text: sp.get("content_search") ?? sp.get("text") ?? "",
     request_id: sp.get("request_id") ?? "",
+    selectedKeys: listParam(sp.get("selected_key_ids") ?? undefined),
+    routingRules: listParam(sp.get("routing_rule_ids") ?? undefined),
+    routingEngines: listParam(sp.get("routing_engine_used") ?? undefined),
+    stopReasons: listParam(sp.get("stop_reasons") ?? undefined),
+    aliases: listParam(sp.get("aliases") ?? undefined),
+    complexityTiers: listParam(sp.get("complexity_tiers") ?? undefined),
+    complexityMechanisms: listParam(sp.get("complexity_mechanisms") ?? undefined),
+    cacheHitTypes: listParam(sp.get("cache_hit_types") ?? undefined),
+    parentId: (sp.get("parent_request_id") ?? "").trim(),
+    correlationId: (sp.get("agent_correlation_id") ?? "").trim(),
+    rootsOnly: sp.get("roots_only") === "true",
+    groupSessions: sp.get("group_sessions") === "true",
   }
+}
+
+// How a request was answered from the local cache: "direct" or "semantic". Entries logged before
+// cache_hit_type was recorded and marked as hits were exact-match hits.
+export function hitTypeOf(e: LogEntry): string {
+  if (e.cache_hit_type !== undefined && e.cache_hit_type !== "") return e.cache_hit_type
+  return e.cache_hit ? "direct" : ""
 }
 
 // Whether an entry has one of the statuses a filter names: success (2xx), cancelled (499) or error (the rest).
@@ -691,7 +743,57 @@ export function selects(e: LogEntry, f: Filter): bool {
   if (f.max_cost >= 0.0 && e.cost > f.max_cost) return false
   if (f.request_id !== "" && e.request_id !== f.request_id) return false
   if (f.text !== "" && !mentions(e, f.text)) return false
+  if (f.selectedKeys.length > 0 && !f.selectedKeys.includes(e.selected_key_id ?? "")) return false
+  if (f.routingRules.length > 0 && !f.routingRules.includes(e.routing_rule_id ?? "")) return false
+  if (f.routingEngines.length > 0 && !f.routingEngines.includes(e.routing_engine_used ?? "")) return false
+  if (f.stopReasons.length > 0 && !f.stopReasons.includes(e.stop_reason ?? "")) return false
+  if (f.aliases.length > 0 && !f.aliases.includes(e.alias ?? "")) return false
+  if (f.complexityTiers.length > 0 && !f.complexityTiers.includes(e.complexity_tier ?? "")) return false
+  if (f.complexityMechanisms.length > 0 && !f.complexityMechanisms.includes(e.complexity_mechanism ?? "")) return false
+  if (f.cacheHitTypes.length > 0 && !f.cacheHitTypes.includes(hitTypeOf(e))) return false
+  if (f.parentId !== "" && e.parent_request_id !== f.parentId) return false
+  if (f.correlationId !== "" && e.agent_correlation_id !== f.correlationId) return false
   return true
+}
+
+// Chains and sessions (Bifrost's roots_only and group_sessions). roots_only hides a row whose
+// parent_request_id names another row of the same selection, so a chain lists as its root. group_sessions,
+// with roots_only, keeps one row per session: the session's earliest root. A parent filter ends roots_only,
+// as Bifrost's does, and a session or request id filter ends group_sessions.
+export function applyChains(es: LogEntry[], f: Filter): LogEntry[] {
+  if (!f.rootsOnly || f.parentId !== "") return es
+  const ids: Set<string> = new Set()
+  for (const e of es) ids.add(e.request_id)
+  const roots: LogEntry[] = []
+  for (const e of es) {
+    const p = e.parent_request_id ?? ""
+    if (p !== "" && ids.has(p)) continue
+    roots.push(e)
+  }
+  if (!f.groupSessions || f.sessionId !== "" || f.request_id !== "") return roots
+  // the earliest root of each session, by its id and time
+  const firstId: Map<string, string> = new Map()
+  const firstTs: Map<string, f64> = new Map()
+  for (const e of roots) {
+    const s = e.session_id ?? ""
+    if (s === "") continue
+    const ts = firstTs.get(s)
+    if (ts === undefined || e.ts < ts) {
+      firstTs.set(s, e.ts)
+      firstId.set(s, e.id)
+    }
+  }
+  const out: LogEntry[] = []
+  for (const e of roots) {
+    const s = e.session_id ?? ""
+    if (s === "") {
+      out.push(e)
+      continue
+    }
+    const keep = firstId.get(s)
+    if (keep !== undefined && keep === e.id) out.push(e)
+  }
+  return out
 }
 
 // Whether a data access scope may see an entry: by the team, business unit, customer or project it is attributed to.
@@ -1017,7 +1119,8 @@ export function statsView(es: LogEntry[]): string {
   let completion = 0
   let cost = 0.0
   let latency = 0.0
-  let cached = 0
+  let direct = 0
+  let semantic = 0
   for (const e of es) {
     n += 1
     if (!isSuccess(e)) errors += 1
@@ -1026,7 +1129,9 @@ export function statsView(es: LogEntry[]): string {
     tokens += e.prompt_tokens + e.completion_tokens
     cost += e.cost
     latency += e.latency_ms
-    if (e.cache_hit) cached += 1
+    const hit = hitTypeOf(e)
+    if (hit === "direct") direct += 1
+    else if (hit === "semantic") semantic += 1
   }
   const rate = n > 0 ? (100.0 * (n - errors)) / n : 0.0
   const avg = n > 0 ? latency / n : 0.0
@@ -1041,7 +1146,9 @@ export function statsView(es: LogEntry[]): string {
     jkv("prompt_tokens", jn(prompt)),
     jkv("completion_tokens", jn(completion)),
     jkv("total_cost", jn(cost)),
-    jkv("direct_cache_hits", jn(cached)),
+    jkv("cache_hit_rate_total_requests", jn(n)),
+    jkv("direct_cache_hits", jn(direct)),
+    jkv("semantic_cache_hits", jn(semantic)),
     jkv("requests", jn(n)),
     jkv("errors", jn(errors)),
     jkv("tokens", jn(tokens)),
@@ -1557,6 +1664,86 @@ test("filters: status, providers, text, bounds and the window", () => {
   mcp.kind = "mcp"
   expect(selects(mcp, f)).toBe(false)
   expect(selects(mcp, filterFrom(new URLSearchParams(""), "mcp", 0.0, 1000.0))).toBe(true)
+})
+
+test("routing, cache, stop and chain filters select the recorded fields", () => {
+  const a = sample("c1", 500.0, "m", 200, { provider: "openai" })
+  a.request_id = "r1"
+  a.selected_key_id = "key-1"
+  a.routing_rule_id = "rule-x"
+  a.routing_engine_used = "routing-rule"
+  a.alias = "fast"
+  a.complexity_tier = "SIMPLE"
+  a.complexity_mechanism = "heuristic"
+  a.cache_hit_type = "semantic"
+  a.stop_reason = "stop"
+  a.parent_request_id = "p0"
+  a.agent_correlation_id = "agent-7"
+  const b = sample("c2", 600.0, "m", 200, { provider: "openai" })
+  b.request_id = "r2"
+  b.selected_key_id = "key-2"
+  b.parent_request_id = "r1"
+  b.session_id = "s1"
+  a.session_id = "s1"
+  const es: LogEntry[] = [a, b]
+  expect(idsOf(es, "selected_key_ids=key-1").join(",")).toBe("c1")
+  expect(idsOf(es, "routing_rule_ids=rule-x").join(",")).toBe("c1")
+  expect(idsOf(es, "routing_engine_used=loadbalancing").length).toBe(0)
+  expect(idsOf(es, "stop_reasons=stop,length").join(",")).toBe("c1")
+  expect(idsOf(es, "aliases=fast").join(",")).toBe("c1")
+  expect(idsOf(es, "complexity_tiers=SIMPLE").join(",")).toBe("c1")
+  expect(idsOf(es, "complexity_mechanisms=heuristic").join(",")).toBe("c1")
+  expect(idsOf(es, "cache_hit_types=semantic").join(",")).toBe("c1")
+  expect(idsOf(es, "cache_hit_types=direct").length).toBe(0)
+  expect(idsOf(es, "parent_request_id=p0").join(",")).toBe("c1")
+  expect(idsOf(es, "agent_correlation_id=agent-7").join(",")).toBe("c1")
+  expect(idsOf(es, "agent_correlation_id=agent").length).toBe(0)
+})
+
+// The ids of the entries a query selects, in order (a top-level helper, so the tests capture nothing).
+function idsOf(es: LogEntry[], q: string): string[] {
+  return selectAll(es, filterFrom(new URLSearchParams(q), "llm", 0.0, 1000.0)).map((e) => e.id)
+}
+
+test("a cache hit without a recorded type is a direct hit, and the stats count both kinds", () => {
+  const old = sample("h1", 500.0, "m", 200, {})
+  old.cache_hit = true
+  const sem = sample("h2", 500.0, "m", 200, {})
+  sem.cache_hit = true
+  sem.cache_hit_type = "semantic"
+  const miss = sample("h3", 500.0, "m", 200, {})
+  expect(hitTypeOf(old)).toBe("direct")
+  expect(hitTypeOf(sem)).toBe("semantic")
+  expect(hitTypeOf(miss)).toBe("")
+  const v = statsView([old, sem, miss])
+  expect(v.includes(`"cache_hit_rate_total_requests":3`)).toBe(true)
+  expect(v.includes(`"direct_cache_hits":1`)).toBe(true)
+  expect(v.includes(`"semantic_cache_hits":1`)).toBe(true)
+})
+
+test("roots_only hides chained rows; group_sessions keeps each session's earliest root", () => {
+  const root = sample("g1", 100.0, "m", 200, {})
+  root.request_id = "R1"
+  root.session_id = "S"
+  const child = sample("g2", 200.0, "m", 200, {})
+  child.request_id = "R2"
+  child.parent_request_id = "R1"
+  child.session_id = "S"
+  const root2 = sample("g3", 300.0, "m", 200, {})
+  root2.request_id = "R3"
+  root2.session_id = "S"
+  const other = sample("g4", 400.0, "m", 200, {})
+  other.request_id = "R4"
+  const all = [root, child, root2, other]
+  const plain = filterFrom(new URLSearchParams(""), "llm", 0.0, 1000.0)
+  expect(applyChains(all, plain).length).toBe(4)
+  const roots = filterFrom(new URLSearchParams("roots_only=true"), "llm", 0.0, 1000.0)
+  expect(applyChains(all, roots).map((e) => e.id).join(",")).toBe("g1,g3,g4")
+  const grouped = filterFrom(new URLSearchParams("roots_only=true&group_sessions=true"), "llm", 0.0, 1000.0)
+  expect(applyChains(all, grouped).map((e) => e.id).join(",")).toBe("g1,g4")
+  // a parent filter ends roots_only: the chain's children are listed
+  const kids = filterFrom(new URLSearchParams("roots_only=true&parent_request_id=R1"), "llm", 0.0, 1000.0)
+  expect(applyChains(selectAll(all, kids), kids).map((e) => e.id).join(",")).toBe("g2")
 })
 
 test("MCP tool executions share the store but not the LLM views", () => {
