@@ -25,10 +25,12 @@ import { ConfigStore, checkAdmin, sweepExpiredKeys, RESOURCES, OPERATIONS } from
 import { keyBudgetIds, permissionDocs, permissionIds, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
+// POST /api/governance/access-profiles/{id}/roles: the roles to attach (Bifrost's AttachRolesRequest).
+type RoleAttachBody = { role_ids?: int[], is_default?: bool, apply_to_existing?: bool }
 type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
 type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, roleIdOf } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
@@ -1713,7 +1715,7 @@ export class Ops {
     const f = listFilter(recalcQuery(rb.filters), Date.now())
     const pricing = this.engine.pricing
     const job = new CostRecalc(
-      (e) => pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens),
+      (e) => (e.op === "decisions" ? pricing.decisionCost(e.provider, e.model, e.prompt_tokens, e.completion_tokens) : pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens)),
       (costs) => store.recost((e) => costs.get(e.id))
     )
     job.begin(selectAll(scopedView(store, sc, f.since - 1.0), f), Date.now())
@@ -2697,7 +2699,7 @@ export class Ops {
   // GET /api/users/me/vk-creation-policy: the access profile that governs keys the caller creates.
   vkCreationPolicy(actor: string): Reply {
     const g = this.store.cfg.governance
-    return { status: 200, body: creationPolicy(g?.users, g?.access_profiles, actor), contentType: "application/json" }
+    return { status: 200, body: creationPolicy(g?.users, g?.roles, g?.access_profiles, actor), contentType: "application/json" }
   }
 
   // /api/users/{name}/access-profiles: GET lists the profiles the user holds; PUT and DELETE
@@ -2712,7 +2714,7 @@ export class Ops {
     const g = this.store.cfg.governance
     if (segs.length === 4) {
       if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
-      const held = heldProfiles(g?.users, g?.access_profiles, name)
+      const held = heldProfiles(g?.users, g?.roles, g?.access_profiles, name)
       return { status: 200, body: JSON.stringify({ access_profiles: held }), contentType: "application/json" }
     }
     const add = method === "PUT"
@@ -2741,11 +2743,52 @@ export class Ops {
     return { status: r.status, body: r.body, contentType: "application/json" }
   }
 
+  // /api/governance/access-profiles/{id}/roles: POST attaches roles ({"role_ids": [...], "is_default": bool});
+  // DELETE .../roles/{role_id} detaches one. Every user holding one of the roles holds the profile, so the
+  // reply counts those users as users_applied.
+  profileRoles(method: string, segs: string[], body: string): Reply {
+    const id = segs[3] ?? ""
+    if (segs.length === 5 && method === "POST") {
+      let b: RoleAttachBody = {}
+      try {
+        b = JSON.parse(body) as RoleAttachBody
+      } catch (e) {
+        return { status: 400, body: errorJson("body must be a JSON object with role_ids", "invalid_request_error", undefined), contentType: "application/json" }
+      }
+      const ids: int[] = b.role_ids ?? []
+      if (ids.length === 0) return { status: 400, body: errorJson("role_ids is required", "invalid_request_error", undefined), contentType: "application/json" }
+      const r = this.store.attachProfileRoles(id, ids, b.is_default)
+      if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+      const g = this.store.cfg.governance
+      let n = 0
+      for (const u of g?.users ?? []) {
+        const rid = roleIdOf(g?.roles, u.role)
+        if (rid !== undefined && ids.includes(rid)) n += 1
+      }
+      return { status: 200, body: JSON.stringify({ message: "roles attached", users_applied: n }), contentType: "application/json" }
+    }
+    if (segs.length === 6 && method === "DELETE") {
+      const rid = parseInt(segs[5] ?? "") ?? 0
+      const r = this.store.detachProfileRole(id, rid)
+      if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+      return { status: 200, body: JSON.stringify({ message: "role detached" }), contentType: "application/json" }
+    }
+    return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+  }
+
   // /api/governance/access-profiles[/{id}]. A profile that keys still use can't be deleted.
   profiles(method: string, path: string, body: string): Reply {
     const gov = this.store.cfg.governance
     const segs0 = path.split("/").filter((s) => s !== "")
     if (method === "POST" && segs0.length === 5 && segs0[4] === "propagate") return this.propagateProfile(segs0[3] ?? "", body)
+    if (segs0.length >= 5 && segs0[4] === "roles") return this.profileRoles(method, segs0, body)
+    // a profile attached to a role is detached from it first, as Bifrost refuses the delete while it is held
+    if (method === "DELETE") {
+      const did = segs0[3] ?? ""
+      for (const p of gov?.access_profiles ?? []) {
+        if (p.id === did && (p.roles ?? []).length > 0) return { status: 409, body: errorJson(`access profile ${did} is attached to roles; detach it first`, "invalid_request_error", undefined), contentType: "application/json" }
+      }
+    }
     const r = handleProfiles(gov?.access_profiles ?? [], method, path, body)
     if (method === "GET" || r.status >= 300) return { status: r.status, body: r.body, contentType: "application/json" }
     if (method === "DELETE") {

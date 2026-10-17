@@ -830,6 +830,8 @@ class ReqCtx {
   completionTokens = 0
   cost = 0.0
   cached = false
+  // a native decision, billed with the decision rates (serve sets it)
+  decision = false
   error = ""
   virtualKey = ""
   // the team, customer, business unit and project the request is attributed to ("" when none)
@@ -1130,7 +1132,7 @@ export class Engine {
     const po = cfg.governance?.pricing_overrides ?? []
     if (po.length > 0) {
       try {
-        const skipped = this.pricing.setOverrides(po.map((o) => ({ scope_kind: o.scope_kind, provider_id: o.provider_id, match_type: o.match_type, pattern: o.pattern, pricing_patch: o.pricing_patch })))
+        const skipped = this.pricing.setOverrides(po.map((o) => ({ scope_kind: o.scope_kind, provider_id: o.provider_id, request_types: o.request_types, match_type: o.match_type, pattern: o.pattern, pricing_patch: o.pricing_patch })))
         if (skipped > 0) console.error(`raiju: ${skipped} pricing overrides use a scope Raiju doesn't apply (only global and provider)`)
       } catch (e) {
         console.error(`raiju: pricing_overrides: ${e.message}`)
@@ -2085,9 +2087,12 @@ export class Engine {
   }
 
   // Shared front half of every inference endpoint.
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied): Promise<Response> {
+  // emulated: a decision answered by a chat or Responses call (compat's convert_decision_to_responses), billed as that call
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool): Promise<Response> {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
+    // a native decision is billed with the decision rates and the overrides that cover decisions
+    ctx.decision = op === "decisions" && emulated !== true
     ctx.sink = sink
     ctx.makeConverter = makeConverter
     ctx.compat = compat
@@ -2250,7 +2255,7 @@ export class Engine {
     // Budgets cannot count the cost of a model with no price, so with client.refuse_unpriced_models
     // a budgeted request is refused for any unpriced model it may reach (fallbacks included).
     if (grant.budgets.length > 0 && this.cfg.client?.refuse_unpriced_models === true) {
-      const no = this.pricing.unpriced(allowed)
+      const no = this.pricing.unpriced(allowed, ctx.decision)
       if (no !== undefined) {
         const msg = `model ${no.provider}/${no.model} has no price, so the budget on this key cannot count it: add a pricing override, or turn off client.refuse_unpriced_models`
         ctx.error = msg
@@ -2344,8 +2349,8 @@ export class Engine {
     // a provider's billed cost (OpenRouter's usage.cost) replaces the datasheet estimate
     // an alias's model_name (Bifrost's canonical name) is the model priced when it is set
     const priced = r.aliasName !== undefined && r.aliasName !== "" ? r.aliasName : r.model
-    const cost = r.billed !== undefined && r.billed > 0 ? r.billed : this.pricing.cost(r.provider, priced, r.promptTokens, r.completionTokens)
-    if (grant.budgets.length > 0 && !this.pricing.known(r.provider, priced) && !this.unpriced.has(r.provider + "/" + priced)) {
+    const cost = r.billed !== undefined && r.billed > 0 ? r.billed : ctx.decision ? this.pricing.decisionCost(r.provider, priced, r.promptTokens, r.completionTokens) : this.pricing.cost(r.provider, priced, r.promptTokens, r.completionTokens)
+    if (grant.budgets.length > 0 && this.pricing.priceFor(r.provider, priced, ctx.decision) === undefined && !this.unpriced.has(r.provider + "/" + priced)) {
       this.unpriced.add(r.provider + "/" + priced)
       console.error(`raiju: no price for ${r.provider}/${priced}: budgets don't count its requests; add a pricing override`)
     }

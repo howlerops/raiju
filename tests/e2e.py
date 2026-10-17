@@ -1681,6 +1681,120 @@ def l104_e2e(env):
     finally:
         gw.terminate()
 
+
+GW_G41 = "http://127.0.0.1:18183"  # rate-limit shares per project member, RBAC roles by id, profiles attached to roles, cycles overrides across a boot
+
+def g41_e2e(env):
+    """The governance remainder (L103): a project member's rate-limit share and an equal split's refusal, RBAC roles
+    by id, access profiles attached to roles (a held profile governs its holder's keys), a user's role by id, and
+    cycles overrides whose cycles are counted from when they were set. Its own gateway (18183)."""
+    import datetime
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    def stamp(days):
+        return (now - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-g41", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-g41-root")},
+                      {"name": "ann", "role": "viewer"},
+                      {"name": "bo", "role": "viewer"},
+                      {"name": "dan", "role": "ops"}],
+            "roles": [{"name": "ops"}, {"name": "dev"}],
+            "access_profiles": [{"id": "p-ops", "name": "Ops models", "allowed_models": ["openai/gpt-4o-mini"]}],
+            "budgets": [{"id": "b-pj", "max_limit": 100, "reset_duration": "1M"},
+                        {"id": "b-cy1", "max_limit": 10, "reset_duration": "1d", "override": {"amount": 5, "mode": "cycles", "cycles": 2, "started_at": stamp(1.5)}},
+                        {"id": "b-cy2", "max_limit": 10, "reset_duration": "1d", "override": {"amount": 5, "mode": "cycles", "cycles": 2, "started_at": stamp(2.5)}}],
+            "rate_limits": [{"id": "rl-pj", "request_max_limit": 10, "request_reset_duration": "1d"},
+                            {"id": "rl-small", "request_max_limit": 1, "request_reset_duration": "1d"}],
+            "projects": [{"id": "pj", "name": "eval", "budget_id": "b-pj", "rate_limit_id": "rl-pj", "members": [{"id": "m-ann", "user_id": "ann"}, {"id": "m-bo", "user_id": "bo"}]}],
+            "virtual_keys": [
+                {"id": "vk-a", "name": "ann-key", "value": "sk-bf-g41-ann-0123456789abcdef", "user_id": "ann", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-b", "name": "bo-key", "value": "sk-bf-g41-bo-0123456789abcdef", "user_id": "bo", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-d", "name": "dan-key", "value": "sk-bf-g41-dan-0123456789abcdef", "user_id": "dan", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-c1", "name": "cy1-key", "value": "sk-bf-g41-c1-0123456789abcdef", "budget_id": "b-cy1", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-c2", "name": "cy2-key", "value": "sk-bf-g41-c2-0123456789abcdef", "budget_id": "b-cy2", "provider_configs": [{"provider": "openai"}]},
+            ],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.g41.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18183", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.g41.log"), "w"))
+    root = {"authorization": "Bearer sk-admin-g41-root"}
+    def adm(method, p, body=None, who=root):
+        return call(method, p, body, dict(who), base=GW_G41, auth=False)
+    def chat_as(vk, model, project=None):
+        h = {"x-bf-vk": vk}
+        if project is not None:
+            h["x-bf-project-id"] = project
+        return call("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": "hi"}]}, h, base=GW_G41, auth=False)
+    try:
+        wait(GW_G41 + "/health")
+        s, _, b = adm("PUT", "/api/governance/projects/pj/members/m-ann", {"rate_limit_shares": [{"source_rate_limit_id": "rl-pj", "request_share": 2}]})
+        check("a member's rate-limit share is set under split none", s == 200 and json.loads(b)["member"]["rate_limit_shares"][0]["request_share"] == 2, (s, b[:300]))
+        s, _, b = adm("PUT", "/api/governance/projects/pj/members/m-ann", {"rate_limit_shares": [{"source_rate_limit_id": "rl-other", "request_share": 2}]})
+        check("a rate-limit share on a limit the project does not hold is refused", s == 400, (s, b[:200]))
+        s1, _, _ = chat_as("sk-bf-g41-ann-0123456789abcdef", "openai/gpt-4o-mini", "pj")
+        s2, _, _ = chat_as("sk-bf-g41-ann-0123456789abcdef", "openai/gpt-4o-mini", "pj")
+        s3, _, b3 = chat_as("sk-bf-g41-ann-0123456789abcdef", "openai/gpt-4o-mini", "pj")
+        check("a member is held to her slice of the project's requests", s1 != 429 and s2 != 429 and s3 == 429 and "rate_limit_exceeded" in b3, (s1, s2, s3, b3[:200]))
+        s, _, _ = chat_as("sk-bf-g41-bo-0123456789abcdef", "openai/gpt-4o-mini", "pj")
+        check("another member keeps the project's own limit", s != 429, (s,))
+        s, _, b = adm("POST", "/api/governance/projects", {"id": "pe", "name": "pe", "rate_limit_id": "rl-small", "split_policy": "equal"})
+        check("an equal split project is created", s == 201, (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/projects/pe/members", {"members": [{"user_id": "ann"}, {"user_id": "bo"}]})
+        check("an equal split is refused when the limit has fewer requests than members", s == 400 and "equal split" in b, (s, b[:200]))
+
+        s, _, b = adm("GET", "/api/governance/rbac/roles/1")
+        check("a role is read by its id in Bifrost's shape", s == 200 and json.loads(b)["role"]["name"] == "ops" and json.loads(b)["role"]["id"] == 1, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/governance/rbac/roles/2", {"description": "developers"})
+        check("a role is updated by its id, keeping what it leaves out", s == 200 and json.loads(b)["role"]["description"] == "developers" and json.loads(b)["role"]["name"] == "dev", (s, b[:200]))
+        s, _, b = adm("GET", "/api/roles/dev")
+        check("the name route shows the same role with its id", s == 200 and '"id":2' in b and '"description":"developers"' in b, (s, b[:200]))
+        s, _, b = adm("GET", "/api/governance/rbac/roles/9")
+        check("an unknown role id is not found", s == 404, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/governance/rbac/roles/2", {"name": "renamed"})
+        check("a role cannot be renamed by id", s == 400, (s, b[:200]))
+
+        s, _, b = adm("POST", "/api/governance/access-profiles/p-ops/roles", {"role_ids": [1], "is_default": True, "apply_to_existing": True})
+        check("a profile is attached to a role, and the role's holders are counted", s == 200 and json.loads(b)["users_applied"] == 1, (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/access-profiles/p-ops/roles", {"role_ids": [9]})
+        check("a role id that names no custom role is refused", s == 400, (s, b[:200]))
+        s, _, b = chat_as("sk-bf-g41-dan-0123456789abcdef", "openai/gpt-4o")
+        check("the profile a user holds through the role governs their key", s == 403 and "permission_error" in b, (s, b[:200]))
+        s, _, b = chat_as("sk-bf-g41-dan-0123456789abcdef", "openai/gpt-4o-mini")
+        check("the models the held profile allows still go through", s != 403, (s, b[:200]))
+        s, _, b = chat_as("sk-bf-g41-ann-0123456789abcdef", "openai/gpt-4o")
+        check("a user who holds no profile is not governed by it", s != 403, (s, b[:200]))
+        s, _, b = adm("GET", "/api/users/dan/access-profiles")
+        check("the user's held profiles include the one from the role", s == 200 and "Ops models" in b, (s, b[:200]))
+        s, _, b = adm("DELETE", "/api/governance/access-profiles/p-ops")
+        check("a profile attached to a role cannot be deleted", s == 409, (s, b[:200]))
+
+        s, _, b = adm("PUT", "/api/users/dan/role", {"role_id": 2})
+        check("a user's role is set by role id", s == 200 and json.loads(b)["role"] == "dev", (s, b[:200]))
+        s, _, b = adm("GET", "/api/users/dan/role")
+        check("the role change is kept", s == 200 and json.loads(b)["role"] == "dev", (s, b[:200]))
+        s, _, b = chat_as("sk-bf-g41-dan-0123456789abcdef", "openai/gpt-4o")
+        check("after the role changes, the role's profile no longer governs", s != 403, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/users/dan/role", {"role_id": 9})
+        check("a role id that names no custom role is refused for a user", s == 400, (s, b[:200]))
+        s, _, b = adm("DELETE", "/api/governance/access-profiles/p-ops/roles/1")
+        check("a role is detached from a profile", s == 200, (s, b[:200]))
+        s, _, b = adm("DELETE", "/api/governance/access-profiles/p-ops/roles/1")
+        check("a role that is not attached cannot be detached again", s == 404, (s, b[:200]))
+
+        s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-g41-c1-0123456789abcdef"}, base=GW_G41, auth=False)
+        check("a cycles override set 1.5 days ago keeps the one cycle left after a boot", s == 200 and json.loads(b)["budgets"][0]["effective_max_limit"] == 15, (s, b[:300]))
+        s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-g41-c2-0123456789abcdef"}, base=GW_G41, auth=False)
+        check("a cycles override whose cycles ran out before the boot adds nothing", s == 200 and json.loads(b)["budgets"][0]["effective_max_limit"] == 10, (s, b[:300]))
+    finally:
+        gw.terminate()
+
 MCP_KEYS = "http://127.0.0.1:18123"  # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients
 
 MCP_KEYS_SPEC = json.dumps({"openapi": "3.0.3", "info": {"title": "Raiju self", "version": "1"}, "paths": {"/api/version": {"get": {"operationId": "version", "summary": "The gateway's version"}}}})
@@ -2738,6 +2852,57 @@ def l97i_e2e(env):
         gw.terminate()
         if gw_b is not None:
             gw_b.terminate()
+
+
+GW_L109 = "http://127.0.0.1:18157"  # decisions: unprefixed routes, decision pricing overrides, native-decision checks under compat
+
+
+def l109_config() -> dict:
+    """TypeSafe and OpenRouter on the mock, compat's decision emulation on, and two pricing overrides on TypeSafe's
+    jev-latest: a chat-only one that must not reach decisions, and one with a decision rate."""
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "compat": {"convert_decision_to_responses": True}},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l109-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "typesafe": {"keys": [{"name": "ts-l109", "value": "ts-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/ts", "max_retries": 0}},
+            "openrouter": {"keys": [{"name": "or-l109", "value": "or-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/or", "max_retries": 0}},
+        },
+        "governance": {"pricing_overrides": [
+            {"id": "l109-chat", "name": "chat only", "scope_kind": "global", "request_types": ["chat_completion"], "match_type": "exact", "pattern": "jev-latest", "pricing_patch": json.dumps({"input_cost_per_token": 1.0})},
+            {"id": "l109-decisions", "name": "decisions", "scope_kind": "global", "request_types": ["decisions"], "match_type": "exact", "pattern": "jev-latest", "pricing_patch": json.dumps({"input_cost_per_token_decisions": 0.00001})},
+        ]},
+    }
+
+
+def l109_e2e(env):
+    """The unprefixed decision routes, the decision pricing override in the request log, and the native-decision
+    check under compat (OpenRouter's TypeSafe models stay native, its chat models are emulated): their own gateway."""
+    cfg_path = os.path.join(BUILD, "e2e.l109.json")
+    json.dump(l109_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18157", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l109.log"), "w"))
+    try:
+        wait(GW_L109 + "/health")
+        dbody = {"model": "typesafe/jev-latest", "input": "Customer message: I was double charged.", "questions": [{"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?", "criteria": {"true": "angry", "false": "calm"}}]}
+        s, _, b = call("POST", "/v1/decisions", dbody, base=GW_L109, auth=False)
+        check("a native decision answers on /v1/decisions", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75, (s, b[:300]))
+        for path in ("/openai/decisions", "/openai/v1/decisions", "/litellm/decisions", "/langchain/v1/decisions", "/pydanticai/decisions"):
+            s, _, b = call("POST", path, dbody, base=GW_L109, auth=False)
+            check(f"{path} serves decisions, as Bifrost mounts it", s == 200 and json.loads(b)["answers"][0].get("name") == "is_frustrated", (s, b[:200]))
+        s, _, b = call("POST", "/decisions", dbody, base=GW_L109, auth=False)
+        check("a bare /decisions is not a route, as in Bifrost", s != 200, (s, b[:200]))
+        s, _, b = call("GET", "/api/logs?providers=typesafe", base=GW_L109, auth=False)
+        costs = [float(x.get("cost") or 0) for x in json.loads(b).get("logs", [])] if s == 200 else []
+        check("each decision is billed at the decision rate, and the chat-only override does not reach it",
+              sum(1 for c in costs if abs(c - 0.00017) < 1e-9) >= 6 and not any(abs(c - 17.0) < 1e-6 for c in costs), (s, costs[:20]))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "openrouter/typesafe/jev-latest"}, base=GW_L109, auth=False)
+        check("OpenRouter's TypeSafe models are decided natively under compat", s == 200 and seen()[-1]["path"] == "/or/alpha/decisions", (s, b[:300]))
+        s, h, b = call("POST", "/v1/decisions", {**dbody, "model": "openrouter/openai/gpt-4o-mini"}, base=GW_L109, auth=False)
+        check("a model OpenRouter does not decide natively is emulated under compat, not sent to its decisions route",
+              seen()[-1]["path"] == "/or/v1/chat/completions" and hdr(h, "x-bifrost-converted-request-type") != "responses", (s, seen()[-1:], b[:200]))
+    finally:
+        gw.terminate()
 
 
 GW_L97H = "http://127.0.0.1:18144"  # provider model lists (Bedrock, Vertex, Cloudflare), Vertex count tokens, OpenRouter decisions
@@ -5654,12 +5819,16 @@ def main():
         l97m_e2e(env)
         # the governance last part: project rosters and caps, entity_dac, access profile versions, user-held profiles, cycles overrides, audit IPs and adaptive routing views
         l97p_e2e(env)
+        # the governance remainder: rate-limit shares per member, RBAC roles by id, profiles attached to roles, cycles overrides across a boot: their own gateway
+        g41_e2e(env)
         # streamed text completion and Responses answers under the output guards, and a cached stream: their own gateways
         l97s_e2e(env)
         # the management routes the web UI drives (MCP tool switches, virtual key and provider edits, settings): their own gateway
         l113_e2e(env)
         # adaptive load balancing: a refused key is held, listed, kept out of rotation and released; its incident history
         l104_e2e(env)
+        # decisions: the unprefixed routes, decision pricing overrides and the native-decision check under compat: their own gateway
+        l109_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
