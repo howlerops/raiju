@@ -48,21 +48,17 @@ No row is queued. The remainders are the "Open:" notes in LEDGER.md (L103 to L12
   role-aware hiding of actions (L113).
 - Identity-aware proxy in full mode does not consult governance for disabled users (L120).
 
-## Open questions for the owner
+## Owner decisions after wave 14 (2026-10-17)
 
-1. **Dynamic plugins.** Go `.so` plugins need the Go runtime, so they are out. WASM plugins are
-   possible only by linking JavaScriptCore into the gateway (about 34 MB, a 10-minute JSC build).
-   Link it, or leave dynamic plugins unbuilt?
-2. **WebRTC create (L108).** Keep the create-time pass-through, or build a real relay (a WebRTC
-   stack in Tov or a sidecar) so media and events are metered and guarded?
-3. **Key holds with breakers off (L104).** Refusals now hold a key (a 429 holds the model on that
-   key for 10 s to 2 min) even when circuit breakers and adaptive routing are off. Keep, or make
-   it opt-in?
-4. **Held access profiles (L103).** A user's held profiles now govern all their keys, and every
-   held profile is charged (Bifrost charges one paying profile). Keep the stricter rule?
-5. **Accepted-but-not-applied config (L112a).** `large_payload_optimization` and
-   `retain_content_in_object_storage` are buildable (a streaming request-body path, a second
-   object-storage write path); the HTTP/2 and pool knobs need Tov runtime changes. Build which?
+1. **Dynamic plugins:** WASM plugins on WAMR, added to the Tov runtime as a patch (L121). No
+   JavaScriptCore. Go `.so` plugins stay impossible.
+2. **WebRTC:** terminated in Raiju with libdatachannel through a Tov patch (L122), as Bifrost
+   terminates it with Pion.
+3. **Key holds:** only under adaptive load balancing, shared across the cluster (L123).
+4. **Held access profiles:** keep Raiju's stricter rule (every held profile is charged); not
+   changed to Bifrost's one-payer rule.
+5. **Config keys:** build large_payload_optimization (L124), retain_content_in_object_storage
+   (L125), the pool and HTTP/2 knobs (L126) and beta_header_overrides (L127).
 
 ## Owner decisions (2026-10-17)
 

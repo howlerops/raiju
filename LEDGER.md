@@ -310,3 +310,21 @@ keys). See docs/parity.md.
 ## Next
 
 Wave 14 above. The handoff for a new lead is HANDOFF.md plus handoff/leader-prompt.md.
+
+## Wave 15 (owner decisions, 2026-10-17: build the correct way)
+
+Tov runtime patches are numbered in advance so workers do not collide: 0005 WAMR (L121),
+0006 libdatachannel (L122), 0007 fetch pool and HTTP/2 (L126). A worker that adds a patch
+builds its own compiler inside its worktree (scripts/build-tov.sh there) and never touches
+/home/user/raiju/build/tov; the lead rebuilds the shared compiler after merging.
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L121 | (e) | Dynamic plugins as WASM (Bifrost's JSON ABI: malloc, free, get_name, init, pre_hook, post_hook, cleanup) on WAMR, added to the Tov runtime as tov-patches/0005; no JavaScriptCore | worker | todo |
+| L122 | G40 | WebRTC terminated in Raiju: libdatachannel through tov-patches/0006; Raiju is the peer for POST /v1/live/sessions and relays media and events to the provider, metering, guarding and logging them as Bifrost does | worker | todo |
+| L123 | G42 | Key holds as Bifrost documents them: only under adaptive load balancing, and shared by every node of the cluster | worker | todo |
+| L124 | G48 | large_payload_optimization: stream large request bodies upstream (routing fields from the first bytes), response thresholds and truncated logs as Bifrost defines them | worker | todo |
+| L125 | G48 | retain_content_in_object_storage: request content written to the object store, the log keeps a reference | worker | todo |
+| L126 | G48 | network_config keep_alive_timeout and max_conns_per_host, and upstream HTTP/2 (enforce_http2, http2_ping_interval) in the Tov fetch client (tov-patches/0007) | worker | todo |
+| L127 | G48 | The anthropic-beta header filter Bifrost has, then beta_header_overrides on top of it | worker | todo |
+
