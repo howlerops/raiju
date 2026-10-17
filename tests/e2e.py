@@ -2751,6 +2751,42 @@ def l97s_config_b() -> dict:
     }
 
 
+GW_L110 = "http://127.0.0.1:18160"  # raw payloads of streamed answers and the content-logging switch; the overhead histogram
+
+def l110_e2e(env):
+    """L110: x-bf-store-raw-request-response keeps a streamed answer's upstream body in the log, up to the size cap,
+    and x-bf-disable-content-logging keeps neither raw payload. Its own gateway (18160)."""
+    import shutil
+    logs_dir = os.path.join(BUILD, "e2e-l110-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "allow_per_request_content_storage_override": True},
+        "logs_store": {"enabled": True, "dir": logs_dir},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "s", "value": "sk-l110", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    path = os.path.join(BUILD, "e2e.l110.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18160", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.l110.log"), "w"))
+    try:
+        wait(GW_L110 + "/health")
+        msg = lambda text: [{"role": "user", "content": text}]
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": msg("raw-l110-stream")}, {"x-bf-store-raw-request-response": "true"}, base=GW_L110, auth=False)
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L110, auth=False)[2])["entries"]
+        mine = [e for e in entries if "raw-l110-stream" in (e.get("raw_request") or "")]
+        check("x-bf-store-raw-request-response keeps a streamed answer's upstream body in the log", s == 200 and len(mine) == 1 and "data:" in (mine[0].get("raw_response") or ""), (s, b[:200], mine[:1]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": msg("raw-l110-off")}, {"x-bf-store-raw-request-response": "true", "x-bf-disable-content-logging": "true"}, base=GW_L110, auth=False)
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L110, auth=False)[2])["entries"]
+        mine = [e for e in entries if "raw-l110-off" in (e.get("raw_request") or "") or "raw-l110-off" in (e.get("input") or "")]
+        check("x-bf-disable-content-logging keeps no raw payload for a request that asked to store it", s == 200 and len(mine) == 0, (s, b[:200], mine[:1]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("raw-l110-plain")}, base=GW_L110, auth=False)
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L110, auth=False)[2])["entries"]
+        # the newest entry is this request (the list is newest first); no header, so no raw payload
+        check("without the header a plain request keeps no raw payload", s == 200 and len(entries) > 0 and entries[0].get("raw_request") is None and entries[0].get("raw_response") is None, (s, entries[:1]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def l97s_e2e(env):
     """Streamed text completions and Responses answers under the output guards: a phone number is redacted as the
     stream goes, a forbidden word ends the stream with the format's error event, and an answer built whole is
@@ -3570,6 +3606,114 @@ def l97l_e2e(env):
         gw.wait()
         gw_s.terminate()
         gw_s.wait()
+
+
+GW_SCIM = "http://127.0.0.1:18170"  # SCIM 2.0 provisioning on, its token read from the environment
+GW_SCIM_OFF = "http://127.0.0.1:18152"  # the same gateway with scim_config off
+SCIM_TOKEN = "scim-" + "e2e-" + "provisioning-7d1f"  # a throwaway token, built from parts
+
+def l115_config(on: bool) -> dict:
+    """The L115 gateway: scim_config with the provisioning token read from env.E2E_SCIM_TOKEN, or off. The admin token (the
+    shared ADMIN header) lets the checks read what SCIM wrote through the management API."""
+    scim = {"enabled": True, "provider": "generic", "config": {"provisioningToken": "env.E2E_SCIM_TOKEN"}} if on else {"enabled": False}
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "scim_config": scim,
+        "governance": {"auth_config": {"token": "admin-secret"}},
+    }
+
+def l115_e2e(env):
+    """SCIM 2.0 at /scim/v2: the bearer token from the environment, discovery, users and groups pushed and read back
+    through the management API, filters and paging, deactivation, deletion, persistence to the config file, the SCIM
+    error shape, and a gateway with scim_config off."""
+    cfg_path = os.path.join(BUILD, "e2e.l115.json")
+    off_path = os.path.join(BUILD, "e2e.l115-off.json")
+    json.dump(l115_config(True), open(cfg_path, "w"))
+    json.dump(l115_config(False), open(off_path, "w"))
+    genv = {**env, "E2E_SCIM_TOKEN": SCIM_TOKEN}
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18170", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=genv, stderr=open(os.path.join(BUILD, "e2e.l115.log"), "w"))
+    gw_off = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18152", "-host", "127.0.0.1", "-config", off_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l115-off.log"), "w"))
+    auth = {"authorization": "Bearer " + SCIM_TOKEN}
+    user_schema = ["urn:ietf:params:scim:schemas:core:2.0:User"]
+    group_schema = ["urn:ietf:params:scim:schemas:core:2.0:Group"]
+    patch_schema = ["urn:ietf:params:scim:api:messages:2.0:PatchOp"]
+    try:
+        wait(GW_SCIM + "/health")
+        wait(GW_SCIM_OFF + "/health")
+        s, h, b = call("GET", "/scim/v2/ServiceProviderConfig", base=GW_SCIM, auth=False)
+        check("scim: no token is refused with the SCIM error shape", s == 401 and hdr(h, "content-type") == "application/scim+json" and '"urn:ietf:params:scim:api:messages:2.0:Error"' in b and '"status":"401"' in b, (s, h, b[:200]))
+        s, h, b = call("GET", "/scim/v2/ServiceProviderConfig", headers={"authorization": "Bearer nope"}, base=GW_SCIM, auth=False)
+        check("scim: a wrong token is refused", s == 401, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/ServiceProviderConfig", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: ServiceProviderConfig advertises the bearer token, patch and filter", s == 200 and "oauthbearertoken" in b and '"patch":{"supported":true}' in b and '"filter":{"supported":true' in b, (s, b[:300]))
+        s, h, b = call("GET", "/scim/v2/ResourceTypes", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: ResourceTypes lists User and Group", s == 200 and '"endpoint":"/Users"' in b and '"endpoint":"/Groups"' in b, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/Schemas", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: Schemas describes the user and group attributes", s == 200 and "userName" in b and "displayName" in b, (s, b[:200]))
+        s, h, b = call("POST", "/scim/v2/Users", {"schemas": user_schema, "userName": "Ana.Lee@Example.com", "active": True, "roles": [{"value": "editor"}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: POST /Users creates the user, lower-cased, with its role", s == 201 and '"userName":"ana.lee@example.com"' in b and '"value":"editor"' in b, (s, b[:300]))
+        check("scim: the created user is saved to the config file", "ana.lee@example.com" in open(cfg_path).read())
+        s, h, b = call("POST", "/scim/v2/Users", {"schemas": user_schema, "userName": "ana.lee@example.com"}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a second push of the same user is a 409 uniqueness error", s == 409 and '"scimType":"uniqueness"' in b, (s, b[:200]))
+        s, h, b = call("GET", "/api/users", headers=ADMIN, base=GW_SCIM, auth=False)
+        users = json.loads(b)["users"] if s == 200 else []
+        check("scim: the user is a Raiju user in the management API", any(u["name"] == "ana.lee@example.com" and u["role"] == "editor" and u["disabled"] is False for u in users), (s, b[:300]))
+        s, h, b = call("POST", "/scim/v2/Users", {"schemas": user_schema, "userName": "Bad Name"}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a user name Raiju cannot hold is refused as invalidValue", s == 400 and '"scimType":"invalidValue"' in b, (s, b[:200]))
+        s, h, b = call("POST", "/scim/v2/Users", {"schemas": user_schema, "userName": "bo@example.com", "roles": [{"value": "ghost"}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a user with no role Raiju knows gets the viewer role", s == 201 and '"value":"viewer"' in b, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/Users?filter=userName%20eq%20%22ana.lee%40example.com%22", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: the filter finds the user by userName", s == 200 and '"totalResults":1' in b and '"userName":"ana.lee@example.com"' in b, (s, b[:300]))
+        s, h, b = call("GET", "/scim/v2/Users?startIndex=2&count=1", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a list pages with startIndex and count", s == 200 and '"itemsPerPage":1' in b and '"totalResults":2' in b and '"userName":"bo@example.com"' in b, (s, b[:300]))
+        s, h, b = call("GET", "/scim/v2/Users?filter=emails.value%20eq%20%22x%22", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a filter on another attribute is refused as invalidFilter", s == 400 and '"scimType":"invalidFilter"' in b, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/Users/ana.lee%40example.com", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: GET /Users/{id} reads an escaped id", s == 200 and '"active":true' in b, (s, b[:200]))
+        s, h, b = call("POST", "/scim/v2/Groups", {"schemas": group_schema, "displayName": "platform", "members": [{"value": "ana.lee@example.com"}]}, headers=auth, base=GW_SCIM, auth=False)
+        g = json.loads(b) if s == 201 else {}
+        gid = g.get("id", "")
+        check("scim: POST /Groups creates a team with its members", s == 201 and g.get("displayName") == "platform" and len(g.get("members", [])) == 1, (s, b[:300]))
+        check("scim: the group is a team in the config file", "platform" in open(cfg_path).read() and gid != "")
+        s, h, b = call("GET", "/api/governance/teams/" + gid + "/members", headers=ADMIN, base=GW_SCIM, auth=False)
+        mem = [m["user_id"] for m in json.loads(b).get("members", [])] if s == 200 else []
+        check("scim: the group's members are the team's members in the management API", mem == ["ana.lee@example.com"], (s, b[:300]))
+        s, h, b = call("POST", "/scim/v2/Groups", {"schemas": group_schema, "displayName": "platform"}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a second group with the same name is a 409", s == 409, (s, b[:200]))
+        s, h, b = call("PATCH", "/scim/v2/Groups/" + gid, {"schemas": patch_schema, "Operations": [{"op": "add", "path": "members", "value": [{"value": "bo@example.com"}]}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: PATCH adds a member to the group", s == 200 and '"value":"bo@example.com"' in b, (s, b[:300]))
+        s, h, b = call("PATCH", "/scim/v2/Groups/" + gid, {"schemas": patch_schema, "Operations": [{"op": "remove", "path": 'members[value eq "bo@example.com"]'}]}, headers=auth, base=GW_SCIM, auth=False)
+        s2, _, b2 = call("GET", "/api/governance/teams/" + gid + "/members", headers=ADMIN, base=GW_SCIM, auth=False)
+        mem = [m["user_id"] for m in json.loads(b2).get("members", [])] if s2 == 200 else []
+        check("scim: PATCH removes a member by its value filter", s == 200 and mem == ["ana.lee@example.com"], (s, b[:200], mem))
+        s, h, b = call("PATCH", "/scim/v2/Users/ana.lee@example.com", {"schemas": patch_schema, "Operations": [{"op": "replace", "value": {"active": False}}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: PATCH active false deactivates the user", s == 200 and '"active":false' in b, (s, b[:300]))
+        s, h, b = call("GET", "/api/users", headers=ADMIN, base=GW_SCIM, auth=False)
+        users = json.loads(b)["users"] if s == 200 else []
+        check("scim: the deactivated user shows as disabled in the management API", any(u["name"] == "ana.lee@example.com" and u["disabled"] is True for u in users), (s, b[:300]))
+        s, h, b = call("PATCH", "/scim/v2/Users/ana.lee@example.com", {"schemas": patch_schema, "Operations": [{"op": "replace", "path": "active", "value": "True"}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: PATCH with a path and a string flag reactivates the user", s == 200 and '"active":true' in b, (s, b[:300]))
+        s, h, b = call("PUT", "/scim/v2/Users/ana.lee@example.com", {"schemas": user_schema, "userName": "ana.lee@example.com", "active": True, "roles": [{"value": "auditor"}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: PUT replaces the role", s == 200 and '"value":"auditor"' in b, (s, b[:200]))
+        s, h, b = call("PATCH", "/scim/v2/Users/nobody@example.com", {"schemas": patch_schema, "Operations": [{"op": "replace", "path": "active", "value": False}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: an unknown user is a 404 SCIM error", s == 404 and '"status":"404"' in b, (s, b[:200]))
+        s, h, b = call("DELETE", "/scim/v2/Groups/" + gid, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: DELETE /Groups removes the team", s == 204, (s, b[:200]))
+        s, h, b = call("DELETE", "/scim/v2/Users/ana.lee@example.com", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: DELETE /Users removes the user", s == 204, (s, b[:200]))
+        s, h, b = call("GET", "/api/users", headers=ADMIN, base=GW_SCIM, auth=False)
+        users = json.loads(b)["users"] if s == 200 else []
+        check("scim: the deleted user is gone from the management API and the config file", not any(u["name"] == "ana.lee@example.com" for u in users) and "ana.lee@example.com" not in open(cfg_path).read(), (s, b[:300]))
+        s, h, b = call("GET", "/scim/v2/Nope", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: an unknown SCIM route is a 404 SCIM error", s == 404 and '"schemas":["urn:ietf:params:scim:api:messages:2.0:Error"]' in b, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/ServiceProviderConfig", headers=auth, base=GW_SCIM_OFF, auth=False)
+        check("scim: with scim_config off, /scim/v2 is a 404 whatever token is sent", s == 404 and "not enabled" in b, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw_off.terminate()
 
 
 def unique_ports():
@@ -5841,13 +5985,21 @@ def main():
             s, _, b = call("GET", "/api/logs/histogram/" + hp)
             hj = json.loads(b) if s == 200 else {}
             check(f"/api/logs/histogram/{hp} answers with buckets", s == 200 and isinstance(hj.get("buckets"), list) and hj.get("bucket_size_seconds") == 3600, (s, b[:200]))
-        s, _, b = call("GET", "/api/logs/histogram/cost/by-dimension?dimension=team_id")
-        check("by-dimension refuses a dimension Raiju does not record", s == 400 and "Invalid dimension" in b, (s, b))
+        s, _, b = call("GET", "/api/logs/histogram/cost/by-dimension?dimension=nope")
+        check("by-dimension refuses a dimension Raiju does not record, in Bifrost's words", s == 400 and "Invalid dimension: nope. Valid values: provider, team_id, customer_id" in b, (s, b))
+        s, _, b = call("GET", "/api/logs/histogram/tokens/by-dimension?dimension=team_id")
+        check("by-dimension takes Bifrost's team_id and echoes it", s == 200 and json.loads(b)["dimension"] == "team_id", (s, b[:200]))
+        s, _, b = call("GET", "/api/logs/rankings/by-dimension?dimension=team_id")
+        check("rankings take the ranking name team, not the histogram's team_id", s == 400 and "Valid values: team, customer" in b, (s, b))
+        s, _, b = call("GET", "/api/logs/histogram/latency")
+        lbs = json.loads(b)["buckets"] if s == 200 else []
+        check("the latency histogram carries the gateway overhead percentiles", s == 200 and len(lbs) > 0 and all("p99_overhead" in x and "avg_overhead" in x for x in lbs), (s, b[:200]))
         s, _, b = call("GET", "/api/logs/histogram/cost/by-dimension?dimension=provider")
         check("by-dimension groups cost by provider", s == 200 and "openai" in json.loads(b)["dimension_values"], (s, b[:300]))
         s, _, b = call("GET", "/api/logs/rankings")
         rj = json.loads(b) if s == 200 else {"rankings": []}
         check("model rankings carry trends", s == 200 and len(rj["rankings"]) > 0 and "trend" in rj["rankings"][0], (s, b[:300]))
+        check("model rankings carry provider, throughput and the cost split", s == 200 and all(k in rj["rankings"][0] for k in ("provider", "throughput", "input_cost", "output_cost", "additional_cost")) and "throughput_trend" in rj["rankings"][0]["trend"], (s, b[:300]))
         s, _, b = call("GET", "/api/logs/rankings/by-dimension?dimension=provider")
         check("dimension rankings", s == 200 and "rankings" in json.loads(b), (s, b[:300]))
         s, _, b = call("GET", "/api/logs/dashboard")
@@ -6096,6 +6248,10 @@ def main():
         l112a_e2e(env)
         # streams under the built-in guard, tool names of streamed answers, legacy completion and cursor Responses streams, paced cache replays
         l107_e2e(env)
+        # L110: raw payloads of streamed answers and the content-logging switch, on their own gateway
+        l110_e2e(env)
+        # SCIM 2.0 provisioning at /scim/v2: users and groups pushed by an identity provider, and scim_config off: their own gateways
+        l115_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

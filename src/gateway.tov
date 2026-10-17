@@ -654,6 +654,18 @@ function storeRawOn(h: Hdrs, cfg: Config, p: ProviderConfig): bool {
   return p.store_raw_request_response === true
 }
 
+// The most upstream bytes kept of a streamed answer for the log (the log store cuts raw payloads at the same size).
+const RAW_CAP = 1048576
+
+// The text of kept raw bytes; "" when they are not valid text.
+function rawText(bytes: u8[]): string {
+  try {
+    return new TextDecoder().decode(bytes)
+  } catch (e) {
+    return ""
+  }
+}
+
 // Bifrost's custom_provider_config.allowed_requests: once the map is set, only the request types marked true are served.
 function allowedRequest(p: ProviderConfig, rtype: string): bool {
   const allowed = p.custom_provider_config?.allowed_requests
@@ -864,6 +876,11 @@ class ReqCtx {
   // the raw upstream request and response, kept for the log store (store_raw_request_response)
   rawRequest = ""
   rawResponse = ""
+  // the price's input and output parts and any additional cost, and the alias's canonical model name, for the log
+  inputCost = 0.0
+  outputCost = 0.0
+  additionalCost = 0.0
+  canonicalModel = ""
   // Bifrost's metric labels for this request, filled once it is routed and admitted
   labels: metrics.RequestLabels = metrics.newLabels("", "", "")
   // the log row's extra columns, read from the request's headers (reqlog.tov)
@@ -1583,6 +1600,9 @@ export class Engine {
             sink.started = true
             sink.open(200, ctx.outHeaders)
             const reader = stream.getReader()
+            // the upstream bytes, kept for the log when store_raw_request_response asks (not under output guards: a match can be split)
+            const keepRaw = storeRaw && this.streamGuards(true).length === 0
+            const rawBytes: u8[] = []
             // a cancel while the upstream is silent aborts the pending read, not just the next one
             sink.abort = () => {
               dl.controller.abort()
@@ -1606,6 +1626,7 @@ export class Engine {
                 if (c.done) break
                 const v = c.value
                 if (v !== undefined) {
+                  if (keepRaw && rawBytes.length < RAW_CAP) for (const b of v) rawBytes.push(b)
                   const out = conv.guarded(conv.push(v), false)
                   if (out !== "") {
                     const at = performance.now()
@@ -1625,6 +1646,7 @@ export class Engine {
               // (a client that cancelled is owed no error event)
               if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
             }
+            if (keepRaw) ctx.rawResponse = rawText(rawBytes)
             const tail = conv.guarded(conv.end(), true)
             if (tail !== "") {
               sink.write(tail)
@@ -2479,6 +2501,12 @@ export class Engine {
     // an alias's model_name (Bifrost's canonical name) is the model priced when it is set
     const priced = r.aliasName !== undefined && r.aliasName !== "" ? r.aliasName : r.model
     const cost = r.billed !== undefined && r.billed > 0 ? r.billed : ctx.decision ? this.pricing.decisionCost(r.provider, priced, r.promptTokens, r.completionTokens) : this.pricing.cost(r.provider, priced, r.promptTokens, r.completionTokens)
+    // the price table's input and output parts (Bifrost's input_cost and output_cost); a billed difference is the additional cost
+    const parts = this.pricing.costParts(r.provider, priced, r.promptTokens, r.completionTokens)
+    ctx.inputCost = parts.input
+    ctx.outputCost = parts.output
+    ctx.additionalCost = Math.max(0.0, cost - parts.input - parts.output)
+    ctx.canonicalModel = r.aliasName !== undefined ? r.aliasName : ""
     if (grant.budgets.length > 0 && this.pricing.priceFor(r.provider, priced, ctx.decision) === undefined && !this.unpriced.has(r.provider + "/" + priced)) {
       this.unpriced.add(r.provider + "/" + priced)
       console.error(`raiju: no price for ${r.provider}/${priced}: budgets don't count its requests; add a pricing override`)
@@ -2660,6 +2688,8 @@ export class Engine {
         input: c.input === "" || c.contentOff ? undefined : c.input, output: c.output === "" || c.contentOff ? undefined : c.output,
         metadata: c.meta, parent_request_id: c.parentId === "" ? undefined : c.parentId, agent_correlation_id: c.agentId === "" ? undefined : c.agentId,
         app: c.app === "" ? undefined : c.app, user_agent: c.userAgent === "" ? undefined : c.userAgent, maxim: c.maximIds, maxim_tags: c.maximTags,
+        overhead_ms: c.overheadUs === undefined ? undefined : c.overheadUs / 1000.0, input_cost: c.inputCost, output_cost: c.outputCost,
+        additional_cost: c.additionalCost, canonical_model_name: c.canonicalModel === "" ? undefined : c.canonicalModel,
       }
       for (const q of this.exportQueues) q.add(e)
     }
@@ -2696,6 +2726,8 @@ export class Engine {
         input: c.input === "" || c.contentOff ? undefined : c.input, output: c.output === "" || c.contentOff ? undefined : c.output,
         metadata: c.meta, parent_request_id: c.parentId === "" ? undefined : c.parentId, agent_correlation_id: c.agentId === "" ? undefined : c.agentId,
         app: c.app === "" ? undefined : c.app, user_agent: c.userAgent === "" ? undefined : c.userAgent, maxim: c.maximIds, maxim_tags: c.maximTags,
+        overhead_ms: c.overheadUs === undefined ? undefined : c.overheadUs / 1000.0, input_cost: c.inputCost, output_cost: c.outputCost,
+        additional_cost: c.additionalCost, canonical_model_name: c.canonicalModel === "" ? undefined : c.canonicalModel,
       })
     }
     const tracer = this.tracer

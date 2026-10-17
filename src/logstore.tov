@@ -68,6 +68,13 @@ export type LogEntry = {
   selected_prompt_id?: string,
   selected_prompt_name?: string,
   selected_prompt_version?: int,
+  // the gateway's overhead for the request (ms; the latency histogram's overhead fields), the price's input and
+  // output parts and any billed difference beyond them, and the alias's canonical model name (Bifrost's rankings)
+  overhead_ms?: f64,
+  input_cost?: f64,
+  output_cost?: f64,
+  additional_cost?: f64,
+  canonical_model_name?: string,
 }
 
 export type LogStoreConfig = {
@@ -544,6 +551,11 @@ export class LogStore {
       selected_prompt_id: e.selected_prompt_id,
       selected_prompt_name: e.selected_prompt_name,
       selected_prompt_version: e.selected_prompt_version,
+      overhead_ms: e.overhead_ms,
+      input_cost: e.input_cost,
+      output_cost: e.output_cost,
+      additional_cost: e.additional_cost,
+      canonical_model_name: e.canonical_model_name,
     }
   }
 
@@ -889,6 +901,16 @@ export function validDimension(dim: string): bool {
   return dim === "provider" || dim === "model" || dim === "virtual_key" || dim === "tool" || dim === "server" || dim === "team" || dim === "customer" || dim === "business_unit" || dim === "project" || dim === "user" || dim === "app" || dim === "user_agent"
 }
 
+// The store's name for a dimension Bifrost's histograms name with an id suffix (team_id is team).
+export function histogramDimName(dim: string): string {
+  if (dim === "team_id") return "team"
+  if (dim === "customer_id") return "customer"
+  if (dim === "user_id") return "user"
+  if (dim === "business_unit_id") return "business_unit"
+  if (dim === "project_id") return "project"
+  return dim
+}
+
 export function dimValue(e: LogEntry, dim: string): string {
   if (dim === "provider") return e.provider
   if (dim === "model") return e.model
@@ -987,18 +1009,28 @@ function costOf(es: LogEntry[]): f64 {
   return c
 }
 
-// tokens/s over the entries that reported completion tokens and a latency
-function throughputFields(es: LogEntry[]): string {
-  let tokens = 0
+// Completion tokens over the seconds they took, from the successful entries with a measured latency
+// (Bifrost's tokensPerSecond: failed rows spend latency without finishing the answer).
+function throughputOf(es: LogEntry[]): f64 {
+  let tokens = 0.0
   let ms = 0.0
-  let n = 0
   for (const e of es) {
+    if (!isSuccess(e) || e.latency_ms <= 0.0) continue
     tokens += e.completion_tokens
     ms += e.latency_ms
+  }
+  return ms > 0.0 ? tokens / (ms / 1000.0) : 0.0
+}
+
+function throughputFields(es: LogEntry[]): string {
+  let tokens = 0
+  let n = 0
+  for (const e of es) {
+    if (!isSuccess(e) || e.latency_ms <= 0.0) continue
+    tokens += e.completion_tokens
     n += 1
   }
-  const tps = ms > 0.0 ? tokens / (ms / 1000.0) : 0.0
-  return jobj([jkv("tokens_per_second", jn(tps)), jkv("total_completion_tokens", jn(tokens)), jkv("total_requests", jn(n))])
+  return jobj([jkv("tokens_per_second", jn(throughputOf(es))), jkv("total_completion_tokens", jn(tokens)), jkv("total_requests", jn(n))])
 }
 
 // The status counts of a set of entries: success is 2xx, cancelled is 499, error the rest.
@@ -1103,10 +1135,29 @@ export function latencyView(es: LogEntry[], g: Grid): string {
   return bucketed(g, rows)
 }
 
-// The latency fields of latencyFields, spliced into an object that already has a timestamp.
+// The overall latency histogram's fields: latencyFields, then the gateway overhead (Bifrost's avg_overhead
+// and percentiles), spliced into an object that already has a timestamp.
 function latencyPairs(es: LogEntry[]): string {
   const t = latencyFields(es)
-  return t.slice(1, t.byteLength - 1)
+  return t.slice(1, t.byteLength - 1) + "," + overheadPairs(es)
+}
+
+// The overhead of the entries that recorded one; 0 when none did.
+function overheadPairs(es: LogEntry[]): string {
+  const xs: f64[] = []
+  for (const e of es) {
+    const o = e.overhead_ms
+    if (o !== undefined) xs.push(o)
+  }
+  xs.sort((a, b) => a - b)
+  let sum = 0.0
+  for (const x of xs) sum += x
+  return [
+    jkv("avg_overhead", jn(xs.length > 0 ? sum / xs.length : 0.0)),
+    jkv("p90_overhead", jn(percentile(xs, 0.9))),
+    jkv("p95_overhead", jn(percentile(xs, 0.95))),
+    jkv("p99_overhead", jn(percentile(xs, 0.99))),
+  ].join(",")
 }
 
 // GET /api/logs/histogram/cost/by-provider, tokens/by-provider, latency/by-provider and
@@ -1138,7 +1189,8 @@ function throughputPairs(es: LogEntry[]): string {
 }
 
 // GET /api/logs/histogram/cost|tokens|latency/by-dimension, for a dimension Raiju records.
-export function dimensionView(es: LogEntry[], g: Grid, what: string, dim: string): string {
+// echo is the dimension name the caller asked for (Bifrost's team_id for team), when it differs from dim.
+export function dimensionView(es: LogEntry[], g: Grid, what: string, dim: string, echo?: string): string {
   const groups = bucketize(es, g)
   const rows: string[] = []
   for (let i = 0; i < g.n; i++) {
@@ -1147,7 +1199,7 @@ export function dimensionView(es: LogEntry[], g: Grid, what: string, dim: string
     else if (what === "tokens") rows.push(jobj([jkv("timestamp", tsOf(g, i)), jkv("by_dimension", byGroup(b, dim, (x) => tokenFields(x)))]))
     else rows.push(jobj([jkv("timestamp", tsOf(g, i)), jkv("by_dimension", byGroup(b, dim, (x) => latencyFields(x)))]))
   }
-  return jobj([jkv("buckets", jarr(rows)), jkv("bucket_size_seconds", jn(g.sizeSec)), jkv("dimension", JSON.stringify(dim)), jkv("dimension_values", jstrs(distinctDim(es, dim)))])
+  return jobj([jkv("buckets", jarr(rows)), jkv("bucket_size_seconds", jn(g.sizeSec)), jkv("dimension", JSON.stringify(echo ?? dim)), jkv("dimension_values", jstrs(distinctDim(es, dim)))])
 }
 
 // GET /api/logs/stats: Bifrost's totals (SearchStats fields at the top level), with the older
@@ -1199,14 +1251,20 @@ export function statsView(es: LogEntry[]): string {
   ])
 }
 
-// The trend of a value against the previous period: percent change, or null without a base.
-function trendOf(cur: f64, prev: f64): string {
-  if (prev <= 0.0) return "null"
-  return jn(((cur - prev) / prev) * 100.0)
+// Bifrost's pctChange: the percent change from old to cur, 0 without a base.
+function pctChange(old: f64, cur: f64): f64 {
+  return old === 0.0 ? 0.0 : ((cur - old) / old) * 100.0
+}
+
+// Bifrost's metricTrend: null when a zero base moves to a nonzero value (no percentage change), else pctChange.
+function metricTrend(old: f64, cur: f64): string {
+  if (old === 0.0 && cur !== 0.0) return "null"
+  return jn(pctChange(old, cur))
 }
 
 // One ranking row: the group's totals, and its trend against the same group in the previous period.
-function rankRow(key: string, dim: string, es: LogEntry[], prev: LogEntry[], extra: string): string {
+// head is the row's key pair and extra the pairs that follow it.
+function rankRow(head: string, es: LogEntry[], prev: LogEntry[], extra: string): string {
   const c = countsOf(es)
   const req = c.total
   const oldReq = countsOf(prev).total
@@ -1216,16 +1274,56 @@ function rankRow(key: string, dim: string, es: LogEntry[], prev: LogEntry[], ext
   const oldTot = sumOf(prev, "total")
   const avg = es.length > 0 ? sumLatency(es) / es.length : 0.0
   const oldAvg = prev.length > 0 ? sumLatency(prev) / prev.length : 0.0
+  const tps = throughputOf(es)
+  const oldTps = throughputOf(prev)
   const trend = jobj([
     jkv("has_previous_period", prev.length > 0 ? "true" : "false"),
-    jkv("requests_trend", jn(prev.length > 0 ? ((req - oldReq) / (oldReq > 0.0 ? oldReq : 1.0)) * 100.0 : 0.0)),
-    jkv("tokens_trend", trendOf(tot, oldTot)),
-    jkv("cost_trend", trendOf(cost, oldCost)),
-    jkv("latency_trend", jn(oldAvg > 0.0 ? ((avg - oldAvg) / oldAvg) * 100.0 : 0.0)),
-    jkv("throughput_trend", jn(0.0)),
+    jkv("requests_trend", jn(pctChange(oldReq, req))),
+    jkv("tokens_trend", metricTrend(oldTot, tot)),
+    jkv("cost_trend", metricTrend(oldCost, cost)),
+    jkv("latency_trend", jn(oldAvg > 0.0 ? pctChange(oldAvg, avg) : 0.0)),
+    jkv("throughput_trend", jn(oldTps > 0.0 ? pctChange(oldTps, tps) : 0.0)),
   ])
-  const head = dim === "model" ? jkv("model", JSON.stringify(key)) : jkv("id", JSON.stringify(key))
-  return jobj([head, extra, jkv("total_requests", jn(req)), jkv("success_count", jn(c.success)), jkv("success_rate", jn(req > 0.0 ? (100.0 * c.success) / req : 0.0)), jkv("total_tokens", jn(tot)), jkv("total_cost", jn(cost)), jkv("avg_latency", jn(avg)), jkv("trend", trend)])
+  return jobj([head, extra, jkv("total_requests", jn(req)), jkv("success_count", jn(c.success)), jkv("success_rate", jn(req > 0.0 ? (100.0 * c.success) / req : 0.0)), jkv("total_tokens", jn(tot)), jkv("total_cost", jn(cost)), jkv("avg_latency", jn(avg)), jkv("throughput", jn(tps)), jkv("trend", trend)])
+}
+
+// The price split of a group: input, output and additional cost (Bifrost's model ranking fields).
+function costPairs(es: LogEntry[]): string {
+  let i = 0.0
+  let o = 0.0
+  let a = 0.0
+  for (const e of es) {
+    i += e.input_cost ?? 0.0
+    o += e.output_cost ?? 0.0
+    a += e.additional_cost ?? 0.0
+  }
+  return jkv("input_cost", jn(i)) + "," + jkv("output_cost", jn(o)) + "," + jkv("additional_cost", jn(a))
+}
+
+// The largest canonical model name of a group ("" when none is set), as Bifrost's MAX over the rows.
+function canonicalOf(es: LogEntry[]): string {
+  let out = ""
+  for (const e of es) {
+    const c = e.canonical_model_name ?? ""
+    if (c !== "" && c > out) out = c
+  }
+  return out
+}
+
+// Rankings group by (provider, model), as Bifrost's: the same model served by two providers ranks twice.
+function pairKey(e: LogEntry): string {
+  return JSON.stringify([e.provider, e.model])
+}
+
+function groupByPair(es: LogEntry[]): Map<string, LogEntry[]> {
+  const m: Map<string, LogEntry[]> = new Map()
+  for (const e of es) {
+    const k = pairKey(e)
+    const cur = m.get(k) ?? []
+    cur.push(e)
+    m.set(k, cur)
+  }
+  return m
 }
 
 function sumLatency(es: LogEntry[]): f64 {
@@ -1234,17 +1332,25 @@ function sumLatency(es: LogEntry[]): f64 {
   return s
 }
 
-// GET /api/logs/rankings: models by request count, each with its trend against prev (the same
-// span just before the window). limit caps the rows; 0 means no cap.
+// GET /api/logs/rankings: the (provider, model) pairs by request count, each with its trend against prev (the
+// same span just before the window). limit caps the rows; 0 means no cap. A row carries its provider, its
+// input, output and additional cost, and the alias's canonical model name when one is set.
 export function modelRankingsView(es: LogEntry[], prev: LogEntry[], limit: int): string {
-  const groups = groupBy(es, "model")
-  const prevGroups = groupBy(prev, "model")
-  const keys = distinctDim(es, "model")
-  const rows: { key: string, text: string, n: f64 }[] = []
+  const groups = groupByPair(es)
+  const prevGroups = groupByPair(prev)
+  const keys: string[] = []
+  for (const e of es) {
+    const k = pairKey(e)
+    if (!keys.includes(k)) keys.push(k)
+  }
+  const rows: { text: string, n: f64 }[] = []
   for (const k of keys) {
     const es2 = groups.get(k) ?? []
-    const provider = es2.length > 0 ? es2[0]!.provider : ""
-    rows.push({ key: k, text: rankRow(k, "model", es2, prevGroups.get(k) ?? [], jkv("provider", JSON.stringify(provider))), n: es2.length })
+    const first = es2[0]!
+    const extra: string[] = [jkv("provider", JSON.stringify(first.provider)), costPairs(es2)]
+    const canon = canonicalOf(es2)
+    if (canon !== "") extra.push(jkv("canonical_model_name", JSON.stringify(canon)))
+    rows.push({ text: rankRow(jkv("model", JSON.stringify(first.model)), es2, prevGroups.get(k) ?? [], extra.join(",")), n: es2.length })
   }
   rows.sort((a, b) => b.n - a.n)
   const out: string[] = []
@@ -1264,7 +1370,7 @@ export function dimensionRankingsView(es: LogEntry[], prev: LogEntry[], dim: str
   for (const k of distinctDim(es, dim)) {
     const es2 = groups.get(k) ?? []
     attributed += es2.length
-    rows.push({ text: rankRow(k, dim, es2, prevGroups.get(k) ?? [], jkv("name", JSON.stringify(k))), n: es2.length })
+    rows.push({ text: rankRow(jkv("id", JSON.stringify(k)), es2, prevGroups.get(k) ?? [], jkv("name", JSON.stringify(k))), n: es2.length })
   }
   rows.sort((a, b) => b.n - a.n)
   const out: string[] = []
@@ -1648,8 +1754,8 @@ test("histograms count by status, sum tokens and cost, and split by model and pr
   // the first bucket holds 100, 300 and 50 ms
   expect(lat.includes(`"avg_latency":150,"p90_latency":300,"p95_latency":300,"p99_latency":300,"total_requests":3`)).toBe(true)
   const thr = throughputView(es, g)
-  // 15 completion tokens in the first bucket
-  expect(thr.includes(`"total_completion_tokens":15,"total_requests":3`)).toBe(true)
+  // 15 completion tokens in the first bucket, from its two successful rows (the error row is left out)
+  expect(thr.includes(`"total_completion_tokens":15,"total_requests":2`)).toBe(true)
   const byDim = dimensionView(es, g, "cost", "provider")
   expect(byDim.includes(`"dimension":"provider"`)).toBe(true)
   expect(byDim.includes(`"dimension_values":["anthropic","openai"]`)).toBe(true)
@@ -1677,13 +1783,40 @@ test("stats views: Bifrost's totals with the older fields beside them, and ranki
 
   const rk = modelRankingsView(now, prev, 0)
   // A leads with two requests against one before: +100% requests
-  expect(rk.startsWith(`{"rankings":[{"model":"A","provider":"openai","total_requests":2,"success_count":2,"success_rate":100`)).toBe(true)
+  expect(rk.startsWith(`{"rankings":[{"model":"A","provider":"openai",`)).toBe(true)
+  expect(rk.includes(`"total_requests":2,"success_count":2,"success_rate":100`)).toBe(true)
   expect(rk.includes(`"requests_trend":100`)).toBe(true)
   expect(rk.includes(`"has_previous_period":true`)).toBe(true)
-  // B has no previous requests: its trend has no base for tokens and cost
-  expect(rk.includes(`"tokens_trend":null`)).toBe(true)
+  // B has no previous requests and no tokens or cost now: zero to zero is a 0% trend
+  expect(rk.includes(`"tokens_trend":0,"cost_trend":0`)).toBe(true)
   expect(modelRankingsView(now, prev, 1).split(`"model":`).length).toBe(2)
   expect(dimensionRankingsView(now, prev, "virtual_key", 0).includes(`"total_attributed_requests":0`)).toBe(true)
+})
+
+test("rankings are per provider and model, with the price split, canonical name and success-only throughput", () => {
+  const a1 = sample("h1", 500.0, "A", 200, { provider: "openai", latency_ms: 1000.0, completion_tokens: 50 })
+  a1.input_cost = 0.25
+  a1.output_cost = 0.5
+  a1.additional_cost = 0.25
+  a1.canonical_model_name = "alias-a"
+  a1.overhead_ms = 4.0
+  const a2 = sample("h2", 600.0, "A", 500, { provider: "openai", latency_ms: 1000.0, completion_tokens: 50 })
+  a2.overhead_ms = 8.0
+  const a3 = sample("h3", 700.0, "A", 200, { provider: "anthropic", latency_ms: 500.0, completion_tokens: 10 })
+  // the overall latency histogram averages the overhead of the rows that recorded one
+  const lv = latencyView([a1, a2, a3], gridOf(0.0, 120000.0))
+  expect(lv.includes(`"avg_overhead":6,"p90_overhead":8,"p95_overhead":8,"p99_overhead":8`)).toBe(true)
+  const rk = modelRankingsView([a1, a2, a3], [], 0)
+  expect(rk.split(`"model":`).length).toBe(3)
+  // the failed row spends latency but adds no throughput: 50 tokens over 1 s
+  expect(rk.includes(`"provider":"openai","input_cost":0.25,"output_cost":0.5,"additional_cost":0.25,"canonical_model_name":"alias-a"`)).toBe(true)
+  expect(rk.includes(`"throughput":50,"trend"`)).toBe(true)
+  expect(rk.includes(`"provider":"anthropic","input_cost":0,"output_cost":0,"additional_cost":0,"total_requests":1`)).toBe(true)
+  expect(rk.includes(`"throughput":20,"trend"`)).toBe(true)
+  // no previous period: a nonzero token total has no base, so its trend is null
+  expect(rk.includes(`"tokens_trend":null`)).toBe(true)
+  expect(histogramDimName("team_id")).toBe("team")
+  expect(histogramDimName("provider")).toBe("provider")
 })
 
 test("filters: status, providers, text, bounds and the window", () => {

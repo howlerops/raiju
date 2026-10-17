@@ -84,6 +84,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Access profiles / projects | partial: access profiles with versions, clone, activate, deactivate and propagate; projects with members and split policies; rate-limit splits and profile role binding are open |
 | RBAC | partial: built-in roles (admin, editor, viewer, auditor) and custom roles with permission pairs; Bifrost's role-id API shape is not built |
 | SSO (OIDC) | done (PKCE, groups to roles) |
+| SCIM provisioning | partial: `/scim/v2` Users and Groups (list with a userName or displayName filter and paging, get, create, PUT, PATCH including active false, delete), the discovery documents and the bearer token from `scim_config`; groups are teams. The provider's directory sync, claim mapping (`claimsSyncMode`, attribute mappings) and bulk are not built |
 | Secret managers | done (Vault KV v2, AWS Secrets Manager) |
 | Virtual MCPs | partial: `/mcp/{name}`, config and management API; no access-profile or project scoping |
 | Required headers | done (global and per access profile) |
@@ -99,7 +100,6 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Provider passthrough routes | done (OpenAI, Anthropic, Azure, Bedrock agent/guardrail, GenAI, ChatGPT Codex) |
 | Direct keys, raw request/response echo | partial: direct keys and send-back of raw requests and responses are done; `x-bf-store-raw-request-response` is not built |
 | Reasoning parameters | done (Anthropic, Gemini, Bedrock Claude and Nova) |
-| SCIM | not built (moved in from Out by the owner, 2026-10-17; L115) |
 | A2A (agent-to-agent, registered agents) | not built (moved in from Out by the owner, 2026-10-17: agent cards, JSON-RPC tasks, `/agents/a2a` and `/api/agents`; L116) |
 | MCP code mode | not built (moved in from Out by the owner, 2026-10-17; L117) |
 

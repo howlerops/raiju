@@ -1,6 +1,6 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
-import { Config, VirtualKeyConfig, providerOf, providerNames } from "./config"
+import { Config, VirtualKeyConfig, providerOf, providerNames, resolveEnv } from "./config"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
@@ -27,7 +27,8 @@ import { resourceOf } from "./rbac"
 import { matchRoute, handleMedia, deploymentRoute, deploymentRequest, realtimeSdp, nativeRoute, nativeCloud, vertexBearer } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs } from "./schemas"
-import { handleApi, proxyWidening, Result } from "./store"
+import { handleApi, proxyWidening, Result, randomId } from "./store"
+import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
 import { passthroughPath, passthroughRoute } from "./passthrough"
 import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, headersRouteAsync, perUserApi, McpReply } from "./mcpapi"
 import { issuerRoute, keyById, grantsList, grantRevoke } from "./mcpissuer"
@@ -429,6 +430,47 @@ function savedReply(status: int, body: string, saved: Result | undefined): Reply
   return { status: status, body: body, contentType: "application/json" }
 }
 
+// The SCIM reply: the body with the SCIM media type.
+function scimReply(status: int, body: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", SCIM_CONTENT_TYPE)
+  return new Response(body, { status: status, headers: h })
+}
+
+// The virtual keys' teams: a group in use by one is not deleted over SCIM.
+function keyTeamIds(vks: VirtualKeyConfig[] | undefined): string[] {
+  const out: string[] = []
+  for (const vk of vks ?? []) {
+    const t = vk.team_id
+    if (t !== undefined) out.push(t)
+  }
+  return out
+}
+
+// /scim/v2: the identity provider's SCIM requests, behind scim_config's provisioning token. The users and
+// teams a request changes are saved as one change and audited under the actor "scim".
+async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response> {
+  const sc = ops.store.cfg.scim_config
+  if (sc?.enabled !== true) return scimReply(404, errorBody(404, "", "SCIM provisioning is not enabled"))
+  const token = resolveEnv(sc?.config?.provisioningToken ?? "")
+  if (!scimAuthorized(req.headers.get("authorization") ?? "", token)) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
+  const body = req.method === "GET" ? "" : await req.text()
+  const u = URL.parse(req.url)
+  const origin = u === undefined ? "" : u.origin
+  const params = u === undefined ? new URLSearchParams("") : u.searchParams
+  const g = ops.store.cfg.governance
+  const st: ScimState = { users: g?.users ?? [], teams: g?.teams ?? [], roles: g?.roles ?? [], keyTeams: keyTeamIds(g?.virtual_keys) }
+  const r = scimHandle(st, req.method, path.slice("/scim/v2".byteLength), params, body, origin + "/scim/v2", () => randomId("team-"))
+  if (r.changed && r.status < 300) {
+    const saved = ops.store.setScim(r.state.users, r.state.teams)
+    if (saved.kind !== "ok") return scimReply(saved.status, errorBody(saved.status, "", saved.message))
+    ops.storeUpdated("/api/users")
+    ops.storeUpdated("/api/governance/teams")
+  }
+  if (req.method !== "GET") ops.recordChange("scim", req, path, r.status, body)
+  return scimReply(r.status, r.body)
+}
+
 // The management API, behind RBAC; every change lands in the audit log.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const gate = ops.gate(req, path)
@@ -723,6 +765,8 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   const cp = compatPath(p)
   if (cp !== p) return try await dispatch(engine, ops, await unprefixed(req, cp))
   const segs = p.split("/")
+  // SCIM 2.0 provisioning from the identity provider, behind its own bearer token (scim.tov)
+  if (p === "/scim/v2" || p.startsWith("/scim/v2/")) return await scimRoute(ops, req, p)
   if (p === "/mcp") return await ops.mcp(req, undefined)
   if (p.startsWith("/mcp/") && segs.length === 3) return await ops.mcp(req, segs[2]!)
   // the Anthropic SDK's batch, file and model routes: before the generic media routes
