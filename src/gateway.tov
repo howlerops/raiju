@@ -26,7 +26,7 @@ import { compileLocal, localVerdict } from "./guard_local"
 import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
 import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream"
 import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
-import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
+import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, RS } from "./providers/types"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
 import { ResponsesToChatStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias } from "./router"
@@ -1616,7 +1616,7 @@ export class Engine {
           live = dl
           const signal = dl.controller.signal
           const px = proxyOf(p)
-          const res = up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal, proxy: px, tls: tlsOf(t.cfg) }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal, proxy: px, tls: tlsOf(t.cfg) })
+          const res = up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
           status = res.status
           // circuit policies: this response's headers may open the circuit of a policy for this primary
           if (this.health.policyList().length > 0) {
@@ -1716,7 +1716,7 @@ export class Engine {
           if (more !== undefined && status >= 200 && status < 300) {
             for (const x of more) {
               const xh: Record<string, string> = x.headers
-              const xr = await fetch(x.url, { method: "POST", headers: xh, body: x.body, signal: signal, proxy: px, tls: tlsOf(t.cfg) })
+              const xr = await fetch(x.url, { method: "POST", headers: xh, body: x.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
               const xt = await xr.text()
               if (xr.status < 200 || xr.status >= 300) {
                 status = xr.status
@@ -1870,7 +1870,7 @@ export class Engine {
     const up = try providers.embeddingsUpstream(sel.t, try fields(`{"model":${quote(sc.embedding_model)},"input":${quote(text)}}`))
     const hs: Record<string, string> = up.headers
     const dl = deadline(10000)
-    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(sel.t.cfg), tls: tlsOf(sel.t.cfg) })
+    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(sel.t.cfg), tls: tlsOf(sel.t.cfg), pool: poolOf(sel.t.cfg) })
     const body = try await res.text()
     dl.finish()
     if (!res.ok) throw new Error(`embedding request failed with HTTP ${res.status}`)
@@ -2180,7 +2180,7 @@ export class Engine {
       const up = oauthKey.tokenRequest(oc, Math.floor(now / 1000))
       const hs: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" }
       const dl = deadline(10000)
-      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg) })
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
       const text = await res.text()
       dl.finish()
       const tok = oauthKey.parseOAuthToken(text, now)
@@ -2203,7 +2203,7 @@ export class Engine {
       const up = databricks.oauthTokenRequest(host, dk.client_id ?? "", dk.client_secret ?? "")
       const hs: Record<string, string> = up.headers
       const dl = deadline(10000)
-      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg) })
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
       const text = await res.text()
       dl.finish()
       const tok = databricks.parseOAuthToken(text, now)
@@ -2889,6 +2889,88 @@ export class Engine {
       tracer.finish(span)
       if (tracer.shouldFlush(Date.now())) this.flushTraces(tracer)
     }
+  }
+
+  // Whether anything guards the text of a live session's events (the built-in guard, or a provider).
+  liveGuarded(): bool {
+    return (this.guard !== undefined && (this.guardInput || this.guardOutput)) || this.guardProviders.length > 0
+  }
+
+  // Checks a piece of a live session's text, as the request path checks a prompt (source "input") or an
+  // answer (source "output"): the built-in guard first (block, or redact and go on), then each provider
+  // that covers the source. action is "pass", "redact" (text is the replacement) or "block".
+  async liveGuard(text: string, source: string): Promise<{ action: string, text: string, reason: string }> {
+    const src: "input" | "output" = source === "output" ? "output" : "input"
+    let cur = text
+    let action = "pass"
+    const g = this.guard
+    if (g !== undefined && (src === "input" ? this.guardInput : this.guardOutput)) {
+      const r = applyToText(cur, g)
+      for (const f of r.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, g.mode), 1.0)
+      if (r.blocked) {
+        const kinds: string[] = []
+        for (const f of r.findings) {
+          if (!kinds.includes(f.kind)) kinds.push(f.kind)
+        }
+        return { action: "block", text: cur, reason: `found ${kinds.join(", ")}` }
+      }
+      if (g.mode === "redact" && r.findings.length > 0) {
+        cur = r.body
+        action = "redact"
+      }
+    }
+    if (this.guardProviders.length > 0) {
+      const v = await this.externalGuard(cur, src)
+      if (v.action === "block") return { action: "block", text: cur, reason: v.reason }
+      const red = v.text
+      if (v.action === "redact" && red !== undefined) {
+        cur = red
+        action = "redact"
+      }
+    }
+    return { action: action, text: cur, reason: "" }
+  }
+
+  // A finished live session (WebRTC) in the request log, the exporters, the spans and the governance
+  // usage, as one request: the model it ran, its duration as the latency, the tokens of its delegated
+  // responses, and the voice seconds it was billed in the row's metadata.
+  recordLive(h: Hdrs, grant: Grant, provider: string, model: string, status: int, durationMs: f64, promptTokens: int, completionTokens: int, input: string, output: string, error: string, extra: Record<string, string>): void {
+    const c = new ReqCtx(h.get("x-request-id") ?? newId("req_"), "live", performance.now() - durationMs)
+    c.provider = provider
+    c.model = model
+    c.status = status
+    c.promptTokens = promptTokens
+    c.completionTokens = completionTokens
+    c.error = error
+    c.requested = model
+    c.contentOff = this.contentOff(h)
+    if (!c.contentOff) {
+      c.input = input
+      c.output = output
+    }
+    c.virtualKey = grant.vk?.id ?? ""
+    c.userId = grant.vk?.user_id ?? ""
+    const at: Attribution = grant.attr ?? noAttribution()
+    c.teamId = at.teamId
+    c.customerId = at.customerId
+    c.businessUnitId = at.businessUnitId
+    c.projectId = at.projectId
+    c.userAgent = h.get("user-agent") ?? ""
+    c.sessionId = sessionId(h) ?? ""
+    const xApp = h.get("x-bf-app") ?? ""
+    c.app = xApp !== "" ? xApp : appOf(h.get("user-agent") ?? "", this.cfg.user_agent_mappings ?? [])
+    const meta: Record<string, string> = {}
+    const base = logMetadata(h, this.cfg.client?.logging_headers ?? [])
+    if (base !== undefined) {
+      for (const k of base.keys()) meta.set(k, base.get(k)!)
+    }
+    for (const k of extra.keys()) meta.set(k, extra.get(k)!)
+    c.meta = meta
+    const cids = correlationIds(h)
+    c.parentId = cids.parent
+    c.agentId = cids.agent
+    this.record(c)
+    this.gov.record(grant, promptTokens + completionTokens, c.cost)
   }
 
   // Sends queued spans to the collector in the background; export failures are logged, never raised.

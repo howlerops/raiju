@@ -1,6 +1,7 @@
 #!/bin/sh
 # Builds Tov with the patches in tov-patches/ (streamed response bodies for
-# Bun.serve, child processes as sockets, TLS ALPN, UDP sockets, WebAssembly on WAMR) into
+# Bun.serve, child processes as sockets, TLS ALPN, UDP sockets, WebAssembly on WAMR, WebRTC on libdatachannel,
+# fetch pool options and HTTP/2) into
 # build/tov/target/release/tov, applied in name order. Raiju needs this build
 # until the patches are upstream. Usage: scripts/build-tov.sh  (needs git and cargo)
 set -eu

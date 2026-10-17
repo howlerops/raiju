@@ -11,7 +11,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Chat completions + streaming | done (chunk-by-chunk on the default server) |
 | Embeddings | done (OpenAI-format, Cohere, Gemini, Vertex, Bedrock Titan and Cohere) |
 | List models | partial: upstream listing for OpenAI-format, Anthropic, Gemini, Bedrock, Vertex and Cloudflare; other providers list their configured models; Databricks lists none, as Bifrost does |
-| Realtime | partial: WebSocket relay (OpenAI, Azure, xAI); client secrets, sessions and SDP calls pass through; live sessions are OpenAI only; POST /v1/live/sessions (WebRTC create) passes the SDP offer to OpenAI with no gateway WebRTC peer, so its media and events are not metered |
+| Realtime | partial: WebSocket relay (OpenAI, Azure, xAI); client secrets, sessions and SDP calls pass through; live sessions are OpenAI only; POST /v1/live/sessions (WebRTC create) is terminated here (libdatachannel in the Tov runtime): the gateway is the WebRTC peer on both sides and meters, guards and logs the audio session's events; the live WebSocket path and the /v1/realtime SDP calls are still relays |
 | Exact-match cache | done |
 | Anthropic SDK route | partial: messages (any provider, streaming), models, message batches and files (passthrough or via an OpenAI-format provider); legacy /anthropic/v1/complete has no streaming yet |
 | Bedrock SDK route | done: converse, invoke, converse-stream and invoke-with-response-stream to any provider, count-tokens (exact where Bedrock counts, estimated elsewhere), /bedrock/rerank |

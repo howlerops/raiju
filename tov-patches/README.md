@@ -3,11 +3,11 @@
 Raiju builds against [Tov](https://github.com/richiemcilroy/Tov) at commit
 `c2048582de4e9468267f801313144d75c12e983f` plus the patches here, applied in
 order by `scripts/build-tov.sh` (`make tov`). Each patch is written to be offered
-upstream. `tests/run.sh` checks all five with the patched compiler:
+upstream. `tests/run.sh` checks all of them with the patched compiler:
 `TOV=build/tov/target/release/tov tov-patches/tests/run.sh` (or `make tov-test`).
 Patch 0004 is written on top of 0003 (its hunks include the ALPN signatures), so the
-patches apply in order only. Patch 0005 adds a vendored C library (about 2.7 MB of text), which
-the first four do not.
+patches apply in order only. Patches 0005 (WAMR) and 0006 (libdatachannel) add vendored C
+libraries (about 2.7 MB and 4.9 MB of text), which the first four do not; 0006 is applied on top of 0005.
 
 ## Submitting upstream
 
@@ -260,3 +260,140 @@ WASI file or socket access, no threads, no SIMD, no floating-point arguments in 
 imports a host function could provide (a module is linked against the fixed set above),
 no multi-memory, and one memory read or written by offset, not mapped into Tov. The test is
 `tov-patches/tests/wasm.tov`, run against `wasm_mod.wasm` (source `wasm_mod.c`).
+
+## 0006 — WebRTC (`std/rtc`, on libdatachannel)
+
+**Problem.** Tov had no WebRTC, so a program could not be a peer: it could not answer a browser's SDP offer,
+open a data channel, or carry audio. An LLM gateway that terminates a browser's WebRTC session (to meter, guard
+and log its events, as Bifrost does with Pion) needs all three.
+
+**API (`import { RTCPeerConnection } from "std/rtc"`; callbacks, like the browser's, on Tov's event loop).**
+
+```ts
+const pc = new RTCPeerConnection({ iceServers: ["stun:stun.example.test:3478"], bindAddress: "127.0.0.1" })
+pc.ondatachannel = (ch) => { ch.onmessage = (m) => ch.send(m) }   // text or bytes
+pc.ontrack = (t) => { t.onpacket = (rtp) => other.sendRtp(rtp, ssrc, payloadType) }   // RTP in and out, no decoding
+pc.onlocaldescription = (sdp, type) => {}      // the answer to a remote offer is made on its own
+pc.ongatheringchange = (s) => { if (s === "complete") reply(pc.localDescription) }   // candidates included
+pc.onstatechange = (s) => {}                   // new, connecting, connected, disconnected, failed, closed
+pc.setRemoteDescription(offer, "offer")        // "" or the error
+pc.addTrack({ codec: "opus", direction: "sendrecv" }); pc.createDataChannel("oai-events")
+pc.setLocalDescription()                       // an offer, from the channels and tracks added
+pc.close()                                     // frees it, its channels and tracks; its callbacks never fire again
+```
+
+`RTCDataChannel` has `send`, `bufferedAmount`, `onopen`, `onmessage`, `onclose`, `onerror`,
+`onbufferedamountlow` and `close`; `RTCTrack` has `sendRtp(packet, ssrc?, payloadType?)` (a negative or missing
+value keeps the packet's own; otherwise the header is rewritten, which is how a relay puts one leg's packets on
+the other's stream), `onpacket`, `payloadType` and `direction`.
+
+**Design.**
+- libdatachannel v0.24.6 (MPL-2.0) with its dependencies, vendored under `vendor/rtc/` byte for byte from the
+  tags below, minus tests, examples and docs: libjuice (ICE and STUN/TURN, MPL-2.0), usrsctp (SCTP for data
+  channels, BSD), libsrtp 2.8.0 (SRTP, BSD) and plog (headers, MIT). `vendor/rtc/srtp/config.h` is the one file
+  that is ours (what libsrtp's CMake writes for the OpenSSL backend, by compiler macros). `vendor/rtc/TOV.md`
+  lists the commits and the build flags. WebSockets in libdatachannel are compiled out (`RTC_ENABLE_WEBSOCKET=0`).
+- The crypto library is the vendored BoringSSL that `fetch()` already links: libdatachannel's OpenSSL backend and
+  libsrtp's OpenSSL provider compile and run against it (DTLS 1.2 with the SRTP profiles, X.509 fingerprints),
+  so a program carries one TLS library. Programs that use `std/rtc` link it, so they are also fetch programs.
+- `runtime/rtc.c` is the bridge (C, over libdatachannel's C API). libdatachannel calls back on threads of its
+  own; nothing there touches the Tov runtime. Each callback appends an event to a mutex-protected queue and
+  writes a byte to a pipe the event loop watches (`tv_io_add`, `runtime/net.c`); the loop pops the events and
+  runs one Tov closure for each: `(kind, id, n, bytes, text)`, which `std/rtc` routes to the objects. A callback
+  installs the callbacks of a channel or track the remote side made before it returns, so no event of it is missed.
+  RTP packets are dropped (not queued) when 4,096 events wait. A live peer connection keeps the program running.
+- The natives are the `rtc*` family in `runtime/net.c` (declared in `tov.h`, signatures in `builtins.rs`); they
+  go through a table of operations (`tv_rtc_impl`) that only `rtc.c` fills, so programs without `std/rtc` carry
+  none of it. Codegen adds `tv_rtc_install()` to a program that calls `rtcPeer`; `build.rs` then links the rtc
+  archive in front of the TLS ones, with `-lstdc++`.
+- The archive is compiled the first time a program needs it (about four minutes on four cores at `-O2`), by
+  `crates/tov/src/build/rtc.rs` from sources the compiler embeds, as the TLS one is, and cached by their hash,
+  the compiler and the flags. Environment: `TOV_RTC_LOG=debug|info|warning|none` sets the library's log level
+  (default: errors, to stderr).
+- At exit the connections still open are closed (`atexit`), so libdatachannel's threads do not hold the process.
+
+**Files.**
+- `runtime/rtc.c`, `runtime/net.c`, `runtime/tov.h`: the bridge, the natives, the operations table.
+- `crates/tov/src/std/rtc.tov`, `crates/tov/src/driver.rs`: the module (`std/rtc`) and its registration.
+- `crates/tov/src/check/builtins.rs`: the native signatures.
+- `crates/tov/src/codegen/mod.rs`, `crates/tov/src/build.rs`, `crates/tov/src/build/rtc.rs`, `crates/tov/build.rs`:
+  the install call, the archive and its link.
+- `vendor/rtc/`: the libraries.
+
+**Tested.** `tov-patches/tests/rtc.tov` (20 checks): two peers on the loopback address, an offer made from a
+track and a channel, the answer made from it, text and bytes both ways, Opus RTP with rewritten SSRC and payload
+type, states, the selected candidate pair, close. Raiju's end-to-end tests also run aiortc (Python) as the browser.
+
+**Not covered.** Video (tracks are audio: Opus, PCMU, PCMA), WebSocket and TURN-over-TCP use of the library,
+media handlers (packetizers, NACK, bandwidth estimation: RTP passes as it is, with the library's receiver
+reports), Windows. The macOS build flags for usrsctp and the C++ link are written from its documentation and
+untested. Two Tov compiler faults found on the way, both worked around: `switch` on a string variable releases
+the string twice, and a closure that captures a class-typed parameter of the closure around it doesn't compile
+(both to report upstream).
+
+## 0007 — fetch pool options and upstream HTTP/2 (`RequestInit.pool`)
+
+**Problem.** `fetch` pooled keep-alive connections with no way to tune them: idle connections
+lived until the server closed them, any number of requests opened that many connections to a
+host, and every request was HTTP/1.1. An LLM gateway needs a per-provider idle timeout and
+connection cap (Bifrost's `keep_alive_timeout_in_seconds` and `max_conns_per_host`), and
+HTTP/2 to providers that serve it (`enforce_http2`, `http2_ping_interval_in_seconds`).
+
+**API (Tov; not in Bun).**
+
+```ts
+const res = await fetch("https://api.example.com/v1/x", {
+  pool: {
+    keepAliveTimeout: 30,      // seconds an idle connection is kept for reuse (default: until the server closes it)
+    maxConnections: 100,       // connections to the origin at once; more requests wait their turn (default: no limit)
+    http2: "prefer",           // "off" (default) | "prefer" | "require"
+    http2PingInterval: 10,     // seconds without a frame before a PING is sent (0: none)
+  },
+})
+```
+
+**Design.**
+- Requests whose options differ do not share connections: the options are part of the pool
+  key, so each provider's settings are its own pool. Requests without `pool` behave as before.
+- `maxConnections` counts connections open or being made. A request that cannot start (no idle
+  connection, no HTTP/2 connection with room, cap reached) waits in a per-origin FIFO queue
+  and starts when a connection goes idle or closes. A waiting request that is aborted leaves
+  the queue.
+- `keepAliveTimeout` stamps a connection when it goes idle and closes it once the stamp is
+  that old (checked when the connection is picked for a request, and by one timer that does
+  not keep the program running).
+- `http2: "prefer"` offers `h2` then `http/1.1` in the TLS handshake (patch 0003's ALPN). A server
+  that picks `h2` gets one connection with many request streams (concurrent requests wait for
+  the first connection's answer instead of each opening one); one that does not gets
+  HTTP/1.1, as Go's `ForceAttemptHTTP2` does. `"require"` offers only `h2` and fails the
+  request with code `HTTP2NotNegotiated` otherwise. Plain `http:` URLs are always HTTP/1.1
+  (no h2c).
+- The framing is [nghttp2](https://nghttp2.org) 1.64.0 (MIT), vendored in `vendor/nghttp2`
+  (see its `TOV.md`) and compiled with the other TLS-side libraries. `runtime/h2.c` is a thin
+  layer over it; `runtime/tov.c` keeps the sockets, TLS and request objects. The request head is
+  the same HTTP/1.1 head `fetch` always builds, turned into pseudo-headers and headers; the
+  response head is turned back into an HTTP/1.1 head and parsed by the existing parser, so
+  content decoding, redirects, `res.body` streaming and abort behave as they do on HTTP/1.1.
+- Flow control follows the reader: body bytes are returned to the stream's window only once the
+  reader has room (the same 256 KiB mark that pauses an HTTP/1.1 socket), so a slow reader holds
+  its own stream and not the connection's others. Windows are 1 MiB per stream and 16 MiB for the
+  connection.
+- With `http2PingInterval`, a connection that has received no frame for that long sends a
+  PING; one that is not answered within 15 seconds is closed and its requests fail (or, if
+  nothing of theirs was answered and the connection had served requests before, are retried).
+  GOAWAY and REFUSED_STREAM retry requests the server did not process on another connection.
+- An aborted request cancels its stream (RST_STREAM) and leaves the connection open.
+
+**Files.**
+- `runtime/tov.c`, `runtime/tov.h`: the pool (origin queue, limits, timer), the HTTP/2 connections,
+  and `fetchStart`'s four new arguments.
+- `runtime/h2.c`: the nghttp2 layer; `runtime/tls.c` installs it with the TLS library.
+- `vendor/nghttp2`, `crates/tov/build.rs`, `crates/tov/src/tls_flags.rs`: the library and how it is built.
+- `crates/tov/src/check/builtins.rs`, `crates/tov/src/std/http.tov`: the signature and `PoolOptions`.
+
+**Not covered.** No h2c (plain-text HTTP/2), no server push (disabled), no HTTP/2 priorities,
+no `Upgrade`/WebSocket over HTTP/2. HTTP/2 over a proxy works through `CONNECT` like HTTPS does.
+Limits are per process: a `Bun.serve` with `workers: n` has a pool per worker. The tests
+(`tests/fetch_pool.tov`, driven by `tests/h2_server.py`) need Python's `h2` package; `run.sh`
+installs it to a temporary directory if it is missing and skips the HTTP/2 and pool checks
+if it cannot.

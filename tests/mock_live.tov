@@ -1,0 +1,165 @@
+// A fake GPT Live provider that is a real WebRTC peer, for the end-to-end tests (mock_upstream.tov serves
+// POST /v1/live/sessions with answer()). It answers the gateway's SDP offer, opens the session on the
+// "oai-events" channel the gateway creates, echoes the audio back, and plays the provider's side of the
+// event protocol: session.started, cumulative session.usage.updated, transcripts, response.event usage
+// and session.closed with the final usage. Test events steer it:
+//   {"type":"test.speak","text":"..."}      an input transcript and an output transcript word by word
+//   {"type":"test.usage","seconds":N}       a session.usage.updated with N cumulative seconds
+//   {"type":"test.backend","input":N,"output":M}  a completed delegated response with that usage
+//   {"type":"test.hangup"}                  closes the connection with no session.closed
+//   {"type":"session.close","mock_seconds":N}     session.closed with usage.seconds N (default 20)
+// Any other event comes back as {"type":"echo","event":<it>}.
+import { RTCPeerConnection, RTCDataChannel, RTCTrack, RTCConfig } from "std/rtc"
+import { fields, find, rawStr } from "../src/json"
+
+class MockLive {
+  // every event the provider peer received, as {"session":id,"event":<event>}
+  events: string[] = []
+  sessions = 0
+  packets = 0
+  offers: string[] = []
+  closedSessions: string[] = []
+}
+
+const LIVE = new MockLive()
+
+export function liveEvents(): string {
+  return "[" + LIVE.events.join(",") + "]"
+}
+
+export function liveStats(): string {
+  return JSON.stringify({ sessions: LIVE.sessions, packets: LIVE.packets, offers: LIVE.offers.length, closed: LIVE.closedSessions })
+}
+
+export function liveReset(): void {
+  LIVE.events = []
+  LIVE.packets = 0
+}
+
+function wait(ms: int): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+function field(text: string, key: string): string {
+  try {
+    return find(fields(text), key) ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// Answers a create body {"session":{...},"transport":{"type":"webrtc","sdp":offer}}: the response body, or
+// "" when the offer is missing or refused.
+export async function liveAnswer(body: string): Promise<string> {
+  let offer = ""
+  try {
+    offer = rawStr(fields(field(body, "transport")), "sdp") ?? ""
+  } catch (e) {
+    return ""
+  }
+  if (offer === "") return ""
+  // a model this provider has no live session for
+  if (body.includes(`"model":"gpt-live-refuse"`)) return ""
+  LIVE.sessions += 1
+  LIVE.offers.push(offer)
+  const id = LIVE.sessions === 1 ? "sess_mock_rtc" : "sess_mock_rtc_" + LIVE.sessions
+  const cfg: RTCConfig = { bindAddress: process.env.MOCK_RTC_BIND ?? "127.0.0.1" }
+  let pc: RTCPeerConnection
+  try {
+    pc = try new RTCPeerConnection(cfg)
+  } catch (e) {
+    return ""
+  }
+  const session = new MockSession(id, pc)
+  pc.ondatachannel = (incoming) => {
+    const ch = incoming
+    session.channel = ch
+    ch.onopen = () => {
+      session.start()
+    }
+    ch.onmessage = (m) => {
+      if (typeof m === "string") session.handle(m)
+    }
+  }
+  pc.ontrack = (incoming) => {
+    const t = incoming
+    session.track = t
+    t.onpacket = (p) => {
+      LIVE.packets += 1
+      // the audio comes back as it came: a loopback
+      t.sendRtp(p)
+    }
+  }
+  let gathered = false
+  pc.ongatheringchange = (s) => {
+    if (s === "complete") gathered = true
+  }
+  if (pc.setRemoteDescription(offer, "offer") !== "") return ""
+  for (let i = 0; i < 300 && !gathered; i++) await wait(10)
+  return `{"session":{"id":"${id}","type":"realtime"},"transport":{"type":"webrtc","sdp":${JSON.stringify(pc.localDescription)}}}`
+}
+
+class MockSession {
+  channel: RTCDataChannel | undefined = undefined
+  track: RTCTrack | undefined = undefined
+  seconds = 0.0
+  done = false
+  constructor(readonly id: string, readonly pc: RTCPeerConnection) {}
+
+  send(m: string): void {
+    const c = this.channel
+    if (c !== undefined) c.send(m)
+  }
+
+  start(): void {
+    this.send(`{"type":"session.started","session":{"id":"${this.id}"}}`)
+    this.seconds = 2.5
+    this.send(`{"type":"session.usage.updated","usage":{"seconds":2.5}}`)
+  }
+
+  handle(m: string): void {
+    LIVE.events.push(`{"session":"${this.id}","event":${m}}`)
+    let type = ""
+    try {
+      type = rawStr(fields(m), "type") ?? ""
+    } catch (e) {
+      return
+    }
+    if (type === "session.close") {
+      let secs = 20.0
+      const ms = field(m, "mock_seconds")
+      if (ms !== "") secs = parseFloat(ms) ?? 20.0
+      this.send(`{"type":"session.closed","reason":"close_requested","usage":{"seconds":${secs}}}`)
+      LIVE.closedSessions.push(this.id)
+      return
+    }
+    if (type === "test.speak") {
+      let text = ""
+      try {
+        text = rawStr(try fields(m), "text") ?? ""
+      } catch (e) {
+        return
+      }
+      this.send(`{"type":"session.input_transcript.delta","delta":"hello","start_ms":0,"end_ms":400}`)
+      for (const w of text.split(" ")) this.send(`{"type":"session.output_transcript.delta","delta":${JSON.stringify(w + " ")},"start_ms":500,"end_ms":900}`)
+      return
+    }
+    if (type === "test.usage") {
+      const n = parseFloat(field(m, "seconds")) ?? 0.0
+      this.seconds = n
+      this.send(`{"type":"session.usage.updated","usage":{"seconds":${n}}}`)
+      return
+    }
+    if (type === "test.backend") {
+      const i = field(m, "input")
+      const o = field(m, "output")
+      this.send(`{"type":"response.event","delegation_id":"d1","event":{"type":"response.completed","response":{"id":"resp_${i}_${o}","usage":{"input_tokens":${i},"output_tokens":${o}}}}}`)
+      return
+    }
+    if (type === "test.hangup") {
+      this.pc.close()
+      return
+    }
+    this.send(`{"type":"echo","event":${m}}`)
+  }
+}

@@ -1,0 +1,158 @@
+// A WebRTC "browser" for the end-to-end tests: it makes an audio track and the "oai-events" data channel,
+// creates a live session with POST /v1/live/sessions (the SDP offer in the body, as a browser does), runs
+// a script on the session and prints one line, RESULT <json>, with what happened.
+//
+// Environment: GW (the gateway's origin), AUTH (the Authorization header), MODEL, EXTRA (a JSON object
+// merged into "session"), BIND (the local address, default 127.0.0.1), OFFER (a literal SDP to send instead
+// of the real one), SCRIPT (a JSON array of steps):
+//   {"send": <event>}                 send a JSON event on the data channel
+//   {"rtp": N}                        send N RTP packets of audio, 20 ms apart
+//   {"wait": "type", "count": N, "ms": M}   wait until N events of that type arrived (default 1, 8000 ms)
+//   {"sleep": M}                      wait M ms
+//   {"leave": true}                   close the peer connection at once
+import { RTCPeerConnection, RTCDataChannel, RTCTrack, RTCConfig } from "std/rtc"
+import { fields, elements, find, rawStr, rawNum, quote } from "../src/json"
+
+function wait(ms: int): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+function packet(seq: int): u8[] {
+  const p: u8[] = []
+  for (let i = 0; i < 32; i++) p.push(u8(0))
+  p[0] = u8(0x80)
+  p[1] = u8(111)
+  p[2] = u8((seq >> 8) & 255)
+  p[3] = u8(seq & 255)
+  const ts = seq * 960
+  p[4] = u8((ts >> 24) & 255)
+  p[5] = u8((ts >> 16) & 255)
+  p[6] = u8((ts >> 8) & 255)
+  p[7] = u8(ts & 255)
+  p[11] = u8(210)
+  p[8] = u8(0)
+  p[9] = u8(0)
+  p[10] = u8(4)
+  p[12] = u8(seq & 127)
+  return p
+}
+
+function typeOf(ev: string): string {
+  try {
+    return rawStr(fields(ev), "type") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+function count(events: string[], type: string): int {
+  let n = 0
+  for (const e of events) {
+    if (typeOf(e) === type) n += 1
+  }
+  return n
+}
+
+async function main(): Promise<void, Error> {
+  const gw = process.env.GW ?? ""
+  const bind = process.env.BIND ?? "127.0.0.1"
+  const cfg: RTCConfig = { bindAddress: bind }
+  const pc = try new RTCPeerConnection(cfg)
+  const track = try pc.addTrack({ direction: "sendrecv", codec: "opus", payloadType: 111, ssrc: 1234, name: "mic", profile: "minptime=10;useinbandfec=1" })
+  const channel = pc.createDataChannel("oai-events")
+  const events: string[] = []
+  let rtpIn = 0
+  let rtpSent = 0
+  let channelClosed = false
+  channel.onmessage = (m) => {
+    if (typeof m === "string") events.push(m)
+  }
+  channel.onclose = () => {
+    channelClosed = true
+  }
+  track.onpacket = (p) => {
+    rtpIn += 1
+  }
+  let gathered = false
+  pc.ongatheringchange = (s) => {
+    if (s === "complete") gathered = true
+  }
+  pc.setLocalDescription("")
+  for (let i = 0; i < 300 && !gathered; i++) await wait(10)
+  let offer = pc.localDescription
+  const literal = process.env.OFFER ?? ""
+  if (literal !== "") offer = literal
+
+  let session = `{"model":${quote(process.env.MODEL ?? "openai/gpt-4o-mini")}`
+  const extra = process.env.EXTRA ?? ""
+  if (extra !== "") {
+    for (const f of try fields(extra)) session += `,${quote(f.key)}:${f.raw}`
+  }
+  session += "}"
+  const body = `{"session":${session},"transport":{"type":"webrtc","sdp":${quote(offer)}}}`
+  const headers: Record<string, string> = {}
+  headers.set("content-type", "application/json")
+  const auth = process.env.AUTH ?? ""
+  if (auth !== "") headers.set("authorization", auth)
+  const res = try await fetch(gw + "/v1/live/sessions", { method: "POST", headers: headers, body: body })
+  const text = try await res.text()
+  if (res.status !== 201) {
+    console.log("RESULT " + JSON.stringify({ status: res.status, body: text }))
+    pc.close()
+    return
+  }
+  const reply = try fields(text)
+  const sid = rawStr(try fields(find(reply, "session") ?? "{}"), "id") ?? ""
+  const answer = rawStr(try fields(find(reply, "transport") ?? "{}"), "sdp") ?? ""
+  const bad = pc.setRemoteDescription(answer, "answer")
+  if (bad !== "") {
+    console.log("RESULT " + JSON.stringify({ status: 201, session: sid, error: bad }))
+    pc.close()
+    return
+  }
+  let opened = false
+  for (let i = 0; i < 500 && !opened; i++) {
+    opened = channel.readyState === "open"
+    if (!opened) await wait(20)
+  }
+  const steps = try elements(process.env.SCRIPT ?? "[]")
+  let seq = 0
+  for (const st of steps) {
+    const f = try fields(st)
+    const send = find(f, "send")
+    if (send !== undefined) {
+      channel.send(send)
+      continue
+    }
+    const rtp = rawNum(f, "rtp")
+    if (rtp !== undefined) {
+      for (let i = 0; i < Math.trunc(rtp); i++) {
+        seq += 1
+        if (track.sendRtp(packet(seq))) rtpSent += 1
+        await wait(20)
+      }
+      continue
+    }
+    const w = rawStr(f, "wait")
+    if (w !== undefined) {
+      const want = Math.trunc(rawNum(f, "count") ?? 1.0)
+      const limit = Math.trunc(rawNum(f, "ms") ?? 8000.0)
+      for (let waited = 0; waited < limit && count(events, w) < want; waited += 10) await wait(10)
+      continue
+    }
+    const sl = rawNum(f, "sleep")
+    if (sl !== undefined) {
+      await wait(Math.trunc(sl))
+      continue
+    }
+    if (find(f, "leave") !== undefined) {
+      pc.close()
+      await wait(50)
+      break
+    }
+  }
+  console.log("RESULT " + JSON.stringify({ status: 201, session: sid, opened: opened, events: "EVENTS", rtp_in: rtpIn, rtp_sent: rtpSent, channel_closed: channelClosed, state: pc.state }).replace(`"EVENTS"`, "[" + events.join(",") + "]"))
+  pc.close()
+}
+
+try await main()

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0005 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0007 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -8,7 +8,8 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 OUT=$(mktemp -d)
 SRV=""
 ASRV=""
-trap 'rm -rf "$OUT"; [ -n "$SRV" ] && kill $SRV 2>/dev/null || true; [ -n "$ASRV" ] && kill $ASRV 2>/dev/null || true' EXIT
+POOLSRV=""
+trap 'rm -rf "$OUT"; [ -n "$SRV" ] && kill $SRV 2>/dev/null || true; [ -n "$ASRV" ] && kill $ASRV 2>/dev/null || true; [ -n "$POOLSRV" ] && kill $POOLSRV 2>/dev/null || true' EXIT
 
 # expect FILE N: no FAIL line, and exactly N ok lines
 expect() {
@@ -81,5 +82,30 @@ expect "$OUT/dgram.out" 8 "node:dgram"
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/wasm.tov" -o "$OUT/wasm" >/dev/null
 (cd "$DIR" && "$OUT/wasm") > "$OUT/wasm.out"
 expect "$OUT/wasm.out" 22 "std/wasm"
+# WebRTC (patch 0006): two std/rtc peer connections in one program, on the loopback address (a data channel
+# both ways, Opus RTP with rewritten headers, states, close). The first build compiles libdatachannel (cached).
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/rtc.tov" -o "$OUT/rtc" >/dev/null
+"$OUT/rtc" > "$OUT/rtc.out"
+expect "$OUT/rtc.out" 20 "std/rtc (WebRTC)"
+# fetch pool options and HTTP/2 (patch 0007): three origins from h2_server.py (HTTP/2 over TLS, HTTP/1.1
+# over TLS, plain HTTP/1.1), which needs Python's `h2` package: installed under $OUT if it is missing
+if ! python3 -c 'import h2' 2>/dev/null; then
+  pip install --quiet --target "$OUT/pylib" h2 >/dev/null 2>&1 || true
+  [ -d "$OUT/pylib/h2" ] && export PYTHONPATH="$OUT/pylib${PYTHONPATH:+:$PYTHONPATH}"
+fi
+if python3 -c 'import h2' 2>/dev/null; then
+  for MODE in h2 h1tls h1; do
+    python3 -u "$DIR/h2_server.py" $MODE "$OUT/cert.pem" "$OUT/key.pem" > "$OUT/pool-$MODE.port" & POOLSRV="$POOLSRV $!"
+  done
+  sleep 1.5
+  TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/fetch_pool.tov" -o "$OUT/fetch_pool" >/dev/null
+  H2_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h2.port") H1TLS_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1tls.port") \
+    H1_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1.port") "$OUT/fetch_pool" > "$OUT/fetch_pool.out"
+  kill $POOLSRV 2>/dev/null || true
+  POOLSRV=""
+  expect "$OUT/fetch_pool.out" 23 "fetch pool options and HTTP/2"
+else
+  echo "skipped: fetch pool options and HTTP/2 (needs Python's h2 package, and pip could not install it)"
+fi
 
 echo "tov-patches tests passed"

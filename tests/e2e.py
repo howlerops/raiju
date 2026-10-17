@@ -29,7 +29,7 @@ MDNS_SERVICE = "_bifrost-e2e._tcp"
 
 def build():
     os.makedirs(BUILD, exist_ok=True)
-    for src, out in [("src/main.tov", "raiju"), ("tests/mock_upstream.tov", "mock_upstream")]:
+    for src, out in [("src/main.tov", "raiju"), ("tests/mock_upstream.tov", "mock_upstream"), ("tests/webrtc_client.tov", "webrtc_client")]:
         env = {**os.environ, "TOV_CFLAGS": os.environ.get("TOV_CFLAGS", "-DTV_PLAIN_ALLOC")}
         subprocess.run([os.environ.get("TOV", "tov"), "build", os.path.join(ROOT, src), "-o", os.path.join(BUILD, out)], check=True, capture_output=True, env=env)
 
@@ -3019,7 +3019,7 @@ def l97s_e2e(env):
         s, _, b = call("POST", "/v1/responses", {"model": "anthropic/pii-anthropic", "stream": True, "input": "hi"}, None, base=GW_L97S_A, auth=False)
         check("a streamed Responses answer built from another provider's whole answer is redacted too", s == 200 and "555-1234" not in b and "[REDACTED:PHONE]" in b, (s, b[:600]))
 
-        t0 = time.time() * 1000
+        t0 = int(time.time() * 1000)  # (log timestamps are whole milliseconds, floored: a fraction here would miss a fast request's row)
         probe = {"model": "anthropic/pii-anthropic", "stream": True, "input": "cache-probe-l97s"}
         s1, _, b1 = call("POST", "/v1/responses", probe, None, base=GW_L97S_B, auth=False)
         s2, _, b2 = call("POST", "/v1/responses", probe, None, base=GW_L97S_B, auth=False)
@@ -3085,7 +3085,7 @@ def l107_e2e(env):
         msgs = [{"role": "user", "content": "hi"}]
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/email-chat", "stream": True, "messages": msgs}, None, base=GW_L107_A, auth=False)
         check("the built-in guard redacts an e-mail address in a streamed answer", s == 200 and "jane.doe" not in b and "[REDACTED:EMAIL] today" in b and "[DONE]" in b, (s, b[:400]))
-        t_tools = time.time() * 1000
+        t_tools = int(time.time() * 1000)  # (log timestamps are whole milliseconds, floored: a fraction here would miss a fast request's row)
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/tools-chat", "stream": True, "messages": msgs}, None, base=GW_L107_A, auth=False)
         check("a streamed answer with tool calls streams them", s == 200 and "get_weather" in b and "lookup_city" in b, (s, b[:300]))
         entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L107_A)[2])["entries"]
@@ -4424,6 +4424,146 @@ def headers_config():
         "providers": {"openai": {"keys": [{"name": "h", "value": "sk-hdrs", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "send_back_raw_response": True}},
     }
 
+def rtc_client(base, script, auth="Bearer sk-bf-openai", model="openai/gpt-4o-mini", extra=None, offer=None, timeout=90):
+    """Runs tests/webrtc_client.tov, a WebRTC browser, against a gateway: it creates a live session with an audio
+    track and the oai-events channel, runs the script on it and reports what it saw (its RESULT line, as a dict)."""
+    env = {**os.environ, "GW": base, "AUTH": auth, "MODEL": model, "SCRIPT": json.dumps(script), "BIND": "127.0.0.1"}
+    if extra is not None:
+        env["EXTRA"] = json.dumps(extra)
+    if offer is not None:
+        env["OFFER"] = offer
+    try:
+        p = subprocess.run([os.path.join(BUILD, "webrtc_client")], env=env, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"timeout": True}
+    for line in p.stdout.splitlines():
+        if line.startswith("RESULT "):
+            return json.loads(line[7:])
+    return {"error": (p.stdout + p.stderr)[-400:]}
+
+def live_row(session_id, base=None, headers=None, wait_s=8):
+    """The log row of a finished live session (it is written when the session ends, a moment after the
+    browser's last event)."""
+    base = base or GW
+    for _ in range(int(wait_s * 10)):
+        s, _, b = call("GET", "/api/logs?limit=500", base=base, headers=headers)
+        rows = [e for e in (json.loads(b).get("entries", []) if s == 200 else []) if e.get("op") == "live" and e.get("metadata", {}).get("live_session_id") == session_id]
+        if rows:
+            return rows[0]
+        time.sleep(0.1)
+    return {}
+
+def live_rows(base, headers, op_error=None):
+    s, _, b = call("GET", "/api/logs?limit=500", base=base, headers=headers)
+    return [e for e in (json.loads(b).get("entries", []) if s == 200 else []) if e.get("op") == "live"]
+
+def aiortc_e2e():
+    """A second WebRTC implementation as the browser: aiortc (Python, with real Opus audio), against the main
+    gateway and the fake provider. aiortc is installed into build/e2e-aiortc when pip can fetch it; without it
+    this is skipped, and says so."""
+    import shutil, venv
+    py = None
+    probe = subprocess.run([sys.executable, "-c", "import aiortc, av"], capture_output=True)
+    if probe.returncode == 0:
+        py = sys.executable
+    else:
+        vdir = os.path.join(BUILD, "e2e-aiortc")
+        cand = os.path.join(vdir, "bin", "python")
+        if not os.path.exists(cand):
+            try:
+                venv.create(vdir, with_pip=True)
+                subprocess.run([cand, "-m", "pip", "install", "--quiet", "aiortc"], check=True, capture_output=True, timeout=600)
+            except Exception as e:
+                shutil.rmtree(vdir, ignore_errors=True)
+                print(f"skip aiortc interop checks: aiortc could not be installed ({type(e).__name__})")
+                return
+        py = cand
+    p = subprocess.run([py, os.path.join(ROOT, "tests/webrtc_aiortc.py"), GW, "Bearer sk-bf-openai"], capture_output=True, text=True, timeout=120, env={**os.environ})
+    try:
+        r = json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception:
+        r = {"error": (p.stdout + p.stderr)[-500:]}
+    types = [e.get("type") for e in r.get("events", [])]
+    check("aiortc, another WebRTC stack, creates a session and runs it through the gateway", r.get("status") == 201 and types[:2] == ["session.started", "session.usage.updated"] and "echo" in types and types.count("session.output_transcript.delta") == 4 and types[-1] == "session.closed" and r.get("closed") is True, r)
+    check("and Opus audio comes back through the gateway's two peers", r.get("frames", 0) >= 20, r.get("frames"))
+
+def webrtc_e2e(env):
+    """The WebRTC relay with guardrails, a rate limit and logs: its own gateway (port 18162). Input text is checked
+    before it reaches the provider and output text before the browser, each billing window of voice time is admitted
+    again, and the session is logged with its transcript."""
+    import shutil
+    GW_R = "http://127.0.0.1:18162"
+    shutil.rmtree(os.path.join(BUILD, "e2e-live-logs"), ignore_errors=True)
+    cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_per_request_content_storage_override": True},
+           "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+           "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-live-logs"), "content_logging": True},
+           "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+           "governance": {"rate_limits": [{"id": "live-rl", "request_max_limit": 2, "request_reset_duration": "1h"}],
+                          "virtual_keys": [{"id": "vk-live", "value": "sk-bf-live", "rate_limit_id": "live-rl"}, {"id": "vk-live-free", "value": "sk-bf-live-free"}]},
+           "guardrails": {"enabled": True, "apply_to": "both", "detect": [], "providers": [
+               {"id": "house-rules", "kind": "regex", "apply_to": "both", "patterns": [
+                   {"pattern": "PROJECT-\\d+", "description": "Codename", "action": "block"},
+                   {"pattern": "ticket-\\d+", "description": "Ticket", "action": "redact"}]}]}}
+    path = os.path.join(BUILD, "e2e.live.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18162", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.live.log"), "w"))
+    FREE = "Bearer sk-bf-live-free"
+
+    def provider_events(mark):
+        return [e["event"] for e in json.loads(call("GET", "/_live/events", base=MOCK, auth=False)[2])[mark:]]
+
+    def mark():
+        return len(json.loads(call("GET", "/_live/events", base=MOCK, auth=False)[2]))
+
+    try:
+        wait(GW_R + "/health")
+        r = rtc_client(GW_R, [], auth="")
+        check("a live session needs a credential when inference auth is on", r.get("status") == 401 and "authentication is required" in r.get("body", ""), r)
+
+        # input text is checked on its way to the provider: redacted, or refused with an error event
+        m0 = mark()
+        r = rtc_client(GW_R, [{"send": {"type": "session.update", "session": {"instructions": "see ticket-77 please"}}}, {"wait": "echo"},
+                              {"send": {"type": "session.update", "session": {"instructions": "ship PROJECT-42 today"}}}, {"wait": "error"},
+                              {"send": {"type": "session.close", "mock_seconds": 3}}, {"wait": "session.closed"}], auth=FREE)
+        got = provider_events(m0)
+        instr = [e.get("session", {}).get("instructions") for e in got if e.get("type") == "session.update"]
+        check("input text is redacted by a guardrail before it reaches the provider", instr == ["see [REDACTED:TICKET] please"], (instr, got))
+        errs = [e for e in r.get("events", []) if e.get("type") == "error"]
+        check("input text a guardrail blocks never reaches the provider, and the browser is told", len(errs) == 1 and errs[0]["error"]["type"] == "guardrail_violation" and "house-rules: found CODENAME" in errs[0]["error"]["message"] and not any("PROJECT-42" in json.dumps(e) for e in got), (errs, got))
+
+        # output text is checked on its way to the browser: redacted, or the session ends with an error
+        r = rtc_client(GW_R, [{"send": {"type": "test.speak", "text": "mail ticket-5 now"}}, {"wait": "session.output_transcript.delta", "count": 3},
+                              {"send": {"type": "session.close", "mock_seconds": 3}}, {"wait": "session.closed"}], auth=FREE)
+        deltas = "".join(e.get("delta", "") for e in r.get("events", []) if e.get("type") == "session.output_transcript.delta")
+        check("output text is redacted by a guardrail before it reaches the browser", deltas == "mail [REDACTED:TICKET] now ", deltas)
+        m0 = mark()
+        r = rtc_client(GW_R, [{"send": {"type": "test.speak", "text": "ship PROJECT-9 and more"}}, {"wait": "error", "ms": 8000}, {"sleep": 800}], auth=FREE)
+        deltas = "".join(e.get("delta", "") for e in r.get("events", []) if e.get("type") == "session.output_transcript.delta")
+        errs = [e for e in r.get("events", []) if e.get("type") == "error"]
+        check("output text a guardrail blocks ends the session: the browser gets an error and no more of it", deltas == "ship " and len(errs) == 1 and errs[0]["error"]["type"] == "guardrail_violation" and "response blocked by guardrails" in errs[0]["error"]["message"], (deltas, errs))
+        check("and the gateway closes the session at the provider", [e["type"] for e in provider_events(m0)] == ["test.speak", "session.close"], provider_events(m0))
+        row = live_row(r.get("session", "none"), GW_R, ADMIN)
+        check("the blocked session is logged as the refusal it was", row.get("status") == 400 and "response blocked by guardrails" in row.get("error", "") and row.get("virtual_key") == "vk-live-free", row)
+
+        # the transcript of a session, kept in its row
+        r = rtc_client(GW_R, [{"send": {"type": "test.speak", "text": "good morning"}}, {"wait": "session.output_transcript.delta", "count": 2}, {"send": {"type": "session.close", "mock_seconds": 5}}, {"wait": "session.closed"}], auth=FREE)
+        row = live_row(r.get("session", "none"), GW_R, ADMIN)
+        check("the row of a finished session holds its transcript", row.get("input", "").strip() == "hello" and row.get("output", "").strip() == "good morning" and row.get("status") == 200, row)
+
+        # each window of voice time is admitted again: the virtual key's limit of two requests covers the create and
+        # the first window; the second window is refused, the browser is told and the session is closed
+        m0 = mark()
+        r = rtc_client(GW_R, [{"send": {"type": "test.usage", "seconds": 31}}, {"sleep": 300}, {"send": {"type": "test.usage", "seconds": 62}}, {"wait": "error", "ms": 8000}, {"sleep": 800}], auth="Bearer sk-bf-live")
+        errs = [e for e in r.get("events", []) if e.get("type") == "error"]
+        types = [e["type"] for e in provider_events(m0)]
+        check("a window the virtual key may not have ends the session with an error", r.get("status") == 201 and len(errs) == 1 and errs[0]["error"]["type"] == "rate_limit_exceeded", (r.get("status"), errs))
+        check("the gateway closes that session at the provider", types == ["test.usage", "test.usage", "session.close"], types)
+        row = live_row(r.get("session", "none"), GW_R, ADMIN)
+        check("and it is logged with the refusal and the seconds it ran", row.get("status") == 429 and float(row.get("metadata", {}).get("live_billed_seconds", -1)) == 62.0 and row.get("virtual_key") == "vk-live", row)
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def headers_e2e(env):
     """Request headers reach the log rows (dimensions, logging headers, correlation ids, app, Maxim attributes);
     x-bf-async runs an SDK route as a job with its own TTL; extra_fields_placement "headers" keeps extra_fields out
@@ -5004,6 +5144,127 @@ def l121_e2e(env):
         check("a viewer may not add a plugin", s == 403, (s, b[:200]))
     finally:
         gw.terminate()
+GW_L126 = "http://127.0.0.1:18186"  # network_config pool knobs and upstream HTTP/2, against tov-patches/tests/h2_server.py origins
+
+def l126_python_env():
+    """The environment for h2_server.py, which needs the `h2` package: the system's, else one installed under build/pylib.
+    None when it can't be had (the checks are then skipped)."""
+    try:
+        import h2  # noqa: F401
+        return dict(os.environ)
+    except ImportError:
+        pass
+    lib = os.path.join(BUILD, "pylib")
+    if not os.path.isdir(os.path.join(lib, "h2")):
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--target", lib, "h2"], capture_output=True)
+        if r.returncode != 0:
+            return None
+    return {**os.environ, "PYTHONPATH": lib + os.pathsep + os.environ.get("PYTHONPATH", "")}
+
+def l126_origin(mode, penv):
+    """Starts h2_server.py in a mode (h2, h1tls, h1) with the e2e certificate; its process and port."""
+    d = os.path.join(BUILD, "e2e-tls")
+    p = subprocess.Popen([sys.executable, "-u", os.path.join(ROOT, "tov-patches", "tests", "h2_server.py"), mode, os.path.join(d, "srv.pem"), os.path.join(d, "srv.key")], env=penv, stdout=subprocess.PIPE, text=True)
+    line = p.stdout.readline()
+    if not line.startswith("listening "):
+        p.terminate()
+        raise SystemExit(f"l126: h2_server.py {mode} did not start: {line!r}")
+    return p, int(line.split()[1])
+
+def l126_stats(port, tls):
+    import ssl
+    ctx = ssl._create_unverified_context() if tls else None
+    with urllib.request.urlopen(("https" if tls else "http") + f"://127.0.0.1:{port}/stats", context=ctx, timeout=5) as r:
+        return json.load(r)
+
+def l126_config(ca, h2port, h1port, h1tlsport):
+    key = lambda n: [{"name": n, "value": "sk-" + "l126-" + n, "models": [], "weight": 1.0}]
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            # TLS origin that speaks h2: enforce_http2 and a 1 s PING interval
+            "openai": {"keys": key("h2"), "network_config": {"base_url": f"https://127.0.0.1:{h2port}", "ca_cert_pem": ca, "max_retries": 0, "enforce_http2": True, "http2_ping_interval_in_seconds": 1}},
+            # plain HTTP/1.1 origin: two connections at most, idle ones closed after a second
+            "vllm": {"keys": [{"name": "plain", "value": "", "models": [], "weight": 1.0}], "network_config": {"base_url": f"http://127.0.0.1:{h1port}", "max_retries": 0, "max_conns_per_host": 2, "keep_alive_timeout_in_seconds": 1}},
+            # TLS origin without h2: enforce_http2 falls back to HTTP/1.1
+            "ollama": {"keys": [{"name": "fb", "value": "", "models": [], "weight": 1.0}], "network_config": {"base_url": f"https://127.0.0.1:{h1tlsport}", "ca_cert_pem": ca, "max_retries": 0, "enforce_http2": True}},
+            # the same HTTP/2 origin without enforce_http2: HTTP/1.1
+            "sgl": {"keys": [{"name": "off", "value": "", "models": [], "weight": 1.0}], "network_config": {"base_url": f"https://127.0.0.1:{h2port}", "ca_cert_pem": ca, "max_retries": 0}},
+        },
+    }
+
+def l126_e2e(env):
+    """network_config's keep_alive_timeout_in_seconds, max_conns_per_host, enforce_http2 and http2_ping_interval_in_seconds,
+    applied through the Tov fetch pool (patch 0007): concurrent requests share one HTTP/2 connection and PINGs go out; a
+    cap queues requests; an idle connection is closed after the keep-alive; an origin without h2 gets HTTP/1.1."""
+    ca = open(os.path.join(BUILD, "e2e-tls", "ca.pem")).read()
+    penv = l126_python_env()
+    if penv is None:
+        print("skip l126: the python h2 package is not installed and could not be installed")
+        return
+    o_h2, p_h2 = l126_origin("h2", penv)
+    o_h1, p_h1 = l126_origin("h1", penv)
+    o_tls, p_tls = l126_origin("h1tls", penv)
+    cfg = os.path.join(BUILD, "e2e.l126.json")
+    json.dump(l126_config(ca, p_h2, p_h1, p_tls), open(cfg, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18186", "-host", "127.0.0.1", "-config", cfg, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l126.log"), "w"))
+    try:
+        wait(GW_L126 + "/health")
+        from concurrent.futures import ThreadPoolExecutor
+        def chat_to(model, content):
+            return call("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": content}]}, None, base=GW_L126, auth=False)
+        def burst(model, n):
+            t0 = time.time()
+            with ThreadPoolExecutor(max_workers=n) as ex:
+                out = list(ex.map(lambda i: chat_to(model, "slow " + str(i)), range(n)))
+            return out, time.time() - t0
+
+        s, _, b = chat_to("openai/gpt-h2", "one")
+        st = l126_stats(p_h2, True)
+        check("enforce_http2: a chat request reaches a TLS origin over HTTP/2", s == 200 and "hello over h2" in b and st["h2_conns"] == 1, (s, b[:200], st))
+
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-h2", "stream": True, "messages": [{"role": "user", "content": "stream"}]}, None, base=GW_L126, auth=False)
+        check("enforce_http2: a streamed chat answer arrives chunk by chunk over HTTP/2", s == 200 and b.count("data: ") >= 4 and "hello " in b and "over h2" in b and b.rstrip().endswith("data: [DONE]"), (s, b[:300]))
+
+        out, dt = burst("openai/gpt-h2", 6)
+        st = l126_stats(p_h2, True)
+        check("enforce_http2: six concurrent requests are six streams on one connection", all(o[0] == 200 for o in out) and st["h2_conns"] == 1 and st["max_streams"] >= 6 and dt < 1.5, ([o[0] for o in out], st, round(dt, 2)))
+
+        before = l126_stats(p_h2, True)["pings"]
+        time.sleep(3.5)
+        got = l126_stats(p_h2, True)["pings"] - before
+        check("http2_ping_interval_in_seconds: an idle HTTP/2 connection sends PINGs", got >= 2, got)
+
+        s, _, b = chat_to("sgl/m", "plain")
+        st = l126_stats(p_h2, True)
+        check("without enforce_http2 the same origin is served over HTTP/1.1", s == 200 and st["h2_conns"] == 1, (s, b[:200], st))
+
+        s, _, b = chat_to("ollama/m", "fallback")
+        st = l126_stats(p_tls, True)
+        check("enforce_http2 against an origin that does not offer h2 falls back to HTTP/1.1", s == 200 and "hello over h2" in b and st["h2_conns"] == 0 and st["reqs"] >= 1, (s, b[:200], st))
+
+        c0 = l126_stats(p_h1, False)["conns"]
+        out, dt = burst("vllm/m", 6)
+        st = l126_stats(p_h1, False)
+        check("max_conns_per_host queues requests beyond the cap", all(o[0] == 200 for o in out) and st["conns"] - c0 <= 2 and st["max_open"] <= 2 and dt >= 1.1, ([o[0] for o in out], st, round(dt, 2)))
+
+        s, _, _ = chat_to("vllm/m", "reuse")
+        c1 = l126_stats(p_h1, False)["conns"]
+        s2, _, _ = chat_to("vllm/m", "reuse again")
+        c2 = l126_stats(p_h1, False)["conns"]
+        check("an idle connection is reused within keep_alive_timeout_in_seconds", s == 200 and s2 == 200 and c2 == c1, (c1, c2))
+        open_before = l126_stats(p_h1, False)["open"]
+        time.sleep(2.4)
+        open_after = l126_stats(p_h1, False)["open"]
+        s3, _, _ = chat_to("vllm/m", "after expiry")
+        c3 = l126_stats(p_h1, False)["conns"]
+        check("it is closed once it has been idle that long, and the next request opens a new one", s3 == 200 and open_after < open_before and c3 == c2 + 1, (open_before, open_after, c2, c3))
+    finally:
+        gw.terminate()
+        for p in (o_h2, o_h1, o_tls):
+            p.terminate()
+
 
 def main():
     unique_ports()
@@ -5018,7 +5279,7 @@ def main():
     shutil.rmtree(os.path.join(ROOT, "build/e2e-wlogs"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-chromem"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-l80-logs"), ignore_errors=True)
-    env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099"}
+    env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099", "RAIJU_WEBRTC_BIND": "127.0.0.1", "MOCK_RTC_BIND": "127.0.0.1"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     qdrant = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/qdrant_mock.py"), "18089"])
     wait(MOCK + "/_seen")  # the gateway connects to the mock's MCP server at startup
@@ -5474,17 +5735,66 @@ def main():
             check(f"the Responses socket alias {alias} runs the same route", al.status == 101 and evs and evs[-1].get("type") == "response.completed", (alias, al.status, evs[-1:] if evs else evs))
             al.close()
 
-        # POST /v1/live/sessions (WebRTC create): the offer goes to OpenAI as it is, its answer comes back, and the
-        # session is recorded for the virtual key that created it
-        s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, headers={"authorization": "Bearer sk-bf-openai"})
-        rtc = json.loads(b) if s == 201 else {}
-        check("a WebRTC live create returns the session id and the provider's SDP answer", s == 201 and rtc.get("session", {}).get("id") == "sess_mock_rtc" and rtc.get("transport", {}).get("type") == "webrtc" and "live-answer" in rtc.get("transport", {}).get("sdp", ""), (s, b))
-        sent = seen()[-1]
-        check("the WebRTC create reaches OpenAI with its key, the bare model and the offer", sent["path"] == "/v1/live/sessions" and sent["auth"] == "Bearer sk-from-env" and "gpt-4o-mini" in sent["body"] and "openai/" not in sent["body"] and "v=0" in sent["body"], sent)
+        # POST /v1/live/sessions (WebRTC create, L122): the gateway is the WebRTC peer on both sides. It answers the
+        # browser's offer on a peer connection of its own, offers to the provider on a second, and relays the audio
+        # and the oai-events channel, metering, guarding and logging them. The browser is tests/webrtc_client.tov,
+        # the provider tests/mock_live.tov: both are libdatachannel peers like the gateway's.
+        live_script = [{"send": {"type": "session.update", "session": {"instructions": "be brief"}}}, {"wait": "echo"},
+                       {"rtp": 10}, {"sleep": 300},
+                       {"send": {"type": "test.speak", "text": "the quick brown fox"}}, {"wait": "session.output_transcript.delta", "count": 4},
+                       {"send": {"type": "session.close", "mock_seconds": 4}}, {"wait": "session.closed"}]
+        call("GET", "/_live/reset", base=MOCK, auth=False)
+        r = rtc_client(GW, live_script)
+        types = [e.get("type") for e in r.get("events", [])]
+        check("a WebRTC live create returns the session id and a working peer: the events channel opens", r.get("status") == 201 and r.get("session") == "sess_mock_rtc" and r.get("opened") is True, r)
+        check("the provider's events reach the browser through the gateway's two peers, in order", types[:2] == ["session.started", "session.usage.updated"] and "echo" in types and types.count("session.output_transcript.delta") == 4 and types[-1] == "session.closed", types)
+        check("the browser's events reach the provider peer", [e["event"]["type"] for e in json.loads(call("GET", "/_live/events", base=MOCK, auth=False)[2])] == ["session.update", "test.speak", "session.close"], call("GET", "/_live/events", base=MOCK, auth=False)[2][:300])
+        mst = json.loads(call("GET", "/_live/stats", base=MOCK, auth=False)[2])
+        check("audio is relayed both ways: the provider peer got the packets and sent them back", r.get("rtp_sent") == 10 and mst["packets"] >= 8 and r.get("rtp_in", 0) >= 8, (r.get("rtp_sent"), r.get("rtp_in"), mst))
+        sent = [x for x in seen() if x["path"] == "/v1/live/sessions"][-1]
+        check("the provider is sent the gateway's own offer, with its key and the bare model", sent["auth"] == "Bearer sk-from-env" and "gpt-4o-mini" in sent["body"] and "openai/" not in sent["body"] and "a=ssrc:1234" not in sent["body"] and "m=application" in sent["body"], sent["body"][:300])
+        row = live_row("sess_mock_rtc")
+        md = row.get("metadata", {})
+        check("the session is logged once it ends: a live row with its seconds, billed at the 15 s minimum", row.get("op") == "live" and row.get("provider") == "openai" and row.get("model") == "gpt-4o-mini" and row.get("status") == 200 and row.get("virtual_key") == "vk-openai-only" and float(md.get("live_audio_seconds", -1)) == 4.0 and float(md.get("live_billed_seconds", -1)) == 15.0 and md.get("live_transport") == "webrtc", row)
+        check("the row keeps the transcript", row.get("input", "").strip() == "hello" and row.get("output", "").strip() == "the quick brown fox", (row.get("input"), row.get("output")))
+        s, _, b = call("GET", "/metrics")
+        check("the session's events and seconds are counted", s == 200 and 'raiju_live_webrtc_events_total{direction="in",type="session.update"}' in b and 'raiju_live_webrtc_events_total{direction="out",type="session.usage.updated"}' in b and "raiju_live_audio_seconds_total" in b, b[-300:])
         s, _, b = call("GET", "/v1/live/sessions/sess_mock_rtc/content", headers={"authorization": "Bearer sk-bf-limited"})
         check("another key does not read a WebRTC session's recording", s == 404, (s, b))
         s, _, b = call("GET", "/v1/live/sessions/sess_mock_rtc/content", headers={"authorization": "Bearer sk-bf-openai"})
         check("the key that created a WebRTC session reads its recording", s == 200 and b == "RIFF-recording-sess_mock_rtc", (s, b))
+
+        r = rtc_client(GW, [], offer="v=0")
+        check("an SDP offer that is not one is refused", r.get("status") == 400 and "invalid browser SDP offer" in r.get("body", ""), r)
+        r = rtc_client(GW, [], auth="", model="openai/gpt-live-refuse")
+        check("a provider that refuses the session has its own answer passed on", r.get("status") == 400 and "invalid live session request" in r.get("body", "") and "invalid_request_error" in r.get("body", ""), r)
+
+        # the browser's own list of server events: the provider is asked for what the gateway needs too, the browser gets only its own
+        r = rtc_client(GW, [{"send": {"type": "test.speak", "text": "one two"}}, {"wait": "session.output_transcript.delta", "count": 2}, {"sleep": 300}, {"send": {"type": "session.close", "mock_seconds": 3}}, {"sleep": 800}],
+                       extra={"client": {"data_channel": {"allowed_server_events": [{"type": "session.output_transcript.delta"}]}}})
+        types = [e.get("type") for e in r.get("events", [])]
+        sent = [x for x in seen() if x["path"] == "/v1/live/sessions"][-1]
+        check("a restricted server-event list reaches the browser as asked", r.get("status") == 201 and types == ["session.output_transcript.delta", "session.output_transcript.delta"], (r.get("status"), types))
+        check("the provider is asked for the events the gateway needs as well", '"type":"session.usage.updated"' in sent["body"] and '"response_event":"response.completed"' in sent["body"] and '"type":"session.output_transcript.delta"' in sent["body"], sent["body"][:400])
+        r = rtc_client(GW, [], extra={"client": {"data_channel": {"allowed_server_events": [{"type": "response.event"}]}}})
+        check("a selector without response_event for response.event is refused", r.get("status") == 400 and "response_event" in r.get("body", ""), r)
+
+        # a browser that leaves: the gateway closes the session upstream, and the final usage is still billed
+        mark = len(json.loads(call("GET", "/_live/events", base=MOCK, auth=False)[2]))
+        r = rtc_client(GW, [{"sleep": 300}, {"leave": True}])
+        time.sleep(1.5)
+        evs = json.loads(call("GET", "/_live/events", base=MOCK, auth=False)[2])[mark:]
+        check("a browser that leaves has its session closed at the provider by the gateway", [e["event"]["type"] for e in evs] == ["session.close"], evs)
+        row = live_row(r.get("session", "none"))
+        check("and the session is billed what the provider then reported", row.get("status") == 200 and float(row.get("metadata", {}).get("live_billed_seconds", -1)) == 20.0 and row.get("metadata", {}).get("live_close_reason") == "close_requested", row)
+
+        # a provider that hangs up without session.closed: the browser is told, and what was reported is billed
+        r = rtc_client(GW, [{"send": {"type": "test.usage", "seconds": 40}}, {"sleep": 300}, {"send": {"type": "test.hangup"}}, {"wait": "error", "ms": 12000}])
+        types = [e.get("type") for e in r.get("events", [])]
+        check("a provider that hangs up is reported to the browser as an error", "error" in types and "before session.closed" in json.dumps(r.get("events", [])), types)
+        row = live_row(r.get("session", "none"))
+        check("and the session is logged as a failure, billed what it had reported", row.get("status") == 502 and float(row.get("metadata", {}).get("live_billed_seconds", -1)) == 40.0 and "before session.closed" in row.get("error", ""), row)
+
         s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}})
         check("a live create needs a WebRTC transport", s == 400 and "transport" in b, (s, b))
         s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "anthropic/claude"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, headers={"authorization": "Bearer sk-bf-openai"})
@@ -5576,6 +5886,14 @@ def main():
                     attach_refused.append(None)
             check("an attach is accepted on every worker of the node", all(s == 101 for s in attach_ok), attach_ok)
             check("another key is refused by every worker of the node", all(s == 404 for s in attach_refused), attach_refused)
+
+            # a WebRTC session stays on the worker that took it, and its owner is recorded for all of them
+            made = [rtc_client(GW_WS, [{"sleep": 200}, {"send": {"type": "session.close", "mock_seconds": 5}}, {"wait": "session.closed"}]) for _ in range(2)]
+            ids = [m.get("session", "") for m in made]
+            check("WebRTC sessions are created through the workers and run to their end", all(m.get("status") == 201 and m.get("opened") is True and m["events"][-1].get("type") == "session.closed" for m in made) and ids[0] != ids[1], made)
+            reads = [call("GET", "/v1/live/sessions/" + ids[0] + "/content", headers={"authorization": "Bearer sk-bf-openai"}, base=GW_WS)[0] for _ in range(8)]
+            others = [call("GET", "/v1/live/sessions/" + ids[0] + "/content", headers={"authorization": "Bearer sk-bf-limited"}, base=GW_WS)[0] for _ in range(8)]
+            check("the owner of a WebRTC session reads it on every worker and another key on none", all(c == 200 for c in reads) and all(c == 404 for c in others), (reads, others))
 
             uis = [WsClient("/ws", ADMIN, port=18150) for _ in range(6)]
             s_refresh = call("POST", "/api/mcp/client/local/refresh-tools", headers=ADMIN, base=GW_WS)[0]
@@ -7156,6 +7474,10 @@ def main():
         l88_e2e(env)
         # request headers on log rows and SDK-route jobs, extra_fields placement: their own gateway
         headers_e2e(env)
+        # the WebRTC relay with guardrails, a rate limit and logs: its own gateway (port 18162)
+        webrtc_e2e(env)
+        # a second WebRTC stack as the browser, when aiortc can be had
+        aiortc_e2e()
         # provider create and key reads, config metadata, virtual key rotation and expiry, team members: their own gateway
         l97b_e2e(env)
         # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients: their own gateway
@@ -7225,6 +7547,8 @@ def main():
         l121_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
         l113_ui_e2e(env)
+        # network_config pool knobs and upstream HTTP/2 (Tov patch 0007): origins from tov-patches/tests/h2_server.py, their own gateway
+        l126_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

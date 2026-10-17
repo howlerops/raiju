@@ -1,0 +1,1786 @@
+// GPT Live over WebRTC, terminated here as Bifrost's webrtclive.go and webrtcrelay.go do: the browser's
+// SDP offer is answered by this gateway's own peer connection, a second peer connection offers to the
+// provider, and the two are relayed: audio as RTP packets (never decoded) and the "oai-events" data
+// channel as text. Every data-channel event passes through LiveCore, which meters, guards and reports
+// it. The peer connections are libdatachannel's (tov-patches/0006, std/rtc).
+//
+// Layout of this file, top to bottom:
+//   - SDP and RTP helpers (pure): the Opus-only offer, a2=max-message-size, RTP header cleanup
+//   - LiveEventFilter: the server-event permissions of the create body (liveeventfilter.go)
+//   - LiveCore: the session's policy and metering (livesession.go and livemeter.go): usage seconds in
+//     billing windows, the 15 s minimum, token usage of delegated responses, the transcript, the
+//     guard hooks, draining until session.closed
+//   - Relay: the two legs wired to a core, with the queues and the clock
+//   - establish: the create handshake with real peer connections
+import { RTCPeerConnection, RTCDataChannel, RTCTrack, RTCConfig } from "std/rtc"
+import { Field, fields, find, rawStr, setField, build, quote, elements } from "./json"
+
+// What OpenAI bills a WebRTC session when it is created, credited against its running time.
+export const LIVE_MINIMUM_SECONDS = 15.0
+// How much voice time accrues before the session's budget is checked again.
+export const LIVE_WINDOW_SECONDS = 30.0
+// How long the provider has to answer a session.close with session.closed.
+const DRAIN_MS = 15000.0
+// How often an idle session meets the window check, and how long without usage counts as idle.
+const STALE_EVERY_MS = 5000.0
+const STALE_AFTER_MS = 2.0 * LIVE_WINDOW_SECONDS * 1000.0
+// Bounds: the transcript kept per session, and the messages waiting for a channel to open.
+const TRANSCRIPT_MAX = 1048576
+const PENDING_MAX = 1000
+// Bifrost's handshake timeouts
+const HANDSHAKE_MS = 10000
+const GATHER_MS = 3000
+const BROWSER_DRAIN_MS = 10000
+
+export const DATA_CHANNEL_LABEL = "oai-events"
+
+// ---------------------------------------------------------------- SDP and RTP helpers
+
+function sdpLines(sdp: string): string[] {
+  return sdp.split("\n")
+}
+
+// The value of a line a=max-message-size:N, or undefined.
+export function sdpMaxMessageSize(sdp: string): int | undefined {
+  for (const l of sdpLines(sdp)) {
+    const t = l.trim()
+    if (t.startsWith("a=max-message-size:")) {
+      const n = parseInt(t.slice(19))
+      if (n !== undefined && n > 0) return n
+      return undefined
+    }
+  }
+  return undefined
+}
+
+// Sets (or adds, ahead of the application section) the a=max-message-size line.
+export function setSdpMaxMessageSize(sdp: string, n: int): string {
+  const line = "a=max-message-size:" + n
+  const out: string[] = []
+  let done = false
+  const ls = sdpLines(sdp)
+  const eol = sdp.includes("\r\n") ? "\r" : ""
+  for (const l of ls) {
+    if (l.trim().startsWith("a=max-message-size:")) {
+      out.push(line + (l.endsWith("\r") ? "\r" : ""))
+      done = true
+    } else {
+      out.push(l)
+    }
+  }
+  if (done) return out.join("\n")
+  const added: string[] = []
+  for (const l of out) {
+    if (!done && l.startsWith("m=application ")) {
+      added.push(line + eol)
+      done = true
+    }
+    added.push(l)
+  }
+  return added.join("\n")
+}
+
+// The provider must not be offered a larger message than the browser takes: the offer's limit is lowered
+// to the browser's.
+export function constrainMaxMessageSize(upstreamOffer: string, browserOffer: string): string {
+  const b = sdpMaxMessageSize(browserOffer)
+  if (b === undefined) return upstreamOffer
+  const u = sdpMaxMessageSize(upstreamOffer)
+  if (u !== undefined && u <= b) return upstreamOffer
+  return setSdpMaxMessageSize(upstreamOffer, b)
+}
+
+// The SDP with each audio section restricted to its Opus payload types, so the answer can only pick
+// Opus: both legs must agree on the codec, because the packets are forwarded as they are. A section
+// with no Opus is left as it is.
+export function opusOnly(sdp: string): string {
+  const ls = sdpLines(sdp)
+  const out: string[] = []
+  let i = 0
+  while (i < ls.length) {
+    const l = ls[i]!
+    if (!l.startsWith("m=audio ")) {
+      out.push(l)
+      i += 1
+      continue
+    }
+    // the section: this line and those up to the next m= line
+    let j = i + 1
+    while (j < ls.length && !ls[j]!.startsWith("m=")) j += 1
+    const sec = ls.slice(i + 1, j)
+    const keep: string[] = []
+    for (const s of sec) {
+      if (s.startsWith("a=rtpmap:")) {
+        const sp = s.indexOf(" ")
+        if (sp > 0 && s.slice(sp + 1).toLowerCase().startsWith("opus/")) keep.push(s.slice(9, sp))
+      }
+    }
+    if (keep.length === 0) {
+      out.push(l)
+      for (const s of sec) out.push(s)
+      i = j
+      continue
+    }
+    const parts = l.trim().split(" ")
+    const head = parts.slice(0, 3).join(" ")
+    const cr = l.endsWith("\r") ? "\r" : ""
+    out.push(head + " " + keep.join(" ") + cr)
+    for (const s of sec) {
+      const t = s.trim()
+      let pt = ""
+      if (t.startsWith("a=rtpmap:") || t.startsWith("a=fmtp:") || t.startsWith("a=rtcp-fb:")) {
+        const colon = t.indexOf(":")
+        const rest = t.slice(colon + 1)
+        const sp = rest.indexOf(" ")
+        pt = sp > 0 ? rest.slice(0, sp) : rest
+      }
+      if (pt === "" || pt === "*" || keep.includes(pt)) out.push(s)
+    }
+    i = j
+  }
+  return out.join("\n")
+}
+
+// An RTP packet ready for the other leg: the header without CSRCs and extensions (their ids belong to
+// the leg they came from), the payload as it is. undefined for something that is not an RTP packet
+// (RTCP, or a runt).
+export function forwardRtp(p: u8[]): u8[] | undefined {
+  if (p.length < 12) return undefined
+  const b0 = int(p[0]!)
+  if ((b0 >> 6) !== 2) return undefined
+  const b1 = int(p[1]!)
+  if (b1 >= 192 && b1 <= 223) return undefined
+  const cc = b0 & 15
+  let start = 12 + 4 * cc
+  if ((b0 & 16) !== 0) {
+    if (p.length < start + 4) return undefined
+    start += 4 + 4 * ((int(p[start + 2]!) << 8) + int(p[start + 3]!))
+  }
+  if (start > p.length) return undefined
+  if (start === 12 && (b0 & 31) === 0) return p
+  let head = p.slice(0, 12)
+  head[0] = u8(b0 & 224)
+  return head.concat(p.slice(start))
+}
+
+// ---------------------------------------------------------------- JSON helpers
+
+// The raw value at a path of object keys, or undefined.
+function jsonAt(text: string, path: string[]): string | undefined {
+  let cur = text
+  for (const k of path) {
+    let fs: Field[] = []
+    try {
+      fs = fields(cur)
+    } catch (e) {
+      return undefined
+    }
+    const v = find(fs, k)
+    if (v === undefined) return undefined
+    cur = v
+  }
+  return cur
+}
+
+function strAt(text: string, path: string[]): string {
+  const v = jsonAt(text, path)
+  if (v === undefined) return ""
+  try {
+    return rawStr([{ key: "v", raw: v }], "v") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+function numAt(text: string, path: string[]): f64 {
+  const v = jsonAt(text, path)
+  if (v === undefined) return 0.0
+  return parseFloat(v.trim()) ?? 0.0
+}
+
+// The text with the value at path replaced by raw (the objects on the way must exist).
+function withJsonAt(text: string, path: string[], raw: string): string throws SyntaxError {
+  if (path.length === 0) return raw
+  let fs = try fields(text)
+  const k = path[0]!
+  const inner = find(fs, k)
+  if (path.length === 1) {
+    setField(&fs, k, raw)
+    return build(fs)
+  }
+  if (inner === undefined) throw new SyntaxError("no " + k)
+  setField(&fs, k, try withJsonAt(inner, path.slice(1), raw))
+  return build(fs)
+}
+
+export function eventType(m: string): string {
+  try {
+    return rawStr(fields(m), "type") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// The error event a refused session sends its client.
+export function errorEvent(type: string, message: string): string {
+  return JSON.stringify({ type: "error", error: { type: type, code: type, message: message } })
+}
+
+// ---------------------------------------------------------------- server-event permissions
+
+const EVENTS_PATH = ["session", "client", "data_channel", "allowed_server_events"]
+
+// The events the gateway's controller needs from the provider, whatever the browser asked for.
+const REQUIRED: string[][] = [
+  ["session.started", ""],
+  ["session.updated", ""],
+  ["session.closed", ""],
+  ["session.usage.updated", ""],
+  ["session.delegation.created", ""],
+  ["session.input_transcript.delta", ""],
+  ["session.output_transcript.delta", ""],
+  ["error", ""],
+  ["response.event", "response.output_item.done"],
+  ["response.event", "response.completed"],
+  ["response.event", "response.incomplete"],
+  ["response.event", "response.failed"],
+]
+
+// A browser's restricted list of server events. The provider is asked for those and the ones the
+// controller consumes; the browser is sent only what it asked for.
+export class LiveEventFilter {
+  allowed: Set<string> = new Set<string>()
+  original = ""
+
+  allows(m: string): bool {
+    const t = eventType(m)
+    const key = t === "response.event" ? t + "|" + strAt(m, ["event", "type"]) : t + "|"
+    return this.allowed.has(key)
+  }
+
+  // The frame for the browser: undefined when it asked not to get it, and its own permissions
+  // restored wherever the provider echoes them.
+  clientMessage(m: string): string | undefined {
+    if (!this.allows(m)) return undefined
+    if (jsonAt(m, EVENTS_PATH) === undefined) return m
+    try {
+      return withJsonAt(m, EVENTS_PATH, this.original)
+    } catch (e) {
+      return m
+    }
+  }
+}
+
+// The create body with its transport.sdp replaced (the gateway, not the browser, is the provider's peer).
+export function withOffer(body: string, sdp: string): string throws SyntaxError {
+  return try withJsonAt(body, ["transport", "sdp"], quote(sdp))
+}
+
+export type PreparedEvents = { body: string, filter: LiveEventFilter | undefined, error: string }
+
+// Widens a restricted server-event list in the create body (the omitted list and "all" already deliver
+// every event). error is the 400 message for a list that is not one.
+export function prepareServerEvents(body: string): PreparedEvents {
+  const value = jsonAt(body, EVENTS_PATH)
+  if (value === undefined) return { body: body, filter: undefined, error: "" }
+  const v = value.trim()
+  if (v === `"all"`) return { body: body, filter: undefined, error: "" }
+  const path = "session.client.data_channel.allowed_server_events"
+  if (!v.startsWith("[")) return { body: body, filter: undefined, error: path + ` must be "all" or an array of server event selectors` }
+  const filter = new LiveEventFilter()
+  filter.original = v
+  const items: string[][] = []
+  let els: string[] = []
+  try {
+    els = elements(v)
+  } catch (e) {
+    return { body: body, filter: undefined, error: path + ` must be "all" or an array of server event selectors` }
+  }
+  let n = 0
+  for (const el of els) {
+    let fs: Field[] = []
+    try {
+      fs = fields(el)
+    } catch (e) {
+      return { body: body, filter: undefined, error: `${path} selector ${n} must be an object` }
+    }
+    const t = rawStr(fs, "type")
+    if (t === undefined || t.byteLength < 1 || t.chars().length > 256) return { body: body, filter: undefined, error: `${path} selector ${n} type must be a string of 1 to 256 characters` }
+    const nested = find(fs, "response_event")
+    let re = ""
+    if (t === "response.event") {
+      const r = rawStr(fs, "response_event")
+      if (nested === undefined || r === undefined || r.byteLength < 1 || r.chars().length > 256) return { body: body, filter: undefined, error: `${path} selector ${n} response_event must be a string of 1 to 256 characters for response.event` }
+      re = r
+    } else if (nested !== undefined) {
+      return { body: body, filter: undefined, error: `${path} selector ${n} response_event is only allowed for response.event` }
+    }
+    for (const f of fs) {
+      if (f.key !== "type" && f.key !== "response_event") return { body: body, filter: undefined, error: `${path} selector ${n} only supports type and response_event` }
+    }
+    filter.allowed.add(t + "|" + re)
+    items.push([t, re])
+    n += 1
+  }
+  for (const r of REQUIRED) {
+    if (!filter.allowed.has(r[0]! + "|" + r[1]!)) items.push(r)
+  }
+  const parts: string[] = []
+  for (const it of items) {
+    parts.push(it[1]! === "" ? `{"type":${quote(it[0]!)}}` : `{"response_event":${quote(it[1]!)},"type":${quote(it[0]!)}}`)
+  }
+  try {
+    return { body: withJsonAt(body, EVENTS_PATH, "[" + parts.join(",") + "]"), filter: filter, error: "" }
+  } catch (e) {
+    return { body: body, filter: undefined, error: "failed to prepare live server event permissions" }
+  }
+}
+
+// ---------------------------------------------------------------- the session's core
+
+// What a guard decided about a piece of text: action is "pass", "redact" (text is the replacement) or "block".
+export type Verdict = { action: string, text: string, reason: string }
+
+// What the core writes to: the two legs, and the end of the whole relay.
+export class LiveIO {
+  constructor(readonly toClient: (m: string) => void, readonly toProvider: (m: string) => void, readonly abandon: () => void) {}
+}
+
+// Why a session may not go on: the HTTP status and error type of the denial, and its message.
+export type Refusal = { status: int, type: string, message: string }
+
+// What the core asks of the gateway: re-admit the session for its next window (undefined, or the
+// refusal), record the finished session, bind the provider's session id to the virtual key that
+// opened it (false when it can't be recorded), and the metrics of an event.
+export class LiveHooks {
+  constructor(readonly readmit: () => Refusal | undefined, readonly report: (r: LiveReport) => void, readonly bind: (id: string) => bool, readonly count: (direction: string, type: string) => void) {}
+}
+
+// One finished session, for its log row.
+export type LiveReport = {
+  sessionId: string,
+  // voice time the provider reported, and what is billed (at least the minimum)
+  seconds: f64,
+  billedSeconds: f64,
+  promptTokens: int,
+  completionTokens: int,
+  status: int,
+  error: string,
+  reason: string,
+  startedMs: f64,
+  endedMs: f64,
+  input: string,
+  output: string,
+  events: int,
+}
+
+type TranscriptLine = { role: string, text: string }
+
+// The client's events that carry text a guard should see, in the order they come: the field that
+// holds it, and the text. A rewrite puts guarded text back (rewriteTexts).
+export function clientTexts(type: string, m: string): string[] {
+  const out: string[] = []
+  if (type === "session.update") {
+    const a = strAt(m, ["session", "instructions"])
+    if (a !== "") out.push(a)
+    const b = strAt(m, ["session", "delegation", "responses", "instructions"])
+    if (b !== "") out.push(b)
+  } else if (type === "session.instructions.append" || type === "session.thinking.append" || type === "session.commentary.append") {
+    const a = strAt(m, ["content"])
+    if (a !== "") out.push(a)
+  } else if (type === "response.item.create") {
+    const item = jsonAt(m, ["item"])
+    if (item !== undefined) {
+      const o = strAt(item, ["output"])
+      if (o !== "") out.push(o)
+      const c = jsonAt(item, ["content"])
+      if (c !== undefined && c.trim().startsWith("[")) {
+        try {
+          for (const part of elements(c)) {
+            const t = strAt(part, ["text"])
+            if (t !== "") out.push(t)
+          }
+        } catch (e) {
+          // not an array of parts: nothing to guard
+        }
+      }
+    }
+  } else if (type === "response.create") {
+    const a = strAt(m, ["response", "instructions"])
+    if (a !== "") out.push(a)
+  }
+  return out
+}
+
+// The same event with its guarded texts replaced, in the order clientTexts gave them.
+export function rewriteClientTexts(type: string, m: string, texts: string[]): string {
+  let i = 0
+  const next = (): string => {
+    const t = texts[i] ?? ""
+    i += 1
+    return quote(t)
+  }
+  try {
+    if (type === "session.update") {
+      let out = m
+      if (strAt(out, ["session", "instructions"]) !== "") out = withJsonAt(out, ["session", "instructions"], next())
+      if (strAt(out, ["session", "delegation", "responses", "instructions"]) !== "") out = withJsonAt(out, ["session", "delegation", "responses", "instructions"], next())
+      return out
+    }
+    if (type === "session.instructions.append" || type === "session.thinking.append" || type === "session.commentary.append") {
+      return strAt(m, ["content"]) !== "" ? withJsonAt(m, ["content"], next()) : m
+    }
+    if (type === "response.item.create") {
+      const item = jsonAt(m, ["item"])
+      if (item === undefined) return m
+      let it = item
+      if (strAt(it, ["output"]) !== "") it = withJsonAt(it, ["output"], next())
+      const c = jsonAt(it, ["content"])
+      if (c !== undefined && c.trim().startsWith("[")) {
+        const parts: string[] = []
+        for (const part of elements(c)) {
+          parts.push(strAt(part, ["text"]) !== "" ? withJsonAt(part, ["text"], next()) : part)
+        }
+        it = withJsonAt(it, ["content"], "[" + parts.join(",") + "]")
+      }
+      return withJsonAt(m, ["item"], it)
+    }
+    if (type === "response.create") {
+      return strAt(m, ["response", "instructions"]) !== "" ? withJsonAt(m, ["response", "instructions"], next()) : m
+    }
+  } catch (e) {
+    return m
+  }
+  return m
+}
+
+// The provider event's text a guard checks: an output transcript delta, or a delegated response's text
+// delta. "" when the event carries none.
+export function providerText(type: string, m: string): string {
+  if (type === "session.output_transcript.delta") return strAt(m, ["delta"])
+  if (type === "response.event" && strAt(m, ["event", "type"]) === "response.output_text.delta") return strAt(m, ["event", "delta"])
+  return ""
+}
+
+function withProviderText(type: string, m: string, text: string): string {
+  try {
+    if (type === "session.output_transcript.delta") return withJsonAt(m, ["delta"], quote(text))
+    return withJsonAt(m, ["event", "delta"], quote(text))
+  } catch (e) {
+    return m
+  }
+}
+
+export class LiveCore {
+  filter: LiveEventFilter | undefined = undefined
+  // the least voice time billed (the provider bills a created WebRTC session this much)
+  minimum = LIVE_MINIMUM_SECONDS
+  sessionId = ""
+  // the provider's latest cumulative voice seconds, and those not yet checked against a window
+  reported = 0.0
+  accrued = 0.0
+  promptTokens = 0
+  completionTokens = 0
+  startedMs: f64 = 0.0
+  lastUsageMs: f64 = 0.0
+  nextStaleMs: f64 = 0.0
+  // when the drain after a session.close ends (0: none running)
+  drainAt: f64 = 0.0
+  // session.closed arrived, the browser is gone, the session is over and reported, session.close went out
+  sessionClosed = false
+  clientGone = false
+  finished = false
+  closeSent = false
+  // nothing more is sent to the browser (a refusal, or an id that could not be recorded)
+  withhold = false
+  refused = false
+  status = 200
+  error = ""
+  reason = ""
+  events = 0
+  lines: TranscriptLine[] = []
+  transcriptBytes = 0
+  tail: string[] = []
+  billed: Set<string> = new Set<string>()
+  // the clock as of the last call into the core
+  now: f64 = 0.0
+
+  constructor(readonly io: LiveIO, readonly hooks: LiveHooks, nowMs: f64) {
+    this.startedMs = nowMs
+    this.lastUsageMs = nowMs
+    this.nextStaleMs = nowMs + STALE_EVERY_MS
+  }
+
+  // ---- browser to provider
+
+  // The texts of a browser event a guard should check.
+  clientTextsOf(m: string): string[] {
+    return clientTexts(eventType(m), m)
+  }
+
+  // Passes a browser event on (guards have run; texts are what they left, or empty when nothing was
+  // checked). A session.close starts the drain.
+  fromClient(m: string, texts: string[], nowMs: f64): void {
+    this.now = nowMs
+    if (this.finished) return
+    const type = eventType(m)
+    let out = m
+    if (texts.length > 0) out = rewriteClientTexts(type, m, texts)
+    this.hooks.count("in", type)
+    this.events += 1
+    if (type === "session.close") {
+      this.closeSent = true
+      this.startDrain(nowMs)
+    }
+    this.io.toProvider(out)
+  }
+
+  // A guard refused a browser event: the browser is told, the event goes nowhere.
+  refuseClient(reason: string): void {
+    this.io.toClient(errorEvent("guardrail_violation", "request blocked by guardrails: " + reason))
+  }
+
+  // ---- provider to browser
+
+  // The output text of a provider event a guard should check ("" for none), and the window it is
+  // checked in: the last deltas, so a secret split across tokens is seen.
+  providerTextOf(m: string): string {
+    return providerText(eventType(m), m)
+  }
+
+  outputWindow(delta: string): string {
+    return this.tail.join("") + delta
+  }
+
+  // Handles a provider event: metering and state first, then it goes to the browser (unless withheld or
+  // filtered). repl is the guarded replacement of its text, or undefined when it was not changed.
+  fromProvider(m: string, repl: string | undefined, nowMs: f64): void {
+    this.now = nowMs
+    if (this.finished) return
+    const type = eventType(m)
+    this.hooks.count("out", type)
+    this.events += 1
+    let out = m
+    // (an if chain: a switch on a string variable releases the string twice in this compiler)
+    if (type === "session.started") {
+      if (this.startedMs === 0.0) this.startedMs = nowMs
+      const id = strAt(m, ["session", "id"])
+      if (id !== "") {
+        this.sessionId = id
+        if (!this.hooks.bind(id)) {
+          // the id is never forwarded: this frame and every later one are withheld
+          this.withhold = true
+          this.endForRefusal("server_error", "the live session could not be recorded for its virtual key and was not opened", 500)
+        }
+      }
+    } else if (type === "session.input_transcript.delta") {
+      this.append("user", strAt(m, ["delta"]))
+    } else if (type === "session.output_transcript.delta") {
+      const d = strAt(m, ["delta"])
+      this.append("assistant", d)
+      this.note(d)
+      if (repl !== undefined) out = withProviderText(type, m, repl)
+    } else if (type === "session.usage.updated") {
+      this.onUsage(numAt(m, ["usage", "seconds"]), nowMs)
+    } else if (type === "response.event") {
+      const et = strAt(m, ["event", "type"])
+      if (et === "response.output_text.delta") {
+        this.note(strAt(m, ["event", "delta"]))
+        if (repl !== undefined) out = withProviderText(type, m, repl)
+      } else if (et === "response.completed" || et === "response.incomplete" || et === "response.failed") {
+        this.onBackend(m)
+      }
+    } else if (type === "session.closed") {
+      this.sessionClosed = true
+      this.reason = strAt(m, ["reason"])
+      this.finish(numAt(m, ["usage", "seconds"]), nowMs)
+    }
+    if (this.withhold) return
+    let sent: string | undefined = out
+    const f = this.filter
+    if (f !== undefined) sent = f.clientMessage(out)
+    if (sent !== undefined) this.io.toClient(sent)
+  }
+
+  // A guard blocked provider output: the browser is told, nothing more reaches it, and the session
+  // is closed upstream so what it used is still reported.
+  blockOutput(reason: string): void {
+    this.endForRefusal("guardrail_violation", "response blocked by guardrails: " + reason, 400)
+  }
+
+  private append(role: string, delta: string): void {
+    if (delta === "" || this.transcriptBytes + delta.byteLength > TRANSCRIPT_MAX) return
+    this.transcriptBytes += delta.byteLength
+    const n = this.lines.length
+    if (n > 0 && this.lines[n - 1]!.role === role) {
+      this.lines[n - 1] = { role: role, text: this.lines[n - 1]!.text + delta }
+    } else {
+      this.lines.push({ role: role, text: delta })
+    }
+  }
+
+  // Keeps the last output deltas for the guard's window.
+  private note(delta: string): void {
+    if (delta === "") return
+    this.tail.push(delta)
+    if (this.tail.length > 16) this.tail.shift()
+  }
+
+  private onUsage(cumulative: f64, nowMs: f64): void {
+    this.lastUsageMs = nowMs
+    if (cumulative > this.reported) {
+      this.accrued += cumulative - this.reported
+      this.reported = cumulative
+    }
+    if (this.accrued >= LIVE_WINDOW_SECONDS) this.window()
+  }
+
+  // The next window starts: the session is admitted for it again (a budget or limit that ran out
+  // ends the session).
+  private window(): void {
+    if (this.finished || this.refused) return
+    this.accrued = 0.0
+    const why = this.hooks.readmit()
+    if (why !== undefined) this.endForRefusal(why.type, why.message, why.status)
+  }
+
+  // A delegated response finished: its token usage joins the session's (once per response).
+  private onBackend(m: string): void {
+    const id = strAt(m, ["event", "response", "id"])
+    if (id !== "") {
+      if (this.billed.has(id)) return
+      this.billed.add(id)
+    }
+    this.promptTokens += Math.trunc(numAt(m, ["event", "response", "usage", "input_tokens"]))
+    this.completionTokens += Math.trunc(numAt(m, ["event", "response", "usage", "output_tokens"]))
+  }
+
+  // Tells the browser why the session is ending, then closes it upstream so the usage already spent
+  // is still reported.
+  private endForRefusal(type: string, message: string, status: int): void {
+    if (this.refused) return
+    this.refused = true
+    this.status = status
+    this.error = message
+    this.io.toClient(errorEvent(type, message))
+    this.withhold = true
+    this.requestClose()
+  }
+
+  // ---- ends
+
+  // The browser's connection or channel ended: the provider is asked to close, and the session lives
+  // on until session.closed, so its final usage is billed.
+  clientLeft(nowMs: f64): void {
+    this.now = nowMs
+    if (this.clientGone) return
+    this.clientGone = true
+    this.withhold = true
+    this.requestClose()
+    this.startDrain(nowMs)
+  }
+
+  private requestClose(): void {
+    if (this.closeSent || this.finished) return
+    this.closeSent = true
+    this.io.toProvider(`{"type":"session.close"}`)
+    this.startDrain(this.now)
+  }
+
+  private startDrain(nowMs: f64): void {
+    if (this.drainAt === 0.0) this.drainAt = nowMs + DRAIN_MS
+  }
+
+  // The provider's connection ended. Without a session.closed, what it last reported is billed, and a
+  // browser still connected is told.
+  providerEnded(nowMs: f64): void {
+    this.now = nowMs
+    if (this.finished) return
+    const early = !this.sessionClosed && !this.clientGone
+    if (early) {
+      if (this.status === 200 && !this.closeSent) {
+        this.status = 502
+        this.error = "the live session's upstream connection ended before session.closed"
+      }
+      if (!this.withhold) this.io.toClient(errorEvent("server_error", "the live session's upstream connection ended before session.closed"))
+    }
+    this.finish(this.reported, nowMs)
+  }
+
+  // The session's setup failed after the provider created it: the minimum is billed, with the error.
+  abort(status: int, message: string, nowMs: f64): void {
+    this.now = nowMs
+    if (this.finished) return
+    if (this.status === 200) {
+      this.status = status
+      this.error = message
+    }
+    this.finish(this.reported, nowMs)
+  }
+
+  // Bills everything and reports the session, once.
+  finish(finalSeconds: f64, nowMs: f64): void {
+    if (this.finished) return
+    this.finished = true
+    this.drainAt = 0.0
+    let seconds = finalSeconds
+    if (this.reported > seconds) seconds = this.reported
+    const billed = seconds < this.minimum ? this.minimum : seconds
+    let input = ""
+    let output = ""
+    for (const l of this.lines) {
+      if (l.role === "user") input += (input === "" ? "" : "\n") + l.text
+      else output += (output === "" ? "" : "\n") + l.text
+    }
+    this.hooks.report({
+      sessionId: this.sessionId, seconds: seconds, billedSeconds: billed, promptTokens: this.promptTokens, completionTokens: this.completionTokens,
+      status: this.status, error: this.error, reason: this.reason, startedMs: this.startedMs, endedMs: nowMs, input: input, output: output, events: this.events,
+    })
+  }
+
+  // The clock: the drain after a close ends (the relay is abandoned), and an idle session meets its window.
+  tick(nowMs: f64): void {
+    this.now = nowMs
+    if (this.finished) return
+    if (this.drainAt > 0.0 && nowMs >= this.drainAt) {
+      this.drainAt = 0.0
+      this.io.abandon()
+      return
+    }
+    if (nowMs >= this.nextStaleMs) {
+      this.nextStaleMs = nowMs + STALE_EVERY_MS
+      if (nowMs - this.lastUsageMs >= STALE_AFTER_MS && !this.closeSent) {
+        this.lastUsageMs = nowMs
+        this.window()
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- the relay
+
+// One leg of the relay (the browser's, or the provider's): what the relay needs of a peer connection,
+// as closures, so the relay runs on fake legs in tests.
+export class Leg {
+  constructor(readonly sendText: (m: string) => bool, readonly sendPacket: (p: u8[]) => bool, readonly buffered: () => int, readonly close: () => void) {}
+}
+
+// Checks a piece of text against the gateway's guardrails (source "input" or "output").
+export type GuardFn = (text: string, source: string) => Promise<Verdict>
+
+class Cell {
+  weak relay: Relay | undefined
+}
+
+// The browser and the provider joined by a LiveCore. Messages cross as text; a message sent before its
+// channel is open waits (up to PENDING_MAX of them). With guardrails on, each direction is a queue that
+// is checked in order. Audio crosses as packets, without waiting for anything.
+export class Relay {
+  core: LiveCore
+  client: Leg | undefined = undefined
+  provider: Leg | undefined = undefined
+  clientOpen = false
+  providerOpen = false
+  closing = false
+  closed = false
+  setupDone = false
+  private cell: Cell
+  private pendingClient: string[] = []
+  private pendingProvider: string[] = []
+  private qUp: string[] = []
+  private qDown: string[] = []
+  private busyUp = false
+  private busyDown = false
+  private packetsIn = 0
+  private packetsOut = 0
+  // runs once the relay is closed (the registry forgets it)
+  onClosed: (() => void) | undefined = undefined
+  // the clock's timer, cleared on close
+  ticker: ((() => void) | undefined) = undefined
+
+  constructor(hooks: LiveHooks, readonly guard: GuardFn | undefined, nowMs: f64) {
+    const cell = new Cell()
+    this.cell = cell
+    const io = new LiveIO((m) => {
+      const r = cell.relay
+      if (r !== undefined) r.sendClient(m)
+    }, (m) => {
+      const r = cell.relay
+      if (r !== undefined) r.sendProvider(m)
+    }, () => {
+      const r = cell.relay
+      if (r !== undefined) r.abandon()
+    })
+    this.core = new LiveCore(io, hooks, nowMs)
+    cell.relay = this
+  }
+
+  // ---- text
+
+  sendClient(m: string): void {
+    const c = this.client
+    if (this.closed || c === undefined) return
+    if (this.clientOpen && this.pendingClient.length === 0) {
+      c.sendText(m)
+      return
+    }
+    if (this.pendingClient.length >= PENDING_MAX) {
+      this.close()
+      return
+    }
+    this.pendingClient.push(m)
+  }
+
+  sendProvider(m: string): void {
+    const p = this.provider
+    if (this.closed || p === undefined) return
+    if (this.providerOpen && this.pendingProvider.length === 0) {
+      p.sendText(m)
+      return
+    }
+    if (this.pendingProvider.length >= PENDING_MAX) {
+      this.close()
+      return
+    }
+    this.pendingProvider.push(m)
+  }
+
+  // A channel opened: what waited for it goes out.
+  channelOpened(isClient: bool): void {
+    if (this.closed) return
+    if (isClient) {
+      this.clientOpen = true
+      const c = this.client
+      const q = this.pendingClient
+      this.pendingClient = []
+      if (c !== undefined) for (const m of q) c.sendText(m)
+    } else {
+      this.providerOpen = true
+      const p = this.provider
+      const q = this.pendingProvider
+      this.pendingProvider = []
+      if (p !== undefined) for (const m of q) p.sendText(m)
+    }
+  }
+
+  // A message from the browser's data channel.
+  fromBrowser(m: string): void {
+    if (this.closed) return
+    this.qUp.push(m)
+    if (!this.busyUp) this.drainUp()
+  }
+
+  // A message from the provider's data channel.
+  fromProvider(m: string): void {
+    if (this.closed) return
+    this.qDown.push(m)
+    if (!this.busyDown) this.drainDown()
+  }
+
+  // The browser's queue: events with nothing to guard go straight through; one with text to check
+  // waits for the guard, and the events behind it wait for that one.
+  private drainUp(): void {
+    while (this.qUp.length > 0 && !this.closed) {
+      const m = this.qUp[0]!
+      if (this.guard !== undefined && this.core.clientTextsOf(m).length > 0) {
+        this.busyUp = true
+        this.guardUp()
+        return
+      }
+      this.qUp.shift()
+      this.core.fromClient(m, [], Date.now())
+    }
+  }
+
+  private async guardUp(): Promise<void> {
+    const m = this.qUp.shift()!
+    const g = this.guard
+    const texts = this.core.clientTextsOf(m)
+    if (g !== undefined && !this.closed) {
+      const out: string[] = []
+      let changed = false
+      let refused = false
+      for (const t of texts) {
+        const v = await g(t, "input")
+        if (v.action === "block") {
+          this.core.refuseClient(v.reason)
+          refused = true
+          break
+        }
+        if (v.action === "redact") {
+          out.push(v.text)
+          changed = true
+        } else {
+          out.push(t)
+        }
+      }
+      if (!refused && !this.closed) this.core.fromClient(m, changed ? out : [], Date.now())
+    }
+    this.busyUp = false
+    this.drainUp()
+  }
+
+  // The provider's queue, the same way: only output text is checked.
+  private drainDown(): void {
+    while (this.qDown.length > 0 && !this.closed) {
+      const m = this.qDown[0]!
+      if (this.guard !== undefined && this.core.providerTextOf(m) !== "") {
+        this.busyDown = true
+        this.guardDown()
+        return
+      }
+      this.qDown.shift()
+      this.core.fromProvider(m, undefined, Date.now())
+      if (this.core.finished) this.endSoon()
+    }
+  }
+
+  private async guardDown(): Promise<void> {
+    const m = this.qDown.shift()!
+    const g = this.guard
+    const t = this.core.providerTextOf(m)
+    let repl: string | undefined = undefined
+    let blocked = ""
+    if (g !== undefined) {
+      const v = await g(this.core.outputWindow(t), "output")
+      if (v.action === "block") {
+        blocked = v.reason
+      } else if (v.action === "redact") {
+        // the window found something: the delta alone says what to put in its place
+        const d = await g(t, "output")
+        if (d.action === "redact") repl = d.text
+      }
+    }
+    if (!this.closed) {
+      if (blocked !== "") this.core.blockOutput(blocked)
+      this.core.fromProvider(m, repl, Date.now())
+      if (this.core.finished) this.endSoon()
+    }
+    this.busyDown = false
+    this.drainDown()
+  }
+
+  // ---- audio
+
+  packetFromBrowser(p: u8[]): void {
+    const o = this.provider
+    if (this.closed || o === undefined) return
+    const f = forwardRtp(p)
+    if (f === undefined) return
+    this.packetsIn += 1
+    o.sendPacket(f)
+  }
+
+  packetFromProvider(p: u8[]): void {
+    const o = this.client
+    if (this.closed || o === undefined) return
+    const f = forwardRtp(p)
+    if (f === undefined) return
+    this.packetsOut += 1
+    o.sendPacket(f)
+  }
+
+  get packets(): int {
+    return this.packetsIn + this.packetsOut
+  }
+
+  // ---- ends
+
+  // The browser's connection or data channel ended.
+  browserGone(): void {
+    if (this.closed) return
+    this.core.clientLeft(Date.now())
+    // before the setup finished there is no session to wait for
+    if (!this.setupDone) this.close()
+  }
+
+  // The provider's connection or data channel ended: what it last reported is billed and the relay ends.
+  providerGone(): void {
+    if (this.closed) return
+    this.close()
+  }
+
+  // The drain after a close ran out: the provider is let go.
+  abandon(): void {
+    this.providerGone()
+  }
+
+  // The session is over (session.closed went out): the relay ends once the browser has it.
+  private endSoon(): void {
+    const r = this
+    setTimeout(() => {
+      r.close()
+    }, 0)
+  }
+
+  // The clock, once a second.
+  tick(nowMs: f64): void {
+    if (this.closed) return
+    this.core.tick(nowMs)
+  }
+
+  // Ends the relay: the session is reported, the browser gets what is queued for it, then both legs go.
+  close(): void {
+    if (this.closing) return
+    this.closing = true
+    this.core.providerEnded(Date.now())
+    this.drain(Date.now() + BROWSER_DRAIN_MS)
+  }
+
+  // Waits for the browser's queue to empty (final events, errors), bounded.
+  private drain(deadlineMs: f64): void {
+    const c = this.client
+    const pending = this.pendingClient.length > 0 || (c !== undefined && this.clientOpen && c.buffered() > 0)
+    if (!pending || Date.now() >= deadlineMs || c === undefined) {
+      this.finalize()
+      return
+    }
+    const r = this
+    setTimeout(() => {
+      r.drain(deadlineMs)
+    }, 10)
+  }
+
+  private finalize(): void {
+    if (this.closed) return
+    this.closed = true
+    const t = this.ticker
+    if (t !== undefined) t()
+    this.ticker = undefined
+    const c = this.client
+    const p = this.provider
+    this.client = undefined
+    this.provider = undefined
+    this.pendingClient = []
+    this.pendingProvider = []
+    this.qUp = []
+    this.qDown = []
+    if (c !== undefined) c.close()
+    if (p !== undefined) p.close()
+    const done = this.onClosed
+    this.onClosed = undefined
+    this.cell.relay = undefined
+    if (done !== undefined) done()
+  }
+}
+
+// ---------------------------------------------------------------- the create handshake
+
+// The provider's side of the handshake: status 0 with its SDP answer and session id, or the status, error
+// and (when it sent one) its own error body and content type, which are passed on as they are.
+export type Exchange = { status: int, type: string, message: string, sdp: string, sessionId: string, body: string, contentType: string }
+
+export type Setup = {
+  // the browser's SDP offer, and the provider's side of the exchange: it gets this gateway's own offer
+  // and answers with the provider's SDP (status 0), or with the error to send the caller
+  offer: string,
+  exchange: (offer: string) => Promise<Exchange>,
+  hooks: LiveHooks,
+  guard: GuardFn | undefined,
+  filter: LiveEventFilter | undefined,
+  iceServers: string[],
+  bindAddress: string,
+}
+
+export type Established = { status: int, type: string, message: string, answer: string, sessionId: string, relay: Relay | undefined, body: string, contentType: string }
+
+function failed(status: int, type: string, message: string): Established {
+  return { status: status, type: type, message: message, answer: "", sessionId: "", relay: undefined, body: "", contentType: "" }
+}
+
+// Resolves when the connection has gathered its candidates (or the wait ran out).
+function whenGathered(pc: RTCPeerConnection, ms: int): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (pc.gatheringState === "complete") {
+      resolve()
+      return
+    }
+    let done = false
+    pc.ongatheringchange = (s) => {
+      if (s === "complete" && !done) {
+        done = true
+        resolve()
+      }
+    }
+    setTimeout(() => {
+      if (!done) {
+        done = true
+        resolve()
+      }
+    }, ms)
+  })
+}
+
+// Wait for a connection to connect: true when it does, false when it fails or closes first.
+class Connect {
+  waiting: ((ok: bool) => void) | undefined = undefined
+  state = "new"
+
+  fire(ok: bool): void {
+    const w = this.waiting
+    this.waiting = undefined
+    if (w !== undefined) w(ok)
+  }
+
+  // Call with each state change of the connection.
+  seen(st: string): void {
+    this.state = st
+    if (st === "connected") this.fire(true)
+    else if (st === "failed" || st === "closed") this.fire(false)
+  }
+
+  wait(ms: int): Promise<bool> {
+    const c = this
+    return new Promise<bool>((resolve) => {
+      if (c.state === "connected") {
+        resolve(true)
+        return
+      }
+      if (c.state === "failed" || c.state === "closed") {
+        resolve(false)
+        return
+      }
+      c.waiting = resolve
+      setTimeout(() => {
+        c.fire(false)
+      }, ms)
+    })
+  }
+}
+
+function randomSsrc(): int {
+  return 1 + Math.floor(Math.random() * 4294967294.0)
+}
+
+// What a leg stands on: its connection, and the channel and track as they arrive.
+class PeerLeg {
+  channel: RTCDataChannel | undefined = undefined
+  track: RTCTrack | undefined = undefined
+  pt = -1
+  constructor(readonly pc: RTCPeerConnection, readonly ssrc: int) {}
+}
+
+// A relay leg on a peer connection: its data channel and audio track.
+function rtcLeg(st: PeerLeg): Leg {
+  return new Leg((m) => {
+    const c = st.channel
+    return c !== undefined && c.send(m)
+  }, (p) => {
+    const t = st.track
+    if (t === undefined) return false
+    // the other leg's packets go out on this leg's stream, in the payload type it negotiated
+    if (st.pt < 0) st.pt = t.payloadType
+    return t.sendRtp(p, st.ssrc, st.pt)
+  }, () => {
+    const c = st.channel
+    return c === undefined ? 0 : c.bufferedAmount
+  }, () => {
+    st.pc.close()
+    st.channel = undefined
+    st.track = undefined
+  })
+}
+
+function makePeer(cfg: RTCConfig): RTCPeerConnection | undefined {
+  try {
+    return try new RTCPeerConnection(cfg)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Makes the two peer connections, runs the handshake and returns the browser's SDP answer, with the
+// relay running. A failure before the provider created the session bills nothing; after it, the
+// minimum.
+export async function establish(s: Setup): Promise<Established> {
+  const cfg: RTCConfig = { iceServers: s.iceServers, bindAddress: s.bindAddress }
+  const down = makePeer(cfg)
+  if (down === undefined) return failed(500, "server_error", "failed to create browser peer connection")
+  const up = makePeer(cfg)
+  if (up === undefined) {
+    down.close()
+    return failed(500, "server_error", "failed to create upstream peer connection")
+  }
+  const relay = new Relay(s.hooks, s.guard, Date.now())
+  relay.core.filter = s.filter
+  // nothing is billed until the provider has created the session
+  relay.core.minimum = 0.0
+  const downLeg = new PeerLeg(down, randomSsrc())
+  const upLeg = new PeerLeg(up, randomSsrc())
+  relay.client = rtcLeg(downLeg)
+  relay.provider = rtcLeg(upLeg)
+  const abort = (st: int, type: string, msg: string): Established => {
+    relay.core.abort(st, msg, Date.now())
+    relay.close()
+    return failed(st, type, msg)
+  }
+
+  // the provider side: an audio track and the events channel
+  let upTrack: RTCTrack | undefined = undefined
+  try {
+    upTrack = try up.addTrack({ direction: "sendrecv", codec: "opus", payloadType: 111, ssrc: upLeg.ssrc, name: "audio", profile: "minptime=10;useinbandfec=1" })
+  } catch (e) {
+    return abort(500, "server_error", "failed to attach provider audio track")
+  }
+  const upChannel = up.createDataChannel(DATA_CHANNEL_LABEL)
+  upLeg.channel = upChannel
+  upLeg.track = upTrack
+  upChannel.onopen = () => {
+    relay.channelOpened(false)
+  }
+  upChannel.onmessage = (m) => {
+    if (typeof m === "string") relay.fromProvider(m)
+  }
+  upChannel.onclose = () => {
+    relay.providerGone()
+  }
+  upChannel.onerror = (e) => {
+    relay.providerGone()
+  }
+  if (upTrack !== undefined) {
+    upTrack.onpacket = (p) => {
+      relay.packetFromProvider(p)
+    }
+  }
+
+  // the browser side: what the browser's offer brings
+  down.ondatachannel = (incoming) => {
+    const ch = incoming
+    if (downLeg.channel !== undefined) {
+      ch.close()
+      return
+    }
+    downLeg.channel = ch
+    ch.onopen = () => {
+      relay.channelOpened(true)
+    }
+    ch.onmessage = (m) => {
+      if (typeof m === "string") relay.fromBrowser(m)
+    }
+    ch.onclose = () => {
+      relay.browserGone()
+    }
+    ch.onerror = (e) => {
+      relay.browserGone()
+    }
+  }
+  down.ontrack = (incoming) => {
+    const t = incoming
+    // only the audio that negotiated Opus is relayed
+    if (downLeg.track !== undefined || t.payloadType < 0) return
+    downLeg.track = t
+    t.onpacket = (p) => {
+      relay.packetFromBrowser(p)
+    }
+  }
+  const downState = new Connect()
+  down.onstatechange = (st) => {
+    downState.seen(st)
+    if (st === "failed" || st === "closed") relay.browserGone()
+  }
+  const upState = new Connect()
+  up.onstatechange = (st) => {
+    upState.seen(st)
+    if (st === "failed" || st === "closed") relay.providerGone()
+  }
+
+  const bad = down.setRemoteDescription(opusOnly(s.offer), "offer")
+  if (bad !== "") return abort(400, "invalid_request_error", "invalid browser SDP offer")
+  if (up.setLocalDescription("") !== "") return abort(500, "server_error", "failed to create upstream SDP offer")
+  await whenGathered(up, GATHER_MS)
+  let upOffer = up.localDescription
+  if (upOffer === "") return abort(500, "server_error", "failed to create upstream SDP offer")
+  upOffer = constrainMaxMessageSize(upOffer, s.offer)
+
+  const ex = await s.exchange(upOffer)
+  if (ex.status !== 0) {
+    const r = abort(ex.status, ex.type, ex.message)
+    return { status: r.status, type: r.type, message: r.message, answer: "", sessionId: "", relay: undefined, body: ex.body, contentType: ex.contentType }
+  }
+  // the provider has created the session: the minimum is incurred
+  relay.core.minimum = LIVE_MINIMUM_SECONDS
+  relay.core.sessionId = ex.sessionId
+  if (!s.hooks.bind(ex.sessionId)) return abort(500, "server_error", "the live session could not be recorded for its virtual key and was not opened")
+  if (ex.sdp === "") return abort(502, "upstream_connection_error", "live session create response has no SDP answer")
+  if (up.setRemoteDescription(ex.sdp, "answer") !== "") return abort(502, "upstream_connection_error", "invalid upstream SDP answer")
+  const connected = await upState.wait(HANDSHAKE_MS)
+  if (!connected) return abort(502, "upstream_connection_error", "upstream WebRTC connection failed")
+  await whenGathered(down, GATHER_MS)
+  const answer = down.localDescription
+  if (answer === "" || down.localDescriptionType !== "answer") return abort(500, "server_error", "failed to create browser SDP answer")
+  if (relay.closing) return failed(502, "upstream_connection_error", "the WebRTC session closed during setup")
+  relay.setupDone = true
+  const clock = setInterval(() => {
+    relay.tick(Date.now())
+  }, 1000)
+  relay.ticker = () => {
+    clearInterval(clock)
+  }
+  return { status: 0, type: "", message: "", answer: answer, sessionId: ex.sessionId, relay: relay, body: "", contentType: "" }
+}
+
+// ---------------------------------------------------------------- tests
+
+class Capture {
+  client: string[] = []
+  provider: string[] = []
+  abandoned = 0
+  reports: LiveReport[] = []
+  binds: string[] = []
+  bindOk = true
+  readmitWhy = ""
+  readmits = 0
+  readmitType = "budget_exceeded"
+  counts: string[] = []
+}
+
+function fixture(): { core: LiveCore, cap: Capture } {
+  const cap = new Capture()
+  const io = new LiveIO((m) => {
+    cap.client.push(m)
+  }, (m) => {
+    cap.provider.push(m)
+  }, () => {
+    cap.abandoned += 1
+  })
+  const hooks = new LiveHooks(() => {
+    cap.readmits += 1
+    if (cap.readmitWhy === "") return undefined
+    return { status: 429, type: cap.readmitType, message: cap.readmitWhy }
+  }, (r) => {
+    cap.reports.push(r)
+  }, (id) => {
+    cap.binds.push(id)
+    return cap.bindOk
+  }, (d, t) => {
+    cap.counts.push(d + ":" + t)
+  })
+  return { core: new LiveCore(io, hooks, 1000.0), cap: cap }
+}
+
+test("max-message-size lines", () => {
+  const offer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\na=max-message-size:1073741823\r\n"
+  expect(sdpMaxMessageSize(offer)).toBe(1073741823)
+  expect(sdpMaxMessageSize("v=0\r\n")).toBe(undefined)
+  const lowered = constrainMaxMessageSize(offer, "v=0\r\nm=application 9 x\r\na=max-message-size:262144\r\n")
+  expect(sdpMaxMessageSize(lowered)).toBe(262144)
+  expect(lowered.includes("a=max-message-size:1073741823")).toBe(false)
+  // a browser offer that is larger leaves the provider's limit alone
+  expect(constrainMaxMessageSize(lowered, "a=max-message-size:1073741823\r\n")).toBe(lowered)
+  // none in the browser's offer: unchanged
+  expect(constrainMaxMessageSize(offer, "v=0\r\n")).toBe(offer)
+  // added ahead of the application section when the offer has none
+  const bare = "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n"
+  const added = setSdpMaxMessageSize(bare, 65536)
+  expect(added).toBe("v=0\r\na=max-message-size:65536\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n")
+})
+
+test("an offer is cut down to Opus", () => {
+  const offer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111 63 9 0 8\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\na=rtcp-fb:111 transport-cc\r\na=rtpmap:9 G722/8000\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=sendrecv\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n"
+  const out = opusOnly(offer)
+  expect(out.includes("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n")).toBe(true)
+  expect(out.includes("G722")).toBe(false)
+  expect(out.includes("PCMU")).toBe(false)
+  expect(out.includes("a=fmtp:111 minptime=10;useinbandfec=1")).toBe(true)
+  expect(out.includes("a=rtcp-fb:111 transport-cc")).toBe(true)
+  expect(out.includes("a=mid:0")).toBe(true)
+  expect(out.includes("m=application 9 UDP/DTLS/SCTP webrtc-datachannel")).toBe(true)
+  // no Opus: left alone
+  const g = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0 8\r\na=rtpmap:0 PCMU/8000\r\n"
+  expect(opusOnly(g)).toBe(g)
+})
+
+test("RTP headers are cleaned for the other leg", () => {
+  const plain: u8[] = [u8(0x80), u8(111), u8(0), u8(1), u8(0), u8(0), u8(0), u8(160), u8(0), u8(0), u8(16), u8(146), u8(7), u8(8)]
+  const same = forwardRtp(plain)
+  expect(same === undefined).toBe(false)
+  expect(same!.length).toBe(14)
+  // one extension word (profile, length 1, 4 bytes) and one CSRC are dropped
+  const ext: u8[] = [u8(0x91), u8(111), u8(0), u8(2), u8(0), u8(0), u8(0), u8(160), u8(0), u8(0), u8(16), u8(146),
+    u8(1), u8(2), u8(3), u8(4),
+    u8(0xBE), u8(0xDE), u8(0), u8(1), u8(9), u8(9), u8(9), u8(9),
+    u8(42), u8(43)]
+  const cleaned = forwardRtp(ext)
+  expect(cleaned === undefined).toBe(false)
+  expect(cleaned!.length).toBe(14)
+  expect(int(cleaned![0]!)).toBe(0x80)
+  expect(int(cleaned![12]!)).toBe(42)
+  expect(int(cleaned![13]!)).toBe(43)
+  // RTCP (a sender report), a runt and a wrong version are not forwarded
+  const rtcp: u8[] = [u8(0x80), u8(200), u8(0), u8(6), u8(0), u8(0), u8(0), u8(1), u8(0), u8(0), u8(0), u8(0), u8(0)]
+  expect(forwardRtp(rtcp) === undefined).toBe(true)
+  expect(forwardRtp([u8(0x80), u8(111)]) === undefined).toBe(true)
+  const v1: u8[] = [u8(0x40), u8(111), u8(0), u8(1), u8(0), u8(0), u8(0), u8(160), u8(0), u8(0), u8(16), u8(146), u8(1)]
+  expect(forwardRtp(v1) === undefined).toBe(true)
+})
+
+test("server event permissions are widened for the provider and kept for the browser", () => {
+  const body = `{"session":{"model":"openai/gpt-live","client":{"data_channel":{"allowed_server_events":[{"type":"session.output_transcript.delta"},{"type":"response.event","response_event":"response.completed"}]}}},"transport":{"type":"webrtc","sdp":"x"}}`
+  const p = prepareServerEvents(body)
+  expect(p.error).toBe("")
+  expect(p.filter === undefined).toBe(false)
+  const widened = jsonAt(p.body, EVENTS_PATH)!
+  expect(widened.includes(`{"type":"session.usage.updated"}`)).toBe(true)
+  expect(widened.includes(`{"response_event":"response.failed","type":"response.event"}`)).toBe(true)
+  // the browser's own two are kept once
+  expect(widened.split(`"session.output_transcript.delta"`).length).toBe(2)
+  const f = p.filter!
+  expect(f.allows(`{"type":"session.output_transcript.delta","delta":"hi"}`)).toBe(true)
+  expect(f.allows(`{"type":"session.usage.updated","usage":{"seconds":3}}`)).toBe(false)
+  expect(f.allows(`{"type":"response.event","event":{"type":"response.completed"}}`)).toBe(true)
+  expect(f.allows(`{"type":"response.event","event":{"type":"response.output_text.delta"}}`)).toBe(false)
+  // an echo of the permissions carries the browser's list again
+  const echoed = f.clientMessage(`{"type":"session.output_transcript.delta","session":{"client":{"data_channel":{"allowed_server_events":[{"type":"x"}]}}}}`)!
+  expect(jsonAt(echoed, EVENTS_PATH)).toBe(`[{"type":"session.output_transcript.delta"},{"type":"response.event","response_event":"response.completed"}]`)
+  expect(f.clientMessage(`{"type":"session.usage.updated"}`) === undefined).toBe(true)
+  // "all", or no list: the body is untouched and nothing is filtered
+  const all = `{"session":{"client":{"data_channel":{"allowed_server_events":"all"}}}}`
+  expect(prepareServerEvents(all).body).toBe(all)
+  expect(prepareServerEvents(all).filter === undefined).toBe(true)
+  expect(prepareServerEvents(`{"session":{"model":"m"}}`).filter === undefined).toBe(true)
+  // bad lists
+  expect(prepareServerEvents(`{"session":{"client":{"data_channel":{"allowed_server_events":5}}}}`).error.includes("must be")).toBe(true)
+  expect(prepareServerEvents(`{"session":{"client":{"data_channel":{"allowed_server_events":[{"type":"response.event"}]}}}}`).error.includes("response_event must be")).toBe(true)
+  expect(prepareServerEvents(`{"session":{"client":{"data_channel":{"allowed_server_events":[{"type":"error","response_event":"x"}]}}}}`).error.includes("only allowed for response.event")).toBe(true)
+  expect(prepareServerEvents(`{"session":{"client":{"data_channel":{"allowed_server_events":[{"type":"error","extra":1}]}}}}`).error.includes("only supports type and response_event")).toBe(true)
+})
+
+test("client texts are found and put back", () => {
+  const upd = `{"type":"session.update","session":{"instructions":"be brief","voice":"alloy"}}`
+  expect(clientTexts("session.update", upd).join("|")).toBe("be brief")
+  expect(rewriteClientTexts("session.update", upd, ["be [x]"])).toBe(`{"type":"session.update","session":{"instructions":"be [x]","voice":"alloy"}}`)
+  const item = `{"type":"response.item.create","item":{"type":"message","content":[{"type":"input_text","text":"hello"},{"type":"input_text","text":"again"}]}}`
+  expect(clientTexts("response.item.create", item).join("|")).toBe("hello|again")
+  expect(rewriteClientTexts("response.item.create", item, ["a", "b"]).includes(`"text":"a"`)).toBe(true)
+  expect(rewriteClientTexts("response.item.create", item, ["a", "b"]).includes(`"text":"b"`)).toBe(true)
+  const out = `{"type":"response.item.create","item":{"type":"function_call_output","call_id":"c","output":"sk"}}`
+  expect(clientTexts("response.item.create", out).join("|")).toBe("sk")
+  expect(clientTexts("session.input_audio.mute", `{"type":"session.input_audio.mute"}`).length).toBe(0)
+  expect(clientTexts("session.instructions.append", `{"type":"session.instructions.append","content":"more"}`).join("|")).toBe("more")
+})
+
+test("a session is metered: usage, the minimum and the report", () => {
+  const t = fixture()
+  const c = t.core
+  c.fromProvider(`{"type":"session.started","session":{"id":"sess_1"}}`, undefined, 1100.0)
+  expect(t.cap.binds.join(",")).toBe("sess_1")
+  c.fromProvider(`{"type":"session.input_transcript.delta","delta":"hi there","start_ms":0,"end_ms":10}`, undefined, 1200.0)
+  c.fromProvider(`{"type":"session.output_transcript.delta","delta":"hello"}`, undefined, 1300.0)
+  c.fromProvider(`{"type":"session.output_transcript.delta","delta":" you"}`, undefined, 1310.0)
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":4.5}}`, undefined, 1400.0)
+  c.fromProvider(`{"type":"response.event","delegation_id":"d","event":{"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":12,"output_tokens":7}}}}`, undefined, 1500.0)
+  // the same response again is not counted twice
+  c.fromProvider(`{"type":"response.event","delegation_id":"d","event":{"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":12,"output_tokens":7}}}}`, undefined, 1510.0)
+  expect(t.cap.client.length).toBe(7)
+  expect(t.cap.reports.length).toBe(0)
+  c.fromProvider(`{"type":"session.closed","reason":"close_requested","usage":{"seconds":6.25}}`, undefined, 9000.0)
+  expect(t.cap.reports.length).toBe(1)
+  const r = t.cap.reports[0]!
+  expect(r.sessionId).toBe("sess_1")
+  expect(r.seconds).toBe(6.25)
+  // a WebRTC session bills at least 15 seconds
+  expect(r.billedSeconds).toBe(15.0)
+  expect(r.promptTokens).toBe(12)
+  expect(r.completionTokens).toBe(7)
+  expect(r.status).toBe(200)
+  expect(r.reason).toBe("close_requested")
+  expect(r.input).toBe("hi there")
+  expect(r.output).toBe("hello you")
+  expect(r.events).toBe(8)
+  // nothing is reported twice, and nothing flows after the end
+  c.providerEnded(9100.0)
+  c.fromProvider(`{"type":"error"}`, undefined, 9200.0)
+  expect(t.cap.reports.length).toBe(1)
+  expect(t.cap.client.length).toBe(8)
+  expect(t.cap.counts.includes("out:session.usage.updated")).toBe(true)
+})
+
+test("a long session bills what it ran, and each window is admitted again", () => {
+  const t = fixture()
+  const c = t.core
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":20}}`, undefined, 2000.0)
+  expect(t.cap.readmits).toBe(0)
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":35}}`, undefined, 3000.0)
+  expect(t.cap.readmits).toBe(1)
+  // snapshots are cumulative: an older one adds nothing
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":10}}`, undefined, 3100.0)
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":80}}`, undefined, 4000.0)
+  expect(t.cap.readmits).toBe(2)
+  c.fromProvider(`{"type":"session.closed","usage":{"seconds":90}}`, undefined, 5000.0)
+  expect(t.cap.reports[0]!.billedSeconds).toBe(90.0)
+})
+
+test("a refused window ends the session with an error and a close upstream", () => {
+  const t = fixture()
+  t.cap.readmitWhy = "budget exceeded"
+  const c = t.core
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":31}}`, undefined, 2000.0)
+  // the usage event itself is withheld along with everything after the refusal
+  expect(t.cap.client.length).toBe(1)
+  expect(t.cap.client[0]!.includes("budget exceeded")).toBe(true)
+  expect(t.cap.client[0]!.includes(`"type":"error"`)).toBe(true)
+  expect(t.cap.provider.join("|")).toBe(`{"type":"session.close"}`)
+  c.fromProvider(`{"type":"session.output_transcript.delta","delta":"more"}`, undefined, 2100.0)
+  expect(t.cap.client.length).toBe(1)
+  c.fromProvider(`{"type":"session.closed","usage":{"seconds":31}}`, undefined, 2200.0)
+  const r = t.cap.reports[0]!
+  expect(r.status).toBe(429)
+  expect(r.billedSeconds).toBe(31.0)
+  // a second close is not sent
+  c.clientLeft(2300.0)
+  expect(t.cap.provider.length).toBe(1)
+})
+
+test("an id that cannot be recorded is never sent to the browser", () => {
+  const t = fixture()
+  t.cap.bindOk = false
+  t.core.fromProvider(`{"type":"session.started","session":{"id":"sess_9"}}`, undefined, 1100.0)
+  expect(t.cap.client.length).toBe(1)
+  expect(t.cap.client[0]!.includes("sess_9")).toBe(false)
+  expect(t.cap.client[0]!.includes("could not be recorded")).toBe(true)
+  expect(t.cap.provider.join("|")).toBe(`{"type":"session.close"}`)
+})
+
+test("a browser that leaves closes the session upstream and waits for the end", () => {
+  const t = fixture()
+  const c = t.core
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":3}}`, undefined, 1500.0)
+  c.clientLeft(2000.0)
+  expect(t.cap.provider.join("|")).toBe(`{"type":"session.close"}`)
+  expect(t.cap.reports.length).toBe(0)
+  // the provider's last events are metered but not sent
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":9}}`, undefined, 2500.0)
+  expect(t.cap.client.length).toBe(1)
+  c.tick(5000.0)
+  expect(t.cap.abandoned).toBe(0)
+  c.fromProvider(`{"type":"session.closed","usage":{"seconds":9.5}}`, undefined, 6000.0)
+  expect(t.cap.reports[0]!.billedSeconds).toBe(15.0)
+  expect(t.cap.reports[0]!.seconds).toBe(9.5)
+})
+
+test("a provider that never answers a close is abandoned after the drain", () => {
+  const t = fixture()
+  const c = t.core
+  c.fromClient(`{"type":"session.close"}`, [], 2000.0)
+  expect(t.cap.provider.join("|")).toBe(`{"type":"session.close"}`)
+  c.tick(16000.0)
+  expect(t.cap.abandoned).toBe(0)
+  c.tick(17001.0)
+  expect(t.cap.abandoned).toBe(1)
+  // the relay ends the provider leg, which reports what was last seen
+  c.providerEnded(17002.0)
+  expect(t.cap.reports.length).toBe(1)
+  expect(t.cap.reports[0]!.status).toBe(200)
+})
+
+test("a provider that ends early is reported with an error and the browser is told", () => {
+  const t = fixture()
+  t.core.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":40}}`, undefined, 1500.0)
+  t.core.providerEnded(2000.0)
+  expect(t.cap.reports.length).toBe(1)
+  expect(t.cap.reports[0]!.status).toBe(502)
+  expect(t.cap.reports[0]!.billedSeconds).toBe(40.0)
+  expect(t.cap.client[t.cap.client.length - 1]!.includes("before session.closed")).toBe(true)
+})
+
+test("a failed setup still bills the minimum", () => {
+  const t = fixture()
+  t.core.abort(502, "upstream WebRTC connection failed", 1200.0)
+  expect(t.cap.reports.length).toBe(1)
+  expect(t.cap.reports[0]!.status).toBe(502)
+  expect(t.cap.reports[0]!.billedSeconds).toBe(15.0)
+  expect(t.cap.reports[0]!.error).toBe("upstream WebRTC connection failed")
+})
+
+test("an idle session meets its window", () => {
+  const t = fixture()
+  t.core.tick(7000.0)
+  expect(t.cap.readmits).toBe(0)
+  t.core.tick(59000.0)
+  expect(t.cap.readmits).toBe(0)
+  t.core.tick(64000.0)
+  expect(t.cap.readmits).toBe(1)
+  t.core.tick(66000.0)
+  expect(t.cap.readmits).toBe(1)
+  t.core.tick(130000.0)
+  expect(t.cap.readmits).toBe(2)
+})
+
+test("the browser sees only the events it asked for, and guarded text is replaced", () => {
+  const t = fixture()
+  const p = prepareServerEvents(`{"session":{"client":{"data_channel":{"allowed_server_events":[{"type":"session.output_transcript.delta"}]}}}}`)
+  t.core.filter = p.filter
+  t.core.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":1}}`, undefined, 1100.0)
+  expect(t.cap.client.length).toBe(0)
+  t.core.fromProvider(`{"type":"session.output_transcript.delta","delta":"key sk-123"}`, "key [redacted]", 1200.0)
+  expect(t.cap.client.join("|")).toBe(`{"type":"session.output_transcript.delta","delta":"key [redacted]"}`)
+  expect(t.core.outputWindow("x")).toBe("key sk-123x")
+  // blocked output ends it
+  t.core.blockOutput("secret")
+  expect(t.cap.client[1]!.includes("response blocked by guardrails: secret")).toBe(true)
+  expect(t.cap.provider.join("|")).toBe(`{"type":"session.close"}`)
+})
+
+test("guarded browser events are passed on with their texts replaced", () => {
+  const t = fixture()
+  const upd = `{"type":"session.update","session":{"instructions":"token abc"}}`
+  expect(t.core.clientTextsOf(upd).join("|")).toBe("token abc")
+  t.core.fromClient(upd, ["token [x]"], 1100.0)
+  expect(t.cap.provider.join("|")).toBe(`{"type":"session.update","session":{"instructions":"token [x]"}}`)
+  t.core.refuseClient("prompt injection")
+  expect(t.cap.client[0]!.includes("request blocked by guardrails: prompt injection")).toBe(true)
+  expect(t.cap.client[0]!.includes("guardrail_violation")).toBe(true)
+})
+
+class FakeLeg {
+  texts: string[] = []
+  packets: u8[][] = []
+  closes = 0
+  queued = 0
+  leg(): Leg {
+    const f = this
+    return new Leg((m) => {
+      f.texts.push(m)
+      return true
+    }, (p) => {
+      f.packets.push(p)
+      return true
+    }, () => f.queued, () => {
+      f.closes += 1
+    })
+  }
+}
+
+class RelayFixture {
+  relay: Relay
+  cap: Capture
+  browser = new FakeLeg()
+  provider = new FakeLeg()
+  constructor() {
+    const cap = new Capture()
+    this.cap = cap
+    const hooks = new LiveHooks(() => undefined, (r) => {
+      cap.reports.push(r)
+    }, (id) => {
+      cap.binds.push(id)
+      return true
+    }, (d, t) => {
+      cap.counts.push(d + ":" + t)
+    })
+    this.relay = new Relay(hooks, undefined, 1000.0)
+    this.relay.client = this.browser.leg()
+    this.relay.provider = this.provider.leg()
+  }
+}
+
+test("messages wait for their channel, then go out in order", () => {
+  const t = new RelayFixture()
+  const r = t.relay
+  // the browser's channel is not open yet: the provider's events wait
+  r.channelOpened(false)
+  r.fromProvider(`{"type":"session.started","session":{"id":"sess_1"}}`)
+  r.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":2}}`)
+  expect(t.browser.texts.length).toBe(0)
+  r.channelOpened(true)
+  expect(t.browser.texts.length).toBe(2)
+  expect(t.browser.texts[0]!.includes("session.started")).toBe(true)
+  expect(t.browser.texts[1]!.includes("session.usage.updated")).toBe(true)
+  // events after that go straight through
+  r.fromProvider(`{"type":"session.output_transcript.delta","delta":"hi"}`)
+  expect(t.browser.texts.length).toBe(3)
+  expect(t.cap.binds.join(",")).toBe("sess_1")
+})
+
+test("browser events reach the provider through the core", () => {
+  const t = new RelayFixture()
+  const r = t.relay
+  r.fromBrowser(`{"type":"session.update","session":{"voice":"alloy"}}`)
+  // the provider's channel is not open: it waits
+  expect(t.provider.texts.length).toBe(0)
+  r.channelOpened(false)
+  expect(t.provider.texts.join("|")).toBe(`{"type":"session.update","session":{"voice":"alloy"}}`)
+  r.fromBrowser(`{"type":"session.input_audio.mute"}`)
+  expect(t.provider.texts.length).toBe(2)
+  expect(t.cap.counts.join(",")).toBe("in:session.update,in:session.input_audio.mute")
+})
+
+test("audio goes both ways as packets, cleaned, and RTCP stays behind", () => {
+  const t = new RelayFixture()
+  const r = t.relay
+  const pkt: u8[] = [u8(0x90), u8(111), u8(0), u8(1), u8(0), u8(0), u8(0), u8(160), u8(0), u8(0), u8(1), u8(2), u8(0xBE), u8(0xDE), u8(0), u8(0), u8(5), u8(6)]
+  r.packetFromBrowser(pkt)
+  expect(t.provider.packets.length).toBe(1)
+  expect(t.provider.packets[0]!.length).toBe(14)
+  r.packetFromProvider(pkt)
+  expect(t.browser.packets.length).toBe(1)
+  const sr: u8[] = [u8(0x80), u8(200), u8(0), u8(6), u8(0), u8(0), u8(0), u8(1), u8(0), u8(0), u8(0), u8(0), u8(0)]
+  r.packetFromBrowser(sr)
+  expect(t.provider.packets.length).toBe(1)
+  expect(r.packets).toBe(2)
+})
+
+test("a session.closed ends the relay after the browser has it", () => {
+  const t = new RelayFixture()
+  const r = t.relay
+  r.channelOpened(true)
+  r.channelOpened(false)
+  r.fromProvider(`{"type":"session.closed","reason":"close_requested","usage":{"seconds":20}}`)
+  expect(t.browser.texts.length).toBe(1)
+  expect(t.cap.reports.length).toBe(1)
+  expect(t.cap.reports[0]!.billedSeconds).toBe(20.0)
+  // (the relay closes on the next turn of the loop: close it as that would)
+  r.close()
+  expect(r.closed).toBe(true)
+  expect(t.browser.closes).toBe(1)
+  expect(t.provider.closes).toBe(1)
+  // once closed, nothing moves
+  r.fromBrowser(`{"type":"session.update"}`)
+  r.packetFromBrowser([u8(0x80), u8(111), u8(0), u8(1), u8(0), u8(0), u8(0), u8(160), u8(0), u8(0), u8(1), u8(2), u8(7)])
+  expect(t.provider.texts.length).toBe(0)
+  expect(t.provider.packets.length).toBe(0)
+  expect(t.cap.reports.length).toBe(1)
+})
+
+test("a provider that disappears is billed what it reported and the browser is told", () => {
+  const t = new RelayFixture()
+  const r = t.relay
+  r.channelOpened(true)
+  r.channelOpened(false)
+  r.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":33}}`)
+  r.providerGone()
+  expect(r.closed).toBe(true)
+  expect(t.cap.reports[0]!.billedSeconds).toBe(33.0)
+  expect(t.cap.reports[0]!.status).toBe(502)
+  expect(t.browser.texts[t.browser.texts.length - 1]!.includes("before session.closed")).toBe(true)
+})
+
+test("a browser that disappears closes the session upstream first", () => {
+  const t = new RelayFixture()
+  const r = t.relay
+  r.channelOpened(true)
+  r.channelOpened(false)
+  r.setupDone = true
+  r.browserGone()
+  expect(r.closed).toBe(false)
+  expect(t.provider.texts.join("|")).toBe(`{"type":"session.close"}`)
+  r.fromProvider(`{"type":"session.closed","usage":{"seconds":4}}`)
+  expect(t.cap.reports[0]!.billedSeconds).toBe(15.0)
+  expect(t.browser.texts.length).toBe(0)
+  r.close()
+  expect(r.closed).toBe(true)
+})
+
+test("a browser that goes before the setup is done ends the relay at once", () => {
+  const t = new RelayFixture()
+  t.relay.browserGone()
+  expect(t.relay.closed).toBe(true)
+  expect(t.provider.closes).toBe(1)
+})
+
+test("a queue that overflows ends the relay", () => {
+  const t = new RelayFixture()
+  const r = t.relay
+  // the browser's channel never opens
+  for (let i = 0; i < 1001; i++) r.sendClient(`{"type":"x"}`)
+  expect(r.closing).toBe(true)
+})

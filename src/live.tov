@@ -4,11 +4,13 @@
 // virtual key that opened it. An attach (/v1/live/sessions/{id}/attach) and the recording
 // (/v1/live/sessions/{id}/content) are refused to any other virtual key, as not found.
 //
-// Not here: billing, transcripts and delegation (Bifrost's livesession.go), forks, and the WebRTC media.
-// POST /v1/live/sessions (the WebRTC create) passes the browser's SDP offer to OpenAI and returns the
-// answer (liveCreate); the media then runs between the browser and OpenAI, unmetered here. Bifrost's live
-// sessions are OpenAI only, and so are these. The registry is shared by the workers of one node through a
-// directory (share).
+// POST /v1/live/sessions (the WebRTC create) makes this gateway the WebRTC peer, as Bifrost's webrtclive.go
+// does (liveCreate, with src/webrtc.tov): it answers the browser's SDP offer on a peer connection of its own,
+// offers to OpenAI on a second, and relays the audio and the "oai-events" data channel, metering, guarding
+// and logging every event. The session stays on the node (the worker process) that took it: the UDP
+// sockets of its peer connections are that process's. Not here: the WebSocket path's billing and transcripts
+// (it relays frames untouched), delegation checks, and forks. Bifrost's live sessions are OpenAI only, and so
+// are these. The registry is shared by the workers of one node through a directory (share).
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { sha256, toHex, utf8 } from "./crypto"
 import { Engine, errorResponse, noHeaders } from "./gateway"
@@ -18,6 +20,9 @@ import { trimSlash } from "./providers/types"
 import { Field, fields, find, rawStr, setField, build, quote } from "./json"
 import { Hdrs, snapshot } from "./schemas"
 import { SocketExt, upstreamFor, wsBase } from "./realtime"
+import { Grant } from "./governance"
+import * as metrics from "./metrics"
+import { LiveHooks, LiveReport, Exchange, Setup, GuardFn, Verdict, establish, prepareServerEvents, withOffer } from "./webrtc"
 
 // How many sessions the registry holds. Past that a new session is refused, not left unrecorded.
 const MAX_RECORDS = 10000
@@ -120,24 +125,37 @@ export function liveAnswer(text: string): { id: string, sdp: string } | undefine
   }
 }
 
-// POST /v1/live/sessions: Bifrost's WebRTC create. Bifrost terminates WebRTC on both sides, with its own
-// peer and its own SDP offer, and meters every data-channel event. This gateway runs no WebRTC peer, so
-// the browser's SDP offer goes to the provider as it is, and the provider's SDP answer comes back. The
-// browser then holds the media and events with the provider: they are not metered, guarded or logged
-// here (the same pass-through as /v1/realtime/calls). The checks run first, as Bifrost's do (the body,
-// the transport, the model, the credential, the governance admission), then the session's id is recorded
-// for the virtual key, so attach and content stay with its owner.
+// The events a session's counters name; any other type is counted as "other", so a browser cannot make up
+// metric labels.
+const EVENT_TYPES: string[] = [
+  "session.start", "session.update", "session.close", "session.input_audio.append", "session.input_audio.mute", "session.input_audio.unmute",
+  "session.instructions.append", "session.thinking.append", "session.commentary.append", "response.item.create", "response.create",
+  "session.started", "session.updated", "session.closed", "session.input_audio.muted", "session.input_audio.unmuted", "session.instructions.appended",
+  "session.thinking.appended", "session.commentary.appended", "session.output_audio.delta", "session.input_transcript.delta",
+  "session.output_transcript.delta", "session.delegation.created", "session.usage.updated", "response.event", "error", "info",
+]
+
+// POST /v1/live/sessions: Bifrost's WebRTC create. This gateway is the WebRTC peer on both sides: it answers
+// the browser's SDP offer with a peer connection of its own, offers to the provider on a second (the
+// provider is sent the gateway's offer, not the browser's), and relays the audio packets and the data
+// channel between them (src/webrtc.tov). Every event on the channel is metered, guarded and logged: the
+// session's usage is billed in 30 s windows with a 15 s minimum, and its row goes to the request log when it
+// ends. The checks run first, as Bifrost's do (the body, the transport, the model, the credential, the
+// governance admission), and the provider's session id is recorded for the virtual key, so attach and content
+// stay with its owner.
 export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request): Promise<Response> {
   let webrtc = false
   let model = ""
   let body = ""
+  let offer = ""
   try {
     body = await req.text()
     const fs = fields(body)
     const tr = find(fs, "transport")
     if (tr !== undefined) {
       const tf = fields(tr)
-      webrtc = rawStr(tf, "type") === "webrtc" && (rawStr(tf, "sdp") ?? "").trim() !== ""
+      offer = rawStr(tf, "sdp") ?? ""
+      webrtc = rawStr(tf, "type") === "webrtc" && offer.trim() !== ""
     }
     const sf = find(fs, "session")
     if (sf !== undefined) model = rawStr(fields(sf), "model") ?? ""
@@ -152,6 +170,7 @@ export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request
   if (ref.provider !== "openai") return errorReply400("this provider has no live API this gateway can relay")
   const admitted = engine.gov.admit(h, ref.provider, ref.model)
   if (admitted.kind === "denial") return errorResponse(admitted.status, admitted.message, admitted.type, noHeaders())
+  const grant: Grant = admitted
   if (reg.owners.size >= MAX_RECORDS) return errorResponse(503, "the live session registry is full", "server_error", noHeaders())
   const sel = target(engine.cfg, ref, new Set<int>(), h.get("x-bf-api-key") ?? undefined)
   if (sel === undefined || sel.t.kind !== "openai") return errorResponse(404, "no OpenAI key is configured for live sessions", "invalid_request_error", noHeaders())
@@ -162,25 +181,104 @@ export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request
   } catch (e) {
     return errorReply400("the request body must be JSON with session and transport")
   }
+  // the browser's own list of server events is widened for the provider and kept for the browser
+  const events = prepareServerEvents(upstreamBody)
+  if (events.error !== "") return errorReply400(events.error)
   const up = upstreamFor(t, undefined)
   const hs: Record<string, string> = {}
   for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
   hs.set("content-type", "application/json")
-  const res = await postLive(liveBase(t) + "/v1/live/sessions", hs, upstreamBody)
-  if (res === undefined) return errorResponse(502, "failed to create the live session at the provider", "api_error", noHeaders())
-  if (res.status < 200 || res.status >= 300) {
-    const out: Record<string, string> = {}
-    out.set("content-type", res.type)
-    return new Response(res.text, { status: res.status, headers: out })
+  const url = liveBase(t) + "/v1/live/sessions"
+  const owner = ownerOf(engine, h)
+  const provider = ref.provider
+  const modelName = ref.model
+
+  // the provider's side of the handshake, with the gateway's offer
+  const exchange = async (gatewayOffer: string): Promise<Exchange> => {
+    let b = ""
+    try {
+      b = try withOffer(events.body, gatewayOffer)
+    } catch (e) {
+      return { status: 500, type: "server_error", message: "failed to prepare the session: " + e.message, sdp: "", sessionId: "", body: "", contentType: "" }
+    }
+    const res = await postLive(url, hs, b)
+    if (res === undefined) return { status: 502, type: "api_error", message: "failed to create the live session at the provider", sdp: "", sessionId: "", body: "", contentType: "" }
+    if (res.status < 200 || res.status >= 300) return { status: res.status, type: "api_error", message: "the provider refused the live session", sdp: "", sessionId: "", body: res.text, contentType: res.type }
+    const answer = liveAnswer(res.text)
+    if (answer === undefined) return { status: 502, type: "api_error", message: "live session create response has no session id or SDP answer", sdp: "", sessionId: "", body: "", contentType: "" }
+    return { status: 0, type: "", message: "", sdp: answer.sdp, sessionId: answer.id, body: "", contentType: "" }
   }
-  const answer = liveAnswer(res.text)
-  if (answer === undefined) return errorResponse(502, "live session create response has no session id or SDP answer", "api_error", noHeaders())
-  // the session exists at the provider now: a registry that cannot record it refuses the answer
-  if (!reg.bind(answer.id, ownerOf(engine, h))) return errorResponse(500, "the live session could not be recorded for its virtual key", "server_error", noHeaders())
-  const reply = JSON.stringify({ session: { id: answer.id }, transport: { type: "webrtc", sdp: answer.sdp } })
+
+  const labels = metrics.labels(provider, modelName, "webrtc")
+  metrics.addGauge("raiju_live_webrtc_sessions", labels, 1.0)
+  const hooks = new LiveHooks(() => {
+    // each window of voice time is admitted again, as Bifrost's meter does for its next billing unit
+    const again = engine.gov.admit(h, provider, modelName)
+    if (again.kind === "denial") return { status: again.status, type: again.type, message: again.message }
+    return undefined
+  }, (r) => {
+    metrics.addGauge("raiju_live_webrtc_sessions", labels, -1.0)
+    metrics.inc("raiju_live_audio_seconds_total", labels, r.billedSeconds)
+    engine.recordLive(h, grant, provider, modelName, r.status, r.endedMs - r.startedMs, r.promptTokens, r.completionTokens, r.input, r.output, r.error, liveMeta(r))
+  }, (id) => {
+    return reg.bind(id, owner)
+  }, (direction, type) => {
+    metrics.inc("raiju_live_webrtc_events_total", `direction="${direction}",type="${EVENT_TYPES.includes(type) ? type : "other"}"`, 1.0)
+  })
+  let guard: GuardFn | undefined = undefined
+  if (engine.liveGuarded()) {
+    guard = (text: string, source: string): Promise<Verdict> => liveVerdict(engine, text, source)
+  }
+  const est = await establish({
+    offer: offer,
+    exchange: exchange,
+    hooks: hooks,
+    guard: guard,
+    filter: events.filter,
+    iceServers: iceServers(),
+    bindAddress: process.env.RAIJU_WEBRTC_BIND ?? "",
+  })
+  if (est.status !== 0) {
+    if (est.body !== "") {
+      // the provider's own refusal
+      const out: Record<string, string> = {}
+      out.set("content-type", est.contentType)
+      return new Response(est.body, { status: est.status, headers: out })
+    }
+    return errorResponse(est.status, est.message, est.type, noHeaders())
+  }
+  const reply = JSON.stringify({ session: { id: est.sessionId }, transport: { type: "webrtc", sdp: est.answer } })
   const out: Record<string, string> = {}
   out.set("content-type", "application/json")
   return new Response(reply, { status: 201, headers: out })
+}
+
+async function liveVerdict(engine: Engine, text: string, source: string): Promise<Verdict> {
+  const v = await engine.liveGuard(text, source)
+  return { action: v.action, text: v.text, reason: v.reason }
+}
+
+// The row metadata of a finished session: its voice seconds, as reported and as billed.
+function liveMeta(r: LiveReport): Record<string, string> {
+  const m: Record<string, string> = {}
+  m.set("live_transport", "webrtc")
+  m.set("live_audio_seconds", "" + r.seconds)
+  m.set("live_billed_seconds", "" + r.billedSeconds)
+  if (r.sessionId !== "") m.set("live_session_id", r.sessionId)
+  if (r.reason !== "") m.set("live_close_reason", r.reason)
+  m.set("live_events", "" + r.events)
+  return m
+}
+
+// The STUN and TURN servers the gateway's peer connections use (RAIJU_WEBRTC_ICE_SERVERS, comma separated).
+// Bifrost uses none: the connections offer the host's own addresses.
+function iceServers(): string[] {
+  const out: string[] = []
+  for (const u of (process.env.RAIJU_WEBRTC_ICE_SERVERS ?? "").split(",")) {
+    const t = u.trim()
+    if (t !== "") out.push(t)
+  }
+  return out
 }
 
 function errorReply400(message: string): Response {
