@@ -3472,7 +3472,7 @@ def l113_e2e(env):
         s, _ = api("PUT", "/api/providers/openai", {"network_config": {"base_url": "http://127.0.0.1:18174"}})
         s, keys = api("GET", "/api/providers/openai/keys")
         check("a provider write without keys keeps them", s == 200 and keys.get("total") == 1, (s, keys))
-        kid = keys["keys"][0]["id"]
+        kid = keys["keys"][0].get("id") or keys["keys"][0]["name"]  # keys from config have no id; the route matches by name
         s, _ = api("PUT", "/api/providers/openai/keys/" + kid, {"name": "main", "models": [], "weight": 2, "value": keys["keys"][0]["value"]})
         stored = json.load(open(cfg_path))["providers"]["openai"]["keys"][0]
         check("a key write with its masked value keeps the stored key", s == 200 and stored.get("value") == "sk-l113-test" and stored.get("weight") == 2.0, (s, stored))

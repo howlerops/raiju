@@ -253,6 +253,8 @@ try {
   await page.fill("#cfg-json", "{")
   await page.click("#cfg-save")
   check("invalid settings JSON is shown inline", await until(page, () => (document.querySelector("#cfg-error")?.textContent ?? "").includes("not valid JSON")))
+  await page.click("#cfg-discard")
+  await until(page, () => (document.querySelector("#cfg-json")?.value ?? "").includes("client_config"))
   await page.evaluate(() => {
     const v = JSON.parse(document.querySelector("#cfg-json").value)
     v.client_config.max_request_body_size_mb = 9
