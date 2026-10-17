@@ -3273,6 +3273,71 @@ def mcp_grants_e2e(env):
         gb.terminate()
         gb.wait()
 
+GW_L113 = "http://127.0.0.1:18173"  # the web UI's management calls: MCP tool switches, virtual key and provider edits, settings
+
+def l113_e2e(env):
+    """The management routes the web UI drives: a tool switched off on a stdio client applies to its running
+    process, a virtual key keeps its MCP tools, content-logging flag and expiry on a write, provider and key
+    writes keep what they do not send, and PUT /api/config replaces the client section. Their own gateway."""
+    cfg_path = os.path.join(BUILD, "e2e.l113.json")
+    stdio = {"command": "python3", "args": [os.path.join(ROOT, "tests/mcp_stdio.py")]}
+    json.dump({
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "providers": {"openai": {"keys": [{"name": "main", "value": "sk-l113-test", "models": [], "weight": 1.0}], "network_config": {"base_url": "http://127.0.0.1:18174"}}},
+        "governance": {"auth_config": {"token": "admin-secret"}, "budgets": [{"id": "monthly", "max_limit": 50, "reset_duration": "1M"}]},
+        "mcp": {"client_configs": [{"name": "local", "connection_type": "stdio", "stdio_config": stdio}]},
+    }, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18173", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l113.log"), "w"))
+    admin = {"authorization": "Bearer admin-secret"}
+
+    def api(method, path, body=None):
+        s, _, b = call(method, path, body, headers=admin, base=GW_L113, auth=False)
+        try:
+            return s, json.loads(b)
+        except ValueError:
+            return s, b
+
+    def echo_allowed():
+        _, b = api("GET", "/api/mcp")
+        rows = [t for c in b.get("clients", []) if c["name"] == "local" for t in c.get("tools_list", []) if t["name"] == "echo"]
+        return rows[0]["allowed"] if len(rows) == 1 else None
+
+    try:
+        wait(GW_L113 + "/health")
+        wait_mcp_tools(GW_L113, ["echo"])
+        check("MCP status lists each tool with whether the client allows it", echo_allowed() is True, echo_allowed())
+        s, _ = api("PUT", "/api/mcp/client/local", {"name": "local", "connection_type": "stdio", "stdio_config": stdio, "tools_to_skip": ["echo"]})
+        check("a tool switched off on a stdio client applies to its running process", s == 200 and echo_allowed() is False, (s, echo_allowed()))
+        s, _ = api("PUT", "/api/mcp/client/local", {"name": "local", "connection_type": "stdio", "stdio_config": stdio, "tools_to_skip": []})
+        check("switching it back on applies again", s == 200 and echo_allowed() is True, (s, echo_allowed()))
+        mcp_rule = [{"mcp_client_name": "local", "tools_to_execute": ["echo"]}]
+        s, b = api("POST", "/api/governance/virtual-keys", {"name": "l113-vk", "is_active": True, "disable_content_logging": True, "expires_at": "2099-01-01T00:00:00Z", "mcp_configs": mcp_rule})
+        vid = b.get("id", "") if isinstance(b, dict) else ""
+        s, lst = api("GET", "/api/governance/virtual-keys")
+        vk = [v for v in lst.get("virtual_keys", []) if v["id"] == vid]
+        vk = vk[0] if vk else {}
+        check("a virtual key's MCP tools, content-logging flag and expiry are read back", s == 200 and vk.get("mcp_configs") == mcp_rule and vk.get("disable_content_logging") is True and vk.get("expires_at") == "2099-01-01T00:00:00Z", (s, vk))
+        s, b = api("PUT", "/api/governance/virtual-keys/" + vid, {"id": vid, "name": "l113-vk", "is_active": True, "budget_id": "monthly", "expires_at": "2099-01-01T00:00:00Z", "disable_content_logging": True, "mcp_configs": mcp_rule})
+        s, lst = api("GET", "/api/governance/virtual-keys")
+        vk = [v for v in lst.get("virtual_keys", []) if v["id"] == vid][0]
+        check("an edit that sends them back keeps the MCP tools, the flag and the expiry", s == 200 and vk.get("mcp_configs") == mcp_rule and vk.get("disable_content_logging") is True and vk.get("budget_id") == "monthly", (s, vk))
+        s, b = api("PUT", "/api/governance/virtual-keys/" + vid, {"id": vid, "name": "l113-vk", "is_active": True})
+        s, lst = api("GET", "/api/governance/virtual-keys")
+        vk = [v for v in lst.get("virtual_keys", []) if v["id"] == vid][0]
+        check("a write without an MCP list leaves the key unlimited", s == 200 and "mcp_configs" not in vk, (s, vk))
+        s, _ = api("PUT", "/api/providers/openai", {"network_config": {"base_url": "http://127.0.0.1:18174"}})
+        s, keys = api("GET", "/api/providers/openai/keys")
+        check("a provider write without keys keeps them", s == 200 and keys.get("total") == 1, (s, keys))
+        kid = keys["keys"][0]["id"]
+        s, _ = api("PUT", "/api/providers/openai/keys/" + kid, {"name": "main", "models": [], "weight": 2, "value": keys["keys"][0]["value"]})
+        stored = json.load(open(cfg_path))["providers"]["openai"]["keys"][0]
+        check("a key write with its masked value keeps the stored key", s == 200 and stored.get("value") == "sk-l113-test" and stored.get("weight") == 2.0, (s, stored))
+        s, _ = api("PUT", "/api/config", {"client_config": {"enable_logging": False, "max_request_body_size_mb": 9}})
+        s, full = api("GET", "/api/config")
+        check("PUT /api/config replaces the client section", s == 200 and full.get("client", {}).get("max_request_body_size_mb") == 9, (s, str(full)[:200]))
+    finally:
+        gw.terminate()
+
 def main():
     unique_ports()
     build()
@@ -5434,6 +5499,8 @@ def main():
         l97p_e2e(env)
         # streamed text completion and Responses answers under the output guards, and a cached stream: their own gateways
         l97s_e2e(env)
+        # the management routes the web UI drives (MCP tool switches, virtual key and provider edits, settings): their own gateway
+        l113_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

@@ -62,7 +62,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Docker / Helm / Terraform | done (image built and run; Terraform validated) |
 | Plugin hooks | partial: compiled-in plugins with Bifrost's placement and order; dynamic (Go shared object and WASM) plugins are not built |
 | Config store + management API | done (the config is a JSON file; Bifrost's sqlite and postgres config stores are not built) |
-| Web UI | done |
+| Web UI | done: the admin client built into the gateway (`ui/`, L113): providers, virtual keys, budgets and limits, logs, the live feed, MCP clients and settings. Not built: dashboard charts, MCP OAuth consent screens, and native apps |
 | Cohere | done |
 | Custom providers | done |
 | Vertex AI | done: chat, streaming, embeddings, responses, images and image edits, batches and files over GCS, exact count tokens; the AWS workload identity is not built (needs a cloud account) |
