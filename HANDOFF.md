@@ -41,8 +41,11 @@ histograms left, `gitleaks:allow`, building the 11 "missing" parity rows, the we
 
 The open questions from the last handoff are answered:
 
-1. **Client toolkit.** Neither Slint nor gpui. The gateway ships as an image and already serves
-   the web UI, so that is the admin client: grow `ui/` (L113). `clients/` spikes are parked.
+1. **Client toolkit.** Neither Slint nor gpui: the admin client is the web UI the gateway
+   serves from its image (L113), and `clients/` is parked. Framework: SolidJS 2.0 RC (no React),
+   built with Vite on Bun, embedded in the binary as hashed assets (`RAIJU_UI_DIR` overrides).
+   Tov has no browser target; the link between UI and gateway is the OpenAPI spec, from which
+   the UI's types are generated. HA: the live feed must be cluster-wide with resume (L119).
    Tauri 2 around the web UI only if desktop or mobile apps are asked for later.
 2. **Models without a price.** Keep the warning (cost 0). `client.refuse_unpriced_models`
    stays off by default.
