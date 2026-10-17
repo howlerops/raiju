@@ -271,8 +271,12 @@ notes on L84, L91, L97f and L97m were finished by later rows (L97p, L97k/L97o, L
 | L109 | G36, G37 | Unprefixed /decisions routes, decision pricing overrides, native-decision model checks | worker | todo |
 | L110 | G39, G47, G48, G22 | x-bf-store-raw-request-response; the a3 histograms and rankings still partial; websocket config keys, large_payload_optimization, top-level access_profiles, network_config knobs, keys[].oauth_key_config; token_exchange auth and inprocess MCP connections | worker | todo |
 | L111 | G43 | Honour `gitleaks:allow` comments; bring the keyword-dense 20 KB secrets check under 35 ms | worker | todo |
-| L112 | — | Re-read the 11 "missing" rows in docs/parity.md; build the buildable ones or mark them out of scope with the owner | lead | todo |
-| L113 | UI | Native client: after the owner picks Slint or gpui (licence), grow the spike into the admin client (providers, keys, logs, live feed) | worker | blocked: owner decision |
+| L112 | — | Build all 11 "missing" rows in docs/parity.md (owner, 2026-10-17: build, none move to Out): /api/api-keys CRUD, websocket config, large_payload_optimization, top-level access_profiles, dual_credential_conflict_behavior, logging_headers, retain_content_in_object_storage, keys[].oauth_key_config, network_config knobs, dynamic plugins (Go/WASM), MCP token exchange. Overlaps L110: split so no row is built twice | lead + workers | todo |
+| L113 | UI | Admin client = the built-in web UI (owner, 2026-10-17: no Slint/gpui; the UI ships in the image). Grow ui/ to cover providers, keys, logs and live feed against docs/openapi/management.yaml; park clients/ spikes. Tauri 2 wrap only if native apps are asked for later | worker | todo |
+| L114 | — | Scope the exact-match response cache per virtual key (owner, 2026-10-17), as the semantic cache already is | worker | todo |
+| L115 | Scope | SCIM user provisioning (moved in from Out, 2026-10-17) | worker | todo |
+| L116 | Scope | A2A: agent cards, JSON-RPC tasks, `/agents/a2a`, `/api/agents`; unblocks the `agent_names` log filter (moved in from Out, 2026-10-17) | worker | todo |
+| L117 | Scope | MCP code mode (moved in from Out, 2026-10-17) | worker | todo |
 
 ## UI track
 

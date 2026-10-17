@@ -29,34 +29,33 @@ work on a fresh branch from `main`.
 
 ## What's next
 
-Wave 14 in LEDGER.md (L103 to L113) collects every open remainder: governance (rate-limit
+Wave 14 in LEDGER.md (L103 to L117) collects every open remainder: governance (rate-limit
 splits, profile role binding), audit archive and adaptive LB, providers (Replicate text and
 edits, streamed usage.cost, Cohere/Azure model retrieve), MCP OAuth (consent modes, grant
 revoke, persisted grants, generated signing key), streams (built-in guard, replay pacing,
 streamed compat headers), live sessions beyond OpenAI, decision routes, the config keys and
-histograms left, `gitleaks:allow`, a pass over the 11 "missing" parity rows, and the native
-client once the owner picks a toolkit.
+histograms left, `gitleaks:allow`, building the 11 "missing" parity rows, the web admin client
+(L113), the per-key exact cache (L114), and SCIM, A2A and MCP code mode (L115 to L117).
 
-## Open questions for the owner
+## Owner decisions (2026-10-17)
 
-1. **Native client toolkit.** Slint (recommended: 431 crates against 660, builds in about half
-   the time, renders headless, documents mobile targets) or gpui (Apache-2.0, desktop-first,
-   0.2.x, needs a vendored xattr fix on Linux). Slint's licence is GPLv3, royalty-free with
-   attribution, or commercial: which one is acceptable? L113 waits on this.
-2. **Models without a price.** They cost 0 with a warning, as in Bifrost. Refusing them is a
-   one-line switch. Keep the warning?
-3. **Exact-match cache scope.** The exact-match response cache is shared across virtual keys
-   (the semantic cache is per key, as Bifrost). Scope it per key?
-4. **Provider-reported cost.** `ignore_provider_cost` is now honoured, and OpenAI-format
-   `usage.cost` (OpenRouter) is billed as reported on non-streamed chat. Confirm that is wanted.
-5. **MCP OAuth signing key.** The authorization server for `/mcp` needs an operator-supplied
-   RSA PEM (`client.oauth2_server_config.signing_key`); Bifrost generates and stores its own.
-   Generate one at startup and persist it (L106)?
-6. **Bedrock Stability variations.** Refused: Bifrost sends a Titan-shaped body that Bedrock
-   rejects. Leave refused, or build Stability's own variation call?
-7. **Missing rows.** 11 rows are still "missing" in docs/parity.md (L112): build or move to Out?
-8. **Out of scope** (SCOPE.md Out): videos and containers, edge device agent, SCIM, MCP code
-   mode, media providers, Warp, skills marketplace, A2A agents, Sidekiq, Runware. Still right?
+The open questions from the last handoff are answered:
+
+1. **Client toolkit.** Neither Slint nor gpui. The gateway ships as an image and already serves
+   the web UI, so that is the admin client: grow `ui/` (L113). `clients/` spikes are parked.
+   Tauri 2 around the web UI only if desktop or mobile apps are asked for later.
+2. **Models without a price.** Keep the warning (cost 0). `client.refuse_unpriced_models`
+   stays off by default.
+3. **Exact-match cache.** Scope it per virtual key (L114).
+4. **Provider-reported cost.** Keep billing `usage.cost` as reported unless
+   `ignore_provider_cost` is set; extend it to streamed answers (L105).
+5. **MCP OAuth signing key.** Generate one at first start and persist it; a configured key
+   still wins (L106).
+6. **Bedrock Stability variations.** Leave refused.
+7. **Missing rows.** Build all 11 (L112, split against L110).
+8. **Out of scope.** SCIM (L115), A2A agents (L116) and MCP code mode (L117) move in to P2.
+   The rest stay Out: videos and containers, edge device agent, media providers, Runware, Warp,
+   skills marketplace, Sidekiq.
 
 ## Can't be done in the cloud container
 

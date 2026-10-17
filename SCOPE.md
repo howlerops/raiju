@@ -99,6 +99,9 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Provider passthrough routes | done (OpenAI, Anthropic, Azure, Bedrock agent/guardrail, GenAI, ChatGPT Codex) |
 | Direct keys, raw request/response echo | partial: direct keys and send-back of raw requests and responses are done; `x-bf-store-raw-request-response` is not built |
 | Reasoning parameters | done (Anthropic, Gemini, Bedrock Claude and Nova) |
+| SCIM | not built (moved in from Out by the owner, 2026-10-17; L115) |
+| A2A (agent-to-agent, registered agents) | not built (moved in from Out by the owner, 2026-10-17: agent cards, JSON-RPC tasks, `/agents/a2a` and `/api/agents`; L116) |
+| MCP code mode | not built (moved in from Out by the owner, 2026-10-17; L117) |
 
 ## Out
 
@@ -106,18 +109,15 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 |---|---|
 | Videos and containers | not built (out of scope) |
 | Edge device agent | not built (out of scope) |
-| SCIM | not built (out of scope) |
-| MCP code mode | not built (out of scope) |
 | Media providers | not built (out of scope) |
 | Runware (media provider and `/runware_passthrough`) | not built (out of scope: a media provider) |
 | Warp | not built (out of scope: Bifrost's Warp integration) |
 | Skills marketplace | not built (out of scope: git and zip skill marketplace, `/api/skills`) |
-| A2A (agent-to-agent, registered agents) | not built (out of scope: agent cards, JSON-RPC tasks, `/agents/a2a` and `/api/agents`) |
 | Sidekiq | not built (out of scope: Bifrost's Sidekiq job queue integration) |
 
 ## Open items
 
-The P2 product decisions are taken, and their builds are in the tables above with their partial parts. The open items are listed in docs/parity.md under "Remaining gaps (current as of the L97 waves)". A native UI (desktop and mobile) is a separate track in LEDGER.md.
+The P2 product decisions are taken, and their builds are in the tables above with their partial parts. The open items are listed in docs/parity.md under "Remaining gaps (current as of the L97 waves)". The admin client is the built-in web UI (owner decision, 2026-10-17); desktop and mobile apps, if wanted later, wrap it in Tauri 2. See the UI track in LEDGER.md.
 
 ## Notes from the form
 
