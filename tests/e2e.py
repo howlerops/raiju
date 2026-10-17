@@ -350,7 +350,8 @@ def write_config():
     for name, on in [("owner", True), ("owner-off", False)]:
         ow = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "refuse_unpriced_models": on},
               "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
-              "cache": {"enabled": True, "ttl_seconds": 60, "scope_by_virtual_key": on},
+              # scope_by_virtual_key is left unset on "owner" so the check covers its default (on, L114)
+              "cache": {"enabled": True, "ttl_seconds": 60, **({} if on else {"scope_by_virtual_key": False})},
               "governance": {"budgets": [{"id": "ob", "max_limit": 5, "reset_duration": "1d"}],
                              "virtual_keys": [{"id": "vk-ob", "value": "sk-bf-owner-budget", "budget_id": "ob"}, {"id": "vk-oa", "value": "sk-bf-owner-a"}],
                              "pricing_overrides": [{"id": "po-own", "name": "own", "scope_kind": "global", "match_type": "exact", "pattern": "priced-by-override", "request_types": ["chat_completion"], "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}]}}
