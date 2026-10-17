@@ -278,7 +278,7 @@ notes on L84, L91, L97f and L97m were finished by later rows (L97p, L97k/L97o, L
 | L113 | UI | Admin client = the web UI built into the gateway (owner, 2026-10-17). Framework: SolidJS 2.0 RC (owner; no React), TypeScript, Vite on Bun, types generated from docs/openapi/management.yaml, virtualized lists. Vite output (hashed assets) embedded in the binary through src/ui_assets.tov (committed; the gateway builds without Node), RAIJU_UI_DIR overrides it. Screens: overview, live feed, providers, keys and governance, logs, MCP, config. The first plain-JS attempt is superseded: its tests and notes feed this row, its ui/index.html is not merged | worker | assigned |
 | L114 | — | Scope the exact-match response cache per virtual key (owner, 2026-10-17), as the semantic cache already is | lead | done: cache.scope_by_virtual_key (L95) now on unless false; the e2e owner gateway leaves it unset to cover the default. make unit 1,381 passed; e2e all passed on Bun and http1; openapi-check ok (310 operations) |
 | L115 | Scope | SCIM user provisioning (moved in from Out, 2026-10-17) | worker | assigned |
-| L116 | Scope | A2A: agent cards, JSON-RPC tasks, `/agents/a2a`, `/api/agents`; unblocks the `agent_names` log filter (moved in from Out, 2026-10-17) | worker | todo |
+| L116 | Scope | A2A: agent cards, JSON-RPC tasks, `/agents/a2a`, `/api/agents`; unblocks the `agent_names` log filter (moved in from Out, 2026-10-17) | worker | assigned |
 | L117 | Scope | MCP code mode (moved in from Out, 2026-10-17) | worker | todo |
 
 ## UI track
