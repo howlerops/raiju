@@ -5,8 +5,10 @@
 // (/v1/live/sessions/{id}/content) are refused to any other virtual key, as not found.
 //
 // Not here: billing, transcripts and delegation (Bifrost's livesession.go), forks, and the WebRTC media.
-// POST /v1/live/sessions (the WebRTC create) is refused by liveCreate, since the gateway runs no WebRTC
-// peer. The registry is shared by the workers of one node through a directory (share).
+// POST /v1/live/sessions (the WebRTC create) passes the browser's SDP offer to OpenAI and returns the
+// answer (liveCreate); the media then runs between the browser and OpenAI, unmetered here. Bifrost's live
+// sessions are OpenAI only, and so are these. The registry is shared by the workers of one node through a
+// directory (share).
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { sha256, toHex, utf8 } from "./crypto"
 import { Engine, errorResponse, noHeaders } from "./gateway"
@@ -102,15 +104,36 @@ export class LiveRegistry {
   }
 }
 
-// POST /v1/live/sessions: Bifrost's WebRTC create. Its answer is an SDP answer from the gateway's own
-// WebRTC peer, which relays the session's media and events, and this gateway runs no such peer. So after
-// the checks Bifrost makes (the body, the transport, the model, the credential) it refuses the create,
-// before anything is opened at the provider. Sessions open over the WebSocket (session.start) instead.
-export async function liveCreate(engine: Engine, req: Request): Promise<Response> {
+// The session id and SDP answer of a WebRTC create's reply, or undefined when either is missing.
+export function liveAnswer(text: string): { id: string, sdp: string } | undefined {
+  try {
+    const fs = fields(text)
+    const s = find(fs, "session")
+    const tr = find(fs, "transport")
+    if (s === undefined || tr === undefined) return undefined
+    const id = rawStr(fields(s), "id") ?? ""
+    const sdp = rawStr(fields(tr), "sdp") ?? ""
+    if (id === "" || sdp === "") return undefined
+    return { id: id, sdp: sdp }
+  } catch (e) {
+    return undefined
+  }
+}
+
+// POST /v1/live/sessions: Bifrost's WebRTC create. Bifrost terminates WebRTC on both sides, with its own
+// peer and its own SDP offer, and meters every data-channel event. This gateway runs no WebRTC peer, so
+// the browser's SDP offer goes to the provider as it is, and the provider's SDP answer comes back. The
+// browser then holds the media and events with the provider: they are not metered, guarded or logged
+// here (the same pass-through as /v1/realtime/calls). The checks run first, as Bifrost's do (the body,
+// the transport, the model, the credential, the governance admission), then the session's id is recorded
+// for the virtual key, so attach and content stay with its owner.
+export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request): Promise<Response> {
   let webrtc = false
   let model = ""
+  let body = ""
   try {
-    const fs = fields(await req.text())
+    body = await req.text()
+    const fs = fields(body)
     const tr = find(fs, "transport")
     if (tr !== undefined) {
       const tf = fields(tr)
@@ -119,13 +142,61 @@ export async function liveCreate(engine: Engine, req: Request): Promise<Response
     const sf = find(fs, "session")
     if (sf !== undefined) model = rawStr(fields(sf), "model") ?? ""
   } catch (e) {
-    return errorResponse(400, "the request body must be JSON with session and transport", "invalid_request_error", noHeaders())
+    return errorReply400("the request body must be JSON with session and transport")
   }
-  if (!webrtc) return errorResponse(400, `transport must be {"type": "webrtc", "sdp": "<SDP offer>"}`, "invalid_request_error", noHeaders())
-  if (model.trim() === "") return errorResponse(400, "session.model is required", "invalid_request_error", noHeaders())
-  if (!credentialOk(engine, snapshot(req.headers))) return errorResponse(401, "authentication is required for live sessions", "authentication_error", noHeaders())
-  if (parseModel(engine.cfg, model).provider !== "openai") return errorResponse(400, "this provider has no live API this gateway can relay", "invalid_request_error", noHeaders())
-  return errorResponse(501, "WebRTC live sessions need a WebRTC peer, which this gateway does not run; open the session over WebSocket with session.start", "invalid_request_error", noHeaders())
+  if (!webrtc) return errorReply400(`transport must be {"type": "webrtc", "sdp": "<SDP offer>"}`)
+  if (model.trim() === "") return errorReply400("session.model is required")
+  const h = snapshot(req.headers)
+  if (!credentialOk(engine, h)) return errorResponse(401, "authentication is required for live sessions", "authentication_error", noHeaders())
+  const ref = parseModel(engine.cfg, model)
+  if (ref.provider !== "openai") return errorReply400("this provider has no live API this gateway can relay")
+  const admitted = engine.gov.admit(h, ref.provider, ref.model)
+  if (admitted.kind === "denial") return errorResponse(admitted.status, admitted.message, admitted.type, noHeaders())
+  if (reg.owners.size >= MAX_RECORDS) return errorResponse(503, "the live session registry is full", "server_error", noHeaders())
+  const sel = target(engine.cfg, ref, new Set<int>(), h.get("x-bf-api-key") ?? undefined)
+  if (sel === undefined || sel.t.kind !== "openai") return errorResponse(404, "no OpenAI key is configured for live sessions", "invalid_request_error", noHeaders())
+  const t = sel.t
+  let upstreamBody = ""
+  try {
+    upstreamBody = rewriteStart(body, t.model)
+  } catch (e) {
+    return errorReply400("the request body must be JSON with session and transport")
+  }
+  const up = upstreamFor(t, undefined)
+  const hs: Record<string, string> = {}
+  for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+  hs.set("content-type", "application/json")
+  const res = await postLive(liveBase(t) + "/v1/live/sessions", hs, upstreamBody)
+  if (res === undefined) return errorResponse(502, "failed to create the live session at the provider", "api_error", noHeaders())
+  if (res.status < 200 || res.status >= 300) {
+    const out: Record<string, string> = {}
+    out.set("content-type", res.type)
+    return new Response(res.text, { status: res.status, headers: out })
+  }
+  const answer = liveAnswer(res.text)
+  if (answer === undefined) return errorResponse(502, "live session create response has no session id or SDP answer", "api_error", noHeaders())
+  // the session exists at the provider now: a registry that cannot record it refuses the answer
+  if (!reg.bind(answer.id, ownerOf(engine, h))) return errorResponse(500, "the live session could not be recorded for its virtual key", "server_error", noHeaders())
+  const reply = JSON.stringify({ session: { id: answer.id }, transport: { type: "webrtc", sdp: answer.sdp } })
+  const out: Record<string, string> = {}
+  out.set("content-type", "application/json")
+  return new Response(reply, { status: 201, headers: out })
+}
+
+function errorReply400(message: string): Response {
+  return errorResponse(400, message, "invalid_request_error", noHeaders())
+}
+
+// The provider's reply to a POST: its status, content type and body. undefined when it can't be reached.
+async function postLive(url: string, hs: Record<string, string>, body: string): Promise<{ status: int, type: string, text: string } | undefined> {
+  try {
+    const res = await fetch(url, { method: "POST", headers: hs, body: body })
+    const text = await res.text()
+    return { status: res.status, type: res.headers.get("content-type") ?? "application/json", text: text }
+  } catch (e) {
+    console.error(`raiju: ${e.message}`)
+    return undefined
+  }
 }
 
 // The virtual key of a request, "" when it has none.
@@ -403,6 +474,16 @@ test("live registry", () => {
   expect(reg.allowed("sess_unknown", "vk2")).toBe(true)
   expect(reg.bind("sess_none", "")).toBe(true)
   expect(reg.allowed("sess_none", "vk2")).toBe(true)
+})
+
+test("live create replies", () => {
+  const a = liveAnswer(`{"session":{"id":"sess_9","type":"realtime"},"transport":{"type":"webrtc","sdp":"v=0\\r\\n"}}`)
+  expect(a === undefined).toBe(false)
+  expect(a!.id).toBe("sess_9")
+  expect(a!.sdp).toBe("v=0\r\n")
+  expect(liveAnswer(`{"session":{"id":"sess_9"}}`) === undefined).toBe(true)
+  expect(liveAnswer(`{"session":{"id":""},"transport":{"sdp":"v=0"}}`) === undefined).toBe(true)
+  expect(liveAnswer("not json") === undefined).toBe(true)
 })
 
 test("live start frames and ids", () => {

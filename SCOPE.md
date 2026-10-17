@@ -11,7 +11,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Chat completions + streaming | done (chunk-by-chunk on the default server) |
 | Embeddings | done (OpenAI-format, Cohere, Gemini, Vertex, Bedrock Titan and Cohere) |
 | List models | partial: upstream listing for OpenAI-format, Anthropic, Gemini, Bedrock, Vertex and Cloudflare; other providers list their configured models; Databricks lists none, as Bifrost does |
-| Realtime | partial: WebSocket relay (OpenAI, Azure); client secrets, sessions and SDP calls pass through; live sessions are OpenAI only; POST /v1/live/sessions (WebRTC create) answers 501 |
+| Realtime | partial: WebSocket relay (OpenAI, Azure, xAI); client secrets, sessions and SDP calls pass through; live sessions are OpenAI only; POST /v1/live/sessions (WebRTC create) passes the SDP offer to OpenAI with no gateway WebRTC peer, so its media and events are not metered |
 | Exact-match cache | done |
 | Anthropic SDK route | partial: messages (any provider, streaming), models, message batches and files (passthrough or via an OpenAI-format provider); legacy /anthropic/v1/complete has no streaming yet |
 | Bedrock SDK route | done: converse, invoke, converse-stream and invoke-with-response-stream to any provider, count-tokens (exact where Bedrock counts, estimated elsewhere), /bedrock/rerank |
@@ -62,7 +62,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Docker / Helm / Terraform | done (image built and run; Terraform validated) |
 | Plugin hooks | partial: compiled-in plugins with Bifrost's placement and order; dynamic (Go shared object and WASM) plugins are not built |
 | Config store + management API | done (the config is a JSON file; Bifrost's sqlite and postgres config stores are not built) |
-| Web UI | done |
+| Web UI | done: the admin client built into the gateway (`ui/`, L113): providers, virtual keys, budgets and limits, logs, the live feed, MCP clients and settings. Not built: dashboard charts, MCP OAuth consent screens, and native apps |
 | Cohere | done |
 | Custom providers | done |
 | Vertex AI | done: chat, streaming, embeddings, responses, images and image edits, batches and files over GCS, exact count tokens; the AWS workload identity is not built (needs a cloud account) |
@@ -84,6 +84,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Access profiles / projects | partial: access profiles with versions, clone, activate, deactivate and propagate; projects with members and split policies; rate-limit splits and profile role binding are open |
 | RBAC | partial: built-in roles (admin, editor, viewer, auditor) and custom roles with permission pairs; Bifrost's role-id API shape is not built |
 | SSO (OIDC) | done (PKCE, groups to roles) |
+| SCIM provisioning | partial: `/scim/v2` Users and Groups (list with a userName or displayName filter and paging, get, create, PUT, PATCH including active false, delete), the discovery documents and the bearer token from `scim_config`; groups are teams. The provider's directory sync, claim mapping (`claimsSyncMode`, attribute mappings) and bulk are not built |
 | Secret managers | done (Vault KV v2, AWS Secrets Manager) |
 | Virtual MCPs | partial: `/mcp/{name}`, config and management API; no access-profile or project scoping |
 | Required headers | done (global and per access profile) |
@@ -99,6 +100,8 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Provider passthrough routes | done (OpenAI, Anthropic, Azure, Bedrock agent/guardrail, GenAI, ChatGPT Codex) |
 | Direct keys, raw request/response echo | partial: direct keys and send-back of raw requests and responses are done; `x-bf-store-raw-request-response` is not built |
 | Reasoning parameters | done (Anthropic, Gemini, Bedrock Claude and Nova) |
+| A2A (agent-to-agent, registered agents) | not built (moved in from Out by the owner, 2026-10-17: agent cards, JSON-RPC tasks, `/agents/a2a` and `/api/agents`; L116) |
+| MCP code mode | not built (moved in from Out by the owner, 2026-10-17; L117) |
 
 ## Out
 
@@ -106,18 +109,15 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 |---|---|
 | Videos and containers | not built (out of scope) |
 | Edge device agent | not built (out of scope) |
-| SCIM | not built (out of scope) |
-| MCP code mode | not built (out of scope) |
 | Media providers | not built (out of scope) |
 | Runware (media provider and `/runware_passthrough`) | not built (out of scope: a media provider) |
 | Warp | not built (out of scope: Bifrost's Warp integration) |
 | Skills marketplace | not built (out of scope: git and zip skill marketplace, `/api/skills`) |
-| A2A (agent-to-agent, registered agents) | not built (out of scope: agent cards, JSON-RPC tasks, `/agents/a2a` and `/api/agents`) |
 | Sidekiq | not built (out of scope: Bifrost's Sidekiq job queue integration) |
 
 ## Open items
 
-The P2 product decisions are taken, and their builds are in the tables above with their partial parts. The open items are listed in docs/parity.md under "Remaining gaps (current as of the L97 waves)". A native UI (desktop and mobile) is a separate track in LEDGER.md.
+The P2 product decisions are taken, and their builds are in the tables above with their partial parts. The open items are listed in docs/parity.md under "Remaining gaps (current as of the L97 waves)". The admin client is the built-in web UI (owner decision, 2026-10-17); desktop and mobile apps, if wanted later, wrap it in Tauri 2. See the UI track in LEDGER.md.
 
 ## Notes from the form
 

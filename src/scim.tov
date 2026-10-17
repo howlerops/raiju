@@ -1,0 +1,824 @@
+// SCIM 2.0 provisioning at /scim/v2 (RFC 7643, RFC 7644), as Bifrost serves it to an identity provider
+// behind one bearer token. A SCIM user is an admin user (rbac.tov) named by its userName, and a SCIM group
+// is a team (governance.teams) whose members are the users that list it in their teams. Deprovisioning
+// (DELETE, or active false for a user) is handled here; the caller saves the returned users and teams.
+// Pure: scimHandle takes the state and returns the new one, so the store saves it once per request.
+import { AdminUserConfig, RoleConfig, TeamConfig } from "./config"
+import { Field, fields, elements, find, rawStr, decodeString } from "./json"
+import { knownRole, safeEq, validName } from "./rbac"
+import { utf8 } from "./crypto"
+
+const ERROR_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:Error"
+const LIST_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
+const USER_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:User"
+const GROUP_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:Group"
+
+// The media type of every SCIM reply.
+export const SCIM_CONTENT_TYPE = "application/scim+json"
+
+// The role of a pushed user that names no role Raiju knows: the least privilege, since SCIM carries no default.
+const DEFAULT_ROLE = "viewer"
+const DEFAULT_COUNT = 100
+const MAX_COUNT = 200
+
+// The users and teams SCIM reads and writes, the custom roles users may name, and the teams virtual keys use
+// (a group in use by a key is not deleted).
+export type ScimState = { users: AdminUserConfig[], teams: TeamConfig[], roles: RoleConfig[], keyTeams: string[] }
+
+// The reply, and the state after it. changed is true when users or teams differ and the caller must save them.
+export type ScimResult = { status: int, body: string, state: ScimState, changed: bool }
+
+// A request problem: the HTTP status, the SCIM scimType ("" for none) and the detail.
+type Fault = { status: int, scimType: string, detail: string }
+
+// A list filter: none, `attr eq "value"`, or something this server does not filter by.
+type Filter = { kind: "none" } | { kind: "eq", value: string } | { kind: "bad" }
+
+// One PATCH operation: op in lower case, the path ("" when the value is an object of attributes), the raw value.
+type PatchOp = { op: string, path: string, value: string | undefined }
+
+// A user being written: its name, role and state. Attributes not held here are accepted and ignored.
+type Work = { name: string, role: string, disabled: bool }
+
+// A group being written: its id, name, the users with their teams applied, and the teams as they stand.
+type GroupWork = { id: string, name: string, users: AdminUserConfig[], teams: TeamConfig[] }
+
+// The request parts a route reads.
+type Ctx = { base: string, params: URLSearchParams, body: string, mint: () => string }
+
+// Whether an Authorization header carries the provisioning token. The comparison does not stop at the first
+// difference, so the time taken does not show how much of the token matched.
+export function scimAuthorized(header: string, token: string): bool {
+  if (token === "") return false
+  if (!(header.startsWith("Bearer ") || header.startsWith("bearer "))) return false
+  return safeEq(header.slice(7), token)
+}
+
+function fault(status: int, scimType: string, detail: string): Fault {
+  return { status: status, scimType: scimType, detail: detail }
+}
+
+// The SCIM error document (RFC 7644 section 3.12): status as a string, scimType only when there is one.
+export function errorBody(status: int, scimType: string, detail: string): string {
+  const t = scimType === "" ? "" : `,"scimType":${JSON.stringify(scimType)}`
+  return `{"schemas":["${ERROR_SCHEMA}"],"status":"${status}"${t},"detail":${JSON.stringify(detail)}}`
+}
+
+function failed(st: ScimState, status: int, scimType: string, detail: string): ScimResult {
+  return { status: status, body: errorBody(status, scimType, detail), state: st, changed: false }
+}
+
+function faulted(st: ScimState, f: Fault): ScimResult {
+  return failed(st, f.status, f.scimType, f.detail)
+}
+
+// The value of a hexadecimal digit, or -1 when the character is not one.
+function hexDigit(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 65 && c <= 70) return c - 55
+  if (c >= 97 && c <= 102) return c - 87
+  return -1
+}
+
+// The path segment with its %XX escapes decoded: a provider may escape the @ of a user name in its URL.
+function pctDecode(s: string): string {
+  if (!s.includes("%")) return s
+  const b = utf8(s)
+  const out: u8[] = []
+  let i = 0
+  while (i < b.length) {
+    const c = int(b[i]!)
+    if (c === 37 && i + 2 < b.length) {
+      const hi = hexDigit(int(b[i + 1]!))
+      const lo = hexDigit(int(b[i + 2]!))
+      if (hi >= 0 && lo >= 0) {
+        out.push(u8(hi * 16 + lo))
+        i += 3
+        continue
+      }
+    }
+    out.push(b[i]!)
+    i += 1
+  }
+  try {
+    return new TextDecoder().decode(out)
+  } catch (e) {
+    return s
+  }
+}
+
+// The fields of a JSON object body, or undefined when the text is not one.
+function objectFields(text: string): Field[] | undefined {
+  if (!text.trim().startsWith("{")) return undefined
+  try {
+    return fields(text)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// A JSON string's value, or undefined when the raw value is not a string.
+function strOf(raw: string | undefined): string | undefined {
+  if (raw === undefined || !raw.startsWith("\"")) return undefined
+  try {
+    return decodeString(raw)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// A SCIM active flag: a JSON boolean, or the string some providers send ("True", "false").
+function activeOf(raw: string | undefined): bool | undefined {
+  if (raw === undefined) return undefined
+  if (raw === "true") return true
+  if (raw === "false") return false
+  const s = raw.toLowerCase()
+  if (s === "\"true\"") return true
+  if (s === "\"false\"") return false
+  return undefined
+}
+
+// The values of a JSON array: each element is a string, or an object whose value field is one.
+function valuesOf(raw: string | undefined): string[] | undefined {
+  if (raw === undefined || !raw.startsWith("[")) return undefined
+  const out: string[] = []
+  try {
+    for (const el of elements(raw)) {
+      if (el.startsWith("\"")) {
+        out.push(decodeString(el))
+      } else {
+        const v = rawStr(fields(el), "value")
+        if (v !== undefined) out.push(v)
+      }
+    }
+  } catch (e) {
+    return undefined
+  }
+  return out
+}
+
+// The operations of a PATCH body (its Operations, or operations), or undefined when the body is not one.
+function patchOps(body: string): PatchOp[] | undefined {
+  const top = objectFields(body)
+  if (top === undefined) return undefined
+  const raw = find(top, "Operations") ?? find(top, "operations")
+  if (raw === undefined || !raw.startsWith("[")) return undefined
+  const out: PatchOp[] = []
+  try {
+    for (const el of elements(raw)) {
+      const f = fields(el)
+      const op = rawStr(f, "op")
+      if (op === undefined) return undefined
+      out.push({ op: op.toLowerCase(), path: rawStr(f, "path") ?? "", value: find(f, "value") })
+    }
+  } catch (e) {
+    return undefined
+  }
+  return out
+}
+
+// The value of `eq "value"`: the operator, then a quoted string with no quote inside it.
+function eqValue(rest: string): string | undefined {
+  if (!rest.toLowerCase().startsWith("eq ")) return undefined
+  const q = rest.slice(3).trim()
+  if (q.byteLength < 2 || !q.startsWith("\"") || !q.endsWith("\"")) return undefined
+  const v = q.slice(1, q.byteLength - 1)
+  if (v.includes("\"")) return undefined
+  return v
+}
+
+// The filter of a list request: `attr eq "value"` for the attribute named, or none, or anything else.
+function filterOf(params: URLSearchParams, attr: string): Filter {
+  const f = params.get("filter")
+  if (f === undefined) return { kind: "none" }
+  const s = f.trim()
+  const i = s.indexOf(" ")
+  if (i < 0 || s.slice(0, i).toLowerCase() !== attr.toLowerCase()) return { kind: "bad" }
+  const v = eqValue(s.slice(i + 1).trim())
+  if (v === undefined) return { kind: "bad" }
+  return { kind: "eq", value: v }
+}
+
+// The member a `members[value eq "x"]` path names, or undefined for any other path.
+function memberPathValue(path: string): string | undefined {
+  const pre = "members["
+  if (!path.toLowerCase().startsWith(pre) || !path.endsWith("]")) return undefined
+  const inner = path.slice(pre.byteLength, path.byteLength - 1).trim()
+  if (!inner.toLowerCase().startsWith("value ")) return undefined
+  return eqValue(inner.slice(6).trim())
+}
+
+// startIndex (from 1) and count (default 100, at most 200) of a list request.
+function pageOf(params: URLSearchParams): { start: int, count: int } {
+  const s = parseInt(params.get("startIndex") ?? "1")
+  const start = s === undefined || s < 1 ? 1 : s
+  const c = params.get("count")
+  const n = c === undefined ? DEFAULT_COUNT : parseInt(c)
+  let count = DEFAULT_COUNT
+  if (n !== undefined) count = n < 0 ? 0 : n > MAX_COUNT ? MAX_COUNT : n
+  return { start: start, count: count }
+}
+
+function listBody(total: int, start: int, page: string[]): string {
+  return `{"schemas":["${LIST_SCHEMA}"],"totalResults":${total},"startIndex":${start},"itemsPerPage":${page.length},"Resources":[${page.join(",")}]}`
+}
+
+// The listed resources, one page of them.
+function listed(st: ScimState, items: string[], params: URLSearchParams): ScimResult {
+  const pg = pageOf(params)
+  const page = items.slice(pg.start - 1, pg.start - 1 + pg.count)
+  return { status: 200, body: listBody(items.length, pg.start, page), state: st, changed: false }
+}
+
+function userNamed(users: AdminUserConfig[], name: string): AdminUserConfig | undefined {
+  for (const u of users) {
+    if (u.name === name) return u
+  }
+  return undefined
+}
+
+function teamNamed(teams: TeamConfig[], id: string): TeamConfig | undefined {
+  for (const t of teams) {
+    if (t.id === id) return t
+  }
+  return undefined
+}
+
+function activeAdmin(u: AdminUserConfig): bool {
+  return u.role === "admin" && u.disabled !== true
+}
+
+// Whether replacing old by next (or removing it, when next is undefined) leaves no enabled admin.
+function losesLastAdmin(users: AdminUserConfig[], old: AdminUserConfig, next: AdminUserConfig | undefined): bool {
+  if (!activeAdmin(old) || (next !== undefined && activeAdmin(next))) return false
+  for (const u of users) {
+    if (u.name !== old.name && activeAdmin(u)) return false
+  }
+  return true
+}
+
+// The user resource (RFC 7643 section 4.1): its name as id and userName, its state, role and groups.
+function userJson(u: AdminUserConfig, teams: TeamConfig[], base: string): string {
+  const groups: { value: string, display: string }[] = []
+  for (const t of teams) {
+    if ((u.teams ?? []).includes(t.id)) groups.push({ value: t.id, display: t.name })
+  }
+  return JSON.stringify({
+    schemas: [USER_SCHEMA],
+    id: u.name,
+    userName: u.name,
+    active: u.disabled !== true,
+    roles: [{ value: u.role, primary: true }],
+    groups: groups,
+    meta: { resourceType: "User", location: `${base}/Users/${u.name}` },
+  })
+}
+
+// The group resource (RFC 7643 section 4.2): its team id, name and the users that hold the team.
+function groupJson(t: TeamConfig, users: AdminUserConfig[], base: string): string {
+  const members: { value: string, display: string }[] = []
+  for (const u of users) {
+    if ((u.teams ?? []).includes(t.id)) members.push({ value: u.name, display: u.name })
+  }
+  return JSON.stringify({
+    schemas: [GROUP_SCHEMA],
+    id: t.id,
+    displayName: t.name,
+    members: members,
+    meta: { resourceType: "Group", location: `${base}/Groups/${t.id}` },
+  })
+}
+
+// The same user with a team added (on) or removed.
+function withTeam(u: AdminUserConfig, team: string, on: bool): AdminUserConfig {
+  const held: string[] = (u.teams ?? []).filter((t) => t !== team)
+  if (on) held.push(team)
+  return userWith(u, u.role, u.disabled === true, held)
+}
+
+// The user as a new value: its role, state and teams replaced, every other field kept.
+function userWith(u: AdminUserConfig, role: string, disabled: bool, teams: string[] | undefined): AdminUserConfig {
+  return {
+    name: u.name,
+    role: role,
+    token_sha256: u.token_sha256,
+    password_sha256: u.password_sha256,
+    salt: u.salt,
+    disabled: disabled,
+    teams: teams,
+    business_units: u.business_units,
+    projects: u.projects,
+    access_profile_ids: u.access_profile_ids,
+  }
+}
+
+function hasUser(users: AdminUserConfig[], name: string): bool {
+  return userNamed(users, name) !== undefined
+}
+
+// ---- users ----
+
+// Applies one user attribute to the work record. An attribute Raiju does not hold is accepted and ignored.
+function applyUser(inout w: Work, key: string, raw: string | undefined, roles: RoleConfig[]): Fault | undefined {
+  const k = key.toLowerCase()
+  if (k === "username") {
+    const v = strOf(raw)
+    if (v === undefined || v.toLowerCase() !== w.name) return fault(400, "mutability", "userName cannot change; delete the user and create a new one")
+    return undefined
+  }
+  if (k === "active") {
+    const a = activeOf(raw)
+    if (a === undefined) return fault(400, "invalidValue", "active must be true or false")
+    w.disabled = !a
+    return undefined
+  }
+  if (k === "roles") {
+    const vals = valuesOf(raw)
+    if (vals === undefined) return fault(400, "invalidValue", "roles must be an array")
+    for (const v of vals) {
+      if (knownRole(roles, v)) {
+        w.role = v
+        return undefined
+      }
+    }
+  }
+  return undefined
+}
+
+// Applies every field of a JSON object to the work record, stopping at the first fault.
+function applyFields(inout w: Work, fs: Field[], roles: RoleConfig[]): Fault | undefined {
+  for (const f of fs) {
+    const bad = applyUser(&w, f.key, f.raw, roles)
+    if (bad !== undefined) return bad
+  }
+  return undefined
+}
+
+// The users as a copy with one replaced.
+function replaceUser(users: AdminUserConfig[], old: string, next: AdminUserConfig): AdminUserConfig[] {
+  const out: AdminUserConfig[] = []
+  for (const u of users) out.push(u.name === old ? next : u)
+  return out
+}
+
+function listUsers(st: ScimState, ctx: Ctx): ScimResult {
+  const f = filterOf(ctx.params, "userName")
+  if (f.kind === "bad") return failed(st, 400, "invalidFilter", "the filter must be userName eq \"value\"")
+  let want = ""
+  if (f.kind === "eq") want = f.value.toLowerCase()
+  const items: string[] = []
+  for (const u of st.users) {
+    if (f.kind === "eq" && u.name !== want) continue
+    items.push(userJson(u, st.teams, ctx.base))
+  }
+  return listed(st, items, ctx.params)
+}
+
+function createUser(st: ScimState, ctx: Ctx): ScimResult {
+  const fs = objectFields(ctx.body)
+  if (fs === undefined) return failed(st, 400, "invalidSyntax", "the body must be a JSON object")
+  const name = (strOf(find(fs, "userName")) ?? "").toLowerCase()
+  if (name === "") return failed(st, 400, "invalidValue", "userName is required")
+  if (!validName(name)) return failed(st, 400, "invalidValue", "userName must be 1 to 64 lower-case letters, digits, _, -, @, . or +")
+  if (hasUser(st.users, name)) return failed(st, 409, "uniqueness", `user ${name} already exists`)
+  let w: Work = { name: name, role: DEFAULT_ROLE, disabled: false }
+  const bad = applyFields(&w, fs, st.roles)
+  if (bad !== undefined) return faulted(st, bad)
+  const u: AdminUserConfig = { name: w.name, role: w.role, disabled: w.disabled }
+  const users: AdminUserConfig[] = []
+  for (const x of st.users) users.push(x)
+  users.push(u)
+  return { status: 201, body: userJson(u, st.teams, ctx.base), state: { users: users, teams: st.teams, roles: st.roles, keyTeams: st.keyTeams }, changed: true }
+}
+
+// Saves a user with the work record's role and state, unless that leaves no enabled admin.
+function saveUser(st: ScimState, old: AdminUserConfig, w: Work, ctx: Ctx): ScimResult {
+  const next = userWith(old, w.role, w.disabled, old.teams)
+  if (losesLastAdmin(st.users, old, next)) return failed(st, 409, "mutability", "cannot remove or disable the last enabled admin")
+  const users = replaceUser(st.users, old.name, next)
+  return { status: 200, body: userJson(next, st.teams, ctx.base), state: { users: users, teams: st.teams, roles: st.roles, keyTeams: st.keyTeams }, changed: true }
+}
+
+function replaceFromBody(st: ScimState, old: AdminUserConfig, ctx: Ctx): ScimResult {
+  const fs = objectFields(ctx.body)
+  if (fs === undefined) return failed(st, 400, "invalidSyntax", "the body must be a JSON object")
+  let w: Work = { name: old.name, role: old.role, disabled: old.disabled === true }
+  const bad = applyFields(&w, fs, st.roles)
+  if (bad !== undefined) return faulted(st, bad)
+  return saveUser(st, old, w, ctx)
+}
+
+function patchUser(st: ScimState, old: AdminUserConfig, ctx: Ctx): ScimResult {
+  const ops = patchOps(ctx.body)
+  if (ops === undefined) return failed(st, 400, "invalidSyntax", "the body must be a PATCH request with Operations")
+  let w: Work = { name: old.name, role: old.role, disabled: old.disabled === true }
+  for (const o of ops) {
+    if (o.op !== "add" && o.op !== "replace" && o.op !== "remove") return failed(st, 400, "invalidSyntax", `op ${o.op} is not supported`)
+    if (o.op === "remove") continue
+    if (o.path !== "") {
+      const bad = applyUser(&w, o.path, o.value, st.roles)
+      if (bad !== undefined) return faulted(st, bad)
+      continue
+    }
+    const fs = objectFields(o.value ?? "")
+    if (fs === undefined) return failed(st, 400, "invalidValue", "a PATCH without a path needs an object value")
+    const bad = applyFields(&w, fs, st.roles)
+    if (bad !== undefined) return faulted(st, bad)
+  }
+  return saveUser(st, old, w, ctx)
+}
+
+function deleteUser(st: ScimState, old: AdminUserConfig): ScimResult {
+  if (losesLastAdmin(st.users, old, undefined)) return failed(st, 409, "mutability", "cannot remove or disable the last enabled admin")
+  const users: AdminUserConfig[] = []
+  for (const u of st.users) {
+    if (u.name !== old.name) users.push(u)
+  }
+  return { status: 204, body: "", state: { users: users, teams: st.teams, roles: st.roles, keyTeams: st.keyTeams }, changed: true }
+}
+
+function usersRoute(st: ScimState, m: string, id: string | undefined, ctx: Ctx): ScimResult {
+  if (id === undefined) {
+    if (m === "GET") return listUsers(st, ctx)
+    if (m === "POST") return createUser(st, ctx)
+    return failed(st, 405, "", `method ${m} is not allowed on this route`)
+  }
+  const old = userNamed(st.users, id.toLowerCase())
+  if (m === "GET" && old !== undefined) return { status: 200, body: userJson(old, st.teams, ctx.base), state: st, changed: false }
+  if (m !== "GET" && m !== "PUT" && m !== "PATCH" && m !== "DELETE") return failed(st, 405, "", `method ${m} is not allowed on this route`)
+  if (old === undefined) return failed(st, 404, "", `no user ${id}`)
+  if (m === "PUT") return replaceFromBody(st, old, ctx)
+  if (m === "PATCH") return patchUser(st, old, ctx)
+  if (m === "DELETE") return deleteUser(st, old)
+  return failed(st, 405, "", `method ${m} is not allowed on this route`)
+}
+
+// ---- groups ----
+
+// Applies one group operation: displayName replaces the name, members add, replace or remove users.
+function applyGroup(inout g: GroupWork, op: string, path: string, raw: string | undefined): Fault | undefined {
+  const attr = path.toLowerCase()
+  if (attr === "displayname") {
+    if (op === "remove") return undefined
+    const v = strOf(raw)
+    if (v === undefined || v === "") return fault(400, "invalidValue", "displayName must be a non-empty string")
+    for (const t of g.teams) {
+      if (t.name === v && t.id !== g.id) return fault(409, "uniqueness", `group ${v} already exists`)
+    }
+    g.name = v
+    return undefined
+  }
+  if (attr.startsWith("members[")) {
+    const one = memberPathValue(path)
+    if (one === undefined) return fault(400, "invalidPath", "members[value eq \"name\"] is the only member filter")
+    const n = one.toLowerCase()
+    const u = userNamed(g.users, n)
+    if (u !== undefined) g.users = replaceUser(g.users, n, withTeam(u, g.id, false))
+    return undefined
+  }
+  if (attr !== "members") return undefined
+  if (raw === undefined && op === "remove") {
+    const out: AdminUserConfig[] = []
+    for (const u of g.users) out.push(withTeam(u, g.id, false))
+    g.users = out
+    return undefined
+  }
+  const names = valuesOf(raw)
+  if (names === undefined) return fault(400, "invalidValue", "members must be an array of objects with a value")
+  const lower: string[] = names.map((n) => n.toLowerCase())
+  if (op !== "remove") {
+    for (const n of lower) {
+      if (!hasUser(g.users, n)) return fault(400, "invalidValue", `member ${n} is not a user`)
+    }
+  }
+  if (op === "replace") {
+    const out: AdminUserConfig[] = []
+    for (const u of g.users) out.push(withTeam(u, g.id, lower.includes(u.name)))
+    g.users = out
+    return undefined
+  }
+  for (const n of lower) {
+    const u = userNamed(g.users, n)
+    if (u !== undefined) g.users = replaceUser(g.users, n, withTeam(u, g.id, op === "add"))
+  }
+  return undefined
+}
+
+// The teams with the group renamed (or added, when it is new).
+function teamsAfter(teams: TeamConfig[], id: string, name: string): TeamConfig[] {
+  const out: TeamConfig[] = []
+  let found = false
+  for (const t of teams) {
+    if (t.id === id) {
+      found = true
+      out.push({ id: t.id, name: name, customer_id: t.customer_id, budget_id: t.budget_id, business_unit_id: t.business_unit_id })
+    } else {
+      out.push(t)
+    }
+  }
+  if (!found) out.push({ id: id, name: name })
+  return out
+}
+
+// The state after a group write: its users and teams, and the group's resource as the reply.
+function groupReply(st: ScimState, g: GroupWork, ctx: Ctx, status: int): ScimResult {
+  const teams = teamsAfter(g.teams, g.id, g.name)
+  const state: ScimState = { users: g.users, teams: teams, roles: st.roles, keyTeams: st.keyTeams }
+  const found = teamNamed(teams, g.id)
+  const t: TeamConfig = found === undefined ? { id: g.id, name: g.name } : found
+  return { status: status, body: groupJson(t, g.users, ctx.base), state: state, changed: true }
+}
+
+// Applies each field of a JSON object (displayName, members) to the group, with op, stopping at the first fault.
+function groupFromFields(inout g: GroupWork, fs: Field[], op: string): Fault | undefined {
+  for (const f of fs) {
+    const bad = applyGroup(&g, op, f.key, f.raw)
+    if (bad !== undefined) return bad
+  }
+  return undefined
+}
+
+function createGroup(st: ScimState, ctx: Ctx): ScimResult {
+  const fs = objectFields(ctx.body)
+  if (fs === undefined) return failed(st, 400, "invalidSyntax", "the body must be a JSON object")
+  const id = ctx.mint()
+  let g: GroupWork = { id: id, name: "", users: st.users, teams: st.teams }
+  const name = strOf(find(fs, "displayName")) ?? ""
+  if (name === "") return failed(st, 400, "invalidValue", "displayName is required")
+  for (const t of st.teams) {
+    if (t.name === name) return failed(st, 409, "uniqueness", `group ${name} already exists`)
+  }
+  const bad = groupFromFields(&g, fs, "replace")
+  if (bad !== undefined) return faulted(st, bad)
+  return groupReply(st, g, ctx, 201)
+}
+
+function replaceGroup(st: ScimState, old: TeamConfig, ctx: Ctx): ScimResult {
+  const fs = objectFields(ctx.body)
+  if (fs === undefined) return failed(st, 400, "invalidSyntax", "the body must be a JSON object")
+  let g: GroupWork = { id: old.id, name: old.name, users: st.users, teams: st.teams }
+  const bad = groupFromFields(&g, fs, "replace")
+  if (bad !== undefined) return faulted(st, bad)
+  return groupReply(st, g, ctx, 200)
+}
+
+function patchGroup(st: ScimState, old: TeamConfig, ctx: Ctx): ScimResult {
+  const ops = patchOps(ctx.body)
+  if (ops === undefined) return failed(st, 400, "invalidSyntax", "the body must be a PATCH request with Operations")
+  let g: GroupWork = { id: old.id, name: old.name, users: st.users, teams: st.teams }
+  for (const o of ops) {
+    if (o.op !== "add" && o.op !== "replace" && o.op !== "remove") return failed(st, 400, "invalidSyntax", `op ${o.op} is not supported`)
+    if (o.path !== "") {
+      const bad = applyGroup(&g, o.op, o.path, o.value)
+      if (bad !== undefined) return faulted(st, bad)
+      continue
+    }
+    const fs = objectFields(o.value ?? "")
+    if (fs === undefined) return failed(st, 400, "invalidValue", "a PATCH without a path needs an object value")
+    const bad = groupFromFields(&g, fs, o.op)
+    if (bad !== undefined) return faulted(st, bad)
+  }
+  return groupReply(st, g, ctx, 200)
+}
+
+function deleteGroup(st: ScimState, old: TeamConfig): ScimResult {
+  if (st.keyTeams.includes(old.id)) return failed(st, 409, "mutability", `group ${old.id} is the team of a virtual key`)
+  const teams: TeamConfig[] = []
+  for (const t of st.teams) {
+    if (t.id !== old.id) teams.push(t)
+  }
+  const users: AdminUserConfig[] = []
+  for (const u of st.users) users.push(withTeam(u, old.id, false))
+  return { status: 204, body: "", state: { users: users, teams: teams, roles: st.roles, keyTeams: st.keyTeams }, changed: true }
+}
+
+function listGroups(st: ScimState, ctx: Ctx): ScimResult {
+  const f = filterOf(ctx.params, "displayName")
+  if (f.kind === "bad") return failed(st, 400, "invalidFilter", "the filter must be displayName eq \"value\"")
+  let want = ""
+  if (f.kind === "eq") want = f.value
+  const items: string[] = []
+  for (const t of st.teams) {
+    if (f.kind === "eq" && t.name !== want) continue
+    items.push(groupJson(t, st.users, ctx.base))
+  }
+  return listed(st, items, ctx.params)
+}
+
+function groupsRoute(st: ScimState, m: string, id: string | undefined, ctx: Ctx): ScimResult {
+  if (id === undefined) {
+    if (m === "GET") return listGroups(st, ctx)
+    if (m === "POST") return createGroup(st, ctx)
+    return failed(st, 405, "", `method ${m} is not allowed on this route`)
+  }
+  const old = teamNamed(st.teams, id)
+  if (m === "GET" && old !== undefined) return { status: 200, body: groupJson(old, st.users, ctx.base), state: st, changed: false }
+  if (m !== "GET" && m !== "PUT" && m !== "PATCH" && m !== "DELETE") return failed(st, 405, "", `method ${m} is not allowed on this route`)
+  if (old === undefined) return failed(st, 404, "", `no group ${id}`)
+  if (m === "PUT") return replaceGroup(st, old, ctx)
+  if (m === "PATCH") return patchGroup(st, old, ctx)
+  if (m === "DELETE") return deleteGroup(st, old)
+  return failed(st, 405, "", `method ${m} is not allowed on this route`)
+}
+
+// ---- discovery ----
+
+function userSchemaDoc(): string {
+  return `{"id":"${USER_SCHEMA}","name":"User","description":"A Raiju user, provisioned by the identity provider","attributes":[` +
+    `{"name":"userName","type":"string","multiValued":false,"required":true,"caseExact":false,"mutability":"readWrite","returned":"default","uniqueness":"server"},` +
+    `{"name":"active","type":"boolean","multiValued":false,"required":false,"mutability":"readWrite","returned":"default"},` +
+    `{"name":"roles","type":"complex","multiValued":true,"required":false,"mutability":"readWrite","returned":"default"},` +
+    `{"name":"groups","type":"complex","multiValued":true,"required":false,"mutability":"readOnly","returned":"default"}]}`
+}
+
+function groupSchemaDoc(): string {
+  return `{"id":"${GROUP_SCHEMA}","name":"Group","description":"A Raiju team, provisioned by the identity provider","attributes":[` +
+    `{"name":"displayName","type":"string","multiValued":false,"required":true,"caseExact":false,"mutability":"readWrite","returned":"default"},` +
+    `{"name":"members","type":"complex","multiValued":true,"required":false,"mutability":"readWrite","returned":"default"}]}`
+}
+
+function resourceTypeDoc(name: string, endpoint: string, schema: string): string {
+  return `{"schemas":["urn:ietf:params:scim:schemas:core:2.0:ResourceType"],"id":"${name}","name":"${name}","endpoint":"${endpoint}","schema":"${schema}"}`
+}
+
+// The discovery documents: ServiceProviderConfig, ResourceTypes and Schemas.
+function metaBody(kind: string): string {
+  if (kind === "ServiceProviderConfig") {
+    return `{"schemas":["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],"patch":{"supported":true},"bulk":{"supported":false,"maxOperations":0,"maxPayloadSize":0},"filter":{"supported":true,"maxResults":${MAX_COUNT}},"changePassword":{"supported":false},"sort":{"supported":false},"etag":{"supported":false},"authenticationSchemes":[{"type":"oauthbearertoken","name":"OAuth Bearer Token","description":"The SCIM provisioning token","specUri":"https://www.rfc-editor.org/info/rfc6750","primary":true}]}`
+  }
+  if (kind === "ResourceTypes") {
+    return `{"schemas":["${LIST_SCHEMA}"],"totalResults":2,"startIndex":1,"itemsPerPage":2,"Resources":[${resourceTypeDoc("User", "/Users", USER_SCHEMA)},${resourceTypeDoc("Group", "/Groups", GROUP_SCHEMA)}]}`
+  }
+  return `{"schemas":["${LIST_SCHEMA}"],"totalResults":2,"startIndex":1,"itemsPerPage":2,"Resources":[${userSchemaDoc()},${groupSchemaDoc()}]}`
+}
+
+// Routes one request under /scim/v2. path is the part after /scim/v2 (for example /Users/ana@example.com);
+// base is the origin and /scim/v2, for the resource locations. mint makes the id of a new group.
+export function scimHandle(st: ScimState, method: string, path: string, params: URLSearchParams, body: string, base: string, mint: () => string): ScimResult {
+  const segs = path.split("/").filter((s) => s !== "")
+  const m = method.toUpperCase()
+  if (segs.length > 2) return failed(st, 404, "", "no route for this path")
+  const id = segs.length === 2 ? pctDecode(segs[1] ?? "") : undefined
+  const kind = segs[0] ?? ""
+  const ctx: Ctx = { base: base, params: params, body: body, mint: mint }
+  if (kind === "Users") return usersRoute(st, m, id, ctx)
+  if (kind === "Groups") return groupsRoute(st, m, id, ctx)
+  if (kind === "ServiceProviderConfig" || kind === "ResourceTypes" || kind === "Schemas") {
+    if (m !== "GET") return failed(st, 405, "", `method ${m} is not allowed on this route`)
+    if (id !== undefined) return failed(st, 404, "", "no route for this path")
+    return { status: 200, body: metaBody(kind), state: st, changed: false }
+  }
+  return failed(st, 404, "", "no route for this path")
+}
+
+// ---- tests ----
+
+const TEST_BASE = "https://raiju.test/scim/v2"
+
+function run(st: ScimState, method: string, path: string, body: string): ScimResult {
+  return scimHandle(st, method, path, new URLSearchParams(""), body, TEST_BASE, () => "team-new")
+}
+
+// The same request with a query string (filter, startIndex, count).
+function runQ(st: ScimState, method: string, path: string, body: string, query: string): ScimResult {
+  return scimHandle(st, method, path, new URLSearchParams(query), body, TEST_BASE, () => "team-new")
+}
+
+function emptyState(): ScimState {
+  return { users: [], teams: [], roles: [], keyTeams: [] }
+}
+
+test("scimAuthorized accepts only the configured bearer token", () => {
+  expect(scimAuthorized("Bearer scim-test-token", "scim-test-token")).toBe(true)
+  expect(scimAuthorized("bearer scim-test-token", "scim-test-token")).toBe(true)
+  expect(scimAuthorized("Bearer scim-test-tokem", "scim-test-token")).toBe(false)
+  expect(scimAuthorized("Basic scim-test-token", "scim-test-token")).toBe(false)
+  expect(scimAuthorized("Bearer ", "")).toBe(false)
+  expect(scimAuthorized("", "scim-test-token")).toBe(false)
+})
+
+test("POST /Users creates a user with its role and state, and refuses a duplicate or a bad name", () => {
+  const made = run(emptyState(), "POST", "/Users", `{"userName":"Ana@Example.com","active":true,"roles":[{"value":"editor"}]}`)
+  expect(made.status).toBe(201)
+  expect(made.changed).toBe(true)
+  expect(made.body.includes(`"userName":"ana@example.com"`)).toBe(true)
+  expect(made.body.includes(`"value":"editor"`)).toBe(true)
+  expect(made.state.users[0]!.role).toBe("editor")
+  expect(made.state.users[0]!.disabled === true).toBe(false)
+  const dup = run(made.state, "POST", "/Users", `{"userName":"ana@example.com"}`)
+  expect(dup.status).toBe(409)
+  expect(dup.body.includes(`"scimType":"uniqueness"`)).toBe(true)
+  expect(run(made.state, "POST", "/Users", `{"userName":"Bad Name"}`).status).toBe(400)
+  expect(run(made.state, "POST", "/Users", `{"active":true}`).status).toBe(400)
+  expect(run(made.state, "POST", "/Users", "not json").status).toBe(400)
+})
+
+test("a pushed user without a known role is a viewer; an unknown role name is ignored", () => {
+  const made = run(emptyState(), "POST", "/Users", `{"userName":"bo@example.com","roles":[{"value":"ghost"}]}`)
+  expect(made.status).toBe(201)
+  expect(made.state.users[0]!.role).toBe("viewer")
+})
+
+test("list filters by userName and pages with startIndex and count", () => {
+  let st = emptyState()
+  for (const n of ["ann", "ben", "cy"]) st = run(st, "POST", "/Users", `{"userName":"${n}@example.com"}`).state
+  const all = run(st, "GET", "/Users", "")
+  expect(all.body.includes(`"totalResults":3`)).toBe(true)
+  const one = runQ(st, "GET", "/Users", "", `filter=userName eq "BEN@example.com"`)
+  expect(one.body.includes(`"totalResults":1`)).toBe(true)
+  expect(one.body.includes(`"userName":"ben@example.com"`)).toBe(true)
+  const page = runQ(st, "GET", "/Users", "", "startIndex=2&count=1")
+  expect(page.body.includes(`"itemsPerPage":1`)).toBe(true)
+  expect(page.body.includes(`"userName":"ben@example.com"`)).toBe(true)
+  expect(runQ(st, "GET", "/Users", "", `filter=emails.value eq "x"`).status).toBe(400)
+})
+
+test("GET, PUT and DELETE work on /Users/{id}, and an escaped id is decoded", () => {
+  let st = run(emptyState(), "POST", "/Users", `{"userName":"ana@example.com","roles":[{"value":"viewer"}]}`).state
+  expect(run(st, "GET", "/Users/ana%40example.com", "").status).toBe(200)
+  expect(run(st, "GET", "/Users/nobody", "").status).toBe(404)
+  const put = run(st, "PUT", "/Users/ana@example.com", `{"userName":"ana@example.com","active":false,"roles":[{"value":"editor"}]}`)
+  expect(put.status).toBe(200)
+  expect(put.state.users[0]!.disabled).toBe(true)
+  expect(put.state.users[0]!.role).toBe("editor")
+  expect(run(put.state, "PUT", "/Users/ana@example.com", `{"userName":"other@example.com"}`).status).toBe(400)
+  const del = run(put.state, "DELETE", "/Users/ana@example.com", "")
+  expect(del.status).toBe(204)
+  expect(del.state.users.length).toBe(0)
+  expect(run(del.state, "DELETE", "/Users/ana@example.com", "").status).toBe(404)
+  st = del.state
+  expect(run(st, "PATCH", "/Users/ana@example.com", "{}").status).toBe(404)
+})
+
+test("PATCH sets active false with a path or a value object, in the forms providers send", () => {
+  let st = run(emptyState(), "POST", "/Users", `{"userName":"ana@example.com"}`).state
+  const okta = run(st, "PATCH", "/Users/ana@example.com", `{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"replace","value":{"active":false}}]}`)
+  expect(okta.status).toBe(200)
+  expect(okta.state.users[0]!.disabled).toBe(true)
+  const entra = run(okta.state, "PATCH", "/Users/ana@example.com", `{"Operations":[{"op":"Replace","path":"active","value":"True"}]}`)
+  expect(entra.state.users[0]!.disabled).toBe(false)
+  const role = run(entra.state, "PATCH", "/Users/ana@example.com", `{"Operations":[{"op":"add","path":"roles","value":[{"value":"auditor"}]}]}`)
+  expect(role.state.users[0]!.role).toBe("auditor")
+  expect(run(role.state, "PATCH", "/Users/ana@example.com", `{"Operations":[{"op":"move","path":"active","value":false}]}`).status).toBe(400)
+  expect(run(role.state, "PATCH", "/Users/ana@example.com", `{"Operations":[{"op":"replace","path":"active","value":"maybe"}]}`).status).toBe(400)
+  expect(run(role.state, "PATCH", "/Users/ana@example.com", `{"Operations":[{"op":"replace","path":"userName","value":"zed@example.com"}]}`).status).toBe(400)
+})
+
+test("the last enabled admin cannot be deleted or deactivated", () => {
+  const only = run(emptyState(), "POST", "/Users", `{"userName":"root@example.com","roles":[{"value":"admin"}]}`).state
+  expect(run(only, "DELETE", "/Users/root@example.com", "").status).toBe(409)
+  expect(run(only, "PATCH", "/Users/root@example.com", `{"Operations":[{"op":"replace","path":"active","value":false}]}`).status).toBe(409)
+  let two = run(only, "POST", "/Users", `{"userName":"root2@example.com","roles":[{"value":"admin"}]}`).state
+  expect(run(two, "DELETE", "/Users/root@example.com", "").status).toBe(204)
+})
+
+test("groups map onto teams: membership follows the members, and a delete removes it", () => {
+  let st = emptyState()
+  st = run(st, "POST", "/Users", `{"userName":"ana@example.com"}`).state
+  st = run(st, "POST", "/Users", `{"userName":"ben@example.com"}`).state
+  const g = run(st, "POST", "/Groups", `{"displayName":"core","members":[{"value":"ana@example.com"}]}`)
+  expect(g.status).toBe(201)
+  expect(g.state.teams.length).toBe(1)
+  expect(g.state.teams[0]!.name).toBe("core")
+  expect(g.body.includes(`"display":"ana@example.com"`)).toBe(true)
+  expect(g.state.users[0]!.teams!.includes("team-new")).toBe(true)
+  expect(g.state.users[1]!.teams!.includes("team-new")).toBe(false)
+  const added = run(g.state, "PATCH", "/Groups/team-new", `{"Operations":[{"op":"add","path":"members","value":[{"value":"ben@example.com"}]}]}`)
+  expect(added.state.users[1]!.teams!.includes("team-new")).toBe(true)
+  const dropped = run(added.state, "PATCH", "/Groups/team-new", `{"Operations":[{"op":"remove","path":"members[value eq \\"ana@example.com\\"]"}]}`)
+  expect(dropped.state.users[0]!.teams!.includes("team-new")).toBe(false)
+  expect(dropped.state.users[1]!.teams!.includes("team-new")).toBe(true)
+  const renamed = run(dropped.state, "PATCH", "/Groups/team-new", `{"Operations":[{"op":"replace","path":"displayName","value":"platform"}]}`)
+  expect(renamed.state.teams[0]!.name).toBe("platform")
+  const exact = run(renamed.state, "PUT", "/Groups/team-new", `{"displayName":"platform","members":[{"value":"ana@example.com"}]}`)
+  expect(exact.state.users[0]!.teams!.includes("team-new")).toBe(true)
+  expect(exact.state.users[1]!.teams!.includes("team-new")).toBe(false)
+  const gone = run(exact.state, "DELETE", "/Groups/team-new", "")
+  expect(gone.status).toBe(204)
+  expect(gone.state.teams.length).toBe(0)
+  expect(gone.state.users[0]!.teams!.includes("team-new")).toBe(false)
+})
+
+test("a group names no unknown user, and a group a virtual key uses is kept", () => {
+  const st = run(emptyState(), "POST", "/Users", `{"userName":"ana@example.com"}`).state
+  expect(run(st, "POST", "/Groups", `{"displayName":"core","members":[{"value":"ghost@example.com"}]}`).status).toBe(400)
+  const g = run(st, "POST", "/Groups", `{"displayName":"core"}`)
+  expect(run(g.state, "POST", "/Groups", `{"displayName":"core"}`).status).toBe(409)
+  const held: ScimState = { users: g.state.users, teams: g.state.teams, roles: [], keyTeams: ["team-new"] }
+  expect(run(held, "DELETE", "/Groups/team-new", "").status).toBe(409)
+  expect(runQ(held, "GET", "/Groups", "", `filter=displayName eq "core"`).body.includes(`"totalResults":1`)).toBe(true)
+})
+
+test("discovery documents, unknown routes and methods answer in the SCIM error shape", () => {
+  const spc = run(emptyState(), "GET", "/ServiceProviderConfig", "")
+  expect(spc.status).toBe(200)
+  expect(spc.body.includes(`"oauthbearertoken"`)).toBe(true)
+  expect(run(emptyState(), "GET", "/ResourceTypes", "").body.includes(`"endpoint":"/Groups"`)).toBe(true)
+  expect(run(emptyState(), "GET", "/Schemas", "").body.includes(`"displayName"`)).toBe(true)
+  expect(run(emptyState(), "POST", "/ServiceProviderConfig", "").status).toBe(405)
+  const nf = run(emptyState(), "GET", "/Nope", "")
+  expect(nf.status).toBe(404)
+  expect(nf.body.includes(`"schemas":["urn:ietf:params:scim:api:messages:2.0:Error"]`)).toBe(true)
+  expect(nf.body.includes(`"status":"404"`)).toBe(true)
+  expect(run(emptyState(), "DELETE", "/Users", "").status).toBe(405)
+})

@@ -3,21 +3,44 @@
 // merges it into the joined state of all nodes and answers with that state and the roster of nodes heard
 // from lately. The broker keeps no usage of its own: it only joins what the nodes send. A node merges the
 // answer with Counters.relay, so the other nodes' usage reaches it in two rounds at most.
-import { Counters, ClusterConfig, LEADER_WINDOW_MS, verify } from "./cluster"
+import { Counters, ClusterConfig, LEADER_WINDOW_MS, verify, nodeOf } from "./cluster"
+import { FeedRing, FeedItem, FeedPull, FeedAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_BATCH_MAX, checkItems, parseAnswer, feedId } from "./feed"
 
 export const BROKER_ROUTE = "/api/cluster/broker"
+// the live feed's relay: a node posts its events and pulls the other nodes' (feed.tov)
+export const BROKER_FEED_ROUTE = "/api/cluster/broker/feed"
 export const BROKER_PORT: int = 50051
 const BROKER_ID = "broker"
 
 // The broker's joined state. A node whose payload is bad is refused with nothing merged.
 export class Relay {
   private state: Counters = new Counters(BROKER_ID)
+  // the nodes' live-feed events in the order the broker took them; each gets a position (bseq) that a node keeps as its cursor
+  private feed: FeedRing = new FeedRing(FEED_RING_SIZE, FEED_RING_SECONDS * 1000.0)
+  private pos: int = 0
 
   // A node's state in; the joined state and the roster out. Nodes silent for a window are dropped.
   exchange(body: string, nowMs: f64): string throws SyntaxError {
     try this.state.merge(body, nowMs)
     this.state.forget(nowMs - LEADER_WINDOW_MS)
     return this.state.encode(this.roster())
+  }
+
+  // A node's feed pull: its own events in, and the other nodes' events after its cursor out (a FeedAnswer as JSON).
+  // The broker keeps each event once, so a node that retries sends nothing twice.
+  feedExchange(body: string, nowMs: f64): string throws SyntaxError {
+    const pull = try JSON.parse(body) as FeedPull
+    const xs: FeedItem[] = pull.items ?? []
+    try checkItems(xs)
+    const node = pull.node ?? ""
+    if (node.byteLength === 0 || node.includes(",")) throw new SyntaxError("feed pull has no usable node id")
+    const after: int = pull.after ?? 0
+    if (after < 0) throw new SyntaxError("feed pull has a negative cursor")
+    for (const it of xs) {
+      const stored: FeedItem = { node: it.node, seq: it.seq, ts: it.ts, team: it.team, bu: it.bu, customer: it.customer, project: it.project, data: it.data, bseq: this.pos + 1 }
+      if (this.feed.add(stored, nowMs)) this.pos += 1
+    }
+    return JSON.stringify(this.feed.since(after, nodeOf(node), FEED_BATCH_MAX, this.pos))
   }
 
   // The node ids heard from in the last window, sorted.
@@ -40,13 +63,15 @@ export async function brokerRoute(relay: Relay, cc: ClusterConfig, req: Request)
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   if (p === "/health") return reply(200, `{"status":"ok"}`)
-  if (p !== BROKER_ROUTE) return reply(404, `{"error":"not found"}`)
+  if (p !== BROKER_ROUTE && p !== BROKER_FEED_ROUTE) return reply(404, `{"error":"not found"}`)
   if (req.method !== "POST" && req.method !== "GET") return reply(405, `{"error":"method not allowed"}`)
+  if (p === BROKER_FEED_ROUTE && req.method !== "POST") return reply(405, `{"error":"method not allowed"}`)
   let body = ""
   if (req.method === "POST") body = await req.text()
   if (!verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return reply(401, `{"error":"bad cluster signature"}`)
   if (req.method === "GET") return reply(200, JSON.stringify({ roster: relay.roster() }))
   try {
+    if (p === BROKER_FEED_ROUTE) return reply(200, try relay.feedExchange(body, Date.now()))
     return reply(200, try relay.exchange(body, Date.now()))
   } catch (e) {
     return reply(400, JSON.stringify({ error: e.message }))
@@ -117,4 +142,41 @@ test("a bad payload is refused and the roster does not change", () => {
   }
   expect(refused).toBe(3)
   expect(relay.roster()).toEqual(["a"])
+})
+
+// The answer of a feed pull as the tests read it: last is -1 when the broker refuses the body.
+function answerOf(relay: Relay, body: string, now: f64): FeedAnswer {
+  try {
+    return parseAnswer(try relay.feedExchange(body, now))
+  } catch (e) {
+    return { items: [], next: 0, missed: 0, last: -1 }
+  }
+}
+
+function pullOf(node: string, after: int, items: FeedItem[]): string {
+  return JSON.stringify({ node: node, after: after, items: items })
+}
+
+function feedEvent(node: string, seq: int): FeedItem {
+  return { node: node, seq: seq, ts: 1000.0, team: "", bu: "", customer: "", project: "", data: `{"id":"e${seq}"}` }
+}
+
+test("the broker keeps the nodes' feed events and answers each node with the others'", () => {
+  const relay = new Relay()
+  const r1 = answerOf(relay, pullOf("a", 0, [feedEvent("a", 1)]), 1000.0)
+  expect(r1.last).toBe(1)
+  expect(r1.items.length).toBe(0)
+  const r2 = answerOf(relay, pullOf("b", 0, [feedEvent("b/7", 3), feedEvent("b/7", 4)]), 1000.0)
+  expect(r2.items.map((it) => feedId(it))).toEqual(["a:1"])
+  expect(r2.last).toBe(3)
+  // a's next pull starts after its cursor and gets the other node's events it has not seen
+  const r3 = answerOf(relay, pullOf("a", r1.next, []), 1000.0)
+  expect(r3.items.map((it) => feedId(it))).toEqual(["b/7:3", "b/7:4"])
+  // a retry of a pull keeps nothing twice
+  const again = answerOf(relay, pullOf("b", 0, [feedEvent("b/7", 4)]), 1000.0)
+  expect(again.last).toBe(3)
+  // a body with a bad node id, or no JSON, is refused
+  expect(answerOf(relay, pullOf("", 0, []), 1000.0).last).toBe(-1)
+  expect(answerOf(relay, pullOf("c,d", 0, []), 1000.0).last).toBe(-1)
+  expect(answerOf(relay, "not json", 1000.0).last).toBe(-1)
 })

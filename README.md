@@ -111,7 +111,8 @@ Two Raiju-only switches, both off by default (Bifrost's behaviour):
   key may use, has no price (no datasheet row, pricing override or config price). Requests
   with no budget pass as before, at cost 0. Settable through `PUT /api/config`.
 - `cache.scope_by_virtual_key`: the exact-match response cache keeps each virtual key's
-  entries apart, as the semantic cache does. Off, keys share exact-cache entries.
+  entries apart, as the semantic cache does. On by default; `false` lets keys share
+  exact-cache entries.
 
 ## Servers
 

@@ -1,12 +1,13 @@
 // Replicate chat, as one prediction. The conversation is folded into the model's input
 // (prompt, system_prompt, image_input); the answer is the prediction's output joined. The
-// request asks for a synchronous answer (Prefer: wait). A prediction still running when
-// that wait ends is an error here: the gateway does not poll (see the notes in INTEGRATION).
-// Replicate's wire format is not OpenAI's, so this translates both ways.
+// request asks for a synchronous answer (Prefer: wait). A chat prediction still running when
+// that wait ends is an error: the chat translate is synchronous, so it cannot poll. Image
+// predictions are polled by media.tov (replicateSettle). Replicate's wire format is not
+// OpenAI's, so this translates both ways.
 import { Field, fields, find, rawStr, rawNum, decodeString, elements, quote } from "../json"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, ContentPart, textOf, nowSeconds } from "../schemas"
-import { parseIsoUtcMs } from "../cloud_auth"
+import { parseIsoUtcMs, pctEncode } from "../cloud_auth"
 
 const DEFAULT_BASE = "https://api.replicate.com"
 const HEX = "0123456789abcdef"
@@ -229,7 +230,148 @@ export function deploymentsRequest(t: Target): Upstream {
   return { url: rootOf(t) + "/v1/deployments", headers: h, body: "" }
 }
 
+// ---- polling, edits and files ----
+
+// A prediction is settled once it has a terminal status, or has no status to wait for.
+export function isSettled(text: string): bool throws SyntaxError {
+  const status = rawStr(try fields(text), "status") ?? ""
+  return status === "succeeded" || status === "failed" || status === "canceled" || status === ""
+}
+
+// The URL a running prediction is read from (its urls.get), or "" when the answer has none.
+export function getUrlOf(text: string): string throws SyntaxError {
+  const u = find(try fields(text), "urls")
+  if (u === undefined || !u.startsWith("{")) return ""
+  return rawStr(try fields(u), "get") ?? ""
+}
+
+// The model's input field for its image(s), as Bifrost maps them: one image in a named field for
+// the models listed here, and an array of images in input_images for every other model.
+function imageFieldOf(model: string): string {
+  const colon = model.indexOf(":")
+  const id = (colon < 0 ? model : model.slice(0, colon)).toLowerCase()
+  const table = new Map<string, string>()
+  table.set("black-forest-labs/flux-1.1-pro", "image_prompt")
+  table.set("black-forest-labs/flux-1.1-pro-ultra", "image_prompt")
+  table.set("black-forest-labs/flux-pro", "image_prompt")
+  table.set("black-forest-labs/flux-1.1-pro-ultra-finetuned", "image_prompt")
+  table.set("black-forest-labs/flux-kontext-pro", "input_image")
+  table.set("black-forest-labs/flux-kontext-max", "input_image")
+  table.set("black-forest-labs/flux-kontext-dev", "input_image")
+  table.set("black-forest-labs/flux-dev", "image")
+  table.set("black-forest-labs/flux-fill-pro", "image")
+  table.set("black-forest-labs/flux-dev-lora", "image")
+  table.set("black-forest-labs/flux-krea-dev", "image")
+  return table.get(id) ?? "input_images"
+}
+
+// An image edit as one prediction: the prompt, the images as data URLs in the model's input field,
+// and the count, negative prompt and seed as in generation. The answer is read as generation's.
+export function imageEditRequest(t: Target, body: Field[], images: string[]): Upstream throws SyntaxError {
+  const key = t.key.value ?? ""
+  if (key === "") throw new SyntaxError("replicate: the key needs a value: an API token")
+  const prompt = rawStr(body, "prompt") ?? ""
+  if (prompt === "") throw new SyntaxError("prompt is required")
+  if (images.length === 0) throw new SyntaxError("an image is required")
+  const input: string[] = [`"prompt":${quote(prompt)}`]
+  const field = imageFieldOf(t.model)
+  const urls = images.map((u) => quote(u))
+  if (field === "input_images") input.push(`"input_images":[${urls.join(",")}]`)
+  else input.push(`${quote(field)}:${urls[0]!}`)
+  const n = rawNum(body, "n")
+  if (n !== undefined) input.push(`"num_outputs":${n}`)
+  const neg = rawStr(body, "negative_prompt") ?? ""
+  if (neg !== "") input.push(`"negative_prompt":${quote(neg)}`)
+  const seed = rawNum(body, "seed")
+  if (seed !== undefined) input.push(`"seed":${seed}`)
+  const b = t.cfg.network_config?.base_url ?? ""
+  const root = b === "" ? DEFAULT_BASE : trimSlash(b)
+  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
+  addExtraHeaders(&h, t.cfg)
+  const head = isVersion(t.model) ? `"version":${quote(t.model)},` : ""
+  return { url: root + predictionPath(t.model), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
+}
+
+// The file API under the account's root: the list (one page, from its cursor) and one file.
+export function fileListUrl(t: Target, cursor: string): string {
+  return rootOf(t) + "/v1/files" + (cursor === "" ? "" : "?cursor=" + pctEncode(cursor))
+}
+
+export function fileUrl(t: Target, id: string): string {
+  return rootOf(t) + "/v1/files/" + pctEncode(id)
+}
+
+// The headers of a file call: the bearer token and the configured extra headers.
+export function fileHeaders(t: Target): Map<string, string> {
+  let h = headers([["authorization", "Bearer " + (t.key.value ?? "")]])
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+// A file list page as OpenAI's list. Files are listed with the batch purpose, as Bifrost does. after is
+// the cursor of the next page, from the next link; has_more says whether there is one.
+export function fileListToOpenAI(text: string): string throws SyntaxError {
+  const fs = try fields(text)
+  const items: string[] = []
+  for (const el of try elements(find(fs, "results") ?? "[]")) items.push(try fileToOpenAI(el, ""))
+  const next = rawStr(fs, "next") ?? ""
+  const at = next.indexOf("cursor=")
+  let after = ""
+  if (at >= 0) after = new URLSearchParams("c=" + (next.slice(at + 7).split("&")[0] ?? "")).get("c") ?? ""
+  const first = items.length > 0 ? rawStr(try fields(items[0]!), "id") ?? "" : ""
+  const last = items.length > 0 ? rawStr(try fields(items[items.length - 1]!), "id") ?? "" : ""
+  const cursor = after === "" ? "" : `,"after":${quote(after)}`
+  return `{"object":"list","data":[${items.join(",")}],"has_more":${next !== ""},"first_id":${quote(first)},"last_id":${quote(last)}${cursor}}`
+}
+
+// The OpenAI delete object for a file the DELETE call removed (Replicate answers 204).
+export function fileDeletedToOpenAI(id: string): string {
+  return `{"id":${quote(id)},"object":"file","deleted":true}`
+}
+
 // ---- tests ----
+
+test("a running prediction is polled at its get URL until it settles", () => {
+  const running = `{"id":"p9","status":"starting","urls":{"get":"https://api.replicate.com/v1/predictions/p9"}}`
+  expect(try isSettled(running)).toBe(false)
+  expect(try getUrlOf(running)).toBe("https://api.replicate.com/v1/predictions/p9")
+  expect(try isSettled(`{"status":"processing"}`)).toBe(false)
+  expect(try getUrlOf(`{"status":"processing"}`)).toBe("")
+  expect(try isSettled(`{"status":"succeeded","output":["x"]}`)).toBe(true)
+  expect(try isSettled(`{"status":"failed","error":"boom"}`)).toBe(true)
+  expect(try isSettled(`{"status":"canceled"}`)).toBe(true)
+})
+
+test("an image edit posts the images to the model's input field", () => {
+  const t: Target = { provider: "replicate", kind: "replicate", model: "black-forest-labs/flux-kontext-pro", key: { value: "r8_x" }, cfg: {} }
+  const body = try fields(`{"prompt":"a red fox","n":1,"seed":3}`)
+  const up = try imageEditRequest(t, body, ["data:image/png;base64,AAAA"])
+  expect(up.url).toBe("https://api.replicate.com/v1/models/black-forest-labs/flux-kontext-pro/predictions")
+  expect(up.headers.get("prefer")).toBe("wait")
+  expect(up.body).toBe(`{"input":{"prompt":"a red fox","input_image":"data:image/png;base64,AAAA","num_outputs":1,"seed":3}}`)
+  const other: Target = { provider: "replicate", kind: "replicate", model: "acme/model-a", key: { value: "r8_x" }, cfg: {} }
+  expect((try imageEditRequest(other, try fields(`{"prompt":"p"}`), ["u1", "u2"])).body).toBe(`{"input":{"prompt":"p","input_images":["u1","u2"]}}`)
+  let none = false
+  try {
+    imageEditRequest(other, try fields(`{"prompt":"p"}`), [])
+  } catch (e) {
+    none = true
+  }
+  expect(none).toBe(true)
+})
+
+test("file list, retrieve and delete: the URLs, the list page and the delete object", () => {
+  const dt: Target = { provider: "replicate", kind: "replicate", model: "", key: { value: "r8_x" }, cfg: {} }
+  expect(fileListUrl(dt, "")).toBe("https://api.replicate.com/v1/files")
+  expect(fileListUrl(dt, "c 2")).toBe("https://api.replicate.com/v1/files?cursor=c%202")
+  expect(fileUrl(dt, "file-1")).toBe("https://api.replicate.com/v1/files/file-1")
+  expect(fileHeaders(dt).get("authorization")).toBe("Bearer r8_x")
+  const page = try fileListToOpenAI(`{"next":"https://api.replicate.com/v1/files?cursor=abc%2B1&x=2","previous":null,"results":[{"id":"file-1","name":"a.png","content_type":"image/png","size":9,"created_at":"2026-10-14T13:00:00.123Z"},{"id":"file-2","size":0,"created_at":"2026-10-14T13:00:00.123Z"}]}`)
+  expect(page.includes(`"object":"list","data":[{"id":"file-1","object":"file","bytes":9,"created_at":1791982800,"filename":"a.png","purpose":"batch","status":"processed"},{"id":"file-2","object":"file","bytes":0,"created_at":1791982800,"filename":"","purpose":"batch","status":"uploaded"}]`)).toBe(true)
+  expect(page.includes(`"has_more":true,"first_id":"file-1","last_id":"file-2","after":"abc+1"}`)).toBe(true)
+  expect(try fileListToOpenAI(`{"next":null,"results":[]}`)).toBe(`{"object":"list","data":[],"has_more":false,"first_id":"","last_id":""}`)
+  expect(fileDeletedToOpenAI("file-1")).toBe(`{"id":"file-1","object":"file","deleted":true}`)
+})
 
 test("prediction path for a model name and for a version", () => {
   expect(predictionPath("meta/llama-3-8b-instruct")).toBe("/v1/models/meta/llama-3-8b-instruct/predictions")

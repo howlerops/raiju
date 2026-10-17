@@ -33,7 +33,7 @@ export function hashPassword(salt: string, password: string): string {
 }
 
 // Compares without stopping at the first difference.
-function safeEq(a: string, b: string): bool {
+export function safeEq(a: string, b: string): bool {
   const x = utf8(a)
   const y = utf8(b)
   const n = x.length > y.length ? x.length : y.length
@@ -180,7 +180,7 @@ export function resourceOf(method: string, path: string): { resource: string, op
   else if (area === "logs") resource = "Logs"
   else if (area === "mcp-logs") resource = "MCPLogs"
   else if (area === "providers" || area === "keys" || area === "models") resource = "ModelProvider"
-  else if (area === "mcp") resource = "MCPGateway"
+  else if (area === "mcp" || area === "oauth2") resource = "MCPGateway"
   else if (area === "cluster") resource = "Cluster"
   else if (area === "alerting" || area === "alerts") resource = "Observability"
   else if (area === "roles") resource = "RBAC"
@@ -228,7 +228,7 @@ export function authorize(cfg: RbacConfig, headers: Map<string, string>, method:
 
 // ---- user management ----
 
-type UserBody = { name?: string, role?: string, disabled?: bool }
+type UserBody = { name?: string, role?: string, role_id?: int, disabled?: bool }
 
 type UserView = { name: string, role: Role, disabled: bool }
 
@@ -238,10 +238,46 @@ export function isBuiltinRole(s: string): bool {
   return BUILT_IN_ROLES.includes(s)
 }
 
+// The name of the custom role with this id, or undefined.
+export function roleNameById(roles: RoleConfig[] | undefined, id: int): string | undefined {
+  for (const r of withRoleIds(roles ?? [])) {
+    if (r.id === id) return r.name
+  }
+  return undefined
+}
+
 // The custom role with this name, if one is defined.
 export function customRole(roles: RoleConfig[] | undefined, name: string): RoleConfig | undefined {
   for (const r of roles ?? []) {
     if (r.name === name) return r
+  }
+  return undefined
+}
+
+// The roles with their ids. A role keeps its id; one saved without one takes the next id after the largest
+// in use, in list order, so ids stay put as roles are added and removed.
+export function withRoleIds(roles: RoleConfig[]): RoleConfig[] {
+  let top: int = 0
+  for (const r of roles) {
+    const id: int = r.id ?? 0
+    if (id > top) top = id
+  }
+  const out: RoleConfig[] = []
+  for (const r of roles) {
+    if (r.id !== undefined) {
+      out.push(r)
+      continue
+    }
+    top += 1
+    out.push({ id: top, name: r.name, description: r.description, dac: r.dac, permissions: r.permissions, entity_dac: r.entity_dac })
+  }
+  return out
+}
+
+// The id of the custom role with this name, or undefined.
+export function roleIdOf(roles: RoleConfig[] | undefined, name: string): int | undefined {
+  for (const r of withRoleIds(roles ?? [])) {
+    if (r.name === name) return r.id
   }
   return undefined
 }
@@ -253,7 +289,7 @@ export function knownRole(roles: RoleConfig[] | undefined, s: string): bool {
 
 // Names are Basic auth user names and path segments: lower-case letters, digits, "_", "-", and
 // "@", "." and "+" so that a sign-in identity (an email, for an identity-aware proxy) can be a user.
-function validName(name: string): bool {
+export function validName(name: string): bool {
   const n = name.byteLength
   if (n < 1 || n > 64) return false
   for (const b of utf8(name)) {
@@ -345,13 +381,19 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
   const old = findUser(cfg.users, name)
   if (old === undefined) return uerror(404, `no user ${name}`, cfg)
   const b = parseUserBody(body)
-  if (b === undefined) return uerror(400, "body must be a JSON object with role or disabled", cfg)
+  if (b === undefined) return uerror(400, "body must be a JSON object with role, role_id or disabled", cfg)
   let role: Role = old.role
   if (b.role !== undefined) {
     if (!knownRole(cfg.roles, b.role)) return uerror(400, "role must be admin, editor, viewer, auditor or a custom role", cfg)
     role = b.role
+  } else if (b.role_id !== undefined) {
+    // Bifrost's AssignUserRoleRequest: the role by its id, which must name a custom role
+    const named = roleNameById(cfg.roles, b.role_id)
+    if (named === undefined) return uerror(400, `role_id ${b.role_id} is not a custom role`, cfg)
+    role = named
   }
   const disabled = b.disabled === undefined ? old.disabled : b.disabled
+  // the record keeps what it holds beyond the role: its teams, business units, projects and access profiles
   const next: UserConfig = {
     name: old.name,
     role: role,
@@ -359,6 +401,10 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
     password_sha256: old.password_sha256,
     salt: old.salt,
     disabled: disabled,
+    teams: old.teams,
+    business_units: old.business_units,
+    projects: old.projects,
+    access_profile_ids: old.access_profile_ids,
   }
   if (isActiveAdmin(old) && !isActiveAdmin(next) && otherActiveAdmins(cfg.users, name) === 0) {
     return uerror(409, LAST_ADMIN, cfg)
@@ -674,6 +720,19 @@ test("sign-in identities can be users, and provisioned ones are found", () => {
   expect(u === undefined ? "" : u.role).toBe("editor")
   expect(provisioned(cfg, "bob@example.com") === undefined).toBe(true)
   expect(handleUsers(cfg, "POST", "/api/users", "{\"name\":\"a b@x\",\"role\":\"viewer\"}").status).toBe(400)
+})
+
+test("a user's role can be set by role id, and a role change keeps the rest of the user's record", () => {
+  const roles: RoleConfig[] = [{ id: 4, name: "ops", permissions: [] }]
+  const cfg: RbacConfig = { users: [{ name: "root", role: "admin", token_sha256: hashToken("sk-root") }, { name: "bob", role: "viewer", teams: ["t1"], access_profile_ids: ["p-one"] }], roles: roles }
+  const byId = handleUsers(cfg, "PUT", "/api/users/bob/role", `{"role_id":4}`)
+  expect(byId.status).toBe(200)
+  const bob = findUser(byId.cfg.users, "bob")!
+  expect(bob.role).toBe("ops")
+  expect((bob.access_profile_ids ?? []).join(",")).toBe("p-one")
+  expect((bob.teams ?? []).join(",")).toBe("t1")
+  expect(handleUsers(cfg, "PUT", "/api/users/bob/role", `{"role_id":9}`).status).toBe(400)
+  expect(handleUsers(cfg, "PUT", "/api/users/bob/role", `{"role":"nope"}`).status).toBe(400)
 })
 
 test("custom roles hold resource and operation pairs and reach only the management API", () => {

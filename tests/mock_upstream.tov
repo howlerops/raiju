@@ -234,6 +234,16 @@ async function replicateMock(req: Request, path: string, lu: URL | undefined): P
     if (second) return jsonBody(`{"next":null,"previous":"${base}","results":[{"owner":"acme","name":"model-c"}]}`, 200)
     return jsonBody(`{"next":"${base}?cursor=2","previous":null,"results":[{"owner":"acme","name":"model-a"},{"owner":"acme","name":"model-b"}]}`, 200)
   }
+  // the file list has two pages; the second answers with a file that has no bytes yet (status uploaded)
+  if (path === "/v1/files" && req.method === "GET") {
+    if (lu !== undefined && lu.search.includes("cursor=p2")) return jsonBody(`{"next":null,"previous":"http://127.0.0.1:18099/replicate/v1/files","results":[{"id":"file-e2e-2","size":0,"created_at":"${now}"}]}`, 200)
+    return jsonBody(`{"next":"http://127.0.0.1:18099/replicate/v1/files?cursor=p2","previous":null,"results":[{"id":"file-e2e-1","name":"pic.png","content_type":"image/png","size":9,"created_at":"${now}"}]}`, 200)
+  }
+  if (path === "/v1/files/file-e2e-1" && req.method === "GET") return jsonBody(`{"id":"file-e2e-1","name":"pic.png","content_type":"image/png","size":9,"created_at":"${now}","urls":{"get":"http://127.0.0.1:18099/replicate/files/file-e2e-1"}}`, 200)
+  if (path === "/v1/files/file-e2e-1" && req.method === "DELETE") return new Response(undefined, { status: 204 })
+  if (path.startsWith("/v1/files/")) return jsonBody(JSON.stringify({ detail: "The requested resource could not be found" }), 404)
+  // a prediction polled at its get URL: it has settled by the first read
+  if (path.startsWith("/v1/predictions/") && req.method === "GET") return Response.json({ id: path.slice(16), status: "succeeded", created_at: now, output: ["http://127.0.0.1:18099/replicate/out/polled.png"] })
   if (path === "/v1/files" && req.method === "POST") {
     const fd = try await req.formData()
     const f = fd.get("content") ?? undefined
@@ -245,6 +255,10 @@ async function replicateMock(req: Request, path: string, lu: URL | undefined): P
     const prompt = doc.input?.prompt ?? ""
     const id = "pred-e2e-" + seen.length
     if (prompt === "fail") return Response.json({ id: id, status: "failed", created_at: now, error: "the model refused the prompt" })
+    // a prediction still running when the wait ends: its get URL answers the settled prediction
+    if (prompt === "slow") return Response.json({ id: id, status: "starting", created_at: now, urls: { get: "http://127.0.0.1:18099/replicate/v1/predictions/" + id } })
+    // an edit carries the image as a data URL in its input: its output is an image
+    if (body.includes("data:image/png;base64,")) return Response.json({ id: id, status: "succeeded", created_at: now, output: ["http://127.0.0.1:18099/replicate/out/edit.png"] })
     const n = doc.input?.num_outputs
     if (n !== undefined) {
       const urls: string[] = []
@@ -324,6 +338,16 @@ Bun.serve<string>({
         if (body.includes("l97t-tools")) return new Response(`{"id":"c5","object":"chat.completion","created":1,"model":"${model}","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{}"}},{"id":"call_b","type":"function","function":{"name":"lookup_city","arguments":"{}"}},{"id":"call_c","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}`, { headers: { "content-type": "application/json" } })
         // a primary that reports its quota as spent: the header is what a circuit policy watches for
         if (model === "policy-quota") return new Response(`{"id":"q1","object":"chat.completion","created":1,"model":"${model}","choices":[{"index":0,"message":{"role":"assistant","content":"from the primary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`, { headers: { "content-type": "application/json", "x-quota-state": "exhausted" } })
+        // "email-chat" streams an email split across two chunks (the built-in guard on a stream); "tools-chat" streams
+        // three tool calls, one name twice (the tool names the log records for a streamed answer)
+        if (model === "email-chat" && m.stream === true) {
+          const emailChunk = (delta: string, finish: string) => `data: {"id":"c6","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          return new Response(emailChunk(`{"role":"assistant","content":""}`, "null") + emailChunk(`{"content":"write to jane.doe"}`, "null") + emailChunk(`{"content":"@example.com today"}`, "null") + emailChunk(`{}`, `"stop"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
+        if (model === "tools-chat" && m.stream === true) {
+          const toolChunk = (delta: string, finish: string) => `data: {"id":"c7","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          return new Response(toolChunk(`{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":""}}]}`, "null") + toolChunk(`{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}`, "null") + toolChunk(`{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"lookup_city","arguments":""}}]}`, "null") + toolChunk(`{"tool_calls":[{"index":2,"id":"call_c","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}`, "null") + toolChunk(`{}`, `"tool_calls"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
         // "pii-chat" streams a phone number split across two chunks (the L97s redaction checks)
         if (model === "pii-chat" && m.stream === true) {
           const piiChunk = (delta: string, finish: string) => `data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
@@ -380,6 +404,12 @@ Bun.serve<string>({
       POST: async (req) => {
         const body = await req.text()
         record(req, "/or/v1/chat/completions", body)
+        // a streamed answer ends with a usage chunk that carries the billed cost (0.00456, not the 0.00123 of the plain answer)
+        if (body.includes(`"stream":true`)) {
+          const frame = (delta: string, finish: string) => `data: {"id":"or-s-1","object":"chat.completion.chunk","created":1,"model":"openai/gpt-4o-mini","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          const usage = `data: {"id":"or-s-1","object":"chat.completion.chunk","created":1,"model":"openai/gpt-4o-mini","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"cost":0.00456}}\n\n`
+          return new Response(frame(`{"role":"assistant","content":"billed "}`, "null") + frame(`{"content":"stream"}`, `"stop"`) + usage + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
         return Response.json({ id: "or-chat-1", object: "chat.completion", created: 1, model: "openai/gpt-4o-mini", choices: [{ index: 0, message: { role: "assistant", content: "billed hello" }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, cost: 0.00123 } })
       },
     },
@@ -394,6 +424,13 @@ Bun.serve<string>({
     },
     // OpenRouter's native decisions (/alpha/decisions under the mock root /or): the key is checked, the
     // answers are TypeSafe's, and the usage carries OpenRouter's billed cost
+    // Cohere's model object under /cohere-up (its base_url): the retrieve answers with the model's limits and endpoints
+    "/cohere-up/v1/models/command-r-plus": {
+      GET: async (req) => {
+        record(req, "/cohere-up/v1/models/command-r-plus", "")
+        return Response.json({ name: "command-r-plus", is_deprecated: false, endpoints: ["chat"], finetuned: false, context_length: 128000, tokenizer_url: "https://tokenizer.example/command-r-plus.json", default_endpoints: ["chat"], features: ["tools"] })
+      },
+    },
     "/or/alpha/decisions": {
       POST: async (req) => {
         const body = await req.text()
@@ -1216,6 +1253,14 @@ Bun.serve<string>({
       record(req, lp, req.method + " " + body)
       if (lp === "/v1/realtime/calls") return new Response("v=0\r\no=- answer\r\n", { status: 201, headers: { "content-type": "application/sdp" } })
       return Response.json({ object: "ok", method: req.method, path: lp })
+    }
+    // GPT Live's WebRTC create: answers with a session id and the SDP answer to the offer it was sent
+    if (lp === "/v1/live/sessions" && req.method === "POST") {
+      const offer = await req.text()
+      record(req, lp, offer)
+      const hl: Record<string, string> = new Map()
+      hl.set("content-type", "application/json")
+      return new Response(`{"session":{"id":"sess_mock_rtc","type":"realtime"},"transport":{"type":"webrtc","sdp":"v=0\\r\\no=- live-answer\\r\\n"}}`, { status: 201, headers: hl })
     }
     // realtime: echo each event back, tagged with the credentials and URL the gateway used
     if (req.url.includes("/v1/realtime") || req.url.includes("/v1/live/sessions")) {

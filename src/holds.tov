@@ -1,0 +1,343 @@
+// Holds and incidents for adaptive load balancing. A provider's refusal (refusal.tov) holds the key, or one
+// model of it, out of rotation: until its wait runs out no request goes to it, then one request is let
+// through as the check. A served check releases the hold; a refused one climbs the wait ladder; a network
+// error or a 5xx holds it again on the same rung. Every hold, and every circuit that a run of failures
+// opens, is an incident until it is resolved. Pure: every call takes `now` in milliseconds.
+import { FailureClass, holdWaitMs, holdsKey, holdsAllModels } from "./refusal"
+
+// a key released this recently keeps its rung when it is held again for the same reason
+const RECENT_MS = 600000.0
+// a check that never reports back (a cancelled request) frees its slot after this
+const PROBE_TIMEOUT_MS = 300000.0
+// incidents kept in memory; the oldest resolved ones go first
+const INCIDENT_CAP = 500
+
+export class Hold {
+  // the key id "provider#key", and the model ("" for the whole key)
+  readonly target: string
+  readonly provider: string
+  readonly keyId: string
+  readonly model: string
+  cls: FailureClass
+  reason: string
+  heldAt: f64
+  nextCheck: f64
+  rung: int
+  waitMs: f64
+  probing: bool = false
+  probeAt: f64 = 0.0
+  constructor(target: string, provider: string, keyId: string, model: string, cls: FailureClass, reason: string, heldAt: f64, waitMs: f64, rung: int) {
+    this.target = target
+    this.provider = provider
+    this.keyId = keyId
+    this.model = model
+    this.cls = cls
+    this.reason = reason
+    this.heldAt = heldAt
+    this.waitMs = waitMs
+    this.nextCheck = heldAt + waitMs
+    this.rung = rung
+  }
+}
+
+export class Incident {
+  resolvedAt: f64 = 0.0
+  recovering: bool = false
+  constructor(readonly id: int, readonly target: string, readonly provider: string, readonly keyId: string, readonly model: string, readonly cls: string, readonly reason: string, readonly openedAt: f64) {}
+}
+
+// Where a hold or a circuit keeps its place: the key ("provider#key") or one of its models.
+function scopeOf(id: string, model: string): string {
+  return model === "" ? id : id + "@" + model
+}
+
+// The scopes a request for this key and model is checked against: the whole key, and its model.
+function scopesOf(id: string, model: string): string[] {
+  return model === "" ? [id] : [id, id + "@" + model]
+}
+
+// The provider and key id of a "provider#key" id (the whole id when it has no "#").
+function splitId(id: string): { provider: string, keyId: string } {
+  const at = id.indexOf("#")
+  if (at < 0) return { provider: id, keyId: "" }
+  return { provider: id.slice(0, at), keyId: id.slice(at + 1) }
+}
+
+export class HoldBook {
+  private holds: Map<string, Hold> = new Map()
+  // the rung and time of the last release, by scope and class
+  private recent: Map<string, { rung: int, at: f64 }> = new Map()
+  private incidents: Incident[] = []
+  // the open incident of each hold ("h:" + scope) or circuit ("c:" + id)
+  private open: Map<string, Incident> = new Map()
+  private seq: int = 0
+
+  // What holds a request for this key and model at now: "" when it may be sent, "due" when the next request
+  // is the check, "checking" while a check is in flight, "held" while the wait runs.
+  state(id: string, model: string, now: f64): string {
+    let out = ""
+    for (const k of scopesOf(id, model)) {
+      const h = this.holds.get(k)
+      if (h === undefined) continue
+      if (now < h.nextCheck) return "held"
+      if (h.probing && now - h.probeAt < PROBE_TIMEOUT_MS) out = "checking"
+      else if (out === "") out = "due"
+    }
+    return out
+  }
+
+  // Marks the check as sent when the key is due. False when the key is held or a check is already in flight,
+  // so the caller picks another key.
+  startCheck(id: string, model: string, now: f64): bool {
+    const s = this.state(id, model, now)
+    if (s === "held" || s === "checking") return false
+    this.checkNow(id, model, now)
+    return true
+  }
+
+  // Marks the request sent to a held key as its check, whatever the wait says: used when every key of the
+  // provider is held, since the request is sent anyway and its answer counts as the check.
+  checkNow(id: string, model: string, now: f64): void {
+    for (const k of scopesOf(id, model)) {
+      const h = this.holds.get(k)
+      if (h === undefined) continue
+      h.probing = true
+      h.probeAt = now
+      const inc = this.open.get("h:" + k)
+      if (inc !== undefined) inc.recovering = true
+    }
+  }
+
+  // The outcome of a request sent to the key. outcome is "ok" (served), "refused" (the provider refused it, with
+  // cls, reason and the provider's wait hint if any) or "unsure" (a failure that says nothing about the key).
+  // r is a number in [0, 1) that spreads the ladder's waits.
+  settle(id: string, model: string, outcome: string, cls: FailureClass, reason: string, hintMs: f64 | undefined, now: f64, r: f64): void {
+    if (outcome === "ok") {
+      for (const k of scopesOf(id, model)) {
+        const h = this.holds.get(k)
+        if (h !== undefined && h.probing) this.release(k, now)
+      }
+      return
+    }
+    if (outcome === "refused") {
+      const fc = cls
+      if (!holdsKey(fc)) return
+      const k = holdsAllModels(fc) ? id : scopeOf(id, model)
+      const h = this.holds.get(k)
+      if (h !== undefined) {
+        // a refusal from a request sent before the hold does not lengthen the wait
+        if (now < h.nextCheck && !h.probing) return
+        h.rung += 1
+        h.probing = false
+        h.cls = fc
+        h.reason = reason
+        h.waitMs = holdWaitMs(fc, h.rung, hintMs, r)
+        h.nextCheck = now + h.waitMs
+        const inc = this.open.get("h:" + k)
+        if (inc !== undefined) inc.recovering = false
+        return
+      }
+      const parts = splitId(id)
+      const rec = this.recent.get(k + "|" + fc)
+      const rung = rec !== undefined && now - rec.at <= RECENT_MS ? rec.rung : 0
+      const model2 = holdsAllModels(fc) ? "" : model
+      const hold = new Hold(k, parts.provider, parts.keyId, model2, fc, reason, now, holdWaitMs(fc, rung, hintMs, r), rung)
+      this.holds.set(k, hold)
+      this.openIncident("h:" + k, k, parts.provider, parts.keyId, model2, fc, reason, now)
+      return
+    }
+    // unsure: a check that failed for another reason is held again on the same rung
+    for (const k of scopesOf(id, model)) {
+      const h = this.holds.get(k)
+      if (h !== undefined && h.probing) {
+        h.probing = false
+        h.waitMs = holdWaitMs(h.cls, h.rung, undefined, r)
+        h.nextCheck = now + h.waitMs
+      }
+    }
+  }
+
+  // Releases the hold on a target ("provider#key", or "provider#key@model"). False when none is held there.
+  clear(target: string, now: f64): bool {
+    if (!this.holds.has(target)) return false
+    this.release(target, now)
+    return true
+  }
+
+  // Releases every hold. Returns how many were held.
+  clearAll(now: f64): int {
+    const keys = this.holds.keys()
+    for (const k of keys) this.release(k, now)
+    return keys.length
+  }
+
+  // The holds now, each with its state (held, checking or due) and the wait it was given.
+  list(now: f64): { h: Hold, state: string }[] {
+    const out: { h: Hold, state: string }[] = []
+    for (const h of this.holds.values()) {
+      const state = now < h.nextCheck ? "held" : h.probing ? "checking" : "due"
+      out.push({ h: h, state: state })
+    }
+    return out
+  }
+
+  // A circuit that a run of failures opened: an incident for the key until the circuit closes.
+  noteOpen(id: string, now: f64): void {
+    if (id.indexOf("#") < 0) return
+    const parts = splitId(id)
+    this.openIncident("c:" + id, id, parts.provider, parts.keyId, "", "failures", "failures opened the circuit", now)
+  }
+
+  noteClose(id: string, now: f64): void {
+    this.resolve("c:" + id, now)
+  }
+
+  // Every incident kept, oldest first.
+  incidentList(): Incident[] {
+    return this.incidents
+  }
+
+  private openIncident(key: string, target: string, provider: string, keyId: string, model: string, cls: string, reason: string, now: f64): void {
+    if (this.open.has(key)) return
+    this.seq += 1
+    const inc = new Incident(this.seq, target, provider, keyId, model, cls, reason, now)
+    this.incidents.push(inc)
+    this.open.set(key, inc)
+    this.prune()
+  }
+
+  private resolve(key: string, now: f64): void {
+    const inc = this.open.get(key)
+    if (inc === undefined) return
+    inc.resolvedAt = now
+    inc.recovering = false
+    this.open.delete(key)
+  }
+
+  private release(k: string, now: f64): void {
+    const h = this.holds.get(k)
+    if (h === undefined) return
+    this.recent.set(k + "|" + h.cls, { rung: h.rung, at: now })
+    this.holds.delete(k)
+    this.resolve("h:" + k, now)
+  }
+
+  // Drops the oldest resolved incident once the list is over its cap (open ones are kept).
+  private prune(): void {
+    if (this.incidents.length <= INCIDENT_CAP) return
+    const first = this.incidents.find((x: Incident) => x.resolvedAt > 0.0)
+    if (first === undefined) return
+    this.incidents = this.incidents.filter((x: Incident) => x !== first)
+  }
+}
+
+test("a refusal holds the key until its wait runs out, then one request checks it", () => {
+  const b = new HoldBook()
+  const t0 = 1000000.0
+  b.settle("openai#pool", "gpt-4o", "refused", "credential", "invalid api key", undefined, t0, 0.5)
+  // the whole key is held: no request goes to it, and the hold is listed with its reason
+  expect(b.state("openai#pool", "gpt-4o", t0 + 1000.0)).toBe("held")
+  expect(b.state("openai#pool", "gpt-4o-mini", t0 + 1000.0)).toBe("held")
+  const rows = b.list(t0 + 1000.0)
+  expect(rows.length).toBe(1)
+  expect(rows[0]!.h.target).toBe("openai#pool")
+  expect(rows[0]!.h.cls).toBe("credential")
+  expect(rows[0]!.h.nextCheck).toBe(t0 + 30000.0)
+  // once due, the next request is the check: one at a time
+  expect(b.startCheck("openai#pool", "gpt-4o", t0 + 30000.0)).toBe(true)
+  expect(b.state("openai#pool", "gpt-4o", t0 + 30000.0)).toBe("checking")
+  expect(b.startCheck("openai#pool", "gpt-4o", t0 + 30001.0)).toBe(false)
+  // the check is served: the hold is released and the incident resolved
+  b.settle("openai#pool", "gpt-4o", "ok", "unknown", "", undefined, t0 + 31000.0, 0.5)
+  expect(b.state("openai#pool", "gpt-4o", t0 + 31000.0)).toBe("")
+  expect(b.list(t0 + 31000.0).length).toBe(0)
+  expect(b.incidentList().length).toBe(1)
+  expect(b.incidentList()[0]!.resolvedAt).toBe(t0 + 31000.0)
+})
+
+test("a refused check climbs the ladder; a 5xx check holds the same rung again", () => {
+  const b = new HoldBook()
+  const t0 = 2000000.0
+  b.settle("p#k", "m", "refused", "rate_limit", "slow down", undefined, t0, 0.5)
+  expect(b.list(t0)[0]!.h.waitMs).toBe(30000.0)
+  // the check is refused again: rung 1, a 60 s wait
+  b.startCheck("p#k", "m", t0 + 30000.0)
+  b.settle("p#k", "m", "refused", "rate_limit", "slow down", undefined, t0 + 30000.0, 0.5)
+  expect(b.list(t0 + 30000.0)[0]!.h.rung).toBe(1)
+  expect(b.list(t0 + 30000.0)[0]!.h.nextCheck).toBe(t0 + 90000.0)
+  // a 503 on the next check holds it again on rung 1, with its wait from that rung
+  b.startCheck("p#k", "m", t0 + 90000.0)
+  b.settle("p#k", "m", "unsure", "transient", "", undefined, t0 + 90000.0, 0.5)
+  expect(b.list(t0 + 90000.0)[0]!.h.rung).toBe(1)
+  expect(b.list(t0 + 90000.0)[0]!.h.nextCheck).toBe(t0 + 150000.0)
+  // a refusal from a request sent before the hold does not lengthen the wait
+  b.settle("p#k", "m", "refused", "rate_limit", "slow down", undefined, t0 + 91000.0, 0.5)
+  expect(b.list(t0 + 91000.0)[0]!.h.rung).toBe(1)
+})
+
+test("a request sent to a held key anyway is its check: a refusal climbs the ladder, a success releases", () => {
+  const b = new HoldBook()
+  b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 0.0, 0.5)
+  // every key is held, so the request goes to this one before its wait is over
+  b.checkNow("p#k", "m", 1000.0)
+  expect(b.state("p#k", "m", 1000.0)).toBe("held")
+  b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 1000.0, 0.5)
+  expect(b.list(1000.0)[0]!.h.rung).toBe(1)
+  expect(b.list(1000.0)[0]!.h.nextCheck).toBe(61000.0)
+  b.checkNow("p#k", "m", 2000.0)
+  b.settle("p#k", "m", "ok", "unknown", "", undefined, 2000.0, 0.5)
+  expect(b.list(2000.0).length).toBe(0)
+})
+
+test("a provider's wait hint is used as given, with the 10 second floor", () => {
+  const b = new HoldBook()
+  b.settle("p#k", "", "refused", "rate_limit", "x", 2500.0, 0.0, 0.5)
+  expect(b.list(0.0)[0]!.h.waitMs).toBe(10000.0)
+})
+
+test("a model hold leaves the key serving its other models", () => {
+  const b = new HoldBook()
+  b.settle("azure#eu", "gpt-4o", "refused", "model_access", "no access", undefined, 0.0, 0.5)
+  expect(b.state("azure#eu", "gpt-4o", 1000.0)).toBe("held")
+  expect(b.state("azure#eu", "gpt-4o-mini", 1000.0)).toBe("")
+  // a rejected credential holds every model
+  b.settle("azure#eu", "gpt-4o-mini", "refused", "credential", "bad key", undefined, 0.0, 0.5)
+  expect(b.state("azure#eu", "gpt-4o-mini", 1000.0)).toBe("held")
+  expect(b.list(1000.0).length).toBe(2)
+  // releasing the key alone leaves the model hold
+  expect(b.clear("azure#eu", 1000.0)).toBe(true)
+  expect(b.state("azure#eu", "gpt-4o", 1000.0)).toBe("held")
+  expect(b.clear("azure#eu@gpt-4o", 1000.0)).toBe(true)
+  expect(b.clearAll(1000.0)).toBe(0)
+})
+
+test("a key released within ten minutes for the same reason resumes its rung", () => {
+  const b = new HoldBook()
+  b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 0.0, 0.5)
+  b.startCheck("p#k", "m", 30000.0)
+  b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 30000.0, 0.5)
+  b.startCheck("p#k", "m", 90000.0)
+  b.settle("p#k", "m", "ok", "unknown", "", undefined, 90000.0, 0.5)
+  // held again 1 minute later: it starts at rung 1 (60 s), not 30 s
+  b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 150000.0, 0.5)
+  expect(b.list(150000.0)[0]!.h.waitMs).toBe(60000.0)
+  // ten minutes later it starts from the bottom again
+  b.startCheck("p#k", "m", 210000.0)
+  b.settle("p#k", "m", "ok", "unknown", "", undefined, 210000.0, 0.5)
+  b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 1000000.0, 0.5)
+  expect(b.list(1000000.0)[0]!.h.waitMs).toBe(30000.0)
+})
+
+test("circuits that failures open are incidents until they close", () => {
+  const b = new HoldBook()
+  b.noteOpen("p#k", 1000.0)
+  b.noteOpen("policy-name", 1000.0)
+  expect(b.incidentList().length).toBe(1)
+  expect(b.incidentList()[0]!.cls).toBe("failures")
+  b.noteClose("p#k", 5000.0)
+  expect(b.incidentList()[0]!.resolvedAt).toBe(5000.0)
+  // a hold and a circuit on the same key are separate incidents
+  b.noteOpen("p#k", 6000.0)
+  b.settle("p#k", "", "refused", "credential", "x", undefined, 6000.0, 0.5)
+  expect(b.incidentList().length).toBe(3)
+})

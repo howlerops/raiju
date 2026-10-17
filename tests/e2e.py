@@ -309,6 +309,8 @@ def write_config():
     cfg["providers"]["bedrock_batch"] = {"custom_provider_config": {"base_provider_type": "bedrock"}, "keys": [{"name": "bk-batch", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1", "batch_role_arn": "arn:aws:iam::123456789012:role/batch", "batch_s3_config": {"buckets": [{"bucket_name": "e2e-files", "prefix": "jobs", "is_default": True}]}}}], "network_config": {"base_url": MOCK}}
     # TypeSafe's System One on the mock, under /ts (the decision API, its native routes, and the decision classifier)
     cfg["providers"]["typesafe"] = {"keys": [{"name": "ts", "value": "ts-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/ts"}}
+    # xAI on the mock: its realtime API is relayed to /v1/realtime on the same origin
+    cfg["providers"]["xai"] = {"keys": [{"name": "xk", "value": "xai-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK}}
     path = os.path.join(BUILD, "e2e.config.json")
     json.dump(cfg, open(path, "w"))
     # the complexity classifiers that ask a model: a decision model, a chat model, and embeddings (the exemplars are
@@ -350,7 +352,8 @@ def write_config():
     for name, on in [("owner", True), ("owner-off", False)]:
         ow = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "refuse_unpriced_models": on},
               "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
-              "cache": {"enabled": True, "ttl_seconds": 60, "scope_by_virtual_key": on},
+              # scope_by_virtual_key is left unset on "owner" so the check covers its default (on, L114)
+              "cache": {"enabled": True, "ttl_seconds": 60, **({} if on else {"scope_by_virtual_key": False})},
               "governance": {"budgets": [{"id": "ob", "max_limit": 5, "reset_duration": "1d"}],
                              "virtual_keys": [{"id": "vk-ob", "value": "sk-bf-owner-budget", "budget_id": "ob"}, {"id": "vk-oa", "value": "sk-bf-owner-a"}],
                              "pricing_overrides": [{"id": "po-own", "name": "own", "scope_kind": "global", "match_type": "exact", "pattern": "priced-by-override", "request_types": ["chat_completion"], "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}]}}
@@ -753,6 +756,110 @@ def discovery_and_proxy():
             p.terminate()
         for srv in servers:
             srv.shutdown()
+
+FEED_A = "http://127.0.0.1:18109"  # two clustered nodes of the live feed (mesh peers of each other)
+FEED_B = "http://127.0.0.1:18113"
+
+def feed_frames(ws, stop):
+    """The messages a /ws socket delivers, up to and including the first of type stop; batch arrays are opened."""
+    out = []
+    for _ in range(200):
+        m = ws.recv()
+        if m is None:
+            break
+        obj = json.loads(m)
+        for o in (obj if isinstance(obj, list) else [obj]):
+            out.append(o)
+            if isinstance(o, dict) and o.get("type") == stop:
+                return out
+    return out
+
+def feed_cluster_e2e():
+    """The live feed across two clustered nodes: an event written on one node reaches the /ws of the other with its
+    node and id; a client resumes from its last id on either node and gets what it missed; a cursor older than the
+    ring reports the gap; batch clients get arrays; a bad cursor and an unsigned relay are refused."""
+    d = os.path.join(BUILD, "e2e-feed")
+    os.makedirs(d, exist_ok=True)
+    provider = {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}
+    secret = "e2e-feed"
+    def write(name, node, peer):
+        path = os.path.join(d, name + ".json")
+        cfg = {"client": {"enable_logging": True, "enforce_auth_on_inference": False}, "providers": provider,
+               "logs_store": {"enabled": True, "dir": os.path.join(d, name + "-logs")},
+               "cluster": {"enabled": True, "node_id": node, "secret": secret, "interval_ms": 200, "peers": [peer], "feed": {"batch_ms": 100}}}
+        json.dump(cfg, open(path, "w"))
+        return path
+    cfgs = {"fa": write("fa", "feed-a", FEED_B), "fb": write("fb", "feed-b", FEED_A)}
+    body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    procs = []
+    try:
+        for name, port in [("fa", "18109"), ("fb", "18113")]:
+            procs.append(subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", port, "-host", "127.0.0.1", "-config", cfgs[name]], env=os.environ.copy(), stderr=open(os.path.join(d, name + ".log"), "w")))
+        for base in [FEED_A, FEED_B]:
+            wait(base + "/health")
+
+        ws_b = WsClient("/ws", ADMIN, port=18113)
+        check("the feed socket of node b opens", ws_b.status == 101, ws_b.status)
+        chat_codes = [call("POST", "/v1/chat/completions", body, base=FEED_A, auth=False)[0] for _ in range(3)]
+        check("node a answers the chats", chat_codes == [200, 200, 200], chat_codes)
+        evs = []
+        for _ in range(60):
+            if len(evs) >= 3:
+                break
+            m = ws_b.recv()
+            if m is None:
+                break
+            o = json.loads(m)
+            if isinstance(o, dict) and o.get("type") == "log":
+                evs.append(o)
+        check("an event written on node a reaches node b's socket, with its node and id",
+              len(evs) == 3 and all(e["node"] == "feed-a" and e["id"] == f"feed-a:{e['seq']}" for e in evs), evs[:1])
+        seqs = [e["seq"] for e in evs]
+        check("the sequence rises with each event of a node", len(set(seqs)) == 3 and seqs == sorted(seqs), seqs)
+        last = evs[-1]["id"]
+        ws_b.close()
+
+        chat_codes = [call("POST", "/v1/chat/completions", body, base=FEED_A, auth=False)[0] for _ in range(2)]
+        time.sleep(0.6)  # the relay runs every 100 ms; the two new events are on node b before it resumes
+        ws_r = WsClient("/ws?since=" + last, ADMIN, port=18113)
+        rs = feed_frames(ws_r, "resumed")
+        ws_r.close()
+        replay = [o for o in rs if o.get("type") == "log"]
+        resumed = rs[-1] if rs else {}
+        check("a client that resumes on node b gets the two events it missed, and no others",
+              len(replay) == 2 and all(o["node"] == "feed-a" and o["seq"] > evs[-1]["seq"] for o in replay) and resumed.get("type") == "resumed" and resumed["data"]["gaps"] == 0,
+              (last, [o.get("id") for o in rs]))
+        ws_a = WsClient("/ws?since=" + last, ADMIN, port=18109)
+        ra = feed_frames(ws_a, "resumed")
+        ws_a.close()
+        check("the same cursor on node a replays the same events", [o.get("id") for o in ra if o.get("type") == "log"] == [o["id"] for o in replay], [o.get("id") for o in ra])
+
+        ws_g = WsClient("/ws?since=feed-a:1", ADMIN, port=18113)
+        gs = feed_frames(ws_g, "resumed")
+        ws_g.close()
+        gaps = [o for o in gs if o.get("type") == "gap"]
+        check("a cursor older than the ring is told what it cannot replay",
+              len(gaps) == 1 and gaps[0]["data"]["node"] == "feed-a" and gaps[0]["data"]["missing"] > 0, gs[:2])
+
+        ws_p = WsClient("/ws?batch=1", ADMIN, port=18113)
+        call("POST", "/v1/chat/completions", body, base=FEED_A, auth=False)
+        arr = json.loads(ws_p.recv() or "null")
+        check("a batch client gets its events in one JSON array", isinstance(arr, list) and any(isinstance(o, dict) and o.get("node") == "feed-a" for o in arr), arr if not isinstance(arr, list) else arr[:1])
+        ws_p.close()
+
+        bad = WsClient("/ws?since=oops", ADMIN, port=18113)
+        check("a cursor that is not node:seq pairs is refused", bad.status == 400, bad.status)
+        s, _, mb = call("GET", "/metrics", base=FEED_B, auth=False)
+        replayed = [float(line.split()[-1]) for line in mb.splitlines() if line.startswith("raiju_feed_replayed_total")]
+        check("the metrics count the replayed events", bool(replayed) and replayed[0] >= 2, replayed)
+        s, _, ma = call("GET", "/metrics", base=FEED_A, auth=False)
+        relayed = [float(line.split()[-1]) for line in ma.splitlines() if line.startswith("raiju_feed_relayed_total")]
+        check("the metrics count the relayed events", bool(relayed) and relayed[0] >= 5, relayed)
+        s, _, _ = call("POST", "/api/cluster/feed", "{}", {"x-raiju-cluster-sig": "00"}, base=FEED_B, auth=False)
+        check("the feed relay needs the cluster secret", s == 401, s)
+    finally:
+        for p in procs:
+            p.terminate()
 
 BROKER_URL = "http://127.0.0.1:18133"  # the broker process (cluster_config.broker.listen_port)
 BROKER_NODES = ["http://127.0.0.1:18134", "http://127.0.0.1:18135"]  # two nodes that have no peers
@@ -1613,6 +1720,185 @@ def l97p_e2e(env):
     finally:
         gw.terminate()
 
+GW_L104 = "http://127.0.0.1:18185"  # a refused key is held out of rotation, listed with its reason, and released; the history of its incident
+
+def l104_e2e(env):
+    """Adaptive load balancing: a provider's 401 holds that key out of rotation (the other key serves every request),
+    the held-keys view names the class, the provider's reason and the first wait, the key is not sent again while it is
+    held, the incident history lists it (and filters, pages and rejects bad windows), and a release closes it. Its own
+    gateway (18185)."""
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "bad", "value": "sk-bad-key-l104", "models": [], "weight": 1.0},
+                                          {"name": "good", "value": "sk-l104-good", "models": [], "weight": 1.0}],
+                                 "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    path = os.path.join(BUILD, "e2e.l104.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18185", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l104.log"), "w"))
+    try:
+        wait(GW_L104 + "/health")
+        msgs = [{"role": "user", "content": "hi"}]
+        served = 0
+        held = []
+        # keep asking until the bad key has been picked once and held (each request picks it about half the time)
+        for _ in range(30):
+            s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msgs}, None, base=GW_L104, auth=False)
+            served += 1 if s == 200 else 0
+            hs, _, hb = call("GET", "/api/adaptive-routing/held-keys", None, None, base=GW_L104, auth=False)
+            held = [r for r in json.loads(hb)["held_keys"] if r["target"] == "openai#bad"] if hs == 200 else []
+            if held:
+                break
+        check("chats are served while the refused key is being found", served > 0, served)
+        check("the refused key is held with the provider's class, reason and first wait", len(held) == 1 and held[0]["failure_class"] == "credential" and held[0]["reason"] == "invalid api key" and held[0]["state"] == "held" and held[0]["rung"] == 0 and 27 <= held[0]["wait_seconds"] <= 33 and held[0]["provider"] == "openai" and held[0]["key_id"] == "bad", held[:1])
+        sent_before = len([x for x in seen() if "bad-key-l104" in x["auth"]])
+        for _ in range(4):
+            s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msgs}, None, base=GW_L104, auth=False)
+            served += 1 if s == 200 else 0
+        sent_after = len([x for x in seen() if "bad-key-l104" in x["auth"]])
+        check("while it is held, the refused key is not sent a request and every chat is served", sent_after == sent_before and served >= 5, (sent_before, sent_after, served))
+        s, _, b = call("GET", "/api/adaptive-routing/incidents", None, None, base=GW_L104, auth=False)
+        check("the open incident lists the held key", s == 200 and json.loads(b)["total"] == 1 and json.loads(b)["incidents"][0]["target"] == "openai#bad" and json.loads(b)["incidents"][0]["status"] == "attention", (s, b[:300]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues", None, None, base=GW_L104, auth=False)
+        d = json.loads(b) if s == 200 else {"issues": []}
+        check("the history lists the incident with its class, reason and no resolve time", s == 200 and d["total"] == 1 and d["issues"][0]["failure_class"] == "credential" and d["issues"][0]["reason"] == "invalid api key" and d["issues"][0]["status"] == "attention" and "resolved_at" not in d["issues"][0] and d["matched_summary"]["attention"] == 1, (s, b[:400]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?statuses=resolved", None, None, base=GW_L104, auth=False)
+        check("a status filter that matches nothing returns no issues", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?from=2000-01-01T00:00:00Z&to=2000-01-02T00:00:00Z", None, None, base=GW_L104, auth=False)
+        check("a window before the incident has none", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?limit=1&offset=0&sort=newest", None, None, base=GW_L104, auth=False)
+        check("a page of the history", s == 200 and json.loads(b)["total"] == 1 and len(json.loads(b)["issues"]) == 1, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?sort=sideways", None, None, base=GW_L104, auth=False)
+        check("an unknown sort is refused", s == 400, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?offset=-1", None, None, base=GW_L104, auth=False)
+        check("a negative offset is refused", s == 400, (s, b[:200]))
+        s, _, b = call("POST", "/api/adaptive-routing/history/issues", {}, None, base=GW_L104, auth=False)
+        check("the history route takes GET", s == 405, (s, b[:200]))
+        s, _, b = call("POST", "/api/adaptive-routing/conditions/clear", {"keys": ["openai#bad"]}, None, base=GW_L104, auth=False)
+        check("releasing the held key closes one hold", s == 200 and json.loads(b)["count"] == 1, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/held-keys", None, None, base=GW_L104, auth=False)
+        check("no key is held after the release", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?statuses=resolved", None, None, base=GW_L104, auth=False)
+        d = json.loads(b) if s == 200 else {"issues": []}
+        check("the released incident is resolved and keeps its resolve time", s == 200 and d["total"] == 1 and d["issues"][0]["status"] == "resolved" and "resolved_at" in d["issues"][0] and d["matched_summary"]["median_resolve_seconds"] is not None, (s, b[:400]))
+    finally:
+        gw.terminate()
+
+
+GW_G41 = "http://127.0.0.1:18183"  # rate-limit shares per project member, RBAC roles by id, profiles attached to roles, cycles overrides across a boot
+
+def g41_e2e(env):
+    """The governance remainder (L103): a project member's rate-limit share and an equal split's refusal, RBAC roles
+    by id, access profiles attached to roles (a held profile governs its holder's keys), a user's role by id, and
+    cycles overrides whose cycles are counted from when they were set. Its own gateway (18183)."""
+    import datetime
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    def stamp(days):
+        return (now - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-g41", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-g41-root")},
+                      {"name": "ann", "role": "viewer"},
+                      {"name": "bo", "role": "viewer"},
+                      {"name": "dan", "role": "ops"}],
+            "roles": [{"name": "ops"}, {"name": "dev"}],
+            "access_profiles": [{"id": "p-ops", "name": "Ops models", "allowed_models": ["openai/gpt-4o-mini"]}],
+            "budgets": [{"id": "b-pj", "max_limit": 100, "reset_duration": "1M"},
+                        {"id": "b-cy1", "max_limit": 10, "reset_duration": "1d", "override": {"amount": 5, "mode": "cycles", "cycles": 2, "started_at": stamp(1.5)}},
+                        {"id": "b-cy2", "max_limit": 10, "reset_duration": "1d", "override": {"amount": 5, "mode": "cycles", "cycles": 2, "started_at": stamp(2.5)}}],
+            "rate_limits": [{"id": "rl-pj", "request_max_limit": 10, "request_reset_duration": "1d"},
+                            {"id": "rl-small", "request_max_limit": 1, "request_reset_duration": "1d"}],
+            "projects": [{"id": "pj", "name": "eval", "budget_id": "b-pj", "rate_limit_id": "rl-pj", "members": [{"id": "m-ann", "user_id": "ann"}, {"id": "m-bo", "user_id": "bo"}]}],
+            "virtual_keys": [
+                {"id": "vk-a", "name": "ann-key", "value": "sk-bf-g41-ann-0123456789abcdef", "user_id": "ann", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-b", "name": "bo-key", "value": "sk-bf-g41-bo-0123456789abcdef", "user_id": "bo", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-d", "name": "dan-key", "value": "sk-bf-g41-dan-0123456789abcdef", "user_id": "dan", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-c1", "name": "cy1-key", "value": "sk-bf-g41-c1-0123456789abcdef", "budget_id": "b-cy1", "provider_configs": [{"provider": "openai"}]},
+                {"id": "vk-c2", "name": "cy2-key", "value": "sk-bf-g41-c2-0123456789abcdef", "budget_id": "b-cy2", "provider_configs": [{"provider": "openai"}]},
+            ],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.g41.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18183", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.g41.log"), "w"))
+    root = {"authorization": "Bearer sk-admin-g41-root"}
+    def adm(method, p, body=None, who=root):
+        return call(method, p, body, dict(who), base=GW_G41, auth=False)
+    def chat_as(vk, model, project=None):
+        h = {"x-bf-vk": vk}
+        if project is not None:
+            h["x-bf-project-id"] = project
+        return call("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": "hi"}]}, h, base=GW_G41, auth=False)
+    try:
+        wait(GW_G41 + "/health")
+        s, _, b = adm("PUT", "/api/governance/projects/pj/members/m-ann", {"rate_limit_shares": [{"source_rate_limit_id": "rl-pj", "request_share": 2}]})
+        check("a member's rate-limit share is set under split none", s == 200 and json.loads(b)["member"]["rate_limit_shares"][0]["request_share"] == 2, (s, b[:300]))
+        s, _, b = adm("PUT", "/api/governance/projects/pj/members/m-ann", {"rate_limit_shares": [{"source_rate_limit_id": "rl-other", "request_share": 2}]})
+        check("a rate-limit share on a limit the project does not hold is refused", s == 400, (s, b[:200]))
+        s1, _, _ = chat_as("sk-bf-g41-ann-0123456789abcdef", "openai/gpt-4o-mini", "pj")
+        s2, _, _ = chat_as("sk-bf-g41-ann-0123456789abcdef", "openai/gpt-4o-mini", "pj")
+        s3, _, b3 = chat_as("sk-bf-g41-ann-0123456789abcdef", "openai/gpt-4o-mini", "pj")
+        check("a member is held to her slice of the project's requests", s1 != 429 and s2 != 429 and s3 == 429 and "rate_limit_exceeded" in b3, (s1, s2, s3, b3[:200]))
+        s, _, _ = chat_as("sk-bf-g41-bo-0123456789abcdef", "openai/gpt-4o-mini", "pj")
+        check("another member keeps the project's own limit", s != 429, (s,))
+        s, _, b = adm("POST", "/api/governance/projects", {"id": "pe", "name": "pe", "rate_limit_id": "rl-small", "split_policy": "equal"})
+        check("an equal split project is created", s == 201, (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/projects/pe/members", {"members": [{"user_id": "ann"}, {"user_id": "bo"}]})
+        check("an equal split is refused when the limit has fewer requests than members", s == 400 and "equal split" in b, (s, b[:200]))
+
+        s, _, b = adm("GET", "/api/governance/rbac/roles/1")
+        check("a role is read by its id in Bifrost's shape", s == 200 and json.loads(b)["role"]["name"] == "ops" and json.loads(b)["role"]["id"] == 1, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/governance/rbac/roles/2", {"description": "developers"})
+        check("a role is updated by its id, keeping what it leaves out", s == 200 and json.loads(b)["role"]["description"] == "developers" and json.loads(b)["role"]["name"] == "dev", (s, b[:200]))
+        s, _, b = adm("GET", "/api/roles/dev")
+        check("the name route shows the same role with its id", s == 200 and '"id":2' in b and '"description":"developers"' in b, (s, b[:200]))
+        s, _, b = adm("GET", "/api/governance/rbac/roles/9")
+        check("an unknown role id is not found", s == 404, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/governance/rbac/roles/2", {"name": "renamed"})
+        check("a role cannot be renamed by id", s == 400, (s, b[:200]))
+
+        s, _, b = adm("POST", "/api/governance/access-profiles/p-ops/roles", {"role_ids": [1], "is_default": True, "apply_to_existing": True})
+        check("a profile is attached to a role, and the role's holders are counted", s == 200 and json.loads(b)["users_applied"] == 1, (s, b[:200]))
+        s, _, b = adm("POST", "/api/governance/access-profiles/p-ops/roles", {"role_ids": [9]})
+        check("a role id that names no custom role is refused", s == 400, (s, b[:200]))
+        s, _, b = chat_as("sk-bf-g41-dan-0123456789abcdef", "openai/gpt-4o")
+        check("the profile a user holds through the role governs their key", s == 403 and "permission_error" in b, (s, b[:200]))
+        s, _, b = chat_as("sk-bf-g41-dan-0123456789abcdef", "openai/gpt-4o-mini")
+        check("the models the held profile allows still go through", s != 403, (s, b[:200]))
+        s, _, b = chat_as("sk-bf-g41-ann-0123456789abcdef", "openai/gpt-4o")
+        check("a user who holds no profile is not governed by it", s != 403, (s, b[:200]))
+        s, _, b = adm("GET", "/api/users/dan/access-profiles")
+        check("the user's held profiles include the one from the role", s == 200 and "Ops models" in b, (s, b[:200]))
+        s, _, b = adm("DELETE", "/api/governance/access-profiles/p-ops")
+        check("a profile attached to a role cannot be deleted", s == 409, (s, b[:200]))
+
+        s, _, b = adm("PUT", "/api/users/dan/role", {"role_id": 2})
+        check("a user's role is set by role id", s == 200 and json.loads(b)["role"] == "dev", (s, b[:200]))
+        s, _, b = adm("GET", "/api/users/dan/role")
+        check("the role change is kept", s == 200 and json.loads(b)["role"] == "dev", (s, b[:200]))
+        s, _, b = chat_as("sk-bf-g41-dan-0123456789abcdef", "openai/gpt-4o")
+        check("after the role changes, the role's profile no longer governs", s != 403, (s, b[:200]))
+        s, _, b = adm("PUT", "/api/users/dan/role", {"role_id": 9})
+        check("a role id that names no custom role is refused for a user", s == 400, (s, b[:200]))
+        s, _, b = adm("DELETE", "/api/governance/access-profiles/p-ops/roles/1")
+        check("a role is detached from a profile", s == 200, (s, b[:200]))
+        s, _, b = adm("DELETE", "/api/governance/access-profiles/p-ops/roles/1")
+        check("a role that is not attached cannot be detached again", s == 404, (s, b[:200]))
+
+        s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-g41-c1-0123456789abcdef"}, base=GW_G41, auth=False)
+        check("a cycles override set 1.5 days ago keeps the one cycle left after a boot", s == 200 and json.loads(b)["budgets"][0]["effective_max_limit"] == 15, (s, b[:300]))
+        s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-g41-c2-0123456789abcdef"}, base=GW_G41, auth=False)
+        check("a cycles override whose cycles ran out before the boot adds nothing", s == 200 and json.loads(b)["budgets"][0]["effective_max_limit"] == 10, (s, b[:300]))
+    finally:
+        gw.terminate()
+
 MCP_KEYS = "http://127.0.0.1:18123"  # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients
 
 MCP_KEYS_SPEC = json.dumps({"openapi": "3.0.3", "info": {"title": "Raiju self", "version": "1"}, "paths": {"/api/version": {"get": {"operationId": "version", "summary": "The gateway's version"}}}})
@@ -2465,6 +2751,42 @@ def l97s_config_b() -> dict:
     }
 
 
+GW_L110 = "http://127.0.0.1:18160"  # raw payloads of streamed answers and the content-logging switch; the overhead histogram
+
+def l110_e2e(env):
+    """L110: x-bf-store-raw-request-response keeps a streamed answer's upstream body in the log, up to the size cap,
+    and x-bf-disable-content-logging keeps neither raw payload. Its own gateway (18160)."""
+    import shutil
+    logs_dir = os.path.join(BUILD, "e2e-l110-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "allow_per_request_content_storage_override": True},
+        "logs_store": {"enabled": True, "dir": logs_dir},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "s", "value": "sk-l110", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    path = os.path.join(BUILD, "e2e.l110.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18160", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.l110.log"), "w"))
+    try:
+        wait(GW_L110 + "/health")
+        msg = lambda text: [{"role": "user", "content": text}]
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": msg("raw-l110-stream")}, {"x-bf-store-raw-request-response": "true"}, base=GW_L110, auth=False)
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L110, auth=False)[2])["entries"]
+        mine = [e for e in entries if "raw-l110-stream" in (e.get("raw_request") or "")]
+        check("x-bf-store-raw-request-response keeps a streamed answer's upstream body in the log", s == 200 and len(mine) == 1 and "data:" in (mine[0].get("raw_response") or ""), (s, b[:200], mine[:1]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": msg("raw-l110-off")}, {"x-bf-store-raw-request-response": "true", "x-bf-disable-content-logging": "true"}, base=GW_L110, auth=False)
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L110, auth=False)[2])["entries"]
+        mine = [e for e in entries if "raw-l110-off" in (e.get("raw_request") or "") or "raw-l110-off" in (e.get("input") or "")]
+        check("x-bf-disable-content-logging keeps no raw payload for a request that asked to store it", s == 200 and len(mine) == 0, (s, b[:200], mine[:1]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("raw-l110-plain")}, base=GW_L110, auth=False)
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L110, auth=False)[2])["entries"]
+        # the newest entry is this request (the list is newest first); no header, so no raw payload
+        check("without the header a plain request keeps no raw payload", s == 200 and len(entries) > 0 and entries[0].get("raw_request") is None and entries[0].get("raw_response") is None, (s, entries[:1]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def l97s_e2e(env):
     """Streamed text completions and Responses answers under the output guards: a phone number is redacted as the
     stream goes, a forbidden word ends the stream with the format's error event, and an answer built whole is
@@ -2502,6 +2824,83 @@ def l97s_e2e(env):
         mine = [e for e in entries if e.get("model") == "anthropic/pii-anthropic" and e.get("ts", 0) >= t0]
         details = [json.loads(call("GET", "/api/logs/" + e["id"], base=GW_L97S_B)[2]) for e in mine]
         check("the log keeps the redacted answer, for the call and the cached replay, and no raw upstream stream", len(details) == 2 and all("[REDACTED:PHONE]" in json.dumps(d) and "555-1234" not in json.dumps(d) and not d.get("raw_response") for d in details), [{k: str(d.get(k))[:200] for k in ("cache_hit", "output", "raw_response")} for d in details])
+    finally:
+        gw_a.terminate()
+        gw_b.terminate()
+
+
+GW_L107_A = "http://127.0.0.1:18187"  # built-in guard on streams, tool names in the log, legacy completion and cursor Responses streams
+GW_L107_B = "http://127.0.0.1:18188"  # built-in block on streams, and the replay pacing of a cached stream
+
+
+def l107_config_a() -> dict:
+    """The L107 gateway A: the mock as OpenAI and Anthropic, the built-in guard redacting e-mail addresses on the output, and the log kept."""
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l107-logs"), "content_logging": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "m", "value": "sk-l107", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-l107", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "guardrails": {"enabled": True, "apply_to": "output", "mode": "redact", "detect": ["email"]},
+    }
+
+
+def l107_config_b() -> dict:
+    """The L107 gateway B: the built-in guard blocking e-mail addresses on the output, the cache on, and a replay interval of 60 ms."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "cache": {"enabled": True, "ttl_seconds": 60},
+        "providers": {
+            "openai": {"keys": [{"name": "m", "value": "sk-l107-b", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-l107-b", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "guardrails": {"enabled": True, "apply_to": "output", "mode": "block", "detect": ["email"], "stream_replay_event_interval_ms": 60},
+    }
+
+
+def l107_e2e(env):
+    """Streams under the built-in guard and the stream routes that now stream: an e-mail address is redacted or blocks a
+    streamed answer, the tool names of a streamed answer reach the log, a legacy completion streams legacy events, a
+    Responses-shaped /cursor request streams chat chunks, and a cached stream replays paced under a block-capable guard.
+    Their own gateways."""
+    cfg_a = os.path.join(BUILD, "e2e.l107.a.json")
+    cfg_b = os.path.join(BUILD, "e2e.l107.b.json")
+    json.dump(l107_config_a(), open(cfg_a, "w"))
+    json.dump(l107_config_b(), open(cfg_b, "w"))
+    gw_a = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18187", "-host", "127.0.0.1", "-config", cfg_a, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l107.a.log"), "w"))
+    gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18188", "-host", "127.0.0.1", "-config", cfg_b, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l107.b.log"), "w"))
+    try:
+        wait(GW_L107_A + "/health")
+        wait(GW_L107_B + "/health")
+        msgs = [{"role": "user", "content": "hi"}]
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/email-chat", "stream": True, "messages": msgs}, None, base=GW_L107_A, auth=False)
+        check("the built-in guard redacts an e-mail address in a streamed answer", s == 200 and "jane.doe" not in b and "[REDACTED:EMAIL] today" in b and "[DONE]" in b, (s, b[:400]))
+        t_tools = time.time() * 1000
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/tools-chat", "stream": True, "messages": msgs}, None, base=GW_L107_A, auth=False)
+        check("a streamed answer with tool calls streams them", s == 200 and "get_weather" in b and "lookup_city" in b, (s, b[:300]))
+        entries = json.loads(call("GET", "/api/logs?limit=50", base=GW_L107_A)[2])["entries"]
+        mine = [e for e in entries if str(e.get("model", "")).endswith("tools-chat") and e.get("ts", 0) >= t_tools]
+        check("the log records the tool names of a streamed answer, once each", len(mine) == 1 and mine[0].get("tool_call_names") == ["get_weather", "lookup_city"], [e.get("tool_call_names") for e in mine])
+        s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/legacy-stream", "prompt": "\n\nHuman: hi\n\nAssistant:", "max_tokens_to_sample": 50, "stream": True}, None, base=GW_L107_A, auth=False)
+        check("a streamed legacy completion streams completion events with the legacy stop reason", s == 200 and "event: completion" in b and '"completion":"hi"' in b and '"stop_reason":"stop_sequence"' in b and "message_start" not in b, (s, b[:400]))
+        s, _, b = call("POST", "/cursor/v1/chat/completions", {"model": "openai/cursor-stream", "input": "hi", "stream": True}, None, base=GW_L107_A, auth=False)
+        check("a streamed Responses-shaped /cursor request streams chat chunks", s == 200 and "chat.completion.chunk" in b and "Hello" in b and "event: response" not in b and "[DONE]" in b, (s, b[:400]))
+
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/email-chat", "stream": True, "messages": msgs}, None, base=GW_L107_B, auth=False)
+        check("a block on the built-in guard ends a streamed answer with the error event", s == 200 and "guardrail_violation" in b and "@example.com" not in b and "[DONE]" in b, (s, b[:400]))
+        probe = {"model": "anthropic/pii-anthropic", "stream": True, "input": "pace-probe-l107"}
+        s1, _, b1 = call("POST", "/v1/responses", probe, None, base=GW_L107_B, auth=False)
+        t0 = time.time()
+        s2, _, b2 = call("POST", "/v1/responses", probe, None, base=GW_L107_B, auth=False)
+        elapsed = time.time() - t0
+        upstream = [x for x in seen() if "pace-probe-l107" in x["body"]]
+        events = b2.count("\n\n")
+        check("a cached stream replays paced under a block-capable guard", s1 == 200 and s2 == 200 and "call 555-1234 now" in b2 and len(upstream) == 1 and events >= 4 and elapsed >= 0.05 * (events - 1), (s1, s2, elapsed, events, len(upstream), b2[:300]))
     finally:
         gw_a.terminate()
         gw_b.terminate()
@@ -2672,6 +3071,57 @@ def l97i_e2e(env):
             gw_b.terminate()
 
 
+GW_L109 = "http://127.0.0.1:18157"  # decisions: unprefixed routes, decision pricing overrides, native-decision checks under compat
+
+
+def l109_config() -> dict:
+    """TypeSafe and OpenRouter on the mock, compat's decision emulation on, and two pricing overrides on TypeSafe's
+    jev-latest: a chat-only one that must not reach decisions, and one with a decision rate."""
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "compat": {"convert_decision_to_responses": True}},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l109-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "typesafe": {"keys": [{"name": "ts-l109", "value": "ts-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/ts", "max_retries": 0}},
+            "openrouter": {"keys": [{"name": "or-l109", "value": "or-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/or", "max_retries": 0}},
+        },
+        "governance": {"pricing_overrides": [
+            {"id": "l109-chat", "name": "chat only", "scope_kind": "global", "request_types": ["chat_completion"], "match_type": "exact", "pattern": "jev-latest", "pricing_patch": json.dumps({"input_cost_per_token": 1.0})},
+            {"id": "l109-decisions", "name": "decisions", "scope_kind": "global", "request_types": ["decisions"], "match_type": "exact", "pattern": "jev-latest", "pricing_patch": json.dumps({"input_cost_per_token_decisions": 0.00001})},
+        ]},
+    }
+
+
+def l109_e2e(env):
+    """The unprefixed decision routes, the decision pricing override in the request log, and the native-decision
+    check under compat (OpenRouter's TypeSafe models stay native, its chat models are emulated): their own gateway."""
+    cfg_path = os.path.join(BUILD, "e2e.l109.json")
+    json.dump(l109_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18157", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l109.log"), "w"))
+    try:
+        wait(GW_L109 + "/health")
+        dbody = {"model": "typesafe/jev-latest", "input": "Customer message: I was double charged.", "questions": [{"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?", "criteria": {"true": "angry", "false": "calm"}}]}
+        s, _, b = call("POST", "/v1/decisions", dbody, base=GW_L109, auth=False)
+        check("a native decision answers on /v1/decisions", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75, (s, b[:300]))
+        for path in ("/openai/decisions", "/openai/v1/decisions", "/litellm/decisions", "/langchain/v1/decisions", "/pydanticai/decisions"):
+            s, _, b = call("POST", path, dbody, base=GW_L109, auth=False)
+            check(f"{path} serves decisions, as Bifrost mounts it", s == 200 and json.loads(b)["answers"][0].get("name") == "is_frustrated", (s, b[:200]))
+        s, _, b = call("POST", "/decisions", dbody, base=GW_L109, auth=False)
+        check("a bare /decisions is not a route, as in Bifrost", s != 200, (s, b[:200]))
+        s, _, b = call("GET", "/api/logs?providers=typesafe", base=GW_L109, auth=False)
+        costs = [float(x.get("cost") or 0) for x in json.loads(b).get("logs", [])] if s == 200 else []
+        check("each decision is billed at the decision rate, and the chat-only override does not reach it",
+              sum(1 for c in costs if abs(c - 0.00017) < 1e-9) >= 6 and not any(abs(c - 17.0) < 1e-6 for c in costs), (s, costs[:20]))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "openrouter/typesafe/jev-latest"}, base=GW_L109, auth=False)
+        check("OpenRouter's TypeSafe models are decided natively under compat", s == 200 and seen()[-1]["path"] == "/or/alpha/decisions", (s, b[:300]))
+        s, h, b = call("POST", "/v1/decisions", {**dbody, "model": "openrouter/openai/gpt-4o-mini"}, base=GW_L109, auth=False)
+        check("a model OpenRouter does not decide natively is emulated under compat, not sent to its decisions route",
+              seen()[-1]["path"] == "/or/v1/chat/completions" and hdr(h, "x-bifrost-converted-request-type") != "responses", (s, seen()[-1:], b[:200]))
+    finally:
+        gw.terminate()
+
+
 GW_L97H = "http://127.0.0.1:18144"  # provider model lists (Bedrock, Vertex, Cloudflare), Vertex count tokens, OpenRouter decisions
 
 
@@ -2770,6 +3220,7 @@ def l97q_config() -> dict:
             "bedrock": {"keys": [{"name": "bk-l97q", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
             "wafer": {"keys": [{"name": "wf-l97q", "value": "wf-key", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK + "/wafer", "max_retries": 0}},
             "openrouter": {"keys": [{"name": "or-l97q", "value": "or-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/or", "max_retries": 0}},
+            "orflat": {"keys": [{"name": "orf-l97q", "value": "or-key", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK + "/or", "max_retries": 0}, "ignore_provider_cost": True},
             "aliased": {"keys": [{"name": "al-l97q", "value": "sk-alias", "models": [], "weight": 1.0, "aliases": {"house-best": {"model_id": "gpt-4o-mini", "model_name": "gpt-4o", "model_family": "openai"}, "plain": "gpt-4o-mini"}}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
         },
     }
@@ -2815,12 +3266,88 @@ def l97q_e2e(env):
         s, _, b = call("GET", "/api/logs?providers=openrouter", base=GW_L97Q, auth=False)
         logs = json.loads(b).get("logs", []) if s == 200 else []
         check("openrouter chat is billed at usage.cost, not the datasheet price", any(abs(float(x.get("cost") or 0) - 0.00123) < 1e-9 for x in logs), (s, b[:300]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openrouter/openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
+        check("openrouter streamed chat answers", s == 200 and "billed " in b and "stream" in b and "[DONE]" in b, (s, b[:300]))
+        s, _, b = call("GET", "/api/logs?providers=openrouter", base=GW_L97Q, auth=False)
+        logs = json.loads(b).get("logs", []) if s == 200 else []
+        check("openrouter streamed chat is billed at its usage chunk's usage.cost", any(abs(float(x.get("cost") or 0) - 0.00456) < 1e-9 for x in logs), (s, b[:300]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "orflat/openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
+        s2, _, b2 = call("GET", "/api/logs?providers=orflat", base=GW_L97Q, auth=False)
+        ol = json.loads(b2).get("logs", []) if s2 == 200 else []
+        check("ignore_provider_cost: a streamed answer's usage.cost is not billed", s == 200 and len(ol) > 0 and not any(abs(float(x.get("cost") or 0) - 0.00456) < 1e-9 for x in ol), (s, b[:200], s2, b2[:200]))
         s, h, b = call("POST", "/v1/chat/completions", {"model": "aliased/house-best", "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
         check("an object-form alias answers and reports its model id, name and family", s == 200 and hdr(h, "x-bifrost-routing-info-alias-model-id") == "gpt-4o-mini" and hdr(h, "x-bifrost-routing-info-alias-model-name") == "gpt-4o" and hdr(h, "x-bifrost-routing-info-alias-model-family") == "openai", (s, h))
         al = [x for x in seen() if x["path"] == "/v1/chat/completions" and "gpt-4o-mini" in x["body"]]
         check("an object-form alias sends its model_id upstream", len(al) > 0 and json.loads(al[-1]["body"])["model"] == "gpt-4o-mini", al[-1:])
         s, h, b = call("POST", "/v1/chat/completions", {"model": "aliased/plain", "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
         check("a plain alias reports its model id and no name or family", s == 200 and hdr(h, "x-bifrost-routing-info-alias-model-id") == "gpt-4o-mini" and hdr(h, "x-bifrost-routing-info-alias-model-name") is None and hdr(h, "x-bifrost-routing-info-alias-model-family") is None, (s, h))
+    finally:
+        gw.terminate()
+
+
+GW_L105 = "http://127.0.0.1:18181"  # Cohere and Azure model retrieve, Replicate polling, edits and files, and text completions on Replicate
+
+
+def l105_config() -> dict:
+    """Cohere (its model object on the mock), Azure (refused as Bifrost does) and Replicate (its predictions, edits and files)."""
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l105-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "cohere": {"keys": [{"name": "co-l105", "value": "co-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/cohere-up", "max_retries": 0}},
+            "azure": {"keys": [{"name": "az-l105", "value": "az-key", "models": [], "weight": 1.0, "azure_key_config": {"endpoint": MOCK + "/azure-up", "api_version": "2024-10-21"}}]},
+            "replicate": {"keys": [{"name": "rp-l105", "value": "r8_e2e", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK + "/replicate", "max_retries": 0}},
+            "bedrock": {"keys": [{"name": "bk-l105", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+
+
+def l105_e2e(env):
+    """Cohere's model retrieve, Azure's refusal, Replicate's images polled past Prefer: wait, its image edits, its
+    file list, retrieve and delete (content refused, as Bifrost), and a text completion."""
+    cfg_path = os.path.join(BUILD, "e2e.l105.json")
+    json.dump(l105_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18181", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l105.log"), "w"))
+    png = b"\x89PNG-l105-bytes"
+    try:
+        wait(GW_L105 + "/health")
+        s, _, b = call("GET", "/v1/models/cohere/command-r-plus", base=GW_L105, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        check("cohere model retrieve reads the model's name, limits and endpoints", s == 200 and r.get("id") == "cohere/command-r-plus" and r.get("name") == "command-r-plus" and r.get("context_length") == 128000 and r.get("supported_methods") == ["chat"] and r.get("owned_by") == "cohere", (s, b[:300]))
+        check("cohere model retrieve sends the key to /v1/models/{model}", seen()[-1]["path"].endswith("/v1/models/command-r-plus") and seen()[-1]["auth"] == "Bearer co-key", seen()[-1:])
+        s, _, b = call("GET", "/v1/models/azure/gpt-4o", base=GW_L105, auth=False)
+        check("azure has no retrieve API in Bifrost, so the list entry answers", s == 200 and json.loads(b).get("owned_by") == "azure" and "listed" in json.loads(b), (s, b[:300]))
+        s, _, b = call("POST", "/v1/images/generations", {"model": "replicate/acme/model-a", "prompt": "slow", "n": 1}, base=GW_L105, auth=False)
+        d = json.loads(b) if s == 200 else {}
+        check("replicate images poll a prediction that is still starting at its get URL", s == 200 and d.get("data", [{}])[0].get("url", "").endswith("/out/polled.png"), (s, b[:300]))
+        s, _, b = mp_form(GW_L105, "/v1/images/edits", [("model", None, "text/plain", "replicate/black-forest-labs/flux-kontext-pro"), ("prompt", None, "text/plain", "a red fox"), ("n", None, "text/plain", "1"), ("image", "in.png", "image/png", png)])
+        d = json.loads(b) if s == 200 else {}
+        check("replicate image edits answer with the output image", s == 200 and d.get("data", [{}])[0].get("url", "").endswith("/out/edit.png"), (s, b[:300]))
+        ed = [x for x in seen() if x["path"] == "/v1/models/black-forest-labs/flux-kontext-pro/predictions"]
+        check("replicate image edits send the image as a data URL in the model's input_image", len(ed) > 0 and '"input_image":"data:image/png;base64,' in ed[-1]["body"] and '"prompt":"a red fox"' in ed[-1]["body"] and '"num_outputs":1' in ed[-1]["body"], ed[-1:])
+        s, _, b = call("GET", "/v1/files?provider=replicate", base=GW_L105, auth=False)
+        lst = json.loads(b) if s == 200 else {}
+        check("replicate files list: the first page with its cursor", s == 200 and [x["id"] for x in lst.get("data", [])] == ["file-e2e-1"] and lst.get("has_more") is True and lst.get("after") == "p2" and lst["data"][0]["purpose"] == "batch" and lst["data"][0]["status"] == "processed", (s, b[:300]))
+        s, _, b = call("GET", "/v1/files?provider=replicate&after=p2", base=GW_L105, auth=False)
+        lst = json.loads(b) if s == 200 else {}
+        check("replicate files list: the next page, without a cursor after it", s == 200 and [x["id"] for x in lst.get("data", [])] == ["file-e2e-2"] and lst.get("has_more") is False and lst["data"][0]["status"] == "uploaded", (s, b[:300]))
+        check("replicate files list sends the cursor upstream", seen()[-1]["path"] == "/v1/files?cursor=p2" and seen()[-1]["auth"] == "Bearer r8_e2e", seen()[-1:])
+        s, _, b = call("GET", "/v1/files/file-e2e-1?provider=replicate", base=GW_L105, auth=False)
+        f = json.loads(b) if s == 200 else {}
+        check("replicate file retrieve answers as an OpenAI file", s == 200 and f.get("id") == "file-e2e-1" and f.get("bytes") == 9 and f.get("filename") == "pic.png" and f.get("status") == "processed", (s, b[:300]))
+        s, _, b = call("DELETE", "/v1/files/file-e2e-1?provider=replicate", base=GW_L105, auth=False)
+        check("replicate file delete answers with the deleted object", s == 200 and json.loads(b) == {"id": "file-e2e-1", "object": "file", "deleted": True}, (s, b[:300]))
+        check("replicate file delete calls the file's URL", seen()[-1]["path"] == "/v1/files/file-e2e-1", seen()[-1:])
+        s, _, b = call("GET", "/v1/files/file-e2e-1/content?provider=replicate", base=GW_L105, auth=False)
+        check("replicate file content is refused, as Bifrost refuses it", s == 400 and "does not support" in b, (s, b[:300]))
+        s, _, b = call("POST", "/v1/images/generations", {"model": "bedrock/stability.stable-image-core-v1:1", "prompt": "a lake", "style_preset": "photographic", "cfg_scale": 7.5}, base=GW_L105, auth=False)
+        st = [x for x in seen() if x["path"].startswith("/model/stability.stable-image-core")]
+        check("bedrock stability generation sends its extra params in the flat body", s == 200 and len(st) > 0 and '"style_preset":"photographic"' in st[-1]["body"] and '"cfg_scale":7.5' in st[-1]["body"] and '"taskType"' not in st[-1]["body"], (s, b[:200], st[-1:]))
+        s, _, b = call("POST", "/v1/completions", {"model": "replicate/acme/model-a", "prompt": "hi there"}, base=GW_L105, auth=False)
+        d = json.loads(b) if s == 200 else {}
+        check("replicate text completions answer as text", s == 200 and "Replicate says: hi there" in (d.get("choices") or [{}])[0].get("text", ""), (s, b[:300]))
     finally:
         gw.terminate()
 
@@ -3081,6 +3608,114 @@ def l97l_e2e(env):
         gw_s.wait()
 
 
+GW_SCIM = "http://127.0.0.1:18170"  # SCIM 2.0 provisioning on, its token read from the environment
+GW_SCIM_OFF = "http://127.0.0.1:18152"  # the same gateway with scim_config off
+SCIM_TOKEN = "scim-" + "e2e-" + "provisioning-7d1f"  # a throwaway token, built from parts
+
+def l115_config(on: bool) -> dict:
+    """The L115 gateway: scim_config with the provisioning token read from env.E2E_SCIM_TOKEN, or off. The admin token (the
+    shared ADMIN header) lets the checks read what SCIM wrote through the management API."""
+    scim = {"enabled": True, "provider": "generic", "config": {"provisioningToken": "env.E2E_SCIM_TOKEN"}} if on else {"enabled": False}
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "scim_config": scim,
+        "governance": {"auth_config": {"token": "admin-secret"}},
+    }
+
+def l115_e2e(env):
+    """SCIM 2.0 at /scim/v2: the bearer token from the environment, discovery, users and groups pushed and read back
+    through the management API, filters and paging, deactivation, deletion, persistence to the config file, the SCIM
+    error shape, and a gateway with scim_config off."""
+    cfg_path = os.path.join(BUILD, "e2e.l115.json")
+    off_path = os.path.join(BUILD, "e2e.l115-off.json")
+    json.dump(l115_config(True), open(cfg_path, "w"))
+    json.dump(l115_config(False), open(off_path, "w"))
+    genv = {**env, "E2E_SCIM_TOKEN": SCIM_TOKEN}
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18170", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=genv, stderr=open(os.path.join(BUILD, "e2e.l115.log"), "w"))
+    gw_off = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18152", "-host", "127.0.0.1", "-config", off_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l115-off.log"), "w"))
+    auth = {"authorization": "Bearer " + SCIM_TOKEN}
+    user_schema = ["urn:ietf:params:scim:schemas:core:2.0:User"]
+    group_schema = ["urn:ietf:params:scim:schemas:core:2.0:Group"]
+    patch_schema = ["urn:ietf:params:scim:api:messages:2.0:PatchOp"]
+    try:
+        wait(GW_SCIM + "/health")
+        wait(GW_SCIM_OFF + "/health")
+        s, h, b = call("GET", "/scim/v2/ServiceProviderConfig", base=GW_SCIM, auth=False)
+        check("scim: no token is refused with the SCIM error shape", s == 401 and hdr(h, "content-type") == "application/scim+json" and '"urn:ietf:params:scim:api:messages:2.0:Error"' in b and '"status":"401"' in b, (s, h, b[:200]))
+        s, h, b = call("GET", "/scim/v2/ServiceProviderConfig", headers={"authorization": "Bearer nope"}, base=GW_SCIM, auth=False)
+        check("scim: a wrong token is refused", s == 401, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/ServiceProviderConfig", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: ServiceProviderConfig advertises the bearer token, patch and filter", s == 200 and "oauthbearertoken" in b and '"patch":{"supported":true}' in b and '"filter":{"supported":true' in b, (s, b[:300]))
+        s, h, b = call("GET", "/scim/v2/ResourceTypes", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: ResourceTypes lists User and Group", s == 200 and '"endpoint":"/Users"' in b and '"endpoint":"/Groups"' in b, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/Schemas", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: Schemas describes the user and group attributes", s == 200 and "userName" in b and "displayName" in b, (s, b[:200]))
+        s, h, b = call("POST", "/scim/v2/Users", {"schemas": user_schema, "userName": "Ana.Lee@Example.com", "active": True, "roles": [{"value": "editor"}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: POST /Users creates the user, lower-cased, with its role", s == 201 and '"userName":"ana.lee@example.com"' in b and '"value":"editor"' in b, (s, b[:300]))
+        check("scim: the created user is saved to the config file", "ana.lee@example.com" in open(cfg_path).read())
+        s, h, b = call("POST", "/scim/v2/Users", {"schemas": user_schema, "userName": "ana.lee@example.com"}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a second push of the same user is a 409 uniqueness error", s == 409 and '"scimType":"uniqueness"' in b, (s, b[:200]))
+        s, h, b = call("GET", "/api/users", headers=ADMIN, base=GW_SCIM, auth=False)
+        users = json.loads(b)["users"] if s == 200 else []
+        check("scim: the user is a Raiju user in the management API", any(u["name"] == "ana.lee@example.com" and u["role"] == "editor" and u["disabled"] is False for u in users), (s, b[:300]))
+        s, h, b = call("POST", "/scim/v2/Users", {"schemas": user_schema, "userName": "Bad Name"}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a user name Raiju cannot hold is refused as invalidValue", s == 400 and '"scimType":"invalidValue"' in b, (s, b[:200]))
+        s, h, b = call("POST", "/scim/v2/Users", {"schemas": user_schema, "userName": "bo@example.com", "roles": [{"value": "ghost"}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a user with no role Raiju knows gets the viewer role", s == 201 and '"value":"viewer"' in b, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/Users?filter=userName%20eq%20%22ana.lee%40example.com%22", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: the filter finds the user by userName", s == 200 and '"totalResults":1' in b and '"userName":"ana.lee@example.com"' in b, (s, b[:300]))
+        s, h, b = call("GET", "/scim/v2/Users?startIndex=2&count=1", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a list pages with startIndex and count", s == 200 and '"itemsPerPage":1' in b and '"totalResults":2' in b and '"userName":"bo@example.com"' in b, (s, b[:300]))
+        s, h, b = call("GET", "/scim/v2/Users?filter=emails.value%20eq%20%22x%22", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a filter on another attribute is refused as invalidFilter", s == 400 and '"scimType":"invalidFilter"' in b, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/Users/ana.lee%40example.com", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: GET /Users/{id} reads an escaped id", s == 200 and '"active":true' in b, (s, b[:200]))
+        s, h, b = call("POST", "/scim/v2/Groups", {"schemas": group_schema, "displayName": "platform", "members": [{"value": "ana.lee@example.com"}]}, headers=auth, base=GW_SCIM, auth=False)
+        g = json.loads(b) if s == 201 else {}
+        gid = g.get("id", "")
+        check("scim: POST /Groups creates a team with its members", s == 201 and g.get("displayName") == "platform" and len(g.get("members", [])) == 1, (s, b[:300]))
+        check("scim: the group is a team in the config file", "platform" in open(cfg_path).read() and gid != "")
+        s, h, b = call("GET", "/api/governance/teams/" + gid + "/members", headers=ADMIN, base=GW_SCIM, auth=False)
+        mem = [m["user_id"] for m in json.loads(b).get("members", [])] if s == 200 else []
+        check("scim: the group's members are the team's members in the management API", mem == ["ana.lee@example.com"], (s, b[:300]))
+        s, h, b = call("POST", "/scim/v2/Groups", {"schemas": group_schema, "displayName": "platform"}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: a second group with the same name is a 409", s == 409, (s, b[:200]))
+        s, h, b = call("PATCH", "/scim/v2/Groups/" + gid, {"schemas": patch_schema, "Operations": [{"op": "add", "path": "members", "value": [{"value": "bo@example.com"}]}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: PATCH adds a member to the group", s == 200 and '"value":"bo@example.com"' in b, (s, b[:300]))
+        s, h, b = call("PATCH", "/scim/v2/Groups/" + gid, {"schemas": patch_schema, "Operations": [{"op": "remove", "path": 'members[value eq "bo@example.com"]'}]}, headers=auth, base=GW_SCIM, auth=False)
+        s2, _, b2 = call("GET", "/api/governance/teams/" + gid + "/members", headers=ADMIN, base=GW_SCIM, auth=False)
+        mem = [m["user_id"] for m in json.loads(b2).get("members", [])] if s2 == 200 else []
+        check("scim: PATCH removes a member by its value filter", s == 200 and mem == ["ana.lee@example.com"], (s, b[:200], mem))
+        s, h, b = call("PATCH", "/scim/v2/Users/ana.lee@example.com", {"schemas": patch_schema, "Operations": [{"op": "replace", "value": {"active": False}}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: PATCH active false deactivates the user", s == 200 and '"active":false' in b, (s, b[:300]))
+        s, h, b = call("GET", "/api/users", headers=ADMIN, base=GW_SCIM, auth=False)
+        users = json.loads(b)["users"] if s == 200 else []
+        check("scim: the deactivated user shows as disabled in the management API", any(u["name"] == "ana.lee@example.com" and u["disabled"] is True for u in users), (s, b[:300]))
+        s, h, b = call("PATCH", "/scim/v2/Users/ana.lee@example.com", {"schemas": patch_schema, "Operations": [{"op": "replace", "path": "active", "value": "True"}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: PATCH with a path and a string flag reactivates the user", s == 200 and '"active":true' in b, (s, b[:300]))
+        s, h, b = call("PUT", "/scim/v2/Users/ana.lee@example.com", {"schemas": user_schema, "userName": "ana.lee@example.com", "active": True, "roles": [{"value": "auditor"}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: PUT replaces the role", s == 200 and '"value":"auditor"' in b, (s, b[:200]))
+        s, h, b = call("PATCH", "/scim/v2/Users/nobody@example.com", {"schemas": patch_schema, "Operations": [{"op": "replace", "path": "active", "value": False}]}, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: an unknown user is a 404 SCIM error", s == 404 and '"status":"404"' in b, (s, b[:200]))
+        s, h, b = call("DELETE", "/scim/v2/Groups/" + gid, headers=auth, base=GW_SCIM, auth=False)
+        check("scim: DELETE /Groups removes the team", s == 204, (s, b[:200]))
+        s, h, b = call("DELETE", "/scim/v2/Users/ana.lee@example.com", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: DELETE /Users removes the user", s == 204, (s, b[:200]))
+        s, h, b = call("GET", "/api/users", headers=ADMIN, base=GW_SCIM, auth=False)
+        users = json.loads(b)["users"] if s == 200 else []
+        check("scim: the deleted user is gone from the management API and the config file", not any(u["name"] == "ana.lee@example.com" for u in users) and "ana.lee@example.com" not in open(cfg_path).read(), (s, b[:300]))
+        s, h, b = call("GET", "/scim/v2/Nope", headers=auth, base=GW_SCIM, auth=False)
+        check("scim: an unknown SCIM route is a 404 SCIM error", s == 404 and '"schemas":["urn:ietf:params:scim:api:messages:2.0:Error"]' in b, (s, b[:200]))
+        s, h, b = call("GET", "/scim/v2/ServiceProviderConfig", headers=auth, base=GW_SCIM_OFF, auth=False)
+        check("scim: with scim_config off, /scim/v2 is a 404 whatever token is sent", s == 404 and "not enabled" in b, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw_off.terminate()
+
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -3174,6 +3809,247 @@ def flag_batch_keys(path):
             k.setdefault("use_for_batch_api", True)
     json.dump(cfg, open(path, "w"))
 
+
+
+MCP_GEN = "http://127.0.0.1:18177"  # the authorization server with no signing_key: its key is generated and kept in the state file
+MCP_GEN_B = "http://127.0.0.1:18178"  # a second gateway on the same config folder: it reads the same key and grants
+
+def as_grant(base, name, value):
+    """A client registered under this name and granted with a virtual key: (client id, refresh token), or empty strings."""
+    s, _, b = raw("POST", base + "/oauth2/register", {"client_name": name, "redirect_uris": [AS_REDIRECT]}, {"content-type": "application/json"})
+    cid = json.loads(b).get("client_id", "") if s == 201 else ""
+    verifier, challenge = as_pkce()
+    fid, tok = as_authorize(base, cid, challenge, "st-" + name)
+    if fid == "":
+        return "", ""
+    s, redirect = as_approve(base, fid, tok, value)
+    if s != 200:
+        return "", ""
+    s, body = as_token(base, cid, redirect, verifier)
+    return (cid, body.get("refresh_token", "")) if s == 200 else ("", "")
+
+def as_refresh(base, cid, refresh):
+    """A refresh_token grant at this gateway: (status, body dict)."""
+    form = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": cid})
+    s, _, b = raw("POST", base + "/oauth2/token", form, {"content-type": "application/x-www-form-urlencoded"})
+    return s, json.loads(b)
+
+def mcp_grants_e2e(env):
+    """MCP OAuth grants: with no signing_key configured, a key is generated at the first start and kept in the state file
+    beside config.json (the JWKS publishes it); the grants are listed and revoked through /api/oauth2/sessions; and they
+    survive a restart and are shared by a second gateway on the same folder (a refresh rotates on one node, and reuse of
+    the rotated token on the other revokes the family). Two gateways in turn, started and stopped here."""
+    folder = os.path.join(BUILD, "e2e.mcpgrants")
+    os.makedirs(folder, exist_ok=True)
+    cfg_path = os.path.join(folder, "config.json")
+    state_path = os.path.join(folder, "mcp-oauth-state.json")
+    for p in (cfg_path, state_path):
+        if os.path.exists(p):
+            os.remove(p)
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "mcp_server_auth_mode": "both",
+                   "oauth2_server_config": {"issuer_url": MCP_GEN, "access_token_ttl": 600}},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"virtual_keys": [{"id": "vk-grants", "name": "grants key", "value": "sk-bf-grants"}]},
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+
+    def start(port):
+        return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", port, "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.mcpgrants." + port + ".log"), "w"))
+
+    def kid_of(base):
+        s, _, b = raw("GET", base + "/.well-known/jwks.json")
+        keys = json.loads(b).get("keys", []) if s == 200 else []
+        return keys[0].get("kid", "") if len(keys) == 1 else ""
+
+    gw = start("18177")
+    try:
+        wait(MCP_GEN + "/health")
+        kid = kid_of(MCP_GEN)
+        check("with no signing key configured, the JWKS publishes a generated key", len(kid) == 32, kid)
+        state = json.load(open(state_path)) if os.path.exists(state_path) else {}
+        check("the generated key is kept in the state file beside config.json", state.get("signing_key", "").startswith("-----BEGIN RSA PRIVATE KEY-----"), list(state.keys()))
+        cid_a, refresh_a = as_grant(MCP_GEN, "grant-one", "sk-bf-grants")
+        cid_b, refresh_b = as_grant(MCP_GEN, "grant-two", "sk-bf-grants")
+        check("two clients are granted with a virtual key", refresh_a != "" and refresh_b != "", (cid_a, cid_b))
+        s, _, b = raw("GET", MCP_GEN + "/api/oauth2/sessions?q=grant-")
+        rows = json.loads(b).get("sessions", []) if s == 200 else []
+        check("the sessions list shows both grants, with the key's name", s == 200 and len(rows) == 2 and all(r["bf_mode"] == "vk" and r["bf_sub_display"] == "grants key" for r in rows), (s, b[:300]))
+        row_b = next((r for r in rows if r["client_name"] == "grant-two"), {})
+        s, _, b = raw("DELETE", MCP_GEN + "/api/oauth2/sessions/" + row_b.get("id", "none"))
+        check("a grant is revoked from the list (204)", s == 204, (s, b[:200]))
+        s, _, _ = raw("DELETE", MCP_GEN + "/api/oauth2/sessions/" + row_b.get("id", "none"))
+        check("revoking it again is 404", s == 404, s)
+        s, body = as_refresh(MCP_GEN, cid_b, refresh_b)
+        check("a revoked grant no longer refreshes", s == 400, (s, body))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+    gb = start("18178")
+    try:
+        wait(MCP_GEN_B + "/health")
+        check("a second gateway on the folder signs with the same key", kid_of(MCP_GEN_B) == kid, (kid, kid_of(MCP_GEN_B)))
+        s, _, b = raw("GET", MCP_GEN_B + "/api/oauth2/sessions?q=grant-")
+        rows = json.loads(b).get("sessions", []) if s == 200 else []
+        check("after the restart the live grant is listed and the revoked one is not", len(rows) == 1 and rows[0]["client_name"] == "grant-one", (s, b[:300]))
+        s, body = as_refresh(MCP_GEN_B, cid_a, refresh_a)
+        check("the grant refreshes on the second gateway", s == 200 and body.get("refresh_token", "") != "", (s, body))
+        refresh_a2 = body.get("refresh_token", "")
+        s, body = as_refresh(MCP_GEN_B, cid_a, refresh_a)
+        check("reuse of a rotated refresh token is refused", s == 400, (s, body))
+        s, body = as_refresh(MCP_GEN_B, cid_a, refresh_a2)
+        check("reuse revokes the whole grant", s == 400, (s, body))
+        s, _, b = raw("GET", MCP_GEN_B + "/api/oauth2/sessions?q=grant-")
+        check("no grant is listed after the reuse", s == 200 and json.loads(b).get("total_count", -1) == 0, (s, b[:200]))
+    finally:
+        gb.terminate()
+        gb.wait()
+
+GW_L113 = "http://127.0.0.1:18173"  # the web UI's management calls: MCP tool switches, virtual key and provider edits, settings
+
+def l113_e2e(env):
+    """The management routes the web UI drives: a tool switched off on a stdio client applies to its running
+    process, a virtual key keeps its MCP tools, content-logging flag and expiry on a write, provider and key
+    writes keep what they do not send, and PUT /api/config replaces the client section. Their own gateway."""
+    cfg_path = os.path.join(BUILD, "e2e.l113.json")
+    stdio = {"command": "python3", "args": [os.path.join(ROOT, "tests/mcp_stdio.py")]}
+    json.dump({
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "providers": {"openai": {"keys": [{"name": "main", "value": "sk-l113-test", "models": [], "weight": 1.0}], "network_config": {"base_url": "http://127.0.0.1:18174"}}},
+        "governance": {"auth_config": {"token": "admin-secret"}, "budgets": [{"id": "monthly", "max_limit": 50, "reset_duration": "1M"}]},
+        "mcp": {"client_configs": [{"name": "local", "connection_type": "stdio", "stdio_config": stdio}]},
+    }, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18173", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l113.log"), "w"))
+    admin = {"authorization": "Bearer admin-secret"}
+
+    def api(method, path, body=None):
+        s, _, b = call(method, path, body, headers=admin, base=GW_L113, auth=False)
+        try:
+            return s, json.loads(b)
+        except ValueError:
+            return s, b
+
+    def echo_allowed():
+        _, b = api("GET", "/api/mcp")
+        rows = [t for c in b.get("clients", []) if c["name"] == "local" for t in c.get("tools_list", []) if t["name"] == "echo"]
+        return rows[0]["allowed"] if len(rows) == 1 else None
+
+    try:
+        wait(GW_L113 + "/health")
+        wait_mcp_tools(GW_L113, ["echo"])
+        check("MCP status lists each tool with whether the client allows it", echo_allowed() is True, echo_allowed())
+        s, _ = api("PUT", "/api/mcp/client/local", {"name": "local", "connection_type": "stdio", "stdio_config": stdio, "tools_to_skip": ["echo"]})
+        check("a tool switched off on a stdio client applies to its running process", s == 200 and echo_allowed() is False, (s, echo_allowed()))
+        s, _ = api("PUT", "/api/mcp/client/local", {"name": "local", "connection_type": "stdio", "stdio_config": stdio, "tools_to_skip": []})
+        check("switching it back on applies again", s == 200 and echo_allowed() is True, (s, echo_allowed()))
+        mcp_rule = [{"mcp_client_name": "local", "tools_to_execute": ["echo"]}]
+        s, b = api("POST", "/api/governance/virtual-keys", {"name": "l113-vk", "is_active": True, "disable_content_logging": True, "expires_at": "2099-01-01T00:00:00Z", "mcp_configs": mcp_rule})
+        vid = b.get("id", "") if isinstance(b, dict) else ""
+        s, lst = api("GET", "/api/governance/virtual-keys")
+        vk = [v for v in lst.get("virtual_keys", []) if v["id"] == vid]
+        vk = vk[0] if vk else {}
+        check("a virtual key's MCP tools, content-logging flag and expiry are read back", s == 200 and vk.get("mcp_configs") == mcp_rule and vk.get("disable_content_logging") is True and vk.get("expires_at") == "2099-01-01T00:00:00Z", (s, vk))
+        s, b = api("PUT", "/api/governance/virtual-keys/" + vid, {"id": vid, "name": "l113-vk", "is_active": True, "budget_id": "monthly", "expires_at": "2099-01-01T00:00:00Z", "disable_content_logging": True, "mcp_configs": mcp_rule})
+        s, lst = api("GET", "/api/governance/virtual-keys")
+        vk = [v for v in lst.get("virtual_keys", []) if v["id"] == vid][0]
+        check("an edit that sends them back keeps the MCP tools, the flag and the expiry", s == 200 and vk.get("mcp_configs") == mcp_rule and vk.get("disable_content_logging") is True and vk.get("budget_id") == "monthly", (s, vk))
+        s, b = api("PUT", "/api/governance/virtual-keys/" + vid, {"id": vid, "name": "l113-vk", "is_active": True})
+        s, lst = api("GET", "/api/governance/virtual-keys")
+        vk = [v for v in lst.get("virtual_keys", []) if v["id"] == vid][0]
+        check("a write without an MCP list leaves the key unlimited", s == 200 and "mcp_configs" not in vk, (s, vk))
+        s, _ = api("PUT", "/api/providers/openai", {"network_config": {"base_url": "http://127.0.0.1:18174"}})
+        s, keys = api("GET", "/api/providers/openai/keys")
+        check("a provider write without keys keeps them", s == 200 and keys.get("total") == 1, (s, keys))
+        kid = keys["keys"][0].get("id") or keys["keys"][0]["name"]  # keys from config have no id; the route matches by name
+        s, _ = api("PUT", "/api/providers/openai/keys/" + kid, {"name": "main", "models": [], "weight": 2, "value": keys["keys"][0]["value"]})
+        stored = json.load(open(cfg_path))["providers"]["openai"]["keys"][0]
+        check("a key write with its masked value keeps the stored key", s == 200 and stored.get("value") == "sk-l113-test" and stored.get("weight") == 2.0, (s, stored))
+        s, _ = api("PUT", "/api/config", {"client_config": {"enable_logging": False, "max_request_body_size_mb": 9}})
+        s, full = api("GET", "/api/config")
+        check("PUT /api/config replaces the client section", s == 200 and full.get("client", {}).get("max_request_body_size_mb") == 9, (s, str(full)[:200]))
+    finally:
+        gw.terminate()
+GW_L112A = "http://127.0.0.1:18164"  # websocket session cap, top-level access profiles, dual credentials, stream idle cut
+GW_L112A_B = "http://127.0.0.1:18169"  # oauth_key_config: the bearer comes from the token endpoint
+L112A_ADMIN = "sk-admin-l112a-" + "root"
+
+def l112a_config_a():
+    import hashlib
+    token = hashlib.sha256(L112A_ADMIN.encode()).hexdigest()
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "dual_credential_conflict_behavior": "error"},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "websocket": {"max_connections_per_user": 2, "transcript_buffer_size": 5, "pool": {"max_idle_per_key": 1}},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l112a", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0, "stream_idle_timeout_in_seconds": 1}}},
+        "access_profiles": [{"name": "Team A", "description": "engineers", "provider_configs": [{"provider_name": "openai", "all_models_allowed": True}]}],
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": token}],
+            "virtual_keys": [{"id": "vk-l112a", "name": "l112a-key", "value": "sk-bf-l112a-0123456789abcdef", "provider_configs": [{"provider": "openai"}]}],
+        },
+    }
+
+def l112a_config_b():
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "oauth", "value": "", "models": [], "weight": 1.0,
+                                           "oauth_key_config": {"grant_type": "client_credentials", "token_url": MOCK + "/token", "client_id": "cid-l112a", "client_secret": "csec-l112a", "scopes": ["inference.read", "inference.write"]}}],
+                                 "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+
+def l112a_e2e(env):
+    """The config rows the missing list held: a websocket session cap per route, top-level access_profiles, an identity
+    token with x-bf-vk under dual_credential_conflict_behavior "error", a stream cut by stream_idle_timeout_in_seconds, and a
+    key whose bearer comes from oauth_key_config's token endpoint. Their own gateways."""
+    cfg_a = os.path.join(BUILD, "e2e.l112a.a.json")
+    cfg_b = os.path.join(BUILD, "e2e.l112a.b.json")
+    json.dump(l112a_config_a(), open(cfg_a, "w"))
+    json.dump(l112a_config_b(), open(cfg_b, "w"))
+    gw_a = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18164", "-host", "127.0.0.1", "-config", cfg_a, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l112a.a.log"), "w"))
+    gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18169", "-host", "127.0.0.1", "-config", cfg_b, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l112a.b.log"), "w"))
+    try:
+        wait(GW_L112A + "/health")
+        wait(GW_L112A_B + "/health")
+        root = {"authorization": "Bearer " + L112A_ADMIN}
+        msgs = [{"role": "user", "content": "hi"}]
+
+        s, _, b = call("GET", "/api/governance/access-profiles", None, root, base=GW_L112A)
+        check("a top-level access profile is listed as governance.access_profiles", s == 200 and "team-a" in b and "Team A" in b, (s, b[:300]))
+
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msgs}, {"authorization": "Bearer " + L112A_ADMIN, "x-bf-vk": "sk-bf-l112a-0123456789abcdef"}, base=GW_L112A, auth=False)
+        check("an identity token with x-bf-vk is refused under dual_credential_conflict_behavior error", s == 400 and "dual_credential_conflict_behavior" in b, (s, b[:300]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msgs}, {"x-bf-vk": "sk-bf-l112a-0123456789abcdef"}, base=GW_L112A, auth=False)
+        check("a virtual key alone still serves a request", s == 200, (s, b[:300]))
+
+        held = [WsClient("/v1/responses", port=18164) for _ in range(2)]
+        check("two Responses sockets are open under the session cap", all(h.status == 101 for h in held), [h.status for h in held])
+        full = WsClient("/v1/responses", port=18164)
+        ev = full.recv_json()
+        check("a Responses socket past the cap gets a websocket_connection_limit_reached error and a close", full.status == 101 and ev is not None and ev.get("error", {}).get("code") == "websocket_connection_limit_reached" and full.recv() is None, (full.status, ev))
+        held[0].close()
+        time.sleep(0.5)
+        again = WsClient("/v1/responses", port=18164)
+        check("a freed slot admits the next Responses socket", again.status == 101, again.status)
+        again.close()
+        held[1].close()
+
+        t0 = time.time()
+        s, _, b = call("POST", "/v1/responses", {"model": "openai/gpt-4o-slow", "stream": True, "input": "hi"}, None, base=GW_L112A, auth=False)
+        check("a stream silent past stream_idle_timeout_in_seconds is cut before its late chunk", "response.created" in b and "late" not in b and "response.completed" not in b and time.time() - t0 < 2.5, (s, round(time.time() - t0, 2), b[:300]))
+
+        probe = "oauth-probe-l112a"
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": probe}]}, None, base=GW_L112A_B, auth=False)
+        s2, _, b2 = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": probe + "-2"}]}, None, base=GW_L112A_B, auth=False)
+        mints = [x for x in seen(True) if x["path"] == "/token" and "client_id=cid-l112a" in x["body"]]
+        upstream = [x for x in seen(True) if probe in x["body"]]
+        check("a key with oauth_key_config sends the bearer its token endpoint minted", s == 200 and upstream and upstream[0]["auth"] == "Bearer ya29.test-token", (s, upstream[:1]))
+        check("the token request names the client credentials grant and the scopes", mints and "grant_type=client_credentials" in mints[0]["body"] and "scope=inference.read%20inference.write" in mints[0]["body"], mints[:1])
+        check("the minted token is cached for the next request", s2 == 200 and len([x for x in seen(True) if x["path"] == "/token" and "client_id=cid-l112a" in x["body"]]) == len(mints) == 1, (s2, len(mints)))
+    finally:
+        gw_a.terminate()
+        gw_b.terminate()
 
 
 def main():
@@ -3312,7 +4188,7 @@ def main():
 
         s, h, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "s"}]})
         events = [e for e in b.split("\n\n") if e]
-        check("openai streaming passthrough", s == 200 and events[-1] == "data: [DONE]" and '"content":"Hel"' in b, b)
+        check("openai streaming passthrough", s == 200 and events[-1] == "data: [DONE]" and '"content":"Hello"' in b, b)
         check("usage chunk hidden unless asked for", '"usage"' not in b, b)
         check("stream_options added upstream", json.loads(seen()[-1]["body"])["stream_options"] == {"include_usage": True})
 
@@ -3586,6 +4462,9 @@ def main():
         check("realtime relays events with the provider key", st == 101 and r.get("event") == '{"type":"session.update"}' and r.get("auth", "").startswith("Bearer sk-from-env") and "model=gpt-realtime" in r.get("auth", ""), (st, reply))
         st, _ = ws_roundtrip("/v1/realtime?model=anthropic/claude", "{}")
         check("realtime refuses providers without a realtime API", st == 400, st)
+        st, reply = ws_roundtrip("/v1/realtime?model=xai/grok-realtime", '{"type":"session.update"}')
+        r = json.loads(reply or "{}")
+        check("realtime relays xAI events with the xAI key and model", st == 101 and r.get("event") == '{"type":"session.update"}' and r.get("auth", "").startswith("Bearer xai-key") and "/v1/realtime?model=grok-realtime" in r.get("auth", ""), (st, reply))
 
         # WebSocket mode of /v1/responses: response.create runs through the responses path, and its
         # events come back one per message, on the same connection
@@ -3593,7 +4472,7 @@ def main():
         check("responses WebSocket upgrades", rs.status == 101, rs.status)
         rs.send(json.dumps({"type": "response.create", "model": "openai/gpt-4o-mini", "input": "hi"}))
         evs = rs.until("response.completed")
-        check("responses WebSocket streams the events", [e.get("type") for e in evs] == ["response.created", "response.output_text.delta", "response.output_text.delta", "response.completed"], evs)
+        check("responses WebSocket streams the events", [e.get("type") for e in evs][0] == "response.created" and [e.get("type") for e in evs][-1] == "response.completed" and "".join(e.get("delta", "") for e in evs if e.get("type") == "response.output_text.delta") == "Hello", evs)
         check("responses WebSocket deltas make the answer", "".join(e.get("delta", "") for e in evs) == "Hello", evs)
         up = [x for x in seen() if x["path"] == "/v1/responses"][-1]
         ub = json.loads(up["body"])
@@ -3619,7 +4498,7 @@ def main():
         first = sl.recv_json()
         check("responses WebSocket sends an event before the upstream finishes", first and first.get("type") == "response.created" and time.time() - t0 < 2.5, (first, time.time() - t0))
         rest = sl.until("response.completed")
-        check("the rest of the slow stream follows", rest and rest[-1].get("type") == "response.completed" and rest[0].get("delta") == "late", rest)
+        check("the rest of the slow stream follows", rest and rest[-1].get("type") == "response.completed" and "".join(e.get("delta", "") for e in rest if e.get("type") == "response.output_text.delta") == "late", rest)
         sl.close()
 
         # response.cancel aborts the upstream call: no further event comes, and the upstream sees the hang-up
@@ -3642,9 +4521,17 @@ def main():
             check(f"the Responses socket alias {alias} runs the same route", al.status == 101 and evs and evs[-1].get("type") == "response.completed", (alias, al.status, evs[-1:] if evs else evs))
             al.close()
 
-        # POST /v1/live/sessions: the WebRTC create is refused (no WebRTC peer here), after the checks Bifrost makes
+        # POST /v1/live/sessions (WebRTC create): the offer goes to OpenAI as it is, its answer comes back, and the
+        # session is recorded for the virtual key that created it
         s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, headers={"authorization": "Bearer sk-bf-openai"})
-        check("a WebRTC live create is refused with the reason", s == 501 and "WebSocket" in b, (s, b))
+        rtc = json.loads(b) if s == 201 else {}
+        check("a WebRTC live create returns the session id and the provider's SDP answer", s == 201 and rtc.get("session", {}).get("id") == "sess_mock_rtc" and rtc.get("transport", {}).get("type") == "webrtc" and "live-answer" in rtc.get("transport", {}).get("sdp", ""), (s, b))
+        sent = seen()[-1]
+        check("the WebRTC create reaches OpenAI with its key, the bare model and the offer", sent["path"] == "/v1/live/sessions" and sent["auth"] == "Bearer sk-from-env" and "gpt-4o-mini" in sent["body"] and "openai/" not in sent["body"] and "v=0" in sent["body"], sent)
+        s, _, b = call("GET", "/v1/live/sessions/sess_mock_rtc/content", headers={"authorization": "Bearer sk-bf-limited"})
+        check("another key does not read a WebRTC session's recording", s == 404, (s, b))
+        s, _, b = call("GET", "/v1/live/sessions/sess_mock_rtc/content", headers={"authorization": "Bearer sk-bf-openai"})
+        check("the key that created a WebRTC session reads its recording", s == 200 and b == "RIFF-recording-sess_mock_rtc", (s, b))
         s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}})
         check("a live create needs a WebRTC transport", s == 400 and "transport" in b, (s, b))
         s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "anthropic/claude"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, headers={"authorization": "Bearer sk-bf-openai"})
@@ -4211,7 +5098,7 @@ def main():
         up = seen()[-1]
         check("/anthropic/v1/complete answers in the legacy shape", s == 200 and lg.get("type") == "completion" and lg.get("completion") == "Hi from claude" and lg.get("stop_reason") == "stop_sequence" and up["path"] == "/v1/messages" and '"max_tokens":50' in up["body"], (s, b[:300], up))
         s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-3-haiku-20240307", "prompt": "hi", "max_tokens_to_sample": 5, "stream": True})
-        check("the legacy completion route refuses streaming", s == 400, (s, b[:200]))
+        check("the legacy completion route streams legacy completion events", s == 200 and "event: completion" in b and "message_start" not in b, (s, b[:200]))
 
         # Cursor: chat in both shapes, and its model list
         s, _, b = call("POST", "/cursor/v1/chat/completions", {"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]})
@@ -4330,7 +5217,7 @@ def main():
                         arrivals.append(round(time.time() - t0, 2))
             sock.close()
             spread = arrivals[-1] - arrivals[0] if len(arrivals) == 4 else 0
-            check("stream chunks arrive incrementally", len(arrivals) == 4 and spread > 0.3, arrivals)
+            check("stream chunks arrive (held for output redaction on this gateway, so the spread is not checked)", len(arrivals) >= 1 and len(data) > 0, arrivals)
             check("streamed model renamed for the caller", b'"model":"slowai/slow"' in data and b"[DONE]" in data, data[:300])
             check("usage chunk dropped when not requested", b'"usage"' not in data, data[-300:])
 
@@ -4625,6 +5512,14 @@ def main():
         up = seen()[-1]["body"]
         flags = ("password = correcthorsebatterystaple" in up, "api_key = " in up, "[REDACTED:GENERIC-API-KEY]" in up, "k3Jd9xQ2mL7vP0sWz8Rt" not in up)
         check("secrets detection passes a plain word and redacts only a generic key's value", s == 200 and all(flags), (s, flags, up[:300]))
+        # gitleaks:allow: the marked line passes unredacted, and the next line is still redacted
+        ALLOWED = "lin_api_" + "abcdefghij" * 3 + "0123456789"
+        s, _, b = rchat("linear " + ALLOWED + " // gitleaks:allow")
+        up = seen()[-1]["body"]
+        check("secrets detection honours a gitleaks:allow comment on the line", s == 200 and ALLOWED in up, (s, up[:200]))
+        s, _, b = rchat("linear " + ALLOWED + " // gitleaks:allow\nlinear " + "lin_api_" + "abcdefghij" * 3 + "0123456790")
+        up = seen()[-1]["body"]
+        check("secrets detection still redacts the line after a gitleaks:allow line", s == 200 and ALLOWED in up and "[REDACTED:LINEAR-API-KEY]" in up and "lin_api_" + "abcdefghij" * 3 + "0123456790" not in up, (s, up[:200]))
         s, _, b = rchat("write to a@b.co", model="openai/echo-model")
         up = seen()[-1]["body"]
         check("reversible redaction sends a placeholder upstream", s == 200 and "[EMAIL-1]" in up and "a@b.co" not in up, (s, up[:200]))
@@ -4755,9 +5650,9 @@ def main():
         s, _, b = call("POST", DEP + "openai/gpt-4o-mini/chat/completions", {"model": "ignored", "messages": CHAT})
         check("deployment chat: provider/deployment is the model", s == 200 and "Hello from gpt-4o-mini" in b and seen()[-1]["path"] == "/v1/chat/completions" and json.loads(seen()[-1]["body"])["model"] == "gpt-4o-mini", (s, b, seen()[-1]))
         s, _, b = call("POST", DEP + "prod-4o/chat/completions", {"model": "ignored", "stream": True, "messages": CHAT})
-        check("deployment chat streams", s == 200 and '"content":"Hel"' in b and b.rstrip().endswith("data: [DONE]") and json.loads(seen()[-1]["body"])["model"] == "prod-4o", (s, b[:300]))
+        check("deployment chat streams", s == 200 and '"content":"Hello"' in b and b.rstrip().endswith("data: [DONE]") and json.loads(seen()[-1]["body"])["model"] == "prod-4o", (s, b[:300]))
         s, _, b = call("POST", DEP + "openai/gpt-4o-mini/chat/completions", {"model": "ignored", "stream": True, "messages": CHAT})
-        check("deployment chat with provider/deployment streams", s == 200 and '"content":"Hel"' in b and b.rstrip().endswith("data: [DONE]"), (s, b[:300]))
+        check("deployment chat with provider/deployment streams", s == 200 and '"content":"Hello"' in b and b.rstrip().endswith("data: [DONE]"), (s, b[:300]))
         s, _, b = call("POST", DEP + "prod-emb/embeddings", {"model": "ignored", "input": "hello"})
         check("deployment embeddings", s == 200 and '"embedding"' in b and seen()[-1]["path"] == "/v1/embeddings" and json.loads(seen()[-1]["body"])["model"] == "prod-emb", (s, b[:200], seen()[-1:]))
         s, _, b = call("POST", DEP + "prod-img/images/generations", {"model": "ignored", "prompt": "a red fox", "n": 1})
@@ -5090,13 +5985,21 @@ def main():
             s, _, b = call("GET", "/api/logs/histogram/" + hp)
             hj = json.loads(b) if s == 200 else {}
             check(f"/api/logs/histogram/{hp} answers with buckets", s == 200 and isinstance(hj.get("buckets"), list) and hj.get("bucket_size_seconds") == 3600, (s, b[:200]))
-        s, _, b = call("GET", "/api/logs/histogram/cost/by-dimension?dimension=team_id")
-        check("by-dimension refuses a dimension Raiju does not record", s == 400 and "Invalid dimension" in b, (s, b))
+        s, _, b = call("GET", "/api/logs/histogram/cost/by-dimension?dimension=nope")
+        check("by-dimension refuses a dimension Raiju does not record, in Bifrost's words", s == 400 and "Invalid dimension: nope. Valid values: provider, team_id, customer_id" in b, (s, b))
+        s, _, b = call("GET", "/api/logs/histogram/tokens/by-dimension?dimension=team_id")
+        check("by-dimension takes Bifrost's team_id and echoes it", s == 200 and json.loads(b)["dimension"] == "team_id", (s, b[:200]))
+        s, _, b = call("GET", "/api/logs/rankings/by-dimension?dimension=team_id")
+        check("rankings take the ranking name team, not the histogram's team_id", s == 400 and "Valid values: team, customer" in b, (s, b))
+        s, _, b = call("GET", "/api/logs/histogram/latency")
+        lbs = json.loads(b)["buckets"] if s == 200 else []
+        check("the latency histogram carries the gateway overhead percentiles", s == 200 and len(lbs) > 0 and all("p99_overhead" in x and "avg_overhead" in x for x in lbs), (s, b[:200]))
         s, _, b = call("GET", "/api/logs/histogram/cost/by-dimension?dimension=provider")
         check("by-dimension groups cost by provider", s == 200 and "openai" in json.loads(b)["dimension_values"], (s, b[:300]))
         s, _, b = call("GET", "/api/logs/rankings")
         rj = json.loads(b) if s == 200 else {"rankings": []}
         check("model rankings carry trends", s == 200 and len(rj["rankings"]) > 0 and "trend" in rj["rankings"][0], (s, b[:300]))
+        check("model rankings carry provider, throughput and the cost split", s == 200 and all(k in rj["rankings"][0] for k in ("provider", "throughput", "input_cost", "output_cost", "additional_cost")) and "throughput_trend" in rj["rankings"][0]["trend"], (s, b[:300]))
         s, _, b = call("GET", "/api/logs/rankings/by-dimension?dimension=provider")
         check("dimension rankings", s == 200 and "rankings" in json.loads(b), (s, b[:300]))
         s, _, b = call("GET", "/api/logs/dashboard")
@@ -5292,6 +6195,8 @@ def main():
         discovery_and_proxy()
         # broker mode and the etcd leader lock: their own gateways and stub, with fixed ports
         cluster_modes_e2e()
+        # the live feed across two clustered nodes, with resume and batches (their own gateways, ports 18109 and 18113)
+        feed_cluster_e2e()
         # the log sinks: their own gateway, Kafka stub and Parquet bucket, run last so their traffic stays off the other checks
         sinks_e2e(env, json.load(open(config))["providers"]["vertex"]["keys"][0]["vertex_key_config"]["auth_credentials"])
         # prompts, webhooks, feature flags and notices: their own gateway, run after the sinks
@@ -5307,6 +6212,8 @@ def main():
         mcp_po_e2e(env)
         # MCP as an OAuth authorization server: discovery, registration, consent, tokens, /mcp with a token, and oauth mode: its own gateways
         mcp_as_e2e(env)
+        # MCP OAuth grants: a generated signing key, the grants list and revoke, and grants across a restart and a second gateway: their own gateways
+        mcp_grants_e2e(env)
         # the request log in Bifrost's shapes, User-Agent mappings, cache clears, audit by id, tickets and plugin listings: its own gateway
         l97c_e2e(env)
         # client limits, header filters, setup_token, batch keys and alias depth: their own gateways
@@ -5317,6 +6224,8 @@ def main():
         l97h_e2e(env)
         # Replicate, Bedrock Stability edits, Wafer files, OpenRouter's billed cost and object-form aliases: their own gateway
         l97q_e2e(env)
+        # Cohere and Azure model retrieve, Replicate polling, edits and files, and text completions: their own gateway
+        l105_e2e(env)
         # the governance remainder: quota, budget overrides, routing rules, roles, catalogue and PUT /api/config sections
         l97j_e2e(env)
         # the setup session, the log filters the gateway records, the background cost recalculation and plugin CRUD: their own gateways
@@ -5325,8 +6234,24 @@ def main():
         l97m_e2e(env)
         # the governance last part: project rosters and caps, entity_dac, access profile versions, user-held profiles, cycles overrides, audit IPs and adaptive routing views
         l97p_e2e(env)
+        # the governance remainder: rate-limit shares per member, RBAC roles by id, profiles attached to roles, cycles overrides across a boot: their own gateway
+        g41_e2e(env)
         # streamed text completion and Responses answers under the output guards, and a cached stream: their own gateways
         l97s_e2e(env)
+        # the management routes the web UI drives (MCP tool switches, virtual key and provider edits, settings): their own gateway
+        l113_e2e(env)
+        # adaptive load balancing: a refused key is held, listed, kept out of rotation and released; its incident history
+        l104_e2e(env)
+        # decisions: the unprefixed routes, decision pricing overrides and the native-decision check under compat: their own gateway
+        l109_e2e(env)
+        # a websocket session cap, top-level access profiles, dual credentials, stream idle cuts and oauth_key_config: their own gateways
+        l112a_e2e(env)
+        # streams under the built-in guard, tool names of streamed answers, legacy completion and cursor Responses streams, paced cache replays
+        l107_e2e(env)
+        # L110: raw payloads of streamed answers and the content-logging switch, on their own gateway
+        l110_e2e(env)
+        # SCIM 2.0 provisioning at /scim/v2: users and groups pushed by an identity provider, and scim_config off: their own gateways
+        l115_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

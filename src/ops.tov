@@ -2,7 +2,8 @@
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
 import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec } from "./config"
-import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page } from "./logapi"
+import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page, timeOf } from "./logapi"
+import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
 import { entryStatus, PluginEntry } from "./plugins"
 import { parseDatasheet } from "./pricing"
@@ -14,7 +15,7 @@ import { join } from "node:path"
 import { Engine } from "./gateway"
 import { CostRecalc, RecalcStatus } from "./costrecalc"
 import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE } from "./setupsession"
-import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
 import { AccessProfile, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
@@ -24,10 +25,12 @@ import { ConfigStore, checkAdmin, sweepExpiredKeys, RESOURCES, OPERATIONS } from
 import { keyBudgetIds, permissionDocs, permissionIds, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
+// POST /api/governance/access-profiles/{id}/roles: the roles to attach (Bifrost's AttachRolesRequest).
+type RoleAttachBody = { role_ids?: int[], is_default?: bool, apply_to_existing?: bool }
 type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
 type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, roleIdOf } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
@@ -48,16 +51,18 @@ import { deadline } from "./deadline"
 import { secureHex, utf8 } from "./crypto"
 import * as b64 from "./base64"
 import * as metrics from "./metrics"
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs"
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync } from "node:fs"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
+import { FeedRing, FeedQueue, FeedItem, feedEnvelope, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
 import { SocketExt } from "./realtime"
 import { LiveRegistry } from "./live"
-import { BROKER_ROUTE } from "./broker"
+import { BROKER_ROUTE, BROKER_FEED_ROUTE } from "./broker"
 import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
-import { ExportCursor, objectKey, putRequest, putBytesRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs } from "./exports"
+import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs, ByteRequest } from "./exports"
+import { planWindow, maxObjectBytes } from "./audit_archive"
 import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode } from "./mcpissuer"
 
@@ -246,6 +251,32 @@ function num(params: URLSearchParams, name: string): f64 | undefined {
   return parseFloat(v)
 }
 
+// A window bound of the adaptive history: RFC 3339, or unix seconds. dflt when absent; undefined when unreadable.
+function historyBound(raw: string | undefined, dflt: f64): f64 | undefined {
+  if (raw === undefined || raw === "") return dflt
+  if (raw.includes("T")) return timeOf(raw)
+  const v = parseFloat(raw)
+  if (v === undefined) return undefined
+  return v * 1000.0
+}
+
+// The status an incident shows: resolved, recovering (its check is in flight) or attention.
+function incidentStatus(inc: Incident): string {
+  if (inc.resolvedAt > 0) return "resolved"
+  return inc.recovering ? "recovering" : "attention"
+}
+
+// An incident as the adaptive routing routes show it.
+function incidentRow(inc: Incident, now: number) {
+  const end = inc.resolvedAt > 0 ? inc.resolvedAt : now
+  return {
+    id: inc.id, target: inc.target, provider: inc.provider, key_id: inc.keyId, model: inc.model,
+    scope: inc.model === "" ? "key" : "route", failure_class: inc.cls, reason: inc.reason, status: incidentStatus(inc),
+    opened_at: rfc3339Of(inc.openedAt), resolved_at: inc.resolvedAt > 0 ? rfc3339Of(inc.resolvedAt) : undefined,
+    duration_seconds: Math.round((end - inc.openedAt) / 1000),
+  }
+}
+
 // The tools of a chat tool definition list, as MCP tools.
 function exposedTools(defs: string[]): ExposedTool[] {
   const out: ExposedTool[] = []
@@ -340,8 +371,9 @@ function trimPeer(p: string): string {
 // How often discovery runs, in ms: it registers this node where the mechanism needs it, then lists the others.
 const DISCOVER_MS = 10000
 
-// How often the UI socket looks for new request-log entries, in ms.
-const UI_TICK_MS = 1000
+// How often the UI socket's tick runs, in ms: it writes and reads the workers' share files, sends each batch
+// client its queue, and runs the heartbeat.
+const UI_TICK_MS = 100
 
 // The UI socket's heartbeat, as Bifrost's: a ping every 30 s, and a client that has not answered for
 // 60 s is dropped.
@@ -352,10 +384,21 @@ const UI_PONG_MS = 60000
 // this many bytes the older lines go.
 const UI_SHARE_MAX = 65536
 
-// One dashboard client on /ws.
+// A batch client may leave this many messages unsent before it is closed (1013): it resumes with its cursor.
+const UI_QUEUE_MAX = 5000
+
+// A worker's feed share file is trimmed to its newest FEED_SHARE_KEEP lines once it passes FEED_SHARE_MAX bytes.
+const FEED_SHARE_MAX = 262144
+const FEED_SHARE_KEEP = 300
+
+// One dashboard client on /ws. A client may ask for batches (batch=1): its messages then come as one JSON array
+// per tick, instead of one message each. A client may resume (since=node:seq,...): the hub replays the events it
+// missed before the live ones (feed.tov).
 export class UiSocket extends SocketExt {
-  // log events reach this socket only for entries its user's data scope covers
-  constructor(readonly hub: UiHub, readonly scope: DataScope) {
+  // messages a batch client has not been sent yet
+  private queue: string[] = []
+
+  constructor(readonly hub: UiHub, readonly scope: DataScope, readonly batch: bool, readonly since: Map<string, int> | undefined) {
     super()
   }
 
@@ -367,64 +410,158 @@ export class UiSocket extends SocketExt {
     this.closed = true
     this.hub.remove(this)
   }
+
+  // Sends a message now, or queues it for the next batch.
+  emit(text: string): void {
+    if (!this.batch) {
+      this.send(text)
+      return
+    }
+    if (this.queue.length >= UI_QUEUE_MAX) {
+      this.queue = []
+      this.endWith(1013, "send buffer full: reconnect with since")
+      return
+    }
+    this.queue.push(text)
+  }
+
+  // Sends the queued messages of a batch client as one JSON array.
+  flush(): void {
+    if (this.queue.length === 0) return
+    const xs = this.queue
+    this.queue = []
+    this.send("[" + xs.join(",") + "]")
+  }
 }
 
 // The events /ws pushes, in Bifrost's envelope {"type": ..., "data": ...}: store_update after a
-// successful management write (tags name the resource changed), and log for each new request-log
-// entry while a client is connected. (Bifrost's socket at this version sends notifications and
-// store updates only; the log events are Raiju's.)
+// successful management write (tags name the resource changed), and log for each request-log entry
+// (Bifrost's socket at this version sends notifications and store updates only; the log events are Raiju's).
 //
-// With several workers, each client gets the events of every worker: log entries from the shared
-// day file (LogStore.viewSince), and store updates from the other workers' share files.
+// Log events are the live feed (feed.tov). Each event has a producer (the node, or node/pid for one worker)
+// and that producer's next sequence. A worker takes the events it writes from the request log (ingest,
+// "local"); the other workers of its node write theirs to share files (ingest, "share"); events from peer
+// nodes or the broker come in over the cluster ("peer"). Every event goes into this worker's ring and to the
+// clients whose data scope covers it, so any node's /ws streams the merged feed.
 export cyclic class UiHub {
   clients: UiSocket[] = []
   timer: int = -1
-  since: f64 = 0.0
   lastPing: f64 = 0.0
   // the node's share directory, or "" for one process
   shareDir = ""
-  // how far each other worker's share file has been read, by file name
+  // how far each other worker's store-update share file has been read, by file name
   offsets: Map<string, int> = new Map()
-  constructor(readonly logs: () => LogStore | undefined) {}
+  // ... and its feed share file
+  feedOffsets: Map<string, int> = new Map()
+  // the newest events from every producer, for a client that resumes
+  ring: FeedRing = new FeedRing(FEED_RING_SIZE, FEED_RING_SECONDS * 1000.0)
+  // this worker's events, waiting for the relay to the peers or the broker (only when relayOn)
+  outbox: FeedQueue = new FeedQueue(FEED_QUEUE_MAX)
+  relayOn = false
+  // the newest sequence this worker has given its events
+  private seq: int = 0
+  // this worker's feed lines not yet written to its share file, and the bytes written since the last trim
+  private shareBuf: string[] = []
+  private shareBytes: int = 0
 
   add(c: UiSocket): void {
     c.pongAt = Date.now()
     this.clients.push(c)
-    if (this.clients.length === 1) {
-      this.since = Date.now()
-      this.lastPing = Date.now()
-      this.timer = setInterval(() => {
-        this.tick()
-      }, UI_TICK_MS)
-    }
+    this.wake()
+    const since = c.since
+    if (since !== undefined) this.replay(c, since)
   }
 
   remove(c: UiSocket): void {
     this.clients = this.clients.filter((x) => x !== c)
-    if (this.clients.length === 0 && this.timer >= 0) {
+    this.wake()
+  }
+
+  // The tick runs while there are clients, or sibling workers to read from.
+  private wake(): void {
+    const need = this.clients.length > 0 || this.shareDir !== ""
+    if (need && this.timer < 0) {
+      this.lastPing = Date.now()
+      this.timer = setInterval(() => {
+        this.tick()
+      }, UI_TICK_MS)
+    } else if (!need && this.timer >= 0) {
       clearInterval(this.timer)
       this.timer = -1
     }
   }
 
+  // Sizes the ring and the outbox from cluster.feed. A change starts them empty; the same sizes keep what they hold.
+  configureRing(maxItems: int, maxAgeMs: f64, queueMax: int): void {
+    if (this.ring.maxItems === maxItems && this.ring.maxAgeMs === maxAgeMs && this.outbox.max === queueMax) return
+    this.ring = new FeedRing(maxItems, maxAgeMs)
+    this.outbox = new FeedQueue(queueMax)
+  }
+
+  // The next sequence for this worker's events. It starts at the process's start time in ms, so it grows across restarts.
+  nextSeq(): int {
+    if (this.seq === 0) this.seq = Math.floor(Date.now())
+    this.seq += 1
+    return this.seq
+  }
+
   // Sends a store update to this worker's clients, and through the share file to the others.
   send(text: string): void {
-    for (const c of this.clients) c.send(text)
+    for (const c of this.clients) c.emit(text)
     if (this.shareDir !== "") this.share(text)
   }
 
-  // The share directory of the node's workers: each worker writes its own file.
+  // The share directory of the node's workers: each worker writes its own files there, and the feed's under feed/.
   setShare(dir: string): void {
     try {
-      mkdirSync(dir, { recursive: true })
+      mkdirSync(dir + "/feed", { recursive: true })
       this.shareDir = dir
     } catch (e) {
       this.shareDir = ""
     }
+    this.wake()
+  }
+
+  // An event into the ring, to the clients that may see it, and on to the other workers and the peers. from is
+  // "local" (this worker wrote it: it goes to the peers and the siblings), "peer" (it came from another node: the
+  // siblings get it) or "share" (a sibling already shared it). False for a repeat.
+  ingest(it: FeedItem, from: string): bool {
+    if (!this.ring.add(it, Date.now())) return false
+    if (from === "local" && this.relayOn) {
+      const d = this.outbox.push(it)
+      if (d > 0) metrics.inc("raiju_feed_dropped_total", `reason="queue"`, d)
+    }
+    if (from !== "share" && this.shareDir !== "") this.shareBuf.push(JSON.stringify(it))
+    const text = feedEnvelope(it)
+    for (const c of this.clients) {
+      if (inScope(c.scope, it.team, it.bu, it.customer, it.project)) c.emit(text)
+    }
+    return true
+  }
+
+  // Replays to a client that resumed: the events it missed and may see, its gaps, then a resumed message.
+  private replay(c: UiSocket, cursor: Map<string, int>): void {
+    const r = this.ring.resume(cursor)
+    let n = 0
+    for (const it of r.items) {
+      if (!inScope(c.scope, it.team, it.bu, it.customer, it.project)) continue
+      c.emit(feedEnvelope(it))
+      n += 1
+    }
+    for (const g of r.gaps) {
+      c.emit(gapEnvelope(g))
+      metrics.inc("raiju_feed_gap_events_total", "", g.missing)
+    }
+    c.emit(resumedEnvelope(n, r.gaps.length))
+    metrics.inc("raiju_feed_replayed_total", "", n)
   }
 
   private shareFile(): string {
     return this.shareDir + "/" + process.pid + ".jsonl"
+  }
+
+  private feedFile(): string {
+    return this.shareDir + "/feed/" + process.pid + ".jsonl"
   }
 
   // Appends a store update to this worker's file, keeping its last lines once it is large.
@@ -444,6 +581,30 @@ export cyclic class UiHub {
       writeFileSync(this.shareFile(), out)
     } catch (e) {
       // the other workers miss this update
+    }
+  }
+
+  // Appends this worker's feed lines to its share file. Past FEED_SHARE_MAX bytes the file keeps its newest lines;
+  // a reader that finds its file shorter than before reads it again, and the ring drops what it has already seen.
+  private flushShare(): void {
+    if (this.shareBuf.length === 0) return
+    const text = this.shareBuf.join("\n") + "\n"
+    this.shareBuf = []
+    const f = this.feedFile()
+    try {
+      appendFileSync(f, text)
+    } catch (e) {
+      // the other workers miss these events
+      return
+    }
+    this.shareBytes += text.byteLength
+    if (this.shareBytes <= FEED_SHARE_MAX) return
+    try {
+      const lines = readFileSync(f, "utf8").split("\n")
+      writeFileSync(f, lines.slice(Math.max(0, lines.length - FEED_SHARE_KEEP)).join("\n"))
+      this.shareBytes = 0
+    } catch (e) {
+      // the file keeps growing until the next try
     }
   }
 
@@ -474,10 +635,48 @@ export cyclic class UiHub {
         const line = parts[i]!
         used += line.byteLength + 1
         if (line !== "") {
-          for (const c of this.clients) c.send(line)
+          for (const c of this.clients) c.emit(line)
         }
       }
       this.offsets.set(f, from + used)
+    }
+  }
+
+  // Ingests the events the other workers wrote to their feed share files since the last tick (whole lines only).
+  private fromFeedShares(): void {
+    const dir = this.shareDir + "/feed"
+    let names: string[] = []
+    try {
+      names = readdirSync(dir)
+    } catch (e) {
+      return
+    }
+    const mine = `${process.pid}.jsonl`
+    for (const f of names) {
+      if (f === mine || !f.endsWith(".jsonl")) continue
+      let text = ""
+      try {
+        text = readFileSync(dir + "/" + f, "utf8")
+      } catch (e) {
+        continue
+      }
+      let from = this.feedOffsets.get(f) ?? 0
+      if (from > text.byteLength) from = 0
+      const parts = text.slice(from).split("\n")
+      let used = 0
+      for (let i = 0; i < parts.length - 1; i++) {
+        const line = parts[i]!
+        used += line.byteLength + 1
+        if (line === "") continue
+        let it: FeedItem | undefined = undefined
+        try {
+          it = parseItem(line)
+        } catch (e) {
+          // a line that is not an event is skipped
+        }
+        if (it !== undefined) this.ingest(it, "share")
+      }
+      this.feedOffsets.set(f, from + used)
     }
   }
 
@@ -491,19 +690,15 @@ export cyclic class UiHub {
     }
   }
 
-  // Pushes the request-log entries that arrived since the last tick, and the other workers' updates.
+  // One tick: the share files, the heartbeat, then each batch client's queue.
   tick(): void {
-    if (this.shareDir !== "") this.fromShares()
-    this.beat(Date.now())
-    const store = this.logs()
-    if (store === undefined) return
-    for (const e of store.viewSince(this.since)) {
-      const text = JSON.stringify({ type: "log", data: logEventView(e) })
-      for (const c of this.clients) {
-        if (visibleTo(e, c.scope)) c.send(text)
-      }
-      this.since = e.ts
+    if (this.shareDir !== "") {
+      this.flushShare()
+      this.fromShares()
+      this.fromFeedShares()
     }
+    this.beat(Date.now())
+    for (const c of this.clients) c.flush()
   }
 }
 
@@ -568,6 +763,13 @@ export class Ops {
   sessions = new UiSessions(28800)
   // the /ws clients, and the virtual key that opened each live session (/v1/live/sessions)
   ui: UiHub
+  // the live feed's relay (feed.tov): one queue per peer (and one for the broker), the broker cursor, the relay
+  // timer, the queue bound, and the last relay error reported
+  feedQueues: Map<string, FeedQueue> = new Map()
+  feedTimer: int = -1
+  brokerAfter: int = 0
+  feedMax: int = FEED_QUEUE_MAX
+  feedErr = ""
   liveSessions = new LiveRegistry()
   // single-use tickets for /ws?ticket= (POST /api/session/ws-ticket)
   wsTickets = new WsTickets()
@@ -575,7 +777,14 @@ export class Ops {
   recalc: CostRecalc | undefined = undefined
 
   constructor(readonly engine: Engine, readonly store: ConfigStore) {
-    this.ui = new UiHub(() => this.engine.logStore)
+    this.ui = new UiHub()
+    // every request-log entry this process writes becomes a feed event (feed.tov)
+    const hook = (e: LogEntry): void => {
+      this.feedPublish(e)
+    }
+    this.engine.logFeed = hook
+    const ls = this.engine.logStore
+    if (ls !== undefined) ls.onAdd = hook
     try {
       this.nodeId = secureHex(6)
     } catch (e) {
@@ -627,6 +836,7 @@ export class Ops {
     this.configurePushGateway(cfg.telemetry?.push_gateway)
     this.configureAlerts(cfg.alerts)
     this.configureCluster(cfg.cluster)
+    this.configureFeed(cfg.cluster)
     this.configureProxy(cfg.auth_proxy, cfg.oidc)
     this.configureExports(cfg.log_exports)
     this.configureExporters(cfg.exporters ?? [])
@@ -646,6 +856,11 @@ export class Ops {
       clearInterval(this.clusterTimer)
       this.clusterTimer = -1
     }
+    if (this.feedTimer >= 0) {
+      clearInterval(this.feedTimer)
+      this.feedTimer = -1
+    }
+    this.ui.relayOn = false
     if (this.discoverTimer >= 0) {
       clearInterval(this.discoverTimer)
       this.discoverTimer = -1
@@ -670,6 +885,11 @@ export class Ops {
     this.clusterTimer = setInterval(() => {
       this.syncCluster()
     }, Math.max(100, syncInterval(cc)))
+    // the live feed goes to the other nodes unless cluster.feed.cluster_wide is off
+    this.ui.relayOn = cc.feed?.cluster_wide ?? true
+    this.feedTimer = setInterval(() => {
+      this.feedRelay()
+    }, Math.max(20, cc.feed?.batch_ms ?? FEED_BATCH_MS))
     // broker mode has no discovery: the broker is the rendezvous point
     if (cluster.isBroker(cc) && cc.broker === undefined) console.error(`raiju: cluster: type "broker" needs cluster.broker.address; no cluster traffic until it is set`)
     const dc = cc.discovery
@@ -935,6 +1155,140 @@ export class Ops {
     this.pushLocal(c)
     this.applyRemote(c)
     return json(200, c.encode())
+  }
+
+  // ---- the live feed (/ws) across the workers of a node and the cluster (feed.tov) ----
+
+  // The ring and outbox sizes from cluster.feed (defaults in feed.tov). The ring serves resumes on every node.
+  configureFeed(cc: ClusterConfig | undefined): void {
+    const f = cc?.feed
+    this.feedMax = f?.queue_max ?? FEED_QUEUE_MAX
+    this.ui.configureRing(f?.ring_size ?? FEED_RING_SIZE, (f?.ring_seconds ?? FEED_RING_SECONDS) * 1000.0, this.feedMax)
+  }
+
+  // The feed's producer: the node, or the node and this worker's pid when several workers share it.
+  feedProducer(): string {
+    return this.shareDir === "" ? this.nodeId : `${this.nodeId}/${process.pid}`
+  }
+
+  // A request-log entry this process wrote, as a feed event.
+  feedPublish(e: LogEntry): void {
+    const it: FeedItem = { node: this.feedProducer(), seq: this.ui.nextSeq(), ts: e.ts, team: e.team_id ?? "", bu: e.business_unit_id ?? "", customer: e.customer_id ?? "", project: e.project_id ?? "", data: JSON.stringify(logEventView(e)) }
+    this.ui.ingest(it, "local")
+  }
+
+  // The relay tick: this worker's new events go into each peer's queue (or the broker's), and one request goes out
+  // per queue with events and none in flight. In broker mode every tick also pulls the other nodes' events.
+  feedRelay(): void {
+    const cc = this.clusterCfg
+    if (cc === undefined || !this.ui.relayOn) return
+    const batch = this.ui.outbox.take(this.ui.outbox.size)
+    if (cluster.isBroker(cc)) {
+      const b = cc.broker
+      if (b !== undefined) this.feedBroker(brokerUrl(b) + BROKER_FEED_ROUTE, this.feedQueueFor("broker"), batch, cc.secret)
+      return
+    }
+    const peers = this.peerUrls(cc)
+    for (const k of this.feedQueues.keys()) {
+      if (k !== "broker" && !peers.includes(k)) this.feedQueues.delete(k)
+    }
+    for (const p of peers) {
+      const q = this.feedQueueFor(p)
+      for (const it of batch) this.feedDropped("queue", q.push(it))
+      this.feedPost(p + "/api/cluster/feed", q, cc.secret)
+    }
+  }
+
+  private feedQueueFor(key: string): FeedQueue {
+    const q = this.feedQueues.get(key)
+    if (q !== undefined) return q
+    const nq = new FeedQueue(this.feedMax)
+    this.feedQueues.set(key, nq)
+    return nq
+  }
+
+  // Events that did not get through, by reason: "queue" (the peer was too slow and the oldest went), "send" (a relay
+  // request failed) and "missed" (the broker's ring had moved past them).
+  private feedDropped(reason: string, n: int): void {
+    if (n > 0) metrics.inc("raiju_feed_dropped_total", `reason="${reason}"`, n)
+  }
+
+  // Sends up to FEED_BATCH_MAX queued events to one peer. One request is in flight per peer, and a failed one drops its events.
+  async feedPost(url: string, q: FeedQueue, secret: string): Promise<void> {
+    if (q.busy || q.size === 0) return
+    q.busy = true
+    const items = q.take(FEED_BATCH_MAX)
+    const body = JSON.stringify({ items: items })
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    h.set("x-raiju-cluster-sig", cluster.sign(secret, body))
+    const r = await postText(url, h, body)
+    q.busy = false
+    if (r.status === 200) {
+      this.feedErr = ""
+      metrics.inc("raiju_feed_relayed_total", "", items.length)
+      return
+    }
+    this.feedDropped("send", items.length)
+    const why = r.status === 0 ? r.body : `HTTP ${r.status}`
+    if (why !== this.feedErr) console.error(`raiju: cluster feed: ${url}: ${why}`)
+    this.feedErr = why
+  }
+
+  // Broker mode: one request per tick. It carries this worker's queued events and its cursor, and the answer has the
+  // other nodes' events after the cursor. A broker that restarted has lower positions than the cursor: the cursor goes back to 0.
+  async feedBroker(url: string, q: FeedQueue, batch: FeedItem[], secret: string): Promise<void> {
+    for (const it of batch) this.feedDropped("queue", q.push(it))
+    if (q.busy) return
+    q.busy = true
+    const items = q.take(FEED_BATCH_MAX)
+    const body = JSON.stringify({ node: cluster.nodeOf(this.nodeId), after: this.brokerAfter, items: items })
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    h.set("x-raiju-cluster-sig", cluster.sign(secret, body))
+    const r = await postText(url, h, body)
+    q.busy = false
+    if (r.status !== 200) {
+      this.feedDropped("send", items.length)
+      const why = r.status === 0 ? r.body : `HTTP ${r.status}`
+      if (why !== this.feedErr) console.error(`raiju: cluster feed: broker: ${why}`)
+      this.feedErr = why
+      return
+    }
+    if (this.feedErr !== "") console.error("raiju: cluster feed: broker connected again")
+    this.feedErr = ""
+    try {
+      const ans = parseAnswer(r.body)
+      if (ans.last < this.brokerAfter) {
+        this.brokerAfter = 0
+        return
+      }
+      this.brokerAfter = ans.next
+      this.feedDropped("missed", ans.missed)
+      metrics.inc("raiju_feed_relayed_total", "", items.length)
+      for (const it of ans.items) this.ui.ingest(it, "peer")
+    } catch (e) {
+      console.error(`raiju: cluster feed: bad answer from the broker: ${e.message}`)
+    }
+  }
+
+  // POST /api/cluster/feed from a peer: its events join this worker's ring, and go on to the sibling workers.
+  async clusterFeed(req: Request): Promise<Response> {
+    const cc = this.clusterCfg
+    if (cc === undefined || !this.ui.relayOn) return json(404, errorJson("the cluster feed is off", "invalid_request_error", undefined))
+    const body = await req.text()
+    if (!cluster.verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    let items: FeedItem[] = []
+    try {
+      items = parseFeed(body)
+    } catch (e) {
+      return json(400, errorJson(e.message, "invalid_request_error", undefined))
+    }
+    let n = 0
+    for (const it of items) {
+      if (this.ui.ingest(it, "peer")) n += 1
+    }
+    return json(200, JSON.stringify({ accepted: n }))
   }
 
   // ---- OpenTelemetry metrics (Bifrost's otel metrics_* settings) ----
@@ -1378,28 +1732,97 @@ export class Ops {
     return { status: 200, body: `{"circuits":{${parts.join(",")}}}`, contentType: "application/json" }
   }
 
-  // GET /api/adaptive-routing/held-keys: the keys (provider#key targets) held out of rotation by an open
-  // circuit, with when each was held and when it next gets a check. Raiju holds a key for its breaker's
-  // cooldown; it does not classify the provider's refusal, so there is no reason or wait ladder.
+  // GET /api/adaptive-routing/held-keys: the keys and models held out of rotation by a provider's refusal
+  // (holds.tov): the failure class, the provider's own reason, when each was held, when it is next checked,
+  // its state (held, checking or due) and its rung on the wait ladder.
   adaptiveHeldKeys(): Reply {
     const rows: string[] = []
-    for (const c of this.engine.health.openCircuits(Date.now())) {
-      if (c.id.indexOf("#") < 0) continue
-      rows.push(JSON.stringify({ target: c.id, state: c.state, held_since: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    for (const r of this.engine.health.holds.list(Date.now())) {
+      const h = r.h
+      rows.push(JSON.stringify({ target: h.target, provider: h.provider, key_id: h.keyId, model: h.model, state: r.state, failure_class: h.cls, reason: h.reason, held_since: rfc3339Of(h.heldAt), next_check_at: rfc3339Of(h.nextCheck), wait_seconds: Math.round(h.waitMs / 1000), rung: h.rung }))
     }
     return { status: 200, body: `{"held_keys":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
   }
 
-  // GET /api/adaptive-routing/incidents: the circuits open now (keys, policies, and a policy's key
-  // sub-circuits), each with when it opened. Resolved incidents are not kept.
+  // GET /api/adaptive-routing/incidents: the incidents still open (a hold, or a circuit a run of failures
+  // opened) and the policy circuits open now. Resolved incidents are in the history route.
   adaptiveIncidents(): Reply {
+    const now = Date.now()
     const rows: string[] = []
-    for (const c of this.engine.health.openCircuits(Date.now())) {
-      const kind = c.id.indexOf("#") >= 0 ? "key" : c.id.indexOf("/") >= 0 ? "policy_key" : "policy"
-      const status = c.state === "half_open" ? "Recovering" : "Needs attention"
-      rows.push(JSON.stringify({ target: c.id, kind: kind, status: status, opened_at: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    for (const inc of this.engine.health.holds.incidentList()) {
+      if (inc.resolvedAt > 0) continue
+      rows.push(JSON.stringify(incidentRow(inc, now)))
+    }
+    for (const c of this.engine.health.openCircuits(now)) {
+      if (c.id.indexOf("#") >= 0) continue
+      const status = c.state === "half_open" ? "recovering" : "attention"
+      rows.push(JSON.stringify({ target: c.id, kind: "policy", status: status, opened_at: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
     }
     return { status: 200, body: `{"incidents":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
+  }
+
+  // GET /api/adaptive-routing/history/issues: the incidents that were open at some point in a window (from,
+  // to: RFC 3339, or unix seconds; the window defaults to all of history until now). statuses (attention,
+  // recovering, resolved) filters them; sort is priority (attention first, then newest), newest, oldest,
+  // longest or shortest. limit (default 25, at most 100) and offset page the result; with neither, every
+  // match is returned. matched_summary covers every match, not the page.
+  adaptiveHistory(req: Request): Reply {
+    const u = URL.parse(req.url)
+    const params = u === undefined ? new URLSearchParams("") : u.searchParams
+    const now = Date.now()
+    const from = historyBound(params.get("from"), 0.0)
+    const to = historyBound(params.get("to"), now)
+    if (from === undefined || to === undefined) return badRequest("from and to must be RFC 3339 times or unix seconds")
+    const sort = params.get("sort") ?? "priority"
+    if (!["priority", "newest", "oldest", "longest", "shortest"].includes(sort)) return badRequest("sort must be priority, newest, oldest, longest or shortest")
+    const statuses = (params.get("statuses") ?? "").split(",").filter((s: string) => s !== "")
+    for (const s of statuses) {
+      if (!["attention", "recovering", "resolved"].includes(s)) return badRequest("statuses takes attention, recovering or resolved")
+    }
+    const limitRaw = params.get("limit")
+    const offsetRaw = params.get("offset")
+    const paged = limitRaw !== undefined || offsetRaw !== undefined
+    const limit = limitRaw === undefined ? 25 : Math.min(100, Math.max(1, parseInt(limitRaw) ?? 25))
+    const offset = offsetRaw === undefined ? 0 : parseInt(offsetRaw) ?? 0
+    if (offset < 0) return badRequest("offset must not be negative")
+    const matched: { inc: Incident, status: string, dur: f64 }[] = []
+    for (const inc of this.engine.health.holds.incidentList()) {
+      const end = inc.resolvedAt > 0 ? inc.resolvedAt : now
+      if (end < from || inc.openedAt > to) continue
+      const st = incidentStatus(inc)
+      if (statuses.length > 0 && !statuses.includes(st)) continue
+      matched.push({ inc: inc, status: st, dur: end - inc.openedAt })
+    }
+    matched.sort((a, b) => {
+      if (sort === "newest") return b.inc.openedAt - a.inc.openedAt
+      if (sort === "oldest") return a.inc.openedAt - b.inc.openedAt
+      if (sort === "longest") return b.dur - a.dur
+      if (sort === "shortest") return a.dur - b.dur
+      const pa = a.status === "resolved" ? 1 : 0
+      const pb = b.status === "resolved" ? 1 : 0
+      if (pa !== pb) return pa - pb
+      return b.inc.openedAt - a.inc.openedAt
+    })
+    // the summary: counts by status, the median time to resolve, and the longest open incident
+    const resolved: number[] = []
+    let attention = 0
+    let recovering = 0
+    let longestOngoing = 0
+    for (const m of matched) {
+      if (m.status === "resolved") resolved.push(m.dur)
+      else {
+        if (m.status === "attention") attention += 1
+        else recovering += 1
+        longestOngoing = Math.max(longestOngoing, m.dur)
+      }
+    }
+    resolved.sort((a, b) => a - b)
+    const median = resolved.length === 0 ? "null" : "" + Math.round(resolved[Math.floor(resolved.length / 2)]! / 1000)
+    const page = paged ? matched.slice(offset, offset + limit) : matched
+    const issues: string[] = []
+    for (const m of page) issues.push(JSON.stringify(incidentRow(m.inc, now)))
+    const summary = `{"attention":${attention},"recovering":${recovering},"resolved":${resolved.length},"median_resolve_seconds":${median},"longest_ongoing_seconds":${Math.round(longestOngoing / 1000)}}`
+    return okJson(`{"issues":[${issues.join(",")}],"total":${matched.length},"offset":${offset},"matched_summary":${summary}}`)
   }
 
   // POST /api/adaptive-routing/conditions/clear: releases the held keys named by {"keys": [...]} (target
@@ -1418,13 +1841,29 @@ export class Ops {
         return badRequest("the body must be a JSON object")
       }
     }
-    if (all) return okJson(JSON.stringify({ message: "held keys released", count: h.resetAll() }))
-    // only circuits that are open now count as released
+    const now = Date.now()
+    if (all) {
+      // every hold, and every circuit that is open now
+      let n = h.holds.clearAll(now)
+      for (const c of h.openCircuits(now)) {
+        if (h.reset(c.id)) {
+          h.holds.noteClose(c.id, now)
+          n += 1
+        }
+      }
+      return okJson(JSON.stringify({ message: "held keys released", count: n }))
+    }
+    // a target is a key ("provider#key") or one of its models ("provider#key@model"), and counts once
     const open: string[] = []
-    for (const c of h.openCircuits(Date.now())) open.push(c.id)
+    for (const c of h.openCircuits(now)) open.push(c.id)
     let n = 0
     for (const id of ids) {
-      if (open.includes(id) && h.reset(id)) n += 1
+      let hit = h.holds.clear(id, now)
+      if (open.includes(id) && h.reset(id)) {
+        h.holds.noteClose(id, now)
+        hit = true
+      }
+      if (hit) n += 1
     }
     return okJson(JSON.stringify({ message: "held keys released", count: n }))
   }
@@ -1504,15 +1943,15 @@ export class Ops {
     if (path === "/api/logs/histogram/throughput") return okJson(throughputView(es, g))
     if (path === "/api/logs/histogram/throughput/by-provider") return okJson(providerView(es, g, "throughput"))
     if (path === "/api/logs/histogram/cost/by-dimension" || path === "/api/logs/histogram/tokens/by-dimension" || path === "/api/logs/histogram/latency/by-dimension") {
-      const bad = this.dimensionError(dim)
+      const bad = this.dimensionError(dim, true)
       if (bad !== "") return badRequest(bad)
       const what = path.includes("/cost/") ? "cost" : path.includes("/tokens/") ? "tokens" : "latency"
-      return okJson(dimensionView(es, g, what, dim))
+      return okJson(dimensionView(es, g, what, histogramDimName(dim), dim))
     }
     if (path === "/api/logs/rankings") return okJson(modelRankingsView(es, prev, ranked))
     if (path === "/api/logs/rankings/users") return okJson(dimensionRankingsView(es, prev, "user", ranked))
     if (path === "/api/logs/rankings/by-dimension") {
-      const bad = this.dimensionError(dim)
+      const bad = this.dimensionError(dim, false)
       if (bad !== "") return badRequest(bad)
       return okJson(dimensionRankingsView(es, prev, dim, ranked))
     }
@@ -1600,7 +2039,7 @@ export class Ops {
     const f = listFilter(recalcQuery(rb.filters), Date.now())
     const pricing = this.engine.pricing
     const job = new CostRecalc(
-      (e) => pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens),
+      (e) => (e.op === "decisions" ? pricing.decisionCost(e.provider, e.model, e.prompt_tokens, e.completion_tokens) : pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens)),
       (costs) => store.recost((e) => costs.get(e.id))
     )
     job.begin(selectAll(scopedView(store, sc, f.since - 1.0), f), Date.now())
@@ -1786,10 +2225,17 @@ export class Ops {
     return v >= 1 ? v : -1
   }
 
-  // "" when dim is a dimension the log store records, else the message for a 400.
-  private dimensionError(dim: string): string {
-    if (dim === "") return "Missing required query parameter: dimension. Valid values: provider, model, virtual_key"
-    if (!validDimension(dim)) return `Invalid dimension: ${dim}. Valid values: provider, model, virtual_key`
+  // "" when dim is a dimension the log store records for the route, else Bifrost's message for a 400. The
+  // histograms take Bifrost's names (team_id, ...) and the rankings its names (team, ...); Raiju's own
+  // dimensions (provider, model, virtual_key, tool, server) are accepted on both without being listed.
+  private dimensionError(dim: string, histogram: bool): string {
+    if (histogram) {
+      if (dim === "") return "Missing required query parameter: dimension. Valid values: provider, team_id, customer_id, user_id, business_unit_id, project_id, app, user_agent"
+      if (!validDimension(histogramDimName(dim))) return `Invalid dimension: ${dim}. Valid values: provider, team_id, customer_id, user_id, business_unit_id, project_id, app, user_agent`
+      return ""
+    }
+    if (dim === "") return "Missing required query parameter: dimension. Valid values: team, customer, business_unit, project, user, virtual_key, app, user_agent"
+    if (!validDimension(dim)) return `Invalid dimension: ${dim}. Valid values: team, customer, business_unit, project, user, virtual_key, app, user_agent`
     return ""
   }
 
@@ -2319,6 +2765,15 @@ export class Ops {
     return { kind: "deny", res: denied(v.status, v.message) }
   }
 
+  // Whether a request carries a dashboard sign-in (a session token, or admin credentials): the identity a session-mode
+  // consent grants (Bifrost's consentIdentityPresent). With dashboard auth off there is none.
+  consentSignedIn(req: Request): bool {
+    if (!this.authOn) return false
+    const auth = req.headers.get("authorization") ?? ""
+    if (auth.startsWith("Bearer sk-sess-")) return this.sessions.get(auth.slice(7), Date.now()) !== undefined
+    return authorize(this.rbac, snapshot(req.headers), "GET", "/api/users/me/permissions").kind === "ok"
+  }
+
   // ---- identity-aware proxy (AWS ALB, Cloudflare Access, a generic JWT proxy) ----
 
   configureProxy(ap: AuthProxyConfig | undefined, oc: OidcConfig | undefined): void {
@@ -2473,8 +2928,11 @@ export class Ops {
   }
 
   // The archive copy: the events in each window that has closed (archive_grace_seconds before now) since
-  // the last copy go to object storage as one JSONL object. The first run only sets the mark, so events
-  // written before archiving was turned on are not copied. Rows are never deleted here.
+  // the last copy go to object storage as a Bifrost-style window (audit.tov's archive layout, planWindow):
+  // parts cut at archive_max_object_bytes, gzipped when archive_compress is set, then the manifest that
+  // commits the window. The mark moves only after the manifest is stored, so a failed window is retried
+  // whole on the next pass. The first run only sets the mark, so events written before archiving was
+  // turned on are not copied. Rows are never deleted here.
   async auditArchive(): Promise<void> {
     const log = this.audit
     const ac = this.store.cfg.audit?.archive
@@ -2490,30 +2948,41 @@ export class Ops {
       const end = now - grace * 1000
       if (end <= mark.until) return
       const w = log.exportWindow(mark.seq, end)
-      if (w.count === 0) {
-        log.setArchiveMark({ seq: mark.seq, until: end })
-        return
-      }
       const ec: LogExportsConfig = {
-        enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix ?? "audit", region: ac.region, endpoint: ac.endpoint,
+        enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix, region: ac.region, endpoint: ac.endpoint,
         access_key_id: ac.access_key_id, secret_access_key: ac.secret_access_key, session_token: ac.session_token,
         interval_seconds: ac.interval_seconds, path_style: ac.path_style, format: ac.format, retention_days: ac.retention_days,
       }
-      const put = putRequest(ec, objectKey(ec, mark.until, end, this.nodeId, "jsonl"), w.body, now)
-      const hs: Record<string, string> = put.headers
+      const plan = planWindow(ac.prefix ?? "bifrost", mark.until, end, w.body, maxObjectBytes(this.store.cfg.audit?.archive_max_object_bytes), this.store.cfg.audit?.archive_compress === true, now)
+      for (const o of plan.objects) {
+        const req = putObjectRequest(ec, o.key, o.body, o.contentType, Date.now())
+        if (!(await this.archivePut(req))) return
+      }
+      log.setArchiveMark({ seq: w.last, until: end })
+    } catch (e) {
+      console.error(`raiju: audit archive failed: ${e.message}`)
+    }
+  }
+
+  // One archive object's upload, tried up to three times with a growing pause. False when every try failed.
+  async archivePut(req: ByteRequest): Promise<bool> {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let ok = false
       const dl = deadline(30000)
       try {
-        const r = await fetch(put.url, { method: "PUT", headers: hs, body: put.body, signal: dl.controller.signal })
+        const hs: Record<string, string> = req.headers
+        const r = await fetch(req.url, { method: "PUT", headers: hs, body: req.body, signal: dl.controller.signal })
         await r.text()
-        if (r.status >= 200 && r.status < 300) log.setArchiveMark({ seq: w.last, until: end })
-        else console.error(`raiju: audit archive: HTTP ${r.status} from ${put.url}`)
+        ok = r.status >= 200 && r.status < 300
+        if (!ok) console.error(`raiju: audit archive: HTTP ${r.status} from ${req.url}`)
       } catch (e) {
         console.error(`raiju: audit archive: ${e.message}`)
       }
       dl.finish()
-    } catch (e) {
-      console.error(`raiju: audit archive failed: ${e.message}`)
+      if (ok) return true
+      if (attempt < 3) await new Promise<void>((resolve) => setTimeout(resolve, 1000 * attempt))
     }
+    return false
   }
 
   // /api/users/me/permissions: the caller's custom role as (resource, operation) pairs with their ids.
@@ -2561,7 +3030,7 @@ export class Ops {
   // GET /api/users/me/vk-creation-policy: the access profile that governs keys the caller creates.
   vkCreationPolicy(actor: string): Reply {
     const g = this.store.cfg.governance
-    return { status: 200, body: creationPolicy(g?.users, g?.access_profiles, actor), contentType: "application/json" }
+    return { status: 200, body: creationPolicy(g?.users, g?.roles, g?.access_profiles, actor), contentType: "application/json" }
   }
 
   // /api/users/{name}/access-profiles: GET lists the profiles the user holds; PUT and DELETE
@@ -2576,7 +3045,7 @@ export class Ops {
     const g = this.store.cfg.governance
     if (segs.length === 4) {
       if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
-      const held = heldProfiles(g?.users, g?.access_profiles, name)
+      const held = heldProfiles(g?.users, g?.roles, g?.access_profiles, name)
       return { status: 200, body: JSON.stringify({ access_profiles: held }), contentType: "application/json" }
     }
     const add = method === "PUT"
@@ -2605,11 +3074,52 @@ export class Ops {
     return { status: r.status, body: r.body, contentType: "application/json" }
   }
 
+  // /api/governance/access-profiles/{id}/roles: POST attaches roles ({"role_ids": [...], "is_default": bool});
+  // DELETE .../roles/{role_id} detaches one. Every user holding one of the roles holds the profile, so the
+  // reply counts those users as users_applied.
+  profileRoles(method: string, segs: string[], body: string): Reply {
+    const id = segs[3] ?? ""
+    if (segs.length === 5 && method === "POST") {
+      let b: RoleAttachBody = {}
+      try {
+        b = JSON.parse(body) as RoleAttachBody
+      } catch (e) {
+        return { status: 400, body: errorJson("body must be a JSON object with role_ids", "invalid_request_error", undefined), contentType: "application/json" }
+      }
+      const ids: int[] = b.role_ids ?? []
+      if (ids.length === 0) return { status: 400, body: errorJson("role_ids is required", "invalid_request_error", undefined), contentType: "application/json" }
+      const r = this.store.attachProfileRoles(id, ids, b.is_default)
+      if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+      const g = this.store.cfg.governance
+      let n = 0
+      for (const u of g?.users ?? []) {
+        const rid = roleIdOf(g?.roles, u.role)
+        if (rid !== undefined && ids.includes(rid)) n += 1
+      }
+      return { status: 200, body: JSON.stringify({ message: "roles attached", users_applied: n }), contentType: "application/json" }
+    }
+    if (segs.length === 6 && method === "DELETE") {
+      const rid = parseInt(segs[5] ?? "") ?? 0
+      const r = this.store.detachProfileRole(id, rid)
+      if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+      return { status: 200, body: JSON.stringify({ message: "role detached" }), contentType: "application/json" }
+    }
+    return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+  }
+
   // /api/governance/access-profiles[/{id}]. A profile that keys still use can't be deleted.
   profiles(method: string, path: string, body: string): Reply {
     const gov = this.store.cfg.governance
     const segs0 = path.split("/").filter((s) => s !== "")
     if (method === "POST" && segs0.length === 5 && segs0[4] === "propagate") return this.propagateProfile(segs0[3] ?? "", body)
+    if (segs0.length >= 5 && segs0[4] === "roles") return this.profileRoles(method, segs0, body)
+    // a profile attached to a role is detached from it first, as Bifrost refuses the delete while it is held
+    if (method === "DELETE") {
+      const did = segs0[3] ?? ""
+      for (const p of gov?.access_profiles ?? []) {
+        if (p.id === did && (p.roles ?? []).length > 0) return { status: 409, body: errorJson(`access profile ${did} is attached to roles; detach it first`, "invalid_request_error", undefined), contentType: "application/json" }
+      }
+    }
     const r = handleProfiles(gov?.access_profiles ?? [], method, path, body)
     if (method === "GET" || r.status >= 300) return { status: r.status, body: r.body, contentType: "application/json" }
     if (method === "DELETE") {
@@ -2706,6 +3216,11 @@ export class Ops {
       const named = keyById(this.engine.cfg, caller.vk)
       if (!keyUsable(named, Date.now()) || named === undefined) return denied(401, "the virtual key this token names is not active", challenge)
       h.set("x-bf-vk", named.value)
+    } else if (caller.kind === "session") {
+      // a session token carries no verified identity (Bifrost): the request is anonymous, refused while auth is enforced,
+      // and keys its per-user OAuth tokens by the session id the token names
+      if (this.engine.gov.enforce) return denied(401, "authentication required; session-mode tokens are not accepted when authentication is enforced - re-authenticate with a virtual key", challenge)
+      h.set("x-bf-mcp-session-id", caller.sub)
     } else if (serverAuthMode(this.engine.cfg) === "oauth") {
       return denied(401, "this server requires OAuth JWT authentication; header credentials are not accepted in oauth mode", challenge)
     }

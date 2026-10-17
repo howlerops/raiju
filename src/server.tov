@@ -1,6 +1,6 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
-import { Config, VirtualKeyConfig, providerOf, providerNames } from "./config"
+import { Config, VirtualKeyConfig, providerOf, providerNames, resolveEnv } from "./config"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
@@ -21,16 +21,17 @@ import * as metrics from "./metrics"
 import { Session, SocketExt, prepare, onOpen, onMessage, onClose, extOpen, extMessage, extClose, extPong, attachHttp1 } from "./realtime"
 import { ResponsesSocket } from "./wsresponses"
 import { LiveSocket, liveContent, liveCreate, contentId, attachId, attachUpstream, ownerOf, credentialOk, validId } from "./live"
-import { WsConnection } from "./ws"
+import { WsConnection, SocketGate } from "./ws"
 import { DataScope } from "./scope"
 import { resourceOf } from "./rbac"
 import { matchRoute, handleMedia, deploymentRoute, deploymentRequest, realtimeSdp, nativeRoute, nativeCloud, vertexBearer } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs } from "./schemas"
-import { handleApi, proxyWidening, Result } from "./store"
+import { handleApi, proxyWidening, Result, randomId } from "./store"
+import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
 import { passthroughPath, passthroughRoute } from "./passthrough"
 import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, headersRouteAsync, perUserApi, McpReply } from "./mcpapi"
-import { issuerRoute, keyById } from "./mcpissuer"
+import { issuerRoute, keyById, grantsList, grantRevoke } from "./mcpissuer"
 import { promptRoute } from "./prompts"
 import { webhookApi, asyncSubmitHooked } from "./webhooks"
 import { flagRoute } from "./flags"
@@ -38,6 +39,7 @@ import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
 import { McpSession } from "./mcp"
 import { Ops, Reply, UiSocket } from "./ops"
+import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
@@ -428,6 +430,47 @@ function savedReply(status: int, body: string, saved: Result | undefined): Reply
   return { status: status, body: body, contentType: "application/json" }
 }
 
+// The SCIM reply: the body with the SCIM media type.
+function scimReply(status: int, body: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", SCIM_CONTENT_TYPE)
+  return new Response(body, { status: status, headers: h })
+}
+
+// The virtual keys' teams: a group in use by one is not deleted over SCIM.
+function keyTeamIds(vks: VirtualKeyConfig[] | undefined): string[] {
+  const out: string[] = []
+  for (const vk of vks ?? []) {
+    const t = vk.team_id
+    if (t !== undefined) out.push(t)
+  }
+  return out
+}
+
+// /scim/v2: the identity provider's SCIM requests, behind scim_config's provisioning token. The users and
+// teams a request changes are saved as one change and audited under the actor "scim".
+async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response> {
+  const sc = ops.store.cfg.scim_config
+  if (sc?.enabled !== true) return scimReply(404, errorBody(404, "", "SCIM provisioning is not enabled"))
+  const token = resolveEnv(sc?.config?.provisioningToken ?? "")
+  if (!scimAuthorized(req.headers.get("authorization") ?? "", token)) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
+  const body = req.method === "GET" ? "" : await req.text()
+  const u = URL.parse(req.url)
+  const origin = u === undefined ? "" : u.origin
+  const params = u === undefined ? new URLSearchParams("") : u.searchParams
+  const g = ops.store.cfg.governance
+  const st: ScimState = { users: g?.users ?? [], teams: g?.teams ?? [], roles: g?.roles ?? [], keyTeams: keyTeamIds(g?.virtual_keys) }
+  const r = scimHandle(st, req.method, path.slice("/scim/v2".byteLength), params, body, origin + "/scim/v2", () => randomId("team-"))
+  if (r.changed && r.status < 300) {
+    const saved = ops.store.setScim(r.state.users, r.state.teams)
+    if (saved.kind !== "ok") return scimReply(saved.status, errorBody(saved.status, "", saved.message))
+    ops.storeUpdated("/api/users")
+    ops.storeUpdated("/api/governance/teams")
+  }
+  if (req.method !== "GET") ops.recordChange("scim", req, path, r.status, body)
+  return scimReply(r.status, r.body)
+}
+
 // The management API, behind RBAC; every change lands in the audit log.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const gate = ops.gate(req, path)
@@ -456,6 +499,15 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
       if (saved.kind !== "ok") r = { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
     }
   }
+  // the MCP grants of the authorization server: the live grants (GET) and the revoke of one (DELETE)
+  else if (path === "/api/oauth2/sessions" || path.startsWith("/api/oauth2/sessions/")) {
+    const gu = URL.parse(req.url)
+    const gq = gu === undefined ? new URLSearchParams("") : gu.searchParams
+    const vkName = (vk: string): string => keyById(ops.engine.cfg, vk)?.name ?? ""
+    const ga = path === "/api/oauth2/sessions" && req.method === "GET" ? grantsList(gq, vkName) : path !== "/api/oauth2/sessions" && req.method === "DELETE" ? grantRevoke(path.slice("/api/oauth2/sessions/".byteLength)) : undefined
+    if (ga !== undefined) r = { status: ga.status, body: ga.body, contentType: ga.contentType }
+    else r = { status: 405, body: `{"error":{"message":"method ${req.method} is not allowed on this route","type":"invalid_request_error"}}`, contentType: "application/json" }
+  }
   else if (path === "/api/alerts") r = req.method === "GET" ? ops.alertsView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
   else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
@@ -466,6 +518,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   // adaptive load balancing: the keys held out of rotation, their incidents, and releasing them
   else if (path === "/api/adaptive-routing/held-keys") r = req.method === "GET" ? ops.adaptiveHeldKeys() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/adaptive-routing/incidents") r = req.method === "GET" ? ops.adaptiveIncidents() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path === "/api/adaptive-routing/history/issues") r = req.method === "GET" ? ops.adaptiveHistory(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/adaptive-routing/conditions/clear") r = req.method === "POST" ? ops.adaptiveRelease(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/vault/flush-cache") r = req.method === "POST" ? ops.vaultFlush() : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/models/parameters") r = req.method === "GET" ? await ops.modelParameters(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
@@ -527,7 +580,8 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)
-  return new Response(r.body, { status: r.status, headers: h })
+  // a 204 has no body (a response with one would be refused)
+  return new Response(r.status === 204 ? undefined : r.body, { status: r.status, headers: h })
 }
 
 function mcpView(engine: Engine): Response {
@@ -611,9 +665,9 @@ const CHAT_PATHS = ["/v1/chat/completions", "/openai/v1/chat/completions", "/ope
 // LiteLLM and LangChain clients pointed at the gateway: /litellm/... and /langchain/...
 // are the same routes without the prefix.
 export function compatPath(p: string): string {
-  if (p.startsWith("/litellm/")) return compatPath(p.slice(8))
-  if (p.startsWith("/langchain/")) return compatPath(p.slice(10))
-  if (p.startsWith("/pydanticai/")) return compatPath(p.slice(11))
+  if (p.startsWith("/litellm/")) return sdkPath(p.slice(8))
+  if (p.startsWith("/langchain/")) return sdkPath(p.slice(10))
+  if (p.startsWith("/pydanticai/")) return sdkPath(p.slice(11))
   // Cursor's routes are the same families under /cursor (its chat is served by dispatch: cursorChat)
   if (p.startsWith("/cursor/") && !isCursorChat(p)) return compatPath(p.slice(7))
   // the OpenAI SDK pointed at /openai: every /v1 route under /openai/v1
@@ -624,6 +678,13 @@ export function compatPath(p: string): string {
   // the same family mounted without the version segment (Bifrost mounts both): /openai/responses is /v1/responses
   if (isUnversionedOpenAI(p)) return "/v1" + p.slice(7)
   return p
+}
+
+// The SDK prefixes mount the decisions route without the version segment too (Bifrost's /litellm/decisions),
+// so /decisions under a prefix is /v1/decisions. A bare /decisions is not a route, as in Bifrost.
+function sdkPath(p: string): string {
+  const cp = compatPath(p)
+  return cp === "/decisions" ? "/v1/decisions" : cp
 }
 
 function isCursorChat(p: string): bool {
@@ -704,6 +765,8 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   const cp = compatPath(p)
   if (cp !== p) return try await dispatch(engine, ops, await unprefixed(req, cp))
   const segs = p.split("/")
+  // SCIM 2.0 provisioning from the identity provider, behind its own bearer token (scim.tov)
+  if (p === "/scim/v2" || p.startsWith("/scim/v2/")) return await scimRoute(ops, req, p)
   if (p === "/mcp") return await ops.mcp(req, undefined)
   if (p.startsWith("/mcp/") && segs.length === 3) return await ops.mcp(req, segs[2]!)
   // the Anthropic SDK's batch, file and model routes: before the generic media routes
@@ -726,7 +789,7 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   }
   const lc = contentId(p)
   if (lc !== "" && m === "GET") return await liveContent(engine, ops.liveSessions, req, lc)
-  if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine.cfg, req, await liveCreate(engine, req))
+  if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine.cfg, req, await liveCreate(engine, ops.liveSessions, req))
   if (m === "GET" || m === "HEAD") {
     // x-bf-async-id on an inference route: poll the job that route created
     const aid = req.headers.get("x-bf-async-id") ?? ""
@@ -777,6 +840,7 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
+  if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
   if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
   if (p.startsWith("/api/oidc/") && m === "GET") return await ops.oidcRoute(req, p)
   // the MCP OAuth callback: the browser comes back here from the authorization server, with no session
@@ -787,7 +851,9 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   }
   // the MCP authorization server (client.mcp_server_auth_mode both or oauth): discovery, registration, the
   // authorize and token endpoints, the consent pages, and the per-user connect page
-  const ia = await issuerRoute(engine.cfg, req, p, (v) => keyByValue(engine, v), (id) => keyById(engine.cfg, id), Date.now())
+  // the consent page offers session mode to a signed-in dashboard user (checked only on the consent routes)
+  const signedIn = p.startsWith("/api/oauth2/consent/flows/") && ops.consentSignedIn(req)
+  const ia = await issuerRoute(engine.cfg, req, p, (v) => keyByValue(engine, v), (id) => keyById(engine.cfg, id), Date.now(), signedIn, engine.gov.enforce)
   if (ia !== undefined) return ia
   // login and logout come before the gate: they are how a caller gets past it
   if (p.startsWith("/api/session/")) return await ops.sessionRoute(req, p)
@@ -845,6 +911,8 @@ export function streamKind(p: string): string {
   if (p === "/cohere/v2/chat") return "cohere"
   if (p.startsWith(GENAI) && p.endsWith(":streamGenerateContent")) return "genai"
   if (p.startsWith("/bedrock/model/") && (p.endsWith("/converse-stream") || p.endsWith("/invoke-with-response-stream"))) return "bedrock"
+  if (p === "/anthropic/v1/complete") return "legacy"
+  if (isCursorChat(p)) return "cursor"
   return ""
 }
 
@@ -868,6 +936,8 @@ export async function routeStream(engine: Engine, req: Request, kind: string, si
   if (dep !== undefined) return await routeStream(engine, await deploymentRequest(req, dep), kind, sink)
   const p = compatPath(u === undefined ? "" : u.pathname)
   if (kind === "anthropic") return await anthropicMessages(engine, req, sink)
+  if (kind === "legacy") return await anthropicLegacy(engine, req, sink)
+  if (kind === "cursor") return await cursorChat(engine, req, sink)
   if (kind === "cohere") return await cohereChat(engine, req, sink)
   if (kind === "genai") return await genai(engine, req, p.slice(GENAI.byteLength), sink)
   if (kind === "bedrock") {
@@ -952,6 +1022,12 @@ function wsSession(req: Request, ext: SocketExt): Session {
   return s
 }
 
+// The route's session cap (websocket.max_connections_per_user) for a socket that counts against it.
+function gated(ext: SocketExt, g: SocketGate): SocketExt {
+  ext.gate = g
+  return ext
+}
+
 // The WebSocket routes, for both servers: the realtime relay, the Responses API (GET /v1/responses),
 // GPT Live (/v1/live/sessions and its attach) and the UI socket (/ws). A refusal is decided before
 // the upgrade, so the client gets an HTTP status.
@@ -968,8 +1044,8 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
   const att = attachId(p)
   if (p !== "/v1/responses" && p !== "/v1/live/sessions" && p !== "/ws" && att === "") return { kind: "none" }
   const h = snapshot(req.headers)
-  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, new ResponsesSocket(engine, h)) }
-  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map())) }
+  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, gated(new ResponsesSocket(engine, h), engine.wsResponses)) }
+  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map()), engine.wsLive)) }
   if (att !== "") {
     if (!validId(att)) return { kind: "refused", status: 400, message: "a session id is required" }
     if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
@@ -977,20 +1053,27 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
     if (!ops.liveSessions.allowed(att, owner)) return { kind: "refused", status: 404, message: "live session not found" }
     const up = attachUpstream(engine, h, att)
     if (up === undefined) return { kind: "refused", status: 404, message: "no OpenAI key is configured for live sessions" }
-    return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers)) }
+    return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers), engine.wsLive)) }
   }
   if (p === "/ws") {
+    // the resume cursor (since=node:seq,...) and the batch flag (batch=1) ride on the URL; a bad cursor is refused
+    // before the ticket is spent
+    const sinceText = u === undefined ? "" : u.searchParams.get("since") ?? ""
+    const cursor: Map<string, int> | undefined = sinceText === "" ? undefined : parseCursor(sinceText)
+    if (sinceText !== "" && cursor === undefined) return { kind: "refused", status: 400, message: "since must be node:seq pairs" }
+    const bt = u === undefined ? "" : u.searchParams.get("batch") ?? ""
+    const batch = bt === "1" || bt === "true"
     // a ticket from POST /api/session/ws-ticket stands for the caller's credentials, once and briefly
     const tk = u === undefined ? "" : u.searchParams.get("ticket") ?? ""
     if (tk !== "") {
       const actor = ops.wsTickets.consume(tk, Date.now())
       if (actor === undefined) return { kind: "refused", status: 401, message: "the WebSocket ticket is invalid, used or expired" }
-      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(actor))) }
+      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(actor), batch, cursor)) }
     }
     // the live feed is log data: whoever may read /api/logs may open it, and sees its own data scope
     const g = ops.gate(req, "/api/logs")
     if (g.kind === "deny") return { kind: "refused", status: g.res.status, message: g.res.status === 401 ? "authentication is required" : "this role may not open the UI socket" }
-    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(g.actor))) }
+    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(g.actor), batch, cursor)) }
   }
   return { kind: "none" }
 }
@@ -1076,6 +1159,13 @@ test("compat paths: the unversioned OpenAI family and the Cursor prefix", () => 
   expect(compatPath("/cursor/anthropic/v1/messages")).toBe("/anthropic/v1/messages")
   expect(compatPath("/cursor/v1/chat/completions")).toBe("/cursor/v1/chat/completions")
   expect(compatPath("/v1/chat/completions")).toBe("/v1/chat/completions")
+  // decisions: the version segment is optional under the OpenAI family and the SDK prefixes
+  expect(compatPath("/openai/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/openai/v1/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/litellm/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/langchain/v1/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/pydanticai/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/decisions")).toBe("/decisions")
 })
 
 test("the Responses route streams through the sink when the request asks for a stream", () => {

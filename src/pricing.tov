@@ -14,18 +14,25 @@
 import { Config, PricingEntry } from "./config"
 import { PRICING_DATA } from "./pricing_data"
 
-// USD per token. A missing cache rate bills cached tokens at the input rate.
-export type Price = { input: f64, output: f64, cacheRead?: f64, cacheWrite?: f64 }
+// USD per token. A missing cache rate bills cached tokens at the input rate. The decision rates
+// bill a decision request's tokens; a missing one is the normal rate (computeDecisionCost in Bifrost).
+export type Price = { input: f64, output: f64, cacheRead?: f64, cacheWrite?: f64, inputDecisions?: f64, outputDecisions?: f64 }
 
 // One datasheet row with the provider and base model it was filed under.
 export type PriceRow = { provider: string, baseModel: string, price: Price }
 
+// A request's price split into its input and output parts (USD).
+export type CostParts = { input: f64, output: f64 }
+
 // A pricing override as Bifrost stores it. Only scope_kind "global" and
 // "provider" apply; virtual-key scopes need request context and are skipped
-// (setOverrides returns how many it skipped). request_types are not checked.
+// (setOverrides returns how many it skipped). request_types decide which billing
+// an override patches: "decisions" for a decision request, any other type for the
+// rest. An override with no request_types patches both, as before.
 export type PricingOverride = {
   scope_kind: string,
   provider_id?: string,
+  request_types?: string[],
   match_type: string,
   pattern: string,
   pricing_patch: string,
@@ -38,9 +45,12 @@ type PricePatch = {
   output_cost_per_token?: f64,
   cache_read_input_token_cost?: f64,
   cache_creation_input_token_cost?: f64,
+  input_cost_per_token_decisions?: f64,
+  output_cost_per_token_decisions?: f64,
 }
 
-type Patch = { provider: string, pattern: string, wildcard: bool, rates: PricePatch }
+// decisions and others: whether the patch applies to a decision request, and to any other request.
+type Patch = { provider: string, pattern: string, wildcard: bool, rates: PricePatch, decisions: bool, others: bool }
 
 type Catalog = {
   rows: Map<string, PriceRow>,
@@ -213,6 +223,8 @@ function overlay(base: Price | undefined, r: PricePatch): Price {
     output: r.output_cost_per_token ?? b.output,
     cacheRead: r.cache_read_input_token_cost ?? b.cacheRead,
     cacheWrite: r.cache_creation_input_token_cost ?? b.cacheWrite,
+    inputDecisions: r.input_cost_per_token_decisions ?? b.inputDecisions,
+    outputDecisions: r.output_cost_per_token_decisions ?? b.outputDecisions,
   }
 }
 
@@ -265,8 +277,11 @@ export class Pricing {
       } else if (o.match_type !== "exact") {
         throw overrideError("unknown match_type " + o.match_type)
       }
+      const types = o.request_types ?? []
+      const decisions = types.length === 0 || types.includes("decisions")
+      const others = types.length === 0 || types.filter((t: string): bool => t !== "decisions").length > 0
       const g = (provider === "" ? 2 : 0) + (wildcard ? 1 : 0)
-      groups[g]!.push({ provider, pattern, wildcard, rates })
+      groups[g]!.push({ provider, pattern, wildcard, rates, decisions, others })
     }
     for (const g of [1, 3]) groups[g]!.sort((a, b) => b.pattern.byteLength - a.pattern.byteLength)
     const out: Patch[] = []
@@ -281,10 +296,11 @@ export class Pricing {
     this.misses = new Set()
   }
 
-  patchFor(provider: string, model: string): PricePatch | undefined {
+  patchFor(provider: string, model: string, decision: bool): PricePatch | undefined {
     const p = normalizeProvider(provider)
     for (const x of this.patches) {
       if (x.provider !== "" && x.provider !== p) continue
+      if (decision ? !x.decisions : !x.others) continue
       const hit = x.wildcard ? model.startsWith(x.pattern) : model === x.pattern
       if (hit) return x.rates
     }
@@ -312,14 +328,19 @@ export class Pricing {
     return p
   }
 
-  // Per-token price for the model, or undefined when nothing prices it.
-  find(provider: string, model: string): Price | undefined {
+  // Per-token price for the model, or undefined when nothing prices it. decision picks the
+  // billing of a decision request: the overrides that cover decisions apply.
+  priceFor(provider: string, model: string, decision: bool): Price | undefined {
     const c = this.overrides.get(provider + "/" + model) ?? this.overrides.get(model)
     if (c !== undefined) return c
     const base = this.datasheet(provider, model)
-    const patch = this.patchFor(provider, model)
+    const patch = this.patchFor(provider, model, decision)
     if (patch === undefined) return base
     return overlay(base, patch)
+  }
+
+  find(provider: string, model: string): Price | undefined {
+    return this.priceFor(provider, model, false)
   }
 
   known(provider: string, model: string): bool {
@@ -328,9 +349,10 @@ export class Pricing {
 
   // The first of refs without a price (a fallback the key may use counts), or undefined when
   // all are priced. A budgeted request is refused for it when refuse_unpriced_models is on.
-  unpriced(refs: { provider: string, model: string }[]): { provider: string, model: string } | undefined {
+  // decision prices the refs as decision requests.
+  unpriced(refs: { provider: string, model: string }[], decision?: bool): { provider: string, model: string } | undefined {
     for (const r of refs) {
-      if (!this.known(r.provider, r.model)) return r
+      if (this.priceFor(r.provider, r.model, decision === true) === undefined) return r
     }
     return undefined
   }
@@ -348,6 +370,26 @@ export class Pricing {
     const writeRate = p.cacheWrite ?? p.input
     return fresh * p.input + r * readRate + w * writeRate + completionTokens * p.output
   }
+
+  // USD for one decision request: its tokens at the decision rates when the price has them, else
+  // the normal rates (computeDecisionCost). A negative rate marks a model with no fixed price, so
+  // nothing is billed for it.
+  decisionCost(provider: string, model: string, promptTokens: int, completionTokens: int): f64 {
+    const p = this.priceFor(provider, model, true)
+    if (p === undefined) return 0.0
+    const ri = p.inputDecisions ?? p.input
+    const ro = p.outputDecisions ?? p.output
+    if (ri < 0 || ro < 0) return 0.0
+    return promptTokens * ri + completionTokens * ro
+  }
+
+  // The input and output parts of a request's price without cache tokens (Bifrost's input_cost and
+  // output_cost); both are 0 when the model's price is unknown.
+  costParts(provider: string, model: string, promptTokens: int, completionTokens: int): CostParts {
+    const p = this.find(provider, model)
+    if (p === undefined) return { input: 0.0, output: 0.0 }
+    return { input: promptTokens * p.input, output: completionTokens * p.output }
+  }
 }
 
 test("datasheet prices for OpenAI, Anthropic, Gemini and Vertex", () => {
@@ -358,6 +400,16 @@ test("datasheet prices for OpenAI, Anthropic, Gemini and Vertex", () => {
   expect(p.cost("gemini", "gemini-2.5-pro", 1000000, 0)).toBeCloseTo(1.25)
   expect(p.cost("vertex_ai", "gemini-2.5-flash", 1000000, 0)).toBeCloseTo(0.3)
   expect(p.known("openai", "text-embedding-3-small")).toBe(true)
+})
+
+test("the input and output parts add up to the cost; an unknown model has none", () => {
+  const p = new Pricing({})
+  const parts = p.costParts("openai", "gpt-4o", 1000000, 1000000)
+  expect(parts.input).toBeCloseTo(2.5)
+  expect(parts.output).toBeCloseTo(10.0)
+  expect(parts.input + parts.output).toBeCloseTo(p.cost("openai", "gpt-4o", 1000000, 1000000))
+  const none = p.costParts("nowhere", "no-model", 5, 5)
+  expect(none.input + none.output).toBe(0.0)
 })
 
 test("unpriced finds the first ref with no price, overrides included", () => {
@@ -461,4 +513,43 @@ test("parseDatasheet and replaceCatalog swap the table", () => {
     threw = true
   }
   expect(threw).toBe(true)
+})
+
+test("request_types: a decision takes the overrides that cover decisions, other requests the rest", () => {
+  const p = new Pricing({})
+  // The chat-only override comes first; the decision rates must not come from it.
+  try p.setOverrides([
+    { scope_kind: "global", request_types: ["chat_completion"], match_type: "exact", pattern: "jev-latest", pricing_patch: "{\"input_cost_per_token\":0.000001}" },
+    { scope_kind: "global", request_types: ["decisions"], match_type: "exact", pattern: "jev-latest", pricing_patch: "{\"input_cost_per_token_decisions\":0.00002,\"output_cost_per_token_decisions\":0.00005}" },
+  ])
+  expect(p.decisionCost("typesafe", "jev-latest", 1000, 10)).toBeCloseTo(0.0205)
+  // the chat override's input rate and the datasheet's output rate
+  expect(p.cost("typesafe", "jev-latest", 1000, 10)).toBeCloseTo(0.001)
+  // A decision-only override does not price other requests of the model: a model with no datasheet row
+  // is unpriced for chat, and priced for decisions.
+  const q = new Pricing({})
+  try q.setOverrides([{ scope_kind: "global", request_types: ["decisions"], match_type: "exact", pattern: "fake-jev", pricing_patch: "{\"input_cost_per_token_decisions\":0.00002}" }])
+  expect(q.known("typesafe", "fake-jev")).toBe(false)
+  expect(q.cost("typesafe", "fake-jev", 1000, 0)).toBe(0.0)
+  expect(q.decisionCost("typesafe", "fake-jev", 1000, 0)).toBeCloseTo(0.02)
+  expect(q.unpriced([{ provider: "typesafe", model: "fake-jev" }], true)).toBeUndefined()
+  expect(q.unpriced([{ provider: "typesafe", model: "fake-jev" }])!.model).toBe("fake-jev")
+})
+
+test("decision rates fall back to the normal rates, and an override without request_types covers both", () => {
+  const p = new Pricing({})
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "my-model", pricing_patch: "{\"input_cost_per_token\":0.000003,\"output_cost_per_token\":0.000004}" }])
+  expect(p.decisionCost("custom", "my-model", 1000000, 1000000)).toBeCloseTo(7.0)
+  expect(p.cost("custom", "my-model", 1000000, 1000000)).toBeCloseTo(7.0)
+  // A decision rate of zero is a rate: it bills nothing for the input.
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "my-model", request_types: ["decisions", "chat_completion"], pricing_patch: "{\"input_cost_per_token_decisions\":0}" }])
+  expect(p.decisionCost("custom", "my-model", 1000000, 1000000)).toBeCloseTo(0.0)
+  expect(p.cost("custom", "my-model", 1000000, 0)).toBe(0.0)
+  // A negative rate is unpriced: nothing billed.
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "my-model", request_types: ["decisions"], pricing_patch: "{\"input_cost_per_token_decisions\":-1}" }])
+  expect(p.decisionCost("custom", "my-model", 1000, 1000)).toBe(0.0)
+  // A decision override on a datasheet model keeps the datasheet's rates for the other requests.
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "gpt-4o", request_types: ["decisions"], pricing_patch: "{\"output_cost_per_token_decisions\":0.00001}" }])
+  expect(p.cost("openai", "gpt-4o", 1000000, 1000000)).toBeCloseTo(12.5)
+  expect(p.decisionCost("openai", "gpt-4o", 1000000, 1000000)).toBeCloseTo(12.5)
 })

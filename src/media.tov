@@ -16,6 +16,7 @@ import { deadline } from "./deadline"
 import * as native from "./media_native"
 import * as cloud from "./media_cloud"
 import * as cloudAuth from "./cloud_auth"
+import * as base64 from "./base64"
 import { S3Creds, awsCall } from "./exports"
 import { parseServiceAccount } from "./providers/vertex"
 
@@ -679,7 +680,7 @@ async function nativeMedia(t: Target, route: MediaRoute, qs: string, text: strin
     if (t.kind === "anthropic") return await anthropicMedia(t, route, qs, text, form)
     if (t.kind === "vertex") return await vertexMedia(t, route, qs, text, form)
     if (t.kind === "bedrock") return await bedrockMedia(t, route, qs, text, form)
-    if (t.kind === "replicate") return await replicateMedia(t, route, text, form)
+    if (t.kind === "replicate") return await replicateMedia(t, route, qs, text, form)
     return await geminiMedia(t, route, qs, text, form)
   } catch (e) {
     return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
@@ -1201,14 +1202,68 @@ async function bedrockBatchOutput(t: Target, c: S3Creds, bid: string): Promise<R
   return jsonlReply(try cloud.bedrockResultsToOpenAI(all, model))
 }
 
-// Replicate: image generations as predictions (the output URLs), and file uploads. Other operations
-// answer 400: Replicate has no image edits here, and its files are not listed or fetched.
-async function replicateMedia(t: Target, route: MediaRoute, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+// Replicate predictions still running when the synchronous wait ends are read again at their get URL,
+// every 2 seconds (Bifrost's interval), until they settle or the provider's timeout ends the wait.
+async function replicateSettle(t: Target, text: string): Promise<string | Response> throws SyntaxError | Error {
+  let cur = text
+  const until = Date.now() + timeoutMs(t.cfg)
+  while (!try replicate.isSettled(cur)) {
+    const url = try replicate.getUrlOf(cur)
+    if (url === "") return cur
+    if (Date.now() >= until) return errorReply(504, `replicate did not finish the prediction within ${timeoutMs(t.cfg)} ms`, "api_error")
+    await new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000))
+    const r = await send(t, { method: "GET", url: url, headers: authHeaders(t), body: undefined })
+    if (!r.ok) return r
+    cur = try await r.text()
+  }
+  return cur
+}
+
+// The MIME type of an image from its first bytes (PNG, JPEG, GIF, WebP); PNG when none matches.
+function imageMime(b: u8[]): string {
+  const a = b[0] ?? 0
+  const c = b[1] ?? 0
+  if (a === 0xff && c === 0xd8) return "image/jpeg"
+  if (a === 0x47 && c === 0x49) return "image/gif"
+  if (a === 0x52 && c === 0x49) return "image/webp"
+  return "image/png"
+}
+
+// An edit form's options as the prediction's input: the prompt, the count, the seed and the negative prompt.
+function replicateEditBody(form: FormData): Field[] throws SyntaxError {
+  const o: string[] = [`"prompt":${quote(formText(form, "prompt"))}`]
+  const n = try formInt(form, "n")
+  if (n !== undefined) o.push(`"n":${n}`)
+  const seed = try formInt(form, "seed")
+  if (seed !== undefined) o.push(`"seed":${seed}`)
+  const neg = formText(form, "negative_prompt")
+  if (neg !== "") o.push(`"negative_prompt":${quote(neg)}`)
+  return try fields("{" + o.join(",") + "}")
+}
+
+// Replicate: image generations and edits as predictions (the output URLs), file uploads, and the file list,
+// retrieve and delete. Files have no content route here, as in Bifrost, and answer 400.
+async function replicateMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
   if (route.op === "images.generations") {
     const up = try replicate.imageRequest(t, try fields(text))
     const r = await send(t, { method: "POST", url: up.url, headers: up.headers, body: up.body })
     if (!r.ok) return r
-    return jsonReply(try replicate.imageResponse(try await r.text()))
+    const settled = try await replicateSettle(t, try await r.text())
+    if (typeof settled !== "string") return settled
+    return jsonReply(try replicate.imageResponse(settled))
+  }
+  // the mask is not sent: Replicate's models take the image (and a mask only in their own inputs)
+  if (route.op === "images.edits") {
+    if (form === undefined) return errorReply(400, "the request needs an image", "invalid_request_error")
+    const urls: string[] = []
+    for (const b of try await imageBytes(form)) urls.push(`data:${imageMime(b)};base64,${base64.encode(b)}`)
+    if (urls.length === 0) return errorReply(400, "the request needs an image", "invalid_request_error")
+    const up = try replicate.imageEditRequest(t, try replicateEditBody(form), urls)
+    const r = await send(t, { method: "POST", url: up.url, headers: up.headers, body: up.body })
+    if (!r.ok) return r
+    const settled = try await replicateSettle(t, try await r.text())
+    if (typeof settled !== "string") return settled
+    return jsonReply(try replicate.imageResponse(settled))
   }
   if (route.op === "files.create") {
     const f = filePart(form)
@@ -1220,6 +1275,23 @@ async function replicateMedia(t: Target, route: MediaRoute, text: string, form: 
     const r = await send(t, { method: "POST", url: replicate.rootOf(t) + "/v1/files", headers: authHeaders(t), body: fd })
     if (!r.ok) return r
     return jsonReply(try replicate.fileToOpenAI(try await r.text(), formText(form, "purpose")))
+  }
+  if (route.op === "files.list") {
+    const cursor = new URLSearchParams(qs).get("after") ?? ""
+    const r = await send(t, { method: "GET", url: replicate.fileListUrl(t, cursor), headers: replicate.fileHeaders(t), body: undefined })
+    if (!r.ok) return r
+    return jsonReply(try replicate.fileListToOpenAI(try await r.text()))
+  }
+  if (route.op === "files.retrieve") {
+    const r = await send(t, { method: "GET", url: replicate.fileUrl(t, routeId(route)), headers: replicate.fileHeaders(t), body: undefined })
+    if (!r.ok) return r
+    return jsonReply(try replicate.fileToOpenAI(try await r.text(), ""))
+  }
+  if (route.op === "files.delete") {
+    const id = routeId(route)
+    const r = await send(t, { method: "DELETE", url: replicate.fileUrl(t, id), headers: replicate.fileHeaders(t), body: undefined })
+    if (!r.ok) return r
+    return jsonReply(replicate.fileDeletedToOpenAI(id))
   }
   return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
 }

@@ -1,9 +1,10 @@
 // Management API logic that needs no store: the RBAC listings, budget overrides, the expired-key
 // cleanup, routing rule checks and the complexity analyzer config. store.tov and ops.tov route to these.
-import { AccessProfile, AdminUserConfig, BudgetOverride, ClientConfig, ComplexitySettings, GovernanceConfig, PermissionPair, VirtualKeyConfig } from "./config"
+import { AccessProfile, AdminUserConfig, BudgetOverride, ClientConfig, ComplexitySettings, GovernanceConfig, PermissionPair, RoleConfig, VirtualKeyConfig } from "./config"
 import { RoutingRule, compile } from "./cel"
 import { fields, Field, find } from "./json"
 import { rfc3339Ms } from "./vkexpiry"
+import { roleIdOf, withRoleIds } from "./rbac"
 
 // ---- RBAC listings ----
 
@@ -165,15 +166,11 @@ function profileNamed(profiles: AccessProfile[] | undefined, id: string): Access
 }
 
 // GET /api/users/me/vk-creation-policy: the active access profile the caller holds that governs the
-// keys it creates (the first one held, highest-ranked). A caller with no stored user, or no active
-// profile, gets {"has_access_profile": false}; creating a key stays allowed, ungoverned.
-export function creationPolicy(users: AdminUserConfig[] | undefined, profiles: AccessProfile[] | undefined, actor: string): string {
-  for (const u of users ?? []) {
-    if (u.name !== actor) continue
-    for (const id of u.access_profile_ids ?? []) {
-      const p = profileNamed(profiles, id)
-      if (p !== undefined && p.is_active !== false) return JSON.stringify({ has_access_profile: true, profile_name: p.name ?? p.id })
-    }
+// keys it creates (the first one held, highest-ranked, as heldProfiles lists them). A caller with no
+// stored user, or no active profile, gets {"has_access_profile": false}; creating a key stays allowed, ungoverned.
+export function creationPolicy(users: AdminUserConfig[] | undefined, roles: RoleConfig[] | undefined, profiles: AccessProfile[] | undefined, actor: string): string {
+  for (const p of heldProfiles(users, roles, profiles, actor)) {
+    if (p.is_active !== false) return JSON.stringify({ has_access_profile: true, profile_name: p.name ?? p.id })
   }
   return JSON.stringify({ has_access_profile: false })
 }
@@ -204,15 +201,41 @@ export function propagateProfileKeys(vks: VirtualKeyConfig[], p: AccessProfile, 
   return { vks: out, updated: updated }
 }
 
-// The access profiles a user holds, in rank order, as the users API lists them.
-export function heldProfiles(users: AdminUserConfig[] | undefined, profiles: AccessProfile[] | undefined, name: string): AccessProfile[] {
-  const out: AccessProfile[] = []
+// The user with this name, or undefined.
+function userNamed(users: AdminUserConfig[] | undefined, name: string): AdminUserConfig | undefined {
   for (const u of users ?? []) {
-    if (u.name !== name) continue
-    for (const id of u.access_profile_ids ?? []) {
-      const p = profileNamed(profiles, id)
-      if (p !== undefined) out.push(p)
+    if (u.name === name) return u
+  }
+  return undefined
+}
+
+// The ids of the access profiles a user holds, in rank order: those set on the user (access_profile_ids),
+// then those attached to the user's custom role (the profile's roles). A profile is listed once, and an id
+// that names no profile is skipped. Built-in roles hold no attachments.
+export function heldProfileIds(users: AdminUserConfig[] | undefined, roles: RoleConfig[] | undefined, profiles: AccessProfile[] | undefined, name: string): string[] {
+  const out: string[] = []
+  const u = userNamed(users, name)
+  if (u === undefined) return out
+  for (const id of u.access_profile_ids ?? []) {
+    if (profileNamed(profiles, id) !== undefined && !out.includes(id)) out.push(id)
+  }
+  const rid = roleIdOf(roles, u.role)
+  if (rid !== undefined) {
+    const want: int = rid
+    for (const p of profiles ?? []) {
+      if (out.includes(p.id)) continue
+      if ((p.roles ?? []).some((b) => b.role_id === want)) out.push(p.id)
     }
+  }
+  return out
+}
+
+// The access profiles a user holds, in the order heldProfileIds gives, as the users API lists them.
+export function heldProfiles(users: AdminUserConfig[] | undefined, roles: RoleConfig[] | undefined, profiles: AccessProfile[] | undefined, name: string): AccessProfile[] {
+  const out: AccessProfile[] = []
+  for (const id of heldProfileIds(users, roles, profiles, name)) {
+    const p = profileNamed(profiles, id)
+    if (p !== undefined) out.push(p)
   }
   return out
 }
@@ -293,10 +316,10 @@ test("complexityProblem checks types and refuses unknown settings", () => {
 test("creationPolicy names the first active profile a user holds", () => {
   const users: AdminUserConfig[] = [{ name: "ana", role: "editor", access_profile_ids: ["p-off", "p-on", "p-two"] }, { name: "bo", role: "viewer" }]
   const profiles: AccessProfile[] = [{ id: "p-off", name: "Off", is_active: false }, { id: "p-on", name: "Engineer" }, { id: "p-two" }]
-  expect(creationPolicy(users, profiles, "ana")).toBe(`{"has_access_profile":true,"profile_name":"Engineer"}`)
-  expect(creationPolicy(users, profiles, "bo")).toBe(`{"has_access_profile":false}`)
-  expect(creationPolicy(users, profiles, "nobody")).toBe(`{"has_access_profile":false}`)
-  expect(creationPolicy(users, [], "ana")).toBe(`{"has_access_profile":false}`)
+  expect(creationPolicy(users, [], profiles, "ana")).toBe(`{"has_access_profile":true,"profile_name":"Engineer"}`)
+  expect(creationPolicy(users, [], profiles, "bo")).toBe(`{"has_access_profile":false}`)
+  expect(creationPolicy(users, [], profiles, "nobody")).toBe(`{"has_access_profile":false}`)
+  expect(creationPolicy(users, [], [], "ana")).toBe(`{"has_access_profile":false}`)
 })
 
 test("propagateProfileKeys pushes the chosen set fields to the keys that hold the profile", () => {
@@ -321,6 +344,28 @@ test("propagateProfileKeys pushes the chosen set fields to the keys that hold th
 test("heldProfiles lists a user's profiles in rank order and skips unknown ids", () => {
   const users: AdminUserConfig[] = [{ name: "ana", role: "editor", access_profile_ids: ["p-b", "gone", "p-a"] }]
   const profiles: AccessProfile[] = [{ id: "p-a" }, { id: "p-b" }]
-  expect(heldProfiles(users, profiles, "ana").map((p) => p.id).join(",")).toBe("p-b,p-a")
-  expect(heldProfiles(users, profiles, "bo").length).toBe(0)
+  expect(heldProfiles(users, [], profiles, "ana").map((p) => p.id).join(",")).toBe("p-b,p-a")
+  expect(heldProfiles(users, [], profiles, "bo").length).toBe(0)
 })
+
+test("a role's profile attachments are held by the users of that role, after the ones set by hand", () => {
+  const roles: RoleConfig[] = [{ id: 1, name: "ops" }, { id: 9, name: "dev" }]
+  const users: AdminUserConfig[] = [{ name: "ana", role: "ops", access_profile_ids: ["p-two"] }, { name: "bo", role: "dev" }, { name: "cy", role: "viewer" }]
+  const profiles: AccessProfile[] = [
+    { id: "p-one", roles: [{ role_id: 1 }] },
+    { id: "p-two", roles: [{ role_id: 1, is_default: true }] },
+    { id: "p-three", roles: [{ role_id: 9 }] },
+  ]
+  expect(heldProfileIds(users, roles, profiles, "ana").join(",")).toBe("p-two,p-one")
+  expect(heldProfileIds(users, roles, profiles, "bo").join(",")).toBe("p-three")
+  expect(heldProfileIds(users, roles, profiles, "cy").length).toBe(0)
+  expect(creationPolicy(users, roles, profiles, "bo")).toBe(`{"has_access_profile":true,"profile_name":"p-three"}`)
+})
+
+test("withRoleIds keeps the ids roles have and numbers the rest after the largest", () => {
+  const out = withRoleIds([{ name: "a" }, { id: 5, name: "b" }, { name: "c" }])
+  expect(out.map((r) => r.id ?? 0).join(",")).toBe("6,5,7")
+  expect(roleIdOf([{ name: "a" }, { id: 5, name: "b" }], "a")).toBe(6)
+  expect(roleIdOf([{ name: "a" }], "zz")).toBeUndefined()
+})
+
