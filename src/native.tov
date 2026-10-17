@@ -2,7 +2,6 @@
 // governance, retries, fallbacks across keys, metrics and cost tracking.
 import { Field, fields, elements, find, quote, build, isNull, rawStr, rawBool, setField } from "./json"
 import { Engine, Build, Translate, StreamSink, StreamConverter, ConverterFactory, streamable, converterKind, errorResponse, noHeaders } from "./gateway"
-import { OutputStreamGuard } from "./guard_stream"
 import { Target, Translated, trimSlash, proxyOf, tlsOf } from "./providers/types"
 import { ChatRequest, snapshot, newId, nowSeconds } from "./schemas"
 import { Config } from "./config"
@@ -21,6 +20,8 @@ import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
 import * as anthropicIn from "./providers/anthropic_in"
 import * as responses from "./responses"
+import { SseSplitter, SseEvent } from "./streams"
+import { ResponsesToChatStream } from "./responses"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
 import * as bedrock from "./providers/bedrock"
@@ -231,11 +232,10 @@ export async function responsesApi(engine: Engine, req: Request, sink?: StreamSi
   }
   // an OpenAI upstream's stream goes to the sink as it arrives; the other kinds are answered whole
   // the output guards check the events as they are passed through (guard_stream.tov)
-  const gs = stream ? engine.streamGuards(true) : []
   const mk: ConverterFactory = (t, requested) => {
     if (t.kind !== "openai") return undefined
     const c = new StreamConverter("responses-raw", requested, true)
-    if (gs.length > 0) c.guard = new OutputStreamGuard(gs, "responses")
+    if (stream) c.guard = engine.streamGuard("responses", true)
     return c
   }
   return await engine.serve(req, "responses", undefined, body, reqText, b, tr, stream, undefined, stream ? sink : undefined, mk, cp)
@@ -261,9 +261,9 @@ function jsonBody(body: string): Response {
 
 // POST /cursor/v1/chat/completions (and /cursor/chat/completions). Cursor sends a Responses-shaped body
 // ("input") and reads a chat completion back: such a body goes through /v1/responses and the answer is
-// converted to a chat completion. A messages body is plain chat. Streamed Responses-shaped requests are
-// not served (400); streamed chat is.
-export async function cursorChat(engine: Engine, req: Request): Promise<Response> {
+// converted to a chat completion. A messages body is plain chat. A streamed Responses-shaped request streams
+// chat chunks: the Responses events of /v1/responses are converted as they arrive (convertingSink).
+export async function cursorChat(engine: Engine, req: Request, sink?: StreamSink): Promise<Response> {
   const text = await req.text()
   let body: Field[] = []
   try {
@@ -272,9 +272,18 @@ export async function cursorChat(engine: Engine, req: Request): Promise<Response
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
   if (find(body, "input") === undefined || find(body, "messages") !== undefined) {
-    return await engine.chat(internalRequest(req, "/v1/chat/completions", text))
+    return await engine.chat(internalRequest(req, "/v1/chat/completions", text), sink)
   }
-  if (find(body, "stream") === "true") return errorResponse(400, "a streamed Responses-shaped /cursor request is not served; send messages", "invalid_request_error", noHeaders())
+  if (find(body, "stream") === "true") {
+    if (sink === undefined) return errorResponse(400, "a streamed Responses-shaped /cursor request needs a streaming transport; send messages", "invalid_request_error", noHeaders())
+    const model = rawStr(body, "model") ?? ""
+    const conv = new ResponsesToChatStream(model, false)
+    const r = await responsesApi(engine, internalRequest(req, "/v1/responses", text), convertingSink(sink, (c: string) => conv.push(c), () => conv.end()))
+    return await convertWhole(r, sink, (t: string) => {
+      const whole = new ResponsesToChatStream(model, false)
+      return whole.push(t) + whole.end()
+    })
+  }
   const r = await responsesApi(engine, internalRequest(req, "/v1/responses", text))
   if (r.status !== 200) return r
   try {
@@ -309,11 +318,111 @@ export async function cursorChat(engine: Engine, req: Request): Promise<Response
   }
 }
 
+// A sink for an inner route's stream: the SSE text it sends goes through convert before it reaches the
+// client's sink, and finish's text ends the stream. The inner route sees the client's cancel on its own sink.
+// The link from the converting sink to the inner route's sink (a class, so both closures share it).
+class SinkLink {
+  inner: StreamSink | undefined = undefined
+}
+
+function convertingSink(real: StreamSink, convert: (chunk: string) => string, finish: () => string): StreamSink {
+  const link = new SinkLink()
+  const s = new StreamSink(
+    (status, headers) => {
+      real.started = true
+      real.open(status, headers)
+    },
+    (chunk) => {
+      const inner = link.inner
+      if (real.cancelled && inner !== undefined) inner.cancelled = true
+      const out = convert(chunk)
+      if (out !== "") real.write(out)
+    },
+    () => {
+      const out = finish()
+      if (out !== "") real.write(out)
+      real.close()
+    },
+  )
+  link.inner = s
+  return s
+}
+
+// An inner route's answer that was not streamed (its target answers whole): the converted body goes out whole.
+async function convertWhole(r: Response, sink: StreamSink, convert: (text: string) => string): Promise<Response> {
+  if (sink.started || r.status !== 200) return r
+  let text = ""
+  try {
+    text = await r.text()
+  } catch (e) {
+    return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+  }
+  // the inner answer's headers (compat, routing) stay; the body is the converted events
+  const hs: Record<string, string> = new Map()
+  r.headers.forEach((value, key) => {
+    if (key !== "content-length" && key !== "content-type") hs.set(key, value)
+  })
+  hs.set("content-type", "text/event-stream")
+  return new Response(convert(text), { status: 200, headers: hs })
+}
+
+type LegacyEvent = { message?: { id?: string }, delta?: { type?: string, text?: string, stop_reason?: string } }
+
+// Anthropic's messages stream as the legacy text completion stream: each text delta is a completion event with
+// the new text, and the message's stop reason closes it with the legacy stop reasons.
+class LegacyCompletionStream {
+  private split = new SseSplitter()
+  private id = ""
+
+  constructor(readonly clientModel: string) {}
+
+  push(text: string): string {
+    let out = ""
+    for (const ev of this.split.push(text)) out += this.event(ev)
+    return out
+  }
+
+  end(): string {
+    let out = ""
+    for (const ev of this.split.flush()) out += this.event(ev)
+    return out
+  }
+
+  private event(ev: SseEvent): string {
+    if (ev.event === "error") return `event: error\ndata: ${ev.data}\n\n`
+    let s: LegacyEvent = {}
+    try {
+      s = JSON.parse(ev.data) as LegacyEvent
+    } catch (e) {
+      return ""
+    }
+    if (ev.event === "message_start") {
+      this.id = s.message?.id ?? ""
+      return ""
+    }
+    if (ev.event === "content_block_delta") {
+      const d = s.delta
+      if (d === undefined || d.type !== "text_delta" || d.text === undefined) return ""
+      return this.completion(d.text, "null")
+    }
+    if (ev.event === "message_delta") {
+      const stop = s.delta?.stop_reason
+      if (stop === undefined) return ""
+      return this.completion("", quote(stop === "max_tokens" ? "max_tokens" : "stop_sequence"))
+    }
+    return ""
+  }
+
+  private completion(text: string, stop: string): string {
+    return `event: completion\ndata: {"type":"completion","id":${quote(this.id)},"completion":${quote(text)},"stop_reason":${stop},"model":${quote(this.clientModel)}}\n\n`
+  }
+}
+
 // POST /anthropic/v1/complete: Anthropic's legacy text completion, served by any provider through the
 // messages bridge. The prompt becomes one user turn (the "Human:" and "Assistant:" markers go). The answer
-// keeps the legacy shape: {id, type: "completion", completion, stop_reason, model, usage}. Streaming is
-// not served here (Bifrost streams it; use /anthropic/v1/messages).
-export async function anthropicLegacy(engine: Engine, req: Request): Promise<Response> {
+// keeps the legacy shape: {id, type: "completion", completion, stop_reason, model, usage}. A streamed request
+// (with a streaming transport) streams the legacy completion events as the messages stream arrives.
+export async function anthropicLegacy(engine: Engine, req: Request, sink?: StreamSink): Promise<Response> {
   const text = await req.text()
   let body: Field[] = []
   try {
@@ -321,7 +430,8 @@ export async function anthropicLegacy(engine: Engine, req: Request): Promise<Res
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
-  if (find(body, "stream") === "true") return errorResponse(400, "streaming is not served on /anthropic/v1/complete; use /anthropic/v1/messages", "invalid_request_error", noHeaders())
+  const streamed = find(body, "stream") === "true"
+  if (streamed && sink === undefined) return errorResponse(400, "streaming needs a streaming transport on /anthropic/v1/complete", "invalid_request_error", noHeaders())
   const model = rawStr(body, "model")
   if (model === undefined) return errorResponse(400, "the request needs a \"model\" field", "invalid_request_error", noHeaders())
   const maxTokens = find(body, "max_tokens_to_sample")
@@ -334,6 +444,17 @@ export async function anthropicLegacy(engine: Engine, req: Request): Promise<Res
   for (const k of ["temperature", "top_p", "top_k", "stop_sequences"]) {
     const v = find(body, k)
     if (v !== undefined && v !== "null") parts.push("\"" + k + "\":" + v)
+  }
+  if (streamed && sink !== undefined) {
+    // the messages stream, converted as it arrives to the legacy completion events
+    const lc = new LegacyCompletionStream(model)
+    parts.push("\"stream\":true")
+    const wrapped = convertingSink(sink, (c: string) => lc.push(c), () => lc.end())
+    const sr = await anthropicMessages(engine, internalRequest(req, "/anthropic/v1/messages", "{" + parts.join(",") + "}"), wrapped)
+    return await convertWhole(sr, sink, (t: string) => {
+      const whole = new LegacyCompletionStream(model)
+      return whole.push(t) + whole.end()
+    })
   }
   const r = await anthropicMessages(engine, internalRequest(req, "/anthropic/v1/messages", "{" + parts.join(",") + "}"))
   if (r.status !== 200) return r
@@ -977,4 +1098,24 @@ test("the first upload step answers the gateway's own URL", () => {
 test("the route provider comes from x-model-provider, Gemini by default", () => {
   expect(routeProvider(new Request("http://gw.local/genai/v1beta/files"))).toBe("gemini")
   expect(routeProvider(new Request("http://gw.local/genai/v1beta/files", { headers: { "x-model-provider": "openai" } }))).toBe("openai")
+})
+
+test("the legacy completion stream turns messages events into completion events, split or whole", () => {
+  const sse = `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_9"}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}\n\nevent: ping\ndata: {"type":"ping"}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`
+  const whole = new LegacyCompletionStream("claude-2.1")
+  const out = whole.push(sse) + whole.end()
+  expect(out.startsWith(`event: completion\ndata: {"type":"completion","id":"msg_9","completion":"Hel","stop_reason":null,"model":"claude-2.1"}\n\n`)).toBe(true)
+  expect(out.includes(`"completion":"lo","stop_reason":null`)).toBe(true)
+  expect(out.endsWith(`event: completion\ndata: {"type":"completion","id":"msg_9","completion":"","stop_reason":"max_tokens","model":"claude-2.1"}\n\n`)).toBe(true)
+  expect(out.includes("ping")).toBe(false)
+  expect(out.includes("message_start")).toBe(false)
+  // the same answer in pieces that split events gives the same events
+  const split = new LegacyCompletionStream("claude-2.1")
+  let parts = ""
+  for (let at = 0; at < sse.byteLength; at += 17) parts += split.push(sse.slice(at, at + 17))
+  parts += split.end()
+  expect(parts).toBe(out)
+  // an error event passes through
+  const err = new LegacyCompletionStream("m")
+  expect(err.push(`event: error\ndata: {"type":"error"}\n\n`)).toBe(`event: error\ndata: {"type":"error"}\n\n`)
 })

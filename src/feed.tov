@@ -1,0 +1,402 @@
+// The live feed on /ws: each request-log event gets an id (its producer and a sequence number), reaches
+// the clients of every node, and stays in a short ring, so a client that reconnects (to any replica) can
+// resume from the last id it saw. The producer is the node, or "node/pid" for one worker process of a
+// node with several. A sequence starts at the process's start time in ms, so it keeps growing across
+// restarts, and a resume cursor from before a restart stays below the new events.
+//
+// This module is pure: the hub (ops.tov) and the broker (broker.tov) hold the rings and queues, and the
+// cluster transport moves the items. Items travel as JSON (the FeedItem fields, data as text).
+
+import { nodeOf } from "./cluster"
+
+// One feed event. data is the event's JSON text (the dashboard's view of a request-log entry). The scope
+// fields are copied, so a relay can check who may see an event without the full entry. bseq is the
+// position in the broker's ring, which a node keeps as its cursor; it is set only there.
+export type FeedItem = { node: string, seq: int, ts: f64, team: string, bu: string, customer: string, project: string, data: string, bseq?: int }
+
+export type FeedGap = { node: string, missing: int }
+export type FeedResume = { items: FeedItem[], gaps: FeedGap[] }
+// a relay body: the items a worker queued for a peer
+export type FeedBatch = { items: FeedItem[] }
+// a worker's pull from the broker: its node, its cursor, and the items it queued
+export type FeedPull = { node: string, after: int, items: FeedItem[] }
+// the broker's answer: the other nodes' items after the cursor, the new cursor, the positions lost, and the newest position
+export type FeedAnswer = { items: FeedItem[], next: int, missed: int, last: int }
+type FeedData = { id?: string }
+
+// The defaults for cluster.feed (cluster.tov FeedConfig), and the batch size of one relay request.
+export const FEED_RING_SIZE = 10000
+export const FEED_RING_SECONDS = 300
+export const FEED_QUEUE_MAX = 10000
+export const FEED_BATCH_MS = 100
+export const FEED_BATCH_MAX = 500
+
+// The event id a client sees: the producer and the sequence, joined by a colon.
+export function feedId(it: FeedItem): string {
+  return it.node + ":" + it.seq
+}
+
+// The text a client gets for an item: Bifrost's {"type", "data"} envelope, with the event id, its producer and its sequence.
+export function feedEnvelope(it: FeedItem): string {
+  return `{"type":"log","id":${JSON.stringify(feedId(it))},"node":${JSON.stringify(it.node)},"seq":${it.seq},"data":${it.data}}`
+}
+
+// A gap a resume could not fill: events of node that are no longer in the ring.
+export function gapEnvelope(g: FeedGap): string {
+  return `{"type":"gap","data":{"node":${JSON.stringify(g.node)},"missing":${g.missing}}}`
+}
+
+// The last message of a resume: how many events were replayed to this client and how many gaps there were.
+export function resumedEnvelope(replayed: int, gaps: int): string {
+  return `{"type":"resumed","data":{"replayed":${replayed},"gaps":${gaps}}}`
+}
+
+function lastColon(s: string): int {
+  for (let k = s.byteLength - 1; k >= 0; k--) {
+    if (s.slice(k, k + 1) === ":") return k
+  }
+  return -1
+}
+
+// The cursor of a resume: "node:seq,node:seq", the last id a client saw from each producer. The sequence is
+// the part after the last colon, so a node id may hold colons. undefined when a pair is malformed.
+export function parseCursor(s: string): Map<string, int> | undefined {
+  const out: Map<string, int> = new Map()
+  for (const part of s.split(",")) {
+    if (part === "") continue
+    const i = lastColon(part)
+    if (i <= 0) return undefined
+    const seq = parseInt(part.slice(i + 1))
+    if (seq === undefined || seq < 0) return undefined
+    out.set(part.slice(0, i), seq)
+  }
+  return out
+}
+
+// Checks items from a peer before any is added: a node id (without a comma, which separates a cursor's pairs),
+// a positive sequence, and data that is a JSON object with an id.
+export function checkItems(xs: FeedItem[]): void throws SyntaxError {
+  for (const it of xs) {
+    const node = it.node ?? ""
+    if (node.byteLength === 0 || node.includes(",")) throw new SyntaxError("feed item has no usable node id")
+    if (!(it.seq > 0)) throw new SyntaxError("feed item has no sequence")
+    const data = it.data ?? ""
+    if (!data.startsWith("{")) throw new SyntaxError("feed item data is not an object")
+    const d = try JSON.parse(data) as FeedData
+    if (d.id === undefined) throw new SyntaxError("feed item data has no id")
+  }
+}
+
+// A relay body (FeedBatch) read and checked.
+export function parseFeed(text: string): FeedItem[] throws SyntaxError {
+  const b = try JSON.parse(text) as FeedBatch
+  const xs: FeedItem[] = b.items ?? []
+  try checkItems(xs)
+  return xs
+}
+
+// One item, as a share file line holds it.
+export function parseItem(text: string): FeedItem throws SyntaxError {
+  const it = try JSON.parse(text) as FeedItem
+  try checkItems([it])
+  return it
+}
+
+// The broker's answer (FeedAnswer) read and checked.
+export function parseAnswer(text: string): FeedAnswer throws SyntaxError {
+  const a = try JSON.parse(text) as FeedAnswer
+  const xs: FeedItem[] = a.items ?? []
+  try checkItems(xs)
+  return { items: xs, next: a.next, missed: a.missed, last: a.last }
+}
+
+// Keeps the newest events of a ring: by count and by age. A producer's sequence only goes up, so an item at or
+// below the newest sequence seen from its producer is a repeat and is not added.
+export class FeedRing {
+  private items: FeedItem[] = []
+  private head: int = 0
+  // the newest sequence seen from each producer (kept after the item leaves the ring)
+  private top: Map<string, int> = new Map()
+
+  constructor(readonly maxItems: int, readonly maxAgeMs: f64) {}
+
+  get size(): int {
+    return this.items.length - this.head
+  }
+
+  // Adds the item if it is new. True when it was added.
+  add(it: FeedItem, nowMs: f64): bool {
+    if (it.seq <= (this.top.get(it.node) ?? 0)) return false
+    this.top.set(it.node, it.seq)
+    this.items.push(it)
+    const cutoff = nowMs - this.maxAgeMs
+    while (this.size > this.maxItems || (this.size > 0 && this.items[this.head]!.ts < cutoff)) this.head += 1
+    if (this.head > this.maxItems) {
+      this.items = this.items.slice(this.head)
+      this.head = 0
+    }
+    return true
+  }
+
+  // What a client that saw the cursor (producer to newest sequence) is missing, in arrival order. A producer in
+  // the cursor resumes after its sequence; a producer not in it is sent whole. A sequence the ring no longer holds
+  // is a gap, counted per producer (the ring's own record of each producer's newest sequence finds the trailing ones).
+  resume(cursor: Map<string, int>): FeedResume {
+    const next: Map<string, int> = new Map()
+    for (const id of cursor.keys()) next.set(id, (cursor.get(id) ?? 0) + 1)
+    const lost: Map<string, int> = new Map()
+    const out: FeedItem[] = []
+    for (let i = this.head; i < this.items.length; i++) {
+      const it = this.items[i]!
+      const want = cursor.get(it.node)
+      if (want === undefined) {
+        out.push(it)
+        continue
+      }
+      if (it.seq <= want) continue
+      const exp = next.get(it.node) ?? want + 1
+      if (it.seq > exp) lost.set(it.node, (lost.get(it.node) ?? 0) + (it.seq - exp))
+      out.push(it)
+      next.set(it.node, it.seq + 1)
+    }
+    for (const id of cursor.keys()) {
+      const newest = this.top.get(id) ?? 0
+      const exp = next.get(id) ?? 0
+      if (newest >= exp) lost.set(id, (lost.get(id) ?? 0) + (newest - exp + 1))
+    }
+    const gaps: FeedGap[] = []
+    for (const id of lost.keys()) gaps.push({ node: id, missing: lost.get(id) ?? 0 })
+    return { items: out, gaps: gaps }
+  }
+
+  // The broker's view: the items after a position, except those of one node (its own), in position order, at most
+  // limit of them. next is the position of the last item scanned, so a caller that asks again from next moves on.
+  // missed counts the positions below the oldest item the ring still holds.
+  since(after: int, fromNode: string, limit: int, last: int): FeedAnswer {
+    const out: FeedItem[] = []
+    let next = after
+    let missed = 0
+    const first = this.items[this.head]
+    const fb = first === undefined ? 0 : first.bseq ?? 0
+    if (fb > after + 1) missed = fb - after - 1
+    for (let i = this.head; i < this.items.length; i++) {
+      const it = this.items[i]!
+      const b = it.bseq ?? 0
+      if (b <= after) continue
+      if (out.length >= limit) break
+      next = b
+      if (nodeOf(it.node) !== fromNode) out.push(it)
+    }
+    return { items: out, next: next, missed: missed, last: last }
+  }
+}
+
+// A bounded queue of items for one destination. When it is full the oldest item goes, and push says so.
+export class FeedQueue {
+  private items: FeedItem[] = []
+  private head: int = 0
+  // a relay request is in flight: the queue waits for its answer
+  busy = false
+
+  constructor(readonly max: int) {}
+
+  get size(): int {
+    return this.items.length - this.head
+  }
+
+  // Adds the item. Returns 1 when the oldest item was dropped to make room, else 0.
+  push(it: FeedItem): int {
+    let dropped = 0
+    if (this.size >= this.max) {
+      this.head += 1
+      dropped = 1
+    }
+    this.items.push(it)
+    if (this.head > this.max) {
+      this.items = this.items.slice(this.head)
+      this.head = 0
+    }
+    return dropped
+  }
+
+  // Up to n items, oldest first, removed from the queue.
+  take(n: int): FeedItem[] {
+    const end = this.head + n < this.items.length ? this.head + n : this.items.length
+    const out = this.items.slice(this.head, end)
+    this.head = end
+    if (this.head === this.items.length) {
+      this.items = []
+      this.head = 0
+    }
+    return out
+  }
+}
+
+// ---- tests ----
+
+function item(node: string, seq: int, ts: f64): FeedItem {
+  return { node: node, seq: seq, ts: ts, team: "", bu: "", customer: "", project: "", data: `{"id":"e${seq}"}` }
+}
+
+// A cursor from parallel lists of producers and sequences (test helper).
+function mapOf(ks: string[], vs: int[]): Map<string, int> {
+  const m: Map<string, int> = new Map()
+  for (let i = 0; i < ks.length; i++) m.set(ks[i]!, vs[i]!)
+  return m
+}
+
+// How many items a relay body holds, or -1 when it is refused (test helper).
+function feedCount(text: string): int {
+  try {
+    return parseFeed(text).length
+  } catch (e) {
+    return -1
+  }
+}
+
+test("a repeat of a producer's sequence is not added", () => {
+  const r = new FeedRing(10, 60000.0)
+  expect(r.add(item("a", 5, 1000.0), 1000.0)).toBe(true)
+  expect(r.add(item("a", 5, 1000.0), 1000.0)).toBe(false)
+  expect(r.add(item("a", 4, 1000.0), 1000.0)).toBe(false)
+  expect(r.add(item("b", 1, 1000.0), 1000.0)).toBe(true)
+  expect(r.size).toBe(2)
+})
+
+test("the ring keeps the newest items by count and by age", () => {
+  const r = new FeedRing(3, 10000.0)
+  for (let i = 1; i <= 5; i++) r.add(item("a", i, 1000.0 + i), 1000.0 + i)
+  expect(r.size).toBe(3)
+  const sent = r.resume(mapOf(["a"], [0]))
+  expect(sent.items.map((it) => it.seq)).toEqual([3, 4, 5])
+  // an item older than the window leaves the ring
+  r.add(item("a", 6, 1000.0 + 20000.0), 1000.0 + 20000.0)
+  expect(r.size).toBe(1)
+})
+
+test("resume replays what a cursor has not seen, per producer, in arrival order", () => {
+  const r = new FeedRing(100, 60000.0)
+  r.add(item("a", 1, 1000.0), 1000.0)
+  r.add(item("b", 7, 1000.0), 1000.0)
+  r.add(item("a", 2, 1000.0), 1000.0)
+  r.add(item("b", 8, 1000.0), 1000.0)
+  r.add(item("a", 3, 1000.0), 1000.0)
+  const got = r.resume(mapOf(["a", "b"], [1, 7]))
+  expect(got.items.map((it) => feedId(it))).toEqual(["a:2", "b:8", "a:3"])
+  expect(got.gaps.length).toBe(0)
+  // a producer the cursor does not name is replayed whole
+  const fresh = r.resume(mapOf(["a"], [3]))
+  expect(fresh.items.map((it) => feedId(it))).toEqual(["b:7", "b:8"])
+  // a cursor at the newest sequence replays nothing and has no gap
+  const even = r.resume(mapOf(["a", "b"], [3, 8]))
+  expect(even.items.length).toBe(0)
+  expect(even.gaps.length).toBe(0)
+})
+
+test("a sequence the ring no longer holds is a gap, inside the stream and at its end", () => {
+  const r = new FeedRing(2, 60000.0)
+  for (let i = 1; i <= 5; i++) r.add(item("a", i, 1000.0), 1000.0)
+  // the ring holds 4 and 5; a client that saw 1 missed 2 and 3
+  const got = r.resume(mapOf(["a"], [1]))
+  expect(got.items.map((it) => feedId(it))).toEqual(["a:4", "a:5"])
+  expect(got.gaps.length).toBe(1)
+  expect(got.gaps[0]!.node).toBe("a")
+  expect(got.gaps[0]!.missing).toBe(2)
+  // a producer with nothing left in the ring: its newest sequence is the whole gap
+  const gone = r.resume(mapOf(["zz", "a"], [0, 5]))
+  expect(gone.items.length).toBe(0)
+  expect(gone.gaps.length).toBe(0)
+  const lagging = r.resume(mapOf(["a"], [2]))
+  expect(lagging.gaps[0]!.missing).toBe(1)
+})
+
+test("a gap in a producer's stream inside the ring is counted", () => {
+  // a relay that dropped sequence 3 leaves a hole the ring shows
+  const r = new FeedRing(100, 60000.0)
+  r.add(item("a", 1, 1000.0), 1000.0)
+  r.add(item("a", 2, 1000.0), 1000.0)
+  r.add(item("a", 5, 1000.0), 1000.0)
+  const got = r.resume(mapOf(["a"], [0]))
+  expect(got.gaps.length).toBe(1)
+  expect(got.gaps[0]!.missing).toBe(2)
+})
+
+test("cursors parse as node:seq pairs, and a node id may hold colons", () => {
+  const c = parseCursor("a:12,b:c:40")
+  expect(c === undefined).toBe(false)
+  expect(c!.get("a")).toBe(12)
+  expect(c!.get("b:c")).toBe(40)
+  expect(parseCursor("")!.size).toBe(0)
+  expect(parseCursor("a")).toBe(undefined)
+  expect(parseCursor("a:x")).toBe(undefined)
+  expect(parseCursor(":4")).toBe(undefined)
+  expect(parseCursor("a:-1")).toBe(undefined)
+})
+
+test("an envelope carries the id, the producer and the sequence around the event", () => {
+  const it = item("node-a/42", 9, 1.0)
+  expect(feedEnvelope(it)).toBe(`{"type":"log","id":"node-a/42:9","node":"node-a/42","seq":9,"data":{"id":"e9"}}`)
+  expect(gapEnvelope({ node: "a", missing: 2 })).toBe(`{"type":"gap","data":{"node":"a","missing":2}}`)
+  expect(resumedEnvelope(3, 0)).toBe(`{"type":"resumed","data":{"replayed":3,"gaps":0}}`)
+})
+
+test("a relay body is checked before its items are used", () => {
+  expect(feedCount(`{"items":[{"node":"a","seq":3,"ts":1,"team":"","bu":"","customer":"","project":"","data":"{\\"id\\":\\"x\\"}"}]}`)).toBe(1)
+  let bad = 0
+  for (const text of [
+    "nope",
+    `{"items":[{"node":"","seq":3,"ts":1,"team":"","bu":"","customer":"","project":"","data":"{\\"id\\":\\"x\\"}"}]}`,
+    `{"items":[{"node":"a","seq":0,"ts":1,"team":"","bu":"","customer":"","project":"","data":"{\\"id\\":\\"x\\"}"}]}`,
+    `{"items":[{"node":"a","seq":3,"ts":1,"team":"","bu":"","customer":"","project":"","data":"[1]"}]}`,
+    `{"items":[{"node":"a","seq":3,"ts":1,"team":"","bu":"","customer":"","project":"","data":"{\\"x\\":1}"}]}`,
+    `{"items":[{"node":"a,b","seq":3,"ts":1,"team":"","bu":"","customer":"","project":"","data":"{\\"id\\":\\"x\\"}"}]}`,
+  ]) {
+    try {
+      parseFeed(text)
+    } catch (e) {
+      if (e instanceof SyntaxError) bad += 1
+    }
+  }
+  expect(bad).toBe(6)
+})
+
+test("the queue drops its oldest item when full, and takes items in order", () => {
+  const q = new FeedQueue(2)
+  expect(q.push(item("a", 1, 1.0))).toBe(0)
+  expect(q.push(item("a", 2, 1.0))).toBe(0)
+  expect(q.push(item("a", 3, 1.0))).toBe(1)
+  expect(q.size).toBe(2)
+  expect(q.take(1).map((it) => it.seq)).toEqual([2])
+  expect(q.take(10).map((it) => it.seq)).toEqual([3])
+  expect(q.size).toBe(0)
+  expect(q.take(5).length).toBe(0)
+})
+
+test("the broker's view gives the other nodes' items after a position, in order and capped", () => {
+  const r = new FeedRing(100, 60000.0)
+  const at = (node: string, seq: int, pos: int): FeedItem => ({ node: node, seq: seq, ts: 1000.0, team: "", bu: "", customer: "", project: "", data: `{"id":"e"}`, bseq: pos })
+  r.add(at("a/1", 1, 1), 1000.0)
+  r.add(at("b", 1, 2), 1000.0)
+  r.add(at("a", 2, 3), 1000.0)
+  r.add(at("c", 1, 4), 1000.0)
+  // node a sees b's and c's items, not its own (a/1 and a:2 are both node a)
+  const ans = r.since(0, "a", 100, 4)
+  expect(ans.items.map((it) => it.bseq ?? 0)).toEqual([2, 4])
+  expect(ans.next).toBe(4)
+  expect(ans.last).toBe(4)
+  expect(ans.missed).toBe(0)
+  // the cap stops the scan at the last item it returned, so the next call starts there
+  const page = r.since(0, "a", 1, 4)
+  expect(page.items.map((it) => it.bseq ?? 0)).toEqual([2])
+  expect(page.next).toBe(2)
+  const rest = r.since(page.next, "a", 1, 4)
+  expect(rest.items.map((it) => it.bseq ?? 0)).toEqual([4])
+  // a caller that is behind the ring's oldest position is told how many it missed
+  const small = new FeedRing(1, 60000.0)
+  small.add(at("b", 1, 1), 1000.0)
+  small.add(at("b", 2, 2), 1000.0)
+  small.add(at("b", 3, 3), 1000.0)
+  const late = small.since(0, "a", 100, 3)
+  expect(late.missed).toBe(2)
+  expect(late.items.map((it) => it.bseq ?? 0)).toEqual([3])
+})

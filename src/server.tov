@@ -21,7 +21,7 @@ import * as metrics from "./metrics"
 import { Session, SocketExt, prepare, onOpen, onMessage, onClose, extOpen, extMessage, extClose, extPong, attachHttp1 } from "./realtime"
 import { ResponsesSocket } from "./wsresponses"
 import { LiveSocket, liveContent, liveCreate, contentId, attachId, attachUpstream, ownerOf, credentialOk, validId } from "./live"
-import { WsConnection } from "./ws"
+import { WsConnection, SocketGate } from "./ws"
 import { DataScope } from "./scope"
 import { resourceOf } from "./rbac"
 import { matchRoute, handleMedia, deploymentRoute, deploymentRequest, realtimeSdp, nativeRoute, nativeCloud, vertexBearer } from "./media"
@@ -38,6 +38,7 @@ import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
 import { McpSession } from "./mcp"
 import { Ops, Reply, UiSocket } from "./ops"
+import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
@@ -795,6 +796,7 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
+  if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
   if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
   if (p.startsWith("/api/oidc/") && m === "GET") return await ops.oidcRoute(req, p)
   // the MCP OAuth callback: the browser comes back here from the authorization server, with no session
@@ -865,6 +867,8 @@ export function streamKind(p: string): string {
   if (p === "/cohere/v2/chat") return "cohere"
   if (p.startsWith(GENAI) && p.endsWith(":streamGenerateContent")) return "genai"
   if (p.startsWith("/bedrock/model/") && (p.endsWith("/converse-stream") || p.endsWith("/invoke-with-response-stream"))) return "bedrock"
+  if (p === "/anthropic/v1/complete") return "legacy"
+  if (isCursorChat(p)) return "cursor"
   return ""
 }
 
@@ -888,6 +892,8 @@ export async function routeStream(engine: Engine, req: Request, kind: string, si
   if (dep !== undefined) return await routeStream(engine, await deploymentRequest(req, dep), kind, sink)
   const p = compatPath(u === undefined ? "" : u.pathname)
   if (kind === "anthropic") return await anthropicMessages(engine, req, sink)
+  if (kind === "legacy") return await anthropicLegacy(engine, req, sink)
+  if (kind === "cursor") return await cursorChat(engine, req, sink)
   if (kind === "cohere") return await cohereChat(engine, req, sink)
   if (kind === "genai") return await genai(engine, req, p.slice(GENAI.byteLength), sink)
   if (kind === "bedrock") {
@@ -972,6 +978,12 @@ function wsSession(req: Request, ext: SocketExt): Session {
   return s
 }
 
+// The route's session cap (websocket.max_connections_per_user) for a socket that counts against it.
+function gated(ext: SocketExt, g: SocketGate): SocketExt {
+  ext.gate = g
+  return ext
+}
+
 // The WebSocket routes, for both servers: the realtime relay, the Responses API (GET /v1/responses),
 // GPT Live (/v1/live/sessions and its attach) and the UI socket (/ws). A refusal is decided before
 // the upgrade, so the client gets an HTTP status.
@@ -988,8 +1000,8 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
   const att = attachId(p)
   if (p !== "/v1/responses" && p !== "/v1/live/sessions" && p !== "/ws" && att === "") return { kind: "none" }
   const h = snapshot(req.headers)
-  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, new ResponsesSocket(engine, h)) }
-  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map())) }
+  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, gated(new ResponsesSocket(engine, h), engine.wsResponses)) }
+  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map()), engine.wsLive)) }
   if (att !== "") {
     if (!validId(att)) return { kind: "refused", status: 400, message: "a session id is required" }
     if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
@@ -997,20 +1009,27 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
     if (!ops.liveSessions.allowed(att, owner)) return { kind: "refused", status: 404, message: "live session not found" }
     const up = attachUpstream(engine, h, att)
     if (up === undefined) return { kind: "refused", status: 404, message: "no OpenAI key is configured for live sessions" }
-    return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers)) }
+    return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers), engine.wsLive)) }
   }
   if (p === "/ws") {
+    // the resume cursor (since=node:seq,...) and the batch flag (batch=1) ride on the URL; a bad cursor is refused
+    // before the ticket is spent
+    const sinceText = u === undefined ? "" : u.searchParams.get("since") ?? ""
+    const cursor: Map<string, int> | undefined = sinceText === "" ? undefined : parseCursor(sinceText)
+    if (sinceText !== "" && cursor === undefined) return { kind: "refused", status: 400, message: "since must be node:seq pairs" }
+    const bt = u === undefined ? "" : u.searchParams.get("batch") ?? ""
+    const batch = bt === "1" || bt === "true"
     // a ticket from POST /api/session/ws-ticket stands for the caller's credentials, once and briefly
     const tk = u === undefined ? "" : u.searchParams.get("ticket") ?? ""
     if (tk !== "") {
       const actor = ops.wsTickets.consume(tk, Date.now())
       if (actor === undefined) return { kind: "refused", status: 401, message: "the WebSocket ticket is invalid, used or expired" }
-      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(actor))) }
+      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(actor), batch, cursor)) }
     }
     // the live feed is log data: whoever may read /api/logs may open it, and sees its own data scope
     const g = ops.gate(req, "/api/logs")
     if (g.kind === "deny") return { kind: "refused", status: g.res.status, message: g.res.status === 401 ? "authentication is required" : "this role may not open the UI socket" }
-    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(g.actor))) }
+    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(g.actor), batch, cursor)) }
   }
   return { kind: "none" }
 }

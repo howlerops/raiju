@@ -12,7 +12,7 @@ type Scope = "input" | "output" | "both"
 
 // A Bifrost rule after the rule-level checks; providerIds are the raw id texts.
 // target is "llm" or "mcp" (tool calls).
-type BRule = { label: string, scope: Scope, target: string, providerIds: string[] }
+type BRule = { label: string, scope: Scope, target: string, providerIds: string[], replayMs: int }
 
 // A Bifrost provider profile: top-level fields and the config object's fields.
 type BProvider = { id: string, label: string, kind: string, enabled: bool, top: Field[], cfg: Field[] }
@@ -24,6 +24,8 @@ class Build {
   detect: string[] = []
   modes: string[] = []
   reversible: bool = false
+  // the largest replay interval of the output rules (Bifrost uses the largest of the matched ones)
+  replayMs: int = 0
 
   warn(msg: string): void {
     this.notes.push(msg)
@@ -161,9 +163,10 @@ function parseRules(raw: string | undefined, b: Build): BRule[] throws SyntaxErr
     const ign = setKeys(f, ["timeout", "evaluation_mode", "send_all_conversation_turns", "max_turns_to_send"])
     const sr = rawNum(f, "sampling_rate")
     if (sr !== undefined && sr !== 100) ign.push("sampling_rate")
-    const sri = rawNum(f, "stream_replay_event_interval_ms")
-    if (sri !== undefined && sri > 0) ign.push("stream_replay_event_interval_ms")
     ignoreNote(b, label, ign)
+    // the replay interval of a block-capable output rule (Bifrost caps it at 1000 ms)
+    const sri = rawNum(f, "stream_replay_event_interval_ms") ?? 0
+    const replay = Math.min(Math.max(Math.floor(sri), 0), 1000)
     const at = rawStr(f, "apply_to") ?? "both"
     let scope: Scope = "both"
     if (at === "input") scope = "input"
@@ -175,7 +178,7 @@ function parseRules(raw: string | undefined, b: Build): BRule[] throws SyntaxErr
       for (const e of try elements(pci)) providerIds.push(e.trim())
     }
     if (providerIds.length === 0) b.warn(`${label} links no providers, so it enforces nothing`)
-    out.push({ label: label, scope: scope, target: target, providerIds: providerIds })
+    out.push({ label: label, scope: scope, target: target, providerIds: providerIds, replayMs: replay })
   }
   return out
 }
@@ -549,6 +552,7 @@ export function fromBifrost(guardrailsConfigJson: string): { config: GuardrailsC
       }
       if (r.scope !== "output") inputOf.add(pid)
       if (r.scope !== "input") outputOf.add(pid)
+      if (r.scope !== "input" && r.replayMs > b.replayMs) b.replayMs = r.replayMs
     }
   }
 
@@ -646,6 +650,7 @@ export function fromBifrost(guardrailsConfigJson: string): { config: GuardrailsC
     apply_to: detApply,
     reversible: b.reversible,
   }
+  if (b.replayMs > 0) config.stream_replay_event_interval_ms = b.replayMs
   return { config: config, warnings: b.notes }
 }
 
@@ -683,6 +688,7 @@ export function merge(own: GuardrailsConfig | undefined, fromBifrost: Guardrails
     custom: custom,
     apply_to: own.apply_to ?? fromBifrost.apply_to,
     reversible: own.reversible === true || fromBifrost.reversible === true,
+    stream_replay_event_interval_ms: own.stream_replay_event_interval_ms ?? fromBifrost.stream_replay_event_interval_ms,
   }
 }
 
@@ -948,4 +954,16 @@ test("mcp rules turn their regex and secrets providers on for tool calls", () =>
   expect(r2.config.providers![0]!.targets).toEqual(["mcp"])
   expect(r2.config.detect!.includes("jwt")).toBe(false)
   expect(r2.config.enabled).toBe(true)
+})
+
+test("a rule's stream_replay_event_interval_ms carries to the output replay pacing, the largest of the output rules", () => {
+  const providers = `"guardrail_providers":[{"id":1,"provider_name":"secrets","policy_name":"k","enabled":true,"config":{"action":"block"}},{"id":2,"provider_name":"secrets","policy_name":"k2","enabled":true,"config":{"action":"block"}}]`
+  const rules = `"guardrail_rules":[{"id":1,"name":"a","enabled":true,"cel_expression":"true","apply_to":"output","provider_config_ids":[1],"stream_replay_event_interval_ms":25},{"id":2,"name":"b","enabled":true,"cel_expression":"true","apply_to":"both","provider_config_ids":[2],"stream_replay_event_interval_ms":40},{"id":3,"name":"c","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[2],"stream_replay_event_interval_ms":900}]`
+  const r = try fromBifrost(`{${rules},${providers}}`)
+  expect(r.config.stream_replay_event_interval_ms).toBe(40)
+  expect(r.warnings.some((w: string) => w.includes("stream_replay_event_interval_ms"))).toBe(false)
+  const none = try fromBifrost(`{"guardrail_rules":[{"id":1,"name":"a","enabled":true,"cel_expression":"true","apply_to":"output","provider_config_ids":[1]}],${providers}}`)
+  expect(none.config.stream_replay_event_interval_ms).toBe(undefined)
+  const capped = try fromBifrost(`{"guardrail_rules":[{"id":1,"name":"a","enabled":true,"cel_expression":"true","apply_to":"output","provider_config_ids":[1],"stream_replay_event_interval_ms":5000}],${providers}}`)
+  expect(capped.config.stream_replay_event_interval_ms).toBe(1000)
 })

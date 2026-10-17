@@ -186,6 +186,8 @@ export class Governance {
   enforce = false
   // other credentials accepted on inference when enforced (admin users and tokens, as Bifrost)
   altAuth: ((h: Hdrs) => bool) | undefined = undefined
+  // client.dual_credential_conflict_behavior "error": a request with an identity token and x-bf-vk is refused
+  dualError = false
   required: string[] = []
   // client.allow_direct_keys: a request may carry its own provider key instead of a virtual key
   directKeys = false
@@ -214,6 +216,7 @@ export class Governance {
     // Bifrost's enforce_auth_on_inference (enforce_governance_header is its older name)
     this.enforce = cfg.client?.enforce_auth_on_inference ?? cfg.client?.enforce_governance_header ?? hasCredentials
     this.required = (cfg.client?.required_headers ?? []).map((n) => n.toLowerCase())
+    this.dualError = cfg.client?.dual_credential_conflict_behavior === "error"
     this.directKeys = cfg.client?.allow_direct_keys === true
     const g = cfg.governance
     if (g === undefined) return
@@ -378,6 +381,11 @@ export class Governance {
   admit(h: Hdrs, provider: string, model: string): Grant | Denial {
     const missing = missingHeader(h, this.required)
     if (missing !== undefined) return { kind: "denial", status: 400, type: "invalid_request_error", message: `the request needs the ${missing} header` }
+    // an identity token and a virtual key on one request: refused under "error", and otherwise the key governs it
+    if (this.dualError && h.get("x-bf-vk") !== undefined) {
+      const idAuth = this.altAuth
+      if (idAuth !== undefined && idAuth(h)) return { kind: "denial", status: 400, type: "invalid_request_error", message: "the request carries both an identity token and x-bf-vk, and client.dual_credential_conflict_behavior is error" }
+    }
     const vk = this.findKey(h)
     if (vk === undefined) {
       const alt = this.altAuth
@@ -1039,6 +1047,23 @@ test("required headers", () => {
   }
   expect(g.admit(hdrs([["x-team", " "]]), "openai", "gpt-4o").kind).toBe("denial")
   expect(g.admit(hdrs([["x-team", "core"]]), "openai", "gpt-4o").kind).toBe("grant")
+})
+
+test("dual credentials: an identity token with x-bf-vk is refused only under error", () => {
+  const cfg: Config = { client: { enforce_auth_on_inference: false }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }] } }
+  const both = hdrs([["authorization", "Bearer user-token"], ["x-bf-vk", "sk-bf-k"]])
+  const vkOnly = hdrs([["x-bf-vk", "sk-bf-k"]])
+  const g = new Governance(cfg)
+  g.altAuth = (h) => h.get("authorization") === "Bearer user-token"
+  expect(g.admit(both, "openai", "m").kind).toBe("grant")
+  const errCfg: Config = { client: { enforce_auth_on_inference: false, dual_credential_conflict_behavior: "error" }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }] } }
+  const strict = new Governance(errCfg)
+  strict.altAuth = (h) => h.get("authorization") === "Bearer user-token"
+  const d = strict.admit(both, "openai", "m") as Denial
+  expect(d.kind).toBe("denial")
+  expect(d.status).toBe(400)
+  expect(strict.admit(vkOnly, "openai", "m").kind).toBe("grant")
+  expect(strict.admit(hdrs([["authorization", "Bearer sk-bf-k"], ["x-bf-vk", "sk-bf-k"]]), "openai", "m").kind).toBe("grant")
 })
 
 test("inference auth defaults on when there are credentials", () => {

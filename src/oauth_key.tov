@@ -1,0 +1,145 @@
+// Bifrost's oauth_key_config: a provider key with no value gets its bearer token from a token endpoint.
+// The grant is RFC 6749 client_credentials, or RFC 7523 jwt_bearer (an RS256 assertion signed with the
+// key's RSA private key). This module builds the token request and reads the answer; gateway.tov
+// caches the token per token URL and client, and mints a new one before it expires.
+
+import { fields, rawStr, rawNum, quote } from "./json"
+import { utf8 } from "./crypto"
+import { encodeUrl } from "./base64"
+import { signRs256 } from "./jwt"
+import { pctEncode } from "./cloud_auth"
+import { OAuthKeyConfig } from "./config"
+
+export type OAuthRequest = { url: string, body: string }
+
+const JWT_BEARER_URN = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+// the lifetime of a jwt_bearer assertion, in seconds
+const ASSERTION_SECONDS = 300
+// the token lifetime when the response names none
+const DEFAULT_TOKEN_SECONDS = 3600.0
+
+// A token URL is an absolute https URL with no userinfo, query or fragment. Plain http is for loopback only.
+function checkTokenUrl(url: string): void throws SyntaxError {
+  const local = url.startsWith("http://localhost") || url.startsWith("http://127.0.0.1")
+  if (!url.startsWith("https://") && !local) throw new SyntaxError("oauth_key_config.token_url must be an https URL")
+  const rest = url.slice(url.indexOf("//") + 2)
+  if (rest.includes("@") || url.includes("?") || url.includes("#")) throw new SyntaxError("oauth_key_config.token_url must not carry userinfo, a query or a fragment")
+}
+
+// The RFC 7523 assertion of a jwt_bearer key, unsigned parts first: iss and sub name the client, aud is the
+// audience (the token URL when none is set). Signed RS256 with the key's private key.
+export function jwtAssertion(c: OAuthKeyConfig, nowSeconds: int): string throws SyntaxError {
+  const who = c.client_id ?? ""
+  const aud = c.audience ?? ""
+  const audience = aud === "" ? (c.token_url ?? "") : aud
+  const header = encodeUrl(utf8(`{"alg":"RS256","typ":"JWT"}`))
+  const claims = `{"iss":${quote(who)},"sub":${quote(who)},"aud":${quote(audience)},"iat":${nowSeconds},"exp":${nowSeconds + ASSERTION_SECONDS}}`
+  const input = header + "." + encodeUrl(utf8(claims))
+  const sig = try signRs256(c.private_key ?? "", input)
+  return input + "." + sig
+}
+
+// The token request for a key: the grant's own fields, then the scopes, the audience and the extra
+// parameters, as a form body.
+export function tokenRequest(c: OAuthKeyConfig, nowSeconds: int): OAuthRequest throws SyntaxError {
+  const url = c.token_url ?? ""
+  try checkTokenUrl(url)
+  let parts: string[] = []
+  if (c.grant_type === "jwt_bearer") {
+    if ((c.private_key ?? "") === "") throw new SyntaxError("oauth_key_config: jwt_bearer needs private_key")
+    const assertion = try jwtAssertion(c, nowSeconds)
+    parts.push("grant_type=" + pctEncode(JWT_BEARER_URN))
+    parts.push("assertion=" + pctEncode(assertion))
+  } else if (c.grant_type === "client_credentials") {
+    if ((c.client_id ?? "") === "" || (c.client_secret ?? "") === "") throw new SyntaxError("oauth_key_config: client_credentials needs client_id and client_secret")
+    parts.push("grant_type=client_credentials")
+    parts.push("client_id=" + pctEncode(c.client_id ?? ""))
+    parts.push("client_secret=" + pctEncode(c.client_secret ?? ""))
+  } else {
+    throw new SyntaxError(`oauth_key_config: grant_type "${c.grant_type ?? ""}" is not client_credentials or jwt_bearer`)
+  }
+  const scopes = c.scopes ?? []
+  if (scopes.length > 0) parts.push("scope=" + pctEncode(scopes.join(" ")))
+  const aud = c.audience ?? ""
+  if (aud !== "") parts.push("audience=" + pctEncode(aud))
+  const extra = c.extra_params
+  if (extra !== undefined) {
+    for (const k of extra.keys()) parts.push(pctEncode(k) + "=" + pctEncode(extra.get(k) ?? ""))
+  }
+  return { url: url, body: parts.join("&") }
+}
+
+// The access token and its absolute expiry from a token response. An error answer names its reason.
+export function parseOAuthToken(text: string, nowMs: f64): { token: string, expiresAtMs: f64 } throws SyntaxError {
+  const fs = try fields(text)
+  const token = rawStr(fs, "access_token")
+  if (token === undefined || token === "") {
+    throw new SyntaxError(`oauth_key_config: token request failed: ${rawStr(fs, "error_description") ?? rawStr(fs, "error") ?? "no access_token"}`)
+  }
+  const secs = rawNum(fs, "expires_in") ?? DEFAULT_TOKEN_SECONDS
+  return { token: token, expiresAtMs: nowMs + secs * 1000.0 }
+}
+
+test("client credentials request body names the grant, scopes and extra parameters", () => {
+  const extra: Map<string, string> = new Map()
+  extra.set("resource", "x y")
+  const c: OAuthKeyConfig = { grant_type: "client_credentials", token_url: "https://auth.example.test/oauth/token", client_id: "id-1", client_secret: "sec ret", scopes: ["read", "write"], extra_params: extra }
+  const r = try tokenRequest(c, 1000)
+  expect(r.url).toBe("https://auth.example.test/oauth/token")
+  expect(r.body).toBe("grant_type=client_credentials&client_id=id-1&client_secret=sec%20ret&scope=read%20write&resource=x%20y")
+})
+
+function clientCreds(url: string): OAuthKeyConfig {
+  return { grant_type: "client_credentials", token_url: url, client_id: "a", client_secret: "b" }
+}
+
+test("token URLs must be https, or loopback http, with no query", () => {
+  let plain = false
+  try {
+    tokenRequest(clientCreds("http://auth.example.test/token"), 0)
+  } catch (e) {
+    plain = true
+  }
+  expect(plain).toBe(true)
+  const local = try tokenRequest(clientCreds("http://localhost:9/token"), 0)
+  expect(local.url).toBe("http://localhost:9/token")
+  let query = false
+  try {
+    tokenRequest(clientCreds("https://auth.example.test/token?x=1"), 0)
+  } catch (e) {
+    query = true
+  }
+  expect(query).toBe(true)
+})
+
+test("a jwt_bearer key needs its private key and a known grant", () => {
+  let missing = false
+  try {
+    tokenRequest({ grant_type: "jwt_bearer", token_url: "https://auth.example.test/token", client_id: "a" }, 0)
+  } catch (e) {
+    missing = true
+  }
+  expect(missing).toBe(true)
+  let unknown = false
+  try {
+    tokenRequest({ grant_type: "password", token_url: "https://auth.example.test/token", client_id: "a", client_secret: "b" }, 0)
+  } catch (e) {
+    unknown = true
+  }
+  expect(unknown).toBe(true)
+})
+
+test("token responses give the token and its expiry, or the reason they fail", () => {
+  const ok = try parseOAuthToken(`{"access_token":"tok-1","token_type":"bearer","expires_in":60}`, 1000.0)
+  expect(ok.token).toBe("tok-1")
+  expect(ok.expiresAtMs).toBe(61000.0)
+  const dflt = try parseOAuthToken(`{"access_token":"tok-2"}`, 0.0)
+  expect(dflt.expiresAtMs).toBe(3600000.0)
+  let reason = ""
+  try {
+    parseOAuthToken(`{"error":"invalid_client","error_description":"bad secret"}`, 0.0)
+  } catch (e) {
+    reason = e.message
+  }
+  expect(reason.includes("bad secret")).toBe(true)
+})

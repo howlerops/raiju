@@ -6,7 +6,7 @@ import { parseModel, target } from "./router"
 import { Target } from "./providers/types"
 import { snapshot } from "./schemas"
 import * as metrics from "./metrics"
-import { WsConnection } from "./ws"
+import { WsConnection, SocketGate } from "./ws"
 import { errorJson } from "./schemas"
 
 export class Session {
@@ -14,6 +14,11 @@ export class Session {
   // the state of a WebSocket route other than the realtime relay (responses, live, the UI socket);
   // undefined for the relay
   ext: SocketExt | undefined = undefined
+  // the route's session cap (websocket.max_connections_per_user), and whether this session holds a slot
+  gate: SocketGate | undefined = undefined
+  held = false
+  // the relay has been counted in its metrics gauge (so the close only takes it back once)
+  live = false
   constructor(readonly url: string, readonly headers: Map<string, string>, readonly provider: string, readonly model: string) {}
 }
 
@@ -31,6 +36,9 @@ export class SocketExt {
   closed = false
   // the route has closed the socket (sent its close frame)
   ended = false
+  // the route's session cap, and whether this socket holds one of its slots
+  gate: SocketGate | undefined = undefined
+  held = false
   // when the client last answered a ping (ms since the epoch); see the UI socket's heartbeat
   pongAt: f64 = Date.now()
   onOpen(): void {}
@@ -62,6 +70,47 @@ export class SocketExt {
       p.closeWith(code, reason)
     }
   }
+  // Takes this socket's slot in its route's gate. False when the route is full.
+  enter(): bool {
+    if (this.held) return true
+    const g = this.gate
+    if (g === undefined) return true
+    if (!g.take()) return false
+    this.held = true
+    return true
+  }
+  leave(): void {
+    if (!this.held) return
+    this.held = false
+    const g = this.gate
+    if (g !== undefined) g.give()
+  }
+  // Answers a socket that the route has no room for: an error event, then a close (Bifrost's 429).
+  refuseFull(): void {
+    this.send(FULL_EVENT)
+    this.closed = true
+    this.endWith(1013, FULL_REASON)
+  }
+}
+
+const FULL_REASON = "websocket connection limit reached"
+const FULL_EVENT = `{"type":"error","error":{"type":"rate_limit_error","code":"websocket_connection_limit_reached","message":"${FULL_REASON}"}}`
+
+// Takes a slot for a relay session in its gate; false when the route is full.
+function enterRelay(s: Session): bool {
+  if (s.held) return true
+  const g = s.gate
+  if (g === undefined) return true
+  if (!g.take()) return false
+  s.held = true
+  return true
+}
+
+function leaveRelay(s: Session): void {
+  if (!s.held) return
+  s.held = false
+  const g = s.gate
+  if (g !== undefined) g.give()
 }
 
 export type Upgrade = { kind: "session", session: Session } | { kind: "refused", status: int, message: string }
@@ -92,6 +141,10 @@ export function extOpen(ws: ServerWebSocket<Session>): bool {
   }, () => {
     ws.terminate()
   })
+  if (!e.enter()) {
+    e.refuseFull()
+    return true
+  }
   e.onOpen()
   return true
 }
@@ -120,6 +173,7 @@ export function extClose(ws: ServerWebSocket<Session>): bool {
   if (e === undefined) return false
   e.closed = true
   e.onClose()
+  e.leave()
   return true
 }
 
@@ -143,6 +197,11 @@ export function attachHttp1(e: SocketExt, client: WsConnection): void {
   client.onClose = (c, r) => {
     e.closed = true
     e.onClose()
+    e.leave()
+  }
+  if (!e.enter()) {
+    e.refuseFull()
+    return
   }
   e.onOpen()
 }
@@ -207,7 +266,9 @@ export function prepare(engine: Engine, req: Request): Upgrade {
   if (sel === undefined) return { kind: "refused", status: 404, message: `no key is configured for ${ref.provider}/${ref.model}` }
   if (!realtimeKind(sel.t.kind)) return { kind: "refused", status: 400, message: `${ref.provider} has no realtime API this gateway can relay` }
   const up = upstreamFor(sel.t, req.headers.get("openai-beta") ?? undefined)
-  return { kind: "session", session: new Session(up.url, up.headers, ref.provider, ref.model) }
+  const session = new Session(up.url, up.headers, ref.provider, ref.model)
+  session.gate = engine.wsRealtime
+  return { kind: "session", session: session }
 }
 
 function labels(s: Session): string {
@@ -217,6 +278,12 @@ function labels(s: Session): string {
 export function onOpen(ws: ServerWebSocket<Session>): void {
   const s = ws.data
   if (s === undefined) return
+  if (!enterRelay(s)) {
+    ws.send(FULL_EVENT)
+    ws.close(1013, FULL_REASON)
+    return
+  }
+  s.live = true
   metrics.addGauge("raiju_realtime_sessions", labels(s), 1.0)
   try {
     const hs: Record<string, string> = {}
@@ -245,6 +312,9 @@ export function onMessage(ws: ServerWebSocket<Session>, m: string | u8[]): void 
 export function onClose(ws: ServerWebSocket<Session>): void {
   const s = ws.data
   if (s === undefined) return
+  leaveRelay(s)
+  if (!s.live) return
+  s.live = false
   metrics.addGauge("raiju_realtime_sessions", labels(s), -1.0)
   const up = s.upstream
   if (up !== undefined && up.readyState < 2) up.close()
@@ -261,6 +331,12 @@ export function relayHttp1(engine: Engine, req: Request, accept: () => WsConnect
   const s = up.session
   const client = accept()
   if (client === undefined) return
+  if (!enterRelay(s)) {
+    client.send(FULL_EVENT)
+    client.close(1013, FULL_REASON)
+    return
+  }
+  s.live = true
   metrics.addGauge("raiju_realtime_sessions", labels(s), 1.0)
   try {
     const hs: Record<string, string> = {}
@@ -281,13 +357,36 @@ export function relayHttp1(engine: Engine, req: Request, accept: () => WsConnect
       upstream.send(m)
     }
     client.onClose = (code, reason) => {
-      metrics.addGauge("raiju_realtime_sessions", labels(s), -1.0)
+      leaveRelay(s)
+      if (s.live) {
+        s.live = false
+        metrics.addGauge("raiju_realtime_sessions", labels(s), -1.0)
+      }
       if (upstream.readyState < 2) upstream.close()
     }
   } catch (e) {
     client.close(1011, e.message)
   }
 }
+
+test("a route's gate admits sockets up to its cap and frees a slot when one leaves", () => {
+  const g = new SocketGate(2)
+  const a = new SocketExt()
+  const b = new SocketExt()
+  const c = new SocketExt()
+  a.gate = g
+  b.gate = g
+  c.gate = g
+  expect(a.enter()).toBe(true)
+  expect(b.enter()).toBe(true)
+  expect(c.enter()).toBe(false)
+  a.leave()
+  expect(c.enter()).toBe(true)
+  a.leave()
+  expect(g.open).toBe(2)
+  const free = new SocketExt()
+  expect(free.enter()).toBe(true)
+})
 
 test("realtime upstream URLs", () => {
   const t: Target = { provider: "openai", kind: "openai", model: "gpt-realtime", key: { value: "sk" }, cfg: {} }
