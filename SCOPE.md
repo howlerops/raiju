@@ -62,7 +62,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Docker / Helm / Terraform | done (image built and run; Terraform validated) |
 | Plugin hooks | partial: compiled-in plugins with Bifrost's placement and order; dynamic (Go shared object and WASM) plugins are not built |
 | Config store + management API | done (the config is a JSON file; Bifrost's sqlite and postgres config stores are not built) |
-| Web UI | done: the admin client built into the gateway (`ui/`, L113): providers, virtual keys, budgets and limits, logs, the live feed, MCP clients and settings. Not built: dashboard charts, MCP OAuth consent screens, and native apps |
+| Web UI | done: the admin client built into the gateway (`web/`, L113; SolidJS and Vite, embedded through `src/ui_assets.tov`): sign-in (admin token, SSO), overview, providers, virtual keys, budgets and limits, logs, the live feed (virtualized, 5,000 rows), MCP clients, settings and a playground. Not built: dashboard charts, MCP OAuth consent screens, and native apps |
 | Cohere | done |
 | Custom providers | done |
 | Vertex AI | done: chat, streaming, embeddings, responses, images and image edits, batches and files over GCS, exact count tokens; the AWS workload identity is not built (needs a cloud account) |
@@ -97,11 +97,11 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Session affinity | done |
 | Complexity router | done |
 | Outbound proxies | done (HTTP, with credentials; SOCKS5 isn't in Tov's fetch) |
+| MCP code mode | partial (moved in from Out by the owner, 2026-10-17; L117): the four meta-tools (listToolFiles, readToolFile, getToolDocs, executeToolCode), Python stubs, `mcp.code_mode_binding_level` and `mcp.code_mode_limits`, and the gates on the tool calls a program makes. The runner is a Starlark subset (no while, classes, exceptions or imports); see docs/parity.md (g) |
 | Provider passthrough routes | done (OpenAI, Anthropic, Azure, Bedrock agent/guardrail, GenAI, ChatGPT Codex) |
 | Direct keys, raw request/response echo | partial: direct keys and send-back of raw requests and responses are done; `x-bf-store-raw-request-response` is not built |
 | Reasoning parameters | done (Anthropic, Gemini, Bedrock Claude and Nova) |
-| A2A (agent-to-agent, registered agents) | not built (moved in from Out by the owner, 2026-10-17: agent cards, JSON-RPC tasks, `/agents/a2a` and `/api/agents`; L116) |
-| MCP code mode | not built (moved in from Out by the owner, 2026-10-17; L117) |
+| A2A agents (registered agents, agent cards, JSON-RPC tasks) | partial: registrations at /api/agents with cached cards, grants, runtime headers and inspect; the gateway at /agents/a2a/{name} serves the card and proxies message/send, message/stream, tasks/get and tasks/cancel, logged under the agent's name; the agent_names log filter works; REST and gRPC bindings, push notifications, OAuth and TLS upstream auth are not built |
 
 ## Out
 

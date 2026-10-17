@@ -15,13 +15,14 @@ import { join } from "node:path"
 import { Engine } from "./gateway"
 import { CostRecalc, RecalcStatus } from "./costrecalc"
 import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE } from "./setupsession"
-import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { agentSessionsOf, a2aLogJson, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
 import { AccessProfile, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin, sweepExpiredKeys, RESOURCES, OPERATIONS } from "./store"
+import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
 import { keyBudgetIds, permissionDocs, permissionIds, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
@@ -30,12 +31,14 @@ type RoleAttachBody = { role_ids?: int[], is_default?: bool, apply_to_existing?:
 type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
 type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, roleIdOf } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, roleIdOf } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
-import { ExposedTool, SessionStore, handleMcp } from "./mcpserver"
+import { ExposedTool, SessionStore, handleMcp, rpcError } from "./mcpserver"
+import { relay } from "./passthrough"
+import { findAgent, grantAllows, runtimeHeaders, a2aMethodOf, rpcIdOf, isStreamMethod, contextOfRequest, contextOfResponse, endpointOf, gatewayCard, A2A_METHODS, CARD_PATH, JSON_RPC_SUFFIX } from "./agents"
 import { tempTokenAllows } from "./mcpuser"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
@@ -63,7 +66,7 @@ import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
 import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs, ByteRequest } from "./exports"
 import { planWindow, maxObjectBytes } from "./audit_archive"
-import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
+import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode } from "./mcpissuer"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
@@ -167,10 +170,37 @@ function byName(a: string, b: string): int {
   return a < b ? -1 : 1
 }
 
+// The names a single sign-on identity is known by in governance: its subject and its email, lower-cased.
+function ssoNames(sub: string, email: string | undefined): string[] {
+  return [sub, (email ?? "").toLowerCase()]
+}
+
 function json(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "application/json")
   return new Response(body, { status: status, headers: h })
+}
+
+// One A2A call that reached an agent (Ops.recordA2a).
+type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, error: string }
+
+// Whether an agent's answer is a JSON-RPC error object (false for a body that is not JSON).
+function rpcFailed(text: string): bool {
+  try {
+    return find(fields(text), "error") !== undefined
+  } catch (e) {
+    return false
+  }
+}
+
+// The comma-separated names of a query parameter, without empty ones.
+function listNames(v: string): string[] {
+  const out: string[] = []
+  for (const x of v.split(",")) {
+    const t = x.trim()
+    if (t !== "") out.push(t)
+  }
+  return out
 }
 
 // Model parameters by model key, each record as the JSON text it came in. The datasheet is keyed
@@ -712,6 +742,8 @@ function logEventView(e: LogEntry): LogEvent {
 export class Ops {
   rbac: RbacConfig = { users: [] }
   authOn = false
+  // when each management API key was last used, by name, as this worker saw it (apikeys.tov)
+  private keyUsed: Map<string, string> = new Map()
   // model parameters (GET /api/models/parameters), loaded when first asked and then daily
   private params: Map<string, string> = new Map()
   private paramsAt: f64 = -1.0
@@ -813,12 +845,12 @@ export class Ops {
     } catch (e) {
       console.error(`raiju: admin credentials: ${e.message}`)
     }
-    this.rbac = { users: users.concat(legacy), roles: gov?.roles ?? [] }
+    this.rbac = { users: users.concat(legacy), roles: gov?.roles ?? [], api_keys: gov?.api_keys ?? [] }
     // admin credentials also count as inference auth, as in Bifrost
     const rb = this.rbac
     this.engine.gov.altAuth = (h) => rb.users.length > 0 && authenticate(rb, h).kind === "user"
     // auth_config with only part of a credential still locks the API, as before
-    this.authOn = this.rbac.users.length > 0 || !checkAdmin(auth, new Map())
+    this.authOn = this.rbac.users.length > 0 || (gov?.api_keys ?? []).length > 0 || !checkAdmin(auth, new Map())
     const ac = cfg.audit
     if (this.audit === undefined && ac !== undefined && ac.enabled === true) {
       try {
@@ -1643,7 +1675,7 @@ export class Ops {
     }
     if (path === "/api/session/is-auth-enabled") {
       if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
-      const valid = bearer !== "" && this.sessions.get(bearer, now) !== undefined
+      const valid = bearer !== "" && this.liveSession(bearer) !== undefined
       const enforced = this.store.cfg.client?.enforce_auth_on_inference ?? false
       return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: !this.authOn, setup_token_configured: resolveEnv(this.store.cfg.setup_token ?? "") !== "" }))
     }
@@ -1966,7 +1998,8 @@ export class Ops {
     if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
     const pg = pageOfQuery(sp, 50, 1000)
     if (pg.error !== "") return badRequest(pg.error)
-    const f = listFilter(sp, Date.now())
+    let f = listFilter(sp, Date.now())
+    this.withAgents(sp, &f, store, sc)
     const es = applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)
     return okJson(listJson(es, pg.page, scopedView(store, sc, 0.0).length > 0))
   }
@@ -1975,7 +2008,8 @@ export class Ops {
   private logStats(sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
     const bad = unsupportedFilter(sp)
     if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
-    const f = listFilter(sp, Date.now())
+    let f = listFilter(sp, Date.now())
+    this.withAgents(sp, &f, store, sc)
     return okJson(statsView(applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)))
   }
 
@@ -2385,6 +2419,135 @@ export class Ops {
   }
 
 
+  // agent_names: the filter selects the requests in the sessions (A2A context ids) of the calls to those
+  // agents within the window (Bifrost's agent context filter). Other filters pass through.
+  withAgents(sp: URLSearchParams, inout f: Filter, store: LogStore, sc: DataScope): void {
+    const names = listNames(sp.get("agent_names") ?? "")
+    if (names.length === 0) return
+    f.agentSessions = agentSessionsOf(scopedView(store, sc, f.since - 1.0), names, f.since, f.until)
+  }
+
+  // One A2A call that reached an agent, as a log entry of kind "a2a" under the agent's name.
+  recordA2a(c: A2aCall): void {
+    const store = this.engine.logStore
+    if (store === undefined) return
+    const now = Date.now()
+    store.add({
+      id: "a2a-" + now + "-" + Math.floor(Math.random() * 1000000000),
+      ts: now,
+      request_id: "",
+      op: c.method,
+      provider: "",
+      model: "",
+      status: c.status,
+      latency_ms: c.latencyMs,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      cost: 0.0,
+      cache_hit: false,
+      virtual_key: c.vk,
+      session_id: c.context === "" ? undefined : c.context,
+      error: c.error === "" ? undefined : c.error,
+      kind: "a2a",
+      agent_name: c.agent,
+    })
+  }
+
+  // GET /api/agents/history: the A2A calls the caller's scope sees, newest first (agent_names, limit, offset).
+  agentHistoryRoute(sp: URLSearchParams, sc: DataScope): Reply {
+    const names = listNames(sp.get("agent_names") ?? "")
+    const pg = pageOfQuery(sp, 50, 1000)
+    if (pg.error !== "") return badRequest(pg.error)
+    const store = this.engine.logStore
+    if (store === undefined) return okJson(`{"history":[],"total":0}`)
+    const hits: string[] = []
+    const es = scopedView(store, sc, 0.0)
+    for (let i = es.length - 1; i >= 0; i--) {
+      const e = es[i]!
+      if (kindOf(e) !== "a2a") continue
+      if (names.length > 0 && !names.includes(e.agent_name ?? "")) continue
+      hits.push(a2aLogJson(e))
+    }
+    const rows = hits.slice(pg.page.offset, pg.page.offset + pg.page.limit)
+    return okJson(`{"history":[${rows.join(",")}],"total":${hits.length}}`)
+  }
+
+  // The gateway's routes under /agents/a2a/{name}: the agent's card (GET .../.well-known/agent-card.json) and
+  // its JSON-RPC endpoint (POST .../json-rpc). rest is the path after the name; base is the public base URL.
+  // A call passes the virtual key (required when enforcement is on), the agent's grants, and the key's
+  // budgets and rate limits, then goes to the card's endpoint with the agent's runtime headers.
+  async a2aRoute(req: Request, name: string, rest: string, base: string): Promise<Response> {
+    const isCard = rest === CARD_PATH
+    if (!isCard && rest !== JSON_RPC_SUFFIX) return json(404, errorJson("no such agent route", "invalid_request_error", undefined))
+    if (isCard && req.method !== "GET") return json(405, errorJson("use GET for the agent card", "invalid_request_error", undefined))
+    if (!isCard && req.method !== "POST") return json(405, errorJson("use POST for JSON-RPC", "invalid_request_error", undefined))
+    const agent = findAgent(this.engine.cfg.agents, name)
+    if (agent === undefined || agent.enabled === false) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
+    const h = snapshot(req.headers)
+    const vk = this.engine.gov.findKey(h)
+    if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)")
+    if (!grantAllows(agent, vk?.id)) return denied(403, `this key may not call the agent ${name}`)
+    const gate = this.engine.gov.admitTool(h)
+    if (gate.kind === "denial") return json(gate.status, errorJson(gate.message, gate.type, undefined))
+    // the key's request and token limits count each call (admitTool checks the budgets only)
+    const rls: string[] = []
+    if (vk !== undefined && vk.rate_limit_id !== undefined) rls.push(vk.rate_limit_id)
+    const limited = this.engine.gov.checkLimits(vk, [], rls)
+    if (limited.kind === "denial") return json(limited.status, errorJson(limited.message, limited.type, undefined))
+    if (isCard) {
+      const card = agent.card ?? ""
+      if (card === "") return json(503, errorJson(`the card of ${name} has not been fetched: refresh it through /api/agents/${name}/refresh-card`, "api_error", undefined))
+      return json(200, gatewayCard(card, base, name))
+    }
+    const body = await req.text()
+    const method = a2aMethodOf(body)
+    const id = rpcIdOf(body)
+    if (method === "") return json(400, rpcError(id, -32600, "invalid request: not a JSON-RPC call"))
+    if (!A2A_METHODS.includes(method)) return json(200, rpcError(id, -32601, `method not found: ${method}`))
+    const endpoint = endpointOf(agent.card ?? "")
+    if (endpoint === "") return json(503, rpcError(id, -32603, `the card of ${name} names no endpoint`))
+    const stream = isStreamMethod(method)
+    const hm: Map<string, string> = new Map()
+    hm.set("content-type", "application/json")
+    hm.set("accept", stream ? "text/event-stream" : "application/json")
+    const ver = h.get("a2a-version")
+    if (ver !== undefined) hm.set("a2a-version", ver)
+    const rh = runtimeHeaders(agent)
+    for (const k of rh.keys()) hm.set(k, rh.get(k) ?? "")
+    const hs: Record<string, string> = hm
+    const started = Date.now()
+    const dl = deadline(stream ? 300000 : 60000)
+    const vkId = vk?.id
+    const context = contextOfRequest(body)
+    try {
+      const res = await fetch(endpoint, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+      const ct = res.headers.get("content-type") ?? ""
+      if (stream && ct.includes("text/event-stream")) {
+        // the stream is passed on as it arrives: the deadline no longer applies to it
+        dl.finish()
+        this.recordA2a({ agent: name, method: method, status: res.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: res.status >= 400 ? `agent answered HTTP ${res.status}` : "" })
+        const up = res.body
+        if (up === undefined) return json(502, rpcError(id, -32603, "the agent sent no stream"))
+        const sh: Record<string, string> = new Map()
+        sh.set("content-type", "text/event-stream")
+        sh.set("cache-control", "no-cache")
+        return new Response(relay(up), { status: res.status, headers: sh })
+      }
+      const text = await res.text()
+      dl.finish()
+      const failed = res.status >= 400 || rpcFailed(text)
+      const ctx = context === "" ? contextOfResponse(text) : context
+      this.recordA2a({ agent: name, method: method, status: res.status, latencyMs: Date.now() - started, context: ctx, vk: vkId, error: failed ? `agent answered ${res.status >= 400 ? "HTTP " + res.status : "a JSON-RPC error"}` : "" })
+      const oh: Record<string, string> = new Map()
+      oh.set("content-type", ct === "" ? "application/json" : ct)
+      return new Response(text, { status: res.status, headers: oh })
+    } catch (e) {
+      dl.finish()
+      this.recordA2a({ agent: name, method: method, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: `the agent did not answer: ${e.message}` })
+      return json(502, rpcError(id, -32603, `the agent did not answer: ${e.message}`))
+    }
+  }
+
   // ---- log exporters (Datadog, Splunk, Elasticsearch, HTTP) ----
 
   configureExporters(list: LogExporterConfig[]): void {
@@ -2626,9 +2789,14 @@ export class Ops {
     if (jw.status !== 200) return html(502, "<p>Could not read the identity provider's signing keys.</p>")
     const v = verifyIdToken(idToken, jw.body, oc, d.issuer, flow.nonce, Date.now())
     if (v.kind === "error") return html(401, `<p>Sign-in failed: ${v.message.replace("<", "&lt;")}</p>`)
+    // a user governance lists as disabled (a SCIM deactivation, say) signs in no more; users it does not list are unchanged
+    if (disabledNamed(this.rbac, ssoNames(v.sub, v.email))) {
+      this.recordChange("sso:" + v.sub, req, path, 403, "")
+      return html(403, "<p>This account is disabled. Ask an administrator to enable it.</p>")
+    }
     let token = ""
     try {
-      token = this.sessions.create(v.sub, v.role, Date.now())
+      token = this.sessions.create(v.sub, v.role, Date.now(), v.email)
     } catch (e) {
       return html(500, "<p>Could not create a session.</p>")
     }
@@ -2737,6 +2905,15 @@ export class Ops {
     this.ui.send(JSON.stringify({ type: "store_update", tags: [seg] }))
   }
 
+  // The single sign-on session a token names, or undefined when there is none or its user is now disabled in
+  // governance: a deactivated user's session stops at its next request.
+  liveSession(token: string): Session | undefined {
+    const s = this.sessions.get(token, Date.now())
+    if (s === undefined) return undefined
+    if (disabledNamed(this.rbac, ssoNames(s.sub, s.email))) return undefined
+    return s
+  }
+
   // Whether the caller may use this /api route; the actor names them in the audit log.
   gate(req: Request, path: string): Gate {
     // client.whitelisted_routes: these exact paths skip authentication (Bifrost)
@@ -2745,7 +2922,7 @@ export class Ops {
     if (pg !== undefined) return pg
     const auth = req.headers.get("authorization") ?? ""
     if (auth.startsWith("Bearer sk-sess-")) {
-      const s = this.sessions.get(auth.slice(7), Date.now())
+      const s = this.liveSession(auth.slice(7))
       // a single sign-on session holds a built-in role
       const role = s === undefined ? undefined : (isBuiltinRole(s.role) ? s.role : undefined)
       if (s === undefined || role === undefined) return { kind: "deny", res: denied(401, "the session expired; sign in again") }
@@ -2760,7 +2937,10 @@ export class Ops {
     // a temp token (client.mcp_enable_temp_token_auth) opens the per-user consent flow it was minted for
     if (this.store.cfg.client?.mcp_enable_temp_token_auth === true && tempTokenAllows(req.headers.get("x-bifrost-temp-token") ?? "", req.method, path, Date.now())) return { kind: "ok", actor: "temp-token" }
     const v = authorize(this.rbac, snapshot(req.headers), req.method, path)
-    if (v.kind === "ok") return { kind: "ok", actor: v.actor }
+    if (v.kind === "ok") {
+      if (v.actor.startsWith("key:")) this.keyUsed.set(v.actor.slice(4), rfc3339Of(Date.now()))
+      return { kind: "ok", actor: v.actor }
+    }
     this.recordChange("unauthenticated", req, path, v.status, "")
     return { kind: "deny", res: denied(v.status, v.message) }
   }
@@ -2770,7 +2950,7 @@ export class Ops {
   consentSignedIn(req: Request): bool {
     if (!this.authOn) return false
     const auth = req.headers.get("authorization") ?? ""
-    if (auth.startsWith("Bearer sk-sess-")) return this.sessions.get(auth.slice(7), Date.now()) !== undefined
+    if (auth.startsWith("Bearer sk-sess-")) return this.liveSession(auth.slice(7)) !== undefined
     return authorize(this.rbac, snapshot(req.headers), "GET", "/api/users/me/permissions").kind === "ok"
   }
 
@@ -2988,6 +3168,11 @@ export class Ops {
   // /api/users/me/permissions: the caller's custom role as (resource, operation) pairs with their ids.
   // Built-in roles hold fixed rules (rbac.tov) and are reported by name, with no pairs.
   mePermissions(actor: string): Reply {
+    if (actor.startsWith("key:")) {
+      const kids = permissionIds(RESOURCES, OPERATIONS, this.heldOf(actor).pairs)
+      const kdocs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => kids.includes(d.id))
+      return { status: 200, body: JSON.stringify({ user: actor, role: "api_key", built_in: false, permissions: kdocs }), contentType: "application/json" }
+    }
     // a caller with no stored user (the legacy admin credential) is the admin
     let role = "admin"
     for (const u of this.store.cfg.governance?.users ?? []) {
@@ -2998,6 +3183,52 @@ export class Ops {
     const ids = permissionIds(RESOURCES, OPERATIONS, pairs)
     const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
     return { status: 200, body: JSON.stringify({ user: actor, role: role, built_in: custom === undefined, permissions: docs }), contentType: "application/json" }
+  }
+
+  // What the actor may grant to a management API key: everything for the admin and the legacy admin
+  // credential, the custom role's permissions for a role user, and a key's own permissions for a key.
+  // A single sign-on or proxy identity holds a built-in role, which grants no pairs here.
+  heldOf(actor: string): Held {
+    if (actor.startsWith("key:")) {
+      for (const k of this.store.cfg.governance?.api_keys ?? []) {
+        if ("key:" + k.name === actor) return { all: false, pairs: k.permissions }
+      }
+      return { all: false, pairs: [] }
+    }
+    if (actor.startsWith("sso:") || actor.startsWith("proxy:") || actor === "temp-token") return { all: false, pairs: [] }
+    const gov = this.store.cfg.governance
+    for (const u of gov?.users ?? []) {
+      if (u.name !== actor) continue
+      if (u.role === "admin") return { all: true, pairs: [] }
+      return { all: false, pairs: customRole(gov?.roles ?? [], u.role)?.permissions ?? [] }
+    }
+    return { all: true, pairs: [] }
+  }
+
+  // /api/api-keys and /api/api-keys/{id} (apikeys.tov). A change is saved to the config; this worker's
+  // copy of the keys is updated at once, so the next request with a new key already authenticates.
+  apiKeysRoute(method: string, path: string, url: string, body: string, actor: string): Reply {
+    let value = ""
+    if (method === "POST") {
+      try {
+        value = newKeyValue()
+      } catch (e) {
+        return { status: 500, body: errorJson(`could not make a key: ${e.message}`, "api_error", undefined), contentType: "application/json" }
+      }
+    }
+    const u = URL.parse(url)
+    const sp = u === undefined ? new URLSearchParams("") : u.searchParams
+    // a key names its creator only when that is a stored user (not a key, the anonymous caller or a sign-in)
+    const creator = actor.startsWith("sso:") || actor.startsWith("proxy:") || actor.startsWith("key:") || actor === "anonymous" || actor === "temp-token" ? "" : actor
+    const ctx: KeyCtx = { held: this.heldOf(actor), actor: creator, nowMs: Date.now(), value: value, lastUsed: this.keyUsed }
+    const r = handleApiKeys(this.store.cfg.governance?.api_keys ?? [], method, path, sp, body, ctx)
+    const next = r.keys
+    if (next !== undefined) {
+      const saved = this.store.setApiKeys(next)
+      if (saved.kind !== "ok") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
+      this.rbac = { users: this.rbac.users, roles: this.rbac.roles, api_keys: next }
+    }
+    return { status: r.status, body: r.body, contentType: "application/json" }
   }
 
   // POST /api/governance/access-profiles/{id}/propagate ({"fields": [...]}; all of them when unset): the

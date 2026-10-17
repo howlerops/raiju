@@ -315,6 +315,63 @@ async function mcpServer(req: Request): Promise<Response> {
 
 const port = parseInt(process.env.MOCK_PORT ?? "18099") ?? 18099
 
+// A fake A2A agent (src/agents.tov). Its card names this mock's JSON-RPC route. message/send answers a
+// completed task that echoes the text ("fail" is refused with a JSON-RPC error); message/stream sends a
+// working status and the task as SSE; tasks/get and tasks/cancel read and cancel the tasks it made. The
+// v0.3 method names and the v1 names are the same methods.
+type A2aTask = { id: string, contextId: string, state: string, text: string }
+type A2aIn = { id?: string, method?: string, params?: { id?: string, message?: { contextId?: string, parts?: { text?: string }[] } } }
+const a2aTasks: Map<string, A2aTask> = new Map()
+let a2aSeq = 0
+
+function a2aTaskJson(t: A2aTask): string {
+  return `{"kind":"task","id":${JSON.stringify(t.id)},"contextId":${JSON.stringify(t.contextId)},"status":{"state":${JSON.stringify(t.state)}},"artifacts":[{"artifactId":"a-${t.id}","parts":[{"kind":"text","text":${JSON.stringify("echo: " + t.text)}}]}]}`
+}
+
+function a2aError(id: string, code: int, message: string): Response {
+  return new Response(`{"jsonrpc":"2.0","id":${JSON.stringify(id)},"error":{"code":${code},"message":${JSON.stringify(message)}}}`, { headers: { "content-type": "application/json" } })
+}
+
+async function a2aRpc(req: Request): Promise<Response> {
+  const body = await req.text()
+  record(req, "/a2a/agent/json-rpc", body)
+  const j = try JSON.parse(body) as A2aIn
+  const id = j.id ?? "0"
+  const method = j.method ?? ""
+  const msg = j.params?.message
+  if (method === "message/send" || method === "SendMessage") {
+    const parts = msg?.parts ?? []
+    const text = parts.length > 0 ? (parts[0]!.text ?? "") : ""
+    if (text === "fail") return a2aError(id, -32000, "agent failed on request")
+    a2aSeq += 1
+    const t: A2aTask = { id: "task-" + a2aSeq, contextId: msg?.contextId ?? "ctx-" + a2aSeq, state: "completed", text: text }
+    a2aTasks.set(t.id, t)
+    return new Response(`{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${a2aTaskJson(t)}}`, { headers: { "content-type": "application/json" } })
+  }
+  if (method === "message/stream" || method === "SendStreamingMessage") {
+    a2aSeq += 1
+    const t: A2aTask = { id: "task-" + a2aSeq, contextId: msg?.contextId ?? "ctx-" + a2aSeq, state: "completed", text: "streamed" }
+    a2aTasks.set(t.id, t)
+    const working = `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":{"kind":"status-update","taskId":${JSON.stringify(t.id)},"contextId":${JSON.stringify(t.contextId)},"status":{"state":"working"},"final":false}}`
+    const done = `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${a2aTaskJson(t)}}`
+    return new Response(`data: ${working}\n\ndata: ${done}\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }
+  if (method === "tasks/get" || method === "GetTask") {
+    const t = a2aTasks.get(j.params?.id ?? "")
+    if (t === undefined) return a2aError(id, -32001, "task not found")
+    return new Response(`{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${a2aTaskJson(t)}}`, { headers: { "content-type": "application/json" } })
+  }
+  if (method === "tasks/cancel" || method === "CancelTask") {
+    const t = a2aTasks.get(j.params?.id ?? "")
+    if (t === undefined) return a2aError(id, -32001, "task not found")
+    // map values are copies: the canceled task is stored again
+    const canceled: A2aTask = { id: t.id, contextId: t.contextId, state: "canceled", text: t.text }
+    a2aTasks.set(canceled.id, canceled)
+    return new Response(`{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${a2aTaskJson(canceled)}}`, { headers: { "content-type": "application/json" } })
+  }
+  return a2aError(id, -32601, "method not found")
+}
+
 Bun.serve<string>({
   port: port,
   routes: {
@@ -1111,6 +1168,13 @@ Bun.serve<string>({
       },
     },
     "/_seen": () => Response.json(seen),
+    "/a2a/agent/.well-known/agent-card.json": {
+      GET: (req) => {
+        record(req, "/a2a/agent/.well-known/agent-card.json", "")
+        return Response.json({ name: "echo-agent", description: "Echoes the text it is sent", url: `http://127.0.0.1:${port}/a2a/agent/json-rpc`, version: "1.0.0", protocolVersion: "0.3.0", capabilities: { streaming: true }, defaultInputModes: ["text/plain"], defaultOutputModes: ["text/plain"], skills: [{ id: "echo", name: "echo", description: "Echoes the text", tags: ["test"] }] })
+      },
+    },
+    "/a2a/agent/json-rpc": { POST: (req) => a2aRpc(req) },
     // OAuth metadata (RFC 8414), dynamic client registration (RFC 7591), the authorize step (PKCE S256) and the token endpoint
     "/.well-known/oauth-authorization-server": {
       GET: () => Response.json({ issuer: `http://127.0.0.1:${port}`, authorization_endpoint: `http://127.0.0.1:${port}/oauth2/authorize`, token_endpoint: `http://127.0.0.1:${port}/oauth2/token`, registration_endpoint: `http://127.0.0.1:${port}/oauth2/register`, code_challenge_methods_supported: ["S256"] }),
@@ -1174,6 +1238,14 @@ Bun.serve<string>({
       POST: async (req) => {
         const auth = req.headers.get("authorization") ?? ""
         if (!auth.startsWith("Bearer ") || !oauthLive.includes(auth.slice(7))) return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } })
+        return try await mcpServer(req)
+      },
+    },
+    // the MCP server behind a token exchange: it accepts only the tokens the e2e's token endpoint issues (exch-...)
+    "/mcp-exchange": {
+      POST: async (req) => {
+        const auth = req.headers.get("authorization") ?? ""
+        if (!auth.startsWith("Bearer exch-")) return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } })
         return try await mcpServer(req)
       },
     },

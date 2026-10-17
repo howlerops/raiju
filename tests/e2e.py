@@ -510,7 +510,7 @@ def start_idp():
             form = urllib.parse.parse_qs(self.rfile.read(int(self.headers["content-length"])).decode())
             state["verifier"] = form.get("code_verifier", [""])[0]
             now = int(time.time())
-            self.send(json.dumps({"token_type": "Bearer", "access_token": "at", "id_token": sign({"iss": iss, "aud": "raiju", "sub": "alice", "email": "alice@example.com", "iat": now, "exp": now + 300, "nonce": state["nonce"], "groups": ["staff", "raiju-editors"]})}))
+            self.send(json.dumps({"token_type": "Bearer", "access_token": "at", "id_token": sign({**{"iss": iss, "aud": "raiju", "sub": "alice", "email": "alice@example.com", "iat": now, "exp": now + 300, "nonce": state["nonce"], "groups": ["staff", "raiju-editors"]}, **state.get("claims", {})})}))
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 18096), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, state
@@ -2465,7 +2465,7 @@ def l97c_e2e(env):
         s, _, b = api("GET", "/api/logs?limit=5000")
         check("a limit above 1000 is refused", s == 400, (s, b[:200]))
         s, _, b = api("GET", "/api/logs?agent_names=bot")
-        check("a filter this gateway does not record is refused, not ignored", s == 400 and "agent_names" in b, (s, b[:200]))
+        check("agent_names is accepted: a name with no calls selects no requests", s == 200 and json.loads(b)["pagination"]["total_count"] == 0, (s, b[:200]))
         s, _, b = api("GET", "/api/logs/stats?user_ids=user-ada")
         # every chat so far went through the key, whose user is user-ada: the three before the mappings
         check("the stats of the filtered logs, in Bifrost's shape", s == 200 and json.loads(b).get("total_requests") == 3, (s, b[:200]))
@@ -3490,7 +3490,7 @@ def l97l_e2e(env):
         s, _, b = api("GET", "/api/logs?min_complexity_score=100000&session_id=sess-l97l")
         check("a complexity score bound no request reaches selects nothing", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
         s, _, b = api("GET", "/api/logs?agent_names=bot")
-        check("agent names are still refused: this gateway has no registered agents", s == 400 and "agent_names" in b, (s, b[:200]))
+        check("agent names select by the agents' calls: none of this gateway's agents has any", s == 200 and json.loads(b)["pagination"]["total_count"] == 0, (s, b[:200]))
         # a tool-calling answer: its names are recorded whether or not content is logged
         tc1 = l97l_chat("l97t-tools please", {"x-bf-session-id": "sess-l97t"})
         tc2 = l97l_chat("l97t-tools please", {"x-bf-session-id": "sess-l97t", "x-bf-cache-key": "k-l97t"})
@@ -3716,6 +3716,491 @@ def l115_e2e(env):
         gw_off.terminate()
 
 
+GW_SSO = "http://127.0.0.1:18180"  # SCIM 2.0 and OIDC sign-in on one gateway, against the mock IdP
+
+def l120_config(cfg_path: str) -> dict:
+    """The L120 gateway: SCIM on, SSO through the mock IdP, the admin token for the management API, and inference open."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "enforce_scim_auth": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "scim_config": {"enabled": True, "provider": "generic", "config": {"provisioningToken": "env.E2E_SCIM_TOKEN"}},
+        "governance": {"auth_config": {"token": "admin-secret"}},
+        "oidc": {"enabled": True, "issuer": "http://127.0.0.1:18096", "client_id": "raiju", "redirect_uri": GW_SSO + "/api/oidc/callback", "role_claim": "groups", "role_map": {"raiju-editors": "editor"}},
+    }
+
+def sso_sign_in(idp_state: dict) -> tuple:
+    """A browser's SSO sign-in against GW_SSO through the mock IdP: (callback status, callback page)."""
+    import http.client, re as _re
+    conn = http.client.HTTPConnection("127.0.0.1", 18180, timeout=10)
+    conn.request("GET", "/api/oidc/login"); r = conn.getresponse(); r.read()
+    loc = r.getheader("location") or ""
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+    idp_state["nonce"] = q.get("nonce", [""])[0]
+    s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], base=GW_SSO, auth=False)
+    return s, page
+
+def l120_e2e(env, idp_state):
+    """A SCIM-deactivated user is refused at OIDC sign-in and its open session stops at the next request; reactivated, it signs
+    in again; a user governance does not list signs in as before; enforce_scim_auth does not turn inference auth on."""
+    import re as _re
+    cfg_path = os.path.join(BUILD, "e2e.l120.json")
+    json.dump(l120_config(cfg_path), open(cfg_path, "w"))
+    genv = {**env, "E2E_SCIM_TOKEN": SCIM_TOKEN}
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18180", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=genv, stderr=open(os.path.join(BUILD, "e2e.l120.log"), "w"))
+    auth = {"authorization": "Bearer " + SCIM_TOKEN}
+    user_schema = ["urn:ietf:params:scim:schemas:core:2.0:User"]
+    patch_schema = ["urn:ietf:params:scim:api:messages:2.0:PatchOp"]
+    try:
+        wait(GW_SSO + "/health")
+        s, h, b = call("POST", "/scim/v2/Users", {"schemas": user_schema, "userName": "alice@example.com", "active": True, "roles": [{"value": "editor"}]}, headers=auth, base=GW_SSO, auth=False)
+        check("l120: SCIM provisions alice", s == 201, (s, b[:200]))
+        s, page = sso_sign_in(idp_state)
+        m = _re.search(r'"(sk-sess-[0-9a-f]+)"', page)
+        tok = m.group(1) if m else "none"
+        check("l120: a provisioned user signs in through OIDC", s == 200 and m is not None, (s, page[:200]))
+        S = {"authorization": "Bearer " + tok}
+        s, _, b = call("GET", "/api/config", headers=S, base=GW_SSO, auth=False)
+        check("l120: the SSO session reads the config", s == 200, (s, b[:200]))
+        s, _, b = call("GET", "/api/session/is-auth-enabled", headers=S, base=GW_SSO, auth=False)
+        check("l120: the SSO session is a valid token while the user is enabled", '"has_valid_token":true' in b, b[:300])
+        s, _, b = call("PATCH", "/scim/v2/Users/alice@example.com", {"schemas": patch_schema, "Operations": [{"op": "replace", "value": {"active": False}}]}, headers=auth, base=GW_SSO, auth=False)
+        check("l120: SCIM deactivates alice", s == 200 and '"active":false' in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/config", headers=S, base=GW_SSO, auth=False)
+        check("l120: alice's open session stops at its next request", s == 401, (s, b[:200]))
+        s, _, b = call("GET", "/api/session/is-auth-enabled", headers=S, base=GW_SSO, auth=False)
+        check("l120: a deactivated user's session is not a valid token", '"has_valid_token":false' in b, b[:300])
+        s, page = sso_sign_in(idp_state)
+        check("l120: a deactivated user is refused at OIDC sign-in, with no session", s == 403 and "is disabled" in page and "sk-sess-" not in page, (s, page[:200]))
+        s, _, b = call("PATCH", "/scim/v2/Users/alice@example.com", {"schemas": patch_schema, "Operations": [{"op": "replace", "value": {"active": True}}]}, headers=auth, base=GW_SSO, auth=False)
+        check("l120: SCIM reactivates alice", s == 200 and '"active":true' in b, (s, b[:200]))
+        s, page = sso_sign_in(idp_state)
+        check("l120: a reactivated user signs in again", s == 200 and "sk-sess-" in page, (s, page[:200]))
+        idp_state["claims"] = {"sub": "dana", "email": "dana@example.com"}
+        try:
+            s, page = sso_sign_in(idp_state)
+        finally:
+            idp_state["claims"] = {}
+        check("l120: a user governance does not list signs in as before", s == 200 and "sk-sess-" in page, (s, page[:200]))
+        s, _, b = call("GET", "/api/session/is-auth-enabled", base=GW_SSO, auth=False)
+        check("l120: enforce_scim_auth in the file does not turn inference auth on", '"inference_auth_enforced":false' in b, b[:300])
+    finally:
+        gw.terminate()
+        gw.wait()
+
+GW_L116 = "http://127.0.0.1:18106"  # the A2A agents: registrations, the gateway's card and JSON-RPC route, grants, budgets and logs; its own config file
+
+def l116_config():
+    """The L116 gateway's config: an agent declared in config (its card is fetched by refresh), virtual keys with and
+    without its grant, and one key under a request limit. The gateway's public URL is set, with a trailing slash."""
+    import hashlib
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True, "a2a_external_client_url": "https://gw.example.test/"},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l116-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l116", "value": "sk-l116", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l116".encode()).hexdigest()}],
+            "rate_limits": [{"id": "l116-rl", "request_max_limit": 2, "request_reset_duration": "1h"}],
+            "virtual_keys": [{"id": "vk-l116-a", "value": "sk-bf-l116-a"}, {"id": "vk-l116-b", "value": "sk-bf-l116-b"}, {"id": "vk-l116-rl", "value": "sk-bf-l116-rl", "rate_limit_id": "l116-rl"}],
+        },
+        "agents": [{"name": "echo", "agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json", "allow_private_network": True, "virtual_key_ids": ["vk-l116-a", "vk-l116-rl"], "runtime_auth": {"type": "headers", "headers": {"Authorization": "env.E2E_L116_AGENT"}}}],
+    }
+
+def l116_e2e(env):
+    """A2A agents: a declared agent's card is fetched and rewritten for the gateway; the API registers, shows (secrets
+    masked), inspects, refreshes, disables and deletes agents; JSON-RPC methods reach the agent with its runtime
+    header and without the caller's key, the grant and the key limits are enforced, SSE passes through, every call is
+    logged under the agent's name, and agent_names selects the LLM requests of the agent's conversations."""
+    cfg_path = os.path.join(BUILD, "e2e.l116.json")
+    json.dump(l116_config(), open(cfg_path, "w"))
+    # a gateway loads today's log file at start: each run starts from an empty one
+    import shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l116-logs"), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18106", "-host", "127.0.0.1", "-config", cfg_path], env={**env, "E2E_L116_AGENT": "Bearer agent-token-l116"}, stderr=open(os.path.join(BUILD, "e2e.l116.log"), "w"))
+    ADM = {"authorization": "Bearer sk-admin-l116"}
+    A = {"authorization": "Bearer sk-bf-l116-a"}
+    B = {"authorization": "Bearer sk-bf-l116-b"}
+    RL = {"authorization": "Bearer sk-bf-l116-rl"}
+    def api(method, path, body=None, headers=None):
+        return call(method, path, body, {**ADM, **(headers or {})}, base=GW_L116, auth=False)
+    def gwc(method, path, body=None, headers=None):
+        return call(method, path, body, headers, base=GW_L116, auth=False)
+    def rpc(method, params, key=A):
+        return gwc("POST", "/agents/a2a/echo/json-rpc", {"jsonrpc": "2.0", "id": "1", "method": method, "params": params}, key)
+    def message(text, ctx="l116-ctx"):
+        return {"message": {"messageId": "m-" + text, "role": "user", "contextId": ctx, "parts": [{"kind": "text", "text": text}]}}
+    def upstream():
+        return [x for x in seen() if x["path"] == "/a2a/agent/json-rpc"]
+    def chat(session, text, key=A):
+        return gwc("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": text}]}, {**key, "x-bf-session-id": session})
+    try:
+        wait(GW_L116 + "/health")
+        s, _, b = api("GET", "/api/agents/echo")
+        echo = json.loads(b) if s == 200 else {}
+        check("a declared agent is listed with its gateway endpoints and no card until it is fetched", s == 200 and echo.get("card") is None and echo["gateway"]["json_rpc_url"] == "https://gw.example.test/agents/a2a/echo/json-rpc", (s, b[:300]))
+        check("a declared agent's runtime header shows its env reference", echo.get("runtime_auth", {}).get("headers", {}).get("Authorization") == "env.E2E_L116_AGENT", b[:300])
+        s, _, b = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, A)
+        check("the gateway card is unavailable until the card is fetched", s == 503, (s, b[:200]))
+        s, _, b = api("POST", "/api/agents/echo/refresh-card")
+        check("refresh-card fetches the card and caches it", s == 200 and json.loads(b)["card"]["name"] == "echo-agent" and json.loads(b)["card_fetched_at"] is not None, (s, b[:200]))
+        s, _, b = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, A)
+        card = json.loads(b) if s == 200 else {}
+        check("the gateway card names the gateway's JSON-RPC route, with the public URL's trailing slash dropped", s == 200 and card.get("url") == "https://gw.example.test/agents/a2a/echo/json-rpc" and card.get("name") == "echo-agent", (s, b[:300]))
+        s, _, _ = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, None)
+        check("a gateway call without a virtual key is refused when enforcement is on", s == 401, s)
+        s, _, _ = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, B)
+        check("a virtual key without the agent's grant is refused", s == 403, s)
+        s, _, b = api("POST", "/api/agents", {"name": "Bad_Name", "agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json", "allow_private_network": True})
+        check("an agent name that is not a slug is refused", s == 400, (s, b[:200]))
+        s, _, b = api("POST", "/api/agents", {"name": "api-echo", "agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json"})
+        check("a private card address is refused without allow_private_network", s == 400 and "private" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/agents", {"name": "api-echo", "agent_card_url": "http://127.0.0.1:1/card", "allow_private_network": True})
+        check("a card that cannot be fetched is refused", s == 400 and "could not be fetched" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/agents", {"name": "api-echo", "agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json", "allow_private_network": True, "discovery_auth": {"type": "headers", "headers": {"X-Card-Key": "card-secret-l116"}}})
+        made = json.loads(b) if s == 201 else {}
+        check("the API registers an agent: the card is fetched, and its secret header is masked on read", s == 201 and made.get("card", {}).get("name") == "echo-agent" and made.get("discovery_auth", {}).get("headers", {}).get("X-Card-Key") == "********" and "card-secret-l116" not in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/agents", {"name": "api-echo", "agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json", "allow_private_network": True})
+        check("an agent name already registered is refused", s == 409, (s, b[:200]))
+        s, _, b = api("POST", "/api/agents/inspect", {"agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json", "allow_private_network": True})
+        check("inspect answers the card without registering anything", s == 200 and json.loads(b)["card"]["name"] == "echo-agent", (s, b[:200]))
+        s, _, b = api("GET", "/api/agents")
+        names = [x["name"] for x in json.loads(b)["agents"]] if s == 200 else []
+        check("the agents list holds both registrations", sorted(names) == ["api-echo", "echo"], (s, names))
+        before = len(upstream())
+        s, _, b = rpc("message/send", message("hi-l116"))
+        out = json.loads(b) if s == 200 else {}
+        task_id = out.get("result", {}).get("id", "")
+        check("message/send reaches the agent and answers its task, with the context kept", s == 200 and out.get("result", {}).get("contextId") == "l116-ctx" and "echo: hi-l116" in b, (s, b[:300]))
+        sent = upstream()[before:]
+        check("the agent gets the runtime header and not the caller's virtual key", len(sent) == 1 and sent[0]["auth"] == "Bearer agent-token-l116" and "sk-bf-l116-a" not in json.dumps(sent), sent[:1])
+        before = len(upstream())
+        s, _, b = rpc("message/send", message("nope-l116"), B)
+        check("a key without the grant does not reach the agent", s == 403 and len(upstream()) == before, (s, b[:200]))
+        s, h, b = rpc("message/stream", message("stream-l116"))
+        ctype = h.get("Content-Type") or h.get("content-type") or ""
+        check("message/stream passes the agent's SSE on", s == 200 and "text/event-stream" in ctype and "working" in b and "streamed" in b, (s, b[:300]))
+        s, _, b = rpc("tasks/get", {"id": task_id})
+        check("tasks/get reads the task from the agent", s == 200 and json.loads(b)["result"]["status"]["state"] == "completed", (s, b[:200]))
+        s, _, b = rpc("tasks/cancel", {"id": task_id})
+        s2, _, b2 = rpc("tasks/get", {"id": task_id})
+        check("tasks/cancel cancels it and the next read shows it canceled", s == 200 and json.loads(b)["result"]["status"]["state"] == "canceled" and json.loads(b2)["result"]["status"]["state"] == "canceled", (s, b[:200], b2[:200]))
+        s, _, b = rpc("message/nope", {})
+        check("an A2A method the gateway does not proxy is a JSON-RPC method-not-found error", s == 200 and json.loads(b)["error"]["code"] == -32601, (s, b[:200]))
+        s, _, b = rpc("message/send", message("fail"))
+        check("an agent's JSON-RPC error comes back as it is", s == 200 and json.loads(b)["error"]["message"] == "agent failed on request", (s, b[:200]))
+        s, _, _ = gwc("POST", "/agents/a2a/echo/json-rpc", {"jsonrpc": "2.0", "id": "1", "method": "message/send"}, None)
+        check("a JSON-RPC call without a virtual key is refused", s == 401, s)
+        s1, _, _ = rpc("message/send", message("rl-1"), RL)
+        s2, _, _ = rpc("message/send", message("rl-2"), RL)
+        s3, _, b3 = rpc("message/send", message("rl-3"), RL)
+        check("the key's request limit answers 429 once it is used up", s1 == 200 and s2 == 200 and s3 == 429, (s1, s2, s3, b3[:200]))
+        s, _, _ = api("PUT", "/api/agents/api-echo", {"agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json", "allow_private_network": True, "enabled": False})
+        s2, _, _ = gwc("GET", "/agents/a2a/api-echo/.well-known/agent-card.json", None, A)
+        check("a disabled agent is not served", s == 200 and s2 == 404, (s, s2))
+        s, _, _ = api("DELETE", "/api/agents/api-echo")
+        s2, _, _ = api("GET", "/api/agents/api-echo")
+        check("a deleted agent is gone", s == 200 and s2 == 404, (s, s2))
+        s, _, b = api("GET", "/api/agents/history")
+        hist = json.loads(b) if s == 200 else {}
+        check("every call that reached the agent is in the agent history, under its name", s == 200 and hist.get("total", 0) >= 5 and all(x["agent_name"] == "echo" for x in hist.get("history", [])), (s, b[:200]))
+        s, _, b = api("GET", "/api/agents/history?agent_names=nosuch")
+        check("the agent history filters by agent name", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = chat("l116-ctx", "chat-in-agent-session")
+        s2, _, _ = chat("l116-other", "chat-elsewhere")
+        check("LLM requests in the agent's sessions are sent", s == 200 and s2 == 200, (s, s2))
+        s, _, b = api("GET", "/api/logs?agent_names=echo&limit=100")
+        rows = json.loads(b).get("logs", []) if s == 200 else []
+        sessions = sorted({x.get("session_id", "") for x in rows})
+        check("agent_names selects the requests of the agent's conversations, and is no longer refused", s == 200 and "l116-ctx" in sessions and "l116-other" not in sessions, (s, sessions, b[:200]))
+        s, _, b = api("GET", "/api/logs?agent_names=nosuch&limit=100")
+        check("an agent name with no calls selects no requests", s == 200 and json.loads(b).get("logs", []) == [], (s, b[:200]))
+    finally:
+        gw.terminate()
+L117 = "http://127.0.0.1:18175"  # MCP code mode: server stubs, the meta-tools, governance and logs on the nested calls
+L117B = "http://127.0.0.1:18176"  # MCP code mode at tool level, with the limits from mcp.tool_manager_config
+
+def l117_config(tag: str, mcp_extra: dict, keys: list) -> dict:
+    """A gateway with the mock's weather server as a code mode client. Its own gateway, started and stopped by l117_e2e."""
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l117-logs-" + tag)},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-l117", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"tool_sync_interval": "1h", "client_configs": [{"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp", "is_code_mode_client": True}], **mcp_extra},
+        "governance": {"virtual_keys": keys},
+    }
+
+def l117_tool(name: str, args: dict) -> dict:
+    """A tool call in the chat shape, as /v1/mcp/tool/execute takes it."""
+    return {"type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+
+def l117_run(base: str, name: str, args: dict, headers=None) -> str:
+    """Runs one meta-tool through /v1/mcp/tool/execute and answers its text."""
+    _, _, b = call("POST", "/v1/mcp/tool/execute", l117_tool(name, args), headers, base=base, auth=False)
+    return json.loads(b).get("content", "")
+
+def l117_e2e(env):
+    """MCP code mode: the four meta-tools replace the code mode client's tools in chat requests; the stubs and docs
+    answer discovery; executeToolCode runs a program whose tool calls go through the key's gates and the MCP log;
+    a key that may not run the tool is refused inside the program; the limits and binding level come from
+    mcp.tool_manager_config. Their own gateways."""
+    import shutil
+    keys_a = [
+        {"id": "vk-code", "value": "sk-bf-l117", "mcp_configs": [{"mcp_client_name": "weather", "tools_to_execute": ["*"]}]},
+        {"id": "vk-deny", "value": "sk-bf-l117d", "mcp_configs": [{"mcp_client_name": "weather", "tools_to_execute": ["other"]}]},
+    ]
+    cfg_a = os.path.join(BUILD, "e2e.l117.a.json")
+    cfg_b = os.path.join(BUILD, "e2e.l117.b.json")
+    json.dump(l117_config("a", {}, keys_a), open(cfg_a, "w"))
+    json.dump(l117_config("b", {"tool_manager_config": {"code_mode_binding_level": "tool", "code_mode_limits": {"max_steps": 50}}}, [{"id": "vk-b", "value": "sk-bf-l117b"}]), open(cfg_b, "w"))
+    for d in ("e2e-l117-logs-a", "e2e-l117-logs-b"):
+        shutil.rmtree(os.path.join(BUILD, d), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18175", "-host", "127.0.0.1", "-config", cfg_a], env=env, stderr=open(os.path.join(BUILD, "e2e.l117.a.log"), "w"))
+    gw_b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18176", "-host", "127.0.0.1", "-config", cfg_b], env=env, stderr=open(os.path.join(BUILD, "e2e.l117.b.log"), "w"))
+    try:
+        wait(L117)
+        wait(L117B)
+        # the weather client connects in the background: wait until its stub is listed
+        ready = ""
+        for _ in range(120):
+            ready = l117_run(L117, "listToolFiles", {})
+            if "weather.pyi" in ready:
+                break
+            time.sleep(0.25)
+        check("code mode: listToolFiles names the server stub file", "servers/\n  weather.pyi" in ready, ready)
+        stub = l117_run(L117, "readToolFile", {"fileName": "servers/weather.pyi"})
+        check("code mode: readToolFile gives the Python signature of the tool", "def get_weather(city: str) -> dict:" in stub, stub)
+        docs = l117_run(L117, "getToolDocs", {"server": "weather", "tool": "get_weather"})
+        check("code mode: getToolDocs documents the arguments", "city (str, required): " in docs, docs)
+        missing = l117_run(L117, "readToolFile", {"fileName": "servers/nope.pyi"})
+        check("code mode: an unknown stub file is an error answer", missing.startswith("Error: file not found"), missing)
+
+        run = l117_run(L117, "executeToolCode", {"code": 'result = weather.get_weather(city = "Oslo")'})
+        check("code mode: a program returns the value of its tool call", 'Return value: "Sunny in Oslo"' in run and "Execution completed successfully." in run, run)
+        loop = l117_run(L117, "executeToolCode", {"code": 'for c in ["Oslo", "Bergen"]:\n    print(weather.get_weather(city = c))\nresult = 2'})
+        check("code mode: print output and a loop over tool calls", "Print output:\nSunny in Oslo\nSunny in Oslo\n\nExecution completed successfully.\nReturn value: 2" in loop, loop)
+        bad = l117_run(L117, "executeToolCode", {"code": "result = (1 +"})
+        check("code mode: a syntax error is reported, not raised", bad.startswith("Error: Execution syntax error:"), bad)
+        denied = l117_run(L117, "executeToolCode", {"code": 'result = weather.get_weather(city = "Oslo")'}, {"authorization": "Bearer sk-bf-l117d"})
+        check("code mode: a key without the tool's grant does not see its server in a program", "Error: Execution runtime error:" in denied and "name 'weather' is not defined" in denied, denied)
+        denied_list = l117_run(L117, "listToolFiles", {}, {"authorization": "Bearer sk-bf-l117d"})
+        check("code mode: discovery hides the server from a key without the grant", "weather" not in denied_list, denied_list)
+
+        # the chat request carries the four meta-tools instead of the code mode client's tool
+        status, _, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "weather in Oslo?"}]}, {"authorization": "Bearer sk-bf-l117"}, base=L117, auth=False)
+        upstream = [x for x in seen() if x["path"] == "/v1/chat/completions" and "executeToolCode" in x["body"]]
+        check("code mode: chat requests offer the four meta-tools", status == 200 and len(upstream) > 0 and all(n in upstream[-1]["body"] for n in ["listToolFiles", "readToolFile", "getToolDocs", "executeToolCode"]), str(status))
+        check("code mode: the code mode client's tool is not offered one by one", len(upstream) > 0 and '"name":"weather-get_weather"' not in upstream[-1]["body"], upstream[-1]["body"][:300] if upstream else "")
+
+        logs = call("GET", "/api/mcp-logs", base=L117, auth=False)[2]
+        check("code mode: the nested tool calls are in the MCP log", "get_weather" in logs, logs[:300])
+
+        tool_stub = l117_run(L117B, "listToolFiles", {})
+        for _ in range(120):
+            if "get_weather.pyi" in tool_stub:
+                break
+            time.sleep(0.25)
+            tool_stub = l117_run(L117B, "listToolFiles", {})
+        check("code mode: tool-level binding lists one stub per tool", "servers/\n  weather/\n    get_weather.pyi" in tool_stub, tool_stub)
+        limited = l117_run(L117B, "executeToolCode", {"code": "i = 0\nfor x in range(100):\n    i += 1\nresult = i"})
+        check("code mode: mcp.tool_manager_config limits apply (max_steps)", "step limit exceeded (max_steps 50)" in limited, limited)
+    finally:
+        gw.terminate()
+        gw_b.terminate()
+
+def l112b_e2e(env):
+    """Management API keys (Bifrost's /api/api-keys): the value shown once, a key's permissions alone (never its
+    creator's role), the ceiling on what a caller grants, expiry, last use, paging, deletion, and a restart that
+    keeps the keys (the config holds a hash of each value, never the value). Its own gateway (18145)."""
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    base = "http://127.0.0.1:18145"
+    cfg_path = os.path.join(BUILD, "e2e.l112b.json")
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l112b", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l112b-root")},
+                      {"name": "ann", "role": "editor", "token_sha256": tok("sk-admin-l112b-ann")},
+                      {"name": "kim", "role": "keeper", "token_sha256": tok("sk-admin-l112b-kim")}],
+            "roles": [{"name": "keeper", "permissions": [
+                {"resource": "APIKeys", "operation": "View"}, {"resource": "APIKeys", "operation": "Create"},
+                {"resource": "APIKeys", "operation": "Update"}, {"resource": "APIKeys", "operation": "Delete"},
+                {"resource": "ModelProvider", "operation": "View"}]}],
+        },
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    def start():
+        return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18145", "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.l112b.log"), "a"))
+    procs = [start()]
+    root = {"authorization": "Bearer sk-admin-l112b-root"}
+    ann = {"authorization": "Bearer sk-admin-l112b-ann"}
+    kim = {"authorization": "Bearer sk-admin-l112b-kim"}
+    def req(method, p, body=None, who=None):
+        return call(method, p, body, who or {}, base=base, auth=False)
+    try:
+        wait(base + "/health")
+        s, _, b = req("GET", "/api/api-keys")
+        check("the API keys route needs a sign-in", s == 401, (s, b[:200]))
+        s, _, b = req("GET", "/api/governance/rbac/permissions", None, root)
+        perms = json.loads(b)["permissions"]
+        def pid(res, op):
+            for x in perms:
+                if x["resource"] == res and x["operation"] == op:
+                    return x["id"]
+            return -1
+        check("the permission catalogue lists the APIKeys resource", pid("APIKeys", "View") > 0 and pid("APIKeys", "Delete") > 0, b[:200])
+
+        s, _, b = req("POST", "/api/api-keys", {"name": "reader", "scopes": [pid("ModelProvider", "View")], "description": "logs only"}, root)
+        made = json.loads(b) if s == 200 else {}
+        value = made.get("key", "")
+        check("creating a key returns its value once, with a prefix", s == 200 and value.startswith("bfst-") and made.get("api_key", {}).get("key_prefix") == value[:13] + "...", (s, b[:300]))
+        s, _, b = req("POST", "/api/api-keys", {"name": "reader"}, root)
+        check("a key name is unique", s == 409, (s, b[:200]))
+        s, _, b = req("GET", "/api/api-keys", None, root)
+        listed = json.loads(b)
+        check("the list shows the key without its value", s == 200 and listed["total_count"] == 1 and value not in b and listed["api_keys"][0]["scopes"] == [pid("ModelProvider", "View")], (s, b[:300]))
+        check("a key not used yet has no last use", listed["api_keys"][0]["last_used_at"] is None, b[:300])
+
+        key = {"authorization": "Bearer " + value}
+        s, _, b = req("GET", "/api/providers", None, key)
+        check("a key reaches what its permissions cover", s == 200, (s, b[:200]))
+        s, _, b = req("GET", "/api/api-keys", None, key)
+        check("a key without APIKeys:View cannot list keys", s == 403, (s, b[:200]))
+        s, _, b = req("POST", "/api/providers", {"name": "x"}, key)
+        check("a key does not inherit the creator's role", s == 403, (s, b[:200]))
+        s, _, b = req("GET", "/api/api-keys", None, root)
+        check("the last use is recorded", json.loads(b)["api_keys"][0]["last_used_at"] is not None, b[:300])
+
+        s, _, b = req("POST", "/api/api-keys", {"name": "kim-ok", "scopes": [pid("ModelProvider", "View")]}, kim)
+        kim_value = json.loads(b).get("key", "") if s == 200 else ""
+        check("a custom role grants a permission it holds", s == 200 and kim_value.startswith("bfst-"), (s, b[:200]))
+        s, _, b = req("POST", "/api/api-keys", {"name": "kim-bad", "scopes": [pid("ModelProvider", "Create")]}, kim)
+        check("a caller cannot grant a permission it does not hold", s == 403 and "ModelProvider:Create" in b, (s, b[:200]))
+        s, _, b = req("GET", "/api/api-keys", None, ann)
+        check("an editor has no key management", s == 403, (s, b[:200]))
+
+        s, _, b = req("POST", "/api/api-keys", {"name": "stale", "scopes": [pid("ModelProvider", "View")], "expires_at": "2001-01-01T00:00:00Z"}, root)
+        stale = json.loads(b).get("key", "") if s == 200 else ""
+        s2, _, b2 = req("GET", "/api/providers", None, {"authorization": "Bearer " + stale})
+        check("an expired key is refused", s == 200 and s2 == 401, (s2, b2[:200]))
+
+        s, _, b = req("GET", "/api/api-keys", None, root)
+        kid = [k["id"] for k in json.loads(b)["api_keys"] if k["name"] == "reader"][0]
+        s, _, b = req("PUT", "/api/api-keys/%d" % kid, {"name": "reader-2", "scopes": [pid("ModelProvider", "View"), pid("MCPGateway", "View")]}, root)
+        check("update renames and replaces the permissions", s == 200 and json.loads(b)["api_key"]["name"] == "reader-2" and len(json.loads(b)["api_key"]["scopes"]) == 2, (s, b[:300]))
+        s, _, b = req("PUT", "/api/api-keys/%d" % kid, {"scopes": [pid("VirtualKeys", "View")]}, kim)
+        check("an update cannot grant a permission the caller does not hold", s == 403, (s, b[:200]))
+        s, _, b = req("GET", "/api/providers", None, key)
+        check("the value keeps working after an update", s == 200, (s, b[:200]))
+
+        s, _, b = req("GET", "/api/api-keys?limit=1&offset=0", None, root)
+        pg = json.loads(b)
+        check("paging counts every match", s == 200 and pg["count"] == 1 and pg["total_count"] == 3 and pg["limit"] == 1, (s, b[:300]))
+        s, _, b = req("GET", "/api/api-keys?search=STALE", None, root)
+        check("search matches names without case", s == 200 and json.loads(b)["total_count"] == 1, (s, b[:200]))
+
+        s, _, b = req("DELETE", "/api/api-keys/%d" % kid, None, root)
+        s2, _, _ = req("GET", "/api/providers", None, key)
+        check("a deleted key stops authenticating at once", s == 200 and s2 == 401, (s, s2))
+        s, _, b = req("GET", "/api/api-keys/%d" % kid, None, root)
+        check("a deleted key is gone", s == 404, (s, b[:200]))
+        s, _, b = req("GET", "/api/api-keys/abc", None, root)
+        check("a malformed key id is refused", s == 400, (s, b[:200]))
+
+        saved = open(cfg_path).read()
+        check("the config keeps a hash of each key and never a value", "key_sha256" in saved and kim_value not in saved and stale not in saved and value not in saved, saved[-400:])
+
+        procs[0].terminate()
+        procs[0].wait()
+        procs[0] = start()
+        wait(base + "/health")
+        s, _, b = req("GET", "/api/providers", None, {"authorization": "Bearer " + kim_value})
+        check("a key survives a restart", s == 200, (s, b[:200]))
+        s, _, b = req("GET", "/api/api-keys", None, root)
+        check("the key list survives a restart", s == 200 and json.loads(b)["total_count"] == 2, (s, b[:300]))
+    finally:
+        for p in procs:
+            p.terminate()
+            p.wait()
+
+def l112b_exchange_e2e(env):
+    """MCP token exchange (RFC 8693, auth_type token_exchange): the client's configuration and its redacted view, the
+    verify-exchange route (the identity provider's token is exchanged at the token endpoint, the MCP server is dialed
+    with the result, and the subject token is never saved), and the identity provider's refusals. The token endpoint
+    is a stub on 18145 (served here, so the port is free once the API key check has finished); the gateway is 18129."""
+    import urllib.parse
+    sts_seen = []
+    issued = [0]
+    def sts(method, path, headers, body):
+        if path != "/token":
+            return 404, "{}", "application/json"
+        form = urllib.parse.parse_qs(body)
+        sts_seen.append(body)
+        def one(k):
+            return (form.get(k) or [""])[0]
+        if one("grant_type") != "urn:ietf:params:oauth:grant-type:token-exchange" or one("subject_token_type") != "urn:ietf:params:oauth:token-type:access_token":
+            return 400, json.dumps({"error": "unsupported_grant_type"}), "application/json"
+        if one("client_id") != "exch-client" or one("client_secret") != "exch-secret" or one("audience") != "api://jira":
+            return 401, json.dumps({"error": "invalid_client", "error_description": "client authentication failed"}), "application/json"
+        subject = one("subject_token")
+        if subject == "idp-expired":
+            return 400, json.dumps({"error": "invalid_grant", "error_description": "subject token expired"}), "application/json"
+        if not subject.startswith("idp-"):
+            return 400, json.dumps({"error": "invalid_grant", "error_description": "subject token not recognised"}), "application/json"
+        issued[0] += 1
+        return 200, json.dumps({"access_token": "exch-%d" % issued[0], "token_type": "Bearer", "expires_in": 3600}), "application/json"
+    stub = serve(18145, sts)
+    cfg_path = os.path.join(BUILD, "e2e.l112b-te.json")
+    cfg = {
+        "client": {"enable_logging": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l112b-te", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"oauth_private_allowlist": ["127.0.0.1"]},
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    base = "http://127.0.0.1:18129"
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18129", "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.l112b-te.log"), "w"))
+    def req(method, p, body=None):
+        return call(method, p, body, {}, base=base, auth=False)
+    try:
+        wait(base + "/health")
+        exch = {"audience": "api://jira", "client_id": "exch-client", "client_secret": "exch-secret", "scopes": ["read"], "authorization_server_url": "http://127.0.0.1:18145/token"}
+        s, _, b = req("POST", "/api/mcp/client", {"name": "jira", "connection_type": "http", "connection_string": MOCK + "/mcp-exchange", "auth_type": "token_exchange", "token_exchange": exch})
+        check("a token_exchange client is created with its block", s in (200, 201), (s, b[:300]))
+        s, _, b = req("GET", "/api/mcp/clients")
+        check("the client view masks the exchange client secret", s == 200 and "exch-secret" not in b and '"token_exchange"' in b and "api://jira" in b, (s, b[:400]))
+        s, _, b = req("POST", "/api/mcp/client", {"name": "jira2", "connection_type": "http", "connection_string": MOCK + "/mcp-exchange", "auth_type": "token_exchange", "token_exchange": {"client_id": "x"}})
+        check("a token_exchange client needs an audience", s == 400 and "audience" in b, (s, b[:200]))
+        s, _, b = req("POST", "/api/mcp/client", {"name": "jira3", "connection_type": "http", "connection_string": MOCK + "/mcp-exchange", "auth_type": "token_exchange", "token_exchange": {"audience": "api://jira"}})
+        check("a token_exchange client needs a client_id unless it uses the login application's", s == 400 and "client_id" in b, (s, b[:200]))
+        s, _, b = req("POST", "/api/mcp/client", {"name": "plain", "connection_type": "http", "connection_string": MOCK + "/mcp", "auth_type": "none"})
+        check("a plain client is created for the refusal check", s in (200, 201), (s, b[:200]))
+
+        s, _, b = req("POST", "/api/mcp/client/jira/verify-exchange", {})
+        check("verify-exchange needs the identity provider's token", s == 400 and "subject_token" in b, (s, b[:200]))
+        s, _, b = req("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-alice"})
+        check("verify-exchange exchanges the token and dials the server with the result", s == 200 and json.loads(b)["tools_count"] >= 1, (s, b[:300]))
+        check("the exchange asked for the audience, the scope and the client's credentials", any("audience=api%3A%2F%2Fjira" in x and "scope=read" in x and "client_id=exch-client" in x and "subject_token=idp-alice" in x for x in sts_seen), sts_seen[-1:])
+        s, _, b = req("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-expired"})
+        check("the identity provider's refusal is the answer", s == 422 and "subject token expired" in b, (s, b[:300]))
+        s, _, b = req("POST", "/api/mcp/client/plain/verify-exchange", {})
+        check("verify-exchange is refused for other client types", s == 400 and "token_exchange" in b, (s, b[:200]))
+        s, _, b = req("GET", "/api/mcp/client/jira/verify-exchange")
+        check("verify-exchange takes POST", s == 405, (s, b[:200]))
+        saved = open(cfg_path).read()
+        check("the subject token is not saved", "idp-alice" not in saved and "idp-expired" not in saved, saved[-300:])
+    finally:
+        gw.terminate()
+        gw.wait()
+        stub.shutdown()
+        stub.server_close()
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -3906,6 +4391,99 @@ def mcp_grants_e2e(env):
     finally:
         gb.terminate()
         gb.wait()
+
+GW_UI = "http://127.0.0.1:18107"  # the embedded web UI
+GW_UI_DIR = "http://127.0.0.1:18108"  # the web UI from a directory (RAIJU_UI_DIR)
+
+
+def l113_ui_e2e(env):
+    """Serving the web UI: the embedded build (page revalidated, hashed files immutable, gzip, ETag and 304,
+    no file outside the build) and RAIJU_UI_DIR (files from a directory, revalidated, no escape from it).
+    Their own gateways."""
+    import gzip, http.client, shutil, tempfile
+    cfg_path = os.path.join(BUILD, "e2e.l113ui.json")
+    json.dump({"client": {"enable_logging": False}, "providers": {}}, open(cfg_path, "w"))
+    ui_dir = tempfile.mkdtemp(prefix="raiju-ui-dir-")
+    os.makedirs(os.path.join(ui_dir, "assets"))
+    open(os.path.join(ui_dir, "index.html"), "w").write("<!doctype html><title>dir ui</title><p>dir-ui-marker</p>")
+    open(os.path.join(ui_dir, "assets", "app.js"), "w").write("console.log('dir-ui-asset')")
+    open(os.path.join(ui_dir, "secret.txt"), "w").write("not for the web")
+    served = os.path.join(ui_dir, "served")
+    os.makedirs(os.path.join(served, "assets"))
+    shutil.move(os.path.join(ui_dir, "index.html"), os.path.join(served, "index.html"))
+    shutil.move(os.path.join(ui_dir, "assets", "app.js"), os.path.join(served, "assets", "app.js"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18107", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l113ui.log"), "w"))
+    gw_dir = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18108", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env={**env, "RAIJU_UI_DIR": served}, stderr=open(os.path.join(BUILD, "e2e.l113uidir.log"), "w"))
+
+    def raw_get(port, path, headers=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", path, headers=headers or {})
+        r = c.getresponse()
+        body = r.read()
+        out = (r.status, {k.lower(): v for k, v in r.getheaders()}, body)
+        c.close()
+        return out
+
+    try:
+        wait(GW_UI + "/health")
+        wait(GW_UI_DIR + "/health")
+        s, h, b = raw_get(18107, "/")
+        page = b.decode()
+        check("GET / serves the web UI page", s == 200 and h.get("content-type", "").startswith("text/html") and '<div id="root">' in page, (s, h, page[:200]))
+        check("the page is revalidated on every load", h.get("cache-control") == "no-cache" and h.get("etag", "").startswith('"'), h)
+        check("the page carries a content security policy and no framing", "script-src 'self'" in h.get("content-security-policy", "") and h.get("x-frame-options") == "DENY" and h.get("x-content-type-options") == "nosniff", h)
+        s2, h2, b2 = raw_get(18107, "/", {"If-None-Match": h["etag"]})
+        check("a matching If-None-Match gets 304 and no body", s2 == 304 and b2 == b"" and h2.get("etag") == h["etag"], (s2, h2, b2[:50]))
+        s3, h3, b3 = raw_get(18107, "/", {"If-None-Match": '"stale"'})
+        check("a stale If-None-Match gets the page", s3 == 200 and b3 == b, (s3, len(b3)))
+        s4, _, b4 = raw_get(18107, "/index.html")
+        check("/index.html is the same page", s4 == 200 and b4 == b, s4)
+        i = page.index("/assets/")
+        js = page[i:page.index(".js", i) + 3]
+        s5, h5, b5 = raw_get(18107, js)
+        check("a hashed script is served as JavaScript, cached for good", s5 == 200 and h5.get("content-type", "").startswith("text/javascript") and "immutable" in h5.get("cache-control", "") and "max-age=31536000" in h5.get("cache-control", ""), (s5, h5))
+        s6, h6, b6 = raw_get(18107, js, {"Accept-Encoding": "gzip, deflate, br"})
+        check("gzip is served to clients that accept it", s6 == 200 and h6.get("content-encoding") == "gzip" and h6.get("vary") == "accept-encoding" and len(b6) < len(b5) // 2, (s6, h6, len(b6), len(b5)))
+        check("the gzip body is the same file", gzip.decompress(b6) == b5, len(b6))
+        check("the gzip variant has its own validator", h6.get("etag") != h5.get("etag") and h6.get("etag", "").endswith('-gzip"'), (h5.get("etag"), h6.get("etag")))
+        s7, _, b7 = raw_get(18107, js, {"Accept-Encoding": "gzip", "If-None-Match": h6["etag"]})
+        check("a script revalidates to 304 with its validator", s7 == 304 and b7 == b"", s7)
+        s8, h8, _ = raw_get(18107, js, {"Accept-Encoding": "gzip;q=0"})
+        check("gzip;q=0 gets the plain file", s8 == 200 and "content-encoding" not in h8, h8)
+        css = page[page.index("/assets/", page.index("stylesheet")):] if "stylesheet" in page else ""
+        css = css[:css.index(".css") + 4] if ".css" in css else ""
+        if css:
+            s9, h9, _ = raw_get(18107, css)
+            check("the stylesheet is served as CSS", s9 == 200 and h9.get("content-type", "").startswith("text/css"), (s9, h9))
+        check("an unknown asset is 404", raw_get(18107, "/assets/nope.js")[0] == 404)
+        check("an unknown file at the root is 404", raw_get(18107, "/nope.txt")[0] == 404)
+        for p in ["/assets/../src/main.tov", "/assets/..%2f..%2fsrc/main.tov", "/%2e%2e/src/main.tov", "/assets//index.html", "/assets\\..\\x"]:
+            st, _, body = raw_get(18107, p)
+            check("a path that climbs out of the build is refused: " + p, st in (400, 404) and b"function " not in body, (st, body[:80]))
+        s10, _, b10 = raw_get(18107, "/health")
+        check("the API routes are untouched", s10 == 200 and b'"ok"' in b10, (s10, b10[:80]))
+
+        # RAIJU_UI_DIR
+        s, h, b = raw_get(18108, "/")
+        check("RAIJU_UI_DIR serves the page from the directory", s == 200 and b"dir-ui-marker" in b and h.get("cache-control") == "no-cache", (s, h, b[:100]))
+        check("directory files carry a weak validator", h.get("etag", "").startswith('W/"'), h)
+        s2, _, b2 = raw_get(18108, "/", {"If-None-Match": h["etag"]})
+        check("directory files revalidate to 304", s2 == 304 and b2 == b"", s2)
+        s3, h3, b3 = raw_get(18108, "/assets/app.js")
+        check("directory assets are served with their type and always revalidated", s3 == 200 and b"dir-ui-asset" in b3 and h3.get("content-type", "").startswith("text/javascript") and h3.get("cache-control") == "no-cache", (s3, h3))
+        open(os.path.join(served, "index.html"), "w").write("<!doctype html><title>dir ui</title><p>dir-ui-marker changed</p>")
+        s4, h4, b4 = raw_get(18108, "/", {"If-None-Match": h["etag"]})
+        check("an edited file is served again, with a new validator", s4 == 200 and b"changed" in b4 and h4.get("etag") != h.get("etag"), (s4, h4))
+        check("the embedded page is not served when a directory is set", b"root" not in b4)
+        check("a file outside the directory is not served", all(raw_get(18108, p)[0] in (400, 404) for p in ["/../secret.txt", "/assets/../../secret.txt", "/..%2fsecret.txt", "/secret.txt"]))
+        check("a missing directory file is 404", raw_get(18108, "/assets/nope.js")[0] == 404)
+        check("the directory server still serves the API", raw_get(18108, "/health")[0] == 200)
+    finally:
+        gw.terminate()
+        gw_dir.terminate()
+        shutil.rmtree(ui_dir, ignore_errors=True)
+
 
 GW_L113 = "http://127.0.0.1:18173"  # the web UI's management calls: MCP tool switches, virtual key and provider edits, settings
 
@@ -6252,6 +6830,18 @@ def main():
         l110_e2e(env)
         # SCIM 2.0 provisioning at /scim/v2: users and groups pushed by an identity provider, and scim_config off: their own gateways
         l115_e2e(env)
+        # SCIM deactivation and OIDC sign-in: a deactivated user loses its sign-in and its session, others are unchanged
+        l120_e2e(env, idp_state)
+        # A2A agents: registrations, the gateway's card and JSON-RPC route, grants, limits, logs and the agent_names filter: their own gateway
+        l116_e2e(env)
+        # MCP code mode: the meta-tools in chat requests, stubs and docs, programs over the MCP tools, the key gates on nested calls and the limits: their own gateways
+        l117_e2e(env)
+        # management API keys: a value shown once, a key's own permissions, the ceiling on grants, expiry, deletion and a restart: their own gateway
+        l112b_e2e(env)
+        # MCP token exchange: the exchange configuration, verify-exchange against a token endpoint stub and an MCP server that takes only its tokens: their own gateway
+        l112b_exchange_e2e(env)
+        # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
+        l113_ui_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

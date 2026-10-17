@@ -50,7 +50,9 @@ import { GuardConfig, applyToChatRequest, applyToCompletion, applyToText } from 
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, userHeadersOf, ToolText } from "./mcp"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches } from "./mcp"
+import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
+import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
 import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, consentLink, startUserFlow, refreshUserRow } from "./mcpuser"
 import { Limiter } from "./limiter"
@@ -997,6 +999,15 @@ function userAuthOf(kind: string, token: string, status: int, type: string, mess
 }
 
 // The registration (auth) of an MCP client by name, or undefined.
+// Whether a chat tool name is on an auto-execute list: "*", the name itself, or a pattern on the list.
+function autoListed(auto: string[], name: string): bool {
+  if (auto.includes("*") || auto.includes(name)) return true
+  for (const p of auto) {
+    if (patternMatches(name, p)) return true
+  }
+  return false
+}
+
 function authOfClient(cfg: Config, name: string): McpAuthConfig | undefined {
   for (const c of cfg.mcp?.client_configs ?? []) {
     if (c.name === name) return c.auth
@@ -1037,6 +1048,10 @@ export class Engine {
   copilotTokens: cloudAuth.TokenCache<string> = cloudAuth.stringCache()
   stsCreds: cloudAuth.TokenCache<cloudAuth.AssumedCreds> = cloudAuth.credsCache()
   iamTokens: Map<string, { token: string, expiresAtSec: int }> = new Map()
+  // token_exchange MCP clients: the token endpoints discovered from the identity provider, and the exchanged
+  // tokens per caller (src/tokenexchange.tov)
+  idp: IdpEndpoints = new IdpEndpoints()
+  exchanges: ExchangeCache = new ExchangeCache()
   guard: GuardConfig | undefined = undefined
   rules: RuleSet | undefined = undefined
   logStore: LogStore | undefined = undefined
@@ -1889,8 +1904,50 @@ export class Engine {
       }
       tools = kept
     }
+    // code mode: the four meta-tools stand in for the code mode clients' tools (not when the request narrows them)
+    if (only === undefined && onlyTools === undefined && this.codeEntriesFor(m, h).length > 0) {
+      for (const d of metaToolDefs()) tools.push(d)
+    }
     if (tools.length === 0) return text
     return try injectTools(text, tools)
+  }
+
+  // The code mode servers a caller may reach, as the stubs and the runner name them.
+  codeEntriesFor(m: McpManager, h: Hdrs): CodeEntry[] {
+    return codeEntries(m.codeToolsFor(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs))
+  }
+
+  // One MCP tool call for a request, with the gates a direct call gets: the guardrails on the call, the
+  // key's MCP rules and budgets, and per-user auth. auto is the agent's auto-execute list when the call runs
+  // unattended (a code mode program in the agent loop); undefined for a call a client made.
+  async mcpCall(m: McpManager, h: Hdrs, real: string, args: string, auto: string[] | undefined): Promise<ToolText> throws Error {
+    const tv = checkToolCall(this.toolGuards, real, args)
+    if (!tv.allowed) return { text: `blocked by guardrails: ${tv.reason}`, isError: true }
+    if (auto !== undefined && !autoListed(auto, real)) return { text: `tool ${real} is not auto-executed`, isError: true }
+    const gate = this.toolGate(m, h, real)
+    if (gate.kind === "denial") return { text: gate.message, isError: true }
+    const ua = try await this.userAuth(real, h, false)
+    if (ua.kind === "denial") return { text: ua.message, isError: true }
+    const t0 = performance.now()
+    const r = try await this.runUser(m, real, args, h, ua)
+    this.chargeTool(m, gate, real)
+    timedMcp(m, real, t0, r.isError)
+    metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", real, r.isError ? "error" : "success"), 1.0)
+    return { text: r.text, isError: r.isError }
+  }
+
+  // A code mode meta-tool call: listToolFiles, readToolFile, getToolDocs or executeToolCode. The tool calls a
+  // program makes run through mcpCall, so they are gated, budgeted, guarded and logged like direct calls.
+  async codeMetaTool(m: McpManager, h: Hdrs, name: string, argsJson: string, auto: string[] | undefined): Promise<ToolText> throws Error {
+    const entries = this.codeEntriesFor(m, h)
+    const level = bindingLevelOf(this.cfg.mcp?.code_mode_binding_level)
+    const lim = limitsOf(this.cfg.mcp?.code_mode_limits)
+    // tool_execution_timeout bounds the whole program, as Bifrost's per-execution timeout does
+    const deadline = Date.now() + 1000.0 * (this.cfg.mcp?.tool_execution_timeout_seconds ?? 30)
+    const host = async (server: string, tool: string, args: string): Promise<ToolText, Error> => {
+      return try await this.mcpCall(m, h, chatToolName(server, tool), args, auto)
+    }
+    return await runMeta(name, argsJson, entries, level, lim, deadline, host)
   }
 
   // The gate of one MCP tool call: the key's MCP rules (access profile patterns and mcp_configs) must
@@ -1925,6 +1982,8 @@ export class Engine {
   // call with (an expiring token is refreshed first and saved); "denial" with the consent link the caller must
   // open. force refreshes the token whatever its expiry (used after the server answered 401).
   async userAuth(name: string, h: Hdrs, force: bool): Promise<UserAuth> {
+    const te = splitToolName(name, tokenExchangeNames(this.cfg.mcp?.client_configs))
+    if (te !== undefined) return await this.exchangeAuth(te.server, h, force)
     const hit = splitToolName(name, perUserOAuthNames(this.cfg.mcp?.client_configs))
     if (hit === undefined) return userAuthOf("none", "", 0, "", "")
     const client = hit.server
@@ -1952,6 +2011,44 @@ export class Engine {
     if (r.flow === undefined) return userAuthOf("denial", "", 401, "authentication_error", r.error)
     const f = r.flow!
     return userAuthOf("denial", "", 401, "authentication_error", consentMessage(client, consentLink(base, f.id, f.temp_token), tempOn))
+  }
+
+  // The caller's identity-provider token: the Authorization bearer, when it is a JWT (an identity provider's
+  // access token) and not the caller's virtual key. Provider keys and the admin secret are not JWTs, so they
+  // never reach the identity provider. "" when the request carries no such token.
+  subjectOf(h: Hdrs): string {
+    const a = h.get("authorization") ?? ""
+    if (!a.startsWith("Bearer ")) return ""
+    const t = a.slice(7).trim()
+    if (t.split(".").length !== 3 || t.includes(" ")) return ""
+    const only: Hdrs = new Map()
+    only.set("authorization", a)
+    if (this.gov.findKey(only) !== undefined) return ""
+    return t
+  }
+
+  // The token for a tool of a token_exchange client: the caller's identity-provider token exchanged for one
+  // scoped to the client's audience. Cached per client, caller and subject until shortly before it expires;
+  // force drops the cached token (after the server answered 401).
+  async exchangeAuth(client: string, h: Hdrs, force: bool): Promise<UserAuth> {
+    let te: McpTokenExchange | undefined = undefined
+    for (const c of this.cfg.mcp?.client_configs ?? []) {
+      if (c.name === client) te = c.token_exchange
+    }
+    if (te === undefined) return userAuthOf("denial", "", 401, "authentication_error", `MCP client ${client} has no token_exchange settings`)
+    const subject = this.subjectOf(h)
+    if (subject === "") return userAuthOf("denial", "", 401, "authentication_error", `MCP client ${client} exchanges the caller's identity-provider token: send it as the Authorization bearer, with the virtual key in x-bf-vk`)
+    const vk = this.gov.findKey(h)?.id ?? ""
+    const now = Date.now()
+    const key = exchangeKey(client, vk, subject)
+    if (force) this.exchanges.drop(key)
+    const hit = this.exchanges.get(key, now)
+    if (hit !== undefined) return userAuthOf("bearer", hit, 0, "", "")
+    const oc = this.cfg.oidc
+    const r = await exchangeToken(te, subject, this.idp, oc?.issuer ?? "", oc?.client_id ?? "", oc?.client_secret ?? "")
+    if (r.error !== "") return userAuthOf("denial", "", 401, "authentication_error", `token exchange for MCP client ${client} failed: ${r.error}`)
+    this.exchanges.put(key, r.token, r.expiresIn, now)
+    return userAuthOf("bearer", r.token, 0, "", "")
   }
 
   // Keeps a token row the gateway obtained; the server's saver writes it to the config file.
@@ -1991,6 +2088,14 @@ export class Engine {
       const tv = checkToolCall(this.toolGuards, call.name, call.argumentsJson)
       if (!tv.allowed) return errorResponse(400, `tool call blocked by guardrails: ${tv.reason}`, "guardrail_violation", noHeaders())
       const h = snapshot(req.headers)
+      if (isMetaTool(call.name)) {
+        // a code mode meta-tool a client executes itself: nothing is auto-executable here, so the program's
+        // tool calls are checked against tools_to_execute only
+        const mt = await this.codeMetaTool(m, h, call.name, call.argumentsJson, undefined)
+        const mr: Record<string, string> = new Map()
+        mr.set("content-type", "application/json")
+        return new Response(toolMessage(call.callId ?? "", mt.isError ? "Error: " + mt.text : mt.text), { status: 200, headers: mr })
+      }
       const gate = this.toolGate(m, h, call.name)
       if (gate.kind === "denial") return errorResponse(gate.status, gate.message, gate.type, noHeaders())
       const ua = try await this.userAuth(call.name, h, false)
@@ -2785,24 +2890,22 @@ export class Engine {
       last.h = kept
       return { status: r.status, body: try await r.text() }
     }
+    const hdr = snapshot(req.headers)
+    const entries = this.codeEntriesFor(m, hdr)
     const exec = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
+      if (isMetaTool(name)) return try await this.codeMetaTool(m, hdr, name, args, ag.auto_execute)
       const real = injectedChatName(this.cfg, name) ?? name
-      const tv = checkToolCall(this.toolGuards, real, args)
-      if (!tv.allowed) return { text: `blocked by guardrails: ${tv.reason}`, isError: true }
-      const h = snapshot(req.headers)
-      const gate = this.toolGate(m, h, real)
-      if (gate.kind === "denial") return { text: gate.message, isError: true }
-      const ua = try await this.userAuth(real, h, false)
-      if (ua.kind === "denial") return { text: ua.message, isError: true }
-      const t0 = performance.now()
-      const r = try await this.runUser(m, real, args, h, ua)
-      this.chargeTool(m, gate, real)
-      timedMcp(m, real, t0, r.isError)
-      metrics.inc("raiju_mcp_tool_calls_total", metrics.labels("", real, r.isError ? "error" : "success"), 1.0)
-      return { text: r.text, isError: r.isError }
+      return try await this.mcpCall(m, hdr, real, args, undefined)
     }
+    // the code mode meta-tools join the names the loop may run, and executeToolCode runs when its program
+    // calls only auto-executable tools
+    const names = m.toolNames().concat(injectedNames(this.cfg))
+    if (entries.length > 0) {
+      for (const n of META_TOOLS) names.push(n)
+    }
+    const codeOk = (a: string): bool => execAutoAllowed(a, entries, ag.auto_execute)
     try {
-      const r = await runAgent(text, call, exec, ag, m.toolNames().concat(injectedNames(this.cfg)))
+      const r = await runAgent(text, call, exec, ag, names, codeOk)
       // the last model call's headers (request id, cache, attempts), plus the agent's counts
       const out: Record<string, string> = last.h
       if (!out.has("content-type")) out.set("content-type", "application/json")

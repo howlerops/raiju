@@ -30,10 +30,11 @@ import { snapshot, errorJson, Hdrs } from "./schemas"
 import { handleApi, proxyWidening, Result, randomId } from "./store"
 import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
 import { passthroughPath, passthroughRoute } from "./passthrough"
-import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, headersRouteAsync, perUserApi, McpReply } from "./mcpapi"
+import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, headersRouteAsync, exchangeRouteAsync, perUserApi, McpReply } from "./mcpapi"
 import { issuerRoute, keyById, grantsList, grantRevoke } from "./mcpissuer"
 import { promptRoute } from "./prompts"
 import { webhookApi, asyncSubmitHooked } from "./webhooks"
+import { agentApi, publicBase } from "./agents"
 import { flagRoute } from "./flags"
 import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
@@ -43,7 +44,7 @@ import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
-import { INDEX_HTML } from "./ui_assets"
+import { serveUi, uiPath, UI_CSP } from "./uiserve"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -485,6 +486,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path.startsWith("/api/users/") && path.split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, path)
   else if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
   else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
+  else if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) r = ops.apiKeysRoute(req.method, path, req.url, body, gate.actor)
   // the cache clears (DELETE) and the read-only plugin listings
   else if (path.startsWith("/api/cache/")) r = ops.cacheClear(req.method, path)
   else if (path === "/api/plugins" || path.startsWith("/api/plugins/")) r = ops.pluginsRoute(req.method, path, body)
@@ -548,6 +550,16 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
     const wr = await webhookApi(ops.store.cfg.webhooks, req.method, req.url.slice(req.url.indexOf("/api/")), body)
     r = savedReply(wr.status, wr.body, wr.next === undefined ? undefined : ops.store.setWebhooks(wr.next))
   }
+  // registered A2A agents (agents.tov); the call history is ops.tov's
+  else if (path === "/api/agents" || path.startsWith("/api/agents/")) {
+    if (path === "/api/agents/history") {
+      const hu = URL.parse(req.url)
+      r = req.method === "GET" ? ops.agentHistoryRoute(hu === undefined ? new URLSearchParams("") : hu.searchParams, sc) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+    } else {
+      const ar = await agentApi(ops.store.cfg.agents, req.method, req.url.slice(req.url.indexOf("/api/")), body, publicBase(ops.store.cfg.client?.a2a_external_client_url, req.url))
+      r = savedReply(ar.status, ar.body, ar.next === undefined ? undefined : ops.store.setAgents(ar.next))
+    }
+  }
   else if (path === "/api/feature-flags" || path.startsWith("/api/feature-flags/")) {
     const fr = flagRoute(ops.store.cfg.feature_flags, req.method, req.url.slice(req.url.indexOf("/api/")), body)
     r = savedReply(fr.status, fr.body, fr.next === undefined ? undefined : ops.store.setFeatureFlags(fr.next))
@@ -563,6 +575,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
     if (oa === undefined) oa = await oauthRoute(ops.store, req.method, path, body, mu === undefined ? "" : mu.origin)
     if (oa === undefined) oa = perUserApi(ops.store, req.method, mu === undefined ? path : path + mu.search, body, mu === undefined ? "" : mu.origin)
     if (oa === undefined) oa = await headersRouteAsync(ops.store, req.method, path, body)
+    if (oa === undefined) oa = await exchangeRouteAsync(ops.store, ops.engine.idp, req.method, path, body)
     if (oa === undefined) oa = await openapiRoute(req.method, path, body)
     // with dashboard auth off, clients registered here must reach public addresses only
     const mr = oa ?? mcpApi(ops.store, req.method, path, body, !ops.authOn)
@@ -660,6 +673,28 @@ function textResponse(body: string, contentType: string): Response {
   return new Response(body, { headers: h })
 }
 
+// A file of the web UI (the embedded build, or the directory RAIJU_UI_DIR names). The page
+// is revalidated on each load; the hashed files under /assets/ are cached for good.
+function uiResponse(p: string, req: Request): Response | undefined {
+  const r = serveUi(p, req.headers.get("if-none-match") ?? "", req.headers.get("accept-encoding") ?? "", process.env.RAIJU_UI_DIR ?? "")
+  if (r === undefined) return undefined
+  const h: Record<string, string> = new Map()
+  h.set("content-type", r.contentType)
+  h.set("cache-control", r.cache)
+  h.set("etag", r.etag)
+  h.set("vary", "accept-encoding")
+  h.set("x-content-type-options", "nosniff")
+  if (r.encoding !== "") h.set("content-encoding", r.encoding)
+  if (r.contentType.startsWith("text/html")) {
+    h.set("content-security-policy", UI_CSP)
+    h.set("referrer-policy", "no-referrer")
+    h.set("x-frame-options", "DENY")
+  }
+  if (r.status === 304) return new Response(undefined, { status: 304, headers: h })
+  if (r.binary) return new Response(r.bytes, { headers: h })
+  return new Response(r.text, { headers: h })
+}
+
 const CHAT_PATHS = ["/v1/chat/completions", "/openai/v1/chat/completions", "/openai/chat/completions"]
 
 // LiteLLM and LangChain clients pointed at the gateway: /litellm/... and /langchain/...
@@ -754,8 +789,9 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   const m = req.method
-  // x-bf-async on an inference route: the request runs as a job, and the caller polls it (Bifrost's integration routes)
-  if (m === "POST" && (req.headers.get("x-bf-async") ?? "") !== "" && !p.startsWith("/api/") && !p.startsWith("/v1/async/") && p !== "/mcp") {
+  // x-bf-async on an inference route: the request runs as a job, and the caller polls it (Bifrost's integration routes).
+  // The A2A gateway is not an inference route: its JSON-RPC calls are answered directly.
+  if (m === "POST" && (req.headers.get("x-bf-async") ?? "") !== "" && !p.startsWith("/api/") && !p.startsWith("/v1/async/") && p !== "/mcp" && !p.startsWith("/agents/a2a/")) {
     const again: Dispatch = async (r) => try await dispatch(engine, ops, r)
     const route = compatPath(p)
     return await sdkAsyncSubmit(engine.jobs, req, again, route.slice(1, route.byteLength))
@@ -767,6 +803,8 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   const segs = p.split("/")
   // SCIM 2.0 provisioning from the identity provider, behind its own bearer token (scim.tov)
   if (p === "/scim/v2" || p.startsWith("/scim/v2/")) return await scimRoute(ops, req, p)
+  // the A2A gateway: an agent's card and its JSON-RPC endpoint (agents.tov); the caller's virtual key is checked there
+  if (p.startsWith("/agents/a2a/") && segs.length >= 5) return await ops.a2aRoute(req, segs[3]!, "/" + segs.slice(4).join("/"), publicBase(engine.cfg.client?.a2a_external_client_url, req.url))
   if (p === "/mcp") return await ops.mcp(req, undefined)
   if (p.startsWith("/mcp/") && segs.length === 3) return await ops.mcp(req, segs[2]!)
   // the Anthropic SDK's batch, file and model routes: before the generic media routes
@@ -795,7 +833,10 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     const aid = req.headers.get("x-bf-async-id") ?? ""
     if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid)
     if (p === "/health") return Response.json({ status: "ok" })
-    if (p === "/") return textResponse(INDEX_HTML, "text/html; charset=utf-8")
+    if (uiPath(p)) {
+      const ui = uiResponse(p, req)
+      if (ui !== undefined) return ui
+    }
     if (p === "/metrics") return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
     if (p === "/v1/models" || p === "/openai/v1/models") return await cors(engine.cfg, req, await listModels(engine, req))
     if (p.startsWith("/v1/models/")) return await cors(engine.cfg, req, await retrieveModel(engine, req, p.slice(11)))

@@ -9,8 +9,13 @@
 // assertions at its left edge (\b, ^) see no text before it. The wordB check looks at
 // the real bytes there. A match that cannot be located (only when a window matches)
 // blocks a rule that does not redact, since its text cannot be replaced.
+//
+// A rule with a required literal (regex.tov's literals()) skips most windows: a window's
+// gate tries only the starts that can begin a match through an occurrence of the literal
+// in the window (windowStarts). The windows are walked once for all rules (scanRegions), so
+// each window is decoded once and only one window's text is held at a time.
 
-import { compileRegex, Regex } from "./regex"
+import { compileRegex, Cset, Decoded, decodeText, hasBorder, LitCand, Regex } from "./regex"
 import { Finding, GuardResult, redact } from "./guardrails"
 
 // A Gitleaks-style allowlist. target is "" (the secret), "match" (the whole match) or
@@ -154,19 +159,161 @@ export function compileRules(rules: RegexRule[]): CompiledRule[] throws SyntaxEr
   return out
 }
 
-// Byte ranges that may hold a match: windows of W bytes, step STEP, that test as a match.
+// The text with ASCII letters lowercased and every other byte kept, so byte offsets are
+// those of the text. undefined when the result is not valid text (then nothing is filtered).
+function asciiLower(b: u8[]): string | undefined {
+  const out: u8[] = []
+  for (const x of b) {
+    const c = int(x)
+    out.push(u8(c >= 65 && c <= 90 ? c + 32 : c))
+  }
+  try {
+    return new TextDecoder().decode(out)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The start offsets of every occurrence of lit in low, overlapping ones included, or
+// undefined when there are too many to list (the rule is then not filtered).
+function occurrences(low: string, lit: string, b: u8[]): int[] | undefined {
+  const out: int[] = []
+  if (!hasBorder(lit)) {
+    // without a border no two occurrences overlap, so the pieces between them give every offset
+    const pieces = low.split(lit)
+    let at = 0
+    for (let i = 0; i + 1 < pieces.length; i++) {
+      at += pieces[i]!.byteLength
+      out.push(at)
+      at += lit.byteLength
+    }
+    return out
+  }
+  // searched in chunks that overlap by the literal's length, so no occurrence is missed and
+  // the text is copied once in all
+  if (lit.byteLength >= 1024) return undefined
+  const n = low.byteLength
+  const chunk = 4096
+  let from = 0
+  while (out.length <= 256) {
+    // chunk ends are code point starts, so the slice is valid text
+    const end = cpAlign(b, from + chunk < n ? from + chunk : n)
+    const q = low.slice(from, end).indexOf(lit)
+    if (q >= 0) {
+      out.push(from + q)
+      from = from + q + 1
+      continue
+    }
+    if (end >= n) return out
+    from = cpAlign(b, end - lit.byteLength + 1)
+  }
+  return undefined
+}
+
+// Whether a byte can be a character of the set: a byte of a multi-byte character is
+// allowed when the set holds any non-ASCII character.
+function byteFits(c: int, cs: Cset): bool {
+  if (cs.any) return true
+  if (c >= 128) return cs.high
+  return ((cs.bits[c >> 5]! >> (c & 31)) & 1) === 1
+}
+
+// The earliest byte a match can start at, when the match holds the literal at byte p. Its
+// bytes before the literal are at most lc.pre, and each is a character of lc.cls, so the
+// start is the first byte of the run of such bytes that ends at p.
+function earliestStart(b: u8[], p: int, lc: LitCand): int {
+  const floor = lc.pre < 0 || p - lc.pre < 0 ? 0 : p - lc.pre
+  let s = p
+  while (s > floor && byteFits(byteAt(b, s - 1), lc.cls)) s -= 1
+  return s
+}
+
+// One start a rule tries in window k: the starts in [from, p], where p is an occurrence of
+// one of the rule's literals that lies in the window.
+type Trip = { k: int, from: int, p: int }
+
+// The starts to try, as a list sorted by window, or undefined when the rule has no literal
+// (every start of every window is tried then). A match of the rule holds one of its literals
+// at an occurrence q that lies in a window, and starts at or after the earliest start of
+// regex.tov's literal bound, so only the starts from there to q are needed. An occurrence at
+// byte p (of length len) can lie in window k (start k*STEP, end at most k*STEP + W + 3, since a
+// window end moves forward to a code point start) only when k*STEP <= p and p + len <= k*STEP
+// + W + 3; the list covers every such window.
+function windowStarts(re: Regex, low: string | undefined, b: u8[]): Trip[] | undefined {
+  const lits = re.literals()
+  if (lits.length === 0 || low === undefined) return undefined
+  const nwin = ((b.length - 1) >> 8) + 1
+  const out: Trip[] = []
+  for (const lc of lits) {
+    const at = occurrences(low, lc.lit, b)
+    if (at === undefined) return undefined
+    const len = lc.lit.byteLength
+    for (const p of at) {
+      const x = p + len - W - 3
+      const lo = x <= 0 ? 0 : (x + STEP - 1) >> 8
+      const hi = p >> 8
+      const from = earliestStart(b, p, lc)
+      for (let k = lo; k <= hi && k < nwin; k++) out.push({ k: k, from: from, p: p })
+    }
+  }
+  out.sort((x, y) => x.k - y.k)
+  return out
+}
+
+// Byte ranges that may hold a match, for each rule: the windows whose gate tests as a match.
 // A match of up to W - STEP bytes starting in a window's first half lies inside that window.
-function hitRegions(re: Regex, text: string, b: u8[]): Span[] {
+// The windows are walked once, in order, so each is decoded once for the rules that need it
+// and only the hit ranges are kept. A window tries only the starts windowStarts gives it,
+// when the rule has literals.
+function scanRegions(rules: CompiledRule[], text: string, b: u8[], low: string | undefined): Span[][] {
   const n = b.length
-  const out: Span[] = []
+  const plans: (Trip[] | undefined)[] = []
+  const next: int[] = []
+  const out: Span[][] = []
+  for (const r of rules) {
+    plans.push(windowStarts(r.gate, low, b))
+    next.push(0)
+    out.push([])
+  }
   let s = 0
+  let k = 0
   while (s < n) {
     const st = cpAlign(b, s)
     const e = cpAlign(b, s + W < n ? s + W : n)
     if (st >= e) break
-    if (re.test(text.slice(st, e))) out.push({ start: st, end: e })
+    let dec = new Decoded([], [])
+    let decodedNow = false
+    for (let i = 0; i < rules.length; i++) {
+      // the starts as offsets into the window; a start before the window is not in it
+      const lo: int[] = []
+      const hi: int[] = []
+      const plan = plans[i]
+      if (plan !== undefined) {
+        // the list is sorted by window, so the entries of earlier windows are passed over
+        let j = next[i]!
+        while (j < plan.length && plan[j]!.k < k) j += 1
+        while (j < plan.length && plan[j]!.k === k) {
+          const t = plan[j]!
+          const h = t.p - st
+          if (h >= 0) {
+            const l = t.from - st
+            lo.push(l < 0 ? 0 : l)
+            hi.push(h)
+          }
+          j += 1
+        }
+        next[i] = j
+        if (lo.length === 0) continue
+      }
+      if (!decodedNow) {
+        dec = decodeText(text.slice(st, e))
+        decodedNow = true
+      }
+      if (rules[i]!.gate.testDecoded(dec, lo, hi)) out[i]!.push({ start: st, end: e })
+    }
     if (e >= n) break
     s += STEP
+    k += 1
   }
   return out
 }
@@ -348,13 +495,20 @@ export function applyRegex(text: string, rules: CompiledRule[]): GuardResult {
   const redactions: Finding[] = []
   let blocked = false
   const low = text.toLowerCase()
+  const ascii = asciiLower(b)
   let memo = new Map<string, bool>()
+  // a rule with keywords runs only when one of them occurs, which is far cheaper than its regex
+  const run: CompiledRule[] = []
   for (const r of rules) {
-    // a rule with keywords runs only when one of them occurs, which is far cheaper than its regex
     if (r.keys.length > 0 && !r.keys.some((k: string) => low.includes(k))) continue
-    const regions = hitRegions(r.gate, text, b)
-    if (regions.length === 0) continue
-    const scan = findSpans(r, text, b, regions)
+    run.push(r)
+  }
+  const regions = scanRegions(run, text, b, ascii)
+  for (let i = 0; i < run.length; i++) {
+    const r = run[i]!
+    const rg = regions[i]!
+    if (rg.length === 0) continue
+    const scan = findSpans(r, text, b, rg)
     if (!scan.placed) {
       // the pattern matched but the span could not be placed
       findings.push({ kind: r.kind, start: 0, end: 0, text: "" })
@@ -539,4 +693,47 @@ test("skip_line_containing drops a finding on a marked line only", () => {
   expect(applyRegex("tok_abcd\ntok_efgh @keep", rules).findings.length).toBe(1)
   expect(applyRegex("tok_abcd\ntok_efgh @keep", rules).findings[0]!.text).toBe("tok_abcd")
   expect(applyRegex("tok_abcd", rules).blocked).toBe(true)
+})
+
+test("a literal rule finds matches at every offset around the window seams", () => {
+  const rules = try compileRules([{ pattern: "[a-z]{3}secret", action: "detect_only" }])
+  // targets near the seams; each match goes at or after its target, so the starts are recorded
+  const targets = [250, 251, 254, 255, 256, 257, 500, 508, 510, 511, 512, 513, 760, 1020, 1023, 1024]
+  for (const lead of ["-", "é"]) {
+    let text = ""
+    const starts: int[] = []
+    for (const t of targets) {
+      if (lead === "é") {
+        while (text.byteLength + 2 <= t) text += "é"
+      }
+      while (text.byteLength < t) text += "-"
+      starts.push(text.byteLength)
+      text += "abcsecret."
+    }
+    const r = applyRegex(text, rules)
+    expect(r.findings.length).toBe(starts.length)
+    for (let i = 0; i < starts.length; i++) {
+      expect(r.findings[i]!.start).toBe(starts[i]!)
+      expect(r.findings[i]!.text).toBe("abcsecret")
+    }
+  }
+})
+
+test("a literal that overlaps itself is still found at each occurrence", () => {
+  // "a-a" can occur at 0, 2 and 4 of "a-a-a-a5"; only the one at 4 is followed by a digit
+  const rules = try compileRules([{ pattern: "a-a[0-9]", action: "detect_only" }])
+  const r = applyRegex("a-a-a-a5", rules)
+  expect(r.findings.length).toBe(1)
+  expect(r.findings[0]!.start).toBe(4)
+  expect(r.findings[0]!.text).toBe("a-a5")
+})
+
+test("an overlapping literal is found past the search chunks, after multibyte text", () => {
+  const rules = try compileRules([{ pattern: "a-a[0-9]", action: "detect_only" }])
+  const text = "é".repeat(2500) + " a-a-a-a5 " + "x".repeat(9000) + " a-a5"
+  const r = applyRegex(text, rules)
+  expect(r.findings.length).toBe(2)
+  const first = text.indexOf("a-a5")
+  expect(r.findings[0]!.start).toBe(first)
+  expect(r.findings[1]!.start).toBe(text.slice(first + 1).indexOf("a-a5") + first + 1)
 })

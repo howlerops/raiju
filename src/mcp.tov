@@ -4,6 +4,7 @@
 // without a network; McpSession and McpManager wrap them around fetch.
 import { McpAuthConfig, TokenCache, staticHeaders, tokenRequest, discoveryUrls, parseAuthServerMetadata } from "./mcpauth"
 import { McpUserToken } from "./mcpuser"
+import { McpTokenExchange } from "./tokenexchange"
 
 // one reply of a per-user call: its status, content type, body and the session id it carries
 type UserReply = { status: int, contentType: string, body: string, sid: string }
@@ -51,6 +52,23 @@ export type McpClientConfig = {
   // the client connects with to list its tools.
   auth_type?: string,
   per_user_header_keys?: string[],
+  // auth_type "token_exchange": the caller's identity-provider token is exchanged for one scoped to the
+  // audience, and the result goes with its tool calls (src/tokenexchange.tov)
+  token_exchange?: McpTokenExchange,
+  // is_code_mode_client: the tools are not offered one by one; the model reaches them through the code mode
+  // meta-tools (src/codemode.tov). Their tools still run through the same gates when a program calls them.
+  is_code_mode_client?: bool,
+}
+
+// The code mode limits as the config gives them (Bifrost's mcp_code_mode_limits); 0 or a missing field is the default.
+export type CodeLimitsIn = {
+  max_source_bytes?: int,
+  max_steps?: int,
+  max_memory_bytes?: int,
+  max_log_bytes?: int,
+  max_tool_calls?: int,
+  max_value_bytes?: int,
+  max_nesting_depth?: int,
 }
 
 export type McpTlsConfig = { insecure_skip_verify?: bool, ca_cert_pem?: string }
@@ -74,6 +92,9 @@ export type McpConfig = {
   header_flows?: McpHeaderFlow[],
   // the tokens each caller obtained for the per_user_oauth clients (src/mcpuser.tov); sealed at rest
   user_tokens?: McpUserToken[],
+  // code mode: "server" (one stub file per server, the default) or "tool" (one per tool), and the run limits
+  code_mode_binding_level?: string,
+  code_mode_limits?: CodeLimitsIn,
 }
 
 // The per-user headers a virtual key submitted for one client; undefined when it has submitted none.
@@ -90,6 +111,15 @@ export function perUserOAuthNames(list: McpClientConfig[] | undefined): string[]
   const out: string[] = []
   for (const c of list ?? []) {
     if (c.auth_type === "per_user_oauth") out.push(c.name)
+  }
+  return out
+}
+
+// The names of the clients whose auth_type is token_exchange.
+export function tokenExchangeNames(list: McpClientConfig[] | undefined): string[] {
+  const out: string[] = []
+  for (const c of list ?? []) {
+    if (c.auth_type === "token_exchange") out.push(c.name)
   }
   return out
 }
@@ -293,6 +323,27 @@ export function sanitizeName(s: string): string {
 // The name a tool has in chat: "<server>-<tool>", sanitized.
 function chatName(server: string, tool: string): string {
   return sanitizeName(`${server}-${tool}`)
+}
+
+export function chatToolName(server: string, tool: string): string {
+  return chatName(server, tool)
+}
+
+// The predicate that decides which of a session's tools a caller sees: the key's mcp_configs rules and
+// the access profile's patterns, with allow_by_default for a client neither names.
+function visibleTo(s: McpSession, policy: string[] | undefined, keys: McpKeyConfig[] | undefined): (orig: string, chat: string) => bool {
+  const name = s.cfg.name
+  const byDefault = s.cfg.allow_by_default === true
+  const ks: McpKeyConfig[] = keys ?? []
+  const pol: string[] = policy ?? []
+  const keyNamed = keys !== undefined && keyNamesClient(ks, name)
+  let polNamed = false
+  if (policy !== undefined) polNamed = namesClient(pol, name)
+  return (orig: string, chat: string): bool => {
+    const keyOk = keys === undefined || (keyNamed ? keyRuleAllows(ks, name, orig, byDefault) : byDefault)
+    const polOk = policy === undefined || (polNamed ? pol.some((p) => patternMatches(chat, p)) : byDefault)
+    return keyOk && polOk
+  }
 }
 
 // Bifrost's allow and skip lists. An empty allow list (or "*") exposes every tool.
@@ -1192,20 +1243,26 @@ export class McpManager {
     if (policy === undefined && keys === undefined) return this.allTools()
     const out: string[] = []
     for (const s of this.sessions) {
-      if (!s.connected) continue
-      const name = s.cfg.name
-      const byDefault = s.cfg.allow_by_default === true
-      const ks: McpKeyConfig[] = keys ?? []
-      const pol: string[] = policy ?? []
-      const keyNamed = keys !== undefined && keyNamesClient(ks, name)
-      let polNamed = false
-      if (policy !== undefined) polNamed = namesClient(pol, name)
-      const pass = s.toolsWhere((orig: string, chat: string): bool => {
-        const keyOk = keys === undefined || (keyNamed ? keyRuleAllows(ks, name, orig, byDefault) : byDefault)
-        const polOk = policy === undefined || (polNamed ? pol.some((p) => patternMatches(chat, p)) : byDefault)
-        return keyOk && polOk
-      })
+      if (!s.connected || s.cfg.is_code_mode_client === true) continue
+      const pass = s.toolsWhere(visibleTo(s, policy, keys))
       for (const t of pass) out.push(t)
+    }
+    return out
+  }
+
+  // The tools of the code mode clients a caller may see, by client (the same rules as allToolsFor).
+  codeToolsFor(policy: string[] | undefined, keys?: McpKeyConfig[]): { name: string, tools: McpTool[] }[] {
+    const out: { name: string, tools: McpTool[] }[] = []
+    for (const s of this.sessions) {
+      if (!s.connected || s.cfg.is_code_mode_client !== true) continue
+      const pass = visibleTo(s, policy, keys)
+      const tools: McpTool[] = []
+      for (const t of s.tools) {
+        if (!toolAllowed(t.name, s.cfg)) continue
+        if (!pass(t.name, chatName(s.cfg.name, t.name))) continue
+        tools.push(t)
+      }
+      if (tools.length > 0) out.push({ name: s.cfg.name, tools: tools })
     }
     return out
   }
@@ -1252,11 +1309,11 @@ export class McpManager {
     return 0.0
   }
 
-  // Chat tool definitions from every connected server.
+  // Chat tool definitions from every connected server (the code mode clients' tools are not offered one by one).
   allTools(): string[] {
     const out: string[] = []
     for (const s of this.sessions) {
-      if (!s.connected) continue
+      if (!s.connected || s.cfg.is_code_mode_client === true) continue
       for (const t of s.chatTools()) out.push(t)
     }
     return out
@@ -1272,7 +1329,7 @@ export class McpManager {
         const t0 = Date.now()
         let r: ToolText = { text: "", isError: false }
         try {
-          if (s.cfg.auth_type === "per_user_oauth") {
+          if (s.cfg.auth_type === "per_user_oauth" || s.cfg.auth_type === "token_exchange") {
             if (bearer === undefined) throw new Error(`${s.cfg.name}: the caller has no token for this server: complete the consent link first`)
             r = await s.callAsUser(original, argsJson, extra, bearer)
           } else {
@@ -1293,7 +1350,7 @@ export class McpManager {
   toolNames(): string[] {
     const out: string[] = []
     for (const s of this.sessions) {
-      if (!s.connected) continue
+      if (!s.connected || s.cfg.is_code_mode_client === true) continue
       for (const n of s.exposedNames()) out.push(n)
     }
     return out
@@ -1343,6 +1400,29 @@ test("allow_by_default and access-profile patterns decide which tools a key sees
   expect(m.allToolsFor(["nothing-here"]).length).toBe(2)
   expect(patternMatches("fs-read", "fs-*")).toBe(true)
   expect(patternMatches("fs-read", "fs-re")).toBe(false)
+})
+
+test("code mode clients are not offered one by one; codeToolsFor lists them for the caller", () => {
+  const m = new McpManager({ client_configs: [
+    { name: "fs", connection_type: "http", connection_string: "http://x/mcp", is_code_mode_client: true },
+    { name: "git", connection_type: "http", connection_string: "http://y/mcp", allow_by_default: true },
+  ] })
+  for (const s of m.sessions) {
+    s.connected = true
+    s.tools = [{ name: "read", description: "reads", inputSchemaRaw: EMPTY_SCHEMA }, { name: "write", description: "", inputSchemaRaw: EMPTY_SCHEMA }]
+  }
+  const names = (list: string[]): string => list.map((t) => { const i = t.indexOf('"name":"'); return t.slice(i + 8).split('"')[0]! }).join(",")
+  expect(names(m.allToolsFor(undefined))).toBe("git-read,git-write")
+  expect(m.toolNames().includes("fs-read")).toBe(false)
+  const cm = m.codeToolsFor(undefined)
+  expect(cm.length).toBe(1)
+  expect(cm[0]!.name).toBe("fs")
+  expect(cm[0]!.tools.map((t) => t.name).join(",")).toBe("read,write")
+  expect(cm[0]!.tools[0]!.description).toBe("reads")
+  // the key's rules apply to the code mode tools as they do to direct ones
+  expect(m.codeToolsFor(["fs-read"])[0]!.tools.map((t) => t.name).join(",")).toBe("read")
+  expect(m.codeToolsFor(["git-*"]).length).toBe(0)
+  expect(chatToolName("fs", "read")).toBe("fs-read")
 })
 
 test("tools_to_auto_execute becomes agent patterns per client", () => {

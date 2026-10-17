@@ -1,4 +1,4 @@
-.PHONY: build test unit e2e ui check openapi-check parity-count run bench tov tov-test
+.PHONY: build test unit e2e ui web web-check check openapi-check parity-count run bench tov tov-test
 
 # Tov's async slab allocator corrupts its free lists once ~30 fetches are in
 # flight (see docs/tov-notes.md); plain malloc avoids it at the same speed.
@@ -35,8 +35,28 @@ e2e:
 	python3 tests/e2e.py
 	RAIJU_SERVER=http1 python3 tests/e2e.py
 
-ui:
+build/mock_upstream: tests/mock_upstream.tov
+	mkdir -p build && $(TOV) build tests/mock_upstream.tov -o build/mock_upstream
+
+# the web UI in headless Chromium against build/raiju (the committed src/ui_assets.tov)
+ui: build build/mock_upstream
 	NODE_PATH=$$(npm root -g) node tests/ui_e2e.mjs
+
+# The web UI (web/, SolidJS on Vite, built with Bun) is embedded in src/ui_assets.tov, which is
+# committed: building the gateway needs no Node. `make web` regenerates the API types from
+# docs/openapi/management.yaml, type-checks, builds web/dist and embeds it.
+BUN ?= $(or $(shell command -v bun 2>/dev/null),$(HOME)/.bun/bin/bun)
+
+web:
+	cd web && $(BUN) install --frozen-lockfile && $(BUN) run gen && $(BUN) run check && $(BUN) run build
+	python3 scripts/embed_ui.py
+
+# rebuilds the UI and fails when src/ui_assets.tov or web/src/api/schema.d.ts would change
+web-check:
+	mkdir -p build && cp web/src/api/schema.d.ts build/schema.d.ts.prev
+	cd web && $(BUN) install --frozen-lockfile && $(BUN) run gen && $(BUN) run check && $(BUN) run build
+	@cmp -s web/src/api/schema.d.ts build/schema.d.ts.prev || { echo "web/src/api/schema.d.ts is out of date; run make web and commit it" >&2; exit 1; }
+	python3 scripts/embed_ui.py --check
 
 test: check unit tov-test e2e ui
 

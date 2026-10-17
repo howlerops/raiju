@@ -1,0 +1,420 @@
+// Management API keys (Bifrost's /api/api-keys): a key authenticates the management API with the
+// permissions it was granted, never the role of whoever created it. The value is shown once, when
+// the key is created; the config keeps only its SHA-256 (rbac.tov authorize). Pure functions: the
+// caller stores the list (governance.api_keys) and passes it in.
+import { ApiKeyConfig, PermissionPair } from "./config"
+import { permissionDocs, pairOfId, permissionIds } from "./govapi"
+import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
+import { hashToken } from "./rbac"
+import { RESOURCES, OPERATIONS } from "./store"
+import { errorJson } from "./schemas"
+import { quote } from "./json"
+import { secureHex } from "./crypto"
+
+// What the caller may grant: every permission (the admin, and a local admin), or the listed pairs.
+export type Held = { all: bool, pairs: PermissionPair[] }
+
+// The context of one request: the caller, its grants, the clock, the value a create would use, and
+// the last-used times this worker has seen (they are not in the config).
+export type KeyCtx = { held: Held, actor: string, nowMs: number, value: string, lastUsed: Map<string, string> }
+
+// The list to save (set when the request changed it) and the reply.
+export type KeyReply = { status: int, body: string, keys: ApiKeyConfig[] | undefined }
+
+type KeyBody = { name?: string, description?: string, scopes?: int[], expires_at?: string }
+
+const PREFIX = "bfst-"
+// the prefix a list shows: the scheme and eight characters of the value
+const SHOWN = 13
+
+// A new key value: the scheme and 40 hex characters from the kernel's random source.
+export function newKeyValue(): string throws Error {
+  const hex = try secureHex(40)
+  return PREFIX + hex
+}
+
+// The non-secret form of a value that a list shows.
+export function keyPrefixOf(value: string): string {
+  return value.slice(0, SHOWN) + "..."
+}
+
+// Whether the caller holds a permission, and so may grant it.
+export function holds(held: Held, p: PermissionPair): bool {
+  if (held.all) return true
+  return held.pairs.some((x) => x.resource === p.resource && x.operation === p.operation)
+}
+
+// The permissions of a list of permission ids, in catalog order without repeats. An id that names no
+// permission is an error.
+export function pairsOfIds(ids: int[]): { pairs: PermissionPair[], error: string } {
+  const docs = permissionDocs(RESOURCES, OPERATIONS)
+  for (const id of ids) {
+    if (pairOfId(RESOURCES, OPERATIONS, id) === undefined) return { pairs: [], error: `unknown permission id ${id}` }
+  }
+  const out: PermissionPair[] = []
+  for (const d of docs) {
+    if (ids.includes(d.id)) out.push({ resource: d.resource, operation: d.operation })
+  }
+  return { pairs: out, error: "" }
+}
+
+// The first permission the caller does not hold, as "Resource:Operation", or "" when it holds all.
+function notHeld(held: Held, pairs: PermissionPair[]): string {
+  for (const p of pairs) {
+    if (!holds(held, p)) return `${p.resource}:${p.operation}`
+  }
+  return ""
+}
+
+// null for an absent value, as the JSON view writes it.
+function nullable(v: string | undefined): string {
+  return v === undefined ? "null" : quote(v)
+}
+
+// The JSON of one key as the API shows it: never the value, only its prefix.
+export function keyView(k: ApiKeyConfig, lastUsed: Map<string, string>): string {
+  const used = lastUsed.get(k.name)
+  const ids = permissionIds(RESOURCES, OPERATIONS, k.permissions)
+  return `{"id":${k.id},"name":${quote(k.name)},"key_prefix":${quote(k.key_prefix)},"description":${nullable(k.description)},"scopes":${JSON.stringify(ids)},"created_by_user_id":${nullable(k.created_by_user_id)},"expires_at":${nullable(k.expires_at)},"last_used_at":${nullable(used)},"created_at":${quote(k.created_at)},"updated_at":${quote(k.updated_at)}}`
+}
+
+// The request body as a key body; undefined when it is not JSON or not an object.
+function bodyOf(body: string): KeyBody | undefined {
+  try {
+    const x = JSON.parse(body) as KeyBody | undefined
+    return x
+  } catch (e) {
+    return undefined
+  }
+}
+
+function errorReply(status: int, message: string): KeyReply {
+  return { status: status, body: errorJson(message, "invalid_request_error", undefined), keys: undefined }
+}
+
+function okReply(status: int, body: string, keys: ApiKeyConfig[] | undefined): KeyReply {
+  return { status: status, body: body, keys: keys }
+}
+
+// The expiry an RFC 3339 text names, written as the API writes it; undefined when it is not one.
+function expiryOf(s: string): string | undefined {
+  const ms = rfc3339Ms(s)
+  return ms === undefined ? undefined : rfc3339Of(ms)
+}
+
+function nextId(keys: ApiKeyConfig[]): int {
+  let max = 0
+  for (const k of keys) {
+    if (k.id > max) max = k.id
+  }
+  return max + 1
+}
+
+function findKey(keys: ApiKeyConfig[], id: int): ApiKeyConfig | undefined {
+  for (const k of keys) {
+    if (k.id === id) return k
+  }
+  return undefined
+}
+
+function nameTaken(keys: ApiKeyConfig[], name: string, exceptId: int): bool {
+  for (const k of keys) {
+    if (k.name === name && k.id !== exceptId) return true
+  }
+  return false
+}
+
+// GET /api/api-keys. Any of limit, offset or search pages the list, and total_count then counts the matches.
+function listKeys(keys: ApiKeyConfig[], sp: URLSearchParams, ctx: KeyCtx): KeyReply {
+  const search = (sp.get("search") ?? "").toLowerCase()
+  const hasLimit = sp.has("limit")
+  const hasOffset = sp.has("offset")
+  const paged = hasLimit || hasOffset || search !== ""
+  let limit = keys.length
+  let offset = 0
+  if (hasLimit) {
+    const n = parseInt(sp.get("limit") ?? "")
+    if (n === undefined || n < 0) return errorReply(400, "limit must be a non-negative integer")
+    limit = n
+  }
+  if (hasOffset) {
+    const n = parseInt(sp.get("offset") ?? "")
+    if (n === undefined || n < 0) return errorReply(400, "offset must be a non-negative integer")
+    offset = n
+  }
+  const matched: ApiKeyConfig[] = []
+  for (const k of keys) {
+    if (search === "" || k.name.toLowerCase().includes(search)) matched.push(k)
+  }
+  const views: string[] = []
+  for (const k of matched.slice(offset, offset + limit)) views.push(keyView(k, ctx.lastUsed))
+  const total = paged ? matched.length : views.length
+  return okReply(200, `{"api_keys":[${views.join(",")}],"count":${views.length},"total_count":${total},"limit":${limit},"offset":${offset}}`, undefined)
+}
+
+// POST /api/api-keys: the new key with its value, which is never shown again.
+function createKey(keys: ApiKeyConfig[], body: string, ctx: KeyCtx): KeyReply {
+  const b = bodyOf(body)
+  if (b === undefined) return errorReply(400, "invalid request body")
+  const name = b.name ?? ""
+  if (name === "") return errorReply(400, "name is required")
+  if (nameTaken(keys, name, -1)) return errorReply(409, `an API key named ${name} exists`)
+  const granted = pairsOfIds(b.scopes ?? [])
+  if (granted.error !== "") return errorReply(400, granted.error)
+  const short = notHeld(ctx.held, granted.pairs)
+  if (short !== "") return errorReply(403, `you cannot grant ${short}: your own permissions do not include it`)
+  let expires: string | undefined = undefined
+  if ((b.expires_at ?? "") !== "") {
+    expires = expiryOf(b.expires_at ?? "")
+    if (expires === undefined) return errorReply(400, "expires_at must be an RFC 3339 time")
+  }
+  const now = rfc3339Of(ctx.nowMs)
+  const rec: ApiKeyConfig = {
+    id: nextId(keys),
+    name: name,
+    description: b.description,
+    key_sha256: hashToken(ctx.value),
+    key_prefix: keyPrefixOf(ctx.value),
+    permissions: granted.pairs,
+    created_by_user_id: ctx.actor === "" ? undefined : ctx.actor,
+    expires_at: expires,
+    created_at: now,
+    updated_at: now,
+  }
+  const next = keys.concat([rec])
+  return okReply(200, `{"api_key":${keyView(rec, ctx.lastUsed)},"key":${quote(ctx.value)}}`, next)
+}
+
+// PUT /api/api-keys/{id}. The value never changes. description is always applied (omitting it clears
+// it); scopes, when sent, replace the permissions; expires_at "" removes the expiry.
+function updateKey(keys: ApiKeyConfig[], cur: ApiKeyConfig, body: string, ctx: KeyCtx): KeyReply {
+  const b = bodyOf(body)
+  if (b === undefined) return errorReply(400, "invalid request body")
+  let name = cur.name
+  if ((b.name ?? "") !== "") {
+    if (nameTaken(keys, b.name ?? "", cur.id)) return errorReply(409, `an API key named ${b.name ?? ""} exists`)
+    name = b.name ?? ""
+  }
+  let perms = cur.permissions
+  if (b.scopes !== undefined) {
+    const granted = pairsOfIds(b.scopes)
+    if (granted.error !== "") return errorReply(400, granted.error)
+    const short = notHeld(ctx.held, granted.pairs)
+    if (short !== "") return errorReply(403, `you cannot grant ${short}: your own permissions do not include it`)
+    perms = granted.pairs
+  }
+  let expires = cur.expires_at
+  if (b.expires_at !== undefined) {
+    if (b.expires_at === "") {
+      expires = undefined
+    } else {
+      const x = expiryOf(b.expires_at)
+      if (x === undefined) return errorReply(400, "expires_at must be an RFC 3339 time")
+      expires = x
+    }
+  }
+  const rec: ApiKeyConfig = {
+    id: cur.id,
+    name: name,
+    description: b.description,
+    key_sha256: cur.key_sha256,
+    key_prefix: cur.key_prefix,
+    permissions: perms,
+    created_by_user_id: cur.created_by_user_id,
+    expires_at: expires,
+    created_at: cur.created_at,
+    updated_at: rfc3339Of(ctx.nowMs),
+  }
+  const out: ApiKeyConfig[] = []
+  for (const k of keys) {
+    out.push(k.id === cur.id ? rec : k)
+  }
+  return okReply(200, `{"api_key":${keyView(rec, ctx.lastUsed)}}`, out)
+}
+
+// The management API key routes: /api/api-keys (GET, POST) and /api/api-keys/{id} (GET, PUT, DELETE).
+// keys is the stored list; the reply carries the list to save when the request changed it.
+export function handleApiKeys(keys: ApiKeyConfig[], method: string, path: string, sp: URLSearchParams, body: string, ctx: KeyCtx): KeyReply {
+  const segs = path.split("/").filter((s) => s !== "")
+  if (segs.length === 2) {
+    if (method === "GET") return listKeys(keys, sp, ctx)
+    if (method === "POST") return createKey(keys, body, ctx)
+    return errorReply(405, "use GET or POST")
+  }
+  if (segs.length !== 3) return errorReply(404, "no such route")
+  if (method !== "GET" && method !== "PUT" && method !== "DELETE") return errorReply(405, "use GET, PUT or DELETE")
+  const id = parseInt(segs[2] ?? "")
+  if (id === undefined || id < 1) return errorReply(400, "the API key id must be a positive integer")
+  const cur = findKey(keys, id)
+  if (cur === undefined) return errorReply(404, `no API key ${id}`)
+  if (method === "GET") return okReply(200, `{"api_key":${keyView(cur, ctx.lastUsed)}}`, undefined)
+  if (method === "PUT") return updateKey(keys, cur, body, ctx)
+  if (method === "DELETE") {
+    const out: ApiKeyConfig[] = []
+    for (const k of keys) {
+      if (k.id !== id) out.push(k)
+    }
+    return okReply(200, `{"message":"API key deleted successfully"}`, out)
+  }
+  return errorReply(405, "use GET, PUT or DELETE")
+}
+
+test("a value has the scheme and forty hex characters, and its prefix is not the value", () => {
+  const v = PREFIX + "0123456789abcdef0123456789abcdef01234567"
+  expect(v.startsWith("bfst-")).toBe(true)
+  expect(v.byteLength).toBe(45)
+  expect(keyPrefixOf(v)).toBe("bfst-01234567...")
+  expect(keyPrefixOf(v).includes("89abcdef")).toBe(false)
+})
+
+test("permission ids map to catalog pairs; an unknown id is refused", () => {
+  const one = pairsOfIds([1])
+  expect(one.error).toBe("")
+  expect(one.pairs[0]!.resource).toBe("Logs")
+  expect(one.pairs[0]!.operation).toBe("View")
+  const dup = pairsOfIds([2, 1, 2])
+  expect(dup.pairs.length).toBe(2)
+  expect(dup.pairs[0]!.operation).toBe("View")
+  expect(pairsOfIds([0]).error.includes("unknown")).toBe(true)
+  expect(pairsOfIds([100000]).error.includes("unknown")).toBe(true)
+})
+
+test("the APIKeys permissions are numbered after the existing ones", () => {
+  const ids = pairsOfIds([127, 130])
+  expect(ids.pairs[0]!.resource).toBe("APIKeys")
+  expect(ids.pairs[0]!.operation).toBe("View")
+  expect(ids.pairs[1]!.operation).toBe("Delete")
+})
+
+test("a holder of all permissions, or of the listed ones only, may grant", () => {
+  const all: Held = { all: true, pairs: [] }
+  const some: Held = { all: false, pairs: [{ resource: "Logs", operation: "View" }] }
+  expect(holds(all, { resource: "APIKeys", operation: "Create" })).toBe(true)
+  expect(holds(some, { resource: "Logs", operation: "View" })).toBe(true)
+  expect(holds(some, { resource: "Logs", operation: "Delete" })).toBe(false)
+  expect(notHeld(some, [{ resource: "Logs", operation: "View" }, { resource: "Teams", operation: "View" }])).toBe("Teams:View")
+})
+
+const ADMIN: Held = { all: true, pairs: [] }
+const CTX: KeyCtx = { held: ADMIN, actor: "root", nowMs: 1800000000000.0, value: "bfst-0123456789abcdef0123456789abcdef01234567", lastUsed: new Map() }
+
+type View = { id: int, name: string, key_prefix: string, scopes: int[], description?: string, expires_at?: string, last_used_at?: string, created_by_user_id?: string }
+type Shape = { api_key?: View, api_keys?: View[], total_count?: int, key?: string }
+
+function parsed(text: string): Shape {
+  try {
+    return JSON.parse(text) as Shape
+  } catch (e) {
+    return {}
+  }
+}
+
+function ctxWith(held: Held): KeyCtx {
+  return { held: held, actor: "root", nowMs: 1800000000000.0, value: CTX.value, lastUsed: new Map() }
+}
+
+test("create stores only the hash and returns the value once", () => {
+  const made = handleApiKeys([], "POST", "/api/api-keys", new URLSearchParams(""), `{"name":"ci","scopes":[1,2],"description":"build"}`, CTX)
+  expect(made.status).toBe(200)
+  const body = parsed(made.body)
+  expect(body.key!).toBe(CTX.value)
+  expect(body.api_key!.key_prefix).toBe("bfst-01234567...")
+  expect(body.api_key!.scopes.length).toBe(2)
+  expect(body.api_key!.created_by_user_id).toBe("root")
+  const saved = made.keys!
+  expect(saved.length).toBe(1)
+  expect(saved[0]!.key_sha256 === CTX.value).toBe(false)
+  expect(made.body.includes(saved[0]!.key_sha256)).toBe(false)
+  // the list never shows the value again
+  const again = handleApiKeys(saved, "GET", "/api/api-keys", new URLSearchParams(""), "", CTX)
+  expect(again.body.includes(CTX.value)).toBe(false)
+  expect(parsed(again.body).total_count!).toBe(1)
+})
+
+test("create refuses a missing name, a taken name, an unknown scope and a bad expiry", () => {
+  const sp = new URLSearchParams("")
+  expect(handleApiKeys([], "POST", "/api/api-keys", sp, `{}`, CTX).status).toBe(400)
+  expect(handleApiKeys([], "POST", "/api/api-keys", sp, `not json`, CTX).status).toBe(400)
+  expect(handleApiKeys([], "POST", "/api/api-keys", sp, `{"name":"a","scopes":[999999]}`, CTX).status).toBe(400)
+  expect(handleApiKeys([], "POST", "/api/api-keys", sp, `{"name":"a","expires_at":"soon"}`, CTX).status).toBe(400)
+  const one = handleApiKeys([], "POST", "/api/api-keys", sp, `{"name":"a"}`, CTX)
+  expect(handleApiKeys(one.keys!, "POST", "/api/api-keys", sp, `{"name":"a"}`, CTX).status).toBe(409)
+})
+
+test("a caller cannot grant a permission it does not hold, and creates nothing", () => {
+  const held: Held = { all: false, pairs: [{ resource: "Logs", operation: "View" }] }
+  const ctx = ctxWith(held)
+  const sp = new URLSearchParams("")
+  const r = handleApiKeys([], "POST", "/api/api-keys", sp, `{"name":"x","scopes":[1,8]}`, ctx)
+  expect(r.status).toBe(403)
+  expect(r.keys).toBe(undefined)
+  const ok = handleApiKeys([], "POST", "/api/api-keys", sp, `{"name":"x","scopes":[1]}`, ctx)
+  expect(ok.status).toBe(200)
+})
+
+test("list pages by limit and offset and filters by name", () => {
+  let keys: ApiKeyConfig[] = []
+  for (const n of ["alpha", "beta", "Alphabet"]) {
+    const r = handleApiKeys(keys, "POST", "/api/api-keys", new URLSearchParams(""), `{"name":"${n}"}`, CTX)
+    keys = r.keys!
+  }
+  const all = parsed(handleApiKeys(keys, "GET", "/api/api-keys", new URLSearchParams(""), "", CTX).body)
+  expect(all.api_keys!.length).toBe(3)
+  expect(all.total_count!).toBe(3)
+  const page = parsed(handleApiKeys(keys, "GET", "/api/api-keys", new URLSearchParams("limit=1&offset=1"), "", CTX).body)
+  expect(page.api_keys!.length).toBe(1)
+  expect(page.api_keys![0]!.name).toBe("beta")
+  expect(page.total_count!).toBe(3)
+  const found = parsed(handleApiKeys(keys, "GET", "/api/api-keys", new URLSearchParams("search=ALPHA"), "", CTX).body)
+  expect(found.total_count!).toBe(2)
+  expect(handleApiKeys(keys, "GET", "/api/api-keys", new URLSearchParams("limit=x"), "", CTX).status).toBe(400)
+})
+
+test("update keeps the value, clears description when omitted, and removes an expiry with an empty string", () => {
+  const made = handleApiKeys([], "POST", "/api/api-keys", new URLSearchParams(""), `{"name":"u","description":"d","expires_at":"2030-01-02T03:04:05Z"}`, CTX)
+  const id = parsed(made.body).api_key!.id
+  const hash = made.keys![0]!.key_sha256
+  const renamed = handleApiKeys(made.keys!, "PUT", `/api/api-keys/${id}`, new URLSearchParams(""), `{"name":"v"}`, CTX)
+  expect(renamed.status).toBe(200)
+  const v = renamed.keys![0]!
+  expect(v.name).toBe("v")
+  expect(v.description).toBe(undefined)
+  expect(v.key_sha256).toBe(hash)
+  expect(v.expires_at).toBe("2030-01-02T03:04:05Z")
+  const unexpiring = handleApiKeys(renamed.keys!, "PUT", `/api/api-keys/${id}`, new URLSearchParams(""), `{"expires_at":""}`, CTX)
+  expect(unexpiring.keys![0]!.expires_at).toBe(undefined)
+  const bad = handleApiKeys(renamed.keys!, "PUT", `/api/api-keys/${id}`, new URLSearchParams(""), `{"expires_at":"never"}`, CTX)
+  expect(bad.status).toBe(400)
+})
+
+test("update replaces scopes in full and keeps the ceiling", () => {
+  const made = handleApiKeys([], "POST", "/api/api-keys", new URLSearchParams(""), `{"name":"s","scopes":[1,2,3]}`, CTX)
+  const id = parsed(made.body).api_key!.id
+  const r = handleApiKeys(made.keys!, "PUT", `/api/api-keys/${id}`, new URLSearchParams(""), `{"scopes":[5]}`, CTX)
+  expect(parsed(r.body).api_key!.scopes).toEqual([5])
+  const narrow = ctxWith({ all: false, pairs: [{ resource: "Logs", operation: "View" }] })
+  expect(handleApiKeys(made.keys!, "PUT", `/api/api-keys/${id}`, new URLSearchParams(""), `{"scopes":[5]}`, narrow).status).toBe(403)
+})
+
+test("get and delete follow the id; an unknown or malformed id is an error", () => {
+  const made = handleApiKeys([], "POST", "/api/api-keys", new URLSearchParams(""), `{"name":"g"}`, CTX)
+  const id = parsed(made.body).api_key!.id
+  const sp = new URLSearchParams("")
+  expect(handleApiKeys(made.keys!, "GET", `/api/api-keys/${id}`, sp, "", CTX).status).toBe(200)
+  expect(handleApiKeys(made.keys!, "GET", `/api/api-keys/${id + 1}`, sp, "", CTX).status).toBe(404)
+  expect(handleApiKeys(made.keys!, "GET", `/api/api-keys/abc`, sp, "", CTX).status).toBe(400)
+  const gone = handleApiKeys(made.keys!, "DELETE", `/api/api-keys/${id}`, sp, "", CTX)
+  expect(gone.status).toBe(200)
+  expect(gone.keys!.length).toBe(0)
+  expect(handleApiKeys(made.keys!, "POST", `/api/api-keys/${id}`, sp, "", CTX).status).toBe(405)
+  expect(handleApiKeys(made.keys!, "GET", `/api/api-keys/${id}/extra`, sp, "", CTX).status).toBe(404)
+})
+
+test("last-used times show in the view when this worker has seen the key", () => {
+  const made = handleApiKeys([], "POST", "/api/api-keys", new URLSearchParams(""), `{"name":"t"}`, CTX)
+  const used: Map<string, string> = new Map()
+  used.set("t", "2030-01-01T00:00:00Z")
+  const view = keyView(made.keys![0]!, used)
+  expect(view.includes(`"last_used_at":"2030-01-01T00:00:00Z"`)).toBe(true)
+  expect(keyView(made.keys![0]!, new Map()).includes(`"last_used_at":null`)).toBe(true)
+})

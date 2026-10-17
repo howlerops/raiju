@@ -75,6 +75,8 @@ export type LogEntry = {
   output_cost?: f64,
   additional_cost?: f64,
   canonical_model_name?: string,
+  // the registered A2A agent a call went to (kind "a2a"; agents.tov); session_id is the call's context id
+  agent_name?: string,
 }
 
 export type LogStoreConfig = {
@@ -528,6 +530,7 @@ export class LogStore {
       kind: e.kind,
       tool: e.tool,
       server: e.server,
+      agent_name: e.agent_name,
       // raw payloads are kept whenever they were captured (store_raw_request_response), cut to Bifrost's
       // truncated_log_bytes default of 1 MiB
       raw_request: clip(e.raw_request, RAW_MAX),
@@ -662,6 +665,8 @@ export type Filter = {
   promptNames: string[],
   parentId: string, // exact parent_request_id
   correlationId: string, // exact agent_correlation_id
+  // agent_names: the sessions of the A2A calls to those agents (agentSessionsOf); absent when the filter is not used
+  agentSessions?: string[],
   rootsOnly: bool, // see applyChains
   groupSessions: bool, // see applyChains
 }
@@ -806,7 +811,22 @@ export function selects(e: LogEntry, f: Filter): bool {
   if (f.promptNames.length > 0 && !f.promptNames.includes(e.selected_prompt_name ?? "")) return false
   if (f.parentId !== "" && e.parent_request_id !== f.parentId) return false
   if (f.correlationId !== "" && e.agent_correlation_id !== f.correlationId) return false
+  const sessions = f.agentSessions
+  if (sessions !== undefined && !sessions.includes(e.session_id ?? "")) return false
   return true
+}
+
+// The sessions (A2A context ids) of the calls to the named agents within [since, until): the LLM requests
+// in those sessions are what the agent_names filter selects (Bifrost's agent context filter).
+export function agentSessionsOf(es: LogEntry[], names: string[], since: f64, until: f64): string[] {
+  const out: string[] = []
+  for (const e of es) {
+    const n = e.agent_name ?? ""
+    const sid = e.session_id ?? ""
+    if (kindOf(e) !== "a2a" || !names.includes(n) || sid === "" || e.ts < since || e.ts >= until) continue
+    if (!out.includes(sid)) out.push(sid)
+  }
+  return out
 }
 
 // Chains and sessions (Bifrost's roots_only and group_sessions). roots_only hides a row whose
@@ -1400,6 +1420,22 @@ export function mcpLogJson(e: LogEntry): string {
   ])
 }
 
+// One A2A call (kind "a2a") as the agent history lists it.
+export function a2aLogJson(e: LogEntry): string {
+  return jobj([
+    jkv("id", JSON.stringify(e.id)),
+    jkv("timestamp", JSON.stringify(isoMs(e.ts))),
+    jkv("agent_name", JSON.stringify(e.agent_name ?? "")),
+    jkv("method", JSON.stringify(e.op)),
+    jkv("context_id", JSON.stringify(e.session_id ?? "")),
+    jkv("virtual_key_id", JSON.stringify(e.virtual_key ?? "")),
+    jkv("latency", jn(e.latency_ms)),
+    jkv("status", JSON.stringify(isSuccess(e) ? "success" : "error")),
+    jkv("status_code", jn(e.status)),
+    jkv("error_details", e.error === undefined ? "null" : jobj([jkv("message", JSON.stringify(e.error))])),
+  ])
+}
+
 // GET /api/mcp-logs/stats
 export function mcpStatsView(es: LogEntry[]): string {
   let ok = 0
@@ -1872,6 +1908,38 @@ test("routing, cache, stop and chain filters select the recorded fields", () => 
   expect(idsOf(es, "parent_request_id=p0").join(",")).toBe("c1")
   expect(idsOf(es, "agent_correlation_id=agent-7").join(",")).toBe("c1")
   expect(idsOf(es, "agent_correlation_id=agent").length).toBe(0)
+})
+
+test("agent_names selects the requests of the sessions an agent's calls ran in", () => {
+  const es: LogEntry[] = []
+  const t = 1000.0
+  const call = sample("a2a1", t, "", 200, {})
+  call.kind = "a2a"
+  call.op = "message/send"
+  call.agent_name = "echo"
+  call.session_id = "ctx-1"
+  es.push(call)
+  const other = sample("a2a2", t + 1.0, "", 200, {})
+  other.kind = "a2a"
+  other.agent_name = "other"
+  other.session_id = "ctx-2"
+  es.push(other)
+  const inside = sample("llm1", t + 2.0, "gpt-4o", 200, {})
+  inside.session_id = "ctx-1"
+  es.push(inside)
+  const outside = sample("llm2", t + 3.0, "gpt-4o", 200, {})
+  outside.session_id = "ctx-2"
+  es.push(outside)
+  const names = ["echo"]
+  expect(agentSessionsOf(es, names, 0.0, 5000.0).join(",")).toBe("ctx-1")
+  expect(agentSessionsOf(es, names, 1500.0, 5000.0).length).toBe(0)
+  let f = filterFrom(new URLSearchParams(""), "llm", 0.0, 5000.0)
+  f.agentSessions = agentSessionsOf(es, names, 0.0, 5000.0)
+  expect(selectAll(es, f).map((e) => e.id).join(",")).toBe("llm1")
+  // the A2A calls are not LLM rows, and their own list is the history
+  expect(selectAll(es, filterFrom(new URLSearchParams(""), "llm", 0.0, 5000.0)).length).toBe(2)
+  expect(a2aLogJson(call).includes(`"agent_name":"echo"`)).toBe(true)
+  expect(a2aLogJson(call).includes(`"context_id":"ctx-1"`)).toBe(true)
 })
 
 // The ids of the entries a query selects, in order (a top-level helper, so the tests capture nothing).

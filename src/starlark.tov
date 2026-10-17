@@ -1,0 +1,2566 @@
+// The runner of MCP code mode: a subset of Starlark, the Python dialect Bifrost's executeToolCode
+// runs. Programs have no classes, imports, exceptions or while loops, and no host access except the
+// code mode servers, which are globals: server.tool(param=value). There is no clock, randomness, file
+// or network access, so a run is deterministic.
+//
+// A tool call suspends the run. runRound returns "pending" with the call; the caller runs the tool and
+// runs the program again with that result in the cache, so every tool runs once. A replay reaches the
+// same calls in the same order because the program is deterministic. Counters (steps, memory) carry
+// over from round to round, so the limits apply to the whole execution.
+import { quote, decodeString } from "./json"
+
+export type CodeLimits = {
+  max_source_bytes: int,
+  max_steps: int,
+  max_memory_bytes: int,
+  max_log_bytes: int,
+  max_tool_calls: int,
+  max_value_bytes: int,
+  max_nesting_depth: int,
+}
+
+export function defaultCodeLimits(): CodeLimits {
+  return { max_source_bytes: 65536, max_steps: 1000000, max_memory_bytes: 67108864, max_log_bytes: 65536, max_tool_calls: 64, max_value_bytes: 1048576, max_nesting_depth: 64 }
+}
+
+// A tool of a code mode server: py is its name in code, name is the MCP tool name.
+export type CodeTool = { py: string, name: string }
+// A code mode server: py is its name in code, name is the MCP client name.
+export type CodeServer = { py: string, name: string, tools: CodeTool[] }
+
+export type ToolOut = { text: string, isError: bool }
+
+// The result of one round: a tool call the caller must run, or the end of the program.
+export type RunOutcome =
+  | { kind: "pending", server: string, tool: string, argsJson: string, steps: int, mem: int }
+  | { kind: "done", ok: bool, resultJson: string, logs: string[], errMsg: string, steps: int, mem: int }
+
+// A node of the syntax tree. Children are in args (and body for blocks, clauses and defaults); kw
+// names the keyword of each call argument ("" for a positional one).
+export type Node = { kind: string, s: string, n: f64, names: string[], args: Node[], kw: string[], body: Node[], line: int }
+
+export type Program = { body: Node[] }
+
+const MAX_NEST = 100
+const MAX_CALL_DEPTH = 100
+// Nesting bounds for the native recursion of expressions, str() and ==, so a deep program cannot overflow the stack.
+const MAX_EXPR_DEPTH = 400
+const MAX_CLAUSES = 20
+const MAX_SAFE = 9007199254740992.0
+const KEYWORDS: string[] = ["and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield", "None", "True", "False"]
+const UNSUPPORTED: string[] = ["as", "assert", "async", "await", "class", "del", "except", "finally", "from", "global", "import", "lambda", "nonlocal", "raise", "try", "while", "with", "yield", "is"]
+const AUG_OPS: string[] = ["+=", "-=", "*=", "/=", "//=", "%="]
+const CMP_OPS: string[] = ["==", "!=", "<", "<=", ">", ">="]
+const BUILTINS: string[] = ["print", "len", "range", "enumerate", "zip", "sorted", "reversed", "min", "max", "int", "float", "str", "repr", "bool", "list", "tuple", "dict", "chr", "ord", "any", "all"]
+const STR_METHODS: string[] = ["join", "split", "strip", "lstrip", "rstrip", "startswith", "endswith", "replace", "lower", "upper"]
+const LIST_METHODS: string[] = ["append", "extend", "pop"]
+const DICT_METHODS: string[] = ["get", "keys", "values", "items"]
+
+// ---- lexer ----
+
+type Tok = { k: string, s: string, n: f64, line: int }
+
+function syntaxAt(line: int, msg: string): SyntaxError {
+  return new SyntaxError(`line ${line}: ${msg}`)
+}
+
+function byteAt(b: u8[], i: int): int {
+  return i < b.length ? int(b[i]!) : -1
+}
+
+function txt(b: u8[], from: int, to: int): string {
+  try {
+    return new TextDecoder().decode(b.slice(from, to))
+  } catch (e) {
+    return ""
+  }
+}
+
+function isDigitB(c: int): bool {
+  return c >= 48 && c <= 57
+}
+
+function isNameStart(c: int): bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c === 95
+}
+
+function isNameChar(c: int): bool {
+  return isNameStart(c) || isDigitB(c)
+}
+
+function hexVal(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 97 && c <= 102) return c - 87
+  if (c >= 65 && c <= 70) return c - 55
+  return -1
+}
+
+// The UTF-8 text of one code point.
+function cpText(cp: int): string {
+  const out: u8[] = []
+  if (cp < 0x80) {
+    out.push(u8(cp))
+  } else if (cp < 0x800) {
+    out.push(u8(0xc0 | (cp >> 6)))
+    out.push(u8(0x80 | (cp & 0x3f)))
+  } else if (cp < 0x10000) {
+    out.push(u8(0xe0 | (cp >> 12)))
+    out.push(u8(0x80 | ((cp >> 6) & 0x3f)))
+    out.push(u8(0x80 | (cp & 0x3f)))
+  } else {
+    out.push(u8(0xf0 | (cp >> 18)))
+    out.push(u8(0x80 | ((cp >> 12) & 0x3f)))
+    out.push(u8(0x80 | ((cp >> 6) & 0x3f)))
+    out.push(u8(0x80 | (cp & 0x3f)))
+  }
+  return txt(out, 0, out.length)
+}
+
+// The code point of a one-character string.
+function cpOf(s: string): int {
+  const b = new TextEncoder().encode(s)
+  const c0 = byteAt(b, 0)
+  if (c0 < 0x80) return c0
+  if (c0 < 0xe0) return ((c0 & 0x1f) << 6) | (byteAt(b, 1) & 0x3f)
+  if (c0 < 0xf0) return ((c0 & 0x0f) << 12) | ((byteAt(b, 1) & 0x3f) << 6) | (byteAt(b, 2) & 0x3f)
+  return ((c0 & 0x07) << 18) | ((byteAt(b, 1) & 0x3f) << 12) | ((byteAt(b, 2) & 0x3f) << 6) | (byteAt(b, 3) & 0x3f)
+}
+
+// The digits at b[k..k+n), read as hex. -1 when one is not a hex digit.
+function hexRun(b: u8[], k: int, n: int): int {
+  let v = 0
+  for (let j = 0; j < n; j++) {
+    const d = hexVal(byteAt(b, k + j))
+    if (d < 0) return -1
+    v = v * 16 + d
+  }
+  return v
+}
+
+// The escape whose letter is at b[k]. len is the number of bytes it consumed after the backslash;
+// an unknown escape keeps its backslash and consumes nothing.
+function escapeAt(b: u8[], k: int, line: int): { text: string, len: int } throws SyntaxError {
+  const e = byteAt(b, k)
+  if (e === 110) return { text: "\n", len: 1 }
+  if (e === 116) return { text: "\t", len: 1 }
+  if (e === 114) return { text: "\r", len: 1 }
+  if (e === 92) return { text: "\\", len: 1 }
+  if (e === 34) return { text: "\"", len: 1 }
+  if (e === 39) return { text: "'", len: 1 }
+  if (e === 48) return { text: "\u0000", len: 1 }
+  if (e === 97) return { text: "\u0007", len: 1 }
+  if (e === 98) return { text: "\b", len: 1 }
+  if (e === 102) return { text: "\f", len: 1 }
+  if (e === 118) return { text: "\u000b", len: 1 }
+  let digits = 0
+  if (e === 120) digits = 2
+  if (e === 117) digits = 4
+  if (e === 85) digits = 8
+  if (digits > 0) {
+    const cp = hexRun(b, k + 1, digits)
+    if (cp < 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) throw syntaxAt(line, "invalid escape in string literal")
+    return { text: cpText(cp), len: digits + 1 }
+  }
+  return { text: "\\", len: 0 }
+}
+
+// The string literal whose opening quote is at b[i]: its value, the index after it, and its newlines.
+function readString(b: u8[], i: int, line: int): { text: string, end: int, lines: int } throws SyntaxError {
+  const q = byteAt(b, i)
+  const triple = byteAt(b, i + 1) === q && byteAt(b, i + 2) === q
+  let j = i + (triple ? 3 : 1)
+  let out = ""
+  let runStart = j
+  let lines = 0
+  while (true) {
+    const c = byteAt(b, j)
+    if (c === -1) throw syntaxAt(line, "unterminated string literal")
+    if (c === 10 && !triple) throw syntaxAt(line, "unterminated string literal")
+    if (c === q && (!triple || (byteAt(b, j + 1) === q && byteAt(b, j + 2) === q))) break
+    if (c === 10) lines += 1
+    if (c === 92) {
+      out += txt(b, runStart, j)
+      const e = byteAt(b, j + 1)
+      if (e === -1) throw syntaxAt(line, "unterminated string literal")
+      if (e === 10) {
+        lines += 1
+        j += 2
+        runStart = j
+        continue
+      }
+      const r = try escapeAt(b, j + 1, line)
+      out += r.text
+      j = j + 1 + r.len
+      runStart = j
+      continue
+    }
+    j += 1
+  }
+  out += txt(b, runStart, j)
+  return { text: out, end: j + (triple ? 3 : 1), lines: lines }
+}
+
+function tok(k: string, s: string, n: f64, line: int): Tok {
+  return { k: k, s: s, n: n, line: line }
+}
+
+// Splits source text into tokens with Python's layout rules: indentation becomes indent and dedent
+// tokens, and line breaks inside brackets are ignored.
+function lex(src: string): Tok[] throws SyntaxError {
+  const b = new TextEncoder().encode(src)
+  const n = b.length
+  const toks: Tok[] = []
+  const indents: int[] = [0]
+  let i = 0
+  let line = 1
+  let depth = 0
+  let atStart = true
+  while (i < n) {
+    if (atStart && depth === 0) {
+      let col = 0
+      let j = i
+      while (j < n && (byteAt(b, j) === 32 || byteAt(b, j) === 9)) {
+        if (byteAt(b, j) === 9) throw syntaxAt(line, "tabs are not allowed in indentation")
+        col += 1
+        j += 1
+      }
+      const c = byteAt(b, j)
+      if (c === 10 || c === 13 || c === 35 || c === -1) {
+        // a blank or comment line changes nothing
+        while (j < n && byteAt(b, j) !== 10) j += 1
+        if (j < n) {
+          j += 1
+          line += 1
+        }
+        i = j
+        continue
+      }
+      const top = indents[indents.length - 1]!
+      if (col > top) {
+        indents.push(col)
+        toks.push(tok("indent", "", 0.0, line))
+      } else {
+        while (col < indents[indents.length - 1]!) {
+          indents.pop()
+          toks.push(tok("dedent", "", 0.0, line))
+        }
+        if (col !== indents[indents.length - 1]!) throw syntaxAt(line, "inconsistent indentation")
+      }
+      i = j
+      atStart = false
+      continue
+    }
+    const c = byteAt(b, i)
+    if (c === 32 || c === 9 || c === 13) {
+      i += 1
+      continue
+    }
+    if (c === 35) {
+      while (i < n && byteAt(b, i) !== 10) i += 1
+      continue
+    }
+    if (c === 10) {
+      if (depth === 0) {
+        if (toks.length > 0 && toks[toks.length - 1]!.k !== "nl") toks.push(tok("nl", "", 0.0, line))
+        atStart = true
+      }
+      line += 1
+      i += 1
+      continue
+    }
+    if (c === 92) {
+      // an explicit line continuation
+      if (byteAt(b, i + 1) !== 10) throw syntaxAt(line, "unexpected character after line continuation")
+      line += 1
+      i += 2
+      continue
+    }
+    if (isDigitB(c) || (c === 46 && isDigitB(byteAt(b, i + 1)))) {
+      let j = i
+      let isFloat = false
+      while (j < n && (isDigitB(byteAt(b, j)) || byteAt(b, j) === 46)) {
+        if (byteAt(b, j) === 46) {
+          if (isFloat) break
+          isFloat = true
+        }
+        j += 1
+      }
+      if (byteAt(b, j) === 101 || byteAt(b, j) === 69) {
+        let k = j + 1
+        if (byteAt(b, k) === 43 || byteAt(b, k) === 45) k += 1
+        if (isDigitB(byteAt(b, k))) {
+          isFloat = true
+          j = k
+          while (j < n && isDigitB(byteAt(b, j))) j += 1
+        }
+      }
+      if (isNameStart(byteAt(b, j))) throw syntaxAt(line, "invalid number literal")
+      const text = txt(b, i, j)
+      const v = parseFloat(text) ?? -1.0
+      if (v < 0.0) throw syntaxAt(line, "invalid number literal")
+      if (!isFloat && v > MAX_SAFE) throw syntaxAt(line, "integer literal is too large")
+      toks.push(tok(isFloat ? "float" : "int", text, v, line))
+      i = j
+      continue
+    }
+    if (isNameStart(c)) {
+      let j = i
+      while (j < n && isNameChar(byteAt(b, j))) j += 1
+      toks.push(tok("name", txt(b, i, j), 0.0, line))
+      i = j
+      continue
+    }
+    if (c === 34 || c === 39) {
+      const r = try readString(b, i, line)
+      toks.push(tok("str", r.text, 0.0, line))
+      line += r.lines
+      i = r.end
+      continue
+    }
+    const three = txt(b, i, i + 3)
+    if (three === "//=") {
+      toks.push(tok("op", three, 0.0, line))
+      i += 3
+      continue
+    }
+    const two = txt(b, i, i + 2)
+    if (two === "==" || two === "!=" || two === "<=" || two === ">=" || two === "+=" || two === "-=" || two === "*=" || two === "/=" || two === "%=" || two === "//") {
+      toks.push(tok("op", two, 0.0, line))
+      i += 2
+      continue
+    }
+    const one = txt(b, i, i + 1)
+    if (one.byteLength === 1 && "+-*/%<>=()[]{}:,.;".includes(one)) {
+      if (one === "(" || one === "[" || one === "{") depth += 1
+      if ((one === ")" || one === "]" || one === "}") && depth > 0) depth -= 1
+      toks.push(tok("op", one, 0.0, line))
+      i += 1
+      continue
+    }
+    throw syntaxAt(line, `unexpected character '${one}'`)
+  }
+  if (toks.length > 0 && toks[toks.length - 1]!.k !== "nl") toks.push(tok("nl", "", 0.0, line))
+  while (indents.length > 1) {
+    indents.pop()
+    toks.push(tok("dedent", "", 0.0, line))
+  }
+  toks.push(tok("eof", "", 0.0, line))
+  return toks
+}
+
+// ---- syntax tree ----
+
+function nd(kind: string, line: int): Node {
+  return { kind: kind, s: "", n: 0.0, names: [], args: [], kw: [], body: [], line: line }
+}
+
+function describe(t: Tok): string {
+  if (t.k === "nl") return "end of line"
+  if (t.k === "eof") return "end of input"
+  if (t.k === "indent") return "an indent"
+  if (t.k === "dedent") return "a dedent"
+  return `'${t.s}'`
+}
+
+class Parser {
+  toks: Tok[]
+  p: int = 0
+  nest: int = 0
+
+  constructor(toks: Tok[]) {
+    this.toks = toks
+  }
+
+  cur(): Tok {
+    return this.toks[this.p]!
+  }
+
+  at(off: int): Tok {
+    const i = this.p + off
+    return i < this.toks.length ? this.toks[i]! : this.toks[this.toks.length - 1]!
+  }
+
+  adv(): void {
+    if (this.p < this.toks.length - 1) this.p += 1
+  }
+
+  isOp(s: string): bool {
+    const t = this.cur()
+    return t.k === "op" && t.s === s
+  }
+
+  isKw(s: string): bool {
+    const t = this.cur()
+    return t.k === "name" && t.s === s
+  }
+
+  eatOp(s: string): bool {
+    if (this.isOp(s)) {
+      this.adv()
+      return true
+    }
+    return false
+  }
+
+  needOp(s: string): void throws SyntaxError {
+    if (!this.isOp(s)) throw syntaxAt(this.cur().line, `expected '${s}', found ${describe(this.cur())}`)
+    this.adv()
+  }
+
+  enter(): void throws SyntaxError {
+    this.nest += 1
+    if (this.nest > MAX_NEST) throw syntaxAt(this.cur().line, "too deeply nested")
+  }
+
+  leave(): void {
+    this.nest -= 1
+  }
+
+  name(): string throws SyntaxError {
+    const t = this.cur()
+    if (t.k !== "name" || KEYWORDS.includes(t.s)) throw syntaxAt(t.line, `expected a name, found ${describe(t)}`)
+    this.adv()
+    return t.s
+  }
+
+  module(): Node[] throws SyntaxError {
+    const out: Node[] = []
+    while (this.cur().k !== "eof") {
+      const ss = try this.statement()
+      for (const s of ss) out.push(s)
+    }
+    return out
+  }
+
+  statement(): Node[] throws SyntaxError {
+    const t = this.cur()
+    if (t.k === "nl") {
+      this.adv()
+      return []
+    }
+    if (t.k === "indent") throw syntaxAt(t.line, "unexpected indent")
+    if (t.k === "name") {
+      if (t.s === "if") {
+        const n = try this.ifStmt()
+        return [n]
+      }
+      if (t.s === "for") {
+        const n = try this.forStmt()
+        return [n]
+      }
+      if (t.s === "def") {
+        const n = try this.defStmt()
+        return [n]
+      }
+    }
+    return try this.simple()
+  }
+
+  // Simple statements separated by ";", ended by a line break.
+  simple(): Node[] throws SyntaxError {
+    const out: Node[] = []
+    while (true) {
+      const s = try this.smallStmt()
+      out.push(s)
+      if (!this.isOp(";")) break
+      this.adv()
+      if (this.cur().k === "nl" || this.cur().k === "eof") break
+    }
+    const t = this.cur()
+    if (t.k === "nl") this.adv()
+    else if (t.k !== "eof") throw syntaxAt(t.line, `expected end of line, found ${describe(t)}`)
+    return out
+  }
+
+  endOfSimple(): bool {
+    const t = this.cur()
+    return t.k === "nl" || t.k === "eof" || (t.k === "op" && t.s === ";")
+  }
+
+  smallStmt(): Node throws SyntaxError {
+    const t = this.cur()
+    if (t.k === "name") {
+      if (UNSUPPORTED.includes(t.s)) throw syntaxAt(t.line, `'${t.s}' is not supported in this runtime`)
+      if (t.s === "return") {
+        this.adv()
+        const r = nd("return", t.line)
+        if (!this.endOfSimple()) r.args.push(try this.testList())
+        return r
+      }
+      if (t.s === "break" || t.s === "continue" || t.s === "pass") {
+        this.adv()
+        return nd(t.s, t.line)
+      }
+    }
+    const e = try this.testList()
+    if (this.isOp("=")) {
+      this.adv()
+      const v = try this.testList()
+      try this.checkTarget(e)
+      const a = nd("assign", t.line)
+      a.args.push(e)
+      a.args.push(v)
+      return a
+    }
+    const op = this.cur()
+    if (op.k === "op" && AUG_OPS.includes(op.s)) {
+      this.adv()
+      const v = try this.testList()
+      try this.checkTarget(e)
+      const a = nd("aug", t.line)
+      a.s = op.s.slice(0, op.s.byteLength - 1)
+      a.args.push(e)
+      a.args.push(v)
+      return a
+    }
+    const x = nd("expr", t.line)
+    x.args.push(e)
+    return x
+  }
+
+  checkTarget(e: Node): void throws SyntaxError {
+    if (e.kind === "name" || e.kind === "index") return
+    if (e.kind === "tuple" || e.kind === "list") {
+      for (const a of e.args) try this.checkTarget(a)
+      return
+    }
+    throw syntaxAt(e.line, "cannot assign to this expression")
+  }
+
+  ifStmt(): Node throws SyntaxError {
+    const line = this.cur().line
+    this.adv()
+    const c = try this.test()
+    try this.needOp(":")
+    const body = try this.suite()
+    const n = nd("if", line)
+    n.args.push(c)
+    n.args.push(body)
+    if (this.isKw("elif")) {
+      const e = try this.ifStmt()
+      n.args.push(e)
+    } else if (this.isKw("else")) {
+      this.adv()
+      try this.needOp(":")
+      const eb = try this.suite()
+      n.args.push(eb)
+    }
+    return n
+  }
+
+  forStmt(): Node throws SyntaxError {
+    const line = this.cur().line
+    this.adv()
+    const tgt = try this.targetList()
+    if (!this.isKw("in")) throw syntaxAt(this.cur().line, "expected 'in' in for loop")
+    this.adv()
+    const it = try this.testList()
+    try this.needOp(":")
+    const body = try this.suite()
+    const n = nd("for", line)
+    n.args.push(tgt)
+    n.args.push(it)
+    n.args.push(body)
+    return n
+  }
+
+  defStmt(): Node throws SyntaxError {
+    const line = this.cur().line
+    this.adv()
+    const n = nd("def", line)
+    n.s = try this.name()
+    try this.needOp("(")
+    let sawDefault = false
+    while (!this.isOp(")")) {
+      const pn = try this.name()
+      if (n.names.includes(pn)) throw syntaxAt(line, `duplicate parameter ${pn}`)
+      n.names.push(pn)
+      if (this.eatOp("=")) {
+        sawDefault = true
+        const d = try this.test()
+        n.args.push(d)
+      } else {
+        if (sawDefault) throw syntaxAt(line, "non-default parameter follows a default parameter")
+        n.args.push(nd("absent", line))
+      }
+      if (!this.eatOp(",")) break
+    }
+    try this.needOp(")")
+    try this.needOp(":")
+    const body = try this.suite()
+    n.body = body.body
+    return n
+  }
+
+  // A block after a colon: an indented run of statements, or simple statements on the same line.
+  suite(): Node throws SyntaxError {
+    const blk = nd("block", this.cur().line)
+    if (this.cur().k === "nl") {
+      this.adv()
+      if (this.cur().k !== "indent") throw syntaxAt(this.cur().line, "expected an indented block")
+      this.adv()
+      try this.enter()
+      while (this.cur().k !== "dedent" && this.cur().k !== "eof") {
+        const ss = try this.statement()
+        for (const s of ss) blk.body.push(s)
+      }
+      this.leave()
+      if (this.cur().k === "dedent") this.adv()
+      return blk
+    }
+    const ss = try this.simple()
+    for (const s of ss) blk.body.push(s)
+    return blk
+  }
+
+  testList(): Node throws SyntaxError {
+    const first = try this.test()
+    if (!this.isOp(",")) return first
+    const n = nd("tuple", first.line)
+    n.args.push(first)
+    while (this.eatOp(",")) {
+      if (this.endOfExpr()) break
+      n.args.push(try this.test())
+    }
+    return n
+  }
+
+  endOfExpr(): bool {
+    const t = this.cur()
+    if (t.k === "nl" || t.k === "eof") return true
+    return t.k === "op" && (t.s === ")" || t.s === "]" || t.s === "}" || t.s === "=" || t.s === ":" || t.s === ";" || AUG_OPS.includes(t.s))
+  }
+
+  // The targets of a for loop or a comprehension: postfix expressions, so "in" ends the list.
+  targetList(): Node throws SyntaxError {
+    const first = try this.postfix()
+    if (!this.isOp(",")) {
+      try this.checkTarget(first)
+      return first
+    }
+    const n = nd("tuple", first.line)
+    n.args.push(first)
+    while (this.eatOp(",")) {
+      if (this.isKw("in")) break
+      n.args.push(try this.postfix())
+    }
+    try this.checkTarget(n)
+    return n
+  }
+
+  test(): Node throws SyntaxError {
+    const e = try this.orTest()
+    if (this.isKw("if")) {
+      this.adv()
+      const c = try this.orTest()
+      if (!this.isKw("else")) throw syntaxAt(this.cur().line, "expected 'else' in conditional expression")
+      this.adv()
+      const alt = try this.test()
+      const n = nd("ifexp", e.line)
+      n.args.push(c)
+      n.args.push(e)
+      n.args.push(alt)
+      return n
+    }
+    return e
+  }
+
+  orTest(): Node throws SyntaxError {
+    let e = try this.andTest()
+    while (this.isKw("or")) {
+      this.adv()
+      const r = try this.andTest()
+      const n = nd("or", e.line)
+      n.args.push(e)
+      n.args.push(r)
+      e = n
+    }
+    return e
+  }
+
+  andTest(): Node throws SyntaxError {
+    let e = try this.notTest()
+    while (this.isKw("and")) {
+      this.adv()
+      const r = try this.notTest()
+      const n = nd("and", e.line)
+      n.args.push(e)
+      n.args.push(r)
+      e = n
+    }
+    return e
+  }
+
+  notTest(): Node throws SyntaxError {
+    if (this.isKw("not")) {
+      const line = this.cur().line
+      this.adv()
+      const x = try this.notTest()
+      const n = nd("unop", line)
+      n.s = "not"
+      n.args.push(x)
+      return n
+    }
+    return try this.comparison()
+  }
+
+  comparison(): Node throws SyntaxError {
+    let e = try this.arith()
+    while (true) {
+      const t = this.cur()
+      let op = ""
+      if (t.k === "op" && CMP_OPS.includes(t.s)) {
+        op = t.s
+        this.adv()
+      } else if (t.k === "name" && t.s === "in") {
+        op = "in"
+        this.adv()
+      } else if (t.k === "name" && t.s === "not" && this.at(1).k === "name" && this.at(1).s === "in") {
+        op = "not in"
+        this.adv()
+        this.adv()
+      } else {
+        break
+      }
+      const r = try this.arith()
+      const n = nd("cmp", e.line)
+      n.s = op
+      n.args.push(e)
+      n.args.push(r)
+      e = n
+    }
+    return e
+  }
+
+  arith(): Node throws SyntaxError {
+    let e = try this.term()
+    while (this.isOp("+") || this.isOp("-")) {
+      const op = this.cur().s
+      this.adv()
+      const r = try this.term()
+      const n = nd("binop", e.line)
+      n.s = op
+      n.args.push(e)
+      n.args.push(r)
+      e = n
+    }
+    return e
+  }
+
+  term(): Node throws SyntaxError {
+    let e = try this.factor()
+    while (this.isOp("*") || this.isOp("/") || this.isOp("//") || this.isOp("%")) {
+      const op = this.cur().s
+      this.adv()
+      const r = try this.factor()
+      const n = nd("binop", e.line)
+      n.s = op
+      n.args.push(e)
+      n.args.push(r)
+      e = n
+    }
+    return e
+  }
+
+  factor(): Node throws SyntaxError {
+    if (this.isOp("-") || this.isOp("+")) {
+      const line = this.cur().line
+      const op = this.cur().s
+      this.adv()
+      const x = try this.factor()
+      const n = nd("unop", line)
+      n.s = op
+      n.args.push(x)
+      return n
+    }
+    return try this.postfix()
+  }
+
+  postfix(): Node throws SyntaxError {
+    let e = try this.atom()
+    while (true) {
+      if (this.isOp("(")) {
+        e = try this.callArgs(e)
+      } else if (this.isOp("[")) {
+        e = try this.subscript(e)
+      } else if (this.isOp(".")) {
+        this.adv()
+        const t = this.cur()
+        const attr = try this.name()
+        const n = nd("attr", t.line)
+        n.s = attr
+        n.args.push(e)
+        e = n
+      } else {
+        break
+      }
+    }
+    return e
+  }
+
+  callArgs(fn: Node): Node throws SyntaxError {
+    const n = nd("call", fn.line)
+    n.args.push(fn)
+    n.kw.push("")
+    this.adv()
+    try this.enter()
+    while (!this.isOp(")")) {
+      const t = this.cur()
+      if (t.k === "name" && this.at(1).k === "op" && this.at(1).s === "=") {
+        this.adv()
+        this.adv()
+        n.kw.push(t.s)
+      } else {
+        n.kw.push("")
+      }
+      n.args.push(try this.test())
+      if (!this.eatOp(",")) break
+    }
+    try this.needOp(")")
+    this.leave()
+    return n
+  }
+
+  subscript(obj: Node): Node throws SyntaxError {
+    const line = this.cur().line
+    this.adv()
+    try this.enter()
+    let lo = nd("absent", line)
+    if (!this.isOp(":")) {
+      lo = try this.test()
+      if (!this.isOp(":")) {
+        try this.needOp("]")
+        this.leave()
+        const ix = nd("index", line)
+        ix.args.push(obj)
+        ix.args.push(lo)
+        return ix
+      }
+    }
+    this.adv()
+    let hi = nd("absent", line)
+    if (!this.isOp("]")) hi = try this.test()
+    try this.needOp("]")
+    this.leave()
+    const sl = nd("slice", line)
+    sl.args.push(obj)
+    sl.args.push(lo)
+    sl.args.push(hi)
+    return sl
+  }
+
+  atom(): Node throws SyntaxError {
+    const t = this.cur()
+    if (t.k === "int" || t.k === "float") {
+      this.adv()
+      const n = nd(t.k, t.line)
+      n.n = t.n
+      return n
+    }
+    if (t.k === "str") {
+      this.adv()
+      let s = t.s
+      while (this.cur().k === "str") {
+        s += this.cur().s
+        this.adv()
+      }
+      const n = nd("str", t.line)
+      n.s = s
+      return n
+    }
+    if (t.k === "name") {
+      if (t.s === "True" || t.s === "False" || t.s === "None") {
+        this.adv()
+        const c = nd("const", t.line)
+        c.s = t.s
+        return c
+      }
+      if (KEYWORDS.includes(t.s)) throw syntaxAt(t.line, `unexpected '${t.s}'`)
+      this.adv()
+      const n = nd("name", t.line)
+      n.s = t.s
+      return n
+    }
+    if (this.isOp("(")) return try this.parenthesized()
+    if (this.isOp("[")) return try this.listDisplay()
+    if (this.isOp("{")) return try this.dictDisplay()
+    throw syntaxAt(t.line, `unexpected ${describe(t)}`)
+  }
+
+  parenthesized(): Node throws SyntaxError {
+    const line = this.cur().line
+    this.adv()
+    try this.enter()
+    if (this.isOp(")")) {
+      this.adv()
+      this.leave()
+      return nd("tuple", line)
+    }
+    const first = try this.test()
+    if (this.isOp(")")) {
+      this.adv()
+      this.leave()
+      return first
+    }
+    const n = nd("tuple", line)
+    n.args.push(first)
+    while (this.eatOp(",")) {
+      if (this.isOp(")")) break
+      n.args.push(try this.test())
+    }
+    try this.needOp(")")
+    this.leave()
+    return n
+  }
+
+  listDisplay(): Node throws SyntaxError {
+    const line = this.cur().line
+    this.adv()
+    try this.enter()
+    if (this.isOp("]")) {
+      this.adv()
+      this.leave()
+      return nd("list", line)
+    }
+    const first = try this.test()
+    if (this.isKw("for")) {
+      const n = nd("listcomp", line)
+      n.args.push(first)
+      n.body = try this.clauses()
+      try this.needOp("]")
+      this.leave()
+      return n
+    }
+    const n = nd("list", line)
+    n.args.push(first)
+    while (this.eatOp(",")) {
+      if (this.isOp("]")) break
+      n.args.push(try this.test())
+    }
+    try this.needOp("]")
+    this.leave()
+    return n
+  }
+
+  dictDisplay(): Node throws SyntaxError {
+    const line = this.cur().line
+    this.adv()
+    try this.enter()
+    if (this.isOp("}")) {
+      this.adv()
+      this.leave()
+      return nd("dict", line)
+    }
+    const k = try this.test()
+    try this.needOp(":")
+    const v = try this.test()
+    if (this.isKw("for")) {
+      const n = nd("dictcomp", line)
+      n.args.push(k)
+      n.args.push(v)
+      n.body = try this.clauses()
+      try this.needOp("}")
+      this.leave()
+      return n
+    }
+    const n = nd("dict", line)
+    n.args.push(k)
+    n.args.push(v)
+    while (this.eatOp(",")) {
+      if (this.isOp("}")) break
+      const k2 = try this.test()
+      try this.needOp(":")
+      const v2 = try this.test()
+      n.args.push(k2)
+      n.args.push(v2)
+    }
+    try this.needOp("}")
+    this.leave()
+    return n
+  }
+
+  // The for and if clauses of a comprehension, kept in its body.
+  clauses(): Node[] throws SyntaxError {
+    const out: Node[] = []
+    while (true) {
+      if (out.length >= MAX_CLAUSES) throw syntaxAt(this.cur().line, "too many clauses in a comprehension")
+      if (this.isKw("for")) {
+        const line = this.cur().line
+        this.adv()
+        const tgt = try this.targetList()
+        if (!this.isKw("in")) throw syntaxAt(line, "expected 'in' in comprehension")
+        this.adv()
+        const it = try this.orTest()
+        const c = nd("cfor", line)
+        c.args.push(tgt)
+        c.args.push(it)
+        out.push(c)
+      } else if (this.isKw("if")) {
+        const line = this.cur().line
+        this.adv()
+        const cond = try this.orTest()
+        const c = nd("cif", line)
+        c.args.push(cond)
+        out.push(c)
+      } else {
+        break
+      }
+    }
+    return out
+  }
+}
+
+// The syntax tree of a program. Errors are SyntaxError with the line.
+export function parseProgram(src: string): Program throws SyntaxError {
+  const toks = try lex(src)
+  const p = new Parser(toks)
+  const body = try p.module()
+  return { body: body }
+}
+
+// ---- values ----
+
+// A runtime value. Ints, floats and bools are held inline; strings in s; containers in the heap
+// (r). t is the tool name of a tool value, whose server is in s.
+type Val = { k: string, i: int, f: f64, s: string, t: string, r: int }
+
+function val(k: string, i: int, f: f64, s: string, t: string, r: int): Val {
+  return { k: k, i: i, f: f, s: s, t: t, r: r }
+}
+
+function none(): Val {
+  return val("none", 0, 0.0, "", "", -1)
+}
+
+function unbound(): Val {
+  return val("unbound", 0, 0.0, "", "", -1)
+}
+
+function absentVal(): Val {
+  return val("absent", 0, 0.0, "", "", -1)
+}
+
+function vint(i: int): Val {
+  return val("int", i, 0.0, "", "", -1)
+}
+
+function vfloat(f: f64): Val {
+  return val("float", 0, f, "", "", -1)
+}
+
+function vstr(s: string): Val {
+  return val("str", 0, 0.0, s, "", -1)
+}
+
+function vbool(b: bool): Val {
+  return val("bool", b ? 1 : 0, 0.0, "", "", -1)
+}
+
+function isNumKind(k: string): bool {
+  return k === "int" || k === "bool" || k === "float"
+}
+
+// A number as a float (ints and bools widen).
+function numF(v: Val): f64 {
+  if (v.k === "float") return v.f
+  const x: f64 = v.i
+  return x
+}
+
+// Whether an int is within the range every int value is kept in (|x| <= 2^53).
+function inSafe(x: int): bool {
+  return x <= 9007199254740992 && x >= -9007199254740992
+}
+
+function fitsInt(f: f64): bool {
+  return f <= MAX_SAFE && f >= -MAX_SAFE
+}
+
+// Python's modulo: the result has the sign of the divisor. b must not be 0.
+function pyMod(a: int, b: int): int {
+  const r = a % b
+  if (r !== 0 && (r < 0) !== (b < 0)) return r + b
+  return r
+}
+
+function fmtFloat(f: f64): string {
+  const s = `${f}`
+  if (s.includes(".") || s.includes("e") || s.includes("N") || s.includes("I")) return s
+  return s + ".0"
+}
+
+function lowerAscii(s: string): string {
+  let out = ""
+  for (const c of s.chars()) {
+    const cp = cpOf(c)
+    out += cp >= 65 && cp <= 90 ? cpText(cp + 32) : c
+  }
+  return out
+}
+
+function upperAscii(s: string): string {
+  let out = ""
+  for (const c of s.chars()) {
+    const cp = cpOf(c)
+    out += cp >= 97 && cp <= 122 ? cpText(cp - 32) : c
+  }
+  return out
+}
+
+function isSpaceChar(c: string): bool {
+  return c === " " || c === "\t" || c === "\n" || c === "\r"
+}
+
+// Splits on runs of whitespace, dropping empty parts.
+function splitWhite(s: string): string[] {
+  const out: string[] = []
+  let cur = ""
+  for (const c of s.chars()) {
+    if (isSpaceChar(c)) {
+      if (cur !== "") out.push(cur)
+      cur = ""
+    } else {
+      cur += c
+    }
+  }
+  if (cur !== "") out.push(cur)
+  return out
+}
+
+
+// ---- the machine ----
+
+class Obj {
+  items: Val[] = []
+  keys: Val[] = []
+}
+
+class Frame {
+  names: string[] = []
+  vals: Val[] = []
+}
+
+type Pending = { server: string, tool: string, argsJson: string }
+
+class Machine {
+  lim: CodeLimits
+  servers: CodeServer[]
+  cache: ToolOut[]
+  deadline: f64
+  heap: Obj[] = []
+  funcs: Node[] = []
+  globals: Frame = new Frame()
+  steps: int = 0
+  mem: int = 0
+  edepth: int = 0
+  sdepth: int = 0
+  qdepth: int = 0
+  logBytes: int = 0
+  logs: string[] = []
+  calls: int = 0
+  depth: int = 0
+  ret: Val = none()
+  pend: Pending | undefined = undefined
+
+  constructor(lim: CodeLimits, servers: CodeServer[], cache: ToolOut[], deadline: f64, steps: int, mem: int) {
+    this.lim = lim
+    this.servers = servers
+    this.cache = cache
+    this.deadline = deadline
+    this.steps = steps
+    this.mem = mem
+  }
+
+  tick(): void throws Error {
+    this.steps += 1
+    if (this.steps > this.lim.max_steps) throw new Error(`step limit exceeded (max_steps ${this.lim.max_steps})`)
+    if ((this.steps & 255) === 0 && Date.now() > this.deadline) throw new Error("execution timed out")
+  }
+
+  charge(bytes: int): void throws Error {
+    this.mem += bytes
+    if (this.mem > this.lim.max_memory_bytes) throw new Error(`memory limit exceeded (max_memory_bytes ${this.lim.max_memory_bytes})`)
+  }
+
+  newObj(o: Obj): int {
+    this.heap.push(o)
+    return this.heap.length - 1
+  }
+
+  listOf(items: Val[], kind: string): Val throws Error {
+    try this.charge(32 + 16 * items.length)
+    const o = new Obj()
+    o.items = items
+    return val(kind, 0, 0.0, "", "", this.newObj(o))
+  }
+
+  truthy(v: Val): bool {
+    if (v.k === "none") return false
+    if (v.k === "bool" || v.k === "int") return v.i !== 0
+    if (v.k === "float") return v.f !== 0.0
+    if (v.k === "str") return v.s.byteLength > 0
+    if (v.k === "list" || v.k === "tuple" || v.k === "dict") return this.heap[v.r]!.items.length > 0
+    return true
+  }
+
+  // Equality as Starlark has it. Nesting past the bound compares unequal rather than recursing further.
+  eqVal(a: Val, b: Val): bool {
+    if (this.qdepth > MAX_EXPR_DEPTH) return false
+    this.qdepth += 1
+    const r = this.eqValNode(a, b)
+    this.qdepth -= 1
+    return r
+  }
+
+  eqValNode(a: Val, b: Val): bool {
+    if (isNumKind(a.k) && isNumKind(b.k)) return numF(a) === numF(b)
+    if (a.k !== b.k) return false
+    if (a.k === "none") return true
+    if (a.k === "str") return a.s === b.s
+    if (a.k === "list" || a.k === "tuple") {
+      const xs = this.heap[a.r]!.items
+      const ys = this.heap[b.r]!.items
+      if (xs.length !== ys.length) return false
+      for (let i = 0; i < xs.length; i++) {
+        this.steps += 1
+        if (!this.eqVal(xs[i]!, ys[i]!)) return false
+      }
+      return true
+    }
+    if (a.k === "dict") {
+      const ao = this.heap[a.r]!
+      const bo = this.heap[b.r]!
+      if (ao.keys.length !== bo.keys.length) return false
+      for (let i = 0; i < ao.keys.length; i++) {
+        const j = this.dictFind(bo, ao.keys[i]!)
+        if (j < 0 || !this.eqVal(ao.items[i]!, bo.items[j]!)) return false
+      }
+      return true
+    }
+    return a.r === b.r && a.s === b.s && a.t === b.t && a.i === b.i
+  }
+
+  // Ordering for < and sorting: numbers by value, strings by code point.
+  ltVal(a: Val, b: Val): bool throws Error {
+    if (isNumKind(a.k) && isNumKind(b.k)) return numF(a) < numF(b)
+    if (a.k === "str" && b.k === "str") return a.s < b.s
+    throw new Error(`'<' is not supported between ${this.typeName(a)} and ${this.typeName(b)}`)
+  }
+
+  typeName(v: Val): string {
+    if (v.k === "none") return "NoneType"
+    if (v.k === "tool") return "tool"
+    if (v.k === "method" || v.k === "builtin") return "function"
+    return v.k
+  }
+
+  // The index of a key in a dict, or -1.
+  dictFind(o: Obj, key: Val): int {
+    for (let i = 0; i < o.keys.length; i++) {
+      // a lookup is work: past the step limit the search stops, and the run ends at its next step
+      this.steps += 1
+      if (this.steps > this.lim.max_steps) return -1
+      if (this.eqVal(o.keys[i]!, key)) return i
+    }
+    return -1
+  }
+
+  hashable(v: Val): bool {
+    return v.k !== "list" && v.k !== "dict"
+  }
+
+  dictSet(o: Obj, key: Val, v: Val): void throws Error {
+    if (!this.hashable(key)) throw new Error(`unhashable type: ${this.typeName(key)}`)
+    const i = this.dictFind(o, key)
+    if (i >= 0) {
+      o.items[i] = v
+      return
+    }
+    try this.charge(48)
+    o.keys.push(key)
+    o.items.push(v)
+  }
+
+  lookup(name: string, fr: Frame): Val throws Error {
+    let s = slotOf(fr, name)
+    if (s >= 0 && fr.vals[s]!.k !== "unbound") return fr.vals[s]!
+    s = slotOf(this.globals, name)
+    if (s >= 0 && this.globals.vals[s]!.k !== "unbound") return this.globals.vals[s]!
+    if (BUILTINS.includes(name)) return val("builtin", 0, 0.0, name, "", -1)
+    for (const sv of this.servers) {
+      if (sv.py === name) return val("server", 0, 0.0, sv.name, "", -1)
+    }
+    throw new Error(`name '${name}' is not defined`)
+  }
+
+  setName(fr: Frame, name: string, v: Val): void {
+    const s = slotOf(fr, name)
+    if (s >= 0) {
+      fr.vals[s] = v
+      return
+    }
+    fr.names.push(name)
+    fr.vals.push(v)
+  }
+
+  // Runs one expression. The nesting is counted, since a long chain of operators nests as deep as it is long.
+  ev(n: Node, fr: Frame): Val throws Error {
+    this.edepth += 1
+    if (this.edepth > MAX_EXPR_DEPTH) throw new Error("expression nests too deeply")
+    const v = try this.evNode(n, fr)
+    this.edepth -= 1
+    return v
+  }
+
+  evNode(n: Node, fr: Frame): Val throws Error {
+    try this.tick()
+    switch (n.kind) {
+      case "int": return vint(Math.trunc(n.n))
+      case "float": return vfloat(n.n)
+      case "str":
+        try this.charge(n.s.byteLength + 16)
+        return vstr(n.s)
+      case "const":
+        if (n.s === "True") return vbool(true)
+        if (n.s === "False") return vbool(false)
+        return none()
+      case "name": return try this.lookup(n.s, fr)
+      case "list":
+      case "tuple": {
+        const items: Val[] = []
+        for (const a of n.args) items.push(try this.ev(a, fr))
+        return try this.listOf(items, n.kind)
+      }
+      case "dict": {
+        try this.charge(32)
+        const o = new Obj()
+        let i = 0
+        while (i < n.args.length) {
+          const k = try this.ev(n.args[i]!, fr)
+          const v = try this.ev(n.args[i + 1]!, fr)
+          try this.dictSet(o, k, v)
+          i += 2
+        }
+        return val("dict", 0, 0.0, "", "", this.newObj(o))
+      }
+      case "listcomp":
+      case "dictcomp":
+        return try this.comprehension(n, fr)
+      case "attr": {
+        const obj = try this.ev(n.args[0]!, fr)
+        return try this.getAttr(obj, n.s)
+      }
+      case "index": {
+        const obj = try this.ev(n.args[0]!, fr)
+        const ix = try this.ev(n.args[1]!, fr)
+        return try this.getIndex(obj, ix)
+      }
+      case "slice": {
+        const obj = try this.ev(n.args[0]!, fr)
+        const lo = try this.optional(n.args[1]!, fr)
+        const hi = try this.optional(n.args[2]!, fr)
+        return try this.getSlice(obj, lo, hi)
+      }
+      case "call": {
+        const fv = try this.ev(n.args[0]!, fr)
+        const argv: Val[] = []
+        const kwn: string[] = []
+        for (let i = 1; i < n.args.length; i++) {
+          argv.push(try this.ev(n.args[i]!, fr))
+          kwn.push(n.kw[i] ?? "")
+        }
+        return try this.call(fv, argv, kwn)
+      }
+      case "unop": {
+        const x = try this.ev(n.args[0]!, fr)
+        return try this.unop(n.s, x)
+      }
+      case "binop": {
+        const l = try this.ev(n.args[0]!, fr)
+        const r = try this.ev(n.args[1]!, fr)
+        return try this.binop(n.s, l, r)
+      }
+      case "cmp": {
+        const l = try this.ev(n.args[0]!, fr)
+        const r = try this.ev(n.args[1]!, fr)
+        return vbool(try this.compare(n.s, l, r))
+      }
+      case "and": {
+        const l = try this.ev(n.args[0]!, fr)
+        if (!this.truthy(l)) return l
+        return try this.ev(n.args[1]!, fr)
+      }
+      case "or": {
+        const l = try this.ev(n.args[0]!, fr)
+        if (this.truthy(l)) return l
+        return try this.ev(n.args[1]!, fr)
+      }
+      case "ifexp": {
+        const c = try this.ev(n.args[0]!, fr)
+        if (this.truthy(c)) return try this.ev(n.args[1]!, fr)
+        return try this.ev(n.args[2]!, fr)
+      }
+      default:
+        throw new Error(`unsupported expression ${n.kind}`)
+    }
+  }
+
+  // An optional slice bound: absent gives none.
+  optional(n: Node, fr: Frame): Val throws Error {
+    if (n.kind === "absent") return none()
+    return try this.ev(n, fr)
+  }
+
+  comprehension(n: Node, fr: Frame): Val throws Error {
+    let names: string[] = []
+    for (const c of n.body) {
+      if (c.kind === "cfor") collectNames(c.args[0]!, &names)
+    }
+    // the loop variables are local to the comprehension: their outer values come back afterwards
+    const saved: Val[] = []
+    for (const nm of names) {
+      const s = slotOf(fr, nm)
+      saved.push(s >= 0 ? fr.vals[s]! : unbound())
+    }
+    const o = new Obj()
+    const isDict = n.kind === "dictcomp"
+    try this.comp(n, 0, fr, o, isDict)
+    for (let i = 0; i < names.length; i++) this.setName(fr, names[i]!, saved[i]!)
+    if (isDict) {
+      try this.charge(32)
+      return val("dict", 0, 0.0, "", "", this.newObj(o))
+    }
+    try this.charge(32 + 16 * o.items.length)
+    return val("list", 0, 0.0, "", "", this.newObj(o))
+  }
+
+  comp(n: Node, ci: int, fr: Frame, o: Obj, isDict: bool): void throws Error {
+    if (ci === n.body.length) {
+      if (isDict) {
+        const k = try this.ev(n.args[0]!, fr)
+        const v = try this.ev(n.args[1]!, fr)
+        try this.dictSet(o, k, v)
+      } else {
+        const v = try this.ev(n.args[0]!, fr)
+        try this.charge(16)
+        o.items.push(v)
+      }
+      return
+    }
+    const c = n.body[ci]!
+    if (c.kind === "cif") {
+      const cond = try this.ev(c.args[0]!, fr)
+      if (this.truthy(cond)) try this.comp(n, ci + 1, fr, o, isDict)
+      return
+    }
+    const seq = try this.iterate(try this.ev(c.args[1]!, fr))
+    for (const item of seq) {
+      try this.assignTo(c.args[0]!, item, fr)
+      try this.comp(n, ci + 1, fr, o, isDict)
+    }
+  }
+
+  // The values a for loop or unpacking visits.
+  iterate(v: Val): Val[] throws Error {
+    if (v.k === "list" || v.k === "tuple") return this.heap[v.r]!.items
+    if (v.k === "dict") return this.heap[v.r]!.keys
+    if (v.k === "str") {
+      const out: Val[] = []
+      for (const c of v.s.chars()) out.push(vstr(c))
+      return out
+    }
+    throw new Error(`${this.typeName(v)} object is not iterable`)
+  }
+
+  // Runs one statement and reports how control leaves it: 0 normally, 1 break, 2 continue, 3 return.
+  exec(n: Node, fr: Frame): int throws Error {
+    try this.tick()
+    switch (n.kind) {
+      case "expr":
+        try this.ev(n.args[0]!, fr)
+        return 0
+      case "assign": {
+        const v = try this.ev(n.args[1]!, fr)
+        try this.assignTo(n.args[0]!, v, fr)
+        return 0
+      }
+      case "aug": {
+        const cur = try this.ev(n.args[0]!, fr)
+        const rhs = try this.ev(n.args[1]!, fr)
+        if (cur.k === "list" && n.s === "+") {
+          // a list grows in place, as in Python
+          const add = try this.iterate(rhs)
+          const o = this.heap[cur.r]!
+          for (const x of add) o.items.push(x)
+          return 0
+        }
+        const res = try this.binop(n.s, cur, rhs)
+        try this.assignTo(n.args[0]!, res, fr)
+        return 0
+      }
+      case "if": {
+        const c = try this.ev(n.args[0]!, fr)
+        if (this.truthy(c)) return try this.exec(n.args[1]!, fr)
+        if (n.args.length > 2) return try this.exec(n.args[2]!, fr)
+        return 0
+      }
+      case "for": {
+        const seq = try this.iterate(try this.ev(n.args[1]!, fr))
+        for (const item of seq) {
+          try this.assignTo(n.args[0]!, item, fr)
+          const sig = try this.exec(n.args[2]!, fr)
+          if (sig === 1) break
+          if (sig === 3) return 3
+        }
+        return 0
+      }
+      case "def": {
+        const defaults: Val[] = []
+        for (const d of n.args) {
+          if (d.kind === "absent") defaults.push(absentVal())
+          else defaults.push(try this.ev(d, fr))
+        }
+        const ob = new Obj()
+        ob.items = defaults
+        try this.charge(64 + 16 * defaults.length)
+        this.funcs.push(n)
+        const fv = val("func", this.funcs.length - 1, 0.0, n.s, "", this.newObj(ob))
+        this.setName(fr, n.s, fv)
+        return 0
+      }
+      case "return":
+        if (n.args.length > 0) this.ret = try this.ev(n.args[0]!, fr)
+        else this.ret = none()
+        return 3
+      case "break":
+        return 1
+      case "continue":
+        return 2
+      case "pass":
+        return 0
+      case "block":
+        return try this.execBlock(n.body, fr)
+      default:
+        throw new Error(`unsupported statement ${n.kind}`)
+    }
+  }
+
+  execBlock(stmts: Node[], fr: Frame): int throws Error {
+    for (const s of stmts) {
+      const sig = try this.exec(s, fr)
+      if (sig !== 0) return sig
+    }
+    return 0
+  }
+
+  // Stores v into a target: a name, an index, or a tuple of those.
+  assignTo(t: Node, v: Val, fr: Frame): void throws Error {
+    if (t.kind === "name") {
+      this.setName(fr, t.s, v)
+      return
+    }
+    if (t.kind === "tuple" || t.kind === "list") {
+      const xs = try this.iterate(v)
+      if (xs.length !== t.args.length) throw new Error(`unpacking needs ${t.args.length} values, got ${xs.length}`)
+      for (let i = 0; i < xs.length; i++) try this.assignTo(t.args[i]!, xs[i]!, fr)
+      return
+    }
+    if (t.kind === "index") {
+      const obj = try this.ev(t.args[0]!, fr)
+      const ix = try this.ev(t.args[1]!, fr)
+      try this.setIndex(obj, ix, v)
+      return
+    }
+    throw new Error("cannot assign to this expression")
+  }
+
+  setIndex(obj: Val, ix: Val, v: Val): void throws Error {
+    if (obj.k === "list") {
+      const o = this.heap[obj.r]!
+      const i = try this.position(ix, o.items.length)
+      o.items[i] = v
+      return
+    }
+    if (obj.k === "dict") {
+      try this.dictSet(this.heap[obj.r]!, ix, v)
+      return
+    }
+    throw new Error(`'${this.typeName(obj)}' object does not support item assignment`)
+  }
+
+  // A list index, negative from the end, checked against the length.
+  position(ix: Val, len: int): int throws Error {
+    if (ix.k !== "int" && ix.k !== "bool") throw new Error("indices must be integers")
+    let i = ix.i
+    if (i < 0) i += len
+    if (i < 0 || i >= len) throw new Error("index out of range")
+    return i
+  }
+
+  getAttr(obj: Val, name: string): Val throws Error {
+    if (obj.k === "server") {
+      for (const sv of this.servers) {
+        if (sv.name !== obj.s) continue
+        for (const t of sv.tools) {
+          if (t.py === name) return val("tool", 0, 0.0, sv.name, t.name, -1)
+        }
+        throw new Error(`server ${sv.py} has no tool ${name}`)
+      }
+      throw new Error(`server ${obj.s} is not connected`)
+    }
+    let ok = false
+    if (obj.k === "str") ok = STR_METHODS.includes(name)
+    if (obj.k === "list") ok = LIST_METHODS.includes(name)
+    if (obj.k === "dict") ok = DICT_METHODS.includes(name)
+    if (!ok) throw new Error(`'${this.typeName(obj)}' object has no attribute '${name}'`)
+    try this.charge(32)
+    const o = new Obj()
+    o.items = [obj]
+    return val("method", 0, 0.0, name, "", this.newObj(o))
+  }
+
+  getIndex(obj: Val, ix: Val): Val throws Error {
+    if (obj.k === "list" || obj.k === "tuple") {
+      const xs = this.heap[obj.r]!.items
+      return xs[try this.position(ix, xs.length)]!
+    }
+    if (obj.k === "str") {
+      const cs = obj.s.chars()
+      return vstr(cs[try this.position(ix, cs.length)]!)
+    }
+    if (obj.k === "dict") {
+      const o = this.heap[obj.r]!
+      const i = this.dictFind(o, ix)
+      if (i < 0) throw new Error(`key not found: ${this.toStr(ix, true)}`)
+      return o.items[i]!
+    }
+    throw new Error(`'${this.typeName(obj)}' object is not subscriptable`)
+  }
+
+  getSlice(obj: Val, lo: Val, hi: Val): Val throws Error {
+    if (obj.k === "str") {
+      const cs = obj.s.chars()
+      const r = sliceBounds(lo, hi, cs.length)
+      let out = ""
+      for (let i = r.from; i < r.to; i++) out += cs[i]!
+      return vstr(out)
+    }
+    if (obj.k === "list" || obj.k === "tuple") {
+      const xs = this.heap[obj.r]!.items
+      const r = sliceBounds(lo, hi, xs.length)
+      const out: Val[] = []
+      for (let i = r.from; i < r.to; i++) out.push(xs[i]!)
+      return try this.listOf(out, obj.k)
+    }
+    throw new Error(`'${this.typeName(obj)}' object is not sliceable`)
+  }
+
+  unop(op: string, x: Val): Val throws Error {
+    if (op === "not") return vbool(!this.truthy(x))
+    if (!isNumKind(x.k)) throw new Error(`bad operand type for unary ${op}: ${this.typeName(x)}`)
+    if (x.k === "float") return vfloat(op === "-" ? -x.f : x.f)
+    if (op === "+") return vint(x.i)
+    return vint(-x.i)
+  }
+
+  binop(op: string, l: Val, r: Val): Val throws Error {
+    if (op === "%" && l.k === "str") return vstr(try this.format(l.s, r))
+    if (isNumKind(l.k) && isNumKind(r.k)) return try this.arithmetic(op, l, r)
+    if (op === "+" && l.k === "str" && r.k === "str") {
+      try this.charge(l.s.byteLength + r.s.byteLength)
+      return vstr(l.s + r.s)
+    }
+    if (op === "+" && (l.k === "list" || l.k === "tuple") && r.k === l.k) {
+      const xs = this.heap[l.r]!.items
+      const ys = this.heap[r.r]!.items
+      const out: Val[] = []
+      for (const x of xs) out.push(x)
+      for (const y of ys) out.push(y)
+      return try this.listOf(out, l.k)
+    }
+    if (op === "*" && ((l.k === "str" && r.k === "int") || (l.k === "int" && r.k === "str"))) {
+      const s = l.k === "str" ? l.s : r.s
+      const n = l.k === "int" ? l.i : r.i
+      if (n <= 0) return vstr("")
+      const want: f64 = (s.byteLength + 0.0) * (n + 0.0)
+      if (want > this.lim.max_memory_bytes + 0.0) throw new Error(`memory limit exceeded (max_memory_bytes ${this.lim.max_memory_bytes})`)
+      try this.charge(s.byteLength * n)
+      let out = ""
+      for (let i = 0; i < n; i++) out += s
+      return vstr(out)
+    }
+    throw new Error(`unsupported operand types for ${op}: ${this.typeName(l)} and ${this.typeName(r)}`)
+  }
+
+  arithmetic(op: string, l: Val, r: Val): Val throws Error {
+    const bothInt = l.k !== "float" && r.k !== "float"
+    if (bothInt && op !== "/") {
+      // operands stay within 2^53, so a sum cannot overflow int64; a product is checked as a float first
+      if (op === "+" || op === "-") {
+        const s = op === "+" ? l.i + r.i : l.i - r.i
+        if (!inSafe(s)) throw new Error("integer overflow")
+        return vint(s)
+      }
+      if (op === "*") {
+        const approx = numF(l) * numF(r)
+        if (approx > 9.0e18 || approx < -9.0e18) throw new Error("integer overflow")
+        const p = l.i * r.i
+        if (!inSafe(p)) throw new Error("integer overflow")
+        return vint(p)
+      }
+      if (r.i === 0) throw new Error(op === "%" ? "integer division or modulo by zero" : "integer division by zero")
+      if (op === "%") return vint(pyMod(l.i, r.i))
+      if (op === "//") {
+        const m = pyMod(l.i, r.i)
+        return vint(Math.trunc((l.i - m) / r.i))
+      }
+      throw new Error(`unsupported operator ${op}`)
+    }
+    const a = numF(l)
+    const b = numF(r)
+    if (op === "+") return vfloat(a + b)
+    if (op === "-") return vfloat(a - b)
+    if (op === "*") return vfloat(a * b)
+    if (op === "/") {
+      if (b === 0.0) throw new Error("division by zero")
+      return vfloat(a / b)
+    }
+    if (b === 0.0) throw new Error("float modulo or division by zero")
+    if (op === "//") {
+      const q: f64 = Math.floor(a / b)
+      return vfloat(q)
+    }
+    if (op === "%") return vfloat(a - b * Math.floor(a / b))
+    throw new Error(`unsupported operator ${op}`)
+  }
+
+  compare(op: string, l: Val, r: Val): bool throws Error {
+    if (op === "==") return this.eqVal(l, r)
+    if (op === "!=") return !this.eqVal(l, r)
+    if (op === "in" || op === "not in") {
+      const found = try this.contains(r, l)
+      return op === "in" ? found : !found
+    }
+    if (op === "<") return try this.ltVal(l, r)
+    if (op === ">") return try this.ltVal(r, l)
+    if (op === "<=") {
+      const gt = try this.ltVal(r, l)
+      return !gt
+    }
+    const ge = try this.ltVal(l, r)
+    return !ge
+  }
+
+  contains(container: Val, item: Val): bool throws Error {
+    if (container.k === "str") {
+      if (item.k !== "str") throw new Error("'in <string>' requires string as left operand")
+      return container.s.includes(item.s)
+    }
+    if (container.k === "dict") return this.dictFind(this.heap[container.r]!, item) >= 0
+    if (container.k === "list" || container.k === "tuple") {
+      for (const x of this.heap[container.r]!.items) {
+        this.steps += 1
+        if (this.eqVal(x, item)) return true
+      }
+      return false
+    }
+    throw new Error(`argument of type '${this.typeName(container)}' is not iterable`)
+  }
+
+  // Calls a function value with positional and keyword arguments.
+  call(fv: Val, args: Val[], kwn: string[]): Val throws Error {
+    if (fv.k === "builtin") return try this.builtin(fv.s, args, kwn)
+    if (fv.k === "method") return try this.method(this.heap[fv.r]!.items[0]!, fv.s, args, kwn)
+    if (fv.k === "func") return try this.callFunc(fv, args, kwn)
+    if (fv.k === "tool") return try this.toolCall(fv.s, fv.t, args, kwn)
+    throw new Error(`'${this.typeName(fv)}' object is not callable`)
+  }
+
+  callFunc(fv: Val, args: Val[], kwn: string[]): Val throws Error {
+    const def = this.funcs[fv.i]!
+    const defaults = this.heap[fv.r]!.items
+    const local = new Frame()
+    for (const nm of def.names) {
+      local.names.push(nm)
+      local.vals.push(unbound())
+    }
+    let pos = 0
+    for (let j = 0; j < args.length; j++) {
+      const k = kwn[j] ?? ""
+      if (k === "") {
+        if (pos >= def.names.length) throw new Error(`${def.s}() takes ${def.names.length} arguments but ${args.length} were given`)
+        if (local.vals[pos]!.k !== "unbound") throw new Error(`${def.s}() got multiple values for '${def.names[pos]!}'`)
+        local.vals[pos] = args[j]!
+        pos += 1
+        continue
+      }
+      const idx = def.names.indexOf(k)
+      if (idx < 0) throw new Error(`${def.s}() got an unexpected keyword argument '${k}'`)
+      if (local.vals[idx]!.k !== "unbound") throw new Error(`${def.s}() got multiple values for '${k}'`)
+      local.vals[idx] = args[j]!
+    }
+    for (let i = 0; i < def.names.length; i++) {
+      if (local.vals[i]!.k !== "unbound") continue
+      const d = defaults[i]!
+      if (d.k === "absent") throw new Error(`${def.s}() is missing argument '${def.names[i]!}'`)
+      local.vals[i] = d
+    }
+    this.depth += 1
+    if (this.depth > MAX_CALL_DEPTH) throw new Error("maximum call depth exceeded")
+    const sig = try this.execBlock(def.body, local)
+    this.depth -= 1
+    if (sig === 3) {
+      const r = this.ret
+      this.ret = none()
+      return r
+    }
+    return none()
+  }
+
+  // server.tool(...): suspends the run unless the result is cached.
+  toolCall(server: string, tool: string, args: Val[], kwn: string[]): Val throws Error {
+    if (args.length > 0 && kwn.some((k) => k === "")) throw new Error(`${server}.${tool} takes keyword arguments: ${server}.${tool}(param=value)`)
+    const pairs: string[] = []
+    for (let i = 0; i < args.length; i++) {
+      const vj = try this.valJson(args[i]!, 0)
+      pairs.push(quote(kwn[i]!) + ":" + vj)
+    }
+    const argsJson = "{" + pairs.join(",") + "}"
+    if (argsJson.byteLength > this.lim.max_value_bytes) throw new Error(`tool arguments exceed max_value_bytes (${this.lim.max_value_bytes})`)
+    const idx = this.calls
+    this.calls += 1
+    if (idx < this.cache.length) {
+      const out = this.cache[idx]!
+      if (out.isError) throw new Error(`${server}.${tool} failed: ${out.text}`)
+      return try this.parseResult(out.text)
+    }
+    if (idx >= this.lim.max_tool_calls) throw new Error(`tool call limit exceeded (max_tool_calls ${this.lim.max_tool_calls})`)
+    this.pend = { server: server, tool: tool, argsJson: argsJson }
+    throw new Error("tool call pending")
+  }
+
+  // A tool result: its text as a value when it is JSON, else the text itself.
+  parseResult(text: string): Val throws Error {
+    if (text.byteLength > this.lim.max_value_bytes) throw new Error(`tool result exceeds max_value_bytes (${this.lim.max_value_bytes})`)
+    try this.charge(text.byteLength)
+    const b = new TextEncoder().encode(text)
+    try {
+      const r = try this.jsonAt(b, skipWs(b, 0), 0)
+      if (skipWs(b, r.end) !== b.length) return vstr(text)
+      return r.v
+    } catch (e) {
+      if (e instanceof SyntaxError) return vstr(text)
+      throw e
+    }
+  }
+
+  // One JSON value at b[i]. Objects become dicts, arrays lists, numbers int or float.
+  jsonAt(b: u8[], i: int, depth: int): { v: Val, end: int } throws Error {
+    if (depth > this.lim.max_nesting_depth) throw new Error(`tool result nests deeper than max_nesting_depth (${this.lim.max_nesting_depth})`)
+    const c = byteAt(b, i)
+    if (c === 123) {
+      const o = new Obj()
+      let j = skipWs(b, i + 1)
+      if (byteAt(b, j) === 125) return { v: val("dict", 0, 0.0, "", "", this.newObj(o)), end: j + 1 }
+      while (true) {
+        const k = try jsonStr(b, j)
+        j = skipWs(b, k.end)
+        if (byteAt(b, j) !== 58) throw new SyntaxError("expected ':'")
+        const v = try this.jsonAt(b, skipWs(b, j + 1), depth + 1)
+        try this.dictSet(o, vstr(k.s), v.v)
+        j = skipWs(b, v.end)
+        if (byteAt(b, j) === 44) {
+          j = skipWs(b, j + 1)
+          continue
+        }
+        if (byteAt(b, j) !== 125) throw new SyntaxError("expected '}'")
+        return { v: val("dict", 0, 0.0, "", "", this.newObj(o)), end: j + 1 }
+      }
+    }
+    if (c === 91) {
+      const items: Val[] = []
+      let j = skipWs(b, i + 1)
+      if (byteAt(b, j) === 93) return { v: try this.listOf(items, "list"), end: j + 1 }
+      while (true) {
+        const v = try this.jsonAt(b, j, depth + 1)
+        items.push(v.v)
+        j = skipWs(b, v.end)
+        if (byteAt(b, j) === 44) {
+          j = skipWs(b, j + 1)
+          continue
+        }
+        if (byteAt(b, j) !== 93) throw new SyntaxError("expected ']'")
+        return { v: try this.listOf(items, "list"), end: j + 1 }
+      }
+    }
+    if (c === 34) {
+      const s = try jsonStr(b, i)
+      try this.charge(s.s.byteLength + 16)
+      return { v: vstr(s.s), end: s.end }
+    }
+    if (c === 116 && txt(b, i, i + 4) === "true") return { v: vbool(true), end: i + 4 }
+    if (c === 102 && txt(b, i, i + 5) === "false") return { v: vbool(false), end: i + 5 }
+    if (c === 110 && txt(b, i, i + 4) === "null") return { v: none(), end: i + 4 }
+    if (c === 45 || isDigitB(c)) {
+      let j = i + 1
+      let isFloat = false
+      while (j < b.length) {
+        const d = byteAt(b, j)
+        if (isDigitB(d)) {
+          j += 1
+        } else if (d === 46 || d === 101 || d === 69 || d === 43 || d === 45) {
+          isFloat = true
+          j += 1
+        } else {
+          break
+        }
+      }
+      const f = parseFloat(txt(b, i, j))
+      if (f === undefined) throw new SyntaxError("invalid number")
+      if (!isFloat && fitsInt(f)) return { v: vint(Math.trunc(f)), end: j }
+      return { v: vfloat(f), end: j }
+    }
+    throw new SyntaxError("invalid JSON value")
+  }
+
+  // A value as JSON text, for a tool argument or the result.
+  valJson(v: Val, depth: int): string throws Error {
+    if (depth > this.lim.max_nesting_depth) throw new Error(`value nests deeper than max_nesting_depth (${this.lim.max_nesting_depth})`)
+    if (v.k === "none") return "null"
+    if (v.k === "bool") return v.i !== 0 ? "true" : "false"
+    if (v.k === "int") return `${v.i}`
+    if (v.k === "float") {
+      if (v.f !== v.f || v.f > 1.7976931348623157e308 || v.f < -1.7976931348623157e308) throw new Error("NaN and infinity are not JSON")
+      return `${v.f}`
+    }
+    if (v.k === "str") return quote(v.s)
+    if (v.k === "list" || v.k === "tuple") {
+      const parts: string[] = []
+      for (const x of this.heap[v.r]!.items) parts.push(try this.valJson(x, depth + 1))
+      return "[" + parts.join(",") + "]"
+    }
+    if (v.k === "dict") {
+      const o = this.heap[v.r]!
+      const parts: string[] = []
+      for (let i = 0; i < o.keys.length; i++) {
+        const key = o.keys[i]!
+        const ks = key.k === "str" ? key.s : this.toStr(key, false)
+        const vj = try this.valJson(o.items[i]!, depth + 1)
+        parts.push(quote(ks) + ":" + vj)
+      }
+      return "{" + parts.join(",") + "}"
+    }
+    throw new Error(`${this.typeName(v)} values are not JSON`)
+  }
+
+  // str() and repr() of a value. Nesting past the bound prints as "...".
+  toStr(v: Val, repr: bool): string {
+    if (this.sdepth > MAX_EXPR_DEPTH) return "..."
+    this.sdepth += 1
+    const out = this.toStrNode(v, repr)
+    this.sdepth -= 1
+    return out
+  }
+
+  toStrNode(v: Val, repr: bool): string {
+    if (v.k === "none") return "None"
+    if (v.k === "bool") return v.i !== 0 ? "True" : "False"
+    if (v.k === "int") return `${v.i}`
+    if (v.k === "float") return fmtFloat(v.f)
+    if (v.k === "str") return repr ? quote(v.s) : v.s
+    if (v.k === "list" || v.k === "tuple") {
+      const parts: string[] = []
+      for (const x of this.heap[v.r]!.items) parts.push(this.toStr(x, true))
+      if (v.k === "list") return "[" + parts.join(", ") + "]"
+      if (parts.length === 1) return "(" + parts[0]! + ",)"
+      return "(" + parts.join(", ") + ")"
+    }
+    if (v.k === "dict") {
+      const o = this.heap[v.r]!
+      const parts: string[] = []
+      for (let i = 0; i < o.keys.length; i++) parts.push(this.toStr(o.keys[i]!, true) + ": " + this.toStr(o.items[i]!, true))
+      return "{" + parts.join(", ") + "}"
+    }
+    if (v.k === "tool") return `<tool ${v.s}.${v.t}>`
+    if (v.k === "server") return `<server ${v.s}>`
+    return `<${v.k}>`
+  }
+
+  // The % operator on a string: %s, %r, %d, %i, %f and %%.
+  format(fmt: string, arg: Val): string throws Error {
+    const args: Val[] = arg.k === "tuple" ? this.heap[arg.r]!.items : [arg]
+    const cs = fmt.chars()
+    let out = ""
+    let ai = 0
+    for (let i = 0; i < cs.length; i++) {
+      const c = cs[i]!
+      if (c !== "%") {
+        out += c
+        continue
+      }
+      i += 1
+      const d = cs[i] ?? ""
+      if (d === "%") {
+        out += "%"
+        continue
+      }
+      if (ai >= args.length) throw new Error("not enough arguments for format string")
+      const v = args[ai]!
+      ai += 1
+      if (d === "s") out += this.toStr(v, false)
+      else if (d === "r") out += this.toStr(v, true)
+      else if (d === "d" || d === "i") {
+        if (!isNumKind(v.k)) throw new Error(`%${d} format needs a number`)
+        out += `${Math.trunc(numF(v))}`
+      } else if (d === "f") {
+        if (!isNumKind(v.k)) throw new Error("%f format needs a number")
+        out += `${numF(v)}`
+      } else throw new Error(`unsupported format character '${d}'`)
+    }
+    if (ai !== args.length) throw new Error("not all arguments converted during string formatting")
+    try this.charge(out.byteLength)
+    return out
+  }
+
+  print(args: Val[], kwn: string[]): Val throws Error {
+    for (const k of kwn) {
+      if (k !== "") throw new Error(`print() got an unexpected keyword argument '${k}'`)
+    }
+    const parts: string[] = []
+    for (const a of args) parts.push(this.toStr(a, false))
+    const line = parts.join(" ")
+    this.logBytes += line.byteLength + 1
+    if (this.logBytes > this.lim.max_log_bytes) throw new Error(`print output exceeds max_log_bytes (${this.lim.max_log_bytes})`)
+    this.logs.push(line)
+    return none()
+  }
+
+  builtin(name: string, args: Val[], kwn: string[]): Val throws Error {
+    if (name !== "dict" && name !== "print") {
+      for (const k of kwn) {
+        if (k !== "") throw new Error(`${name}() takes no keyword arguments`)
+      }
+    }
+    if (name === "print") return try this.print(args, kwn)
+    if (name === "len") {
+      try one(name, args)
+      const x = args[0]!
+      if (x.k === "str") return vint(x.s.chars().length)
+      if (x.k === "list" || x.k === "tuple" || x.k === "dict") return vint(this.heap[x.r]!.items.length)
+      throw new Error(`object of type '${this.typeName(x)}' has no len()`)
+    }
+    if (name === "range") return try this.range(args)
+    if (name === "enumerate") {
+      const xs = try this.iterate(args[0] ?? none())
+      const out: Val[] = []
+      for (let i = 0; i < xs.length; i++) out.push(try this.pair(vint(i), xs[i]!))
+      return try this.listOf(out, "list")
+    }
+    if (name === "zip") {
+      const seqs: Val[][] = []
+      let n = -1
+      for (const a of args) {
+        const xs = try this.iterate(a)
+        seqs.push(xs)
+        if (n < 0 || xs.length < n) n = xs.length
+      }
+      const out: Val[] = []
+      for (let i = 0; i < n; i++) {
+        const row: Val[] = []
+        for (const s of seqs) row.push(s[i]!)
+        out.push(try this.listOf(row, "tuple"))
+      }
+      return try this.listOf(out, "list")
+    }
+    if (name === "sorted") {
+      const xs = try this.iterate(args[0] ?? none())
+      const sorted = try this.sortVals(xs)
+      return try this.listOf(sorted, "list")
+    }
+    if (name === "reversed") {
+      const xs = try this.iterate(args[0] ?? none())
+      const out: Val[] = []
+      for (let i = xs.length - 1; i >= 0; i--) out.push(xs[i]!)
+      return try this.listOf(out, "list")
+    }
+    if (name === "min" || name === "max") {
+      const xs = args.length === 1 ? try this.iterate(args[0]!) : args
+      if (xs.length === 0) throw new Error(`${name}() arg is an empty sequence`)
+      let best = xs[0]!
+      for (let i = 1; i < xs.length; i++) {
+        const x = xs[i]!
+        const less = name === "min" ? try this.ltVal(x, best) : try this.ltVal(best, x)
+        if (less) best = x
+      }
+      return best
+    }
+    if (name === "int") return try this.toInt(args)
+    if (name === "float") {
+      try one(name, args)
+      const x = args[0]!
+      if (isNumKind(x.k)) return vfloat(numF(x))
+      if (x.k === "str") {
+        const f = parseFloat(x.s.trim())
+        if (f === undefined) throw new Error(`could not convert string to float: ${this.toStr(x, true)}`)
+        return vfloat(f)
+      }
+      throw new Error(`float() argument must be a number or string`)
+    }
+    if (name === "str") return vstr(args.length === 0 ? "" : this.toStr(args[0]!, false))
+    if (name === "repr") {
+      try one(name, args)
+      return vstr(this.toStr(args[0]!, true))
+    }
+    if (name === "bool") return vbool(args.length === 0 ? false : this.truthy(args[0]!))
+    if (name === "list" || name === "tuple") {
+      const xs: Val[] = []
+      if (args.length > 0) {
+        const got = try this.iterate(args[0]!)
+        for (const g of got) xs.push(g)
+      }
+      const out: Val[] = []
+      for (const x of xs) out.push(x)
+      return try this.listOf(out, name)
+    }
+    if (name === "dict") {
+      try this.charge(32)
+      const o = new Obj()
+      for (let i = 0; i < args.length; i++) {
+        const k = kwn[i] ?? ""
+        if (k !== "") {
+          try this.dictSet(o, vstr(k), args[i]!)
+          continue
+        }
+        for (const pr of try this.iterate(args[i]!)) {
+          const kv = try this.iterate(pr)
+          if (kv.length !== 2) throw new Error("dict() needs pairs of two values")
+          try this.dictSet(o, kv[0]!, kv[1]!)
+        }
+      }
+      return val("dict", 0, 0.0, "", "", this.newObj(o))
+    }
+    if (name === "chr") {
+      try one(name, args)
+      const x = args[0]!
+      if (x.k !== "int") throw new Error("chr() needs an int")
+      if (x.i < 0 || x.i > 0x10ffff || (x.i >= 0xd800 && x.i <= 0xdfff)) throw new Error("chr() arg not in range")
+      return vstr(cpText(x.i))
+    }
+    if (name === "ord") {
+      try one(name, args)
+      const x = args[0]!
+      if (x.k !== "str" || x.s.chars().length !== 1) throw new Error("ord() expected a character")
+      return vint(cpOf(x.s))
+    }
+    if (name === "any" || name === "all") {
+      const xs = try this.iterate(args[0] ?? none())
+      for (const x of xs) {
+        if (this.truthy(x) !== (name === "any")) return vbool(name === "all" ? false : true)
+      }
+      return vbool(name === "all")
+    }
+    throw new Error(`unsupported builtin ${name}`)
+  }
+
+  pair(a: Val, b: Val): Val throws Error {
+    return try this.listOf([a, b], "tuple")
+  }
+
+  range(args: Val[]): Val throws Error {
+    if (args.length < 1 || args.length > 3) throw new Error("range() takes 1 to 3 arguments")
+    for (const a of args) {
+      if (a.k !== "int" && a.k !== "bool") throw new Error("range() arguments must be integers")
+    }
+    let start = 0
+    let stop = args[0]!.i
+    let step = 1
+    if (args.length > 1) {
+      start = args[0]!.i
+      stop = args[1]!.i
+    }
+    if (args.length > 2) step = args[2]!.i
+    if (step === 0) throw new Error("range() step must not be zero")
+    let count = 0
+    if (step > 0 && stop > start) count = Math.floor((stop - start - 1) / step) + 1
+    if (step < 0 && start > stop) count = Math.floor((start - stop - 1) / (0 - step)) + 1
+    try this.charge(16 * count)
+    const out: Val[] = []
+    let x = start
+    for (let i = 0; i < count; i++) {
+      out.push(vint(x))
+      x += step
+    }
+    return try this.listOf(out, "list")
+  }
+
+  toInt(args: Val[]): Val throws Error {
+    if (args.length === 0) return vint(0)
+    try one("int", args)
+    const x = args[0]!
+    if (x.k === "int" || x.k === "bool") return vint(x.i)
+    if (x.k === "float") {
+      if (!fitsInt(x.f)) throw new Error("int() out of range")
+      return vint(Math.trunc(x.f))
+    }
+    if (x.k === "str") {
+      const n = parseInt(x.s.trim())
+      if (n === undefined || !fitsInt(n)) throw new Error(`invalid literal for int(): ${this.toStr(x, true)}`)
+      return vint(n)
+    }
+    throw new Error(`int() argument must be a number or string`)
+  }
+
+  // Methods of str, list and dict.
+  method(recv: Val, name: string, args: Val[], kwn: string[]): Val throws Error {
+    for (const k of kwn) {
+      if (k !== "") throw new Error(`${name}() takes no keyword arguments`)
+    }
+    if (recv.k === "str") return try this.strMethod(recv.s, name, args)
+    if (recv.k === "list") return try this.listMethod(recv, name, args)
+    if (recv.k === "dict") return try this.dictMethod(recv, name, args)
+    throw new Error(`'${this.typeName(recv)}' object has no attribute '${name}'`)
+  }
+
+  strArg(args: Val[], i: int, name: string): string throws Error {
+    const a = args[i]
+    if (a === undefined || a.k !== "str") throw new Error(`${name}() needs a string argument`)
+    return a.s
+  }
+
+  strMethod(s: string, name: string, args: Val[]): Val throws Error {
+    if (name === "join") {
+      const parts: string[] = []
+      for (const x of try this.iterate(args[0] ?? none())) {
+        if (x.k !== "str") throw new Error("join() needs strings")
+        parts.push(x.s)
+      }
+      let total = 0
+      for (const p of parts) total += p.byteLength + s.byteLength
+      try this.charge(total)
+      return vstr(parts.join(s))
+    }
+    if (name === "split") {
+      if (args.length === 0) return try this.listOf(splitWhite(s).map((p) => vstr(p)), "list")
+      const sep = try this.strArg(args, 0, name)
+      if (sep === "") throw new Error("split() separator must not be empty")
+      return try this.listOf(s.split(sep).map((p) => vstr(p)), "list")
+    }
+    if (name === "strip") return vstr(s.trim())
+    if (name === "lstrip") return vstr(s.trimStart())
+    if (name === "rstrip") return vstr(s.trimEnd())
+    if (name === "startswith") return vbool(s.startsWith(try this.strArg(args, 0, name)))
+    if (name === "endswith") return vbool(s.endsWith(try this.strArg(args, 0, name)))
+    if (name === "replace") {
+      const from = try this.strArg(args, 0, name)
+      const to = try this.strArg(args, 1, name)
+      if (from === "") throw new Error("replace() needs a non-empty pattern")
+      return vstr(s.replaceAll(from, to))
+    }
+    if (name === "lower") return vstr(lowerAscii(s))
+    if (name === "upper") return vstr(upperAscii(s))
+    throw new Error(`'str' object has no attribute '${name}'`)
+  }
+
+  listMethod(recv: Val, name: string, args: Val[]): Val throws Error {
+    const o = this.heap[recv.r]!
+    if (name === "append") {
+      if (args.length !== 1) throw new Error("append() takes one argument")
+      try this.charge(16)
+      o.items.push(args[0]!)
+      return none()
+    }
+    if (name === "extend") {
+      const xs = try this.iterate(args[0] ?? none())
+      try this.charge(16 * xs.length)
+      for (const x of xs) o.items.push(x)
+      return none()
+    }
+    if (name === "pop") {
+      if (o.items.length === 0) throw new Error("pop from empty list")
+      const i = args.length === 0 ? o.items.length - 1 : try this.position(args[0]!, o.items.length)
+      const x = o.items[i]!
+      const kept: Val[] = []
+      for (let k = 0; k < o.items.length; k++) {
+        if (k !== i) kept.push(o.items[k]!)
+      }
+      o.items = kept
+      return x
+    }
+    throw new Error(`'list' object has no attribute '${name}'`)
+  }
+
+  dictMethod(recv: Val, name: string, args: Val[]): Val throws Error {
+    const o = this.heap[recv.r]!
+    if (name === "get") {
+      if (args.length < 1) throw new Error("get() needs a key")
+      const i = this.dictFind(o, args[0]!)
+      if (i >= 0) return o.items[i]!
+      return args.length > 1 ? args[1]! : none()
+    }
+    if (name === "keys") return try this.listOf(o.keys.slice(0), "list")
+    if (name === "values") return try this.listOf(o.items.slice(0), "list")
+    if (name === "items") {
+      const out: Val[] = []
+      for (let i = 0; i < o.keys.length; i++) out.push(try this.pair(o.keys[i]!, o.items[i]!))
+      return try this.listOf(out, "list")
+    }
+    throw new Error(`'dict' object has no attribute '${name}'`)
+  }
+
+  // Merge sort, so the result is stable and the cost is n log n steps.
+  sortVals(xs: Val[]): Val[] throws Error {
+    if (xs.length < 2) return xs
+    const mid = Math.floor(xs.length / 2)
+    const left = try this.sortVals(xs.slice(0, mid))
+    const right = try this.sortVals(xs.slice(mid))
+    const out: Val[] = []
+    let i = 0
+    let j = 0
+    while (i < left.length && j < right.length) {
+      try this.tick()
+      const takeRight = try this.ltVal(right[j]!, left[i]!)
+      if (takeRight) {
+        out.push(right[j]!)
+        j += 1
+      } else {
+        out.push(left[i]!)
+        i += 1
+      }
+    }
+    while (i < left.length) {
+      out.push(left[i]!)
+      i += 1
+    }
+    while (j < right.length) {
+      out.push(right[j]!)
+      j += 1
+    }
+    return out
+  }
+}
+
+function one(name: string, args: Val[]): void throws Error {
+  if (args.length !== 1) throw new Error(`${name}() takes exactly one argument (${args.length} given)`)
+}
+
+// The [from, to) range a slice covers in a sequence of length len.
+function sliceBounds(lo: Val, hi: Val, len: int): { from: int, to: int } {
+  let from = 0
+  let to = len
+  if (lo.k === "int") {
+    from = lo.i < 0 ? lo.i + len : lo.i
+  }
+  if (hi.k === "int") {
+    to = hi.i < 0 ? hi.i + len : hi.i
+  }
+  if (from < 0) from = 0
+  if (from > len) from = len
+  if (to < 0) to = 0
+  if (to > len) to = len
+  return { from: from, to: to }
+}
+
+// The slot of a name in a frame (the last one bound to it), or -1.
+function slotOf(fr: Frame, name: string): int {
+  for (let i = fr.names.length - 1; i >= 0; i--) {
+    if (fr.names[i] === name) return i
+  }
+  return -1
+}
+
+// The names a target binds.
+function collectNames(t: Node, inout out: string[]): void {
+  if (t.kind === "name") {
+    if (!out.includes(t.s)) out.push(t.s)
+    return
+  }
+  if (t.kind === "tuple" || t.kind === "list") {
+    for (const a of t.args) collectNames(a, &out)
+  }
+}
+
+function skipWs(b: u8[], i: int): int {
+  let j = i
+  while (j < b.length) {
+    const c = byteAt(b, j)
+    if (c !== 32 && c !== 9 && c !== 10 && c !== 13) break
+    j += 1
+  }
+  return j
+}
+
+// A JSON string at b[i]: its value and the index after it.
+function jsonStr(b: u8[], i: int): { s: string, end: int } throws Error {
+  if (byteAt(b, i) !== 34) throw new SyntaxError("expected a string")
+  let j = i + 1
+  while (true) {
+    const c = byteAt(b, j)
+    if (c === -1) throw new SyntaxError("unterminated string")
+    if (c === 34) break
+    j += c === 92 ? 2 : 1
+  }
+  const s = try decodeString(txt(b, i, j + 1))
+  return { s: s, end: j + 1 }
+}
+
+// ---- running ----
+
+// Runs the program until it ends or needs a tool call that is not in cache. Counters start at
+// steps and mem, the values the previous round stopped with.
+export function runRound(prog: Program, servers: CodeServer[], lim: CodeLimits, cache: ToolOut[], deadline: f64, steps: int, mem: int): RunOutcome {
+  const m = new Machine(lim, servers, cache, deadline, steps, mem)
+  try {
+    m.execBlock(prog.body, m.globals)
+    if (m.steps > lim.max_steps) throw new Error(`step limit exceeded (max_steps ${lim.max_steps})`)
+    let resultJson = ""
+    const slot = slotOf(m.globals, "result")
+    if (slot >= 0 && m.globals.vals[slot]!.k !== "unbound") resultJson = m.valJson(m.globals.vals[slot]!, 0)
+    if (resultJson.byteLength > lim.max_value_bytes) throw new Error(`result exceeds max_value_bytes (${lim.max_value_bytes})`)
+    return { kind: "done", ok: true, resultJson: resultJson, logs: m.logs, errMsg: "", steps: m.steps, mem: m.mem }
+  } catch (e) {
+    const p = m.pend
+    if (p !== undefined) return { kind: "pending", server: p.server, tool: p.tool, argsJson: p.argsJson, steps: m.steps, mem: m.mem }
+    return { kind: "done", ok: false, resultJson: "", logs: m.logs, errMsg: e.message, steps: m.steps, mem: m.mem }
+  }
+}
+
+// ---- tests ----
+
+// A program for a test that is known to parse.
+function parseOk(src: string): Program {
+  try {
+    return parseProgram(src)
+  } catch (e) {
+    return { body: [] }
+  }
+}
+
+function runSrc(src: string, servers: CodeServer[], cache: ToolOut[]): RunOutcome {
+  try {
+    const prog = parseProgram(src)
+    return runRound(prog, servers, defaultCodeLimits(), cache, Date.now() + 60000.0, 0, 0)
+  } catch (e) {
+    return { kind: "done", ok: false, resultJson: "", logs: [], errMsg: "syntax: " + e.message, steps: 0, mem: 0 }
+  }
+}
+
+function resultOf(src: string): string {
+  const r = runSrc(src, [], [])
+  if (r.kind !== "done") return "pending"
+  if (!r.ok) return "error: " + r.errMsg
+  return r.resultJson
+}
+
+test("arithmetic, strings and the result variable", () => {
+  expect(resultOf("result = 7 // 2 + 3 * 2")).toBe("9")
+  expect(resultOf("result = -7 // 2")).toBe("-4")
+  expect(resultOf("result = -7 % 3")).toBe("2")
+  expect(resultOf("result = 7 / 2")).toBe("3.5")
+  expect(resultOf("result = 'a' + \"b\" * 3")).toBe("\"abbb\"")
+  expect(resultOf("result = \"%s=%d\" % (\"x\", 4)")).toBe("\"x=4\"")
+  expect(resultOf("result = len(\"héllo\")")).toBe("5")
+  expect(resultOf("result = \"a,b,,c\".split(\",\")")).toBe("[\"a\",\"b\",\"\",\"c\"]")
+  expect(resultOf("result = \"  x y \".strip().upper()")).toBe("\"X Y\"")
+  expect(resultOf("result = \"line1\\nline2\"")).toBe("\"line1\\nline2\"")
+  expect(resultOf("result = \"\"\"multi\nline\"\"\"")).toBe("\"multi\\nline\"")
+  expect(resultOf("result = 2 < 3 and not (1 == 2) or False")).toBe("true")
+  expect(resultOf("result = 1 if 0 else 'no'")).toBe("\"no\"")
+  expect(resultOf("result = 9007199254740992 + 1")).toBe("error: integer overflow")
+})
+
+test("lists, dicts, comprehensions and slices", () => {
+  expect(resultOf("xs = [3, 1, 2]\nxs.append(0)\nresult = sorted(xs)")).toBe("[0,1,2,3]")
+  expect(resultOf("result = [x * x for x in range(5) if x % 2 == 0]")).toBe("[0,4,16]")
+  expect(resultOf("d = {\"a\": 1}\nd[\"b\"] = 2\nresult = {k: v + 1 for k, v in d.items()}")).toBe("{\"a\":2,\"b\":3}")
+  expect(resultOf("result = [1, 2, 3, 4][1:3] + [9][-1:]")).toBe("[2,3,9]")
+  expect(resultOf("result = {\"k\": [1, {\"n\": None}]}")).toBe("{\"k\":[1,{\"n\":null}]}")
+  expect(resultOf("result = dict(a = 1, b = [True])")).toBe("{\"a\":1,\"b\":[true]}")
+  expect(resultOf("result = {\"a\": 1}.get(\"z\", 5)")).toBe("5")
+  expect(resultOf("x = 5\nys = [x for x in range(3)]\nresult = [x, ys]")).toBe("[5,[0,1,2]]")
+  expect(resultOf("result = [1, 2][5]")).toBe("error: index out of range")
+  expect(resultOf("result = {}[\"missing\"]")).toBe("error: key not found: \"missing\"")
+  expect(resultOf("a, b = (1, 2)\nresult = [b, a]")).toBe("[2,1]")
+  expect(resultOf("for i, v in enumerate(['x', 'y']):\n    result = [i, v]")).toBe("[1,\"y\"]")
+})
+
+test("functions, control flow and the output log", () => {
+  const src = "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\nresult = fib(10)"
+  expect(resultOf(src)).toBe("55")
+  expect(resultOf("def f(a, b=10, *, c=1):\n    return a\nresult = 1")).toBe("error: syntax: line 1: expected a name, found '*'")
+  expect(resultOf("def f(a, b=10):\n    return a + b\nresult = [f(1), f(1, 2), f(b=5, a=1)]")).toBe("[11,3,6]")
+  expect(resultOf("def f(a):\n    return a\nresult = f()")).toBe("error: f() is missing argument 'a'")
+  expect(resultOf("t = 0\nfor i in range(10):\n    if i == 3:\n        break\n    if i == 1:\n        continue\n    t += i\nresult = t")).toBe("2")
+  expect(resultOf("print('a', 1, 2.5)\nprint([None])\nresult = 1")).toBe("1")
+  const r = runSrc("print('a', 1, 2.5)\nprint([None])\nresult = True", [], [])
+  if (r.kind === "done") {
+    expect(r.logs.length).toBe(2)
+    expect(r.logs[0]!).toBe("a 1 2.5")
+    expect(r.logs[1]!).toBe("[None]")
+  }
+  expect(resultOf("x = 1\nresult = undefined_name")).toBe("error: name 'undefined_name' is not defined")
+  expect(resultOf("result = 1 +")).toBe("error: syntax: line 1: unexpected end of line")
+  expect(resultOf("while True:\n    pass")).toBe("error: syntax: line 1: 'while' is not supported in this runtime")
+  expect(resultOf("if True:\n  x = 1\n    y = 2")).toBe("error: syntax: line 3: unexpected indent")
+})
+
+test("limits: steps, output size, memory and recursion", () => {
+  const small = defaultCodeLimits()
+  small.max_steps = 200
+  const prog = parseOk("t = 0\nfor i in range(1000):\n    t += i\nresult = t")
+  const r = runRound(prog, [], small, [], Date.now() + 60000.0, 0, 0)
+  expect(r.kind).toBe("done")
+  if (r.kind === "done") expect(r.errMsg).toBe("step limit exceeded (max_steps 200)")
+  const lo = defaultCodeLimits()
+  lo.max_log_bytes = 4
+  const p2 = parseOk("print('abcdef')")
+  const r2 = runRound(p2, [], lo, [], Date.now() + 60000.0, 0, 0)
+  if (r2.kind === "done") expect(r2.errMsg).toBe("print output exceeds max_log_bytes (4)")
+  expect(resultOf("result = range(100000000)")).toBe("error: memory limit exceeded (max_memory_bytes 67108864)")
+  expect(resultOf("def f(n):\n    return f(n)\nresult = f(1)")).toBe("error: maximum call depth exceeded")
+})
+
+test("tool calls suspend the run and replay with cached results", () => {
+  const servers: CodeServer[] = [{ py: "yt", name: "youtube", tools: [{ py: "search", name: "search" }] }]
+  const src = "hits = yt.search(query = 'ai')\nprint(len(hits['items']))\nresult = hits['items'][0]['title']"
+  const prog = parseOk(src)
+  const first = runRound(prog, servers, defaultCodeLimits(), [], Date.now() + 60000.0, 0, 0)
+  expect(first.kind).toBe("pending")
+  if (first.kind !== "pending") return
+  expect(first.server).toBe("youtube")
+  expect(first.tool).toBe("search")
+  expect(first.argsJson).toBe("{\"query\":\"ai\"}")
+  const cache: ToolOut[] = [{ text: "{\"items\":[{\"title\":\"A\"}]}", isError: false }]
+  const second = runRound(prog, servers, defaultCodeLimits(), cache, Date.now() + 60000.0, first.steps, first.mem)
+  expect(second.kind).toBe("done")
+  if (second.kind === "done") {
+    expect(second.ok).toBe(true)
+    expect(second.resultJson).toBe("\"A\"")
+    expect(second.logs[0]!).toBe("1")
+  }
+  const failed: ToolOut[] = [{ text: "boom", isError: true }]
+  const third = runRound(prog, servers, defaultCodeLimits(), failed, Date.now() + 60000.0, 0, 0)
+  if (third.kind === "done") expect(third.errMsg).toBe("youtube.search failed: boom")
+  const plain = parseOk("result = yt.search(q = 1)\nresult = yt.missing(q = 1)")
+  const bad = runRound(plain, servers, defaultCodeLimits(), [], Date.now() + 60000.0, 0, 0)
+  expect(bad.kind).toBe("pending")
+  const notKw = runRound(parseOk("result = yt.search(1)"), servers, defaultCodeLimits(), [], Date.now() + 60000.0, 0, 0)
+  if (notKw.kind === "done") expect(notKw.errMsg).toBe("youtube.search takes keyword arguments: youtube.search(param=value)")
+})
+
+test("JSON results from tools are values, other text stays text", () => {
+  const servers: CodeServer[] = [{ py: "fs", name: "fs", tools: [{ py: "read", name: "read_file" }] }]
+  const cache: ToolOut[] = [{ text: "plain text", isError: false }, { text: "[1, 2.5, true, null]", isError: false }]
+  const prog = parseOk("a = fs.read(path = 'x')\nb = fs.read(path = 'y')\nresult = [a, b]")
+  const r = runRound(prog, servers, defaultCodeLimits(), cache, Date.now() + 60000.0, 0, 0)
+  if (r.kind === "done") expect(r.resultJson).toBe("[\"plain text\",[1,2.5,true,null]]")
+})
+
+test("runaway programs end with an error: deep expressions, big repeats", () => {
+  let src = "result = 1"
+  for (let i = 0; i < 500; i++) src += " + 1"
+  const deep = runRound(parseOk(src), [], defaultCodeLimits(), [], Date.now() + 60000.0, 0, 0)
+  if (deep.kind === "done") expect(deep.errMsg).toBe("expression nests too deeply")
+  const big = runRound(parseOk("result = 'abcdefgh' * 9007199254740991"), [], defaultCodeLimits(), [], Date.now() + 60000.0, 0, 0)
+  if (big.kind === "done") expect(big.errMsg.startsWith("memory limit exceeded")).toBe(true)
+  expect(resultOf("result = [1, 2] * 3")).toBe("error: unsupported operand types for *: list and int")
+})

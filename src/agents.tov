@@ -1,0 +1,581 @@
+// A2A agents (Bifrost's agents section, /api/agents and the agent gateway at /agents/a2a/{name}).
+//
+// A registered agent is a remote A2A agent. Its card is fetched when it is registered (or refreshed
+// on demand) and kept in the registration, and the card names the agent's endpoint. The gateway serves
+// the card with its endpoint rewritten to the gateway's JSON-RPC route, and proxies the A2A methods to
+// the endpoint once the caller's virtual key passes the agent's grants and the key's budgets and rate
+// limits (ops.tov a2aRoute). Each call is logged as an "a2a" entry with the agent's name. Its context id
+// is the session, so the agent_names log filter selects the LLM requests made in those conversations.
+//
+// Not built: the REST and gRPC bindings, push notifications, OAuth and TLS settings for the upstream,
+// extension URIs, and a timer that refreshes cards (refresh is by the API).
+import { Field, fields, elements, find, rawStr, rawBool, decodeString, quote, build, setField, isNull } from "./json"
+import { AgentConfig, AgentAuth, resolveEnv } from "./config"
+import { urlProblem } from "./webhooks"
+import { deadline } from "./deadline"
+import { errorJson } from "./schemas"
+
+export const CARD_PATH = "/.well-known/agent-card.json"
+export const JSON_RPC_SUFFIX = "/json-rpc"
+// the A2A methods the gateway proxies: the v0.3 names and the v1 names (the same methods)
+export const A2A_METHODS: string[] = ["message/send", "message/stream", "tasks/get", "tasks/cancel", "SendMessage", "SendStreamingMessage", "GetTask", "CancelTask"]
+const STREAM_METHODS: string[] = ["message/stream", "SendStreamingMessage"]
+// what a read answers for a secret header value
+const MASK = "********"
+const CARD_TIMEOUT_MS = 10000
+
+export type AgentReply = { status: int, body: string, next?: AgentConfig[] }
+export type CardResult = { card: string, error: string }
+
+function reply(status: int, body: string, next?: AgentConfig[]): AgentReply {
+  return { status: status, body: body, next: next }
+}
+
+function fail(status: int, message: string): AgentReply {
+  return { status: status, body: errorJson(message, status === 404 ? "not_found_error" : "invalid_request_error", undefined) }
+}
+
+// A registration name: lowercase letters and digits in single hyphen-separated runs, at most 255 bytes.
+export function validName(name: string): bool {
+  if (name === "" || name.byteLength > 255 || name.startsWith("-") || name.endsWith("-") || name.includes("--")) return false
+  for (let i = 0; i < name.byteLength; i++) {
+    const c = name.slice(i, i + 1)
+    if (!(("a" <= c && c <= "z") || ("0" <= c && c <= "9") || c === "-")) return false
+  }
+  return true
+}
+
+function objectFields(text: string): Field[] | undefined {
+  if (!text.startsWith("{")) return undefined
+  try {
+    return fields(text)
+  } catch (e) {
+    return undefined
+  }
+}
+
+function headerMap(raw: string): Map<string, string> | undefined {
+  if (!raw.startsWith("{")) return undefined
+  const out: Map<string, string> = new Map()
+  try {
+    for (const f of fields(raw)) {
+      if (!f.raw.startsWith("\"")) return undefined
+      out.set(f.key, decodeString(f.raw))
+    }
+  } catch (e) {
+    return undefined
+  }
+  return out
+}
+
+// An agent's auth object: type none or headers (OAuth is not built). bad names the first problem.
+function authFrom(fs: Field[], key: string): { auth: AgentAuth | undefined, bad: string } {
+  const raw = find(fs, key)
+  if (raw === undefined || isNull(raw)) return { auth: undefined, bad: "" }
+  const af = objectFields(raw)
+  if (af === undefined) return { auth: undefined, bad: `${key} must be an object` }
+  const type = rawStr(af, "type") ?? "none"
+  if (type !== "none" && type !== "headers") return { auth: undefined, bad: `${key}.type must be none or headers` }
+  const hraw = find(af, "headers")
+  let headers: Map<string, string> | undefined = undefined
+  if (hraw !== undefined && !isNull(hraw)) {
+    headers = headerMap(hraw)
+    if (headers === undefined) return { auth: undefined, bad: `${key}.headers must be an object of string values` }
+  }
+  if (type === "headers" && (headers === undefined || headers.keys().length === 0)) return { auth: undefined, bad: `${key}: header auth needs at least one header` }
+  return { auth: { type: type, headers: headers }, bad: "" }
+}
+
+// A header value as a read shows it: env references are shown, stored values are masked.
+function shownValue(v: string): string {
+  return v.startsWith("env.") ? v : MASK
+}
+
+// The auth as a read shows it (secret values masked).
+function authView(a: AgentAuth | undefined): string {
+  if (a === undefined) return "null"
+  const hs = a.headers
+  let hv = "null"
+  if (hs !== undefined) {
+    const pairs: string[] = []
+    for (const k of hs.keys()) pairs.push(quote(k) + ":" + quote(shownValue(hs.get(k) ?? "")))
+    hv = "{" + pairs.join(",") + "}"
+  }
+  return `{"type":${quote(a.type)},"headers":${hv}}`
+}
+
+// The identity of an auth with its values, for telling whether a replace changed it.
+function authKey(a: AgentAuth | undefined): string {
+  if (a === undefined) return ""
+  const parts: string[] = [a.type]
+  const hs = a.headers
+  if (hs !== undefined) {
+    for (const k of hs.keys()) parts.push(k + "=" + (hs.get(k) ?? ""))
+  }
+  return parts.join("|")
+}
+
+// The card's endpoint: its url (A2A v0.3), else the first JSON-RPC interface (v1). "" when there is none.
+export function endpointOf(card: string): string {
+  const cf = objectFields(card)
+  if (cf === undefined) return ""
+  const u = rawStr(cf, "url") ?? ""
+  if (u !== "") return u
+  const ifs = find(cf, "supportedInterfaces") ?? find(cf, "additionalInterfaces")
+  if (ifs === undefined) return ""
+  let items: string[] = []
+  try {
+    items = elements(ifs)
+  } catch (e) {
+    return ""
+  }
+  for (const it of items) {
+    const f = objectFields(it)
+    if (f === undefined) continue
+    const proto = rawStr(f, "protocolBinding") ?? rawStr(f, "transport") ?? "JSONRPC"
+    const iu = rawStr(f, "url") ?? ""
+    if (iu !== "" && proto === "JSONRPC") return iu
+  }
+  return ""
+}
+
+// The card the gateway serves: the cached card with its endpoints and security rewritten to the gateway.
+// base is the public base URL the gateway is reached at; the caller authenticates with x-bf-vk.
+export function gatewayCard(card: string, base: string, name: string): string {
+  let cf: Field[] = objectFields(card) ?? []
+  const ep = base + "/agents/a2a/" + name + JSON_RPC_SUFFIX
+  setField(&cf, "url", quote(ep))
+  setField(&cf, "preferredTransport", quote("JSONRPC"))
+  if (find(cf, "additionalInterfaces") !== undefined) setField(&cf, "additionalInterfaces", `[{"url":${quote(ep)},"transport":"JSONRPC"}]`)
+  if (find(cf, "supportedInterfaces") !== undefined) setField(&cf, "supportedInterfaces", `[{"url":${quote(ep)},"protocolBinding":"JSONRPC"}]`)
+  setField(&cf, "securitySchemes", `{"bifrostVirtualKey":{"type":"apiKey","in":"header","name":"x-bf-vk"}}`)
+  setField(&cf, "security", `[{"bifrostVirtualKey":[]}]`)
+  return build(cf)
+}
+
+// Fetches an agent card and checks it: a JSON object with a name and an endpoint the URL guard allows.
+// The card's raw text is what the registration keeps.
+export async function fetchCard(url: string, auth: AgentAuth | undefined, allowPrivate: bool): Promise<CardResult, Error> {
+  const bad = urlProblem(url, allowPrivate)
+  if (bad !== "") return { card: "", error: `agent_card_url: ${bad}` }
+  const hm: Map<string, string> = new Map()
+  hm.set("accept", "application/json")
+  const ah = auth?.headers
+  if (auth !== undefined && auth.type === "headers" && ah !== undefined) {
+    for (const k of ah.keys()) hm.set(k, resolveEnv(ah.get(k) ?? ""))
+  }
+  const hs: Record<string, string> = hm
+  const dl = deadline(CARD_TIMEOUT_MS)
+  try {
+    const r = await fetch(url, { headers: hs, signal: dl.controller.signal })
+    const text = await r.text()
+    dl.finish()
+    if (r.status < 200 || r.status >= 300) return { card: "", error: `the agent card answered HTTP ${r.status}` }
+    const cf = objectFields(text)
+    if (cf === undefined) return { card: "", error: "the agent card is not a JSON object" }
+    if ((rawStr(cf, "name") ?? "") === "") return { card: "", error: "the agent card has no name" }
+    const ep = endpointOf(text)
+    if (ep === "") return { card: "", error: "the agent card names no endpoint" }
+    const epBad = urlProblem(ep, allowPrivate)
+    if (epBad !== "") return { card: "", error: `the agent card's endpoint: ${epBad}` }
+    return { card: text, error: "" }
+  } catch (e) {
+    dl.finish()
+    return { card: "", error: `the agent card could not be fetched: ${e.message}` }
+  }
+}
+
+// A whole-number field as JSON: its value, or null when it is not set.
+function numOrNull(v: int | undefined): string {
+  if (v === undefined) return "null"
+  return JSON.stringify(v)
+}
+
+// The API view of a registration: its settings, the cached card, and the gateway's endpoints.
+// Header values are masked; the card is its raw JSON.
+export function agentView(a: AgentConfig, base: string): string {
+  const gw = base + "/agents/a2a/" + a.name
+  const card = a.card === undefined || a.card === "" ? "null" : a.card
+  const vks: string[] = a.virtual_key_ids ?? []
+  const parts: string[] = [
+    `"name":${quote(a.name)}`,
+    `"agent_card_url":${quote(a.agent_card_url)}`,
+    `"enabled":${a.enabled === false ? "false" : "true"}`,
+    `"allow_by_default":${a.allow_by_default === true ? "true" : "false"}`,
+    `"virtual_key_ids":${JSON.stringify(vks)}`,
+    `"discovery_auth":${authView(a.discovery_auth)}`,
+    `"runtime_auth":${authView(a.runtime_auth)}`,
+    `"allow_private_network":${a.allow_private_network === true ? "true" : "false"}`,
+    `"card":${card}`,
+    `"card_fetched_at":${numOrNull(a.card_fetched_at)}`,
+    `"endpoint":${quote(endpointOf(card === "null" ? "" : card))}`,
+    `"created_at":${numOrNull(a.created_at)}`,
+    `"updated_at":${numOrNull(a.updated_at)}`,
+    `"gateway":{"agent_card_url":${quote(gw + CARD_PATH)},"json_rpc_url":${quote(gw + JSON_RPC_SUFFIX)}}`,
+  ]
+  return "{" + parts.join(",") + "}"
+}
+
+// The fields of a create or replace body, checked. error is the reason it is refused. A masked header
+// value keeps the stored value of the same header (old, for a replace).
+type Draft = { url: string, enabled: bool, allowDefault: bool, vks: string[], discovery: AgentAuth | undefined, runtime: AgentAuth | undefined, allowPrivate: bool, error: string }
+
+// The stored value of a header, for a masked one.
+function keep(old: AgentAuth | undefined, key: string, v: string): string {
+  if (v !== MASK) return v
+  const hs = old?.headers
+  if (hs === undefined) return v
+  return hs.get(key) ?? v
+}
+
+// The auth of a body with masked values filled in from the stored one.
+function filled(a: { auth: AgentAuth | undefined, bad: string }, old: AgentAuth | undefined): AgentAuth | undefined {
+  const au = a.auth
+  if (au === undefined) return undefined
+  const hs = au.headers
+  if (hs === undefined) return au
+  const m: Map<string, string> = new Map()
+  for (const k of hs.keys()) m.set(k, keep(old, k, hs.get(k) ?? ""))
+  return { type: au.type, headers: m }
+}
+
+function draftOf(fs: Field[], old: AgentConfig | undefined): Draft {
+  const url = rawStr(fs, "agent_card_url") ?? ""
+  const allowPrivate = rawBool(fs, "allow_private_network") ?? old?.allow_private_network ?? false
+  const bad = (msg: string): Draft => ({ url: url, enabled: true, allowDefault: false, vks: [], discovery: undefined, runtime: undefined, allowPrivate: allowPrivate, error: msg })
+  if (url === "") return bad("agent_card_url is required")
+  const up = urlProblem(url, allowPrivate)
+  if (up !== "") return bad(`agent_card_url: ${up}`)
+  const vraw = find(fs, "virtual_key_ids")
+  const vks: string[] = []
+  if (vraw !== undefined && !isNull(vraw)) {
+    let items: string[] = []
+    try {
+      items = elements(vraw)
+      for (const it of items) {
+        const id = decodeString(it)
+        if (!it.startsWith("\"") || id === "" || vks.includes(id)) return bad("virtual_key_ids: empty and duplicate IDs are rejected")
+        vks.push(id)
+      }
+    } catch (e) {
+      return bad("virtual_key_ids must be an array of strings")
+    }
+  }
+  const d = authFrom(fs, "discovery_auth")
+  if (d.bad !== "") return bad(d.bad)
+  const r = authFrom(fs, "runtime_auth")
+  if (r.bad !== "") return bad(r.bad)
+  return { url: url, enabled: rawBool(fs, "enabled") ?? true, allowDefault: rawBool(fs, "allow_by_default") ?? false, vks: vks, discovery: filled(d, old?.discovery_auth), runtime: filled(r, old?.runtime_auth), allowPrivate: allowPrivate, error: "" }
+}
+
+function indexOf(list: AgentConfig[], name: string): int {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i]!.name === name) return i
+  }
+  return -1
+}
+
+function withoutAt(list: AgentConfig[], i: int): AgentConfig[] {
+  const out: AgentConfig[] = []
+  for (let j = 0; j < list.length; j++) {
+    if (j !== i) out.push(list[j]!)
+  }
+  return out
+}
+
+async function create(list: AgentConfig[], body: string, base: string): Promise<AgentReply, Error> {
+  const fs = objectFields(body)
+  if (fs === undefined) return fail(400, "invalid request body")
+  const name = rawStr(fs, "name") ?? ""
+  if (!validName(name)) return fail(400, "name must be lowercase letters and digits, with single hyphens between them")
+  if (indexOf(list, name) >= 0) return fail(409, "an agent with this name already exists")
+  const d = draftOf(fs, undefined)
+  if (d.error !== "") return fail(400, d.error)
+  const f = await fetchCard(d.url, d.discovery, d.allowPrivate)
+  if (f.error !== "") return fail(400, f.error)
+  const now = Math.floor(Date.now())
+  const made: AgentConfig = { name: name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, card: f.card, card_fetched_at: now, created_at: now, updated_at: now }
+  return reply(201, agentView(made, base), list.concat([made]))
+}
+
+// A full replacement (PUT): the card is fetched again when its URL, its discovery auth or the private-network
+// setting changed, or when none is cached.
+async function replace(list: AgentConfig[], i: int, body: string, base: string): Promise<AgentReply, Error> {
+  const old = list[i]!
+  const fs = objectFields(body)
+  if (fs === undefined) return fail(400, "invalid request body")
+  const d = draftOf(fs, old)
+  if (d.error !== "") return fail(400, d.error)
+  const changed = d.url !== old.agent_card_url || d.allowPrivate !== (old.allow_private_network === true) || authKey(d.discovery) !== authKey(old.discovery_auth)
+  let card = old.card ?? ""
+  let fetched = old.card_fetched_at
+  const now = Math.floor(Date.now())
+  if (changed || card === "") {
+    const f = await fetchCard(d.url, d.discovery, d.allowPrivate)
+    if (f.error !== "") return fail(400, f.error)
+    card = f.card
+    fetched = now
+  }
+  const made: AgentConfig = { name: old.name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, card: card, card_fetched_at: fetched, created_at: old.created_at, updated_at: now }
+  const out: AgentConfig[] = []
+  for (let j = 0; j < list.length; j++) out.push(j === i ? made : list[j]!)
+  return reply(200, agentView(made, base), out)
+}
+
+// Fetches the card of a body's URL and answers it, without saving anything.
+async function inspect(body: string): Promise<AgentReply, Error> {
+  const fs = objectFields(body)
+  if (fs === undefined) return fail(400, "invalid request body")
+  const a = authFrom(fs, "discovery_auth")
+  if (a.bad !== "") return fail(400, a.bad)
+  const f = await fetchCard(rawStr(fs, "agent_card_url") ?? "", a.auth, rawBool(fs, "allow_private_network") ?? false)
+  if (f.error !== "") return fail(400, f.error)
+  return reply(200, `{"card":${f.card}}`)
+}
+
+// Fetches the card again for a registration: its cache is replaced.
+async function refresh(list: AgentConfig[], i: int, base: string): Promise<AgentReply, Error> {
+  const old = list[i]!
+  const f = await fetchCard(old.agent_card_url, old.discovery_auth, old.allow_private_network === true)
+  if (f.error !== "") return fail(400, f.error)
+  const now = Math.floor(Date.now())
+  const made: AgentConfig = { name: old.name, agent_card_url: old.agent_card_url, enabled: old.enabled, allow_by_default: old.allow_by_default, virtual_key_ids: old.virtual_key_ids, discovery_auth: old.discovery_auth, runtime_auth: old.runtime_auth, allow_private_network: old.allow_private_network, card: f.card, card_fetched_at: now, created_at: old.created_at, updated_at: now }
+  const out: AgentConfig[] = []
+  for (let j = 0; j < list.length; j++) out.push(j === i ? made : list[j]!)
+  return reply(200, agentView(made, base), out)
+}
+
+// Routes one request under /api/agents (the history is ops.tov's). base is the public base URL the
+// gateway endpoints are shown at. Changes come back as next, the list to save.
+export async function agentApi(cfg: AgentConfig[] | undefined, method: string, path: string, body: string, base: string): Promise<AgentReply, Error> {
+  const list: AgentConfig[] = cfg ?? []
+  const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
+  const name = segs[2] ?? ""
+  if (segs.length === 2) {
+    if (method === "GET") {
+      const views: string[] = []
+      for (const a of list) views.push(agentView(a, base))
+      return reply(200, `{"agents":[${views.join(",")}]}`)
+    }
+    if (method === "POST") return await create(list, body, base)
+    return fail(405, "use GET or POST")
+  }
+  if (segs.length === 3 && name === "inspect") {
+    if (method !== "POST") return fail(405, "use POST")
+    return await inspect(body)
+  }
+  if (segs.length === 4 && segs[3] === "refresh-card") {
+    if (method !== "POST") return fail(405, "use POST")
+    const i = indexOf(list, name)
+    if (i < 0) return fail(404, "agent not found")
+    return await refresh(list, i, base)
+  }
+  if (segs.length === 3) {
+    if (method !== "GET" && method !== "PUT" && method !== "DELETE") return fail(405, "use GET, PUT or DELETE")
+    const i = indexOf(list, name)
+    if (i < 0) return fail(404, "agent not found")
+    if (method === "GET") return reply(200, agentView(list[i]!, base))
+    if (method === "PUT") return await replace(list, i, body, base)
+    return reply(200, `{"deleted":true,"name":${quote(name)}}`, withoutAt(list, i))
+  }
+  return fail(404, "no such route")
+}
+
+// ---- the gateway ----
+
+// The public base URL the gateway's endpoints are advertised at: client.a2a_external_client_url when it is
+// set, else the origin the request came in on.
+export function publicBase(external: string | undefined, url: string): string {
+  const ext = external ?? ""
+  if (ext !== "") return ext.endsWith("/") ? ext.slice(0, ext.byteLength - 1) : ext
+  const u = URL.parse(url)
+  return u === undefined ? "" : u.origin
+}
+
+export function findAgent(list: AgentConfig[] | undefined, name: string): AgentConfig | undefined {
+  for (const a of list ?? []) {
+    if (a.name === name) return a
+  }
+  return undefined
+}
+
+// Whether a caller may call an agent: an identified key needs the agent's grant or allow_by_default. An
+// anonymous call (no key, enforcement off) is not limited by the grants, as Bifrost does.
+export function grantAllows(a: AgentConfig, vkId: string | undefined): bool {
+  if (vkId === undefined) return true
+  return a.allow_by_default === true || (a.virtual_key_ids ?? []).includes(vkId)
+}
+
+// The headers the agent's runtime auth adds to a proxied call.
+export function runtimeHeaders(a: AgentConfig): Map<string, string> {
+  const out: Map<string, string> = new Map()
+  const auth = a.runtime_auth
+  const hs = auth?.headers
+  if (auth === undefined || auth.type !== "headers" || hs === undefined) return out
+  for (const k of hs.keys()) out.set(k, hs.get(k) ?? "")
+  return out
+}
+
+// The method of a JSON-RPC request body, "" when it has none.
+export function a2aMethodOf(body: string): string {
+  try {
+    return rawStr(fields(body), "method") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// The raw id of a JSON-RPC request ("null" when it has none), as a JSON-RPC response echoes it.
+export function rpcIdOf(body: string): string {
+  try {
+    return find(fields(body), "id") ?? "null"
+  } catch (e) {
+    return "null"
+  }
+}
+
+export function isStreamMethod(m: string): bool {
+  return STREAM_METHODS.includes(m)
+}
+
+// The context id a request names (params.message.contextId): the conversation the call belongs to.
+export function contextOfRequest(body: string): string {
+  try {
+    const pf = fields(find(fields(body), "params") ?? "{}")
+    const mraw = find(pf, "message")
+    if (mraw !== undefined) return rawStr(fields(mraw), "contextId") ?? ""
+    return rawStr(pf, "contextId") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// The context id of a unary answer (result.contextId, or the context of its task or message).
+export function contextOfResponse(text: string): string {
+  try {
+    const rf = fields(find(fields(text), "result") ?? "{}")
+    const direct = rawStr(rf, "contextId") ?? ""
+    if (direct !== "") return direct
+    const tr = find(rf, "task")
+    if (tr !== undefined) return rawStr(fields(tr), "contextId") ?? ""
+    const mr = find(rf, "message")
+    if (mr !== undefined) return rawStr(fields(mr), "contextId") ?? ""
+    return ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// ---- tests ----
+
+// The value of a header of an auth, "" when it has none.
+function headerOf(a: AgentAuth | undefined, key: string): string {
+  if (a === undefined) return ""
+  const hs = a.headers
+  if (hs === undefined) return ""
+  return hs.get(key) ?? ""
+}
+
+function headersOf(pairs: string[][]): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  for (const p of pairs) m.set(p[0]!, p[1]!)
+  return m
+}
+
+test("agent names are lowercase, digits and single hyphens", () => {
+  expect(validName("library-research")).toBe(true)
+  expect(validName("a1")).toBe(true)
+  expect(validName("Bad")).toBe(false)
+  expect(validName("-lead")).toBe(false)
+  expect(validName("two--hyphens")).toBe(false)
+  expect(validName("")).toBe(false)
+  expect(validName("with space")).toBe(false)
+})
+
+test("the endpoint is the card's url, else its JSON-RPC interface", () => {
+  expect(endpointOf(`{"name":"a","url":"https://x.example.com/rpc"}`)).toBe("https://x.example.com/rpc")
+  expect(endpointOf(`{"name":"a","supportedInterfaces":[{"url":"https://x.example.com/rest","protocolBinding":"HTTP+JSON"},{"url":"https://x.example.com/v1","protocolBinding":"JSONRPC"}]}`)).toBe("https://x.example.com/v1")
+  expect(endpointOf(`{"name":"a","additionalInterfaces":[{"url":"https://x.example.com/t","transport":"JSONRPC"}]}`)).toBe("https://x.example.com/t")
+  expect(endpointOf(`{"name":"a"}`)).toBe("")
+  expect(endpointOf("not json")).toBe("")
+})
+
+test("the gateway card points at the gateway's JSON-RPC route and asks for the virtual key", () => {
+  const card = try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc","supportedInterfaces":[{"url":"https://agent.example.com/v1","protocolBinding":"JSONRPC"}]}`, "https://gw.example.com", "echo")
+  expect(endpointOf(card)).toBe("https://gw.example.com/agents/a2a/echo/json-rpc")
+  expect(card.includes(`"supportedInterfaces":[{"url":"https://gw.example.com/agents/a2a/echo/json-rpc","protocolBinding":"JSONRPC"}]`)).toBe(true)
+  expect(card.includes(`"securitySchemes":{"bifrostVirtualKey":{"type":"apiKey","in":"header","name":"x-bf-vk"}}`)).toBe(true)
+  expect(rawStr(try fields(card), "name")).toBe("echo")
+})
+
+test("views show env references and mask stored header values", () => {
+  const a: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", virtual_key_ids: ["vk1"], runtime_auth: { type: "headers", headers: headersOf([["Authorization", "env.AGENT_TOKEN"], ["X-Key", "plain-secret"]]) }, card: `{"name":"echo","url":"https://a.example.com/rpc"}`, card_fetched_at: 5, created_at: 1, updated_at: 2 }
+  const view = agentView(a, "https://gw.example.com")
+  expect(view.includes(`"headers":{"Authorization":"env.AGENT_TOKEN","X-Key":"********"}`)).toBe(true)
+  expect(view.includes("plain-secret")).toBe(false)
+  expect(view.includes(`"enabled":true`)).toBe(true)
+  expect(view.includes(`"virtual_key_ids":["vk1"]`)).toBe(true)
+  expect(view.includes(`"endpoint":"https://a.example.com/rpc"`)).toBe(true)
+  expect(view.includes(`"json_rpc_url":"https://gw.example.com/agents/a2a/echo/json-rpc"`)).toBe(true)
+  expect(rawStr(try fields(view), "name")).toBe("echo")
+})
+
+test("a masked header keeps the stored value on replace; a new value replaces it", () => {
+  const old: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", runtime_auth: { type: "headers", headers: headersOf([["X-Key", "stored"]]) } }
+  const kept = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"headers","headers":{"X-Key":"********"}}}`), old)
+  expect(kept.error).toBe("")
+  expect(headerOf(kept.runtime, "X-Key")).toBe("stored")
+  const changed = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"headers","headers":{"X-Key":"fresh"}}}`), old)
+  expect(headerOf(changed.runtime, "X-Key")).toBe("fresh")
+  const none = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card"}`), old)
+  expect(none.runtime).toBeUndefined()
+})
+
+test("a registration body is checked: URL, grants and auth", () => {
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card"}`), undefined).error).toBe("")
+  expect(try draftOf(try fields(`{"agent_card_url":"https://user:pw@a.example.com/card"}`), undefined).error.includes("credentials")).toBe(true)
+  expect(try draftOf(try fields(`{"agent_card_url":"http://127.0.0.1:1/card"}`), undefined).error.includes("private")).toBe(true)
+  expect(try draftOf(try fields(`{"agent_card_url":"http://127.0.0.1:1/card","allow_private_network":true}`), undefined).error).toBe("")
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","virtual_key_ids":["vk1","vk1"]}`), undefined).error.includes("duplicate")).toBe(true)
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"headers","headers":{}}}`), undefined).error.includes("header")).toBe(true)
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","discovery_auth":{"type":"oauth"}}`), undefined).error.includes("none or headers")).toBe(true)
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card"}`), undefined).enabled).toBe(true)
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","enabled":false}`), undefined).enabled).toBe(false)
+})
+
+test("grants: an identified key needs the grant or allow_by_default; anonymous calls pass", () => {
+  const a: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", virtual_key_ids: ["vk1"] }
+  expect(grantAllows(a, "vk1")).toBe(true)
+  expect(grantAllows(a, "vk2")).toBe(false)
+  expect(grantAllows(a, undefined)).toBe(true)
+  const open: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", allow_by_default: true }
+  expect(grantAllows(open, "vk2")).toBe(true)
+})
+
+test("JSON-RPC requests: method, id, and the context a call belongs to", () => {
+  const body = `{"jsonrpc":"2.0","id":7,"method":"message/send","params":{"message":{"messageId":"m1","contextId":"ctx-9","role":"user","parts":[{"kind":"text","text":"hi"}]}}}`
+  expect(a2aMethodOf(body)).toBe("message/send")
+  expect(rpcIdOf(body)).toBe("7")
+  expect(rpcIdOf(`{"jsonrpc":"2.0","method":"tasks/get"}`)).toBe("null")
+  expect(contextOfRequest(body)).toBe("ctx-9")
+  expect(contextOfRequest(`{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t1"}}`)).toBe("")
+  expect(a2aMethodOf("not json")).toBe("")
+  expect(isStreamMethod("message/stream")).toBe(true)
+  expect(isStreamMethod("SendStreamingMessage")).toBe(true)
+  expect(isStreamMethod("message/send")).toBe(false)
+  expect(A2A_METHODS.includes("tasks/cancel")).toBe(true)
+})
+
+test("the context of a unary answer comes from the task, the message or the result", () => {
+  expect(contextOfResponse(`{"jsonrpc":"2.0","id":1,"result":{"kind":"task","id":"t1","contextId":"c1"}}`)).toBe("c1")
+  expect(contextOfResponse(`{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"t1","contextId":"c2"}}}`)).toBe("c2")
+  expect(contextOfResponse(`{"jsonrpc":"2.0","id":1,"result":{"message":{"contextId":"c3"}}}`)).toBe("c3")
+  expect(contextOfResponse(`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no"}}`)).toBe("")
+})
+
+test("the runtime headers are the agent's header auth", () => {
+  const a: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", runtime_auth: { type: "headers", headers: headersOf([["Authorization", "Bearer t"]]) } }
+  expect(runtimeHeaders(a).get("Authorization")).toBe("Bearer t")
+  expect(runtimeHeaders({ name: "x", agent_card_url: "https://a.example.com/card" }).keys().length).toBe(0)
+})
+

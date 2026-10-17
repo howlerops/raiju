@@ -49,7 +49,7 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 - **Gateway features:** routing rules (CEL), circuit breakers and adaptive load
   balancing, guardrails (PII and secret redaction), semantic cache, MCP gateway,
   plugins, request log store, OpenTelemetry, management API with admin auth,
-  web UI at `/`. Deployment: Dockerfile, compose and a Helm chart in `deploy/`.
+  web UI at `/` (SolidJS, in `web/`, embedded in the binary). Deployment: Dockerfile, compose and a Helm chart in `deploy/`.
   The management API is specified in [`docs/openapi/management.yaml`](docs/openapi/management.yaml),
   and `make openapi-check` checks the routes against it. `clients/` holds a native client spike
   (gpui and Slint) that reads the same API; see [clients/README.md](clients/README.md).
@@ -193,5 +193,32 @@ make e2e     # gateway against a mock upstream, on both servers
 make openapi-check # docs/openapi/management.yaml against a probe gateway
 make parity-count  # recount docs/parity.md and refresh its Summary table
 make ui      # the web UI in headless Chromium against a real gateway
+make web     # rebuild the web UI (web/) and embed it in src/ui_assets.tov
+make web-check # rebuild it and fail when src/ui_assets.tov or the API types would change
 make bench
 ```
+
+### The web UI
+
+The admin client is a browser app in [`web/`](web/): SolidJS 2.0 (release candidate), TypeScript,
+Vite, built with [Bun](https://bun.sh). It talks to the gateway over HTTP and the `/ws` socket, and
+its API types are generated from `docs/openapi/management.yaml` (`web/src/api/schema.d.ts`, by
+`bun run gen`). The build is embedded in the binary through `src/ui_assets.tov`, which is generated
+and committed, so building the gateway needs no Node or Bun.
+
+```sh
+cd web
+bun install
+bun run dev      # Vite dev server on :5173, proxying /api, /ws, /v1 to a running gateway
+                 # (RAIJU_GATEWAY=http://127.0.0.1:8080 by default)
+bun run check    # tsc --noEmit
+bun run gen      # regenerate src/api/schema.d.ts after the spec changes
+bun run build    # web/dist, hashed file names
+cd .. && make web   # install + gen + check + build, then embed into src/ui_assets.tov
+```
+
+Commit `src/ui_assets.tov` and `web/src/api/schema.d.ts` with a UI change; `make web-check` fails
+when they are stale. The gateway serves the page with `Cache-Control: no-cache` and an ETag, the
+hashed files under `/assets/` as immutable, and gzip to clients that accept it. To serve the UI from
+a directory instead of the binary (a dev build, or a CDN copy), set `RAIJU_UI_DIR=/path/to/dist`;
+files there are revalidated on every request.
