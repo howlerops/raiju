@@ -7,6 +7,7 @@ import { Field, fields, find, elements, rawStr, rawNum, isNull, quote, build, se
 import { errorJson, newId, nowSeconds } from "./schemas"
 import { compileRegex } from "./regex"
 import { deltaText } from "./guard_stream"
+import { WasmPluginInst, WasmPluginLimits, openWasmPlugin } from "./wasmplugin"
 
 // Hooks take the context by inout: plugins add headers and share values
 // through ctx.headers and ctx.values, which parameters can't change.
@@ -804,9 +805,46 @@ export class MaxTokensPlugin extends BasePlugin {
   }
 }
 
+// ---- WebAssembly plugin ----
+
+// The request-wide JSON context the WebAssembly plugins pass along, as Bifrost's plugin context.
+const WASM_CONTEXT = "plugins.wasm.context"
+
+// A plugin loaded from a .wasm file (wasmplugin.tov has the ABI). Its context object lives in
+// ctx.values, so a plugin's post_hook sees what its pre_hook put there, and the plugins of one
+// request share it.
+export class WasmPlugin extends BasePlugin {
+  constructor(readonly host: WasmPluginInst) {
+    super()
+  }
+
+  name(): string {
+    return this.host.name()
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult throws Error {
+    const have = ctx.values.get(WASM_CONTEXT) ?? ""
+    const cur = have === "" ? `{"request_id":${quote(ctx.requestId)}}` : have
+    const r = try this.host.preRequest(cur, body)
+    ctx.values.set(WASM_CONTEXT, r.context)
+    if (r.kind === "short_circuit") return { kind: "short_circuit", status: r.status, body: r.body, contentType: "application/json" }
+    return { kind: "continue", body: r.body }
+  }
+
+  postResponse(inout ctx: PluginContext, status: int, body: string): PostResult throws Error {
+    const have = ctx.values.get(WASM_CONTEXT) ?? ""
+    const cur = have === "" ? `{"request_id":${quote(ctx.requestId)}}` : have
+    const r = try this.host.postResponse(cur, body)
+    ctx.values.set(WASM_CONTEXT, r.context)
+    return { kind: "continue", body: r.body }
+  }
+}
+
 // ---- configuration ----
 
-export type PluginEntry = { name: string, enabled?: bool, configJson: string, placement?: string, order?: int }
+// path names a .wasm file to load as a plugin (name is then only the entry's label); limits are
+// that plugin's wasm_limits.
+export type PluginEntry = { name: string, enabled?: bool, configJson: string, placement?: string, order?: int, path?: string, limits?: WasmPluginLimits }
 
 // Bifrost's placement groups, in run order. Pre-hooks run in this order and post-hooks in reverse.
 // A plugin with no placement is post_builtin, as in Bifrost. undefined for any other value.
@@ -821,7 +859,14 @@ type Sequenced = { p: BasePlugin, rank: int, order: int, at: int }
 
 // Builds the plugin for one name from its raw JSON config. Throws SyntaxError
 // on a bad config; returns undefined for a name nothing provides.
-function makePlugin(name: string, text: string): BasePlugin | undefined throws SyntaxError {
+function makePlugin(name: string, text: string, path: string | undefined, limits: WasmPluginLimits | undefined): BasePlugin | undefined throws SyntaxError {
+  if (path !== undefined && path.trim() !== "") {
+    try {
+      return new WasmPlugin(openWasmPlugin(path.trim(), text, limits))
+    } catch (e) {
+      throw new SyntaxError(e.message)
+    }
+  }
   if (name === "header") {
     const cfg = try JSON.parse(text) as HeaderConfig
     return new HeaderPlugin(cfg)
@@ -861,7 +906,7 @@ export function buildChain(entries: PluginEntry[]): { chain: PluginChain, errors
     }
     const text = e.configJson.trim() === "" ? "{}" : e.configJson
     try {
-      const p = makePlugin(e.name, text)
+      const p = makePlugin(e.name, text, e.path, e.limits)
       if (p === undefined) errors.push(`unknown plugin "${e.name}"`)
       else seq.push({ p: p, rank: rank, order: e.order ?? 0, at: i })
     } catch (err) {
@@ -884,7 +929,7 @@ export function entryStatus(e: PluginEntry): { status: string, error: string } {
   if (e.enabled === false) return { status: "disabled", error: "" }
   const text = e.configJson.trim() === "" ? "{}" : e.configJson
   try {
-    const p = makePlugin(e.name, text)
+    const p = makePlugin(e.name, text, e.path, e.limits)
     if (p === undefined) return { status: "error", error: `unknown plugin "${e.name}"` }
     return { status: "active", error: "" }
   } catch (err) {
@@ -1253,4 +1298,60 @@ test("mocker weights pick a response, and global latency sets the delay", () => 
   const r = p.preRequest(&ctx, "{}")
   expect(ctx.values.get("mock_latency_ms")).toBe("250")
   if (r.kind === "short_circuit") expect(r.body.includes(`"content":"always"`)).toBe(true)
+})
+
+// ---- WebAssembly plugins in the chain (tests/wasm/plugin.wasm; source tests/wasm/plugin.c) ----
+
+const WASM_FIXTURE = "tests/wasm/plugin.wasm"
+const WASM_CHAT = `{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"ping"}]}`
+const WASM_REPLY = `{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`
+
+function wasmEntry(name: string, config: string): PluginEntry {
+  return { name: name, enabled: true, configJson: config, path: WASM_FIXTURE }
+}
+
+test("a path ending in .wasm loads as a plugin, rewrites the request and stamps the response", () => {
+  const built = buildChain([wasmEntry("wasm-a", `{"mode":"rewrite","from":"ping","to":"pong","tag":"chain"}`)])
+  expect(built.errors.length).toBe(0)
+  expect(built.chain.plugins.length).toBe(1)
+  expect(built.chain.plugins[0]!.name()).toBe("raiju-test-plugin")
+  let ctx = ctxFor("gpt-4o-mini")
+  const pre = built.chain.runPre(&ctx, WASM_CHAT)
+  expect(pre.kind).toBe("continue")
+  if (pre.kind === "continue") expect(pre.body.includes(`"content":"pong"`)).toBe(true)
+  const post = built.chain.runPost(&ctx, 200, WASM_REPLY)
+  expect(post.body.includes(`"x_wasm_plugin":"ctx-ok:chain"`)).toBe(true)
+  expect(post.body.includes(`"content":"hi"`)).toBe(true)
+})
+
+test("a wasm plugin can short-circuit, and one that fails is skipped like any plugin", () => {
+  const short = buildChain([wasmEntry("wasm-s", `{"mode":"short"}`), { name: "header", enabled: true, configJson: `{"set_request_headers":{"x-after":"1"}}` }])
+  let c1 = ctxFor("m")
+  const r = short.chain.runPre(&c1, WASM_CHAT)
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") {
+    expect(r.status).toBe(200)
+    expect(r.body.includes("from the plugin")).toBe(true)
+  }
+  expect(c1.headers.get("x-after")).toBe(undefined)
+  const bad = buildChain([wasmEntry("wasm-t", `{"mode":"trap"}`), wasmEntry("wasm-u", `{"mode":"rewrite","from":"ping","to":"next"}`)])
+  let c2 = ctxFor("m")
+  const k = bad.chain.runPre(&c2, WASM_CHAT)
+  expect(k.kind).toBe("continue")
+  if (k.kind === "continue") expect(k.body.includes(`"content":"next"`)).toBe(true)
+})
+
+test("a wasm entry that cannot load is reported and left out", () => {
+  const built = buildChain([
+    { name: "gone", enabled: true, configJson: "{}", path: "/no/such/plugin.wasm" },
+    { name: "native", enabled: true, configJson: "{}", path: "/plugins/p.so" },
+    { name: "text", enabled: true, configJson: "{}", path: "/plugins/p.txt" },
+    wasmEntry("wasm-i", `{"mode":"initfail"}`),
+  ])
+  expect(built.chain.plugins.length).toBe(0)
+  expect(built.errors.length).toBe(4)
+  expect(built.errors[1]!.includes("Go shared-object plugins")).toBe(true)
+  expect(built.errors[3]!.includes("init returned 1")).toBe(true)
+  expect(entryStatus(wasmEntry("wasm-ok", `{"mode":"rewrite"}`)).status).toBe("active")
+  expect(entryStatus({ name: "native", configJson: "{}", path: "/plugins/p.so" }).status).toBe("error")
 })

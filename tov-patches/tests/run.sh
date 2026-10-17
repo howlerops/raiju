@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0004 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0005 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -76,5 +76,10 @@ expect "$OUT/udp.out" 8 "Bun.udpSocket"
 
 "$TOV" run "$DIR/udp_dgram.tov" > "$OUT/dgram.out"
 expect "$OUT/dgram.out" 8 "node:dgram"
+
+# WebAssembly (patch 0005): std/wasm on WAMR, with its limits (run from the tests directory: it reads wasm_mod.wasm)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/wasm.tov" -o "$OUT/wasm" >/dev/null
+(cd "$DIR" && "$OUT/wasm") > "$OUT/wasm.out"
+expect "$OUT/wasm.out" 22 "std/wasm"
 
 echo "tov-patches tests passed"

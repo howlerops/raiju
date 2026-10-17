@@ -53,6 +53,12 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   The management API is specified in [`docs/openapi/management.yaml`](docs/openapi/management.yaml),
   and `make openapi-check` checks the routes against it. `clients/` holds a native client spike
   (gpui and Slint) that reads the same API; see [clients/README.md](clients/README.md).
+- **WebAssembly plugins:** a `plugins[]` entry with `"path": "/path/to/plugin.wasm"` loads a plugin in
+  Bifrost's JSON ABI (exports `malloc`, `free`, `get_name`, `init`, `pre_hook`, `post_hook`, `cleanup`) and
+  runs it on an embedded interpreter (WAMR, added to the Tov runtime by `tov-patches/0005-wamr.patch`).
+  `wasm_limits` on the entry caps its memory pages, stack and instructions per hook call. A plugin sees only
+  its own memory; a hook that traps, loops or answers with an error is logged and skipped. Go shared-object
+  plugins (`.so`) are not supported. `tests/wasm/plugin.c` is a small example.
 - **Enterprise:** RBAC for the management API (admin, editor, viewer, auditor;
   `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), a hash-chained
   HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting

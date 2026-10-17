@@ -60,7 +60,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Request log store | partial: JSONL files with an in-memory index, histograms and filters; per worker unless shared; no SQL store |
 | OpenTelemetry | done: traces and metrics over OTLP HTTP and gRPC (plaintext h2c; TLS through the ALPN patch), span filters and overhead spans |
 | Docker / Helm / Terraform | done (image built and run; Terraform validated) |
-| Plugin hooks | partial: compiled-in plugins with Bifrost's placement and order; dynamic (Go shared object and WASM) plugins are not built |
+| Plugin hooks | partial: compiled-in plugins with Bifrost's placement and order; WebAssembly plugins (Bifrost's JSON ABI, pre and post hooks on chat requests) load from a local `.wasm` path on WAMR, with limits on memory, stack and instructions (`tov-patches/0005-wamr.patch`); Go shared-object plugins (`.so`) are not supported, because Go's `plugin` package needs the Go runtime and Tov cannot load a Go shared object; the HTTP transport hooks and URL loading are not built |
 | Config store + management API | done (the config is a JSON file; Bifrost's sqlite and postgres config stores are not built) |
 | Web UI | done: the admin client built into the gateway (`web/`, L113; SolidJS and Vite, embedded through `src/ui_assets.tov`): sign-in (admin token, SSO), overview, providers, virtual keys, budgets and limits, logs, the live feed (virtualized, 5,000 rows), MCP clients, settings and a playground. Not built: dashboard charts, MCP OAuth consent screens, and native apps |
 | Cohere | done |

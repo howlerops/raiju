@@ -1,16 +1,55 @@
 // Holds and incidents for adaptive load balancing. A provider's refusal (refusal.tov) holds the key, or one
-// model of it, out of rotation: until its wait runs out no request goes to it, then one request is let
-// through as the check. A served check releases the hold; a refused one climbs the wait ladder; a network
-// error or a 5xx holds it again on the same rung. Every hold, and every circuit that a run of failures
-// opens, is an incident until it is resolved. Pure: every call takes `now` in milliseconds.
+// model of it, out of rotation on every node of a cluster: until its wait runs out no request goes to it, then
+// one request is let through as the check. A served check releases the hold; a refused one climbs the wait
+// ladder; a network error or a 5xx holds it again on the same rung. Holds exist only under adaptive load
+// balancing (health.adaptive); the gateway and the router check that before they call in here.
+//
+// The hold state is a state-based CRDT keyed by target ("provider#key" or "provider#key@model"): each target
+// keeps its newest write, ordered by ver (its write count) and then by the node that made it, so every node
+// settles on the same state whatever order the writes arrive in. A release is a write too (released: true),
+// kept for a while so the other nodes learn it. Only the owner (the node that saw the refusal) sends the check
+// when the wait is over; the others wait TAKEOVER_MS longer and only then check, if the owner has not.
+//
+// Every incident of a hold is derived from the same writes on every node, so the hold incidents agree across
+// the cluster. Circuit incidents (noteOpen) stay on the node that opened the circuit.
+// Pure: every call takes `now` in milliseconds.
 import { FailureClass, holdWaitMs, holdsKey, holdsAllModels } from "./refusal"
 
 // a key released this recently keeps its rung when it is held again for the same reason
 const RECENT_MS = 600000.0
 // a check that never reports back (a cancelled request) frees its slot after this
 const PROBE_TIMEOUT_MS = 300000.0
+// the other nodes wait this long past a key's due time before they check it, so the owner's check goes first
+const TAKEOVER_MS = 60000.0
+// a release is kept this long so the other nodes learn it before it is forgotten
+const TOMB_MS = 600000.0
 // incidents kept in memory; the oldest resolved ones go first
 const INCIDENT_CAP = 500
+// wire numbers must be finite and within this bound (cluster.tov uses the same one for its slots)
+const MAX_WIRE: f64 = 1.0e300
+
+const CLASSES: FailureClass[] = ["credential", "quota", "model_access", "model_gone", "region_blocked", "rate_limit"]
+
+// A hold as it travels between nodes (cluster.tov carries a list of them). ver and by order the writes of a target.
+export type HoldWire = {
+  target: string,
+  provider: string,
+  keyId: string,
+  model: string,
+  cls: string,
+  reason: string,
+  heldAt: f64,
+  rung: int,
+  waitMs: f64,
+  nextCheck: f64,
+  owner: string,
+  claimBy: string,
+  claimAt: f64,
+  ver: int,
+  by: string,
+  released: bool,
+  at: f64,
+}
 
 export class Hold {
   // the key id "provider#key", and the model ("" for the whole key)
@@ -24,9 +63,16 @@ export class Hold {
   nextCheck: f64
   rung: int
   waitMs: f64
-  probing: bool = false
-  probeAt: f64 = 0.0
-  constructor(target: string, provider: string, keyId: string, model: string, cls: FailureClass, reason: string, heldAt: f64, waitMs: f64, rung: int) {
+  // the node that saw the refusal: it sends the check when the wait is over
+  owner: string
+  // the node whose request is the check now ("" when none), and when it was sent
+  claimBy: string = ""
+  claimAt: f64 = 0.0
+  // the write count of this target, the node that made it, and when
+  ver: int = 1
+  by: string = ""
+  at: f64 = 0.0
+  constructor(target: string, provider: string, keyId: string, model: string, cls: FailureClass, reason: string, heldAt: f64, waitMs: f64, rung: int, owner: string) {
     this.target = target
     this.provider = provider
     this.keyId = keyId
@@ -37,6 +83,7 @@ export class Hold {
     this.waitMs = waitMs
     this.nextCheck = heldAt + waitMs
     this.rung = rung
+    this.owner = owner
   }
 }
 
@@ -63,14 +110,80 @@ function splitId(id: string): { provider: string, keyId: string } {
   return { provider: id.slice(0, at), keyId: id.slice(at + 1) }
 }
 
+function classOf(s: string): FailureClass | undefined {
+  for (const c of CLASSES) {
+    if (c === s) return c
+  }
+  return undefined
+}
+
+// Whether a is a newer write than b: the higher write count, or the same count from the node that sorts later.
+function newer(ver: int, by: string, cur: int, curBy: string): bool {
+  return ver > cur || (ver === cur && by > curBy)
+}
+
+// The first problem with a hold from the wire ("" when it is sound). A bad one is refused before any is merged.
+export function holdProblem(h: HoldWire): string {
+  if (h.target === "" || h.by === "") return "hold has no target or writer"
+  if (!(h.ver >= 1) || h.ver > 1000000000) return "hold has a bad write count"
+  for (const n of [h.heldAt, h.rung * 1.0, h.waitMs, h.nextCheck, h.claimAt, h.at]) {
+    if (!(n >= 0.0 && n <= MAX_WIRE)) return "hold has a negative or out-of-range number"
+  }
+  if (!h.released && classOf(h.cls) === undefined) return "hold has an unknown failure class"
+  return ""
+}
+
+function wireOf(h: Hold, released: bool, ver: int, by: string, at: f64): HoldWire {
+  return {
+    target: h.target,
+    provider: h.provider,
+    keyId: h.keyId,
+    model: h.model,
+    cls: h.cls,
+    reason: h.reason,
+    heldAt: h.heldAt,
+    rung: h.rung,
+    waitMs: h.waitMs,
+    nextCheck: h.nextCheck,
+    owner: h.owner,
+    claimBy: h.claimBy,
+    claimAt: h.claimAt,
+    ver: ver,
+    by: by,
+    released: released,
+    at: at,
+  }
+}
+
 export class HoldBook {
+  private node: string
   private holds: Map<string, Hold> = new Map()
+  // the releases still kept, by target, so an older write cannot bring a released hold back
+  private tombs: Map<string, HoldWire> = new Map()
   // the rung and time of the last release, by scope and class
   private recent: Map<string, { rung: int, at: f64 }> = new Map()
   private incidents: Incident[] = []
-  // the open incident of each hold ("h:" + scope) or circuit ("c:" + id)
+  // the open incident of each hold ("h:" + target) or circuit ("c:" + id)
   private open: Map<string, Incident> = new Map()
   private seq: int = 0
+
+  constructor(node?: string) {
+    this.node = node ?? "node"
+  }
+
+  // The id this node writes its holds under (a worker of a node has its own).
+  setNode(id: string): void {
+    this.node = id
+  }
+
+  // The state of one hold at now: "held" while the wait runs (or while the owner's check is still to come),
+  // "checking" while a check is in flight, "due" when the next request is the check.
+  private stateOf(h: Hold, now: f64): string {
+    if (now < h.nextCheck) return "held"
+    if (h.claimBy !== "" && now - h.claimAt < PROBE_TIMEOUT_MS) return "checking"
+    if (h.owner !== this.node && now < h.nextCheck + TAKEOVER_MS) return "held"
+    return "due"
+  }
 
   // What holds a request for this key and model at now: "" when it may be sent, "due" when the next request
   // is the check, "checking" while a check is in flight, "held" while the wait runs.
@@ -79,33 +192,40 @@ export class HoldBook {
     for (const k of scopesOf(id, model)) {
       const h = this.holds.get(k)
       if (h === undefined) continue
-      if (now < h.nextCheck) return "held"
-      if (h.probing && now - h.probeAt < PROBE_TIMEOUT_MS) out = "checking"
+      const s = this.stateOf(h, now)
+      if (s === "held") return "held"
+      if (s === "checking") out = "checking"
       else if (out === "") out = "due"
     }
     return out
   }
 
-  // Marks the check as sent when the key is due. False when the key is held or a check is already in flight,
-  // so the caller picks another key.
-  startCheck(id: string, model: string, now: f64): bool {
-    const s = this.state(id, model, now)
-    if (s === "held" || s === "checking") return false
-    this.checkNow(id, model, now)
+  // Whether this node is the owner of every hold on the key and model, so it may send the held key a request
+  // (its check) when no other key is left.
+  ownsHold(id: string, model: string): bool {
+    for (const k of scopesOf(id, model)) {
+      const h = this.holds.get(k)
+      if (h !== undefined && h.owner !== this.node) return false
+    }
     return true
   }
 
-  // Marks the request sent to a held key as its check, whatever the wait says: used when every key of the
-  // provider is held, since the request is sent anyway and its answer counts as the check.
-  checkNow(id: string, model: string, now: f64): void {
+  // Marks the check as sent when the key is due. False when the key is held, is being checked, or is due for
+  // another node to check, so the caller picks another key.
+  startCheck(id: string, model: string, now: f64): bool {
+    if (this.state(id, model, now) !== "due") return false
+    this.claim(id, model, now)
+    return true
+  }
+
+  // The time a request for this key and model has to wait for: the latest next check of its holds (0 when none).
+  nextCheckOf(id: string, model: string): f64 {
+    let out = 0.0
     for (const k of scopesOf(id, model)) {
       const h = this.holds.get(k)
-      if (h === undefined) continue
-      h.probing = true
-      h.probeAt = now
-      const inc = this.open.get("h:" + k)
-      if (inc !== undefined) inc.recovering = true
+      if (h !== undefined && h.nextCheck > out) out = h.nextCheck
     }
+    return out
   }
 
   // The outcome of a request sent to the key. outcome is "ok" (served), "refused" (the provider refused it, with
@@ -113,47 +233,54 @@ export class HoldBook {
   // r is a number in [0, 1) that spreads the ladder's waits.
   settle(id: string, model: string, outcome: string, cls: FailureClass, reason: string, hintMs: f64 | undefined, now: f64, r: f64): void {
     if (outcome === "ok") {
+      // a served request releases the hold on its key or model, whether or not it was the check (Bifrost's rule)
       for (const k of scopesOf(id, model)) {
-        const h = this.holds.get(k)
-        if (h !== undefined && h.probing) this.release(k, now)
+        if (this.holds.has(k)) this.release(k, now)
       }
       return
     }
     if (outcome === "refused") {
-      const fc = cls
-      if (!holdsKey(fc)) return
-      const k = holdsAllModels(fc) ? id : scopeOf(id, model)
+      if (!holdsKey(cls)) return
+      const k = holdsAllModels(cls) ? id : scopeOf(id, model)
       const h = this.holds.get(k)
       if (h !== undefined) {
-        // a refusal from a request sent before the hold does not lengthen the wait
-        if (now < h.nextCheck && !h.probing) return
+        // only the scheduled check (the claim startCheck made) climbs the ladder; a request sent to a held key
+        // anyway, or one sent before the hold, leaves the hold and its wait as they are
+        if (h.claimBy !== this.node) return
         h.rung += 1
-        h.probing = false
-        h.cls = fc
+        h.claimBy = ""
+        h.claimAt = 0.0
+        h.cls = cls
         h.reason = reason
-        h.waitMs = holdWaitMs(fc, h.rung, hintMs, r)
+        h.waitMs = holdWaitMs(cls, h.rung, hintMs, r)
         h.nextCheck = now + h.waitMs
+        this.bump(h, now)
         const inc = this.open.get("h:" + k)
         if (inc !== undefined) inc.recovering = false
         return
       }
       const parts = splitId(id)
-      const rec = this.recent.get(k + "|" + fc)
+      const rec = this.recent.get(k + "|" + cls)
       const rung = rec !== undefined && now - rec.at <= RECENT_MS ? rec.rung : 0
-      const model2 = holdsAllModels(fc) ? "" : model
-      const hold = new Hold(k, parts.provider, parts.keyId, model2, fc, reason, now, holdWaitMs(fc, rung, hintMs, r), rung)
+      const model2 = holdsAllModels(cls) ? "" : model
+      const hold = new Hold(k, parts.provider, parts.keyId, model2, cls, reason, now, holdWaitMs(cls, rung, hintMs, r), rung, this.node)
+      hold.ver = this.lastVer(k) + 1
+      hold.by = this.node
+      hold.at = now
       this.holds.set(k, hold)
-      this.openIncident("h:" + k, k, parts.provider, parts.keyId, model2, fc, reason, now)
+      this.tombs.delete(k)
+      this.openIncident("h:" + k, k, parts.provider, parts.keyId, model2, cls, reason, now)
       return
     }
     // unsure: a check that failed for another reason is held again on the same rung
     for (const k of scopesOf(id, model)) {
       const h = this.holds.get(k)
-      if (h !== undefined && h.probing) {
-        h.probing = false
-        h.waitMs = holdWaitMs(h.cls, h.rung, undefined, r)
-        h.nextCheck = now + h.waitMs
-      }
+      if (h === undefined || h.claimBy !== this.node) continue
+      h.claimBy = ""
+      h.claimAt = 0.0
+      h.waitMs = holdWaitMs(h.cls, h.rung, undefined, r)
+      h.nextCheck = now + h.waitMs
+      this.bump(h, now)
     }
   }
 
@@ -171,12 +298,21 @@ export class HoldBook {
     return keys.length
   }
 
+  // Drops every hold on this node without a release, for when adaptive load balancing is turned off. Their
+  // incidents are resolved here.
+  forget(now: f64): void {
+    for (const k of this.holds.keys()) {
+      this.holds.delete(k)
+      this.resolve("h:" + k, now)
+    }
+    this.tombs = new Map()
+  }
+
   // The holds now, each with its state (held, checking or due) and the wait it was given.
   list(now: f64): { h: Hold, state: string }[] {
     const out: { h: Hold, state: string }[] = []
     for (const h of this.holds.values()) {
-      const state = now < h.nextCheck ? "held" : h.probing ? "checking" : "due"
-      out.push({ h: h, state: state })
+      out.push({ h: h, state: this.stateOf(h, now) })
     }
     return out
   }
@@ -197,10 +333,104 @@ export class HoldBook {
     return this.incidents
   }
 
-  private openIncident(key: string, target: string, provider: string, keyId: string, model: string, cls: string, reason: string, now: f64): void {
+  // What this node sends the others: its live holds and the releases still kept.
+  wire(now: f64): HoldWire[] {
+    this.pruneTombs(now)
+    const out: HoldWire[] = []
+    for (const h of this.holds.values()) out.push(wireOf(h, false, h.ver, h.by, h.at))
+    for (const t of this.tombs.values()) out.push(t)
+    return out
+  }
+
+  // Merges the holds of the other nodes. Each target takes the newer of its write and ours, so merging the
+  // same state again changes nothing. Invalid holds are skipped (cluster.tov refuses them before this).
+  merge(list: HoldWire[], now: f64): void {
+    for (const r of list) {
+      if (holdProblem(r) !== "") continue
+      const k = r.target
+      const cur = this.verOf(k)
+      if (cur !== undefined && !newer(r.ver, r.by, cur.ver, cur.by)) continue
+      const h = this.holds.get(k)
+      if (r.released) {
+        const rc: FailureClass = classOf(r.cls) ?? "rate_limit"
+        if (h !== undefined) this.drop(k, rc, r.rung, r.at)
+        this.tombs.set(k, r)
+        continue
+      }
+      const cls: FailureClass = classOf(r.cls) ?? "rate_limit"
+      const nh = new Hold(k, r.provider, r.keyId, r.model, cls, r.reason, r.heldAt, r.waitMs, r.rung, r.owner)
+      nh.nextCheck = r.nextCheck
+      nh.claimBy = r.claimBy
+      nh.claimAt = r.claimAt
+      nh.ver = r.ver
+      nh.by = r.by
+      nh.at = r.at
+      this.holds.set(k, nh)
+      this.tombs.delete(k)
+      if (h === undefined) this.openIncident("h:" + k, k, r.provider, r.keyId, r.model, cls, r.reason, r.heldAt)
+    }
+    this.pruneTombs(now)
+  }
+
+  private claim(id: string, model: string, now: f64): void {
+    for (const k of scopesOf(id, model)) {
+      const h = this.holds.get(k)
+      if (h === undefined) continue
+      h.claimBy = this.node
+      h.claimAt = now
+      this.bump(h, now)
+      const inc = this.open.get("h:" + k)
+      if (inc !== undefined) inc.recovering = true
+    }
+  }
+
+  // A local write: the next write count of the hold, by this node.
+  private bump(h: Hold, now: f64): void {
+    h.ver += 1
+    h.by = this.node
+    h.at = now
+  }
+
+  // The newest write known for a target: its live hold or its release.
+  private verOf(k: string): { ver: int, by: string } | undefined {
+    const h = this.holds.get(k)
+    if (h !== undefined) return { ver: h.ver, by: h.by }
+    const t = this.tombs.get(k)
+    if (t !== undefined) return { ver: t.ver, by: t.by }
+    return undefined
+  }
+
+  private lastVer(k: string): int {
+    const v = this.verOf(k)
+    return v === undefined ? 0 : v.ver
+  }
+
+  // Releases a hold on this node and keeps the release as a write.
+  private release(k: string, now: f64): void {
+    const h = this.holds.get(k)
+    if (h === undefined) return
+    this.tombs.set(k, wireOf(h, true, h.ver + 1, this.node, now))
+    this.drop(k, h.cls, h.rung, now)
+  }
+
+  // Takes a live hold out of the book: its rung is kept for the same reason, and its incident resolves.
+  private drop(k: string, cls: FailureClass, rung: int, at: f64): void {
+    this.recent.set(k + "|" + cls, { rung: rung, at: at })
+    this.holds.delete(k)
+    this.resolve("h:" + k, at)
+  }
+
+  private pruneTombs(now: f64): void {
+    for (const k of this.tombs.keys()) {
+      const t = this.tombs.get(k)
+      if (t !== undefined && t.at < now - TOMB_MS) this.tombs.delete(k)
+    }
+  }
+
+  private openIncident(key: string, target: string, provider: string, keyId: string, model: string, cls: string, reason: string, openedAt: f64): void {
     if (this.open.has(key)) return
     this.seq += 1
-    const inc = new Incident(this.seq, target, provider, keyId, model, cls, reason, now)
+    const inc = new Incident(this.seq, target, provider, keyId, model, cls, reason, openedAt)
     this.incidents.push(inc)
     this.open.set(key, inc)
     this.prune()
@@ -214,14 +444,6 @@ export class HoldBook {
     this.open.delete(key)
   }
 
-  private release(k: string, now: f64): void {
-    const h = this.holds.get(k)
-    if (h === undefined) return
-    this.recent.set(k + "|" + h.cls, { rung: h.rung, at: now })
-    this.holds.delete(k)
-    this.resolve("h:" + k, now)
-  }
-
   // Drops the oldest resolved incident once the list is over its cap (open ones are kept).
   private prune(): void {
     if (this.incidents.length <= INCIDENT_CAP) return
@@ -232,7 +454,7 @@ export class HoldBook {
 }
 
 test("a refusal holds the key until its wait runs out, then one request checks it", () => {
-  const b = new HoldBook()
+  const b = new HoldBook("n1")
   const t0 = 1000000.0
   b.settle("openai#pool", "gpt-4o", "refused", "credential", "invalid api key", undefined, t0, 0.5)
   // the whole key is held: no request goes to it, and the hold is listed with its reason
@@ -256,7 +478,7 @@ test("a refusal holds the key until its wait runs out, then one request checks i
 })
 
 test("a refused check climbs the ladder; a 5xx check holds the same rung again", () => {
-  const b = new HoldBook()
+  const b = new HoldBook("n1")
   const t0 = 2000000.0
   b.settle("p#k", "m", "refused", "rate_limit", "slow down", undefined, t0, 0.5)
   expect(b.list(t0)[0]!.h.waitMs).toBe(30000.0)
@@ -275,28 +497,42 @@ test("a refused check climbs the ladder; a 5xx check holds the same rung again",
   expect(b.list(t0 + 91000.0)[0]!.h.rung).toBe(1)
 })
 
-test("a request sent to a held key anyway is its check: a refusal climbs the ladder, a success releases", () => {
-  const b = new HoldBook()
+test("a request sent to a held key anyway does not climb the ladder; a served answer releases it", () => {
+  const b = new HoldBook("n1")
   b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 0.0, 0.5)
-  // every key is held, so the request goes to this one before its wait is over
-  b.checkNow("p#k", "m", 1000.0)
+  // every key is held, so the request is sent to this one before its wait is over: it is not the scheduled check
   expect(b.state("p#k", "m", 1000.0)).toBe("held")
+  expect(b.nextCheckOf("p#k", "m")).toBe(30000.0)
   b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 1000.0, 0.5)
-  expect(b.list(1000.0)[0]!.h.rung).toBe(1)
-  expect(b.list(1000.0)[0]!.h.nextCheck).toBe(61000.0)
-  b.checkNow("p#k", "m", 2000.0)
+  expect(b.list(1000.0)[0]!.h.rung).toBe(0)
+  expect(b.list(1000.0)[0]!.h.nextCheck).toBe(30000.0)
+  // a served answer releases it
   b.settle("p#k", "m", "ok", "unknown", "", undefined, 2000.0, 0.5)
   expect(b.list(2000.0).length).toBe(0)
 })
 
+test("ownership and the soonest check rank the held keys a request is sent to when every key is held", () => {
+  const a = new HoldBook("a")
+  const b = new HoldBook("b")
+  a.settle("p#k1", "m", "refused", "rate_limit", "x", undefined, 0.0, 0.5)
+  a.settle("p#k2", "m", "refused", "rate_limit", "x", 90000.0, 0.0, 0.5)
+  b.merge(a.wire(0.0), 0.0)
+  // a owns both holds; b owns neither, and k1 is due sooner than k2
+  expect(a.ownsHold("p#k1", "m")).toBe(true)
+  expect(b.ownsHold("p#k1", "m")).toBe(false)
+  expect(b.nextCheckOf("p#k1", "m")).toBe(30000.0)
+  expect(b.nextCheckOf("p#k2", "m")).toBe(90000.0)
+  expect(b.nextCheckOf("q#k", "m")).toBe(0.0)
+})
+
 test("a provider's wait hint is used as given, with the 10 second floor", () => {
-  const b = new HoldBook()
+  const b = new HoldBook("n1")
   b.settle("p#k", "", "refused", "rate_limit", "x", 2500.0, 0.0, 0.5)
   expect(b.list(0.0)[0]!.h.waitMs).toBe(10000.0)
 })
 
 test("a model hold leaves the key serving its other models", () => {
-  const b = new HoldBook()
+  const b = new HoldBook("n1")
   b.settle("azure#eu", "gpt-4o", "refused", "model_access", "no access", undefined, 0.0, 0.5)
   expect(b.state("azure#eu", "gpt-4o", 1000.0)).toBe("held")
   expect(b.state("azure#eu", "gpt-4o-mini", 1000.0)).toBe("")
@@ -312,7 +548,7 @@ test("a model hold leaves the key serving its other models", () => {
 })
 
 test("a key released within ten minutes for the same reason resumes its rung", () => {
-  const b = new HoldBook()
+  const b = new HoldBook("n1")
   b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 0.0, 0.5)
   b.startCheck("p#k", "m", 30000.0)
   b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 30000.0, 0.5)
@@ -329,7 +565,7 @@ test("a key released within ten minutes for the same reason resumes its rung", (
 })
 
 test("circuits that failures open are incidents until they close", () => {
-  const b = new HoldBook()
+  const b = new HoldBook("n1")
   b.noteOpen("p#k", 1000.0)
   b.noteOpen("policy-name", 1000.0)
   expect(b.incidentList().length).toBe(1)
@@ -340,4 +576,98 @@ test("circuits that failures open are incidents until they close", () => {
   b.noteOpen("p#k", 6000.0)
   b.settle("p#k", "", "refused", "credential", "x", undefined, 6000.0, 0.5)
   expect(b.incidentList().length).toBe(3)
+})
+
+test("a hold reaches another node, which holds the key too, and a release there clears it here", () => {
+  const a = new HoldBook("a")
+  const b = new HoldBook("b")
+  const t0 = 1000000.0
+  a.settle("p#k", "m", "refused", "credential", "bad key", undefined, t0, 0.5)
+  const sent = a.wire(t0)
+  b.merge(sent, t0)
+  expect(b.state("p#k", "m", t0 + 1000.0)).toBe("held")
+  expect(b.list(t0 + 1000.0)[0]!.h.reason).toBe("bad key")
+  // the hold's incident is the same on both nodes
+  expect(b.incidentList()[0]!.openedAt).toBe(t0)
+  // the release on b is a write that a takes
+  expect(b.clear("p#k", t0 + 2000.0)).toBe(true)
+  a.merge(b.wire(t0 + 2000.0), t0 + 2000.0)
+  expect(a.state("p#k", "m", t0 + 2000.0)).toBe("")
+  expect(a.list(t0 + 2000.0).length).toBe(0)
+  expect(a.incidentList()[0]!.resolvedAt).toBe(t0 + 2000.0)
+  // the stale copy of the hold, sent again, does not bring it back
+  a.merge(sent, t0 + 2000.0)
+  expect(a.list(t0 + 2000.0).length).toBe(0)
+  expect(a.state("p#k", "m", t0 + 2000.0)).toBe("")
+})
+
+test("merging is order-free: two refusals at once settle on one writer everywhere", () => {
+  const a = new HoldBook("a")
+  const b = new HoldBook("b")
+  const t0 = 1000000.0
+  a.settle("p#k", "m", "refused", "rate_limit", "x", undefined, t0, 0.5)
+  b.settle("p#k", "m", "refused", "rate_limit", "x", undefined, t0, 0.5)
+  const wa = a.wire(t0)
+  const wb = b.wire(t0)
+  a.merge(wb, t0)
+  b.merge(wa, t0)
+  expect(a.wire(t0)[0]!.by).toBe("b")
+  expect(b.wire(t0)[0]!.by).toBe("b")
+  // merging the same state again is a no-op
+  a.merge(wb, t0)
+  b.merge(wa, t0)
+  expect(a.wire(t0).length).toBe(1)
+  expect(a.incidentList().length).toBe(1)
+  expect(b.incidentList().length).toBe(1)
+})
+
+test("only the owner checks a held key; a claim seen elsewhere keeps the others off it", () => {
+  const a = new HoldBook("a")
+  const b = new HoldBook("b")
+  const t0 = 1000000.0
+  a.settle("p#k", "m", "refused", "rate_limit", "x", undefined, t0, 0.5)
+  b.merge(a.wire(t0), t0)
+  const due = t0 + 30000.0
+  // due on b, but a owns the check: b waits
+  expect(b.state("p#k", "m", due)).toBe("held")
+  expect(b.startCheck("p#k", "m", due)).toBe(false)
+  expect(b.ownsHold("p#k", "m")).toBe(false)
+  // a sends the check and gossips the claim
+  expect(a.state("p#k", "m", due)).toBe("due")
+  expect(a.startCheck("p#k", "m", due)).toBe(true)
+  b.merge(a.wire(due), due)
+  expect(b.state("p#k", "m", due + 1000.0)).toBe("checking")
+  // the check is refused: a climbs to rung 1, and b sees the new wait
+  a.settle("p#k", "m", "refused", "rate_limit", "x", undefined, due, 0.5)
+  b.merge(a.wire(due), due)
+  expect(b.list(due)[0]!.h.rung).toBe(1)
+  expect(b.list(due)[0]!.h.nextCheck).toBe(due + 60000.0)
+  expect(b.list(due)[0]!.h.claimBy).toBe("")
+  // after the owner's wait the other node takes over, if the owner has not checked
+  const late = due + 60000.0
+  expect(b.state("p#k", "m", late + TAKEOVER_MS - 1.0)).toBe("held")
+  expect(b.state("p#k", "m", late + TAKEOVER_MS)).toBe("due")
+})
+
+test("a node that does not own a held key cannot be the one that sends it anyway", () => {
+  const a = new HoldBook("a")
+  const b = new HoldBook("b")
+  a.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 0.0, 0.5)
+  b.merge(a.wire(0.0), 0.0)
+  expect(b.ownsHold("p#k", "m")).toBe(false)
+  expect(a.ownsHold("p#k", "m")).toBe(true)
+  expect(b.ownsHold("q#k", "m")).toBe(true)
+})
+
+test("a release is forgotten once it is old, and a bad hold is refused by holdProblem", () => {
+  const a = new HoldBook("a")
+  a.settle("p#k", "m", "refused", "rate_limit", "x", undefined, 0.0, 0.5)
+  // a rate limit holds the model, so its target is "p#k@m"
+  expect(a.clear("p#k@m", 1000.0)).toBe(true)
+  expect(a.wire(1000.0).length).toBe(1)
+  expect(a.wire(1000.0)[0]!.released).toBe(true)
+  expect(a.wire(1000.0 + TOMB_MS + 1.0).length).toBe(0)
+  expect(holdProblem(wireOf(new Hold("p#k", "p", "k", "m", "rate_limit", "x", 0.0, 30000.0, 0, "a"), false, 1, "a", 0.0))).toBe("")
+  expect(holdProblem(wireOf(new Hold("p#k", "p", "k", "m", "rate_limit", "x", 0.0, -5.0, 0, "a"), false, 1, "a", 0.0))).toBe("hold has a negative or out-of-range number")
+  expect(holdProblem(wireOf(new Hold("p#k", "p", "k", "m", "rate_limit", "x", 0.0, 30000.0, 0, "a"), false, 0, "a", 0.0))).toBe("hold has a bad write count")
 })

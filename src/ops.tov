@@ -1,7 +1,7 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec, WasmLimitsSpec } from "./config"
 import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page, timeOf } from "./logapi"
 import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
@@ -88,25 +88,46 @@ function configOf(fs: Field[], dflt: string): string {
   return raw === undefined || isNull(raw) ? dflt : raw
 }
 
+// The plugin file a body names, or dflt when it names none.
+function pathOf(fs: Field[], dflt: string | undefined): string | undefined {
+  const raw = find(fs, "path")
+  if (raw === undefined) return dflt
+  const p = rawStr(fs, "path") ?? ""
+  return p === "" ? undefined : p
+}
+
+// The wasm_limits a body names, or dflt when it names none.
+function limitsOf(fs: Field[], dflt: WasmLimitsSpec | undefined): WasmLimitsSpec | undefined {
+  const raw = find(fs, "wasm_limits")
+  if (raw === undefined) return dflt
+  if (!raw.startsWith("{")) return undefined
+  try {
+    return JSON.parse(raw) as WasmLimitsSpec
+  } catch (e) {
+    return dflt
+  }
+}
+
 // Why a plugin cannot be built from its config: "" when it can. Checked as enabled, so a disabled plugin is
 // still checked for its name and config.
 function badPlugin(spec: PluginSpec): string {
-  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}" })
+  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}", path: spec.path, limits: spec.wasm_limits })
   return st.status === "error" ? st.error : ""
 }
 
 // One configured plugin as Bifrost's plugin response: its name, whether it is on, its config and its status.
 function pluginJson(sp: PluginSpec): string {
   const config = sp.config_json ?? ""
-  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config })
-  const builtin = builtinPlugins().includes(sp.name)
+  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config, path: sp.path, limits: sp.wasm_limits })
+  const custom = (sp.path ?? "") !== ""
+  const builtin = !custom && builtinPlugins().includes(sp.name)
   return jobj([
     jkv("name", JSON.stringify(sp.name)),
     jkv("actualName", JSON.stringify(sp.name)),
     jkv("enabled", sp.enabled === false ? "false" : "true"),
     jkv("config", config.trim() === "" ? "{}" : config),
     jkv("isCustom", builtin ? "false" : "true"),
-    jkv("path", "null"),
+    jkv("path", custom ? JSON.stringify(sp.path) : "null"),
     jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(["llm"]))])),
   ])
 }
@@ -919,6 +940,7 @@ export class Ops {
     const id = cc.node_id ?? ""
     if (id !== "") this.nodeId = id
     if (this.counters === undefined) this.counters = new Counters(this.nodeId)
+    this.engine.health.holds.setNode(this.nodeId)
     this.clusterTimer = setInterval(() => {
       this.syncCluster()
     }, Math.max(100, syncInterval(cc)))
@@ -1039,6 +1061,7 @@ export class Ops {
     }
     // each worker is its own slot (inherited counters would collide)
     this.counters = new Counters(this.nodeId + "/" + process.pid)
+    this.engine.health.holds.setNode(this.nodeId + "/" + process.pid)
     this.pushed = new Map()
     this.pushedWindow = new Map()
     this.engine.sharedWindows = true
@@ -1109,12 +1132,16 @@ export class Ops {
       this.pushed.set(u.name, u.used)
       this.pushedWindow.set(u.name, u.window)
     }
+    // the key holds travel with the usage (holds.tov); they exist only under adaptive load balancing
+    c.setHolds(this.engine.health.holds.wire(now))
   }
 
   applyRemote(c: Counters): void {
     const now = Date.now()
     const gov = this.engine.gov
     for (const u of gov.sharedUsage(now)) gov.setRemote(u.name, u.window, Math.max(0.0, c.total(u.name, u.window) - u.used), now)
+    const hs = c.takeHolds()
+    if (this.engine.cfg.health?.adaptive === true) this.engine.health.holds.merge(hs, now)
   }
 
   syncCluster(): void {
@@ -2180,7 +2207,7 @@ export class Ops {
   }
 
   // POST /api/plugins: {name, enabled, config}. 201 with the plugin; 409 when the name is taken; 400 when the name
-  // is missing, the config does not build, or a custom plugin path is given (this gateway has none).
+  // is missing, or the config does not build (a custom plugin path must be a .wasm file that loads).
   private createPlugin(body: string): Reply {
     let fs: Field[] = []
     try {
@@ -2190,12 +2217,11 @@ export class Ops {
     }
     const name = (rawStr(fs, "name") ?? "").trim()
     if (name === "") return pluginError(400, "Plugin name is required")
-    if ((rawStr(fs, "path") ?? "") !== "") return pluginError(400, "custom plugin paths are not supported by this gateway")
     const specs = this.store.cfg.plugins ?? []
     for (const sp of specs) {
       if (sp.name === name) return pluginError(409, "Plugin already exists")
     }
-    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}") }
+    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}"), path: pathOf(fs, undefined), wasm_limits: limitsOf(fs, undefined) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = specs.slice()
@@ -2219,7 +2245,7 @@ export class Ops {
     if (at < 0) return pluginError(404, "plugin not found")
     const cur = specs[at]!
     const en = rawBool(fs, "enabled")
-    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}") }
+    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}"), placement: cur.placement, order: cur.order, path: pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = []

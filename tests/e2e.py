@@ -1730,6 +1730,7 @@ def l104_e2e(env):
     cfg = {
         "client": {"enable_logging": False, "enforce_auth_on_inference": False},
         "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "health": {"adaptive": True},
         "providers": {"openai": {"keys": [{"name": "bad", "value": "sk-bad-key-l104", "models": [], "weight": 1.0},
                                           {"name": "good", "value": "sk-l104-good", "models": [], "weight": 1.0}],
                                  "network_config": {"base_url": MOCK, "max_retries": 0}}},
@@ -1785,6 +1786,149 @@ def l104_e2e(env):
     finally:
         gw.terminate()
 
+
+GW_L123A = "http://127.0.0.1:18172"  # adaptive load balancing across two clustered nodes: a hold is shared and checked once
+GW_L123B = "http://127.0.0.1:18179"
+
+def l123_config(node, peer, adaptive):
+    """A gateway with one refused key (bad) and one that serves; adaptive load balancing and clustering are optional."""
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "bad", "value": "sk-bad-key-l123", "models": [], "weight": 1.0},
+                                          {"name": "good", "value": "sk-l123-good", "models": [], "weight": 1.0}],
+                                 "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    if adaptive:
+        cfg["health"] = {"adaptive": True}
+    if peer is not None:
+        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l123", "interval_ms": 200, "peers": [peer]}
+    return cfg
+
+def l123_start(env, name, port, cfg):
+    path = os.path.join(BUILD, f"e2e.{name}.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", port, "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, f"e2e.{name}.log"), "w"))
+    wait(f"http://127.0.0.1:{port}/health")
+    return gw
+
+def l123_held(base):
+    s, _, b = call("GET", "/api/adaptive-routing/held-keys", None, None, base=base, auth=False)
+    return [r for r in json.loads(b)["held_keys"] if r["target"] == "openai#bad"] if s == 200 else []
+
+def l123_bad_sent():
+    return len([x for x in seen() if "bad-key-l123" in x["auth"]])
+
+def l123_e2e(env):
+    """L123: under adaptive load balancing a refusal on one node holds the key on its peer too, the peer sends it
+    nothing, the owner's check is the only request cluster-wide, and a release on the peer clears the hold here. With
+    adaptive load balancing off (one node, its own ports) nothing is held and the refused key keeps being picked."""
+    msgs = [{"role": "user", "content": "hi"}]
+    def chat(base):
+        return call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msgs}, None, base=base, auth=False)[0]
+    procs = []
+    try:
+        procs.append(l123_start(env, "l123a", "18172", l123_config("l123-a", GW_L123B, True)))
+        procs.append(l123_start(env, "l123b", "18179", l123_config("l123-b", GW_L123A, True)))
+        held_a = []
+        for _ in range(30):
+            chat(GW_L123A)
+            held_a = l123_held(GW_L123A)
+            if held_a:
+                break
+        check("node A holds the refused key after the provider's 401", len(held_a) == 1 and held_a[0]["state"] == "held" and held_a[0]["failure_class"] == "credential" and held_a[0]["rung"] == 0, held_a[:1])
+        held_b = []
+        for _ in range(50):
+            held_b = l123_held(GW_L123B)
+            if held_b:
+                break
+            time.sleep(0.1)
+        reason_a = held_a[0]["reason"] if held_a else ""
+        check("node B holds the same key from A's refusal, with the same reason", len(held_b) == 1 and held_b[0]["state"] == "held" and held_b[0]["reason"] == reason_a and held_b[0]["failure_class"] == "credential", held_b[:1])
+        s, _, b = call("GET", "/api/adaptive-routing/incidents", None, None, base=GW_L123B, auth=False)
+        check("node B lists the hold's incident", s == 200 and json.loads(b)["total"] == 1 and json.loads(b)["incidents"][0]["target"] == "openai#bad", (s, b[:200]))
+        sent0 = l123_bad_sent()
+        served = sum(1 for _ in range(8) if chat(GW_L123B) == 200)
+        check("node B sends the held key nothing and serves its chats", l123_bad_sent() == sent0 and served == 8, (sent0, l123_bad_sent(), served))
+        # the wait runs out on the owner; the peer keeps off the key until the owner's check has had its time
+        due = False
+        for _ in range(200):
+            h = l123_held(GW_L123A)
+            if h and h[0]["state"] == "due":
+                due = True
+                break
+            time.sleep(0.25)
+        check("the hold on the owner comes due", due, l123_held(GW_L123A)[:1])
+        sent1 = l123_bad_sent()
+        served = sum(1 for _ in range(4) if chat(GW_L123B) == 200)
+        check("while the owner's check is due, node B does not send the key", l123_bad_sent() == sent1 and served == 4, (sent1, l123_bad_sent(), served))
+        # the owner's requests pick the key (about half of them) and the first one is the check
+        for _ in range(40):
+            if l123_bad_sent() > sent1:
+                break
+            chat(GW_L123A)
+        for _ in range(4):
+            chat(GW_L123A)
+            chat(GW_L123B)
+        check("the owner's check is the one request sent to the key cluster-wide", l123_bad_sent() - sent1 == 1, (sent1, l123_bad_sent()))
+        climbed = False
+        for _ in range(50):
+            h = l123_held(GW_L123B)
+            if h and h[0]["rung"] == 1:
+                climbed = True
+                break
+            time.sleep(0.1)
+        check("the refused check climbs the ladder on node B too", climbed, l123_held(GW_L123B)[:1])
+        s, _, b = call("POST", "/api/adaptive-routing/conditions/clear", {"keys": ["openai#bad"]}, None, base=GW_L123B, auth=False)
+        check("a release on node B returns the hold", s == 200 and json.loads(b)["count"] == 1, (s, b[:200]))
+        gone = False
+        for _ in range(50):
+            if not l123_held(GW_L123A):
+                gone = True
+                break
+            time.sleep(0.1)
+        check("the release on node B clears the hold on node A", gone, l123_held(GW_L123A)[:1])
+        both = []
+        for base in [GW_L123A, GW_L123B]:
+            s, _, b = call("GET", "/api/adaptive-routing/history/issues?statuses=resolved", None, None, base=base, auth=False)
+            both.append(json.loads(b)["total"] if s == 200 else -1)
+        check("both nodes keep the same resolved incident", both == [1, 1], both)
+    finally:
+        for p in procs:
+            p.terminate()
+            p.wait(timeout=10)
+    # every key of the provider held: the request is still sent (it is not a scheduled check), and its refusal leaves
+    # the hold on its rung and its wait as they were
+    cfg_all = l123_config("l123-all", None, True)
+    cfg_all["providers"]["openai"]["keys"] = [cfg_all["providers"]["openai"]["keys"][0]]
+    gw = l123_start(env, "l123all", "18172", cfg_all)
+    try:
+        for _ in range(20):
+            chat(GW_L123A)
+            if l123_held(GW_L123A):
+                break
+        held = l123_held(GW_L123A)
+        check("with its only key held, the refused key is listed on its first rung", len(held) == 1 and held[0]["state"] == "held" and held[0]["rung"] == 0, held[:1])
+        sent0 = l123_bad_sent()
+        codes = [chat(GW_L123A) for _ in range(3)]
+        check("with every key held, the request is still sent to the key", l123_bad_sent() - sent0 == 3, (sent0, l123_bad_sent(), codes))
+        after = l123_held(GW_L123A)
+        check("the refusal of a request sent anyway keeps the hold on its rung and wait", len(after) == 1 and after[0]["rung"] == 0 and after[0]["state"] == "held" and held and after[0]["next_check_at"] == held[0]["next_check_at"], after[:1])
+        s, _, b = call("POST", "/api/adaptive-routing/conditions/clear", {"keys": ["openai#bad"]}, None, base=GW_L123A, auth=False)
+        check("the held key is released", s == 200 and json.loads(b)["count"] == 1, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait(timeout=10)
+    # one node with adaptive load balancing off: nothing is held, and the refused key keeps being picked
+    gw = l123_start(env, "l123off", "18172", l123_config("l123-off", None, False))
+    try:
+        for _ in range(12):
+            chat(GW_L123A)
+        check("with adaptive load balancing off, a refused key is not held", l123_held(GW_L123A) == [] and json.loads(call("GET", "/api/adaptive-routing/held-keys", None, None, base=GW_L123A, auth=False)[2])["total"] == 0)
+        check("with adaptive load balancing off, the refused key is still picked and refused", l123_bad_sent() >= 2, l123_bad_sent())
+    finally:
+        gw.terminate()
+        gw.wait(timeout=10)
 
 GW_G41 = "http://127.0.0.1:18183"  # rate-limit shares per project member, RBAC roles by id, profiles attached to roles, cycles overrides across a boot
 
@@ -3630,7 +3774,7 @@ def l97l_e2e(env):
         s, _, b = api("POST", "/api/plugins", {"enabled": True})
         check("a plugin needs a name", s == 400 and "name" in b, (s, b[:200]))
         s, _, b = api("POST", "/api/plugins", {"name": "x-l97l", "path": "/tmp/x.so"})
-        check("a custom plugin path is refused", s == 400 and "custom plugin" in b, (s, b[:200]))
+        check("a Go shared-object plugin path is refused with the reason", s == 400 and "Go shared-object" in b, (s, b[:200]))
         s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True}, who=VIC)
         check("a viewer may not add a plugin", s == 403, (s, b[:200]))
         s, _, b = api("GET", "/api/plugins/loaded")
@@ -4775,6 +4919,91 @@ def l125_e2e(env):
         gw.terminate()
         gw.wait()
 
+def l121_e2e(env):
+    """L121: WebAssembly plugins (Bifrost's JSON ABI, on WAMR). A plugin entry whose path is a .wasm file is
+    loaded: pre_hook rewrites the request the provider sees, post_hook adds a field to the answer, a short
+    circuit answers without the provider, a trapping or looping plugin fails its hook without failing the
+    request, and the plugin API takes a path. Its own gateway (18158); the plugin is tests/wasm/plugin.wasm."""
+    import hashlib
+    base = "http://127.0.0.1:18158"
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    cfg_path = os.path.join(BUILD, "e2e.l121.json")
+    adm = {"authorization": "Bearer sk-admin-l121"}
+    vic = {"authorization": "Bearer sk-viewer-l121"}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l121", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l121").hexdigest()},
+                                 {"name": "vic", "role": "viewer", "token_sha256": hashlib.sha256(b"sk-viewer-l121").hexdigest()}]},
+        "plugins": [{"name": "wasm-rewrite", "enabled": True, "path": wasm, "config": {"mode": "rewrite", "from": "hello-wasm", "to": "bonjour-wasm", "tag": "e2e"}}],
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18158", "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.l121.log"), "w"))
+    def api(method, p, body=None, who=adm):
+        return call(method, p, body, who, base=base, auth=False)
+    def ask(text):
+        return call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": text}]}, {}, base=base, auth=False)
+    try:
+        wait(base + "/health")
+        s, _, b = api("GET", "/api/plugins/loaded")
+        check("a plugin loaded from a .wasm file is in the live chain, under the name it reports", s == 200 and json.loads(b)["plugins"] == ["raiju-test-plugin"], (s, b[:200]))
+        s, _, b = api("GET", "/api/plugins/wasm-rewrite")
+        listed = json.loads(b) if s == 200 else {}
+        check("the plugin list shows its path, as a custom plugin that is active", s == 200 and listed.get("path") == wasm and listed.get("isCustom") is True and listed.get("status", {}).get("status") == "active", (s, b[:300]))
+
+        n = len(seen())
+        s, _, b = ask("say hello-wasm please")
+        up = seen()[n:]
+        check("pre_hook rewrites the request the provider receives", s == 200 and len(up) == 1 and "bonjour-wasm" in up[0]["body"] and "hello-wasm" not in up[0]["body"], (s, up[0]["body"][:300] if up else "no request"))
+        answer = json.loads(b) if s == 200 else {}
+        check("post_hook adds a field to the answer, and it saw the context pre_hook set", answer.get("x_wasm_plugin") == "ctx-ok:e2e" and answer.get("choices", [{}])[0].get("message", {}).get("content", "").startswith("Hello"), b[:300])
+
+        s, _, b = api("POST", "/api/plugins", {"name": "wasm-short", "enabled": True, "path": wasm, "config": {"mode": "short"}})
+        check("a plugin with a path is added over the API and builds", s == 201 and json.loads(b).get("plugin", {}).get("status", {}).get("status") == "active", (s, b[:300]))
+        n = len(seen())
+        s, h, b = ask("anything")
+        check("a short circuit answers without the provider", s == 200 and "from the plugin" in b and hdr(h, "x-bf-plugin-short-circuit") == "true" and len(seen()) == n, (s, b[:300], len(seen()) - n))
+        check("and the post_hook of the plugin before it still saw the answer", '"x_wasm_plugin":"ctx-ok:e2e"' in b, b[:300])
+        s, _, b = api("PUT", "/api/plugins/wasm-short", {"config": {"mode": "fail"}})
+        s2, _, b2 = ask("anything again")
+        check("a short-circuit error carries its status and body", s == 200 and s2 == 418 and "plugin_blocked" in b2, (s, s2, b2[:300]))
+        s, _, b = api("DELETE", "/api/plugins/wasm-short")
+        check("the short-circuit plugin is removed", s == 200, (s, b[:200]))
+
+        s, _, b = api("POST", "/api/plugins", {"name": "wasm-trap", "enabled": True, "path": wasm, "config": {"mode": "trap"}})
+        check("a plugin that traps still loads", s == 201, (s, b[:300]))
+        for i in range(25):
+            s, _, b = ask("hello-wasm after trap %d" % i)
+            if s != 200:
+                break
+        check("a trapping plugin fails its hook, not the request (25 times in a row)", s == 200 and "x_wasm_plugin" in b, (s, b[:300]))
+        s, _, b = api("DELETE", "/api/plugins/wasm-trap")
+
+        s, _, b = api("POST", "/api/plugins", {"name": "wasm-loop", "enabled": True, "path": wasm, "config": {"mode": "loop"}, "wasm_limits": {"max_instructions": 200000}})
+        check("a plugin with limits is added", s == 201, (s, b[:300]))
+        t0 = time.time()
+        s, _, b = ask("hello-wasm with a loop")
+        took = time.time() - t0
+        check("the instruction limit ends a runaway loop and the request is served", s == 200 and took < 5.0, (s, took, b[:200]))
+        saved = json.load(open(cfg_path))
+        entry = [p for p in saved.get("plugins", []) if p.get("name") == "wasm-loop"]
+        check("the path and the limits are saved in the config", len(entry) == 1 and entry[0].get("path") == wasm and entry[0].get("wasm_limits", {}).get("max_instructions") == 200000, entry)
+        s, _, b = api("DELETE", "/api/plugins/wasm-loop")
+
+        s, _, b = api("POST", "/api/plugins", {"name": "native", "path": "/plugins/native.so", "enabled": True})
+        check("a Go shared object is refused with the reason", s == 400 and "Go shared-object" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "gone", "path": "/no/such/plugin.wasm", "enabled": True})
+        check("a plugin file that does not exist is refused", s == 400 and "plugin file" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "url", "path": "https://example.test/p.wasm", "enabled": True})
+        check("a plugin URL is refused", s == 400 and "URL" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "init-fails", "path": wasm, "enabled": True, "config": {"mode": "initfail"}})
+        check("a plugin whose init fails is refused", s == 400 and "init returned 1" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "wasm-viewer", "path": wasm, "enabled": True}, who=vic)
+        check("a viewer may not add a plugin", s == 403, (s, b[:200]))
+    finally:
+        gw.terminate()
 
 def main():
     unique_ports()
@@ -6966,6 +7195,8 @@ def main():
         l113_e2e(env)
         # adaptive load balancing: a refused key is held, listed, kept out of rotation and released; its incident history
         l104_e2e(env)
+        # L123: key holds under adaptive load balancing, shared by two clustered nodes (ports 18172 and 18179), and off without it
+        l123_e2e(env)
         # decisions: the unprefixed routes, decision pricing overrides and the native-decision check under compat: their own gateway
         l109_e2e(env)
         # a websocket session cap, top-level access profiles, dual credentials, stream idle cuts and oauth_key_config: their own gateways
@@ -6990,6 +7221,8 @@ def main():
         l112b_e2e(env)
         # MCP token exchange: the exchange configuration, verify-exchange against a token endpoint stub and an MCP server that takes only its tokens: their own gateway
         l112b_exchange_e2e(env)
+        # WebAssembly plugins (a .wasm path in plugins[]): rewrites, short circuits, traps, limits and the plugin API: their own gateway
+        l121_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
         l113_ui_e2e(env)
     finally:

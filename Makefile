@@ -1,4 +1,4 @@
-.PHONY: build test unit e2e ui web web-check check openapi-check parity-count run bench tov tov-test
+.PHONY: build test unit e2e ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture
 
 # Tov's async slab allocator corrupts its free lists once ~30 fetches are in
 # flight (see docs/tov-notes.md); plain malloc avoids it at the same speed.
@@ -16,6 +16,12 @@ tov-test:
 
 build:
 	mkdir -p build && $(TOV) build src/main.tov -o build/raiju
+
+# The WebAssembly plugin the unit and e2e tests load (tests/wasm/plugin.c). The .wasm is committed, so the
+# tests need no toolchain; this rebuilds it with clang and wasm-ld (clang --target=wasm32 needs no libc).
+wasm-fixture:
+	clang --target=wasm32 -O2 -nostdlib -fno-builtin -Wall -Wl,--no-entry -Wl,--initial-memory=262144 -Wl,-z,stack-size=16384 -o tests/wasm/plugin.wasm tests/wasm/plugin.c
+	cd tov-patches/tests && clang --target=wasm32 -O1 -nostdlib -fno-builtin -Wl,--no-entry -Wl,--export-all -Wl,-z,stack-size=8192 -Wl,--initial-memory=131072 -Wl,--max-memory=1048576 -o wasm_mod.wasm wasm_mod.c
 
 check:
 	scripts/check.py src/*.tov src/providers/*.tov tests/*.tov

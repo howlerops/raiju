@@ -3,10 +3,11 @@
 Raiju builds against [Tov](https://github.com/richiemcilroy/Tov) at commit
 `c2048582de4e9468267f801313144d75c12e983f` plus the patches here, applied in
 order by `scripts/build-tov.sh` (`make tov`). Each patch is written to be offered
-upstream. `tests/run.sh` checks all four with the patched compiler:
+upstream. `tests/run.sh` checks all five with the patched compiler:
 `TOV=build/tov/target/release/tov tov-patches/tests/run.sh` (or `make tov-test`).
 Patch 0004 is written on top of 0003 (its hunks include the ALPN signatures), so the
-patches apply in order only.
+patches apply in order only. Patch 0005 adds a vendored C library (about 2.7 MB of text), which
+the first four do not.
 
 ## Submitting upstream
 
@@ -186,3 +187,76 @@ retried). `setBroadcast`, `setTTL`, `setMulticastTTL`, `setMulticastLoopback`, `
 **Not covered.** No source-specific multicast (IGMPv3), no `connect` on the Tov API (send takes
 the address), and no `dgram` buffer sizes beyond the kernel's limits. `node:dgram` tests run
 through `tov-patches/tests/udp_dgram.tov`.
+
+## 0005 — WebAssembly modules (`std/wasm`, on WAMR)
+
+**Problem.** Tov could not run WebAssembly. Bifrost's dynamic plugins are WebAssembly modules
+(its Go shared-object plugins are out of reach for a native Tov binary), and the only route to a
+WebAssembly engine was linking JavaScriptCore into the gateway (about 34 MB). This adds a small
+interpreter, [WAMR](https://github.com/bytecodealliance/wasm-micro-runtime), to the runtime
+build, behind a Tov module.
+
+**API (Tov, `import { instantiate } from "std/wasm"`).**
+
+```ts
+const m = instantiate(bytes, { fuel: 5_000_000, stackBytes: 65536, maxPages: 256 })
+m.has("add")                       // an export of that name
+m.arity("add")                     // its parameter count, -1 when there is none
+m.call("add", [40, 2])             // i32 and i64 arguments as int; the first result as int (42)
+m.write(ptr, bytes)                // linear memory, by offset (u8[])
+const out = m.read(ptr, len)       // throws when the range is outside memory
+m.memorySize()                     // bytes
+m.output()                         // what the module wrote to standard output and error (64 KiB at most)
+m.close()
+```
+
+A trap, a missing export, a wrong argument count or a bad offset throws an `Error` with WAMR's
+message. A trapped instance keeps the state it had at the
+trap (a module's own stack pointer is not restored), so a host that wants to go on replaces it
+with a new instance, as `src/wasmplugin.tov` does.
+
+**Limits per instance.**
+- `maxPages`: the most 64 KiB pages of linear memory (default 256). A module whose initial memory
+  is above it is refused; `memory.grow` past it returns -1.
+- `stackBytes`: the operand stack (default 64 KiB). Past it a call traps.
+- `fuel`: the most instructions one call may run (WAMR's instruction metering; default none, at
+  most 2^31 - 1). A call past it traps with "instruction limit exceeded". There is no wall-clock
+  limit: a call runs on the thread that made it until it returns, traps or runs out of fuel.
+
+**What a module can reach.** Nothing but its own memory and a WASI subset written for this
+patch (runtime/wasm.c): `fd_write` to fd 1 and 2 (captured, read back with `output()`),
+`fd_read` of an empty stdin, `clock_time_get`, `clock_res_get`, `random_get`, an empty
+environment and argument list, `sched_yield`, `proc_exit` (a trap) and refusals (`EBADF`,
+`ENOSYS`) for files and polling; and `env.abort`, which AssemblyScript imports. No files, no
+sockets, no processes. An import outside that set does not stop the module from loading; calling
+it traps.
+
+**Design.**
+- WAMR 2.4.5 (`WAMR-2.4.5`, commit `25bd7eb6`, Apache-2.0 with LLVM exception; `vendor/wamr/LICENSE`)
+  is vendored under `vendor/wamr`: the fast interpreter, the loader, the runtime, the `ems`
+  allocator files and the POSIX platform layer, with its headers (2.7 MB; AOT, JIT, WASI libc,
+  threads, SIMD and GC code is not included). It is built with explicit bounds checks
+  (`WASM_DISABLE_HW_BOUND_CHECK=1`): no signal handlers and no 8 GiB address reservation per
+  memory. Flags are in `crates/tov/src/tls_flags.rs`.
+- It is built like BoringSSL: into the vendored archive the compiler carries, linked only into
+  programs that call the natives, which `codegen` finds by the `tv_native_wasm` prefix.
+  `runtime/wasm.c` is one more file of the TLS library's runtime archive.
+- Platforms: Linux on x86-64 and AArch64. Elsewhere `runtime/wasm.c` is compiled as stubs
+  (`TV_NO_WASM`) that report "WebAssembly is not supported on this platform", and WAMR is left
+  out of the vendored archive, so other targets build as before.
+- Instances live in a table of handles (`wasmLoad` returns one; at most 1024 at once).
+
+**Files.**
+- `vendor/wamr/**`: WAMR 2.4.5 (the subset above).
+- `runtime/wasm.c`, `runtime/tov.h`: the natives `wasmLoad`, `wasmHas`, `wasmArity`, `wasmCall`,
+  `wasmRead`, `wasmWrite`, `wasmMemSize`, `wasmOutput`, `wasmFree`, `wasmError`, and the WASI subset.
+- `crates/tov/src/std/wasm.tov`, `crates/tov/src/driver.rs`, `crates/tov/src/check/builtins.rs`:
+  the `std/wasm` module and the native signatures.
+- `crates/tov/src/codegen/mod.rs`: a program that uses the natives links the TLS library's archives.
+- `crates/tov/build.rs`, `crates/tov/src/tls_flags.rs`: WAMR's sources and flags, and the platform filter.
+
+**Not covered.** Only the interpreter (no AOT or JIT, so no speed beyond an interpreter's), no
+WASI file or socket access, no threads, no SIMD, no floating-point arguments in `call`, no
+imports a host function could provide (a module is linked against the fixed set above),
+no multi-memory, and one memory read or written by offset, not mapped into Tov. The test is
+`tov-patches/tests/wasm.tov`, run against `wasm_mod.wasm` (source `wasm_mod.c`).

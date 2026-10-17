@@ -1,0 +1,709 @@
+// WebAssembly plugins in Bifrost's JSON ABI, run by the interpreter behind std/wasm (WAMR, added
+// to the Tov runtime by tov-patches/0005-wamr.patch). A plugin is a .wasm file that exports
+//
+//   malloc(size) -> ptr           free(ptr) or free(ptr, size)
+//   get_name() -> packed          init(config_ptr, config_len) -> 0 on success
+//   pre_hook(ptr, len) -> packed  post_hook(ptr, len) -> packed
+//   cleanup() -> 0
+//
+// where "packed" is a u64: the pointer to a JSON text in the plugin's memory in the upper 32
+// bits and its length in the lower 32. The host writes each input into memory it got from
+// malloc, calls the hook, reads the answer, and frees both. All data is JSON.
+//
+// pre_hook gets {"context", "request"} and answers {"context", "request", "short_circuit",
+// "has_short_circuit", "error"}; post_hook gets {"context", "response", "error", "has_error"}
+// and answers {"context", "response", "error", "has_error", "hook_error"}. A non-empty "error"
+// or "hook_error", a trap, or an answer that is not JSON is a failed hook: the chain logs it and
+// goes on without that plugin's change, as Bifrost's plugin pipeline does.
+//
+// The request is Bifrost's chat request: provider, model, input (the messages), params (every
+// other field of the OpenAI body) and fallbacks, both at the top of the object (as Bifrost's
+// docs show it) and under "chat_request" (as its Rust and TypeScript examples read it). The
+// response is {"chat_response": <the chat completion>}. Whichever of the two request forms a
+// plugin changes is applied. The HTTP transport hooks (http_pre_hook, http_post_hook,
+// http_stream_chunk_hook) are not called.
+//
+// Each instance runs with limits (memory pages, operand stack, instructions per call), so a
+// plugin that loops or grows without end fails its hook instead of hanging the gateway.
+
+import { instantiate, WasmInstance, WasmLimits } from "std/wasm"
+import { readFileBytesSync, statSync } from "node:fs"
+import { Field, fields, elements, find, rawStr, rawNum, rawBool, isNull, quote, build, setField, without } from "./json"
+import { errorJson } from "./schemas"
+import { utf8 } from "./crypto"
+
+// The text of UTF-8 bytes.
+function text(b: u8[]): string throws Error {
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    throw new Error("not UTF-8 text")
+  }
+}
+
+// Limits for one plugin, set on its entry in the config (wasm_limits); a field left out takes the default.
+export type WasmPluginLimits = { max_memory_pages?: int, max_stack_bytes?: int, max_instructions?: int }
+
+const DEFAULT_PAGES = 1024
+const DEFAULT_STACK = 262144
+const DEFAULT_FUEL = 200000000
+const MAX_OUT = 67108864
+const MAX_CACHED = 64
+
+export type WasmPre =
+  | { kind: "continue", body: string, context: string }
+  | { kind: "short_circuit", status: int, body: string, context: string }
+
+export type WasmPost = { body: string, context: string }
+
+// ---- the request and response in Bifrost's shapes ----
+
+const CHAT_KEYS: string[] = ["model", "messages", "fallbacks"]
+const REQUEST_KEYS: string[] = ["provider", "model", "input", "params", "fallbacks"]
+
+function splitModel(m: string): { provider: string, model: string } {
+  const i = m.indexOf("/")
+  if (i < 0) return { provider: "", model: m }
+  return { provider: m.slice(0, i), model: m.slice(i + 1) }
+}
+
+// A chat body (OpenAI shape) as the request a plugin gets.
+export function requestJson(body: string): string throws SyntaxError {
+  const fs = try fields(body)
+  const m = splitModel(rawStr(fs, "model") ?? "")
+  const params: Field[] = fs.filter((f) => !CHAT_KEYS.includes(f.key))
+  const parts: string[] = [`"provider":${quote(m.provider)}`, `"model":${quote(m.model)}`, `"input":${find(fs, "messages") ?? "[]"}`, `"params":${build(params)}`]
+  const fb = find(fs, "fallbacks")
+  if (fb !== undefined) parts.push(`"fallbacks":${fb}`)
+  const flat = parts.join(",")
+  return `{${flat},"chat_request":{${flat}}}`
+}
+
+// JSON text without the whitespace between tokens, to tell a changed value from a reformatted one.
+function compact(s: string): string {
+  const src = utf8(s)
+  const out: u8[] = []
+  let str = false
+  let i = 0
+  while (i < src.length) {
+    const c = int(src[i]!)
+    if (str) {
+      out.push(src[i]!)
+      if (c === 92 && i + 1 < src.length) {
+        i++
+        out.push(src[i]!)
+      } else if (c === 34) {
+        str = false
+      }
+    } else if (c === 34) {
+      str = true
+      out.push(src[i]!)
+    } else if (c !== 32 && c !== 9 && c !== 10 && c !== 13) {
+      out.push(src[i]!)
+    }
+    i++
+  }
+  try {
+    return text(out)
+  } catch (e) {
+    return s
+  }
+}
+
+// JSON text in a canonical form: no whitespace between tokens and object keys in order, so a plugin
+// that parses and serialises a value again (Rust's serde_json and Go's maps sort the keys) does not
+// look like it changed it.
+function canon(s: string): string {
+  const t = s.trim()
+  try {
+    if (t.startsWith("{")) {
+      const fs = fields(t)
+      fs.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0))
+      const parts: string[] = []
+      for (const f of fs) parts.push(quote(f.key) + ":" + canon(f.raw))
+      return "{" + parts.join(",") + "}"
+    }
+    if (t.startsWith("[")) {
+      const parts: string[] = []
+      for (const el of elements(t)) parts.push(canon(el))
+      return "[" + parts.join(",") + "]"
+    }
+  } catch (e) {
+    return compact(t)
+  }
+  return compact(t)
+}
+
+function same(a: string | undefined, b: string | undefined): bool {
+  if (a === b) return true
+  if (a === undefined || b === undefined) return false
+  return canon(a) === canon(b)
+}
+
+// The body after a plugin's answer: `sent` is the request text the plugin got, `out` the request value it returned.
+export function applyRequest(body: string, sent: string, out: string): string throws SyntaxError {
+  if (same(out, sent)) return body
+  const of = try fields(out)
+  const sf = try fields(sent)
+  let flatChanged = false
+  for (const k of REQUEST_KEYS) {
+    const o = find(of, k)
+    if (o !== undefined && !same(o, find(sf, k))) flatChanged = true
+  }
+  let src: Field[] = of
+  if (!flatChanged) {
+    const chat = find(of, "chat_request") ?? find(of, "ChatRequest")
+    if (chat === undefined || !chat.startsWith("{") || same(chat, find(sf, "chat_request"))) return body
+    src = try fields(chat)
+  }
+  let nb = try fields(body)
+  const model = rawStr(src, "model")
+  if (model !== undefined) {
+    const provider = rawStr(src, "provider") ?? ""
+    setField(&nb, "model", quote(provider !== "" ? `${provider}/${model}` : model))
+  }
+  const input = find(src, "input")
+  if (input !== undefined && input.startsWith("[")) setField(&nb, "messages", input)
+  const params = find(src, "params")
+  if (params !== undefined && params.startsWith("{")) {
+    const pf = try fields(params)
+    nb = nb.filter((f) => CHAT_KEYS.includes(f.key))
+    for (const f of pf) setField(&nb, f.key, f.raw)
+  }
+  const fb = find(src, "fallbacks")
+  if (fb !== undefined) {
+    if (isNull(fb)) nb = without(nb, ["fallbacks"])
+    else setField(&nb, "fallbacks", fb)
+  }
+  return build(nb)
+}
+
+// A chat completion as the response a plugin gets.
+export function responseJson(body: string): string {
+  return `{"chat_response":${body}}`
+}
+
+// The completion after a plugin's answer; `out` is the response value it returned.
+export function applyResponse(body: string, out: string): string throws SyntaxError {
+  const of = try fields(out)
+  const chat = find(of, "chat_response") ?? find(of, "ChatResponse")
+  if (chat === undefined || !chat.startsWith("{")) return body
+  if (same(chat, body)) return body
+  return chat
+}
+
+// The reply of a short circuit: a chat response (200) or a Bifrost error with its status.
+export function shortCircuitReply(sc: string): { status: int, body: string } throws SyntaxError {
+  const f = try fields(sc)
+  const resp = find(f, "response")
+  if (resp !== undefined && resp.startsWith("{")) {
+    const rf = try fields(resp)
+    const chat = find(rf, "chat_response") ?? find(rf, "ChatResponse")
+    if (chat !== undefined && chat.startsWith("{")) return { status: 200, body: chat }
+    throw new SyntaxError("the short circuit has no chat_response")
+  }
+  const err = find(f, "error")
+  if (err !== undefined && err.startsWith("{")) {
+    const ef = try fields(err)
+    let status = Math.trunc(rawNum(ef, "status_code") ?? 500.0)
+    if (status < 400 || status > 599) status = 500
+    const inner = find(ef, "error")
+    if (inner !== undefined && inner.startsWith("{")) return { status: status, body: `{"error":${inner}}` }
+    return { status: status, body: errorJson("the plugin refused the request", "api_error", undefined) }
+  }
+  throw new SyntaxError("the short circuit has neither a response nor an error")
+}
+
+// ---- one loaded plugin ----
+
+export class WasmPluginInst {
+  // A trap leaves the module as it was at the trap (its stack pointer, a half-written structure), so
+  // after a failed call the instance is replaced by a fresh one, initialised again, before the next.
+  dirty: bool = false
+  restarts: int = 0
+
+  constructor(public inst: WasmInstance, public pluginName: string, public freeArity: int, public hasPre: bool, public hasPost: bool, readonly key: string, readonly bytes: u8[], readonly configJson: string, readonly limits: WasmPluginLimits | undefined) {}
+
+  name(): string {
+    return this.pluginName
+  }
+
+  private alloc(n: int): int throws Error {
+    const r = try this.inst.call("malloc", [n])
+    const p = r & 0xffffffff
+    if (p === 0 && n > 0) throw new Error(`${this.pluginName}: malloc failed`)
+    return p
+  }
+
+  private release(ptr: int, size: int): void {
+    freeBuffer(this.inst, this.freeArity, ptr, size, this.pluginName)
+  }
+
+  // What the plugin printed to standard output or error, logged after each call.
+  private flushOutput(): void {
+    const o = this.inst.output()
+    if (o !== "") console.error(`raiju: plugin ${this.pluginName}: ${o.trim()}`)
+  }
+
+  // Replaces a trapped instance with a fresh one.
+  private revive(): void throws Error {
+    this.inst.close()
+    this.dirty = false
+    this.restarts += 1
+    const s = try start(this.bytes, this.configJson, this.limits)
+    this.inst = s.inst
+    this.freeArity = s.freeArity
+    this.hasPre = s.hasPre
+    this.hasPost = s.hasPost
+  }
+
+  // Calls a hook with a JSON text and returns the JSON text it answers with.
+  private callJson(fn: string, input: string): string throws Error {
+    if (this.dirty) {
+      try {
+        this.revive()
+      } catch (e) {
+        this.dirty = true
+        throw new Error(`${this.pluginName}: could not restart after a failure: ${e.message}`)
+      }
+    }
+    const bytes = utf8(input)
+    const n = bytes.length
+    const ptr = try this.alloc(n)
+    let packed = 0
+    try {
+      if (n > 0) this.inst.write(ptr, bytes)
+      packed = this.inst.call(fn, [ptr, n])
+    } catch (e) {
+      this.dirty = true
+      this.flushOutput()
+      throw new Error(`${this.pluginName}: ${fn} failed: ${e.message}`)
+    }
+    this.release(ptr, n)
+    this.flushOutput()
+    const outPtr = (packed >> 32) & 0xffffffff
+    const outLen = packed & 0xffffffff
+    if (outLen === 0) throw new Error(`${this.pluginName}: ${fn} returned no data`)
+    if (outLen > MAX_OUT || outPtr + outLen > this.inst.memorySize()) throw new Error(`${this.pluginName}: ${fn} returned a buffer outside its memory`)
+    let raw: u8[] = []
+    try {
+      raw = this.inst.read(outPtr, outLen)
+    } catch (e) {
+      throw new Error(`${this.pluginName}: ${fn} failed: ${e.message}`)
+    }
+    this.release(outPtr, outLen)
+    try {
+      return text(raw)
+    } catch (e) {
+      throw new Error(`${this.pluginName}: ${fn} returned text that is not UTF-8`)
+    }
+  }
+
+  // The pre_hook for a chat body. `context` is the JSON object shared by the plugins of this request.
+  preRequest(context: string, body: string): WasmPre throws Error {
+    if (!this.hasPre) return { kind: "continue", body: body, context: context }
+    let sent = ""
+    try {
+      sent = requestJson(body)
+    } catch (e) {
+      throw new Error(`${this.pluginName}: the request is not JSON: ${e.message}`)
+    }
+    const text = try this.callJson("pre_hook", `{"context":${context},"request":${sent}}`)
+    try {
+      const f = fields(text)
+      const err = rawStr(f, "error") ?? ""
+      if (err !== "") throw new Error(`${this.pluginName}: pre_hook: ${err}`)
+      const ctxOut = find(f, "context")
+      const ctx = ctxOut !== undefined && ctxOut.startsWith("{") ? ctxOut : context
+      if (rawBool(f, "has_short_circuit") === true) {
+        const sc = find(f, "short_circuit")
+        if (sc === undefined || !sc.startsWith("{")) throw new Error(`${this.pluginName}: pre_hook: has_short_circuit without a short_circuit`)
+        const r = shortCircuitReply(sc)
+        return { kind: "short_circuit", status: r.status, body: r.body, context: ctx }
+      }
+      const req = find(f, "request")
+      if (req === undefined || !req.startsWith("{")) return { kind: "continue", body: body, context: ctx }
+      return { kind: "continue", body: applyRequest(body, sent, req), context: ctx }
+    } catch (e) {
+      throw new Error(e.message.startsWith(this.pluginName) ? e.message : `${this.pluginName}: pre_hook returned an invalid answer: ${e.message}`)
+    }
+  }
+
+  // The post_hook for a chat completion.
+  postResponse(context: string, body: string): WasmPost throws Error {
+    if (!this.hasPost) return { body: body, context: context }
+    const text = try this.callJson("post_hook", `{"context":${context},"response":${responseJson(body)},"error":{},"has_error":false}`)
+    try {
+      const f = fields(text)
+      const herr = rawStr(f, "hook_error") ?? ""
+      if (herr !== "") throw new Error(`${this.pluginName}: post_hook: ${herr}`)
+      const ctxOut = find(f, "context")
+      const ctx = ctxOut !== undefined && ctxOut.startsWith("{") ? ctxOut : context
+      const resp = find(f, "response")
+      if (resp === undefined || !resp.startsWith("{")) return { body: body, context: ctx }
+      return { body: applyResponse(body, resp), context: ctx }
+    } catch (e) {
+      throw new Error(e.message.startsWith(this.pluginName) ? e.message : `${this.pluginName}: post_hook returned an invalid answer: ${e.message}`)
+    }
+  }
+
+  // Calls cleanup and releases the instance.
+  close(): void {
+    if (!this.dirty) {
+      try {
+        if (this.inst.has("cleanup")) this.inst.call("cleanup", [])
+      } catch (e) {
+        console.error(`raiju: plugin ${this.pluginName}: cleanup failed: ${e.message}`)
+      }
+      this.flushOutput()
+    }
+    this.inst.close()
+  }
+}
+
+// ---- loading ----
+
+function freeBuffer(inst: WasmInstance, freeArity: int, ptr: int, size: int, name: string): void {
+  try {
+    if (freeArity >= 2) inst.call("free", [ptr, size])
+    else inst.call("free", [ptr])
+  } catch (e) {
+    console.error(`raiju: plugin ${name}: free failed: ${e.message}`)
+  }
+}
+
+function open(bytes: u8[], l: WasmLimits): WasmInstance throws Error {
+  try {
+    return instantiate(bytes, l)
+  } catch (e) {
+    throw new Error(`failed to instantiate the WASM module: ${e.message}`)
+  }
+}
+
+type Started = { inst: WasmInstance, name: string, freeArity: int, hasPre: bool, hasPost: bool }
+
+// Instantiates a plugin from its bytes: checks the exports, reads its name and runs init with the config.
+function start(bytes: u8[], configJson: string, limits: WasmPluginLimits | undefined): Started throws Error {
+  const l: WasmLimits = {
+    stackBytes: limits?.max_stack_bytes ?? DEFAULT_STACK,
+    maxPages: limits?.max_memory_pages ?? DEFAULT_PAGES,
+    fuel: limits?.max_instructions ?? DEFAULT_FUEL,
+  }
+  const inst = try open(bytes, l)
+  for (const need of ["malloc", "free", "get_name", "init"]) {
+    if (!inst.has(need)) {
+      inst.close()
+      throw new Error(`the WASM module does not export "${need}"`)
+    }
+  }
+  const freeArity = inst.arity("free")
+  if (freeArity !== 1 && freeArity !== 2) {
+    inst.close()
+    throw new Error(`the WASM module's "free" must take (ptr) or (ptr, size)`)
+  }
+  // the name: get_name's packed pointer and length
+  let name = ""
+  try {
+    const packed = inst.call("get_name", [])
+    const p = (packed >> 32) & 0xffffffff
+    const n = packed & 0xffffffff
+    if (n > 0 && n <= 4096) name = text(inst.read(p, n))
+    freeBuffer(inst, freeArity, p, n, "")
+  } catch (e) {
+    inst.close()
+    throw new Error(`get_name failed: ${e.message}`)
+  }
+  if (name === "") {
+    inst.close()
+    throw new Error("get_name returned no name")
+  }
+  // init(config)
+  const cfg = utf8(configJson)
+  let rc = 0
+  try {
+    const ptr = inst.call("malloc", [cfg.length]) & 0xffffffff
+    if (cfg.length > 0) inst.write(ptr, cfg)
+    rc = inst.call("init", [ptr, cfg.length])
+    freeBuffer(inst, freeArity, ptr, cfg.length, name)
+  } catch (e) {
+    inst.close()
+    throw new Error(`init failed: ${e.message}`)
+  }
+  const out = inst.output()
+  if (out !== "") console.error(`raiju: plugin ${name}: ${out.trim()}`)
+  if (rc !== 0) {
+    inst.close()
+    throw new Error(`init returned ${rc}`)
+  }
+  return { inst: inst, name: name, freeArity: freeArity, hasPre: inst.has("pre_hook"), hasPost: inst.has("post_hook") }
+}
+
+// A plugin instantiated from its bytes, initialised with the config.
+export function loadWasmPlugin(bytes: u8[], configJson: string, limits: WasmPluginLimits | undefined, key: string): WasmPluginInst throws Error {
+  const s = try start(bytes, configJson, limits)
+  return new WasmPluginInst(s.inst, s.name, s.freeArity, s.hasPre, s.hasPost, key, bytes, configJson, limits)
+}
+
+// Plugins stay loaded across config reloads and status checks: the same file (size and
+// modification time), config and limits is the same instance. The oldest entries are closed
+// once there are more than MAX_CACHED.
+class Loaded {
+  entries: Map<string, WasmPluginInst> = new Map()
+  order: string[] = []
+
+  get(key: string): WasmPluginInst | undefined {
+    return this.entries.get(key)
+  }
+
+  put(key: string, p: WasmPluginInst): void {
+    this.entries.set(key, p)
+    this.order.push(key)
+    while (this.order.length > MAX_CACHED) {
+      const old = this.order[0]!
+      this.order = this.order.slice(1)
+      const gone = this.entries.get(old)
+      this.entries.delete(old)
+      if (gone !== undefined) gone.close()
+    }
+  }
+}
+
+const loaded = new Loaded()
+
+// The plugin at a local path, loaded (or the one loaded before for the same file and config).
+export function openWasmPlugin(path: string, configJson: string, limits: WasmPluginLimits | undefined): WasmPluginInst throws Error {
+  const lower = path.toLowerCase()
+  if (lower.startsWith("http://") || lower.startsWith("https://")) {
+    throw new Error("loading a plugin from a URL is not supported; give a local path")
+  }
+  if (lower.endsWith(".so")) {
+    throw new Error("Go shared-object plugins (.so) are not supported by this gateway; build the plugin as WebAssembly (.wasm)")
+  }
+  if (!lower.endsWith(".wasm")) throw new Error(`unsupported plugin file "${path}": a plugin is a .wasm file`)
+  let size = 0
+  let mtime = 0.0
+  try {
+    const st = statSync(path)
+    size = st.size
+    mtime = st.mtimeMs
+  } catch (e) {
+    throw new Error(`plugin file ${path}: ${e.message}`)
+  }
+  const lim = limits === undefined ? "" : `${limits.max_memory_pages ?? 0},${limits.max_stack_bytes ?? 0},${limits.max_instructions ?? 0}`
+  const key = `${path}|${size}|${mtime}|${lim}|${configJson}`
+  const hit = loaded.get(key)
+  if (hit !== undefined) return hit
+  let bytes: u8[] = []
+  try {
+    bytes = readFileBytesSync(path)
+  } catch (e) {
+    throw new Error(`plugin file ${path}: ${e.message}`)
+  }
+  const p = try loadWasmPlugin(bytes, configJson, limits, key)
+  loaded.put(key, p)
+  return p
+}
+
+// ---- tests ----
+
+const FIXTURE = "tests/wasm/plugin.wasm"
+
+function fixture(config: string, limits: WasmPluginLimits | undefined): WasmPluginInst {
+  const bytes = try readFileBytesSync(FIXTURE)
+  return try loadWasmPlugin(bytes, config, limits, "")
+}
+
+const CHAT = `{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"ping"}],"temperature":0.2,"stream":false}`
+const COMPLETION = `{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+
+test("requestJson gives Bifrost's chat request in both forms", () => {
+  const r = try requestJson(CHAT)
+  const f = try fields(r)
+  expect(rawStr(f, "provider")).toBe("openai")
+  expect(rawStr(f, "model")).toBe("gpt-4o-mini")
+  expect(find(f, "input")).toBe(`[{"role":"user","content":"ping"}]`)
+  expect(find(f, "params")).toBe(`{"temperature":0.2,"stream":false}`)
+  const c = try fields(find(f, "chat_request")!)
+  expect(rawStr(c, "model")).toBe("gpt-4o-mini")
+  const bare = try requestJson(`{"model":"gpt-4o","messages":[]}`)
+  expect(rawStr(try fields(bare), "provider")).toBe("")
+})
+
+test("applyRequest applies whichever form changed and leaves a reformatted echo alone", () => {
+  const sent = try requestJson(CHAT)
+  // the same request with other spacing is no change
+  expect(try applyRequest(CHAT, sent, sent.replace(",", " , "))).toBe(CHAT)
+  // a change to the flat fields
+  const flat = sent.replace(`"content":"ping"`, `"content":"pong"`)
+  const a = try applyRequest(CHAT, sent, flat)
+  expect(a.includes(`"content":"pong"`)).toBe(true)
+  expect(a.includes(`"model":"openai/gpt-4o-mini"`)).toBe(true)
+  expect(a.includes(`"temperature":0.2`)).toBe(true)
+  // a change to chat_request alone
+  const cf = try fields(sent)
+  const chat = find(cf, "chat_request")!.replace(`"model":"gpt-4o-mini"`, `"model":"gpt-4o"`)
+  const out = `{"chat_request":${chat}}`
+  const b = try applyRequest(CHAT, sent, out)
+  expect(b.includes(`"model":"openai/gpt-4o"`)).toBe(true)
+  // params replace the old ones
+  const p = `{"provider":"openai","model":"gpt-4o-mini","input":[{"role":"user","content":"ping"}],"params":{"max_tokens":5}}`
+  const c = try applyRequest(CHAT, sent, p)
+  expect(c.includes(`"max_tokens":5`)).toBe(true)
+  expect(c.includes(`"temperature"`)).toBe(false)
+})
+
+test("a request serialised again with sorted keys is no change, and an edit of chat_request alone is applied", () => {
+  const sent = try requestJson(CHAT)
+  const flat = `"input":[{"content":"ping","role":"user"}],"model":"gpt-4o-mini","params":{"stream":false,"temperature":0.2},"provider":"openai"`
+  const echo = `{${flat},"chat_request":{${flat}}}`
+  expect(try applyRequest(CHAT, sent, echo)).toBe(CHAT)
+  const edited = `{${flat},"chat_request":{${flat.replace("ping", "pong")}}}`
+  const r = try applyRequest(CHAT, sent, edited)
+  expect(r.includes(`"content":"pong"`)).toBe(true)
+  expect(r.includes(`"temperature":0.2`)).toBe(true)
+})
+
+test("applyResponse and shortCircuitReply", () => {
+  const sent = responseJson(COMPLETION)
+  expect(try applyResponse(COMPLETION, sent)).toBe(COMPLETION)
+  expect(try applyResponse(COMPLETION, `{}`)).toBe(COMPLETION)
+  const changed = `{"chat_response":${COMPLETION.replace("\"hi\"", "\"yo\"")}}`
+  expect((try applyResponse(COMPLETION, changed)).includes(`"yo"`)).toBe(true)
+  const ok = try shortCircuitReply(`{"response":{"chat_response":${COMPLETION}}}`)
+  expect(ok.status).toBe(200)
+  expect(ok.body).toBe(COMPLETION)
+  const bad = try shortCircuitReply(`{"error":{"error":{"message":"no","type":"t"},"status_code":418}}`)
+  expect(bad.status).toBe(418)
+  expect(bad.body).toBe(`{"error":{"message":"no","type":"t"}}`)
+  const odd = try shortCircuitReply(`{"error":{"error":{"message":"no"},"status_code":200}}`)
+  expect(odd.status).toBe(500)
+})
+
+test("the plugin rewrites the request in pre_hook and stamps the response in post_hook", () => {
+  const p = try fixture(`{"mode":"rewrite","from":"ping","to":"pong","tag":"t1"}`, undefined)
+  expect(p.name()).toBe("raiju-test-plugin")
+  const pre = try p.preRequest(`{"request_id":"r1"}`, CHAT)
+  expect(pre.kind).toBe("continue")
+  if (pre.kind === "continue") {
+    expect(pre.body.includes(`"content":"pong"`)).toBe(true)
+    expect(pre.body.includes(`"model":"openai/gpt-4o-mini"`)).toBe(true)
+    expect(pre.context.includes(`"pre":"ran"`)).toBe(true)
+    const post = try p.postResponse(pre.context, COMPLETION)
+    expect(post.body.includes(`"x_wasm_plugin":"ctx-ok:t1"`)).toBe(true)
+    expect(post.body.includes(`"content":"hi"`)).toBe(true)
+    // without the context from pre_hook the plugin says so
+    const lost = try p.postResponse(`{"request_id":"r1"}`, COMPLETION)
+    expect(lost.body.includes(`"x_wasm_plugin":"ctx-missing:t1"`)).toBe(true)
+  }
+  p.close()
+})
+
+test("a short-circuit answer and a short-circuit error", () => {
+  const s = try fixture(`{"mode":"short"}`, undefined)
+  const r = try s.preRequest("{}", CHAT)
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") {
+    expect(r.status).toBe(200)
+    expect(r.body.includes(`"from the plugin"`)).toBe(true)
+  }
+  s.close()
+  const f = try fixture(`{"mode":"fail"}`, undefined)
+  const e = try f.preRequest("{}", CHAT)
+  expect(e.kind).toBe("short_circuit")
+  if (e.kind === "short_circuit") {
+    expect(e.status).toBe(418)
+    expect(e.body.includes(`"plugin_blocked"`)).toBe(true)
+  }
+  f.close()
+})
+
+test("a plugin that fails its hook throws a clear error", () => {
+  const cases: { mode: string, text: string }[] = [
+    { mode: "trap", text: "unreachable" },
+    { mode: "error", text: "plugin said no" },
+    { mode: "badjson", text: "invalid answer" },
+  ]
+  for (const c of cases) {
+    const p = try fixture(`{"mode":"${c.mode}"}`, undefined)
+    let msg = ""
+    try {
+      p.preRequest("{}", CHAT)
+    } catch (e) {
+      msg = e.message
+    }
+    expect(msg.includes("raiju-test-plugin")).toBe(true)
+    expect(msg.toLowerCase().includes(c.text)).toBe(true)
+    p.close()
+  }
+})
+
+test("a plugin that trapped is restarted, not left with a damaged stack", () => {
+  const p = try fixture(`{"mode":"trap"}`, undefined)
+  let clean = 0
+  for (let i = 0; i < 40; i++) {
+    let msg = ""
+    try {
+      p.preRequest("{}", CHAT)
+    } catch (e) {
+      msg = e.message
+    }
+    if (msg.toLowerCase().includes("unreachable")) clean++
+  }
+  expect(clean).toBe(40)
+  expect(p.restarts).toBe(39)
+  p.close()
+})
+
+test("limits stop a runaway loop and a memory grab, and the plugin works again after", () => {
+  const p = try fixture(`{"mode":"loop"}`, { max_instructions: 100000 })
+  let msg = ""
+  try {
+    p.preRequest("{}", CHAT)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg.includes("raiju-test-plugin")).toBe(true)
+  expect(msg.includes("pre_hook failed")).toBe(true)
+  p.close()
+  const m = try fixture(`{"mode":"memory"}`, { max_memory_pages: 64 })
+  let mm = ""
+  try {
+    m.preRequest("{}", CHAT)
+  } catch (e) {
+    mm = e.message
+  }
+  expect(mm.includes("grow denied")).toBe(true)
+  m.close()
+})
+
+test("a plugin that fails init, or is not a plugin, does not load", () => {
+  let msg = ""
+  try {
+    fixture(`{"mode":"initfail"}`, undefined)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("init returned 1")
+  let bad = ""
+  try {
+    loadWasmPlugin(utf8("not wasm"), "{}", undefined, "")
+  } catch (e) {
+    bad = e.message
+  }
+  expect(bad.startsWith("failed to instantiate the WASM module")).toBe(true)
+  let so = ""
+  try {
+    openWasmPlugin("/plugins/p.so", "{}", undefined)
+  } catch (e) {
+    so = e.message
+  }
+  expect(so.includes("Go shared-object plugins")).toBe(true)
+})
+
+test("openWasmPlugin loads a file once for the same config", () => {
+  const a = try openWasmPlugin(FIXTURE, `{"mode":"short"}`, undefined)
+  const b = try openWasmPlugin(FIXTURE, `{"mode":"short"}`, undefined)
+  expect(a.inst.handle).toBe(b.inst.handle)
+  const c = try openWasmPlugin(FIXTURE, `{"mode":"fail"}`, undefined)
+  expect(c.inst.handle === a.inst.handle).toBe(false)
+})

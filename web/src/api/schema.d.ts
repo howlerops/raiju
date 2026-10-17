@@ -2343,7 +2343,7 @@ export interface paths {
         };
         /** One configured plugin */
         get: operations["getPlugin"];
-        /** Change a configured plugin (enabled, config); the save rebuilds the live chain */
+        /** Change a configured plugin (enabled, config, path, wasm_limits); the save rebuilds the live chain */
         put: operations["updatePlugin"];
         post?: never;
         /** Remove a configured plugin; the save rebuilds the live chain */
@@ -4966,6 +4966,15 @@ export interface components {
         /** @description Errors are {error: {message}}. Gate errors (401, 403) and the audit and log routes also set type; Bifrost's ErrorField has the same names. Bifrost's ManagementErrorResponse references BifrostError; Raiju uses this shape. */
         ManagementErrorResponse: {
             error: components["schemas"]["ErrorField"];
+        };
+        /** @description Caps for a WebAssembly plugin; a field left out takes the default. */
+        WasmPluginLimits: {
+            /** @description Most 64 KiB pages of linear memory (default 1024). */
+            max_memory_pages?: number;
+            /** @description Bytes of operand stack (default 262144). */
+            max_stack_bytes?: number;
+            /** @description Most instructions one hook call may run (default 200000000); a call past it fails. */
+            max_instructions?: number;
         };
         /** @description JSON-RPC 2.0 request of the MCP protocol. */
         McpJsonRpcRequest: {
@@ -16623,8 +16632,9 @@ export interface operations {
                     name: string;
                     enabled?: boolean;
                     config?: Record<string, never>;
-                    /** @description Custom plugin paths are refused by this gateway. */
+                    /** @description A local .wasm file to load as a plugin (Bifrost's WebAssembly plugin ABI). Go shared objects (.so) and URLs are refused. */
                     path?: string;
+                    wasm_limits?: components["schemas"]["WasmPluginLimits"];
                 };
             };
         };
@@ -16638,7 +16648,7 @@ export interface operations {
                     "application/json": Record<string, never>;
                 };
             };
-            /** @description The name is missing, the config does not build, or a custom path is given */
+            /** @description The name is missing, the config does not build, or the plugin file does not load */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -16862,6 +16872,9 @@ export interface operations {
                 "application/json": {
                     enabled?: boolean;
                     config?: Record<string, never>;
+                    /** @description A local .wasm file to load as the plugin; an empty string removes the path. */
+                    path?: string;
+                    wasm_limits?: components["schemas"]["WasmPluginLimits"];
                 };
             };
         };

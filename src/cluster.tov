@@ -6,6 +6,7 @@
 // HTTP transport and the sync timer live in the server; this file is pure state.
 import { hmacSha256, toHex, utf8 } from "./crypto"
 import { DiscoveryConfig, baseUrl } from "./discovery"
+import { HoldWire, holdProblem } from "./holds"
 
 // Bifrost's cluster_config.broker (type "broker"): where the nodes reach the broker, and the port it serves on.
 export type BrokerConfig = { address: string, tls?: bool, listen_port?: int }
@@ -55,8 +56,9 @@ export function electLeader(ids: string[]): string {
 }
 
 type WireCounter = { name: string, window: string, slots: Record<string, f64> }
-// roster: only in a broker's answer, the ids of the nodes it has heard from.
-type Wire = { node: string, ts: f64, counters: WireCounter[], roster?: string[] }
+// roster: only in a broker's answer, the ids of the nodes it has heard from. holds: the key holds of
+// adaptive load balancing (holds.tov), joined by write count and writer.
+type Wire = { node: string, ts: f64, counters: WireCounter[], roster?: string[], holds?: HoldWire[] }
 
 // Slot values must be finite; NaN and infinities would poison every total.
 // Far above any budget or token count, and below the f64 limit.
@@ -68,6 +70,10 @@ function parseWire(text: string): Wire throws SyntaxError {
   if (w.node.byteLength === 0) throw new SyntaxError("cluster payload has no node id")
   for (const id of w.roster ?? []) {
     if (id.byteLength === 0) throw new SyntaxError("cluster payload has an empty id in its roster")
+  }
+  for (const h of w.holds ?? []) {
+    const p = holdProblem(h)
+    if (p !== "") throw new SyntaxError("cluster payload: " + p)
   }
   for (const c of w.counters) {
     if (c.name.byteLength === 0) throw new SyntaxError("cluster payload has an empty counter name")
@@ -86,6 +92,9 @@ class Counter {
 
 export class Counters {
   private counters: Map<string, Counter> = new Map()
+  // the holds this node sends (set before encode), and the holds received since the last takeHolds
+  private outHolds: HoldWire[] = []
+  private inHolds: HoldWire[] = []
   // Last time a peer's payload was merged, by node id. Own node is never tracked.
   private seen: Map<string, f64> = new Map()
   constructor(readonly nodeId: string) {}
@@ -130,7 +139,20 @@ export class Counters {
     }
   }
 
+  // The key holds this node sends with its next encode.
+  setHolds(list: HoldWire[]): void {
+    this.outHolds = list
+  }
+
+  // The holds received from peers since the last call; the caller merges them into its holds.
+  takeHolds(): HoldWire[] {
+    const out = this.inHolds
+    this.inHolds = []
+    return out
+  }
+
   private apply(w: Wire): void {
+    for (const h of w.holds ?? []) this.inHolds.push(h)
     for (const rc of w.counters) {
       const cur = this.counters.get(rc.name)
       if (cur === undefined || rc.window > cur.window) {
@@ -155,7 +177,7 @@ export class Counters {
       const c = this.counters.get(name)!
       counters.push({ name, window: c.window, slots: c.slots })
     }
-    const w: Wire = { node: this.nodeId, ts: Date.now(), counters: counters, roster: roster }
+    const w: Wire = { node: this.nodeId, ts: Date.now(), counters: counters, roster: roster, holds: this.outHolds }
     return JSON.stringify(w)
   }
 
@@ -387,4 +409,28 @@ test("broker mode and the broker URL", () => {
   expect(brokerUrl({ address: "broker.example.run.app:443", tls: true })).toBe("https://broker.example.run.app:443")
   expect(brokerUrl({ address: "10.0.0.5:50051" })).toBe("http://10.0.0.5:50051")
   expect(brokerUrl({ address: "https://b.example/" })).toBe("https://b.example")
+})
+
+test("key holds travel with the counters, and a payload with a bad hold changes nothing", () => {
+  const a = new Counters("a")
+  const b = new Counters("b")
+  const h: HoldWire = { target: "p#k", provider: "p", keyId: "k", model: "", cls: "credential", reason: "bad", heldAt: 1000.0, rung: 0, waitMs: 30000.0, nextCheck: 31000.0, owner: "a", claimBy: "", claimAt: 0.0, ver: 1, by: "a", released: false, at: 1000.0 }
+  a.setHolds([h])
+  try b.merge(a.encode(), 1000)
+  const got = b.takeHolds()
+  expect(got.length).toBe(1)
+  expect(got[0]!.target).toBe("p#k")
+  expect(b.takeHolds().length).toBe(0)
+  // a hold with a negative wait refuses the whole payload, its counters included
+  const c = new Counters("c")
+  const bad = `{"node":"x","ts":1,"counters":[{"name":"c","window":"w","slots":{"x":1}}],"holds":[{"target":"p#k","provider":"p","keyId":"k","model":"","cls":"credential","reason":"","heldAt":1,"rung":0,"waitMs":-1,"nextCheck":1,"owner":"x","claimBy":"","claimAt":0,"ver":1,"by":"x","released":false,"at":1}]}`
+  let threw = 0
+  try {
+    c.merge(bad)
+  } catch (e) {
+    if (e instanceof SyntaxError) threw += 1
+  }
+  expect(threw).toBe(1)
+  expect(c.total("c", "w")).toBe(0)
+  expect(c.takeHolds().length).toBe(0)
 })
