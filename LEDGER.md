@@ -279,7 +279,7 @@ notes on L84, L91, L97f and L97m were finished by later rows (L97p, L97k/L97o, L
 | L114 | — | Scope the exact-match response cache per virtual key (owner, 2026-10-17), as the semantic cache already is | lead | done: cache.scope_by_virtual_key (L95) now on unless false; the e2e owner gateway leaves it unset to cover the default. make unit 1,381 passed; e2e all passed on Bun and http1; openapi-check ok (310 operations) |
 | L115 | Scope | SCIM user provisioning (moved in from Out, 2026-10-17) | worker | assigned |
 | L116 | Scope | A2A: agent cards, JSON-RPC tasks, `/agents/a2a`, `/api/agents`; unblocks the `agent_names` log filter (moved in from Out, 2026-10-17) | worker | assigned |
-| L117 | Scope | MCP code mode (moved in from Out, 2026-10-17) | worker | todo |
+| L117 | Scope | MCP code mode (moved in from Out, 2026-10-17) | worker | assigned |
 
 ## UI track
 
