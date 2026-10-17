@@ -1,0 +1,175 @@
+// The audit archive's objects, in Bifrost's layout: each closed window is <prefix>/audit-logs/YYYY/MM/DD/
+// <start>-<end>/ with part-00000.jsonl (cut where a part reaches archive_max_object_bytes, never inside a
+// line) and a manifest.json that lists the parts. The manifest is written last and commits the window.
+// With compress set, every object is gzip and its name ends in .gz.
+import { isoMs } from "./exports"
+import { gzipBytes } from "./gzip"
+
+export const DEFAULT_MAX_OBJECT_BYTES = 134217728
+const MIN_OBJECT_BYTES = 1048576
+const MAX_OBJECT_BYTES = 4294967296
+
+const NDJSON_TYPE = "application/x-ndjson"
+const JSON_TYPE = "application/json"
+const GZIP_TYPE = "application/gzip"
+
+export type ArchiveObject = { key: string, body: u8[], contentType: string }
+export type ArchivePart = { key: string, event_count: int, bytes: int }
+export type ArchiveManifest = { version: int, window_start: string, window_end: string, event_count: int, compressed: bool, completed_at: string, parts: ArchivePart[] }
+export type ArchivePlan = { objects: ArchiveObject[], manifest: ArchiveManifest, parts: int }
+
+// archive_max_object_bytes as the archive uses it: the 128 MiB default when unset, else kept within 1 MiB to 4 GiB.
+export function maxObjectBytes(v: int | undefined): int {
+  if (v === undefined || v <= 0) return DEFAULT_MAX_OBJECT_BYTES
+  if (v < MIN_OBJECT_BYTES) return MIN_OBJECT_BYTES
+  if (v > MAX_OBJECT_BYTES) return MAX_OBJECT_BYTES
+  return v
+}
+
+// 20261014T120000Z, the compact form window names use.
+function compact(ms: number): string {
+  const d = isoMs(ms)
+  return d.slice(0, 4) + d.slice(5, 7) + d.slice(8, 10) + "T" + d.slice(11, 13) + d.slice(14, 16) + d.slice(17, 19) + "Z"
+}
+
+// 2026-10-14T12:00:00Z, the form the manifest uses for its times.
+function isoSeconds(ms: number): string {
+  return isoMs(ms).slice(0, 19) + "Z"
+}
+
+// <prefix>/audit-logs/YYYY/MM/DD/<start>-<end>/, the day being the UTC date of the window's start.
+export function windowPrefix(prefix: string, startMs: number, endMs: number): string {
+  const segs = prefix.split("/").filter((s: string) => s !== "")
+  const d = isoMs(startMs)
+  segs.push("audit-logs", d.slice(0, 4), d.slice(5, 7), d.slice(8, 10), compact(startMs) + "-" + compact(endMs))
+  return segs.join("/") + "/"
+}
+
+// part-00000 and so on, zero padded to five digits.
+function partName(i: int): string {
+  const s = "" + i
+  return "part-" + (s.byteLength >= 5 ? "" : "00000".slice(0, 5 - s.byteLength)) + s
+}
+
+// The JSON lines cut into parts: a part closes once its uncompressed size reaches max, and a line never
+// splits. Each part has its text and its event count. No lines, no parts.
+export function splitParts(body: string, max: int): { text: string, count: int }[] {
+  const out: { text: string, count: int }[] = []
+  let text = ""
+  let count: int = 0
+  let size: int = 0
+  for (const line of body.split("\n")) {
+    if (line === "") continue
+    text += line + "\n"
+    count += 1
+    size += line.byteLength + 1
+    if (size >= max) {
+      out.push({ text: text, count: count })
+      text = ""
+      count = 0
+      size = 0
+    }
+  }
+  if (count > 0) out.push({ text: text, count: count })
+  return out
+}
+
+// Everything one window writes, in upload order: its parts, then the manifest that commits them. A window
+// with no events has no parts and still gets a manifest, so an absent manifest means "not archived yet".
+export function planWindow(prefix: string, startMs: number, endMs: number, body: string, max: int, compress: bool, nowMs: number): ArchivePlan {
+  const dir = windowPrefix(prefix, startMs, endMs)
+  const ext = compress ? ".gz" : ""
+  const objects: ArchiveObject[] = []
+  const parts: ArchivePart[] = []
+  let events: int = 0
+  const cut = splitParts(body, max)
+  for (let i = 0; i < cut.length; i++) {
+    const p = cut[i]!
+    const raw = new TextEncoder().encode(p.text)
+    const data = compress ? gzipBytes(raw) : raw
+    const key = dir + partName(i) + ".jsonl" + ext
+    objects.push({ key: key, body: data, contentType: compress ? GZIP_TYPE : NDJSON_TYPE })
+    parts.push({ key: key, event_count: p.count, bytes: data.length })
+    events += p.count
+  }
+  const manifest: ArchiveManifest = {
+    version: 1, window_start: isoSeconds(startMs), window_end: isoSeconds(endMs), event_count: events,
+    compressed: compress, completed_at: isoSeconds(nowMs), parts: parts,
+  }
+  const raw = new TextEncoder().encode(JSON.stringify(manifest))
+  objects.push({ key: dir + "manifest.json" + ext, body: compress ? gzipBytes(raw) : raw, contentType: compress ? GZIP_TYPE : JSON_TYPE })
+  return { objects: objects, manifest: manifest, parts: parts.length }
+}
+
+test("the window prefix follows Bifrost's layout, with the start's UTC date", () => {
+  // 2026-10-14T12:00:00Z and five minutes later
+  expect(windowPrefix("acme-prod/", 1791979200000.0, 1791979500000.0)).toBe("acme-prod/audit-logs/2026/10/14/20261014T120000Z-20261014T120500Z/")
+  expect(windowPrefix("", 1791979200000.0, 1791979500000.0)).toBe("audit-logs/2026/10/14/20261014T120000Z-20261014T120500Z/")
+  expect(windowPrefix("/a//b/", 1791979200000.0, 1791979500000.0).startsWith("a/b/audit-logs/")).toBe(true)
+})
+
+test("archive_max_object_bytes defaults and clamps", () => {
+  expect(maxObjectBytes(undefined)).toBe(134217728)
+  expect(maxObjectBytes(0)).toBe(134217728)
+  expect(maxObjectBytes(1)).toBe(1048576)
+  expect(maxObjectBytes(1048576 * 8)).toBe(8388608)
+  expect(maxObjectBytes(10000000000)).toBe(4294967296)
+})
+
+test("parts close at the size limit and never split a line", () => {
+  // each line is 10 bytes with its newline; a limit of 25 closes a part at 3 lines
+  const body = "aaaaaaaaa\nbbbbbbbbb\nccccccccc\nddddddddd\neeeeeeeee\n"
+  const cut = splitParts(body, 25)
+  expect(cut.length).toBe(2)
+  expect(cut[0]!.count).toBe(3)
+  expect(cut[1]!.count).toBe(2)
+  expect(cut[0]!.text).toBe("aaaaaaaaa\nbbbbbbbbb\nccccccccc\n")
+  expect(splitParts("", 25).length).toBe(0)
+  // a line longer than the limit is one part of its own
+  expect(splitParts("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", 25).length).toBe(1)
+})
+
+test("a window's objects are its parts, then the manifest that lists them", () => {
+  const body = "{\"seq\":1}\n{\"seq\":2}\n{\"seq\":3}\n{\"seq\":4}\n{\"seq\":5}\n"
+  const plan = planWindow("audit", 1791979200000.0, 1791979500000.0, body, 20, false, 1791979600000.0)
+  expect(plan.parts).toBe(3)
+  expect(plan.objects.length).toBe(4)
+  expect(plan.objects[0]!.key).toBe("audit/audit-logs/2026/10/14/20261014T120000Z-20261014T120500Z/part-00000.jsonl")
+  expect(plan.objects[2]!.key.endsWith("/part-00002.jsonl")).toBe(true)
+  expect(plan.objects[3]!.key).toBe("audit/audit-logs/2026/10/14/20261014T120000Z-20261014T120500Z/manifest.json")
+  expect(plan.objects[0]!.contentType).toBe("application/x-ndjson")
+  expect(plan.manifest.event_count).toBe(5)
+  expect(plan.manifest.window_start).toBe("2026-10-14T12:00:00Z")
+  expect(plan.manifest.completed_at).toBe("2026-10-14T12:06:40Z")
+  expect(plan.manifest.parts[0]!.event_count).toBe(2)
+  expect(plan.manifest.parts[0]!.bytes).toBe(20)
+  // the uploaded part is the text of its lines
+  expect(try new TextDecoder().decode(plan.objects[0]!.body)).toBe("{\"seq\":1}\n{\"seq\":2}\n")
+  const back = try JSON.parse(try new TextDecoder().decode(plan.objects[3]!.body)) as ArchiveManifest
+  expect(back.parts.length).toBe(3)
+  expect(back.parts[2]!.key.endsWith("part-00002.jsonl")).toBe(true)
+})
+
+test("a compressed window names its objects .gz and gzips them", () => {
+  const body = "{\"seq\":1}\n".repeat(50)
+  const plan = planWindow("audit", 1791979200000.0, 1791979500000.0, body, 134217728, true, 1791979600000.0)
+  expect(plan.objects.length).toBe(2)
+  expect(plan.objects[0]!.key.endsWith("/part-00000.jsonl.gz")).toBe(true)
+  expect(plan.objects[1]!.key.endsWith("/manifest.json.gz")).toBe(true)
+  expect(plan.objects[0]!.contentType).toBe("application/gzip")
+  expect(int(plan.objects[0]!.body[0]!)).toBe(0x1f)
+  expect(int(plan.objects[0]!.body[1]!)).toBe(0x8b)
+  expect(plan.objects[0]!.body.length < 500).toBe(true)
+  expect(plan.manifest.compressed).toBe(true)
+  expect(plan.manifest.parts[0]!.bytes).toBe(plan.objects[0]!.body.length)
+})
+
+test("an empty window still gets a manifest with no parts", () => {
+  const plan = planWindow("audit", 1791979200000.0, 1791979500000.0, "", 134217728, false, 1791979600000.0)
+  expect(plan.parts).toBe(0)
+  expect(plan.objects.length).toBe(1)
+  expect(plan.objects[0]!.key.endsWith("/manifest.json")).toBe(true)
+  const back = try JSON.parse(try new TextDecoder().decode(plan.objects[0]!.body)) as ArchiveManifest
+  expect(back.event_count).toBe(0)
+  expect(back.parts.length).toBe(0)
+})

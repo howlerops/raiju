@@ -172,17 +172,35 @@ function pickHealthy(provider: string, keys: KeyConfig[], model: string, exclude
     const idx: int[] = []
     const ids: string[] = []
     const ws: f64[] = []
+    // the first held key, which serves the request if every key is held
+    let heldIdx = -1
+    let heldId = ""
     for (let i = 0; i < keys.length; i++) {
       if (tried.has(i) || !keyAllows(keys[i]!, model)) continue
+      const hid = healthId(provider, keys[i]!, i)
+      // a refused key is out of rotation until its check; a key whose check is in flight is skipped too
+      const hs = health.holds.state(hid, model, now)
+      if (hs === "held" || hs === "checking") {
+        if (heldIdx < 0) {
+          heldIdx = i
+          heldId = hid
+        }
+        continue
+      }
       idx.push(i)
-      ids.push(healthId(provider, keys[i]!, i))
+      ids.push(hid)
       ws.push(keys[i]!.weight ?? 1.0)
     }
-    if (idx.length === 0) return -1
+    if (idx.length === 0) {
+      // every key is held: the request is sent to one anyway, and its answer counts as that key's check
+      if (heldIdx < 0) return -1
+      health.holds.checkNow(heldId, model, now)
+      return heldIdx
+    }
     let j = -1
     if (adaptive) j = pickAdaptive(ids, ws, health, now, Math.random())
     else {
-      // static weights, open breakers skipped
+      // static weights; open breakers, held keys and keys already tried are skipped
       const open: Set<int> = new Set()
       for (let k = 0; k < idx.length; k++) {
         if (!health.wouldAllow(ids[k]!, now)) open.add(idx[k]!)
@@ -190,14 +208,43 @@ function pickHealthy(provider: string, keys: KeyConfig[], model: string, exclude
       const all: Set<int> = new Set()
       for (const t of tried.values()) all.add(t)
       for (const o of open.values()) all.add(o)
+      for (let k = 0; k < keys.length; k++) {
+        if (!idx.includes(k)) all.add(k)
+      }
       const i = pickKey(keys, model, all, undefined)
       j = idx.indexOf(i)
     }
     if (j < 0) return -1
     // allow() starts a half-open probe; if another request took the only probe slot, pick again
-    if (health.allow(ids[j]!, now)) return idx[j]!
+    if (health.allow(ids[j]!, now)) {
+      // a key due for its check gets this request as the check
+      health.holds.startCheck(ids[j]!, model, now)
+      return idx[j]!
+    }
     tried.add(idx[j]!)
   }
+}
+
+// Key choice when the load balancer's breakers and weights are off: the usual choice, but a key held by a
+// provider's refusal (holds.tov) is skipped. When every key is held the request goes to one anyway, and its
+// answer is that key's check.
+function pickUnheld(provider: string, keys: KeyConfig[], model: string, exclude: Set<int>, health: Health): int {
+  const now = Date.now()
+  const skip: Set<int> = new Set()
+  for (const x of exclude.values()) skip.add(x)
+  for (let i = 0; i < keys.length; i++) {
+    const hs = health.holds.state(healthId(provider, keys[i]!, i), model, now)
+    if (hs === "held" || hs === "checking") skip.add(i)
+  }
+  const i = pickKey(keys, model, skip, undefined)
+  if (i >= 0) {
+    health.holds.startCheck(healthId(provider, keys[i]!, i), model, now)
+    return i
+  }
+  const first = pickKey(keys, model, exclude, undefined)
+  if (first < 0) return -1
+  health.holds.checkNow(healthId(provider, keys[first]!, first), model, now)
+  return first
 }
 
 export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: string | undefined, health?: Health): { t: Target, keyIndex: int } | undefined {
@@ -212,7 +259,10 @@ export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: st
   }
   const hc = cfg.health
   const useHealth = health !== undefined && pinned === undefined && hc !== undefined && (hc.circuit_breaker === true || hc.adaptive === true)
-  const i = useHealth ? pickHealthy(ref.provider, keys, ref.model, exclude, health!, hc!.adaptive === true) : pickKey(keys, ref.model, exclude, pinned)
+  let i: int = -1
+  if (useHealth) i = pickHealthy(ref.provider, keys, ref.model, exclude, health!, hc!.adaptive === true)
+  else if (health !== undefined && pinned === undefined) i = pickUnheld(ref.provider, keys, ref.model, exclude, health)
+  else i = pickKey(keys, ref.model, exclude, pinned)
   if (i < 0) return undefined
   const up = resolveAlias(keys[i]!, ref.model, cfg.client?.routing_chain_max_depth)
   if (up.error !== "") return undefined

@@ -2,7 +2,8 @@
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
 import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec } from "./config"
-import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page } from "./logapi"
+import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page, timeOf } from "./logapi"
+import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
 import { entryStatus, PluginEntry } from "./plugins"
 import { parseDatasheet } from "./pricing"
@@ -57,7 +58,8 @@ import { LiveRegistry } from "./live"
 import { BROKER_ROUTE } from "./broker"
 import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
-import { ExportCursor, objectKey, putRequest, putBytesRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs } from "./exports"
+import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs, ByteRequest } from "./exports"
+import { planWindow, maxObjectBytes } from "./audit_archive"
 import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode } from "./mcpissuer"
 
@@ -244,6 +246,32 @@ function num(params: URLSearchParams, name: string): f64 | undefined {
   const v = params.get(name)
   if (v === undefined || v === "") return undefined
   return parseFloat(v)
+}
+
+// A window bound of the adaptive history: RFC 3339, or unix seconds. dflt when absent; undefined when unreadable.
+function historyBound(raw: string | undefined, dflt: f64): f64 | undefined {
+  if (raw === undefined || raw === "") return dflt
+  if (raw.includes("T")) return timeOf(raw)
+  const v = parseFloat(raw)
+  if (v === undefined) return undefined
+  return v * 1000.0
+}
+
+// The status an incident shows: resolved, recovering (its check is in flight) or attention.
+function incidentStatus(inc: Incident): string {
+  if (inc.resolvedAt > 0) return "resolved"
+  return inc.recovering ? "recovering" : "attention"
+}
+
+// An incident as the adaptive routing routes show it.
+function incidentRow(inc: Incident, now: number) {
+  const end = inc.resolvedAt > 0 ? inc.resolvedAt : now
+  return {
+    id: inc.id, target: inc.target, provider: inc.provider, key_id: inc.keyId, model: inc.model,
+    scope: inc.model === "" ? "key" : "route", failure_class: inc.cls, reason: inc.reason, status: incidentStatus(inc),
+    opened_at: rfc3339Of(inc.openedAt), resolved_at: inc.resolvedAt > 0 ? rfc3339Of(inc.resolvedAt) : undefined,
+    duration_seconds: Math.round((end - inc.openedAt) / 1000),
+  }
 }
 
 // The tools of a chat tool definition list, as MCP tools.
@@ -1378,28 +1406,97 @@ export class Ops {
     return { status: 200, body: `{"circuits":{${parts.join(",")}}}`, contentType: "application/json" }
   }
 
-  // GET /api/adaptive-routing/held-keys: the keys (provider#key targets) held out of rotation by an open
-  // circuit, with when each was held and when it next gets a check. Raiju holds a key for its breaker's
-  // cooldown; it does not classify the provider's refusal, so there is no reason or wait ladder.
+  // GET /api/adaptive-routing/held-keys: the keys and models held out of rotation by a provider's refusal
+  // (holds.tov): the failure class, the provider's own reason, when each was held, when it is next checked,
+  // its state (held, checking or due) and its rung on the wait ladder.
   adaptiveHeldKeys(): Reply {
     const rows: string[] = []
-    for (const c of this.engine.health.openCircuits(Date.now())) {
-      if (c.id.indexOf("#") < 0) continue
-      rows.push(JSON.stringify({ target: c.id, state: c.state, held_since: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    for (const r of this.engine.health.holds.list(Date.now())) {
+      const h = r.h
+      rows.push(JSON.stringify({ target: h.target, provider: h.provider, key_id: h.keyId, model: h.model, state: r.state, failure_class: h.cls, reason: h.reason, held_since: rfc3339Of(h.heldAt), next_check_at: rfc3339Of(h.nextCheck), wait_seconds: Math.round(h.waitMs / 1000), rung: h.rung }))
     }
     return { status: 200, body: `{"held_keys":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
   }
 
-  // GET /api/adaptive-routing/incidents: the circuits open now (keys, policies, and a policy's key
-  // sub-circuits), each with when it opened. Resolved incidents are not kept.
+  // GET /api/adaptive-routing/incidents: the incidents still open (a hold, or a circuit a run of failures
+  // opened) and the policy circuits open now. Resolved incidents are in the history route.
   adaptiveIncidents(): Reply {
+    const now = Date.now()
     const rows: string[] = []
-    for (const c of this.engine.health.openCircuits(Date.now())) {
-      const kind = c.id.indexOf("#") >= 0 ? "key" : c.id.indexOf("/") >= 0 ? "policy_key" : "policy"
-      const status = c.state === "half_open" ? "Recovering" : "Needs attention"
-      rows.push(JSON.stringify({ target: c.id, kind: kind, status: status, opened_at: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    for (const inc of this.engine.health.holds.incidentList()) {
+      if (inc.resolvedAt > 0) continue
+      rows.push(JSON.stringify(incidentRow(inc, now)))
+    }
+    for (const c of this.engine.health.openCircuits(now)) {
+      if (c.id.indexOf("#") >= 0) continue
+      const status = c.state === "half_open" ? "recovering" : "attention"
+      rows.push(JSON.stringify({ target: c.id, kind: "policy", status: status, opened_at: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
     }
     return { status: 200, body: `{"incidents":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
+  }
+
+  // GET /api/adaptive-routing/history/issues: the incidents that were open at some point in a window (from,
+  // to: RFC 3339, or unix seconds; the window defaults to all of history until now). statuses (attention,
+  // recovering, resolved) filters them; sort is priority (attention first, then newest), newest, oldest,
+  // longest or shortest. limit (default 25, at most 100) and offset page the result; with neither, every
+  // match is returned. matched_summary covers every match, not the page.
+  adaptiveHistory(req: Request): Reply {
+    const u = URL.parse(req.url)
+    const params = u === undefined ? new URLSearchParams("") : u.searchParams
+    const now = Date.now()
+    const from = historyBound(params.get("from"), 0.0)
+    const to = historyBound(params.get("to"), now)
+    if (from === undefined || to === undefined) return badRequest("from and to must be RFC 3339 times or unix seconds")
+    const sort = params.get("sort") ?? "priority"
+    if (!["priority", "newest", "oldest", "longest", "shortest"].includes(sort)) return badRequest("sort must be priority, newest, oldest, longest or shortest")
+    const statuses = (params.get("statuses") ?? "").split(",").filter((s: string) => s !== "")
+    for (const s of statuses) {
+      if (!["attention", "recovering", "resolved"].includes(s)) return badRequest("statuses takes attention, recovering or resolved")
+    }
+    const limitRaw = params.get("limit")
+    const offsetRaw = params.get("offset")
+    const paged = limitRaw !== undefined || offsetRaw !== undefined
+    const limit = limitRaw === undefined ? 25 : Math.min(100, Math.max(1, parseInt(limitRaw) ?? 25))
+    const offset = offsetRaw === undefined ? 0 : parseInt(offsetRaw) ?? 0
+    if (offset < 0) return badRequest("offset must not be negative")
+    const matched: { inc: Incident, status: string, dur: f64 }[] = []
+    for (const inc of this.engine.health.holds.incidentList()) {
+      const end = inc.resolvedAt > 0 ? inc.resolvedAt : now
+      if (end < from || inc.openedAt > to) continue
+      const st = incidentStatus(inc)
+      if (statuses.length > 0 && !statuses.includes(st)) continue
+      matched.push({ inc: inc, status: st, dur: end - inc.openedAt })
+    }
+    matched.sort((a, b) => {
+      if (sort === "newest") return b.inc.openedAt - a.inc.openedAt
+      if (sort === "oldest") return a.inc.openedAt - b.inc.openedAt
+      if (sort === "longest") return b.dur - a.dur
+      if (sort === "shortest") return a.dur - b.dur
+      const pa = a.status === "resolved" ? 1 : 0
+      const pb = b.status === "resolved" ? 1 : 0
+      if (pa !== pb) return pa - pb
+      return b.inc.openedAt - a.inc.openedAt
+    })
+    // the summary: counts by status, the median time to resolve, and the longest open incident
+    const resolved: number[] = []
+    let attention = 0
+    let recovering = 0
+    let longestOngoing = 0
+    for (const m of matched) {
+      if (m.status === "resolved") resolved.push(m.dur)
+      else {
+        if (m.status === "attention") attention += 1
+        else recovering += 1
+        longestOngoing = Math.max(longestOngoing, m.dur)
+      }
+    }
+    resolved.sort((a, b) => a - b)
+    const median = resolved.length === 0 ? "null" : "" + Math.round(resolved[Math.floor(resolved.length / 2)]! / 1000)
+    const page = paged ? matched.slice(offset, offset + limit) : matched
+    const issues: string[] = []
+    for (const m of page) issues.push(JSON.stringify(incidentRow(m.inc, now)))
+    const summary = `{"attention":${attention},"recovering":${recovering},"resolved":${resolved.length},"median_resolve_seconds":${median},"longest_ongoing_seconds":${Math.round(longestOngoing / 1000)}}`
+    return okJson(`{"issues":[${issues.join(",")}],"total":${matched.length},"offset":${offset},"matched_summary":${summary}}`)
   }
 
   // POST /api/adaptive-routing/conditions/clear: releases the held keys named by {"keys": [...]} (target
@@ -1418,13 +1515,29 @@ export class Ops {
         return badRequest("the body must be a JSON object")
       }
     }
-    if (all) return okJson(JSON.stringify({ message: "held keys released", count: h.resetAll() }))
-    // only circuits that are open now count as released
+    const now = Date.now()
+    if (all) {
+      // every hold, and every circuit that is open now
+      let n = h.holds.clearAll(now)
+      for (const c of h.openCircuits(now)) {
+        if (h.reset(c.id)) {
+          h.holds.noteClose(c.id, now)
+          n += 1
+        }
+      }
+      return okJson(JSON.stringify({ message: "held keys released", count: n }))
+    }
+    // a target is a key ("provider#key") or one of its models ("provider#key@model"), and counts once
     const open: string[] = []
-    for (const c of h.openCircuits(Date.now())) open.push(c.id)
+    for (const c of h.openCircuits(now)) open.push(c.id)
     let n = 0
     for (const id of ids) {
-      if (open.includes(id) && h.reset(id)) n += 1
+      let hit = h.holds.clear(id, now)
+      if (open.includes(id) && h.reset(id)) {
+        h.holds.noteClose(id, now)
+        hit = true
+      }
+      if (hit) n += 1
     }
     return okJson(JSON.stringify({ message: "held keys released", count: n }))
   }
@@ -2482,8 +2595,11 @@ export class Ops {
   }
 
   // The archive copy: the events in each window that has closed (archive_grace_seconds before now) since
-  // the last copy go to object storage as one JSONL object. The first run only sets the mark, so events
-  // written before archiving was turned on are not copied. Rows are never deleted here.
+  // the last copy go to object storage as a Bifrost-style window (audit.tov's archive layout, planWindow):
+  // parts cut at archive_max_object_bytes, gzipped when archive_compress is set, then the manifest that
+  // commits the window. The mark moves only after the manifest is stored, so a failed window is retried
+  // whole on the next pass. The first run only sets the mark, so events written before archiving was
+  // turned on are not copied. Rows are never deleted here.
   async auditArchive(): Promise<void> {
     const log = this.audit
     const ac = this.store.cfg.audit?.archive
@@ -2499,30 +2615,41 @@ export class Ops {
       const end = now - grace * 1000
       if (end <= mark.until) return
       const w = log.exportWindow(mark.seq, end)
-      if (w.count === 0) {
-        log.setArchiveMark({ seq: mark.seq, until: end })
-        return
-      }
       const ec: LogExportsConfig = {
-        enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix ?? "audit", region: ac.region, endpoint: ac.endpoint,
+        enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix, region: ac.region, endpoint: ac.endpoint,
         access_key_id: ac.access_key_id, secret_access_key: ac.secret_access_key, session_token: ac.session_token,
         interval_seconds: ac.interval_seconds, path_style: ac.path_style, format: ac.format, retention_days: ac.retention_days,
       }
-      const put = putRequest(ec, objectKey(ec, mark.until, end, this.nodeId, "jsonl"), w.body, now)
-      const hs: Record<string, string> = put.headers
+      const plan = planWindow(ac.prefix ?? "bifrost", mark.until, end, w.body, maxObjectBytes(this.store.cfg.audit?.archive_max_object_bytes), this.store.cfg.audit?.archive_compress === true, now)
+      for (const o of plan.objects) {
+        const req = putObjectRequest(ec, o.key, o.body, o.contentType, Date.now())
+        if (!(await this.archivePut(req))) return
+      }
+      log.setArchiveMark({ seq: w.last, until: end })
+    } catch (e) {
+      console.error(`raiju: audit archive failed: ${e.message}`)
+    }
+  }
+
+  // One archive object's upload, tried up to three times with a growing pause. False when every try failed.
+  async archivePut(req: ByteRequest): Promise<bool> {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let ok = false
       const dl = deadline(30000)
       try {
-        const r = await fetch(put.url, { method: "PUT", headers: hs, body: put.body, signal: dl.controller.signal })
+        const hs: Record<string, string> = req.headers
+        const r = await fetch(req.url, { method: "PUT", headers: hs, body: req.body, signal: dl.controller.signal })
         await r.text()
-        if (r.status >= 200 && r.status < 300) log.setArchiveMark({ seq: w.last, until: end })
-        else console.error(`raiju: audit archive: HTTP ${r.status} from ${put.url}`)
+        ok = r.status >= 200 && r.status < 300
+        if (!ok) console.error(`raiju: audit archive: HTTP ${r.status} from ${req.url}`)
       } catch (e) {
         console.error(`raiju: audit archive: ${e.message}`)
       }
       dl.finish()
-    } catch (e) {
-      console.error(`raiju: audit archive failed: ${e.message}`)
+      if (ok) return true
+      if (attempt < 3) await new Promise<void>((resolve) => setTimeout(resolve, 1000 * attempt))
     }
+    return false
   }
 
   // /api/users/me/permissions: the caller's custom role as (resource, operation) pairs with their ids.

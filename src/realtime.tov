@@ -147,24 +147,49 @@ export function attachHttp1(e: SocketExt, client: WsConnection): void {
   e.onOpen()
 }
 
+// The providers whose realtime API this relay serves, as Bifrost's RealtimeProvider: OpenAI, Azure
+// OpenAI and xAI. ElevenLabs is a media provider here, and the other OpenAI-compatible providers
+// have no realtime endpoint.
+export function realtimeKind(kind: string): bool {
+  return kind === "openai" || kind === "azure" || kind === "xai"
+}
+
+// The provider's configured headers, as Bifrost copies them. With keepAuth false an
+// authorization header from the config is dropped, since the provider key is the one sent.
+function configHeaders(inout h: Map<string, string>, t: Target, keepAuth: bool): void {
+  const extra = t.cfg.network_config?.extra_headers
+  if (extra === undefined) return
+  for (const k of extra.keys()) {
+    if (keepAuth || k.toLowerCase() !== "authorization") h.set(k, extra.get(k)!)
+  }
+}
+
 export function upstreamFor(t: Target, beta: string | undefined): { url: string, headers: Map<string, string> } {
-  const h: Map<string, string> = new Map()
+  let h: Map<string, string> = new Map()
   if (t.kind === "azure") {
     const az = t.key.azure_key_config
     let deployment = t.model
     const deps = az?.deployments
     if (deps !== undefined) deployment = deps.get(t.model) ?? t.model
-    h.set("api-key", t.key.value ?? "")
+    // an Entra ID token goes in authorization and an API key in api-key, as chat does
+    if (az?.tenant_id !== undefined) h.set("authorization", "Bearer " + (t.key.value ?? ""))
+    else h.set("api-key", t.key.value ?? "")
+    configHeaders(&h, t, true)
     const endpoint = trim(az?.endpoint ?? t.cfg.network_config?.base_url ?? "")
     return { url: `${wsBase(endpoint)}/openai/realtime?api-version=${az?.api_version ?? "2025-04-01-preview"}&deployment=${deployment}`, headers: h }
+  }
+  if (t.kind === "xai") {
+    // xAI's voice endpoint takes the bearer key only: no OpenAI beta header, and the origin is api.x.ai
+    // unless network_config.base_url names another
+    const base = trim(t.cfg.network_config?.base_url ?? "https://api.x.ai")
+    configHeaders(&h, t, false)
+    h.set("authorization", "Bearer " + (t.key.value ?? ""))
+    return { url: `${wsBase(base)}/v1/realtime?model=${t.model}`, headers: h }
   }
   const base = trim(t.cfg.network_config?.base_url ?? "https://api.openai.com")
   h.set("authorization", "Bearer " + (t.key.value ?? ""))
   if (beta !== undefined) h.set("openai-beta", beta)
-  const extra = t.cfg.network_config?.extra_headers
-  if (extra !== undefined) {
-    for (const k of extra.keys()) h.set(k, extra.get(k)!)
-  }
+  configHeaders(&h, t, true)
   return { url: `${wsBase(base)}/v1/realtime?model=${t.model}`, headers: h }
 }
 
@@ -180,7 +205,7 @@ export function prepare(engine: Engine, req: Request): Upgrade {
   const none: Set<int> = new Set()
   const sel = target(engine.cfg, ref, none, req.headers.get("x-bf-api-key") ?? undefined)
   if (sel === undefined) return { kind: "refused", status: 404, message: `no key is configured for ${ref.provider}/${ref.model}` }
-  if (sel.t.kind !== "openai" && sel.t.kind !== "azure") return { kind: "refused", status: 400, message: `${ref.provider} has no realtime API this gateway can relay` }
+  if (!realtimeKind(sel.t.kind)) return { kind: "refused", status: 400, message: `${ref.provider} has no realtime API this gateway can relay` }
   const up = upstreamFor(sel.t, req.headers.get("openai-beta") ?? undefined)
   return { kind: "session", session: new Session(up.url, up.headers, ref.provider, ref.model) }
 }
@@ -274,4 +299,36 @@ test("realtime upstream URLs", () => {
   deps.set("gpt-realtime", "rt-prod")
   const az: Target = { provider: "azure", kind: "azure", model: "gpt-realtime", key: { value: "ak", azure_key_config: { endpoint: "https://x.openai.azure.com/", deployments: deps, api_version: "2025-04-01-preview" } }, cfg: {} }
   expect(upstreamFor(az, undefined).url).toBe("wss://x.openai.azure.com/openai/realtime?api-version=2025-04-01-preview&deployment=rt-prod")
+})
+
+test("realtime kinds and xAI upstream", () => {
+  expect(realtimeKind("openai")).toBe(true)
+  expect(realtimeKind("azure")).toBe(true)
+  expect(realtimeKind("xai")).toBe(true)
+  expect(realtimeKind("groq")).toBe(false)
+  expect(realtimeKind("gemini")).toBe(false)
+  const x: Target = { provider: "xai", kind: "xai", model: "grok-realtime", key: { value: "xk" }, cfg: {} }
+  const u = upstreamFor(x, "realtime=v1")
+  expect(u.url).toBe("wss://api.x.ai/v1/realtime?model=grok-realtime")
+  expect(u.headers.get("authorization")).toBe("Bearer xk")
+  // Bifrost's xAI realtime sends no OpenAI beta header
+  expect(u.headers.has("openai-beta")).toBe(false)
+  const extra: Map<string, string> = new Map()
+  extra.set("Authorization", "Bearer config-value")
+  extra.set("x-team", "voice")
+  const xc: Target = { provider: "xai", kind: "xai", model: "grok-realtime", key: { value: "xk" }, cfg: { network_config: { base_url: "https://xai.example.test/", extra_headers: extra } } }
+  const v = upstreamFor(xc, undefined)
+  expect(v.url).toBe("wss://xai.example.test/v1/realtime?model=grok-realtime")
+  expect(v.headers.get("authorization")).toBe("Bearer xk")
+  expect(v.headers.get("x-team")).toBe("voice")
+})
+
+test("realtime Azure with Entra ID and configured headers", () => {
+  const extra: Map<string, string> = new Map()
+  extra.set("x-team", "voice")
+  const az: Target = { provider: "azure", kind: "azure", model: "gpt-realtime", key: { value: "entra-token", azure_key_config: { endpoint: "https://x.openai.azure.com", tenant_id: "t", client_id: "c", client_secret: "s" } }, cfg: { network_config: { extra_headers: extra } } }
+  const u = upstreamFor(az, undefined)
+  expect(u.headers.get("authorization")).toBe("Bearer entra-token")
+  expect(u.headers.has("api-key")).toBe(false)
+  expect(u.headers.get("x-team")).toBe("voice")
 })

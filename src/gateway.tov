@@ -26,11 +26,12 @@ import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
 import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream"
 import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, RS } from "./providers/types"
-import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText } from "./compat"
+import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
 import { ResponsesToChatStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias } from "./router"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
+import { errorParts, classifyFailure, holdsKey } from "./refusal"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
 import { Pricing, PriceRow } from "./pricing"
 import { ResponseCache, CacheOrigin, cacheKey, keyScope, parseTtl } from "./cache"
@@ -332,6 +333,11 @@ export class StreamConverter {
     const oa = this.oa
     if (oa !== undefined) return this.stopAtFinish ? this.quirkEnd(oa) : oa.end()
     return ""
+  }
+
+  // The provider's billed cost on a streamed answer (OpenRouter's usage.cost on the usage chunk).
+  billedCost(): f64 | undefined {
+    return this.oa?.billed
   }
 
   promptTokens(): int {
@@ -930,6 +936,13 @@ function textAsChat(t: Target, sh: Shaped, stream: bool, canPipe: bool): Upstrea
   return try providers.chatUpstream(t, req, sh.body, false)
 }
 
+// Replicate's text completion: the prompt as the one user message of its chat prediction (Bifrost sends the
+// prompt as the prediction's input, and the answer comes back as a text completion).
+function replicateText(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const cf = try textToChatFields(body)
+  return try providers.chatUpstream(t, try new LazyChat(build(cf)).get(), cf, false)
+}
+
 // The in-process rules of the regex and secrets providers, by provider id. A bad pattern is logged and its provider is skipped.
 function compileLocalRules(providers: GuardrailProvider[]): Map<string, CompiledRule[]> {
   const out: Map<string, CompiledRule[]> = new Map()
@@ -1524,7 +1537,7 @@ export class Engine {
             upstreamMs += performance.now() - started
             metrics.observeRequest(tl, { ok: true, status: 200, errorType: "", retries: retry * 1.0 }, (performance.now() - started) / 1000.0)
             if (sel.keyIndex >= 0) this.stick(h, ref, t)
-            return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true }
+            return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true, billed: t.cfg.ignore_provider_cost === true ? undefined : conv.billedCost() }
           }
           text = await res.text()
           // a streamed upstream body is not kept when local output guards apply: a match can be split across its events,
@@ -1571,7 +1584,18 @@ export class Engine {
         // A 4xx other than 429 is the caller's fault and says the provider is up.
         if (sel.keyIndex >= 0) {
           const healthy = ok || (status >= 400 && status < 500 && status !== 429 && status !== 408)
-          this.health.record(healthId(ref.provider, t.key, sel.keyIndex), healthy, tookMs, Date.now())
+          const hid = healthId(ref.provider, t.key, sel.keyIndex)
+          const now = Date.now()
+          // a provider's refusal that holds the key (or its model) is the hold's to record (holds.tov); the
+          // breaker below counts the same failure as before
+          if (ok) this.health.holds.settle(hid, ref.model, "ok", "unknown", "", undefined, now, 0.0)
+          else {
+            const ep = errorParts(text)
+            const fc = classifyFailure(status, ep.message, ep.type, ep.code)
+            if (holdsKey(fc)) this.health.holds.settle(hid, ref.model, "refused", fc, ep.message, hintMs, now, Math.random())
+            else this.health.holds.settle(hid, ref.model, "unsure", fc, "", undefined, now, Math.random())
+          }
+          this.health.record(hid, healthy, tookMs, now)
           metrics.observeKeyUp(ref.provider, t.key.id ?? "", t.key.name ?? "", ok)
         }
         metrics.observeRequest(tl, { ok: ok, status: status, errorType: ok ? "" : status === 0 ? "provider_connection_failed" : metrics.errorTypeForStatus(status), retries: retry * 1.0 }, secs)
@@ -2796,7 +2820,7 @@ export class Engine {
       }
       if (providers.streamsNatively(t.kind)) {
         const tr = openai.streamResponse(text, requested)
-        return { body: try this.guardWhole(wantUsage ? tr.body : dropUsageChunks(tr.body), "chat", guardOn), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+        return { body: try this.guardWhole(wantUsage ? tr.body : dropUsageChunks(tr.body), "chat", guardOn), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, billed: tr.billed }
       }
       const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
       return { body: try this.guardWhole(try completionToSse(tr.body, wantUsage), "chat", guardOn), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
@@ -2871,12 +2895,13 @@ export class Engine {
     const build: Build = (t) => {
       const sh = try cp.shape(t.provider, t.kind, t.model, body)
       if (sh.route === "chat") return try textAsChat(t, sh, stream, canPipe)
+      if (t.kind === "replicate") return try replicateText(t, body)
       if (!providers.streamsNatively(t.kind)) throw new SyntaxError(`${t.provider} does not serve text completions`)
       return openai.completionsRequest(t, sh.body)
     }
     const translate: Translate = (t, text, requested) => {
       const sh = try cp.shape(t.provider, t.kind, t.model, body)
-      if (sh.route === "chat") {
+      if (sh.route === "chat" || t.kind === "replicate") {
         // a chat answer read whole: a stream was sent as SSE (not piped), or a call made without streaming
         if (text.startsWith("data:")) {
           const sr = openai.streamResponse(text, requested)

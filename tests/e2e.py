@@ -309,6 +309,8 @@ def write_config():
     cfg["providers"]["bedrock_batch"] = {"custom_provider_config": {"base_provider_type": "bedrock"}, "keys": [{"name": "bk-batch", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1", "batch_role_arn": "arn:aws:iam::123456789012:role/batch", "batch_s3_config": {"buckets": [{"bucket_name": "e2e-files", "prefix": "jobs", "is_default": True}]}}}], "network_config": {"base_url": MOCK}}
     # TypeSafe's System One on the mock, under /ts (the decision API, its native routes, and the decision classifier)
     cfg["providers"]["typesafe"] = {"keys": [{"name": "ts", "value": "ts-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/ts"}}
+    # xAI on the mock: its realtime API is relayed to /v1/realtime on the same origin
+    cfg["providers"]["xai"] = {"keys": [{"name": "xk", "value": "xai-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK}}
     path = os.path.join(BUILD, "e2e.config.json")
     json.dump(cfg, open(path, "w"))
     # the complexity classifiers that ask a model: a decision model, a chat model, and embeddings (the exemplars are
@@ -1614,6 +1616,71 @@ def l97p_e2e(env):
     finally:
         gw.terminate()
 
+GW_L104 = "http://127.0.0.1:18185"  # a refused key is held out of rotation, listed with its reason, and released; the history of its incident
+
+def l104_e2e(env):
+    """Adaptive load balancing: a provider's 401 holds that key out of rotation (the other key serves every request),
+    the held-keys view names the class, the provider's reason and the first wait, the key is not sent again while it is
+    held, the incident history lists it (and filters, pages and rejects bad windows), and a release closes it. Its own
+    gateway (18185)."""
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "bad", "value": "sk-bad-key-l104", "models": [], "weight": 1.0},
+                                          {"name": "good", "value": "sk-l104-good", "models": [], "weight": 1.0}],
+                                 "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    path = os.path.join(BUILD, "e2e.l104.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18185", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l104.log"), "w"))
+    try:
+        wait(GW_L104 + "/health")
+        msgs = [{"role": "user", "content": "hi"}]
+        served = 0
+        held = []
+        # keep asking until the bad key has been picked once and held (each request picks it about half the time)
+        for _ in range(30):
+            s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msgs}, None, base=GW_L104, auth=False)
+            served += 1 if s == 200 else 0
+            hs, _, hb = call("GET", "/api/adaptive-routing/held-keys", None, None, base=GW_L104, auth=False)
+            held = [r for r in json.loads(hb)["held_keys"] if r["target"] == "openai#bad"] if hs == 200 else []
+            if held:
+                break
+        check("chats are served while the refused key is being found", served > 0, served)
+        check("the refused key is held with the provider's class, reason and first wait", len(held) == 1 and held[0]["failure_class"] == "credential" and held[0]["reason"] == "invalid api key" and held[0]["state"] == "held" and held[0]["rung"] == 0 and 27 <= held[0]["wait_seconds"] <= 33 and held[0]["provider"] == "openai" and held[0]["key_id"] == "bad", held[:1])
+        sent_before = len([x for x in seen() if "bad-key-l104" in x["auth"]])
+        for _ in range(4):
+            s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msgs}, None, base=GW_L104, auth=False)
+            served += 1 if s == 200 else 0
+        sent_after = len([x for x in seen() if "bad-key-l104" in x["auth"]])
+        check("while it is held, the refused key is not sent a request and every chat is served", sent_after == sent_before and served >= 5, (sent_before, sent_after, served))
+        s, _, b = call("GET", "/api/adaptive-routing/incidents", None, None, base=GW_L104, auth=False)
+        check("the open incident lists the held key", s == 200 and json.loads(b)["total"] == 1 and json.loads(b)["incidents"][0]["target"] == "openai#bad" and json.loads(b)["incidents"][0]["status"] == "attention", (s, b[:300]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues", None, None, base=GW_L104, auth=False)
+        d = json.loads(b) if s == 200 else {"issues": []}
+        check("the history lists the incident with its class, reason and no resolve time", s == 200 and d["total"] == 1 and d["issues"][0]["failure_class"] == "credential" and d["issues"][0]["reason"] == "invalid api key" and d["issues"][0]["status"] == "attention" and "resolved_at" not in d["issues"][0] and d["matched_summary"]["attention"] == 1, (s, b[:400]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?statuses=resolved", None, None, base=GW_L104, auth=False)
+        check("a status filter that matches nothing returns no issues", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?from=2000-01-01T00:00:00Z&to=2000-01-02T00:00:00Z", None, None, base=GW_L104, auth=False)
+        check("a window before the incident has none", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?limit=1&offset=0&sort=newest", None, None, base=GW_L104, auth=False)
+        check("a page of the history", s == 200 and json.loads(b)["total"] == 1 and len(json.loads(b)["issues"]) == 1, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?sort=sideways", None, None, base=GW_L104, auth=False)
+        check("an unknown sort is refused", s == 400, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?offset=-1", None, None, base=GW_L104, auth=False)
+        check("a negative offset is refused", s == 400, (s, b[:200]))
+        s, _, b = call("POST", "/api/adaptive-routing/history/issues", {}, None, base=GW_L104, auth=False)
+        check("the history route takes GET", s == 405, (s, b[:200]))
+        s, _, b = call("POST", "/api/adaptive-routing/conditions/clear", {"keys": ["openai#bad"]}, None, base=GW_L104, auth=False)
+        check("releasing the held key closes one hold", s == 200 and json.loads(b)["count"] == 1, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/held-keys", None, None, base=GW_L104, auth=False)
+        check("no key is held after the release", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        s, _, b = call("GET", "/api/adaptive-routing/history/issues?statuses=resolved", None, None, base=GW_L104, auth=False)
+        d = json.loads(b) if s == 200 else {"issues": []}
+        check("the released incident is resolved and keeps its resolve time", s == 200 and d["total"] == 1 and d["issues"][0]["status"] == "resolved" and "resolved_at" in d["issues"][0] and d["matched_summary"]["median_resolve_seconds"] is not None, (s, b[:400]))
+    finally:
+        gw.terminate()
+
 MCP_KEYS = "http://127.0.0.1:18123"  # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients
 
 MCP_KEYS_SPEC = json.dumps({"openapi": "3.0.3", "info": {"title": "Raiju self", "version": "1"}, "paths": {"/api/version": {"get": {"operationId": "version", "summary": "The gateway's version"}}}})
@@ -2771,6 +2838,7 @@ def l97q_config() -> dict:
             "bedrock": {"keys": [{"name": "bk-l97q", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
             "wafer": {"keys": [{"name": "wf-l97q", "value": "wf-key", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK + "/wafer", "max_retries": 0}},
             "openrouter": {"keys": [{"name": "or-l97q", "value": "or-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/or", "max_retries": 0}},
+            "orflat": {"keys": [{"name": "orf-l97q", "value": "or-key", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK + "/or", "max_retries": 0}, "ignore_provider_cost": True},
             "aliased": {"keys": [{"name": "al-l97q", "value": "sk-alias", "models": [], "weight": 1.0, "aliases": {"house-best": {"model_id": "gpt-4o-mini", "model_name": "gpt-4o", "model_family": "openai"}, "plain": "gpt-4o-mini"}}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
         },
     }
@@ -2816,12 +2884,88 @@ def l97q_e2e(env):
         s, _, b = call("GET", "/api/logs?providers=openrouter", base=GW_L97Q, auth=False)
         logs = json.loads(b).get("logs", []) if s == 200 else []
         check("openrouter chat is billed at usage.cost, not the datasheet price", any(abs(float(x.get("cost") or 0) - 0.00123) < 1e-9 for x in logs), (s, b[:300]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openrouter/openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
+        check("openrouter streamed chat answers", s == 200 and "billed " in b and "stream" in b and "[DONE]" in b, (s, b[:300]))
+        s, _, b = call("GET", "/api/logs?providers=openrouter", base=GW_L97Q, auth=False)
+        logs = json.loads(b).get("logs", []) if s == 200 else []
+        check("openrouter streamed chat is billed at its usage chunk's usage.cost", any(abs(float(x.get("cost") or 0) - 0.00456) < 1e-9 for x in logs), (s, b[:300]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "orflat/openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
+        s2, _, b2 = call("GET", "/api/logs?providers=orflat", base=GW_L97Q, auth=False)
+        ol = json.loads(b2).get("logs", []) if s2 == 200 else []
+        check("ignore_provider_cost: a streamed answer's usage.cost is not billed", s == 200 and len(ol) > 0 and not any(abs(float(x.get("cost") or 0) - 0.00456) < 1e-9 for x in ol), (s, b[:200], s2, b2[:200]))
         s, h, b = call("POST", "/v1/chat/completions", {"model": "aliased/house-best", "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
         check("an object-form alias answers and reports its model id, name and family", s == 200 and hdr(h, "x-bifrost-routing-info-alias-model-id") == "gpt-4o-mini" and hdr(h, "x-bifrost-routing-info-alias-model-name") == "gpt-4o" and hdr(h, "x-bifrost-routing-info-alias-model-family") == "openai", (s, h))
         al = [x for x in seen() if x["path"] == "/v1/chat/completions" and "gpt-4o-mini" in x["body"]]
         check("an object-form alias sends its model_id upstream", len(al) > 0 and json.loads(al[-1]["body"])["model"] == "gpt-4o-mini", al[-1:])
         s, h, b = call("POST", "/v1/chat/completions", {"model": "aliased/plain", "messages": [{"role": "user", "content": "hi"}]}, base=GW_L97Q, auth=False)
         check("a plain alias reports its model id and no name or family", s == 200 and hdr(h, "x-bifrost-routing-info-alias-model-id") == "gpt-4o-mini" and hdr(h, "x-bifrost-routing-info-alias-model-name") is None and hdr(h, "x-bifrost-routing-info-alias-model-family") is None, (s, h))
+    finally:
+        gw.terminate()
+
+
+GW_L105 = "http://127.0.0.1:18181"  # Cohere and Azure model retrieve, Replicate polling, edits and files, and text completions on Replicate
+
+
+def l105_config() -> dict:
+    """Cohere (its model object on the mock), Azure (refused as Bifrost does) and Replicate (its predictions, edits and files)."""
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l105-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "cohere": {"keys": [{"name": "co-l105", "value": "co-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/cohere-up", "max_retries": 0}},
+            "azure": {"keys": [{"name": "az-l105", "value": "az-key", "models": [], "weight": 1.0, "azure_key_config": {"endpoint": MOCK + "/azure-up", "api_version": "2024-10-21"}}]},
+            "replicate": {"keys": [{"name": "rp-l105", "value": "r8_e2e", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK + "/replicate", "max_retries": 0}},
+            "bedrock": {"keys": [{"name": "bk-l105", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+
+
+def l105_e2e(env):
+    """Cohere's model retrieve, Azure's refusal, Replicate's images polled past Prefer: wait, its image edits, its
+    file list, retrieve and delete (content refused, as Bifrost), and a text completion."""
+    cfg_path = os.path.join(BUILD, "e2e.l105.json")
+    json.dump(l105_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18181", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l105.log"), "w"))
+    png = b"\x89PNG-l105-bytes"
+    try:
+        wait(GW_L105 + "/health")
+        s, _, b = call("GET", "/v1/models/cohere/command-r-plus", base=GW_L105, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        check("cohere model retrieve reads the model's name, limits and endpoints", s == 200 and r.get("id") == "cohere/command-r-plus" and r.get("name") == "command-r-plus" and r.get("context_length") == 128000 and r.get("supported_methods") == ["chat"] and r.get("owned_by") == "cohere", (s, b[:300]))
+        check("cohere model retrieve sends the key to /v1/models/{model}", seen()[-1]["path"].endswith("/v1/models/command-r-plus") and seen()[-1]["auth"] == "Bearer co-key", seen()[-1:])
+        s, _, b = call("GET", "/v1/models/azure/gpt-4o", base=GW_L105, auth=False)
+        check("azure has no retrieve API in Bifrost, so the list entry answers", s == 200 and json.loads(b).get("owned_by") == "azure" and "listed" in json.loads(b), (s, b[:300]))
+        s, _, b = call("POST", "/v1/images/generations", {"model": "replicate/acme/model-a", "prompt": "slow", "n": 1}, base=GW_L105, auth=False)
+        d = json.loads(b) if s == 200 else {}
+        check("replicate images poll a prediction that is still starting at its get URL", s == 200 and d.get("data", [{}])[0].get("url", "").endswith("/out/polled.png"), (s, b[:300]))
+        s, _, b = mp_form(GW_L105, "/v1/images/edits", [("model", None, "text/plain", "replicate/black-forest-labs/flux-kontext-pro"), ("prompt", None, "text/plain", "a red fox"), ("n", None, "text/plain", "1"), ("image", "in.png", "image/png", png)])
+        d = json.loads(b) if s == 200 else {}
+        check("replicate image edits answer with the output image", s == 200 and d.get("data", [{}])[0].get("url", "").endswith("/out/edit.png"), (s, b[:300]))
+        ed = [x for x in seen() if x["path"] == "/v1/models/black-forest-labs/flux-kontext-pro/predictions"]
+        check("replicate image edits send the image as a data URL in the model's input_image", len(ed) > 0 and '"input_image":"data:image/png;base64,' in ed[-1]["body"] and '"prompt":"a red fox"' in ed[-1]["body"] and '"num_outputs":1' in ed[-1]["body"], ed[-1:])
+        s, _, b = call("GET", "/v1/files?provider=replicate", base=GW_L105, auth=False)
+        lst = json.loads(b) if s == 200 else {}
+        check("replicate files list: the first page with its cursor", s == 200 and [x["id"] for x in lst.get("data", [])] == ["file-e2e-1"] and lst.get("has_more") is True and lst.get("after") == "p2" and lst["data"][0]["purpose"] == "batch" and lst["data"][0]["status"] == "processed", (s, b[:300]))
+        s, _, b = call("GET", "/v1/files?provider=replicate&after=p2", base=GW_L105, auth=False)
+        lst = json.loads(b) if s == 200 else {}
+        check("replicate files list: the next page, without a cursor after it", s == 200 and [x["id"] for x in lst.get("data", [])] == ["file-e2e-2"] and lst.get("has_more") is False and lst["data"][0]["status"] == "uploaded", (s, b[:300]))
+        check("replicate files list sends the cursor upstream", seen()[-1]["path"] == "/v1/files?cursor=p2" and seen()[-1]["auth"] == "Bearer r8_e2e", seen()[-1:])
+        s, _, b = call("GET", "/v1/files/file-e2e-1?provider=replicate", base=GW_L105, auth=False)
+        f = json.loads(b) if s == 200 else {}
+        check("replicate file retrieve answers as an OpenAI file", s == 200 and f.get("id") == "file-e2e-1" and f.get("bytes") == 9 and f.get("filename") == "pic.png" and f.get("status") == "processed", (s, b[:300]))
+        s, _, b = call("DELETE", "/v1/files/file-e2e-1?provider=replicate", base=GW_L105, auth=False)
+        check("replicate file delete answers with the deleted object", s == 200 and json.loads(b) == {"id": "file-e2e-1", "object": "file", "deleted": True}, (s, b[:300]))
+        check("replicate file delete calls the file's URL", seen()[-1]["path"] == "/v1/files/file-e2e-1", seen()[-1:])
+        s, _, b = call("GET", "/v1/files/file-e2e-1/content?provider=replicate", base=GW_L105, auth=False)
+        check("replicate file content is refused, as Bifrost refuses it", s == 400 and "does not support" in b, (s, b[:300]))
+        s, _, b = call("POST", "/v1/images/generations", {"model": "bedrock/stability.stable-image-core-v1:1", "prompt": "a lake", "style_preset": "photographic", "cfg_scale": 7.5}, base=GW_L105, auth=False)
+        st = [x for x in seen() if x["path"].startswith("/model/stability.stable-image-core")]
+        check("bedrock stability generation sends its extra params in the flat body", s == 200 and len(st) > 0 and '"style_preset":"photographic"' in st[-1]["body"] and '"cfg_scale":7.5' in st[-1]["body"] and '"taskType"' not in st[-1]["body"], (s, b[:200], st[-1:]))
+        s, _, b = call("POST", "/v1/completions", {"model": "replicate/acme/model-a", "prompt": "hi there"}, base=GW_L105, auth=False)
+        d = json.loads(b) if s == 200 else {}
+        check("replicate text completions answer as text", s == 200 and "Replicate says: hi there" in (d.get("choices") or [{}])[0].get("text", ""), (s, b[:300]))
     finally:
         gw.terminate()
 
@@ -3748,6 +3892,9 @@ def main():
         check("realtime relays events with the provider key", st == 101 and r.get("event") == '{"type":"session.update"}' and r.get("auth", "").startswith("Bearer sk-from-env") and "model=gpt-realtime" in r.get("auth", ""), (st, reply))
         st, _ = ws_roundtrip("/v1/realtime?model=anthropic/claude", "{}")
         check("realtime refuses providers without a realtime API", st == 400, st)
+        st, reply = ws_roundtrip("/v1/realtime?model=xai/grok-realtime", '{"type":"session.update"}')
+        r = json.loads(reply or "{}")
+        check("realtime relays xAI events with the xAI key and model", st == 101 and r.get("event") == '{"type":"session.update"}' and r.get("auth", "").startswith("Bearer xai-key") and "/v1/realtime?model=grok-realtime" in r.get("auth", ""), (st, reply))
 
         # WebSocket mode of /v1/responses: response.create runs through the responses path, and its
         # events come back one per message, on the same connection
@@ -3804,9 +3951,17 @@ def main():
             check(f"the Responses socket alias {alias} runs the same route", al.status == 101 and evs and evs[-1].get("type") == "response.completed", (alias, al.status, evs[-1:] if evs else evs))
             al.close()
 
-        # POST /v1/live/sessions: the WebRTC create is refused (no WebRTC peer here), after the checks Bifrost makes
+        # POST /v1/live/sessions (WebRTC create): the offer goes to OpenAI as it is, its answer comes back, and the
+        # session is recorded for the virtual key that created it
         s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, headers={"authorization": "Bearer sk-bf-openai"})
-        check("a WebRTC live create is refused with the reason", s == 501 and "WebSocket" in b, (s, b))
+        rtc = json.loads(b) if s == 201 else {}
+        check("a WebRTC live create returns the session id and the provider's SDP answer", s == 201 and rtc.get("session", {}).get("id") == "sess_mock_rtc" and rtc.get("transport", {}).get("type") == "webrtc" and "live-answer" in rtc.get("transport", {}).get("sdp", ""), (s, b))
+        sent = seen()[-1]
+        check("the WebRTC create reaches OpenAI with its key, the bare model and the offer", sent["path"] == "/v1/live/sessions" and sent["auth"] == "Bearer sk-from-env" and "gpt-4o-mini" in sent["body"] and "openai/" not in sent["body"] and "v=0" in sent["body"], sent)
+        s, _, b = call("GET", "/v1/live/sessions/sess_mock_rtc/content", headers={"authorization": "Bearer sk-bf-limited"})
+        check("another key does not read a WebRTC session's recording", s == 404, (s, b))
+        s, _, b = call("GET", "/v1/live/sessions/sess_mock_rtc/content", headers={"authorization": "Bearer sk-bf-openai"})
+        check("the key that created a WebRTC session reads its recording", s == 200 and b == "RIFF-recording-sess_mock_rtc", (s, b))
         s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}})
         check("a live create needs a WebRTC transport", s == 400 and "transport" in b, (s, b))
         s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "anthropic/claude"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, headers={"authorization": "Bearer sk-bf-openai"})
@@ -5489,6 +5644,8 @@ def main():
         l97h_e2e(env)
         # Replicate, Bedrock Stability edits, Wafer files, OpenRouter's billed cost and object-form aliases: their own gateway
         l97q_e2e(env)
+        # Cohere and Azure model retrieve, Replicate polling, edits and files, and text completions: their own gateway
+        l105_e2e(env)
         # the governance remainder: quota, budget overrides, routing rules, roles, catalogue and PUT /api/config sections
         l97j_e2e(env)
         # the setup session, the log filters the gateway records, the background cost recalculation and plugin CRUD: their own gateways
@@ -5501,6 +5658,8 @@ def main():
         l97s_e2e(env)
         # the management routes the web UI drives (MCP tool switches, virtual key and provider edits, settings): their own gateway
         l113_e2e(env)
+        # adaptive load balancing: a refused key is held, listed, kept out of rotation and released; its incident history
+        l104_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

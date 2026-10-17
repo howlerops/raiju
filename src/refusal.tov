@@ -1,0 +1,233 @@
+// What a provider's refusal of a key says, and how long the key is held. The classes and the phrase lists
+// follow Bifrost's failure classification (core/failureclass.go): the status alone decides 401, 402, 403 and
+// 429 and the transient 5xx set, and the other classes need the provider's error code, type or message.
+// Holds (health.tov) use the classes that repeat on every request until something changes; transient,
+// caller-fault and unknown failures never hold a key.
+import { fields, find, rawStr } from "./json"
+
+export type FailureClass = "credential" | "quota" | "model_access" | "model_gone" | "region_blocked" | "rate_limit" | "transient" | "caller_fault" | "unknown"
+
+export type ErrorParts = { message: string, type: string, code: string }
+
+const TRANSIENT_STATUS: int[] = [500, 502, 503, 504, 529]
+const CALLER_STATUS: int[] = [400, 409, 413, 415, 422]
+
+const RATE_PATTERNS: string[] = [
+  "rate limit", "rate_limit", "ratelimit", "too many requests", "quota exceeded", "quota_exceeded", "request limit",
+  "throttled", "throttling", "rate exceeded", "limit exceeded", "requests per", "rpm exceeded", "tpm exceeded",
+  "tokens per minute", "requests per minute", "requests per second", "api rate limit", "usage limit",
+  "concurrent requests limit", "burst_rate", "rate increased",
+]
+const QUOTA_MARKERS: string[] = [
+  "credit balance", "spend limit", "api usage limits", "prepayment credits", "credits are depleted", "spending cap",
+  "requires billing to be enabled", "key limit exceeded", "account is not active",
+]
+const QUOTA_CODES: string[] = ["insufficient_quota", "blocked_api_access"]
+const REGION_MARKERS: string[] = ["unsupported countries", "location is not supported", "not available in your country"]
+const CREDENTIAL_TYPES: string[] = [
+  "authentication_error", "UNAUTHENTICATED", "UnrecognizedClientException", "InvalidSignatureException",
+  "ExpiredTokenException", "IncompleteSignatureException",
+]
+const CREDENTIAL_CODES: string[] = ["invalid_api_key", "organization_restricted"]
+const CREDENTIAL_SHARED_TYPES: string[] = ["INVALID_ARGUMENT", "AccessDeniedException", "permission_error"]
+const CREDENTIAL_MARKERS: string[] = [
+  "api key not valid", "api_key_invalid", "api key expired", "api key is valid", "invalid api key", "security token",
+]
+const MODEL_ACCESS_CODES: string[] = ["model_not_found", "DeploymentNotFound", "unknown_model", "model_terms_required"]
+const MODEL_ACCESS_TYPES: string[] = ["model_not_found", "invalid_model", "permission_error", "AccessDeniedException"]
+const GOOGLE_MODEL_TYPES: string[] = ["NOT_FOUND", "PERMISSION_DENIED", "FAILED_PRECONDITION"]
+const GOOGLE_MODEL_MARKERS: string[] = ["models/", "publisher model"]
+const ANTHROPIC_MODEL_MARKERS: string[] = ["model:", "is not available"]
+const BEDROCK_MODEL_MARKERS: string[] = ["model id", "on-demand throughput", "inference profile"]
+const OPENROUTER_MODEL_MARKERS: string[] = ["no endpoints found", "no allowed providers"]
+const RETIRED_CODES: string[] = ["model_decommissioned", "ServiceModelDeprecating"]
+const RETIRED_MARKERS: string[] = [
+  "deprecated", "deprecation", "decommissioned", "retired", "end of its life", "end-of-life", "no longer available",
+  "was removed", "has been removed",
+]
+
+const HOLD_START_MS = 30000.0
+const HOLD_FLOOR_MS = 10000.0
+
+function hasAny(lower: string, markers: string[]): bool {
+  for (const m of markers) {
+    if (lower.includes(m)) return true
+  }
+  return false
+}
+
+// The message, type and code of a provider error body. A body that is not a JSON object is the message
+// as it came, with no type or code.
+export function errorParts(text: string): ErrorParts {
+  let message = text
+  let type = ""
+  let code = ""
+  try {
+    const top = try fields(text)
+    const e = find(top, "error")
+    let scope = top
+    if (e !== undefined && e.startsWith("{")) scope = try fields(e)
+    message = rawStr(scope, "message") ?? rawStr(top, "message") ?? text
+    type = rawStr(scope, "type") ?? rawStr(top, "type") ?? ""
+    code = rawStr(scope, "code") ?? rawStr(top, "code") ?? ""
+  } catch (e) {
+    message = text
+  }
+  return { message: message, type: type, code: code }
+}
+
+// The class of a failed call. status is the HTTP status (0 for a network error); the rest are the parts
+// errorParts reads from the body.
+export function classifyFailure(status: int, message: string, errType: string, code: string): FailureClass {
+  const lower = message.toLowerCase()
+  const typeLower = errType.toLowerCase()
+  const codeLower = code.toLowerCase()
+  const body = message !== ""
+  const transient = TRANSIENT_STATUS.includes(status)
+  // quota before rate limit: an exhausted balance is often reported as a 429 that also reads as a rate limit
+  if (!transient && (status === 402 || QUOTA_CODES.includes(code) || errType === "insufficient_quota" || hasAny(lower, QUOTA_MARKERS))) return "quota"
+  if (status === 429 || (status !== 401 && status !== 403 && (hasAny(lower, RATE_PATTERNS) || hasAny(typeLower, RATE_PATTERNS) || hasAny(codeLower, RATE_PATTERNS)))) return "rate_limit"
+  if (transient) return "transient"
+  if (code === "unsupported_country_region_territory" || ((status === 400 || status === 403) && hasAny(lower, REGION_MARKERS))) return "region_blocked"
+  if (status === 401 || CREDENTIAL_TYPES.includes(errType) || CREDENTIAL_CODES.includes(code) || (CREDENTIAL_SHARED_TYPES.includes(errType) && hasAny(lower, CREDENTIAL_MARKERS))) return "credential"
+  const m = modelSignals(status, errType, code, lower, body)
+  if (m.isModel) return m.retired ? "model_gone" : "model_access"
+  // any other 403 is a permission problem with the key
+  if (status === 403) return "credential"
+  if (CALLER_STATUS.includes(status) && (errType !== "" || code !== "" || body)) return "caller_fault"
+  return "unknown"
+}
+
+// Whether the error names the model as the thing that could not be served, and whether it says the model
+// was withdrawn. A 410 with a body is a withdrawn model (Azure's retired deployments).
+function modelSignals(status: int, errType: string, code: string, lower: string, body: bool): { isModel: bool, retired: bool } {
+  let retired = RETIRED_CODES.includes(code) || hasAny(lower, RETIRED_MARKERS)
+  if (status === 410) return { isModel: body || retired, retired: true }
+  if (MODEL_ACCESS_CODES.includes(code) || RETIRED_CODES.includes(code) || code.startsWith("model_permission_blocked")) return { isModel: true, retired: retired }
+  if (MODEL_ACCESS_TYPES.includes(errType)) return { isModel: true, retired: retired }
+  if (errType === "ResourceNotFoundException") return { isModel: lower.includes("model"), retired: retired }
+  if (errType === "ValidationException") {
+    // only a retirement notice about the model counts; a field the model no longer accepts is the request's problem
+    retired = retired && lower.includes("model")
+    return { isModel: retired || hasAny(lower, BEDROCK_MODEL_MARKERS), retired: retired }
+  }
+  if (errType === "not_found_error") return { isModel: hasAny(lower, ANTHROPIC_MODEL_MARKERS), retired: retired }
+  if (GOOGLE_MODEL_TYPES.includes(errType)) return { isModel: hasAny(lower, GOOGLE_MODEL_MARKERS), retired: retired }
+  if (status === 404) {
+    if (hasAny(lower, OPENROUTER_MODEL_MARKERS)) return { isModel: true, retired: retired }
+    if (lower.includes("model") && (lower.includes("not found") || retired)) return { isModel: true, retired: retired }
+  }
+  return { isModel: false, retired: false }
+}
+
+// Whether the class holds the key (or its model) out of rotation.
+export function holdsKey(cls: FailureClass): bool {
+  return holdCapMs(cls) > 0
+}
+
+// The longest wait the ladder reaches for the class (the wait when the provider gives no hint).
+export function holdCapMs(cls: FailureClass): f64 {
+  if (cls === "credential") return 900000.0
+  if (cls === "quota" || cls === "model_access") return 300000.0
+  if (cls === "model_gone") return 1800000.0
+  if (cls === "region_blocked") return 900000.0
+  if (cls === "rate_limit") return 120000.0
+  return 0.0
+}
+
+// Whether a refusal holds every model of the key: a rejected credential, or an account out of credit.
+export function holdsAllModels(cls: FailureClass): bool {
+  return cls === "credential" || cls === "quota"
+}
+
+// The wait before a held key is checked again. The provider's hint is used as given, never under 10 s.
+// Otherwise the ladder: 30 s, doubled for each failed check (rung), up to the class's cap, varied by 10
+// percent either way (r is a number in [0, 1)).
+export function holdWaitMs(cls: FailureClass, rung: int, hintMs: f64 | undefined, r: f64): f64 {
+  if (hintMs !== undefined) return Math.max(hintMs, HOLD_FLOOR_MS)
+  const cap = holdCapMs(cls)
+  let d = HOLD_START_MS
+  for (let i = 0; i < rung && d < cap; i++) d = d * 2.0
+  if (d > cap) d = cap
+  return Math.floor(d * (90.0 + 20.0 * r) / 100.0)
+}
+
+// The name the dashboard shows for a class (Bifrost's FailReason labels).
+export function reasonLabel(cls: FailureClass): string {
+  if (cls === "credential") return "key rejected"
+  if (cls === "quota") return "out of quota"
+  if (cls === "model_access") return "no model access"
+  if (cls === "model_gone") return "model retired"
+  if (cls === "region_blocked") return "region blocked"
+  if (cls === "rate_limit") return "rate limited"
+  return cls
+}
+
+test("a 401, a 402 and a 429 are the key's own failures whatever the body says", () => {
+  expect(classifyFailure(401, "invalid api key", "auth", "")).toBe("credential")
+  expect(classifyFailure(402, "payment required", "", "")).toBe("quota")
+  expect(classifyFailure(429, "slow down", "", "")).toBe("rate_limit")
+  expect(classifyFailure(403, "forbidden", "", "")).toBe("credential")
+})
+
+test("provider wording moves a refusal to its class", () => {
+  // an exhausted balance under a 400 (Anthropic) and under a 429 that reads as a rate limit
+  expect(classifyFailure(400, "Your credit balance is too low", "invalid_request_error", "")).toBe("quota")
+  expect(classifyFailure(429, "You exceeded your current quota", "", "insufficient_quota")).toBe("quota")
+  // a 500 whose body says the limit was hit is a rate limit; a plain 503 is transient
+  expect(classifyFailure(500, "rate limit reached", "", "")).toBe("rate_limit")
+  expect(classifyFailure(503, "overloaded", "server", "")).toBe("transient")
+  expect(classifyFailure(529, "overloaded", "overloaded_error", "")).toBe("transient")
+  expect(classifyFailure(403, "This service is not available in your country", "", "")).toBe("region_blocked")
+  expect(classifyFailure(400, "API key not valid. Please pass a valid API key.", "INVALID_ARGUMENT", "")).toBe("credential")
+  expect(classifyFailure(400, "bad field", "INVALID_ARGUMENT", "")).toBe("caller_fault")
+})
+
+test("model signals: unreachable models hold the model, withdrawn ones hold it longer", () => {
+  expect(classifyFailure(404, "The model does not exist", "", "model_not_found")).toBe("model_access")
+  expect(classifyFailure(404, "Deployment not found", "", "DeploymentNotFound")).toBe("model_access")
+  expect(classifyFailure(404, "the model gpt-3.5 has been retired", "", "")).toBe("model_gone")
+  expect(classifyFailure(410, "gone", "", "")).toBe("model_gone")
+  expect(classifyFailure(400, "invalid parameter", "invalid_request_error", "")).toBe("caller_fault")
+  expect(classifyFailure(404, "no route for this path", "", "")).toBe("unknown")
+  expect(classifyFailure(422, "", "", "")).toBe("unknown")
+})
+
+test("only the classes that repeat hold a key", () => {
+  expect(holdsKey("credential")).toBe(true)
+  expect(holdsKey("rate_limit")).toBe(true)
+  expect(holdsKey("transient")).toBe(false)
+  expect(holdsKey("caller_fault")).toBe(false)
+  expect(holdsKey("unknown")).toBe(false)
+  expect(holdsAllModels("credential")).toBe(true)
+  expect(holdsAllModels("model_access")).toBe(false)
+})
+
+test("the wait climbs 30 s, 60 s, 120 s up to the class cap, with 10 percent either way", () => {
+  expect(holdWaitMs("credential", 0, undefined, 0.5)).toBe(30000)
+  expect(holdWaitMs("credential", 1, undefined, 0.5)).toBe(60000)
+  expect(holdWaitMs("credential", 4, undefined, 0.5)).toBe(480000)
+  expect(holdWaitMs("credential", 9, undefined, 0.5)).toBe(900000)
+  expect(holdWaitMs("rate_limit", 5, undefined, 0.5)).toBe(120000)
+  expect(holdWaitMs("credential", 0, undefined, 0.0)).toBe(27000)
+  expect(holdWaitMs("credential", 0, undefined, 0.25)).toBe(28500)
+})
+
+test("a provider's hint is used as given, never under 10 seconds", () => {
+  expect(holdWaitMs("rate_limit", 3, 2500.0, 0.5)).toBe(10000)
+  expect(holdWaitMs("rate_limit", 0, 20000.0, 0.5)).toBe(20000)
+  expect(holdWaitMs("credential", 0, 600000.0, 0.5)).toBe(600000)
+})
+
+test("error bodies: OpenAI and Anthropic shapes, and text that is not JSON", () => {
+  const a = errorParts(`{"error":{"message":"Incorrect key","type":"invalid_request_error","code":"invalid_api_key"}}`)
+  expect(a.message).toBe("Incorrect key")
+  expect(a.type).toBe("invalid_request_error")
+  expect(a.code).toBe("invalid_api_key")
+  const b = errorParts(`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+  expect(b.type).toBe("authentication_error")
+  expect(b.message).toBe("invalid x-api-key")
+  const c = errorParts("upstream exploded")
+  expect(c.message).toBe("upstream exploded")
+  expect(c.type).toBe("")
+})
