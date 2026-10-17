@@ -3177,6 +3177,102 @@ def flag_batch_keys(path):
 
 
 
+MCP_GEN = "http://127.0.0.1:18177"  # the authorization server with no signing_key: its key is generated and kept in the state file
+MCP_GEN_B = "http://127.0.0.1:18178"  # a second gateway on the same config folder: it reads the same key and grants
+
+def as_grant(base, name, value):
+    """A client registered under this name and granted with a virtual key: (client id, refresh token), or empty strings."""
+    s, _, b = raw("POST", base + "/oauth2/register", {"client_name": name, "redirect_uris": [AS_REDIRECT]}, {"content-type": "application/json"})
+    cid = json.loads(b).get("client_id", "") if s == 201 else ""
+    verifier, challenge = as_pkce()
+    fid, tok = as_authorize(base, cid, challenge, "st-" + name)
+    if fid == "":
+        return "", ""
+    s, redirect = as_approve(base, fid, tok, value)
+    if s != 200:
+        return "", ""
+    s, body = as_token(base, cid, redirect, verifier)
+    return (cid, body.get("refresh_token", "")) if s == 200 else ("", "")
+
+def as_refresh(base, cid, refresh):
+    """A refresh_token grant at this gateway: (status, body dict)."""
+    form = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": cid})
+    s, _, b = raw("POST", base + "/oauth2/token", form, {"content-type": "application/x-www-form-urlencoded"})
+    return s, json.loads(b)
+
+def mcp_grants_e2e(env):
+    """MCP OAuth grants: with no signing_key configured, a key is generated at the first start and kept in the state file
+    beside config.json (the JWKS publishes it); the grants are listed and revoked through /api/oauth2/sessions; and they
+    survive a restart and are shared by a second gateway on the same folder (a refresh rotates on one node, and reuse of
+    the rotated token on the other revokes the family). Two gateways in turn, started and stopped here."""
+    folder = os.path.join(BUILD, "e2e.mcpgrants")
+    os.makedirs(folder, exist_ok=True)
+    cfg_path = os.path.join(folder, "config.json")
+    state_path = os.path.join(folder, "mcp-oauth-state.json")
+    for p in (cfg_path, state_path):
+        if os.path.exists(p):
+            os.remove(p)
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "mcp_server_auth_mode": "both",
+                   "oauth2_server_config": {"issuer_url": MCP_GEN, "access_token_ttl": 600}},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"virtual_keys": [{"id": "vk-grants", "name": "grants key", "value": "sk-bf-grants"}]},
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+
+    def start(port):
+        return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", port, "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.mcpgrants." + port + ".log"), "w"))
+
+    def kid_of(base):
+        s, _, b = raw("GET", base + "/.well-known/jwks.json")
+        keys = json.loads(b).get("keys", []) if s == 200 else []
+        return keys[0].get("kid", "") if len(keys) == 1 else ""
+
+    gw = start("18177")
+    try:
+        wait(MCP_GEN + "/health")
+        kid = kid_of(MCP_GEN)
+        check("with no signing key configured, the JWKS publishes a generated key", len(kid) == 32, kid)
+        state = json.load(open(state_path)) if os.path.exists(state_path) else {}
+        check("the generated key is kept in the state file beside config.json", state.get("signing_key", "").startswith("-----BEGIN RSA PRIVATE KEY-----"), list(state.keys()))
+        cid_a, refresh_a = as_grant(MCP_GEN, "grant-one", "sk-bf-grants")
+        cid_b, refresh_b = as_grant(MCP_GEN, "grant-two", "sk-bf-grants")
+        check("two clients are granted with a virtual key", refresh_a != "" and refresh_b != "", (cid_a, cid_b))
+        s, _, b = raw("GET", MCP_GEN + "/api/oauth2/sessions?q=grant-")
+        rows = json.loads(b).get("sessions", []) if s == 200 else []
+        check("the sessions list shows both grants, with the key's name", s == 200 and len(rows) == 2 and all(r["bf_mode"] == "vk" and r["bf_sub_display"] == "grants key" for r in rows), (s, b[:300]))
+        row_b = next((r for r in rows if r["client_name"] == "grant-two"), {})
+        s, _, b = raw("DELETE", MCP_GEN + "/api/oauth2/sessions/" + row_b.get("id", "none"))
+        check("a grant is revoked from the list (204)", s == 204, (s, b[:200]))
+        s, _, _ = raw("DELETE", MCP_GEN + "/api/oauth2/sessions/" + row_b.get("id", "none"))
+        check("revoking it again is 404", s == 404, s)
+        s, body = as_refresh(MCP_GEN, cid_b, refresh_b)
+        check("a revoked grant no longer refreshes", s == 400, (s, body))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+    gb = start("18178")
+    try:
+        wait(MCP_GEN_B + "/health")
+        check("a second gateway on the folder signs with the same key", kid_of(MCP_GEN_B) == kid, (kid, kid_of(MCP_GEN_B)))
+        s, _, b = raw("GET", MCP_GEN_B + "/api/oauth2/sessions?q=grant-")
+        rows = json.loads(b).get("sessions", []) if s == 200 else []
+        check("after the restart the live grant is listed and the revoked one is not", len(rows) == 1 and rows[0]["client_name"] == "grant-one", (s, b[:300]))
+        s, body = as_refresh(MCP_GEN_B, cid_a, refresh_a)
+        check("the grant refreshes on the second gateway", s == 200 and body.get("refresh_token", "") != "", (s, body))
+        refresh_a2 = body.get("refresh_token", "")
+        s, body = as_refresh(MCP_GEN_B, cid_a, refresh_a)
+        check("reuse of a rotated refresh token is refused", s == 400, (s, body))
+        s, body = as_refresh(MCP_GEN_B, cid_a, refresh_a2)
+        check("reuse revokes the whole grant", s == 400, (s, body))
+        s, _, b = raw("GET", MCP_GEN_B + "/api/oauth2/sessions?q=grant-")
+        check("no grant is listed after the reuse", s == 200 and json.loads(b).get("total_count", -1) == 0, (s, b[:200]))
+    finally:
+        gb.terminate()
+        gb.wait()
+
 def main():
     unique_ports()
     build()
@@ -4626,6 +4722,14 @@ def main():
         up = seen()[-1]["body"]
         flags = ("password = correcthorsebatterystaple" in up, "api_key = " in up, "[REDACTED:GENERIC-API-KEY]" in up, "k3Jd9xQ2mL7vP0sWz8Rt" not in up)
         check("secrets detection passes a plain word and redacts only a generic key's value", s == 200 and all(flags), (s, flags, up[:300]))
+        # gitleaks:allow: the marked line passes unredacted, and the next line is still redacted
+        ALLOWED = "lin_api_" + "abcdefghij" * 3 + "0123456789"
+        s, _, b = rchat("linear " + ALLOWED + " // gitleaks:allow")
+        up = seen()[-1]["body"]
+        check("secrets detection honours a gitleaks:allow comment on the line", s == 200 and ALLOWED in up, (s, up[:200]))
+        s, _, b = rchat("linear " + ALLOWED + " // gitleaks:allow\nlinear " + "lin_api_" + "abcdefghij" * 3 + "0123456790")
+        up = seen()[-1]["body"]
+        check("secrets detection still redacts the line after a gitleaks:allow line", s == 200 and ALLOWED in up and "[REDACTED:LINEAR-API-KEY]" in up and "lin_api_" + "abcdefghij" * 3 + "0123456790" not in up, (s, up[:200]))
         s, _, b = rchat("write to a@b.co", model="openai/echo-model")
         up = seen()[-1]["body"]
         check("reversible redaction sends a placeholder upstream", s == 200 and "[EMAIL-1]" in up and "a@b.co" not in up, (s, up[:200]))
@@ -5308,6 +5412,8 @@ def main():
         mcp_po_e2e(env)
         # MCP as an OAuth authorization server: discovery, registration, consent, tokens, /mcp with a token, and oauth mode: its own gateways
         mcp_as_e2e(env)
+        # MCP OAuth grants: a generated signing key, the grants list and revoke, and grants across a restart and a second gateway: their own gateways
+        mcp_grants_e2e(env)
         # the request log in Bifrost's shapes, User-Agent mappings, cache clears, audit by id, tickets and plugin listings: its own gateway
         l97c_e2e(env)
         # client limits, header filters, setup_token, batch keys and alias depth: their own gateways
