@@ -39,6 +39,8 @@ Then tell the user what is left and how you will approach it, and start.
 - Unit: `make unit TOV=$TOV` (several minutes)
 - OpenAPI: `make openapi-check TOV=$TOV` (must print `openapi-check: ok`)
 - Parity counts: `python3 scripts/parity_count.py --check` (`make parity-count` rewrites)
+- UI: `make web-check TOV=$TOV` (after a spec change: `make web`, commit the generated files) and
+  `flock /tmp/raiju-e2e.lock env TOV=$TOV make ui`
 - e2e, always through the lock, on both servers, in the background:
   `flock /tmp/raiju-e2e.lock env TOV=$TOV python3 tests/e2e.py`
   `flock /tmp/raiju-e2e.lock env TOV=$TOV RAIJU_SERVER=http1 python3 tests/e2e.py`

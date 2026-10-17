@@ -11,31 +11,58 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `main` holds everything (PR howlerops/raiju#1 merged waves 12, 13 and L97). Start new
-work on a fresh branch from `main`.
+Branch: wave 14 is on `claude/affectionate-shannon-pjwi5z` (not yet merged to `main`; `main`
+still holds waves 12, 13 and L97 from PR howlerops/raiju#1). Merge or PR that branch first, then
+start new work on a fresh branch from `main`.
 
 ## Where things stand
 
-- Waves 1 to 13 and L97a to L97t are merged. The saved wave-12 patches were all finished, so
-  `handoff/patches/` is gone (recover from git history if needed).
-- docs/parity.md counts 560 parity rows: done 368, partial 144, missing 11, out of scope 28,
-  n/a 9, plus 34 Raiju-only extras. `make parity-count` regenerates the Summary;
+- Waves 1 to 14 are merged on the branch above. Wave 14 (L103 to L120, L112a/b) closed every
+  row: done or partial with its "Open:" remainder written in LEDGER.md.
+- docs/parity.md counts 562 parity rows: done 374, partial 159, missing 5, out of scope 15,
+  n/a 9, plus 35 Raiju-only extras. `make parity-count` regenerates the Summary;
   `python3 scripts/parity_count.py --check` fails when it is stale.
-- Tests at handoff: `make unit` 1,381 passed, 0 failed; e2e "all passed" on both servers (Bun
-  and http1); `make openapi-check` ok (docs/openapi/management.yaml, 300 operations).
-- UI track: OpenAPI spec done (L98); native client spike done (L99, `clients/`): gpui and Slint
-  both build and share a data layer checked headless against a gateway. clients/README.md
-  recommends Slint. No window was opened (no display in the container).
+- Tests at handoff: `make unit` 1,544 passed, 0 failed; e2e "all passed" on both servers (Bun
+  and http1); `make ui` all passed (about 160 browser checks); `make openapi-check` ok
+  (336 operations); `make web-check` up to date.
+- Admin UI: SolidJS 2.0 RC in `web/` (Vite on Bun, types generated from the OpenAPI spec),
+  embedded in the binary through the committed `src/ui_assets.tov` and served by
+  `src/uiserve.tov`; `RAIJU_UI_DIR` serves a directory instead. Building the gateway needs no
+  Node or Bun; changing the UI does (`make web`, then commit). `clients/` (gpui and Slint
+  spikes) is parked. The live feed is cluster-wide and resumable (L119).
 
 ## What's next
 
-Wave 14 in LEDGER.md (L103 to L117) collects every open remainder: governance (rate-limit
-splits, profile role binding), audit archive and adaptive LB, providers (Replicate text and
-edits, streamed usage.cost, Cohere/Azure model retrieve), MCP OAuth (consent modes, grant
-revoke, persisted grants, generated signing key), streams (built-in guard, replay pacing,
-streamed compat headers), live sessions beyond OpenAI, decision routes, the config keys and
-histograms left, `gitleaks:allow`, building the 11 "missing" parity rows, the web admin client
-(L113), the per-key exact cache (L114), and SCIM, A2A and MCP code mode (L115 to L117).
+No row is queued. The remainders are the "Open:" notes in LEDGER.md (L103 to L120) and the 5
+"missing" rows of docs/parity.md (dynamic plugins, `large_payload_optimization`,
+`retain_content_in_object_storage`, MCP `max_instructions_length`, the agent CLI headers
+`x-bf-agent-vk-id` / `x-bf-agent-auth`). The larger ones:
+
+- Streams: Bifrost holds and replays live block-capable streams; Raiju cuts them (G43).
+- WebRTC create is a pass-through with no gateway peer, so media and events after the create
+  are not metered or guarded (G40, L108).
+- MCP: token_exchange clients are not connected at runtime (L112b); code mode lacks while,
+  try, lambda and is not on the Responses API (L117); A2A lacks REST/gRPC bindings, push and
+  upstream OAuth (L116).
+- UI: dashboard charts, MCP OAuth consent screens, virtual MCP and tool group editors,
+  role-aware hiding of actions (L113).
+- Identity-aware proxy in full mode does not consult governance for disabled users (L120).
+
+## Open questions for the owner
+
+1. **Dynamic plugins.** Go `.so` plugins need the Go runtime, so they are out. WASM plugins are
+   possible only by linking JavaScriptCore into the gateway (about 34 MB, a 10-minute JSC build).
+   Link it, or leave dynamic plugins unbuilt?
+2. **WebRTC create (L108).** Keep the create-time pass-through, or build a real relay (a WebRTC
+   stack in Tov or a sidecar) so media and events are metered and guarded?
+3. **Key holds with breakers off (L104).** Refusals now hold a key (a 429 holds the model on that
+   key for 10 s to 2 min) even when circuit breakers and adaptive routing are off. Keep, or make
+   it opt-in?
+4. **Held access profiles (L103).** A user's held profiles now govern all their keys, and every
+   held profile is charged (Bifrost charges one paying profile). Keep the stricter rule?
+5. **Accepted-but-not-applied config (L112a).** `large_payload_optimization` and
+   `retain_content_in_object_storage` are buildable (a streaming request-body path, a second
+   object-storage write path); the HTTP/2 and pool knobs need Tov runtime changes. Build which?
 
 ## Owner decisions (2026-10-17)
 
@@ -72,10 +99,11 @@ The open questions from the last handoff are answered:
 
 - **Ports.** Every e2e gateway has a fixed port. Give each worker two free ones and never
   reuse. `tests/e2e.py` refuses to start on a duplicate. Port registry:
-  - used by e2e: 18100–18105, 18110–18112, 18114–18128, 18130–18144, 18146–18151,
-    18153–18156, 18159, 18161, 18163, 18165–18168, 18193
-  - openapi-check: 18190–18199; native client spike checks: 18171–18172
-  - free for new workers: 18173–18189 (and the gaps above, after checking)
+  - used by e2e and the UI tests: 18100–18157, 18159–18161, 18163–18170, 18173–18178, 18180,
+    18181, 18183, 18185, 18187, 18188, 18193
+  - openapi-check: 18190–18199
+  - free for new workers: 18158, 18162, 18171, 18172, 18179, 18182, 18184, 18186, 18189
+    (check with `grep -oE '181[0-9][0-9]' tests/e2e.py tests/ui_e2e.mjs | sort -u` first)
 - **Shared mock.** Background senders (bulk, export, alert hooks, log posts) hit the same mock;
   `background()` in tests/e2e.py filters them. A test that asserts on `/_seen` must filter too.
 - **MCP tool lists change request bodies.** e2e waits for the MCP tools at startup
@@ -91,6 +119,24 @@ The open questions from the last handoff are answered:
   launch line. Two created reminders and deleted them; check `list_triggers` at the end. A
   container restart kills background workers but not their worktrees; resume them with
   SendMessage. Workers sometimes report twice; compare the worktree diff before re-merging.
+- **Worker worktrees start from `main`**, not from the branch tip. A worker that needs merged
+  work must be told to run `git merge --ff-only <commit>` as its first step (allow it explicitly
+  in the launch line). Patches are diffs against each worker's own base, so they still apply
+  with `git apply -3`.
+- **`git apply -3` stages what it applies.** Run `git reset -q` right after, or a later
+  "ledger only" commit picks up unverified merges.
+- **Keeping both sides of a conflict breaks code.** It dropped a closing brace between two new
+  methods (pricing.tov, store.tov) and split an e2e function from its `finally`. After every
+  union: typecheck, `python3 -m py_compile tests/e2e.py`, and check that each e2e function
+  that starts a gateway still stops it.
+- **docs/parity.md conflicts** need line-by-line merging of both sides' facts, then
+  `python3 scripts/parity_count.py --write`; never take one side of a row blindly.
+- **Generated UI files.** When the OpenAPI spec changes, run `make web` and commit
+  `web/src/api/schema.d.ts` (and `src/ui_assets.tov` if the bundle changed); `make web-check`
+  fails otherwise.
+- **After a container restart**, worker reports that were not delivered are in
+  `~/.claude/projects/-home-user-raiju/<session>/subagents/agent-<id>.jsonl`: search the
+  strings for the "FILES:" report.
 - **e2e while merging.** e2e builds from the working tree, so don't apply a patch to the main
   tree while a run is going. Verify in a scratch worktree instead.
 
@@ -103,6 +149,9 @@ The open questions from the last handoff are answered:
 - e2e uses fixed ports. Always: `flock /tmp/raiju-e2e.lock env TOV=$TOV python3 tests/e2e.py`
   and again with `RAIJU_SERVER=http1`. UI: `make ui`. Tov patches: `make tov-test`.
 - OpenAPI: `make openapi-check TOV=$TOV` after any /api, /mcp, /health or /metrics change.
+- UI: `make web` (Bun at /root/.bun/bin) rebuilds `web/` and re-embeds it; `make web-check` must
+  say up to date; `flock /tmp/raiju-e2e.lock env TOV=$TOV make ui` runs the browser checks.
+  Develop with `cd web && bun run dev` against a running gateway.
 - Merging a worker: `git -C <worktree> add -A && git -C <worktree> diff --cached HEAD --binary -- . ':!LEDGER.md' ':!build' > x.patch`,
   then `git apply -3 x.patch` in the main tree, resolve, test, write the ledger row, commit.
 - Commit trailers on this repo: `Co-Authored-By` and `Claude-Session` lines as in `git log`.
