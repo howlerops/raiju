@@ -1,0 +1,147 @@
+// Which anthropic-beta flags reach an Anthropic-family provider, as Bifrost filters them
+// (core/providers/anthropic FilterBetaHeadersForProvider and MergeBetaHeaders). A known flag goes
+// upstream only when the provider supports its feature; an unknown flag goes to Anthropic alone.
+// network_config.beta_header_overrides, keyed by prefix, sets support for a prefix on that provider.
+
+import { NetworkConfig } from "./config"
+
+export const BETA_HEADER = "anthropic-beta"
+
+const FALLBACK_CREDIT_AWS = "fallback-credit-2026-06-09"
+
+// Every known flag prefix. A flag belongs to the first prefix it starts with.
+const PREFIXES: string[] = [
+  "dangerous-tool-use-", "auto-mode-classifier-", "computer-use-", "structured-outputs-", "mcp-client-",
+  "prompt-caching-scope-", "compact-", "context-management-", "files-api-", "advanced-tool-use-",
+  "tool-search-tool-", "tool-examples-", "interleaved-thinking-", "skills-", "context-1m-", "fast-mode-",
+  "redact-thinking-", "task-budgets-", "fine-grained-tool-streaming-", "advisor-tool-", "cache-diagnosis-",
+  "server-side-fallback-", "fallback-credit-", "mid-conversation-tool-changes-", "mid-conversation-output-config-",
+  "inline-tools-",
+]
+
+// The prefixes each provider kind supports by default (Bifrost's ProviderFeatures). Anthropic's own API takes all.
+function supportedBy(kind: string): string[] {
+  if (kind === "anthropic") return PREFIXES
+  if (kind === "vertex") return ["dangerous-tool-use-", "auto-mode-classifier-", "computer-use-", "compact-", "context-management-", "tool-search-tool-", "interleaved-thinking-", "context-1m-", "fine-grained-tool-streaming-", "fallback-credit-"]
+  if (kind === "bedrock") return ["dangerous-tool-use-", "auto-mode-classifier-", "computer-use-", "structured-outputs-", "compact-", "context-management-", "tool-search-tool-", "tool-examples-", "interleaved-thinking-", "context-1m-", "fine-grained-tool-streaming-", "fallback-credit-"]
+  if (kind === "bedrock_mantle") return ["dangerous-tool-use-", "auto-mode-classifier-", "computer-use-", "compact-", "context-management-", "tool-search-tool-", "tool-examples-", "interleaved-thinking-", "context-1m-", "fine-grained-tool-streaming-", "fallback-credit-", "mid-conversation-tool-changes-", "inline-tools-"]
+  return []
+}
+
+// The filter applies to Anthropic's API and to Claude models on Vertex and Bedrock. Other models keep
+// the headers the caller sent, as they did before the filter.
+export function filtered(kind: string, model: string): bool {
+  if (kind === "anthropic") return true
+  return (kind === "vertex" || kind === "bedrock" || kind === "bedrock_mantle") && model.includes("claude")
+}
+
+// The flags of several header values, split on commas, trimmed, each kept once (MergeBetaHeaders).
+export function flagsOf(values: string[]): string[] {
+  const out: string[] = []
+  for (const v of values) {
+    for (const part of v.split(",")) {
+      const tok = part.trim()
+      if (tok !== "" && !out.includes(tok)) out.push(tok)
+    }
+  }
+  return out
+}
+
+// The flags a provider sends, in order. An override by prefix decides first; the defaults apply to the rest.
+export function keepFlags(kind: string, flags: string[], overrides: Map<string, bool> | undefined): string[] {
+  const supported = supportedBy(kind)
+  const out: string[] = []
+  for (const tok of flags) {
+    let prefix: string | undefined = undefined
+    for (const p of PREFIXES) {
+      if (tok.startsWith(p)) {
+        prefix = p
+        break
+      }
+    }
+    if (prefix === undefined) {
+      // an unknown flag: a matching override prefix decides it; with none, only Anthropic takes it
+      let matched = false
+      if (overrides !== undefined) {
+        for (const p of overrides.keys()) {
+          if (tok.startsWith(p)) {
+            matched = true
+            if (overrides.get(p) === true) out.push(tok)
+            break
+          }
+        }
+      }
+      if (!matched && kind === "anthropic") out.push(tok)
+      continue
+    }
+    let on = supported.includes(prefix)
+    if (overrides !== undefined && overrides.has(prefix)) on = overrides.get(prefix) === true
+    if (!on) continue
+    if (prefix === "fallback-credit-" && (kind === "bedrock" || kind === "bedrock_mantle")) out.push(FALLBACK_CREDIT_AWS)
+    else out.push(tok)
+  }
+  return out
+}
+
+// The anthropic-beta value a request to this provider carries: the caller's and the provider's flags,
+// merged and filtered. "" means no header.
+export function betaValue(kind: string, model: string, values: string[], nc: NetworkConfig | undefined): string {
+  if (!filtered(kind, model)) return values.join(",")
+  return keepFlags(kind, flagsOf(values), nc?.beta_header_overrides).join(",")
+}
+
+test("Anthropic's own API keeps every known flag and any unknown one", () => {
+  expect(keepFlags("anthropic", ["structured-outputs-2025-11-13", "x-future-2030-01-01"], undefined)).toEqual(["structured-outputs-2025-11-13", "x-future-2030-01-01"])
+})
+
+test("Vertex drops the flags it does not offer and unknown flags", () => {
+  expect(keepFlags("vertex", ["structured-outputs-2025-11-13", "context-1m-2025-08-07", "x-future-2030-01-01"], undefined)).toEqual(["context-1m-2025-08-07"])
+  expect(keepFlags("vertex", ["mid-conversation-tool-changes-2026-07-01"], undefined)).toEqual([])
+})
+
+test("Bedrock keeps structured outputs and rewrites fallback credit to the AWS date", () => {
+  expect(keepFlags("bedrock", ["structured-outputs-2025-11-13", "fallback-credit-2026-06-01"], undefined)).toEqual(["structured-outputs-2025-11-13", "fallback-credit-2026-06-09"])
+  expect(keepFlags("vertex", ["fallback-credit-2026-06-01"], undefined)).toEqual(["fallback-credit-2026-06-01"])
+})
+
+test("Bedrock Mantle drops structured outputs and keeps mid-conversation tool changes", () => {
+  expect(keepFlags("bedrock_mantle", ["structured-outputs-2025-11-13", "mid-conversation-tool-changes-2026-07-01", "inline-tools-2026-09-15"], undefined)).toEqual(["mid-conversation-tool-changes-2026-07-01", "inline-tools-2026-09-15"])
+})
+
+test("overrides by prefix turn a default on or off", () => {
+  const on: Map<string, bool> = new Map()
+  on.set("structured-outputs-", true)
+  expect(keepFlags("vertex", ["structured-outputs-2025-11-13"], on)).toEqual(["structured-outputs-2025-11-13"])
+  const off: Map<string, bool> = new Map()
+  off.set("context-1m-", false)
+  expect(keepFlags("anthropic", ["context-1m-2025-08-07", "computer-use-2025-01-24"], off)).toEqual(["computer-use-2025-01-24"])
+})
+
+test("an override names an unknown flag by prefix, and false drops it", () => {
+  const ov: Map<string, bool> = new Map()
+  ov.set("x-team-", true)
+  ov.set("x-blocked-", false)
+  expect(keepFlags("vertex", ["x-team-1", "x-blocked-2", "x-other-3"], ov)).toEqual(["x-team-1"])
+  expect(keepFlags("anthropic", ["x-blocked-2", "x-other-3"], ov)).toEqual(["x-other-3"])
+})
+
+test("the flags of several values are merged once each, in order", () => {
+  expect(flagsOf(["a-1, b-2", "b-2,,c-3 "])).toEqual(["a-1", "b-2", "c-3"])
+  expect(flagsOf([""])).toEqual([])
+})
+
+test("only Claude models on the cloud paths are filtered", () => {
+  expect(filtered("anthropic", "claude-sonnet-4-5")).toBe(true)
+  expect(filtered("vertex", "claude-sonnet-4@20250514")).toBe(true)
+  expect(filtered("vertex", "gemini-2.5-flash")).toBe(false)
+  expect(filtered("openai", "claude-x")).toBe(false)
+  expect(betaValue("vertex", "gemini-2.5-flash", ["x-future-2030-01-01"], undefined)).toBe("x-future-2030-01-01")
+})
+
+test("betaValue merges the provider's and the caller's flags, filtered", () => {
+  const bo: Map<string, bool> = new Map()
+  bo.set("structured-outputs-", true)
+  const nc: NetworkConfig = { beta_header_overrides: bo }
+  expect(betaValue("vertex", "claude-sonnet-4@20250514", ["structured-outputs-2025-11-13,context-1m-2025-08-07", "x-future-2030-01-01"], nc)).toBe("structured-outputs-2025-11-13,context-1m-2025-08-07")
+  expect(betaValue("vertex", "claude-sonnet-4@20250514", [""], undefined)).toBe("")
+})

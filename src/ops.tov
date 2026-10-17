@@ -66,6 +66,7 @@ import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
 import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs, ByteRequest } from "./exports"
 import { planWindow, maxObjectBytes } from "./audit_archive"
+import { jobRequest, MAX_ATTEMPTS } from "./retained"
 import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode } from "./mcpissuer"
 
@@ -779,6 +780,9 @@ export class Ops {
   pushedWindow: Map<string, string> = new Map()
   exportCfg: LogExportsConfig | undefined = undefined
   exportTimer: int = -1
+  // the retained-content uploads (retained.tov), and whether one pass is running
+  retainTimer: int = -1
+  retainSending = false
   exportKey = ""
   cursor = new ExportCursor(Date.now())
   exporting = false
@@ -871,6 +875,7 @@ export class Ops {
     this.configureFeed(cfg.cluster)
     this.configureProxy(cfg.auth_proxy, cfg.oidc)
     this.configureExports(cfg.log_exports)
+    this.configureRetained()
     this.configureExporters(cfg.exporters ?? [])
     const oc = cfg.oidc
     const same = oc !== undefined && this.oidcCfg !== undefined && JSON.stringify(oc) === JSON.stringify(this.oidcCfg)
@@ -2598,6 +2603,55 @@ export class Ops {
       else if (st >= 300) console.error(`raiju: exporter ${q.cfg.id}: status ${st}, batch dropped`)
     }
     this.sending = false
+  }
+
+  // ---- retained content (client.retain_content_in_object_storage) ----
+
+  // The queue of hidden objects is uploaded once a second, while the engine has one.
+  configureRetained(): void {
+    if (this.engine.hiddenQueue === undefined || this.retainTimer >= 0) return
+    this.retainTimer = setInterval(() => {
+      this.flushRetained()
+    }, 1000)
+  }
+
+  // Uploads the retained objects that are due: at most 16 a pass, each tried once here. A failed one waits
+  // its pause in the queue and is given up after MAX_ATTEMPTS tries. Nothing waits on this, so a store
+  // outage never holds up a request.
+  async flushRetained(): Promise<void> {
+    const q = this.engine.hiddenQueue
+    if (q === undefined || this.retainSending) return
+    this.retainSending = true
+    try {
+      for (let n = 0; n < 16; n++) {
+        const now = Date.now()
+        const job = q.take(now)
+        if (job === undefined) break
+        const ok = await this.retainPut(jobRequest(q, job, now))
+        if (ok) q.done(job)
+        else if (!q.fail(job, Date.now())) console.error(`raiju: retained content ${job.key}: given up after ${MAX_ATTEMPTS} tries`)
+      }
+    } catch (e) {
+      console.error(`raiju: retained content: ${e.message}`)
+    }
+    this.retainSending = false
+  }
+
+  // One upload, with a 30 second deadline. True when the store answered 2xx.
+  async retainPut(req: ByteRequest): Promise<bool> {
+    const dl = deadline(30000)
+    let ok = false
+    try {
+      const hs: Record<string, string> = req.headers
+      const r = await fetch(req.url, { method: "PUT", headers: hs, body: req.body, signal: dl.controller.signal })
+      await r.text()
+      ok = r.status >= 200 && r.status < 300
+      if (!ok) console.error(`raiju: retained content: HTTP ${r.status} from ${req.url}`)
+    } catch (e) {
+      console.error(`raiju: retained content: ${e.message}`)
+    }
+    dl.finish()
+    return ok
   }
 
   // ---- request log exports ----

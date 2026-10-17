@@ -1,6 +1,6 @@
 // The request engine: governance, cache, the attempt loop (retries, key
 // rotation, fallbacks), translation, accounting.
-import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, OAuthKeyConfig, providerOf } from "./config"
+import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, OAuthKeyConfig, LogExportsConfig, providerOf } from "./config"
 import { applyPrompt, Applied } from "./prompts"
 import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField, without } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
@@ -18,6 +18,7 @@ import * as typesafe from "./providers/typesafe"
 import { AgentConfig, runAgent } from "./agent"
 import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
+import { RetainQueue, HiddenPayload, MAX_JOBS, MAX_BYTES } from "./retained"
 import { GuardrailProvider, Verdict, appliesTo, checkRequest, parseVerdictFor, isLocal, extractText, completionText } from "./guardrail_providers"
 import { judgeText } from "./guard_judge"
 import { CompiledRule, applyRegex } from "./guard_regex"
@@ -30,6 +31,7 @@ import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText,
 import { ResponsesToChatStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias } from "./router"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
+import * as anthropicBeta from "./anthropic_beta"
 import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
 import { errorParts, classifyFailure, holdsKey } from "./refusal"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
@@ -49,6 +51,7 @@ import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
 import { GuardConfig, applyToChatRequest, applyToCompletion, applyToText } from "./guardrails"
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
+import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
 import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
@@ -875,6 +878,8 @@ class ReqCtx {
   outHeaders: Map<string, string> = new Map()
   // request and response bodies stay out of the logs (content logging is off for this request)
   contentOff = false
+  // the bodies of a content-off request are kept as a hidden object in object storage (retained.tov)
+  hidden = false
   // the raw upstream request and response, kept for the log store (store_raw_request_response)
   rawRequest = ""
   rawResponse = ""
@@ -1090,6 +1095,8 @@ export class Engine {
   sharedWindows = false
   // set by the exporters loop: every logged request is queued for each exporter
   exportQueues: ExportQueue[] = []
+  // hidden content of content-off requests, uploaded by ops.tov (client.retain_content_in_object_storage)
+  hiddenQueue: RetainQueue | undefined = undefined
   guardProviders: GuardrailProvider[] = []
   // compiled regex and secrets providers, by id, and the guards on MCP tool calls
   localRules: Map<string, CompiledRule[]> = new Map()
@@ -1166,6 +1173,16 @@ export class Engine {
         this.logStore = store
       } catch (e) {
         console.error(`raiju: request log store disabled: ${e.message}`)
+      }
+    }
+    // Bifrost's retain_content_in_object_storage: content-off bodies go to logs_store.object_storage, with the store on
+    const ob = ls?.object_storage
+    if (ls !== undefined && ls.enabled === true && cfg.client?.retain_content_in_object_storage === true && this.logStore !== undefined) {
+      if (ob !== undefined && ob.bucket !== "" && (ob.type === "s3" || ob.type === "gcs")) {
+        const dst: LogExportsConfig = { enabled: true, kind: ob.type, bucket: ob.bucket, region: ob.region, endpoint: ob.endpoint, access_key_id: ob.access_key_id, secret_access_key: ob.secret_access_key, session_token: ob.session_token, path_style: ob.path_style }
+        this.hiddenQueue = new RetainQueue(dst, ob.prefix ?? "bifrost", ob.compress === true, MAX_JOBS, MAX_BYTES)
+      } else {
+        console.error("raiju: retain_content_in_object_storage is on but logs_store.object_storage is not set (type s3 or gcs, and a bucket); content-off requests keep no content")
       }
     }
     const mc = cfg.mcp
@@ -1555,8 +1572,17 @@ export class Engine {
         } catch (e) {
           return { ok: false, status: 400, body: errorJson(e.message, "invalid_request_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
         }
+        // anthropic-beta: the provider's flags and the caller's, filtered for Claude as Bifrost does (anthropic_beta.tov).
+        // The Messages route forwards the caller's own anthropic-beta, as Bifrost's Anthropic integration does.
+        const providerBeta: string = up.headers.get("anthropic-beta") ?? ""
         for (const k of extra.keys()) up.headers.set(k, extra.get(k)!)
         for (const k of ctx.upstreamHeaders.keys()) up.headers.set(k, ctx.upstreamHeaders.get(k)!)
+        if (anthropicBeta.filtered(t.kind, t.model)) {
+          const callerBeta: string = ctx.op === "anthropic.messages" ? (h.get("anthropic-beta") ?? "") : ""
+          const beta = anthropicBeta.betaValue(t.kind, t.model, [providerBeta, up.headers.get("anthropic-beta") ?? "", callerBeta], t.cfg.network_config)
+          if (beta === "") up.headers.delete("anthropic-beta")
+          else up.headers.set("anthropic-beta", beta)
+        }
         attempts += 1
         const tracer = this.tracer
         const parent = ctx.span
@@ -2367,9 +2393,11 @@ export class Engine {
       ctx.span = rs
     }
     ctx.contentOff = this.contentOff(h)
+    // the queue is built at start (as the log store is); the live config can still switch the retention off
+    ctx.hidden = ctx.contentOff && this.hiddenQueue !== undefined && this.cfg.client?.retain_content_in_object_storage === true
     ctx.userAgent = h.get("user-agent") ?? ""
     ctx.sessionId = sessionId(h) ?? ""
-    if (this.logStore !== undefined && !ctx.contentOff) ctx.input = text
+    if (this.logStore !== undefined && (!ctx.contentOff || ctx.hidden)) ctx.input = text
     // bifrost_active_requests: in flight from here until the answer (or the throw) is out
     const method = requestType(op, streamed)
     metrics.activeRequests(method, 1.0)
@@ -2783,6 +2811,13 @@ export class Engine {
     const ring = this.samples
     if (ring !== undefined) ring.push({ ts: Date.now(), provider: c.provider, model: c.model, status: c.status, latency_ms: ms, cost: c.cost })
     const store = this.logStore
+    // a content-off request with retention: its bodies go to object storage as a hidden object; the row keeps none
+    const hq = this.hiddenQueue
+    const now = Date.now()
+    if (c.hidden && hq !== undefined) {
+      const p: HiddenPayload = { id: c.rid, timestamp: isoMs(now), object: c.op, provider: c.provider, model: c.model, status: c.status, input: c.input === "" ? undefined : c.input, output: c.output === "" ? undefined : c.output, error: c.error === "" ? undefined : c.error }
+      hq.add(now, c.rid, JSON.stringify(p))
+    }
     if (this.exportQueues.length > 0) {
       const e: LogEntry = {
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
@@ -2806,6 +2841,7 @@ export class Engine {
       const keyRef = lb.selectedKeyId !== "" ? lb.selectedKeyId : lb.selectedKeyName
       const engine = lb.routingRuleId !== "" ? "routing-rule" : keyRef !== "" ? "loadbalancing" : ""
       store.add({
+        content_hidden: c.hidden ? true : undefined,
         selected_key_id: keyRef === "" ? undefined : keyRef,
         selected_key_name: lb.selectedKeyName === "" ? undefined : lb.selectedKeyName,
         routing_rule_id: lb.routingRuleId === "" ? undefined : lb.routingRuleId,

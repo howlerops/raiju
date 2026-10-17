@@ -2787,6 +2787,67 @@ def l110_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L127 = "http://127.0.0.1:18189"  # anthropic-beta: the flags each upstream call carries, filtered and overridden per provider
+
+def l127_e2e(env):
+    """L127: the anthropic-beta filter. A mock records the beta header of each upstream call. The direct Anthropic
+    provider and Vertex (a Claude model) keep the flags their defaults allow and drop the rest; the
+    beta_header_overrides of a second provider over the same upstream turn a default on or off. Its own gateway."""
+    import re
+    src = open(os.path.join(ROOT, "src/jwt.tov")).read()
+    pem = re.search(r"const TEST_PKCS8 = `(.*?)`", src, re.S).group(1)
+    seen_beta = []
+    def routes(method, path, hs, body):
+        if path == "/token":
+            return 200, '{"access_token":"l127-token","expires_in":3600}', "application/json"
+        seen_beta.append((path, hs.get("anthropic-beta")))
+        msg = '{"id":"msg_l127","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}'
+        return 200, msg, "application/json"
+    up_srv = serve(0, routes)
+    up = f"http://127.0.0.1:{up_srv.server_address[1]}"
+    sa = {"type": "service_account", "client_email": "e2e@test.iam.gserviceaccount.com", "private_key": pem, "token_uri": up + "/token"}
+    vertex_key = {"name": "vx-l127", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps(sa)}}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": up + "/nodatasheet", "enabled": False},
+        "providers": {
+            "anthropic": {"keys": [{"name": "a-l127", "value": "l127-direct", "models": [], "weight": 1.0}], "network_config": {"base_url": up, "max_retries": 0}},
+            "anthropic-off": {"custom_provider_config": {"base_provider_type": "anthropic"}, "keys": [{"name": "a-off-l127", "value": "l127-direct", "models": [], "weight": 1.0}], "network_config": {"base_url": up, "max_retries": 0, "beta_header_overrides": {"context-1m-": False, "x-future-": True}}},
+            "vertex": {"keys": [vertex_key], "network_config": {"base_url": up, "max_retries": 0}},
+            "vertex-on": {"custom_provider_config": {"base_provider_type": "vertex"}, "keys": [dict(vertex_key, name="vx-on-l127")], "network_config": {"base_url": up, "max_retries": 0, "beta_header_overrides": {"structured-outputs-": True}}},
+        },
+    }
+    cfg_path = os.path.join(BUILD, "e2e.l127.json")
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18189", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l127.log"), "w"))
+    try:
+        wait(GW_L127 + "/health")
+        msgs = [{"role": "user", "content": "beta l127"}]
+        claude = "claude-sonnet-4-5"
+        # the direct API: the defaults keep every flag, unknown ones included
+        beta_all = "context-1m-2025-08-07,structured-outputs-2025-11-13,x-future-2030-01-01"
+        s, _, b = call("POST", "/anthropic/v1/messages", {"model": "anthropic/" + claude, "max_tokens": 16, "messages": msgs}, {"anthropic-beta": beta_all}, base=GW_L127, auth=False)
+        got = [x[1] for x in seen_beta if x[0] == "/v1/messages"]
+        check("direct: the caller's anthropic-beta reaches Anthropic as sent by default", s == 200 and got[-1:] == [beta_all], (s, b[:200], got[-1:]))
+        # a second provider with beta_header_overrides: context-1m off, so only that flag drops
+        s, _, b = call("POST", "/anthropic/v1/messages", {"model": "anthropic-off/" + claude, "max_tokens": 16, "messages": msgs}, {"anthropic-beta": beta_all}, base=GW_L127, auth=False)
+        got = [x[1] for x in seen_beta if x[0] == "/v1/messages"]
+        check("direct: an override of false drops that flag and keeps the rest", s == 200 and got[-1:] == ["structured-outputs-2025-11-13,x-future-2030-01-01"], (s, b[:200], got[-1:]))
+        # Vertex, a Claude model: structured outputs and unknown flags drop, context 1M stays
+        vx_flags = "structured-outputs-2025-11-13,context-1m-2025-08-07,x-future-2030-01-01"
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "vertex/claude-sonnet-4@20250514", "messages": msgs}, {"x-bf-eh-anthropic-beta": vx_flags}, base=GW_L127, auth=False)
+        got = [x[1] for x in seen_beta if x[0].endswith(":rawPredict")]
+        check("vertex: Claude drops the flags Vertex does not offer", s == 200 and got[-1:] == ["context-1m-2025-08-07"], (s, b[:200], got[-1:]))
+        # Vertex with structured outputs turned on by an override
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "vertex-on/claude-sonnet-4@20250514", "messages": msgs}, {"x-bf-eh-anthropic-beta": vx_flags}, base=GW_L127, auth=False)
+        got = [x[1] for x in seen_beta if x[0].endswith(":rawPredict")]
+        check("vertex: an override of true keeps a flag the default drops", s == 200 and got[-1:] == ["structured-outputs-2025-11-13,context-1m-2025-08-07"], (s, b[:200], got[-1:]))
+    finally:
+        gw.terminate()
+        gw.wait()
+        up_srv.shutdown()
+
 def l97s_e2e(env):
     """Streamed text completions and Responses answers under the output guards: a phone number is redacted as the
     stream goes, a forbidden word ends the stream with the format's error event, and an answer built whole is
@@ -4628,6 +4689,91 @@ def l112a_e2e(env):
     finally:
         gw_a.terminate()
         gw_b.terminate()
+
+
+GW_L125 = "http://127.0.0.1:18184"  # retained content: content-off bodies kept as hidden objects in the mock's bucket, never served back
+
+
+def l125_config() -> dict:
+    # the bucket is the mock, path style; the access keys are the documented AWS example values
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "allow_per_request_content_storage_override": True, "retain_content_in_object_storage": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l125-logs"), "content_logging": True,
+                       "object_storage": {"type": "s3", "bucket": "logs-hidden", "prefix": "bifrost", "region": "us-east-1", "endpoint": MOCK, "path_style": True,
+                                          "access_key_id": "AKIAIOSFODNN7EXAMPLE", "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "s", "value": "sk-l125", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+
+
+def l125_e2e(env):
+    """L125: client.retain_content_in_object_storage. A request whose content logging is off (the header, allowed by the
+    client) keeps its bodies in the object store as a hidden object under <prefix>/logs/YYYY/MM/DD/HH/<id>.json. Its log
+    row holds no bodies and content_hidden; GET /api/logs/{id} never serves them. A store outage fails no request, and the
+    upload is retried once the store is back. Its own gateway (18184)."""
+    import re
+    import shutil
+    logs_dir = os.path.join(BUILD, "e2e-l125-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    path = os.path.join(BUILD, "e2e.l125.json")
+    json.dump(l125_config(), open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18184", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l125.log"), "w"))
+    try:
+        wait(GW_L125 + "/health")
+        call("GET", "/_hidden/up", base=MOCK, auth=False)
+        msg = lambda text: [{"role": "user", "content": text}]
+        hidden_hdr = {"x-bf-disable-content-logging": "true"}
+
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l125-plain-probe")}, None, base=GW_L125, auth=False)
+        rows = json.loads(call("GET", "/api/logs?limit=50", base=GW_L125, auth=False)[2])["entries"]
+        plain = rows[0] if rows else {}
+        check("a request with content logging on keeps its input in the row, and is not content_hidden", s == 200 and "l125-plain-probe" in (plain.get("input") or "") and not plain.get("content_hidden"), (s, b[:200], plain))
+        check("a request with content logging on writes no object to the retained bucket", not [x for x in seen(True) if x["path"].startswith("/logs-hidden/")], [x["path"] for x in seen(True) if x["path"].startswith("/logs-hidden/")][:3])
+
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l125-hidden-probe")}, hidden_hdr, base=GW_L125, auth=False)
+        rows = json.loads(call("GET", "/api/logs?limit=50", base=GW_L125, auth=False)[2])["entries"]
+        row = rows[0] if rows else {}
+        rid = row.get("request_id") or ""
+        check("a content-off request is answered and its row has no bodies, marked content_hidden", s == 200 and row.get("content_hidden") is True and not row.get("input") and not row.get("output") and not row.get("raw_request") and not row.get("raw_response"), (s, b[:200], row))
+
+        # the object lands under Bifrost's layout, with the body, after a short wait (the uploads run once a second)
+        obj = []
+        for _ in range(30):
+            obj = [x for x in seen(True) if x["path"].endswith("/" + rid + ".json") and x["path"].startswith("/logs-hidden/")]
+            if obj:
+                break
+            time.sleep(0.5)
+        layout = re.compile(r"^/logs-hidden/bifrost/logs/\d{4}/\d{2}/\d{2}/\d{2}/" + re.escape(rid) + r"\.json$")
+        check("the content lands in the object store under bifrost/logs/YYYY/MM/DD/HH/<id>.json", len(obj) >= 1 and layout.match(obj[0]["path"]) is not None, [x["path"] for x in obj][:2])
+        stored = json.loads(obj[0]["body"]) if obj else {}
+        check("the object holds the full bodies and no raw payloads", (stored.get("input") or "").find("l125-hidden-probe") >= 0 and stored.get("id") == rid and "raw_request" not in stored and "raw_response" not in stored, stored)
+        got = call("GET", obj[0]["path"] if obj else "/logs-hidden/none", base=MOCK, auth=False)
+        check("the stored object reads back from the bucket", got[0] == 200 and "l125-hidden-probe" in got[2], got[0])
+
+        det = call("GET", "/api/logs/" + rid, base=GW_L125, auth=False)
+        check("GET /api/logs/{id} never serves the retained content", det[0] == 200 and "l125-hidden-probe" not in det[2] and json.loads(det[2]).get("content_hidden") is True and json.loads(det[2]).get("input") is None, (det[0], det[2][:300]))
+
+        # a store outage: the requests are answered, the rows are kept, and the uploads are retried until the store is back
+        call("GET", "/_hidden/down", base=MOCK, auth=False)
+        s1, _, b1 = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l125-outage-probe")}, hidden_hdr, base=GW_L125, auth=False)
+        s2, _, b2 = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l125-outage-probe-2")}, hidden_hdr, base=GW_L125, auth=False)
+        rows = json.loads(call("GET", "/api/logs?limit=50", base=GW_L125, auth=False)[2])["entries"]
+        out_rows = [r for r in rows if r.get("content_hidden") is True and not r.get("input")][:2]
+        check("requests during a store outage are answered and their rows are kept", s1 == 200 and s2 == 200 and len(out_rows) == 2, (s1, s2, b1[:150], b2[:150]))
+        time.sleep(2.5)
+        call("GET", "/_hidden/up", base=MOCK, auth=False)
+        rid1 = out_rows[1].get("request_id") or ""
+        retried = []
+        for _ in range(60):
+            retried = [x for x in seen(True) if x["path"].endswith("/" + rid1 + ".json") and x["path"].startswith("/logs-hidden/")]
+            if len(retried) >= 2 and any(x["path"].startswith("/logs-hidden/") for x in retried):
+                break
+            time.sleep(0.5)
+        check("an upload refused by the outage is retried and lands once the store is back", len(retried) >= 2 and "l125-outage-probe" in (json.loads(retried[-1]["body"]).get("input") or ""), [x["path"] for x in retried][:4])
+    finally:
+        call("GET", "/_hidden/up", base=MOCK, auth=False)
+        gw.terminate()
+        gw.wait()
 
 
 def main():
@@ -6824,10 +6970,14 @@ def main():
         l109_e2e(env)
         # a websocket session cap, top-level access profiles, dual credentials, stream idle cuts and oauth_key_config: their own gateways
         l112a_e2e(env)
+        # retained content: content-off bodies kept as hidden objects in object storage, never served back; a store outage fails no request: their own gateway
+        l125_e2e(env)
         # streams under the built-in guard, tool names of streamed answers, legacy completion and cursor Responses streams, paced cache replays
         l107_e2e(env)
         # L110: raw payloads of streamed answers and the content-logging switch, on their own gateway
         l110_e2e(env)
+        # L127: the anthropic-beta filter per provider, and beta_header_overrides, on the direct API and Vertex Claude: their own gateway
+        l127_e2e(env)
         # SCIM 2.0 provisioning at /scim/v2: users and groups pushed by an identity provider, and scim_config off: their own gateways
         l115_e2e(env)
         # SCIM deactivation and OIDC sign-in: a deactivated user loses its sign-in and its session, others are unchanged

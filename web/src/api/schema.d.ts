@@ -4730,6 +4730,8 @@ export interface components {
             server?: string;
             raw_request?: string;
             raw_response?: string;
+            /** @description The bodies were kept as a hidden object in object storage (client.retain_content_in_object_storage), so the row has none and the API never serves them */
+            content_hidden?: boolean;
             /** @description The canonical model name of the alias that served the request, when one is set */
             canonical_model_name?: string | null;
             /** @description The gateway overhead of the request in ms, null when it was not measured */

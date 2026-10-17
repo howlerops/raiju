@@ -1,0 +1,200 @@
+// Retained content (client.retain_content_in_object_storage). When a request's bodies are kept out of
+// the log (content logging is off for it), the full bodies still go to object storage as a hidden
+// object, under <prefix>/logs/YYYY/MM/DD/HH/<request id>.json (.json.gz when compressed), as Bifrost
+// lays them out. Nothing reads the object back: the log row carries content_hidden and no bodies.
+// Uploads run from a bounded queue with retries, so a store outage never holds up a request.
+import { LogExportsConfig } from "./config"
+import { isoMs, putObjectRequest, ByteRequest } from "./exports"
+import { gzipBytes } from "./gzip"
+
+// What a retained object holds: the request's identity and its bodies. Raw provider payloads are not
+// in it, as Bifrost keeps them only while content logging is on.
+export type HiddenPayload = {
+  id: string,
+  timestamp: string,
+  object: string,
+  provider: string,
+  model: string,
+  status: int,
+  input?: string,
+  output?: string,
+  error?: string,
+}
+
+// A queued upload: its key, its JSON text, the tries it has had, and the earliest time of the next try.
+export type RetainJob = { key: string, body: string, attempts: int, notBefore: number }
+
+export const MAX_JOBS = 5000
+// the bytes of JSON text the queue holds at once (64 MiB)
+export const MAX_BYTES = 67108864
+// tries per object, the first included; the pause before try n+1 grows with n
+export const MAX_ATTEMPTS = 5
+
+// <prefix>/logs/YYYY/MM/DD/HH/<id>.json, with the UTC hour of the request. Empty prefix segments are
+// dropped, as the export keys do.
+export function hiddenKey(prefix: string, ts: number, id: string, gz: bool): string {
+  const iso = isoMs(ts)
+  const segs = prefix.split("/").filter((s) => s !== "")
+  segs.push("logs", iso.slice(0, 4), iso.slice(5, 7), iso.slice(8, 10), iso.slice(11, 13))
+  return segs.join("/") + "/" + id + (gz ? ".json.gz" : ".json")
+}
+
+// The jobs waiting for their upload. A job taken from the queue is in flight until done or fail; its
+// bytes count against the bound until then.
+export class RetainQueue {
+  private jobs: RetainJob[] = []
+  private bytes: int = 0
+  // objects written, and objects given up on (queue full, or out of tries)
+  stored: int = 0
+  dropped: int = 0
+
+  constructor(readonly cfg: LogExportsConfig, readonly prefix: string, readonly gz: bool, readonly maxJobs: int, readonly maxBytes: int) {}
+
+  // Queues one request's payload. False, and counted as dropped, when the queue is full.
+  add(ts: number, id: string, body: string): bool {
+    const size = body.byteLength
+    if (this.jobs.length >= this.maxJobs || this.bytes + size > this.maxBytes) {
+      this.dropped += 1
+      return false
+    }
+    this.jobs.push({ key: hiddenKey(this.prefix, ts, id, this.gz), body: body, attempts: 0, notBefore: 0 })
+    this.bytes += size
+    return true
+  }
+
+  // Jobs waiting, in flight not counted.
+  size(): int {
+    return this.jobs.length
+  }
+
+  // The first job that is due at nowMs. It leaves the queue until done or fail is called with it.
+  take(nowMs: number): RetainJob | undefined {
+    for (let i = 0; i < this.jobs.length; i++) {
+      const j = this.jobs[i]!
+      if (j.notBefore <= nowMs) {
+        const rest: RetainJob[] = []
+        for (let k = 0; k < this.jobs.length; k++) {
+          if (k !== i) rest.push(this.jobs[k]!)
+        }
+        this.jobs = rest
+        return j
+      }
+    }
+    return undefined
+  }
+
+  // The object was written.
+  done(j: RetainJob): void {
+    this.stored += 1
+    this.bytes -= j.body.byteLength
+  }
+
+  // The upload failed. The job waits for a later try, or is given up after MAX_ATTEMPTS. False when given up.
+  fail(j: RetainJob, nowMs: number): bool {
+    const tries = j.attempts + 1
+    if (tries >= MAX_ATTEMPTS) {
+      this.dropped += 1
+      this.bytes -= j.body.byteLength
+      return false
+    }
+    const pause = tries === 1 ? 1000.0 : tries === 2 ? 2000.0 : tries === 3 ? 4000.0 : 8000.0
+    this.jobs.push({ key: j.key, body: j.body, attempts: tries, notBefore: nowMs + pause })
+    return true
+  }
+}
+
+// The signed PUT for one job: the JSON text, gzipped when the queue compresses it.
+export function jobRequest(q: RetainQueue, j: RetainJob, nowMs: number): ByteRequest {
+  const raw = new TextEncoder().encode(j.body)
+  if (q.gz) return putObjectRequest(q.cfg, j.key, gzipBytes(raw), "application/gzip", nowMs)
+  return putObjectRequest(q.cfg, j.key, raw, "application/json", nowMs)
+}
+
+test("hiddenKey: Bifrost's layout, with the UTC hour of the request", () => {
+  // 2026-10-14T12:00:00Z
+  expect(hiddenKey("bifrost", 1791979200000.0, "req-1", false)).toBe("bifrost/logs/2026/10/14/12/req-1.json")
+  expect(hiddenKey("bifrost", 1791979200000.0 + 3599000.0, "req-2", true)).toBe("bifrost/logs/2026/10/14/12/req-2.json.gz")
+  expect(hiddenKey("bifrost", 1791979200000.0 + 3600000.0, "req-3", false)).toBe("bifrost/logs/2026/10/14/13/req-3.json")
+})
+
+test("hiddenKey: empty and slashed prefixes", () => {
+  expect(hiddenKey("", 1791979200000.0, "r", false)).toBe("logs/2026/10/14/12/r.json")
+  expect(hiddenKey("/a//b/", 1791979200000.0, "r", false)).toBe("a/b/logs/2026/10/14/12/r.json")
+})
+
+test("RetainQueue: add, take in order, done frees the bytes", () => {
+  const cfg: LogExportsConfig = { enabled: true, kind: "s3", bucket: "b", access_key_id: "AKIAIOSFODNN7EXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" }
+  const q = new RetainQueue(cfg, "bifrost", false, 2, 100)
+  expect(q.add(1791979200000.0, "a", "{\"x\":1}")).toBe(true)
+  expect(q.add(1791979200000.0, "b", "{\"x\":2}")).toBe(true)
+  expect(q.add(1791979200000.0, "c", "{}")).toBe(false)
+  expect(q.dropped).toBe(1)
+  expect(q.size()).toBe(2)
+  const first = q.take(0)!
+  expect(first.key).toBe("bifrost/logs/2026/10/14/12/a.json")
+  expect(q.size()).toBe(1)
+  q.done(first)
+  expect(q.stored).toBe(1)
+  const second = q.take(0)!
+  expect(second.key).toBe("bifrost/logs/2026/10/14/12/b.json")
+  expect(q.take(0)).toBeUndefined()
+})
+
+test("RetainQueue: the byte bound counts waiting and in-flight jobs", () => {
+  const cfg: LogExportsConfig = { enabled: true, kind: "s3", bucket: "b", access_key_id: "k", secret_access_key: "s" }
+  const q = new RetainQueue(cfg, "bifrost", false, 10, 10)
+  expect(q.add(0.0, "a", "123456")).toBe(true)
+  expect(q.add(0.0, "b", "12345")).toBe(false)
+  const j = q.take(0)!
+  expect(q.add(0.0, "c", "12345")).toBe(false)
+  q.done(j)
+  expect(q.add(0.0, "d", "1234")).toBe(true)
+  expect(q.dropped).toBe(2)
+})
+
+test("RetainQueue: a failed upload waits for its pause, then is given up after MAX_ATTEMPTS", () => {
+  const cfg: LogExportsConfig = { enabled: true, kind: "s3", bucket: "b", access_key_id: "k", secret_access_key: "s" }
+  const q = new RetainQueue(cfg, "bifrost", false, 10, 1000)
+  q.add(0.0, "a", "{}")
+  const j = q.take(0)!
+  expect(q.fail(j, 10000.0)).toBe(true)
+  expect(q.take(10500.0)).toBeUndefined()
+  const again = q.take(11000.0)!
+  expect(again.attempts).toBe(1)
+  expect(q.fail(again, 11000.0)).toBe(true)
+  // the second pause is two seconds
+  expect(q.take(12999.0)).toBeUndefined()
+  let t = 13000.0
+  let job = q.take(t)!
+  let gaveUp = false
+  for (let n = 0; n < 10 && !gaveUp; n++) {
+    if (!q.fail(job, t)) {
+      gaveUp = true
+      break
+    }
+    t += 100000.0
+    job = q.take(t)!
+  }
+  expect(gaveUp).toBe(true)
+  expect(q.dropped).toBe(1)
+  expect(q.size()).toBe(0)
+  expect(q.add(0.0, "b", "{}")).toBe(true)
+})
+
+test("jobRequest: a PUT on the bucket, gzipped when the queue compresses", () => {
+  const cfg: LogExportsConfig = { enabled: true, kind: "s3", bucket: "audit-bkt", endpoint: "http://127.0.0.1:9", path_style: true, region: "us-east-1", access_key_id: "AKIAIOSFODNN7EXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" }
+  const plain = new RetainQueue(cfg, "bifrost", false, 10, 1000)
+  plain.add(1791979200000.0, "req-9", "{\"input\":\"hi\"}")
+  const pj = plain.take(0)!
+  const pr = jobRequest(plain, pj, 1791979200000.0)
+  expect(pr.method).toBe("PUT")
+  expect(pr.url).toBe("http://127.0.0.1:9/audit-bkt/bifrost/logs/2026/10/14/12/req-9.json")
+  expect(pr.headers.get("content-type")).toBe("application/json")
+  const zipped = new RetainQueue(cfg, "bifrost", true, 10, 1000)
+  zipped.add(1791979200000.0, "req-9", "{\"input\":\"hi\"}")
+  const zr = jobRequest(zipped, zipped.take(0)!, 1791979200000.0)
+  expect(zr.url.endsWith("/req-9.json.gz")).toBe(true)
+  expect(zr.headers.get("content-type")).toBe("application/gzip")
+  expect(zr.body[0]).toBe(31)
+  expect(zr.body[1]).toBe(139)
+})
