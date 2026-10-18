@@ -1,8 +1,9 @@
 // Small shared pieces: toasts, pills, tables, the two-step delete button,
 // busy wrappers and the error line.
-import { createSignal, For, Show } from "solid-js"
+import { createSignal, Errored, For, Loading, Show } from "solid-js"
 import type { JSX } from "@solidjs/web"
 import { message } from "./api/client"
+import { can, type Op } from "./perm"
 
 // ---- initial values for uncontrolled fields ----
 
@@ -101,6 +102,15 @@ export function Table(props: { cols: string[]; children?: JSX.Element }) {
         <tbody>{props.children}</tbody>
       </table>
     </div>
+  )
+}
+
+// Loading text and an error line around async content.
+export function Guard(props: { children?: JSX.Element }) {
+  return (
+    <Errored fallback={(err) => <ErrP error={err()} />}>
+      <Loading fallback={<p class="muted">Loading...</p>}>{props.children}</Loading>
+    </Errored>
   )
 }
 
@@ -234,4 +244,9 @@ export async function copyText(text: string, field?: HTMLInputElement): Promise<
 // aria-pressed and aria-expanded take the strings "true" and "false"
 export function tf(b: boolean): "true" | "false" {
   return b ? "true" : "false"
+}
+
+// Shows its children only when the signed-in role holds the permission (the server still decides).
+export function Can(props: { resource: string; op?: Op; children?: JSX.Element }) {
+  return <Show when={can(props.resource, props.op ?? "View")}>{props.children}</Show>
 }

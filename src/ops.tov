@@ -18,10 +18,10 @@ import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_C
 import { agentSessionsOf, a2aLogJson, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
-import { AccessProfile, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
+import { AccessProfile, AgentConfig, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
-import { ConfigStore, checkAdmin, sweepExpiredKeys, RESOURCES, OPERATIONS } from "./store"
+import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS } from "./store"
 import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
 import { keyBudgetIds, permissionDocs, permissionIds, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
 
@@ -39,7 +39,10 @@ import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp, rpcError } from "./mcpserver"
 import { isMetaTool, metaToolDefs } from "./codemode"
 import { relay } from "./passthrough"
-import { findAgent, grantAllows, runtimeHeaders, a2aMethodOf, rpcIdOf, isStreamMethod, contextOfRequest, contextOfResponse, endpointOf, gatewayCard, A2A_METHODS, CARD_PATH, JSON_RPC_SUFFIX } from "./agents"
+import { findAgent, grantAllows, endpointOf, restEndpointOf, gatewayCard, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
+import { Call, PushSpec, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, interfacesOf, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
+import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
+import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
 import { tempTokenAllows } from "./mcpuser"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
@@ -48,11 +51,11 @@ import { notify, notifyOnce } from "./notify"
 import * as exporters from "./exporters"
 import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
-import { Field, fields, find, rawStr, rawBool, isNull, elements } from "./json"
+import { Field, fields, find, rawStr, rawBool, rawNum, isNull, elements } from "./json"
 import { trimSlash } from "./providers/types"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { deadline } from "./deadline"
-import { secureHex, utf8 } from "./crypto"
+import { secureHex, utf8, sha256, toHex } from "./crypto"
 import * as b64 from "./base64"
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync } from "node:fs"
@@ -202,6 +205,92 @@ function json(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "application/json")
   return new Response(body, { status: status, headers: h })
+}
+
+// ---- the A2A gateway: what is not the Ops state ----
+
+// The headers of a call that do not go on to the agent: the connection's own, cookies, and the gateway's
+// credentials (the virtual key the caller logged in with is dropped by name where it came in).
+const A2A_NOT_FORWARDED: string[] = ["host", "content-length", "content-type", "content-encoding", "accept", "accept-encoding", "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "cookie", "x-bf-vk", "x-bf-agent-vk-id", "x-bf-agent-auth"]
+
+// What the agent answered to one call. rpc says which binding it answered in; error is set when no answer came.
+type Fwd = { status: int, text: string, ct: string, stream: ReadableStream | undefined, rpc: bool, error: string }
+
+function fwdFail(message: string): Fwd {
+  return { status: 0, text: "", ct: "", stream: undefined, rpc: true, error: message }
+}
+
+// A unary answer in the one shape both bindings use: failed, with the error's code and message, or the result.
+type Unary = { failed: bool, result: string, code: int, message: string }
+
+function unaryOf(f: Fwd): Unary {
+  if (f.rpc) {
+    try {
+      const fs = fields(f.text)
+      const er = find(fs, "error")
+      if (er !== undefined && !isNull(er)) {
+        const ef = fields(er)
+        return { failed: true, result: "", code: Math.floor(rawNum(ef, "code") ?? -32603.0), message: rawStr(ef, "message") ?? "the agent failed" }
+      }
+      const res = find(fs, "result")
+      if (res !== undefined && f.status < 400) return { failed: false, result: res, code: 0, message: "" }
+    } catch (e) {
+      // not a JSON-RPC answer
+    }
+    return { failed: true, result: "", code: -32603, message: f.status >= 400 ? `the agent answered HTTP ${f.status}` : "the agent's answer is not a JSON-RPC response" }
+  }
+  if (f.status >= 200 && f.status < 300) return { failed: false, result: f.text.trim() === "" ? "{}" : f.text, code: 0, message: "" }
+  const e = codeOfRestError(f.status, f.text)
+  return { failed: true, result: "", code: e.code, message: e.message }
+}
+
+// The agent's unary answer for a caller in a binding: as it came when the bindings are the same, else
+// its result or its error in the caller's shape.
+function a2aRender(rest: bool, rpcId: string, f: Fwd, u: Unary): Response {
+  const hs: Record<string, string> = new Map()
+  if (rest !== f.rpc) {
+    hs.set("content-type", f.ct === "" ? "application/json" : f.ct)
+    // a 204 has no body (a response with one would be refused)
+    return new Response(f.status === 204 || f.status === 304 ? undefined : f.text, { status: f.status, headers: hs })
+  }
+  hs.set("content-type", "application/json")
+  if (rest) {
+    if (u.failed) return new Response(restErrorBody(u.code, u.message), { status: httpOfCode(u.code), headers: hs })
+    return new Response(u.result, { status: 200, headers: hs })
+  }
+  if (u.failed) return new Response(rpcErrorBody(rpcId, u.code, u.message), { status: 200, headers: hs })
+  return new Response(`{"jsonrpc":"2.0","id":${rpcId},"result":${u.result}}`, { status: 200, headers: hs })
+}
+
+// A refusal before the protocol starts (no agent, no key, no grant, a budget used up), in the caller's binding.
+function a2aDeny(rest: bool, status: int, message: string, type: string): Response {
+  if (!rest) return status === 401 ? denied(401, message) : json(status, errorJson(message, type, undefined))
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  if (status === 401) h.set("www-authenticate", `ApiKey name="x-bf-vk", in="header"`)
+  return new Response(restErrorOfStatus(status, message), { status: status, headers: h })
+}
+
+// Whether an If-None-Match value names the tag.
+function etagMatches(header: string, tag: string): bool {
+  for (const v of header.split(",")) {
+    const t = v.trim()
+    if (t === "*" || t === tag || (t.startsWith("W/") && t.slice(2) === tag)) return true
+  }
+  return false
+}
+
+// A card as the gateway serves it: cacheable by the caller but to be checked again before each use, since
+// the key that may read it can change; answered 304 when the caller's copy is current.
+function a2aCardResponse(body: string, h: Hdrs): Response {
+  const tag = "\"" + toHex(sha256(utf8(body))).slice(0, 32) + "\""
+  const hs: Record<string, string> = new Map()
+  hs.set("cache-control", "private, no-cache")
+  hs.set("vary", "Authorization, x-bf-vk, api-key, x-api-key, x-goog-api-key")
+  hs.set("etag", tag)
+  if (etagMatches(h.get("if-none-match") ?? "", tag)) return new Response(undefined, { status: 304, headers: hs })
+  hs.set("content-type", "application/json")
+  return new Response(body, { status: 200, headers: hs })
 }
 
 // One A2A call that reached an agent (Ops.recordA2a).
@@ -765,6 +854,13 @@ function logEventView(e: LogEntry): LogEvent {
 export class Ops {
   rbac: RbacConfig = { users: [] }
   authOn = false
+  // the A2A push relay: a pass in progress, and the passes made (the housekeeping runs on the first of each hour's)
+  relayBusy = false
+  relayTicks = 0
+  // the card timer runs in this process (so a card can be fetched again and saved), and when each agent's card was
+  // last fetched again because its endpoint answered as if it had moved
+  cardRefreshOn = false
+  cardRefreshAt: Map<string, f64> = new Map()
   // when each management API key was last used, by name, as this worker saw it (apikeys.tov)
   private keyUsed: Map<string, string> = new Map()
   // model parameters (GET /api/models/parameters), loaded when first asked and then daily
@@ -862,6 +958,18 @@ export class Ops {
     // deliveries survive restarts in the logs_store folder, when that store is on
     const lsw = cfg.logs_store
     if (lsw !== undefined && lsw.enabled === true) deliveryLog().persistTo(join(lsw.dir ?? "logs", "webhook-deliveries.jsonl"))
+    // the A2A callbacks callers registered and the pushes waiting to reach them survive restarts the same way; their
+    // secrets are sealed with the config's key
+    const ps = pushStore()
+    ps.seal = (v: string): string => {
+      try {
+        return sealStored(this.store.cipher, v)
+      } catch (e) {
+        return v
+      }
+    }
+    ps.open = (v: string): string => openStored(this.store.cipher, v) ?? ""
+    if (ps.file === "" && lsw !== undefined && lsw.enabled === true) ps.persistTo(join(lsw.dir ?? "logs", "a2a-push.jsonl"))
     const gov = cfg.governance
     const users: UserConfig[] = gov?.users ?? []
     const auth = gov?.auth_config
@@ -875,6 +983,11 @@ export class Ops {
     // admin credentials also count as inference auth, as in Bifrost
     const rb = this.rbac
     this.engine.gov.altAuth = (h) => rb.users.length > 0 && authenticate(rb, h).kind === "user"
+    this.engine.gov.userOf = (h) => {
+      if (rb.users.length === 0) return undefined
+      const who = authenticate(rb, h)
+      return who.kind === "user" ? who.name : undefined
+    }
     // auth_config with only part of a credential still locks the API, as before
     this.authOn = this.rbac.users.length > 0 || (gov?.api_keys ?? []).length > 0 || !checkAdmin(auth, new Map())
     const ac = cfg.audit
@@ -2504,79 +2617,406 @@ export class Ops {
     return okJson(`{"history":[${rows.join(",")}],"total":${hits.length}}`)
   }
 
-  // The gateway's routes under /agents/a2a/{name}: the agent's card (GET .../.well-known/agent-card.json) and
-  // its JSON-RPC endpoint (POST .../json-rpc). rest is the path after the name; base is the public base URL.
-  // A call passes the virtual key (required when enforcement is on), the agent's grants, and the key's
-  // budgets and rate limits, then goes to the card's endpoint with the agent's runtime headers.
-  async a2aRoute(req: Request, name: string, rest: string, base: string): Promise<Response> {
-    const isCard = rest === CARD_PATH
-    if (!isCard && rest !== JSON_RPC_SUFFIX) return json(404, errorJson("no such agent route", "invalid_request_error", undefined))
-    if (isCard && req.method !== "GET") return json(405, errorJson("use GET for the agent card", "invalid_request_error", undefined))
-    if (!isCard && req.method !== "POST") return json(405, errorJson("use POST for JSON-RPC", "invalid_request_error", undefined))
-    const agent = findAgent(this.engine.cfg.agents, name)
-    if (agent === undefined || agent.enabled === false) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
-    const h = snapshot(req.headers)
+  // ---- the A2A gateway ----
+
+  // Whether push callbacks may go to private addresses (server.a2a_allow_private_push_callbacks).
+  pushPrivate(): bool {
+    return this.engine.cfg.server?.a2a_allow_private_push_callbacks === true
+  }
+
+  // The checks every call under /agents/a2a/{name} passes: the agent is registered and enabled, the caller's
+  // virtual key (required when auth is enforced), the agent's grants, and the key's budgets. count also takes
+  // the key's request and token limits (a call does; discovery does not). refusal is the answer when one fails.
+  a2aGate(agent: AgentConfig | undefined, name: string, h: Hdrs, rest: bool, count: bool): { refusal: Response | undefined, vk: VirtualKeyConfig | undefined } {
+    if (agent === undefined || agent.enabled === false) return { refusal: a2aDeny(rest, 404, `no agent named ${name}`, "not_found_error"), vk: undefined }
     const vk = this.engine.gov.findKey(h)
-    if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)")
-    if (!grantAllows(agent, vk?.id)) return denied(403, `this key may not call the agent ${name}`)
+    if (this.engine.gov.enforce && vk === undefined) return { refusal: a2aDeny(rest, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error"), vk: vk }
+    if (!grantAllows(agent, vk?.id)) return { refusal: a2aDeny(rest, 403, `this key may not call the agent ${name}`, "permission_error"), vk: vk }
     const gate = this.engine.gov.admitTool(h)
-    if (gate.kind === "denial") return json(gate.status, errorJson(gate.message, gate.type, undefined))
-    // the key's request and token limits count each call (admitTool checks the budgets only)
-    const rls: string[] = []
-    if (vk !== undefined && vk.rate_limit_id !== undefined) rls.push(vk.rate_limit_id)
-    const limited = this.engine.gov.checkLimits(vk, [], rls)
-    if (limited.kind === "denial") return json(limited.status, errorJson(limited.message, limited.type, undefined))
+    if (gate.kind === "denial") return { refusal: a2aDeny(rest, gate.status, gate.message, gate.type), vk: vk }
+    if (count) {
+      // the key's request and token limits count each call (admitTool checks the budgets only)
+      const rls: string[] = []
+      if (vk !== undefined && vk.rate_limit_id !== undefined) rls.push(vk.rate_limit_id)
+      const limited = this.engine.gov.checkLimits(vk, [], rls)
+      if (limited.kind === "denial") return { refusal: a2aDeny(rest, limited.status, limited.message, limited.type), vk: vk }
+    }
+    return { refusal: undefined, vk: vk }
+  }
+
+  // The routes under /agents/a2a/{name}: the agent's card (GET .../.well-known/agent-card.json), its JSON-RPC
+  // endpoint (POST .../json-rpc), its REST endpoint (.../rest/...) and the push ingress (POST .../push/callback).
+  // rest is the path after the name; base is the public base URL. A call passes a2aGate, then goes to the
+  // agent's endpoint (a2aCall). The ingress takes no virtual key: the agent proves itself with the token the
+  // gateway gave it.
+  async a2aRoute(req: Request, name: string, rest: string, base: string): Promise<Response> {
+    if (rest === INGRESS_SUFFIX) return await this.a2aIngress(req, name)
+    const isCard = rest === CARD_PATH
+    const isRpc = rest === JSON_RPC_SUFFIX
+    const isRest = rest === REST_PREFIX || rest.startsWith(REST_PREFIX + "/")
+    if (!isCard && !isRpc && !isRest) return json(404, errorJson("no such agent route", "invalid_request_error", undefined))
+    if (isCard && req.method !== "GET") return json(405, errorJson("use GET for the agent card", "invalid_request_error", undefined))
+    if (isRpc && req.method !== "POST") return json(405, errorJson("use POST for JSON-RPC", "invalid_request_error", undefined))
+    const agent = findAgent(this.engine.cfg.agents, name)
+    const h = snapshot(req.headers)
+    const gate = this.a2aGate(agent, name, h, isRest, true)
+    const refusal = gate.refusal
+    if (refusal !== undefined) return refusal
+    if (agent === undefined) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
     if (isCard) {
       const card = agent.card ?? ""
       if (card === "") return json(503, errorJson(`the card of ${name} has not been fetched: refresh it through /api/agents/${name}/refresh-card`, "api_error", undefined))
-      return json(200, gatewayCard(card, base, name))
+      return a2aCardResponse(gatewayCard(card, base, name, true), h)
     }
     const body = await req.text()
-    const method = a2aMethodOf(body)
-    const id = rpcIdOf(body)
-    if (method === "") return json(400, rpcError(id, -32600, "invalid request: not a JSON-RPC call"))
-    if (!A2A_METHODS.includes(method)) return json(200, rpcError(id, -32601, `method not found: ${method}`))
-    const endpoint = endpointOf(agent.card ?? "")
-    if (endpoint === "") return json(503, rpcError(id, -32603, `the card of ${name} names no endpoint`))
-    const stream = isStreamMethod(method)
-    const hm: Map<string, string> = new Map()
-    hm.set("content-type", "application/json")
-    hm.set("accept", stream ? "text/event-stream" : "application/json")
-    const ver = h.get("a2a-version")
-    if (ver !== undefined) hm.set("a2a-version", ver)
-    const rh = runtimeHeaders(agent)
-    for (const k of rh.keys()) hm.set(k, rh.get(k) ?? "")
-    const hs: Record<string, string> = hm
-    const started = Date.now()
-    const dl = deadline(stream ? 300000 : 60000)
+    if (isRpc) {
+      const routed = rpcCall(body)
+      const id = rpcIdOf(body)
+      if (routed.kind === "fail") return json(routed.status, rpcErrorBody(id, routed.code, routed.message))
+      return await this.a2aCall(agent, routed.call, "rpc", id, h, gate.vk, base)
+    }
+    const qi = req.url.indexOf("?")
+    const query = qi < 0 ? "" : req.url.slice(qi + 1, req.url.byteLength)
+    const routed = restCall(req.method, rest.slice(REST_PREFIX.byteLength, rest.byteLength), query, body)
+    if (routed.kind === "fail") return a2aDeny(true, routed.status, routed.message, "invalid_request_error")
+    return await this.a2aCall(agent, routed.call, "rest", "\"1\"", h, gate.vk, base)
+  }
+
+  // GET /agents/a2a (and .../.well-known/agent-card.json): one card for the gateway, listing the agents the
+  // caller may call. Raiju's own; Bifrost has the per-agent cards only.
+  async a2aAggregate(req: Request, base: string): Promise<Response> {
+    if (req.method !== "GET") return json(405, errorJson("use GET for the agent card", "invalid_request_error", undefined))
+    const h = snapshot(req.headers)
+    const vk = this.engine.gov.findKey(h)
+    if (this.engine.gov.enforce && vk === undefined) return a2aDeny(false, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error")
+    const gate = this.engine.gov.admitTool(h)
+    if (gate.kind === "denial") return a2aDeny(false, gate.status, gate.message, gate.type)
     const vkId = vk?.id
-    const context = contextOfRequest(body)
+    const list = (this.engine.cfg.agents ?? []).filter((a) => a.enabled !== false && (a.card ?? "") !== "" && grantAllows(a, vkId))
+    return a2aCardResponse(aggregateCard(list, base, true), h)
+  }
+
+  // An answer the gateway makes up itself, in the caller's binding.
+  a2aFail(rest: bool, rpcId: string, status: int, code: int, message: string): Response {
+    if (rest) return json(status, restErrorOfStatus(status, message))
+    // a JSON-RPC error rides in a 200; only an agent that did not answer is a gateway error
+    return json(status === 502 ? 502 : 200, rpcErrorBody(rpcId, code, message))
+  }
+
+  // The result of a call in the caller's binding: the result object itself on REST, a JSON-RPC response on JSON-RPC.
+  a2aResult(rest: bool, rpcId: string, result: string): Response {
+    if (rest) return json(200, result)
+    return json(200, `{"jsonrpc":"2.0","id":${rpcId},"result":${result}}`)
+  }
+
+  // Headers for a call to the agent: the caller's own headers (without the gateway credential it logged in
+  // with, cookies and connection headers), then the agent's runtime credentials, which win. With
+  // forward_accepted_credential the caller's gateway credential goes too, on the header it came in on, unless
+  // the agent's own headers set that one (forward_accepted_credential_overrides_auth lets it replace them).
+  async a2aHeaders(agent: AgentConfig, h: Hdrs, accepted: { header: string, value: string } | undefined, hasBody: bool, stream: bool): Promise<{ headers: Map<string, string>, error: string }> {
+    const consumed = accepted === undefined ? "" : accepted.header
+    const out: Map<string, string> = new Map()
+    const conn = (h.get("connection") ?? "").split(",").map((x) => x.trim().toLowerCase())
+    for (const k of h.keys()) {
+      if (A2A_NOT_FORWARDED.includes(k) || k === consumed || conn.includes(k)) continue
+      out.set(k, h.get(k) ?? "")
+    }
+    const managed = await upstreamHeaders(agent.name + "|runtime", agent.runtime_auth, agent.allow_private_network === true)
+    if (managed.error !== "") return { headers: out, error: `the agent's credentials could not be obtained: ${managed.error}` }
+    let mine = managed.headers
+    if (agent.forward_accepted_credential === true && accepted !== undefined) withAcceptedCredential(&mine, accepted.header, accepted.value, agent.forward_accepted_credential_overrides_auth === true)
+    for (const k of mine.keys()) out.set(k, mine.get(k) ?? "")
+    if (hasBody) out.set("content-type", "application/json")
+    out.set("accept", stream ? "text/event-stream" : "application/json")
+    return { headers: out, error: "" }
+  }
+
+  // Sends one call to the agent, in the binding its card offers that the caller's binding prefers: a REST
+  // caller goes to the card's REST endpoint, else its JSON-RPC one, and the other way round. params is the call's
+  // params after any push rewriting.
+  async a2aSend(agent: AgentConfig, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined): Promise<Fwd> {
+    const card = agent.card ?? ""
+    const rpcUrl = endpointOf(card)
+    const restUrl = restEndpointOf(card)
+    if (rpcUrl === "" && restUrl === "") return fwdFail(`the card of ${agent.name} names no endpoint`)
+    const useRest = binding === "rest" ? restUrl !== "" : rpcUrl === "" && restUrl !== ""
+    let url = rpcUrl
+    let method = "POST"
+    let body = ""
+    if (useRest) {
+      const rr = restRequestOf({ op: call.op, v03: call.v03, params: params, stream: call.stream, taskId: call.taskId, configId: call.configId })
+      let base = restUrl
+      while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+      url = base + rr.path + (rr.query === "" ? "" : "?" + rr.query)
+      method = rr.method
+      body = rr.body
+    } else {
+      // a JSON-RPC caller's method names are kept; a REST caller's go out in the names the card's version uses
+      const old = binding === "rpc" ? call.v03 : !interfacesOf(card).v1
+      body = `{"jsonrpc":"2.0","id":${rpcId},"method":${JSON.stringify(methodOf(call.op, old))},"params":${params}}`
+    }
+    const hd = await this.a2aHeaders(agent, h, accepted, body !== "", call.stream)
+    if (hd.error !== "") return fwdFail(hd.error)
+    const hs: Record<string, string> = hd.headers
+    const dl = deadline(call.stream ? 300000 : 60000)
     try {
-      const res = await fetch(endpoint, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+      const res = body === "" ? await fetch(url, { method: method, headers: hs, signal: dl.controller.signal, tls: tlsOf(agent.runtime_auth) }) : await fetch(url, { method: method, headers: hs, body: body, signal: dl.controller.signal, tls: tlsOf(agent.runtime_auth) })
       const ct = res.headers.get("content-type") ?? ""
-      if (stream && ct.includes("text/event-stream")) {
+      if (call.stream && ct.includes("text/event-stream") && res.body !== undefined) {
         // the stream is passed on as it arrives: the deadline no longer applies to it
         dl.finish()
-        this.recordA2a({ agent: name, method: method, status: res.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: res.status >= 400 ? `agent answered HTTP ${res.status}` : "" })
-        const up = res.body
-        if (up === undefined) return json(502, rpcError(id, -32603, "the agent sent no stream"))
-        const sh: Record<string, string> = new Map()
-        sh.set("content-type", "text/event-stream")
-        sh.set("cache-control", "no-cache")
-        return new Response(relay(up), { status: res.status, headers: sh })
+        return { status: res.status, text: "", ct: ct, stream: res.body, rpc: !useRest, error: "" }
       }
       const text = await res.text()
       dl.finish()
-      const failed = res.status >= 400 || rpcFailed(text)
-      const ctx = context === "" ? contextOfResponse(text) : context
-      this.recordA2a({ agent: name, method: method, status: res.status, latencyMs: Date.now() - started, context: ctx, vk: vkId, error: failed ? `agent answered ${res.status >= 400 ? "HTTP " + res.status : "a JSON-RPC error"}` : "" })
-      const oh: Record<string, string> = new Map()
-      oh.set("content-type", ct === "" ? "application/json" : ct)
-      return new Response(text, { status: res.status, headers: oh })
+      // an endpoint that is gone or does not speak the protocol: the card may have changed
+      if (res.status === 405 || res.status === 410 || res.status === 426 || (res.status === 404 && !ct.includes("json"))) this.refreshSoon(agent.name)
+      return { status: res.status, text: text, ct: ct, stream: undefined, rpc: !useRest, error: "" }
     } catch (e) {
       dl.finish()
-      this.recordA2a({ agent: name, method: method, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: `the agent did not answer: ${e.message}` })
-      return json(502, rpcError(id, -32603, `the agent did not answer: ${e.message}`))
+      return fwdFail(`the agent did not answer: ${e.message}`)
+    }
+  }
+
+  // One call, whatever binding it came in on: push configs are kept by the gateway (get and list are answered
+  // from its store; create and delete go to the agent first), the rest is sent on and its answer brought back
+  // to the caller's binding. Every call that reached the agent is logged.
+  async a2aCall(agent: AgentConfig, call: Call, binding: string, rpcId: string, h: Hdrs, vk: VirtualKeyConfig | undefined, base: string): Promise<Response> {
+    const name = agent.name
+    const rest = binding === "rest"
+    const started = Date.now()
+    const label = methodOf(call.op, call.v03)
+    const vkId = vk?.id
+    const store = pushStore()
+    const accepted = vk === undefined ? undefined : this.engine.gov.credentialHeader(h)
+    let params = call.params
+    let context = contextOfParams(params)
+    // push configs the gateway answers itself
+    if (call.op === "GetTaskPushNotificationConfig" || call.op === "ListTaskPushNotificationConfigs") {
+      if (call.taskId === "") return this.a2aFail(rest, rpcId, 400, -32602, "invalid params: a task id is required")
+      if (call.op === "GetTaskPushNotificationConfig") {
+        const c = store.config(name, call.taskId, call.configId)
+        if (c === undefined) return this.a2aFail(rest, rpcId, 404, -32001, "push notification config not found")
+        this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "" })
+        return this.a2aResult(rest, rpcId, pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
+      }
+      const views: string[] = []
+      for (const c of store.forTask(name, call.taskId)) views.push(pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
+      this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "" })
+      return this.a2aResult(rest, rpcId, pushListJson(views, call.v03))
+    }
+    // a create or an embedded config: the agent gets the gateway's ingress and a token of its own for it
+    const ingress = base + "/agents/a2a/" + name + INGRESS_SUFFIX
+    let created: PushSpec | undefined = undefined
+    let createdHash = ""
+    let pendingTask = ""
+    let pendingHash = ""
+    try {
+      if (call.op === "CreateTaskPushNotificationConfig") {
+        const spec = pushSpecOf(call)
+        if (spec.error !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${spec.error}`)
+        const bad = callbackProblem(spec.url, this.pushPrivate())
+        if (bad !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${bad}`)
+        const m = mintToken()
+        params = pushUpstreamParams(call, ingress, m.token)
+        created = spec
+        createdHash = m.hash
+      } else if (call.op === "SendMessage" || call.op === "SendStreamingMessage") {
+        const emb = embeddedPush(params)
+        if (emb !== undefined) {
+          if (emb.spec.error !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${emb.spec.error}`)
+          const bad = callbackProblem(emb.spec.url, this.pushPrivate())
+          if (bad !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${bad}`)
+          const m = mintToken()
+          const cid = emb.spec.configId !== "" ? emb.spec.configId : secureHex(8)
+          pendingTask = PENDING_PREFIX + secureHex(8)
+          pendingHash = m.hash
+          const now = Math.floor(Date.now())
+          store.saveConfig({ agent: name, task: pendingTask, id: cid, url: emb.spec.url, token: emb.spec.token, scheme: emb.spec.scheme, credentials: emb.spec.credentials, ingress: m.hash, created_at: now, updated_at: now })
+          params = rewriteEmbedded(params, emb.key, cid, ingress, m.token)
+        }
+      }
+    } catch (e) {
+      return this.a2aFail(rest, rpcId, 500, -32603, `could not set up the push configuration: ${e.message}`)
+    }
+    const fwd = await this.a2aSend(agent, call, params, binding, rpcId, h, accepted)
+    if (fwd.error !== "") {
+      if (pendingTask !== "") store.removePending(name, pendingHash, pendingTask)
+      this.recordA2a({ agent: name, method: label, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error })
+      return this.a2aFail(rest, rpcId, 502, -32603, fwd.error)
+    }
+    const up = fwd.stream
+    if (call.stream && up !== undefined) {
+      this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.status >= 400 ? `agent answered HTTP ${fwd.status}` : "" })
+      const sh: Record<string, string> = new Map()
+      sh.set("content-type", "text/event-stream")
+      sh.set("cache-control", "no-cache")
+      // the same binding on both sides passes the events as they are; the other maps each event's payload
+      const out = !rest && !fwd.rpc ? relayMapped(up, (d: string): string => rpcEvent(rpcId, d)) : (rest && fwd.rpc ? relayMapped(up, restEvent) : relay(up))
+      return new Response(out, { status: fwd.status, headers: sh })
+    }
+    const u = unaryOf(fwd)
+    if (context === "" && !u.failed) context = contextOfResult(u.result)
+    const err = u.failed ? `agent answered ${fwd.status >= 400 ? "HTTP " + fwd.status : "a JSON-RPC error"}` : ""
+    this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err })
+    // an embedded config is bound to the task the send made, or dropped when it made none
+    if (pendingTask !== "") {
+      const tid = u.failed ? "" : taskIdOfResult(u.result)
+      if (tid === "") store.removePending(name, pendingHash, pendingTask)
+      else store.bind(name, pendingHash, pendingTask, tid)
+    }
+    if (!u.failed && created !== undefined) {
+      const spec = created
+      let cid = pushIdOfResult(u.result, call.v03)
+      if (cid === "") cid = spec.configId
+      if (cid === "") {
+        try {
+          cid = secureHex(8)
+        } catch (e) {
+          cid = "config"
+        }
+      }
+      const now = Math.floor(Date.now())
+      store.saveConfig({ agent: name, task: spec.taskId, id: cid, url: spec.url, token: spec.token, scheme: spec.scheme, credentials: spec.credentials, ingress: createdHash, created_at: now, updated_at: now })
+      return this.a2aResult(rest, rpcId, pushViewJson(spec.taskId, cid, spec.url, spec.scheme, call.v03))
+    }
+    if (!u.failed && call.op === "DeleteTaskPushNotificationConfig") {
+      store.remove(name, call.taskId, call.configId)
+      return this.a2aResult(rest, rpcId, rest ? "{}" : "null")
+    }
+    return a2aRender(rest, rpcId, fwd, u)
+  }
+
+  // POST /agents/a2a/{name}/push/callback: an event the agent pushes. The token it carries (the one the gateway
+  // gave it for a config) is the only authentication; the event is queued for the relay (202).
+  async a2aIngress(req: Request, name: string): Promise<Response> {
+    if (req.method !== "POST") return json(405, errorJson("use POST for push notifications", "invalid_request_error", undefined))
+    const agent = findAgent(this.engine.cfg.agents, name)
+    if (agent === undefined || agent.enabled === false) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
+    const body = await req.text()
+    const started = Date.now()
+    const r = acceptPush(pushStore(), name, req.headers.get(TOKEN_HEADER) ?? "", body, Math.floor(started))
+    this.recordA2a({ agent: name, method: "push_notification", status: r.status, latencyMs: Date.now() - started, context: "", vk: undefined, error: r.error })
+    if (r.status !== 202) return json(r.status, errorJson(r.error, r.status === 401 ? "authentication_error" : "invalid_request_error", undefined))
+    return new Response(undefined, { status: 202 })
+  }
+
+  // GET /api/agents/push-configs, DELETE /api/agents/push-configs/{agent}/{task}/{config}: the callbacks callers
+  // registered through the gateway. Secrets are never shown. Deleting here removes the gateway's copy only; the
+  // agent keeps its registration until the caller deletes it through the protocol.
+  pushConfigsRoute(method: string, path: string, sp: URLSearchParams): Reply {
+    const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
+    const store = pushStore()
+    if (segs.length === 3) {
+      if (method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+      let limit = parseInt(sp.get("limit") ?? "") ?? 0
+      let offset = parseInt(sp.get("offset") ?? "") ?? 0
+      if (limit <= 0) limit = 25
+      if (limit > 100) limit = 100
+      if (offset < 0) offset = 0
+      const page = store.page({ agents: listNames(sp.get("agent_names") ?? ""), task: sp.get("task_id") ?? "", config: sp.get("config_id") ?? "", url: sp.get("url") ?? "", limit: limit, offset: offset })
+      const rows: string[] = []
+      for (const c of page.rows) rows.push(configView(c))
+      return okJson(`{"push_configs":[${rows.join(",")}],"agent_names":${JSON.stringify(store.agentNames())},"count":${rows.length},"total_count":${page.total},"limit":${limit},"offset":${offset}}`)
+    }
+    if (segs.length === 6) {
+      if (method !== "DELETE") return { status: 405, body: errorJson("use DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+      if (!store.remove(segs[3]!, segs[4]!, segs[5]!)) return { status: 404, body: errorJson("agent push configuration not found", "not_found_error", undefined), contentType: "application/json" }
+      return { status: 204, body: "", contentType: "application/json" }
+    }
+    return { status: 404, body: errorJson("no such route", "not_found_error", undefined), contentType: "application/json" }
+  }
+
+  // Starts the push relay: every second, the queued pushes that are due go to the callers' callbacks, and an
+  // hour's housekeeping drops what is old. Runs in every process; each has its own queue.
+  startA2aRelay(): void {
+    setInterval(() => {
+      this.a2aRelayPass()
+    }, 1000)
+  }
+
+  async a2aRelayPass(): Promise<void> {
+    if (this.relayBusy) return
+    this.relayBusy = true
+    const store = pushStore()
+    try {
+      if (store.deliveries.length > 0) {
+        await deliverDue(store, this.pushPrivate(), Math.floor(Date.now()), (d: PushDelivery, err: string, ms: int): void => {
+          this.recordA2a({ agent: d.agent, method: "push_delivery", status: err === "" ? 200 : 502, latencyMs: ms, context: "", vk: undefined, error: err })
+        })
+      }
+      this.relayTicks += 1
+      if (this.relayTicks % 3600 === 1) store.prune(Math.floor(Date.now()), (this.store.cfg.agents ?? []).map((a) => a.name))
+    } catch (e) {
+      console.error(`raiju: a2a push relay: ${e.message}`)
+    }
+    this.relayBusy = false
+  }
+
+  // Starts the card timer (client.a2a_card_refresh_seconds, 300 by default, 0 for none): each pass fetches the
+  // card of every enabled agent again and saves the ones that changed. Only the process that may save the
+  // config runs it.
+  startCardRefresh(): void {
+    this.cardRefreshOn = true
+    const secs = this.store.cfg.client?.a2a_card_refresh_seconds ?? 300
+    if (secs <= 0) return
+    setInterval(() => {
+      this.refreshCards()
+    }, secs * 1000)
+  }
+
+  // One pass of the card timer.
+  async refreshCards(): Promise<void> {
+    const list = this.store.cfg.agents ?? []
+    if (list.length === 0) return
+    try {
+      const r = await refreshAll(list)
+      for (const f of r.failed) console.error(`raiju: agent card refresh: ${f}`)
+      const next = r.next
+      if (next !== undefined) {
+        this.store.setAgents(this.mergeCards(next, r.changed))
+        console.error(`raiju: agent card changed: ${r.changed.join(", ")}`)
+      }
+    } catch (e) {
+      console.error(`raiju: agent card refresh: ${e.message}`)
+    }
+  }
+
+  // The current list with the refreshed cards of the agents named in changed (the list may have been edited
+  // while the cards were being fetched).
+  mergeCards(fresh: AgentConfig[], changed: string[]): AgentConfig[] {
+    const out: AgentConfig[] = []
+    for (const a of this.store.cfg.agents ?? []) {
+      const f = findAgent(fresh, a.name)
+      if (f !== undefined && changed.includes(a.name) && f.agent_card_url === a.agent_card_url) out.push(withCard(a, f.card ?? "", f.card_fetched_at ?? Math.floor(Date.now())))
+      else out.push(a)
+    }
+    return out
+  }
+
+  // An agent answered as if its endpoint had moved (404 without a protocol error, 405, 410, 426): fetch its card
+  // again, at most once a minute. Only where the timer runs (the process that may save the config).
+  refreshSoon(name: string): void {
+    if (!this.cardRefreshOn) return
+    const now = Date.now()
+    const last = this.cardRefreshAt.get(name) ?? 0.0
+    if (now - last < 60000.0) return
+    this.cardRefreshAt.set(name, now)
+    this.refreshOne(name)
+  }
+
+  async refreshOne(name: string): Promise<void> {
+    const a = findAgent(this.store.cfg.agents, name)
+    if (a === undefined || a.enabled === false) return
+    try {
+      const r = await refreshAll([a])
+      const next = r.next
+      if (next !== undefined) {
+        this.store.setAgents(this.mergeCards(next, r.changed))
+        console.error(`raiju: agent card changed: ${name}`)
+      }
+    } catch (e) {
+      console.error(`raiju: agent card refresh: ${e.message}`)
     }
   }
 
@@ -3606,7 +4046,16 @@ export class Ops {
       this.engine.chargeTool(m, gate, real)
       return { text: r.text, isError: r.isError }
     }
-    const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now)
+    // the servers' own guidance goes out with initialize, for the servers that offer this caller a tool
+    const seen: string[] = []
+    if (virtual) {
+      for (const k of mapping.keys()) seen.push(mapping.get(k)!.source)
+    } else {
+      for (const t of tools) seen.push(t.name)
+    }
+    const iparts = m.instructionParts(allowedTools, vk?.mcp_configs).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
+    const instructions = m.renderInstructions(iparts)
+    const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now, instructions)
     const out: Record<string, string> = new Map()
     out.set("content-type", r.contentType)
     const sid = r.sessionId
@@ -3794,4 +4243,63 @@ test("log histogram counts requests per bucket by status", () => {
   expect(h.buckets[1]!.cancelled).toBe(1)
   expect(ops.logsHistogram(new Request(`http://raiju.test/api/logs/histogram?start_time=${t0 + 5.0}&end_time=${t0}`)).status).toBe(400)
   try rmSync(dir, { recursive: true, force: true })
+})
+
+function fwdOf(status: int, text: string, rpc: bool): Fwd {
+  return { status: status, text: text, ct: "", stream: undefined, rpc: rpc, error: "" }
+}
+
+test("an agent's unary answer is read the same from either binding", () => {
+  const ok = unaryOf(fwdOf(200, `{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"t1"}}}`, true))
+  expect(ok.failed).toBe(false)
+  expect(ok.result).toBe(`{"task":{"id":"t1"}}`)
+  expect(unaryOf(fwdOf(200, `{"jsonrpc":"2.0","id":1,"result":null}`, true)).result).toBe("null")
+  const bad = unaryOf(fwdOf(200, `{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"task not found"}}`, true))
+  expect(bad.failed).toBe(true)
+  expect(bad.code).toBe(-32001)
+  expect(bad.message).toBe("task not found")
+  const html = unaryOf(fwdOf(502, "<html>bad gateway</html>", true))
+  expect(html.failed).toBe(true)
+  expect(html.message).toBe("the agent answered HTTP 502")
+  expect(unaryOf(fwdOf(200, "plain text", true)).failed).toBe(true)
+  const rest = unaryOf(fwdOf(200, `{"id":"t1"}`, false))
+  expect(rest.failed).toBe(false)
+  expect(rest.result).toBe(`{"id":"t1"}`)
+  expect(unaryOf(fwdOf(204, "", false)).result).toBe("{}")
+  const gone = unaryOf(fwdOf(404, `{"error":{"code":404,"status":"NOT_FOUND","message":"gone","details":[{"reason":"TASK_NOT_FOUND"}]}}`, false))
+  expect(gone.failed).toBe(true)
+  expect(gone.code).toBe(-32001)
+  expect(gone.message).toBe("gone")
+  expect(unaryOf(fwdOf(500, "oops", false)).code).toBe(-32603)
+})
+
+test("an agent's answer reaches the caller in the caller's binding", () => {
+  const same = a2aRender(true, "\"1\"", fwdOf(201, `{"id":"t1"}`, false), unaryOf(fwdOf(201, `{"id":"t1"}`, false)))
+  expect(same.status).toBe(201)
+  expect(a2aRender(true, "\"1\"", fwdOf(204, "", false), unaryOf(fwdOf(204, "", false))).status).toBe(204)
+  const rpcErr = fwdOf(200, `{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"gone"}}`, true)
+  expect(a2aRender(true, "\"1\"", rpcErr, unaryOf(rpcErr)).status).toBe(404)
+  expect(a2aRender(false, "5", rpcErr, unaryOf(rpcErr)).status).toBe(200)
+  const restErr = fwdOf(404, `{"error":{"code":404,"status":"NOT_FOUND","message":"gone"}}`, false)
+  expect(a2aRender(false, "5", restErr, unaryOf(restErr)).status).toBe(200)
+  expect(a2aRender(true, "\"1\"", restErr, unaryOf(restErr)).status).toBe(404)
+})
+
+test("a refusal comes in the caller's binding, and an ETag is matched like HTTP does", () => {
+  expect(a2aDeny(false, 403, "no", "permission_error").status).toBe(403)
+  expect(a2aDeny(true, 401, "no", "authentication_error").headers.get("www-authenticate")).toBe(`ApiKey name="x-bf-vk", in="header"`)
+  expect(a2aDeny(false, 401, "no", "authentication_error").headers.get("www-authenticate")).toBe(`Bearer realm="raiju", Basic realm="raiju"`)
+  expect(etagMatches(`"a", "b"`, `"b"`)).toBe(true)
+  expect(etagMatches(`W/"b"`, `"b"`)).toBe(true)
+  expect(etagMatches("*", `"b"`)).toBe(true)
+  expect(etagMatches(`"a"`, `"b"`)).toBe(false)
+  expect(etagMatches("", `"b"`)).toBe(false)
+  const h: Hdrs = new Map()
+  h.set("if-none-match", `"zzz"`)
+  expect(a2aCardResponse("{}", h).status).toBe(200)
+  const first = a2aCardResponse("{}", new Map())
+  const tag = first.headers.get("etag") ?? ""
+  expect(tag.byteLength).toBe(34)
+  h.set("if-none-match", tag)
+  expect(a2aCardResponse("{}", h).status).toBe(304)
 })

@@ -17,48 +17,42 @@ start new work on a fresh branch from `main`.
 
 ## Where things stand
 
-- Waves 1 to 15 are merged on the branch above. Wave 14 (L103 to L120) and wave 15 (L121 to
-  L127, the owner's "build it the correct way" decisions) closed every row: done or partial with
-  its "Open:" remainder written in LEDGER.md.
-- docs/parity.md counts 563 parity rows: done 376, partial 161, missing 2, out of scope 15,
-  n/a 9, plus 36 Raiju-only extras. `make parity-count` regenerates the Summary;
-  `python3 scripts/parity_count.py --check` fails when it is stale.
-- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,620 passed, 0 failed;
-  e2e "all passed" on both servers (Bun and http1); `make ui` all passed; `make openapi-check`
-  ok; `make web-check` up to date; `tov-patches/tests/run.sh` passed (including std/wasm 22,
-  std/rtc 20, fetch pool and HTTP/2 23, request body streams 55 checks).
-- The Tov runtime carries eight patches (`tov-patches/`): 0001 to 0004 as before, 0005 WAMR
-  (WASM plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2),
-  0008 streamed request bodies. 0005 to 0007 vendor C libraries (several MB each). They apply in
-  order only; `make tov` rebuilds the compiler (a few minutes; the first build of Raiju after it
-  compiles the vendored archives once).
-- Admin UI: SolidJS 2.0 RC in `web/` (Vite on Bun, types generated from the OpenAPI spec),
-  embedded in the binary through the committed `src/ui_assets.tov` and served by
-  `src/uiserve.tov`; `RAIJU_UI_DIR` serves a directory instead. Building the gateway needs no
-  Node or Bun; changing the UI does (`make web`, then commit). The live feed is cluster-wide and
-  resumable (L119).
-- WebRTC live sessions terminate in Raiju (L122): set `RAIJU_WEBRTC_BIND` to bind the media
-  sockets to one address and `RAIJU_WEBRTC_ICE_SERVERS` for STUN/TURN behind NAT; a session stays
-  on the node that took it.
+- Waves 1 to 16 are merged on the branch above (PR howlerops/raiju#2). Wave 16 (L128 to L134)
+  built the open items left after wave 15. Every ledger row is done or partial with its "Open:"
+  remainder in LEDGER.md.
+- docs/parity.md counts 565 parity rows: done 377, partial 164, missing 0, out of scope 15,
+  n/a 9, plus 38 Raiju-only extras.
+- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,746 passed, 0 failed;
+  e2e "all passed" on Bun and http1; `make ui` all passed (258 checks); `make openapi-check` ok;
+  `make web-check` up to date; `tov-patches/tests/run.sh` passed.
+- The Tov runtime carries eight patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
+  plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2), 0008
+  streamed request bodies. They apply in order only; `make tov` rebuilds the compiler.
+- Admin UI: SolidJS 2.0 RC in `web/`, embedded through the committed `src/ui_assets.tov`;
+  charts, MCP access and virtual MCP screens, role-aware actions (L132). `make web` after any
+  spec change.
+- Realtime and live sessions are metered, guarded and billed on every path (WebRTC, WebSocket,
+  realtime calls on Raiju's own peer). Set `RAIJU_WEBRTC_BIND` and `RAIJU_WEBRTC_ICE_SERVERS`
+  for deployment.
+- The built-in price table's audio rates for gpt-realtime and gpt-realtime-mini were entered by
+  hand and no row has a per-second voice rate: regenerate with `scripts/gen_pricing.py` from
+  https://getbifrost.ai/datasheet (this environment's network policy blocks that host; add it
+  under Allowed domains to do it here). Pricing sync at runtime overrides the table.
 
 ## What's next
 
-No row is queued. The remainders are the "Open:" notes in LEDGER.md and the 2 "missing" rows
-of docs/parity.md (MCP `max_instructions_length`; the agent CLI headers `x-bf-agent-vk-id` /
-`x-bf-agent-auth`). The larger ones:
+No row is queued; the remainders are the "Open:" notes in LEDGER.md. The larger ones:
 
-- Live sessions cost 0 (no per-second audio price in the datasheet); the WebSocket live path and
-  the /v1/realtime SDP calls are still unmetered relays (L122).
-- Large payloads stream for chat, completions and embeddings to OpenAI-format providers only;
-  streamed requests count 0 tokens for budgets (L124).
-- WASM plugins cover non-streaming chat (the HTTP transport hooks are not called) (L121).
-- Streams: Bifrost holds and replays live block-capable streams; Raiju cuts them (G43).
-- MCP: token_exchange clients are not connected at runtime (L112b); code mode lacks while, try,
-  lambda and the Responses API (L117); A2A lacks REST/gRPC bindings, push and upstream OAuth (L116).
-- UI: dashboard charts, MCP OAuth consent screens, virtual MCP and tool group editors,
-  role-aware hiding of actions (L113).
-- Upstream: the Tov patches (and the two compiler bugs found, in tov-patches/README.md) could be
-  offered to Tov; only 0001 to 0004 have upstream format-patches.
+- Pricing data: regenerate the datasheet (above).
+- Large requests to providers whose format differs still buffer (no streaming converter);
+  streamed chat usage needs the caller's stream_options.include_usage (L129).
+- Realtime: one log row per session where Bifrost logs one per turn; budgets charged at session
+  end; transcription sessions and ephemeral ek_ tokens (L128).
+- A2A: push store per process (multi-worker), no gRPC binding (L134).
+- Plugins: LLM hooks not on Anthropic Messages, GenAI, Bedrock, Cohere routes (L130).
+- MCP: the token-exchange admin credential is not refreshed (L133).
+- Streams under block-capable guards arrive after the answer ends (L131, by design).
+- Upstream: the Tov patches and the compiler bugs found could be offered to Tov.
 
 ## Owner decisions after wave 14 (2026-10-17)
 

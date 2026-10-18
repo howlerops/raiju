@@ -186,6 +186,9 @@ export class Governance {
   enforce = false
   // other credentials accepted on inference when enforced (admin users and tokens, as Bifrost)
   altAuth: ((h: Hdrs) => bool) | undefined = undefined
+  // the user an identity credential names (undefined when the credential is not one); with it, a request that
+  // carries x-bf-agent-vk-id picks one of the keys assigned to that user (the CLI's selected key)
+  userOf: ((h: Hdrs) => string | undefined) | undefined = undefined
   // client.dual_credential_conflict_behavior "error": a request with an identity token and x-bf-vk is refused
   dualError = false
   required: string[] = []
@@ -352,6 +355,9 @@ export class Governance {
       const vk = this.vks.get(c.trim())
       if (vk !== undefined) return vk
     }
+    // an identity credential with x-bf-agent-vk-id: the named key, when it is assigned to that user
+    const picked = this.selectedKey(h)
+    if (picked !== undefined) return picked
     // a rotated key's old value works until its grace period ends
     const now = Date.now()
     for (const c of candidates) {
@@ -359,6 +365,47 @@ export class Governance {
       if (p !== undefined && p.until > now) return this.vks.get(p.vk.value) ?? p.vk
     }
     return undefined
+  }
+
+  // The header the request's virtual key arrived in, with the value as it was sent (what an agent that takes
+  // over the caller's identity is sent). Looked for in the order findKey looks. undefined when none matches.
+  credentialHeader(h: Hdrs): { header: string, value: string } | undefined {
+    for (const name of ["x-bf-vk", "authorization", "x-api-key", "x-goog-api-key", "api-key"]) {
+      const v = h.get(name)
+      if (v === undefined) continue
+      let c = v.trim()
+      if (name === "authorization") {
+        if (!c.startsWith("Bearer ")) continue
+        c = c.slice(7).trim()
+      }
+      if (this.vks.get(c) !== undefined) return { header: name, value: v.trim() }
+      const p = this.prevVks.get(c)
+      if (p !== undefined && p.until > Date.now()) return { header: name, value: v.trim() }
+    }
+    return undefined
+  }
+
+  // The key x-bf-agent-vk-id names, when the request's identity credential belongs to the user the key is
+  // assigned to; undefined otherwise.
+  selectedKey(h: Hdrs): VirtualKeyConfig | undefined {
+    const want = (h.get("x-bf-agent-vk-id") ?? "").trim()
+    const who = this.userOf
+    if (want === "" || who === undefined) return undefined
+    const user = who(h)
+    if (user === undefined) return undefined
+    for (const vk of this.vks.values()) {
+      if (vk.id === want && vk.user_id === user) return vk
+    }
+    return undefined
+  }
+
+  // Whether the request names a key (x-bf-agent-vk-id) that its identity credential may not use.
+  // The credential must be valid; a request without one is judged by the usual rules.
+  unassignedSelection(h: Hdrs): string | undefined {
+    const want = (h.get("x-bf-agent-vk-id") ?? "").trim()
+    const who = this.userOf
+    if (want === "" || who === undefined || who(h) === undefined) return undefined
+    return this.selectedKey(h) === undefined ? want : undefined
   }
 
   // Records a key's expiry and its retired value's grace period, as read from the config.
@@ -387,6 +434,8 @@ export class Governance {
       if (idAuth !== undefined && idAuth(h)) return { kind: "denial", status: 400, type: "invalid_request_error", message: "the request carries both an identity token and x-bf-vk, and client.dual_credential_conflict_behavior is error" }
     }
     const vk = this.findKey(h)
+    const wrong = vk === undefined ? this.unassignedSelection(h) : undefined
+    if (wrong !== undefined) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${wrong} is not assigned to this user` }
     if (vk === undefined) {
       const alt = this.altAuth
       // a direct provider key satisfies the auth requirement, as in Bifrost; provider and model limits still apply
@@ -1064,6 +1113,49 @@ test("dual credentials: an identity token with x-bf-vk is refused only under err
   expect(d.status).toBe(400)
   expect(strict.admit(vkOnly, "openai", "m").kind).toBe("grant")
   expect(strict.admit(hdrs([["authorization", "Bearer sk-bf-k"], ["x-bf-vk", "sk-bf-k"]]), "openai", "m").kind).toBe("grant")
+})
+
+test("the credential header is the one the virtual key came in on, with its value as sent", () => {
+  const g = new Governance({ governance: { virtual_keys: [{ id: "k1", value: "sk-bf-one" }] } })
+  const a = g.credentialHeader(hdrs([["x-bf-vk", "sk-bf-one"]]))!
+  expect(a.header).toBe("x-bf-vk")
+  expect(a.value).toBe("sk-bf-one")
+  const b = g.credentialHeader(hdrs([["authorization", "Bearer sk-bf-one"]]))!
+  expect(b.header).toBe("authorization")
+  expect(b.value).toBe("Bearer sk-bf-one")
+  expect(g.credentialHeader(hdrs([["x-api-key", " sk-bf-one "]]))!.header).toBe("x-api-key")
+  // a header that holds something else is not the credential, even when another one is
+  const c = g.credentialHeader(hdrs([["authorization", "Bearer other"], ["x-goog-api-key", "sk-bf-one"]]))!
+  expect(c.header).toBe("x-goog-api-key")
+  expect(g.credentialHeader(hdrs([["authorization", "Bearer nope"]]))).toBeUndefined()
+  expect(g.credentialHeader(hdrs([["authorization", "sk-bf-one"]]))).toBeUndefined()
+  expect(g.credentialHeader(hdrs([]))).toBeUndefined()
+})
+
+test("x-bf-agent-vk-id picks one of the keys assigned to the identity's user", () => {
+  const cfg: Config = { client: { enforce_auth_on_inference: true }, governance: { virtual_keys: [{ id: "k-ana", value: "sk-bf-ana", user_id: "ana" }, { id: "k-bo", value: "sk-bf-bo", user_id: "bo" }, { id: "k-ana2", value: "sk-bf-ana2", user_id: "ana", is_active: false }] } }
+  const g = new Governance(cfg)
+  g.altAuth = (h) => h.get("authorization") === "Bearer ana-token"
+  g.userOf = (h) => (h.get("authorization") === "Bearer ana-token" ? "ana" : undefined)
+  const pick = hdrs([["authorization", "Bearer ana-token"], ["x-bf-agent-vk-id", "k-ana"]])
+  expect(g.findKey(pick)?.id).toBe("k-ana")
+  expect(g.admit(pick, "openai", "m").kind).toBe("grant")
+  // a key of another user, or an unknown one, is refused by name
+  const other = g.admit(hdrs([["authorization", "Bearer ana-token"], ["x-bf-agent-vk-id", "k-bo"]]), "openai", "m") as Denial
+  expect(other.kind).toBe("denial")
+  expect(other.status).toBe(403)
+  expect(other.message.includes("k-bo")).toBe(true)
+  expect((g.admit(hdrs([["authorization", "Bearer ana-token"], ["x-bf-agent-vk-id", "nope"]]), "openai", "m") as Denial).status).toBe(403)
+  // an inactive assigned key is picked, and then refused as that key is
+  const dead = g.admit(hdrs([["authorization", "Bearer ana-token"], ["x-bf-agent-vk-id", "k-ana2"]]), "openai", "m") as Denial
+  expect(dead.kind).toBe("denial")
+  expect(dead.message.includes("inactive")).toBe(true)
+  // without the header the identity is judged as before; the header alone proves nothing
+  expect(g.findKey(hdrs([["authorization", "Bearer ana-token"]]))).toBe(undefined)
+  expect(g.admit(hdrs([["authorization", "Bearer ana-token"]]), "openai", "m").kind).toBe("grant")
+  const anon = g.admit(hdrs([["x-bf-agent-vk-id", "k-ana"]]), "openai", "m") as Denial
+  expect(anon.status).toBe(401)
+  expect(g.findKey(hdrs([["authorization", "Bearer wrong"], ["x-bf-agent-vk-id", "k-ana"]]))).toBe(undefined)
 })
 
 test("inference auth defaults on when there are credentials", () => {

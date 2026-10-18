@@ -3950,6 +3950,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agents/push-configs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The push notification callbacks callers registered through the gateway (their secrets are never shown)
+         * @description Bifrost's route. The gateway keeps each callback and relays the agent's pushes to it (A2A push notifications); this lists them, newest update first.
+         */
+        get: operations["getApiAgentsPushConfigs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/push-configs/{agent}/{task}/{config}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete the gateway's copy of a push callback
+         * @description Bifrost's route. Only the gateway's copy goes; the agent keeps its registration until the caller deletes the config through the protocol. Use it for abandoned registrations.
+         */
+        delete: operations["deleteApiAgentsPushConfigsAgentTaskConfig"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/agents/{name}": {
         parameters: {
             query?: never;
@@ -3994,8 +4034,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * The agent's card as the gateway serves it (its endpoint is the gateway's JSON-RPC route)
-         * @description Raiju-only route shape; Bifrost serves the same card at this path. The caller's virtual key is checked (x-bf-vk or Authorization Bearer sk-bf-...).
+         * The agent's card as the gateway serves it (its interfaces are the gateway's JSON-RPC and REST routes)
+         * @description Bifrost serves the same card at this path. Its JSON-RPC and REST interfaces are the gateway's own routes; push notifications are advertised only when the agent can push; the agent's signatures are dropped. The caller's virtual key is checked (x-bf-vk or Authorization Bearer sk-bf-...). Cacheable with revalidation (Cache-Control private, no-cache, ETag, 304).
          */
         get: operations["getAgentsA2aNameAgentCard"];
         put?: never;
@@ -4016,10 +4056,95 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * JSON-RPC A2A methods, proxied to the agent (message/send, message/stream, tasks/get, tasks/cancel, and the v1 names)
-         * @description The request is passed to the agent's endpoint with the agent's runtime headers; the caller's virtual key is not forwarded. message/stream answers text/event-stream as the agent streams it. A method the gateway does not proxy answers a JSON-RPC method-not-found error. Each call is logged under the agent's name.
+         * JSON-RPC A2A methods, proxied to the agent (v0.3 and v1 names, including tasks/resubscribe and the push config methods)
+         * @description The request is passed to the agent's endpoint (its JSON-RPC one, else as REST to its REST one) with the agent's runtime headers (fixed headers, or an OAuth bearer token); the caller's virtual key is not forwarded unless the registration sets forward_accepted_credential. Streaming methods answer text/event-stream as the agent streams them. Push config methods are kept by the gateway (get and list answer from its store). A method the gateway does not proxy answers a JSON-RPC method-not-found error. Each call is logged under the agent's name.
          */
         post: operations["postAgentsA2aNameJsonRpc"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/a2a": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One card for the gateway, listing the agents the caller may call
+         * @description Raiju-only; Bifrost serves the per-agent cards only. An agent card for the gateway as a whole - the skills of every listed agent (ids prefixed with the agent's name), and an agents list with each agent's card, JSON-RPC and REST routes. The caller's virtual key is checked, and only agents the key may call are listed. Also served at /agents/a2a/.well-known/agent-card.json.
+         */
+        get: operations["getAgentsA2a"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/a2a/.well-known/agent-card.json": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The same aggregated card as /agents/a2a */
+        get: operations["getAgentsA2aAgentCard"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/a2a/{name}/rest/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A2A REST binding, reads (GetTask, ListTasks, push config get and list, GetExtendedAgentCard)
+         * @description Bifrost mounts the same routes at /agents/a2a/{name}/rest. The call is sent to the agent's REST endpoint when its card offers one, else as JSON-RPC to its JSON-RPC endpoint, and the answer comes back in the REST shape (errors as {"error":{"code","status","message","details"}}). Push config reads are answered from the gateway's own store. The caller's virtual key is checked; it is not forwarded unless the registration says so.
+         */
+        get: operations["getAgentsA2aNameRest"];
+        put?: never;
+        /**
+         * A2A REST binding, writes (SendMessage, SendStreamingMessage, CancelTask, SubscribeToTask, push config create)
+         * @description message:stream and tasks/{id}:subscribe answer text/event-stream, each event the agent's result as it came. A push config create is sent to the agent with the gateway's ingress URL and a token of its own; the caller's callback, token and credentials stay with the gateway, which relays the agent's pushes to the callback. A push config embedded in a send is handled the same way.
+         */
+        post: operations["postAgentsA2aNameRest"];
+        /**
+         * A2A REST binding, DeleteTaskPushNotificationConfig
+         * @description The agent's registration is deleted first, then the gateway's copy.
+         */
+        delete: operations["deleteAgentsA2aNameRest"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/a2a/{name}/push/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Push ingress - an event the agent pushes for a task
+         * @description Bifrost's route. The event must be about the task of the config the token belongs to. It is queued and answered 202; the gateway then sends it to the caller's callback (application/a2a+json, with the caller's own token and credentials), retrying a failed delivery up to six times with a doubling delay. A repeated event is queued once.
+         */
+        post: operations["postAgentsA2aNamePushCallback"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4030,13 +4155,34 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /** @description Authentication for the card fetch (discovery_auth) or the proxied calls (runtime_auth). Header values may be env.NAME references; stored values are returned masked. OAuth is not built. */
+        /** @description Authentication for the card fetch (discovery_auth) or the proxied calls (runtime_auth). Header values, the OAuth client and the TLS certificates may be env.NAME references; stored values are returned masked. */
         AgentUpstreamAuth: {
             /** @enum {string} */
-            type: "none" | "headers";
+            type: "none" | "headers" | "oauth";
             headers?: {
                 [key: string]: string;
             };
+            /** @description A client-credentials grant (type oauth). The token endpoint is token_url, or the token_endpoint that discovery_url (or provider_url's /.well-known/oauth-authorization-server) names on its own origin. The token is kept until 30 seconds before it expires. */
+            oauth?: {
+                provider_url?: string | null;
+                discovery_url?: string | null;
+                token_url?: string | null;
+                client_id?: string;
+                client_secret?: string;
+                scopes?: string[];
+                resource?: string | null;
+            } | null;
+            /** @description The card requirements this configuration satisfies (recorded, not enforced). */
+            security_schemes?: string[];
+            /** @description Records that the authentication was configured by hand rather than from the card. */
+            advanced?: boolean;
+            /** @description How https connections to the card and the agent are checked. The client certificate and key are stored but not used (no client certificates in Raiju's HTTP client). */
+            tls?: {
+                insecure_skip_verify?: boolean;
+                ca_cert_pem?: string;
+                client_cert_pem?: string;
+                client_key_pem?: string;
+            } | null;
         };
         AgentRegistrationRequest: {
             /** @description The registration name; it forms the gateway routes under /agents/a2a/{name}. Fixed for the life of the registration. */
@@ -4047,6 +4193,10 @@ export interface components {
             enabled: boolean;
             /** @description Allow any identified virtual key to call the agent without a grant. */
             allow_by_default?: boolean;
+            /** @description Send the caller's accepted gateway credential to the agent, on the header it came in on (x-bf-vk, Authorization, ...), so the agent can use it on its own LLM and MCP calls through the gateway. Off by default. */
+            forward_accepted_credential?: boolean;
+            /** @description With forward_accepted_credential, let the forwarded credential replace a header the registration's own auth sets on the same name (otherwise the configured one wins). */
+            forward_accepted_credential_overrides_auth?: boolean;
             /** @description Virtual keys granted access. Empty and duplicate IDs are rejected. */
             virtual_key_ids?: string[];
             discovery_auth?: components["schemas"]["AgentUpstreamAuth"];
@@ -4060,6 +4210,8 @@ export interface components {
             agent_card_url?: string;
             enabled?: boolean;
             allow_by_default?: boolean;
+            forward_accepted_credential?: boolean;
+            forward_accepted_credential_overrides_auth?: boolean;
             virtual_key_ids?: string[];
             discovery_auth?: components["schemas"]["AgentUpstreamAuth"];
             runtime_auth?: components["schemas"]["AgentUpstreamAuth"];
@@ -4072,12 +4224,35 @@ export interface components {
             card_fetched_at?: number | null;
             /** @description The agent's own JSON-RPC endpoint (from its card); the gateway proxies to it. */
             endpoint?: string;
+            /** @description The agent's own REST (HTTP+JSON) endpoint, "" when its card offers none. */
+            rest_endpoint?: string;
             created_at?: number | null;
             updated_at?: number | null;
             gateway?: {
                 agent_card_url?: string;
                 json_rpc_url?: string;
+                rest_url?: string;
             };
+        };
+        /** @description A push callback a caller registered through the gateway. Its token and credentials are never shown. */
+        AgentPushConfig: {
+            agent_name?: string;
+            task_id?: string;
+            config_id?: string;
+            url?: string;
+            /** Format: date-time */
+            created_at?: string;
+            /** Format: date-time */
+            updated_at?: string;
+        };
+        AgentPushConfigList: {
+            push_configs?: components["schemas"]["AgentPushConfig"][];
+            /** @description Every agent that has a stored config, whatever the filters. */
+            agent_names?: string[];
+            count?: number;
+            total_count?: number;
+            limit?: number;
+            offset?: number;
         };
         AgentList: {
             agents?: components["schemas"]["AgentRegistration"][];
@@ -4880,6 +5055,8 @@ export interface components {
             allow_by_default?: boolean;
             allow_on_all_virtual_keys?: boolean;
             is_code_mode_client?: boolean;
+            /** @description Bytes of this server's initialize instructions forwarded to the model; 0 or unset takes mcp.tool_manager_config.max_instructions_per_client (4096). The text is cut on a character boundary and says how much was dropped. */
+            max_instructions_length?: number;
             disabled?: boolean;
             tool_sync_interval?: string;
             tls_config?: {
@@ -23451,6 +23628,104 @@ export interface operations {
             };
         };
     };
+    getApiAgentsPushConfigs: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated agent names. */
+                agent_names?: string;
+                /** @description Contains, any case. */
+                task_id?: string;
+                /** @description Contains, any case. */
+                config_id?: string;
+                /** @description Contains, any case. */
+                url?: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentPushConfigList"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiAgentsPushConfigsAgentTaskConfig: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent: string;
+                task: string;
+                config: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such push configuration. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     getApiAgentsName: {
         parameters: {
             query?: never;
@@ -23820,6 +24095,381 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+        };
+    };
+    getAgentsA2a: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description A virtual key is required. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getAgentsA2aAgentCard: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description A virtual key is required. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getAgentsA2aNameRest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The agent's registration name. */
+                name: string;
+                /** @description The A2A HTTP+JSON route: tasks/{id}, tasks, tasks/{id}/pushNotificationConfigs, tasks/{id}/pushNotificationConfigs/{configId}, extendedAgentCard. A leading tenant segment is accepted. */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agent's answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description A virtual key is required. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The key has no grant for this agent, or its budget or rate limit is used up. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No agent has this name, or it is disabled. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The route does not take this method. */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The agent did not answer. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    postAgentsA2aNameRest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The agent's registration name. */
+                name: string;
+                /** @description message:send, message:stream, tasks/{id}:cancel, tasks/{id}:subscribe, tasks/{id}/pushNotificationConfigs. A leading tenant segment is accepted. */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description The agent's answer, or its event stream. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                    "text/event-stream": string;
+                };
+            };
+            /** @description The request is not valid for the route, or the push callback is refused (not http(s), a metadata address, a private address without server.a2a_allow_private_push_callbacks, or credentials of a scheme other than Basic or Bearer). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description A virtual key is required. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The key has no grant for this agent, or its budget or rate limit is used up. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No agent has this name, or it is disabled. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The route does not take this method. */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The key's request or token rate limit is reached. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The agent did not answer. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    deleteAgentsA2aNameRest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The agent's registration name. */
+                name: string;
+                /** @description tasks/{id}/pushNotificationConfigs/{configId}. */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description A virtual key is required. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The key has no grant for this agent, or its budget or rate limit is used up. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No agent has this name, or it is disabled. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The route does not take this method. */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The agent did not answer. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    postAgentsA2aNamePushCallback: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The token the gateway gave the agent for the push config. It is the only authentication; no virtual key is involved. */
+                "A2A-Notification-Token": string;
+            };
+            path: {
+                /** @description The agent's registration name. */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Queued for delivery. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The body is not an A2A event, or it is about another task than the config's. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The token is missing or unknown. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No agent has this name, or it is disabled. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The event is over 1 MiB. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
         };

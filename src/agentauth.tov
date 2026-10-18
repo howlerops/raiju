@@ -1,0 +1,201 @@
+// How the gateway authenticates to a registered A2A agent (Bifrost's UpstreamAuth). An auth is
+//   none     no credential,
+//   headers  fixed headers (a value may be an env.NAME reference),
+//   oauth    a client-credentials grant: the gateway fetches an access token from the token endpoint (given as
+//            token_url, or found through discovery_url or provider_url) and sends it as a bearer token. The token
+//            is kept until 30 seconds before it expires.
+// tls sets how https connections are checked (a CA bundle, or no check). A client certificate and key are kept
+// in the registration but not used: Tov's fetch has no client certificates.
+import { fields, find, rawStr, rawNum } from "./json"
+import { AgentAuth, AgentOAuth, resolveEnv } from "./config"
+import { urlProblem } from "./webhooks"
+import { deadline } from "./deadline"
+
+export type AuthHeaders = { headers: Map<string, string>, error: string }
+
+const TOKEN_TIMEOUT_MS = 10000
+const EARLY_MS: f64 = 30000.0
+const DEFAULT_LIFETIME_MS: f64 = 60000.0
+
+type Cached = { value: string, expiresAt: f64, print: string }
+
+class TokenCache {
+  items: Map<string, Cached> = new Map()
+}
+
+let cacheInstance: TokenCache | undefined = undefined
+
+// The process's token cache (created on first use: top-level statements in imported modules do not run).
+function tokenCache(): TokenCache {
+  let c = cacheInstance
+  if (c === undefined) {
+    c = new TokenCache()
+    cacheInstance = c
+  }
+  return c
+}
+
+// Drops the cached tokens (for tests, and for a registration that was deleted).
+export function forgetTokens(prefix: string): void {
+  const c = tokenCache()
+  for (const k of c.items.keys()) {
+    if (k.startsWith(prefix)) c.items.delete(k)
+  }
+}
+
+// What identifies an OAuth configuration, so a changed one never reuses an old token.
+function print(o: AgentOAuth): string {
+  return [o.provider_url ?? "", o.discovery_url ?? "", o.token_url ?? "", resolveEnv(o.client_id), resolveEnv(o.client_secret), (o.scopes ?? []).join(" "), o.resource ?? ""].join("\n")
+}
+
+// The fetch options for an auth's TLS settings, undefined for the defaults.
+export function tlsOf(a: AgentAuth | undefined): { rejectUnauthorized?: bool, ca?: string } | undefined {
+  const t = a?.tls
+  if (t === undefined) return undefined
+  const skip = t.insecure_skip_verify === true
+  const ca = resolveEnv(t.ca_cert_pem ?? "")
+  if (!skip && ca === "") return undefined
+  return { rejectUnauthorized: !skip, ca: ca === "" ? undefined : ca }
+}
+
+function originOf(raw: string): string {
+  const u = URL.parse(raw)
+  return u === undefined ? "" : u.origin
+}
+
+// The token endpoint an OAuth configuration names: token_url as it is, else the one the authorization
+// server's metadata gives (discovery_url, or provider_url's well-known document). A discovered endpoint must
+// have the origin of the document that names it.
+async function tokenEndpoint(a: AgentAuth, o: AgentOAuth, allowPrivate: bool): Promise<{ url: string, error: string }> {
+  const direct = o.token_url ?? ""
+  if (direct !== "") return { url: direct, error: "" }
+  let doc = o.discovery_url ?? ""
+  if (doc === "") {
+    let base = o.provider_url ?? ""
+    while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+    doc = base + "/.well-known/oauth-authorization-server"
+  }
+  const bad = urlProblem(doc, allowPrivate)
+  if (bad !== "") return { url: "", error: `OAuth discovery url: ${bad}` }
+  const dl = deadline(TOKEN_TIMEOUT_MS)
+  try {
+    const r = await fetch(doc, { headers: { accept: "application/json" }, signal: dl.controller.signal, redirect: "manual", tls: tlsOf(a) })
+    const text = await r.text()
+    dl.finish()
+    if (r.status !== 200) return { url: "", error: `OAuth discovery answered HTTP ${r.status}` }
+    const ep = rawStr(fields(text), "token_endpoint") ?? ""
+    if (ep === "") return { url: "", error: "OAuth discovery response has no token_endpoint" }
+    if (originOf(ep) === "" || originOf(ep) !== originOf(doc)) return { url: "", error: "OAuth discovery token_endpoint must use the origin of the discovery document; set token_url to use another origin" }
+    return { url: ep, error: "" }
+  } catch (e) {
+    dl.finish()
+    return { url: "", error: `OAuth discovery failed: ${e.message}` }
+  }
+}
+
+type Fetched = { value: string, lifetimeMs: f64, error: string }
+
+// One client-credentials request, with the id and secret in the form body.
+async function fetchToken(a: AgentAuth, o: AgentOAuth, allowPrivate: bool): Promise<Fetched> {
+  const ep = await tokenEndpoint(a, o, allowPrivate)
+  if (ep.error !== "") return { value: "", lifetimeMs: 0.0, error: ep.error }
+  const bad = urlProblem(ep.url, allowPrivate)
+  if (bad !== "") return { value: "", lifetimeMs: 0.0, error: `OAuth token url: ${bad}` }
+  const form = new URLSearchParams("")
+  form.set("grant_type", "client_credentials")
+  form.set("client_id", resolveEnv(o.client_id))
+  form.set("client_secret", resolveEnv(o.client_secret))
+  const scopes = o.scopes ?? []
+  if (scopes.length > 0) form.set("scope", scopes.join(" "))
+  if ((o.resource ?? "") !== "") form.set("resource", o.resource ?? "")
+  const dl = deadline(TOKEN_TIMEOUT_MS)
+  try {
+    const r = await fetch(ep.url, { method: "POST", headers: { accept: "application/json" }, body: form, signal: dl.controller.signal, redirect: "manual", tls: tlsOf(a) })
+    const text = await r.text()
+    dl.finish()
+    if (r.status !== 200) return { value: "", lifetimeMs: 0.0, error: `the OAuth token endpoint answered HTTP ${r.status}` }
+    const tf = fields(text)
+    const tok = rawStr(tf, "access_token") ?? ""
+    if (tok === "") return { value: "", lifetimeMs: 0.0, error: "the OAuth token response has no access_token" }
+    const secs = rawNum(tf, "expires_in") ?? 0.0
+    return { value: tok, lifetimeMs: secs > 0.0 ? secs * 1000.0 : DEFAULT_LIFETIME_MS, error: "" }
+  } catch (e) {
+    dl.finish()
+    return { value: "", lifetimeMs: 0.0, error: `the OAuth token could not be fetched: ${e.message}` }
+  }
+}
+
+// The access token of an oauth auth, from the cache while it is fresh. id names the registration and the use
+// (discovery or runtime), so the two tokens stay apart.
+export async function accessToken(id: string, a: AgentAuth, allowPrivate: bool): Promise<{ token: string, error: string }> {
+  const o = a.oauth
+  if (o === undefined) return { token: "", error: "oauth auth has no oauth settings" }
+  if (resolveEnv(o.client_id) === "" || resolveEnv(o.client_secret) === "") return { token: "", error: "OAuth client_id and client_secret are required" }
+  const key = id
+  const fp = print(o)
+  const now = Date.now()
+  const hit = tokenCache().items.get(key)
+  if (hit !== undefined && hit.print === fp && hit.expiresAt - now > EARLY_MS) return { token: hit.value, error: "" }
+  const got = await fetchToken(a, o, allowPrivate)
+  if (got.error !== "") return { token: "", error: got.error }
+  tokenCache().items.set(key, { value: got.value, expiresAt: Date.now() + got.lifetimeMs, print: fp })
+  return { token: got.value, error: "" }
+}
+
+// The headers an auth adds to a call to the agent (or to its card): the fixed headers with env references
+// resolved, and for oauth the bearer token. The names are lower case. An oauth token that cannot be had is an error.
+export async function upstreamHeaders(id: string, a: AgentAuth | undefined, allowPrivate: bool): Promise<AuthHeaders> {
+  const out: Map<string, string> = new Map()
+  if (a === undefined || a.type === "none") return { headers: out, error: "" }
+  const hs = a.headers
+  if (hs !== undefined) {
+    for (const k of hs.keys()) out.set(k.toLowerCase(), resolveEnv(hs.get(k) ?? ""))
+  }
+  if (a.type === "oauth") {
+    const t = await accessToken(id, a, allowPrivate)
+    if (t.error !== "") return { headers: out, error: t.error }
+    out.set("authorization", "Bearer " + t.token)
+  }
+  return { headers: out, error: "" }
+}
+
+// Adds the caller's accepted gateway credential to the headers sent to the agent (forward_accepted_credential).
+// A header the auth already sets is kept, unless overrides is set.
+export function withAcceptedCredential(inout headers: Map<string, string>, header: string, value: string, overrides: bool): void {
+  const k = header.toLowerCase()
+  if (k === "" || value === "") return
+  if (overrides || (headers.get(k) ?? "") === "") headers.set(k, value)
+}
+
+// ---- tests ----
+
+test("the TLS options follow the auth's settings", () => {
+  expect(tlsOf(undefined)).toBeUndefined()
+  expect(tlsOf({ type: "none" })).toBeUndefined()
+  expect(tlsOf({ type: "none", tls: { insecure_skip_verify: false } })).toBeUndefined()
+  expect(tlsOf({ type: "none", tls: { insecure_skip_verify: true } })!.rejectUnauthorized).toBe(false)
+  const ca = tlsOf({ type: "none", tls: { ca_cert_pem: "PEM-TEXT" } })!
+  expect(ca.rejectUnauthorized).toBe(true)
+  expect(ca.ca).toBe("PEM-TEXT")
+})
+
+test("the accepted credential is forwarded unless the auth set that header", () => {
+  let m: Map<string, string> = new Map()
+  m.set("x-agent-key", "k")
+  withAcceptedCredential(&m, "x-bf-vk", "sk-bf-a", false)
+  expect(m.get("x-bf-vk")).toBe("sk-bf-a")
+  withAcceptedCredential(&m, "X-Agent-Key", "other", false)
+  expect(m.get("x-agent-key")).toBe("k")
+  withAcceptedCredential(&m, "X-Agent-Key", "other", true)
+  expect(m.get("x-agent-key")).toBe("other")
+  withAcceptedCredential(&m, "", "v", true)
+  withAcceptedCredential(&m, "x-empty", "", true)
+  expect(m.keys().length).toBe(2)
+})
+
+test("an OAuth configuration is told apart by its parts", () => {
+  const a = print({ token_url: "https://t.example/token", client_id: "id", client_secret: "s", scopes: ["x", "y"] })
+  const b = print({ token_url: "https://t.example/token", client_id: "id", client_secret: "s2", scopes: ["x", "y"] })
+  expect(a === b).toBe(false)
+  expect(a.includes("x y")).toBe(true)
+})

@@ -1,5 +1,6 @@
 import { createMemo, createSignal, Errored, Loading, refresh, Show, untrack } from "solid-js"
 import { api } from "../api/client"
+import { can } from "../perm"
 import { pretty } from "../fmt"
 import { ErrP, FormError, notify, Toolbar, useFormRun } from "../ui"
 
@@ -63,11 +64,17 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
           spellcheck={false}
           aria-describedby="cfg-edit-h"
           value={text()}
+          readonly={!can("Settings", "Update")}
           onInput={(e) => setText(e.currentTarget.value)}
         />
       </label>
       <FormError text={error()} wide={false} />
-      <div class="actions" style="margin-top:10px">
+      <Show when={!can("Settings", "Update")}>
+        <p class="hint" id="cfg-readonly">
+          Your role can read the settings but not change them.
+        </p>
+      </Show>
+      <div class="actions" style="margin-top:10px" hidden={!can("Settings", "Update")}>
         <button
           type="button"
           id="cfg-discard"

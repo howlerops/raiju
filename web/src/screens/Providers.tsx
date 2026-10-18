@@ -2,7 +2,7 @@ import { createMemo, createSignal, Errored, For, Loading, refresh, Show, untrack
 import { api } from "../api/client"
 import type { Key, Provider } from "../api/types"
 import { splitList } from "../fmt"
-import { DangerButton, ErrP, FormError, initValue, Pill, notify, Table, Toolbar, useFormRun, tf } from "../ui"
+import { Can, DangerButton, ErrP, FormError, initValue, Pill, notify, Table, Toolbar, useFormRun, tf } from "../ui"
 
 // A key is addressed by its id; older records without one fall back to the name.
 function keyRef(k: Key): string {
@@ -198,17 +198,21 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
         <Pill>{props.p.kind || "unknown"}</Pill>
         <span class="hint mono grow">{baseUrlOf(props.p) || "default endpoint"}</span>
         <span class="row-actions">
-          <button type="button" class="ghost" aria-expanded={tf(editing())} onClick={() => setEditing(!editing())}>
-            Edit
-          </button>
-          <DangerButton
-            label="Delete"
-            action={async () => {
-              await api.del("/api/providers/{provider}", { params: { provider: props.p.name } })
-              notify("Provider deleted", "ok")
-              props.onChange()
-            }}
-          />
+          <Can resource="ModelProvider" op="Update">
+            <button type="button" class="ghost" aria-expanded={tf(editing())} onClick={() => setEditing(!editing())}>
+              Edit
+            </button>
+          </Can>
+          <Can resource="ModelProvider" op="Delete">
+            <DangerButton
+              label="Delete"
+              action={async () => {
+                await api.del("/api/providers/{provider}", { params: { provider: props.p.name } })
+                notify("Provider deleted", "ok")
+                props.onChange()
+              }}
+            />
+          </Can>
         </span>
       </header>
       <Show when={editing()}>
@@ -233,17 +237,21 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
                 <td>{k().weight === undefined ? "—" : String(k().weight)}</td>
                 <td>
                   <span class="row-actions">
-                    <button type="button" class="ghost" onClick={() => setEditKey(k())}>
-                      Edit
-                    </button>
-                    <DangerButton
-                      label="Delete"
-                      action={async () => {
-                        await api.del("/api/providers/{provider}/keys/{key_id}", { params: { provider: props.p.name, key_id: keyRef(k()) } })
-                        notify("Key deleted", "ok")
-                        props.onChange()
-                      }}
-                    />
+                    <Can resource="ModelProvider" op="Update">
+                      <button type="button" class="ghost" onClick={() => setEditKey(k())}>
+                        Edit
+                      </button>
+                    </Can>
+                    <Can resource="ModelProvider" op="Delete">
+                      <DangerButton
+                        label="Delete"
+                        action={async () => {
+                          await api.del("/api/providers/{provider}/keys/{key_id}", { params: { provider: props.p.name, key_id: keyRef(k()) } })
+                          notify("Key deleted", "ok")
+                          props.onChange()
+                        }}
+                      />
+                    </Can>
                   </span>
                 </td>
               </tr>
@@ -266,7 +274,9 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
           )}
         </Show>
       </div>
-      <AddKeyForm provider={props.p.name} onSaved={props.onChange} />
+      <Can resource="ModelProvider" op="Create">
+        <AddKeyForm provider={props.p.name} onSaved={props.onChange} />
+      </Can>
     </article>
   )
 }
@@ -360,7 +370,9 @@ export function Providers() {
           </Loading>
         </Errored>
       </div>
-      <AddProvider names={() => safeNames(providers)} onSaved={reload} />
+      <Can resource="ModelProvider" op="Update">
+        <AddProvider names={() => safeNames(providers)} onSaved={reload} />
+      </Can>
     </section>
   )
 }

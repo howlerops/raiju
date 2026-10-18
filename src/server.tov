@@ -36,7 +36,7 @@ import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, head
 import { issuerRoute, keyById, grantsList, grantRevoke } from "./mcpissuer"
 import { promptRoute } from "./prompts"
 import { webhookApi, asyncSubmitHooked } from "./webhooks"
-import { agentApi, publicBase } from "./agents"
+import { agentApi, publicBase, CARD_PATH } from "./agents"
 import { flagRoute } from "./flags"
 import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
@@ -560,7 +560,10 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   }
   // registered A2A agents (agents.tov); the call history is ops.tov's
   else if (path === "/api/agents" || path.startsWith("/api/agents/")) {
-    if (path === "/api/agents/history") {
+    if (path === "/api/agents/push-configs" || path.startsWith("/api/agents/push-configs/")) {
+      const pu = URL.parse(req.url)
+      r = ops.pushConfigsRoute(req.method, path, pu === undefined ? new URLSearchParams("") : pu.searchParams)
+    } else if (path === "/api/agents/history") {
       const hu = URL.parse(req.url)
       r = req.method === "GET" ? ops.agentHistoryRoute(hu === undefined ? new URLSearchParams("") : hu.searchParams, sc) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
     } else {
@@ -820,7 +823,38 @@ async function echoRequestId(req: Request, res: Response): Promise<Response> {
 
 export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
   const res = try await routes(engine, ops, req)
-  return await echoRequestId(req, res)
+  return await echoRequestId(req, await markAgentRejection(engine, req, res))
+}
+
+// The CLI that signs in with an identity credential sends it as a bearer token, with x-bf-agent-vk-id
+// when it has picked a key. When the gateway refuses that credential (a 401), x-bf-agent-auth tells the
+// client to sign in again; a refusal for any other reason (a 403 for a model, a budget) carries no mark.
+export async function markAgentRejection(engine: Engine, req: Request, res: Response): Promise<Response> {
+  if (res.status !== 401) return res
+  if ((res.headers.get("x-bf-agent-auth") ?? "") !== "") return res
+  const h = snapshot(req.headers)
+  const auth = h.get("authorization") ?? ""
+  if (!auth.startsWith("Bearer ")) return res
+  const agentClient = h.get("x-bf-agent-vk-id") !== undefined || h.get("x-bifrost-agent") !== undefined || auth.startsWith("Bearer ck-bf-agent-")
+  if (!agentClient) return res
+  // a credential the gateway accepts (a key, or an identity) was not what it refused
+  if (engine.gov.findKey(h) !== undefined) return res
+  const alt = engine.gov.altAuth
+  if (alt !== undefined && alt(h)) return res
+  const st = res.body
+  if (st !== undefined && st.pushed) return res
+  const hs: Record<string, string> = new Map()
+  res.headers.forEach((v, k) => {
+    if (k !== "content-length") hs.set(k, v)
+  })
+  hs.set("x-bf-agent-auth", "rejected")
+  let bytes: u8[] = []
+  try {
+    bytes = await res.bytes()
+  } catch (e) {
+    bytes = []
+  }
+  return new Response(bytes, { status: res.status, headers: hs })
 }
 
 async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
@@ -851,6 +885,7 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   // SCIM 2.0 provisioning from the identity provider, behind its own bearer token (scim.tov)
   if (p === "/scim/v2" || p.startsWith("/scim/v2/")) return await scimRoute(ops, req, p)
   // the A2A gateway: an agent's card and its JSON-RPC endpoint (agents.tov); the caller's virtual key is checked there
+  if (p === "/agents/a2a" || p === "/agents/a2a/" || p === "/agents/a2a" + CARD_PATH) return await ops.a2aAggregate(req, publicBase(engine.cfg.client?.a2a_external_client_url, req.url))
   if (p.startsWith("/agents/a2a/") && segs.length >= 5) return await ops.a2aRoute(req, segs[3]!, "/" + segs.slice(4).join("/"), publicBase(engine.cfg.client?.a2a_external_client_url, req.url))
   if (p === "/mcp") return await ops.mcp(req, undefined)
   if (p.startsWith("/mcp/") && segs.length === 3) return await ops.mcp(req, segs[2]!)
@@ -1024,6 +1059,10 @@ export function streamsRequest(kind: string, text: string): bool {
 
 // The answer of a route kind; streamed into sink when there is one.
 export async function routeStream(engine: Engine, req: Request, kind: string, sink?: StreamSink): Promise<Response> {
+  return await markAgentRejection(engine, req, await routeStreamInner(engine, req, kind, sink))
+}
+
+async function routeStreamInner(engine: Engine, req: Request, kind: string, sink?: StreamSink): Promise<Response> {
   const u = URL.parse(req.url)
   const dep = deploymentRoute(u === undefined ? "" : u.pathname)
   if (dep !== undefined) return await routeStream(engine, await deploymentRequest(req, dep), kind, sink)

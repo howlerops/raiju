@@ -31,10 +31,19 @@ export function adminToken(): string {
   return current
 }
 
+let tokenListener: (() => void) | undefined
+
+// Called after the token changes (sign-in, sign-out); the app reloads what the caller may do.
+export function onTokenChange(fn: () => void): void {
+  tokenListener = fn
+}
+
 export function setToken(t: string): void {
+  const changed = t !== current
   current = t
   writeToken(t)
   setTokenSet(t !== "")
+  if (changed && tokenListener) tokenListener()
 }
 
 let pending: Promise<string> | undefined

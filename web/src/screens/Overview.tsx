@@ -1,8 +1,9 @@
-import { createMemo, createSignal, Errored, For, Loading, onSettled, refresh, Show } from "solid-js"
+import { createMemo, createSignal, For, onSettled, refresh, Show } from "solid-js"
 import { api, send } from "../api/client"
 import { fmtInt, fmtMoney, fmtMs, fmtPct, num } from "../fmt"
-import type { JSX } from "@solidjs/web"
-import { ErrP, Card, Mono, Pill, Stat, stateTone, Table, Toolbar } from "../ui"
+import { can } from "../perm"
+import { OverviewCharts } from "./Charts"
+import { Card, Guard, Mono, Pill, Stat, stateTone, Table, Toolbar } from "../ui"
 
 interface ModelRow {
   model: string
@@ -26,16 +27,9 @@ function modelRows(by: unknown): ModelRow[] {
   return rows.sort((a, b) => b.requests - a.requests)
 }
 
-function Guard(props: { children?: JSX.Element }) {
-  return (
-    <Errored fallback={(err) => <ErrP error={err()} />}>
-      <Loading fallback={<p class="muted">Loading...</p>}>{props.children}</Loading>
-    </Errored>
-  )
-}
-
 export function Overview() {
   const [updated, setUpdated] = createSignal("")
+  const [tick, setTick] = createSignal(0)
   const stats = createMemo(() => api.get("/api/logs/stats", { query: { start_time: Date.now() - 3600000 } }))
   const cache = createMemo(() => api.get("/api/cache"))
   const health = createMemo(() => api.get("/api/health"))
@@ -47,6 +41,7 @@ export function Overview() {
     refresh(cache)
     refresh(health)
     refresh(mcp)
+    setTick((n) => n + 1)
     setUpdated("Updated " + new Date().toLocaleTimeString())
   }
   onSettled(() => {
@@ -78,6 +73,7 @@ export function Overview() {
         </button>
       </Toolbar>
 
+      <Show when={can("Logs")}>
       <div class="cards" id="ov-stats">
         <Guard>
           {(() => {
@@ -96,7 +92,13 @@ export function Overview() {
         </Guard>
       </div>
 
-      <div class="grid">
+      </Show>
+      <Show when={can("Logs")}>
+        <OverviewCharts tick={tick} />
+      </Show>
+
+      <div class="grid" style="margin-top:14px">
+        <Show when={can("Logs")}>
         <Card title="Models, last hour" id="ov-models-h">
           <div id="ov-models">
             <Guard>
@@ -123,7 +125,9 @@ export function Overview() {
             </Guard>
           </div>
         </Card>
+        </Show>
 
+        <Show when={can("Settings")}>
         <Card title="Circuit breakers" id="ov-breakers-h">
           <div id="ov-breakers">
             <Guard>
@@ -149,7 +153,9 @@ export function Overview() {
             </Guard>
           </div>
         </Card>
+        </Show>
 
+        <Show when={can("Settings")}>
         <Card title="Response cache" id="ov-cache-h">
           <div id="ov-cache">
             <Guard>
@@ -177,7 +183,9 @@ export function Overview() {
             </Guard>
           </div>
         </Card>
+        </Show>
 
+        <Show when={can("MCPGateway")}>
         <Card title="MCP clients" id="ov-mcp-h">
           <div id="ov-mcp">
             <Guard>
@@ -202,14 +210,17 @@ export function Overview() {
             </Guard>
           </div>
         </Card>
+        </Show>
       </div>
 
+      <Show when={can("Metrics")}>
       <details class="card" id="ov-metrics-box" style="margin-top:14px" onToggle={loadMetrics}>
         <summary>Prometheus metrics</summary>
         <pre class="code" id="ov-metrics">
           {metrics()}
         </pre>
       </details>
+      </Show>
     </section>
   )
 }

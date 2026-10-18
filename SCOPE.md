@@ -62,7 +62,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Docker / Helm / Terraform | done (image built and run; Terraform validated) |
 | Plugin hooks | partial: compiled-in plugins with Bifrost's placement and order; WebAssembly plugins (Bifrost's JSON ABI, pre and post hooks on chat requests) load from a local `.wasm` path on WAMR, with limits on memory, stack and instructions (`tov-patches/0005-wamr.patch`); Go shared-object plugins (`.so`) are not supported, because Go's `plugin` package needs the Go runtime and Tov cannot load a Go shared object; the HTTP transport hooks and URL loading are not built |
 | Config store + management API | done (the config is a JSON file; Bifrost's sqlite and postgres config stores are not built) |
-| Web UI | done: the admin client built into the gateway (`web/`, L113; SolidJS and Vite, embedded through `src/ui_assets.tov`): sign-in (admin token, SSO), overview, providers, virtual keys, budgets and limits, logs, the live feed (virtualized, 5,000 rows), MCP clients, settings and a playground. Not built: dashboard charts, MCP OAuth consent screens, and native apps |
+| Web UI | done: the admin client built into the gateway (`web/`, L113; SolidJS and Vite, embedded through `src/ui_assets.tov`): sign-in (admin token, SSO), overview, providers, virtual keys, budgets and limits, logs, the live feed (virtualized, 5,000 rows), MCP clients, settings and a playground; L132: dashboard charts on the overview and logs screens, MCP access (OAuth grants, per-user sessions and headers) with restyled consent pages, virtual MCP and tool group editors, and role-aware actions. Not built: a permission editor and native apps |
 | Cohere | done |
 | Custom providers | done |
 | Vertex AI | done: chat, streaming, embeddings, responses, images and image edits, batches and files over GCS, exact count tokens; the AWS workload identity is not built (needs a cloud account) |
@@ -101,7 +101,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Provider passthrough routes | done (OpenAI, Anthropic, Azure, Bedrock agent/guardrail, GenAI, ChatGPT Codex) |
 | Direct keys, raw request/response echo | partial: direct keys and send-back of raw requests and responses are done; `x-bf-store-raw-request-response` is not built |
 | Reasoning parameters | done (Anthropic, Gemini, Bedrock Claude and Nova) |
-| A2A agents (registered agents, agent cards, JSON-RPC tasks) | partial: registrations at /api/agents with cached cards, grants, runtime headers and inspect; the gateway at /agents/a2a/{name} serves the card and proxies message/send, message/stream, tasks/get and tasks/cancel, logged under the agent's name; the agent_names log filter works; REST and gRPC bindings, push notifications, OAuth and TLS upstream auth are not built |
+| A2A agents (registered agents, agent cards, JSON-RPC tasks) | partial: registrations at /api/agents with cached cards (fetched again on a timer), grants, runtime headers or OAuth, forwarded caller credentials, inspect and push-config management; the gateway at /agents/a2a/{name} serves the card and proxies the JSON-RPC methods (v0.3 and v1 names, tasks/resubscribe) and the REST binding, bridging between them, with push notification configs relayed through the gateway, logged under the agent's name; /agents/a2a lists the agents a key may call; the agent_names log filter works; the gRPC binding, extension URIs and client certificates for the agent's TLS are not built |
 
 ## Out
 

@@ -1,9 +1,10 @@
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show, snapshot, untrack } from "solid-js"
 import { createStore } from "solid-js"
 import { api } from "../api/client"
+import { can } from "../perm"
 import type { Budget, Customer, McpClient, Provider, RateLimit, Team, VirtualKey, VkProviderConfig } from "../api/types"
 import { splitList } from "../fmt"
-import { copyText, DangerButton, ErrP, FormError, initChecked, initSelected, initValue, notify, Table, Toolbar, useFormRun, useRun, tf } from "../ui"
+import { Can, copyText, DangerButton, ErrP, FormError, initChecked, initSelected, initValue, notify, Table, Toolbar, useFormRun, useRun, tf } from "../ui"
 
 interface Options {
   providers: Provider[]
@@ -377,9 +378,11 @@ export function Keys() {
         <button type="button" id="vk-refresh" class="ghost" onClick={reload}>
           Refresh
         </button>
-        <button type="button" id="vk-new" class="primary" onClick={() => setEditor({ vk: undefined })}>
-          New virtual key
-        </button>
+        <Can resource="VirtualKeys" op="Create">
+          <button type="button" id="vk-new" class="primary" onClick={() => setEditor({ vk: undefined })}>
+            New virtual key
+          </button>
+        </Can>
       </Toolbar>
 
       <Show when={secret()}>{(s) => <Secret value={s()} onDone={() => setSecret(undefined)} />}</Show>
@@ -423,7 +426,7 @@ export function Keys() {
                             type="button"
                             class="toggle"
                             aria-pressed={tf(active())}
-                            disabled={busy()}
+                            disabled={busy() || !can("VirtualKeys", "Update")}
                             onClick={() =>
                               run(async () => {
                                 await api.put("/api/governance/virtual-keys/{id}", {
@@ -446,33 +449,39 @@ export function Keys() {
                         <td>{nameOf(data().opts.rate_limits, vk().rate_limit_id)}</td>
                         <td>
                           <span class="row-actions">
-                            <button type="button" class="ghost" onClick={() => setEditor({ vk: vk() })}>
-                              Edit
-                            </button>
-                            <button
-                              type="button"
-                              class="ghost"
-                              disabled={busy()}
-                              onClick={() =>
-                                run(async () => {
-                                  const r = await api.post("/api/governance/virtual-keys/{id}/rotate", { params: { id: vk().id } })
+                            <Can resource="VirtualKeys" op="Update">
+                              <button type="button" class="ghost" onClick={() => setEditor({ vk: vk() })}>
+                                Edit
+                              </button>
+                            </Can>
+                            <Can resource="VirtualKeys" op="Create">
+                              <button
+                                type="button"
+                                class="ghost"
+                                disabled={busy()}
+                                onClick={() =>
+                                  run(async () => {
+                                    const r = await api.post("/api/governance/virtual-keys/{id}/rotate", { params: { id: vk().id } })
+                                    reload()
+                                    const value = r.virtual_key?.value
+                                    if (value) setSecret(value)
+                                    else notify("Virtual key rotated", "ok")
+                                  })
+                                }
+                              >
+                                Rotate
+                              </button>
+                            </Can>
+                            <Can resource="VirtualKeys" op="Delete">
+                              <DangerButton
+                                label="Delete"
+                                action={async () => {
+                                  await api.del("/api/governance/virtual-keys/{id}", { params: { id: vk().id } })
+                                  notify("Virtual key deleted", "ok")
                                   reload()
-                                  const value = r.virtual_key?.value
-                                  if (value) setSecret(value)
-                                  else notify("Virtual key rotated", "ok")
-                                })
-                              }
-                            >
-                              Rotate
-                            </button>
-                            <DangerButton
-                              label="Delete"
-                              action={async () => {
-                                await api.del("/api/governance/virtual-keys/{id}", { params: { id: vk().id } })
-                                notify("Virtual key deleted", "ok")
-                                reload()
-                              }}
-                            />
+                                }}
+                              />
+                            </Can>
                           </span>
                         </td>
                       </tr>

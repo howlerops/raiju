@@ -1,8 +1,9 @@
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show, untrack } from "solid-js"
 import { api } from "../api/client"
+import { can } from "../perm"
 import type { McpClient, McpStatus } from "../api/types"
 import { splitList } from "../fmt"
-import { DangerButton, ErrP, FormError, initChecked, initSelected, initValue, notify, Pill, Toolbar, useFormRun, useRun, tf } from "../ui"
+import { Can, DangerButton, ErrP, FormError, initChecked, initSelected, initValue, notify, Pill, Toolbar, useFormRun, useRun, tf } from "../ui"
 
 type Cfg = Record<string, unknown> & { name?: string; connection_type?: string; connection_string?: string }
 
@@ -160,31 +161,37 @@ function ClientCard(props: { c: Cfg; st: McpStatus | undefined; onEdit: () => vo
         <Pill tone={disabled() ? "" : connected() ? "ok" : "bad"}>{status()}</Pill>
         <span class="hint mono grow">{where()}</span>
         <span class="row-actions">
-          <button type="button" class="ghost" onClick={props.onEdit}>
-            Edit
-          </button>
-          <button
-            type="button"
-            class="ghost"
-            disabled={busy()}
-            onClick={() =>
-              run(async () => {
-                await api.post("/api/mcp/client/{name}/reconnect", { params: { name: String(props.c.name) } })
-                notify("Reconnecting " + props.c.name, "ok")
+          <Can resource="MCPGateway" op="Update">
+            <button type="button" class="ghost" onClick={props.onEdit}>
+              Edit
+            </button>
+          </Can>
+          <Can resource="MCPGateway" op="Create">
+            <button
+              type="button"
+              class="ghost"
+              disabled={busy()}
+              onClick={() =>
+                run(async () => {
+                  await api.post("/api/mcp/client/{name}/reconnect", { params: { name: String(props.c.name) } })
+                  notify("Reconnecting " + props.c.name, "ok")
+                  props.onChange()
+                })
+              }
+            >
+              Reconnect
+            </button>
+          </Can>
+          <Can resource="MCPGateway" op="Delete">
+            <DangerButton
+              label="Delete"
+              action={async () => {
+                await api.del("/api/mcp/client/{name}", { params: { name: String(props.c.name) } })
+                notify("MCP client deleted", "ok")
                 props.onChange()
-              })
-            }
-          >
-            Reconnect
-          </button>
-          <DangerButton
-            label="Delete"
-            action={async () => {
-              await api.del("/api/mcp/client/{name}", { params: { name: String(props.c.name) } })
-              notify("MCP client deleted", "ok")
-              props.onChange()
-            }}
-          />
+              }}
+            />
+          </Can>
         </span>
       </header>
       <Show when={props.st?.error && !connected() && !disabled()}>
@@ -203,7 +210,7 @@ function ClientCard(props: { c: Cfg; st: McpStatus | undefined; onEdit: () => vo
                 class="toggle mono"
                 aria-pressed={tf(!!t().allowed)}
                 title={t().allowed ? "Enabled. Select to disable." : "Disabled. Select to enable."}
-                disabled={busy()}
+                disabled={busy() || !can("MCPGateway", "Update")}
                 onClick={() => setAllowed(t().name, !t().allowed)}
               >
                 {t().name}
@@ -226,9 +233,11 @@ export function Mcp() {
         <button type="button" id="mcp-refresh" class="ghost" onClick={reload}>
           Refresh
         </button>
-        <button type="button" id="mcp-new" class="primary" onClick={() => setEditor({ c: undefined })}>
-          Add client
-        </button>
+        <Can resource="MCPGateway" op="Create">
+          <button type="button" id="mcp-new" class="primary" onClick={() => setEditor({ c: undefined })}>
+            Add client
+          </button>
+        </Can>
       </Toolbar>
       <Show when={editor()} keyed>
         {(e) => (

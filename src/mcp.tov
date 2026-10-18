@@ -5,6 +5,7 @@
 import { McpAuthConfig, TokenCache, staticHeaders, tokenRequest, discoveryUrls, parseAuthServerMetadata } from "./mcpauth"
 import { McpUserToken } from "./mcpuser"
 import { McpTokenExchange } from "./tokenexchange"
+import { InstructionPart, aggregate, commentBlock } from "./mcpinstructions"
 
 // one reply of a per-user call: its status, content type, body and the session id it carries
 type UserReply = { status: int, contentType: string, body: string, sid: string }
@@ -58,6 +59,8 @@ export type McpClientConfig = {
   // is_code_mode_client: the tools are not offered one by one; the model reaches them through the code mode
   // meta-tools (src/codemode.tov). Their tools still run through the same gates when a program calls them.
   is_code_mode_client?: bool,
+  // the byte cap on this server's forwarded instructions; 0 or unset uses mcp.max_instructions_per_client
+  max_instructions_length?: int,
 }
 
 // The code mode limits as the config gives them (Bifrost's mcp_code_mode_limits); 0 or a missing field is the default.
@@ -98,6 +101,10 @@ export type McpConfig = {
   // code mode: "server" (one stub file per server, the default) or "tool" (one per tool), and the run limits
   code_mode_binding_level?: string,
   code_mode_limits?: CodeLimitsIn,
+  // byte caps on the MCP server instructions forwarded to the model: per server (4096 when unset) and
+  // for the whole set (16384 when unset); a client's max_instructions_length overrides the first
+  max_instructions_per_client?: int,
+  max_instructions_total?: int,
 }
 
 // The per-user headers a virtual key submitted for one client; undefined when it has submitted none.
@@ -365,6 +372,15 @@ function toolAllowed(name: string, cfg: McpClientConfig): bool {
   const allow = cfg.tools_to_execute ?? []
   if (allow.length > 0 && !allow.includes("*") && !allow.includes(name)) return false
   return !(cfg.tools_to_skip ?? []).includes(name)
+}
+
+// The instructions of an initialize result, "" when it has none.
+export function instructionsOf(resultRaw: string): string {
+  try {
+    return rawStr(fields(resultRaw), "instructions") ?? ""
+  } catch (e) {
+    return ""
+  }
 }
 
 // One OpenAI tool definition.
@@ -655,6 +671,8 @@ export class McpSession {
   tools: McpTool[] = []
   connected = false
   lastError = ""
+  // the instructions the server sent with its initialize answer ("" when it sent none)
+  instructions = ""
   private sessionId = ""
   private version = ""
   private nextId = 1
@@ -884,7 +902,8 @@ export class McpSession {
         this.stdio = ch
       }
       const initId = this.newId()
-      try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS)
+      const initRaw = try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS)
+      this.instructions = instructionsOf(initRaw)
       // From here on the protocol version is sent with every request.
       this.version = PROTOCOL
       try await this.notify(initializedNotification())
@@ -1210,6 +1229,8 @@ export class McpManager {
   // the global tool_sync_interval, for clients with none of their own (0: no periodic re-list)
   private defaultSyncSecs: int = 0
   private allow: string[] = []
+  private instrPerClient: int = 0
+  private instrTotal: int = 0
 
   constructor(cfg: McpConfig) {
     const secs = cfg.tool_execution_timeout_seconds
@@ -1217,6 +1238,8 @@ export class McpManager {
     const list = cfg.client_configs ?? []
     this.allow = cfg.oauth_private_allowlist ?? []
     this.defaultSyncSecs = syncSeconds(cfg.tool_sync_interval)
+    this.instrPerClient = cfg.max_instructions_per_client ?? 0
+    this.instrTotal = cfg.max_instructions_total ?? 0
     const admin = cfg.exchange_admin
     this.sessions = list.map((c) => {
       const s = new McpSession(c, ms, this.allow)
@@ -1277,9 +1300,47 @@ export class McpManager {
     return out
   }
 
+  // The servers whose instructions a caller may be sent: the connected clients that gave some and
+  // that offer the caller at least one tool (a server the caller cannot reach is not heard from), by
+  // name. Code mode clients are left out: their guidance rides in the stub files.
+  instructionParts(policy: string[] | undefined, keys?: McpKeyConfig[]): InstructionPart[] {
+    const out: InstructionPart[] = []
+    for (const s of this.sessions) {
+      if (!s.connected || s.cfg.is_code_mode_client === true || s.instructions === "") continue
+      if (s.toolsWhere(visibleTo(s, policy, keys)).length === 0) continue
+      out.push({ name: s.cfg.name, text: s.instructions, max: s.cfg.max_instructions_length ?? 0 })
+    }
+    out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    return out
+  }
+
+  // The parts as one block, within the caps; "" when there are none.
+  renderInstructions(parts: InstructionPart[]): string {
+    return aggregate(parts, this.instrPerClient, this.instrTotal)
+  }
+
+  // The block of server instructions a caller is sent, within the caps; "" when there is none.
+  instructionsFor(policy: string[] | undefined, keys?: McpKeyConfig[]): string {
+    return this.renderInstructions(this.instructionParts(policy, keys))
+  }
+
+  // Follows a changed config's caps (the sessions are followed by follow()).
+  setInstructionCaps(perClient: int, total: int): void {
+    this.instrPerClient = perClient
+    this.instrTotal = total
+  }
+
+  // The instructions of a code mode client, for its stub file ("" when it gave none).
+  codeInstructions(name: string): { text: string, max: int } {
+    for (const s of this.sessions) {
+      if (s.cfg.name === name && s.connected) return { text: s.instructions, max: s.cfg.max_instructions_length ?? 0 }
+    }
+    return { text: "", max: 0 }
+  }
+
   // The tools of the code mode clients a caller may see, by client (the same rules as allToolsFor).
-  codeToolsFor(policy: string[] | undefined, keys?: McpKeyConfig[]): { name: string, tools: McpTool[] }[] {
-    const out: { name: string, tools: McpTool[] }[] = []
+  codeToolsFor(policy: string[] | undefined, keys?: McpKeyConfig[]): { name: string, tools: McpTool[], instructions?: string }[] {
+    const out: { name: string, tools: McpTool[], instructions?: string }[] = []
     for (const s of this.sessions) {
       if (!s.connected || s.cfg.is_code_mode_client !== true) continue
       const pass = visibleTo(s, policy, keys)
@@ -1289,7 +1350,7 @@ export class McpManager {
         if (!pass(t.name, chatName(s.cfg.name, t.name))) continue
         tools.push(t)
       }
-      if (tools.length > 0) out.push({ name: s.cfg.name, tools: tools })
+      if (tools.length > 0) out.push({ name: s.cfg.name, tools: tools, instructions: commentBlock(s.instructions, (s.cfg.max_instructions_length ?? 0) > 0 ? s.cfg.max_instructions_length! : this.instrPerClient) })
     }
     return out
   }
@@ -1392,6 +1453,37 @@ export class McpManager {
 async function syncOnce(s: McpSession): Promise<void> {
   await s.relist()
 }
+
+test("instructions go to a caller for the servers that offer it a tool, within the caps", () => {
+  const m = new McpManager({ client_configs: [{ name: "docs", connection_type: "http", connection_string: "http://x/mcp", max_instructions_length: 10 }, { name: "vcs", connection_type: "http", connection_string: "http://y/mcp" }, { name: "code", connection_type: "http", connection_string: "http://z/mcp", is_code_mode_client: true }, { name: "quiet", connection_type: "http", connection_string: "http://q/mcp" }], max_instructions_per_client: 50 })
+  const tool: McpTool = { name: "go", description: "", inputSchemaRaw: "{}" }
+  for (const s of m.sessions) {
+    s.connected = true
+    s.tools = [tool]
+  }
+  m.sessions[0]!.instructions = "Search before you read anything."
+  m.sessions[1]!.instructions = "Commit small."
+  m.sessions[2]!.instructions = "Never shown as a block."
+  const parts = m.instructionParts(undefined)
+  expect(parts.map((p) => p.name).join(",")).toBe("docs,vcs")
+  expect(parts[0]!.max).toBe(10)
+  const text = m.instructionsFor(undefined)
+  expect(text.includes("<mcp_server name=\"docs\">\nSearch bef\n[truncated: 22 bytes omitted]\n</mcp_server>")).toBe(true)
+  expect(text.includes("<mcp_server name=\"vcs\">\nCommit small.\n</mcp_server>")).toBe(true)
+  // a key whose rules name only vcs is not told what docs said
+  const only = m.instructionParts(undefined, [{ mcp_client_name: "vcs", tools_to_execute: ["*"] }])
+  expect(only.map((p) => p.name).join(",")).toBe("vcs")
+  // the code mode client's guidance rides in its stub comment
+  expect(m.codeInstructions("code").text).toBe("Never shown as a block.")
+  m.sessions[1]!.connected = false
+  expect(m.instructionParts(undefined).map((p) => p.name).join(",")).toBe("docs")
+})
+
+test("an initialize result's instructions are read, and absent ones are empty", () => {
+  expect(instructionsOf(`{"protocolVersion":"2025-06-18","instructions":"Use it well.\\nTwice."}`)).toBe("Use it well.\nTwice.")
+  expect(instructionsOf(`{"protocolVersion":"2025-06-18"}`)).toBe("")
+  expect(instructionsOf("not json")).toBe("")
+})
 
 test("tool_sync_interval seconds and the timers it starts and clears", () => {
   expect(syncSeconds(undefined)).toBe(0)

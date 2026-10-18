@@ -3,6 +3,7 @@ import { api } from "../api/client"
 import type { LogEntry } from "../api/types"
 import { fmtInt } from "../fmt"
 import { ErrP, Toolbar, tf } from "../ui"
+import { LogCharts } from "./Charts"
 import { LOG_COLS, LogCells, LogDetail } from "./logParts"
 
 const PAGE_SIZE = 25
@@ -70,6 +71,32 @@ export function Logs() {
       query.since = Date.now() - PERIOD_MS[a.period]!
     }
     return api.get("/api/logs", { query })
+  })
+
+  // the same filters for the chart routes, over a window (24 hours when none is chosen)
+  const chartQuery = createMemo(() => {
+    const a = applied()
+    const q: Record<string, string | number> = {}
+    if (a.provider) q.providers = a.provider
+    if (a.model) q.models = a.model
+    if (a.status) q.status = a.status
+    if (a.virtual_key) q.virtual_key_ids = a.virtual_key
+    if (a.text) q.content_search = a.text
+    const now = Date.now()
+    let start = now - 86400000
+    let end = now
+    if (a.period === "custom") {
+      const from = new Date(a.from).getTime()
+      const to = new Date(a.to).getTime()
+      if (Number.isFinite(from)) start = from
+      if (Number.isFinite(to)) end = to
+    } else if (PERIOD_MS[a.period]) {
+      start = now - PERIOD_MS[a.period]!
+    }
+    if (start >= end) start = end - 3600000
+    q.start_time = start
+    q.end_time = end
+    return q
   })
 
   const filters = createMemo(async () => {
@@ -202,6 +229,8 @@ export function Logs() {
           </button>
         </div>
       </form>
+
+      <LogCharts query={chartQuery()} />
 
       <div class="card" style="padding:0">
         <div class="table-wrap">

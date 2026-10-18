@@ -30,6 +30,8 @@ export interface RawOpts {
   headers?: Record<string, string>
   // false: do not send the admin token and do not ask for one on 401
   auth?: boolean
+  // on 401, fail instead of opening the sign-in dialog (background reads)
+  quiet?: boolean
   query?: Record<string, string | number | boolean | undefined>
 }
 
@@ -93,7 +95,7 @@ export async function send(method: string, path: string, o: RawOpts = {}): Promi
     return { status: res.status, text, data }
   }
   let r = await attempt()
-  if (r.status === 401 && o.auth !== false) {
+  if (r.status === 401 && o.auth !== false && !o.quiet) {
     const t = await askToken(
       adminToken() ? "The admin token was rejected. Enter a valid token." : "This page needs the admin token to continue.",
     )

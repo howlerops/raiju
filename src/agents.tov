@@ -1,25 +1,27 @@
 // A2A agents (Bifrost's agents section, /api/agents and the agent gateway at /agents/a2a/{name}).
 //
-// A registered agent is a remote A2A agent. Its card is fetched when it is registered (or refreshed
-// on demand) and kept in the registration, and the card names the agent's endpoint. The gateway serves
-// the card with its endpoint rewritten to the gateway's JSON-RPC route, and proxies the A2A methods to
-// the endpoint once the caller's virtual key passes the agent's grants and the key's budgets and rate
-// limits (ops.tov a2aRoute). Each call is logged as an "a2a" entry with the agent's name. Its context id
-// is the session, so the agent_names log filter selects the LLM requests made in those conversations.
+// A registered agent is a remote A2A agent. Its card is fetched when it is registered (and again on demand and
+// on a timer) and kept in the registration, and the card names the agent's endpoints. The gateway serves the
+// card with its endpoints rewritten to its own JSON-RPC and REST routes, and sends the A2A calls on to the
+// agent once the caller's virtual key passes the agent's grants and the key's budgets and rate limits
+// (ops.tov a2aRoute). Each call is logged as an "a2a" entry with the agent's name. Its context id is the
+// session, so the agent_names log filter selects the LLM requests made in those conversations.
 //
-// Not built: the REST and gRPC bindings, push notifications, OAuth and TLS settings for the upstream,
-// extension URIs, and a timer that refreshes cards (refresh is by the API).
+// How a call is shaped and mapped between the bindings is a2a.tov; the push relay is a2apush.tov; the
+// credentials the gateway sends to the agent (headers, an OAuth token) are agentauth.tov.
+//
+// Not built: the gRPC binding, extension URIs, and client certificates for the agent's TLS.
 import { Field, fields, elements, find, rawStr, rawBool, decodeString, quote, build, setField, isNull } from "./json"
-import { AgentConfig, AgentAuth, resolveEnv } from "./config"
+import { AgentConfig, AgentAuth, AgentOAuth, AgentTls } from "./config"
 import { urlProblem } from "./webhooks"
 import { deadline } from "./deadline"
 import { errorJson } from "./schemas"
+import { upstreamHeaders, tlsOf } from "./agentauth"
+import { interfacesOf, interfaceUrl, cardPushes } from "./a2a"
 
 export const CARD_PATH = "/.well-known/agent-card.json"
 export const JSON_RPC_SUFFIX = "/json-rpc"
-// the A2A methods the gateway proxies: the v0.3 names and the v1 names (the same methods)
-export const A2A_METHODS: string[] = ["message/send", "message/stream", "tasks/get", "tasks/cancel", "SendMessage", "SendStreamingMessage", "GetTask", "CancelTask"]
-const STREAM_METHODS: string[] = ["message/stream", "SendStreamingMessage"]
+export const REST_PREFIX = "/rest"
 // what a read answers for a secret header value
 const MASK = "********"
 const CARD_TIMEOUT_MS = 10000
@@ -68,27 +70,129 @@ function headerMap(raw: string): Map<string, string> | undefined {
   return out
 }
 
-// An agent's auth object: type none or headers (OAuth is not built). bad names the first problem.
-function authFrom(fs: Field[], key: string): { auth: AgentAuth | undefined, bad: string } {
+function strOf(raw: string | undefined): string | undefined {
+  if (raw === undefined || !raw.startsWith("\"")) return undefined
+  try {
+    return decodeString(raw)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// An array of strings, undefined when the raw JSON is not one.
+function strList(raw: string): string[] | undefined {
+  if (!raw.startsWith("[")) return undefined
+  const out: string[] = []
+  try {
+    for (const el of elements(raw)) {
+      if (!el.startsWith("\"")) return undefined
+      out.push(decodeString(el))
+    }
+  } catch (e) {
+    return undefined
+  }
+  return out
+}
+
+// Headers an auth may not set: they belong to the connection, not to the gateway's credentials.
+function blockedHeader(name: string): bool {
+  const k = name.toLowerCase()
+  return k === "" || k === "cookie" || k === "proxy-authorization" || k === "connection" || k === "keep-alive" || k === "proxy-authenticate" || k === "proxy-connection" || k === "te" || k === "trailer" || k === "transfer-encoding" || k === "upgrade" || k === "host" || k === "content-length"
+}
+
+type AuthRead = { auth: AgentAuth | undefined, bad: string }
+
+function oauthFrom(af: Field[], key: string, allowPrivate: bool): { oauth: AgentOAuth | undefined, bad: string } {
+  const raw = find(af, "oauth")
+  const none = (msg: string): { oauth: AgentOAuth | undefined, bad: string } => ({ oauth: undefined, bad: msg })
+  if (raw === undefined || isNull(raw)) return none(`${key}: oauth auth needs an oauth object`)
+  const of = objectFields(raw)
+  if (of === undefined) return none(`${key}.oauth must be an object`)
+  const id = rawStr(of, "client_id") ?? ""
+  const secret = rawStr(of, "client_secret") ?? ""
+  if (id === "" || secret === "") return none(`${key}: OAuth auth requires inline client_id and client_secret`)
+  const pu = rawStr(of, "provider_url") ?? ""
+  const du = rawStr(of, "discovery_url") ?? ""
+  const tu = rawStr(of, "token_url") ?? ""
+  if (pu === "" && du === "" && tu === "") return none(`${key}: OAuth auth requires token_url, discovery_url or provider_url`)
+  const urls: string[][] = [["provider_url", pu], ["discovery_url", du], ["token_url", tu]]
+  for (const pair of urls) {
+    if (pair[1]! === "") continue
+    const p = urlProblem(pair[1]!, allowPrivate)
+    if (p !== "") return none(`${key}.oauth.${pair[0]!}: ${p}`)
+  }
+  let scopes: string[] | undefined = undefined
+  const sraw = find(of, "scopes")
+  if (sraw !== undefined && !isNull(sraw)) {
+    scopes = strList(sraw)
+    if (scopes === undefined) return none(`${key}.oauth.scopes must be an array of strings`)
+  }
+  const resource = rawStr(of, "resource")
+  return { oauth: { provider_url: pu === "" ? undefined : pu, discovery_url: du === "" ? undefined : du, token_url: tu === "" ? undefined : tu, client_id: id, client_secret: secret, scopes: scopes, resource: resource === "" ? undefined : resource }, bad: "" }
+}
+
+function tlsFrom(af: Field[], key: string): { tls: AgentTls | undefined, bad: string } {
+  const raw = find(af, "tls")
+  if (raw === undefined || isNull(raw)) return { tls: undefined, bad: "" }
+  const tf = objectFields(raw)
+  if (tf === undefined) return { tls: undefined, bad: `${key}.tls must be an object` }
+  for (const k of ["ca_cert_pem", "client_cert_pem", "client_key_pem"]) {
+    const r = find(tf, k)
+    if (r !== undefined && !isNull(r) && !r.startsWith("\"")) return { tls: undefined, bad: `${key}.tls.${k} must be a string` }
+  }
+  const cert = rawStr(tf, "client_cert_pem") ?? ""
+  const keyPem = rawStr(tf, "client_key_pem") ?? ""
+  if ((cert === "") !== (keyPem === "")) return { tls: undefined, bad: `${key}.tls: a client certificate needs both client_cert_pem and client_key_pem` }
+  return { tls: { insecure_skip_verify: rawBool(tf, "insecure_skip_verify"), ca_cert_pem: rawStr(tf, "ca_cert_pem"), client_cert_pem: rawStr(tf, "client_cert_pem"), client_key_pem: rawStr(tf, "client_key_pem") }, bad: "" }
+}
+
+// An agent's auth object: type none, headers or oauth. bad names the first problem.
+function authFrom(fs: Field[], key: string, allowPrivate: bool): AuthRead {
   const raw = find(fs, key)
   if (raw === undefined || isNull(raw)) return { auth: undefined, bad: "" }
   const af = objectFields(raw)
   if (af === undefined) return { auth: undefined, bad: `${key} must be an object` }
   const type = rawStr(af, "type") ?? "none"
-  if (type !== "none" && type !== "headers") return { auth: undefined, bad: `${key}.type must be none or headers` }
+  if (type !== "none" && type !== "headers" && type !== "oauth") return { auth: undefined, bad: `${key}.type must be none, headers or oauth` }
   const hraw = find(af, "headers")
   let headers: Map<string, string> | undefined = undefined
   if (hraw !== undefined && !isNull(hraw)) {
     headers = headerMap(hraw)
     if (headers === undefined) return { auth: undefined, bad: `${key}.headers must be an object of string values` }
+    for (const k of headers.keys()) {
+      if (blockedHeader(k) || (headers.get(k) ?? "") === "") return { auth: undefined, bad: `${key}.headers need a non-empty, forwardable name and value` }
+    }
   }
   if (type === "headers" && (headers === undefined || headers.keys().length === 0)) return { auth: undefined, bad: `${key}: header auth needs at least one header` }
-  return { auth: { type: type, headers: headers }, bad: "" }
+  let oauth: AgentOAuth | undefined = undefined
+  if (type === "oauth") {
+    const o = oauthFrom(af, key, allowPrivate)
+    if (o.bad !== "") return { auth: undefined, bad: o.bad }
+    oauth = o.oauth
+  }
+  let schemes: string[] | undefined = undefined
+  const sraw = find(af, "security_schemes")
+  if (sraw !== undefined && !isNull(sraw)) {
+    schemes = strList(sraw)
+    if (schemes === undefined) return { auth: undefined, bad: `${key}.security_schemes must be an array of strings` }
+    for (let i = 0; i < schemes.length; i++) {
+      if (schemes[i]!.trim() === "") return { auth: undefined, bad: `${key}.security_schemes cannot contain an empty name` }
+      if (schemes.indexOf(schemes[i]!) !== i) return { auth: undefined, bad: `duplicate ${key} security scheme "${schemes[i]!}"` }
+    }
+  }
+  const t = tlsFrom(af, key)
+  if (t.bad !== "") return { auth: undefined, bad: t.bad }
+  return { auth: { type: type, headers: headers, oauth: oauth, security_schemes: schemes, advanced: rawBool(af, "advanced"), tls: t.tls }, bad: "" }
 }
 
-// A header value as a read shows it: env references are shown, stored values are masked.
-function shownValue(v: string): string {
+// A secret as a read shows it: env references are shown, stored values are masked, empty stays empty.
+function shown(v: string): string {
+  if (v === "") return ""
   return v.startsWith("env.") ? v : MASK
+}
+
+function opt(v: string | undefined): string {
+  return v === undefined ? "null" : quote(v)
 }
 
 // The auth as a read shows it (secret values masked).
@@ -98,10 +202,16 @@ function authView(a: AgentAuth | undefined): string {
   let hv = "null"
   if (hs !== undefined) {
     const pairs: string[] = []
-    for (const k of hs.keys()) pairs.push(quote(k) + ":" + quote(shownValue(hs.get(k) ?? "")))
+    for (const k of hs.keys()) pairs.push(quote(k) + ":" + quote(shown(hs.get(k) ?? "")))
     hv = "{" + pairs.join(",") + "}"
   }
-  return `{"type":${quote(a.type)},"headers":${hv}}`
+  let ov = "null"
+  const o = a.oauth
+  if (o !== undefined) ov = `{"provider_url":${opt(o.provider_url)},"discovery_url":${opt(o.discovery_url)},"token_url":${opt(o.token_url)},"client_id":${quote(shown(o.client_id))},"client_secret":${quote(shown(o.client_secret))},"scopes":${JSON.stringify(o.scopes ?? [])},"resource":${opt(o.resource)}}`
+  let tv = "null"
+  const t = a.tls
+  if (t !== undefined) tv = `{"insecure_skip_verify":${t.insecure_skip_verify === true ? "true" : "false"},"ca_cert_pem":${quote(shown(t.ca_cert_pem ?? ""))},"client_cert_pem":${quote(shown(t.client_cert_pem ?? ""))},"client_key_pem":${quote(shown(t.client_key_pem ?? ""))}}`
+  return `{"type":${quote(a.type)},"headers":${hv},"oauth":${ov},"security_schemes":${JSON.stringify(a.security_schemes ?? [])},"advanced":${a.advanced === true ? "true" : "false"},"tls":${tv}}`
 }
 
 // The identity of an auth with its values, for telling whether a replace changed it.
@@ -112,72 +222,132 @@ function authKey(a: AgentAuth | undefined): string {
   if (hs !== undefined) {
     for (const k of hs.keys()) parts.push(k + "=" + (hs.get(k) ?? ""))
   }
+  const o = a.oauth
+  if (o !== undefined) parts.push(JSON.stringify(o))
+  const t = a.tls
+  if (t !== undefined) parts.push(JSON.stringify(t))
   return parts.join("|")
 }
 
-// The card's endpoint: its url (A2A v0.3), else the first JSON-RPC interface (v1). "" when there is none.
+// The card's JSON-RPC endpoint: its url (A2A v0.3), else the first JSON-RPC interface (v1). "" when there is none.
 export function endpointOf(card: string): string {
-  const cf = objectFields(card)
-  if (cf === undefined) return ""
-  const u = rawStr(cf, "url") ?? ""
-  if (u !== "") return u
-  const ifs = find(cf, "supportedInterfaces") ?? find(cf, "additionalInterfaces")
-  if (ifs === undefined) return ""
-  let items: string[] = []
-  try {
-    items = elements(ifs)
-  } catch (e) {
-    return ""
-  }
-  for (const it of items) {
-    const f = objectFields(it)
-    if (f === undefined) continue
-    const proto = rawStr(f, "protocolBinding") ?? rawStr(f, "transport") ?? "JSONRPC"
-    const iu = rawStr(f, "url") ?? ""
-    if (iu !== "" && proto === "JSONRPC") return iu
-  }
-  return ""
+  return interfaceUrl(card, "JSONRPC")
 }
 
-// The card the gateway serves: the cached card with its endpoints and security rewritten to the gateway.
-// base is the public base URL the gateway is reached at; the caller authenticates with x-bf-vk.
-export function gatewayCard(card: string, base: string, name: string): string {
+// The card's REST (HTTP+JSON) endpoint, "" when there is none.
+export function restEndpointOf(card: string): string {
+  return interfaceUrl(card, "HTTP+JSON")
+}
+
+// The card the gateway serves: the cached card with its endpoints rewritten to the gateway's JSON-RPC and REST
+// routes, push notifications advertised only when the gateway relays them and the agent can push, the agent's
+// signatures dropped (the document changed), and the caller authenticating with x-bf-vk. base is the public
+// base URL the gateway is reached at.
+export function gatewayCard(card: string, base: string, name: string, pushOn: bool): string {
   let cf: Field[] = objectFields(card) ?? []
-  const ep = base + "/agents/a2a/" + name + JSON_RPC_SUFFIX
-  setField(&cf, "url", quote(ep))
+  const root = base + "/agents/a2a/" + name
+  const rpc = root + JSON_RPC_SUFFIX
+  const rest = root + REST_PREFIX
+  const v1 = find(cf, "supportedInterfaces") !== undefined
+  setField(&cf, "url", quote(rpc))
   setField(&cf, "preferredTransport", quote("JSONRPC"))
-  if (find(cf, "additionalInterfaces") !== undefined) setField(&cf, "additionalInterfaces", `[{"url":${quote(ep)},"transport":"JSONRPC"}]`)
-  if (find(cf, "supportedInterfaces") !== undefined) setField(&cf, "supportedInterfaces", `[{"url":${quote(ep)},"protocolBinding":"JSONRPC"}]`)
+  if (v1) setField(&cf, "supportedInterfaces", `[{"url":${quote(rpc)},"protocolBinding":"JSONRPC","protocolVersion":"1.0"},{"url":${quote(rest)},"protocolBinding":"HTTP+JSON","protocolVersion":"1.0"}]`)
+  if (!v1 || find(cf, "additionalInterfaces") !== undefined) setField(&cf, "additionalInterfaces", `[{"url":${quote(rpc)},"transport":"JSONRPC"},{"url":${quote(rest)},"transport":"HTTP+JSON"}]`)
+  let caps: Field[] = objectFields(find(cf, "capabilities") ?? "") ?? []
+  setField(&caps, "pushNotifications", pushOn && cardPushes(card) ? "true" : "false")
+  setField(&cf, "capabilities", build(caps))
   setField(&cf, "securitySchemes", `{"bifrostVirtualKey":{"type":"apiKey","in":"header","name":"x-bf-vk"}}`)
   setField(&cf, "security", `[{"bifrostVirtualKey":[]}]`)
-  return build(cf)
+  const out: Field[] = []
+  for (const f of cf) {
+    if (f.key !== "signatures") out.push(f)
+  }
+  return build(out)
 }
 
-// Fetches an agent card and checks it: a JSON object with a name and an endpoint the URL guard allows.
-// The card's raw text is what the registration keeps.
-export async function fetchCard(url: string, auth: AgentAuth | undefined, allowPrivate: bool): Promise<CardResult, Error> {
+// The card that lists the agents a caller may call, at GET /agents/a2a (Raiju's own; Bifrost serves cards per
+// agent only). It is an agent card for the gateway as a whole: the skills of every listed agent, prefixed with
+// the agent's name, and an agents list with each agent's gateway routes.
+export function aggregateCard(list: AgentConfig[], base: string, pushOn: bool): string {
+  const skills: string[] = []
+  const agents: string[] = []
+  let streaming = false
+  let pushing = false
+  for (const a of list) {
+    const card = a.card ?? ""
+    if (card === "") continue
+    const cf = objectFields(card)
+    if (cf === undefined) continue
+    const root = base + "/agents/a2a/" + a.name
+    const ids: string[] = []
+    const sraw = find(cf, "skills")
+    if (sraw !== undefined && sraw.startsWith("[")) {
+      try {
+        for (const it of elements(sraw)) {
+          const sf = objectFields(it)
+          if (sf === undefined) continue
+          const sid = rawStr(sf, "id") ?? rawStr(sf, "name") ?? ""
+          if (sid === "") continue
+          const gid = a.name + "/" + sid
+          ids.push(gid)
+          const tags = strList(find(sf, "tags") ?? "") ?? []
+          if (!tags.includes(a.name)) tags.push(a.name)
+          let out = sf
+          setField(&out, "id", quote(gid))
+          setField(&out, "tags", JSON.stringify(tags))
+          skills.push(build(out))
+        }
+      } catch (e) {
+        // an agent whose skills cannot be read is listed without them
+      }
+    }
+    const caps = objectFields(find(cf, "capabilities") ?? "")
+    if (caps !== undefined && rawBool(caps, "streaming") === true) streaming = true
+    if (pushOn && cardPushes(card)) pushing = true
+    agents.push(`{"name":${quote(a.name)},"description":${quote(rawStr(cf, "description") ?? "")},"agent_card_url":${quote(root + CARD_PATH)},"json_rpc_url":${quote(root + JSON_RPC_SUFFIX)},"rest_url":${quote(root + REST_PREFIX)},"skills":${JSON.stringify(ids)}}`)
+  }
+  const parts: string[] = [
+    `"name":"Raiju agent gateway"`,
+    `"description":"The A2A agents registered with this gateway"`,
+    `"url":${quote(base + "/agents/a2a")}`,
+    `"version":"1.0.0"`,
+    `"protocolVersion":"0.3.0"`,
+    `"capabilities":{"streaming":${streaming ? "true" : "false"},"pushNotifications":${pushing ? "true" : "false"}}`,
+    `"defaultInputModes":["text/plain"]`,
+    `"defaultOutputModes":["text/plain"]`,
+    `"skills":[${skills.join(",")}]`,
+    `"agents":[${agents.join(",")}]`,
+    `"securitySchemes":{"bifrostVirtualKey":{"type":"apiKey","in":"header","name":"x-bf-vk"}}`,
+    `"security":[{"bifrostVirtualKey":[]}]`,
+  ]
+  return "{" + parts.join(",") + "}"
+}
+
+// Fetches an agent card and checks it: a JSON object with a name and an endpoint the URL guard allows. The
+// card's raw text is what the registration keeps. credId names the OAuth token cache entry of the auth.
+export async function fetchCard(url: string, auth: AgentAuth | undefined, allowPrivate: bool, credId: string): Promise<CardResult, Error> {
   const bad = urlProblem(url, allowPrivate)
   if (bad !== "") return { card: "", error: `agent_card_url: ${bad}` }
-  const hm: Map<string, string> = new Map()
+  const ah = await upstreamHeaders(credId, auth, allowPrivate)
+  if (ah.error !== "") return { card: "", error: `the agent card could not be fetched: ${ah.error}` }
+  const hm = ah.headers
   hm.set("accept", "application/json")
-  const ah = auth?.headers
-  if (auth !== undefined && auth.type === "headers" && ah !== undefined) {
-    for (const k of ah.keys()) hm.set(k, resolveEnv(ah.get(k) ?? ""))
-  }
   const hs: Record<string, string> = hm
   const dl = deadline(CARD_TIMEOUT_MS)
   try {
-    const r = await fetch(url, { headers: hs, signal: dl.controller.signal })
+    const r = await fetch(url, { headers: hs, signal: dl.controller.signal, tls: tlsOf(auth) })
     const text = await r.text()
     dl.finish()
     if (r.status < 200 || r.status >= 300) return { card: "", error: `the agent card answered HTTP ${r.status}` }
     const cf = objectFields(text)
     if (cf === undefined) return { card: "", error: "the agent card is not a JSON object" }
     if ((rawStr(cf, "name") ?? "") === "") return { card: "", error: "the agent card has no name" }
-    const ep = endpointOf(text)
-    if (ep === "") return { card: "", error: "the agent card names no endpoint" }
-    const epBad = urlProblem(ep, allowPrivate)
-    if (epBad !== "") return { card: "", error: `the agent card's endpoint: ${epBad}` }
+    if (endpointOf(text) === "" && restEndpointOf(text) === "") return { card: "", error: "the agent card names no endpoint" }
+    for (const i of interfacesOf(text).list) {
+      if (i.binding !== "JSONRPC" && i.binding !== "HTTP+JSON") continue
+      const epBad = urlProblem(i.url, allowPrivate)
+      if (epBad !== "") return { card: "", error: `the agent card's endpoint: ${epBad}` }
+    }
     return { card: text, error: "" }
   } catch (e) {
     dl.finish()
@@ -192,7 +362,7 @@ function numOrNull(v: int | undefined): string {
 }
 
 // The API view of a registration: its settings, the cached card, and the gateway's endpoints.
-// Header values are masked; the card is its raw JSON.
+// Secret values are masked; the card is its raw JSON.
 export function agentView(a: AgentConfig, base: string): string {
   const gw = base + "/agents/a2a/" + a.name
   const card = a.card === undefined || a.card === "" ? "null" : a.card
@@ -202,6 +372,8 @@ export function agentView(a: AgentConfig, base: string): string {
     `"agent_card_url":${quote(a.agent_card_url)}`,
     `"enabled":${a.enabled === false ? "false" : "true"}`,
     `"allow_by_default":${a.allow_by_default === true ? "true" : "false"}`,
+    `"forward_accepted_credential":${a.forward_accepted_credential === true ? "true" : "false"}`,
+    `"forward_accepted_credential_overrides_auth":${a.forward_accepted_credential_overrides_auth === true ? "true" : "false"}`,
     `"virtual_key_ids":${JSON.stringify(vks)}`,
     `"discovery_auth":${authView(a.discovery_auth)}`,
     `"runtime_auth":${authView(a.runtime_auth)}`,
@@ -209,40 +381,49 @@ export function agentView(a: AgentConfig, base: string): string {
     `"card":${card}`,
     `"card_fetched_at":${numOrNull(a.card_fetched_at)}`,
     `"endpoint":${quote(endpointOf(card === "null" ? "" : card))}`,
+    `"rest_endpoint":${quote(restEndpointOf(card === "null" ? "" : card))}`,
     `"created_at":${numOrNull(a.created_at)}`,
     `"updated_at":${numOrNull(a.updated_at)}`,
-    `"gateway":{"agent_card_url":${quote(gw + CARD_PATH)},"json_rpc_url":${quote(gw + JSON_RPC_SUFFIX)}}`,
+    `"gateway":{"agent_card_url":${quote(gw + CARD_PATH)},"json_rpc_url":${quote(gw + JSON_RPC_SUFFIX)},"rest_url":${quote(gw + REST_PREFIX)}}`,
   ]
   return "{" + parts.join(",") + "}"
 }
 
-// The fields of a create or replace body, checked. error is the reason it is refused. A masked header
-// value keeps the stored value of the same header (old, for a replace).
-type Draft = { url: string, enabled: bool, allowDefault: bool, vks: string[], discovery: AgentAuth | undefined, runtime: AgentAuth | undefined, allowPrivate: bool, error: string }
+// The fields of a create or replace body, checked. error is the reason it is refused. A masked secret
+// keeps the stored value of the same field (old, for a replace).
+type Draft = { url: string, enabled: bool, allowDefault: bool, forward: bool, forwardOver: bool, vks: string[], discovery: AgentAuth | undefined, runtime: AgentAuth | undefined, allowPrivate: bool, error: string }
 
-// The stored value of a header, for a masked one.
-function keep(old: AgentAuth | undefined, key: string, v: string): string {
+// The stored value of a secret, for a masked one.
+function keepStr(v: string, was: string | undefined): string {
   if (v !== MASK) return v
-  const hs = old?.headers
-  if (hs === undefined) return v
-  return hs.get(key) ?? v
+  return was ?? v
 }
 
 // The auth of a body with masked values filled in from the stored one.
-function filled(a: { auth: AgentAuth | undefined, bad: string }, old: AgentAuth | undefined): AgentAuth | undefined {
+function filled(a: AuthRead, old: AgentAuth | undefined): AgentAuth | undefined {
   const au = a.auth
   if (au === undefined) return undefined
+  let headers: Map<string, string> | undefined = undefined
   const hs = au.headers
-  if (hs === undefined) return au
-  const m: Map<string, string> = new Map()
-  for (const k of hs.keys()) m.set(k, keep(old, k, hs.get(k) ?? ""))
-  return { type: au.type, headers: m }
+  if (hs !== undefined) {
+    const m: Map<string, string> = new Map()
+    const oh = old?.headers
+    for (const k of hs.keys()) m.set(k, keepStr(hs.get(k) ?? "", oh === undefined ? undefined : oh.get(k)))
+    headers = m
+  }
+  let oauth = au.oauth
+  const oo = old?.oauth
+  if (oauth !== undefined) oauth = { provider_url: oauth.provider_url, discovery_url: oauth.discovery_url, token_url: oauth.token_url, client_id: keepStr(oauth.client_id, oo?.client_id), client_secret: keepStr(oauth.client_secret, oo?.client_secret), scopes: oauth.scopes, resource: oauth.resource }
+  let tls = au.tls
+  const ot = old?.tls
+  if (tls !== undefined) tls = { insecure_skip_verify: tls.insecure_skip_verify, ca_cert_pem: tls.ca_cert_pem === undefined ? undefined : keepStr(tls.ca_cert_pem, ot?.ca_cert_pem), client_cert_pem: tls.client_cert_pem === undefined ? undefined : keepStr(tls.client_cert_pem, ot?.client_cert_pem), client_key_pem: tls.client_key_pem === undefined ? undefined : keepStr(tls.client_key_pem, ot?.client_key_pem) }
+  return { type: au.type, headers: headers, oauth: oauth, security_schemes: au.security_schemes, advanced: au.advanced, tls: tls }
 }
 
 function draftOf(fs: Field[], old: AgentConfig | undefined): Draft {
   const url = rawStr(fs, "agent_card_url") ?? ""
   const allowPrivate = rawBool(fs, "allow_private_network") ?? old?.allow_private_network ?? false
-  const bad = (msg: string): Draft => ({ url: url, enabled: true, allowDefault: false, vks: [], discovery: undefined, runtime: undefined, allowPrivate: allowPrivate, error: msg })
+  const bad = (msg: string): Draft => ({ url: url, enabled: true, allowDefault: false, forward: false, forwardOver: false, vks: [], discovery: undefined, runtime: undefined, allowPrivate: allowPrivate, error: msg })
   if (url === "") return bad("agent_card_url is required")
   const up = urlProblem(url, allowPrivate)
   if (up !== "") return bad(`agent_card_url: ${up}`)
@@ -261,11 +442,15 @@ function draftOf(fs: Field[], old: AgentConfig | undefined): Draft {
       return bad("virtual_key_ids must be an array of strings")
     }
   }
-  const d = authFrom(fs, "discovery_auth")
+  const d = authFrom(fs, "discovery_auth", allowPrivate)
   if (d.bad !== "") return bad(d.bad)
-  const r = authFrom(fs, "runtime_auth")
+  const r = authFrom(fs, "runtime_auth", allowPrivate)
   if (r.bad !== "") return bad(r.bad)
-  return { url: url, enabled: rawBool(fs, "enabled") ?? true, allowDefault: rawBool(fs, "allow_by_default") ?? false, vks: vks, discovery: filled(d, old?.discovery_auth), runtime: filled(r, old?.runtime_auth), allowPrivate: allowPrivate, error: "" }
+  for (const k of ["forward_accepted_credential", "forward_accepted_credential_overrides_auth"]) {
+    const raw = find(fs, k)
+    if (raw !== undefined && !isNull(raw) && raw !== "true" && raw !== "false") return bad(`${k} must be a boolean`)
+  }
+  return { url: url, enabled: rawBool(fs, "enabled") ?? true, allowDefault: rawBool(fs, "allow_by_default") ?? false, forward: rawBool(fs, "forward_accepted_credential") ?? false, forwardOver: rawBool(fs, "forward_accepted_credential_overrides_auth") ?? false, vks: vks, discovery: filled(d, old?.discovery_auth), runtime: filled(r, old?.runtime_auth), allowPrivate: allowPrivate, error: "" }
 }
 
 function indexOf(list: AgentConfig[], name: string): int {
@@ -291,10 +476,10 @@ async function create(list: AgentConfig[], body: string, base: string): Promise<
   if (indexOf(list, name) >= 0) return fail(409, "an agent with this name already exists")
   const d = draftOf(fs, undefined)
   if (d.error !== "") return fail(400, d.error)
-  const f = await fetchCard(d.url, d.discovery, d.allowPrivate)
+  const f = await fetchCard(d.url, d.discovery, d.allowPrivate, name + "|discovery")
   if (f.error !== "") return fail(400, f.error)
   const now = Math.floor(Date.now())
-  const made: AgentConfig = { name: name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, card: f.card, card_fetched_at: now, created_at: now, updated_at: now }
+  const made: AgentConfig = { name: name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, forward_accepted_credential: d.forward, forward_accepted_credential_overrides_auth: d.forwardOver, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, card: f.card, card_fetched_at: now, created_at: now, updated_at: now }
   return reply(201, agentView(made, base), list.concat([made]))
 }
 
@@ -311,12 +496,12 @@ async function replace(list: AgentConfig[], i: int, body: string, base: string):
   let fetched = old.card_fetched_at
   const now = Math.floor(Date.now())
   if (changed || card === "") {
-    const f = await fetchCard(d.url, d.discovery, d.allowPrivate)
+    const f = await fetchCard(d.url, d.discovery, d.allowPrivate, old.name + "|discovery")
     if (f.error !== "") return fail(400, f.error)
     card = f.card
     fetched = now
   }
-  const made: AgentConfig = { name: old.name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, card: card, card_fetched_at: fetched, created_at: old.created_at, updated_at: now }
+  const made: AgentConfig = { name: old.name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, forward_accepted_credential: d.forward, forward_accepted_credential_overrides_auth: d.forwardOver, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, card: card, card_fetched_at: fetched, created_at: old.created_at, updated_at: now }
   const out: AgentConfig[] = []
   for (let j = 0; j < list.length; j++) out.push(j === i ? made : list[j]!)
   return reply(200, agentView(made, base), out)
@@ -326,27 +511,67 @@ async function replace(list: AgentConfig[], i: int, body: string, base: string):
 async function inspect(body: string): Promise<AgentReply, Error> {
   const fs = objectFields(body)
   if (fs === undefined) return fail(400, "invalid request body")
-  const a = authFrom(fs, "discovery_auth")
+  const allowPrivate = rawBool(fs, "allow_private_network") ?? false
+  const a = authFrom(fs, "discovery_auth", allowPrivate)
   if (a.bad !== "") return fail(400, a.bad)
-  const f = await fetchCard(rawStr(fs, "agent_card_url") ?? "", a.auth, rawBool(fs, "allow_private_network") ?? false)
+  const f = await fetchCard(rawStr(fs, "agent_card_url") ?? "", a.auth, allowPrivate, "inspect|discovery")
   if (f.error !== "") return fail(400, f.error)
   return reply(200, `{"card":${f.card}}`)
+}
+
+// The registration with a freshly fetched card.
+export function withCard(old: AgentConfig, card: string, now: int): AgentConfig {
+  return { name: old.name, agent_card_url: old.agent_card_url, enabled: old.enabled, allow_by_default: old.allow_by_default, forward_accepted_credential: old.forward_accepted_credential, forward_accepted_credential_overrides_auth: old.forward_accepted_credential_overrides_auth, virtual_key_ids: old.virtual_key_ids, discovery_auth: old.discovery_auth, runtime_auth: old.runtime_auth, allow_private_network: old.allow_private_network, card: card, card_fetched_at: now, created_at: old.created_at, updated_at: now }
 }
 
 // Fetches the card again for a registration: its cache is replaced.
 async function refresh(list: AgentConfig[], i: int, base: string): Promise<AgentReply, Error> {
   const old = list[i]!
-  const f = await fetchCard(old.agent_card_url, old.discovery_auth, old.allow_private_network === true)
+  const f = await fetchCard(old.agent_card_url, old.discovery_auth, old.allow_private_network === true, old.name + "|discovery")
   if (f.error !== "") return fail(400, f.error)
-  const now = Math.floor(Date.now())
-  const made: AgentConfig = { name: old.name, agent_card_url: old.agent_card_url, enabled: old.enabled, allow_by_default: old.allow_by_default, virtual_key_ids: old.virtual_key_ids, discovery_auth: old.discovery_auth, runtime_auth: old.runtime_auth, allow_private_network: old.allow_private_network, card: f.card, card_fetched_at: now, created_at: old.created_at, updated_at: now }
+  const made = withCard(old, f.card, Math.floor(Date.now()))
   const out: AgentConfig[] = []
   for (let j = 0; j < list.length; j++) out.push(j === i ? made : list[j]!)
   return reply(200, agentView(made, base), out)
 }
 
-// Routes one request under /api/agents (the history is ops.tov's). base is the public base URL the
-// gateway endpoints are shown at. Changes come back as next, the list to save.
+// Fetches the card of every enabled registration again (the timer's pass) and returns the list to save, undefined
+// when no card changed. A card that cannot be fetched is kept as it was. changed names the registrations whose card
+// moved, failed those whose fetch failed and why.
+export async function refreshAll(list: AgentConfig[]): Promise<{ next: AgentConfig[] | undefined, changed: string[], failed: string[] }> {
+  const out: AgentConfig[] = []
+  const changed: string[] = []
+  const failed: string[] = []
+  let any = false
+  for (const a of list) {
+    if (a.enabled === false) {
+      out.push(a)
+      continue
+    }
+    try {
+      const f = await fetchCard(a.agent_card_url, a.discovery_auth, a.allow_private_network === true, a.name + "|discovery")
+      if (f.error !== "") {
+        failed.push(`${a.name}: ${f.error}`)
+        out.push(a)
+        continue
+      }
+      if (f.card === (a.card ?? "")) {
+        out.push(a)
+        continue
+      }
+      out.push(withCard(a, f.card, Math.floor(Date.now())))
+      changed.push(a.name)
+      any = true
+    } catch (e) {
+      failed.push(`${a.name}: ${e.message}`)
+      out.push(a)
+    }
+  }
+  return { next: any ? out : undefined, changed: changed, failed: failed }
+}
+
+// Routes one request under /api/agents (the history and the push configs are ops.tov's). base is the public
+// base URL the gateway endpoints are shown at. Changes come back as next, the list to save.
 export async function agentApi(cfg: AgentConfig[] | undefined, method: string, path: string, body: string, base: string): Promise<AgentReply, Error> {
   const list: AgentConfig[] = cfg ?? []
   const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
@@ -406,42 +631,10 @@ export function grantAllows(a: AgentConfig, vkId: string | undefined): bool {
   return a.allow_by_default === true || (a.virtual_key_ids ?? []).includes(vkId)
 }
 
-// The headers the agent's runtime auth adds to a proxied call.
-export function runtimeHeaders(a: AgentConfig): Map<string, string> {
-  const out: Map<string, string> = new Map()
-  const auth = a.runtime_auth
-  const hs = auth?.headers
-  if (auth === undefined || auth.type !== "headers" || hs === undefined) return out
-  for (const k of hs.keys()) out.set(k, hs.get(k) ?? "")
-  return out
-}
-
-// The method of a JSON-RPC request body, "" when it has none.
-export function a2aMethodOf(body: string): string {
-  try {
-    return rawStr(fields(body), "method") ?? ""
-  } catch (e) {
-    return ""
-  }
-}
-
-// The raw id of a JSON-RPC request ("null" when it has none), as a JSON-RPC response echoes it.
-export function rpcIdOf(body: string): string {
-  try {
-    return find(fields(body), "id") ?? "null"
-  } catch (e) {
-    return "null"
-  }
-}
-
-export function isStreamMethod(m: string): bool {
-  return STREAM_METHODS.includes(m)
-}
-
 // The context id a request names (params.message.contextId): the conversation the call belongs to.
-export function contextOfRequest(body: string): string {
+export function contextOfParams(params: string): string {
   try {
-    const pf = fields(find(fields(body), "params") ?? "{}")
+    const pf = fields(params)
     const mraw = find(pf, "message")
     if (mraw !== undefined) return rawStr(fields(mraw), "contextId") ?? ""
     return rawStr(pf, "contextId") ?? ""
@@ -450,10 +643,19 @@ export function contextOfRequest(body: string): string {
   }
 }
 
-// The context id of a unary answer (result.contextId, or the context of its task or message).
-export function contextOfResponse(text: string): string {
+// The context id of a JSON-RPC request body.
+export function contextOfRequest(body: string): string {
   try {
-    const rf = fields(find(fields(text), "result") ?? "{}")
+    return contextOfParams(find(fields(body), "params") ?? "{}")
+  } catch (e) {
+    return ""
+  }
+}
+
+// The context id of a unary result (a task, a message, or a v1 {task} / {message} wrapper).
+export function contextOfResult(result: string): string {
+  try {
+    const rf = fields(result)
     const direct = rawStr(rf, "contextId") ?? ""
     if (direct !== "") return direct
     const tr = find(rf, "task")
@@ -461,6 +663,15 @@ export function contextOfResponse(text: string): string {
     const mr = find(rf, "message")
     if (mr !== undefined) return rawStr(fields(mr), "contextId") ?? ""
     return ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// The context id of a unary JSON-RPC answer (its result).
+export function contextOfResponse(text: string): string {
+  try {
+    return contextOfResult(find(fields(text), "result") ?? "{}")
   } catch (e) {
     return ""
   }
@@ -492,41 +703,86 @@ test("agent names are lowercase, digits and single hyphens", () => {
   expect(validName("with space")).toBe(false)
 })
 
-test("the endpoint is the card's url, else its JSON-RPC interface", () => {
+test("the endpoints are the card's interfaces of each binding", () => {
   expect(endpointOf(`{"name":"a","url":"https://x.example.com/rpc"}`)).toBe("https://x.example.com/rpc")
   expect(endpointOf(`{"name":"a","supportedInterfaces":[{"url":"https://x.example.com/rest","protocolBinding":"HTTP+JSON"},{"url":"https://x.example.com/v1","protocolBinding":"JSONRPC"}]}`)).toBe("https://x.example.com/v1")
+  expect(restEndpointOf(`{"name":"a","supportedInterfaces":[{"url":"https://x.example.com/rest","protocolBinding":"HTTP+JSON"},{"url":"https://x.example.com/v1","protocolBinding":"JSONRPC"}]}`)).toBe("https://x.example.com/rest")
   expect(endpointOf(`{"name":"a","additionalInterfaces":[{"url":"https://x.example.com/t","transport":"JSONRPC"}]}`)).toBe("https://x.example.com/t")
   expect(endpointOf(`{"name":"a"}`)).toBe("")
   expect(endpointOf("not json")).toBe("")
+  // a v0.3 card whose own url is the REST one has no JSON-RPC endpoint
+  expect(endpointOf(`{"name":"a","url":"https://x.example.com/r","preferredTransport":"HTTP+JSON"}`)).toBe("")
+  expect(restEndpointOf(`{"name":"a","url":"https://x.example.com/r","preferredTransport":"HTTP+JSON"}`)).toBe("https://x.example.com/r")
 })
 
-test("the gateway card points at the gateway's JSON-RPC route and asks for the virtual key", () => {
-  const card = try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc","supportedInterfaces":[{"url":"https://agent.example.com/v1","protocolBinding":"JSONRPC"}]}`, "https://gw.example.com", "echo")
+test("the gateway card points at the gateway's JSON-RPC and REST routes and asks for the virtual key", () => {
+  const card = try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc","signatures":[{"protected":"x","signature":"y"}],"capabilities":{"streaming":true,"pushNotifications":true},"supportedInterfaces":[{"url":"https://agent.example.com/v1","protocolBinding":"JSONRPC"}]}`, "https://gw.example.com", "echo", true)
   expect(endpointOf(card)).toBe("https://gw.example.com/agents/a2a/echo/json-rpc")
-  expect(card.includes(`"supportedInterfaces":[{"url":"https://gw.example.com/agents/a2a/echo/json-rpc","protocolBinding":"JSONRPC"}]`)).toBe(true)
+  expect(restEndpointOf(card)).toBe("https://gw.example.com/agents/a2a/echo/rest")
+  expect(card.includes(`"supportedInterfaces":[{"url":"https://gw.example.com/agents/a2a/echo/json-rpc","protocolBinding":"JSONRPC","protocolVersion":"1.0"},{"url":"https://gw.example.com/agents/a2a/echo/rest","protocolBinding":"HTTP+JSON","protocolVersion":"1.0"}]`)).toBe(true)
   expect(card.includes(`"securitySchemes":{"bifrostVirtualKey":{"type":"apiKey","in":"header","name":"x-bf-vk"}}`)).toBe(true)
+  expect(card.includes("signatures")).toBe(false)
+  expect(card.includes(`"streaming":true`)).toBe(true)
+  expect(card.includes(`"pushNotifications":true`)).toBe(true)
   expect(rawStr(try fields(card), "name")).toBe("echo")
+  // push is advertised only when the gateway relays it and the agent can push
+  expect(try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc","capabilities":{"pushNotifications":true}}`, "https://gw.example.com", "echo", false).includes(`"pushNotifications":false`)).toBe(true)
+  expect(try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc"}`, "https://gw.example.com", "echo", true).includes(`"pushNotifications":false`)).toBe(true)
+  // a v0.3 card lists its additional interfaces
+  const old = try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc"}`, "https://gw.example.com", "echo", true)
+  expect(old.includes(`"additionalInterfaces":[{"url":"https://gw.example.com/agents/a2a/echo/json-rpc","transport":"JSONRPC"},{"url":"https://gw.example.com/agents/a2a/echo/rest","transport":"HTTP+JSON"}]`)).toBe(true)
+  expect(old.includes("supportedInterfaces")).toBe(false)
 })
 
-test("views show env references and mask stored header values", () => {
-  const a: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", virtual_key_ids: ["vk1"], runtime_auth: { type: "headers", headers: headersOf([["Authorization", "env.AGENT_TOKEN"], ["X-Key", "plain-secret"]]) }, card: `{"name":"echo","url":"https://a.example.com/rpc"}`, card_fetched_at: 5, created_at: 1, updated_at: 2 }
+test("the aggregated card lists the agents' skills under their names", () => {
+  const a: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", card: `{"name":"e","description":"Echoes","url":"https://a.example.com/rpc","capabilities":{"streaming":true},"skills":[{"id":"say","name":"Say","description":"d","tags":["t"]}]}` }
+  const b: AgentConfig = { name: "calc", agent_card_url: "https://b.example.com/card", card: `{"name":"c","url":"https://b.example.com/rpc","capabilities":{"pushNotifications":true},"skills":[{"id":"add","name":"Add"}]}` }
+  const none: AgentConfig = { name: "unfetched", agent_card_url: "https://c.example.com/card" }
+  const card = aggregateCard([a, b, none], "https://gw.example.com", true)
+  const cf = try fields(card)
+  expect(rawStr(cf, "name")).toBe("Raiju agent gateway")
+  expect(rawStr(cf, "url")).toBe("https://gw.example.com/agents/a2a")
+  expect(card.includes(`"id":"echo/say"`)).toBe(true)
+  expect(card.includes(`"id":"calc/add"`)).toBe(true)
+  expect(card.includes(`"tags":["t","echo"]`)).toBe(true)
+  expect(card.includes(`"capabilities":{"streaming":true,"pushNotifications":true}`)).toBe(true)
+  expect(card.includes(`"rest_url":"https://gw.example.com/agents/a2a/echo/rest"`)).toBe(true)
+  expect(card.includes("unfetched")).toBe(false)
+  expect(aggregateCard([], "https://gw.example.com", true).includes(`"agents":[]`)).toBe(true)
+})
+
+test("views show env references and mask stored secrets", () => {
+  const a: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", virtual_key_ids: ["vk1"], forward_accepted_credential: true, runtime_auth: { type: "headers", headers: headersOf([["Authorization", "env.AGENT_TOKEN"], ["X-Key", "plain-secret"]]) }, discovery_auth: { type: "oauth", oauth: { token_url: "https://idp.example.com/token", client_id: "cid-plain", client_secret: "env.AGENT_SECRET", scopes: ["a2a"] }, tls: { ca_cert_pem: "PEM-TEXT" } }, card: `{"name":"echo","url":"https://a.example.com/rpc"}`, card_fetched_at: 5, created_at: 1, updated_at: 2 }
   const view = agentView(a, "https://gw.example.com")
   expect(view.includes(`"headers":{"Authorization":"env.AGENT_TOKEN","X-Key":"********"}`)).toBe(true)
   expect(view.includes("plain-secret")).toBe(false)
+  expect(view.includes("cid-plain")).toBe(false)
+  expect(view.includes("PEM-TEXT")).toBe(false)
+  expect(view.includes(`"client_secret":"env.AGENT_SECRET"`)).toBe(true)
+  expect(view.includes(`"client_id":"********"`)).toBe(true)
+  expect(view.includes(`"scopes":["a2a"]`)).toBe(true)
   expect(view.includes(`"enabled":true`)).toBe(true)
+  expect(view.includes(`"forward_accepted_credential":true`)).toBe(true)
+  expect(view.includes(`"forward_accepted_credential_overrides_auth":false`)).toBe(true)
   expect(view.includes(`"virtual_key_ids":["vk1"]`)).toBe(true)
   expect(view.includes(`"endpoint":"https://a.example.com/rpc"`)).toBe(true)
   expect(view.includes(`"json_rpc_url":"https://gw.example.com/agents/a2a/echo/json-rpc"`)).toBe(true)
+  expect(view.includes(`"rest_url":"https://gw.example.com/agents/a2a/echo/rest"`)).toBe(true)
   expect(rawStr(try fields(view), "name")).toBe("echo")
 })
 
-test("a masked header keeps the stored value on replace; a new value replaces it", () => {
-  const old: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", runtime_auth: { type: "headers", headers: headersOf([["X-Key", "stored"]]) } }
-  const kept = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"headers","headers":{"X-Key":"********"}}}`), old)
+test("a masked secret keeps the stored value on replace; a new value replaces it", () => {
+  const old: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", runtime_auth: { type: "headers", headers: headersOf([["X-Key", "stored"]]) }, discovery_auth: { type: "oauth", oauth: { token_url: "https://idp.example.com/token", client_id: "stored-id", client_secret: "stored-secret" }, tls: { ca_cert_pem: "STORED-PEM" } } }
+  const kept = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"headers","headers":{"X-Key":"********"}},"discovery_auth":{"type":"oauth","oauth":{"token_url":"https://idp.example.com/token","client_id":"********","client_secret":"********"},"tls":{"ca_cert_pem":"********"}}}`), old)
   expect(kept.error).toBe("")
   expect(headerOf(kept.runtime, "X-Key")).toBe("stored")
+  expect(kept.discovery!.oauth!.client_id).toBe("stored-id")
+  expect(kept.discovery!.oauth!.client_secret).toBe("stored-secret")
+  expect(kept.discovery!.tls!.ca_cert_pem).toBe("STORED-PEM")
+  expect(authKey(kept.discovery) === authKey(old.discovery_auth)).toBe(true)
   const changed = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"headers","headers":{"X-Key":"fresh"}}}`), old)
   expect(headerOf(changed.runtime, "X-Key")).toBe("fresh")
+  expect(changed.discovery).toBeUndefined()
   const none = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card"}`), old)
   expect(none.runtime).toBeUndefined()
 })
@@ -538,9 +794,50 @@ test("a registration body is checked: URL, grants and auth", () => {
   expect(try draftOf(try fields(`{"agent_card_url":"http://127.0.0.1:1/card","allow_private_network":true}`), undefined).error).toBe("")
   expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","virtual_key_ids":["vk1","vk1"]}`), undefined).error.includes("duplicate")).toBe(true)
   expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"headers","headers":{}}}`), undefined).error.includes("header")).toBe(true)
-  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","discovery_auth":{"type":"oauth"}}`), undefined).error.includes("none or headers")).toBe(true)
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"headers","headers":{"Cookie":"x"}}}`), undefined).error.includes("forwardable")).toBe(true)
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","discovery_auth":{"type":"basic"}}`), undefined).error.includes("none, headers or oauth")).toBe(true)
   expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card"}`), undefined).enabled).toBe(true)
   expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","enabled":false}`), undefined).enabled).toBe(false)
+  const fwd = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","forward_accepted_credential":true,"forward_accepted_credential_overrides_auth":true}`), undefined)
+  expect(fwd.forward).toBe(true)
+  expect(fwd.forwardOver).toBe(true)
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","forward_accepted_credential":"yes"}`), undefined).error.includes("boolean")).toBe(true)
+})
+
+function draftError(body: string): string {
+  try {
+    return draftOf(fields(body), undefined).error
+  } catch (e) {
+    return "unreadable"
+  }
+}
+
+test("an OAuth auth needs a client and a token source; tls and schemes are checked", () => {
+  const ok = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"oauth","advanced":true,"security_schemes":["agentOauth"],"oauth":{"token_url":"https://idp.example.com/token","client_id":"id","client_secret":"s","scopes":["a","b"],"resource":"https://a.example.com"},"tls":{"ca_cert_pem":"PEM","insecure_skip_verify":false}}}`), undefined)
+  expect(ok.error).toBe("")
+  expect(ok.runtime!.type).toBe("oauth")
+  expect(ok.runtime!.oauth!.scopes!.length).toBe(2)
+  expect(ok.runtime!.oauth!.resource).toBe("https://a.example.com")
+  expect(ok.runtime!.advanced).toBe(true)
+  expect(ok.runtime!.security_schemes![0]!).toBe("agentOauth")
+  expect(ok.runtime!.tls!.ca_cert_pem).toBe("PEM")
+  expect(draftError(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"oauth"}}`).includes("oauth object")).toBe(true)
+  expect(draftError(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"oauth","oauth":{"token_url":"https://idp.example.com/token","client_id":"id"}}}`).includes("client_secret")).toBe(true)
+  expect(draftError(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"oauth","oauth":{"client_id":"id","client_secret":"s"}}}`).includes("token_url, discovery_url or provider_url")).toBe(true)
+  expect(draftError(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"oauth","oauth":{"token_url":"http://127.0.0.1:1/t","client_id":"id","client_secret":"s"}}}`).includes("token_url")).toBe(true)
+  expect(draftError(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"oauth","oauth":{"token_url":"https://idp.example.com/token","client_id":"id","client_secret":"s","scopes":[1]}}}`).includes("scopes")).toBe(true)
+  expect(draftError(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"none","security_schemes":["a","a"]}}`).includes("duplicate")).toBe(true)
+  expect(draftError(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"none","security_schemes":[" "]}}`).includes("empty name")).toBe(true)
+  expect(draftError(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"none","tls":{"client_cert_pem":"c"}}}`).includes("both")).toBe(true)
+  expect(draftError(`{"agent_card_url":"https://a.example.com/card","runtime_auth":{"type":"none","tls":{"ca_cert_pem":1}}}`).includes("string")).toBe(true)
+})
+
+test("JSON-RPC requests: the context a call belongs to", () => {
+  const body = `{"jsonrpc":"2.0","id":7,"method":"message/send","params":{"message":{"messageId":"m1","contextId":"ctx-9","role":"user","parts":[{"kind":"text","text":"hi"}]}}}`
+  expect(contextOfRequest(body)).toBe("ctx-9")
+  expect(contextOfRequest(`{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t1"}}`)).toBe("")
+  expect(contextOfParams(`{"contextId":"c5"}`)).toBe("c5")
+  expect(contextOfParams(`{"message":{"contextId":"c6"}}`)).toBe("c6")
 })
 
 test("grants: an identified key needs the grant or allow_by_default; anonymous calls pass", () => {
@@ -552,30 +849,10 @@ test("grants: an identified key needs the grant or allow_by_default; anonymous c
   expect(grantAllows(open, "vk2")).toBe(true)
 })
 
-test("JSON-RPC requests: method, id, and the context a call belongs to", () => {
-  const body = `{"jsonrpc":"2.0","id":7,"method":"message/send","params":{"message":{"messageId":"m1","contextId":"ctx-9","role":"user","parts":[{"kind":"text","text":"hi"}]}}}`
-  expect(a2aMethodOf(body)).toBe("message/send")
-  expect(rpcIdOf(body)).toBe("7")
-  expect(rpcIdOf(`{"jsonrpc":"2.0","method":"tasks/get"}`)).toBe("null")
-  expect(contextOfRequest(body)).toBe("ctx-9")
-  expect(contextOfRequest(`{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t1"}}`)).toBe("")
-  expect(a2aMethodOf("not json")).toBe("")
-  expect(isStreamMethod("message/stream")).toBe(true)
-  expect(isStreamMethod("SendStreamingMessage")).toBe(true)
-  expect(isStreamMethod("message/send")).toBe(false)
-  expect(A2A_METHODS.includes("tasks/cancel")).toBe(true)
-})
-
 test("the context of a unary answer comes from the task, the message or the result", () => {
   expect(contextOfResponse(`{"jsonrpc":"2.0","id":1,"result":{"kind":"task","id":"t1","contextId":"c1"}}`)).toBe("c1")
   expect(contextOfResponse(`{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"t1","contextId":"c2"}}}`)).toBe("c2")
   expect(contextOfResponse(`{"jsonrpc":"2.0","id":1,"result":{"message":{"contextId":"c3"}}}`)).toBe("c3")
   expect(contextOfResponse(`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no"}}`)).toBe("")
+  expect(contextOfResult(`{"task":{"contextId":"c4"}}`)).toBe("c4")
 })
-
-test("the runtime headers are the agent's header auth", () => {
-  const a: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", runtime_auth: { type: "headers", headers: headersOf([["Authorization", "Bearer t"]]) } }
-  expect(runtimeHeaders(a).get("Authorization")).toBe("Bearer t")
-  expect(runtimeHeaders({ name: "x", agent_card_url: "https://a.example.com/card" }).keys().length).toBe(0)
-})
-

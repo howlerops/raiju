@@ -1,0 +1,567 @@
+// A2A push notifications through the gateway (Bifrost's core/agent/push.go).
+//
+// A caller registers a callback for a task through the gateway. The agent is told a callback of the gateway's
+// own instead, with a token the gateway made for that config (ingress); the caller's callback, its token and
+// its credentials stay here. When the agent pushes an event, the gateway checks the token and that the event
+// is about the config's task, queues the event (202), and a relay sends it on to the caller's callback with the
+// caller's own token and credentials. A delivery that fails is retried with a doubling delay, up to six
+// attempts, and then given up. Delivery is at least once; a push the agent repeats is queued once.
+//
+// Configs and queued deliveries are kept in memory and in a file (logs_store folder) so they survive a restart.
+// The secrets in the file are sealed when the config has an encryption key. Each process has its own copy: a
+// push must reach the process that took the registration.
+import { readFileSync, writeFileSync, existsSync } from "node:fs"
+import { sha256, toHex, utf8, secureHex } from "./crypto"
+import { fields, find, rawStr, rawNum, quote } from "./json"
+import { isPrivateHost, isMetadataHost } from "./netguard"
+import { deadline } from "./deadline"
+import { pushEventTaskId } from "./a2a"
+import { isoMs } from "./exports"
+
+export const INGRESS_SUFFIX = "/push/callback"
+export const TOKEN_HEADER = "a2a-notification-token"
+export const MAX_ATTEMPTS = 6
+const BATCH = 16
+const LEASE_MS = 60000
+const SEND_TIMEOUT_MS = 30000
+const BASE_BACKOFF_MS = 1000
+const MAX_BACKOFF_MS = 300000
+const RETENTION_MS = 7 * 86400000
+const PENDING_TTL_MS = 3600000
+const MAX_PAYLOAD = 1048576
+export const PENDING_PREFIX = "__pending__:"
+
+// One registered callback. ingress is the SHA-256 of the token the agent was given for it.
+export type PushConfig = {
+  agent: string,
+  task: string,
+  id: string,
+  url: string,
+  token: string,
+  scheme: string,
+  credentials: string,
+  ingress: string,
+  created_at: int,
+  updated_at: int,
+}
+
+// One queued push. id is a digest of the agent, the config and the payload, so a repeat is not queued twice.
+export type PushDelivery = {
+  id: string,
+  agent: string,
+  task: string,
+  config: string,
+  payload: string,
+  status: string, // pending, delivered or dead
+  attempts: int,
+  next_at: int,
+  last_error: string,
+  created_at: int,
+  updated_at: int,
+}
+
+export type PushQuery = { agents: string[], task: string, config: string, url: string, limit: int, offset: int }
+
+function has(hay: string, needle: string): bool {
+  return needle === "" || hay.toLowerCase().includes(needle.toLowerCase())
+}
+
+function order(a: string, b: string): int {
+  if (a < b) return -1
+  if (a > b) return 1
+  return 0
+}
+
+// Newest update first; ties by agent, task and config id.
+function newestFirst(a: PushConfig, b: PushConfig): int {
+  if (a.updated_at !== b.updated_at) return b.updated_at - a.updated_at
+  const x = order(a.agent, b.agent)
+  if (x !== 0) return x
+  const y = order(a.task, b.task)
+  if (y !== 0) return y
+  return order(a.id, b.id)
+}
+
+export class PushStore {
+  configs: PushConfig[] = []
+  deliveries: PushDelivery[] = []
+  file = ""
+  // seals and opens the secrets kept in the file (identity when there is no key)
+  seal: (v: string) => string = (v: string): string => v
+  open: (v: string) => string = (v: string): string => v
+
+  // Loads the file (one JSON object per line) and writes every later change there.
+  persistTo(path: string): void {
+    this.file = path
+    if (!existsSync(path)) return
+    try {
+      for (const line of try readFileSync(path, "utf8").split("\n")) {
+        if (line === "") continue
+        try {
+          const fs = try fields(line)
+          const t = rawStr(fs, "t") ?? ""
+          const v = find(fs, "v") ?? ""
+          if (t === "c") {
+            const c = try JSON.parse(v) as PushConfig
+            this.configs.push({ agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.open(c.token), scheme: c.scheme, credentials: this.open(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at })
+          } else if (t === "d") {
+            this.deliveries.push(try JSON.parse(v) as PushDelivery)
+          }
+        } catch (e) {
+          continue
+        }
+      }
+    } catch (e) {
+      console.error(`raiju: a2a push: could not read ${path}: ${e.message}`)
+    }
+  }
+
+  save(): void {
+    if (this.file === "") return
+    try {
+      let text = ""
+      for (const c of this.configs) {
+        const sealed: PushConfig = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.seal(c.token), scheme: c.scheme, credentials: this.seal(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
+        text += `{"t":"c","v":${JSON.stringify(sealed)}}\n`
+      }
+      for (const d of this.deliveries) text += `{"t":"d","v":${JSON.stringify(d)}}\n`
+      try writeFileSync(this.file, text)
+    } catch (e) {
+      console.error(`raiju: a2a push: could not write ${this.file}: ${e.message}`)
+    }
+  }
+
+  indexOfConfig(agent: string, task: string, id: string): int {
+    for (let i = 0; i < this.configs.length; i++) {
+      const c = this.configs[i]!
+      if (c.agent === agent && c.task === task && c.id === id) return i
+    }
+    return -1
+  }
+
+  // Adds a config, or replaces the one with the same agent, task and id (keeping when it was created).
+  saveConfig(c: PushConfig): void {
+    const i = this.indexOfConfig(c.agent, c.task, c.id)
+    if (i >= 0) {
+      const old = this.configs[i]!
+      this.configs[i] = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: c.token, scheme: c.scheme, credentials: c.credentials, ingress: c.ingress, created_at: old.created_at, updated_at: c.updated_at }
+    } else {
+      this.configs.push(c)
+    }
+    this.save()
+  }
+
+  config(agent: string, task: string, id: string): PushConfig | undefined {
+    const i = this.indexOfConfig(agent, task, id)
+    return i < 0 ? undefined : this.configs[i]!
+  }
+
+  byIngress(agent: string, hash: string): PushConfig | undefined {
+    for (const c of this.configs) {
+      if (c.agent === agent && c.ingress === hash) return c
+    }
+    return undefined
+  }
+
+  forTask(agent: string, task: string): PushConfig[] {
+    return this.configs.filter((c) => c.agent === agent && c.task === task)
+  }
+
+  // Removes a config. Whether one was there.
+  remove(agent: string, task: string, id: string): bool {
+    const i = this.indexOfConfig(agent, task, id)
+    if (i < 0) return false
+    this.configs = this.configs.filter((c) => !(c.agent === agent && c.task === task && c.id === id))
+    this.save()
+    return true
+  }
+
+  // Removes an embedded config that no push has bound to a task yet.
+  removePending(agent: string, hash: string, pendingTask: string): bool {
+    const before = this.configs.length
+    this.configs = this.configs.filter((c) => !(c.agent === agent && c.ingress === hash && c.task === pendingTask))
+    if (this.configs.length === before) return false
+    this.save()
+    return true
+  }
+
+  // Binds an embedded config to the task its first push (or its send) named. A config of the same id
+  // already on that task is replaced.
+  bind(agent: string, hash: string, pendingTask: string, task: string): void {
+    let id = ""
+    for (const c of this.configs) {
+      if (c.agent === agent && c.ingress === hash && c.task === pendingTask) id = c.id
+    }
+    if (id === "") return
+    this.configs = this.configs.filter((c) => !(c.agent === agent && c.task === task && c.id === id))
+    for (let i = 0; i < this.configs.length; i++) {
+      const c = this.configs[i]!
+      if (c.agent === agent && c.ingress === hash && c.task === pendingTask) this.configs[i] = { agent: c.agent, task: task, id: c.id, url: c.url, token: c.token, scheme: c.scheme, credentials: c.credentials, ingress: c.ingress, created_at: c.created_at, updated_at: Math.floor(Date.now()) }
+    }
+    this.save()
+  }
+
+  // The configs a management page shows, newest update first, and how many match before the page is cut.
+  page(q: PushQuery): { rows: PushConfig[], total: int } {
+    const hits = this.configs.filter((c) => (q.agents.length === 0 || q.agents.includes(c.agent)) && has(c.task, q.task) && has(c.id, q.config) && has(c.url, q.url))
+    hits.sort(newestFirst)
+    return { rows: hits.slice(q.offset, q.offset + q.limit), total: hits.length }
+  }
+
+  agentNames(): string[] {
+    const out: string[] = []
+    for (const c of this.configs) {
+      if (!out.includes(c.agent)) out.push(c.agent)
+    }
+    out.sort(order)
+    return out
+  }
+
+  // Queues a delivery unless one with the same id is there. Whether it was new.
+  addDelivery(d: PushDelivery): bool {
+    for (const x of this.deliveries) {
+      if (x.id === d.id) return false
+    }
+    this.deliveries.push(d)
+    this.save()
+    return true
+  }
+
+  delivery(id: string): PushDelivery | undefined {
+    for (const d of this.deliveries) {
+      if (d.id === id) return d
+    }
+    return undefined
+  }
+
+  // The deliveries due now, oldest first.
+  due(now: int, limit: int): PushDelivery[] {
+    const hits = this.deliveries.filter((d) => d.status === "pending" && d.next_at <= now)
+    hits.sort((a, b) => a.next_at - b.next_at)
+    return hits.slice(0, limit)
+  }
+
+  setDelivery(d: PushDelivery): void {
+    for (let i = 0; i < this.deliveries.length; i++) {
+      if (this.deliveries[i]!.id === d.id) this.deliveries[i] = d
+    }
+    this.save()
+  }
+
+  // Drops finished deliveries after a week, embedded configs no push ever bound after an hour, and the
+  // configs of agents that are no longer registered.
+  prune(now: int, agents: string[]): void {
+    const before = this.configs.length + this.deliveries.length
+    this.deliveries = this.deliveries.filter((d) => d.status === "pending" || now - d.updated_at < RETENTION_MS)
+    this.configs = this.configs.filter((c) => agents.includes(c.agent) && !(c.task.startsWith(PENDING_PREFIX) && now - c.created_at > PENDING_TTL_MS))
+    if (this.configs.length + this.deliveries.length !== before) this.save()
+  }
+}
+
+let storeInstance: PushStore | undefined = undefined
+
+// The process's push store (created on first use: top-level statements in imported modules do not run).
+export function pushStore(): PushStore {
+  let s = storeInstance
+  if (s === undefined) {
+    s = new PushStore()
+    storeInstance = s
+  }
+  return s
+}
+
+// A token for one config, and the digest that is kept in its place.
+export function mintToken(): { token: string, hash: string } throws Error {
+  const token = try secureHex(32)
+  return { token: token, hash: hashToken(token) }
+}
+
+export function hashToken(token: string): string {
+  return toHex(sha256(utf8(token)))
+}
+
+// Why a callback URL is refused ("" when it is fine): it must be an absolute http(s) URL without credentials,
+// and not a private or metadata address unless private callbacks are allowed.
+export function callbackProblem(raw: string, allowPrivate: bool): string {
+  const u = URL.parse(raw)
+  if (u === undefined || (u.protocol !== "http:" && u.protocol !== "https:") || u.hostname === "") return "push config url must be an absolute HTTP(S) URL without user info"
+  const authority = u.href.slice(u.protocol.byteLength + 2).split("/")[0] ?? ""
+  if (authority.includes("@")) return "push config url must be an absolute HTTP(S) URL without user info"
+  if (isMetadataHost(u.hostname)) return "push config url points at a link-local or metadata address"
+  if (!allowPrivate && isPrivateHost(u.hostname)) return "push config url points at a private address; set server.a2a_allow_private_push_callbacks to allow it"
+  return ""
+}
+
+export type Accepted = { status: int, error: string, deliveryId: string }
+
+function refuse(status: int, error: string): Accepted {
+  return { status: status, error: error, deliveryId: "" }
+}
+
+// The ingress: one event pushed by an agent. The token authenticates it (nothing else does), the event must be
+// about the config's task, and an embedded config that no event has bound yet is bound to the task of its first.
+// 202 means queued, not delivered.
+export function acceptPush(store: PushStore, agent: string, token: string, body: string, now: int): Accepted {
+  if (body.byteLength > MAX_PAYLOAD) return refuse(413, "push payload exceeds size limit")
+  if (token === "") return refuse(401, "push ingress token is required")
+  const hash = hashToken(token)
+  const cfg = store.byIngress(agent, hash)
+  if (cfg === undefined) return refuse(401, "push ingress token is not recognized")
+  const task = pushEventTaskId(body)
+  if (task === "" && !cfg.task.startsWith(PENDING_PREFIX)) return refuse(400, "push payload is not a valid A2A event")
+  let taskId = cfg.task
+  if (taskId.startsWith(PENDING_PREFIX)) {
+    if (task === "") return refuse(400, "pushed event does not carry a task id")
+    store.bind(agent, hash, taskId, task)
+    taskId = task
+  } else if (task !== taskId) {
+    return refuse(400, "pushed event does not address the configured task")
+  }
+  const id = toHex(sha256(utf8(agent + "\u0000" + cfg.id + "\u0000" + body)))
+  store.addDelivery({ id: id, agent: agent, task: taskId, config: cfg.id, payload: body, status: "pending", attempts: 0, next_at: now, last_error: "", created_at: now, updated_at: now })
+  return { status: 202, error: "", deliveryId: id }
+}
+
+// The delay before attempt number n+1, after n failed attempts.
+export function backoffMs(attempts: int): int {
+  let wait = BASE_BACKOFF_MS
+  for (let i = 1; i < attempts && wait < MAX_BACKOFF_MS; i++) wait = wait * 2
+  return wait > MAX_BACKOFF_MS ? MAX_BACKOFF_MS : wait
+}
+
+// One send to the caller's callback: the event as application/a2a+json, with the caller's own token and
+// credentials. Redirects are not followed. "" on a 2xx, else the reason.
+async function sendOnce(cfg: PushConfig, payload: string, allowPrivate: bool): Promise<string> {
+  const bad = callbackProblem(cfg.url, allowPrivate)
+  if (bad !== "") return bad
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/a2a+json")
+  if (cfg.token !== "") h.set(TOKEN_HEADER, cfg.token)
+  if (cfg.credentials !== "") {
+    const s = cfg.scheme.toLowerCase()
+    if (s === "bearer") h.set("authorization", "Bearer " + cfg.credentials)
+    else if (s === "basic") h.set("authorization", "Basic " + cfg.credentials)
+  }
+  const dl = deadline(SEND_TIMEOUT_MS)
+  try {
+    const r = await fetch(cfg.url, { method: "POST", headers: h, body: payload, signal: dl.controller.signal, redirect: "manual" })
+    try {
+      await r.text()
+    } catch (e) {
+      // the answer's body does not matter
+    }
+    dl.finish()
+    if (r.status < 200 || r.status >= 300) return `push delivery endpoint returned HTTP status ${r.status}`
+    return ""
+  } catch (e) {
+    dl.finish()
+    return `send push delivery: ${e.message}`
+  }
+}
+
+function clip(s: string): string {
+  return s.byteLength > 512 ? s.slice(0, 512) : s
+}
+
+// Sends what is due. A delivery is leased for a minute while it is tried, so another pass does not send it too.
+// After the attempt it is delivered, set to try again later, or dead (six attempts, or its config is gone).
+// seen is told about each attempt (the delivery, the error or "", and how long the send took).
+export async function deliverDue(store: PushStore, allowPrivate: bool, now: int, seen: (d: PushDelivery, err: string, ms: int) => void): Promise<int> {
+  const due = store.due(now, BATCH)
+  let done = 0
+  for (const d of due) {
+    store.setDelivery({ id: d.id, agent: d.agent, task: d.task, config: d.config, payload: d.payload, status: d.status, attempts: d.attempts, next_at: now + LEASE_MS, last_error: d.last_error, created_at: d.created_at, updated_at: d.updated_at })
+    const cfg = store.config(d.agent, d.task, d.config)
+    let err = ""
+    let gone = false
+    const t0 = Date.now()
+    if (cfg === undefined) {
+      err = "push configuration no longer exists"
+      gone = true
+    } else {
+      err = await sendOnce(cfg, d.payload, allowPrivate)
+    }
+    const at = Math.floor(Date.now())
+    const attempts = d.attempts + 1
+    let status = "pending"
+    let next = at
+    if (err === "") status = "delivered"
+    else if (gone || attempts >= MAX_ATTEMPTS) status = "dead"
+    else next = at + backoffMs(attempts)
+    if (status === "dead") console.error(`raiju: a2a push delivery ${d.id} (agent ${d.agent}) gave up after ${attempts} attempts: ${err}`)
+    seen(d, err, Math.floor(Date.now() - t0))
+    store.setDelivery({ id: d.id, agent: d.agent, task: d.task, config: d.config, payload: d.payload, status: status, attempts: attempts, next_at: next, last_error: clip(err), created_at: d.created_at, updated_at: at })
+    done += 1
+  }
+  return done
+}
+
+// A config as the management API lists it: no token, no credentials.
+export function configView(c: PushConfig): string {
+  return `{"agent_name":${quote(c.agent)},"task_id":${quote(c.task)},"config_id":${quote(c.id)},"url":${quote(c.url)},"created_at":${quote(isoOf(c.created_at))},"updated_at":${quote(isoOf(c.updated_at))}}`
+}
+
+function isoOf(ms: int): string {
+  return isoMs(ms)
+}
+
+// ---- tests ----
+
+function cfg(agent: string, task: string, id: string, hash: string): PushConfig {
+  return { agent: agent, task: task, id: id, url: "https://cb.example/h", token: "t", scheme: "", credentials: "", ingress: hash, created_at: 1000, updated_at: 1000 }
+}
+
+test("a pushed event is queued once for the config its token names", () => {
+  const s = new PushStore()
+  const m = try mintToken()
+  s.saveConfig(cfg("echo", "t1", "c1", m.hash))
+  const body = `{"task":{"id":"t1","status":{"state":"completed"}}}`
+  const a = acceptPush(s, "echo", m.token, body, 5000)
+  expect(a.status).toBe(202)
+  expect(s.deliveries.length).toBe(1)
+  expect(s.deliveries[0]!.task).toBe("t1")
+  expect(s.deliveries[0]!.config).toBe("c1")
+  // the agent repeating itself queues nothing new
+  const b = acceptPush(s, "echo", m.token, body, 5001)
+  expect(b.status).toBe(202)
+  expect(b.deliveryId).toBe(a.deliveryId)
+  expect(s.deliveries.length).toBe(1)
+  // another event is another delivery
+  acceptPush(s, "echo", m.token, `{"statusUpdate":{"taskId":"t1"}}`, 5002)
+  expect(s.deliveries.length).toBe(2)
+})
+
+test("the ingress refuses a missing or wrong token, a wrong task, a bad event and a big body", () => {
+  const s = new PushStore()
+  const m = try mintToken()
+  s.saveConfig(cfg("echo", "t1", "c1", m.hash))
+  expect(acceptPush(s, "echo", "", `{"task":{"id":"t1"}}`, 1).status).toBe(401)
+  expect(acceptPush(s, "echo", "nope", `{"task":{"id":"t1"}}`, 1).status).toBe(401)
+  expect(acceptPush(s, "other", m.token, `{"task":{"id":"t1"}}`, 1).status).toBe(401)
+  expect(acceptPush(s, "echo", m.token, `{"task":{"id":"t2"}}`, 1).status).toBe(400)
+  expect(acceptPush(s, "echo", m.token, "not json", 1).status).toBe(400)
+  expect(acceptPush(s, "echo", m.token, "x".repeat(1048577), 1).status).toBe(413)
+  expect(s.deliveries.length).toBe(0)
+})
+
+test("an embedded config is bound to the task of the first push", () => {
+  const s = new PushStore()
+  const m = try mintToken()
+  s.saveConfig(cfg("echo", PENDING_PREFIX + "abc", "c1", m.hash))
+  expect(acceptPush(s, "echo", m.token, `{"message":{"messageId":"x"}}`, 1).status).toBe(400)
+  expect(acceptPush(s, "echo", m.token, `{"task":{"id":"t7"}}`, 2).status).toBe(202)
+  expect(s.config("echo", "t7", "c1")!.id).toBe("c1")
+  expect(s.config("echo", PENDING_PREFIX + "abc", "c1")).toBeUndefined()
+  expect(s.deliveries[0]!.task).toBe("t7")
+  // a send that made no task drops its pending config
+  const m2 = try mintToken()
+  s.saveConfig(cfg("echo", PENDING_PREFIX + "def", "c2", m2.hash))
+  expect(s.removePending("echo", m2.hash, PENDING_PREFIX + "def")).toBe(true)
+  expect(s.removePending("echo", m2.hash, PENDING_PREFIX + "def")).toBe(false)
+  // a send that made a task binds it
+  const m3 = try mintToken()
+  s.saveConfig(cfg("echo", PENDING_PREFIX + "ghi", "c3", m3.hash))
+  s.bind("echo", m3.hash, PENDING_PREFIX + "ghi", "t9")
+  expect(s.config("echo", "t9", "c3")!.url).toBe("https://cb.example/h")
+})
+
+test("a config is replaced by one with the same ids, and removed once", () => {
+  const s = new PushStore()
+  s.saveConfig(cfg("echo", "t1", "c1", "h1"))
+  const moved = cfg("echo", "t1", "c1", "h2")
+  moved.updated_at = 2000
+  moved.created_at = 2000
+  s.saveConfig(moved)
+  expect(s.configs.length).toBe(1)
+  expect(s.configs[0]!.ingress).toBe("h2")
+  expect(s.configs[0]!.created_at).toBe(1000)
+  expect(s.forTask("echo", "t1").length).toBe(1)
+  expect(s.remove("echo", "t1", "c1")).toBe(true)
+  expect(s.remove("echo", "t1", "c1")).toBe(false)
+})
+
+test("the management page filters, sorts and counts", () => {
+  const s = new PushStore()
+  const a = cfg("alpha", "task-1", "c1", "h1")
+  a.updated_at = 3000
+  const b = cfg("beta", "task-2", "c2", "h2")
+  b.updated_at = 2000
+  b.url = "https://other.example/x"
+  const c = cfg("alpha", "task-3", "c3", "h3")
+  c.updated_at = 1000
+  s.saveConfig(a)
+  s.saveConfig(b)
+  s.saveConfig(c)
+  const all = s.page({ agents: [], task: "", config: "", url: "", limit: 25, offset: 0 })
+  expect(all.total).toBe(3)
+  expect(all.rows.map((r) => r.id).join(",")).toBe("c1,c2,c3")
+  expect(s.page({ agents: ["alpha"], task: "", config: "", url: "", limit: 25, offset: 0 }).total).toBe(2)
+  expect(s.page({ agents: [], task: "TASK-2", config: "", url: "", limit: 25, offset: 0 }).rows[0]!.id).toBe("c2")
+  expect(s.page({ agents: [], task: "", config: "", url: "other", limit: 25, offset: 0 }).total).toBe(1)
+  const cut = s.page({ agents: [], task: "", config: "", url: "", limit: 1, offset: 1 })
+  expect(cut.total).toBe(3)
+  expect(cut.rows[0]!.id).toBe("c2")
+  expect(s.agentNames().join(",")).toBe("alpha,beta")
+  expect(configView(a).includes("token")).toBe(false)
+  expect(configView(a).includes(`"config_id":"c1"`)).toBe(true)
+})
+
+test("retries wait twice as long each time, up to five minutes", () => {
+  expect(backoffMs(1)).toBe(1000)
+  expect(backoffMs(2)).toBe(2000)
+  expect(backoffMs(5)).toBe(16000)
+  expect(backoffMs(12)).toBe(300000)
+})
+
+test("callbacks must be http or https without credentials, and public unless allowed", () => {
+  expect(callbackProblem("https://cb.example/hook", false)).toBe("")
+  expect(callbackProblem("http://cb.example/hook", false)).toBe("")
+  expect(callbackProblem("ftp://cb.example/hook", false).includes("HTTP(S)")).toBe(true)
+  expect(callbackProblem("https://user:pw@cb.example/hook", false).includes("user info")).toBe(true)
+  expect(callbackProblem("http://127.0.0.1:9/hook", false).includes("private")).toBe(true)
+  expect(callbackProblem("http://127.0.0.1:9/hook", true)).toBe("")
+  expect(callbackProblem("http://169.254.169.254/latest", true).includes("metadata")).toBe(true)
+  expect(callbackProblem("nope", false).includes("HTTP(S)")).toBe(true)
+})
+
+test("finished deliveries, unbound embedded configs and configs of removed agents are pruned", () => {
+  const s = new PushStore()
+  const base = 100000000000
+  s.saveConfig(cfg("echo", "t1", "c1", "h1"))
+  s.saveConfig(cfg("gone", "t1", "c1", "h2"))
+  const late = cfg("echo", PENDING_PREFIX + "x", "c2", "h3")
+  late.created_at = base
+  s.saveConfig(late)
+  s.addDelivery({ id: "old", agent: "echo", task: "t1", config: "c1", payload: "{}", status: "delivered", attempts: 1, next_at: 0, last_error: "", created_at: 0, updated_at: 0 })
+  s.addDelivery({ id: "wait", agent: "echo", task: "t1", config: "c1", payload: "{}", status: "pending", attempts: 0, next_at: 0, last_error: "", created_at: 0, updated_at: 0 })
+  s.prune(base + 2 * 3600000, ["echo"])
+  expect(s.configs.length).toBe(1)
+  expect(s.configs[0]!.id).toBe("c1")
+  expect(s.deliveries.length).toBe(1)
+  expect(s.deliveries[0]!.id).toBe("wait")
+})
+
+test("secrets are sealed in the file and opened on load", () => {
+  const path = "/tmp/raiju-a2apush-test-" + (try secureHex(6)) + ".jsonl"
+  const s = new PushStore()
+  s.seal = (v: string): string => (v === "" ? v : "sealed:" + v)
+  s.open = (v: string): string => (v.startsWith("sealed:") ? v.slice(7) : v)
+  s.persistTo(path)
+  const c = cfg("echo", "t1", "c1", "h1")
+  c.token = "cb-token"
+  c.credentials = "cb-cred"
+  s.saveConfig(c)
+  s.addDelivery({ id: "d1", agent: "echo", task: "t1", config: "c1", payload: `{"task":{"id":"t1"}}`, status: "pending", attempts: 0, next_at: 0, last_error: "", created_at: 0, updated_at: 0 })
+  const text = try readFileSync(path, "utf8")
+  expect(text.includes("sealed:cb-token")).toBe(true)
+  expect(text.includes(`"token":"cb-token"`)).toBe(false)
+  const back = new PushStore()
+  back.seal = s.seal
+  back.open = s.open
+  back.persistTo(path)
+  expect(back.configs.length).toBe(1)
+  expect(back.configs[0]!.token).toBe("cb-token")
+  expect(back.configs[0]!.credentials).toBe("cb-cred")
+  expect(back.deliveries.length).toBe(1)
+  try writeFileSync(path, "")
+})

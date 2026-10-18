@@ -1,8 +1,9 @@
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show } from "solid-js"
 import type { JSX } from "@solidjs/web"
 import { api, send } from "../api/client"
+import { can } from "../perm"
 import { fmtInt, fmtMoney } from "../fmt"
-import { DangerButton, ErrP, FormError, Mono, notify, Table, Toolbar, useFormRun } from "../ui"
+import { Can, DangerButton, ErrP, FormError, Mono, notify, Table, Toolbar, useFormRun } from "../ui"
 
 interface FieldSpec {
   name: string
@@ -29,6 +30,12 @@ interface Spec<T extends Row> {
   fields: FieldSpec[]
   load: () => Promise<T[]>
   columns: Column<T>[]
+}
+
+// The permission resource of a governance collection (rbac.tov resourceOf)
+function resourceOf(path: string): string {
+  const coll = path.split("/").pop() ?? ""
+  return coll === "teams" ? "Teams" : coll === "customers" ? "Customers" : "Governance"
 }
 
 const dash = (v: unknown): string => (v === undefined || v === null || v === "" ? "—" : String(v))
@@ -162,7 +169,10 @@ function Crud(props: { spec: Spec<Row>; version: () => number }) {
   return (
     <section class="card" aria-label={spec.title}>
       <h2>{spec.title}</h2>
-      <form class="form-grid" ref={(el) => (form = el)} onSubmit={submit}>
+      <Show when={!can(resourceOf(spec.path), "Create") && !can(resourceOf(spec.path), "Update")}>
+        <p class="hint">Your role can read this list but not change it.</p>
+      </Show>
+      <form class="form-grid" ref={(el) => (form = el)} onSubmit={submit} hidden={!can(resourceOf(spec.path), "Create") && !can(resourceOf(spec.path), "Update")}>
         <For each={spec.fields}>
           {(f) => (
             <label>
@@ -201,18 +211,22 @@ function Crud(props: { spec: Spec<Row>; version: () => number }) {
                       <For each={spec.columns}>{(c) => <td>{c.get(row())}</td>}</For>
                       <td>
                         <span class="row-actions">
-                          <button type="button" class="ghost" onClick={() => startEdit(row())}>
-                            Edit
-                          </button>
-                          <DangerButton
-                            label="Delete"
-                            action={async () => {
-                              await send("DELETE", spec.path + "/" + encodeURIComponent(String(row().id)))
-                              notify(spec.noun + " deleted", "ok")
-                              if (editing() && String(editing()!.id) === String(row().id)) reset()
-                              refresh(items)
-                            }}
-                          />
+                          <Can resource={resourceOf(spec.path)} op="Update">
+                            <button type="button" class="ghost" onClick={() => startEdit(row())}>
+                              Edit
+                            </button>
+                          </Can>
+                          <Can resource={resourceOf(spec.path)} op="Delete">
+                            <DangerButton
+                              label="Delete"
+                              action={async () => {
+                                await send("DELETE", spec.path + "/" + encodeURIComponent(String(row().id)))
+                                notify(spec.noun + " deleted", "ok")
+                                if (editing() && String(editing()!.id) === String(row().id)) reset()
+                                refresh(items)
+                              }}
+                            />
+                          </Can>
                         </span>
                       </td>
                     </tr>

@@ -1,6 +1,7 @@
 import { createSignal, For, Match, onSettled, Show, Switch, Errored } from "solid-js"
 import { api, send, ApiError } from "./api/client"
-import { clearSignIn, closeSignIn, dialog, openSignIn, tokenSet } from "./auth"
+import { clearSignIn, closeSignIn, dialog, onTokenChange, openSignIn, tokenSet } from "./auth"
+import { can, me, refreshMe, roleLabel } from "./perm"
 import { Pill, Toasts, type Tone } from "./ui"
 import { Overview } from "./screens/Overview"
 import { Live } from "./screens/Live"
@@ -9,19 +10,24 @@ import { Keys } from "./screens/Keys"
 import { Governance } from "./screens/Governance"
 import { Logs } from "./screens/Logs"
 import { Mcp } from "./screens/Mcp"
+import { McpAccess } from "./screens/McpAccess"
+import { VirtualMcp } from "./screens/VirtualMcp"
 import { Config } from "./screens/Config"
 import { Playground } from "./screens/Playground"
 
+// [id, label, the resource a role needs to see it (any role may open "")]
 const VIEWS = [
-  ["overview", "Overview"],
-  ["live", "Live"],
-  ["providers", "Providers"],
-  ["keys", "Virtual keys"],
-  ["governance", "Budgets & limits"],
-  ["logs", "Logs"],
-  ["mcp", "MCP"],
-  ["config", "Config"],
-  ["playground", "Playground"],
+  ["overview", "Overview", ""],
+  ["live", "Live", "Logs"],
+  ["providers", "Providers", "ModelProvider"],
+  ["keys", "Virtual keys", "VirtualKeys"],
+  ["governance", "Budgets & limits", "Governance"],
+  ["logs", "Logs", "Logs"],
+  ["mcp", "MCP", "MCPGateway"],
+  ["mcpaccess", "MCP access", "MCPGateway"],
+  ["vmcp", "Virtual MCPs", "MCPGateway"],
+  ["config", "Config", "Settings"],
+  ["playground", "Playground", ""],
 ] as const
 
 type ViewId = (typeof VIEWS)[number][0]
@@ -103,6 +109,8 @@ export function App() {
   onSettled(() => {
     const onHash = () => setView(viewFromHash())
     window.addEventListener("hashchange", onHash)
+    onTokenChange(() => void refreshMe())
+    void refreshMe()
     void checkHealth()
     api
       .get("/api/oidc/status")
@@ -137,6 +145,13 @@ export function App() {
           <span id="health-pill" class={["pill", health().tone]} role="status">
             {health().text}
           </span>
+          <Show when={me()}>
+            {(m) => (
+              <span id="role-pill" class="pill" title="The role of the signed-in caller">
+                {roleLabel(m())}
+              </span>
+            )}
+          </Show>
           <button
             type="button"
             id="token-btn"
@@ -151,9 +166,11 @@ export function App() {
       <nav class="tabs" aria-label="Sections">
         <For each={VIEWS}>
           {(v) => (
-            <a href={"#" + v[0]} data-nav={v[0]} aria-current={view() === v[0] ? "page" : undefined}>
-              {v[1]}
-            </a>
+            <Show when={v[2] === "" || can(v[2])}>
+              <a href={"#" + v[0]} data-nav={v[0]} aria-current={view() === v[0] ? "page" : undefined}>
+                {v[1]}
+              </a>
+            </Show>
           )}
         </For>
       </nav>
@@ -192,6 +209,12 @@ export function App() {
             </Match>
             <Match when={view() === "mcp"}>
               <Mcp />
+            </Match>
+            <Match when={view() === "mcpaccess"}>
+              <McpAccess />
+            </Match>
+            <Match when={view() === "vmcp"}>
+              <VirtualMcp />
             </Match>
             <Match when={view() === "config"}>
               <Config />

@@ -1,33 +1,52 @@
 // Drives the web UI (web/, embedded in the gateway) in headless Chromium against a real gateway
 // and the mock upstream. Run: NODE_PATH=$(npm root -g) node tests/ui_e2e.mjs   (make ui)
 // Needs build/raiju and build/mock_upstream (make ui builds both) and the committed src/ui_assets.tov.
-// Ports 18107 (gateway) and 18108 (mock upstream) are reserved for this file.
-import { spawn } from "node:child_process"
+// Ports 18107 (gateway) and 18108 (mock upstream) are reserved for this file; UI_E2E_PORT=n uses n and n+1.
+import { spawn, execFileSync } from "node:child_process"
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createRequire } from "node:module"
+import { createHash, randomBytes } from "node:crypto"
 
 const require = createRequire(import.meta.url)
 const { chromium } = require("playwright")
 const root = join(dirname(fileURLToPath(import.meta.url)), "..")
-const GW = "http://127.0.0.1:18107"
-const MOCK = "http://127.0.0.1:18108"
+const PORT = Number(process.env.UI_E2E_PORT ?? 18107)
+const GW = `http://127.0.0.1:${PORT}`
+const MOCK = `http://127.0.0.1:${PORT + 1}`
 const ADMIN = { authorization: "Bearer admin-secret" }
 const dir = mkdtempSync(join(tmpdir(), "raiju-ui-"))
 const config = join(dir, "config.json")
+// the MCP authorization server needs a signing key to validate a saved configuration
+const signingKey = execFileSync("openssl", ["genrsa", "2048"], { stdio: ["ignore", "pipe", "ignore"] }).toString()
 writeFileSync(config, JSON.stringify({
-  client: { enable_logging: false, enforce_auth_on_inference: false },
+  client: { enable_logging: false, enforce_auth_on_inference: false, mcp_server_auth_mode: "both", mcp_enable_temp_token_auth: true, oauth2_server_config: { issuer_url: GW, signing_key: signingKey } },
   providers: { openai: { keys: [{ name: "main", value: "sk-ui-test", models: [], weight: 1 }], network_config: { base_url: MOCK } } },
-  governance: { auth_config: { token: "admin-secret" }, budgets: [{ id: "monthly", max_limit: 50, reset_duration: "1M" }] },
-  mcp: { client_configs: [{ name: "local", connection_type: "stdio", stdio_config: { command: "python3", args: [join(root, "tests/mcp_stdio.py")] } }] },
+  governance: {
+    auth_config: { token: "admin-secret" },
+    budgets: [{ id: "monthly", max_limit: 50, reset_duration: "1M" }],
+    virtual_keys: [
+      { id: "vk-ui-oauth", value: "sk-bf-ui-oauth", mcp_configs: [{ mcp_client_name: "local", tools_to_execute: ["*"] }] },
+      { id: "vk-po-a", value: "sk-bf-po-a", mcp_configs: [{ mcp_client_name: "po", tools_to_execute: ["*"] }] },
+    ],
+  },
+  mcp: {
+    tool_sync_interval: "1h",
+    oauth_private_allowlist: ["127.0.0.1"],
+    client_configs: [
+      { name: "local", connection_type: "stdio", stdio_config: { command: "python3", args: [join(root, "tests/mcp_stdio.py")] } },
+      { name: "po", connection_type: "http", connection_string: MOCK + "/mcp-peruser-oauth", auth_type: "per_user_oauth", auth: { type: "oauth" } },
+      { name: "tenant", connection_type: "http", connection_string: MOCK + "/mcp-peruser", auth_type: "per_user_headers", per_user_header_keys: ["x-tenant"] },
+    ],
+  },
   logs_store: { enabled: true, dir: join(dir, "logs") },
 }))
 
 const procs = [
-  spawn(join(root, "build/mock_upstream"), [], { env: { ...process.env, MOCK_PORT: "18108" }, stdio: "ignore" }),
-  spawn(join(root, "build/raiju"), ["-port", "18107", "-host", "127.0.0.1", "-config", config, "-server", process.env.RAIJU_SERVER ?? "bun"], { stdio: "ignore" }),
+  spawn(join(root, "build/mock_upstream"), [], { env: { ...process.env, MOCK_PORT: String(PORT + 1) }, stdio: "ignore" }),
+  spawn(join(root, "build/raiju"), ["-port", String(PORT), "-host", "127.0.0.1", "-config", config, "-server", process.env.RAIJU_SERVER ?? "bun"], { stdio: "ignore" }),
 ]
 const fails = []
 const check = (name, ok, detail = "") => {
@@ -98,7 +117,7 @@ try {
   // 401s before the sign-in and the 400s of rejected inputs are expected; anything else on the console (a CSP violation, a Solid warning) is not
   page.on("console", (m) => {
     if (m.type() !== "error" && m.type() !== "warning") return
-    if (/status of (400|401|404)/.test(m.text())) return
+    if (/status of (400|401|404|422)/.test(m.text())) return
     errors.push(m.type() + ": " + m.text())
   })
 
@@ -137,6 +156,40 @@ try {
   check("Refresh updates the overview", await until(page, () => /4/.test(document.querySelector("#ov-stats")?.textContent ?? "")), await text(page, "#ov-stats"))
   const width = await page.evaluate(() => document.documentElement.scrollWidth)
   check("no horizontal scroll at 400px", width <= 400, width)
+
+  // ---- overview charts ----
+  await chat("a failing one", "nope/none")
+  await page.click("#ov-refresh")
+  check("the requests chart is an svg with a title and a description", await until(page, () => {
+    const svg = document.querySelector("#ch-requests svg")
+    return !!svg && svg.getAttribute("role") === "img" && !!svg.querySelector("title")?.textContent && !!svg.querySelector("desc")?.textContent
+  }), await text(page, "#ch-requests"))
+  check("the requests chart draws bars for success and errors", await until(page, () => document.querySelectorAll("#ch-requests rect.bar").length >= 2), String(await page.locator("#ch-requests rect.bar").count()))
+  check("the requests chart has a legend", (await text(page, "#ch-requests .legend")).includes("Errors"))
+  await page.click("#ch-requests summary")
+  const tbl = await text(page, "#ch-requests details table")
+  check("the data table lists the same numbers as the chart", /Success/.test(tbl) && /\b[1-9]\d*\b/.test(tbl), tbl.slice(0, 200))
+  check("latency, tokens, cost and provider charts are drawn", await until(page, () => ["ch-latency", "ch-tokens", "ch-cost", "ch-provider-cost"].every((id) => document.querySelector("#" + id + " svg") !== null)), await text(page, "#ov-charts"))
+  check("the latency chart draws a line per percentile", (await page.locator("#ch-latency svg path").count()) === 4)
+  check("top models are ranked with their numbers", await until(page, () => (document.querySelector("#ch-models")?.textContent ?? "").includes("gpt-4o-mini") && /tokens/.test(document.querySelector("#ch-models")?.textContent ?? "")), await text(page, "#ch-models"))
+  check("top providers are ranked", await until(page, () => (document.querySelector("#ch-providers")?.textContent ?? "").includes("openai")), await text(page, "#ch-providers"))
+  const chartW = await page.evaluate(() => Number(document.querySelector("#ch-requests svg").getAttribute("width")))
+  check("a chart fits a 400px screen", chartW > 200 && chartW <= 400, chartW)
+  const box = await page.locator("#ch-requests svg").boundingBox()
+  await page.mouse.move(box.x + box.width - 30, box.y + box.height / 2)
+  check("hovering a chart shows a readout of that bucket", await until(page, () => (document.querySelector("#ch-requests .chart-tip")?.textContent ?? "").includes("Success")), await text(page, "#ch-requests"))
+  await page.mouse.move(2, 2)
+  await page.focus("#ch-requests svg")
+  await page.keyboard.press("ArrowLeft")
+  check("the arrow keys read single buckets", await until(page, () => document.querySelector("#ch-requests .chart-tip") !== null))
+  const lightFill = await page.evaluate(() => getComputedStyle(document.querySelector("#ch-requests rect.bar")).fill)
+  await page.emulateMedia({ colorScheme: "dark" })
+  const darkFill = await page.evaluate(() => getComputedStyle(document.querySelector("#ch-requests rect.bar")).fill)
+  await page.emulateMedia({ colorScheme: "light" })
+  check("the chart colours follow the colour scheme", lightFill !== darkFill, lightFill + " " + darkFill)
+  await page.selectOption("#ov-period", "24h")
+  check("the period menu reloads the charts", await until(page, () => document.querySelector("#ch-requests svg") !== null && document.querySelector("#ov-charts select").value === "24h"))
+  await page.selectOption("#ov-period", "1h")
 
   // ---- live feed (the real socket) ----
   await page.goto(GW + "/#live")
@@ -391,6 +444,26 @@ try {
   const okPill = await page.locator("#lg-body tr.clickable").first().locator("td").nth(3).textContent()
   check("a successful request shows its HTTP status as a green pill", okPill?.trim() === "200" && (await page.locator("#lg-body tr.clickable").first().locator(".pill.ok").count()) === 1, okPill)
   check("the range line counts the entries", /1–\d+ of \d+/.test(await text(page, "#lg-range")), await text(page, "#lg-range"))
+  // charts on the logs screen
+  check("the logs screen draws the requests chart", await until(page, () => document.querySelectorAll("#lgc-requests rect.bar").length > 0), await text(page, "#lg-charts"))
+  check("it breaks the cost down by provider", await until(page, () => (document.querySelector("#lgc-by figcaption")?.textContent ?? "") === "Cost by provider" && document.querySelectorAll("#lgc-by rect.bar").length > 0), await text(page, "#lgc-by"))
+  check("it ranks the providers", await until(page, () => (document.querySelector("#lgc-rank")?.textContent ?? "").includes("openai")), await text(page, "#lgc-rank"))
+  await page.selectOption("#lg-dim", "model")
+  await page.selectOption("#lg-metric", "latency")
+  check("the dimension and measure menus change the chart", await until(page, () => (document.querySelector("#lgc-by figcaption")?.textContent ?? "") === "p95 latency by model" && document.querySelectorAll("#lgc-by svg path").length > 0), await text(page, "#lgc-by"))
+  check("the ranking follows the dimension", await until(page, () => (document.querySelector("#lgc-rank")?.textContent ?? "").includes("gpt-4o-mini")), await text(page, "#lgc-rank"))
+  await page.selectOption("#lg-metric", "tokens")
+  check("tokens by model are drawn", await until(page, () => (document.querySelector("#lgc-by figcaption")?.textContent ?? "") === "Tokens by model" && document.querySelectorAll("#lgc-by rect.bar").length > 0))
+  await page.selectOption("#lg-dim", "virtual_key")
+  check("virtual key is a dimension too", await until(page, () => (document.querySelector("#lgc-by figcaption")?.textContent ?? "") === "Tokens by virtual key"))
+  await page.selectOption("#lg-dim", "provider")
+  await page.selectOption("#lg-metric", "cost")
+  await page.fill('#lg-filter input[name=provider]', "nobody")
+  await page.click('#lg-filter button[type=submit]')
+  check("the charts follow the log filters", await until(page, () => (document.querySelector("#lgc-requests")?.textContent ?? "").includes("No data in this period")), await text(page, "#lgc-requests"))
+  await page.fill('#lg-filter input[name=provider]', "")
+  await page.click('#lg-filter button[type=submit]')
+  await until(page, () => document.querySelectorAll("#lgc-requests rect.bar").length > 0)
   await page.selectOption('#lg-filter select[name=period]', "custom")
   check("a custom time range shows its from and to fields", await page.isVisible("#lg-from-wrap") && await page.isVisible("#lg-to-wrap"))
   await page.selectOption('#lg-filter select[name=period]', "")
@@ -406,7 +479,7 @@ try {
   await page.waitForFunction(() => (document.querySelector("#lg-body")?.textContent ?? "").includes("gpt-4o-mini"), null, { timeout: 5000 })
   await page.selectOption('#lg-filter select[name=status]', "error")
   await page.click('#lg-filter button[type=submit]')
-  check("the status filter applies", await until(page, () => (document.querySelector("#lg-body")?.textContent ?? "").includes("No matching entries")), await text(page, "#lg-body"))
+  check("the status filter applies", await until(page, () => { const t = document.querySelector("#lg-body")?.textContent ?? ""; return t.includes("nope/none") && !t.includes("gpt-4o-mini") }), await text(page, "#lg-body"))
   await page.click("#lg-clear")
   await page.waitForFunction(() => document.querySelectorAll("#lg-body tr.clickable").length > 0, null, { timeout: 5000 })
   // pages: 25 per page
@@ -463,6 +536,284 @@ try {
   await page.locator('article[aria-label="MCP client offui"] > header button:has-text("Confirm delete")').click()
   check("an MCP client can be deleted from the page", await until(page, () => !document.querySelector('article[aria-label="MCP client offui"]')))
 
+  // ---- MCP OAuth: the consent pages, the grants and the per-user sessions ----
+  {
+    const redirect = "http://127.0.0.1:8080/cb"
+    const cp = await browser.newPage({ viewport: { width: 400, height: 800 } })
+    await cp.route("http://127.0.0.1:8080/**", (r) => r.fulfill({ status: 200, contentType: "text/plain", body: "callback" }))
+    const reg = await fetch(GW + "/oauth2/register", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "ui-client", redirect_uris: [redirect] }) })
+    const cid = (await reg.json()).client_id
+    const verifier = randomBytes(32).toString("base64url")
+    const challenge = createHash("sha256").update(verifier).digest("base64url")
+    const q = new URLSearchParams({ client_id: cid, redirect_uri: redirect, response_type: "code", state: "st-ui", code_challenge: challenge, code_challenge_method: "S256", scope: "mcp" })
+    const au = await fetch(GW + "/oauth2/authorize?" + q, { redirect: "manual" })
+    const consentUrl = new URL(au.headers.get("location") ?? "", GW).href
+    check("the authorize redirect opens the consent page", consentUrl.includes("/oauth/consent?flow=") && consentUrl.includes("#t="), consentUrl)
+    await cp.goto(consentUrl)
+    check("the consent page names the client", await until(cp, () => document.querySelector("#client")?.textContent === "ui-client"), await text(cp, "main"))
+    check("the consent page shows where the code goes", (await text(cp, "#redirect")) === redirect)
+    check("the consent page carries the gateway header and a titled form", (await cp.title()) === "Authorize an MCP client" && (await cp.locator("header.top .logo").count()) === 1 && (await cp.locator("h1").count()) === 1)
+    check("the key field has a label and focus", await cp.evaluate(() => document.activeElement?.id === "vk" && document.querySelector("#vk").labels.length === 1))
+    const lightBg = await cp.evaluate(() => getComputedStyle(document.body).backgroundColor)
+    await cp.emulateMedia({ colorScheme: "dark" })
+    const darkBg = await cp.evaluate(() => getComputedStyle(document.body).backgroundColor)
+    await cp.emulateMedia({ colorScheme: "light" })
+    check("the consent page follows the colour scheme", lightBg !== darkBg, lightBg + " " + darkBg)
+    check("the consent page fits a 400px screen", (await cp.evaluate(() => document.documentElement.scrollWidth)) <= 400)
+    await cp.fill("#vk", "   ")
+    await cp.click("#go")
+    check("a blank key is refused on the page, as an alert", await until(cp, () => document.querySelector("#msg")?.getAttribute("role") === "alert" && /Enter the virtual key/.test(document.querySelector("#msg").textContent)), await text(cp, "#msg"))
+    await cp.fill("#vk", "sk-bf-not-a-key")
+    await cp.click("#go")
+    check("a key the gateway does not know is refused with the reason", await until(cp, () => /HTTP 4\d\d/.test(document.querySelector("#msg")?.textContent ?? "")), await text(cp, "#msg"))
+    await cp.fill("#vk", "sk-bf-ui-oauth")
+    await cp.click("#go")
+    check("approving with a virtual key returns to the client with a code", await cp.waitForURL(/8080\/cb\?code=/, { timeout: 8000 }).then(() => true, () => false), cp.url())
+    const code = new URL(cp.url()).searchParams.get("code") ?? ""
+    const tokenRes = await fetch(GW + "/oauth2/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: cid, redirect_uri: redirect, resource: GW + "/mcp" }).toString(),
+    })
+    check("the client exchanges the code for tokens", tokenRes.status === 200 && !!(await tokenRes.json()).refresh_token)
+    await cp.goto(consentUrl)
+    check("a used consent link says so", await until(cp, () => document.querySelector("#msg")?.getAttribute("role") === "alert"), await text(cp, "#msg"))
+    await cp.goto(GW + "/oauth/consent")
+    check("a consent link without a flow explains itself", await until(cp, () => /incomplete/.test(document.querySelector("#msg")?.textContent ?? "")), await text(cp, "#msg"))
+    await cp.close()
+
+    await page.goto(GW + "/#mcpaccess")
+    check("the OAuth grant of the client is listed", await until(page, () => (document.querySelector("#mca-grants")?.textContent ?? "").includes("ui-client")), await text(page, "#mca-grants"))
+    const grantRow = page.locator("#mca-grants tbody tr", { hasText: "ui-client" })
+    check("the grant shows its mode and the key", (await grantRow.textContent()).includes("vk") && (await grantRow.textContent()).includes("vk-ui-oauth"), await grantRow.textContent())
+    await page.fill("#mca-grant-q", "nobody-like-this")
+    await page.press("#mca-grant-q", "Enter")
+    check("the grant filter narrows the list", await until(page, () => (document.querySelector("#mca-grants")?.textContent ?? "").includes("No live grants")), await text(page, "#mca-grants"))
+    await page.fill("#mca-grant-q", "")
+    await page.press("#mca-grant-q", "Enter")
+    await until(page, () => (document.querySelector("#mca-grants")?.textContent ?? "").includes("ui-client"))
+    await page.locator("#mca-grants tbody tr", { hasText: "ui-client" }).locator('button:has-text("Revoke")').click()
+    await page.locator("#mca-grants tbody tr", { hasText: "ui-client" }).locator('button:has-text("Confirm revoke")').click()
+    check("a grant can be revoked from the page", await poll(async () => ((await api("GET", "/api/oauth2/sessions")).data.sessions ?? []).length === 0))
+    check("the revoked grant leaves the list", await until(page, () => !(document.querySelector("#mca-grants")?.textContent ?? "").includes("ui-client")), await text(page, "#mca-grants"))
+
+    // per-user OAuth: the admin authorizes the client once, a caller consents on the connect page
+    const init = await api("POST", "/api/mcp/client/po/initiate-verification")
+    const hop = await fetch(init.data.authorize_url, { redirect: "manual" })
+    await fetch(hop.headers.get("location"), { headers: ADMIN })
+    await api("POST", "/api/mcp/client/po/complete-oauth")
+    const poReady = await poll(async () => ((await api("GET", "/api/mcp")).data.clients ?? []).some((c) => c.name === "po" && c.connected))
+    check("the per-user OAuth client connects with the admin's token", poReady)
+    const call = await fetch(GW + "/v1/mcp/tool/execute", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer sk-bf-po-a" },
+      body: JSON.stringify({ id: "c1", type: "function", function: { name: "po-get_weather", arguments: '{"city":"Oslo"}' } }),
+    })
+    const denial = await call.text()
+    const link = /flow=([0-9a-f]+)#t=([0-9a-f]+)/.exec(denial)
+    check("a caller without consent is given a consent link", call.status === 401 && !!link, denial.slice(0, 200))
+    const pp = await browser.newPage({ viewport: { width: 400, height: 800 } })
+    await pp.goto(GW + "/workspace/mcp-sessions/auth")
+    check("the connect page without a flow explains itself", await until(pp, () => document.querySelector("#msg")?.getAttribute("role") === "alert" && /no flow/.test(document.querySelector("#msg").textContent)), await text(pp, "#msg"))
+    await pp.goto(GW + "/workspace/mcp-sessions/auth?flow=" + link[1] + "#t=" + link[2])
+    check("the connect page names the client and the caller", await until(pp, () => document.querySelector("#client")?.textContent === "po" && (document.querySelector("#caller")?.textContent ?? "").includes("vk-po-a")), await text(pp, "main"))
+    check("the connect page has a titled card and the gateway header", (await pp.title()) === "Connect an MCP client" && (await pp.locator("header.top").count()) === 1)
+    await pp.click("#go")
+    check("Connect goes through the provider and back to the gateway", await pp.waitForFunction(() => document.body.textContent.includes("for this caller"), null, { timeout: 8000 }).then(() => true, () => false), await pp.textContent("body").catch(() => ""))
+    await pp.close()
+
+    await page.click("#mca-refresh")
+    check("the caller's token row is listed", await until(page, () => (document.querySelector("#mca-sessions")?.textContent ?? "").includes("OAuth token")), await text(page, "#mca-sessions"))
+    const tokenRow = page.locator("#mca-sessions tbody tr", { hasText: "OAuth token" })
+    check("the row shows the client, the key and an active status", (await tokenRow.textContent()).includes("po") && (await tokenRow.textContent()).includes("vk-po-a") && (await tokenRow.locator(".pill.ok").count()) === 1, await tokenRow.textContent())
+    check("no token is shown", !(await text(page, "#mca-sessions")).includes("oauth-access-"))
+    await tokenRow.locator('button:has-text("Re-authorize")').click()
+    check("Re-authorize shows a new consent link", await until(page, () => (document.querySelector("#mca-link input")?.value ?? "").includes("/workspace/mcp-sessions/auth?flow=")), await text(page, "#mca-sessions"))
+    await page.click("#mca-link button:has-text('Close')")
+    await page.selectOption("#mca-kind", "flow")
+    check("the kind menu narrows the sessions", await until(page, () => (document.querySelector("#mca-sessions")?.textContent ?? "").includes("Pending consent") && !(document.querySelector("#mca-sessions")?.textContent ?? "").includes("OAuth token")), await text(page, "#mca-sessions"))
+    await page.selectOption("#mca-kind", "token")
+    await until(page, () => (document.querySelector("#mca-sessions")?.textContent ?? "").includes("OAuth token"))
+    await page.locator("#mca-sessions tbody tr", { hasText: "OAuth token" }).locator('button:has-text("Revoke")').click()
+    await page.locator("#mca-sessions tbody tr", { hasText: "OAuth token" }).locator('button:has-text("Confirm revoke")').click()
+    check("a session can be revoked from the page", await poll(async () => ((await api("GET", "/api/mcp/sessions?kind=token")).data.sessions ?? []).length === 0))
+
+    // per-user headers
+    await page.selectOption("#mca-kind", "")
+    await page.selectOption("#mca-hdr-open select[name=client]", "tenant")
+    await page.selectOption("#mca-hdr-open select[name=vk]", "vk-po-a")
+    await page.click("#mca-hdr-open button[type=submit]")
+    check("opening a submission asks for the client's header names", await until(page, () => document.querySelector('#mca-hdr-flow input[name="h:x-tenant"]') !== null), await text(page, "#mca-headers"))
+    await page.fill('#mca-hdr-flow input[name="h:x-tenant"]', "not-a-tenant")
+    await page.click("#mca-hdr-flow button[type=submit]")
+    check("values the MCP server rejects are shown inline", await until(page, () => (document.querySelector("#mca-hdr-flow p.error")?.textContent ?? "").includes("Verification failed")), await text(page, "#mca-hdr-flow"))
+    await page.fill('#mca-hdr-flow input[name="h:x-tenant"]', "tenant-a-key-example")
+    await page.click("#mca-hdr-flow button[type=submit]")
+    check("verified values are stored for the key", await poll(async () => ((await api("GET", "/api/mcp/sessions?kind=header")).data.sessions ?? []).some((r) => r.virtual_key_id === "vk-po-a" && r.mcp_client.name === "tenant")))
+    await page.selectOption("#mca-kind", "header")
+    check("the header credential is listed without its values", await until(page, () => (document.querySelector("#mca-sessions")?.textContent ?? "").includes("Header credential") && !(document.querySelector("#mca-sessions")?.textContent ?? "").includes("tenant-a-key-example")), await text(page, "#mca-sessions"))
+    await page.locator("#mca-sessions tbody tr", { hasText: "Header credential" }).locator('button:has-text("Revoke")').click()
+    await page.locator("#mca-sessions tbody tr", { hasText: "Header credential" }).locator('button:has-text("Confirm revoke")').click()
+    check("a header credential can be revoked", await poll(async () => ((await api("GET", "/api/mcp/sessions?kind=header")).data.sessions ?? []).length === 0))
+    const w3 = await page.evaluate(() => document.documentElement.scrollWidth)
+    check("MCP access has no horizontal scroll at 400px", w3 <= 400, w3)
+  }
+
+  // ---- virtual MCPs and tool groups ----
+  {
+    await page.goto(GW + "/#vmcp")
+    await page.click("#vm-new")
+    await page.fill("#vm-form input[name=name]", "ui-vmcp")
+    await page.fill("#vm-form input[name=description]", "made in the browser")
+    await page.click("#vm-add-tool")
+    await page.fill('#vm-tools input[aria-label="Source tool"]', "nowhere-tool")
+    await page.click("#vm-save")
+    check("a source of an unknown client is refused inline", await until(page, () => (document.querySelector("#vm-form p.error")?.textContent ?? "").includes("nowhere")), await text(page, "#vm-form p.error"))
+    await page.fill('#vm-tools input[aria-label="Source tool"]', "local-echo")
+    await page.fill('#vm-tools input[aria-label="Renamed as"]', "say")
+    await page.fill('#vm-tools input[aria-label="Argument defaults"]', "{")
+    await page.click("#vm-save")
+    check("defaults that are not a JSON object are refused", await until(page, () => (document.querySelector("#vm-form p.error")?.textContent ?? "").includes("JSON object")), await text(page, "#vm-form p.error"))
+    await page.fill('#vm-tools input[aria-label="Argument defaults"]', "")
+    await page.click("#vm-save")
+    check("a virtual MCP is created from the page", await until(page, () => document.querySelector('article[aria-label="Virtual MCP ui-vmcp"]') !== null), await text(page, "#vm-form p.error"))
+    const made = (await api("GET", "/api/mcp/virtual-mcps/ui-vmcp")).data.virtual_mcp
+    check("its tools are stored as written", JSON.stringify(made?.tools) === JSON.stringify([{ source: "local-echo", as: "say" }]), JSON.stringify(made))
+    check("the card lists the tool the gateway serves", await until(page, () => (document.querySelector('article[aria-label="Virtual MCP ui-vmcp"]')?.textContent ?? "").includes("say")), await text(page, "#vm-list"))
+    const card = page.locator('article[aria-label="Virtual MCP ui-vmcp"]')
+    check("every key may use it until one is detached", (await card.locator("input[type=checkbox]:checked").count()) === (await card.locator("input[type=checkbox]").count()) && (await card.locator("input[type=checkbox]").count()) >= 2)
+    await card.locator('input[aria-label="Allow key vk-po-a"]').uncheck()
+    check("unticking a key detaches it", await poll(async () => !((await api("GET", "/api/mcp/virtual-mcps/ui-vmcp")).data.virtual_mcp.virtual_key_ids ?? []).includes("vk-po-a")))
+    check("the other keys stay attached", ((await api("GET", "/api/mcp/virtual-mcps/ui-vmcp")).data.virtual_mcp.virtual_key_ids ?? []).includes("vk-ui-oauth"))
+    await card.locator('input[aria-label="Allow key vk-po-a"]').check()
+    check("ticking it attaches it again", await poll(async () => ((await api("GET", "/api/mcp/virtual-mcps/ui-vmcp")).data.virtual_mcp.virtual_key_ids ?? []).includes("vk-po-a")))
+    await card.locator('button:has-text("Edit")').click()
+    check("the editor keeps the name read only and shows the stored tool", (await page.evaluate(() => document.querySelector("#vm-form input[name=name]").readOnly)) && (await page.inputValue('#vm-tools input[aria-label="Renamed as"]')) === "say")
+    await page.fill("#vm-form input[name=description]", "edited")
+    await page.click("#vm-save")
+    check("an edit is saved", await poll(async () => (await api("GET", "/api/mcp/virtual-mcps/ui-vmcp")).data.virtual_mcp.description === "edited"))
+
+    // tool groups
+    await page.click("#vm-mode-group")
+    check("the tool group view lists the same record", await until(page, () => document.querySelector('article[aria-label="Tool group ui-vmcp"]') !== null))
+    await page.click("#vm-new")
+    await page.fill("#tg-form input[name=name]", "ui-group")
+    await page.click("#tg-add-tool")
+    await page.selectOption('#tg-tools select[aria-label="MCP client"]', "local")
+    await page.fill('#tg-tools input[aria-label="Tool names"]', "echo")
+    await page.check('#tg-form input[name="g-key"][value="vk-po-a"]')
+    await page.click("#tg-save")
+    check("a tool group is created from the page", await until(page, () => document.querySelector('article[aria-label="Tool group ui-group"]') !== null), await text(page, "#tg-form p.error"))
+    const grp = (await api("GET", "/api/mcp/tool-groups/ui-group")).data.mcp_tool_group
+    check("its tools and its one key are stored", JSON.stringify(grp?.tools) === JSON.stringify([{ source: "local-echo" }]) && JSON.stringify(grp?.virtual_key_ids) === JSON.stringify(["vk-po-a"]), JSON.stringify(grp))
+    await page.locator('article[aria-label="Tool group ui-group"] button:has-text("Edit")').click()
+    check("the group editor shows the stored client and tools and the attached key", (await page.inputValue('#tg-tools input[aria-label="Tool names"]')) === "echo" && (await page.isChecked('#tg-form input[name="g-key"][value="vk-po-a"]')) && !(await page.isChecked('#tg-form input[name="g-key"][value="vk-ui-oauth"]')))
+    await page.check('#tg-form input[name="g-key"][value="vk-ui-oauth"]')
+    await page.click("#tg-save")
+    check("a group's keys are replaced on save", await poll(async () => ((await api("GET", "/api/mcp/tool-groups/ui-group")).data.mcp_tool_group.virtual_key_ids ?? []).length === 2))
+    for (const n of ["ui-group", "ui-vmcp"]) {
+      await page.locator('article[aria-label$="' + n + '"] button:has-text("Delete")').click()
+      await page.locator('article[aria-label$="' + n + '"] button:has-text("Confirm delete")').click()
+    }
+    check("virtual MCPs and groups can be deleted", await poll(async () => ((await api("GET", "/api/mcp/virtual-mcps")).data.virtual_mcps ?? []).length === 0))
+    await page.click("#vm-mode-mcp")
+    const w4 = await page.evaluate(() => document.documentElement.scrollWidth)
+    check("the virtual MCP page has no horizontal scroll at 400px", w4 <= 400, w4)
+  }
+
+  // ---- roles: each role sees the actions it can take ----
+  {
+    const mk = async (role, name) => {
+      const r = await api("POST", "/api/users", { name, role })
+      return r.data.token
+    }
+    await api("POST", "/api/roles", { name: "keys-reader", permissions: [{ resource: "VirtualKeys", operation: "View" }] })
+    const tokens = { viewer: await mk("viewer", "ui-viewer"), editor: await mk("editor", "ui-editor"), auditor: await mk("auditor", "ui-auditor"), custom: await mk("keys-reader", "ui-custom") }
+    const as = async (token) => {
+      const ctx = await browser.newContext({ viewport: { width: 1200, height: 900 } })
+      const p = await ctx.newPage()
+      const denied = []
+      p.on("response", (r) => {
+        if (r.status() === 403) denied.push(r.url())
+      })
+      await p.addInitScript((t) => sessionStorage.setItem("raiju.adminToken", t), token)
+      return { ctx, p, denied }
+    }
+    const has = (p, sel) => p.locator(sel).count().then((n) => n > 0)
+
+    // viewer: reads everything, changes nothing
+    {
+      const { ctx, p, denied } = await as(tokens.viewer)
+      await p.goto(GW + "/#overview")
+      check("the header names the signed-in user and role", await until(p, () => /ui-viewer/.test(document.querySelector("#role-pill")?.textContent ?? "") && /viewer/.test(document.querySelector("#role-pill").textContent)), await text(p, "#role-pill"))
+      check("a viewer sees the overview without the metrics box", (await until(p, () => /\d/.test(document.querySelector("#ov-stats")?.textContent ?? ""))) && !(await has(p, "#ov-metrics-box")))
+      await p.goto(GW + "/#keys")
+      await p.waitForSelector("#vk-list tbody tr", { timeout: 6000 })
+      check("a viewer has no New virtual key button", !(await has(p, "#vk-new")))
+      check("a viewer's key rows have no Edit, Rotate or Delete", (await p.locator('#vk-list button:has-text("Edit"), #vk-list button:has-text("Rotate"), #vk-list button:has-text("Delete")').count()) === 0)
+      check("the status toggle is disabled for a viewer", await p.evaluate(() => [...document.querySelectorAll("#vk-list button.toggle")].every((b) => b.disabled)))
+      await p.goto(GW + "/#providers")
+      await p.waitForSelector("#pv-list article", { timeout: 6000 })
+      check("a viewer sees providers without add, edit or delete", !(await has(p, "#pv-add")) && (await p.locator('#pv-list button:has-text("Edit"), #pv-list button:has-text("Delete"), #pv-list summary').count()) === 0)
+      await p.goto(GW + "/#governance")
+      await p.waitForFunction(() => (document.querySelector("#gov-root")?.textContent ?? "").includes("monthly"), null, { timeout: 6000 })
+      check("a viewer sees budgets read only", (await p.locator("#gov-root form:not([hidden])").count()) === 0 && (await p.locator('#gov-root button:has-text("Delete"), #gov-root button:has-text("Edit")').count()) === 0)
+      await p.goto(GW + "/#mcp")
+      await p.waitForSelector('article[aria-label="MCP client local"]', { timeout: 6000 })
+      check("a viewer sees MCP clients without add, edit, reconnect or delete", !(await has(p, "#mcp-new")) && (await p.locator('#mcp-list button:has-text("Edit"), #mcp-list button:has-text("Reconnect"), #mcp-list button:has-text("Delete")').count()) === 0)
+      await until(p, () => document.querySelectorAll('article[aria-label="MCP client local"] .tool-chips button').length > 0, null, 10000)
+      check("the tool switches are disabled", await p.evaluate(() => [...document.querySelectorAll(".tool-chips button")].every((b) => b.disabled)))
+      await p.goto(GW + "/#config")
+      check("a viewer reads the settings but cannot save them", (await until(p, () => document.querySelector("#cfg-json") !== null)) && (await p.evaluate(() => document.querySelector("#cfg-json").readOnly)) && !(await p.isVisible("#cfg-save")) && (await has(p, "#cfg-readonly")))
+      await p.goto(GW + "/#mcpaccess")
+      await p.waitForSelector("#mca-sessions", { timeout: 6000 })
+      check("a viewer has no revoke or open-submission actions on MCP access", (await p.locator('#mca-grants button:has-text("Revoke"), #mca-sessions button:has-text("Revoke"), #mca-hdr-open').count()) === 0)
+      await p.goto(GW + "/#vmcp")
+      await p.waitForSelector("#vm-title", { timeout: 6000 })
+      check("a viewer has no New button on virtual MCPs", !(await has(p, "#vm-new")))
+      check("a viewer's own pages never got a 403", denied.length === 0, denied.join(" "))
+      await ctx.close()
+    }
+    // editor: providers and governance records, no MCP or settings
+    {
+      const { ctx, p } = await as(tokens.editor)
+      await p.goto(GW + "/#keys")
+      check("an editor can create virtual keys", await until(p, () => document.querySelector("#vk-new") !== null))
+      await p.goto(GW + "/#providers")
+      check("an editor can add providers", await until(p, () => document.querySelector("#pv-add") !== null))
+      await p.goto(GW + "/#mcp")
+      await p.waitForSelector("#mcp-title", { timeout: 6000 })
+      check("an editor cannot add MCP clients", !(await has(p, "#mcp-new")))
+      await p.goto(GW + "/#config")
+      check("an editor cannot save settings", await until(p, () => document.querySelector("#cfg-readonly") !== null))
+      await ctx.close()
+    }
+    // auditor: logs only
+    {
+      const { ctx, p } = await as(tokens.auditor)
+      await p.goto(GW + "/#logs")
+      check("an auditor sees the logs", await until(p, () => (document.querySelector("#lg-body")?.textContent ?? "").includes("gpt-4o-mini")))
+      const nav = await p.evaluate(() => [...document.querySelectorAll("nav.tabs a")].map((a) => a.getAttribute("data-nav")))
+      check("an auditor's tabs are the logs and the pages that need no permission", nav.includes("logs") && nav.includes("live") && !nav.includes("providers") && !nav.includes("keys") && !nav.includes("config") && !nav.includes("mcp"), nav.join(","))
+      await ctx.close()
+    }
+    // custom role: the pairs it holds
+    {
+      const { ctx, p } = await as(tokens.custom)
+      await p.goto(GW + "/#keys")
+      check("a custom role sees the key list", await until(p, () => document.querySelector("#vk-list") !== null))
+      const nav = await p.evaluate(() => [...document.querySelectorAll("nav.tabs a")].map((a) => a.getAttribute("data-nav")))
+      check("its tabs follow its permissions", nav.includes("keys") && !nav.includes("providers") && !nav.includes("logs") && !nav.includes("config"), nav.join(","))
+      check("it has no write actions", !(await has(p, "#vk-new")))
+      await ctx.close()
+    }
+    await api("DELETE", "/api/users/ui-viewer")
+    await api("DELETE", "/api/users/ui-editor")
+    await api("DELETE", "/api/users/ui-auditor")
+    await api("DELETE", "/api/users/ui-custom")
+    await api("DELETE", "/api/roles/keys-reader")
+  }
+
   // ---- config ----
   await page.goto(GW + "/#config")
   check("the settings editor loads the client section", await until(page, () => (document.querySelector("#cfg-json")?.value ?? "").includes("client_config")))
@@ -487,6 +838,8 @@ try {
   await page.click("#cfg-save")
   const sized = await poll(async () => (await api("GET", "/api/config")).data.client?.max_request_body_size_mb === 9)
   check("saved settings reach the gateway", sized, JSON.stringify((await api("GET", "/api/config")).data.client).slice(0, 200))
+  const jwks = await (await fetch(GW + "/.well-known/jwks.json")).json().catch(() => ({}))
+  check("saving the settings keeps the MCP authorization server and its signing key", (await api("GET", "/api/config")).data.client?.mcp_server_auth_mode === "both" && (jwks.keys ?? []).length === 1, JSON.stringify(jwks).slice(0, 200))
 
   // ---- playground ----
   await page.goto(GW + "/#playground")
