@@ -1,24 +1,23 @@
-// /v1/realtime: a WebSocket relay between the caller and the provider's
-// realtime endpoint (OpenAI or Azure OpenAI). The gateway checks the virtual
-// key, picks the provider key, and passes events through untouched.
+// /v1/realtime: a WebSocket relay between the caller and the provider's realtime endpoint (OpenAI, Azure
+// OpenAI or xAI). The gateway checks the virtual key, picks the provider key, and relays the events through
+// a LiveCore (webrtc.tov), as Bifrost's realtime handler does: each turn (a response, from its start to its
+// response.done) is admitted by governance, the text of both sides is guarded, the tokens that response.done
+// reports are billed (audio tokens at the audio rates, cached tokens at the cache rate), and the session ends
+// as one log row with its cost. The events themselves pass as they came.
 import { Engine } from "./gateway"
 import { parseModel, target } from "./router"
 import { Target } from "./providers/types"
-import { snapshot } from "./schemas"
-import * as metrics from "./metrics"
+import { Grant } from "./governance"
+import { Hdrs, snapshot } from "./schemas"
 import { WsConnection, SocketGate } from "./ws"
 import { errorJson } from "./schemas"
+import { SessionSpec, sessionHooks, sessionGuard } from "./livehooks"
+import { Relay, Leg, startClock } from "./webrtc"
 
+// What a WebSocket upgrade becomes on the server: the socket's own state in ext.
 export class Session {
-  upstream: WebSocket | undefined = undefined
-  // the state of a WebSocket route other than the realtime relay (responses, live, the UI socket);
-  // undefined for the relay
+  // the state of the WebSocket route (the realtime relay, responses, live, the UI socket)
   ext: SocketExt | undefined = undefined
-  // the route's session cap (websocket.max_connections_per_user), and whether this session holds a slot
-  gate: SocketGate | undefined = undefined
-  held = false
-  // the relay has been counted in its metrics gauge (so the close only takes it back once)
-  live = false
   constructor(readonly url: string, readonly headers: Map<string, string>, readonly provider: string, readonly model: string) {}
 }
 
@@ -96,23 +95,6 @@ export class SocketExt {
 const FULL_REASON = "websocket connection limit reached"
 const FULL_EVENT = `{"type":"error","error":{"type":"rate_limit_error","code":"websocket_connection_limit_reached","message":"${FULL_REASON}"}}`
 
-// Takes a slot for a relay session in its gate; false when the route is full.
-function enterRelay(s: Session): bool {
-  if (s.held) return true
-  const g = s.gate
-  if (g === undefined) return true
-  if (!g.take()) return false
-  s.held = true
-  return true
-}
-
-function leaveRelay(s: Session): void {
-  if (!s.held) return
-  s.held = false
-  const g = s.gate
-  if (g !== undefined) g.give()
-}
-
 export type Upgrade = { kind: "session", session: Session } | { kind: "refused", status: int, message: string }
 
 export function wsBase(url: string): string {
@@ -125,8 +107,7 @@ function trim(s: string): string {
   return s.endsWith("/") ? s.slice(0, s.byteLength - 1) : s
 }
 
-// Bun.serve's open, message and close for a route with state in ext. Each returns false for the
-// realtime relay, which the caller then hands to onOpen, onMessage and onClose.
+// Bun.serve's open, message and close for a route with state in ext (every WebSocket route has one).
 export function extOpen(ws: ServerWebSocket<Session>): bool {
   const s = ws.data
   if (s === undefined) return false
@@ -252,7 +233,8 @@ export function upstreamFor(t: Target, beta: string | undefined): { url: string,
   return { url: `${wsBase(base)}/v1/realtime?model=${t.model}`, headers: h }
 }
 
-// Decides whether a /v1/realtime upgrade may proceed, and where it goes.
+// Decides whether a /v1/realtime upgrade may proceed, and where it goes. The session it returns carries
+// the socket's state (a RealtimeSocket), which both servers run the same way.
 export function prepare(engine: Engine, req: Request): Upgrade {
   const u = URL.parse(req.url)
   const model = u === undefined ? undefined : u.searchParams.get("model")
@@ -267,105 +249,98 @@ export function prepare(engine: Engine, req: Request): Upgrade {
   if (!realtimeKind(sel.t.kind)) return { kind: "refused", status: 400, message: `${ref.provider} has no realtime API this gateway can relay` }
   const up = upstreamFor(sel.t, req.headers.get("openai-beta") ?? undefined)
   const session = new Session(up.url, up.headers, ref.provider, ref.model)
-  session.gate = engine.wsRealtime
+  const sock = new RealtimeSocket(engine, h, admitted, ref.provider, ref.model, up.url, up.headers)
+  sock.gate = engine.wsRealtime
+  session.ext = sock
   return { kind: "session", session: session }
 }
 
-function labels(s: Session): string {
-  return metrics.labels(s.provider, s.model, "open")
+// A WebSocket the gateway opens upstream, or undefined when it can't be made (a malformed URL, say).
+function openUpstream(url: string, hs: Record<string, string>): WebSocket | undefined {
+  try {
+    return new WebSocket(url, { headers: hs })
+  } catch (e) {
+    return undefined
+  }
 }
 
-export function onOpen(ws: ServerWebSocket<Session>): void {
-  const s = ws.data
-  if (s === undefined) return
-  if (!enterRelay(s)) {
-    ws.send(FULL_EVENT)
-    ws.close(1013, FULL_REASON)
-    return
+// Closes an upstream socket that is open. One still connecting is left to its onopen, which closes it:
+// closing a socket mid-connect crashed the process on the http1 server.
+function closeUp(up: WebSocket): void {
+  if (up.readyState === 1) up.close()
+}
+
+// One realtime WebSocket: the caller's frames and the provider's pass through a relay (webrtc.tov) that
+// admits each turn, guards the text, bills the tokens and logs the session. Frames go on as they came, except
+// where a guard redacted text. The provider's socket is opened with the caller's; what the caller sends before
+// it is open waits.
+export class RealtimeSocket extends SocketExt {
+  relay: Relay | undefined = undefined
+  upstream: WebSocket | undefined = undefined
+  constructor(readonly engine: Engine, readonly headers: Hdrs, readonly grant: Grant, readonly provider: string, readonly model: string, readonly url: string, readonly upstreamHeaders: Map<string, string>) {
+    super()
   }
-  s.live = true
-  metrics.addGauge("raiju_realtime_sessions", labels(s), 1.0)
-  try {
+
+  onOpen(): void {
+    const spec: SessionSpec = { op: "realtime", transport: "websocket", provider: this.provider, model: this.model }
+    // a realtime session has no id of its own to record: attach and content are live sessions' routes
+    const relay = new Relay(sessionHooks(this.engine, this.headers, this.grant, spec, (id) => true), sessionGuard(this.engine), Date.now())
+    relay.core.realtime = true
+    relay.core.minimum = 0.0
+    relay.core.model = this.model
+    relay.clientOpen = true
+    relay.setupDone = true
+    const me = this
+    relay.client = new Leg((t) => {
+      me.send(t)
+      return true
+    }, (p) => false, () => 0, (code, why) => {
+      if (!me.closed) me.endWith(code, why)
+    })
+    this.relay = relay
     const hs: Record<string, string> = {}
-    for (const k of s.headers.keys()) hs.set(k, s.headers.get(k)!)
-    const up = new WebSocket(s.url, { headers: hs })
+    for (const k of this.upstreamHeaders.keys()) hs.set(k, this.upstreamHeaders.get(k)!)
+    const up = openUpstream(this.url, hs)
+    if (up === undefined) {
+      relay.providerBroke()
+      return
+    }
+    this.upstream = up
+    relay.provider = new Leg((t) => {
+      up.send(t)
+      return true
+    }, (p) => false, () => 0, (code, why) => {
+      closeUp(up)
+    })
+    up.onopen = () => {
+      // a caller that left while the dial was connecting: the relay is over, so the socket is closed
+      if (relay.closed) up.close()
+      else relay.channelOpened(false)
+    }
     up.onmessage = (ev) => {
-      ws.send(ev.data)
+      const d = ev.data
+      if (typeof d === "string") relay.fromProvider(d)
     }
     up.onclose = (ev) => {
-      ws.close(ev.code === 1005 || ev.code === 1006 ? 1011 : ev.code, ev.reason)
+      if (ev.code === 1000 || ev.code === 1001 || ev.code === 1005) relay.providerGone()
+      else relay.providerBroke()
     }
     up.onerror = (ev) => {
-      ws.close(1011, "upstream realtime connection failed")
+      relay.providerBroke()
     }
-    s.upstream = up
-  } catch (e) {
-    ws.close(1011, e.message)
+    startClock(relay)
   }
-}
 
-export function onMessage(ws: ServerWebSocket<Session>, m: string | u8[]): void {
-  const up = ws.data?.upstream
-  if (up !== undefined) up.send(m)
-}
-
-export function onClose(ws: ServerWebSocket<Session>): void {
-  const s = ws.data
-  if (s === undefined) return
-  leaveRelay(s)
-  if (!s.live) return
-  s.live = false
-  metrics.addGauge("raiju_realtime_sessions", labels(s), -1.0)
-  const up = s.upstream
-  if (up !== undefined && up.readyState < 2) up.close()
-}
-
-// The same relay on the http1 server's WebSocket connections. No stored handler
-// captures its own connection (that would form a cycle nothing frees).
-export function relayHttp1(engine: Engine, req: Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void): void {
-  const up = prepare(engine, req)
-  if (up.kind === "refused") {
-    reject(up.status, errorJson(up.message, "invalid_request_error", undefined))
-    return
+  onMessage(m: string): void {
+    if (this.closed || this.ended) return
+    const r = this.relay
+    if (r !== undefined) r.fromBrowser(m)
   }
-  const s = up.session
-  const client = accept()
-  if (client === undefined) return
-  if (!enterRelay(s)) {
-    client.send(FULL_EVENT)
-    client.close(1013, FULL_REASON)
-    return
-  }
-  s.live = true
-  metrics.addGauge("raiju_realtime_sessions", labels(s), 1.0)
-  try {
-    const hs: Record<string, string> = {}
-    for (const k of s.headers.keys()) hs.set(k, s.headers.get(k)!)
-    const upstream = new WebSocket(s.url, { headers: hs })
-    upstream.onmessage = (ev) => {
-      const d = ev.data
-      if (typeof d === "string") client.send(d)
-      else client.sendBinary(d)
-    }
-    upstream.onclose = (ev) => {
-      client.close(ev.code === 1005 || ev.code === 1006 ? 1011 : ev.code, ev.reason)
-    }
-    upstream.onerror = (ev) => {
-      client.close(1011, "upstream realtime connection failed")
-    }
-    client.onMessage = (m) => {
-      upstream.send(m)
-    }
-    client.onClose = (code, reason) => {
-      leaveRelay(s)
-      if (s.live) {
-        s.live = false
-        metrics.addGauge("raiju_realtime_sessions", labels(s), -1.0)
-      }
-      if (upstream.readyState < 2) upstream.close()
-    }
-  } catch (e) {
-    client.close(1011, e.message)
+
+  onClose(): void {
+    this.closed = true
+    const r = this.relay
+    if (r !== undefined) r.browserGone()
   }
 }
 

@@ -43,6 +43,7 @@ import { sha256, toHex, utf8 } from "./crypto"
 import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
+import * as anthropicNative from "./providers/anthropic"
 import * as watsonx from "./providers/watsonx"
 import * as databricks from "./providers/databricks"
 import * as copilot from "./providers/githubcopilot"
@@ -60,21 +61,22 @@ import { McpAuthConfig } from "./mcpauth"
 import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, consentLink, startUserFlow, refreshUserRow } from "./mcpuser"
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
-import { PluginChain, PluginContext, PluginEntry, buildChain, jsonStreamEnabled, JsonStreamFixer } from "./plugins"
+import { PluginChain, PluginContext, PluginEntry, PluginRun, RUN_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
+import { SseBuffer, sseData, sseWithData } from "./plughttp"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline } from "./deadline"
 import { logMetadata, correlationIds, maximAttrs, stopReasonOf, toolNamesOfBody, ToolNameStream } from "./reqlog"
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 import * as oauthKey from "./oauth_key"
-import { LargeBody, LargeSettings, BodyTap, largeSettings, scanPrefix } from "./largepayload"
+import { LargeBody, LargeSettings, BodyTap, UsageTap, largeSettings, scanPrefix, usageOfText } from "./largepayload"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 // a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
 type ChatSender = (t: Target, b: Field[], tc: LazyChat) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool }
 
 // Where a streamed answer goes, when the server can stream (the http1 front end).
 export class StreamSink {
@@ -86,6 +88,85 @@ export class StreamSink {
   constructor(readonly open: (status: int, headers: Map<string, string>) => void, readonly write: (chunk: string) => void, readonly close: () => void) {}
   // binary event-stream frames (Bedrock's streaming routes); only the Bun.serve path sets it
   writeBytes: ((chunk: u8[]) => void) | undefined = undefined
+}
+
+// What an event hook does with one server-sent event: send a block on (the event itself, or another), drop
+// it, or send a last block and end the stream.
+export type EventStep =
+  | { kind: "send", block: string }
+  | { kind: "drop" }
+  | { kind: "end", block: string }
+
+// The link from an event sink to the sink it feeds (a class, so the closures share it).
+class EventLink {
+  inner: StreamSink | undefined = undefined
+  buf: SseBuffer = new SseBuffer()
+  ended = false
+  closed = false
+}
+
+// A sink that cuts what is written into server-sent events and passes each through onEvent before it goes to
+// `real`. Events are held until their closing blank line is in, so a hook always sees whole events. A client
+// that leaves (real.cancelled) is passed on to the sink that feeds this one, and so is the end of the stream
+// when a hook asks for it: the rest of the upstream is not read.
+export function eventSink(real: StreamSink, onEvent: (block: string) => EventStep): StreamSink {
+  const link = new EventLink()
+  const feed = (blocks: string[]): void => {
+    for (const b of blocks) {
+      if (link.ended) return
+      const step = onEvent(b)
+      if (step.kind === "send") {
+        real.write(step.block)
+      } else if (step.kind === "end") {
+        real.write(step.block)
+        link.ended = true
+        const inner = link.inner
+        if (inner !== undefined) inner.cancelled = true
+      }
+    }
+  }
+  const s = new StreamSink(
+    (status, headers) => {
+      real.started = true
+      real.open(status, headers)
+    },
+    (chunk) => {
+      const inner = link.inner
+      if (real.cancelled && inner !== undefined) inner.cancelled = true
+      if (link.ended) return
+      feed(link.buf.push(chunk))
+    },
+    () => {
+      if (!link.ended) {
+        const rest = link.buf.rest()
+        if (rest.trim() !== "") feed([rest + "\n\n"])
+      }
+      if (!link.closed) {
+        link.closed = true
+        real.close()
+      }
+    },
+  )
+  link.inner = s
+  s.writeBytes = (b: u8[]) => {
+    const w = real.writeBytes
+    if (w !== undefined) w(b)
+  }
+  return s
+}
+
+// The sink of a streamed answer with the plugins' post hooks on each chunk (Bifrost runs the LLM post hooks per
+// chunk of a stream): the JSON of every event goes through the chain, in reverse; a chunk a plugin turns into
+// an error ends the stream with that error as the last event. The [DONE] marker and error events are not hooked.
+export function llmStreamSink(chain: PluginChain, run: PluginRun, real: StreamSink): StreamSink {
+  return eventSink(real, (block) => {
+    const data = sseData(block)
+    if (data === undefined || !data.startsWith("{") || data.startsWith("{\"error\"")) return { kind: "send", block: block }
+    const o = chain.runPostChunk(&run.ctx, data)
+    if (o.status >= 400) return { kind: "end", block: "data: " + o.body + "\n\n" }
+    if (o.body === data) return { kind: "send", block: block }
+    return { kind: "send", block: sseWithData(block, o.body) }
+  })
 }
 
 // Turns a provider's streaming body into OpenAI SSE events as bytes arrive.
@@ -470,6 +551,29 @@ function routeOf(op: string): string {
   return "openai"
 }
 
+// Whether a provider of this kind takes a large request of this route (largepayload.tov's largeRoute) as the
+// caller sent it, so the body can stream through: OpenAI-format providers for chat, completions and
+// embeddings, OpenAI for Responses, Anthropic for Messages. The others convert the body (hoisting the system
+// prompt, merging turns, signing the bytes), which needs all of it.
+function takesBodyAsIs(route: string, kind: string): bool {
+  if (route === "responses") return kind === "openai"
+  if (route === "messages") return kind === "anthropic"
+  return providers.streamsNatively(kind)
+}
+
+test("a large body goes as it is only to a provider that takes its route's format", () => {
+  expect(takesBodyAsIs("chat", "openai")).toBe(true)
+  expect(takesBodyAsIs("chat", "groq")).toBe(true)
+  expect(takesBodyAsIs("chat", "anthropic")).toBe(false)
+  expect(takesBodyAsIs("embeddings", "bedrock")).toBe(false)
+  expect(takesBodyAsIs("responses", "openai")).toBe(true)
+  expect(takesBodyAsIs("responses", "groq")).toBe(false)
+  expect(takesBodyAsIs("responses", "anthropic")).toBe(false)
+  expect(takesBodyAsIs("messages", "anthropic")).toBe(true)
+  expect(takesBodyAsIs("messages", "bedrock")).toBe(false)
+  expect(takesBodyAsIs("messages", "openai")).toBe(false)
+})
+
 function requestType(op: string, streamed: bool): string {
   let t = op
   if (op === "chat" || op === "anthropic.messages") t = "chat_completion"
@@ -848,6 +952,9 @@ function fallbackRefs(cfg: Config, body: Field[]): ModelRef[] {
   return out
 }
 
+// What a live or realtime session cost (USD): the total and its input and output parts.
+export type LiveCost = { total: f64, input: f64, output: f64 }
+
 // What one request did, gathered as it runs and recorded once at the end
 // (request log, log store, trace span).
 class ReqCtx {
@@ -920,14 +1027,11 @@ class ReqCtx {
   // a request whose body streams to the provider (large_payload_optimization), and whether the stream that answers it logs it
   large: LargeBody | undefined = undefined
   deferRecord = false
+  // counts the usage of an answer that streams back (set when the answer is passed through: the usage is known only at its end)
+  settle: ((pt: int, ct: int, billed: f64 | undefined) => void) | undefined = undefined
   // an ordinary request's answer longer than this many bytes goes back as it arrives (-1: always read whole)
   passAbove = -1
   constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
-}
-
-// One request's plugin context, shared by its pre and post hooks.
-class PluginRun {
-  constructor(public ctx: PluginContext) {}
 }
 
 class LazyChat {
@@ -1080,6 +1184,9 @@ export class Engine {
   mcp: McpManager | undefined = undefined
   jobs: JobStore
   plugins: PluginChain | undefined = undefined
+  // the plugin runs of the requests in flight, by the id the transport hooks put in x-bf-plugin-run: the LLM hooks
+  // of a request use the context its transport hooks used (pluginroute.tov)
+  pluginRuns: Map<string, PluginRun> = new Map()
   // jsonparser with usage all_requests: the JSON of each stream is completed (plugins.tov JsonStreamFixer)
   jsonStreamOn = false
   semantic: SemanticCache | undefined = undefined
@@ -1697,7 +1804,7 @@ export class Engine {
               const finishAnswer = (): void => {
                 dl.finish()
               }
-              return { ok: true, status: status, body: "", contentType: ctype === "" ? "application/json" : ctype, provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasName: aliasNameOf(t.key, ref.model), aliasFamily: aliasFamilyOf(t.key, ref.model), pass: res, finish: finishAnswer }
+              return { ok: true, status: status, body: "", contentType: ctype === "" ? "application/json" : ctype, provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasName: aliasNameOf(t.key, ref.model), aliasFamily: aliasFamilyOf(t.key, ref.model), pass: res, finish: finishAnswer, noBilled: t.cfg.ignore_provider_cost === true }
             }
           }
           const sink = ctx.sink
@@ -1871,7 +1978,10 @@ export class Engine {
             const rawBody = echoReq || echoResp ? withRawFields(tr.body, echoReq ? up.body : undefined, echoResp ? text : undefined) : tr.body
             return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasName: aliasNameOf(t.key, ref.model), aliasFamily: aliasFamilyOf(t.key, ref.model), served: tr.served ?? "", billed: t.cfg.ignore_provider_cost === true ? undefined : tr.billed }
           } catch (e) {
-            last = { ok: false, status: 502, body: errorJson(`could not read ${ref.provider}'s response: ${e.message}`, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            // a post hook that turned the answer into an error (has_error)
+            const pe = parsePluginError(e.message)
+            if (pe !== undefined) last = { ok: false, status: pe.status, body: pe.body, contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            else last = { ok: false, status: 502, body: errorJson(`could not read ${ref.provider}'s response: ${e.message}`, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
             break
           }
         }
@@ -2742,22 +2852,35 @@ export class Engine {
     // a provider's billed cost (OpenRouter's usage.cost) replaces the datasheet estimate
     // an alias's model_name (Bifrost's canonical name) is the model priced when it is set
     const priced = r.aliasName !== undefined && r.aliasName !== "" ? r.aliasName : r.model
-    const cost = r.billed !== undefined && r.billed > 0 ? r.billed : ctx.decision ? this.pricing.decisionCost(r.provider, priced, r.promptTokens, r.completionTokens) : this.pricing.cost(r.provider, priced, r.promptTokens, r.completionTokens)
-    // the price table's input and output parts (Bifrost's input_cost and output_cost); a billed difference is the additional cost
-    const parts = this.pricing.costParts(r.provider, priced, r.promptTokens, r.completionTokens)
-    ctx.inputCost = parts.input
-    ctx.outputCost = parts.output
-    ctx.additionalCost = Math.max(0.0, cost - parts.input - parts.output)
     ctx.canonicalModel = r.aliasName !== undefined ? r.aliasName : ""
     if (grant.budgets.length > 0 && this.pricing.priceFor(r.provider, priced, ctx.decision) === undefined && !this.unpriced.has(r.provider + "/" + priced)) {
       this.unpriced.add(r.provider + "/" + priced)
       console.error(`raiju: no price for ${r.provider}/${priced}: budgets don't count its requests; add a pricing override`)
     }
-    this.gov.record(grant, r.promptTokens + r.completionTokens, cost)
+    // what the tokens cost, debited from the key's budgets and token limits and counted in the metrics and the log row;
+    // an answer that streams back is counted when it ends (settle, called by passThrough)
+    const rProvider = r.provider
+    const rModel = r.model
+    const settle = (pt: int, ct: int, billed: f64 | undefined): f64 => {
+      const c = billed !== undefined && billed > 0 ? billed : ctx.decision ? this.pricing.decisionCost(rProvider, priced, pt, ct) : this.pricing.cost(rProvider, priced, pt, ct)
+      // the price table's input and output parts (Bifrost's input_cost and output_cost); a billed difference is the additional cost
+      const parts = this.pricing.costParts(rProvider, priced, pt, ct)
+      ctx.inputCost = parts.input
+      ctx.outputCost = parts.output
+      ctx.additionalCost = Math.max(0.0, c - parts.input - parts.output)
+      this.gov.record(grant, pt + ct, c)
+      let sl = ctx.labels
+      sl.provider = rProvider
+      sl.model = rModel
+      metrics.observeUsage(sl, { input: pt, output: ct, cost: c, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
+      return c
+    }
+    const passed = r.pass !== undefined
+    const keepBilled = r.noBilled !== true
+    const cost = passed ? 0.0 : settle(r.promptTokens, r.completionTokens, r.billed)
     let ul = ctx.labels
     ul.provider = r.provider
     ul.model = r.model
-    metrics.observeUsage(ul, { input: r.promptTokens, output: r.completionTokens, cost: cost, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
     if (r.direct === true) {
       // already streamed to the client; nothing to cache or send
       ctx.provider = r.provider
@@ -2796,8 +2919,11 @@ export class Engine {
     out.set("content-type", r.contentType)
     if (r.contentType === "text/event-stream") out.set("cache-control", "no-cache")
     if (r.pass !== undefined) {
-      ctx.promptTokens = r.promptTokens
-      ctx.completionTokens = r.completionTokens
+      ctx.settle = (pt: int, ct: int, billed: f64 | undefined): void => {
+        ctx.promptTokens = pt
+        ctx.completionTokens = ct
+        ctx.cost = settle(pt, ct, keepBilled ? billed : undefined)
+      }
       return this.passThrough(ctx, r, out)
     }
     // Time spent in the gateway itself, upstream calls excluded (Bifrost's "overhead").
@@ -3041,16 +3167,19 @@ export class Engine {
     return { action: action, text: cur, reason: "" }
   }
 
-  // A finished live session (WebRTC) in the request log, the exporters, the spans and the governance
-  // usage, as one request: the model it ran, its duration as the latency, the tokens of its delegated
-  // responses, and the voice seconds it was billed in the row's metadata.
-  recordLive(h: Hdrs, grant: Grant, provider: string, model: string, status: int, durationMs: f64, promptTokens: int, completionTokens: int, input: string, output: string, error: string, extra: Record<string, string>): void {
-    const c = new ReqCtx(h.get("x-request-id") ?? newId("req_"), "live", performance.now() - durationMs)
+  // A finished live or realtime session (over WebRTC or a WebSocket) in the request log, the exporters,
+  // the spans and the governance usage, as one request (op "live" or "realtime"): the model it ran, its
+  // duration as the latency, its tokens, what it cost, and the voice seconds it was billed in the row's metadata.
+  recordLive(op: string, h: Hdrs, grant: Grant, provider: string, model: string, status: int, durationMs: f64, promptTokens: int, completionTokens: int, input: string, output: string, error: string, extra: Record<string, string>, cost: LiveCost): void {
+    const c = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now() - durationMs)
     c.provider = provider
     c.model = model
     c.status = status
     c.promptTokens = promptTokens
     c.completionTokens = completionTokens
+    c.cost = cost.total
+    c.inputCost = cost.input
+    c.outputCost = cost.output
     c.error = error
     c.requested = model
     c.contentOff = this.contentOff(h)
@@ -3193,12 +3322,14 @@ export class Engine {
       await src.cancel()
       return errorResponse(400, `could not find the model in the first ${head.length} bytes of the request (large_payload_optimization.prefetch_size_bytes is ${lp.prefetch}); put "model" first in large request bodies`, "invalid_request_error", noHeaders())
     }
-    // the provider must take the body as it is: an OpenAI-format one (the other formats need the whole body to convert)
-    const first = parseModelVia(this.cfg, meta.model, route === "chat" ? "chat" : route)
+    // the provider must take the body as it is: one whose wire format for this route is the caller's (the other
+    // formats are converted, and the converters need the whole body)
+    const op = route === "embeddings" ? "embeddings" : route === "completions" ? "completions" : route === "responses" ? "responses" : route === "messages" ? "anthropic.messages" : "chat"
+    const first = parseModelVia(this.cfg, meta.model, routeOf(op))
     const p = first.provider === "" ? undefined : providerOf(this.cfg, first.provider)
     const kind = p === undefined ? "" : kindOf(first.provider, p)
     const stream = meta.hasStream ? meta.stream : false
-    if (!providers.streamsNatively(kind)) {
+    if (!takesBodyAsIs(route, kind)) {
       // buffered after all, up to client.max_request_body_size_mb: the ordinary path converts it
       const limit = (this.cfg.client?.max_request_body_size_mb ?? 100) * 1048576
       if (declared > limit) {
@@ -3222,16 +3353,20 @@ export class Engine {
     const lg = new LargeBody(lp, head, meta, ended ? undefined : src, declared)
     const tiny: Field[] = [{ key: "model", raw: quote(meta.model) }]
     const build: Build = (t) => {
-      if (!providers.streamsNatively(t.kind)) throw new SyntaxError(`${t.provider} needs the whole request body in memory, which large_payload_optimization does not allow: use an OpenAI-format provider for large requests`)
-      const up = route === "embeddings" ? openai.embeddingsRequest(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : openai.chatRequest(t, tiny)
+      if (!takesBodyAsIs(route, t.kind)) throw new SyntaxError(`${t.provider} needs the whole request body in memory, which large_payload_optimization does not allow: a large ${route} request goes only to a provider that takes its format as it is`)
+      const up = route === "embeddings" ? openai.embeddingsRequest(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : route === "responses" ? openai.responsesRequest(t, tiny) : route === "messages" ? anthropicNative.nativeRequest(t, tiny) : openai.chatRequest(t, tiny)
       return { url: up.url, headers: up.headers, body: "" }
     }
+    // the answer of a request that streams on is a small one here (a big one is passed through): its usage is read from the text
     const translate: Translate = (t, text, requested) => {
+      if (route === "responses" || route === "messages") {
+        const u = usageOfText(text)
+        return { body: text, promptTokens: u.promptTokens, completionTokens: u.completionTokens }
+      }
       if (route === "embeddings") return try providers.embeddingsTranslate(t.kind, t.model, text, requested)
       if (route === "completions") return try openai.chatResponse(text, requested)
       return try providers.chatTranslate(t.kind, t.model, text, requested, false)
     }
-    const op = route === "embeddings" ? "embeddings" : route === "completions" ? "completions" : "chat"
     const modelBody: Field[] = [{ key: "model", raw: quote(meta.model) }]
     if (meta.hasStream) modelBody.push({ key: "stream", raw: stream ? "true" : "false" })
     const res = try await this.serve(req, op, undefined, modelBody, "", build, translate, stream, undefined, undefined, undefined, undefined, undefined, undefined, lg)
@@ -3251,12 +3386,19 @@ export class Engine {
     ctx.provider = r.provider
     const reader = src.body
     const keep = new BodyTap(lg !== undefined ? lg.settings.truncatedLog : (lps === undefined ? 0 : lps.truncatedLog), 9007199254740991)
+    // the two ends of the answer, read for its usage when it is over
+    const seen = new UsageTap(16384, 65536)
     let finished = false
     const fin = (): void => {
       if (finished) return
       finished = true
       const f = r.finish
       if (f !== undefined) f()
+      const settle = ctx.settle
+      if (settle !== undefined) {
+        const u = seen.usage()
+        settle(u.promptTokens, u.completionTokens, u.billed)
+      }
       if (this.logStore !== undefined && !ctx.contentOff) {
         if (lg !== undefined) ctx.input = lg.tap.previewText()
         ctx.output = keep.previewText()
@@ -3287,6 +3429,7 @@ export class Engine {
           return
         }
         keep.see(v)
+        seen.see(v)
         c.enqueue(v)
       },
       cancel() {
@@ -3381,16 +3524,20 @@ export class Engine {
     const chain = this.plugins
     let run: PluginRun | undefined = undefined
     if (chain !== undefined) {
-      const r = new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: "chat", model: rawStr(body, "model") ?? "", provider: "", headers: new Map(), values: new Map() })
+      // the context of the transport hooks, when they ran for this request
+      const shared = this.pluginRuns.get(req.headers.get(RUN_HEADER) ?? "")
+      const r = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: "chat", model: "", provider: "", headers: new Map(), values: new Map() })
+      r.ctx.op = "chat"
+      r.ctx.model = rawStr(body, "model") ?? ""
       const pre = chain.runPre(&r.ctx, text)
       if (pre.kind === "short_circuit") {
         const post = chain.runPost(&r.ctx, pre.status, pre.body)
         const delay = parseInt(r.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
         if (delay > 0) await sleep(delay)
         const hs: Record<string, string> = new Map()
-        hs.set("content-type", pre.contentType)
+        hs.set("content-type", post.status === pre.status ? pre.contentType : "application/json")
         hs.set("x-bf-plugin-short-circuit", "true")
-        return new Response(post.body, { status: pre.status, headers: hs })
+        return new Response(post.body, { status: post.status, headers: hs })
       }
       run = r
       if (pre.body !== text) {
@@ -3415,7 +3562,9 @@ export class Engine {
       }
     }
     const autoCache = this.autoPromptCache || req.headers.get("x-bf-prompt-cache-auto-inject") === "true"
-    const canPipe = stream && sink !== undefined
+    // a streamed answer goes through the plugins' post hooks chunk by chunk
+    const pipeSink = stream && sink !== undefined && chain !== undefined && run !== undefined ? llmStreamSink(chain, run, sink) : sink
+    const canPipe = stream && pipeSink !== undefined
     // a provider's own prompt_cache.auto_inject turns the breakpoints on for its requests
     const autoFor = (t: Target): bool => autoCache || (t.cfg.prompt_cache?.auto_inject ?? false)
     // compat: the request for each target, shaped in build (drops and fits, and Responses when the model needs it)
@@ -3456,7 +3605,11 @@ export class Engine {
         }
         const tr = try providers.chatTranslate(t.kind, t.model, src, requested, false)
         let out = tr.body
-        if (pluginChain !== undefined && pluginRun !== undefined) out = pluginChain.runPost(&pluginRun.ctx, 200, out).body
+        if (pluginChain !== undefined && pluginRun !== undefined) {
+          const po = pluginChain.runPost(&pluginRun.ctx, 200, out)
+          if (po.status >= 400) throw new SyntaxError(pluginErrorMessage(po.status, po.body))
+          out = po.body
+        }
         if (reversible) out = try restoreCompletion(out, vault)
         if (outGuard === undefined) return { body: out, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served, billed: tr.billed }
         const g = try applyToCompletion(out, outGuard)
@@ -3494,7 +3647,12 @@ export class Engine {
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return guardedConv(conv)
     }
-    const res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? sink : undefined, mk, cp, promptUsed)
+    let res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed)
+    // post hooks on an error answer (they may recover from it or change it); a stream's hooks ran per chunk
+    if (chain !== undefined && run !== undefined) {
+      if (pipeSink !== undefined && pipeSink.started) chain.finish(&run.ctx)
+      else if (res.status >= 400) res = await errorPost(chain, run, res)
+    }
     // external output guardrails see the whole answer, so they apply to non-streamed answers
     if (!guardOn || this.guardProviders.length === 0 || stream || res.status !== 200) return res
     let answer = ""

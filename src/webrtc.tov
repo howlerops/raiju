@@ -356,6 +356,10 @@ export class LiveHooks {
   constructor(readonly readmit: () => Refusal | undefined, readonly report: (r: LiveReport) => void, readonly bind: (id: string) => bool, readonly count: (direction: string, type: string) => void) {}
 }
 
+// The tokens a session's responses used under one model, as the provider reported them: the totals,
+// the cached part of the prompt, and the audio tokens among each side's.
+export type ModelTokens = { model: string, prompt: int, completion: int, cached: int, inputAudio: int, outputAudio: int }
+
 // One finished session, for its log row.
 export type LiveReport = {
   sessionId: string,
@@ -364,6 +368,8 @@ export type LiveReport = {
   billedSeconds: f64,
   promptTokens: int,
   completionTokens: int,
+  // the same tokens by the model that used them (the realtime model, or the models of delegated responses)
+  uses: ModelTokens[],
   status: int,
   error: string,
   reason: string,
@@ -380,7 +386,7 @@ type TranscriptLine = { role: string, text: string }
 // holds it, and the text. A rewrite puts guarded text back (rewriteTexts).
 export function clientTexts(type: string, m: string): string[] {
   const out: string[] = []
-  if (type === "session.update") {
+  if (type === "session.update" || type === "session.start") {
     const a = strAt(m, ["session", "instructions"])
     if (a !== "") out.push(a)
     const b = strAt(m, ["session", "delegation", "responses", "instructions"])
@@ -388,7 +394,7 @@ export function clientTexts(type: string, m: string): string[] {
   } else if (type === "session.instructions.append" || type === "session.thinking.append" || type === "session.commentary.append") {
     const a = strAt(m, ["content"])
     if (a !== "") out.push(a)
-  } else if (type === "response.item.create") {
+  } else if (type === "response.item.create" || type === "conversation.item.create") {
     const item = jsonAt(m, ["item"])
     if (item !== undefined) {
       const o = strAt(item, ["output"])
@@ -421,7 +427,7 @@ export function rewriteClientTexts(type: string, m: string, texts: string[]): st
     return quote(t)
   }
   try {
-    if (type === "session.update") {
+    if (type === "session.update" || type === "session.start") {
       let out = m
       if (strAt(out, ["session", "instructions"]) !== "") out = withJsonAt(out, ["session", "instructions"], next())
       if (strAt(out, ["session", "delegation", "responses", "instructions"]) !== "") out = withJsonAt(out, ["session", "delegation", "responses", "instructions"], next())
@@ -430,7 +436,7 @@ export function rewriteClientTexts(type: string, m: string, texts: string[]): st
     if (type === "session.instructions.append" || type === "session.thinking.append" || type === "session.commentary.append") {
       return strAt(m, ["content"]) !== "" ? withJsonAt(m, ["content"], next()) : m
     }
-    if (type === "response.item.create") {
+    if (type === "response.item.create" || type === "conversation.item.create") {
       const item = jsonAt(m, ["item"])
       if (item === undefined) return m
       let it = item
@@ -459,12 +465,30 @@ export function rewriteClientTexts(type: string, m: string, texts: string[]): st
 export function providerText(type: string, m: string): string {
   if (type === "session.output_transcript.delta") return strAt(m, ["delta"])
   if (type === "response.event" && strAt(m, ["event", "type"]) === "response.output_text.delta") return strAt(m, ["event", "delta"])
+  // the realtime API: text and audio transcript deltas, in the GA and the beta names; and what the
+  // provider transcribed of the caller's audio
+  if (isRealtimeOutputDelta(type)) return strAt(m, ["delta"])
+  if (type === INPUT_TRANSCRIPT) return strAt(m, ["transcript"])
   return ""
+}
+
+// The realtime events whose delta is output text.
+function isRealtimeOutputDelta(type: string): bool {
+  return type === "response.output_text.delta" || type === "response.text.delta" || type === "response.output_audio_transcript.delta" || type === "response.audio_transcript.delta"
+}
+
+const INPUT_TRANSCRIPT = "conversation.item.input_audio_transcription.completed"
+
+// What a provider event's text is checked as: "input" for the transcript of the caller's own audio, "output" for
+// anything the model said.
+export function providerSource(type: string): string {
+  return type === INPUT_TRANSCRIPT ? "input" : "output"
 }
 
 function withProviderText(type: string, m: string, text: string): string {
   try {
-    if (type === "session.output_transcript.delta") return withJsonAt(m, ["delta"], quote(text))
+    if (type === "session.output_transcript.delta" || isRealtimeOutputDelta(type)) return withJsonAt(m, ["delta"], quote(text))
+    if (type === INPUT_TRANSCRIPT) return withJsonAt(m, ["transcript"], quote(text))
     return withJsonAt(m, ["event", "delta"], quote(text))
   } catch (e) {
     return m
@@ -475,6 +499,19 @@ export class LiveCore {
   filter: LiveEventFilter | undefined = undefined
   // the least voice time billed (the provider bills a created WebRTC session this much)
   minimum = LIVE_MINIMUM_SECONDS
+  // A realtime session (the Realtime API: OpenAI, Azure, xAI) rather than a GPT Live one. It has no
+  // session.close or session.closed and no voice seconds: it is admitted again at each turn, its tokens
+  // come from response.done, and it ends when either side leaves.
+  realtime = false
+  // the model the session runs, which the tokens of its own responses (realtime) are billed under, and the
+  // model of a live session's delegated responses when they name none
+  model = ""
+  backendModel = ""
+  // a turn (a response, from its start to its response.done) is running
+  turnActive = false
+  // the provider's connection ended abnormally
+  providerFailed = false
+  uses: ModelTokens[] = []
   sessionId = ""
   // the provider's latest cumulative voice seconds, and those not yet checked against a window
   reported = 0.0
@@ -528,6 +565,11 @@ export class LiveCore {
     if (texts.length > 0) out = rewriteClientTexts(type, m, texts)
     this.hooks.count("in", type)
     this.events += 1
+    // a realtime turn the caller starts is admitted first; a refusal ends the session and the event goes nowhere
+    if (this.realtime && type === "response.create") {
+      this.startTurn()
+      if (this.refused) return
+    }
     if (type === "session.close") {
       this.closeSent = true
       this.startDrain(nowMs)
@@ -562,7 +604,9 @@ export class LiveCore {
     this.events += 1
     let out = m
     // (an if chain: a switch on a string variable releases the string twice in this compiler)
-    if (type === "session.started") {
+    if (this.realtime) {
+      out = this.realtimeEvent(type, m, repl)
+    } else if (type === "session.started") {
       if (this.startedMs === 0.0) this.startedMs = nowMs
       const id = strAt(m, ["session", "id"])
       if (id !== "") {
@@ -608,6 +652,78 @@ export class LiveCore {
     this.endForRefusal("guardrail_violation", "response blocked by guardrails: " + reason, 400)
   }
 
+  // A guard blocked what the provider transcribed of the caller's audio: the audio is already with the
+  // provider, so the session ends.
+  blockInput(reason: string): void {
+    this.endForRefusal("guardrail_violation", "request blocked by guardrails: " + reason, 400)
+  }
+
+  // The source ("input" or "output") a guard checks a provider event's text as.
+  providerSourceOf(m: string): string {
+    return providerSource(eventType(m))
+  }
+
+  // A realtime turn starts: it is admitted (the first one with the connection, each later one here), and
+  // a budget or limit that ran out ends the session.
+  private startTurn(): void {
+    if (this.turnActive || this.finished || this.refused) return
+    this.turnActive = true
+    this.lastUsageMs = this.now
+    const why = this.hooks.readmit()
+    if (why !== undefined) this.endForRefusal(why.type, why.message, why.status)
+  }
+
+  // The realtime events that carry state: the turn they start or end, the transcripts and the output
+  // text (checked above, repl is what the guard left), and the usage of a finished response.
+  private realtimeEvent(type: string, m: string, repl: string | undefined): string {
+    let out = m
+    if (type === "session.created") {
+      const id = strAt(m, ["session", "id"])
+      if (id !== "" && this.sessionId === "") this.sessionId = id
+    } else if (type === "response.created" || type === "input_audio_buffer.committed") {
+      this.startTurn()
+    } else if (type === INPUT_TRANSCRIPT) {
+      this.append("user", strAt(m, ["transcript"]))
+      if (repl !== undefined) out = withProviderText(type, m, repl)
+    } else if (isRealtimeOutputDelta(type)) {
+      const d = strAt(m, ["delta"])
+      this.append("assistant", d)
+      this.note(d)
+      if (repl !== undefined) out = withProviderText(type, m, repl)
+    } else if (type === "response.done") {
+      this.turnActive = false
+      this.onRealtimeDone(m)
+    }
+    return out
+  }
+
+  // A realtime response finished: its usage joins the session's (once per response).
+  private onRealtimeDone(m: string): void {
+    const id = strAt(m, ["response", "id"])
+    if (id !== "") {
+      if (this.billed.has(id)) return
+      this.billed.add(id)
+    }
+    const u = ["response", "usage"]
+    this.addTokens(this.model, Math.trunc(numAt(m, u.concat(["input_tokens"]))), Math.trunc(numAt(m, u.concat(["output_tokens"]))),
+      Math.trunc(numAt(m, u.concat(["input_token_details", "cached_tokens"]))), Math.trunc(numAt(m, u.concat(["input_token_details", "audio_tokens"]))),
+      Math.trunc(numAt(m, u.concat(["output_token_details", "audio_tokens"]))))
+  }
+
+  // Adds tokens to the session's totals and to the model's.
+  private addTokens(model: string, prompt: int, completion: int, cached: int, inputAudio: int, outputAudio: int): void {
+    this.promptTokens += prompt
+    this.completionTokens += completion
+    for (let i = 0; i < this.uses.length; i++) {
+      const u = this.uses[i]!
+      if (u.model === model) {
+        this.uses[i] = { model: model, prompt: u.prompt + prompt, completion: u.completion + completion, cached: u.cached + cached, inputAudio: u.inputAudio + inputAudio, outputAudio: u.outputAudio + outputAudio }
+        return
+      }
+    }
+    this.uses.push({ model: model, prompt: prompt, completion: completion, cached: cached, inputAudio: inputAudio, outputAudio: outputAudio })
+  }
+
   private append(role: string, delta: string): void {
     if (delta === "" || this.transcriptBytes + delta.byteLength > TRANSCRIPT_MAX) return
     this.transcriptBytes += delta.byteLength
@@ -651,8 +767,13 @@ export class LiveCore {
       if (this.billed.has(id)) return
       this.billed.add(id)
     }
-    this.promptTokens += Math.trunc(numAt(m, ["event", "response", "usage", "input_tokens"]))
-    this.completionTokens += Math.trunc(numAt(m, ["event", "response", "usage", "output_tokens"]))
+    // the tokens are billed under the model the response names, else the session's backend model
+    let model = strAt(m, ["event", "response", "model"])
+    if (model === "") model = this.backendModel
+    if (model === "") model = this.model
+    const u = ["event", "response", "usage"]
+    this.addTokens(model, Math.trunc(numAt(m, u.concat(["input_tokens"]))), Math.trunc(numAt(m, u.concat(["output_tokens"]))),
+      Math.trunc(numAt(m, u.concat(["input_tokens_details", "cached_tokens"]))), 0, 0)
   }
 
   // Tells the browser why the session is ending, then closes it upstream so the usage already spent
@@ -664,6 +785,12 @@ export class LiveCore {
     this.error = message
     this.io.toClient(errorEvent(type, message))
     this.withhold = true
+    if (this.realtime) {
+      // nothing to wait for: the session is reported and both connections are let go
+      this.finish(this.reported, this.now)
+      this.io.abandon()
+      return
+    }
     this.requestClose()
   }
 
@@ -676,6 +803,10 @@ export class LiveCore {
     if (this.clientGone) return
     this.clientGone = true
     this.withhold = true
+    if (this.realtime) {
+      this.finish(this.reported, nowMs)
+      return
+    }
     this.requestClose()
     this.startDrain(nowMs)
   }
@@ -696,6 +827,19 @@ export class LiveCore {
   providerEnded(nowMs: f64): void {
     this.now = nowMs
     if (this.finished) return
+    if (this.realtime) {
+      // a realtime provider just hangs up: only a connection that broke is an error
+      if (this.providerFailed && !this.clientGone && !this.refused) {
+        const msg = "the realtime session's upstream connection was interrupted"
+        if (this.status === 200) {
+          this.status = 502
+          this.error = msg
+        }
+        if (!this.withhold) this.io.toClient(errorEvent("server_error", msg))
+      }
+      this.finish(this.reported, nowMs)
+      return
+    }
     const early = !this.sessionClosed && !this.clientGone
     if (early) {
       if (this.status === 200 && !this.closeSent) {
@@ -733,7 +877,7 @@ export class LiveCore {
       else output += (output === "" ? "" : "\n") + l.text
     }
     this.hooks.report({
-      sessionId: this.sessionId, seconds: seconds, billedSeconds: billed, promptTokens: this.promptTokens, completionTokens: this.completionTokens,
+      sessionId: this.sessionId, seconds: seconds, billedSeconds: billed, promptTokens: this.promptTokens, completionTokens: this.completionTokens, uses: this.uses,
       status: this.status, error: this.error, reason: this.reason, startedMs: this.startedMs, endedMs: nowMs, input: input, output: output, events: this.events,
     })
   }
@@ -747,7 +891,8 @@ export class LiveCore {
       this.io.abandon()
       return
     }
-    if (nowMs >= this.nextStaleMs) {
+    // (a realtime session has no voice windows: it is admitted at each turn)
+    if (!this.realtime && nowMs >= this.nextStaleMs) {
       this.nextStaleMs = nowMs + STALE_EVERY_MS
       if (nowMs - this.lastUsageMs >= STALE_AFTER_MS && !this.closeSent) {
         this.lastUsageMs = nowMs
@@ -761,8 +906,9 @@ export class LiveCore {
 
 // One leg of the relay (the browser's, or the provider's): what the relay needs of a peer connection,
 // as closures, so the relay runs on fake legs in tests.
+// close gets the WebSocket close code and reason a leg that is a WebSocket ends with (a peer connection has no use for them).
 export class Leg {
-  constructor(readonly sendText: (m: string) => bool, readonly sendPacket: (p: u8[]) => bool, readonly buffered: () => int, readonly close: () => void) {}
+  constructor(readonly sendText: (m: string) => bool, readonly sendPacket: (p: u8[]) => bool, readonly buffered: () => int, readonly close: (code: int, reason: string) => void) {}
 }
 
 // Checks a piece of text against the gateway's guardrails (source "input" or "output").
@@ -889,6 +1035,7 @@ export class Relay {
       }
       this.qUp.shift()
       this.core.fromClient(m, [], Date.now())
+      if (this.core.finished) this.endSoon()
     }
   }
 
@@ -915,6 +1062,7 @@ export class Relay {
         }
       }
       if (!refused && !this.closed) this.core.fromClient(m, changed ? out : [], Date.now())
+      if (this.core.finished) this.endSoon()
     }
     this.busyUp = false
     this.drainUp()
@@ -939,20 +1087,25 @@ export class Relay {
     const m = this.qDown.shift()!
     const g = this.guard
     const t = this.core.providerTextOf(m)
+    const source = this.core.providerSourceOf(m)
     let repl: string | undefined = undefined
     let blocked = ""
     if (g !== undefined) {
-      const v = await g(this.core.outputWindow(t), "output")
+      // output is checked with the deltas before it, so a secret split across tokens is seen
+      const v = await g(source === "output" ? this.core.outputWindow(t) : t, source)
       if (v.action === "block") {
         blocked = v.reason
       } else if (v.action === "redact") {
         // the window found something: the delta alone says what to put in its place
-        const d = await g(t, "output")
+        const d = source === "output" ? await g(t, source) : v
         if (d.action === "redact") repl = d.text
       }
     }
     if (!this.closed) {
-      if (blocked !== "") this.core.blockOutput(blocked)
+      if (blocked !== "") {
+        if (source === "input") this.core.blockInput(blocked)
+        else this.core.blockOutput(blocked)
+      }
       this.core.fromProvider(m, repl, Date.now())
       if (this.core.finished) this.endSoon()
     }
@@ -990,13 +1143,20 @@ export class Relay {
   browserGone(): void {
     if (this.closed) return
     this.core.clientLeft(Date.now())
-    // before the setup finished there is no session to wait for
-    if (!this.setupDone) this.close()
+    // before the setup finished there is no session to wait for, and a realtime one has no closing exchange
+    if (!this.setupDone || this.core.realtime) this.close()
   }
 
   // The provider's connection or data channel ended: what it last reported is billed and the relay ends.
   providerGone(): void {
     if (this.closed) return
+    this.close()
+  }
+
+  // The provider's connection broke (it did not close normally).
+  providerBroke(): void {
+    if (this.closed) return
+    this.core.providerFailed = true
     this.close()
   }
 
@@ -1055,8 +1215,19 @@ export class Relay {
     this.pendingProvider = []
     this.qUp = []
     this.qDown = []
-    if (c !== undefined) c.close()
-    if (p !== undefined) p.close()
+    // a WebSocket leg ends with the session's own outcome: refused, failed, or done
+    const core = this.core
+    let code = 1000
+    let why = "session ended"
+    if (core.refused) {
+      code = 1008
+      why = "refused"
+    } else if (core.providerFailed || core.status !== 200) {
+      code = 1011
+      why = "session failed"
+    }
+    if (c !== undefined) c.close(code, why)
+    if (p !== undefined) p.close(1000, "session ended")
     const done = this.onClosed
     this.onClosed = undefined
     this.cell.relay = undefined
@@ -1080,6 +1251,11 @@ export type Setup = {
   filter: LiveEventFilter | undefined,
   iceServers: string[],
   bindAddress: string,
+  // a realtime call (POST /v1/realtime/calls) rather than a GPT Live session, the model it runs, and the
+  // model a live session's delegated responses run on
+  realtime: bool,
+  model: string,
+  backendModel: string,
 }
 
 export type Established = { status: int, type: string, message: string, answer: string, sessionId: string, relay: Relay | undefined, body: string, contentType: string }
@@ -1181,6 +1357,16 @@ function rtcLeg(st: PeerLeg): Leg {
   })
 }
 
+// Starts the relay's clock, once a second, until the relay is over.
+export function startClock(relay: Relay): void {
+  const clock = setInterval(() => {
+    relay.tick(Date.now())
+  }, 1000)
+  relay.ticker = () => {
+    clearInterval(clock)
+  }
+}
+
 function makePeer(cfg: RTCConfig): RTCPeerConnection | undefined {
   try {
     return try new RTCPeerConnection(cfg)
@@ -1203,6 +1389,9 @@ export async function establish(s: Setup): Promise<Established> {
   }
   const relay = new Relay(s.hooks, s.guard, Date.now())
   relay.core.filter = s.filter
+  relay.core.realtime = s.realtime
+  relay.core.model = s.model
+  relay.core.backendModel = s.backendModel
   // nothing is billed until the provider has created the session
   relay.core.minimum = 0.0
   const downLeg = new PeerLeg(down, randomSsrc())
@@ -1297,10 +1486,11 @@ export async function establish(s: Setup): Promise<Established> {
     const r = abort(ex.status, ex.type, ex.message)
     return { status: r.status, type: r.type, message: r.message, answer: "", sessionId: "", relay: undefined, body: ex.body, contentType: ex.contentType }
   }
-  // the provider has created the session: the minimum is incurred
-  relay.core.minimum = LIVE_MINIMUM_SECONDS
-  relay.core.sessionId = ex.sessionId
-  if (!s.hooks.bind(ex.sessionId)) return abort(500, "server_error", "the live session could not be recorded for its virtual key and was not opened")
+  // the provider has created the session: the minimum is incurred (a realtime call has none, and the
+  // provider names its session later, in session.created)
+  if (!s.realtime) relay.core.minimum = LIVE_MINIMUM_SECONDS
+  if (ex.sessionId !== "") relay.core.sessionId = ex.sessionId
+  if (ex.sessionId !== "" && !s.hooks.bind(ex.sessionId)) return abort(500, "server_error", "the live session could not be recorded for its virtual key and was not opened")
   if (ex.sdp === "") return abort(502, "upstream_connection_error", "live session create response has no SDP answer")
   if (up.setRemoteDescription(ex.sdp, "answer") !== "") return abort(502, "upstream_connection_error", "invalid upstream SDP answer")
   const connected = await upState.wait(HANDSHAKE_MS)
@@ -1310,12 +1500,7 @@ export async function establish(s: Setup): Promise<Established> {
   if (answer === "" || down.localDescriptionType !== "answer") return abort(500, "server_error", "failed to create browser SDP answer")
   if (relay.closing) return failed(502, "upstream_connection_error", "the WebRTC session closed during setup")
   relay.setupDone = true
-  const clock = setInterval(() => {
-    relay.tick(Date.now())
-  }, 1000)
-  relay.ticker = () => {
-    clearInterval(clock)
-  }
+  startClock(relay)
   return { status: 0, type: "", message: "", answer: answer, sessionId: ex.sessionId, relay: relay, body: "", contentType: "" }
 }
 
@@ -1636,6 +1821,7 @@ class FakeLeg {
   texts: string[] = []
   packets: u8[][] = []
   closes = 0
+  codes: int[] = []
   queued = 0
   leg(): Leg {
     const f = this
@@ -1645,7 +1831,8 @@ class FakeLeg {
     }, (p) => {
       f.packets.push(p)
       return true
-    }, () => f.queued, () => {
+    }, () => f.queued, (code, why) => {
+      f.codes.push(code)
       f.closes += 1
     })
   }
@@ -1783,4 +1970,236 @@ test("a queue that overflows ends the relay", () => {
   // the browser's channel never opens
   for (let i = 0; i < 1001; i++) r.sendClient(`{"type":"x"}`)
   expect(r.closing).toBe(true)
+})
+
+function realtimeFixture(): { core: LiveCore, cap: Capture } {
+  const t = fixture()
+  t.core.realtime = true
+  t.core.minimum = 0.0
+  t.core.model = "gpt-realtime"
+  return t
+}
+
+const DONE_1 = `{"type":"response.done","response":{"id":"resp_1","status":"completed","usage":{"total_tokens":150,"input_tokens":100,"output_tokens":50,"input_token_details":{"text_tokens":60,"audio_tokens":40,"cached_tokens":20},"output_token_details":{"text_tokens":10,"audio_tokens":40}}}}`
+
+test("a realtime session bills the usage of its responses, once each, by model", () => {
+  const t = realtimeFixture()
+  t.core.fromProvider(`{"type":"session.created","session":{"id":"sess_rt1"}}`, undefined, 1100.0)
+  t.core.fromProvider(DONE_1, undefined, 1200.0)
+  // the same response again is not billed twice
+  t.core.fromProvider(DONE_1, undefined, 1300.0)
+  t.core.fromProvider(`{"type":"response.done","response":{"id":"resp_2","usage":{"input_tokens":10,"output_tokens":5,"input_token_details":{"audio_tokens":4,"cached_tokens":0},"output_token_details":{"audio_tokens":1}}}}`, undefined, 1400.0)
+  // a response with no usage adds nothing
+  t.core.fromProvider(`{"type":"response.done","response":{"id":"resp_3"}}`, undefined, 1500.0)
+  t.core.clientLeft(1600.0)
+  expect(t.cap.reports.length).toBe(1)
+  const r = t.cap.reports[0]!
+  expect(r.sessionId).toBe("sess_rt1")
+  expect(r.promptTokens).toBe(110)
+  expect(r.completionTokens).toBe(55)
+  expect(r.uses.length).toBe(1)
+  expect(r.uses[0]!.model).toBe("gpt-realtime")
+  expect(r.uses[0]!.cached).toBe(20)
+  expect(r.uses[0]!.inputAudio).toBe(44)
+  expect(r.uses[0]!.outputAudio).toBe(41)
+  expect(r.billedSeconds).toBe(0.0)
+  expect(r.status).toBe(200)
+  // every event reached the client: the usage is not hidden from it
+  expect(t.cap.client.length).toBe(5)
+})
+
+test("a realtime session ends at once when the client leaves, and sends no session.close", () => {
+  const t = realtimeFixture()
+  t.core.fromProvider(DONE_1, undefined, 1200.0)
+  t.core.clientLeft(1300.0)
+  expect(t.cap.provider.length).toBe(0)
+  expect(t.cap.reports.length).toBe(1)
+  expect(t.core.finished).toBe(true)
+  // later events change nothing
+  t.core.fromProvider(DONE_1, undefined, 1400.0)
+  expect(t.cap.reports.length).toBe(1)
+})
+
+test("a realtime turn is admitted when it starts, once, whoever starts it", () => {
+  const t = realtimeFixture()
+  // the caller starts a turn
+  t.core.fromClient(`{"type":"response.create"}`, [], 1100.0)
+  expect(t.cap.readmits).toBe(1)
+  expect(t.cap.provider.length).toBe(1)
+  // the provider's own events for the same turn do not admit it again
+  t.core.fromProvider(`{"type":"response.created","response":{"id":"resp_1"}}`, undefined, 1150.0)
+  t.core.fromClient(`{"type":"response.create"}`, [], 1160.0)
+  expect(t.cap.readmits).toBe(1)
+  t.core.fromProvider(DONE_1, undefined, 1200.0)
+  expect(t.core.turnActive).toBe(false)
+  // the provider starts the next one (the caller's speech was committed)
+  t.core.fromProvider(`{"type":"input_audio_buffer.committed","item_id":"item_1"}`, undefined, 1300.0)
+  expect(t.cap.readmits).toBe(2)
+  t.core.fromProvider(`{"type":"response.created","response":{"id":"resp_2"}}`, undefined, 1310.0)
+  expect(t.cap.readmits).toBe(2)
+  // events that start no turn do not admit
+  t.core.fromProvider(`{"type":"response.output_audio.delta","delta":"AAAA"}`, undefined, 1320.0)
+  t.core.fromClient(`{"type":"input_audio_buffer.append","audio":"AAAA"}`, [], 1330.0)
+  expect(t.cap.readmits).toBe(2)
+})
+
+test("a refused realtime turn ends the session: the caller is told and the event goes nowhere", () => {
+  const t = realtimeFixture()
+  t.cap.readmitWhy = "budget is spent"
+  t.cap.readmitType = "budget_exceeded"
+  t.core.fromClient(`{"type":"response.create"}`, [], 1100.0)
+  expect(t.cap.provider.length).toBe(0)
+  expect(t.cap.client.length).toBe(1)
+  expect(t.cap.client[0]!.includes("budget is spent")).toBe(true)
+  expect(t.cap.client[0]!.includes("budget_exceeded")).toBe(true)
+  expect(t.cap.abandoned).toBe(1)
+  expect(t.core.finished).toBe(true)
+  expect(t.cap.reports.length).toBe(1)
+  expect(t.cap.reports[0]!.status).toBe(429)
+  expect(t.cap.reports[0]!.error).toBe("budget is spent")
+  // a turn the provider starts is admitted the same way
+  const u = realtimeFixture()
+  u.cap.readmitWhy = "rate limit reached"
+  u.core.fromProvider(`{"type":"response.created","response":{"id":"resp_9"}}`, undefined, 1100.0)
+  expect(u.cap.client.length).toBe(1)
+  expect(u.cap.client[0]!.includes("rate limit reached")).toBe(true)
+  expect(u.cap.reports[0]!.status).toBe(429)
+})
+
+test("realtime text is guarded: output deltas in both naming schemes, and what the caller's audio said", () => {
+  expect(providerText("response.output_audio_transcript.delta", `{"type":"response.output_audio_transcript.delta","delta":"hi there"}`)).toBe("hi there")
+  expect(providerText("response.audio_transcript.delta", `{"type":"response.audio_transcript.delta","delta":"old name"}`)).toBe("old name")
+  expect(providerText("response.output_text.delta", `{"type":"response.output_text.delta","delta":"text"}`)).toBe("text")
+  expect(providerText("response.text.delta", `{"type":"response.text.delta","delta":"beta"}`)).toBe("beta")
+  expect(providerText("conversation.item.input_audio_transcription.completed", `{"type":"conversation.item.input_audio_transcription.completed","transcript":"my key"}`)).toBe("my key")
+  expect(providerText("response.output_audio.delta", `{"type":"response.output_audio.delta","delta":"AAAA"}`)).toBe("")
+  expect(providerSource("conversation.item.input_audio_transcription.completed")).toBe("input")
+  expect(providerSource("response.output_text.delta")).toBe("output")
+  // the caller's item text is checked, and put back as the guard left it
+  const item = `{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}`
+  expect(clientTexts("conversation.item.create", item).join("|")).toBe("hello")
+  expect(rewriteClientTexts("conversation.item.create", item, ["[redacted]"]).includes(`"text":"[redacted]"`)).toBe(true)
+  // redacted output reaches the caller; the transcript the log keeps is what the provider said
+  const t = realtimeFixture()
+  t.core.fromProvider(`{"type":"response.output_audio_transcript.delta","delta":"key sk-123"}`, "key [redacted]", 1100.0)
+  expect(t.cap.client.join("|")).toBe(`{"type":"response.output_audio_transcript.delta","delta":"key [redacted]"}`)
+  t.core.fromProvider(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"my card"}`, "my [redacted]", 1200.0)
+  expect(t.cap.client[1]!.includes(`"transcript":"my [redacted]"`)).toBe(true)
+  t.core.clientLeft(1300.0)
+  expect(t.cap.reports[0]!.output).toBe("key sk-123")
+  expect(t.cap.reports[0]!.input).toBe("my card")
+})
+
+test("realtime guard blocks end the session, input or output", () => {
+  const t = realtimeFixture()
+  t.core.blockOutput("secret")
+  expect(t.cap.client[0]!.includes("response blocked by guardrails: secret")).toBe(true)
+  expect(t.cap.abandoned).toBe(1)
+  expect(t.cap.reports[0]!.status).toBe(400)
+  const u = realtimeFixture()
+  u.core.blockInput("card number")
+  expect(u.cap.client[0]!.includes("request blocked by guardrails: card number")).toBe(true)
+  expect(u.cap.reports[0]!.status).toBe(400)
+})
+
+test("a realtime provider that hangs up is no error; one that breaks is", () => {
+  const t = realtimeFixture()
+  t.core.fromProvider(DONE_1, undefined, 1200.0)
+  t.core.providerEnded(1300.0)
+  expect(t.cap.reports.length).toBe(1)
+  expect(t.cap.reports[0]!.status).toBe(200)
+  expect(t.cap.reports[0]!.promptTokens).toBe(100)
+  expect(t.cap.client.length).toBe(1)
+  const u = realtimeFixture()
+  u.core.fromProvider(DONE_1, undefined, 1200.0)
+  u.core.providerFailed = true
+  u.core.providerEnded(1300.0)
+  expect(u.cap.reports[0]!.status).toBe(502)
+  expect(u.cap.reports[0]!.promptTokens).toBe(100)
+  expect(u.cap.client[u.cap.client.length - 1]!.includes("interrupted")).toBe(true)
+})
+
+test("a realtime session has no voice windows and no stale check", () => {
+  const t = realtimeFixture()
+  t.core.tick(7000.0)
+  t.core.tick(64000.0)
+  t.core.tick(130000.0)
+  expect(t.cap.readmits).toBe(0)
+  // usage events of a live session mean nothing here
+  t.core.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":100}}`, undefined, 1100.0)
+  t.core.clientLeft(1200.0)
+  expect(t.cap.readmits).toBe(0)
+  expect(t.cap.reports[0]!.seconds).toBe(0.0)
+})
+
+test("live backend tokens are kept by the model that ran them, with the cache", () => {
+  const t = fixture()
+  t.core.model = "gpt-live"
+  t.core.backendModel = "gpt-5.4"
+  t.core.fromProvider(`{"type":"response.event","event":{"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":30}}}}}`, undefined, 1100.0)
+  t.core.fromProvider(`{"type":"response.event","event":{"type":"response.completed","response":{"id":"r2","model":"gpt-5.4-mini","usage":{"input_tokens":7,"output_tokens":3}}}}`, undefined, 1200.0)
+  t.core.fromProvider(`{"type":"session.closed","usage":{"seconds":20}}`, undefined, 1300.0)
+  const r = t.cap.reports[0]!
+  expect(r.promptTokens).toBe(107)
+  expect(r.completionTokens).toBe(13)
+  expect(r.uses.length).toBe(2)
+  expect(r.uses[0]!.model).toBe("gpt-5.4")
+  expect(r.uses[0]!.cached).toBe(30)
+  expect(r.uses[1]!.model).toBe("gpt-5.4-mini")
+  expect(r.billedSeconds).toBe(20.0)
+})
+
+test("a relay for a realtime session ends when the client leaves", () => {
+  const t = new RelayFixture()
+  const r = t.relay
+  r.core.realtime = true
+  r.core.minimum = 0.0
+  r.channelOpened(true)
+  r.channelOpened(false)
+  r.setupDone = true
+  r.fromBrowser(`{"type":"session.update","session":{"voice":"alloy"}}`)
+  expect(t.provider.texts.length).toBe(1)
+  r.fromProvider(DONE_1)
+  r.browserGone()
+  expect(r.closing).toBe(true)
+  expect(t.cap.reports.length).toBe(1)
+  expect(t.cap.reports[0]!.promptTokens).toBe(100)
+  // the provider got no session.close
+  expect(t.provider.texts.length).toBe(1)
+})
+
+test("a WebSocket client leg ends with the session's own outcome", () => {
+  // a refused realtime session: policy violation, after the client has the error event
+  const a = new RelayFixture()
+  a.relay.core.realtime = true
+  a.relay.core.minimum = 0.0
+  a.relay.channelOpened(true)
+  a.relay.channelOpened(false)
+  a.relay.setupDone = true
+  a.relay.core.blockOutput("secret")
+  expect(a.relay.closing).toBe(true)
+  expect(a.browser.texts.length).toBe(1)
+  expect(a.browser.texts[0]!.includes("response blocked by guardrails: secret")).toBe(true)
+  a.relay.close()
+  expect(a.browser.codes.join(",")).toBe("1008")
+  // a session that just ends
+  const b = new RelayFixture()
+  b.relay.core.realtime = true
+  b.relay.core.minimum = 0.0
+  b.relay.channelOpened(true)
+  b.relay.channelOpened(false)
+  b.relay.setupDone = true
+  b.relay.providerGone()
+  expect(b.browser.codes.join(",")).toBe("1000")
+  expect(b.provider.codes.join(",")).toBe("1000")
+  // a provider that broke
+  const c = new RelayFixture()
+  c.relay.core.realtime = true
+  c.relay.core.minimum = 0.0
+  c.relay.channelOpened(true)
+  c.relay.channelOpened(false)
+  c.relay.setupDone = true
+  c.relay.providerBroke()
+  expect(c.browser.codes.join(",")).toBe("1011")
+  expect(c.cap.reports[0]!.status).toBe(502)
 })

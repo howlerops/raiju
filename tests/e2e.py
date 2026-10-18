@@ -4625,10 +4625,20 @@ def headers_config():
         "providers": {"openai": {"keys": [{"name": "h", "value": "sk-hdrs", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "send_back_raw_response": True}},
     }
 
-def rtc_client(base, script, auth="Bearer sk-bf-openai", model="openai/gpt-4o-mini", extra=None, offer=None, timeout=90):
+def rtc_client(base, script, auth="Bearer sk-bf-openai", model="openai/gpt-4o-mini", extra=None, offer=None, timeout=90, realtime=False, call=None, raw=False):
     """Runs tests/webrtc_client.tov, a WebRTC browser, against a gateway: it creates a live session with an audio
-    track and the oai-events channel, runs the script on it and reports what it saw (its RESULT line, as a dict)."""
+    track and the oai-events channel, runs the script on it and reports what it saw (its RESULT line, as a dict).
+    With realtime it makes a Realtime API call instead (POST /v1/realtime/calls, or `call`; raw sends the SDP as the
+    body with ?model=, as the beta format does)."""
+    if realtime and model == "openai/gpt-4o-mini":
+        model = "openai/gpt-realtime"
     env = {**os.environ, "GW": base, "AUTH": auth, "MODEL": model, "SCRIPT": json.dumps(script), "BIND": "127.0.0.1"}
+    if realtime:
+        env["MODE"] = "realtime"
+        if call is not None:
+            env["CALL"] = call
+        if raw:
+            env["RAW"] = "1"
     if extra is not None:
         env["EXTRA"] = json.dumps(extra)
     if offer is not None:
@@ -4764,6 +4774,353 @@ def webrtc_e2e(env):
     finally:
         gw.terminate()
         gw.wait()
+
+def ws_collect(c, stop, limit=60):
+    """The JSON messages a WebSocket client receives, up to and including the first one `stop` accepts, or until the
+    server closes the connection."""
+    out = []
+    for _ in range(limit):
+        m = c.recv()
+        if m is None:
+            break
+        try:
+            ev = json.loads(m)
+        except Exception:
+            continue
+        out.append(ev)
+        if stop(ev):
+            break
+    return out
+
+def session_row(op, session_id, base, wait_s=8):
+    """The log row of a finished live or realtime session, found by the session id in its metadata."""
+    key = "live_session_id" if op == "live" else "realtime_session_id"
+    for _ in range(int(wait_s * 10)):
+        s, _, b = call("GET", "/api/logs?limit=500", base=base, headers=ADMIN)
+        rows = [e for e in (json.loads(b).get("entries", []) if s == 200 else []) if e.get("op") == op and e.get("metadata", {}).get(key) == session_id]
+        if rows:
+            return rows[0]
+        time.sleep(0.1)
+    return {}
+
+def near(a, b, tol=1e-9):
+    return a is not None and abs(float(a) - b) <= tol
+
+def realtime_e2e(env):
+    """Live and realtime sessions are metered whatever carries them: a GPT Live WebSocket, a realtime WebSocket (OpenAI
+    and xAI) and a realtime WebRTC call, each through the gateway's own LiveCore. Their own gateways (ports 18200 and
+    18201): a rate limit that refuses the next window or turn, guardrails on the text of both sides, prices with audio
+    rates, and the log row of every session with its cost."""
+    import shutil
+    GW_R = "http://127.0.0.1:18200"
+    GW_A = "http://127.0.0.1:18201"
+    for d in ("e2e-rt-logs", "e2e-rt-azure-logs"):
+        shutil.rmtree(os.path.join(BUILD, d), ignore_errors=True)
+    rt_price = {"input_cost_per_token": 0.000004, "output_cost_per_token": 0.000016, "cache_read_input_token_cost": 0.0000004, "input_cost_per_audio_token": 0.000032, "output_cost_per_audio_token": 0.000064}
+    cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_per_request_content_storage_override": True},
+           "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+                         "xai": {"keys": [{"name": "xk", "value": "xai-rt-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+           "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-rt-logs"), "content_logging": True},
+           "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+           "pricing": {
+               # the voice rate of a live model, and the model its delegated responses run on
+               "openai/gpt-live": {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0, "input_cost_per_second": 0.001},
+               "openai/gpt-back": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000004, "cache_read_input_token_cost": 0.0000001},
+               "openai/gpt-realtime": rt_price,
+               "xai/grok-realtime": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.00001}},
+           "governance": {"rate_limits": [{"id": "rl-live", "request_max_limit": 2, "request_reset_duration": "1h"}, {"id": "rl-rt", "request_max_limit": 2, "request_reset_duration": "1h"},
+                                          {"id": "rl-call", "request_max_limit": 2, "request_reset_duration": "1h"}],
+                          "virtual_keys": [{"id": "vk-rt-live", "value": "sk-bf-rt-live", "rate_limit_id": "rl-live"}, {"id": "vk-rt-turn", "value": "sk-bf-rt-turn", "rate_limit_id": "rl-rt"},
+                                           {"id": "vk-rt-call", "value": "sk-bf-rt-call", "rate_limit_id": "rl-call"}, {"id": "vk-rt-free", "value": "sk-bf-rt-free"}]},
+           "guardrails": {"enabled": True, "apply_to": "both", "detect": [], "providers": [
+               {"id": "house-rules", "kind": "regex", "apply_to": "both", "patterns": [
+                   {"pattern": "PROJECT-\\d+", "description": "Codename", "action": "block"},
+                   {"pattern": "ticket-\\d+", "description": "Ticket", "action": "redact"}]}]}}
+    path = os.path.join(BUILD, "e2e.rt.json")
+    json.dump(cfg, open(path, "w"))
+    # Azure OpenAI has a WebRTC call API too: its own key, endpoint and price
+    acfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": False},
+            "providers": {"azure": {"keys": [{"name": "az", "value": "az-rt-key", "models": [], "weight": 1.0, "azure_key_config": {"endpoint": MOCK, "api_version": "2025-04-01-preview"}}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-rt-azure-logs"), "content_logging": True},
+            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+            "pricing": {"azure/gpt-realtime": rt_price}}
+    apath = os.path.join(BUILD, "e2e.rt-azure.json")
+    json.dump(acfg, open(apath, "w"))
+    srv = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18200", "-host", "127.0.0.1", "-config", path, "-server", srv], env=env, stderr=open(os.path.join(BUILD, "e2e.rt.log"), "w"))
+    gw2 = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18201", "-host", "127.0.0.1", "-config", apath, "-server", srv], env=env, stderr=open(os.path.join(BUILD, "e2e.rt-azure.log"), "w"))
+    FREE = {"authorization": "Bearer sk-bf-rt-free"}
+
+    def live_ws(headers, sid, port=18200):
+        c = WsClient("/v1/live/sessions", headers, port=port)
+        c.send(json.dumps({"type": "session.start", "session": {"model": "openai/gpt-live", "mock_id": sid, "delegation": {"type": "responses", "responses": {"model": "openai/gpt-back"}}}}))
+        return c
+
+    def rt_ws(headers, sid, model="openai/gpt-realtime", port=18200):
+        c = WsClient("/v1/realtime?model=" + model, headers, port=port)
+        c.send(json.dumps({"type": "test.rt.start", "id": sid}))
+        return c
+
+    def is_type(t):
+        return lambda ev: ev.get("type") == t
+
+    def turn(**kw):
+        return json.dumps({"type": "test.rt.turn", **kw})
+
+    try:
+        wait(GW_R + "/health")
+        wait(GW_A + "/health")
+
+        # ---- GPT Live over a WebSocket ----
+        # the session is metered like a WebRTC one: voice seconds are what the provider reports (no WebRTC minimum),
+        # the delegated response's tokens are billed under the model that ran them, and the row holds the cost
+        c = live_ws(FREE, "sess_ws_meter")
+        evs = ws_collect(c, is_type("echo"))
+        check("a live WebSocket session starts at the provider and the start frame reaches it", [e["type"] for e in evs] == ["session.started", "echo"] and '"model":"gpt-live"' in evs[-1]["event"] and "openai/gpt-live" not in evs[-1]["event"], evs)
+        c.send(json.dumps({"type": "test.usage", "seconds": 12}))
+        c.send(json.dumps({"type": "test.backend", "input": 1000, "output": 100, "model": "gpt-back"}))
+        c.send(json.dumps({"type": "test.speak", "text": "good morning"}))
+        evs = ws_collect(c, lambda e: e.get("type") == "session.output_transcript.delta" and e.get("delta") == "morning ")
+        check("the provider's events reach the client as they are", [e["type"] for e in evs][:3] == ["session.usage.updated", "response.event", "session.input_transcript.delta"], [e["type"] for e in evs])
+        c.send(json.dumps({"type": "session.close", "mock_seconds": 18}))
+        evs = ws_collect(c, is_type("session.closed"))
+        check("a client's session.close makes the provider close, and its session.closed reaches the client", evs and evs[-1].get("type") == "session.closed" and evs[-1]["usage"]["seconds"] == 18, evs)
+        row = session_row("live", "sess_ws_meter", GW_R)
+        md = row.get("metadata", {})
+        check("the session is one log row with its seconds, billed as reported (a WebSocket session has no minimum)", row.get("op") == "live" and row.get("status") == 200 and row.get("provider") == "openai" and row.get("model") == "gpt-live" and md.get("live_transport") == "websocket" and float(md.get("live_billed_seconds", -1)) == 18.0 and md.get("live_close_reason") == "close_requested", row)
+        check("and it costs its voice seconds at the model's rate plus its delegated tokens at their model's", near(row.get("cost"), 18 * 0.001 + 1000 * 0.000001 + 100 * 0.000004) and near(row.get("input_cost"), 18 * 0.001 + 1000 * 0.000001) and near(row.get("output_cost"), 100 * 0.000004) and row.get("prompt_tokens") == 1000 and row.get("completion_tokens") == 100, row)
+        check("the row keeps the transcript and the virtual key", row.get("input", "").strip() == "hello" and row.get("output", "").strip() == "good morning" and row.get("virtual_key") == "vk-rt-free", row)
+
+        # a short session is billed what it ran, not the 15 s a created WebRTC session bills
+        c = live_ws(FREE, "sess_ws_short")
+        ws_collect(c, is_type("echo"))
+        c.send(json.dumps({"type": "session.close", "mock_seconds": 3}))
+        ws_collect(c, is_type("session.closed"))
+        row = session_row("live", "sess_ws_short", GW_R)
+        check("a short WebSocket session is billed 3 s", float(row.get("metadata", {}).get("live_billed_seconds", -1)) == 3.0 and near(row.get("cost"), 0.003), row)
+
+        # a client that leaves: the provider is asked to close, and the session is billed what it reports
+        c = live_ws(FREE, "sess_ws_leave")
+        ws_collect(c, is_type("echo"))
+        c.send(json.dumps({"type": "test.usage", "seconds": 7}))
+        ws_collect(c, is_type("session.usage.updated"))
+        c.sock.close()
+        row = session_row("live", "sess_ws_leave", GW_R)
+        check("a client that leaves ends the session, billed what the provider reported at its close", row.get("status") == 200 and float(row.get("metadata", {}).get("live_billed_seconds", -1)) == 20.0, row)
+
+        # input text is checked on its way to the provider: redacted, or refused with an error event
+        c = live_ws(FREE, "sess_ws_guard_in")
+        ws_collect(c, is_type("echo"))
+        c.send(json.dumps({"type": "session.update", "session": {"instructions": "see ticket-77 please"}}))
+        evs = ws_collect(c, is_type("echo"))
+        check("live input text is redacted by a guardrail before it reaches the provider", evs and "see [REDACTED:TICKET] please" in evs[-1]["event"] and "ticket-77" not in evs[-1]["event"], evs)
+        c.send(json.dumps({"type": "session.update", "session": {"instructions": "ship PROJECT-42 today"}}))
+        evs = ws_collect(c, is_type("error"))
+        check("live input text a guardrail blocks never reaches the provider, and the client is told", evs and evs[-1]["error"]["type"] == "guardrail_violation" and "house-rules: found CODENAME" in evs[-1]["error"]["message"] and not any("PROJECT-42" in json.dumps(e) for e in evs), evs)
+        c.send(json.dumps({"type": "session.close", "mock_seconds": 3}))
+        ws_collect(c, is_type("session.closed"))
+
+        # output text is checked on its way to the client: redacted, or the session ends with an error
+        c = live_ws(FREE, "sess_ws_guard_out")
+        ws_collect(c, is_type("echo"))
+        c.send(json.dumps({"type": "test.speak", "text": "mail ticket-5 now"}))
+        evs = ws_collect(c, lambda e: e.get("type") == "session.output_transcript.delta" and e.get("delta", "").strip() == "now")
+        deltas = "".join(e.get("delta", "") for e in evs if e.get("type") == "session.output_transcript.delta")
+        check("live output text is redacted by a guardrail before it reaches the client", deltas == "mail [REDACTED:TICKET] now ", deltas)
+        c.send(json.dumps({"type": "session.close", "mock_seconds": 3}))
+        ws_collect(c, is_type("session.closed"))
+        c = live_ws(FREE, "sess_ws_blocked")
+        ws_collect(c, is_type("echo"))
+        c.send(json.dumps({"type": "test.speak", "text": "ship PROJECT-9 and more"}))
+        evs = ws_collect(c, is_type("error"))
+        deltas = "".join(e.get("delta", "") for e in evs if e.get("type") == "session.output_transcript.delta")
+        check("live output text a guardrail blocks ends the session: the client gets an error and no more of it", deltas == "ship " and evs[-1].get("error", {}).get("type") == "guardrail_violation" and "response blocked by guardrails" in evs[-1]["error"]["message"], evs)
+        row = session_row("live", "sess_ws_blocked", GW_R)
+        check("and the blocked session is logged as the refusal it was", row.get("status") == 400 and "response blocked by guardrails" in row.get("error", ""), row)
+
+        # each window of voice time is admitted again: the key's limit of two requests covers the start and the
+        # first window; the second window is refused, the client is told and the session is closed
+        c = live_ws({"authorization": "Bearer sk-bf-rt-live"}, "sess_ws_limit")
+        ws_collect(c, is_type("echo"))
+        c.send(json.dumps({"type": "test.usage", "seconds": 31}))
+        ws_collect(c, is_type("session.usage.updated"))
+        c.send(json.dumps({"type": "test.usage", "seconds": 62}))
+        evs = ws_collect(c, is_type("error"))
+        check("a window the virtual key may not have ends the live session with an error", evs and evs[-1].get("error", {}).get("type") == "rate_limit_exceeded", evs)
+        row = session_row("live", "sess_ws_limit", GW_R)
+        check("and it is logged with the refusal and the seconds it ran", row.get("status") == 429 and float(row.get("metadata", {}).get("live_billed_seconds", -1)) == 62.0 and row.get("virtual_key") == "vk-rt-live", row)
+
+        # a provider that drops the connection: the client is told, and what was reported is billed
+        c = live_ws(FREE, "sess_ws_drop")
+        ws_collect(c, is_type("echo"))
+        c.send(json.dumps({"type": "test.usage", "seconds": 40}))
+        c.send(json.dumps({"type": "test.hangup"}))
+        evs = ws_collect(c, is_type("error"))
+        row = session_row("live", "sess_ws_drop", GW_R)
+        check("a provider that drops a live session is reported as a failure, billed what it had reported", evs and "before session.closed" in evs[-1].get("error", {}).get("message", "") and row.get("status") == 502 and float(row.get("metadata", {}).get("live_billed_seconds", -1)) == 40.0, (evs, row))
+
+        # ---- the Realtime API over a WebSocket ----
+        # each response.done is billed from its usage: audio tokens at the audio rates, cached tokens at the cache rate
+        c = rt_ws(FREE, "sess_rt_meter")
+        c.send(turn(id="resp_a", text="good morning", heard="hello there", input=1000, output=500, audio_in=300, audio_out=400, cached=200))
+        evs = ws_collect(c, is_type("response.done"))
+        check("realtime events reach the client as the provider sent them", [e["type"] for e in evs] == ["session.created", "conversation.item.input_audio_transcription.completed", "response.created", "response.output_audio_transcript.delta", "response.output_audio_transcript.delta", "response.done"], [e["type"] for e in evs])
+        c.send(turn(id="resp_b", text="and again", input=100, output=50, audio_in=0, audio_out=20, cached=0))
+        ws_collect(c, lambda e: e.get("type") == "response.done" and e["response"]["id"] == "resp_b")
+        c.sock.close()
+        row = session_row("realtime", "sess_rt_meter", GW_R)
+        md = row.get("metadata", {})
+        first = 500 * 0.000004 + 300 * 0.000032 + 200 * 0.0000004 + 100 * 0.000016 + 400 * 0.000064
+        second = 100 * 0.000004 + 30 * 0.000016 + 20 * 0.000064
+        check("a realtime session is one log row, an op of its own", row.get("op") == "realtime" and row.get("status") == 200 and row.get("provider") == "openai" and row.get("model") == "gpt-realtime" and md.get("realtime_transport") == "websocket" and row.get("virtual_key") == "vk-rt-free", row)
+        check("it holds the tokens of both responses", row.get("prompt_tokens") == 1100 and row.get("completion_tokens") == 550 and md.get("realtime_cached_tokens") == "200" and md.get("realtime_input_audio_tokens") == "300" and md.get("realtime_output_audio_tokens") == "420", row)
+        check("and it costs them at the text, audio and cache rates", near(row.get("cost"), first + second) and near(row.get("input_cost"), 500 * 0.000004 + 300 * 0.000032 + 200 * 0.0000004 + 100 * 0.000004) and near(row.get("output_cost"), 100 * 0.000016 + 400 * 0.000064 + 30 * 0.000016 + 20 * 0.000064), row)
+        check("the row keeps what was said", row.get("input", "").strip() == "hello there" and row.get("output", "").strip() == "good morning and again", (row.get("input"), row.get("output")))
+
+        # frames the client sends reach the provider untouched, and the provider's reply comes back in order
+        c = rt_ws(FREE, "sess_rt_echo")
+        ws_collect(c, is_type("session.created"))
+        c.send('{"type":"session.update","session":{"voice":"alloy"}}')
+        evs = ws_collect(c, is_type("echo"))
+        check("a realtime frame reaches the provider as the client sent it", evs and evs[-1]["event"] == '{"type":"session.update","session":{"voice":"alloy"}}' and evs[-1]["auth"].startswith("Bearer sk-pool") and "model=gpt-realtime" in evs[-1]["auth"], evs)
+        c.sock.close()
+
+        # a turn the provider starts (it heard the caller) is admitted too, and a refusal ends the session
+        c = rt_ws({"authorization": "Bearer sk-bf-rt-turn"}, "sess_rt_limit")
+        ws_collect(c, is_type("session.created"))
+        c.send(turn(id="resp_1", vad=True, text="one", input=10, output=5))
+        ws_collect(c, is_type("response.done"))
+        c.send(turn(id="resp_2", vad=True, text="two", input=10, output=5))
+        evs = ws_collect(c, is_type("error"))
+        check("a turn the virtual key may not have ends the realtime session with an error event", evs and evs[-1].get("error", {}).get("type") == "rate_limit_exceeded", evs)
+        row = session_row("realtime", "sess_rt_limit", GW_R)
+        check("and it is logged with the refusal and the tokens of the turn that ran", row.get("status") == 429 and row.get("prompt_tokens") == 10 and row.get("completion_tokens") == 5 and row.get("virtual_key") == "vk-rt-turn", row)
+
+        # guardrails: the client's item text is checked before the provider gets it, the model's words before the client
+        c = rt_ws(FREE, "sess_rt_guard")
+        ws_collect(c, is_type("session.created"))
+        c.send(json.dumps({"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "see ticket-77 please"}]}}))
+        evs = ws_collect(c, is_type("echo"))
+        check("realtime input text is redacted by a guardrail before it reaches the provider", evs and "see [REDACTED:TICKET] please" in evs[-1]["event"] and "ticket-77" not in evs[-1]["event"], evs)
+        c.send(json.dumps({"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ship PROJECT-42 today"}]}}))
+        evs = ws_collect(c, is_type("error"))
+        check("realtime input text a guardrail blocks never reaches the provider, and the client is told", evs and evs[-1]["error"]["type"] == "guardrail_violation" and "house-rules: found CODENAME" in evs[-1]["error"]["message"] and not any("PROJECT-42" in json.dumps(e) for e in evs), evs)
+        c.send(turn(id="resp_g", text="mail ticket-5 now", input=1, output=1))
+        evs = ws_collect(c, is_type("response.done"))
+        deltas = "".join(e.get("delta", "") for e in evs if e.get("type") == "response.output_audio_transcript.delta")
+        check("realtime output text is redacted by a guardrail before it reaches the client", deltas == "mail [REDACTED:TICKET] now ", deltas)
+        c.sock.close()
+        c = rt_ws(FREE, "sess_rt_blocked")
+        ws_collect(c, is_type("session.created"))
+        c.send(turn(id="resp_h", text="ship PROJECT-9 and more", input=4, output=3))
+        evs = ws_collect(c, is_type("error"))
+        deltas = "".join(e.get("delta", "") for e in evs if e.get("type") == "response.output_audio_transcript.delta")
+        check("realtime output text a guardrail blocks ends the session: the client gets an error and no more of it", deltas == "ship " and evs[-1].get("error", {}).get("type") == "guardrail_violation" and "response blocked by guardrails" in evs[-1]["error"]["message"], evs)
+        row = session_row("realtime", "sess_rt_blocked", GW_R)
+        check("and the blocked realtime session is logged as the refusal it was", row.get("status") == 400 and "response blocked by guardrails" in row.get("error", ""), row)
+        c = rt_ws(FREE, "sess_rt_heard")
+        ws_collect(c, is_type("session.created"))
+        c.send(turn(id="resp_i", heard="my codename is PROJECT-3", input=4, output=3))
+        evs = ws_collect(c, is_type("error"))
+        check("what the provider heard the caller say is checked too: a blocked transcript ends the session", evs and evs[-1].get("error", {}).get("type") == "guardrail_violation" and "request blocked by guardrails" in evs[-1]["error"]["message"] and not any(e.get("type") == "conversation.item.input_audio_transcription.completed" for e in evs), evs)
+
+        # a provider that drops the connection mid-session
+        c = rt_ws(FREE, "sess_rt_drop")
+        ws_collect(c, is_type("session.created"))
+        c.send(turn(id="resp_j", text="hi", input=20, output=10))
+        ws_collect(c, is_type("response.done"))
+        c.send(json.dumps({"type": "test.hangup"}))
+        evs = ws_collect(c, is_type("error"))
+        row = session_row("realtime", "sess_rt_drop", GW_R)
+        check("a realtime provider that drops the connection is reported as a failure, with the tokens billed so far", evs and "interrupted" in evs[-1].get("error", {}).get("message", "") and row.get("status") == 502 and row.get("prompt_tokens") == 20, (evs, row))
+
+        # xAI: the same relay, its own price
+        c = rt_ws(FREE, "sess_rt_xai", model="xai/grok-realtime")
+        c.send(turn(id="resp_x", text="hi", input=1000, output=100))
+        ws_collect(c, is_type("response.done"))
+        c.sock.close()
+        row = session_row("realtime", "sess_rt_xai", GW_R)
+        check("an xAI realtime session is metered and priced as its own provider's", row.get("provider") == "xai" and row.get("model") == "grok-realtime" and near(row.get("cost"), 1000 * 0.000002 + 100 * 0.00001), row)
+
+        s, _, b = call("GET", "/metrics", base=GW_R)
+        check("live WebSocket sessions are counted: events and voice seconds", 'raiju_live_ws_events_total{direction="in",type="session.update"}' in b and 'raiju_live_ws_events_total{direction="out",type="session.usage.updated"}' in b and "raiju_live_audio_seconds_total" in b and "raiju_live_ws_sessions" in b, b[-400:])
+        check("realtime sessions are counted: events, tokens and open sessions", 'raiju_realtime_events_total{direction="out",type="response.done"}' in b and 'raiju_realtime_events_total{direction="in",type="conversation.item.create"}' in b and "raiju_realtime_tokens_total" in b and "raiju_realtime_sessions" in b, b[-400:])
+
+        # ---- the Realtime API over WebRTC (POST /v1/realtime/calls), terminated on the gateway's own peer ----
+        def call_row(r, base=GW_R):
+            sid = ""
+            for e in r.get("events", []):
+                if e.get("type") == "session.created":
+                    sid = e["session"]["id"]
+            return session_row("realtime", sid, base) if sid else {}
+
+        def provider_events(mark):
+            return [e["event"] for e in json.loads(call("GET", "/_live/events", base=MOCK, auth=False)[2])[mark:]]
+
+        def mark():
+            return len(json.loads(call("GET", "/_live/events", base=MOCK, auth=False)[2]))
+
+        m0 = mark()
+        r = rtc_client(GW_R, [{"wait": "session.created"}, {"send": {"type": "test.rt.turn", "id": "resp_c1", "text": "good morning", "heard": "hello", "input": 1000, "output": 500, "audio_in": 300, "audio_out": 400, "cached": 200}},
+                              {"wait": "response.done"}, {"send": {"type": "session.update", "session": {"voice": "alloy"}}}, {"wait": "echo"}], auth="Bearer sk-bf-rt-free", model="openai/gpt-realtime", realtime=True, extra={"type": "realtime", "audio": {"input": {"transcription": {"model": "openai/whisper-1"}}}})
+        types = [e.get("type") for e in r.get("events", [])]
+        check("a realtime call is answered by the gateway's peer: the events channel opens and the provider's events arrive in order", r.get("status") == 200 and r.get("opened") is True and types[:2] == ["session.created", "conversation.item.input_audio_transcription.completed"] and "response.done" in types and types[-1] == "echo", r)
+        check("the browser's events reach the provider peer", [e["type"] for e in provider_events(m0)][:2] == ["test.rt.turn", "session.update"], provider_events(m0))
+        sent = [x for x in seen() if x["path"] == "/v1/realtime/calls"][-1]
+        check("the provider is sent the gateway's own offer and the session with bare models, under the provider's key", sent["auth"] == "Bearer sk-pool" and '"model":"gpt-realtime"' in sent["body"] and "openai/" not in sent["body"] and '"model":"whisper-1"' in sent["body"] and "a=ssrc:1234" not in sent["body"] and "m=application" in sent["body"], sent["body"][:400])
+        row = call_row(r)
+        md = row.get("metadata", {})
+        check("the call is one realtime row: its transport, tokens and cost", row.get("op") == "realtime" and row.get("status") == 200 and md.get("realtime_transport") == "webrtc" and row.get("prompt_tokens") == 1000 and row.get("completion_tokens") == 500 and near(row.get("cost"), first) and row.get("virtual_key") == "vk-rt-free", row)
+        check("and it keeps what was said", row.get("input", "").strip() == "hello" and row.get("output", "").strip() == "good morning", (row.get("input"), row.get("output")))
+
+        # the beta format: a raw SDP body with ?model= at /v1/realtime
+        r = rtc_client(GW_R, [{"wait": "session.created"}], auth="Bearer sk-bf-rt-free", model="openai/gpt-realtime", realtime=True, call="/v1/realtime", raw=True)
+        check("a raw SDP offer at /v1/realtime is terminated too", r.get("status") == 200 and r.get("opened") is True and [e.get("type") for e in r.get("events", [])][:1] == ["session.created"], r)
+        sent = [x for x in seen() if x["path"].startswith("/v1/realtime") and "model=gpt-realtime" in x["path"]][-1]
+        check("and goes to the provider's /v1/realtime with the bare model", sent["path"] == "/v1/realtime?model=gpt-realtime" and "sdp=v=0" in sent["body"], sent)
+        r = rtc_client(GW_R, [{"wait": "session.created"}], auth="Bearer sk-bf-rt-free", model="openai/gpt-realtime", realtime=True, call="/openai/realtime/calls")
+        check("the /openai family is the same route", r.get("status") == 200 and r.get("opened") is True, r)
+
+        # guardrails and governance apply on the call as on a WebSocket
+        r = rtc_client(GW_R, [{"wait": "session.created"}, {"send": {"type": "test.rt.turn", "id": "resp_c2", "text": "mail ticket-5 now", "input": 1, "output": 1}}, {"wait": "response.done"}], auth="Bearer sk-bf-rt-free", realtime=True)
+        deltas = "".join(e.get("delta", "") for e in r.get("events", []) if e.get("type") == "response.output_audio_transcript.delta")
+        check("output text of a call is redacted by a guardrail", deltas == "mail [REDACTED:TICKET] now ", deltas)
+        r = rtc_client(GW_R, [{"wait": "session.created"}, {"send": {"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ship PROJECT-42 today"}]}}}, {"wait": "error"}], auth="Bearer sk-bf-rt-free", realtime=True)
+        errs = [e for e in r.get("events", []) if e.get("type") == "error"]
+        check("input text of a call a guardrail blocks never reaches the provider, and the browser is told", errs and errs[0]["error"]["type"] == "guardrail_violation", r.get("events"))
+        m0 = mark()
+        r = rtc_client(GW_R, [{"wait": "session.created"}, {"send": {"type": "test.rt.turn", "id": "resp_c3", "vad": True, "text": "one", "input": 10, "output": 5}}, {"wait": "response.done"},
+                              {"send": {"type": "test.rt.turn", "id": "resp_c4", "vad": True, "text": "two", "input": 10, "output": 5}}, {"wait": "error", "ms": 8000}, {"sleep": 500}], auth="Bearer sk-bf-rt-call", realtime=True)
+        errs = [e for e in r.get("events", []) if e.get("type") == "error"]
+        check("a turn the virtual key may not have ends the call with an error event", errs and errs[0]["error"]["type"] == "rate_limit_exceeded", r.get("events"))
+        row = call_row(r)
+        check("and the call is logged with the refusal", row.get("status") == 429 and row.get("prompt_tokens") == 10 and row.get("virtual_key") == "vk-rt-call", row)
+
+        # refusals before any peer exists
+        r = rtc_client(GW_R, [], auth="", realtime=True)
+        check("a realtime call needs a credential when inference auth is on", r.get("status") == 401 and "authentication is required" in r.get("body", ""), r)
+        r = rtc_client(GW_R, [], auth="Bearer sk-bf-rt-free", model="xai/grok-realtime", realtime=True)
+        check("a provider with no WebRTC realtime API is refused", r.get("status") == 400 and "no realtime WebRTC API" in r.get("body", ""), r)
+        r = rtc_client(GW_R, [], auth="Bearer sk-bf-rt-free", realtime=True, offer="v=0\r\no=- not a real offer\r\n")
+        check("an SDP offer the gateway's peer cannot parse is refused", r.get("status") == 400 and "invalid browser SDP offer" in r.get("body", ""), r)
+        r = rtc_client(GW_R, [], auth="Bearer sk-bf-rt-free", model="openai/gpt-realtime-refuse", realtime=True)
+        check("a provider that refuses the call has its own answer passed on", r.get("status") == 400 and "invalid realtime session" in r.get("body", ""), r)
+        s, _, b = call("POST", "/v1/realtime/calls", "sdp=1", headers={"authorization": "Bearer sk-bf-rt-free", "content-type": "application/sdp"}, base=GW_R)
+        check("a raw call with no ?model= is refused", s == 400 and "model" in b, (s, b))
+
+        # Azure OpenAI: its own endpoint and key
+        m0 = mark()
+        r = rtc_client(GW_A, [{"wait": "session.created"}, {"send": {"type": "test.rt.turn", "id": "resp_az", "text": "hi", "input": 1000, "output": 100}}, {"wait": "response.done"}], auth="", model="azure/gpt-realtime", realtime=True)
+        check("an Azure realtime call is terminated on the gateway's peer", r.get("status") == 200 and r.get("opened") is True and "response.done" in [e.get("type") for e in r.get("events", [])], r)
+        sent = [x for x in seen() if x["path"].startswith("/openai/v1/realtime")][-1]
+        check("it goes to Azure's realtime endpoint with the key and the bare model", sent["path"] == "/openai/v1/realtime?model=gpt-realtime" and sent["auth"] == "az-rt-key" and '"model":"gpt-realtime"' in sent["body"], sent)
+        row = call_row(r, GW_A)
+        check("and it is a realtime row priced as Azure's", row.get("provider") == "azure" and near(row.get("cost"), 1000 * 0.000004 + 100 * 0.000016), row)
+    finally:
+        gw.terminate()
+        gw2.terminate()
+        gw.wait()
+        gw2.wait()
 
 def headers_e2e(env):
     """Request headers reach the log rows (dimensions, logging headers, correlation ids, app, Maxim attributes);
@@ -5345,6 +5702,237 @@ def l121_e2e(env):
         check("a viewer may not add a plugin", s == 403, (s, b[:200]))
     finally:
         gw.terminate()
+GW_L130 = "http://127.0.0.1:18204"  # plugins: the HTTP transport hooks, the LLM hooks on every request type and on streams
+
+def l130_e2e(env):
+    """L130: the plugin chain as Bifrost runs it. A WebAssembly plugin (tests/wasm/plugin.wasm) with the HTTP transport
+    hooks (http_pre_hook rewrites the request or answers it, http_post_hook rewrites the response, http_stream_chunk_hook
+    rewrites, drops or ends the chunks of a stream), the LLM hooks on embeddings, speech, transcription, images, Responses,
+    rerank and text completions, post_hook on every chunk of a stream, and a post_hook answer that turns a response into
+    an error (has_error). The compiled-in header plugin's response headers. Its own gateway (18204)."""
+    import hashlib
+    base = GW_L130
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    cfg_path = os.path.join(BUILD, "e2e.l130.json")
+    adm = {"authorization": "Bearer sk-admin-l130"}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l130", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l130").hexdigest()}]},
+        "plugins": [{"name": "h130", "enabled": True, "path": wasm, "config": {"mode": "rewrite", "from": "ping", "to": "pong", "tag": "l130", "http": "rewrite"}}],
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18204", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l130.log"), "w"))
+
+    def api(method, p, body=None):
+        return call(method, p, body, adm, base=base, auth=False)
+
+    def setp(config, name="h130"):
+        s, _, b = api("PUT", "/api/plugins/" + name, {"config": config})
+        if s != 200:
+            raise SystemExit(f"l130: could not set the plugin config {config}: {s} {b[:200]}")
+
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers or {}, base=base, auth=False)
+
+    def raw(method, path, body=None, headers=None, ctype="application/json"):
+        data = None if body is None else (body if isinstance(body, bytes) else (body if isinstance(body, str) else json.dumps(body)).encode())
+        req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": ctype, **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+
+    def events(text):
+        """The data payloads of an event stream, in order."""
+        out = []
+        for block in text.split("\n\n"):
+            for line in block.split("\n"):
+                if line.startswith("data:"):
+                    out.append(line[5:].strip())
+        return out
+
+    def contents(text):
+        """The text deltas of a chat stream."""
+        got = []
+        for d in events(text):
+            if d.startswith("{") and '"choices"' in d:
+                for c in json.loads(d).get("choices", []):
+                    t = c.get("delta", {}).get("content")
+                    if t:
+                        got.append(t)
+        return got
+
+    def form(fields, filename="talk.wav", data=b"RIFF\x00\x00\x00\x00WAVEfmt "):
+        boundary = "raiju-l130-boundary"
+        parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields.items()]
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode() + data + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+    EMB = {"model": "openai/text-embedding-3-small", "input": "ping me"}
+    CHAT = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "say hello"}]}
+    try:
+        wait(base + "/health")
+        # ---- the HTTP transport hooks, on a route that is not chat ----
+        s, _, b = api("GET", "/api/plugins/h130")
+        check("the plugin list shows the plugin types: llm and http", s == 200 and json.loads(b).get("status", {}).get("types") == ["llm", "http"], (s, b[:300]))
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/embeddings", EMB)
+        up = seen()[n:]
+        ans = json.loads(b) if s == 200 else {}
+        check("http_pre_hook rewrites the request body before routing, and the provider gets it", s == 200 and len(up) == 1 and json.loads(up[0]["body"]).get("input") == "pong me", (s, [u["body"] for u in up], b[:200]))
+        check("http_pre_hook sets a request header (x-request-id), which the answer echoes", h.get("x-request-id") == "l130", h)
+        check("http_post_hook rewrites the response: a header, and a field in the body", h.get("x-wasm-http-post") == "l130" and ans.get("x_http_post") == "l130", (h, b[:200]))
+        check("the context set in http_pre_hook reaches pre_hook, post_hook and http_post_hook", h.get("x-wasm-http-ctx") == "ok" and ans.get("x_wasm_plugin") == "ctx-ok:l130", (h.get("x-wasm-http-ctx"), b[:300]))
+        check("the LLM hooks ran on an embeddings request (post_hook marked the answer, as it does a chat answer)", ans.get("object") == "list" and len(ans.get("data", [])) == 1, b[:200])
+        s, h, b = raw("GET", "/api/plugins/loaded", headers=adm)
+        check("a management route is not an inference route: no transport hook runs on it", s == 200 and "x-wasm-http-post" not in h and "x_http_post" not in b.decode(), (s, h))
+
+        # ---- the LLM hooks alone, on every request type ----
+        setp({"mode": "rewrite", "from": "ping", "to": "pong", "tag": "llm"})
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/embeddings", EMB)
+        up = seen()[n:]
+        ans = json.loads(b) if s == 200 else {}
+        check("embeddings: pre_hook rewrites the request and post_hook marks the answer", s == 200 and len(up) == 1 and json.loads(up[0]["body"]).get("input") == "pong me" and ans.get("x_wasm_plugin") == "ctx-ok:llm", (s, b[:200], [u["body"] for u in up]))
+        check("and the transport hooks, with no http setting, leave the exchange alone", "x-wasm-http-post" not in h and "x_http_post" not in ans and h.get("x-request-id", "") != "llm", h)
+
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/audio/speech", {"model": "openai/tts-1", "input": "say ping", "voice": "alloy"})
+        up = seen()[n:]
+        check("speech: the request is rewritten and the audio comes back intact", s == 200 and len(up) == 1 and json.loads(up[0]["body"]).get("input") == "say pong" and b == bytes([0x49, 0x44, 0x33, 0xff, 0xfb, 0x90, 0x00, 0x80, 0xc3, 0x28]) and h.get("content-type") == "audio/mpeg", (s, b[:20], h.get("content-type"), [u["body"] for u in up]))
+
+        body, ct = form({"model": "openai/ping-1", "language": "en"})
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/audio/transcriptions", body, ctype=ct)
+        ans = json.loads(b) if s == 200 else {}
+        check("transcription (a form): the model field is rewritten, and the answer is marked", s == 200 and ans.get("text") == "transcribed by pong-1" and ans.get("x_wasm_plugin") == "ctx-ok:llm", (s, b[:200]))
+
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/images/generations", {"model": "openai/dall-e-3", "prompt": "a ping"})
+        up = seen()[n:]
+        ans = json.loads(b) if s == 200 else {}
+        check("images: the prompt is rewritten and the answer is marked", s == 200 and len(up) == 1 and json.loads(up[0]["body"]).get("prompt") == "a pong" and ans.get("x_wasm_plugin") == "ctx-ok:llm", (s, b[:200], [u["body"] for u in up]))
+
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/responses", {"model": "openai/gpt-4o-mini", "input": "ping"})
+        up = seen()[n:]
+        ans = json.loads(b) if s == 200 else {}
+        check("Responses: the input is rewritten and the answer is marked", s == 200 and len(up) == 1 and json.loads(up[0]["body"]).get("input") == "pong" and ans.get("x_wasm_plugin") == "ctx-ok:llm", (s, b[:200], [u["body"] for u in up]))
+
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/completions", {"model": "openai/pii-text", "prompt": "ping"})
+        up = seen()[n:]
+        ans = json.loads(b) if s == 200 else {}
+        check("text completions: the prompt is rewritten and the answer is marked", s == 200 and len(up) == 1 and json.loads(up[0]["body"]).get("prompt") == "pong" and ans.get("x_wasm_plugin") == "ctx-ok:llm", (s, b[:200], [u["body"] for u in up]))
+
+        s, h, b = raw("POST", "/v1/rerank", {"model": "raiju/lexical", "query": "ping", "documents": ["a pong here", "nothing"]})
+        ans = json.loads(b) if s == 200 else {}
+        check("rerank: the query is rewritten and the answer is marked", s == 200 and ans.get("x_wasm_plugin") == "ctx-ok:llm" and ans.get("results", [{}])[0].get("index") == 0, (s, b[:300]))
+
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]})
+        up = seen()[n:]
+        ans = json.loads(b) if s == 200 else {}
+        check("chat: still rewritten and marked", s == 200 and len(up) == 1 and "pong" in up[0]["body"] and ans.get("x_wasm_plugin") == "ctx-ok:llm", (s, b[:200]))
+
+        # ---- post_hook answers that turn a response into an error, and an error into a response ----
+        setp({"mode": "rewrite", "post": "error", "tag": "err"})
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/chat/completions", CHAT)
+        check("has_error on a chat answer: the answer becomes the plugin's error, with its status", s == 429 and "turned into an error by the plugin" in b.decode() and json.loads(b)["error"]["code"] == "plugin_post", (s, b[:300]))
+        s, h, b = raw("POST", "/v1/embeddings", EMB)
+        check("has_error on an embeddings answer", s == 429 and "turned into an error by the plugin" in b.decode(), (s, b[:300]))
+        s, h, b = raw("POST", "/v1/chat/completions", {"model": "openai/down-1", "messages": [{"role": "user", "content": "x"}]})
+        check("an error from the provider reaches post_hook as an error, and the plugin hands it back", s >= 500 and "turned into an error" not in b.decode(), (s, b[:300]))
+        setp({"mode": "rewrite", "post": "recover", "tag": "rec"})
+        s, h, b = raw("POST", "/v1/chat/completions", {"model": "openai/down-1", "messages": [{"role": "user", "content": "x"}]})
+        check("post_hook recovers a provider error into a response", s == 200 and "from the plugin" in b.decode(), (s, b[:300]))
+
+        # ---- HTTP pre hook answers, refusals and moves ----
+        setp({"mode": "rewrite", "http": "respond"})
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/chat/completions", CHAT)
+        check("http_pre_hook can answer the request itself: status, headers and body, and the provider is not called", s == 202 and h.get("x-plugin") == "pre" and json.loads(b) == {"answered": "by the plugin"} and len(seen()) == n, (s, h, b[:200]))
+        setp({"mode": "rewrite", "http": "error"})
+        s, h, b = raw("POST", "/v1/chat/completions", CHAT)
+        check("an error from http_pre_hook fails the request with 500 and its message", s == 500 and "http pre refused" in b.decode(), (s, b[:200]))
+        setp({"mode": "rewrite", "http": "path"})
+        s, h, b = raw("POST", "/v1/chat/completions", CHAT)
+        check("a plugin that moves the request to another route is refused with 409, as Bifrost does", s == 409 and "modified by a plugin" in b.decode(), (s, b[:200]))
+
+        # ---- streams ----
+        setp({"mode": "rewrite", "tag": "st", "http": "rewrite", "chunk_from": "Hel", "chunk_to": "Howdy"})
+        s, h, b = raw("POST", "/v1/chat/completions", {**CHAT, "stream": True})
+        text = b.decode()
+        marks = [d for d in events(text) if d.startswith("{") and '"choices"' in d]
+        check("http_stream_chunk_hook rewrites the chunks of a stream", s == 200 and contents(text) == ["Howdy", "lo"] and events(text)[-1] == "[DONE]", (s, text[:400]))
+        check("and post_hook ran on every chunk (the marker is in each one)", len(marks) >= 3 and all(json.loads(d).get("x_wasm_plugin") == "ctx-ok:st" for d in marks), text[:500])
+        check("http_post_hook is not called for a stream; the header set before routing is", "x-wasm-http-post" not in h and h.get("x-request-id") == "st", h)
+
+        setp({"mode": "rewrite", "chunk_skip": "lo"})
+        s, h, b = raw("POST", "/v1/chat/completions", {**CHAT, "stream": True})
+        text = b.decode()
+        check("a chunk the hook skips is not sent, and the stream goes on", s == 200 and contents(text) == ["Hel"] and events(text)[-1] == "[DONE]", (s, text[:400]))
+        setp({"mode": "rewrite", "chunk_stop": "Hel"})
+        s, h, b = raw("POST", "/v1/chat/completions", {**CHAT, "stream": True})
+        text = b.decode()
+        ev = events(text)
+        check("an error from the chunk hook ends the stream with an error event", s == 200 and contents(text) == [] and ev[-1].startswith('{"error":') and "chunk blocked by the plugin" in ev[-1] and "[DONE]" not in ev, (s, text[:400]))
+
+        setp({"mode": "rewrite", "post": "chunk", "chunk_from": "Hel", "chunk_to": "Hiya"})
+        s, h, b = raw("POST", "/v1/chat/completions", {**CHAT, "stream": True})
+        text = b.decode()
+        check("post_hook rewrites each chunk of a stream (the LLM hook on a stream)", s == 200 and contents(text) == ["Hiya", "lo"], (s, text[:400]))
+        setp({"mode": "rewrite", "post": "error"})
+        s, h, b = raw("POST", "/v1/chat/completions", {**CHAT, "stream": True})
+        text = b.decode()
+        ev = events(text)
+        check("a chunk that post_hook turns into an error ends the stream with that error", s == 200 and contents(text) == [] and len(ev) >= 1 and "turned into an error by the plugin" in ev[-1] and "[DONE]" not in ev, (s, text[:400]))
+
+        # text completions stream through the same hooks
+        setp({"mode": "rewrite", "tag": "tc", "chunk_from": "call", "chunk_to": "ring"})
+        s, h, b = raw("POST", "/v1/completions", {"model": "openai/pii-text", "prompt": "hi", "stream": True})
+        text = b.decode()
+        parts = [json.loads(d)["choices"][0].get("text") for d in events(text) if d.startswith("{")]
+        check("a streamed text completion goes through the chunk hook and post_hook per chunk", s == 200 and parts[:2] == ["ring 555-", "1234 now"] and all(json.loads(d).get("x_wasm_plugin") == "ctx-ok:tc" for d in events(text) if d.startswith("{")), (s, text[:500]))
+
+        # the Responses API streams through the same hooks
+        setp({"mode": "rewrite", "tag": "rs", "chunk_from": "Hel", "chunk_to": "Howdy"})
+        s, h, b = raw("POST", "/v1/responses", {"model": "openai/gpt-4o-mini", "input": "hi", "stream": True})
+        text = b.decode()
+        deltas = [json.loads(d).get("delta") for d in events(text) if d.startswith("{") and '"response.output_text.delta"' in d]
+        check("a streamed Responses answer goes through the chunk hook, event by event", s == 200 and deltas == ["Howdy", "lo"] and "event: response.completed" in text, (s, text[:500]))
+
+        # ---- order: pre hooks in order, post and chunk hooks in reverse ----
+        setp({"mode": "rewrite", "tag": "first", "http": "rewrite", "chunk_from": "Howdy", "chunk_to": "Hey"})
+        s, _, b = api("POST", "/api/plugins", {"name": "h130b", "enabled": True, "path": wasm, "config": {"mode": "rewrite", "tag": "second", "http": "rewrite", "chunk_from": "Hel", "chunk_to": "Howdy"}})
+        check("a second plugin is added after the first", s == 201, (s, b[:200]))
+        s, h, b = raw("POST", "/v1/embeddings", EMB)
+        check("http_pre_hook runs in order: the last plugin's header is the one left", s == 200 and h.get("x-request-id") == "second", h)
+        check("http_post_hook runs in reverse: the first plugin has the last word", h.get("x-wasm-http-post") == "first", h)
+        s, h, b = raw("POST", "/v1/chat/completions", {**CHAT, "stream": True})
+        check("the chunk hooks run in reverse: the second plugin rewrites first, then the first", s == 200 and contents(b.decode()) == ["Hey", "lo"], (s, b.decode()[:400]))
+        s, _, b = api("DELETE", "/api/plugins/h130b")
+
+        # ---- a compiled-in plugin: the header plugin sets response headers ----
+        s, _, b = api("DELETE", "/api/plugins/h130")
+        s, _, b = api("POST", "/api/plugins", {"name": "header", "enabled": True, "config": {"set_response_headers": {"X-Served-By": "raiju"}}})
+        check("the header plugin takes set_response_headers", s == 201, (s, b[:200]))
+        s, h, b = raw("GET", "/v1/models")
+        check("it sets the header on an inference route's answer", h.get("x-served-by") == "raiju", (s, h))
+        s, h, b = raw("POST", "/v1/chat/completions", CHAT)
+        check("also on a chat answer", s == 200 and h.get("x-served-by") == "raiju", (s, h))
+        s, h, b = raw("GET", "/api/plugins/loaded", headers=adm)
+        check("and not on a management route", s == 200 and "x-served-by" not in h, (s, h))
+        s, h, b = raw("POST", "/v1/chat/completions", {**CHAT, "stream": True})
+        check("a stream gets no post hook, so no header (Bifrost's post hook is not called for streams)", s == 200 and "x-served-by" not in h and contents(b.decode()) == ["Hel", "lo"], (s, h))
+    finally:
+        gw.terminate()
 GW_L126 = "http://127.0.0.1:18186"  # network_config pool knobs and upstream HTTP/2, against tov-patches/tests/h2_server.py origins
 
 def l126_python_env():
@@ -5678,6 +6266,191 @@ def l124_e2e(env):
         gw.wait()
         if origin is not None:
             origin.terminate()
+
+GW_L129 = "http://127.0.0.1:18202"  # large_payload_optimization beyond chat: Responses, Messages and multipart streamed, usage counted
+
+def l129_form(fields, file_name, file_bytes, boundary="----l129form", file_first=False):
+    """A multipart/form-data body: the text fields, then the file part (or the file part first)."""
+    def field(k, v):
+        return ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, k, v)).encode()
+    head = b"".join(field(k, v) for k, v in fields)
+    filep = ('--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\nContent-Type: audio/wav\r\n\r\n' % (boundary, file_name)).encode() + file_bytes + b"\r\n"
+    tail = ("--%s--\r\n" % boundary).encode()
+    return (filep + head if file_first else head + filep) + tail, {"content-type": "multipart/form-data; boundary=" + boundary}
+
+def l129_json(model, size, **extra):
+    """A request of about `size` bytes with the model first and any extra fields right after it."""
+    ex = "".join(',"%s":%s' % (k, json.dumps(v)) for k, v in extra.items())
+    return ('{"model":"%s"%s,"input":"%s"}' % (model, ex, "A" * size)).encode()
+
+def l129_e2e(env):
+    """large_payload_optimization beyond chat (L129): a big Responses request and a big Anthropic Messages request stream to
+    their providers intact, multipart uploads stream after their form fields are read, formats that need conversion are
+    buffered, and the usage of what streams back is counted for budgets, token limits and the request log. Its own gateway (18202)."""
+    import hashlib, shutil
+    logs_dir = os.path.join(BUILD, "e2e-l129-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "max_request_body_size_mb": 8},
+        "logs_store": {"enabled": True, "dir": logs_dir, "content_logging": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 62914560, "truncated_log_bytes": 4096},
+        "governance": {
+            "budgets": [{"id": "b-l129", "max_limit": 100, "reset_duration": "1d"}],
+            "rate_limits": [{"id": "rl-l129", "token_max_limit": 10, "token_reset_duration": "1h"}],
+            "pricing_overrides": [{"id": "po-l129", "name": "l129", "scope_kind": "global", "match_type": "wildcard", "pattern": "*", "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}],
+            "virtual_keys": [{"id": "vk-l129b", "value": "sk-bf-l129-budget-0123456789", "budget_id": "b-l129"}, {"id": "vk-l129t", "value": "sk-bf-l129-tokens-0123456789", "rate_limit_id": "rl-l129"}],
+        },
+        "providers": {
+            "openai": {"keys": [{"name": "o", "value": "sk-" + "l129", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-" + "l129", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+    path = os.path.join(BUILD, "e2e.l129.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18202", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l129.log"), "w"))
+    port = 18202
+    try:
+        wait(GW_L129 + "/health")
+        mine = lambda path_: [x for x in seen() if x["path"] == path_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        logs = lambda: json.loads(call("GET", "/api/logs?limit=500", base=GW_L129, auth=False)[2])["entries"]
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L129, auth=False)[2])["budgets"]}
+
+        # ---- the Responses route ----
+        body = l129_json("openai/resp-n", 3 * 1048576)
+        want = l129_json("resp-n", 3 * 1048576)
+        s, hs, b = l124_http(port, "POST", "/v1/responses", body)
+        got = mine("/v1/responses")
+        check("a 3 MiB Responses request reaches OpenAI intact, with the model renamed", s == 200 and b"native responses" in b and got and got[-1]["size"] == len(want) and got[-1]["sha"] == sha(want), (s, b[:200], got[-1]["size"] if got else None, len(want)))
+        check("the Responses answer carries the gateway's request id", "x-request-id" in hs and "x-bifrost-request-id" in hs, hs)
+        sbody = l129_json("openai/resp-s", 3 * 1048576, stream=True)
+        swant = l129_json("resp-s", 3 * 1048576, stream=True)
+        s, hs, b = l124_http(port, "POST", "/v1/responses", sbody)
+        got = mine("/v1/responses")
+        check("a big Responses request that asks for a stream is streamed both ways", s == 200 and hdr(hs, "content-type") == "text/event-stream" and b"response.completed" in b and got[-1]["sha"] == sha(swant), (s, hs, b[:200]))
+        sbody = l129_json("openai/resp-c", 3 * 1048576)
+        pieces = [sbody[i:i + 100000] for i in range(0, len(sbody), 100000)]
+        s, _, b = l124_http(port, "POST", "/v1/responses", pieces, chunked=True)
+        got = mine("/v1/responses")
+        check("a chunked Responses request reaches OpenAI intact", s == 200 and got[-1]["sha"] == sha(l129_json("resp-c", 3 * 1048576)), (s, b[:200]))
+
+        # a stream flag that comes after the input is beyond the prefix: the answer is still passed through as a stream
+        late = ('{"model":"openai/resp-late","input":"%s","stream":true}' % ("L" * 2097152)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/responses", late)
+        check("a stream flag beyond the prefetch still gets a streamed answer", s == 200 and hdr(hs, "content-type") == "text/event-stream" and b"response.completed" in b, (s, hs, b[:200]))
+
+        # ---- the Anthropic Messages route ----
+        def msg(model, size, **extra):
+            ex = "".join(',"%s":%s' % (k, json.dumps(v)) for k, v in extra.items())
+            return ('{"model":"%s","max_tokens":16%s,"messages":[{"role":"user","content":"%s"}]}' % (model, ex, "M" * size)).encode()
+        mbody = msg("anthropic/claude-l129-n", 3 * 1048576)
+        mwant = msg("claude-l129-n", 3 * 1048576)
+        n0 = len(mine("/v1/messages"))
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", mbody)
+        got = mine("/v1/messages")
+        check("a 3 MiB Messages request reaches Anthropic intact, with the model renamed", s == 200 and b"Hi from claude" in b and len(got) == n0 + 1 and got[-1]["size"] == len(mwant) and got[-1]["sha"] == sha(mwant), (s, b[:200], got[-1]["size"] if got else None, len(mwant)))
+        check("the Messages answer is Anthropic's own message, as it came", s == 200 and json.loads(b).get("type") == "message" and json.loads(b)["usage"]["input_tokens"] == 11, b[:200])
+        check("the provider's key goes up as x-api-key", got[-1]["auth"] == "sk-ant-l129", got[-1]["auth"])
+        mbody = msg("anthropic/claude-l129-s", 3 * 1048576, stream=True)
+        mwant = msg("claude-l129-s", 3 * 1048576, stream=True)
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", mbody)
+        got = mine("/v1/messages")
+        check("a big Messages request that asks for a stream is streamed both ways", s == 200 and hdr(hs, "content-type") == "text/event-stream" and b"message_stop" in b and got[-1]["sha"] == sha(mwant), (s, hs, b[:200]))
+
+        # ---- providers whose format differs are converted from the whole body ----
+        n1 = len(mine("/v1/messages"))
+        s, _, b = l124_http(port, "POST", "/v1/responses", l129_json("anthropic/claude-3-5-sonnet-20241022", 1048576))
+        check("a big Responses request to a provider that converts it is buffered and converted", s == 200 and len(mine("/v1/messages")) == n1 + 1, (s, b[:300]))
+        n2 = len(mine("/v1/chat/completions"))
+        s, _, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-4o-mini", 1048576))
+        check("a big Messages request to an OpenAI provider is buffered and converted", s == 200 and len(mine("/v1/chat/completions")) == n2 + 1 and json.loads(b).get("type") == "message", (s, b[:300]))
+        s, _, b = l124_http(port, "POST", "/v1/responses", l129_json("anthropic/claude-3-5-sonnet-20241022", 9 * 1048576))
+        check("... but not past client.max_request_body_size_mb", s == 413, (s, b[:200]))
+        s, _, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-4o-mini", 9 * 1048576))
+        check("... on the Messages route too", s == 413, (s, b[:200]))
+        s, _, b = l124_http(port, "POST", "/v1/responses", l129_json("openai/resp-x", 4096) + b" ", headers={"content-length": str(200 * 1048576)})
+        check("a declared length over max_payload_bytes is refused with a 413 on the Responses route", s == 413 and "maximum payload" in b.decode(), (s, b[:200]))
+
+        # ---- multipart uploads ----
+        audio = bytes(range(256)) * (6 * 4096)
+        form, fh = l129_form([("model", "openai/whisper-1"), ("language", "en"), ("response_format", "json")], "talk.wav", audio)
+        want = form.replace(b"openai/whisper-1", b"whisper-1", 1)
+        s, hs, b = l124_http(port, "POST", "/v1/audio/transcriptions", form, headers=fh)
+        got = mine("/v1/audio/transcriptions")
+        check("a 6 MiB transcription upload reaches OpenAI intact, with the model renamed", s == 200 and b"transcribed by whisper-1" in b and got and got[-1]["size"] == len(want) and got[-1]["sha"] == sha(want), (s, b[:200], got[-1]["size"] if got else None, len(want)))
+        check("the provider's own answer comes back as it is (usage included)", s == 200 and json.loads(b)["usage"]["input_tokens"] == 14, b[:200])
+        pieces = [form[i:i + 100000] for i in range(0, len(form), 100000)]
+        s, _, b = l124_http(port, "POST", "/v1/audio/transcriptions", pieces, chunked=True, headers=fh)
+        got = mine("/v1/audio/transcriptions")
+        check("a chunked transcription upload reaches OpenAI intact", s == 200 and got[-1]["size"] == len(want) and got[-1]["sha"] == sha(want), (s, b[:200], got[-1]["size"], len(want)))
+        s, _, b = l124_http(port, "POST", "/openai/v1/audio/transcriptions", form, headers=fh)
+        check("the /openai prefix reaches the same route", s == 200 and b"transcribed by whisper-1" in b, (s, b[:200]))
+        # the gateway does not hold the upload: its peak memory barely moves for a 48 MiB file
+        hwm0 = l124_vm(gw.pid, "VmHWM")
+        formb, fhb = l129_form([("model", "openai/whisper-1")], "long.wav", audio * 8)
+        s, _, b = l124_http(port, "POST", "/v1/audio/transcriptions", formb, headers=fhb, timeout=120)
+        hwm1 = l124_vm(gw.pid, "VmHWM")
+        got = mine("/v1/audio/transcriptions")
+        check("a 48 MiB upload arrives intact", s == 200 and got[-1]["sha"] == sha(formb.replace(b"openai/whisper-1", b"whisper-1", 1)), (s, b[:200]))
+        check("the gateway's peak memory grew by under 24 MiB for the 48 MiB upload (%d to %d MiB)" % (hwm0, hwm1), hwm1 - hwm0 < 24, (hwm0, hwm1))
+        # the file comes before the model: the model is not in the prefix, so the body is read whole (up to the size limit)
+        form2, fh2 = l129_form([("model", "openai/whisper-1")], "talk.wav", audio[:1048576], file_first=True)
+        s, _, b = l124_http(port, "POST", "/v1/audio/transcriptions", form2, headers=fh2)
+        got = mine("/v1/audio/transcriptions")
+        check("a 1 MiB upload with the file first is buffered and served", s == 200 and b"transcribed by whisper-1" in b and got[-1]["size"] > len(audio[:1048576]), (s, b[:200], got[-1]["size"], len(form2)))
+        form3, fh3 = l129_form([("model", "openai/whisper-1")], "talk.wav", audio[:9 * 1048576 // 2] * 2, file_first=True)
+        s, _, b = l124_http(port, "POST", "/v1/audio/transcriptions", form3, headers=fh3)
+        check("... but not past client.max_request_body_size_mb", s == 413, (s, b[:200]))
+        s, _, b = l124_http(port, "POST", "/v1/audio/transcriptions", b"x" * 1000, headers={**fh, "content-length": str(200 * 1048576)})
+        check("a declared length over max_payload_bytes is refused with a 413 on an upload", s == 413 and "maximum payload" in b.decode(), (s, b[:200]))
+        ffile = b"".join(b'{"custom_id":"r%d","method":"POST","url":"/v1/chat/completions","body":{"model":"m"}}\n' % i for i in range(40000))
+        formf, fhf = l129_form([("purpose", "batch")], "batch.jsonl", ffile)
+        s, _, b = l124_http(port, "POST", "/v1/files", formf, headers=fhf)
+        got = mine("/v1/files/big")
+        check("a file upload (no model) streams to the provider and arrives intact", s == 200 and json.loads(b).get("object") == "file" and got and got[-1]["sha"] == sha(ffile) and got[-1]["size"] == len(ffile), (s, b[:200], got[-1] if got else None))
+
+        # ---- usage of what streams back ----
+        def vk(key, path_, body, headers=None):
+            return l124_http(port, "POST", path_, body, headers={"x-bf-vk": key, **(headers or {})})
+        # (every model costs 1e-6 a token here, by a pricing override)
+        bk = "sk-bf-l129-budget-0123456789"
+        sb = ('{"model":"openai/large-stream","stream":true,"messages":[{"role":"user","content":"%s"}]}' % ("S" * 600000)).encode()
+        u0 = used()["b-l129"]
+        s, _, b = vk(bk, "/v1/chat/completions", sb)
+        u1 = used()["b-l129"]
+        check("a streamed large chat request is counted in the key's budget (7 tokens)", s == 200 and abs((u1 - u0) - 7e-6) < 1e-9, (s, b[:100], u0, u1))
+        s, _, b = vk(bk, "/v1/responses", l129_json("openai/resp-b", 1048576, stream=True))
+        u2 = used()["b-l129"]
+        check("... and so is a streamed large Responses request (5 tokens)", s == 200 and abs((u2 - u1) - 5e-6) < 1e-9, (s, b[:100], u1, u2))
+        s, _, b = vk(bk, "/anthropic/v1/messages", msg("anthropic/claude-b", 1048576, stream=True))
+        u3 = used()["b-l129"]
+        check("... and a streamed large Messages request (14 tokens)", s == 200 and abs((u3 - u2) - 14e-6) < 1e-9, (s, b[:100], u2, u3))
+        # the same answers against a token limit of 10
+        tk = "sk-bf-l129-tokens-0123456789"
+        s1, _, _ = vk(tk, "/v1/chat/completions", sb)
+        s2, _, _ = vk(tk, "/v1/chat/completions", sb)
+        s3, _, b3 = vk(tk, "/v1/chat/completions", sb)
+        check("the tokens of a streamed answer count against the key's token limit (two answers of 7 tokens spend 10)", s1 == 200 and s2 == 200 and s3 == 429, (s1, s2, s3, b3[:200]))
+        time.sleep(0.5)
+        entries = logs()
+        row = lambda m: [e for e in entries if e.get("model") == m]
+        r = row("openai/resp-n")
+        check("the log row of a big Responses request has its tokens", len(r) == 1 and r[0]["prompt_tokens"] == 5 and r[0]["completion_tokens"] == 2, [(e.get("prompt_tokens"), e.get("completion_tokens")) for e in r])
+        r = row("openai/resp-s")
+        check("the log row of a streamed Responses answer has the tokens of its completed event", len(r) == 1 and r[0]["prompt_tokens"] == 3 and r[0]["completion_tokens"] == 2, [(e.get("prompt_tokens"), e.get("completion_tokens")) for e in r])
+        r = row("anthropic/claude-l129-n")
+        check("the log row of a big Messages request has its tokens", len(r) == 1 and r[0]["prompt_tokens"] == 11 and r[0]["completion_tokens"] == 5, [(e.get("prompt_tokens"), e.get("completion_tokens")) for e in r])
+        r = row("anthropic/claude-l129-s")
+        check("the log row of a streamed Messages answer has the prompt from message_start and the output from message_delta", len(r) == 1 and r[0]["prompt_tokens"] == 9 and r[0]["completion_tokens"] == 5, [(e.get("prompt_tokens"), e.get("completion_tokens")) for e in r])
+        # a big answer to an ordinary request, passed through, is counted too
+        s, hs, b = call("POST", "/v1/chat/completions", {"model": "openai/large-answer", "messages": [{"role": "user", "content": "l129 answer"}]}, None, base=GW_L129, auth=False)
+        time.sleep(0.5)
+        r = [e for e in logs() if e.get("model") == "openai/large-answer"]
+        check("a big answer to an ordinary request is counted from its tail", s == 200 and len(r) == 1 and r[0]["prompt_tokens"] == 3 and r[0]["completion_tokens"] == 4, [(e.get("prompt_tokens"), e.get("completion_tokens")) for e in r])
+    finally:
+        gw.terminate()
+        gw.wait()
 
 def main():
     unique_ports()
@@ -6764,8 +7537,11 @@ def main():
         check("/openai/models lists models", s == 200 and jget(b).get("object") == "list", (s, b[:200]))
         s, _, b = call("POST", "/openai/embeddings", {"model": "openai/text-embedding-3-small", "input": "hi"})
         check("/openai/embeddings serves embeddings", s == 200 and seen()[-1]["path"] == "/v1/embeddings", (s, b[:200]))
-        s, _, b = call("POST", "/openai/realtime/calls", "v=0\r\no=- offer\r\n", {"x-bf-provider": "openai", "content-type": "application/sdp"})
-        check("/openai/realtime/calls passes the SDP offer to OpenAI", s == 201 and seen()[-1]["path"] == "/v1/realtime/calls" and "offer" in seen()[-1]["body"], (s, b[:200]))
+        # a realtime call is terminated on the gateway's own peer (realtime_e2e runs real ones): an offer its peer cannot
+        # parse is refused before any provider is called
+        before = len(seen())
+        s, _, b = call("POST", "/openai/realtime/calls?model=openai/gpt-realtime", "v=0\r\no=- offer\r\n", {"content-type": "application/sdp"})
+        check("/openai/realtime/calls answers the SDP offer itself: one it cannot parse is refused", s == 400 and "invalid browser SDP offer" in b and len(seen()) == before, (s, b[:200]))
 
         # POST /v1/realtime with an SDP offer at the base path (Bifrost accepts both)
         rq = urllib.request.Request(GW + "/v1/realtime?model=openai/gpt-realtime", data=b"v=0\r\no=- offer\r\n", method="POST", headers={"content-type": "application/sdp"})
@@ -6774,7 +7550,7 @@ def main():
                 rs, rb = r.status, r.read().decode()
         except urllib.error.HTTPError as e:
             rs, rb = e.code, e.read().decode()
-        check("POST /v1/realtime with an SDP offer goes to the calls route", rs == 201 and seen()[-1]["path"] == "/v1/realtime/calls" and "offer" in seen()[-1]["body"], (rs, rb[:200]))
+        check("POST /v1/realtime with an SDP offer is terminated the same way", rs == 400 and "invalid browser SDP offer" in rb and len(seen()) == before, (rs, rb[:200]))
 
         # Anthropic's legacy text completion, through the messages bridge
         s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-3-haiku-20240307", "prompt": "\n\nHuman: hi\n\nAssistant:", "max_tokens_to_sample": 50, "temperature": 0.2})
@@ -7891,6 +8667,8 @@ def main():
         webrtc_e2e(env)
         # a second WebRTC stack as the browser, when aiortc can be had
         aiortc_e2e()
+        # live and realtime sessions over WebSockets and realtime calls over WebRTC: metered, guarded, admitted per turn and logged with their cost; their own gateways (ports 18200 and 18201)
+        realtime_e2e(env)
         # provider create and key reads, config metadata, virtual key rotation and expiry, team members: their own gateway
         l97b_e2e(env)
         # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients: their own gateway
@@ -7962,12 +8740,16 @@ def main():
         l133_e2e(env)
         # WebAssembly plugins (a .wasm path in plugins[]): rewrites, short circuits, traps, limits and the plugin API: their own gateway
         l121_e2e(env)
+        # the plugin chain as Bifrost runs it: HTTP transport hooks, the LLM hooks on every request type and on streams, has_error: their own gateway
+        l130_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
         l113_ui_e2e(env)
         # network_config pool knobs and upstream HTTP/2 (Tov patch 0007): origins from tov-patches/tests/h2_server.py, their own gateway
         l126_e2e(env)
         # large_payload_optimization (Tov patch 0008): big request bodies streamed to the provider and big answers streamed back: their own gateway
         l124_e2e(env)
+        # large_payload_optimization beyond chat: Responses, Messages and multipart streamed, usage counted: their own gateway
+        l129_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

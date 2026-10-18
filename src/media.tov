@@ -13,6 +13,7 @@ import { parseModel, target, kindOf, pickKey, timeoutMs } from "./router"
 import { Field, fields, find, rawStr, rawNum, setField, build, quote } from "./json"
 import { errorJson, snapshot, nowSeconds } from "./schemas"
 import { deadline } from "./deadline"
+import { LargeSettings, LargeBody, formPrefix, boundaryOf, readAhead, readRest } from "./largepayload"
 import * as native from "./media_native"
 import * as cloud from "./media_cloud"
 import * as cloudAuth from "./cloud_auth"
@@ -56,7 +57,6 @@ function patterns(): Pattern[] {
     // Realtime over REST and WebRTC: ephemeral client secrets, sessions, and SDP calls
     { method: "POST", pattern: "/v1/realtime/client_secrets", op: "realtime.client_secrets", modelIn: "none" },
     { method: "POST", pattern: "/v1/realtime/sessions", op: "realtime.sessions", modelIn: "json" },
-    { method: "POST", pattern: "/v1/realtime/calls", op: "realtime.calls", modelIn: "none" },
     // Mistral's OCR (and OpenAI-compatible providers that offer it)
     { method: "POST", pattern: "/v1/ocr", op: "ocr", modelIn: "json" },
   ]
@@ -329,7 +329,7 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       else if (text !== "") {
         body = text
         // an SDP offer goes up as the caller sent it (application/sdp, or the multipart boundary)
-        contentType = route.op === "realtime.calls" ? (req.headers.get("content-type") ?? "application/sdp") : "application/json"
+        contentType = "application/json"
       }
     }
   } catch (e) {
@@ -347,6 +347,95 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
   const hs = authHeaders(tt)
   if (contentType !== undefined) hs.set("content-type", contentType)
   return await send(tt, { method: route.method, url: upstreamUrl(tt, route, qs), headers: hs, body: body })
+}
+
+// large_payload_optimization for a multipart upload (audio, image edits, files; largepayload.tov). A body over
+// the request threshold is not read whole: its first bytes give the model and the form fields before the file,
+// and the rest goes to the provider as it arrives, with the provider's name for the model in the form field.
+// Returns undefined for a request this does not touch (under the threshold), the Request to go on with (the
+// body was small after all, or its provider needs it whole: native providers, or a model field that comes
+// after the file) or the Response (refused, or the provider's answer).
+export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRoute, lp: LargeSettings): Promise<Response | Request | undefined> {
+  if (req.method !== "POST") return undefined
+  const dtext = req.headers.get("content-length")
+  const declared = dtext === undefined ? -1 : (parseInt(dtext) ?? -1)
+  if (declared >= 0 && declared <= lp.requestThreshold) return undefined
+  if (declared > lp.maxPayload) return errorReply(413, `request body of ${declared} bytes is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error")
+  const src = req.body
+  if (src === undefined) return undefined
+  const contentType = req.headers.get("content-type") ?? ""
+  const boundary = boundaryOf(contentType)
+  if (boundary === "") return undefined
+  // read ahead: the prefix, or the whole body when it ends within the threshold
+  const want = declared >= 0 ? lp.prefetch : Math.max(lp.prefetch, lp.requestThreshold + 1)
+  const ahead = await readAhead(src, want)
+  if (ahead.error !== "") return errorReply(400, `the request body could not be read: ${ahead.error}`, "invalid_request_error")
+  const hs0 = snapshot(req.headers)
+  if (ahead.ended && declared < 0 && ahead.head.length <= lp.requestThreshold) {
+    // no declared length, and small after all: an ordinary request
+    return new Request(req.url, { method: "POST", headers: hs0, body: ahead.head })
+  }
+  const meta = formPrefix(ahead.head, boundary)
+  const url = URL.parse(req.url)
+  const sp = new URLSearchParams(url === undefined ? "" : url.search)
+  const provider = providerFor(hs0, sp)
+  sp.delete("provider")
+  const qs = sp.toString()
+  // the provider needs the whole body (or the model is not in the prefix): read it, up to client.max_request_body_size_mb
+  const wholeRequest = async (): Promise<Response | Request> => {
+    const limit = (cfg.client?.max_request_body_size_mb ?? 100) * 1048576
+    if (declared > limit) {
+      await src.cancel()
+      return errorReply(413, "request body too large: this upload is read whole here and it is over client.max_request_body_size_mb", "invalid_request_error")
+    }
+    const all = await readRest(src, ahead.head, limit)
+    if (all.over) return errorReply(413, "request body too large", "invalid_request_error")
+    if (all.error !== "") return errorReply(400, `the request body could not be read: ${all.error}`, "invalid_request_error")
+    return new Request(req.url, { method: "POST", headers: hs0, body: all.bytes })
+  }
+  let t: Target | undefined = undefined
+  if (route.modelIn === "form") {
+    if (!meta.hasModel) return await wholeRequest()
+    t = modelTarget(cfg, meta.model)
+    if (t === undefined) {
+      await src.cancel()
+      return errorReply(404, `no provider or key serves model "${meta.model}"`, "invalid_request_error")
+    }
+  } else {
+    t = providerTarget(cfg, provider)
+    if (t === undefined) {
+      await src.cancel()
+      return errorReply(404, `provider "${provider}" is not configured or has no key`, "invalid_request_error")
+    }
+  }
+  const tt: Target = t
+  if (isNative(tt.kind) || (tt.kind === "wafer" && route.op === "files.create")) return await wholeRequest()
+  if (!supported(tt.kind)) {
+    await src.cancel()
+    return errorReply(400, `provider "${tt.provider}" does not support ${route.op}`, "invalid_request_error")
+  }
+  const lg = new LargeBody(lp, ahead.head, meta, ahead.ended ? undefined : src, declared)
+  lg.plain = true
+  if (route.modelIn === "form") lg.upstreamModel = tt.model
+  const h = authHeaders(tt)
+  h.set("content-type", contentType)
+  // the length is declared again when the caller declared one (so the provider need not accept chunks)
+  if (declared >= 0) h.set("content-length", "" + (declared + lg.delta()))
+  const hr: Record<string, string> = h
+  const dl = deadline(timeoutMs(tt.cfg))
+  try {
+    const res = await fetch(upstreamUrl(tt, route, qs), { method: "POST", headers: hr, body: lg.stream(), signal: dl.controller.signal, proxy: proxyOf(tt.cfg), tls: tlsOf(tt.cfg), pool: poolOf(tt.cfg) })
+    const bytes = await res.bytes()
+    dl.finish()
+    // a body with no declared length that grew past max_payload_bytes cut its own upload short
+    if (lg.tap.over) return errorReply(413, `request body is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error")
+    const ct = res.headers.get("content-type") ?? "application/json"
+    return new Response(bytes, { status: res.status, headers: { "content-type": ct } })
+  } catch (e) {
+    dl.finish()
+    if (lg.tap.over) return errorReply(413, `request body is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error")
+    return errorReply(502, `${tt.provider} request failed: ${e.message}`, "api_connection_error")
+  }
 }
 
 // ---- Native cloud routes: the provider's own job, file and cache APIs ----
@@ -507,63 +596,6 @@ function vertexNativeRequest(t: Target, token: string, nr: NativeRoute, qs: stri
   if (body !== undefined) hs.set("content-type", "application/json")
   addExtraHeaders(&hs, t.cfg)
   return { method: method, url: url, headers: hs, body: body }
-}
-
-// POST /v1/realtime with a WebRTC SDP offer (Bifrost accepts it at the base path as well as at
-// /realtime/calls). The model is the session's (the multipart "session" field, or ?model=), and it picks
-// the provider; the call goes up as /v1/realtime/calls of that provider with the model's bare name.
-export async function realtimeSdp(cfg: Config, req: Request): Promise<Response> throws TypeError {
-  const url = try new URL(req.url)
-  const sp = new URLSearchParams(url.search)
-  const ct = req.headers.get("content-type") ?? ""
-  let model = sp.get("model") ?? ""
-  let form: FormData | undefined = undefined
-  let sdp = ""
-  let session = ""
-  try {
-    if (ct.includes("multipart/form-data")) {
-      const fd = try await req.formData()
-      form = fd
-      const s = fd.get("session")
-      if (typeof s === "string") {
-        session = s
-        if (model === "") model = rawStr(try fields(s), "model") ?? ""
-      }
-    } else {
-      sdp = try await req.text()
-    }
-  } catch (e) {
-    return errorReply(400, `invalid request body: ${e.message}`, "invalid_request_error")
-  }
-  if (model === "") return errorReply(400, "session.model is required", "invalid_request_error")
-  const mt = modelTarget(cfg, model)
-  if (mt === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
-  if (!supported(mt.kind)) return errorReply(400, `provider "${mt.provider}" does not support realtime calls`, "invalid_request_error")
-  sp.delete("provider")
-  sp.set("model", mt.model)
-  const origin = url.origin
-  const hs: Map<string, string> = snapshot(req.headers)
-  hs.set("x-bf-provider", mt.provider)
-  let next: Request
-  try {
-    if (form !== undefined) {
-      // the session with its model replaced by the bare name (Bifrost strips the provider prefix)
-      const newSession = session === "" ? "" : try rewriteJsonModel(session, mt.model)
-      const out = new FormData()
-      form.forEach((value, key) => {
-        if (key === "session" && typeof value === "string") out.append(key, newSession === "" ? value : newSession)
-        else out.append(key, value)
-      })
-      hs.delete("content-type")
-      next = new Request(origin + "/v1/realtime/calls?" + sp.toString(), { method: "POST", headers: hs, body: out })
-    } else {
-      next = new Request(origin + "/v1/realtime/calls?" + sp.toString(), { method: "POST", headers: hs, body: sdp })
-    }
-  } catch (e) {
-    return errorReply(400, `invalid session: ${e.message}`, "invalid_request_error")
-  }
-  const route = matchRoute("POST", "/v1/realtime/calls") ?? { op: "realtime.calls", method: "POST", upstreamPath: "/realtime/calls", modelIn: "none" }
-  return try await handleMedia(cfg, next, route)
 }
 
 // ---- Anthropic and Gemini ----

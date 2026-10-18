@@ -21,6 +21,7 @@ build:
 # tests need no toolchain; this rebuilds it with clang and wasm-ld (clang --target=wasm32 needs no libc).
 wasm-fixture:
 	clang --target=wasm32 -O2 -nostdlib -fno-builtin -Wall -Wl,--no-entry -Wl,--initial-memory=262144 -Wl,-z,stack-size=16384 -o tests/wasm/plugin.wasm tests/wasm/plugin.c
+	clang --target=wasm32 -O2 -nostdlib -fno-builtin -Wall -Wl,--no-entry -Wl,--initial-memory=262144 -Wl,-z,stack-size=16384 -DPRE_NAME='"http_intercept"' -o tests/wasm/plugin_intercept.wasm tests/wasm/plugin.c
 	cd tov-patches/tests && clang --target=wasm32 -O1 -nostdlib -fno-builtin -Wl,--no-entry -Wl,--export-all -Wl,-z,stack-size=8192 -Wl,--initial-memory=131072 -Wl,--max-memory=1048576 -o wasm_mod.wasm wasm_mod.c
 
 check:

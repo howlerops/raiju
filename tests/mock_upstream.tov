@@ -2,7 +2,7 @@ import { listen } from "../src/http1"
 import { fields, find, rawStr } from "../src/json"
 import { sha256, utf8, toHex } from "../src/crypto"
 import { encodeUrl } from "../src/base64"
-import { liveAnswer, liveEvents, liveStats, liveReset } from "./mock_live"
+import { liveAnswer, liveEvents, liveStats, liveReset, realtimeAnswer, realtimeTurn } from "./mock_live"
 // A fake provider for end-to-end tests. Speaks enough of OpenAI, Anthropic,
 // Gemini and Bedrock to exercise translation, and fails on demand:
 //   model "flaky-*"   → 503 on every other call
@@ -84,6 +84,24 @@ function record(req: Request, path: string, body: string): void {
   const size = body.byteLength
   const big = size > 65536
   seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "" })
+}
+
+// The raw JSON text of a field of an event, or "".
+function wsField(text: string, key: string): string {
+  try {
+    return find(fields(text), key) ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// A string field of an event, or "".
+function wsString(text: string, key: string): string {
+  try {
+    return rawStr(fields(text), key) ?? ""
+  } catch (e) {
+    return ""
+  }
 }
 
 function failure(model: string, auth: string): Response | undefined {
@@ -621,6 +639,8 @@ Bun.serve<string>({
         if (typeof f === "string" || f === undefined) return Response.json({ error: { message: "no file part", type: "invalid_request_error" } }, { status: 400 })
         const raw = try await f.bytes()
         const text = try await f.text()
+        // a big upload (large_payload_optimization): its size and hash
+        if (raw.length > 65536) seen.push({ path: "/v1/files/big", auth: req.headers.get("authorization") ?? "", body: f.name, team: "", tenant: "", size: raw.length, sha: toHex(sha256(raw)) })
         const id = nextId(isAnthropic(req) ? "file_" : "file-")
         mockFiles.set(id, text)
         if (isAnthropic(req)) {
@@ -1049,11 +1069,15 @@ Bun.serve<string>({
     // the form's model is what the upstream got
     "/v1/audio/transcriptions": {
       POST: async (req) => {
-        const fd = try await req.formData()
+        // the whole upload as bytes: a big one (large_payload_optimization) is checked by its size and hash
+        const raw = try await req.bytes()
+        const form = new Request(req.url, { method: "POST", headers: { "content-type": req.headers.get("content-type") ?? "" }, body: raw })
+        const fd = try await form.formData()
         const mv = fd.get("model")
         const model = typeof mv === "string" ? mv : ""
-        record(req, "/v1/audio/transcriptions", `{"model":"${model}"}`)
-        return Response.json({ text: "transcribed by " + model })
+        if (raw.length > 65536) seen.push({ path: "/v1/audio/transcriptions", auth: req.headers.get("authorization") ?? "", body: `{"model":"${model}"}`, team: "", tenant: "", size: raw.length, sha: toHex(sha256(raw)) })
+        else record(req, "/v1/audio/transcriptions", `{"model":"${model}"}`)
+        return Response.json({ text: "transcribed by " + model, usage: { type: "tokens", input_tokens: 14, output_tokens: 6, total_tokens: 20 } })
       },
     },
     "/v1/audio/speech": {
@@ -1339,6 +1363,28 @@ Bun.serve<string>({
     const lp = lu === undefined ? "" : lu.pathname
     // Replicate's API (see replicateMock)
     if (lp.startsWith("/replicate/")) return try await replicateMock(req, lp.slice(10), lu)
+    // a realtime call (OpenAI's /v1/realtime/calls and its beta /v1/realtime, Azure's /openai/v1/realtime): a
+    // multipart body with the caller's SDP offer in "sdp" and the session in "session". A real WebRTC peer
+    // (mock_live.tov) answers it, and plays the Realtime API on the data channel. The request is recorded
+    // as the session and then the offer, so a test can see what the gateway sent.
+    if (req.method === "POST" && (lp === "/v1/realtime/calls" || lp === "/v1/realtime" || lp === "/openai/v1/realtime")) {
+      let sdp = ""
+      let session = ""
+      try {
+        const fd = try await req.formData()
+        const s = fd.get("sdp")
+        if (typeof s === "string") sdp = s
+        const ses = fd.get("session")
+        if (typeof ses === "string") session = ses
+      } catch (e) {
+        sdp = ""
+      }
+      record(req, lp + (lu === undefined ? "" : lu.search), "session=" + session + "\nsdp=" + sdp)
+      if (session.includes("gpt-realtime-refuse")) return new Response(`{"error":{"message":"invalid realtime session","type":"invalid_request_error"}}`, { status: 400, headers: { "content-type": "application/json" } })
+      const answer = await realtimeAnswer(sdp)
+      if (answer === "") return new Response(`{"error":{"message":"invalid realtime call","type":"invalid_request_error"}}`, { status: 400, headers: { "content-type": "application/json" } })
+      return new Response(answer, { status: 201, headers: { "content-type": "application/sdp" } })
+    }
     // Azure-style deployments: the call is recorded as sent, then answered by the /v1 route of its operation
     if (lp.startsWith("/openai/deployments/") && lu !== undefined) {
       const rest = lp.slice(20)
@@ -1362,10 +1408,9 @@ Bun.serve<string>({
       hd.set("content-type", "audio/wav")
       return new Response("RIFF-recording-" + lp.slice(18, lp.byteLength - 8), { headers: hd })
     }
-    if (lp.startsWith("/v1/responses/") || lp === "/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions" || lp === "/v1/realtime/calls") {
+    if (lp.startsWith("/v1/responses/") || lp === "/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions") {
       const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
       record(req, lp, req.method + " " + body)
-      if (lp === "/v1/realtime/calls") return new Response("v=0\r\no=- answer\r\n", { status: 201, headers: { "content-type": "application/sdp" } })
       return Response.json({ object: "ok", method: req.method, path: lp })
     }
     // GPT Live's WebRTC create: a real WebRTC peer answers the offer (mock_live.tov); a body the peer
@@ -1525,7 +1570,67 @@ Bun.serve<string>({
     message(ws, m) {
       const text = typeof m === "string" ? m : "binary"
       // a live session starts with session.start; the provider answers with its id
-      if (text.includes(`"session.start"`)) ws.send(`{"type":"session.started","session":{"id":"sess_mock_1"}}`)
+      // (a mock_id in the start frame's session names it, so a test can tell sessions apart)
+      if (text.includes(`"session.start"`)) {
+        let sid = "sess_mock_1"
+        try {
+          const mid = rawStr(fields(wsField(text, "session")), "mock_id") ?? ""
+          if (mid !== "") sid = mid
+        } catch (e) {
+          sid = "sess_mock_1"
+        }
+        ws.send(`{"type":"session.started","session":{"id":"${sid}"}}`)
+      }
+      // test events steer the provider (see mock_live.tov for the same ones over WebRTC):
+      //   test.usage {seconds}       a live session.usage.updated
+      //   test.speak {text}          a live input transcript and the words of text as output transcript deltas
+      //   test.backend {input,output,model}  a live delegated response that completed with that usage
+      //   test.rt.start              a realtime session.created
+      //   test.rt.turn {...}         a realtime response (mock_live.tov realtimeTurn)
+      //   test.hangup                the provider's connection breaks (close code 1011)
+      //   session.close {mock_seconds}   a live session.closed with that many seconds (20), then the close
+      let type = ""
+      try {
+        type = rawStr(fields(text), "type") ?? ""
+      } catch (e) {
+        type = ""
+      }
+      if (type === "test.usage") {
+        ws.send(`{"type":"session.usage.updated","usage":{"seconds":${wsField(text, "seconds") === "" ? "0" : wsField(text, "seconds")}}}`)
+        return
+      }
+      if (type === "test.speak") {
+        ws.send(`{"type":"session.input_transcript.delta","delta":"hello","start_ms":0,"end_ms":400}`)
+        for (const w of wsString(text, "text").split(" ")) ws.send(`{"type":"session.output_transcript.delta","delta":${JSON.stringify(w + " ")},"start_ms":500,"end_ms":900}`)
+        return
+      }
+      if (type === "test.backend") {
+        const i = wsField(text, "input")
+        const o = wsField(text, "output")
+        const model = wsString(text, "model")
+        const named = model === "" ? "" : "\"model\":" + JSON.stringify(model) + ","
+        ws.send(`{"type":"response.event","delegation_id":"d1","event":{"type":"response.completed","response":{"id":"resp_${i}_${o}",${named}"usage":{"input_tokens":${i},"output_tokens":${o}}}}}`)
+        return
+      }
+      if (type === "test.rt.start") {
+        const id = wsString(text, "id")
+        ws.send(`{"type":"session.created","session":{"id":"${id === "" ? "sess_mock_rt_ws" : id}","object":"realtime.session"}}`)
+        return
+      }
+      if (type === "test.rt.turn") {
+        for (const e of realtimeTurn(text)) ws.send(e)
+        return
+      }
+      if (type === "test.hangup") {
+        ws.close(1011, "hangup")
+        return
+      }
+      if (type === "session.close") {
+        const secs = wsField(text, "mock_seconds")
+        ws.send(`{"type":"session.closed","reason":"close_requested","usage":{"seconds":${secs === "" ? "20" : secs}}}`)
+        ws.close(1000, "closed")
+        return
+      }
       ws.send(JSON.stringify({ type: "echo", auth: ws.data ?? "", event: text }))
     },
   },

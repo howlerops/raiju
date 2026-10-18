@@ -1,0 +1,352 @@
+// What plugins see of a request on the HTTP transport (Bifrost's HTTPRequest and HTTPResponse, with
+// the body as base64 in JSON), the server-sent events a streamed answer is cut into for the stream
+// chunk hook, and the request types the LLM hooks run on. Pure functions; src/pluginroute.tov wires
+// them to the servers and src/wasmplugin.tov to WebAssembly plugins.
+
+import { Field, fields, find, rawStr, rawNum, isNull, quote, decodeString } from "./json"
+import { encode, decode } from "./base64"
+
+// A request as the transport hooks see it. Header names are lower-cased. query holds the last value
+// of each parameter, as Bifrost's HTTPRequest does; rawQuery is the query string as it arrived and is
+// kept unless a hook changed the map (queryEdited).
+export type HttpReq = {
+  method: string,
+  path: string,
+  headers: Map<string, string>,
+  query: Map<string, string>,
+  rawQuery: string,
+  queryEdited: bool,
+  body: u8[],
+}
+
+export type HttpResp = { status: int, headers: Map<string, string>, body: u8[] }
+
+// Bodies over this size are not handed to hooks (Bifrost skips the body of a large payload).
+export const HOOK_BODY_LIMIT = 4194304
+
+export function emptyReq(method: string, path: string): HttpReq {
+  return { method: method, path: path, headers: new Map(), query: new Map(), rawQuery: "", queryEdited: false, body: [] }
+}
+
+// The query string without its "?" as a map of the last value of each parameter.
+export function queryMap(qs: string): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  const sp = new URLSearchParams(qs)
+  sp.forEach((value, key) => {
+    m.set(key, value)
+  })
+  return m
+}
+
+// A query string from a map.
+export function queryString(m: Map<string, string>): string {
+  const sp = new URLSearchParams("")
+  for (const k of m.keys()) sp.set(k, m.get(k)!)
+  return sp.toString()
+}
+
+// ---- JSON forms ----
+
+// A string map as a JSON object.
+export function mapJson(m: Map<string, string>): string {
+  const parts: string[] = []
+  for (const k of m.keys()) parts.push(quote(k) + ":" + quote(m.get(k)!))
+  return "{" + parts.join(",") + "}"
+}
+
+// A JSON object as a string map: string values as they are, other values as their JSON text, null left out.
+export function mapOf(raw: string): Map<string, string> throws SyntaxError {
+  const out: Map<string, string> = new Map()
+  if (!raw.startsWith("{")) return out
+  for (const f of try fields(raw)) {
+    if (f.raw.startsWith("\"")) out.set(f.key, try decodeString(f.raw))
+    else if (!isNull(f.raw)) out.set(f.key, f.raw)
+  }
+  return out
+}
+
+// The request as the JSON object Bifrost's WebAssembly hooks get. The body is base64.
+export function httpReqJson(r: HttpReq): string {
+  return `{"method":${quote(r.method)},"path":${quote(r.path)},"headers":${mapJson(r.headers)},"query":${mapJson(r.query)},"path_params":{},"body":${quote(encode(r.body))}}`
+}
+
+// The response as the JSON object the hooks get.
+export function httpRespJson(r: HttpResp): string {
+  return `{"status_code":${r.status},"headers":${mapJson(r.headers)},"body":${quote(encode(r.body))}}`
+}
+
+// Applies a hook's answer to the request. As Bifrost applies it, a header or query parameter the hook
+// sets replaces the one that was there and nothing is removed; a body that differs from the one sent
+// replaces it. A changed method or path is left in r for the caller to refuse.
+export function applyHttpReq(inout r: HttpReq, outRaw: string): void throws SyntaxError {
+  const of = try fields(outRaw)
+  const m = rawStr(of, "method")
+  if (m !== undefined && m !== "") r.method = m
+  const p = rawStr(of, "path")
+  if (p !== undefined && p !== "") r.path = p
+  const h = find(of, "headers")
+  if (h !== undefined) {
+    const hm = try mapOf(h)
+    for (const k of hm.keys()) r.headers.set(k.toLowerCase(), hm.get(k)!)
+  }
+  const q = find(of, "query")
+  if (q !== undefined) {
+    const qm = try mapOf(q)
+    for (const k of qm.keys()) {
+      if (r.query.get(k) !== qm.get(k)!) {
+        r.query.set(k, qm.get(k)!)
+        r.queryEdited = true
+      }
+    }
+  }
+  const b = rawStr(of, "body")
+  if (b !== undefined && b !== encode(r.body)) r.body = try decode(b)
+}
+
+// Applies a hook's answer to the response: a valid status_code, headers set, a body that differs.
+export function applyHttpResp(inout r: HttpResp, outRaw: string): void throws SyntaxError {
+  const of = try fields(outRaw)
+  const sc = rawNum(of, "status_code")
+  if (sc !== undefined) {
+    const s = Math.trunc(sc)
+    if (s >= 100 && s <= 599) r.status = s
+  }
+  const h = find(of, "headers")
+  if (h !== undefined) {
+    const hm = try mapOf(h)
+    for (const k of hm.keys()) r.headers.set(k.toLowerCase(), hm.get(k)!)
+  }
+  const b = rawStr(of, "body")
+  if (b !== undefined && b !== encode(r.body)) r.body = try decode(b)
+}
+
+// A response from a hook's own HTTPResponse JSON (a short circuit): status_code (default 200), headers, body.
+export function respFromJson(raw: string): HttpResp throws SyntaxError {
+  const of = try fields(raw)
+  const sc = rawNum(of, "status_code")
+  let status = sc === undefined ? 200 : Math.trunc(sc)
+  if (status < 100 || status > 599) status = 500
+  const hm = find(of, "headers")
+  const headers: Map<string, string> = new Map()
+  if (hm !== undefined) {
+    const m = try mapOf(hm)
+    for (const k of m.keys()) headers.set(k.toLowerCase(), m.get(k)!)
+  }
+  const b = rawStr(of, "body")
+  const body: u8[] = b === undefined || b === "" ? [] : try decode(b)
+  return { status: status, headers: headers, body: body }
+}
+
+// ---- server-sent events ----
+
+// Cuts a stream of text into events: each block ends with a blank line.
+export class SseBuffer {
+  pending = ""
+
+  // The complete event blocks the text finishes, each with its closing blank line.
+  push(t: string): string[] {
+    this.pending += t.includes("\r\n") ? t.replaceAll("\r\n", "\n") : t
+    const out: string[] = []
+    while (true) {
+      const i = this.pending.indexOf("\n\n")
+      if (i < 0) break
+      out.push(this.pending.slice(0, i + 2))
+      this.pending = this.pending.slice(i + 2)
+    }
+    return out
+  }
+
+  // What is left that is not a whole event (cleared).
+  rest(): string {
+    const r = this.pending
+    this.pending = ""
+    return r
+  }
+}
+
+// The data of an event block (lines joined with a newline), or undefined when it has none.
+export function sseData(block: string): string | undefined {
+  const datas: string[] = []
+  for (const line of block.split("\n")) {
+    if (line.startsWith("data:")) {
+      let v = line.slice(5)
+      if (v.startsWith(" ")) v = v.slice(1)
+      datas.push(v)
+    }
+  }
+  if (datas.length === 0) return undefined
+  return datas.join("\n")
+}
+
+// The block with its data replaced (other lines, such as event:, stay).
+export function sseWithData(block: string, data: string): string {
+  const out: string[] = []
+  let placed = false
+  for (const line of block.split("\n")) {
+    if (line.startsWith("data:")) {
+      if (!placed) out.push("data: " + data)
+      placed = true
+    } else if (line !== "") {
+      out.push(line)
+    }
+  }
+  return out.join("\n") + "\n\n"
+}
+
+// An error event, in the shape Bifrost sends when a stream hook ends a stream.
+export function sseErrorEvent(message: string): string {
+  return `data: {"error":${quote(message)}}\n\n`
+}
+
+// ---- the request types the LLM hooks run on ----
+
+// op is the name the gateway gives the request; reqType is Bifrost's request type; reqKey, respKey and
+// streamKey are the members that hold the request, the response and a stream chunk in the JSON the
+// hooks exchange; inputKey is the body field that is the request's input ("" when there is none). A
+// form request is multipart (its text fields are the params); a binary answer (speech) is handed to
+// the hooks as {"audio": base64, "content_type"}.
+export type LlmKind = { op: string, reqType: string, reqKey: string, respKey: string, streamKey: string, inputKey: string, form: bool, binary: bool }
+
+function kind(op: string, reqType: string, stem: string, streamKey: string, inputKey: string, form: bool, binary: bool): LlmKind {
+  return { op: op, reqType: reqType, reqKey: stem + "_request", respKey: stem + "_response", streamKey: streamKey === "" ? stem + "_response" : streamKey, inputKey: inputKey, form: form, binary: binary }
+}
+
+function makeKinds(): LlmKind[] {
+  return [
+    kind("chat", "chat_completion", "chat", "", "messages", false, false),
+    kind("completions", "text_completion", "text_completion", "", "prompt", false, false),
+    kind("embeddings", "embedding", "embedding", "", "input", false, false),
+    kind("responses", "responses", "responses", "responses_stream_response", "input", false, false),
+    kind("rerank", "rerank", "rerank", "", "", false, false),
+    kind("speech", "speech", "speech", "speech_stream_response", "input", false, true),
+    kind("transcription", "transcription", "transcription", "transcription_stream_response", "", true, false),
+    kind("image_generation", "image_generation", "image_generation", "image_generation_stream_response", "prompt", false, false),
+    kind("image_edit", "image_edit", "image_edit", "image_generation_stream_response", "prompt", true, false),
+    kind("image_variation", "image_variation", "image_variation", "image_generation_stream_response", "", true, false),
+    kind("ocr", "ocr", "ocr", "", "", false, false),
+  ]
+}
+
+const KINDS: LlmKind[] = makeKinds()
+
+export const CHAT_KIND: LlmKind = KINDS[0]!
+
+// The kind for an op name, or undefined.
+export function kindOfOp(op: string): LlmKind | undefined {
+  for (const k of KINDS) {
+    if (k.op === op) return k
+  }
+  return undefined
+}
+
+// The kind a POST to a /v1 route runs the LLM hooks as (the path after the compat prefixes are removed).
+export function kindOfPath(method: string, path: string): LlmKind | undefined {
+  if (method !== "POST") return undefined
+  if (path === "/v1/chat/completions") return kindOfOp("chat")
+  if (path === "/v1/completions") return kindOfOp("completions")
+  if (path === "/v1/embeddings") return kindOfOp("embeddings")
+  if (path === "/v1/responses") return kindOfOp("responses")
+  if (path === "/v1/rerank") return kindOfOp("rerank")
+  if (path === "/v1/audio/speech") return kindOfOp("speech")
+  if (path === "/v1/audio/transcriptions" || path === "/v1/audio/translations") return kindOfOp("transcription")
+  if (path === "/v1/images/generations") return kindOfOp("image_generation")
+  if (path === "/v1/images/edits") return kindOfOp("image_edit")
+  if (path === "/v1/images/variations") return kindOfOp("image_variation")
+  if (path === "/v1/ocr") return kindOfOp("ocr")
+  return undefined
+}
+
+// Whether a path is an inference route, one the transport hooks run on. Bifrost runs them on the
+// inference routes (its LLM, integration and MCP-over-HTTP routes) and not on the management API,
+// the health and metrics endpoints or the dashboard.
+export function isInferencePath(p: string): bool {
+  if (p === "/" || p === "/health" || p === "/metrics" || p === "/favicon.ico") return false
+  if (p.startsWith("/api/") || p.startsWith("/assets/") || p.startsWith("/scim/") || p.startsWith("/agents/") || p === "/mcp" || p.startsWith("/mcp/")) return false
+  if (p === "/ws" || p.startsWith("/ws/")) return false
+  return p.startsWith("/v1/") || p.startsWith("/openai") || p.startsWith("/anthropic") || p.startsWith("/genai") || p.startsWith("/bedrock") || p.startsWith("/cohere") || p.startsWith("/litellm") || p.startsWith("/langchain") || p.startsWith("/pydanticai") || p.startsWith("/cursor") || p.startsWith("/typesafe") || p.startsWith("/decisions")
+}
+
+// ---- tests ----
+
+function text(b: u8[]): string {
+  return try new TextDecoder().decode(b)
+}
+
+test("a request round trips through its JSON form and a hook's answer is applied as Bifrost applies it", () => {
+  let r = emptyReq("POST", "/v1/embeddings")
+  r.headers.set("content-type", "application/json")
+  r.query.set("a", "1")
+  r.body = new TextEncoder().encode(`{"x":1}`)
+  const j = httpReqJson(r)
+  const f = try fields(j)
+  expect(rawStr(f, "method")).toBe("POST")
+  expect(rawStr(f, "body")).toBe(encode(r.body))
+  expect(try mapOf(find(f, "headers")!)).toEqual(r.headers)
+  const out = `{"method":"POST","path":"/v1/embeddings","headers":{"X-Added":"yes"},"query":{"a":"1","b":"2"},"body":${quote(encode(new TextEncoder().encode(`{"x":2}`)))}}`
+  try applyHttpReq(&r, out)
+  expect(r.headers.get("x-added")).toBe("yes")
+  expect(r.headers.get("content-type")).toBe("application/json")
+  expect(r.query.get("b")).toBe("2")
+  expect(r.queryEdited).toBe(true)
+  expect((try text(r.body))).toBe(`{"x":2}`)
+  // an answer that repeats what was sent changes nothing
+  let same = emptyReq("GET", "/v1/models")
+  same.query.set("k", "v")
+  try applyHttpReq(&same, httpReqJson(same))
+  expect(same.queryEdited).toBe(false)
+  expect(same.path).toBe("/v1/models")
+})
+
+test("a response is applied the same way, and a short circuit reads status, headers and body", () => {
+  let resp: HttpResp = { status: 200, headers: new Map(), body: new TextEncoder().encode("hi") }
+  resp.headers.set("content-type", "text/plain")
+  try applyHttpResp(&resp, `{"status_code":201,"headers":{"X-Seen":"1"},"body":${quote(encode(new TextEncoder().encode("bye")))}}`)
+  expect(resp.status).toBe(201)
+  expect(resp.headers.get("x-seen")).toBe("1")
+  expect(resp.headers.get("content-type")).toBe("text/plain")
+  expect((try text(resp.body))).toBe("bye")
+  try applyHttpResp(&resp, `{"status_code":9000}`)
+  expect(resp.status).toBe(201)
+  const sc = try respFromJson(`{"status_code":418,"headers":{"Content-Type":"text/plain"},"body":"${encode(new TextEncoder().encode("teapot"))}"}`)
+  expect(sc.status).toBe(418)
+  expect(sc.headers.get("content-type")).toBe("text/plain")
+  expect((try text(sc.body))).toBe("teapot")
+  const bare = try respFromJson(`{}`)
+  expect(bare.status).toBe(200)
+  expect(bare.body.length).toBe(0)
+})
+
+test("events are cut at blank lines whatever the chunking, and a data line is replaced in place", () => {
+  const b = new SseBuffer()
+  expect(b.push(`data: {"a":1}\n\nda`).length).toBe(1)
+  const more = b.push(`ta: {"b":2}\n\nevent: x\ndata: [DONE]\n\n`)
+  expect(more.length).toBe(2)
+  expect(more[0]).toBe(`data: {"b":2}\n\n`)
+  expect(sseData(more[1]!)).toBe("[DONE]")
+  expect(b.rest()).toBe("")
+  expect(b.push("data: tail").length).toBe(0)
+  expect(b.rest()).toBe("data: tail")
+  const crlf = new SseBuffer()
+  expect(crlf.push("data: 1\r\n\r\n").length).toBe(1)
+  expect(sseData("event: e\ndata: {\"x\":1}\n\n")).toBe(`{"x":1}`)
+  expect(sseData(": comment\n\n")).toBe(undefined)
+  expect(sseWithData("event: e\ndata: {\"x\":1}\n\n", `{"x":2}`)).toBe("event: e\ndata: {\"x\":2}\n\n")
+  expect(sseErrorEvent("no")).toBe(`data: {"error":"no"}\n\n`)
+})
+
+test("request kinds come from the route, and the transport hooks run on inference routes only", () => {
+  expect(kindOfPath("POST", "/v1/embeddings")!.reqKey).toBe("embedding_request")
+  expect(kindOfPath("POST", "/v1/audio/translations")!.form).toBe(true)
+  expect(kindOfPath("POST", "/v1/audio/speech")!.binary).toBe(true)
+  expect(kindOfPath("GET", "/v1/embeddings")).toBe(undefined)
+  expect(kindOfPath("POST", "/v1/files")).toBe(undefined)
+  expect(kindOfOp("responses")!.streamKey).toBe("responses_stream_response")
+  expect(CHAT_KIND.respKey).toBe("chat_response")
+  expect(isInferencePath("/v1/chat/completions")).toBe(true)
+  expect(isInferencePath("/anthropic/v1/messages")).toBe(true)
+  expect(isInferencePath("/genai/v1beta/models/m:generateContent")).toBe(true)
+  expect(isInferencePath("/api/plugins")).toBe(false)
+  expect(isInferencePath("/health")).toBe(false)
+  expect(isInferencePath("/metrics")).toBe(false)
+  expect(isInferencePath("/")).toBe(false)
+})

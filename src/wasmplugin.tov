@@ -6,6 +6,10 @@
 //   pre_hook(ptr, len) -> packed  post_hook(ptr, len) -> packed
 //   cleanup() -> 0
 //
+// The HTTP transport hooks are optional exports in the same format: http_pre_hook (http_intercept,
+// its older name, when that is all the module has), http_post_hook and http_stream_chunk_hook.
+// Their inputs and answers are described at wasmHttpPre, wasmHttpPost and wasmHttpChunk below.
+//
 // where "packed" is a u64: the pointer to a JSON text in the plugin's memory in the upper 32
 // bits and its length in the lower 32. The host writes each input into memory it got from
 // malloc, calls the hook, reads the answer, and frees both. All data is JSON.
@@ -20,8 +24,10 @@
 // other field of the OpenAI body) and fallbacks, both at the top of the object (as Bifrost's
 // docs show it) and under "chat_request" (as its Rust and TypeScript examples read it). The
 // response is {"chat_response": <the chat completion>}. Whichever of the two request forms a
-// plugin changes is applied. The HTTP transport hooks (http_pre_hook, http_post_hook,
-// http_stream_chunk_hook) are not called.
+// plugin changes is applied. The same shapes serve every request type the hooks run on (embeddings,
+// speech, transcription, images, Responses, rerank...): the request key and the response key are
+// named after the type (plughttp.tov LlmKind), and a type with no chat messages has its own input
+// field as "input".
 //
 // Each instance runs with limits (memory pages, operand stack, instructions per call), so a
 // plugin that loops or grows without end fails its hook instead of hanging the gateway.
@@ -31,6 +37,7 @@ import { readFileBytesSync, statSync } from "node:fs"
 import { Field, fields, elements, find, rawStr, rawNum, rawBool, isNull, quote, build, setField, without } from "./json"
 import { errorJson } from "./schemas"
 import { utf8 } from "./crypto"
+import { LlmKind, CHAT_KIND, HttpResp, kindOfOp, emptyReq, httpReqJson, httpRespJson, applyHttpReq, applyHttpResp, respFromJson } from "./plughttp"
 
 // The text of UTF-8 bytes.
 function text(b: u8[]): string throws Error {
@@ -54,11 +61,36 @@ export type WasmPre =
   | { kind: "continue", body: string, context: string }
   | { kind: "short_circuit", status: int, body: string, context: string }
 
-export type WasmPost = { body: string, context: string }
+// A post_hook's answer: the body (and the status it now has, when the plugin changed it: an error made
+// of a response, or a response made of an error), and the shared context.
+export type WasmPost =
+  | { kind: "same", context: string }
+  | { kind: "body", body: string, context: string }
+  | { kind: "status", status: int, body: string, context: string }
+
+// The hooks a module exports. httpPre is the export that runs before routing (http_pre_hook, or
+// http_intercept, its older name), "" when there is none.
+export type WasmExports = { pre: bool, post: bool, httpPre: string, httpPost: bool, httpChunk: bool }
+
+// An http_pre_hook answer: go on (with the request the plugin returned, when it did), answer at once
+// with a response of its own, or fail with the message the plugin gave.
+export type WasmHttpPre =
+  | { kind: "continue", request: string | undefined, context: string }
+  | { kind: "respond", response: string, context: string }
+  | { kind: "error", message: string, context: string }
+
+// An http_post_hook answer: the response the plugin returned (when it did), or the message of its error
+// (the chain then stops, keeping what was changed so far).
+export type WasmHttpPost = { response: string | undefined, error: string, context: string }
+
+// An http_stream_chunk_hook answer: the chunk to send on (possibly changed), drop the chunk, or end the stream.
+export type WasmHttpChunk =
+  | { kind: "chunk", chunk: string, warning: string, context: string }
+  | { kind: "skip", context: string }
+  | { kind: "stop", message: string, context: string }
 
 // ---- the request and response in Bifrost's shapes ----
 
-const CHAT_KEYS: string[] = ["model", "messages", "fallbacks"]
 const REQUEST_KEYS: string[] = ["provider", "model", "input", "params", "fallbacks"]
 
 function splitModel(m: string): { provider: string, model: string } {
@@ -67,16 +99,38 @@ function splitModel(m: string): { provider: string, model: string } {
   return { provider: m.slice(0, i), model: m.slice(i + 1) }
 }
 
-// A chat body (OpenAI shape) as the request a plugin gets.
-export function requestJson(body: string): string throws SyntaxError {
+// The body fields that are not params: the model, the input and the fallbacks.
+function paramSkip(k: LlmKind): string[] {
+  return k.inputKey === "" ? ["model", "fallbacks"] : ["model", k.inputKey, "fallbacks"]
+}
+
+// A snake_case member name as Go would name the field (chat_request is ChatRequest).
+function pascal(snake: string): string {
+  const parts = snake.split("_")
+  const out: string[] = []
+  for (const p of parts) out.push(p.slice(0, 1).toUpperCase() + p.slice(1))
+  return out.join("")
+}
+
+// A request body (OpenAI shape) as the request a plugin gets: provider, model, input, params and
+// fallbacks, flat and under the kind's request key.
+export function requestJsonFor(k: LlmKind, body: string): string throws SyntaxError {
   const fs = try fields(body)
   const m = splitModel(rawStr(fs, "model") ?? "")
-  const params: Field[] = fs.filter((f) => !CHAT_KEYS.includes(f.key))
-  const parts: string[] = [`"provider":${quote(m.provider)}`, `"model":${quote(m.model)}`, `"input":${find(fs, "messages") ?? "[]"}`, `"params":${build(params)}`]
+  const skip = paramSkip(k)
+  const params: Field[] = fs.filter((f) => !skip.includes(f.key))
+  const parts: string[] = [`"provider":${quote(m.provider)}`, `"model":${quote(m.model)}`]
+  if (k.inputKey !== "") parts.push(`"input":${find(fs, k.inputKey) ?? (k.inputKey === "messages" ? "[]" : "null")}`)
+  parts.push(`"params":${build(params)}`)
   const fb = find(fs, "fallbacks")
   if (fb !== undefined) parts.push(`"fallbacks":${fb}`)
   const flat = parts.join(",")
-  return `{${flat},"chat_request":{${flat}}}`
+  return `{${flat},"request_type":${quote(k.reqType)},"${k.reqKey}":{${flat}}}`
+}
+
+// A chat body as the request a plugin gets.
+export function requestJson(body: string): string throws SyntaxError {
+  return try requestJsonFor(CHAT_KIND, body)
 }
 
 // JSON text without the whitespace between tokens, to tell a changed value from a reformatted one.
@@ -141,20 +195,20 @@ function same(a: string | undefined, b: string | undefined): bool {
 }
 
 // The body after a plugin's answer: `sent` is the request text the plugin got, `out` the request value it returned.
-export function applyRequest(body: string, sent: string, out: string): string throws SyntaxError {
+export function applyRequestFor(k: LlmKind, body: string, sent: string, out: string): string throws SyntaxError {
   if (same(out, sent)) return body
   const of = try fields(out)
   const sf = try fields(sent)
   let flatChanged = false
-  for (const k of REQUEST_KEYS) {
-    const o = find(of, k)
-    if (o !== undefined && !same(o, find(sf, k))) flatChanged = true
+  for (const key of REQUEST_KEYS) {
+    const o = find(of, key)
+    if (o !== undefined && !same(o, find(sf, key))) flatChanged = true
   }
   let src: Field[] = of
   if (!flatChanged) {
-    const chat = find(of, "chat_request") ?? find(of, "ChatRequest")
-    if (chat === undefined || !chat.startsWith("{") || same(chat, find(sf, "chat_request"))) return body
-    src = try fields(chat)
+    const wrapped = find(of, k.reqKey) ?? find(of, pascal(k.reqKey))
+    if (wrapped === undefined || !wrapped.startsWith("{") || same(wrapped, find(sf, k.reqKey))) return body
+    src = try fields(wrapped)
   }
   let nb = try fields(body)
   const model = rawStr(src, "model")
@@ -163,11 +217,14 @@ export function applyRequest(body: string, sent: string, out: string): string th
     setField(&nb, "model", quote(provider !== "" ? `${provider}/${model}` : model))
   }
   const input = find(src, "input")
-  if (input !== undefined && input.startsWith("[")) setField(&nb, "messages", input)
+  if (input !== undefined && k.inputKey !== "" && !isNull(input)) {
+    if (k.inputKey !== "messages" || input.startsWith("[")) setField(&nb, k.inputKey, input)
+  }
+  const skip = paramSkip(k)
   const params = find(src, "params")
   if (params !== undefined && params.startsWith("{")) {
     const pf = try fields(params)
-    nb = nb.filter((f) => CHAT_KEYS.includes(f.key))
+    nb = nb.filter((f) => skip.includes(f.key))
     for (const f of pf) setField(&nb, f.key, f.raw)
   }
   const fb = find(src, "fallbacks")
@@ -178,40 +235,97 @@ export function applyRequest(body: string, sent: string, out: string): string th
   return build(nb)
 }
 
-// A chat completion as the response a plugin gets.
-export function responseJson(body: string): string {
-  return `{"chat_response":${body}}`
+// The chat body after a plugin's answer.
+export function applyRequest(body: string, sent: string, out: string): string throws SyntaxError {
+  return try applyRequestFor(CHAT_KIND, body, sent, out)
 }
 
-// The completion after a plugin's answer; `out` is the response value it returned.
-export function applyResponse(body: string, out: string): string throws SyntaxError {
+// A response body as the response a plugin gets (a stream chunk is under the kind's stream key).
+export function responseJsonFor(k: LlmKind, body: string, stream: bool): string {
+  return `{"${stream ? k.streamKey : k.respKey}":${body}}`
+}
+
+// A chat completion as the response a plugin gets.
+export function responseJson(body: string): string {
+  return responseJsonFor(CHAT_KIND, body, false)
+}
+
+// The body after a plugin's answer; `out` is the response value it returned.
+export function applyResponseFor(k: LlmKind, body: string, out: string, stream: bool): string throws SyntaxError {
   const of = try fields(out)
-  const chat = find(of, "chat_response") ?? find(of, "ChatResponse")
+  const key = stream ? k.streamKey : k.respKey
+  const chat = find(of, key) ?? find(of, pascal(key))
   if (chat === undefined || !chat.startsWith("{")) return body
   if (same(chat, body)) return body
   return chat
 }
 
-// The reply of a short circuit: a chat response (200) or a Bifrost error with its status.
-export function shortCircuitReply(sc: string): { status: int, body: string } throws SyntaxError {
+// The completion after a plugin's answer.
+export function applyResponse(body: string, out: string): string throws SyntaxError {
+  return try applyResponseFor(CHAT_KIND, body, out, false)
+}
+
+// The error body of a Bifrost error a plugin returned, and its status (500 unless it names a 4xx or 5xx).
+function errorReply(ef: Field[]): { status: int, body: string } {
+  let status = Math.trunc(rawNum(ef, "status_code") ?? 500.0)
+  if (status < 400 || status > 599) status = 500
+  const inner = find(ef, "error")
+  if (inner !== undefined && inner.startsWith("{")) return { status: status, body: `{"error":${inner}}` }
+  return { status: status, body: errorJson("the plugin refused the request", "api_error", undefined) }
+}
+
+// Whether a Bifrost error carries nothing: Bifrost's pipeline reads such an error as a recovery.
+function emptyError(ef: Field[]): bool {
+  for (const key of ["status_code", "type", "code"]) {
+    const v = find(ef, key)
+    if (v !== undefined && !isNull(v)) return false
+  }
+  const inner = find(ef, "error")
+  if (inner === undefined || isNull(inner)) return true
+  if (!inner.startsWith("{")) return false
+  try {
+    const f = fields(inner)
+    if ((rawStr(f, "message") ?? "") !== "") return false
+    for (const key of ["type", "code", "error"]) {
+      const v = find(f, key)
+      if (v !== undefined && !isNull(v)) return false
+    }
+  } catch (e) {
+    return false
+  }
+  return true
+}
+
+// The reply of a short circuit: a response of the kind (200) or a Bifrost error with its status.
+export function shortCircuitReplyFor(k: LlmKind, sc: string): { status: int, body: string } throws SyntaxError {
   const f = try fields(sc)
   const resp = find(f, "response")
   if (resp !== undefined && resp.startsWith("{")) {
     const rf = try fields(resp)
-    const chat = find(rf, "chat_response") ?? find(rf, "ChatResponse")
+    const chat = find(rf, k.respKey) ?? find(rf, pascal(k.respKey))
     if (chat !== undefined && chat.startsWith("{")) return { status: 200, body: chat }
-    throw new SyntaxError("the short circuit has no chat_response")
+    throw new SyntaxError(`the short circuit has no ${k.respKey}`)
   }
   const err = find(f, "error")
-  if (err !== undefined && err.startsWith("{")) {
-    const ef = try fields(err)
-    let status = Math.trunc(rawNum(ef, "status_code") ?? 500.0)
-    if (status < 400 || status > 599) status = 500
-    const inner = find(ef, "error")
-    if (inner !== undefined && inner.startsWith("{")) return { status: status, body: `{"error":${inner}}` }
-    return { status: status, body: errorJson("the plugin refused the request", "api_error", undefined) }
-  }
+  if (err !== undefined && err.startsWith("{")) return errorReply(try fields(err))
   throw new SyntaxError("the short circuit has neither a response nor an error")
+}
+
+// The reply of a chat short circuit.
+export function shortCircuitReply(sc: string): { status: int, body: string } throws SyntaxError {
+  return try shortCircuitReplyFor(CHAT_KIND, sc)
+}
+
+// A gateway error body ({"error":{...}}) as the Bifrost error a post hook gets.
+export function bifrostErrorJson(status: int, body: string): string {
+  let inner = `{"message":"the request failed"}`
+  try {
+    const e = find(fields(body), "error")
+    if (e !== undefined && e.startsWith("{")) inner = e
+  } catch (x) {
+    inner = `{"message":${quote(body.slice(0, 500))}}`
+  }
+  return `{"is_bifrost_error":false,"status_code":${status},"error":${inner}}`
 }
 
 // ---- one loaded plugin ----
@@ -222,7 +336,7 @@ export class WasmPluginInst {
   dirty: bool = false
   restarts: int = 0
 
-  constructor(public inst: WasmInstance, public pluginName: string, public freeArity: int, public hasPre: bool, public hasPost: bool, readonly key: string, readonly bytes: u8[], readonly configJson: string, readonly limits: WasmPluginLimits | undefined) {}
+  constructor(public inst: WasmInstance, public pluginName: string, public freeArity: int, public ex: WasmExports, readonly key: string, readonly bytes: u8[], readonly configJson: string, readonly limits: WasmPluginLimits | undefined) {}
 
   name(): string {
     return this.pluginName
@@ -253,8 +367,7 @@ export class WasmPluginInst {
     const s = try start(this.bytes, this.configJson, this.limits)
     this.inst = s.inst
     this.freeArity = s.freeArity
-    this.hasPre = s.hasPre
-    this.hasPost = s.hasPost
+    this.ex = s.ex
   }
 
   // Calls a hook with a JSON text and returns the JSON text it answers with.
@@ -299,12 +412,27 @@ export class WasmPluginInst {
     }
   }
 
-  // The pre_hook for a chat body. `context` is the JSON object shared by the plugins of this request.
-  preRequest(context: string, body: string): WasmPre throws Error {
-    if (!this.hasPre) return { kind: "continue", body: body, context: context }
+  // The context a hook answered with, or the one it was given when it answered none.
+  private contextOf(f: Field[], context: string): string {
+    const c = find(f, "context")
+    return c !== undefined && c.startsWith("{") ? c : context
+  }
+
+  // A hook's answer as fields, or an error that names the plugin and the hook.
+  private answer(fn: string, text: string): Field[] throws Error {
+    try {
+      return fields(text)
+    } catch (e) {
+      throw new Error(`${this.pluginName}: ${fn} returned an invalid answer: ${e.message}`)
+    }
+  }
+
+  // The pre_hook for a request body of a kind. `context` is the JSON object shared by the plugins of this request.
+  preRequest(context: string, k: LlmKind, body: string): WasmPre throws Error {
+    if (!this.ex.pre) return { kind: "continue", body: body, context: context }
     let sent = ""
     try {
-      sent = requestJson(body)
+      sent = requestJsonFor(k, body)
     } catch (e) {
       throw new Error(`${this.pluginName}: the request is not JSON: ${e.message}`)
     }
@@ -313,38 +441,115 @@ export class WasmPluginInst {
       const f = fields(text)
       const err = rawStr(f, "error") ?? ""
       if (err !== "") throw new Error(`${this.pluginName}: pre_hook: ${err}`)
-      const ctxOut = find(f, "context")
-      const ctx = ctxOut !== undefined && ctxOut.startsWith("{") ? ctxOut : context
+      const ctx = this.contextOf(f, context)
       if (rawBool(f, "has_short_circuit") === true) {
         const sc = find(f, "short_circuit")
         if (sc === undefined || !sc.startsWith("{")) throw new Error(`${this.pluginName}: pre_hook: has_short_circuit without a short_circuit`)
-        const r = shortCircuitReply(sc)
+        const r = shortCircuitReplyFor(k, sc)
         return { kind: "short_circuit", status: r.status, body: r.body, context: ctx }
       }
       const req = find(f, "request")
       if (req === undefined || !req.startsWith("{")) return { kind: "continue", body: body, context: ctx }
-      return { kind: "continue", body: applyRequest(body, sent, req), context: ctx }
+      return { kind: "continue", body: applyRequestFor(k, body, sent, req), context: ctx }
     } catch (e) {
       throw new Error(e.message.startsWith(this.pluginName) ? e.message : `${this.pluginName}: pre_hook returned an invalid answer: ${e.message}`)
     }
   }
 
-  // The post_hook for a chat completion.
-  postResponse(context: string, body: string): WasmPost throws Error {
-    if (!this.hasPost) return { body: body, context: context }
-    const text = try this.callJson("post_hook", `{"context":${context},"response":${responseJson(body)},"error":{},"has_error":false}`)
+  // The post_hook for an answer of a kind: a response with a status below 400, else an error (the hook then
+  // gets has_error and may recover). A stream chunk is a response under the kind's stream key.
+  postHook(context: string, k: LlmKind, status: int, body: string, stream: bool): WasmPost throws Error {
+    if (!this.ex.post) return { kind: "same", context: context }
+    const failed = status >= 400
+    const input = failed
+      ? `{"context":${context},"response":null,"error":${bifrostErrorJson(status, body)},"has_error":true}`
+      : `{"context":${context},"response":${responseJsonFor(k, body, stream)},"error":{},"has_error":false}`
+    const text = try this.callJson("post_hook", input)
     try {
       const f = fields(text)
       const herr = rawStr(f, "hook_error") ?? ""
       if (herr !== "") throw new Error(`${this.pluginName}: post_hook: ${herr}`)
-      const ctxOut = find(f, "context")
-      const ctx = ctxOut !== undefined && ctxOut.startsWith("{") ? ctxOut : context
+      const ctx = this.contextOf(f, context)
+      // an error the plugin keeps or sets turns the answer into that error
+      if (rawBool(f, "has_error") === true) {
+        const ev = find(f, "error")
+        if (ev !== undefined && ev.startsWith("{")) {
+          const ef = fields(ev)
+          if (!emptyError(ef)) {
+            const r = errorReply(ef)
+            if (!(failed && r.status === status && same(r.body, body))) return { kind: "status", status: r.status, body: r.body, context: ctx }
+            return { kind: "same", context: ctx }
+          }
+        }
+      }
       const resp = find(f, "response")
-      if (resp === undefined || !resp.startsWith("{")) return { body: body, context: ctx }
-      return { body: applyResponse(body, resp), context: ctx }
+      if (resp === undefined || !resp.startsWith("{")) return { kind: "same", context: ctx }
+      const key = stream ? k.streamKey : k.respKey
+      const rf = fields(resp)
+      const got = find(rf, key) ?? find(rf, pascal(key))
+      if (got === undefined || !got.startsWith("{")) return { kind: "same", context: ctx }
+      // a response made of an error is a recovery
+      if (failed) return { kind: "status", status: 200, body: got, context: ctx }
+      if (same(got, body)) return { kind: "same", context: ctx }
+      return { kind: "body", body: got, context: ctx }
     } catch (e) {
       throw new Error(e.message.startsWith(this.pluginName) ? e.message : `${this.pluginName}: post_hook returned an invalid answer: ${e.message}`)
     }
+  }
+
+  // Whether the module exports an HTTP transport hook.
+  hasHttp(): bool {
+    return this.ex.httpPre !== "" || this.ex.httpPost || this.ex.httpChunk
+  }
+
+  // http_pre_hook, before the request is routed. Input {"context", "request"}; the answer is
+  // {"context", "request", "response", "has_response", "error"}: "request" is the request as the plugin
+  // wants it, "response" with has_response answers at once (an HTTP response: status_code, headers, body
+  // in base64), a non-empty "error" fails the request. reqJson is httpReqJson.
+  httpPre(context: string, reqJson: string): WasmHttpPre throws Error {
+    const fn = this.ex.httpPre
+    if (fn === "") return { kind: "continue", request: undefined, context: context }
+    const text = try this.callJson(fn, `{"context":${context},"request":${reqJson}}`)
+    const f = try this.answer(fn, text)
+    const ctx = this.contextOf(f, context)
+    const err = rawStr(f, "error") ?? ""
+    if (err !== "") return { kind: "error", message: `${this.pluginName}: ${err}`, context: ctx }
+    if (rawBool(f, "has_response") === true) {
+      const r = find(f, "response")
+      if (r === undefined || !r.startsWith("{")) throw new Error(`${this.pluginName}: ${fn}: has_response without a response`)
+      return { kind: "respond", response: r, context: ctx }
+    }
+    const req = find(f, "request")
+    return { kind: "continue", request: req !== undefined && req.startsWith("{") ? req : undefined, context: ctx }
+  }
+
+  // http_post_hook, after the response (not called for a stream). Input {"context", "request", "response"};
+  // the answer is {"context", "error"} and may carry "response", the response as the plugin wants it.
+  httpPost(context: string, reqJson: string, respJson: string): WasmHttpPost throws Error {
+    if (!this.ex.httpPost) return { response: undefined, error: "", context: context }
+    const text = try this.callJson("http_post_hook", `{"context":${context},"request":${reqJson},"response":${respJson}}`)
+    const f = try this.answer("http_post_hook", text)
+    const r = find(f, "response")
+    const err = rawStr(f, "error") ?? ""
+    return { response: r !== undefined && r.startsWith("{") ? r : undefined, error: err === "" ? "" : `${this.pluginName}: ${err}`, context: this.contextOf(f, context) }
+  }
+
+  // http_stream_chunk_hook, for each chunk of a streamed answer before it is written. Input {"context",
+  // "request", "chunk"} (the chunk is the event's JSON, with no SSE framing); the answer is {"context",
+  // "chunk", "has_chunk", "skip", "error"}: skip drops the chunk, a chunk (has_chunk) is sent on, and an
+  // error with no chunk ends the stream (with a chunk it is only logged, as Bifrost does).
+  httpChunk(context: string, reqJson: string, chunk: string): WasmHttpChunk throws Error {
+    if (!this.ex.httpChunk) return { kind: "chunk", chunk: chunk, warning: "", context: context }
+    const text = try this.callJson("http_stream_chunk_hook", `{"context":${context},"request":${reqJson},"chunk":${chunk}}`)
+    const f = try this.answer("http_stream_chunk_hook", text)
+    const ctx = this.contextOf(f, context)
+    if (rawBool(f, "skip") === true) return { kind: "skip", context: ctx }
+    const err = rawStr(f, "error") ?? ""
+    const c = find(f, "chunk")
+    const has = rawBool(f, "has_chunk") === true && c !== undefined && c.startsWith("{")
+    if (err !== "" && !has) return { kind: "stop", message: `${this.pluginName}: ${err}`, context: ctx }
+    if (has) return { kind: "chunk", chunk: c!, warning: err === "" ? "" : `${this.pluginName}: ${err}`, context: ctx }
+    return { kind: "chunk", chunk: chunk, warning: "", context: ctx }
   }
 
   // Calls cleanup and releases the instance.
@@ -380,7 +585,7 @@ function open(bytes: u8[], l: WasmLimits): WasmInstance throws Error {
   }
 }
 
-type Started = { inst: WasmInstance, name: string, freeArity: int, hasPre: bool, hasPost: bool }
+type Started = { inst: WasmInstance, name: string, freeArity: int, ex: WasmExports }
 
 // Instantiates a plugin from its bytes: checks the exports, reads its name and runs init with the config.
 function start(bytes: u8[], configJson: string, limits: WasmPluginLimits | undefined): Started throws Error {
@@ -435,13 +640,14 @@ function start(bytes: u8[], configJson: string, limits: WasmPluginLimits | undef
     inst.close()
     throw new Error(`init returned ${rc}`)
   }
-  return { inst: inst, name: name, freeArity: freeArity, hasPre: inst.has("pre_hook"), hasPost: inst.has("post_hook") }
+  const httpPre = inst.has("http_pre_hook") ? "http_pre_hook" : inst.has("http_intercept") ? "http_intercept" : ""
+  return { inst: inst, name: name, freeArity: freeArity, ex: { pre: inst.has("pre_hook"), post: inst.has("post_hook"), httpPre: httpPre, httpPost: inst.has("http_post_hook"), httpChunk: inst.has("http_stream_chunk_hook") } }
 }
 
 // A plugin instantiated from its bytes, initialised with the config.
 export function loadWasmPlugin(bytes: u8[], configJson: string, limits: WasmPluginLimits | undefined, key: string): WasmPluginInst throws Error {
   const s = try start(bytes, configJson, limits)
-  return new WasmPluginInst(s.inst, s.name, s.freeArity, s.hasPre, s.hasPost, key, bytes, configJson, limits)
+  return new WasmPluginInst(s.inst, s.name, s.freeArity, s.ex, key, bytes, configJson, limits)
 }
 
 // Plugins stay loaded across config reloads and status checks: the same file (size and
@@ -582,25 +788,29 @@ test("applyResponse and shortCircuitReply", () => {
 test("the plugin rewrites the request in pre_hook and stamps the response in post_hook", () => {
   const p = try fixture(`{"mode":"rewrite","from":"ping","to":"pong","tag":"t1"}`, undefined)
   expect(p.name()).toBe("raiju-test-plugin")
-  const pre = try p.preRequest(`{"request_id":"r1"}`, CHAT)
+  const pre = try p.preRequest(`{"request_id":"r1"}`, CHAT_KIND, CHAT)
   expect(pre.kind).toBe("continue")
   if (pre.kind === "continue") {
     expect(pre.body.includes(`"content":"pong"`)).toBe(true)
     expect(pre.body.includes(`"model":"openai/gpt-4o-mini"`)).toBe(true)
     expect(pre.context.includes(`"pre":"ran"`)).toBe(true)
-    const post = try p.postResponse(pre.context, COMPLETION)
-    expect(post.body.includes(`"x_wasm_plugin":"ctx-ok:t1"`)).toBe(true)
-    expect(post.body.includes(`"content":"hi"`)).toBe(true)
+    const post = try p.postHook(pre.context, CHAT_KIND, 200, COMPLETION, false)
+    expect(post.kind).toBe("body")
+    if (post.kind === "body") {
+      expect(post.body.includes(`"x_wasm_plugin":"ctx-ok:t1"`)).toBe(true)
+      expect(post.body.includes(`"content":"hi"`)).toBe(true)
+    }
     // without the context from pre_hook the plugin says so
-    const lost = try p.postResponse(`{"request_id":"r1"}`, COMPLETION)
-    expect(lost.body.includes(`"x_wasm_plugin":"ctx-missing:t1"`)).toBe(true)
+    const lost = try p.postHook(`{"request_id":"r1"}`, CHAT_KIND, 200, COMPLETION, false)
+    expect(lost.kind).toBe("body")
+    if (lost.kind === "body") expect(lost.body.includes(`"x_wasm_plugin":"ctx-missing:t1"`)).toBe(true)
   }
   p.close()
 })
 
 test("a short-circuit answer and a short-circuit error", () => {
   const s = try fixture(`{"mode":"short"}`, undefined)
-  const r = try s.preRequest("{}", CHAT)
+  const r = try s.preRequest("{}", CHAT_KIND, CHAT)
   expect(r.kind).toBe("short_circuit")
   if (r.kind === "short_circuit") {
     expect(r.status).toBe(200)
@@ -608,7 +818,7 @@ test("a short-circuit answer and a short-circuit error", () => {
   }
   s.close()
   const f = try fixture(`{"mode":"fail"}`, undefined)
-  const e = try f.preRequest("{}", CHAT)
+  const e = try f.preRequest("{}", CHAT_KIND, CHAT)
   expect(e.kind).toBe("short_circuit")
   if (e.kind === "short_circuit") {
     expect(e.status).toBe(418)
@@ -627,7 +837,7 @@ test("a plugin that fails its hook throws a clear error", () => {
     const p = try fixture(`{"mode":"${c.mode}"}`, undefined)
     let msg = ""
     try {
-      p.preRequest("{}", CHAT)
+      p.preRequest("{}", CHAT_KIND, CHAT)
     } catch (e) {
       msg = e.message
     }
@@ -643,7 +853,7 @@ test("a plugin that trapped is restarted, not left with a damaged stack", () => 
   for (let i = 0; i < 40; i++) {
     let msg = ""
     try {
-      p.preRequest("{}", CHAT)
+      p.preRequest("{}", CHAT_KIND, CHAT)
     } catch (e) {
       msg = e.message
     }
@@ -658,7 +868,7 @@ test("limits stop a runaway loop and a memory grab, and the plugin works again a
   const p = try fixture(`{"mode":"loop"}`, { max_instructions: 100000 })
   let msg = ""
   try {
-    p.preRequest("{}", CHAT)
+    p.preRequest("{}", CHAT_KIND, CHAT)
   } catch (e) {
     msg = e.message
   }
@@ -668,7 +878,7 @@ test("limits stop a runaway loop and a memory grab, and the plugin works again a
   const m = try fixture(`{"mode":"memory"}`, { max_memory_pages: 64 })
   let mm = ""
   try {
-    m.preRequest("{}", CHAT)
+    m.preRequest("{}", CHAT_KIND, CHAT)
   } catch (e) {
     mm = e.message
   }
@@ -706,4 +916,218 @@ test("openWasmPlugin loads a file once for the same config", () => {
   expect(a.inst.handle).toBe(b.inst.handle)
   const c = try openWasmPlugin(FIXTURE, `{"mode":"fail"}`, undefined)
   expect(c.inst.handle === a.inst.handle).toBe(false)
+})
+
+// ---- tests of the HTTP transport hooks, the other request types and has_error ----
+
+const EMBED = `{"model":"openai/text-embedding-3-small","input":"ping me"}`
+const EMBED_REPLY = `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"e","usage":{"prompt_tokens":2,"total_tokens":2}}`
+
+function reqWith(body: string): string {
+  let r = emptyReq("POST", "/v1/embeddings")
+  r.headers.set("content-type", "application/json")
+  r.query.set("a", "1")
+  r.body = utf8(body)
+  return httpReqJson(r)
+}
+
+function respWith(body: string): string {
+  let r: HttpResp = { status: 200, headers: new Map(), body: utf8(body) }
+  r.headers.set("content-type", "application/json")
+  return httpRespJson(r)
+}
+
+function bodyText(b: u8[]): string {
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+test("http_pre_hook rewrites the request body and headers and sets a context for the later hooks", () => {
+  const p = try fixture(`{"http":"rewrite","from":"ping","to":"pong","tag":"h1"}`, undefined)
+  expect(p.hasHttp()).toBe(true)
+  const r = try p.httpPre(`{"request_id":"r1"}`, reqWith(EMBED))
+  expect(r.kind).toBe("continue")
+  if (r.kind === "continue") {
+    expect(r.context.includes(`"http_pre":"ran"`)).toBe(true)
+    let req = emptyReq("POST", "/v1/embeddings")
+    req.body = utf8(EMBED)
+    try applyHttpReq(&req, r.request!)
+    expect(req.headers.get("x-request-id")).toBe("h1")
+    expect(bodyText(req.body)).toBe(`{"model":"openai/text-embedding-3-small","input":"pong me"}`)
+    // http_post_hook sees the context and adds a header and a marker to the body
+    const post = try p.httpPost(r.context, reqWith(EMBED), respWith(EMBED_REPLY))
+    expect(post.error).toBe("")
+    let resp: HttpResp = { status: 200, headers: new Map(), body: utf8(EMBED_REPLY) }
+    try applyHttpResp(&resp, post.response!)
+    expect(resp.headers.get("x-wasm-http-post")).toBe("h1")
+    expect(resp.headers.get("x-wasm-http-ctx")).toBe("ok")
+    expect(bodyText(resp.body).startsWith(`{"x_http_post":"h1",`)).toBe(true)
+    // without the context from the pre hook it says so
+    const lost = try p.httpPost(`{}`, reqWith(EMBED), respWith(EMBED_REPLY))
+    let r2: HttpResp = { status: 200, headers: new Map(), body: utf8(EMBED_REPLY) }
+    try applyHttpResp(&r2, lost.response!)
+    expect(r2.headers.get("x-wasm-http-ctx")).toBe("missing")
+  }
+  p.close()
+})
+
+test("http_pre_hook can answer the request, fail it, or move it", () => {
+  const a = try fixture(`{"http":"respond"}`, undefined)
+  const r = try a.httpPre("{}", reqWith(EMBED))
+  expect(r.kind).toBe("respond")
+  if (r.kind === "respond") {
+    const resp = try respFromJson(r.response)
+    expect(resp.status).toBe(202)
+    expect(resp.headers.get("x-plugin")).toBe("pre")
+    expect(bodyText(resp.body)).toBe(`{"answered":"by the plugin"}`)
+  }
+  a.close()
+  const e = try fixture(`{"http":"error"}`, undefined)
+  const er = try e.httpPre("{}", reqWith(EMBED))
+  expect(er.kind).toBe("error")
+  if (er.kind === "error") expect(er.message).toBe("raiju-test-plugin: http pre refused")
+  e.close()
+  const m = try fixture(`{"http":"path"}`, undefined)
+  const mr = try m.httpPre("{}", reqWith(EMBED))
+  expect(mr.kind).toBe("continue")
+  if (mr.kind === "continue") {
+    let req = emptyReq("POST", "/v1/embeddings")
+    try applyHttpReq(&req, mr.request!)
+    expect(req.path).toBe("/v1/models")
+  }
+  m.close()
+})
+
+test("a plugin with no http setting passes the transport through untouched", () => {
+  const p = try fixture(`{}`, undefined)
+  const r = try p.httpPre(`{"request_id":"r"}`, reqWith(EMBED))
+  expect(r.kind).toBe("continue")
+  if (r.kind === "continue") {
+    let req = emptyReq("POST", "/v1/embeddings")
+    req.body = utf8(EMBED)
+    try applyHttpReq(&req, r.request!)
+    expect(bodyText(req.body)).toBe(EMBED)
+    expect(req.headers.get("x-request-id")).toBe(undefined)
+  }
+  const po = try p.httpPost("{}", reqWith(EMBED), respWith(EMBED_REPLY))
+  expect(po.response).toBe(undefined)
+  p.close()
+})
+
+test("http_stream_chunk_hook rewrites, drops or ends", () => {
+  const chunk = `{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"}}]}`
+  const rw = try fixture(`{"chunk_from":"Hello","chunk_to":"Howdy"}`, undefined)
+  const r = try rw.httpChunk("{}", reqWith(EMBED), chunk)
+  expect(r.kind).toBe("chunk")
+  if (r.kind === "chunk") expect(r.chunk.includes(`"content":"Howdy"`)).toBe(true)
+  rw.close()
+  const sk = try fixture(`{"chunk_skip":"Hello"}`, undefined)
+  expect((try sk.httpChunk("{}", reqWith(EMBED), chunk)).kind).toBe("skip")
+  sk.close()
+  const st = try fixture(`{"chunk_stop":"Hello"}`, undefined)
+  const s = try st.httpChunk("{}", reqWith(EMBED), chunk)
+  expect(s.kind).toBe("stop")
+  if (s.kind === "stop") expect(s.message).toBe("raiju-test-plugin: chunk blocked by the plugin")
+  st.close()
+  const pass = try fixture(`{}`, undefined)
+  const pr = try pass.httpChunk("{}", reqWith(EMBED), chunk)
+  expect(pr.kind).toBe("chunk")
+  if (pr.kind === "chunk") expect(pr.chunk).toBe(chunk)
+  pass.close()
+})
+
+test("the hooks run on other request types: embeddings in and out, with the kind's own keys", () => {
+  const k = kindOfOp("embeddings")!
+  const p = try fixture(`{"from":"ping","to":"pong","tag":"e1"}`, undefined)
+  const pre = try p.preRequest("{}", k, EMBED)
+  expect(pre.kind).toBe("continue")
+  if (pre.kind === "continue") {
+    expect(pre.body).toBe(`{"model":"openai/text-embedding-3-small","input":"pong me"}`)
+    const post = try p.postHook(pre.context, k, 200, EMBED_REPLY, false)
+    expect(post.kind).toBe("body")
+    if (post.kind === "body") {
+      expect(post.body.includes(`"x_wasm_plugin":"ctx-ok:e1"`)).toBe(true)
+      expect(post.body.includes(`"object":"list"`)).toBe(true)
+    }
+  }
+  const sent = try requestJsonFor(k, EMBED)
+  expect(sent.includes(`"embedding_request":{`)).toBe(true)
+  expect(sent.includes(`"request_type":"embedding"`)).toBe(true)
+  p.close()
+})
+
+test("a short circuit carries the response key of its request type", () => {
+  const k = kindOfOp("embeddings")!
+  const ok = try shortCircuitReplyFor(k, `{"response":{"embedding_response":{"object":"list"}}}`)
+  expect(ok.status).toBe(200)
+  expect(ok.body).toBe(`{"object":"list"}`)
+  let msg = ""
+  try {
+    shortCircuitReplyFor(k, `{"response":{"chat_response":{"object":"chat.completion"}}}`)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("the short circuit has no embedding_response")
+})
+
+test("a form request is a flat object of its text fields, and a request with no input has params only", () => {
+  const k = kindOfOp("transcription")!
+  const sent = try requestJsonFor(k, `{"model":"openai/whisper-1","language":"en","prompt":"hi"}`)
+  const f = try fields(sent)
+  expect(find(f, "input")).toBe(undefined)
+  expect(find(f, "params")).toBe(`{"language":"en","prompt":"hi"}`)
+  const out = try applyRequestFor(k, `{"model":"openai/whisper-1","language":"en"}`, sent, sent.replace(`"whisper-1"`, `"whisper-2"`))
+  expect(out.includes(`"model":"openai/whisper-2"`)).toBe(true)
+  const rr = try requestJsonFor(kindOfOp("rerank")!, `{"model":"cohere/rerank","query":"q","documents":["a"]}`)
+  expect(find(try fields(rr), "params")).toBe(`{"query":"q","documents":["a"]}`)
+})
+
+test("post_hook may turn a response into an error, recover from an error, and rewrite a stream chunk", () => {
+  const e = try fixture(`{"post":"error"}`, undefined)
+  const r = try e.postHook("{}", CHAT_KIND, 200, COMPLETION, false)
+  expect(r.kind).toBe("status")
+  if (r.kind === "status") {
+    expect(r.status).toBe(429)
+    expect(r.body).toBe(`{"error":{"message":"turned into an error by the plugin","type":"plugin_error","code":"plugin_post"}}`)
+  }
+  // an error that came in is handed back as it was
+  const same = try e.postHook("{}", CHAT_KIND, 502, `{"error":{"message":"bad gateway","type":"api_error"}}`, false)
+  expect(same.kind).toBe("same")
+  e.close()
+  const rec = try fixture(`{"post":"recover"}`, undefined)
+  const back = try rec.postHook("{}", CHAT_KIND, 502, `{"error":{"message":"bad gateway","type":"api_error"}}`, false)
+  expect(back.kind).toBe("status")
+  if (back.kind === "status") {
+    expect(back.status).toBe(200)
+    expect(back.body.includes(`"from the plugin"`)).toBe(true)
+  }
+  // a success is only marked
+  const ok = try rec.postHook("{}", CHAT_KIND, 200, COMPLETION, false)
+  expect(ok.kind).toBe("body")
+  rec.close()
+  const ch = try fixture(`{"post":"chunk","chunk_from":"Hello","chunk_to":"Howdy"}`, undefined)
+  const chunk = `{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"}}]}`
+  const c = try ch.postHook("{}", CHAT_KIND, 200, chunk, true)
+  expect(c.kind).toBe("body")
+  if (c.kind === "body") expect(c.body.includes(`"content":"Howdy"`)).toBe(true)
+  ch.close()
+})
+
+test("the error a post hook gets is Bifrost's error shape, and the module's http export is found", () => {
+  expect(bifrostErrorJson(502, `{"error":{"message":"m","type":"t"}}`)).toBe(`{"is_bifrost_error":false,"status_code":502,"error":{"message":"m","type":"t"}}`)
+  const p = try fixture(`{}`, undefined)
+  expect(p.ex.httpPre).toBe("http_pre_hook")
+  p.close()
+})
+
+test("a module that exports http_intercept, the older name of http_pre_hook, is called through it", () => {
+  const bytes = try readFileBytesSync("tests/wasm/plugin_intercept.wasm")
+  const p = try loadWasmPlugin(bytes, `{"http":"respond"}`, undefined, "")
+  expect(p.ex.httpPre).toBe("http_intercept")
+  const r = try p.httpPre("{}", reqWith(EMBED))
+  expect(r.kind).toBe("respond")
+  p.close()
 })

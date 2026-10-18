@@ -31,8 +31,10 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 - **API:** `/v1/chat/completions` (tools, vision, JSON mode, reasoning, streaming),
   `/v1/responses` (and its retrieve, delete, cancel, input_items, input_tokens, compact;
   WebSocket mode for OpenAI), `/v1/embeddings`, `/v1/completions` (OpenAI-format providers),
-  `/v1/models`, `/v1/realtime` (WebSocket relay for OpenAI and Azure; client secrets, sessions
-  and SDP calls are routed; `POST /v1/live/sessions` answers 501 for WebRTC create),
+  `/v1/models`, `/v1/realtime` (WebSocket for OpenAI, Azure and xAI, and WebRTC calls for OpenAI
+  and Azure at `POST /v1/realtime/calls`) and GPT Live (`/v1/live/sessions`, WebSocket and
+  WebRTC), each session metered, guarded and logged with its cost (client secrets and sessions
+  are routed),
   `/v1/rerank`, `/v1/count_tokens`, `/v1/async/*` jobs, and audio, images, files and batches
   (which providers serve each one is in [SCOPE.md](SCOPE.md)).
 - **Drop-in SDK routes:** `/openai/v1/*`; `/anthropic/v1/messages` (to any provider),
@@ -58,7 +60,13 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   runs it on an embedded interpreter (WAMR, added to the Tov runtime by `tov-patches/0005-wamr.patch`).
   `wasm_limits` on the entry caps its memory pages, stack and instructions per hook call. A plugin sees only
   its own memory; a hook that traps, loops or answers with an error is logged and skipped. Go shared-object
-  plugins (`.so`) are not supported. `tests/wasm/plugin.c` is a small example.
+  plugins (`.so`) are not supported. `tests/wasm/plugin.c` is a small example. The chain runs Bifrost's LLM hooks
+  (`pre_hook`, `post_hook`) on every request type (chat, completions, embeddings, Responses, rerank, speech,
+  transcription, images, OCR) and on each chunk of a stream, and a `post_hook` answer with `has_error` turns a
+  response into an error. A module that exports `http_pre_hook`, `http_post_hook` or `http_stream_chunk_hook`
+  also gets Bifrost's HTTP transport hooks: before routing it can rewrite the request or answer it, after the
+  response it can rewrite that, and for each event of a stream it can rewrite, drop or end (see `docs/parity.md`,
+  section Plugins).
 - **Enterprise:** RBAC for the management API (admin, editor, viewer, auditor;
   `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), a hash-chained
   HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting

@@ -8,9 +8,14 @@
 // does (liveCreate, with src/webrtc.tov): it answers the browser's SDP offer on a peer connection of its own,
 // offers to OpenAI on a second, and relays the audio and the "oai-events" data channel, metering, guarding
 // and logging every event. The session stays on the node (the worker process) that took it: the UDP
-// sockets of its peer connections are that process's. Not here: the WebSocket path's billing and transcripts
-// (it relays frames untouched), delegation checks, and forks. Bifrost's live sessions are OpenAI only, and so
-// are these. The registry is shared by the workers of one node through a directory (share).
+// sockets of its peer connections are that process's.
+//
+// The WebSocket path (LiveSocket) is metered the same way: a primary session runs through the same LiveCore
+// (webrtc.tov) as the WebRTC one, so its voice seconds are billed in 30 s windows that governance admits
+// again, its text is guarded, and it ends as one log row with its cost (livehooks.tov). It has no minimum:
+// only a created WebRTC session bills one. An attach (a sideband) bills nothing, the primary does, and
+// relays frames untouched. Not here: delegation checks, and forks. Bifrost's live sessions are OpenAI only,
+// and so are these. The registry is shared by the workers of one node through a directory (share).
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { sha256, toHex, utf8 } from "./crypto"
 import { Engine, errorResponse, noHeaders } from "./gateway"
@@ -19,10 +24,11 @@ import { Target } from "./providers/types"
 import { trimSlash } from "./providers/types"
 import { Field, fields, find, rawStr, setField, build, quote } from "./json"
 import { Hdrs, snapshot } from "./schemas"
+import { Config } from "./config"
 import { SocketExt, upstreamFor, wsBase } from "./realtime"
 import { Grant } from "./governance"
-import * as metrics from "./metrics"
-import { LiveHooks, LiveReport, Exchange, Setup, GuardFn, Verdict, establish, prepareServerEvents, withOffer } from "./webrtc"
+import { SessionSpec, sessionHooks, sessionGuard } from "./livehooks"
+import { Relay, Leg, Exchange, establish, prepareServerEvents, startClock, withOffer } from "./webrtc"
 
 // How many sessions the registry holds. Past that a new session is refused, not left unrecorded.
 const MAX_RECORDS = 10000
@@ -125,15 +131,22 @@ export function liveAnswer(text: string): { id: string, sdp: string } | undefine
   }
 }
 
-// The events a session's counters name; any other type is counted as "other", so a browser cannot make up
-// metric labels.
-const EVENT_TYPES: string[] = [
-  "session.start", "session.update", "session.close", "session.input_audio.append", "session.input_audio.mute", "session.input_audio.unmute",
-  "session.instructions.append", "session.thinking.append", "session.commentary.append", "response.item.create", "response.create",
-  "session.started", "session.updated", "session.closed", "session.input_audio.muted", "session.input_audio.unmuted", "session.instructions.appended",
-  "session.thinking.appended", "session.commentary.appended", "session.output_audio.delta", "session.input_transcript.delta",
-  "session.output_transcript.delta", "session.delegation.created", "session.usage.updated", "response.event", "error", "info",
-]
+// The model a start body names for its delegated responses (session.delegation.responses.model), bare, or
+// "" when it names none: the tokens of those responses are billed under it.
+export function backendModelOf(cfg: Config, body: string): string {
+  try {
+    const s = find(fields(body), "session")
+    if (s === undefined) return ""
+    const d = find(fields(s), "delegation")
+    if (d === undefined) return ""
+    const r = find(fields(d), "responses")
+    if (r === undefined) return ""
+    const m = rawStr(fields(r), "model") ?? ""
+    return m.trim() === "" ? "" : parseModel(cfg, m).model
+  } catch (e) {
+    return ""
+  }
+}
 
 // POST /v1/live/sessions: Bifrost's WebRTC create. This gateway is the WebRTC peer on both sides: it answers
 // the browser's SDP offer with a peer connection of its own, offers to the provider on a second (the
@@ -209,34 +222,20 @@ export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request
     return { status: 0, type: "", message: "", sdp: answer.sdp, sessionId: answer.id, body: "", contentType: "" }
   }
 
-  const labels = metrics.labels(provider, modelName, "webrtc")
-  metrics.addGauge("raiju_live_webrtc_sessions", labels, 1.0)
-  const hooks = new LiveHooks(() => {
-    // each window of voice time is admitted again, as Bifrost's meter does for its next billing unit
-    const again = engine.gov.admit(h, provider, modelName)
-    if (again.kind === "denial") return { status: again.status, type: again.type, message: again.message }
-    return undefined
-  }, (r) => {
-    metrics.addGauge("raiju_live_webrtc_sessions", labels, -1.0)
-    metrics.inc("raiju_live_audio_seconds_total", labels, r.billedSeconds)
-    engine.recordLive(h, grant, provider, modelName, r.status, r.endedMs - r.startedMs, r.promptTokens, r.completionTokens, r.input, r.output, r.error, liveMeta(r))
-  }, (id) => {
-    return reg.bind(id, owner)
-  }, (direction, type) => {
-    metrics.inc("raiju_live_webrtc_events_total", `direction="${direction}",type="${EVENT_TYPES.includes(type) ? type : "other"}"`, 1.0)
-  })
-  let guard: GuardFn | undefined = undefined
-  if (engine.liveGuarded()) {
-    guard = (text: string, source: string): Promise<Verdict> => liveVerdict(engine, text, source)
-  }
+  // each window of voice time is admitted again, as Bifrost's meter does for its next billing unit
+  const spec: SessionSpec = { op: "live", transport: "webrtc", provider: provider, model: modelName }
+  const hooks = sessionHooks(engine, h, grant, spec, (id) => reg.bind(id, owner))
   const est = await establish({
     offer: offer,
     exchange: exchange,
     hooks: hooks,
-    guard: guard,
+    guard: sessionGuard(engine),
     filter: events.filter,
     iceServers: iceServers(),
     bindAddress: process.env.RAIJU_WEBRTC_BIND ?? "",
+    realtime: false,
+    model: modelName,
+    backendModel: backendModelOf(engine.cfg, body),
   })
   if (est.status !== 0) {
     if (est.body !== "") {
@@ -253,26 +252,9 @@ export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request
   return new Response(reply, { status: 201, headers: out })
 }
 
-async function liveVerdict(engine: Engine, text: string, source: string): Promise<Verdict> {
-  const v = await engine.liveGuard(text, source)
-  return { action: v.action, text: v.text, reason: v.reason }
-}
-
-// The row metadata of a finished session: its voice seconds, as reported and as billed.
-function liveMeta(r: LiveReport): Record<string, string> {
-  const m: Record<string, string> = {}
-  m.set("live_transport", "webrtc")
-  m.set("live_audio_seconds", "" + r.seconds)
-  m.set("live_billed_seconds", "" + r.billedSeconds)
-  if (r.sessionId !== "") m.set("live_session_id", r.sessionId)
-  if (r.reason !== "") m.set("live_close_reason", r.reason)
-  m.set("live_events", "" + r.events)
-  return m
-}
-
 // The STUN and TURN servers the gateway's peer connections use (RAIJU_WEBRTC_ICE_SERVERS, comma separated).
 // Bifrost uses none: the connections offer the host's own addresses.
-function iceServers(): string[] {
+export function iceServers(): string[] {
   const out: string[] = []
   for (const u of (process.env.RAIJU_WEBRTC_ICE_SERVERS ?? "").split(",")) {
     const t = u.trim()
@@ -404,7 +386,8 @@ function closeUpstream(up: WebSocket | undefined): void {
 export class LiveSocket extends SocketExt {
   started = false
   upstream: WebSocket | undefined = undefined
-  sessionId = ""
+  // a primary's relay: the metered path between the client and the provider (an attach has none)
+  relay: Relay | undefined = undefined
   constructor(readonly engine: Engine, readonly reg: LiveRegistry, readonly headers: Map<string, string>, readonly owner: string, readonly attachUrl: string, readonly attachHeaders: Map<string, string>) {
     super()
   }
@@ -412,12 +395,17 @@ export class LiveSocket extends SocketExt {
   onOpen(): void {
     if (this.attachUrl !== "") {
       this.started = true
-      this.dial(this.attachUrl, this.attachHeaders, "")
+      this.attach(this.attachUrl, this.attachHeaders)
     }
   }
 
   onMessage(m: string): void {
     if (this.closed || this.ended) return
+    const r = this.relay
+    if (r !== undefined) {
+      r.fromBrowser(m)
+      return
+    }
     const up = this.upstream
     if (up !== undefined) {
       up.send(m)
@@ -426,8 +414,14 @@ export class LiveSocket extends SocketExt {
     if (!this.started) this.start(m)
   }
 
+  // The client left: a primary asks the provider to close and is billed what it reports; an attach just ends.
   onClose(): void {
     this.closed = true
+    const r = this.relay
+    if (r !== undefined) {
+      r.browserGone()
+      return
+    }
     closeUpstream(this.upstream)
   }
 
@@ -474,13 +468,15 @@ export class LiveSocket extends SocketExt {
       this.refuse("invalid_request_error", "failed to parse session.start JSON")
       return
     }
-    this.dial(wsBase(liveBase(sel.t)) + "/v1/live/sessions", up.headers, frame)
+    this.started = true
+    this.session(admitted, ref.provider, ref.model, backendModelOf(cfg, m), wsBase(liveBase(sel.t)) + "/v1/live/sessions", up.headers, frame)
   }
 
-  private dial(url: string, headers: Map<string, string>, first: string): void {
+  // A sideband: frames pass between the client and the session another connection runs, untouched. It bills
+  // nothing, the primary does.
+  private attach(url: string, headers: Map<string, string>): void {
     const hs: Record<string, string> = {}
     for (const k of headers.keys()) hs.set(k, headers.get(k)!)
-    this.started = true
     const up = openUpstream(url, hs)
     if (up === undefined) {
       this.refuse("server_error", "failed to open the live connection at the provider")
@@ -491,10 +487,10 @@ export class LiveSocket extends SocketExt {
     up.onopen = () => {
       if (this.closed || this.ended) up.close()
     }
-    // the start frame goes first: the client socket sends anything later behind it
-    if (first !== "") up.send(first)
     up.onmessage = (ev) => {
-      this.fromUpstream(ev.data)
+      const d = ev.data
+      if (this.closed || this.ended || typeof d !== "string") return
+      this.send(d)
     }
     up.onclose = (ev) => {
       this.endWith(ev.code === 1005 || ev.code === 1006 ? 1011 : ev.code, ev.reason)
@@ -504,19 +500,63 @@ export class LiveSocket extends SocketExt {
     }
   }
 
-  private fromUpstream(d: string | u8[]): void {
-    if (this.closed || this.ended || typeof d !== "string") return
-    if (this.attachUrl === "") {
-      const id = startedId(d)
-      if (id !== "") {
-        this.sessionId = id
-        if (!this.reg.bind(id, this.owner)) {
-          this.refuse("server_error", "the live session could not be recorded for its virtual key and was not opened")
-          return
-        }
-      }
+  // A primary session, admitted: the client and the provider are joined by a relay that meters, guards and
+  // logs it (webrtc.tov). The start frame goes first; the client's later frames queue behind it, and wait for
+  // the provider's socket to open.
+  private session(grant: Grant, provider: string, model: string, backend: string, url: string, headers: Map<string, string>, first: string): void {
+    const spec: SessionSpec = { op: "live", transport: "websocket", provider: provider, model: model }
+    const reg = this.reg
+    const owner = this.owner
+    const relay = new Relay(sessionHooks(this.engine, this.headers, grant, spec, (id) => reg.bind(id, owner)), sessionGuard(this.engine), Date.now())
+    // only a created WebRTC session bills a minimum
+    relay.core.minimum = 0.0
+    relay.core.model = model
+    relay.core.backendModel = backend
+    relay.clientOpen = true
+    relay.setupDone = true
+    const me = this
+    relay.client = new Leg((t) => {
+      me.send(t)
+      return true
+    }, (p) => false, () => 0, (code, why) => {
+      if (!me.closed) me.endWith(code, why)
+    })
+    this.relay = relay
+    const hs: Record<string, string> = {}
+    for (const k of headers.keys()) hs.set(k, headers.get(k)!)
+    const up = openUpstream(url, hs)
+    if (up === undefined) {
+      const msg = "failed to open the live connection at the provider"
+      this.send(refusalEvent("server_error", msg))
+      relay.core.abort(502, msg, Date.now())
+      relay.close()
+      return
     }
-    this.send(d)
+    this.upstream = up
+    relay.provider = new Leg((t) => {
+      up.send(t)
+      return true
+    }, (p) => false, () => 0, (code, why) => {
+      closeUpstream(up)
+    })
+    up.onopen = () => {
+      // a client that left while the dial was connecting: the relay is over, so the socket is closed
+      if (relay.closed) up.close()
+      else relay.channelOpened(false)
+    }
+    up.onmessage = (ev) => {
+      const d = ev.data
+      if (typeof d === "string") relay.fromProvider(d)
+    }
+    up.onclose = (ev) => {
+      if (ev.code === 1000 || ev.code === 1001 || ev.code === 1005) relay.providerGone()
+      else relay.providerBroke()
+    }
+    up.onerror = (ev) => {
+      relay.providerBroke()
+    }
+    relay.fromBrowser(first)
+    startClock(relay)
   }
 
   // Tells the client why the session ends, then ends it. The upstream, if dialed, is closed too.
@@ -589,4 +629,15 @@ test("live start frames and ids", () => {
   expect(startedId(`{"type":"session.started","session":{"id":"sess_42"}}`)).toBe("sess_42")
   expect(startedId(`{"type":"session.updated","session":{"id":"sess_42"}}`)).toBe("")
   expect(startedId(`{"type":"response.audio.delta"}`)).toBe("")
+})
+
+test("the model a live start names for its delegated responses", () => {
+  const cfg: Config = {}
+  const start = `{"type":"session.start","session":{"model":"openai/gpt-live","delegation":{"type":"responses","responses":{"model":"openai/gpt-5.4","instructions":"x"}}}}`
+  expect(backendModelOf(cfg, start)).toBe("gpt-5.4")
+  expect(backendModelOf(cfg, `{"session":{"model":"gpt-live","delegation":{"type":"responses","responses":{"model":"gpt-5.4-mini"}}}}`)).toBe("gpt-5.4-mini")
+  expect(backendModelOf(cfg, `{"session":{"model":"gpt-live"}}`)).toBe("")
+  expect(backendModelOf(cfg, `{"session":{"delegation":{"type":"responses"}}}`)).toBe("")
+  expect(backendModelOf(cfg, `{"session":{"delegation":{"responses":{"model":"  "}}}}`)).toBe("")
+  expect(backendModelOf(cfg, "not json")).toBe("")
 })

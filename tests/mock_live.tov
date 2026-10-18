@@ -9,8 +9,42 @@
 //   {"type":"test.hangup"}                  closes the connection with no session.closed
 //   {"type":"session.close","mock_seconds":N}     session.closed with usage.seconds N (default 20)
 // Any other event comes back as {"type":"echo","event":<it>}.
+//
+// It also plays the Realtime API (realtimeAnswer, for POST /v1/realtime/calls): session.created when the
+// channel opens, and
+//   {"type":"test.rt.turn", ...}            a response: see realtimeTurn
+// Any other event comes back as {"type":"echo","event":<it>}.
 import { RTCPeerConnection, RTCDataChannel, RTCTrack, RTCConfig } from "std/rtc"
 import { fields, find, rawStr } from "../src/json"
+
+// The server events a test.rt.turn makes a realtime provider send, in order: the turn's start (a
+// server-detected one, when "vad" is set), the transcript of what the caller said ("heard"), a response of
+// the words of "text" as audio transcript deltas, and response.done with the usage given: input, output,
+// audio_in, audio_out and cached tokens. "id" names the response.
+export function realtimeTurn(ev: string): string[] {
+  const out: string[] = []
+  const id = field(ev, "id") === "" ? "resp_mock" : unquote(field(ev, "id"))
+  if (field(ev, "vad") === "true") out.push(`{"type":"input_audio_buffer.committed","item_id":"item_${id}"}`)
+  const heard = unquote(field(ev, "heard"))
+  if (heard !== "") out.push(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_${id}","transcript":${JSON.stringify(heard)}}`)
+  out.push(`{"type":"response.created","response":{"id":"${id}","status":"in_progress"}}`)
+  const text = unquote(field(ev, "text"))
+  if (text !== "") {
+    for (const w of text.split(" ")) out.push(`{"type":"response.output_audio_transcript.delta","response_id":"${id}","delta":${JSON.stringify(w + " ")}}`)
+  }
+  const n = (k: string): string => (field(ev, k) === "" ? "0" : field(ev, k))
+  out.push(`{"type":"response.done","response":{"id":"${id}","status":"completed","usage":{"total_tokens":${parseInt(n("input"))! + parseInt(n("output"))!},"input_tokens":${n("input")},"output_tokens":${n("output")},"input_token_details":{"audio_tokens":${n("audio_in")},"cached_tokens":${n("cached")}},"output_token_details":{"audio_tokens":${n("audio_out")}}}}}`)
+  return out
+}
+
+function unquote(raw: string): string {
+  if (raw === "") return ""
+  try {
+    return rawStr([{ key: "v", raw: raw }], "v") ?? raw
+  } catch (e) {
+    return raw
+  }
+}
 
 class MockLive {
   // every event the provider peer received, as {"session":id,"event":<event>}
@@ -61,8 +95,22 @@ export async function liveAnswer(body: string): Promise<string> {
   // a model this provider has no live session for
   if (body.includes(`"model":"gpt-live-refuse"`)) return ""
   LIVE.sessions += 1
-  LIVE.offers.push(offer)
   const id = LIVE.sessions === 1 ? "sess_mock_rtc" : "sess_mock_rtc_" + LIVE.sessions
+  const sdp = await answerOffer(offer, id, false)
+  if (sdp === "") return ""
+  return `{"session":{"id":"${id}","type":"realtime"},"transport":{"type":"webrtc","sdp":${JSON.stringify(sdp)}}}`
+}
+
+// Answers a realtime call's SDP offer (POST /v1/realtime/calls): the SDP answer, or "" when the offer is
+// unusable. The peer plays the Realtime API on the "oai-events" channel.
+export async function realtimeAnswer(offer: string): Promise<string> {
+  if (offer === "") return ""
+  LIVE.sessions += 1
+  return await answerOffer(offer, "sess_mock_rt_" + LIVE.sessions, true)
+}
+
+async function answerOffer(offer: string, id: string, realtime: bool): Promise<string> {
+  LIVE.offers.push(offer)
   const cfg: RTCConfig = { bindAddress: process.env.MOCK_RTC_BIND ?? "127.0.0.1" }
   let pc: RTCPeerConnection
   try {
@@ -70,7 +118,7 @@ export async function liveAnswer(body: string): Promise<string> {
   } catch (e) {
     return ""
   }
-  const session = new MockSession(id, pc)
+  const session = new MockSession(id, pc, realtime)
   pc.ondatachannel = (incoming) => {
     const ch = incoming
     session.channel = ch
@@ -96,7 +144,7 @@ export async function liveAnswer(body: string): Promise<string> {
   }
   if (pc.setRemoteDescription(offer, "offer") !== "") return ""
   for (let i = 0; i < 300 && !gathered; i++) await wait(10)
-  return `{"session":{"id":"${id}","type":"realtime"},"transport":{"type":"webrtc","sdp":${JSON.stringify(pc.localDescription)}}}`
+  return pc.localDescription
 }
 
 class MockSession {
@@ -104,7 +152,7 @@ class MockSession {
   track: RTCTrack | undefined = undefined
   seconds = 0.0
   done = false
-  constructor(readonly id: string, readonly pc: RTCPeerConnection) {}
+  constructor(readonly id: string, readonly pc: RTCPeerConnection, readonly realtime: bool) {}
 
   send(m: string): void {
     const c = this.channel
@@ -112,6 +160,10 @@ class MockSession {
   }
 
   start(): void {
+    if (this.realtime) {
+      this.send(`{"type":"session.created","session":{"id":"${this.id}","object":"realtime.session"}}`)
+      return
+    }
     this.send(`{"type":"session.started","session":{"id":"${this.id}"}}`)
     this.seconds = 2.5
     this.send(`{"type":"session.usage.updated","usage":{"seconds":2.5}}`)
@@ -123,6 +175,18 @@ class MockSession {
     try {
       type = rawStr(fields(m), "type") ?? ""
     } catch (e) {
+      return
+    }
+    if (this.realtime) {
+      if (type === "test.rt.turn") {
+        for (const e of realtimeTurn(m)) this.send(e)
+        return
+      }
+      if (type === "test.hangup") {
+        this.pc.close()
+        return
+      }
+      this.send(`{"type":"echo","event":${m}}`)
       return
     }
     if (type === "session.close") {

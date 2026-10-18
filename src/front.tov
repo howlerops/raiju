@@ -7,8 +7,8 @@ import { WsConnection } from "./ws"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { Ops } from "./ops"
 import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel, http1Upgrade, largeFront, limitedBody } from "./server"
+import { TransportRun, transportStart, transportEnd, transportDone, transportSink } from "./pluginroute"
 import * as metrics from "./metrics"
-import { relayHttp1 } from "./realtime"
 
 // streamThreshold: request bodies over this many bytes reach the handler as a stream (0: never; large_payload_optimization).
 // limitBytes: client.max_request_body_size_mb, checked by the handler when maxBodyBytes (the parser's) is looser than it.
@@ -21,11 +21,11 @@ function pathOf(target: string): string {
 
 // The streamed route kind of a request this front end streams, or "". Bedrock's event streams
 // are binary, which this front end can't write yet, so those answer whole.
-function streamingKind(req: Http1Request): string {
+function streamingKind(req: Http1Request, body: string): string {
   if (req.method !== "POST") return ""
   const kind = streamKind(compatPath(pathOf(req.path)))
   if (kind === "bedrock") return ""
-  return streamsRequest(kind, req.body) ? kind : ""
+  return streamsRequest(kind, body) ? kind : ""
 }
 
 // A request body that is still arriving, as a stream (src/http1.tov BodyQueue).
@@ -94,6 +94,7 @@ async function write(res: Http1Response, r: Response): Promise<int> {
 
 async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request, res: Http1Response, limit: int): Promise<void> {
   let request = toRequest(req, host)
+  let tr: TransportRun | undefined = undefined
   const t0 = performance.now()
   const label = pathLabel(pathOf(req.path))
   // (a streamed body has not arrived: its declared length stands in)
@@ -116,21 +117,36 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       }
       request = within
     }
-    const kind = streamingKind(req)
+    // the plugins' HTTP pre hooks, before the request is routed: they may rewrite it or answer it
+    const th = await transportStart(engine, request)
+    tr = th.tr
+    if (th.response !== undefined) {
+      const n = await write(res, th.response)
+      metrics.observeHttp(label, req.method, th.response.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
+      return
+    }
+    request = th.request
+    const kind = streamingKind(req, tr === undefined ? req.body : th.body)
     if (kind !== "") {
       const sink = new StreamSink(
         (status, headers) => res.writeHead(status, headers),
         (chunk) => res.write(chunk),
         () => res.end(),
       )
-      const r = await routeStream(engine, request, kind, sink)
+      // the plugins' chunk hooks see each event on its way to the client
+      const r = await routeStream(engine, request, kind, transportSink(tr, sink))
       // Bifrost's http_* metrics; a streamed body counts as 0 bytes
       let n = 0
-      if (!sink.started) n = await write(res, r)
-      metrics.observeHttp(label, req.method, r.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
+      let status = r.status
+      if (!sink.started) {
+        const hooked = await transportEnd(engine, tr, r)
+        status = hooked.status
+        n = await write(res, hooked)
+      }
+      metrics.observeHttp(label, req.method, status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
       return
     }
-    const r = await dispatch(engine, ops, request)
+    const r = await transportEnd(engine, tr, await dispatch(engine, ops, request))
     const n = await write(res, r)
     metrics.observeHttp(label, req.method, r.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
   } catch (e) {
@@ -141,18 +157,15 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       res.end(`{"error":{"message":"internal error","type":"api_error"}}`)
     }
     console.error(`raiju: ${e.message}`)
+  } finally {
+    transportDone(engine, tr)
   }
 }
 
 export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): string {
   const host = `${opts.hostname}:${opts.port}`
   const onUpgrade = (req: Http1Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void): bool => {
-    const p = pathOf(req.path)
-    if ((p === "/v1/realtime" || p === "/openai/v1/realtime") && req.method === "GET") {
-      relayHttp1(engine, toRequest(req, host), accept, reject)
-      return true
-    }
-    // the other WebSocket routes (server.tov's wsUpgrade)
+    // every WebSocket route, the realtime relay among them (server.tov's wsUpgrade)
     return http1Upgrade(engine, ops, toRequest(req, host), accept, reject)
   }
   listen({ hostname: opts.hostname, port: opts.port, maxBodyBytes: opts.maxBodyBytes, streamThreshold: opts.streamThreshold, onUpgrade: onUpgrade }, (req, res) => {

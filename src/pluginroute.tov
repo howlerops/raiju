@@ -1,0 +1,536 @@
+// Plugin hooks around a request on the servers. Bifrost runs the plugins' HTTP transport hooks on the
+// inference routes: before routing (a plugin can rewrite the request's headers, query and body, or answer at
+// once), after the response (rewrite its status, headers and body), and for each chunk of a streamed answer
+// (rewrite, drop, or end the stream). Its LLM hooks (preRequest and postResponse) run on every request type.
+// The built-in chat route runs them in gateway.tov chatOnce; the other routes run them here (llmHooked), so
+// a plugin sees embeddings, speech, transcription, images, Responses and the other types as chat requests,
+// in the shapes of plughttp.tov and wasmplugin.tov.
+//
+// The two phases share one PluginRun per request: transportStart makes it and puts its id in the request's
+// x-bf-plugin-run header, and the LLM hooks find it in Engine.pluginRuns by that id, so a WebAssembly
+// plugin's context travels from http_pre_hook to pre_hook, post_hook and http_post_hook.
+
+import { Engine, StreamSink, EventStep, eventSink, llmStreamSink, errorResponse, noHeaders } from "./gateway"
+import { PluginChain, PluginRun, PluginContext, BasePlugin, PostResult, HttpChunkResult, RUN_HEADER, errorPost } from "./plugins"
+import { HttpReq, HttpResp, LlmKind, SseBuffer, HOOK_BODY_LIMIT, emptyReq, queryMap, queryString, sseData, sseWithData, sseErrorEvent, isInferencePath, kindOfOp } from "./plughttp"
+import { snapshot, newId } from "./schemas"
+import { fields, find, rawStr, quote, decodeString, isNull } from "./json"
+import { encode, decode } from "./base64"
+import { utf8, secureHex } from "./crypto"
+
+// The plugin chain, when there is one with plugins.
+function chainOf(engine: Engine): PluginChain | undefined {
+  const c = engine.plugins
+  if (c === undefined || c.plugins.length === 0) return undefined
+  return c
+}
+
+// One request's transport hooks: the chain, the run (its context and the request as the hooks left it), and
+// the id the handlers find the run by.
+export class TransportRun {
+  constructor(readonly id: string, readonly chain: PluginChain, readonly run: PluginRun) {}
+}
+
+// What transportStart decided. response: a plugin answered (or failed) the request, and that is the answer.
+// Otherwise request is the one to serve; tr is set when hooks ran, and body is that request's body as text
+// (for the streaming decision).
+export type TransportStart = { response: Response | undefined, request: Request, tr: TransportRun | undefined, body: string }
+
+function text(b: u8[]): string {
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+// A response of an HTTP hook as a gateway response. Framing headers are the server's.
+function responseOf(r: HttpResp): Response {
+  const hs: Record<string, string> = new Map()
+  for (const k of r.headers.keys()) {
+    if (k !== "content-length" && k !== "transfer-encoding" && k !== "connection") hs.set(k, r.headers.get(k)!)
+  }
+  return new Response(r.status === 204 || r.status === 304 ? undefined : r.body, { status: r.status, headers: hs })
+}
+
+// Runs the plugins' HTTP pre hooks on a request, before it is routed. A request that no hook looks at (no
+// plugin with a transport hook, a route that is not an inference route, a body over HOOK_BODY_LIMIT) comes back
+// as it was. The handlers that run later find the hooks' run through the x-bf-plugin-run header.
+export async function transportStart(engine: Engine, req: Request): Promise<TransportStart> {
+  const chain = chainOf(engine)
+  const u = URL.parse(req.url)
+  const path = u === undefined ? "" : u.pathname
+  // (a CORS preflight is answered before the plugins, as Bifrost's CORS middleware does)
+  if (chain === undefined || u === undefined || req.method === "OPTIONS" || !chain.hasHttp() || !isInferencePath(path)) return { response: undefined, request: req, tr: undefined, body: "" }
+  const hs = snapshot(req.headers)
+  hs.delete(RUN_HEADER)
+  // a body declared bigger than hooks take is not read here (a large upload goes on as it is)
+  if ((parseFloat(hs.get("content-length") ?? "0") ?? 0.0) > HOOK_BODY_LIMIT) return { response: undefined, request: req, tr: undefined, body: "" }
+  let bytes: u8[] = []
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    try {
+      bytes = await req.bytes()
+    } catch (e) {
+      return { response: errorResponse(400, `the request body could not be read: ${e.message}`, "invalid_request_error", noHeaders()), request: req, tr: undefined, body: "" }
+    }
+  }
+  const search = u.search.startsWith("?") ? u.search.slice(1) : u.search
+  const origin = u.origin
+  if (bytes.length > HOOK_BODY_LIMIT) return { response: undefined, request: rebuild(origin, path, search, req.method, hs, bytes, undefined), tr: undefined, body: "" }
+  let hr = emptyReq(req.method, path)
+  hr.headers = hs
+  hr.query = queryMap(search)
+  hr.rawQuery = search
+  hr.body = bytes
+  const rid = hs.get("x-request-id") ?? newId("req_")
+  const run = new PluginRun({ requestId: rid, op: "http", model: "", provider: "", headers: new Map(), values: new Map() })
+  const method0 = hr.method
+  const path0 = hr.path
+  const pre = chain.runHttpPre(&run.ctx, &hr)
+  if (pre.kind === "error") return { response: errorResponse(500, pre.message, "api_error", noHeaders()), request: req, tr: undefined, body: "" }
+  if (pre.kind === "respond") return { response: responseOf(pre.resp), request: req, tr: undefined, body: "" }
+  // Bifrost refuses a plugin that moves the request to another route
+  if (hr.method !== method0 || hr.path !== path0) return { response: errorResponse(409, "request method/path was modified by a plugin, this is not allowed", "api_error", noHeaders()), request: req, tr: undefined, body: "" }
+  run.req = hr
+  // the id is the only way to reach the run, so it is not guessable
+  let id = newId("run_")
+  try {
+    id = "run_" + secureHex(24)
+  } catch (e) {
+    // the kernel source is out of reach: the time-based id stands
+  }
+  const tr = new TransportRun(id, chain, run)
+  engine.pluginRuns.set(id, run)
+  const nh: Map<string, string> = new Map()
+  for (const k of hr.headers.keys()) nh.set(k, hr.headers.get(k)!)
+  nh.set(RUN_HEADER, id)
+  const qs = hr.queryEdited ? queryString(hr.query) : hr.rawQuery
+  return { response: undefined, request: rebuild(origin, hr.path, qs, hr.method, nh, hr.body, undefined), tr: tr, body: text(hr.body) }
+}
+
+// A request for a URL with a body (bytes, or a form that brings its own boundary).
+function rebuild(origin: string, path: string, query: string, method: string, headers: Map<string, string>, body: u8[], form: FormData | undefined): Request {
+  const hs: Map<string, string> = new Map()
+  for (const k of headers.keys()) {
+    // the body's framing is made again
+    if (k !== "content-length" && k !== "transfer-encoding" && !(form !== undefined && k === "content-type")) hs.set(k, headers.get(k)!)
+  }
+  const url = origin + path + (query === "" ? "" : "?" + query)
+  if (method === "GET" || method === "HEAD") return new Request(url, { method: method, headers: hs })
+  if (form !== undefined) return new Request(url, { method: method, headers: hs, body: form })
+  return new Request(url, { method: method, headers: hs, body: body })
+}
+
+// The run's record is dropped when the request is over, whatever the answer.
+export function transportDone(engine: Engine, tr: TransportRun | undefined): void {
+  if (tr !== undefined) engine.pluginRuns.delete(tr.id)
+}
+
+// The HTTP post hooks on the answer of a request that transportStart hooked. A streamed answer (its body is a
+// stream the server is already sending) is left alone, and an event stream read whole goes through the chunk
+// hooks instead, as a stream does.
+export async function transportEnd(engine: Engine, tr: TransportRun | undefined, res: Response): Promise<Response> {
+  if (tr === undefined) return res
+  transportDone(engine, tr)
+  const st = res.body
+  if (st !== undefined && st.pushed) return res
+  let bytes: u8[] = []
+  try {
+    bytes = await res.bytes()
+  } catch (e) {
+    return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+  }
+  const req = tr.run.req
+  if (req === undefined) return new Response(bytes, { status: res.status, headers: snapshotRecord(res.headers) })
+  const ct = res.headers.get("content-type") ?? ""
+  if (ct.startsWith("text/event-stream")) {
+    const out = chunkWhole(tr, text(bytes))
+    return new Response(out, { status: res.status, headers: snapshotRecord(res.headers) })
+  }
+  if (bytes.length > HOOK_BODY_LIMIT) return new Response(bytes, { status: res.status, headers: snapshotRecord(res.headers) })
+  let hr: HttpResp = { status: res.status, headers: snapshot(res.headers), body: bytes }
+  tr.chain.runHttpPost(&tr.run.ctx, req, &hr)
+  return responseOf(hr)
+}
+
+// The response's headers as a record, without the body's length (the server sets it).
+function snapshotRecord(h: Headers): Record<string, string> {
+  const out: Record<string, string> = new Map()
+  h.forEach((v, k) => {
+    if (k !== "content-length") out.set(k, v)
+  })
+  return out
+}
+
+// ---- streamed answers ----
+
+// What the chunk hooks do with one event of a stream.
+function chunkStep(tr: TransportRun, block: string): EventStep {
+  const data = sseData(block)
+  const req = tr.run.req
+  if (data === undefined || req === undefined || !data.startsWith("{")) return { kind: "send", block: block }
+  const r = tr.chain.runHttpChunk(&tr.run.ctx, req, data)
+  if (r.kind === "skip") return { kind: "drop" }
+  if (r.kind === "stop") return { kind: "end", block: sseErrorEvent(r.message) }
+  if (r.data === data) return { kind: "send", block: block }
+  return { kind: "send", block: sseWithData(block, r.data) }
+}
+
+// The sink of a streamed answer with the plugins' chunk hooks on each event.
+export function transportSink(tr: TransportRun | undefined, real: StreamSink): StreamSink {
+  if (tr === undefined) return real
+  return eventSink(real, (block) => chunkStep(tr, block))
+}
+
+// An event stream that was built whole, through the chunk hooks event by event.
+function chunkWhole(tr: TransportRun, body: string): string {
+  const buf = new SseBuffer()
+  const blocks = buf.push(body)
+  const rest = buf.rest()
+  if (rest.trim() !== "") blocks.push(rest + "\n\n")
+  const out: string[] = []
+  for (const b of blocks) {
+    const step = chunkStep(tr, b)
+    if (step.kind === "send") out.push(step.block)
+    else if (step.kind === "end") {
+      out.push(step.block)
+      break
+    }
+  }
+  return out.join("")
+}
+
+// ---- the LLM hooks on the other request types ----
+
+export type Handler = (r: Request, s: StreamSink | undefined) => Promise<Response, TypeError>
+
+// The text fields of a multipart request as a JSON object (the files are not part of what plugins see).
+function formJson(fd: FormData): string {
+  const parts: string[] = []
+  fd.forEach((value, key) => {
+    if (typeof value === "string") parts.push(quote(key) + ":" + quote(value))
+  })
+  return "{" + parts.join(",") + "}"
+}
+
+// A form field's text from the JSON value a plugin left.
+function fieldText(raw: string): string {
+  if (raw.startsWith("\"")) {
+    try {
+      return decodeString(raw)
+    } catch (e) {
+      return raw
+    }
+  }
+  return raw
+}
+
+// The multipart request with its text fields as a plugin left them (JSON object): fields it removed are
+// dropped, new ones are added, files stay.
+function formWith(fd: FormData, body: string): FormData throws SyntaxError {
+  const nf = try fields(body)
+  const out = new FormData()
+  const seen: Map<string, bool> = new Map()
+  fd.forEach((value, key) => {
+    if (typeof value === "string") {
+      const nv = find(nf, key)
+      if (nv !== undefined && !isNull(nv)) {
+        out.append(key, fieldText(nv))
+        seen.set(key, true)
+      }
+    } else {
+      out.append(key, value)
+    }
+  })
+  for (const f of nf) {
+    if (!seen.has(f.key) && !isNull(f.raw)) {
+      let had = false
+      fd.forEach((value, key) => {
+        if (key === f.key) had = true
+      })
+      if (!had) out.append(f.key, fieldText(f.raw))
+    }
+  }
+  return out
+}
+
+// The answer a short-circuiting plugin gave for a request of a kind.
+function shortResponse(k: LlmKind, status: int, body: string, contentType: string): Response {
+  const hs: Record<string, string> = new Map()
+  hs.set("x-bf-plugin-short-circuit", "true")
+  if (k.binary && status < 400) {
+    try {
+      const f = fields(body)
+      const audio = rawStr(f, "audio")
+      if (audio !== undefined) {
+        hs.set("content-type", rawStr(f, "content_type") ?? "application/octet-stream")
+        return new Response(decode(audio), { status: status, headers: hs })
+      }
+    } catch (e) {
+      // sent as the JSON it is
+    }
+  }
+  hs.set("content-type", status >= 400 ? "application/json" : contentType)
+  return new Response(body, { status: status, headers: hs })
+}
+
+// Runs a handler for a request of a kind with the plugins' LLM hooks around it: preRequest on the request (it may
+// rewrite it or answer for the provider), postResponse on the answer, an error answer included (it may change it
+// or recover from it), and postResponse on each chunk of a stream. Without plugins that handle the kind the
+// handler just runs. A body that is not JSON (a malformed request) is left to the handler to refuse.
+export async function llmHooked(engine: Engine, req: Request, op: string, handler: Handler, sink: StreamSink | undefined): Promise<Response> throws TypeError {
+  const chain = chainOf(engine)
+  const k = kindOfOp(op)
+  if (chain === undefined || k === undefined || !chain.handles(op)) return try await handler(req, sink)
+  const hs = snapshot(req.headers)
+  let body = ""
+  let fd: FormData | undefined = undefined
+  try {
+    if (k.form) {
+      const f = try await req.formData()
+      fd = f
+      body = formJson(f)
+    } else {
+      body = try await req.text()
+    }
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const u = URL.parse(req.url)
+  const origin = u === undefined ? "http://localhost" : u.origin
+  const path = u === undefined ? "" : u.pathname
+  const qs = u === undefined ? "" : (u.search.startsWith("?") ? u.search.slice(1) : u.search)
+  let model = ""
+  try {
+    model = rawStr(fields(body), "model") ?? ""
+  } catch (e) {
+    // not a JSON object: the handler refuses it
+    return try await handler(rebuild(origin, path, qs, req.method, hs, utf8(body), fd), sink)
+  }
+  const shared = engine.pluginRuns.get(req.headers.get(RUN_HEADER) ?? "")
+  const run = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: op, model: model, provider: "", headers: new Map(), values: new Map() })
+  run.ctx.op = op
+  run.ctx.model = model
+  const pre = chain.runPre(&run.ctx, body)
+  if (pre.kind === "short_circuit") {
+    const post = chain.runPost(&run.ctx, pre.status, pre.body)
+    return shortResponse(k, post.status, post.body, pre.contentType)
+  }
+  let next: Request = req
+  if (pre.body === body) {
+    next = rebuild(origin, path, qs, req.method, hs, utf8(body), fd)
+  } else if (fd !== undefined) {
+    try {
+      next = rebuild(origin, path, qs, req.method, hs, [], try formWith(fd, pre.body))
+    } catch (e) {
+      return errorResponse(500, `a plugin produced an invalid request: ${e.message}`, "api_error", noHeaders())
+    }
+  } else {
+    next = rebuild(origin, path, qs, req.method, hs, utf8(pre.body), undefined)
+  }
+  const wrapped = sink === undefined ? undefined : llmStreamSink(chain, run, sink)
+  const res = try await handler(next, wrapped)
+  if (wrapped !== undefined && wrapped.started) {
+    chain.finish(&run.ctx)
+    return res
+  }
+  return await postProcess(chain, run, k, res)
+}
+
+// An answer through the post hooks. A speech answer (audio) goes to them as {"audio": base64, "content_type"};
+// an answer that is not a JSON object is left alone.
+async function postProcess(chain: PluginChain, run: PluginRun, k: LlmKind, res: Response): Promise<Response> {
+  if (res.status >= 400) return await errorPost(chain, run, res)
+  let bytes: u8[] = []
+  try {
+    bytes = await res.bytes()
+  } catch (e) {
+    return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+  }
+  const ct = res.headers.get("content-type") ?? ""
+  const binary = k.binary && !ct.includes("json")
+  const asText = binary ? `{"audio":${quote(encode(bytes))},"content_type":${quote(ct)}}` : text(bytes)
+  if (!binary && !asText.trimStart().startsWith("{")) {
+    chain.finish(&run.ctx)
+    return new Response(bytes, { status: res.status, headers: snapshotRecord(res.headers) })
+  }
+  const o = chain.runPost(&run.ctx, res.status, asText)
+  const hs = snapshotRecord(res.headers)
+  if (o.status < 400 && binary) {
+    try {
+      const f = fields(o.body)
+      const audio = rawStr(f, "audio")
+      if (audio !== undefined) {
+        const nct = rawStr(f, "content_type")
+        if (nct !== undefined) hs.set("content-type", nct)
+        return new Response(decode(audio), { status: o.status, headers: hs })
+      }
+    } catch (e) {
+      return errorResponse(500, `a plugin produced an invalid answer: ${e.message}`, "api_error", noHeaders())
+    }
+  }
+  if (o.status >= 400 || o.status !== res.status || binary) hs.set("content-type", "application/json")
+  return new Response(o.body, { status: o.status, headers: hs })
+}
+
+// ---- tests ----
+
+// A plugin for the chunk hooks: skip drops a chunk that has "skipme", end stops the stream on "endme", upper
+// changes the first "a" to "A"; as an LLM plugin it marks each chunk (postChunk) and can turn "bad" into a 502.
+class ChunkTest extends BasePlugin {
+  constructor(readonly mode: string) {
+    super()
+  }
+
+  name(): string {
+    return "chunk-test"
+  }
+
+  hasHttp(): bool {
+    return true
+  }
+
+  httpChunk(inout ctx: PluginContext, req: HttpReq, data: string): HttpChunkResult {
+    if (this.mode === "skip" && data.includes("skipme")) return { kind: "skip" }
+    if (this.mode === "end" && data.includes("endme")) return { kind: "stop", message: "enough" }
+    if (this.mode === "upper") return { kind: "chunk", data: data.replace("a", "A") }
+    return { kind: "chunk", data: data }
+  }
+
+  postChunk(inout ctx: PluginContext, status: int, chunk: string): PostResult {
+    if (this.mode === "mark") return { kind: "continue", body: chunk.replace("}", `,"m":1}`) }
+    if (this.mode === "bad" && chunk.includes("bad")) return { kind: "status", status: 502, body: `{"error":{"message":"bad chunk"}}` }
+    return { kind: "continue", body: chunk }
+  }
+}
+
+class Collected {
+  out: string[] = []
+  opened = 0
+  closed = 0
+}
+
+function collector(c: Collected): StreamSink {
+  return new StreamSink(
+    (status, headers) => {
+      c.opened += 1
+    },
+    (chunk) => {
+      c.out.push(chunk)
+    },
+    () => {
+      c.closed += 1
+    },
+  )
+}
+
+function hookRun(mode: string): TransportRun {
+  const chain = new PluginChain([new ChunkTest(mode)])
+  const run = new PluginRun({ requestId: "r", op: "chat", model: "m", provider: "", headers: new Map(), values: new Map() })
+  run.req = emptyReq("POST", "/v1/chat/completions")
+  return new TransportRun("run_t", chain, run)
+}
+
+test("the chunk hooks see whole events however the stream is cut, and [DONE] and comments pass", () => {
+  const c = new Collected()
+  const s = transportSink(hookRun("upper"), collector(c))
+  s.open(200, new Map())
+  s.write(`data: {"t":"aa"}\n\nda`)
+  s.write(`ta: {"t":"ab"}\n\n: ping\n\nevent: x\ndata: [DONE]\n\n`)
+  s.close()
+  expect(c.out).toEqual([`data: {"t":"Aa"}\n\n`, `data: {"t":"Ab"}\n\n`, `: ping\n\n`, `event: x\ndata: [DONE]\n\n`])
+  expect(c.opened).toBe(1)
+  expect(c.closed).toBe(1)
+})
+
+test("a chunk the hook skips is dropped, and one that ends the stream sends the error and stops reading", () => {
+  const c = new Collected()
+  const s = transportSink(hookRun("skip"), collector(c))
+  s.write(`data: {"t":"keep"}\n\ndata: {"t":"skipme"}\n\ndata: {"t":"also"}\n\n`)
+  s.close()
+  expect(c.out).toEqual([`data: {"t":"keep"}\n\n`, `data: {"t":"also"}\n\n`])
+  const e = new Collected()
+  const real = collector(e)
+  const es = transportSink(hookRun("end"), real)
+  es.write(`data: {"t":"one"}\n\ndata: {"t":"endme"}\n\ndata: {"t":"never"}\n\n`)
+  expect(e.out).toEqual([`data: {"t":"one"}\n\n`, `data: {"error":"enough"}\n\n`])
+  // what feeds the sink is told to stop, and later writes and the close reach the client once
+  expect(es.cancelled).toBe(true)
+  es.write(`data: {"t":"late"}\n\n`)
+  es.close()
+  es.close()
+  expect(e.out.length).toBe(2)
+  expect(e.closed).toBe(1)
+})
+
+test("a client that left is passed on to the stream's source, and an unfinished event is sent at the close", () => {
+  const c = new Collected()
+  const real = collector(c)
+  const s = transportSink(hookRun("pass"), real)
+  real.cancelled = true
+  s.write(`data: {"t":"x"}\n\n`)
+  expect(s.cancelled).toBe(true)
+  const d = new Collected()
+  const t = transportSink(hookRun("pass"), collector(d))
+  t.write(`data: {"t":"tail"}`)
+  expect(d.out.length).toBe(0)
+  t.close()
+  expect(d.out).toEqual([`data: {"t":"tail"}\n\n`])
+  // with no hooks the sink is the real one
+  const r = collector(new Collected())
+  expect(transportSink(undefined, r) === r).toBe(true)
+})
+
+test("post hooks run on each chunk of a stream, and a chunk turned into an error ends it", () => {
+  const chain = new PluginChain([new ChunkTest("mark")])
+  const run = new PluginRun({ requestId: "r", op: "chat", model: "m", provider: "", headers: new Map(), values: new Map() })
+  chain.runPre(&run.ctx, `{}`)
+  const c = new Collected()
+  const s = llmStreamSink(chain, run, collector(c))
+  s.write(`data: {"n":1}\n\nevent: e\ndata: {"n":2}\n\ndata: {"error":{"message":"up"}}\n\ndata: [DONE]\n\n`)
+  s.close()
+  expect(c.out).toEqual([`data: {"n":1,"m":1}\n\n`, `event: e\ndata: {"n":2,"m":1}\n\n`, `data: {"error":{"message":"up"}}\n\n`, `data: [DONE]\n\n`])
+  const bad = new PluginChain([new ChunkTest("bad")])
+  const run2 = new PluginRun({ requestId: "r", op: "chat", model: "m", provider: "", headers: new Map(), values: new Map() })
+  bad.runPre(&run2.ctx, `{}`)
+  const e = new Collected()
+  const es = llmStreamSink(bad, run2, collector(e))
+  es.write(`data: {"n":"ok"}\n\ndata: {"n":"bad"}\n\ndata: {"n":"after"}\n\n`)
+  es.close()
+  expect(e.out).toEqual([`data: {"n":"ok"}\n\n`, `data: {"error":{"message":"bad chunk"}}\n\n`])
+  expect(es.cancelled).toBe(true)
+})
+
+test("an event stream read whole goes through the chunk hooks event by event", () => {
+  expect(chunkWhole(hookRun("upper"), `data: {"t":"aa"}\n\ndata: {"t":"ab"}\n\ndata: [DONE]\n\n`)).toBe(`data: {"t":"Aa"}\n\ndata: {"t":"Ab"}\n\ndata: [DONE]\n\n`)
+  expect(chunkWhole(hookRun("skip"), `data: {"t":"skipme"}\n\ndata: {"t":"x"}\n\n`)).toBe(`data: {"t":"x"}\n\n`)
+  expect(chunkWhole(hookRun("end"), `data: {"t":"endme"}\n\ndata: {"t":"x"}\n\n`)).toBe(`data: {"error":"enough"}\n\n`)
+})
+
+test("a form request is its text fields as JSON, and a plugin's changes come back into the form", () => {
+  const fd = new FormData()
+  fd.append("model", "openai/whisper-1")
+  fd.append("language", "en")
+  fd.append("file", new File([utf8("RIFF")], "talk.wav"))
+  expect(formJson(fd)).toBe(`{"model":"openai/whisper-1","language":"en"}`)
+  const out = try formWith(fd, `{"model":"openai/whisper-2","prompt":"hi","temperature":0.2}`)
+  expect(out.get("model")).toBe("openai/whisper-2")
+  expect(out.get("language")).toBe(undefined)
+  expect(out.get("prompt")).toBe("hi")
+  expect(out.get("temperature")).toBe("0.2")
+  const file = out.get("file")
+  expect(typeof file === "string").toBe(false)
+})
+
+test("a short circuit of speech is audio, and others are the plugin's body", () => {
+  const speech = kindOfOp("speech")!
+  const a = shortResponse(speech, 200, `{"audio":"${encode(utf8("abc"))}","content_type":"audio/mpeg"}`, "application/json")
+  expect(a.headers.get("content-type")).toBe("audio/mpeg")
+  expect(a.headers.get("x-bf-plugin-short-circuit")).toBe("true")
+  const j = shortResponse(kindOfOp("embeddings")!, 200, `{"object":"list"}`, "application/json")
+  expect(j.status).toBe(200)
+  expect(j.headers.get("content-type")).toBe("application/json")
+  const e = shortResponse(speech, 429, `{"error":{"message":"no"}}`, "audio/mpeg")
+  expect(e.status).toBe(429)
+  expect(e.headers.get("content-type")).toBe("application/json")
+})

@@ -1,0 +1,218 @@
+// What every live and realtime session shares, whatever carries it (a WebRTC peer, a WebSocket) and
+// whichever API it speaks (GPT Live, the Realtime API): the hooks LiveCore (webrtc.tov) calls to
+// re-admit the session, count its events and record it when it ends, the guard that checks its
+// text, the bill, and the metadata of its log row.
+//
+// The bill is Bifrost's. A live session costs its voice seconds (the billed ones, with the WebRTC
+// minimum) at the model's rate per second, plus the tokens of its delegated responses at the text
+// rates of the model that ran them (computeLiveCost and the Responses usage). A realtime session costs
+// the tokens its responses reported (response.done): audio tokens at the audio rates, cached tokens
+// at the cache rate, the rest at the text rates (computeTextCost). Nothing is billed for a model the
+// price list does not know.
+import { Engine, LiveCost } from "./gateway"
+import { Grant } from "./governance"
+import { Hdrs } from "./schemas"
+import { Pricing, parseDatasheet } from "./pricing"
+import * as metrics from "./metrics"
+import { LiveHooks, LiveReport, GuardFn, Verdict } from "./webrtc"
+
+// What a session is: "live" or "realtime", the transport that carries it ("webrtc" or "websocket"),
+// and the provider and model it runs.
+export type SessionSpec = { op: string, transport: string, provider: string, model: string }
+
+// The events a live session's counters name; any other type is counted as "other", so a client cannot
+// make up metric labels.
+const LIVE_EVENT_TYPES: string[] = [
+  "session.start", "session.update", "session.close", "session.input_audio.append", "session.input_audio.mute", "session.input_audio.unmute",
+  "session.instructions.append", "session.thinking.append", "session.commentary.append", "response.item.create", "response.create",
+  "session.started", "session.updated", "session.closed", "session.input_audio.muted", "session.input_audio.unmuted", "session.instructions.appended",
+  "session.thinking.appended", "session.commentary.appended", "session.output_audio.delta", "session.input_transcript.delta",
+  "session.output_transcript.delta", "session.delegation.created", "session.usage.updated", "response.event", "error", "info",
+]
+
+// The same for a realtime session's: the Realtime API's client and server events.
+const REALTIME_EVENT_TYPES: string[] = [
+  "session.update", "input_audio_buffer.append", "input_audio_buffer.commit", "input_audio_buffer.clear", "conversation.item.create",
+  "conversation.item.retrieve", "conversation.item.truncate", "conversation.item.delete", "response.create", "response.cancel",
+  "output_audio_buffer.clear", "transcription_session.update", "error", "session.created", "session.updated", "conversation.created",
+  "conversation.item.created", "conversation.item.added", "conversation.item.done", "conversation.item.retrieved",
+  "conversation.item.truncated", "conversation.item.deleted", "conversation.item.input_audio_transcription.completed",
+  "conversation.item.input_audio_transcription.delta", "conversation.item.input_audio_transcription.segment",
+  "conversation.item.input_audio_transcription.failed", "input_audio_buffer.committed", "input_audio_buffer.cleared",
+  "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped", "input_audio_buffer.timeout_triggered",
+  "response.created", "response.done", "response.output_item.added", "response.output_item.done", "response.content_part.added",
+  "response.content_part.done", "response.text.delta", "response.text.done", "response.audio_transcript.delta",
+  "response.audio_transcript.done", "response.audio.delta", "response.audio.done", "response.output_text.delta",
+  "response.output_text.done", "response.output_audio.delta", "response.output_audio.done", "response.output_audio_transcript.delta",
+  "response.output_audio_transcript.done", "response.function_call_arguments.delta", "response.function_call_arguments.done",
+  "rate_limits.updated", "output_audio_buffer.started", "output_audio_buffer.stopped", "output_audio_buffer.cleared",
+  "transcription_session.updated",
+]
+
+// The label an event type is counted under.
+export function eventLabel(op: string, type: string): string {
+  const known = op === "live" ? LIVE_EVENT_TYPES : REALTIME_EVENT_TYPES
+  return known.includes(type) ? type : "other"
+}
+
+// What a finished session cost: the voice seconds it was billed, and its tokens by the model that used
+// them (a token count with no model is the session's own).
+export function liveCost(pricing: Pricing, provider: string, model: string, r: LiveReport): LiveCost {
+  let input = pricing.voiceCost(provider, model, r.billedSeconds)
+  let output = 0.0
+  for (const u of r.uses) {
+    const m = u.model === "" ? model : u.model
+    const c = pricing.usageParts(provider, m, { prompt: u.prompt, completion: u.completion, cached: u.cached, inputAudio: u.inputAudio, outputAudio: u.outputAudio })
+    input += c.input
+    output += c.output
+  }
+  return { total: input + output, input: input, output: output }
+}
+
+// The metadata of a finished session's log row.
+export function sessionMeta(spec: SessionSpec, r: LiveReport): Record<string, string> {
+  const m: Record<string, string> = {}
+  if (spec.op === "live") {
+    m.set("live_transport", spec.transport)
+    m.set("live_audio_seconds", "" + r.seconds)
+    m.set("live_billed_seconds", "" + r.billedSeconds)
+    if (r.sessionId !== "") m.set("live_session_id", r.sessionId)
+    if (r.reason !== "") m.set("live_close_reason", r.reason)
+    m.set("live_events", "" + r.events)
+    return m
+  }
+  m.set("realtime_transport", spec.transport)
+  if (r.sessionId !== "") m.set("realtime_session_id", r.sessionId)
+  m.set("realtime_events", "" + r.events)
+  let cached = 0
+  let inAudio = 0
+  let outAudio = 0
+  for (const u of r.uses) {
+    cached += u.cached
+    inAudio += u.inputAudio
+    outAudio += u.outputAudio
+  }
+  m.set("realtime_cached_tokens", "" + cached)
+  m.set("realtime_input_audio_tokens", "" + inAudio)
+  m.set("realtime_output_audio_tokens", "" + outAudio)
+  return m
+}
+
+function sessionsGauge(spec: SessionSpec): string {
+  if (spec.op === "realtime") return "raiju_realtime_sessions"
+  return spec.transport === "webrtc" ? "raiju_live_webrtc_sessions" : "raiju_live_ws_sessions"
+}
+
+function eventsCounter(spec: SessionSpec): string {
+  if (spec.op === "realtime") return "raiju_realtime_events_total"
+  return spec.transport === "webrtc" ? "raiju_live_webrtc_events_total" : "raiju_live_ws_events_total"
+}
+
+// The hooks of one session: it is counted open from here until its report; each window or turn is
+// admitted again by governance; every event is counted; the report bills the session, counts its voice
+// seconds or tokens, and writes its row. bind records the provider's session id for the key that opened it
+// (false when it can't be recorded).
+export function sessionHooks(engine: Engine, h: Hdrs, grant: Grant, spec: SessionSpec, bind: (id: string) => bool): LiveHooks {
+  const provider = spec.provider
+  const model = spec.model
+  const labels = metrics.labels(provider, model, spec.transport === "websocket" && spec.op === "realtime" ? "open" : spec.transport)
+  const gauge = sessionsGauge(spec)
+  const counter = eventsCounter(spec)
+  metrics.addGauge(gauge, labels, 1.0)
+  return new LiveHooks(() => {
+    // each window of voice time, and each turn, is admitted again, as Bifrost's meter does for its next unit
+    const again = engine.gov.admit(h, provider, model)
+    if (again.kind === "denial") return { status: again.status, type: again.type, message: again.message }
+    return undefined
+  }, (r) => {
+    metrics.addGauge(gauge, labels, -1.0)
+    if (spec.op === "live") {
+      metrics.inc("raiju_live_audio_seconds_total", labels, r.billedSeconds)
+    } else {
+      metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "input"), r.promptTokens * 1.0)
+      metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "output"), r.completionTokens * 1.0)
+    }
+    engine.recordLive(spec.op, h, grant, provider, model, r.status, r.endedMs - r.startedMs, r.promptTokens, r.completionTokens, r.input, r.output, r.error, sessionMeta(spec, r), liveCost(engine.pricing, provider, model, r))
+  }, bind, (direction, type) => {
+    metrics.inc(counter, `direction="${direction}",type="${eventLabel(spec.op, type)}"`, 1.0)
+  })
+}
+
+async function verdictOf(engine: Engine, text: string, source: string): Promise<Verdict> {
+  const v = await engine.liveGuard(text, source)
+  return { action: v.action, text: v.text, reason: v.reason }
+}
+
+// The guard that checks a session's text, or undefined when nothing is guarded.
+export function sessionGuard(engine: Engine): GuardFn | undefined {
+  if (!engine.liveGuarded()) return undefined
+  return (text: string, source: string): Promise<Verdict> => verdictOf(engine, text, source)
+}
+
+function report(): LiveReport {
+  return { sessionId: "", seconds: 0.0, billedSeconds: 0.0, promptTokens: 0, completionTokens: 0, uses: [], status: 200, error: "", reason: "", startedMs: 0.0, endedMs: 0.0, input: "", output: "", events: 0 }
+}
+
+test("a live session costs its billed voice seconds and the tokens of its delegated responses", () => {
+  const p = new Pricing({})
+  const csv = "{\"live-x\": {\"provider\": \"acme\", \"input_cost_per_second\": 0.002}, \"back-x\": {\"provider\": \"acme\", \"input_cost_per_token\": 0.000001, \"output_cost_per_token\": 0.000004, \"cache_read_input_token_cost\": 0.0000001}}"
+  p.replaceCatalog(try parseDatasheet(csv))
+  const r = report()
+  r.billedSeconds = 40.0
+  r.uses = [{ model: "back-x", prompt: 1000, completion: 100, cached: 500, inputAudio: 0, outputAudio: 0 }, { model: "", prompt: 0, completion: 0, cached: 0, inputAudio: 0, outputAudio: 0 }]
+  const c = liveCost(p, "acme", "live-x", r)
+  // 40 s at 0.002 on the input side; 500 fresh + 500 cached tokens in, 100 out
+  expect(c.input).toBeCloseTo(0.08 + 0.0005 + 0.00005)
+  expect(c.output).toBeCloseTo(0.0004)
+  expect(c.total).toBeCloseTo(c.input + c.output)
+  // a model the list does not know costs nothing
+  expect(liveCost(p, "acme", "nowhere", report()).total).toBe(0.0)
+})
+
+test("a realtime session costs its tokens at the text and audio rates", () => {
+  const p = new Pricing({})
+  const csv = "{\"rt-x\": {\"provider\": \"acme\", \"input_cost_per_token\": 0.000004, \"output_cost_per_token\": 0.000016, \"cache_read_input_token_cost\": 0.0000004, \"input_cost_per_audio_token\": 0.000032, \"output_cost_per_audio_token\": 0.000064}}"
+  p.replaceCatalog(try parseDatasheet(csv))
+  const r = report()
+  r.uses = [{ model: "rt-x", prompt: 1000, completion: 500, cached: 200, inputAudio: 300, outputAudio: 400 }]
+  const c = liveCost(p, "acme", "rt-x", r)
+  expect(c.input).toBeCloseTo(0.002 + 0.0096 + 0.00008)
+  expect(c.output).toBeCloseTo(0.0016 + 0.0256)
+  // two responses under one model add up the same as one
+  r.uses = [{ model: "rt-x", prompt: 500, completion: 250, cached: 100, inputAudio: 150, outputAudio: 200 }, { model: "rt-x", prompt: 500, completion: 250, cached: 100, inputAudio: 150, outputAudio: 200 }]
+  expect(liveCost(p, "acme", "rt-x", r).total).toBeCloseTo(c.total)
+  // the built-in table prices gpt-realtime audio at the audio rates
+  const q = new Pricing({})
+  const g = report()
+  g.uses = [{ model: "gpt-realtime", prompt: 1000000, completion: 1000000, cached: 0, inputAudio: 1000000, outputAudio: 1000000 }]
+  expect(liveCost(q, "openai", "gpt-realtime", g).total).toBeCloseTo(32.0 + 64.0)
+})
+
+test("event labels are the API's own, and anything else is other", () => {
+  expect(eventLabel("live", "session.usage.updated")).toBe("session.usage.updated")
+  expect(eventLabel("live", "response.done")).toBe("other")
+  expect(eventLabel("realtime", "response.done")).toBe("response.done")
+  expect(eventLabel("realtime", "made.up.by.a.client")).toBe("other")
+})
+
+test("a finished session's metadata names its transport, seconds and tokens", () => {
+  const live: SessionSpec = { op: "live", transport: "websocket", provider: "openai", model: "gpt-live" }
+  const r = report()
+  r.sessionId = "sess_1"
+  r.seconds = 12.5
+  r.billedSeconds = 12.5
+  r.events = 7
+  const m = sessionMeta(live, r)
+  expect(m.get("live_transport")).toBe("websocket")
+  expect(m.get("live_billed_seconds")).toBe("12.5")
+  expect(m.get("live_session_id")).toBe("sess_1")
+  expect(m.get("live_events")).toBe("7")
+  const rt: SessionSpec = { op: "realtime", transport: "webrtc", provider: "openai", model: "gpt-realtime" }
+  r.uses = [{ model: "gpt-realtime", prompt: 10, completion: 5, cached: 3, inputAudio: 4, outputAudio: 2 }]
+  const n = sessionMeta(rt, r)
+  expect(n.get("realtime_transport")).toBe("webrtc")
+  expect(n.get("realtime_cached_tokens")).toBe("3")
+  expect(n.get("realtime_input_audio_tokens")).toBe("4")
+  expect(n.get("realtime_output_audio_tokens")).toBe("2")
+  expect(n.has("live_transport")).toBe(false)
+})
