@@ -341,5 +341,5 @@ fast-forwarding their worktree to the branch tip.
 | L131 | G43 | Hold-and-replay of live block-capable streams (stream_replay_event_interval_ms): output held until the guards pass, then replayed paced, as Bifrost does | worker | assigned |
 | L132 | UI | Admin UI: dashboard charts (log histograms and rankings), MCP OAuth consent screens, virtual MCP and tool group editors, role-aware actions | worker | assigned |
 | L133 | G22, (g) | MCP: token_exchange clients connected at runtime; code mode gains while, try/except, lambda and f-strings and is offered on the Responses API and POST /mcp | worker | assigned |
-| L134 | (g), (b) | A2A REST binding, push notifications, tasks/resubscribe, upstream OAuth and the aggregated card; the last two missing parity rows (MCP max_instructions_length, x-bf-agent-vk-id and x-bf-agent-auth) | worker | todo |
+| L134 | (g), (b) | A2A REST binding, push notifications, tasks/resubscribe, upstream OAuth and the aggregated card; the last two missing parity rows (MCP max_instructions_length, x-bf-agent-vk-id and x-bf-agent-auth) | worker | assigned |
 
