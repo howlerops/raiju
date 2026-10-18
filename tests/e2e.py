@@ -2853,7 +2853,7 @@ def l97m_e2e(env):
         check("custom labels reach the http families, and the overhead split and user labels are exported", s == 200 and 'team="core"' in m and 'user_id=""' in m and 'overhead_component="routing"' in m, m[:200])
 
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": msgs}, None, base=GW_L97M_B, auth=False)
-        check("a streamed block ends the stream with the error event before the blocked text", '"content":"Hel"' in b and '"content":"lo"' not in b and "guardrail_violation" in b and "[DONE]" in b, b[:400])
+        check("a streamed block sends the error event and none of the held answer (L131)", '"content":"Hel"' not in b and '"content":"lo"' not in b and "guardrail_violation" in b and "[DONE]" in b, b[:400])
     finally:
         gw_a.terminate()
         gw_b.terminate()
@@ -3109,6 +3109,103 @@ def l107_e2e(env):
     finally:
         gw_a.terminate()
         gw_b.terminate()
+
+
+GW_L131 = "http://127.0.0.1:18205"  # hold-and-replay of live streams under block-capable output guards
+
+
+def l131_config(hold: dict) -> dict:
+    """A gateway with a phone redaction and two block rules on the output, a replay interval of 80 ms and the hold settings given."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "m", "value": "sk-l131", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "guardrails": {"enabled": True, "apply_to": "output", "detect": [], "stream_replay_event_interval_ms": 80, **hold, "providers": [
+            {"id": "pii", "kind": "regex", "apply_to": "output", "patterns": [{"pattern": "\\d{3}-\\d{4}", "description": "Phone", "action": "redact"}]},
+            {"id": "words", "kind": "regex", "apply_to": "output", "patterns": [{"pattern": "forbidden", "description": "Word", "action": "block"}, {"pattern": "jane", "description": "Name", "action": "block"}]}]},
+    }
+
+
+def stream_times(base: str, path: str, body: dict):
+    """A streamed POST read as it arrives: the status, and the (seconds since the request, event text) of each SSE event."""
+    import http.client
+    host, port = base.replace("http://", "").split(":")
+    conn = http.client.HTTPConnection(host, int(port), timeout=20)
+    t0 = time.time()
+    conn.request("POST", path, json.dumps(body), {"content-type": "application/json"})
+    r = conn.getresponse()
+    events, cur = [], ""
+    while True:
+        line = r.readline()
+        if not line:
+            break
+        if line in (b"\n", b"\r\n"):
+            if cur:
+                events.append((time.time() - t0, cur))
+            cur = ""
+        else:
+            cur += line.decode()
+    if cur:
+        events.append((time.time() - t0, cur))
+    conn.close()
+    return r.status, events
+
+
+def l131_e2e(env):
+    """A live stream under a block-capable output guard is held until the guards pass: a blocked answer sends no answer
+    text (chat, text completion, Responses), a passing one arrives complete with its events paced by
+    stream_replay_event_interval_ms, and the hold caps block the stream or (on_limit release) let it go live.
+    Their own gateways, one after the other on one port."""
+    msgs = [{"role": "user", "content": "hi"}]
+
+    def run(hold: dict, name: str, body):
+        cfg = os.path.join(BUILD, f"e2e.l131.{name}.json")
+        json.dump(l131_config(hold), open(cfg, "w"))
+        gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18205", "-host", "127.0.0.1", "-config", cfg, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, f"e2e.l131.{name}.log"), "w"))
+        try:
+            wait(GW_L131 + "/health")
+            body()
+        finally:
+            gw.terminate()
+            gw.wait()
+
+    def held():
+        s, ev = stream_times(GW_L131, "/v1/chat/completions", {"model": "openai/email-chat", "stream": True, "messages": msgs})
+        text = "".join(e for _, e in ev)
+        check("chat: a blocked streamed answer sends no answer text, only the error", s == 200 and "guardrail_violation" in text and "write to" not in text and "jane" not in text and "chat.completion.chunk" not in text, (s, text[:300]))
+        s, ev = stream_times(GW_L131, "/v1/completions", {"model": "openai/block-text", "stream": True, "prompt": "hi"})
+        text = "".join(e for _, e in ev)
+        check("text completion: a blocked streamed answer sends no answer text", s == 200 and "guardrail_violation" in text and "forbidden" not in text and "text_completion" not in text, (s, text[:300]))
+        s, ev = stream_times(GW_L131, "/v1/responses", {"model": "openai/block-responses", "stream": True, "input": "hi"})
+        text = "".join(e for _, e in ev)
+        check("responses: a blocked streamed answer sends no answer text", s == 200 and "event: error" in text and "forbidden" not in text and "output_text" not in text, (s, text[:300]))
+        for label, path, req, key in [
+            ("chat", "/v1/chat/completions", {"model": "openai/pii-chat", "stream": True, "messages": msgs}, "chat.completion.chunk"),
+            ("text completion", "/v1/completions", {"model": "openai/pii-text", "stream": True, "prompt": "hi"}, "text_completion"),
+            ("responses", "/v1/responses", {"model": "openai/pii-responses", "stream": True, "input": "hi"}, "response.output_text.delta"),
+        ]:
+            s, ev = stream_times(GW_L131, path, req)
+            text = "".join(e + "\n\n" for _, e in ev)
+            spread = ev[-1][0] - ev[0][0] if ev else 0.0
+            gaps = [b[0] - a[0] for a, b in zip(ev, ev[1:])]
+            check(f"{label}: a passing streamed answer arrives complete (redacted), paced by the replay interval", s == 200 and key in text and "555-1234" not in text and "[REDACTED:PHONE]" in text and len(ev) >= 4 and spread >= 0.08 * (len(ev) - 1) * 0.8 and min(gaps) >= 0.05, (s, len(ev), spread, gaps, text[:300]))
+
+    def capped():
+        s, ev = stream_times(GW_L131, "/v1/chat/completions", {"model": "openai/pii-chat", "stream": True, "messages": msgs})
+        text = "".join(e for _, e in ev)
+        check("the hold's byte cap blocks the stream and none of the answer goes out", s == 200 and "guardrail_violation" in text and "size limit" in text and "call" not in text, (s, text[:300]))
+
+    def released():
+        s, ev = stream_times(GW_L131, "/v1/chat/completions", {"model": "openai/pii-chat", "stream": True, "messages": msgs})
+        text = "".join(e for _, e in ev)
+        check("on_limit release lets the held answer go out and the stream continue", s == 200 and "guardrail_violation" not in text and "[REDACTED:PHONE]" in text and "555-1234" not in text and "[DONE]" in text, (s, text[:300]))
+
+    run({}, "held", held)
+    run({"stream_hold_max_bytes": 100}, "capped", capped)
+    run({"stream_hold_max_bytes": 100, "stream_hold_on_limit": "release"}, "released", released)
 
 
 def chunked_post(port: int, path: str, total: int) -> int | None:
@@ -7739,6 +7836,8 @@ def main():
         l125_e2e(env)
         # streams under the built-in guard, tool names of streamed answers, legacy completion and cursor Responses streams, paced cache replays
         l107_e2e(env)
+        # L131: hold-and-replay of live streams under a block-capable output guard (port 18205)
+        l131_e2e(env)
         # L110: raw payloads of streamed answers and the content-logging switch, on their own gateway
         l110_e2e(env)
         # L127: the anthropic-beta filter per provider, and beta_header_overrides, on the direct API and Vertex Claude: their own gateway

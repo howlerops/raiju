@@ -252,6 +252,7 @@ export class StreamConverter {
     }
     const g = this.guard
     if (g === undefined) return text
+    g.nowMs = Math.floor(Date.now())
     const out = last ? g.finish(text) : g.filter(text)
     if (g.stopped && !this.halted) {
       this.halted = true
@@ -260,6 +261,13 @@ export class StreamConverter {
     for (let k = this.reportedKinds; k < g.kinds.length; k++) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", g.kinds[k]!, "redact"), 1.0)
     this.reportedKinds = g.kinds.length
     return out
+  }
+
+  // The events a held stream hands back (once the guards pass, or at a limit), to be sent paced.
+  replay(): string[] {
+    const g = this.guard
+    if (g === undefined) return []
+    return g.takeReplay()
   }
 
   // Whole frames only: a text completion frame is built from a complete chat frame.
@@ -1330,13 +1338,43 @@ export class Engine {
   }
 
   // The output guard of one streamed answer in a format (guard_stream.tov), or undefined when none applies.
-  streamGuard(format: StreamFormat, guardOn: bool): OutputStreamGuard | undefined {
+  // live: the stream goes to a client as it arrives, so a block-capable guard holds it (Bifrost's hold-and-replay).
+  streamGuard(format: StreamFormat, guardOn: bool, live?: bool): OutputStreamGuard | undefined {
     const gs = this.streamGuards(guardOn)
     const b = this.streamBuiltin(guardOn)
     if (gs.length === 0 && b === undefined) return undefined
     const g = new OutputStreamGuard(gs, format)
     if (b !== undefined) g.useBuiltin(b)
+    let blocks = b !== undefined && b.mode === "block"
+    for (const p of gs) {
+      if (p.rules.some((r: CompiledRule) => r.action === "block")) blocks = true
+    }
+    if (live === true && blocks) {
+      const gc = this.cfg.guardrails
+      g.useHold(gc?.stream_hold_max_bytes ?? 8388608, gc?.stream_hold_max_ms ?? 300000, gc?.stream_hold_on_limit ?? "block")
+    }
     return g
+  }
+
+  // Sends held events to a client, pace ms apart (the first one at once when nothing was sent before).
+  // A client that went away stops it. Returns the text sent.
+  async sendPaced(sink: StreamSink, evs: string[], pace: int, first: bool): Promise<string> {
+    if (pace <= 0) {
+      let all = ""
+      for (const e of evs) all += e
+      if (all !== "" && !sink.cancelled) sink.write(all)
+      return all
+    }
+    let sent = ""
+    let n = first ? 0 : 1
+    for (const e of evs) {
+      if (sink.cancelled) break
+      if (n > 0) await sleep(pace)
+      sink.write(e)
+      sent += e
+      n += 1
+    }
+    return sent
   }
 
   // A streamed answer that is built whole (not sent as it arrives) goes through the same guards, so what is
@@ -1686,6 +1724,9 @@ export class Engine {
             }
             // the tool names the client was sent, for the log row (a binary stream has none)
             const sentNames = new ToolNameStream()
+            // whether any event has gone to the client (replay pacing starts after the first)
+            let wrote = false
+            let failed = false
             try {
               let chunkIndex = 0
               let lastAt = started
@@ -1705,7 +1746,14 @@ export class Engine {
                 if (v !== undefined) {
                   if (keepRaw && rawBytes.length < RAW_CAP) for (const b of v) rawBytes.push(b)
                   const out = conv.guarded(conv.push(v), false)
+                  const rep = conv.replay()
+                  if (rep.length > 0) {
+                    const sentRep = await this.sendPaced(sink, rep, this.replayPace(), !wrote)
+                    wrote = true
+                    if (this.logStore !== undefined) sentNames.push(sentRep)
+                  }
                   if (out !== "") {
+                    wrote = true
                     const at = performance.now()
                     metrics.observeStreamChunk(tl, chunkIndex, (at - lastAt) / 1000.0)
                     chunkIndex += 1
@@ -1721,10 +1769,17 @@ export class Engine {
             } catch (e) {
               // a binary stream just ends: a text error would corrupt its frames
               // (a client that cancelled is owed no error event)
+              failed = true
               if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
             }
             if (keepRaw) ctx.rawResponse = rawText(rawBytes)
             const tail = conv.guarded(conv.end(), true)
+            // a held answer that passed goes out now, paced; one cut by an upstream failure is dropped
+            const repEnd = conv.replay()
+            if (repEnd.length > 0 && !failed) {
+              const sentRep = await this.sendPaced(sink, repEnd, this.replayPace(), !wrote)
+              if (this.logStore !== undefined) sentNames.push(sentRep)
+            }
             if (tail !== "") {
               sink.write(tail)
               if (this.logStore !== undefined) sentNames.push(tail)
@@ -3427,7 +3482,7 @@ export class Engine {
     // the output guards (local rules and the built-in guard) check the stream as it accumulates (guard_stream.tov)
     const jsonOn = stream && this.jsonStreamOn
     const guardedConv = (c: StreamConverter): StreamConverter => {
-      if (stream) c.guard = this.streamGuard("chat", guardOn)
+      if (stream) c.guard = this.streamGuard("chat", guardOn, true)
       if (jsonOn) c.jsonFix = new JsonStreamFixer()
       return c
     }
@@ -3521,7 +3576,7 @@ export class Engine {
       if (!streamable(t)) return undefined
       const conv = new StreamConverter(converterKind(t), requested, wantUsage)
       conv.txt = cp.routeFor(t.provider, t.kind, t.model) === "chat"
-      if (stream) conv.guard = this.streamGuard("text", true)
+      if (stream) conv.guard = this.streamGuard("text", true, true)
       return conv
     }
     return try await this.serve(req, "completions", undefined, body, text, build, translate, stream, undefined, canPipe ? sink : undefined, mk, cp)
