@@ -17,36 +17,48 @@ start new work on a fresh branch from `main`.
 
 ## Where things stand
 
-- Waves 1 to 14 are merged on the branch above. Wave 14 (L103 to L120, L112a/b) closed every
-  row: done or partial with its "Open:" remainder written in LEDGER.md.
-- docs/parity.md counts 562 parity rows: done 374, partial 159, missing 5, out of scope 15,
-  n/a 9, plus 35 Raiju-only extras. `make parity-count` regenerates the Summary;
+- Waves 1 to 15 are merged on the branch above. Wave 14 (L103 to L120) and wave 15 (L121 to
+  L127, the owner's "build it the correct way" decisions) closed every row: done or partial with
+  its "Open:" remainder written in LEDGER.md.
+- docs/parity.md counts 563 parity rows: done 376, partial 161, missing 2, out of scope 15,
+  n/a 9, plus 36 Raiju-only extras. `make parity-count` regenerates the Summary;
   `python3 scripts/parity_count.py --check` fails when it is stale.
-- Tests at handoff: `make unit` 1,544 passed, 0 failed; e2e "all passed" on both servers (Bun
-  and http1); `make ui` all passed (about 160 browser checks); `make openapi-check` ok
-  (336 operations); `make web-check` up to date.
+- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,620 passed, 0 failed;
+  e2e "all passed" on both servers (Bun and http1); `make ui` all passed; `make openapi-check`
+  ok; `make web-check` up to date; `tov-patches/tests/run.sh` passed (including std/wasm 22,
+  std/rtc 20, fetch pool and HTTP/2 23, request body streams 55 checks).
+- The Tov runtime carries eight patches (`tov-patches/`): 0001 to 0004 as before, 0005 WAMR
+  (WASM plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2),
+  0008 streamed request bodies. 0005 to 0007 vendor C libraries (several MB each). They apply in
+  order only; `make tov` rebuilds the compiler (a few minutes; the first build of Raiju after it
+  compiles the vendored archives once).
 - Admin UI: SolidJS 2.0 RC in `web/` (Vite on Bun, types generated from the OpenAPI spec),
   embedded in the binary through the committed `src/ui_assets.tov` and served by
   `src/uiserve.tov`; `RAIJU_UI_DIR` serves a directory instead. Building the gateway needs no
-  Node or Bun; changing the UI does (`make web`, then commit). `clients/` (gpui and Slint
-  spikes) is parked. The live feed is cluster-wide and resumable (L119).
+  Node or Bun; changing the UI does (`make web`, then commit). The live feed is cluster-wide and
+  resumable (L119).
+- WebRTC live sessions terminate in Raiju (L122): set `RAIJU_WEBRTC_BIND` to bind the media
+  sockets to one address and `RAIJU_WEBRTC_ICE_SERVERS` for STUN/TURN behind NAT; a session stays
+  on the node that took it.
 
 ## What's next
 
-No row is queued. The remainders are the "Open:" notes in LEDGER.md (L103 to L120) and the 5
-"missing" rows of docs/parity.md (dynamic plugins, `large_payload_optimization`,
-`retain_content_in_object_storage`, MCP `max_instructions_length`, the agent CLI headers
-`x-bf-agent-vk-id` / `x-bf-agent-auth`). The larger ones:
+No row is queued. The remainders are the "Open:" notes in LEDGER.md and the 2 "missing" rows
+of docs/parity.md (MCP `max_instructions_length`; the agent CLI headers `x-bf-agent-vk-id` /
+`x-bf-agent-auth`). The larger ones:
 
+- Live sessions cost 0 (no per-second audio price in the datasheet); the WebSocket live path and
+  the /v1/realtime SDP calls are still unmetered relays (L122).
+- Large payloads stream for chat, completions and embeddings to OpenAI-format providers only;
+  streamed requests count 0 tokens for budgets (L124).
+- WASM plugins cover non-streaming chat (the HTTP transport hooks are not called) (L121).
 - Streams: Bifrost holds and replays live block-capable streams; Raiju cuts them (G43).
-- WebRTC create is a pass-through with no gateway peer, so media and events after the create
-  are not metered or guarded (G40, L108).
-- MCP: token_exchange clients are not connected at runtime (L112b); code mode lacks while,
-  try, lambda and is not on the Responses API (L117); A2A lacks REST/gRPC bindings, push and
-  upstream OAuth (L116).
+- MCP: token_exchange clients are not connected at runtime (L112b); code mode lacks while, try,
+  lambda and the Responses API (L117); A2A lacks REST/gRPC bindings, push and upstream OAuth (L116).
 - UI: dashboard charts, MCP OAuth consent screens, virtual MCP and tool group editors,
   role-aware hiding of actions (L113).
-- Identity-aware proxy in full mode does not consult governance for disabled users (L120).
+- Upstream: the Tov patches (and the two compiler bugs found, in tov-patches/README.md) could be
+  offered to Tov; only 0001 to 0004 have upstream format-patches.
 
 ## Owner decisions after wave 14 (2026-10-17)
 
@@ -130,6 +142,18 @@ The open questions from the last handoff are answered:
 - **Generated UI files.** When the OpenAPI spec changes, run `make web` and commit
   `web/src/api/schema.d.ts` (and `src/ui_assets.tov` if the bundle changed); `make web-check`
   fails otherwise.
+- **Tov runtime patches written in parallel collide.** Each worker writes its patch against
+  0001 to 0004, so later ones conflict in the compiler's shared lists (check/builtins.rs,
+  codegen/mod.rs, driver.rs STD_MODULES, tov.h, build.rs library list, tls_flags.rs includes).
+  Rebase: in a Tov clone commit 0001-0004 as one base and the earlier patches as another, apply
+  the new patch on the first base, cherry-pick it onto the second, keep both sides, then
+  `git diff` the result as the new patch and prove the whole set applies from a clean checkout.
+- **Verify a runtime patch with its own compiler.** Build a compiler inside the scratch worktree
+  (copy build/tov there and run scripts/build-tov.sh, about 2 minutes incrementally) and run
+  every check with it; rebuild the shared compiler only after the merge.
+- **Workers' cleanup can kill your runs.** A worker's `pkill` matched the lead's e2e gateways and
+  cut an http1 run short ("connection refused" mid-run). Rerun before blaming the code; tell
+  workers to kill only processes they started.
 - **After a container restart**, worker reports that were not delivered are in
   `~/.claude/projects/-home-user-raiju/<session>/subagents/agent-<id>.jsonl`: search the
   strings for the "FILES:" report.
