@@ -335,11 +335,11 @@ fast-forwarding their worktree to the branch tip.
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L128 | G40 | Realtime metered everywhere: the WebSocket live path and the /v1/realtime SDP calls go through src/webrtc.tov's LiveCore (governance windows, guards, logs); live and realtime cost billed from usage with Bifrost's audio and text token rates | worker | todo |
-| L129 | G48 | Large payloads beyond chat: Responses, Anthropic Messages and multipart uploads stream; usage parsed from passed-through answers so budgets and cost count streamed large requests | worker | todo |
-| L130 | (e) | Plugin chain as Bifrost runs it: HTTP transport hooks (http_pre_hook, http_post_hook, http_stream_chunk_hook, intercept) and the chain on streamed and non-chat routes, for compiled-in and WASM plugins | worker | todo |
-| L131 | G43 | Hold-and-replay of live block-capable streams (stream_replay_event_interval_ms): output held until the guards pass, then replayed paced, as Bifrost does | worker | todo |
-| L132 | UI | Admin UI: dashboard charts (log histograms and rankings), MCP OAuth consent screens, virtual MCP and tool group editors, role-aware actions | worker | todo |
-| L133 | G22, (g) | MCP: token_exchange clients connected at runtime; code mode gains while, try/except, lambda and f-strings and is offered on the Responses API and POST /mcp | worker | todo |
+| L128 | G40 | Realtime metered everywhere: the WebSocket live path and the /v1/realtime SDP calls go through src/webrtc.tov's LiveCore (governance windows, guards, logs); live and realtime cost billed from usage with Bifrost's audio and text token rates | worker | assigned |
+| L129 | G48 | Large payloads beyond chat: Responses, Anthropic Messages and multipart uploads stream; usage parsed from passed-through answers so budgets and cost count streamed large requests | worker | assigned |
+| L130 | (e) | Plugin chain as Bifrost runs it: HTTP transport hooks (http_pre_hook, http_post_hook, http_stream_chunk_hook, intercept) and the chain on streamed and non-chat routes, for compiled-in and WASM plugins | worker | assigned |
+| L131 | G43 | Hold-and-replay of live block-capable streams (stream_replay_event_interval_ms): output held until the guards pass, then replayed paced, as Bifrost does | worker | assigned |
+| L132 | UI | Admin UI: dashboard charts (log histograms and rankings), MCP OAuth consent screens, virtual MCP and tool group editors, role-aware actions | worker | assigned |
+| L133 | G22, (g) | MCP: token_exchange clients connected at runtime; code mode gains while, try/except, lambda and f-strings and is offered on the Responses API and POST /mcp | worker | assigned |
 | L134 | (g), (b) | A2A REST binding, push notifications, tasks/resubscribe, upstream OAuth and the aggregated card; the last two missing parity rows (MCP max_instructions_length, x-bf-agent-vk-id and x-bf-agent-auth) | worker | todo |
 
