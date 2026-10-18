@@ -3466,7 +3466,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Verify a token exchange for a token_exchange client (400 for other types). The body names the identity-provider token; it is exchanged, the server is dialed with the result, and nothing is saved. */
+        /** Verify a token exchange for a token_exchange client (400 for other types). The body names the identity-provider token; it is exchanged, the server is dialed with the result, and the exchanged token is kept as the client's admin credential (its tools are listed with it from then on). */
         post: operations["postApiMcpClientNameVerifyExchange"];
         delete?: never;
         options?: never;
@@ -21568,7 +21568,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The exchange and the server check passed. tools_count is the number of tools the server listed. */
+            /** @description The exchange and the server check passed, and the exchanged token is kept as the admin credential. tools_count is the number of tools the server listed. */
             200: {
                 headers: {
                     [name: string]: unknown;

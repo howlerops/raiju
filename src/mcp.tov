@@ -92,6 +92,9 @@ export type McpConfig = {
   header_flows?: McpHeaderFlow[],
   // the tokens each caller obtained for the per_user_oauth clients (src/mcpuser.tov); sealed at rest
   user_tokens?: McpUserToken[],
+  // the admin discovery credential of each token_exchange client, kept by its verification (verify-exchange):
+  // the tools are listed with it, as Bifrost's admin bootstrap token does. Sealed at rest, never returned.
+  exchange_admin?: McpUserToken[],
   // code mode: "server" (one stub file per server, the default) or "tool" (one per tool), and the run limits
   code_mode_binding_level?: string,
   code_mode_limits?: CodeLimitsIn,
@@ -122,6 +125,17 @@ export function tokenExchangeNames(list: McpClientConfig[] | undefined): string[
     if (c.auth_type === "token_exchange") out.push(c.name)
   }
   return out
+}
+
+// The admin discovery credential a token_exchange client was verified with (undefined when none is kept).
+// An expired credential reads as none: the client waits for a new verification. nowMs is epoch milliseconds.
+export function adminTokenOf(list: McpUserToken[] | undefined, client: string, nowMs: f64): string {
+  for (const r of list ?? []) {
+    if (r.mcp_client_name !== client) continue
+    if (r.token_expires_at > 0.0 && r.token_expires_at <= nowMs) return ""
+    return r.access_token
+  }
+  return ""
 }
 
 // The names of the clients whose auth_type is per_user_headers.
@@ -661,6 +675,8 @@ export class McpSession {
 
   // the config this session runs with; follow() swaps in a changed tool policy for a kept stdio process
   cfg: McpClientConfig
+  // a token_exchange client's admin discovery credential: its tools are listed with it (see adminTokenOf)
+  adminToken = ""
 
   // timeoutMs bounds each tool call unless the client has its own tool_execution_timeout.
   constructor(cfg: McpClientConfig, timeoutMs?: int, allowList?: string[]) {
@@ -711,6 +727,7 @@ export class McpSession {
       const bearer = this.tokens.header(this.cfg.name, Date.now())
       if (bearer !== undefined) h.set("authorization", bearer)
     }
+    if (this.cfg.auth_type === "token_exchange" && this.adminToken !== "") h.set("authorization", "Bearer " + this.adminToken)
     h.set("content-type", "application/json")
     h.set("accept", "application/json, text/event-stream")
     if (this.sessionId !== "") h.set("mcp-session-id", this.sessionId)
@@ -842,6 +859,11 @@ export class McpSession {
     this.version = ""
     if (this.cfg.disabled === true) {
       this.lastError = "disabled"
+      return
+    }
+    // a token_exchange client lists its tools with the admin credential its verification kept; without one it waits
+    if (this.cfg.auth_type === "token_exchange" && this.adminToken === "") {
+      this.lastError = "awaiting verification: the admin credential of this token_exchange client is missing or expired; verify it with POST /api/mcp/client/{id}/verify-exchange"
       return
     }
     try {
@@ -1171,7 +1193,7 @@ export class McpManager {
             s.applyPolicy()
           }
           kept = s
-        } else if (JSON.stringify(s.cfg) === JSON.stringify(n.cfg)) {
+        } else if (JSON.stringify(s.cfg) === JSON.stringify(n.cfg) && s.adminToken === n.adminToken) {
           kept = s
         }
       }
@@ -1195,7 +1217,12 @@ export class McpManager {
     const list = cfg.client_configs ?? []
     this.allow = cfg.oauth_private_allowlist ?? []
     this.defaultSyncSecs = syncSeconds(cfg.tool_sync_interval)
-    this.sessions = list.map((c) => new McpSession(c, ms, this.allow))
+    const admin = cfg.exchange_admin
+    this.sessions = list.map((c) => {
+      const s = new McpSession(c, ms, this.allow)
+      s.adminToken = adminTokenOf(admin, c.name, Date.now())
+      return s
+    })
   }
 
   // Connects every HTTP server. A server that fails is recorded in status(), not thrown.
@@ -1610,6 +1637,30 @@ test("a config change keeps unchanged HTTP clients with their tools and replaces
   expect(m.sessions[0]! === oldA).toBe(true)
   expect(m.sessions[0]!.tools.length).toBe(1)
   expect(m.sessions[1]!.cfg.connection_string).toBe("http://127.0.0.1:3/mcp")
+})
+
+test("a token_exchange client lists with its retained admin credential, and a new one replaces the session", () => {
+  const te: McpClientConfig = { name: "jira", connection_type: "http", connection_string: "http://127.0.0.1:1/mcp", auth_type: "token_exchange", token_exchange: { audience: "api://jira", client_id: "exch" } }
+  const row: McpUserToken = { id: "ex1", mcp_client_name: "jira", virtual_key_id: "", session_id: "", access_token: "admin-tok", refresh_token: "", token_expires_at: 0.0, scopes: [], created_at: 1.0, last_refreshed_at: 1.0 }
+  // no credential: the client waits for verification
+  expect(adminTokenOf(undefined, "jira", 1000.0)).toBe("")
+  expect(adminTokenOf([row], "other", 1000.0)).toBe("")
+  expect(adminTokenOf([row], "jira", 1000.0)).toBe("admin-tok")
+  // an expired credential reads as none
+  const old: McpUserToken = { id: "ex1", mcp_client_name: "jira", virtual_key_id: "", session_id: "", access_token: "admin-tok", refresh_token: "", token_expires_at: 500.0, scopes: [], created_at: 1.0, last_refreshed_at: 1.0 }
+  expect(adminTokenOf([old], "jira", 1000.0)).toBe("")
+  const m = new McpManager({ client_configs: [te] })
+  expect(m.sessions[0]!.adminToken).toBe("")
+  const verified = new McpManager({ client_configs: [te], exchange_admin: [row] })
+  expect(verified.sessions[0]!.adminToken).toBe("admin-tok")
+  // a verification that lands on a running client replaces its session, so it connects
+  m.follow(verified.sessions)
+  expect(m.sessions[0]! === verified.sessions[0]!).toBe(true)
+  expect(m.sessions[0]!.adminToken).toBe("admin-tok")
+  // an unchanged credential keeps the running session
+  const again = new McpManager({ client_configs: [te], exchange_admin: [row] })
+  m.follow(again.sessions)
+  expect(m.sessions[0]! === verified.sessions[0]!).toBe(true)
 })
 
 test("per-client durations and virtual key allow-lists", () => {

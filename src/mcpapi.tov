@@ -631,9 +631,15 @@ function updateClient(store: ConfigStore, id: string, body: string, publicOnly: 
     c.token_exchange = b.token_exchange
   }
 
+  // a changed token exchange (its audience, client or identity provider) needs a new verification: the admin credential goes
+  const exchangeChanged = JSON.stringify(list[at]!.token_exchange) !== JSON.stringify(c.token_exchange) || list[at]!.auth_type !== c.auth_type
   let next: McpClientConfig[] = list
   next[at] = c
-  const err = persist(store, withClients(store.cfg, next))
+  let cfgNext = withClients(store.cfg, next)
+  if (exchangeChanged) {
+    cfgNext = withExchangeAdmin(cfgNext, exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], c.name))
+  }
+  const err = persist(store, cfgNext)
   if (err !== undefined) return err
   return reply(200, clientJson(c))
 }
@@ -645,7 +651,7 @@ function deleteClient(store: ConfigStore, id: string): McpReply {
   for (const c of list) {
     if (c.name !== id) next.push(c)
   }
-  const err = persist(store, withClients(store.cfg, next))
+  const err = persist(store, withExchangeAdmin(withClients(store.cfg, next), exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], id)))
   if (err !== undefined) return err
   return reply(200, `{"status":"success","message":"MCP client removed successfully"}`)
 }
@@ -800,10 +806,12 @@ function credentialIndex(list: McpUserCredential[], client: string, vk: string):
 
 // Connects to a per_user_headers client with these header values and reports the tools it lists, or why it
 // could not connect. The client is a copy: nothing is saved here.
-async function dialWith(cfg: McpClientConfig, headers: Map<string, string>, allow: string[]): Promise<{ ok: bool, tools: int, error: string }> {
+async function dialWith(cfg: McpClientConfig, headers: Map<string, string>, allow: string[], admin?: string): Promise<{ ok: bool, tools: int, error: string }> {
   let c = cfg
   c.headers = headers
   const s = new McpSession(c, CONNECT_MS, allow)
+  // a token_exchange client connects with its admin credential; a verification passes the token it has just exchanged
+  s.adminToken = admin ?? ""
   await s.connect()
   return { ok: s.connected, tools: s.tools.length, error: s.lastError }
 }
@@ -1010,9 +1018,29 @@ export async function headersRouteAsync(store: ConfigStore, method: string, path
   return undefined
 }
 
+// The config with the admin discovery credentials of the token_exchange clients set.
+function withExchangeAdmin(c: Config, list: McpUserToken[]): Config {
+  let n = c
+  let m: McpConfig = n.mcp ?? {}
+  m.exchange_admin = list
+  n.mcp = m
+  return n
+}
+
+// The admin credentials without the one of client.
+function exchangeAdminWithout(list: McpUserToken[], client: string): McpUserToken[] {
+  const out: McpUserToken[] = []
+  for (const r of list) {
+    if (r.mcp_client_name !== client) out.push(r)
+  }
+  return out
+}
+
 // POST /api/mcp/client/{id}/verify-exchange for a token_exchange client. The body names the identity-provider
-// token to check the exchange with (subject_token): it is exchanged for one scoped to the audience, the server
-// is dialed with the result, and the tools it lists are counted. Nothing is saved, and the token is not kept.
+// token to check the exchange with (subject_token): it is exchanged for one scoped to the audience, and the
+// server is dialed with the result, which must list tools. The exchanged token is then kept as the client's
+// admin credential (Bifrost's retained admin token): the client's tools are listed with it from then on, and
+// the caller's own tokens are exchanged per call as before.
 async function verifyExchange(store: ConfigStore, idp: IdpEndpoints, client: McpClientConfig, body: string): Promise<McpReply> {
   let parsed: { subject_token?: string } = {}
   try {
@@ -1029,8 +1057,14 @@ async function verifyExchange(store: ConfigStore, idp: IdpEndpoints, client: Mcp
   if (r.error !== "") return fail(422, `Admin credential exchange failed: ${r.error}`)
   const hs: Map<string, string> = new Map()
   hs.set("authorization", "Bearer " + r.token)
-  const v = await dialWith(client, hs, store.cfg.mcp?.oauth_private_allowlist ?? [])
+  const v = await dialWith(client, hs, store.cfg.mcp?.oauth_private_allowlist ?? [], r.token)
   if (!v.ok) return fail(422, `Verification failed: ${v.error}`)
+  const now = Date.now()
+  const row: McpUserToken = { id: "exchange-" + client.name, mcp_client_name: client.name, virtual_key_id: "", session_id: "", access_token: r.token, refresh_token: "", token_expires_at: r.expiresIn > 0.0 ? now + r.expiresIn * 1000.0 : 0.0, scopes: [], created_at: now, last_refreshed_at: now }
+  const kept = exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], client.name)
+  kept.push(row)
+  const err = persist(store, withExchangeAdmin(store.cfg, kept))
+  if (err !== undefined) return err
   return { status: 200, body: `{"status":"success","message":${quote(`Token exchange verified. ${v.tools} tools discovered.`)},"tools_count":${v.tools}}` }
 }
 

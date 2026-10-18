@@ -4503,6 +4503,110 @@ def l112b_exchange_e2e(env):
         stub.shutdown()
         stub.server_close()
 
+def l133_find_named(obj, name):
+    """The first object of a JSON tree whose name is name, or None."""
+    if isinstance(obj, dict):
+        if obj.get("name") == name:
+            return obj
+        for v in obj.values():
+            r = l133_find_named(v, name)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = l133_find_named(v, name)
+            if r is not None:
+                return r
+    return None
+
+def l133_e2e(env):
+    """L133: a token_exchange client that verification has retained lists its tools with the admin credential and
+    connects without a prior connect; each caller's call goes out with the token exchanged for its own subject, cached
+    per caller; POST /mcp lists the code mode meta-tools and runs executeToolCode; a Responses request runs a code
+    mode program (a lambda and a while loop) through the code mode path. The token endpoint is a stub on 18145 and
+    the gateway is 18208."""
+    import urllib.parse
+    sts_seen = []
+    issued = [0]
+    def sts(method, path, headers, body):
+        if path != "/token":
+            return 404, "{}", "application/json"
+        form = urllib.parse.parse_qs(body)
+        sts_seen.append(body)
+        def one(k):
+            return (form.get(k) or [""])[0]
+        if one("client_id") != "exch-client" or one("client_secret") != "exch-secret" or one("audience") != "api://jira":
+            return 401, json.dumps({"error": "invalid_client"}), "application/json"
+        subject = one("subject_token")
+        if not subject.startswith("idp-"):
+            return 400, json.dumps({"error": "invalid_grant", "error_description": "subject token not recognised"}), "application/json"
+        issued[0] += 1
+        return 200, json.dumps({"access_token": "exch-%d" % issued[0], "token_type": "Bearer", "expires_in": 3600}), "application/json"
+    stub = serve(18145, sts)
+    cfg_path = os.path.join(BUILD, "e2e.l133.json")
+    exch = {"audience": "api://jira", "client_id": "exch-client", "client_secret": "exch-secret", "scopes": ["read"], "authorization_server_url": "http://127.0.0.1:18145/token"}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-l133", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"tool_sync_interval": "1h", "oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
+            {"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp", "is_code_mode_client": True, "tools_to_auto_execute": ["get_weather"]},
+            {"name": "jira", "connection_type": "http", "connection_string": MOCK + "/mcp-exchange", "auth_type": "token_exchange", "token_exchange": exch},
+        ]},
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    base = "http://127.0.0.1:18208"
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18208", "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.l133.log"), "w"))
+    def req(method, p, body=None, headers=None):
+        return call(method, p, body, headers, base=base, auth=False)
+    def mcp_status():
+        _, _, b = req("GET", "/api/mcp")
+        return b, l133_find_named(json.loads(b), "jira") or {}
+    try:
+        wait(base + "/health")
+        b, jira = mcp_status()
+        check("token exchange: a client without a retained admin credential waits for verification", jira.get("connected") is False and "awaiting verification" in str(jira.get("error", "")), b[:400])
+        s, _, b = req("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-alice.p.s"})
+        check("token exchange: verification keeps the exchanged token as the admin credential", s == 200 and json.loads(b)["tools_count"] >= 1, (s, b[:300]))
+        connected = False
+        for _ in range(120):
+            b, jira = mcp_status()
+            if jira.get("connected") is True:
+                connected = True
+                break
+            time.sleep(0.25)
+        check("token exchange: the client connects after verification, with no prior connect", connected and int(jira.get("tools", 0)) >= 1, b[:400])
+        n0 = len(sts_seen)
+        s, _, b = req("POST", "/v1/mcp/tool/execute", l117_tool("jira-get_weather", {"city": "Oslo"}), {"authorization": "Bearer idp-alice.p.s"})
+        check("token exchange: alice's call runs with the token exchanged for her subject", s == 200 and "Sunny in Oslo" in b and len(sts_seen) == n0 + 1 and "subject_token=idp-alice.p.s" in sts_seen[-1], (s, b[:300]))
+        s, _, b = req("POST", "/v1/mcp/tool/execute", l117_tool("jira-get_weather", {"city": "Bergen"}), {"authorization": "Bearer idp-bob.p.s"})
+        check("token exchange: bob's call exchanges bob's own token", s == 200 and "Sunny in" in b and len(sts_seen) == n0 + 2 and "subject_token=idp-bob.p.s" in sts_seen[-1], (s, b[:300]))
+        s, _, b = req("POST", "/v1/mcp/tool/execute", l117_tool("jira-get_weather", {"city": "Oslo"}), {"authorization": "Bearer idp-alice.p.s"})
+        check("token exchange: a caller's exchanged token is cached until it expires", "Sunny in Oslo" in b and len(sts_seen) == n0 + 2, (s, b[:300]))
+        s, _, b = req("POST", "/v1/mcp/tool/execute", l117_tool("jira-get_weather", {"city": "Oslo"}))
+        check("token exchange: a call without the caller's token is refused", "exchanges the caller's identity-provider token" in b, (s, b[:300]))
+
+        s, h, b = req("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-l133", "version": "1"}}})
+        sid = h.get("mcp-session-id", "")
+        _, _, b = req("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {"mcp-session-id": sid})
+        names = [t.get("name") for t in json.loads(b)["result"]["tools"]]
+        check("code mode on POST /mcp: the four meta-tools are listed beside the other tools", all(n in names for n in ["listToolFiles", "readToolFile", "getToolDocs", "executeToolCode"]) and "jira-get_weather" in names and "weather-get_weather" not in names, names)
+        _, _, b = req("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "executeToolCode", "arguments": {"code": 'result = weather.get_weather(city = "Oslo")'}}}, {"mcp-session-id": sid})
+        check("code mode on POST /mcp: executeToolCode runs its program", "Sunny in Oslo" in b and "Return value" in b, b[:400])
+
+        s, _, b = req("POST", "/v1/responses", {"model": "openai/codeagent-1", "input": "weather in Oslo?"})
+        check("code mode on /v1/responses: the program answers the request", s == 200 and "sunny in Oslo" in b, (s, b[:400]))
+        offered = [x for x in seen() if x["path"] == "/v1/chat/completions" and "codeagent-1" in x["body"] and "executeToolCode" in x["body"]]
+        check("code mode on /v1/responses: the four meta-tools go upstream with the request", len(offered) > 0 and "listToolFiles" in offered[-1]["body"], str(len(offered)))
+        s, h, b = req("POST", "/v1/responses", {"model": "openai/codeagent-1", "input": "weather in Oslo?", "stream": True})
+        hl = {k.lower(): v for k, v in h.items()}
+        check("code mode on /v1/responses: a streamed request is answered as a stream", s == 200 and "sunny in Oslo" in b and "text/event-stream" in hl.get("content-type", ""), (s, b[:300]))
+    finally:
+        gw.terminate()
+        gw.wait()
+        stub.shutdown()
+        stub.server_close()
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -7854,6 +7958,8 @@ def main():
         l112b_e2e(env)
         # MCP token exchange: the exchange configuration, verify-exchange against a token endpoint stub and an MCP server that takes only its tokens: their own gateway
         l112b_exchange_e2e(env)
+        # MCP token exchange at runtime (the retained admin credential lists the tools, each caller's own token is exchanged per call) and code mode on the Responses API and POST /mcp: their own gateway
+        l133_e2e(env)
         # WebAssembly plugins (a .wasm path in plugins[]): rewrites, short circuits, traps, limits and the plugin API: their own gateway
         l121_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways

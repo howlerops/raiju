@@ -1,5 +1,5 @@
 // The runner of MCP code mode: a subset of Starlark, the Python dialect Bifrost's executeToolCode
-// runs. Programs have no classes, imports, exceptions or while loops, and no host access except the
+// runs. Programs have no classes, imports or exceptions, and no host access except the
 // code mode servers, which are globals: server.tool(param=value). There is no clock, randomness, file
 // or network access, so a run is deterministic.
 //
@@ -48,7 +48,8 @@ const MAX_EXPR_DEPTH = 400
 const MAX_CLAUSES = 20
 const MAX_SAFE = 9007199254740992.0
 const KEYWORDS: string[] = ["and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield", "None", "True", "False"]
-const UNSUPPORTED: string[] = ["as", "assert", "async", "await", "class", "del", "except", "finally", "from", "global", "import", "lambda", "nonlocal", "raise", "try", "while", "with", "yield", "is"]
+// while and lambda are in Bifrost's dialect (canonical Starlark with the while option); try, raise and f-strings are not
+const UNSUPPORTED: string[] = ["as", "assert", "async", "await", "class", "del", "except", "finally", "from", "global", "import", "nonlocal", "raise", "try", "with", "yield", "is"]
 const AUG_OPS: string[] = ["+=", "-=", "*=", "/=", "//=", "%="]
 const CMP_OPS: string[] = ["==", "!=", "<", "<=", ">", ">="]
 const BUILTINS: string[] = ["print", "len", "range", "enumerate", "zip", "sorted", "reversed", "min", "max", "int", "float", "str", "repr", "bool", "list", "tuple", "dict", "chr", "ord", "any", "all"]
@@ -448,6 +449,10 @@ class Parser {
         const n = try this.forStmt()
         return [n]
       }
+      if (t.s === "while") {
+        const n = try this.whileStmt()
+        return [n]
+      }
       if (t.s === "def") {
         const n = try this.defStmt()
         return [n]
@@ -548,6 +553,18 @@ class Parser {
     return n
   }
 
+  whileStmt(): Node throws SyntaxError {
+    const line = this.cur().line
+    this.adv()
+    const c = try this.test()
+    try this.needOp(":")
+    const body = try this.suite()
+    const n = nd("while", line)
+    n.args.push(c)
+    n.args.push(body)
+    return n
+  }
+
   forStmt(): Node throws SyntaxError {
     const line = this.cur().line
     this.adv()
@@ -589,6 +606,34 @@ class Parser {
     try this.needOp(":")
     const body = try this.suite()
     n.body = body.body
+    return n
+  }
+
+  // lambda x, y=1: expr. It is a def whose body returns the expression, so it runs as a function does.
+  lambdaExpr(): Node throws SyntaxError {
+    const line = this.cur().line
+    this.adv()
+    const n = nd("lambda", line)
+    n.s = "lambda"
+    let sawDefault = false
+    while (!this.isOp(":")) {
+      const pn = try this.name()
+      if (n.names.includes(pn)) throw syntaxAt(line, `duplicate parameter ${pn}`)
+      n.names.push(pn)
+      if (this.eatOp("=")) {
+        sawDefault = true
+        const d = try this.test()
+        n.args.push(d)
+      } else {
+        if (sawDefault) throw syntaxAt(line, "non-default parameter follows a default parameter")
+        n.args.push(nd("absent", line))
+      }
+      if (!this.eatOp(",")) break
+    }
+    try this.needOp(":")
+    const r = nd("return", line)
+    r.args.push(try this.test())
+    n.body = [r]
     return n
   }
 
@@ -649,6 +694,7 @@ class Parser {
   }
 
   test(): Node throws SyntaxError {
+    if (this.isKw("lambda")) return try this.lambdaExpr()
     const e = try this.orTest()
     if (this.isKw("if")) {
       this.adv()
@@ -1325,6 +1371,7 @@ class Machine {
         if (n.s === "False") return vbool(false)
         return none()
       case "name": return try this.lookup(n.s, fr)
+      case "lambda": return try this.makeFunc(n, fr)
       case "list":
       case "tuple": {
         const items: Val[] = []
@@ -1514,17 +1561,18 @@ class Machine {
         }
         return 0
       }
-      case "def": {
-        const defaults: Val[] = []
-        for (const d of n.args) {
-          if (d.kind === "absent") defaults.push(absentVal())
-          else defaults.push(try this.ev(d, fr))
+      case "while": {
+        while (true) {
+          const c = try this.ev(n.args[0]!, fr)
+          if (!this.truthy(c)) break
+          const sig = try this.exec(n.args[1]!, fr)
+          if (sig === 1) break
+          if (sig === 3) return 3
         }
-        const ob = new Obj()
-        ob.items = defaults
-        try this.charge(64 + 16 * defaults.length)
-        this.funcs.push(n)
-        const fv = val("func", this.funcs.length - 1, 0.0, n.s, "", this.newObj(ob))
+        return 0
+      }
+      case "def": {
+        const fv = try this.makeFunc(n, fr)
         this.setName(fr, n.s, fv)
         return 0
       }
@@ -1543,6 +1591,20 @@ class Machine {
       default:
         throw new Error(`unsupported statement ${n.kind}`)
     }
+  }
+
+  // The function value of a def or lambda node: its defaults are evaluated now, as Python does.
+  makeFunc(n: Node, fr: Frame): Val throws Error {
+    const defaults: Val[] = []
+    for (const d of n.args) {
+      if (d.kind === "absent") defaults.push(absentVal())
+      else defaults.push(try this.ev(d, fr))
+    }
+    const ob = new Obj()
+    ob.items = defaults
+    try this.charge(64 + 16 * defaults.length)
+    this.funcs.push(n)
+    return val("func", this.funcs.length - 1, 0.0, n.s, "", this.newObj(ob))
   }
 
   execBlock(stmts: Node[], fr: Frame): int throws Error {
@@ -2499,8 +2561,29 @@ test("functions, control flow and the output log", () => {
   }
   expect(resultOf("x = 1\nresult = undefined_name")).toBe("error: name 'undefined_name' is not defined")
   expect(resultOf("result = 1 +")).toBe("error: syntax: line 1: unexpected end of line")
-  expect(resultOf("while True:\n    pass")).toBe("error: syntax: line 1: 'while' is not supported in this runtime")
+  // f-strings are not in Bifrost's dialect: the f is a name, and the string after it is a syntax error
+  expect(resultOf("x = 1\nresult = f\"{x}\"").includes("error: syntax")).toBe(true)
   expect(resultOf("if True:\n  x = 1\n    y = 2")).toBe("error: syntax: line 3: unexpected indent")
+})
+
+test("while loops run until their condition fails, with break and continue, and stop at the step limit", () => {
+  expect(resultOf("t = 0\nwhile t < 5:\n    t += 1\nresult = t")).toBe("5")
+  expect(resultOf("n = 0\nwhile True:\n    n += 1\n    if n == 3:\n        break\nresult = n")).toBe("3")
+  expect(resultOf("t = 0\ni = 0\nwhile i < 5:\n    i += 1\n    if i == 2:\n        continue\n    t += i\nresult = t")).toBe("13")
+  expect(resultOf("def f(n):\n    s = 0\n    while n > 0:\n        s += n\n        n -= 1\n    return s\nresult = f(4)")).toBe("10")
+  expect(resultOf("while False:\n    pass\nresult = 'skipped'")).toBe("\"skipped\"")
+  const small = defaultCodeLimits()
+  small.max_steps = 200
+  const r = runRound(parseOk("while True:\n    pass"), [], small, [], Date.now() + 60000.0, 0, 0)
+  expect(r.kind).toBe("done")
+  if (r.kind === "done") expect(r.errMsg).toBe("step limit exceeded (max_steps 200)")
+})
+
+test("lambda makes a function with defaults, as def does", () => {
+  expect(resultOf("f = lambda x, y=2: x * y\nresult = [f(3), f(3, 4), (lambda: 7)()]")).toBe("[6,12,7]")
+  expect(resultOf("g = lambda a, b: a - b\nresult = g(b=1, a=5)")).toBe("4")
+  expect(resultOf("result = (lambda x: x + 1)(41)")).toBe("42")
+  expect(resultOf("h = lambda x: x\nresult = h()")).toBe("error: lambda() is missing argument 'x'")
 })
 
 test("limits: steps, output size, memory and recursion", () => {
