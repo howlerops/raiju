@@ -328,3 +328,18 @@ builds its own compiler inside its worktree (scripts/build-tov.sh there) and nev
 | L126 | G48 | network_config keep_alive_timeout and max_conns_per_host, and upstream HTTP/2 (enforce_http2, http2_ping_interval) in the Tov fetch client (tov-patches/0007) | worker | done: tov-patches/0007 gives Tov fetch a per-origin pool (keep-alive timeout, connection cap with a FIFO queue) and upstream HTTP/2 over TLS on vendored nghttp2 1.64.0 (multiplexed streams, PING, GOAWAY and REFUSED_STREAM retry, fallback to HTTP/1.1); providers' network_config keep_alive_timeout_in_seconds, max_conns_per_host, enforce_http2 (offer h2 and fall back, as Bifrost's ForceAttemptHTTP2) and http2_ping_interval_in_seconds. Bifrost's defaults (30 s, 5000) now apply to every provider. Unit + e2e (l126_e2e) + 23 patch checks. Open: no h2c; pools per worker process |
 | L127 | G48 | The anthropic-beta header filter Bifrost has, then beta_header_overrides on top of it | worker | done: Bifrost's anthropic-beta filter table per provider and model (anthropic, Claude on vertex, bedrock, bedrock_mantle) on the gateway, batch and media paths, with network_config.beta_header_overrides by prefix (src/anthropic_beta.tov). /anthropic/v1/messages now forwards the caller's anthropic-beta through the filter, as Bifrost's integration does. Unit + e2e (l127_e2e). Open: raw passthrough stays unfiltered (as Bifrost); Bedrock body-side anthropic_beta; custom Anthropic-based providers are filtered (Bifrost allows all flags for them) |
 
+## Wave 16 (the open items after wave 15, built the correct way)
+
+Ports for new e2e gateways move to 18200-18299 (18100-18189 is full). Workers start by
+fast-forwarding their worktree to the branch tip.
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L128 | G40 | Realtime metered everywhere: the WebSocket live path and the /v1/realtime SDP calls go through src/webrtc.tov's LiveCore (governance windows, guards, logs); live and realtime cost billed from usage with Bifrost's audio and text token rates | worker | todo |
+| L129 | G48 | Large payloads beyond chat: Responses, Anthropic Messages and multipart uploads stream; usage parsed from passed-through answers so budgets and cost count streamed large requests | worker | todo |
+| L130 | (e) | Plugin chain as Bifrost runs it: HTTP transport hooks (http_pre_hook, http_post_hook, http_stream_chunk_hook, intercept) and the chain on streamed and non-chat routes, for compiled-in and WASM plugins | worker | todo |
+| L131 | G43 | Hold-and-replay of live block-capable streams (stream_replay_event_interval_ms): output held until the guards pass, then replayed paced, as Bifrost does | worker | todo |
+| L132 | UI | Admin UI: dashboard charts (log histograms and rankings), MCP OAuth consent screens, virtual MCP and tool group editors, role-aware actions | worker | todo |
+| L133 | G22, (g) | MCP: token_exchange clients connected at runtime; code mode gains while, try/except, lambda and f-strings and is offered on the Responses API and POST /mcp | worker | todo |
+| L134 | (g), (b) | A2A REST binding, push notifications, tasks/resubscribe, upstream OAuth and the aggregated card; the last two missing parity rows (MCP max_instructions_length, x-bf-agent-vk-id and x-bf-agent-auth) | worker | todo |
+
