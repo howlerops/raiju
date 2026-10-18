@@ -12,6 +12,10 @@ Paths:
   /slow       200 after 0.4 s (so concurrent requests overlap)
   /big?n=N    200 with an N-byte body (default 300000)
   /post       200, body = the request body, back
+  /upload     200 JSON {"n": body length, "ok": body is the bytes 0..250 repeating} (request bodies, patch 0008)
+  /slowup     as /upload, but the server does not read the body for 0.8 s first
+  /early      413 "too big" as soon as the request head is in, before the body (HTTP/1.1 closes after it; HTTP/2 resets the stream)
+  /redir307   307 to /echo?redirected
   /gzip       200, Content-Encoding: gzip
   /redir      302 to /echo?redirected
   /bye        200, then the server sends GOAWAY and closes the connection
@@ -28,7 +32,7 @@ import sys
 import time
 
 per_conn = []
-stats = {"conns": 0, "h2_conns": 0, "open": 0, "max_open": 0, "reqs": 0, "max_streams": 0, "pings": 0, "paths": []}
+stats = {"conns": 0, "h2_conns": 0, "open": 0, "max_open": 0, "reqs": 0, "max_streams": 0, "pings": 0, "paths": [], "chat_bytes": 0}
 
 
 def conn_opened():
@@ -57,6 +61,12 @@ def answer(method, path, body):
         return 200, "application/octet-stream", bytes(65 + (i * 7) % 26 for i in range(n)), 0, None
     if bare == "/post":
         return 200, "application/octet-stream", body, 0, None
+    if bare in ("/upload", "/slowup"):
+        pat = bytes(range(251))
+        ok = body == (pat * (len(body) // 251 + 1))[:len(body)]
+        return 200, "application/json", json.dumps({"n": len(body), "ok": ok}).encode(), 0, None
+    if bare == "/redir307":
+        return 307, "text/plain", b"", 0, "redir"
     if bare == "/gzip":
         import gzip
         return 200, "text/plain", gzip.compress(b"gzipped over the wire"), 0, "gzip"
@@ -65,6 +75,7 @@ def answer(method, path, body):
     if bare == "/bye":
         return 200, "text/plain", b"bye", 0, "bye"
     if bare == "/v1/chat/completions":
+        stats["chat_bytes"] = len(body)
         out = {
             "id": "chatcmpl-h2test", "object": "chat.completion", "created": 1700000000, "model": "gpt-h2",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello over h2"}, "finish_reason": "stop"}],
@@ -77,8 +88,9 @@ def answer(method, path, body):
 class H1(asyncio.Protocol):
     def connection_made(self, transport):
         self.t = transport
-        self.buf = b""
+        self.buf = bytearray()
         self.counted = False   # (a connection that only asks for /stats is not counted)
+        self.req = None        # the request whose body is being read (method, path, n: its Content-Length or -1 for chunked, body, state)
 
     def connection_lost(self, exc):
         if self.counted:
@@ -87,24 +99,76 @@ class H1(asyncio.Protocol):
     def data_received(self, data):
         self.buf += data
         while True:
-            end = self.buf.find(b"\r\n\r\n")
-            if end < 0:
-                return
-            head = self.buf[:end].decode("latin1").split("\r\n")
-            method, path, _ = head[0].split(" ", 2)
-            n = 0
-            for line in head[1:]:
-                k, _, v = line.partition(":")
-                if k.strip().lower() == "content-length":
-                    n = int(v.strip())
-            if len(self.buf) < end + 4 + n:
-                return
-            if not self.counted and path.split("?")[0] != "/stats":
-                self.counted = True
-                conn_opened()
-            body = self.buf[end + 4:end + 4 + n]
-            self.buf = self.buf[end + 4 + n:]
-            asyncio.ensure_future(self.reply(method, path, body))
+            if self.req is None:
+                end = self.buf.find(b"\r\n\r\n")
+                if end < 0:
+                    return
+                head = self.buf[:end].decode("latin1").split("\r\n")
+                del self.buf[:end + 4]
+                method, path, _ = head[0].split(" ", 2)
+                n = 0
+                for line in head[1:]:
+                    k, _, v = line.partition(":")
+                    if k.strip().lower() == "content-length":
+                        n = int(v.strip())
+                    if k.strip().lower() == "transfer-encoding" and v.strip().lower() == "chunked":
+                        n = -1
+                if not self.counted and path.split("?")[0] != "/stats":
+                    self.counted = True
+                    conn_opened()
+                bare = path.split("?")[0]
+                if bare == "/early":
+                    body = b"too big"
+                    self.t.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 7\r\nConnection: close\r\n\r\n" + body)
+                    self.t.close()
+                    return
+                if bare == "/slowup":
+                    self.t.pause_reading()
+                    asyncio.get_running_loop().call_later(0.8, self.t.resume_reading)
+                self.req = {"method": method, "path": path, "n": n, "body": bytearray(), "state": "size", "left": 0}
+            rq = self.req
+            body = rq["body"]
+            if rq["n"] >= 0:
+                take = min(rq["n"] - len(body), len(self.buf))
+                body += self.buf[:take]
+                del self.buf[:take]
+                if len(body) < rq["n"]:
+                    return
+            else:
+                # chunked: size line, data, CRLF, ..., 0, trailers
+                done = False
+                while not done:
+                    state = rq["state"]
+                    if state == "size":
+                        i = self.buf.find(b"\r\n")
+                        if i < 0:
+                            return
+                        size = int(bytes(self.buf[:i]).split(b";")[0], 16)
+                        del self.buf[:i + 2]
+                        rq["state"] = "data" if size else "trailer"
+                        rq["left"] = size
+                    elif state == "data":
+                        take = min(rq["left"], len(self.buf))
+                        body += self.buf[:take]
+                        del self.buf[:take]
+                        rq["left"] -= take
+                        if rq["left"] > 0:
+                            return
+                        rq["state"] = "crlf"
+                    elif state == "crlf":
+                        if len(self.buf) < 2:
+                            return
+                        del self.buf[:2]
+                        rq["state"] = "size"
+                    else:
+                        i = self.buf.find(b"\r\n")
+                        if i < 0:
+                            return
+                        done = i == 0
+                        del self.buf[:i + 2]
+            method, path = rq["method"], rq["path"]
+            self.req = None
+            asyncio.ensure_future(self.reply(method, path, bytes(body)))
 
     async def reply(self, method, path, body):
         status, ctype, payload, delay, after = answer(method, path, body)
@@ -157,15 +221,34 @@ class H2(asyncio.Protocol):
                     stats["h2_conns"] += 1
                     per_conn.append(0)
                     self.cid = len(per_conn) - 1
-                self.reqs[ev.stream_id] = {"method": hd.get(":method", "GET"), "path": hd.get(":path", "/"), "body": b""}
+                self.reqs[ev.stream_id] = {"method": hd.get(":method", "GET"), "path": hd.get(":path", "/"), "body": bytearray()}
+                if hd.get(":path", "/").split("?")[0] == "/early":
+                    self.conn.send_headers(ev.stream_id, [(":status", "413"), ("content-length", "7")])
+                    self.conn.send_data(ev.stream_id, b"too big", end_stream=True)
+                    self.conn.reset_stream(ev.stream_id, error_code=0)
+                    self.reqs.pop(ev.stream_id, None)
+                    continue
                 self.active += 1
                 if self.counted:
                     stats["max_streams"] = max(stats["max_streams"], self.active)
                     per_conn[self.cid] = max(per_conn[self.cid], self.active)
                     stats["per_conn"] = list(per_conn)
             elif isinstance(ev, h2.events.DataReceived):
-                self.reqs[ev.stream_id]["body"] += ev.data
-                self.conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                rq = self.reqs.get(ev.stream_id)
+                if rq is None:   # a stream that was answered and reset: its data still takes connection window
+                    try:
+                        self.conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                    except Exception:
+                        pass
+                    continue
+                rq["body"] += ev.data
+                if rq["path"].split("?")[0] == "/slowup" and not rq.get("started"):
+                    # the window is not given back for 0.8 s: the sender has to wait
+                    rq["started"] = time.time()
+                if rq.get("started") and time.time() - rq["started"] < 0.8:
+                    asyncio.get_running_loop().call_later(max(0.0, 0.8 - (time.time() - rq["started"])), self.late_ack, ev.flow_controlled_length, ev.stream_id)
+                else:
+                    self.conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
             elif isinstance(ev, h2.events.StreamEnded):
                 rq = self.reqs.pop(ev.stream_id, None)
                 if rq:
@@ -182,6 +265,13 @@ class H2(asyncio.Protocol):
                 self.reqs.pop(ev.stream_id, None)
                 self.active = max(0, self.active - 1)
         self.flush()
+
+    def late_ack(self, n, sid):
+        try:
+            self.conn.acknowledge_received_data(n, sid)
+            self.flush()
+        except Exception:
+            pass
 
     async def stream_reply(self, sid):
         """A chat completion as server-sent events, a chunk at a time."""
@@ -201,7 +291,7 @@ class H2(asyncio.Protocol):
             pass
 
     async def reply(self, sid, rq):
-        status, ctype, payload, delay, after = answer(rq["method"], rq["path"], rq["body"])
+        status, ctype, payload, delay, after = answer(rq["method"], rq["path"], bytes(rq["body"]))
         if rq["path"].split("?")[0] == "/v1/chat/completions":
             try:
                 if json.loads(rq["body"]).get("stream"):

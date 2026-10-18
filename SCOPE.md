@@ -23,7 +23,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Virtual keys | done |
 | Request IDs | done |
 | Prometheus metrics | partial: Bifrost's families and enrichment labels, http_* with custom labels, active requests, key rotation, MCP and the push gateway; the overhead components are Raiju's own four stages |
-| config.json compatibility | partial: sections and keys mapped; keys Raiju does not apply are reported at startup (`websocket`, `large_payload_optimization`, top-level `access_profiles`, `network_config` transport knobs, Vertex workload identity; docs/parity.md section c) |
+| config.json compatibility | partial: sections and keys mapped; keys Raiju does not apply are reported at startup (`websocket`, top-level `access_profiles`, `network_config` transport knobs, Vertex workload identity; docs/parity.md section c) |
 | Multi-core workers | partial: budgets, rate limits and caches shared between workers; `/metrics` is summed; request logs are per worker unless the log store is shared |
 | Anthropic | partial: no legacy text completions |
 | Azure OpenAI | partial: API keys and Entra ID; decisions by emulation only, as for OpenAI |

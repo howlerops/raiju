@@ -67,13 +67,14 @@ import { logMetadata, correlationIds, maximAttrs, stopReasonOf, toolNamesOfBody,
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 import * as oauthKey from "./oauth_key"
+import { LargeBody, LargeSettings, BodyTap, largeSettings, scanPrefix } from "./largepayload"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 // a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
 type ChatSender = (t: Target, b: Field[], tc: LazyChat) => Upstream throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64 }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void }
 
 // Where a streamed answer goes, when the server can stream (the http1 front end).
 export class StreamSink {
@@ -908,6 +909,11 @@ class ReqCtx {
   maximTags: Record<string, string> | undefined = undefined
   // the compat plan of a chat or completions request: its drops and conversions go out with the stream headers
   compat: CompatPlan | undefined = undefined
+  // a request whose body streams to the provider (large_payload_optimization), and whether the stream that answers it logs it
+  large: LargeBody | undefined = undefined
+  deferRecord = false
+  // an ordinary request's answer longer than this many bytes goes back as it arrives (-1: always read whole)
+  passAbove = -1
   constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
 }
 
@@ -1107,9 +1113,12 @@ export class Engine {
   wsResponses: SocketGate
   wsRealtime: SocketGate
   wsLive: SocketGate
+  // large_payload_optimization, when it is on (largepayload.tov)
+  large: LargeSettings | undefined = undefined
 
   constructor(public cfg: Config) {
     this.gov = new Governance(cfg)
+    this.large = largeSettings(cfg)
     const wsMax = cfg.websocket?.max_connections_per_user ?? 100
     this.wsResponses = new SocketGate(wsMax)
     this.wsRealtime = new SocketGate(wsMax)
@@ -1583,6 +1592,13 @@ export class Engine {
           if (beta === "") up.headers.delete("anthropic-beta")
           else up.headers.set("anthropic-beta", beta)
         }
+        // a large request body streams to the provider as it comes in: the provider's name for the model goes where the
+        // caller's was, and the length is declared again when the caller declared one (so the provider need not accept chunks)
+        const lg = ctx.large
+        if (lg !== undefined) {
+          lg.upstreamModel = t.model
+          if (lg.declared >= 0) up.headers.set("content-length", "" + (lg.declared + lg.delta()))
+        }
         attempts += 1
         const tracer = this.tracer
         const parent = ctx.span
@@ -1616,7 +1632,7 @@ export class Engine {
           live = dl
           const signal = dl.controller.signal
           const px = proxyOf(p)
-          const res = up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+          const res = lg !== undefined ? await fetch(up.url, { method: "POST", headers: hs, body: lg.stream(), signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
           status = res.status
           // circuit policies: this response's headers may open the circuit of a policy for this primary
           if (this.health.policyList().length > 0) {
@@ -1625,6 +1641,26 @@ export class Engine {
               rh.set(k, v)
             })
             this.health.policyObserve(ref.provider, ref.model, t.key.id ?? "", rh, Date.now())
+          }
+          // a large answer (or a stream) goes back as it comes, without being read whole
+          if ((lg !== undefined || (ctx.passAbove >= 0 && providers.streamsNatively(t.kind))) && status >= 200 && status < 300) {
+            const clen = parseInt(res.headers.get("content-length") ?? "") ?? -1
+            const ctype = res.headers.get("content-type") ?? ""
+            const limit = lg !== undefined ? lg.settings.responseThreshold : ctx.passAbove
+            if ((lg !== undefined && (ctype.startsWith("text/event-stream") || (clen < 0 && streamed))) || clen > limit) {
+              const tookMs = performance.now() - started
+              upstreamMs += tookMs
+              if (sel.keyIndex >= 0) {
+                this.health.record(healthId(ref.provider, t.key, sel.keyIndex), true, tookMs, Date.now())
+                metrics.observeKeyUp(ref.provider, t.key.id ?? "", t.key.name ?? "", true)
+                this.stick(h, ref, t)
+              }
+              metrics.observeRequest(tl, { ok: true, status: status, errorType: "", retries: 0.0 }, tookMs / 1000.0)
+              const finishAnswer = (): void => {
+                dl.finish()
+              }
+              return { ok: true, status: status, body: "", contentType: ctype === "" ? "application/json" : ctype, provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasName: aliasNameOf(t.key, ref.model), aliasFamily: aliasFamilyOf(t.key, ref.model), pass: res, finish: finishAnswer }
+            }
           }
           const sink = ctx.sink
           const mk = ctx.makeConverter
@@ -1786,6 +1822,8 @@ export class Engine {
         }
         last = { ok: false, status: status === 0 ? 502 : status, body: text.startsWith("{") ? text : errorJson(text === "" ? `${ref.provider} returned HTTP ${status}` : text, "api_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
         last.retryMs = hintMs
+        // the body of a large request was consumed by this attempt: it cannot be sent again
+        if (ctx.large !== undefined) return last
         const d = status === 0 ? "retry" : try classify(status)
         if (d === "fail") return last
         if (d === "fallback") break
@@ -1835,6 +1873,7 @@ export class Engine {
     if (fm === undefined) this.mcp = undefined
     else if (this.mcp === undefined) this.mcp = fm
     else this.mcp.follow(fm.sessions)
+    this.large = fresh.large
     this.guard = fresh.guard
     this.guardInput = fresh.guardInput
     this.guardOutput = fresh.guardOutput
@@ -2367,9 +2406,14 @@ export class Engine {
 
   // Shared front half of every inference endpoint.
   // emulated: a decision answered by a chat or Responses call (compat's convert_decision_to_responses), billed as that call
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool): Promise<Response> {
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool, large?: LargeBody): Promise<Response> {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
+    ctx.large = large
+    // large_payload_optimization: a long answer to an ordinary request is not read whole either, unless something
+    // here has to see it (output guardrails, plugins)
+    const lps = this.large
+    if (lps !== undefined && large === undefined && !streamed && (op === "chat" || op === "completions" || op === "embeddings") && !this.guardOutput && this.guardProviders.length === 0 && this.plugins === undefined) ctx.passAbove = lps.responseThreshold
     // a native decision is billed with the decision rates and the overrides that cover decisions
     ctx.decision = op === "decisions" && emulated !== true
     ctx.sink = sink
@@ -2412,7 +2456,12 @@ export class Engine {
       metrics.activeRequests(method, -1.0)
     }
     ctx.status = res.status
-    this.record(ctx)
+    const lg = ctx.large
+    if (lg !== undefined && !ctx.deferRecord) {
+      // a large request is logged with the truncated copy of its body
+      if (this.logStore !== undefined && !ctx.contentOff) ctx.input = lg.tap.previewText()
+    }
+    if (!ctx.deferRecord) this.record(ctx)
     return res
   }
 
@@ -2438,7 +2487,7 @@ export class Engine {
     // how the tier was decided, for the request log: a classifier's name, "heuristic" or "override"
     let mechanism = ""
     const cx = this.complexity
-    if (cx !== undefined && op === "chat") {
+    if (cx !== undefined && op === "chat" && ctx.large === undefined) {
       const forced = overrideTier(h)
       if (forced !== undefined) {
         tier = forced
@@ -2545,7 +2594,8 @@ export class Engine {
     }
 
     const tCache = performance.now()
-    const cache = this.cache
+    // a request streamed to the provider has no text to key a cache on
+    const cache = ctx.large === undefined ? this.cache : undefined
     let key = ""
     const noStore = h.get("x-bf-cache-no-store") === "true"
     if (cache !== undefined) {
@@ -2579,7 +2629,7 @@ export class Engine {
     // Semantic cache: only for requests that name a cache key (header or config default).
     let semScope = ""
     let semVec: f64[] = []
-    const sem = this.semantic
+    const sem = ctx.large === undefined ? this.semantic : undefined
     const semKey = h.get("x-bf-cache-key") ?? this.cfg.semantic_cache?.default_cache_key
     if (sem !== undefined && semKey !== undefined && op === "chat" && h.get("x-bf-cache-type") !== "direct") {
       try {
@@ -2690,6 +2740,11 @@ export class Engine {
     out.set("x-bifrost-latency-ms", "" + Math.round(performance.now() - started))
     out.set("content-type", r.contentType)
     if (r.contentType === "text/event-stream") out.set("cache-control", "no-cache")
+    if (r.pass !== undefined) {
+      ctx.promptTokens = r.promptTokens
+      ctx.completionTokens = r.completionTokens
+      return this.passThrough(ctx, r, out)
+    }
     // Time spent in the gateway itself, upstream calls excluded (Bifrost's "overhead").
     const overheadUs = (performance.now() - started - r.upstreamMs) * 1000.0
     metrics.observeOverheadFor(ul, overheadUs)
@@ -3037,6 +3092,157 @@ export class Engine {
     } catch (e) {
       return errorResponse(502, `agent mode failed: ${e.message}`, "api_error", noHeaders())
     }
+  }
+
+
+  // ---- large_payload_optimization (largepayload.tov) ----
+
+  // The answer to a request whose body may be large: undefined when it is an ordinary request (the caller
+  // goes on with `req` as it is), else the Request to go on with (the body was small after all, or this route's
+  // provider needs it whole) or the Response (refused, or served with the body streamed to the provider).
+  // `route` is largeRoute's kind. The body is read only as far as it must be: the first prefetch_size_bytes
+  // to find the model, or (no Content-Length) up to request_threshold_bytes to see whether it is big at all.
+  async largeRequest(req: Request, route: string, path: string): Promise<Response | Request | undefined> {
+    const lp = this.large
+    if (lp === undefined || req.method !== "POST") return undefined
+    const dtext = req.headers.get("content-length")
+    const declared = dtext === undefined ? -1 : (parseInt(dtext) ?? -1)
+    if (declared >= 0 && declared <= lp.requestThreshold) return undefined
+    if (declared > lp.maxPayload) return errorResponse(413, `request body of ${declared} bytes is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error", noHeaders())
+    const src = req.body
+    if (src === undefined) return undefined
+    // read ahead: the prefix, or the whole body when it ends within the threshold
+    const want = declared >= 0 ? lp.prefetch : Math.max(lp.prefetch, lp.requestThreshold + 1)
+    const head: u8[] = []
+    let ended = false
+    try {
+      while (head.length < want) {
+        const r = await src.pull()
+        const v = r.value
+        if (r.done || v === undefined) {
+          ended = true
+          break
+        }
+        for (const b of v) head.push(b)
+      }
+    } catch (e) {
+      return errorResponse(400, `the request body could not be read: ${e.message}`, "invalid_request_error", noHeaders())
+    }
+    if (ended && declared < 0 && head.length <= lp.requestThreshold) {
+      // a body with no declared length that turned out small: an ordinary request
+      return new Request(req.url, { method: "POST", headers: snapshot(req.headers), body: head })
+    }
+    const meta = scanPrefix(head)
+    const hs = snapshot(req.headers)
+    if (!meta.hasModel) {
+      await src.cancel()
+      return errorResponse(400, `could not find the model in the first ${head.length} bytes of the request (large_payload_optimization.prefetch_size_bytes is ${lp.prefetch}); put "model" first in large request bodies`, "invalid_request_error", noHeaders())
+    }
+    // the provider must take the body as it is: an OpenAI-format one (the other formats need the whole body to convert)
+    const first = parseModelVia(this.cfg, meta.model, route === "chat" ? "chat" : route)
+    const p = first.provider === "" ? undefined : providerOf(this.cfg, first.provider)
+    const kind = p === undefined ? "" : kindOf(first.provider, p)
+    const stream = meta.hasStream ? meta.stream : false
+    if (!providers.streamsNatively(kind)) {
+      // buffered after all, up to client.max_request_body_size_mb: the ordinary path converts it
+      const limit = (this.cfg.client?.max_request_body_size_mb ?? 100) * 1048576
+      if (declared > limit) {
+        await src.cancel()
+        return errorResponse(413, `request body too large: ${first.provider === "" ? "this model" : first.provider} needs the whole body in memory and it is over client.max_request_body_size_mb`, "invalid_request_error", noHeaders())
+      }
+      const all: u8[] = head.slice()
+      try {
+        while (!ended) {
+          const r = await src.pull()
+          const v = r.value
+          if (r.done || v === undefined) break
+          for (const b of v) all.push(b)
+          if (all.length > limit) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
+        }
+      } catch (e) {
+        return errorResponse(400, `the request body could not be read: ${e.message}`, "invalid_request_error", noHeaders())
+      }
+      return new Request(req.url, { method: "POST", headers: hs, body: all })
+    }
+    const lg = new LargeBody(lp, head, meta, ended ? undefined : src, declared)
+    const tiny: Field[] = [{ key: "model", raw: quote(meta.model) }]
+    const build: Build = (t) => {
+      if (!providers.streamsNatively(t.kind)) throw new SyntaxError(`${t.provider} needs the whole request body in memory, which large_payload_optimization does not allow: use an OpenAI-format provider for large requests`)
+      const up = route === "embeddings" ? openai.embeddingsRequest(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : openai.chatRequest(t, tiny)
+      return { url: up.url, headers: up.headers, body: "" }
+    }
+    const translate: Translate = (t, text, requested) => {
+      if (route === "embeddings") return try providers.embeddingsTranslate(t.kind, t.model, text, requested)
+      if (route === "completions") return try openai.chatResponse(text, requested)
+      return try providers.chatTranslate(t.kind, t.model, text, requested, false)
+    }
+    const op = route === "embeddings" ? "embeddings" : route === "completions" ? "completions" : "chat"
+    const modelBody: Field[] = [{ key: "model", raw: quote(meta.model) }]
+    if (meta.hasStream) modelBody.push({ key: "stream", raw: stream ? "true" : "false" })
+    const res = try await this.serve(req, op, undefined, modelBody, "", build, translate, stream, undefined, undefined, undefined, undefined, undefined, undefined, lg)
+    // a body with no declared length that grew past max_payload_bytes cut its own upload short
+    if (lg.tap.over && res.status !== 413) return errorResponse(413, `request body is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error", noHeaders())
+    return res
+  }
+
+  // The answer of a large request that is streamed back: the upstream's bytes as they come, with a truncated
+  // copy for the request log. The request is logged when the stream ends.
+  passThrough(ctx: ReqCtx, r: Outcome, out: Hdrs): Response {
+    const src = r.pass!
+    const lg = ctx.large
+    const lps = this.large
+    ctx.deferRecord = true
+    ctx.status = r.status
+    ctx.provider = r.provider
+    const reader = src.body
+    const keep = new BodyTap(lg !== undefined ? lg.settings.truncatedLog : (lps === undefined ? 0 : lps.truncatedLog), 9007199254740991)
+    let finished = false
+    const fin = (): void => {
+      if (finished) return
+      finished = true
+      const f = r.finish
+      if (f !== undefined) f()
+      if (this.logStore !== undefined && !ctx.contentOff) {
+        if (lg !== undefined) ctx.input = lg.tap.previewText()
+        ctx.output = keep.previewText()
+      }
+      this.record(ctx)
+    }
+    const body = new ReadableStream({
+      async pull(c) {
+        if (reader === undefined) {
+          c.close()
+          fin()
+          return
+        }
+        let chunk: u8[] | undefined = undefined
+        try {
+          const x = await reader.pull()
+          chunk = x.value
+          if (x.done) chunk = undefined
+        } catch (e) {
+          c.error(e)
+          fin()
+          return
+        }
+        const v = chunk
+        if (v === undefined) {
+          c.close()
+          fin()
+          return
+        }
+        keep.see(v)
+        c.enqueue(v)
+      },
+      cancel() {
+        if (reader !== undefined) reader.cancel()
+        fin()
+      },
+    })
+    const hs: Record<string, string> = out
+    hs.set("content-type", r.contentType)
+    if (r.contentType.startsWith("text/event-stream")) hs.set("cache-control", "no-cache")
+    return new Response(body, { status: r.status, headers: hs })
   }
 
   async chatOnce(req: Request, sink?: StreamSink, skipGuards?: bool): Promise<Response> {

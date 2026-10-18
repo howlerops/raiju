@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0007 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0008 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -101,11 +101,31 @@ if python3 -c 'import h2' 2>/dev/null; then
   TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/fetch_pool.tov" -o "$OUT/fetch_pool" >/dev/null
   H2_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h2.port") H1TLS_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1tls.port") \
     H1_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1.port") "$OUT/fetch_pool" > "$OUT/fetch_pool.out"
+  expect "$OUT/fetch_pool.out" 23 "fetch pool options and HTTP/2"
+  # request bodies as streams (patch 0008): fetch with a ReadableStream body on the same three origins
+  TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/request_body_fetch.tov" -o "$OUT/request_body_fetch" >/dev/null
+  H2_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h2.port") H1TLS_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1tls.port") \
+    H1_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1.port") "$OUT/request_body_fetch" > "$OUT/request_body_fetch.out"
   kill $POOLSRV 2>/dev/null || true
   POOLSRV=""
-  expect "$OUT/fetch_pool.out" 23 "fetch pool options and HTTP/2"
+  expect "$OUT/request_body_fetch.out" 36 "fetch with a ReadableStream body (HTTP/1.1, TLS, HTTP/2)"
 else
   echo "skipped: fetch pool options and HTTP/2 (needs Python's h2 package, and pip could not install it)"
 fi
+
+# Bun.serve request bodies as streams (patch 0008): a server that reads big bodies chunk by chunk, driven over raw sockets
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/request_body_server.tov" -o "$OUT/request_body_server" >/dev/null
+"$OUT/request_body_server" > "$OUT/request_body_server.out" & SRV=$!
+sleep 0.5
+RB_PORT=$(sed -n 's/^listening //p' "$OUT/request_body_server.out")
+python3 "$DIR/request_body_client.py" "$RB_PORT" "$SRV" > "$OUT/request_body_client.out" || true
+kill $SRV 2>/dev/null || true
+SRV=""
+expect "$OUT/request_body_client.out" 17 "Bun.serve request body streams"
+
+# Socket.pause() and resume() (patch 0008)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/socket_pause.tov" -o "$OUT/socket_pause" >/dev/null
+"$OUT/socket_pause" > "$OUT/socket_pause.out"
+expect "$OUT/socket_pause.out" 2 "Socket.pause"
 
 echo "tov-patches tests passed"

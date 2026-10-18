@@ -24,6 +24,7 @@ import { LiveSocket, liveContent, liveCreate, contentId, attachId, attachUpstrea
 import { WsConnection, SocketGate } from "./ws"
 import { DataScope } from "./scope"
 import { resourceOf } from "./rbac"
+import { largeRoute } from "./largepayload"
 import { matchRoute, handleMedia, deploymentRoute, deploymentRequest, realtimeSdp, nativeRoute, nativeCloud, vertexBearer } from "./media"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs } from "./schemas"
@@ -646,10 +647,10 @@ async function cors(cfg: Config, req: Request, res: Response): Promise<Response>
 
 export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int }
 
-// Bun.serve has no body limit of its own, so client.max_request_body_size_mb is checked here:
-// a declared length over the limit is refused unread, and a body with no length is read once
-// and refused when it is over. undefined means refused; otherwise the request to dispatch
-// (rebuilt around its bytes when they were read here).
+// client.max_request_body_size_mb is checked here, not by the server: a declared length over the
+// limit is refused unread, and a body with no length is read as far as the limit and refused when it
+// is over. undefined means refused; otherwise the request to dispatch (rebuilt around its bytes when
+// they were read here).
 export async function limitedBody(req: Request, maxBytes: int): Promise<Request | undefined> {
   if (req.method === "GET" || req.method === "HEAD") return req
   const declared = req.headers.get("content-length")
@@ -657,14 +658,38 @@ export async function limitedBody(req: Request, maxBytes: int): Promise<Request 
     const n = parseFloat(declared) ?? 0.0
     return n > maxBytes ? undefined : req
   }
-  let body: u8[] = []
+  const st = req.body
+  if (st === undefined) return req
+  const body: u8[] = []
   try {
-    body = await req.bytes()
+    while (true) {
+      const r = await st.pull()
+      const v = r.value
+      if (r.done || v === undefined) break
+      for (const b of v) body.push(b)
+      if (body.length > maxBytes) {
+        await st.cancel()
+        return undefined
+      }
+    }
   } catch (e) {
-    body = []
+    // a body cut off reads as what arrived
   }
-  if (body.length > maxBytes) return undefined
   return new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body })
+}
+
+// large_payload_optimization (largepayload.tov) at the front of a server: the Response that refuses or
+// serves a request whose body is big, the Request to go on with (its body was read, or is small), or
+// undefined for a request the feature does not touch.
+export async function largeFront(engine: Engine, req: Request): Promise<Response | Request | undefined> {
+  if (engine.large === undefined || req.method !== "POST" || (req.headers.get("x-bf-async") ?? "") !== "") return undefined
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  const route = largeRoute(compatPath(p))
+  if (route === "") return undefined
+  const r = await engine.largeRequest(req, route, p)
+  if (r instanceof Response) return await echoRequestId(req, await cors(engine.cfg, req, r))
+  return r
 }
 
 function textResponse(body: string, contentType: string): Response {
@@ -1135,7 +1160,11 @@ export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: () 
 }
 
 // One HTTP request on the Bun.serve server: the body limit, then the streamed or whole route.
-async function bunHttp(engine: Engine, ops: Ops, req0: Request, limit: int): Promise<Response, TypeError> {
+async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Promise<Response, TypeError> {
+  let req0 = req00
+  const lf = await largeFront(engine, req00)
+  if (lf instanceof Response) return lf
+  if (lf instanceof Request) req0 = lf
   const within = try await limitedBody(req0, limit)
   if (within === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
   const req = within
@@ -1154,10 +1183,15 @@ async function bunHttp(engine: Engine, ops: Ops, req0: Request, limit: int): Pro
 // The Bun.serve server (the default): streamed chat answers, Tov's multi-process workers,
 // native WebSockets.
 export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
+  const lp = engine.large
   const server = Bun.serve<Session>({
     port: opts.port,
     hostname: opts.hostname,
     workers: opts.workers,
+    // large_payload_optimization: bodies over the request threshold arrive as a stream, and the sizes are
+    // checked by the gateway (client.max_request_body_size_mb, large_payload_optimization.max_payload_bytes)
+    bodyStreamThreshold: lp === undefined ? undefined : Math.max(1, lp.requestThreshold),
+    maxRequestBodySize: lp === undefined ? undefined : 1099511627776,
     fetch(req0, server) {
       const wu = wsUpgrade(engine, ops, req0)
       if (wu.kind === "refused") return errorResponse(wu.status, wu.message, "invalid_request_error", noHeaders())

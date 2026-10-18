@@ -8,6 +8,7 @@ upstream. `tests/run.sh` checks all of them with the patched compiler:
 Patch 0004 is written on top of 0003 (its hunks include the ALPN signatures), so the
 patches apply in order only. Patches 0005 (WAMR) and 0006 (libdatachannel) add vendored C
 libraries (about 2.7 MB and 4.9 MB of text), which the first four do not; 0006 is applied on top of 0005.
+Patch 0008 changes the fetch and HTTP/2 code that 0007 adds, so it is applied on top of 0007.
 
 ## Submitting upstream
 
@@ -397,3 +398,74 @@ Limits are per process: a `Bun.serve` with `workers: n` has a pool per worker. T
 (`tests/fetch_pool.tov`, driven by `tests/h2_server.py`) need Python's `h2` package; `run.sh`
 installs it to a temporary directory if it is missing and skips the HTTP/2 and pool checks
 if it cannot.
+
+
+## 0008 — request body streams (`fetch` with a `ReadableStream` body, `req.body` in `Bun.serve`)
+
+**Problem.** Neither end of an HTTP request could stream its body. `fetch` took a string or bytes, and
+`Bun.serve` held a request whole (up to 64 MiB) before calling the handler, so a gateway could not pass
+a large body to a provider without holding it. Bifrost's `large_payload_optimization` reads the routing
+fields from the first bytes of a big request and streams the rest through.
+
+**API (Bun's, plus two options and `Socket.pause()` / `resume()`).**
+
+```ts
+// fetch: a ReadableStream body is sent as it is read, chunked on HTTP/1.1 and as DATA frames on HTTP/2
+const body = new ReadableStream({
+  async pull(c) {                      // new: called when a reader wants a chunk and none is queued
+    c.enqueue(await nextChunk())       // c.enqueue(u8[] | string), c.close(), c.error(e)
+  },
+})
+const res = await fetch(url, { method: "POST", body, headers: { "content-length": "123" } })  // length optional
+
+// Bun.serve: a body over the threshold reaches the handler before it has arrived
+Bun.serve({
+  bodyStreamThreshold: 262144,         // bytes (Content-Length, or what a chunked body has sent so far)
+  maxRequestBodySize: 1 << 30,         // bytes; a declared length over it is a 413, a chunked body past it fails its stream
+  async fetch(req) {
+    for await (const chunk of req.body!) { /* u8[] */ }
+    // or req.text(), req.json(), req.bytes()...: they read the stream whole
+  },
+})
+```
+
+`Request.body` is a `ReadableStream | undefined` (the stream of a body that came whole is one chunk).
+`Socket.pause()` / `resume()` stop and restart reading a socket (Node's pair).
+
+**Design.**
+- `fetch` (runtime/tov.c). A stream body is flagged to `fetchStart`; the Tov side then pumps it:
+  `fetchWrite(id, bytes)` appends the next chunk and returns a promise that settles once the chunk is
+  on the wire (HTTP/1.1: written to the socket, framed as a chunk unless the caller gave a
+  `Content-Length`; HTTP/2: handed to nghttp2 by a deferred data provider, which waits for the
+  stream's window), so at most one chunk waits in memory and a slow server slows the source. A
+  negative result means the request is over (the response came first, it failed or was aborted) and
+  the pump cancels the source. `fetchEnd` ends the body. A source that fails aborts the request.
+- The request cannot be repeated, so a 307 or 308 answer is returned instead of followed, and a
+  request that fails on a reused connection is retried only while everything sent is still held: the
+  first 1 MiB of the body is kept for that, then dropped. A server that answers early and closes
+  (an HTTP/1.1 413, say) has its answer read: a write failure switches the request to reading.
+- `Bun.serve` (runtime/tov.c, tv_http_bs). A body over `bodyStreamThreshold` is handed to the handler
+  as soon as its head is in; the connection's later bytes feed the stream (Content-Length or an
+  incremental chunked decoder, with trailers) while `httpBodyRead`/`httpBodyTake` give them to
+  the handler. Once 512 KiB are held the socket is not read until the handler takes them, so a slow
+  handler slows the sender. A body nobody reads is dropped when the request is answered (at most
+  32 MiB further; past that the connection closes), and the connection serves its next request. A
+  client that leaves or half-closes fails the stream. `text()`, `json()` and the others read it whole.
+  `Expect: 100-continue` is answered for a streamed body.
+- `Socket.pause()` (runtime/net.c) takes the socket off the read interest; `src/http1.tov` uses it for
+  the same backpressure on raw sockets.
+
+**Files.**
+- `runtime/tov.c`, `runtime/tov.h`: the request writer (`fetchWrite`, `fetchEnd`), the server-side body
+  stream (`httpBodyOptions`, `httpBodyStream`, `httpBodyRead`, `httpBodyTake`, `httpBodyCancel`).
+- `runtime/h2.c`: the streaming data provider and `resume`.
+- `runtime/net.c`: `netPause`.
+- `crates/tov/src/check/builtins.rs`, `crates/tov/src/std/http.tov`: the signatures, `RequestInit.body`,
+  `UnderlyingSource.pull`, `Request.body`, `ServeOptions`, `Socket.pause`.
+
+**Not covered.** A stream body cannot be sent through a redirect that keeps the method, and after
+1 MiB a failed request is not retried. A TLS HTTP/1.1 server that answers early and resets the
+connection may cost the answer (HTTP/1.1 over plain TCP and HTTP/2 return it). The worker processes
+of `workers: n` each hold their own streams. `Request.body` of a request read with `text()` first is
+the empty stream. The tests (`tests/request_body_server.tov` with `request_body_client.py`,
+`request_body_fetch.tov` against `h2_server.py`, `socket_pause.tov`) are in `run.sh`.

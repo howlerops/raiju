@@ -346,7 +346,7 @@ def write_config():
                                 "guardrail_providers": [{"id": 1, "provider_name": "webhook", "policy_name": "hook", "enabled": True, "config": {"url": MOCK + "/guard-hook"}}]},
           "plugins": [{"name": "semantic_cache", "enabled": True, "config": {"provider": "openai", "embedding_model": "text-embedding-3-small", "threshold": 0.95, "ttl": "5m", "vector_store_namespace": "e2e-ns"}}],
           "vector_store": {"enabled": True, "type": "qdrant", "config": {"host": "127.0.0.1", "rest_port": 18089}},
-          "large_payload_optimization": {"request_threshold_bytes": 1048576}}
+          "skills_registry": {}}
     json.dump(bf, open(os.path.join(BUILD, "e2e.bifrost.json"), "w"))
     # the owner switches: refuse_unpriced_models and scope_by_virtual_key on one gateway, both off on the other
     for name, on in [("owner", True), ("owner-off", False)]:
@@ -5266,6 +5266,218 @@ def l126_e2e(env):
             p.terminate()
 
 
+GW_L124 = "http://127.0.0.1:18182"  # large_payload_optimization: big request bodies streamed to the provider, big answers streamed back
+
+def l124_http(port, method, path, body, headers=None, chunked=False, read=True, timeout=60):
+    """One HTTP/1.1 request on a raw socket (body: bytes, or a list of byte chunks for chunked); (status, headers, body bytes)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    h = {"host": "x", "content-type": "application/json", "connection": "close", **(headers or {})}
+    if chunked:
+        h["transfer-encoding"] = "chunked"
+    elif body is not None:
+        h.setdefault("content-length", str(len(body)))
+    s.sendall((f"{method} {path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in h.items()) + "\r\n").encode())
+    try:
+        if chunked:
+            for c in body:
+                s.sendall(b"%x\r\n" % len(c) + c + b"\r\n")
+            s.sendall(b"0\r\n\r\n")
+        elif body is not None:
+            s.sendall(body)
+    except OSError:
+        pass
+    if not read:
+        return s
+    return l124_read(s)
+
+def l124_read(s):
+    buf = b""
+    try:
+        while b"\r\n\r\n" not in buf:
+            c = s.recv(65536)
+            if not c:
+                break
+            buf += c
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        lines = head.decode("latin1").split("\r\n")
+        status = int(lines[0].split(" ")[1]) if lines and lines[0] else 0
+        hs = {}
+        for l in lines[1:]:
+            k, _, v = l.partition(":")
+            hs[k.strip().lower()] = v.strip()
+        body = b""
+        if hs.get("transfer-encoding", "").lower() == "chunked":
+            data = rest
+            while True:
+                while b"\r\n" not in data:
+                    c = s.recv(65536)
+                    if not c:
+                        return status, hs, body
+                    data += c
+                line, _, data = data.partition(b"\r\n")
+                n = int(line.split(b";")[0], 16)
+                if n == 0:
+                    break
+                while len(data) < n + 2:
+                    c = s.recv(65536)
+                    if not c:
+                        return status, hs, body + data[:n]
+                    data += c
+                body += data[:n]
+                data = data[n + 2:]
+        else:
+            n = int(hs.get("content-length", "-1"))
+            body = rest
+            while n < 0 or len(body) < n:
+                c = s.recv(65536)
+                if not c:
+                    break
+                body += c
+        return status, hs, body
+    finally:
+        s.close()
+
+def l124_vm(pid, key):
+    for l in open(f"/proc/{pid}/status"):
+        if l.startswith(key + ":"):
+            return int(l.split()[1]) // 1024
+    return 0
+
+def l124_body(model, size, first=True):
+    """A chat request of about `size` bytes with the model first (or last when first is False)."""
+    filler = "A" * size
+    if first:
+        return ('{"model":"%s","messages":[{"role":"user","content":"%s"}]}' % (model, filler)).encode()
+    return ('{"messages":[{"role":"user","content":"%s"}],"model":"%s"}' % (filler, model)).encode()
+
+def l124_e2e(env):
+    """large_payload_optimization (Tov patch 0008): a request over request_threshold_bytes is read for its model in the first
+    prefetch_size_bytes and streamed to the provider without being held (checked by the gateway's peak memory), a body over
+    max_payload_bytes is refused with a 413, an answer over response_threshold_bytes (or a stream) comes back as it arrives, and
+    the request log keeps truncated_log_bytes of each. Its own gateway (18182)."""
+    import hashlib, shutil
+    logs_dir = os.path.join(BUILD, "e2e-l124-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    penv = l126_python_env()
+    ca_path = os.path.join(BUILD, "e2e-tls", "ca.pem")
+    origin = None
+    providers = {
+        "openai": {"keys": [{"name": "o", "value": "sk-" + "l124", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 2}},
+        "anthropic": {"keys": [{"name": "a", "value": "sk-ant-" + "l124", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+    }
+    h2port = 0
+    if penv is not None and os.path.exists(ca_path):
+        origin, h2port = l126_origin("h2", penv)
+        providers["sgl"] = {"keys": [{"name": "h", "value": "", "models": [], "weight": 1.0}], "network_config": {"base_url": f"https://127.0.0.1:{h2port}", "ca_cert_pem": open(ca_path).read(), "max_retries": 0, "enforce_http2": True}}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "max_request_body_size_mb": 8},
+        "logs_store": {"enabled": True, "dir": logs_dir, "content_logging": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 62914560, "truncated_log_bytes": 4096},
+        "providers": providers,
+    }
+    path = os.path.join(BUILD, "e2e.l124.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18182", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l124.log"), "w"))
+    port = 18182
+    try:
+        wait(GW_L124 + "/health")
+        chat = lambda b: call("POST", "/v1/chat/completions", b, None, base=GW_L124, auth=False)
+        mine = lambda path_: [x for x in seen() if x["path"] == path_]
+
+        # below the threshold nothing changes: an ordinary request
+        small = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l124 small " + "s" * 50000}]}
+        n0 = len(mine("/v1/chat/completions"))
+        s, _, b = chat(small)
+        got = mine("/v1/chat/completions")
+        check("a request under the threshold is an ordinary request", s == 200 and "Hello from gpt-4o-mini" in b and len(got) == n0 + 1 and "l124 small" in got[-1]["body"], (s, b[:200]))
+
+        # a big request: the provider receives every byte, with its own name for the model
+        body = l124_body("openai/large-x", 12 * 1048576)
+        want = l124_body("large-x", 12 * 1048576)
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", body)
+        got = mine("/v1/chat/completions")
+        check("a 12 MiB request reaches the provider intact, with the model renamed", s == 200 and b"Hello from large-x" in b and got[-1]["size"] == len(want) and got[-1]["sha"] == hashlib.sha256(want).hexdigest(), (s, b[:200], got[-1]["size"] if got else None, len(want)))
+        check("the answer carries the gateway's request id", "x-request-id" in hs and "x-bifrost-request-id" in hs, hs)
+
+        # the same with no Content-Length (chunked)
+        pieces = [body[i:i + 100000] for i in range(0, len(body), 100000)]
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", pieces, chunked=True)
+        got = mine("/v1/chat/completions")
+        check("a chunked 12 MiB request reaches the provider intact", s == 200 and got[-1]["size"] == len(want) and got[-1]["sha"] == hashlib.sha256(want).hexdigest(), (s, b[:200], got[-1]["size"], len(want)))
+
+        # the routing fields come from the first bytes: a model that comes late cannot be found
+        late = l124_body("openai/large-x", 2 * 1048576, first=False)
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", late)
+        check("a model beyond the prefetch is refused with a 400 that says so", s == 400 and "could not find the model in the first" in b.decode() and "prefetch_size_bytes" in b.decode(), (s, b[:300]))
+
+        # the gateway does not hold the body: its peak memory barely moves for a body four times the size
+        pid = gw.pid
+        hwm0 = l124_vm(pid, "VmHWM")
+        big = l124_body("openai/large-y", 48 * 1048576)
+        bigwant = l124_body("large-y", 48 * 1048576)
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", big)
+        got = mine("/v1/chat/completions")
+        hwm1 = l124_vm(pid, "VmHWM")
+        check("a 48 MiB request arrives intact", s == 200 and got[-1]["sha"] == hashlib.sha256(bigwant).hexdigest(), (s, b[:200]))
+        check("the gateway's peak memory grew by under 24 MiB for the 48 MiB body (%d to %d MiB)" % (hwm0, hwm1), hwm1 - hwm0 < 24, (hwm0, hwm1))
+
+        # limits
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", b"x" * 1000, headers={"content-length": str(200 * 1048576)}, read=True)
+        check("a declared length over max_payload_bytes is refused with a 413", s == 413 and "maximum payload" in b.decode(), (s, b[:200]))
+        # (the body is cut off by the declared length; the gateway answered before reading it)
+        blk = b"B" * 1000000
+        pre = b'{"model":"openai/large-z","messages":[{"role":"user","content":"'
+        chunks = [pre] + [blk] * 64 + [b'"}]}']
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", chunks, chunked=True)
+        check("a chunked body that grows past max_payload_bytes is refused with a 413", s == 413 and "maximum payload" in b.decode(), (s, b[:300]))
+        s, _, b = l124_http(port, "POST", "/v1/rerank", b'{"model":"openai/m","query":"q","documents":["' + b"d" * (9 * 1048576) + b'"]}')
+        check("a route outside the feature keeps client.max_request_body_size_mb", s == 413, (s, b[:200]))
+
+        # the answer of a big request is not retried (its body is spent): one call, the provider's error back
+        n1 = len(mine("/v1/chat/completions"))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", l124_body("openai/down-1", 400000))
+        check("a failing provider is called once for a streamed body (max_retries 2 does not apply)", s == 500 and len(mine("/v1/chat/completions")) == n1 + 1, (s, b[:200], len(mine("/v1/chat/completions")) - n1))
+
+        # big answers
+        s, hs, b = chat({"model": "openai/large-answer", "messages": [{"role": "user", "content": "l124 answer"}]})
+        check("an answer over response_threshold_bytes comes back whole", s == 200 and len(b) > 3000000 and b.rstrip().endswith("}") and json.loads(b)["choices"][0]["message"]["content"].startswith("yyyy") and len(json.loads(b)["choices"][0]["message"]["content"]) == 3000000, (s, len(b)))
+        s, hs, b = chat({"model": "openai/large-stream", "stream": True, "messages": [{"role": "user", "content": "l124 stream"}]})
+        check("a stream comes back event by event, to its [DONE]", s == 200 and hdr(hs, "content-type") == "text/event-stream" and b.count("data: ") >= 3000 and b.rstrip().endswith("data: [DONE]"), (s, hs, len(b)))
+        sbody = ('{"model":"openai/large-stream","stream":true,"messages":[{"role":"user","content":"%s"}]}' % ("S" * 600000)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", sbody)
+        b = b.decode()
+        got = mine("/v1/chat/completions")
+        check("a big request that asks for a stream is streamed both ways", s == 200 and hdr(hs, "content-type") == "text/event-stream" and b.count("data: ") >= 3000 and b.rstrip().endswith("data: [DONE]") and got[-1]["size"] == len(sbody) - 7, (s, hs, len(b), got[-1]["size"], len(sbody)))
+        s, hs, b = chat({"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l124 plain"}]})
+        check("a small answer is an ordinary answer, with usage", s == 200 and json.loads(b)["usage"]["total_tokens"] == 7, (s, b[:200]))
+
+        # the request log keeps a truncated copy of a big request and of a big answer
+        time.sleep(0.5)
+        entries = json.loads(call("GET", "/api/logs?limit=200", base=GW_L124, auth=False)[2])["entries"]
+        bigs = [e for e in entries if e.get("model") == "openai/large-y"]
+        check("the log row of the 48 MiB request holds its first truncated_log_bytes", len(bigs) == 1 and len(bigs[0].get("input") or "") == 4096 and (bigs[0].get("input") or "").startswith('{"model":"openai/large-y"'), [{k: (v if len(str(v)) < 80 else str(v)[:80]) for k, v in e.items()} for e in bigs])
+        ans = [e for e in entries if e.get("model") == "openai/large-answer"]
+        check("the log row of a streamed answer holds the first truncated_log_bytes of it, with the request", len(ans) == 1 and len(ans[0].get("output") or "") == 4096 and "l124 answer" in (ans[0].get("input") or ""), [(len(e.get("output") or ""), e.get("model")) for e in ans])
+
+        # a provider that needs the whole body (Anthropic's format) gets it in memory, up to client.max_request_body_size_mb
+        n2 = len(mine("/v1/messages"))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", l124_body("anthropic/claude-3-5-sonnet-20241022", 1048576))
+        check("a provider that converts the body is sent the converted request (buffered)", s == 200 and len(mine("/v1/messages")) == n2 + 1, (s, b[:300]))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", l124_body("anthropic/claude-3-5-sonnet-20241022", 9 * 1048576))
+        check("... but not past client.max_request_body_size_mb", s == 413, (s, b[:200]))
+
+        # over HTTP/2 to the provider
+        if origin is not None:
+            s, _, b = l124_http(port, "POST", "/v1/chat/completions", l124_body("sgl/m", 3 * 1048576))
+            st = l126_stats(h2port, True)
+            check("a big request streams to an HTTP/2 provider as DATA frames", s == 200 and b"hello over h2" in b and st["h2_conns"] >= 1 and st["chat_bytes"] > 3 * 1048576, (s, b[:200], st))
+    finally:
+        gw.terminate()
+        gw.wait()
+        if origin is not None:
+            origin.terminate()
+
 def main():
     unique_ports()
     build()
@@ -6865,7 +7077,7 @@ def main():
         _, d2, _ = ochat(OFF, "openai/gpt-4o-mini", "sk-bf-owner-a", "owner cache check")
         check("with scope_by_virtual_key off the other key hits the shared entry", hl(d1).get("x-bf-cache") != "hit" and hl(d2).get("x-bf-cache") == "hit", (d1, d2))
         log = open(os.path.join(BUILD, "e2e.bifrost.log")).read()
-        check("unknown config keys are reported at startup", 'config: "large_payload_optimization" is not implemented' in log, log[:600])
+        check("unknown config keys are reported at startup", 'config: "skills_registry" is not implemented' in log, log[:600])
 
         # Bifrost's x-bifrost-* response headers
         _, h, _ = chat("openai/gpt-4o-mini", seed=1400, headers={"x-bf-mcp-include-clients": "none"})
@@ -7331,7 +7543,7 @@ def main():
 
         # Bifrost keys with no Raiju counterpart are named at startup, not dropped silently
         blog = open(os.path.join(BUILD, "e2e.bifrost.log")).read()
-        check("Bifrost sections Raiju does not use are noted at startup", 'config: "large_payload_optimization" is not implemented' in blog, blog[:300])
+        check("Bifrost sections Raiju does not use are noted at startup", 'config: "skills_registry" is not implemented' in blog, blog[:300])
 
         # ---- L80: per-provider queue, injected tools, path overrides, allowed requests, disable_store, raw storage ----
         GW_L = "http://127.0.0.1:18101"
@@ -7549,6 +7761,8 @@ def main():
         l113_ui_e2e(env)
         # network_config pool knobs and upstream HTTP/2 (Tov patch 0007): origins from tov-patches/tests/h2_server.py, their own gateway
         l126_e2e(env)
+        # large_payload_optimization (Tov patch 0008): big request bodies streamed to the provider and big answers streamed back: their own gateway
+        l124_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

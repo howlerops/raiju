@@ -2,15 +2,17 @@
 // the client chunk by chunk. Every request runs through the same dispatch() as
 // the Bun.serve server; streaming chat requests get a sink that writes SSE
 // events to the socket as they arrive from the upstream.
-import { listen, Http1Request, Http1Response } from "./http1"
+import { listen, Http1Request, Http1Response, BodyQueue } from "./http1"
 import { WsConnection } from "./ws"
-import { Engine, StreamSink } from "./gateway"
+import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { Ops } from "./ops"
-import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel, http1Upgrade } from "./server"
+import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel, http1Upgrade, largeFront, limitedBody } from "./server"
 import * as metrics from "./metrics"
 import { relayHttp1 } from "./realtime"
 
-export type FrontOptions = { hostname: string, port: int, maxBodyBytes: int }
+// streamThreshold: request bodies over this many bytes reach the handler as a stream (0: never; large_payload_optimization).
+// limitBytes: client.max_request_body_size_mb, checked by the handler when maxBodyBytes (the parser's) is looser than it.
+export type FrontOptions = { hostname: string, port: int, maxBodyBytes: int, streamThreshold?: int, limitBytes?: int }
 
 function pathOf(target: string): string {
   const q = target.indexOf("?")
@@ -26,10 +28,30 @@ function streamingKind(req: Http1Request): string {
   return streamsRequest(kind, req.body) ? kind : ""
 }
 
+// A request body that is still arriving, as a stream (src/http1.tov BodyQueue).
+function bodyStream(q: BodyQueue): ReadableStream {
+  return new ReadableStream({
+    async pull(c) {
+      try {
+        const v = await q.next()
+        if (v === undefined) c.close()
+        else c.enqueue(v)
+      } catch (e) {
+        c.error(e)
+      }
+    },
+    cancel() {
+      q.discard()
+    },
+  })
+}
+
 function toRequest(req: Http1Request, host: string): Request {
   const h: Record<string, string> = req.headers
   const url = "http://" + (req.headers.get("host") ?? host) + req.path
   if (req.method === "GET" || req.method === "HEAD") return new Request(url, { method: req.method, headers: h })
+  const q = req.stream
+  if (q !== undefined) return new Request(url, { method: req.method, headers: h, body: bodyStream(q) })
   // the bytes, not the decoded text: a multipart upload carries binary files
   return new Request(url, { method: req.method, headers: h, body: req.bytes })
 }
@@ -39,6 +61,25 @@ async function write(res: Http1Response, r: Response): Promise<int> {
   r.headers.forEach((value, key) => {
     h.set(key, value)
   })
+  // a streamed body (a large answer) goes out as it comes
+  const st = r.body
+  if (st !== undefined && st.pushed) {
+    res.writeHead(r.status, h)
+    let sent = 0
+    try {
+      while (true) {
+        const c = await st.pull()
+        const v = c.value
+        if (c.done || v === undefined) break
+        res.writeBytes(v)
+        sent += v.length
+      }
+    } catch (e) {
+      // the source failed after the head went out: the body ends here
+    }
+    res.end("")
+    return sent
+  }
   // bytes, so binary bodies (audio, images, file contents) pass through intact
   let body: u8[] = []
   try {
@@ -51,12 +92,30 @@ async function write(res: Http1Response, r: Response): Promise<int> {
   return body.length
 }
 
-async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request, res: Http1Response): Promise<void> {
-  const request = toRequest(req, host)
+async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request, res: Http1Response, limit: int): Promise<void> {
+  let request = toRequest(req, host)
   const t0 = performance.now()
   const label = pathLabel(pathOf(req.path))
-  const inBytes = req.bytes.length * 1.0
+  // (a streamed body has not arrived: its declared length stands in)
+  const inBytes = req.stream === undefined ? req.bytes.length * 1.0 : (parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0)
   try {
+    // large_payload_optimization: a big body is refused, streamed on, or read after all
+    const lf = await largeFront(engine, request)
+    if (lf instanceof Response) {
+      const n = await write(res, lf)
+      metrics.observeHttp(label, req.method, lf.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
+      return
+    }
+    if (lf instanceof Request) request = lf
+    if (limit > 0) {
+      const within = await limitedBody(request, limit)
+      if (within === undefined) {
+        const n = await write(res, errorResponse(413, "request body too large", "invalid_request_error", noHeaders()))
+        metrics.observeHttp(label, req.method, 413, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
+        return
+      }
+      request = within
+    }
     const kind = streamingKind(req)
     if (kind !== "") {
       const sink = new StreamSink(
@@ -96,9 +155,9 @@ export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): string
     // the other WebSocket routes (server.tov's wsUpgrade)
     return http1Upgrade(engine, ops, toRequest(req, host), accept, reject)
   }
-  listen({ hostname: opts.hostname, port: opts.port, maxBodyBytes: opts.maxBodyBytes, onUpgrade: onUpgrade }, (req, res) => {
+  listen({ hostname: opts.hostname, port: opts.port, maxBodyBytes: opts.maxBodyBytes, streamThreshold: opts.streamThreshold, onUpgrade: onUpgrade }, (req, res) => {
     // runs as its own task; the response is finished from there
-    handle(engine, ops, host, req, res)
+    handle(engine, ops, host, req, res, opts.limitBytes ?? 0)
   })
   return `http://${host}/`
 }

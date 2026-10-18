@@ -1,6 +1,6 @@
 import { listen } from "../src/http1"
 import { fields, find, rawStr } from "../src/json"
-import { sha256, utf8 } from "../src/crypto"
+import { sha256, utf8, toHex } from "../src/crypto"
 import { encodeUrl } from "../src/base64"
 import { liveAnswer, liveEvents, liveStats, liveReset } from "./mock_live"
 // A fake provider for end-to-end tests. Speaks enough of OpenAI, Anthropic,
@@ -10,7 +10,8 @@ import { liveAnswer, liveEvents, liveStats, liveReset } from "./mock_live"
 //   model "limited-*" → always 429 with retry-after-ms: 2500
 //   key "bad-key"     → 401
 //   model "policy-quota" → 200 with x-quota-state: exhausted (trips a circuit policy)
-type Seen = { path: string, auth: string, body: string, team: string, tenant: string }
+// size and sha: the request body's length and SHA-256, kept for bodies too big to keep whole (body is then its first 2000 bytes)
+type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string }
 
 const seen: Seen[] = []
 // webhook deliveries received: the path, the Standard Webhooks headers and the body
@@ -80,7 +81,9 @@ function anthropicRequests(body: string): { id: string, model: string }[] throws
 
 function record(req: Request, path: string, body: string): void {
   const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? req.headers.get("x-goog-api-key") ?? req.headers.get("api-key") ?? ""
-  seen.push({ path: path, auth: auth, body: body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "" })
+  const size = body.byteLength
+  const big = size > 65536
+  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "" })
 }
 
 function failure(model: string, auth: string): Response | undefined {
@@ -386,6 +389,15 @@ Bun.serve<string>({
         const model = m.model ?? ""
         const f = failure(model, req.headers.get("authorization") ?? "")
         if (f !== undefined) return f
+        // large_payload_optimization: "large-answer" answers with a 3 MB completion, "large-stream" with a 3 MB event stream
+        if (model === "large-answer") return Response.json({ id: "cl1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "y".repeat(3000000) }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
+        if (model === "large-stream") {
+          const bulk = "z".repeat(1000)
+          let sse = ""
+          for (let i = 0; i < 3000; i++) sse += `data: {"id":"cs1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":{"content":"${bulk}"},"finish_reason":null}]}\n\n`
+          sse += `data: {"id":"cs1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\ndata: [DONE]\n\n`
+          return new Response(sse, { headers: { "content-type": "text/event-stream" } })
+        }
         // "strict-*" refuses the sampling parameters its datasheet row does not list (the compat tests)
         if (model.startsWith("strict-")) {
           for (const p of ["temperature", "top_p", "seed", "presence_penalty"]) {

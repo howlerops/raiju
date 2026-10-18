@@ -1,0 +1,489 @@
+// Bifrost's large_payload_optimization: a request body over request_threshold_bytes is not read whole.
+// The first prefetch_size_bytes are read to find the routing fields (scanPrefix), and the whole body then
+// goes to the provider as a stream (LargeBody.stream) while the request log keeps a truncated copy
+// (BodyTap). Bodies over max_payload_bytes are refused. The Tov patch 0008 gives fetch a stream body and
+// Bun.serve (and src/http1.tov) a request body that arrives as a stream.
+import { Config } from "./config"
+import { decodeString, quote } from "./json"
+
+// The settings with Bifrost's defaults (config.schema.json): 10 MiB, 10 MiB, 64 KiB, 500 MiB, 1 MiB.
+export type LargeSettings = { requestThreshold: int, responseThreshold: int, prefetch: int, maxPayload: int, truncatedLog: int }
+
+export const DEFAULT_REQUEST_THRESHOLD = 10485760
+export const DEFAULT_RESPONSE_THRESHOLD = 10485760
+export const DEFAULT_PREFETCH = 65536
+export const DEFAULT_MAX_PAYLOAD = 524288000
+export const DEFAULT_TRUNCATED_LOG = 1048576
+
+function orDefault(v: int | undefined, d: int): int {
+  if (v === undefined || v < 0) return d
+  return v
+}
+
+// undefined while the feature is off (enabled false or absent, as in Bifrost).
+export function largeSettings(cfg: Config): LargeSettings | undefined {
+  const c = cfg.large_payload_optimization
+  if (c === undefined || c.enabled !== true) return undefined
+  return {
+    requestThreshold: orDefault(c.request_threshold_bytes, DEFAULT_REQUEST_THRESHOLD),
+    responseThreshold: orDefault(c.response_threshold_bytes, DEFAULT_RESPONSE_THRESHOLD),
+    prefetch: orDefault(c.prefetch_size_bytes, DEFAULT_PREFETCH),
+    maxPayload: orDefault(c.max_payload_bytes, DEFAULT_MAX_PAYLOAD),
+    truncatedLog: orDefault(c.truncated_log_bytes, DEFAULT_TRUNCATED_LOG),
+  }
+}
+
+// ---- reading the routing fields from the first bytes ----
+
+// What Bifrost keeps as LargePayloadMetadata: the model (and where its string literal is, for the rewrite to
+// the provider's model name), whether the body asks for a stream, generationConfig.responseModalities and
+// whether it has a speechConfig (Gemini), and thread.type (Anthropic). A field the prefix does not reach is absent.
+export type Prefix = {
+  model: string,
+  hasModel: bool,
+  modelFrom: int,
+  modelTo: int,
+  hasStream: bool,
+  stream: bool,
+  modalities: string[],
+  speech: bool,
+  threadType: string,
+}
+
+function isWs(c: int): bool {
+  return c === 32 || c === 9 || c === 10 || c === 13
+}
+
+function skipWs(b: u8[], i0: int): int {
+  let i = i0
+  while (i < b.length && isWs(int(b[i]!))) i += 1
+  return i
+}
+
+// The index just past the string that opens at b[i], or -1 when the bytes end inside it.
+function endOfString(b: u8[], i0: int): int {
+  let i = i0 + 1
+  while (i < b.length) {
+    const c = int(b[i]!)
+    if (c === 92) {
+      i += 2
+      continue
+    }
+    if (c === 34) return i + 1
+    i += 1
+  }
+  return -1
+}
+
+// The index just past the value that starts at b[i], or -1 when the bytes end inside it.
+function endOfValue(b: u8[], i0: int): int {
+  if (i0 >= b.length) return -1
+  const c0 = int(b[i0]!)
+  if (c0 === 34) return endOfString(b, i0)
+  if (c0 === 123 || c0 === 91) {
+    let depth = 0
+    let i = i0
+    while (i < b.length) {
+      const c = int(b[i]!)
+      if (c === 34) {
+        const e = endOfString(b, i)
+        if (e < 0) return -1
+        i = e
+        continue
+      }
+      if (c === 123 || c === 91) depth += 1
+      else if (c === 125 || c === 93) {
+        depth -= 1
+        if (depth === 0) return i + 1
+      }
+      i += 1
+    }
+    return -1
+  }
+  // a number or a literal: it ends at a delimiter, which must be in the bytes
+  let i = i0
+  while (i < b.length) {
+    const c = int(b[i]!)
+    if (c === 44 || c === 125 || c === 93 || isWs(c)) return i
+    i += 1
+  }
+  return -1
+}
+
+function text(b: u8[], from: int, to: int): string {
+  try {
+    return new TextDecoder().decode(b.slice(from, to))
+  } catch (e) {
+    return ""
+  }
+}
+
+function matches(b: u8[], from: int, to: int, name: string): bool {
+  // a key without escapes: the quotes are at from and to - 1
+  const n = new TextEncoder().encode(name)
+  if (to - from - 2 !== n.length) return false
+  for (let i = 0; i < n.length; i++) if (b[from + 1 + i] !== n[i]) return false
+  return true
+}
+
+function boolAt(b: u8[], i: int, e: int): bool | undefined {
+  const t = text(b, i, e)
+  if (t === "true") return true
+  if (t === "false") return false
+  return undefined
+}
+
+// The members of the object that opens at b[start]: calls on(keyFrom, keyTo, valueFrom, valueTo) for each whose
+// value lies inside the bytes; stops at the first member that is cut off.
+function eachMember(b: u8[], start: int, on: (kf: int, kt: int, vf: int, vt: int) => void): void {
+  let i = skipWs(b, start)
+  if (i >= b.length || int(b[i]!) !== 123) return
+  i += 1
+  while (true) {
+    i = skipWs(b, i)
+    if (i >= b.length) return
+    const c = int(b[i]!)
+    if (c === 125) return
+    if (c === 44) {
+      i += 1
+      continue
+    }
+    if (c !== 34) return
+    const ke = endOfString(b, i)
+    if (ke < 0) return
+    let j = skipWs(b, ke)
+    if (j >= b.length || int(b[j]!) !== 58) return
+    j = skipWs(b, j + 1)
+    const ve = endOfValue(b, j)
+    if (ve < 0) return
+    on(i, ke, j, ve)
+    i = ve
+  }
+}
+
+// Reads the routing fields from the start of a JSON request body. Nested objects are entered only for the
+// two Bifrost reads (generationConfig and thread); every other value is skipped, so a big message array
+// costs one pass and a field after it is simply not found.
+export function scanPrefix(b: u8[]): Prefix {
+  const p: Prefix = { model: "", hasModel: false, modelFrom: 0, modelTo: 0, hasStream: false, stream: false, modalities: [], speech: false, threadType: "" }
+  let model = ""
+  let hasModel = false
+  let mf = 0
+  let mt = 0
+  let hasStream = false
+  let stream = false
+  const modalities: string[] = []
+  let speech = false
+  let threadType = ""
+  eachMember(b, 0, (kf, kt, vf, vt) => {
+    if (matches(b, kf, kt, "model")) {
+      if (int(b[vf]!) !== 34) return
+      try {
+        model = decodeString(text(b, vf, vt))
+        hasModel = true
+        mf = vf
+        mt = vt
+      } catch (e) {
+        hasModel = false
+      }
+    } else if (matches(b, kf, kt, "stream")) {
+      const v = boolAt(b, vf, vt)
+      if (v !== undefined) {
+        hasStream = true
+        stream = v
+      }
+    } else if (matches(b, kf, kt, "generationConfig")) {
+      eachMember(b, vf, (k2f, k2t, v2f, v2t) => {
+        if (matches(b, k2f, k2t, "speechConfig")) speech = true
+        else if (matches(b, k2f, k2t, "responseModalities") && int(b[v2f]!) === 91) {
+          let i = skipWs(b, v2f + 1)
+          while (i < v2t) {
+            const c = int(b[i]!)
+            if (c === 34) {
+              const e = endOfString(b, i)
+              if (e < 0) break
+              try {
+                modalities.push(decodeString(text(b, i, e)))
+              } catch (x) {
+                break
+              }
+              i = e
+            } else {
+              i += 1
+            }
+          }
+        }
+      })
+    } else if (matches(b, kf, kt, "thread")) {
+      eachMember(b, vf, (k2f, k2t, v2f, v2t) => {
+        if (matches(b, k2f, k2t, "type") && int(b[v2f]!) === 34) {
+          try {
+            threadType = decodeString(text(b, v2f, v2t))
+          } catch (x) {
+            threadType = ""
+          }
+        }
+      })
+    }
+  })
+  p.model = model
+  p.hasModel = hasModel
+  p.modelFrom = mf
+  p.modelTo = mt
+  p.hasStream = hasStream
+  p.stream = stream
+  p.modalities = modalities
+  p.speech = speech
+  p.threadType = threadType
+  return p
+}
+
+// ---- the body on its way to the provider ----
+
+// Counts the bytes that pass, keeps the first `cap` of them for the request log, and notes the body going over `limit`.
+export class BodyTap {
+  total = 0
+  preview: u8[] = []
+  over = false
+  constructor(readonly cap: int, readonly limit: int) {}
+
+  // false once the total is over the limit
+  see(b: u8[]): bool {
+    this.total += b.length
+    const room = this.cap - this.preview.length
+    if (room > 0) {
+      const n = b.length < room ? b.length : room
+      for (let i = 0; i < n; i++) this.preview.push(b[i]!)
+    }
+    if (this.total > this.limit) {
+      this.over = true
+      return false
+    }
+    return true
+  }
+
+  // the kept bytes as text (invalid UTF-8 shows as ?)
+  previewText(): string {
+    const p = this.preview
+    try {
+      return new TextDecoder().decode(p)
+    } catch (e) {
+      const out: u8[] = []
+      for (const c of p) out.push(int(c) < 128 ? c : u8(63))
+      try {
+        return new TextDecoder().decode(out)
+      } catch (x) {
+        return ""
+      }
+    }
+  }
+}
+
+// A request body being sent on: the bytes already read (the prefix), the rest still to come from the client,
+// and the provider's model name to put where the caller's was.
+export class LargeBody {
+  tap: BodyTap
+  // the provider's name for the model (set when the target is chosen); "" sends the prefix as it came
+  upstreamModel = ""
+  constructor(readonly settings: LargeSettings, readonly prefix: u8[], readonly meta: Prefix, readonly source: ReadableStream | undefined, readonly declared: int) {
+    this.tap = new BodyTap(settings.truncatedLog, settings.maxPayload)
+    this.tap.see(prefix)
+  }
+
+  // the model literal's length change, for an upstream Content-Length
+  delta(): int {
+    if (this.upstreamModel === "" || !this.meta.hasModel) return 0
+    return new TextEncoder().encode(quote(this.upstreamModel)).length - (this.meta.modelTo - this.meta.modelFrom)
+  }
+
+  // the prefix with the provider's model name where the caller's was
+  head(): u8[] {
+    const m = this.meta
+    if (this.upstreamModel === "" || !m.hasModel || this.upstreamModel === m.model) return this.prefix
+    const mid = new TextEncoder().encode(quote(this.upstreamModel))
+    const out: u8[] = []
+    for (let i = 0; i < m.modelFrom; i++) out.push(this.prefix[i]!)
+    for (const c of mid) out.push(c)
+    for (let i = m.modelTo; i < this.prefix.length; i++) out.push(this.prefix[i]!)
+    return out
+  }
+
+  // The whole body as a stream: the (rewritten) prefix, then the rest as the client sends it. Reading stops
+  // with an error when the body goes over max_payload_bytes.
+  stream(): ReadableStream {
+    let first = true
+    const self = this
+    return new ReadableStream({
+      async pull(c) {
+        if (first) {
+          first = false
+          c.enqueue(self.head())
+          return
+        }
+        const src = self.source
+        if (src === undefined) {
+          c.close()
+          return
+        }
+        let chunk: u8[] | undefined = undefined
+        try {
+          const r = await src.pull()
+          chunk = r.value
+          if (r.done) chunk = undefined
+        } catch (e) {
+          c.error(e)
+          return
+        }
+        const v = chunk
+        if (v === undefined) {
+          c.close()
+          return
+        }
+        if (!self.tap.see(v)) {
+          c.error(new Error("the request body is over max_payload_bytes"))
+          await src.cancel()
+          return
+        }
+        c.enqueue(v)
+      },
+      cancel() {
+        const src = self.source
+        if (src !== undefined) src.cancel()
+      },
+    })
+  }
+}
+
+// The kinds of route this feature serves (the OpenAI-format JSON routes that name a model in the body).
+export function largeRoute(path: string): string {
+  if (path === "/v1/chat/completions" || path === "/openai/v1/chat/completions" || path === "/openai/chat/completions") return "chat"
+  if (path === "/v1/completions") return "completions"
+  if (path === "/v1/embeddings") return "embeddings"
+  return ""
+}
+
+// ---- tests ----
+
+function bytes(s: string): u8[] {
+  return new TextEncoder().encode(s)
+}
+
+function str(b: u8[]): string {
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+test("defaults and the off switch", () => {
+  expect(largeSettings({})).toBe(undefined)
+  expect(largeSettings({ large_payload_optimization: { request_threshold_bytes: 5 } })).toBe(undefined)
+  const s = largeSettings({ large_payload_optimization: { enabled: true } })!
+  expect(s.requestThreshold).toBe(10485760)
+  expect(s.responseThreshold).toBe(10485760)
+  expect(s.prefetch).toBe(65536)
+  expect(s.maxPayload).toBe(524288000)
+  expect(s.truncatedLog).toBe(1048576)
+  const t = largeSettings({ large_payload_optimization: { enabled: true, request_threshold_bytes: 1, response_threshold_bytes: 2, prefetch_size_bytes: 3, max_payload_bytes: 4, truncated_log_bytes: 5 } })!
+  expect(t.requestThreshold).toBe(1)
+  expect(t.responseThreshold).toBe(2)
+  expect(t.prefetch).toBe(3)
+  expect(t.maxPayload).toBe(4)
+  expect(t.truncatedLog).toBe(5)
+  // a negative value is not a size: the default stands
+  const n = largeSettings({ large_payload_optimization: { enabled: true, max_payload_bytes: -1 } })!
+  expect(n.maxPayload).toBe(524288000)
+})
+
+test("scanPrefix reads the model and the stream flag in any order", () => {
+  const a = scanPrefix(bytes(`{"model":"openai/gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+  expect(a.hasModel).toBe(true)
+  expect(a.model).toBe("openai/gpt-4o")
+  expect(a.hasStream).toBe(true)
+  expect(a.stream).toBe(true)
+  const b = scanPrefix(bytes(` { "messages" : [ {"role":"user","content":"a \\" quote, and } brace"} ] , "stream" : false , "model" : "gpt-4o-mini" } `))
+  expect(b.model).toBe("gpt-4o-mini")
+  expect(b.hasStream).toBe(true)
+  expect(b.stream).toBe(false)
+})
+
+test("scanPrefix gives the model literal's place, for the rewrite", () => {
+  const src = `{"stream":true,"model":"openai/gpt-4o","messages":[]}`
+  const p = scanPrefix(bytes(src))
+  expect(src.slice(p.modelFrom, p.modelTo)).toBe(`"openai/gpt-4o"`)
+  expect(p.modelFrom).toBe(src.indexOf(`"openai/gpt-4o"`))
+})
+
+test("scanPrefix on a cut prefix finds what is whole and nothing more", () => {
+  // the model comes after a message that runs past the prefix
+  const cut = scanPrefix(bytes(`{"messages":[{"role":"user","content":"` + "x".repeat(200)))
+  expect(cut.hasModel).toBe(false)
+  expect(cut.hasStream).toBe(false)
+  // a model whose string is cut off
+  const half = scanPrefix(bytes(`{"stream":true,"model":"openai/gp`))
+  expect(half.hasModel).toBe(false)
+  expect(half.hasStream).toBe(true)
+  // a number cut at the end of the bytes may continue
+  const num = scanPrefix(bytes(`{"max_tokens":12`))
+  expect(num.hasModel).toBe(false)
+  expect(scanPrefix(bytes(``)).hasModel).toBe(false)
+  expect(scanPrefix(bytes(`[1,2]`)).hasModel).toBe(false)
+})
+
+test("scanPrefix reads escapes in the model and ignores look-alike keys inside values", () => {
+  const e = scanPrefix(bytes(`{"model":"a\\u0062c","x":{"model":"inner","stream":true}}`))
+  expect(e.model).toBe("abc")
+  expect(e.hasStream).toBe(false)
+  // keys that merely start like a wanted one
+  const k = scanPrefix(bytes(`{"models":"no","streaming":true,"model":"yes"}`))
+  expect(k.model).toBe("yes")
+  expect(k.hasStream).toBe(false)
+  // a model that is not a string is not a model
+  expect(scanPrefix(bytes(`{"model":5}`)).hasModel).toBe(false)
+})
+
+test("scanPrefix reads Bifrost's other metadata", () => {
+  const g = scanPrefix(bytes(`{"model":"gemini-2.0","generationConfig":{"temperature":0.2,"responseModalities":["AUDIO","TEXT"],"speechConfig":{"voiceConfig":{}}},"thread":{"id":"t","type":"create"}}`))
+  expect(g.modalities.join(",")).toBe("AUDIO,TEXT")
+  expect(g.speech).toBe(true)
+  expect(g.threadType).toBe("create")
+  const none = scanPrefix(bytes(`{"model":"m","generationConfig":{"temperature":1}}`))
+  expect(none.speech).toBe(false)
+  expect(none.modalities.length).toBe(0)
+  expect(none.threadType).toBe("")
+})
+
+test("LargeBody puts the provider's model name where the caller's was", () => {
+  const src = `{"model":"openai/gpt-4o","messages":[]}`
+  const meta = scanPrefix(bytes(src))
+  const body = new LargeBody({ requestThreshold: 1, responseThreshold: 1, prefetch: 64, maxPayload: 1000, truncatedLog: 10 }, bytes(src), meta, undefined, 38)
+  expect(str(body.head())).toBe(src)
+  expect(body.delta()).toBe(0)
+  body.upstreamModel = "gpt-4o"
+  expect(str(body.head())).toBe(`{"model":"gpt-4o","messages":[]}`)
+  expect(body.delta()).toBe(-7)
+  body.upstreamModel = "a-much-longer-model-name"
+  expect(str(body.head())).toBe(`{"model":"a-much-longer-model-name","messages":[]}`)
+  expect(body.delta()).toBe("a-much-longer-model-name".byteLength - "openai/gpt-4o".byteLength)
+})
+
+test("BodyTap keeps the first bytes and notes the limit", () => {
+  const t = new BodyTap(5, 12)
+  expect(t.see(bytes("abc"))).toBe(true)
+  expect(t.see(bytes("defgh"))).toBe(true)
+  expect(t.previewText()).toBe("abcde")
+  expect(t.total).toBe(8)
+  expect(t.see(bytes("12345"))).toBe(false)
+  expect(t.over).toBe(true)
+  expect(t.previewText()).toBe("abcde")
+})
+
+test("largeRoute names the routes this serves", () => {
+  expect(largeRoute("/v1/chat/completions")).toBe("chat")
+  expect(largeRoute("/openai/v1/chat/completions")).toBe("chat")
+  expect(largeRoute("/v1/embeddings")).toBe("embeddings")
+  expect(largeRoute("/v1/completions")).toBe("completions")
+  expect(largeRoute("/v1/responses")).toBe("")
+  expect(largeRoute("/api/logs")).toBe("")
+})
