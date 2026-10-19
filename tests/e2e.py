@@ -8511,6 +8511,136 @@ def l146_e2e(env):
         gw.terminate()
         gwb.terminate()
 
+
+A2A_GRPC_LISTEN = 18245  # the port the listener binds (RAIJU_A2A_GRPC_LISTEN_PORT)
+A2A_GRPC_ADVERTISED = 18246  # server.a2a_grpc_port: what the cards advertise
+A2A_GRPC_DOMAIN = "gw.grpc.test"
+
+def l148_config(logs: str = "e2e-l148-logs"):
+    """The L148 gateway: the gRPC binding under gw.grpc.test (advertised on 18246), one agent granted to one key, and a key
+    without the grant. Push callbacks may go to the (private) mock, and the gateway's public URL is set."""
+    import hashlib
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True, "a2a_external_client_url": "https://gw.example.test/"},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, logs)},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"a2a_allow_private_push_callbacks": True, "a2a_grpc_base_domain": A2A_GRPC_DOMAIN, "a2a_grpc_port": A2A_GRPC_ADVERTISED},
+        "providers": {"openai": {"keys": [{"name": "l148", "value": "sk-l148", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l148".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-l148-a", "value": "sk-bf-l148-a"}, {"id": "vk-l148-b", "value": "sk-bf-l148-b"}],
+        },
+        "agents": [{"name": "grpc", "agent_card_url": MOCK + "/a2a/v1/.well-known/agent-card.json", "allow_private_network": True, "virtual_key_ids": ["vk-l148-a"]}],
+    }
+
+def l148_run(env, workers: int, label: str, port: int):
+    """A2A over gRPC: the lf.a2a.v1 service on its own listener (bound on RAIJU_A2A_GRPC_LISTEN_PORT, advertised as
+    server.a2a_grpc_port), the agent named by the :authority, the virtual key read from the metadata, and the eleven methods on
+    the A2A dispatch. tests/a2a_grpc_client talks to it: the SDK's own gRPC transport for the calls that work, the generated stub
+    for the statuses. The calls reach the mock agent without the caller's key and are logged under the agent's name. Needs go
+    (skipped without it). Its own gateway on 18244."""
+    import shutil
+    if shutil.which("go") is None:
+        print("skip the A2A gRPC checks: go is not installed")
+        return
+    client_dir = os.path.join(ROOT, "tests/a2a_grpc_client")
+    client = os.path.join(BUILD, "a2a_grpc_client")
+    built = subprocess.run(["go", "build", "-o", client, "."], cwd=client_dir, env={**os.environ, "GOTOOLCHAIN": "go1.26.9", "GOFLAGS": "-mod=mod"}, capture_output=True, text=True)
+    check("the A2A gRPC test client builds", built.returncode == 0, built.stderr[-600:])
+    if built.returncode != 0:
+        return
+    cfg_path = os.path.join(BUILD, f"e2e.{label}.json")
+    json.dump(l148_config(f"e2e-{label}-logs"), open(cfg_path, "w"))
+    shutil.rmtree(os.path.join(BUILD, f"e2e-{label}-logs"), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", cfg_path, "-workers", str(workers)], env={**env, "RAIJU_A2A_GRPC_LISTEN_PORT": str(A2A_GRPC_LISTEN)}, stderr=open(os.path.join(BUILD, f"e2e.{label}.log"), "w"))
+    base = f"http://127.0.0.1:{port}"
+    ADM = {"authorization": "Bearer sk-admin-l148"}
+    A = {"authorization": "Bearer sk-bf-l148-a"}
+    def api(method, path, body=None):
+        return call(method, path, body, ADM, base=base, auth=False)
+    def gwc(method, path, body=None, headers=None):
+        return call(method, path, body, headers, base=base, auth=False)
+    def upstream():
+        got = json.loads(call("GET", "/_a2a/seen", base=MOCK)[2])
+        return [x for x in got if x["path"] == "/a2a/v1/json-rpc"]
+    try:
+        wait(base + "/health")
+        # before the card is fetched, a call is refused in both bindings: 503 over HTTP, UNAVAILABLE over gRPC, the same message
+        s, _, b = gwc("POST", "/agents/a2a/grpc/json-rpc", {"jsonrpc": "2.0", "id": "1", "method": "GetTask", "params": {"id": "precard-task"}}, A)
+        check("a call before the agent's card is fetched is refused with 503 and the card's message", s == 503 and "has not been fetched" in b, (s, b[:200]))
+        pre = subprocess.run([client, "-addr", f"127.0.0.1:{A2A_GRPC_LISTEN}", "-domain", A2A_GRPC_DOMAIN, "-agent", "grpc", "-key", "sk-bf-l148-a", "-precard"], capture_output=True, text=True, timeout=120)
+        pre_row = json.loads(pre.stdout.strip().splitlines()[0]) if pre.returncode == 0 and pre.stdout.strip() != "" else {}
+        check("a gRPC call before the agent's card is fetched is UNAVAILABLE with the same message", pre_row.get("code") == "UNAVAILABLE" and pre_row.get("message") == "the card of grpc has not been fetched: refresh it through /api/agents/grpc/refresh-card", (pre.returncode, pre.stdout[:200], pre.stderr[-300:], b[:200]))
+        s, _, b = api("POST", "/api/agents/grpc/refresh-card")
+        check("the agent's card is fetched for the gRPC checks", s == 200, (s, b[:200]))
+        s, _, b = gwc("GET", "/agents/a2a/grpc/.well-known/agent-card.json", None, A)
+        card = json.loads(b) if s == 200 else {}
+        grpc_ifs = [i for i in card.get("supportedInterfaces", []) if i.get("protocolBinding") == "GRPC"]
+        check("the served card lists the gRPC interface under the agent's name and the advertised port", len(grpc_ifs) == 1 and grpc_ifs[0]["url"] == f"grpc.{A2A_GRPC_DOMAIN}:{A2A_GRPC_ADVERTISED}", (s, b[:300]))
+        s, _, b = api("GET", "/api/agents/history?limit=200")
+        before = len(json.loads(b).get("history", [])) if s == 200 else 0
+        before_up = len(upstream())
+        run = subprocess.run([client, "-addr", f"127.0.0.1:{A2A_GRPC_LISTEN}", "-domain", A2A_GRPC_DOMAIN, "-agent", "grpc", "-key", "sk-bf-l148-a", "-nogrant", "sk-bf-l148-b", "-push", MOCK + "/cb/push"], capture_output=True, text=True, timeout=300)
+        check("the gRPC client runs to the end", run.returncode == 0, (run.returncode, run.stderr[-600:]))
+        rows = {}
+        for line in run.stdout.splitlines():
+            if line.strip() != "":
+                r = json.loads(line)
+                rows[r["case"]] = r
+        def row(name):
+            return rows.get(name, {"code": "MISSING", "message": "", "result": "", "events": []})
+        def ok_with(name, *words):
+            r = row(name)
+            text = (r.get("result", "") + " " + " ".join(r.get("events", []))).lower()
+            return r["code"] == "OK" and all(w in text for w in words)
+        check("SendMessage (the SDK's transport) answers the task, with the agent's echo", ok_with("send-message", "hi-grpc", "complet"), row("send-message"))
+        check("SendStreamingMessage passes each event of the agent's stream as it arrives", row("send-streaming-message")["code"] == "OK" and len(row("send-streaming-message")["events"]) >= 2 and "complet" in row("send-streaming-message")["events"][-1].lower(), row("send-streaming-message"))
+        check("GetTask reads the task", ok_with("get-task", "complet"), row("get-task"))
+        check("CancelTask cancels it", ok_with("cancel-task", "cancel"), row("cancel-task"))
+        check("a push config is created for the task", ok_with("push-create", "cfg-grpc"), row("push-create"))
+        check("a push config is read back", ok_with("push-get", "cfg-grpc"), row("push-get"))
+        check("the push configs of the task are listed", ok_with("push-list", "cfg-grpc"), row("push-list"))
+        check("a push config is deleted", row("push-delete")["code"] == "OK", row("push-delete"))
+        check("GetExtendedAgentCard answers the agent's card", ok_with("extended-card", "v1-agent"), row("extended-card"))
+        check("SubscribeToTask streams the task's events", row("subscribe-to-task")["code"] == "OK" and len(row("subscribe-to-task")["events"]) >= 1, row("subscribe-to-task"))
+        check("an authority under another domain is NOT_FOUND", row("wrong-authority")["code"] == "NOT_FOUND" and row("wrong-authority")["message"] == "agent not found", row("wrong-authority"))
+        check("an authority that is the domain itself names no agent: NOT_FOUND", row("domain-only")["code"] == "NOT_FOUND", row("domain-only"))
+        check("an agent the gateway does not have is NOT_FOUND, as an unknown authority is", row("unknown-agent")["code"] == "NOT_FOUND" and row("unknown-agent")["message"] == "agent not found", row("unknown-agent"))
+        check("a call without a virtual key is UNAUTHENTICATED", row("no-key")["code"] == "UNAUTHENTICATED", row("no-key"))
+        check("a call with a key the gateway does not know is UNAUTHENTICATED", row("bad-key")["code"] == "UNAUTHENTICATED", row("bad-key"))
+        check("a key without the agent's grant is PERMISSION_DENIED", row("no-grant")["code"] == "PERMISSION_DENIED", row("no-grant"))
+        check("a task the agent does not have is NOT_FOUND with the agent's message", row("task-missing")["code"] == "NOT_FOUND" and row("task-missing")["message"] == "task not found", row("task-missing"))
+        check("an agent's error is INTERNAL with its message", row("agent-error")["code"] == "INTERNAL" and row("agent-error")["message"] == "agent failed on request", row("agent-error"))
+        check("the key sent as x-api-key is read", row("api-key-header")["code"] == "OK", row("api-key-header"))
+        sent = upstream()[before_up:]
+        check("the calls reach the mock agent as JSON-RPC with the v1 method names", any(x["body"].find('"method":"SendMessage"') >= 0 for x in sent) and any(x["body"].find('"method":"CancelTask"') >= 0 for x in sent), [x["body"][:120] for x in sent[:3]])
+        check("the agent does not get the caller's virtual key", len(sent) > 0 and all("sk-bf-l148" not in json.dumps(x) for x in sent), sent[:1])
+        s, _, b = api("GET", "/api/agents/history?limit=200")
+        hist = json.loads(b).get("history", []) if s == 200 else []
+        mine = [x for x in hist[: max(0, len(hist) - before)]]
+        check("every call that reached the agent is logged under its name, with its method", s == 200 and len(mine) >= 8 and all(x["agent_name"] == "grpc" for x in mine) and any(x["method"] == "SendMessage" for x in mine), (s, len(mine), b[:200]))
+        s, _, b = api("GET", "/api/agents/history?agent_names=grpc&limit=200")
+        check("the agent history selects the gRPC calls by name", s == 200 and json.loads(b).get("total", 0) >= 8, (s, b[:200]))
+        s, _, _ = gwc("GET", "/health")
+        check("the HTTP side of the gateway still answers", s == 200, s)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+def l148_e2e(env):
+    """The L148 checks on a single-process gateway, which opens the gRPC listener at start (its own gateway on 18244)."""
+    l148_run(env, 1, "l148", 18244)
+
+def l148w_e2e(env):
+    """The L148 checks on a bun gateway with two workers: one worker opens the gRPC listener after the fork (the lease in the
+    share folder), the cards of both advertise the interface, and calls to either reach the agent. Its own gateway on 18244,
+    after the single-process one has stopped. http1 runs one process, so it is skipped there."""
+    if os.environ.get("RAIJU_SERVER", "bun") == "http1":
+        print("skip the two-worker A2A gRPC checks: http1 runs one process")
+        return
+    l148_run(env, 2, "l148w", 18244)
+
 def main():
     unique_ports()
     build()
@@ -10795,6 +10925,10 @@ def main():
         l134b_e2e(env)
         # L138: A2A push state shared by the workers of a node, exactly-once relay across workers: their own gateway
         l138_e2e(env)
+        # L148: A2A over gRPC: the lf.a2a.v1 listener, the agent named by the authority, the key from the metadata, the eleven methods (go client): their own gateway
+        l148_e2e(env)
+        # L148 with two bun workers: the listener opened by one of them, the cards in both
+        l148w_e2e(env)
         # MCP code mode: the meta-tools in chat requests, stubs and docs, programs over the MCP tools, the key gates on nested calls and the limits: their own gateways
         l117_e2e(env)
         # management API keys: a value shown once, a key's own permissions, the ceiling on grants, expiry, deletion and a restart: their own gateway
