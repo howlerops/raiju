@@ -2550,6 +2550,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/crews/tasks/{task_id}/outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Records an attempt's outcome on a task (quality, verifier signal, accuracy)
+         * @description The attempt's cost is summed from its log rows (x-raiju-task-attempt). The first outcome of an attempt counts: a repeat answers with the stored one (recorded false) and changes nothing. The outcome is credited to the learned evidence of the crew's roles. A pass or no verifier completes the task (its cost is paced in budget mode); a fail leaves it open for next.
+         */
+        post: operations["postApiCrewsTasksTaskIdOutcome"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/crews/tasks/{task_id}/next": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The sequential layer's decision after a task's attempts (accept, or the next attempt's crew)
+         * @description Pandora's rule on the within-task posterior (paper section 3.4, Prop. 11), over the class frontier's crews given the attempts' verifier signals. It accepts when the layer is off for the pool, the task is complete, the attempt budget is used up, the verifier's accuracy is unknown or at or below the threshold of Theorem 2, or no crew is worth its cost; accept completes the task. Otherwise it starts attempt k+1 on the crew it picks: later calls carrying that attempt number go to that crew, and calls carrying an earlier one keep theirs.
+         */
+        post: operations["postApiCrewsTasksTaskIdNext"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/alerts": {
         parameters: {
             query?: never;
@@ -17955,6 +17995,141 @@ export interface operations {
                 };
             };
             /** @description No such pool, or no task of that name in it. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiCrewsTasksTaskIdOutcome: {
+        parameters: {
+            query: {
+                /** @description Pool name */
+                pool: string;
+            };
+            header?: never;
+            path: {
+                /** @description Task id */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The task's quality for this attempt, 0 to 1 */
+                    quality: number;
+                    /**
+                     * @description The verifier's signal, when it spoke
+                     * @enum {string}
+                     */
+                    verifier?: "pass" | "fail";
+                    /** @description The attempt; the task's current attempt when left out */
+                    attempt?: number;
+                    /** @description The verifier's accuracy, when known (else the pool's sequential.verifier_accuracy for the class) */
+                    accuracy?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description OK, with the attempt's stored outcome and whether this call recorded it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description The body names no valid quality, verifier, attempt or accuracy. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No pool of that name, no task in force, or no record of the attempt. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiCrewsTasksTaskIdNext: {
+        parameters: {
+            query: {
+                /** @description Pool name */
+                pool: string;
+            };
+            header?: never;
+            path: {
+                /** @description Task id */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK, with action accept (and its reason) or attempt (its number, crew and reservation index) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No pool of that name, or no task in force. */
             404: {
                 headers: {
                     [name: string]: unknown;

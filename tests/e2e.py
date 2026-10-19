@@ -8873,6 +8873,169 @@ def l153_e2e(env):
         gw2.terminate()
         gw2.wait()
 
+GW_L154 = "http://127.0.0.1:18260"  # crew outcomes: an escalation pool (cheap, then strong), the sequential layer, learning
+GW_L154B = "http://127.0.0.1:18261"  # the same pool in budget mode: a completed task over budget paces the multiplier
+GW_L154E = "http://127.0.0.1:18262"  # the same pool with a one-second task ttl: an expired task leaves the state
+L154_ADMIN = {"authorization": "Bearer sk-admin-l154"}
+L154_POOL = "codeaf"
+L154_CLASSES = ["bug-fix", "open-ended", "other"]
+
+def l154_config(tag, operating_point, ttl, pricing):
+    """The crew gateway for L154: the mock as one OpenAI-format provider; two candidates, cheap and strong, whose costs are
+    set by pricing; the worker's prior favours the strong candidate by 0.55 over the reference (the cheap one); explicit
+    call profiles, so the learned ones do not move the multiplier; the sequential layer on, with one attempt per crew."""
+    import hashlib
+    profiles = {c: {"worker": {"calls": 1, "input_tokens": 2000, "output_tokens": 500}, "checker": {"calls": 1, "input_tokens": 2000, "output_tokens": 500}} for c in L154_CLASSES}
+    return {
+        "client": {"enforce_auth_on_inference": False},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l154".encode()).hexdigest()}]},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l154-logs-" + tag)},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "pricing": pricing,
+        "providers": {
+            "openai": {"keys": [{"name": "l154", "value": "sk-l154", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "crews": {"task_ttl_seconds": ttl, "pools": [{
+            "name": L154_POOL,
+            "roles": ["worker", "checker"],
+            "classes": L154_CLASSES,
+            "uncertain_class": "open-ended",
+            "candidates": [
+                {"id": "cheap", "model": "openai/crew-cheap", "route": "api"},
+                {"id": "strong", "model": "openai/crew-strong", "route": "api"},
+            ],
+            "profiles": profiles,
+            "priors": {"baseline": {"bug-fix": 0.4}, "cells": [{"class": "bug-fix", "role": "worker", "candidate": "strong", "delta": 0.55, "n": 50, "info": 0.2}]},
+            "operating_point": operating_point,
+            "sequential": {"enabled": True, "max_attempts": 6, "per_candidate": 1, "verifier_accuracy": {"bug-fix": 0.9}},
+            "credibility": {"prior_scale": 1.2},
+        }]},
+    }
+
+L154_CHEAP = {"openai/crew-cheap": {"input_cost_per_token": 0.0000001, "output_cost_per_token": 0.0000001}, "openai/crew-strong": {"input_cost_per_token": 0.00001, "output_cost_per_token": 0.00001}}
+# dear, with the strong candidate dearer: the frontier needs two vertices, else the warm start is 0 and eq. 12 cannot move it
+L154_DEAR = {"openai/crew-cheap": {"input_cost_per_token": 0.01, "output_cost_per_token": 0.01}, "openai/crew-strong": {"input_cost_per_token": 0.1, "output_cost_per_token": 0.1}}
+
+def l154_chat(base, marker, task, role, attempt=None):
+    """A chat call of the pool's task, forced to bug-fix; its user turn carries the marker that finds it at the mock."""
+    h = {"x-raiju-task-id": task, "x-raiju-crew-role": role, "x-raiju-task-class": "bug-fix"}
+    if attempt is not None:
+        h["x-raiju-task-attempt"] = str(attempt)
+    body = {"model": "crew/" + L154_POOL, "messages": [{"role": "user", "content": "Fix the crash in the parser " + marker}]}
+    return call("POST", "/v1/chat/completions", body, h, base=base, auth=False)
+
+def l154_post(base, task, action, body):
+    return call("POST", f"/api/crews/tasks/{task}/{action}?pool={L154_POOL}", body, L154_ADMIN, base=base, auth=False)
+
+def l154_task(base, task):
+    return call("GET", f"/api/crews/tasks/{task}?pool={L154_POOL}", None, L154_ADMIN, base=base, auth=False)
+
+def l154_listing(base):
+    s, _, b = call("GET", "/api/crews", None, L154_ADMIN, base=base, auth=False)
+    pools = json.loads(b).get("pools", []) if s == 200 else []
+    return next((p for p in pools if p.get("name") == L154_POOL), {})
+
+def l154_e2e(env):
+    """L154: outcomes, online learning, budget pacing and the sequential layer. A task whose cheap worker fails goes to a
+    next attempt on the strong worker (the sequential layer), which its own pass completes; the outcome credits the strong
+    worker's cell, which the listing shows as learned. The outcome API's refusals and its idempotence. In budget mode a
+    completed task over budget steps the multiplier up by exp(step) (the cost is far above the budget, so the step clips).
+    With a one-second ttl an expired task leaves the state, and its cost is paced."""
+    import shutil, math
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-a"), ignore_errors=True)
+    cfg_path = os.path.join(BUILD, "e2e.l154.json")
+    json.dump(l154_config("a", {"mode": "lambda", "lambda": 23}, 3600, L154_CHEAP), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18260", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l154.log"), "w"))
+    try:
+        wait(GW_L154 + "/health")
+        s, h, b = l154_chat(GW_L154, "mk-l1", "t154-a", "worker")
+        hd = {k.lower(): v for k, v in h.items()}
+        check("the first worker call takes the cheap candidate at lambda 23, as attempt 1", s == 200 and hd.get("x-raiju-crew-candidate") == "cheap" and hd.get("x-raiju-crew-attempt") == "1", (s, hd))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.1, "verifier": "fail", "accuracy": 0.9})
+        check("the failed outcome is recorded on attempt 1", s == 200 and '"recorded":true' in b and '"completed":false' in b, (s, b[:300]))
+        s, _, b = l154_post(GW_L154, "t154-a", "next", {})
+        nx = json.loads(b) if s == 200 else {}
+        crew2 = {x.get("role"): x.get("candidate") for x in nx.get("crew", [])}
+        check("the sequential layer starts attempt 2 on the strong worker", nx.get("action") == "attempt" and nx.get("attempt") == 2 and crew2.get("worker") == "strong", (s, b[:300]))
+        s, h, b = l154_chat(GW_L154, "mk-l2", "t154-a", "worker", attempt=2)
+        hd = {k.lower(): v for k, v in h.items()}
+        check("a call carrying attempt 2 goes to the strong worker, and the mock gets its model", hd.get("x-raiju-crew-candidate") == "strong" and l153_upstream("mk-l2") == ("crew-strong", "Bearer sk-l154"), (hd, l153_upstream("mk-l2")))
+        s, h, b = l154_chat(GW_L154, "mk-l3", "t154-a", "worker", attempt=1)
+        hd = {k.lower(): v for k, v in h.items()}
+        check("a call carrying attempt 1 keeps the cheap worker", hd.get("x-raiju-crew-candidate") == "cheap", hd)
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.3, "verifier": "pass", "attempt": 2})
+        check("the strong worker's pass completes the task", s == 200 and '"completed":true' in b, (s, b[:300]))
+        s, _, b = l154_post(GW_L154, "t154-a", "next", {})
+        check("the sequential layer then accepts: the task is complete", s == 200 and json.loads(b).get("reason") == "the task is complete", (s, b[:300]))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.9, "verifier": "pass", "attempt": 2})
+        check("a second outcome for attempt 2 changes nothing (recorded false, the stored quality)", s == 200 and '"recorded":false' in b and '"quality":0.3' in b, (s, b[:300]))
+        pool = l154_listing(GW_L154)
+        cells = [c for c in pool.get("learned_cells", []) if c.get("class") == "bug-fix" and c.get("role") == "worker" and c.get("candidate") == "strong"]
+        check("the strong worker's cell is learned from its outcome: one outcome, its estimate below the prior", len(cells) == 1 and cells[0]["outcomes"] == 1 and cells[0]["delta_hat"] < cells[0]["prior_delta"] - 0.05, cells)
+        bugfix = next((c for c in pool.get("classes_detail", []) if c.get("class") == "bug-fix"), {})
+        check("the class lists what it learned: its two credited outcomes (the reference crew, and the strong worker) and the reference quality", bugfix.get("learned", {}).get("outcomes") == 2 and bugfix["learned"]["reference_quality"] > 0, bugfix.get("learned"))
+        s, _, b = l154_task(GW_L154, "t154-a")
+        t = json.loads(b) if s == 200 else {}
+        atts = {x["attempt"]: x for x in t.get("attempts", [])}
+        check("the task's detail lists both attempts with their crews, outcomes and costs", sorted(atts) == [1, 2] and atts[1]["outcome"]["verifier"] == "fail" and atts[2]["outcome"]["verifier"] == "pass" and atts[2]["crew"][0]["candidate"] == "strong" and atts[1]["cost"] > 0, (s, b[:400]))
+        s, _, b = l154_post(GW_L154, "nope-task", "outcome", {"quality": 0.5})
+        check("an outcome for a task with no assignment is a 404", s == 404, (s, b[:200]))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 1.5})
+        check("a quality above 1 is a 400", s == 400 and "quality" in b, (s, b[:200]))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.5, "verifier": "maybe"})
+        check("a verifier that is neither pass nor fail is a 400", s == 400 and "verifier" in b, (s, b[:200]))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.5, "attempt": 9})
+        check("an attempt with no record is a 404 that says so", s == 404 and "attempt 9" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/crews/tasks/t154-a/outcome", {"quality": 0.5}, L154_ADMIN, base=GW_L154, auth=False)
+        check("the outcome route needs its pool", s == 400 and "pool" in b, (s, b[:200]))
+        s, _, b = call("GET", f"/api/crews/tasks/t154-a/next?pool={L154_POOL}", None, L154_ADMIN, base=GW_L154, auth=False)
+        check("next takes POST only", s == 405, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+    # budget mode: a completed task whose cost is far above the budget steps the multiplier up by exp(step)
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-b"), ignore_errors=True)
+    cfg_b = os.path.join(BUILD, "e2e.l154b.json")
+    json.dump(l154_config("b", {"mode": "budget", "budget_usd": 0.0001, "step": 0.5}, 3600, L154_DEAR), open(cfg_b, "w"))
+    gb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18261", "-host", "127.0.0.1", "-config", cfg_b, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l154b.log"), "w"))
+    try:
+        wait(GW_L154B + "/health")
+        l154_chat(GW_L154B, "mk-p1", "t154-p1", "worker")
+        lam0 = next((c["lambda"] for c in l154_listing(GW_L154B).get("classes_detail", []) if c.get("class") == "bug-fix"), None)
+        s, _, b = l154_post(GW_L154B, "t154-p1", "outcome", {"quality": 0.8, "verifier": "pass"})
+        check("the completed task is paced", s == 200 and '"completed":true' in b, (s, b[:200]))
+        pool = l154_listing(GW_L154B)
+        pc = pool.get("pacing", {})
+        lam1 = pc.get("lambda")
+        check("a completed task over budget steps the multiplier up by exp(step), and the class plan follows it", lam0 and lam1 and abs(lam1 / lam0 - math.exp(0.5)) < 1e-6 and next(c["lambda"] for c in pool["classes_detail"] if c["class"] == "bug-fix") == lam1, (lam0, pc))
+        check("the pacing shows its mode, one live writer, one completed task and its mean cost", pc.get("mode") == "budget" and pc.get("live_writers") == 1 and pc.get("tasks_completed") == 1 and pc.get("mean_task_cost", 0) > 0, pc)
+    finally:
+        gb.terminate()
+        gb.wait()
+
+    # a one-second ttl: an expired task leaves the state when it is read, and it counts as completed (its cost paced)
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-e"), ignore_errors=True)
+    cfg_e = os.path.join(BUILD, "e2e.l154e.json")
+    json.dump(l154_config("e", {"mode": "lambda", "lambda": 23}, 1, L154_CHEAP), open(cfg_e, "w"))
+    ge = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18262", "-host", "127.0.0.1", "-config", cfg_e, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l154e.log"), "w"))
+    try:
+        wait(GW_L154E + "/health")
+        s, h, b = l154_chat(GW_L154E, "mk-x1", "t154-x1", "worker")
+        check("a task in force has its assignment", s == 200 and {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") in ("cheap", "strong"), (s, b[:200]))
+        time.sleep(2.5)
+        s, _, b = l154_task(GW_L154E, "t154-x1")
+        t = json.loads(b) if s == 200 else {}
+        check("an expired task's assignment is gone from the detail, its calls stay in the log", s == 200 and t.get("assignment") is None and t.get("calls") == 1, (s, b[:300]))
+        check("the expired task counts as completed in the pacing", l154_listing(GW_L154E).get("pacing", {}).get("tasks_completed") == 1, l154_listing(GW_L154E).get("pacing"))
+        s, _, b = l154_post(GW_L154E, "t154-x1", "outcome", {"quality": 0.5})
+        check("an outcome for an expired task is a 404", s == 404, (s, b[:200]))
+    finally:
+        ge.terminate()
+        ge.wait()
+
 def main():
     unique_ports()
     build()
@@ -11202,6 +11365,8 @@ def main():
         l146_e2e(env)
         # L153: crew routing (crew/<pool> models, the task headers, the assign API, the task detail): its own gateways
         l153_e2e(env)
+        # L154: crew outcomes, learning, budget pacing and the sequential layer: its own gateways
+        l154_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
