@@ -37,6 +37,7 @@ parity-count:
 
 unit:
 	$(TOV) test src/main.tov
+	python3 -m unittest tests/test_gen_pricing.py
 
 e2e:
 	python3 tests/e2e.py

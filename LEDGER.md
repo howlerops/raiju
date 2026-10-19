@@ -347,7 +347,7 @@ fast-forwarding their worktree to the branch tip.
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L135 | (f) pricing | Audio token and per-second rates for every model from a public price file with Bifrost's field names (LiteLLM's model_prices_and_context_window.json, which the Bifrost datasheet descends from; getbifrost.ai is blocked here); the hand-entered gpt-realtime rates are confirmed by it | worker | assigned |
+| L135 | (f) pricing | Audio token and per-second rates for every model from a public price file with Bifrost's field names (LiteLLM's model_prices_and_context_window.json, which the Bifrost datasheet descends from; getbifrost.ai is blocked here); the hand-entered gpt-realtime rates are confirmed by it | worker | partial: `scripts/gen_pricing.py --merge` fills only the audio token and per-second columns from the price file (token rates stay the datasheet's; 388 disagreements are reported, not applied); 179 cells over 117 rows. Realtime sessions are billed by tokens only, live sessions by voice seconds (`liveCost` op). Open: transcription is not billed by the second; no OpenAI live model is in the table; token rates need the Bifrost datasheet (getbifrost.ai blocked) |
 | L136 | G48 | Large payloads to providers whose format differs: streaming request conversion for Anthropic, Gemini, Vertex, Bedrock and Cohere (or the closest correct approach per provider) | worker | assigned |
 | L137 | G40 | Realtime and live: one log row per turn as Bifrost logs them, and budgets charged per window or turn, not at session end | worker | assigned |
 | L138 | (g) A2A | A2A push store shared by every worker of a node (and the cluster where Bifrost shares it); the gRPC binding | worker | assigned |

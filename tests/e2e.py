@@ -5240,7 +5240,8 @@ def realtime_e2e(env):
     GW_A = "http://127.0.0.1:18201"
     for d in ("e2e-rt-logs", "e2e-rt-azure-logs"):
         shutil.rmtree(os.path.join(BUILD, d), ignore_errors=True)
-    rt_price = {"input_cost_per_token": 0.000004, "output_cost_per_token": 0.000016, "cache_read_input_token_cost": 0.0000004, "input_cost_per_audio_token": 0.000032, "output_cost_per_audio_token": 0.000064}
+    # the voice rate per second is set too: a realtime call is billed by its tokens, not by its seconds (Bifrost's RealtimeRequest)
+    rt_price = {"input_cost_per_token": 0.000004, "output_cost_per_token": 0.000016, "cache_read_input_token_cost": 0.0000004, "input_cost_per_audio_token": 0.000032, "output_cost_per_audio_token": 0.000064, "input_cost_per_second": 0.001}
     cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_per_request_content_storage_override": True},
            "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
                          "xai": {"keys": [{"name": "xk", "value": "xai-rt-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
