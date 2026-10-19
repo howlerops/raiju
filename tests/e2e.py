@@ -8641,6 +8641,238 @@ def l148w_e2e(env):
         return
     l148_run(env, 2, "l148w", 18244)
 
+
+
+GW_L153 = "http://127.0.0.1:18256"  # crew routing: a pool of three candidates on mock providers, two roles, the assign API and the task detail
+GW_L153W = "http://127.0.0.1:18257"  # the same pool with two workers of one node (Bun only)
+GW_L153X = "http://127.0.0.1:18258"  # a crews config that does not check: the gateway refuses to start
+L153_ADMIN = {"authorization": "Bearer sk-admin-l153"}
+L153_POOL = "codeaf"
+
+def l153_priors():
+    """Priors for the pool. The open-ended worker prefers the cheap candidate and the open-ended checker the strong one;
+    the bug-fix worker prefers the strong candidate and the bug-fix checker the subscription, which is free while its
+    quota is above 20 percent of its limit. At lambda 1 these are the per-role argmaxes of delta - lambda cost."""
+    table = {
+        ("bug-fix", "worker"): {"cheap": 0.0, "strong": 0.10, "sub": 0.05},
+        ("bug-fix", "checker"): {"cheap": 0.0, "strong": 0.20, "sub": 0.30},
+        ("open-ended", "worker"): {"cheap": 0.09, "strong": 0.10, "sub": 0.0},
+        ("open-ended", "checker"): {"cheap": 0.10, "strong": 0.12, "sub": 0.0},
+    }
+    cells = []
+    for (klass, role), row in table.items():
+        for cand, delta in row.items():
+            cells.append({"class": klass, "role": role, "candidate": cand, "delta": delta, "n": 40, "info": 0.5})
+    return {"version": 1, "baseline": {"bug-fix": 0.4, "open-ended": 0.4}, "cells": cells}
+
+def l153_config(tag):
+    """The crew gateway: the mock as two OpenAI-format providers (openai, and alpha for the subscription candidate), the
+    prices, the pool with its priors in a file beside the config (a relative path) and its own logs. Admin is a governance
+    user; inference needs no key."""
+    import hashlib
+    pricing = {
+        "openai/crew-cheap": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001},
+        "openai/crew-strong": {"input_cost_per_token": 0.00001, "output_cost_per_token": 0.00001},
+        "alpha/crew-sub": {"input_cost_per_token": 0.00001, "output_cost_per_token": 0.00001},
+    }
+    profiles = {c: {"worker": {"calls": 2, "input_tokens": 1000, "output_tokens": 500}, "checker": {"calls": 1, "input_tokens": 1000, "output_tokens": 200}} for c in ["bug-fix", "open-ended", "other"]}
+    priors_name = "crew-priors-l153-" + tag + ".json"
+    json.dump(l153_priors(), open(os.path.join(BUILD, priors_name), "w"))
+    return {
+        "client": {"enforce_auth_on_inference": False},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l153".encode()).hexdigest()}]},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l153-logs-" + tag)},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "pricing": pricing,
+        "providers": {
+            "openai": {"keys": [{"name": "l153", "value": "sk-l153", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "alpha": {"keys": [{"name": "l153a", "value": "sk-alpha-l153", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "crews": {"task_ttl_seconds": 3600, "pools": [{
+            "name": L153_POOL,
+            "roles": ["worker", "checker"],
+            "classes": ["bug-fix", "open-ended", "other"],
+            "uncertain_class": "open-ended",
+            "candidates": [
+                {"id": "cheap", "model": "openai/crew-cheap", "route": "api"},
+                {"id": "strong", "model": "openai/crew-strong", "route": "api"},
+                {"id": "sub", "model": "alpha/crew-sub", "route": "subscription", "subscription": "team"},
+            ],
+            "subscriptions": [{"name": "team", "window_hours": 5, "limit_usd": 50, "free_until_fraction": 0.2}],
+            "profiles": profiles,
+            "priors": priors_name,
+            "operating_point": {"mode": "lambda", "lambda": 1.0},
+            "credibility": {"prior_scale": 1.2},
+        }]},
+    }
+
+def l153_chat(base, marker, role=None, task=None, cls=None, text=None, model="crew/" + L153_POOL):
+    """A chat call of a crew model. Its user turn carries the marker, which finds the call in the mock's record."""
+    h = {}
+    if task is not None:
+        h["x-raiju-task-id"] = task
+    if role is not None:
+        h["x-raiju-crew-role"] = role
+    if cls is not None:
+        h["x-raiju-task-class"] = cls
+    body = {"model": model, "messages": [{"role": "user", "content": text or ("Fix the crash in the parser, the traceback shows a NullPointerError " + marker)}]}
+    return call("POST", "/v1/chat/completions", body, h, base=base, auth=False)
+
+def l153_upstream(marker):
+    """The model and key the mock received for the call that carries the marker (None when it did not arrive)."""
+    for x in seen():
+        if marker in x.get("body", ""):
+            return json.loads(x["body"])["model"], x["auth"]
+    return None
+
+def l153_task(base, task, pool=L153_POOL):
+    return call("GET", f"/api/crews/tasks/{task}?pool={pool}", None, L153_ADMIN, base=base, auth=False)
+
+def l153_assign(base, pool, body):
+    return call("POST", f"/api/crews/{pool}/assign", body, L153_ADMIN, base=base, auth=False)
+
+def l153_e2e(env):
+    """L153: crew routing. A model named crew/codeaf takes its task from x-raiju-task-id and its role from x-raiju-crew-role.
+    The first call of a task fixes its class and crew, and each call goes to its role's candidate. Checked: the refusals;
+    two roles of one task on their candidates (the upstream sees each candidate's model, and the subscription's provider
+    its own key); a forced class; a bug-fix-looking first message classified bug-fix; the assign API agreeing with routing;
+    the crew listing; the task's calls and cost summed from its log rows; a config that does not check refuses to start.
+    With RAIJU_WORKERS=2 on Bun, the calls of one task on either worker use one crew."""
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    shutil.rmtree(os.path.join(BUILD, "e2e-l153-logs-a"), ignore_errors=True)
+    cfg_path = os.path.join(BUILD, "e2e.l153.json")
+    json.dump(l153_config("a"), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18256", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l153.log"), "w"))
+    try:
+        wait(GW_L153 + "/health")
+        # the refusals (none of them reaches the upstream)
+        s, _, b = l153_chat(GW_L153, "mk-r1", task=None, role="worker")
+        check("a crew call without x-raiju-task-id is a 400 that names the header", s == 400 and "x-raiju-task-id" in b, (s, b[:200]))
+        s, _, b = l153_chat(GW_L153, "mk-r2", task="t153-r", role=None)
+        check("a crew call without x-raiju-crew-role is a 400 that names the header", s == 400 and "x-raiju-crew-role" in b, (s, b[:200]))
+        s, _, b = l153_chat(GW_L153, "mk-r3", task="t153-r", role="judge")
+        check("an unknown role is a 400 that lists the pool's roles", s == 400 and "worker, checker" in b, (s, b[:200]))
+        s, _, b = l153_chat(GW_L153, "mk-r4", task="t153-r", role="worker", cls="poetry")
+        check("an unknown x-raiju-task-class is a 400", s == 400 and "poetry" in b, (s, b[:200]))
+        s, _, b = l153_chat(GW_L153, "mk-r5", task="t153-r", role="worker", model="crew/nope")
+        check("an unknown pool is a 404", s == 404 and "nope" in b, (s, b[:200]))
+        check("no refused call reached the upstream", l153_upstream("mk-r1") is None and l153_upstream("mk-r5") is None)
+
+        # two roles of one task: the worker's call goes to the strong candidate, the checker's to the subscription
+        s, h, b = l153_chat(GW_L153, "mk-a1", role="worker", task="t153-a")
+        hd = {k.lower(): v for k, v in h.items()}
+        check("a worker call of a new task is answered", s == 200, (s, b[:200]))
+        check("the worker's answer names its candidate, class and attempt", hd.get("x-raiju-crew-candidate") == "strong" and hd.get("x-raiju-crew-class") == "bug-fix" and hd.get("x-raiju-crew-attempt") == "1", hd)
+        up = l153_upstream("mk-a1")
+        check("the worker's call reaches the strong candidate's model, with the openai key", up == ("crew-strong", "Bearer sk-l153"), up)
+        s, h, b = l153_chat(GW_L153, "mk-a2", role="checker", task="t153-a")
+        hd = {k.lower(): v for k, v in h.items()}
+        check("the checker's call of the same task goes to the subscription candidate", hd.get("x-raiju-crew-candidate") == "sub" and hd.get("x-raiju-crew-class") == "bug-fix", hd)
+        up = l153_upstream("mk-a2")
+        check("the subscription's provider serves it, with its own key", up == ("crew-sub", "Bearer sk-alpha-l153"), up)
+        s, h, b = l153_chat(GW_L153, "mk-a3", role="worker", task="t153-a")
+        check("a later worker call of the task keeps the strong candidate", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == "strong", h)
+
+        # a forced class: that class's crew, whatever the text says
+        s, h, b = l153_chat(GW_L153, "mk-b1", role="worker", task="t153-b", cls="open-ended")
+        hd = {k.lower(): v for k, v in h.items()}
+        check("a forced class takes its own crew: the open-ended worker is the cheap candidate", hd.get("x-raiju-crew-class") == "open-ended" and hd.get("x-raiju-crew-candidate") == "cheap", hd)
+        s, h, b = l153_chat(GW_L153, "mk-b2", role="checker", task="t153-b")
+        check("and its checker is the strong one, on the same task", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == "strong", h)
+
+        # no class header: the classifier reads the first user turn
+        s, h, b = l153_chat(GW_L153, "mk-c1", role="worker", task="t153-c")
+        check("a bug-fix-looking first message is classified bug-fix", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-class") == "bug-fix", h)
+
+        # the assign API makes the assignment routing would make, and a task keeps the one it has
+        s, _, b = l153_assign(GW_L153, L153_POOL, {"task_id": "t153-d", "text": "Fix the crash in the parser: the traceback shows a NullPointerError", "labels": ["bug"]})
+        a = json.loads(b) if s == 200 else {}
+        crew = {x["role"]: x["candidate"] for x in a.get("crew", [])}
+        check("the assign API classes the task and returns its crew", s == 200 and a.get("class") == "bug-fix" and crew == {"worker": "strong", "checker": "sub"}, (s, b[:300]))
+        check("the assign API reports the classifier's posterior over the classes", sorted(p["class"] for p in a.get("posterior", [])) == ["bug-fix", "open-ended", "other"], a.get("posterior"))
+        s, h, b = l153_chat(GW_L153, "mk-d1", role="checker", task="t153-d")
+        check("routing of that task follows the assignment", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == crew.get("checker"), (h, crew))
+        s, _, b = l153_assign(GW_L153, L153_POOL, {"task_id": "t153-a", "class": "other"})
+        a2 = json.loads(b) if s == 200 else {}
+        t0 = json.loads(l153_task(GW_L153, "t153-a")[2])
+        check("assigning a task that has one returns it unchanged", s == 200 and a2.get("class") == "bug-fix" and a2.get("created") == t0["assignment"]["created"], (s, b[:200]))
+        s, _, b = l153_assign(GW_L153, L153_POOL, {"task_id": "t153-e", "class": "poetry"})
+        check("assign refuses a class the pool does not have", s == 400, (s, b[:200]))
+        s, _, b = l153_assign(GW_L153, "nope", {"task_id": "t153-e"})
+        check("assign to an unknown pool is a 404", s == 404, (s, b[:200]))
+
+        # the crew listing: per class the multiplier, the crew and the frontier
+        s, _, b = call("GET", "/api/crews", None, L153_ADMIN, base=GW_L153, auth=False)
+        pools = json.loads(b)["pools"] if s == 200 else []
+        pool = pools[0] if len(pools) == 1 else {}
+        classes = {c["class"]: c for c in pool.get("classes_detail", [])}
+        check("the crew listing has the pool, its candidates and its subscription", s == 200 and pool.get("name") == L153_POOL and [c["id"] for c in pool.get("candidates", [])] == ["cheap", "strong", "sub"] and 0.99 < pool["subscriptions"][0]["phi"] <= 1.0, (s, b[:300]))
+        check("each class carries its multiplier, where it came from and the crew", classes.get("bug-fix", {}).get("lambda") == 1.0 and classes["bug-fix"]["lambda_source"] == "lambda" and {x["role"]: x["candidate"] for x in classes["bug-fix"]["crew"]} == {"worker": "strong", "checker": "sub"}, classes.get("bug-fix"))
+        check("the open-ended crew is the cheap worker and the strong checker", {x["role"]: x["candidate"] for x in classes.get("open-ended", {}).get("crew", [])} == {"worker": "cheap", "checker": "strong"}, classes.get("open-ended"))
+        check("the configured profiles are reported as configured", all(p["source"] == "configured" for p in classes.get("bug-fix", {}).get("profiles", [])) and len(classes.get("bug-fix", {}).get("profiles", [])) == 2, classes.get("bug-fix"))
+
+        # the task detail: the calls of the task, their attempts and the cost summed from the log rows
+        s, _, b = l153_task(GW_L153, "t153-a")
+        t = json.loads(b) if s == 200 else {}
+        rows = t.get("rows", [])
+        check("the task detail counts the task's calls", s == 200 and t.get("calls") == 3 and len(rows) == 3, (s, b[:300]))
+        check("the task's cost is the sum of its rows' costs, and positive", t.get("cost", 0) > 0 and abs(t.get("cost", 0) - sum(r["cost"] for r in rows)) < 1e-12, (t.get("cost"), [r["cost"] for r in rows]))
+        check("the rows say which role and candidate each call took", sorted((r["role"], r["candidate"]) for r in rows) == [("checker", "sub"), ("worker", "strong"), ("worker", "strong")], [(r["role"], r["candidate"]) for r in rows])
+        check("the task's assignment is there, and its attempts count the calls", t.get("assignment", {}).get("class") == "bug-fix" and [(x["attempt"], x["calls"]) for x in t.get("attempts", [])] == [(1, 3)], (t.get("assignment"), t.get("attempts")))
+        s, _, b = call("GET", "/api/crews/tasks/t153-a", None, L153_ADMIN, base=GW_L153, auth=False)
+        check("the task detail needs its pool", s == 400, (s, b[:200]))
+        s, _, b = l153_task(GW_L153, "t153-nothing")
+        check("a task with no assignment and no calls is a 404", s == 404, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+    # a config that does not check: the named field is logged, the exit status is 1 and nothing listens
+    bad = l153_config("x")
+    bad["crews"]["pools"][0]["candidates"][0]["model"] = "nowhere/crew-cheap"
+    bad_path = os.path.join(BUILD, "e2e.l153x.json")
+    json.dump(bad, open(bad_path, "w"))
+    bad_log = os.path.join(BUILD, "e2e.l153x.log")
+    gx = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18258", "-host", "127.0.0.1", "-config", bad_path, "-server", server], env=env, stderr=open(bad_log, "w"))
+    try:
+        code = gx.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        gx.kill()
+        gx.wait()
+        code = None
+    log_text = open(bad_log).read()
+    check("a crews config with an unknown provider refuses to start, naming the candidate's model field", code == 1 and "crews.pools[0].candidates[0].model" in log_text, (code, log_text[-300:]))
+
+    if server == "http1":
+        return
+    # two workers of one node: a task's calls on either worker use one crew (the first call's assignment travels on the share)
+    shutil.rmtree(os.path.join(BUILD, "e2e-l153-logs-w"), ignore_errors=True)
+    wcfg_path = os.path.join(BUILD, "e2e.l153w.json")
+    json.dump(l153_config("w"), open(wcfg_path, "w"))
+    gw2 = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18257", "-host", "127.0.0.1", "-config", wcfg_path, "-server", server], env={**env, "RAIJU_WORKERS": "2"}, stderr=open(os.path.join(BUILD, "e2e.l153w.log"), "w"))
+    try:
+        wait(GW_L153W + "/health")
+        s, h, b = l153_chat(GW_L153W, "mk-w1", role="worker", task="t153-w")
+        first = {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate")
+        time.sleep(2.0)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            res = list(ex.map(lambda i: l153_chat(GW_L153W, f"mk-w{i}", role="worker", task="t153-w"), range(2, 14)))
+            res2 = list(ex.map(lambda i: l153_chat(GW_L153W, f"mk-wc{i}", role="checker", task="t153-w"), range(2, 14)))
+        cands = [{k.lower(): v for k, v in x[1].items()}.get("x-raiju-crew-candidate") for x in res]
+        cands2 = [{k.lower(): v for k, v in x[1].items()}.get("x-raiju-crew-candidate") for x in res2]
+        check("the first call on one worker fixes the crew", first == "strong", first)
+        check("the worker's calls of that task, on either worker, use one candidate", cands == ["strong"] * 12, cands)
+        check("and the checker's calls use one candidate", cands2 == ["sub"] * 12, cands2)
+        s, _, b = l153_task(GW_L153W, "t153-w")
+        t = json.loads(b) if s == 200 else {}
+        check("the task's rows from both workers are one task: 25 calls, each on its role's candidate", t.get("calls") == 25 and all(r["candidate"] == ("strong" if r["role"] == "worker" else "sub") for r in t.get("rows", [])), (s, t.get("calls")))
+    finally:
+        gw2.terminate()
+        gw2.wait()
+
 def main():
     unique_ports()
     build()
@@ -10968,6 +11200,8 @@ def main():
         l145_e2e(env)
         # large_payload_optimization for Messages to OpenAI-format, Gemini and Cohere, and embeddings to Gemini (L146): their own gateways
         l146_e2e(env)
+        # L153: crew routing (crew/<pool> models, the task headers, the assign API, the task detail): its own gateways
+        l153_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

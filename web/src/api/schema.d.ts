@@ -2490,6 +2490,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/crews": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Crew pools, with per class the multiplier in use, the crew, the frontier and the knee
+         * @description Raiju-only (docs/crew-routing.md). Each pool lists its candidates with their prices, its subscriptions with the spend and quota fraction in their window, and per class the lambda and where it came from (knee, lambda or budget), the crew (one candidate per role), the frontier points and the knee. A class profile says whether it is configured, learned from the task log rows, or the default.
+         */
+        get: operations["getApiCrews"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/crews/{pool}/assign": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The crew of a task, made now when the task has none in force
+         * @description The same store as crew/<pool> routing, so the crew returned is the one the task's calls go to. The class is the caller's (class), else the classifier's on text and labels; a task keeps its first assignment until task_ttl_seconds passes.
+         */
+        post: operations["postApiCrewsPoolAssign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/crews/tasks/{task_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A task's assignment, attempts and calls, with the cost summed from the log rows
+         * @description The pool is named by the pool query parameter. The calls are the log rows the task wrote for that pool; the cost is their sum.
+         */
+        get: operations["getApiCrewsTasksTaskId"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/alerts": {
         parameters: {
             query?: never;
@@ -17717,6 +17777,184 @@ export interface operations {
                 };
             };
             /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiCrews: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        pools: {
+                            [key: string]: unknown;
+                        }[];
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiCrewsPoolAssign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Pool name */
+                pool: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    task_id: string;
+                    /** @description The task's first user turn, for the classifier */
+                    text?: string;
+                    labels?: string[];
+                    /** @description The class, instead of the classifier's */
+                    class?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description The body names no valid task, or a class the pool does not have. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No pool of that name. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiCrewsTasksTaskId: {
+        parameters: {
+            query: {
+                /** @description Pool name */
+                pool: string;
+            };
+            header?: never;
+            path: {
+                /** @description Task id */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description The pool query parameter is missing. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such pool, or no task of that name in it. */
             404: {
                 headers: {
                     [name: string]: unknown;

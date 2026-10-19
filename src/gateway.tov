@@ -30,6 +30,7 @@ import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, RS } from "./prov
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
 import { ResponsesToChatStream, toResponse, toResponseStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias } from "./router"
+import { CrewPick, crewRoute } from "./crew"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import * as anthropicBeta from "./anthropic_beta"
 import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
@@ -1042,6 +1043,8 @@ class ReqCtx {
   promptId = ""
   promptName = ""
   promptVersion: int | undefined = undefined
+  // the crew routing of a crew/<pool> call (crew.tov): empty when the call names a model directly
+  crew: CrewPick | undefined = undefined
   app = ""
   maximIds: Record<string, string> | undefined = undefined
   maximTags: Record<string, string> | undefined = undefined
@@ -2855,12 +2858,19 @@ export class Engine {
     ctx.userAgent = h.get("user-agent") ?? ""
     ctx.sessionId = sessionId(h) ?? ""
     if (this.logStore !== undefined && (!ctx.contentOff || ctx.hidden)) ctx.input = text
+    // a crew/<pool> model: the task's crew picks the candidate, and the call is served as if that model had been named
+    // (crew.tov); the refusals (missing task or role headers, unknown pool or role) are answered here
+    const named = modelName ?? rawStr(body, "model") ?? ""
+    const pick: CrewPick | undefined = named.startsWith("crew/") ? crewRoute(named, h, text, Date.now(), this.logStore, this.pricing) : undefined
+    if (pick !== undefined && pick.status !== 0) return errorResponse(pick.status, pick.message, pick.status === 404 ? "not_found_error" : "invalid_request_error", noHeaders())
+    if (pick !== undefined) ctx.crew = pick
+    const callModel = pick === undefined ? modelName : pick.model
     // bifrost_active_requests: in flight from here until the answer (or the throw) is out
     const method = requestType(op, streamed)
     metrics.activeRequests(method, 1.0)
     let res: Response = new Response(undefined, { status: 500 })
     try {
-      res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed, compat)
+      res = try await this.serveInner(req, h, ctx, callModel, body, text, build, translate, streamed, compat)
     } finally {
       metrics.activeRequests(method, -1.0)
     }
@@ -2884,6 +2894,13 @@ export class Engine {
     // Bifrost's tracing middleware echoes the request id as x-request-id too
     out.set("x-request-id", rid)
     out.set("x-bifrost-request-type", requestType(op, streamed))
+    // a crew/<pool> call says which candidate, class and attempt it was routed by (crew.tov)
+    const crew = ctx.crew
+    if (crew !== undefined) {
+      out.set("x-raiju-crew-candidate", crew.candidate)
+      out.set("x-raiju-crew-class", crew.taskClass)
+      out.set("x-raiju-crew-attempt", "" + crew.attempt)
+    }
     const span = ctx.span
     if (span !== undefined) out.set("x-bifrost-trace-id", span.traceId)
     const model = modelName ?? rawStr(body, "model")
@@ -3340,6 +3357,12 @@ export class Engine {
         selected_prompt_id: c.promptId === "" ? undefined : c.promptId,
         selected_prompt_name: c.promptName === "" ? undefined : c.promptName,
         selected_prompt_version: c.promptVersion,
+        task_id: c.crew === undefined ? undefined : c.crew.taskId,
+        crew_pool: c.crew === undefined ? undefined : c.crew.pool,
+        crew_role: c.crew === undefined ? undefined : c.crew.role,
+        crew_class: c.crew === undefined ? undefined : c.crew.taskClass,
+        crew_candidate: c.crew === undefined ? undefined : c.crew.candidate,
+        crew_attempt: c.crew === undefined ? undefined : c.crew.attempt,
         raw_request: c.contentOff || c.rawRequest === "" ? undefined : this.redactRaw(c.rawRequest, false),
         raw_response: c.contentOff || c.rawResponse === "" ? undefined : this.redactRaw(c.rawResponse, true),
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,

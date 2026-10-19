@@ -28,14 +28,23 @@ threshold of Theorem 2.
     text (plus `x-raiju-task-labels`, comma-separated, optional).
   - `x-raiju-task-attempt` (optional): the attempt number, set by the caller after `next`.
 - The first call of a task fixes its crew (sticky for the task's lifetime, `task_ttl_seconds`,
-  shared across workers and nodes through the cluster state, ns `crew.task`). Each call goes to
-  the model and route of its role's seat. Answers carry `x-raiju-crew-candidate`,
-  `x-raiju-crew-class` and `x-raiju-crew-attempt`.
-- Agents that call providers themselves can ask for the crew instead:
-  `POST /api/crews/{pool}/assign {task_id, text, labels?, class?}` returns the crew.
-- Outcomes: `POST /api/crews/tasks/{task_id}/outcome {quality (0..1), verifier?: "pass"|"fail",
-  attempt?}`. Cost is not sent: the gateway sums the task's own log rows.
-- Escalation: `POST /api/crews/tasks/{task_id}/next` returns `{action: "accept"}` or
+  shared across workers and nodes through the cluster state, ns `crew.task`, key `pool/task_id`).
+  Each call goes to the model and route of its role's seat, served as if the caller had named that
+  model (fallbacks, governance, budgets and logging are unchanged). Answers carry
+  `x-raiju-crew-candidate`, `x-raiju-crew-class` and `x-raiju-crew-attempt`. The attempt is the
+  caller's `x-raiju-task-attempt` (default 1), echoed back; it is not stored yet (L154 keeps it).
+- The classifier reads the first user turn of the request (`messages`, or Responses `input`), or the
+  whole body when neither is there. A task id is 1 to 200 letters, digits, `-`, `_`, `.` or `:`.
+- A refusal is answered before any upstream call: 400 for a missing or bad `x-raiju-task-id`,
+  `x-raiju-crew-role`, `x-raiju-task-class` or `x-raiju-task-attempt`, 404 for an unknown pool.
+- Callers that send requests to providers themselves can ask for the crew instead:
+  `POST /api/crews/{pool}/assign {task_id, text?, labels?, class?}` returns the assignment (the same
+  store as routing; a task keeps the assignment it has until it expires).
+- The task's detail: `GET /api/crews/tasks/{task_id}?pool=` returns the assignment, its attempts and
+  its calls, with the cost summed from the task's log rows.
+- Not built yet (L154): `POST /api/crews/tasks/{task_id}/outcome {quality (0..1), verifier?:
+  "pass"|"fail", attempt?}` (the cost is the task's own log rows, not sent), and
+  `POST /api/crews/tasks/{task_id}/next`, which returns `{action: "accept"}` or
   `{action: "attempt", attempt, crew}` from the reservation index.
 
 ## Configuration (`crews` in config.json)
@@ -74,6 +83,26 @@ threshold of Theorem 2.
 - `operating_point.mode`: `knee` (Def. 6 on the class frontier), `lambda` (fixed `lambda`),
   or `budget` (`budget_usd` per task, step `step`, eq. 12, warm-started at the λ whose
   predicted policy cost equals the budget).
+- As built (L153): `priors` and `classifier` are a file path, resolved against the config file's
+  folder, or an inline object. A problem with any field (an unknown role, class or candidate, a
+  candidate whose model names no configured provider, a duplicate id, a subscription route with no
+  subscription, a role no candidate admits, a priors or classifier file that does not check) stops
+  the start, and the log names the field (`crews.pools[0].candidates[0].model: ...`). Defaults:
+  `route` `api`; `free_until_fraction` 0.2; `credibility.prior_scale` 1.2; `operating_point.step` 0.5
+  (used by L154). `sequential` is stored for L154. `reasoning_effort` is checked and reported but
+  not applied to the call (the body is built before the route is chosen). Without `classes` set to
+  bug-fix, open-ended and other, a classifier is required.
+- The classifier file as the loader reads it (L151) wants every class in `weights` (and `named`),
+  although the section above lets a class be left out; an inline object is written with empty lists
+  for the classes it leaves out.
+- Quotas and learned profiles come from the log rows the node holds (the shared day file of its
+  workers; the in-memory window of the store). A subscription's spend is the cost of its candidates'
+  rows in the window, so another node's spend is not counted unless its logs are shared.
+- Log rows carry `task_id`, `crew_pool`, `crew_role`, `crew_class`, `crew_candidate` and
+  `crew_attempt`. The learned profile of a class and role is calls per task (rows per task, averaged
+  over the tasks) and tokens per call (averaged over the rows).
+- The multiplier of a class is the knee's (`lambda_source` says so, `knee (at an end of the frontier)`
+  when the knee is an end vertex), a fixed `lambda`, or `budget` (warm start, eq. 12).
 
 ## Priors file (`crew-priors.json`)
 
@@ -138,5 +167,8 @@ are used (`defaultClassifier`, hand-set word lists and named weights until L152 
   knee, pacing step, credibility blend, reservation index, verifier threshold, grid posterior).
 - `src/taskclass.tov`: the task classifier (hashed uni/bi-gram logistic regression, ≤ 2,000 int8
   weights per class, temperature and prior floor, label features; uncertain → `uncertain_class`).
-- `src/crew.tov`: pools, task assignments, routing hook, outcomes, sequential layer, pacing state.
+- `src/crew.tov`: the config check and the pools (L153), the per-pool models (prices, quotas, learned
+  profiles, class plans), task assignments on the cluster state, the routing hook (`crewRoute`, called
+  from the engine's `serve`), the management routes (`crewsRoute`). Outcomes, the sequential layer and
+  pacing state come in L154.
 - `scripts/crew_priors.py`: offline fitting of the priors file from evaluation matrices.

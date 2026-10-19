@@ -1,0 +1,1070 @@
+// Crew routing for Raiju (docs/crew-routing.md; Radha, "Pareto Crewing", sections 2-4). A model named crew/<pool> is
+// a task-level choice. The first call of a task fixes the task's class (the caller's, or the classifier's on the first
+// user turn) and its crew, one candidate per role from bestCrew at the class's multiplier. Every later call of the task
+// goes to its role's candidate, as if the caller had named that model, so fallbacks, governance, budgets and logging
+// are unchanged. The assignment lives on the cluster state (ns crew.task, key pool/task), so every worker and node of a
+// cluster routes a task the same way. The formulas are in crewmath.tov, the classifier in taskclass.tov.
+import * as path from "node:path"
+import { readFileSync, statSync } from "node:fs"
+import { Config, CrewsConfig, CrewPool, CrewPriorsFile, CrewClassifierFile, CrewSequential, parseConfig } from "./config"
+import { parseModel } from "./router"
+import { Pricing } from "./pricing"
+import { LogEntry, LogStore } from "./logstore"
+import { Field, fields, elements, find, rawStr, decodeString, quote } from "./json"
+import { Hdrs, hdrs } from "./schemas"
+import { clusterState } from "./clusterstate"
+import { CrewModel, CallProfile, Route, Interaction, Frontier, Knee, bestCrew, classFrontier, knee, warmStart, roleCost, subscriptionFactor, crewCost, crewQuality } from "./crewmath"
+import { TaskClassifier, loadClassifier, defaultClassifier, splitLabels } from "./taskclass"
+
+const NS = "crew.task"
+const DEFAULT_TTL = 86400
+// quotas, learned profiles and the files' times are read at most this often (ms)
+const PLAN_MS = 10000
+const HOUR_MS = 3600000
+const NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+const TASK_CHARS = NAME_CHARS + ":"
+const MAX_TASK_BYTES = 200
+const EFFORTS = ["minimal", "low", "medium", "high"]
+const DEFAULT_CLASSES = ["bug-fix", "open-ended", "other"]
+// the profile of a role when neither the config nor the task log has one (paper Def. 4)
+const DEFAULT_PROFILE: CallProfile = { calls: 1, input_tokens: 2000, output_tokens: 500 }
+
+// A candidate of a pool as the config names it, with its provider and bare model resolved.
+type CandInfo = { id: string, model: string, provider: string, bare: string, route: Route, roles: string[], sub: string, reasoning: string }
+// A subscription: its window and limit, the candidates that draw on it.
+type SubInfo = { name: string, windowMs: f64, limit: f64, freeUntil: f64, cands: string[] }
+type OpPoint = { mode: string, lambda: f64, budget: f64, step: f64 }
+type PriorCell = { delta: f64, n: f64, info: f64 }
+type PriorInter = { roleA: string, roleB: string, a: string, b: string, v: f64 }
+type PriorsData = { baseline: Map<string, f64>, cells: Map<string, PriorCell>, inter: Map<string, PriorInter[]> }
+
+// A pool as it is checked and kept. Priors and classifier are read from their files when those change.
+type PoolSpec = {
+  name: string,
+  roles: string[],
+  classes: string[],
+  uncertain: string,
+  cands: CandInfo[],
+  subs: SubInfo[],
+  profiles: Map<string, CallProfile>, // key: class, newline, role
+  op: OpPoint,
+  priorScale: f64,
+  seq: CrewSequential | undefined,
+  priorsPath: string, // "" when the priors are inline
+  classifierPath: string, // "" when the classifier is inline or the built-in one
+}
+
+// The price of a candidate per token (0 when the table has none) and whether it has one.
+type CandPrice = { input: f64, output: f64, priced: bool }
+// The status of one subscription at a rebuild: its spend in the window, remaining fraction phi and factor h (Def. 4).
+type SubStatus = { name: string, spentUsd: f64, limit: f64, windowHours: f64, freeUntil: f64, phi: f64, h: f64 }
+// One class: its multiplier, where it came from, the frontier and knee, the crew (candidate index per role) and the
+// source of each role's profile ("configured", "learned" or "default").
+type ClassPlan = { model: CrewModel, frontier: Frontier, lambda: f64, source: string, knee: Knee | undefined, crew: int[], profiles: CallProfile[], sources: string[] }
+type PoolModels = { bucket: f64, pricing: Pricing, plans: Map<string, ClassPlan>, subs: SubStatus[], prices: CandPrice[] }
+
+// One pool at run time. The spec is fixed; the priors, the classifier and the models follow their files and the logs.
+class Pool {
+  priors: PriorsData
+  classifier: TaskClassifier
+  priorsStamp: f64 = 0
+  classifierStamp: f64 = 0
+  models: PoolModels | undefined = undefined
+  constructor(readonly spec: PoolSpec, priors: PriorsData, classifier: TaskClassifier) {
+    this.priors = priors
+    this.classifier = classifier
+  }
+}
+
+class Crews {
+  pools: Map<string, Pool> = new Map()
+  ttlSeconds: f64 = DEFAULT_TTL
+}
+
+let instance: Crews | undefined = undefined
+
+// The process's crew state (created on first use: top-level statements in imported modules do not run).
+function crewsState(): Crews {
+  let s = instance
+  if (s === undefined) {
+    s = new Crews()
+    instance = s
+  }
+  return s
+}
+
+// The stored assignment of a task: its class, the classifier's posterior (empty when the caller named the class), the
+// crew as one candidate per role, the attempt, the multiplier it was made at and when (ms). Stored as JSON.
+export type CrewPart = { role: string, candidate: string }
+export type ClassPart = { class: string, p: f64 }
+export type Assignment = { pool: string, taskClass: string, posterior: ClassPart[], crew: CrewPart[], attempt: int, lambda: f64, created: f64 }
+
+// The result of routing one call: status 0 with the candidate and model it goes to, or the refusal's status and message.
+export type CrewPick = { status: int, message: string, pool: string, taskId: string, role: string, taskClass: string, candidate: string, model: string, attempt: int }
+
+function finite(x: f64): bool {
+  return x - x === 0
+}
+
+// A name of 1 to 64 letters, digits, '-', '_' or '.'.
+function validName(s: string): bool {
+  return s.byteLength >= 1 && s.byteLength <= 64 && onlyChars(s, NAME_CHARS)
+}
+
+function validTask(s: string): bool {
+  return s.byteLength >= 1 && s.byteLength <= MAX_TASK_BYTES && onlyChars(s, TASK_CHARS)
+}
+
+function onlyChars(s: string, allowed: string): bool {
+  for (let i = 0; i < s.byteLength; i++) {
+    if (!allowed.includes(s.slice(i, i + 1))) return false
+  }
+  return true
+}
+
+function candIndex(sp: PoolSpec, id: string): int {
+  for (let m = 0; m < sp.cands.length; m++) {
+    if (sp.cands[m]!.id === id) return m
+  }
+  return -1
+}
+
+function cellKey(klass: string, role: string, cand: string): string {
+  return klass + "\n" + role + "\n" + cand
+}
+
+function sameSet(a: string[], b: string[]): bool {
+  if (a.length !== b.length) return false
+  for (const x of a) {
+    if (!b.includes(x)) return false
+  }
+  return true
+}
+
+function refusal(status: int, message: string): CrewPick {
+  return { status: status, message: message, pool: "", taskId: "", role: "", taskClass: "", candidate: "", model: "", attempt: 0 }
+}
+
+// ---- priors and classifier files ----
+
+// The priors checked against the pool: classes, roles and candidates must be the pool's. Problems go to out, each
+// naming its field under at.
+function priorsOf(sp: PoolSpec, raw: CrewPriorsFile, at: string, inout out: string[]): PriorsData {
+  const d: PriorsData = { baseline: new Map(), cells: new Map(), inter: new Map() }
+  if (raw.version !== undefined && raw.version !== 1) out.push(`${at}.version: must be 1`)
+  const base = raw.baseline
+  if (base !== undefined) {
+    for (const k of base.keys()) {
+      const v = base.get(k)!
+      if (!sp.classes.includes(k)) out.push(`${at}.baseline.${k}: not one of the pool's classes`)
+      else if (!finite(v)) out.push(`${at}.baseline.${k}: must be a number`)
+      else d.baseline.set(k, v)
+    }
+  }
+  const cells = raw.cells ?? []
+  for (let i = 0; i < cells.length; i++) {
+    const c = cells[i]!
+    const w = `${at}.cells[${i}]`
+    if (!sp.classes.includes(c.class)) out.push(`${w}.class: not one of the pool's classes`)
+    else if (!sp.roles.includes(c.role)) out.push(`${w}.role: not one of the pool's roles`)
+    else if (candIndex(sp, c.candidate) < 0) out.push(`${w}.candidate: not one of the pool's candidates`)
+    else if (!finite(c.delta)) out.push(`${w}.delta: must be a number`)
+    else {
+      const n = c.n ?? 0
+      const info = c.info ?? 0
+      if (!finite(n) || n < 0) out.push(`${w}.n: must be a number of at least 0`)
+      else if (!finite(info) || info < 0) out.push(`${w}.info: must be a number of at least 0`)
+      else d.cells.set(cellKey(c.class, c.role, c.candidate), { delta: c.delta, n: n, info: info })
+    }
+  }
+  const its = raw.interactions ?? []
+  for (let i = 0; i < its.length; i++) {
+    const x = its[i]!
+    const w = `${at}.interactions[${i}]`
+    if (!sp.classes.includes(x.class)) out.push(`${w}.class: not one of the pool's classes`)
+    else if (x.roles.length !== 2 || x.roles[0] === x.roles[1] || !sp.roles.includes(x.roles[0]!) || !sp.roles.includes(x.roles[1]!)) out.push(`${w}.roles: two different roles of the pool`)
+    else if (candIndex(sp, x.a) < 0 || candIndex(sp, x.b) < 0) out.push(`${w}.a or ${w}.b: not one of the pool's candidates`)
+    else if (!finite(x.value)) out.push(`${w}.value: must be a number`)
+    else {
+      const list: PriorInter[] = d.inter.get(x.class) ?? []
+      list.push({ roleA: x.roles[0]!, roleB: x.roles[1]!, a: x.a, b: x.b, v: x.value })
+      d.inter.set(x.class, list)
+    }
+  }
+  return d
+}
+
+// Reads a priors file; undefined with problems in out when it cannot be read or does not check.
+function loadPriorsFile(sp: PoolSpec, file: string, at: string, inout out: string[]): PriorsData | undefined {
+  let text = ""
+  try {
+    text = readFileSync(file, "utf8")
+  } catch (e) {
+    out.push(`${at}: cannot read ${file}`)
+    return undefined
+  }
+  let raw: CrewPriorsFile = {}
+  try {
+    raw = JSON.parse(text) as CrewPriorsFile
+  } catch (e) {
+    out.push(`${at}: ${file} is not a JSON object`)
+    return undefined
+  }
+  return priorsOf(sp, raw, at, &out)
+}
+
+// The text of a JSON object of numbers, with its keys in the map's order.
+function jsonOfMap(m: Map<string, f64> | undefined): string {
+  if (m === undefined) return "{}"
+  const parts: string[] = []
+  for (const k of m.keys()) parts.push(quote(k) + ":" + m.get(k)!)
+  return "{" + parts.join(",") + "}"
+}
+
+// An inline classifier object written back as the file's text, so the one loader checks both forms.
+// Every class gets its weights and named list, empty when the object leaves it out: the loader wants each class present.
+function classifierText(c: CrewClassifierFile): string {
+  const classes = c.classes ?? []
+  const weights: string[] = []
+  const ws = c.weights
+  const named: string[] = []
+  const ns = c.named
+  for (const k of classes) {
+    const rows: number[][] = ws === undefined ? [] : (ws.get(k) ?? [])
+    weights.push(quote(k) + ":[" + rows.map((r: number[]) => "[" + r.join(",") + "]").join(",") + "]")
+    named.push(quote(k) + ":" + jsonOfMap(ns === undefined ? undefined : ns.get(k)))
+  }
+  const parts: string[] = [
+    `"version":${c.version ?? 1}`,
+    `"buckets":${c.buckets ?? 262144}`,
+    `"hash":"fnv1a32"`,
+    `"classes":${JSON.stringify(c.classes ?? [])}`,
+    `"prior":${jsonOfMap(c.prior)}`,
+    `"temperature":${c.temperature ?? 1.0}`,
+    `"floor":${c.floor ?? 0.05}`,
+    `"uncertain_below":${c.uncertain_below ?? 0.5}`,
+    `"uncertain_class":${quote(c.uncertain_class ?? "open-ended")}`,
+    `"bias":${jsonOfMap(c.bias)}`,
+    `"scale":${jsonOfMap(c.scale)}`,
+    `"weights":{${weights.join(",")}}`,
+    `"named":{${named.join(",")}}`,
+  ]
+  return "{" + parts.join(",") + "}"
+}
+
+function mtimeOf(file: string): f64 {
+  try {
+    return statSync(file).mtimeMs
+  } catch (e) {
+    return -1
+  }
+}
+
+// Re-reads the pool's files whose times changed since they were read. A file that no longer checks keeps the old copy.
+function refreshFiles(p: Pool): void {
+  const sp = p.spec
+  if (sp.priorsPath !== "") {
+    const m = mtimeOf(sp.priorsPath)
+    if (m !== p.priorsStamp) {
+      p.priorsStamp = m
+      let out: string[] = []
+      const d = loadPriorsFile(sp, sp.priorsPath, "priors", &out)
+      if (d !== undefined && out.length === 0) p.priors = d
+      else console.error(`raiju: crews ${sp.name}: priors not reloaded: ${out.join("; ")}`)
+    }
+  }
+  if (sp.classifierPath !== "") {
+    const m = mtimeOf(sp.classifierPath)
+    if (m !== p.classifierStamp) {
+      p.classifierStamp = m
+      try {
+        p.classifier = loadClassifier(readFileSync(sp.classifierPath, "utf8"))
+      } catch (e) {
+        console.error(`raiju: crews ${sp.name}: classifier not reloaded: ${e.message}`)
+      }
+    }
+  }
+}
+
+// ---- config ----
+
+// Checks one pool of the config and loads its priors and classifier. Problems go to out, each naming its field under at.
+function poolOf(cfg: Config, cp: CrewPool, at: string, baseDir: string, inout out: string[]): Pool | undefined {
+  const before = out.length
+  const name = cp.name ?? ""
+  if (!validName(name)) out.push(`${at}.name: use 1 to 64 letters, digits, '-', '_' or '.'`)
+  const roles = cp.roles ?? []
+  if (roles.length === 0) out.push(`${at}.roles: needs at least one role`)
+  for (let j = 0; j < roles.length; j++) {
+    if (!validName(roles[j]!)) out.push(`${at}.roles[${j}]: use 1 to 64 letters, digits, '-', '_' or '.'`)
+    else if (roles.indexOf(roles[j]!) !== j) out.push(`${at}.roles[${j}]: duplicate role ${roles[j]}`)
+  }
+  const classes = cp.classes ?? []
+  if (classes.length === 0) out.push(`${at}.classes: needs at least one class`)
+  for (let j = 0; j < classes.length; j++) {
+    if (!validName(classes[j]!)) out.push(`${at}.classes[${j}]: use 1 to 64 letters, digits, '-', '_' or '.'`)
+    else if (classes.indexOf(classes[j]!) !== j) out.push(`${at}.classes[${j}]: duplicate class ${classes[j]}`)
+  }
+  const uncertain = cp.uncertain_class ?? (classes.includes("open-ended") ? "open-ended" : (classes[0] ?? ""))
+  if (!classes.includes(uncertain)) out.push(`${at}.uncertain_class: not one of the classes`)
+  // subscriptions first: candidates name them
+  const subs: SubInfo[] = []
+  const subList = cp.subscriptions ?? []
+  for (let j = 0; j < subList.length; j++) {
+    const s = subList[j]!
+    const w = `${at}.subscriptions[${j}]`
+    if (!validName(s.name)) out.push(`${w}.name: use 1 to 64 letters, digits, '-', '_' or '.'`)
+    else if (subs.some((x) => x.name === s.name)) out.push(`${w}.name: duplicate subscription ${s.name}`)
+    else if (!finite(s.window_hours) || s.window_hours <= 0) out.push(`${w}.window_hours: must be above 0`)
+    else if (!finite(s.limit_usd) || s.limit_usd <= 0) out.push(`${w}.limit_usd: must be above 0`)
+    else {
+      const free = s.free_until_fraction ?? 0.2
+      if (!finite(free) || free <= 0 || free > 1) out.push(`${w}.free_until_fraction: must be above 0 and at most 1`)
+      else subs.push({ name: s.name, windowMs: s.window_hours * HOUR_MS, limit: s.limit_usd, freeUntil: free, cands: [] })
+    }
+  }
+  const cands: CandInfo[] = []
+  const candList = cp.candidates ?? []
+  if (candList.length === 0) out.push(`${at}.candidates: needs at least one candidate`)
+  for (let j = 0; j < candList.length; j++) {
+    const c = candList[j]!
+    const w = `${at}.candidates[${j}]`
+    if (!validName(c.id)) out.push(`${w}.id: use 1 to 64 letters, digits, '-', '_' or '.'`)
+    else if (candList.findIndex((x) => x.id === c.id) !== j) out.push(`${w}.id: duplicate candidate ${c.id}`)
+    const ref = parseModel(cfg, c.model)
+    const ps = cfg.providers
+    const configured = ps !== undefined && ref.provider !== "" && ps.has(ref.provider)
+    if (c.model === "") out.push(`${w}.model: is empty`)
+    else if (!configured) out.push(`${w}.model: ${c.model} does not resolve to a configured provider`)
+    const route = c.route ?? "api"
+    if (route !== "api" && route !== "local" && route !== "subscription") out.push(`${w}.route: use api, local or subscription`)
+    if (route === "subscription" && (c.subscription ?? "") === "") out.push(`${w}.subscription: a subscription route names its subscription`)
+    else if ((c.subscription ?? "") !== "" && route !== "subscription") out.push(`${w}.subscription: only a subscription route takes one`)
+    else if ((c.subscription ?? "") !== "" && !subs.some((x) => x.name === c.subscription)) out.push(`${w}.subscription: no subscription ${c.subscription}`)
+    const cr = c.roles ?? []
+    if (c.roles !== undefined && cr.length === 0) out.push(`${w}.roles: is empty; leave it out for every role`)
+    for (const r of cr) {
+      if (!roles.includes(r)) out.push(`${w}.roles: no role ${r} in this pool`)
+    }
+    const effort = c.reasoning_effort ?? ""
+    if (effort !== "" && !EFFORTS.includes(effort)) out.push(`${w}.reasoning_effort: use minimal, low, medium or high`)
+    cands.push({ id: c.id, model: c.model, provider: ref.provider, bare: ref.model, route: routeOf(route), roles: cr, sub: c.subscription ?? "", reasoning: effort })
+  }
+  // every role needs a candidate that admits it
+  for (const r of roles) {
+    if (!cands.some((c) => c.roles.length === 0 || c.roles.includes(r))) out.push(`${at}.roles: role ${r} has no candidate`)
+  }
+  for (let j = 0; j < subs.length; j++) {
+    const s = subs[j]!
+    subs[j] = { name: s.name, windowMs: s.windowMs, limit: s.limit, freeUntil: s.freeUntil, cands: cands.filter((c) => c.sub === s.name).map((c) => c.id) }
+  }
+  // call profiles per class and role
+  const profiles: Map<string, CallProfile> = new Map()
+  const pf = cp.profiles ?? new Map<string, Map<string, CallProfile>>()
+  for (const k of pf.keys()) {
+    const byRole = pf.get(k)!
+    for (const r of byRole.keys()) {
+      const w = `${at}.profiles.${k}.${r}`
+      const v = byRole.get(r)!
+      if (!classes.includes(k)) out.push(`${w}: not one of the classes`)
+      else if (!roles.includes(r)) out.push(`${w}: not one of the roles`)
+      else if (!finite(v.calls) || !finite(v.input_tokens) || !finite(v.output_tokens) || v.calls < 0 || v.input_tokens < 0 || v.output_tokens < 0) out.push(`${w}: calls and tokens must be numbers of at least 0`)
+      else profiles.set(k + "\n" + r, { calls: v.calls, input_tokens: v.input_tokens, output_tokens: v.output_tokens })
+    }
+  }
+  // operating point, credibility and the sequential layer (stored here; the sequential layer reads it)
+  const opc = cp.operating_point
+  const mode = opc?.mode ?? "knee"
+  const lam: f64 = opc?.lambda ?? 0
+  const bud: f64 = opc?.budget_usd ?? 0
+  const op: OpPoint = { mode: mode, lambda: lam, budget: bud, step: opc?.step ?? 0.5 }
+  if (mode !== "knee" && mode !== "lambda" && mode !== "budget") out.push(`${at}.operating_point.mode: use knee, lambda or budget`)
+  else if (mode === "lambda" && (opc?.lambda === undefined || !finite(lam) || lam < 0)) out.push(`${at}.operating_point.lambda: a lambda mode needs a number of at least 0`)
+  else if (mode === "budget" && (opc?.budget_usd === undefined || !finite(bud) || bud <= 0)) out.push(`${at}.operating_point.budget_usd: a budget mode needs an amount above 0`)
+  if (!finite(op.step) || op.step <= 0) out.push(`${at}.operating_point.step: must be above 0`)
+  const priorScale = cp.credibility?.prior_scale ?? 1.2
+  if (!finite(priorScale) || priorScale <= 0) out.push(`${at}.credibility.prior_scale: must be above 0`)
+  // the priors and the classifier: file paths first, then the spec the priors are checked against
+  const pr = cp.priors
+  const cl = cp.classifier
+  const priorsPath = typeof pr === "string" ? resolvePath(pr, baseDir) : ""
+  const classifierPath = typeof cl === "string" ? resolvePath(cl, baseDir) : ""
+  const spec: PoolSpec = { name: name, roles: roles, classes: classes, uncertain: uncertain, cands: cands, subs: subs, profiles: profiles, op: op, priorScale: priorScale, seq: cp.sequential, priorsPath: priorsPath, classifierPath: classifierPath }
+  let priors: PriorsData = emptyPriors()
+  if (typeof pr === "string") {
+    const d = loadPriorsFile(spec, priorsPath, `${at}.priors`, &out)
+    if (d !== undefined) priors = d
+  } else if (pr !== undefined) {
+    priors = priorsOf(spec, pr, `${at}.priors`, &out)
+  }
+  let classifier: TaskClassifier | undefined = undefined
+  if (cl === undefined) {
+    if (!sameSet(classes, DEFAULT_CLASSES)) out.push(`${at}.classifier: needed when the classes are not ${DEFAULT_CLASSES.join(", ")}`)
+    else classifier = defaultClassifier()
+  } else if (typeof cl === "string") {
+    try {
+      classifier = loadClassifier(readFileSync(classifierPath, "utf8"))
+    } catch (e) {
+      out.push(`${at}.classifier: ${e.message}`)
+    }
+  } else {
+    try {
+      classifier = loadClassifier(classifierText(cl))
+    } catch (e) {
+      out.push(`${at}.classifier: ${e.message}`)
+    }
+  }
+  if (classifier !== undefined && !sameSet(classifier.classNames(), classes)) out.push(`${at}.classifier: its classes must be the pool's classes`)
+  if (out.length > before || classifier === undefined) return undefined
+  const p = new Pool(spec, priors, classifier)
+  p.priorsStamp = priorsPath === "" ? 0 : mtimeOf(priorsPath)
+  p.classifierStamp = classifierPath === "" ? 0 : mtimeOf(classifierPath)
+  return p
+}
+
+function resolvePath(file: string, baseDir: string): string {
+  return path.isAbsolute(file) ? file : path.join(baseDir, file)
+}
+
+function emptyPriors(): PriorsData {
+  return { baseline: new Map(), cells: new Map(), inter: new Map() }
+}
+
+function routeOf(s: string): Route {
+  if (s === "local") return "local"
+  if (s === "subscription") return "subscription"
+  return "api"
+}
+
+// Loads the crews config of cfg, relative paths resolved against baseDir (the config file's folder). Returns the
+// problems, one line each naming its field; the caller refuses to start on any. Without crews the state is empty.
+export function configureCrews(cfg: Config, baseDir: string): string[] {
+  let out: string[] = []
+  const st = crewsState()
+  st.pools = new Map()
+  st.ttlSeconds = DEFAULT_TTL
+  const cc: CrewsConfig | undefined = cfg.crews
+  if (cc === undefined) return out
+  const ttl = cc.task_ttl_seconds ?? DEFAULT_TTL
+  if (!finite(ttl) || ttl < 1 || Math.floor(ttl) !== ttl) out.push("crews.task_ttl_seconds: must be a whole number of seconds, at least 1")
+  else st.ttlSeconds = ttl
+  const list = cc.pools ?? []
+  for (let i = 0; i < list.length; i++) {
+    const p = poolOf(cfg, list[i]!, `crews.pools[${i}]`, baseDir, &out)
+    if (p === undefined) continue
+    if (st.pools.has(p.spec.name)) out.push(`crews.pools[${i}].name: duplicate pool ${p.spec.name}`)
+    else st.pools.set(p.spec.name, p)
+  }
+  return out
+}
+
+// ---- profiles, quotas and models ----
+
+// The running means of the call profiles of each class and role, from the task log rows of the pool: calls per task
+// (rows per task, averaged over the tasks), and tokens per call (averaged over the rows). Keyed class, newline, role.
+export function learnProfiles(rows: LogEntry[], pool: string): Map<string, CallProfile> {
+  const perTask: Map<string, int> = new Map()
+  const sums: Map<string, { rows: int, tasks: int, input: f64, output: f64 }> = new Map()
+  for (const e of rows) {
+    const klass = e.crew_class ?? ""
+    const role = e.crew_role ?? ""
+    const task = e.task_id ?? ""
+    if (e.crew_pool !== pool || klass === "" || role === "" || task === "") continue
+    const key = klass + "\n" + role
+    const tk = key + "\n" + task
+    const seen = perTask.get(tk)
+    const s = sums.get(key) ?? { rows: 0, tasks: 0, input: 0, output: 0 }
+    s.rows += 1
+    if (seen === undefined) s.tasks += 1
+    s.input += e.prompt_tokens
+    s.output += e.completion_tokens
+    sums.set(key, s)
+    perTask.set(tk, (seen ?? 0) + 1)
+  }
+  const out: Map<string, CallProfile> = new Map()
+  for (const key of sums.keys()) {
+    const s = sums.get(key)!
+    if (s.rows > 0 && s.tasks > 0) out.set(key, { calls: s.rows / s.tasks, input_tokens: s.input / s.rows, output_tokens: s.output / s.rows })
+  }
+  return out
+}
+
+// What a subscription's candidates spent in the rows of the pool from sinceMs on (the cost each row carries).
+export function spentOn(rows: LogEntry[], pool: string, cands: string[], sinceMs: f64): f64 {
+  let total: f64 = 0
+  for (const e of rows) {
+    const c = e.crew_candidate ?? ""
+    if (e.crew_pool === pool && e.ts >= sinceMs && cands.includes(c)) total += e.cost
+  }
+  return total
+}
+
+// phi of Def. 4: the remaining fraction of a quota, from its spend. A quota with no limit is not drawn down.
+export function quotaPhi(spent: f64, limit: f64): f64 {
+  if (!(limit > 0)) return 1
+  return Math.max(0, 1 - spent / limit)
+}
+
+function freeUntilOf(sp: PoolSpec, sub: string): f64 {
+  for (const s of sp.subs) {
+    if (s.name === sub) return s.freeUntil
+  }
+  return 0
+}
+
+// The class plan: the crew model from the priors, the route-aware costs, the frontier, and the multiplier (paper
+// section 2 and Defs. 5-6; eq. 12 is the budget mode's warm start).
+function planFor(p: Pool, klass: string, prices: CandPrice[], phi: Map<string, f64>, learned: Map<string, CallProfile>): ClassPlan {
+  const sp = p.spec
+  const admit: int[][] = []
+  const delta: f64[][] = []
+  const cost: f64[][] = []
+  const sources: string[] = []
+  const profs: CallProfile[] = []
+  for (let s = 0; s < sp.roles.length; s++) {
+    const role = sp.roles[s]!
+    const key = klass + "\n" + role
+    let profile: CallProfile = DEFAULT_PROFILE
+    let src = "default"
+    const configured = sp.profiles.get(key)
+    if (configured !== undefined) {
+      profile = configured
+      src = "configured"
+    } else {
+      const l = learned.get(key)
+      if (l !== undefined) {
+        profile = l
+        src = "learned"
+      }
+    }
+    sources.push(src)
+    profs.push(profile)
+    const ad: int[] = []
+    const dl: f64[] = []
+    const cs: f64[] = []
+    for (let m = 0; m < sp.cands.length; m++) {
+      const c = sp.cands[m]!
+      if (c.roles.length === 0 || c.roles.includes(role)) ad.push(m)
+      const cell = p.priors.cells.get(cellKey(klass, role, c.id))
+      dl.push(cell === undefined ? 0 : cell.delta)
+      const pr = prices[m]!
+      const f = c.sub === "" ? 1 : (phi.get(c.sub) ?? 1)
+      cs.push(roleCost(profile, { input: pr.input, output: pr.output }, c.route, f, freeUntilOf(sp, c.sub)))
+    }
+    admit.push(ad)
+    delta.push(dl)
+    cost.push(cs)
+  }
+  const inter: Interaction[] = []
+  for (const it of p.priors.inter.get(klass) ?? []) {
+    let s = sp.roles.indexOf(it.roleA)
+    let t = sp.roles.indexOf(it.roleB)
+    let a = candIndex(sp, it.a)
+    let b = candIndex(sp, it.b)
+    if (s < 0 || t < 0 || a < 0 || b < 0) continue
+    if (s > t) {
+      const ts = s
+      s = t
+      t = ts
+      const tc = a
+      a = b
+      b = tc
+    }
+    inter.push({ s: s, t: t, a: a, b: b, v: it.v })
+  }
+  const model: CrewModel = { q0: p.priors.baseline.get(klass) ?? 0, admit: admit, delta: delta, cost: cost, inter: inter }
+  const frontier = classFrontier(model)
+  const kn = knee(frontier)
+  let lambda: f64 = 0
+  let source = "knee"
+  if (sp.op.mode === "lambda") {
+    lambda = sp.op.lambda
+    source = "lambda"
+  } else if (sp.op.mode === "budget") {
+    lambda = warmStart(frontier, sp.op.budget)
+    source = "budget"
+  } else if (kn !== undefined) {
+    lambda = kn.lambda
+    if (kn.endpoint) source = "knee (at an end of the frontier)"
+  } else {
+    source = "knee (no priced vertex)"
+  }
+  const crew = bestCrew(model, lambda) ?? []
+  return { model: model, frontier: frontier, lambda: lambda, source: source, knee: kn, crew: crew, profiles: profs, sources: sources }
+}
+
+// The models of a pool at a time: prices, subscription quotas and the class plans. Rebuilt when the bucket of time
+// changes, the pricing changes or a file changed (refreshFiles), so quotas and profiles follow the logs.
+function modelsOf(p: Pool, pricing: Pricing, logs: LogStore | undefined, nowMs: f64): PoolModels {
+  const bucket = Math.floor(nowMs / PLAN_MS)
+  const cur = p.models
+  if (cur !== undefined && cur.bucket === bucket && cur.pricing === pricing) return cur
+  refreshFiles(p)
+  const sp = p.spec
+  const rows: LogEntry[] = logs === undefined ? [] : logs.viewSince(0)
+  const learned = learnProfiles(rows, sp.name)
+  const prices: CandPrice[] = []
+  for (const c of sp.cands) {
+    const price = pricing.priceFor(c.provider, c.bare, false)
+    prices.push({ input: price === undefined ? 0 : price.input, output: price === undefined ? 0 : price.output, priced: price !== undefined })
+  }
+  const subs: SubStatus[] = []
+  const phi: Map<string, f64> = new Map()
+  for (const s of sp.subs) {
+    const spent = spentOn(rows, sp.name, s.cands, nowMs - s.windowMs)
+    const f = quotaPhi(spent, s.limit)
+    phi.set(s.name, f)
+    subs.push({ name: s.name, spentUsd: spent, limit: s.limit, windowHours: s.windowMs / HOUR_MS, freeUntil: s.freeUntil, phi: f, h: subscriptionFactor(f, s.freeUntil) })
+  }
+  const plans: Map<string, ClassPlan> = new Map()
+  for (const klass of sp.classes) plans.set(klass, planFor(p, klass, prices, phi, learned))
+  const m: PoolModels = { bucket: bucket, pricing: pricing, plans: plans, subs: subs, prices: prices }
+  p.models = m
+  return m
+}
+
+// ---- tasks ----
+
+function keyOf(pool: string, taskId: string): string {
+  return pool + "/" + taskId
+}
+
+function parseAssignment(raw: string): Assignment | undefined {
+  try {
+    const a = JSON.parse(raw) as Assignment
+    return a
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The stored assignment of a task, expired or not (undefined when none was made).
+function storedAssignment(pool: string, taskId: string): Assignment | undefined {
+  const raw = clusterState().get(NS, keyOf(pool, taskId))
+  if (raw === undefined) return undefined
+  return parseAssignment(raw)
+}
+
+function expired(a: Assignment, nowMs: f64): bool {
+  return nowMs - a.created > crewsState().ttlSeconds * 1000
+}
+
+// The assignment of a task that is still in force, or undefined.
+function liveAssignment(pool: string, taskId: string, nowMs: f64): Assignment | undefined {
+  const a = storedAssignment(pool, taskId)
+  if (a === undefined || expired(a, nowMs)) return undefined
+  return a
+}
+
+// Makes a task's assignment: its class (the caller's, else the classifier's on userText and labels, the uncertain class
+// when it is unsure), and the crew of that class. It is stored for every worker and node to read.
+function decideTask(p: Pool, taskId: string, userText: string, labels: string[], forced: string, pricing: Pricing, logs: LogStore | undefined, nowMs: f64): Assignment {
+  const sp = p.spec
+  const models = modelsOf(p, pricing, logs, nowMs)
+  let klass = forced
+  const posterior: ClassPart[] = []
+  if (klass === "") {
+    const v = p.classifier.classify(userText, labels)
+    klass = v.uncertain ? sp.uncertain : v.top
+    for (const c of v.posterior.keys()) posterior.push({ class: c, p: v.posterior.get(c)! })
+  }
+  const plan = models.plans.get(klass)!
+  const crew: CrewPart[] = []
+  for (let s = 0; s < sp.roles.length; s++) {
+    const m = plan.crew[s] ?? 0
+    crew.push({ role: sp.roles[s]!, candidate: sp.cands[m]!.id })
+  }
+  const a: Assignment = { pool: sp.name, taskClass: klass, posterior: posterior, crew: crew, attempt: 1, lambda: plan.lambda, created: nowMs }
+  clusterState().put(NS, keyOf(sp.name, taskId), JSON.stringify(a), nowMs)
+  return a
+}
+
+// The first user turn of a request body (messages or Responses input), which the classifier reads. A body with neither
+// is read whole.
+export function firstUserText(body: string): string {
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return body
+  }
+  const input = find(fs, "input")
+  const msgs = find(fs, "messages") ?? input
+  if (msgs === undefined) return body
+  if (!msgs.startsWith("[")) return msgs.startsWith("\"") ? stringOf(msgs) : body
+  let els: string[] = []
+  try {
+    els = elements(msgs)
+  } catch (e) {
+    return body
+  }
+  for (const el of els) {
+    if (!el.startsWith("{")) continue
+    let mf: Field[] = []
+    try {
+      mf = fields(el)
+    } catch (e) {
+      continue
+    }
+    if (rawStr(mf, "role") !== "user") continue
+    return contentText(find(mf, "content"))
+  }
+  return body
+}
+
+// A JSON string literal's text ("" when it is not one).
+function stringOf(raw: string): string {
+  try {
+    return decodeString(raw)
+  } catch (e) {
+    return ""
+  }
+}
+
+// The text of a message's content: a string, or the text parts of a list.
+function contentText(raw: string | undefined): string {
+  if (raw === undefined) return ""
+  if (raw.startsWith("\"")) return stringOf(raw)
+  if (!raw.startsWith("[")) return ""
+  const parts: string[] = []
+  let els: string[] = []
+  try {
+    els = elements(raw)
+  } catch (e) {
+    return ""
+  }
+  for (const el of els) {
+    if (!el.startsWith("{")) continue
+    try {
+      const t = rawStr(fields(el), "text")
+      if (t !== undefined) parts.push(t)
+    } catch (e) {
+      continue
+    }
+  }
+  return parts.join("\n")
+}
+
+// Routes one call of a crew/<pool> model. The task's assignment is made by its first call; the call goes to its role's
+// candidate. Refusals carry the status and the message the caller sees (400 for a bad or missing header, 404 for an
+// unknown pool).
+export function crewRoute(model: string, h: Hdrs, text: string, nowMs: f64, logs: LogStore | undefined, pricing: Pricing): CrewPick {
+  const name = model.slice(5)
+  const pool = crewsState().pools.get(name)
+  if (pool === undefined) return refusal(404, `no crew pool named ${name}`)
+  const taskId = (h.get("x-raiju-task-id") ?? "").trim()
+  if (taskId === "") return refusal(400, "a crew/<pool> call needs the x-raiju-task-id header: the task the call belongs to")
+  if (!validTask(taskId)) return refusal(400, "x-raiju-task-id: use 1 to 200 letters, digits, '-', '_', '.' or ':'")
+  const role = (h.get("x-raiju-crew-role") ?? "").trim()
+  if (role === "") return refusal(400, "a crew/<pool> call needs the x-raiju-crew-role header: the role this call plays")
+  if (!pool.spec.roles.includes(role)) return refusal(400, `x-raiju-crew-role: pool ${name} has no role ${role} (its roles: ${pool.spec.roles.join(", ")})`)
+  const forced = (h.get("x-raiju-task-class") ?? "").trim()
+  if (forced !== "" && !pool.spec.classes.includes(forced)) return refusal(400, `x-raiju-task-class: pool ${name} has no class ${forced} (its classes: ${pool.spec.classes.join(", ")})`)
+  const attemptRaw = (h.get("x-raiju-task-attempt") ?? "").trim()
+  let attempt = 1
+  if (attemptRaw !== "") {
+    const n = parseInt(attemptRaw)
+    if (n === undefined || n < 1) return refusal(400, "x-raiju-task-attempt: use a whole number from 1")
+    attempt = n
+  }
+  let a = liveAssignment(name, taskId, nowMs)
+  if (a === undefined) {
+    const user = forced === "" ? firstUserText(text) : ""
+    a = decideTask(pool, taskId, user, splitLabels(h.get("x-raiju-task-labels") ?? ""), forced, pricing, logs, nowMs)
+  }
+  const got = a.crew.find((x) => x.role === role)
+  if (got === undefined) return refusal(500, `crew ${name}: no candidate for role ${role}`)
+  const cand = pool.spec.cands.find((c) => c.id === got.candidate)
+  if (cand === undefined) return refusal(500, `crew ${name}: candidate ${got.candidate} is gone`)
+  return { status: 0, message: "", pool: name, taskId: taskId, role: role, taskClass: a.taskClass, candidate: cand.id, model: cand.model, attempt: attempt }
+}
+
+// ---- the management API ----
+
+function jnum(x: f64): string {
+  return x - x === 0 ? "" + x : "null"
+}
+
+function jcrew(sp: PoolSpec, crew: int[]): string {
+  const parts: string[] = []
+  for (let s = 0; s < sp.roles.length; s++) {
+    const m = crew[s] ?? 0
+    parts.push(`{"role":${quote(sp.roles[s]!)},"candidate":${quote(sp.cands[m]?.id ?? "")}}`)
+  }
+  return "[" + parts.join(",") + "]"
+}
+
+function jstrs(xs: string[]): string {
+  return JSON.stringify(xs)
+}
+
+function jassignment(a: Assignment, task: string): string {
+  const post: string[] = a.posterior.map((x) => `{"class":${quote(x.class)},"p":${jnum(x.p)}}`)
+  const crew: string[] = a.crew.map((x) => `{"role":${quote(x.role)},"candidate":${quote(x.candidate)}}`)
+  return `{"task_id":${quote(task)},"pool":${quote(a.pool)},"class":${quote(a.taskClass)},"posterior":[${post.join(",")}],"crew":[${crew.join(",")}],"attempt":${a.attempt},"lambda":${jnum(a.lambda)},"created":${jnum(a.created)},"expired":false}`
+}
+
+// The pool's listing: its candidates, subscriptions and operating point, and per class the multiplier, the chosen crew,
+// the frontier and the knee.
+function poolJson(p: Pool, pricing: Pricing, logs: LogStore | undefined, nowMs: f64): string {
+  const sp = p.spec
+  const m = modelsOf(p, pricing, logs, nowMs)
+  const cands: string[] = []
+  for (let i = 0; i < sp.cands.length; i++) {
+    const c = sp.cands[i]!
+    const pr = m.prices[i]!
+    cands.push(`{"id":${quote(c.id)},"model":${quote(c.model)},"provider":${quote(c.provider)},"route":${quote(c.route)},"roles":${jstrs(c.roles)},"subscription":${quote(c.sub)},"reasoning_effort":${quote(c.reasoning)},"price":{"input":${jnum(pr.input)},"output":${jnum(pr.output)},"priced":${pr.priced}}}`)
+  }
+  const subs: string[] = m.subs.map((s) => `{"name":${quote(s.name)},"window_hours":${jnum(s.windowHours)},"limit_usd":${jnum(s.limit)},"free_until_fraction":${jnum(s.freeUntil)},"spent_usd":${jnum(s.spentUsd)},"phi":${jnum(s.phi)},"h":${jnum(s.h)}}`)
+  const classes: string[] = []
+  for (const klass of sp.classes) {
+    const plan = m.plans.get(klass)!
+    const profs: string[] = []
+    for (let s = 0; s < sp.roles.length; s++) {
+      const pf = plan.profiles[s] ?? DEFAULT_PROFILE
+      profs.push(`{"role":${quote(sp.roles[s]!)},"calls":${jnum(pf.calls)},"input_tokens":${jnum(pf.input_tokens)},"output_tokens":${jnum(pf.output_tokens)},"source":${quote(plan.sources[s] ?? "default")}}`)
+    }
+    const kn = plan.knee
+    const kneeJson = kn === undefined ? "null" : `{"budget":${jnum(kn.budget)},"quality":${jnum(kn.quality)},"lambda":${jnum(kn.lambda)},"endpoint":${kn.endpoint}}`
+    const pts: string[] = plan.frontier.points.map((x) => `{"cost":${jnum(x.cost)},"quality":${jnum(x.quality)},"crew":${jcrew(sp, x.crews[0] ?? [])}}`)
+    classes.push(`{"class":${quote(klass)},"lambda":${jnum(plan.lambda)},"lambda_source":${quote(plan.source)},"cost":${jnum(crewCost(plan.model, plan.crew))},"quality":${jnum(crewQuality(plan.model, plan.crew))},"crew":${jcrew(sp, plan.crew)},"knee":${kneeJson},"frontier":[${pts.join(",")}],"profiles":[${profs.join(",")}]}`)
+  }
+  const op = sp.op
+  const opJson = `{"mode":${quote(op.mode)},"lambda":${jnum(op.lambda)},"budget_usd":${jnum(op.budget)},"step":${jnum(op.step)}}`
+  const pri = sp.priorsPath === "" ? `{"source":"inline"}` : `{"source":"file","path":${quote(sp.priorsPath)}}`
+  const cls = sp.classifierPath === "" ? `{"source":"inline or built-in"}` : `{"source":"file","path":${quote(sp.classifierPath)}}`
+  return `{"name":${quote(sp.name)},"roles":${jstrs(sp.roles)},"classes":${jstrs(sp.classes)},"uncertain_class":${quote(sp.uncertain)},"task_ttl_seconds":${jnum(crewsState().ttlSeconds)},"candidates":[${cands.join(",")}],"subscriptions":[${subs.join(",")}],"operating_point":${opJson},"priors":${pri},"classifier":${cls},"credibility":{"prior_scale":${jnum(sp.priorScale)}},"classes_detail":[${classes.join(",")}]}`
+}
+
+// The management routes under /api/crews. Returns the status and the JSON body.
+export function crewsRoute(method: string, url: string, body: string, logs: LogStore | undefined, pricing: Pricing, nowMs: f64): { status: int, body: string } {
+  const q = url.indexOf("?")
+  const p = q < 0 ? url : url.slice(0, q)
+  const query = q < 0 ? "" : url.slice(q + 1)
+  const segs = p.split("/")
+  const st = crewsState()
+  const bad = (status: int, message: string): { status: int, body: string } => {
+    return { status: status, body: JSON.stringify({ error: { message: message, type: status === 404 ? "not_found_error" : "invalid_request_error" } }) }
+  }
+  if (segs.length === 3) {
+    if (method !== "GET") return bad(405, "use GET")
+    const items: string[] = []
+    for (const p2 of st.pools.values()) items.push(poolJson(p2, pricing, logs, nowMs))
+    return { status: 200, body: `{"pools":[${items.join(",")}]}` }
+  }
+  if (segs.length === 5 && segs[3] === "tasks") {
+    if (method !== "GET") return bad(405, "use GET")
+    const taskId = segs[4]!
+    const pool = queryValue(query, "pool")
+    if (pool === "") return bad(400, "the pool is named by the pool query parameter, e.g. ?pool=codeaf")
+    const pl = st.pools.get(pool)
+    if (pl === undefined) return bad(404, `no crew pool named ${pool}`)
+    return taskDetail(pl, taskId, logs, nowMs)
+  }
+  if (segs.length === 5 && segs[4] === "assign") {
+    if (method !== "POST") return bad(405, "use POST")
+    const pl = st.pools.get(segs[3]!)
+    if (pl === undefined) return bad(404, `no crew pool named ${segs[3]}`)
+    return assignRoute(pl, body, pricing, logs, nowMs)
+  }
+  return bad(404, "no such route")
+}
+
+function queryValue(query: string, key: string): string {
+  for (const part of query.split("&")) {
+    const eq = part.indexOf("=")
+    if (eq < 0) continue
+    if (part.slice(0, eq) === key) return part.slice(eq + 1)
+  }
+  return ""
+}
+
+// POST /api/crews/{pool}/assign: the task's crew, made now when the task has none in force. The class is the caller's
+// (class), else the classifier's on text and labels. A task keeps its first assignment until it expires.
+function assignRoute(pl: Pool, body: string, pricing: Pricing, logs: LogStore | undefined, nowMs: f64): { status: int, body: string } {
+  const fail = (message: string): { status: int, body: string } => {
+    return { status: 400, body: JSON.stringify({ error: { message: message, type: "invalid_request_error" } }) }
+  }
+  let fs: Field[] = []
+  try {
+    fs = fields(body)
+  } catch (e) {
+    return fail("the body is not a JSON object")
+  }
+  const taskId = rawStr(fs, "task_id") ?? ""
+  if (!validTask(taskId)) return fail("task_id: use 1 to 200 letters, digits, '-', '_', '.' or ':'")
+  const klass = rawStr(fs, "class") ?? ""
+  if (klass !== "" && !pl.spec.classes.includes(klass)) return fail(`class: pool ${pl.spec.name} has no class ${klass}`)
+  const text = rawStr(fs, "text") ?? ""
+  const labels: string[] = []
+  const lr = find(fs, "labels")
+  if (lr !== undefined && lr.startsWith("[")) {
+    try {
+      for (const el of elements(lr)) {
+        if (el.startsWith("\"")) labels.push(stringOf(el))
+      }
+    } catch (e) {
+      return fail("labels: use a list of strings")
+    }
+  }
+  const cur = liveAssignment(pl.spec.name, taskId, nowMs)
+  const a = cur ?? decideTask(pl, taskId, text, labels, klass, pricing, logs, nowMs)
+  return { status: 200, body: jassignment(a, taskId) }
+}
+
+// GET /api/crews/tasks/{task_id}?pool=: the task's assignment (expired ones are marked), its attempts and its calls, with
+// the cost summed from the log rows of the task.
+function taskDetail(pl: Pool, taskId: string, logs: LogStore | undefined, nowMs: f64): { status: int, body: string } {
+  const a = storedAssignment(pl.spec.name, taskId)
+  const rows: LogEntry[] = []
+  if (logs !== undefined) {
+    for (const e of logs.viewSince(0)) {
+      if (e.task_id === taskId && e.crew_pool === pl.spec.name) rows.push(e)
+    }
+  }
+  if (a === undefined && rows.length === 0) {
+    return { status: 404, body: JSON.stringify({ error: { message: `no task ${taskId} in pool ${pl.spec.name}`, type: "not_found_error" } }) }
+  }
+  rows.sort((x, y) => x.ts - y.ts)
+  let total: f64 = 0
+  const byAttempt: Map<int, { calls: int, cost: f64 }> = new Map()
+  const items: string[] = []
+  for (const e of rows) {
+    total += e.cost
+    const at = e.crew_attempt ?? 1
+    const cur = byAttempt.get(at) ?? { calls: 0, cost: 0 }
+    cur.calls += 1
+    cur.cost += e.cost
+    byAttempt.set(at, cur)
+    items.push(`{"request_id":${quote(e.request_id)},"ts":${jnum(e.ts)},"role":${quote(e.crew_role ?? "")},"candidate":${quote(e.crew_candidate ?? "")},"attempt":${e.crew_attempt ?? 1},"model":${quote(e.model)},"status":${e.status},"prompt_tokens":${e.prompt_tokens},"completion_tokens":${e.completion_tokens},"cost":${jnum(e.cost)}}`)
+  }
+  const attempts: string[] = []
+  for (const at of byAttempt.keys()) {
+    const v = byAttempt.get(at)!
+    attempts.push(`{"attempt":${at},"calls":${v.calls},"cost":${jnum(v.cost)}}`)
+  }
+  let assignment = "null"
+  if (a !== undefined) {
+    const live = !expired(a, nowMs)
+    assignment = jassignment(a, taskId).replace(`"expired":false`, `"expired":${!live}`)
+  }
+  return { status: 200, body: `{"task_id":${quote(taskId)},"pool":${quote(pl.spec.name)},"assignment":${assignment},"calls":${rows.length},"cost":${jnum(total)},"attempts":[${attempts.join(",")}],"rows":[${items.join(",")}]}` }
+}
+
+// ---- tests ----
+
+function poolConfigText(extra: string): string {
+  return `{"providers":{"openai":{"keys":[{"name":"k","value":"sk-crew-test","models":[],"weight":1.0}]},"anthropic":{"keys":[{"name":"a","value":"sk-ant-crew-test","models":[],"weight":1.0}]}},"crews":{"pools":[{"name":"codeaf","roles":["worker","checker"],"classes":["bug-fix","open-ended","other"],"candidates":[{"id":"cheap","model":"openai/gpt-4o-mini","route":"api"},{"id":"strong","model":"anthropic/crew-strong","route":"api"}],"priors":{"baseline":{"bug-fix":0.4},"cells":[{"class":"bug-fix","role":"checker","candidate":"strong","delta":0.2,"n":50,"info":0.5}]}${extra}}]}}`
+}
+
+test("a valid pool loads, and each problem names its field", () => {
+  const ok = try parseConfig(poolConfigText(""))
+  expect(configureCrews(ok, ".").length).toBe(0)
+  const bad = try parseConfig(poolConfigText(`,"classifier":{"classes":["x"]}`))
+  const probs = configureCrews(bad, ".")
+  expect(probs.some((x) => x.startsWith("crews.pools[0].classifier:"))).toBe(true)
+  const unknownModel = try parseConfig(`{"providers":{"openai":{"keys":[]}},"crews":{"pools":[{"name":"p","roles":["w"],"classes":["bug-fix","open-ended","other"],"candidates":[{"id":"x","model":"nowhere/m"}]}]}}`)
+  const up = configureCrews(unknownModel, ".")
+  expect(up.some((x) => x.startsWith("crews.pools[0].candidates[0].model: nowhere/m does not resolve"))).toBe(true)
+  const dupes = try parseConfig(`{"providers":{"openai":{"keys":[]}},"crews":{"pools":[{"name":"p","roles":["w","w"],"classes":["bug-fix","open-ended","other"],"candidates":[{"id":"x","model":"openai/m"},{"id":"x","model":"openai/m","roles":["nope"]}]}]}}`)
+  const dp = configureCrews(dupes, ".")
+  expect(dp.some((x) => x.startsWith("crews.pools[0].roles[1]: duplicate role"))).toBe(true)
+  expect(dp.some((x) => x.startsWith("crews.pools[0].candidates[1].id: duplicate candidate"))).toBe(true)
+  expect(dp.some((x) => x.startsWith("crews.pools[0].candidates[1].roles: no role nope"))).toBe(true)
+  const sub = try parseConfig(`{"providers":{"openai":{"keys":[]}},"crews":{"pools":[{"name":"p","roles":["w"],"classes":["bug-fix","open-ended","other"],"candidates":[{"id":"x","model":"openai/m","route":"subscription"}]}]}}`)
+  expect(configureCrews(sub, ".").some((x) => x.startsWith("crews.pools[0].candidates[0].subscription: a subscription route"))).toBe(true)
+  const badClass = try parseConfig(`{"providers":{"openai":{"keys":[]}},"crews":{"pools":[{"name":"p","roles":["w"],"classes":["bug-fix","open-ended","other"],"candidates":[{"id":"x","model":"openai/m"}],"profiles":{"nope":{"w":{"calls":1,"input_tokens":1,"output_tokens":1}}}}]}}`)
+  expect(configureCrews(badClass, ".").some((x) => x.startsWith("crews.pools[0].profiles.nope.w:"))).toBe(true)
+  // a role with no candidate that admits it
+  const uncovered = try parseConfig(`{"providers":{"openai":{"keys":[]}},"crews":{"pools":[{"name":"p","roles":["w","c"],"classes":["bug-fix","open-ended","other"],"candidates":[{"id":"x","model":"openai/m","roles":["w"]}]}]}}`)
+  expect(configureCrews(uncovered, ".").some((x) => x.startsWith("crews.pools[0].roles: role c has no candidate"))).toBe(true)
+  expect(configureCrews(try parseConfig(`{}`), ".").length).toBe(0)
+})
+
+test("the priors check against the pool: unknown classes, roles and candidates are named", () => {
+  const cfg = try parseConfig(poolConfigText(`,"priors":{"cells":[{"class":"nope","role":"worker","candidate":"cheap","delta":0.1}]}`))
+  expect(configureCrews(cfg, ".").some((x) => x.startsWith("crews.pools[0].priors.cells[0].class:"))).toBe(true)
+  const cfg2 = try parseConfig(poolConfigText(`,"priors":{"cells":[{"class":"bug-fix","role":"worker","candidate":"ghost","delta":0.1}]}`))
+  expect(configureCrews(cfg2, ".").some((x) => x.startsWith("crews.pools[0].priors.cells[0].candidate:"))).toBe(true)
+})
+
+test("a task's first call fixes its crew, its later calls keep it, and the listing shows the class crews", () => {
+  const cfg = try parseConfig(`{"providers":{"openai":{"keys":[]}},"pricing":{"openai/a":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000001},"openai/b":{"input_cost_per_token":0.00001,"output_cost_per_token":0.00001}},"crews":{"pools":[{"name":"p","roles":["w","c"],"classes":["bug-fix","open-ended","other"],"candidates":[{"id":"a","model":"openai/a"},{"id":"b","model":"openai/b"}],"operating_point":{"mode":"lambda","lambda":1.0},"priors":{"cells":[{"class":"bug-fix","role":"w","candidate":"b","delta":0.5},{"class":"bug-fix","role":"c","candidate":"a","delta":0.1}]}}]}}`)
+  expect(configureCrews(cfg, ".").length).toBe(0)
+  const pricing = new Pricing(cfg)
+  const body = `{"model":"crew/p","messages":[{"role":"user","content":"Fix the crash: a traceback and a NullPointerError"}]}`
+  const first = crewRoute("crew/p", hdrs([["x-raiju-task-id", "unit-fix-1"], ["x-raiju-crew-role", "w"]]), body, 1000, undefined, pricing)
+  expect(first.status).toBe(0)
+  expect(first.taskClass).toBe("bug-fix")
+  expect(first.candidate).toBe("b")
+  expect(first.model).toBe("openai/b")
+  expect(first.attempt).toBe(1)
+  // the checker's call of the same task: its own role's candidate, the same class; a later call with the same role keeps its crew
+  const second = crewRoute("crew/p", hdrs([["x-raiju-task-id", "unit-fix-1"], ["x-raiju-crew-role", "c"], ["x-raiju-task-attempt", "2"]]), "{}", 2000, undefined, pricing)
+  expect(second.candidate).toBe("a")
+  expect(second.taskClass).toBe("bug-fix")
+  expect(second.attempt).toBe(2)
+  const again = crewRoute("crew/p", hdrs([["x-raiju-task-id", "unit-fix-1"], ["x-raiju-crew-role", "w"], ["x-raiju-task-class", "other"]]), "{}", 3000, undefined, pricing)
+  expect(again.taskClass).toBe("bug-fix")
+  expect(again.candidate).toBe("b")
+  // a forced class takes its own crew: with no priors for other, the cheap candidate has no delta and the strong one costs more
+  const forced = crewRoute("crew/p", hdrs([["x-raiju-task-id", "unit-other-1"], ["x-raiju-crew-role", "w"], ["x-raiju-task-class", "other"]]), "{}", 3000, undefined, pricing)
+  expect(forced.taskClass).toBe("other")
+  expect(forced.candidate).toBe("a")
+  const listing = crewsRoute("GET", "/api/crews", "", undefined, pricing, 3000)
+  expect(listing.status).toBe(200)
+  expect(listing.body.includes(`"class":"bug-fix","lambda":1,"lambda_source":"lambda"`)).toBe(true)
+  expect(listing.body.includes(`"crew":[{"role":"w","candidate":"b"},{"role":"c","candidate":"a"}]`)).toBe(true)
+  const detail = crewsRoute("GET", "/api/crews/tasks/unit-fix-1?pool=p", "", undefined, pricing, 3000)
+  expect(detail.status).toBe(200)
+  expect(detail.body.includes(`"class":"bug-fix"`)).toBe(true)
+  expect(crewRoute("crew/p", hdrs([["x-raiju-task-id", "unit-x"]]), "{}", 1, undefined, pricing).status).toBe(400)
+  expect(crewRoute("crew/nope", hdrs([["x-raiju-task-id", "unit-x"], ["x-raiju-crew-role", "w"]]), "{}", 1, undefined, pricing).status).toBe(404)
+})
+
+test("learned profiles are per-task call counts and per-row token means", () => {
+  const row = (task: string, role: string, p: int, c: int): LogEntry => {
+    return { id: task + role + p, ts: 1, request_id: "r", op: "chat", provider: "openai", model: "m", status: 200, latency_ms: 1, prompt_tokens: p, completion_tokens: c, cost: 0.01, cache_hit: false, task_id: task, crew_pool: "codeaf", crew_role: role, crew_class: "bug-fix" }
+  }
+  const rows = [row("t1", "worker", 100, 10), row("t1", "worker", 300, 30), row("t2", "worker", 200, 20), row("t2", "checker", 50, 5)]
+  const prof = learnProfiles(rows, "codeaf")
+  const w = prof.get("bug-fix\nworker")!
+  expect(w.calls).toBe(1.5)
+  expect(w.input_tokens).toBe(200)
+  expect(w.output_tokens).toBe(20)
+  expect(prof.get("bug-fix\nchecker")!.calls).toBe(1)
+  expect(learnProfiles(rows, "other").size).toBe(0)
+})
+
+test("quotas: spend in the window of the subscription's candidates, and phi", () => {
+  const rowOf = (cand: string, ts: f64, cost: f64): LogEntry => {
+    return { id: cand + ts, ts: ts, request_id: "r", op: "chat", provider: "p", model: "m", status: 200, latency_ms: 1, prompt_tokens: 0, completion_tokens: 0, cost: cost, cache_hit: false, crew_pool: "codeaf", crew_candidate: cand }
+  }
+  const rows = [rowOf("sub", 1000, 10), rowOf("sub", 5000, 15), rowOf("api", 5000, 99), rowOf("sub", 6000, 0)]
+  expect(spentOn(rows, "codeaf", ["sub"], 2000)).toBe(15)
+  expect(spentOn(rows, "codeaf", ["sub"], 0)).toBe(25)
+  expect(spentOn(rows, "other", ["sub"], 0)).toBe(0)
+  expect(quotaPhi(25, 50)).toBe(0.5)
+  expect(quotaPhi(80, 50)).toBe(0)
+  expect(quotaPhi(0, 0)).toBe(1)
+  // h(phi) of Def. 4 with free_until_fraction 0.2: free above 0.2, full at 0
+  expect(subscriptionFactor(quotaPhi(25, 50), 0.2)).toBe(0)
+  expect(Math.abs(subscriptionFactor(quotaPhi(45, 50), 0.2) - 0.5) < 1e-9).toBe(true)
+})
+
+test("a task's class comes from the caller, else the classifier on the first user turn", () => {
+  const body = `{"model":"crew/codeaf","messages":[{"role":"system","content":"be terse"},{"role":"user","content":"Fix the crash in parser: traceback follows"},{"role":"assistant","content":"ok"}]}`
+  expect(firstUserText(body)).toBe("Fix the crash in parser: traceback follows")
+  const list = `{"input":[{"role":"user","content":[{"type":"input_text","text":"add a dark mode"}]}]}`
+  expect(firstUserText(list)).toBe("add a dark mode")
+  expect(firstUserText(`{"input":"plain string"}`)).toBe("plain string")
+  expect(firstUserText(`{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}`)).toBe("a\nb")
+})
+
+test("classifier text for an inline object loads and keeps its weights", () => {
+  const c = try parseConfig(`{"crews":{"pools":[{"name":"codeaf","roles":["w"],"classes":["bug-fix","open-ended","other"],"candidates":[{"id":"x","model":"openai/m"}],"classifier":{"classes":["bug-fix","open-ended","other"],"prior":{"bug-fix":0.4,"open-ended":0.45,"other":0.15},"bias":{"bug-fix":0,"open-ended":0,"other":0},"scale":{"bug-fix":0.1,"open-ended":0.1,"other":0.1},"weights":{"bug-fix":[[87512,60]]},"named":{"bug-fix":{"verb:fix":40}}}}]}}`)
+  const cl = c.crews!.pools![0]!.classifier
+  if (typeof cl === "string" || cl === undefined) return
+  const loaded = try loadClassifier(classifierText(cl))
+  expect(loaded.classNames().join(",")).toBe("bug-fix,open-ended,other")
+})
