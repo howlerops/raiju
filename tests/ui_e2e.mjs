@@ -42,6 +42,24 @@ writeFileSync(config, JSON.stringify({
     ],
   },
   logs_store: { enabled: true, dir: join(dir, "logs") },
+  // one crew pool for the Crews screen: a cheap and a strong candidate at a fixed multiplier, so a failed first attempt
+  // escalates to the strong worker (as in the L154 e2e) and its outcome is learned; each class frontier has a knee
+  pricing: {
+    "openai/crew-cheap": { input_cost_per_token: 0.0000001, output_cost_per_token: 0.0000001 },
+    "openai/crew-strong": { input_cost_per_token: 0.00001, output_cost_per_token: 0.00001 },
+  },
+  crews: { task_ttl_seconds: 3600, pools: [{
+    name: "codeaf", roles: ["worker", "checker"], classes: ["bug-fix", "open-ended", "other"], uncertain_class: "open-ended",
+    candidates: [
+      { id: "cheap", model: "openai/crew-cheap", route: "api" },
+      { id: "strong", model: "openai/crew-strong", route: "api" },
+    ],
+    profiles: Object.fromEntries(["bug-fix", "open-ended", "other"].map((c) => [c, { worker: { calls: 1, input_tokens: 2000, output_tokens: 500 }, checker: { calls: 1, input_tokens: 2000, output_tokens: 300 } }])),
+    priors: { version: 1, baseline: { "bug-fix": 0.4 }, cells: [{ class: "bug-fix", role: "worker", candidate: "strong", delta: 0.55, n: 50, info: 0.2 }] },
+    operating_point: { mode: "lambda", lambda: 23 },
+    sequential: { enabled: true, max_attempts: 6, per_candidate: 1, verifier_accuracy: { "bug-fix": 0.9 } },
+    credibility: { prior_scale: 1.2 },
+  }] },
 }))
 
 const procs = [
@@ -913,6 +931,80 @@ try {
     await api("DELETE", "/api/users/ui-auditor")
     await api("DELETE", "/api/users/ui-custom")
     await api("DELETE", "/api/roles/keys-reader")
+  }
+
+  // ---- crews: the frontier with its knee and the table behind it, the learned cells, the task lookup; a viewer sees no actions ----
+  {
+    const crewChat = (task, role, attempt = 1) => chat("Fix the crash in the parser", "crew/codeaf", { "x-raiju-task-id": task, "x-raiju-crew-role": role, "x-raiju-task-class": "bug-fix", "x-raiju-task-attempt": String(attempt) })
+    await crewChat("t-ui-1", "worker")
+    await crewChat("t-ui-1", "checker")
+    await api("POST", "/api/crews/codeaf/assign", { task_id: "t-ui-2", class: "open-ended" })
+    // the first attempt fails its verifier; the sequential layer opens attempt 2 on a dearer crew, which passes: the cells of that crew are learned
+    await api("POST", "/api/crews/tasks/t-ui-1/outcome?pool=codeaf", { quality: 0.2, verifier: "fail" })
+    await api("POST", "/api/crews/tasks/t-ui-1/next?pool=codeaf")
+    await crewChat("t-ui-1", "worker", 2)
+    await api("POST", "/api/crews/tasks/t-ui-1/outcome?pool=codeaf", { quality: 0.8, verifier: "pass", attempt: 2 })
+    await page.goto(GW + "/#crews")
+    check("the Crews tab is there for the admin", await until(page, () => document.querySelector('nav.tabs a[data-nav="crews"]') !== null))
+    check("the pool's card names its pool and roles", await until(page, () => (document.querySelector("#cr-pool-codeaf h2")?.textContent ?? "") === "Pool codeaf" && (document.querySelector("#cr-pool-codeaf")?.textContent ?? "").includes("worker, checker")), await text(page, "#cr-pool-codeaf"))
+    check("the frontier chart is an svg with a title and a description", await until(page, () => {
+      const svg = document.querySelector("#cr-codeaf-bug-fix svg")
+      return !!svg && svg.getAttribute("role") === "img" && /Frontier of bug-fix/.test(svg.querySelector("title")?.textContent ?? "") && !!svg.querySelector("desc")?.textContent
+    }), await text(page, "#cr-codeaf-bug-fix"))
+    check("the frontier draws its crews as points", (await page.locator("#cr-codeaf-bug-fix svg circle").count()) >= 2, await page.locator("#cr-codeaf-bug-fix svg circle").count())
+    check("the knee is marked on the frontier and named in the class", (await page.locator("#cr-codeaf-bug-fix svg polygon").count()) === 1 && (await text(page, "#cr-codeaf-bug-fix")).includes("Knee"), await text(page, "#cr-codeaf-bug-fix"))
+    check("the table behind the chart lists the frontier crews", await until(page, () => document.querySelectorAll("#cr-codeaf-bug-fix details.chart-table tbody tr").length >= 2))
+    await page.focus("#cr-codeaf-bug-fix svg")
+    await page.keyboard.press("ArrowRight")
+    check("the arrow keys read a frontier crew", await until(page, () => (document.querySelector("#cr-codeaf-bug-fix .chart-tip")?.textContent ?? "").includes("Cost:")), await text(page, "#cr-codeaf-bug-fix"))
+    const chosen = await page.locator("#cr-codeaf-bug-fix-class dt").allTextContents()
+    check("the class names the chosen crew for each role", chosen.includes("worker") && chosen.includes("checker"), chosen.join(","))
+    check("the pacing shows the live writers and the completed tasks", (await text(page, "#cr-pool-codeaf")).includes("Live writers") && (await text(page, "#cr-pool-codeaf")).includes("Tasks completed"))
+    check("the candidates table lists the models and routes", (await text(page, "#cr-pool-codeaf")).includes("openai/crew-strong") && (await page.locator("#cr-pool-codeaf table").first().textContent()).includes("api"))
+    check("the learned role effects table has the credited cells", await until(page, () => document.querySelectorAll("table.cr-cells tbody tr").length >= 1), await text(page, "#cr-pool-codeaf"))
+    const sortPrior = () => page.evaluate(() => [...document.querySelectorAll("table.cr-cells th")].find((th) => (th.textContent ?? "").includes("Prior δ"))?.getAttribute("aria-sort"))
+    await page.click('table.cr-cells th button:has-text("Prior δ")')
+    const first = await sortPrior()
+    const vals = await page.$$eval("table.cr-cells tbody tr", (rows) => rows.map((r) => parseFloat(r.children[3].textContent)))
+    check("the learned cells sort by a column when its header is pressed", first === "descending" && vals.every((v, i) => i === 0 || vals[i - 1] >= v), JSON.stringify(vals))
+    await page.click('table.cr-cells th button:has-text("Prior δ")')
+    check("pressing the same header again reverses the order", (await sortPrior()) === "ascending")
+    await page.fill("#cr-task-id", "t-ui-1")
+    await page.click('#cr-task-form button[type="submit"]')
+    check("the task lookup shows the assignment, its attempt and its calls", await until(page, () => (document.querySelector("#cr-task-detail")?.textContent ?? "").includes("Task t-ui-1") && document.querySelectorAll("#cr-task-detail tbody tr").length >= 3), await text(page, "#cr-task-detail"))
+    check("the admin sees the assign, outcome and next actions", (await page.locator("#cr-assign-form, #cr-outcome-form, #cr-next").count()) === 3)
+    await page.fill("#cr-task-id", "t-ui-nope")
+    await page.click('#cr-task-form button[type="submit"]')
+    check("an unknown task says so in the lookup", await until(page, () => /No task t-ui-nope in pool codeaf/.test(document.querySelector("#cr-task-form [role=alert]")?.textContent ?? "")), await text(page, "#cr-task-form"))
+    await page.fill("#cr-task-id", "t-ui-2")
+    await page.click('#cr-task-form button[type="submit"]')
+    await until(page, () => (document.querySelector("#cr-task-detail")?.textContent ?? "").includes("Task t-ui-2"))
+    await page.fill("#cr-outcome-quality", "0.6")
+    await page.selectOption("#cr-outcome-verifier", "pass")
+    await page.click('#cr-outcome-form button[type="submit"]')
+    check("recording an outcome from the page confirms it", await until(page, () => (document.querySelector(".toasts")?.textContent ?? "").includes("Outcome recorded")), await text(page, ".toasts"))
+    check("the outcome shows on the task", await until(page, () => (document.querySelector("#cr-task-detail")?.textContent ?? "").includes("pass")))
+
+    // a viewer reads the crews and the tasks, and is offered no action on them
+    const viewerTok = (await api("POST", "/api/users", { name: "ui-crew-viewer", role: "viewer" })).data.token
+    const vctx = await browser.newContext({ viewport: { width: 1200, height: 900 } })
+    const vp = await vctx.newPage()
+    const vdenied = []
+    vp.on("response", (r) => {
+      if (r.status() === 403) vdenied.push(r.url())
+    })
+    await vp.addInitScript((t) => sessionStorage.setItem("raiju.adminToken", t), viewerTok)
+    await vp.goto(GW + "/#crews")
+    check("a viewer reads the pool and its frontier", await until(vp, () => document.querySelector("#cr-codeaf-bug-fix svg[role=img]") !== null && (document.querySelector("#cr-pool-codeaf")?.textContent ?? "").includes("Candidates")), await text(vp, "#cr-pool-codeaf"))
+    check("a viewer has no assign, outcome or next forms", (await vp.locator("#cr-assign-form, #cr-outcome-form, #cr-next").count()) === 0)
+    check("a viewer's task panel has no action buttons", (await vp.locator('#cr-tasks button:has-text("Assign"), #cr-tasks button:has-text("Record outcome"), #cr-tasks button:has-text("Ask for the next step")').count()) === 0)
+    check("a viewer is told it reads the crews but cannot change them", (await text(vp, "#cr-tasks")).includes("can read the crews but not"))
+    await vp.fill("#cr-task-id", "t-ui-1")
+    await vp.click('#cr-task-form button[type="submit"]')
+    check("a viewer looks a task up", await until(vp, () => (document.querySelector("#cr-task-detail")?.textContent ?? "").includes("Task t-ui-1")))
+    check("a viewer's pages never got a 403", vdenied.length === 0, vdenied.join(" "))
+    await vctx.close()
+    await api("DELETE", "/api/users/ui-crew-viewer")
   }
 
   // ---- role editor: a role made in the UI limits what a user sees and may call ----

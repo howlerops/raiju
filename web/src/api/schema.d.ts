@@ -28,7 +28,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Prometheus text metrics */
+        /**
+         * Prometheus text metrics
+         * @description Families follow Bifrost's telemetry plugin; the raiju_* families are Raiju's own. The crew routing families (raiju_crew_assignments_total, raiju_crew_calls_total, raiju_crew_attempts_total, raiju_crew_escalations_total, raiju_crew_accepts_total, raiju_crew_outcomes_total, raiju_crew_outcome_quality, raiju_crew_task_cost_usd, raiju_crew_lambda, raiju_crew_subscription_phi) are described in docs/crew-routing.md. Counters and histograms add up over the workers of a node; the lambda and quota gauges take the largest.
+         */
         get: operations["getMetrics"];
         put?: never;
         post?: never;
@@ -4255,6 +4258,188 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description One role of a crew and the candidate that plays it. */
+        CrewPart: {
+            role: string;
+            candidate: string;
+        };
+        /** @description A candidate of a pool, with its price per token (USD) from the pricing table. */
+        CrewCandidate: {
+            id?: string;
+            model?: string;
+            provider?: string;
+            /** @enum {string} */
+            route?: "api" | "local" | "subscription";
+            roles?: string[];
+            subscription?: string;
+            reasoning_effort?: string;
+            price?: {
+                input?: number;
+                output?: number;
+                priced?: boolean;
+            };
+        };
+        /** @description A subscription's spend in its window and its quota fraction phi; h is the subscription factor of Def. 4. */
+        CrewSubscription: {
+            name?: string;
+            window_hours?: number;
+            limit_usd?: number;
+            free_until_fraction?: number;
+            spent_usd?: number;
+            phi?: number;
+            h?: number;
+        };
+        /** @description A vertex of the class frontier, with the crew that attains it. */
+        CrewFrontierPoint: {
+            cost?: number | null;
+            quality?: number | null;
+            crew?: components["schemas"]["CrewPart"][];
+        };
+        /** @description One class of a pool, with its multiplier and where it came from, the crew, the frontier and the knee. */
+        CrewClass: {
+            class?: string;
+            lambda?: number | null;
+            lambda_source?: string;
+            cost?: number | null;
+            quality?: number | null;
+            crew?: components["schemas"]["CrewPart"][];
+            /** @description The knee of the frontier (Def. 6); endpoint is true when the knee is an end vertex. */
+            knee?: {
+                budget?: number;
+                quality?: number;
+                lambda?: number;
+                endpoint?: boolean;
+            } | null;
+            frontier?: components["schemas"]["CrewFrontierPoint"][];
+            profiles?: {
+                role?: string;
+                calls?: number;
+                input_tokens?: number;
+                output_tokens?: number;
+                source?: string;
+            }[];
+            /** @description The outcomes credited to the class, the reference crew's quality and each crew's mean quality. */
+            learned?: {
+                outcomes?: number | null;
+                mean_quality?: number | null;
+                reference_quality?: number;
+                crews?: {
+                    crew?: components["schemas"]["CrewPart"][];
+                    outcomes?: number;
+                    mean_quality?: number | null;
+                }[];
+            };
+        };
+        /** @description One learned role effect: its prior, its blend with the outcomes (eq. 10) and the evidence behind it. */
+        CrewLearnedCell: {
+            class?: string;
+            role?: string;
+            candidate?: string;
+            prior_delta?: number;
+            delta_hat?: number;
+            outcomes?: number;
+            mean_excess?: number | null;
+        };
+        /** @description Where a pool's priors or classifier come from - a file (its path) or inline, or the built-in classifier. */
+        CrewSource: {
+            source: string;
+            path?: string;
+        };
+        /** @description A crew pool as the listing shows it. */
+        CrewPool: {
+            name: string;
+            roles?: string[];
+            classes?: string[];
+            uncertain_class?: string;
+            task_ttl_seconds?: number;
+            candidates: components["schemas"]["CrewCandidate"][];
+            subscriptions?: components["schemas"]["CrewSubscription"][];
+            operating_point?: {
+                /** @enum {string} */
+                mode?: "knee" | "lambda" | "budget";
+                lambda?: number | null;
+                budget_usd?: number | null;
+                step?: number;
+            };
+            /** @description The operating point's mode, the multiplier the live writers share (null when none is paced), the running mean cost of completed tasks. */
+            pacing?: {
+                mode?: string;
+                lambda?: number | null;
+                lambda_source?: string;
+                live_writers?: number;
+                tasks_completed?: number;
+                mean_task_cost?: number | null;
+                budget_usd?: number | null;
+                step?: number;
+            };
+            priors?: components["schemas"]["CrewSource"];
+            classifier?: components["schemas"]["CrewSource"];
+            credibility?: {
+                prior_scale?: number;
+            };
+            learned_cells?: components["schemas"]["CrewLearnedCell"][];
+            classes_detail: components["schemas"]["CrewClass"][];
+        };
+        /** @description An attempt's recorded outcome (null until it is scored). */
+        CrewOutcome: {
+            /** @description pass, fail or empty (no verifier) */
+            verifier?: string;
+            quality?: number;
+            accuracy?: number | null;
+            cost?: number;
+        } | null;
+        /** @description An attempt of an assignment, with its crew and outcome. */
+        CrewAttemptRecord: {
+            attempt?: number;
+            crew?: components["schemas"]["CrewPart"][];
+            outcome?: components["schemas"]["CrewOutcome"];
+        };
+        /** @description The task's assignment in force (null when none is recorded). */
+        CrewAssignment: {
+            task_id?: string;
+            pool?: string;
+            class?: string;
+            posterior?: {
+                class?: string;
+                p?: number;
+            }[];
+            crew?: components["schemas"]["CrewPart"][];
+            attempt?: number;
+            attempts?: components["schemas"]["CrewAttemptRecord"][];
+            lambda?: number | null;
+            created?: number;
+            paced?: boolean;
+            expired?: boolean;
+        } | null;
+        /** @description One attempt of a task as the log rows show it, with its assignment record when there is one. */
+        CrewTaskAttempt: {
+            attempt?: number;
+            crew?: components["schemas"]["CrewPart"][] | null;
+            outcome?: components["schemas"]["CrewOutcome"];
+            calls?: number;
+            cost?: number;
+        };
+        /** @description A task's assignment, its attempts and its calls, with the cost summed from the log rows. */
+        CrewTaskDetail: {
+            task_id: string;
+            pool: string;
+            assignment?: components["schemas"]["CrewAssignment"];
+            calls: number;
+            cost: number;
+            attempts: components["schemas"]["CrewTaskAttempt"][];
+            rows: {
+                request_id?: string;
+                ts?: number;
+                role?: string;
+                candidate?: string;
+                attempt?: number;
+                model?: string;
+                status?: number;
+                prompt_tokens?: number;
+                completion_tokens?: number;
+                cost?: number;
+            }[];
+        };
         /** @description Authentication for the card fetch (discovery_auth) or the proxied calls (runtime_auth). Header values, the OAuth client and the TLS certificates may be env.NAME references; stored values are returned masked. */
         AgentUpstreamAuth: {
             /** @enum {string} */
@@ -4686,7 +4871,7 @@ export interface components {
         };
         CustomRolePermission: {
             /** @enum {string} */
-            resource: "Logs" | "MCPLogs" | "AuditLogs" | "ModelProvider" | "Observability" | "VirtualKeys" | "Users" | "MCPGateway" | "Teams" | "Customers" | "BusinessUnits" | "Projects" | "RBAC" | "AccessProfiles" | "RoutingRules" | "Governance" | "Settings" | "Cluster";
+            resource: "Logs" | "MCPLogs" | "AuditLogs" | "ModelProvider" | "Observability" | "VirtualKeys" | "Users" | "MCPGateway" | "Teams" | "Customers" | "BusinessUnits" | "Projects" | "RBAC" | "AccessProfiles" | "RoutingRules" | "Governance" | "Settings" | "Cluster" | "APIKeys" | "Crews";
             /** @enum {string} */
             operation: "View" | "Create" | "Update" | "Delete" | "Download" | "Reveal" | "RunInference";
         };
@@ -17843,9 +18028,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        pools: {
-                            [key: string]: unknown;
-                        }[];
+                        pools: components["schemas"]["CrewPool"][];
                     };
                 };
             };
@@ -17962,9 +18145,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["CrewTaskDetail"];
                 };
             };
             /** @description The pool query parameter is missing. */

@@ -21,14 +21,17 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
   protobuf codec for lf.a2a.v1, the binding itself), transcription and speech billing, large
   Responses, Messages and embeddings converted as they stream, a replicated cluster state channel
   with a file lease (MCP renewals done once per cluster), and A2A push configs and cards shared
-  across workers and nodes. Wave 19 (crew routing, docs/crew-routing.md) is under way: L150 to
-  L152 are in, L153 (gateway wiring) is assigned, L154 and L155 are queued.
+  across workers and nodes. Wave 19 (L150 to L155) built crew routing (task-level multi-model
+  routing after "Pareto Crewing", docs/crew-routing.md): the math, the task classifier, offline
+  priors and classifier training, the gateway wiring, outcomes with credibility learning, budget
+  pacing and escalation, and the Crews tab with metrics. The price table was regenerated from the
+  current Bifrost datasheet.
 - docs/parity.md counts 565 parity rows: done 377, partial 164, missing 0, out of scope 15,
-  n/a 9, plus 42 Raiju-only extras. Wave 18 narrowed "Open:" notes; no row changed status.
-- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,896 passed, 0 failed,
+  n/a 9, plus 41 Raiju-only extras. Wave 18 narrowed "Open:" notes; no row changed status.
+- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,949 passed, 0 failed,
   plus the Python tests (gen_pricing, the h2/gRPC interop suite with grpcio and h2, crew_priors);
-  e2e "all passed" on Bun and http1; `make openapi-check` ok. `make ui` and `make web-check` were
-  last run in wave 17 (no UI change since).
+  e2e "all passed" on Bun and http1; `make ui` all passed (333 checks); `make openapi-check` ok;
+  `make web-check` up to date.
 - Test tools now needed: `pip install grpcio h2 numpy scipy`, and Go with GOTOOLCHAIN=go1.26.9 for
   the A2A gRPC e2e client (tests/a2a_grpc_client; e2e skips it if go is missing).
 - The Tov runtime carries eight patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
@@ -51,9 +54,10 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
 
 No row is queued; the remainders are the "Open:" notes in LEDGER.md. The larger ones:
 
-- Wave 19, crew routing: L153 gateway wiring (assigned), then L154 outcomes, credibility learning,
-  pacing and the sequential layer, then L155 the Crews UI tab and metrics. Briefs for finished rows
-  are the pattern; the design is docs/crew-routing.md.
+- Crew routing: fit real priors and a classifier from your own evaluation data
+  (`scripts/crew_priors.py`; the built-in classifier and empty priors are placeholders);
+  reasoning_effort is applied on chat completions only; per-role credit from a whole-task outcome is
+  an approximation (L154, L155).
 - Pricing: Gemini transcription carries no usage on its native path, so it costs 0 (L144).
 - Large requests: completions to other formats and Titan embeddings buffer; Bedrock Messages
   streams are replayed (L136, L146).
@@ -115,9 +119,9 @@ The open questions from the last handoff are answered:
 - **Ports.** Every e2e gateway has a fixed port. Give each worker two free ones and never
   reuse. `tests/e2e.py` refuses to start on a duplicate. Port registry:
   - 18100–18189 is full (18171 is the only gap); openapi-check uses 18190–18199
-  - 18200–18259: waves 16 to 19, handed out four per worker (L142 18220–18223 ... L153 18256–18259);
+  - 18200–18267: waves 16 to 19, handed out four per worker (L142 18220–18223 ... L155 18264–18267);
     a port listed in tests/e2e.py is taken
-  - free for new workers: 18260 and up (check with `grep -oE '18[0-9]{3}' tests/e2e.py
+  - free for new workers: 18268 and up (check with `grep -oE '18[0-9]{3}' tests/e2e.py
     tests/ui_e2e.mjs | sort -u` first)
 - **Shared mock.** Background senders (bulk, export, alert hooks, log posts) hit the same mock;
   `background()` in tests/e2e.py filters them. A test that asserts on `/_seen` must filter too.

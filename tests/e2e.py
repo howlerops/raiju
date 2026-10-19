@@ -9036,6 +9036,125 @@ def l154_e2e(env):
         ge.terminate()
         ge.wait()
 
+GW_L155 = "http://127.0.0.1:18264"  # crew metrics: the L154 pool, one task through an escalation, the assign API, the readers
+GW_L155S = "http://127.0.0.1:18265"  # the same pool with a subscription candidate: the quota gauge and the subscription's h
+
+def metric(text, series):
+    """The value of one series in a /metrics text (its name and labels exactly as rendered), or None when it is absent."""
+    for line in text.split("\n"):
+        if line.startswith(series + " "):
+            return float(line[len(series) + 1:])
+    return None
+
+def l155_metrics(base):
+    s, _, b = call("GET", "/metrics", None, None, base=base, auth=False)
+    return b if s == 200 else ""
+
+def l155_user(base, name, role):
+    """A management user with a built-in or custom role, and its token (the admin creates it)."""
+    s, _, b = call("POST", "/api/users", {"name": name, "role": role}, L154_ADMIN, base=base, auth=False)
+    return json.loads(b).get("token", "") if s in (200, 201) else ""
+
+def l155_as(token):
+    return {"authorization": "Bearer " + token}
+
+def l155_e2e(env):
+    """L155: the crew families on /metrics and the Crews screen's reads and writes by role. One pool (as L154) runs a task
+    that fails its cheap worker, escalates to the strong worker and passes: the counters count one assignment per task,
+    the attempts, the escalation, the outcomes by verifier, the quality sum, the accept and the task's cost, and the class's
+    multiplier is a gauge. The readers: a viewer and a custom role with Crews View read the listing and the task, and a
+    writer-less role gets 403; only the admin (and a custom role with Crews Create) assigns. A pool with a subscription
+    candidate shows its quota gauge and the subscription's h at full quota (0)."""
+    import shutil
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-m"), ignore_errors=True)
+    cfg_path = os.path.join(BUILD, "e2e.l155.json")
+    json.dump(l154_config("m", {"mode": "lambda", "lambda": 23}, 3600, L154_CHEAP), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18264", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l155.log"), "w"))
+    try:
+        wait(GW_L155 + "/health")
+        s, h, b = l154_chat(GW_L155, "mk-m1", "t155-a", "worker")
+        check("the first worker call of t155-a takes the cheap candidate, as attempt 1", s == 200 and {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == "cheap", (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/{L154_POOL}/assign", {"task_id": "t155-b", "class": "other"}, L154_ADMIN, base=GW_L155, auth=False)
+        check("the assign API gives a second task its crew", s == 200 and json.loads(b).get("class") == "other", (s, b[:200]))
+        s, _, b = l154_post(GW_L155, "t155-a", "outcome", {"quality": 0.1, "verifier": "fail", "accuracy": 0.9})
+        check("the failed outcome of attempt 1 is recorded", s == 200 and '"recorded":true' in b, (s, b[:200]))
+        s, _, b = l154_post(GW_L155, "t155-a", "next", {})
+        check("next starts attempt 2 on the strong worker", s == 200 and json.loads(b).get("action") == "attempt", (s, b[:200]))
+        s, h, b = l154_chat(GW_L155, "mk-m2", "t155-a", "worker", attempt=2)
+        check("the attempt-2 call goes to the strong worker", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == "strong", (s, b[:200]))
+        s, _, b = l154_post(GW_L155, "t155-a", "outcome", {"quality": 0.3, "verifier": "pass", "attempt": 2})
+        check("the pass completes t155-a", s == 200 and '"completed":true' in b, (s, b[:200]))
+        s, _, b = l154_post(GW_L155, "t155-a", "next", {})
+        check("next accepts the completed task", s == 200 and json.loads(b).get("action") == "accept", (s, b[:200]))
+
+        text = l155_metrics(GW_L155)
+        check("assignments count one task per class, by the routing call and by the assign API",
+              metric(text, 'raiju_crew_assignments_total{pool="codeaf",class="bug-fix"}') == 1 and metric(text, 'raiju_crew_assignments_total{pool="codeaf",class="other"}') == 1, text[:300])
+        check("calls count each role's candidate: the cheap worker's call and the strong worker's",
+              metric(text, 'raiju_crew_calls_total{pool="codeaf",role="worker",candidate="cheap"}') == 1 and metric(text, 'raiju_crew_calls_total{pool="codeaf",role="worker",candidate="strong"}') == 1)
+        check("attempts count the first attempt and the one next opened; escalations count the latter", metric(text, 'raiju_crew_attempts_total{pool="codeaf",class="bug-fix"}') == 2 and metric(text, 'raiju_crew_escalations_total{pool="codeaf",class="bug-fix"}') == 1)
+        check("outcomes count by verifier, and the quality histogram keeps the count and the sum of the qualities",
+              metric(text, 'raiju_crew_outcomes_total{pool="codeaf",class="bug-fix",verifier="fail"}') == 1 and metric(text, 'raiju_crew_outcomes_total{pool="codeaf",class="bug-fix",verifier="pass"}') == 1
+              and metric(text, 'raiju_crew_outcome_quality_count{pool="codeaf",class="bug-fix"}') == 2 and abs((metric(text, 'raiju_crew_outcome_quality_sum{pool="codeaf",class="bug-fix"}') or 0) - 0.4) < 1e-9
+              and metric(text, 'raiju_crew_outcome_quality_bucket{pool="codeaf",class="bug-fix",le="0.1"}') == 1, text[-400:])
+        check("accepts count the tasks next completed", metric(text, 'raiju_crew_accepts_total{pool="codeaf",class="bug-fix"}') == 1)
+        check("the task cost histogram takes each completed task once", metric(text, 'raiju_crew_task_cost_usd_count{pool="codeaf"}') == 1 and (metric(text, 'raiju_crew_task_cost_usd_sum{pool="codeaf"}') or 0) > 0)
+        check("the class multiplier is a gauge: lambda 23 as configured", metric(text, 'raiju_crew_lambda{pool="codeaf",class="bug-fix"}') == 23)
+        check("the families carry their TYPE lines", "# TYPE raiju_crew_outcome_quality histogram\n" in text and "# TYPE raiju_crew_calls_total counter\n" in text and "# TYPE raiju_crew_lambda gauge\n" in text)
+
+        viewer = l155_user(GW_L155, "l155-viewer", "viewer")
+        editor = l155_user(GW_L155, "l155-editor", "editor")
+        s, _, _ = call("POST", "/api/roles", {"name": "l155-reader", "permissions": [{"resource": "Crews", "operation": "View"}]}, L154_ADMIN, base=GW_L155, auth=False)
+        reader = l155_user(GW_L155, "l155-reader-user", "l155-reader") if s in (200, 201) else ""
+        s, _, _ = call("POST", "/api/roles", {"name": "l155-keys", "permissions": [{"resource": "VirtualKeys", "operation": "View"}]}, L154_ADMIN, base=GW_L155, auth=False)
+        keys = l155_user(GW_L155, "l155-keys-user", "l155-keys") if s in (200, 201) else ""
+        check("the readers and the writer-less roles exist", bool(viewer) and bool(editor) and bool(reader) and bool(keys))
+        s, _, b = call("GET", "/api/crews", None, l155_as(viewer), base=GW_L155, auth=False)
+        check("a viewer reads the crews listing", s == 200 and len(json.loads(b).get("pools", [])) == 1, (s, b[:200]))
+        s, _, b = call("GET", f"/api/crews/tasks/t155-a?pool={L154_POOL}", None, l155_as(viewer), base=GW_L155, auth=False)
+        check("a viewer reads a task's detail", s == 200 and json.loads(b).get("attempts", [])[0]["attempt"] == 1, (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/{L154_POOL}/assign", {"task_id": "t155-c"}, l155_as(viewer), base=GW_L155, auth=False)
+        check("a viewer cannot assign a task", s == 403, (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/tasks/t155-a/outcome?pool={L154_POOL}", {"quality": 0.5}, l155_as(viewer), base=GW_L155, auth=False)
+        check("a viewer cannot record an outcome", s == 403, (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/tasks/t155-a/next?pool={L154_POOL}", None, l155_as(editor), base=GW_L155, auth=False)
+        check("an editor cannot ask for the next step", s == 403, (s, b[:200]))
+        s, _, b = call("GET", "/api/crews", None, l155_as(editor), base=GW_L155, auth=False)
+        check("an editor reads the crews listing", s == 200, (s, b[:200]))
+        s, _, b = call("GET", "/api/crews", None, l155_as(reader), base=GW_L155, auth=False)
+        check("a custom role with Crews View reads the listing", s == 200, (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/{L154_POOL}/assign", {"task_id": "t155-c"}, l155_as(reader), base=GW_L155, auth=False)
+        check("a custom role with only Crews View cannot assign", s == 403, (s, b[:200]))
+        s, _, b = call("GET", "/api/crews", None, l155_as(keys), base=GW_L155, auth=False)
+        check("a custom role without Crews View is refused the listing", s == 403, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+    # a pool with a subscription candidate: its quota fraction is a gauge, and its h is 0 at a full quota
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-s"), ignore_errors=True)
+    cfg_s = os.path.join(BUILD, "e2e.l155s.json")
+    conf = l154_config("s", {"mode": "lambda", "lambda": 23}, 3600, L154_CHEAP)
+    pool = conf["crews"]["pools"][0]
+    pool["subscriptions"] = [{"name": "team", "window_hours": 5, "limit_usd": 50, "free_until_fraction": 0.2}]
+    pool["candidates"][1]["route"] = "subscription"
+    pool["candidates"][1]["subscription"] = "team"
+    json.dump(conf, open(cfg_s, "w"))
+    gs = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18265", "-host", "127.0.0.1", "-config", cfg_s, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l155s.log"), "w"))
+    try:
+        wait(GW_L155S + "/health")
+        s, h, b = l154_chat(GW_L155S, "mk-s1", "t155-s", "worker")
+        check("a call with a subscription candidate is served", s == 200, (s, b[:200]))
+        text = l155_metrics(GW_L155S)
+        check("the subscription's quota fraction is a gauge, full before any spend", metric(text, 'raiju_crew_subscription_phi{pool="codeaf",subscription="team"}') == 1, text[-300:])
+        s, _, b = call("GET", "/api/crews", None, L154_ADMIN, base=GW_L155S, auth=False)
+        subs = json.loads(b)["pools"][0]["subscriptions"] if s == 200 else []
+        check("the listing gives the same subscription with its h(phi) of 0", len(subs) == 1 and subs[0]["phi"] == 1 and subs[0]["h"] == 0, subs)
+    finally:
+        gs.terminate()
+        gs.wait()
+
 def main():
     unique_ports()
     build()
@@ -11367,6 +11486,8 @@ def main():
         l153_e2e(env)
         # L154: crew outcomes, learning, budget pacing and the sequential layer: its own gateways
         l154_e2e(env)
+        # L155: the crew metrics on /metrics and the Crews screen's reads and writes by role: its own gateways
+        l155_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

@@ -42,7 +42,7 @@ interface Data {
 }
 
 // The catalogue a role without Settings / View cannot read; the editor falls back to these.
-const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster", "APIKeys"]
+const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster", "APIKeys", "Crews"]
 const OPERATIONS = ["View", "Create", "Update", "Delete", "Download", "Reveal", "RunInference"]
 const DACS: [string, string][] = [
   ["", "Default"],

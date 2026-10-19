@@ -211,6 +211,43 @@ are used (`defaultClassifier`, hand-set word lists and named weights until L152 
   `verb:`. `weights` and `named` may be left out for a class (it then scores on its bias alone).
   Unknown top-level fields are ignored. Errors name the field that failed.
 
+## Admin UI and metrics (L155)
+
+- The Crews tab (`web/src/screens/Crews.tsx`) is shown to callers who may read `Crews` (View). Per pool: the roles, classes,
+  uncertain class and task lifetime; the priors and classifier sources; the candidates (model, route, admitted roles, the
+  subscription with its spend in the window, φ and h(φ), the price per million tokens); the pacing (mode, multiplier and its
+  source, live writers, completed tasks, mean task cost). Per class: the multiplier and its source, the chosen crew per role,
+  the knee, the frontier (`FrontierChart` in `web/src/charts.tsx`: cost on a log axis against quality, the vertices as points,
+  the knee as a diamond, the crew at the current multiplier ringed, a readout on hover or with the arrow keys, and the table
+  behind it), the call profiles and the class's learned evidence. The learned role effects are a table sorted by any column
+  (prior δ, δ̂, outcomes, mean excess). A task lookup (pool and task id) shows the assignment, its attempts with crew,
+  verifier, quality and cost, and its calls.
+- Writers (`Crews` Create: admin, or a custom role holding it) also get the forms: assign a task (`POST .../assign`), record
+  an outcome for the task looked up (`POST .../outcome`), and ask for the next step (`POST .../next`). Other callers see the
+  listing and the lookup only; the server refuses the writes (403) whatever the page shows.
+- RBAC: the crew routes are the `Crews` resource (`rbac.tov` `resourceOf`). The built-in roles: admin reads and writes;
+  editor and viewer read; auditor has no crew access. A custom role needs `Crews` View to read and `Crews` Create to write.
+- Metrics (`metrics.tov`, on `GET /metrics`; Prometheus names under `raiju_`):
+  - `raiju_crew_assignments_total{pool,class}`: tasks given a crew (by a `crew/<pool>` call or the assign API).
+  - `raiju_crew_calls_total{pool,role,candidate}`: calls routed to a role's candidate.
+  - `raiju_crew_attempts_total{pool,class}`: attempts started (the first, and each one `next` opened).
+  - `raiju_crew_escalations_total{pool,class}`: the attempts `next` opened (the attempts beyond a task's first).
+  - `raiju_crew_accepts_total{pool,class}`: tasks `next` accepted.
+  - `raiju_crew_outcomes_total{pool,class,verifier}`: recorded outcomes (`pass`, `fail` or `none`); a repeat is not counted.
+  - `raiju_crew_outcome_quality{pool,class}`: histogram of the qualities (the mean is `_sum` over `_count`).
+  - `raiju_crew_task_cost_usd{pool}`: histogram of each completed task's cost (the rows of all its attempts).
+  - `raiju_crew_lambda{pool,class}`: the multiplier in use. `raiju_crew_subscription_phi{pool,subscription}`: the quota fraction.
+  - Across workers, counters and histograms add up. The two gauges are the same in every worker (cluster state, shared
+    logs), so the merge keeps the largest instead of the sum (`MAX_MERGED` in `metrics.tov`).
+
+Limits of the UI and metrics (as built):
+
+- The frontier chart can draw the uniform crews as a second series (`uniform`), but the listing does not give them, so the
+  screen omits that series. The chart has no zoom.
+- Each writer observes a completed task's cost and each outcome once, so a task that completes on two workers of a node is
+  counted twice in the cost histogram (as it is paced twice). Gauges and counters are per process until the scrape merges them.
+- The task lookup shows the calls the log window holds, and an assignment that has expired shows as none.
+
 ## Modules
 
 - `src/crewmath.tov`: the formulas (role cost, per-role argmax, coordinate ascent, frontier and
@@ -222,6 +259,8 @@ are used (`defaultClassifier`, hand-set word lists and named weights until L152 
   from the engine's `serve`), the management routes (`crewsRoute`), the outcome, learning, pacing and
   `next` routes (L154, with `withReasoningEffort` for the routed body).
 - `scripts/crew_priors.py`: offline fitting of the priors file from evaluation matrices.
+- `web/src/screens/Crews.tsx` and `FrontierChart` in `web/src/charts.tsx` (L155): the Crews tab. The metrics are in
+  `src/metrics.tov` (`observeCrew*`, `setCrew*`), called from `src/crew.tov`.
 
 ## Limits (as built)
 
