@@ -7,10 +7,13 @@
 // caller's own token and credentials. A delivery that fails is retried with a doubling delay, up to six
 // attempts, and then given up. Delivery is at least once; a push the agent repeats is queued once.
 //
-// Configs and queued deliveries are kept in memory and in a file (logs_store folder) so they survive a restart.
-// The secrets in the file are sealed when the config has an encryption key. Each process has its own copy: a
-// push must reach the process that took the registration.
-import { readFileSync, writeFileSync, existsSync } from "node:fs"
+// Configs and queued deliveries are kept in memory and as one file each in a directory (a2a-push in the logs_store
+// folder, or the workers' share directory when there is no logs store), so they survive a restart and are shared by
+// every worker of a node: a push may reach any worker, and a queued push is relayed by whichever worker takes its
+// lease first (see PushStore). The secrets in the files are sealed when the config has an encryption key. Bifrost
+// keeps this state in its config database, which every node of a cluster shares; Raiju shares it per node (or among
+// the nodes that use one logs_store folder on a shared file system).
+import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, rmSync, statSync } from "node:fs"
 import { sha256, toHex, utf8, secureHex } from "./crypto"
 import { fields, find, rawStr, rawNum, quote } from "./json"
 import { isPrivateHost, isMetadataHost } from "./netguard"
@@ -82,18 +85,61 @@ function newestFirst(a: PushConfig, b: PushConfig): int {
   return order(a.id, b.id)
 }
 
+// The file a config is kept in, and the file a queued push is kept in (its id is a hex digest).
+function configFile(agent: string, task: string, id: string): string {
+  return "c-" + toHex(sha256(utf8(agent + "\u0000" + task + "\u0000" + id))) + ".json"
+}
+
+function deliveryFile(id: string): string {
+  return "d-" + id + ".json"
+}
+
+// Configs and queued pushes live in memory and, with a directory (persistTo or useDir), as one file per item, so
+// every process that uses the directory (the workers of a node) sees the others' changes: each method first reads
+// the directory (sync) and then writes only the files it changes, one write per file, so two processes that change
+// different items never lose each other's writes. Two processes changing the same item is last writer wins, as with
+// any PUT. A file that cannot be parsed (it is being written) keeps the copy already in memory.
+//
+// A queued push is relayed by one process at a time: claim takes a lease on it (a directory made with mkdir, which
+// only one process can make), the holder sends and writes the outcome, and release gives the lease up. A lease whose
+// holder died is taken over after leaseMs, as a new generation, so there is still one owner.
 export class PushStore {
   configs: PushConfig[] = []
   deliveries: PushDelivery[] = []
-  file = ""
-  // seals and opens the secrets kept in the file (identity when there is no key)
+  dir = ""
+  made = false
+  leaseMs = LEASE_MS
+  // deliveries this instance holds a lease on: id to the lease generation
+  held: Map<string, int> = new Map()
+  // seals and opens the secrets kept in the files (identity when there is no key)
   seal: (v: string) => string = (v: string): string => v
   open: (v: string) => string = (v: string): string => v
 
-  // Loads the file (one JSON object per line) and writes every later change there.
+  // Keeps the items in a directory (named like the old single file, without its .jsonl) and reads what is there. A
+  // single-file store left by an earlier version is moved in once.
   persistTo(path: string): void {
-    this.file = path
-    if (!existsSync(path)) return
+    const dir = path.endsWith(".jsonl") ? path.slice(0, path.byteLength - 6) : path
+    this.useDir(dir)
+    if (path.endsWith(".jsonl") && existsSync(path)) this.importLegacy(path)
+  }
+
+  // Uses dir for the items: what is in memory is written there first (where no file has it yet), then the
+  // directory is read. The directory is made by the first write, so a gateway that never sees a push leaves none.
+  useDir(dir: string): void {
+    const mem = this.configs
+    const memD = this.deliveries
+    this.dir = dir
+    this.made = false
+    for (const c of mem) {
+      if (!existsSync(dir + "/" + configFile(c.agent, c.task, c.id))) this.writeConfig(c)
+    }
+    for (const d of memD) {
+      if (!existsSync(dir + "/" + deliveryFile(d.id))) this.writeDelivery(d)
+    }
+    this.sync()
+  }
+
+  importLegacy(path: string): void {
     try {
       for (const line of try readFileSync(path, "utf8").split("\n")) {
         if (line === "") continue
@@ -103,32 +149,125 @@ export class PushStore {
           const v = find(fs, "v") ?? ""
           if (t === "c") {
             const c = try JSON.parse(v) as PushConfig
-            this.configs.push({ agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.open(c.token), scheme: c.scheme, credentials: this.open(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at })
+            const own: PushConfig = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.open(c.token), scheme: c.scheme, credentials: this.open(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
+            if (!existsSync(this.dir + "/" + configFile(own.agent, own.task, own.id))) this.writeConfig(own)
           } else if (t === "d") {
-            this.deliveries.push(try JSON.parse(v) as PushDelivery)
+            const d = try JSON.parse(v) as PushDelivery
+            if (!existsSync(this.dir + "/" + deliveryFile(d.id))) this.writeDelivery(d)
           }
         } catch (e) {
           continue
         }
       }
+      try writeFileSync(path, "")
     } catch (e) {
       console.error(`raiju: a2a push: could not read ${path}: ${e.message}`)
     }
+    this.sync()
   }
 
-  save(): void {
-    if (this.file === "") return
+  readConfig(name: string): PushConfig | undefined {
     try {
-      let text = ""
-      for (const c of this.configs) {
-        const sealed: PushConfig = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.seal(c.token), scheme: c.scheme, credentials: this.seal(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
-        text += `{"t":"c","v":${JSON.stringify(sealed)}}\n`
-      }
-      for (const d of this.deliveries) text += `{"t":"d","v":${JSON.stringify(d)}}\n`
-      try writeFileSync(this.file, text)
+      const fs = try fields(try readFileSync(this.dir + "/" + name, "utf8"))
+      const c = try JSON.parse(find(fs, "v") ?? "") as PushConfig
+      return { agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.open(c.token), scheme: c.scheme, credentials: this.open(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
     } catch (e) {
-      console.error(`raiju: a2a push: could not write ${this.file}: ${e.message}`)
+      return undefined
     }
+  }
+
+  readDelivery(name: string): PushDelivery | undefined {
+    try {
+      const fs = try fields(try readFileSync(this.dir + "/" + name, "utf8"))
+      return try JSON.parse(find(fs, "v") ?? "") as PushDelivery
+    } catch (e) {
+      return undefined
+    }
+  }
+
+  // Makes the directory (once) before a write.
+  ensureDir(): void {
+    if (this.made) return
+    try {
+      mkdirSync(this.dir, { recursive: true })
+      this.made = true
+    } catch (e) {
+      console.error(`raiju: a2a push: could not create ${this.dir}: ${e.message}`)
+    }
+  }
+
+  writeConfig(c: PushConfig): void {
+    if (this.dir === "") return
+    this.ensureDir()
+    const sealed: PushConfig = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.seal(c.token), scheme: c.scheme, credentials: this.seal(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
+    try {
+      try writeFileSync(this.dir + "/" + configFile(c.agent, c.task, c.id), `{"by":${process.pid},"v":${JSON.stringify(sealed)}}\n`)
+    } catch (e) {
+      this.made = false
+      console.error(`raiju: a2a push: could not write in ${this.dir}: ${e.message}`)
+    }
+  }
+
+  writeDelivery(d: PushDelivery): void {
+    if (this.dir === "") return
+    this.ensureDir()
+    try {
+      try writeFileSync(this.dir + "/" + deliveryFile(d.id), `{"by":${process.pid},"v":${JSON.stringify(d)}}\n`)
+    } catch (e) {
+      this.made = false
+      console.error(`raiju: a2a push: could not write in ${this.dir}: ${e.message}`)
+    }
+  }
+
+  dropFile(name: string): void {
+    if (this.dir === "") return
+    try {
+      unlinkSync(this.dir + "/" + name)
+    } catch (e) {
+      // another process removed it first
+    }
+  }
+
+  // Reads the directory: the items in memory become what the files say. A finished delivery is not read again.
+  sync(): void {
+    if (this.dir === "") return
+    let names: string[] = []
+    try {
+      names = readdirSync(this.dir)
+    } catch (e) {
+      return
+    }
+    const oldC = new Map<string, PushConfig>()
+    for (const c of this.configs) oldC.set(configFile(c.agent, c.task, c.id), c)
+    const oldD = new Map<string, PushDelivery>()
+    for (const d of this.deliveries) oldD.set(d.id, d)
+    const nc: PushConfig[] = []
+    const nd: PushDelivery[] = []
+    for (const f of names) {
+      if (f.startsWith("c-") && f.endsWith(".json")) {
+        const c = this.readConfig(f)
+        if (c !== undefined) {
+          nc.push(c)
+        } else {
+          const o = oldC.get(f)
+          if (o !== undefined) nc.push(o)
+        }
+      } else if (f.startsWith("d-") && f.endsWith(".json")) {
+        const o = oldD.get(f.slice(2, f.byteLength - 5))
+        if (o !== undefined && o.status !== "pending") {
+          nd.push(o)
+          continue
+        }
+        const d = this.readDelivery(f)
+        if (d !== undefined) {
+          nd.push(d)
+        } else if (o !== undefined) {
+          nd.push(o)
+        }
+      }
+    }
+    this.configs = nc
+    this.deliveries = nd
   }
 
   indexOfConfig(agent: string, task: string, id: string): int {
@@ -141,22 +280,27 @@ export class PushStore {
 
   // Adds a config, or replaces the one with the same agent, task and id (keeping when it was created).
   saveConfig(c: PushConfig): void {
+    this.sync()
     const i = this.indexOfConfig(c.agent, c.task, c.id)
+    let next = c
     if (i >= 0) {
       const old = this.configs[i]!
-      this.configs[i] = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: c.token, scheme: c.scheme, credentials: c.credentials, ingress: c.ingress, created_at: old.created_at, updated_at: c.updated_at }
+      next = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: c.token, scheme: c.scheme, credentials: c.credentials, ingress: c.ingress, created_at: old.created_at, updated_at: c.updated_at }
+      this.configs[i] = next
     } else {
       this.configs.push(c)
     }
-    this.save()
+    this.writeConfig(next)
   }
 
   config(agent: string, task: string, id: string): PushConfig | undefined {
+    this.sync()
     const i = this.indexOfConfig(agent, task, id)
     return i < 0 ? undefined : this.configs[i]!
   }
 
   byIngress(agent: string, hash: string): PushConfig | undefined {
+    this.sync()
     for (const c of this.configs) {
       if (c.agent === agent && c.ingress === hash) return c
     }
@@ -164,30 +308,34 @@ export class PushStore {
   }
 
   forTask(agent: string, task: string): PushConfig[] {
+    this.sync()
     return this.configs.filter((c) => c.agent === agent && c.task === task)
   }
 
   // Removes a config. Whether one was there.
   remove(agent: string, task: string, id: string): bool {
+    this.sync()
     const i = this.indexOfConfig(agent, task, id)
     if (i < 0) return false
     this.configs = this.configs.filter((c) => !(c.agent === agent && c.task === task && c.id === id))
-    this.save()
+    this.dropFile(configFile(agent, task, id))
     return true
   }
 
   // Removes an embedded config that no push has bound to a task yet.
   removePending(agent: string, hash: string, pendingTask: string): bool {
-    const before = this.configs.length
+    this.sync()
+    const gone = this.configs.filter((c) => c.agent === agent && c.ingress === hash && c.task === pendingTask)
+    if (gone.length === 0) return false
     this.configs = this.configs.filter((c) => !(c.agent === agent && c.ingress === hash && c.task === pendingTask))
-    if (this.configs.length === before) return false
-    this.save()
+    for (const c of gone) this.dropFile(configFile(c.agent, c.task, c.id))
     return true
   }
 
   // Binds an embedded config to the task its first push (or its send) named. A config of the same id
   // already on that task is replaced.
   bind(agent: string, hash: string, pendingTask: string, task: string): void {
+    this.sync()
     let id = ""
     for (const c of this.configs) {
       if (c.agent === agent && c.ingress === hash && c.task === pendingTask) id = c.id
@@ -196,19 +344,25 @@ export class PushStore {
     this.configs = this.configs.filter((c) => !(c.agent === agent && c.task === task && c.id === id))
     for (let i = 0; i < this.configs.length; i++) {
       const c = this.configs[i]!
-      if (c.agent === agent && c.ingress === hash && c.task === pendingTask) this.configs[i] = { agent: c.agent, task: task, id: c.id, url: c.url, token: c.token, scheme: c.scheme, credentials: c.credentials, ingress: c.ingress, created_at: c.created_at, updated_at: Math.floor(Date.now()) }
+      if (c.agent === agent && c.ingress === hash && c.task === pendingTask) {
+        const moved: PushConfig = { agent: c.agent, task: task, id: c.id, url: c.url, token: c.token, scheme: c.scheme, credentials: c.credentials, ingress: c.ingress, created_at: c.created_at, updated_at: Math.floor(Date.now()) }
+        this.configs[i] = moved
+        this.writeConfig(moved)
+        this.dropFile(configFile(c.agent, c.task, c.id))
+      }
     }
-    this.save()
   }
 
   // The configs a management page shows, newest update first, and how many match before the page is cut.
   page(q: PushQuery): { rows: PushConfig[], total: int } {
+    this.sync()
     const hits = this.configs.filter((c) => (q.agents.length === 0 || q.agents.includes(c.agent)) && has(c.task, q.task) && has(c.id, q.config) && has(c.url, q.url))
     hits.sort(newestFirst)
     return { rows: hits.slice(q.offset, q.offset + q.limit), total: hits.length }
   }
 
   agentNames(): string[] {
+    this.sync()
     const out: string[] = []
     for (const c of this.configs) {
       if (!out.includes(c.agent)) out.push(c.agent)
@@ -219,42 +373,138 @@ export class PushStore {
 
   // Queues a delivery unless one with the same id is there. Whether it was new.
   addDelivery(d: PushDelivery): bool {
+    this.sync()
     for (const x of this.deliveries) {
       if (x.id === d.id) return false
     }
     this.deliveries.push(d)
-    this.save()
+    this.writeDelivery(d)
     return true
   }
 
   delivery(id: string): PushDelivery | undefined {
+    this.sync()
     for (const d of this.deliveries) {
       if (d.id === id) return d
     }
     return undefined
   }
 
-  // The deliveries due now, oldest first.
+  // The deliveries due now, oldest first. A delivery another process is sending is still listed: claim decides.
   due(now: int, limit: int): PushDelivery[] {
+    this.sync()
     const hits = this.deliveries.filter((d) => d.status === "pending" && d.next_at <= now)
     hits.sort((a, b) => a.next_at - b.next_at)
     return hits.slice(0, limit)
   }
 
   setDelivery(d: PushDelivery): void {
+    let found = false
     for (let i = 0; i < this.deliveries.length; i++) {
-      if (this.deliveries[i]!.id === d.id) this.deliveries[i] = d
+      if (this.deliveries[i]!.id === d.id) {
+        this.deliveries[i] = d
+        found = true
+      }
     }
-    this.save()
+    if (!found) this.deliveries.push(d)
+    this.writeDelivery(d)
+  }
+
+  leasePath(id: string, gen: int): string {
+    return this.dir + "/l-" + id + "-" + gen
+  }
+
+  // Takes the lease on a queued push so that this process alone sends it. The delivery is read again once the lease
+  // is held, so a push another process just finished (and released) is not sent twice. undefined when the push is not
+  // due, is finished, or another process holds the lease.
+  claim(id: string, now: int): PushDelivery | undefined {
+    if (this.held.has(id)) return undefined
+    if (this.dir === "") {
+      const m = this.delivery(id)
+      if (m === undefined || m.status !== "pending" || m.next_at > now) return undefined
+      this.held.set(id, 0)
+      return m
+    }
+    let gen = 0
+    let last = -1
+    while (existsSync(this.leasePath(id, gen))) {
+      last = gen
+      gen += 1
+    }
+    if (last >= 0) {
+      let age = 0
+      try {
+        age = now - Math.floor(statSync(this.leasePath(id, last)).mtimeMs)
+      } catch (e) {
+        return undefined
+      }
+      if (age <= this.leaseMs) return undefined
+    }
+    try {
+      mkdirSync(this.leasePath(id, gen))
+    } catch (e) {
+      return undefined
+    }
+    const fresh = this.readDelivery(deliveryFile(id))
+    if (fresh === undefined || fresh.status !== "pending" || fresh.next_at > now) {
+      this.dropLease(id, gen)
+      return undefined
+    }
+    this.held.set(id, gen)
+    return fresh
+  }
+
+  // Whether this instance still owns the lease it took (a stalled holder is overtaken by a higher generation).
+  holds(id: string): bool {
+    const gen = this.held.get(id)
+    if (gen === undefined) return false
+    return this.dir === "" || !existsSync(this.leasePath(id, gen + 1))
+  }
+
+  // Removes a lease and the older ones it replaced.
+  dropLease(id: string, gen: int): void {
+    for (let g = 0; g <= gen; g++) {
+      try {
+        rmSync(this.leasePath(id, g), { recursive: true, force: true })
+      } catch (e) {
+        continue
+      }
+    }
+  }
+
+  // Gives the lease up (after the outcome is written). A holder that was overtaken leaves the new holder's lease alone.
+  release(id: string): void {
+    const gen = this.held.get(id)
+    if (gen === undefined) return
+    this.held.delete(id)
+    if (this.dir === "") return
+    if (existsSync(this.leasePath(id, gen + 1))) return
+    this.dropLease(id, gen)
   }
 
   // Drops finished deliveries after a week, embedded configs no push ever bound after an hour, and the
-  // configs of agents that are no longer registered.
+  // configs of agents that are no longer registered; leases whose holder died long ago go too.
   prune(now: int, agents: string[]): void {
-    const before = this.configs.length + this.deliveries.length
-    this.deliveries = this.deliveries.filter((d) => d.status === "pending" || now - d.updated_at < RETENTION_MS)
-    this.configs = this.configs.filter((c) => agents.includes(c.agent) && !(c.task.startsWith(PENDING_PREFIX) && now - c.created_at > PENDING_TTL_MS))
-    if (this.configs.length + this.deliveries.length !== before) this.save()
+    this.sync()
+    const goneD = this.deliveries.filter((d) => !(d.status === "pending" || now - d.updated_at < RETENTION_MS))
+    const goneC = this.configs.filter((c) => !(agents.includes(c.agent) && !(c.task.startsWith(PENDING_PREFIX) && now - c.created_at > PENDING_TTL_MS)))
+    if (goneD.length > 0) this.deliveries = this.deliveries.filter((d) => d.status === "pending" || now - d.updated_at < RETENTION_MS)
+    if (goneC.length > 0) this.configs = this.configs.filter((c) => agents.includes(c.agent) && !(c.task.startsWith(PENDING_PREFIX) && now - c.created_at > PENDING_TTL_MS))
+    for (const d of goneD) this.dropFile(deliveryFile(d.id))
+    for (const c of goneC) this.dropFile(configFile(c.agent, c.task, c.id))
+    if (this.dir === "") return
+    try {
+      for (const f of readdirSync(this.dir)) {
+        if (!f.startsWith("l-")) continue
+        try {
+          if (now - Math.floor(statSync(this.dir + "/" + f).mtimeMs) > 10 * this.leaseMs) rmSync(this.dir + "/" + f, { recursive: true, force: true })
+        } catch (e) {
+          continue
+        }
+      }
+    } catch (e) {
+      return
+    }
   }
 }
 
@@ -363,14 +613,16 @@ function clip(s: string): string {
   return s.byteLength > 512 ? s.slice(0, 512) : s
 }
 
-// Sends what is due. A delivery is leased for a minute while it is tried, so another pass does not send it too.
-// After the attempt it is delivered, set to try again later, or dead (six attempts, or its config is gone).
-// seen is told about each attempt (the delivery, the error or "", and how long the send took).
+// Sends what is due. Each delivery is claimed first (a lease, so that of all the processes sharing the store only one
+// sends it) and released once its outcome is written. After the attempt it is delivered, set to try again later,
+// or dead (six attempts, or its config is gone). seen is told about each attempt (the delivery, the error or "",
+// and how long the send took).
 export async function deliverDue(store: PushStore, allowPrivate: bool, now: int, seen: (d: PushDelivery, err: string, ms: int) => void): Promise<int> {
   const due = store.due(now, BATCH)
   let done = 0
-  for (const d of due) {
-    store.setDelivery({ id: d.id, agent: d.agent, task: d.task, config: d.config, payload: d.payload, status: d.status, attempts: d.attempts, next_at: now + LEASE_MS, last_error: d.last_error, created_at: d.created_at, updated_at: d.updated_at })
+  for (const listed of due) {
+    const d = store.claim(listed.id, now)
+    if (d === undefined) continue
     const cfg = store.config(d.agent, d.task, d.config)
     let err = ""
     let gone = false
@@ -390,7 +642,9 @@ export async function deliverDue(store: PushStore, allowPrivate: bool, now: int,
     else next = at + backoffMs(attempts)
     if (status === "dead") console.error(`raiju: a2a push delivery ${d.id} (agent ${d.agent}) gave up after ${attempts} attempts: ${err}`)
     seen(d, err, Math.floor(Date.now() - t0))
-    store.setDelivery({ id: d.id, agent: d.agent, task: d.task, config: d.config, payload: d.payload, status: status, attempts: attempts, next_at: next, last_error: clip(err), created_at: d.created_at, updated_at: at })
+    // a holder that stalled past its lease and was overtaken must not overwrite the new holder's outcome
+    if (store.holds(d.id)) store.setDelivery({ id: d.id, agent: d.agent, task: d.task, config: d.config, payload: d.payload, status: status, attempts: attempts, next_at: next, last_error: clip(err), created_at: d.created_at, updated_at: at })
+    store.release(d.id)
     done += 1
   }
   return done
@@ -541,27 +795,213 @@ test("finished deliveries, unbound embedded configs and configs of removed agent
   expect(s.deliveries[0]!.id).toBe("wait")
 })
 
-test("secrets are sealed in the file and opened on load", () => {
-  const path = "/tmp/raiju-a2apush-test-" + (try secureHex(6)) + ".jsonl"
+let tmpSeq = 0
+
+function tmpDir(): string {
+  tmpSeq += 1
+  return "/tmp/raiju-a2apush-test-" + process.pid + "-" + Math.floor(Date.now()) + "-" + tmpSeq
+}
+
+function pending(id: string): PushDelivery {
+  return { id: id, agent: "echo", task: "t1", config: "c1", payload: `{"task":{"id":"t1"}}`, status: "pending", attempts: 0, next_at: 0, last_error: "", created_at: 0, updated_at: 0 }
+}
+
+test("secrets are sealed in the files and opened on load", () => {
+  const dir = tmpDir()
   const s = new PushStore()
   s.seal = (v: string): string => (v === "" ? v : "sealed:" + v)
   s.open = (v: string): string => (v.startsWith("sealed:") ? v.slice(7) : v)
-  s.persistTo(path)
+  s.persistTo(dir + ".jsonl")
   const c = cfg("echo", "t1", "c1", "h1")
   c.token = "cb-token"
   c.credentials = "cb-cred"
   s.saveConfig(c)
-  s.addDelivery({ id: "d1", agent: "echo", task: "t1", config: "c1", payload: `{"task":{"id":"t1"}}`, status: "pending", attempts: 0, next_at: 0, last_error: "", created_at: 0, updated_at: 0 })
-  const text = try readFileSync(path, "utf8")
+  s.addDelivery(pending("d1"))
+  const text = try readFileSync(dir + "/" + configFile("echo", "t1", "c1"), "utf8")
   expect(text.includes("sealed:cb-token")).toBe(true)
   expect(text.includes(`"token":"cb-token"`)).toBe(false)
   const back = new PushStore()
   back.seal = s.seal
   back.open = s.open
-  back.persistTo(path)
+  back.persistTo(dir + ".jsonl")
   expect(back.configs.length).toBe(1)
   expect(back.configs[0]!.token).toBe("cb-token")
   expect(back.configs[0]!.credentials).toBe("cb-cred")
   expect(back.deliveries.length).toBe(1)
-  try writeFileSync(path, "")
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a single-file store of an earlier version is moved into the directory once", () => {
+  const dir = tmpDir()
+  const file = dir + ".jsonl"
+  const c = cfg("echo", "t1", "c1", "h1")
+  try writeFileSync(file, `{"t":"c","v":${JSON.stringify(c)}}\n{"t":"d","v":${JSON.stringify(pending("d1"))}}\nnot json\n`)
+  const s = new PushStore()
+  s.persistTo(file)
+  expect(s.configs.length).toBe(1)
+  expect(s.deliveries.length).toBe(1)
+  expect(try readFileSync(file, "utf8")).toBe("")
+  const again = new PushStore()
+  again.persistTo(file)
+  expect(again.configs.length).toBe(1)
+  expect(again.deliveries.length).toBe(1)
+  try rmSync(dir, { recursive: true, force: true })
+  try rmSync(file, { force: true })
+})
+
+test("two stores on one directory see each other's configs, replacements and removals", () => {
+  const dir = tmpDir()
+  const a = new PushStore()
+  const b = new PushStore()
+  a.useDir(dir)
+  b.useDir(dir)
+  // registrations on different workers are all kept
+  a.saveConfig(cfg("echo", "t1", "c1", "h1"))
+  b.saveConfig(cfg("echo", "t2", "c2", "h2"))
+  a.saveConfig(cfg("echo", "t3", "c3", "h3"))
+  expect(a.page({ agents: [], task: "", config: "", url: "", limit: 25, offset: 0 }).total).toBe(3)
+  expect(b.page({ agents: [], task: "", config: "", url: "", limit: 25, offset: 0 }).total).toBe(3)
+  expect(b.byIngress("echo", "h1")!.task).toBe("t1")
+  expect(a.config("echo", "t2", "c2")!.ingress).toBe("h2")
+  // a replacement keeps when the config was created
+  const moved = cfg("echo", "t1", "c1", "h9")
+  moved.created_at = 5
+  moved.updated_at = 5
+  b.saveConfig(moved)
+  expect(a.config("echo", "t1", "c1")!.ingress).toBe("h9")
+  expect(a.config("echo", "t1", "c1")!.created_at).toBe(1000)
+  // a removal on one is a removal on the other, and happens once
+  expect(a.remove("echo", "t2", "c2")).toBe(true)
+  expect(b.remove("echo", "t2", "c2")).toBe(false)
+  expect(b.config("echo", "t2", "c2")).toBeUndefined()
+  // an embedded config bound on one worker is bound on the other
+  a.saveConfig(cfg("echo", PENDING_PREFIX + "p", "c4", "h4"))
+  b.bind("echo", "h4", PENDING_PREFIX + "p", "t4")
+  expect(a.config("echo", "t4", "c4")!.id).toBe("c4")
+  expect(a.config("echo", PENDING_PREFIX + "p", "c4")).toBeUndefined()
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a push accepted by one store is queued once and relayed by the store that takes its lease", () => {
+  const dir = tmpDir()
+  const a = new PushStore()
+  const b = new PushStore()
+  a.useDir(dir)
+  b.useDir(dir)
+  const m = try mintToken()
+  a.saveConfig(cfg("echo", "t1", "c1", m.hash))
+  const body = `{"task":{"id":"t1","status":{"state":"completed"}}}`
+  const x = acceptPush(b, "echo", m.token, body, 5000)
+  expect(x.status).toBe(202)
+  // the same event arriving on the other worker is the same delivery
+  const y = acceptPush(a, "echo", m.token, body, 5001)
+  expect(y.deliveryId).toBe(x.deliveryId)
+  expect(a.deliveries.length).toBe(1)
+  expect(a.due(6000, 16).length).toBe(1)
+  expect(b.due(6000, 16).length).toBe(1)
+  // one of them gets the lease; the other is told no, whoever asks first
+  const got = a.claim(x.deliveryId, 6000)
+  expect(got === undefined).toBe(false)
+  expect(b.claim(x.deliveryId, 6000) === undefined).toBe(true)
+  expect(a.claim(x.deliveryId, 6000) === undefined).toBe(true)
+  // the outcome is written, then the lease released
+  const d = got!
+  a.setDelivery({ id: d.id, agent: d.agent, task: d.task, config: d.config, payload: d.payload, status: "delivered", attempts: 1, next_at: 6000, last_error: "", created_at: d.created_at, updated_at: 6001 })
+  a.release(d.id)
+  // a delivery that is finished is not claimed again, and neither is one that waits for its backoff
+  expect(b.claim(d.id, 7000) === undefined).toBe(true)
+  expect(b.due(7000, 16).length).toBe(0)
+  expect(b.delivery(d.id)!.status).toBe("delivered")
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a claim made after another store finished the push finds it finished, even from an old list", () => {
+  const dir = tmpDir()
+  const a = new PushStore()
+  const b = new PushStore()
+  a.useDir(dir)
+  b.useDir(dir)
+  a.addDelivery(pending("d1"))
+  // b listed it as due before a took it
+  const listed = b.due(10, 16)
+  expect(listed.length).toBe(1)
+  const got = a.claim("d1", 10)!
+  a.setDelivery({ id: got.id, agent: got.agent, task: got.task, config: got.config, payload: got.payload, status: "pending", attempts: 1, next_at: 100000, last_error: "x", created_at: 0, updated_at: 11 })
+  a.release("d1")
+  expect(b.claim(listed[0]!.id, 11) === undefined).toBe(true)
+  // once the backoff has passed it can be claimed again, by either
+  expect(b.claim("d1", 100000) === undefined).toBe(false)
+  b.release("d1")
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a lease whose holder died is taken over after it expires, by one store only", () => {
+  const dir = tmpDir()
+  const a = new PushStore()
+  const b = new PushStore()
+  const c = new PushStore()
+  a.useDir(dir)
+  b.useDir(dir)
+  c.useDir(dir)
+  a.addDelivery(pending("d1"))
+  expect(a.claim("d1", 10) === undefined).toBe(false)
+  // a never releases (it died); within the lease nobody else can
+  expect(b.claim("d1", 10 + 1000) === undefined).toBe(true)
+  const later = Math.floor(Date.now()) + 120000
+  expect(b.claim("d1", later) === undefined).toBe(false)
+  expect(c.claim("d1", Math.floor(Date.now())) === undefined).toBe(true)
+  // a is no longer the owner: its outcome would be dropped
+  expect(a.holds("d1")).toBe(false)
+  expect(b.holds("d1")).toBe(true)
+  a.release("d1")
+  expect(c.claim("d1", Math.floor(Date.now())) === undefined).toBe(true)
+  b.release("d1")
+  expect(c.claim("d1", Math.floor(Date.now())) === undefined).toBe(false)
+  c.release("d1")
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("one store in memory claims a delivery once at a time", () => {
+  const s = new PushStore()
+  s.addDelivery(pending("d1"))
+  expect(s.claim("d1", 5) === undefined).toBe(false)
+  expect(s.claim("d1", 5) === undefined).toBe(true)
+  s.release("d1")
+  expect(s.claim("d1", 5) === undefined).toBe(false)
+  s.release("d1")
+  expect(s.claim("nope", 5) === undefined).toBe(true)
+})
+
+test("a file being written (unreadable) keeps the copy in memory; a finished delivery is not read again", () => {
+  const dir = tmpDir()
+  const a = new PushStore()
+  a.useDir(dir)
+  a.saveConfig(cfg("echo", "t1", "c1", "h1"))
+  a.addDelivery(pending("d1"))
+  try writeFileSync(dir + "/" + configFile("echo", "t1", "c1"), `{"by":1,"v":{"agent":`)
+  try writeFileSync(dir + "/" + deliveryFile("d1"), "")
+  a.sync()
+  expect(a.configs.length).toBe(1)
+  expect(a.configs[0]!.ingress).toBe("h1")
+  expect(a.deliveries.length).toBe(1)
+  a.setDelivery({ id: "d1", agent: "echo", task: "t1", config: "c1", payload: "{}", status: "delivered", attempts: 1, next_at: 0, last_error: "", created_at: 0, updated_at: 1 })
+  try writeFileSync(dir + "/" + deliveryFile("d1"), "garbage")
+  a.sync()
+  expect(a.deliveries[0]!.status).toBe("delivered")
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("pruning removes the files of what it drops", () => {
+  const dir = tmpDir()
+  const a = new PushStore()
+  const b = new PushStore()
+  a.useDir(dir)
+  b.useDir(dir)
+  a.saveConfig(cfg("gone", "t1", "c1", "h1"))
+  a.addDelivery({ id: "old", agent: "gone", task: "t1", config: "c1", payload: "{}", status: "delivered", attempts: 1, next_at: 0, last_error: "", created_at: 0, updated_at: 0 })
+  b.prune(100000000000, [])
+  a.sync()
+  expect(a.configs.length).toBe(0)
+  expect(a.deliveries.length).toBe(0)
+  try rmSync(dir, { recursive: true, force: true })
 })

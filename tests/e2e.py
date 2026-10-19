@@ -4648,6 +4648,147 @@ def l134b_e2e(env):
 L117 = "http://127.0.0.1:18175"  # MCP code mode: server stubs, the meta-tools, governance and logs on the nested calls
 L117B = "http://127.0.0.1:18176"  # MCP code mode at tool level, with the limits from mcp.tool_manager_config
 
+GW_L138 = "http://127.0.0.1:18215"  # A2A push state shared by the workers of a node (two workers on Bun; one process on http1)
+
+def l138_config(logs, card):
+    """The L138 gateway: one agent on the mock's v1 card (kept in the config: the workers do not share a card fetched through the
+    API, and only a single process runs the card timer), push callbacks allowed at the (private) mock."""
+    import hashlib
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True, "a2a_card_refresh_seconds": 0},
+        "logs_store": {"enabled": True, "dir": logs},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"a2a_allow_private_push_callbacks": True},
+        "providers": {"openai": {"keys": [{"name": "l138", "value": "sk-l138", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l138".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-l138", "value": "sk-bf-l138"}],
+        },
+        "agents": [{"name": "w", "agent_card_url": MOCK + "/a2a/v1/.well-known/agent-card.json", "allow_private_network": True, "allow_by_default": True, "card": card, "card_fetched_at": int(time.time() * 1000)}],
+    }
+
+def l138_e2e(env):
+    """A2A push configs and queued pushes shared by every worker of a node: the registrations land on different workers
+    (new connections), the agent's pushes land on others, and each push reaches the caller's callback exactly once, also
+    after a restart. The state is one file per config and per queued push in the logs_store folder. Its own gateway on 18215."""
+    import shutil, glob
+    logs = os.path.join(BUILD, "e2e-l138-logs")
+    cfg_path = os.path.join(BUILD, "e2e.l138.json")
+    card = call("GET", "/a2a/v1/.well-known/agent-card.json", base=MOCK)[2]
+    json.dump(l138_config(logs, card), open(cfg_path, "w"))
+    shutil.rmtree(logs, ignore_errors=True)
+    call("GET", "/_a2a/reset", base=MOCK)
+    workers = os.environ.get("RAIJU_SERVER", "bun") != "http1"
+    def start(tag):
+        args = [os.path.join(BUILD, "raiju"), "-port", "18215", "-host", "127.0.0.1", "-config", cfg_path]
+        if workers:
+            args += ["-workers", "2"]
+        return subprocess.Popen(cwd=ROOT, args=args, env=env, stderr=open(os.path.join(BUILD, f"e2e.l138.{tag}.log"), "w"))
+    gw = start("a")
+    ADM = {"authorization": "Bearer sk-admin-l138"}
+    KEY = {"x-bf-vk": "sk-bf-l138"}
+    def api(method, path, body=None):
+        return call(method, path, body, ADM, base=GW_L138, auth=False)
+    def rpc(method, params):
+        return call("POST", "/agents/a2a/w/json-rpc", {"jsonrpc": "2.0", "id": "7", "method": method, "params": params}, KEY, base=GW_L138, auth=False)
+    def callbacks():
+        return json.loads(call("GET", "/_a2a/cb-seen", base=MOCK)[2])
+    def delivered():
+        return [c for c in callbacks() if not c["failed"]]
+    def wait_for(fn, tries=120):
+        for _ in range(tries):
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.25)
+        return fn()
+    def total_configs():
+        s, _, b = api("GET", "/api/agents/push-configs?limit=100")
+        return json.loads(b).get("total_count") if s == 200 else -1
+    def store_files(prefix):
+        out = []
+        for f in sorted(glob.glob(os.path.join(logs, "a2a-push", prefix + "*.json"))):
+            try:
+                out.append(json.loads(open(f).read()))
+            except Exception:
+                pass
+        return out
+    cb = MOCK + "/cb/push"
+    n = 24
+    try:
+        wait(GW_L138 + "/health")
+        tasks = []
+        for i in range(n):
+            s, _, b = rpc("SendMessage", {"message": {"messageId": f"m-l138-{i}", "role": "ROLE_USER", "contextId": f"l138-{i}", "parts": [{"text": f"hi-{i}"}]}})
+            tasks.append(json.loads(b)["result"]["task"]["id"] if s == 200 and "task" in b else "")
+        check("the agent made a task for each message", all(tasks) and len(set(tasks)) == n, tasks)
+        from concurrent.futures import ThreadPoolExecutor
+        def register(it):
+            i, t = it
+            s, _, b = rpc("CreateTaskPushNotificationConfig", {"taskId": t, "id": "c1", "url": cb, "token": f"cb-token-l138-{i}"})
+            return 1 if s == 200 and json.loads(b).get("result", {}).get("id") == "c1" else 0
+        # at once, so that both workers take some of the connections
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            made = sum(ex.map(register, list(enumerate(tasks))))
+        check("every push config is registered (each request on a new connection)", made == n, made)
+        counts = [total_configs() for _ in range(8)]
+        check("every worker lists every registration", counts == [n] * 8, counts)
+        confs = store_files("c-")
+        pids = {c["by"] for c in confs}
+        check("the configs are one file each in the logs_store folder, written by both workers" if workers else "the configs are one file each in the logs_store folder", len(confs) == n and (len(pids) == 2 if workers else len(pids) == 1), (len(confs), pids))
+        def push(t):
+            s, _, b = call("GET", f"/_a2a/push?task={t}&state=completed", base=MOCK)
+            return json.loads(b)["sent"][0]["status"] if s == 200 else s
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            sent = list(ex.map(push, tasks))
+        check("the agent's pushes are all accepted at the ingress, whichever worker takes them", sent == [202] * n, sent)
+        def task_of(c):
+            hit = [t for t in tasks if f'"{t}"' in c["request"]["body"]]
+            return hit[0] if len(hit) == 1 else "?"
+        got = wait_for(lambda: len({task_of(c) for c in delivered()}) == n and delivered())
+        time.sleep(3)
+        got = delivered()
+        per_task = {}
+        for c in got:
+            tid = task_of(c)
+            per_task[tid] = per_task.get(tid, 0) + 1
+        check("every push reaches the caller's callback exactly once", sorted(per_task) == sorted(tasks) and all(v == 1 for v in per_task.values()) and len(got) == n and len(callbacks()) == n, (len(got), len(callbacks()), per_task))
+        check("each callback carries its own config's token", all(c["request"]["headers"].get("a2a-notification-token", "").startswith("cb-token-l138-") for c in got), got[:1])
+        dels = store_files("d-")
+        done = [d for d in dels if d["v"]["status"] == "delivered" and d["v"]["attempts"] == 1]
+        check("every queued push ended delivered after one attempt", len(done) == n, [(d["v"]["status"], d["v"]["attempts"]) for d in dels])
+        cfg_by = {c["v"]["task"]: c["by"] for c in confs}
+        relayed_elsewhere = [d for d in done if cfg_by.get(d["v"]["task"]) != d["by"]]
+        if workers:
+            check("some pushes were relayed by a worker other than the one that took the registration", len(relayed_elsewhere) > 0, (len(done), len(relayed_elsewhere)))
+        # a repeat of an event is the same queued push
+        s, _, b = call("GET", f"/_a2a/push?task={tasks[0]}&state=completed", base=MOCK)
+        time.sleep(2)
+        check("a push the agent repeats is queued once, also across workers", json.loads(b)["sent"][0]["status"] == 202 and len(callbacks()) == n, len(callbacks()))
+        # the management API shows the same list on every worker, and a delete is seen by all
+        s, _, b = api("DELETE", f"/api/agents/push-configs/w/{tasks[1]}/c1")
+        counts = [total_configs() for _ in range(8)]
+        check("a config deleted through one worker is gone for all", s == 204 and counts == [n - 1] * 8, (s, counts))
+        # a restart keeps the registrations and the queue
+        gw.terminate()
+        gw.wait(timeout=15)
+        gw = start("b")
+        wait(GW_L138 + "/health")
+        counts = [total_configs() for _ in range(6)]
+        check("the registrations survive a restart", counts == [n - 1] * 6, counts)
+        s, _, b = call("GET", f"/_a2a/push?task={tasks[2]}&state=working", base=MOCK)
+        wait_for(lambda: len(delivered()) >= n + 1)
+        time.sleep(2)
+        check("a push after the restart is delivered once", json.loads(b)["sent"][0]["status"] == 202 and len(delivered()) == n + 1 and len(callbacks()) == n + 1, (len(delivered()), len(callbacks())))
+    finally:
+        gw.terminate()
+        try:
+            gw.wait(timeout=15)
+        except Exception:
+            pass
+
+
 def l117_config(tag: str, mcp_extra: dict, keys: list) -> dict:
     """A gateway with the mock's weather server as a code mode client. Its own gateway, started and stopped by l117_e2e."""
     return {
@@ -9291,6 +9432,8 @@ def main():
         # credentials, the aggregated card and the card timer (their own gateway), then MCP server instructions and the agent CLI's headers
         l134_e2e(env)
         l134b_e2e(env)
+        # L138: A2A push state shared by the workers of a node, exactly-once relay across workers: their own gateway
+        l138_e2e(env)
         # MCP code mode: the meta-tools in chat requests, stubs and docs, programs over the MCP tools, the key gates on nested calls and the limits: their own gateways
         l117_e2e(env)
         # management API keys: a value shown once, a key's own permissions, the ceiling on grants, expiry, deletion and a restart: their own gateway
