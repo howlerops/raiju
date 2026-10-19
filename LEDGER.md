@@ -355,3 +355,20 @@ fast-forwarding their worktree to the branch tip.
 | L140 | (g) MCP | Token-exchange admin credential refreshed before it expires, as Bifrost does | worker | partial: verify-exchange keeps the refresh token, sealed at rest; the admin credential is renewed 5 minutes before expiry (or halfway through a shorter life) and after a 401, with the refresh_token grant and the exchange's client credentials; a refusal marks the client needs_reauth with Bifrost's reason, shown in GET /api/mcp and /api/mcp/clients. Open: renewals are not coordinated across workers or nodes |
 | L141 | UI | Chart zoom and series toggles; a permission editor for custom roles | worker | done: chart zoom by drag or keyboard (overview and logs refetch for the range; reset restores), legend series toggles, and a Roles tab: built-in roles read only, custom roles created and edited on a resource by operation grid, access profiles attached and detached, user roles set, every control following the caller's own permissions. make ui 309 checks. Open: per-resource data access overrides are not edited; no pan or wheel zoom |
 
+
+## Wave 18 (the open items after wave 17)
+
+Ports for new e2e gateways: each worker gets four from 18220-18299 (named in its brief).
+Workers fast-forward their worktree to the ledger commit first. getbifrost.ai is still blocked
+here, so token rates are not regenerated in this wave.
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L142 | (g) A2A gRPC | HTTP/2 cleartext (prior knowledge) server on Tov raw sockets: frames, HPACK with Huffman, flow control, streams, trailers; gRPC message framing and status trailers (src/h2.tov, src/hpack.tov, src/grpcwire.tov), proven with grpcio and h2 clients against a test echo server | worker | assigned |
+| L143 | (g) A2A gRPC | Protobuf wire codec and the lf.a2a.v1 messages mapped to and from A2A JSON (src/protobuf.tov, src/a2apb.tov), checked against golden vectors made with a2a-go v2.5.0 | worker | assigned |
+| L144 | (f) pricing | Transcription and speech billed as Bifrost's computeTranscriptionCost and computeSpeechCost do (audio tokens first, then per second), whole and streamed; OpenAI live/realtime rows checked | worker | assigned |
+| L145 | G48 | Large /v1/responses requests to non-OpenAI providers converted as they stream (Responses to chat, chained into the existing converters) | worker | assigned |
+| L146 | G48 | Large /anthropic/v1/messages to OpenAI-format, Gemini and Cohere providers, and large embeddings and completions to other formats, converted as they stream | worker | assigned |
+| L147 | (g) MCP, cluster | A replicated last-writer-wins state channel on the cluster transport plus a file lease shared by a node's workers; MCP token-exchange admin renewals done once (one worker, one node) and the renewed credential shared | worker | assigned |
+| L148 | (g) A2A gRPC | The gRPC binding wired as Bifrost's agentgatewaygrpc.go: listener on a2a_grpc_port, agent from the :authority label under a2a_grpc_base_domain, virtual-key auth from metadata, all eleven methods on the existing A2A dispatch | worker | todo (after L142, L143) |
+| L149 | (g) A2A | A2A push configs and fetched cards shared across nodes and workers on L147's channel | worker | todo (after L147) |
