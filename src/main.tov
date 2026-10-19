@@ -7,14 +7,15 @@ import * as path from "node:path"
 import { Config, loadConfig, loadRawConfig, resolveConfig, providerNames } from "./config"
 import { ConfigStore, ConfigCipher, cipherFromConfig, openConfig } from "./store"
 import { Engine } from "./gateway"
-import { McpManager } from "./mcp"
-import { saveUserToken } from "./mcpapi"
+import { McpManager, setAdminRenew } from "./mcp"
+import { saveUserToken, saveExchangeAdmin } from "./mcpapi"
 import { start } from "./server"
 import { Ops, withSecrets } from "./ops"
 import { fromBifrost, merge } from "./guardrails_compat"
 import { warnings } from "./config_compat"
 import { existsSync, readFileSync } from "node:fs"
 import { startFront } from "./front"
+import { openIssuerState } from "./mcpissuer"
 
 type Args = { port: int, host: string, config: string, workers: int, server: string, mode: string }
 
@@ -92,6 +93,8 @@ async function applyChange(engine: Engine, ops: Ops, store: ConfigStore, c: Conf
   if (newMcp !== undefined) await newMcp.connectNew()
   // a changed tool_sync_interval restarts the MCP tool sync timers
   engine.mcp?.startToolSync()
+  // a new or renewed token_exchange admin credential sets the next renewal
+  engine.scheduleAdminRenewal()
   ops.configure(next)
 }
 
@@ -143,17 +146,28 @@ async function main(): Promise<int> {
   reportConfig(args.config)
   const cfg = withBifrostGuardrails(await withSecrets(first), store, true)
   for (const p of aliasProblems(cfg)) console.error(`raiju: config: ${p}`)
+  // the MCP authorization server's state beside config.json: its signing key (generated when none is configured)
+  // and its grants. It is opened before the workers start, so every worker signs with the same key.
+  const stateNote = openIssuerState(cfg, path.join(path.dirname(args.config), "mcp-oauth-state.json"), cipher)
+  if (stateNote !== "") console.error(`raiju: mcp oauth: ${stateNote}`)
   const engine = new Engine(cfg)
   const ops = new Ops(engine, store)
   // refreshed per-user OAuth tokens are saved to the config file
   engine.userTokenSaved = (r) => {
     saveUserToken(store, r)
   }
+  // token_exchange admin credentials: renewed before they expire and after a 401, and saved to the config file
+  engine.adminSaved = (r) => {
+    saveExchangeAdmin(store, r)
+  }
+  setAdminRenew(async (client: string): Promise<string> => await engine.renewAdminCredential(client, true))
   store.onChange = (c) => {
     applyChange(engine, ops, store, c)
   }
   const mcp = engine.mcp
   if (mcp !== undefined) {
+    // an admin credential that ran out while the gateway was down is renewed before the clients connect
+    await engine.renewDueAdmins()
     await mcp.connectAll()
     for (const s of mcp.status().filter((x) => !x.stdio)) console.error(`raiju: mcp ${s.name}: ${s.connected ? `${s.tools} tools` : `not connected (${s.error})`}`)
   }
@@ -163,12 +177,20 @@ async function main(): Promise<int> {
   const server = args.server !== "" ? args.server : "bun"
   if (server === "http1" && args.workers > 1) console.error("raiju: the http1 server runs in one process; -workers needs -server bun")
   const maxBody = (cfg.client?.max_request_body_size_mb ?? 100) * 1048576
-  const url = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: maxBody }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody })
+  // large_payload_optimization: bodies over its request threshold stream to the provider, and the gateway checks the sizes
+  const lp = engine.large
+  const url = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: lp === undefined ? maxBody : 1099511627776, streamThreshold: lp === undefined ? 0 : Math.max(1, lp.requestThreshold), limitBytes: lp === undefined ? 0 : maxBody }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody })
   // Runs once the server is up: with -workers, in every worker after the fork.
   const supervisor = process.pid
   setTimeout(() => {
-    if (process.pid !== supervisor) ops.startLocalShare(supervisor)
-    else if (server === "http1" || args.workers <= 1) ops.startExpirySweep()
+    if (process.pid !== supervisor) {
+      ops.startLocalShare(supervisor)
+      ops.startA2aRelay()
+    } else if (server === "http1" || args.workers <= 1) {
+      ops.startExpirySweep()
+      ops.startA2aRelay()
+      ops.startCardRefresh()
+    }
     // each worker starts its own stdio MCP servers
     if (mcp !== undefined) startStdio(mcp)
   }, 0)

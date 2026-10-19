@@ -23,71 +23,87 @@
 //   they behave the same. The flag changes only branch order.
 // - \Z, octal escapes and backreferences are not supported.
 
+// Opcodes of a compiled program. The program is parallel int arrays with one row per
+// instruction, so the matcher reads ints and copies no records. ax and ay hold the
+// operands: a code point, a set index, an assertion code, a jump target or a slot.
+const OP_CHAR = 0
+const OP_SET = 1
+const OP_ANY = 2
+const OP_ASSERT = 3
+const OP_SPLIT = 4
+const OP_JMP = 5
+const OP_SAVE = 6
+const OP_MATCH = 7
+
+// A compiled program. setBits holds 4 words per set (its ASCII members, 32 to a word);
+// setLo and setHi hold the ranges of set k at indexes setAt[k] up to setAt[k+1]. first
+// is the bitmap of code points a match can start with (firstHigh covers all the others).
+// filtered is set when a match cannot be empty and cannot start with any code point, so
+// the matcher skips each start whose character is not in first.
+class Prog {
+  constructor(public ops: int[], public ax: int[], public ay: int[], public setBits: int[], public setLo: int[], public setHi: int[], public setAt: int[], public first: int[], public firstHigh: bool, public filtered: bool) {}
+}
+
+// A text decoded once for many matches: its code points and the byte offset of each
+// (at[i] for code point i, then the byte length).
+export class Decoded {
+  constructor(public cps: int[], public at: int[]) {}
+}
+
+export function decodeText(s: string): Decoded {
+  const cps = decodeCps(s)
+  return new Decoded(cps, byteStarts(cps))
+}
+
 // The matcher is a memoized backtracking VM over code points.
 export class Regex {
-  constructor(private prog: Inst[], private ncap: int) {}
+  constructor(private prog: Prog, private ncap: int, private lits: LitCand[]) {}
 
   // Numbered groups in the pattern (group 0, the whole match, not counted).
   groups(): int {
     return this.ncap
   }
 
+  // Lowercase ASCII literals, one of which every match contains (an any-of set), or none
+  // when the pattern has no such set. A text with none of them has no match, so a caller
+  // can skip it without running the matcher. The byte bound pre and the character set cls
+  // say where a match holding the literal can start (see seqReq). A literal may overlap
+  // itself (hasBorder), so a caller that finds occurrences must count overlapping ones.
+  literals(): LitCand[] {
+    return this.lits
+  }
+
+  // test() on a decoded text. With lo and hi given, only the starts in the byte ranges
+  // [lo[r], hi[r]] are tried; a range is widened to whole code points, so the ranges
+  // must cover every start a match could have. No ranges means every start.
+  testDecoded(d: Decoded, lo: int[], hi: int[]): bool {
+    const n = d.cps.length
+    if (this.prog.ops.length * (n + 1) > stepLimit()) return false
+    const rlo: int[] = []
+    const rhi: int[] = []
+    for (let r = 0; r < lo.length; r++) {
+      if (hi[r]! < 0) continue
+      rlo.push(cpFloor(d.at, lo[r]! < 0 ? 0 : lo[r]!))
+      rhi.push(cpFloor(d.at, hi[r]!))
+    }
+    if (lo.length > 0 && rlo.length === 0) return false
+    let caps: int[] = []
+    return runProg(this.prog, d.cps, false, &caps, rlo, rhi)
+  }
+
   // False when a text of n bytes is past the step budget, so test() and exec() would
   // give up on it. Code points never outnumber bytes, so this can refuse a multibyte
   // text that would fit; callers use it to skip a text without decoding it.
   fits(n: int): bool {
-    return this.prog.length * (n + 1) <= stepLimit()
+    return this.prog.ops.length * (n + 1) <= stepLimit()
   }
 
   test(s: string): bool {
     const cps = decodeCps(s)
-    const n = cps.length
-    const width = this.prog.length
-    if (width * (n + 1) > stepLimit()) return false
-    let seen = newBits(width * (n + 1))
-    const stack: Branch[] = []
-    // Unanchored: a match may start at any position. States already visited
-    // from an earlier start failed then and fail now, so they are skipped.
-    for (let start = 0; start <= n; start++) {
-      stack.push({ pc: 0, pos: start, slot: -1 })
-      while (stack.length > 0) {
-        const top = stack.pop()
-        if (top === undefined) break
-        let pc = top.pc
-        let pos = top.pos
-        while (true) {
-          const idx = pc * (n + 1) + pos
-          if (testBit(seen, idx)) break
-          setBit(&seen, idx)
-          const ins = this.prog[pc]!
-          if (ins.kind === "match") return true
-          if (ins.kind === "split") {
-            stack.push({ pc: ins.y, pos: pos, slot: -1 })
-            pc = ins.x
-          } else if (ins.kind === "jmp") {
-            pc = ins.x
-          } else if (ins.kind === "char") {
-            if (pos >= n || cps[pos] !== ins.c) break
-            pc += 1
-            pos += 1
-          } else if (ins.kind === "set") {
-            if (pos >= n || !inRanges(ins.rs, cps[pos]!)) break
-            pc += 1
-            pos += 1
-          } else if (ins.kind === "any") {
-            if (pos >= n || (!ins.nl && cps[pos] === 10)) break
-            pc += 1
-            pos += 1
-          } else if (ins.kind === "save") {
-            pc += 1
-          } else {
-            if (!assertHolds(ins.op, cps, pos)) break
-            pc += 1
-          }
-        }
-      }
-    }
-    return false
+    if (this.prog.ops.length * (cps.length + 1) > stepLimit()) return false
+    let caps: int[] = []
+    const none: int[] = []
+    return runProg(this.prog, cps, false, &caps, none, none)
   }
 
   // The leftmost-first match, as RE2 and Perl choose it, with the span of every
@@ -101,58 +117,11 @@ export class Regex {
   exec(s: string): int[] | undefined {
     const cps = decodeCps(s)
     const n = cps.length
-    const width = this.prog.length
-    if (width * (n + 1) > stepLimit()) return undefined
-    let seen = newBits(width * (n + 1))
+    if (this.prog.ops.length * (n + 1) > stepLimit()) return undefined
     let caps: int[] = []
     for (let k = 0; k < 2 * (this.ncap + 1); k++) caps.push(-1)
-    const stack: Branch[] = []
-    for (let start = 0; start <= n; start++) {
-      stack.push({ pc: 0, pos: start, slot: -1 })
-      while (stack.length > 0) {
-        const top = stack.pop()
-        if (top === undefined) break
-        // A restore entry: backtracking past a save puts the old value back.
-        if (top.slot >= 0) {
-          caps[top.slot] = top.pos
-          continue
-        }
-        let pc = top.pc
-        let pos = top.pos
-        while (true) {
-          const idx = pc * (n + 1) + pos
-          if (testBit(seen, idx)) break
-          setBit(&seen, idx)
-          const ins = this.prog[pc]!
-          if (ins.kind === "match") return spansOf(caps, byteStarts(cps))
-          if (ins.kind === "split") {
-            stack.push({ pc: ins.y, pos: pos, slot: -1 })
-            pc = ins.x
-          } else if (ins.kind === "jmp") {
-            pc = ins.x
-          } else if (ins.kind === "char") {
-            if (pos >= n || cps[pos] !== ins.c) break
-            pc += 1
-            pos += 1
-          } else if (ins.kind === "set") {
-            if (pos >= n || !inRanges(ins.rs, cps[pos]!)) break
-            pc += 1
-            pos += 1
-          } else if (ins.kind === "any") {
-            if (pos >= n || (!ins.nl && cps[pos] === 10)) break
-            pc += 1
-            pos += 1
-          } else if (ins.kind === "save") {
-            stack.push({ pc: 0, pos: caps[ins.slot]!, slot: ins.slot })
-            caps[ins.slot] = pos
-            pc += 1
-          } else {
-            if (!assertHolds(ins.op, cps, pos)) break
-            pc += 1
-          }
-        }
-      }
-    }
+    const none: int[] = []
+    if (runProg(this.prog, cps, true, &caps, none, none)) return spansOf(caps, byteStarts(cps))
     return undefined
   }
 }
@@ -167,7 +136,115 @@ export function compileRegex(src: string): Regex throws SyntaxError {
   try c.gen(root)
   try c.emit({ kind: "save", slot: 1 })
   try c.emit({ kind: "match" })
-  return new Regex(c.prog, p.groupCount())
+  return new Regex(toProg(c.prog), p.groupCount(), seqReq([root]))
+}
+
+// Assertion codes: 0 bot, 1 eot, 2 bol, 3 eol, 4 wordb, 5 nwordb.
+function assertCode(op: string): int {
+  if (op === "bot") return 0
+  if (op === "eot") return 1
+  if (op === "bol") return 2
+  if (op === "eol") return 3
+  if (op === "wordb") return 4
+  return 5
+}
+
+// The program as parallel int arrays, with the set bitmaps and the first characters.
+function toProg(insts: Inst[]): Prog {
+  const ops: int[] = []
+  const ax: int[] = []
+  const ay: int[] = []
+  const setBits: int[] = []
+  const setLo: int[] = []
+  const setHi: int[] = []
+  const setAt: int[] = []
+  let nsets = 0
+  for (const ins of insts) {
+    if (ins.kind === "char") {
+      ops.push(OP_CHAR)
+      ax.push(ins.c)
+      ay.push(0)
+    } else if (ins.kind === "set") {
+      ops.push(OP_SET)
+      ax.push(nsets)
+      ay.push(0)
+      nsets += 1
+      setAt.push(setLo.length)
+      let bits: int[] = [0, 0, 0, 0]
+      for (const x of ins.rs) {
+        setLo.push(x.lo)
+        setHi.push(x.hi)
+        for (let c = x.lo; c <= x.hi && c < 128; c++) bits[c >> 5] = bits[c >> 5]! | (1 << (c & 31))
+      }
+      for (const w of bits) setBits.push(w)
+    } else if (ins.kind === "any") {
+      ops.push(OP_ANY)
+      ax.push(ins.nl ? 1 : 0)
+      ay.push(0)
+    } else if (ins.kind === "assert") {
+      ops.push(OP_ASSERT)
+      ax.push(assertCode(ins.op))
+      ay.push(0)
+    } else if (ins.kind === "split") {
+      ops.push(OP_SPLIT)
+      ax.push(ins.x)
+      ay.push(ins.y)
+    } else if (ins.kind === "jmp") {
+      ops.push(OP_JMP)
+      ax.push(ins.x)
+      ay.push(0)
+    } else if (ins.kind === "save") {
+      ops.push(OP_SAVE)
+      ax.push(ins.slot)
+      ay.push(0)
+    } else {
+      ops.push(OP_MATCH)
+      ax.push(0)
+      ay.push(0)
+    }
+  }
+  setAt.push(setLo.length)
+  // The first characters: follow the edges that consume nothing (split, jmp, save and
+  // assert) from the start. A match that can be reached without a character can be empty.
+  const first: int[] = [0, 0, 0, 0]
+  let firstHigh = false
+  let firstAll = false
+  let nullable = false
+  const visited: bool[] = []
+  for (let k = 0; k < ops.length; k++) visited.push(false)
+  const todo: int[] = [0]
+  while (todo.length > 0) {
+    const pc = todo.pop()!
+    if (visited[pc]!) continue
+    visited[pc] = true
+    const op = ops[pc]!
+    if (op === OP_CHAR) {
+      const c = ax[pc]!
+      if (c >= 128) {
+        firstHigh = true
+      } else {
+        first[c >> 5] = first[c >> 5]! | (1 << (c & 31))
+      }
+    } else if (op === OP_SET) {
+      const k = ax[pc]!
+      for (let w = 0; w < 4; w++) first[w] = first[w]! | setBits[4 * k + w]!
+      for (let j = setAt[k]!; j < setAt[k + 1]!; j++) {
+        if (setHi[j]! >= 128) firstHigh = true
+      }
+    } else if (op === OP_ANY) {
+      firstAll = true
+    } else if (op === OP_SPLIT) {
+      todo.push(ax[pc]!)
+      todo.push(ay[pc]!)
+    } else if (op === OP_JMP) {
+      todo.push(ax[pc]!)
+    } else if (op === OP_MATCH) {
+      nullable = true
+    } else {
+      todo.push(pc + 1)
+    }
+  }
+  return new Prog(ops, ax, ay, setBits, setLo, setHi, setAt, first, firstHigh, !nullable && !firstAll)
 }
 
 // Byte offset of each code point of cps, then the byte length.
@@ -950,16 +1027,377 @@ class ReCompiler {
 
 // ---- helpers used by the matcher ----
 
-function assertHolds(op: string, cps: int[], pos: int): bool {
+function assertHolds(op: int, cps: int[], pos: int): bool {
   const n = cps.length
-  if (op === "bot") return pos === 0
-  if (op === "eot") return pos === n
-  if (op === "bol") return pos === 0 || cps[pos - 1] === 10
-  if (op === "eol") return pos === n || cps[pos] === 10
+  if (op === 0) return pos === 0
+  if (op === 1) return pos === n
+  if (op === 2) return pos === 0 || cps[pos - 1] === 10
+  if (op === 3) return pos === n || cps[pos] === 10
   const before = pos > 0 && isWordCp(cps[pos - 1]!)
   const after = pos < n && isWordCp(cps[pos]!)
-  if (op === "wordb") return before !== after
+  if (op === 4) return before !== after
   return before === after
+}
+
+// Whether a match can start with code point c.
+function startOk(p: Prog, c: int): bool {
+  if (c >= 128) return p.firstHigh
+  return ((p.first[c >> 5]! >> (c & 31)) & 1) === 1
+}
+
+// Whether set k of the program holds code point c.
+function setHas(p: Prog, k: int, c: int): bool {
+  if (c < 128) return ((p.setBits[4 * k + (c >> 5)]! >> (c & 31)) & 1) === 1
+  const end = p.setAt[k + 1]!
+  for (let j = p.setAt[k]!; j < end; j++) {
+    if (c >= p.setLo[j]! && c <= p.setHi[j]!) return true
+  }
+  return false
+}
+
+// The code point holding byte b: the largest i with at[i] <= b.
+function cpFloor(at: int[], b: int): int {
+  let lo = 0
+  let hi = at.length - 1
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (at[mid]! <= b) {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  return lo
+}
+
+// Whether code point index i lies in one of the ranges [lo[r], hi[r]].
+function startIn(lo: int[], hi: int[], i: int): bool {
+  for (let r = 0; r < lo.length; r++) {
+    if (i >= lo[r]! && i <= hi[r]!) return true
+  }
+  return false
+}
+
+// Runs the program over cps, from each start in turn: true at the first match found.
+// With track set, save instructions record positions in caps and restore them when the
+// search backtracks past them, so caps holds the match's spans on return.
+function runProg(p: Prog, cps: int[], track: bool, inout caps: int[], rlo: int[], rhi: int[]): bool {
+  const n = cps.length
+  const stride = n + 1
+  let seen = newBits(p.ops.length * stride)
+  let stk: int[] = []
+  for (let start = 0; start <= n; start++) {
+    // With ranges given, only starts inside them are tried.
+    if (rlo.length > 0 && !startIn(rlo, rhi, start)) continue
+    // A start whose character cannot begin a match has no match to find.
+    if (p.filtered) {
+      if (start >= n) break
+      if (!startOk(p, cps[start]!)) continue
+    }
+    // Stack entries are three ints: pc, pos, slot. A slot >= 0 is a restore entry
+    // that puts pos back into that capture slot; slot -1 is a branch to (pc, pos).
+    stk.push(0)
+    stk.push(start)
+    stk.push(-1)
+    while (stk.length > 0) {
+      const slot = stk.pop()!
+      const at = stk.pop()!
+      let pc = stk.pop()!
+      if (slot >= 0) {
+        caps[slot] = at
+        continue
+      }
+      let pos = at
+      while (true) {
+        const idx = pc * stride + pos
+        if (testBit(seen, idx)) break
+        setBit(&seen, idx)
+        const op = p.ops[pc]!
+        if (op === OP_CHAR) {
+          if (pos >= n || cps[pos] !== p.ax[pc]) break
+          pc += 1
+          pos += 1
+        } else if (op === OP_SET) {
+          if (pos >= n || !setHas(p, p.ax[pc]!, cps[pos]!)) break
+          pc += 1
+          pos += 1
+        } else if (op === OP_SPLIT) {
+          stk.push(p.ay[pc]!)
+          stk.push(pos)
+          stk.push(-1)
+          pc = p.ax[pc]!
+        } else if (op === OP_JMP) {
+          pc = p.ax[pc]!
+        } else if (op === OP_ANY) {
+          if (pos >= n || (p.ax[pc] === 0 && cps[pos] === 10)) break
+          pc += 1
+          pos += 1
+        } else if (op === OP_SAVE) {
+          if (track) {
+            const s = p.ax[pc]!
+            stk.push(0)
+            stk.push(caps[s]!)
+            stk.push(s)
+            caps[s] = pos
+          }
+          pc += 1
+        } else if (op === OP_ASSERT) {
+          if (!assertHolds(p.ax[pc]!, cps, pos)) break
+          pc += 1
+        } else {
+          return true
+        }
+      }
+    }
+  }
+  return false
+}
+
+// ---- required literals ----
+// A literal is a run of characters every match must contain, lowercased when it is
+// ASCII: a match of a case-folded letter contains the letter in either case, and the
+// window filter in guard_regex lowercases the text the same way. pre is the most bytes a
+// match can consume before the literal, so a match that holds the literal at byte q
+// starts at or after q - pre. pre is -1 when no bound is known.
+
+export type LitCand = { lit: string, pre: int, cls: Cset }
+
+// A set of characters: the ASCII members as 4 words, whether some non-ASCII character is
+// in it, and whether every character is (a dot).
+export type Cset = { bits: int[], high: bool, any: bool }
+
+// The ASCII lowercase of code point c, or -1 when c is not ASCII.
+function asciiLow(c: int): int {
+  if (c < 0 || c >= 128) return -1
+  return c >= 65 && c <= 90 ? c + 32 : c
+}
+
+// The lowercase ASCII code point a node matches on its own, or -1 when it matches
+// anything else. A set counts when all its members fold to one character.
+function singleChar(n: Node): int {
+  if (n.kind === "lit") return asciiLow(n.c)
+  if (n.kind === "set") {
+    let out = -1
+    for (const x of n.rs) {
+      if (x.lo !== x.hi) return -1
+      const c = asciiLow(x.lo)
+      if (c < 0 || (out >= 0 && c !== out)) return -1
+      out = c
+    }
+    return out
+  }
+  return -1
+}
+
+function emptyCset(): Cset {
+  return { bits: [0, 0, 0, 0], high: false, any: false }
+}
+
+// The union of two character sets.
+function unionCs(a: Cset, b: Cset): Cset {
+  const bits: int[] = []
+  for (let w = 0; w < 4; w++) bits.push(a.bits[w]! | b.bits[w]!)
+  return { bits: bits, high: a.high || b.high, any: a.any || b.any }
+}
+
+function addCp(inout cs: Cset, c: int): void {
+  if (c >= 128) {
+    cs.high = true
+  } else {
+    cs.bits[c >> 5] = cs.bits[c >> 5]! | (1 << (c & 31))
+  }
+}
+
+// Adds the characters a node can match to cs. An assertion or an empty node matches none.
+function addNode(n: Node, inout cs: Cset): void {
+  if (n.kind === "lit") {
+    addCp(&cs, n.c)
+  } else if (n.kind === "set") {
+    for (const x of n.rs) {
+      for (let c = x.lo; c <= x.hi && c < 128; c++) addCp(&cs, c)
+      if (x.hi >= 128) cs.high = true
+    }
+  } else if (n.kind === "any") {
+    cs.any = true
+  } else if (n.kind === "cat") {
+    for (const x of n.items) addNode(x, &cs)
+  } else if (n.kind === "cap") {
+    for (const x of n.items) addNode(x, &cs)
+  } else if (n.kind === "alt") {
+    for (const x of n.items) addNode(x, &cs)
+  } else if (n.kind === "rep") {
+    if (n.max !== 0) addNode(n.items[0]!, &cs)
+  }
+}
+
+// The characters a node can match.
+function charsOf(n: Node): Cset {
+  let cs = emptyCset()
+  addNode(n, &cs)
+  return cs
+}
+
+// Bytes of one code point in UTF-8.
+function utf8Len(c: int): int {
+  if (c < 128) return 1
+  if (c < 2048) return 2
+  if (c < 65536) return 3
+  return 4
+}
+
+// a + b, or -1 when either is unbounded.
+function addBytes(a: int, b: int): int {
+  if (a < 0 || b < 0) return -1
+  return a + b
+}
+
+// The most bytes a node can match, or -1 when that is unbounded.
+function maxBytes(n: Node): int {
+  if (n.kind === "empty" || n.kind === "assert") return 0
+  if (n.kind === "lit") return utf8Len(n.c)
+  if (n.kind === "set") {
+    // an ASCII-only set matches one byte
+    for (const x of n.rs) {
+      if (x.hi >= 128) return 4
+    }
+    return 1
+  }
+  if (n.kind === "any") return 4
+  if (n.kind === "cat" || n.kind === "cap") {
+    let total = 0
+    for (const x of n.items) total = addBytes(total, maxBytes(x))
+    return total
+  }
+  if (n.kind === "alt") {
+    let m = 0
+    for (const x of n.items) {
+      const b = maxBytes(x)
+      if (b < 0) return -1
+      if (b > m) m = b
+    }
+    return m
+  }
+  // a repeat of a node that matches nothing matches nothing however often it repeats
+  const b = maxBytes(n.items[0]!)
+  if (b === 0) return 0
+  if (n.max < 0 || b < 0) return -1
+  return b * n.max
+}
+
+// Appends the nodes of a sequence to out, with concatenations and groups spliced in.
+// A group is a zero-width wrapper for this purpose.
+function flatten(items: Node[], inout out: Node[]): void {
+  for (const x of items) {
+    if (x.kind === "cat") {
+      flatten(x.items, &out)
+    } else if (x.kind === "cap") {
+      flatten(x.items, &out)
+    } else {
+      out.push(x)
+    }
+  }
+}
+
+// The candidates of a node that starts off bytes into the sequence, after the characters
+// pref: their bounds and sets count what comes before them.
+function shiftLits(xs: LitCand[], off: int, pref: Cset): LitCand[] {
+  const out: LitCand[] = []
+  for (const x of xs) out.push({ lit: x.lit, pre: addBytes(x.pre, off), cls: unionCs(pref, x.cls) })
+  return out
+}
+
+// The literal of a run of code points, or none for an empty run.
+function flushRun(run: int[], pre: int, cls: Cset): LitCand[] {
+  if (run.length === 0) return []
+  return [{ lit: cpString(run, 0, run.length), pre: pre, cls: cls }]
+}
+
+function shortestLen(xs: LitCand[]): int {
+  let m = xs[0]!.lit.byteLength
+  for (const x of xs) {
+    if (x.lit.byteLength < m) m = x.lit.byteLength
+  }
+  return m
+}
+
+// The largest pre of a set, with unbounded as the largest.
+function maxPre(xs: LitCand[]): int {
+  let m = 0
+  for (const x of xs) {
+    if (x.pre < 0) return 1000000000
+    if (x.pre > m) m = x.pre
+  }
+  return m
+}
+
+// The better of two candidate sets. The longer shortest literal is the stronger filter,
+// then fewer literals, then the smaller largest pre. An empty set means none.
+function betterLits(a: LitCand[], b: LitCand[]): LitCand[] {
+  if (b.length === 0) return a
+  if (a.length === 0) return b
+  const la = shortestLen(a)
+  const lb = shortestLen(b)
+  if (la !== lb) return lb > la ? b : a
+  if (b.length !== a.length) return b.length < a.length ? b : a
+  return maxPre(b) < maxPre(a) ? b : a
+}
+
+// The candidates of a node that is not a sequence: an alternation needs a literal from
+// every branch, and a repeat needs its body when it runs at least once.
+function nodeReq(n: Node): LitCand[] {
+  if (n.kind === "alt") {
+    const out: LitCand[] = []
+    for (const x of n.items) {
+      const r = seqReq([x])
+      if (r.length === 0) return []
+      for (const c of r) out.push(c)
+    }
+    return out.length <= 16 ? out : []
+  }
+  if (n.kind === "rep" && n.min >= 1) return seqReq([n.items[0]!])
+  return []
+}
+
+// The candidates of a sequence: sets of literals that every match of the sequence
+// contains one of, or [] when there are none. Runs of literal characters are candidates.
+// An assertion is zero-width, so a run goes on across it.
+function seqReq(items: Node[]): LitCand[] {
+  let flat: Node[] = []
+  flatten(items, &flat)
+  let best: LitCand[] = []
+  let run: int[] = []
+  // what the sequence holds before the current item: its byte bound, and its characters
+  let cons = 0
+  let pref = emptyCset()
+  let runPre = 0
+  let runCls = emptyCset()
+  for (const x of flat) {
+    if (x.kind === "empty" || x.kind === "assert") continue
+    const c = singleChar(x)
+    if (c >= 0) {
+      if (run.length === 0) {
+        runPre = cons
+        runCls = pref
+      }
+      run.push(c)
+    } else {
+      best = betterLits(best, flushRun(run, runPre, runCls))
+      run = []
+      best = betterLits(best, shiftLits(nodeReq(x), cons, pref))
+    }
+    cons = addBytes(cons, maxBytes(x))
+    pref = unionCs(pref, charsOf(x))
+  }
+  best = betterLits(best, flushRun(run, runPre, runCls))
+  return best
+}
+
+// True when a proper prefix of s is also its suffix, so occurrences of s can overlap.
+export function hasBorder(s: string): bool {
+  for (let k = 1; k < s.byteLength; k++) {
+    if (s.slice(0, k) === s.slice(s.byteLength - k)) return true
+  }
+  return false
 }
 
 // ---- tests ----
@@ -1264,4 +1702,34 @@ test("exec gives no match past the step budget, as test() does", () => {
   expect(m === undefined).toBe(true)
   expect(try compileRegex("(a)").exec("a")).toEqual([0, 1, 0, 1])
   expect(spansFor("(a$)", repeatText("a", 50000))).toEqual([49999, 50000, 49999, 50000])
+})
+
+function litsOf(p: string): string[] throws SyntaxError {
+  const out: string[] = []
+  const re = try compileRegex(p)
+  for (const c of re.literals()) out.push(c.lit)
+  return out
+}
+
+test("required literals: the literal, its case folding and the bytes that may precede it", () => {
+  expect(try litsOf("ghp_[0-9a-zA-Z]{36}")).toEqual(["ghp_"])
+  expect(try litsOf("(?i)algolia")).toEqual(["algolia"])
+  expect(try litsOf("[0-9]+")).toEqual([])
+  expect(try litsOf("(?:sk|rk)_(?:test|live)_[a-z]+")).toEqual(["test", "live"])
+  const pre = try compileRegex("^[a-z]{2}xyz").literals()
+  expect(pre[0]!.lit).toBe("xyz")
+  expect(pre[0]!.pre).toBe(2)
+  // an unbounded prefix has no byte bound
+  expect(try compileRegex("a.*xyz").literals()[0]!.pre).toBe(-1)
+})
+
+test("testDecoded tries only the starts in the given byte ranges", () => {
+  const re = try compileRegex("ab")
+  const d = decodeText("xxab")
+  expect(re.testDecoded(d, [], [])).toBe(true)
+  expect(re.testDecoded(d, [0], [1])).toBe(false)
+  expect(re.testDecoded(d, [2], [2])).toBe(true)
+  expect(re.testDecoded(d, [3], [3])).toBe(false)
+  // after a two-byte character, byte 2 is the start of "a"
+  expect(re.testDecoded(decodeText("éab"), [2], [2])).toBe(true)
 })

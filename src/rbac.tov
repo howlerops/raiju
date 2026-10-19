@@ -3,14 +3,15 @@
 // a token is shown once, when its user is created, and never stored.
 import { sha256, toHex, utf8, secureHex } from "./crypto"
 import { decode, encode } from "./base64"
-import { AdminAuthConfig, AdminUserConfig, RoleConfig } from "./config"
+import { rfc3339Ms } from "./vkexpiry"
+import { AdminAuthConfig, AdminUserConfig, ApiKeyConfig, PermissionPair, RoleConfig } from "./config"
 
 // A built-in role (admin, editor, viewer, auditor) or the name of a custom role under governance.roles.
 export type Role = string
 
 export type UserConfig = AdminUserConfig
 
-export type RbacConfig = { users: UserConfig[], roles?: RoleConfig[] }
+export type RbacConfig = { users: UserConfig[], roles?: RoleConfig[], api_keys?: ApiKeyConfig[] }
 
 export type Identity = { kind: "user", name: string, role: Role } | { kind: "anonymous" } | { kind: "denied", reason: string }
 
@@ -33,7 +34,7 @@ export function hashPassword(salt: string, password: string): string {
 }
 
 // Compares without stopping at the first difference.
-function safeEq(a: string, b: string): bool {
+export function safeEq(a: string, b: string): bool {
   const x = utf8(a)
   const y = utf8(b)
   const n = x.length > y.length ? x.length : y.length
@@ -152,6 +153,8 @@ export function allowed(role: Role, perm: Permission, path: string): bool {
   if (role === "admin") return true
   const segs = segmentsOf(path)
   if (!isApi(segs)) return false
+  // management API keys are granted by a custom role's APIKeys permissions, or by the admin
+  if ((segs[1] ?? "") === "api-keys") return false
   if (perm === "manage_users") return false
   if (perm === "audit" && !isAudit(segs)) return false
   // the audit trail is for admins and auditors only
@@ -180,10 +183,11 @@ export function resourceOf(method: string, path: string): { resource: string, op
   else if (area === "logs") resource = "Logs"
   else if (area === "mcp-logs") resource = "MCPLogs"
   else if (area === "providers" || area === "keys" || area === "models") resource = "ModelProvider"
-  else if (area === "mcp") resource = "MCPGateway"
+  else if (area === "mcp" || area === "oauth2") resource = "MCPGateway"
   else if (area === "cluster") resource = "Cluster"
   else if (area === "alerting" || area === "alerts") resource = "Observability"
   else if (area === "roles") resource = "RBAC"
+  else if (area === "api-keys") resource = "APIKeys"
   else if (area === "governance") {
     if (coll === "virtual-keys") resource = "VirtualKeys"
     else if (coll === "teams") resource = "Teams"
@@ -193,6 +197,7 @@ export function resourceOf(method: string, path: string): { resource: string, op
     else if (coll === "access-profiles") resource = "AccessProfiles"
     else if (coll === "routing-rules") resource = "RoutingRules"
     else if (coll === "audit-logs") resource = "AuditLogs"
+    else if (coll === "rbac") resource = "RBAC"
     else resource = "Governance"
   }
   return { resource: resource, op: op }
@@ -214,9 +219,47 @@ export function roleAllows(roles: RoleConfig[] | undefined, role: string, method
   return false
 }
 
+// The management API key a Bearer value names, or undefined when it names none (the user credentials
+// are tried next). Every key is compared, as the users are.
+export function keyOf(cfg: RbacConfig, headers: Map<string, string>): ApiKeyConfig | undefined {
+  const h = headers.get("authorization") ?? ""
+  if (!(h.startsWith("Bearer ") || h.startsWith("bearer "))) return undefined
+  const token = h.slice(7)
+  if (token === "") return undefined
+  const want = hashToken(token)
+  let hit: ApiKeyConfig | undefined = undefined
+  for (const k of cfg.api_keys ?? []) {
+    if (safeEq(want, k.key_sha256)) hit = k
+  }
+  return hit
+}
+
+// Whether a key may make this request: the route's (resource, operation) pair must be among its
+// permissions. Keys reach only /api routes, and the caller's own permission and policy reads.
+export function keyAllows(k: ApiKeyConfig, method: string, path: string): bool {
+  if (!isApi(segmentsOf(path))) return false
+  if (method.toUpperCase() === "GET" && (path === "/api/users/me/permissions" || path === "/api/users/me/vk-creation-policy")) return true
+  const need = resourceOf(method, path)
+  for (const p of k.permissions) {
+    if (p.resource === need.resource && p.operation === need.op) return true
+  }
+  return false
+}
+
 // The access decision for one request. 401 when the caller is not
-// authenticated, 403 when the role does not cover the request.
+// authenticated, 403 when the role does not cover the request. An API key is checked by its
+// permissions alone (it never inherits the role of whoever created it), and an expired one is refused.
 export function authorize(cfg: RbacConfig, headers: Map<string, string>, method: string, path: string): Verdict {
+  const key = keyOf(cfg, headers)
+  if (key !== undefined) {
+    const exp = key.expires_at === undefined ? undefined : rfc3339Ms(key.expires_at)
+    if (exp !== undefined && exp <= Date.now()) return { kind: "error", status: 401, message: "the API key has expired" }
+    if (!keyAllows(key, method, path)) {
+      const need = resourceOf(method, path)
+      return { kind: "error", status: 403, message: `API key ${key.name} may not ${need.resource}:${need.op} on this route` }
+    }
+    return { kind: "ok", actor: "key:" + key.name }
+  }
   const who = authenticate(cfg, headers)
   if (who.kind === "anonymous") return { kind: "error", status: 401, message: "authentication required" }
   if (who.kind === "denied") return { kind: "error", status: 401, message: who.reason }
@@ -228,7 +271,7 @@ export function authorize(cfg: RbacConfig, headers: Map<string, string>, method:
 
 // ---- user management ----
 
-type UserBody = { name?: string, role?: string, disabled?: bool }
+type UserBody = { name?: string, role?: string, role_id?: int, disabled?: bool }
 
 type UserView = { name: string, role: Role, disabled: bool }
 
@@ -238,10 +281,46 @@ export function isBuiltinRole(s: string): bool {
   return BUILT_IN_ROLES.includes(s)
 }
 
+// The name of the custom role with this id, or undefined.
+export function roleNameById(roles: RoleConfig[] | undefined, id: int): string | undefined {
+  for (const r of withRoleIds(roles ?? [])) {
+    if (r.id === id) return r.name
+  }
+  return undefined
+}
+
 // The custom role with this name, if one is defined.
 export function customRole(roles: RoleConfig[] | undefined, name: string): RoleConfig | undefined {
   for (const r of roles ?? []) {
     if (r.name === name) return r
+  }
+  return undefined
+}
+
+// The roles with their ids. A role keeps its id; one saved without one takes the next id after the largest
+// in use, in list order, so ids stay put as roles are added and removed.
+export function withRoleIds(roles: RoleConfig[]): RoleConfig[] {
+  let top: int = 0
+  for (const r of roles) {
+    const id: int = r.id ?? 0
+    if (id > top) top = id
+  }
+  const out: RoleConfig[] = []
+  for (const r of roles) {
+    if (r.id !== undefined) {
+      out.push(r)
+      continue
+    }
+    top += 1
+    out.push({ id: top, name: r.name, description: r.description, dac: r.dac, permissions: r.permissions, entity_dac: r.entity_dac })
+  }
+  return out
+}
+
+// The id of the custom role with this name, or undefined.
+export function roleIdOf(roles: RoleConfig[] | undefined, name: string): int | undefined {
+  for (const r of withRoleIds(roles ?? [])) {
+    if (r.name === name) return r.id
   }
   return undefined
 }
@@ -253,7 +332,7 @@ export function knownRole(roles: RoleConfig[] | undefined, s: string): bool {
 
 // Names are Basic auth user names and path segments: lower-case letters, digits, "_", "-", and
 // "@", "." and "+" so that a sign-in identity (an email, for an identity-aware proxy) can be a user.
-function validName(name: string): bool {
+export function validName(name: string): bool {
   const n = name.byteLength
   if (n < 1 || n > 64) return false
   for (const b of utf8(name)) {
@@ -271,6 +350,15 @@ export function provisioned(cfg: RbacConfig, identity: string): UserConfig | und
     if (u.name === who && u.disabled !== true) return u
   }
   return undefined
+}
+
+// Whether governance lists a disabled user under one of the names (a sign-in's email or subject). A name no
+// user holds is not disabled, so its sign-in is unchanged.
+export function disabledNamed(cfg: RbacConfig, names: string[]): bool {
+  for (const u of cfg.users) {
+    if (u.disabled === true && names.includes(u.name)) return true
+  }
+  return false
 }
 
 function view(u: UserConfig): UserView {
@@ -345,13 +433,19 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
   const old = findUser(cfg.users, name)
   if (old === undefined) return uerror(404, `no user ${name}`, cfg)
   const b = parseUserBody(body)
-  if (b === undefined) return uerror(400, "body must be a JSON object with role or disabled", cfg)
+  if (b === undefined) return uerror(400, "body must be a JSON object with role, role_id or disabled", cfg)
   let role: Role = old.role
   if (b.role !== undefined) {
     if (!knownRole(cfg.roles, b.role)) return uerror(400, "role must be admin, editor, viewer, auditor or a custom role", cfg)
     role = b.role
+  } else if (b.role_id !== undefined) {
+    // Bifrost's AssignUserRoleRequest: the role by its id, which must name a custom role
+    const named = roleNameById(cfg.roles, b.role_id)
+    if (named === undefined) return uerror(400, `role_id ${b.role_id} is not a custom role`, cfg)
+    role = named
   }
   const disabled = b.disabled === undefined ? old.disabled : b.disabled
+  // the record keeps what it holds beyond the role: its teams, business units, projects and access profiles
   const next: UserConfig = {
     name: old.name,
     role: role,
@@ -359,6 +453,10 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
     password_sha256: old.password_sha256,
     salt: old.salt,
     disabled: disabled,
+    teams: old.teams,
+    business_units: old.business_units,
+    projects: old.projects,
+    access_profile_ids: old.access_profile_ids,
   }
   if (isActiveAdmin(old) && !isActiveAdmin(next) && otherActiveAdmins(cfg.users, name) === 0) {
     return uerror(409, LAST_ADMIN, cfg)
@@ -673,7 +771,27 @@ test("sign-in identities can be users, and provisioned ones are found", () => {
   const u = provisioned(cfg, "Alice@Example.com")
   expect(u === undefined ? "" : u.role).toBe("editor")
   expect(provisioned(cfg, "bob@example.com") === undefined).toBe(true)
+  // a disabled user is named by its email; a sign-in no user holds is not disabled
+  const off: RbacConfig = { users: [{ name: "alice@example.com", role: "editor", disabled: true }, { name: "bob@example.com", role: "viewer" }], roles: [] }
+  expect(disabledNamed(off, ["sub-1", "alice@example.com"])).toBe(true)
+  expect(disabledNamed(off, ["sub-1", "bob@example.com"])).toBe(false)
+  expect(disabledNamed(off, ["carol@example.com", "sub-3"])).toBe(false)
+  const none: RbacConfig = { users: [], roles: [] }
+  expect(disabledNamed(none, ["alice@example.com"])).toBe(false)
   expect(handleUsers(cfg, "POST", "/api/users", "{\"name\":\"a b@x\",\"role\":\"viewer\"}").status).toBe(400)
+})
+
+test("a user's role can be set by role id, and a role change keeps the rest of the user's record", () => {
+  const roles: RoleConfig[] = [{ id: 4, name: "ops", permissions: [] }]
+  const cfg: RbacConfig = { users: [{ name: "root", role: "admin", token_sha256: hashToken("sk-root") }, { name: "bob", role: "viewer", teams: ["t1"], access_profile_ids: ["p-one"] }], roles: roles }
+  const byId = handleUsers(cfg, "PUT", "/api/users/bob/role", `{"role_id":4}`)
+  expect(byId.status).toBe(200)
+  const bob = findUser(byId.cfg.users, "bob")!
+  expect(bob.role).toBe("ops")
+  expect((bob.access_profile_ids ?? []).join(",")).toBe("p-one")
+  expect((bob.teams ?? []).join(",")).toBe("t1")
+  expect(handleUsers(cfg, "PUT", "/api/users/bob/role", `{"role_id":9}`).status).toBe(400)
+  expect(handleUsers(cfg, "PUT", "/api/users/bob/role", `{"role":"nope"}`).status).toBe(400)
 })
 
 test("custom roles hold resource and operation pairs and reach only the management API", () => {
@@ -699,6 +817,9 @@ test("resourceOf names the Bifrost resource and the operation for a route", () =
   expect(resourceOf("PUT", "/api/governance/business-units/bu1").resource).toBe("BusinessUnits")
   expect(resourceOf("DELETE", "/api/roles/ops").resource).toBe("RBAC")
   expect(resourceOf("GET", "/api/governance/budgets").resource).toBe("Governance")
+  // the governance-scoped role routes are RBAC, as /api/roles is: Governance rights do not edit roles
+  expect(resourceOf("PUT", "/api/governance/rbac/roles/r1").resource).toBe("RBAC")
+  expect(resourceOf("GET", "/api/governance/rbac/roles/r1/permissions").resource).toBe("RBAC")
   expect(resourceOf("GET", "/api/providers/openai/keys/k1/secrets").op).toBe("Reveal")
 })
 
@@ -707,4 +828,37 @@ test("a custom role can be assigned to a user, and an unknown role cannot", () =
   const cfg: RbacConfig = { users: [], roles: roles }
   expect(handleUsers(cfg, "POST", "/api/users", `{"name":"ann","role":"ops"}`).status).toBe(201)
   expect(handleUsers(cfg, "POST", "/api/users", `{"name":"bob","role":"ghost"}`).status).toBe(400)
+})
+
+test("a management API key is checked by its own permissions, and an expired one is refused", () => {
+  const value = "bfst-" + "0123456789abcdef0123456789abcdef01234567"
+  const cfg: RbacConfig = {
+    users: fixture().users,
+    api_keys: [
+      { id: 1, name: "reader", key_sha256: hashToken(value), key_prefix: "bfst-01234567...", permissions: [{ resource: "Logs", operation: "View" }], created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:00Z" },
+      { id: 2, name: "old", key_sha256: hashToken("bfst-expired"), key_prefix: "bfst-expired...", permissions: [{ resource: "Logs", operation: "View" }], expires_at: "2001-01-01T00:00:00Z", created_at: "2030-01-01T00:00:00Z", updated_at: "2030-01-01T00:00:00Z" },
+    ],
+  }
+  expect(statusOf(authorize(cfg, hdr("Bearer " + value), "GET", "/api/logs"))).toBe(200)
+  expect(actorOf(authorize(cfg, hdr("Bearer " + value), "GET", "/api/logs"))).toBe("key:reader")
+  // the key holds Logs:View only: no write, no other resource
+  expect(statusOf(authorize(cfg, hdr("Bearer " + value), "DELETE", "/api/logs"))).toBe(403)
+  expect(statusOf(authorize(cfg, hdr("Bearer " + value), "GET", "/api/providers"))).toBe(403)
+  expect(statusOf(authorize(cfg, hdr("Bearer " + value), "GET", "/api/users/me/permissions"))).toBe(200)
+  // a route outside /api is never a key's
+  expect(statusOf(authorize(cfg, hdr("Bearer " + value), "GET", "/v1/models"))).toBe(403)
+  // an expired key is refused as unauthenticated
+  expect(statusOf(authorize(cfg, hdr("Bearer bfst-expired"), "GET", "/api/logs"))).toBe(401)
+  // a value that names no key falls through to the users
+  expect(statusOf(authorize(cfg, hdr("Bearer sk-root-token"), "GET", "/api/providers"))).toBe(200)
+  expect(statusOf(authorize(cfg, hdr("Bearer bfst-nope"), "GET", "/api/logs"))).toBe(401)
+})
+
+test("the management API keys are for the admin and a custom role, not the editor, viewer or auditor", () => {
+  expect(allowed("editor", "read", "/api/api-keys")).toBe(false)
+  expect(allowed("viewer", "read", "/api/api-keys")).toBe(false)
+  expect(allowed("admin", "read", "/api/api-keys")).toBe(true)
+  expect(resourceOf("POST", "/api/api-keys").resource).toBe("APIKeys")
+  expect(resourceOf("POST", "/api/api-keys").op).toBe("Create")
+  expect(resourceOf("DELETE", "/api/api-keys/3").op).toBe("Delete")
 })

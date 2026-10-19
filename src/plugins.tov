@@ -1,12 +1,19 @@
-// Plugins in the shape of Bifrost's hooks. Tov can't load shared libraries, so
-// a plugin is a class compiled into the binary and enabled by config. A chain
-// runs each plugin's preRequest in order, and postResponse in reverse for the
-// plugins whose preRequest ran (Bifrost's semantics).
+// Plugins in the shape of Bifrost's hooks. A plugin is a class compiled into the binary and enabled
+// by config, or a WebAssembly module (wasmplugin.tov). A chain runs each plugin's preRequest in order,
+// and postResponse in reverse for the plugins whose preRequest ran (Bifrost's LLM hooks; postChunk is
+// the same hook for each chunk of a streamed answer). The HTTP transport hooks run around them, on the
+// request as it arrived and the response as it leaves: httpPre in order before routing (it can rewrite
+// the request or answer at once), httpPost in reverse after the response (it can rewrite it), and
+// httpChunk in reverse for each chunk of a streamed answer (it can rewrite or drop the chunk, or end the
+// stream). pluginroute.tov calls them from the servers.
 
 import { Field, fields, find, elements, rawStr, rawNum, isNull, quote, build, setField } from "./json"
 import { errorJson, newId, nowSeconds } from "./schemas"
 import { compileRegex } from "./regex"
 import { deltaText } from "./guard_stream"
+import { WasmPluginInst, WasmPluginLimits, openWasmPlugin } from "./wasmplugin"
+import { HttpReq, HttpResp, LlmKind, CHAT_KIND, kindOfOp, emptyReq, httpReqJson, httpRespJson, applyHttpReq, applyHttpResp, respFromJson } from "./plughttp"
+import { utf8 } from "./crypto"
 
 // Hooks take the context by inout: plugins add headers and share values
 // through ctx.headers and ctx.values, which parameters can't change.
@@ -23,11 +30,36 @@ export type PreResult =
   | { kind: "continue", body: string }
   | { kind: "short_circuit", status: int, body: string, contentType: string }
 
-export type PostResult = { kind: "continue", body: string }
+// A post hook's answer: the body, or the body with the status the answer now has (an error made of a
+// response, or a response made of an error).
+export type PostResult =
+  | { kind: "continue", body: string }
+  | { kind: "status", status: int, body: string }
+
+// What the post hooks leave of an answer.
+export type PostOutcome = { status: int, body: string }
+
+// What an httpPre hook decides: go on with the (possibly rewritten) request, answer at once with a response, or fail the request.
+export type HttpPreResult =
+  | { kind: "continue" }
+  | { kind: "respond", resp: HttpResp }
+  | { kind: "error", message: string }
+
+// What an httpChunk hook decides for a chunk: send it on (changed or not), drop it, or end the stream with a message.
+export type HttpChunkResult =
+  | { kind: "chunk", data: string }
+  | { kind: "skip" }
+  | { kind: "stop", message: string }
 
 // Each plugin's hooks pass through unless overridden.
 export abstract class BasePlugin {
   abstract name(): string
+
+  // The request types the LLM hooks run for. The built-in plugins work on chat bodies; a WebAssembly
+  // plugin sees every type.
+  handlesOp(op: string): bool {
+    return op === "chat"
+  }
 
   preRequest(inout ctx: PluginContext, body: string): PreResult throws Error {
     return { kind: "continue", body: body }
@@ -36,6 +68,67 @@ export abstract class BasePlugin {
   postResponse(inout ctx: PluginContext, status: int, body: string): PostResult throws Error {
     return { kind: "continue", body: body }
   }
+
+  // The post hook for one chunk of a streamed answer (its JSON, with no event framing). status is 200 until a
+  // plugin turns the stream into an error.
+  postChunk(inout ctx: PluginContext, status: int, chunk: string): PostResult throws Error {
+    return { kind: "continue", body: chunk }
+  }
+
+  // Whether the plugin's chat hooks also run on the routes that speak a provider's own format (Anthropic Messages,
+  // Cohere, GenAI, Bedrock), where the request is converted to chat shape for them (nativehook.tov). The built-in
+  // plugins work on chat requests as the OpenAI routes send them, so they stay off those routes.
+  hooksNative(): bool {
+    return false
+  }
+
+  // Whether the plugin has an HTTP transport hook (the servers read request bodies only when one does).
+  hasHttp(): bool {
+    return false
+  }
+
+  httpPre(inout ctx: PluginContext, inout req: HttpReq): HttpPreResult throws Error {
+    return { kind: "continue" }
+  }
+
+  // Returns a message to stop the chain with (what was changed so far stays), or "".
+  httpPost(inout ctx: PluginContext, req: HttpReq, inout resp: HttpResp): string throws Error {
+    return ""
+  }
+
+  httpChunk(inout ctx: PluginContext, req: HttpReq, data: string): HttpChunkResult throws Error {
+    return { kind: "chunk", data: data }
+  }
+}
+
+// One request's plugin state, shared by the hooks of both phases (the transport hooks and the LLM
+// hooks): the context, and the request as the transport hooks left it.
+export class PluginRun {
+  req: HttpReq | undefined = undefined
+  constructor(public ctx: PluginContext) {}
+}
+
+// The header that carries the id of a request's PluginRun from the transport hooks to the handler that runs
+// the LLM hooks (pluginroute.tov). The gateway's own x-bf-* headers never go upstream.
+export const RUN_HEADER = "x-bf-plugin-run"
+
+// A throw that carries a plugin's error out of a place that can only fail (a translate step): the
+// status and body are in the message.
+const PLUGIN_ERROR = "plugin error:"
+
+export function pluginErrorMessage(status: int, body: string): string {
+  return PLUGIN_ERROR + status + ":" + body
+}
+
+// The status and body a pluginErrorMessage carries, or undefined for any other message.
+export function parsePluginError(msg: string): { status: int, body: string } | undefined {
+  if (!msg.startsWith(PLUGIN_ERROR)) return undefined
+  const rest = msg.slice(PLUGIN_ERROR.byteLength)
+  const i = rest.indexOf(":")
+  if (i < 0) return undefined
+  const st = parseInt(rest.slice(0, i))
+  if (st === undefined) return undefined
+  return { status: st, body: rest.slice(i + 1) }
 }
 
 // Which plugins' preRequest ran for this request, as comma-separated indices.
@@ -61,14 +154,122 @@ function safePost(p: BasePlugin, inout ctx: PluginContext, status: int, body: st
   }
 }
 
+function safeChunk(p: BasePlugin, inout ctx: PluginContext, status: int, chunk: string): PostResult | undefined {
+  try {
+    return p.postChunk(&ctx, status, chunk)
+  } catch (e) {
+    console.error(`raiju: plugin ${p.name()} postChunk failed: ${e.message}`)
+    return undefined
+  }
+}
+
 export class PluginChain {
   constructor(readonly plugins: BasePlugin[]) {}
 
-  // Stops at the first short-circuit. Later plugins' preRequest hooks don't run.
+  // Whether any plugin takes part in the LLM hooks of a request type.
+  handles(op: string): bool {
+    for (const p of this.plugins) {
+      if (p.handlesOp(op)) return true
+    }
+    return false
+  }
+
+  // Whether any plugin takes part in the chat hooks of the provider-format routes.
+  hooksNative(): bool {
+    for (const p of this.plugins) {
+      if (p.hooksNative() && p.handlesOp("chat")) return true
+    }
+    return false
+  }
+
+  // Whether any plugin has an HTTP transport hook.
+  hasHttp(): bool {
+    for (const p of this.plugins) {
+      if (p.hasHttp()) return true
+    }
+    return false
+  }
+
+  // The HTTP pre hooks, in order, on the request (rewritten in place). Stops at the first plugin that answers
+  // or fails. A hook that traps or returns a broken answer is logged and skipped.
+  runHttpPre(inout ctx: PluginContext, inout req: HttpReq): HttpPreResult {
+    for (let i = 0; i < this.plugins.length; i++) {
+      const p = this.plugins[i]!
+      if (!p.hasHttp()) continue
+      try {
+        const r = p.httpPre(&ctx, &req)
+        if (r.kind !== "continue") return r
+      } catch (e) {
+        console.error(`raiju: plugin ${p.name()} httpPre failed: ${e.message}`)
+      }
+    }
+    return { kind: "continue" }
+  }
+
+  // The HTTP post hooks, in reverse, on the response (rewritten in place). A plugin that returns a message
+  // stops the chain; what was changed so far stays.
+  runHttpPost(inout ctx: PluginContext, req: HttpReq, inout resp: HttpResp): void {
+    for (let i = this.plugins.length - 1; i >= 0; i--) {
+      const p = this.plugins[i]!
+      if (!p.hasHttp()) continue
+      try {
+        const msg = p.httpPost(&ctx, req, &resp)
+        if (msg !== "") {
+          console.error(`raiju: plugin ${p.name()} httpPost: ${msg}`)
+          return
+        }
+      } catch (e) {
+        console.error(`raiju: plugin ${p.name()} httpPost failed: ${e.message}`)
+      }
+    }
+  }
+
+  // The HTTP stream chunk hooks, in reverse, on one chunk. A plugin may change it, drop it (nothing after it
+  // sees it) or end the stream. A hook that traps is logged and skipped.
+  runHttpChunk(inout ctx: PluginContext, req: HttpReq, data: string): HttpChunkResult {
+    let cur = data
+    for (let i = this.plugins.length - 1; i >= 0; i--) {
+      const p = this.plugins[i]!
+      if (!p.hasHttp()) continue
+      try {
+        const r = p.httpChunk(&ctx, req, cur)
+        if (r.kind === "skip" || r.kind === "stop") return r
+        cur = r.data
+      } catch (e) {
+        console.error(`raiju: plugin ${p.name()} httpChunk failed: ${e.message}`)
+      }
+    }
+    return { kind: "chunk", data: cur }
+  }
+
+  // The post hooks for one chunk of a streamed answer, in reverse for the plugins whose preRequest ran. The
+  // run's record of them stays until finish.
+  runPostChunk(inout ctx: PluginContext, chunk: string): PostOutcome {
+    const ran = (ctx.values.get(RAN_KEY) ?? "").split(",")
+    let status = 200
+    let cur = chunk
+    for (let i = this.plugins.length - 1; i >= 0; i--) {
+      if (!ran.includes(`${i}`)) continue
+      const r = safeChunk(this.plugins[i]!, &ctx, status, cur)
+      if (r === undefined) continue
+      cur = r.body
+      if (r.kind === "status") status = r.status
+    }
+    return { status: status, body: cur }
+  }
+
+  // Ends a streamed run: the record of the plugins whose preRequest ran is dropped.
+  finish(inout ctx: PluginContext): void {
+    ctx.values.delete(RAN_KEY)
+  }
+
+  // Stops at the first short-circuit. Later plugins' preRequest hooks don't run. Only the plugins that
+  // handle the request's type (ctx.op) take part.
   runPre(inout ctx: PluginContext, body: string): PreResult {
     const ran: string[] = []
     let cur = body
     for (let i = 0; i < this.plugins.length; i++) {
+      if (!this.plugins[i]!.handlesOp(ctx.op)) continue
       const r = safePre(this.plugins[i]!, &ctx, cur)
       if (r === undefined) continue
       ran.push(`${i}`)
@@ -82,25 +283,47 @@ export class PluginChain {
     return { kind: "continue", body: cur }
   }
 
-  // Runs postResponse in reverse, only for the plugins whose preRequest ran.
-  runPost(inout ctx: PluginContext, status: int, body: string): PostResult {
+  // Runs postResponse in reverse, only for the plugins whose preRequest ran. A status of 400 or more is an
+  // error the plugins get as one (and may recover from); a plugin may also turn a response into an error.
+  runPost(inout ctx: PluginContext, status: int, body: string): PostOutcome {
     const ran = (ctx.values.get(RAN_KEY) ?? "").split(",")
     ctx.values.delete(RAN_KEY)
     let cur = body
+    let st = status
     for (let i = this.plugins.length - 1; i >= 0; i--) {
       if (!ran.includes(`${i}`)) continue
-      const r = safePost(this.plugins[i]!, &ctx, status, cur)
-      if (r !== undefined) cur = r.body
+      const r = safePost(this.plugins[i]!, &ctx, st, cur)
+      if (r === undefined) continue
+      cur = r.body
+      if (r.kind === "status") st = r.status
     }
-    return { kind: "continue", body: cur }
+    return { status: st, body: cur }
   }
+}
+
+// A failed answer through the post hooks: they get it as an error, and may change it or recover from it.
+export async function errorPost(chain: PluginChain, run: PluginRun, res: Response): Promise<Response> {
+  let text = ""
+  try {
+    text = await res.text()
+  } catch (e) {
+    return new Response(errorJson("the answer could not be read", "api_error", undefined), { status: 502, headers: { "content-type": "application/json" } })
+  }
+  const o = chain.runPost(&run.ctx, res.status, text)
+  const hs: Record<string, string> = new Map()
+  res.headers.forEach((v, k) => {
+    if (k !== "content-length") hs.set(k, v)
+  })
+  if (o.status !== res.status) hs.set("content-type", "application/json")
+  return new Response(o.body, { status: o.status, headers: hs })
 }
 
 // ---- header ----
 
-export type HeaderConfig = { set_request_headers?: Map<string, string> }
+export type HeaderConfig = { set_request_headers?: Map<string, string>, set_response_headers?: Map<string, string> }
 
-// Copies configured headers into ctx.headers; the lead forwards them upstream.
+// Copies configured headers into ctx.headers, which go upstream; set_response_headers (Raiju's own) are
+// set on every response of an inference route, by the HTTP post hook.
 export class HeaderPlugin extends BasePlugin {
   constructor(readonly config: HeaderConfig) {
     super()
@@ -108,6 +331,18 @@ export class HeaderPlugin extends BasePlugin {
 
   name(): string {
     return "header"
+  }
+
+  hasHttp(): bool {
+    return this.config.set_response_headers !== undefined
+  }
+
+  httpPost(inout ctx: PluginContext, req: HttpReq, inout resp: HttpResp): string {
+    const set = this.config.set_response_headers
+    if (set !== undefined) {
+      for (const k of set.keys()) resp.headers.set(k.toLowerCase(), set.get(k)!)
+    }
+    return ""
   }
 
   preRequest(inout ctx: PluginContext, body: string): PreResult {
@@ -403,7 +638,7 @@ export class JsonParserPlugin extends BasePlugin {
   }
 
   postResponse(inout ctx: PluginContext, status: int, body: string): PostResult {
-    if (this.config.strip_markdown_fences !== true) return { kind: "continue", body: body }
+    if (this.config.strip_markdown_fences !== true || status >= 400) return { kind: "continue", body: body }
     // Bodies that aren't chat completions JSON pass through untouched.
     try {
       return { kind: "continue", body: try stripFencesIn(body) }
@@ -804,9 +1039,108 @@ export class MaxTokensPlugin extends BasePlugin {
   }
 }
 
+// ---- WebAssembly plugin ----
+
+// The request-wide JSON context the WebAssembly plugins pass along, as Bifrost's plugin context.
+const WASM_CONTEXT = "plugins.wasm.context"
+
+// A plugin loaded from a .wasm file (wasmplugin.tov has the ABI). Its context object lives in
+// ctx.values, so a plugin's post_hook sees what its pre_hook put there, and the plugins of one
+// request share it (the transport hooks and the LLM hooks use the same one).
+export class WasmPlugin extends BasePlugin {
+  constructor(readonly host: WasmPluginInst) {
+    super()
+  }
+
+  name(): string {
+    return this.host.name()
+  }
+
+  handlesOp(op: string): bool {
+    return true
+  }
+
+  hooksNative(): bool {
+    return true
+  }
+
+  hasHttp(): bool {
+    return this.host.hasHttp()
+  }
+
+  private context(ctx: PluginContext): string {
+    const have = ctx.values.get(WASM_CONTEXT) ?? ""
+    return have === "" ? `{"request_id":${quote(ctx.requestId)}}` : have
+  }
+
+  private kind(ctx: PluginContext): LlmKind {
+    return kindOfOp(ctx.op) ?? CHAT_KIND
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult throws Error {
+    const r = try this.host.preRequest(this.context(ctx), this.kind(ctx), body)
+    ctx.values.set(WASM_CONTEXT, r.context)
+    if (r.kind === "short_circuit") return { kind: "short_circuit", status: r.status, body: r.body, contentType: "application/json" }
+    return { kind: "continue", body: r.body }
+  }
+
+  private post(inout ctx: PluginContext, status: int, body: string, stream: bool): PostResult throws Error {
+    const r = try this.host.postHook(this.context(ctx), this.kind(ctx), status, body, stream)
+    ctx.values.set(WASM_CONTEXT, r.context)
+    if (r.kind === "status") return { kind: "status", status: r.status, body: r.body }
+    if (r.kind === "body") return { kind: "continue", body: r.body }
+    return { kind: "continue", body: body }
+  }
+
+  postResponse(inout ctx: PluginContext, status: int, body: string): PostResult throws Error {
+    return try this.post(&ctx, status, body, false)
+  }
+
+  postChunk(inout ctx: PluginContext, status: int, chunk: string): PostResult throws Error {
+    return try this.post(&ctx, status, chunk, true)
+  }
+
+  httpPre(inout ctx: PluginContext, inout req: HttpReq): HttpPreResult throws Error {
+    const r = try this.host.httpPre(this.context(ctx), httpReqJson(req))
+    ctx.values.set(WASM_CONTEXT, r.context)
+    if (r.kind === "error") return { kind: "error", message: r.message }
+    try {
+      if (r.kind === "respond") return { kind: "respond", resp: respFromJson(r.response) }
+      if (r.request !== undefined) applyHttpReq(&req, r.request)
+    } catch (e) {
+      throw new Error(`${this.host.name()}: http_pre_hook returned an invalid answer: ${e.message}`)
+    }
+    return { kind: "continue" }
+  }
+
+  httpPost(inout ctx: PluginContext, req: HttpReq, inout resp: HttpResp): string throws Error {
+    const r = try this.host.httpPost(this.context(ctx), httpReqJson(req), httpRespJson(resp))
+    ctx.values.set(WASM_CONTEXT, r.context)
+    if (r.response !== undefined) {
+      try {
+        applyHttpResp(&resp, r.response)
+      } catch (e) {
+        throw new Error(`${this.host.name()}: http_post_hook returned an invalid answer: ${e.message}`)
+      }
+    }
+    return r.error
+  }
+
+  httpChunk(inout ctx: PluginContext, req: HttpReq, data: string): HttpChunkResult throws Error {
+    const r = try this.host.httpChunk(this.context(ctx), httpReqJson(req), data)
+    ctx.values.set(WASM_CONTEXT, r.context)
+    if (r.kind === "skip") return { kind: "skip" }
+    if (r.kind === "stop") return { kind: "stop", message: r.message }
+    if (r.warning !== "") console.error(`raiju: plugin ${this.host.name()} http_stream_chunk_hook: ${r.warning}`)
+    return { kind: "chunk", data: r.chunk }
+  }
+}
+
 // ---- configuration ----
 
-export type PluginEntry = { name: string, enabled?: bool, configJson: string, placement?: string, order?: int }
+// path names a .wasm file to load as a plugin (name is then only the entry's label); limits are
+// that plugin's wasm_limits.
+export type PluginEntry = { name: string, enabled?: bool, configJson: string, placement?: string, order?: int, path?: string, limits?: WasmPluginLimits }
 
 // Bifrost's placement groups, in run order. Pre-hooks run in this order and post-hooks in reverse.
 // A plugin with no placement is post_builtin, as in Bifrost. undefined for any other value.
@@ -821,7 +1155,14 @@ type Sequenced = { p: BasePlugin, rank: int, order: int, at: int }
 
 // Builds the plugin for one name from its raw JSON config. Throws SyntaxError
 // on a bad config; returns undefined for a name nothing provides.
-function makePlugin(name: string, text: string): BasePlugin | undefined throws SyntaxError {
+function makePlugin(name: string, text: string, path: string | undefined, limits: WasmPluginLimits | undefined): BasePlugin | undefined throws SyntaxError {
+  if (path !== undefined && path.trim() !== "") {
+    try {
+      return new WasmPlugin(openWasmPlugin(path.trim(), text, limits))
+    } catch (e) {
+      throw new SyntaxError(e.message)
+    }
+  }
   if (name === "header") {
     const cfg = try JSON.parse(text) as HeaderConfig
     return new HeaderPlugin(cfg)
@@ -861,7 +1202,7 @@ export function buildChain(entries: PluginEntry[]): { chain: PluginChain, errors
     }
     const text = e.configJson.trim() === "" ? "{}" : e.configJson
     try {
-      const p = makePlugin(e.name, text)
+      const p = makePlugin(e.name, text, e.path, e.limits)
       if (p === undefined) errors.push(`unknown plugin "${e.name}"`)
       else seq.push({ p: p, rank: rank, order: e.order ?? 0, at: i })
     } catch (err) {
@@ -879,16 +1220,17 @@ export function buildChain(entries: PluginEntry[]): { chain: PluginChain, errors
 }
 
 // The status of one configured entry, as the plugin list reports it: disabled, active, or error with
-// the reason it was left out of the chain.
-export function entryStatus(e: PluginEntry): { status: string, error: string } {
-  if (e.enabled === false) return { status: "disabled", error: "" }
+// the reason it was left out of the chain. types are Bifrost's plugin types: llm, and http when the
+// plugin has a transport hook.
+export function entryStatus(e: PluginEntry): { status: string, error: string, types: string[] } {
+  if (e.enabled === false) return { status: "disabled", error: "", types: ["llm"] }
   const text = e.configJson.trim() === "" ? "{}" : e.configJson
   try {
-    const p = makePlugin(e.name, text)
-    if (p === undefined) return { status: "error", error: `unknown plugin "${e.name}"` }
-    return { status: "active", error: "" }
+    const p = makePlugin(e.name, text, e.path, e.limits)
+    if (p === undefined) return { status: "error", error: `unknown plugin "${e.name}"`, types: ["llm"] }
+    return { status: "active", error: "", types: p.hasHttp() ? ["llm", "http"] : ["llm"] }
   } catch (err) {
-    return { status: "error", error: `plugin "${e.name}": ${err.message}` }
+    return { status: "error", error: `plugin "${e.name}": ${err.message}`, types: ["llm"] }
   }
 }
 
@@ -1253,4 +1595,360 @@ test("mocker weights pick a response, and global latency sets the delay", () => 
   const r = p.preRequest(&ctx, "{}")
   expect(ctx.values.get("mock_latency_ms")).toBe("250")
   if (r.kind === "short_circuit") expect(r.body.includes(`"content":"always"`)).toBe(true)
+})
+
+// ---- WebAssembly plugins in the chain (tests/wasm/plugin.wasm; source tests/wasm/plugin.c) ----
+
+const WASM_FIXTURE = "tests/wasm/plugin.wasm"
+const WASM_CHAT = `{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"ping"}]}`
+const WASM_REPLY = `{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`
+
+function wasmEntry(name: string, config: string): PluginEntry {
+  return { name: name, enabled: true, configJson: config, path: WASM_FIXTURE }
+}
+
+test("a path ending in .wasm loads as a plugin, rewrites the request and stamps the response", () => {
+  const built = buildChain([wasmEntry("wasm-a", `{"mode":"rewrite","from":"ping","to":"pong","tag":"chain"}`)])
+  expect(built.errors.length).toBe(0)
+  expect(built.chain.plugins.length).toBe(1)
+  expect(built.chain.plugins[0]!.name()).toBe("raiju-test-plugin")
+  let ctx = ctxFor("gpt-4o-mini")
+  const pre = built.chain.runPre(&ctx, WASM_CHAT)
+  expect(pre.kind).toBe("continue")
+  if (pre.kind === "continue") expect(pre.body.includes(`"content":"pong"`)).toBe(true)
+  const post = built.chain.runPost(&ctx, 200, WASM_REPLY)
+  expect(post.body.includes(`"x_wasm_plugin":"ctx-ok:chain"`)).toBe(true)
+  expect(post.body.includes(`"content":"hi"`)).toBe(true)
+})
+
+test("a wasm plugin can short-circuit, and one that fails is skipped like any plugin", () => {
+  const short = buildChain([wasmEntry("wasm-s", `{"mode":"short"}`), { name: "header", enabled: true, configJson: `{"set_request_headers":{"x-after":"1"}}` }])
+  let c1 = ctxFor("m")
+  const r = short.chain.runPre(&c1, WASM_CHAT)
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") {
+    expect(r.status).toBe(200)
+    expect(r.body.includes("from the plugin")).toBe(true)
+  }
+  expect(c1.headers.get("x-after")).toBe(undefined)
+  const bad = buildChain([wasmEntry("wasm-t", `{"mode":"trap"}`), wasmEntry("wasm-u", `{"mode":"rewrite","from":"ping","to":"next"}`)])
+  let c2 = ctxFor("m")
+  const k = bad.chain.runPre(&c2, WASM_CHAT)
+  expect(k.kind).toBe("continue")
+  if (k.kind === "continue") expect(k.body.includes(`"content":"next"`)).toBe(true)
+})
+
+test("a wasm entry that cannot load is reported and left out", () => {
+  const built = buildChain([
+    { name: "gone", enabled: true, configJson: "{}", path: "/no/such/plugin.wasm" },
+    { name: "native", enabled: true, configJson: "{}", path: "/plugins/p.so" },
+    { name: "text", enabled: true, configJson: "{}", path: "/plugins/p.txt" },
+    wasmEntry("wasm-i", `{"mode":"initfail"}`),
+  ])
+  expect(built.chain.plugins.length).toBe(0)
+  expect(built.errors.length).toBe(4)
+  expect(built.errors[1]!.includes("Go shared-object plugins")).toBe(true)
+  expect(built.errors[3]!.includes("init returned 1")).toBe(true)
+  expect(entryStatus(wasmEntry("wasm-ok", `{"mode":"rewrite"}`)).status).toBe("active")
+  expect(entryStatus(wasmEntry("wasm-ok", `{"mode":"rewrite"}`)).types).toEqual(["llm", "http"])
+  expect(entryStatus({ name: "header", configJson: "{}" }).types).toEqual(["llm"])
+  expect(entryStatus({ name: "header", configJson: `{"set_response_headers":{"x":"1"}}` }).types).toEqual(["llm", "http"])
+  expect(entryStatus({ name: "native", configJson: "{}", path: "/plugins/p.so" }).status).toBe("error")
+})
+
+// ---- tests of the HTTP transport hooks, other request types and has_error ----
+
+// Records the transport hooks into ctx.values "trace". mode: "" passes through; "respond" answers in httpPre; "fail" throws in
+// every hook; "stop" returns a message from httpPost; "skip" and "end" do that to a chunk; "error" turns the response
+// into a 503 (postResponse) and the chunk into a 502 (postChunk); "mark" appends its id to the chunk and the response body.
+class HttpRecorder extends BasePlugin {
+  constructor(readonly id: string, readonly mode: string) {
+    super()
+  }
+
+  name(): string {
+    return this.id
+  }
+
+  handlesOp(op: string): bool {
+    return true
+  }
+
+  hasHttp(): bool {
+    return true
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult {
+    add(&ctx, "pre:" + this.id)
+    return { kind: "continue", body: body }
+  }
+
+  postResponse(inout ctx: PluginContext, status: int, body: string): PostResult throws Error {
+    add(&ctx, "post:" + this.id + ":" + status)
+    if (this.mode === "error" && status < 400) return { kind: "status", status: 503, body: `{"error":{"message":"by ${this.id}"}}` }
+    if (this.mode === "mark") return { kind: "continue", body: body + "+" + this.id }
+    return { kind: "continue", body: body }
+  }
+
+  postChunk(inout ctx: PluginContext, status: int, chunk: string): PostResult throws Error {
+    add(&ctx, "chunk:" + this.id + ":" + status)
+    if (this.mode === "error" && status < 400) return { kind: "status", status: 502, body: `{"error":{"message":"chunk by ${this.id}"}}` }
+    if (this.mode === "mark") return { kind: "continue", body: chunk + "+" + this.id }
+    return { kind: "continue", body: chunk }
+  }
+
+  httpPre(inout ctx: PluginContext, inout req: HttpReq): HttpPreResult throws Error {
+    add(&ctx, "hpre:" + this.id)
+    if (this.mode === "fail") throw new Error("boom")
+    if (this.mode === "respond") return { kind: "respond", resp: { status: 202, headers: new Map(), body: utf8("answered by " + this.id) } }
+    req.headers.set("x-" + this.id, "1")
+    return { kind: "continue" }
+  }
+
+  httpPost(inout ctx: PluginContext, req: HttpReq, inout resp: HttpResp): string throws Error {
+    add(&ctx, "hpost:" + this.id)
+    if (this.mode === "fail") throw new Error("boom")
+    resp.headers.set("x-post-" + this.id, "1")
+    if (this.mode === "stop") return "enough"
+    return ""
+  }
+
+  httpChunk(inout ctx: PluginContext, req: HttpReq, data: string): HttpChunkResult throws Error {
+    add(&ctx, "hchunk:" + this.id)
+    if (this.mode === "fail") throw new Error("boom")
+    if (this.mode === "skip") return { kind: "skip" }
+    if (this.mode === "end") return { kind: "stop", message: "ended by " + this.id }
+    if (this.mode === "mark") return { kind: "chunk", data: data + "+" + this.id }
+    return { kind: "chunk", data: data }
+  }
+}
+
+function chainOf3(modes: string[]): PluginChain {
+  const ps: BasePlugin[] = []
+  for (let i = 0; i < modes.length; i++) ps.push(new HttpRecorder(["a", "b", "c"][i]!, modes[i]!))
+  return new PluginChain(ps)
+}
+
+function traceOf(ctx: PluginContext): string {
+  return ctx.values.get("trace") ?? ""
+}
+
+test("the HTTP pre hooks run in order on the request, and the post hooks in reverse on the response", () => {
+  const chain = chainOf3(["", "", ""])
+  expect(chain.hasHttp()).toBe(true)
+  let ctx = ctxFor("m")
+  let req = emptyReq("POST", "/v1/embeddings")
+  const pre = chain.runHttpPre(&ctx, &req)
+  expect(pre.kind).toBe("continue")
+  expect(traceOf(ctx)).toBe("hpre:a hpre:b hpre:c")
+  expect(req.headers.get("x-a")).toBe("1")
+  expect(req.headers.get("x-c")).toBe("1")
+  let resp: HttpResp = { status: 200, headers: new Map(), body: utf8("ok") }
+  chain.runHttpPost(&ctx, req, &resp)
+  expect(traceOf(ctx)).toBe("hpre:a hpre:b hpre:c hpost:c hpost:b hpost:a")
+  expect(resp.headers.get("x-post-b")).toBe("1")
+})
+
+test("an HTTP pre hook may answer, and then the later plugins do not see the request", () => {
+  const chain = chainOf3(["", "respond", ""])
+  let ctx = ctxFor("m")
+  let req = emptyReq("POST", "/v1/embeddings")
+  const pre = chain.runHttpPre(&ctx, &req)
+  expect(pre.kind).toBe("respond")
+  if (pre.kind === "respond") {
+    expect(pre.resp.status).toBe(202)
+    expect((try new TextDecoder().decode(pre.resp.body))).toBe("answered by b")
+  }
+  expect(traceOf(ctx)).toBe("hpre:a hpre:b")
+})
+
+test("a failing HTTP hook is skipped in every direction", () => {
+  const chain = chainOf3(["", "fail", ""])
+  let ctx = ctxFor("m")
+  let req = emptyReq("POST", "/v1/embeddings")
+  expect(chain.runHttpPre(&ctx, &req).kind).toBe("continue")
+  expect(req.headers.get("x-c")).toBe("1")
+  let resp: HttpResp = { status: 200, headers: new Map(), body: [] }
+  chain.runHttpPost(&ctx, req, &resp)
+  expect(resp.headers.get("x-post-a")).toBe("1")
+  const out = chain.runHttpChunk(&ctx, req, `{"a":1}`)
+  expect(out.kind).toBe("chunk")
+  expect(traceOf(ctx)).toBe("hpre:a hpre:b hpre:c hpost:c hpost:b hpost:a hchunk:c hchunk:b hchunk:a")
+})
+
+test("an HTTP post hook that returns a message stops the chain and keeps what was changed", () => {
+  const chain = chainOf3(["", "stop", ""])
+  let ctx = ctxFor("m")
+  const req = emptyReq("GET", "/v1/models")
+  let resp: HttpResp = { status: 200, headers: new Map(), body: [] }
+  chain.runHttpPost(&ctx, req, &resp)
+  expect(traceOf(ctx)).toBe("hpost:c hpost:b")
+  expect(resp.headers.get("x-post-c")).toBe("1")
+  expect(resp.headers.get("x-post-b")).toBe("1")
+  expect(resp.headers.get("x-post-a")).toBe(undefined)
+})
+
+test("the chunk hooks run in reverse, may rewrite, drop or end", () => {
+  let ctx = ctxFor("m")
+  const req = emptyReq("POST", "/v1/chat/completions")
+  const marks = chainOf3(["mark", "mark", "mark"])
+  const m = marks.runHttpChunk(&ctx, req, `{"x":1}`)
+  expect(m.kind).toBe("chunk")
+  if (m.kind === "chunk") expect(m.data).toBe(`{"x":1}+c+b+a`)
+  const drop = chainOf3(["", "skip", ""])
+  let ctx2 = ctxFor("m")
+  expect(drop.runHttpChunk(&ctx2, req, `{"x":1}`).kind).toBe("skip")
+  expect(traceOf(ctx2)).toBe("hchunk:c hchunk:b")
+  const end = chainOf3(["end", "", ""])
+  const e = end.runHttpChunk(&ctx2, req, `{"x":1}`)
+  expect(e.kind).toBe("stop")
+  if (e.kind === "stop") expect(e.message).toBe("ended by a")
+})
+
+test("post hooks get an error as one, may turn a response into an error, and the last status stands", () => {
+  const chain = chainOf3(["", "error", ""])
+  let ctx = ctxFor("embeddings")
+  ctx.op = "embeddings"
+  const pre = chain.runPre(&ctx, `{"model":"m","input":"x"}`)
+  expect(pre.kind).toBe("continue")
+  const post = chain.runPost(&ctx, 200, `{"ok":true}`)
+  // c sees the response, b turns it into a 503, a sees the 503
+  expect(post.status).toBe(503)
+  expect(post.body).toBe(`{"error":{"message":"by b"}}`)
+  expect(traceOf(ctx)).toBe("pre:a pre:b pre:c post:c:200 post:b:200 post:a:503")
+  // an upstream error goes in as an error
+  let ctx2 = ctxFor("embeddings")
+  ctx2.op = "embeddings"
+  chain.runPre(&ctx2, `{}`)
+  const failed = chain.runPost(&ctx2, 429, `{"error":{"message":"slow down"}}`)
+  expect(failed.status).toBe(429)
+  expect(traceOf(ctx2)).toBe("pre:a pre:b pre:c post:c:429 post:b:429 post:a:429")
+})
+
+class NativeRecorder extends BasePlugin {
+  name(): string {
+    return "native"
+  }
+
+  hooksNative(): bool {
+    return true
+  }
+}
+
+test("only a plugin that opts in takes part in the hooks of the provider-format routes", () => {
+  const chat = new Recorder("x", false, false, false)
+  expect(new PluginChain([chat]).hooksNative()).toBe(false)
+  expect(new PluginChain([chat, new NativeRecorder()]).hooksNative()).toBe(true)
+  expect(new PluginChain([]).hooksNative()).toBe(false)
+})
+
+test("the plugins that handle a request type are the only ones that see it", () => {
+  const chat = new Recorder("x", false, false, false)
+  const wide = new HttpRecorder("w", "")
+  const chain = new PluginChain([chat, wide])
+  expect(chain.handles("chat")).toBe(true)
+  expect(chain.handles("embeddings")).toBe(true)
+  expect(new PluginChain([chat]).handles("embeddings")).toBe(false)
+  let ctx = ctxFor("m")
+  ctx.op = "embeddings"
+  chain.runPre(&ctx, `{}`)
+  chain.runPost(&ctx, 200, `{}`)
+  expect(traceOf(ctx)).toBe("pre:w post:w:200")
+})
+
+test("the post hooks of a stream run per chunk for the plugins whose pre hook ran, until finish", () => {
+  const chain = chainOf3(["mark", "", "mark"])
+  let ctx = ctxFor("m")
+  ctx.op = "responses"
+  chain.runPre(&ctx, `{}`)
+  const one = chain.runPostChunk(&ctx, `{"n":1}`)
+  const two = chain.runPostChunk(&ctx, `{"n":2}`)
+  expect(one.body).toBe(`{"n":1}+c+a`)
+  expect(two.body).toBe(`{"n":2}+c+a`)
+  expect(one.status).toBe(200)
+  chain.finish(&ctx)
+  // after finish no plugin is recorded as having run
+  expect(chain.runPostChunk(&ctx, `{"n":3}`).body).toBe(`{"n":3}`)
+  const bad = chainOf3(["", "error", ""])
+  let c2 = ctxFor("m")
+  c2.op = "responses"
+  bad.runPre(&c2, `{}`)
+  const e = bad.runPostChunk(&c2, `{"n":1}`)
+  expect(e.status).toBe(502)
+  expect(e.body).toBe(`{"error":{"message":"chunk by b"}}`)
+})
+
+test("the header plugin sets response headers in its HTTP post hook", () => {
+  const h = new Map<string, string>()
+  h.set("X-Served-By", "raiju")
+  const chain = new PluginChain([new HeaderPlugin({ set_response_headers: h })])
+  expect(chain.hasHttp()).toBe(true)
+  let ctx = ctxFor("m")
+  let resp: HttpResp = { status: 200, headers: new Map(), body: [] }
+  chain.runHttpPost(&ctx, emptyReq("GET", "/v1/models"), &resp)
+  expect(resp.headers.get("x-served-by")).toBe("raiju")
+  expect(new PluginChain([new HeaderPlugin({})]).hasHttp()).toBe(false)
+})
+
+test("a plugin error carried through a throw keeps its status and body", () => {
+  const m = pluginErrorMessage(429, `{"error":{"message":"no"}}`)
+  const p = parsePluginError(m)
+  expect(p!.status).toBe(429)
+  expect(p!.body).toBe(`{"error":{"message":"no"}}`)
+  expect(parsePluginError("could not read the answer")).toBe(undefined)
+})
+
+function wasmHttp(config: string): PluginEntry {
+  return { name: "wasm-http", enabled: true, configJson: config, path: WASM_FIXTURE }
+}
+
+test("a wasm plugin's context travels from http_pre_hook to the LLM hooks and http_post_hook", () => {
+  const built = buildChain([wasmHttp(`{"http":"rewrite","from":"ping","to":"pong","tag":"w1"}`)])
+  expect(built.errors.length).toBe(0)
+  const chain = built.chain
+  expect(chain.hasHttp()).toBe(true)
+  let ctx = ctxFor("gpt-4o-mini")
+  ctx.op = "http"
+  let req = emptyReq("POST", "/v1/chat/completions")
+  req.body = utf8(WASM_CHAT)
+  const pre = chain.runHttpPre(&ctx, &req)
+  expect(pre.kind).toBe("continue")
+  expect(req.headers.get("x-request-id")).toBe("w1")
+  expect((try new TextDecoder().decode(req.body)).includes(`"content":"pong"`)).toBe(true)
+  // the LLM hooks of the same request keep the context
+  ctx.op = "chat"
+  const llm = chain.runPre(&ctx, WASM_CHAT)
+  expect(llm.kind).toBe("continue")
+  const post = chain.runPost(&ctx, 200, WASM_REPLY)
+  expect(post.body.includes(`"x_wasm_plugin":"ctx-ok:w1"`)).toBe(true)
+  let resp: HttpResp = { status: 200, headers: new Map(), body: utf8(post.body) }
+  chain.runHttpPost(&ctx, req, &resp)
+  expect(resp.headers.get("x-wasm-http-ctx")).toBe("ok")
+  expect(resp.headers.get("x-wasm-http-post")).toBe("w1")
+})
+
+test("a wasm plugin turns a response into an error and recovers an error, through the chain", () => {
+  const e = buildChain([wasmHttp(`{"mode":"rewrite","post":"error"}`)]).chain
+  let ctx = ctxFor("m")
+  e.runPre(&ctx, WASM_CHAT)
+  const out = e.runPost(&ctx, 200, WASM_REPLY)
+  expect(out.status).toBe(429)
+  expect(out.body.includes("turned into an error by the plugin")).toBe(true)
+  const r = buildChain([wasmHttp(`{"mode":"rewrite","post":"recover"}`)]).chain
+  let c2 = ctxFor("m")
+  r.runPre(&c2, WASM_CHAT)
+  const back = r.runPost(&c2, 502, `{"error":{"message":"bad gateway","type":"api_error"}}`)
+  expect(back.status).toBe(200)
+  expect(back.body.includes("from the plugin")).toBe(true)
+})
+
+test("a wasm plugin that answers or refuses in http_pre_hook stops the request", () => {
+  let ctx = ctxFor("m")
+  let req = emptyReq("POST", "/v1/chat/completions")
+  const a = buildChain([wasmHttp(`{"http":"respond"}`)]).chain.runHttpPre(&ctx, &req)
+  expect(a.kind).toBe("respond")
+  if (a.kind === "respond") expect(a.resp.status).toBe(202)
+  const e = buildChain([wasmHttp(`{"http":"error"}`)]).chain.runHttpPre(&ctx, &req)
+  expect(e.kind).toBe("error")
+  if (e.kind === "error") expect(e.message).toBe("raiju-test-plugin: http pre refused")
 })

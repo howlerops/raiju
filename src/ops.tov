@@ -1,8 +1,9 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec } from "./config"
-import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page } from "./logapi"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec, WasmLimitsSpec } from "./config"
+import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page, timeOf } from "./logapi"
+import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
 import { entryStatus, PluginEntry } from "./plugins"
 import { parseDatasheet } from "./pricing"
@@ -14,25 +15,34 @@ import { join } from "node:path"
 import { Engine } from "./gateway"
 import { CostRecalc, RecalcStatus } from "./costrecalc"
 import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE } from "./setupsession"
-import { LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { agentSessionsOf, a2aLogJson, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
-import { AccessProfile, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
+import { AccessProfile, AgentConfig, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
-import { ConfigStore, checkAdmin, sweepExpiredKeys, RESOURCES, OPERATIONS } from "./store"
+import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS } from "./store"
+import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
 import { keyBudgetIds, permissionDocs, permissionIds, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
+// POST /api/governance/access-profiles/{id}/roles: the roles to attach (Bifrost's AttachRolesRequest).
+type RoleAttachBody = { role_ids?: int[], is_default?: bool, apply_to_existing?: bool }
 type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
 type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, roleIdOf } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
-import { ExposedTool, SessionStore, handleMcp } from "./mcpserver"
+import { ExposedTool, SessionStore, handleMcp, rpcError } from "./mcpserver"
+import { isMetaTool, metaToolDefs } from "./codemode"
+import { relay } from "./passthrough"
+import { findAgent, grantAllows, endpointOf, restEndpointOf, gatewayCard, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
+import { Call, PushSpec, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, interfacesOf, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
+import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
+import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
 import { tempTokenAllows } from "./mcpuser"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
@@ -41,24 +51,27 @@ import { notify, notifyOnce } from "./notify"
 import * as exporters from "./exporters"
 import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
-import { Field, fields, find, rawStr, rawBool, isNull, elements } from "./json"
+import { Field, fields, find, rawStr, rawBool, rawNum, isNull, elements } from "./json"
 import { trimSlash } from "./providers/types"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { deadline } from "./deadline"
-import { secureHex, utf8 } from "./crypto"
+import { secureHex, utf8, sha256, toHex } from "./crypto"
 import * as b64 from "./base64"
 import * as metrics from "./metrics"
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs"
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync } from "node:fs"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
+import { FeedRing, FeedQueue, FeedItem, feedEnvelope, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
 import { SocketExt } from "./realtime"
 import { LiveRegistry } from "./live"
-import { BROKER_ROUTE } from "./broker"
+import { BROKER_ROUTE, BROKER_FEED_ROUTE } from "./broker"
 import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
-import { ExportCursor, objectKey, putRequest, putBytesRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs } from "./exports"
-import { OidcConfig, Discovery, OidcFlows, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
+import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs, ByteRequest } from "./exports"
+import { planWindow, maxObjectBytes } from "./audit_archive"
+import { jobRequest, MAX_ATTEMPTS } from "./retained"
+import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode } from "./mcpissuer"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
@@ -79,26 +92,47 @@ function configOf(fs: Field[], dflt: string): string {
   return raw === undefined || isNull(raw) ? dflt : raw
 }
 
+// The plugin file a body names, or dflt when it names none.
+function pathOf(fs: Field[], dflt: string | undefined): string | undefined {
+  const raw = find(fs, "path")
+  if (raw === undefined) return dflt
+  const p = rawStr(fs, "path") ?? ""
+  return p === "" ? undefined : p
+}
+
+// The wasm_limits a body names, or dflt when it names none.
+function limitsOf(fs: Field[], dflt: WasmLimitsSpec | undefined): WasmLimitsSpec | undefined {
+  const raw = find(fs, "wasm_limits")
+  if (raw === undefined) return dflt
+  if (!raw.startsWith("{")) return undefined
+  try {
+    return JSON.parse(raw) as WasmLimitsSpec
+  } catch (e) {
+    return dflt
+  }
+}
+
 // Why a plugin cannot be built from its config: "" when it can. Checked as enabled, so a disabled plugin is
 // still checked for its name and config.
 function badPlugin(spec: PluginSpec): string {
-  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}" })
+  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}", path: spec.path, limits: spec.wasm_limits })
   return st.status === "error" ? st.error : ""
 }
 
 // One configured plugin as Bifrost's plugin response: its name, whether it is on, its config and its status.
 function pluginJson(sp: PluginSpec): string {
   const config = sp.config_json ?? ""
-  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config })
-  const builtin = builtinPlugins().includes(sp.name)
+  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config, path: sp.path, limits: sp.wasm_limits })
+  const custom = (sp.path ?? "") !== ""
+  const builtin = !custom && builtinPlugins().includes(sp.name)
   return jobj([
     jkv("name", JSON.stringify(sp.name)),
     jkv("actualName", JSON.stringify(sp.name)),
     jkv("enabled", sp.enabled === false ? "false" : "true"),
     jkv("config", config.trim() === "" ? "{}" : config),
     jkv("isCustom", builtin ? "false" : "true"),
-    jkv("path", "null"),
-    jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(["llm"]))])),
+    jkv("path", custom ? JSON.stringify(sp.path) : "null"),
+    jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(st.types))])),
   ])
 }
 
@@ -162,10 +196,123 @@ function byName(a: string, b: string): int {
   return a < b ? -1 : 1
 }
 
+// The names a single sign-on identity is known by in governance: its subject and its email, lower-cased.
+function ssoNames(sub: string, email: string | undefined): string[] {
+  return [sub, (email ?? "").toLowerCase()]
+}
+
 function json(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "application/json")
   return new Response(body, { status: status, headers: h })
+}
+
+// ---- the A2A gateway: what is not the Ops state ----
+
+// The headers of a call that do not go on to the agent: the connection's own, cookies, and the gateway's
+// credentials (the virtual key the caller logged in with is dropped by name where it came in).
+const A2A_NOT_FORWARDED: string[] = ["host", "content-length", "content-type", "content-encoding", "accept", "accept-encoding", "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "cookie", "x-bf-vk", "x-bf-agent-vk-id", "x-bf-agent-auth"]
+
+// What the agent answered to one call. rpc says which binding it answered in; error is set when no answer came.
+type Fwd = { status: int, text: string, ct: string, stream: ReadableStream | undefined, rpc: bool, error: string }
+
+function fwdFail(message: string): Fwd {
+  return { status: 0, text: "", ct: "", stream: undefined, rpc: true, error: message }
+}
+
+// A unary answer in the one shape both bindings use: failed, with the error's code and message, or the result.
+type Unary = { failed: bool, result: string, code: int, message: string }
+
+function unaryOf(f: Fwd): Unary {
+  if (f.rpc) {
+    try {
+      const fs = fields(f.text)
+      const er = find(fs, "error")
+      if (er !== undefined && !isNull(er)) {
+        const ef = fields(er)
+        return { failed: true, result: "", code: Math.floor(rawNum(ef, "code") ?? -32603.0), message: rawStr(ef, "message") ?? "the agent failed" }
+      }
+      const res = find(fs, "result")
+      if (res !== undefined && f.status < 400) return { failed: false, result: res, code: 0, message: "" }
+    } catch (e) {
+      // not a JSON-RPC answer
+    }
+    return { failed: true, result: "", code: -32603, message: f.status >= 400 ? `the agent answered HTTP ${f.status}` : "the agent's answer is not a JSON-RPC response" }
+  }
+  if (f.status >= 200 && f.status < 300) return { failed: false, result: f.text.trim() === "" ? "{}" : f.text, code: 0, message: "" }
+  const e = codeOfRestError(f.status, f.text)
+  return { failed: true, result: "", code: e.code, message: e.message }
+}
+
+// The agent's unary answer for a caller in a binding: as it came when the bindings are the same, else
+// its result or its error in the caller's shape.
+function a2aRender(rest: bool, rpcId: string, f: Fwd, u: Unary): Response {
+  const hs: Record<string, string> = new Map()
+  if (rest !== f.rpc) {
+    hs.set("content-type", f.ct === "" ? "application/json" : f.ct)
+    // a 204 has no body (a response with one would be refused)
+    return new Response(f.status === 204 || f.status === 304 ? undefined : f.text, { status: f.status, headers: hs })
+  }
+  hs.set("content-type", "application/json")
+  if (rest) {
+    if (u.failed) return new Response(restErrorBody(u.code, u.message), { status: httpOfCode(u.code), headers: hs })
+    return new Response(u.result, { status: 200, headers: hs })
+  }
+  if (u.failed) return new Response(rpcErrorBody(rpcId, u.code, u.message), { status: 200, headers: hs })
+  return new Response(`{"jsonrpc":"2.0","id":${rpcId},"result":${u.result}}`, { status: 200, headers: hs })
+}
+
+// A refusal before the protocol starts (no agent, no key, no grant, a budget used up), in the caller's binding.
+function a2aDeny(rest: bool, status: int, message: string, type: string): Response {
+  if (!rest) return status === 401 ? denied(401, message) : json(status, errorJson(message, type, undefined))
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  if (status === 401) h.set("www-authenticate", `ApiKey name="x-bf-vk", in="header"`)
+  return new Response(restErrorOfStatus(status, message), { status: status, headers: h })
+}
+
+// Whether an If-None-Match value names the tag.
+function etagMatches(header: string, tag: string): bool {
+  for (const v of header.split(",")) {
+    const t = v.trim()
+    if (t === "*" || t === tag || (t.startsWith("W/") && t.slice(2) === tag)) return true
+  }
+  return false
+}
+
+// A card as the gateway serves it: cacheable by the caller but to be checked again before each use, since
+// the key that may read it can change; answered 304 when the caller's copy is current.
+function a2aCardResponse(body: string, h: Hdrs): Response {
+  const tag = "\"" + toHex(sha256(utf8(body))).slice(0, 32) + "\""
+  const hs: Record<string, string> = new Map()
+  hs.set("cache-control", "private, no-cache")
+  hs.set("vary", "Authorization, x-bf-vk, api-key, x-api-key, x-goog-api-key")
+  hs.set("etag", tag)
+  if (etagMatches(h.get("if-none-match") ?? "", tag)) return new Response(undefined, { status: 304, headers: hs })
+  hs.set("content-type", "application/json")
+  return new Response(body, { status: 200, headers: hs })
+}
+
+// One A2A call that reached an agent (Ops.recordA2a).
+type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, error: string }
+
+// Whether an agent's answer is a JSON-RPC error object (false for a body that is not JSON).
+function rpcFailed(text: string): bool {
+  try {
+    return find(fields(text), "error") !== undefined
+  } catch (e) {
+    return false
+  }
+}
+
+// The comma-separated names of a query parameter, without empty ones.
+function listNames(v: string): string[] {
+  const out: string[] = []
+  for (const x of v.split(",")) {
+    const t = x.trim()
+    if (t !== "") out.push(t)
+  }
+  return out
 }
 
 // Model parameters by model key, each record as the JSON text it came in. The datasheet is keyed
@@ -244,6 +391,32 @@ function num(params: URLSearchParams, name: string): f64 | undefined {
   const v = params.get(name)
   if (v === undefined || v === "") return undefined
   return parseFloat(v)
+}
+
+// A window bound of the adaptive history: RFC 3339, or unix seconds. dflt when absent; undefined when unreadable.
+function historyBound(raw: string | undefined, dflt: f64): f64 | undefined {
+  if (raw === undefined || raw === "") return dflt
+  if (raw.includes("T")) return timeOf(raw)
+  const v = parseFloat(raw)
+  if (v === undefined) return undefined
+  return v * 1000.0
+}
+
+// The status an incident shows: resolved, recovering (its check is in flight) or attention.
+function incidentStatus(inc: Incident): string {
+  if (inc.resolvedAt > 0) return "resolved"
+  return inc.recovering ? "recovering" : "attention"
+}
+
+// An incident as the adaptive routing routes show it.
+function incidentRow(inc: Incident, now: number) {
+  const end = inc.resolvedAt > 0 ? inc.resolvedAt : now
+  return {
+    id: inc.id, target: inc.target, provider: inc.provider, key_id: inc.keyId, model: inc.model,
+    scope: inc.model === "" ? "key" : "route", failure_class: inc.cls, reason: inc.reason, status: incidentStatus(inc),
+    opened_at: rfc3339Of(inc.openedAt), resolved_at: inc.resolvedAt > 0 ? rfc3339Of(inc.resolvedAt) : undefined,
+    duration_seconds: Math.round((end - inc.openedAt) / 1000),
+  }
 }
 
 // The tools of a chat tool definition list, as MCP tools.
@@ -340,8 +513,9 @@ function trimPeer(p: string): string {
 // How often discovery runs, in ms: it registers this node where the mechanism needs it, then lists the others.
 const DISCOVER_MS = 10000
 
-// How often the UI socket looks for new request-log entries, in ms.
-const UI_TICK_MS = 1000
+// How often the UI socket's tick runs, in ms: it writes and reads the workers' share files, sends each batch
+// client its queue, and runs the heartbeat.
+const UI_TICK_MS = 100
 
 // The UI socket's heartbeat, as Bifrost's: a ping every 30 s, and a client that has not answered for
 // 60 s is dropped.
@@ -352,10 +526,21 @@ const UI_PONG_MS = 60000
 // this many bytes the older lines go.
 const UI_SHARE_MAX = 65536
 
-// One dashboard client on /ws.
+// A batch client may leave this many messages unsent before it is closed (1013): it resumes with its cursor.
+const UI_QUEUE_MAX = 5000
+
+// A worker's feed share file is trimmed to its newest FEED_SHARE_KEEP lines once it passes FEED_SHARE_MAX bytes.
+const FEED_SHARE_MAX = 262144
+const FEED_SHARE_KEEP = 300
+
+// One dashboard client on /ws. A client may ask for batches (batch=1): its messages then come as one JSON array
+// per tick, instead of one message each. A client may resume (since=node:seq,...): the hub replays the events it
+// missed before the live ones (feed.tov).
 export class UiSocket extends SocketExt {
-  // log events reach this socket only for entries its user's data scope covers
-  constructor(readonly hub: UiHub, readonly scope: DataScope) {
+  // messages a batch client has not been sent yet
+  private queue: string[] = []
+
+  constructor(readonly hub: UiHub, readonly scope: DataScope, readonly batch: bool, readonly since: Map<string, int> | undefined) {
     super()
   }
 
@@ -367,64 +552,158 @@ export class UiSocket extends SocketExt {
     this.closed = true
     this.hub.remove(this)
   }
+
+  // Sends a message now, or queues it for the next batch.
+  emit(text: string): void {
+    if (!this.batch) {
+      this.send(text)
+      return
+    }
+    if (this.queue.length >= UI_QUEUE_MAX) {
+      this.queue = []
+      this.endWith(1013, "send buffer full: reconnect with since")
+      return
+    }
+    this.queue.push(text)
+  }
+
+  // Sends the queued messages of a batch client as one JSON array.
+  flush(): void {
+    if (this.queue.length === 0) return
+    const xs = this.queue
+    this.queue = []
+    this.send("[" + xs.join(",") + "]")
+  }
 }
 
 // The events /ws pushes, in Bifrost's envelope {"type": ..., "data": ...}: store_update after a
-// successful management write (tags name the resource changed), and log for each new request-log
-// entry while a client is connected. (Bifrost's socket at this version sends notifications and
-// store updates only; the log events are Raiju's.)
+// successful management write (tags name the resource changed), and log for each request-log entry
+// (Bifrost's socket at this version sends notifications and store updates only; the log events are Raiju's).
 //
-// With several workers, each client gets the events of every worker: log entries from the shared
-// day file (LogStore.viewSince), and store updates from the other workers' share files.
+// Log events are the live feed (feed.tov). Each event has a producer (the node, or node/pid for one worker)
+// and that producer's next sequence. A worker takes the events it writes from the request log (ingest,
+// "local"); the other workers of its node write theirs to share files (ingest, "share"); events from peer
+// nodes or the broker come in over the cluster ("peer"). Every event goes into this worker's ring and to the
+// clients whose data scope covers it, so any node's /ws streams the merged feed.
 export cyclic class UiHub {
   clients: UiSocket[] = []
   timer: int = -1
-  since: f64 = 0.0
   lastPing: f64 = 0.0
   // the node's share directory, or "" for one process
   shareDir = ""
-  // how far each other worker's share file has been read, by file name
+  // how far each other worker's store-update share file has been read, by file name
   offsets: Map<string, int> = new Map()
-  constructor(readonly logs: () => LogStore | undefined) {}
+  // ... and its feed share file
+  feedOffsets: Map<string, int> = new Map()
+  // the newest events from every producer, for a client that resumes
+  ring: FeedRing = new FeedRing(FEED_RING_SIZE, FEED_RING_SECONDS * 1000.0)
+  // this worker's events, waiting for the relay to the peers or the broker (only when relayOn)
+  outbox: FeedQueue = new FeedQueue(FEED_QUEUE_MAX)
+  relayOn = false
+  // the newest sequence this worker has given its events
+  private seq: int = 0
+  // this worker's feed lines not yet written to its share file, and the bytes written since the last trim
+  private shareBuf: string[] = []
+  private shareBytes: int = 0
 
   add(c: UiSocket): void {
     c.pongAt = Date.now()
     this.clients.push(c)
-    if (this.clients.length === 1) {
-      this.since = Date.now()
-      this.lastPing = Date.now()
-      this.timer = setInterval(() => {
-        this.tick()
-      }, UI_TICK_MS)
-    }
+    this.wake()
+    const since = c.since
+    if (since !== undefined) this.replay(c, since)
   }
 
   remove(c: UiSocket): void {
     this.clients = this.clients.filter((x) => x !== c)
-    if (this.clients.length === 0 && this.timer >= 0) {
+    this.wake()
+  }
+
+  // The tick runs while there are clients, or sibling workers to read from.
+  private wake(): void {
+    const need = this.clients.length > 0 || this.shareDir !== ""
+    if (need && this.timer < 0) {
+      this.lastPing = Date.now()
+      this.timer = setInterval(() => {
+        this.tick()
+      }, UI_TICK_MS)
+    } else if (!need && this.timer >= 0) {
       clearInterval(this.timer)
       this.timer = -1
     }
   }
 
+  // Sizes the ring and the outbox from cluster.feed. A change starts them empty; the same sizes keep what they hold.
+  configureRing(maxItems: int, maxAgeMs: f64, queueMax: int): void {
+    if (this.ring.maxItems === maxItems && this.ring.maxAgeMs === maxAgeMs && this.outbox.max === queueMax) return
+    this.ring = new FeedRing(maxItems, maxAgeMs)
+    this.outbox = new FeedQueue(queueMax)
+  }
+
+  // The next sequence for this worker's events. It starts at the process's start time in ms, so it grows across restarts.
+  nextSeq(): int {
+    if (this.seq === 0) this.seq = Math.floor(Date.now())
+    this.seq += 1
+    return this.seq
+  }
+
   // Sends a store update to this worker's clients, and through the share file to the others.
   send(text: string): void {
-    for (const c of this.clients) c.send(text)
+    for (const c of this.clients) c.emit(text)
     if (this.shareDir !== "") this.share(text)
   }
 
-  // The share directory of the node's workers: each worker writes its own file.
+  // The share directory of the node's workers: each worker writes its own files there, and the feed's under feed/.
   setShare(dir: string): void {
     try {
-      mkdirSync(dir, { recursive: true })
+      mkdirSync(dir + "/feed", { recursive: true })
       this.shareDir = dir
     } catch (e) {
       this.shareDir = ""
     }
+    this.wake()
+  }
+
+  // An event into the ring, to the clients that may see it, and on to the other workers and the peers. from is
+  // "local" (this worker wrote it: it goes to the peers and the siblings), "peer" (it came from another node: the
+  // siblings get it) or "share" (a sibling already shared it). False for a repeat.
+  ingest(it: FeedItem, from: string): bool {
+    if (!this.ring.add(it, Date.now())) return false
+    if (from === "local" && this.relayOn) {
+      const d = this.outbox.push(it)
+      if (d > 0) metrics.inc("raiju_feed_dropped_total", `reason="queue"`, d)
+    }
+    if (from !== "share" && this.shareDir !== "") this.shareBuf.push(JSON.stringify(it))
+    const text = feedEnvelope(it)
+    for (const c of this.clients) {
+      if (inScope(c.scope, it.team, it.bu, it.customer, it.project)) c.emit(text)
+    }
+    return true
+  }
+
+  // Replays to a client that resumed: the events it missed and may see, its gaps, then a resumed message.
+  private replay(c: UiSocket, cursor: Map<string, int>): void {
+    const r = this.ring.resume(cursor)
+    let n = 0
+    for (const it of r.items) {
+      if (!inScope(c.scope, it.team, it.bu, it.customer, it.project)) continue
+      c.emit(feedEnvelope(it))
+      n += 1
+    }
+    for (const g of r.gaps) {
+      c.emit(gapEnvelope(g))
+      metrics.inc("raiju_feed_gap_events_total", "", g.missing)
+    }
+    c.emit(resumedEnvelope(n, r.gaps.length))
+    metrics.inc("raiju_feed_replayed_total", "", n)
   }
 
   private shareFile(): string {
     return this.shareDir + "/" + process.pid + ".jsonl"
+  }
+
+  private feedFile(): string {
+    return this.shareDir + "/feed/" + process.pid + ".jsonl"
   }
 
   // Appends a store update to this worker's file, keeping its last lines once it is large.
@@ -444,6 +723,30 @@ export cyclic class UiHub {
       writeFileSync(this.shareFile(), out)
     } catch (e) {
       // the other workers miss this update
+    }
+  }
+
+  // Appends this worker's feed lines to its share file. Past FEED_SHARE_MAX bytes the file keeps its newest lines;
+  // a reader that finds its file shorter than before reads it again, and the ring drops what it has already seen.
+  private flushShare(): void {
+    if (this.shareBuf.length === 0) return
+    const text = this.shareBuf.join("\n") + "\n"
+    this.shareBuf = []
+    const f = this.feedFile()
+    try {
+      appendFileSync(f, text)
+    } catch (e) {
+      // the other workers miss these events
+      return
+    }
+    this.shareBytes += text.byteLength
+    if (this.shareBytes <= FEED_SHARE_MAX) return
+    try {
+      const lines = readFileSync(f, "utf8").split("\n")
+      writeFileSync(f, lines.slice(Math.max(0, lines.length - FEED_SHARE_KEEP)).join("\n"))
+      this.shareBytes = 0
+    } catch (e) {
+      // the file keeps growing until the next try
     }
   }
 
@@ -474,10 +777,48 @@ export cyclic class UiHub {
         const line = parts[i]!
         used += line.byteLength + 1
         if (line !== "") {
-          for (const c of this.clients) c.send(line)
+          for (const c of this.clients) c.emit(line)
         }
       }
       this.offsets.set(f, from + used)
+    }
+  }
+
+  // Ingests the events the other workers wrote to their feed share files since the last tick (whole lines only).
+  private fromFeedShares(): void {
+    const dir = this.shareDir + "/feed"
+    let names: string[] = []
+    try {
+      names = readdirSync(dir)
+    } catch (e) {
+      return
+    }
+    const mine = `${process.pid}.jsonl`
+    for (const f of names) {
+      if (f === mine || !f.endsWith(".jsonl")) continue
+      let text = ""
+      try {
+        text = readFileSync(dir + "/" + f, "utf8")
+      } catch (e) {
+        continue
+      }
+      let from = this.feedOffsets.get(f) ?? 0
+      if (from > text.byteLength) from = 0
+      const parts = text.slice(from).split("\n")
+      let used = 0
+      for (let i = 0; i < parts.length - 1; i++) {
+        const line = parts[i]!
+        used += line.byteLength + 1
+        if (line === "") continue
+        let it: FeedItem | undefined = undefined
+        try {
+          it = parseItem(line)
+        } catch (e) {
+          // a line that is not an event is skipped
+        }
+        if (it !== undefined) this.ingest(it, "share")
+      }
+      this.feedOffsets.set(f, from + used)
     }
   }
 
@@ -491,19 +832,15 @@ export cyclic class UiHub {
     }
   }
 
-  // Pushes the request-log entries that arrived since the last tick, and the other workers' updates.
+  // One tick: the share files, the heartbeat, then each batch client's queue.
   tick(): void {
-    if (this.shareDir !== "") this.fromShares()
-    this.beat(Date.now())
-    const store = this.logs()
-    if (store === undefined) return
-    for (const e of store.viewSince(this.since)) {
-      const text = JSON.stringify({ type: "log", data: logEventView(e) })
-      for (const c of this.clients) {
-        if (visibleTo(e, c.scope)) c.send(text)
-      }
-      this.since = e.ts
+    if (this.shareDir !== "") {
+      this.flushShare()
+      this.fromShares()
+      this.fromFeedShares()
     }
+    this.beat(Date.now())
+    for (const c of this.clients) c.flush()
   }
 }
 
@@ -517,6 +854,15 @@ function logEventView(e: LogEntry): LogEvent {
 export class Ops {
   rbac: RbacConfig = { users: [] }
   authOn = false
+  // the A2A push relay: a pass in progress, and the passes made (the housekeeping runs on the first of each hour's)
+  relayBusy = false
+  relayTicks = 0
+  // the card timer runs in this process (so a card can be fetched again and saved), and when each agent's card was
+  // last fetched again because its endpoint answered as if it had moved
+  cardRefreshOn = false
+  cardRefreshAt: Map<string, f64> = new Map()
+  // when each management API key was last used, by name, as this worker saw it (apikeys.tov)
+  private keyUsed: Map<string, string> = new Map()
   // model parameters (GET /api/models/parameters), loaded when first asked and then daily
   private params: Map<string, string> = new Map()
   private paramsAt: f64 = -1.0
@@ -552,6 +898,9 @@ export class Ops {
   pushedWindow: Map<string, string> = new Map()
   exportCfg: LogExportsConfig | undefined = undefined
   exportTimer: int = -1
+  // the retained-content uploads (retained.tov), and whether one pass is running
+  retainTimer: int = -1
+  retainSending = false
   exportKey = ""
   cursor = new ExportCursor(Date.now())
   exporting = false
@@ -568,6 +917,13 @@ export class Ops {
   sessions = new UiSessions(28800)
   // the /ws clients, and the virtual key that opened each live session (/v1/live/sessions)
   ui: UiHub
+  // the live feed's relay (feed.tov): one queue per peer (and one for the broker), the broker cursor, the relay
+  // timer, the queue bound, and the last relay error reported
+  feedQueues: Map<string, FeedQueue> = new Map()
+  feedTimer: int = -1
+  brokerAfter: int = 0
+  feedMax: int = FEED_QUEUE_MAX
+  feedErr = ""
   liveSessions = new LiveRegistry()
   // single-use tickets for /ws?ticket= (POST /api/session/ws-ticket)
   wsTickets = new WsTickets()
@@ -575,7 +931,14 @@ export class Ops {
   recalc: CostRecalc | undefined = undefined
 
   constructor(readonly engine: Engine, readonly store: ConfigStore) {
-    this.ui = new UiHub(() => this.engine.logStore)
+    this.ui = new UiHub()
+    // every request-log entry this process writes becomes a feed event (feed.tov)
+    const hook = (e: LogEntry): void => {
+      this.feedPublish(e)
+    }
+    this.engine.logFeed = hook
+    const ls = this.engine.logStore
+    if (ls !== undefined) ls.onAdd = hook
     try {
       this.nodeId = secureHex(6)
     } catch (e) {
@@ -595,6 +958,18 @@ export class Ops {
     // deliveries survive restarts in the logs_store folder, when that store is on
     const lsw = cfg.logs_store
     if (lsw !== undefined && lsw.enabled === true) deliveryLog().persistTo(join(lsw.dir ?? "logs", "webhook-deliveries.jsonl"))
+    // the A2A callbacks callers registered and the pushes waiting to reach them survive restarts the same way; their
+    // secrets are sealed with the config's key
+    const ps = pushStore()
+    ps.seal = (v: string): string => {
+      try {
+        return sealStored(this.store.cipher, v)
+      } catch (e) {
+        return v
+      }
+    }
+    ps.open = (v: string): string => openStored(this.store.cipher, v) ?? ""
+    if (ps.dir === "" && lsw !== undefined && lsw.enabled === true) ps.persistTo(join(lsw.dir ?? "logs", "a2a-push.jsonl"))
     const gov = cfg.governance
     const users: UserConfig[] = gov?.users ?? []
     const auth = gov?.auth_config
@@ -604,12 +979,17 @@ export class Ops {
     } catch (e) {
       console.error(`raiju: admin credentials: ${e.message}`)
     }
-    this.rbac = { users: users.concat(legacy), roles: gov?.roles ?? [] }
+    this.rbac = { users: users.concat(legacy), roles: gov?.roles ?? [], api_keys: gov?.api_keys ?? [] }
     // admin credentials also count as inference auth, as in Bifrost
     const rb = this.rbac
     this.engine.gov.altAuth = (h) => rb.users.length > 0 && authenticate(rb, h).kind === "user"
+    this.engine.gov.userOf = (h) => {
+      if (rb.users.length === 0) return undefined
+      const who = authenticate(rb, h)
+      return who.kind === "user" ? who.name : undefined
+    }
     // auth_config with only part of a credential still locks the API, as before
-    this.authOn = this.rbac.users.length > 0 || !checkAdmin(auth, new Map())
+    this.authOn = this.rbac.users.length > 0 || (gov?.api_keys ?? []).length > 0 || !checkAdmin(auth, new Map())
     const ac = cfg.audit
     if (this.audit === undefined && ac !== undefined && ac.enabled === true) {
       try {
@@ -627,8 +1007,10 @@ export class Ops {
     this.configurePushGateway(cfg.telemetry?.push_gateway)
     this.configureAlerts(cfg.alerts)
     this.configureCluster(cfg.cluster)
+    this.configureFeed(cfg.cluster)
     this.configureProxy(cfg.auth_proxy, cfg.oidc)
     this.configureExports(cfg.log_exports)
+    this.configureRetained()
     this.configureExporters(cfg.exporters ?? [])
     const oc = cfg.oidc
     const same = oc !== undefined && this.oidcCfg !== undefined && JSON.stringify(oc) === JSON.stringify(this.oidcCfg)
@@ -646,6 +1028,11 @@ export class Ops {
       clearInterval(this.clusterTimer)
       this.clusterTimer = -1
     }
+    if (this.feedTimer >= 0) {
+      clearInterval(this.feedTimer)
+      this.feedTimer = -1
+    }
+    this.ui.relayOn = false
     if (this.discoverTimer >= 0) {
       clearInterval(this.discoverTimer)
       this.discoverTimer = -1
@@ -667,9 +1054,15 @@ export class Ops {
     const id = cc.node_id ?? ""
     if (id !== "") this.nodeId = id
     if (this.counters === undefined) this.counters = new Counters(this.nodeId)
+    this.engine.health.holds.setNode(this.nodeId)
     this.clusterTimer = setInterval(() => {
       this.syncCluster()
     }, Math.max(100, syncInterval(cc)))
+    // the live feed goes to the other nodes unless cluster.feed.cluster_wide is off
+    this.ui.relayOn = cc.feed?.cluster_wide ?? true
+    this.feedTimer = setInterval(() => {
+      this.feedRelay()
+    }, Math.max(20, cc.feed?.batch_ms ?? FEED_BATCH_MS))
     // broker mode has no discovery: the broker is the rendezvous point
     if (cluster.isBroker(cc) && cc.broker === undefined) console.error(`raiju: cluster: type "broker" needs cluster.broker.address; no cluster traffic until it is set`)
     const dc = cc.discovery
@@ -782,6 +1175,7 @@ export class Ops {
     }
     // each worker is its own slot (inherited counters would collide)
     this.counters = new Counters(this.nodeId + "/" + process.pid)
+    this.engine.health.holds.setNode(this.nodeId + "/" + process.pid)
     this.pushed = new Map()
     this.pushedWindow = new Map()
     this.engine.sharedWindows = true
@@ -792,6 +1186,9 @@ export class Ops {
     if (sem !== undefined && this.engine.vstore === undefined) sem.share(this.shareDir + "/semantic")
     const ls = this.engine.logStore
     if (ls !== undefined) ls.shared = true
+    // A2A push configs and queued pushes: in the logs_store folder when there is one (already in use), else here
+    const ps = pushStore()
+    if (ps.dir === "") ps.useDir(this.shareDir + "/a2a-push")
     // live sessions (who opened each one) and the UI socket's store updates
     this.liveSessions.share(this.shareDir + "/live")
     this.ui.setShare(this.shareDir + "/ui")
@@ -852,12 +1249,16 @@ export class Ops {
       this.pushed.set(u.name, u.used)
       this.pushedWindow.set(u.name, u.window)
     }
+    // the key holds travel with the usage (holds.tov); they exist only under adaptive load balancing
+    c.setHolds(this.engine.health.holds.wire(now))
   }
 
   applyRemote(c: Counters): void {
     const now = Date.now()
     const gov = this.engine.gov
     for (const u of gov.sharedUsage(now)) gov.setRemote(u.name, u.window, Math.max(0.0, c.total(u.name, u.window) - u.used), now)
+    const hs = c.takeHolds()
+    if (this.engine.cfg.health?.adaptive === true) this.engine.health.holds.merge(hs, now)
   }
 
   syncCluster(): void {
@@ -935,6 +1336,140 @@ export class Ops {
     this.pushLocal(c)
     this.applyRemote(c)
     return json(200, c.encode())
+  }
+
+  // ---- the live feed (/ws) across the workers of a node and the cluster (feed.tov) ----
+
+  // The ring and outbox sizes from cluster.feed (defaults in feed.tov). The ring serves resumes on every node.
+  configureFeed(cc: ClusterConfig | undefined): void {
+    const f = cc?.feed
+    this.feedMax = f?.queue_max ?? FEED_QUEUE_MAX
+    this.ui.configureRing(f?.ring_size ?? FEED_RING_SIZE, (f?.ring_seconds ?? FEED_RING_SECONDS) * 1000.0, this.feedMax)
+  }
+
+  // The feed's producer: the node, or the node and this worker's pid when several workers share it.
+  feedProducer(): string {
+    return this.shareDir === "" ? this.nodeId : `${this.nodeId}/${process.pid}`
+  }
+
+  // A request-log entry this process wrote, as a feed event.
+  feedPublish(e: LogEntry): void {
+    const it: FeedItem = { node: this.feedProducer(), seq: this.ui.nextSeq(), ts: e.ts, team: e.team_id ?? "", bu: e.business_unit_id ?? "", customer: e.customer_id ?? "", project: e.project_id ?? "", data: JSON.stringify(logEventView(e)) }
+    this.ui.ingest(it, "local")
+  }
+
+  // The relay tick: this worker's new events go into each peer's queue (or the broker's), and one request goes out
+  // per queue with events and none in flight. In broker mode every tick also pulls the other nodes' events.
+  feedRelay(): void {
+    const cc = this.clusterCfg
+    if (cc === undefined || !this.ui.relayOn) return
+    const batch = this.ui.outbox.take(this.ui.outbox.size)
+    if (cluster.isBroker(cc)) {
+      const b = cc.broker
+      if (b !== undefined) this.feedBroker(brokerUrl(b) + BROKER_FEED_ROUTE, this.feedQueueFor("broker"), batch, cc.secret)
+      return
+    }
+    const peers = this.peerUrls(cc)
+    for (const k of this.feedQueues.keys()) {
+      if (k !== "broker" && !peers.includes(k)) this.feedQueues.delete(k)
+    }
+    for (const p of peers) {
+      const q = this.feedQueueFor(p)
+      for (const it of batch) this.feedDropped("queue", q.push(it))
+      this.feedPost(p + "/api/cluster/feed", q, cc.secret)
+    }
+  }
+
+  private feedQueueFor(key: string): FeedQueue {
+    const q = this.feedQueues.get(key)
+    if (q !== undefined) return q
+    const nq = new FeedQueue(this.feedMax)
+    this.feedQueues.set(key, nq)
+    return nq
+  }
+
+  // Events that did not get through, by reason: "queue" (the peer was too slow and the oldest went), "send" (a relay
+  // request failed) and "missed" (the broker's ring had moved past them).
+  private feedDropped(reason: string, n: int): void {
+    if (n > 0) metrics.inc("raiju_feed_dropped_total", `reason="${reason}"`, n)
+  }
+
+  // Sends up to FEED_BATCH_MAX queued events to one peer. One request is in flight per peer, and a failed one drops its events.
+  async feedPost(url: string, q: FeedQueue, secret: string): Promise<void> {
+    if (q.busy || q.size === 0) return
+    q.busy = true
+    const items = q.take(FEED_BATCH_MAX)
+    const body = JSON.stringify({ items: items })
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    h.set("x-raiju-cluster-sig", cluster.sign(secret, body))
+    const r = await postText(url, h, body)
+    q.busy = false
+    if (r.status === 200) {
+      this.feedErr = ""
+      metrics.inc("raiju_feed_relayed_total", "", items.length)
+      return
+    }
+    this.feedDropped("send", items.length)
+    const why = r.status === 0 ? r.body : `HTTP ${r.status}`
+    if (why !== this.feedErr) console.error(`raiju: cluster feed: ${url}: ${why}`)
+    this.feedErr = why
+  }
+
+  // Broker mode: one request per tick. It carries this worker's queued events and its cursor, and the answer has the
+  // other nodes' events after the cursor. A broker that restarted has lower positions than the cursor: the cursor goes back to 0.
+  async feedBroker(url: string, q: FeedQueue, batch: FeedItem[], secret: string): Promise<void> {
+    for (const it of batch) this.feedDropped("queue", q.push(it))
+    if (q.busy) return
+    q.busy = true
+    const items = q.take(FEED_BATCH_MAX)
+    const body = JSON.stringify({ node: cluster.nodeOf(this.nodeId), after: this.brokerAfter, items: items })
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    h.set("x-raiju-cluster-sig", cluster.sign(secret, body))
+    const r = await postText(url, h, body)
+    q.busy = false
+    if (r.status !== 200) {
+      this.feedDropped("send", items.length)
+      const why = r.status === 0 ? r.body : `HTTP ${r.status}`
+      if (why !== this.feedErr) console.error(`raiju: cluster feed: broker: ${why}`)
+      this.feedErr = why
+      return
+    }
+    if (this.feedErr !== "") console.error("raiju: cluster feed: broker connected again")
+    this.feedErr = ""
+    try {
+      const ans = parseAnswer(r.body)
+      if (ans.last < this.brokerAfter) {
+        this.brokerAfter = 0
+        return
+      }
+      this.brokerAfter = ans.next
+      this.feedDropped("missed", ans.missed)
+      metrics.inc("raiju_feed_relayed_total", "", items.length)
+      for (const it of ans.items) this.ui.ingest(it, "peer")
+    } catch (e) {
+      console.error(`raiju: cluster feed: bad answer from the broker: ${e.message}`)
+    }
+  }
+
+  // POST /api/cluster/feed from a peer: its events join this worker's ring, and go on to the sibling workers.
+  async clusterFeed(req: Request): Promise<Response> {
+    const cc = this.clusterCfg
+    if (cc === undefined || !this.ui.relayOn) return json(404, errorJson("the cluster feed is off", "invalid_request_error", undefined))
+    const body = await req.text()
+    if (!cluster.verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    let items: FeedItem[] = []
+    try {
+      items = parseFeed(body)
+    } catch (e) {
+      return json(400, errorJson(e.message, "invalid_request_error", undefined))
+    }
+    let n = 0
+    for (const it of items) {
+      if (this.ui.ingest(it, "peer")) n += 1
+    }
+    return json(200, JSON.stringify({ accepted: n }))
   }
 
   // ---- OpenTelemetry metrics (Bifrost's otel metrics_* settings) ----
@@ -1289,7 +1824,7 @@ export class Ops {
     }
     if (path === "/api/session/is-auth-enabled") {
       if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
-      const valid = bearer !== "" && this.sessions.get(bearer, now) !== undefined
+      const valid = bearer !== "" && this.liveSession(bearer) !== undefined
       const enforced = this.store.cfg.client?.enforce_auth_on_inference ?? false
       return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: !this.authOn, setup_token_configured: resolveEnv(this.store.cfg.setup_token ?? "") !== "" }))
     }
@@ -1378,28 +1913,97 @@ export class Ops {
     return { status: 200, body: `{"circuits":{${parts.join(",")}}}`, contentType: "application/json" }
   }
 
-  // GET /api/adaptive-routing/held-keys: the keys (provider#key targets) held out of rotation by an open
-  // circuit, with when each was held and when it next gets a check. Raiju holds a key for its breaker's
-  // cooldown; it does not classify the provider's refusal, so there is no reason or wait ladder.
+  // GET /api/adaptive-routing/held-keys: the keys and models held out of rotation by a provider's refusal
+  // (holds.tov): the failure class, the provider's own reason, when each was held, when it is next checked,
+  // its state (held, checking or due) and its rung on the wait ladder.
   adaptiveHeldKeys(): Reply {
     const rows: string[] = []
-    for (const c of this.engine.health.openCircuits(Date.now())) {
-      if (c.id.indexOf("#") < 0) continue
-      rows.push(JSON.stringify({ target: c.id, state: c.state, held_since: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    for (const r of this.engine.health.holds.list(Date.now())) {
+      const h = r.h
+      rows.push(JSON.stringify({ target: h.target, provider: h.provider, key_id: h.keyId, model: h.model, state: r.state, failure_class: h.cls, reason: h.reason, held_since: rfc3339Of(h.heldAt), next_check_at: rfc3339Of(h.nextCheck), wait_seconds: Math.round(h.waitMs / 1000), rung: h.rung }))
     }
     return { status: 200, body: `{"held_keys":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
   }
 
-  // GET /api/adaptive-routing/incidents: the circuits open now (keys, policies, and a policy's key
-  // sub-circuits), each with when it opened. Resolved incidents are not kept.
+  // GET /api/adaptive-routing/incidents: the incidents still open (a hold, or a circuit a run of failures
+  // opened) and the policy circuits open now. Resolved incidents are in the history route.
   adaptiveIncidents(): Reply {
+    const now = Date.now()
     const rows: string[] = []
-    for (const c of this.engine.health.openCircuits(Date.now())) {
-      const kind = c.id.indexOf("#") >= 0 ? "key" : c.id.indexOf("/") >= 0 ? "policy_key" : "policy"
-      const status = c.state === "half_open" ? "Recovering" : "Needs attention"
-      rows.push(JSON.stringify({ target: c.id, kind: kind, status: status, opened_at: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
+    for (const inc of this.engine.health.holds.incidentList()) {
+      if (inc.resolvedAt > 0) continue
+      rows.push(JSON.stringify(incidentRow(inc, now)))
+    }
+    for (const c of this.engine.health.openCircuits(now)) {
+      if (c.id.indexOf("#") >= 0) continue
+      const status = c.state === "half_open" ? "recovering" : "attention"
+      rows.push(JSON.stringify({ target: c.id, kind: "policy", status: status, opened_at: rfc3339Of(c.openedAt), next_check_at: rfc3339Of(c.nextCheck) }))
     }
     return { status: 200, body: `{"incidents":[${rows.join(",")}],"total":${rows.length}}`, contentType: "application/json" }
+  }
+
+  // GET /api/adaptive-routing/history/issues: the incidents that were open at some point in a window (from,
+  // to: RFC 3339, or unix seconds; the window defaults to all of history until now). statuses (attention,
+  // recovering, resolved) filters them; sort is priority (attention first, then newest), newest, oldest,
+  // longest or shortest. limit (default 25, at most 100) and offset page the result; with neither, every
+  // match is returned. matched_summary covers every match, not the page.
+  adaptiveHistory(req: Request): Reply {
+    const u = URL.parse(req.url)
+    const params = u === undefined ? new URLSearchParams("") : u.searchParams
+    const now = Date.now()
+    const from = historyBound(params.get("from"), 0.0)
+    const to = historyBound(params.get("to"), now)
+    if (from === undefined || to === undefined) return badRequest("from and to must be RFC 3339 times or unix seconds")
+    const sort = params.get("sort") ?? "priority"
+    if (!["priority", "newest", "oldest", "longest", "shortest"].includes(sort)) return badRequest("sort must be priority, newest, oldest, longest or shortest")
+    const statuses = (params.get("statuses") ?? "").split(",").filter((s: string) => s !== "")
+    for (const s of statuses) {
+      if (!["attention", "recovering", "resolved"].includes(s)) return badRequest("statuses takes attention, recovering or resolved")
+    }
+    const limitRaw = params.get("limit")
+    const offsetRaw = params.get("offset")
+    const paged = limitRaw !== undefined || offsetRaw !== undefined
+    const limit = limitRaw === undefined ? 25 : Math.min(100, Math.max(1, parseInt(limitRaw) ?? 25))
+    const offset = offsetRaw === undefined ? 0 : parseInt(offsetRaw) ?? 0
+    if (offset < 0) return badRequest("offset must not be negative")
+    const matched: { inc: Incident, status: string, dur: f64 }[] = []
+    for (const inc of this.engine.health.holds.incidentList()) {
+      const end = inc.resolvedAt > 0 ? inc.resolvedAt : now
+      if (end < from || inc.openedAt > to) continue
+      const st = incidentStatus(inc)
+      if (statuses.length > 0 && !statuses.includes(st)) continue
+      matched.push({ inc: inc, status: st, dur: end - inc.openedAt })
+    }
+    matched.sort((a, b) => {
+      if (sort === "newest") return b.inc.openedAt - a.inc.openedAt
+      if (sort === "oldest") return a.inc.openedAt - b.inc.openedAt
+      if (sort === "longest") return b.dur - a.dur
+      if (sort === "shortest") return a.dur - b.dur
+      const pa = a.status === "resolved" ? 1 : 0
+      const pb = b.status === "resolved" ? 1 : 0
+      if (pa !== pb) return pa - pb
+      return b.inc.openedAt - a.inc.openedAt
+    })
+    // the summary: counts by status, the median time to resolve, and the longest open incident
+    const resolved: number[] = []
+    let attention = 0
+    let recovering = 0
+    let longestOngoing = 0
+    for (const m of matched) {
+      if (m.status === "resolved") resolved.push(m.dur)
+      else {
+        if (m.status === "attention") attention += 1
+        else recovering += 1
+        longestOngoing = Math.max(longestOngoing, m.dur)
+      }
+    }
+    resolved.sort((a, b) => a - b)
+    const median = resolved.length === 0 ? "null" : "" + Math.round(resolved[Math.floor(resolved.length / 2)]! / 1000)
+    const page = paged ? matched.slice(offset, offset + limit) : matched
+    const issues: string[] = []
+    for (const m of page) issues.push(JSON.stringify(incidentRow(m.inc, now)))
+    const summary = `{"attention":${attention},"recovering":${recovering},"resolved":${resolved.length},"median_resolve_seconds":${median},"longest_ongoing_seconds":${Math.round(longestOngoing / 1000)}}`
+    return okJson(`{"issues":[${issues.join(",")}],"total":${matched.length},"offset":${offset},"matched_summary":${summary}}`)
   }
 
   // POST /api/adaptive-routing/conditions/clear: releases the held keys named by {"keys": [...]} (target
@@ -1418,13 +2022,29 @@ export class Ops {
         return badRequest("the body must be a JSON object")
       }
     }
-    if (all) return okJson(JSON.stringify({ message: "held keys released", count: h.resetAll() }))
-    // only circuits that are open now count as released
+    const now = Date.now()
+    if (all) {
+      // every hold, and every circuit that is open now
+      let n = h.holds.clearAll(now)
+      for (const c of h.openCircuits(now)) {
+        if (h.reset(c.id)) {
+          h.holds.noteClose(c.id, now)
+          n += 1
+        }
+      }
+      return okJson(JSON.stringify({ message: "held keys released", count: n }))
+    }
+    // a target is a key ("provider#key") or one of its models ("provider#key@model"), and counts once
     const open: string[] = []
-    for (const c of h.openCircuits(Date.now())) open.push(c.id)
+    for (const c of h.openCircuits(now)) open.push(c.id)
     let n = 0
     for (const id of ids) {
-      if (open.includes(id) && h.reset(id)) n += 1
+      let hit = h.holds.clear(id, now)
+      if (open.includes(id) && h.reset(id)) {
+        h.holds.noteClose(id, now)
+        hit = true
+      }
+      if (hit) n += 1
     }
     return okJson(JSON.stringify({ message: "held keys released", count: n }))
   }
@@ -1504,15 +2124,15 @@ export class Ops {
     if (path === "/api/logs/histogram/throughput") return okJson(throughputView(es, g))
     if (path === "/api/logs/histogram/throughput/by-provider") return okJson(providerView(es, g, "throughput"))
     if (path === "/api/logs/histogram/cost/by-dimension" || path === "/api/logs/histogram/tokens/by-dimension" || path === "/api/logs/histogram/latency/by-dimension") {
-      const bad = this.dimensionError(dim)
+      const bad = this.dimensionError(dim, true)
       if (bad !== "") return badRequest(bad)
       const what = path.includes("/cost/") ? "cost" : path.includes("/tokens/") ? "tokens" : "latency"
-      return okJson(dimensionView(es, g, what, dim))
+      return okJson(dimensionView(es, g, what, histogramDimName(dim), dim))
     }
     if (path === "/api/logs/rankings") return okJson(modelRankingsView(es, prev, ranked))
     if (path === "/api/logs/rankings/users") return okJson(dimensionRankingsView(es, prev, "user", ranked))
     if (path === "/api/logs/rankings/by-dimension") {
-      const bad = this.dimensionError(dim)
+      const bad = this.dimensionError(dim, false)
       if (bad !== "") return badRequest(bad)
       return okJson(dimensionRankingsView(es, prev, dim, ranked))
     }
@@ -1527,7 +2147,8 @@ export class Ops {
     if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
     const pg = pageOfQuery(sp, 50, 1000)
     if (pg.error !== "") return badRequest(pg.error)
-    const f = listFilter(sp, Date.now())
+    let f = listFilter(sp, Date.now())
+    this.withAgents(sp, &f, store, sc)
     const es = applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)
     return okJson(listJson(es, pg.page, scopedView(store, sc, 0.0).length > 0))
   }
@@ -1536,7 +2157,8 @@ export class Ops {
   private logStats(sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
     const bad = unsupportedFilter(sp)
     if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
-    const f = listFilter(sp, Date.now())
+    let f = listFilter(sp, Date.now())
+    this.withAgents(sp, &f, store, sc)
     return okJson(statsView(applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)))
   }
 
@@ -1600,7 +2222,7 @@ export class Ops {
     const f = listFilter(recalcQuery(rb.filters), Date.now())
     const pricing = this.engine.pricing
     const job = new CostRecalc(
-      (e) => pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens),
+      (e) => (e.op === "decisions" ? pricing.decisionCost(e.provider, e.model, e.prompt_tokens, e.completion_tokens) : pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens)),
       (costs) => store.recost((e) => costs.get(e.id))
     )
     job.begin(selectAll(scopedView(store, sc, f.since - 1.0), f), Date.now())
@@ -1702,7 +2324,7 @@ export class Ops {
   }
 
   // POST /api/plugins: {name, enabled, config}. 201 with the plugin; 409 when the name is taken; 400 when the name
-  // is missing, the config does not build, or a custom plugin path is given (this gateway has none).
+  // is missing, or the config does not build (a custom plugin path must be a .wasm file that loads).
   private createPlugin(body: string): Reply {
     let fs: Field[] = []
     try {
@@ -1712,12 +2334,11 @@ export class Ops {
     }
     const name = (rawStr(fs, "name") ?? "").trim()
     if (name === "") return pluginError(400, "Plugin name is required")
-    if ((rawStr(fs, "path") ?? "") !== "") return pluginError(400, "custom plugin paths are not supported by this gateway")
     const specs = this.store.cfg.plugins ?? []
     for (const sp of specs) {
       if (sp.name === name) return pluginError(409, "Plugin already exists")
     }
-    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}") }
+    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}"), path: pathOf(fs, undefined), wasm_limits: limitsOf(fs, undefined) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = specs.slice()
@@ -1741,7 +2362,7 @@ export class Ops {
     if (at < 0) return pluginError(404, "plugin not found")
     const cur = specs[at]!
     const en = rawBool(fs, "enabled")
-    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}") }
+    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}"), placement: cur.placement, order: cur.order, path: pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = []
@@ -1786,10 +2407,17 @@ export class Ops {
     return v >= 1 ? v : -1
   }
 
-  // "" when dim is a dimension the log store records, else the message for a 400.
-  private dimensionError(dim: string): string {
-    if (dim === "") return "Missing required query parameter: dimension. Valid values: provider, model, virtual_key"
-    if (!validDimension(dim)) return `Invalid dimension: ${dim}. Valid values: provider, model, virtual_key`
+  // "" when dim is a dimension the log store records for the route, else Bifrost's message for a 400. The
+  // histograms take Bifrost's names (team_id, ...) and the rankings its names (team, ...); Raiju's own
+  // dimensions (provider, model, virtual_key, tool, server) are accepted on both without being listed.
+  private dimensionError(dim: string, histogram: bool): string {
+    if (histogram) {
+      if (dim === "") return "Missing required query parameter: dimension. Valid values: provider, team_id, customer_id, user_id, business_unit_id, project_id, app, user_agent"
+      if (!validDimension(histogramDimName(dim))) return `Invalid dimension: ${dim}. Valid values: provider, team_id, customer_id, user_id, business_unit_id, project_id, app, user_agent`
+      return ""
+    }
+    if (dim === "") return "Missing required query parameter: dimension. Valid values: team, customer, business_unit, project, user, virtual_key, app, user_agent"
+    if (!validDimension(dim)) return `Invalid dimension: ${dim}. Valid values: team, customer, business_unit, project, user, virtual_key, app, user_agent`
     return ""
   }
 
@@ -1939,6 +2567,465 @@ export class Ops {
   }
 
 
+  // agent_names: the filter selects the requests in the sessions (A2A context ids) of the calls to those
+  // agents within the window (Bifrost's agent context filter). Other filters pass through.
+  withAgents(sp: URLSearchParams, inout f: Filter, store: LogStore, sc: DataScope): void {
+    const names = listNames(sp.get("agent_names") ?? "")
+    if (names.length === 0) return
+    f.agentSessions = agentSessionsOf(scopedView(store, sc, f.since - 1.0), names, f.since, f.until)
+  }
+
+  // One A2A call that reached an agent, as a log entry of kind "a2a" under the agent's name.
+  recordA2a(c: A2aCall): void {
+    const store = this.engine.logStore
+    if (store === undefined) return
+    const now = Date.now()
+    store.add({
+      id: "a2a-" + now + "-" + Math.floor(Math.random() * 1000000000),
+      ts: now,
+      request_id: "",
+      op: c.method,
+      provider: "",
+      model: "",
+      status: c.status,
+      latency_ms: c.latencyMs,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      cost: 0.0,
+      cache_hit: false,
+      virtual_key: c.vk,
+      session_id: c.context === "" ? undefined : c.context,
+      error: c.error === "" ? undefined : c.error,
+      kind: "a2a",
+      agent_name: c.agent,
+    })
+  }
+
+  // GET /api/agents/history: the A2A calls the caller's scope sees, newest first (agent_names, limit, offset).
+  agentHistoryRoute(sp: URLSearchParams, sc: DataScope): Reply {
+    const names = listNames(sp.get("agent_names") ?? "")
+    const pg = pageOfQuery(sp, 50, 1000)
+    if (pg.error !== "") return badRequest(pg.error)
+    const store = this.engine.logStore
+    if (store === undefined) return okJson(`{"history":[],"total":0}`)
+    const hits: string[] = []
+    const es = scopedView(store, sc, 0.0)
+    for (let i = es.length - 1; i >= 0; i--) {
+      const e = es[i]!
+      if (kindOf(e) !== "a2a") continue
+      if (names.length > 0 && !names.includes(e.agent_name ?? "")) continue
+      hits.push(a2aLogJson(e))
+    }
+    const rows = hits.slice(pg.page.offset, pg.page.offset + pg.page.limit)
+    return okJson(`{"history":[${rows.join(",")}],"total":${hits.length}}`)
+  }
+
+  // ---- the A2A gateway ----
+
+  // Whether push callbacks may go to private addresses (server.a2a_allow_private_push_callbacks).
+  pushPrivate(): bool {
+    return this.engine.cfg.server?.a2a_allow_private_push_callbacks === true
+  }
+
+  // The checks every call under /agents/a2a/{name} passes: the agent is registered and enabled, the caller's
+  // virtual key (required when auth is enforced), the agent's grants, and the key's budgets. count also takes
+  // the key's request and token limits (a call does; discovery does not). refusal is the answer when one fails.
+  a2aGate(agent: AgentConfig | undefined, name: string, h: Hdrs, rest: bool, count: bool): { refusal: Response | undefined, vk: VirtualKeyConfig | undefined } {
+    if (agent === undefined || agent.enabled === false) return { refusal: a2aDeny(rest, 404, `no agent named ${name}`, "not_found_error"), vk: undefined }
+    const vk = this.engine.gov.findKey(h)
+    if (this.engine.gov.enforce && vk === undefined) return { refusal: a2aDeny(rest, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error"), vk: vk }
+    if (!grantAllows(agent, vk?.id)) return { refusal: a2aDeny(rest, 403, `this key may not call the agent ${name}`, "permission_error"), vk: vk }
+    const gate = this.engine.gov.admitTool(h)
+    if (gate.kind === "denial") return { refusal: a2aDeny(rest, gate.status, gate.message, gate.type), vk: vk }
+    if (count) {
+      // the key's request and token limits count each call (admitTool checks the budgets only)
+      const rls: string[] = []
+      if (vk !== undefined && vk.rate_limit_id !== undefined) rls.push(vk.rate_limit_id)
+      const limited = this.engine.gov.checkLimits(vk, [], rls)
+      if (limited.kind === "denial") return { refusal: a2aDeny(rest, limited.status, limited.message, limited.type), vk: vk }
+    }
+    return { refusal: undefined, vk: vk }
+  }
+
+  // The routes under /agents/a2a/{name}: the agent's card (GET .../.well-known/agent-card.json), its JSON-RPC
+  // endpoint (POST .../json-rpc), its REST endpoint (.../rest/...) and the push ingress (POST .../push/callback).
+  // rest is the path after the name; base is the public base URL. A call passes a2aGate, then goes to the
+  // agent's endpoint (a2aCall). The ingress takes no virtual key: the agent proves itself with the token the
+  // gateway gave it.
+  async a2aRoute(req: Request, name: string, rest: string, base: string): Promise<Response> {
+    if (rest === INGRESS_SUFFIX) return await this.a2aIngress(req, name)
+    const isCard = rest === CARD_PATH
+    const isRpc = rest === JSON_RPC_SUFFIX
+    const isRest = rest === REST_PREFIX || rest.startsWith(REST_PREFIX + "/")
+    if (!isCard && !isRpc && !isRest) return json(404, errorJson("no such agent route", "invalid_request_error", undefined))
+    if (isCard && req.method !== "GET") return json(405, errorJson("use GET for the agent card", "invalid_request_error", undefined))
+    if (isRpc && req.method !== "POST") return json(405, errorJson("use POST for JSON-RPC", "invalid_request_error", undefined))
+    const agent = findAgent(this.engine.cfg.agents, name)
+    const h = snapshot(req.headers)
+    const gate = this.a2aGate(agent, name, h, isRest, true)
+    const refusal = gate.refusal
+    if (refusal !== undefined) return refusal
+    if (agent === undefined) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
+    if (isCard) {
+      const card = agent.card ?? ""
+      if (card === "") return json(503, errorJson(`the card of ${name} has not been fetched: refresh it through /api/agents/${name}/refresh-card`, "api_error", undefined))
+      return a2aCardResponse(gatewayCard(card, base, name, true), h)
+    }
+    const body = await req.text()
+    if (isRpc) {
+      const routed = rpcCall(body)
+      const id = rpcIdOf(body)
+      if (routed.kind === "fail") return json(routed.status, rpcErrorBody(id, routed.code, routed.message))
+      return await this.a2aCall(agent, routed.call, "rpc", id, h, gate.vk, base)
+    }
+    const qi = req.url.indexOf("?")
+    const query = qi < 0 ? "" : req.url.slice(qi + 1, req.url.byteLength)
+    const routed = restCall(req.method, rest.slice(REST_PREFIX.byteLength, rest.byteLength), query, body)
+    if (routed.kind === "fail") return a2aDeny(true, routed.status, routed.message, "invalid_request_error")
+    return await this.a2aCall(agent, routed.call, "rest", "\"1\"", h, gate.vk, base)
+  }
+
+  // GET /agents/a2a (and .../.well-known/agent-card.json): one card for the gateway, listing the agents the
+  // caller may call. Raiju's own; Bifrost has the per-agent cards only.
+  async a2aAggregate(req: Request, base: string): Promise<Response> {
+    if (req.method !== "GET") return json(405, errorJson("use GET for the agent card", "invalid_request_error", undefined))
+    const h = snapshot(req.headers)
+    const vk = this.engine.gov.findKey(h)
+    if (this.engine.gov.enforce && vk === undefined) return a2aDeny(false, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error")
+    const gate = this.engine.gov.admitTool(h)
+    if (gate.kind === "denial") return a2aDeny(false, gate.status, gate.message, gate.type)
+    const vkId = vk?.id
+    const list = (this.engine.cfg.agents ?? []).filter((a) => a.enabled !== false && (a.card ?? "") !== "" && grantAllows(a, vkId))
+    return a2aCardResponse(aggregateCard(list, base, true), h)
+  }
+
+  // An answer the gateway makes up itself, in the caller's binding.
+  a2aFail(rest: bool, rpcId: string, status: int, code: int, message: string): Response {
+    if (rest) return json(status, restErrorOfStatus(status, message))
+    // a JSON-RPC error rides in a 200; only an agent that did not answer is a gateway error
+    return json(status === 502 ? 502 : 200, rpcErrorBody(rpcId, code, message))
+  }
+
+  // The result of a call in the caller's binding: the result object itself on REST, a JSON-RPC response on JSON-RPC.
+  a2aResult(rest: bool, rpcId: string, result: string): Response {
+    if (rest) return json(200, result)
+    return json(200, `{"jsonrpc":"2.0","id":${rpcId},"result":${result}}`)
+  }
+
+  // Headers for a call to the agent: the caller's own headers (without the gateway credential it logged in
+  // with, cookies and connection headers), then the agent's runtime credentials, which win. With
+  // forward_accepted_credential the caller's gateway credential goes too, on the header it came in on, unless
+  // the agent's own headers set that one (forward_accepted_credential_overrides_auth lets it replace them).
+  async a2aHeaders(agent: AgentConfig, h: Hdrs, accepted: { header: string, value: string } | undefined, hasBody: bool, stream: bool): Promise<{ headers: Map<string, string>, error: string }> {
+    const consumed = accepted === undefined ? "" : accepted.header
+    const out: Map<string, string> = new Map()
+    const conn = (h.get("connection") ?? "").split(",").map((x) => x.trim().toLowerCase())
+    for (const k of h.keys()) {
+      if (A2A_NOT_FORWARDED.includes(k) || k === consumed || conn.includes(k)) continue
+      out.set(k, h.get(k) ?? "")
+    }
+    const managed = await upstreamHeaders(agent.name + "|runtime", agent.runtime_auth, agent.allow_private_network === true)
+    if (managed.error !== "") return { headers: out, error: `the agent's credentials could not be obtained: ${managed.error}` }
+    let mine = managed.headers
+    if (agent.forward_accepted_credential === true && accepted !== undefined) withAcceptedCredential(&mine, accepted.header, accepted.value, agent.forward_accepted_credential_overrides_auth === true)
+    for (const k of mine.keys()) out.set(k, mine.get(k) ?? "")
+    if (hasBody) out.set("content-type", "application/json")
+    out.set("accept", stream ? "text/event-stream" : "application/json")
+    return { headers: out, error: "" }
+  }
+
+  // Sends one call to the agent, in the binding its card offers that the caller's binding prefers: a REST
+  // caller goes to the card's REST endpoint, else its JSON-RPC one, and the other way round. params is the call's
+  // params after any push rewriting.
+  async a2aSend(agent: AgentConfig, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined): Promise<Fwd> {
+    const card = agent.card ?? ""
+    const rpcUrl = endpointOf(card)
+    const restUrl = restEndpointOf(card)
+    if (rpcUrl === "" && restUrl === "") return fwdFail(`the card of ${agent.name} names no endpoint`)
+    const useRest = binding === "rest" ? restUrl !== "" : rpcUrl === "" && restUrl !== ""
+    let url = rpcUrl
+    let method = "POST"
+    let body = ""
+    if (useRest) {
+      const rr = restRequestOf({ op: call.op, v03: call.v03, params: params, stream: call.stream, taskId: call.taskId, configId: call.configId })
+      let base = restUrl
+      while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+      url = base + rr.path + (rr.query === "" ? "" : "?" + rr.query)
+      method = rr.method
+      body = rr.body
+    } else {
+      // a JSON-RPC caller's method names are kept; a REST caller's go out in the names the card's version uses
+      const old = binding === "rpc" ? call.v03 : !interfacesOf(card).v1
+      body = `{"jsonrpc":"2.0","id":${rpcId},"method":${JSON.stringify(methodOf(call.op, old))},"params":${params}}`
+    }
+    const hd = await this.a2aHeaders(agent, h, accepted, body !== "", call.stream)
+    if (hd.error !== "") return fwdFail(hd.error)
+    const hs: Record<string, string> = hd.headers
+    const dl = deadline(call.stream ? 300000 : 60000)
+    try {
+      const res = body === "" ? await fetch(url, { method: method, headers: hs, signal: dl.controller.signal, tls: tlsOf(agent.runtime_auth) }) : await fetch(url, { method: method, headers: hs, body: body, signal: dl.controller.signal, tls: tlsOf(agent.runtime_auth) })
+      const ct = res.headers.get("content-type") ?? ""
+      if (call.stream && ct.includes("text/event-stream") && res.body !== undefined) {
+        // the stream is passed on as it arrives: the deadline no longer applies to it
+        dl.finish()
+        return { status: res.status, text: "", ct: ct, stream: res.body, rpc: !useRest, error: "" }
+      }
+      const text = await res.text()
+      dl.finish()
+      // an endpoint that is gone or does not speak the protocol: the card may have changed
+      if (res.status === 405 || res.status === 410 || res.status === 426 || (res.status === 404 && !ct.includes("json"))) this.refreshSoon(agent.name)
+      return { status: res.status, text: text, ct: ct, stream: undefined, rpc: !useRest, error: "" }
+    } catch (e) {
+      dl.finish()
+      return fwdFail(`the agent did not answer: ${e.message}`)
+    }
+  }
+
+  // One call, whatever binding it came in on: push configs are kept by the gateway (get and list are answered
+  // from its store; create and delete go to the agent first), the rest is sent on and its answer brought back
+  // to the caller's binding. Every call that reached the agent is logged.
+  async a2aCall(agent: AgentConfig, call: Call, binding: string, rpcId: string, h: Hdrs, vk: VirtualKeyConfig | undefined, base: string): Promise<Response> {
+    const name = agent.name
+    const rest = binding === "rest"
+    const started = Date.now()
+    const label = methodOf(call.op, call.v03)
+    const vkId = vk?.id
+    const store = pushStore()
+    const accepted = vk === undefined ? undefined : this.engine.gov.credentialHeader(h)
+    let params = call.params
+    let context = contextOfParams(params)
+    // push configs the gateway answers itself
+    if (call.op === "GetTaskPushNotificationConfig" || call.op === "ListTaskPushNotificationConfigs") {
+      if (call.taskId === "") return this.a2aFail(rest, rpcId, 400, -32602, "invalid params: a task id is required")
+      if (call.op === "GetTaskPushNotificationConfig") {
+        const c = store.config(name, call.taskId, call.configId)
+        if (c === undefined) return this.a2aFail(rest, rpcId, 404, -32001, "push notification config not found")
+        this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "" })
+        return this.a2aResult(rest, rpcId, pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
+      }
+      const views: string[] = []
+      for (const c of store.forTask(name, call.taskId)) views.push(pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
+      this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "" })
+      return this.a2aResult(rest, rpcId, pushListJson(views, call.v03))
+    }
+    // a create or an embedded config: the agent gets the gateway's ingress and a token of its own for it
+    const ingress = base + "/agents/a2a/" + name + INGRESS_SUFFIX
+    let created: PushSpec | undefined = undefined
+    let createdHash = ""
+    let pendingTask = ""
+    let pendingHash = ""
+    try {
+      if (call.op === "CreateTaskPushNotificationConfig") {
+        const spec = pushSpecOf(call)
+        if (spec.error !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${spec.error}`)
+        const bad = callbackProblem(spec.url, this.pushPrivate())
+        if (bad !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${bad}`)
+        const m = mintToken()
+        params = pushUpstreamParams(call, ingress, m.token)
+        created = spec
+        createdHash = m.hash
+      } else if (call.op === "SendMessage" || call.op === "SendStreamingMessage") {
+        const emb = embeddedPush(params)
+        if (emb !== undefined) {
+          if (emb.spec.error !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${emb.spec.error}`)
+          const bad = callbackProblem(emb.spec.url, this.pushPrivate())
+          if (bad !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${bad}`)
+          const m = mintToken()
+          const cid = emb.spec.configId !== "" ? emb.spec.configId : secureHex(8)
+          pendingTask = PENDING_PREFIX + secureHex(8)
+          pendingHash = m.hash
+          const now = Math.floor(Date.now())
+          store.saveConfig({ agent: name, task: pendingTask, id: cid, url: emb.spec.url, token: emb.spec.token, scheme: emb.spec.scheme, credentials: emb.spec.credentials, ingress: m.hash, created_at: now, updated_at: now })
+          params = rewriteEmbedded(params, emb.key, cid, ingress, m.token)
+        }
+      }
+    } catch (e) {
+      return this.a2aFail(rest, rpcId, 500, -32603, `could not set up the push configuration: ${e.message}`)
+    }
+    const fwd = await this.a2aSend(agent, call, params, binding, rpcId, h, accepted)
+    if (fwd.error !== "") {
+      if (pendingTask !== "") store.removePending(name, pendingHash, pendingTask)
+      this.recordA2a({ agent: name, method: label, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error })
+      return this.a2aFail(rest, rpcId, 502, -32603, fwd.error)
+    }
+    const up = fwd.stream
+    if (call.stream && up !== undefined) {
+      this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.status >= 400 ? `agent answered HTTP ${fwd.status}` : "" })
+      const sh: Record<string, string> = new Map()
+      sh.set("content-type", "text/event-stream")
+      sh.set("cache-control", "no-cache")
+      // the same binding on both sides passes the events as they are; the other maps each event's payload
+      const out = !rest && !fwd.rpc ? relayMapped(up, (d: string): string => rpcEvent(rpcId, d)) : (rest && fwd.rpc ? relayMapped(up, restEvent) : relay(up))
+      return new Response(out, { status: fwd.status, headers: sh })
+    }
+    const u = unaryOf(fwd)
+    if (context === "" && !u.failed) context = contextOfResult(u.result)
+    const err = u.failed ? `agent answered ${fwd.status >= 400 ? "HTTP " + fwd.status : "a JSON-RPC error"}` : ""
+    this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err })
+    // an embedded config is bound to the task the send made, or dropped when it made none
+    if (pendingTask !== "") {
+      const tid = u.failed ? "" : taskIdOfResult(u.result)
+      if (tid === "") store.removePending(name, pendingHash, pendingTask)
+      else store.bind(name, pendingHash, pendingTask, tid)
+    }
+    if (!u.failed && created !== undefined) {
+      const spec = created
+      let cid = pushIdOfResult(u.result, call.v03)
+      if (cid === "") cid = spec.configId
+      if (cid === "") {
+        try {
+          cid = secureHex(8)
+        } catch (e) {
+          cid = "config"
+        }
+      }
+      const now = Math.floor(Date.now())
+      store.saveConfig({ agent: name, task: spec.taskId, id: cid, url: spec.url, token: spec.token, scheme: spec.scheme, credentials: spec.credentials, ingress: createdHash, created_at: now, updated_at: now })
+      return this.a2aResult(rest, rpcId, pushViewJson(spec.taskId, cid, spec.url, spec.scheme, call.v03))
+    }
+    if (!u.failed && call.op === "DeleteTaskPushNotificationConfig") {
+      store.remove(name, call.taskId, call.configId)
+      return this.a2aResult(rest, rpcId, rest ? "{}" : "null")
+    }
+    return a2aRender(rest, rpcId, fwd, u)
+  }
+
+  // POST /agents/a2a/{name}/push/callback: an event the agent pushes. The token it carries (the one the gateway
+  // gave it for a config) is the only authentication; the event is queued for the relay (202).
+  async a2aIngress(req: Request, name: string): Promise<Response> {
+    if (req.method !== "POST") return json(405, errorJson("use POST for push notifications", "invalid_request_error", undefined))
+    const agent = findAgent(this.engine.cfg.agents, name)
+    if (agent === undefined || agent.enabled === false) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
+    const body = await req.text()
+    const started = Date.now()
+    const r = acceptPush(pushStore(), name, req.headers.get(TOKEN_HEADER) ?? "", body, Math.floor(started))
+    this.recordA2a({ agent: name, method: "push_notification", status: r.status, latencyMs: Date.now() - started, context: "", vk: undefined, error: r.error })
+    if (r.status !== 202) return json(r.status, errorJson(r.error, r.status === 401 ? "authentication_error" : "invalid_request_error", undefined))
+    return new Response(undefined, { status: 202 })
+  }
+
+  // GET /api/agents/push-configs, DELETE /api/agents/push-configs/{agent}/{task}/{config}: the callbacks callers
+  // registered through the gateway. Secrets are never shown. Deleting here removes the gateway's copy only; the
+  // agent keeps its registration until the caller deletes it through the protocol.
+  pushConfigsRoute(method: string, path: string, sp: URLSearchParams): Reply {
+    const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
+    const store = pushStore()
+    if (segs.length === 3) {
+      if (method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+      let limit = parseInt(sp.get("limit") ?? "") ?? 0
+      let offset = parseInt(sp.get("offset") ?? "") ?? 0
+      if (limit <= 0) limit = 25
+      if (limit > 100) limit = 100
+      if (offset < 0) offset = 0
+      const page = store.page({ agents: listNames(sp.get("agent_names") ?? ""), task: sp.get("task_id") ?? "", config: sp.get("config_id") ?? "", url: sp.get("url") ?? "", limit: limit, offset: offset })
+      const rows: string[] = []
+      for (const c of page.rows) rows.push(configView(c))
+      return okJson(`{"push_configs":[${rows.join(",")}],"agent_names":${JSON.stringify(store.agentNames())},"count":${rows.length},"total_count":${page.total},"limit":${limit},"offset":${offset}}`)
+    }
+    if (segs.length === 6) {
+      if (method !== "DELETE") return { status: 405, body: errorJson("use DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+      if (!store.remove(segs[3]!, segs[4]!, segs[5]!)) return { status: 404, body: errorJson("agent push configuration not found", "not_found_error", undefined), contentType: "application/json" }
+      return { status: 204, body: "", contentType: "application/json" }
+    }
+    return { status: 404, body: errorJson("no such route", "not_found_error", undefined), contentType: "application/json" }
+  }
+
+  // Starts the push relay: every second, the queued pushes that are due go to the callers' callbacks, and an
+  // hour's housekeeping drops what is old. Runs in every worker; they share one queue and a worker takes a lease on
+  // a push before it sends it, so each push is sent by one worker.
+  startA2aRelay(): void {
+    setInterval(() => {
+      this.a2aRelayPass()
+    }, 1000)
+  }
+
+  async a2aRelayPass(): Promise<void> {
+    if (this.relayBusy) return
+    this.relayBusy = true
+    const store = pushStore()
+    try {
+      // the queue is shared with the node's other workers: read it before looking
+      store.sync()
+      if (store.deliveries.length > 0) {
+        await deliverDue(store, this.pushPrivate(), Math.floor(Date.now()), (d: PushDelivery, err: string, ms: int): void => {
+          this.recordA2a({ agent: d.agent, method: "push_delivery", status: err === "" ? 200 : 502, latencyMs: ms, context: "", vk: undefined, error: err })
+        })
+      }
+      this.relayTicks += 1
+      if (this.relayTicks % 3600 === 1) store.prune(Math.floor(Date.now()), (this.store.cfg.agents ?? []).map((a) => a.name))
+    } catch (e) {
+      console.error(`raiju: a2a push relay: ${e.message}`)
+    }
+    this.relayBusy = false
+  }
+
+  // Starts the card timer (client.a2a_card_refresh_seconds, 300 by default, 0 for none): each pass fetches the
+  // card of every enabled agent again and saves the ones that changed. Only the process that may save the
+  // config runs it.
+  startCardRefresh(): void {
+    this.cardRefreshOn = true
+    const secs = this.store.cfg.client?.a2a_card_refresh_seconds ?? 300
+    if (secs <= 0) return
+    setInterval(() => {
+      this.refreshCards()
+    }, secs * 1000)
+  }
+
+  // One pass of the card timer.
+  async refreshCards(): Promise<void> {
+    const list = this.store.cfg.agents ?? []
+    if (list.length === 0) return
+    try {
+      const r = await refreshAll(list)
+      for (const f of r.failed) console.error(`raiju: agent card refresh: ${f}`)
+      const next = r.next
+      if (next !== undefined) {
+        this.store.setAgents(this.mergeCards(next, r.changed))
+        console.error(`raiju: agent card changed: ${r.changed.join(", ")}`)
+      }
+    } catch (e) {
+      console.error(`raiju: agent card refresh: ${e.message}`)
+    }
+  }
+
+  // The current list with the refreshed cards of the agents named in changed (the list may have been edited
+  // while the cards were being fetched).
+  mergeCards(fresh: AgentConfig[], changed: string[]): AgentConfig[] {
+    const out: AgentConfig[] = []
+    for (const a of this.store.cfg.agents ?? []) {
+      const f = findAgent(fresh, a.name)
+      if (f !== undefined && changed.includes(a.name) && f.agent_card_url === a.agent_card_url) out.push(withCard(a, f.card ?? "", f.card_fetched_at ?? Math.floor(Date.now())))
+      else out.push(a)
+    }
+    return out
+  }
+
+  // An agent answered as if its endpoint had moved (404 without a protocol error, 405, 410, 426): fetch its card
+  // again, at most once a minute. Only where the timer runs (the process that may save the config).
+  refreshSoon(name: string): void {
+    if (!this.cardRefreshOn) return
+    const now = Date.now()
+    const last = this.cardRefreshAt.get(name) ?? 0.0
+    if (now - last < 60000.0) return
+    this.cardRefreshAt.set(name, now)
+    this.refreshOne(name)
+  }
+
+  async refreshOne(name: string): Promise<void> {
+    const a = findAgent(this.store.cfg.agents, name)
+    if (a === undefined || a.enabled === false) return
+    try {
+      const r = await refreshAll([a])
+      const next = r.next
+      if (next !== undefined) {
+        this.store.setAgents(this.mergeCards(next, r.changed))
+        console.error(`raiju: agent card changed: ${name}`)
+      }
+    } catch (e) {
+      console.error(`raiju: agent card refresh: ${e.message}`)
+    }
+  }
+
   // ---- log exporters (Datadog, Splunk, Elasticsearch, HTTP) ----
 
   configureExporters(list: LogExporterConfig[]): void {
@@ -1989,6 +3076,55 @@ export class Ops {
       else if (st >= 300) console.error(`raiju: exporter ${q.cfg.id}: status ${st}, batch dropped`)
     }
     this.sending = false
+  }
+
+  // ---- retained content (client.retain_content_in_object_storage) ----
+
+  // The queue of hidden objects is uploaded once a second, while the engine has one.
+  configureRetained(): void {
+    if (this.engine.hiddenQueue === undefined || this.retainTimer >= 0) return
+    this.retainTimer = setInterval(() => {
+      this.flushRetained()
+    }, 1000)
+  }
+
+  // Uploads the retained objects that are due: at most 16 a pass, each tried once here. A failed one waits
+  // its pause in the queue and is given up after MAX_ATTEMPTS tries. Nothing waits on this, so a store
+  // outage never holds up a request.
+  async flushRetained(): Promise<void> {
+    const q = this.engine.hiddenQueue
+    if (q === undefined || this.retainSending) return
+    this.retainSending = true
+    try {
+      for (let n = 0; n < 16; n++) {
+        const now = Date.now()
+        const job = q.take(now)
+        if (job === undefined) break
+        const ok = await this.retainPut(jobRequest(q, job, now))
+        if (ok) q.done(job)
+        else if (!q.fail(job, Date.now())) console.error(`raiju: retained content ${job.key}: given up after ${MAX_ATTEMPTS} tries`)
+      }
+    } catch (e) {
+      console.error(`raiju: retained content: ${e.message}`)
+    }
+    this.retainSending = false
+  }
+
+  // One upload, with a 30 second deadline. True when the store answered 2xx.
+  async retainPut(req: ByteRequest): Promise<bool> {
+    const dl = deadline(30000)
+    let ok = false
+    try {
+      const hs: Record<string, string> = req.headers
+      const r = await fetch(req.url, { method: "PUT", headers: hs, body: req.body, signal: dl.controller.signal })
+      await r.text()
+      ok = r.status >= 200 && r.status < 300
+      if (!ok) console.error(`raiju: retained content: HTTP ${r.status} from ${req.url}`)
+    } catch (e) {
+      console.error(`raiju: retained content: ${e.message}`)
+    }
+    dl.finish()
+    return ok
   }
 
   // ---- request log exports ----
@@ -2180,9 +3316,14 @@ export class Ops {
     if (jw.status !== 200) return html(502, "<p>Could not read the identity provider's signing keys.</p>")
     const v = verifyIdToken(idToken, jw.body, oc, d.issuer, flow.nonce, Date.now())
     if (v.kind === "error") return html(401, `<p>Sign-in failed: ${v.message.replace("<", "&lt;")}</p>`)
+    // a user governance lists as disabled (a SCIM deactivation, say) signs in no more; users it does not list are unchanged
+    if (disabledNamed(this.rbac, ssoNames(v.sub, v.email))) {
+      this.recordChange("sso:" + v.sub, req, path, 403, "")
+      return html(403, "<p>This account is disabled. Ask an administrator to enable it.</p>")
+    }
     let token = ""
     try {
-      token = this.sessions.create(v.sub, v.role, Date.now())
+      token = this.sessions.create(v.sub, v.role, Date.now(), v.email)
     } catch (e) {
       return html(500, "<p>Could not create a session.</p>")
     }
@@ -2291,6 +3432,15 @@ export class Ops {
     this.ui.send(JSON.stringify({ type: "store_update", tags: [seg] }))
   }
 
+  // The single sign-on session a token names, or undefined when there is none or its user is now disabled in
+  // governance: a deactivated user's session stops at its next request.
+  liveSession(token: string): Session | undefined {
+    const s = this.sessions.get(token, Date.now())
+    if (s === undefined) return undefined
+    if (disabledNamed(this.rbac, ssoNames(s.sub, s.email))) return undefined
+    return s
+  }
+
   // Whether the caller may use this /api route; the actor names them in the audit log.
   gate(req: Request, path: string): Gate {
     // client.whitelisted_routes: these exact paths skip authentication (Bifrost)
@@ -2299,7 +3449,7 @@ export class Ops {
     if (pg !== undefined) return pg
     const auth = req.headers.get("authorization") ?? ""
     if (auth.startsWith("Bearer sk-sess-")) {
-      const s = this.sessions.get(auth.slice(7), Date.now())
+      const s = this.liveSession(auth.slice(7))
       // a single sign-on session holds a built-in role
       const role = s === undefined ? undefined : (isBuiltinRole(s.role) ? s.role : undefined)
       if (s === undefined || role === undefined) return { kind: "deny", res: denied(401, "the session expired; sign in again") }
@@ -2314,9 +3464,21 @@ export class Ops {
     // a temp token (client.mcp_enable_temp_token_auth) opens the per-user consent flow it was minted for
     if (this.store.cfg.client?.mcp_enable_temp_token_auth === true && tempTokenAllows(req.headers.get("x-bifrost-temp-token") ?? "", req.method, path, Date.now())) return { kind: "ok", actor: "temp-token" }
     const v = authorize(this.rbac, snapshot(req.headers), req.method, path)
-    if (v.kind === "ok") return { kind: "ok", actor: v.actor }
+    if (v.kind === "ok") {
+      if (v.actor.startsWith("key:")) this.keyUsed.set(v.actor.slice(4), rfc3339Of(Date.now()))
+      return { kind: "ok", actor: v.actor }
+    }
     this.recordChange("unauthenticated", req, path, v.status, "")
     return { kind: "deny", res: denied(v.status, v.message) }
+  }
+
+  // Whether a request carries a dashboard sign-in (a session token, or admin credentials): the identity a session-mode
+  // consent grants (Bifrost's consentIdentityPresent). With dashboard auth off there is none.
+  consentSignedIn(req: Request): bool {
+    if (!this.authOn) return false
+    const auth = req.headers.get("authorization") ?? ""
+    if (auth.startsWith("Bearer sk-sess-")) return this.liveSession(auth.slice(7)) !== undefined
+    return authorize(this.rbac, snapshot(req.headers), "GET", "/api/users/me/permissions").kind === "ok"
   }
 
   // ---- identity-aware proxy (AWS ALB, Cloudflare Access, a generic JWT proxy) ----
@@ -2473,8 +3635,11 @@ export class Ops {
   }
 
   // The archive copy: the events in each window that has closed (archive_grace_seconds before now) since
-  // the last copy go to object storage as one JSONL object. The first run only sets the mark, so events
-  // written before archiving was turned on are not copied. Rows are never deleted here.
+  // the last copy go to object storage as a Bifrost-style window (audit.tov's archive layout, planWindow):
+  // parts cut at archive_max_object_bytes, gzipped when archive_compress is set, then the manifest that
+  // commits the window. The mark moves only after the manifest is stored, so a failed window is retried
+  // whole on the next pass. The first run only sets the mark, so events written before archiving was
+  // turned on are not copied. Rows are never deleted here.
   async auditArchive(): Promise<void> {
     const log = this.audit
     const ac = this.store.cfg.audit?.archive
@@ -2490,35 +3655,51 @@ export class Ops {
       const end = now - grace * 1000
       if (end <= mark.until) return
       const w = log.exportWindow(mark.seq, end)
-      if (w.count === 0) {
-        log.setArchiveMark({ seq: mark.seq, until: end })
-        return
-      }
       const ec: LogExportsConfig = {
-        enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix ?? "audit", region: ac.region, endpoint: ac.endpoint,
+        enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix, region: ac.region, endpoint: ac.endpoint,
         access_key_id: ac.access_key_id, secret_access_key: ac.secret_access_key, session_token: ac.session_token,
         interval_seconds: ac.interval_seconds, path_style: ac.path_style, format: ac.format, retention_days: ac.retention_days,
       }
-      const put = putRequest(ec, objectKey(ec, mark.until, end, this.nodeId, "jsonl"), w.body, now)
-      const hs: Record<string, string> = put.headers
-      const dl = deadline(30000)
-      try {
-        const r = await fetch(put.url, { method: "PUT", headers: hs, body: put.body, signal: dl.controller.signal })
-        await r.text()
-        if (r.status >= 200 && r.status < 300) log.setArchiveMark({ seq: w.last, until: end })
-        else console.error(`raiju: audit archive: HTTP ${r.status} from ${put.url}`)
-      } catch (e) {
-        console.error(`raiju: audit archive: ${e.message}`)
+      const plan = planWindow(ac.prefix ?? "bifrost", mark.until, end, w.body, maxObjectBytes(this.store.cfg.audit?.archive_max_object_bytes), this.store.cfg.audit?.archive_compress === true, now)
+      for (const o of plan.objects) {
+        const req = putObjectRequest(ec, o.key, o.body, o.contentType, Date.now())
+        if (!(await this.archivePut(req))) return
       }
-      dl.finish()
+      log.setArchiveMark({ seq: w.last, until: end })
     } catch (e) {
       console.error(`raiju: audit archive failed: ${e.message}`)
     }
   }
 
+  // One archive object's upload, tried up to three times with a growing pause. False when every try failed.
+  async archivePut(req: ByteRequest): Promise<bool> {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let ok = false
+      const dl = deadline(30000)
+      try {
+        const hs: Record<string, string> = req.headers
+        const r = await fetch(req.url, { method: "PUT", headers: hs, body: req.body, signal: dl.controller.signal })
+        await r.text()
+        ok = r.status >= 200 && r.status < 300
+        if (!ok) console.error(`raiju: audit archive: HTTP ${r.status} from ${req.url}`)
+      } catch (e) {
+        console.error(`raiju: audit archive: ${e.message}`)
+      }
+      dl.finish()
+      if (ok) return true
+      if (attempt < 3) await new Promise<void>((resolve) => setTimeout(resolve, 1000 * attempt))
+    }
+    return false
+  }
+
   // /api/users/me/permissions: the caller's custom role as (resource, operation) pairs with their ids.
   // Built-in roles hold fixed rules (rbac.tov) and are reported by name, with no pairs.
   mePermissions(actor: string): Reply {
+    if (actor.startsWith("key:")) {
+      const kids = permissionIds(RESOURCES, OPERATIONS, this.heldOf(actor).pairs)
+      const kdocs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => kids.includes(d.id))
+      return { status: 200, body: JSON.stringify({ user: actor, role: "api_key", built_in: false, permissions: kdocs }), contentType: "application/json" }
+    }
     // a caller with no stored user (the legacy admin credential) is the admin
     let role = "admin"
     for (const u of this.store.cfg.governance?.users ?? []) {
@@ -2529,6 +3710,52 @@ export class Ops {
     const ids = permissionIds(RESOURCES, OPERATIONS, pairs)
     const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
     return { status: 200, body: JSON.stringify({ user: actor, role: role, built_in: custom === undefined, permissions: docs }), contentType: "application/json" }
+  }
+
+  // What the actor may grant to a management API key: everything for the admin and the legacy admin
+  // credential, the custom role's permissions for a role user, and a key's own permissions for a key.
+  // A single sign-on or proxy identity holds a built-in role, which grants no pairs here.
+  heldOf(actor: string): Held {
+    if (actor.startsWith("key:")) {
+      for (const k of this.store.cfg.governance?.api_keys ?? []) {
+        if ("key:" + k.name === actor) return { all: false, pairs: k.permissions }
+      }
+      return { all: false, pairs: [] }
+    }
+    if (actor.startsWith("sso:") || actor.startsWith("proxy:") || actor === "temp-token") return { all: false, pairs: [] }
+    const gov = this.store.cfg.governance
+    for (const u of gov?.users ?? []) {
+      if (u.name !== actor) continue
+      if (u.role === "admin") return { all: true, pairs: [] }
+      return { all: false, pairs: customRole(gov?.roles ?? [], u.role)?.permissions ?? [] }
+    }
+    return { all: true, pairs: [] }
+  }
+
+  // /api/api-keys and /api/api-keys/{id} (apikeys.tov). A change is saved to the config; this worker's
+  // copy of the keys is updated at once, so the next request with a new key already authenticates.
+  apiKeysRoute(method: string, path: string, url: string, body: string, actor: string): Reply {
+    let value = ""
+    if (method === "POST") {
+      try {
+        value = newKeyValue()
+      } catch (e) {
+        return { status: 500, body: errorJson(`could not make a key: ${e.message}`, "api_error", undefined), contentType: "application/json" }
+      }
+    }
+    const u = URL.parse(url)
+    const sp = u === undefined ? new URLSearchParams("") : u.searchParams
+    // a key names its creator only when that is a stored user (not a key, the anonymous caller or a sign-in)
+    const creator = actor.startsWith("sso:") || actor.startsWith("proxy:") || actor.startsWith("key:") || actor === "anonymous" || actor === "temp-token" ? "" : actor
+    const ctx: KeyCtx = { held: this.heldOf(actor), actor: creator, nowMs: Date.now(), value: value, lastUsed: this.keyUsed }
+    const r = handleApiKeys(this.store.cfg.governance?.api_keys ?? [], method, path, sp, body, ctx)
+    const next = r.keys
+    if (next !== undefined) {
+      const saved = this.store.setApiKeys(next)
+      if (saved.kind !== "ok") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
+      this.rbac = { users: this.rbac.users, roles: this.rbac.roles, api_keys: next }
+    }
+    return { status: r.status, body: r.body, contentType: "application/json" }
   }
 
   // POST /api/governance/access-profiles/{id}/propagate ({"fields": [...]}; all of them when unset): the
@@ -2561,7 +3788,7 @@ export class Ops {
   // GET /api/users/me/vk-creation-policy: the access profile that governs keys the caller creates.
   vkCreationPolicy(actor: string): Reply {
     const g = this.store.cfg.governance
-    return { status: 200, body: creationPolicy(g?.users, g?.access_profiles, actor), contentType: "application/json" }
+    return { status: 200, body: creationPolicy(g?.users, g?.roles, g?.access_profiles, actor), contentType: "application/json" }
   }
 
   // /api/users/{name}/access-profiles: GET lists the profiles the user holds; PUT and DELETE
@@ -2576,7 +3803,7 @@ export class Ops {
     const g = this.store.cfg.governance
     if (segs.length === 4) {
       if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
-      const held = heldProfiles(g?.users, g?.access_profiles, name)
+      const held = heldProfiles(g?.users, g?.roles, g?.access_profiles, name)
       return { status: 200, body: JSON.stringify({ access_profiles: held }), contentType: "application/json" }
     }
     const add = method === "PUT"
@@ -2605,11 +3832,52 @@ export class Ops {
     return { status: r.status, body: r.body, contentType: "application/json" }
   }
 
+  // /api/governance/access-profiles/{id}/roles: POST attaches roles ({"role_ids": [...], "is_default": bool});
+  // DELETE .../roles/{role_id} detaches one. Every user holding one of the roles holds the profile, so the
+  // reply counts those users as users_applied.
+  profileRoles(method: string, segs: string[], body: string): Reply {
+    const id = segs[3] ?? ""
+    if (segs.length === 5 && method === "POST") {
+      let b: RoleAttachBody = {}
+      try {
+        b = JSON.parse(body) as RoleAttachBody
+      } catch (e) {
+        return { status: 400, body: errorJson("body must be a JSON object with role_ids", "invalid_request_error", undefined), contentType: "application/json" }
+      }
+      const ids: int[] = b.role_ids ?? []
+      if (ids.length === 0) return { status: 400, body: errorJson("role_ids is required", "invalid_request_error", undefined), contentType: "application/json" }
+      const r = this.store.attachProfileRoles(id, ids, b.is_default)
+      if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+      const g = this.store.cfg.governance
+      let n = 0
+      for (const u of g?.users ?? []) {
+        const rid = roleIdOf(g?.roles, u.role)
+        if (rid !== undefined && ids.includes(rid)) n += 1
+      }
+      return { status: 200, body: JSON.stringify({ message: "roles attached", users_applied: n }), contentType: "application/json" }
+    }
+    if (segs.length === 6 && method === "DELETE") {
+      const rid = parseInt(segs[5] ?? "") ?? 0
+      const r = this.store.detachProfileRole(id, rid)
+      if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+      return { status: 200, body: JSON.stringify({ message: "role detached" }), contentType: "application/json" }
+    }
+    return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+  }
+
   // /api/governance/access-profiles[/{id}]. A profile that keys still use can't be deleted.
   profiles(method: string, path: string, body: string): Reply {
     const gov = this.store.cfg.governance
     const segs0 = path.split("/").filter((s) => s !== "")
     if (method === "POST" && segs0.length === 5 && segs0[4] === "propagate") return this.propagateProfile(segs0[3] ?? "", body)
+    if (segs0.length >= 5 && segs0[4] === "roles") return this.profileRoles(method, segs0, body)
+    // a profile attached to a role is detached from it first, as Bifrost refuses the delete while it is held
+    if (method === "DELETE") {
+      const did = segs0[3] ?? ""
+      for (const p of gov?.access_profiles ?? []) {
+        if (p.id === did && (p.roles ?? []).length > 0) return { status: 409, body: errorJson(`access profile ${did} is attached to roles; detach it first`, "invalid_request_error", undefined), contentType: "application/json" }
+      }
+    }
     const r = handleProfiles(gov?.access_profiles ?? [], method, path, body)
     if (method === "GET" || r.status >= 300) return { status: r.status, body: r.body, contentType: "application/json" }
     if (method === "DELETE") {
@@ -2706,6 +3974,11 @@ export class Ops {
       const named = keyById(this.engine.cfg, caller.vk)
       if (!keyUsable(named, Date.now()) || named === undefined) return denied(401, "the virtual key this token names is not active", challenge)
       h.set("x-bf-vk", named.value)
+    } else if (caller.kind === "session") {
+      // a session token carries no verified identity (Bifrost): the request is anonymous, refused while auth is enforced,
+      // and keys its per-user OAuth tokens by the session id the token names
+      if (this.engine.gov.enforce) return denied(401, "authentication required; session-mode tokens are not accepted when authentication is enforced - re-authenticate with a virtual key", challenge)
+      h.set("x-bf-mcp-session-id", caller.sub)
     } else if (serverAuthMode(this.engine.cfg) === "oauth") {
       return denied(401, "this server requires OAuth JWT authentication; header credentials are not accepted in oauth mode", challenge)
     }
@@ -2714,6 +3987,11 @@ export class Ops {
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
     let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs))
+    // code mode: the four meta-tools stand in for the code mode clients' tools, as in the tool list Bifrost serves
+    // (a virtual MCP lists only its own tools)
+    if (virtualName === undefined && this.engine.codeEntriesFor(m, h).length > 0) {
+      for (const d of exposedTools(metaToolDefs())) tools.push(d)
+    }
     // virtual names → the source tool and its argument defaults
     let mapping: Map<string, { source: string, defaults: string }> = new Map()
     if (virtualName !== undefined) {
@@ -2749,6 +4027,11 @@ export class Ops {
     // each call passes the key's MCP rules and budgets, forwards the allowed request headers, and
     // is charged its tool_pricing cost; a virtual MCP's call is judged by the tool it runs
     const run = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
+      // a code mode meta-tool runs its program; the program's own tool calls pass the same gates as any call
+      if (isMetaTool(name)) {
+        const mr = try await this.engine.codeMetaTool(m, h, name, args, undefined)
+        return { text: mr.text, isError: mr.isError }
+      }
       let real = name
       let merged = args
       if (virtual) {
@@ -2769,7 +4052,16 @@ export class Ops {
       this.engine.chargeTool(m, gate, real)
       return { text: r.text, isError: r.isError }
     }
-    const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now)
+    // the servers' own guidance goes out with initialize, for the servers that offer this caller a tool
+    const seen: string[] = []
+    if (virtual) {
+      for (const k of mapping.keys()) seen.push(mapping.get(k)!.source)
+    } else {
+      for (const t of tools) seen.push(t.name)
+    }
+    const iparts = m.instructionParts(allowedTools, vk?.mcp_configs).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
+    const instructions = m.renderInstructions(iparts)
+    const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now, instructions)
     const out: Record<string, string> = new Map()
     out.set("content-type", r.contentType)
     const sid = r.sessionId
@@ -2957,4 +4249,63 @@ test("log histogram counts requests per bucket by status", () => {
   expect(h.buckets[1]!.cancelled).toBe(1)
   expect(ops.logsHistogram(new Request(`http://raiju.test/api/logs/histogram?start_time=${t0 + 5.0}&end_time=${t0}`)).status).toBe(400)
   try rmSync(dir, { recursive: true, force: true })
+})
+
+function fwdOf(status: int, text: string, rpc: bool): Fwd {
+  return { status: status, text: text, ct: "", stream: undefined, rpc: rpc, error: "" }
+}
+
+test("an agent's unary answer is read the same from either binding", () => {
+  const ok = unaryOf(fwdOf(200, `{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"t1"}}}`, true))
+  expect(ok.failed).toBe(false)
+  expect(ok.result).toBe(`{"task":{"id":"t1"}}`)
+  expect(unaryOf(fwdOf(200, `{"jsonrpc":"2.0","id":1,"result":null}`, true)).result).toBe("null")
+  const bad = unaryOf(fwdOf(200, `{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"task not found"}}`, true))
+  expect(bad.failed).toBe(true)
+  expect(bad.code).toBe(-32001)
+  expect(bad.message).toBe("task not found")
+  const html = unaryOf(fwdOf(502, "<html>bad gateway</html>", true))
+  expect(html.failed).toBe(true)
+  expect(html.message).toBe("the agent answered HTTP 502")
+  expect(unaryOf(fwdOf(200, "plain text", true)).failed).toBe(true)
+  const rest = unaryOf(fwdOf(200, `{"id":"t1"}`, false))
+  expect(rest.failed).toBe(false)
+  expect(rest.result).toBe(`{"id":"t1"}`)
+  expect(unaryOf(fwdOf(204, "", false)).result).toBe("{}")
+  const gone = unaryOf(fwdOf(404, `{"error":{"code":404,"status":"NOT_FOUND","message":"gone","details":[{"reason":"TASK_NOT_FOUND"}]}}`, false))
+  expect(gone.failed).toBe(true)
+  expect(gone.code).toBe(-32001)
+  expect(gone.message).toBe("gone")
+  expect(unaryOf(fwdOf(500, "oops", false)).code).toBe(-32603)
+})
+
+test("an agent's answer reaches the caller in the caller's binding", () => {
+  const same = a2aRender(true, "\"1\"", fwdOf(201, `{"id":"t1"}`, false), unaryOf(fwdOf(201, `{"id":"t1"}`, false)))
+  expect(same.status).toBe(201)
+  expect(a2aRender(true, "\"1\"", fwdOf(204, "", false), unaryOf(fwdOf(204, "", false))).status).toBe(204)
+  const rpcErr = fwdOf(200, `{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"gone"}}`, true)
+  expect(a2aRender(true, "\"1\"", rpcErr, unaryOf(rpcErr)).status).toBe(404)
+  expect(a2aRender(false, "5", rpcErr, unaryOf(rpcErr)).status).toBe(200)
+  const restErr = fwdOf(404, `{"error":{"code":404,"status":"NOT_FOUND","message":"gone"}}`, false)
+  expect(a2aRender(false, "5", restErr, unaryOf(restErr)).status).toBe(200)
+  expect(a2aRender(true, "\"1\"", restErr, unaryOf(restErr)).status).toBe(404)
+})
+
+test("a refusal comes in the caller's binding, and an ETag is matched like HTTP does", () => {
+  expect(a2aDeny(false, 403, "no", "permission_error").status).toBe(403)
+  expect(a2aDeny(true, 401, "no", "authentication_error").headers.get("www-authenticate")).toBe(`ApiKey name="x-bf-vk", in="header"`)
+  expect(a2aDeny(false, 401, "no", "authentication_error").headers.get("www-authenticate")).toBe(`Bearer realm="raiju", Basic realm="raiju"`)
+  expect(etagMatches(`"a", "b"`, `"b"`)).toBe(true)
+  expect(etagMatches(`W/"b"`, `"b"`)).toBe(true)
+  expect(etagMatches("*", `"b"`)).toBe(true)
+  expect(etagMatches(`"a"`, `"b"`)).toBe(false)
+  expect(etagMatches("", `"b"`)).toBe(false)
+  const h: Hdrs = new Map()
+  h.set("if-none-match", `"zzz"`)
+  expect(a2aCardResponse("{}", h).status).toBe(200)
+  const first = a2aCardResponse("{}", new Map())
+  const tag = first.headers.get("etag") ?? ""
+  expect(tag.byteLength).toBe(34)
+  h.set("if-none-match", tag)
+  expect(a2aCardResponse("{}", h).status).toBe(304)
 })

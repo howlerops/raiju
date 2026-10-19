@@ -1,0 +1,225 @@
+// The Realtime API over WebRTC, terminated here as Bifrost's webrtcrealtime.go does: POST /v1/realtime/calls
+// (the GA format: a multipart body with the browser's SDP offer in "sdp" and the session in "session", or a
+// raw SDP body with ?model=) and POST /v1/realtime (the beta format). The browser's offer is answered by this
+// gateway's own peer connection, a second peer connection offers to the provider, and the two are relayed
+// (webrtc.tov): the audio as RTP packets and the "oai-events" channel as text, every event passing through
+// the same LiveCore as a realtime WebSocket (turns admitted, text guarded, response.done tokens billed, one
+// log row). OpenAI and Azure OpenAI have a WebRTC call API; xAI's realtime API is a WebSocket only.
+import { Engine, errorResponse, noHeaders } from "./gateway"
+import { Grant } from "./governance"
+import { Config } from "./config"
+import { parseModel, target } from "./router"
+import { Target, trimSlash } from "./providers/types"
+import { snapshot } from "./schemas"
+import { fields, find, rawStr, setField, build, quote } from "./json"
+import { credentialOk, iceServers } from "./live"
+import { send } from "./media"
+import { upstreamFor } from "./realtime"
+import { SessionSpec, sessionHooks, sessionGuard } from "./livehooks"
+import { Exchange, establish } from "./webrtc"
+
+// Whether a provider kind has a WebRTC call API for the Realtime API.
+export function callsKind(kind: string): bool {
+  return kind === "openai" || kind === "azure"
+}
+
+// The model of a nested transcription object, with its provider prefix removed (a model of "openai/whisper-1"
+// goes up as "whisper-1"). The object is returned as it was when it names no model or has no prefix.
+function bareNested(cfg: Config, obj: string): string {
+  try {
+    const fs = fields(obj)
+    const m = rawStr(fs, "model")
+    if (m === undefined) return obj
+    const bare = parseModel(cfg, m).model
+    if (bare === m) return obj
+    let out = fs
+    setField(&out, "model", quote(bare))
+    return build(out)
+  } catch (e) {
+    return obj
+  }
+}
+
+// The session the provider is sent: the model the provider knows it by, and no provider prefixes on the
+// nested transcription model (StripNestedModelPrefixes). Throws when the session is not a JSON object.
+export function providerSession(cfg: Config, session: string, model: string): string throws SyntaxError {
+  let fs = try fields(session)
+  setField(&fs, "model", quote(model))
+  // the beta format: input_audio_transcription.model
+  const old = find(fs, "input_audio_transcription")
+  if (old !== undefined && old.trim().startsWith("{")) setField(&fs, "input_audio_transcription", bareNested(cfg, old))
+  // the GA format: audio.input.transcription.model
+  const audio = find(fs, "audio")
+  if (audio !== undefined && audio.trim().startsWith("{")) {
+    let af = try fields(audio)
+    const input = find(af, "input")
+    if (input !== undefined && input.trim().startsWith("{")) {
+      let inf = try fields(input)
+      const tr = find(inf, "transcription")
+      if (tr !== undefined && tr.trim().startsWith("{")) {
+        setField(&inf, "transcription", bareNested(cfg, tr))
+        setField(&af, "input", build(inf))
+        setField(&fs, "audio", build(af))
+      }
+    }
+  }
+  return build(fs)
+}
+
+// The URL a provider's call is made at, and the headers it takes. calls is the GA route (/realtime/calls);
+// the beta route goes to the provider's /realtime. A call with no session names its model in the query.
+export function callsUpstream(t: Target, calls: bool, withSession: bool): { url: string, headers: Map<string, string> } {
+  const up = upstreamFor(t, undefined)
+  const headers: Map<string, string> = new Map()
+  for (const k of up.headers.keys()) headers.set(k, up.headers.get(k)!)
+  if (t.kind === "azure") {
+    const endpoint = trimSlash(t.key.azure_key_config?.endpoint ?? t.cfg.network_config?.base_url ?? "")
+    return { url: `${endpoint}/openai/v1/realtime?model=${t.model}`, headers: headers }
+  }
+  const base = trimSlash(t.cfg.network_config?.base_url ?? "https://api.openai.com")
+  if (!calls) return { url: `${base}/v1/realtime?model=${t.model}`, headers: headers }
+  return { url: withSession ? `${base}/v1/realtime/calls` : `${base}/v1/realtime/calls?model=${t.model}`, headers: headers }
+}
+
+function refuse(status: int, message: string, type: string): Response {
+  return errorResponse(status, message, type, noHeaders())
+}
+
+// POST /v1/realtime/calls (calls) and POST /v1/realtime: terminates the call on this gateway's peer.
+export async function realtimeCall(engine: Engine, req: Request, calls: bool): Promise<Response> {
+  const cfg = engine.cfg
+  const u = URL.parse(req.url)
+  const queryModel = u === undefined ? "" : (u.searchParams.get("model") ?? "").trim()
+  const ct = (req.headers.get("content-type") ?? "").toLowerCase()
+  let offer = ""
+  let session = ""
+  let rawModel = queryModel
+  try {
+    if (ct.startsWith("multipart/form-data")) {
+      const fd = await req.formData()
+      const s = fd.get("sdp")
+      if (typeof s === "string") offer = s
+      if (offer.trim() === "") return refuse(400, "sdp form field is required", "invalid_request_error")
+      const ses = fd.get("session")
+      if (typeof ses === "string") session = ses
+      if (calls && session.trim() === "") return refuse(400, "session form field is required", "invalid_request_error")
+      // the GA format names its model in the session; the beta format lets ?model= win
+      if (session.trim() !== "" && rawModel === "") {
+        const sm = rawStr(try fields(session), "model")
+        if (sm !== undefined) rawModel = sm.trim()
+      }
+    } else {
+      offer = await req.text()
+      if (offer.trim() === "") return refuse(400, "SDP is required", "invalid_request_error")
+    }
+  } catch (e) {
+    return refuse(400, "failed to parse the request body", "invalid_request_error")
+  }
+  if (rawModel === "") return refuse(400, ct.startsWith("multipart/form-data") && calls ? "session.model is required" : "model query param is required", "invalid_request_error")
+  const h = snapshot(req.headers)
+  if (!credentialOk(engine, h)) return refuse(401, "authentication is required for realtime sessions", "authentication_error")
+  const ref = parseModel(cfg, rawModel)
+  const admitted = engine.gov.admit(h, ref.provider, ref.model)
+  if (admitted.kind === "denial") return refuse(admitted.status, admitted.message, admitted.type)
+  const grant: Grant = admitted
+  const sel = target(cfg, ref, new Set<int>(), h.get("x-bf-api-key") ?? undefined)
+  if (sel === undefined) return refuse(404, `no key is configured for ${ref.provider}/${ref.model}`, "invalid_request_error")
+  const t = sel.t
+  if (!callsKind(t.kind)) return refuse(400, `${ref.provider} has no realtime WebRTC API this gateway can relay`, "invalid_request_error")
+  let body = ""
+  if (session.trim() !== "") {
+    try {
+      body = try providerSession(cfg, session, t.model)
+    } catch (e) {
+      return refuse(400, "session must be a JSON object", "invalid_request_error")
+    }
+  }
+  const up = callsUpstream(t, calls, body !== "")
+  const exchange = async (gatewayOffer: string): Promise<Exchange> => {
+    // the provider is sent the gateway's offer, not the browser's
+    const fd = new FormData()
+    fd.append("sdp", gatewayOffer)
+    if (body !== "") fd.append("session", body)
+    const hs: Map<string, string> = new Map()
+    for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
+    const res = await send(t, { method: "POST", url: up.url, headers: hs, body: fd })
+    let text = ""
+    try {
+      text = await res.text()
+    } catch (e) {
+      return { status: 502, type: "api_error", message: "the provider's answer could not be read", sdp: "", sessionId: "", body: "", contentType: "" }
+    }
+    if (res.status < 200 || res.status >= 300) return { status: res.status, type: "api_error", message: "the provider refused the realtime call", sdp: "", sessionId: "", body: text, contentType: res.headers.get("content-type") ?? "application/json" }
+    return { status: 0, type: "", message: "", sdp: text, sessionId: "", body: "", contentType: "" }
+  }
+  const spec: SessionSpec = { op: "realtime", transport: "webrtc", provider: ref.provider, model: ref.model }
+  // a realtime session has no id of its own to record: attach and content are live sessions' routes
+  const hooks = sessionHooks(engine, h, grant, spec, (id) => true)
+  const est = await establish({
+    offer: offer,
+    exchange: exchange,
+    hooks: hooks,
+    guard: sessionGuard(engine),
+    filter: undefined,
+    iceServers: iceServers(),
+    bindAddress: process.env.RAIJU_WEBRTC_BIND ?? "",
+    realtime: true,
+    model: ref.model,
+    backendModel: "",
+  })
+  if (est.status !== 0) {
+    if (est.body !== "") {
+      // the provider's own refusal
+      const out: Record<string, string> = {}
+      out.set("content-type", est.contentType)
+      return new Response(est.body, { status: est.status, headers: out })
+    }
+    return refuse(est.status, est.message, est.type)
+  }
+  const out: Record<string, string> = {}
+  out.set("content-type", "application/sdp")
+  return new Response(est.answer, { status: 200, headers: out })
+}
+
+test("the provider's session has its model and nested transcription models bare", () => {
+  const cfg: Config = {}
+  const s = `{"type":"realtime","model":"openai/gpt-realtime","audio":{"input":{"transcription":{"model":"openai/whisper-1","language":"en"}},"output":{"voice":"marin"}}}`
+  const out = try providerSession(cfg, s, "gpt-realtime")
+  expect(out.includes(`"model":"gpt-realtime"`)).toBe(true)
+  expect(out.includes(`"model":"whisper-1"`)).toBe(true)
+  expect(out.includes("openai/")).toBe(false)
+  expect(out.includes(`"voice":"marin"`)).toBe(true)
+  expect(out.includes(`"language":"en"`)).toBe(true)
+  // the beta format
+  const b = try providerSession(cfg, `{"model":"openai/gpt-4o-realtime-preview","input_audio_transcription":{"model":"openai/whisper-1"}}`, "gpt-4o-realtime-preview")
+  expect(b.includes("openai/")).toBe(false)
+  expect(b.includes(`"input_audio_transcription":{"model":"whisper-1"}`)).toBe(true)
+  // a session without them is only given its model; a bare transcription model stays
+  const c = try providerSession(cfg, `{"audio":{"input":{"transcription":{"model":"whisper-1"}}}}`, "m")
+  expect(c.includes(`"model":"m"`)).toBe(true)
+  expect(c.includes(`"model":"whisper-1"`)).toBe(true)
+  let threw = false
+  try {
+    providerSession(cfg, "[1]", "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("a call goes to the provider's calls route, or its beta route, with its key", () => {
+  const t: Target = { provider: "openai", kind: "openai", model: "gpt-realtime", key: { value: "sk-x" }, cfg: { network_config: { base_url: "https://api.example.test/" } } }
+  const a = callsUpstream(t, true, true)
+  expect(a.url).toBe("https://api.example.test/v1/realtime/calls")
+  expect(a.headers.get("authorization")).toBe("Bearer sk-x")
+  // a call with no session names its model in the query
+  expect(callsUpstream(t, true, false).url).toBe("https://api.example.test/v1/realtime/calls?model=gpt-realtime")
+  expect(callsUpstream(t, false, true).url).toBe("https://api.example.test/v1/realtime?model=gpt-realtime")
+  const z: Target = { provider: "azure", kind: "azure", model: "gpt-realtime", key: { value: "ak", azure_key_config: { endpoint: "https://x.openai.azure.com/" } }, cfg: {} }
+  const b = callsUpstream(z, true, true)
+  expect(b.url).toBe("https://x.openai.azure.com/openai/v1/realtime?model=gpt-realtime")
+  expect(b.headers.get("api-key")).toBe("ak")
+  expect(callsKind("openai")).toBe(true)
+  expect(callsKind("azure")).toBe(true)
+  expect(callsKind("xai")).toBe(false)
+})

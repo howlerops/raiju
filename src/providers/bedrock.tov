@@ -59,10 +59,15 @@ export function sign(creds: Credentials, service: string, host: string, path: st
 // Signs a request with the given method. `query` is the canonical query string (names and values
 // already percent-encoded, sorted), "" for none.
 export function signRequest(method: string, creds: Credentials, service: string, host: string, path: string, query: string, body: string, nowMs: f64): Map<string, string> {
+  return signHashed(method, creds, service, host, path, query, toHex(sha256(utf8(body))), nowMs)
+}
+
+// The same, for a payload whose SHA-256 (lower-case hex) is known already: a body that was converted while it
+// streamed and never held in memory.
+export function signHashed(method: string, creds: Credentials, service: string, host: string, path: string, query: string, payloadHash: string, nowMs: f64): Map<string, string> {
   const date = amzDate(nowMs)
   const day = date.slice(0, 8)
   const canonicalPath = path.split("/").map((seg) => encodeSegment(seg)).join("/")
-  const payloadHash = toHex(sha256(utf8(body)))
   const hs: string[][] = [["content-type", "application/json"], ["host", host], ["x-amz-date", date]]
   const token = creds.sessionToken
   if (token !== undefined && token !== "") hs.push(["x-amz-security-token", token])
@@ -174,6 +179,15 @@ export function converseBody(req: ChatRequest, body: Field[], autoCache: bool, m
   }
   const out: string[] = [`"messages":[${turns.map((t) => `{"role":"${t.role}","content":[${t.content.join(",")}]}`).join(",")}]`]
   if (system.length > 0) out.push(`"system":[${system.join(",")}]`)
+  for (const p of try converseTail(req, body, modelId)) out.push(p)
+  return "{" + out.join(",") + "}"
+}
+
+// The request fields that come after the messages and the system (inferenceConfig, additionalModelRequestFields,
+// toolConfig). They do not depend on the messages, so a streaming conversion (streamconv.tov) writes them when
+// the body ends.
+export function converseTail(req: ChatRequest, body: Field[], modelId?: string): string[] throws SyntaxError {
+  const out: string[] = []
   const inf: string[] = []
   const max0 = req.max_completion_tokens ?? req.max_tokens
   // Claude thinking or Nova reasoning, from reasoning_effort / reasoning.max_tokens
@@ -190,7 +204,7 @@ export function converseBody(req: ChatRequest, body: Field[], autoCache: bool, m
   if (plan.fields !== undefined) out.push(`"additionalModelRequestFields":${plan.fields}`)
   const tools = find(body, "tools")
   if (tools !== undefined && !isNull(tools)) out.push(`"toolConfig":${try toolConfig(tools, find(body, "tool_choice"))}`)
-  return "{" + out.join(",") + "}"
+  return out
 }
 
 type BedrockUsage = { inputTokens?: int, outputTokens?: int, cacheReadInputTokens?: int, cacheWriteInputTokens?: int }
@@ -302,6 +316,30 @@ function callTo(t: Target, reg: string, h: string, sch: string, path: string, bo
   }
   addExtraHeaders(&hs, t.cfg)
   return { url: sch + h + path, headers: hs, body: body }
+}
+
+// A request to /model/{id}/{action} for a body that is converted while it streams in (streamconv.tov): signed
+// from the payload's SHA-256, since SigV4 needs it before the first byte goes out. The body is not here.
+export function largeRequest(t: Target, action: string, payloadHash: string): Upstream {
+  const reg = region(t)
+  const h = host(t, "bedrock-runtime", reg)
+  const path = `/model/${modelPath(t)}/${action}`
+  const bk = t.key.bedrock_key_config
+  const ak = bk?.access_key ?? ""
+  let hs: Map<string, string> = new Map()
+  if (ak !== "") {
+    hs = signHashed("POST", { accessKey: ak, secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token, region: reg }, "bedrock", h, path, "", payloadHash, Date.now())
+  } else {
+    hs = headers([["content-type", "application/json"], ["authorization", "Bearer " + (t.key.value ?? "")]])
+  }
+  addExtraHeaders(&hs, t.cfg)
+  return { url: scheme(t) + h + path, headers: hs, body: "" }
+}
+
+// Whether a chat request for this key goes to Bedrock's OpenAI-compatible endpoint (the body goes as it is),
+// not to Converse.
+export function takesOpenAIBody(t: Target): bool {
+  return usesOpenAIEndpoints(t)
 }
 
 // A GET on Bedrock's control plane (the "bedrock" service, not bedrock-runtime) for a model listing

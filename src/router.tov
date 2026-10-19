@@ -163,7 +163,8 @@ export function healthId(provider: string, k: KeyConfig, index: int): string {
 }
 
 // Breaker-aware choice: keys whose breaker is open are skipped, the rest are
-// weighted by measured health when `adaptive` is set, else by static weight.
+// weighted by measured health when `adaptive` is set, else by static weight. Under adaptive load
+// balancing a key held by a provider's refusal (holds.tov) is skipped too.
 function pickHealthy(provider: string, keys: KeyConfig[], model: string, exclude: Set<int>, health: Health, adaptive: bool): int {
   const now = Date.now()
   const tried: Set<int> = new Set()
@@ -172,17 +173,41 @@ function pickHealthy(provider: string, keys: KeyConfig[], model: string, exclude
     const idx: int[] = []
     const ids: string[] = []
     const ws: f64[] = []
+    // the held key a request goes to when every key is held: one this node owns the check for, else the one
+    // whose next check is soonest (Bifrost sends the request anyway; its answer settles the hold)
+    let heldIdx = -1
+    let heldOwned = false
+    let heldSoon = 0.0
     for (let i = 0; i < keys.length; i++) {
       if (tried.has(i) || !keyAllows(keys[i]!, model)) continue
+      const hid = healthId(provider, keys[i]!, i)
+      if (adaptive) {
+        // a refused key is out of rotation until its check; a key whose check is in flight is skipped too
+        const hs = health.holds.state(hid, model, now)
+        if (hs === "held" || hs === "checking") {
+          const owned = health.holds.ownsHold(hid, model)
+          const soon = health.holds.nextCheckOf(hid, model)
+          if (heldIdx < 0 || (owned && !heldOwned) || (owned === heldOwned && soon < heldSoon)) {
+            heldIdx = i
+            heldOwned = owned
+            heldSoon = soon
+          }
+          continue
+        }
+      }
       idx.push(i)
-      ids.push(healthId(provider, keys[i]!, i))
+      ids.push(hid)
       ws.push(keys[i]!.weight ?? 1.0)
     }
-    if (idx.length === 0) return -1
+    if (idx.length === 0) {
+      // every key is held: the request is sent to the best of them without a check, so the scheduled check
+      // (startCheck, on the owner) is still the only one sent cluster-wide
+      return heldIdx
+    }
     let j = -1
     if (adaptive) j = pickAdaptive(ids, ws, health, now, Math.random())
     else {
-      // static weights, open breakers skipped
+      // static weights; open breakers, held keys and keys already tried are skipped
       const open: Set<int> = new Set()
       for (let k = 0; k < idx.length; k++) {
         if (!health.wouldAllow(ids[k]!, now)) open.add(idx[k]!)
@@ -190,12 +215,19 @@ function pickHealthy(provider: string, keys: KeyConfig[], model: string, exclude
       const all: Set<int> = new Set()
       for (const t of tried.values()) all.add(t)
       for (const o of open.values()) all.add(o)
+      for (let k = 0; k < keys.length; k++) {
+        if (!idx.includes(k)) all.add(k)
+      }
       const i = pickKey(keys, model, all, undefined)
       j = idx.indexOf(i)
     }
     if (j < 0) return -1
     // allow() starts a half-open probe; if another request took the only probe slot, pick again
-    if (health.allow(ids[j]!, now)) return idx[j]!
+    if (health.allow(ids[j]!, now)) {
+      // a key due for its check gets this request as the check
+      if (adaptive) health.holds.startCheck(ids[j]!, model, now)
+      return idx[j]!
+    }
     tried.add(idx[j]!)
   }
 }
@@ -212,7 +244,9 @@ export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: st
   }
   const hc = cfg.health
   const useHealth = health !== undefined && pinned === undefined && hc !== undefined && (hc.circuit_breaker === true || hc.adaptive === true)
-  const i = useHealth ? pickHealthy(ref.provider, keys, ref.model, exclude, health!, hc!.adaptive === true) : pickKey(keys, ref.model, exclude, pinned)
+  let i: int = -1
+  if (useHealth) i = pickHealthy(ref.provider, keys, ref.model, exclude, health!, hc!.adaptive === true)
+  else i = pickKey(keys, ref.model, exclude, pinned)
   if (i < 0) return undefined
   const up = resolveAlias(keys[i]!, ref.model, cfg.client?.routing_chain_max_depth)
   if (up.error !== "") return undefined

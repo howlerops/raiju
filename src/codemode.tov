@@ -1,0 +1,557 @@
+// MCP code mode (Bifrost's code mode). The clients marked is_code_mode_client are not offered to the
+// model one by one. The model gets four meta-tools instead: listToolFiles and readToolFile (the Python
+// stubs of the servers), getToolDocs (one tool's documentation) and executeToolCode, which runs a program
+// that calls the tools. The tool calls a program makes go through the same gates as direct calls (see
+// gateway.tov mcpCall). This module holds the pure parts: the meta-tool definitions, the stubs, the
+// discovery answers, the limits and the auto-execute check. runCode drives the runner (starlark.tov).
+import { Field, fields, elements, find, rawStr, rawNum, decodeString, quote } from "./json"
+import { McpTool, CodeLimitsIn, chatToolName, patternMatches } from "./mcp"
+import { CodeLimits, CodeServer, CodeTool, ToolOut, Node, Program, RunOutcome, defaultCodeLimits, parseProgram, runRound } from "./starlark"
+
+export const LIST_TOOL = "listToolFiles"
+export const READ_TOOL = "readToolFile"
+export const DOCS_TOOL = "getToolDocs"
+export const EXECUTE_TOOL = "executeToolCode"
+// The four meta-tools, in the order the model is offered them.
+export const META_TOOLS: string[] = [LIST_TOOL, READ_TOOL, DOCS_TOOL, EXECUTE_TOOL]
+
+// The tool's host: runs one MCP tool of a code mode server, and answers its text.
+export type CodeHost = (server: string, tool: string, argsJson: string) => Promise<ToolOut, Error>
+
+// A tool as the stubs describe it: its name in code, its MCP name, and its MCP description and schema.
+export type CodeToolInfo = { py: string, name: string, description: string, schema: string }
+// A code mode server with its tools; name is the MCP client name.
+// instructions is the server's own guidance as a comment block ("" when it gave none)
+export type CodeEntry = { py: string, name: string, tools: CodeToolInfo[], instructions?: string }
+// The tools of one client, as the MCP manager lists them for a caller.
+export type CodeServerTools = { name: string, tools: McpTool[], instructions?: string }
+
+const IDENT_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+const MAX_STUB_DOC = 160
+
+export function isMetaTool(name: string): bool {
+  return name === LIST_TOOL || name === READ_TOOL || name === DOCS_TOOL || name === EXECUTE_TOOL
+}
+
+// The meta-tools that only read: they run unattended in the agent loop.
+export function isDiscoveryTool(name: string): bool {
+  return name === LIST_TOOL || name === READ_TOOL || name === DOCS_TOOL
+}
+
+// The limits with the configured values, and the defaults for every field left out or 0.
+export function limitsOf(cfg: CodeLimitsIn | undefined): CodeLimits {
+  const d = defaultCodeLimits()
+  if (cfg === undefined) return d
+  return {
+    max_source_bytes: (cfg.max_source_bytes ?? 0) > 0 ? cfg.max_source_bytes! : d.max_source_bytes,
+    max_steps: (cfg.max_steps ?? 0) > 0 ? cfg.max_steps! : d.max_steps,
+    max_memory_bytes: (cfg.max_memory_bytes ?? 0) > 0 ? cfg.max_memory_bytes! : d.max_memory_bytes,
+    max_log_bytes: (cfg.max_log_bytes ?? 0) > 0 ? cfg.max_log_bytes! : d.max_log_bytes,
+    max_tool_calls: (cfg.max_tool_calls ?? 0) > 0 ? cfg.max_tool_calls! : d.max_tool_calls,
+    max_value_bytes: (cfg.max_value_bytes ?? 0) > 0 ? cfg.max_value_bytes! : d.max_value_bytes,
+    max_nesting_depth: (cfg.max_nesting_depth ?? 0) > 1000 ? 1000 : (cfg.max_nesting_depth ?? 0) > 0 ? cfg.max_nesting_depth! : d.max_nesting_depth,
+  }
+}
+
+// "tool" for one stub file per tool; anything else is one stub file per server.
+export function bindingLevelOf(s: string | undefined): string {
+  return s === "tool" ? "tool" : "server"
+}
+
+// A name as Python reads it: ASCII letters, digits and "_", other characters become "_".
+export function pyName(s: string): string {
+  let out = ""
+  for (const c of s.chars()) out += IDENT_CHARS.includes(c) ? c : "_"
+  if (out === "") return "_"
+  const first = out.slice(0, 1)
+  if (first >= "0" && first <= "9") return "_" + out
+  return out
+}
+
+function uniquePy(base: string, inout used: string[]): string {
+  let name = base
+  let k = 2
+  while (used.includes(name)) {
+    name = base + "_" + `${k}`
+    k += 1
+  }
+  used.push(name)
+  return name
+}
+
+// The code mode servers of a caller, with the Python names their stubs and code use.
+export function codeEntries(list: CodeServerTools[]): CodeEntry[] {
+  let used: string[] = []
+  const out: CodeEntry[] = []
+  for (const sv of list) {
+    const tools: CodeToolInfo[] = []
+    let tused: string[] = []
+    for (const t of sv.tools) {
+      tools.push({ py: uniquePy(pyName(t.name), &tused), name: t.name, description: t.description, schema: t.inputSchemaRaw })
+    }
+    out.push({ py: uniquePy(pyName(sv.name), &used), name: sv.name, tools: tools, instructions: sv.instructions ?? "" })
+  }
+  return out
+}
+
+// The runner's view of the entries.
+export function runnerServers(entries: CodeEntry[]): CodeServer[] {
+  const out: CodeServer[] = []
+  for (const e of entries) {
+    const tools: CodeTool[] = []
+    for (const t of e.tools) tools.push({ py: t.py, name: t.name })
+    out.push({ py: e.py, name: e.name, tools: tools })
+  }
+  return out
+}
+
+// The OpenAI tool definitions of the four meta-tools.
+export function metaToolDefs(): string[] {
+  const noArgs = `{"type":"object","properties":{},"required":[]}`
+  const list = `{"type":"function","function":{"name":${quote(LIST_TOOL)},"description":${quote("Lists the virtual Python stub files (.pyi) of the code mode servers, one per server (or per tool, by server configuration). Read a file with readToolFile before writing code.")},"parameters":${noArgs}}}`
+  const read = `{"type":"function","function":{"name":${quote(READ_TOOL)},"description":${quote("Reads a virtual .pyi stub file from listToolFiles: the Python signatures of a server's tools. startLine and endLine (1-based, inclusive) read part of a file.")},"parameters":{"type":"object","properties":{"fileName":{"type":"string","description":"A path from listToolFiles, such as servers/youtube.pyi"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["fileName"]}}}`
+  const docs = `{"type":"function","function":{"name":${quote(DOCS_TOOL)},"description":${quote("Returns the full documentation of one tool of a code mode server, when the signature from readToolFile is not enough.")},"parameters":{"type":"object","properties":{"server":{"type":"string","description":"The server name, as in the stub files"},"tool":{"type":"string","description":"The tool name, as in the stub files"}},"required":["server","tool"]}}}`
+  const exec = `{"type":"function","function":{"name":${quote(EXECUTE_TOOL)},"description":${quote("Runs Python (Starlark) code in a sandbox, with the code mode servers as global objects. A tool is a synchronous call with keyword arguments: result = server.tool(param=\"value\"). Assign the value to result, and use print() for logs. There are no imports, classes or exceptions, and no file or network access. Each run has a fresh scope; read the stubs first.")},"parameters":{"type":"object","properties":{"code":{"type":"string","description":"The Python code to run"}},"required":["code"]}}}`
+  return [list, read, docs, exec]
+}
+
+// The first line of a description, flattened and cut short.
+function oneLine(s: string): string {
+  const flat = s.replaceAll("\r", " ").replaceAll("\n", " ").trim()
+  if (flat.byteLength <= MAX_STUB_DOC) return flat
+  return flat.slice(0, MAX_STUB_DOC) + "..."
+}
+
+function pyType(t: string | undefined): string {
+  if (t === "string") return "str"
+  if (t === "integer") return "int"
+  if (t === "number") return "float"
+  if (t === "boolean") return "bool"
+  if (t === "array") return "list"
+  if (t === "object") return "dict"
+  return "Any"
+}
+
+type Param = { name: string, type: string, desc: string, required: bool }
+
+// The parameters of a tool's JSON schema, required ones first. A name that is not a Python identifier
+// is left out of the signature (its call still takes it by its own name in the documentation).
+function paramsOf(schema: string): Param[] throws SyntaxError {
+  const out: Param[] = []
+  const fs = try fields(schema)
+  const propsRaw = find(fs, "properties")
+  if (propsRaw === undefined) return out
+  const req: string[] = []
+  const reqRaw = find(fs, "required")
+  if (reqRaw !== undefined) {
+    for (const el of try elements(reqRaw)) req.push(try decodeString(el))
+  }
+  for (const pf of try fields(propsRaw)) {
+    if (pyName(pf.key) !== pf.key) continue
+    const ps = try fields(pf.raw)
+    out.push({ name: pf.key, type: pyType(rawStr(ps, "type")), desc: rawStr(ps, "description") ?? "", required: req.includes(pf.key) })
+  }
+  const first = out.filter((p) => p.required)
+  const rest = out.filter((p) => !p.required)
+  return first.concat(rest)
+}
+
+// The Python signature of one tool: "def name(params) -> dict:".
+function signature(t: CodeToolInfo): string {
+  let ps: Param[] = []
+  try {
+    ps = paramsOf(t.schema)
+  } catch (e) {
+    ps = []
+  }
+  const parts: string[] = []
+  for (const p of ps) parts.push(p.required ? `${p.name}: ${p.type}` : `${p.name}: ${p.type} = None`)
+  return `def ${t.py}(${parts.join(", ")}) -> dict:`
+}
+
+// One tool's stub: its signature with the description as a comment.
+function stubOf(t: CodeToolInfo): string {
+  return `${signature(t)}  # ${oneLine(t.description)}`
+}
+
+// The stub file of a server: every tool of it.
+function serverStub(sv: CodeEntry): string {
+  const lines: string[] = [
+    `# ${sv.name} server tools`,
+    `# Usage: ${sv.py}.tool_name(param=value)`,
+    `# For detailed docs: use getToolDocs(server="${sv.name}", tool="tool_name")`,
+  ]
+  const ins = sv.instructions ?? ""
+  if (ins !== "") {
+    lines.push("#")
+    lines.push(ins.endsWith("\n") ? ins.slice(0, ins.byteLength - 1) : ins)
+  }
+  lines.push("")
+  for (const t of sv.tools) lines.push(stubOf(t))
+  return lines.join("\n")
+}
+
+// The stub file of one tool.
+function toolStub(sv: CodeEntry, t: CodeToolInfo): string {
+  const lines: string[] = [`# ${sv.name} tool ${t.name}`, `# Usage: ${sv.py}.${t.py}(param=value)`]
+  const ins = sv.instructions ?? ""
+  if (ins !== "") {
+    lines.push("#")
+    lines.push(ins.endsWith("\n") ? ins.slice(0, ins.byteLength - 1) : ins)
+  }
+  lines.push("")
+  lines.push(stubOf(t))
+  return lines.join("\n")
+}
+
+// The file names of a binding level, with the text of each.
+type StubFile = { path: string, text: string, server: string, tool: string }
+
+function stubFiles(entries: CodeEntry[], level: string): StubFile[] {
+  const out: StubFile[] = []
+  for (const sv of entries) {
+    if (level === "tool") {
+      for (const t of sv.tools) out.push({ path: `servers/${sv.py}/${t.py}.pyi`, text: toolStub(sv, t), server: sv.py, tool: t.py })
+    } else {
+      out.push({ path: `servers/${sv.py}.pyi`, text: serverStub(sv), server: sv.py, tool: "" })
+    }
+  }
+  return out
+}
+
+// What listToolFiles answers.
+export function listFilesText(entries: CodeEntry[], level: string): string {
+  if (entries.length === 0) return "No code mode servers are available."
+  const lines: string[] = ["servers/"]
+  for (const sv of entries) {
+    if (level === "tool") {
+      lines.push(`  ${sv.py}/`)
+      for (const t of sv.tools) lines.push(`    ${t.py}.pyi`)
+    } else {
+      lines.push(`  ${sv.py}.pyi`)
+    }
+  }
+  return lines.join("\n")
+}
+
+// What readToolFile answers: the lines of a stub file from startLine to endLine (1-based, inclusive).
+export function readFileText(entries: CodeEntry[], level: string, fileName: string, startLine: int, endLine: int): ToolOut {
+  for (const f of stubFiles(entries, level)) {
+    if (f.path !== fileName) continue
+    const all = f.text.split("\n")
+    const from = startLine > 0 ? startLine - 1 : 0
+    const to = endLine > 0 ? endLine : all.length
+    const shown: string[] = []
+    for (let i = from; i < to && i < all.length; i++) shown.push(all[i]!)
+    return { text: shown.join("\n"), isError: false }
+  }
+  return { text: `file not found: ${fileName}. Call listToolFiles for the available files.`, isError: true }
+}
+
+// The documentation of one tool: its signature, the description and each argument.
+function docsOf(sv: CodeEntry, t: CodeToolInfo): string {
+  let ps: Param[] = []
+  try {
+    ps = paramsOf(t.schema)
+  } catch (e) {
+    ps = []
+  }
+  const lines: string[] = [
+    `# Documentation for ${sv.py}.${t.py} (MCP tool ${t.name} of ${sv.name})`,
+    `# Call it with keyword arguments: result = ${sv.py}.${t.py}(param=value)`,
+  ]
+  const ins = sv.instructions ?? ""
+  if (ins !== "") {
+    lines.push("#")
+    lines.push(ins.endsWith("\n") ? ins.slice(0, ins.byteLength - 1) : ins)
+  }
+  const rest: string[] = [
+    "",
+    signature(t),
+    `    """`,
+    `    ${t.description.replaceAll("\"\"\"", "'''").trim().replaceAll("\n", "\n    ")}`,
+    "",
+    "    Args:",
+  ]
+  for (const r of rest) lines.push(r)
+  if (ps.length === 0) lines.push("        (none)")
+  for (const p of ps) {
+    const req = p.required ? "required" : "optional"
+    lines.push(`        ${p.name} (${p.type}, ${req}): ${p.desc.replaceAll("\n", " ")}`)
+  }
+  lines.push("    \"\"\"")
+  lines.push("    ...")
+  return lines.join("\n")
+}
+
+// What getToolDocs answers, by server and tool name (as the stubs name them, or the MCP name).
+export function toolDocsText(entries: CodeEntry[], server: string, tool: string): ToolOut {
+  for (const sv of entries) {
+    if (sv.py !== server && sv.name !== server) continue
+    for (const t of sv.tools) {
+      if (t.py === tool || t.name === tool) return { text: docsOf(sv, t), isError: false }
+    }
+    return { text: `server ${server} has no tool ${tool}. Call listToolFiles and readToolFile for the tools.`, isError: true }
+  }
+  return { text: `server ${server} is not a code mode server. Call listToolFiles for the servers.`, isError: true }
+}
+
+// A tool reference found in a program: the server and tool names, or tool "" when the program names a
+// server attribute that is not one of its tools.
+type Ref = { server: string, tool: string }
+
+// The tool references of a syntax tree, found from the attribute accesses on the server globals.
+function refsIn(nodes: Node[], servers: CodeServer[]): Ref[] {
+  const out: Ref[] = []
+  for (const n of nodes) {
+    if (n.kind === "attr" && n.args.length > 0 && n.args[0]!.kind === "name") {
+      const obj = n.args[0]!.s
+      for (const sv of servers) {
+        if (sv.py !== obj) continue
+        let tool = ""
+        for (const t of sv.tools) {
+          if (t.py === n.s) tool = t.name
+        }
+        out.push({ server: sv.name, tool: tool })
+      }
+    }
+    for (const r of refsIn(n.args, servers)) out.push(r)
+    for (const r of refsIn(n.body, servers)) out.push(r)
+  }
+  return out
+}
+
+// The tool references of a program: none when it does not parse (nothing can run then).
+function refsOf(code: string, servers: CodeServer[]): Ref[] {
+  try {
+    const prog = parseProgram(code)
+    return refsIn(prog.body, servers)
+  } catch (e) {
+    return []
+  }
+}
+
+// The code of an executeToolCode call's arguments, or undefined when they carry none.
+function codeArg(argsJson: string): string | undefined {
+  try {
+    return rawStr(fields(argsJson), "code")
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Whether every tool a program calls is on the auto-execute list (chat names, "*", or patterns). A
+// program that calls no tool, or does not parse, runs unattended too: it changes nothing.
+export function execAutoAllowed(argsJson: string, entries: CodeEntry[], auto: string[]): bool {
+  const code = codeArg(argsJson)
+  if (code === undefined) return false
+  const servers = runnerServers(entries)
+  for (const r of refsOf(code, servers)) {
+    if (r.tool === "") return false
+    const chat = chatToolName(r.server, r.tool)
+    if (auto.includes("*") || auto.includes(chat)) continue
+    let listed = false
+    for (const p of auto) {
+      if (patternMatches(chat, p)) listed = true
+    }
+    if (!listed) return false
+  }
+  return true
+}
+
+// The text of a finished run, in the words Bifrost uses for the model.
+export function runText(out: RunOutcome, entries: CodeEntry[]): ToolOut {
+  const keys = entries.map((e) => e.py).join(", ")
+  if (out.kind !== "done") return { text: "", isError: true }
+  if (!out.ok) {
+    const logs = out.logs.length > 0 ? "\n\nPrint output:\n" + out.logs.join("\n") : ""
+    return { text: `Execution runtime error:\n\n${out.errMsg}${logs}\n\nEnvironment:\n  Available server keys: ${keys}`, isError: true }
+  }
+  if (out.logs.length === 0 && out.resultJson === "") {
+    return { text: `Execution completed but produced no data: print() the values you need or assign the value to result.\n\nEnvironment:\n  Available server keys: ${keys}`, isError: true }
+  }
+  let text = out.logs.length > 0 ? "Print output:\n" + out.logs.join("\n") + "\n\nExecution completed successfully." : "Execution completed successfully."
+  if (out.resultJson !== "") text += "\nReturn value: " + out.resultJson
+  text += `\n\nEnvironment:\n  Available server keys: ${keys}`
+  text += "\nNote: This is a Starlark (Python subset) environment. Use MCP tools for external interactions."
+  return { text: text, isError: false }
+}
+
+// Runs a program: the runner suspends at each tool call, the host runs it, and the program runs again
+// with the result cached. The answer is the run's text.
+export async function runCode(code: string, entries: CodeEntry[], lim: CodeLimits, deadline: f64, host: CodeHost): Promise<ToolOut> {
+  if (code.byteLength > lim.max_source_bytes) return { text: `Execution compile error: code exceeds source limit (${lim.max_source_bytes} bytes)`, isError: true }
+  let prog: Program = { body: [] }
+  try {
+    prog = parseProgram(code)
+  } catch (e) {
+    return { text: `Execution syntax error:\n\n${e.message}\n\nEnvironment:\n  Available server keys: ${entries.map((x) => x.py).join(", ")}`, isError: true }
+  }
+  const servers = runnerServers(entries)
+  const cache: ToolOut[] = []
+  let steps = 0
+  let mem = 0
+  while (true) {
+    const out = runRound(prog, servers, lim, cache, deadline, steps, mem)
+    if (out.kind === "done") return runText(out, entries)
+    steps = out.steps
+    mem = out.mem
+    let r: ToolOut = { text: "", isError: false }
+    try {
+      r = await host(out.server, out.tool, out.argsJson)
+    } catch (e) {
+      r = { text: e.message, isError: true }
+    }
+    cache.push(r)
+  }
+}
+
+// Answers one meta-tool call. argsJson is the call's arguments; the host runs the nested tool calls of
+// executeToolCode. Bad arguments are an error answer, not a failure of the request.
+export async function runMeta(name: string, argsJson: string, entries: CodeEntry[], level: string, lim: CodeLimits, deadline: f64, host: CodeHost): Promise<ToolOut, Error> {
+  if (name === LIST_TOOL) return { text: listFilesText(entries, level), isError: false }
+  let fs: Field[] = []
+  try {
+    fs = try fields(argsJson)
+  } catch (e) {
+    return { text: `invalid arguments for ${name}: ${e.message}`, isError: true }
+  }
+  if (name === READ_TOOL) {
+    const fileName = rawStr(fs, "fileName") ?? ""
+    const start = Math.trunc(rawNum(fs, "startLine") ?? 0.0)
+    const end = Math.trunc(rawNum(fs, "endLine") ?? 0.0)
+    return readFileText(entries, level, fileName, start, end)
+  }
+  if (name === DOCS_TOOL) return toolDocsText(entries, rawStr(fs, "server") ?? "", rawStr(fs, "tool") ?? "")
+  if (name === EXECUTE_TOOL) {
+    const code = rawStr(fs, "code")
+    if (code === undefined) return { text: "code is required", isError: true }
+    return await runCode(code, entries, lim, deadline, host)
+  }
+  return { text: `unknown code mode tool ${name}`, isError: true }
+}
+
+test("pyName turns names into Python identifiers", () => {
+  expect(pyName("youtube")).toBe("youtube")
+  expect(pyName("my-server.v2")).toBe("my_server_v2")
+  expect(pyName("9lives")).toBe("_9lives")
+  expect(pyName("")).toBe("_")
+})
+
+test("limitsOf: configured values, defaults for missing or zero fields", () => {
+  const d = limitsOf(undefined)
+  expect(d.max_steps).toBe(1000000)
+  expect(d.max_tool_calls).toBe(64)
+  const c = limitsOf({ max_steps: 5000, max_tool_calls: 0, max_memory_bytes: 1024 })
+  expect(c.max_steps).toBe(5000)
+  expect(c.max_tool_calls).toBe(64)
+  expect(c.max_memory_bytes).toBe(1024)
+  expect(c.max_source_bytes).toBe(65536)
+  expect(bindingLevelOf("tool")).toBe("tool")
+  expect(bindingLevelOf(undefined)).toBe("server")
+  expect(bindingLevelOf("bogus")).toBe("server")
+})
+
+// The name of an OpenAI tool definition ("" when it does not parse).
+function fnNameOf(def: string): string {
+  try {
+    const fnRaw = find(try fields(def), "function")
+    if (fnRaw === undefined) return ""
+    return rawStr(try fields(fnRaw), "name") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+test("meta-tool definitions name the four tools", () => {
+  const defs = metaToolDefs()
+  expect(defs.length).toBe(4)
+  const names: string[] = []
+  for (const d of defs) names.push(fnNameOf(d))
+  expect(names).toEqual([LIST_TOOL, READ_TOOL, DOCS_TOOL, EXECUTE_TOOL])
+  expect(isMetaTool(EXECUTE_TOOL)).toBe(true)
+  expect(isMetaTool("youtube-search")).toBe(false)
+  expect(isDiscoveryTool(EXECUTE_TOOL)).toBe(false)
+  expect(isDiscoveryTool(READ_TOOL)).toBe(true)
+})
+
+// A two-server fixture: a search tool with a required and an optional argument, and a tool whose
+// name needs sanitizing. The schemas are plain JSON text.
+function fixture(): CodeEntry[] {
+  const search: McpTool = { name: "search", description: "Search for videos.\nSecond line.", inputSchemaRaw: `{"type":"object","properties":{"maxResults":{"type":"integer","description":"Max results"},"query":{"type":"string","description":"What to find"}},"required":["query"]}` }
+  const get: McpTool = { name: "get-video", description: "Get one video", inputSchemaRaw: `{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}` }
+  return codeEntries([{ name: "youtube", tools: [search, get] }, { name: "fs", tools: [] }])
+}
+
+test("a server's own instructions ride in its stub files and docs, as comments", () => {
+  const block = "# ---- server instructions (from the upstream handshake) ----\n# Search first.\n# ---- end server instructions ----\n"
+  const entries = codeEntries([{ name: "docs", tools: [{ name: "find", description: "Find a page", inputSchemaRaw: "{}" }], instructions: block }])
+  const file = readFileText(entries, "server", "servers/docs.pyi", 0, 0)
+  expect(file.text.includes("#\n# ---- server instructions (from the upstream handshake) ----\n# Search first.\n# ---- end server instructions ----\n\ndef find")).toBe(true)
+  const tool = readFileText(entries, "tool", "servers/docs/find.pyi", 0, 0)
+  expect(tool.text.includes("# Search first.")).toBe(true)
+  expect(toolDocsText(entries, "docs", "find").text.includes("# Search first.")).toBe(true)
+  const none = codeEntries([{ name: "docs", tools: [{ name: "find", description: "Find a page", inputSchemaRaw: "{}" }] }])
+  expect(readFileText(none, "server", "servers/docs.pyi", 0, 0).text.includes("server instructions")).toBe(false)
+})
+
+test("stubs: server and tool files, required arguments first, sanitized names", () => {
+  const entries = fixture()
+  expect(entries[0]!.py).toBe("youtube")
+  expect(entries[0]!.tools[1]!.py).toBe("get_video")
+  const list = listFilesText(entries, "server")
+  expect(list).toBe("servers/\n  youtube.pyi\n  fs.pyi")
+  expect(listFilesText(entries, "tool")).toBe("servers/\n  youtube/\n    search.pyi\n    get_video.pyi\n  fs/")
+  const file = readFileText(entries, "server", "servers/youtube.pyi", 0, 0)
+  expect(file.isError).toBe(false)
+  expect(file.text.includes("def search(query: str, maxResults: int = None) -> dict:  # Search for videos. Second line.")).toBe(true)
+  expect(file.text.includes("def get_video(id: str) -> dict:  # Get one video")).toBe(true)
+  expect(file.text.includes("# Usage: youtube.tool_name(param=value)")).toBe(true)
+  const part = readFileText(entries, "server", "servers/youtube.pyi", 5, 5)
+  expect(part.text).toBe("def search(query: str, maxResults: int = None) -> dict:  # Search for videos. Second line.")
+  const tool = readFileText(entries, "tool", "servers/youtube/get_video.pyi", 0, 0)
+  expect(tool.text.includes("def get_video(id: str) -> dict:")).toBe(true)
+  const missing = readFileText(entries, "server", "servers/nope.pyi", 0, 0)
+  expect(missing.isError).toBe(true)
+})
+
+test("getToolDocs: the signature, the description and each argument", () => {
+  const entries = fixture()
+  const d = toolDocsText(entries, "youtube", "search")
+  expect(d.isError).toBe(false)
+  expect(d.text.includes("query (str, required): What to find")).toBe(true)
+  expect(d.text.includes("maxResults (int, optional): Max results")).toBe(true)
+  expect(toolDocsText(entries, "youtube", "get-video").isError).toBe(false)
+  expect(toolDocsText(entries, "youtube", "nope").isError).toBe(true)
+  expect(toolDocsText(entries, "nope", "search").isError).toBe(true)
+})
+
+test("execAutoAllowed: every tool a program calls must be on the list", () => {
+  const entries = fixture()
+  const ok = "{\"code\":\"r = youtube.search(query = 'x')\\nresult = r\"}"
+  expect(execAutoAllowed(ok, entries, ["youtube-search"])).toBe(true)
+  expect(execAutoAllowed(ok, entries, ["youtube-*"])).toBe(true)
+  expect(execAutoAllowed(ok, entries, [])).toBe(false)
+  const two = "{\"code\":\"youtube.search(query = 'x')\\nyoutube.get_video(id = '1')\"}"
+  expect(execAutoAllowed(two, entries, ["youtube-search"])).toBe(false)
+  expect(execAutoAllowed(two, entries, ["*"])).toBe(true)
+  // a server attribute that is not a tool is never allowed
+  expect(execAutoAllowed("{\"code\":\"youtube.delete(id = '1')\"}", entries, ["*"])).toBe(false)
+  // a program with no tool calls, or one that does not parse, runs unattended
+  expect(execAutoAllowed("{\"code\":\"result = 1 + 1\"}", entries, [])).toBe(true)
+  expect(execAutoAllowed("{\"code\":\"result = (\"}", entries, [])).toBe(true)
+  expect(execAutoAllowed("{\"other\":1}", entries, ["*"])).toBe(false)
+})
+
+test("runText: values, prints and errors in the model's words", () => {
+  const entries = fixture()
+  const okOut = runText({ kind: "done", ok: true, resultJson: "[1]", logs: ["hi"], errMsg: "", steps: 0, mem: 0 }, entries)
+  expect(okOut.isError).toBe(false)
+  expect(okOut.text.includes("Print output:\nhi\n\nExecution completed successfully.\nReturn value: [1]")).toBe(true)
+  expect(okOut.text.includes("Available server keys: youtube, fs")).toBe(true)
+  const bad = runText({ kind: "done", ok: false, resultJson: "", logs: [], errMsg: "name 'x' is not defined", steps: 0, mem: 0 }, entries)
+  expect(bad.isError).toBe(true)
+  expect(bad.text.startsWith("Execution runtime error:\n\nname 'x' is not defined")).toBe(true)
+  const empty = runText({ kind: "done", ok: true, resultJson: "", logs: [], errMsg: "", steps: 0, mem: 0 }, entries)
+  expect(empty.isError).toBe(true)
+})

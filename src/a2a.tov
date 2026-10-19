@@ -1,0 +1,1124 @@
+// The A2A protocol as the gateway speaks it (agents.tov holds the registrations, ops.tov the routes).
+//
+// A caller reaches an agent through the gateway's JSON-RPC binding (POST .../json-rpc) or its REST binding
+// (.../rest/...), and the agent's card may offer either. Every call is brought to one shape, an operation
+// under its v1 name with its parameters as a JSON object, and is sent on in whichever binding the agent
+// offers: the REST routes map to the JSON-RPC methods and back (message:send is SendMessage, tasks/{id}:cancel
+// is CancelTask, ...), results and errors included. The v0.3 method names (message/send, tasks/resubscribe,
+// tasks/pushNotificationConfig/set, ...) are accepted too and answered in the same dialect.
+//
+// Not done here: translating message shapes between protocol versions. A body is sent on as it came.
+import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString, quote, build, setField, isNull } from "./json"
+
+// ---- operations ----
+
+type OpInfo = { op: string, v03: string, stream: bool }
+
+function opTable(): OpInfo[] {
+  return [
+    { op: "SendMessage", v03: "message/send", stream: false },
+    { op: "SendStreamingMessage", v03: "message/stream", stream: true },
+    { op: "GetTask", v03: "tasks/get", stream: false },
+    { op: "ListTasks", v03: "tasks/list", stream: false },
+    { op: "CancelTask", v03: "tasks/cancel", stream: false },
+    { op: "SubscribeToTask", v03: "tasks/resubscribe", stream: true },
+    { op: "CreateTaskPushNotificationConfig", v03: "tasks/pushNotificationConfig/set", stream: false },
+    { op: "GetTaskPushNotificationConfig", v03: "tasks/pushNotificationConfig/get", stream: false },
+    { op: "ListTaskPushNotificationConfigs", v03: "tasks/pushNotificationConfig/list", stream: false },
+    { op: "DeleteTaskPushNotificationConfig", v03: "tasks/pushNotificationConfig/delete", stream: false },
+    { op: "GetExtendedAgentCard", v03: "agent/getAuthenticatedExtendedCard", stream: false },
+  ]
+}
+
+// Every method name the gateway proxies: the v1 names and the v0.3 names.
+export function methodNames(): string[] {
+  const out: string[] = []
+  for (const o of opTable()) {
+    out.push(o.op)
+    out.push(o.v03)
+  }
+  return out
+}
+
+// The operation (v1 name) a method name stands for, and whether the name is the v0.3 one.
+export function opOfMethod(method: string): { op: string, v03: bool } | undefined {
+  for (const o of opTable()) {
+    if (o.op === method) return { op: o.op, v03: false }
+    if (o.v03 === method) return { op: o.op, v03: true }
+  }
+  return undefined
+}
+
+// The method name of an operation in a dialect.
+export function methodOf(op: string, v03: bool): string {
+  for (const o of opTable()) {
+    if (o.op === op) return v03 ? o.v03 : o.op
+  }
+  return op
+}
+
+export function isStreamOp(op: string): bool {
+  for (const o of opTable()) {
+    if (o.op === op) return o.stream
+  }
+  return false
+}
+
+export function isPushOp(op: string): bool {
+  return op === "CreateTaskPushNotificationConfig" || op === "GetTaskPushNotificationConfig" || op === "ListTaskPushNotificationConfigs" || op === "DeleteTaskPushNotificationConfig"
+}
+
+// ---- calls ----
+
+// One call, whatever binding it came in on. params is a JSON object whose top-level keys are camelCase.
+export type Call = { op: string, v03: bool, params: string, stream: bool, taskId: string, configId: string }
+export type Routed = { kind: "call", call: Call } | { kind: "fail", status: int, code: int, message: string }
+
+function failed(status: int, code: int, message: string): Routed {
+  return { kind: "fail", status: status, code: code, message: message }
+}
+
+function objectFields(text: string): Field[] | undefined {
+  if (!text.startsWith("{")) return undefined
+  try {
+    return fields(text)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// snake_case -> lowerCamelCase (the ProtoJSON name of a proto field).
+export function camelOf(name: string): string {
+  const parts = name.split("_")
+  let out = parts[0] ?? ""
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i]!
+    if (p === "") continue
+    out += p.slice(0, 1).toUpperCase() + p.slice(1)
+  }
+  return out
+}
+
+// A v1 request may use proto field names (task_id) where the JSON names (taskId) are expected: the top-level
+// params keys with an underscore are renamed unless the camelCase key is there too. Nested maps are left alone.
+export function camelKeys(params: string): string {
+  const fs = objectFields(params)
+  if (fs === undefined) return params
+  let changed = false
+  const out: Field[] = []
+  for (const f of fs) {
+    if (f.key.includes("_")) {
+      const c = camelOf(f.key)
+      if (find(fs, c) === undefined) {
+        out.push({ key: c, raw: f.raw })
+        changed = true
+        continue
+      }
+    }
+    out.push(f)
+  }
+  return changed ? build(out) : params
+}
+
+function strOf(raw: string | undefined): string {
+  if (raw === undefined || !raw.startsWith("\"")) return ""
+  try {
+    return decodeString(raw)
+  } catch (e) {
+    return ""
+  }
+}
+
+function strField(params: string, key: string): string {
+  const fs = objectFields(params)
+  return fs === undefined ? "" : strOf(find(fs, key))
+}
+
+// The task and push config a call names, for the log and the push store.
+function idsOf(op: string, v03: bool, params: string): { taskId: string, configId: string } {
+  if (!isPushOp(op)) return { taskId: strField(params, "id"), configId: "" }
+  if (!v03) {
+    if (op === "CreateTaskPushNotificationConfig" || op === "GetTaskPushNotificationConfig" || op === "DeleteTaskPushNotificationConfig") return { taskId: strField(params, "taskId"), configId: strField(params, "id") }
+    return { taskId: strField(params, "taskId"), configId: "" }
+  }
+  if (op === "CreateTaskPushNotificationConfig") {
+    const fs = objectFields(params)
+    const inner = fs === undefined ? undefined : objectFields(find(fs, "pushNotificationConfig") ?? "")
+    return { taskId: strField(params, "taskId"), configId: inner === undefined ? "" : strOf(find(inner, "id")) }
+  }
+  if (op === "GetTaskPushNotificationConfig" || op === "DeleteTaskPushNotificationConfig") return { taskId: strField(params, "id"), configId: strField(params, "pushNotificationConfigId") }
+  return { taskId: strField(params, "id"), configId: "" }
+}
+
+function callOf(op: string, v03: bool, params: string): Call {
+  const ids = idsOf(op, v03, params)
+  return { op: op, v03: v03, params: params, stream: isStreamOp(op), taskId: ids.taskId, configId: ids.configId }
+}
+
+// The JSON-RPC id of a request, as raw JSON ("null" when it has none).
+export function rpcIdOf(body: string): string {
+  const fs = objectFields(body)
+  if (fs === undefined) return "null"
+  return find(fs, "id") ?? "null"
+}
+
+// A JSON-RPC request body as a call.
+export function rpcCall(body: string): Routed {
+  const fs = objectFields(body)
+  if (fs === undefined) return failed(400, -32600, "invalid request: not a JSON-RPC call")
+  const method = rawStr(fs, "method") ?? ""
+  if (method === "") return failed(400, -32600, "invalid request: not a JSON-RPC call")
+  const o = opOfMethod(method)
+  if (o === undefined) return failed(200, -32601, `method not found: ${method}`)
+  const raw = find(fs, "params")
+  let params = "{}"
+  if (raw !== undefined && !isNull(raw)) {
+    if (!raw.startsWith("{")) return failed(200, -32602, "invalid params: expected an object")
+    params = camelKeys(raw)
+  }
+  return { kind: "call", call: callOf(o.op, o.v03, params) }
+}
+
+// ---- percent-encoding of path ids ----
+
+const HEX = "0123456789ABCDEF"
+
+function hexVal(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 65 && c <= 70) return c - 55
+  if (c >= 97 && c <= 102) return c - 87
+  return -1
+}
+
+// A path segment with its %XX escapes decoded (an invalid escape is kept as it is).
+export function pctDecode(s: string): string {
+  if (!s.includes("%")) return s
+  const b = new TextEncoder().encode(s)
+  const out: u8[] = []
+  let i = 0
+  while (i < b.length) {
+    const c = int(b[i]!)
+    if (c === 37 && i + 2 < b.length + 0 && hexVal(int(b[i + 1]!)) >= 0 && hexVal(int(b[i + 2]!)) >= 0) {
+      out.push(u8(hexVal(int(b[i + 1]!)) * 16 + hexVal(int(b[i + 2]!))))
+      i += 3
+    } else {
+      out.push(b[i]!)
+      i += 1
+    }
+  }
+  try {
+    return new TextDecoder().decode(out)
+  } catch (e) {
+    return s
+  }
+}
+
+// A path segment with everything but letters, digits and "-._~" escaped.
+export function pctEncode(s: string): string {
+  const keep = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+  let out = ""
+  for (const ch of s.chars()) {
+    if (ch.byteLength === 1 && keep.includes(ch)) {
+      out += ch
+      continue
+    }
+    const b = new TextEncoder().encode(ch)
+    for (let i = 0; i < b.length; i++) {
+      const c = int(b[i]!)
+      out += "%" + HEX.slice(c >> 4, (c >> 4) + 1) + HEX.slice(c & 15, (c & 15) + 1)
+    }
+  }
+  return out
+}
+
+// ---- the REST binding ----
+
+function roots(): string[] {
+  return ["message:send", "message:stream", "tasks", "extendedAgentCard"]
+}
+
+// The query of a REST call as params: whole numbers and booleans keep their type.
+function queryParams(query: string, ints: string[], bools: string[], extra: Field[]): string {
+  const sp = new URLSearchParams(query)
+  const out: Field[] = []
+  for (const f of extra) out.push(f)
+  for (const k of sp.keys()) {
+    const v = sp.get(k) ?? ""
+    const key = camelOf(k)
+    if (ints.includes(key)) {
+      const n = parseInt(v)
+      if (n !== undefined) out.push({ key: key, raw: `${n}` })
+    } else if (bools.includes(key)) {
+      out.push({ key: key, raw: v === "true" ? "true" : "false" })
+    } else {
+      out.push({ key: key, raw: quote(v) })
+    }
+  }
+  return build(out)
+}
+
+// The body of a REST call as a JSON object ("" is an empty one).
+function bodyObject(body: string): string | undefined {
+  const t = body.trim()
+  if (t === "") return "{}"
+  return t.startsWith("{") ? camelKeys(t) : undefined
+}
+
+// A REST request under .../rest as a call. path is what follows "rest" (like "/message:send"), query the
+// raw query string without "?". A leading tenant segment is accepted and dropped.
+export function restCall(method: string, path: string, query: string, body: string): Routed {
+  let segs: string[] = []
+  for (const s of path.split("/")) {
+    if (s !== "") segs.push(pctDecode(s))
+  }
+  if (segs.length > 1 && !roots().includes(segs[0]!)) segs = segs.slice(1)
+  if (segs.length === 0) return failed(404, -32601, "no such REST route")
+  const head = segs[0]!
+  const wrong = (): Routed => failed(405, -32601, `${method} is not allowed on this route`)
+  if (head === "message:send" || head === "message:stream") {
+    if (segs.length !== 1) return failed(404, -32601, "no such REST route")
+    if (method !== "POST") return wrong()
+    const p = bodyObject(body)
+    if (p === undefined) return failed(400, -32602, "invalid params: the request body must be a JSON object")
+    return { kind: "call", call: callOf(head === "message:send" ? "SendMessage" : "SendStreamingMessage", false, p) }
+  }
+  if (head === "extendedAgentCard") {
+    if (segs.length !== 1) return failed(404, -32601, "no such REST route")
+    if (method !== "GET") return wrong()
+    return { kind: "call", call: callOf("GetExtendedAgentCard", false, "{}") }
+  }
+  if (head !== "tasks") return failed(404, -32601, "no such REST route")
+  if (segs.length === 1) {
+    if (method !== "GET") return wrong()
+    return { kind: "call", call: callOf("ListTasks", false, queryParams(query, ["pageSize", "historyLength"], ["includeArtifacts"], [])) }
+  }
+  // tasks/{id}, tasks/{id}:cancel, tasks/{id}:subscribe
+  let id = segs[1]!
+  let verb = ""
+  const pieces = id.split(":")
+  if (pieces.length > 1) {
+    const tail = pieces[pieces.length - 1]!
+    if (tail === "cancel" || tail === "subscribe") {
+      verb = tail
+      id = pieces.slice(0, pieces.length - 1).join(":")
+    }
+  }
+  if (segs.length === 2) {
+    const idf: Field[] = [{ key: "id", raw: quote(id) }]
+    if (verb === "cancel") {
+      if (method !== "POST") return wrong()
+      const extra = bodyObject(body)
+      if (extra === undefined) return failed(400, -32602, "invalid params: the request body must be a JSON object")
+      let fs = objectFields(extra) ?? []
+      setField(&fs, "id", quote(id))
+      return { kind: "call", call: callOf("CancelTask", false, build(fs)) }
+    }
+    if (verb === "subscribe") {
+      if (method !== "POST" && method !== "GET") return wrong()
+      return { kind: "call", call: callOf("SubscribeToTask", false, build(idf)) }
+    }
+    if (method !== "GET") return wrong()
+    return { kind: "call", call: callOf("GetTask", false, queryParams(query, ["historyLength"], [], idf)) }
+  }
+  if (segs[2]! !== "pushNotificationConfigs" || verb !== "") return failed(404, -32601, "no such REST route")
+  const task: Field[] = [{ key: "taskId", raw: quote(id) }]
+  if (segs.length === 3) {
+    if (method === "POST") {
+      const p = bodyObject(body)
+      if (p === undefined) return failed(400, -32602, "invalid params: the request body must be a JSON object")
+      let fs = objectFields(p) ?? []
+      // a body that wraps the config ({"config": {...}}) is unwrapped
+      const inner = objectFields(find(fs, "config") ?? "")
+      if (inner !== undefined) {
+        const cid = strOf(find(fs, "configId"))
+        fs = inner
+        if (cid !== "" && find(fs, "id") === undefined) setField(&fs, "id", quote(cid))
+      }
+      setField(&fs, "taskId", quote(id))
+      return { kind: "call", call: callOf("CreateTaskPushNotificationConfig", false, build(fs)) }
+    }
+    if (method === "GET") return { kind: "call", call: callOf("ListTaskPushNotificationConfigs", false, queryParams(query, ["pageSize"], [], task)) }
+    return wrong()
+  }
+  if (segs.length === 4) {
+    const both: Field[] = [{ key: "taskId", raw: quote(id) }, { key: "id", raw: quote(segs[3]!) }]
+    if (method === "GET") return { kind: "call", call: callOf("GetTaskPushNotificationConfig", false, build(both)) }
+    if (method === "DELETE") return { kind: "call", call: callOf("DeleteTaskPushNotificationConfig", false, build(both)) }
+    return wrong()
+  }
+  return failed(404, -32601, "no such REST route")
+}
+
+// A REST request: the method, the path after the base, the query and the body.
+export type RestRequest = { method: string, path: string, query: string, body: string }
+
+function queryOf(params: string, skip: string[]): string {
+  const fs = objectFields(params) ?? []
+  const parts: string[] = []
+  for (const f of fs) {
+    if (skip.includes(f.key)) continue
+    if (f.raw.startsWith("{") || f.raw.startsWith("[") || f.raw === "null") continue
+    const v = f.raw.startsWith("\"") ? strOf(f.raw) : f.raw
+    parts.push(pctEncode(f.key) + "=" + pctEncode(v))
+  }
+  return parts.join("&")
+}
+
+// The REST request that stands for a call, for an agent that offers only the REST binding.
+export function restRequestOf(call: Call): RestRequest {
+  const tid = pctEncode(call.taskId)
+  const fs = objectFields(call.params) ?? []
+  if (call.op === "SendMessage") return { method: "POST", path: "/message:send", query: "", body: call.params }
+  if (call.op === "SendStreamingMessage") return { method: "POST", path: "/message:stream", query: "", body: call.params }
+  if (call.op === "GetTask") return { method: "GET", path: "/tasks/" + tid, query: queryOf(call.params, ["id"]), body: "" }
+  if (call.op === "ListTasks") return { method: "GET", path: "/tasks", query: queryOf(call.params, []), body: "" }
+  if (call.op === "CancelTask") return { method: "POST", path: "/tasks/" + tid + ":cancel", query: "", body: build(without(fs, ["id"])) }
+  if (call.op === "SubscribeToTask") return { method: "POST", path: "/tasks/" + tid + ":subscribe", query: "", body: "" }
+  if (call.op === "CreateTaskPushNotificationConfig") return { method: "POST", path: "/tasks/" + tid + "/pushNotificationConfigs", query: "", body: build(without(fs, ["taskId"])) }
+  if (call.op === "GetTaskPushNotificationConfig") return { method: "GET", path: "/tasks/" + tid + "/pushNotificationConfigs/" + pctEncode(call.configId), query: "", body: "" }
+  if (call.op === "DeleteTaskPushNotificationConfig") return { method: "DELETE", path: "/tasks/" + tid + "/pushNotificationConfigs/" + pctEncode(call.configId), query: "", body: "" }
+  if (call.op === "ListTaskPushNotificationConfigs") return { method: "GET", path: "/tasks/" + tid + "/pushNotificationConfigs", query: queryOf(call.params, ["taskId"]), body: "" }
+  return { method: "GET", path: "/extendedAgentCard", query: "", body: "" }
+}
+
+function without(fs: Field[], keys: string[]): Field[] {
+  const out: Field[] = []
+  for (const f of fs) {
+    if (!keys.includes(f.key)) out.push(f)
+  }
+  return out
+}
+
+// ---- errors ----
+
+// The HTTP status and the status name (google.rpc.Code) of a JSON-RPC error code.
+export function httpOfCode(code: int): int {
+  if (code === -32001) return 404
+  if (code === -32002) return 409
+  if (code === -32003 || code === -32004 || code === -32007 || code === -32008 || code === -32009) return 400
+  if (code === -32005) return 415
+  if (code === -32006) return 502
+  if (code === -32600 || code === -32602 || code === -32700) return 400
+  if (code === -32601) return 404
+  if (code === -31401) return 401
+  return 500
+}
+
+export function statusNameOf(code: int): string {
+  if (code === -32001 || code === -32601) return "NOT_FOUND"
+  if (code === -32002 || code === -32007 || code === -32008 || code === -32009) return "FAILED_PRECONDITION"
+  if (code === -32003 || code === -32004) return "UNIMPLEMENTED"
+  if (code === -32005 || code === -32600 || code === -32602 || code === -32700) return "INVALID_ARGUMENT"
+  if (code === -31401) return "UNAUTHENTICATED"
+  return "INTERNAL"
+}
+
+function reasonOf(code: int): string {
+  if (code === -32001) return "TASK_NOT_FOUND"
+  if (code === -32002) return "TASK_NOT_CANCELABLE"
+  if (code === -32003) return "PUSH_NOTIFICATION_NOT_SUPPORTED"
+  if (code === -32004) return "UNSUPPORTED_OPERATION"
+  if (code === -32005) return "CONTENT_TYPE_NOT_SUPPORTED"
+  if (code === -32006) return "INVALID_AGENT_RESPONSE"
+  if (code === -32007) return "EXTENDED_AGENT_CARD_NOT_CONFIGURED"
+  if (code === -32008) return "EXTENSION_SUPPORT_REQUIRED"
+  if (code === -32009) return "VERSION_NOT_SUPPORTED"
+  if (code === -31401) return "UNAUTHENTICATED"
+  return ""
+}
+
+function codeOfReason(r: string): int {
+  for (const c of [-32001, -32002, -32003, -32004, -32005, -32006, -32007, -32008, -32009, -31401]) {
+    if (reasonOf(c) === r) return c
+  }
+  return 0
+}
+
+// A REST error body for a JSON-RPC error code.
+export function restErrorBody(code: int, message: string): string {
+  const status = httpOfCode(code)
+  const reason = reasonOf(code)
+  const details = reason === "" ? "" : `,"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":${quote(reason)},"domain":"a2a-protocol.org"}]`
+  return `{"error":{"code":${status},"status":${quote(statusNameOf(code))},"message":${quote(message)}${details}}}`
+}
+
+// The JSON-RPC error code of a REST error answer: the A2A reason when it names one, else the status.
+export function codeOfRestError(status: int, body: string): { code: int, message: string } {
+  const fs = objectFields(body)
+  const ef = fs === undefined ? undefined : objectFields(find(fs, "error") ?? "")
+  const message = ef === undefined ? `HTTP ${status}` : (strOf(find(ef, "message")) === "" ? `HTTP ${status}` : strOf(find(ef, "message")))
+  if (ef !== undefined) {
+    const dr = find(ef, "details")
+    if (dr !== undefined) {
+      try {
+        for (const d of elements(dr)) {
+          const df = objectFields(d)
+          if (df === undefined) continue
+          const c = codeOfReason(strOf(find(df, "reason")))
+          if (c !== 0) return { code: c, message: message }
+        }
+      } catch (e) {
+        // no usable details
+      }
+    }
+  }
+  if (status === 404) return { code: -32001, message: message }
+  if (status === 409) return { code: -32002, message: message }
+  if (status === 400 || status === 422) return { code: -32602, message: message }
+  if (status === 415) return { code: -32005, message: message }
+  if (status === 401) return { code: -31401, message: message }
+  return { code: -32603, message: message }
+}
+
+// The status name (google.rpc.Code) of an HTTP status, for errors the gateway itself answers on the REST binding.
+export function statusNameOfHttp(status: int): string {
+  if (status === 401) return "UNAUTHENTICATED"
+  if (status === 403) return "PERMISSION_DENIED"
+  if (status === 404) return "NOT_FOUND"
+  if (status === 405 || status === 501) return "UNIMPLEMENTED"
+  if (status === 409) return "FAILED_PRECONDITION"
+  if (status === 429) return "RESOURCE_EXHAUSTED"
+  if (status === 502 || status === 503) return "UNAVAILABLE"
+  if (status >= 500) return "INTERNAL"
+  return "INVALID_ARGUMENT"
+}
+
+// A REST error body for an HTTP status.
+export function restErrorOfStatus(status: int, message: string): string {
+  return `{"error":{"code":${status},"status":${quote(statusNameOfHttp(status))},"message":${quote(message)}}}`
+}
+
+export function rpcErrorBody(id: string, code: int, message: string): string {
+  return `{"jsonrpc":"2.0","id":${id},"error":{"code":${code},"message":${quote(message)}}}`
+}
+
+// ---- results between the bindings ----
+
+export type Plain = { status: int, body: string }
+
+// A JSON-RPC answer as the REST answer to the same call: the result as it is, or the error as a REST error.
+export function restFromRpc(text: string): Plain {
+  const fs = objectFields(text)
+  if (fs === undefined) return { status: 502, body: restErrorBody(-32006, "the agent's answer is not a JSON-RPC response") }
+  const er = find(fs, "error")
+  if (er !== undefined && !isNull(er)) {
+    const ef = objectFields(er)
+    const code = ef === undefined ? -32603 : Math.floor(rawNum(ef, "code") ?? -32603.0)
+    const msg = ef === undefined ? "the agent failed" : (rawStr(ef, "message") ?? "the agent failed")
+    return { status: httpOfCode(code), body: restErrorBody(code, msg) }
+  }
+  const res = find(fs, "result")
+  if (res === undefined) return { status: 502, body: restErrorBody(-32006, "the agent's answer has no result") }
+  return { status: 200, body: res }
+}
+
+// A REST answer as the JSON-RPC answer to the call with this id.
+export function rpcFromRest(id: string, status: number, body: string): string {
+  if (status >= 200 && status < 300) return `{"jsonrpc":"2.0","id":${id},"result":${body.trim() === "" ? "{}" : body}}`
+  const e = codeOfRestError(Math.floor(status), body)
+  return rpcErrorBody(id, e.code, e.message)
+}
+
+// ---- server-sent events ----
+
+// Splits a stream of text into its events, keeping what has not ended yet. An event's payload is the
+// lines that start with "data:", joined by newlines.
+export class SseSplitter {
+  buf = ""
+
+  push(text: string): string[] {
+    this.buf += text.replaceAll("\r\n", "\n")
+    const out: string[] = []
+    while (true) {
+      const i = this.buf.indexOf("\n\n")
+      if (i < 0) break
+      const ev = this.buf.slice(0, i)
+      this.buf = this.buf.slice(i + 2, this.buf.byteLength)
+      const d = dataOf(ev)
+      if (d !== undefined) out.push(d)
+    }
+    return out
+  }
+
+  // What is left when the stream ends.
+  rest(): string | undefined {
+    const d = dataOf(this.buf)
+    this.buf = ""
+    return d
+  }
+}
+
+function dataOf(ev: string): string | undefined {
+  const lines: string[] = []
+  for (const l of ev.split("\n")) {
+    if (l.startsWith("data:")) lines.push(l.startsWith("data: ") ? l.slice(6) : l.slice(5))
+  }
+  return lines.length === 0 ? undefined : lines.join("\n")
+}
+
+class MapRelay {
+  ctl: ReadableStreamDefaultController | undefined = undefined
+  cancelled = false
+}
+
+// The caller's stream of an upstream event stream, each event's payload passed through map. The copy runs in
+// the background, and a caller that goes away stops it.
+export function relayMapped(upstream: ReadableStream, map: (data: string) => string): ReadableStream {
+  const rl = new MapRelay()
+  const out = new ReadableStream({
+    start: (c) => {
+      rl.ctl = c
+    },
+    cancel: () => {
+      rl.cancelled = true
+    },
+  })
+  copyMapped(upstream, rl, map)
+  return out
+}
+
+function emit(rl: MapRelay, payload: string): void {
+  const c = rl.ctl
+  if (c !== undefined && !rl.cancelled) c.enqueue(new TextEncoder().encode("data: " + payload + "\n\n"))
+}
+
+async function copyMapped(upstream: ReadableStream, rl: MapRelay, map: (data: string) => string): Promise<void> {
+  const split = new SseSplitter()
+  try {
+    const dec = new TextDecoder()
+    const reader = upstream.getReader()
+    while (!rl.cancelled) {
+      const r = await reader.read()
+      if (r.done) break
+      const v = r.value
+      if (v === undefined) continue
+      for (const d of split.push(dec.decode(v, { stream: true }))) emit(rl, map(d))
+    }
+    const tail = split.rest()
+    if (tail !== undefined) emit(rl, map(tail))
+  } catch (e) {
+    console.error(`raiju: a2a stream relay: ${e.message}`)
+  }
+  const c = rl.ctl
+  if (c !== undefined && !rl.cancelled) {
+    try {
+      c.close()
+    } catch (e) {
+      // already closed by the caller
+    }
+  }
+}
+
+// One SSE payload of a JSON-RPC stream as a REST stream payload: its result. An error event ends the stream
+// as a REST error body.
+export function restEvent(data: string): string {
+  const fs = objectFields(data)
+  if (fs === undefined) return data
+  const er = find(fs, "error")
+  if (er !== undefined && !isNull(er)) {
+    const p = restFromRpc(data)
+    return p.body
+  }
+  return find(fs, "result") ?? data
+}
+
+// One REST stream payload as a JSON-RPC stream payload for the call with this id.
+export function rpcEvent(id: string, data: string): string {
+  const fs = objectFields(data)
+  if (fs !== undefined && find(fs, "error") !== undefined && find(fs, "result") === undefined && find(fs, "jsonrpc") === undefined) {
+    const ef = objectFields(find(fs, "error") ?? "")
+    const status = ef === undefined ? 500 : Math.floor(rawNum(ef, "code") ?? 500.0)
+    const e = codeOfRestError(status, data)
+    return rpcErrorBody(id, e.code, e.message)
+  }
+  return `{"jsonrpc":"2.0","id":${id},"result":${data}}`
+}
+
+// ---- push notification configurations ----
+
+// A push config as a caller sends it. error names the first problem ("" when the config is usable).
+export type PushSpec = { taskId: string, configId: string, url: string, token: string, scheme: string, credentials: string, error: string }
+
+function badSpec(taskId: string, error: string): PushSpec {
+  return { taskId: taskId, configId: "", url: "", token: "", scheme: "", credentials: "", error: error }
+}
+
+// The config object inside params: params itself (v1), or its pushNotificationConfig (v0.3).
+function configFields(params: string, v03: bool): Field[] | undefined {
+  const fs = objectFields(params)
+  if (fs === undefined) return undefined
+  if (!v03) return fs
+  return objectFields(find(fs, "pushNotificationConfig") ?? "")
+}
+
+function specFrom(cf: Field[], taskId: string, v03: bool): PushSpec {
+  let scheme = ""
+  let credentials = ""
+  const araw = find(cf, "authentication")
+  if (araw !== undefined && !isNull(araw)) {
+    const af = objectFields(araw)
+    if (af === undefined) return badSpec(taskId, "push config authentication must be an object")
+    credentials = strOf(find(af, "credentials"))
+    if (v03) {
+      const sr = find(af, "schemes")
+      if (sr !== undefined && sr.startsWith("[")) {
+        try {
+          const items = elements(sr)
+          if (items.length > 0) scheme = strOf(items[0]!)
+        } catch (e) {
+          scheme = ""
+        }
+      }
+      if (scheme === "") scheme = strOf(find(af, "scheme"))
+    } else {
+      scheme = strOf(find(af, "scheme"))
+    }
+    if (credentials === "") return badSpec(taskId, "push callback authentication credentials are required")
+    const low = scheme.toLowerCase()
+    if (low !== "basic" && low !== "bearer") return badSpec(taskId, "push callback authentication scheme must be Basic or Bearer")
+  }
+  return { taskId: taskId, configId: strOf(find(cf, "id")), url: strOf(find(cf, "url")), token: strOf(find(cf, "token")), scheme: scheme, credentials: credentials, error: "" }
+}
+
+// The push config a CreateTaskPushNotificationConfig call carries.
+export function pushSpecOf(call: Call): PushSpec {
+  if (call.taskId === "") return badSpec("", "push config with a task id is required")
+  const cf = configFields(call.params, call.v03)
+  if (cf === undefined) return badSpec(call.taskId, "push config is required")
+  const s = specFrom(cf, call.taskId, call.v03)
+  if (s.error === "" && s.url === "") return badSpec(call.taskId, "push config url is required")
+  return s
+}
+
+// The call as the agent should get it: the callback is the gateway's ingress with a token of its own, and the
+// caller's callback, token and credentials stay with the gateway.
+export function pushUpstreamParams(call: Call, ingressUrl: string, token: string): string {
+  const fs = objectFields(call.params) ?? []
+  if (!call.v03) {
+    let out = without(fs, ["authentication"])
+    setField(&out, "url", quote(ingressUrl))
+    setField(&out, "token", quote(token))
+    return build(out)
+  }
+  let inner = objectFields(find(fs, "pushNotificationConfig") ?? "") ?? []
+  inner = without(inner, ["authentication"])
+  setField(&inner, "url", quote(ingressUrl))
+  setField(&inner, "token", quote(token))
+  let out = fs
+  setField(&out, "pushNotificationConfig", build(inner))
+  return build(out)
+}
+
+// A stored config as a caller reads it: the callback and the authentication scheme only.
+export function pushViewJson(taskId: string, configId: string, url: string, scheme: string, v03: bool): string {
+  if (!v03) {
+    const auth = scheme === "" ? "" : `,"authentication":{"scheme":${quote(scheme)}}`
+    return `{"taskId":${quote(taskId)},"id":${quote(configId)},"url":${quote(url)}${auth}}`
+  }
+  const auth = scheme === "" ? "" : `,"authentication":{"schemes":[${quote(scheme)}]}`
+  return `{"taskId":${quote(taskId)},"pushNotificationConfig":{"id":${quote(configId)},"url":${quote(url)}${auth}}}`
+}
+
+// The answer to a list call: v1 wraps the configs in an object, v0.3 answers the array.
+export function pushListJson(views: string[], v03: bool): string {
+  const arr = "[" + views.join(",") + "]"
+  return v03 ? arr : `{"configs":${arr}}`
+}
+
+// A push config embedded in a message send (configuration.pushNotificationConfig, or
+// configuration.taskPushNotificationConfig in v1): its spec, and the key that holds it. undefined when there is none.
+export function embeddedPush(params: string): { key: string, spec: PushSpec } | undefined {
+  const fs = objectFields(params)
+  if (fs === undefined) return undefined
+  const conf = objectFields(find(fs, "configuration") ?? "")
+  if (conf === undefined) return undefined
+  for (const key of ["pushNotificationConfig", "taskPushNotificationConfig"]) {
+    const raw = find(conf, key)
+    if (raw === undefined || isNull(raw)) continue
+    let cf = objectFields(raw)
+    if (cf === undefined) return { key: key, spec: badSpec("", "push config must be an object") }
+    // v1 wraps the settings once more
+    const nested = objectFields(find(cf, "pushNotificationConfig") ?? "")
+    if (nested !== undefined) cf = nested
+    const s = specFrom(cf, "", key === "pushNotificationConfig")
+    if (s.error === "" && s.url === "") return { key: key, spec: badSpec("", "push config url is required") }
+    return { key: key, spec: s }
+  }
+  return undefined
+}
+
+// The send's params with the embedded push config pointing at the gateway's ingress.
+export function rewriteEmbedded(params: string, key: string, configId: string, ingressUrl: string, token: string): string {
+  let fs = objectFields(params) ?? []
+  let conf = objectFields(find(fs, "configuration") ?? "") ?? []
+  const v03 = key === "pushNotificationConfig"
+  const body = v03 ? `{"id":${quote(configId)},"url":${quote(ingressUrl)},"token":${quote(token)}}` : `{"id":${quote(configId)},"url":${quote(ingressUrl)},"token":${quote(token)}}`
+  setField(&conf, key, body)
+  setField(&fs, "configuration", build(conf))
+  return build(fs)
+}
+
+// The task a pushed event is about. v1 events are {task}, {statusUpdate}, {artifactUpdate} or {message}; v0.3
+// pushes the task itself or an update event (kind status-update, artifact-update, message). "" when the body
+// is not an event the gateway knows.
+export function pushEventTaskId(body: string): string {
+  const fs = objectFields(body)
+  if (fs === undefined) return ""
+  const t = objectFields(find(fs, "task") ?? "")
+  if (t !== undefined) return strOf(find(t, "id"))
+  for (const k of ["statusUpdate", "artifactUpdate", "message"]) {
+    const u = objectFields(find(fs, k) ?? "")
+    if (u !== undefined) return strOf(find(u, "taskId"))
+  }
+  const kind = strOf(find(fs, "kind"))
+  if (kind === "task") return strOf(find(fs, "id"))
+  if (kind === "status-update" || kind === "artifact-update" || kind === "message") return strOf(find(fs, "taskId"))
+  return ""
+}
+
+// The id of the push config an agent's answer to a create holds (v1 {id}, v0.3 {pushNotificationConfig: {id}}).
+export function pushIdOfResult(result: string, v03: bool): string {
+  const fs = objectFields(result)
+  if (fs === undefined) return ""
+  if (!v03) return strOf(find(fs, "id"))
+  const inner = objectFields(find(fs, "pushNotificationConfig") ?? "")
+  return inner === undefined ? "" : strOf(find(inner, "id"))
+}
+
+// The id of the task a unary answer holds (a v1 SendMessage result {task}, or a v0.3 task), "" for a message.
+export function taskIdOfResult(result: string): string {
+  const fs = objectFields(result)
+  if (fs === undefined) return ""
+  const t = objectFields(find(fs, "task") ?? "")
+  if (t !== undefined) return strOf(find(t, "id"))
+  if (strOf(find(fs, "kind")) === "task") return strOf(find(fs, "id"))
+  return ""
+}
+
+// ---- the card ----
+
+export type Interface = { url: string, binding: string }
+
+// The interfaces a card offers: the v1 supportedInterfaces, or the v0.3 url with its additionalInterfaces.
+// binding is JSONRPC, HTTP+JSON or GRPC. v1 is true for a v1 card.
+export function interfacesOf(card: string): { list: Interface[], v1: bool } {
+  const cf = objectFields(card)
+  const out: Interface[] = []
+  if (cf === undefined) return { list: out, v1: false }
+  const sup = find(cf, "supportedInterfaces")
+  if (sup !== undefined && sup.startsWith("[")) {
+    try {
+      for (const it of elements(sup)) {
+        const f = objectFields(it)
+        if (f === undefined) continue
+        const u = strOf(find(f, "url"))
+        if (u === "") continue
+        const b = strOf(find(f, "protocolBinding"))
+        out.push({ url: u, binding: b === "" ? "JSONRPC" : b })
+      }
+    } catch (e) {
+      // no usable list
+    }
+    return { list: out, v1: true }
+  }
+  const u = strOf(find(cf, "url"))
+  if (u !== "") {
+    const pt = strOf(find(cf, "preferredTransport"))
+    out.push({ url: u, binding: pt === "" ? "JSONRPC" : pt })
+  }
+  const add = find(cf, "additionalInterfaces")
+  if (add !== undefined && add.startsWith("[")) {
+    try {
+      for (const it of elements(add)) {
+        const f = objectFields(it)
+        if (f === undefined) continue
+        const iu = strOf(find(f, "url"))
+        if (iu === "") continue
+        const t = strOf(find(f, "transport"))
+        out.push({ url: iu, binding: t === "" ? "JSONRPC" : t })
+      }
+    } catch (e) {
+      // no usable list
+    }
+  }
+  return { list: out, v1: false }
+}
+
+// The first interface of a binding, "" when the card has none.
+export function interfaceUrl(card: string, binding: string): string {
+  for (const i of interfacesOf(card).list) {
+    if (i.binding === binding) return i.url
+  }
+  return ""
+}
+
+// Whether the card says the agent can push (capabilities.pushNotifications).
+export function cardPushes(card: string): bool {
+  const cf = objectFields(card)
+  const caps = cf === undefined ? undefined : objectFields(find(cf, "capabilities") ?? "")
+  return caps !== undefined && rawBool(caps, "pushNotifications") === true
+}
+
+// ---- tests ----
+
+test("v1 and v0.3 method names map to one operation", () => {
+  expect(opOfMethod("SendMessage")!.op).toBe("SendMessage")
+  expect(opOfMethod("message/send")!.op).toBe("SendMessage")
+  expect(opOfMethod("message/send")!.v03).toBe(true)
+  expect(opOfMethod("tasks/resubscribe")!.op).toBe("SubscribeToTask")
+  expect(opOfMethod("SubscribeToTask")!.v03).toBe(false)
+  expect(opOfMethod("tasks/pushNotificationConfig/set")!.op).toBe("CreateTaskPushNotificationConfig")
+  expect(opOfMethod("nope")).toBeUndefined()
+  expect(methodOf("SendMessage", true)).toBe("message/send")
+  expect(methodOf("SendMessage", false)).toBe("SendMessage")
+  expect(isStreamOp("SubscribeToTask")).toBe(true)
+  expect(isStreamOp("GetTask")).toBe(false)
+  expect(methodNames().includes("tasks/cancel")).toBe(true)
+  expect(isPushOp("DeleteTaskPushNotificationConfig")).toBe(true)
+})
+
+test("snake_case params keys become camelCase unless the camelCase key is there", () => {
+  expect(camelOf("task_id")).toBe("taskId")
+  expect(camelOf("history_length_max")).toBe("historyLengthMax")
+  expect(camelKeys(`{"task_id":"t1","metadata":{"a_b":1}}`)).toBe(`{"taskId":"t1","metadata":{"a_b":1}}`)
+  expect(camelKeys(`{"task_id":"t1","taskId":"t2"}`)).toBe(`{"task_id":"t1","taskId":"t2"}`)
+  expect(camelKeys(`{"id":"t1"}`)).toBe(`{"id":"t1"}`)
+})
+
+test("a JSON-RPC body becomes a call", () => {
+  const r = rpcCall(`{"jsonrpc":"2.0","id":4,"method":"CancelTask","params":{"id":"t9"}}`)
+  expect(r.kind).toBe("call")
+  if (r.kind === "call") {
+    expect(r.call.op).toBe("CancelTask")
+    expect(r.call.taskId).toBe("t9")
+    expect(r.call.v03).toBe(false)
+  }
+  const sub = rpcCall(`{"jsonrpc":"2.0","id":4,"method":"tasks/resubscribe","params":{"id":"t9"}}`)
+  expect(sub.kind === "call" && sub.call.stream && sub.call.v03).toBe(true)
+  const push = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"tasks/pushNotificationConfig/set","params":{"taskId":"t1","pushNotificationConfig":{"id":"c1","url":"https://cb.example/hook"}}}`)
+  expect(push.kind === "call" && push.call.taskId === "t1" && push.call.configId === "c1").toBe(true)
+  const get = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"tasks/pushNotificationConfig/get","params":{"id":"t1","pushNotificationConfigId":"c1"}}`)
+  expect(get.kind === "call" && get.call.taskId === "t1" && get.call.configId === "c1").toBe(true)
+  const snake = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"GetTaskPushNotificationConfig","params":{"task_id":"t1","id":"c1"}}`)
+  expect(snake.kind === "call" && snake.call.taskId === "t1" && snake.call.configId === "c1").toBe(true)
+  const none = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"nope"}`)
+  expect(none.kind === "fail" && none.code === -32601).toBe(true)
+  expect(rpcCall("[]").kind).toBe("fail")
+  expect(rpcCall(`{"jsonrpc":"2.0","id":1,"method":"GetTask","params":[1]}`).kind).toBe("fail")
+  expect(rpcIdOf(`{"id":"abc","method":"x"}`)).toBe(`"abc"`)
+  expect(rpcIdOf("nope")).toBe("null")
+})
+
+test("REST routes map to operations", () => {
+  const send = restCall("POST", "/message:send", "", `{"message":{"messageId":"m1","parts":[{"text":"hi"}]}}`)
+  expect(send.kind === "call" && send.call.op === "SendMessage" && send.call.params.includes(`"messageId":"m1"`)).toBe(true)
+  const stream = restCall("POST", "/message:stream", "", "{}")
+  expect(stream.kind === "call" && stream.call.op === "SendStreamingMessage" && stream.call.stream).toBe(true)
+  const get = restCall("GET", "/tasks/t1", "historyLength=3", "")
+  expect(get.kind === "call" && get.call.op === "GetTask" && get.call.taskId === "t1" && get.call.params === `{"id":"t1","historyLength":3}`).toBe(true)
+  const list = restCall("GET", "/tasks", "contextId=c1&pageSize=5&includeArtifacts=true", "")
+  expect(list.kind === "call" && list.call.params === `{"contextId":"c1","pageSize":5,"includeArtifacts":true}`).toBe(true)
+  const cancel = restCall("POST", "/tasks/t1:cancel", "", "")
+  expect(cancel.kind === "call" && cancel.call.op === "CancelTask" && cancel.call.params === `{"id":"t1"}`).toBe(true)
+  for (const m of ["POST", "GET"]) {
+    const sub = restCall(m, "/tasks/t1:subscribe", "", "")
+    expect(sub.kind === "call" && sub.call.op === "SubscribeToTask" && sub.call.stream).toBe(true)
+  }
+  const create = restCall("POST", "/tasks/t1/pushNotificationConfigs", "", `{"id":"c1","url":"https://cb.example/h","token":"tk"}`)
+  expect(create.kind === "call" && create.call.op === "CreateTaskPushNotificationConfig" && create.call.taskId === "t1" && create.call.configId === "c1").toBe(true)
+  const wrapped = restCall("POST", "/tasks/t1/pushNotificationConfigs", "", `{"configId":"c2","config":{"url":"https://cb.example/h"}}`)
+  expect(wrapped.kind === "call" && wrapped.call.configId === "c2" && wrapped.call.taskId === "t1").toBe(true)
+  expect(restCall("GET", "/tasks/t1/pushNotificationConfigs", "", "").kind).toBe("call")
+  const one = restCall("GET", "/tasks/t1/pushNotificationConfigs/c1", "", "")
+  expect(one.kind === "call" && one.call.op === "GetTaskPushNotificationConfig" && one.call.configId === "c1").toBe(true)
+  const del = restCall("DELETE", "/tasks/t1/pushNotificationConfigs/c1", "", "")
+  expect(del.kind === "call" && del.call.op === "DeleteTaskPushNotificationConfig").toBe(true)
+  expect(restCall("GET", "/extendedAgentCard", "", "").kind).toBe("call")
+  // a tenant segment is dropped; unknown routes and wrong methods are refused
+  const tenant = restCall("POST", "/acme/message:send", "", "{}")
+  expect(tenant.kind === "call" && tenant.call.op === "SendMessage").toBe(true)
+  const nf = restCall("GET", "/nothing", "", "")
+  expect(nf.kind === "fail" && nf.status === 404).toBe(true)
+  const wrong = restCall("GET", "/message:send", "", "")
+  expect(wrong.kind === "fail" && wrong.status === 405).toBe(true)
+  expect(restCall("POST", "/message:send", "", "[1]").kind).toBe("fail")
+  expect(restCall("GET", "", "", "").kind).toBe("fail")
+  // an escaped id is decoded
+  const esc = restCall("GET", "/tasks/a%2Fb", "", "")
+  expect(esc.kind === "call" && esc.call.taskId === "a/b").toBe(true)
+})
+
+test("a call maps back to a REST request", () => {
+  const r = restRequestOf({ op: "GetTask", v03: false, params: `{"id":"a/b","historyLength":2}`, stream: false, taskId: "a/b", configId: "" })
+  expect(r.method).toBe("GET")
+  expect(r.path).toBe("/tasks/a%2Fb")
+  expect(r.query).toBe("historyLength=2")
+  const c = restRequestOf({ op: "CancelTask", v03: false, params: `{"id":"t1"}`, stream: false, taskId: "t1", configId: "" })
+  expect(c.path).toBe("/tasks/t1:cancel")
+  expect(c.body).toBe("{}")
+  const p = restRequestOf({ op: "CreateTaskPushNotificationConfig", v03: false, params: `{"taskId":"t1","url":"https://x.example/h"}`, stream: false, taskId: "t1", configId: "" })
+  expect(p.path).toBe("/tasks/t1/pushNotificationConfigs")
+  expect(p.body).toBe(`{"url":"https://x.example/h"}`)
+  const d = restRequestOf({ op: "DeleteTaskPushNotificationConfig", v03: false, params: "{}", stream: false, taskId: "t1", configId: "c1" })
+  expect(d.method).toBe("DELETE")
+  expect(d.path).toBe("/tasks/t1/pushNotificationConfigs/c1")
+  expect(restRequestOf({ op: "SendStreamingMessage", v03: false, params: "{}", stream: true, taskId: "", configId: "" }).path).toBe("/message:stream")
+})
+
+test("percent escapes round trip", () => {
+  expect(pctEncode("a/b c")).toBe("a%2Fb%20c")
+  expect(pctDecode("a%2Fb%20c")).toBe("a/b c")
+  expect(pctDecode("100%")).toBe("100%")
+  expect(pctDecode("%zz")).toBe("%zz")
+  expect(pctDecode(pctEncode("é-ü"))).toBe("é-ü")
+})
+
+test("errors map between the bindings", () => {
+  expect(httpOfCode(-32001)).toBe(404)
+  expect(httpOfCode(-32002)).toBe(409)
+  expect(httpOfCode(-32009)).toBe(400)
+  expect(httpOfCode(-32603)).toBe(500)
+  const body = restErrorBody(-32001, "task not found")
+  expect(body.includes(`"status":"NOT_FOUND"`)).toBe(true)
+  expect(body.includes(`"reason":"TASK_NOT_FOUND"`)).toBe(true)
+  expect(codeOfRestError(404, body).code).toBe(-32001)
+  expect(codeOfRestError(404, body).message).toBe("task not found")
+  expect(codeOfRestError(409, `{"error":{"message":"x"}}`).code).toBe(-32002)
+  expect(codeOfRestError(500, "oops").code).toBe(-32603)
+  const p = restFromRpc(`{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"task not found"}}`)
+  expect(p.status).toBe(404)
+  expect(p.body.includes("task not found")).toBe(true)
+  expect(rpcFromRest("7", 404, body)).toBe(`{"jsonrpc":"2.0","id":7,"error":{"code":-32001,"message":"task not found"}}`)
+})
+
+test("results move between the bindings", () => {
+  const ok = restFromRpc(`{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"t1"}}}`)
+  expect(ok.status).toBe(200)
+  expect(ok.body).toBe(`{"task":{"id":"t1"}}`)
+  expect(restFromRpc("nope").status).toBe(502)
+  expect(restFromRpc(`{"jsonrpc":"2.0","id":1}`).status).toBe(502)
+  expect(rpcFromRest("3", 200, `{"id":"t1"}`)).toBe(`{"jsonrpc":"2.0","id":3,"result":{"id":"t1"}}`)
+  expect(rpcFromRest("3", 200, "")).toBe(`{"jsonrpc":"2.0","id":3,"result":{}}`)
+})
+
+test("REST errors of the gateway's own carry the status name", () => {
+  expect(restErrorOfStatus(403, "no")).toBe(`{"error":{"code":403,"status":"PERMISSION_DENIED","message":"no"}}`)
+  expect(statusNameOfHttp(401)).toBe("UNAUTHENTICATED")
+  expect(statusNameOfHttp(502)).toBe("UNAVAILABLE")
+  expect(statusNameOfHttp(400)).toBe("INVALID_ARGUMENT")
+  expect(statusNameOfHttp(500)).toBe("INTERNAL")
+})
+
+test("server-sent events are split and mapped between the bindings", () => {
+  const s = new SseSplitter()
+  expect(s.push("data: {\"a\":1}\n\ndata: {\"b\"").length).toBe(1)
+  const more = s.push(":2}\r\n\r\n: comment\n\ndata:x\ndata:y\n\n")
+  expect(more.length).toBe(2)
+  expect(more[0]).toBe(`{"b":2}`)
+  expect(more[1]).toBe("x\ny")
+  expect(s.rest()).toBeUndefined()
+  const t = new SseSplitter()
+  t.push("data: tail")
+  expect(t.rest()).toBe("tail")
+  expect(restEvent(`{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"t1"}}}`)).toBe(`{"task":{"id":"t1"}}`)
+  expect(restEvent(`{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"gone"}}`).includes("NOT_FOUND")).toBe(true)
+  expect(rpcEvent("9", `{"task":{"id":"t1"}}`)).toBe(`{"jsonrpc":"2.0","id":9,"result":{"task":{"id":"t1"}}}`)
+  expect(rpcEvent("9", `{"error":{"code":404,"status":"NOT_FOUND","message":"gone"}}`).includes(`"code":-32001`)).toBe(true)
+})
+
+test("a push config is read in both dialects and checked", () => {
+  const v1 = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"CreateTaskPushNotificationConfig","params":{"taskId":"t1","id":"c1","url":"https://cb.example/h","token":"tk","authentication":{"scheme":"Bearer","credentials":"cred"}}}`)
+  expect(v1.kind).toBe("call")
+  if (v1.kind === "call") {
+    const s = pushSpecOf(v1.call)
+    expect(s.error).toBe("")
+    expect(s.taskId).toBe("t1")
+    expect(s.configId).toBe("c1")
+    expect(s.url).toBe("https://cb.example/h")
+    expect(s.token).toBe("tk")
+    expect(s.scheme).toBe("Bearer")
+    expect(s.credentials).toBe("cred")
+    const up = pushUpstreamParams(v1.call, "https://gw.example/agents/a2a/x/push/callback", "ingress-token")
+    expect(up).toBe(`{"taskId":"t1","id":"c1","url":"https://gw.example/agents/a2a/x/push/callback","token":"ingress-token"}`)
+  }
+  const old = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"tasks/pushNotificationConfig/set","params":{"taskId":"t1","pushNotificationConfig":{"id":"c1","url":"https://cb.example/h","authentication":{"schemes":["Basic"],"credentials":"dTpw"}}}}`)
+  if (old.kind === "call") {
+    const s = pushSpecOf(old.call)
+    expect(s.error).toBe("")
+    expect(s.scheme).toBe("Basic")
+    expect(s.credentials).toBe("dTpw")
+    const up = pushUpstreamParams(old.call, "https://gw.example/cb", "tk2")
+    expect(up).toBe(`{"taskId":"t1","pushNotificationConfig":{"id":"c1","url":"https://gw.example/cb","token":"tk2"}}`)
+  }
+  const nocred = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"CreateTaskPushNotificationConfig","params":{"taskId":"t1","url":"https://cb.example/h","authentication":{"scheme":"Bearer"}}}`)
+  if (nocred.kind === "call") expect(pushSpecOf(nocred.call).error.includes("credentials")).toBe(true)
+  const badScheme = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"CreateTaskPushNotificationConfig","params":{"taskId":"t1","url":"https://cb.example/h","authentication":{"scheme":"Digest","credentials":"x"}}}`)
+  if (badScheme.kind === "call") expect(pushSpecOf(badScheme.call).error.includes("Basic or Bearer")).toBe(true)
+  const notask = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"CreateTaskPushNotificationConfig","params":{"url":"https://cb.example/h"}}`)
+  if (notask.kind === "call") expect(pushSpecOf(notask.call).error.includes("task id")).toBe(true)
+  const nourl = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"CreateTaskPushNotificationConfig","params":{"taskId":"t1"}}`)
+  if (nourl.kind === "call") expect(pushSpecOf(nourl.call).error.includes("url")).toBe(true)
+})
+
+test("a stored push config is shown without its secrets", () => {
+  expect(pushViewJson("t1", "c1", "https://cb.example/h", "Bearer", false)).toBe(`{"taskId":"t1","id":"c1","url":"https://cb.example/h","authentication":{"scheme":"Bearer"}}`)
+  expect(pushViewJson("t1", "c1", "https://cb.example/h", "", false)).toBe(`{"taskId":"t1","id":"c1","url":"https://cb.example/h"}`)
+  expect(pushViewJson("t1", "c1", "https://cb.example/h", "Basic", true)).toBe(`{"taskId":"t1","pushNotificationConfig":{"id":"c1","url":"https://cb.example/h","authentication":{"schemes":["Basic"]}}}`)
+  expect(pushListJson(["{}"], false)).toBe(`{"configs":[{}]}`)
+  expect(pushListJson(["{}"], true)).toBe(`[{}]`)
+})
+
+test("an embedded push config is found and pointed at the gateway", () => {
+  const send = `{"message":{"messageId":"m1"},"configuration":{"blocking":false,"pushNotificationConfig":{"id":"c1","url":"https://cb.example/h","token":"t","authentication":{"schemes":["Bearer"],"credentials":"cred"}}}}`
+  const e = embeddedPush(send)!
+  expect(e.key).toBe("pushNotificationConfig")
+  expect(e.spec.error).toBe("")
+  expect(e.spec.url).toBe("https://cb.example/h")
+  expect(e.spec.scheme).toBe("Bearer")
+  const out = rewriteEmbedded(send, e.key, "c1", "https://gw.example/cb", "ing")
+  expect(out.includes("cb.example")).toBe(false)
+  expect(out.includes("cred")).toBe(false)
+  expect(out.includes(`"blocking":false`)).toBe(true)
+  expect(out.includes(`"url":"https://gw.example/cb","token":"ing"`)).toBe(true)
+  const v1 = embeddedPush(`{"message":{},"configuration":{"taskPushNotificationConfig":{"url":"https://cb.example/h"}}}`)!
+  expect(v1.key).toBe("taskPushNotificationConfig")
+  expect(embeddedPush(`{"message":{}}`)).toBeUndefined()
+  expect(embeddedPush(`{"message":{},"configuration":{"blocking":true}}`)).toBeUndefined()
+  expect(embeddedPush(`{"configuration":{"pushNotificationConfig":{"id":"x"}}}`)!.spec.error.includes("url")).toBe(true)
+})
+
+test("pushed events name their task", () => {
+  expect(pushEventTaskId(`{"task":{"id":"t1","status":{}}}`)).toBe("t1")
+  expect(pushEventTaskId(`{"statusUpdate":{"taskId":"t2"}}`)).toBe("t2")
+  expect(pushEventTaskId(`{"artifactUpdate":{"taskId":"t3"}}`)).toBe("t3")
+  expect(pushEventTaskId(`{"message":{"taskId":"t4"}}`)).toBe("t4")
+  expect(pushEventTaskId(`{"kind":"task","id":"t5"}`)).toBe("t5")
+  expect(pushEventTaskId(`{"kind":"status-update","taskId":"t6"}`)).toBe("t6")
+  expect(pushEventTaskId(`{"other":1}`)).toBe("")
+  expect(pushEventTaskId("nope")).toBe("")
+  expect(taskIdOfResult(`{"task":{"id":"t1"}}`)).toBe("t1")
+  expect(taskIdOfResult(`{"kind":"task","id":"t2"}`)).toBe("t2")
+  expect(taskIdOfResult(`{"message":{"messageId":"m"}}`)).toBe("")
+})
+
+test("the push config id of a create answer", () => {
+  expect(pushIdOfResult(`{"taskId":"t1","id":"c9","url":"u"}`, false)).toBe("c9")
+  expect(pushIdOfResult(`{"taskId":"t1","pushNotificationConfig":{"id":"c8"}}`, true)).toBe("c8")
+  expect(pushIdOfResult(`{"taskId":"t1"}`, true)).toBe("")
+  expect(pushIdOfResult("nope", false)).toBe("")
+})
+
+test("a card's interfaces are read in both forms", () => {
+  const v03 = interfacesOf(`{"name":"a","url":"https://a.example/rpc","additionalInterfaces":[{"url":"https://a.example/rest","transport":"HTTP+JSON"}]}`)
+  expect(v03.v1).toBe(false)
+  expect(v03.list.length).toBe(2)
+  expect(interfaceUrl(`{"url":"https://a.example/rpc","additionalInterfaces":[{"url":"https://a.example/rest","transport":"HTTP+JSON"}]}`, "HTTP+JSON")).toBe("https://a.example/rest")
+  const v1 = interfacesOf(`{"name":"a","supportedInterfaces":[{"url":"https://a.example/rest","protocolBinding":"HTTP+JSON","protocolVersion":"1.0"},{"url":"https://a.example/rpc","protocolBinding":"JSONRPC"}]}`)
+  expect(v1.v1).toBe(true)
+  expect(v1.list.length).toBe(2)
+  expect(interfaceUrl(`{"supportedInterfaces":[{"url":"https://a.example/rpc","protocolBinding":"JSONRPC"}]}`, "JSONRPC")).toBe("https://a.example/rpc")
+  expect(interfaceUrl(`{"supportedInterfaces":[{"url":"https://a.example/rpc","protocolBinding":"JSONRPC"}]}`, "HTTP+JSON")).toBe("")
+  expect(interfacesOf("nope").list.length).toBe(0)
+  expect(cardPushes(`{"capabilities":{"pushNotifications":true}}`)).toBe(true)
+  expect(cardPushes(`{"capabilities":{}}`)).toBe(false)
+})

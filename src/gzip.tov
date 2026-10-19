@@ -1,0 +1,160 @@
+// gzip (RFC 1952) around DEFLATE (RFC 1951) with the fixed Huffman codes and greedy LZ77 matches
+// (a 3-byte hash keeps the last position only). It compresses JSON lines well enough for the audit
+// archive and needs no native codec; any gunzip reads the output.
+
+const LEN_BASE: int[] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+const LEN_EXTRA: int[] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+const DIST_BASE: int[] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+const DIST_EXTRA: int[] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+const HASH_SIZE = 32768
+const WINDOW = 32768
+
+const CRC_TABLE = crcTable()
+
+function crcTable(): int[] {
+  const t: int[] = []
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) c = (c & 1) === 1 ? 0xedb88320 ^ (c >> 1) : c >> 1
+    t.push(c)
+  }
+  return t
+}
+
+// CRC-32 of the bytes, as the gzip trailer stores it.
+export function crc32(data: u8[]): int {
+  let crc = 0xffffffff
+  for (const x of data) crc = CRC_TABLE[(crc ^ int(x)) & 0xff]! ^ (crc >> 8)
+  return crc ^ 0xffffffff
+}
+
+// Writes bits the way DEFLATE packs them: extra bits and headers least significant first, Huffman
+// codes most significant first.
+class BitWriter {
+  out: u8[] = []
+  acc: int = 0
+  n: int = 0
+
+  put(v: int, count: int): void {
+    for (let i = 0; i < count; i++) {
+      this.acc = this.acc | ((((v >> i) & 1)) << this.n)
+      this.n += 1
+      if (this.n === 8) {
+        this.out.push(u8(this.acc))
+        this.acc = 0
+        this.n = 0
+      }
+    }
+  }
+
+  code(c: int, len: int): void {
+    for (let i = len - 1; i >= 0; i--) this.put((c >> i) & 1, 1)
+  }
+
+  // a literal byte or an end-of-block code (0 to 285) in the fixed table
+  symbol(v: int): void {
+    if (v < 144) this.code(0x30 + v, 8)
+    else if (v < 256) this.code(0x190 + v - 144, 9)
+    else if (v < 280) this.code(v - 256, 7)
+    else this.code(0xc0 + v - 280, 8)
+  }
+
+  match(len: int, dist: int): void {
+    let li = 28
+    while (LEN_BASE[li]! > len) li -= 1
+    this.symbol(257 + li)
+    this.put(len - LEN_BASE[li]!, LEN_EXTRA[li]!)
+    let di = 29
+    while (DIST_BASE[di]! > dist) di -= 1
+    this.code(di, 5)
+    this.put(dist - DIST_BASE[di]!, DIST_EXTRA[di]!)
+  }
+
+  finish(): u8[] {
+    if (this.n > 0) this.out.push(u8(this.acc))
+    return this.out
+  }
+}
+
+// One DEFLATE block with the fixed Huffman codes, the whole input in it.
+export function deflateFixed(data: u8[]): u8[] {
+  const w = new BitWriter()
+  w.put(1, 1)
+  w.put(1, 2)
+  const head: int[] = []
+  for (let i = 0; i < HASH_SIZE; i++) head.push(-1)
+  const n = data.length
+  let i = 0
+  while (i < n) {
+    let bestLen = 0
+    let bestDist = 0
+    if (i + 2 < n) {
+      const h = ((int(data[i]!) << 10) ^ (int(data[i + 1]!) << 5) ^ int(data[i + 2]!)) & (HASH_SIZE - 1)
+      const cand = head[h]!
+      head[h] = i
+      if (cand >= 0 && i - cand <= WINDOW) {
+        let l = 0
+        while (l < 258 && i + l < n && data[cand + l]! === data[i + l]!) l += 1
+        if (l >= 3) {
+          bestLen = l
+          bestDist = i - cand
+        }
+      }
+    }
+    if (bestLen >= 3) {
+      w.match(bestLen, bestDist)
+      i += bestLen
+    } else {
+      w.symbol(int(data[i]!))
+      i += 1
+    }
+  }
+  w.symbol(256)
+  return w.finish()
+}
+
+const HEX = "0123456789abcdef"
+
+// Lower-case hex of the bytes.
+export function toHex(b: u8[]): string {
+  let s = ""
+  for (const x of b) {
+    const v = int(x)
+    s += HEX.slice(v >> 4, (v >> 4) + 1) + HEX.slice(v & 15, (v & 15) + 1)
+  }
+  return s
+}
+
+// The bytes as one gzip member: the 10-byte header (no name, no time), the DEFLATE data, then
+// CRC-32 and the size mod 2^32, both little endian.
+export function gzipBytes(data: u8[]): u8[] {
+  const out: u8[] = [u8(0x1f), u8(0x8b), u8(8), u8(0), u8(0), u8(0), u8(0), u8(0), u8(0), u8(3)]
+  for (const x of deflateFixed(data)) out.push(x)
+  const crc = crc32(data)
+  const size = data.length % 4294967296
+  for (let k = 0; k < 4; k++) out.push(u8((crc >> (8 * k)) & 0xff))
+  for (let k = 0; k < 4; k++) out.push(u8((size >> (8 * k)) & 0xff))
+  return out
+}
+
+test("an empty input is the standard empty gzip member", () => {
+  const hex = toHex(gzipBytes([]))
+  expect(hex).toBe("1f8b0800000000000003" + "0300" + "00000000" + "00000000")
+})
+
+test("crc-32 of a known string", () => {
+  expect(crc32(new TextEncoder().encode("hello"))).toBe(0x3610a686)
+})
+
+test("repeated text compresses and keeps the trailer", () => {
+  let text = ""
+  for (let i = 0; i < 200; i++) text += "{\"seq\":1,\"action\":\"provider.upsert\"}\n"
+  const bytes: u8[] = []
+  for (const x of new TextEncoder().encode(text)) bytes.push(x)
+  const z = gzipBytes(bytes)
+  expect(z.length < bytes.length / 4).toBe(true)
+  expect(int(z[0]!)).toBe(0x1f)
+  expect(int(z[1]!)).toBe(0x8b)
+  const n = bytes.length
+  expect(int(z[z.length - 4]!) + 256 * int(z[z.length - 3]!) + 65536 * int(z[z.length - 2]!) + 16777216 * int(z[z.length - 1]!)).toBe(n)
+})

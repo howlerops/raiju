@@ -3,8 +3,9 @@
 // called again. The loop ends when the model answers without such calls, or at the depth
 // limit, and the caller gets the final answer. The step logic is pure so it tests without
 // a network; runAgent takes the model call and the tool executor as functions.
-import { fields, elements, find, rawStr, isNull, decodeString, build, setField } from "./json"
+import { fields, elements, find, rawStr, isNull, decodeString, build, setField, quote } from "./json"
 import { toolMessage } from "./mcp"
+import { EXECUTE_TOOL, isDiscoveryTool } from "./codemode"
 
 export type AgentConfig = {
   // Bifrost's client.mcp_agent_depth: how many rounds of tool execution are allowed.
@@ -89,11 +90,15 @@ export function nextRequest(chatBody: string, assistantMsg: string, toolMessages
   return build(fs)
 }
 
-// What the loop does with one completion. depth is the number of tool rounds already run.
-export function decide(completion: string, cfg: AgentConfig, mcpNames: string[], depth: int): AgentDecision throws SyntaxError {
+// What the loop does with one completion. depth is the number of tool rounds already run. Code mode's
+// discovery tools only read, so they run whenever they are offered (mcpNames); executeToolCode runs when
+// codeOk accepts its arguments (every tool the program calls is auto-executable).
+export function decide(completion: string, cfg: AgentConfig, mcpNames: string[], depth: int, codeOk: (argsJson: string) => bool): AgentDecision throws SyntaxError {
   const calls = try toolCallsOf(completion)
   if (calls.length === 0) return { kind: "done" }
   for (const c of calls) {
+    if (isDiscoveryTool(c.name) && mcpNames.includes(c.name)) continue
+    if (c.name === EXECUTE_TOOL && mcpNames.includes(c.name) && codeOk(c.argumentsJson)) continue
     if (!allowed(c.name, cfg, mcpNames)) return { kind: "stop", reason: `tool ${c.name} is not auto-executed`, completion: completion }
   }
   if (depth >= cfg.max_depth) return { kind: "stop", reason: `agent depth limit ${cfg.max_depth} reached`, completion: completion }
@@ -126,6 +131,7 @@ export async function runAgent(
   exec: (name: string, argsJson: string) => Promise<{ text: string, isError: bool }, Error>,
   cfg: AgentConfig,
   mcpNames: string[],
+  codeOk: (argsJson: string) => bool,
 ): Promise<{ status: int, body: string, steps: int, toolCalls: int }, Error> throws SyntaxError | Error {
   let body = chatBody
   let steps = 0
@@ -136,7 +142,7 @@ export async function runAgent(
     steps += 1
     let d: AgentDecision = { kind: "done" }
     try {
-      d = decide(r.body, cfg, mcpNames, steps - 1)
+      d = decide(r.body, cfg, mcpNames, steps - 1, codeOk)
     } catch (e) {
       return { status: r.status, body: r.body, steps: steps, toolCalls: toolCalls }
     }
@@ -222,33 +228,49 @@ test("nextRequest appends messages and keeps other fields raw", () => {
 })
 
 test("decide: done, execute, not-allowed stop and depth stop", () => {
+  const noCode = (a: string): bool => false
   const msgJson = '{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs-read","arguments":"{}"}}]}'
   const withCall = '{"choices":[{"message":' + msgJson + '}]}'
   const final = '{"choices":[{"message":{"role":"assistant","content":"done"}}]}'
   const mcp = ["fs-read"]
   const cfg: AgentConfig = { max_depth: 2, auto_execute: ["*"], parallel: true }
 
-  expect(try decide(final, cfg, mcp, 0)).toEqual({ kind: "done" })
-  const ex = try decide(withCall, cfg, mcp, 1)
+  expect(try decide(final, cfg, mcp, 0, noCode)).toEqual({ kind: "done" })
+  const ex = try decide(withCall, cfg, mcp, 1, noCode)
   expect(ex.kind).toBe("execute")
   if (ex.kind === "execute") expect(ex.calls).toEqual([{ id: "call_1", name: "fs-read", argumentsJson: "{}" }])
 
-  const notAllowed = try decide(withCall, { max_depth: 2, auto_execute: ["other"], parallel: true }, mcp, 0)
+  const notAllowed = try decide(withCall, { max_depth: 2, auto_execute: ["other"], parallel: true }, mcp, 0, noCode)
   expect(notAllowed.kind).toBe("stop")
   if (notAllowed.kind === "stop") {
     expect(notAllowed.completion).toBe(withCall)
     expect(notAllowed.reason.indexOf("fs-read") >= 0).toBe(true)
   }
 
-  const depth = try decide(withCall, cfg, mcp, 2)
+  const depth = try decide(withCall, cfg, mcp, 2, noCode)
   expect(depth.kind).toBe("stop")
   if (depth.kind === "stop") expect(depth.completion).toBe(withCall)
   // a final answer at the limit is still final
-  expect(try decide(final, cfg, mcp, 2)).toEqual({ kind: "done" })
+  expect(try decide(final, cfg, mcp, 2, noCode)).toEqual({ kind: "done" })
 })
 
 test("annotate adds the agent counts", () => {
   const out = try annotate('{"id":"c","choices":[]}', 2, 1)
   expect(out).toBe('{"id":"c","choices":[],"agent":{"steps":2,"tool_calls":1}}')
   expect(rawStr(try fields(out), "id")).toBe("c")
+})
+
+test("decide: code mode's discovery tools run; executeToolCode runs only when codeOk accepts it", () => {
+  const cfg: AgentConfig = { max_depth: 5, auto_execute: [], parallel: true }
+  const names = ["listToolFiles", "readToolFile", "getToolDocs", "executeToolCode", "fs-read"]
+  const callOf = (name: string, args: string): string => '{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"' + name + '","arguments":' + quote(args) + '}}]}}]}'
+  const yes = (a: string): bool => true
+  const no = (a: string): bool => false
+  const read = try decide(callOf("readToolFile", "{\"fileName\":\"servers/fs.pyi\"}"), cfg, names, 0, no)
+  expect(read.kind).toBe("execute")
+  // the discovery tools are not run unless code mode is on for the caller
+  expect(try decide(callOf("listToolFiles", "{}"), cfg, ["fs-read"], 0, no).kind).toBe("stop")
+  expect(try decide(callOf("executeToolCode", "{\"code\":\"result = 1\"}"), cfg, names, 0, no).kind).toBe("stop")
+  expect(try decide(callOf("executeToolCode", "{\"code\":\"result = 1\"}"), cfg, names, 0, yes).kind).toBe("execute")
+  expect(try decide(callOf("executeToolCode", "{\"code\":\"x = 1\"}"), cfg, ["fs-read"], 0, yes).kind).toBe("stop")
 })

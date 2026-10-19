@@ -31,8 +31,10 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 - **API:** `/v1/chat/completions` (tools, vision, JSON mode, reasoning, streaming),
   `/v1/responses` (and its retrieve, delete, cancel, input_items, input_tokens, compact;
   WebSocket mode for OpenAI), `/v1/embeddings`, `/v1/completions` (OpenAI-format providers),
-  `/v1/models`, `/v1/realtime` (WebSocket relay for OpenAI and Azure; client secrets, sessions
-  and SDP calls are routed; `POST /v1/live/sessions` answers 501 for WebRTC create),
+  `/v1/models`, `/v1/realtime` (WebSocket for OpenAI, Azure and xAI, and WebRTC calls for OpenAI
+  and Azure at `POST /v1/realtime/calls`) and GPT Live (`/v1/live/sessions`, WebSocket and
+  WebRTC), each session metered, guarded and logged with its cost (client secrets and sessions
+  are routed),
   `/v1/rerank`, `/v1/count_tokens`, `/v1/async/*` jobs, and audio, images, files and batches
   (which providers serve each one is in [SCOPE.md](SCOPE.md)).
 - **Drop-in SDK routes:** `/openai/v1/*`; `/anthropic/v1/messages` (to any provider),
@@ -49,10 +51,22 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 - **Gateway features:** routing rules (CEL), circuit breakers and adaptive load
   balancing, guardrails (PII and secret redaction), semantic cache, MCP gateway,
   plugins, request log store, OpenTelemetry, management API with admin auth,
-  web UI at `/`. Deployment: Dockerfile, compose and a Helm chart in `deploy/`.
+  web UI at `/` (SolidJS, in `web/`, embedded in the binary). Deployment: Dockerfile, compose and a Helm chart in `deploy/`.
   The management API is specified in [`docs/openapi/management.yaml`](docs/openapi/management.yaml),
   and `make openapi-check` checks the routes against it. `clients/` holds a native client spike
   (gpui and Slint) that reads the same API; see [clients/README.md](clients/README.md).
+- **WebAssembly plugins:** a `plugins[]` entry with `"path": "/path/to/plugin.wasm"` loads a plugin in
+  Bifrost's JSON ABI (exports `malloc`, `free`, `get_name`, `init`, `pre_hook`, `post_hook`, `cleanup`) and
+  runs it on an embedded interpreter (WAMR, added to the Tov runtime by `tov-patches/0005-wamr.patch`).
+  `wasm_limits` on the entry caps its memory pages, stack and instructions per hook call. A plugin sees only
+  its own memory; a hook that traps, loops or answers with an error is logged and skipped. Go shared-object
+  plugins (`.so`) are not supported. `tests/wasm/plugin.c` is a small example. The chain runs Bifrost's LLM hooks
+  (`pre_hook`, `post_hook`) on every request type (chat, completions, embeddings, Responses, rerank, speech,
+  transcription, images, OCR) and on each chunk of a stream, and a `post_hook` answer with `has_error` turns a
+  response into an error. A module that exports `http_pre_hook`, `http_post_hook` or `http_stream_chunk_hook`
+  also gets Bifrost's HTTP transport hooks: before routing it can rewrite the request or answer it, after the
+  response it can rewrite that, and for each event of a stream it can rewrite, drop or end (see `docs/parity.md`,
+  section Plugins).
 - **Enterprise:** RBAC for the management API (admin, editor, viewer, auditor;
   `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), a hash-chained
   HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting
@@ -111,7 +125,8 @@ Two Raiju-only switches, both off by default (Bifrost's behaviour):
   key may use, has no price (no datasheet row, pricing override or config price). Requests
   with no budget pass as before, at cost 0. Settable through `PUT /api/config`.
 - `cache.scope_by_virtual_key`: the exact-match response cache keeps each virtual key's
-  entries apart, as the semantic cache does. Off, keys share exact-cache entries.
+  entries apart, as the semantic cache does. On by default; `false` lets keys share
+  exact-cache entries.
 
 ## Servers
 
@@ -192,5 +207,32 @@ make e2e     # gateway against a mock upstream, on both servers
 make openapi-check # docs/openapi/management.yaml against a probe gateway
 make parity-count  # recount docs/parity.md and refresh its Summary table
 make ui      # the web UI in headless Chromium against a real gateway
+make web     # rebuild the web UI (web/) and embed it in src/ui_assets.tov
+make web-check # rebuild it and fail when src/ui_assets.tov or the API types would change
 make bench
 ```
+
+### The web UI
+
+The admin client is a browser app in [`web/`](web/): SolidJS 2.0 (release candidate), TypeScript,
+Vite, built with [Bun](https://bun.sh). It talks to the gateway over HTTP and the `/ws` socket, and
+its API types are generated from `docs/openapi/management.yaml` (`web/src/api/schema.d.ts`, by
+`bun run gen`). The build is embedded in the binary through `src/ui_assets.tov`, which is generated
+and committed, so building the gateway needs no Node or Bun.
+
+```sh
+cd web
+bun install
+bun run dev      # Vite dev server on :5173, proxying /api, /ws, /v1 to a running gateway
+                 # (RAIJU_GATEWAY=http://127.0.0.1:8080 by default)
+bun run check    # tsc --noEmit
+bun run gen      # regenerate src/api/schema.d.ts after the spec changes
+bun run build    # web/dist, hashed file names
+cd .. && make web   # install + gen + check + build, then embed into src/ui_assets.tov
+```
+
+Commit `src/ui_assets.tov` and `web/src/api/schema.d.ts` with a UI change; `make web-check` fails
+when they are stale. The gateway serves the page with `Cache-Control: no-cache` and an ETag, the
+hashed files under `/assets/` as immutable, and gzip to clients that accept it. To serve the UI from
+a directory instead of the binary (a dev build, or a CDN copy), set `RAIJU_UI_DIR=/path/to/dist`;
+files there are revalidated on every request.

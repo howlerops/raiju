@@ -1,6 +1,6 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
-import { Config, VirtualKeyConfig, providerOf, providerNames } from "./config"
+import { Config, VirtualKeyConfig, providerOf, providerNames, resolveEnv } from "./config"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
@@ -18,30 +18,37 @@ import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath } from 
 import { retrieveRequest, retrieveBody } from "./model_retrieve"
 import { fields, find, elements, rawStr, rawBool } from "./json"
 import * as metrics from "./metrics"
-import { Session, SocketExt, prepare, onOpen, onMessage, onClose, extOpen, extMessage, extClose, extPong, attachHttp1 } from "./realtime"
+import { Session, SocketExt, prepare, extOpen, extMessage, extClose, extPong, attachHttp1 } from "./realtime"
 import { ResponsesSocket } from "./wsresponses"
 import { LiveSocket, liveContent, liveCreate, contentId, attachId, attachUpstream, ownerOf, credentialOk, validId } from "./live"
-import { WsConnection } from "./ws"
+import { WsConnection, SocketGate } from "./ws"
 import { DataScope } from "./scope"
 import { resourceOf } from "./rbac"
-import { matchRoute, handleMedia, deploymentRoute, deploymentRequest, realtimeSdp, nativeRoute, nativeCloud, vertexBearer } from "./media"
+import { largeRoute } from "./largepayload"
+import { matchRoute, handleMedia, handleMediaLarge, deploymentRoute, deploymentRequest, nativeRoute, nativeCloud, vertexBearer } from "./media"
+import { realtimeCall } from "./realtimecalls"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs } from "./schemas"
-import { handleApi, proxyWidening, Result } from "./store"
+import { handleApi, proxyWidening, Result, randomId } from "./store"
+import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
 import { passthroughPath, passthroughRoute } from "./passthrough"
-import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, headersRouteAsync, perUserApi, McpReply } from "./mcpapi"
-import { issuerRoute, keyById } from "./mcpissuer"
+import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, headersRouteAsync, exchangeRouteAsync, perUserApi, McpReply } from "./mcpapi"
+import { issuerRoute, keyById, grantsList, grantRevoke } from "./mcpissuer"
 import { promptRoute } from "./prompts"
 import { webhookApi, asyncSubmitHooked } from "./webhooks"
+import { agentApi, publicBase, CARD_PATH } from "./agents"
 import { flagRoute } from "./flags"
 import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
 import { McpSession } from "./mcp"
 import { Ops, Reply, UiSocket } from "./ops"
+import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
-import { INDEX_HTML } from "./ui_assets"
+import { serveUi, uiPath, UI_CSP } from "./uiserve"
+import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked } from "./pluginroute"
+import { kindOfPath } from "./plughttp"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -384,13 +391,17 @@ function dispatcher(engine: Engine): Dispatch {
     const u = URL.parse(req.url)
     const p = u === undefined ? "" : u.pathname
     if (p === "/v1/chat/completions") return await engine.chat(req)
-    if (p === "/v1/completions") return await engine.completions(req)
-    if (p === "/v1/embeddings") return await engine.embeddings(req)
-    if (p === "/v1/responses") return await responsesApi(engine, req)
+    if (p === "/v1/completions") return try await llmHooked(engine, req, "completions", async (r, s) => await engine.completions(r), undefined)
+    if (p === "/v1/embeddings") return try await llmHooked(engine, req, "embeddings", async (r, s) => await engine.embeddings(r), undefined)
+    if (p === "/v1/responses") return try await llmHooked(engine, req, "responses", async (r, s) => await responsesApi(engine, r), undefined)
     if (p === "/anthropic/v1/messages") return await anthropicMessages(engine, req)
-    if (p === "/v1/rerank") return try await rerank(engine, req)
+    if (p === "/v1/rerank") return try await llmHooked(engine, req, "rerank", async (r, s) => try await rerank(engine, r), undefined)
     const media = matchRoute("POST", p)
-    if (media !== undefined) return try await handleMedia(engine.cfg, req, media)
+    if (media !== undefined) {
+      const lk = kindOfPath("POST", p)
+      if (lk !== undefined) return try await llmHooked(engine, req, lk.op, async (r, s) => try await handleMedia(engine.cfg, r, media), undefined)
+      return try await handleMedia(engine.cfg, req, media)
+    }
     return errorResponse(404, `no route for ${p}`, "invalid_request_error", noHeaders())
   }
 }
@@ -428,6 +439,47 @@ function savedReply(status: int, body: string, saved: Result | undefined): Reply
   return { status: status, body: body, contentType: "application/json" }
 }
 
+// The SCIM reply: the body with the SCIM media type.
+function scimReply(status: int, body: string): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", SCIM_CONTENT_TYPE)
+  return new Response(body, { status: status, headers: h })
+}
+
+// The virtual keys' teams: a group in use by one is not deleted over SCIM.
+function keyTeamIds(vks: VirtualKeyConfig[] | undefined): string[] {
+  const out: string[] = []
+  for (const vk of vks ?? []) {
+    const t = vk.team_id
+    if (t !== undefined) out.push(t)
+  }
+  return out
+}
+
+// /scim/v2: the identity provider's SCIM requests, behind scim_config's provisioning token. The users and
+// teams a request changes are saved as one change and audited under the actor "scim".
+async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response> {
+  const sc = ops.store.cfg.scim_config
+  if (sc?.enabled !== true) return scimReply(404, errorBody(404, "", "SCIM provisioning is not enabled"))
+  const token = resolveEnv(sc?.config?.provisioningToken ?? "")
+  if (!scimAuthorized(req.headers.get("authorization") ?? "", token)) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
+  const body = req.method === "GET" ? "" : await req.text()
+  const u = URL.parse(req.url)
+  const origin = u === undefined ? "" : u.origin
+  const params = u === undefined ? new URLSearchParams("") : u.searchParams
+  const g = ops.store.cfg.governance
+  const st: ScimState = { users: g?.users ?? [], teams: g?.teams ?? [], roles: g?.roles ?? [], keyTeams: keyTeamIds(g?.virtual_keys) }
+  const r = scimHandle(st, req.method, path.slice("/scim/v2".byteLength), params, body, origin + "/scim/v2", () => randomId("team-"))
+  if (r.changed && r.status < 300) {
+    const saved = ops.store.setScim(r.state.users, r.state.teams)
+    if (saved.kind !== "ok") return scimReply(saved.status, errorBody(saved.status, "", saved.message))
+    ops.storeUpdated("/api/users")
+    ops.storeUpdated("/api/governance/teams")
+  }
+  if (req.method !== "GET") ops.recordChange("scim", req, path, r.status, body)
+  return scimReply(r.status, r.body)
+}
+
 // The management API, behind RBAC; every change lands in the audit log.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const gate = ops.gate(req, path)
@@ -442,6 +494,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path.startsWith("/api/users/") && path.split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, path)
   else if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
   else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
+  else if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) r = ops.apiKeysRoute(req.method, path, req.url, body, gate.actor)
   // the cache clears (DELETE) and the read-only plugin listings
   else if (path.startsWith("/api/cache/")) r = ops.cacheClear(req.method, path)
   else if (path === "/api/plugins" || path.startsWith("/api/plugins/")) r = ops.pluginsRoute(req.method, path, body)
@@ -456,6 +509,15 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
       if (saved.kind !== "ok") r = { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
     }
   }
+  // the MCP grants of the authorization server: the live grants (GET) and the revoke of one (DELETE)
+  else if (path === "/api/oauth2/sessions" || path.startsWith("/api/oauth2/sessions/")) {
+    const gu = URL.parse(req.url)
+    const gq = gu === undefined ? new URLSearchParams("") : gu.searchParams
+    const vkName = (vk: string): string => keyById(ops.engine.cfg, vk)?.name ?? ""
+    const ga = path === "/api/oauth2/sessions" && req.method === "GET" ? grantsList(gq, vkName) : path !== "/api/oauth2/sessions" && req.method === "DELETE" ? grantRevoke(path.slice("/api/oauth2/sessions/".byteLength)) : undefined
+    if (ga !== undefined) r = { status: ga.status, body: ga.body, contentType: ga.contentType }
+    else r = { status: 405, body: `{"error":{"message":"method ${req.method} is not allowed on this route","type":"invalid_request_error"}}`, contentType: "application/json" }
+  }
   else if (path === "/api/alerts") r = req.method === "GET" ? ops.alertsView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
   else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
@@ -466,6 +528,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   // adaptive load balancing: the keys held out of rotation, their incidents, and releasing them
   else if (path === "/api/adaptive-routing/held-keys") r = req.method === "GET" ? ops.adaptiveHeldKeys() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/adaptive-routing/incidents") r = req.method === "GET" ? ops.adaptiveIncidents() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (path === "/api/adaptive-routing/history/issues") r = req.method === "GET" ? ops.adaptiveHistory(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/adaptive-routing/conditions/clear") r = req.method === "POST" ? ops.adaptiveRelease(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/vault/flush-cache") r = req.method === "POST" ? ops.vaultFlush() : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/models/parameters") r = req.method === "GET" ? await ops.modelParameters(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
@@ -495,6 +558,19 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
     const wr = await webhookApi(ops.store.cfg.webhooks, req.method, req.url.slice(req.url.indexOf("/api/")), body)
     r = savedReply(wr.status, wr.body, wr.next === undefined ? undefined : ops.store.setWebhooks(wr.next))
   }
+  // registered A2A agents (agents.tov); the call history is ops.tov's
+  else if (path === "/api/agents" || path.startsWith("/api/agents/")) {
+    if (path === "/api/agents/push-configs" || path.startsWith("/api/agents/push-configs/")) {
+      const pu = URL.parse(req.url)
+      r = ops.pushConfigsRoute(req.method, path, pu === undefined ? new URLSearchParams("") : pu.searchParams)
+    } else if (path === "/api/agents/history") {
+      const hu = URL.parse(req.url)
+      r = req.method === "GET" ? ops.agentHistoryRoute(hu === undefined ? new URLSearchParams("") : hu.searchParams, sc) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+    } else {
+      const ar = await agentApi(ops.store.cfg.agents, req.method, req.url.slice(req.url.indexOf("/api/")), body, publicBase(ops.store.cfg.client?.a2a_external_client_url, req.url))
+      r = savedReply(ar.status, ar.body, ar.next === undefined ? undefined : ops.store.setAgents(ar.next))
+    }
+  }
   else if (path === "/api/feature-flags" || path.startsWith("/api/feature-flags/")) {
     const fr = flagRoute(ops.store.cfg.feature_flags, req.method, req.url.slice(req.url.indexOf("/api/")), body)
     r = savedReply(fr.status, fr.body, fr.next === undefined ? undefined : ops.store.setFeatureFlags(fr.next))
@@ -510,6 +586,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
     if (oa === undefined) oa = await oauthRoute(ops.store, req.method, path, body, mu === undefined ? "" : mu.origin)
     if (oa === undefined) oa = perUserApi(ops.store, req.method, mu === undefined ? path : path + mu.search, body, mu === undefined ? "" : mu.origin)
     if (oa === undefined) oa = await headersRouteAsync(ops.store, req.method, path, body)
+    if (oa === undefined) oa = await exchangeRouteAsync(ops.store, ops.engine.idp, req.method, path, body)
     if (oa === undefined) oa = await openapiRoute(req.method, path, body)
     // with dashboard auth off, clients registered here must reach public addresses only
     const mr = oa ?? mcpApi(ops.store, req.method, path, body, !ops.authOn)
@@ -527,7 +604,8 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)
-  return new Response(r.body, { status: r.status, headers: h })
+  // a 204 has no body (a response with one would be refused)
+  return new Response(r.status === 204 ? undefined : r.body, { status: r.status, headers: h })
 }
 
 function mcpView(engine: Engine): Response {
@@ -579,10 +657,10 @@ async function cors(cfg: Config, req: Request, res: Response): Promise<Response>
 
 export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int }
 
-// Bun.serve has no body limit of its own, so client.max_request_body_size_mb is checked here:
-// a declared length over the limit is refused unread, and a body with no length is read once
-// and refused when it is over. undefined means refused; otherwise the request to dispatch
-// (rebuilt around its bytes when they were read here).
+// client.max_request_body_size_mb is checked here, not by the server: a declared length over the
+// limit is refused unread, and a body with no length is read as far as the limit and refused when it
+// is over. undefined means refused; otherwise the request to dispatch (rebuilt around its bytes when
+// they were read here).
 export async function limitedBody(req: Request, maxBytes: int): Promise<Request | undefined> {
   if (req.method === "GET" || req.method === "HEAD") return req
   const declared = req.headers.get("content-length")
@@ -590,14 +668,53 @@ export async function limitedBody(req: Request, maxBytes: int): Promise<Request 
     const n = parseFloat(declared) ?? 0.0
     return n > maxBytes ? undefined : req
   }
-  let body: u8[] = []
+  const st = req.body
+  if (st === undefined) return req
+  const body: u8[] = []
   try {
-    body = await req.bytes()
+    while (true) {
+      const r = await st.pull()
+      const v = r.value
+      if (r.done || v === undefined) break
+      for (const b of v) body.push(b)
+      if (body.length > maxBytes) {
+        await st.cancel()
+        return undefined
+      }
+    }
   } catch (e) {
-    body = []
+    // a body cut off reads as what arrived
   }
-  if (body.length > maxBytes) return undefined
   return new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body })
+}
+
+// large_payload_optimization (largepayload.tov) at the front of a server: the Response that refuses or
+// serves a request whose body is big, the Request to go on with (its body was read, or is small), or
+// undefined for a request the feature does not touch.
+export async function largeFront(engine: Engine, req: Request): Promise<Response | Request | undefined> {
+  const lp = engine.large
+  if (lp === undefined || req.method !== "POST" || (req.headers.get("x-bf-async") ?? "") !== "") return undefined
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  // a deployment path names its model in the URL, not in the body: it is read whole
+  if (deploymentRoute(p) !== undefined) return undefined
+  const cp = compatPath(p)
+  const route = largeRoute(cp)
+  if (route !== "") {
+    const r = await engine.largeRequest(req, route, p)
+    if (r instanceof Response) return await echoRequestId(req, await cors(engine.cfg, req, r))
+    return r
+  }
+  // a multipart upload: audio, image edits and variations, files
+  if (!(req.headers.get("content-type") ?? "").toLowerCase().includes("multipart/form-data")) return undefined
+  const mr = matchRoute("POST", cp)
+  if (mr === undefined || (mr.modelIn !== "form" && mr.op !== "files.create")) return undefined
+  if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
+    return await echoRequestId(req, await cors(engine.cfg, req, errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())))
+  }
+  const m = await handleMediaLarge(engine.cfg, req, mr, lp)
+  if (m instanceof Response) return await echoRequestId(req, await cors(engine.cfg, req, m))
+  return m
 }
 
 function textResponse(body: string, contentType: string): Response {
@@ -606,14 +723,36 @@ function textResponse(body: string, contentType: string): Response {
   return new Response(body, { headers: h })
 }
 
+// A file of the web UI (the embedded build, or the directory RAIJU_UI_DIR names). The page
+// is revalidated on each load; the hashed files under /assets/ are cached for good.
+function uiResponse(p: string, req: Request): Response | undefined {
+  const r = serveUi(p, req.headers.get("if-none-match") ?? "", req.headers.get("accept-encoding") ?? "", process.env.RAIJU_UI_DIR ?? "")
+  if (r === undefined) return undefined
+  const h: Record<string, string> = new Map()
+  h.set("content-type", r.contentType)
+  h.set("cache-control", r.cache)
+  h.set("etag", r.etag)
+  h.set("vary", "accept-encoding")
+  h.set("x-content-type-options", "nosniff")
+  if (r.encoding !== "") h.set("content-encoding", r.encoding)
+  if (r.contentType.startsWith("text/html")) {
+    h.set("content-security-policy", UI_CSP)
+    h.set("referrer-policy", "no-referrer")
+    h.set("x-frame-options", "DENY")
+  }
+  if (r.status === 304) return new Response(undefined, { status: 304, headers: h })
+  if (r.binary) return new Response(r.bytes, { headers: h })
+  return new Response(r.text, { headers: h })
+}
+
 const CHAT_PATHS = ["/v1/chat/completions", "/openai/v1/chat/completions", "/openai/chat/completions"]
 
 // LiteLLM and LangChain clients pointed at the gateway: /litellm/... and /langchain/...
 // are the same routes without the prefix.
 export function compatPath(p: string): string {
-  if (p.startsWith("/litellm/")) return compatPath(p.slice(8))
-  if (p.startsWith("/langchain/")) return compatPath(p.slice(10))
-  if (p.startsWith("/pydanticai/")) return compatPath(p.slice(11))
+  if (p.startsWith("/litellm/")) return sdkPath(p.slice(8))
+  if (p.startsWith("/langchain/")) return sdkPath(p.slice(10))
+  if (p.startsWith("/pydanticai/")) return sdkPath(p.slice(11))
   // Cursor's routes are the same families under /cursor (its chat is served by dispatch: cursorChat)
   if (p.startsWith("/cursor/") && !isCursorChat(p)) return compatPath(p.slice(7))
   // the OpenAI SDK pointed at /openai: every /v1 route under /openai/v1
@@ -624,6 +763,13 @@ export function compatPath(p: string): string {
   // the same family mounted without the version segment (Bifrost mounts both): /openai/responses is /v1/responses
   if (isUnversionedOpenAI(p)) return "/v1" + p.slice(7)
   return p
+}
+
+// The SDK prefixes mount the decisions route without the version segment too (Bifrost's /litellm/decisions),
+// so /decisions under a prefix is /v1/decisions. A bare /decisions is not a route, as in Bifrost.
+function sdkPath(p: string): string {
+  const cp = compatPath(p)
+  return cp === "/decisions" ? "/v1/decisions" : cp
 }
 
 function isCursorChat(p: string): bool {
@@ -677,7 +823,38 @@ async function echoRequestId(req: Request, res: Response): Promise<Response> {
 
 export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
   const res = try await routes(engine, ops, req)
-  return await echoRequestId(req, res)
+  return await echoRequestId(req, await markAgentRejection(engine, req, res))
+}
+
+// The CLI that signs in with an identity credential sends it as a bearer token, with x-bf-agent-vk-id
+// when it has picked a key. When the gateway refuses that credential (a 401), x-bf-agent-auth tells the
+// client to sign in again; a refusal for any other reason (a 403 for a model, a budget) carries no mark.
+export async function markAgentRejection(engine: Engine, req: Request, res: Response): Promise<Response> {
+  if (res.status !== 401) return res
+  if ((res.headers.get("x-bf-agent-auth") ?? "") !== "") return res
+  const h = snapshot(req.headers)
+  const auth = h.get("authorization") ?? ""
+  if (!auth.startsWith("Bearer ")) return res
+  const agentClient = h.get("x-bf-agent-vk-id") !== undefined || h.get("x-bifrost-agent") !== undefined || auth.startsWith("Bearer ck-bf-agent-")
+  if (!agentClient) return res
+  // a credential the gateway accepts (a key, or an identity) was not what it refused
+  if (engine.gov.findKey(h) !== undefined) return res
+  const alt = engine.gov.altAuth
+  if (alt !== undefined && alt(h)) return res
+  const st = res.body
+  if (st !== undefined && st.pushed) return res
+  const hs: Record<string, string> = new Map()
+  res.headers.forEach((v, k) => {
+    if (k !== "content-length") hs.set(k, v)
+  })
+  hs.set("x-bf-agent-auth", "rejected")
+  let bytes: u8[] = []
+  try {
+    bytes = await res.bytes()
+  } catch (e) {
+    bytes = []
+  }
+  return new Response(bytes, { status: res.status, headers: hs })
 }
 
 async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
@@ -693,8 +870,9 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   const m = req.method
-  // x-bf-async on an inference route: the request runs as a job, and the caller polls it (Bifrost's integration routes)
-  if (m === "POST" && (req.headers.get("x-bf-async") ?? "") !== "" && !p.startsWith("/api/") && !p.startsWith("/v1/async/") && p !== "/mcp") {
+  // x-bf-async on an inference route: the request runs as a job, and the caller polls it (Bifrost's integration routes).
+  // The A2A gateway is not an inference route: its JSON-RPC calls are answered directly.
+  if (m === "POST" && (req.headers.get("x-bf-async") ?? "") !== "" && !p.startsWith("/api/") && !p.startsWith("/v1/async/") && p !== "/mcp" && !p.startsWith("/agents/a2a/")) {
     const again: Dispatch = async (r) => try await dispatch(engine, ops, r)
     const route = compatPath(p)
     return await sdkAsyncSubmit(engine.jobs, req, again, route.slice(1, route.byteLength))
@@ -704,6 +882,11 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   const cp = compatPath(p)
   if (cp !== p) return try await dispatch(engine, ops, await unprefixed(req, cp))
   const segs = p.split("/")
+  // SCIM 2.0 provisioning from the identity provider, behind its own bearer token (scim.tov)
+  if (p === "/scim/v2" || p.startsWith("/scim/v2/")) return await scimRoute(ops, req, p)
+  // the A2A gateway: an agent's card and its JSON-RPC endpoint (agents.tov); the caller's virtual key is checked there
+  if (p === "/agents/a2a" || p === "/agents/a2a/" || p === "/agents/a2a" + CARD_PATH) return await ops.a2aAggregate(req, publicBase(engine.cfg.client?.a2a_external_client_url, req.url))
+  if (p.startsWith("/agents/a2a/") && segs.length >= 5) return await ops.a2aRoute(req, segs[3]!, "/" + segs.slice(4).join("/"), publicBase(engine.cfg.client?.a2a_external_client_url, req.url))
   if (p === "/mcp") return await ops.mcp(req, undefined)
   if (p.startsWith("/mcp/") && segs.length === 3) return await ops.mcp(req, segs[2]!)
   // the Anthropic SDK's batch, file and model routes: before the generic media routes
@@ -726,13 +909,16 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   }
   const lc = contentId(p)
   if (lc !== "" && m === "GET") return await liveContent(engine, ops.liveSessions, req, lc)
-  if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine.cfg, req, await liveCreate(engine, req))
+  if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine.cfg, req, await liveCreate(engine, ops.liveSessions, req))
   if (m === "GET" || m === "HEAD") {
     // x-bf-async-id on an inference route: poll the job that route created
     const aid = req.headers.get("x-bf-async-id") ?? ""
     if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid)
     if (p === "/health") return Response.json({ status: "ok" })
-    if (p === "/") return textResponse(INDEX_HTML, "text/html; charset=utf-8")
+    if (uiPath(p)) {
+      const ui = uiResponse(p, req)
+      if (ui !== undefined) return ui
+    }
     if (p === "/metrics") return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
     if (p === "/v1/models" || p === "/openai/v1/models") return await cors(engine.cfg, req, await listModels(engine, req))
     if (p.startsWith("/v1/models/")) return await cors(engine.cfg, req, await retrieveModel(engine, req, p.slice(11)))
@@ -754,10 +940,11 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   }
   if (m === "POST") {
     if (CHAT_PATHS.includes(p)) return await cors(engine.cfg, req, await engine.chat(req))
-    if (p === "/v1/embeddings" || p === "/openai/v1/embeddings") return await cors(engine.cfg, req, await engine.embeddings(req))
-    if (p === "/v1/completions" || p === "/openai/v1/completions") return await cors(engine.cfg, req, await engine.completions(req))
-    if (p === "/v1/responses" || p === "/openai/v1/responses") return await cors(engine.cfg, req, await responsesApi(engine, req))
-    if (p === "/v1/rerank") return await cors(engine.cfg, req, await rerank(engine, req))
+    // the plugins' LLM hooks run on each of these request types (pluginroute.tov llmHooked)
+    if (p === "/v1/embeddings" || p === "/openai/v1/embeddings") return await cors(engine.cfg, req, try await llmHooked(engine, req, "embeddings", async (r, s) => await engine.embeddings(r), undefined))
+    if (p === "/v1/completions" || p === "/openai/v1/completions") return await cors(engine.cfg, req, try await llmHooked(engine, req, "completions", async (r, s) => await engine.completions(r), undefined))
+    if (p === "/v1/responses" || p === "/openai/v1/responses") return await cors(engine.cfg, req, try await llmHooked(engine, req, "responses", async (r, s) => await responsesApi(engine, r), undefined))
+    if (p === "/v1/rerank") return await cors(engine.cfg, req, try await llmHooked(engine, req, "rerank", async (r, s) => await rerank(engine, r), undefined))
     if (p === "/v1/decisions" || p === "/openai/v1/decisions" || p === "/typesafe/v1/systemone") return await cors(engine.cfg, req, await decisionRoute(engine, req, p))
     if (p === "/bedrock/rerank") return await cors(engine.cfg, req, await bedrockRerank(engine, req))
     if (p === "/v1/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, false))
@@ -765,7 +952,9 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     if (p === "/anthropic/v1/messages") return await cors(engine.cfg, req, await anthropicMessages(engine, req))
     if (p === "/anthropic/v1/complete") return await cors(engine.cfg, req, await anthropicLegacy(engine, req))
     if (isCursorChat(p)) return await cors(engine.cfg, req, await cursorChat(engine, req))
-    if (p === "/v1/realtime") return try await cors(engine.cfg, req, try await realtimeSdp(engine.cfg, req))
+    // a WebRTC realtime call is terminated on the gateway's own peer (realtimecalls.tov)
+    if (p === "/v1/realtime/calls") return await cors(engine.cfg, req, await realtimeCall(engine, req, true))
+    if (p === "/v1/realtime" || p === "/openai/v1/realtime") return await cors(engine.cfg, req, await realtimeCall(engine, req, false))
     if (p === "/v1/mcp/tool/execute") return await cors(engine.cfg, req, await engine.executeTool(req))
     if (p === "/cohere/v2/chat") return await cors(engine.cfg, req, await cohereChat(engine, req))
     if (p === "/cohere/v2/embed") return await cors(engine.cfg, req, await cohereEmbed(engine, req))
@@ -777,6 +966,7 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
+  if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
   if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
   if (p.startsWith("/api/oidc/") && m === "GET") return await ops.oidcRoute(req, p)
   // the MCP OAuth callback: the browser comes back here from the authorization server, with no session
@@ -787,7 +977,9 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
   }
   // the MCP authorization server (client.mcp_server_auth_mode both or oauth): discovery, registration, the
   // authorize and token endpoints, the consent pages, and the per-user connect page
-  const ia = await issuerRoute(engine.cfg, req, p, (v) => keyByValue(engine, v), (id) => keyById(engine.cfg, id), Date.now())
+  // the consent page offers session mode to a signed-in dashboard user (checked only on the consent routes)
+  const signedIn = p.startsWith("/api/oauth2/consent/flows/") && ops.consentSignedIn(req)
+  const ia = await issuerRoute(engine.cfg, req, p, (v) => keyByValue(engine, v), (id) => keyById(engine.cfg, id), Date.now(), signedIn, engine.gov.enforce)
   if (ia !== undefined) return ia
   // login and logout come before the gate: they are how a caller gets past it
   if (p.startsWith("/api/session/")) return await ops.sessionRoute(req, p)
@@ -805,6 +997,8 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
       return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
     }
+    const lk = kindOfPath(m, p)
+    if (lk !== undefined) return try await llmHooked(engine, req, lk.op, async (r, s) => try await handleMedia(engine.cfg, r, media), undefined)
     return try await handleMedia(engine.cfg, req, media)
   }
   if (m === "OPTIONS") {
@@ -845,6 +1039,8 @@ export function streamKind(p: string): string {
   if (p === "/cohere/v2/chat") return "cohere"
   if (p.startsWith(GENAI) && p.endsWith(":streamGenerateContent")) return "genai"
   if (p.startsWith("/bedrock/model/") && (p.endsWith("/converse-stream") || p.endsWith("/invoke-with-response-stream"))) return "bedrock"
+  if (p === "/anthropic/v1/complete") return "legacy"
+  if (isCursorChat(p)) return "cursor"
   return ""
 }
 
@@ -863,27 +1059,39 @@ export function streamsRequest(kind: string, text: string): bool {
 
 // The answer of a route kind; streamed into sink when there is one.
 export async function routeStream(engine: Engine, req: Request, kind: string, sink?: StreamSink): Promise<Response> {
+  return await markAgentRejection(engine, req, await routeStreamInner(engine, req, kind, sink))
+}
+
+async function routeStreamInner(engine: Engine, req: Request, kind: string, sink?: StreamSink): Promise<Response> {
   const u = URL.parse(req.url)
   const dep = deploymentRoute(u === undefined ? "" : u.pathname)
   if (dep !== undefined) return await routeStream(engine, await deploymentRequest(req, dep), kind, sink)
   const p = compatPath(u === undefined ? "" : u.pathname)
   if (kind === "anthropic") return await anthropicMessages(engine, req, sink)
+  if (kind === "legacy") return await anthropicLegacy(engine, req, sink)
+  if (kind === "cursor") return await cursorChat(engine, req, sink)
   if (kind === "cohere") return await cohereChat(engine, req, sink)
   if (kind === "genai") return await genai(engine, req, p.slice(GENAI.byteLength), sink)
   if (kind === "bedrock") {
     const segs = p.split("/")
     return await bedrockModel(engine, req, segs[3]!, segs[4]!, sink)
   }
-  if (kind === "completions") return await engine.completions(req, sink)
-  if (kind === "responses") return await responsesApi(engine, req, sink)
+  if (kind === "completions" || kind === "responses") {
+    try {
+      if (kind === "completions") return try await llmHooked(engine, req, "completions", async (r, s) => await engine.completions(r, s), sink)
+      return try await llmHooked(engine, req, "responses", async (r, s) => await responsesApi(engine, r, s), sink)
+    } catch (e) {
+      return errorResponse(500, "internal error", "api_error", noHeaders())
+    }
+  }
   return await engine.chat(req, sink)
 }
 
-async function runChat(engine: Engine, req: Request, sink: StreamSink, head: StreamHead, kind: string): Promise<void> {
+async function runChat(engine: Engine, req: Request, sink: StreamSink, head: StreamHead, kind: string, tr: TransportRun | undefined): Promise<void> {
   try {
     const r = await routeStream(engine, req, kind, sink)
-    // never started streaming (an error, a cache hit, a non-streaming provider): the whole answer
-    if (!sink.started) head.give(r)
+    // never started streaming (an error, a cache hit, a non-streaming provider): the whole answer, through the HTTP post hooks
+    if (!sink.started) head.give(await transportEnd(engine, tr, r))
   } catch (e) {
     head.give(errorResponse(500, "internal error", "api_error", noHeaders()))
   }
@@ -891,11 +1099,11 @@ async function runChat(engine: Engine, req: Request, sink: StreamSink, head: Str
 
 // A streamed route on Bun.serve: the answer is a ReadableStream body that gets each SSE event
 // (or binary Bedrock frame) as the upstream produces it (needs Tov's stream bodies; see tov-patches/).
-async function chatStreamed(engine: Engine, req: Request, kind: string): Promise<Response> {
+async function chatStreamed(engine: Engine, req: Request, kind: string, tr: TransportRun | undefined): Promise<Response> {
   const text = await req.text()
   const hs: Record<string, string> = snapshot(req.headers)
   const again = new Request(req.url, { method: "POST", headers: hs, body: text })
-  if (!streamsRequest(kind, text)) return await cors(engine.cfg, req, await routeStream(engine, again, kind))
+  if (!streamsRequest(kind, text)) return await cors(engine.cfg, req, await transportEnd(engine, tr, await routeStream(engine, again, kind)))
   const head = new StreamHead()
   const sink = new StreamSink(
     (status, headers) => {
@@ -927,8 +1135,15 @@ async function chatStreamed(engine: Engine, req: Request, kind: string): Promise
   const p = new Promise<Response>((resolve) => {
     head.resolve = resolve
   })
-  runChat(engine, again, sink, head, kind)
+  // the plugins' chunk hooks see each event on its way to the client
+  runChat(engine, again, transportSink(tr, sink), head, kind, tr)
   return await cors(engine.cfg, req, await p)
+}
+
+// One request through dispatch, with the plugins' HTTP post hooks on the answer.
+async function hookedDispatch(engine: Engine, ops: Ops, req: Request, tr: TransportRun | undefined): Promise<Response, TypeError> {
+  const res = try await dispatch(engine, ops, req)
+  return await transportEnd(engine, tr, res)
 }
 
 // The base path of a WebSocket route. The OpenAI integration prefixes Bifrost registers for these
@@ -952,6 +1167,12 @@ function wsSession(req: Request, ext: SocketExt): Session {
   return s
 }
 
+// The route's session cap (websocket.max_connections_per_user) for a socket that counts against it.
+function gated(ext: SocketExt, g: SocketGate): SocketExt {
+  ext.gate = g
+  return ext
+}
+
 // The WebSocket routes, for both servers: the realtime relay, the Responses API (GET /v1/responses),
 // GPT Live (/v1/live/sessions and its attach) and the UI socket (/ws). A refusal is decided before
 // the upgrade, so the client gets an HTTP status.
@@ -968,8 +1189,8 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
   const att = attachId(p)
   if (p !== "/v1/responses" && p !== "/v1/live/sessions" && p !== "/ws" && att === "") return { kind: "none" }
   const h = snapshot(req.headers)
-  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, new ResponsesSocket(engine, h)) }
-  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map())) }
+  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, gated(new ResponsesSocket(engine, h), engine.wsResponses)) }
+  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map()), engine.wsLive)) }
   if (att !== "") {
     if (!validId(att)) return { kind: "refused", status: 400, message: "a session id is required" }
     if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
@@ -977,20 +1198,27 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
     if (!ops.liveSessions.allowed(att, owner)) return { kind: "refused", status: 404, message: "live session not found" }
     const up = attachUpstream(engine, h, att)
     if (up === undefined) return { kind: "refused", status: 404, message: "no OpenAI key is configured for live sessions" }
-    return { kind: "session", session: wsSession(req, new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers)) }
+    return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, owner, up.url, up.headers), engine.wsLive)) }
   }
   if (p === "/ws") {
+    // the resume cursor (since=node:seq,...) and the batch flag (batch=1) ride on the URL; a bad cursor is refused
+    // before the ticket is spent
+    const sinceText = u === undefined ? "" : u.searchParams.get("since") ?? ""
+    const cursor: Map<string, int> | undefined = sinceText === "" ? undefined : parseCursor(sinceText)
+    if (sinceText !== "" && cursor === undefined) return { kind: "refused", status: 400, message: "since must be node:seq pairs" }
+    const bt = u === undefined ? "" : u.searchParams.get("batch") ?? ""
+    const batch = bt === "1" || bt === "true"
     // a ticket from POST /api/session/ws-ticket stands for the caller's credentials, once and briefly
     const tk = u === undefined ? "" : u.searchParams.get("ticket") ?? ""
     if (tk !== "") {
       const actor = ops.wsTickets.consume(tk, Date.now())
       if (actor === undefined) return { kind: "refused", status: 401, message: "the WebSocket ticket is invalid, used or expired" }
-      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(actor))) }
+      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(actor), batch, cursor)) }
     }
     // the live feed is log data: whoever may read /api/logs may open it, and sees its own data scope
     const g = ops.gate(req, "/api/logs")
     if (g.kind === "deny") return { kind: "refused", status: g.res.status, message: g.res.status === 401 ? "authentication is required" : "this role may not open the UI socket" }
-    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(g.actor))) }
+    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(g.actor), batch, cursor)) }
   }
   return { kind: "none" }
 }
@@ -1011,10 +1239,18 @@ export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: () 
 }
 
 // One HTTP request on the Bun.serve server: the body limit, then the streamed or whole route.
-async function bunHttp(engine: Engine, ops: Ops, req0: Request, limit: int): Promise<Response, TypeError> {
+async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Promise<Response, TypeError> {
+  let req0 = req00
+  const lf = await largeFront(engine, req00)
+  if (lf instanceof Response) return lf
+  if (lf instanceof Request) req0 = lf
   const within = try await limitedBody(req0, limit)
   if (within === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
-  const req = within
+  // the plugins' HTTP pre hooks, before the request is routed
+  const th = await transportStart(engine, within)
+  if (th.response !== undefined) return th.response
+  const req = th.request
+  const tr = th.tr
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   const cp = compatPath(p)
@@ -1023,17 +1259,26 @@ async function bunHttp(engine: Engine, ops: Ops, req0: Request, limit: int): Pro
   // an x-bf-async request runs as a job through dispatch, not as a stream
   const asyncReq = (req.headers.get("x-bf-async") ?? "") !== ""
   const kind = req.method === "POST" && !asyncReq ? streamKind(cp) : ""
-  if (kind !== "") return try await timed(p, req.method, t0, reqBytes, req.headers, chatStreamed(engine, req, kind))
-  return try await timed(p, req.method, t0, reqBytes, req.headers, dispatch(engine, ops, req))
+  try {
+    if (kind !== "") return try await timed(p, req.method, t0, reqBytes, req.headers, chatStreamed(engine, req, kind, tr))
+    return try await timed(p, req.method, t0, reqBytes, req.headers, hookedDispatch(engine, ops, req, tr))
+  } finally {
+    transportDone(engine, tr)
+  }
 }
 
 // The Bun.serve server (the default): streamed chat answers, Tov's multi-process workers,
 // native WebSockets.
 export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
+  const lp = engine.large
   const server = Bun.serve<Session>({
     port: opts.port,
     hostname: opts.hostname,
     workers: opts.workers,
+    // large_payload_optimization: bodies over the request threshold arrive as a stream, and the sizes are
+    // checked by the gateway (client.max_request_body_size_mb, large_payload_optimization.max_payload_bytes)
+    bodyStreamThreshold: lp === undefined ? undefined : Math.max(1, lp.requestThreshold),
+    maxRequestBodySize: lp === undefined ? undefined : 1099511627776,
     fetch(req0, server) {
       const wu = wsUpgrade(engine, ops, req0)
       if (wu.kind === "refused") return errorResponse(wu.status, wu.message, "invalid_request_error", noHeaders())
@@ -1045,13 +1290,13 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
     },
     websocket: {
       open: (ws) => {
-        if (!extOpen(ws)) onOpen(ws)
+        extOpen(ws)
       },
       message: (ws, m) => {
-        if (!extMessage(ws, m)) onMessage(ws, m)
+        extMessage(ws, m)
       },
       close: (ws) => {
-        if (!extClose(ws)) onClose(ws)
+        extClose(ws)
       },
       pong: (ws) => {
         extPong(ws)
@@ -1076,6 +1321,13 @@ test("compat paths: the unversioned OpenAI family and the Cursor prefix", () => 
   expect(compatPath("/cursor/anthropic/v1/messages")).toBe("/anthropic/v1/messages")
   expect(compatPath("/cursor/v1/chat/completions")).toBe("/cursor/v1/chat/completions")
   expect(compatPath("/v1/chat/completions")).toBe("/v1/chat/completions")
+  // decisions: the version segment is optional under the OpenAI family and the SDK prefixes
+  expect(compatPath("/openai/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/openai/v1/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/litellm/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/langchain/v1/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/pydanticai/decisions")).toBe("/v1/decisions")
+  expect(compatPath("/decisions")).toBe("/decisions")
 })
 
 test("the Responses route streams through the sink when the request asks for a stream", () => {

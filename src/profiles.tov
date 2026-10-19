@@ -206,6 +206,75 @@ export function applyProfiles(vk: VirtualKeyConfig, profileIds: string[], profil
   }
 }
 
+// The model patterns a profile allows, or undefined when it names none (so it allows every model): its
+// allowed_models, else the provider configs it lists (each provider's models, or every model of it).
+function allowedOf(p: AccessProfile): string[] | undefined {
+  if (p.allowed_models !== undefined) return p.allowed_models
+  const pcs = p.provider_configs ?? []
+  if (pcs.length === 0) return undefined
+  const out: string[] = []
+  for (const pc of pcs) {
+    const al = pc.allowed_models
+    if (al === undefined || al.length === 0) {
+      out.push(pc.provider + "/*")
+      continue
+    }
+    for (const m of al) out.push(pc.provider + "/" + m)
+  }
+  return out
+}
+
+// The policy of the profiles a user holds, added to the policy of one of the user's keys (eff). Held
+// profiles widen the models together: a model is allowed when any held profile allows it, and the key's
+// own list still narrows that. Their denied models, required headers and token caps add to the key's own,
+// as profiles do. An inactive held profile counts for nothing, and an invalid one is an error the key is
+// refused on (fail closed), as it is for the key's own profiles.
+export function applyHeld(eff: Effective, held: AccessProfile[]): Effective {
+  const errors: string[] = []
+  for (const e of eff.errors) errors.push(e)
+  let union: string[] | undefined = undefined
+  let open = false
+  let maxTokens = eff.maxTokens
+  const denied: string[] = []
+  for (const d of eff.deniedModels) denied.push(d)
+  const headers: string[] = []
+  for (const h of eff.requiredHeaders) headers.push(h)
+  for (const p of held) {
+    if (p.is_active === false) continue
+    const why = validateProfile(p)
+    if (why !== "") {
+      errors.push(`access profile ${p.id} is invalid: ${why}`)
+      continue
+    }
+    const al = allowedOf(p)
+    if (al === undefined) open = true
+    else union = union === undefined ? al : union.concat(al)
+    for (const d of p.denied_models ?? []) {
+      if (!denied.includes(d)) denied.push(d)
+    }
+    for (const h of p.required_headers ?? []) {
+      const l = h.toLowerCase()
+      if (!headers.includes(l)) headers.push(l)
+    }
+    const mt = p.max_tokens
+    if (mt !== undefined && (maxTokens === undefined || mt < maxTokens)) maxTokens = mt
+  }
+  // the held union narrows nothing when a held profile allows every model
+  let allowed = eff.allowedModels
+  if (!open && union !== undefined) {
+    allowed = allowed === undefined ? union : intersectLists(allowed, union, false)
+  }
+  return {
+    vk: eff.vk,
+    mcpTools: eff.mcpTools,
+    requiredHeaders: headers,
+    maxTokens: maxTokens,
+    deniedModels: denied,
+    allowedModels: allowed,
+    errors: errors,
+  }
+}
+
 // Whether the effective key may call provider/model. Deny wins over allow, and
 // an unset allow list allows every model that is not denied.
 export function modelAllowed(eff: Effective, provider: string, model: string): bool {
@@ -443,7 +512,10 @@ function updateProfile(profiles: AccessProfile[], id: string, body: string): Pro
   const b = parseBody(body)
   if (b === undefined) return perror(400, "body must be a JSON object", profiles)
   if (b.id !== undefined && b.id !== id) return perror(400, "the id in the body must match the id in the path", profiles)
-  const p = withVersion(toProfile(b, id), "update", profiles[i]!.versions)
+  // the role attachments are managed by their own route, so an update keeps them
+  let made = toProfile(b, id)
+  made.roles = profiles[i]!.roles
+  const p = withVersion(made, "update", profiles[i]!.versions)
   const why = validateProfile(p)
   if (why !== "") return perror(400, why, profiles)
   const next: AccessProfile[] = []
@@ -562,6 +634,35 @@ function profileMap(ps: AccessProfile[]): Map<string, AccessProfile> {
 function effOf(vk: VirtualKeyConfig, ids: string[], ps: AccessProfile[]): Effective {
   return applyProfiles(vk, ids, profileMap(ps))
 }
+
+test("held profiles widen the models a key may call, and their denials and headers apply", () => {
+  const vk: VirtualKeyConfig = { id: "k", value: "v" }
+  const none: Map<string, AccessProfile> = new Map()
+  const own = applyProfiles(vk, [], none)
+  const held: AccessProfile[] = [{ id: "h1", allowed_models: ["openai/gpt-4o"] }, { id: "h2", provider_configs: [{ provider: "anthropic" }] }]
+  const eff = applyHeld(own, held)
+  expect(modelAllowed(eff, "openai", "gpt-4o")).toBe(true)
+  expect(modelAllowed(eff, "anthropic", "claude")).toBe(true)
+  expect(modelAllowed(eff, "openai", "gpt-4o-mini")).toBe(false)
+  // the key's own list still narrows the union
+  const ownProfiles: Map<string, AccessProfile> = new Map()
+  ownProfiles.set("own", { id: "own", allowed_models: ["openai/*"] })
+  const own2 = applyProfiles({ id: "k", value: "v", access_profile_ids: ["own"] }, ["own"], ownProfiles)
+  const eff2 = applyHeld(own2, held)
+  expect(modelAllowed(eff2, "anthropic", "claude")).toBe(false)
+  expect(modelAllowed(eff2, "openai", "gpt-4o")).toBe(true)
+  // a held profile that names no models lifts the list, and a denied model stays denied
+  const lifted = applyHeld(own2, [{ id: "h3", denied_models: ["openai/gpt-4o"] }])
+  expect(modelAllowed(lifted, "openai", "gpt-4o")).toBe(false)
+  expect(modelAllowed(lifted, "openai", "gpt-4o-mini")).toBe(true)
+  expect(modelAllowed(lifted, "anthropic", "claude")).toBe(false)
+  // an inactive held profile counts for nothing
+  expect(modelAllowed(applyHeld(own2, [{ id: "h4", allowed_models: ["anthropic/*"], is_active: false }]), "anthropic", "claude")).toBe(false)
+  // a held profile's headers and token cap apply to the key
+  const capped = applyHeld(own, [{ id: "h5", required_headers: ["X-Team"], max_tokens: 500 }, { id: "h6", max_tokens: 900 }])
+  expect(capped.requiredHeaders.join(",")).toBe("x-team")
+  expect(capped.maxTokens).toBe(500)
+})
 
 test("no profiles leave the key and the policy unrestricted", () => {
   const eff = effOf(vkOf(), [], [])

@@ -12,6 +12,7 @@ import { McpAuthConfig, AuthEndpoints, discoveryUrls, registrationRequest, regis
 import { deadline } from "./deadline"
 import { secureHex } from "./crypto"
 import { McpClientConfig, McpConfig, McpTlsConfig, McpUserCredential, McpHeaderFlow, McpSession, sanitizeName, durationMsOf, userHeadersOf } from "./mcp"
+import { McpTokenExchange, IdpEndpoints, exchangeToken, adminCredential, needsReverify } from "./tokenexchange"
 import { McpUserToken, UserFlow, userFlowById, userFlowsLive, takeUserFlow, forgetUserFlows, dropUserFlow, startUserFlow, exchangeUserCode, rowFromTokens, upsertUserRow, dropUserRow, userTokenIndex, tokenAction, flowIdOfPath, consentLink } from "./mcpuser"
 import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, parseSpec, inputSchema } from "./openapi"
 import * as vmcp from "./vmcp"
@@ -43,6 +44,9 @@ type ClientBody = {
   allowed_extra_headers?: string[],
   openapi_config?: OpenApiConfig,
   per_user_header_keys?: string[],
+  is_code_mode_client?: bool,
+  token_exchange?: McpTokenExchange,
+  max_instructions_length?: int,
 }
 
 // A tool in a virtual MCP's tools: Bifrost's {mcp_client_id, tool_names} or Raiju's native form.
@@ -51,7 +55,7 @@ type ToolBody = { mcp_client_id?: string, tool_names?: string[], source?: string
 type VmcpBody = { name?: string, endpoint_slug?: string, description?: string, enabled?: bool }
 
 // The JSON kind each body field must have: s string, b bool, a array, o object.
-const CLIENT_KINDS: string[] = ["name:s", "connection_type:s", "connection_string:s", "auth_type:s", "headers:o", "auth:o", "stdio_config:o", "tools_to_execute:a", "tools_to_skip:a", "tools_to_auto_execute:a", "allow_by_default:b", "allow_on_all_virtual_keys:b", "disabled:b", "tool_sync_interval:s", "tls_config:o", "is_ping_available:b", "needs_session_stickiness:b", "allowed_extra_headers:a", "tool_pricing:o", "openapi_config:o", "per_user_header_keys:a"]
+const CLIENT_KINDS: string[] = ["name:s", "connection_type:s", "connection_string:s", "auth_type:s", "headers:o", "auth:o", "stdio_config:o", "tools_to_execute:a", "tools_to_skip:a", "tools_to_auto_execute:a", "allow_by_default:b", "allow_on_all_virtual_keys:b", "disabled:b", "tool_sync_interval:s", "tls_config:o", "is_ping_available:b", "needs_session_stickiness:b", "allowed_extra_headers:a", "tool_pricing:o", "openapi_config:o", "per_user_header_keys:a", "is_code_mode_client:b", "token_exchange:o", "max_instructions_length:n"]
 const VMCP_KINDS: string[] = ["name:s", "endpoint_slug:s", "description:s", "enabled:b", "tools:a"]
 const TOOL_KINDS: string[] = ["mcp_client_id:s", "tool_names:a", "source:s", "as:s", "description:s", "defaults:s"]
 const CONNECT_MS = 15000
@@ -103,6 +107,7 @@ function kindOk(fs: Field[], key: string, kind: string): bool {
   if (kind === "s") return r.startsWith("\"")
   if (kind === "b") return r === "true" || r === "false"
   if (kind === "a") return r.startsWith("[")
+  if (kind === "n") return "-0123456789".includes(r.slice(0, 1))
   return r.startsWith("{")
 }
 
@@ -282,6 +287,12 @@ function redactClient(c: McpClientConfig): McpClientConfig {
     ns.env = maskMap(ns.env)
     n.stdio_config = ns
   }
+  const te = n.token_exchange
+  if (te !== undefined) {
+    let nt = te
+    nt.client_secret = maskOpt(nt.client_secret)
+    n.token_exchange = nt
+  }
   const oc = n.openapi_config
   if (oc !== undefined) {
     let no = oc
@@ -418,6 +429,8 @@ function clientFields(fs: Field[], b: ClientBody): ClientBody {
   n.allowed_extra_headers = present(fs, "allowed_extra_headers", n.allowed_extra_headers)
   n.openapi_config = present(fs, "openapi_config", n.openapi_config)
   n.per_user_header_keys = present(fs, "per_user_header_keys", n.per_user_header_keys)
+  n.is_code_mode_client = present(fs, "is_code_mode_client", n.is_code_mode_client)
+  n.max_instructions_length = present(fs, "max_instructions_length", n.max_instructions_length)
   return n
 }
 
@@ -455,7 +468,22 @@ function pricingFrom(fs: Field[]): { value: Map<string, f64> | undefined, error:
 function listClients(store: ConfigStore): McpReply {
   const list = clientsOf(store.cfg)
   const parts: string[] = []
-  for (const c of list) parts.push(clientJson(c))
+  for (const c of list) {
+    const j = clientJson(c)
+    // a token_exchange client's retained admin credential, as Bifrost lists it (state and expiry, no token)
+    let row: McpUserToken | undefined = undefined
+    if (c.auth_type === "token_exchange") {
+      for (const r of store.cfg.mcp?.exchange_admin ?? []) {
+        if (r.mcp_client_name === c.name) row = r
+      }
+    }
+    if (row === undefined) parts.push(j)
+    else {
+      const cred = adminCredential(row)
+      const state = needsReverify(row) ? `,"state":"needs_reauth"` : ""
+      parts.push(`${j.slice(0, j.byteLength - 1)},"credential":${JSON.stringify(cred)}${state}}`)
+    }
+  }
   return reply(200, `{"clients":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
 }
 
@@ -492,6 +520,8 @@ function createClient(store: ConfigStore, body: string, publicOnly: bool): McpRe
   const auth = b.auth_type ?? "none"
   const pue = perUserError(auth, ct, b.auth?.type ?? "", b.per_user_header_keys)
   if (pue !== "") return fail(400, pue)
+  const tee = exchangeError(auth, ct, b.auth?.type ?? "", b.token_exchange)
+  if (tee !== "") return fail(400, tee)
   const cp = connectionError(b, ct)
   if (cp !== "") return fail(400, cp)
   const ae = authError(b.auth)
@@ -502,6 +532,7 @@ function createClient(store: ConfigStore, body: string, publicOnly: bool): McpRe
   if (to.error !== "") return fail(400, to.error)
   const pr = pricingFrom(fs)
   if (pr.error !== "") return fail(400, pr.error)
+  if ((b.max_instructions_length ?? 0) < 0) return fail(400, "max_instructions_length must not be negative")
   // Bifrost: a new http client connects fresh for each call unless it says it needs a session
   const sticky = rawBool(fs, "needs_session_stickiness")
   if (ct !== "http" && sticky === false) return fail(400, "needs_session_stickiness false applies only to http connections: sse and stdio stay sticky")
@@ -510,6 +541,8 @@ function createClient(store: ConfigStore, body: string, publicOnly: bool): McpRe
   if (ct === "openapi") c.openapi_config = b.openapi_config
   c.tool_execution_timeout = to.value
   c.is_ping_available = b.is_ping_available ?? true
+  c.is_code_mode_client = b.is_code_mode_client
+  c.max_instructions_length = (b.max_instructions_length ?? 0) > 0 ? b.max_instructions_length : undefined
   c.needs_session_stickiness = ct === "http" ? (sticky ?? false) : undefined
   c.allowed_extra_headers = b.allowed_extra_headers
   c.tool_pricing = pr.value
@@ -523,6 +556,10 @@ function createClient(store: ConfigStore, body: string, publicOnly: bool): McpRe
     c.per_user_header_keys = normalKeys(b.per_user_header_keys)
   }
   if (auth === "per_user_oauth") c.auth_type = auth
+  if (auth === "token_exchange") {
+    c.auth_type = auth
+    c.token_exchange = b.token_exchange
+  }
   c.stdio_config = b.stdio_config
   c.tools_to_execute = b.tools_to_execute
   c.tools_to_skip = b.tools_to_skip
@@ -585,6 +622,11 @@ function updateClient(store: ConfigStore, id: string, body: string, publicOnly: 
     c.openapi_config = keepOpenApi(b.openapi_config, c.openapi_config)
   }
   if (has(fs, "is_ping_available")) c.is_ping_available = b.is_ping_available
+  if (has(fs, "is_code_mode_client")) c.is_code_mode_client = b.is_code_mode_client
+  if (has(fs, "max_instructions_length")) {
+    if ((b.max_instructions_length ?? 0) < 0) return fail(400, "max_instructions_length must not be negative")
+    c.max_instructions_length = (b.max_instructions_length ?? 0) > 0 ? b.max_instructions_length : undefined
+  }
   if (has(fs, "allowed_extra_headers")) c.allowed_extra_headers = b.allowed_extra_headers
   // can be turned on, never off (Bifrost's require_public_target)
   if (publicOnly) c.require_public_target = true
@@ -602,13 +644,26 @@ function updateClient(store: ConfigStore, id: string, body: string, publicOnly: 
     const keys = has(fs, "per_user_header_keys") ? b.per_user_header_keys : c.per_user_header_keys
     const pue = perUserError(t, c.connection_type, c.auth?.type ?? "", keys)
     if (pue !== "") return fail(400, pue)
-    c.auth_type = t === "per_user_headers" || t === "per_user_oauth" ? t : undefined
+    const tte = exchangeError(t, c.connection_type, c.auth?.type ?? "", has(fs, "token_exchange") ? b.token_exchange : c.token_exchange)
+    if (tte !== "") return fail(400, tte)
+    c.auth_type = t === "per_user_headers" || t === "per_user_oauth" || t === "token_exchange" ? t : undefined
     c.per_user_header_keys = t === "per_user_headers" ? normalKeys(keys) : undefined
+    c.token_exchange = t === "token_exchange" ? (has(fs, "token_exchange") ? b.token_exchange : c.token_exchange) : undefined
+  } else if (has(fs, "token_exchange") && c.auth_type === "token_exchange") {
+    const tte = exchangeError("token_exchange", c.connection_type, c.auth?.type ?? "", b.token_exchange)
+    if (tte !== "") return fail(400, tte)
+    c.token_exchange = b.token_exchange
   }
 
+  // a changed token exchange (its audience, client or identity provider) needs a new verification: the admin credential goes
+  const exchangeChanged = JSON.stringify(list[at]!.token_exchange) !== JSON.stringify(c.token_exchange) || list[at]!.auth_type !== c.auth_type
   let next: McpClientConfig[] = list
   next[at] = c
-  const err = persist(store, withClients(store.cfg, next))
+  let cfgNext = withClients(store.cfg, next)
+  if (exchangeChanged) {
+    cfgNext = withExchangeAdmin(cfgNext, exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], c.name))
+  }
+  const err = persist(store, cfgNext)
   if (err !== undefined) return err
   return reply(200, clientJson(c))
 }
@@ -620,7 +675,7 @@ function deleteClient(store: ConfigStore, id: string): McpReply {
   for (const c of list) {
     if (c.name !== id) next.push(c)
   }
-  const err = persist(store, withClients(store.cfg, next))
+  const err = persist(store, withExchangeAdmin(withClients(store.cfg, next), exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], id)))
   if (err !== undefined) return err
   return reply(200, `{"status":"success","message":"MCP client removed successfully"}`)
 }
@@ -702,6 +757,7 @@ const HEADER_FLOW_TTL_MS: f64 = 1800000.0
 // auth_type per_user_headers applies to http and sse clients with per_user_header_keys, and the client
 // carries no auth object. "" when the combination is fine.
 function perUserError(t: string, ct: string, authT: string, keys: string[] | undefined): string {
+  if (t === "token_exchange") return ""
   if (t !== "none" && t !== "headers" && t !== "per_user_headers" && t !== "per_user_oauth") return `auth_type "${t}" is not supported by this gateway: use none, headers, per_user_headers or per_user_oauth`
   if (t === "per_user_oauth") {
     if (ct !== "http" && ct !== "sse") return "auth_type per_user_oauth applies to http and sse connections"
@@ -716,6 +772,18 @@ function perUserError(t: string, ct: string, authT: string, keys: string[] | und
   for (const k of ks) {
     if (k.trim() === "") return "per_user_header_keys must not contain an empty name"
   }
+  return ""
+}
+
+// auth_type token_exchange applies to http and sse clients with a token_exchange block (its audience, and the
+// exchange application's client_id unless use_idp_credentials), and no auth object. "" when the combination is fine.
+function exchangeError(t: string, ct: string, authT: string, te: McpTokenExchange | undefined): string {
+  if (t !== "token_exchange") return ""
+  if (ct !== "http" && ct !== "sse") return "auth_type token_exchange applies to http and sse connections"
+  if (authT !== "") return "auth and auth_type token_exchange cannot be set together"
+  if (te === undefined) return "token_exchange is required for auth_type token_exchange"
+  if ((te.audience ?? "").trim() === "") return "token_exchange.audience is required"
+  if (te.use_idp_credentials !== true && (te.client_id ?? "").trim() === "") return "token_exchange.client_id is required unless use_idp_credentials is set"
   return ""
 }
 
@@ -762,10 +830,12 @@ function credentialIndex(list: McpUserCredential[], client: string, vk: string):
 
 // Connects to a per_user_headers client with these header values and reports the tools it lists, or why it
 // could not connect. The client is a copy: nothing is saved here.
-async function dialWith(cfg: McpClientConfig, headers: Map<string, string>, allow: string[]): Promise<{ ok: bool, tools: int, error: string }> {
+async function dialWith(cfg: McpClientConfig, headers: Map<string, string>, allow: string[], admin?: string): Promise<{ ok: bool, tools: int, error: string }> {
   let c = cfg
   c.headers = headers
   const s = new McpSession(c, CONNECT_MS, allow)
+  // a token_exchange client connects with its admin credential; a verification passes the token it has just exchanged
+  s.adminToken = admin ?? ""
   await s.connect()
   return { ok: s.connected, tools: s.tools.length, error: s.lastError }
 }
@@ -970,6 +1040,91 @@ export async function headersRouteAsync(store: ConfigStore, method: string, path
     return try await verifyClient(store, segs[3]!, body)
   }
   return undefined
+}
+
+// The config with the admin discovery credentials of the token_exchange clients set.
+function withExchangeAdmin(c: Config, list: McpUserToken[]): Config {
+  let n = c
+  let m: McpConfig = n.mcp ?? {}
+  m.exchange_admin = list
+  n.mcp = m
+  return n
+}
+
+// The admin credentials without the one of client.
+function exchangeAdminWithout(list: McpUserToken[], client: string): McpUserToken[] {
+  const out: McpUserToken[] = []
+  for (const r of list) {
+    if (r.mcp_client_name !== client) out.push(r)
+  }
+  return out
+}
+
+// Saves a token_exchange client's renewed (or refused) admin credential. Only a credential the config still
+// holds is replaced, so a client deleted or re-verified meanwhile keeps what it has now. A failed save is
+// logged: the renewal runs again when it is next due.
+export function saveExchangeAdmin(store: ConfigStore, row: McpUserToken): void {
+  const list = store.cfg.mcp?.exchange_admin ?? []
+  let found = false
+  const next: McpUserToken[] = []
+  for (const r of list) {
+    if (r.mcp_client_name === row.mcp_client_name && r.id === row.id && r.created_at === row.created_at) {
+      next.push(row)
+      found = true
+    } else {
+      next.push(r)
+    }
+  }
+  if (!found) return
+  const err = persist(store, withExchangeAdmin(store.cfg, next))
+  if (err !== undefined) console.error(`raiju: the admin credential of MCP client ${row.mcp_client_name} could not be saved`)
+}
+
+// POST /api/mcp/client/{id}/verify-exchange for a token_exchange client. The body names the identity-provider
+// token to check the exchange with (subject_token): it is exchanged for one scoped to the audience, and the
+// server is dialed with the result, which must list tools. The exchanged token is then kept as the client's
+// admin credential (Bifrost's retained admin token): the client's tools are listed with it from then on, and
+// the caller's own tokens are exchanged per call as before.
+async function verifyExchange(store: ConfigStore, idp: IdpEndpoints, client: McpClientConfig, body: string): Promise<McpReply> {
+  let parsed: { subject_token?: string } = {}
+  try {
+    parsed = JSON.parse(body) as { subject_token?: string }
+  } catch (e) {
+    return fail(400, "Invalid request payload")
+  }
+  const subject = (parsed.subject_token ?? "").trim()
+  if (subject === "") return fail(400, "subject_token is required: the identity-provider token to verify the exchange with")
+  const te = client.token_exchange
+  if (te === undefined) return fail(400, "the client has no token_exchange settings")
+  const oc = store.cfg.oidc
+  const r = await exchangeToken(te, subject, idp, oc?.issuer ?? "", oc?.client_id ?? "", oc?.client_secret ?? "")
+  if (r.error !== "") return fail(422, `Admin credential exchange failed: ${r.error}`)
+  const hs: Map<string, string> = new Map()
+  hs.set("authorization", "Bearer " + r.token)
+  const v = await dialWith(client, hs, store.cfg.mcp?.oauth_private_allowlist ?? [], r.token)
+  if (!v.ok) return fail(422, `Verification failed: ${v.error}`)
+  const now = Date.now()
+  // the refresh token, when the identity provider issued one, renews the credential before it expires
+  const row: McpUserToken = { id: "exchange-" + client.name, mcp_client_name: client.name, virtual_key_id: "", session_id: "", access_token: r.token, refresh_token: r.refreshToken, token_expires_at: r.expiresIn > 0.0 ? now + r.expiresIn * 1000.0 : 0.0, scopes: [], created_at: now, last_refreshed_at: now, status: "active" }
+  const kept = exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], client.name)
+  kept.push(row)
+  const err = persist(store, withExchangeAdmin(store.cfg, kept))
+  if (err !== undefined) return err
+  return { status: 200, body: `{"status":"success","message":${quote(`Token exchange verified. ${v.tools} tools discovered.`)},"tools_count":${v.tools}}` }
+}
+
+// The token_exchange route that reaches the MCP server: POST .../verify-exchange of a token_exchange client.
+// undefined for any other request, which mcpApi answers.
+export async function exchangeRouteAsync(store: ConfigStore, idp: IdpEndpoints, method: string, path: string, body: string): Promise<McpReply | undefined> {
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  const segs = p.split("/").filter((s) => s !== "")
+  if (segs.length !== 5 || segs[0] !== "api" || segs[1] !== "mcp" || segs[2] !== "client" || segs[4] !== "verify-exchange") return undefined
+  const clients = clientsOf(store.cfg)
+  const ci = clientIndex(clients, segs[3]!)
+  if (ci < 0 || clients[ci]!.auth_type !== "token_exchange") return undefined
+  if (method.toUpperCase() !== "POST") return fail(405, "use POST")
+  return await verifyExchange(store, idp, clients[ci]!, body)
 }
 
 // ---- virtual MCPs ----
@@ -1870,6 +2025,10 @@ test("create adds a client, validates it, and saves", () => {
   expect(saved.includes("sk-live-0123456789")).toBe(true)
   expect(saved.includes("\"tool_sync_interval\": \"10m\"")).toBe(true)
 
+  const withCap = mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"capped\",\"connection_type\":\"http\",\"connection_string\":\"https://c.example/mcp\",\"max_instructions_length\":256}")!
+  expect(withCap.status).toBe(201)
+  expect(withCap.body.includes("\"max_instructions_length\":256")).toBe(true)
+  expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"neg\",\"connection_type\":\"http\",\"connection_string\":\"https://c.example/mcp\",\"max_instructions_length\":-5}")!.body.includes("must not be negative")).toBe(true)
   expect(mcpApi(s, "POST", "/api/mcp/client", "not json")!.status).toBe(400)
   expect(mcpApi(s, "POST", "/api/mcp/client", "[1]")!.status).toBe(400)
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":5}")!.status).toBe(400)
@@ -1879,7 +2038,7 @@ test("create adds a client, validates it, and saves", () => {
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"fs\",\"connection_type\":\"http\",\"connection_string\":\"http://x\"}")!.status).toBe(409)
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"inprocess\"}")!.status).toBe(400)
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\"}")!.body.includes("connection_string is required")).toBe(true)
-  expect(clientsOf(s.cfg).length).toBe(3)
+  expect(clientsOf(s.cfg).length).toBe(4)
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"ftp://x\"}")!.body.includes("http or https")).toBe(true)
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"stdio\"}")!.body.includes("stdio_config.command is required")).toBe(true)
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"http://x\",\"auth_type\":\"oauth\"}")!.status).toBe(400)
@@ -1887,7 +2046,7 @@ test("create adds a client, validates it, and saves", () => {
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"http://x\",\"tool_sync_interval\":\"1500ms\"}")!.status).toBe(400)
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"http://x\",\"headers\":{\"a\":1}}")!.status).toBe(400)
   expect(mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"x\",\"connection_type\":\"http\",\"connection_string\":\"http://x\",\"tools_to_execute\":[1]}")!.status).toBe(400)
-  expect(clientsOf(s.cfg).length).toBe(3)
+  expect(clientsOf(s.cfg).length).toBe(4)
   cleanupFile(s.path)
 })
 
@@ -1918,6 +2077,17 @@ test("update patches fields, keeps masked secrets, and refuses renames", () => {
   expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"allow_on_all_virtual_keys\":true}")!.body.includes("\"allow_by_default\":true")).toBe(true)
   expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"name\":\"files\"}")!.status).toBe(400)
   expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"name\":\"fs\"}")!.status).toBe(200)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"is_code_mode_client\":true}")!.status).toBe(200)
+  expect(s.cfg.mcp!.client_configs![0]!.is_code_mode_client).toBe(true)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"is_code_mode_client\":\"yes\"}")!.status).toBe(400)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"max_instructions_length\":-1}")!.status).toBe(400)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"max_instructions_length\":\"big\"}")!.status).toBe(400)
+  const mil = mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"max_instructions_length\":512}")!
+  expect(mil.status).toBe(200)
+  expect(mil.body.includes("\"max_instructions_length\":512")).toBe(true)
+  expect(s.cfg.mcp!.client_configs![0]!.max_instructions_length).toBe(512)
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"max_instructions_length\":0}")!.status).toBe(200)
+  expect(s.cfg.mcp!.client_configs![0]!.max_instructions_length).toBeUndefined()
   expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"tool_sync_interval\":\"soon\"}")!.status).toBe(400)
   expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"auth\":null,\"disabled\":false}")!.status).toBe(200)
   expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"auth\":{\"type\":\"weird\"}}")!.status).toBe(400)

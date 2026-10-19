@@ -14,18 +14,34 @@
 import { Config, PricingEntry } from "./config"
 import { PRICING_DATA } from "./pricing_data"
 
-// USD per token. A missing cache rate bills cached tokens at the input rate.
-export type Price = { input: f64, output: f64, cacheRead?: f64, cacheWrite?: f64 }
+// USD per token. A missing cache rate bills cached tokens at the input rate. The decision rates
+// bill a decision request's tokens; a missing one is the normal rate (computeDecisionCost in Bifrost).
+// inputAudio and outputAudio are the rates of audio tokens (realtime and audio models report them in
+// their usage details; a missing one bills audio tokens at the text rate), perSecond is the voice rate
+// of a live session (USD per second, input_cost_per_second). Only a live session is billed by it (liveCost
+// in livehooks.tov, as Bifrost's computeLiveCost); Raiju bills no transcription or speech by the second.
+export type Price = { input: f64, output: f64, cacheRead?: f64, cacheWrite?: f64, inputDecisions?: f64, outputDecisions?: f64, inputAudio?: f64, outputAudio?: f64, perSecond?: f64 }
+
+// The tokens a realtime or live response used, as the provider reports them: prompt and completion are
+// the totals, cached the part of the prompt read from cache, and inputAudio and outputAudio the audio
+// tokens among them.
+export type TokenUsage = { prompt: int, completion: int, cached: int, inputAudio: int, outputAudio: int }
 
 // One datasheet row with the provider and base model it was filed under.
 export type PriceRow = { provider: string, baseModel: string, price: Price }
 
+// A request's price split into its input and output parts (USD).
+export type CostParts = { input: f64, output: f64 }
+
 // A pricing override as Bifrost stores it. Only scope_kind "global" and
 // "provider" apply; virtual-key scopes need request context and are skipped
-// (setOverrides returns how many it skipped). request_types are not checked.
+// (setOverrides returns how many it skipped). request_types decide which billing
+// an override patches: "decisions" for a decision request, any other type for the
+// rest. An override with no request_types patches both, as before.
 export type PricingOverride = {
   scope_kind: string,
   provider_id?: string,
+  request_types?: string[],
   match_type: string,
   pattern: string,
   pricing_patch: string,
@@ -38,9 +54,15 @@ type PricePatch = {
   output_cost_per_token?: f64,
   cache_read_input_token_cost?: f64,
   cache_creation_input_token_cost?: f64,
+  input_cost_per_token_decisions?: f64,
+  output_cost_per_token_decisions?: f64,
+  input_cost_per_audio_token?: f64,
+  output_cost_per_audio_token?: f64,
+  input_cost_per_second?: f64,
 }
 
-type Patch = { provider: string, pattern: string, wildcard: bool, rates: PricePatch }
+// decisions and others: whether the patch applies to a decision request, and to any other request.
+type Patch = { provider: string, pattern: string, wildcard: bool, rates: PricePatch, decisions: bool, others: bool }
 
 type Catalog = {
   rows: Map<string, PriceRow>,
@@ -56,6 +78,9 @@ type DatasheetEntry = {
   output_cost_per_token?: f64,
   cache_read_input_token_cost?: f64,
   cache_creation_input_token_cost?: f64,
+  input_cost_per_audio_token?: f64,
+  output_cost_per_audio_token?: f64,
+  input_cost_per_second?: f64,
 }
 
 // Bedrock variants and Vertex's two spellings are filed under one name each.
@@ -65,34 +90,39 @@ function normalizeProvider(p: string): string {
   return p
 }
 
-function makeRow(provider: string, baseModel: string, input: f64, output: f64, cacheRead: f64 | undefined, cacheWrite: f64 | undefined): PriceRow {
-  return { provider: normalizeProvider(provider), baseModel, price: { input, output, cacheRead, cacheWrite } }
+function makeRow(provider: string, baseModel: string, input: f64, output: f64, cacheRead: f64 | undefined, cacheWrite: f64 | undefined, inputAudio: f64 | undefined, outputAudio: f64 | undefined, perSecond: f64 | undefined): PriceRow {
+  return { provider: normalizeProvider(provider), baseModel, price: { input, output, cacheRead, cacheWrite, inputAudio, outputAudio, perSecond } }
 }
 
-// Parses PRICING_DATA's lines: key, provider, input, output, cacheRead,
-// cacheWrite, baseModel. Empty rates are missing; malformed lines are skipped.
+// Parses PRICING_DATA's lines: key, provider, input, output, cacheRead, cacheWrite, baseModel and,
+// in a ten column line, inputAudio, outputAudio, perSecond. Empty rates are missing; malformed
+// lines are skipped.
 function parseTable(text: string): Map<string, PriceRow> {
   const rows: Map<string, PriceRow> = new Map()
   for (const line of text.split("\n")) {
     const f = line.split("\t")
-    if (f.length !== 7) continue
+    if (f.length !== 7 && f.length !== 10) continue
     const input = parseFloat(f[2]!)
     const output = parseFloat(f[3]!)
-    if (input === undefined && output === undefined) continue
-    rows.set(f[0]!, makeRow(f[1]!, f[6]!, input ?? 0.0, output ?? 0.0, parseFloat(f[4]!), parseFloat(f[5]!)))
+    const wide = f.length === 10
+    const perSecond = wide ? parseFloat(f[9]!) : undefined
+    if (input === undefined && output === undefined && perSecond === undefined) continue
+    const inputAudio = wide ? parseFloat(f[7]!) : undefined
+    const outputAudio = wide ? parseFloat(f[8]!) : undefined
+    rows.set(f[0]!, makeRow(f[1]!, f[6]!, input ?? 0.0, output ?? 0.0, parseFloat(f[4]!), parseFloat(f[5]!), inputAudio, outputAudio, perSecond))
   }
   return rows
 }
 
-// Parses a Bifrost datasheet (https://getbifrost.ai/datasheet). Entries with
-// neither an input nor an output price are dropped; a missing one is 0.
+// Parses a Bifrost datasheet (https://getbifrost.ai/datasheet). Entries with neither an input nor an
+// output price (nor a voice rate per second) are dropped; a missing one is 0.
 export function parseDatasheet(json: string): Map<string, PriceRow> throws SyntaxError {
   const sheet = try JSON.parse(json) as Record<string, DatasheetEntry>
   const rows: Map<string, PriceRow> = new Map()
   for (const k of sheet.keys()) {
     const e = sheet.get(k)!
-    if (e.input_cost_per_token === undefined && e.output_cost_per_token === undefined) continue
-    rows.set(k, makeRow(e.provider ?? "", e.base_model ?? "", e.input_cost_per_token ?? 0.0, e.output_cost_per_token ?? 0.0, e.cache_read_input_token_cost, e.cache_creation_input_token_cost))
+    if (e.input_cost_per_token === undefined && e.output_cost_per_token === undefined && e.input_cost_per_second === undefined) continue
+    rows.set(k, makeRow(e.provider ?? "", e.base_model ?? "", e.input_cost_per_token ?? 0.0, e.output_cost_per_token ?? 0.0, e.cache_read_input_token_cost, e.cache_creation_input_token_cost, e.input_cost_per_audio_token, e.output_cost_per_audio_token, e.input_cost_per_second))
   }
   return rows
 }
@@ -213,6 +243,11 @@ function overlay(base: Price | undefined, r: PricePatch): Price {
     output: r.output_cost_per_token ?? b.output,
     cacheRead: r.cache_read_input_token_cost ?? b.cacheRead,
     cacheWrite: r.cache_creation_input_token_cost ?? b.cacheWrite,
+    inputDecisions: r.input_cost_per_token_decisions ?? b.inputDecisions,
+    outputDecisions: r.output_cost_per_token_decisions ?? b.outputDecisions,
+    inputAudio: r.input_cost_per_audio_token ?? b.inputAudio,
+    outputAudio: r.output_cost_per_audio_token ?? b.outputAudio,
+    perSecond: r.input_cost_per_second ?? b.perSecond,
   }
 }
 
@@ -232,7 +267,7 @@ export class Pricing {
     if (p === undefined) return
     for (const k of p.keys()) {
       const e = p.get(k)!
-      this.overrides.set(k, { input: e.input_cost_per_token, output: e.output_cost_per_token })
+      this.overrides.set(k, { input: e.input_cost_per_token, output: e.output_cost_per_token, cacheRead: e.cache_read_input_token_cost, inputAudio: e.input_cost_per_audio_token, outputAudio: e.output_cost_per_audio_token, perSecond: e.input_cost_per_second })
     }
   }
 
@@ -265,8 +300,11 @@ export class Pricing {
       } else if (o.match_type !== "exact") {
         throw overrideError("unknown match_type " + o.match_type)
       }
+      const types = o.request_types ?? []
+      const decisions = types.length === 0 || types.includes("decisions")
+      const others = types.length === 0 || types.filter((t: string): bool => t !== "decisions").length > 0
       const g = (provider === "" ? 2 : 0) + (wildcard ? 1 : 0)
-      groups[g]!.push({ provider, pattern, wildcard, rates })
+      groups[g]!.push({ provider, pattern, wildcard, rates, decisions, others })
     }
     for (const g of [1, 3]) groups[g]!.sort((a, b) => b.pattern.byteLength - a.pattern.byteLength)
     const out: Patch[] = []
@@ -281,10 +319,11 @@ export class Pricing {
     this.misses = new Set()
   }
 
-  patchFor(provider: string, model: string): PricePatch | undefined {
+  patchFor(provider: string, model: string, decision: bool): PricePatch | undefined {
     const p = normalizeProvider(provider)
     for (const x of this.patches) {
       if (x.provider !== "" && x.provider !== p) continue
+      if (decision ? !x.decisions : !x.others) continue
       const hit = x.wildcard ? model.startsWith(x.pattern) : model === x.pattern
       if (hit) return x.rates
     }
@@ -312,14 +351,19 @@ export class Pricing {
     return p
   }
 
-  // Per-token price for the model, or undefined when nothing prices it.
-  find(provider: string, model: string): Price | undefined {
+  // Per-token price for the model, or undefined when nothing prices it. decision picks the
+  // billing of a decision request: the overrides that cover decisions apply.
+  priceFor(provider: string, model: string, decision: bool): Price | undefined {
     const c = this.overrides.get(provider + "/" + model) ?? this.overrides.get(model)
     if (c !== undefined) return c
     const base = this.datasheet(provider, model)
-    const patch = this.patchFor(provider, model)
+    const patch = this.patchFor(provider, model, decision)
     if (patch === undefined) return base
     return overlay(base, patch)
+  }
+
+  find(provider: string, model: string): Price | undefined {
+    return this.priceFor(provider, model, false)
   }
 
   known(provider: string, model: string): bool {
@@ -328,9 +372,10 @@ export class Pricing {
 
   // The first of refs without a price (a fallback the key may use counts), or undefined when
   // all are priced. A budgeted request is refused for it when refuse_unpriced_models is on.
-  unpriced(refs: { provider: string, model: string }[]): { provider: string, model: string } | undefined {
+  // decision prices the refs as decision requests.
+  unpriced(refs: { provider: string, model: string }[], decision?: bool): { provider: string, model: string } | undefined {
     for (const r of refs) {
-      if (!this.known(r.provider, r.model)) return r
+      if (this.priceFor(r.provider, r.model, decision === true) === undefined) return r
     }
     return undefined
   }
@@ -348,6 +393,67 @@ export class Pricing {
     const writeRate = p.cacheWrite ?? p.input
     return fresh * p.input + r * readRate + w * writeRate + completionTokens * p.output
   }
+
+  // USD for one decision request: its tokens at the decision rates when the price has them, else
+  // the normal rates (computeDecisionCost). A negative rate marks a model with no fixed price, so
+  // nothing is billed for it.
+  decisionCost(provider: string, model: string, promptTokens: int, completionTokens: int): f64 {
+    const p = this.priceFor(provider, model, true)
+    if (p === undefined) return 0.0
+    const ri = p.inputDecisions ?? p.input
+    const ro = p.outputDecisions ?? p.output
+    if (ri < 0 || ro < 0) return 0.0
+    return promptTokens * ri + completionTokens * ro
+  }
+
+  // The input and output parts of a realtime or live response's price, as Bifrost's computeTextCost
+  // splits them: cached prompt tokens at the cache rate, audio tokens at the audio rates (taken out of
+  // the text cost; a missing audio rate leaves them at the text rate), the rest at the text rates. Both
+  // are 0 when the model's price is unknown.
+  usageParts(provider: string, model: string, u: TokenUsage): CostParts {
+    const p = this.find(provider, model)
+    if (p === undefined) return { input: 0.0, output: 0.0 }
+    const prompt = Math.max(0, u.prompt)
+    const completion = Math.max(0, u.completion)
+    const cached = Math.min(Math.max(0, u.cached), prompt)
+    const fresh = prompt - cached
+    let input = fresh * p.input + cached * (p.cacheRead ?? p.input)
+    let output = completion * p.output
+    const ia = p.inputAudio
+    if (ia !== undefined) {
+      // audio tokens are taken from the uncached ones
+      const n = Math.min(Math.min(Math.max(0, u.inputAudio), prompt), fresh)
+      input += n * (ia - p.input)
+    }
+    const oa = p.outputAudio
+    if (oa !== undefined) {
+      const n = Math.min(Math.max(0, u.outputAudio), completion)
+      output += n * (oa - p.output)
+    }
+    return { input: input, output: output }
+  }
+
+  // USD of a realtime or live response's tokens.
+  usageCost(provider: string, model: string, u: TokenUsage): f64 {
+    const c = this.usageParts(provider, model, u)
+    return c.input + c.output
+  }
+
+  // USD of a live session's voice time: seconds at the model's rate per second (0 without one). Callers bill
+  // only live sessions with it; a realtime session's tokens are its cost.
+  voiceCost(provider: string, model: string, seconds: f64): f64 {
+    const p = this.find(provider, model)
+    if (p === undefined || seconds <= 0.0) return 0.0
+    return seconds * (p.perSecond ?? 0.0)
+  }
+
+  // The input and output parts of a request's price without cache tokens (Bifrost's input_cost and
+  // output_cost); both are 0 when the model's price is unknown.
+  costParts(provider: string, model: string, promptTokens: int, completionTokens: int): CostParts {
+    const p = this.find(provider, model)
+    if (p === undefined) return { input: 0.0, output: 0.0 }
+    return { input: promptTokens * p.input, output: completionTokens * p.output }
+  }
 }
 
 test("datasheet prices for OpenAI, Anthropic, Gemini and Vertex", () => {
@@ -358,6 +464,16 @@ test("datasheet prices for OpenAI, Anthropic, Gemini and Vertex", () => {
   expect(p.cost("gemini", "gemini-2.5-pro", 1000000, 0)).toBeCloseTo(1.25)
   expect(p.cost("vertex_ai", "gemini-2.5-flash", 1000000, 0)).toBeCloseTo(0.3)
   expect(p.known("openai", "text-embedding-3-small")).toBe(true)
+})
+
+test("the input and output parts add up to the cost; an unknown model has none", () => {
+  const p = new Pricing({})
+  const parts = p.costParts("openai", "gpt-4o", 1000000, 1000000)
+  expect(parts.input).toBeCloseTo(2.5)
+  expect(parts.output).toBeCloseTo(10.0)
+  expect(parts.input + parts.output).toBeCloseTo(p.cost("openai", "gpt-4o", 1000000, 1000000))
+  const none = p.costParts("nowhere", "no-model", 5, 5)
+  expect(none.input + none.output).toBe(0.0)
 })
 
 test("unpriced finds the first ref with no price, overrides included", () => {
@@ -461,4 +577,127 @@ test("parseDatasheet and replaceCatalog swap the table", () => {
     threw = true
   }
   expect(threw).toBe(true)
+})
+
+test("request_types: a decision takes the overrides that cover decisions, other requests the rest", () => {
+  const p = new Pricing({})
+  // The chat-only override comes first; the decision rates must not come from it.
+  try p.setOverrides([
+    { scope_kind: "global", request_types: ["chat_completion"], match_type: "exact", pattern: "jev-latest", pricing_patch: "{\"input_cost_per_token\":0.000001}" },
+    { scope_kind: "global", request_types: ["decisions"], match_type: "exact", pattern: "jev-latest", pricing_patch: "{\"input_cost_per_token_decisions\":0.00002,\"output_cost_per_token_decisions\":0.00005}" },
+  ])
+  expect(p.decisionCost("typesafe", "jev-latest", 1000, 10)).toBeCloseTo(0.0205)
+  // the chat override's input rate and the datasheet's output rate
+  expect(p.cost("typesafe", "jev-latest", 1000, 10)).toBeCloseTo(0.001)
+  // A decision-only override does not price other requests of the model: a model with no datasheet row
+  // is unpriced for chat, and priced for decisions.
+  const q = new Pricing({})
+  try q.setOverrides([{ scope_kind: "global", request_types: ["decisions"], match_type: "exact", pattern: "fake-jev", pricing_patch: "{\"input_cost_per_token_decisions\":0.00002}" }])
+  expect(q.known("typesafe", "fake-jev")).toBe(false)
+  expect(q.cost("typesafe", "fake-jev", 1000, 0)).toBe(0.0)
+  expect(q.decisionCost("typesafe", "fake-jev", 1000, 0)).toBeCloseTo(0.02)
+  expect(q.unpriced([{ provider: "typesafe", model: "fake-jev" }], true)).toBeUndefined()
+  expect(q.unpriced([{ provider: "typesafe", model: "fake-jev" }])!.model).toBe("fake-jev")
+})
+
+test("decision rates fall back to the normal rates, and an override without request_types covers both", () => {
+  const p = new Pricing({})
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "my-model", pricing_patch: "{\"input_cost_per_token\":0.000003,\"output_cost_per_token\":0.000004}" }])
+  expect(p.decisionCost("custom", "my-model", 1000000, 1000000)).toBeCloseTo(7.0)
+  expect(p.cost("custom", "my-model", 1000000, 1000000)).toBeCloseTo(7.0)
+  // A decision rate of zero is a rate: it bills nothing for the input.
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "my-model", request_types: ["decisions", "chat_completion"], pricing_patch: "{\"input_cost_per_token_decisions\":0}" }])
+  expect(p.decisionCost("custom", "my-model", 1000000, 1000000)).toBeCloseTo(0.0)
+  expect(p.cost("custom", "my-model", 1000000, 0)).toBe(0.0)
+  // A negative rate is unpriced: nothing billed.
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "my-model", request_types: ["decisions"], pricing_patch: "{\"input_cost_per_token_decisions\":-1}" }])
+  expect(p.decisionCost("custom", "my-model", 1000, 1000)).toBe(0.0)
+  // A decision override on a datasheet model keeps the datasheet's rates for the other requests.
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "gpt-4o", request_types: ["decisions"], pricing_patch: "{\"output_cost_per_token_decisions\":0.00001}" }])
+  expect(p.cost("openai", "gpt-4o", 1000000, 1000000)).toBeCloseTo(12.5)
+  expect(p.decisionCost("openai", "gpt-4o", 1000000, 1000000)).toBeCloseTo(12.5)
+})
+
+test("a datasheet row carries audio token rates and a voice rate per second", () => {
+  const sample = "{" +
+    "\"rt-1\": {\"provider\": \"acme\", \"input_cost_per_token\": 0.000004, \"output_cost_per_token\": 0.000016, \"cache_read_input_token_cost\": 0.0000004, \"input_cost_per_audio_token\": 0.000032, \"output_cost_per_audio_token\": 0.000064}," +
+    "\"live-1\": {\"provider\": \"acme\", \"input_cost_per_second\": 0.0005}" +
+    "}"
+  const p = new Pricing({})
+  p.replaceCatalog(try parseDatasheet(sample))
+  const a = p.find("acme", "rt-1")!
+  expect(a.inputAudio!).toBeCloseTo(0.000032)
+  expect(a.outputAudio!).toBeCloseTo(0.000064)
+  // a row with only a voice rate is kept
+  const l = p.find("acme", "live-1")!
+  expect(l.perSecond!).toBeCloseTo(0.0005)
+  expect(l.input).toBe(0.0)
+  expect(p.voiceCost("acme", "live-1", 40.0)).toBeCloseTo(0.02)
+  expect(p.voiceCost("acme", "rt-1", 40.0)).toBe(0.0)
+  expect(p.voiceCost("acme", "live-1", 0.0)).toBe(0.0)
+  expect(p.voiceCost("acme", "nowhere", 10.0)).toBe(0.0)
+})
+
+test("realtime usage: audio tokens at the audio rates, cached tokens at the cache rate", () => {
+  const cfg: Config = { pricing: new Map() }
+  cfg.pricing!.set("acme/rt", { input_cost_per_token: 0.000004, output_cost_per_token: 0.000016, cache_read_input_token_cost: 0.0000004, input_cost_per_audio_token: 0.000032, output_cost_per_audio_token: 0.000064 })
+  const p = new Pricing(cfg)
+  // 1000 prompt tokens: 200 cached, 300 of them audio; 500 completion tokens, 400 of them audio
+  const u: TokenUsage = { prompt: 1000, completion: 500, cached: 200, inputAudio: 300, outputAudio: 400 }
+  const parts = p.usageParts("acme", "rt", u)
+  // input: 500 text at 4e-6, 300 audio at 32e-6, 200 cached at 0.4e-6
+  expect(parts.input).toBeCloseTo(0.002 + 0.0096 + 0.00008)
+  // output: 100 text at 16e-6, 400 audio at 64e-6
+  expect(parts.output).toBeCloseTo(0.0016 + 0.0256)
+  expect(p.usageCost("acme", "rt", u)).toBeCloseTo(parts.input + parts.output)
+  // audio tokens beyond the uncached prompt are clamped, as Bifrost does
+  const c = p.usageParts("acme", "rt", { prompt: 100, completion: 0, cached: 80, inputAudio: 100, outputAudio: 0 })
+  expect(c.input).toBeCloseTo(20.0 * 0.000032 + 80.0 * 0.0000004)
+  // negative counts are no counts
+  const n = p.usageParts("acme", "rt", { prompt: -5, completion: -5, cached: -5, inputAudio: -5, outputAudio: -5 })
+  expect(n.input + n.output).toBe(0.0)
+  // an unknown model costs nothing
+  expect(p.usageCost("acme", "nowhere", { prompt: 10, completion: 10, cached: 0, inputAudio: 0, outputAudio: 0 })).toBe(0.0)
+})
+
+test("without audio rates, audio tokens are text tokens; plain usage matches cost()", () => {
+  const p = new Pricing({})
+  const u: TokenUsage = { prompt: 1000, completion: 100, cached: 0, inputAudio: 500, outputAudio: 50 }
+  expect(p.usageCost("openai", "gpt-4o", u)).toBeCloseTo(p.cost("openai", "gpt-4o", 1000, 100))
+  const c: TokenUsage = { prompt: 1000, completion: 0, cached: 600, inputAudio: 0, outputAudio: 0 }
+  expect(p.usageCost("anthropic", "claude-sonnet-4-5", c)).toBeCloseTo(p.cost("anthropic", "claude-sonnet-4-5", 1000, 0, 600))
+})
+
+test("an override patches the audio rates and the voice rate", () => {
+  const p = new Pricing({})
+  try p.setOverrides([{ scope_kind: "global", match_type: "exact", pattern: "gpt-realtime", pricing_patch: "{\"input_cost_per_audio_token\":0.00004,\"output_cost_per_audio_token\":0.00008,\"input_cost_per_second\":0.001}" }])
+  const price = p.find("openai", "gpt-realtime")!
+  expect(price.inputAudio!).toBeCloseTo(0.00004)
+  expect(price.outputAudio!).toBeCloseTo(0.00008)
+  expect(price.perSecond!).toBeCloseTo(0.001)
+  // the datasheet's text rates stay
+  expect(price.input).toBeCloseTo(0.000004)
+  expect(p.voiceCost("openai", "gpt-realtime", 10.0)).toBeCloseTo(0.01)
+})
+
+test("the built-in table parses ten column rows", () => {
+  const rows = parseTable("rt-x\tacme\t0.000001\t0.000002\t\t\trt-x\t0.00001\t0.00002\t\nlive-x\tacme\t\t\t\t\tlive-x\t\t\t0.002\nold\tacme\t0.1\t0.2\t\t\told\n")
+  expect(rows.size).toBe(3)
+  expect(rows.get("rt-x")!.price.inputAudio!).toBeCloseTo(0.00001)
+  expect(rows.get("rt-x")!.price.perSecond).toBeUndefined()
+  expect(rows.get("live-x")!.price.perSecond!).toBeCloseTo(0.002)
+  expect(rows.get("old")!.price.outputAudio).toBeUndefined()
+})
+
+test("the built-in table carries the merged audio and voice rates, and its token rates stay", () => {
+  const p = new Pricing({})
+  // a transcription model: its audio token rate and per-second rate come from the price file
+  const t = p.find("openai", "gpt-4o-transcribe")!
+  expect(t.input).toBeCloseTo(0.0000025)
+  expect(t.inputAudio!).toBeCloseTo(0.0000025)
+  expect(t.perSecond!).toBeCloseTo(0.0001)
+  // a realtime model the price file gives audio rates for
+  expect(p.find("openai", "gpt-realtime-2")!.outputAudio!).toBeCloseTo(0.000064)
+  // a model the price file gives no audio rate for keeps none
+  expect(p.find("openai", "gpt-4o")!.inputAudio).toBeUndefined()
 })

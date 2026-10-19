@@ -1,7 +1,9 @@
 import { listen } from "../src/http1"
 import { fields, find, rawStr } from "../src/json"
-import { sha256, utf8 } from "../src/crypto"
+import { sha256, utf8, toHex } from "../src/crypto"
 import { encodeUrl } from "../src/base64"
+import { liveAnswer, liveEvents, liveStats, liveReset, realtimeAnswer, realtimeTurn } from "./mock_live"
+import { a2aHandle, pushV03, knowTask, resubscribeV03 } from "./mock_a2a"
 // A fake provider for end-to-end tests. Speaks enough of OpenAI, Anthropic,
 // Gemini and Bedrock to exercise translation, and fails on demand:
 //   model "flaky-*"   → 503 on every other call
@@ -9,13 +11,17 @@ import { encodeUrl } from "../src/base64"
 //   model "limited-*" → always 429 with retry-after-ms: 2500
 //   key "bad-key"     → 401
 //   model "policy-quota" → 200 with x-quota-state: exhausted (trips a circuit policy)
-type Seen = { path: string, auth: string, body: string, team: string, tenant: string }
+// size and sha: the request body's length and SHA-256, kept for bodies too big to keep whole (body is then its first 2000 bytes)
+// hdr: the request's x-amz-date, content-length and transfer-encoding, bar-separated (the SigV4 and framing checks of the large request tests)
+type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string }
 
 const seen: Seen[] = []
 // webhook deliveries received: the path, the Standard Webhooks headers and the body
 type Hook = { path: string, id: string, timestamp: string, signature: string, event: string, body: string }
 const hooks: Hook[] = []
 let flakyCalls = 0
+// set by /_hidden/down: the retained-content bucket refuses its PUTs (a store outage) until /_hidden/up
+let hiddenDown = false
 // the OAuth authorization server: codes by their PKCE challenge and redirect URI, and the access token the MCP server accepts
 const OAUTH_CLIENT = "raiju-dcr-client"
 const OAUTH_REFRESH = "oauth-refresh-1"
@@ -75,9 +81,35 @@ function anthropicRequests(body: string): { id: string, model: string }[] throws
   return out
 }
 
+// Streams of the large request tests (L136): one text in two events, with the token counts
+const GEMINI_SSE = `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hi from "}]}}]}\n\ndata: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":6,"candidatesTokenCount":3,"totalTokenCount":9}}\n\n`
+const ANTHROPIC_SSE = `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`
+const COHERE_SSE = `event: message-start\ndata: {"type":"message-start","id":"co_s","delta":{"message":{"role":"assistant"}}}\n\nevent: content-start\ndata: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}\n\nevent: content-delta\ndata: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"Hi from "}}}}\n\nevent: content-delta\ndata: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"cohere"}}}}\n\nevent: message-end\ndata: {"type":"message-end","id":"co_s","delta":{"finish_reason":"COMPLETE","usage":{"tokens":{"input_tokens":7,"output_tokens":3}}}}\n\n`
+
 function record(req: Request, path: string, body: string): void {
   const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? req.headers.get("x-goog-api-key") ?? req.headers.get("api-key") ?? ""
-  seen.push({ path: path, auth: auth, body: body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "" })
+  const size = body.byteLength
+  const big = size > 65536
+  const hdr = (req.headers.get("x-amz-date") ?? "") + "|" + (req.headers.get("content-length") ?? "") + "|" + (req.headers.get("transfer-encoding") ?? "")
+  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr })
+}
+
+// The raw JSON text of a field of an event, or "".
+function wsField(text: string, key: string): string {
+  try {
+    return find(fields(text), key) ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// A string field of an event, or "".
+function wsString(text: string, key: string): string {
+  try {
+    return rawStr(fields(text), key) ?? ""
+  } catch (e) {
+    return ""
+  }
 }
 
 function failure(model: string, auth: string): Response | undefined {
@@ -234,6 +266,16 @@ async function replicateMock(req: Request, path: string, lu: URL | undefined): P
     if (second) return jsonBody(`{"next":null,"previous":"${base}","results":[{"owner":"acme","name":"model-c"}]}`, 200)
     return jsonBody(`{"next":"${base}?cursor=2","previous":null,"results":[{"owner":"acme","name":"model-a"},{"owner":"acme","name":"model-b"}]}`, 200)
   }
+  // the file list has two pages; the second answers with a file that has no bytes yet (status uploaded)
+  if (path === "/v1/files" && req.method === "GET") {
+    if (lu !== undefined && lu.search.includes("cursor=p2")) return jsonBody(`{"next":null,"previous":"http://127.0.0.1:18099/replicate/v1/files","results":[{"id":"file-e2e-2","size":0,"created_at":"${now}"}]}`, 200)
+    return jsonBody(`{"next":"http://127.0.0.1:18099/replicate/v1/files?cursor=p2","previous":null,"results":[{"id":"file-e2e-1","name":"pic.png","content_type":"image/png","size":9,"created_at":"${now}"}]}`, 200)
+  }
+  if (path === "/v1/files/file-e2e-1" && req.method === "GET") return jsonBody(`{"id":"file-e2e-1","name":"pic.png","content_type":"image/png","size":9,"created_at":"${now}","urls":{"get":"http://127.0.0.1:18099/replicate/files/file-e2e-1"}}`, 200)
+  if (path === "/v1/files/file-e2e-1" && req.method === "DELETE") return new Response(undefined, { status: 204 })
+  if (path.startsWith("/v1/files/")) return jsonBody(JSON.stringify({ detail: "The requested resource could not be found" }), 404)
+  // a prediction polled at its get URL: it has settled by the first read
+  if (path.startsWith("/v1/predictions/") && req.method === "GET") return Response.json({ id: path.slice(16), status: "succeeded", created_at: now, output: ["http://127.0.0.1:18099/replicate/out/polled.png"] })
   if (path === "/v1/files" && req.method === "POST") {
     const fd = try await req.formData()
     const f = fd.get("content") ?? undefined
@@ -245,6 +287,10 @@ async function replicateMock(req: Request, path: string, lu: URL | undefined): P
     const prompt = doc.input?.prompt ?? ""
     const id = "pred-e2e-" + seen.length
     if (prompt === "fail") return Response.json({ id: id, status: "failed", created_at: now, error: "the model refused the prompt" })
+    // a prediction still running when the wait ends: its get URL answers the settled prediction
+    if (prompt === "slow") return Response.json({ id: id, status: "starting", created_at: now, urls: { get: "http://127.0.0.1:18099/replicate/v1/predictions/" + id } })
+    // an edit carries the image as a data URL in its input: its output is an image
+    if (body.includes("data:image/png;base64,")) return Response.json({ id: id, status: "succeeded", created_at: now, output: ["http://127.0.0.1:18099/replicate/out/edit.png"] })
     const n = doc.input?.num_outputs
     if (n !== undefined) {
       const urls: string[] = []
@@ -301,6 +347,71 @@ async function mcpServer(req: Request): Promise<Response> {
 
 const port = parseInt(process.env.MOCK_PORT ?? "18099") ?? 18099
 
+// A fake A2A agent (src/agents.tov). Its card names this mock's JSON-RPC route. message/send answers a
+// completed task that echoes the text ("fail" is refused with a JSON-RPC error); message/stream sends a
+// working status and the task as SSE; tasks/get and tasks/cancel read and cancel the tasks it made. The
+// v0.3 method names and the v1 names are the same methods.
+type A2aTask = { id: string, contextId: string, state: string, text: string }
+type A2aIn = { id?: string, method?: string, params?: { id?: string, message?: { contextId?: string, parts?: { text?: string }[] } } }
+const a2aTasks: Map<string, A2aTask> = new Map()
+let a2aSeq = 0
+
+function a2aTaskJson(t: A2aTask): string {
+  return `{"kind":"task","id":${JSON.stringify(t.id)},"contextId":${JSON.stringify(t.contextId)},"status":{"state":${JSON.stringify(t.state)}},"artifacts":[{"artifactId":"a-${t.id}","parts":[{"kind":"text","text":${JSON.stringify("echo: " + t.text)}}]}]}`
+}
+
+function a2aError(id: string, code: int, message: string): Response {
+  return new Response(`{"jsonrpc":"2.0","id":${JSON.stringify(id)},"error":{"code":${code},"message":${JSON.stringify(message)}}}`, { headers: { "content-type": "application/json" } })
+}
+
+async function a2aRpc(req: Request): Promise<Response> {
+  const body = await req.text()
+  record(req, "/a2a/agent/json-rpc", body)
+  const j = try JSON.parse(body) as A2aIn
+  const id = j.id ?? "0"
+  const method = j.method ?? ""
+  const msg = j.params?.message
+  if (method === "message/send" || method === "SendMessage") {
+    const parts = msg?.parts ?? []
+    const text = parts.length > 0 ? (parts[0]!.text ?? "") : ""
+    if (text === "fail") return a2aError(id, -32000, "agent failed on request")
+    a2aSeq += 1
+    const t: A2aTask = { id: "task-" + a2aSeq, contextId: msg?.contextId ?? "ctx-" + a2aSeq, state: "completed", text: text }
+    a2aTasks.set(t.id, t)
+    knowTask(t.id, t.contextId)
+    return new Response(`{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${a2aTaskJson(t)}}`, { headers: { "content-type": "application/json" } })
+  }
+  if (method === "message/stream" || method === "SendStreamingMessage") {
+    a2aSeq += 1
+    const t: A2aTask = { id: "task-" + a2aSeq, contextId: msg?.contextId ?? "ctx-" + a2aSeq, state: "completed", text: "streamed" }
+    a2aTasks.set(t.id, t)
+    const working = `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":{"kind":"status-update","taskId":${JSON.stringify(t.id)},"contextId":${JSON.stringify(t.contextId)},"status":{"state":"working"},"final":false}}`
+    const done = `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${a2aTaskJson(t)}}`
+    return new Response(`data: ${working}\n\ndata: ${done}\n\n`, { headers: { "content-type": "text/event-stream" } })
+  }
+  if (method === "tasks/get" || method === "GetTask") {
+    const t = a2aTasks.get(j.params?.id ?? "")
+    if (t === undefined) return a2aError(id, -32001, "task not found")
+    return new Response(`{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${a2aTaskJson(t)}}`, { headers: { "content-type": "application/json" } })
+  }
+  if (method === "tasks/cancel" || method === "CancelTask") {
+    const t = a2aTasks.get(j.params?.id ?? "")
+    if (t === undefined) return a2aError(id, -32001, "task not found")
+    // map values are copies: the canceled task is stored again
+    const canceled: A2aTask = { id: t.id, contextId: t.contextId, state: "canceled", text: t.text }
+    a2aTasks.set(canceled.id, canceled)
+    return new Response(`{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${a2aTaskJson(canceled)}}`, { headers: { "content-type": "application/json" } })
+  }
+  if (method === "tasks/resubscribe" || method === "SubscribeToTask") {
+    const ev = resubscribeV03(j.params?.id ?? "", JSON.stringify(id))
+    if (ev === undefined) return a2aError(id, -32001, "task not found")
+    return new Response(ev, { headers: { "content-type": "text/event-stream" } })
+  }
+  const pv = pushV03(method, find(try fields(body), "params") ?? "{}", JSON.stringify(id))
+  if (pv !== undefined) return new Response(pv, { headers: { "content-type": "application/json" } })
+  return a2aError(id, -32601, "method not found")
+}
+
 Bun.serve<string>({
   port: port,
   routes: {
@@ -312,6 +423,15 @@ Bun.serve<string>({
         const model = m.model ?? ""
         const f = failure(model, req.headers.get("authorization") ?? "")
         if (f !== undefined) return f
+        // large_payload_optimization: "large-answer" answers with a 3 MB completion, "large-stream" with a 3 MB event stream
+        if (model === "large-answer") return Response.json({ id: "cl1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "y".repeat(3000000) }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
+        if (model === "large-stream") {
+          const bulk = "z".repeat(1000)
+          let sse = ""
+          for (let i = 0; i < 3000; i++) sse += `data: {"id":"cs1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":{"content":"${bulk}"},"finish_reason":null}]}\n\n`
+          sse += `data: {"id":"cs1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\ndata: [DONE]\n\n`
+          return new Response(sse, { headers: { "content-type": "text/event-stream" } })
+        }
         // "strict-*" refuses the sampling parameters its datasheet row does not list (the compat tests)
         if (model.startsWith("strict-")) {
           for (const p of ["temperature", "top_p", "seed", "presence_penalty"]) {
@@ -324,6 +444,16 @@ Bun.serve<string>({
         if (body.includes("l97t-tools")) return new Response(`{"id":"c5","object":"chat.completion","created":1,"model":"${model}","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{}"}},{"id":"call_b","type":"function","function":{"name":"lookup_city","arguments":"{}"}},{"id":"call_c","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}`, { headers: { "content-type": "application/json" } })
         // a primary that reports its quota as spent: the header is what a circuit policy watches for
         if (model === "policy-quota") return new Response(`{"id":"q1","object":"chat.completion","created":1,"model":"${model}","choices":[{"index":0,"message":{"role":"assistant","content":"from the primary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`, { headers: { "content-type": "application/json", "x-quota-state": "exhausted" } })
+        // "email-chat" streams an email split across two chunks (the built-in guard on a stream); "tools-chat" streams
+        // three tool calls, one name twice (the tool names the log records for a streamed answer)
+        if (model === "email-chat" && m.stream === true) {
+          const emailChunk = (delta: string, finish: string) => `data: {"id":"c6","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          return new Response(emailChunk(`{"role":"assistant","content":""}`, "null") + emailChunk(`{"content":"write to jane.doe"}`, "null") + emailChunk(`{"content":"@example.com today"}`, "null") + emailChunk(`{}`, `"stop"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
+        if (model === "tools-chat" && m.stream === true) {
+          const toolChunk = (delta: string, finish: string) => `data: {"id":"c7","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          return new Response(toolChunk(`{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":""}}]}`, "null") + toolChunk(`{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}`, "null") + toolChunk(`{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"lookup_city","arguments":""}}]}`, "null") + toolChunk(`{"tool_calls":[{"index":2,"id":"call_c","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}`, "null") + toolChunk(`{}`, `"tool_calls"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
         // "pii-chat" streams a phone number split across two chunks (the L97s redaction checks)
         if (model === "pii-chat" && m.stream === true) {
           const piiChunk = (delta: string, finish: string) => `data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
@@ -358,6 +488,16 @@ Bun.serve<string>({
           const sunny = body.includes("Sunny in Oslo")
           return Response.json({ id: "c3", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: sunny ? "It is sunny in Oslo" : "no tool result" }, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: 5, total_tokens: 14 } })
         }
+        // "codeagent-*": asks for a code mode program (a lambda and a while loop) that calls the weather tool, then
+        // answers with what the program returned
+        if (model.startsWith("codeagent-")) {
+          if (!body.includes(`"role":"tool"`)) {
+            const code = "f = lambda c: weather.get_weather(city = c)\nn = 0\nwhile n < 1:\n    n += 1\nresult = f(\"Oslo\")"
+            return Response.json({ id: "c6", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "", tool_calls: [{ id: "call_code", type: "function", function: { name: "executeToolCode", arguments: JSON.stringify({ code: code }) } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 } })
+          }
+          const sunny = body.includes("Sunny in Oslo")
+          return Response.json({ id: "c7", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: sunny ? "The program says it is sunny in Oslo" : "no program result" }, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: 5, total_tokens: 14 } })
+        }
         return Response.json({ id: "c1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "Hello from " + model }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
       },
     },
@@ -380,6 +520,12 @@ Bun.serve<string>({
       POST: async (req) => {
         const body = await req.text()
         record(req, "/or/v1/chat/completions", body)
+        // a streamed answer ends with a usage chunk that carries the billed cost (0.00456, not the 0.00123 of the plain answer)
+        if (body.includes(`"stream":true`)) {
+          const frame = (delta: string, finish: string) => `data: {"id":"or-s-1","object":"chat.completion.chunk","created":1,"model":"openai/gpt-4o-mini","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          const usage = `data: {"id":"or-s-1","object":"chat.completion.chunk","created":1,"model":"openai/gpt-4o-mini","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"cost":0.00456}}\n\n`
+          return new Response(frame(`{"role":"assistant","content":"billed "}`, "null") + frame(`{"content":"stream"}`, `"stop"`) + usage + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
         return Response.json({ id: "or-chat-1", object: "chat.completion", created: 1, model: "openai/gpt-4o-mini", choices: [{ index: 0, message: { role: "assistant", content: "billed hello" }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, cost: 0.00123 } })
       },
     },
@@ -394,6 +540,13 @@ Bun.serve<string>({
     },
     // OpenRouter's native decisions (/alpha/decisions under the mock root /or): the key is checked, the
     // answers are TypeSafe's, and the usage carries OpenRouter's billed cost
+    // Cohere's model object under /cohere-up (its base_url): the retrieve answers with the model's limits and endpoints
+    "/cohere-up/v1/models/command-r-plus": {
+      GET: async (req) => {
+        record(req, "/cohere-up/v1/models/command-r-plus", "")
+        return Response.json({ name: "command-r-plus", is_deprecated: false, endpoints: ["chat"], finetuned: false, context_length: 128000, tokenizer_url: "https://tokenizer.example/command-r-plus.json", default_endpoints: ["chat"], features: ["tools"] })
+      },
+    },
     "/or/alpha/decisions": {
       POST: async (req) => {
         const body = await req.text()
@@ -502,6 +655,8 @@ Bun.serve<string>({
         if (typeof f === "string" || f === undefined) return Response.json({ error: { message: "no file part", type: "invalid_request_error" } }, { status: 400 })
         const raw = try await f.bytes()
         const text = try await f.text()
+        // a big upload (large_payload_optimization): its size and hash
+        if (raw.length > 65536) seen.push({ path: "/v1/files/big", auth: req.headers.get("authorization") ?? "", body: f.name, team: "", tenant: "", size: raw.length, sha: toHex(sha256(raw)) })
         const id = nextId(isAnthropic(req) ? "file_" : "file-")
         mockFiles.set(id, text)
         if (isAnthropic(req)) {
@@ -647,6 +802,15 @@ Bun.serve<string>({
         return Response.json({ input_tokens: 42 })
       },
     },
+    // Cohere's v2 chat: one text answer with its token counts
+    "/v2/chat": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v2/chat", body)
+        if (body.endsWith(`"stream":true}`)) return new Response(COHERE_SSE, { headers: { "content-type": "text/event-stream" } })
+        return Response.json({ id: "co_1", finish_reason: "COMPLETE", message: { role: "assistant", content: [{ type: "text", text: "Hi from cohere" }] }, usage: { tokens: { input_tokens: 7, output_tokens: 3 } } })
+      },
+    },
     "/v1/messages": {
       POST: async (req) => {
         const body = await req.text()
@@ -689,6 +853,7 @@ Bun.serve<string>({
           return new Response(op, { headers: { "content-type": "application/json" } })
         }
         if (action.endsWith(":predict")) return Response.json({ predictions: [{ bytesBase64Encoded: "iVBORw0KGgo=" }] })
+        if (action.endsWith(":streamGenerateContent")) return new Response(GEMINI_SSE, { headers: { "content-type": "text/event-stream" } })
         // image models answer with inline image data; TTS with 16-bit mono PCM at 24 kHz
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
         if (body.includes(`"AUDIO"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "audio/L16;codec=pcm;rate=24000", data: "AAECAw==" } }] }, finishReason: "STOP" }] })
@@ -878,6 +1043,8 @@ Bun.serve<string>({
         if (req.params.modelAction.endsWith(":countTokens")) return Response.json({ totalTokens: 11 })
         if (req.params.modelAction === "count-tokens:rawPredict") return Response.json({ input_tokens: 9 })
         if (req.params.modelAction.endsWith(":predict")) return Response.json({ predictions: [{ bytesBase64Encoded: "iVBORw0KGgo=" }] })
+        if (req.params.modelAction.endsWith(":streamGenerateContent")) return new Response(GEMINI_SSE, { headers: { "content-type": "text/event-stream" } })
+        if (req.params.modelAction.endsWith(":streamRawPredict")) return new Response(ANTHROPIC_SSE, { headers: { "content-type": "text/event-stream" } })
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
         return Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "Hi from vertex" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 3, totalTokenCount: 7 } })
       },
@@ -930,11 +1097,15 @@ Bun.serve<string>({
     // the form's model is what the upstream got
     "/v1/audio/transcriptions": {
       POST: async (req) => {
-        const fd = try await req.formData()
+        // the whole upload as bytes: a big one (large_payload_optimization) is checked by its size and hash
+        const raw = try await req.bytes()
+        const form = new Request(req.url, { method: "POST", headers: { "content-type": req.headers.get("content-type") ?? "" }, body: raw })
+        const fd = try await form.formData()
         const mv = fd.get("model")
         const model = typeof mv === "string" ? mv : ""
-        record(req, "/v1/audio/transcriptions", `{"model":"${model}"}`)
-        return Response.json({ text: "transcribed by " + model })
+        if (raw.length > 65536) seen.push({ path: "/v1/audio/transcriptions", auth: req.headers.get("authorization") ?? "", body: `{"model":"${model}"}`, team: "", tenant: "", size: raw.length, sha: toHex(sha256(raw)) })
+        else record(req, "/v1/audio/transcriptions", `{"model":"${model}"}`)
+        return Response.json({ text: "transcribed by " + model, usage: { type: "tokens", input_tokens: 14, output_tokens: 6, total_tokens: 20 } })
       },
     },
     "/v1/audio/speech": {
@@ -1074,6 +1245,28 @@ Bun.serve<string>({
       },
     },
     "/_seen": () => Response.json(seen),
+    "/_hidden/down": () => {
+      hiddenDown = true
+      return new Response("down", { status: 200 })
+    },
+    "/_hidden/up": () => {
+      hiddenDown = false
+      return new Response("up", { status: 200 })
+    },
+    // the fake GPT Live peer (mock_live.tov): what it received, its counters, and a reset
+    "/_live/events": () => new Response(liveEvents(), { headers: { "content-type": "application/json" } }),
+    "/_live/stats": () => new Response(liveStats(), { headers: { "content-type": "application/json" } }),
+    "/_live/reset": () => {
+      liveReset()
+      return new Response("{}", { headers: { "content-type": "application/json" } })
+    },
+    "/a2a/agent/.well-known/agent-card.json": {
+      GET: (req) => {
+        record(req, "/a2a/agent/.well-known/agent-card.json", "")
+        return Response.json({ name: "echo-agent", description: "Echoes the text it is sent", url: `http://127.0.0.1:${port}/a2a/agent/json-rpc`, version: "1.0.0", protocolVersion: "0.3.0", capabilities: { streaming: true }, defaultInputModes: ["text/plain"], defaultOutputModes: ["text/plain"], skills: [{ id: "echo", name: "echo", description: "Echoes the text", tags: ["test"] }] })
+      },
+    },
+    "/a2a/agent/json-rpc": { POST: (req) => a2aRpc(req) },
     // OAuth metadata (RFC 8414), dynamic client registration (RFC 7591), the authorize step (PKCE S256) and the token endpoint
     "/.well-known/oauth-authorization-server": {
       GET: () => Response.json({ issuer: `http://127.0.0.1:${port}`, authorization_endpoint: `http://127.0.0.1:${port}/oauth2/authorize`, token_endpoint: `http://127.0.0.1:${port}/oauth2/token`, registration_endpoint: `http://127.0.0.1:${port}/oauth2/register`, code_challenge_methods_supported: ["S256"] }),
@@ -1140,6 +1333,14 @@ Bun.serve<string>({
         return try await mcpServer(req)
       },
     },
+    // the MCP server behind a token exchange: it accepts only the tokens the e2e's token endpoint issues (exch-...)
+    "/mcp-exchange": {
+      POST: async (req) => {
+        const auth = req.headers.get("authorization") ?? ""
+        if (!auth.startsWith("Bearer exch-")) return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } })
+        return try await mcpServer(req)
+      },
+    },
     // expires every issued access token, so each caller's next call must refresh
     "/_oauth/expire-all": {
       POST: () => {
@@ -1180,14 +1381,43 @@ Bun.serve<string>({
         put = try try new TextDecoder().decode(raw)
       }
       record(req, u === undefined ? req.url : u.pathname, put)
+      // the retained-content bucket while it is down: refused, and not kept
+      if (u !== undefined && hiddenDown && u.pathname.startsWith("/logs-hidden/")) return new Response("unavailable", { status: 503 })
       if (u !== undefined) putObject(u.pathname.slice(1), put)
       return new Response("", { status: 200 })
     }
     // the Responses lifecycle and realtime REST: answer with what was asked
     const lu = URL.parse(req.url)
     const lp = lu === undefined ? "" : lu.pathname
+    // the fake A2A agents, their OAuth server and the push callback (mock_a2a.tov)
+    if (lp.startsWith("/a2a/") || lp.startsWith("/_a2a/") || lp.startsWith("/mcp-i/") || lp === "/cb/push") {
+      const ar = await a2aHandle(req, lp, lu === undefined ? "" : lu.search, port)
+      if (ar !== undefined) return ar
+    }
     // Replicate's API (see replicateMock)
     if (lp.startsWith("/replicate/")) return try await replicateMock(req, lp.slice(10), lu)
+    // a realtime call (OpenAI's /v1/realtime/calls and its beta /v1/realtime, Azure's /openai/v1/realtime): a
+    // multipart body with the caller's SDP offer in "sdp" and the session in "session". A real WebRTC peer
+    // (mock_live.tov) answers it, and plays the Realtime API on the data channel. The request is recorded
+    // as the session and then the offer, so a test can see what the gateway sent.
+    if (req.method === "POST" && (lp === "/v1/realtime/calls" || lp === "/v1/realtime" || lp === "/openai/v1/realtime")) {
+      let sdp = ""
+      let session = ""
+      try {
+        const fd = try await req.formData()
+        const s = fd.get("sdp")
+        if (typeof s === "string") sdp = s
+        const ses = fd.get("session")
+        if (typeof ses === "string") session = ses
+      } catch (e) {
+        sdp = ""
+      }
+      record(req, lp + (lu === undefined ? "" : lu.search), "session=" + session + "\nsdp=" + sdp)
+      if (session.includes("gpt-realtime-refuse")) return new Response(`{"error":{"message":"invalid realtime session","type":"invalid_request_error"}}`, { status: 400, headers: { "content-type": "application/json" } })
+      const answer = await realtimeAnswer(sdp)
+      if (answer === "") return new Response(`{"error":{"message":"invalid realtime call","type":"invalid_request_error"}}`, { status: 400, headers: { "content-type": "application/json" } })
+      return new Response(answer, { status: 201, headers: { "content-type": "application/sdp" } })
+    }
     // Azure-style deployments: the call is recorded as sent, then answered by the /v1 route of its operation
     if (lp.startsWith("/openai/deployments/") && lu !== undefined) {
       const rest = lp.slice(20)
@@ -1211,11 +1441,21 @@ Bun.serve<string>({
       hd.set("content-type", "audio/wav")
       return new Response("RIFF-recording-" + lp.slice(18, lp.byteLength - 8), { headers: hd })
     }
-    if (lp.startsWith("/v1/responses/") || lp === "/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions" || lp === "/v1/realtime/calls") {
+    if (lp.startsWith("/v1/responses/") || lp === "/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions") {
       const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
       record(req, lp, req.method + " " + body)
-      if (lp === "/v1/realtime/calls") return new Response("v=0\r\no=- answer\r\n", { status: 201, headers: { "content-type": "application/sdp" } })
       return Response.json({ object: "ok", method: req.method, path: lp })
+    }
+    // GPT Live's WebRTC create: a real WebRTC peer answers the offer (mock_live.tov); a body the peer
+    // cannot use is refused as the provider would
+    if (lp === "/v1/live/sessions" && req.method === "POST") {
+      const offer = await req.text()
+      record(req, lp, offer)
+      const hl: Record<string, string> = new Map()
+      hl.set("content-type", "application/json")
+      const made = await liveAnswer(offer)
+      if (made === "") return new Response(`{"error":{"message":"invalid live session request","type":"invalid_request_error"}}`, { status: 400, headers: hl })
+      return new Response(made, { status: 201, headers: hl })
     }
     // realtime: echo each event back, tagged with the credentials and URL the gateway used
     if (req.url.includes("/v1/realtime") || req.url.includes("/v1/live/sessions")) {
@@ -1335,6 +1575,12 @@ Bun.serve<string>({
       if (obj === undefined) return new Response("NoSuchKey", { status: 404 })
       return new Response(obj, { headers: { "content-type": "application/octet-stream" } })
     }
+    // the retained-content bucket: GET reads back the objects it was sent (the gateway never does)
+    if (lp.startsWith("/logs-hidden/") && req.method === "GET") {
+      const hobj = cloudObjects.get(lp.slice(1))
+      if (hobj === undefined) return new Response("NoSuchKey", { status: 404 })
+      return new Response(hobj, { headers: { "content-type": "application/json" } })
+    }
     // S3 objects of the test bucket, path style as the endpoint is set: listings, gets and deletes
     if (lp === "/e2e-files" || lp.startsWith("/e2e-files/")) {
       const bucket = "e2e-files"
@@ -1357,7 +1603,67 @@ Bun.serve<string>({
     message(ws, m) {
       const text = typeof m === "string" ? m : "binary"
       // a live session starts with session.start; the provider answers with its id
-      if (text.includes(`"session.start"`)) ws.send(`{"type":"session.started","session":{"id":"sess_mock_1"}}`)
+      // (a mock_id in the start frame's session names it, so a test can tell sessions apart)
+      if (text.includes(`"session.start"`)) {
+        let sid = "sess_mock_1"
+        try {
+          const mid = rawStr(fields(wsField(text, "session")), "mock_id") ?? ""
+          if (mid !== "") sid = mid
+        } catch (e) {
+          sid = "sess_mock_1"
+        }
+        ws.send(`{"type":"session.started","session":{"id":"${sid}"}}`)
+      }
+      // test events steer the provider (see mock_live.tov for the same ones over WebRTC):
+      //   test.usage {seconds}       a live session.usage.updated
+      //   test.speak {text}          a live input transcript and the words of text as output transcript deltas
+      //   test.backend {input,output,model}  a live delegated response that completed with that usage
+      //   test.rt.start              a realtime session.created
+      //   test.rt.turn {...}         a realtime response (mock_live.tov realtimeTurn)
+      //   test.hangup                the provider's connection breaks (close code 1011)
+      //   session.close {mock_seconds}   a live session.closed with that many seconds (20), then the close
+      let type = ""
+      try {
+        type = rawStr(fields(text), "type") ?? ""
+      } catch (e) {
+        type = ""
+      }
+      if (type === "test.usage") {
+        ws.send(`{"type":"session.usage.updated","usage":{"seconds":${wsField(text, "seconds") === "" ? "0" : wsField(text, "seconds")}}}`)
+        return
+      }
+      if (type === "test.speak") {
+        ws.send(`{"type":"session.input_transcript.delta","delta":"hello","start_ms":0,"end_ms":400}`)
+        for (const w of wsString(text, "text").split(" ")) ws.send(`{"type":"session.output_transcript.delta","delta":${JSON.stringify(w + " ")},"start_ms":500,"end_ms":900}`)
+        return
+      }
+      if (type === "test.backend") {
+        const i = wsField(text, "input")
+        const o = wsField(text, "output")
+        const model = wsString(text, "model")
+        const named = model === "" ? "" : "\"model\":" + JSON.stringify(model) + ","
+        ws.send(`{"type":"response.event","delegation_id":"d1","event":{"type":"response.completed","response":{"id":"resp_${i}_${o}",${named}"usage":{"input_tokens":${i},"output_tokens":${o}}}}}`)
+        return
+      }
+      if (type === "test.rt.start") {
+        const id = wsString(text, "id")
+        ws.send(`{"type":"session.created","session":{"id":"${id === "" ? "sess_mock_rt_ws" : id}","object":"realtime.session"}}`)
+        return
+      }
+      if (type === "test.rt.turn") {
+        for (const e of realtimeTurn(text)) ws.send(e)
+        return
+      }
+      if (type === "test.hangup") {
+        ws.close(1011, "hangup")
+        return
+      }
+      if (type === "session.close") {
+        const secs = wsField(text, "mock_seconds")
+        ws.send(`{"type":"session.closed","reason":"close_requested","usage":{"seconds":${secs === "" ? "20" : secs}}}`)
+        ws.close(1000, "closed")
+        return
+      }
       ws.send(JSON.stringify({ type: "echo", auth: ws.data ?? "", event: text }))
     },
   },

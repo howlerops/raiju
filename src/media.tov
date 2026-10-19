@@ -6,16 +6,18 @@
 // have their own APIs: media_native.tov and media_cloud.tov build those requests and the answers
 // are converted to OpenAI's shapes here.
 import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
-import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf } from "./providers/types"
+import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf, poolOf } from "./providers/types"
 import { isOpenAICompatible, modelsRequest } from "./providers/openai"
 import * as replicate from "./providers/replicate"
 import { parseModel, target, kindOf, pickKey, timeoutMs } from "./router"
 import { Field, fields, find, rawStr, rawNum, setField, build, quote } from "./json"
 import { errorJson, snapshot, nowSeconds } from "./schemas"
 import { deadline } from "./deadline"
+import { LargeSettings, LargeBody, formPrefix, boundaryOf, readAhead, readRest } from "./largepayload"
 import * as native from "./media_native"
 import * as cloud from "./media_cloud"
 import * as cloudAuth from "./cloud_auth"
+import * as base64 from "./base64"
 import { S3Creds, awsCall } from "./exports"
 import { parseServiceAccount } from "./providers/vertex"
 
@@ -55,7 +57,6 @@ function patterns(): Pattern[] {
     // Realtime over REST and WebRTC: ephemeral client secrets, sessions, and SDP calls
     { method: "POST", pattern: "/v1/realtime/client_secrets", op: "realtime.client_secrets", modelIn: "none" },
     { method: "POST", pattern: "/v1/realtime/sessions", op: "realtime.sessions", modelIn: "json" },
-    { method: "POST", pattern: "/v1/realtime/calls", op: "realtime.calls", modelIn: "none" },
     // Mistral's OCR (and OpenAI-compatible providers that offer it)
     { method: "POST", pattern: "/v1/ocr", op: "ocr", modelIn: "json" },
   ]
@@ -269,8 +270,9 @@ export async function send(t: Target, mr: native.MediaRequest): Promise<Response
     let res: Response
     const px = proxyOf(t.cfg)
     const tls = tlsOf(t.cfg)
-    if (body === undefined) res = try await fetch(mr.url, { method: mr.method, headers: r, signal: signal, proxy: px, tls: tls })
-    else res = try await fetch(mr.url, { method: mr.method, headers: r, body: body, signal: signal, proxy: px, tls: tls })
+    const pool = poolOf(t.cfg)
+    if (body === undefined) res = try await fetch(mr.url, { method: mr.method, headers: r, signal: signal, proxy: px, tls: tls, pool: pool })
+    else res = try await fetch(mr.url, { method: mr.method, headers: r, body: body, signal: signal, proxy: px, tls: tls, pool: pool })
     const bytes = try await res.bytes()
     dl.finish()
     const ct = res.headers.get("content-type") ?? "application/json"
@@ -327,7 +329,7 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       else if (text !== "") {
         body = text
         // an SDP offer goes up as the caller sent it (application/sdp, or the multipart boundary)
-        contentType = route.op === "realtime.calls" ? (req.headers.get("content-type") ?? "application/sdp") : "application/json"
+        contentType = "application/json"
       }
     }
   } catch (e) {
@@ -345,6 +347,95 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
   const hs = authHeaders(tt)
   if (contentType !== undefined) hs.set("content-type", contentType)
   return await send(tt, { method: route.method, url: upstreamUrl(tt, route, qs), headers: hs, body: body })
+}
+
+// large_payload_optimization for a multipart upload (audio, image edits, files; largepayload.tov). A body over
+// the request threshold is not read whole: its first bytes give the model and the form fields before the file,
+// and the rest goes to the provider as it arrives, with the provider's name for the model in the form field.
+// Returns undefined for a request this does not touch (under the threshold), the Request to go on with (the
+// body was small after all, or its provider needs it whole: native providers, or a model field that comes
+// after the file) or the Response (refused, or the provider's answer).
+export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRoute, lp: LargeSettings): Promise<Response | Request | undefined> {
+  if (req.method !== "POST") return undefined
+  const dtext = req.headers.get("content-length")
+  const declared = dtext === undefined ? -1 : (parseInt(dtext) ?? -1)
+  if (declared >= 0 && declared <= lp.requestThreshold) return undefined
+  if (declared > lp.maxPayload) return errorReply(413, `request body of ${declared} bytes is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error")
+  const src = req.body
+  if (src === undefined) return undefined
+  const contentType = req.headers.get("content-type") ?? ""
+  const boundary = boundaryOf(contentType)
+  if (boundary === "") return undefined
+  // read ahead: the prefix, or the whole body when it ends within the threshold
+  const want = declared >= 0 ? lp.prefetch : Math.max(lp.prefetch, lp.requestThreshold + 1)
+  const ahead = await readAhead(src, want)
+  if (ahead.error !== "") return errorReply(400, `the request body could not be read: ${ahead.error}`, "invalid_request_error")
+  const hs0 = snapshot(req.headers)
+  if (ahead.ended && declared < 0 && ahead.head.length <= lp.requestThreshold) {
+    // no declared length, and small after all: an ordinary request
+    return new Request(req.url, { method: "POST", headers: hs0, body: ahead.head })
+  }
+  const meta = formPrefix(ahead.head, boundary)
+  const url = URL.parse(req.url)
+  const sp = new URLSearchParams(url === undefined ? "" : url.search)
+  const provider = providerFor(hs0, sp)
+  sp.delete("provider")
+  const qs = sp.toString()
+  // the provider needs the whole body (or the model is not in the prefix): read it, up to client.max_request_body_size_mb
+  const wholeRequest = async (): Promise<Response | Request> => {
+    const limit = (cfg.client?.max_request_body_size_mb ?? 100) * 1048576
+    if (declared > limit) {
+      await src.cancel()
+      return errorReply(413, "request body too large: this upload is read whole here and it is over client.max_request_body_size_mb", "invalid_request_error")
+    }
+    const all = await readRest(src, ahead.head, limit)
+    if (all.over) return errorReply(413, "request body too large", "invalid_request_error")
+    if (all.error !== "") return errorReply(400, `the request body could not be read: ${all.error}`, "invalid_request_error")
+    return new Request(req.url, { method: "POST", headers: hs0, body: all.bytes })
+  }
+  let t: Target | undefined = undefined
+  if (route.modelIn === "form") {
+    if (!meta.hasModel) return await wholeRequest()
+    t = modelTarget(cfg, meta.model)
+    if (t === undefined) {
+      await src.cancel()
+      return errorReply(404, `no provider or key serves model "${meta.model}"`, "invalid_request_error")
+    }
+  } else {
+    t = providerTarget(cfg, provider)
+    if (t === undefined) {
+      await src.cancel()
+      return errorReply(404, `provider "${provider}" is not configured or has no key`, "invalid_request_error")
+    }
+  }
+  const tt: Target = t
+  if (isNative(tt.kind) || (tt.kind === "wafer" && route.op === "files.create")) return await wholeRequest()
+  if (!supported(tt.kind)) {
+    await src.cancel()
+    return errorReply(400, `provider "${tt.provider}" does not support ${route.op}`, "invalid_request_error")
+  }
+  const lg = new LargeBody(lp, ahead.head, meta, ahead.ended ? undefined : src, declared)
+  lg.plain = true
+  if (route.modelIn === "form") lg.upstreamModel = tt.model
+  const h = authHeaders(tt)
+  h.set("content-type", contentType)
+  // the length is declared again when the caller declared one (so the provider need not accept chunks)
+  if (declared >= 0) h.set("content-length", "" + (declared + lg.delta()))
+  const hr: Record<string, string> = h
+  const dl = deadline(timeoutMs(tt.cfg))
+  try {
+    const res = await fetch(upstreamUrl(tt, route, qs), { method: "POST", headers: hr, body: lg.stream(), signal: dl.controller.signal, proxy: proxyOf(tt.cfg), tls: tlsOf(tt.cfg), pool: poolOf(tt.cfg) })
+    const bytes = await res.bytes()
+    dl.finish()
+    // a body with no declared length that grew past max_payload_bytes cut its own upload short
+    if (lg.tap.over) return errorReply(413, `request body is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error")
+    const ct = res.headers.get("content-type") ?? "application/json"
+    return new Response(bytes, { status: res.status, headers: { "content-type": ct } })
+  } catch (e) {
+    dl.finish()
+    if (lg.tap.over) return errorReply(413, `request body is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error")
+    return errorReply(502, `${tt.provider} request failed: ${e.message}`, "api_connection_error")
+  }
 }
 
 // ---- Native cloud routes: the provider's own job, file and cache APIs ----
@@ -507,63 +598,6 @@ function vertexNativeRequest(t: Target, token: string, nr: NativeRoute, qs: stri
   return { method: method, url: url, headers: hs, body: body }
 }
 
-// POST /v1/realtime with a WebRTC SDP offer (Bifrost accepts it at the base path as well as at
-// /realtime/calls). The model is the session's (the multipart "session" field, or ?model=), and it picks
-// the provider; the call goes up as /v1/realtime/calls of that provider with the model's bare name.
-export async function realtimeSdp(cfg: Config, req: Request): Promise<Response> throws TypeError {
-  const url = try new URL(req.url)
-  const sp = new URLSearchParams(url.search)
-  const ct = req.headers.get("content-type") ?? ""
-  let model = sp.get("model") ?? ""
-  let form: FormData | undefined = undefined
-  let sdp = ""
-  let session = ""
-  try {
-    if (ct.includes("multipart/form-data")) {
-      const fd = try await req.formData()
-      form = fd
-      const s = fd.get("session")
-      if (typeof s === "string") {
-        session = s
-        if (model === "") model = rawStr(try fields(s), "model") ?? ""
-      }
-    } else {
-      sdp = try await req.text()
-    }
-  } catch (e) {
-    return errorReply(400, `invalid request body: ${e.message}`, "invalid_request_error")
-  }
-  if (model === "") return errorReply(400, "session.model is required", "invalid_request_error")
-  const mt = modelTarget(cfg, model)
-  if (mt === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
-  if (!supported(mt.kind)) return errorReply(400, `provider "${mt.provider}" does not support realtime calls`, "invalid_request_error")
-  sp.delete("provider")
-  sp.set("model", mt.model)
-  const origin = url.origin
-  const hs: Map<string, string> = snapshot(req.headers)
-  hs.set("x-bf-provider", mt.provider)
-  let next: Request
-  try {
-    if (form !== undefined) {
-      // the session with its model replaced by the bare name (Bifrost strips the provider prefix)
-      const newSession = session === "" ? "" : try rewriteJsonModel(session, mt.model)
-      const out = new FormData()
-      form.forEach((value, key) => {
-        if (key === "session" && typeof value === "string") out.append(key, newSession === "" ? value : newSession)
-        else out.append(key, value)
-      })
-      hs.delete("content-type")
-      next = new Request(origin + "/v1/realtime/calls?" + sp.toString(), { method: "POST", headers: hs, body: out })
-    } else {
-      next = new Request(origin + "/v1/realtime/calls?" + sp.toString(), { method: "POST", headers: hs, body: sdp })
-    }
-  } catch (e) {
-    return errorReply(400, `invalid session: ${e.message}`, "invalid_request_error")
-  }
-  const route = matchRoute("POST", "/v1/realtime/calls") ?? { op: "realtime.calls", method: "POST", upstreamPath: "/realtime/calls", modelIn: "none" }
-  return try await handleMedia(cfg, next, route)
-}
-
 // ---- Anthropic and Gemini ----
 // Their answers are converted to OpenAI's shapes (media_native.tov builds the
 // requests). An upstream error comes back as the upstream sent it.
@@ -679,7 +713,7 @@ async function nativeMedia(t: Target, route: MediaRoute, qs: string, text: strin
     if (t.kind === "anthropic") return await anthropicMedia(t, route, qs, text, form)
     if (t.kind === "vertex") return await vertexMedia(t, route, qs, text, form)
     if (t.kind === "bedrock") return await bedrockMedia(t, route, qs, text, form)
-    if (t.kind === "replicate") return await replicateMedia(t, route, text, form)
+    if (t.kind === "replicate") return await replicateMedia(t, route, qs, text, form)
     return await geminiMedia(t, route, qs, text, form)
   } catch (e) {
     return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
@@ -825,7 +859,7 @@ export async function vertexBearer(t: Target): Promise<string> throws SyntaxErro
   const dl = deadline(10000)
   let text = ""
   try {
-    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg) })
+    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
     text = try await res.text()
   } catch (e) {
     dl.finish()
@@ -1004,7 +1038,7 @@ async function bedrockCreds(t: Target): Promise<S3Creds> throws SyntaxError | Er
   const dl = deadline(10000)
   let text = ""
   try {
-    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg) })
+    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
     text = try await res.text()
   } catch (e) {
     dl.finish()
@@ -1201,14 +1235,68 @@ async function bedrockBatchOutput(t: Target, c: S3Creds, bid: string): Promise<R
   return jsonlReply(try cloud.bedrockResultsToOpenAI(all, model))
 }
 
-// Replicate: image generations as predictions (the output URLs), and file uploads. Other operations
-// answer 400: Replicate has no image edits here, and its files are not listed or fetched.
-async function replicateMedia(t: Target, route: MediaRoute, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+// Replicate predictions still running when the synchronous wait ends are read again at their get URL,
+// every 2 seconds (Bifrost's interval), until they settle or the provider's timeout ends the wait.
+async function replicateSettle(t: Target, text: string): Promise<string | Response> throws SyntaxError | Error {
+  let cur = text
+  const until = Date.now() + timeoutMs(t.cfg)
+  while (!try replicate.isSettled(cur)) {
+    const url = try replicate.getUrlOf(cur)
+    if (url === "") return cur
+    if (Date.now() >= until) return errorReply(504, `replicate did not finish the prediction within ${timeoutMs(t.cfg)} ms`, "api_error")
+    await new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000))
+    const r = await send(t, { method: "GET", url: url, headers: authHeaders(t), body: undefined })
+    if (!r.ok) return r
+    cur = try await r.text()
+  }
+  return cur
+}
+
+// The MIME type of an image from its first bytes (PNG, JPEG, GIF, WebP); PNG when none matches.
+function imageMime(b: u8[]): string {
+  const a = b[0] ?? 0
+  const c = b[1] ?? 0
+  if (a === 0xff && c === 0xd8) return "image/jpeg"
+  if (a === 0x47 && c === 0x49) return "image/gif"
+  if (a === 0x52 && c === 0x49) return "image/webp"
+  return "image/png"
+}
+
+// An edit form's options as the prediction's input: the prompt, the count, the seed and the negative prompt.
+function replicateEditBody(form: FormData): Field[] throws SyntaxError {
+  const o: string[] = [`"prompt":${quote(formText(form, "prompt"))}`]
+  const n = try formInt(form, "n")
+  if (n !== undefined) o.push(`"n":${n}`)
+  const seed = try formInt(form, "seed")
+  if (seed !== undefined) o.push(`"seed":${seed}`)
+  const neg = formText(form, "negative_prompt")
+  if (neg !== "") o.push(`"negative_prompt":${quote(neg)}`)
+  return try fields("{" + o.join(",") + "}")
+}
+
+// Replicate: image generations and edits as predictions (the output URLs), file uploads, and the file list,
+// retrieve and delete. Files have no content route here, as in Bifrost, and answer 400.
+async function replicateMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
   if (route.op === "images.generations") {
     const up = try replicate.imageRequest(t, try fields(text))
     const r = await send(t, { method: "POST", url: up.url, headers: up.headers, body: up.body })
     if (!r.ok) return r
-    return jsonReply(try replicate.imageResponse(try await r.text()))
+    const settled = try await replicateSettle(t, try await r.text())
+    if (typeof settled !== "string") return settled
+    return jsonReply(try replicate.imageResponse(settled))
+  }
+  // the mask is not sent: Replicate's models take the image (and a mask only in their own inputs)
+  if (route.op === "images.edits") {
+    if (form === undefined) return errorReply(400, "the request needs an image", "invalid_request_error")
+    const urls: string[] = []
+    for (const b of try await imageBytes(form)) urls.push(`data:${imageMime(b)};base64,${base64.encode(b)}`)
+    if (urls.length === 0) return errorReply(400, "the request needs an image", "invalid_request_error")
+    const up = try replicate.imageEditRequest(t, try replicateEditBody(form), urls)
+    const r = await send(t, { method: "POST", url: up.url, headers: up.headers, body: up.body })
+    if (!r.ok) return r
+    const settled = try await replicateSettle(t, try await r.text())
+    if (typeof settled !== "string") return settled
+    return jsonReply(try replicate.imageResponse(settled))
   }
   if (route.op === "files.create") {
     const f = filePart(form)
@@ -1220,6 +1308,23 @@ async function replicateMedia(t: Target, route: MediaRoute, text: string, form: 
     const r = await send(t, { method: "POST", url: replicate.rootOf(t) + "/v1/files", headers: authHeaders(t), body: fd })
     if (!r.ok) return r
     return jsonReply(try replicate.fileToOpenAI(try await r.text(), formText(form, "purpose")))
+  }
+  if (route.op === "files.list") {
+    const cursor = new URLSearchParams(qs).get("after") ?? ""
+    const r = await send(t, { method: "GET", url: replicate.fileListUrl(t, cursor), headers: replicate.fileHeaders(t), body: undefined })
+    if (!r.ok) return r
+    return jsonReply(try replicate.fileListToOpenAI(try await r.text()))
+  }
+  if (route.op === "files.retrieve") {
+    const r = await send(t, { method: "GET", url: replicate.fileUrl(t, routeId(route)), headers: replicate.fileHeaders(t), body: undefined })
+    if (!r.ok) return r
+    return jsonReply(try replicate.fileToOpenAI(try await r.text(), ""))
+  }
+  if (route.op === "files.delete") {
+    const id = routeId(route)
+    const r = await send(t, { method: "DELETE", url: replicate.fileUrl(t, id), headers: replicate.fileHeaders(t), body: undefined })
+    if (!r.ok) return r
+    return jsonReply(replicate.fileDeletedToOpenAI(id))
   }
   return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
 }

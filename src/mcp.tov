@@ -4,6 +4,8 @@
 // without a network; McpSession and McpManager wrap them around fetch.
 import { McpAuthConfig, TokenCache, staticHeaders, tokenRequest, discoveryUrls, parseAuthServerMetadata } from "./mcpauth"
 import { McpUserToken } from "./mcpuser"
+import { McpTokenExchange, AdminCredential, adminCredential, needsReverify, reverifyRow } from "./tokenexchange"
+import { InstructionPart, aggregate, commentBlock } from "./mcpinstructions"
 
 // one reply of a per-user call: its status, content type, body and the session id it carries
 type UserReply = { status: int, contentType: string, body: string, sid: string }
@@ -51,6 +53,25 @@ export type McpClientConfig = {
   // the client connects with to list its tools.
   auth_type?: string,
   per_user_header_keys?: string[],
+  // auth_type "token_exchange": the caller's identity-provider token is exchanged for one scoped to the
+  // audience, and the result goes with its tool calls (src/tokenexchange.tov)
+  token_exchange?: McpTokenExchange,
+  // is_code_mode_client: the tools are not offered one by one; the model reaches them through the code mode
+  // meta-tools (src/codemode.tov). Their tools still run through the same gates when a program calls them.
+  is_code_mode_client?: bool,
+  // the byte cap on this server's forwarded instructions; 0 or unset uses mcp.max_instructions_per_client
+  max_instructions_length?: int,
+}
+
+// The code mode limits as the config gives them (Bifrost's mcp_code_mode_limits); 0 or a missing field is the default.
+export type CodeLimitsIn = {
+  max_source_bytes?: int,
+  max_steps?: int,
+  max_memory_bytes?: int,
+  max_log_bytes?: int,
+  max_tool_calls?: int,
+  max_value_bytes?: int,
+  max_nesting_depth?: int,
 }
 
 export type McpTlsConfig = { insecure_skip_verify?: bool, ca_cert_pem?: string }
@@ -74,6 +95,16 @@ export type McpConfig = {
   header_flows?: McpHeaderFlow[],
   // the tokens each caller obtained for the per_user_oauth clients (src/mcpuser.tov); sealed at rest
   user_tokens?: McpUserToken[],
+  // the admin discovery credential of each token_exchange client, kept by its verification (verify-exchange):
+  // the tools are listed with it, as Bifrost's admin bootstrap token does. Sealed at rest, never returned.
+  exchange_admin?: McpUserToken[],
+  // code mode: "server" (one stub file per server, the default) or "tool" (one per tool), and the run limits
+  code_mode_binding_level?: string,
+  code_mode_limits?: CodeLimitsIn,
+  // byte caps on the MCP server instructions forwarded to the model: per server (4096 when unset) and
+  // for the whole set (16384 when unset); a client's max_instructions_length overrides the first
+  max_instructions_per_client?: int,
+  max_instructions_total?: int,
 }
 
 // The per-user headers a virtual key submitted for one client; undefined when it has submitted none.
@@ -92,6 +123,50 @@ export function perUserOAuthNames(list: McpClientConfig[] | undefined): string[]
     if (c.auth_type === "per_user_oauth") out.push(c.name)
   }
   return out
+}
+
+// The names of the clients whose auth_type is token_exchange.
+export function tokenExchangeNames(list: McpClientConfig[] | undefined): string[] {
+  const out: string[] = []
+  for (const c of list ?? []) {
+    if (c.auth_type === "token_exchange") out.push(c.name)
+  }
+  return out
+}
+
+// The admin discovery credential a token_exchange client was verified with ("" when none is kept). An expired
+// credential, or one whose renewal was refused, reads as none: the client waits for a new verification. nowMs
+// is epoch milliseconds.
+export function adminTokenOf(list: McpUserToken[] | undefined, client: string, nowMs: f64): string {
+  for (const r of list ?? []) {
+    if (r.mcp_client_name !== client) continue
+    if (needsReverify(r)) return ""
+    if (r.token_expires_at > 0.0 && r.token_expires_at <= nowMs) return ""
+    return r.access_token
+  }
+  return ""
+}
+
+// The retained admin credential row of a token_exchange client, or undefined.
+export function adminRowOf(list: McpUserToken[] | undefined, client: string): McpUserToken | undefined {
+  for (const r of list ?? []) {
+    if (r.mcp_client_name === client) return r
+  }
+  return undefined
+}
+
+// Renews a token_exchange client's admin credential after the server answered 401 to it: the new token, or ""
+// when there is none. Set once by the gateway (the renewal saves the credential).
+let adminRenew: ((client: string) => Promise<string>) | undefined = undefined
+
+export function setAdminRenew(f: ((client: string) => Promise<string>) | undefined): void {
+  adminRenew = f
+}
+
+// the error a token_exchange client shows while its admin credential needs a new verification
+function reverifyError(row: McpUserToken): string {
+  const why = row.status_reason ?? ""
+  return `needs re-verification: ${why !== "" ? why : "the admin credential can no longer be renewed"}; verify it again with POST /api/mcp/client/{id}/verify-exchange`
 }
 
 // The names of the clients whose auth_type is per_user_headers.
@@ -295,11 +370,41 @@ function chatName(server: string, tool: string): string {
   return sanitizeName(`${server}-${tool}`)
 }
 
+export function chatToolName(server: string, tool: string): string {
+  return chatName(server, tool)
+}
+
+// The predicate that decides which of a session's tools a caller sees: the key's mcp_configs rules and
+// the access profile's patterns, with allow_by_default for a client neither names.
+function visibleTo(s: McpSession, policy: string[] | undefined, keys: McpKeyConfig[] | undefined): (orig: string, chat: string) => bool {
+  const name = s.cfg.name
+  const byDefault = s.cfg.allow_by_default === true
+  const ks: McpKeyConfig[] = keys ?? []
+  const pol: string[] = policy ?? []
+  const keyNamed = keys !== undefined && keyNamesClient(ks, name)
+  let polNamed = false
+  if (policy !== undefined) polNamed = namesClient(pol, name)
+  return (orig: string, chat: string): bool => {
+    const keyOk = keys === undefined || (keyNamed ? keyRuleAllows(ks, name, orig, byDefault) : byDefault)
+    const polOk = policy === undefined || (polNamed ? pol.some((p) => patternMatches(chat, p)) : byDefault)
+    return keyOk && polOk
+  }
+}
+
 // Bifrost's allow and skip lists. An empty allow list (or "*") exposes every tool.
 function toolAllowed(name: string, cfg: McpClientConfig): bool {
   const allow = cfg.tools_to_execute ?? []
   if (allow.length > 0 && !allow.includes("*") && !allow.includes(name)) return false
   return !(cfg.tools_to_skip ?? []).includes(name)
+}
+
+// The instructions of an initialize result, "" when it has none.
+export function instructionsOf(resultRaw: string): string {
+  try {
+    return rawStr(fields(resultRaw), "instructions") ?? ""
+  } catch (e) {
+    return ""
+  }
 }
 
 // One OpenAI tool definition.
@@ -590,6 +695,8 @@ export class McpSession {
   tools: McpTool[] = []
   connected = false
   lastError = ""
+  // the instructions the server sent with its initialize answer ("" when it sent none)
+  instructions = ""
   private sessionId = ""
   private version = ""
   private nextId = 1
@@ -608,8 +715,16 @@ export class McpSession {
   private openapi: OpenApiDoc | undefined = undefined
   private opBase = ""
 
+  // the config this session runs with; follow() swaps in a changed tool policy for a kept stdio process
+  cfg: McpClientConfig
+  // a token_exchange client's admin discovery credential: its tools are listed with it (see adminTokenOf)
+  adminToken = ""
+  // the retained row behind it (its expiry, renewal state), for the status view
+  adminRow: McpUserToken | undefined = undefined
+
   // timeoutMs bounds each tool call unless the client has its own tool_execution_timeout.
-  constructor(readonly cfg: McpClientConfig, timeoutMs?: int, allowList?: string[]) {
+  constructor(cfg: McpClientConfig, timeoutMs?: int, allowList?: string[]) {
+    this.cfg = cfg
     const own = durationMsOf(cfg.tool_execution_timeout)
     this.timeoutMs = own > 0 ? own : timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS
     this.allow = allowList ?? []
@@ -656,6 +771,7 @@ export class McpSession {
       const bearer = this.tokens.header(this.cfg.name, Date.now())
       if (bearer !== undefined) h.set("authorization", bearer)
     }
+    if (this.cfg.auth_type === "token_exchange" && this.adminToken !== "") h.set("authorization", "Bearer " + this.adminToken)
     h.set("content-type", "application/json")
     h.set("accept", "application/json, text/event-stream")
     if (this.sessionId !== "") h.set("mcp-session-id", this.sessionId)
@@ -710,10 +826,19 @@ export class McpSession {
   }
 
   // POSTs one message, with an OAuth token when the server needs one: fetched first if
-  // missing, and once more after a 401.
+  // missing, and once more after a 401. A token_exchange client's admin credential is renewed after a 401.
   private async exchange(body: string, timeoutMs: int, extra?: Map<string, string>): Promise<Reply> throws Error {
     if (this.isOAuth() && this.tokens.header(this.cfg.name, Date.now()) === undefined) try await this.fetchToken()
     const first = try await this.send(body, timeoutMs, extra)
+    if (first.status === 401 && this.cfg.auth_type === "token_exchange" && this.adminToken !== "") {
+      const renew = adminRenew
+      if (renew === undefined) return first
+      const used = this.adminToken
+      const fresh = await renew(this.cfg.name)
+      if (fresh === "" || fresh === used) return first
+      this.adminToken = fresh
+      return try await this.send(body, timeoutMs, extra)
+    }
     if (first.status !== 401 || !this.isOAuth()) return first
     this.tokens.invalidate(this.cfg.name)
     try await this.fetchToken()
@@ -789,6 +914,11 @@ export class McpSession {
       this.lastError = "disabled"
       return
     }
+    // a token_exchange client lists its tools with the admin credential its verification kept; without one it waits
+    if (this.cfg.auth_type === "token_exchange" && this.adminToken === "") {
+      this.lastError = this.awaitingError()
+      return
+    }
     try {
       const transport = this.cfg.connection_type
       if (transport !== "http" && transport !== "sse" && transport !== "stdio" && transport !== "openapi") throw new Error(`unsupported connection type ${transport}`)
@@ -807,7 +937,8 @@ export class McpSession {
         this.stdio = ch
       }
       const initId = this.newId()
-      try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS)
+      const initRaw = try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS)
+      this.instructions = instructionsOf(initRaw)
       // From here on the protocol version is sent with every request.
       this.version = PROTOCOL
       try await this.notify(initializedNotification())
@@ -815,7 +946,7 @@ export class McpSession {
       this.connected = true
     } catch (e) {
       this.connected = false
-      this.lastError = e.message
+      this.lastError = this.cfg.auth_type === "token_exchange" && this.adminToken === "" ? this.awaitingError() : e.message
     }
   }
 
@@ -907,17 +1038,38 @@ export class McpSession {
     return { text: r.text, isError: r.status >= 400 }
   }
 
-  // Lists the tools again (the periodic tool_sync_interval refresh). A failure keeps the tools it had.
+  // Why a token_exchange client without an admin credential cannot list its tools.
+  private awaitingError(): string {
+    const row = this.adminRow
+    if (row !== undefined && needsReverify(row)) return reverifyError(row)
+    return "awaiting verification: the admin credential of this token_exchange client is missing or expired; verify it with POST /api/mcp/client/{id}/verify-exchange"
+  }
+
+  // Whether this token_exchange client's admin credential needs a new verification (Bifrost's needs_reauth).
+  awaitingReverify(): bool {
+    const row = this.adminRow
+    return this.cfg.auth_type === "token_exchange" && row !== undefined && needsReverify(row)
+  }
+
+  // Lists the tools again (the periodic tool_sync_interval refresh). A failure keeps the tools it had; a
+  // success clears the error an earlier one left. A token_exchange client without its admin credential keeps
+  // its tools (each caller's calls still run with their own exchanged tokens) and says why it cannot list.
   async relist(): Promise<void> {
     if (!this.connected) return
+    if (this.cfg.auth_type === "token_exchange" && this.adminToken === "") {
+      this.lastError = this.awaitingError()
+      return
+    }
     try {
       if (this.cfg.connection_type === "openapi") {
         try await this.loadOpenApi()
       } else {
         try await this.listAll()
       }
+      this.lastError = ""
     } catch (e) {
-      this.lastError = e.message
+      // a renewal refused during this listing (after the server's 401) says so rather than "HTTP 401"
+      this.lastError = this.cfg.auth_type === "token_exchange" && this.adminToken === "" ? this.awaitingError() : e.message
     }
   }
 
@@ -965,6 +1117,23 @@ export class McpSession {
 
   exposedCount(): int {
     return this.exposed.size
+  }
+
+  // Re-applies this client's tool policy to the tools already listed, without a new listing.
+  applyPolicy(): void {
+    const ex: Map<string, string> = new Map()
+    for (const t of this.tools) {
+      if (toolAllowed(t.name, this.cfg)) ex.set(chatName(this.cfg.name, t.name), t.name)
+    }
+    this.exposed = ex
+  }
+
+  // Every tool the server listed, by its own name, with whether this client's config allows it (the
+  // management UI turns tools on and off through tools_to_skip and tools_to_execute).
+  toolStates(): { name: string, allowed: bool }[] {
+    const out: { name: string, allowed: bool }[] = []
+    for (const t of this.tools) out.push({ name: t.name, allowed: toolAllowed(t.name, this.cfg) })
+    return out
   }
 
   // A tool call of a per_user_oauth client with the calling key's own token. Each call opens a fresh session
@@ -1092,7 +1261,23 @@ export class McpManager {
         if (s.cfg.name !== n.cfg.name) continue
         // a stdio server keeps its process; an unchanged HTTP client keeps its connection and tools,
         // so a config write elsewhere doesn't empty the tool list while it reconnects
-        if (s.cfg.connection_type === "stdio" || JSON.stringify(s.cfg) === JSON.stringify(n.cfg)) kept = s
+        if (s.cfg.connection_type === "stdio") {
+          // the kept process takes the saved tool policy, so a tool switched off or on applies now
+          if (JSON.stringify(s.cfg) !== JSON.stringify(n.cfg)) {
+            s.cfg = n.cfg
+            s.applyPolicy()
+          }
+          kept = s
+        } else if (JSON.stringify(s.cfg) === JSON.stringify(n.cfg) && s.adminToken === n.adminToken) {
+          s.adminRow = n.adminRow
+          kept = s
+        } else if (JSON.stringify(s.cfg) === JSON.stringify(n.cfg) && n.cfg.auth_type === "token_exchange" && n.adminToken === "" && s.connected) {
+          // the admin credential ran out or needs a new verification: the connected client keeps its tools and
+          // each caller's calls, and only stops re-listing (as Bifrost's needs_reauth for per-user clients)
+          s.adminToken = ""
+          s.adminRow = n.adminRow
+          kept = s
+        }
       }
       keep.push(kept ?? n)
     }
@@ -1107,6 +1292,8 @@ export class McpManager {
   // the global tool_sync_interval, for clients with none of their own (0: no periodic re-list)
   private defaultSyncSecs: int = 0
   private allow: string[] = []
+  private instrPerClient: int = 0
+  private instrTotal: int = 0
 
   constructor(cfg: McpConfig) {
     const secs = cfg.tool_execution_timeout_seconds
@@ -1114,7 +1301,26 @@ export class McpManager {
     const list = cfg.client_configs ?? []
     this.allow = cfg.oauth_private_allowlist ?? []
     this.defaultSyncSecs = syncSeconds(cfg.tool_sync_interval)
-    this.sessions = list.map((c) => new McpSession(c, ms, this.allow))
+    this.instrPerClient = cfg.max_instructions_per_client ?? 0
+    this.instrTotal = cfg.max_instructions_total ?? 0
+    const admin = cfg.exchange_admin
+    this.sessions = list.map((c) => {
+      const s = new McpSession(c, ms, this.allow)
+      s.adminToken = adminTokenOf(admin, c.name, Date.now())
+      s.adminRow = adminRowOf(admin, c.name)
+      return s
+    })
+  }
+
+  // Takes a token_exchange client's renewed (or refused) admin credential in place, so the running session
+  // keeps its connection: the next listing uses the new token, and a refused one stops the listing.
+  setAdmin(row: McpUserToken): void {
+    for (const s of this.sessions) {
+      if (s.cfg.name !== row.mcp_client_name) continue
+      s.adminRow = row
+      s.adminToken = needsReverify(row) ? "" : row.access_token
+      if (needsReverify(row)) s.lastError = reverifyError(row)
+    }
   }
 
   // Connects every HTTP server. A server that fails is recorded in status(), not thrown.
@@ -1162,20 +1368,64 @@ export class McpManager {
     if (policy === undefined && keys === undefined) return this.allTools()
     const out: string[] = []
     for (const s of this.sessions) {
-      if (!s.connected) continue
-      const name = s.cfg.name
-      const byDefault = s.cfg.allow_by_default === true
-      const ks: McpKeyConfig[] = keys ?? []
-      const pol: string[] = policy ?? []
-      const keyNamed = keys !== undefined && keyNamesClient(ks, name)
-      let polNamed = false
-      if (policy !== undefined) polNamed = namesClient(pol, name)
-      const pass = s.toolsWhere((orig: string, chat: string): bool => {
-        const keyOk = keys === undefined || (keyNamed ? keyRuleAllows(ks, name, orig, byDefault) : byDefault)
-        const polOk = policy === undefined || (polNamed ? pol.some((p) => patternMatches(chat, p)) : byDefault)
-        return keyOk && polOk
-      })
+      if (!s.connected || s.cfg.is_code_mode_client === true) continue
+      const pass = s.toolsWhere(visibleTo(s, policy, keys))
       for (const t of pass) out.push(t)
+    }
+    return out
+  }
+
+  // The servers whose instructions a caller may be sent: the connected clients that gave some and
+  // that offer the caller at least one tool (a server the caller cannot reach is not heard from), by
+  // name. Code mode clients are left out: their guidance rides in the stub files.
+  instructionParts(policy: string[] | undefined, keys?: McpKeyConfig[]): InstructionPart[] {
+    const out: InstructionPart[] = []
+    for (const s of this.sessions) {
+      if (!s.connected || s.cfg.is_code_mode_client === true || s.instructions === "") continue
+      if (s.toolsWhere(visibleTo(s, policy, keys)).length === 0) continue
+      out.push({ name: s.cfg.name, text: s.instructions, max: s.cfg.max_instructions_length ?? 0 })
+    }
+    out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    return out
+  }
+
+  // The parts as one block, within the caps; "" when there are none.
+  renderInstructions(parts: InstructionPart[]): string {
+    return aggregate(parts, this.instrPerClient, this.instrTotal)
+  }
+
+  // The block of server instructions a caller is sent, within the caps; "" when there is none.
+  instructionsFor(policy: string[] | undefined, keys?: McpKeyConfig[]): string {
+    return this.renderInstructions(this.instructionParts(policy, keys))
+  }
+
+  // Follows a changed config's caps (the sessions are followed by follow()).
+  setInstructionCaps(perClient: int, total: int): void {
+    this.instrPerClient = perClient
+    this.instrTotal = total
+  }
+
+  // The instructions of a code mode client, for its stub file ("" when it gave none).
+  codeInstructions(name: string): { text: string, max: int } {
+    for (const s of this.sessions) {
+      if (s.cfg.name === name && s.connected) return { text: s.instructions, max: s.cfg.max_instructions_length ?? 0 }
+    }
+    return { text: "", max: 0 }
+  }
+
+  // The tools of the code mode clients a caller may see, by client (the same rules as allToolsFor).
+  codeToolsFor(policy: string[] | undefined, keys?: McpKeyConfig[]): { name: string, tools: McpTool[], instructions?: string }[] {
+    const out: { name: string, tools: McpTool[], instructions?: string }[] = []
+    for (const s of this.sessions) {
+      if (!s.connected || s.cfg.is_code_mode_client !== true) continue
+      const pass = visibleTo(s, policy, keys)
+      const tools: McpTool[] = []
+      for (const t of s.tools) {
+        if (!toolAllowed(t.name, s.cfg)) continue
+        if (!pass(t.name, chatName(s.cfg.name, t.name))) continue
+        tools.push(t)
+      }
+      if (tools.length > 0) out.push({ name: s.cfg.name, tools: tools, instructions: commentBlock(s.instructions, (s.cfg.max_instructions_length ?? 0) > 0 ? s.cfg.max_instructions_length! : this.instrPerClient) })
     }
     return out
   }
@@ -1222,11 +1472,11 @@ export class McpManager {
     return 0.0
   }
 
-  // Chat tool definitions from every connected server.
+  // Chat tool definitions from every connected server (the code mode clients' tools are not offered one by one).
   allTools(): string[] {
     const out: string[] = []
     for (const s of this.sessions) {
-      if (!s.connected) continue
+      if (!s.connected || s.cfg.is_code_mode_client === true) continue
       for (const t of s.chatTools()) out.push(t)
     }
     return out
@@ -1242,7 +1492,7 @@ export class McpManager {
         const t0 = Date.now()
         let r: ToolText = { text: "", isError: false }
         try {
-          if (s.cfg.auth_type === "per_user_oauth") {
+          if (s.cfg.auth_type === "per_user_oauth" || s.cfg.auth_type === "token_exchange") {
             if (bearer === undefined) throw new Error(`${s.cfg.name}: the caller has no token for this server: complete the consent link first`)
             r = await s.callAsUser(original, argsJson, extra, bearer)
           } else {
@@ -1263,14 +1513,21 @@ export class McpManager {
   toolNames(): string[] {
     const out: string[] = []
     for (const s of this.sessions) {
-      if (!s.connected) continue
+      if (!s.connected || s.cfg.is_code_mode_client === true) continue
       for (const n of s.exposedNames()) out.push(n)
     }
     return out
   }
 
-  status(): { name: string, connected: bool, tools: int, error: string, stdio: bool }[] {
-    return this.sessions.map((s) => ({ name: s.cfg.name, connected: s.connected, tools: s.exposedCount(), error: s.lastError, stdio: s.cfg.connection_type === "stdio" }))
+  // Each client's state. A token_exchange client shows its retained admin credential (credential, no token
+  // values), and state "needs_reauth" once that credential needs a new verification.
+  status(): { name: string, connected: bool, tools: int, error: string, stdio: bool, tools_list: { name: string, allowed: bool }[], state?: string, credential?: AdminCredential }[] {
+    return this.sessions.map((s) => {
+      const row = s.adminRow
+      const cred: AdminCredential | undefined = s.cfg.auth_type === "token_exchange" && row !== undefined ? adminCredential(row) : undefined
+      const state: string | undefined = s.awaitingReverify() ? "needs_reauth" : undefined
+      return { name: s.cfg.name, connected: s.connected, tools: s.exposedCount(), error: s.lastError, stdio: s.cfg.connection_type === "stdio", tools_list: s.toolStates(), state: state, credential: cred }
+    })
   }
 }
 
@@ -1278,6 +1535,37 @@ export class McpManager {
 async function syncOnce(s: McpSession): Promise<void> {
   await s.relist()
 }
+
+test("instructions go to a caller for the servers that offer it a tool, within the caps", () => {
+  const m = new McpManager({ client_configs: [{ name: "docs", connection_type: "http", connection_string: "http://x/mcp", max_instructions_length: 10 }, { name: "vcs", connection_type: "http", connection_string: "http://y/mcp" }, { name: "code", connection_type: "http", connection_string: "http://z/mcp", is_code_mode_client: true }, { name: "quiet", connection_type: "http", connection_string: "http://q/mcp" }], max_instructions_per_client: 50 })
+  const tool: McpTool = { name: "go", description: "", inputSchemaRaw: "{}" }
+  for (const s of m.sessions) {
+    s.connected = true
+    s.tools = [tool]
+  }
+  m.sessions[0]!.instructions = "Search before you read anything."
+  m.sessions[1]!.instructions = "Commit small."
+  m.sessions[2]!.instructions = "Never shown as a block."
+  const parts = m.instructionParts(undefined)
+  expect(parts.map((p) => p.name).join(",")).toBe("docs,vcs")
+  expect(parts[0]!.max).toBe(10)
+  const text = m.instructionsFor(undefined)
+  expect(text.includes("<mcp_server name=\"docs\">\nSearch bef\n[truncated: 22 bytes omitted]\n</mcp_server>")).toBe(true)
+  expect(text.includes("<mcp_server name=\"vcs\">\nCommit small.\n</mcp_server>")).toBe(true)
+  // a key whose rules name only vcs is not told what docs said
+  const only = m.instructionParts(undefined, [{ mcp_client_name: "vcs", tools_to_execute: ["*"] }])
+  expect(only.map((p) => p.name).join(",")).toBe("vcs")
+  // the code mode client's guidance rides in its stub comment
+  expect(m.codeInstructions("code").text).toBe("Never shown as a block.")
+  m.sessions[1]!.connected = false
+  expect(m.instructionParts(undefined).map((p) => p.name).join(",")).toBe("docs")
+})
+
+test("an initialize result's instructions are read, and absent ones are empty", () => {
+  expect(instructionsOf(`{"protocolVersion":"2025-06-18","instructions":"Use it well.\\nTwice."}`)).toBe("Use it well.\nTwice.")
+  expect(instructionsOf(`{"protocolVersion":"2025-06-18"}`)).toBe("")
+  expect(instructionsOf("not json")).toBe("")
+})
 
 test("tool_sync_interval seconds and the timers it starts and clears", () => {
   expect(syncSeconds(undefined)).toBe(0)
@@ -1313,6 +1601,29 @@ test("allow_by_default and access-profile patterns decide which tools a key sees
   expect(m.allToolsFor(["nothing-here"]).length).toBe(2)
   expect(patternMatches("fs-read", "fs-*")).toBe(true)
   expect(patternMatches("fs-read", "fs-re")).toBe(false)
+})
+
+test("code mode clients are not offered one by one; codeToolsFor lists them for the caller", () => {
+  const m = new McpManager({ client_configs: [
+    { name: "fs", connection_type: "http", connection_string: "http://x/mcp", is_code_mode_client: true },
+    { name: "git", connection_type: "http", connection_string: "http://y/mcp", allow_by_default: true },
+  ] })
+  for (const s of m.sessions) {
+    s.connected = true
+    s.tools = [{ name: "read", description: "reads", inputSchemaRaw: EMPTY_SCHEMA }, { name: "write", description: "", inputSchemaRaw: EMPTY_SCHEMA }]
+  }
+  const names = (list: string[]): string => list.map((t) => { const i = t.indexOf('"name":"'); return t.slice(i + 8).split('"')[0]! }).join(",")
+  expect(names(m.allToolsFor(undefined))).toBe("git-read,git-write")
+  expect(m.toolNames().includes("fs-read")).toBe(false)
+  const cm = m.codeToolsFor(undefined)
+  expect(cm.length).toBe(1)
+  expect(cm[0]!.name).toBe("fs")
+  expect(cm[0]!.tools.map((t) => t.name).join(",")).toBe("read,write")
+  expect(cm[0]!.tools[0]!.description).toBe("reads")
+  // the key's rules apply to the code mode tools as they do to direct ones
+  expect(m.codeToolsFor(["fs-read"])[0]!.tools.map((t) => t.name).join(",")).toBe("read")
+  expect(m.codeToolsFor(["git-*"]).length).toBe(0)
+  expect(chatToolName("fs", "read")).toBe("fs-read")
 })
 
 test("tools_to_auto_execute becomes agent patterns per client", () => {
@@ -1500,6 +1811,66 @@ test("a config change keeps unchanged HTTP clients with their tools and replaces
   expect(m.sessions[0]! === oldA).toBe(true)
   expect(m.sessions[0]!.tools.length).toBe(1)
   expect(m.sessions[1]!.cfg.connection_string).toBe("http://127.0.0.1:3/mcp")
+})
+
+test("a token_exchange client lists with its retained admin credential, and a new one replaces the session", () => {
+  const te: McpClientConfig = { name: "jira", connection_type: "http", connection_string: "http://127.0.0.1:1/mcp", auth_type: "token_exchange", token_exchange: { audience: "api://jira", client_id: "exch" } }
+  const row: McpUserToken = { id: "ex1", mcp_client_name: "jira", virtual_key_id: "", session_id: "", access_token: "admin-tok", refresh_token: "", token_expires_at: 0.0, scopes: [], created_at: 1.0, last_refreshed_at: 1.0 }
+  // no credential: the client waits for verification
+  expect(adminTokenOf(undefined, "jira", 1000.0)).toBe("")
+  expect(adminTokenOf([row], "other", 1000.0)).toBe("")
+  expect(adminTokenOf([row], "jira", 1000.0)).toBe("admin-tok")
+  // an expired credential reads as none
+  const old: McpUserToken = { id: "ex1", mcp_client_name: "jira", virtual_key_id: "", session_id: "", access_token: "admin-tok", refresh_token: "", token_expires_at: 500.0, scopes: [], created_at: 1.0, last_refreshed_at: 1.0 }
+  expect(adminTokenOf([old], "jira", 1000.0)).toBe("")
+  const m = new McpManager({ client_configs: [te] })
+  expect(m.sessions[0]!.adminToken).toBe("")
+  const verified = new McpManager({ client_configs: [te], exchange_admin: [row] })
+  expect(verified.sessions[0]!.adminToken).toBe("admin-tok")
+  // a verification that lands on a running client replaces its session, so it connects
+  m.follow(verified.sessions)
+  expect(m.sessions[0]! === verified.sessions[0]!).toBe(true)
+  expect(m.sessions[0]!.adminToken).toBe("admin-tok")
+  // an unchanged credential keeps the running session
+  const again = new McpManager({ client_configs: [te], exchange_admin: [row] })
+  m.follow(again.sessions)
+  expect(m.sessions[0]! === verified.sessions[0]!).toBe(true)
+})
+
+test("a renewed admin credential is taken in place, and a refused one keeps the client's tools and shows needs_reauth", () => {
+  const te: McpClientConfig = { name: "jira", connection_type: "http", connection_string: "http://127.0.0.1:1/mcp", auth_type: "token_exchange", token_exchange: { audience: "api://jira", client_id: "exch" } }
+  const row: McpUserToken = { id: "ex1", mcp_client_name: "jira", virtual_key_id: "", session_id: "", access_token: "admin-1", refresh_token: "rt-1", token_expires_at: Date.now() + 60000.0, scopes: [], created_at: 1.0, last_refreshed_at: 1.0 }
+  const m = new McpManager({ client_configs: [te], exchange_admin: [row] })
+  const live = m.sessions[0]!
+  live.connected = true
+  live.tools = [{ name: "search", description: "", inputSchemaRaw: "{}" }]
+  expect(m.status()[0]!.credential!.has_refresh_token).toBe(true)
+  expect(m.status()[0]!.state === undefined).toBe(true)
+  // a renewal: the running session takes the new token, and the saved config that follows keeps it
+  let renewed = row
+  renewed.access_token = "admin-2"
+  m.setAdmin(renewed)
+  expect(live.adminToken).toBe("admin-2")
+  m.follow(new McpManager({ client_configs: [te], exchange_admin: [renewed] }).sessions)
+  expect(m.sessions[0]! === live).toBe(true)
+  // a refused renewal: no admin token, the tools stay, and the status says it needs a new verification
+  const dead = reverifyRow(renewed, "provider rejected the refresh (HTTP 400, invalid_grant)")
+  expect(adminTokenOf([dead], "jira", 1000.0)).toBe("")
+  m.setAdmin(dead)
+  m.follow(new McpManager({ client_configs: [te], exchange_admin: [dead] }).sessions)
+  expect(m.sessions[0]! === live).toBe(true)
+  expect(live.adminToken).toBe("")
+  expect(live.connected).toBe(true)
+  expect(m.hasTool("jira-search")).toBe(true)
+  const st = m.status()[0]!
+  expect(st.state).toBe("needs_reauth")
+  expect(st.credential!.status).toBe("needs_reauth")
+  expect(st.error.includes("needs re-verification")).toBe(true)
+  expect(st.error.includes("invalid_grant")).toBe(true)
+  expect(JSON.stringify(st).includes("rt-1")).toBe(false)
+  // a client that was not connected starts in that state with the same reason
+  const cold = new McpManager({ client_configs: [te], exchange_admin: [dead] })
+  expect(cold.status()[0]!.state).toBe("needs_reauth")
 })
 
 test("per-client durations and virtual key allow-lists", () => {

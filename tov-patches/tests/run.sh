@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0004 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0008 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -8,7 +8,8 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 OUT=$(mktemp -d)
 SRV=""
 ASRV=""
-trap 'rm -rf "$OUT"; [ -n "$SRV" ] && kill $SRV 2>/dev/null || true; [ -n "$ASRV" ] && kill $ASRV 2>/dev/null || true' EXIT
+POOLSRV=""
+trap 'rm -rf "$OUT"; [ -n "$SRV" ] && kill $SRV 2>/dev/null || true; [ -n "$ASRV" ] && kill $ASRV 2>/dev/null || true; [ -n "$POOLSRV" ] && kill $POOLSRV 2>/dev/null || true' EXIT
 
 # expect FILE N: no FAIL line, and exactly N ok lines
 expect() {
@@ -76,5 +77,55 @@ expect "$OUT/udp.out" 8 "Bun.udpSocket"
 
 "$TOV" run "$DIR/udp_dgram.tov" > "$OUT/dgram.out"
 expect "$OUT/dgram.out" 8 "node:dgram"
+
+# WebAssembly (patch 0005): std/wasm on WAMR, with its limits (run from the tests directory: it reads wasm_mod.wasm)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/wasm.tov" -o "$OUT/wasm" >/dev/null
+(cd "$DIR" && "$OUT/wasm") > "$OUT/wasm.out"
+expect "$OUT/wasm.out" 22 "std/wasm"
+# WebRTC (patch 0006): two std/rtc peer connections in one program, on the loopback address (a data channel
+# both ways, Opus RTP with rewritten headers, states, close). The first build compiles libdatachannel (cached).
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/rtc.tov" -o "$OUT/rtc" >/dev/null
+"$OUT/rtc" > "$OUT/rtc.out"
+expect "$OUT/rtc.out" 20 "std/rtc (WebRTC)"
+# fetch pool options and HTTP/2 (patch 0007): three origins from h2_server.py (HTTP/2 over TLS, HTTP/1.1
+# over TLS, plain HTTP/1.1), which needs Python's `h2` package: installed under $OUT if it is missing
+if ! python3 -c 'import h2' 2>/dev/null; then
+  pip install --quiet --target "$OUT/pylib" h2 >/dev/null 2>&1 || true
+  [ -d "$OUT/pylib/h2" ] && export PYTHONPATH="$OUT/pylib${PYTHONPATH:+:$PYTHONPATH}"
+fi
+if python3 -c 'import h2' 2>/dev/null; then
+  for MODE in h2 h1tls h1; do
+    python3 -u "$DIR/h2_server.py" $MODE "$OUT/cert.pem" "$OUT/key.pem" > "$OUT/pool-$MODE.port" & POOLSRV="$POOLSRV $!"
+  done
+  sleep 1.5
+  TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/fetch_pool.tov" -o "$OUT/fetch_pool" >/dev/null
+  H2_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h2.port") H1TLS_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1tls.port") \
+    H1_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1.port") "$OUT/fetch_pool" > "$OUT/fetch_pool.out"
+  expect "$OUT/fetch_pool.out" 23 "fetch pool options and HTTP/2"
+  # request bodies as streams (patch 0008): fetch with a ReadableStream body on the same three origins
+  TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/request_body_fetch.tov" -o "$OUT/request_body_fetch" >/dev/null
+  H2_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h2.port") H1TLS_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1tls.port") \
+    H1_PORT=$(sed -n 's/^listening //p' "$OUT/pool-h1.port") "$OUT/request_body_fetch" > "$OUT/request_body_fetch.out"
+  kill $POOLSRV 2>/dev/null || true
+  POOLSRV=""
+  expect "$OUT/request_body_fetch.out" 36 "fetch with a ReadableStream body (HTTP/1.1, TLS, HTTP/2)"
+else
+  echo "skipped: fetch pool options and HTTP/2 (needs Python's h2 package, and pip could not install it)"
+fi
+
+# Bun.serve request bodies as streams (patch 0008): a server that reads big bodies chunk by chunk, driven over raw sockets
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/request_body_server.tov" -o "$OUT/request_body_server" >/dev/null
+"$OUT/request_body_server" > "$OUT/request_body_server.out" & SRV=$!
+sleep 0.5
+RB_PORT=$(sed -n 's/^listening //p' "$OUT/request_body_server.out")
+python3 "$DIR/request_body_client.py" "$RB_PORT" "$SRV" > "$OUT/request_body_client.out" || true
+kill $SRV 2>/dev/null || true
+SRV=""
+expect "$OUT/request_body_client.out" 17 "Bun.serve request body streams"
+
+# Socket.pause() and resume() (patch 0008)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/socket_pause.tov" -o "$OUT/socket_pause" >/dev/null
+"$OUT/socket_pause" > "$OUT/socket_pause.out"
+expect "$OUT/socket_pause.out" 2 "Socket.pause"
 
 echo "tov-patches tests passed"

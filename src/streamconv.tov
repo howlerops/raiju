@@ -1,0 +1,1260 @@
+// Streaming conversion of a large chat request (large_payload_optimization): the OpenAI chat body is read
+// token by token (jsonstream.tov) and the provider's body is written as it goes, so a message with a 40 MiB
+// base64 image reaches the provider without being held.
+//
+// What is held: the small top-level fields (params, tools), the system messages (they are hoisted out of the
+// message list), tool call arguments, and any one part that cannot be placed while it streams. What flows
+// through: message text and image data, copied as the raw JSON string bytes the caller sent (so the escapes the
+// caller wrote are kept; the JSON means the same).
+//
+// A message streams when its header comes first: "role" (and "tool_call_id" for a tool message) before
+// "content". A message whose content comes first is held whole (up to holdMax), reordered and replayed. In a
+// content array a text or image part streams when its "type" comes before the big string; otherwise that one
+// part is held.
+//
+// The target body is written in the order its format allows without lookahead: the system prompt (Anthropic's
+// top-level "system", Gemini's systemInstruction, Converse's system) follows the messages, and so do the
+// request parameters, which are written by the provider module's own tail function when the body ends.
+//
+// Formats: Anthropic Messages (direct, and Vertex Claude without "model" and with its version), Gemini
+// generateContent, Bedrock Converse and Cohere v2 chat. MessagesConv does the Messages route's body for Bedrock
+// InvokeModel and Vertex Claude, which only changes top-level fields.
+import { Field, fields, elements, find, quote, rawStr, build, decodeString } from "./json"
+import { ChatRequest } from "./schemas"
+import { JsonTokenizer, ByteOut, Compact, Tok, bytesOf, textOfBytes, T_OBJ, T_OBJ_END, T_ARR, T_ARR_END, T_KEY, T_STR, T_STRH, T_STRP, T_STRE, T_LIT } from "./jsonstream"
+
+export const F_ANTHROPIC = 1
+export const F_VERTEX_CLAUDE = 2
+export const F_GEMINI = 3
+export const F_CONVERSE = 4
+export const F_COHERE = 5
+
+// The request fields written after the messages (the provider module's tail function for this format).
+export type TailFn = (req: ChatRequest, body: Field[]) => string[] throws SyntaxError
+
+export type ConvOpts = {
+  fmt: int,
+  // the provider's name for the model (in the body of Anthropic and Cohere)
+  model: string,
+  // Anthropic: mark the system prompt and the newest block as cache breakpoints
+  autoCache: bool,
+  // the cache_control value of those breakpoints
+  cacheMarker: string,
+  // Vertex Claude: the anthropic_version it takes
+  version: string,
+  // the most that is held for one thing (a system prompt, a tool list, a message that cannot stream)
+  holdMax: int,
+  // strings over this length stream in pieces
+  strMax: int,
+  tail: TailFn,
+}
+
+function hasPrefix(b: u8[], s: string): bool {
+  const p = bytesOf(s)
+  if (b.length < p.length) return false
+  for (let i = 0; i < p.length; i++) if (b[i] !== p[i]) return false
+  return true
+}
+
+function indexOfByte(b: u8[], c: int): int {
+  for (let i = 0; i < b.length; i++) if (int(b[i]!) === c) return i
+  return -1
+}
+
+// A raw JSON string body (escapes still in) as text.
+function decodeRaw(raw: u8[]): string throws SyntaxError {
+  const s = textOfBytes(raw)
+  if (s.indexOf("\\") < 0) return s
+  return try decodeString("\"" + s + "\"")
+}
+
+// The inside of a raw JSON string literal's text (between its quotes), as bytes; undefined for any other value.
+function innerOf(lit: string | undefined): u8[] | undefined {
+  if (lit === undefined || !lit.startsWith("\"") || lit.byteLength < 2) return undefined
+  return bytesOf(lit.slice(1, lit.byteLength - 1))
+}
+
+// A data URL's pieces: ok when the head holds "data:" and a comma; prefix is the decoded text before the comma
+// (data:image/png;base64), data the raw base64 after it.
+type DataUrl = { ok: bool, prefix: string, data: u8[] }
+
+function splitData(head: u8[]): DataUrl throws SyntaxError {
+  if (!hasPrefix(head, "data:")) return { ok: false, prefix: "", data: [] }
+  const ci = indexOfByte(head, 44)
+  if (ci < 0) return { ok: false, prefix: "", data: [] }
+  return { ok: true, prefix: try decodeRaw(head.slice(0, ci)), data: head.slice(ci + 1) }
+}
+
+function mimeOf(prefix: string): string {
+  const semi = prefix.indexOf(";")
+  return prefix.slice(5, semi > 0 ? semi : prefix.byteLength)
+}
+
+function normRole(r: string): string {
+  if (r === "system" || r === "developer") return "system"
+  if (r === "assistant") return "assistant"
+  if (r === "tool") return "tool"
+  return "user"
+}
+
+// A tool call's arguments are a JSON string; the target wants the object itself.
+function argsObject(args: string): string {
+  try {
+    return build(fields(args))
+  } catch (e) {
+    return "{}"
+  }
+}
+
+// ---- the writer: one target format ----
+
+class ChatWriter {
+  out: ByteOut = new ByteOut()
+  // the open turn (Anthropic, Gemini, Converse)
+  private turnRole = ""
+  private turnCount = 0
+  private blocks = 0
+  // an Anthropic block waiting for its closing brace (the newest one may take a cache_control)
+  private pending = false
+  // system content held back: raw string pieces (Anthropic) or whole parts (Gemini, Converse)
+  private sysFrags: u8[][] = []
+  private sysSize = 0
+  private holding = false
+  private hold: ByteOut = new ByteOut()
+  // the message being written
+  private role = ""
+  private toolId = ""
+  private toolOpen = false
+  private textMode = 0
+  private imgMode = 0
+  private callNames: Map<string, string> = new Map()
+  // Cohere
+  private msgs = 0
+  private hasContent = false
+  private strOpen = false
+  private userMode = 0
+  private parts = 0
+  private calls = 0
+
+  constructor(readonly fmt: int, readonly o: ConvOpts) {}
+
+  private isA(): bool {
+    return this.fmt === F_ANTHROPIC || this.fmt === F_VERTEX_CLAUDE
+  }
+
+  private dest(): ByteOut {
+    return this.holding ? this.hold : this.out
+  }
+
+  start(): void {
+    if (this.fmt === F_ANTHROPIC || this.fmt === F_COHERE) this.out.text(`{"model":${quote(this.o.model)},"messages":[`)
+    else if (this.fmt === F_GEMINI) this.out.text(`{"contents":[`)
+    else this.out.text(`{"messages":[`)
+  }
+
+  private turnFor(): string {
+    if (this.fmt === F_GEMINI) return this.role === "assistant" ? "model" : "user"
+    return this.role === "assistant" ? "assistant" : "user"
+  }
+
+  private closePending(): void {
+    if (this.pending) {
+      this.out.byte(125)
+      this.pending = false
+    }
+  }
+
+  // The start of a block (part) in the turn of the message's role: a new turn when the role changes.
+  private blockBegin(): void {
+    const r = this.turnFor()
+    this.closePending()
+    if (this.turnRole === r) {
+      if (this.blocks > 0) this.out.byte(44)
+    } else {
+      if (this.turnRole !== "") this.out.text("]}")
+      if (this.turnCount > 0) this.out.byte(44)
+      this.out.text(`{"role":"${r}","${this.fmt === F_GEMINI ? "parts" : "content"}":[`)
+      this.turnRole = r
+      this.turnCount += 1
+      this.blocks = 0
+    }
+    this.blocks += 1
+  }
+
+  // The end of an Anthropic block, which was written without its closing brace.
+  private blockEnd(): void {
+    if (this.o.autoCache) this.pending = true
+    else this.out.byte(125)
+  }
+
+  msgOpen(role: string, id: string): void {
+    this.role = role
+    this.toolId = id
+    this.toolOpen = false
+    this.textMode = 0
+    this.imgMode = 0
+    if (this.fmt !== F_COHERE) return
+    const o = this.out
+    if (this.msgs > 0) o.byte(44)
+    this.msgs += 1
+    this.hasContent = false
+    this.strOpen = false
+    this.userMode = 0
+    this.parts = 0
+    this.calls = 0
+    if (role === "system") o.text(`{"role":"system","content":"`)
+    else if (role === "tool") o.text(`{"role":"tool","tool_call_id":${quote(id)},"content":"`)
+    else if (role === "assistant") o.text(`{"role":"assistant"`)
+    else o.text(`{"role":"user"`)
+  }
+
+  // The message's content is an array of parts (Cohere's user content is an array then, even when empty).
+  arrayOpen(): void {
+    if (this.fmt === F_COHERE && this.role === "user") {
+      this.out.text(`,"content":[`)
+      this.userMode = 2
+    }
+  }
+
+  private toolBlock(): void {
+    if (this.toolOpen) return
+    this.toolOpen = true
+    this.blockBegin()
+    if (this.isA()) this.out.text(`{"type":"tool_result","tool_use_id":${quote(this.toolId)},"content":"`)
+    else if (this.fmt === F_GEMINI) this.out.text(`{"functionResponse":{"name":${quote(this.callNames.get(this.toolId) ?? "tool")},"response":{"content":"`)
+    else this.out.text(`{"toolResult":{"toolUseId":${quote(this.toolId)},"content":[{"text":"`)
+  }
+
+  private startHold(): void {
+    this.holding = true
+    this.hold = new ByteOut()
+  }
+
+  private endHold(): void {
+    const b = this.hold.all()
+    this.sysSize += b.length
+    this.sysFrags.push(b)
+    this.holding = false
+    this.hold = new ByteOut()
+  }
+
+  // A text begins (a content string, or a text part). `typed`: it is a part of type "text" or a string. Returns
+  // whether this format takes it; a text it does not take is skipped by the caller.
+  textStart(typed: bool, fromString: bool): bool {
+    const r = this.role
+    if (this.fmt === F_COHERE) {
+      if (r === "user") {
+        if (fromString) {
+          this.out.text(`,"content":"`)
+          this.userMode = 1
+          this.textMode = 5
+          return true
+        }
+        if (!typed) return false
+        if (this.parts > 0) this.out.byte(44)
+        this.parts += 1
+        this.out.text(`{"type":"text","text":"`)
+        this.textMode = 4
+        return true
+      }
+      // the typed texts of a system, tool or assistant message join into one string
+      if (!typed) return false
+      this.textMode = 5
+      return true
+    }
+    if (r === "system") {
+      if (this.isA()) {
+        this.startHold()
+        this.textMode = 2
+        return true
+      }
+      if (!typed) return false
+      this.startHold()
+      this.hold.text(`{"text":"`)
+      this.textMode = 2
+      return true
+    }
+    if (r === "tool") {
+      this.toolBlock()
+      this.textMode = 3
+      return true
+    }
+    if (!typed) return false
+    this.blockBegin()
+    this.out.text(this.isA() ? `{"type":"text","text":"` : `{"text":"`)
+    this.textMode = 1
+    return true
+  }
+
+  // raw JSON string bytes of the text
+  textPiece(raw: u8[]): void throws SyntaxError {
+    if (raw.length === 0) return
+    if (this.fmt === F_COHERE && this.role === "assistant" && !this.hasContent) {
+      this.out.text(`,"content":"`)
+      this.hasContent = true
+      this.strOpen = true
+    }
+    if (this.holding) {
+      this.hold.bytes(raw)
+      if (this.sysSize + this.hold.size > this.o.holdMax) throw new SyntaxError("the system prompt is too large to convert while streaming (client.max_request_body_size_mb)")
+    } else {
+      this.out.bytes(raw)
+    }
+  }
+
+  textEnd(): void {
+    const m = this.textMode
+    this.textMode = 0
+    if (m === 1) {
+      if (this.isA()) {
+        this.out.byte(34)
+        this.blockEnd()
+      } else {
+        this.out.text(`"}`)
+      }
+    } else if (m === 2) {
+      if (!this.isA()) this.hold.text(`"}`)
+      this.endHold()
+    } else if (m === 4) {
+      this.out.text(`"}`)
+    }
+    // a tool result's string stays open until the message closes, and so does a Cohere content string
+  }
+
+  // An image URL begins: its raw bytes so far (all of it when it is short). Returns whether this format takes it.
+  imageStart(head: u8[]): bool throws SyntaxError {
+    const r = this.role
+    if (this.fmt === F_COHERE) {
+      if (r !== "user") return false
+      if (this.parts > 0) this.out.byte(44)
+      this.parts += 1
+      this.out.text(`{"type":"image_url","image_url":{"url":"`)
+      this.out.bytes(head)
+      this.imgMode = 5
+      return true
+    }
+    if (r === "tool") return false
+    if (r === "system" && this.isA()) return false
+    const du = try splitData(head)
+    if (this.fmt === F_CONVERSE) {
+      if (!du.ok || !du.prefix.startsWith("data:image/")) return false
+      if (r === "system") this.startHold()
+      else this.blockBegin()
+      const semi = du.prefix.indexOf(";")
+      const format = du.prefix.slice(11, semi > 0 ? semi : du.prefix.byteLength)
+      const d = this.dest()
+      d.text(`{"image":{"format":${quote(format === "jpg" ? "jpeg" : format)},"source":{"bytes":"`)
+      d.bytes(du.data)
+      this.imgMode = 4
+      return true
+    }
+    if (this.fmt === F_GEMINI) {
+      if (r === "system") this.startHold()
+      else this.blockBegin()
+      const d = this.dest()
+      if (du.ok) {
+        d.text(`{"inline_data":{"mime_type":${quote(mimeOf(du.prefix))},"data":"`)
+        d.bytes(du.data)
+        this.imgMode = 2
+      } else {
+        d.text(`{"file_data":{"file_uri":"`)
+        d.bytes(head)
+        this.imgMode = 3
+      }
+      return true
+    }
+    // Anthropic
+    this.blockBegin()
+    if (du.ok) {
+      this.out.text(`{"type":"image","source":{"type":"base64","media_type":${quote(mimeOf(du.prefix))},"data":"`)
+      this.out.bytes(du.data)
+    } else {
+      this.out.text(`{"type":"image","source":{"type":"url","url":"`)
+      this.out.bytes(head)
+    }
+    this.imgMode = 1
+    return true
+  }
+
+  imagePiece(raw: u8[]): void {
+    this.dest().bytes(raw)
+  }
+
+  imageEnd(): void {
+    const m = this.imgMode
+    this.imgMode = 0
+    if (m === 1) {
+      this.out.text(`"}`)
+      this.blockEnd()
+    } else if (m === 2 || m === 3 || m === 5) {
+      this.dest().text(`"}}`)
+    } else if (m === 4) {
+      this.dest().text(`"}}}`)
+    }
+    if (this.holding) this.endHold()
+  }
+
+  // An assistant message's tool call (after the message's content).
+  call(id: string, name: string, args: string): void {
+    if (this.fmt === F_COHERE) {
+      if (this.strOpen) {
+        this.out.byte(34)
+        this.strOpen = false
+      }
+      this.out.text(this.calls === 0 ? `,"tool_calls":[` : ",")
+      this.calls += 1
+      this.out.text(`{"id":${quote(id)},"type":"function","function":{"name":${quote(name)},"arguments":${quote(args)}}}`)
+      return
+    }
+    const input = argsObject(args)
+    this.blockBegin()
+    if (this.isA()) {
+      this.out.text(`{"type":"tool_use","id":${quote(id)},"name":${quote(name)},"input":${input}`)
+      this.blockEnd()
+    } else if (this.fmt === F_GEMINI) {
+      this.out.text(`{"functionCall":{"name":${quote(name)},"args":${input}}}`)
+      this.callNames.set(id, name)
+    } else {
+      this.out.text(`{"toolUse":{"toolUseId":${quote(id)},"name":${quote(name)},"input":${input}}}`)
+    }
+  }
+
+  msgClose(): void {
+    const r = this.role
+    if (this.fmt === F_COHERE) {
+      const o = this.out
+      if (r === "system" || r === "tool") {
+        o.text(`"}`)
+      } else if (r === "assistant") {
+        if (this.strOpen) o.byte(34)
+        if (this.calls > 0) o.byte(93)
+        o.byte(125)
+      } else if (this.userMode === 1) {
+        o.text(`"}`)
+      } else if (this.userMode === 2) {
+        o.text(`]}`)
+      } else {
+        o.text(`,"content":""}`)
+      }
+      return
+    }
+    if (r !== "tool") return
+    this.toolBlock()
+    if (this.isA()) {
+      this.out.byte(34)
+      this.blockEnd()
+    } else if (this.fmt === F_GEMINI) {
+      this.out.text(`"}}}`)
+    } else {
+      this.out.text(`"}]}}`)
+    }
+  }
+
+  // The end of the messages: the system prompt, the parameters and the closing brace.
+  finish(req: ChatRequest, body: Field[]): void throws SyntaxError {
+    const tail = try this.o.tail(req, body)
+    const o = this.out
+    if (this.fmt === F_COHERE) {
+      o.byte(93)
+      for (const p of tail) o.text("," + p)
+      o.byte(125)
+      return
+    }
+    if (this.isA()) {
+      if (this.pending) {
+        o.text(`,"cache_control":${this.o.cacheMarker}}`)
+        this.pending = false
+      }
+      if (this.turnRole !== "") o.text("]}")
+      o.byte(93)
+      let total = 0
+      for (const f of this.sysFrags) total += f.length
+      if (this.sysFrags.length > 1) total += 4 * (this.sysFrags.length - 1)
+      if (total > 0) {
+        o.text(this.o.autoCache ? `,"system":[{"type":"text","text":"` : `,"system":"`)
+        for (let i = 0; i < this.sysFrags.length; i++) {
+          if (i > 0) o.text("\\n\\n")
+          o.bytes(this.sysFrags[i]!)
+        }
+        o.text(this.o.autoCache ? `","cache_control":${this.o.cacheMarker}}]` : `"`)
+      }
+      for (const p of tail) o.text("," + p)
+      if (this.fmt === F_VERTEX_CLAUDE) o.text(`,"anthropic_version":${quote(this.o.version)}`)
+      o.byte(125)
+      return
+    }
+    if (this.fmt === F_GEMINI) {
+      if (this.turnRole !== "") o.text("]}")
+      o.byte(93)
+      if (this.sysFrags.length > 0) {
+        o.text(`,"systemInstruction":{"parts":[`)
+        for (let i = 0; i < this.sysFrags.length; i++) {
+          if (i > 0) o.byte(44)
+          o.bytes(this.sysFrags[i]!)
+        }
+        o.text("]}")
+      }
+      for (const p of tail) o.text("," + p)
+      o.byte(125)
+      return
+    }
+    // Converse
+    if (this.o.autoCache && this.turnRole !== "") o.text(`,{"cachePoint":{"type":"default"}}`)
+    if (this.turnRole !== "") o.text("]}")
+    o.byte(93)
+    if (this.sysFrags.length > 0) {
+      o.text(`,"system":[`)
+      for (let i = 0; i < this.sysFrags.length; i++) {
+        if (i > 0) o.byte(44)
+        o.bytes(this.sysFrags[i]!)
+      }
+      if (this.o.autoCache) o.text(`,{"cachePoint":{"type":"default"}}`)
+      o.byte(93)
+    }
+    for (const p of tail) o.text("," + p)
+    o.byte(125)
+  }
+}
+
+// ---- the reader: the chat request, token by token ----
+
+// the top level
+const TS_START = 0
+const TS_ROOT = 1
+const TS_MESSAGES = 2
+const TS_LIST = 3
+const TS_MESSAGE = 4
+const TS_FIELD = 5
+const TS_DONE = 6
+
+// inside a message
+const MS_KEY = 0
+const MS_ROLE = 1
+const MS_ID = 2
+const MS_CONTENT = 3
+const MS_CLONG = 4
+const MS_PARTS = 5
+const MS_PART = 6
+const MS_CALLS = 7
+const MS_SKIP = 8
+
+export class ChatConv {
+  private tk: JsonTokenizer
+  private w: ChatWriter
+  private ts = TS_START
+  private topKey = ""
+  private topOut: ByteOut
+  private topComp: Compact
+  private top: Field[] = []
+  private sawMessages = false
+  // the message
+  private ms = MS_KEY
+  private mdepth = 0
+  private role = ""
+  private hasRole = false
+  private toolId = ""
+  private hasId = false
+  private opened = false
+  // the message's tokens are recorded until its content starts (and kept when the content comes too early)
+  private mrecOn = false
+  private mrecOut: ByteOut
+  private mrecComp: Compact
+  private mcap = false
+  private replaying = false
+  private callsOut: ByteOut
+  private callsComp: Compact
+  private callsText = ""
+  // skipping a value
+  private skd = 0
+  private skLong = false
+  private afterSkip = MS_KEY
+  // the long string of a content string or part: 0 none, 1 text, 2 image, 3 discarded
+  private plong = 0
+  // a content part
+  private pout: ByteOut
+  private pcomp: Compact
+  private ptype = ""
+  private pk0 = ""
+  private pk1 = ""
+  private pdone = false
+  private clong = 0
+  private ihead: u8[] = []
+
+  constructor(readonly o: ConvOpts) {
+    this.tk = new JsonTokenizer(o.strMax, 65536)
+    this.w = new ChatWriter(o.fmt, o)
+    this.topOut = new ByteOut()
+    this.topComp = new Compact(this.topOut)
+    this.mrecOut = new ByteOut()
+    this.mrecComp = new Compact(this.mrecOut)
+    this.callsOut = new ByteOut()
+    this.callsComp = new Compact(this.callsOut)
+    this.pout = new ByteOut()
+    this.pcomp = new Compact(this.pout)
+  }
+
+  // Reads the next bytes of the request; the converted bytes they complete.
+  push(b: u8[]): u8[][] throws SyntaxError {
+    for (const t of try this.tk.push(b)) try this.tok(t)
+    return this.w.out.take()
+  }
+
+  // A top-level field of the request (its raw JSON), once the body has been read.
+  topField(key: string): string | undefined {
+    return find(this.top, key)
+  }
+
+  // The end of the request; the rest of the converted body.
+  finish(): u8[][] throws SyntaxError {
+    for (const t of try this.tk.finish()) try this.tok(t)
+    if (this.ts !== TS_DONE) throw new SyntaxError("the request body must be a JSON object")
+    if (!this.sawMessages) throw new SyntaxError("the request has no messages")
+    let text = `{"model":"x","messages":[]`
+    for (const f of this.top) {
+      if (f.key !== "model" && f.key !== "messages") text += `,${quote(f.key)}:${f.raw}`
+    }
+    text += "}"
+    const req = try JSON.parse(text) as ChatRequest
+    try this.w.finish(req, this.top)
+    return this.w.out.take()
+  }
+
+  private tok(t: Tok): void throws SyntaxError {
+    const s = this.ts
+    if (s === TS_START) {
+      if (t.kind !== T_OBJ) throw new SyntaxError("the request body must be a JSON object")
+      this.ts = TS_ROOT
+    } else if (s === TS_ROOT) {
+      if (t.kind === T_KEY) {
+        const name = try decodeRaw(t.raw)
+        if (name === "messages") {
+          if (this.sawMessages) throw new SyntaxError("the request has two messages fields")
+          this.ts = TS_MESSAGES
+        } else {
+          this.topKey = name
+          this.topOut = new ByteOut()
+          this.topComp = new Compact(this.topOut)
+          this.ts = TS_FIELD
+        }
+      } else if (t.kind === T_OBJ_END) {
+        this.ts = TS_DONE
+      }
+    } else if (s === TS_MESSAGES) {
+      if (t.kind !== T_ARR) throw new SyntaxError("messages must be an array")
+      this.sawMessages = true
+      this.w.start()
+      this.ts = TS_LIST
+    } else if (s === TS_LIST) {
+      if (t.kind === T_ARR_END) {
+        this.ts = TS_ROOT
+      } else if (t.kind === T_OBJ) {
+        this.startMessage()
+        this.ts = TS_MESSAGE
+        try this.msgTok(t)
+      } else {
+        throw new SyntaxError("each message must be an object")
+      }
+    } else if (s === TS_MESSAGE) {
+      try this.msgTok(t)
+    } else if (s === TS_FIELD) {
+      this.topComp.tok(t)
+      if (this.topOut.size > this.o.holdMax) throw new SyntaxError(`the request field ${this.topKey} is too large to convert while streaming (client.max_request_body_size_mb)`)
+      if (this.topComp.complete) {
+        this.top.push({ key: this.topKey, raw: textOfBytes(this.topOut.all()) })
+        this.ts = TS_ROOT
+      }
+    }
+  }
+
+  // ---- one message ----
+
+  private startMessage(): void {
+    this.ms = MS_KEY
+    this.mdepth = 0
+    this.role = ""
+    this.hasRole = false
+    this.toolId = ""
+    this.hasId = false
+    this.opened = false
+    this.mrecOn = !this.replaying
+    this.mrecOut = new ByteOut()
+    this.mrecComp = new Compact(this.mrecOut)
+    this.mcap = false
+    this.callsOut = new ByteOut()
+    this.callsComp = new Compact(this.callsOut)
+    this.callsText = ""
+    this.plong = 0
+    this.clong = 0
+  }
+
+  private headerOk(): bool {
+    return this.hasRole && (this.role !== "tool" || this.hasId)
+  }
+
+  private ensureOpen(): void throws SyntaxError {
+    if (this.opened) return
+    if (!this.hasRole) throw new SyntaxError("a message needs a role")
+    this.opened = true
+    this.w.msgOpen(this.role, this.toolId)
+  }
+
+  private record(t: Tok): void throws SyntaxError {
+    this.mrecComp.tok(t)
+    if (this.mrecOut.size > this.o.holdMax) throw new SyntaxError("a message is too large to convert while streaming: put \"role\" before \"content\" in each message (client.max_request_body_size_mb)")
+  }
+
+  private msgTok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (k === T_OBJ || k === T_ARR) this.mdepth += 1
+    else if (k === T_OBJ_END || k === T_ARR_END) this.mdepth -= 1
+    if (this.mrecOn && !(this.ms === MS_SKIP && k === T_STRP)) try this.record(t)
+    if (this.mcap) {
+      if (k === T_OBJ_END && this.mdepth === 0) try this.replay()
+      return
+    }
+    const m = this.ms
+    if (m === MS_KEY) {
+      if (k === T_KEY) {
+        const name = textOfBytes(t.raw)
+        if (name === "role") this.ms = MS_ROLE
+        else if (name === "tool_call_id") this.ms = MS_ID
+        else if (name === "tool_calls") {
+          this.callsOut = new ByteOut()
+          this.callsComp = new Compact(this.callsOut)
+          this.ms = MS_CALLS
+        } else if (name === "content") {
+          if (!this.replaying && !this.headerOk()) {
+            // the content comes before the role: hold the message whole and replay it in order
+            this.mcap = true
+            return
+          }
+          this.mrecOn = false
+          this.mrecOut = new ByteOut()
+          this.ms = MS_CONTENT
+        } else {
+          this.afterSkip = MS_KEY
+          this.skd = 0
+          this.skLong = false
+          this.ms = MS_SKIP
+        }
+      } else if (k === T_OBJ_END && this.mdepth === 0) {
+        try this.endMessage()
+      }
+    } else if (m === MS_ROLE) {
+      if (k === T_STR) {
+        this.role = normRole(try decodeRaw(t.raw))
+        this.hasRole = true
+        this.ms = MS_KEY
+      } else {
+        try this.beginSkip(t, MS_KEY)
+      }
+    } else if (m === MS_ID) {
+      if (k === T_STR) {
+        this.toolId = try decodeRaw(t.raw)
+        this.hasId = true
+        this.ms = MS_KEY
+      } else {
+        try this.beginSkip(t, MS_KEY)
+      }
+    } else if (m === MS_CALLS) {
+      this.callsComp.tok(t)
+      if (this.callsOut.size > this.o.holdMax) throw new SyntaxError("the tool calls of a message are too large to convert while streaming")
+      if (this.callsComp.complete) {
+        this.callsText = textOfBytes(this.callsOut.all())
+        this.ms = MS_KEY
+      }
+    } else if (m === MS_CONTENT) {
+      try this.contentStart(t)
+    } else if (m === MS_CLONG) {
+      if (k === T_STRP) {
+        if (this.clong === 1) try this.w.textPiece(t.raw)
+      } else if (k === T_STRE) {
+        if (this.clong === 1) this.w.textEnd()
+        this.ms = MS_KEY
+      }
+    } else if (m === MS_PARTS) {
+      if (k === T_OBJ) try this.partBegin(t)
+      else if (k === T_ARR_END) this.ms = MS_KEY
+      else try this.beginSkip(t, MS_PARTS)
+    } else if (m === MS_PART) {
+      try this.partTok(t)
+    } else {
+      this.skipTok(t)
+    }
+  }
+
+  private beginSkip(t: Tok, back: int): void {
+    this.afterSkip = back
+    this.skd = 0
+    this.skLong = false
+    this.ms = MS_SKIP
+    this.skipTok(t)
+  }
+
+  private skipTok(t: Tok): void {
+    const k = t.kind
+    if (this.skLong) {
+      if (k === T_STRE) {
+        this.skLong = false
+        if (this.skd === 0) this.ms = this.afterSkip
+      }
+      return
+    }
+    if (k === T_STRH) {
+      this.skLong = true
+      return
+    }
+    if (k === T_OBJ || k === T_ARR) {
+      this.skd += 1
+      return
+    }
+    if (k === T_OBJ_END || k === T_ARR_END) {
+      this.skd -= 1
+      if (this.skd === 0) this.ms = this.afterSkip
+      return
+    }
+    if (this.skd === 0) this.ms = this.afterSkip
+  }
+
+  // the first token of the content value
+  private contentStart(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (k === T_STR) {
+      try this.ensureOpen()
+      // (an empty system string still counts as a part of Anthropic's joined system prompt)
+      const emptyOk = t.raw.length === 0 && this.role === "system" && (this.o.fmt === F_ANTHROPIC || this.o.fmt === F_VERTEX_CLAUDE)
+      if ((t.raw.length > 0 || emptyOk) && this.w.textStart(true, true)) {
+        try this.w.textPiece(t.raw)
+        this.w.textEnd()
+      }
+      this.ms = MS_KEY
+    } else if (k === T_STRH) {
+      try this.ensureOpen()
+      const take = this.w.textStart(true, true)
+      this.clong = take ? 1 : 3
+      if (take) try this.w.textPiece(t.raw)
+      this.ms = MS_CLONG
+    } else if (k === T_ARR) {
+      try this.ensureOpen()
+      this.w.arrayOpen()
+      this.ms = MS_PARTS
+    } else {
+      try this.beginSkip(t, MS_KEY)
+    }
+  }
+
+  // ---- a content part ----
+
+  private partBegin(t: Tok): void {
+    this.pout = new ByteOut()
+    this.pcomp = new Compact(this.pout)
+    this.ptype = ""
+    this.pk0 = ""
+    this.pk1 = ""
+    this.plong = 0
+    this.pdone = false
+    this.ms = MS_PART
+    this.pcomp.tok(t)
+  }
+
+  private partTok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (this.plong > 0) {
+      if (k === T_STRP) {
+        if (this.plong === 1) {
+          try this.w.textPiece(t.raw)
+        } else if (this.plong === 2) {
+          this.w.imagePiece(t.raw)
+        } else if (this.plong === 4) {
+          // a data URL's head is gathered until its comma is in
+          this.ihead = this.ihead.concat(t.raw)
+          if (indexOfByte(this.ihead, 44) >= 0 || this.ihead.length >= 1024) try this.imageBegin(this.ihead)
+        }
+        return
+      }
+      if (k === T_STRE) {
+        if (this.plong === 4) try this.imageBegin(this.ihead)
+        if (this.plong === 1) this.w.textEnd()
+        else if (this.plong === 2) this.w.imageEnd()
+        this.plong = 0
+        return
+      }
+    }
+    if (k === T_KEY) {
+      const name = textOfBytes(t.raw)
+      if (this.mdepth === 3) {
+        this.pk0 = name
+        this.pk1 = ""
+      } else if (this.mdepth === 4) {
+        this.pk1 = name
+      }
+    } else if (k === T_STR && this.mdepth === 3 && this.pk0 === "type") {
+      this.ptype = try decodeRaw(t.raw)
+    } else if (k === T_STRH) {
+      if (try this.partLong(t)) return
+    }
+    this.pcomp.tok(t)
+    if (this.pout.size > this.o.holdMax) throw new SyntaxError("a content part is too large to convert while streaming: put \"type\" before the data in each part (client.max_request_body_size_mb)")
+    if (k === T_OBJ_END && this.mdepth === 2) {
+      try this.partEnd()
+      this.ms = MS_PARTS
+    }
+  }
+
+  // A long string starts inside a part: stream it when its place and the part's type are known. True when it is
+  // handled (streamed, or dropped with the part), false when it is held with the rest of the part.
+  private partLong(t: Tok): bool throws SyntaxError {
+    const d = this.mdepth
+    const ty = this.ptype
+    if (d === 3 && this.pk0 === "text") {
+      if (ty === "") return false
+      try this.ensureOpen()
+      if (this.w.textStart(ty === "text", false)) {
+        try this.w.textPiece(t.raw)
+        this.plong = 1
+      } else {
+        this.plong = 3
+      }
+      this.pdone = true
+      return true
+    }
+    if (d === 4 && this.pk0 === "image_url" && this.pk1 === "url") {
+      if (ty === "") return false
+      this.pdone = true
+      if (ty !== "image_url") {
+        this.plong = 3
+        return true
+      }
+      try this.ensureOpen()
+      if (hasPrefix(t.raw, "data:") && indexOfByte(t.raw, 44) < 0 && t.raw.length < 1024) {
+        this.ihead = t.raw
+        this.plong = 4
+        return true
+      }
+      try this.imageBegin(t.raw)
+      return true
+    }
+    if (ty !== "" && ty !== "text" && ty !== "image_url") {
+      // a part of another kind (audio, files): the converters drop it
+      this.pdone = true
+      this.plong = 3
+      return true
+    }
+    return false
+  }
+
+  // The image of a part streams from here on, or is skipped when the format does not take it.
+  private imageBegin(head: u8[]): void throws SyntaxError {
+    this.plong = (try this.w.imageStart(head)) ? 2 : 3
+    this.ihead = []
+  }
+
+  // A part that was held whole: its text or image.
+  private partEnd(): void throws SyntaxError {
+    if (this.pdone) return
+    const fs = try fields(textOfBytes(this.pout.all()))
+    const ty = rawStr(fs, "type") ?? ""
+    const text = innerOf(find(fs, "text"))
+    const iu = find(fs, "image_url")
+    if (ty === "text" && text !== undefined) {
+      try this.smallText(true, text)
+    } else if (ty === "image_url" && iu !== undefined && iu.startsWith("{")) {
+      const url = innerOf(find(try fields(iu), "url"))
+      if (url !== undefined) {
+        try this.ensureOpen()
+        if (try this.w.imageStart(url)) this.w.imageEnd()
+      }
+    } else if (text !== undefined) {
+      try this.smallText(false, text)
+    }
+  }
+
+  private smallText(typed: bool, raw: u8[]): void throws SyntaxError {
+    try this.ensureOpen()
+    if (this.w.textStart(typed, false)) {
+      try this.w.textPiece(raw)
+      this.w.textEnd()
+    }
+  }
+
+  // ---- the end of a message ----
+
+  private endMessage(): void throws SyntaxError {
+    try this.ensureOpen()
+    if (this.callsText !== "" && this.role !== "system" && this.role !== "tool") {
+      for (const el of try elements(this.callsText)) {
+        const c = try fields(el)
+        const fnRaw = find(c, "function")
+        if (fnRaw === undefined || !fnRaw.startsWith("{")) continue
+        const fn = try fields(fnRaw)
+        const args = rawStr(fn, "arguments") ?? find(fn, "arguments") ?? "{}"
+        this.w.call(rawStr(c, "id") ?? "", rawStr(fn, "name") ?? "", args)
+      }
+    }
+    this.w.msgClose()
+    this.ts = TS_LIST
+  }
+
+  // The message came with its content before its role: written in order (role, tool_call_id first), it goes
+  // through the same path as any other.
+  private replay(): void throws SyntaxError {
+    const fs = try fields(textOfBytes(this.mrecOut.all()))
+    const role = find(fs, "role")
+    if (role === undefined) throw new SyntaxError("a message needs a role")
+    const parts: string[] = [`"role":${role}`]
+    const id = find(fs, "tool_call_id")
+    if (id !== undefined) parts.push(`"tool_call_id":${id}`)
+    for (const f of fs) {
+      if (f.key !== "role" && f.key !== "tool_call_id") parts.push(`${quote(f.key)}:${f.raw}`)
+    }
+    const text = "{" + parts.join(",") + "}"
+    this.replaying = true
+    this.startMessage()
+    const sub = new JsonTokenizer(this.o.strMax, 65536)
+    for (const t of try sub.push(bytesOf(text))) try this.msgTok(t)
+    for (const t of try sub.finish()) try this.msgTok(t)
+    this.replaying = false
+  }
+}
+
+// ---- the Messages route: Bedrock InvokeModel and Vertex Claude ----
+
+// The Anthropic Messages body for Bedrock InvokeModel ("bedrock-invoke": no model or stream, the Bedrock
+// version first) or Vertex Claude ("vertex-claude": no model, the Vertex version last, and stream when asked).
+// Only top-level fields change, so everything else is copied as it streams.
+export class MessagesConv {
+  private tk: JsonTokenizer
+  private out: ByteOut = new ByteOut()
+  private comp: Compact
+  private d = 0
+  private dropping = false
+  private sd = 0
+  private sl = false
+
+  constructor(readonly bedrock: bool, readonly version: string, readonly stream: bool, strMax: int) {
+    this.tk = new JsonTokenizer(strMax, 65536)
+    this.comp = new Compact(this.out)
+  }
+
+  private member(key: string, kind: int, raw: string): void {
+    this.comp.tok({ kind: T_KEY, raw: bytesOf(key) })
+    this.comp.tok({ kind: kind, raw: bytesOf(raw) })
+  }
+
+  private tok(t: Tok): void {
+    const k = t.kind
+    if (this.dropping) {
+      if (this.sl) {
+        if (k === T_STRE) {
+          this.sl = false
+          if (this.sd === 0) this.dropping = false
+        }
+        return
+      }
+      if (k === T_STRH) this.sl = true
+      else if (k === T_OBJ || k === T_ARR) this.sd += 1
+      else if (k === T_OBJ_END || k === T_ARR_END) {
+        this.sd -= 1
+        if (this.sd === 0) this.dropping = false
+      } else if (this.sd === 0) this.dropping = false
+      return
+    }
+    if (this.d === 1 && k === T_KEY) {
+      const name = textOfBytes(t.raw)
+      if (name === "model" || name === "stream" || name === "anthropic_version") {
+        this.dropping = true
+        this.sd = 0
+        this.sl = false
+        return
+      }
+    }
+    if (k === T_OBJ || k === T_ARR) this.d += 1
+    if ((k === T_OBJ_END || k === T_ARR_END) && this.d === 1) {
+      // the end of the body: Vertex's version, and the stream flag it is asked for
+      if (!this.bedrock) {
+        this.member("anthropic_version", T_STR, this.version)
+        if (this.stream) this.member("stream", T_LIT, "true")
+      }
+    }
+    if (k === T_OBJ_END || k === T_ARR_END) this.d -= 1
+    this.comp.tok(t)
+    if (k === T_OBJ && this.d === 1 && this.bedrock) this.member("anthropic_version", T_STR, this.version)
+  }
+
+  push(b: u8[]): u8[][] throws SyntaxError {
+    for (const t of try this.tk.push(b)) this.tok(t)
+    return this.out.take()
+  }
+
+  finish(): u8[][] throws SyntaxError {
+    for (const t of try this.tk.finish()) this.tok(t)
+    return this.out.take()
+  }
+}
+
+// ---- tests ----
+
+function maxTail(req: ChatRequest, body: Field[]): string[] throws SyntaxError {
+  const m = req.max_tokens
+  return m === undefined ? [] : [`"max_tokens":${m}`]
+}
+
+function testOpts(fmt: int, strMax: int, autoCache: bool): ConvOpts {
+  return { fmt: fmt, model: "claude", autoCache: autoCache, cacheMarker: `{"type":"ephemeral"}`, version: "vertex-2023-10-16", holdMax: 1048576, strMax: strMax, tail: maxTail }
+}
+
+// the converted body when the request arrives `step` bytes at a time
+function convert(o: ConvOpts, text: string, step: int): string throws SyntaxError {
+  const c = new ChatConv(o)
+  const out = new ByteOut()
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    for (const p of try c.push(b.slice(i, e))) out.bytes(p)
+    i = e
+  }
+  for (const p of try c.finish()) out.bytes(p)
+  return textOfBytes(out.all())
+}
+
+// the same body from every chunk size and string limit
+function sameEverywhere(fmt: int, text: string, autoCache: bool): string throws SyntaxError {
+  const want = try convert(testOpts(fmt, 4096, autoCache), text, 100000)
+  for (const step of [1, 2, 5, 13, 100]) {
+    for (const mx of [12, 16, 40]) {
+      const got = try convert(testOpts(fmt, mx, autoCache), text, step)
+      expect(got).toBe(want)
+    }
+  }
+  return want
+}
+
+function messagesVia(c: MessagesConv, text: string, step: int): string throws SyntaxError {
+  const out = new ByteOut()
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    for (const p of try c.push(b.slice(i, e))) out.bytes(p)
+    i = e
+  }
+  for (const p of try c.finish()) out.bytes(p)
+  return textOfBytes(out.all())
+}
+
+const CHAT = `{"model":"m","messages":[{"role":"system","content":"be brief and answer in one line"},{"role":"user","content":[{"type":"text","text":"what is in this picture, tell me"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAABBBBCCCC"}}]},{"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"look","arguments":"{\\"q\\":1}"}}]},{"role":"tool","tool_call_id":"t1","content":"a cat sitting on a mat"},{"role":"user","content":"thanks for the answer"}],"max_tokens":9}`
+
+test("a chat request to Anthropic is written in order, whatever the chunking", () => {
+  const out = try sameEverywhere(F_ANTHROPIC, CHAT, false)
+  expect(out).toBe(`{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"what is in this picture, tell me"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAABBBBCCCC"}}]},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"look","input":{"q":1}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a cat sitting on a mat"},{"type":"text","text":"thanks for the answer"}]}],"system":"be brief and answer in one line","max_tokens":9}`)
+})
+
+test("Anthropic auto caching marks the newest block and the system prompt", () => {
+  const out = try sameEverywhere(F_ANTHROPIC, CHAT, true)
+  expect(out.includes(`"text":"thanks for the answer","cache_control":{"type":"ephemeral"}}]}]`)).toBe(true)
+  expect(out.includes(`"system":[{"type":"text","text":"be brief and answer in one line","cache_control":{"type":"ephemeral"}}]`)).toBe(true)
+  expect(out.includes(`"text":"what is in this picture, tell me","cache_control"`)).toBe(false)
+})
+
+test("Vertex Claude has no model and ends with its version", () => {
+  const out = try sameEverywhere(F_VERTEX_CLAUDE, CHAT, false)
+  expect(out.startsWith(`{"messages":[{"role":"user"`)).toBe(true)
+  expect(out.endsWith(`"max_tokens":9,"anthropic_version":"vertex-2023-10-16"}`)).toBe(true)
+})
+
+test("a chat request to Gemini", () => {
+  const out = try sameEverywhere(F_GEMINI, CHAT, false)
+  expect(out).toBe(`{"contents":[{"role":"user","parts":[{"text":"what is in this picture, tell me"},{"inline_data":{"mime_type":"image/png","data":"AAAABBBBCCCC"}}]},{"role":"model","parts":[{"functionCall":{"name":"look","args":{"q":1}}}]},{"role":"user","parts":[{"functionResponse":{"name":"look","response":{"content":"a cat sitting on a mat"}}},{"text":"thanks for the answer"}]}],"systemInstruction":{"parts":[{"text":"be brief and answer in one line"}]},"max_tokens":9}`)
+})
+
+test("a chat request to Bedrock Converse", () => {
+  const out = try sameEverywhere(F_CONVERSE, CHAT, false)
+  expect(out).toBe(`{"messages":[{"role":"user","content":[{"text":"what is in this picture, tell me"},{"image":{"format":"png","source":{"bytes":"AAAABBBBCCCC"}}}]},{"role":"assistant","content":[{"toolUse":{"toolUseId":"t1","name":"look","input":{"q":1}}}]},{"role":"user","content":[{"toolResult":{"toolUseId":"t1","content":[{"text":"a cat sitting on a mat"}]}},{"text":"thanks for the answer"}]}],"system":[{"text":"be brief and answer in one line"}],"max_tokens":9}`)
+  const cached = try sameEverywhere(F_CONVERSE, CHAT, true)
+  expect(cached.includes(`{"text":"thanks for the answer"},{"cachePoint":{"type":"default"}}]}]`)).toBe(true)
+  expect(cached.includes(`"system":[{"text":"be brief and answer in one line"},{"cachePoint":{"type":"default"}}]`)).toBe(true)
+})
+
+test("a chat request to Cohere", () => {
+  const out = try sameEverywhere(F_COHERE, CHAT, false)
+  expect(out).toBe(`{"model":"claude","messages":[{"role":"system","content":"be brief and answer in one line"},{"role":"user","content":[{"type":"text","text":"what is in this picture, tell me"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAABBBBCCCC"}}]},{"role":"assistant","tool_calls":[{"id":"t1","type":"function","function":{"name":"look","arguments":"{\\"q\\":1}"}}]},{"role":"tool","tool_call_id":"t1","content":"a cat sitting on a mat"},{"role":"user","content":"thanks for the answer"}],"max_tokens":9}`)
+})
+
+test("a message whose content comes before its role is held and written in order", () => {
+  const early = `{"messages":[{"content":"a long enough text to stream, honest","role":"user"},{"content":"the tool said so, in full","tool_call_id":"c9","role":"tool"}],"model":"m"}`
+  const inOrder = `{"model":"m","messages":[{"role":"user","content":"a long enough text to stream, honest"},{"role":"tool","tool_call_id":"c9","content":"the tool said so, in full"}]}`
+  for (const f of [F_ANTHROPIC, F_GEMINI, F_CONVERSE, F_COHERE]) {
+    expect(try sameEverywhere(f, early, false)).toBe(try convert(testOpts(f, 4096, false), inOrder, 100000))
+  }
+})
+
+test("a long text and a long image stream through in pieces", () => {
+  const big = "x".repeat(300)
+  const img = "QUJD".repeat(100)
+  const req = `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"${big}"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,${img}"}}]},{"role":"user","content":"${big}"}]}`
+  const out = try sameEverywhere(F_ANTHROPIC, req, false)
+  expect(out).toBe(`{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"${big}"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"${img}"}},{"type":"text","text":"${big}"}]}]}`)
+  const g = try sameEverywhere(F_GEMINI, req, false)
+  expect(g.includes(`{"inline_data":{"mime_type":"image/jpeg","data":"${img}"}}`)).toBe(true)
+})
+
+test("a part whose type comes after its data is held whole", () => {
+  const big = "y".repeat(100)
+  const req = `{"model":"m","messages":[{"role":"user","content":[{"text":"${big}","type":"text"},{"image_url":{"url":"data:image/png;base64,${big}"},"type":"image_url"}]}]}`
+  const out = try sameEverywhere(F_ANTHROPIC, req, false)
+  expect(out).toBe(`{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"${big}"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"${big}"}}]}]}`)
+})
+
+test("parts of other kinds are dropped, big or small", () => {
+  const big = "z".repeat(100)
+  const req = `{"model":"m","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"${big}","format":"wav"}},{"type":"text","text":"keep this one, it is long enough"}]}]}`
+  const out = try sameEverywhere(F_ANTHROPIC, req, false)
+  expect(out).toBe(`{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"keep this one, it is long enough"}]}]}`)
+})
+
+test("several system messages join, wherever they are", () => {
+  const req = `{"model":"m","messages":[{"role":"system","content":"first system line, long"},{"role":"user","content":"hello there to you"},{"role":"developer","content":[{"type":"text","text":"second one, after a user"}]}]}`
+  expect((try sameEverywhere(F_ANTHROPIC, req, false)).includes(`"system":"first system line, long\\n\\nsecond one, after a user"`)).toBe(true)
+  expect((try sameEverywhere(F_GEMINI, req, false)).includes(`"systemInstruction":{"parts":[{"text":"first system line, long"},{"text":"second one, after a user"}]}`)).toBe(true)
+  expect((try sameEverywhere(F_COHERE, req, false)).includes(`{"role":"system","content":"second one, after a user"}`)).toBe(true)
+})
+
+test("empty messages are skipped and do not break turn merging", () => {
+  const req = `{"model":"m","messages":[{"role":"user","content":"first user message here"},{"role":"assistant","content":""},{"role":"user","content":"second user message here"}]}`
+  const out = try sameEverywhere(F_ANTHROPIC, req, false)
+  expect(out).toBe(`{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"first user message here"},{"type":"text","text":"second user message here"}]}]}`)
+})
+
+test("bad requests are refused", () => {
+  const bad = [`[]`, `{"model":"m"}`, `{"model":"m","messages":{}}`, `{"model":"m","messages":[1]}`, `{"model":"m","messages":[{"content":"no role at all"}]}`, `{"model":"m","messages":[{"role":"user","content":"x"}`]
+  for (const s of bad) {
+    let threw = false
+    try {
+      convert(testOpts(F_ANTHROPIC, 16, false), s, 7)
+    } catch (e) {
+      threw = true
+    }
+    expect(threw).toBe(true)
+  }
+})
+
+test("a held thing over holdMax is refused", () => {
+  const o = testOpts(F_ANTHROPIC, 16, false)
+  o.holdMax = 50
+  let threw = false
+  try {
+    convert(o, `{"model":"m","messages":[{"role":"system","content":"${"s".repeat(200)}"}]}`, 10)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("the Messages body for Bedrock InvokeModel and Vertex Claude", () => {
+  const body = `{"model":"claude-x","max_tokens":10,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"${"m".repeat(60)}"}]}],"anthropic_version":"old"}`
+  for (const step of [1, 7, 1000]) {
+    expect(try messagesVia(new MessagesConv(true, "bedrock-2023-05-31", false, 16), body, step)).toBe(`{"anthropic_version":"bedrock-2023-05-31","max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"${"m".repeat(60)}"}]}]}`)
+    expect(try messagesVia(new MessagesConv(false, "vertex-2023-10-16", true, 16), body, step)).toBe(`{"max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"${"m".repeat(60)}"}]}],"anthropic_version":"vertex-2023-10-16","stream":true}`)
+  }
+})

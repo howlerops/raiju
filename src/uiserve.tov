@@ -1,0 +1,267 @@
+// Serves the web UI: the files of the Vite build embedded in ui_assets.tov, or the files of a
+// directory when RAIJU_UI_DIR is set (for development, or a build kept apart from the binary).
+//
+// serveUi() is pure over its inputs (the request path, two request headers, the directory),
+// so the cache and range rules are unit tested here; server.tov turns a UiReply into a Response.
+import { uiAssets, UiAsset } from "./ui_assets"
+import { readFileBytesSync, statSync } from "node:fs"
+import { decode } from "./base64"
+
+export type UiReply = {
+  status: int
+  contentType: string
+  // Cache-Control
+  cache: string
+  etag: string
+  // "gzip" when bytes hold the compressed body
+  encoding: string
+  // the body as text, when binary is false
+  text: string
+  bytes: u8[]
+  binary: boolean
+}
+
+// Content Security Policy for the page: its own script and styles, the gateway's own API and
+// socket, and nothing from elsewhere.
+export const UI_CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+
+type ExtType = { ext: string, type: string }
+
+const EXT_TYPES: ExtType[] = [
+  { ext: "html", type: "text/html; charset=utf-8" },
+  { ext: "js", type: "text/javascript; charset=utf-8" },
+  { ext: "mjs", type: "text/javascript; charset=utf-8" },
+  { ext: "css", type: "text/css; charset=utf-8" },
+  { ext: "json", type: "application/json; charset=utf-8" },
+  { ext: "map", type: "application/json; charset=utf-8" },
+  { ext: "svg", type: "image/svg+xml" },
+  { ext: "txt", type: "text/plain; charset=utf-8" },
+  { ext: "png", type: "image/png" },
+  { ext: "jpg", type: "image/jpeg" },
+  { ext: "jpeg", type: "image/jpeg" },
+  { ext: "gif", type: "image/gif" },
+  { ext: "webp", type: "image/webp" },
+  { ext: "ico", type: "image/x-icon" },
+  { ext: "woff", type: "font/woff" },
+  { ext: "woff2", type: "font/woff2" },
+  { ext: "ttf", type: "font/ttf" },
+  { ext: "otf", type: "font/otf" },
+  { ext: "webmanifest", type: "application/manifest+json; charset=utf-8" },
+]
+
+// The Content-Type for a file name, from its extension.
+export function contentTypeOf(path: string): string {
+  const parts = path.split(".")
+  if (parts.length < 2) return "application/octet-stream"
+  const ext = parts[parts.length - 1]!.toLowerCase()
+  for (const e of EXT_TYPES) {
+    if (e.ext === ext) return e.type
+  }
+  return "application/octet-stream"
+}
+
+// A request path as a path under the UI root ("" is the page itself), or undefined when it
+// cannot name a file there: dot segments, backslashes, NUL, and an empty segment are refused.
+export function uiRelPath(p: string): string | undefined {
+  if (p === "/" || p === "/index.html") return "index.html"
+  if (!p.startsWith("/")) return undefined
+  const rel = p.slice(1, p.byteLength)
+  if (rel === "" || rel.includes("\\") || rel.includes("\x00") || rel.includes("%")) return undefined
+  for (const seg of rel.split("/")) {
+    if (seg === "" || seg === "." || seg === "..") return undefined
+  }
+  return rel
+}
+
+// Whether a path may be a UI file, so other routes skip the lookup: the page, anything under
+// /assets/, or a single file at the root (/favicon.svg).
+export function uiPath(p: string): boolean {
+  if (p === "/" || p.startsWith("/assets/")) return true
+  if (!p.startsWith("/") || p.byteLength < 3) return false
+  const rest = p.slice(1, p.byteLength)
+  return !rest.includes("/") && rest.includes(".")
+}
+
+// Whether an If-None-Match value matches a validator ("*" matches anything; a weak prefix is ignored).
+export function etagMatches(header: string, etag: string): boolean {
+  const h = header.trim()
+  if (h === "") return false
+  if (h === "*") return true
+  const want = etag.startsWith("W/") ? etag.slice(2, etag.byteLength) : etag
+  for (const part of h.split(",")) {
+    let t = part.trim()
+    if (t.startsWith("W/")) t = t.slice(2, t.byteLength)
+    if (t === want) return true
+  }
+  return false
+}
+
+// Whether an Accept-Encoding value allows gzip (q=0 refuses it).
+export function acceptsGzip(header: string): boolean {
+  for (const part of header.split(",")) {
+    const bits = part.trim().toLowerCase().split(";")
+    if (bits[0]!.trim() !== "gzip" && bits[0]!.trim() !== "*") continue
+    let q = 1.0
+    for (let i = 1; i < bits.length; i++) {
+      const kv = bits[i]!.trim()
+      if (kv.startsWith("q=")) q = parseFloat(kv.slice(2, kv.byteLength)) ?? 1.0
+    }
+    if (q > 0.0) return true
+  }
+  return false
+}
+
+let index: Map<string, UiAsset> | undefined = undefined
+// base64 bodies and gzip bodies, decoded on first use
+let decoded: Map<string, u8[]> = new Map()
+
+function embedded(rel: string): UiAsset | undefined {
+  let m = index
+  if (m === undefined) {
+    m = new Map()
+    for (const a of uiAssets()) m.set(a.path, a)
+    index = m
+  }
+  return m.get(rel)
+}
+
+function decodedOf(key: string, b64: string): u8[] {
+  const hit = decoded.get(key)
+  if (hit !== undefined) return hit
+  let bytes: u8[] = []
+  try {
+    bytes = decode(b64)
+  } catch (e) {
+    bytes = []
+  }
+  decoded.set(key, bytes)
+  return bytes
+}
+
+function cacheFor(rel: string): string {
+  // the build hashes every file name under assets/, so those never change
+  return rel.startsWith("assets/") ? "public, max-age=31536000, immutable" : "no-cache"
+}
+
+function notModified(etag: string, cache: string, ctype: string): UiReply {
+  return { status: 304, contentType: ctype, cache: cache, etag: etag, encoding: "", text: "", bytes: [], binary: false }
+}
+
+// The reply for GET path, or undefined when the UI has no such file. dir is RAIJU_UI_DIR ("" for
+// the embedded build).
+export function serveUi(path: string, ifNoneMatch: string, acceptEncoding: string, dir: string): UiReply | undefined {
+  const rel = uiRelPath(path)
+  if (rel === undefined) return undefined
+  if (dir !== "") return serveDir(dir, rel, ifNoneMatch)
+  const a = embedded(rel)
+  if (a === undefined) return undefined
+  const cache = cacheFor(rel)
+  const gz = a.gz !== "" && acceptsGzip(acceptEncoding)
+  const etag = gz ? a.etag.slice(0, a.etag.byteLength - 1) + "-gzip\"" : a.etag
+  if (etagMatches(ifNoneMatch, etag)) return notModified(etag, cache, a.type)
+  if (gz) return { status: 200, contentType: a.type, cache: cache, etag: etag, encoding: "gzip", text: "", bytes: decodedOf(a.path + "#gz", a.gz), binary: true }
+  if (a.base64) return { status: 200, contentType: a.type, cache: cache, etag: etag, encoding: "", text: "", bytes: decodedOf(a.path, a.body), binary: true }
+  return { status: 200, contentType: a.type, cache: cache, etag: etag, encoding: "", text: a.body, bytes: [], binary: false }
+}
+
+// Files of a directory: always revalidated (a development or CDN build changes under the same names).
+function serveDir(dir: string, rel: string, ifNoneMatch: string): UiReply | undefined {
+  const full = dir.endsWith("/") ? dir + rel : dir + "/" + rel
+  let size = 0
+  let mtime = 0.0
+  try {
+    const st = statSync(full)
+    if (!st.isFile()) return undefined
+    size = st.size
+    mtime = st.mtimeMs
+  } catch (e) {
+    return undefined
+  }
+  const etag = `W/"${size}-${Math.floor(mtime)}"`
+  const ctype = contentTypeOf(rel)
+  if (etagMatches(ifNoneMatch, etag)) return notModified(etag, "no-cache", ctype)
+  try {
+    const bytes = readFileBytesSync(full)
+    return { status: 200, contentType: ctype, cache: "no-cache", etag: etag, encoding: "", text: "", bytes: bytes, binary: true }
+  } catch (e) {
+    return undefined
+  }
+}
+
+test("content types by extension", () => {
+  expect(contentTypeOf("assets/index-abc.js")).toBe("text/javascript; charset=utf-8")
+  expect(contentTypeOf("index.html")).toBe("text/html; charset=utf-8")
+  expect(contentTypeOf("a/b.WOFF2")).toBe("font/woff2")
+  expect(contentTypeOf("noext")).toBe("application/octet-stream")
+})
+
+test("paths are checked before they name a file", () => {
+  expect(uiRelPath("/")).toBe("index.html")
+  expect(uiRelPath("/index.html")).toBe("index.html")
+  expect(uiRelPath("/assets/index-1.js")).toBe("assets/index-1.js")
+  expect(uiRelPath("/../etc/passwd")).toBe(undefined)
+  expect(uiRelPath("/assets/../x")).toBe(undefined)
+  expect(uiRelPath("/assets//x")).toBe(undefined)
+  expect(uiRelPath("/a\\b")).toBe(undefined)
+  expect(uiRelPath("/%2e%2e/x")).toBe(undefined)
+  expect(uiRelPath("/assets/")).toBe(undefined)
+  expect(uiRelPath("assets/x")).toBe(undefined)
+})
+
+test("If-None-Match matching", () => {
+  expect(etagMatches("\"a\"", "\"a\"")).toBe(true)
+  expect(etagMatches("W/\"a\"", "\"a\"")).toBe(true)
+  expect(etagMatches("\"b\", \"a\"", "\"a\"")).toBe(true)
+  expect(etagMatches("\"b\"", "\"a\"")).toBe(false)
+  expect(etagMatches("*", "\"a\"")).toBe(true)
+  expect(etagMatches("", "\"a\"")).toBe(false)
+})
+
+test("Accept-Encoding gzip", () => {
+  expect(acceptsGzip("gzip, deflate, br")).toBe(true)
+  expect(acceptsGzip("deflate")).toBe(false)
+  expect(acceptsGzip("gzip;q=0")).toBe(false)
+  expect(acceptsGzip("br;q=1.0, gzip;q=0.5")).toBe(true)
+  expect(acceptsGzip("")).toBe(false)
+})
+
+test("the embedded page is served with a validator and revalidated", () => {
+  const r = serveUi("/", "", "", "")!
+  expect(r.status).toBe(200)
+  expect(r.contentType).toBe("text/html; charset=utf-8")
+  expect(r.cache).toBe("no-cache")
+  expect(r.text.includes("<div id=\"root\">")).toBe(true)
+  const again = serveUi("/", r.etag, "", "")!
+  expect(again.status).toBe(304)
+  expect(serveUi("/nope.js", "", "", "")).toBe(undefined)
+})
+
+test("hashed assets are immutable and gzip is offered", () => {
+  const page = serveUi("/", "", "", "")!
+  // the page names its script: /assets/<name>.js
+  const at = page.text.indexOf("/assets/")
+  expect(at >= 0).toBe(true)
+  const tail = page.text.slice(at, page.text.byteLength)
+  const url = tail.slice(0, tail.indexOf(".js") + 3)
+  const plain = serveUi(url, "", "", "")!
+  expect(plain.status).toBe(200)
+  expect(plain.cache).toBe("public, max-age=31536000, immutable")
+  expect(plain.encoding).toBe("")
+  const packed = serveUi(url, "", "gzip, br", "")!
+  expect(packed.encoding).toBe("gzip")
+  expect(packed.binary).toBe(true)
+  // a gzip stream starts 1f 8b
+  expect(int(packed.bytes[0]!)).toBe(31)
+  expect(int(packed.bytes[1]!)).toBe(139)
+  expect(packed.etag === plain.etag).toBe(false)
+  expect(serveUi(url, packed.etag, "gzip", "")!.status).toBe(304)
+})
+
+test("which paths are looked up as UI files", () => {
+  expect(uiPath("/")).toBe(true)
+  expect(uiPath("/assets/x.js")).toBe(true)
+  expect(uiPath("/favicon.svg")).toBe(true)
+  expect(uiPath("/health")).toBe(false)
+  expect(uiPath("/v1/models")).toBe(false)
+  expect(uiPath("/api/logs")).toBe(false)
+})

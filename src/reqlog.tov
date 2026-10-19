@@ -257,6 +257,97 @@ export function toolCallNamesOf(body: string): string[] {
   return names
 }
 
+// The tool names of one streamed event: a chat chunk's tool_calls deltas, a Responses output item that is a
+// function call, or an Anthropic tool_use content block. Other events and bad JSON add nothing.
+type StreamToolEvent = {
+  choices?: { delta?: { tool_calls?: { function?: { name?: string } }[] } }[],
+  type?: string,
+  item?: { type?: string, name?: string },
+  content_block?: { type?: string, name?: string },
+}
+
+function eventNames(names: string[], ev: string): string[] {
+  let body = ""
+  for (const line of ev.split("\n")) {
+    if (line.startsWith("data:")) body = line.slice(5).trim()
+  }
+  if (body === "" || body === "[DONE]" || !body.includes("name")) return names
+  let s: StreamToolEvent = {}
+  try {
+    s = JSON.parse(body) as StreamToolEvent
+  } catch (e) {
+    return names
+  }
+  let out = names
+  const cs = s.choices
+  if (cs !== undefined) {
+    for (const c of cs) {
+      const tcs = c.delta?.tool_calls
+      if (tcs === undefined) continue
+      for (const tc of tcs) out = addName(out, tc.function?.name)
+    }
+  }
+  if (s.type === "response.output_item.added" || s.type === "response.output_item.done") {
+    const it = s.item
+    if (it !== undefined && (it.type === "function_call" || it.type === "custom_tool_call")) out = addName(out, it.name)
+  }
+  if (s.type === "content_block_start") {
+    const cb = s.content_block
+    if (cb !== undefined && cb.type === "tool_use") out = addName(out, cb.name)
+  }
+  return out
+}
+
+// Collects the tool names of a streamed answer as its events are sent. push takes the text as it goes
+// out (events may be split across pushes); end reads the last event when the stream ends without a blank line.
+export class ToolNameStream {
+  names: string[] = []
+  private tail = ""
+
+  push(s: string): void {
+    const parts = (this.tail + s).split("\n\n")
+    this.tail = parts[parts.length - 1]!
+    for (let k = 0; k < parts.length - 1; k++) this.names = eventNames(this.names, parts[k]!)
+  }
+
+  end(): void {
+    if (this.tail !== "") this.names = eventNames(this.names, this.tail)
+    this.tail = ""
+  }
+}
+
+// The tool names of a whole streamed answer (its SSE text), in first-seen order.
+export function toolCallNamesOfStream(body: string): string[] {
+  const s = new ToolNameStream()
+  s.push(body)
+  s.end()
+  return s.names
+}
+
+// The tool names of an answer body: SSE events for a streamed answer, a JSON body otherwise.
+export function toolNamesOfBody(body: string): string[] {
+  if (body.startsWith("data:") || body.startsWith("event:")) return toolCallNamesOfStream(body)
+  return toolCallNamesOf(body)
+}
+
+test("tool names of a streamed answer: chat deltas, Responses function items and Anthropic tool_use, deduplicated", () => {
+  const chat = `data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null}}]}\n\ndata: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}\n\ndata: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}\n\ndata: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"b","type":"function","function":{"name":"lookup_city","arguments":""}}]}}]}\n\ndata: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"function":{"name":"get_weather","arguments":"{}"}}]}}]}\n\ndata: [DONE]\n\n`
+  expect(toolCallNamesOfStream(chat).join(",")).toBe("get_weather,lookup_city")
+  const resp = `event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"message","content":[]}}\n\nevent: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","name":"search","arguments":""}}\n\nevent: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"type":"function_call","name":"search"}}\n\n`
+  expect(toolCallNamesOfStream(resp).join(",")).toBe("search")
+  const anth = `event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"fs-read","input":{}}}\n\n`
+  expect(toolCallNamesOfStream(anth).join(",")).toBe("fs-read")
+  expect(toolCallNamesOfStream(`data: {"choices":[{"delta":{"content":"no tools"}}]}\n\n`).length).toBe(0)
+  // an event split across pushes, and one with no blank line at the end
+  const s = new ToolNameStream()
+  for (let at = 0; at < chat.byteLength; at += 23) s.push(chat.slice(at, at + 23))
+  s.end()
+  expect(s.names.join(",")).toBe("get_weather,lookup_city")
+  expect(toolNamesOfBody(chat).join(",")).toBe("get_weather,lookup_city")
+  expect(toolNamesOfBody(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"ok"}}]}}]}`).join(",")).toBe("ok")
+  expect(toolCallNamesOfStream("data: not json, name\n\n").length).toBe(0)
+})
+
 test("tool call names: chat, Responses, Anthropic and Gemini answers, deduplicated", () => {
   expect(toolCallNamesOf(`{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"get_weather","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"lookup_city","arguments":"{}"}},{"id":"c","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`).join(",")).toBe("get_weather,lookup_city")
   expect(toolCallNamesOf(`{"id":"r1","output":[{"type":"message","content":[]},{"type":"function_call","name":"search","arguments":"{}"},{"type":"local_shell_call","action":{}}]}`).join(",")).toBe("search,local_shell")

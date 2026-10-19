@@ -2,8 +2,8 @@
 // no RSA library, so the RSASSA-PKCS1-v1_5 signature (RFC 8017) is computed
 // here with bigint: parse the PEM key, then one modular exponentiation.
 import { quote } from "./json"
-import { sha256, utf8, toHex } from "./crypto"
-import { encodeUrl, decode } from "./base64"
+import { sha256, utf8, toHex, secureHex } from "./crypto"
+import { encodeUrl, decode, encode } from "./base64"
 
 // ---- DER ----
 
@@ -204,6 +204,154 @@ export function serviceAccountJwt(clientEmail: string, privateKeyPem: string, sc
   return input + "." + sig
 }
 
+// ---- key generation ----
+
+// A random number of exactly `bits` bits, from the kernel CSPRNG. The two top bits are set, so the product of
+// two such primes has the full 2 * bits length.
+function randomBits(bits: int): bigint throws Error {
+  const x = try BigInt("0x" + (try secureHex(Math.ceil(bits / 4))))
+  return (x & ((1n << BigInt(bits)) - 1n)) | (1n << BigInt(bits - 1)) | (1n << BigInt(bits - 2))
+}
+
+// A random number in [2, n - 2], for a Miller-Rabin base. The extra 64 bits make the bias negligible.
+function randomBase(n: bigint): bigint throws Error {
+  const bits = byteLen(n) * 8 + 64
+  return 2n + ((try randomBits(bits)) % (n - 3n))
+}
+
+// Trial division bound for candidate primes: most composites fall to these before any modular exponentiation.
+const SMALL_PRIME_BOUND = 1000
+
+function smallPrimes(): bigint[] {
+  const out: bigint[] = []
+  for (let k = 3; k < SMALL_PRIME_BOUND; k += 2) {
+    let prime = true
+    for (let d = 3; d * d <= k; d += 2) {
+      if (k % d === 0) {
+        prime = false
+        break
+      }
+    }
+    if (prime) out.push(BigInt(k))
+  }
+  return out
+}
+
+// Miller-Rabin with random bases (FIPS 186-5, Appendix B.3). A composite is never reported as prime.
+function probablyPrime(n: bigint, rounds: int): bool throws Error {
+  if (n < 3n || (n & 1n) === 0n) return false
+  let d = n - 1n
+  let r = 0
+  while ((d & 1n) === 0n) {
+    d = d >> 1n
+    r++
+  }
+  for (let i = 0; i < rounds; i++) {
+    const base = try randomBase(n)
+    let x = modPow(base, d, n)
+    if (x === 1n || x === n - 1n) continue
+    let witness = true
+    for (let j = 1; j < r; j++) {
+      x = (x * x) % n
+      if (x === n - 1n) {
+        witness = false
+        break
+      }
+    }
+    if (witness) return false
+  }
+  return true
+}
+
+// A prime of `bits` bits whose predecessor is not a multiple of e, so e stays invertible modulo p - 1.
+function randomPrime(bits: int, e: bigint): bigint throws Error {
+  const small = smallPrimes()
+  while (true) {
+    const c = (try randomBits(bits)) | 1n
+    if (c % e === 1n) continue
+    let hit = false
+    for (const sp of small) {
+      if (c % sp === 0n && c !== sp) {
+        hit = true
+        break
+      }
+    }
+    if (hit) continue
+    const isPrime = try probablyPrime(c, 20)
+    if (isPrime) return c
+  }
+}
+
+// The inverse of a modulo m (extended Euclid), or a throw when they share a factor.
+function modInverse(a: bigint, m: bigint): bigint throws SyntaxError {
+  let r0 = m
+  let r1 = a % m
+  let s0 = 0n
+  let s1 = 1n
+  while (r1 !== 0n) {
+    const q = r0 / r1
+    const r2 = r0 - q * r1
+    r0 = r1
+    r1 = r2
+    const s2 = s0 - q * s1
+    s0 = s1
+    s1 = s2
+  }
+  if (r0 !== 1n) throw new SyntaxError("rsa: no inverse")
+  let x = s0 % m
+  if (x < 0n) x += m
+  return x
+}
+
+// A DER TLV with the given tag and content.
+function derTlv(tag: int, content: u8[]): u8[] {
+  const len = content.length
+  const head: u8[] = [u8(tag)]
+  if (len < 0x80) {
+    head.push(u8(len))
+  } else {
+    const lb = bytesOf(BigInt(len), byteLen(BigInt(len)))
+    head.push(u8(0x80 | lb.length))
+    for (const b of lb) head.push(b)
+  }
+  return head.concat(content)
+}
+
+// A non-negative INTEGER: a leading zero byte keeps a high bit from reading as a sign.
+function derInt(x: bigint): u8[] {
+  let b = bytesOf(x, byteLen(x))
+  if (b.length === 0 || int(b[0]!) >= 0x80) b = [u8(0)].concat(b)
+  return derTlv(0x02, b)
+}
+
+// PKCS#1 RSAPrivateKey (RFC 8017, A.1.2) as a PEM block, the form parseKey reads.
+function pkcs1Pem(k: RsaKey): string {
+  let body: u8[] = derInt(0n)
+  for (const v of [k.n, k.e, k.d, k.p, k.q, k.dP, k.dQ, k.qInv]) body = body.concat(derInt(v))
+  const der = derTlv(0x30, body)
+  const b64 = encode(der)
+  const lines: string[] = []
+  for (let i = 0; i < b64.byteLength; i += 64) lines.push(b64.slice(i, i + 64))
+  return "-----BEGIN RSA PRIVATE KEY-----\n" + lines.join("\n") + "\n-----END RSA PRIVATE KEY-----\n"
+}
+
+// A new RSA key of `bits` modulus bits (2048 is the usual size) as a PKCS#1 PEM. The primes come from the
+// kernel CSPRNG and pass Miller-Rabin; the key is checked by a sign-and-verify round trip before it is returned.
+export function generateRsaPem(bits: int): string throws Error {
+  if (bits < 512 || bits % 16 !== 0) throw new Error("rsa: key size must be a multiple of 16 and at least 512 bits")
+  const e = 65537n
+  const half: int = Math.floor(bits / 2)
+  const p = try randomPrime(half, e)
+  let q = try randomPrime(half, e)
+  while (q === p) q = try randomPrime(half, e)
+  const n = p * q
+  const d = try modInverse(e, (p - 1n) * (q - 1n))
+  const k: RsaKey = { n: n, e: e, d: d, p: p, q: q, dP: d % (p - 1n), dQ: d % (q - 1n), qInv: try modInverse(q, p) }
+  // the key must invert the public operation on a test value, or it is never handed out
+  if (modPow(modPow(2n, e, n), d, n) !== 2n) throw new Error("rsa: generated key failed the round trip")
+  return pkcs1Pem(k)
+}
+
 // ---- tests ----
 // The keys below are throwaway test keys generated for these tests. They guard nothing.
 
@@ -325,6 +473,37 @@ test("rejects bad keys", () => {
   threw = false
   try {
     signRs256("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----", "x")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("a generated key signs and verifies, and two keys differ", () => {
+  const pem = try generateRsaPem(512)
+  expect(pem.startsWith("-----BEGIN RSA PRIVATE KEY-----")).toBe(true)
+  const sig = try signRs256(pem, "hello")
+  expect(try verifyRs256(pem, "hello", sig)).toBe(true)
+  expect(try verifyRs256(pem, "hellO", sig)).toBe(false)
+  expect((try publicKeyId(pem)).byteLength).toBe(32)
+  expect(try generateRsaPem(512) === pem).toBe(false)
+})
+
+test("a generated 2048-bit key is usable as the MCP signing key", () => {
+  const pem = try generateRsaPem(2048)
+  const jwk = try publicJwk(pem, "k2048")
+  expect(jwk.includes("\"kid\":\"k2048\"")).toBe(true)
+  const sig = try signRs256(pem, "x")
+  expect(try verifyRs256(pem, "x", sig)).toBe(true)
+  // a 2048-bit modulus signs 256 bytes, which is 342 base64url characters without padding
+  expect(sig.byteLength).toBe(342)
+})
+
+test("generated key sizes are checked", () => {
+  let threw = false
+  try {
+    const bad = try generateRsaPem(100)
+    threw = bad === ""
   } catch (e) {
     threw = true
   }

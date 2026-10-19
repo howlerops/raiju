@@ -9,7 +9,8 @@
 import { WsConnection, WsSink, acceptKey, validKey } from "./ws"
 
 // body is the text (for routing and JSON); bytes is the body as it came, for binary uploads
-export type Http1Request = { method: string, path: string, version: string, headers: Map<string, string>, body: string, bytes: u8[] }
+// stream: a body over the parser's stream threshold, which arrives after the request does (body and bytes are empty)
+export type Http1Request = { method: string, path: string, version: string, headers: Map<string, string>, body: string, bytes: u8[], stream?: BodyQueue }
 export type Http1Fail = { kind: "fail", status: int, message: string }
 export type Http1Result = { kind: "request", req: Http1Request } | Http1Fail
 export type Framing = { kind: "length", n: int } | { kind: "chunked" } | { kind: "none" }
@@ -22,6 +23,111 @@ const MAX_LINE = 8192
 const MAX_NUM = 1000000000000000
 
 export const DEFAULT_MAX_BODY = 100 * 1024 * 1024
+
+// Buffered body bytes at which the socket stops being read, and where it reads on.
+const BODY_HIGH = 524288
+const BODY_LOW = 131072
+// A discarded body is read on this far; past it the connection is closed.
+const DRAIN_MAX = 33554432
+
+// The body of a request that is delivered before it has all arrived (the parser's stream threshold): the
+// handler takes it with next(), and the socket is not read while the handler is behind (backpressure).
+export class BodyQueue {
+  queued = 0
+  paused = false
+  done = false
+  failed = ""
+  private chunks: u8[][] = []
+  private waiter: ((n: int) => void) | undefined = undefined
+  private dropping = false
+  private dropped = 0
+  // set by the connection: reading resumes, and the connection closes (a body that is dropped too far)
+  resumeRead: (() => void) | undefined = undefined
+  closeConn: (() => void) | undefined = undefined
+
+  private wake(): void {
+    const w = this.waiter
+    if (w !== undefined) {
+      this.waiter = undefined
+      w(0)
+    }
+  }
+
+  private resume(): void {
+    if (!this.paused) return
+    this.paused = false
+    const f = this.resumeRead
+    if (f !== undefined) f()
+  }
+
+  // Bytes of the body, from the parser.
+  push(b: u8[]): void {
+    if (b.length === 0) return
+    if (this.dropping) {
+      this.dropped += b.length
+      if (this.dropped > DRAIN_MAX) {
+        this.failed = "the request body was not read"
+        const c = this.closeConn
+        if (c !== undefined) c()
+      }
+      return
+    }
+    this.chunks.push(b)
+    this.queued += b.length
+    this.wake()
+  }
+
+  // The body is all in.
+  finish(): void {
+    this.done = true
+    this.resume()
+    this.wake()
+  }
+
+  // The body will not be completed.
+  fail(message: string): void {
+    if (this.done || this.failed !== "") return
+    this.failed = message
+    this.resume()
+    this.wake()
+  }
+
+  // The next piece, or undefined at the end of the body. Throws when the body failed.
+  async next(): Promise<u8[] | undefined> throws Error {
+    while (true) {
+      const c = this.chunks.shift()
+      if (c !== undefined) {
+        this.queued -= c.length
+        if (this.paused && this.queued < BODY_LOW) this.resume()
+        return c
+      }
+      if (this.failed !== "") throw new Error(this.failed)
+      if (this.done) return undefined
+      await new Promise<int>((resolve) => {
+        this.waiter = resolve
+      })
+    }
+  }
+
+  // Everything held, at once (what next() hands over a piece at a time).
+  drain(): u8[] {
+    const out: u8[] = []
+    for (const c of this.chunks) for (const b of c) out.push(b)
+    this.chunks = []
+    this.queued = 0
+    if (this.paused) this.resume()
+    return out
+  }
+
+  // Nobody wants the rest: what is held goes, and what comes is dropped.
+  discard(): void {
+    this.dropping = true
+    this.chunks = []
+    this.queued = 0
+    this.resume()
+    this.wake()
+  }
+}
 
 const enc = new TextEncoder()
 const HEX = "0123456789abcdef"
@@ -182,9 +288,28 @@ export class Http1Parser {
   private version = ""
   private headers: Map<string, string> = new Map()
   private max: int
+  // bodies over this many bytes are delivered as a stream (0: never), and the one being delivered
+  private thr: int
+  private rx: BodyQueue | undefined = undefined
+  private rxTotal = 0
 
-  constructor(maxBodyBytes?: int) {
+  constructor(maxBodyBytes?: int, streamThreshold?: int) {
     this.max = maxBodyBytes ?? DEFAULT_MAX_BODY
+    this.thr = streamThreshold ?? 0
+  }
+
+  // The body being delivered as a stream, if any.
+  streaming(): BodyQueue | undefined {
+    return this.rx
+  }
+
+  // The connection closed: a body still arriving will not complete.
+  abort(): void {
+    const q = this.rx
+    if (q !== undefined) {
+      this.rx = undefined
+      q.fail("the connection closed before the request body was complete")
+    }
   }
 
   // Returns the requests (and at most one failure) that this chunk completes,
@@ -274,7 +399,22 @@ export class Http1Parser {
     if (n === 0) return this.complete(&out)
     this.left = n
     this.phase = "length"
+    // a big body: the request is handed over now, and the body follows
+    if (this.thr > 0 && n > this.thr) this.beginStream(&out)
     return true
+  }
+
+  // Hands the request over with its body to follow; what has been read of the body so far goes into the stream.
+  private beginStream(inout out: Http1Result[]): void {
+    const q = new BodyQueue()
+    this.rx = q
+    this.rxTotal = 0
+    if (this.body.length > 0) {
+      q.push(this.body)
+      this.rxTotal = this.body.length
+      this.body = []
+    }
+    out.push({ kind: "request", req: { method: this.method, path: this.path, version: this.version, headers: this.headers, body: "", bytes: [], stream: q } })
   }
 
   // Reads body bytes for a Content-Length body or one chunk's data.
@@ -292,7 +432,13 @@ export class Http1Parser {
 
   private take(n: int): void {
     const end = this.pos + n
-    for (let i = this.pos; i < end; i++) this.body.push(this.buf[i]!)
+    const q = this.rx
+    if (q !== undefined) {
+      q.push(this.buf.slice(this.pos, end))
+      this.rxTotal += n
+    } else {
+      for (let i = this.pos; i < end; i++) this.body.push(this.buf[i]!)
+    }
     this.pos = end
   }
 
@@ -310,7 +456,9 @@ export class Http1Parser {
       this.phase = "trailer"
       return true
     }
-    if (size > this.max - this.body.length) return this.reject(&out, 413, "request body too large")
+    if (size > this.max - this.body.length - this.rxTotal) return this.reject(&out, 413, "request body too large")
+    // a chunked body that has outgrown the threshold: the request is handed over, the rest follows
+    if (this.thr > 0 && this.rx === undefined && this.body.length > this.thr) this.beginStream(&out)
     this.left = size
     this.phase = "chunk-data"
     return true
@@ -345,8 +493,15 @@ export class Http1Parser {
   }
 
   private complete(inout out: Http1Result[]): bool {
-    const req: Http1Request = { method: this.method, path: this.path, version: this.version, headers: this.headers, body: decodeUtf8(this.body), bytes: this.body }
-    out.push({ kind: "request", req })
+    const q = this.rx
+    const req: Http1Request = q === undefined ? { method: this.method, path: this.path, version: this.version, headers: this.headers, body: decodeUtf8(this.body), bytes: this.body } : { method: this.method, path: this.path, version: this.version, headers: this.headers, body: "", bytes: [], stream: q }
+    if (q !== undefined) {
+      // the request went out when its body began: the body is complete now
+      this.rx = undefined
+      q.finish()
+    } else {
+      out.push({ kind: "request", req })
+    }
     // what follows an upgrade request is WebSocket frames, not requests
     if (wantsUpgrade(req.headers)) {
       this.stopped = true
@@ -361,6 +516,11 @@ export class Http1Parser {
   }
 
   private reject(inout out: Http1Result[], status: int, message: string): bool {
+    const q = this.rx
+    if (q !== undefined) {
+      this.rx = undefined
+      q.fail(message)
+    }
     out.push(fail(status, message))
     this.stopped = true
     return false
@@ -497,8 +657,23 @@ cyclic class Http1Conn {
   // set once an upgrade request has its answer (the 101 or an HTTP error)
   answered = false
 
-  constructor(maxBodyBytes?: int) {
-    this.parser = new Http1Parser(maxBodyBytes)
+  constructor(maxBodyBytes?: int, streamThreshold?: int) {
+    this.parser = new Http1Parser(maxBodyBytes, streamThreshold)
+  }
+
+  // After bytes were fed: a request body that the handler is behind on stops the socket being read.
+  flow(): void {
+    const q = this.parser.streaming()
+    if (q === undefined || q.paused || q.queued < BODY_HIGH) return
+    const s = this.sock
+    if (s === undefined) return
+    q.paused = true
+    q.resumeRead = () => {
+      const sk = this.sock
+      if (sk !== undefined) sk.resume()
+    }
+    q.closeConn = () => this.close()
+    s.pause()
   }
 
   // Routes parsed requests to the handler, one response per request. A handler
@@ -513,6 +688,11 @@ cyclic class Http1Conn {
         this.upgrade(r.req)
       } else {
         const res = this.respond(r.req.method, r.req.version, !keepAlive(r.req))
+        const bq = r.req.stream
+        if (bq !== undefined) {
+          res.body = bq
+          bq.closeConn = () => this.close()
+        }
         try {
           handler(r.req, res)
         } catch (e) {
@@ -571,6 +751,7 @@ cyclic class Http1Conn {
     this.closed = true
     this.sock = undefined
     this.queue = []
+    this.parser.abort()
   }
 
   // Runs the upgrade hook. The socket switches to frames only when accept()
@@ -677,7 +858,11 @@ export class Http1Response {
   buf: string[] = []
   // a binary body given to endBytes(), sent after buf
   tail: u8[] = []
+  // the request's body when it arrives as a stream: dropped once the response is done
+  body: BodyQueue | undefined = undefined
   private headSent = false
+  // bytes were buffered in tail: later output follows them there
+  private tailed = false
   // a back-reference: a response outliving its connection writes nowhere
   weak conn: Http1Conn | undefined
 
@@ -702,6 +887,20 @@ export class Http1Response {
     this.emit(this.version === "HTTP/1.1" ? chunk(text) : text)
   }
 
+  // Writes a piece of a binary body (chunked for HTTP/1.1, like write()).
+  writeBytes(b: u8[]): void {
+    if (this.finished) return
+    if (!this.headSent) this.startStream()
+    if (this.bodyless() || b.length === 0) return
+    if (this.version === "HTTP/1.1") {
+      this.emit(`${hexOf(b.length)}\r\n`)
+      this.emitBytes(b)
+      this.emit("\r\n")
+    } else {
+      this.emitBytes(b)
+    }
+  }
+
   // Finishes the response, with an optional last piece of body.
   end(body?: string): void {
     if (this.finished) return
@@ -716,6 +915,8 @@ export class Http1Response {
       } else this.emit(text)
     }
     this.finished = true
+    const dq = this.body
+    if (dq !== undefined) dq.discard()
     const c = this.conn
     if (c !== undefined) c.advance()
   }
@@ -741,6 +942,8 @@ export class Http1Response {
       else this.tail = body
     }
     this.finished = true
+    const dq = this.body
+    if (dq !== undefined) dq.discard()
     const c = this.conn
     if (c !== undefined) c.advance()
   }
@@ -768,21 +971,34 @@ export class Http1Response {
     const c = this.conn
     if (c === undefined) return
     if (c.queue.length > 0 && c.queue[0] === this) c.sendRaw(text)
-    else this.buf.push(text)
+    else if (this.tailed) {
+      for (const x of enc.encode(text)) this.tail.push(x)
+    } else this.buf.push(text)
+  }
+
+  private emitBytes(b: u8[]): void {
+    const c = this.conn
+    if (c === undefined) return
+    if (c.queue.length > 0 && c.queue[0] === this) {
+      c.sendBytes(b)
+    } else {
+      this.tailed = true
+      for (const x of b) this.tail.push(x)
+    }
   }
 }
 
 // Listens on a port and serves HTTP/1.1 through `handler`. The handler may
 // finish its response later, from async code.
 // onUpgrade (optional) takes WebSocket upgrade requests; see UpgradeHandler.
-export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, onUpgrade?: UpgradeHandler }, handler: Handler): TCPSocketListener<Http1Conn> {
+export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, streamThreshold?: int, onUpgrade?: UpgradeHandler }, handler: Handler): TCPSocketListener<Http1Conn> {
   const maxBody = opts.maxBodyBytes ?? DEFAULT_MAX_BODY
   return Bun.listen<Http1Conn>({
     hostname: opts.hostname,
     port: opts.port,
     socket: {
       open(socket) {
-        const conn = new Http1Conn(maxBody)
+        const conn = new Http1Conn(maxBody, opts.streamThreshold)
         conn.sock = socket
         conn.onUpgrade = opts.onUpgrade
         socket.data = conn
@@ -796,6 +1012,7 @@ export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, 
           return
         }
         conn.serve(conn.parser.feed(bytes), handler)
+        conn.flow()
       },
       close(socket) {
         const conn = socket.data
@@ -1108,4 +1325,79 @@ test("frames after an upgrade are not read as requests", () => {
   // the 1002 close frame went out on the socket
   expect(int(conn.sentBytes[0]![0]!)).toBe(0x88)
   expect(int(conn.sentBytes[0]![2]!) * 256 + int(conn.sentBytes[0]![3]!)).toBe(1002)
+})
+
+test("a body over the stream threshold is handed over before it has arrived", () => {
+  const p = new Http1Parser(1000, 10)
+  const rs = requestsOf(feedText(p, "POST /big HTTP/1.1\r\nContent-Length: 25\r\n\r\n12345"))
+  expect(rs.length).toBe(1)
+  expect(rs[0]!.path).toBe("/big")
+  expect(rs[0]!.body).toBe("")
+  const q = rs[0]!.stream!
+  expect(q.done).toBe(false)
+  expect(q.queued).toBe(5)
+  expect(requestsOf(feedText(p, "6789012345")).length).toBe(0)
+  expect(q.done).toBe(false)
+  feedText(p, "6789012345")
+  expect(q.done).toBe(true)
+  expect(q.queued).toBe(25)
+  expect(decodeUtf8(q.drain())).toBe("1234567890123456789012345")
+  // not over the threshold: delivered whole as before
+  const small = requestsOf(feedText(new Http1Parser(1000, 10), "POST /s HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"))
+  expect(small[0]!.body).toBe("hello")
+  expect(small[0]!.stream).toBe(undefined)
+})
+
+test("the next request on the connection follows a streamed body", () => {
+  const p = new Http1Parser(1000, 4)
+  const rs = requestsOf(feedText(p, "POST /a HTTP/1.1\r\nContent-Length: 8\r\n\r\n12345678GET /b HTTP/1.1\r\n\r\n"))
+  expect(rs.length).toBe(2)
+  expect(rs[0]!.path).toBe("/a")
+  expect(rs[0]!.stream!.done).toBe(true)
+  expect(decodeUtf8(rs[0]!.stream!.drain())).toBe("12345678")
+  expect(rs[1]!.path).toBe("/b")
+})
+
+test("a chunked body that outgrows the threshold is handed over, and the rest follows", () => {
+  const p = new Http1Parser(1000, 6)
+  const rs1 = requestsOf(feedText(p, "POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n"))
+  // the second chunk's data has just made the body 8 bytes; the third chunk's size line is what starts the stream
+  expect(rs1.length).toBe(0)
+  const rs2 = requestsOf(feedText(p, "3\r\nijk\r\n"))
+  expect(rs2.length).toBe(1)
+  const q = rs2[0]!.stream!
+  expect(q.done).toBe(false)
+  expect(requestsOf(feedText(p, "2;x=1\r\nlm\r\n0\r\nT: 1\r\n\r\nGET /d HTTP/1.1\r\n\r\n")).length).toBe(1)
+  expect(q.done).toBe(true)
+  expect(decodeUtf8(q.drain())).toBe("abcdefghijklm")
+})
+
+test("a streamed body that is malformed, too big or cut off fails its queue", () => {
+  const p = new Http1Parser(1000, 4)
+  const rs = requestsOf(feedText(p, "POST /e HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabcde\r\n3\r\nxyz\r\n"))
+  const q = rs.length > 0 ? rs[0]!.stream : undefined
+  const fs = failuresOf(feedText(p, "zz\r\n"))
+  expect(fs.length).toBe(1)
+  expect(fs[0]!.status).toBe(400)
+  expect(q === undefined ? "" : q.failed).toBe("malformed chunk size")
+  // the connection closing mid-body
+  const p2 = new Http1Parser(1000, 4)
+  const r2 = requestsOf(feedText(p2, "POST /f HTTP/1.1\r\nContent-Length: 20\r\n\r\nabcdef"))
+  p2.abort()
+  expect(r2[0]!.stream!.failed).toBe("the connection closed before the request body was complete")
+  // a length over the parser's maximum is refused before any stream starts
+  const big = failuresOf(feedText(new Http1Parser(100, 4), "POST /g HTTP/1.1\r\nContent-Length: 500\r\n\r\n"))
+  expect(big[0]!.status).toBe(413)
+})
+
+test("a discarded body drops what arrives and holds nothing", () => {
+  const p = new Http1Parser(1000000, 4)
+  const rs = requestsOf(feedText(p, "POST /h HTTP/1.1\r\nContent-Length: 12\r\n\r\nabcd"))
+  const q = rs[0]!.stream!
+  expect(q.queued).toBe(4)
+  q.discard()
+  expect(q.queued).toBe(0)
+  feedText(p, "efghijkl")
+  expect(q.queued).toBe(0)
+  expect(q.done).toBe(true)
 })

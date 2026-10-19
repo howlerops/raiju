@@ -1,0 +1,1518 @@
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index eb6c130..921e92c 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -50,6 +50,14 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "httpStreamWrite" => (vec![INT, STR, BOOL], VOID),
+         "httpStreamAbort" => (vec![INT], VOID),
+         "httpBuffered" => (vec![INT], INT),
++        "httpBodyOptions" => (vec![INT, INT, INT], VOID),
++        "httpBodyStream" => (vec![], INT),
++        "httpBodyRead" => (vec![INT], types.promise(INT, NEVER)),
++        "httpBodyTake" => {
++            let bytes = types.array(U8);
++            (vec![INT], bytes)
++        }
++        "httpBodyCancel" => (vec![INT], VOID),
+         "headerIndex" => (vec![STR, STR], INT),
+         "headerValue" => (vec![STR, INT], STR),
+         "headerRemove" => (vec![STR, STR], STR),
+@@ -60,6 +68,11 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+             let bytes = types.array(U8);
+             (vec![INT], bytes)
+         }
++        "fetchWrite" => {
++            let bytes = types.array(U8);
++            (vec![INT, bytes], types.promise(INT, NEVER))
++        }
++        "fetchEnd" => (vec![INT], VOID),
+         "fetchShare" => (vec![INT], VOID),
+         "fetchStatus" => (vec![INT], INT),
+         "fetchStatusText" | "fetchHeaders" | "fetchUrl" | "fetchBody" | "fetchErrorCode" | "fetchErrorMessage" => (vec![INT], STR),
+@@ -98,7 +111,7 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         }
+         "netWriteText" => (vec![INT, STR], INT),
+         "netEnd" | "netFlush" | "netClose" | "netStop" => (vec![INT], VOID),
+-        "netRef" | "netHalfOpen" | "netListenRef" => (vec![INT, BOOL], VOID),
++        "netRef" | "netHalfOpen" | "netListenRef" | "netPause" => (vec![INT, BOOL], VOID),
+         "netNoDelay" => (vec![INT, BOOL], BOOL),
+         "netAddress" => (vec![INT, INT], STR),
+         "netBuffered" | "netListenPort" => (vec![INT], INT),
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index f4eb955..7507eb2 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -643,7 +643,11 @@ export type RequestRedirect = "follow" | "manual" | "error"
+ export type RequestInit = {
+   method?: string
+   headers?: HeadersInit
+-  body?: BodyInit
++  // fetch(): a ReadableStream is sent as it is read (chunked on HTTP/1.1, DATA frames on HTTP/2), with
++  // backpressure. Its request can't be repeated, so a 307 or 308 answer is returned as is (not
++  // followed), and a request that fails on a reused connection is retried only while the first
++  // megabyte of the body is still held
++  body?: BodyInit | ReadableStream
+   // fetch(): what to do with a 3xx response (default "follow", up to 20 times)
+   redirect?: RequestRedirect
+   // fetch(): cancels the request (it rejects with the signal's reason)
+@@ -726,21 +730,94 @@ export class Request {
+   private fromWire: bool
+   private rawHeaders: string
+   private rawBody: string
++  // a body that is a stream: given to the constructor (to send with fetch), or the one the server
++  // is receiving (bodyId: see bodyStreamThreshold in ServeOptions; 0 when the body came whole)
++  private streamBody: ReadableStream | undefined
++  private bodyId: int
++  // the body is a stream that text(), json() and the others have yet to read
++  private pending: bool
+ 
+   constructor(input: string, init?: RequestInit) {
+     const m = init?.method
+     this.verb = m === undefined ? "GET" : normalizeMethod(m)
+     this.target = input
+     this.fromWire = false
++    this.streamBody = undefined
++    this.bodyId = 0
++    this.pending = false
+     const h = init?.headers
+     this.rawHeaders = h === undefined ? "" : new Headers(h).wire()
+     const b = init?.body
+-    this.rawBody = b === undefined ? "" : bodyText(b)
+-    if (b !== undefined && bodyType(b) !== "" && __native.headerIndex(this.rawHeaders, "content-type") < 0) {
+-      this.rawHeaders = __native.headerAppend(this.rawHeaders, "Content-Type", bodyType(b))
++    this.rawBody = ""
++    if (b instanceof ReadableStream) {
++      this.streamBody = b
++      this.pending = true
++    } else if (b !== undefined) {
++      this.rawBody = bodyText(b)
++      if (bodyType(b) !== "" && __native.headerIndex(this.rawHeaders, "content-type") < 0) {
++        this.rawHeaders = __native.headerAppend(this.rawHeaders, "Content-Type", bodyType(b))
++      }
+     }
+   }
+ 
++  // The body as a stream of byte chunks (undefined when there is none). On a server with
++  // bodyStreamThreshold, a big body is read from the connection as the stream is read.
++  get body(): ReadableStream | undefined {
++    const st = this.streamBody
++    if (st !== undefined) {
++      return st
++    }
++    if (this.bodyId !== 0) {
++      const made = ReadableStream.incoming(this.bodyId)
++      this.streamBody = made
++      return made
++    }
++    if (this.rawBody === "") {
++      return undefined
++    }
++    const made = ReadableStream.of(__native.stringToBytes(this.rawBody))
++    this.streamBody = made
++    return made
++  }
++
++  // Internal: a streamed body is read whole (what text(), json() and the others do with it). A
++  // body that is cut off reads as what arrived.
++  async collect(): Promise<void> {
++    const id = this.bodyId
++    const st = this.streamBody
++    this.bodyId = 0
++    this.pending = false
++    const parts: string[] = []
++    if (id !== 0) {
++      while (true) {
++        const n = await __native.httpBodyRead(id)
++        if (n <= 0) {
++          break
++        }
++        parts.push(__native.bytesToString(__native.httpBodyTake(id)))
++      }
++    } else if (st !== undefined) {
++      while (true) {
++        try {
++          const c = await st.pull()
++          const v = c.value
++          if (c.done || v === undefined) {
++            break
++          }
++          parts.push(__native.bytesToString(v))
++        } catch (e) {
++          break
++        }
++      }
++    }
++    this.rawBody = parts.join("")
++  }
++
++  // Internal: the stream of a body sent with fetch.
++  wireStream(): ReadableStream | undefined {
++    return this.pending && this.bodyId === 0 ? this.streamBody : undefined
++  }
++
+   get method(): string {
+     return this.verb
+   }
+@@ -757,41 +834,52 @@ export class Request {
+     return Headers.fromWire(this.rawHeaders)
+   }
+ 
+-  // As in Bun, the body is read through a promise (already settled: the body has arrived).
+-  text(): Promise<string> {
+-    return Promise.resolve(this.rawBody)
++  // As in Bun, the body is read through a promise (already settled: the body has arrived; a
++  // streamed one is read from the connection first).
++  async text(): Promise<string> {
++    if (this.pending) {
++      await this.collect()
++    }
++    return this.rawBody
+   }
+ 
+   // The body parsed as JSON, checked against the type the context expects.
+-  json<T>(): Promise<T, SyntaxError> {
+-    try {
+-      const value: T = JSON.parse(this.rawBody)
+-      return Promise.resolve(value)
+-    } catch (e) {
+-      return Promise.reject(e)
++  async json<T>(): Promise<T, SyntaxError> {
++    if (this.pending) {
++      await this.collect()
+     }
++    const value: T = try JSON.parse(this.rawBody)
++    return value
+   }
+ 
+   // The body's form fields (multipart/form-data or application/x-www-form-urlencoded).
+-  formData(): Promise<FormData, TypeError> {
+-    try {
+-      return Promise.resolve(FormData.parse(this.rawBody, __native.headerGet(this.rawHeaders, "content-type")))
+-    } catch (e) {
+-      return Promise.reject(e)
++  async formData(): Promise<FormData, TypeError> {
++    if (this.pending) {
++      await this.collect()
+     }
++    return try FormData.parse(this.rawBody, __native.headerGet(this.rawHeaders, "content-type"))
+   }
+ 
+   // The body as a Blob typed by its Content-Type.
+-  blob(): Promise<Blob> {
+-    return Promise.resolve(Blob.typed(this.rawBody, __native.headerGet(this.rawHeaders, "content-type")))
++  async blob(): Promise<Blob> {
++    if (this.pending) {
++      await this.collect()
++    }
++    return Blob.typed(this.rawBody, __native.headerGet(this.rawHeaders, "content-type"))
+   }
+ 
+-  bytes(): Promise<u8[]> {
+-    return Promise.resolve(__native.stringToBytes(this.rawBody))
++  async bytes(): Promise<u8[]> {
++    if (this.pending) {
++      await this.collect()
++    }
++    return __native.stringToBytes(this.rawBody)
+   }
+ 
+-  arrayBuffer(): Promise<u8[]> {
+-    return Promise.resolve(__native.stringToBytes(this.rawBody))
++  async arrayBuffer(): Promise<u8[]> {
++    if (this.pending) {
++      await this.collect()
++    }
++    return __native.stringToBytes(this.rawBody)
+   }
+ 
+   // Internal: the header block and body, as sent.
+@@ -810,6 +898,8 @@ export class Request {
+     this.fromWire = true
+     this.rawHeaders = headers
+     this.rawBody = body
++    this.bodyId = __native.httpBodyStream()
++    this.pending = this.bodyId !== 0
+   }
+ }
+ 
+@@ -1182,6 +1272,15 @@ export type ServeOptions<T = undefined> = {
+   development?: bool
+   // Tov: serve from this many processes.
+   workers?: int
++  // Tov: a request whose body is over this many bytes (its Content-Length, or what a chunked body
++  // has sent so far) reaches the handler as soon as its head is in; `req.body` is then a stream
++  // that reads the connection as it is read (a slow reader slows the sender; a body nobody reads
++  // is dropped once the request is answered). text(), json() and the others still work: they read
++  // it whole. Without it every body is received whole before the handler runs.
++  bodyStreamThreshold?: int
++  // Bun: the most a request body may have, in bytes (default 64 MiB). A declared length over it is
++  // answered 413 at once; a chunked body that grows past it fails its stream.
++  maxRequestBodySize?: int
+ }
+ 
+ // A route with `:name` segments or a trailing `*`.
+@@ -1412,6 +1511,7 @@ export function serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+     process.exit(1)
+   }
+   __native.httpWorkers(options.workers ?? 1)
++  __native.httpBodyOptions(id, options.bodyStreamThreshold ?? 0, options.maxRequestBodySize ?? 0)
+   server.bound(id, __native.httpPort(id))
+   return server
+ }
+@@ -1626,6 +1726,9 @@ export type ReadableStreamReadResult = { done: bool, value: u8[] | undefined }
+ // enqueue chunks to, `cancel` runs when the reader stops (for a response: the client left).
+ export type UnderlyingSource = {
+   start?: (controller: ReadableStreamDefaultController) => void
++  // called when a reader wants a chunk and none is queued: it enqueues one (or closes), and the
++  // reader waits for it. A body that is produced this way is read at the pace it is consumed.
++  pull?: (controller: ReadableStreamDefaultController) => Promise<void>
+   cancel?: () => void
+ }
+ 
+@@ -1663,6 +1766,9 @@ export class ReadableStream {
+   private waiter: ((n: int) => void) | undefined
+   private failure: string
+   private onCancel: (() => void) | undefined
++  private onPull: ((controller: ReadableStreamDefaultController) => Promise<void>) | undefined
++  // the request body a server is receiving (httpBodyStream's id; 0 otherwise)
++  private reqId: int
+   private queuedBytes: int
+   private handle: Promise<int> | undefined
+   private signal: AbortSignal | undefined
+@@ -1670,8 +1776,10 @@ export class ReadableStream {
+   private isLocked: bool
+   private started: bool
+   private finished: bool
++  private pulling: bool
+ 
+   constructor(source?: UnderlyingSource) {
++    this.pulling = false
+     this.id = 0
+     this.handle = undefined
+     this.signal = undefined
+@@ -1683,6 +1791,8 @@ export class ReadableStream {
+     this.waiter = undefined
+     this.failure = ""
+     this.onCancel = source?.cancel
++    this.onPull = source?.pull
++    this.reqId = 0
+     this.queuedBytes = 0
+     const start = source?.start
+     if (start !== undefined) {
+@@ -1733,6 +1843,13 @@ export class ReadableStream {
+     return s
+   }
+ 
++  // Internal: the body of the request a server is receiving (httpBodyStream's id).
++  static incoming(id: int): ReadableStream {
++    const s = new ReadableStream()
++    s.reqId = id
++    return s
++  }
++
+   // Internal: a stream of one chunk.
+   static of(bytes: u8[]): ReadableStream {
+     const s = new ReadableStream()
+@@ -1775,6 +1892,9 @@ export class ReadableStream {
+     if (this.id !== 0) {
+       __native.fetchAbort(this.id)
+     }
++    if (this.reqId !== 0 && !already) {
++      __native.httpBodyCancel(this.reqId)
++    }
+   }
+ 
+   // Internal: the reader's read().
+@@ -1794,11 +1914,37 @@ export class ReadableStream {
+           }
+           return { done: true, value: undefined }
+         }
++        const source = this.onPull
++        if (source !== undefined && !this.pulling) {
++          this.pulling = true
++          try {
++            await source(new ReadableStreamDefaultController(this))
++          } catch (e) {
++            this.pulling = false
++            this.finished = true
++            throw e
++          }
++          this.pulling = false
++          if (this.chunks.length > 0 || this.finished) {
++            continue
++          }
++        }
+         await new Promise<int>((resolve) => {
+           this.waiter = resolve
+         })
+       }
+     }
++    if (this.reqId !== 0 && !this.finished) {
++      const n = await __native.httpBodyRead(this.reqId)
++      if (n > 0) {
++        return { done: false, value: __native.httpBodyTake(this.reqId) }
++      }
++      this.finished = true
++      if (n < 0) {
++        throw new Error(n === -1 ? "request body too large" : n === -2 ? "request body cut off" : "request body no longer available")
++      }
++      return { done: true, value: undefined }
++    }
+     if (id === 0 || this.finished) {
+       const c = this.chunks.shift()
+       if (c === undefined) {
+@@ -1871,6 +2017,31 @@ export class FetchError extends TypeError {
+   }
+ }
+ 
++// Sends a request body that is a stream: each chunk is written once the one before it is on the
++// wire (so a slow server slows the source). It stops when the request is over, and a stream that
++// fails aborts the request.
++async function sendBody(id: int, st: ReadableStream) {
++  while (true) {
++    let c: ReadableStreamReadResult = { done: true, value: undefined }
++    try {
++      c = await st.pull()
++    } catch (e) {
++      __native.fetchAbort(id)
++      return
++    }
++    const v = c.value
++    if (c.done || v === undefined) {
++      break
++    }
++    const rc = await __native.fetchWrite(id, v)
++    if (rc < 0) {
++      await st.cancel()
++      return
++    }
++  }
++  __native.fetchEnd(id)
++}
++
+ // Bun's fetch(): an HTTP/1.1 request on a pooled keep-alive connection (or, with pool.http2, a stream on a shared HTTP/2 one), resolving once the
+ // response's head has arrived; the body follows (`res.text()`, `res.json()`, `res.body`...).
+ // Rejects with a FetchError when the request fails (an HTTP error status still resolves), or
+@@ -1880,6 +2051,7 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+   let url = ""
+   let headers = ""
+   let body = ""
++  let bodyStream: ReadableStream | undefined = undefined
+   if (typeof input === "string") {
+     url = input
+   } else if (input instanceof URL) {
+@@ -1889,6 +2061,7 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+     method = input.method
+     headers = input.wireHeaders()
+     body = input.wireBody()
++    bodyStream = input.wireStream()
+   }
+   let redirect = 0
+   let flags = 1
+@@ -1906,8 +2079,12 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+       headers = new Headers(h).wire()
+     }
+     const b = init.body
+-    if (b !== undefined) {
++    if (b instanceof ReadableStream) {
++      bodyStream = b
++      body = ""
++    } else if (b !== undefined) {
+       body = bodyText(b)
++      bodyStream = undefined
+       const t = bodyType(b)
+       if (t !== "" && __native.headerIndex(headers, "content-type") < 0) {
+         headers = __native.headerAppend(headers, "Content-Type", t)
+@@ -1929,7 +2106,7 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+     proxy = init.proxy ?? ""
+     signal = init.signal
+   }
+-  if ((method === "GET" || method === "HEAD") && body !== "") {
++  if ((method === "GET" || method === "HEAD") && (body !== "" || bodyStream !== undefined)) {
+     throw new FetchError("fetch() request with GET/HEAD method cannot have body.", "ERR_INVALID_ARG_VALUE")
+   }
+   if (signal !== undefined) {
+@@ -1948,10 +2125,13 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+       pingMs = (pool.http2PingInterval ?? 0) * 1000
+     }
+   }
+-  const id = __native.fetchStart(method, url, headers, body, redirect, flags, ca, unix, proxy, keepAliveMs, maxConns, http2, pingMs)
++  const id = __native.fetchStart(method, url, headers, body, redirect, bodyStream !== undefined ? flags + 4 : flags, ca, unix, proxy, keepAliveMs, maxConns, http2, pingMs)
+   if (signal !== undefined) {
+     signal.watch(id)
+   }
++  if (bodyStream !== undefined) {
++    sendBody(id, bodyStream)
++  }
+   // the head: the body follows (the signal can still abort it)
+   const result = await __native.fetchWait(id)
+   if (result !== 0) {
+@@ -2210,6 +2390,16 @@ export class Socket<T = undefined> {
+     return __native.netNoDelay(this.id, noDelay ?? true)
+   }
+ 
++  // Stops reading the socket until resume(): a sender that has more than the kernel's buffers
++  // hold has to wait (Tov; Node's net.Socket has the same pair).
++  pause(): void {
++    __native.netPause(this.id, true)
++  }
++
++  resume(): void {
++    __native.netPause(this.id, false)
++  }
++
+   ref(): void {
+     __native.netRef(this.id, true)
+   }
+diff --git a/runtime/h2.c b/runtime/h2.c
+index 9bb7556..5658f07 100644
+--- a/runtime/h2.c
++++ b/runtime/h2.c
+@@ -22,6 +22,7 @@ struct tv_h2_stream {
+     size_t lines_len, lines_cap;
+     uint8_t *body;               /* the request body, copied */
+     size_t body_len, body_off;
++    bool streaming;              /* the request body comes from the request's events->body */
+ };
+ 
+ struct tv_h2 {
+@@ -138,8 +139,17 @@ static int on_close(nghttp2_session *s, int32_t id, uint32_t code, void *ud) {
+ }
+ 
+ static nghttp2_ssize read_body(nghttp2_session *s, int32_t id, uint8_t *buf, size_t length, uint32_t *flags, nghttp2_data_source *src, void *ud) {
+-    (void)s; (void)id; (void)ud;
++    (void)s; (void)id;
+     tv_h2_stream *st = src->ptr;
++    if (st->streaming) {
++        tv_h2 *h = ud;
++        bool eof = false;
++        long got = st->user ? h->ev->body(st->user, buf, length, &eof) : 0;
++        if (!st->user) eof = true;   /* (the request let go of its stream) */
++        if (eof) *flags |= NGHTTP2_DATA_FLAG_EOF;
++        else if (got <= 0) return NGHTTP2_ERR_DEFERRED;
++        return (nghttp2_ssize)(got > 0 ? got : 0);
++    }
+     size_t n = st->body_len - st->body_off;
+     if (n > length) n = length;
+     memcpy(buf, st->body + st->body_off, n);
+@@ -200,7 +210,7 @@ static bool hop_by_hop(const char *n, size_t len) {
+ /* Starts a request from its HTTP/1.1 head ("GET /x HTTP/1.1\r\nName: v\r\n...\r\n\r\n") and body.
+  * The head's Host becomes :authority; hop-by-hop headers are dropped. The stream's handle, or NULL
+  * if it couldn't start. */
+-static void *h2_submit(tv_h2 *h, void *user, const char *head, size_t head_len, bool https, const uint8_t *body, size_t blen, int32_t *sid) {
++static void *h2_submit(tv_h2 *h, void *user, const char *head, size_t head_len, bool https, const uint8_t *body, size_t blen, bool stream_body, int32_t *sid) {
+     const char *end = head + head_len, *eol = memchr(head, '\n', head_len);
+     if (!eol) return NULL;
+     const char *sp1 = memchr(head, ' ', (size_t)(eol - head));
+@@ -256,6 +266,11 @@ static void *h2_submit(tv_h2 *h, void *user, const char *head, size_t head_len,
+         prd.source.ptr = st;
+         prd.read_callback = read_body;
+         pp = &prd;
++    } else if (stream_body) {
++        st->streaming = true;
++        prd.source.ptr = st;
++        prd.read_callback = read_body;
++        pp = &prd;
+     }
+     int32_t id = nghttp2_submit_request2(h->session, NULL, nv, 4 + n, pp, st);
+     free(nv);
+@@ -270,6 +285,12 @@ static void *h2_submit(tv_h2 *h, void *user, const char *head, size_t head_len,
+     return st;
+ }
+ 
++/* A streamed request body has bytes (or its end) again: the stream's data is read once more. */
++static void h2_resume(tv_h2 *h, void *stream) {
++    tv_h2_stream *st = stream;
++    nghttp2_session_resume_data(h->session, st->id);
++}
++
+ /* The request lets go of its stream: no more events for it, and the server is told to stop. */
+ static void h2_cancel(tv_h2 *h, void *stream) {
+     tv_h2_stream *st = stream;
+@@ -334,7 +355,7 @@ static bool h2_alive(tv_h2 *h) {
+ }
+ 
+ static const tv_h2_ops tv_h2_table = {
+-    h2_open, h2_destroy, h2_submit, h2_cancel, h2_feed, h2_pending, h2_sent, h2_consume, h2_ping, h2_capacity, h2_streams, h2_alive,
++    h2_open, h2_destroy, h2_submit, h2_resume, h2_cancel, h2_feed, h2_pending, h2_sent, h2_consume, h2_ping, h2_capacity, h2_streams, h2_alive,
+ };
+ 
+ void tv_h2_install(void) { tv_h2_impl = &tv_h2_table; }
+diff --git a/runtime/net.c b/runtime/net.c
+index 01d6fb8..c8100fe 100644
+--- a/runtime/net.c
++++ b/runtime/net.c
+@@ -33,6 +33,7 @@ typedef struct tv_ns {
+     bool ending;             /* end() asked: shut the write side once the buffer is out */
+     bool shut;               /* the write side is shut */
+     bool peer_ended;         /* the peer finished sending */
++    bool paused;             /* pause(): the socket is not read until resume() */
+     bool half_open;          /* allowHalfOpen: stay open after the peer ends */
+     bool dirty;              /* on the flush list */
+     bool want_tls;           /* a client that starts TLS once connected */
+@@ -152,6 +153,7 @@ static void tv_ns_emit(tv_ns *s, int kind, const void *data, size_t n, const cha
+ 
+ static void tv_ns_watch(tv_ns *s, bool read, bool write) {
+     if (s->fd < 0 || s->state == TV_NS_CLOSED) return;
++    if (s->paused) read = false;
+     if (s->registered && read == s->watch_read && write == s->watch_write) return;
+     s->watch_read = read;
+     s->watch_write = write;
+@@ -671,6 +673,27 @@ void tv_native_netClose(tv_int id) {
+     if (s) tv_ns_close(s, NULL);
+ }
+ 
++/* pause(): stops reading the socket (what the peer sends waits in the kernel's buffers, so a fast
++ * sender is slowed down); resume() reads on. Data a TLS session already holds is read at once. */
++void tv_native_netPause(tv_int id, bool on) {
++    tv_ns *s = tv_ns_get(id);
++    if (!s || s->state == TV_NS_CLOSED || s->paused == on) return;
++    s->paused = on;
++    if (s->state != TV_NS_OPEN) return;
++    if (on) {
++        tv_ns_watch(s, false, s->watch_write);
++        return;
++    }
++    if (s->peer_ended) return;
++    tv_ns_watch(s, true, s->watch_write);
++    if (s->tls && tv_tls_impl->pending(s->tls)) {
++        s->busy++;
++        tv_ns_read(s);
++        s->busy--;
++        tv_ns_settle(s);
++    }
++}
++
+ void tv_native_netRef(tv_int id, bool ref) {
+     tv_ns *s = tv_ns_get(id);
+     if (!s || s->state == TV_NS_CLOSED || s->refd == ref) return;
+diff --git a/runtime/tov.c b/runtime/tov.c
+index e27ded2..0cf9fee 100644
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -3908,6 +3908,7 @@ typedef struct tv_http_conn {
+     /* Requests answered later (async handlers), in request order; see tv_http_req. */
+     struct tv_http_req *pend_head, *pend_tail;
+     int npending;
++    struct tv_http_bs *rx;   /* the request body being received as a stream (see tv_http_bs) */
+ } tv_http_conn;
+ 
+ /* A request whose response isn't written yet: its handler returned a promise (it has an id for
+@@ -3921,6 +3922,7 @@ typedef struct tv_http_req {
+     bool streaming;       /* raw output so far goes out as soon as it's this request's turn */
+     bool gone;            /* its client has gone (told tv_http_on_gone) */
+     tv_sb out;            /* the response, once ready */
++    struct tv_http_bs *bs;   /* its body, when that was streamed */
+ } tv_http_req;
+ 
+ /* Deferred requests whose clients went away (the connection closed or reset, or the client ended
+@@ -3961,6 +3963,8 @@ typedef struct tv_http_server {
+     tv_int port;
+     tv_fn handler;
+     bool node_errors;    /* malformed requests are answered as Node.js's http answers them */
++    int64_t stream_threshold;   /* bodies over this many bytes reach the handler as a stream (0: never) */
++    int64_t max_body;           /* the most a request body may have (0: TV_HTTP_MAX_BODY) */
+ } tv_http_server;
+ 
+ #define TV_HTTP_MAX_SERVERS 64
+@@ -4097,6 +4101,8 @@ static void tv_http_mark_dirty(tv_http_conn *c) {
+     tv_http_dirty = c;
+ }
+ 
++static void tv_http_req_free(tv_http_req *r);
++
+ static void tv_http_enqueue(tv_http_conn *c, tv_http_req *r) {
+     r->next = NULL;
+     if (c->pend_tail) c->pend_tail->next = r; else c->pend_head = r;
+@@ -4119,8 +4125,7 @@ static void tv_http_drain(tv_http_conn *c) {
+         c->pend_head = r->next;
+         if (!c->pend_head) c->pend_tail = NULL;
+         c->npending--;
+-        tv_sb_free(&r->out);
+-        tv_async_free(r, sizeof *r);
++        tv_http_req_free(r);   /* (answered: a body nobody read is dropped) */
+     }
+ }
+ 
+@@ -4180,7 +4185,7 @@ void tv_native_httpRespondTo(tv_int id, tv_int status, tv_str headers, tv_str bo
+     tv_http_deferred[id] = (tv_http_req *)(intptr_t)tv_http_deferred_free;
+     tv_http_deferred_free = id;
+     r->id = 0;
+-    if (!r->c) { tv_async_free(r, sizeof *r); return; }   /* the client went away */
++    if (!r->c) { tv_http_req_free(r); return; }   /* the client went away */
+     tv_http_refresh_date();
+     tv_http_conn *c = r->c;
+     /* next in line: straight into the connection's output; otherwise it waits its turn */
+@@ -4204,10 +4209,7 @@ void tv_native_httpWriteRaw(tv_int id, const char *p, size_t n, int end) {
+         r->id = 0;
+     }
+     if (!r->c) {   /* the client went away */
+-        if (end) {
+-            tv_sb_free(&r->out);
+-            tv_async_free(r, sizeof *r);
+-        }
++        if (end) tv_http_req_free(r);
+         return;
+     }
+     tv_http_conn *c = r->c;
+@@ -4310,8 +4312,7 @@ int tv_native_httpTakeover(tv_int id, tv_sb *rest) {
+     tv_http_deferred_free = id;
+     c->pend_head = c->pend_tail = NULL;
+     c->npending = 0;
+-    tv_sb_free(&r->out);
+-    tv_async_free(r, sizeof *r);
++    tv_http_req_free(r);
+     return c->fd;
+ }
+ 
+@@ -4395,8 +4396,276 @@ tv_str tv_native_requestUrl(tv_str headers, tv_str target) {
+ TV_STR_LIT(tv_lit_get, "GET");
+ TV_STR_LIT(tv_lit_post, "POST");
+ 
++
++/* ---- request bodies read as a stream (Bun.serve's bodyStreamThreshold) ----
++ *
++ * A request whose body is declared (or, chunked, has buffered) over the server's threshold reaches
++ * its handler as soon as the head is in. The body then arrives on the connection's `rx` stream:
++ * bytes land in buf, which the program takes with httpBodyRead/httpBodyTake; once buf holds
++ * TV_HTTP_BODY_HIGH bytes the socket is not read until it is taken (backpressure). A body nobody
++ * reads is dropped as it arrives (discard) once the request has been answered. */
++#define TV_HTTP_BODY_HIGH (512 * 1024)
++#define TV_HTTP_DRAIN_MAX ((int64_t)32 << 20)   /* a discarded body is read on at most this far */
++
++typedef struct tv_http_bs {
++    tv_int id;
++    tv_http_conn *c;           /* NULL once the connection is gone */
++    tv_http_req *req;          /* the request it belongs to (NULL: answered at once, or not queued yet) */
++    tv_sb buf;                 /* received, not yet taken */
++    int64_t left;              /* length: body bytes to come; chunked: bytes left of the current chunk */
++    int64_t total, limit, csize, drain;
++    size_t tbytes;
++    int cs, cdigits, ccr, tl;  /* chunked: 0 size line, 1 data, 2 CRLF after data, 3 trailers */
++    bool chunked, cext, tcr;
++    bool done, discard, paused;
++    int fail;                  /* 0, or what the reader is told: -1 over the limit, -2 malformed or closed */
++    tv_promise *waiter;
++} tv_http_bs;
++
++static tv_http_bs **tv_http_bs_table;
++static tv_int *tv_http_bs_free, tv_http_bs_cap, tv_http_bs_nfree;
++static uint32_t tv_http_bs_gen;
++static tv_http_bs *tv_http_cur_bs;   /* the stream of the request being handled */
++
++static tv_http_bs *tv_http_bs_get(tv_int id) {
++    tv_int slot = (id & 0xffffffff) - 1;
++    if (slot < 0 || slot >= tv_http_bs_cap) return NULL;
++    tv_http_bs *b = tv_http_bs_table[slot];
++    return b && b->id == id ? b : NULL;
++}
++
++static void tv_http_bs_free_now(tv_http_bs *b) {
++    if (b->c && b->c->rx == b) b->c->rx = NULL;
++    if (b->req) b->req->bs = NULL;
++    if (tv_http_cur_bs == b) tv_http_cur_bs = NULL;
++    tv_int slot = (b->id & 0xffffffff) - 1;
++    tv_http_bs_table[slot] = NULL;
++    tv_http_bs_free[tv_http_bs_nfree++] = slot;
++    if (b->waiter) tv_promise_release(b->waiter);
++    tv_sb_free(&b->buf);
++    tv_free(b);
++}
++
++static void tv_http_bs_resolve(tv_http_bs *b, tv_int v) {
++    tv_promise *p = b->waiter;
++    if (!p) return;
++    b->waiter = NULL;
++    tv_promise_resolve(p, &v);
++    tv_promise_release(p);
++}
++
++/* Tells a waiting reader what there is: bytes, the failure, or the end. */
++static void tv_http_bs_wake(tv_http_bs *b) {
++    if (!b->waiter) return;
++    if (b->buf.len) tv_http_bs_resolve(b, (tv_int)b->buf.len);
++    else if (b->fail) tv_http_bs_resolve(b, b->fail);
++    else if (b->done) tv_http_bs_resolve(b, 0);
++}
++
++/* The body is all in (code 0) or reception failed. */
++static void tv_http_bs_finish(tv_http_bs *b, int code) {
++    tv_http_conn *c = b->c;
++    if (code) b->fail = code; else b->done = true;
++    if (c && c->rx == b) c->rx = NULL;
++    if (code && c) c->close_after = true;   /* (the framing is lost) */
++    if (b->discard) { tv_http_bs_free_now(b); return; }
++    tv_http_bs_wake(b);
++}
++
++/* Nobody wants the rest: what is held goes, and what comes is dropped. */
++static void tv_http_bs_discard(tv_http_bs *b) {
++    b->discard = true;
++    b->drain = TV_HTTP_DRAIN_MAX;
++    tv_sb_free(&b->buf);
++    b->paused = false;
++    tv_http_bs_resolve(b, -2);
++    if (b->done || b->fail || !b->c) { tv_http_bs_free_now(b); return; }
++    if (b->c->rx != b) tv_http_bs_free_now(b);
++}
++
++/* The connection is gone: the reader is told, and a body nobody reads is freed. */
++static void tv_http_bs_detach(tv_http_bs *b) {
++    b->c = NULL;
++    if (!b->done && !b->fail) b->fail = -2;
++    if (b->discard) { tv_http_bs_free_now(b); return; }
++    tv_http_bs_wake(b);
++}
++
++static void tv_http_bs_put(tv_http_bs *b, const char *p, size_t n) {
++    if (!n) return;
++    if (b->discard) {
++        b->drain -= (int64_t)n;
++        if (b->drain < 0) b->fail = -2;   /* (tv_http_bs_feed ends it) */
++        return;
++    }
++    tv_sb_push(&b->buf, p, n);
++    if (b->buf.len >= TV_HTTP_BODY_HIGH) b->paused = true;
++    tv_http_bs_wake(b);
++}
++
++static int tv_http_hexval(int ch) { return ch >= '0' && ch <= '9' ? ch - '0' : (ch | 32) >= 'a' && (ch | 32) <= 'f' ? (ch | 32) - 'a' + 10 : -1; }
++
++/* Takes the body's bytes from p[0, n): the count used. The body may end inside them (c->rx is then
++ * NULL and the rest is the next request's). */
++static size_t tv_http_bs_feed(tv_http_bs *b, const char *p, size_t n) {
++    size_t used = 0;
++    if (!b->chunked) {
++        size_t take = (int64_t)n < b->left ? n : (size_t)b->left;
++        tv_http_bs_put(b, p, take);
++        b->left -= (int64_t)take;
++        if (b->discard && b->fail) { tv_http_bs_finish(b, b->fail); return take; }
++        if (b->left == 0) tv_http_bs_finish(b, 0);
++        return take;
++    }
++    while (used < n) {
++        int ch = (unsigned char)p[used];
++        if (b->cs == 1) {
++            size_t take = (int64_t)(n - used) < b->left ? n - used : (size_t)b->left;
++            b->total += (int64_t)take;
++            if (b->total > b->limit) { tv_http_bs_finish(b, -1); return used; }
++            tv_http_bs_put(b, p + used, take);
++            used += take;
++            b->left -= (int64_t)take;
++            if (b->discard && b->fail) { tv_http_bs_finish(b, b->fail); return used; }
++            if (b->left == 0) { b->cs = 2; b->ccr = 0; }
++            continue;
++        }
++        used++;
++        if (b->cs == 0) {
++            if (ch == '\n') {
++                if (b->cdigits == 0) { tv_http_bs_finish(b, -2); return used; }
++                if (b->csize == 0) { b->cs = 3; b->tl = 0; b->tcr = false; b->tbytes = 0; }
++                else { b->left = b->csize; b->cs = 1; }
++                b->csize = 0;
++                b->cdigits = 0;
++                b->cext = false;
++            } else if (b->cext || ch == '\r') {
++            } else if (ch == ';') {
++                b->cext = true;
++            } else if ((ch == ' ' || ch == '\t') && b->cdigits) {
++            } else {
++                int v = tv_http_hexval(ch);
++                if (v < 0) { tv_http_bs_finish(b, -2); return used; }
++                b->csize = b->csize * 16 + v;
++                b->cdigits++;
++                if (b->csize > b->limit || b->cdigits > 16) { tv_http_bs_finish(b, -1); return used; }
++            }
++        } else if (b->cs == 2) {
++            if (b->ccr == 0) {
++                if (ch != '\r') { tv_http_bs_finish(b, -2); return used; }
++                b->ccr = 1;
++            } else {
++                if (ch != '\n') { tv_http_bs_finish(b, -2); return used; }
++                b->cs = 0;
++            }
++        } else {
++            if (++b->tbytes > 65536) { tv_http_bs_finish(b, -2); return used; }
++            if (ch == '\n') {
++                if (b->tl == 0 || (b->tl == 1 && b->tcr)) { tv_http_bs_finish(b, 0); return used; }
++                b->tl = 0;
++                b->tcr = false;
++            } else {
++                b->tl++;
++                b->tcr = ch == '\r';
++            }
++        }
++    }
++    return used;
++}
++
++/* Makes the stream for the request whose head has just been read. */
++static tv_http_bs *tv_http_bs_open(tv_http_conn *c, bool chunked, int64_t length, int64_t limit) {
++    if (tv_http_bs_nfree == 0) {
++        tv_int cap = tv_http_bs_cap ? tv_http_bs_cap * 2 : 16;
++        tv_http_bs_table = tv_realloc(tv_http_bs_table, (size_t)cap * sizeof *tv_http_bs_table);
++        tv_http_bs_free = tv_realloc(tv_http_bs_free, (size_t)cap * sizeof *tv_http_bs_free);
++        for (tv_int i = cap - 1; i >= tv_http_bs_cap; i--) { tv_http_bs_table[i] = NULL; tv_http_bs_free[tv_http_bs_nfree++] = i; }
++        tv_http_bs_cap = cap;
++    }
++    tv_int slot = tv_http_bs_free[--tv_http_bs_nfree];
++    tv_http_bs *b = tv_alloc(sizeof *b);
++    memset(b, 0, sizeof *b);
++    b->id = (tv_int)(((uint64_t)++tv_http_bs_gen << 32) | (uint64_t)(slot + 1));
++    b->c = c;
++    b->chunked = chunked;
++    b->left = length;
++    b->limit = limit;
++    tv_http_bs_table[slot] = b;
++    c->rx = b;
++    return b;
++}
++
++static void tv_http_req_free(tv_http_req *r) {
++    if (r->bs) { tv_http_bs *b = r->bs; r->bs = NULL; b->req = NULL; tv_http_bs_discard(b); }
++    tv_sb_free(&r->out);
++    tv_async_free(r, sizeof *r);
++}
++
++/* Per-server limits: bodies over `stream` bytes are streamed (0: all are buffered); `max` is the
++ * most a request body may have (0: 64 MiB). */
++void tv_native_httpBodyOptions(tv_int id, tv_int stream, tv_int max) {
++    if (id < 0 || id >= tv_http_nservers) return;
++    tv_http_servers[id].stream_threshold = stream > 0 ? stream : 0;
++    tv_http_servers[id].max_body = max > 0 ? max : 0;
++}
++
++/* The stream of the request being handled (0: its body came whole). */
++tv_int tv_native_httpBodyStream(void) { return tv_http_cur_bs ? tv_http_cur_bs->id : 0; }
++
++/* Bytes to take (> 0), the end (0), or a failure (-1 over the limit, -2 the connection closed or
++ * the framing was bad, -3 no such stream, or the request was answered). */
++tv_promise *tv_native_httpBodyRead(tv_int id) {
++    tv_promise *p = tv_promise_new(&tv_type_int);
++    tv_http_bs *b = tv_http_bs_get(id);
++    tv_int now = -3;
++    if (b && !b->discard) {
++        if (b->buf.len) now = (tv_int)b->buf.len;
++        else if (b->fail) now = b->fail;
++        else if (b->done) now = 0;
++        else {
++            if (b->waiter) tv_http_bs_resolve(b, -3);
++            tv_promise_retain(p);
++            b->waiter = p;
++            return p;
++        }
++        if (!b->buf.len) {   /* the reader has the end: nothing is left to hold */
++            b->discard = true;
++            if (b->done || b->fail || !b->c) tv_http_bs_free_now(b);
++        }
++    }
++    tv_promise_resolve(p, &now);
++    return p;
++}
++
++/* What has arrived and was not taken. */
++tv_arr tv_native_httpBodyTake(tv_int id) {
++    tv_http_bs *b = tv_http_bs_get(id);
++    if (!b || !b->buf.len) return TV_EMPTY_ARR;
++    tv_arr a = tv_arr_with_capacity(&tv_type_u8, (tv_int)b->buf.len);
++    memcpy(tv_arr_data(a), b->buf.data, b->buf.len);
++    a.len = (tv_int)b->buf.len;
++    b->buf.len = 0;
++    if (b->buf.cap > ((size_t)1 << 20)) tv_sb_free(&b->buf);
++    if (b->paused) {
++        b->paused = false;
++        if (b->c) tv_http_mark_dirty(b->c);   /* reading resumes */
++    }
++    return a;
++}
++
++/* The reader stops: the rest of the body is dropped as it arrives. */
++void tv_native_httpBodyCancel(tv_int id) {
++    tv_http_bs *b = tv_http_bs_get(id);
++    if (b && !b->discard) {
++        tv_http_bs_discard(b);
++        if (b->c) tv_http_mark_dirty(b->c);
++    }
++}
++
+ #define TV_HTTP_MAX_HEAD (64 * 1024)
+ #define TV_HTTP_MAX_BODY (64 * 1024 * 1024)
++/* a server's own limit on a request body */
++static inline int64_t tv_http_maxbody(const tv_http_conn *c) { return c->srv->max_body ? c->srv->max_body : TV_HTTP_MAX_BODY; }
+ #define TV_HTTP_OUT_HIGH (1024 * 1024)   /* stop handling pipelined requests until flushed */
+ 
+ /* A canned error response; the connection closes after it is written. */
+@@ -4417,7 +4686,7 @@ static bool tv_http_token_eq(const char *v, const char *end, const char *word) {
+ 
+ /* Decodes a chunked body starting at `p`; returns the bytes consumed (through the trailers),
+  * 0 if incomplete, or -1 if malformed / too large. */
+-static long long tv_http_dechunk(const char *p, const char *end, tv_sb *out) {
++static long long tv_http_dechunk(const char *p, const char *end, tv_sb *out, int64_t limit) {
+     const char *s = p;
+     for (;;) {
+         const char *nl = memchr(s, '\n', (size_t)(end - s));
+@@ -4429,7 +4698,7 @@ static long long tv_http_dechunk(const char *p, const char *end, tv_sb *out) {
+             int v = *d >= '0' && *d <= '9' ? *d - '0' : (*d | 32) >= 'a' && (*d | 32) <= 'f' ? (*d | 32) - 'a' + 10 : -1;
+             if (v < 0) break;
+             size = size * 16 + (uint64_t)v;
+-            if (size > TV_HTTP_MAX_BODY) return -1;
++            if ((int64_t)size > limit) return -1;
+         }
+         if (!digits || (*d != '\r' && *d != ';')) return -1;
+         s = nl + 1;
+@@ -4444,7 +4713,7 @@ static long long tv_http_dechunk(const char *p, const char *end, tv_sb *out) {
+             }
+         }
+         if ((uint64_t)(end - s) < size + 2) return 0;
+-        if (out->len + size > TV_HTTP_MAX_BODY) return -1;
++        if ((int64_t)(out->len + size) > limit) return -1;
+         tv_sb_push(out, s, (size_t)size);
+         s += size;
+         if (s[0] != '\r' || s[1] != '\n') return -1;
+@@ -4458,7 +4727,12 @@ static bool tv_http_process(tv_http_conn *c) {
+     tv_fn h = c->srv->handler;
+     size_t pos = 0;
+     c->stalled = false;
+-    while (pos < c->in_len && !c->close_after && c->npending < TV_HTTP_MAX_PENDING) {
++    while (pos < c->in_len && (c->rx || !c->close_after) && (c->rx || c->npending < TV_HTTP_MAX_PENDING)) {
++        /* the body of a streamed request goes to its stream */
++        if (c->rx) {
++            pos += tv_http_bs_feed(c->rx, c->in + pos, c->in_len - pos);
++            continue;
++        }
+         if (c->out_len >= TV_HTTP_OUT_HIGH) { c->stalled = true; break; }
+         char *start = c->in + pos;
+         size_t avail = c->in_len - pos;
+@@ -4484,6 +4758,7 @@ static bool tv_http_process(tv_http_conn *c) {
+             break;
+         }
+         bool http10 = sp2[8] == '0';
++        const int64_t maxb = tv_http_maxbody(c), thr = c->srv->stream_threshold;
+         char *headers = line_end + 1;
+         char *headers_end = hdr_end - (hdr_end[-2] == '\r' ? 2 : 1);
+         long long clen = -1;
+@@ -4499,7 +4774,7 @@ static bool tv_http_process(tv_http_conn *c) {
+                 if (v == e) bad = true;
+                 for (; v < e; v++) {
+                     if (*v < '0' || *v > '9') { bad = true; break; }
+-                    if (n <= TV_HTTP_MAX_BODY) n = n * 10 + (*v - '0'); /* saturates: over the cap → 413 */
++                    if (n <= maxb) n = n * 10 + (*v - '0'); /* saturates: over the cap → 413 */
+                 }
+                 if (clen >= 0 && clen != n) bad = true;
+                 clen = n;
+@@ -4515,13 +4790,20 @@ static bool tv_http_process(tv_http_conn *c) {
+             s = nl + 1;
+         }
+         if (bad || (chunked && clen >= 0)) { tv_http_fail(c, "400 Bad Request"); break; }
+-        if (clen > TV_HTTP_MAX_BODY) { tv_http_fail(c, "413 Payload Too Large"); break; }
++        if (clen > maxb) { tv_http_fail(c, "413 Payload Too Large"); break; }
+         char *in_end = c->in + c->in_len;
+         size_t consumed;
+         tv_str body;
+-        if (chunked) {
++        tv_http_bs *stream = NULL;
++        if (chunked ? thr > 0 && (int64_t)(in_end - hdr_end) > thr : thr > 0 && clen > thr) {
++            /* a big body: the handler runs now and reads the body as it arrives */
++            if (expect && !c->continued && (chunked || (int64_t)(in_end - hdr_end) < clen)) { tv_http_out(c, "HTTP/1.1 100 Continue\r\n\r\n", 25); c->continued = true; }
++            stream = tv_http_bs_open(c, chunked, chunked ? 0 : clen, maxb);
++            consumed = (size_t)(hdr_end - start) + tv_http_bs_feed(stream, hdr_end, (size_t)(in_end - hdr_end));
++            body = TV_EMPTY_STR;
++        } else if (chunked) {
+             tv_sb sb = {0};
+-            long long n = tv_http_dechunk(hdr_end, in_end, &sb);
++            long long n = tv_http_dechunk(hdr_end, in_end, &sb, maxb);
+             if (n < 0) { tv_sb_free(&sb); tv_http_fail(c, "400 Bad Request"); break; }
+             if (n == 0) {
+                 tv_sb_free(&sb);
+@@ -4549,8 +4831,16 @@ static bool tv_http_process(tv_http_conn *c) {
+         tv_http_v10 = http10;
+         tv_http_rest_off = pos + consumed;
+         tv_http_head = mlen == 4 && memcmp(start, "HEAD", 4) == 0;
++        tv_http_req *tail = c->pend_tail;
++        tv_http_cur_bs = stream;
+         ((void (*)(void *, tv_str, tv_str, tv_str, tv_str))h.fn)(h.env, method, target, hdrs, body);
++        tv_http_cur_bs = NULL;
+         if (tv_http_cur) tv_native_httpRespond(500, TV_EMPTY_STR, TV_EMPTY_STR, false); /* no response */
++        if (stream) {
++            /* the request that was queued for this one owns its body; one answered at once has no use for it */
++            if (c->pend_tail && c->pend_tail != tail) { c->pend_tail->bs = stream; stream->req = c->pend_tail; }
++            else tv_http_bs_discard(stream);
++        }
+         tv_run_microtasks();   /* each request is a macrotask, as in JavaScript */
+         tv_str_release(method);
+         tv_str_release(target);
+@@ -4596,14 +4886,15 @@ static void tv_http_release(tv_http_conn *c, bool close_fd) {
+             if (*pp == c) { *pp = c->dirty_next; break; }
+     }
+     /* waiting requests outlive the connection until they're answered (then dropped) */
++    if (c->rx) tv_http_bs_detach(c->rx);
+     for (tv_http_req *r = c->pend_head, *next; r; r = next) {
+         next = r->next;
+         if (r->id) {
+             tv_http_note_gone(r);
+             r->c = NULL;
++            if (r->bs) tv_http_bs_detach(r->bs);
+         } else {
+-            tv_sb_free(&r->out);
+-            tv_async_free(r, sizeof *r);
++            tv_http_req_free(r);
+         }
+     }
+     if (c->prev) c->prev->next = c->next; else tv_http_conns = c->next;
+@@ -4773,9 +5064,17 @@ static bool tv_http_service(tv_http_conn *c, bool readable, bool broken) {
+             ssize_t r = read(c->fd, c->in + c->in_len, room);
+             /* Level-triggered: a short read means the socket is drained, so skip the read that
+              * would only return EAGAIN (one syscall per request saved). */
+-            if (r > 0) { c->in_len += (size_t)r; if ((size_t)r == room && c->in_len < TV_HTTP_MAX_BODY + TV_HTTP_MAX_HEAD) continue; break; }
++            if (r > 0) {
++                c->in_len += (size_t)r;
++                /* (a streamed body is read a piece at a time, so the program can keep up; a big one is
++                 * recognised from its head, so not much more than the threshold is read before that) */
++                int64_t cap = c->srv->stream_threshold > 0 ? c->srv->stream_threshold + 2 * TV_HTTP_MAX_HEAD : tv_http_maxbody(c) + TV_HTTP_MAX_HEAD;
++                if (!c->rx && (size_t)r == room && (int64_t)c->in_len < cap) continue;
++                break;
++            }
+             if (r == 0) {
+                 c->eof = true;
++                if (c->rx) tv_http_bs_finish(c->rx, -2);   /* the body was cut short */
+                 /* (as Node.js's http and Bun do: a client that ends its side has gone) */
+                 for (tv_http_req *q = c->pend_head; q; q = q->next) tv_http_note_gone(q);
+                 break;
+@@ -4788,7 +5087,7 @@ static bool tv_http_service(tv_http_conn *c, bool readable, bool broken) {
+     }
+     /* handle, write, and handle again while flushing unblocks pipelined requests */
+     while (ok) {
+-        if (c->in_len && !c->close_after && c->npending < TV_HTTP_MAX_PENDING) ok = tv_http_process(c);
++        if (c->in_len && (c->rx || (!c->close_after && c->npending < TV_HTTP_MAX_PENDING))) ok = tv_http_process(c);
+         if (c->taken) {
+             tv_http_detach(c);
+             tv_http_release(c, false);
+@@ -4799,7 +5098,7 @@ static bool tv_http_service(tv_http_conn *c, bool readable, bool broken) {
+     }
+     /* a stopped server finishes the requests in hand, then closes its connections */
+     if (c->srv->fd < 0 && c->in_len == 0) c->close_after = true;
+-    if (ok && c->out_len == 0 && c->npending == 0 && (c->close_after || c->eof)) ok = false;
++    if (ok && c->out_len == 0 && c->npending == 0 && (c->close_after || c->eof) && !(c->rx && !c->rx->discard)) ok = false;
+     if (!ok) {
+         tv_http_detach(c);
+         tv_http_close(c);
+@@ -4809,7 +5108,7 @@ static bool tv_http_service(tv_http_conn *c, bool readable, bool broken) {
+     /* interest: write while output is pending; read unless output is backed up, or too many
+      * requests are waiting for their responses */
+     bool want_write = c->out_len > 0;
+-    bool want_read = !(c->stalled || c->eof || (c->close_after && c->out_len) || c->npending >= TV_HTTP_MAX_PENDING);
++    bool want_read = !(c->stalled || c->eof || (c->close_after && c->out_len && !c->rx) || (c->npending >= TV_HTTP_MAX_PENDING && !c->rx) || (c->rx && c->rx->paused));
+ #ifdef TV_KQUEUE
+     struct kevent mods[2];
+     int nm = 0;
+@@ -5756,7 +6055,10 @@ typedef struct tv_origin {
+ 
+ enum { TV_FR_HEAD, TV_FR_FIXED, TV_FR_CHUNK_SIZE, TV_FR_CHUNK_DATA, TV_FR_CHUNK_END, TV_FR_TRAILERS, TV_FR_UNTIL_CLOSE, TV_FR_DONE };
+ enum { TV_FETCH_FOLLOW, TV_FETCH_MANUAL, TV_FETCH_ERROR };
+-enum { TV_FETCH_DECOMPRESS = 1, TV_FETCH_INSECURE = 2 };
++enum { TV_FETCH_DECOMPRESS = 1, TV_FETCH_INSECURE = 2, TV_FETCH_STREAM_BODY = 4 };
++/* A streamed request body keeps what it has sent this long, so a request that fails on a pooled
++ * connection the server had closed can be sent again (past this, it can't). */
++#define TV_FETCH_REPLAY_MAX ((size_t)1 << 20)
+ 
+ /* Set by tv_tls_install() in programs linked with TLS (runtime/tls.c, runtime/codecs.c). */
+ const tv_tls_ops *tv_tls_impl;
+@@ -5795,6 +6097,16 @@ typedef struct tv_fr {
+     tv_sb head;                /* the serialized request head */
+     bool merged;               /* the body was appended to head (one TLS record for both) */
+     size_t sent;               /* bytes of head + body written */
++    /* A streamed request body (RequestInit.body is a ReadableStream): fetchWrite adds to sbuf (chunk
++     * framed unless a Content-Length was given), which is sent after the head; soff is how much of
++     * it is on the wire (HTTP/1.1) or handed to the HTTP/2 stream. */
++    bool body_stream, body_chunked, body_end;
++    bool body_dead;            /* writing the body failed (the server may have answered and closed): only its answer is read */
++    bool replay;               /* sbuf still holds all of the body so far: a retry can send it again */
++    int sfmt;                  /* sbuf's form: 0 raw (the protocol isn't known yet), 1 HTTP/1.1 (chunk framed), 2 HTTP/2 (raw) */
++    tv_sb sbuf;
++    size_t soff;
++    tv_promise *wr_p;          /* fetchWrite: sbuf is all sent (0), or the request is over (< 0) */
+     tv_fc *c;
+     bool retried;
+     /* pool options, and where the request waits or runs (see tv_origin) */
+@@ -5993,6 +6305,7 @@ static void tv_fr_settle(tv_fr *r, int result) {
+     }
+     tv_fr_resolve(&r->body_p, result);
+     tv_fr_resolve(&r->read_p, result == 0 && r->rbody.len ? (tv_int)r->rbody.len : result);
++    tv_fr_resolve(&r->wr_p, -1);   /* a streamed body's writer: the request is over */
+ }
+ 
+ /* The final response's head is in: fetch() resolves (the body follows). */
+@@ -6231,7 +6544,11 @@ static bool tv_fr_prepare(tv_fr *r) {
+     const char *m = r->method.p->data;
+     /* as Bun: every method but GET and HEAD says its length, even when it's 0 */
+     bool wants_length = r->body.p->len > 0 || (strcmp(m, "GET") != 0 && strcmp(m, "HEAD") != 0);
+-    if (wants_length && !tv_hdr_has(r->headers, "content-length") && !tv_hdr_has(r->headers, "transfer-encoding")) {
++    if (r->body_stream) {
++        /* a streamed body is framed as chunks unless the caller gave its length */
++        r->body_chunked = !tv_hdr_has(r->headers, "content-length");
++        if (r->body_chunked && !tv_hdr_has(r->headers, "transfer-encoding")) tv_sb_push(h, "Transfer-Encoding: chunked\r\n", 28);
++    } else if (wants_length && !tv_hdr_has(r->headers, "content-length") && !tv_hdr_has(r->headers, "transfer-encoding")) {
+         char cl[48];
+         int n = snprintf(cl, sizeof cl, "Content-Length: %d\r\n", (int)r->body.p->len);
+         tv_sb_push(h, cl, (size_t)n);
+@@ -6255,29 +6572,47 @@ static bool tv_fr_prepare(tv_fr *r) {
+ 
+ /* Bytes of request still to write: the head, then the body (unless merged into the head). */
+ static size_t tv_fr_out_len(const tv_fr *r) { return r->head.len + (r->merged ? 0 : (size_t)r->body.p->len); }
++/* ... and whether a streamed body has bytes waiting too. */
++static bool tv_fr_unsent(const tv_fr *r) { return !r->body_dead && (r->sent < tv_fr_out_len(r) || r->soff < r->sbuf.len); }
++/* ... and whether a streamed body went out whole (a connection that did not carry all of it is not reused). */
++static bool tv_fr_body_whole(const tv_fr *r) { return !r->body_stream || (r->body_end && !r->body_dead && r->soff >= r->sbuf.len); }
++/* A request that failed on a pooled connection can go again unless a streamed body has outgrown
++ * its replay buffer. */
++static bool tv_fr_replayable(const tv_fr *r) { return !r->body_stream || r->replay; }
++
++/* A streamed body whose bytes are all on the wire: its writer may send more. */
++static void tv_fr_wrote(tv_fr *r) {
++    if (r->wr_p && r->soff >= r->sbuf.len) tv_fr_resolve(&r->wr_p, 0);
++}
+ 
+ static bool tv_fc_write(tv_fc *c) {
+     tv_fr *r = c->r;
+-    size_t hn = r->head.len, bn = r->merged ? 0 : (size_t)r->body.p->len;
++    size_t hn = r->head.len, bn = r->merged ? 0 : (size_t)r->body.p->len, hb = hn + bn;
+     if (c->tls) {
+-        while (r->sent < hn + bn) {
+-            const char *p = r->sent < hn ? r->head.data + r->sent : r->body.p->data + (r->sent - hn);
+-            size_t n = r->sent < hn ? hn - r->sent : bn - (r->sent - hn);
++        for (;;) {
++            const char *p;
++            size_t n;
++            if (r->sent < hn) { p = r->head.data + r->sent; n = hn - r->sent; }
++            else if (r->sent < hb) { p = r->body.p->data + (r->sent - hn); n = hb - r->sent; }
++            else if (r->soff < r->sbuf.len) { p = r->sbuf.data + r->soff; n = r->sbuf.len - r->soff; }
++            else break;
+             long w = tv_tls_impl->write(c->tls, p, n);
+-            if (w > 0) { r->sent += (size_t)w; continue; }
++            if (w > 0) { if (r->sent < hb) r->sent += (size_t)w; else r->soff += (size_t)w; continue; }
+             if (w == -1) { tv_fc_interest(c, true, false); return true; }
+             if (w == -2) { tv_fc_interest(c, true, true); return true; }
+             return false;
+         }
+         tv_fc_interest(c, true, false);
++        tv_fr_wrote(r);
+         return true;
+     }
+-    while (r->sent < hn + bn) {
+-        struct iovec iov[2];
++    while (r->sent < hb || r->soff < r->sbuf.len) {
++        struct iovec iov[3];
+         int n = 0;
+         if (r->sent < hn) iov[n++] = (struct iovec){ r->head.data + r->sent, hn - r->sent };
+         size_t bo = r->sent > hn ? r->sent - hn : 0;
+         if (bn > bo) iov[n++] = (struct iovec){ r->body.p->data + bo, bn - bo };
++        if (r->soff < r->sbuf.len) iov[n++] = (struct iovec){ r->sbuf.data + r->soff, r->sbuf.len - r->soff };
+         struct msghdr mh;
+         memset(&mh, 0, sizeof mh);
+         mh.msg_iov = iov;
+@@ -6287,12 +6622,19 @@ static bool tv_fc_write(tv_fc *c) {
+ #else
+         ssize_t w = sendmsg(c->fd, &mh, 0);
+ #endif
+-        if (w > 0) { r->sent += (size_t)w; continue; }
++        if (w > 0) {
++            size_t left = (size_t)w, head_body = hb > r->sent ? hb - r->sent : 0;
++            size_t take = left < head_body ? left : head_body;
++            r->sent += take;
++            r->soff += left - take;
++            continue;
++        }
+         if (w < 0 && errno == EINTR) continue;
+         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { tv_fc_interest(c, true, true); return true; }
+         return false;
+     }
+     tv_fc_interest(c, true, false);
++    tv_fr_wrote(r);
+     return true;
+ }
+ 
+@@ -6647,6 +6989,23 @@ static void tv_fr_send(tv_fr *r, tv_fc *c) {
+     r->c = c;
+     c->r = r;
+     r->sent = 0;
++    r->soff = 0;
++    r->body_dead = false;
++    if (r->body_stream && r->body_chunked && r->sfmt != 1) {
++        /* what was written before the protocol was known goes out as one chunk */
++        tv_sb f = {0};
++        if (r->sbuf.len) {
++            char hex[24];
++            int hl = snprintf(hex, sizeof hex, "%zx\r\n", r->sbuf.len);
++            tv_sb_push(&f, hex, (size_t)hl);
++            tv_sb_push(&f, r->sbuf.data, r->sbuf.len);
++            tv_sb_push(&f, "\r\n", 2);
++        }
++        if (r->body_end) tv_sb_push(&f, "0\r\n\r\n", 5);
++        tv_sb_free(&r->sbuf);
++        r->sbuf = f;
++    }
++    if (r->body_stream) r->sfmt = 1;
+     if (c->tls && !r->merged && r->body.p->len && r->body.p->len <= 8192) {
+         /* one TLS record (and one write) for a small request */
+         tv_sb_push(&r->head, r->body.p->data, (size_t)r->body.p->len);
+@@ -6656,7 +7015,7 @@ static void tv_fr_send(tv_fr *r, tv_fc *c) {
+     r->got_any = false;
+     if (!tv_fc_write(c)) {
+         /* a pooled connection the server closed: try once more on a new one */
+-        bool retry = c->reused && !r->retried;
++        bool retry = c->reused && !r->retried && tv_fr_replayable(r);
+         c->r = NULL;
+         r->c = NULL;
+         tv_fc_close(c);
+@@ -7148,7 +7507,7 @@ static void tv_fr_reset_response(tv_fr *r) {
+ /* The whole response is in: follow a redirect, or decode the body and settle. */
+ static void tv_fr_complete(tv_fr *r) {
+     int s = r->status;
+-    if (r->redirect_mode != TV_FETCH_MANUAL && tv_redirect_status(s) && r->location.len > 0) {
++    if (r->redirect_mode != TV_FETCH_MANUAL && tv_redirect_status(s) && r->location.len > 0 && !(r->body_stream && (s == 307 || s == 308))) {
+         if (r->redirect_mode == TV_FETCH_ERROR) {
+             tv_fr_fail(r, "UnexpectedRedirect", "UnexpectedRedirect fetching \"%s\". %s", r->url.p->data, TV_FETCH_VERBOSE);
+             return;
+@@ -7170,6 +7529,12 @@ static void tv_fr_complete(tv_fr *r) {
+             r->method = tv_str_from("GET", 3);
+             tv_str_release(r->body);
+             r->body = TV_EMPTY_STR;
++            if (r->body_stream) {   /* the stream is not sent to the new request: its writer stops */
++                r->body_stream = false;
++                tv_sb_free(&r->sbuf);
++                r->soff = 0;
++                tv_fr_resolve(&r->wr_p, -1);
++            }
+             static const char *const body_headers[] = {"content-type", "content-length", "content-encoding", "content-language", "content-location", "transfer-encoding"};
+             for (size_t i = 0; i < sizeof body_headers / sizeof *body_headers; i++) {
+                 tv_str name = tv_str_from(body_headers[i], strlen(body_headers[i]));
+@@ -7287,15 +7652,24 @@ static void tv_fc_ready(tv_io *h, bool readable, bool writable, bool broken) {
+         if (readable || writable || broken) tv_fc_handshake(c);
+         return;
+     }
+-    if (writable && r->sent < tv_fr_out_len(r)) {
++    if (writable && tv_fr_unsent(r)) {
+         if (!tv_fc_write(c)) {
+-            bool retry = c->reused && !r->retried && !r->got_any;
+-            c->r = NULL;
+-            r->c = NULL;
+-            tv_fc_close(c);
+-            if (retry) { r->retried = true; tv_fr_step(r); }
+-            else tv_fr_fail(r, "ECONNRESET", "The socket connection was closed unexpectedly. %s", TV_FETCH_VERBOSE);
+-            return;
++            if (r->body_stream && !r->body_dead) {
++                /* a server that answers before the body is in may close the connection: what it said is
++                 * still to be read (the body's writer is told the request is over, unless the request
++                 * is sent again) */
++                r->body_dead = true;
++                tv_fc_interest(c, true, false);
++                readable = true;
++            } else {
++                bool retry = c->reused && !r->retried && !r->got_any && tv_fr_replayable(r);
++                c->r = NULL;
++                r->c = NULL;
++                tv_fc_close(c);
++                if (retry) { r->retried = true; tv_fr_step(r); }
++                else tv_fr_fail(r, "ECONNRESET", "The socket connection was closed unexpectedly. %s", TV_FETCH_VERBOSE);
++                return;
++            }
+         }
+     }
+     if (!readable && !broken) return;
+@@ -7378,7 +7752,7 @@ static void tv_fc_ready(tv_io *h, bool readable, bool writable, bool broken) {
+     if (r->state == TV_FR_DONE) {
+         bool leftover = c->in_off < c->in_len;
+         r->c = NULL;
+-        tv_fc_release(c, r->keep && !leftover && !eof && !error);
++        tv_fc_release(c, r->keep && !leftover && !eof && !error && tv_fr_body_whole(r));
+         tv_fr_complete(r);
+         return;
+     }
+@@ -7390,7 +7764,7 @@ static void tv_fc_ready(tv_io *h, bool readable, bool writable, bool broken) {
+             tv_fr_complete(r);
+             return;
+         }
+-        bool retry = c->reused && !r->retried && !r->got_any;
++        bool retry = c->reused && !r->retried && !r->got_any && tv_fr_replayable(r);
+         c->r = NULL;
+         r->c = NULL;
+         tv_fc_close(c);
+@@ -7449,7 +7823,7 @@ static void tv_h2_on_closed(void *user, uint32_t err) {
+     tv_fr_h2_detach(r, false);
+     if (r->result != 1) return;
+     if (err != 0) {
+-        if (err == 7 && !r->got_any && !r->retried) { /* REFUSED_STREAM: nothing was processed */
++        if (err == 7 && !r->got_any && !r->retried && tv_fr_replayable(r)) { /* REFUSED_STREAM: nothing was processed */
+             r->retried = true;
+             tv_fr_reset_response(r);
+             tv_fr_step(r);
+@@ -7466,6 +7840,17 @@ static void tv_h2_on_closed(void *user, uint32_t err) {
+     tv_fr_complete(r);
+ }
+ 
++/* The next bytes of r's streamed request body, for its stream's DATA frames. */
++static long tv_h2_on_body(void *user, uint8_t *buf, size_t len, bool *eof) {
++    tv_fr *r = user;
++    size_t avail = r->sbuf.len - r->soff, n = avail < len ? avail : len;
++    if (n) memcpy(buf, r->sbuf.data + r->soff, n);
++    r->soff += n;
++    *eof = r->body_end && r->soff >= r->sbuf.len;
++    if (r->soff >= r->sbuf.len) tv_fr_wrote(r);
++    return (long)n;
++}
++
+ static void tv_h2_on_goaway(void *conn, int32_t last, uint32_t err) {
+     (void)last; (void)err;
+     ((tv_fc *)conn)->goaway = true;
+@@ -7519,7 +7904,7 @@ static void tv_fc_h2_down(tv_fc *c, bool eof) {
+         r->h2s = NULL;
+         r->h2_held = 0;
+         if (r->result != 1) continue;
+-        if (r->h2_reused && !r->got_any && !r->retried) {
++        if (r->h2_reused && !r->got_any && !r->retried && tv_fr_replayable(r)) {
+             r->retried = true;
+             tv_fr_reset_response(r);
+             tv_fr_step(r);
+@@ -7570,8 +7955,10 @@ static void tv_fr_h2_resume(tv_fr *r) {
+ static bool tv_fr_h2_start(tv_fr *r, tv_fc *c) {
+     size_t hl = r->head.len - (r->merged ? (size_t)r->body.p->len : 0);
+     int32_t sid = 0;
+-    void *st = tv_h2_impl->submit(c->h2, r, r->head.data, hl, r->https, (const uint8_t *)r->body.p->data, (size_t)r->body.p->len, &sid);
++    if (r->body_stream && r->body_chunked && r->sfmt == 1 && r->sbuf.len) return false;   /* (it was framed for HTTP/1.1) */
++    void *st = tv_h2_impl->submit(c->h2, r, r->head.data, hl, r->https, (const uint8_t *)r->body.p->data, (size_t)r->body.p->len, r->body_stream, &sid);
+     if (!st) return false;
++    if (r->body_stream) { r->sfmt = 2; r->soff = 0; }
+     r->h2c = c;
+     r->h2s = st;
+     r->h2_prev = NULL;
+@@ -7598,6 +7985,7 @@ static void tv_fc_become_h2(tv_fc *c) {
+         tv_fc_h2_ev.goaway = tv_h2_on_goaway;
+         tv_fc_h2_ev.ping_ack = tv_h2_on_ping_ack;
+         tv_fc_h2_ev.frame = tv_h2_on_frame;
++        tv_fc_h2_ev.body = tv_h2_on_body;
+     }
+     c->h2 = tv_h2_impl->open(c, &tv_fc_h2_ev);
+     c->r = NULL;
+@@ -7725,6 +8113,8 @@ tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str bo
+     r->redirect_mode = (int)redirect;
+     r->decompress = (flags & TV_FETCH_DECOMPRESS) != 0;
+     r->insecure = (flags & TV_FETCH_INSECURE) != 0;
++    r->body_stream = (flags & TV_FETCH_STREAM_BODY) != 0;
++    r->replay = r->body_stream;
+     tv_str_retain(ca);
+     r->ca = ca;
+     tv_str_retain(unix_path);
+@@ -7817,6 +8207,51 @@ tv_promise *tv_native_fetchRead(tv_int id) {
+     return tv_fr_promise(&r->read_p, r->result == 1, r->result);
+ }
+ 
++/* Streamed request bodies (RequestInit.body is a ReadableStream). fetchWrite hands over the next
++ * chunk: its promise settles with 0 once the chunk is on the wire (the writer sends the next only
++ * then, so at most one chunk waits here) or with < 0 when the request is over (the response came
++ * first, it failed or was aborted: the writer stops). fetchEnd says there is no more. */
++static void tv_fr_body_kick(tv_fr *r) {
++    tv_fc *c = r->c;
++    if (c && c->r == r && !c->dead && !c->h2 && !c->connecting && !c->handshaking && !c->tunneling) {
++        tv_fc_ready(&c->io, false, true, false);
++    } else if (r->h2c && r->h2s && !r->h2c->dead && r->h2c->h2) {
++        tv_h2_impl->resume(r->h2c->h2, r->h2s);
++        tv_fc_h2_flush(r->h2c);
++    }
++}
++
++tv_promise *tv_native_fetchWrite(tv_int id, tv_arr data) {
++    tv_fr *r = tv_fr_get(id);
++    if (!r || r->result != 1 || !r->body_stream || r->body_end) return tv_fr_promise(NULL, false, -1);
++    size_t n = (size_t)data.len;
++    if (n == 0) return tv_fr_promise(NULL, false, 0);
++    if (r->soff >= r->sbuf.len && (!r->replay || r->sbuf.len + n > TV_FETCH_REPLAY_MAX)) {
++        r->replay = false;   /* what was sent is dropped (a retry could not send it again) */
++        r->sbuf.len = 0;
++        r->soff = 0;
++    }
++    bool frame = r->body_chunked && r->sfmt == 1;
++    if (frame) {
++        char hex[24];
++        int hl = snprintf(hex, sizeof hex, "%zx\r\n", n);
++        tv_sb_push(&r->sbuf, hex, (size_t)hl);
++    }
++    tv_sb_push(&r->sbuf, (const char *)tv_arr_data(data), n);
++    if (frame) tv_sb_push(&r->sbuf, "\r\n", 2);
++    tv_promise *p = tv_fr_promise(&r->wr_p, true, 0);
++    tv_fr_body_kick(r);
++    return p;
++}
++
++void tv_native_fetchEnd(tv_int id) {
++    tv_fr *r = tv_fr_get(id);
++    if (!r || r->result != 1 || !r->body_stream || r->body_end) return;
++    r->body_end = true;
++    if (r->body_chunked && r->sfmt == 1) tv_sb_push(&r->sbuf, "0\r\n\r\n", 5);
++    tv_fr_body_kick(r);
++}
++
+ /* The body bytes that have arrived and haven't been taken (*len of them; NULL if none): read
+  * them, then tv_native_fetchTaken. */
+ const char *tv_native_fetchData(tv_int id, size_t *len) {
+@@ -7932,6 +8367,7 @@ void tv_native_fetchAbort(tv_int id) {
+                 if (*pp == r) { *pp = r->dns_next; goto unlinked; }
+ unlinked:
+     r->code = "AbortError";
++    if (r->body_stream && !r->message.len) tv_sb_push_cstr(&r->message, "The request body stream failed or was aborted");
+     tv_fr_settle(r, -2);
+     /* (nothing will read what arrived: its buffers go now, not when the request is freed) */
+     tv_sb_free(&r->rbody);
+@@ -7961,6 +8397,8 @@ void tv_native_fetchFree(tv_int id) {
+     tv_free(r->host);
+     tv_free(r->key);
+     tv_sb_free(&r->head);
++    tv_sb_free(&r->sbuf);
++    if (r->wr_p) tv_promise_release(r->wr_p);
+     tv_sb_free(&r->status_text);
+     tv_sb_free(&r->rheaders);
+     tv_sb_free(&r->rbody);
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 6e00324..9400ab8 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -743,6 +743,13 @@ int64_t tv_native_httpBuffered(tv_int id);
+ void tv_native_httpStreamStart(tv_int id, tv_int status, tv_str headers);
+ void tv_native_httpStreamAbort(tv_int id);
+ void tv_native_httpStreamWrite(tv_int id, tv_str data, bool last);
++void tv_native_netPause(tv_int id, bool on);   /* a socket is not read while paused (runtime/net.c) */
++/* request bodies as streams (Bun.serve's bodyStreamThreshold): see tv_http_bs in tov.c */
++void tv_native_httpBodyOptions(tv_int id, tv_int stream, tv_int max);
++tv_int tv_native_httpBodyStream(void);
++tv_promise *tv_native_httpBodyRead(tv_int id);
++tv_arr tv_native_httpBodyTake(tv_int id);
++void tv_native_httpBodyCancel(tv_int id);
+ int tv_native_httpTakeover(tv_int id, tv_sb *rest);
+ void tv_native_httpNodeErrors(tv_int id);   /* malformed requests answered in Node.js's form */
+ extern bool tv_http_v10;
+@@ -757,6 +764,8 @@ tv_promise *tv_native_fetchWait(tv_int id);    /* Promise<int>: 0 the head arriv
+ tv_promise *tv_native_fetchBodyWait(tv_int id);   /* ... 0 the whole body is in */
+ tv_promise *tv_native_fetchRead(tv_int id);    /* ... > 0 bytes to take, 0 the end */
+ tv_arr tv_native_fetchTake(tv_int id);
++tv_promise *tv_native_fetchWrite(tv_int id, tv_arr data);   /* a streamed request body's next chunk: 0 sent, < 0 the request is over */
++void tv_native_fetchEnd(tv_int id);                          /* ... and no more chunks */
+ void tv_native_fetchShare(tv_int id);
+ tv_promise *tv_native_fetchHandle(tv_int id);  /* a Response's hold on the request */
+ tv_int tv_native_fetchStatus(tv_int id);
+@@ -813,12 +822,16 @@ typedef struct tv_h2_events {
+     void (*settings)(void *conn);
+     void (*ping_ack)(void *conn);
+     void (*frame)(void *conn);                      /* any frame arrived */
++    /* a streamed request body: up to len bytes into buf (the count; 0 with *eof false: none for now,
++     * resume() when there are) */
++    long (*body)(void *user, uint8_t *buf, size_t len, bool *eof);
+ } tv_h2_events;
+ typedef struct tv_h2_ops {
+     tv_h2 *(*open)(void *conn, const tv_h2_events *ev);
+     void (*destroy)(tv_h2 *h);
+     /* a request from its HTTP/1.1 head and body; the stream's handle (NULL: it can't start) */
+-    void *(*submit)(tv_h2 *h, void *user, const char *head, size_t head_len, bool https, const uint8_t *body, size_t blen, int32_t *id);
++    void *(*submit)(tv_h2 *h, void *user, const char *head, size_t head_len, bool https, const uint8_t *body, size_t blen, bool stream_body, int32_t *id);
++    void (*resume)(tv_h2 *h, void *stream);        /* a streamed request body has bytes again */
+     void (*cancel)(tv_h2 *h, void *stream);        /* the request let go: no more events for it */
+     long (*feed)(tv_h2 *h, const uint8_t *in, size_t n);   /* < 0: the connection failed */
+     const uint8_t *(*pending)(tv_h2 *h, size_t *n);

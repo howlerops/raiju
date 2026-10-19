@@ -1,0 +1,993 @@
+// Bifrost's large_payload_optimization: a request body over request_threshold_bytes is not read whole.
+// The first prefetch_size_bytes are read to find the routing fields (scanPrefix), and the whole body then
+// goes to the provider as a stream (LargeBody.stream) while the request log keeps a truncated copy
+// (BodyTap). Bodies over max_payload_bytes are refused. The Tov patch 0008 gives fetch a stream body and
+// Bun.serve (and src/http1.tov) a request body that arrives as a stream.
+// Routes: the OpenAI-format JSON routes, the Responses route and the Anthropic Messages route (JSON bodies
+// with the model in the first bytes), and multipart uploads (the model among the form fields before the file).
+// An answer that is passed through is read for its usage as it flows (UsageTap), so budgets, rate limits and
+// the request log count what a streamed request used.
+import { Config } from "./config"
+import { decodeString, quote } from "./json"
+
+// The settings with Bifrost's defaults (config.schema.json): 10 MiB, 10 MiB, 64 KiB, 500 MiB, 1 MiB.
+export type LargeSettings = { requestThreshold: int, responseThreshold: int, prefetch: int, maxPayload: int, truncatedLog: int }
+
+export const DEFAULT_REQUEST_THRESHOLD = 10485760
+export const DEFAULT_RESPONSE_THRESHOLD = 10485760
+export const DEFAULT_PREFETCH = 65536
+export const DEFAULT_MAX_PAYLOAD = 524288000
+export const DEFAULT_TRUNCATED_LOG = 1048576
+
+function orDefault(v: int | undefined, d: int): int {
+  if (v === undefined || v < 0) return d
+  return v
+}
+
+// undefined while the feature is off (enabled false or absent, as in Bifrost).
+export function largeSettings(cfg: Config): LargeSettings | undefined {
+  const c = cfg.large_payload_optimization
+  if (c === undefined || c.enabled !== true) return undefined
+  return {
+    requestThreshold: orDefault(c.request_threshold_bytes, DEFAULT_REQUEST_THRESHOLD),
+    responseThreshold: orDefault(c.response_threshold_bytes, DEFAULT_RESPONSE_THRESHOLD),
+    prefetch: orDefault(c.prefetch_size_bytes, DEFAULT_PREFETCH),
+    maxPayload: orDefault(c.max_payload_bytes, DEFAULT_MAX_PAYLOAD),
+    truncatedLog: orDefault(c.truncated_log_bytes, DEFAULT_TRUNCATED_LOG),
+  }
+}
+
+// ---- reading the routing fields from the first bytes ----
+
+// What Bifrost keeps as LargePayloadMetadata: the model (and where its string literal is, for the rewrite to
+// the provider's model name), whether the body asks for a stream, generationConfig.responseModalities and
+// whether it has a speechConfig (Gemini), and thread.type (Anthropic). A field the prefix does not reach is absent.
+export type Prefix = {
+  model: string,
+  hasModel: bool,
+  modelFrom: int,
+  modelTo: int,
+  hasStream: bool,
+  stream: bool,
+  modalities: string[],
+  speech: bool,
+  threadType: string,
+}
+
+function isWs(c: int): bool {
+  return c === 32 || c === 9 || c === 10 || c === 13
+}
+
+function skipWs(b: u8[], i0: int): int {
+  let i = i0
+  while (i < b.length && isWs(int(b[i]!))) i += 1
+  return i
+}
+
+// The index just past the string that opens at b[i], or -1 when the bytes end inside it.
+function endOfString(b: u8[], i0: int): int {
+  let i = i0 + 1
+  while (i < b.length) {
+    const c = int(b[i]!)
+    if (c === 92) {
+      i += 2
+      continue
+    }
+    if (c === 34) return i + 1
+    i += 1
+  }
+  return -1
+}
+
+// The index just past the value that starts at b[i], or -1 when the bytes end inside it.
+function endOfValue(b: u8[], i0: int): int {
+  if (i0 >= b.length) return -1
+  const c0 = int(b[i0]!)
+  if (c0 === 34) return endOfString(b, i0)
+  if (c0 === 123 || c0 === 91) {
+    let depth = 0
+    let i = i0
+    while (i < b.length) {
+      const c = int(b[i]!)
+      if (c === 34) {
+        const e = endOfString(b, i)
+        if (e < 0) return -1
+        i = e
+        continue
+      }
+      if (c === 123 || c === 91) depth += 1
+      else if (c === 125 || c === 93) {
+        depth -= 1
+        if (depth === 0) return i + 1
+      }
+      i += 1
+    }
+    return -1
+  }
+  // a number or a literal: it ends at a delimiter, which must be in the bytes
+  let i = i0
+  while (i < b.length) {
+    const c = int(b[i]!)
+    if (c === 44 || c === 125 || c === 93 || isWs(c)) return i
+    i += 1
+  }
+  return -1
+}
+
+function text(b: u8[], from: int, to: int): string {
+  try {
+    return new TextDecoder().decode(b.slice(from, to))
+  } catch (e) {
+    return ""
+  }
+}
+
+function matches(b: u8[], from: int, to: int, name: string): bool {
+  // a key without escapes: the quotes are at from and to - 1
+  const n = new TextEncoder().encode(name)
+  if (to - from - 2 !== n.length) return false
+  for (let i = 0; i < n.length; i++) if (b[from + 1 + i] !== n[i]) return false
+  return true
+}
+
+function boolAt(b: u8[], i: int, e: int): bool | undefined {
+  const t = text(b, i, e)
+  if (t === "true") return true
+  if (t === "false") return false
+  return undefined
+}
+
+// The members of the object that opens at b[start]: calls on(keyFrom, keyTo, valueFrom, valueTo) for each whose
+// value lies inside the bytes; stops at the first member that is cut off.
+function eachMember(b: u8[], start: int, on: (kf: int, kt: int, vf: int, vt: int) => void): void {
+  let i = skipWs(b, start)
+  if (i >= b.length || int(b[i]!) !== 123) return
+  i += 1
+  while (true) {
+    i = skipWs(b, i)
+    if (i >= b.length) return
+    const c = int(b[i]!)
+    if (c === 125) return
+    if (c === 44) {
+      i += 1
+      continue
+    }
+    if (c !== 34) return
+    const ke = endOfString(b, i)
+    if (ke < 0) return
+    let j = skipWs(b, ke)
+    if (j >= b.length || int(b[j]!) !== 58) return
+    j = skipWs(b, j + 1)
+    const ve = endOfValue(b, j)
+    if (ve < 0) return
+    on(i, ke, j, ve)
+    i = ve
+  }
+}
+
+// Reads the routing fields from the start of a JSON request body. Nested objects are entered only for the
+// two Bifrost reads (generationConfig and thread); every other value is skipped, so a big message array
+// costs one pass and a field after it is simply not found.
+export function scanPrefix(b: u8[]): Prefix {
+  const p: Prefix = { model: "", hasModel: false, modelFrom: 0, modelTo: 0, hasStream: false, stream: false, modalities: [], speech: false, threadType: "" }
+  let model = ""
+  let hasModel = false
+  let mf = 0
+  let mt = 0
+  let hasStream = false
+  let stream = false
+  const modalities: string[] = []
+  let speech = false
+  let threadType = ""
+  eachMember(b, 0, (kf, kt, vf, vt) => {
+    if (matches(b, kf, kt, "model")) {
+      if (int(b[vf]!) !== 34) return
+      try {
+        model = decodeString(text(b, vf, vt))
+        hasModel = true
+        mf = vf
+        mt = vt
+      } catch (e) {
+        hasModel = false
+      }
+    } else if (matches(b, kf, kt, "stream")) {
+      const v = boolAt(b, vf, vt)
+      if (v !== undefined) {
+        hasStream = true
+        stream = v
+      }
+    } else if (matches(b, kf, kt, "generationConfig")) {
+      eachMember(b, vf, (k2f, k2t, v2f, v2t) => {
+        if (matches(b, k2f, k2t, "speechConfig")) speech = true
+        else if (matches(b, k2f, k2t, "responseModalities") && int(b[v2f]!) === 91) {
+          let i = skipWs(b, v2f + 1)
+          while (i < v2t) {
+            const c = int(b[i]!)
+            if (c === 34) {
+              const e = endOfString(b, i)
+              if (e < 0) break
+              try {
+                modalities.push(decodeString(text(b, i, e)))
+              } catch (x) {
+                break
+              }
+              i = e
+            } else {
+              i += 1
+            }
+          }
+        }
+      })
+    } else if (matches(b, kf, kt, "thread")) {
+      eachMember(b, vf, (k2f, k2t, v2f, v2t) => {
+        if (matches(b, k2f, k2t, "type") && int(b[v2f]!) === 34) {
+          try {
+            threadType = decodeString(text(b, v2f, v2t))
+          } catch (x) {
+            threadType = ""
+          }
+        }
+      })
+    }
+  })
+  p.model = model
+  p.hasModel = hasModel
+  p.modelFrom = mf
+  p.modelTo = mt
+  p.hasStream = hasStream
+  p.stream = stream
+  p.modalities = modalities
+  p.speech = speech
+  p.threadType = threadType
+  return p
+}
+
+// ---- the body on its way to the provider ----
+
+// Counts the bytes that pass, keeps the first `cap` of them for the request log, and notes the body going over `limit`.
+export class BodyTap {
+  total = 0
+  preview: u8[] = []
+  over = false
+  constructor(readonly cap: int, readonly limit: int) {}
+
+  // false once the total is over the limit
+  see(b: u8[]): bool {
+    this.total += b.length
+    const room = this.cap - this.preview.length
+    if (room > 0) {
+      const n = b.length < room ? b.length : room
+      for (let i = 0; i < n; i++) this.preview.push(b[i]!)
+    }
+    if (this.total > this.limit) {
+      this.over = true
+      return false
+    }
+    return true
+  }
+
+  // the kept bytes as text (invalid UTF-8 shows as ?)
+  previewText(): string {
+    const p = this.preview
+    try {
+      return new TextDecoder().decode(p)
+    } catch (e) {
+      const out: u8[] = []
+      for (const c of p) out.push(int(c) < 128 ? c : u8(63))
+      try {
+        return new TextDecoder().decode(out)
+      } catch (x) {
+        return ""
+      }
+    }
+  }
+}
+
+// A request body being sent on: the bytes already read (the prefix), the rest still to come from the client,
+// and the provider's model name to put where the caller's was.
+export class LargeBody {
+  tap: BodyTap
+  // the provider's name for the model (set when the target is chosen); "" sends the prefix as it came
+  upstreamModel = ""
+  // the model sits in the prefix as bare text (a multipart form field), not as a JSON string literal
+  plain = false
+  // A request converted while it streams in (largeconv.tov): the converted body, in place of the caller's bytes.
+  converted: ReadableStream | undefined = undefined
+  // its length when it is known (a spooled body), else -1: it goes out chunked
+  convertedLength = -1
+  // the SHA-256 (hex) of a spooled body, for a provider that signs the payload
+  payloadHash = ""
+  // whether the provider's answer goes back as it is (the caller's own format), or is converted to the caller's
+  passAnswer = true
+  // why the conversion refused the body, when it did
+  convError = ""
+  // set by the spool to remove its files when the request is over
+  release: (() => void) | undefined = undefined
+  constructor(readonly settings: LargeSettings, readonly prefix: u8[], readonly meta: Prefix, readonly source: ReadableStream | undefined, readonly declared: int) {
+    this.tap = new BodyTap(settings.truncatedLog, settings.maxPayload)
+    this.tap.see(prefix)
+  }
+
+  // the model as it is written in the body
+  literal(): string {
+    return this.plain ? this.upstreamModel : quote(this.upstreamModel)
+  }
+
+  // The Content-Length to declare upstream, or -1 for a chunked body.
+  contentLength(): int {
+    if (this.converted !== undefined) return this.convertedLength
+    if (this.declared < 0) return -1
+    return this.declared + this.delta()
+  }
+
+  // the model literal's length change, for an upstream Content-Length
+  delta(): int {
+    if (this.upstreamModel === "" || !this.meta.hasModel) return 0
+    return new TextEncoder().encode(this.literal()).length - (this.meta.modelTo - this.meta.modelFrom)
+  }
+
+  // the prefix with the provider's model name where the caller's was
+  head(): u8[] {
+    const m = this.meta
+    if (this.upstreamModel === "" || !m.hasModel || this.upstreamModel === m.model) return this.prefix
+    const mid = new TextEncoder().encode(this.literal())
+    const out: u8[] = []
+    for (let i = 0; i < m.modelFrom; i++) out.push(this.prefix[i]!)
+    for (const c of mid) out.push(c)
+    for (let i = m.modelTo; i < this.prefix.length; i++) out.push(this.prefix[i]!)
+    return out
+  }
+
+  // The whole body as a stream: the (rewritten) prefix, then the rest as the client sends it. Reading stops
+  // with an error when the body goes over max_payload_bytes.
+  stream(): ReadableStream {
+    const conv = this.converted
+    if (conv !== undefined) return conv
+    let first = true
+    const self = this
+    return new ReadableStream({
+      async pull(c) {
+        if (first) {
+          first = false
+          c.enqueue(self.head())
+          return
+        }
+        const src = self.source
+        if (src === undefined) {
+          c.close()
+          return
+        }
+        let chunk: u8[] | undefined = undefined
+        try {
+          const r = await src.pull()
+          chunk = r.value
+          if (r.done) chunk = undefined
+        } catch (e) {
+          c.error(e)
+          return
+        }
+        const v = chunk
+        if (v === undefined) {
+          c.close()
+          return
+        }
+        if (!self.tap.see(v)) {
+          c.error(new Error("the request body is over max_payload_bytes"))
+          await src.cancel()
+          return
+        }
+        c.enqueue(v)
+      },
+      cancel() {
+        const src = self.source
+        if (src !== undefined) src.cancel()
+      },
+    })
+  }
+}
+
+// The kinds of JSON route this feature serves: those that name a model in the body.
+export function largeRoute(path: string): string {
+  if (path === "/v1/chat/completions" || path === "/openai/v1/chat/completions" || path === "/openai/chat/completions") return "chat"
+  if (path === "/v1/completions") return "completions"
+  if (path === "/v1/embeddings") return "embeddings"
+  if (path === "/v1/responses") return "responses"
+  if (path === "/anthropic/v1/messages") return "messages"
+  return ""
+}
+
+// ---- reading the body ahead ----
+
+// The first `want` bytes of a request body (fewer when it ends sooner: `ended`), or the reason it could not be read.
+export type Ahead = { head: u8[], ended: bool, error: string }
+
+export async function readAhead(src: ReadableStream, want: int): Promise<Ahead> {
+  const head: u8[] = []
+  let ended = false
+  try {
+    while (head.length < want) {
+      const r = await src.pull()
+      const v = r.value
+      if (r.done || v === undefined) {
+        ended = true
+        break
+      }
+      for (const b of v) head.push(b)
+    }
+  } catch (e) {
+    return { head: head, ended: false, error: e.message }
+  }
+  return { head: head, ended: ended, error: "" }
+}
+
+// The rest of a body whose start is `head`, up to `limit` bytes in all: `over` when it is longer.
+export type Whole = { bytes: u8[], over: bool, error: string }
+
+export async function readRest(src: ReadableStream, head: u8[], limit: int): Promise<Whole> {
+  const all: u8[] = head.slice()
+  try {
+    while (true) {
+      const r = await src.pull()
+      const v = r.value
+      if (r.done || v === undefined) break
+      for (const b of v) all.push(b)
+      if (all.length > limit) {
+        await src.cancel()
+        return { bytes: [], over: true, error: "" }
+      }
+    }
+  } catch (e) {
+    return { bytes: [], over: false, error: e.message }
+  }
+  return { bytes: all, over: false, error: "" }
+}
+
+// ---- usage of a passed-through answer ----
+
+// What an answer reports it used: the prompt and completion tokens (Anthropic's cache tokens count as prompt),
+// the cost a provider bills itself (OpenRouter's usage.cost), and whether any usage object was found.
+export type Usage = { promptTokens: int, completionTokens: int, billed: f64 | undefined, found: bool }
+
+type UsageObj = { prompt_tokens?: int, completion_tokens?: int, input_tokens?: int, output_tokens?: int, cache_read_input_tokens?: int, cache_creation_input_tokens?: int, cost?: f64 }
+
+function encode(s: string): u8[] {
+  return new TextEncoder().encode(s)
+}
+
+function matchAt(b: u8[], at: int, needle: u8[]): bool {
+  if (at < 0 || at + needle.length > b.length) return false
+  for (let i = 0; i < needle.length; i++) if (b[at + i] !== needle[i]) return false
+  return true
+}
+
+// The index of the first place at or after `from` where `needle` occurs in b, or -1.
+function findFrom(b: u8[], needle: u8[], from: int): int {
+  if (needle.length === 0) return -1
+  const first = needle[0]!
+  const last = b.length - needle.length
+  let i = from
+  while (i <= last) {
+    if (b[i] === first && matchAt(b, i, needle)) return i
+    i += 1
+  }
+  return -1
+}
+
+// Every "usage":{...} object in the bytes whose braces close inside them, as text. A key that is itself
+// escaped (the text of a message that mentions usage) is skipped, and so is "usage":null.
+function usageObjects(b: u8[]): string[] {
+  const out: string[] = []
+  const key = encode(`"usage"`)
+  let i = 0
+  while (i + key.length <= b.length) {
+    if (int(b[i]!) === 34 && matchAt(b, i, key)) {
+      const escaped = i > 0 && int(b[i - 1]!) === 92
+      let j = skipWs(b, i + key.length)
+      if (!escaped && j < b.length && int(b[j]!) === 58) {
+        j = skipWs(b, j + 1)
+        if (j < b.length && int(b[j]!) === 123) {
+          const e = endOfValue(b, j)
+          if (e > 0) {
+            out.push(text(b, j, e))
+            i = e
+            continue
+          }
+        }
+      }
+      i += key.length
+    } else {
+      i += 1
+    }
+  }
+  return out
+}
+
+// The usage of the objects in order: a later count replaces an earlier one that is not zero, so an Anthropic
+// stream (input tokens in message_start, output tokens in message_delta) and an OpenAI one (the last chunk)
+// both come out right.
+function foldUsage(objs: string[]): Usage {
+  let pt = 0
+  let ct = 0
+  let billed: f64 | undefined = undefined
+  let found = false
+  for (const raw of objs) {
+    let u: UsageObj = {}
+    try {
+      u = JSON.parse(raw) as UsageObj
+    } catch (e) {
+      continue
+    }
+    found = true
+    const chat = u.prompt_tokens
+    const p = chat !== undefined ? chat : (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
+    const c = u.completion_tokens ?? u.output_tokens ?? 0
+    if (p > 0) pt = p
+    if (c > 0) ct = c
+    const cost = u.cost
+    if (cost !== undefined && cost > 0.0) billed = cost
+  }
+  return { promptTokens: pt, completionTokens: ct, billed: billed, found: found }
+}
+
+// The usage reported in a body held whole (a small answer).
+export function usageOfBytes(b: u8[]): Usage {
+  return foldUsage(usageObjects(b))
+}
+
+export function usageOfText(s: string): Usage {
+  return usageOfBytes(encode(s))
+}
+
+// Watches an answer pass and keeps only its first headCap and last tailCap bytes: an event stream reports the
+// prompt in its first event (Anthropic) and the totals in its last, and a JSON answer ends with its usage, so
+// the two ends are enough and the body is never held.
+export class UsageTap {
+  head: u8[] = []
+  private chunks: u8[][] = []
+  private kept = 0
+  total = 0
+  constructor(readonly headCap: int, readonly tailCap: int) {}
+
+  see(b: u8[]): void {
+    this.total += b.length
+    const room = this.headCap - this.head.length
+    if (room > 0) {
+      const n = b.length < room ? b.length : room
+      for (let i = 0; i < n; i++) this.head.push(b[i]!)
+    }
+    if (b.length >= this.tailCap) {
+      this.chunks = [b.slice(b.length - this.tailCap)]
+      this.kept = this.tailCap
+      return
+    }
+    this.chunks.push(b)
+    this.kept += b.length
+    while (this.chunks.length > 1 && this.kept - this.chunks[0]!.length >= this.tailCap) {
+      this.kept -= this.chunks[0]!.length
+      this.chunks.shift()
+    }
+  }
+
+  tail(): u8[] {
+    const out: u8[] = []
+    for (const c of this.chunks) for (const x of c) out.push(x)
+    return out
+  }
+
+  usage(): Usage {
+    const objs = usageObjects(this.head)
+    // a body that fits in the head has no separate tail
+    if (this.total > this.head.length) for (const o of usageObjects(this.tail())) objs.push(o)
+    return foldUsage(objs)
+  }
+}
+
+// ---- multipart: the form fields before the file ----
+
+// One part of a multipart body: its name, its text and where the text lies in the bytes. A part with a
+// filename is the file: its text is not read and the scan stops there.
+export type FormPart = { name: string, filename: string, file: bool, value: string, from: int, to: int }
+
+// `file` is whether the scan reached the file part; `complete` whether it reached the closing delimiter
+// (a body with no file part that fits the prefix).
+export type Multipart = { parts: FormPart[], file: bool, complete: bool }
+
+// The value of key in a header parameter list (name="x"; filename="y"), or undefined.
+function paramOf(v: string, key: string): string | undefined {
+  const needle = key + "="
+  let from = 0
+  while (from < v.byteLength) {
+    const k = v.slice(from).indexOf(needle)
+    if (k < 0) return undefined
+    const at = from + k
+    const prev = at === 0 ? " " : v.slice(at - 1, at)
+    const s = at + needle.byteLength
+    if (prev === " " || prev === ";") {
+      if (v.slice(s, s + 1) === "\"") {
+        const r = v.slice(s + 1)
+        const e = r.indexOf("\"")
+        return e < 0 ? r : r.slice(0, e)
+      }
+      const r = v.slice(s)
+      const e = r.indexOf(";")
+      return (e < 0 ? r : r.slice(0, e)).trim()
+    }
+    from = s
+  }
+  return undefined
+}
+
+// The boundary of a multipart Content-Type, or "".
+export function boundaryOf(contentType: string): string {
+  const low = contentType.toLowerCase()
+  if (!low.includes("multipart/")) return ""
+  return paramOf(contentType.replaceAll("\t", " "), "boundary") ?? ""
+}
+
+// Reads the parts of a multipart body that lie whole in its first bytes, up to the first file part.
+export function scanMultipart(b: u8[], boundary: string): Multipart {
+  const parts: FormPart[] = []
+  let file = false
+  let complete = false
+  if (boundary === "") return { parts: parts, file: false, complete: false }
+  const delim = encode("--" + boundary)
+  const sep = encode("\r\n--" + boundary)
+  const crlf = encode("\r\n")
+  const blank = encode("\r\n\r\n")
+  let at = findFrom(b, delim, 0)
+  while (at >= 0) {
+    const p = at + delim.length
+    if (p + 2 <= b.length && int(b[p]!) === 45 && int(b[p + 1]!) === 45) {
+      complete = true
+      break
+    }
+    const eol = findFrom(b, crlf, p)
+    if (eol < 0) break
+    const hs = eol + 2
+    // the headers end at a blank line; a part may have none
+    let hend = hs
+    let body = hs
+    if (matchAt(b, hs, crlf)) {
+      body = hs + 2
+    } else {
+      const e = findFrom(b, blank, hs)
+      if (e < 0) break
+      hend = e
+      body = e + 4
+    }
+    let name = ""
+    let filename: string | undefined = undefined
+    for (const line of text(b, hs, hend).split("\r\n")) {
+      const c = line.indexOf(":")
+      if (c < 0 || line.slice(0, c).trim().toLowerCase() !== "content-disposition") continue
+      const v = line.slice(c + 1).replaceAll("\t", " ")
+      name = paramOf(v, "name") ?? ""
+      filename = paramOf(v, "filename")
+      if (filename === undefined && paramOf(v, "filename*") !== undefined) filename = ""
+    }
+    const fn = filename
+    if (fn !== undefined) {
+      parts.push({ name: name, filename: fn, file: true, value: "", from: body, to: body })
+      file = true
+      break
+    }
+    const end = findFrom(b, sep, body)
+    if (end < 0) break
+    parts.push({ name: name, filename: "", file: false, value: text(b, body, end), from: body, to: end })
+    at = end + 2
+  }
+  return { parts: parts, file: file, complete: complete }
+}
+
+// The routing fields of a multipart prefix as a Prefix: the model form field, with its value's place in the
+// bytes for the rewrite (the value is bare text, so LargeBody.plain is set), and the stream form field.
+export function formPrefix(b: u8[], boundary: string): Prefix {
+  const mp = scanMultipart(b, boundary)
+  const p: Prefix = { model: "", hasModel: false, modelFrom: 0, modelTo: 0, hasStream: false, stream: false, modalities: [], speech: false, threadType: "" }
+  let model = ""
+  let has = false
+  let mf = 0
+  let mt = 0
+  let hasStream = false
+  let stream = false
+  for (const part of mp.parts) {
+    if (part.file) continue
+    if (part.name === "model" && !has) {
+      model = part.value
+      has = true
+      mf = part.from
+      mt = part.to
+    } else if (part.name === "stream" && !hasStream) {
+      const v = part.value.trim().toLowerCase()
+      if (v === "true" || v === "false") {
+        hasStream = true
+        stream = v === "true"
+      }
+    }
+  }
+  p.model = model
+  p.hasModel = has
+  p.modelFrom = mf
+  p.modelTo = mt
+  p.hasStream = hasStream
+  p.stream = stream
+  return p
+}
+
+// ---- tests ----
+
+function bytes(s: string): u8[] {
+  return new TextEncoder().encode(s)
+}
+
+function str(b: u8[]): string {
+  try {
+    return new TextDecoder().decode(b)
+  } catch (e) {
+    return ""
+  }
+}
+
+test("defaults and the off switch", () => {
+  expect(largeSettings({})).toBe(undefined)
+  expect(largeSettings({ large_payload_optimization: { request_threshold_bytes: 5 } })).toBe(undefined)
+  const s = largeSettings({ large_payload_optimization: { enabled: true } })!
+  expect(s.requestThreshold).toBe(10485760)
+  expect(s.responseThreshold).toBe(10485760)
+  expect(s.prefetch).toBe(65536)
+  expect(s.maxPayload).toBe(524288000)
+  expect(s.truncatedLog).toBe(1048576)
+  const t = largeSettings({ large_payload_optimization: { enabled: true, request_threshold_bytes: 1, response_threshold_bytes: 2, prefetch_size_bytes: 3, max_payload_bytes: 4, truncated_log_bytes: 5 } })!
+  expect(t.requestThreshold).toBe(1)
+  expect(t.responseThreshold).toBe(2)
+  expect(t.prefetch).toBe(3)
+  expect(t.maxPayload).toBe(4)
+  expect(t.truncatedLog).toBe(5)
+  // a negative value is not a size: the default stands
+  const n = largeSettings({ large_payload_optimization: { enabled: true, max_payload_bytes: -1 } })!
+  expect(n.maxPayload).toBe(524288000)
+})
+
+test("scanPrefix reads the model and the stream flag in any order", () => {
+  const a = scanPrefix(bytes(`{"model":"openai/gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+  expect(a.hasModel).toBe(true)
+  expect(a.model).toBe("openai/gpt-4o")
+  expect(a.hasStream).toBe(true)
+  expect(a.stream).toBe(true)
+  const b = scanPrefix(bytes(` { "messages" : [ {"role":"user","content":"a \\" quote, and } brace"} ] , "stream" : false , "model" : "gpt-4o-mini" } `))
+  expect(b.model).toBe("gpt-4o-mini")
+  expect(b.hasStream).toBe(true)
+  expect(b.stream).toBe(false)
+})
+
+test("scanPrefix gives the model literal's place, for the rewrite", () => {
+  const src = `{"stream":true,"model":"openai/gpt-4o","messages":[]}`
+  const p = scanPrefix(bytes(src))
+  expect(src.slice(p.modelFrom, p.modelTo)).toBe(`"openai/gpt-4o"`)
+  expect(p.modelFrom).toBe(src.indexOf(`"openai/gpt-4o"`))
+})
+
+test("scanPrefix on a cut prefix finds what is whole and nothing more", () => {
+  // the model comes after a message that runs past the prefix
+  const cut = scanPrefix(bytes(`{"messages":[{"role":"user","content":"` + "x".repeat(200)))
+  expect(cut.hasModel).toBe(false)
+  expect(cut.hasStream).toBe(false)
+  // a model whose string is cut off
+  const half = scanPrefix(bytes(`{"stream":true,"model":"openai/gp`))
+  expect(half.hasModel).toBe(false)
+  expect(half.hasStream).toBe(true)
+  // a number cut at the end of the bytes may continue
+  const num = scanPrefix(bytes(`{"max_tokens":12`))
+  expect(num.hasModel).toBe(false)
+  expect(scanPrefix(bytes(``)).hasModel).toBe(false)
+  expect(scanPrefix(bytes(`[1,2]`)).hasModel).toBe(false)
+})
+
+test("scanPrefix reads escapes in the model and ignores look-alike keys inside values", () => {
+  const e = scanPrefix(bytes(`{"model":"a\\u0062c","x":{"model":"inner","stream":true}}`))
+  expect(e.model).toBe("abc")
+  expect(e.hasStream).toBe(false)
+  // keys that merely start like a wanted one
+  const k = scanPrefix(bytes(`{"models":"no","streaming":true,"model":"yes"}`))
+  expect(k.model).toBe("yes")
+  expect(k.hasStream).toBe(false)
+  // a model that is not a string is not a model
+  expect(scanPrefix(bytes(`{"model":5}`)).hasModel).toBe(false)
+})
+
+test("scanPrefix reads Bifrost's other metadata", () => {
+  const g = scanPrefix(bytes(`{"model":"gemini-2.0","generationConfig":{"temperature":0.2,"responseModalities":["AUDIO","TEXT"],"speechConfig":{"voiceConfig":{}}},"thread":{"id":"t","type":"create"}}`))
+  expect(g.modalities.join(",")).toBe("AUDIO,TEXT")
+  expect(g.speech).toBe(true)
+  expect(g.threadType).toBe("create")
+  const none = scanPrefix(bytes(`{"model":"m","generationConfig":{"temperature":1}}`))
+  expect(none.speech).toBe(false)
+  expect(none.modalities.length).toBe(0)
+  expect(none.threadType).toBe("")
+})
+
+test("LargeBody puts the provider's model name where the caller's was", () => {
+  const src = `{"model":"openai/gpt-4o","messages":[]}`
+  const meta = scanPrefix(bytes(src))
+  const body = new LargeBody({ requestThreshold: 1, responseThreshold: 1, prefetch: 64, maxPayload: 1000, truncatedLog: 10 }, bytes(src), meta, undefined, 38)
+  expect(str(body.head())).toBe(src)
+  expect(body.delta()).toBe(0)
+  body.upstreamModel = "gpt-4o"
+  expect(str(body.head())).toBe(`{"model":"gpt-4o","messages":[]}`)
+  expect(body.delta()).toBe(-7)
+  body.upstreamModel = "a-much-longer-model-name"
+  expect(str(body.head())).toBe(`{"model":"a-much-longer-model-name","messages":[]}`)
+  expect(body.delta()).toBe("a-much-longer-model-name".byteLength - "openai/gpt-4o".byteLength)
+})
+
+test("BodyTap keeps the first bytes and notes the limit", () => {
+  const t = new BodyTap(5, 12)
+  expect(t.see(bytes("abc"))).toBe(true)
+  expect(t.see(bytes("defgh"))).toBe(true)
+  expect(t.previewText()).toBe("abcde")
+  expect(t.total).toBe(8)
+  expect(t.see(bytes("12345"))).toBe(false)
+  expect(t.over).toBe(true)
+  expect(t.previewText()).toBe("abcde")
+})
+
+test("largeRoute names the routes this serves", () => {
+  expect(largeRoute("/v1/chat/completions")).toBe("chat")
+  expect(largeRoute("/openai/v1/chat/completions")).toBe("chat")
+  expect(largeRoute("/v1/embeddings")).toBe("embeddings")
+  expect(largeRoute("/v1/completions")).toBe("completions")
+  expect(largeRoute("/v1/responses")).toBe("responses")
+  expect(largeRoute("/anthropic/v1/messages")).toBe("messages")
+  expect(largeRoute("/v1/responses/resp_1")).toBe("")
+  expect(largeRoute("/api/logs")).toBe("")
+})
+
+test("usage of a JSON answer: chat, Responses, Anthropic and embeddings shapes", () => {
+  const chat = usageOfText(`{"id":"c1","choices":[{"message":{"content":"a \\"usage\\":{\\"prompt_tokens\\":999} b"}}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":2}}}`)
+  expect(chat.found).toBe(true)
+  expect(chat.promptTokens).toBe(11)
+  expect(chat.completionTokens).toBe(7)
+  const resp = usageOfText(`{"id":"r","output":[],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7,"output_tokens_details":{"reasoning_tokens":0}}}`)
+  expect(resp.promptTokens).toBe(5)
+  expect(resp.completionTokens).toBe(2)
+  // Anthropic: the cache tokens are part of the prompt
+  const ant = usageOfText(`{"type":"message","content":[],"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":9}}`)
+  expect(ant.promptTokens).toBe(35)
+  expect(ant.completionTokens).toBe(9)
+  const emb = usageOfText(`{"object":"list","data":[],"model":"m","usage":{"prompt_tokens":8,"total_tokens":8}}`)
+  expect(emb.promptTokens).toBe(8)
+  expect(emb.completionTokens).toBe(0)
+})
+
+test("usage of a JSON answer: none, null, cut and billed cost", () => {
+  expect(usageOfText(`{"text":"hello"}`).found).toBe(false)
+  expect(usageOfText(`{"usage":null}`).found).toBe(false)
+  expect(usageOfText(`{"a":1,"usage":{"prompt_tokens":3,"comp`).found).toBe(false)
+  expect(usageOfText(``).found).toBe(false)
+  const u = usageOfText(`{"usage":{"prompt_tokens":4,"completion_tokens":6,"cost":0.00042}}`)
+  expect(u.billed).toBe(0.00042)
+  expect(usageOfText(`{"usage":{"prompt_tokens":4,"cost":0}}`).billed).toBe(undefined)
+  // a usage object of the wrong shape is skipped
+  expect(usageOfText(`{"usage":{"prompt_tokens":"many"}}`).found).toBe(false)
+})
+
+test("usage of event streams: OpenAI's last chunk, Anthropic's two events, Responses' completed event", () => {
+  const oa = usageOfText(`data: {"choices":[{"delta":{"content":"hi"}}],"usage":null}\n\ndata: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\ndata: [DONE]\n\n`)
+  expect(oa.promptTokens).toBe(3)
+  expect(oa.completionTokens).toBe(4)
+  const an = usageOfText(`event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n`)
+  expect(an.promptTokens).toBe(9)
+  expect(an.completionTokens).toBe(5)
+  const rs = usageOfText(`event: response.created\ndata: {"type":"response.created","response":{"id":"r","usage":null}}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"id":"r","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}\n\n`)
+  expect(rs.promptTokens).toBe(3)
+  expect(rs.completionTokens).toBe(2)
+})
+
+test("UsageTap reads a body it never held: the prompt at the head and the totals at the end", () => {
+  const tap = new UsageTap(256, 512)
+  tap.see(bytes(`event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}\n\n`))
+  const filler = bytes(`event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"` + "x".repeat(300) + `"}}\n\n`)
+  for (let i = 0; i < 200; i++) tap.see(filler)
+  // a usage object in the middle is gone: only the two ends are kept
+  tap.see(bytes(`data: {"usage":{"input_tokens":1000,"output_tokens":1000}}\n\n`))
+  for (let i = 0; i < 20; i++) tap.see(filler)
+  tap.see(bytes(`event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":77}}\n\n`))
+  const u = tap.usage()
+  expect(u.promptTokens).toBe(12)
+  expect(u.completionTokens).toBe(77)
+  expect(tap.head.length).toBe(256)
+  expect(tap.tail().length < 512 + 400).toBe(true)
+  expect(tap.total > 60000).toBe(true)
+})
+
+test("UsageTap on a body that fits in its head, and on one chunk bigger than the tail", () => {
+  const small = new UsageTap(1024, 1024)
+  small.see(bytes(`{"usage":{"prompt_tokens":2,"completion_tokens":3}}`))
+  expect(small.usage().promptTokens).toBe(2)
+  expect(small.usage().completionTokens).toBe(3)
+  const big = new UsageTap(16, 64)
+  big.see(bytes("y".repeat(500) + `{"usage":{"prompt_tokens":6,"completion_tokens":1}}`))
+  expect(big.usage().promptTokens).toBe(6)
+  expect(big.tail().length).toBe(64)
+  expect(new UsageTap(8, 8).usage().found).toBe(false)
+})
+
+function formBody(boundary: string, fields: string[], fileName: string): string {
+  let out = ""
+  for (const f of fields) {
+    const i = f.indexOf("=")
+    out += `--${boundary}\r\nContent-Disposition: form-data; name="${f.slice(0, i)}"\r\n\r\n${f.slice(i + 1)}\r\n`
+  }
+  if (fileName !== "") out += `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: audio/wav\r\n\r\n` + "RIFF".repeat(100)
+  return out
+}
+
+test("boundaryOf reads quoted and bare boundaries", () => {
+  expect(boundaryOf("multipart/form-data; boundary=abc123")).toBe("abc123")
+  expect(boundaryOf(`multipart/form-data; boundary="a b-c"; charset=utf-8`)).toBe("a b-c")
+  expect(boundaryOf("application/json")).toBe("")
+  expect(boundaryOf("multipart/form-data")).toBe("")
+})
+
+test("scanMultipart reads the fields before the file and stops at it", () => {
+  const b = "XbX"
+  const body = formBody(b, ["model=openai/whisper-1", "language=en", "response_format=json"], "talk.wav")
+  const mp = scanMultipart(bytes(body), b)
+  expect(mp.file).toBe(true)
+  expect(mp.complete).toBe(false)
+  expect(mp.parts.length).toBe(4)
+  expect(mp.parts[0]!.name).toBe("model")
+  expect(mp.parts[0]!.value).toBe("openai/whisper-1")
+  expect(mp.parts[1]!.value).toBe("en")
+  expect(mp.parts[3]!.file).toBe(true)
+  expect(mp.parts[3]!.filename).toBe("talk.wav")
+  // where the model value lies
+  expect(body.slice(mp.parts[0]!.from, mp.parts[0]!.to)).toBe("openai/whisper-1")
+})
+
+test("scanMultipart: a file before the model hides it, a cut field is not read, a body without a file completes", () => {
+  const b = "bnd"
+  const fileFirst = formBody(b, [], "a.wav") + `\r\n--${b}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n--${b}--\r\n`
+  const f = scanMultipart(bytes(fileFirst), b)
+  expect(f.file).toBe(true)
+  expect(f.parts.length).toBe(1)
+  expect(formPrefix(bytes(fileFirst), b).hasModel).toBe(false)
+  // the prefix ends inside the value
+  const full = formBody(b, ["model=openai/whisper-1"], "")
+  const cut = scanMultipart(bytes(full.slice(0, full.indexOf("whisper") + 4)), b)
+  expect(cut.parts.length).toBe(0)
+  expect(cut.file).toBe(false)
+  // no file: the closing delimiter is reached
+  const whole = scanMultipart(bytes(full + `--${b}--\r\n`), b)
+  expect(whole.complete).toBe(true)
+  expect(whole.parts.length).toBe(1)
+  // not multipart at all
+  expect(scanMultipart(bytes("{}"), b).parts.length).toBe(0)
+  expect(scanMultipart(bytes(full), "").parts.length).toBe(0)
+})
+
+test("scanMultipart: names that merely contain a wanted name, tabs, and a preamble", () => {
+  const b = "q"
+  const body = `preamble text\r\n--q\r\nContent-Disposition: form-data; filename_hint="x"; name="model"\r\n\r\nm1\r\n--q\r\ncontent-disposition:\tform-data;\tname="stream"\r\n\r\ntrue\r\n--q\r\nContent-Disposition: form-data; name="file"; filename="f.png"\r\n\r\nPNG`
+  const p = formPrefix(bytes(body), b)
+  expect(p.hasModel).toBe(true)
+  expect(p.model).toBe("m1")
+  expect(body.slice(p.modelFrom, p.modelTo)).toBe("m1")
+  expect(p.hasStream).toBe(true)
+  expect(p.stream).toBe(true)
+})
+
+test("LargeBody puts the provider's model name into a form field", () => {
+  const b = "bd"
+  const body = formBody(b, ["model=openai/whisper-1", "language=en"], "t.wav")
+  const meta = formPrefix(bytes(body), b)
+  expect(meta.model).toBe("openai/whisper-1")
+  const lb = new LargeBody({ requestThreshold: 1, responseThreshold: 1, prefetch: 64, maxPayload: 100000, truncatedLog: 10 }, bytes(body), meta, undefined, body.byteLength)
+  lb.plain = true
+  lb.upstreamModel = "whisper-1"
+  expect(str(lb.head())).toBe(body.replace("openai/whisper-1", "whisper-1"))
+  expect(lb.delta()).toBe(-7)
+  lb.upstreamModel = "a-much-longer-whisper"
+  expect(str(lb.head())).toBe(body.replace("openai/whisper-1", "a-much-longer-whisper"))
+  expect(lb.delta()).toBe("a-much-longer-whisper".byteLength - "openai/whisper-1".byteLength)
+})

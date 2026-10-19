@@ -11,7 +11,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Chat completions + streaming | done (chunk-by-chunk on the default server) |
 | Embeddings | done (OpenAI-format, Cohere, Gemini, Vertex, Bedrock Titan and Cohere) |
 | List models | partial: upstream listing for OpenAI-format, Anthropic, Gemini, Bedrock, Vertex and Cloudflare; other providers list their configured models; Databricks lists none, as Bifrost does |
-| Realtime | partial: WebSocket relay (OpenAI, Azure); client secrets, sessions and SDP calls pass through; live sessions are OpenAI only; POST /v1/live/sessions (WebRTC create) answers 501 |
+| Realtime | partial: WebSocket (OpenAI, Azure, xAI) and WebRTC calls (POST /v1/realtime/calls and /v1/realtime, OpenAI and Azure) and live sessions (OpenAI only, WebSocket and POST /v1/live/sessions) all run through one core: the gateway is the WebRTC peer on both sides (libdatachannel in the Tov runtime), every session is admitted per voice window or turn, guarded, billed from the provider's usage (voice seconds, audio, cached and text tokens at the datasheet's rates) and logged as one row; client secrets and sessions pass through. Open: Bifrost logs one row per turn; the committed price table has audio rates for two models only |
 | Exact-match cache | done |
 | Anthropic SDK route | partial: messages (any provider, streaming), models, message batches and files (passthrough or via an OpenAI-format provider); legacy /anthropic/v1/complete has no streaming yet |
 | Bedrock SDK route | done: converse, invoke, converse-stream and invoke-with-response-stream to any provider, count-tokens (exact where Bedrock counts, estimated elsewhere), /bedrock/rerank |
@@ -23,7 +23,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Virtual keys | done |
 | Request IDs | done |
 | Prometheus metrics | partial: Bifrost's families and enrichment labels, http_* with custom labels, active requests, key rotation, MCP and the push gateway; the overhead components are Raiju's own four stages |
-| config.json compatibility | partial: sections and keys mapped; keys Raiju does not apply are reported at startup (`websocket`, `large_payload_optimization`, top-level `access_profiles`, `network_config` transport knobs, Vertex workload identity; docs/parity.md section c) |
+| config.json compatibility | partial: sections and keys mapped; keys Raiju does not apply are reported at startup (`websocket`, top-level `access_profiles`, `network_config` transport knobs, Vertex workload identity; docs/parity.md section c) |
 | Multi-core workers | partial: budgets, rate limits and caches shared between workers; `/metrics` is summed; request logs are per worker unless the log store is shared |
 | Anthropic | partial: no legacy text completions |
 | Azure OpenAI | partial: API keys and Entra ID; decisions by emulation only, as for OpenAI |
@@ -60,9 +60,9 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Request log store | partial: JSONL files with an in-memory index, histograms and filters; per worker unless shared; no SQL store |
 | OpenTelemetry | done: traces and metrics over OTLP HTTP and gRPC (plaintext h2c; TLS through the ALPN patch), span filters and overhead spans |
 | Docker / Helm / Terraform | done (image built and run; Terraform validated) |
-| Plugin hooks | partial: compiled-in plugins with Bifrost's placement and order; dynamic (Go shared object and WASM) plugins are not built |
+| Plugin hooks | partial: compiled-in plugins with Bifrost's placement and order; WebAssembly plugins (Bifrost's JSON ABI, pre and post hooks on chat requests) load from a local `.wasm` path on WAMR, with limits on memory, stack and instructions (`tov-patches/0005-wamr.patch`); Go shared-object plugins (`.so`) are not supported, because Go's `plugin` package needs the Go runtime and Tov cannot load a Go shared object; the HTTP transport hooks and URL loading are not built |
 | Config store + management API | done (the config is a JSON file; Bifrost's sqlite and postgres config stores are not built) |
-| Web UI | done |
+| Web UI | done: the admin client built into the gateway (`web/`, L113; SolidJS and Vite, embedded through `src/ui_assets.tov`): sign-in (admin token, SSO), overview, providers, virtual keys, budgets and limits, logs, the live feed (virtualized, 5,000 rows), MCP clients, settings and a playground; L132: dashboard charts on the overview and logs screens, MCP access (OAuth grants, per-user sessions and headers) with restyled consent pages, virtual MCP and tool group editors, and role-aware actions; L141: chart zoom (drag or Shift+arrows) and per-series legend toggles, and a Roles tab with a permission editor for custom roles (resource by operation grid, access profiles, user roles). Not built: native apps |
 | Cohere | done |
 | Custom providers | done |
 | Vertex AI | done: chat, streaming, embeddings, responses, images and image edits, batches and files over GCS, exact count tokens; the AWS workload identity is not built (needs a cloud account) |
@@ -84,6 +84,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Access profiles / projects | partial: access profiles with versions, clone, activate, deactivate and propagate; projects with members and split policies; rate-limit splits and profile role binding are open |
 | RBAC | partial: built-in roles (admin, editor, viewer, auditor) and custom roles with permission pairs; Bifrost's role-id API shape is not built |
 | SSO (OIDC) | done (PKCE, groups to roles) |
+| SCIM provisioning | partial: `/scim/v2` Users and Groups (list with a userName or displayName filter and paging, get, create, PUT, PATCH including active false, delete), the discovery documents and the bearer token from `scim_config`; groups are teams. The provider's directory sync, claim mapping (`claimsSyncMode`, attribute mappings) and bulk are not built |
 | Secret managers | done (Vault KV v2, AWS Secrets Manager) |
 | Virtual MCPs | partial: `/mcp/{name}`, config and management API; no access-profile or project scoping |
 | Required headers | done (global and per access profile) |
@@ -96,9 +97,11 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Session affinity | done |
 | Complexity router | done |
 | Outbound proxies | done (HTTP, with credentials; SOCKS5 isn't in Tov's fetch) |
+| MCP code mode | partial (moved in from Out by the owner, 2026-10-17; L117): the four meta-tools (listToolFiles, readToolFile, getToolDocs, executeToolCode), Python stubs, `mcp.code_mode_binding_level` and `mcp.code_mode_limits`, and the gates on the tool calls a program makes. The runner is a Starlark subset (no while, classes, exceptions or imports); see docs/parity.md (g) |
 | Provider passthrough routes | done (OpenAI, Anthropic, Azure, Bedrock agent/guardrail, GenAI, ChatGPT Codex) |
 | Direct keys, raw request/response echo | partial: direct keys and send-back of raw requests and responses are done; `x-bf-store-raw-request-response` is not built |
 | Reasoning parameters | done (Anthropic, Gemini, Bedrock Claude and Nova) |
+| A2A agents (registered agents, agent cards, JSON-RPC tasks) | partial: registrations at /api/agents with cached cards (fetched again on a timer), grants, runtime headers or OAuth, forwarded caller credentials, inspect and push-config management; the gateway at /agents/a2a/{name} serves the card and proxies the JSON-RPC methods (v0.3 and v1 names, tasks/resubscribe) and the REST binding, bridging between them, with push notification configs relayed through the gateway, logged under the agent's name; /agents/a2a lists the agents a key may call; the agent_names log filter works; the gRPC binding, extension URIs and client certificates for the agent's TLS are not built |
 
 ## Out
 
@@ -106,18 +109,15 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 |---|---|
 | Videos and containers | not built (out of scope) |
 | Edge device agent | not built (out of scope) |
-| SCIM | not built (out of scope) |
-| MCP code mode | not built (out of scope) |
 | Media providers | not built (out of scope) |
 | Runware (media provider and `/runware_passthrough`) | not built (out of scope: a media provider) |
 | Warp | not built (out of scope: Bifrost's Warp integration) |
 | Skills marketplace | not built (out of scope: git and zip skill marketplace, `/api/skills`) |
-| A2A (agent-to-agent, registered agents) | not built (out of scope: agent cards, JSON-RPC tasks, `/agents/a2a` and `/api/agents`) |
 | Sidekiq | not built (out of scope: Bifrost's Sidekiq job queue integration) |
 
 ## Open items
 
-The P2 product decisions are taken, and their builds are in the tables above with their partial parts. The open items are listed in docs/parity.md under "Remaining gaps (current as of the L97 waves)". A native UI (desktop and mobile) is a separate track in LEDGER.md.
+The P2 product decisions are taken, and their builds are in the tables above with their partial parts. The open items are listed in docs/parity.md under "Remaining gaps (current as of the L97 waves)". The admin client is the built-in web UI (owner decision, 2026-10-17); desktop and mobile apps, if wanted later, wrap it in Tauri 2. See the UI track in LEDGER.md.
 
 ## Notes from the form
 

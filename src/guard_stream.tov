@@ -4,13 +4,23 @@
 // in place of the event that completed the match and everything after it. Text already sent stays
 // sent, so the earliest a block can land is the event that completes the match.
 // A redact rule rewrites the text before it goes out. Text is released up to the last whitespace that
-// is at least HOLD bytes behind the newest text, so a match is seen whole unless it spans a release
-// point. Text still held goes out in an event built on the last text event, ahead of the next event
-// that carries no text (a finish chunk, a done event) or at the end of the stream. A Responses stream's
-// summary events repeat the whole answer, so they get the released text in place of the answer.
+// is at least HOLD bytes behind the newest text. A match that crosses that point (a phone number with a
+// space in it, a key spanning lines) moves the point back to its start, so it is released whole or
+// held; a private key block whose END marker has not arrived is held from its BEGIN marker. Text still
+// held goes out in an event built on the last text event, ahead of the next event that carries no text
+// (a finish chunk, a done event) or at the end of the stream. A Responses stream's summary events repeat
+// the whole answer, so they get the released text in place of the answer.
+// The built-in guard (guardrails.detect) joins the local rules through useBuiltin: in block mode it
+// blocks like a rule, in redact mode its findings are rewritten the same way.
+// useHold turns on Bifrost's hold-and-replay for a block-capable guard: no event goes out while the
+// stream runs. The events (after any redaction) are kept; a block drops them and sends only the error
+// event, and a stream that passes is handed back through takeReplay for the caller to send paced. The
+// hold is bounded by a byte cap and a time cap; past either the stream is blocked, or (on_limit
+// "release") the held events are released and the stream continues on the live path.
 
 import { CompiledRule, applyRegex } from "./guard_regex"
 import { compileLocal, localVerdict } from "./guard_local"
+import { GuardConfig, applyToText, scan } from "./guardrails"
 import { Field, fields, elements, find, decodeString, quote, rawStr } from "./json"
 import { errorJson } from "./schemas"
 
@@ -22,8 +32,14 @@ export type StreamFormat = "chat" | "text" | "responses"
 // bytes of the newest text that are held back from release, and how far back a release point is looked for
 const HOLD = 256
 const SEARCH = 512
+// how far before the release point the redaction check looks for matches that cross it
+const LOOKBACK = 1024
+// a held stream is checked again after it grows by this many bytes or by a quarter, so the checks add up
+// to a few passes over the answer, not one per event
+const CHECK_STEP = 2048
 
 type GuardHit = { id: string, reason: string }
+type ByteSpan = { start: int, end: int }
 
 // The text of one event: the JSON string that holds it (raw, under key) and its decoded text.
 export type Piece = { key: string, raw: string, text: string }
@@ -98,9 +114,24 @@ export class OutputStreamGuard {
   private emitted = ""
   private pending = ""
   private redacting = false
+  // the built-in guard, when it guards this stream (block or redact mode)
+  private builtin: GuardConfig | undefined = undefined
   // the last text event, the template for held text that goes out in an event of its own
   private tpl: Piece | undefined = undefined
   private tplEv = ""
+  // hold-and-replay (useHold)
+  private holding = false
+  private holdMaxBytes = 0
+  private holdMaxMs = 0
+  private holdRelease = false
+  private held: string[] = []
+  private heldBytes = 0
+  private startMs = 0
+  private checked = 0
+  private errorEv = ""
+  private replay: string[] = []
+  // the clock the caller sets before each call (ms); the time cap reads it
+  nowMs = 0
 
   constructor(readonly providers: GuardedProvider[], readonly format: StreamFormat) {
     for (const p of providers) {
@@ -110,9 +141,107 @@ export class OutputStreamGuard {
     }
   }
 
+  // Adds the built-in guard (guardrails.detect): block mode blocks the stream on a finding, redact mode
+  // rewrites the findings. Log mode is not a stream guard.
+  useBuiltin(cfg: GuardConfig): void {
+    if (cfg.mode !== "block" && cfg.mode !== "redact") return
+    this.builtin = cfg
+    if (cfg.mode === "redact") this.redacting = true
+  }
+
+  // Holds the stream until the guards pass (Bifrost's behaviour for a block-capable output guard).
+  // maxBytes and maxMs bound the hold (0 is no bound); onLimit "release" lets the held events go and the
+  // stream continue live, anything else blocks the stream.
+  useHold(maxBytes: int, maxMs: int, onLimit: string): void {
+    this.holding = true
+    this.holdMaxBytes = maxBytes
+    this.holdMaxMs = maxMs
+    this.holdRelease = onLimit === "release"
+  }
+
+  // Whether the stream is being held now.
+  isHolding(): bool {
+    return this.holding
+  }
+
+  // The events to send now, in order: a held stream that passed, or the events released at a limit.
+  // The caller sends them paced.
+  takeReplay(): string[] {
+    const r = this.replay
+    this.replay = []
+    return r
+  }
+
   // The client's text for what the converter produced. Events pass through until a block; the
-  // block's error event replaces the rest of the stream.
+  // block's error event replaces the rest of the stream. A held stream returns "" until it ends (or
+  // blocks): its events come from takeReplay.
   filter(s: string): string {
+    if (this.stopped) return ""
+    if (!this.holding) return this.run(s)
+    if (this.startMs === 0) this.startMs = this.nowMs
+    const out = this.run(s)
+    if (this.stopped) return this.dropHeld()
+    this.hold(out)
+    return this.overLimit()
+  }
+
+  // The stream's last text: what is still pending goes out unless a block has ended the stream.
+  finish(s: string): string {
+    if (this.stopped) return ""
+    if (!this.holding) return this.runFinish(s)
+    if (this.startMs === 0) this.startMs = this.nowMs
+    const out = this.runFinish(s)
+    if (this.stopped) return this.dropHeld()
+    this.hold(out)
+    const over = this.overLimit()
+    if (over !== "" || this.stopped) return over
+    if (this.holding) {
+      for (const e of this.held) this.replay.push(e)
+      this.held = []
+      this.heldBytes = 0
+    }
+    return ""
+  }
+
+  // Adds the events of `out` to the hold.
+  private hold(out: string): void {
+    const parts = out.split("\n\n")
+    const last = parts.length - 1
+    for (let i = 0; i <= last; i++) {
+      const part = parts[i]!
+      if (i === last && part === "") continue
+      const ev = i < last ? part + "\n\n" : part
+      this.held.push(ev)
+      this.heldBytes += ev.byteLength
+    }
+  }
+
+  // The error event alone: nothing of the held answer goes out.
+  private dropHeld(): string {
+    this.held = []
+    this.heldBytes = 0
+    return this.errorEv
+  }
+
+  // "" while the hold is within its caps. Over a cap the stream is blocked (the error event comes back)
+  // or, on_limit "release", the held events move to the replay and the hold ends.
+  private overLimit(): string {
+    if (!this.holding) return ""
+    const big = this.holdMaxBytes > 0 && this.heldBytes > this.holdMaxBytes
+    const late = this.holdMaxMs > 0 && this.startMs > 0 && this.nowMs - this.startMs > this.holdMaxMs
+    if (!big && !late) return ""
+    if (this.holdRelease) {
+      for (const e of this.held) this.replay.push(e)
+      this.held = []
+      this.heldBytes = 0
+      this.holding = false
+      return ""
+    }
+    this.block("stream_hold", big ? "the held answer is over the size limit" : "the held answer is over the time limit")
+    return this.dropHeld()
+  }
+
+  private run(s: string): string {
     if (this.stopped) return ""
     this.pending += s
     let out = ""
@@ -129,7 +258,9 @@ export class OutputStreamGuard {
         continue
       }
       this.answer += piece.text
-      const hit = this.check()
+      // a held stream is checked at growing steps and once more at its end
+      const skip = this.holding && this.answer.byteLength - this.checked < Math.max(CHECK_STEP, Math.floor(this.checked / 4))
+      const hit = skip ? undefined : this.check()
       if (hit !== undefined) return out + this.block(hit.id, hit.reason)
       if (!this.redacting) {
         out += ev
@@ -148,10 +279,13 @@ export class OutputStreamGuard {
     return out
   }
 
-  // The stream's last text: what is still pending goes out unless a block has ended the stream.
-  finish(s: string): string {
-    const out = this.filter(s)
+  private runFinish(s: string): string {
+    const out = this.run(s)
     if (this.stopped) return out
+    if (this.holding) {
+      const hit = this.check()
+      if (hit !== undefined) return out + this.block(hit.id, hit.reason)
+    }
     const rest = this.pending
     this.pending = ""
     const held = this.release()
@@ -160,24 +294,103 @@ export class OutputStreamGuard {
   }
 
   private check(): GuardHit | undefined {
+    this.checked = this.answer.byteLength
     for (const p of this.providers) {
       const v = localVerdict(p.rules, this.answer)
       if (v.action === "block") return { id: p.id, reason: `${p.id}: ${v.reason}` }
+    }
+    const b = this.builtin
+    if (b !== undefined && b.mode === "block") {
+      const fs = scan(this.answer, b)
+      if (fs.length > 0) {
+        const kinds: string[] = []
+        for (const f of fs) {
+          if (!kinds.includes(f.kind)) kinds.push(f.kind)
+        }
+        return { id: "builtin", reason: `builtin: found ${kinds.join(", ")}` }
+      }
     }
     return undefined
   }
 
   // The release point: the last whitespace at least HOLD bytes behind the newest text, looked for no
-  // further back than SEARCH bytes. The cut stays where it is when there is none.
+  // further back than SEARCH bytes. The point moves back to the start of any match it would cross, and
+  // to the start of an unfinished private key block. The cut stays where it is when there is none.
   private cutPoint(): int {
     const limit = this.answer.byteLength - HOLD
+    let at = -1
     let i = limit
     while (i > this.cut && i > limit - SEARCH) {
       const c = this.answer.slice(i - 1, i)
-      if (c === " " || c === "\n" || c === "\t" || c === "\r") return i
+      if (c === " " || c === "\n" || c === "\t" || c === "\r") {
+        at = i
+        break
+      }
       i -= 1
     }
+    if (at < 0) return this.cut
+    const spans = this.spans()
+    let moved = true
+    while (moved) {
+      moved = false
+      for (const s of spans) {
+        if (s.start < at && at < s.end) {
+          at = s.start
+          moved = true
+        }
+      }
+    }
+    const open = this.openBlock()
+    if (open >= 0 && open < at) at = open
+    return at > this.cut ? at : this.cut
+  }
+
+  // The byte ranges the redact rules and the built-in redaction would rewrite near the release point. Only the
+  // text from LOOKBACK bytes before the cut on is scanned, so a check does not grow with the length of the answer.
+  private spans(): ByteSpan[] {
+    const from = this.windowFrom()
+    const text = this.answer.slice(from, this.answer.byteLength)
+    const out: ByteSpan[] = []
+    for (const p of this.providers) {
+      for (const f of applyRegex(text, p.rules).findings) {
+        if (f.end > f.start) out.push({ start: f.start + from, end: f.end + from })
+      }
+    }
+    const b = this.builtin
+    if (b !== undefined && b.mode === "redact") {
+      for (const f of scan(text, b)) out.push({ start: f.start + from, end: f.end + from })
+    }
+    return out
+  }
+
+  // The start of the scanned window: the first whitespace at or after LOOKBACK bytes before the cut (a character
+  // boundary), 0 near the start of the answer, or the cut itself when no whitespace is near.
+  private windowFrom(): int {
+    const first = this.cut - LOOKBACK
+    if (first <= 0) return 0
+    let i = first
+    while (i < this.cut) {
+      const c = this.answer.slice(i, i + 1)
+      if (c === " " || c === "\n" || c === "\t" || c === "\r") return i
+      i += 1
+    }
     return this.cut
+  }
+
+  // The start of the first PEM block after the cut that is not closed yet (-1 for none). A block is closed
+  // when its END line has its closing dashes, as the built-in scanner needs them to see the whole block.
+  private openBlock(): int {
+    const tail = this.answer.slice(this.cut, this.answer.byteLength)
+    let from = 0
+    while (true) {
+      const at = tail.slice(from, tail.byteLength).indexOf("-----BEGIN ")
+      if (at < 0) return -1
+      const p = from + at
+      const rest = tail.slice(p, tail.byteLength)
+      const e = rest.indexOf("-----END ")
+      if (e < 0 || !rest.slice(e + 9, rest.byteLength).includes("-----")) return this.cut + p
+      from = p + 11
+    }
   }
 
   // The text still held, as an event built on the last text event ("" when nothing is held).
@@ -195,6 +408,14 @@ export class OutputStreamGuard {
     let red = seg
     for (const p of this.providers) {
       const r = applyRegex(red, p.rules)
+      if (r.body !== red) {
+        for (const f of r.findings) this.kinds.push(f.kind)
+      }
+      red = r.body
+    }
+    const b = this.builtin
+    if (b !== undefined && b.mode === "redact") {
+      const r = applyToText(red, b)
       if (r.body !== red) {
         for (const f of r.findings) this.kinds.push(f.kind)
       }
@@ -218,8 +439,9 @@ export class OutputStreamGuard {
     this.blockedBy = id
     this.pending = ""
     const msg = `response blocked by guardrails: ${reason}`
-    if (this.format === "responses") return `event: error\ndata: {"type":"error","code":"guardrail_violation","message":${quote(msg)},"param":null}\n\n`
-    return `data: ${errorJson(msg, "guardrail_violation", undefined)}\n\ndata: [DONE]\n\n`
+    if (this.format === "responses") this.errorEv = `event: error\ndata: {"type":"error","code":"guardrail_violation","message":${quote(msg)},"param":null}\n\n`
+    else this.errorEv = `data: ${errorJson(msg, "guardrail_violation", undefined)}\n\ndata: [DONE]\n\n`
+    return this.errorEv
   }
 }
 
@@ -388,4 +610,197 @@ test("a Responses stream redacts its deltas and the summary event that repeats t
   expect(joined(out, "responses")).toBe("call [REDACTED:PHONE] now")
   expect(out.includes(`"text":"call [REDACTED:PHONE] now"`)).toBe(true)
   expect(out.includes("event: response.completed")).toBe(true)
+})
+
+test("the built-in guard blocks a stream whose answer holds a finding, and redacts in redact mode", () => {
+  const g = new OutputStreamGuard([], "chat")
+  g.useBuiltin({ detect: ["email"], mode: "block" })
+  const out = g.filter(chunk("write to jane.doe@example.com today"))
+  expect(out.includes("guardrail_violation")).toBe(true)
+  expect(out.includes("jane.doe")).toBe(false)
+  expect(out.includes("builtin: found email")).toBe(true)
+  expect(g.blockedBy).toBe("builtin")
+  const r = new OutputStreamGuard([], "chat")
+  r.useBuiltin({ detect: ["email"], mode: "redact" })
+  let o = ""
+  for (const piece of ["write to jane.doe", "@example.com", " today"]) o += r.filter(chunk(piece))
+  o += r.finish("data: [DONE]\n\n")
+  expect(o.includes("jane.doe")).toBe(false)
+  expect(joined(o, "chat")).toBe("write to [REDACTED:EMAIL] today")
+  expect(r.kinds).toEqual(["email"])
+  expect(r.stopped).toBe(false)
+  // log mode is not a stream guard: the text passes through
+  const l = new OutputStreamGuard([], "chat")
+  l.useBuiltin({ detect: ["email"], mode: "log" })
+  expect(l.filter(chunk("jane.doe@example.com")).includes("jane.doe@example.com")).toBe(true)
+})
+
+test("a private key that spans release points is held until its end, then redacted whole", () => {
+  const head = "-----BEGIN " + "RSA PRIVATE KEY-----"
+  const foot = "-----END " + "RSA PRIVATE KEY-----"
+  const line = "MIIEpAIBAAKCAQEAu" + "Qz3cY0kP8mW2nR5tV7xB9dF1gH3jK5lM7nP9qR1sT3uV5wX7yZ9"
+  let lines = ""
+  for (let k = 0; k < 12; k++) lines += line + "\n"
+  const key = "key follows\n" + head + "\n" + lines + foot + "\nthat was all"
+  const g = new OutputStreamGuard([], "chat")
+  g.useBuiltin({ detect: ["private_key"], mode: "redact" })
+  let out = ""
+  for (let at = 0; at < key.byteLength; at += 50) out += g.filter(chunk(key.slice(at, at + 50)))
+  out += g.finish("data: [DONE]\n\n")
+  expect(out.includes("MIIEpAIBAAKCAQEAu")).toBe(false)
+  expect(out.includes("-----BEGIN")).toBe(false)
+  expect(joined(out, "chat")).toBe("key follows\n[REDACTED:PRIVATE_KEY]\nthat was all")
+  expect(g.kinds).toEqual(["private_key"])
+})
+
+test("a rule's match is redacted whole when it sits in a long text across release points", () => {
+  const g = new OutputStreamGuard([{ id: "pii", rules: try phone() }], "text")
+  let filler = ""
+  for (let k = 0; k < 40; k++) filler += "word" + k + " "
+  const text = filler + "call 555-1234 now " + filler
+  let out = ""
+  for (let at = 0; at < text.byteLength; at += 37) out += g.filter(textChunk(text.slice(at, at + 37)))
+  out += g.finish("data: [DONE]\n\n")
+  expect(out.includes("555-1234")).toBe(false)
+  expect(joined(out, "text")).toBe(text.split("555-1234").join("[REDACTED:PHONE]"))
+})
+
+// ---- hold-and-replay tests ----
+
+function held(p: GuardedProvider[], format: StreamFormat): OutputStreamGuard {
+  const g = new OutputStreamGuard(p, format)
+  g.useHold(1000000, 60000, "block")
+  return g
+}
+
+test("a held stream sends nothing while it runs, then hands every event back in order", () => {
+  const g = held([{ id: "words", rules: try rx("forbidden", "block") }], "chat")
+  expect(g.isHolding()).toBe(true)
+  const evs = [chunk("all "), chunk("clear "), chunk("here"), "data: [DONE]\n\n"]
+  expect(g.filter(evs[0]!)).toBe("")
+  expect(g.filter(evs[1]!)).toBe("")
+  expect(g.takeReplay().length).toBe(0)
+  expect(g.filter(evs[2]!)).toBe("")
+  expect(g.finish(evs[3]!)).toBe("")
+  expect(g.stopped).toBe(false)
+  expect(g.takeReplay()).toEqual(evs)
+  expect(g.takeReplay().length).toBe(0)
+})
+
+test("a held stream that matches a block rule sends only the error event", () => {
+  const g = held([{ id: "words", rules: try rx("forbidden", "block") }], "chat")
+  expect(g.filter(chunk("a fine start "))).toBe("")
+  expect(g.filter(chunk("then a forbidden word"))).toBe("")
+  // the match is found by the check at the end of the stream
+  const out = g.finish("data: [DONE]\n\n")
+  expect(g.stopped).toBe(true)
+  expect(g.blockedBy).toBe("words")
+  expect(out.includes("fine start")).toBe(false)
+  expect(out.includes("forbidden word")).toBe(false)
+  expect(out.includes("response blocked by guardrails: words: found REGEX_MATCH")).toBe(true)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+  expect(g.takeReplay().length).toBe(0)
+})
+
+test("a held stream is checked as it grows, and a block drops everything held", () => {
+  const g = held([{ id: "words", rules: try rx("forbidden", "block") }], "text")
+  let filler = ""
+  for (let k = 0; k < 400; k++) filler += "padding "
+  expect(g.filter(textChunk("one forbidden two "))).toBe("")
+  expect(g.stopped).toBe(false)
+  const out = g.filter(textChunk(filler))
+  expect(g.stopped).toBe(true)
+  expect(out.includes("guardrail_violation")).toBe(true)
+  expect(out.includes("padding")).toBe(false)
+  expect(g.filter(textChunk("more"))).toBe("")
+  expect(g.finish("")).toBe("")
+  expect(g.takeReplay().length).toBe(0)
+})
+
+test("the built-in guard in block mode holds and blocks a Responses stream", () => {
+  const g = new OutputStreamGuard([], "responses")
+  g.useBuiltin({ detect: ["email"], mode: "block" })
+  g.useHold(1000000, 60000, "block")
+  expect(g.filter(deltaEv("write to jane.doe@"))).toBe("")
+  expect(g.filter(deltaEv("example.com please"))).toBe("")
+  const out = g.finish(`event: response.completed\ndata: {"type":"response.completed","response":{"output":[]}}\n\n`)
+  expect(out.startsWith("event: error\ndata: {\"type\":\"error\",\"code\":\"guardrail_violation\"")).toBe(true)
+  expect(out.includes("jane.doe")).toBe(false)
+  expect(out.includes("response.completed")).toBe(false)
+  expect(g.blockedBy).toBe("builtin")
+  const ok = new OutputStreamGuard([], "responses")
+  ok.useBuiltin({ detect: ["email"], mode: "block" })
+  ok.useHold(1000000, 60000, "block")
+  expect(ok.filter(deltaEv("nothing to see"))).toBe("")
+  expect(ok.finish(`event: response.completed\ndata: {"type":"response.completed"}\n\n`)).toBe("")
+  const rep = ok.takeReplay()
+  expect(rep.length).toBe(2)
+  expect(rep[0]).toBe(deltaEv("nothing to see"))
+})
+
+test("a held stream with a redact rule replays the redacted text", () => {
+  const g = new OutputStreamGuard([{ id: "pii", rules: try phone() }, { id: "words", rules: try rx("forbidden", "block") }], "chat")
+  g.useHold(1000000, 60000, "block")
+  let out = g.filter(chunk("call 555-")) + g.filter(chunk("1234 now"))
+  out += g.finish("data: [DONE]\n\n")
+  expect(out).toBe("")
+  const rep = g.takeReplay()
+  let all = ""
+  for (const e of rep) all += e
+  expect(all.includes("555-1234")).toBe(false)
+  expect(joined(all, "chat")).toBe("call [REDACTED:PHONE] now")
+  expect(rep[rep.length - 1]).toBe("data: [DONE]\n\n")
+})
+
+test("the size cap blocks a held stream, or releases it on the live path with on_limit release", () => {
+  const p: GuardedProvider[] = [{ id: "words", rules: try rx("forbidden", "block") }]
+  const big = chunk("second part of the answer, long enough to pass the cap of three hundred bytes " + "........................................................................................................................................................................................")
+  const g = new OutputStreamGuard(p, "chat")
+  g.useHold(300, 60000, "block")
+  expect(g.filter(chunk("first part of the answer"))).toBe("")
+  const out = g.filter(big)
+  expect(g.stopped).toBe(true)
+  expect(g.blockedBy).toBe("stream_hold")
+  expect(out.includes("over the size limit")).toBe(true)
+  expect(out.includes("first part")).toBe(false)
+  expect(g.takeReplay().length).toBe(0)
+
+  const r = new OutputStreamGuard(p, "chat")
+  r.useHold(300, 60000, "release")
+  expect(r.filter(chunk("first part of the answer"))).toBe("")
+  expect(r.filter(big)).toBe("")
+  expect(r.isHolding()).toBe(false)
+  expect(r.stopped).toBe(false)
+  const rep = r.takeReplay()
+  expect(rep.length).toBe(2)
+  expect(rep[0]).toBe(chunk("first part of the answer"))
+  // after the release the stream runs live: a later event passes at once, and a match still blocks
+  expect(r.filter(chunk(" and on"))).toBe(chunk(" and on"))
+  const late = r.filter(chunk(" forbidden"))
+  expect(late.includes("guardrail_violation")).toBe(true)
+  expect(r.stopped).toBe(true)
+})
+
+test("the time cap blocks a held stream that runs too long", () => {
+  const g = new OutputStreamGuard([{ id: "words", rules: try rx("forbidden", "block") }], "chat")
+  g.useHold(1000000, 5000, "block")
+  g.nowMs = 1000
+  expect(g.filter(chunk("one"))).toBe("")
+  g.nowMs = 5000
+  expect(g.filter(chunk("two"))).toBe("")
+  expect(g.stopped).toBe(false)
+  g.nowMs = 6500
+  const out = g.filter(chunk("three"))
+  expect(g.stopped).toBe(true)
+  expect(out.includes("over the time limit")).toBe(true)
+  expect(out.includes("\"content\":\"one\"")).toBe(false)
+})
+
+test("a stream that ends without a closing blank line keeps its last piece as it came", () => {
+  const g = held([{ id: "words", rules: try rx("forbidden", "block") }], "chat")
+  expect(g.filter(chunk("hi"))).toBe("")
+  expect(g.finish("data: [DONE]")).toBe("")
+  const rep = g.takeReplay()
+  expect(rep.length).toBe(2)
+  expect(rep[1]).toBe("data: [DONE]")
 })

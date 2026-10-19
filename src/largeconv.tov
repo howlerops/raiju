@@ -1,0 +1,499 @@
+// The converters of a large request, per provider (large_payload_optimization): which targets the streaming
+// conversion (streamconv.tov) serves, the converter for one, and the upstream request for its body.
+import { Field, fields, find, quote, without, setField, build, decodeString, elements } from "./json"
+import { ChatRequest } from "./schemas"
+import { Target, Upstream } from "./providers/types"
+import { ProviderConfig } from "./config"
+import * as anthropic from "./providers/anthropic"
+import * as gemini from "./providers/gemini"
+import * as cohere from "./providers/cohere"
+import * as bedrock from "./providers/bedrock"
+import * as vertex from "./providers/vertex"
+import { ChatConv, MessagesConv, ConvOpts, TailFn, F_ANTHROPIC, F_VERTEX_CLAUDE, F_GEMINI, F_CONVERSE, F_COHERE } from "./streamconv"
+import { bytesOf, textOfBytes, ByteOut } from "./jsonstream"
+import { LargeBody } from "./largepayload"
+import { Sha256, sha256, toHex } from "./crypto"
+import { newId } from "./schemas"
+import { readFileBytesSync, appendFileSync, mkdirSync, rmSync, unlinkSync, readdirSync, statSync, existsSync } from "node:fs"
+
+// A converter for one request: a chat body to the provider's format, or a Messages body to Bedrock/Vertex Claude.
+export class AnyConv {
+  constructor(readonly chat: ChatConv | undefined, readonly msgs: MessagesConv | undefined) {}
+
+  push(b: u8[]): u8[][] throws SyntaxError {
+    const c = this.chat
+    if (c !== undefined) return try c.push(b)
+    const m = this.msgs
+    if (m !== undefined) return try m.push(b)
+    return []
+  }
+
+  finish(): u8[][] throws SyntaxError {
+    const c = this.chat
+    if (c !== undefined) return try c.finish()
+    const m = this.msgs
+    if (m !== undefined) return try m.finish()
+    return []
+  }
+
+  // the request's stream_options.include_usage, once its body has been read (an answer replayed as SSE carries usage when asked)
+  wantsUsage(): bool {
+    const c = this.chat
+    if (c === undefined) return false
+    const so = c.topField("stream_options")
+    if (so === undefined || !so.startsWith("{")) return false
+    try {
+      return find(fields(so), "include_usage") === "true"
+    } catch (e) {
+      return false
+    }
+  }
+}
+
+// Where the gateway keeps the converter of the request in flight (a closure cannot reassign what it captures).
+export class ConvRef {
+  conv: AnyConv | undefined = undefined
+}
+
+// The family of converter that serves a large request of this route to a provider of this kind, or "" when
+// none does (the body is buffered, or refused, as before). `route` is largeRoute's kind.
+export function familyFor(route: string, kind: string, model: string, cfg: ProviderConfig, stream: bool): string {
+  if (route === "chat") {
+    if (kind === "anthropic") {
+      // injection points name messages by their index from either end, and apply only when no message carries
+      // cache_control: both need the whole list
+      const pts = cfg.prompt_cache?.cache_control_injection_points
+      return pts !== undefined && pts.length > 0 ? "" : "anthropic"
+    }
+    if (kind === "gemini") return "gemini"
+    if (kind === "cohere") return "cohere"
+    if (kind === "vertex") return vertex.isClaude(model) ? "vertex-claude" : "gemini"
+    if (kind === "bedrock") {
+      // a key that sends OpenAI-family models to Bedrock's OpenAI-compatible endpoint gets the body as it is, signed
+      for (const k of cfg.keys ?? []) {
+        if (k.bedrock_key_config?.use_openai_endpoints === true) return ""
+      }
+      return "converse"
+    }
+    return ""
+  }
+  if (route === "messages") {
+    // (a Messages stream from Bedrock comes as binary event frames in Bedrock's own envelope: that path stays buffered)
+    if (kind === "bedrock") return stream ? "" : "messages-bedrock"
+    if (kind === "vertex" && vertex.isClaude(model)) return "messages-vertex"
+  }
+  return ""
+}
+
+// Bedrock signs the payload, so its body is known whole (and hashed) before the request is made.
+export function needsHash(family: string): bool {
+  return family === "converse" || family === "messages-bedrock"
+}
+
+// The converter for a family. `autoCache`: the request or the provider asks for prompt cache breakpoints. `wire`: the
+// provider is called as a stream (a chat stream whose events are converted as they arrive, or a Messages stream).
+export function newConv(family: string, model: string, cfg: ProviderConfig, autoCache: bool, wire: bool, holdMax: int, strMax: int): AnyConv {
+  if (family === "messages-bedrock") return new AnyConv(undefined, new MessagesConv(true, "bedrock-2023-05-31", false, strMax))
+  if (family === "messages-vertex") return new AnyConv(undefined, new MessagesConv(false, vertex.CLAUDE_VERSION, wire, strMax))
+  let fmt = F_ANTHROPIC
+  let tail: TailFn = (req, body) => try anthropic.messagesTail(req, body, wire)
+  let cache = autoCache
+  if (family === "vertex-claude") {
+    fmt = F_VERTEX_CLAUDE
+    cache = false
+  } else if (family === "gemini") {
+    fmt = F_GEMINI
+    tail = (req, body) => try gemini.generateTail(req, body, model)
+  } else if (family === "converse") {
+    fmt = F_CONVERSE
+    tail = (req, body) => try bedrock.converseTail(req, body, model)
+  } else if (family === "cohere") {
+    fmt = F_COHERE
+    tail = (req, body) => {
+      const parts = try cohere.chatTail(req, body)
+      if (wire) parts.push(`"stream":true`)
+      return parts
+    }
+  }
+  const o: ConvOpts = { fmt: fmt, model: model, autoCache: cache, cacheMarker: anthropic.cacheMarker(cfg.prompt_cache?.ttl), version: vertex.CLAUDE_VERSION, holdMax: holdMax, strMax: strMax, tail: tail }
+  return new AnyConv(new ChatConv(o), undefined)
+}
+
+// The upstream request (URL and headers, no body) for a converted body. `wire`: called as a stream. `hash` is the
+// body's SHA-256 in hex, for the families that need it.
+export function upstreamFor(family: string, t: Target, wire: bool, hash: string): Upstream throws SyntaxError {
+  if (family === "anthropic") return anthropic.largeRequest(t)
+  if (family === "gemini") return t.kind === "vertex" ? try vertex.largeRequest(t, t.key.value ?? "", wire) : gemini.largeRequest(t, wire)
+  if (family === "cohere") return cohere.largeRequest(t)
+  if (family === "vertex-claude") return try vertex.largeRequest(t, t.key.value ?? "", wire)
+  if (family === "messages-vertex") return try vertex.largeRequest(t, t.key.value ?? "", wire)
+  if (family === "converse") {
+    if (bedrock.takesOpenAIBody(t)) throw new SyntaxError(`${t.provider} sends this model to Bedrock's OpenAI-compatible endpoint, which a large request does not reach`)
+    return bedrock.largeRequest(t, "converse", hash)
+  }
+  if (family === "messages-bedrock") return bedrock.largeRequest(t, "invoke", hash)
+  throw new SyntaxError(`${t.provider}: no streaming conversion`)
+}
+
+// ---- the converted body on its way ----
+
+class Pump {
+  started = false
+  ended = false
+  finished = false
+  queue: u8[][] = []
+}
+
+// The converted body of a large request as a stream: the caller's body (the prefix first) is read as the
+// provider's connection takes the converted bytes, so only what is in flight is held. A body the converter
+// refuses ends the stream with an error and leaves the reason in lg.convError.
+export function convertedStream(lg: LargeBody, conv: AnyConv): ReadableStream {
+  const st = new Pump()
+  return new ReadableStream({
+    async pull(c) {
+      while (st.queue.length === 0 && !st.finished) {
+        let out: u8[][] = []
+        try {
+          if (!st.started) {
+            st.started = true
+            out = conv.push(lg.prefix)
+          } else {
+            const src = lg.source
+            if (src === undefined || st.ended) {
+              out = conv.finish()
+              st.finished = true
+            } else {
+              const r = await src.pull()
+              const v = r.value
+              if (r.done || v === undefined) {
+                st.ended = true
+              } else if (!lg.tap.see(v)) {
+                await src.cancel()
+                throw new Error("the request body is over max_payload_bytes")
+              } else {
+                out = conv.push(v)
+              }
+            }
+          }
+        } catch (e) {
+          if (!lg.tap.over) lg.convError = e.message
+          st.finished = true
+          c.error(e)
+          return
+        }
+        for (const p of out) st.queue.push(p)
+      }
+      const next = st.queue.shift()
+      if (next !== undefined) {
+        c.enqueue(next)
+        return
+      }
+      c.close()
+    },
+    cancel() {
+      const s = lg.source
+      if (s !== undefined) s.cancel()
+    },
+  })
+}
+
+const SEGMENT = 1048576
+
+// Converted bytes kept in files while they are hashed: segments of about 1 MiB in a directory of their own, read
+// back in order (and removed as they go) when the request is sent.
+export class Spool {
+  private dir: string
+  private count = 0
+  private cur = 0
+  size = 0
+  private hasher: Sha256 = new Sha256()
+  private gone = false
+
+  constructor(root: string) throws Error {
+    // a spool left behind by a process that died is removed when a later one starts
+    try {
+      const now = Date.now()
+      for (const n of readdirSync(root)) {
+        if (!n.startsWith("raiju-spool-")) continue
+        const st = statSync(root + "/" + n)
+        if (now - st.mtimeMs > 21600000.0) rmSync(root + "/" + n, { recursive: true, force: true })
+      }
+    } catch (e) {
+      // best effort
+    }
+    this.dir = root + "/raiju-spool-" + newId("")
+    try mkdirSync(this.dir, { recursive: true })
+  }
+
+  private segment(i: int): string {
+    return `${this.dir}/${i}`
+  }
+
+  // the directory the segments are in
+  where(): string {
+    return this.dir
+  }
+
+  segments(): int {
+    return this.count
+  }
+
+  write(b: u8[]): void throws Error {
+    if (b.length === 0) return
+    this.hasher.update(b)
+    this.size += b.length
+    if (this.count === 0 || this.cur >= SEGMENT) {
+      this.count += 1
+      this.cur = 0
+    }
+    try appendFileSync(this.segment(this.count - 1), b)
+    this.cur += b.length
+  }
+
+  // the SHA-256 of everything written, in hex
+  seal(): string {
+    return toHex(this.hasher.digest())
+  }
+
+  // The spooled bytes as a stream; the files go as they are read.
+  stream(): ReadableStream {
+    let i = 0
+    const self = this
+    return new ReadableStream({
+      async pull(c) {
+        if (i >= self.count) {
+          c.close()
+          self.discard()
+          return
+        }
+        try {
+          const b = readFileBytesSync(self.segment(i))
+          unlinkSync(self.segment(i))
+          i += 1
+          c.enqueue(b)
+        } catch (e) {
+          c.error(e)
+          self.discard()
+        }
+      },
+      cancel() {
+        self.discard()
+      },
+    })
+  }
+
+  discard(): void {
+    if (this.gone) return
+    this.gone = true
+    try {
+      rmSync(this.dir, { recursive: true, force: true })
+    } catch (e) {
+      // best effort
+    }
+  }
+}
+
+// The result of spooling a converted body.
+export type Spooled = { ok: bool, over: bool, bad: bool, message: string }
+
+// Converts the whole request into a spool (for a provider that signs the payload), hashing it on the way. On
+// success lg carries the converted body as a stream, its length and its hash.
+export async function spoolConverted(lg: LargeBody, conv: AnyConv): Promise<Spooled> {
+  let sp: Spool | undefined = undefined
+  try {
+    sp = new Spool(process.env.TMPDIR ?? "/tmp")
+  } catch (e) {
+    return { ok: false, over: false, bad: false, message: `could not create the spool directory: ${e.message}` }
+  }
+  const spool = sp!
+  lg.release = () => spool.discard()
+  try {
+    for (const p of conv.push(lg.prefix)) spool.write(p)
+    const src = lg.source
+    while (src !== undefined) {
+      const r = await src.pull()
+      const v = r.value
+      if (r.done || v === undefined) break
+      if (!lg.tap.see(v)) {
+        await src.cancel()
+        spool.discard()
+        return { ok: false, over: true, bad: false, message: "the request body is over max_payload_bytes" }
+      }
+      for (const p of conv.push(v)) spool.write(p)
+    }
+    for (const p of conv.finish()) spool.write(p)
+  } catch (e) {
+    spool.discard()
+    return { ok: false, over: false, bad: e instanceof SyntaxError, message: e.message }
+  }
+  lg.payloadHash = spool.seal()
+  lg.convertedLength = spool.size
+  lg.converted = spool.stream()
+  return { ok: true, over: false, bad: false, message: "" }
+}
+
+// ---- tests: the streaming conversion against the converters that hold the whole body ----
+
+// A JSON text with its keys sorted and its strings re-escaped one way, to compare two bodies that mean the same.
+function canon(raw: string): string throws SyntaxError {
+  const t = raw.trim()
+  if (t.startsWith("{")) {
+    const fs = try fields(t)
+    fs.sort((a, b) => (a.key < b.key ? -1 : (a.key > b.key ? 1 : 0)))
+    const parts: string[] = []
+    for (const f of fs) parts.push(quote(f.key) + ":" + (try canon(f.raw)))
+    return "{" + parts.join(",") + "}"
+  }
+  if (t.startsWith("[")) {
+    const parts: string[] = []
+    for (const e of try elements(t)) parts.push(try canon(e))
+    return "[" + parts.join(",") + "]"
+  }
+  if (t.startsWith("\"")) return quote(try decodeString(t))
+  return t
+}
+
+const MODEL = "target-model"
+
+function targetFor(kind: string): Target {
+  return { provider: kind, kind: kind, model: MODEL, key: {}, cfg: {} }
+}
+
+// what the converters that hold the whole request write
+function reference(family: string, text: string, autoCache: bool, wire: bool): string throws SyntaxError {
+  const req = try JSON.parse(text) as ChatRequest
+  const fs = try fields(text)
+  if (family === "anthropic") return try anthropic.messagesBody(req, fs, MODEL, wire, autoCache)
+  if (family === "vertex-claude") {
+    let g = without(try fields(try anthropic.messagesBody(req, fs, MODEL, wire, false)), ["model"])
+    setField(&g, "anthropic_version", quote(vertex.CLAUDE_VERSION))
+    return build(g)
+  }
+  if (family === "gemini") return try gemini.generateBody(req, fs, MODEL)
+  if (family === "converse") return try bedrock.converseBody(req, fs, autoCache, MODEL)
+  if (wire) return (try cohere.streamRequest(targetFor("cohere"), req, fs)).body
+  return (try cohere.chatRequest(targetFor("cohere"), req, fs)).body
+}
+
+// what the streaming conversion writes, with the request arriving `step` bytes at a time
+function streamed(family: string, text: string, autoCache: bool, step: int, strMax: int, wire: bool): string throws SyntaxError {
+  const c = newConv(family, MODEL, {}, autoCache, wire, 104857600, strMax)
+  const out = new ByteOut()
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    for (const p of try c.push(b.slice(i, e))) out.bytes(p)
+    i = e
+  }
+  for (const p of try c.finish()) out.bytes(p)
+  return textOfBytes(out.all())
+}
+
+function corpus(): string[] {
+  const big = "lorem ipsum dolor sit amet, ".repeat(10)
+  const b64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=".repeat(8)
+  const tools = `"tools":[{"type":"function","function":{"name":"look","description":"look at it","parameters":{"type":"object","properties":{"q":{"type":"integer"}},"required":["q"]}}}],"tool_choice":"required"`
+  return [
+    // plain turns, params
+    `{"model":"m","messages":[{"role":"user","content":"hello there, how are you"}]}`,
+    `{"model":"m","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hello there, how are you"},{"role":"assistant","content":"fine, thanks for asking"},{"role":"user","content":"good to hear it"}],"max_tokens":128,"temperature":0.25,"top_p":0.9,"stop":["END","STOP"],"user":"u-17"}`,
+    `{"model":"m","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":300,"stop":"END"}`,
+    // system messages anywhere, developer role, array system content
+    `{"model":"m","messages":[{"role":"user","content":"first"},{"role":"system","content":"late system"},{"role":"developer","content":[{"type":"text","text":"dev one"},{"type":"text","text":"dev two"}]},{"role":"user","content":"second"}]}`,
+    `{"model":"m","messages":[{"role":"system","content":""},{"role":"system","content":"after an empty one"},{"role":"user","content":"x"}]}`,
+    // turn merging and empty messages
+    `{"model":"m","messages":[{"role":"user","content":"a"},{"role":"user","content":"b"},{"role":"assistant","content":""},{"role":"assistant","content":null},{"role":"user","content":"c"},{"role":"assistant","content":"d"},{"role":"assistant","content":"e"}]}`,
+    // content arrays: text, images (data URL, https URL), unknown parts, empty text
+    `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"look at these"},{"type":"image_url","image_url":{"url":"data:image/png;base64,${b64}"}},{"type":"image_url","image_url":{"url":"https://example.com/cat.png","detail":"high"}},{"type":"input_audio","input_audio":{"data":"${b64}","format":"wav"}},{"type":"text","text":""}]}]}`,
+    `{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpg;base64,${b64}"}},{"type":"image_url","image_url":{"url":"data:application/pdf;base64,${b64}"}}]}]}`,
+    `{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"${big}"},{"type":"image_url","image_url":{"url":"data:image/webp;base64,${b64}"}}]}]}`,
+    // parts with their keys in another order, extra keys
+    `{"model":"m","messages":[{"role":"user","content":[{"text":"type last","type":"text"},{"image_url":{"url":"data:image/png;base64,${b64}","detail":"low"},"type":"image_url"},{"type":"text","text":"extra","cache_control":{"type":"ephemeral"}}]}]}`,
+    // tool calls and results
+    `{"model":"m","messages":[{"role":"user","content":"weather?"},{"role":"assistant","content":"let me look","tool_calls":[{"id":"c1","type":"function","function":{"name":"look","arguments":"{\\"q\\": 1, \\"r\\": [1, 2]}"}},{"id":"c2","type":"function","function":{"name":"look","arguments":"not json"}}]},{"role":"tool","tool_call_id":"c1","content":"sunny"},{"role":"tool","tool_call_id":"c2","content":[{"type":"text","text":"part one, "},{"type":"text","text":"part two"}]},{"role":"user","content":"thanks"}],${tools}}`,
+    `{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"look","arguments":"{}"}}],"content":null},{"role":"tool","tool_call_id":"c1","content":""},{"role":"tool","tool_call_id":"c9","content":[{"type":"text","text":"${big}"}]}]}`,
+    `{"model":"m","messages":[{"role":"tool","tool_call_id":"orphan","content":"no call before it"},{"role":"tool","tool_call_id":"t2"}]}`,
+    // message keys in another order: content first, tool_calls before content
+    `{"model":"m","messages":[{"content":"content before role, long enough","role":"user"},{"tool_calls":[{"id":"c1","type":"function","function":{"name":"look","arguments":"{\\"q\\":2}"}}],"role":"assistant","content":"text after calls"},{"content":"tool text first","tool_call_id":"c1","role":"tool"}]}`,
+    // tools, tool choice by name, response format, reasoning
+    `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"a","parameters":{"type":"object"}}},{"type":"function","function":{"name":"b","description":"second","parameters":null}}],"tool_choice":{"type":"function","function":{"name":"b"}},"response_format":{"type":"json_object"},"max_tokens":50}`,
+    `{"model":"m","messages":[{"role":"user","content":"think"}],"reasoning_effort":"medium","max_tokens":4096,"temperature":0.3,"response_format":{"type":"json_schema","json_schema":{"name":"s","schema":{"type":"object"}}}}`,
+    // unusual layout: params before messages, whitespace, escapes, unicode
+    `  {  "temperature" : 0.5 , "messages" : [ { "role" : "user" , "content" : "caf\\u00e9 \\"quoted\\" \\\\ back\\nslash and \\/ slash" } ] , "model" : "m" , "max_tokens" : 7 }  `,
+    `{"messages":[{"role":"user","content":"unicode: é 日本語 🙂 and more text here"}],"model":"m"}`,
+    // legacy and odd roles
+    `{"model":"m","messages":[{"role":"function","name":"f","content":"result text here"},{"role":"user","content":"u"}]}`,
+    // no messages
+    `{"model":"m","messages":[]}`,
+  ]
+}
+
+test("the streaming conversion writes what the whole-body converters write, for every chunk size", () => {
+  const families = ["anthropic", "vertex-claude", "gemini", "converse", "cohere"]
+  let n = 0
+  for (const text of corpus()) {
+    for (const f of families) {
+      for (const cache of [false, true]) {
+        if (cache && f !== "anthropic" && f !== "converse") continue
+        for (const wire of [false, true]) {
+          if (wire && f !== "anthropic" && f !== "vertex-claude" && f !== "cohere") continue
+          const want = try canon(try reference(f, text, cache, wire))
+          for (const step of [1, 7, 100000]) {
+            for (const mx of [16, 4096]) {
+              const got = try canon(try streamed(f, text, cache, step, mx, wire))
+              if (got !== want) console.log(`MISMATCH ${f} cache=${cache} wire=${wire} step=${step} strMax=${mx}\n  input: ${text}\n  want:  ${want}\n  got:   ${got}`)
+              expect(got).toBe(want)
+              n += 1
+            }
+          }
+        }
+      }
+    }
+  }
+  expect(n > 300).toBe(true)
+})
+
+test("the system prompt of a request that puts it first comes out as the whole-body converters write it", () => {
+  const text = `{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"hi"}],"max_tokens":9}`
+  expect(try streamed("gemini", text, false, 5, 4096, false)).toBe(try reference("gemini", text, false, false))
+  expect(try streamed("converse", text, false, 5, 4096, false)).toBe(try reference("converse", text, false, false))
+  expect(try streamed("cohere", text, false, 5, 4096, false)).toBe(try reference("cohere", text, false, false))
+})
+
+test("a spool hashes what it holds, in segments, and removes its files", () => {
+  const sp = try new Spool("/tmp")
+  const all: u8[] = []
+  const chunk: u8[] = []
+  for (let i = 0; i < 100000; i++) chunk.push(u8((i * 31 + 7) % 251))
+  for (let k = 0; k < 25; k++) {
+    try sp.write(chunk)
+    for (const x of chunk) all.push(x)
+  }
+  expect(sp.size).toBe(2500000)
+  expect(sp.segments()).toBe(3)
+  expect(sp.seal()).toBe(toHex(sha256(all)))
+  expect(existsSync(sp.where())).toBe(true)
+  expect((try readdirSync(sp.where())).length).toBe(3)
+  sp.discard()
+  expect(existsSync(sp.where())).toBe(false)
+})
+
+test("families by route and provider", () => {
+  expect(familyFor("chat", "anthropic", "claude", {}, false)).toBe("anthropic")
+  expect(familyFor("chat", "anthropic", "claude", { prompt_cache: { cache_control_injection_points: [{ role: "user" }] } }, false)).toBe("")
+  expect(familyFor("chat", "vertex", "claude-sonnet-4", {}, false)).toBe("vertex-claude")
+  expect(familyFor("chat", "vertex", "gemini-2.5-flash", {}, false)).toBe("gemini")
+  expect(familyFor("chat", "gemini", "g", {}, false)).toBe("gemini")
+  expect(familyFor("chat", "cohere", "c", {}, false)).toBe("cohere")
+  expect(familyFor("chat", "bedrock", "b", {}, false)).toBe("converse")
+  expect(familyFor("chat", "bedrock", "b", { keys: [{ name: "k", value: "", models: [], weight: 1.0, bedrock_key_config: { region: "us-east-1", use_openai_endpoints: true } }] }, false)).toBe("")
+  expect(familyFor("chat", "openai", "o", {}, false)).toBe("")
+  expect(familyFor("messages", "bedrock", "b", {}, false)).toBe("messages-bedrock")
+  expect(familyFor("messages", "bedrock", "b", {}, true)).toBe("")
+  expect(familyFor("messages", "vertex", "claude-x", {}, true)).toBe("messages-vertex")
+  expect(familyFor("messages", "vertex", "gemini-x", {}, false)).toBe("")
+  expect(familyFor("responses", "anthropic", "claude", {}, false)).toBe("")
+  expect(needsHash("converse")).toBe(true)
+  expect(needsHash("anthropic")).toBe(false)
+})
