@@ -343,3 +343,15 @@ fast-forwarding their worktree to the branch tip.
 | L133 | G22, (g) | MCP: token_exchange clients connected at runtime; code mode gains while, try/except, lambda and f-strings and is offered on the Responses API and POST /mcp | worker | partial: token_exchange clients connect at runtime with an admin credential kept (sealed) by verify-exchange, then each caller's tool calls exchange their own subject token; code mode gains while and lambda (Bifrost's Starlark dialect; try and f-strings stay out, as there), and is offered in POST /mcp tools/list and on /v1/responses (through the chat path). Unit + e2e (l133_e2e). Open: the admin credential is not refreshed (re-verify after expiry; Bifrost uses a refresh token); code mode on Responses has no log row of its own and sends its stream as one burst; meta-tools not listed on virtual MCP endpoints |
 | L134 | (g), (b) | A2A REST binding, push notifications, tasks/resubscribe, upstream OAuth and the aggregated card; the last two missing parity rows (MCP max_instructions_length, x-bf-agent-vk-id and x-bf-agent-auth) | worker | done: A2A REST binding bridged both ways with JSON-RPC, tasks/resubscribe, push notification configs relayed through the gateway (minted ingress token, retries with backoff, /api/agents/push-configs), upstream OAuth client credentials and TLS for agents, forwarded caller credentials, aggregated card at /agents/a2a, card refresh timer; MCP server instructions forwarded with max_instructions_length and Bifrost's caps (src/mcpinstructions.tov); x-bf-agent-vk-id key selection and the x-bf-agent-auth marker (src/agentauth.tov). Parity missing rows 2 to 0. Unit + e2e (l134_e2e, l134b_e2e). Open: no gRPC binding or A2A-Version translation; push store per process (multi-worker loses pushes); no client certificates in Tov fetch; Enterprise agent-token endpoints not in the OSS source |
 
+## Wave 17 (the remaining partial items, then merge to main)
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L135 | (f) pricing | Audio token and per-second rates for every model from a public price file with Bifrost's field names (LiteLLM's model_prices_and_context_window.json, which the Bifrost datasheet descends from; getbifrost.ai is blocked here); the hand-entered gpt-realtime rates are confirmed by it | worker | todo |
+| L136 | G48 | Large payloads to providers whose format differs: streaming request conversion for Anthropic, Gemini, Vertex, Bedrock and Cohere (or the closest correct approach per provider) | worker | todo |
+| L137 | G40 | Realtime and live: one log row per turn as Bifrost logs them, and budgets charged per window or turn, not at session end | worker | todo |
+| L138 | (g) A2A | A2A push store shared by every worker of a node (and the cluster where Bifrost shares it); the gRPC binding | worker | todo |
+| L139 | (e) | LLM plugin hooks on the Anthropic Messages, GenAI, Bedrock and Cohere routes | worker | todo |
+| L140 | (g) MCP | Token-exchange admin credential refreshed before it expires, as Bifrost does | worker | todo |
+| L141 | UI | Chart zoom and series toggles; a permission editor for custom roles | worker | todo |
+
