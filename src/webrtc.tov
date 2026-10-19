@@ -353,14 +353,41 @@ export type Refusal = { status: int, type: string, message: string }
 // refusal), record the finished session, bind the provider's session id to the virtual key that
 // opened it (false when it can't be recorded), and the metrics of an event.
 export class LiveHooks {
-  constructor(readonly readmit: () => Refusal | undefined, readonly report: (r: LiveReport) => void, readonly bind: (id: string) => bool, readonly count: (direction: string, type: string) => void) {}
+  constructor(readonly readmit: () => Refusal | undefined, readonly report: (r: LiveReport) => void, readonly bind: (id: string) => bool, readonly count: (direction: string, type: string) => void, readonly turn: (t: TurnReport) => void) {}
 }
 
 // The tokens a session's responses used under one model, as the provider reported them: the totals,
 // the cached part of the prompt, and the audio tokens among each side's.
 export type ModelTokens = { model: string, prompt: int, completion: int, cached: int, inputAudio: int, outputAudio: int }
 
-// One finished session, for its log row.
+// One billing unit that closed, for its log row, as Bifrost's meter closes them: a window of voice time, a
+// delegated response, or the voice unit that ends a live session ("window", "delegation", "end"); a realtime
+// response ("turn"), or what a turn left behind when the session ended ("end"). The units of a session are
+// linked by its id.
+export type TurnReport = {
+  kind: string,
+  // 1-based, in the order the units closed
+  index: int,
+  sessionId: string,
+  // voice time the provider reported in this unit, and what is billed for it
+  seconds: f64,
+  billedSeconds: f64,
+  promptTokens: int,
+  completionTokens: int,
+  uses: ModelTokens[],
+  status: int,
+  error: string,
+  reason: string,
+  startedMs: f64,
+  endedMs: f64,
+  input: string,
+  output: string,
+  events: int,
+  // the unit that ends the session
+  last: bool,
+}
+
+// One finished session, for its gauge and totals.
 export type LiveReport = {
   sessionId: string,
   // voice time the provider reported, and what is billed (at least the minimum)
@@ -513,6 +540,16 @@ export class LiveCore {
   providerFailed = false
   uses: ModelTokens[] = []
   sessionId = ""
+  // the units already closed: how many, the voice seconds they were reported and billed, and when the
+  // voice unit and the realtime turn that are open began
+  units = 0
+  emittedBilled = 0.0
+  emittedAudio = 0.0
+  unitStartMs: f64 = 0.0
+  turnStartMs: f64 = 0.0
+  // delegated responses that finished after the session was refused: billed on the unit that ends it
+  pendingUses: ModelTokens[] = []
+  lastBackendMs: f64 = 0.0
   // the provider's latest cumulative voice seconds, and those not yet checked against a window
   reported = 0.0
   accrued = 0.0
@@ -544,6 +581,7 @@ export class LiveCore {
 
   constructor(readonly io: LiveIO, readonly hooks: LiveHooks, nowMs: f64) {
     this.startedMs = nowMs
+    this.unitStartMs = nowMs
     this.lastUsageMs = nowMs
     this.nextStaleMs = nowMs + STALE_EVERY_MS
   }
@@ -668,6 +706,7 @@ export class LiveCore {
   private startTurn(): void {
     if (this.turnActive || this.finished || this.refused) return
     this.turnActive = true
+    this.turnStartMs = this.now
     this.lastUsageMs = this.now
     const why = this.hooks.readmit()
     if (why !== undefined) this.endForRefusal(why.type, why.message, why.status)
@@ -697,7 +736,8 @@ export class LiveCore {
     return out
   }
 
-  // A realtime response finished: its usage joins the session's (once per response).
+  // A realtime response finished: its usage joins the session's (once per response) and closes the turn,
+  // which is logged and charged on its own.
   private onRealtimeDone(m: string): void {
     const id = strAt(m, ["response", "id"])
     if (id !== "") {
@@ -705,23 +745,68 @@ export class LiveCore {
       this.billed.add(id)
     }
     const u = ["response", "usage"]
-    this.addTokens(this.model, Math.trunc(numAt(m, u.concat(["input_tokens"]))), Math.trunc(numAt(m, u.concat(["output_tokens"]))),
+    const used = this.addTokens(this.model, Math.trunc(numAt(m, u.concat(["input_tokens"]))), Math.trunc(numAt(m, u.concat(["output_tokens"]))),
       Math.trunc(numAt(m, u.concat(["input_token_details", "cached_tokens"]))), Math.trunc(numAt(m, u.concat(["input_token_details", "audio_tokens"]))),
       Math.trunc(numAt(m, u.concat(["output_token_details", "audio_tokens"]))))
+    const text = this.takeText()
+    const began = this.turnStartMs > 0.0 ? this.turnStartMs : this.now
+    this.turnStartMs = 0.0
+    this.emit("turn", 0.0, 0.0, [used], text.input, text.output, began, this.now, false)
   }
 
-  // Adds tokens to the session's totals and to the model's.
-  private addTokens(model: string, prompt: int, completion: int, cached: int, inputAudio: int, outputAudio: int): void {
+  // Adds tokens to the session's totals and to the model's; what was added is returned.
+  private addTokens(model: string, prompt: int, completion: int, cached: int, inputAudio: int, outputAudio: int): ModelTokens {
     this.promptTokens += prompt
     this.completionTokens += completion
+    const added: ModelTokens = { model: model, prompt: prompt, completion: completion, cached: cached, inputAudio: inputAudio, outputAudio: outputAudio }
     for (let i = 0; i < this.uses.length; i++) {
       const u = this.uses[i]!
       if (u.model === model) {
         this.uses[i] = { model: model, prompt: u.prompt + prompt, completion: u.completion + completion, cached: u.cached + cached, inputAudio: u.inputAudio + inputAudio, outputAudio: u.outputAudio + outputAudio }
-        return
+        return added
       }
     }
-    this.uses.push({ model: model, prompt: prompt, completion: completion, cached: cached, inputAudio: inputAudio, outputAudio: outputAudio })
+    this.uses.push(added)
+    return added
+  }
+
+  // The transcript lines so far as the text a row holds (the caller's, the model's), and they start over.
+  private takeText(): { input: string, output: string } {
+    let input = ""
+    let output = ""
+    for (const l of this.lines) {
+      if (l.role === "user") input += (input === "" ? "" : "\n") + l.text
+      else output += (output === "" ? "" : "\n") + l.text
+    }
+    this.lines = []
+    this.transcriptBytes = 0
+    return { input: input, output: output }
+  }
+
+  // A billing unit closes: its row is handed to the gateway, which logs it and charges it (budgets and
+  // token limits) at once.
+  private emit(kind: string, seconds: f64, billed: f64, uses: ModelTokens[], input: string, output: string, startedMs: f64, endedMs: f64, last: bool): void {
+    this.units += 1
+    let prompt = 0
+    let completion = 0
+    for (const u of uses) {
+      prompt += u.prompt
+      completion += u.completion
+    }
+    this.hooks.turn({
+      kind: kind, index: this.units, sessionId: this.sessionId, seconds: seconds, billedSeconds: billed, promptTokens: prompt, completionTokens: completion, uses: uses,
+      status: last ? this.status : 200, error: last ? this.error : "", reason: last ? this.reason : "", startedMs: startedMs, endedMs: endedMs, input: input, output: output,
+      events: this.events, last: last,
+    })
+  }
+
+  // A voice unit closes: its seconds, as reported and as billed.
+  private emitVoice(kind: string, seconds: f64, billed: f64, last: bool, input: string, output: string): void {
+    this.emittedAudio += seconds
+    this.emittedBilled += billed
+    const began = this.unitStartMs
+    this.unitStartMs = this.now
+    this.emit(kind, seconds, billed, [], input, output, began, this.now, last)
   }
 
   private append(role: string, delta: string): void {
@@ -752,15 +837,24 @@ export class LiveCore {
   }
 
   // The next window starts: the session is admitted for it again (a budget or limit that ran out
-  // ends the session).
+  // ends the session, and the open window is billed with it). Otherwise the window that ends is
+  // logged and charged now, with the voice seconds that accrued in it.
   private window(): void {
     if (this.finished || this.refused) return
-    this.accrued = 0.0
     const why = this.hooks.readmit()
-    if (why !== undefined) this.endForRefusal(why.type, why.message, why.status)
+    if (why !== undefined) {
+      this.endForRefusal(why.type, why.message, why.status)
+      return
+    }
+    const seconds = this.accrued
+    this.accrued = 0.0
+    // (an idle session meets its budget check here, but a window with no voice time is not a row)
+    if (seconds > 0.0) this.emitVoice("window", seconds, seconds, false, "", "")
   }
 
-  // A delegated response finished: its token usage joins the session's (once per response).
+  // A delegated response finished: its token usage joins the session's (once per response). The next
+  // unit is admitted, then this response is logged and charged on its own; a refusal ends the session and
+  // the response is billed with it.
   private onBackend(m: string): void {
     const id = strAt(m, ["event", "response", "id"])
     if (id !== "") {
@@ -772,8 +866,21 @@ export class LiveCore {
     if (model === "") model = this.backendModel
     if (model === "") model = this.model
     const u = ["event", "response", "usage"]
-    this.addTokens(model, Math.trunc(numAt(m, u.concat(["input_tokens"]))), Math.trunc(numAt(m, u.concat(["output_tokens"]))),
+    const used = this.addTokens(model, Math.trunc(numAt(m, u.concat(["input_tokens"]))), Math.trunc(numAt(m, u.concat(["output_tokens"]))),
       Math.trunc(numAt(m, u.concat(["input_tokens_details", "cached_tokens"]))), 0, 0)
+    if (this.finished || this.refused) {
+      this.pendingUses.push(used)
+      return
+    }
+    const began = this.lastBackendMs > 0.0 ? this.lastBackendMs : this.startedMs
+    const why = this.hooks.readmit()
+    if (why !== undefined) {
+      this.pendingUses.push(used)
+      this.endForRefusal(why.type, why.message, why.status)
+      return
+    }
+    this.lastBackendMs = this.now
+    this.emit("delegation", 0.0, 0.0, [used], "", "", began, this.now, false)
   }
 
   // Tells the browser why the session is ending, then closes it upstream so the usage already spent
@@ -862,23 +969,35 @@ export class LiveCore {
     this.finish(this.reported, nowMs)
   }
 
-  // Bills everything and reports the session, once.
+  // Closes the last billing unit, and reports the session, once. The unit that ends a live session carries
+  // what the earlier ones did not: the rest of the voice time (at least the minimum, in all), the
+  // transcript, the status and the close reason. A realtime session ends with a row only when something is
+  // left: a refusal or failure, a turn that never finished, or text no turn took.
   finish(finalSeconds: f64, nowMs: f64): void {
     if (this.finished) return
     this.finished = true
+    this.now = nowMs
     this.drainAt = 0.0
     let seconds = finalSeconds
     if (this.reported > seconds) seconds = this.reported
     const billed = seconds < this.minimum ? this.minimum : seconds
-    let input = ""
-    let output = ""
-    for (const l of this.lines) {
-      if (l.role === "user") input += (input === "" ? "" : "\n") + l.text
-      else output += (output === "" ? "" : "\n") + l.text
+    const text = this.takeText()
+    if (this.realtime) {
+      if (this.status !== 200 || this.turnActive || text.input !== "" || text.output !== "") {
+        this.emit("end", 0.0, 0.0, [], text.input, text.output, this.turnStartMs > 0.0 ? this.turnStartMs : nowMs, nowMs, true)
+      }
+    } else {
+      if (this.pendingUses.length > 0) {
+        this.emit("delegation", 0.0, 0.0, this.pendingUses, "", "", this.lastBackendMs > 0.0 ? this.lastBackendMs : this.startedMs, nowMs, false)
+        this.pendingUses = []
+      }
+      const rest = seconds - this.emittedAudio
+      const owed = billed - this.emittedBilled
+      this.emitVoice("end", rest > 0.0 ? rest : 0.0, owed > 0.0 ? owed : 0.0, true, text.input, text.output)
     }
     this.hooks.report({
       sessionId: this.sessionId, seconds: seconds, billedSeconds: billed, promptTokens: this.promptTokens, completionTokens: this.completionTokens, uses: this.uses,
-      status: this.status, error: this.error, reason: this.reason, startedMs: this.startedMs, endedMs: nowMs, input: input, output: output, events: this.events,
+      status: this.status, error: this.error, reason: this.reason, startedMs: this.startedMs, endedMs: nowMs, input: text.input, output: text.output, events: this.events,
     })
   }
 
@@ -1511,6 +1630,7 @@ class Capture {
   provider: string[] = []
   abandoned = 0
   reports: LiveReport[] = []
+  turns: TurnReport[] = []
   binds: string[] = []
   bindOk = true
   readmitWhy = ""
@@ -1539,6 +1659,8 @@ function fixture(): { core: LiveCore, cap: Capture } {
     return cap.bindOk
   }, (d, t) => {
     cap.counts.push(d + ":" + t)
+  }, (t) => {
+    cap.turns.push(t)
   })
   return { core: new LiveCore(io, hooks, 1000.0), cap: cap }
 }
@@ -1853,6 +1975,8 @@ class RelayFixture {
       return true
     }, (d, t) => {
       cap.counts.push(d + ":" + t)
+    }, (t) => {
+      cap.turns.push(t)
     })
     this.relay = new Relay(hooks, undefined, 1000.0)
     this.relay.client = this.browser.leg()
@@ -2202,4 +2326,202 @@ test("a WebSocket client leg ends with the session's own outcome", () => {
   c.relay.providerBroke()
   expect(c.browser.codes.join(",")).toBe("1011")
   expect(c.cap.reports[0]!.status).toBe(502)
+})
+
+const DONE_2 = `{"type":"response.done","response":{"id":"resp_2","status":"completed","usage":{"total_tokens":30,"input_tokens":20,"output_tokens":10,"input_token_details":{"audio_tokens":5,"cached_tokens":0},"output_token_details":{"audio_tokens":4}}}}`
+
+test("each realtime response is a row of its own, with its tokens and its text", () => {
+  const t = realtimeFixture()
+  t.core.fromProvider(`{"type":"session.created","session":{"id":"sess_rt1"}}`, undefined, 1100.0)
+  t.core.fromClient(`{"type":"response.create"}`, [], 1200.0)
+  t.core.fromProvider(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"hi"}`, undefined, 1250.0)
+  t.core.fromProvider(`{"type":"response.output_audio_transcript.delta","delta":"hello"}`, undefined, 1300.0)
+  expect(t.cap.turns.length).toBe(0)
+  t.core.fromProvider(DONE_1, undefined, 1400.0)
+  expect(t.cap.turns.length).toBe(1)
+  const a = t.cap.turns[0]!
+  expect(a.kind).toBe("turn")
+  expect(a.index).toBe(1)
+  expect(a.sessionId).toBe("sess_rt1")
+  expect(a.promptTokens).toBe(100)
+  expect(a.completionTokens).toBe(50)
+  expect(a.uses[0]!.cached).toBe(20)
+  expect(a.uses[0]!.inputAudio).toBe(40)
+  expect(a.input).toBe("hi")
+  expect(a.output).toBe("hello")
+  expect(a.startedMs).toBe(1200.0)
+  expect(a.endedMs).toBe(1400.0)
+  expect(a.last).toBe(false)
+  // the second turn counts its own tokens only, and none of the first turn's text
+  t.core.fromProvider(`{"type":"response.created","response":{"id":"resp_2"}}`, undefined, 1500.0)
+  t.core.fromProvider(`{"type":"response.output_audio_transcript.delta","delta":"again"}`, undefined, 1550.0)
+  t.core.fromProvider(DONE_2, undefined, 1600.0)
+  expect(t.cap.turns.length).toBe(2)
+  const b = t.cap.turns[1]!
+  expect(b.index).toBe(2)
+  expect(b.promptTokens).toBe(20)
+  expect(b.completionTokens).toBe(10)
+  expect(b.input).toBe("")
+  expect(b.output).toBe("again")
+  expect(b.startedMs).toBe(1500.0)
+  // the same response again is no new row
+  t.core.fromProvider(DONE_2, undefined, 1700.0)
+  expect(t.cap.turns.length).toBe(2)
+  // a session that ends with nothing left adds no row; its report still totals the tokens
+  t.core.clientLeft(1800.0)
+  expect(t.cap.turns.length).toBe(2)
+  expect(t.cap.reports[0]!.promptTokens).toBe(120)
+})
+
+test("a realtime turn is admitted before it is logged: a refusal is a row with the refusal, and no tokens", () => {
+  const t = realtimeFixture()
+  t.core.fromClient(`{"type":"response.create"}`, [], 1100.0)
+  t.core.fromProvider(DONE_1, undefined, 1200.0)
+  expect(t.cap.turns.length).toBe(1)
+  expect(t.cap.turns[0]!.status).toBe(200)
+  t.cap.readmitWhy = "budget is spent"
+  t.core.fromClient(`{"type":"response.create"}`, [], 1300.0)
+  expect(t.cap.turns.length).toBe(2)
+  const r = t.cap.turns[1]!
+  expect(r.kind).toBe("end")
+  expect(r.last).toBe(true)
+  expect(r.status).toBe(429)
+  expect(r.error).toBe("budget is spent")
+  expect(r.promptTokens).toBe(0)
+  expect(r.startedMs).toBe(1300.0)
+})
+
+test("a realtime turn the caller cut off, or text no turn took, is a closing row", () => {
+  const t = realtimeFixture()
+  t.core.fromClient(`{"type":"response.create"}`, [], 1100.0)
+  t.core.clientLeft(1200.0)
+  expect(t.cap.turns.length).toBe(1)
+  expect(t.cap.turns[0]!.kind).toBe("end")
+  expect(t.cap.turns[0]!.status).toBe(200)
+  expect(t.cap.turns[0]!.promptTokens).toBe(0)
+  const u = realtimeFixture()
+  u.core.fromProvider(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"unanswered"}`, undefined, 1100.0)
+  u.core.clientLeft(1200.0)
+  expect(u.cap.turns.length).toBe(1)
+  expect(u.cap.turns[0]!.input).toBe("unanswered")
+  // nothing at all: no row
+  const v = realtimeFixture()
+  v.core.clientLeft(1200.0)
+  expect(v.cap.turns.length).toBe(0)
+})
+
+test("a live session is a row per window of voice time, and the last one carries the end", () => {
+  const t = fixture()
+  const c = t.core
+  c.fromProvider(`{"type":"session.started","session":{"id":"sess_l1"}}`, undefined, 1100.0)
+  c.fromProvider(`{"type":"session.input_transcript.delta","delta":"hello"}`, undefined, 1200.0)
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":20}}`, undefined, 2000.0)
+  expect(t.cap.turns.length).toBe(0)
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":35}}`, undefined, 3000.0)
+  expect(t.cap.turns.length).toBe(1)
+  expect(t.cap.turns[0]!.kind).toBe("window")
+  expect(t.cap.turns[0]!.seconds).toBe(35.0)
+  expect(t.cap.turns[0]!.billedSeconds).toBe(35.0)
+  expect(t.cap.turns[0]!.input).toBe("")
+  c.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":80}}`, undefined, 4000.0)
+  expect(t.cap.turns.length).toBe(2)
+  expect(t.cap.turns[1]!.seconds).toBe(45.0)
+  c.fromProvider(`{"type":"session.closed","reason":"close_requested","usage":{"seconds":90}}`, undefined, 5000.0)
+  expect(t.cap.turns.length).toBe(3)
+  const e = t.cap.turns[2]!
+  expect(e.kind).toBe("end")
+  expect(e.last).toBe(true)
+  expect(e.seconds).toBe(10.0)
+  expect(e.billedSeconds).toBe(10.0)
+  expect(e.reason).toBe("close_requested")
+  expect(e.input).toBe("hello")
+  expect(e.sessionId).toBe("sess_l1")
+  // the rows add up to what the session ran
+  let sum = 0.0
+  for (const x of t.cap.turns) sum += x.billedSeconds
+  expect(sum).toBe(90.0)
+  expect(t.cap.turns[0]!.index).toBe(1)
+  expect(e.index).toBe(3)
+})
+
+test("the minimum voice time is billed once, on the unit that ends a short session", () => {
+  const t = fixture()
+  t.core.fromProvider(`{"type":"session.closed","usage":{"seconds":4}}`, undefined, 2000.0)
+  expect(t.cap.turns.length).toBe(1)
+  expect(t.cap.turns[0]!.seconds).toBe(4.0)
+  expect(t.cap.turns[0]!.billedSeconds).toBe(15.0)
+  // a session past the minimum in its first window owes no more at the end
+  const u = fixture()
+  u.core.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":31}}`, undefined, 2000.0)
+  u.core.fromProvider(`{"type":"session.closed","usage":{"seconds":33}}`, undefined, 3000.0)
+  expect(u.cap.turns.length).toBe(2)
+  expect(u.cap.turns[0]!.billedSeconds).toBe(31.0)
+  expect(u.cap.turns[1]!.billedSeconds).toBe(2.0)
+})
+
+test("a refused window leaves the open window to the closing row, with the refusal", () => {
+  const t = fixture()
+  t.core.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":31}}`, undefined, 2000.0)
+  expect(t.cap.turns.length).toBe(1)
+  t.cap.readmitWhy = "budget exceeded"
+  t.core.fromProvider(`{"type":"session.usage.updated","usage":{"seconds":62}}`, undefined, 3000.0)
+  // the window that was refused is not closed yet
+  expect(t.cap.turns.length).toBe(1)
+  t.core.fromProvider(`{"type":"session.closed","usage":{"seconds":62}}`, undefined, 3100.0)
+  expect(t.cap.turns.length).toBe(2)
+  const e = t.cap.turns[1]!
+  expect(e.status).toBe(429)
+  expect(e.error).toBe("budget exceeded")
+  expect(e.seconds).toBe(31.0)
+  expect(e.billedSeconds).toBe(31.0)
+})
+
+test("each delegated response is a row of its own with its model's tokens, admitted first", () => {
+  const t = fixture()
+  t.core.model = "gpt-live"
+  t.core.backendModel = "gpt-5.4"
+  t.core.fromProvider(`{"type":"response.event","event":{"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":30}}}}}`, undefined, 1100.0)
+  expect(t.cap.readmits).toBe(1)
+  expect(t.cap.turns.length).toBe(1)
+  const a = t.cap.turns[0]!
+  expect(a.kind).toBe("delegation")
+  expect(a.promptTokens).toBe(100)
+  expect(a.uses[0]!.model).toBe("gpt-5.4")
+  expect(a.uses[0]!.cached).toBe(30)
+  expect(a.billedSeconds).toBe(0.0)
+  t.core.fromProvider(`{"type":"response.event","event":{"type":"response.completed","response":{"id":"r2","model":"gpt-5.4-mini","usage":{"input_tokens":7,"output_tokens":3}}}}`, undefined, 1200.0)
+  expect(t.cap.turns.length).toBe(2)
+  expect(t.cap.turns[1]!.uses[0]!.model).toBe("gpt-5.4-mini")
+  expect(t.cap.turns[1]!.promptTokens).toBe(7)
+  // the same response again is no new row
+  t.core.fromProvider(`{"type":"response.event","event":{"type":"response.completed","response":{"id":"r2","usage":{"input_tokens":7,"output_tokens":3}}}}`, undefined, 1250.0)
+  expect(t.cap.turns.length).toBe(2)
+  // a response whose admission is refused ends the session and is billed on the closing rows
+  t.cap.readmitWhy = "budget exceeded"
+  t.core.fromProvider(`{"type":"response.event","event":{"type":"response.completed","response":{"id":"r3","usage":{"input_tokens":50,"output_tokens":5}}}}`, undefined, 1300.0)
+  expect(t.cap.turns.length).toBe(2)
+  t.core.fromProvider(`{"type":"session.closed","usage":{"seconds":20}}`, undefined, 1400.0)
+  expect(t.cap.turns.length).toBe(4)
+  expect(t.cap.turns[2]!.kind).toBe("delegation")
+  expect(t.cap.turns[2]!.promptTokens).toBe(50)
+  expect(t.cap.turns[3]!.kind).toBe("end")
+  expect(t.cap.turns[3]!.status).toBe(429)
+  // every token the provider reported is in some row
+  let sum = 0
+  for (const x of t.cap.turns) sum += x.promptTokens
+  expect(sum).toBe(157)
+})
+
+test("an idle live session meets its budget check, and logs no row for a window with no voice time", () => {
+  const t = fixture()
+  t.core.tick(70000.0)
+  expect(t.cap.readmits).toBe(1)
+  expect(t.cap.turns.length).toBe(0)
+  // a refusal at that check ends the session, with the closing row
+  t.cap.readmitWhy = "budget exceeded"
+  t.core.tick(140000.0)
+  t.core.fromProvider(`{"type":"session.closed","usage":{"seconds":0}}`, undefined, 141000.0)
+  expect(t.cap.turns.length).toBe(1)
+  expect(t.cap.turns[0]!.status).toBe(429)
+  expect(t.cap.turns[0]!.billedSeconds).toBe(15.0)
 })

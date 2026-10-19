@@ -11,10 +11,10 @@
 // price list does not know.
 import { Engine, LiveCost } from "./gateway"
 import { Grant } from "./governance"
-import { Hdrs } from "./schemas"
+import { Hdrs, newId } from "./schemas"
 import { Pricing, parseDatasheet } from "./pricing"
 import * as metrics from "./metrics"
-import { LiveHooks, LiveReport, GuardFn, Verdict } from "./webrtc"
+import { LiveHooks, ModelTokens, TurnReport, GuardFn, Verdict } from "./webrtc"
 
 // What a session is: "live" or "realtime", the transport that carries it ("webrtc" or "websocket"),
 // and the provider and model it runs.
@@ -55,14 +55,18 @@ export function eventLabel(op: string, type: string): string {
   return known.includes(type) ? type : "other"
 }
 
-// What a finished session cost: the voice seconds it was billed, and its tokens by the model that used
-// them (a token count with no model is the session's own). Only a live session bills voice seconds, as
-// Bifrost's LiveRequest does; a realtime session is billed by its tokens alone (RealtimeRequest).
-export function liveCost(pricing: Pricing, provider: string, model: string, r: LiveReport, op: string): LiveCost {
-  let input = 0.0
-  if (op === "live") input = pricing.voiceCost(provider, model, r.billedSeconds)
+// What a billing unit cost: the voice seconds it was billed, and its tokens by the model that used them (a
+// token count with no model is the session's own). Callers pass voiceSeconds, so a realtime unit bills no
+// seconds: only a live session is billed by its voice time (Bifrost's LiveRequest; RealtimeRequest is tokens).
+// The voice seconds a unit is billed for: a live session's own, and none for a realtime one.
+export function voiceSeconds(op: string, billedSeconds: f64): f64 {
+  return op === "live" ? billedSeconds : 0.0
+}
+
+export function liveCost(pricing: Pricing, provider: string, model: string, billedSeconds: f64, uses: ModelTokens[]): LiveCost {
+  let input = pricing.voiceCost(provider, model, billedSeconds)
   let output = 0.0
-  for (const u of r.uses) {
+  for (const u of uses) {
     const m = u.model === "" ? model : u.model
     const c = pricing.usageParts(provider, m, { prompt: u.prompt, completion: u.completion, cached: u.cached, inputAudio: u.inputAudio, outputAudio: u.outputAudio })
     input += c.input
@@ -71,25 +75,31 @@ export function liveCost(pricing: Pricing, provider: string, model: string, r: L
   return { total: input + output, input: input, output: output }
 }
 
-// The metadata of a finished session's log row.
-export function sessionMeta(spec: SessionSpec, r: LiveReport): Record<string, string> {
+// The metadata of a unit's log row: the session it belongs to (sessionKey, which is also the row's parent
+// request id), what kind of unit it is and its place in the session, and what it used.
+export function unitMeta(spec: SessionSpec, sessionKey: string, t: TurnReport): Record<string, string> {
   const m: Record<string, string> = {}
+  m.set("session_request_id", sessionKey)
   if (spec.op === "live") {
     m.set("live_transport", spec.transport)
-    m.set("live_audio_seconds", "" + r.seconds)
-    m.set("live_billed_seconds", "" + r.billedSeconds)
-    if (r.sessionId !== "") m.set("live_session_id", r.sessionId)
-    if (r.reason !== "") m.set("live_close_reason", r.reason)
-    m.set("live_events", "" + r.events)
+    m.set("live_unit", t.kind)
+    m.set("live_unit_index", "" + t.index)
+    m.set("live_audio_seconds", "" + t.seconds)
+    m.set("live_billed_seconds", "" + t.billedSeconds)
+    if (t.sessionId !== "") m.set("live_session_id", t.sessionId)
+    if (t.reason !== "") m.set("live_close_reason", t.reason)
+    m.set("live_events", "" + t.events)
     return m
   }
   m.set("realtime_transport", spec.transport)
-  if (r.sessionId !== "") m.set("realtime_session_id", r.sessionId)
-  m.set("realtime_events", "" + r.events)
+  m.set("realtime_unit", t.kind)
+  m.set("realtime_unit_index", "" + t.index)
+  if (t.sessionId !== "") m.set("realtime_session_id", t.sessionId)
+  m.set("realtime_events", "" + t.events)
   let cached = 0
   let inAudio = 0
   let outAudio = 0
-  for (const u of r.uses) {
+  for (const u of t.uses) {
     cached += u.cached
     inAudio += u.inputAudio
     outAudio += u.outputAudio
@@ -111,8 +121,10 @@ function eventsCounter(spec: SessionSpec): string {
 }
 
 // The hooks of one session: it is counted open from here until its report; each window or turn is
-// admitted again by governance; every event is counted; the report bills the session, counts its voice
-// seconds or tokens, and writes its row. bind records the provider's session id for the key that opened it
+// admitted again by governance; every event is counted; each billing unit that closes (a window of voice
+// time, a delegated response, a realtime turn, the unit that ends the session) counts its voice seconds or
+// tokens, is written as a row of its own linked to the session and is charged to the budgets and limits
+// at once. bind records the provider's session id for the key that opened it
 // (false when it can't be recorded).
 export function sessionHooks(engine: Engine, h: Hdrs, grant: Grant, spec: SessionSpec, bind: (id: string) => bool): LiveHooks {
   const provider = spec.provider
@@ -121,22 +133,28 @@ export function sessionHooks(engine: Engine, h: Hdrs, grant: Grant, spec: Sessio
   const gauge = sessionsGauge(spec)
   const counter = eventsCounter(spec)
   metrics.addGauge(gauge, labels, 1.0)
+  // the id every row of the session carries as its parent (unless the caller names its own parent)
+  const given = (h.get("x-request-id") ?? "").trim()
+  const sessionKey = given !== "" ? given : newId("sess_")
   return new LiveHooks(() => {
     // each window of voice time, and each turn, is admitted again, as Bifrost's meter does for its next unit
     const again = engine.gov.admit(h, provider, model)
     if (again.kind === "denial") return { status: again.status, type: again.type, message: again.message }
     return undefined
   }, (r) => {
+    // the session is over; its units were logged and charged as they closed
     metrics.addGauge(gauge, labels, -1.0)
-    if (spec.op === "live") {
-      metrics.inc("raiju_live_audio_seconds_total", labels, r.billedSeconds)
-    } else {
-      metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "input"), r.promptTokens * 1.0)
-      metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "output"), r.completionTokens * 1.0)
-    }
-    engine.recordLive(spec.op, h, grant, provider, model, r.status, r.endedMs - r.startedMs, r.promptTokens, r.completionTokens, r.input, r.output, r.error, sessionMeta(spec, r), liveCost(engine.pricing, provider, model, r, spec.op))
   }, bind, (direction, type) => {
     metrics.inc(counter, `direction="${direction}",type="${eventLabel(spec.op, type)}"`, 1.0)
+  }, (t) => {
+    // a unit closed: its metrics, its row and its charge, now rather than when the session ends
+    if (spec.op === "live") {
+      metrics.inc("raiju_live_audio_seconds_total", labels, t.billedSeconds)
+    } else {
+      metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "input"), t.promptTokens * 1.0)
+      metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "output"), t.completionTokens * 1.0)
+    }
+    engine.recordLive(spec.op, h, grant, provider, model, t.status, t.endedMs - t.startedMs, t.promptTokens, t.completionTokens, t.input, t.output, t.error, unitMeta(spec, sessionKey, t), liveCost(engine.pricing, provider, model, voiceSeconds(spec.op, t.billedSeconds), t.uses), newId("req_"), sessionKey)
   })
 }
 
@@ -151,59 +169,55 @@ export function sessionGuard(engine: Engine): GuardFn | undefined {
   return (text: string, source: string): Promise<Verdict> => verdictOf(engine, text, source)
 }
 
-function report(): LiveReport {
-  return { sessionId: "", seconds: 0.0, billedSeconds: 0.0, promptTokens: 0, completionTokens: 0, uses: [], status: 200, error: "", reason: "", startedMs: 0.0, endedMs: 0.0, input: "", output: "", events: 0 }
+
+function unit(): TurnReport {
+  return { kind: "end", index: 1, sessionId: "", seconds: 0.0, billedSeconds: 0.0, promptTokens: 0, completionTokens: 0, uses: [], status: 200, error: "", reason: "", startedMs: 0.0, endedMs: 0.0, input: "", output: "", events: 0, last: false }
 }
 
-test("a live session costs its billed voice seconds and the tokens of its delegated responses", () => {
+test("a live unit costs its billed voice seconds and the tokens of its delegated responses", () => {
   const p = new Pricing({})
   const csv = "{\"live-x\": {\"provider\": \"acme\", \"input_cost_per_second\": 0.002}, \"back-x\": {\"provider\": \"acme\", \"input_cost_per_token\": 0.000001, \"output_cost_per_token\": 0.000004, \"cache_read_input_token_cost\": 0.0000001}}"
   p.replaceCatalog(try parseDatasheet(csv))
-  const r = report()
-  r.billedSeconds = 40.0
-  r.uses = [{ model: "back-x", prompt: 1000, completion: 100, cached: 500, inputAudio: 0, outputAudio: 0 }, { model: "", prompt: 0, completion: 0, cached: 0, inputAudio: 0, outputAudio: 0 }]
-  const c = liveCost(p, "acme", "live-x", r, "live")
+  const uses: ModelTokens[] = [{ model: "back-x", prompt: 1000, completion: 100, cached: 500, inputAudio: 0, outputAudio: 0 }, { model: "", prompt: 0, completion: 0, cached: 0, inputAudio: 0, outputAudio: 0 }]
+  const c = liveCost(p, "acme", "live-x", 40.0, uses)
   // 40 s at 0.002 on the input side; 500 fresh + 500 cached tokens in, 100 out
   expect(c.input).toBeCloseTo(0.08 + 0.0005 + 0.00005)
   expect(c.output).toBeCloseTo(0.0004)
   expect(c.total).toBeCloseTo(c.input + c.output)
   // a model the list does not know costs nothing
-  expect(liveCost(p, "acme", "nowhere", report(), "live").total).toBe(0.0)
+  expect(liveCost(p, "acme", "nowhere", 0.0, []).total).toBe(0.0)
+  // windows add up to the session: 30 s and 10 s cost what 40 s do
+  const a = liveCost(p, "acme", "live-x", 30.0, [])
+  const b = liveCost(p, "acme", "live-x", 10.0, [])
+  expect(a.total + b.total).toBeCloseTo(0.08)
 })
 
-test("only a live session bills voice seconds: a realtime session of the same model is billed by its tokens", () => {
-  const p = new Pricing({})
-  const csv = "{\"live-x\": {\"provider\": \"acme\", \"input_cost_per_second\": 0.002, \"input_cost_per_token\": 0.000001, \"output_cost_per_token\": 0.000004}}"
-  p.replaceCatalog(try parseDatasheet(csv))
-  const r = report()
-  r.billedSeconds = 40.0
-  r.uses = [{ model: "live-x",prompt: 1000, completion: 100, cached: 0, inputAudio: 0, outputAudio: 0 }]
-  // as a live session: 40 s at 0.002, and the tokens at their rates
-  expect(liveCost(p, "acme", "live-x", r, "live").input).toBeCloseTo(0.08 + 0.001)
-  // as a realtime session: the same tokens, and no voice time
-  const rt = liveCost(p, "acme", "live-x", r, "realtime")
-  expect(rt.input).toBeCloseTo(0.001)
-  expect(rt.output).toBeCloseTo(0.0004)
-  expect(rt.total).toBeCloseTo(0.0014)
-})
-
-test("a realtime session costs its tokens at the text and audio rates", () => {
+test("a realtime turn costs its tokens at the text and audio rates", () => {
   const p = new Pricing({})
   const csv = "{\"rt-x\": {\"provider\": \"acme\", \"input_cost_per_token\": 0.000004, \"output_cost_per_token\": 0.000016, \"cache_read_input_token_cost\": 0.0000004, \"input_cost_per_audio_token\": 0.000032, \"output_cost_per_audio_token\": 0.000064}}"
   p.replaceCatalog(try parseDatasheet(csv))
-  const r = report()
-  r.uses = [{ model: "rt-x", prompt: 1000, completion: 500, cached: 200, inputAudio: 300, outputAudio: 400 }]
-  const c = liveCost(p, "acme", "rt-x", r, "realtime")
+  const one: ModelTokens[] = [{ model: "rt-x", prompt: 1000, completion: 500, cached: 200, inputAudio: 300, outputAudio: 400 }]
+  const c = liveCost(p, "acme", "rt-x", 0.0, one)
   expect(c.input).toBeCloseTo(0.002 + 0.0096 + 0.00008)
   expect(c.output).toBeCloseTo(0.0016 + 0.0256)
-  // two responses under one model add up the same as one
-  r.uses = [{ model: "rt-x", prompt: 500, completion: 250, cached: 100, inputAudio: 150, outputAudio: 200 }, { model: "rt-x", prompt: 500, completion: 250, cached: 100, inputAudio: 150, outputAudio: 200 }]
-  expect(liveCost(p, "acme", "rt-x", r, "realtime").total).toBeCloseTo(c.total)
+  // two turns cost what one turn of their sum does
+  const half: ModelTokens[] = [{ model: "rt-x", prompt: 500, completion: 250, cached: 100, inputAudio: 150, outputAudio: 200 }]
+  expect(liveCost(p, "acme", "rt-x", 0.0, half).total * 2.0).toBeCloseTo(c.total)
   // the built-in table prices gpt-realtime audio at the audio rates
   const q = new Pricing({})
-  const g = report()
-  g.uses = [{ model: "gpt-realtime", prompt: 1000000, completion: 1000000, cached: 0, inputAudio: 1000000, outputAudio: 1000000 }]
-  expect(liveCost(q, "openai", "gpt-realtime", g, "realtime").total).toBeCloseTo(32.0 + 64.0)
+  const g: ModelTokens[] = [{ model: "gpt-realtime", prompt: 1000000, completion: 1000000, cached: 0, inputAudio: 1000000, outputAudio: 1000000 }]
+  expect(liveCost(q, "openai", "gpt-realtime", 0.0, g).total).toBeCloseTo(32.0 + 64.0)
+})
+
+test("only a live session bills voice seconds: a realtime unit of the same model is billed by its tokens", () => {
+  const p = new Pricing({})
+  const csv = "{\"live-x\": {\"provider\": \"acme\", \"input_cost_per_second\": 0.002, \"input_cost_per_token\": 0.000001, \"output_cost_per_token\": 0.000004}}"
+  p.replaceCatalog(try parseDatasheet(csv))
+  const uses: ModelTokens[] = [{ model: "live-x", prompt: 1000, completion: 100, cached: 0, inputAudio: 0, outputAudio: 0 }]
+  expect(liveCost(p, "acme", "live-x", voiceSeconds("live", 40.0), uses).input).toBeCloseTo(0.08 + 0.001)
+  const rt = liveCost(p, "acme", "live-x", voiceSeconds("realtime", 40.0), uses)
+  expect(rt.input).toBeCloseTo(0.001)
+  expect(rt.total).toBeCloseTo(0.0014)
 })
 
 test("event labels are the API's own, and anything else is other", () => {
@@ -213,22 +227,32 @@ test("event labels are the API's own, and anything else is other", () => {
   expect(eventLabel("realtime", "made.up.by.a.client")).toBe("other")
 })
 
-test("a finished session's metadata names its transport, seconds and tokens", () => {
+test("a unit's metadata names its session, kind, transport, seconds and tokens", () => {
   const live: SessionSpec = { op: "live", transport: "websocket", provider: "openai", model: "gpt-live" }
-  const r = report()
+  const r = unit()
+  r.kind = "window"
+  r.index = 2
   r.sessionId = "sess_1"
   r.seconds = 12.5
   r.billedSeconds = 12.5
   r.events = 7
-  const m = sessionMeta(live, r)
+  const m = unitMeta(live, "req-key", r)
+  expect(m.get("session_request_id")).toBe("req-key")
   expect(m.get("live_transport")).toBe("websocket")
+  expect(m.get("live_unit")).toBe("window")
+  expect(m.get("live_unit_index")).toBe("2")
   expect(m.get("live_billed_seconds")).toBe("12.5")
   expect(m.get("live_session_id")).toBe("sess_1")
   expect(m.get("live_events")).toBe("7")
+  expect(m.has("live_close_reason")).toBe(false)
+  r.reason = "close_requested"
+  expect(unitMeta(live, "req-key", r).get("live_close_reason")).toBe("close_requested")
   const rt: SessionSpec = { op: "realtime", transport: "webrtc", provider: "openai", model: "gpt-realtime" }
+  r.kind = "turn"
   r.uses = [{ model: "gpt-realtime", prompt: 10, completion: 5, cached: 3, inputAudio: 4, outputAudio: 2 }]
-  const n = sessionMeta(rt, r)
+  const n = unitMeta(rt, "req-key", r)
   expect(n.get("realtime_transport")).toBe("webrtc")
+  expect(n.get("realtime_unit")).toBe("turn")
   expect(n.get("realtime_cached_tokens")).toBe("3")
   expect(n.get("realtime_input_audio_tokens")).toBe("4")
   expect(n.get("realtime_output_audio_tokens")).toBe("2")

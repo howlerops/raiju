@@ -5076,17 +5076,54 @@ def rtc_client(base, script, auth="Bearer sk-bf-openai", model="openai/gpt-4o-mi
             return json.loads(line[7:])
     return {"error": (p.stdout + p.stderr)[-400:]}
 
-def live_row(session_id, base=None, headers=None, wait_s=8):
-    """The log row of a finished live session (it is written when the session ends, a moment after the
-    browser's last event)."""
-    base = base or GW
+def unit_index(row):
+    md = row.get("metadata", {})
+    return int(md.get("live_unit_index") or md.get("realtime_unit_index") or 0)
+
+def session_rows(op, session_id, base, headers=None, wait_s=8, until_end=True):
+    """The log rows of one live or realtime session, in the order its units closed: a row per window of voice time,
+    per delegated response and per realtime turn, found by the provider's session id in their metadata. A live
+    session's last row (live_unit "end") is written when it ends, so that is waited for; a realtime session has no
+    marked end, so the rows that exist are given a moment to settle. until_end=False returns the rows of a live
+    session as soon as it has any (it is still open)."""
+    key = "live_session_id" if op == "live" else "realtime_session_id"
+    rows = []
     for _ in range(int(wait_s * 10)):
-        s, _, b = call("GET", "/api/logs?limit=500", base=base, headers=headers)
-        rows = [e for e in (json.loads(b).get("entries", []) if s == 200 else []) if e.get("op") == "live" and e.get("metadata", {}).get("live_session_id") == session_id]
-        if rows:
-            return rows[0]
+        s, _, b = call("GET", "/api/logs?limit=500", base=base, headers=headers or ADMIN)
+        rows = [e for e in (json.loads(b).get("entries", []) if s == 200 else []) if e.get("op") == op and e.get("metadata", {}).get(key) == session_id]
+        if rows and (op == "realtime" or not until_end or any(r.get("metadata", {}).get("live_unit") == "end" for r in rows)):
+            if op == "realtime" and until_end:
+                time.sleep(0.3)
+                s, _, b = call("GET", "/api/logs?limit=500", base=base, headers=headers or ADMIN)
+                rows = [e for e in (json.loads(b).get("entries", []) if s == 200 else []) if e.get("op") == op and e.get("metadata", {}).get(key) == session_id]
+            break
         time.sleep(0.1)
-    return {}
+    return sorted(rows, key=unit_index)
+
+def merge_rows(rows):
+    """One view of a session's rows: the last row's fields (the session's end: its status, error and close reason),
+    with the tokens, costs, voice seconds and text of every row summed. The checks that ask what a whole session used
+    read this; the checks about the rows themselves read session_rows."""
+    if not rows:
+        return {}
+    out = json.loads(json.dumps(rows[-1]))
+    md = out.setdefault("metadata", {})
+    for k in ("prompt_tokens", "completion_tokens", "cost", "input_cost", "output_cost"):
+        out[k] = sum(r.get(k) or 0 for r in rows)
+    for k in ("live_audio_seconds", "live_billed_seconds"):
+        if k in md:
+            md[k] = str(sum(float(r.get("metadata", {}).get(k, 0)) for r in rows))
+    for k in ("realtime_cached_tokens", "realtime_input_audio_tokens", "realtime_output_audio_tokens"):
+        if k in md:
+            md[k] = str(sum(int(r.get("metadata", {}).get(k, 0)) for r in rows))
+    out["input"] = "".join(r.get("input") or "" for r in rows)
+    out["output"] = "".join(r.get("output") or "" for r in rows)
+    return out
+
+def live_row(session_id, base=None, headers=None, wait_s=8):
+    """The merged log row of a finished live session (its rows are written as its windows close, the last when it
+    ends, a moment after the browser's last event)."""
+    return merge_rows(session_rows("live", session_id, base or GW, headers, wait_s))
 
 def live_rows(base, headers, op_error=None):
     s, _, b = call("GET", "/api/logs?limit=500", base=base, headers=headers)
@@ -5133,8 +5170,12 @@ def webrtc_e2e(env):
            "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-live-logs"), "content_logging": True},
            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+           # a voice rate for the live model, so a window has a cost to spend a budget with
+           "pricing": {"openai/gpt-4o-mini": {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0, "input_cost_per_second": 0.001}},
            "governance": {"rate_limits": [{"id": "live-rl", "request_max_limit": 2, "request_reset_duration": "1h"}],
-                          "virtual_keys": [{"id": "vk-live", "value": "sk-bf-live", "rate_limit_id": "live-rl"}, {"id": "vk-live-free", "value": "sk-bf-live-free"}]},
+                          "budgets": [{"id": "live-bud", "max_limit": 0.05, "reset_duration": "1h"}],
+                          "virtual_keys": [{"id": "vk-live", "value": "sk-bf-live", "rate_limit_id": "live-rl"}, {"id": "vk-live-free", "value": "sk-bf-live-free"},
+                                           {"id": "vk-live-bud", "value": "sk-bf-live-bud", "budget_id": "live-bud"}]},
            "guardrails": {"enabled": True, "apply_to": "both", "detect": [], "providers": [
                {"id": "house-rules", "kind": "regex", "apply_to": "both", "patterns": [
                    {"pattern": "PROJECT-\\d+", "description": "Codename", "action": "block"},
@@ -5195,6 +5236,13 @@ def webrtc_e2e(env):
         check("the gateway closes that session at the provider", types == ["test.usage", "test.usage", "session.close"], types)
         row = live_row(r.get("session", "none"), GW_R, ADMIN)
         check("and it is logged with the refusal and the seconds it ran", row.get("status") == 429 and float(row.get("metadata", {}).get("live_billed_seconds", -1)) == 62.0 and row.get("virtual_key") == "vk-live", row)
+
+        # a budget spent window by window (L137): each window of 31 s costs 0.031 against 0.05, charged as it closes
+        r = rtc_client(GW_R, [{"send": {"type": "test.usage", "seconds": 31}}, {"sleep": 300}, {"send": {"type": "test.usage", "seconds": 62}}, {"sleep": 300}, {"send": {"type": "test.usage", "seconds": 93}}, {"wait": "error", "ms": 8000}, {"sleep": 800}], auth="Bearer sk-bf-live-bud")
+        errs = [e for e in r.get("events", []) if e.get("type") == "error"]
+        check("a budget the WebRTC live session spent window by window refuses its next window", r.get("status") == 201 and len(errs) == 1 and errs[0]["error"]["type"] == "budget_exceeded", (r.get("status"), errs))
+        rows = session_rows("live", r.get("session", "none"), GW_R, ADMIN)
+        check("its windows are rows of their own, charged as they closed, and the refused one closes the session", [x["metadata"].get("live_unit") for x in rows] == ["window", "window", "end"] and [x["metadata"].get("live_transport") for x in rows] == ["webrtc"] * 3 and near(rows[0].get("cost"), 0.031) and near(rows[1].get("cost"), 0.031) and rows[2].get("status") == 402 and len({x.get("parent_request_id") for x in rows}) == 1, [(x["metadata"].get("live_unit"), x.get("status"), x.get("cost")) for x in rows])
     finally:
         gw.terminate()
         gw.wait()
@@ -5217,15 +5265,8 @@ def ws_collect(c, stop, limit=60):
     return out
 
 def session_row(op, session_id, base, wait_s=8):
-    """The log row of a finished live or realtime session, found by the session id in its metadata."""
-    key = "live_session_id" if op == "live" else "realtime_session_id"
-    for _ in range(int(wait_s * 10)):
-        s, _, b = call("GET", "/api/logs?limit=500", base=base, headers=ADMIN)
-        rows = [e for e in (json.loads(b).get("entries", []) if s == 200 else []) if e.get("op") == op and e.get("metadata", {}).get(key) == session_id]
-        if rows:
-            return rows[0]
-        time.sleep(0.1)
-    return {}
+    """The merged log row of a finished live or realtime session (merge_rows), found by the session id in its metadata."""
+    return merge_rows(session_rows(op, session_id, base, ADMIN, wait_s))
 
 def near(a, b, tol=1e-9):
     return a is not None and abs(float(a) - b) <= tol
@@ -5254,9 +5295,16 @@ def realtime_e2e(env):
                "openai/gpt-realtime": rt_price,
                "xai/grok-realtime": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.00001}},
            "governance": {"rate_limits": [{"id": "rl-live", "request_max_limit": 2, "request_reset_duration": "1h"}, {"id": "rl-rt", "request_max_limit": 2, "request_reset_duration": "1h"},
-                                          {"id": "rl-call", "request_max_limit": 2, "request_reset_duration": "1h"}],
+                                          {"id": "rl-call", "request_max_limit": 2, "request_reset_duration": "1h"},
+                                          {"id": "rl-tok", "token_max_limit": 1000, "token_reset_duration": "1h"}],
+                          # budgets a session spends down turn by turn: a live key (31 s windows cost 0.031 each), a realtime key
+                          # (a 1000 + 500 token turn costs 0.012) and the same for a realtime call
+                          "budgets": [{"id": "bud-live", "max_limit": 0.05, "reset_duration": "1h"}, {"id": "bud-rt", "max_limit": 0.02, "reset_duration": "1h"},
+                                      {"id": "bud-call", "max_limit": 0.02, "reset_duration": "1h"}],
                           "virtual_keys": [{"id": "vk-rt-live", "value": "sk-bf-rt-live", "rate_limit_id": "rl-live"}, {"id": "vk-rt-turn", "value": "sk-bf-rt-turn", "rate_limit_id": "rl-rt"},
-                                           {"id": "vk-rt-call", "value": "sk-bf-rt-call", "rate_limit_id": "rl-call"}, {"id": "vk-rt-free", "value": "sk-bf-rt-free"}]},
+                                           {"id": "vk-rt-call", "value": "sk-bf-rt-call", "rate_limit_id": "rl-call"}, {"id": "vk-rt-free", "value": "sk-bf-rt-free"},
+                                           {"id": "vk-rt-bl", "value": "sk-bf-rt-bl", "budget_id": "bud-live"}, {"id": "vk-rt-br", "value": "sk-bf-rt-br", "budget_id": "bud-rt"},
+                                           {"id": "vk-rt-bc", "value": "sk-bf-rt-bc", "budget_id": "bud-call"}, {"id": "vk-rt-tok", "value": "sk-bf-rt-tok", "rate_limit_id": "rl-tok"}]},
            "guardrails": {"enabled": True, "apply_to": "both", "detect": [], "providers": [
                {"id": "house-rules", "kind": "regex", "apply_to": "both", "patterns": [
                    {"pattern": "PROJECT-\\d+", "description": "Codename", "action": "block"},
@@ -5312,7 +5360,7 @@ def realtime_e2e(env):
         check("a client's session.close makes the provider close, and its session.closed reaches the client", evs and evs[-1].get("type") == "session.closed" and evs[-1]["usage"]["seconds"] == 18, evs)
         row = session_row("live", "sess_ws_meter", GW_R)
         md = row.get("metadata", {})
-        check("the session is one log row with its seconds, billed as reported (a WebSocket session has no minimum)", row.get("op") == "live" and row.get("status") == 200 and row.get("provider") == "openai" and row.get("model") == "gpt-live" and md.get("live_transport") == "websocket" and float(md.get("live_billed_seconds", -1)) == 18.0 and md.get("live_close_reason") == "close_requested", row)
+        check("the session's rows add up to its seconds, billed as reported (a WebSocket session has no minimum)", row.get("op") == "live" and row.get("status") == 200 and row.get("provider") == "openai" and row.get("model") == "gpt-live" and md.get("live_transport") == "websocket" and float(md.get("live_billed_seconds", -1)) == 18.0 and md.get("live_close_reason") == "close_requested", row)
         check("and it costs its voice seconds at the model's rate plus its delegated tokens at their model's", near(row.get("cost"), 18 * 0.001 + 1000 * 0.000001 + 100 * 0.000004) and near(row.get("input_cost"), 18 * 0.001 + 1000 * 0.000001) and near(row.get("output_cost"), 100 * 0.000004) and row.get("prompt_tokens") == 1000 and row.get("completion_tokens") == 100, row)
         check("the row keeps the transcript and the virtual key", row.get("input", "").strip() == "hello" and row.get("output", "").strip() == "good morning" and row.get("virtual_key") == "vk-rt-free", row)
 
@@ -5384,6 +5432,40 @@ def realtime_e2e(env):
         row = session_row("live", "sess_ws_drop", GW_R)
         check("a provider that drops a live session is reported as a failure, billed what it had reported", evs and "before session.closed" in evs[-1].get("error", {}).get("message", "") and row.get("status") == 502 and float(row.get("metadata", {}).get("live_billed_seconds", -1)) == 40.0, (evs, row))
 
+        # ---- a row per unit (L137): each window of voice time and each delegated response is logged and charged as it closes ----
+        c = live_ws(FREE, "sess_ws_units")
+        ws_collect(c, is_type("echo"))
+        c.send(json.dumps({"type": "test.usage", "seconds": 31}))
+        ws_collect(c, is_type("session.usage.updated"))
+        early = session_rows("live", "sess_ws_units", GW_R, ADMIN, until_end=False)
+        check("a window of voice time is logged and charged when it closes, while the session is still open", len(early) == 1 and early[0]["metadata"].get("live_unit") == "window" and float(early[0]["metadata"].get("live_billed_seconds", -1)) == 31.0 and near(early[0].get("cost"), 0.031), early)
+        c.send(json.dumps({"type": "test.backend", "input": 500, "output": 50, "model": "gpt-back"}))
+        ws_collect(c, is_type("response.event"))
+        c.send(json.dumps({"type": "test.speak", "text": "good morning"}))
+        ws_collect(c, lambda e: e.get("type") == "session.output_transcript.delta" and e.get("delta") == "morning ")
+        c.send(json.dumps({"type": "session.close", "mock_seconds": 40}))
+        ws_collect(c, is_type("session.closed"))
+        rows = session_rows("live", "sess_ws_units", GW_R)
+        md = [r.get("metadata", {}) for r in rows]
+        check("a live session is a row per window of voice time, per delegated response, and one that ends it", [m.get("live_unit") for m in md] == ["window", "delegation", "end"] and [m.get("live_unit_index") for m in md] == ["1", "2", "3"] and all(r.get("op") == "live" and r.get("model") == "gpt-live" and r.get("virtual_key") == "vk-rt-free" for r in rows), md)
+        check("each row has its own voice seconds: the window's 31, none for the response, the rest at the end", [float(m.get("live_billed_seconds", -1)) for m in md] == [31.0, 0.0, 9.0] and [float(m.get("live_audio_seconds", -1)) for m in md] == [31.0, 0.0, 9.0], md)
+        check("and its own tokens and cost: the response's tokens at its model's rate, the seconds at the live rate", [r.get("prompt_tokens") for r in rows] == [0, 500, 0] and [r.get("completion_tokens") for r in rows] == [0, 50, 0] and near(rows[0].get("cost"), 0.031) and near(rows[1].get("cost"), 500 * 0.000001 + 50 * 0.000004) and near(rows[2].get("cost"), 0.009), [(r.get("prompt_tokens"), r.get("cost")) for r in rows])
+        parents = {r.get("parent_request_id") for r in rows}
+        check("the rows are linked by the session: one parent request id, which is not any row's own id", len({r.get("id") for r in rows}) == 3 and len(parents) == 1 and parents == {md[0].get("session_request_id")} and not (parents & {r.get("id") for r in rows}), [(r.get("id"), r.get("parent_request_id")) for r in rows])
+        check("the last row carries the end of the session: the close reason, the status and the transcript", md[2].get("live_close_reason") == "close_requested" and rows[2].get("status") == 200 and rows[2].get("input", "").strip() == "hello" and rows[2].get("output", "").strip() == "good morning" and "live_close_reason" not in md[0], rows[2])
+
+        # a budget is spent window by window: the window after the one that used it up is refused, not the session's end
+        c = live_ws({"authorization": "Bearer sk-bf-rt-bl"}, "sess_ws_budget")
+        ws_collect(c, is_type("echo"))
+        for sec in (31, 62):
+            c.send(json.dumps({"type": "test.usage", "seconds": sec}))
+            ws_collect(c, is_type("session.usage.updated"))
+        c.send(json.dumps({"type": "test.usage", "seconds": 93}))
+        evs = ws_collect(c, is_type("error"))
+        check("a budget the live session spent window by window refuses its next window", evs and evs[-1].get("error", {}).get("type") == "budget_exceeded", evs)
+        rows = session_rows("live", "sess_ws_budget", GW_R)
+        check("the windows that ran were charged as they closed: two of 31 s, then the refused window's closing row", [r["metadata"].get("live_unit") for r in rows] == ["window", "window", "end"] and near(rows[0].get("cost"), 0.031) and near(rows[1].get("cost"), 0.031) and rows[2].get("status") == 402 and "budget" in rows[2].get("error", "") and near(rows[2].get("cost"), 0.031), [(r["metadata"].get("live_unit"), r.get("status"), r.get("cost")) for r in rows])
+
         # ---- the Realtime API over a WebSocket ----
         # each response.done is billed from its usage: audio tokens at the audio rates, cached tokens at the cache rate
         c = rt_ws(FREE, "sess_rt_meter")
@@ -5397,7 +5479,7 @@ def realtime_e2e(env):
         md = row.get("metadata", {})
         first = 500 * 0.000004 + 300 * 0.000032 + 200 * 0.0000004 + 100 * 0.000016 + 400 * 0.000064
         second = 100 * 0.000004 + 30 * 0.000016 + 20 * 0.000064
-        check("a realtime session is one log row, an op of its own", row.get("op") == "realtime" and row.get("status") == 200 and row.get("provider") == "openai" and row.get("model") == "gpt-realtime" and md.get("realtime_transport") == "websocket" and row.get("virtual_key") == "vk-rt-free", row)
+        check("a realtime session is logged as rows of the op realtime", row.get("op") == "realtime" and row.get("status") == 200 and row.get("provider") == "openai" and row.get("model") == "gpt-realtime" and md.get("realtime_transport") == "websocket" and row.get("virtual_key") == "vk-rt-free", row)
         check("it holds the tokens of both responses", row.get("prompt_tokens") == 1100 and row.get("completion_tokens") == 550 and md.get("realtime_cached_tokens") == "200" and md.get("realtime_input_audio_tokens") == "300" and md.get("realtime_output_audio_tokens") == "420", row)
         check("and it costs them at the text, audio and cache rates", near(row.get("cost"), first + second) and near(row.get("input_cost"), 500 * 0.000004 + 300 * 0.000032 + 200 * 0.0000004 + 100 * 0.000004) and near(row.get("output_cost"), 100 * 0.000016 + 400 * 0.000064 + 30 * 0.000016 + 20 * 0.000064), row)
         check("the row keeps what was said", row.get("input", "").strip() == "hello there" and row.get("output", "").strip() == "good morning and again", (row.get("input"), row.get("output")))
@@ -5467,6 +5549,46 @@ def realtime_e2e(env):
         row = session_row("realtime", "sess_rt_xai", GW_R)
         check("an xAI realtime session is metered and priced as its own provider's", row.get("provider") == "xai" and row.get("model") == "grok-realtime" and near(row.get("cost"), 1000 * 0.000002 + 100 * 0.00001), row)
 
+        # ---- a row per turn (L137): each response.done is logged and charged on its own ----
+        c = rt_ws(FREE, "sess_rt_units")
+        c.send(turn(id="resp_u1", text="good morning", heard="hello there", input=1000, output=500, audio_in=300, audio_out=400, cached=200))
+        ws_collect(c, is_type("response.done"))
+        early = session_rows("realtime", "sess_rt_units", GW_R)
+        check("a realtime turn is logged and charged when its response is done, while the session is still open", len(early) == 1 and early[0].get("prompt_tokens") == 1000 and near(early[0].get("cost"), first), early)
+        c.send(turn(id="resp_u2", text="and again", input=100, output=50, audio_in=0, audio_out=20, cached=0))
+        ws_collect(c, lambda e: e.get("type") == "response.done" and e["response"]["id"] == "resp_u2")
+        c.sock.close()
+        rows = session_rows("realtime", "sess_rt_units", GW_R)
+        md = [r.get("metadata", {}) for r in rows]
+        check("a realtime session is a row per turn, each of the op realtime with its place in the session", len(rows) == 2 and [m.get("realtime_unit") for m in md] == ["turn", "turn"] and [m.get("realtime_unit_index") for m in md] == ["1", "2"] and all(r.get("op") == "realtime" and r.get("model") == "gpt-realtime" and r.get("virtual_key") == "vk-rt-free" for r in rows), md)
+        check("each turn has its own tokens, audio and cache tokens, and cost", [r.get("prompt_tokens") for r in rows] == [1000, 100] and [r.get("completion_tokens") for r in rows] == [500, 50] and [m.get("realtime_cached_tokens") for m in md] == ["200", "0"] and [m.get("realtime_input_audio_tokens") for m in md] == ["300", "0"] and [m.get("realtime_output_audio_tokens") for m in md] == ["400", "20"] and near(rows[0].get("cost"), first) and near(rows[1].get("cost"), second), [(r.get("prompt_tokens"), r.get("cost")) for r in rows])
+        check("each turn keeps what was said in it", rows[0].get("input", "").strip() == "hello there" and rows[0].get("output", "").strip() == "good morning" and rows[1].get("input", "") == "" and rows[1].get("output", "").strip() == "and again", [(r.get("input"), r.get("output")) for r in rows])
+        parents = {r.get("parent_request_id") for r in rows}
+        check("the turns are linked by the session: one parent request id, distinct ids", len({r.get("id") for r in rows}) == 2 and len(parents) == 1 and parents == {md[0].get("session_request_id")} and not (parents & {r.get("id") for r in rows}), [(r.get("id"), r.get("parent_request_id")) for r in rows])
+
+        # a budget spent turn by turn: a turn costs 0.012 against 0.02, so the third is the one refused
+        c = rt_ws({"authorization": "Bearer sk-bf-rt-br"}, "sess_rt_budget")
+        ws_collect(c, is_type("session.created"))
+        for i in (1, 2):
+            c.send(turn(id=f"resp_bg{i}", text="ok", input=1000, output=500))
+            ws_collect(c, is_type("response.done"))
+        c.send(turn(id="resp_bg3", text="no", input=1000, output=500))
+        evs = ws_collect(c, is_type("error"))
+        check("a budget the realtime session spent turn by turn refuses its next turn", evs and evs[-1].get("error", {}).get("type") == "budget_exceeded" and not any(e.get("type") == "response.done" for e in evs), evs)
+        rows = session_rows("realtime", "sess_rt_budget", GW_R)
+        check("the turns that ran were charged as they closed; the refused one is a row with the refusal and no tokens", [r["metadata"].get("realtime_unit") for r in rows] == ["turn", "turn", "end"] and near(rows[0].get("cost"), 0.012) and near(rows[1].get("cost"), 0.012) and rows[2].get("status") == 402 and rows[2].get("prompt_tokens") == 0 and near(rows[2].get("cost"), 0.0), [(r["metadata"].get("realtime_unit"), r.get("status"), r.get("cost")) for r in rows])
+
+        # a token limit is debited the same way: one turn of 1100 tokens uses up a limit of 1000
+        c = rt_ws({"authorization": "Bearer sk-bf-rt-tok"}, "sess_rt_tokens")
+        ws_collect(c, is_type("session.created"))
+        c.send(turn(id="resp_tk1", text="ok", input=600, output=500))
+        ws_collect(c, is_type("response.done"))
+        c.send(turn(id="resp_tk2", text="no", input=1, output=1))
+        evs = ws_collect(c, is_type("error"))
+        check("a token limit the session spent turn by turn refuses its next turn", evs and evs[-1].get("error", {}).get("type") == "rate_limit_exceeded" and "token rate limit" in evs[-1]["error"].get("message", ""), evs)
+        rows = session_rows("realtime", "sess_rt_tokens", GW_R)
+        check("and the first turn's tokens are in its row", [r["metadata"].get("realtime_unit") for r in rows] == ["turn", "end"] and rows[0].get("prompt_tokens") == 600 and rows[0].get("completion_tokens") == 500 and rows[1].get("status") == 429, [(r["metadata"].get("realtime_unit"), r.get("status"), r.get("prompt_tokens")) for r in rows])
+
         s, _, b = call("GET", "/metrics", base=GW_R)
         check("live WebSocket sessions are counted: events and voice seconds", 'raiju_live_ws_events_total{direction="in",type="session.update"}' in b and 'raiju_live_ws_events_total{direction="out",type="session.usage.updated"}' in b and "raiju_live_audio_seconds_total" in b and "raiju_live_ws_sessions" in b, b[-400:])
         check("realtime sessions are counted: events, tokens and open sessions", 'raiju_realtime_events_total{direction="out",type="response.done"}' in b and 'raiju_realtime_events_total{direction="in",type="conversation.item.create"}' in b and "raiju_realtime_tokens_total" in b and "raiju_realtime_sessions" in b, b[-400:])
@@ -5495,8 +5617,18 @@ def realtime_e2e(env):
         check("the provider is sent the gateway's own offer and the session with bare models, under the provider's key", sent["auth"] == "Bearer sk-pool" and '"model":"gpt-realtime"' in sent["body"] and "openai/" not in sent["body"] and '"model":"whisper-1"' in sent["body"] and "a=ssrc:1234" not in sent["body"] and "m=application" in sent["body"], sent["body"][:400])
         row = call_row(r)
         md = row.get("metadata", {})
-        check("the call is one realtime row: its transport, tokens and cost", row.get("op") == "realtime" and row.get("status") == 200 and md.get("realtime_transport") == "webrtc" and row.get("prompt_tokens") == 1000 and row.get("completion_tokens") == 500 and near(row.get("cost"), first) and row.get("virtual_key") == "vk-rt-free", row)
+        check("the call's rows hold its transport, tokens and cost", row.get("op") == "realtime" and row.get("status") == 200 and md.get("realtime_transport") == "webrtc" and row.get("prompt_tokens") == 1000 and row.get("completion_tokens") == 500 and near(row.get("cost"), first) and row.get("virtual_key") == "vk-rt-free", row)
         check("and it keeps what was said", row.get("input", "").strip() == "hello" and row.get("output", "").strip() == "good morning", (row.get("input"), row.get("output")))
+
+        # a budget spent turn by turn over WebRTC too
+        r = rtc_client(GW_R, [{"wait": "session.created"}, {"send": {"type": "test.rt.turn", "id": "resp_cb1", "text": "ok", "input": 1000, "output": 500}}, {"wait": "response.done"},
+                              {"send": {"type": "test.rt.turn", "id": "resp_cb2", "text": "ok", "input": 1000, "output": 500}}, {"wait": "response.done", "count": 2},
+                              {"send": {"type": "test.rt.turn", "id": "resp_cb3", "text": "no", "input": 1000, "output": 500}}, {"wait": "error"}], auth="Bearer sk-bf-rt-bc", model="openai/gpt-realtime", realtime=True)
+        errs = [e for e in r.get("events", []) if e.get("type") == "error"]
+        check("a budget the realtime call spent turn by turn refuses its next turn", r.get("status") == 200 and len(errs) == 1 and errs[0]["error"]["type"] == "budget_exceeded" and sum(1 for e in r.get("events", []) if e.get("type") == "response.done") == 2, r)
+        sid = next((e["session"]["id"] for e in r.get("events", []) if e.get("type") == "session.created"), "none")
+        rows = session_rows("realtime", sid, GW_R)
+        check("its turns are rows of their own, charged as they closed, and the refused turn closes the session", [x["metadata"].get("realtime_unit") for x in rows] == ["turn", "turn", "end"] and [x["metadata"].get("realtime_transport") for x in rows] == ["webrtc"] * 3 and near(rows[0].get("cost"), 0.012) and near(rows[1].get("cost"), 0.012) and rows[2].get("status") == 402, [(x["metadata"].get("realtime_unit"), x.get("status"), x.get("cost")) for x in rows])
 
         # the beta format: a raw SDP body with ?model= at /v1/realtime
         r = rtc_client(GW_R, [{"wait": "session.created"}], auth="Bearer sk-bf-rt-free", model="openai/gpt-realtime", realtime=True, call="/v1/realtime", raw=True)
@@ -7366,7 +7498,7 @@ def main():
         check("the provider is sent the gateway's own offer, with its key and the bare model", sent["auth"] == "Bearer sk-from-env" and "gpt-4o-mini" in sent["body"] and "openai/" not in sent["body"] and "a=ssrc:1234" not in sent["body"] and "m=application" in sent["body"], sent["body"][:300])
         row = live_row("sess_mock_rtc")
         md = row.get("metadata", {})
-        check("the session is logged once it ends: a live row with its seconds, billed at the 15 s minimum", row.get("op") == "live" and row.get("provider") == "openai" and row.get("model") == "gpt-4o-mini" and row.get("status") == 200 and row.get("virtual_key") == "vk-openai-only" and float(md.get("live_audio_seconds", -1)) == 4.0 and float(md.get("live_billed_seconds", -1)) == 15.0 and md.get("live_transport") == "webrtc", row)
+        check("the session is logged by the time it ends: live rows with its seconds, billed at the 15 s minimum", row.get("op") == "live" and row.get("provider") == "openai" and row.get("model") == "gpt-4o-mini" and row.get("status") == 200 and row.get("virtual_key") == "vk-openai-only" and float(md.get("live_audio_seconds", -1)) == 4.0 and float(md.get("live_billed_seconds", -1)) == 15.0 and md.get("live_transport") == "webrtc", row)
         check("the row keeps the transcript", row.get("input", "").strip() == "hello" and row.get("output", "").strip() == "the quick brown fox", (row.get("input"), row.get("output")))
         s, _, b = call("GET", "/metrics")
         check("the session's events and seconds are counted", s == 200 and 'raiju_live_webrtc_events_total{direction="in",type="session.update"}' in b and 'raiju_live_webrtc_events_total{direction="out",type="session.usage.updated"}' in b and "raiju_live_audio_seconds_total" in b, b[-300:])
