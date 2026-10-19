@@ -5172,6 +5172,166 @@ def l133_e2e(env):
         stub.shutdown()
         stub.server_close()
 
+def l140_e2e(env):
+    """L140: a token_exchange client's admin credential is renewed with the refresh token its verification kept. The
+    token endpoint issues short-lived tokens with rotating refresh tokens, and the MCP server (both served here on
+    18145) accepts only live tokens: the client keeps listing past the first token's expiry, a 401 from the server
+    renews at once, and a revoked refresh token shows needs_reauth until the client is verified again (its tools and
+    each caller's calls keep working meanwhile). The config is sealed, so the refresh token is not saved in clear.
+    The gateway is 18218."""
+    import urllib.parse, threading
+    lock = threading.Lock()
+    st = {"n": 0, "life": 4, "live": {}, "issued_rt": [], "revoked": set(), "grants": [], "lists": []}
+    def issue(rt_too):
+        st["n"] += 1
+        tok = "adm-%d" % st["n"]
+        st["live"][tok] = time.time() + st["life"]
+        out = {"access_token": tok, "token_type": "Bearer", "expires_in": st["life"]}
+        if rt_too:
+            rt = "rt-%d" % st["n"]
+            st["issued_rt"].append(rt)
+            out["refresh_token"] = rt
+        return out
+    def stub(method, path, headers, body):
+        with lock:
+            if path == "/_life":
+                st["life"] = int(body)
+                return 200, "{}", "application/json"
+            if path == "/_expire-all":
+                st["live"] = {}
+                return 200, "{}", "application/json"
+            if path == "/_revoke":
+                st["revoked"] = set(st["issued_rt"])
+                return 200, "{}", "application/json"
+            if path == "/token":
+                form = urllib.parse.parse_qs(body)
+                def one(k):
+                    return (form.get(k) or [""])[0]
+                st["grants"].append(form)
+                if one("client_id") != "exch-client" or one("client_secret") != "exch-secret":
+                    return 401, json.dumps({"error": "invalid_client"}), "application/json"
+                if one("grant_type") == "refresh_token":
+                    rt = one("refresh_token")
+                    if rt in st["revoked"] or rt not in st["issued_rt"]:
+                        return 400, json.dumps({"error": "invalid_grant", "error_description": "refresh token revoked"}), "application/json"
+                    # rotation: the used refresh token stops working
+                    st["revoked"].add(rt)
+                    return 200, json.dumps(issue(True)), "application/json"
+                if not one("subject_token").startswith("idp-"):
+                    return 400, json.dumps({"error": "invalid_grant", "error_description": "subject token not recognised"}), "application/json"
+                # the admin's verification gets a refresh token; a caller's per-call exchange does not
+                return 200, json.dumps(issue(one("subject_token").startswith("idp-admin"))), "application/json"
+            if path == "/mcp":
+                auth = headers.get("authorization") or ""
+                tok = auth[7:] if auth.startswith("Bearer ") else ""
+                if st["live"].get(tok, 0) <= time.time():
+                    return 401, "unauthorized", "text/plain"
+                msg = json.loads(body)
+                m = msg.get("method")
+                if "id" not in msg:
+                    return 202, "", "application/json"
+                if m == "initialize":
+                    res = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "l140", "version": "1"}}
+                elif m == "tools/list":
+                    st["lists"].append((tok, time.time()))
+                    res = {"tools": [{"name": "lookup", "description": "Looks a key up", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}}}]}
+                elif m == "tools/call":
+                    res = {"content": [{"type": "text", "text": "found " + str(msg["params"]["arguments"].get("key"))}]}
+                else:
+                    return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "no such method"}}), "application/json"
+                return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}), "application/json"
+            return 404, "{}", "application/json"
+    srv = serve(18145, stub)
+    sts = "http://127.0.0.1:18145"
+    cfg_path = os.path.join(BUILD, "e2e.l140.json")
+    exch = {"audience": "api://jira", "client_id": "exch-client", "client_secret": "exch-secret", "scopes": ["offline_access"], "authorization_server_url": sts + "/token"}
+    cfg = {
+        "encryption_key": "an e2e passphrase of some length",
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-l140", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
+            {"name": "jira", "connection_type": "http", "connection_string": sts + "/mcp", "auth_type": "token_exchange", "token_exchange": exch, "tool_sync_interval": "1s"},
+        ]},
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    base = "http://127.0.0.1:18218"
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18218", "-host", "127.0.0.1", "-config", cfg_path], env=env, stderr=open(os.path.join(BUILD, "e2e.l140.log"), "w"))
+    def req(method, p, body=None, headers=None):
+        return call(method, p, body, headers, base=base, auth=False)
+    def jira():
+        _, _, b = req("GET", "/api/mcp")
+        return l133_find_named(json.loads(b), "jira") or {}
+    def refreshes():
+        with lock:
+            return [g for g in st["grants"] if (g.get("grant_type") or [""])[0] == "refresh_token"]
+    def until(pred, secs):
+        end = time.time() + secs
+        while time.time() < end:
+            if pred():
+                return True
+            time.sleep(0.2)
+        return pred()
+    try:
+        wait(base + "/health")
+        s, _, b = req("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-admin.p.s"})
+        check("admin renewal: verification keeps the exchanged token and its refresh token", s == 200 and json.loads(b)["tools_count"] >= 1, (s, b[:300]))
+        t0 = time.time()
+        check("admin renewal: the client connects with the retained credential", until(lambda: jira().get("connected") is True, 15), jira())
+        cred = jira().get("credential") or {}
+        check("admin renewal: the status shows the credential (refresh token held, active, no token values)", cred.get("has_refresh_token") is True and cred.get("status") == "active" and "expires_at" in cred and "rt-" not in json.dumps(jira()) and "adm-" not in json.dumps(jira()), jira())
+        saved = open(cfg_path).read()
+        check("admin renewal: the refresh token is sealed in the saved config", "exchange_admin" in saved and "rt-1" not in saved and '"adm-1"' not in saved, saved[-400:])
+        # the first token lives 4 s: it is renewed after 2 s, and the listing goes on past its expiry
+        time.sleep(max(0.0, t0 + 6.5 - time.time()))
+        rf = refreshes()
+        check("admin renewal: the credential is renewed with the refresh_token grant and the exchange's client credentials", len(rf) >= 1 and (rf[0].get("refresh_token") or [""])[0] == "rt-1" and (rf[0].get("client_id") or [""])[0] == "exch-client", [dict(g) for g in rf[:2]])
+        with lock:
+            late = [x for x in st["lists"] if x[1] > t0 + 4.5]
+        j = jira()
+        check("admin renewal: the client keeps listing its tools past the first token's expiry, with a renewed token", len(late) >= 1 and late[-1][0] != "adm-1" and j.get("connected") is True and j.get("error", "") == "" and int(j.get("tools", 0)) >= 1, (late[-3:], j))
+        check("admin renewal: the status shows when it was last renewed", "last_refreshed_at" in (j.get("credential") or {}), j)
+        s, _, b = req("POST", "/api/mcp/client/jira/reconnect")
+        check("admin renewal: a reconnect after the first token's expiry connects with the renewed credential", s in (200, 202) and until(lambda: jira().get("connected") is True and jira().get("error", "") == "", 10), (s, b[:200], jira()))
+        s, _, b = req("POST", "/v1/mcp/tool/execute", l117_tool("jira-lookup", {"key": "A-1"}), {"authorization": "Bearer idp-alice.p.s"})
+        check("admin renewal: a caller's call still runs with its own exchanged token", s == 200 and "found A-1" in b, (s, b[:300]))
+
+        # long-lived tokens from here: a scheduled renewal is an hour away, so a renewal now comes from a 401
+        call("POST", "/_life", "3600", {}, base=sts, auth=False)
+        n0 = len(refreshes())
+        check("admin renewal: the next renewal issues a long-lived token", until(lambda: len(refreshes()) > n0, 6), len(refreshes()))
+        time.sleep(1.5)
+        n1 = len(refreshes())
+        call("POST", "/_expire-all", "", {}, base=sts, auth=False)
+        texp = time.time()
+        def relisted():
+            with lock:
+                return any(x[1] > texp for x in st["lists"])
+        check("admin renewal: a 401 from the server renews the credential at once and the listing goes on", until(lambda: len(refreshes()) > n1 and relisted(), 8) and jira().get("error", "") == "", (len(refreshes()), n1, jira()))
+
+        # a revoked refresh token: the next renewal is refused, and the client needs a new verification
+        call("POST", "/_revoke", "", {}, base=sts, auth=False)
+        call("POST", "/_expire-all", "", {}, base=sts, auth=False)
+        check("admin renewal: a refused renewal shows needs_reauth in GET /api/mcp", until(lambda: jira().get("state") == "needs_reauth", 8), jira())
+        j = jira()
+        cred = j.get("credential") or {}
+        check("admin renewal: the status says why, and how to repair it", cred.get("status") == "needs_reauth" and "invalid_grant" in cred.get("status_reason", "") and "needs re-verification" in j.get("error", "") and "verify-exchange" in j.get("error", ""), j)
+        _, _, b = req("GET", "/api/mcp/clients")
+        listed = l133_find_named(json.loads(b), "jira") or {}
+        check("admin renewal: the client list shows needs_reauth and the credential, without token values", listed.get("state") == "needs_reauth" and (listed.get("credential") or {}).get("status") == "needs_reauth" and "rt-" not in b, listed)
+        check("admin renewal: the marked client keeps its tools", j.get("connected") is True and int(j.get("tools", 0)) >= 1, j)
+        s, _, b = req("POST", "/v1/mcp/tool/execute", l117_tool("jira-lookup", {"key": "B-2"}), {"authorization": "Bearer idp-bob.p.s"})
+        check("admin renewal: callers' calls keep working while it needs a new verification", s == 200 and "found B-2" in b, (s, b[:300]))
+        saved = open(cfg_path).read()
+        check("admin renewal: the needs_reauth state is saved", "needs_reauth" in saved, saved[-400:])
+        s, _, b = req("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-admin.p.s"})
+        check("admin renewal: a new verification repairs the client", s == 200 and until(lambda: jira().get("state") is None and jira().get("connected") is True and (jira().get("credential") or {}).get("status") == "active", 10), (s, b[:200], jira()))
+    finally:
+        gw.terminate()
+        gw.wait()
+        srv.shutdown()
+        srv.server_close()
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -6631,6 +6791,207 @@ def l130_e2e(env):
         check("a stream gets no post hook, so no header (Bifrost's post hook is not called for streams)", s == 200 and "x-served-by" not in h and contents(b.decode()) == ["Hel", "lo"], (s, h))
     finally:
         gw.terminate()
+GW_L139 = "http://127.0.0.1:18217"  # plugins: the LLM hooks on the Anthropic Messages, Cohere, GenAI and Bedrock routes, and Cursor's Responses-shaped chat
+
+def l139_e2e(env):
+    """L139: the plugins' LLM hooks (pre_hook, post_hook, post_hook per stream chunk, short circuits, has_error) on the
+    routes that speak a provider's own format: Anthropic Messages, Cohere chat, GenAI generateContent, Bedrock Converse and
+    InvokeModel (whole and streamed), plus Cohere embed and rerank and Cursor's Responses-shaped chat. The WASM test plugin
+    (tests/wasm/plugin.wasm) sees the chat request, and its changes and its short circuits come back in each route's own
+    format. A plugin that changes nothing leaves the answer the same as a gateway without the plugin gives. Its own gateway
+    (18217)."""
+    import hashlib
+    base = GW_L139
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    cfg_path = os.path.join(BUILD, "e2e.l139.json")
+    adm = {"authorization": "Bearer sk-admin-l139"}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l139", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l139").hexdigest()}]},
+        "plugins": [{"name": "h139", "enabled": True, "path": wasm, "config": {"mode": "rewrite", "tag": "noop"}}],
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18217", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l139.log"), "w"))
+
+    def setp(config):
+        s, _, b = call("PUT", "/api/plugins/h139", {"config": config}, adm, base=base, auth=False)
+        if s != 200:
+            raise SystemExit(f"l139: could not set the plugin config {config}: {s} {b[:200]}")
+
+    def sse_data(text):
+        out = []
+        for block in text.split("\n\n"):
+            for line in block.split("\n"):
+                if line.startswith("data:"):
+                    out.append(line[5:].strip())
+        return [json.loads(d) for d in out if d.startswith("{")]
+
+    def frames_of(raw):
+        try:
+            return eventstream(raw)
+        except ValueError:
+            return []
+
+    # how to read the text out of a whole answer and out of a stream, for each route
+    def anth_text(b):
+        return "".join(c.get("text", "") for c in json.loads(b).get("content", []))
+
+    def anth_stream(b):
+        return "".join(e.get("delta", {}).get("text", "") for e in sse_data(b) if e.get("type") == "content_block_delta")
+
+    def coh_text(b):
+        return "".join(c.get("text", "") for c in json.loads(b).get("message", {}).get("content", []))
+
+    def coh_stream(b):
+        return "".join(e.get("delta", {}).get("message", {}).get("content", {}).get("text", "") for e in sse_data(b) if e.get("type") == "content-delta")
+
+    def gen_text(b):
+        return "".join(p.get("text", "") for p in json.loads(b)["candidates"][0]["content"]["parts"])
+
+    def gen_stream(b):
+        return "".join(p.get("text", "") for e in sse_data(b) for c in e.get("candidates", []) for p in c.get("content", {}).get("parts", []))
+
+    def conv_text(b):
+        return "".join(c.get("text", "") for c in json.loads(b)["output"]["message"]["content"])
+
+    def conv_stream(raw):
+        return "".join(json.loads(p)["delta"]["text"] for hd, p in frames_of(raw) if hd.get(":event-type") == "contentBlockDelta")
+
+    def inv_stream(raw):
+        events = [json.loads(B64.b64decode(json.loads(p)["bytes"])) for hd, p in frames_of(raw) if hd.get(":event-type") == "chunk"]
+        return "".join(e.get("delta", {}).get("text", "") for e in events if e.get("type") == "content_block_delta")
+
+    ANTH = {"model": "openai/gpt-4o-mini", "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
+    COH = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]}
+    GENP = "/genai/v1beta/models/openai/gpt-4o-mini"
+    GENB = {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}
+    BED = "/bedrock/model/openai%2Fgpt-4o-mini/"
+    CONV = {"messages": [{"role": "user", "content": [{"text": "ping"}]}]}
+    INV = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 20, "messages": [{"role": "user", "content": "ping"}]}
+    # name, whole path, stream path, body, whole reader, stream reader, binary stream
+    ROUTES = [
+        ("anthropic", "/anthropic/v1/messages", "/anthropic/v1/messages", ANTH, anth_text, anth_stream, False),
+        ("cohere", "/cohere/v2/chat", "/cohere/v2/chat", COH, coh_text, coh_stream, False),
+        ("genai", GENP + ":generateContent", GENP + ":streamGenerateContent", GENB, gen_text, gen_stream, False),
+        ("bedrock converse", BED + "converse", BED + "converse-stream", CONV, conv_text, conv_stream, True),
+        ("bedrock invoke", BED + "invoke", BED + "invoke-with-response-stream", INV, anth_text, inv_stream, True),
+    ]
+
+    def whole(path, body, b=base):
+        return call("POST", path, body, None, base=b, auth=False)
+
+    def streamed(path, body, binary, b=base):
+        """A streamed request and its answer: the text, or the raw bytes of a binary stream."""
+        body = dict(body)
+        if not binary and "contents" not in body:
+            body["stream"] = True
+        if binary:
+            return call_bytes("POST", path, body, None, base=b)
+        return call("POST", path, body, None, base=b, auth=False)
+
+    def upstream_chat(n):
+        """The chat requests the provider got since the mock had n requests, as JSON text."""
+        return json.dumps([json.loads(u["body"]) for u in seen()[n:] if u["path"] == "/v1/chat/completions"])
+
+    try:
+        wait(base + "/health")
+        # ---- a plugin that changes nothing: the same answers as a gateway without such a plugin ----
+        for name, wp, sp, body, rd, srd, binary in ROUTES:
+            s0, _, b0 = whole(wp, body, GW)
+            n = len(seen())
+            s1, _, b1 = whole(wp, body)
+            check(f"{name}: with a no-op plugin the answer's text is what the gateway without it answers", s0 == 200 and s1 == 200 and rd(b1) == rd(b0) == "Hello from gpt-4o-mini", (s0, s1, b0[:200], b1[:200]))
+            up = [json.loads(u["body"]) for u in seen()[n:] if u["path"] == "/v1/chat/completions"]
+            check(f"{name}: the provider got a chat request with the user's text", len(up) == 1 and up[0].get("model") == "gpt-4o-mini" and "ping" in json.dumps(up[0].get("messages")), up)
+            if name == "anthropic":
+                m1 = json.loads(b1)
+                check("anthropic: the answer is a Messages answer with usage", m1.get("type") == "message" and m1.get("role") == "assistant" and m1.get("usage", {}).get("input_tokens") == 3, b1[:300])
+            s0, _, c0 = streamed(sp, body, binary, GW)
+            s1, h1, c1 = streamed(sp, body, binary)
+            check(f"{name}: a streamed answer reads the same with a no-op plugin", s0 == 200 and s1 == 200 and srd(c1) == srd(c0) == "Hello", (s0, s1, c0[:200], c1[:200]))
+            if binary:
+                check(f"{name}: the stream is still Bedrock event-stream frames", h1.get("content-type") == "application/vnd.amazon.eventstream" and len(frames_of(c1)) > 0, (h1.get("content-type"), c1[:60]))
+
+        # ---- pre_hook rewrites the request; the provider gets the rewritten chat request ----
+        setp({"mode": "rewrite", "from": "ping", "to": "pong", "tag": "pre"})
+        for name, wp, sp, body, rd, srd, binary in ROUTES:
+            n = len(seen())
+            s, h, b = whole(wp, body)
+            sent = upstream_chat(n)
+            check(f"{name}: pre_hook rewrites the request, and the provider sees it", s == 200 and "pong" in sent and "ping" not in sent and rd(b) == "Hello from gpt-4o-mini", (s, sent, b[:200]))
+            n = len(seen())
+            s, h, c = streamed(sp, body, binary)
+            sent = upstream_chat(n)
+            check(f"{name}: and on a streamed request", s == 200 and "pong" in sent and "ping" not in sent and srd(c) == "Hello", (s, sent, c[:200]))
+
+        # ---- post_hook rewrites the answer, and each chunk of a stream ----
+        setp({"mode": "rewrite", "post": "text", "chunk_from": "Hello", "chunk_to": "Howdy", "tag": "post"})
+        for name, wp, sp, body, rd, srd, binary in ROUTES:
+            s, h, b = whole(wp, body)
+            check(f"{name}: post_hook rewrites the answer, which comes back in the route's format", s == 200 and rd(b) == "Howdy from gpt-4o-mini", (s, b[:300]))
+        setp({"mode": "rewrite", "post": "chunk", "chunk_from": "Hel", "chunk_to": "Howdy", "tag": "post"})
+        for name, wp, sp, body, rd, srd, binary in ROUTES:
+            s, h, c = streamed(sp, body, binary)
+            check(f"{name}: post_hook rewrites each chunk of a stream", s == 200 and srd(c) == "Howdylo", (s, c[:300]))
+        s, h, c = streamed("/anthropic/v1/messages", ANTH, False)
+        names = [l[7:] for l in c.split("\n") if l.startswith("event: ")]
+        check("anthropic: the rewritten stream is still a whole Messages stream", names[:1] == ["message_start"] and names[-1:] == ["message_stop"] and "message_delta" in names, names)
+
+        # ---- a short circuit answers in the route's own format, and the provider is not called ----
+        setp({"mode": "short"})
+        for name, wp, sp, body, rd, srd, binary in ROUTES:
+            n = len(seen())
+            s, h, b = whole(wp, body)
+            check(f"{name}: a short circuit answers in the route's format without the provider", s == 200 and rd(b) == "from the plugin" and hdr(h, "x-bf-plugin-short-circuit") == "true" and upstream_chat(n) == "[]", (s, b[:300], upstream_chat(n)))
+            n = len(seen())
+            s, h, c = streamed(sp, body, binary)
+            check(f"{name}: and for a streamed request, as a stream", s == 200 and srd(c) == "from the plugin" and upstream_chat(n) == "[]", (s, c[:300]))
+        setp({"mode": "fail"})
+        for name, wp, sp, body, rd, srd, binary in ROUTES:
+            s, h, b = whole(wp, body)
+            check(f"{name}: a short-circuit error carries its status and body", s == 418 and "plugin_blocked" in b, (s, b[:300]))
+
+        # ---- post_hook turns an answer into an error; on a stream the error ends it ----
+        setp({"mode": "rewrite", "post": "error"})
+        for name, wp, sp, body, rd, srd, binary in ROUTES:
+            s, h, b = whole(wp, body)
+            check(f"{name}: has_error on an answer turns it into the plugin's error", s == 429 and "turned into an error by the plugin" in b, (s, b[:300]))
+        s, h, c = streamed("/anthropic/v1/messages", ANTH, False)
+        check("anthropic: a chunk that post_hook turns into an error ends the stream with an error event", s == 200 and "event: error" in c and "turned into an error by the plugin" in c and "message_stop" not in c, (s, c[:400]))
+        s, h, c = streamed("/cohere/v2/chat", COH, False)
+        check("cohere: and so does Cohere's stream", s == 200 and "turned into an error by the plugin" in c and "message-end" not in c, (s, c[:400]))
+        s, h, raw = streamed(BED + "converse-stream", CONV, True)
+        fr = frames_of(raw)
+        check("bedrock: a stream error ends with an exception frame", s == 200 and [hd.get(":message-type") for hd, _ in fr][-1:] == ["exception"] and "messageStop" not in [hd.get(":event-type") for hd, _ in fr], (s, [hd for hd, _ in fr]))
+
+        # ---- the other requests the native routes make: Cohere embed and rerank, Cursor's Responses-shaped chat ----
+        setp({"mode": "rewrite", "from": "one", "to": "uno", "tag": "emb"})
+        n = len(seen())
+        s, _, b = whole("/cohere/v2/embed", {"model": "openai/text-embedding-3-small", "texts": ["one", "two"], "input_type": "search_document", "embedding_types": ["float"]})
+        up = [json.loads(u["body"]) for u in seen()[n:] if u["path"] == "/v1/embeddings"]
+        check("cohere embed: pre_hook rewrites the texts the provider gets", s == 200 and len(up) == 1 and up[0].get("input") == ["uno", "two"] and len(json.loads(b)["embeddings"]["float"]) == 2, (s, up, b[:200]))
+        setp({"mode": "rewrite", "from": "ping", "to": "pong", "tag": "rr"})
+        s, _, b = whole("/cohere/v2/rerank", {"model": "raiju/lexical", "query": "ping", "documents": ["nothing", "a pong here"]})
+        check("cohere rerank: pre_hook rewrites the query, which then matches the second document", s == 200 and json.loads(b).get("results", [{}])[0].get("index") == 1, (s, b[:300]))
+        n = len(seen())
+        s, _, b = whole("/cursor/v1/chat/completions", {"model": "openai/gpt-4o-mini", "input": "ping"})
+        up = [json.loads(u["body"]) for u in seen()[n:] if u["path"] == "/v1/responses"]
+        check("cursor: a Responses-shaped chat runs the hooks as a Responses request", s == 200 and len(up) == 1 and up[0].get("input") == "pong" and json.loads(b).get("object") == "chat.completion", (s, up, b[:300]))
+        setp({"mode": "rewrite", "post": "chunk", "chunk_from": "Hel", "chunk_to": "Howdy", "tag": "cur"})
+        s, h, c = streamed("/cursor/v1/chat/completions", {"model": "openai/gpt-4o-mini", "input": "hi"}, False)
+        texts = [ch.get("delta", {}).get("content", "") for e in sse_data(c) for ch in e.get("choices", [])]
+        check("cursor: post_hook rewrites each Responses event of a streamed Responses-shaped chat, which comes out as chat chunks", s == 200 and "".join(texts) == "Howdylo" and "[DONE]" in c, (s, c[:400]))
+
+        # ---- only built-in plugins: the provider-format routes are served as before ----
+        s, _, b = call("DELETE", "/api/plugins/h139", None, adm, base=base, auth=False)
+        s, _, b = call("POST", "/api/plugins", {"name": "header", "enabled": True, "config": {"set_response_headers": {"X-Served-By": "raiju"}}}, adm, base=base, auth=False)
+        s, h, b = whole("/anthropic/v1/messages", ANTH)
+        check("with only built-in plugins the Messages route is served as before", s == 200 and anth_text(b) == "Hello from gpt-4o-mini", (s, h, b[:200]))
+    finally:
+        gw.terminate()
 GW_L126 = "http://127.0.0.1:18186"  # network_config pool knobs and upstream HTTP/2, against tov-patches/tests/h2_server.py origins
 
 def l126_python_env():
@@ -6947,12 +7308,13 @@ def l124_e2e(env):
         ans = [e for e in entries if e.get("model") == "openai/large-answer"]
         check("the log row of a streamed answer holds the first truncated_log_bytes of it, with the request", len(ans) == 1 and len(ans[0].get("output") or "") == 4096 and "l124 answer" in (ans[0].get("input") or ""), [(len(e.get("output") or ""), e.get("model")) for e in ans])
 
-        # a provider that needs the whole body (Anthropic's format) gets it in memory, up to client.max_request_body_size_mb
+        # a provider whose format differs (Anthropic's) is sent the converted request while the body streams in (L136), so
+        # client.max_request_body_size_mb does not apply to it
         n2 = len(mine("/v1/messages"))
         s, _, b = l124_http(port, "POST", "/v1/chat/completions", l124_body("anthropic/claude-3-5-sonnet-20241022", 1048576))
-        check("a provider that converts the body is sent the converted request (buffered)", s == 200 and len(mine("/v1/messages")) == n2 + 1, (s, b[:300]))
+        check("a provider that converts the body is sent the converted request", s == 200 and len(mine("/v1/messages")) == n2 + 1, (s, b[:300]))
         s, _, b = l124_http(port, "POST", "/v1/chat/completions", l124_body("anthropic/claude-3-5-sonnet-20241022", 9 * 1048576))
-        check("... but not past client.max_request_body_size_mb", s == 413, (s, b[:200]))
+        check("... and it is not held, so a body past client.max_request_body_size_mb goes through too", s == 200, (s, b[:200]))
 
         # over HTTP/2 to the provider
         if origin is not None:
@@ -7149,6 +7511,296 @@ def l129_e2e(env):
     finally:
         gw.terminate()
         gw.wait()
+
+GW_L136 = "http://127.0.0.1:18212"  # large_payload_optimization for providers whose format differs: converted while the body streams in
+GW_L136B = "http://127.0.0.1:18213"  # the same with client.max_request_body_size_mb 1: what is held is bounded by it
+
+# AWS's documented example credentials
+L136_AK = "AKIDEXAMPLE"
+L136_SK = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+
+def l136_sigv4(seen_row, path, region="us-east-1", service="bedrock"):
+    """The SigV4 signature the mock's request should carry for the body the mock received (its SHA-256 is in the row), and the one it did carry."""
+    import hashlib, hmac
+    date = seen_row["hdr"].split("|")[0]
+    day = date[:8]
+    host = MOCK.split("//")[1]
+    signed = "content-type;host;x-amz-date"
+    canonical = f"POST\n{path}\n\ncontent-type:application/json\nhost:{host}\nx-amz-date:{date}\n\n{signed}\n{seen_row['sha']}"
+    scope = f"{day}/{region}/{service}/aws4_request"
+    to_sign = f"AWS4-HMAC-SHA256\n{date}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
+    k = hmac.new(("AWS4" + L136_SK).encode(), day.encode(), hashlib.sha256).digest()
+    for part in (region, service, "aws4_request"):
+        k = hmac.new(k, part.encode(), hashlib.sha256).digest()
+    want = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+    got = seen_row["auth"].rsplit("Signature=", 1)[-1]
+    return want, got
+
+def l136_e2e(env):
+    """large_payload_optimization for providers whose format differs (L136): a big chat request to Anthropic, Gemini, Cohere,
+    Vertex and Bedrock is converted while it streams in (so the gateway holds none of it), arrives intact by content hash, and its
+    answer is counted. Bedrock's body is hashed on the way to a spool so it can be signed; a Messages request to Bedrock and to
+    Vertex Claude is rewritten the same way. Its own gateways (18212, and 18213 with a 1 MiB hold limit)."""
+    import hashlib, re, shutil
+    logs_dir = os.path.join(BUILD, "e2e-l136-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    src = open(os.path.join(ROOT, "src/jwt.tov")).read()
+    pem = re.search(r"const TEST_PKCS8 = `(.*?)`", src, re.S).group(1)
+    sa = {"type": "service_account", "client_email": "e2e@test.iam.gserviceaccount.com", "private_key": pem, "token_uri": MOCK + "/token"}
+    bk = {"access_key": L136_AK, "secret_key": L136_SK, "region": "us-east-1"}
+    providers = {
+        "anthropic": {"keys": [{"name": "a", "value": "sk-ant-" + "l136", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "anthropic_pc": {"custom_provider_config": {"base_provider_type": "anthropic"}, "keys": [{"name": "a2", "value": "sk-ant-" + "l136pc", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}, "prompt_cache": {"cache_control_injection_points": [{"location": "message", "role": "user"}]}},
+        "gemini": {"keys": [{"name": "g", "value": "g-" + "l136", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "cohere": {"keys": [{"name": "c", "value": "co-" + "l136", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "bedrock": {"keys": [{"name": "b", "models": [], "weight": 1.0, "bedrock_key_config": bk}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "bedrock_bearer": {"custom_provider_config": {"base_provider_type": "bedrock"}, "keys": [{"name": "bb", "value": "bedrock-api-" + "key-l136", "models": [], "weight": 1.0, "bedrock_key_config": {"region": "us-east-1"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "vertex": {"keys": [{"name": "vx", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps(sa)}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+    }
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "max_request_body_size_mb": 8},
+        "logs_store": {"enabled": True, "dir": logs_dir, "content_logging": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096},
+        "governance": {
+            "budgets": [{"id": "b-l136", "max_limit": 100, "reset_duration": "1d"}],
+            "pricing_overrides": [{"id": "po-l136", "name": "l136", "scope_kind": "global", "match_type": "wildcard", "pattern": "*", "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}],
+            "virtual_keys": [{"id": "vk-l136", "value": "sk-bf-l136-budget-0123456789", "budget_id": "b-l136"}],
+        },
+        "providers": providers,
+    }
+    path = os.path.join(BUILD, "e2e.l136.json")
+    json.dump(cfg, open(path, "w"))
+    cfg_b = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 1},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096},
+        "providers": {"anthropic": providers["anthropic"]},
+    }
+    path_b = os.path.join(BUILD, "e2e.l136b.json")
+    json.dump(cfg_b, open(path_b, "w"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18212", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l136.log"), "w"))
+    gwb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18213", "-host", "127.0.0.1", "-config", path_b, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l136b.log"), "w"))
+    port = 18212
+    try:
+        wait(GW_L136 + "/health")
+        wait(GW_L136B + "/health")
+        mine = lambda p_: [x for x in seen() if x["path"] == p_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        chat = lambda b, headers=None: call("POST", "/v1/chat/completions", b, headers, base=GW_L136, auth=False)
+        logs = lambda: json.loads(call("GET", "/api/logs?limit=500", base=GW_L136, auth=False)[2])["entries"]
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L136, auth=False)[2])["budgets"]}
+        FILL = lambda n, c="F": c * n
+        B64 = lambda n: "QUJD" * (n // 4)
+
+        def text_req(model, n):
+            return ('{"model":"%s","max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % (model, FILL(n))).encode()
+        def image_req(model, n, extra=""):
+            return ('{"model":"%s","max_tokens":16%s,"messages":[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,%s"}}]}]}' % (model, extra, B64(n))).encode()
+        # what each provider should receive (the converted body, whole)
+        def want_text(fam, n, model=""):
+            f = FILL(n)
+            return {
+                "anthropic": '{"model":"%s","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16}' % (model, f),
+                "gemini": '{"contents":[{"role":"user","parts":[{"text":"%s"}]}],"generationConfig":{"maxOutputTokens":16}}' % f,
+                "cohere": '{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":16}' % (model, f),
+                "converse": '{"messages":[{"role":"user","content":[{"text":"%s"}]}],"inferenceConfig":{"maxTokens":16}}' % f,
+                "vertex-claude": '{"messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16,"anthropic_version":"vertex-2023-10-16"}' % f,
+            }[fam].encode()
+        def want_image(fam, n, model=""):
+            b = B64(n)
+            return {
+                "anthropic": '{"model":"%s","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"%s"}}]}],"system":"be brief","max_tokens":16}' % (model, b),
+                "gemini": '{"contents":[{"role":"user","parts":[{"text":"look"},{"inline_data":{"mime_type":"image/png","data":"%s"}}]}],"systemInstruction":{"parts":[{"text":"be brief"}]},"generationConfig":{"maxOutputTokens":16}}' % b,
+                "cohere": '{"model":"%s","messages":[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,%s"}}]}],"max_tokens":16}' % (model, b),
+                "converse": '{"messages":[{"role":"user","content":[{"text":"look"},{"image":{"format":"png","source":{"bytes":"%s"}}}]}],"system":[{"text":"be brief"}],"inferenceConfig":{"maxTokens":16}}' % b,
+            }[fam].encode()
+        MB = 1048576
+        vx = "/v1/projects/proj/locations/us-central1/publishers/%s/models/%s"
+        targets = [
+            # family, model the caller names, the path the provider sees, what its answer says, the model the body names
+            ("anthropic", "anthropic/claude-l136", "/v1/messages", "Hi from claude", "claude-l136"),
+            ("gemini", "gemini/gemini-l136", "/v1beta/models/gemini-l136:generateContent", "Hi from gemini", ""),
+            ("cohere", "cohere/command-l136", "/v2/chat", "Hi from cohere", "command-l136"),
+            ("converse", "bedrock/claude-l136", "/model/claude-l136/converse", "Hi from bedrock", ""),
+            ("vertex-claude", "vertex/claude-l136", vx % ("anthropic", "claude-l136:rawPredict"), None, ""),
+            ("gemini", "vertex/gemini-l136", vx % ("google", "gemini-l136:generateContent"), "Hi from vertex", ""),
+        ]
+
+        # ---- a text request of 12 MiB to each provider: converted while it streams, intact by content hash ----
+        for fam, model, ppath, says, bmodel in targets:
+            want = want_text(fam, 12 * MB, bmodel)
+            n0 = len(mine(ppath))
+            s, hs, b = l124_http(port, "POST", "/v1/chat/completions", text_req(model, 12 * MB), timeout=120)
+            got = mine(ppath)
+            row = got[-1] if got else {}
+            ok = s == 200 and len(got) == n0 + 1 and row.get("size") == len(want) and row.get("sha") == sha(want)
+            check("a 12 MiB chat request to %s arrives as the %s body, intact by content hash" % (model.split("/")[0] + (" Claude" if fam == "vertex-claude" else ""), fam), ok, (s, b[:200], row.get("size"), len(want)))
+            if says is not None:
+                check("... and its answer comes back as a chat completion", s == 200 and says in b.decode("utf8", "replace") and json.loads(b)["object"] == "chat.completion", b[:200])
+            if fam == "converse":
+                want_sig, got_sig = l136_sigv4(row, "/model/claude-l136/converse")
+                check("... signed over the converted bytes (SigV4 verified against the body the provider got)", want_sig == got_sig, (want_sig, got_sig))
+                check("... with its length declared (the spool knows it)", row["hdr"].split("|")[1] == str(len(want)) and "chunked" not in row["hdr"], row["hdr"])
+            else:
+                check("... %s went out chunked (the converted length is not known up front)" % model.split("/")[0], "chunked" in row["hdr"].split("|")[2] or row["hdr"].split("|")[1] == str(len(want)), row["hdr"])
+
+        # ---- an image of 12 MiB (base64 inside the message array) to the providers that take images ----
+        for fam, model, ppath, says, bmodel in targets[:4]:
+            want = want_image(fam, 12 * MB, bmodel)
+            s, hs, b = l124_http(port, "POST", "/v1/chat/completions", image_req(model, 12 * MB), timeout=120)
+            row = mine(ppath)[-1]
+            check("a 12 MiB image in a chat request to %s arrives as the %s body, system prompt hoisted" % (model.split("/")[0], fam), s == 200 and row["size"] == len(want) and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+
+        # ---- chunked from the client ----
+        body = image_req("anthropic/claude-l136", 6 * MB)
+        want = want_image("anthropic", 6 * MB, "claude-l136")
+        pieces = [body[i:i + 100000] for i in range(0, len(body), 100000)]
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", pieces, chunked=True, timeout=120)
+        row = mine("/v1/messages")[-1]
+        check("a chunked 6 MiB image request to Anthropic arrives intact", s == 200 and row["sha"] == sha(want), (s, b[:200]))
+
+        # ---- the message layout: content before role, parts with the type last, system messages anywhere ----
+        odd = ('{"model":"anthropic/claude-l136","max_tokens":16,"messages":[{"content":"%s","role":"user"},{"role":"assistant","content":"in the middle"},{"role":"system","content":"late rules"},{"role":"user","content":[{"text":"%s","type":"text"}]}]}' % (FILL(1 * MB), FILL(1 * MB, "G"))).encode()
+        want = ('{"model":"claude-l136","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]},{"role":"assistant","content":[{"type":"text","text":"in the middle"}]},{"role":"user","content":[{"type":"text","text":"%s"}]}],"system":"late rules","max_tokens":16}' % (FILL(1 * MB), FILL(1 * MB, "G"))).encode()
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", odd, timeout=120)
+        row = mine("/v1/messages")[-1]
+        check("a message with its content before its role, a late system message and a part with its type last are converted in order", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+        tool = ('{"model":"anthropic/claude-l136","max_tokens":16,"messages":[{"role":"user","content":"call it"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"look","arguments":"{\\"q\\": 1}"}}]},{"role":"tool","tool_call_id":"c1","content":"%s"}],"tools":[{"type":"function","function":{"name":"look","parameters":{"type":"object"}}}]}' % FILL(1 * MB)).encode()
+        want = ('{"model":"claude-l136","messages":[{"role":"user","content":[{"type":"text","text":"call it"}]},{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"look","input":{"q":1}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"%s"}]}],"max_tokens":16,"tools":[{"name":"look","input_schema":{"type":"object"}}]}' % FILL(1 * MB)).encode()
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", tool, timeout=120)
+        row = mine("/v1/messages")[-1]
+        check("tool calls, a big tool result and the tool list are converted (tools after the messages in the body)", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+
+        # ---- the gateway does not hold the body ----
+        pid = gw.pid
+        hwm0 = l124_vm(pid, "VmHWM")
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", image_req("anthropic/claude-l136", 48 * MB), timeout=180)
+        hwm1 = l124_vm(pid, "VmHWM")
+        row = mine("/v1/messages")[-1]
+        check("a 48 MiB image request to Anthropic arrives intact", s == 200 and row["sha"] == sha(want_image("anthropic", 48 * MB, "claude-l136")), (s, b[:200]))
+        check("the gateway's peak memory grew by under 24 MiB for the 48 MiB Anthropic body (%d to %d MiB)" % (hwm0, hwm1), hwm1 - hwm0 < 24, (hwm0, hwm1))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", image_req("gemini/gemini-l136", 48 * MB), timeout=180)
+        hwm2 = l124_vm(pid, "VmHWM")
+        row = mine("/v1beta/models/gemini-l136:generateContent")[-1]
+        check("a 48 MiB image request to Gemini arrives intact, with no memory growth (%d to %d MiB)" % (hwm1, hwm2), s == 200 and row["sha"] == sha(want_image("gemini", 48 * MB)) and hwm2 - hwm1 < 24, (s, b[:200], hwm1, hwm2))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", text_req("cohere/command-l136", 48 * MB), timeout=180)
+        hwm3 = l124_vm(pid, "VmHWM")
+        row = mine("/v2/chat")[-1]
+        check("a 48 MiB text request to Cohere arrives intact, with no memory growth (%d to %d MiB)" % (hwm2, hwm3), s == 200 and row["sha"] == sha(want_text("cohere", 48 * MB, "command-l136")) and hwm3 - hwm2 < 24, (s, b[:200], hwm2, hwm3))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", image_req("bedrock/claude-l136", 24 * MB), timeout=300)
+        hwm4 = l124_vm(pid, "VmHWM")
+        row = mine("/model/claude-l136/converse")[-1]
+        wb = want_image("converse", 24 * MB)
+        want_sig, got_sig = l136_sigv4(row, "/model/claude-l136/converse")
+        check("a 24 MiB image request to Bedrock arrives intact and correctly signed, through the disk spool, with no memory growth (%d to %d MiB)" % (hwm3, hwm4), s == 200 and row["sha"] == sha(wb) and want_sig == got_sig and hwm4 - hwm3 < 24, (s, b[:200], hwm3, hwm4, want_sig, got_sig))
+        spools = [n for n in os.listdir("/tmp") if n.startswith("raiju-spool-")]
+        check("the spool's files are gone when the request is over", not spools, spools)
+
+        # ---- a key that sends a Bedrock API key as a bearer token: nothing to sign, but the same body ----
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", text_req("bedrock_bearer/claude-l136b", 3 * MB), timeout=120)
+        row = mine("/model/claude-l136b/converse")[-1]
+        check("a bearer-token Bedrock key gets the converted body too", s == 200 and row["sha"] == sha(want_text("converse", 3 * MB)) and row["auth"].startswith("Bearer bedrock-api-key"), (s, b[:200], row["auth"]))
+
+        # ---- Messages requests to Bedrock and to Vertex Claude: only the top-level fields change ----
+        def messages(model, n, **extra):
+            ex = "".join(',"%s":%s' % (k, json.dumps(v)) for k, v in extra.items())
+            return ('{"model":"%s","max_tokens":16%s,"messages":[{"role":"user","content":"%s"}]}' % (model, ex, FILL(n))).encode()
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", messages("bedrock/claude-l136", 12 * MB, stream=False), timeout=120)
+        row = mine("/model/claude-l136/invoke")[-1]
+        want = ('{"anthropic_version":"bedrock-2023-05-31","max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % FILL(12 * MB)).encode()
+        want_sig, got_sig = l136_sigv4(row, "/model/claude-l136/invoke")
+        check("a 12 MiB Messages request to Bedrock goes to InvokeModel without model or stream, with the Bedrock version, signed", s == 200 and row["sha"] == sha(want) and want_sig == got_sig, (s, b[:200], row["size"], len(want), want_sig, got_sig))
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", messages("vertex/claude-l136", 12 * MB), timeout=120)
+        row = mine(vx % ("anthropic", "claude-l136:rawPredict"))[-1]
+        want = ('{"max_tokens":16,"messages":[{"role":"user","content":"%s"}],"anthropic_version":"vertex-2023-10-16"}' % FILL(12 * MB)).encode()
+        check("a 12 MiB Messages request to Vertex Claude goes to rawPredict without the model, with the Vertex version", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+
+        # ---- a stream the caller asked for: the provider streams, its events are converted to chat chunks as they arrive
+        # (Bedrock's binary frames are not: its answer is read whole and replayed as a stream) ----
+        def sse_text(t):
+            out = ""
+            for line in t.split("\n"):
+                if line.startswith("data: {"):
+                    ch = json.loads(line[6:])
+                    for c in ch.get("choices", []):
+                        out += c.get("delta", {}).get("content") or ""
+            return out
+        for model, says, wirepath in [
+            ("anthropic/claude-l136", "hi", "/v1/messages"),
+            ("gemini/gemini-l136", "Hi from gemini", "/v1beta/models/gemini-l136:streamGenerateContent"),
+            ("cohere/command-l136", "Hi from cohere", "/v2/chat"),
+            ("vertex/claude-l136", "hi", vx % ("anthropic", "claude-l136:streamRawPredict")),
+            ("vertex/gemini-l136", "Hi from gemini", vx % ("google", "gemini-l136:streamGenerateContent")),
+            ("bedrock/claude-l136", "Hi from bedrock", "/model/claude-l136/converse"),
+        ]:
+            sb = ('{"model":"%s","stream":true,"stream_options":{"include_usage":true},"max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % (model, FILL(2 * MB))).encode()
+            s, hs, b = l124_http(port, "POST", "/v1/chat/completions", sb, timeout=120)
+            t = b.decode("utf8", "replace")
+            check("a big streamed chat request to %s gets an event stream with the answer, its usage and [DONE]" % model, s == 200 and hdr(hs, "content-type") == "text/event-stream" and sse_text(t) == says and '"usage"' in t and t.rstrip().endswith("data: [DONE]"), (s, hs, t[:400]))
+            row = mine(wirepath.split("?")[0])[-1]
+            check("... the provider was called with the stream variant of its API" if "converse" not in wirepath else "... Bedrock was called once, without streaming", row["size"] > 2 * MB, (wirepath, row["size"]))
+
+        # ---- usage: the converted answer is counted in the key's budget, the request log and the metrics ----
+        vk = "sk-bf-l136-budget-0123456789"
+        u0 = used()["b-l136"]
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", text_req("anthropic/claude-l136u", 1 * MB), headers={"x-bf-vk": vk})
+        u1 = used()["b-l136"]
+        check("a converted answer is counted in the key's budget (11 + 5 tokens)", s == 200 and abs((u1 - u0) - 16e-6) < 1e-9, (s, b[:100], u0, u1))
+        sb = ('{"model":"gemini/gemini-l136u","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % FILL(1 * MB)).encode()
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", sb, headers={"x-bf-vk": vk})
+        u2 = used()["b-l136"]
+        check("... and so is a converted stream (6 + 3 tokens)", s == 200 and abs((u2 - u1) - 9e-6) < 1e-9, (s, b[:100], u1, u2))
+        sb = ('{"model":"bedrock/claude-l136u","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % FILL(1 * MB)).encode()
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", sb, headers={"x-bf-vk": vk})
+        u3 = used()["b-l136"]
+        check("... and a replayed Bedrock stream (8 + 2 tokens)", s == 200 and abs((u3 - u2) - 10e-6) < 1e-9, (s, b[:100], u2, u3))
+        time.sleep(0.5)
+        entries = logs()
+        r = [e for e in entries if e.get("model") == "anthropic/claude-l136u"]
+        check("the log row has the tokens and a truncated copy of the caller's request", len(r) == 1 and r[0]["prompt_tokens"] == 11 and r[0]["completion_tokens"] == 5 and (r[0].get("input") or "").startswith('{"model":"anthropic/claude-l136u"') and len(r[0].get("input") or "") == 4096, [(e.get("prompt_tokens"), e.get("completion_tokens"), len(e.get("input") or "")) for e in r])
+
+        # ---- bad bodies are refused with a 400 ----
+        cut = ('{"model":"anthropic/claude-l136","messages":[{"role":"user","content":"%s' % FILL(1 * MB)).encode()
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", cut)
+        check("a body cut off inside a message is a 400", s == 400 and "invalid request" in b.decode(), (s, b[:200]))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", ('{"model":"anthropic/claude-l136","messages":"%s"}' % FILL(1 * MB)).encode())
+        check("messages that are not an array are a 400", s == 400 and "messages" in b.decode(), (s, b[:200]))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", ('{"model":"anthropic/claude-l136","temperature":"hot","messages":[{"role":"user","content":"%s"}]}' % FILL(1 * MB)).encode())
+        check("a parameter of the wrong type is a 400", s == 400 and "invalid request" in b.decode(), (s, b[:200]))
+
+        # ---- what still needs the whole body ----
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", text_req("anthropic_pc/claude-pc", 1 * MB))
+        wantpc = ('{"model":"claude-pc","messages":[{"role":"user","content":[{"type":"text","text":"%s","cache_control":{"type":"ephemeral"}}]}],"max_tokens":16}' % FILL(1 * MB)).encode()
+        check("a provider with cache_control_injection_points is buffered and converted whole (the points name messages by index)", s == 200 and mine("/v1/messages")[-1]["sha"] == sha(wantpc), (s, b[:200], mine("/v1/messages")[-1]["size"], len(wantpc)))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", text_req("anthropic_pc/claude-pc", 9 * MB))
+        check("... and not past client.max_request_body_size_mb", s == 413, (s, b[:200]))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", text_req("anthropic/claude-l136", 9 * MB), timeout=120)
+        check("a converted request is not held, so client.max_request_body_size_mb does not stop it", s == 200, (s, b[:200]))
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", b"x" * 1000, headers={"content-length": str(300 * MB)})
+        check("a declared length over max_payload_bytes is still a 413", s == 413 and "maximum payload" in b.decode(), (s, b[:200]))
+
+        # ---- the hold limit: client.max_request_body_size_mb bounds what is held (1 MiB on the second gateway) ----
+        portb = 18213
+        big_sys = ('{"model":"anthropic/claude-l136","max_tokens":16,"messages":[{"role":"system","content":"%s"},{"role":"user","content":"hi"}]}' % FILL(3 * MB)).encode()
+        s, _, b = l124_http(portb, "POST", "/v1/chat/completions", big_sys)
+        check("a system prompt over the hold limit is refused with a 400 that says so", s == 400 and "too large to convert while streaming" in b.decode(), (s, b[:300]))
+        s, _, b = l124_http(portb, "POST", "/v1/chat/completions", text_req("anthropic/claude-l136", 3 * MB), timeout=120)
+        check("... while a user message of the same size streams through", s == 200, (s, b[:200]))
+        early = ('{"model":"anthropic/claude-l136","max_tokens":16,"messages":[{"content":"%s","role":"user"}]}' % FILL(3 * MB)).encode()
+        s, _, b = l124_http(portb, "POST", "/v1/chat/completions", early)
+        check("a message with its content first and over the hold limit is refused, and the error says to put role first", s == 400 and 'put "role" before "content"' in json.loads(b)["error"]["message"], (s, b[:300]))
+
+        # (last: an error in the middle of the upload)
+        s, _, b = l124_http(port, "POST", "/v1/chat/completions", ('{"model":"anthropic/claude-l136","messages":[{"content":"%s"}]}' % FILL(1 * MB)).encode())
+        check("a message with no role is a 400", s == 400 and "role" in b.decode(), (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+        gwb.terminate()
+        gwb.wait()
+
 
 def main():
     unique_ports()
@@ -9442,10 +10094,14 @@ def main():
         l112b_exchange_e2e(env)
         # MCP token exchange at runtime (the retained admin credential lists the tools, each caller's own token is exchanged per call) and code mode on the Responses API and POST /mcp: their own gateway
         l133_e2e(env)
+        # the token_exchange admin credential renewed with its refresh token (scheduled and after a 401), and needs_reauth once refused: its own gateway
+        l140_e2e(env)
         # WebAssembly plugins (a .wasm path in plugins[]): rewrites, short circuits, traps, limits and the plugin API: their own gateway
         l121_e2e(env)
         # the plugin chain as Bifrost runs it: HTTP transport hooks, the LLM hooks on every request type and on streams, has_error: their own gateway
         l130_e2e(env)
+        # the LLM hooks on the Anthropic Messages, Cohere, GenAI and Bedrock routes and Cursor's Responses-shaped chat: their own gateway
+        l139_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
         l113_ui_e2e(env)
         # network_config pool knobs and upstream HTTP/2 (Tov patch 0007): origins from tov-patches/tests/h2_server.py, their own gateway
@@ -9454,6 +10110,8 @@ def main():
         l124_e2e(env)
         # large_payload_optimization beyond chat: Responses, Messages and multipart streamed, usage counted: their own gateway
         l129_e2e(env)
+        # large_payload_optimization for providers whose format differs: converted while the body streams in: their own gateways
+        l136_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

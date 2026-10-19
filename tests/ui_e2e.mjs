@@ -117,7 +117,7 @@ try {
   // 401s before the sign-in and the 400s of rejected inputs are expected; anything else on the console (a CSP violation, a Solid warning) is not
   page.on("console", (m) => {
     if (m.type() !== "error" && m.type() !== "warning") return
-    if (/status of (400|401|404|422)/.test(m.text())) return
+    if (/status of (400|401|403|404|409|422)/.test(m.text())) return
     errors.push(m.type() + ": " + m.text())
   })
 
@@ -190,6 +190,54 @@ try {
   await page.selectOption("#ov-period", "24h")
   check("the period menu reloads the charts", await until(page, () => document.querySelector("#ch-requests svg") !== null && document.querySelector("#ov-charts select").value === "24h"))
   await page.selectOption("#ov-period", "1h")
+
+  // ---- chart series toggles and zoom (overview) ----
+  await until(page, () => document.querySelector("#ch-requests svg") !== null)
+  const axisOf = (sel) => page.evaluate((s) => [...document.querySelectorAll(s + " svg text.axis[text-anchor=end]")].map((t) => t.textContent).join("|"), sel)
+  const legendBtn = (id, name) => page.locator("#" + id + ' .legend-toggle:has-text("' + name + '")')
+  const barsBefore = await page.locator("#ch-requests rect.bar").count()
+  const axisBefore = await axisOf("#ch-requests")
+  check("each legend entry is a toggle button, pressed while its series is drawn", (await legendBtn("ch-requests", "Success").getAttribute("aria-pressed")) === "true" && (await page.locator("#ch-requests .legend button").count()) >= 2)
+  await legendBtn("ch-requests", "Success").click()
+  check("hiding a series marks its legend entry and removes its bars", (await legendBtn("ch-requests", "Success").getAttribute("aria-pressed")) === "false" && (await page.locator("#ch-requests rect.bar").count()) < barsBefore, barsBefore + " -> " + (await page.locator("#ch-requests rect.bar").count()))
+  check("the axis rescales to the series still shown", (await axisOf("#ch-requests")) !== axisBefore, axisBefore + " vs " + (await axisOf("#ch-requests")))
+  check("the hover readout leaves the hidden series out", await (async () => {
+    const b = await page.locator("#ch-requests svg").boundingBox()
+    await page.mouse.move(b.x + b.width - 20, b.y + 80)
+    await until(page, () => document.querySelector("#ch-requests .chart-tip") !== null)
+    return !(await text(page, "#ch-requests .chart-tip")).includes("Success")
+  })())
+  await legendBtn("ch-requests", "Success").click()
+  check("showing the series again restores the bars and the axis", (await page.locator("#ch-requests rect.bar").count()) === barsBefore && (await axisOf("#ch-requests")) === axisBefore)
+  const linesBefore = await page.locator("#ch-latency svg path").count()
+  await legendBtn("ch-latency", "p99").click()
+  check("a line series can be hidden too", (await page.locator("#ch-latency svg path").count()) === linesBefore - 1, linesBefore)
+  await legendBtn("ch-latency", "p99").click()
+  check("the legend toggles are keyboard operable", await (async () => {
+    await page.focus('#ch-latency .legend-toggle:has-text("p90")')
+    await page.keyboard.press("Enter")
+    const hid = (await page.locator("#ch-latency svg path").count()) === linesBefore - 1
+    await page.keyboard.press("Space")
+    return hid && (await page.locator("#ch-latency svg path").count()) === linesBefore
+  })())
+
+  const dashReqs = []
+  page.on("request", (r) => { if (r.url().includes("/api/logs/dashboard")) dashReqs.push(new URL(r.url())) })
+  await page.locator("#ch-requests svg").scrollIntoViewIfNeeded()
+  const ob = await page.locator("#ch-requests svg").boundingBox()
+  await page.mouse.move(ob.x + ob.width * 0.55, ob.y + 80)
+  await page.mouse.down()
+  await page.mouse.move(ob.x + ob.width * 0.8, ob.y + 80, { steps: 5 })
+  check("dragging across a chart draws the selection", await until(page, () => document.querySelector("#ch-requests rect.sel") !== null))
+  await page.mouse.up()
+  check("releasing the drag zooms every overview chart to that range and drops the period", await until(page, () => document.querySelector("#ch-requests .zoom-reset") !== null && document.querySelector("#ch-latency .zoom-reset") !== null) && dashReqs.length > 0 && dashReqs[dashReqs.length - 1].searchParams.has("start_time") && dashReqs[dashReqs.length - 1].searchParams.has("end_time") && !dashReqs[dashReqs.length - 1].searchParams.has("period"), dashReqs.map((u) => u.search).join(" "))
+  {
+    const u = dashReqs[dashReqs.length - 1]
+    const span = Number(u.searchParams.get("end_time")) - Number(u.searchParams.get("start_time"))
+    check("the zoomed range is a part of the hour", span > 0 && span < 3600000, span)
+  }
+  await page.locator("#ch-requests .zoom-reset").click()
+  check("Reset zoom brings the period back", await until(page, () => document.querySelector("#ch-requests .zoom-reset") === null) && dashReqs[dashReqs.length - 1].searchParams.get("period") === "1h" && !dashReqs[dashReqs.length - 1].searchParams.has("start_time"), dashReqs.map((u) => u.search).join(" "))
 
   // ---- live feed (the real socket) ----
   await page.goto(GW + "/#live")
@@ -464,6 +512,59 @@ try {
   await page.fill('#lg-filter input[name=provider]', "")
   await page.click('#lg-filter button[type=submit]')
   await until(page, () => document.querySelectorAll("#lgc-requests rect.bar").length > 0)
+  // zoom: a drag over the chart narrows the screen's time range, the list and the charts refetch
+  {
+    const hist = []
+    const list = []
+    const onReq = (r) => {
+      const u = new URL(r.url())
+      if (u.pathname === "/api/logs/histogram") hist.push(u)
+      if (u.pathname === "/api/logs") list.push(u)
+    }
+    page.on("request", onReq)
+    const spanOf = (u) => Number(u.searchParams.get("end_time")) - Number(u.searchParams.get("start_time"))
+    await page.reload()
+    await until(page, () => document.querySelectorAll("#lgc-requests rect.bar").length > 0)
+    const fullSpan = spanOf(hist[hist.length - 1])
+    check("the log charts start on the last 24 hours", Math.abs(fullSpan - 86400000) < 5000, fullSpan)
+    await page.locator("#lgc-requests svg").scrollIntoViewIfNeeded()
+    const b = await page.locator("#lgc-requests svg").boundingBox()
+    const nHist = hist.length
+    await page.mouse.move(b.x + b.width * 0.6, b.y + 80)
+    await page.mouse.down()
+    await page.mouse.move(b.x + b.width - 12, b.y + 80, { steps: 6 })
+    await page.mouse.up()
+    check("a drag selection refetches the charts over the selected range", await until(page, () => document.querySelector("#lgc-requests .zoom-reset") !== null) && hist.length > nHist && spanOf(hist[hist.length - 1]) <= fullSpan * 0.6 && spanOf(hist[hist.length - 1]) > 0, hist.map(spanOf).join(","))
+    const z = hist[hist.length - 1]
+    check("the log list takes the same range", list.length > 0 && Number(list[list.length - 1].searchParams.get("since")) === Number(z.searchParams.get("start_time")) && Number(list[list.length - 1].searchParams.get("until")) === Number(z.searchParams.get("end_time")), list.map((u) => u.search).join(" "))
+    check("the filter form shows it as a custom range", (await page.inputValue('#lg-filter select[name=period]')) === "custom" && (await page.inputValue('#lg-filter input[name=from]')) !== "" && (await page.isVisible("#lg-from-wrap")))
+    await page.locator("#lgc-requests .zoom-reset").click()
+    check("Reset zoom restores the 24 hour range and the form", await until(page, () => document.querySelector("#lgc-requests .zoom-reset") === null) && Math.abs(spanOf(hist[hist.length - 1]) - 86400000) < 5000 && (await page.inputValue('#lg-filter select[name=period]')) === "" && !(await page.isVisible("#lg-from-wrap")), hist.map(spanOf).join(","))
+    // from the keyboard: arrows read a bucket, Shift+arrows extend a selection, Enter zooms, Escape cancels
+    await page.focus("#lgc-requests svg")
+    await page.keyboard.press("ArrowLeft")
+    await page.keyboard.press("Shift+ArrowLeft")
+    await page.keyboard.press("Shift+ArrowLeft")
+    check("Shift+arrows select a range and say which", await until(page, () => document.querySelector("#lgc-requests rect.sel") !== null && /to/.test(document.querySelector("#lgc-requests .zoom-bar")?.textContent ?? "")), await text(page, "#lgc-requests .zoom-bar"))
+    await page.keyboard.press("Escape")
+    check("Escape drops the selection without zooming", await until(page, () => document.querySelector("#lgc-requests rect.sel") === null) && (await page.locator("#lgc-requests .zoom-reset").count()) === 0)
+    await page.keyboard.press("Shift+ArrowRight")
+    await page.keyboard.press("Shift+ArrowRight")
+    await page.keyboard.press("Enter")
+    check("Enter zooms to the keyboard selection", await until(page, () => document.querySelector("#lgc-requests .zoom-reset") !== null) && spanOf(hist[hist.length - 1]) <= fullSpan * 0.6, hist.map(spanOf).join(","))
+    await page.locator("#lgc-requests .zoom-reset").click()
+    await until(page, () => document.querySelector("#lgc-requests .zoom-reset") === null)
+    // the selection can also be applied with its button
+    await page.focus("#lgc-requests svg")
+    await page.keyboard.press("ArrowLeft")
+    await page.keyboard.press("Shift+ArrowLeft")
+    await page.locator("#lgc-requests .zoom-apply").click()
+    check("the Zoom to selection button applies a selection", await until(page, () => document.querySelector("#lgc-requests .zoom-reset") !== null))
+    await page.fill('#lg-filter input[name=text]', "")
+    await page.click('#lg-filter button[type=submit]')
+    check("Apply on the filters leaves the zoom", await until(page, () => document.querySelector("#lgc-requests .zoom-reset") === null))
+    page.off("request", onReq)
+  }
   await page.selectOption('#lg-filter select[name=period]', "custom")
   check("a custom time range shows its from and to fields", await page.isVisible("#lg-from-wrap") && await page.isVisible("#lg-to-wrap"))
   await page.selectOption('#lg-filter select[name=period]', "")
@@ -814,6 +915,118 @@ try {
     await api("DELETE", "/api/roles/keys-reader")
   }
 
+  // ---- role editor: a role made in the UI limits what a user sees and may call ----
+  {
+    await api("POST", "/api/governance/access-profiles", { id: "p-ui-role", name: "UI role profile", allowed_models: ["openai/gpt-4o-mini"] })
+    const mk = async (name, role) => (await api("POST", "/api/users", { name, role })).data.token
+    const asUser = async (token) => {
+      const ctx = await browser.newContext({ viewport: { width: 1200, height: 900 } })
+      const p = await ctx.newPage()
+      await p.addInitScript((t) => sessionStorage.setItem("raiju.adminToken", t), token)
+      return { ctx, p }
+    }
+    const callAs = async (token, method, path, body) => {
+      const res = await fetch(GW + path, { method, headers: { "content-type": "application/json", authorization: "Bearer " + token }, body: body === undefined ? undefined : JSON.stringify(body) })
+      return res.status
+    }
+    const navOf = (p) => p.evaluate(() => [...document.querySelectorAll("nav.tabs a")].map((a) => a.getAttribute("data-nav")))
+    const roleToken = await mk("ui-roleuser", "viewer")
+
+    await page.goto(GW + "/#roles")
+    check("the roles page lists the built-in roles, read only", await until(page, () => ["admin", "editor", "viewer", "auditor"].every((r) => (document.querySelector("#role-builtin")?.textContent ?? "").includes(r))) && (await page.locator("#role-builtin button, #role-builtin input").count()) === 0)
+    await until(page, () => document.querySelector("#role-new") !== null)
+    await page.click("#role-new")
+    await page.waitForSelector("#role-form")
+    check("the permission grid has a row per resource and a column per operation", (await page.locator("#role-grid tbody tr").count()) >= 18 && (await page.locator("#role-grid thead th").count()) === 8, await page.locator("#role-grid tbody tr").count())
+    await page.fill('#role-form input[name=name]', "ui-keyreader")
+    await page.fill('#role-form input[name=description]', "reads virtual keys")
+    await page.check('#role-grid input[aria-label="VirtualKeys View"]')
+    check("an access profile can be attached to the new role", await page.isVisible('#role-profiles input[value="p-ui-role"]'))
+    await page.check('#role-profiles input[value="p-ui-role"]')
+    await page.click('#role-form button[type=submit]')
+    check("a created role appears in the list with its permission count", await until(page, () => /1/.test(document.querySelector('#role-list tr[data-role="ui-keyreader"]')?.children[2]?.textContent ?? "") && document.querySelector("#role-form") === null), await text(page, "#role-list"))
+    const made = (await api("GET", "/api/roles/ui-keyreader")).data
+    check("the gateway stored exactly the ticked pair", JSON.stringify(made.permissions) === JSON.stringify([{ resource: "VirtualKeys", operation: "View" }]) && made.description === "reads virtual keys", JSON.stringify(made))
+    const prof = (await api("GET", "/api/governance/access-profiles")).data.profiles.find((p) => p.id === "p-ui-role")
+    check("the access profile is attached to the role", (prof.roles ?? []).some((r) => r.role_id === made.id), JSON.stringify(prof))
+    check("the list names the attached profile", (await text(page, '#role-list tr[data-role="ui-keyreader"]')).includes("p-ui-role"))
+
+    // assign the role to a user
+    await page.selectOption('select[aria-label="Role of ui-roleuser"]', "ui-keyreader")
+    check("choosing a role for a user saves it", await poll(async () => (await api("GET", "/api/users/ui-roleuser/role")).data.role === "ui-keyreader"), JSON.stringify((await api("GET", "/api/users/ui-roleuser/role")).data))
+    check("the list shows the role's holders", await until(page, () => (document.querySelector('#role-list tr[data-role="ui-keyreader"]')?.textContent ?? "").includes("ui-roleuser")), await text(page, "#role-list"))
+
+    // the user is limited, in the UI and on the API
+    {
+      const { ctx, p } = await asUser(roleToken)
+      await p.goto(GW + "/#keys")
+      check("the user sees the key list the role reads", await until(p, () => document.querySelector("#vk-list") !== null))
+      const nav = await navOf(p)
+      check("the user's tabs follow the role", nav.includes("keys") && !nav.includes("providers") && !nav.includes("logs") && !nav.includes("config") && !nav.includes("roles"), nav.join(","))
+      check("it has no New virtual key button", (await p.locator("#vk-new").count()) === 0)
+      check("the API lets it read keys and refuses providers and writes", (await callAs(roleToken, "GET", "/api/governance/virtual-keys")) === 200 && (await callAs(roleToken, "GET", "/api/providers")) === 403 && (await callAs(roleToken, "POST", "/api/governance/virtual-keys", {})) === 403)
+      await ctx.close()
+    }
+
+    // edit the role in the UI: the grid shows what it holds, one more pair widens the user's access
+    await page.click('#role-list tr[data-role="ui-keyreader"] button:has-text("Edit")')
+    await page.waitForSelector("#role-form")
+    check("the editor opens with the role's pairs and profiles ticked", (await page.isChecked('#role-grid input[aria-label="VirtualKeys View"]')) && !(await page.isChecked('#role-grid input[aria-label="VirtualKeys Create"]')) && (await page.isChecked('#role-profiles input[value="p-ui-role"]')) && (await page.inputValue('#role-form input[name=name]')) === "ui-keyreader")
+    check("a saved role's name is fixed", await page.evaluate(() => document.querySelector('#role-form input[name=name]').readOnly))
+    await page.check('#role-grid input[aria-label="VirtualKeys Create"]')
+    await page.click('#role-grid button[aria-label="Toggle every operation on Logs"]')
+    await page.click('#role-grid button[aria-label="Toggle every operation on Logs"]')
+    check("a row's All button ticks and unticks the whole row", !(await page.isChecked('#role-grid input[aria-label="Logs View"]')))
+    await page.click('#role-form button[type=submit]')
+    check("the saved edit reaches the gateway", await poll(async () => ((await api("GET", "/api/roles/ui-keyreader")).data.permissions ?? []).length === 2), JSON.stringify((await api("GET", "/api/roles/ui-keyreader")).data))
+    {
+      const { ctx, p } = await asUser(roleToken)
+      await p.goto(GW + "/#keys")
+      check("the widened role shows the user New virtual key", await until(p, () => document.querySelector("#vk-new") !== null))
+      check("and the API no longer refuses the write", (await callAs(roleToken, "POST", "/api/governance/virtual-keys", {})) !== 403)
+      await ctx.close()
+    }
+    // untick the profile again: it is detached
+    await page.click('#role-list tr[data-role="ui-keyreader"] button:has-text("Edit")')
+    await page.waitForSelector("#role-form")
+    await page.uncheck('#role-profiles input[value="p-ui-role"]')
+    await page.click('#role-form button[type=submit]')
+    check("unticking a profile detaches it from the role", await poll(async () => ((await api("GET", "/api/governance/access-profiles")).data.profiles.find((p) => p.id === "p-ui-role").roles ?? []).length === 0))
+
+    // a role that only reads RBAC sees the roles read only
+    await api("POST", "/api/roles", { name: "ui-rbac-ro", permissions: [{ resource: "RBAC", operation: "View" }] })
+    const roToken = await mk("ui-rbac-user", "ui-rbac-ro")
+    {
+      const { ctx, p } = await asUser(roToken)
+      await p.goto(GW + "/#roles")
+      check("a role that reads RBAC sees the custom roles", await until(p, () => document.querySelector('#role-list tr[data-role="ui-keyreader"]') !== null))
+      check("it has no New role, Delete or Users section", (await p.locator("#role-new, #role-users").count()) === 0 && (await p.locator('#role-list button:has-text("Delete")').count()) === 0)
+      await p.click('#role-list tr[data-role="ui-keyreader"] button:has-text("View")')
+      await p.waitForSelector("#role-form")
+      check("the form opens with every control disabled", await p.evaluate(() => document.querySelector('#role-form button[type=submit]').disabled && [...document.querySelectorAll('#role-grid input[name=perm]')].every((b) => b.disabled)))
+      check("the API refuses its writes", (await callAs(roToken, "POST", "/api/roles", { name: "nope" })) === 403 && (await callAs(roToken, "DELETE", "/api/roles/ui-keyreader")) === 403)
+      await ctx.close()
+    }
+
+    // deleting a role a user holds is refused; once released it goes
+    await page.click('#role-list tr[data-role="ui-keyreader"] button:has-text("Delete")')
+    await page.click('#role-list tr[data-role="ui-keyreader"] button:has-text("Confirm delete")')
+    check("a role a user still holds is not deleted, and the refusal is shown", await until(page, () => document.querySelector(".toast.error") !== null) && (await api("GET", "/api/roles/ui-keyreader")).status === 200, await text(page, ".toasts"))
+    await api("PUT", "/api/users/ui-roleuser/role", { role: "viewer" })
+    await page.click("#roles-refresh")
+    await until(page, () => !(document.querySelector('#role-list tr[data-role="ui-keyreader"]')?.textContent ?? "").includes("ui-roleuser"))
+    await page.click('#role-list tr[data-role="ui-keyreader"] button:has-text("Delete")')
+    await page.click('#role-list tr[data-role="ui-keyreader"] button:has-text("Confirm delete")')
+    check("a released role is deleted", await until(page, () => document.querySelector('#role-list tr[data-role="ui-keyreader"]') === null) && (await api("GET", "/api/roles/ui-keyreader")).status === 404)
+    const w = await page.evaluate(() => document.documentElement.scrollWidth)
+    check("the roles page has no horizontal scroll at 400px", w <= 400, w)
+
+    await api("DELETE", "/api/users/ui-roleuser")
+    await api("DELETE", "/api/users/ui-rbac-user")
+    await api("DELETE", "/api/roles/ui-rbac-ro")
+    await api("DELETE", "/api/governance/access-profiles/p-ui-role")
+  }
+
   // ---- config ----
   await page.goto(GW + "/#config")
   check("the settings editor loads the client section", await until(page, () => (document.querySelector("#cfg-json")?.value ?? "").includes("client_config")))
@@ -854,7 +1067,7 @@ try {
   check("a failed request shows its error", await until(page, () => document.querySelector("#pg-result p.error") !== null), await text(page, "#pg-result"))
 
   // ---- layout at phone width, names for every field ----
-  const VIEWS = ["overview", "live", "providers", "keys", "governance", "logs", "mcp", "config", "playground"]
+  const VIEWS = ["overview", "live", "providers", "keys", "governance", "logs", "mcp", "roles", "config", "playground"]
   for (const view of VIEWS) {
     await page.goto(GW + "/#" + view)
     await page.waitForTimeout(400)

@@ -27,7 +27,8 @@
  *            error     pre: fails with "http pre refused"
  *            path      pre: moves the request to /v1/models (the host must refuse it)
  *   post   what post_hook adds: error (turns a response into a 429 error), recover (turns an error into
- *          a chat response), chunk (rewrites each stream chunk: "chunk_from" to "chunk_to")
+ *          a chat response), chunk (rewrites each stream chunk: "chunk_from" to "chunk_to"), text (the
+ *          same, in a whole response as well as in each chunk)
  *   chunk_from, chunk_to, chunk_skip, chunk_stop   http_stream_chunk_hook: replaces chunk_from with
  *          chunk_to in each chunk, drops a chunk that contains chunk_skip, ends the stream on a chunk
  *          that contains chunk_stop. The hook is a pass-through when none is set.
@@ -391,8 +392,8 @@ EXPORT("post_hook") u64 plugin_post_hook(u32 ptr, u32 len) {
     }
     if (value_of(in, len, "response", &rs, &re)) {
         int is_chunk = find(in + rs, re - rs, CHAT_CHUNK) >= 0;
-        if (is_post("chunk") && is_chunk) {
-            /* chunk_from becomes chunk_to inside the stream chunk */
+        if ((is_post("chunk") && is_chunk) || is_post("text")) {
+            /* chunk_from becomes chunk_to inside the stream chunk (text: inside a whole response too) */
             put_replaced(&b, in + rs, re - rs, chunk_from, chunk_to);
         } else {
             /* insert the marker as the first field of the object the response holds (":{" opens it) */

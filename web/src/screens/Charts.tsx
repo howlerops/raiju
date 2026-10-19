@@ -37,13 +37,20 @@ function Panel(props: { children?: import("@solidjs/web").JSX.Element }) {
 
 export function OverviewCharts(props: { tick: () => number }) {
   const [period, setPeriod] = createSignal("1h")
+  // a zoomed range (epoch ms) replaces the period until it is reset
+  const [zoom, setZoom] = createSignal<[number, number] | undefined>(undefined)
+  const zoomProps = () => ({ onZoom: (a: number, b: number) => setZoom([a, b]), zoomed: zoom() !== undefined, onReset: () => setZoom(undefined) })
+  const range = (): Query => {
+    const z = zoom()
+    return z ? { start_time: z[0], end_time: z[1] } : { period: period() }
+  }
   const dash = createMemo(() => {
     props.tick()
-    return getJson("/api/logs/dashboard", { period: period() })
+    return getJson("/api/logs/dashboard", range())
   })
   const providers = createMemo(() => {
     props.tick()
-    return getJson("/api/logs/rankings/by-dimension", { dimension: "provider", period: period(), limit: 8 })
+    return getJson("/api/logs/rankings/by-dimension", { dimension: "provider", ...range(), limit: 8 })
   })
 
   return (
@@ -55,7 +62,10 @@ export function OverviewCharts(props: { tick: () => number }) {
         <span class="grow"></span>
         <label class="inline">
           Period
-          <select id="ov-period" onChange={(ev) => setPeriod(ev.currentTarget.value)}>
+          <select id="ov-period" onChange={(ev) => {
+                setZoom(undefined)
+                setPeriod(ev.currentTarget.value)
+              }}>
             {PERIODS.map(([v, l]) => (
               <option value={v} ref={(el) => (el.selected = v === "1h")}>
                 {l}
@@ -84,6 +94,7 @@ export function OverviewCharts(props: { tick: () => number }) {
                   times={req.times}
                   series={requestSeries(req)}
                   kind="bars"
+                  {...zoomProps()}
                   format={fmtInt}
                 />
               </Panel>
@@ -95,6 +106,7 @@ export function OverviewCharts(props: { tick: () => number }) {
                   times={lat.times}
                   series={latencySeries(lat)}
                   kind="lines"
+                  {...zoomProps()}
                   format={ms}
                 />
               </Panel>
@@ -106,6 +118,7 @@ export function OverviewCharts(props: { tick: () => number }) {
                   times={tok.times}
                   series={tokenSeries(tok)}
                   kind="bars"
+                  {...zoomProps()}
                   format={compact}
                 />
               </Panel>
@@ -117,6 +130,7 @@ export function OverviewCharts(props: { tick: () => number }) {
                   times={cost.times}
                   series={costSeries(cost)}
                   kind="bars"
+                  {...zoomProps()}
                   format={money}
                 />
               </Panel>
@@ -128,6 +142,7 @@ export function OverviewCharts(props: { tick: () => number }) {
                   times={provCost.times}
                   series={foldSeries(groupSeries(provCost, "by_provider"))}
                   kind="bars"
+                  {...zoomProps()}
                   format={money}
                 />
               </Panel>
@@ -168,7 +183,14 @@ const METRICS: [string, string][] = [
   ["latency", "p95 latency"],
 ]
 
-export function LogCharts(props: { query: Query }) {
+// what a screen passes the time charts so a drag selection narrows its filters
+export interface ZoomProps {
+  onZoom: (start: number, end: number) => void
+  zoomed: boolean
+  onReset: () => void
+}
+
+export function LogCharts(props: { query: Query; zoom?: ZoomProps }) {
   const [dimension, setDimension] = createSignal("provider")
   const [metric, setMetric] = createSignal("cost")
 
@@ -218,6 +240,7 @@ export function LogCharts(props: { query: Query }) {
                   times={b.times}
                   series={requestSeries(b)}
                   kind="bars"
+                  {...props.zoom}
                   format={fmtInt}
                 />
               )
@@ -238,6 +261,7 @@ export function LogCharts(props: { query: Query }) {
                   times={b.times}
                   series={foldSeries(series)}
                   kind={m === "latency" ? "lines" : "bars"}
+                  {...props.zoom}
                   format={m === "cost" ? money : m === "tokens" ? compact : ms}
                 />
               )

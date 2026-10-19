@@ -15,6 +15,8 @@ import * as genaiIn from "./genai_in"
 import * as bedrockIn from "./bedrock_in"
 import { estimateChatTokens, estimateTokens } from "./jobs"
 import { rerank, bedrockCountTokens } from "./extras"
+import { hooksOn, viaChat } from "./nativehook"
+import { Handler, llmHooked } from "./pluginroute"
 import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
@@ -138,6 +140,14 @@ export async function anthropicMessages(engine: Engine, req: Request, sink?: Str
   }
   const stream = find(body, "stream") === "true"
   const clientModel = rawStr(body, "model") ?? ""
+  // with plugins in the chat hooks, the request goes through chat, where they run (nativehook.tov)
+  if (hooksOn(engine)) {
+    try {
+      return await viaChat(engine, req, anthropicIn.toChatRequest(text, clientModel), { kind: "anthropic", model: clientModel }, stream, sink)
+    } catch (e) {
+      return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+    }
+  }
   try {
     // Every provider other than Anthropic (and non-streaming Bedrock) is reached through OpenAI chat.
     bridge = chatBridge(anthropicIn.toChatRequest(text, clientModel), stream, false, stream && sink !== undefined)
@@ -288,6 +298,17 @@ async function codeModeResponses(engine: Engine, req: Request, reqText: string, 
   }
 }
 
+// An internal call to one of the gateway's own routes with the plugins' LLM hooks around it (pluginroute.tov
+// llmHooked), for the native routes that are served by another request type (Cursor's Responses-shaped chat,
+// Cohere's embed and rerank, GenAI's :predict and rank).
+async function hooked(engine: Engine, req: Request, op: string, handler: Handler, sink: StreamSink | undefined): Promise<Response> {
+  try {
+    return await llmHooked(engine, req, op, handler, sink)
+  } catch (e) {
+    return errorResponse(502, `the plugin hooks failed: ${e.message}`, "api_error", noHeaders())
+  }
+}
+
 function jsonBody(body: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "application/json")
@@ -313,13 +334,13 @@ export async function cursorChat(engine: Engine, req: Request, sink?: StreamSink
     if (sink === undefined) return errorResponse(400, "a streamed Responses-shaped /cursor request needs a streaming transport; send messages", "invalid_request_error", noHeaders())
     const model = rawStr(body, "model") ?? ""
     const conv = new ResponsesToChatStream(model, false)
-    const r = await responsesApi(engine, internalRequest(req, "/v1/responses", text), convertingSink(sink, (c: string) => conv.push(c), () => conv.end()))
+    const r = await hooked(engine, internalRequest(req, "/v1/responses", text), "responses", async (hr, hs) => await responsesApi(engine, hr, hs), convertingSink(sink, (c: string) => conv.push(c), () => conv.end()))
     return await convertWhole(r, sink, (t: string) => {
       const whole = new ResponsesToChatStream(model, false)
       return whole.push(t) + whole.end()
     })
   }
-  const r = await responsesApi(engine, internalRequest(req, "/v1/responses", text))
+  const r = await hooked(engine, internalRequest(req, "/v1/responses", text), "responses", async (hr, hs) => await responsesApi(engine, hr, hs), undefined)
   if (r.status !== 200) return r
   try {
     const out = fields(await r.text())
@@ -535,6 +556,13 @@ export async function cohereChat(engine: Engine, req: Request, sink?: StreamSink
   }
   const stream = find(body, "stream") === "true"
   const clientModel = rawStr(body, "model") ?? ""
+  if (hooksOn(engine)) {
+    try {
+      return await viaChat(engine, req, cohereIn.chatToOpenAI(text, clientModel), { kind: "cohere", model: clientModel }, stream, sink)
+    } catch (e) {
+      return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+    }
+  }
   try {
     bridge = chatBridge(cohereIn.chatToOpenAI(text, clientModel), stream, false, stream && sink !== undefined)
   } catch (e) {
@@ -567,7 +595,7 @@ export async function cohereEmbed(engine: Engine, req: Request): Promise<Respons
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
-  const r = await engine.embeddings(internalRequest(req, "/v1/embeddings", conv))
+  const r = await hooked(engine, internalRequest(req, "/v1/embeddings", conv), "embeddings", async (hr, hs) => await engine.embeddings(hr), undefined)
   if (r.status !== 200) return r
   try {
     return jsonBody(cohereIn.openAIToEmbed(await r.text(), texts))
@@ -585,7 +613,7 @@ export async function cohereRerank(engine: Engine, req: Request): Promise<Respon
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
-  const r = await rerank(engine, internalRequest(req, "/v1/rerank", conv))
+  const r = await hooked(engine, internalRequest(req, "/v1/rerank", conv), "rerank", async (hr, hs) => await rerank(engine, hr), undefined)
   if (r.status !== 200) return r
   try {
     return jsonBody(cohereIn.raijuToRerank(await r.text()))
@@ -622,6 +650,13 @@ export async function genai(engine: Engine, req: Request, modelAction: string, s
   if (method === "countTokens") return genaiCount(text, full)
   if (method !== "generateContent" && method !== "streamGenerateContent") return errorResponse(404, `${method} isn't supported`, "invalid_request_error", noHeaders())
   const stream = method === "streamGenerateContent"
+  if (hooksOn(engine)) {
+    try {
+      return await viaChat(engine, req, genaiIn.generateToOpenAI(text, full, stream), { kind: "genai", model: full }, stream, sink)
+    } catch (e) {
+      return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+    }
+  }
   let bridge: Bridge | undefined = undefined
   try {
     bridge = chatBridge(genaiIn.generateToOpenAI(text, full, stream), stream, false, stream && sink !== undefined)
@@ -924,7 +959,7 @@ async function genaiModelRoute(engine: Engine, req: Request, op: string, model: 
     }
   }
   const conv = try genaiIn.predictToEmbeddings(text, t.provider + "/" + t.model)
-  const r = await engine.embeddings(internalRequest(req, "/v1/embeddings", conv))
+  const r = await hooked(engine, internalRequest(req, "/v1/embeddings", conv), "embeddings", async (hr, hs) => await engine.embeddings(hr), undefined)
   if (r.status !== 200) return r
   try {
     return jsonBody(genaiIn.embeddingsToPredict(await r.text()))
@@ -942,7 +977,7 @@ async function genaiRank(engine: Engine, req: Request): Promise<Response> throws
   const hp = req.headers.get("x-model-provider") ?? ""
   const full = model.includes("/") ? model : (hp === "" ? "vertex" : hp) + "/" + model
   const conv = try genaiIn.rankToRaiju(text, full)
-  const r = await rerank(engine, internalRequest(req, "/v1/rerank", conv))
+  const r = await hooked(engine, internalRequest(req, "/v1/rerank", conv), "rerank", async (hr, hs) => await rerank(engine, hr), undefined)
   if (r.status !== 200) return r
   try {
     return jsonBody(genaiIn.rerankToRank(await r.text(), text))
@@ -1068,6 +1103,11 @@ export async function bedrockModel(engine: Engine, req: Request, modelId: string
   let bridge: Bridge | undefined = undefined
   try {
     const chat = invoke ? (stream ? bedrockIn.invokeStreamToOpenAI(text, id) : bedrockIn.invokeToOpenAI(text, id)) : bedrockIn.converseToOpenAI(text, id, stream)
+    if (hooksOn(engine)) {
+      // the chat request names the model as the route resolves it ("bedrock/<id>" for a bare id)
+      const hooked = invoke ? (stream ? bedrockIn.invokeStreamToOpenAI(text, full) : bedrockIn.invokeToOpenAI(text, full)) : bedrockIn.converseToOpenAI(text, full, stream)
+      return await viaChat(engine, req, hooked, { kind: invoke ? "invoke" : "converse", model: id }, stream, sink)
+    }
     bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())

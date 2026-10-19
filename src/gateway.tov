@@ -54,9 +54,9 @@ import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches } from "./mcp"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches, adminRowOf } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
-import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken } from "./tokenexchange"
+import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewDue, nextRenewal, needsReverify, RENEW_RETRY_MS } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
 import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, consentLink, startUserFlow, refreshUserRow } from "./mcpuser"
 import { Limiter } from "./limiter"
@@ -70,6 +70,7 @@ import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 import * as oauthKey from "./oauth_key"
 import { LargeBody, LargeSettings, BodyTap, UsageTap, largeSettings, scanPrefix, usageOfText } from "./largepayload"
+import { AnyConv, ConvRef, familyFor, needsHash, newConv, upstreamFor, convertedStream, spoolConverted } from "./largeconv"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 // a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
@@ -77,6 +78,22 @@ type ChatSender = (t: Target, b: Field[], tc: LazyChat) => Upstream throws Synta
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
 type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool }
+
+// The answer of a large request whose events are converted as they arrive: the Response is given when the
+// provider's answer starts, and its body is fed by a StreamSink.
+class LiveHead {
+  resolve: ((r: Response) => void) | undefined = undefined
+  ctl: ReadableStreamDefaultController | undefined = undefined
+  body: ReadableStream | undefined = undefined
+  sent = false
+
+  give(r: Response): void {
+    if (this.sent) return
+    this.sent = true
+    const f = this.resolve
+    if (f !== undefined) f(r)
+  }
+}
 
 // Where a streamed answer goes, when the server can stream (the http1 front end).
 export class StreamSink {
@@ -1175,6 +1192,13 @@ export class Engine {
   // tokens per caller (src/tokenexchange.tov)
   idp: IdpEndpoints = new IdpEndpoints()
   exchanges: ExchangeCache = new ExchangeCache()
+  // their retained admin credentials: saved after a renewal (the server writes them to the config file), the
+  // timer of the next renewal, the retry time of a renewal that failed for a passing reason, and the renewals
+  // in flight
+  adminSaved: ((r: McpUserToken) => void) | undefined = undefined
+  private adminTimer: int = -1
+  private adminRetry: Map<string, f64> = new Map()
+  private adminBusy: string[] = []
   guard: GuardConfig | undefined = undefined
   rules: RuleSet | undefined = undefined
   logStore: LogStore | undefined = undefined
@@ -1742,7 +1766,8 @@ export class Engine {
         const lg = ctx.large
         if (lg !== undefined) {
           lg.upstreamModel = t.model
-          if (lg.declared >= 0) up.headers.set("content-length", "" + (lg.declared + lg.delta()))
+          const cl = lg.contentLength()
+          if (cl >= 0) up.headers.set("content-length", "" + cl)
         }
         attempts += 1
         const tracer = this.tracer
@@ -1788,7 +1813,8 @@ export class Engine {
             this.health.policyObserve(ref.provider, ref.model, t.key.id ?? "", rh, Date.now())
           }
           // a large answer (or a stream) goes back as it comes, without being read whole
-          if ((lg !== undefined || (ctx.passAbove >= 0 && providers.streamsNatively(t.kind))) && status >= 200 && status < 300) {
+          // (a large request that was converted for this provider has its answer converted back, so it is not passed through)
+          if ((lg !== undefined ? lg.passAnswer : (ctx.passAbove >= 0 && providers.streamsNatively(t.kind))) && status >= 200 && status < 300) {
             const clen = parseInt(res.headers.get("content-length") ?? "") ?? -1
             const ctype = res.headers.get("content-type") ?? ""
             const limit = lg !== undefined ? lg.settings.responseThreshold : ctx.passAbove
@@ -2310,6 +2336,68 @@ export class Engine {
   saveUserRow(row: McpUserToken): void {
     const f = this.userTokenSaved
     if (f !== undefined) f(row)
+  }
+
+  // Renews a token_exchange client's retained admin credential with its refresh token: when it is due, or now
+  // with force (the server answered 401 to it). The renewed credential, or the mark that it needs a new
+  // verification, goes to the running session and is saved. Returns the token to use ("" when there is none).
+  async renewAdminCredential(client: string, force: bool): Promise<string> {
+    const row = adminRowOf(this.cfg.mcp?.exchange_admin, client)
+    if (row === undefined || needsReverify(row)) return ""
+    const now = Date.now()
+    if (!force && !renewDue(row, this.adminRetry.get(client) ?? 0.0, now)) return row.access_token
+    if (this.adminBusy.includes(client)) return ""
+    let te: McpTokenExchange | undefined = undefined
+    for (const c of this.cfg.mcp?.client_configs ?? []) {
+      if (c.name === client && c.auth_type === "token_exchange") te = c.token_exchange
+    }
+    if (te === undefined) return ""
+    this.adminBusy.push(client)
+    const oc = this.cfg.oidc
+    const out = await renewAdmin(te, row, this.idp, oc?.issuer ?? "", oc?.client_id ?? "", oc?.client_secret ?? "", now)
+    this.adminBusy = this.adminBusy.filter((n) => n !== client)
+    if (!out.changed) {
+      this.adminRetry.set(client, Date.now() + RENEW_RETRY_MS)
+      console.error(`raiju: mcp ${client}: the admin credential could not be renewed (${out.error}); trying again in ${Math.round(RENEW_RETRY_MS / 1000.0)}s`)
+      return ""
+    }
+    this.adminRetry.delete(client)
+    if (needsReverify(out.row)) console.error(`raiju: mcp ${client}: ${out.row.status_reason ?? ""}; verify the client again`)
+    // the config in memory takes the row at once, so the next look does not renew it again before the save lands
+    let c = this.cfg
+    let m = c.mcp ?? {}
+    m.exchange_admin = (m.exchange_admin ?? []).map((r) => (r.mcp_client_name === client ? out.row : r))
+    c.mcp = m
+    this.cfg = c
+    const live = this.mcp
+    if (live !== undefined) live.setAdmin(out.row)
+    const f = this.adminSaved
+    if (f !== undefined) f(out.row)
+    return needsReverify(out.row) ? "" : out.row.access_token
+  }
+
+  // Sets the timer of the next admin credential renewal (from the config's retained credentials); a config
+  // change calls it again.
+  scheduleAdminRenewal(): void {
+    if (this.adminTimer >= 0) clearTimeout(this.adminTimer)
+    this.adminTimer = -1
+    const at = nextRenewal(this.cfg.mcp?.exchange_admin ?? [], this.adminRetry, tokenExchangeNames(this.cfg.mcp?.client_configs))
+    if (at <= 0.0) return
+    const wait: int = Math.max(0, Math.round(at - Date.now()))
+    this.adminTimer = setTimeout(() => {
+      this.renewDueAdmins()
+    }, wait)
+  }
+
+  // Renews every credential that is due, then sets the next timer.
+  async renewDueAdmins(): Promise<void> {
+    if (this.adminTimer >= 0) clearTimeout(this.adminTimer)
+    this.adminTimer = -1
+    const now = Date.now()
+    for (const r of this.cfg.mcp?.exchange_admin ?? []) {
+      if (renewDue(r, this.adminRetry.get(r.mcp_client_name) ?? 0.0, now)) await this.renewAdminCredential(r.mcp_client_name, false)
+    }
+    this.scheduleAdminRenewal()
   }
 
   // Runs one tool call with the caller's bearer. A 401 from the server on a per-user call refreshes the token once
@@ -3353,9 +3441,24 @@ export class Engine {
     const p = first.provider === "" ? undefined : providerOf(this.cfg, first.provider)
     const kind = p === undefined ? "" : kindOf(first.provider, p)
     const stream = meta.hasStream ? meta.stream : false
-    if (!takesBodyAsIs(route, kind)) {
+    // A provider whose format differs gets the body converted while it streams in (largeconv.tov), when this route
+    // has a converter for it. Bedrock signs the payload, so one model id must serve every key.
+    const limit = (this.cfg.client?.max_request_body_size_mb ?? 100) * 1048576
+    let family = ""
+    let convModel = first.model
+    if (p !== undefined && !takesBodyAsIs(route, kind)) {
+      family = familyFor(route, kind, first.model, p, stream)
+      if (family !== "" && needsHash(family)) {
+        const ks = p.keys ?? []
+        for (let i = 0; i < ks.length; i++) {
+          const m = resolveAlias(ks[i]!, first.model, this.cfg.client?.routing_chain_max_depth).model
+          if (i === 0) convModel = m
+          else if (m !== convModel) family = ""
+        }
+      }
+    }
+    if (!takesBodyAsIs(route, kind) && family === "") {
       // buffered after all, up to client.max_request_body_size_mb: the ordinary path converts it
-      const limit = (this.cfg.client?.max_request_body_size_mb ?? 100) * 1048576
       if (declared > limit) {
         await src.cancel()
         return errorResponse(413, `request body too large: ${first.provider === "" ? "this model" : first.provider} needs the whole body in memory and it is over client.max_request_body_size_mb`, "invalid_request_error", noHeaders())
@@ -3376,7 +3479,45 @@ export class Engine {
     }
     const lg = new LargeBody(lp, head, meta, ended ? undefined : src, declared)
     const tiny: Field[] = [{ key: "model", raw: quote(meta.model) }]
+    // A chat stream to a converted provider is called as a stream and its events are converted as they arrive (Bedrock's
+    // binary event frames are not: its answer is read whole and replayed). A Messages stream passes through.
+    const live = family !== "" && family !== "converse" && route === "chat" && stream
+    const wire = live || (route === "messages" && stream)
+    const holder = new ConvRef()
+    const autoCache = this.autoPromptCache || hs.get("x-bf-prompt-cache-auto-inject") === "true" || (p?.prompt_cache?.auto_inject ?? false)
+    if (family !== "") {
+      // the answer is converted back (a chat answer), or is the provider's own Messages answer (the Messages route)
+      lg.passAnswer = route === "messages"
+      if (needsHash(family)) {
+        if (this.gov.enforce && this.gov.findKey(hs) === undefined) {
+          if (!ended) await src.cancel()
+          return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
+        }
+        // converted into a spool on disk and hashed, so the request can be signed before its first byte goes out
+        const c = newConv(family, convModel, p!, autoCache, wire, limit, 4096)
+        holder.conv = c
+        const sp = await spoolConverted(lg, c)
+        if (!sp.ok) {
+          const rel = lg.release
+          if (rel !== undefined) rel()
+          if (sp.over) return errorResponse(413, `request body is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error", noHeaders())
+          return errorResponse(sp.bad ? 400 : 500, sp.bad ? `invalid request: ${sp.message}` : `could not convert the request: ${sp.message}`, sp.bad ? "invalid_request_error" : "api_error", noHeaders())
+        }
+      }
+    }
     const build: Build = (t) => {
+      if (family !== "") {
+        if (t.kind !== kind) throw new SyntaxError(`${t.provider}: this large request is being converted for ${first.provider} and cannot go to a provider with another format`)
+        if (needsHash(family)) {
+          if (t.model !== convModel) throw new SyntaxError(`${t.provider}: the keys of this provider name the model differently, which a large request converted for Bedrock cannot follow`)
+        } else {
+          // (a fresh converter for each target: a model alias is per key, and nothing has been read yet)
+          const c = newConv(family, t.model, t.cfg, autoCache, wire, limit, 4096)
+          holder.conv = c
+          lg.converted = convertedStream(lg, c)
+        }
+        return try upstreamFor(family, t, wire, lg.payloadHash)
+      }
       if (!takesBodyAsIs(route, t.kind)) throw new SyntaxError(`${t.provider} needs the whole request body in memory, which large_payload_optimization does not allow: a large ${route} request goes only to a provider that takes its format as it is`)
       const up = route === "embeddings" ? openai.embeddingsRequest(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : route === "responses" ? openai.responsesRequest(t, tiny) : route === "messages" ? anthropicNative.nativeRequest(t, tiny) : openai.chatRequest(t, tiny)
       return { url: up.url, headers: up.headers, body: "" }
@@ -3389,14 +3530,86 @@ export class Engine {
       }
       if (route === "embeddings") return try providers.embeddingsTranslate(t.kind, t.model, text, requested)
       if (route === "completions") return try openai.chatResponse(text, requested)
-      return try providers.chatTranslate(t.kind, t.model, text, requested, false)
+      const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+      if (family !== "" && stream) {
+        // a converted provider is called without streaming: its answer is replayed as the stream the caller asked for
+        const hc = holder.conv
+        return { body: try completionToSse(tr.body, hc !== undefined && hc.wantsUsage()), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served, billed: tr.billed }
+      }
+      return tr
     }
     const modelBody: Field[] = [{ key: "model", raw: quote(meta.model) }]
     if (meta.hasStream) modelBody.push({ key: "stream", raw: stream ? "true" : "false" })
-    const res = try await this.serve(req, op, undefined, modelBody, "", build, translate, stream, undefined, undefined, undefined, undefined, undefined, undefined, lg)
+    if (live) return await this.largeLive(req, op, modelBody, build, translate, stream, lg, holder)
+    return await this.largeRun(req, op, modelBody, build, translate, stream, lg, undefined, undefined)
+  }
+
+  // serve() for a large request, and what follows it: the spool removed, a body the converter refused, a body that grew
+  // past max_payload_bytes.
+  async largeRun(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, sink?: StreamSink, mk?: ConverterFactory): Promise<Response> {
+    const res = try await this.serve(req, op, undefined, modelBody, "", build, translate, stream, undefined, sink, mk, undefined, undefined, undefined, lg)
+    const release = lg.release
+    if (release !== undefined) release()
+    // a body the converter refused
+    if (lg.convError !== "" && !lg.tap.over) return errorResponse(400, `invalid request: ${lg.convError}`, "invalid_request_error", noHeaders())
     // a body with no declared length that grew past max_payload_bytes cut its own upload short
-    if (lg.tap.over && res.status !== 413) return errorResponse(413, `request body is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error", noHeaders())
+    if (lg.tap.over && res.status !== 413) return errorResponse(413, `request body is over the maximum payload size of ${lg.settings.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error", noHeaders())
     return res
+  }
+
+  // A large chat request that asks for a stream, to a provider whose format differs: the provider streams its events and
+  // they are converted to chat chunks as they arrive, as for an ordinary request. The Response is given at the first event.
+  async largeLive(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, holder: ConvRef): Promise<Response> {
+    const head = new LiveHead()
+    const sink = new StreamSink(
+      (status, headers) => {
+        const b = head.body
+        const h: Record<string, string> = headers
+        if (b !== undefined) head.give(new Response(b, { status: status, headers: h }))
+      },
+      (chunk) => {
+        const c = head.ctl
+        if (c !== undefined) c.enqueue(chunk)
+      },
+      () => {
+        const c = head.ctl
+        if (c !== undefined) c.close()
+      },
+    )
+    head.body = new ReadableStream({
+      start: (c) => {
+        head.ctl = c
+      },
+      cancel: () => {
+        sink.cancelled = true
+      },
+    })
+    sink.writeBytes = (chunk) => {
+      const c = head.ctl
+      if (c !== undefined) c.enqueue(chunk)
+    }
+    // (the body has been read by the time the answer starts, so include_usage is known)
+    const mk: ConverterFactory = (t, requested) => {
+      if (!streamable(t)) return undefined
+      const hc = holder.conv
+      const conv = new StreamConverter(converterKind(t), requested, hc !== undefined && hc.wantsUsage())
+      conv.stopAtFinish = quirkStopsAtFinish(t)
+      return conv
+    }
+    const p = new Promise<Response>((resolve) => {
+      head.resolve = resolve
+    })
+    this.largeBackground(req, op, modelBody, build, translate, stream, lg, sink, mk, head)
+    return await p
+  }
+
+  async largeBackground(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, sink: StreamSink, mk: ConverterFactory, head: LiveHead): Promise<void> {
+    try {
+      const r = await this.largeRun(req, op, modelBody, build, translate, stream, lg, sink, mk)
+      if (!sink.started) head.give(r)
+    } catch (e) {
+      head.give(errorResponse(500, "internal error", "api_error", noHeaders()))
+    }
   }
 
   // The answer of a large request that is streamed back: the upstream's bytes as they come, with a truncated

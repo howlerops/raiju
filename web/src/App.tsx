@@ -12,6 +12,7 @@ import { Logs } from "./screens/Logs"
 import { Mcp } from "./screens/Mcp"
 import { McpAccess } from "./screens/McpAccess"
 import { VirtualMcp } from "./screens/VirtualMcp"
+import { Roles } from "./screens/Roles"
 import { Config } from "./screens/Config"
 import { Playground } from "./screens/Playground"
 
@@ -26,6 +27,7 @@ const VIEWS = [
   ["mcp", "MCP", "MCPGateway"],
   ["mcpaccess", "MCP access", "MCPGateway"],
   ["vmcp", "Virtual MCPs", "MCPGateway"],
+  ["roles", "Roles", "RBAC"],
   ["config", "Config", "Settings"],
   ["playground", "Playground", ""],
 ] as const
@@ -215,6 +217,9 @@ export function App() {
             </Match>
             <Match when={view() === "vmcp"}>
               <VirtualMcp />
+            </Match>
+            <Match when={view() === "roles"}>
+              <Roles />
             </Match>
             <Match when={view() === "config"}>
               <Config />

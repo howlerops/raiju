@@ -4,7 +4,7 @@
 // without a network; McpSession and McpManager wrap them around fetch.
 import { McpAuthConfig, TokenCache, staticHeaders, tokenRequest, discoveryUrls, parseAuthServerMetadata } from "./mcpauth"
 import { McpUserToken } from "./mcpuser"
-import { McpTokenExchange } from "./tokenexchange"
+import { McpTokenExchange, AdminCredential, adminCredential, needsReverify, reverifyRow } from "./tokenexchange"
 import { InstructionPart, aggregate, commentBlock } from "./mcpinstructions"
 
 // one reply of a per-user call: its status, content type, body and the session id it carries
@@ -134,15 +134,39 @@ export function tokenExchangeNames(list: McpClientConfig[] | undefined): string[
   return out
 }
 
-// The admin discovery credential a token_exchange client was verified with (undefined when none is kept).
-// An expired credential reads as none: the client waits for a new verification. nowMs is epoch milliseconds.
+// The admin discovery credential a token_exchange client was verified with ("" when none is kept). An expired
+// credential, or one whose renewal was refused, reads as none: the client waits for a new verification. nowMs
+// is epoch milliseconds.
 export function adminTokenOf(list: McpUserToken[] | undefined, client: string, nowMs: f64): string {
   for (const r of list ?? []) {
     if (r.mcp_client_name !== client) continue
+    if (needsReverify(r)) return ""
     if (r.token_expires_at > 0.0 && r.token_expires_at <= nowMs) return ""
     return r.access_token
   }
   return ""
+}
+
+// The retained admin credential row of a token_exchange client, or undefined.
+export function adminRowOf(list: McpUserToken[] | undefined, client: string): McpUserToken | undefined {
+  for (const r of list ?? []) {
+    if (r.mcp_client_name === client) return r
+  }
+  return undefined
+}
+
+// Renews a token_exchange client's admin credential after the server answered 401 to it: the new token, or ""
+// when there is none. Set once by the gateway (the renewal saves the credential).
+let adminRenew: ((client: string) => Promise<string>) | undefined = undefined
+
+export function setAdminRenew(f: ((client: string) => Promise<string>) | undefined): void {
+  adminRenew = f
+}
+
+// the error a token_exchange client shows while its admin credential needs a new verification
+function reverifyError(row: McpUserToken): string {
+  const why = row.status_reason ?? ""
+  return `needs re-verification: ${why !== "" ? why : "the admin credential can no longer be renewed"}; verify it again with POST /api/mcp/client/{id}/verify-exchange`
 }
 
 // The names of the clients whose auth_type is per_user_headers.
@@ -695,6 +719,8 @@ export class McpSession {
   cfg: McpClientConfig
   // a token_exchange client's admin discovery credential: its tools are listed with it (see adminTokenOf)
   adminToken = ""
+  // the retained row behind it (its expiry, renewal state), for the status view
+  adminRow: McpUserToken | undefined = undefined
 
   // timeoutMs bounds each tool call unless the client has its own tool_execution_timeout.
   constructor(cfg: McpClientConfig, timeoutMs?: int, allowList?: string[]) {
@@ -800,10 +826,19 @@ export class McpSession {
   }
 
   // POSTs one message, with an OAuth token when the server needs one: fetched first if
-  // missing, and once more after a 401.
+  // missing, and once more after a 401. A token_exchange client's admin credential is renewed after a 401.
   private async exchange(body: string, timeoutMs: int, extra?: Map<string, string>): Promise<Reply> throws Error {
     if (this.isOAuth() && this.tokens.header(this.cfg.name, Date.now()) === undefined) try await this.fetchToken()
     const first = try await this.send(body, timeoutMs, extra)
+    if (first.status === 401 && this.cfg.auth_type === "token_exchange" && this.adminToken !== "") {
+      const renew = adminRenew
+      if (renew === undefined) return first
+      const used = this.adminToken
+      const fresh = await renew(this.cfg.name)
+      if (fresh === "" || fresh === used) return first
+      this.adminToken = fresh
+      return try await this.send(body, timeoutMs, extra)
+    }
     if (first.status !== 401 || !this.isOAuth()) return first
     this.tokens.invalidate(this.cfg.name)
     try await this.fetchToken()
@@ -881,7 +916,7 @@ export class McpSession {
     }
     // a token_exchange client lists its tools with the admin credential its verification kept; without one it waits
     if (this.cfg.auth_type === "token_exchange" && this.adminToken === "") {
-      this.lastError = "awaiting verification: the admin credential of this token_exchange client is missing or expired; verify it with POST /api/mcp/client/{id}/verify-exchange"
+      this.lastError = this.awaitingError()
       return
     }
     try {
@@ -911,7 +946,7 @@ export class McpSession {
       this.connected = true
     } catch (e) {
       this.connected = false
-      this.lastError = e.message
+      this.lastError = this.cfg.auth_type === "token_exchange" && this.adminToken === "" ? this.awaitingError() : e.message
     }
   }
 
@@ -1003,17 +1038,38 @@ export class McpSession {
     return { text: r.text, isError: r.status >= 400 }
   }
 
-  // Lists the tools again (the periodic tool_sync_interval refresh). A failure keeps the tools it had.
+  // Why a token_exchange client without an admin credential cannot list its tools.
+  private awaitingError(): string {
+    const row = this.adminRow
+    if (row !== undefined && needsReverify(row)) return reverifyError(row)
+    return "awaiting verification: the admin credential of this token_exchange client is missing or expired; verify it with POST /api/mcp/client/{id}/verify-exchange"
+  }
+
+  // Whether this token_exchange client's admin credential needs a new verification (Bifrost's needs_reauth).
+  awaitingReverify(): bool {
+    const row = this.adminRow
+    return this.cfg.auth_type === "token_exchange" && row !== undefined && needsReverify(row)
+  }
+
+  // Lists the tools again (the periodic tool_sync_interval refresh). A failure keeps the tools it had; a
+  // success clears the error an earlier one left. A token_exchange client without its admin credential keeps
+  // its tools (each caller's calls still run with their own exchanged tokens) and says why it cannot list.
   async relist(): Promise<void> {
     if (!this.connected) return
+    if (this.cfg.auth_type === "token_exchange" && this.adminToken === "") {
+      this.lastError = this.awaitingError()
+      return
+    }
     try {
       if (this.cfg.connection_type === "openapi") {
         try await this.loadOpenApi()
       } else {
         try await this.listAll()
       }
+      this.lastError = ""
     } catch (e) {
-      this.lastError = e.message
+      // a renewal refused during this listing (after the server's 401) says so rather than "HTTP 401"
+      this.lastError = this.cfg.auth_type === "token_exchange" && this.adminToken === "" ? this.awaitingError() : e.message
     }
   }
 
@@ -1213,6 +1269,13 @@ export class McpManager {
           }
           kept = s
         } else if (JSON.stringify(s.cfg) === JSON.stringify(n.cfg) && s.adminToken === n.adminToken) {
+          s.adminRow = n.adminRow
+          kept = s
+        } else if (JSON.stringify(s.cfg) === JSON.stringify(n.cfg) && n.cfg.auth_type === "token_exchange" && n.adminToken === "" && s.connected) {
+          // the admin credential ran out or needs a new verification: the connected client keeps its tools and
+          // each caller's calls, and only stops re-listing (as Bifrost's needs_reauth for per-user clients)
+          s.adminToken = ""
+          s.adminRow = n.adminRow
           kept = s
         }
       }
@@ -1244,8 +1307,20 @@ export class McpManager {
     this.sessions = list.map((c) => {
       const s = new McpSession(c, ms, this.allow)
       s.adminToken = adminTokenOf(admin, c.name, Date.now())
+      s.adminRow = adminRowOf(admin, c.name)
       return s
     })
+  }
+
+  // Takes a token_exchange client's renewed (or refused) admin credential in place, so the running session
+  // keeps its connection: the next listing uses the new token, and a refused one stops the listing.
+  setAdmin(row: McpUserToken): void {
+    for (const s of this.sessions) {
+      if (s.cfg.name !== row.mcp_client_name) continue
+      s.adminRow = row
+      s.adminToken = needsReverify(row) ? "" : row.access_token
+      if (needsReverify(row)) s.lastError = reverifyError(row)
+    }
   }
 
   // Connects every HTTP server. A server that fails is recorded in status(), not thrown.
@@ -1444,8 +1519,15 @@ export class McpManager {
     return out
   }
 
-  status(): { name: string, connected: bool, tools: int, error: string, stdio: bool, tools_list: { name: string, allowed: bool }[] }[] {
-    return this.sessions.map((s) => ({ name: s.cfg.name, connected: s.connected, tools: s.exposedCount(), error: s.lastError, stdio: s.cfg.connection_type === "stdio", tools_list: s.toolStates() }))
+  // Each client's state. A token_exchange client shows its retained admin credential (credential, no token
+  // values), and state "needs_reauth" once that credential needs a new verification.
+  status(): { name: string, connected: bool, tools: int, error: string, stdio: bool, tools_list: { name: string, allowed: bool }[], state?: string, credential?: AdminCredential }[] {
+    return this.sessions.map((s) => {
+      const row = s.adminRow
+      const cred: AdminCredential | undefined = s.cfg.auth_type === "token_exchange" && row !== undefined ? adminCredential(row) : undefined
+      const state: string | undefined = s.awaitingReverify() ? "needs_reauth" : undefined
+      return { name: s.cfg.name, connected: s.connected, tools: s.exposedCount(), error: s.lastError, stdio: s.cfg.connection_type === "stdio", tools_list: s.toolStates(), state: state, credential: cred }
+    })
   }
 }
 
@@ -1753,6 +1835,42 @@ test("a token_exchange client lists with its retained admin credential, and a ne
   const again = new McpManager({ client_configs: [te], exchange_admin: [row] })
   m.follow(again.sessions)
   expect(m.sessions[0]! === verified.sessions[0]!).toBe(true)
+})
+
+test("a renewed admin credential is taken in place, and a refused one keeps the client's tools and shows needs_reauth", () => {
+  const te: McpClientConfig = { name: "jira", connection_type: "http", connection_string: "http://127.0.0.1:1/mcp", auth_type: "token_exchange", token_exchange: { audience: "api://jira", client_id: "exch" } }
+  const row: McpUserToken = { id: "ex1", mcp_client_name: "jira", virtual_key_id: "", session_id: "", access_token: "admin-1", refresh_token: "rt-1", token_expires_at: Date.now() + 60000.0, scopes: [], created_at: 1.0, last_refreshed_at: 1.0 }
+  const m = new McpManager({ client_configs: [te], exchange_admin: [row] })
+  const live = m.sessions[0]!
+  live.connected = true
+  live.tools = [{ name: "search", description: "", inputSchemaRaw: "{}" }]
+  expect(m.status()[0]!.credential!.has_refresh_token).toBe(true)
+  expect(m.status()[0]!.state === undefined).toBe(true)
+  // a renewal: the running session takes the new token, and the saved config that follows keeps it
+  let renewed = row
+  renewed.access_token = "admin-2"
+  m.setAdmin(renewed)
+  expect(live.adminToken).toBe("admin-2")
+  m.follow(new McpManager({ client_configs: [te], exchange_admin: [renewed] }).sessions)
+  expect(m.sessions[0]! === live).toBe(true)
+  // a refused renewal: no admin token, the tools stay, and the status says it needs a new verification
+  const dead = reverifyRow(renewed, "provider rejected the refresh (HTTP 400, invalid_grant)")
+  expect(adminTokenOf([dead], "jira", 1000.0)).toBe("")
+  m.setAdmin(dead)
+  m.follow(new McpManager({ client_configs: [te], exchange_admin: [dead] }).sessions)
+  expect(m.sessions[0]! === live).toBe(true)
+  expect(live.adminToken).toBe("")
+  expect(live.connected).toBe(true)
+  expect(m.hasTool("jira-search")).toBe(true)
+  const st = m.status()[0]!
+  expect(st.state).toBe("needs_reauth")
+  expect(st.credential!.status).toBe("needs_reauth")
+  expect(st.error.includes("needs re-verification")).toBe(true)
+  expect(st.error.includes("invalid_grant")).toBe(true)
+  expect(JSON.stringify(st).includes("rt-1")).toBe(false)
+  // a client that was not connected starts in that state with the same reason
+  const cold = new McpManager({ client_configs: [te], exchange_admin: [dead] })
+  expect(cold.status()[0]!.state).toBe("needs_reauth")
 })
 
 test("per-client durations and virtual key allow-lists", () => {

@@ -1,0 +1,430 @@
+// The plugins' LLM hooks on the routes that speak a provider's own format (Anthropic Messages, Cohere chat, GenAI
+// generateContent, Bedrock Converse and InvokeModel). Bifrost turns every integration request into its internal
+// request before the plugins run, so a plugin always sees one shape. Raiju does the same here: the request is
+// converted to the chat request (the converters of anthropic_in, cohere_in, genai_in and bedrock_in), served by the
+// chat route, where pre_hook, post_hook and the per-chunk post_hook run, and the answer (or each stream chunk) is
+// converted back to the route's own format. A plugin's short-circuit answer, in chat shape, is converted the same
+// way. Without a plugin that takes part in the chat hooks the routes serve as they did (native.tov).
+
+import { Field, fields, find, quote, build, rawStr, setField } from "./json"
+import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
+import { snapshot } from "./schemas"
+import { completionToSse } from "./sse"
+import { SseSplitter } from "./streams"
+import * as anthropicIn from "./providers/anthropic_in"
+import { StreamState } from "./providers/anthropic_in"
+import * as cohereIn from "./cohere_in"
+import { CohereStream } from "./cohere_in"
+import * as genaiIn from "./genai_in"
+import { GenAIStream } from "./genai_in"
+import * as bedrockIn from "./bedrock_in"
+import { ConverseStream, InvokeStream } from "./bedrock_in"
+
+// The route's own format: kind is "anthropic", "cohere", "genai", "converse" or "invoke"; model is the name the
+// converters put in the answer (the client's model, the GenAI model path, the Bedrock id).
+export type NativeFormat = { kind: string, model: string }
+
+// Whether a plugin in the chain takes part in the chat hooks of the provider-format routes (a WebAssembly
+// plugin does; the built-in ones work on the OpenAI routes only), so a native route is served through chat.
+export function hooksOn(engine: Engine): bool {
+  const c = engine.plugins
+  if (c === undefined || c.plugins.length === 0) return false
+  return c.hooksNative()
+}
+
+// A chat completion (JSON) in the route's own answer format.
+export function responseToNative(f: NativeFormat, completion: string): string throws SyntaxError {
+  if (f.kind === "cohere") return try cohereIn.openAIToChat(completion)
+  if (f.kind === "genai") return try genaiIn.openAIToGenerate(completion, f.model)
+  if (f.kind === "converse") return try bedrockIn.openAIToConverse(completion)
+  return try anthropicIn.toMessage(completion, f.model)
+}
+
+// Chat chunks (SSE) turned, as they come, into the route's own stream. Bedrock's streams are binary frames,
+// taken with takeFrames(). An error event ends the stream with the format's error.
+export class NativeStream {
+  private split = new SseSplitter()
+  private st: StreamState | undefined = undefined
+  private gen: GenAIStream | undefined = undefined
+  private co: CohereStream | undefined = undefined
+  private cv: ConverseStream | undefined = undefined
+  private iv: InvokeStream | undefined = undefined
+  private frames: u8[] = []
+  private done = false
+
+  constructor(readonly f: NativeFormat) {
+    if (f.kind === "cohere") this.co = new CohereStream(f.model)
+    else if (f.kind === "genai") this.gen = new GenAIStream(f.model)
+    else if (f.kind === "converse") this.cv = new ConverseStream()
+    else if (f.kind === "invoke") this.iv = new InvokeStream(f.model)
+    else this.st = new StreamState(f.model)
+  }
+
+  framed(): bool {
+    return this.cv !== undefined || this.iv !== undefined
+  }
+
+  takeFrames(): u8[] {
+    const f = this.frames
+    this.frames = []
+    return f
+  }
+
+  private collect(bytes: u8[]): void {
+    for (const b of bytes) this.frames.push(b)
+  }
+
+  push(text: string): string {
+    let out = ""
+    for (const ev of this.split.push(text)) out += this.event(ev.data)
+    return out
+  }
+
+  // The end of the chat stream: what the format still owes (its closing events). Safe to call twice.
+  end(): string {
+    let out = ""
+    for (const ev of this.split.flush()) out += this.event(ev.data)
+    if (this.done) return out
+    this.done = true
+    const st = this.st
+    if (st !== undefined) return out + st.end()
+    const gen = this.gen
+    if (gen !== undefined) return out + gen.end()
+    const co = this.co
+    if (co !== undefined) return out + co.end()
+    const cv = this.cv
+    if (cv !== undefined) this.collect(cv.end())
+    const iv = this.iv
+    if (iv !== undefined) this.collect(iv.end())
+    return out
+  }
+
+  private event(data: string): string {
+    if (this.done) return ""
+    if (data.startsWith("{\"error\"")) return this.fail(data)
+    try {
+      const st = this.st
+      if (st !== undefined) return st.push(data)
+      const gen = this.gen
+      if (gen !== undefined) return gen.push(data)
+      const co = this.co
+      if (co !== undefined) return co.push(data)
+      const cv = this.cv
+      if (cv !== undefined) this.collect(cv.push(data))
+      const iv = this.iv
+      if (iv !== undefined) this.collect(iv.push(data))
+    } catch (e) {
+      // a malformed chunk is skipped
+    }
+    if (data === "[DONE]") this.done = true
+    return ""
+  }
+
+  // An error event of the chat stream, in the format's error form; nothing follows it.
+  private fail(data: string): string {
+    this.done = true
+    if (this.framed()) {
+      try {
+        this.collect(new ConverseStream().push(data))
+      } catch (e) {
+        // the stream just ends
+      }
+      return ""
+    }
+    if (this.st !== undefined) {
+      let msg = "the stream failed"
+      try {
+        msg = rawStr(fields(find(fields(data), "error") ?? "{}"), "message") ?? msg
+      } catch (e) {
+        // the default message stands
+      }
+      return `event: error\ndata: {"type":"error","error":{"type":"api_error","message":${quote(msg)}}}\n\n`
+    }
+    return `data: ${data}\n\n`
+  }
+}
+
+// The link from the converting sink to the sink it feeds (a class, so the closures share it).
+class NativeLink {
+  inner: StreamSink | undefined = undefined
+}
+
+// A sink for the chat route's stream: its chunks are converted to the route's format before they reach the
+// client's sink. The client's cancel reaches the chat route through the inner sink.
+function nativeSink(real: StreamSink, conv: NativeStream): StreamSink {
+  const link = new NativeLink()
+  const frames = (): void => {
+    const fb = conv.takeFrames()
+    const wb = real.writeBytes
+    if (wb !== undefined && fb.length > 0) wb(fb)
+  }
+  const s = new StreamSink(
+    (status, headers) => {
+      real.started = true
+      const hs: Map<string, string> = new Map()
+      for (const k of headers.keys()) hs.set(k, headers.get(k)!)
+      if (conv.framed()) hs.set("content-type", "application/vnd.amazon.eventstream")
+      real.open(status, hs)
+    },
+    (chunk) => {
+      const inner = link.inner
+      if (real.cancelled && inner !== undefined) inner.cancelled = true
+      const out = conv.push(chunk)
+      if (out !== "") real.write(out)
+      frames()
+    },
+    () => {
+      const out = conv.end()
+      if (out !== "") real.write(out)
+      frames()
+      real.close()
+    },
+  )
+  link.inner = s
+  return s
+}
+
+// The chat request of a native request, ready for the chat route: a stream asks for its usage (the closing
+// events carry the token counts).
+function chatText(chat: string, stream: bool): string throws SyntaxError {
+  if (!stream) return chat
+  let fs: Field[] = try fields(chat)
+  setField(&fs, "stream", "true")
+  setField(&fs, "stream_options", `{"include_usage":true}`)
+  return build(fs)
+}
+
+// What a stream collected when there is no sink to stream into (a server that answers whole).
+class Collect {
+  parts: string[] = []
+  headers: Map<string, string> = new Map()
+}
+
+// A sink that keeps what the chat route streams, so the chunk hooks still run on each chunk and the stream is
+// answered whole afterwards.
+function collectSink(c: Collect): StreamSink {
+  return new StreamSink(
+    (status, headers) => {
+      c.headers = headers
+    },
+    (chunk) => {
+      c.parts.push(chunk)
+    },
+    () => {},
+  )
+}
+
+// Serves a native request through the chat route, so the plugins' chat hooks run on it. chat is the request
+// converted to chat shape; the answer comes back in f's format, whole or (with a sink) as a stream. A stream
+// with no sink is collected, its chunks hooked, and answered whole. An error answer, and a short circuit that is
+// an error, are returned as the chat route made them.
+export async function viaChat(engine: Engine, req: Request, chat: string, f: NativeFormat, stream: bool, sink?: StreamSink): Promise<Response> {
+  let text = ""
+  try {
+    text = chatText(chat, stream)
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const u = URL.parse(req.url)
+  const origin = u === undefined ? "http://localhost" : u.origin
+  const inner = new Request(origin + "/v1/chat/completions", { method: "POST", headers: snapshot(req.headers), body: text })
+  const conv = new NativeStream(f)
+  const got = new Collect()
+  const keep = stream && sink === undefined ? collectSink(got) : undefined
+  const wrapped = stream && sink !== undefined ? nativeSink(sink, conv) : keep
+  const r = await engine.chat(inner, wrapped)
+  if (sink !== undefined && sink.started) return r
+  let body = ""
+  // the chat route's headers (routing, compat, the short-circuit mark) stay; the body is converted
+  const hs: Record<string, string> = new Map()
+  if (keep !== undefined && keep.started) {
+    body = got.parts.join("")
+    for (const k of got.headers.keys()) {
+      if (k !== "content-length" && k !== "content-type") hs.set(k, got.headers.get(k)!)
+    }
+  } else {
+    if (r.status !== 200) return r
+    try {
+      body = await r.text()
+    } catch (e) {
+      return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+    }
+    r.headers.forEach((value, key) => {
+      if (key !== "content-length" && key !== "content-type") hs.set(key, value)
+    })
+  }
+  try {
+    if (stream) {
+      // a stream answered whole (no sink, a target that does not stream, or a plugin's short circuit): its chat events, converted
+      const sse = body.trimStart().startsWith("{") ? completionToSse(body, true) : body
+      const out = conv.push(sse) + conv.end()
+      if (conv.framed()) {
+        hs.set("content-type", "application/vnd.amazon.eventstream")
+        return new Response(conv.takeFrames(), { status: 200, headers: hs })
+      }
+      hs.set("content-type", "text/event-stream")
+      return new Response(out, { status: 200, headers: hs })
+    }
+    hs.set("content-type", "application/json")
+    return new Response(responseToNative(f, body), { status: 200, headers: hs })
+  } catch (e) {
+    return errorResponse(502, `the answer could not be converted: ${e.message}`, "api_error", noHeaders())
+  }
+}
+
+// ---- tests ----
+
+class Collected {
+  out: string[] = []
+  frames = 0
+  opened: Map<string, string> = new Map()
+  closed = 0
+}
+
+function collector(c: Collected): StreamSink {
+  const s = new StreamSink(
+    (status, headers) => {
+      c.opened = headers
+    },
+    (chunk) => {
+      c.out.push(chunk)
+    },
+    () => {
+      c.closed += 1
+    },
+  )
+  s.writeBytes = (b: u8[]) => {
+    c.frames += b.length
+  }
+  return s
+}
+
+const CHAT_ANSWER = `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"Hello there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`
+
+function chunk(delta: string, finish: string): string {
+  return `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+}
+
+const CHAT_STREAM = chunk(`{"role":"assistant","content":"Hel"}`, "null") + chunk(`{"content":"lo"}`, "null") + chunk(`{}`, `"stop"`) + `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}\n\ndata: [DONE]\n\n`
+
+test("an answer comes back in each route's format, as the route's own converter writes it", () => {
+  expect(try responseToNative({ kind: "anthropic", model: "claude-x" }, CHAT_ANSWER)).toBe(try anthropicIn.toMessage(CHAT_ANSWER, "claude-x"))
+  expect(try responseToNative({ kind: "invoke", model: "claude-x" }, CHAT_ANSWER)).toBe(try anthropicIn.toMessage(CHAT_ANSWER, "claude-x"))
+  expect(try responseToNative({ kind: "cohere", model: "m" }, CHAT_ANSWER)).toBe(try cohereIn.openAIToChat(CHAT_ANSWER))
+  expect(try responseToNative({ kind: "genai", model: "gemini/g" }, CHAT_ANSWER)).toBe(try genaiIn.openAIToGenerate(CHAT_ANSWER, "gemini/g"))
+  expect(try responseToNative({ kind: "converse", model: "m" }, CHAT_ANSWER)).toBe(try bedrockIn.openAIToConverse(CHAT_ANSWER))
+  const m = try fields(try responseToNative({ kind: "anthropic", model: "claude-x" }, CHAT_ANSWER))
+  expect(rawStr(m, "type")).toBe("message")
+  expect(find(m, "content")!.includes("Hello there")).toBe(true)
+})
+
+test("a native request's chat form keeps its text, model and stream flag through the round trip", () => {
+  const a = try anthropicIn.toChatRequest(`{"model":"openai/gpt-4o-mini","max_tokens":50,"system":"be brief","messages":[{"role":"user","content":"ping"}],"stream":true}`, "openai/gpt-4o-mini")
+  const af = try fields(a)
+  expect(rawStr(af, "model")).toBe("openai/gpt-4o-mini")
+  expect(find(af, "stream")).toBe("true")
+  expect(a.includes("be brief")).toBe(true)
+  expect(a.includes("ping")).toBe(true)
+  const c = try cohereIn.chatToOpenAI(`{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"ping"}]}`, "openai/gpt-4o-mini")
+  expect(find(try fields(c), "messages")!.includes("ping")).toBe(true)
+  const g = try genaiIn.generateToOpenAI(`{"contents":[{"role":"user","parts":[{"text":"ping"}]}]}`, "openai/gpt-4o-mini", false)
+  expect(rawStr(try fields(g), "model")).toBe("openai/gpt-4o-mini")
+  expect(g.includes("ping")).toBe(true)
+  const gs = try genaiIn.generateToOpenAI(`{"contents":[{"role":"user","parts":[{"text":"ping"}]}]}`, "openai/gpt-4o-mini", true)
+  expect(find(try fields(gs), "stream")).toBe("true")
+  const b = try bedrockIn.converseToOpenAI(`{"messages":[{"role":"user","content":[{"text":"ping"}]}]}`, "openai/gpt-4o-mini", false)
+  expect(b.includes("ping")).toBe(true)
+  const bs = try bedrockIn.converseToOpenAI(`{"messages":[{"role":"user","content":[{"text":"ping"}]}]}`, "openai/gpt-4o-mini", true)
+  expect(find(try fields(bs), "stream")).toBe("true")
+})
+
+test("a stream asks for usage, and keeps the rest of the request as it was", () => {
+  const whole = try chatText(`{"model":"m","messages":[],"temperature":0.5}`, false)
+  expect(whole).toBe(`{"model":"m","messages":[],"temperature":0.5}`)
+  const s = try fields(try chatText(`{"model":"m","messages":[],"temperature":0.5}`, true))
+  expect(find(s, "stream")).toBe("true")
+  expect(find(s, "stream_options")).toBe(`{"include_usage":true}`)
+  expect(find(s, "temperature")).toBe("0.5")
+})
+
+test("chat chunks turn into each format's stream, whole or in pieces, the same", () => {
+  const kinds = ["anthropic", "cohere", "genai"]
+  for (const k of kinds) {
+    const f: NativeFormat = { kind: k, model: "m" }
+    const whole = new NativeStream(f)
+    const a = whole.push(CHAT_STREAM) + whole.end()
+    const split = new NativeStream(f)
+    let b = ""
+    for (let at = 0; at < CHAT_STREAM.byteLength; at += 23) b += split.push(CHAT_STREAM.slice(at, at + 23))
+    b += split.end()
+    expect(b).toBe(a)
+    expect(a.includes("Hel")).toBe(true)
+    expect(a.includes("lo")).toBe(true)
+  }
+  const an = new NativeStream({ kind: "anthropic", model: "m" })
+  expect(an.push(CHAT_STREAM) + an.end()).toBe(anthropicIn.toMessageStream(CHAT_STREAM, "m"))
+  const co = new NativeStream({ kind: "cohere", model: "m" })
+  expect(co.push(CHAT_STREAM) + co.end()).toBe(cohereIn.toCohereStream(CHAT_STREAM, "m"))
+  const ge = new NativeStream({ kind: "genai", model: "m" })
+  expect(ge.push(CHAT_STREAM) + ge.end()).toBe(genaiIn.toGenAIStream(CHAT_STREAM, "m"))
+})
+
+test("Bedrock streams are frames, the same as the route's own converters make from the whole stream", () => {
+  const cv = new NativeStream({ kind: "converse", model: "m" })
+  expect(cv.framed()).toBe(true)
+  expect(cv.push(CHAT_STREAM)).toBe("")
+  expect(cv.end()).toBe("")
+  expect(cv.takeFrames()).toEqual(bedrockIn.converseFramesFromSse(CHAT_STREAM))
+  const iv = new NativeStream({ kind: "invoke", model: "claude-x" })
+  iv.push(CHAT_STREAM)
+  iv.end()
+  expect(iv.takeFrames()).toEqual(bedrockIn.invokeFramesFromSse(CHAT_STREAM, "claude-x"))
+})
+
+test("an error event ends the stream with the format's error and nothing after it", () => {
+  const err = `data: {"error":{"message":"blocked by a plugin","type":"api_error"}}\n\n`
+  const an = new NativeStream({ kind: "anthropic", model: "m" })
+  const a = an.push(chunk(`{"role":"assistant","content":"Hi"}`, "null") + err + chunk(`{"content":"late"}`, "null")) + an.end()
+  expect(a.includes(`event: error\ndata: {"type":"error","error":{"type":"api_error","message":"blocked by a plugin"}}`)).toBe(true)
+  expect(a.includes("late")).toBe(false)
+  expect(a.includes("message_stop")).toBe(false)
+  const ge = new NativeStream({ kind: "genai", model: "m" })
+  const g = ge.push(err) + ge.end()
+  expect(g).toBe(err)
+  const cv = new NativeStream({ kind: "converse", model: "m" })
+  cv.push(err)
+  cv.end()
+  expect(cv.takeFrames().length > 0).toBe(true)
+})
+
+test("the converting sink opens with the format's headers, writes the converted events and closes once", () => {
+  const c = new Collected()
+  const conv = new NativeStream({ kind: "anthropic", model: "m" })
+  const s = nativeSink(collector(c), conv)
+  const h: Map<string, string> = new Map()
+  h.set("content-type", "text/event-stream")
+  s.open(200, h)
+  s.write(CHAT_STREAM.slice(0, 40))
+  s.write(CHAT_STREAM.slice(40))
+  s.close()
+  expect(c.opened.get("content-type")).toBe("text/event-stream")
+  expect(c.out.join("")).toBe(anthropicIn.toMessageStream(CHAT_STREAM, "m"))
+  expect(c.closed).toBe(1)
+  const d = new Collected()
+  const bs = nativeSink(collector(d), new NativeStream({ kind: "converse", model: "m" }))
+  bs.open(200, h)
+  bs.write(CHAT_STREAM)
+  bs.close()
+  expect(d.opened.get("content-type")).toBe("application/vnd.amazon.eventstream")
+  expect(d.frames).toBe(bedrockIn.converseFramesFromSse(CHAT_STREAM).length)
+  expect(d.out.length).toBe(0)
+})
+
+test("a client that left is passed on to the chat route's sink", () => {
+  const c = new Collected()
+  const real = collector(c)
+  const s = nativeSink(real, new NativeStream({ kind: "cohere", model: "m" }))
+  real.cancelled = true
+  s.write(chunk(`{"content":"x"}`, "null"))
+  expect(s.cancelled).toBe(true)
+})

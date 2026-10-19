@@ -18,6 +18,8 @@ interface Applied {
   period: string
   from: string
   to: string
+  // a zoomed range from a chart (epoch ms); it wins over from and to
+  zoom?: [number, number]
   offset: number
 }
 
@@ -62,7 +64,10 @@ export function Logs() {
     const a = applied()
     const query: Record<string, string | number> = { limit: PAGE_SIZE, offset: a.offset }
     for (const k of ["provider", "model", "status", "virtual_key", "text"] as const) if (a[k]) query[k] = a[k]
-    if (a.period === "custom") {
+    if (a.zoom) {
+      query.since = a.zoom[0]
+      query.until = a.zoom[1]
+    } else if (a.period === "custom") {
       const from = new Date(a.from).getTime()
       const to = new Date(a.to).getTime()
       if (Number.isFinite(from)) query.since = from
@@ -85,7 +90,10 @@ export function Logs() {
     const now = Date.now()
     let start = now - 86400000
     let end = now
-    if (a.period === "custom") {
+    if (a.zoom) {
+      start = a.zoom[0]
+      end = a.zoom[1]
+    } else if (a.period === "custom") {
       const from = new Date(a.from).getTime()
       const to = new Date(a.to).getTime()
       if (Number.isFinite(from)) start = from
@@ -110,6 +118,7 @@ export function Logs() {
   const read = (n: string) => ((form?.elements.namedItem(n) as HTMLInputElement | HTMLSelectElement | null)?.value ?? "").trim()
   const apply = (ev: SubmitEvent) => {
     ev.preventDefault()
+    before = undefined
     setApplied({
       provider: read("provider"),
       model: read("model"),
@@ -121,6 +130,36 @@ export function Logs() {
       to: read("to"),
       offset: 0,
     })
+  }
+  // Zooming a chart narrows the screen's time range (list and charts refetch); Reset puts the
+  // filters back as they were before the first zoom.
+  let before: { applied: Applied; period: string; from: string; to: string } | undefined
+  const local = (t: number): string => {
+    const d = new Date(t)
+    const p = (n: number) => (n < 10 ? "0" + n : String(n))
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "T" + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds())
+  }
+  const setField = (n: string, v: string) => {
+    const el = form?.elements.namedItem(n) as HTMLInputElement | HTMLSelectElement | null
+    if (el) el.value = v
+  }
+  const zoomTo = (start: number, end: number) => {
+    if (!before) before = { applied: applied(), period: read("period"), from: read("from"), to: read("to") }
+    setField("period", "custom")
+    setField("from", local(start))
+    setField("to", local(end))
+    setPeriod("custom")
+    setApplied((a) => ({ ...a, period: "custom", zoom: [start, end], offset: 0 }))
+  }
+  const resetZoom = () => {
+    const b = before
+    before = undefined
+    if (!b) return
+    setField("period", b.period)
+    setField("from", b.from)
+    setField("to", b.to)
+    setPeriod(b.period)
+    setApplied({ ...b.applied, zoom: undefined })
   }
   const go = (delta: number) => setApplied((a) => ({ ...a, offset: Math.max(0, a.offset + delta) }))
 
@@ -219,6 +258,7 @@ export function Logs() {
             onClick={() => {
               form?.reset()
               setPeriod("")
+              before = undefined
               setApplied(EMPTY)
             }}
           >
@@ -230,7 +270,7 @@ export function Logs() {
         </div>
       </form>
 
-      <LogCharts query={chartQuery()} />
+      <LogCharts query={chartQuery()} zoom={{ onZoom: zoomTo, zoomed: applied().zoom !== undefined, onReset: resetZoom }} />
 
       <div class="card" style="padding:0">
         <div class="table-wrap">

@@ -12,7 +12,8 @@ import { a2aHandle, pushV03, knowTask, resubscribeV03 } from "./mock_a2a"
 //   key "bad-key"     → 401
 //   model "policy-quota" → 200 with x-quota-state: exhausted (trips a circuit policy)
 // size and sha: the request body's length and SHA-256, kept for bodies too big to keep whole (body is then its first 2000 bytes)
-type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string }
+// hdr: the request's x-amz-date, content-length and transfer-encoding, bar-separated (the SigV4 and framing checks of the large request tests)
+type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string }
 
 const seen: Seen[] = []
 // webhook deliveries received: the path, the Standard Webhooks headers and the body
@@ -80,11 +81,17 @@ function anthropicRequests(body: string): { id: string, model: string }[] throws
   return out
 }
 
+// Streams of the large request tests (L136): one text in two events, with the token counts
+const GEMINI_SSE = `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hi from "}]}}]}\n\ndata: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":6,"candidatesTokenCount":3,"totalTokenCount":9}}\n\n`
+const ANTHROPIC_SSE = `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`
+const COHERE_SSE = `event: message-start\ndata: {"type":"message-start","id":"co_s","delta":{"message":{"role":"assistant"}}}\n\nevent: content-start\ndata: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}\n\nevent: content-delta\ndata: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"Hi from "}}}}\n\nevent: content-delta\ndata: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"cohere"}}}}\n\nevent: message-end\ndata: {"type":"message-end","id":"co_s","delta":{"finish_reason":"COMPLETE","usage":{"tokens":{"input_tokens":7,"output_tokens":3}}}}\n\n`
+
 function record(req: Request, path: string, body: string): void {
   const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? req.headers.get("x-goog-api-key") ?? req.headers.get("api-key") ?? ""
   const size = body.byteLength
   const big = size > 65536
-  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "" })
+  const hdr = (req.headers.get("x-amz-date") ?? "") + "|" + (req.headers.get("content-length") ?? "") + "|" + (req.headers.get("transfer-encoding") ?? "")
+  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr })
 }
 
 // The raw JSON text of a field of an event, or "".
@@ -795,6 +802,15 @@ Bun.serve<string>({
         return Response.json({ input_tokens: 42 })
       },
     },
+    // Cohere's v2 chat: one text answer with its token counts
+    "/v2/chat": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v2/chat", body)
+        if (body.endsWith(`"stream":true}`)) return new Response(COHERE_SSE, { headers: { "content-type": "text/event-stream" } })
+        return Response.json({ id: "co_1", finish_reason: "COMPLETE", message: { role: "assistant", content: [{ type: "text", text: "Hi from cohere" }] }, usage: { tokens: { input_tokens: 7, output_tokens: 3 } } })
+      },
+    },
     "/v1/messages": {
       POST: async (req) => {
         const body = await req.text()
@@ -837,6 +853,7 @@ Bun.serve<string>({
           return new Response(op, { headers: { "content-type": "application/json" } })
         }
         if (action.endsWith(":predict")) return Response.json({ predictions: [{ bytesBase64Encoded: "iVBORw0KGgo=" }] })
+        if (action.endsWith(":streamGenerateContent")) return new Response(GEMINI_SSE, { headers: { "content-type": "text/event-stream" } })
         // image models answer with inline image data; TTS with 16-bit mono PCM at 24 kHz
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
         if (body.includes(`"AUDIO"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "audio/L16;codec=pcm;rate=24000", data: "AAECAw==" } }] }, finishReason: "STOP" }] })
@@ -1026,6 +1043,8 @@ Bun.serve<string>({
         if (req.params.modelAction.endsWith(":countTokens")) return Response.json({ totalTokens: 11 })
         if (req.params.modelAction === "count-tokens:rawPredict") return Response.json({ input_tokens: 9 })
         if (req.params.modelAction.endsWith(":predict")) return Response.json({ predictions: [{ bytesBase64Encoded: "iVBORw0KGgo=" }] })
+        if (req.params.modelAction.endsWith(":streamGenerateContent")) return new Response(GEMINI_SSE, { headers: { "content-type": "text/event-stream" } })
+        if (req.params.modelAction.endsWith(":streamRawPredict")) return new Response(ANTHROPIC_SSE, { headers: { "content-type": "text/event-stream" } })
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
         return Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "Hi from vertex" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 3, totalTokenCount: 7 } })
       },

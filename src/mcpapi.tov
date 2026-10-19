@@ -12,7 +12,7 @@ import { McpAuthConfig, AuthEndpoints, discoveryUrls, registrationRequest, regis
 import { deadline } from "./deadline"
 import { secureHex } from "./crypto"
 import { McpClientConfig, McpConfig, McpTlsConfig, McpUserCredential, McpHeaderFlow, McpSession, sanitizeName, durationMsOf, userHeadersOf } from "./mcp"
-import { McpTokenExchange, IdpEndpoints, exchangeToken } from "./tokenexchange"
+import { McpTokenExchange, IdpEndpoints, exchangeToken, adminCredential, needsReverify } from "./tokenexchange"
 import { McpUserToken, UserFlow, userFlowById, userFlowsLive, takeUserFlow, forgetUserFlows, dropUserFlow, startUserFlow, exchangeUserCode, rowFromTokens, upsertUserRow, dropUserRow, userTokenIndex, tokenAction, flowIdOfPath, consentLink } from "./mcpuser"
 import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, parseSpec, inputSchema } from "./openapi"
 import * as vmcp from "./vmcp"
@@ -468,7 +468,22 @@ function pricingFrom(fs: Field[]): { value: Map<string, f64> | undefined, error:
 function listClients(store: ConfigStore): McpReply {
   const list = clientsOf(store.cfg)
   const parts: string[] = []
-  for (const c of list) parts.push(clientJson(c))
+  for (const c of list) {
+    const j = clientJson(c)
+    // a token_exchange client's retained admin credential, as Bifrost lists it (state and expiry, no token)
+    let row: McpUserToken | undefined = undefined
+    if (c.auth_type === "token_exchange") {
+      for (const r of store.cfg.mcp?.exchange_admin ?? []) {
+        if (r.mcp_client_name === c.name) row = r
+      }
+    }
+    if (row === undefined) parts.push(j)
+    else {
+      const cred = adminCredential(row)
+      const state = needsReverify(row) ? `,"state":"needs_reauth"` : ""
+      parts.push(`${j.slice(0, j.byteLength - 1)},"credential":${JSON.stringify(cred)}${state}}`)
+    }
+  }
   return reply(200, `{"clients":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
 }
 
@@ -1045,6 +1060,26 @@ function exchangeAdminWithout(list: McpUserToken[], client: string): McpUserToke
   return out
 }
 
+// Saves a token_exchange client's renewed (or refused) admin credential. Only a credential the config still
+// holds is replaced, so a client deleted or re-verified meanwhile keeps what it has now. A failed save is
+// logged: the renewal runs again when it is next due.
+export function saveExchangeAdmin(store: ConfigStore, row: McpUserToken): void {
+  const list = store.cfg.mcp?.exchange_admin ?? []
+  let found = false
+  const next: McpUserToken[] = []
+  for (const r of list) {
+    if (r.mcp_client_name === row.mcp_client_name && r.id === row.id && r.created_at === row.created_at) {
+      next.push(row)
+      found = true
+    } else {
+      next.push(r)
+    }
+  }
+  if (!found) return
+  const err = persist(store, withExchangeAdmin(store.cfg, next))
+  if (err !== undefined) console.error(`raiju: the admin credential of MCP client ${row.mcp_client_name} could not be saved`)
+}
+
 // POST /api/mcp/client/{id}/verify-exchange for a token_exchange client. The body names the identity-provider
 // token to check the exchange with (subject_token): it is exchanged for one scoped to the audience, and the
 // server is dialed with the result, which must list tools. The exchanged token is then kept as the client's
@@ -1069,7 +1104,8 @@ async function verifyExchange(store: ConfigStore, idp: IdpEndpoints, client: Mcp
   const v = await dialWith(client, hs, store.cfg.mcp?.oauth_private_allowlist ?? [], r.token)
   if (!v.ok) return fail(422, `Verification failed: ${v.error}`)
   const now = Date.now()
-  const row: McpUserToken = { id: "exchange-" + client.name, mcp_client_name: client.name, virtual_key_id: "", session_id: "", access_token: r.token, refresh_token: "", token_expires_at: r.expiresIn > 0.0 ? now + r.expiresIn * 1000.0 : 0.0, scopes: [], created_at: now, last_refreshed_at: now }
+  // the refresh token, when the identity provider issued one, renews the credential before it expires
+  const row: McpUserToken = { id: "exchange-" + client.name, mcp_client_name: client.name, virtual_key_id: "", session_id: "", access_token: r.token, refresh_token: r.refreshToken, token_expires_at: r.expiresIn > 0.0 ? now + r.expiresIn * 1000.0 : 0.0, scopes: [], created_at: now, last_refreshed_at: now, status: "active" }
   const kept = exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], client.name)
   kept.push(row)
   const err = persist(store, withExchangeAdmin(store.cfg, kept))

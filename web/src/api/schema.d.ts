@@ -3466,7 +3466,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Verify a token exchange for a token_exchange client (400 for other types). The body names the identity-provider token; it is exchanged, the server is dialed with the result, and the exchanged token is kept as the client's admin credential (its tools are listed with it from then on). */
+        /** Verify a token exchange for a token_exchange client (400 for other types). The body names the identity-provider token; it is exchanged, the server is dialed with the result, and the exchanged token is kept as the client's admin credential (its tools are listed with it from then on). A refresh token in the answer is kept too (sealed), and renews the credential shortly before it expires and after a 401; a refused renewal marks the client needs_reauth until it is verified again. */
         post: operations["postApiMcpClientNameVerifyExchange"];
         delete?: never;
         options?: never;
@@ -5022,12 +5022,34 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** @description Bifrost MCPClient name. Raiju returns the client's configuration with client_id (its name) added and secrets masked. */
+        /** @description Bifrost MCPClient name. Raiju returns the client's configuration with client_id (its name) added and secrets masked. A token_exchange client with a retained admin credential carries credential (and state once it needs a new verification). */
         MCPClient: {
             client_id: string;
             name?: string;
+            credential?: components["schemas"]["MCPAdminCredential"];
+            /**
+             * @description Set on a token_exchange client whose retained admin credential needs a new verification (its renewal was refused, or it expired with no refresh token).
+             * @enum {string}
+             */
+            state?: "needs_reauth";
         } & {
             [key: string]: unknown;
+        };
+        /** @description The admin credential a token_exchange client keeps from its verification (Bifrost's MCPClientCredentialResponse). It lists the tools, and is renewed with its refresh token shortly before it expires and after a 401. No token value appears. */
+        MCPAdminCredential: {
+            /** @enum {string} */
+            kind: "oauth";
+            /** @enum {string} */
+            status: "active" | "needs_reauth";
+            /** @description Why the credential needs a new verification (the identity provider's refusal of the renewal) */
+            status_reason?: string;
+            /** Format: date-time */
+            expires_at?: string;
+            /** Format: date-time */
+            last_refreshed_at?: string;
+            has_refresh_token: boolean;
+            /** Format: date-time */
+            created_at: string;
         };
         /** @description Bifrost MCPClientConfig (Raiju subset). */
         MCPClientConfig: {
@@ -5078,6 +5100,12 @@ export interface components {
             tools: number;
             error?: string;
             stdio?: boolean;
+            /**
+             * @description Set on a token_exchange client whose retained admin credential needs a new verification. The client keeps its tools and each caller's calls; only the tool listing stops until it is verified again.
+             * @enum {string}
+             */
+            state?: "needs_reauth";
+            credential?: components["schemas"]["MCPAdminCredential"];
             /** @description Every tool the server listed, by its own name, with whether this client's config allows it (tools_to_execute and tools_to_skip). The UI turns a tool on or off through those lists. */
             tools_list?: {
                 name: string;
