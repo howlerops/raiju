@@ -347,11 +347,11 @@ fast-forwarding their worktree to the branch tip.
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L135 | (f) pricing | Audio token and per-second rates for every model from a public price file with Bifrost's field names (LiteLLM's model_prices_and_context_window.json, which the Bifrost datasheet descends from; getbifrost.ai is blocked here); the hand-entered gpt-realtime rates are confirmed by it | worker | todo |
-| L136 | G48 | Large payloads to providers whose format differs: streaming request conversion for Anthropic, Gemini, Vertex, Bedrock and Cohere (or the closest correct approach per provider) | worker | todo |
-| L137 | G40 | Realtime and live: one log row per turn as Bifrost logs them, and budgets charged per window or turn, not at session end | worker | todo |
-| L138 | (g) A2A | A2A push store shared by every worker of a node (and the cluster where Bifrost shares it); the gRPC binding | worker | todo |
-| L139 | (e) | LLM plugin hooks on the Anthropic Messages, GenAI, Bedrock and Cohere routes | worker | todo |
+| L135 | (f) pricing | Audio token and per-second rates for every model from a public price file with Bifrost's field names (LiteLLM's model_prices_and_context_window.json, which the Bifrost datasheet descends from; getbifrost.ai is blocked here); the hand-entered gpt-realtime rates are confirmed by it | worker | assigned |
+| L136 | G48 | Large payloads to providers whose format differs: streaming request conversion for Anthropic, Gemini, Vertex, Bedrock and Cohere (or the closest correct approach per provider) | worker | assigned |
+| L137 | G40 | Realtime and live: one log row per turn as Bifrost logs them, and budgets charged per window or turn, not at session end | worker | assigned |
+| L138 | (g) A2A | A2A push store shared by every worker of a node (and the cluster where Bifrost shares it); the gRPC binding | worker | assigned |
+| L139 | (e) | LLM plugin hooks on the Anthropic Messages, GenAI, Bedrock and Cohere routes | worker | assigned |
 | L140 | (g) MCP | Token-exchange admin credential refreshed before it expires, as Bifrost does | worker | todo |
-| L141 | UI | Chart zoom and series toggles; a permission editor for custom roles | worker | todo |
+| L141 | UI | Chart zoom and series toggles; a permission editor for custom roles | worker | assigned |
 
