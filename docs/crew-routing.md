@@ -100,6 +100,38 @@ per-role credit from a whole-task outcome is the credit-assignment problem of Pr
 means per class are kept too and shown in the UI. State lives in the logs store folder and travels
 on the cluster state (ns `crew.cells`).
 
+## Classifier file (`crew-classifier.json`)
+
+Read by `src/taskclass.tov` (`loadClassifier`). Without the file the built-in placeholder weights
+are used (`defaultClassifier`, hand-set word lists and named weights until L152 trains the file).
+
+```json
+{"version": 1, "buckets": 262144, "hash": "fnv1a32",
+ "classes": ["bug-fix", "open-ended", "other"],
+ "prior": {"bug-fix": 0.4, "open-ended": 0.45, "other": 0.15},
+ "temperature": 1.0, "floor": 0.05,
+ "uncertain_below": 0.5, "uncertain_class": "open-ended",
+ "bias": {"bug-fix": 0.0, "open-ended": 0.0, "other": 0.0},
+ "scale": {"bug-fix": 0.1, "open-ended": 0.1, "other": 0.1},
+ "weights": {"bug-fix": [[87512, 60]], "open-ended": [[70260, 60]]},
+ "named": {"bug-fix": {"label:bug": 40, "has:stacktrace": 40, "verb:fix": 40}, "open-ended": {"verb:add": 40}}}
+```
+
+- Features: each distinct word unigram and bigram of the issue text (ASCII letters and digits,
+  lowered; every other byte separates words; a bigram is two adjacent words joined by one space),
+  hashed with FNV-1a 32 over the UTF-8 bytes and masked to 18 bits. Named features (not hashed):
+  `label:<name>` for each task label, `has:stacktrace` (Python, JS, Java, Go or Rust traceback
+  lines), `has:code` (a complete ``` fence pair), and `verb:<v>` for add, support, implement,
+  refactor, rename, document, fix, crash, error or regression starting the title or a sentence.
+  The trainer must use the same tokenisation and hash; test vectors are in `src/taskclass.tov`.
+- Scores: `z_c = bias_c + scale_c * sum of the weights present`; `psi = (1 - floor) softmax(z / T)
+  + floor * prior`. The decision is the argmax, or `uncertain_class` when the max psi is below
+  `uncertain_below`.
+- Limits: at most 1 MiB; at most 2,000 non-zero weights per class (hashed and named together);
+  each int8 in -128..127 and not 0; buckets 0..262143; named keys start with `label:`, `has:` or
+  `verb:`. `weights` and `named` may be left out for a class (it then scores on its bias alone).
+  Unknown top-level fields are ignored. Errors name the field that failed.
+
 ## Modules
 
 - `src/crewmath.tov`: the formulas (role cost, per-role argmax, coordinate ascent, frontier and
