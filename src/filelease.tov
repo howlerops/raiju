@@ -1,0 +1,158 @@
+// A lease the processes of one node share: the supervisor's workers, which fork from one process, take it through a
+// directory they all can see (the node's share folder). Whichever process takes a name first holds it until it
+// releases it, or until leaseMs pass without a renewal, when another process takes it over. The lease is a directory
+// named for the name and a generation, made with mkdir, which only one process can make, so two processes never hold
+// the same generation. Generations run 0, 1, 2 ... with no gaps: a take makes the next one, a renewal makes the next
+// one from the holder's own, and a release removes them all, from the newest down. A holder whose generation has a
+// newer one over it was overtaken: holds is false, and its release leaves the new holder's lease alone. With no
+// directory (one process) every take succeeds.
+import { existsSync, mkdirSync, rmSync, statSync } from "node:fs"
+import { sha256, toHex, utf8 } from "./crypto"
+
+// Long enough for one exchange with an identity provider, short enough that a dead holder is taken over soon.
+export const FILE_LEASE_MS = 60000
+
+export class FileLease {
+  constructor(readonly dir: string, readonly leaseMs: int) {}
+
+  // The directory of a name's generation. The name is hashed, so any name makes a valid file name.
+  private pathOf(name: string, gen: int): string {
+    return this.dir + "/l-" + toHex(sha256(utf8(name))).slice(0, 32) + "-" + gen
+  }
+
+  // The newest generation that exists, or -1 when none does.
+  private newest(name: string): int {
+    let last = -1
+    while (existsSync(this.pathOf(name, last + 1))) last = last + 1
+    return last
+  }
+
+  // Whether a generation was made within leaseMs of nowMs. A generation that is gone reads as not fresh.
+  private fresh(name: string, gen: int, nowMs: f64): bool {
+    try {
+      const age: f64 = nowMs - statSync(this.pathOf(name, gen)).mtimeMs
+      return age <= this.leaseMs * 1.0
+    } catch (e) {
+      return false
+    }
+  }
+
+  // Takes the lease on name at nowMs (epoch milliseconds): the generation now held, or -1 when another process holds
+  // it and it has not expired. An expired lease is taken over as the next generation.
+  take(name: string, nowMs: f64): int {
+    if (this.dir === "") return 0
+    try {
+      mkdirSync(this.dir, { recursive: true })
+    } catch (e) {
+      return -1
+    }
+    const last = this.newest(name)
+    if (last >= 0 && this.fresh(name, last, nowMs)) return -1
+    try {
+      mkdirSync(this.pathOf(name, last + 1))
+    } catch (e) {
+      return -1
+    }
+    return last + 1
+  }
+
+  // Whether the lease held at gen is still the holder's: no newer generation was made over it.
+  holds(name: string, gen: int): bool {
+    return this.dir === "" || !existsSync(this.pathOf(name, gen + 1))
+  }
+
+  // Renews the lease held at gen: makes the next generation, so its age counts from now. Returns the generation now
+  // held, or -1 when the holder was overtaken (the lease then belongs to the other holder).
+  renew(name: string, gen: int): int {
+    if (this.dir === "") return 0
+    if (!this.holds(name, gen)) return -1
+    try {
+      mkdirSync(this.pathOf(name, gen + 1))
+    } catch (e) {
+      return -1
+    }
+    return gen + 1
+  }
+
+  // Gives the lease up. A holder that was overtaken leaves the new holder's lease alone.
+  release(name: string, gen: int): void {
+    if (this.dir === "" || !this.holds(name, gen)) return
+    for (let g = gen; g >= 0; g--) {
+      try {
+        rmSync(this.pathOf(name, g), { recursive: true, force: true })
+      } catch (e) {
+        continue
+      }
+    }
+  }
+}
+
+let leaseSeq = 0
+
+function leaseDir(): string {
+  leaseSeq += 1
+  return "/tmp/raiju-filelease-test-" + process.pid + "-" + Math.floor(Date.now()) + "-" + leaseSeq
+}
+
+test("one holder at a time, a different name is a different lease, and a release lets the next one take it", () => {
+  const dir = leaseDir()
+  const a = new FileLease(dir, 60000)
+  const b = new FileLease(dir, 60000)
+  const t0 = Date.now()
+  const ga = a.take("x", t0)
+  expect(ga).toBe(0)
+  expect(b.take("x", t0)).toBe(-1)
+  expect(b.take("y", t0) >= 0).toBe(true)
+  a.release("x", ga)
+  // a released lease is gone, so the next holder starts again at the first generation
+  const gb = b.take("x", t0)
+  expect(gb).toBe(0)
+  expect(b.holds("x", gb)).toBe(true)
+  expect(a.take("x", t0) === -1).toBe(true)
+  b.release("x", gb)
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("an expired lease is taken over as the next generation, and the overtaken holder knows", () => {
+  const dir = leaseDir()
+  const a = new FileLease(dir, 60000)
+  const b = new FileLease(dir, 60000)
+  const t0 = Date.now()
+  const ga = a.take("x", t0)
+  // a holder that does not renew keeps the lease for leaseMs
+  expect(b.take("x", t0 + 59000) === -1).toBe(true)
+  const gb = b.take("x", t0 + 60001)
+  expect(gb).toBe(ga + 1)
+  expect(a.holds("x", ga)).toBe(false)
+  expect(a.renew("x", ga)).toBe(-1)
+  expect(b.holds("x", gb)).toBe(true)
+  b.release("x", gb)
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a renewal restarts the lease and keeps the holder's place", () => {
+  const dir = leaseDir()
+  const a = new FileLease(dir, 60000)
+  const b = new FileLease(dir, 60000)
+  const t0 = Date.now()
+  const g0 = a.take("r", t0)
+  const g1 = a.renew("r", g0)
+  expect(g1).toBe(g0 + 1)
+  expect(a.holds("r", g0)).toBe(false)
+  expect(a.holds("r", g1)).toBe(true)
+  // the renewal's age counts, so the lease is still held at t0 + 59 s, and the holder releases its newest generation
+  expect(b.take("r", t0 + 59000) === -1).toBe(true)
+  a.release("r", g1)
+  expect(b.take("r", t0) >= 0).toBe(true)
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("with no directory (one process) every take succeeds and nothing is left behind", () => {
+  const solo = new FileLease("", 60000)
+  const t0 = Date.now()
+  expect(solo.take("x", t0)).toBe(0)
+  expect(solo.take("x", t0)).toBe(0)
+  expect(solo.holds("x", 0)).toBe(true)
+  expect(solo.renew("x", 0)).toBe(0)
+  solo.release("x", 0)
+})

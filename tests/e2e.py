@@ -5332,6 +5332,208 @@ def l140_e2e(env):
         srv.shutdown()
         srv.server_close()
 
+L147_STUB = "http://127.0.0.1:18240"  # the identity provider's token endpoint and the MCP server, for both L147 parts
+L147_WORKERS = "http://127.0.0.1:18243"  # two workers of one node (Bun; one process on http1)
+L147_NODE_A = "http://127.0.0.1:18241"  # two cluster nodes
+L147_NODE_B = "http://127.0.0.1:18242"
+
+def l147_idp():
+    """An identity provider and MCP server stub for the L147 tests. Tokens live for st["life"] seconds; a refresh token
+    is single use (a rotating provider: one that was spent is refused with invalid_grant); every refresh grant is kept;
+    /_expire-all ends every live token. The MCP server takes only live tokens."""
+    import urllib.parse, threading
+    lock = threading.Lock()
+    st = {"n": 0, "life": 8, "live": {}, "issued": [], "spent": set(), "refreshes": [], "lock": lock}
+    def issue(rt_too):
+        st["n"] += 1
+        tok = "adm-%d" % st["n"]
+        st["live"][tok] = time.time() + st["life"]
+        out = {"access_token": tok, "token_type": "Bearer", "expires_in": st["life"]}
+        if rt_too:
+            rt = "rt-%d" % st["n"]
+            st["issued"].append(rt)
+            out["refresh_token"] = rt
+        return out
+    def route(method, path, headers, body):
+        with lock:
+            if path == "/_expire-all":
+                st["live"] = {}
+                return 200, "{}", "application/json"
+            if path == "/token":
+                form = urllib.parse.parse_qs(body)
+                def one(k):
+                    return (form.get(k) or [""])[0]
+                if one("client_id") != "exch-client" or one("client_secret") != "exch-secret":
+                    return 401, json.dumps({"error": "invalid_client"}), "application/json"
+                if one("grant_type") == "refresh_token":
+                    rt = one("refresh_token")
+                    st["refreshes"].append(rt)
+                    if rt in st["spent"] or rt not in st["issued"]:
+                        return 400, json.dumps({"error": "invalid_grant", "error_description": "refresh token spent"}), "application/json"
+                    st["spent"].add(rt)
+                    return 200, json.dumps(issue(True)), "application/json"
+                if not one("subject_token").startswith("idp-"):
+                    return 400, json.dumps({"error": "invalid_grant", "error_description": "subject token not recognised"}), "application/json"
+                return 200, json.dumps(issue(one("subject_token").startswith("idp-admin"))), "application/json"
+            if path == "/mcp":
+                auth = headers.get("authorization") or ""
+                tok = auth[7:] if auth.startswith("Bearer ") else ""
+                if st["live"].get(tok, 0) <= time.time():
+                    return 401, "unauthorized", "text/plain"
+                msg = json.loads(body)
+                m = msg.get("method")
+                if "id" not in msg:
+                    return 202, "", "application/json"
+                if m == "initialize":
+                    res = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "l147", "version": "1"}}
+                elif m == "tools/list":
+                    res = {"tools": [{"name": "lookup", "description": "Looks a key up", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}}}]}
+                elif m == "tools/call":
+                    res = {"content": [{"type": "text", "text": "found " + str(msg["params"]["arguments"].get("key"))}]}
+                else:
+                    return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "no such method"}}), "application/json"
+                return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}), "application/json"
+            return 404, "{}", "application/json"
+    return st, route
+
+def l147_config(node=None, peer=None):
+    """A token_exchange MCP client at the stub, its secrets sealed with one encryption key; with node and peer, a cluster member."""
+    exch = {"audience": "api://jira", "client_id": "exch-client", "client_secret": "exch-secret", "scopes": ["offline_access"], "authorization_server_url": L147_STUB + "/token"}
+    cfg = {
+        "encryption_key": "an e2e passphrase of some length",
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-l147", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
+            {"name": "jira", "connection_type": "http", "connection_string": L147_STUB + "/mcp", "auth_type": "token_exchange", "token_exchange": exch, "tool_sync_interval": "1s"},
+        ]},
+    }
+    if node is not None:
+        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l147", "interval_ms": 200, "peers": [peer]}
+    return cfg
+
+def l147_jira(base):
+    _, _, b = call("GET", "/api/mcp", None, None, base=base, auth=False)
+    return l133_find_named(json.loads(b), "jira") or {}
+
+def l147_calls(base, n, tag):
+    return [call("POST", "/v1/mcp/tool/execute", l117_tool("jira-lookup", {"key": "%s-%d" % (tag, i)}), {"authorization": "Bearer idp-alice.p.s"}, base=base, auth=False)[0] for i in range(n)]
+
+def l147_until(pred, secs):
+    end = time.time() + secs
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.2)
+    return pred()
+
+def l147_workers_e2e(env):
+    """L147: with two workers on one node, a token_exchange admin credential whose refresh token rotates is renewed
+    once. When it falls due exactly one refresh_token grant reaches the provider (the worker holding the lease renews,
+    the other reads the renewed credential from the config file), both workers keep serving, and a 401 that both
+    workers see renews it once more. The gateway is 18243 with RAIJU_WORKERS=2; the provider stub is 18240."""
+    st, route = l147_idp()
+    srv = serve(18240, route)
+    base = L147_WORKERS
+    cfg_path = os.path.join(BUILD, "e2e.l147w.json")
+    json.dump(l147_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18243", "-host", "127.0.0.1", "-config", cfg_path], env={**env, "RAIJU_WORKERS": "2"}, stderr=open(os.path.join(BUILD, "e2e.l147w.log"), "w"))
+    def refreshes():
+        with st["lock"]:
+            return len(st["refreshes"])
+    try:
+        wait(base + "/health")
+        with st["lock"]:
+            st["life"] = 8
+        t0 = time.time()
+        s, _, b = call("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-admin.p.s"}, None, base=base, auth=False)
+        check("workers: the verification keeps the exchanged token and its refresh token", s == 200 and json.loads(b)["tools_count"] >= 1, (s, b[:300]))
+        check("workers: the client connects with the retained credential", l147_until(lambda: l147_jira(base).get("connected") is True, 15), l147_jira(base))
+        # the token issued from here lives an hour, so the first token's renewal is the only one this test waits for
+        time.sleep(1.0)
+        with st["lock"]:
+            st["life"] = 3600
+        check("workers: the credential falls due and is renewed", l147_until(lambda: refreshes() >= 1, 10), refreshes())
+        time.sleep(max(0.0, t0 + 10.0 - time.time()))
+        with st["lock"]:
+            rts = list(st["refreshes"])
+        check("workers: exactly one refresh_token grant reaches the provider, after the first token's expiry", rts == ["rt-1"], rts)
+        codes = l147_calls(base, 12, "W")
+        check("workers: both workers keep serving tool calls after the renewal", all(c == 200 for c in codes), codes)
+        j = l147_jira(base)
+        check("workers: the client stays connected, listing its tools, with an active credential", j.get("connected") is True and j.get("error", "") == "" and int(j.get("tools", 0)) >= 1 and (j.get("credential") or {}).get("status") == "active", j)
+        with st["lock"]:
+            st["live"] = {}
+        renewed_once = l147_until(lambda: refreshes() == 2, 20)
+        time.sleep(2.0)
+        check("workers: a 401 renews the credential once for both workers", renewed_once and refreshes() == 2, refreshes())
+        codes = l147_calls(base, 8, "X")
+        check("workers: both workers serve after the 401 renewal", all(c == 200 for c in codes), codes)
+        saved = open(cfg_path).read()
+        check("workers: the renewed credential is sealed in the saved config", "exchange_admin" in saved and "rt-" not in saved and "adm-" not in saved, saved[-300:])
+    finally:
+        gw.terminate()
+        gw.wait()
+        srv.shutdown()
+        srv.server_close()
+
+def l147_cluster_e2e(env):
+    """L147: two cluster nodes share a token_exchange admin credential whose refresh token rotates. Node A verifies it and
+    node B learns it through the cluster state, sealed. When it falls due one node renews it (one refresh_token grant in
+    all) and the other learns the renewed credential; both serve. Refused by the provider, one renewal serves both again.
+    The nodes are 18241 and 18242; the provider stub is 18240."""
+    st, route = l147_idp()
+    srv = serve(18240, route)
+    pa = os.path.join(BUILD, "e2e.l147a.json")
+    pb = os.path.join(BUILD, "e2e.l147b.json")
+    json.dump(l147_config("l147-a", L147_NODE_B), open(pa, "w"))
+    json.dump(l147_config("l147-b", L147_NODE_A), open(pb, "w"))
+    ga = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18241", "-host", "127.0.0.1", "-config", pa], env=env, stderr=open(os.path.join(BUILD, "e2e.l147a.log"), "w"))
+    gb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18242", "-host", "127.0.0.1", "-config", pb], env=env, stderr=open(os.path.join(BUILD, "e2e.l147b.log"), "w"))
+    def refreshes():
+        with st["lock"]:
+            return len(st["refreshes"])
+    try:
+        wait(L147_NODE_A + "/health")
+        wait(L147_NODE_B + "/health")
+        # the nodes hear from each other before the credential is verified
+        time.sleep(3.0)
+        with st["lock"]:
+            st["life"] = 8
+        t0 = time.time()
+        s, _, b = call("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-admin.p.s"}, None, base=L147_NODE_A, auth=False)
+        check("cluster: node A verifies the exchange and keeps the admin credential", s == 200, (s, b[:300]))
+        check("cluster: node A connects with it", l147_until(lambda: l147_jira(L147_NODE_A).get("connected") is True, 15), l147_jira(L147_NODE_A))
+        check("cluster: node B learns the credential node A verified, through the cluster state", l147_until(lambda: l147_jira(L147_NODE_B).get("connected") is True, 20), l147_jira(L147_NODE_B))
+        time.sleep(1.0)
+        with st["lock"]:
+            st["life"] = 3600
+        check("cluster: the credential falls due and one node renews it", l147_until(lambda: refreshes() >= 1, 10), refreshes())
+        time.sleep(max(0.0, t0 + 10.0 - time.time()))
+        with st["lock"]:
+            rts = list(st["refreshes"])
+        check("cluster: exactly one refresh_token grant reaches the provider across both nodes", rts == ["rt-1"], rts)
+        ja = l147_jira(L147_NODE_A)
+        jb = l147_jira(L147_NODE_B)
+        check("cluster: the other node learns the renewed credential", (jb.get("credential") or {}).get("last_refreshed_at") is not None and (ja.get("credential") or {}).get("last_refreshed_at") == (jb.get("credential") or {}).get("last_refreshed_at"), (ja.get("credential"), jb.get("credential")))
+        codes = l147_calls(L147_NODE_A, 4, "A") + l147_calls(L147_NODE_B, 4, "B")
+        check("cluster: both nodes serve tool calls after the renewal", all(c == 200 for c in codes), codes)
+        with st["lock"]:
+            st["live"] = {}
+        renewed_once = l147_until(lambda: refreshes() == 2, 25)
+        time.sleep(3.0)
+        check("cluster: a 401 on both nodes renews once more, for both", renewed_once and refreshes() == 2, refreshes())
+        codes = l147_calls(L147_NODE_A, 4, "C") + l147_calls(L147_NODE_B, 4, "D")
+        check("cluster: both nodes serve after the 401 renewal", all(c == 200 for c in codes), codes)
+        ok = all(l147_jira(u).get("connected") is True and (l147_jira(u).get("credential") or {}).get("status") == "active" for u in [L147_NODE_A, L147_NODE_B])
+        check("cluster: both nodes stay connected with an active credential", ok, (l147_jira(L147_NODE_A), l147_jira(L147_NODE_B)))
+    finally:
+        for p in [ga, gb]:
+            p.terminate()
+            p.wait()
+        srv.shutdown()
+        srv.server_close()
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -7426,7 +7628,7 @@ def l129_e2e(env):
         s, _, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-4o-mini", 1048576))
         check("a big Messages request to an OpenAI provider is buffered and converted", s == 200 and len(mine("/v1/chat/completions")) == n2 + 1 and json.loads(b).get("type") == "message", (s, b[:300]))
         s, _, b = l124_http(port, "POST", "/v1/responses", l129_json("anthropic/claude-3-5-sonnet-20241022", 9 * 1048576))
-        check("... but not past client.max_request_body_size_mb", s == 413, (s, b[:200]))
+        check("... and a converted one is not held, so it is not stopped by client.max_request_body_size_mb (L145)", s == 200, (s, b[:200]))
         s, _, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-4o-mini", 9 * 1048576))
         check("... on the Messages route too", s == 413, (s, b[:200]))
         s, _, b = l124_http(port, "POST", "/v1/responses", l129_json("openai/resp-x", 4096) + b" ", headers={"content-length": str(200 * 1048576)})
@@ -7800,6 +8002,142 @@ def l136_e2e(env):
         gw.wait()
         gwb.terminate()
         gwb.wait()
+
+
+GW_L145 = "http://127.0.0.1:18232"  # large /v1/responses requests to providers whose format differs: converted to chat as they stream in
+GW_L145B = "http://127.0.0.1:18233"  # the same with client.max_request_body_size_mb 1: what is held is bounded by it
+
+def l145_e2e(env):
+    """large_payload_optimization for Responses requests to providers whose format differs (L145): a big /v1/responses request to
+    Anthropic, Gemini and an OpenAI-format provider is converted to chat while it streams in (the gateway holds none of it), arrives
+    intact by content hash, and its answer comes back as a Responses object, counted in the key's budget. Its own gateways (18232,
+    and 18233 with a 1 MiB hold limit)."""
+    import hashlib, shutil
+    logs_dir = os.path.join(BUILD, "e2e-l145-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    providers = {
+        "anthropic": {"keys": [{"name": "a", "value": "sk-ant-" + "l145", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "gemini": {"keys": [{"name": "g", "value": "g-" + "l145", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "groq": {"keys": [{"name": "gq", "value": "gsk-" + "l145", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+    }
+    lpo = {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "max_request_body_size_mb": 8},
+        "logs_store": {"enabled": True, "dir": logs_dir, "content_logging": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": lpo,
+        "governance": {
+            "budgets": [{"id": "b-l145", "max_limit": 100, "reset_duration": "1d"}],
+            "pricing_overrides": [{"id": "po-l145", "name": "l145", "scope_kind": "global", "match_type": "wildcard", "pattern": "*", "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}],
+            "virtual_keys": [{"id": "vk-l145", "value": "sk-bf-l145-budget-0123456789", "budget_id": "b-l145"}],
+        },
+        "providers": providers,
+    }
+    path = os.path.join(BUILD, "e2e.l145.json")
+    json.dump(cfg, open(path, "w"))
+    cfg_b = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 1},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": lpo,
+        "providers": {"anthropic": providers["anthropic"]},
+    }
+    path_b = os.path.join(BUILD, "e2e.l145b.json")
+    json.dump(cfg_b, open(path_b, "w"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw145 = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18232", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l145.log"), "w"))
+    gw145b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18233", "-host", "127.0.0.1", "-config", path_b, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l145b.log"), "w"))
+    port = 18232
+    portb = 18233
+    try:
+        wait(GW_L145 + "/health")
+        wait(GW_L145B + "/health")
+        mine = lambda p_: [x for x in seen() if x["path"] == p_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L145, auth=False)[2])["budgets"]}
+        FILL = lambda n, c="F": c * n
+        B64 = lambda n: "QUJD" * (n // 4)
+        MB = 1048576
+
+        def resp_text(model, n):
+            return ('{"model":"%s","max_output_tokens":16,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"}]}]}' % (model, FILL(n))).encode()
+        def resp_image(model, n):
+            return ('{"model":"%s","instructions":"be brief","max_output_tokens":16,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"look"},{"type":"input_image","image_url":"data:image/png;base64,%s"}]}]}' % (model, B64(n))).encode()
+        # what each provider should receive: the converted chat body, as the chat converters write it
+        def want_text(fam, n, model=""):
+            f = FILL(n)
+            return {
+                "anthropic": '{"model":"%s","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16}' % (model, f),
+                "gemini": '{"contents":[{"role":"user","parts":[{"text":"%s"}]}],"generationConfig":{"maxOutputTokens":16}}' % f,
+                "openai": '{"model":"%s","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16}' % (model, f),
+            }[fam].encode()
+        def want_image(fam, n, model=""):
+            b = B64(n)
+            return {
+                "anthropic": '{"model":"%s","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"%s"}}]}],"system":"be brief","max_tokens":16}' % (model, b),
+                "gemini": '{"contents":[{"role":"user","parts":[{"text":"look"},{"inline_data":{"mime_type":"image/png","data":"%s"}}]}],"systemInstruction":{"parts":[{"text":"be brief"}]},"generationConfig":{"maxOutputTokens":16}}' % b,
+            }[fam].encode()
+        targets = [
+            # family, the model the caller names, the path the provider sees, what its answer says, the model the body names
+            ("anthropic", "anthropic/claude-l145", "/v1/messages", "Hi from claude", "claude-l145"),
+            ("gemini", "gemini/gemini-l145", "/v1beta/models/gemini-l145:generateContent", "Hi from gemini", ""),
+            ("openai", "groq/llama-l145", "/v1/chat/completions", None, "llama-l145"),
+        ]
+
+        # ---- a text request of 12 MiB to each provider: converted while it streams, intact by content hash ----
+        for fam, model, ppath, says, bmodel in targets:
+            want = want_text(fam, 12 * MB, bmodel)
+            s, hs, b = l124_http(port, "POST", "/v1/responses", resp_text(model, 12 * MB), timeout=120)
+            row = mine(ppath)[-1]
+            check("a 12 MiB Responses request to %s arrives as the %s chat body, intact by content hash" % (model, fam), s == 200 and row["size"] == len(want) and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+            t = b.decode("utf8", "replace")
+            if says is not None:
+                check("... and its answer comes back as a Responses object with the text", s == 200 and '"object":"response"' in t and says in t and '"output_text"' in t, t[:200])
+            else:
+                check("... and its answer comes back as a Responses object", s == 200 and '"object":"response"' in t and '"output_text"' in t, t[:200])
+
+        # ---- an image of 12 MiB (base64 inside the message) and the instructions as the system prompt ----
+        for fam, model, ppath, says, bmodel in targets[:2]:
+            want = want_image(fam, 12 * MB, bmodel)
+            s, hs, b = l124_http(port, "POST", "/v1/responses", resp_image(model, 12 * MB), timeout=120)
+            row = mine(ppath)[-1]
+            check("a 12 MiB image in a Responses request to %s arrives as the %s body, instructions hoisted" % (model.split("/")[0], fam), s == 200 and row["size"] == len(want) and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+
+        # ---- a stream the caller asked for: the answer is replayed as Responses events, as the whole-request path does ----
+        sb = ('{"model":"anthropic/claude-l145","stream":true,"max_output_tokens":16,"input":"%s"}' % FILL(2 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/responses", sb, timeout=120)
+        t = b.decode("utf8", "replace")
+        check("a big streamed Responses request to Anthropic gets Responses events with the answer and response.completed", s == 200 and hdr(hs, "content-type") == "text/event-stream" and "response.output_text.delta" in t and "response.completed" in t and "Hi from claude" in t, (s, hs, t[:300]))
+
+        # ---- the gateway does not hold the body ----
+        pid = gw145.pid
+        hwm0 = l124_vm(pid, "VmHWM")
+        s, _, b = l124_http(port, "POST", "/v1/responses", resp_image("anthropic/claude-l145", 48 * MB), timeout=180)
+        hwm1 = l124_vm(pid, "VmHWM")
+        row = mine("/v1/messages")[-1]
+        check("a 48 MiB image in a Responses request to Anthropic arrives intact (%d to %d MiB)" % (hwm0, hwm1), s == 200 and row["sha"] == sha(want_image("anthropic", 48 * MB, "claude-l145")) and hwm1 - hwm0 < 24, (s, b[:200], hwm0, hwm1))
+        s, _, b = l124_http(port, "POST", "/v1/responses", resp_image("gemini/gemini-l145", 48 * MB), timeout=180)
+        hwm2 = l124_vm(pid, "VmHWM")
+        row = mine("/v1beta/models/gemini-l145:generateContent")[-1]
+        check("a 48 MiB image in a Responses request to Gemini arrives intact, with no memory growth (%d to %d MiB)" % (hwm1, hwm2), s == 200 and row["sha"] == sha(want_image("gemini", 48 * MB)) and hwm2 - hwm1 < 24, (s, b[:200], hwm1, hwm2))
+
+        # ---- usage: the converted answer is counted in the key's budget (11 + 5 tokens) ----
+        vk = "sk-bf-l145-budget-0123456789"
+        u0 = used()["b-l145"]
+        s, _, b = l124_http(port, "POST", "/v1/responses", resp_text("anthropic/claude-l145u", 1 * MB), headers={"x-bf-vk": vk})
+        u1 = used()["b-l145"]
+        check("a converted Responses answer is counted in the key's budget (11 + 5 tokens)", s == 200 and abs((u1 - u0) - 16e-6) < 1e-9, (s, b[:100], u0, u1))
+
+        # ---- the hold limit: client.max_request_body_size_mb bounds what is held (1 MiB on the second gateway) ----
+        big_instr = ('{"model":"anthropic/claude-l145","max_output_tokens":16,"instructions":"%s","input":"hi"}' % FILL(3 * MB)).encode()
+        s, _, b = l124_http(portb, "POST", "/v1/responses", big_instr)
+        check("instructions over the hold limit are refused with a 400 that says so", s == 400 and "too large to convert while streaming" in b.decode(), (s, b[:300]))
+        s, _, b = l124_http(portb, "POST", "/v1/responses", resp_text("anthropic/claude-l145", 3 * MB), timeout=120)
+        check("... while a message of the same size streams through", s == 200, (s, b[:200]))
+    finally:
+        gw145.terminate()
+        gw145.wait()
+        gw145b.terminate()
+        gw145b.wait()
 
 
 def main():
@@ -10096,6 +10434,9 @@ def main():
         l133_e2e(env)
         # the token_exchange admin credential renewed with its refresh token (scheduled and after a 401), and needs_reauth once refused: its own gateway
         l140_e2e(env)
+        # L147: the token_exchange admin credential renewed once across two workers, and once across two cluster nodes (sealed through the cluster state)
+        l147_workers_e2e(env)
+        l147_cluster_e2e(env)
         # WebAssembly plugins (a .wasm path in plugins[]): rewrites, short circuits, traps, limits and the plugin API: their own gateway
         l121_e2e(env)
         # the plugin chain as Bifrost runs it: HTTP transport hooks, the LLM hooks on every request type and on streams, has_error: their own gateway
@@ -10112,6 +10453,8 @@ def main():
         l129_e2e(env)
         # large_payload_optimization for providers whose format differs: converted while the body streams in: their own gateways
         l136_e2e(env)
+        # large_payload_optimization for Responses requests to providers whose format differs: converted as they stream: their own gateways
+        l145_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

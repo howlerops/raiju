@@ -9,31 +9,61 @@ import * as gemini from "./providers/gemini"
 import * as cohere from "./providers/cohere"
 import * as bedrock from "./providers/bedrock"
 import * as vertex from "./providers/vertex"
+import * as openai from "./providers/openai"
+import * as providers from "./providers/index"
 import { ChatConv, MessagesConv, ConvOpts, TailFn, F_ANTHROPIC, F_VERTEX_CLAUDE, F_GEMINI, F_CONVERSE, F_COHERE } from "./streamconv"
+import { RespConv, respCorpus, streamedChat, canonJson } from "./respconv"
 import { bytesOf, textOfBytes, ByteOut } from "./jsonstream"
 import { LargeBody } from "./largepayload"
 import { Sha256, sha256, toHex } from "./crypto"
 import { newId } from "./schemas"
 import { readFileBytesSync, appendFileSync, mkdirSync, rmSync, unlinkSync, readdirSync, statSync, existsSync } from "node:fs"
 
-// A converter for one request: a chat body to the provider's format, or a Messages body to Bedrock/Vertex Claude.
+// A converter for one request: a chat body to the provider's format, or a Messages body to Bedrock/Vertex Claude. A
+// Responses request is converted to chat first (respconv.tov), and the chat body goes through the chat converter.
 export class AnyConv {
+  resp: RespConv | undefined = undefined
+
   constructor(readonly chat: ChatConv | undefined, readonly msgs: MessagesConv | undefined) {}
 
-  push(b: u8[]): u8[][] throws SyntaxError {
+  // the chat or Messages converter's output for a chunk of its input (the chunk itself when there is none)
+  private through(b: u8[]): u8[][] throws SyntaxError {
     const c = this.chat
     if (c !== undefined) return try c.push(b)
     const m = this.msgs
     if (m !== undefined) return try m.push(b)
-    return []
+    return [b]
   }
 
-  finish(): u8[][] throws SyntaxError {
+  private end(): u8[][] throws SyntaxError {
     const c = this.chat
     if (c !== undefined) return try c.finish()
     const m = this.msgs
     if (m !== undefined) return try m.finish()
     return []
+  }
+
+  push(b: u8[]): u8[][] throws SyntaxError {
+    const r = this.resp
+    if (r === undefined) return try this.through(b)
+    const out: u8[][] = []
+    for (const p of try r.push(b)) for (const q of try this.through(p)) out.push(q)
+    return out
+  }
+
+  finish(): u8[][] throws SyntaxError {
+    const r = this.resp
+    if (r === undefined) return try this.end()
+    const out: u8[][] = []
+    for (const p of try r.finish()) for (const q of try this.through(p)) out.push(q)
+    for (const q of try this.end()) out.push(q)
+    return out
+  }
+
+  // the fields a Responses answer repeats (none for a chat request)
+  echo(): string {
+    const r = this.resp
+    return r === undefined ? "{}" : r.echo()
   }
 
   // the request's stream_options.include_usage, once its body has been read (an answer replayed as SSE carries usage when asked)
@@ -58,6 +88,14 @@ export class ConvRef {
 // The family of converter that serves a large request of this route to a provider of this kind, or "" when
 // none does (the body is buffered, or refused, as before). `route` is largeRoute's kind.
 export function familyFor(route: string, kind: string, model: string, cfg: ProviderConfig, stream: bool): string {
+  if (route === "responses") {
+    // a Responses request becomes a chat request (respconv.tov) for every provider but OpenAI: the OpenAI-format ones
+    // take that chat body as it is, the others convert it with their chat family
+    if (kind === "openai") return ""
+    if (providers.streamsNatively(kind)) return "resp-openai"
+    const f = familyFor("chat", kind, model, cfg, stream)
+    return f === "" ? "" : "resp-" + f
+  }
   if (route === "chat") {
     if (kind === "anthropic") {
       // injection points name messages by their index from either end, and apply only when no message carries
@@ -87,12 +125,20 @@ export function familyFor(route: string, kind: string, model: string, cfg: Provi
 
 // Bedrock signs the payload, so its body is known whole (and hashed) before the request is made.
 export function needsHash(family: string): bool {
-  return family === "converse" || family === "messages-bedrock"
+  const f = family.startsWith("resp-") ? family.slice(5) : family
+  return f === "converse" || f === "messages-bedrock"
 }
 
 // The converter for a family. `autoCache`: the request or the provider asks for prompt cache breakpoints. `wire`: the
 // provider is called as a stream (a chat stream whose events are converted as they arrive, or a Messages stream).
 export function newConv(family: string, model: string, cfg: ProviderConfig, autoCache: bool, wire: bool, holdMax: int, strMax: int): AnyConv {
+  if (family.startsWith("resp-")) {
+    // a Responses request, converted to chat as it streams in, then by its chat family's converter (none for OpenAI-format)
+    const sub = family.slice(5)
+    const c = sub === "openai" ? new AnyConv(undefined, undefined) : newConv(sub, model, cfg, autoCache, wire, holdMax, strMax)
+    c.resp = new RespConv(model, sub === "openai", holdMax, strMax)
+    return c
+  }
   if (family === "messages-bedrock") return new AnyConv(undefined, new MessagesConv(true, "bedrock-2023-05-31", false, strMax))
   if (family === "messages-vertex") return new AnyConv(undefined, new MessagesConv(false, vertex.CLAUDE_VERSION, wire, strMax))
   let fmt = F_ANTHROPIC
@@ -122,6 +168,12 @@ export function newConv(family: string, model: string, cfg: ProviderConfig, auto
 // The upstream request (URL and headers, no body) for a converted body. `wire`: called as a stream. `hash` is the
 // body's SHA-256 in hex, for the families that need it.
 export function upstreamFor(family: string, t: Target, wire: bool, hash: string): Upstream throws SyntaxError {
+  if (family === "resp-openai") {
+    // the chat endpoint of the OpenAI-format provider, which takes the converted chat body
+    const up = openai.chatRequest(t, [{ key: "model", raw: quote(t.model) }])
+    return { url: up.url, headers: up.headers, body: "" }
+  }
+  if (family.startsWith("resp-")) return try upstreamFor(family.slice(5), t, wire, hash)
   if (family === "anthropic") return anthropic.largeRequest(t)
   if (family === "gemini") return t.kind === "vertex" ? try vertex.largeRequest(t, t.key.value ?? "", wire) : gemini.largeRequest(t, wire)
   if (family === "cohere") return cohere.largeRequest(t)
@@ -493,7 +545,51 @@ test("families by route and provider", () => {
   expect(familyFor("messages", "bedrock", "b", {}, true)).toBe("")
   expect(familyFor("messages", "vertex", "claude-x", {}, true)).toBe("messages-vertex")
   expect(familyFor("messages", "vertex", "gemini-x", {}, false)).toBe("")
-  expect(familyFor("responses", "anthropic", "claude", {}, false)).toBe("")
+  expect(familyFor("responses", "anthropic", "claude", {}, false)).toBe("resp-anthropic")
+  expect(familyFor("responses", "gemini", "g", {}, false)).toBe("resp-gemini")
+  expect(familyFor("responses", "vertex", "claude-x", {}, false)).toBe("resp-vertex-claude")
+  expect(familyFor("responses", "cohere", "c", {}, false)).toBe("resp-cohere")
+  expect(familyFor("responses", "bedrock", "b", {}, false)).toBe("resp-converse")
+  expect(familyFor("responses", "groq", "g", {}, false)).toBe("resp-openai")
+  expect(familyFor("responses", "azure", "a", {}, false)).toBe("resp-openai")
+  expect(familyFor("responses", "openai", "o", {}, false)).toBe("")
+  expect(familyFor("responses", "anthropic", "claude", { prompt_cache: { cache_control_injection_points: [{ role: "user" }] } }, false)).toBe("")
+  expect(needsHash("resp-converse")).toBe(true)
   expect(needsHash("converse")).toBe(true)
   expect(needsHash("anthropic")).toBe(false)
+  expect(needsHash("resp-anthropic")).toBe(false)
+})
+
+// the streamed conversion of a Responses body into a provider's format, when the body arrives `step` bytes at a time
+function streamedResp(family: string, text: string, autoCache: bool, step: int, strMax: int): string throws SyntaxError {
+  const c = newConv("resp-" + family, MODEL, {}, autoCache, false, 104857600, strMax)
+  const out = new ByteOut()
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    for (const p of try c.push(b.slice(i, e))) out.bytes(p)
+    i = e
+  }
+  for (const p of try c.finish()) out.bytes(p)
+  return textOfBytes(out.all())
+}
+
+test("a Responses body converted as it streams is what the whole-body converters write after toChatRequest", () => {
+  for (const text of respCorpus()) {
+    const chat = try streamedChat(text, 100000, 4096, false)
+    for (const f of ["anthropic", "gemini", "converse", "cohere", "vertex-claude"]) {
+      for (const cache of [false, true]) {
+        if (cache && f !== "anthropic" && f !== "converse") continue
+        const want = try canonJson(try reference(f, chat, cache, false))
+        for (const step of [1, 9, 100000]) {
+          for (const mx of [16, 4096]) {
+            const got = try canonJson(try streamedResp(f, text, cache, step, mx))
+            if (got !== want) console.log(`MISMATCH ${f} cache=${cache} step=${step} strMax=${mx}\n  input: ${text}\n  want:  ${want}\n  got:   ${got}`)
+            expect(got).toBe(want)
+          }
+        }
+      }
+    }
+  }
 })

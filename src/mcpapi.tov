@@ -193,7 +193,8 @@ function persist(store: ConfigStore, next: Config): McpReply | undefined {
   }
   store.version += 1
   const f = store.onChange
-  if (f !== undefined) f(next)
+  // the store's copy, as saving left it: a save may have kept a newer retained credential from the file
+  if (f !== undefined) f(store.cfg)
   return undefined
 }
 
@@ -665,6 +666,7 @@ function updateClient(store: ConfigStore, id: string, body: string, publicOnly: 
   }
   const err = persist(store, cfgNext)
   if (err !== undefined) return err
+  if (exchangeChanged) noteAdminRemoved(c.name)
   return reply(200, clientJson(c))
 }
 
@@ -677,6 +679,7 @@ function deleteClient(store: ConfigStore, id: string): McpReply {
   }
   const err = persist(store, withExchangeAdmin(withClients(store.cfg, next), exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], id)))
   if (err !== undefined) return err
+  noteAdminRemoved(id)
   return reply(200, `{"status":"success","message":"MCP client removed successfully"}`)
 }
 
@@ -1060,24 +1063,65 @@ function exchangeAdminWithout(list: McpUserToken[], client: string): McpUserToke
   return out
 }
 
-// Saves a token_exchange client's renewed (or refused) admin credential. Only a credential the config still
-// holds is replaced, so a client deleted or re-verified meanwhile keeps what it has now. A failed save is
-// logged: the renewal runs again when it is next due.
+// Saves a token_exchange client's admin credential: a renewal, a refusal, or one another worker or node renewed or
+// verified. It replaces the client's credential while the config still names the client (a deleted client keeps
+// none), and a credential the file already holds unchanged is not written again. A failed save is logged: the
+// renewal runs again when it is next due.
 export function saveExchangeAdmin(store: ConfigStore, row: McpUserToken): void {
+  let named = false
+  for (const c of store.cfg.mcp?.client_configs ?? []) {
+    if (c.name === row.mcp_client_name) named = true
+  }
+  if (!named) return
   const list = store.cfg.mcp?.exchange_admin ?? []
   let found = false
+  let same = false
   const next: McpUserToken[] = []
   for (const r of list) {
-    if (r.mcp_client_name === row.mcp_client_name && r.id === row.id && r.created_at === row.created_at) {
+    if (r.mcp_client_name === row.mcp_client_name) {
+      same = r.access_token === row.access_token && r.refresh_token === row.refresh_token && r.token_expires_at === row.token_expires_at && r.last_refreshed_at === row.last_refreshed_at && (r.status ?? "") === (row.status ?? "")
       next.push(row)
       found = true
     } else {
       next.push(r)
     }
   }
-  if (!found) return
+  if (!found) next.push(row)
+  if (same) return
   const err = persist(store, withExchangeAdmin(store.cfg, next))
   if (err !== undefined) console.error(`raiju: the admin credential of MCP client ${row.mcp_client_name} could not be saved`)
+}
+
+// Sends a credential that verify-exchange kept to the other nodes (set by main.tov; see clusterstate.tov).
+let adminPublished: ((r: McpUserToken) => void) | undefined = undefined
+
+export function setAdminPublished(f: ((r: McpUserToken) => void) | undefined): void {
+  adminPublished = f
+}
+
+// Tells the other nodes that a client's admin credential was removed (set by main.tov): a deleted client, or one whose
+// token exchange changed.
+let adminRemoved: ((client: string) => void) | undefined = undefined
+
+export function setAdminRemoved(f: ((client: string) => void) | undefined): void {
+  adminRemoved = f
+}
+
+function noteAdminRemoved(client: string): void {
+  const f = adminRemoved
+  if (f !== undefined) f(client)
+}
+
+// Drops a client's admin credential from the config: one another node removed. A credential the config does not hold is
+// left alone.
+export function dropExchangeAdmin(store: ConfigStore, client: string): void {
+  let held = false
+  for (const r of store.cfg.mcp?.exchange_admin ?? []) {
+    if (r.mcp_client_name === client) held = true
+  }
+  if (!held) return
+  const err = persist(store, withExchangeAdmin(store.cfg, exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], client)))
+  if (err !== undefined) console.error(`raiju: the admin credential of MCP client ${client} could not be removed`)
 }
 
 // POST /api/mcp/client/{id}/verify-exchange for a token_exchange client. The body names the identity-provider
@@ -1110,6 +1154,8 @@ async function verifyExchange(store: ConfigStore, idp: IdpEndpoints, client: Mcp
   kept.push(row)
   const err = persist(store, withExchangeAdmin(store.cfg, kept))
   if (err !== undefined) return err
+  const pub = adminPublished
+  if (pub !== undefined) pub(row)
   return { status: 200, body: `{"status":"success","message":${quote(`Token exchange verified. ${v.tools} tools discovered.`)},"tools_count":${v.tools}}` }
 }
 

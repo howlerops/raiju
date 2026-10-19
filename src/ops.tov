@@ -60,6 +60,7 @@ import * as b64 from "./base64"
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync } from "node:fs"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
+import { clusterState, ownerOf } from "./clusterstate"
 import { FeedRing, FeedQueue, FeedItem, feedEnvelope, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
@@ -1054,6 +1055,7 @@ export class Ops {
     const id = cc.node_id ?? ""
     if (id !== "") this.nodeId = id
     if (this.counters === undefined) this.counters = new Counters(this.nodeId)
+    clusterState().setWriter(this.nodeId)
     this.engine.health.holds.setNode(this.nodeId)
     this.clusterTimer = setInterval(() => {
       this.syncCluster()
@@ -1175,6 +1177,7 @@ export class Ops {
     }
     // each worker is its own slot (inherited counters would collide)
     this.counters = new Counters(this.nodeId + "/" + process.pid)
+    clusterState().setWriter(this.nodeId + "/" + process.pid)
     this.engine.health.holds.setNode(this.nodeId + "/" + process.pid)
     this.pushed = new Map()
     this.pushedWindow = new Map()
@@ -1251,6 +1254,8 @@ export class Ops {
     }
     // the key holds travel with the usage (holds.tov); they exist only under adaptive load balancing
     c.setHolds(this.engine.health.holds.wire(now))
+    // the replicated state (clusterstate.tov) travels the same way
+    c.setState(clusterState().wire(now))
   }
 
   applyRemote(c: Counters): void {
@@ -1259,6 +1264,25 @@ export class Ops {
     for (const u of gov.sharedUsage(now)) gov.setRemote(u.name, u.window, Math.max(0.0, c.total(u.name, u.window) - u.used), now)
     const hs = c.takeHolds()
     if (this.engine.cfg.health?.adaptive === true) this.engine.health.holds.merge(hs, now)
+    clusterState().merge(c.takeState(), now)
+  }
+
+  // The live nodes: this one and the peers heard from within the leader window, by node id (a worker counts as its node).
+  liveNodes(): string[] {
+    const me = cluster.nodeOf(this.nodeId)
+    const out: string[] = [me]
+    const c = this.counters
+    if (c === undefined || this.clusterCfg === undefined) return out
+    for (const p of c.peers(Date.now() - cluster.LEADER_WINDOW_MS)) {
+      const n = cluster.nodeOf(p.id)
+      if (!out.includes(n)) out.push(n)
+    }
+    return out
+  }
+
+  // Whether this node owns the retained admin credential of an MCP client (one node renews each, see gateway.tov).
+  ownsAdmin(client: string): bool {
+    return ownerOf(client, this.liveNodes()) === cluster.nodeOf(this.nodeId)
   }
 
   syncCluster(): void {

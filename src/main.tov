@@ -8,7 +8,11 @@ import { Config, loadConfig, loadRawConfig, resolveConfig, providerNames } from 
 import { ConfigStore, ConfigCipher, cipherFromConfig, openConfig } from "./store"
 import { Engine } from "./gateway"
 import { McpManager, setAdminRenew } from "./mcp"
-import { saveUserToken, saveExchangeAdmin } from "./mcpapi"
+import { McpUserToken } from "./mcpuser"
+import { saveUserToken, saveExchangeAdmin, setAdminPublished, setAdminRemoved, dropExchangeAdmin } from "./mcpapi"
+import { readStoredAdmin, sealAdminRow, openAdminRow } from "./store"
+import { clusterState } from "./clusterstate"
+import { FileLease, FILE_LEASE_MS } from "./filelease"
 import { start } from "./server"
 import { Ops, withSecrets } from "./ops"
 import { fromBifrost, merge } from "./guardrails_compat"
@@ -160,7 +164,41 @@ async function main(): Promise<int> {
   engine.adminSaved = (r) => {
     saveExchangeAdmin(store, r)
   }
-  setAdminRenew(async (client: string): Promise<string> => await engine.renewAdminCredential(client, true))
+  // token_exchange admin credentials. Each is renewed by one node of the cluster (Ops.ownsAdmin) and by one worker of
+  // that node at a time (the lease in the supervisor's share folder, shared by its workers). The renewed credential is
+  // read back from the config file by the other workers, and sent to the other nodes through the cluster state with
+  // its tokens sealed (every node must hold the same encryption_key for them to open it)
+  // (process.pid is the supervisor's here, before the workers fork; ops.startLocalShare names the same folder)
+  if (args.workers > 1 && args.server !== "http1") engine.adminLease = new FileLease("/tmp/raiju-" + process.pid + "/leases", FILE_LEASE_MS)
+  // the closures below take a const copy of the cipher: a mutable local captured by a closure in this async function
+  // does not compile
+  const sealKey: ConfigCipher | undefined = cipher
+  const configPath = args.config
+  engine.adminOwns = (client: string): bool => ops.ownsAdmin(client)
+  engine.adminStored = (client: string): McpUserToken | undefined => readStoredAdmin(configPath, sealKey, client)
+  const publishAdmin = (r: McpUserToken): void => {
+    try {
+      clusterState().put("mcp.exchange_admin", r.mcp_client_name, sealAdminRow(sealKey, r))
+    } catch (e) {
+      console.error(`raiju: mcp ${r.mcp_client_name}: the admin credential could not be sent to the other nodes: ${e.message}`)
+    }
+  }
+  engine.adminPublish = publishAdmin
+  setAdminPublished(publishAdmin)
+  // a credential removed on another node (its client deleted, or its token exchange changed) is removed here too
+  setAdminRemoved((client: string) => {
+    clusterState().del("mcp.exchange_admin", client)
+  })
+  clusterState().onChange("mcp.exchange_admin", (client: string, value: string | undefined) => {
+    if (value === undefined) {
+      dropExchangeAdmin(store, client)
+      return
+    }
+    const row = openAdminRow(sealKey, value)
+    if (row === undefined || row.mcp_client_name !== client) return
+    engine.adoptRemoteAdmin(row)
+  })
+  setAdminRenew(async (client: string, used: string): Promise<string> => await engine.renewAdminCredential(client, used))
   store.onChange = (c) => {
     applyChange(engine, ops, store, c)
   }

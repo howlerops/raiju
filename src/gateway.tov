@@ -28,7 +28,7 @@ import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream
 import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, RS } from "./providers/types"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
-import { ResponsesToChatStream } from "./responses"
+import { ResponsesToChatStream, toResponse, toResponseStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias } from "./router"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import * as anthropicBeta from "./anthropic_beta"
@@ -56,8 +56,9 @@ import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
 import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches, adminRowOf } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
-import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewDue, nextRenewal, needsReverify, RENEW_RETRY_MS } from "./tokenexchange"
+import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewAt, needsReverify, RENEW_RETRY_MS, ADMIN_TAKEOVER_MS, ADMIN_WAIT_MS, ADMIN_POLL_MS } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
+import { FileLease, FILE_LEASE_MS } from "./filelease"
 import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, consentLink, startUserFlow, refreshUserRow } from "./mcpuser"
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
@@ -1193,12 +1194,18 @@ export class Engine {
   idp: IdpEndpoints = new IdpEndpoints()
   exchanges: ExchangeCache = new ExchangeCache()
   // their retained admin credentials: saved after a renewal (the server writes them to the config file), the
-  // timer of the next renewal, the retry time of a renewal that failed for a passing reason, and the renewals
-  // in flight
+  // timer of the next renewal, and the retry time of a renewal that failed for a passing reason. The renewal of a
+  // credential runs under adminLease, shared by the workers of a node (main.tov sets it; one process when unset).
+  // The hooks main.tov sets: adminOwns (whether this node owns a client's renewal; every node when unset),
+  // adminStored (the credential the config file holds for a client, read for the workers and nodes that renewed it
+  // elsewhere) and adminPublish (sends a renewed credential to the other nodes, sealed; see clusterstate.tov).
   adminSaved: ((r: McpUserToken) => void) | undefined = undefined
+  adminLease: FileLease = new FileLease("", FILE_LEASE_MS)
+  adminOwns: ((client: string) => bool) | undefined = undefined
+  adminStored: ((client: string) => McpUserToken | undefined) | undefined = undefined
+  adminPublish: ((r: McpUserToken) => void) | undefined = undefined
   private adminTimer: int = -1
   private adminRetry: Map<string, f64> = new Map()
-  private adminBusy: string[] = []
   guard: GuardConfig | undefined = undefined
   rules: RuleSet | undefined = undefined
   logStore: LogStore | undefined = undefined
@@ -2338,41 +2345,154 @@ export class Engine {
     if (f !== undefined) f(row)
   }
 
-  // Renews a token_exchange client's retained admin credential with its refresh token: when it is due, or now
-  // with force (the server answered 401 to it). The renewed credential, or the mark that it needs a new
-  // verification, goes to the running session and is saved. Returns the token to use ("" when there is none).
-  async renewAdminCredential(client: string, force: bool): Promise<string> {
-    const row = adminRowOf(this.cfg.mcp?.exchange_admin, client)
+  // When a retained admin credential is due for renewal, in epoch milliseconds (0: never). A node that does not own
+  // the client's renewal waits ADMIN_TAKEOVER_MS more, so the owner's renewal comes first.
+  adminDueAt(r: McpUserToken): f64 {
+    const at = renewAt(r)
+    if (at <= 0.0) return 0.0
+    const owns = this.adminOwns
+    return owns === undefined || owns(r.mcp_client_name) ? at : at + ADMIN_TAKEOVER_MS
+  }
+
+  // Whether a retained admin credential is due now: its time has come and no retry holds it.
+  private adminDue(r: McpUserToken, nowMs: f64): bool {
+    const at = this.adminDueAt(r)
+    return at > 0.0 && at <= nowMs && (this.adminRetry.get(r.mcp_client_name) ?? 0.0) <= nowMs
+  }
+
+  // The retained admin credential of a client as this process holds it.
+  private adminRowNow(client: string): McpUserToken | undefined {
+    return adminRowOf(this.cfg.mcp?.exchange_admin, client)
+  }
+
+  // Takes the credential the config file holds for a client when it is newer than the one held here: a worker of
+  // this node, or a node, renewed it and saved it.
+  private adoptStored(client: string): void {
+    const read = this.adminStored
+    if (read === undefined) return
+    const stored = read(client)
+    if (stored === undefined) return
+    const cur = this.adminRowNow(client)
+    if (cur !== undefined) {
+      // a marked credential keeps its renewal time, so a mark is a change of its own
+      if (stored.last_refreshed_at < cur.last_refreshed_at) return
+      if (stored.last_refreshed_at === cur.last_refreshed_at && needsReverify(stored) === needsReverify(cur)) return
+    }
+    this.setAdminRow(stored, false)
+  }
+
+  // Puts a credential in place of the one held for its client, in the config in memory and in the running session,
+  // and saves it (adminSaved). publish sends it to the other nodes (a renewal does; a credential from them does not).
+  private setAdminRow(row: McpUserToken, publish: boolean): void {
+    let c = this.cfg
+    if (!tokenExchangeNames(c.mcp?.client_configs).includes(row.mcp_client_name)) return
+    let m = c.mcp ?? {}
+    let next: McpUserToken[] = []
+    let found = false
+    for (const r of m.exchange_admin ?? []) {
+      if (r.mcp_client_name === row.mcp_client_name) {
+        next.push(row)
+        found = true
+      } else {
+        next.push(r)
+      }
+    }
+    if (!found) next.push(row)
+    m.exchange_admin = next
+    c.mcp = m
+    this.cfg = c
+    const live = this.mcp
+    if (live !== undefined) live.setAdmin(row)
+    const f = this.adminSaved
+    if (f !== undefined) f(row)
+    if (publish) {
+      const p = this.adminPublish
+      if (p !== undefined) p(row)
+    }
+    this.scheduleAdminRenewal()
+  }
+
+  // A credential another node renewed or verified arrives through the cluster state (clusterstate.tov, last writer
+  // wins): it takes the place of the one held here, unless that one is the same.
+  adoptRemoteAdmin(row: McpUserToken): void {
+    const cur = this.adminRowNow(row.mcp_client_name)
+    if (cur !== undefined && cur.access_token === row.access_token && cur.refresh_token === row.refresh_token && needsReverify(cur) === needsReverify(row)) return
+    this.setAdminRow(row, false)
+  }
+
+  // Renews a token_exchange client's retained admin credential with its refresh token. used is the access token the
+  // server refused (after a 401), or "" when the renewal is due. A due credential is renewed by its owner node (and by
+  // another once ADMIN_TAKEOVER_MS have passed). Within a node the renewal runs under adminLease: a worker that finds
+  // it held waits for the holder's result, which it reads from the config file, and renews only when that does not
+  // come in ADMIN_WAIT_MS. Returns the token to use ("" when there is none).
+  async renewAdminCredential(client: string, used: string): Promise<string> {
+    const waitUntil = Date.now() + ADMIN_WAIT_MS
+    const name = "mcp-admin:" + client
+    for (;;) {
+      this.adoptStored(client)
+      const row = this.adminRowNow(client)
+      if (row === undefined || needsReverify(row)) return ""
+      const now = Date.now()
+      if (used !== "") {
+        if (row.access_token !== used) return row.access_token
+      } else if (!this.adminDue(row, now)) {
+        return row.access_token
+      }
+      // after a 401 the owner node is given the time to renew first; the others renew once it has had it
+      const owns = this.adminOwns
+      if (used !== "" && owns !== undefined && !owns(client) && now < waitUntil) {
+        await sleep(ADMIN_POLL_MS)
+        continue
+      }
+      const gen = this.adminLease.take(name, now)
+      if (gen < 0) {
+        if (now >= waitUntil) {
+          this.adminRetry.set(client, now + RENEW_RETRY_MS)
+          return ""
+        }
+        await sleep(ADMIN_POLL_MS)
+        continue
+      }
+      try {
+        return await this.renewHeld(client, used)
+      } finally {
+        this.adminLease.release(name, gen)
+      }
+    }
+  }
+
+  // The renewal itself, by the process that holds the lease: the credential as the config file holds it now, the
+  // refresh, the save and the publication to the other nodes.
+  private async renewHeld(client: string, used: string): Promise<string> {
+    this.adoptStored(client)
+    const row = this.adminRowNow(client)
     if (row === undefined || needsReverify(row)) return ""
     const now = Date.now()
-    if (!force && !renewDue(row, this.adminRetry.get(client) ?? 0.0, now)) return row.access_token
-    if (this.adminBusy.includes(client)) return ""
+    if (used !== "") {
+      if (row.access_token !== used) return row.access_token
+    } else if (!this.adminDue(row, now)) {
+      return row.access_token
+    }
     let te: McpTokenExchange | undefined = undefined
     for (const c of this.cfg.mcp?.client_configs ?? []) {
       if (c.name === client && c.auth_type === "token_exchange") te = c.token_exchange
     }
     if (te === undefined) return ""
-    this.adminBusy.push(client)
     const oc = this.cfg.oidc
     const out = await renewAdmin(te, row, this.idp, oc?.issuer ?? "", oc?.client_id ?? "", oc?.client_secret ?? "", now)
-    this.adminBusy = this.adminBusy.filter((n) => n !== client)
     if (!out.changed) {
       this.adminRetry.set(client, Date.now() + RENEW_RETRY_MS)
       console.error(`raiju: mcp ${client}: the admin credential could not be renewed (${out.error}); trying again in ${Math.round(RENEW_RETRY_MS / 1000.0)}s`)
       return ""
     }
+    // a refusal is believed only when nothing newer arrived meanwhile: a refresh token that another process has
+    // already rotated is the one that counts
+    this.adoptStored(client)
+    const latest = this.adminRowNow(client)
+    if (needsReverify(out.row) && latest !== undefined && latest.refresh_token !== row.refresh_token) return needsReverify(latest) ? "" : latest.access_token
     this.adminRetry.delete(client)
     if (needsReverify(out.row)) console.error(`raiju: mcp ${client}: ${out.row.status_reason ?? ""}; verify the client again`)
-    // the config in memory takes the row at once, so the next look does not renew it again before the save lands
-    let c = this.cfg
-    let m = c.mcp ?? {}
-    m.exchange_admin = (m.exchange_admin ?? []).map((r) => (r.mcp_client_name === client ? out.row : r))
-    c.mcp = m
-    this.cfg = c
-    const live = this.mcp
-    if (live !== undefined) live.setAdmin(out.row)
-    const f = this.adminSaved
-    if (f !== undefined) f(out.row)
+    this.setAdminRow(out.row, true)
     return needsReverify(out.row) ? "" : out.row.access_token
   }
 
@@ -2381,9 +2501,18 @@ export class Engine {
   scheduleAdminRenewal(): void {
     if (this.adminTimer >= 0) clearTimeout(this.adminTimer)
     this.adminTimer = -1
-    const at = nextRenewal(this.cfg.mcp?.exchange_admin ?? [], this.adminRetry, tokenExchangeNames(this.cfg.mcp?.client_configs))
-    if (at <= 0.0) return
-    const wait: int = Math.max(0, Math.round(at - Date.now()))
+    const names = tokenExchangeNames(this.cfg.mcp?.client_configs)
+    let best: f64 = 0.0
+    for (const r of this.cfg.mcp?.exchange_admin ?? []) {
+      if (!names.includes(r.mcp_client_name)) continue
+      let at = this.adminDueAt(r)
+      if (at <= 0.0) continue
+      const hold = this.adminRetry.get(r.mcp_client_name) ?? 0.0
+      if (hold > at) at = hold
+      if (best === 0.0 || at < best) best = at
+    }
+    if (best <= 0.0) return
+    const wait: int = Math.max(0, Math.round(best - Date.now()))
     this.adminTimer = setTimeout(() => {
       this.renewDueAdmins()
     }, wait)
@@ -2393,9 +2522,10 @@ export class Engine {
   async renewDueAdmins(): Promise<void> {
     if (this.adminTimer >= 0) clearTimeout(this.adminTimer)
     this.adminTimer = -1
-    const now = Date.now()
+    const names = tokenExchangeNames(this.cfg.mcp?.client_configs)
     for (const r of this.cfg.mcp?.exchange_admin ?? []) {
-      if (renewDue(r, this.adminRetry.get(r.mcp_client_name) ?? 0.0, now)) await this.renewAdminCredential(r.mcp_client_name, false)
+      if (!names.includes(r.mcp_client_name)) continue
+      if (this.adminDue(r, Date.now())) await this.renewAdminCredential(r.mcp_client_name, "")
     }
     this.scheduleAdminRenewal()
   }
@@ -3524,6 +3654,19 @@ export class Engine {
     }
     // the answer of a request that streams on is a small one here (a big one is passed through): its usage is read from the text
     const translate: Translate = (t, text, requested) => {
+      if (route === "responses" && family !== "") {
+        // a Responses request converted to chat: its chat answer is converted back as the whole-request path does it
+        const hc = holder.conv
+        const echo = hc === undefined ? "{}" : hc.echo()
+        let o: Translated = { body: "", promptTokens: 0, completionTokens: 0 }
+        if (stream && providers.streamsNatively(t.kind)) o = openai.streamResponse(text, requested)
+        else o = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        if (stream) {
+          const sse = o.body.startsWith("{") ? try completionToSse(o.body, true) : o.body
+          return { body: toResponseStream(sse, meta.model), promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+        }
+        return { body: try toResponse(o.body, meta.model, echo), promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+      }
       if (route === "responses" || route === "messages") {
         const u = usageOfText(text)
         return { body: text, promptTokens: u.promptTokens, completionTokens: u.completionTokens }

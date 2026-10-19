@@ -4,6 +4,8 @@
 // from lately. The broker keeps no usage of its own: it only joins what the nodes send. A node merges the
 // answer with Counters.relay, so the other nodes' usage reaches it in two rounds at most.
 import { Counters, ClusterConfig, LEADER_WINDOW_MS, verify, nodeOf } from "./cluster"
+import { ClusterState } from "./clusterstate"
+import { HoldBook, HoldWire } from "./holds"
 import { FeedRing, FeedItem, FeedPull, FeedAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_BATCH_MAX, checkItems, parseAnswer, feedId } from "./feed"
 
 export const BROKER_ROUTE = "/api/cluster/broker"
@@ -15,6 +17,10 @@ const BROKER_ID = "broker"
 // The broker's joined state. A node whose payload is bad is refused with nothing merged.
 export class Relay {
   private state: Counters = new Counters(BROKER_ID)
+  // the replicated state entries (clusterstate.tov) the nodes have sent, joined as the nodes join them
+  private relayed: ClusterState = new ClusterState(BROKER_ID)
+  // the key holds the nodes have sent (holds.tov), joined as at a peer
+  private holds: HoldBook = new HoldBook(BROKER_ID)
   // the nodes' live-feed events in the order the broker took them; each gets a position (bseq) that a node keeps as its cursor
   private feed: FeedRing = new FeedRing(FEED_RING_SIZE, FEED_RING_SECONDS * 1000.0)
   private pos: int = 0
@@ -23,7 +29,16 @@ export class Relay {
   exchange(body: string, nowMs: f64): string throws SyntaxError {
     try this.state.merge(body, nowMs)
     this.state.forget(nowMs - LEADER_WINDOW_MS)
-    return this.state.encode(this.roster())
+    // the state entries join here and go back out with the counters
+    this.relayed.merge(this.state.takeState(), nowMs)
+    this.state.setState(this.relayed.wire(nowMs))
+    // the key holds join the same way as at a peer: what the broker takes is drained each time (it never grows), and
+    // only the holds of nodes in the roster go back out, so a node that left takes its holds with it
+    const roster = this.roster()
+    const live: string[] = roster.map((id) => nodeOf(id))
+    this.holds.merge(this.state.takeHolds(), nowMs)
+    this.state.setHolds(this.holds.wire(nowMs).filter((h) => live.includes(nodeOf(h.owner))))
+    return this.state.encode(roster)
   }
 
   // A node's feed pull: its own events in, and the other nodes' events after its cursor out (a FeedAnswer as JSON).
@@ -179,4 +194,50 @@ test("the broker keeps the nodes' feed events and answers each node with the oth
   expect(answerOf(relay, pullOf("", 0, []), 1000.0).last).toBe(-1)
   expect(answerOf(relay, pullOf("c,d", 0, []), 1000.0).last).toBe(-1)
   expect(answerOf(relay, "not json", 1000.0).last).toBe(-1)
+})
+
+test("the broker relays replicated state between nodes that have no link, last writer wins", () => {
+  const relay = new Relay()
+  const a = new Counters("a")
+  const b = new Counters("b")
+  const sa = new ClusterState("a")
+  sa.put("mcp.exchange_admin", "jira", `{"n":1}`, 1000.0)
+  a.setState(sa.wire(1000.0))
+  try relay.exchange(a.encode(), 1000.0)
+  // b has never heard from a: its answer to the broker carries a's entry
+  const answer = try relay.exchange(b.encode(), 1000.0)
+  const got = new Counters("b")
+  try got.relay(answer, 1000.0)
+  const received = got.takeState()
+  expect(received.length).toBe(1)
+  expect(received[0]!.value).toBe(`{"n":1}`)
+  // a later write from a replaces it at the broker and at b
+  sa.put("mcp.exchange_admin", "jira", `{"n":2}`, 2000.0)
+  a.setState(sa.wire(2000.0))
+  try relay.exchange(a.encode(), 2000.0)
+  const again = try relay.exchange(b.encode(), 2000.0)
+  const got2 = new Counters("b")
+  try got2.relay(again, 2000.0)
+  expect(got2.takeState()[0]!.value).toBe(`{"n":2}`)
+})
+
+test("the broker relays key holds between nodes, and stops relaying the holds of a node that left", () => {
+  const relay = new Relay()
+  const a = new Counters("a")
+  const b = new Counters("b")
+  const h: HoldWire = { target: "p#k", provider: "p", keyId: "k", model: "", cls: "credential", reason: "bad", heldAt: 1000.0, rung: 0, waitMs: 30000.0, nextCheck: 31000.0, owner: "a", claimBy: "", claimAt: 0.0, ver: 1, by: "a", released: false, at: 1000.0 }
+  a.setHolds([h])
+  try relay.exchange(a.encode(), 1000.0)
+  const answer = try relay.exchange(b.encode(), 1000.0)
+  const got = new Counters("b")
+  try got.relay(answer, 1000.0)
+  const held = got.takeHolds()
+  expect(held.length).toBe(1)
+  expect(held[0]!.target).toBe("p#k")
+  // a's holds are not relayed once a has left the roster (a silent for a window)
+  const late = 1000.0 + LEADER_WINDOW_MS + 1.0
+  const again = try relay.exchange(b.encode(), late)
+  const got2 = new Counters("b")
+  try got2.relay(again, late)
+  expect(got2.takeHolds().length).toBe(0)
 })

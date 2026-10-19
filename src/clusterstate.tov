@@ -1,0 +1,285 @@
+// Replicated state for a cluster of gateways, and for the workers of one node: a map of entries by namespace and key,
+// merged last writer wins by every process that holds a copy. cluster.tov carries it as the "state" section of its
+// payload, to the peers (sync) or through the broker, and each worker of a node gets the others' entries through the
+// share folder the same way.
+//
+// API. clusterState() is the process's copy (a node, or one worker of a node). A value is JSON text; the caller
+// encodes it and reads it back.
+//   put(ns, key, value)     writes value; the next sync sends it to every node
+//   get(ns, key)            the value, or undefined when it is absent or deleted
+//   del(ns, key)            deletes it: a tombstone, kept for TOMB_MS so that the deletion reaches every node
+//   keys(ns)                the live keys of a namespace
+//   onChange(ns, fn)        calls fn(key, value) for each change merged in from another process, value undefined
+//                           on a deletion. Writes made here do not call it.
+//   setWriter(id)           the id this process writes under (its node, or node/pid for a worker)
+//
+// Merging: an entry replaces the held one when its ver is higher, or equal and its writer id greater. ver is the
+// write time in epoch milliseconds, or one past the held entry's ver when that is later, so the later write wins even
+// between workers or nodes whose copies lag a sync tick. Merging the same entries again changes nothing.
+//
+// Security. The cluster transport is signed with cluster.secret, not encrypted: a value in the state section is read
+// by anyone who can read the wire. A value that holds a credential is sealed by its writer (store.tov sealStored)
+// with the encryption key, which every node of the cluster must share; nodes without that key cannot open it.
+import { sha256, toHex, utf8 } from "./crypto"
+
+export type StateWire = { ns: string, key: string, value: string, ver: int, by: string, deleted: bool, at: f64 }
+
+export type StateListener = (key: string, value: string | undefined) => void
+
+// a deletion is kept this long so that every node learns of it
+const TOMB_MS: f64 = 600000.0
+// versions and write times must be finite and within this bound (about the year 33658 in milliseconds)
+const MAX_VER = 1000000000000000
+const MAX_AT: f64 = 1.0e15
+
+// The first problem with an entry from the wire ("" when it is sound). A bad entry refuses its whole payload.
+export function stateProblem(e: StateWire): string {
+  if (e.ns === "" || e.key === "") return "state entry has no namespace or key"
+  if (!(e.ver >= 1) || e.ver > MAX_VER) return "state entry has a bad version"
+  if (e.by === "") return "state entry has no writer"
+  if (!e.deleted && e.value === "") return "state entry has no value"
+  if (!(e.at >= 0.0) || e.at > MAX_AT) return "state entry has a bad time"
+  return ""
+}
+
+function entryKey(ns: string, key: string): string {
+  return JSON.stringify([ns, key])
+}
+
+function newer(ver: int, by: string, cur: int, curBy: string): bool {
+  return ver > cur || (ver === cur && by > curBy)
+}
+
+export class ClusterState {
+  private entries: Map<string, StateWire> = new Map()
+  private listeners: Map<string, StateListener[]> = new Map()
+  private writer: string
+
+  constructor(writer: string) {
+    this.writer = writer
+  }
+
+  setWriter(id: string): void {
+    this.writer = id
+  }
+
+  // Writes value under ns and key. nowMs defaults to the clock.
+  put(ns: string, key: string, value: string, nowMs?: f64): void {
+    this.write(ns, key, value, false, nowMs ?? Date.now())
+  }
+
+  // Deletes ns and key (a tombstone).
+  del(ns: string, key: string, nowMs?: f64): void {
+    this.write(ns, key, "", true, nowMs ?? Date.now())
+  }
+
+  private write(ns: string, key: string, value: string, deleted: bool, nowMs: f64): void {
+    const k = entryKey(ns, key)
+    const cur = this.entries.get(k)
+    let ver: int = Math.floor(nowMs)
+    if (cur !== undefined && cur.ver >= ver) ver = cur.ver + 1
+    this.entries.set(k, { ns: ns, key: key, value: value, ver: ver, by: this.writer, deleted: deleted, at: nowMs })
+  }
+
+  // The value under ns and key, or undefined when it is absent or deleted.
+  get(ns: string, key: string): string | undefined {
+    const e = this.entries.get(entryKey(ns, key))
+    if (e === undefined || e.deleted) return undefined
+    return e.value
+  }
+
+  // The live keys of a namespace, sorted.
+  keys(ns: string): string[] {
+    const out: string[] = []
+    for (const e of this.entries.values()) {
+      if (e.ns === ns && !e.deleted) out.push(e.key)
+    }
+    out.sort()
+    return out
+  }
+
+  // Calls fn for each change of the namespace merged in from another process.
+  onChange(ns: string, fn: StateListener): void {
+    const ls = this.listeners.get(ns) ?? []
+    ls.push(fn)
+    this.listeners.set(ns, ls)
+  }
+
+  // Every entry this process holds, tombstones included, for the next payload.
+  wire(nowMs: f64): StateWire[] {
+    this.prune(nowMs)
+    return this.entries.values()
+  }
+
+  // Merges entries from a payload. An entry that does not hold up is skipped (the transport refuses such a payload
+  // before this). Listeners run after the merge, one call per changed entry.
+  merge(list: StateWire[], nowMs: f64): void {
+    const changed: StateWire[] = []
+    for (const r of list) {
+      if (stateProblem(r) !== "") continue
+      const k = entryKey(r.ns, r.key)
+      const cur = this.entries.get(k)
+      if (cur !== undefined && !newer(r.ver, r.by, cur.ver, cur.by)) continue
+      this.entries.set(k, r)
+      changed.push(r)
+    }
+    this.prune(nowMs)
+    for (const r of changed) {
+      const ls = this.listeners.get(r.ns) ?? []
+      for (const f of ls) {
+        try {
+          f(r.key, r.deleted ? undefined : r.value)
+        } catch (e) {
+          console.error(`raiju: cluster state listener for ${r.ns}: ${e.message}`)
+        }
+      }
+    }
+  }
+
+  // Forgets the deletions older than TOMB_MS.
+  private prune(nowMs: f64): void {
+    for (const k of this.entries.keys()) {
+      const e = this.entries.get(k)!
+      if (e.deleted && e.at < nowMs - TOMB_MS) this.entries.delete(k)
+    }
+  }
+}
+
+let instance: ClusterState | undefined = undefined
+
+// The process's copy of the cluster state (created on first use: top-level statements in imported modules do not run).
+export function clusterState(): ClusterState {
+  let s = instance
+  if (s === undefined) {
+    s = new ClusterState("node")
+    instance = s
+  }
+  return s
+}
+
+// The node that owns a key among the live nodes: the one whose hash with the key is highest (rendezvous hashing), so
+// every node picks the same owner from the same roster, and when a node leaves, the next highest takes over.
+export function ownerOf(key: string, nodes: string[]): string {
+  let best = ""
+  let bestHash = ""
+  for (const n of nodes) {
+    const h = toHex(sha256(utf8(key + "\n" + n))).slice(0, 32)
+    if (best === "" || h > bestHash || (h === bestHash && n > best)) {
+      best = n
+      bestHash = h
+    }
+  }
+  return best
+}
+
+test("the later write wins, the writer breaks a tie, and a stale entry changes nothing", () => {
+  const a = new ClusterState("a")
+  const b = new ClusterState("b")
+  a.put("ns", "k", `"one"`, 1000.0)
+  b.put("ns", "k", `"two"`, 2000.0)
+  a.merge(b.wire(3000.0), 3000.0)
+  b.merge(a.wire(3000.0), 3000.0)
+  expect(a.get("ns", "k")).toBe(`"two"`)
+  expect(b.get("ns", "k")).toBe(`"two"`)
+  // a copy that lags a tick still writes later than what it holds
+  a.put("ns", "k", `"three"`, 2000.0)
+  expect(a.get("ns", "k")).toBe(`"three"`)
+  a.merge(b.wire(3000.0), 3000.0)
+  expect(a.get("ns", "k")).toBe(`"three"`)
+  // equal versions: the greater writer id wins, on both sides
+  const c = new ClusterState("c")
+  const d = new ClusterState("d")
+  c.put("ns", "t", `"c"`, 5000.0)
+  d.put("ns", "t", `"d"`, 5000.0)
+  c.merge(d.wire(6000.0), 6000.0)
+  d.merge(c.wire(6000.0), 6000.0)
+  expect(c.get("ns", "t")).toBe(`"d"`)
+  expect(d.get("ns", "t")).toBe(`"d"`)
+  // merging the same entries again changes nothing and calls no listener
+  let calls = 0
+  c.onChange("ns", (key, value) => {
+    calls += 1
+  })
+  c.merge(d.wire(6000.0), 6000.0)
+  expect(calls).toBe(0)
+})
+
+test("a deletion is a tombstone that wins over older writes, kept for ten minutes", () => {
+  const a = new ClusterState("a")
+  const b = new ClusterState("b")
+  a.put("ns", "k", `{"v":1}`, 1000.0)
+  b.merge(a.wire(1000.0), 1000.0)
+  b.del("ns", "k", 2000.0)
+  expect(b.get("ns", "k") === undefined).toBe(true)
+  // the old value arrives late: the deletion stays
+  a.merge(b.wire(2000.0), 2000.0)
+  a.merge(b.wire(2000.0), 2000.0)
+  expect(a.get("ns", "k") === undefined).toBe(true)
+  expect(a.keys("ns").length).toBe(0)
+  // the tombstone travels, and a newer write brings the key back
+  a.merge([{ ns: "ns", key: "k", value: `{"v":2}`, ver: 3000, by: "a", deleted: false, at: 3000.0 }], 3000.0)
+  expect(a.get("ns", "k")).toBe(`{"v":2}`)
+  // a tombstone is forgotten after TOMB_MS
+  const late = new ClusterState("x")
+  late.merge(b.wire(2000.0), 2000.0)
+  expect(late.wire(2000.0).length).toBe(1)
+  expect(late.wire(2000.0 + TOMB_MS + 1.0).length).toBe(0)
+})
+
+test("listeners hear the changes merged in, deletions as undefined, and writes made here stay silent", () => {
+  const a = new ClusterState("a")
+  const b = new ClusterState("b")
+  const seen: string[] = []
+  b.onChange("mcp", (key, value) => {
+    seen.push(key + "=" + (value ?? "<gone>"))
+  })
+  b.onChange("other", (key, value) => {
+    seen.push("wrong namespace")
+  })
+  b.put("mcp", "local", `1`, 1000.0)
+  a.put("mcp", "jira", `{"n":1}`, 1000.0)
+  b.merge(a.wire(1000.0), 1000.0)
+  expect(seen).toEqual(["jira={\"n\":1}"])
+  a.del("mcp", "jira", 2000.0)
+  b.merge(a.wire(2000.0), 2000.0)
+  expect(seen).toEqual(["jira={\"n\":1}", "jira=<gone>"])
+  expect(b.keys("mcp").length).toBe(1)
+  expect(b.get("mcp", "local")).toBe("1")
+})
+
+test("keys are kept apart by namespace, and a bad entry changes nothing", () => {
+  const a = new ClusterState("a")
+  a.put("x", "a.b", `1`, 1000.0)
+  a.put("x.a", "b", `2`, 1000.0)
+  expect(a.get("x", "a.b")).toBe("1")
+  expect(a.get("x.a", "b")).toBe("2")
+  expect(a.keys("x").length).toBe(1)
+  const bad: StateWire[] = [
+    { ns: "", key: "k", value: "1", ver: 5, by: "b", deleted: false, at: 1000.0 },
+    { ns: "x", key: "k", value: "", ver: 5, by: "b", deleted: false, at: 1000.0 },
+    { ns: "x", key: "k", value: "1", ver: 0, by: "b", deleted: false, at: 1000.0 },
+    { ns: "x", key: "k", value: "1", ver: 5, by: "", deleted: false, at: 1000.0 },
+  ]
+  expect(stateProblem(bad[0]!) !== "").toBe(true)
+  expect(stateProblem(bad[1]!) !== "").toBe(true)
+  expect(stateProblem(bad[2]!) !== "").toBe(true)
+  expect(stateProblem(bad[3]!) !== "").toBe(true)
+  a.merge(bad, 1000.0)
+  expect(a.get("x", "k") === undefined).toBe(true)
+  expect(a.keys("x").length).toBe(1)
+})
+
+test("ownerOf picks the same node from the same roster, and the next one when the owner leaves", () => {
+  const roster = ["node-a", "node-b", "node-c"]
+  const owner = ownerOf("jira", roster)
+  expect(roster.includes(owner)).toBe(true)
+  // the order of the roster does not matter
+  expect(ownerOf("jira", ["node-c", "node-a", "node-b"])).toBe(owner)
+  // a key that the owner does not hold keeps its owner when another node leaves
+  const others = roster.filter((n) => n !== owner)
+  const rest = others.filter((n) => n !== others[0]!)
+  expect(ownerOf("jira", [owner, rest[0]!])).toBe(owner)
+  expect(ownerOf("jira", [])).toBe("")
+  expect(ownerOf("jira", ["solo"])).toBe("solo")
+})
+
