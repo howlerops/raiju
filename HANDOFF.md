@@ -42,11 +42,10 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
   realtime calls on Raiju's own peer). Set `RAIJU_WEBRTC_BIND` and `RAIJU_WEBRTC_ICE_SERVERS`
   for deployment.
 - Audio is billed (L144): transcriptions by audio tokens then seconds, speech by characters. The
-  built-in price table's audio, per-second and per-character rates are merged from LiteLLM's public
-  price file (`scripts/gen_pricing.py --merge`, L135, L144); its token rates are an older Bifrost datasheet
-  snapshot (388 disagree with LiteLLM). Regenerate with `scripts/gen_pricing.py` from
-  https://getbifrost.ai/datasheet (this environment's network policy blocks that host; add it
-  under Allowed domains to do it here). Pricing sync at runtime overrides the table.
+  built-in price table (`src/pricing_data.tov`) was regenerated on 2026-10-19 from the current
+  Bifrost datasheet (https://getbifrost.ai/datasheet, 4,765 priced entries, its audio, per-second and
+  per-character rates included): `python3 scripts/gen_pricing.py <datasheet.json>`. Pricing sync at
+  runtime overrides the table.
 
 ## What's next
 
@@ -55,8 +54,7 @@ No row is queued; the remainders are the "Open:" notes in LEDGER.md. The larger 
 - Wave 19, crew routing: L153 gateway wiring (assigned), then L154 outcomes, credibility learning,
   pacing and the sequential layer, then L155 the Crews UI tab and metrics. Briefs for finished rows
   are the pattern; the design is docs/crew-routing.md.
-- Pricing data: regenerate the token rates from the Bifrost datasheet (above; getbifrost.ai must be
-  allowed); Gemini transcription carries no usage on its native path (L144).
+- Pricing: Gemini transcription carries no usage on its native path, so it costs 0 (L144).
 - Large requests: completions to other formats and Titan embeddings buffer; Bedrock Messages
   streams are replayed (L136, L146).
 - A2A gRPC: no TLS (as Bifrost), no ErrorInfo details, GRPC-only upstream agents are not dialed

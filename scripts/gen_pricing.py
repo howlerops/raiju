@@ -5,7 +5,7 @@ Usage: scripts/gen_pricing.py DATASHEET.json
        scripts/gen_pricing.py --merge PRICES.json
 
 The datasheet is a JSON object keyed by model name (https://getbifrost.ai/datasheet).
-Each entry with a token price becomes one line of a compact table:
+Each entry with a token price, a rate per second or a rate per character becomes one line of a compact table:
 
     key  provider  input  output  cacheRead  cacheWrite  baseModel  [inputAudio  outputAudio  perSecond  inputCharacter]
 
@@ -215,7 +215,8 @@ def generate(src):
         inp = entry.get("input_cost_per_token")
         out = entry.get("output_cost_per_token")
         sec = entry.get("input_cost_per_second")
-        if inp is None and out is None and sec is None:
+        # a speech model can carry only a rate per character
+        if inp is None and out is None and sec is None and entry.get("input_cost_per_character") is None:
             continue
         text(key, key)
         row = (
