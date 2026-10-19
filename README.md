@@ -87,6 +87,19 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   (`exporters`), next to the S3/GCS object exports.
 - **Routing:** session affinity (`x-bf-session-id`, `session_affinity`) and a
   complexity router (`complexity_tier` in routing rules, tiers behind model `auto`).
+- **Crew routing** (Raiju-only; [docs/crew-routing.md](docs/crew-routing.md)): task-level routing of
+  agent crews after S. K. Radha's *Pareto Crewing*. Model `crew/<pool>` with `x-raiju-task-id` and
+  `x-raiju-crew-role`: the first call of a task picks a model per role (worker, planner, checker ...)
+  by maximising quality − λ·cost for the task's class, with route-aware costs (API price, free local
+  models, subscriptions free until their quota runs low), λ at the frontier's knee, fixed or paced to a
+  per-task budget. `/api/crews` assigns and inspects tasks, takes outcomes (credibility-weighted
+  learning) and decides escalation after a verifier signal (Pandora's index). Priors and the task
+  classifier are fitted offline by `scripts/crew_priors.py`; the admin UI has a Crews tab.
+- **A2A agent gateway:** agents behind `/agents/a2a/{name}` over JSON-RPC, REST and gRPC
+  (`server.a2a_grpc_port`, `server.a2a_grpc_base_domain`; HTTP/2 cleartext served by Raiju itself),
+  with push notifications relayed and shared across the cluster.
+- **Large payloads** (`large_payload_optimization`): request bodies over the threshold stream to the
+  provider, converted on the fly when its format differs (chat, Responses, Messages, embeddings).
 - **Providers:** OpenAI, Azure OpenAI, Anthropic, Gemini, Vertex AI, Cohere, Bedrock (SigV4 or API key), IBM watsonx,
   Hugging Face, NVIDIA, SambaNova, DeepInfra, Novita, Hyperbolic, Lambda, Moonshot, Zhipu, Qwen (DashScope),
   AI21, Upstage, Baseten, Featherless, Inception, Friendli, SiliconFlow, GitHub Models,
@@ -101,7 +114,9 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   header forwarding.
 - **Governance:** virtual keys (`x-bf-vk`, Bearer, `x-api-key`, `x-goog-api-key`,
   `api-key`), provider/model allowlists, budgets and rate limits across the
-  customer → team → key hierarchy, cost tracking with a price table and overrides.
+  customer → team → key hierarchy, cost tracking with a price table and overrides (the built-in
+  table is generated from the Bifrost datasheet by `scripts/gen_pricing.py`; audio is billed by
+  tokens, seconds or characters as Bifrost bills it).
 - **Caching:** exact-match response cache (`x-bf-cache-key`, `x-bf-cache-ttl`,
   `x-bf-cache-no-store`); auto prompt caching for Anthropic and Bedrock
   (`prompt_cache.auto_inject`, `x-bf-prompt-cache-auto-inject`).
@@ -162,8 +177,7 @@ worker starts its own stdio MCP servers.
 - Open items, and the partial parts of each feature: [SCOPE.md](SCOPE.md) and the
   "Remaining gaps" section of [docs/parity.md](docs/parity.md).
 - Out of scope ([SCOPE.md](SCOPE.md), Out table): videos and containers, the edge device
-  agent, SCIM, MCP code mode, media providers (Runware included), Warp, the skills
-  marketplace, A2A agents, and Sidekiq.
+  agent, media providers (Runware included), Warp, the skills marketplace, and Sidekiq.
 - See [LEDGER.md](LEDGER.md) for the history.
 
 ## Performance
@@ -202,7 +216,7 @@ measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
 make check   # tov check --json on every file, applying "safe" fixes
 make tov     # Tov with the patches in tov-patches/
 make tov-test # the patches' own tests
-make unit    # tov test
+make unit    # tov test, plus the Python tests (pricing, HTTP/2 and gRPC interop, crew priors)
 make e2e     # gateway against a mock upstream, on both servers
 make openapi-check # docs/openapi/management.yaml against a probe gateway
 make parity-count  # recount docs/parity.md and refresh its Summary table

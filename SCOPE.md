@@ -78,7 +78,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | LiteLLM / LangChain routes | done |
 | Alerting | done (webhook, Slack, Teams, PagerDuty; metric rules and Bifrost CEL rules, /api/alerting) |
 | Audit logs | partial: hash-chained, HMAC-signed, verify, export, retention and archive to object storage; the archive manifest and gzip are open |
-| Clustering | partial: budgets and rate limits gossiped as CRDT counters; static, Kubernetes, DNS, Consul, etcd, mDNS and UDP discovery; etcd lease leader lock; the UDP, mDNS and broker wire formats are Raiju's, so Bifrost nodes cannot join |
+| Clustering | partial: budgets and rate limits gossiped as CRDT counters; a replicated last-writer-wins state channel (MCP credentials, A2A push configs and cards, crew assignments); static, Kubernetes, DNS, Consul, etcd, mDNS and UDP discovery; etcd lease leader lock; the UDP, mDNS and broker wire formats are Raiju's, so Bifrost nodes cannot join |
 | Log exports | partial: S3, MinIO, GCS, BigQuery, Kafka, Pub/Sub and Maxim sinks; Parquet payloads; raw bodies are redacted in redact mode; no logs-only mode |
 | Guardrail integrations | partial: Bedrock Guardrails, Azure Content Safety, Patronus, webhook, Presidio, Azure PII, Model Armor, CrowdStrike and the local engines; streamed output guards on text and Responses streams are open |
 | Access profiles / projects | partial: access profiles with versions, clone, activate, deactivate and propagate; projects with members and split policies; rate-limit splits and profile role binding are open |
@@ -89,7 +89,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Virtual MCPs | partial: `/mcp/{name}`, config and management API; no access-profile or project scoping |
 | Required headers | done (global and per access profile) |
 | MCP agent mode | done |
-| MCP auth | partial: bearer, headers, OAuth client credentials and refresh, authorization-code OAuth, per-user headers and per-user OAuth, temporary tokens; token exchange is not built |
+| MCP auth | partial: bearer, headers, OAuth client credentials and refresh, authorization-code OAuth, per-user headers and per-user OAuth, temporary tokens, token exchange with its admin credential renewed once per cluster (L133, L140, L147); see docs/parity.md for the rest |
 | Gateway as MCP server | partial: POST /mcp; GET /mcp answers one connection event and does not hold the stream open; Raiju is an OAuth authorization server for MCP clients (virtual-key mode) |
 | stdio MCP servers | done (Tov patch 0002, one server per worker) |
 | Exporters | done (Datadog, Splunk HEC, Elasticsearch, HTTP) |
@@ -101,7 +101,8 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Provider passthrough routes | done (OpenAI, Anthropic, Azure, Bedrock agent/guardrail, GenAI, ChatGPT Codex) |
 | Direct keys, raw request/response echo | partial: direct keys and send-back of raw requests and responses are done; `x-bf-store-raw-request-response` is not built |
 | Reasoning parameters | done (Anthropic, Gemini, Bedrock Claude and Nova) |
-| A2A agents (registered agents, agent cards, JSON-RPC tasks) | partial: registrations at /api/agents with cached cards (fetched again on a timer), grants, runtime headers or OAuth, forwarded caller credentials, inspect and push-config management; the gateway at /agents/a2a/{name} serves the card and proxies the JSON-RPC methods (v0.3 and v1 names, tasks/resubscribe) and the REST binding, bridging between them, with push notification configs relayed through the gateway, logged under the agent's name; /agents/a2a lists the agents a key may call; the agent_names log filter works; the gRPC binding, extension URIs and client certificates for the agent's TLS are not built |
+| A2A agents (registered agents, agent cards, JSON-RPC tasks) | partial: registrations at /api/agents with cached cards (fetched again on a timer), grants, runtime headers or OAuth, forwarded caller credentials, inspect and push-config management; the gateway at /agents/a2a/{name} serves the card and proxies the JSON-RPC methods (v0.3 and v1 names, tasks/resubscribe) and the REST binding, bridging between them, with push notification configs relayed through the gateway, logged under the agent's name; /agents/a2a lists the agents a key may call; the agent_names log filter works; the gRPC binding (lf.a2a.v1 over Raiju's own HTTP/2 cleartext server, `server.a2a_grpc_port`), push configs and cards shared across workers and nodes; extension URIs, client certificates for the agent's TLS and calls to GRPC-only agents are not built |
+| Crew routing (Raiju-only, not in Bifrost) | done: task-level multi-model routing of agent crews (`crew/<pool>`, docs/crew-routing.md), offline priors and classifier training, outcomes, credibility learning, budget pacing, escalation, the Crews tab and metrics |
 
 ## Out
 
