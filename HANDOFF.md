@@ -11,20 +11,26 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: wave 14 is on `claude/affectionate-shannon-pjwi5z` (not yet merged to `main`; `main`
-still holds waves 12, 13 and L97 from PR howlerops/raiju#1). Merge or PR that branch first, then
-start new work on a fresh branch from `main`.
+Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR howlerops/raiju#2
+(waves 14 to 17) merged. It carries wave 18 and wave 19 so far; not yet in a PR.
 
 ## Where things stand
 
-- Waves 1 to 17 are merged on the branch above (PR howlerops/raiju#2). Wave 17 (L135 to L141)
-  built the open items left after wave 16. Every ledger row is done or partial with its "Open:"
-  remainder in LEDGER.md.
+- Waves 1 to 17 are on `main`. Wave 18 (L142 to L149) built the open items left after wave 17:
+  the A2A gRPC binding (an h2c server, HPACK and gRPC framing written in Tov on raw sockets, a
+  protobuf codec for lf.a2a.v1, the binding itself), transcription and speech billing, large
+  Responses, Messages and embeddings converted as they stream, a replicated cluster state channel
+  with a file lease (MCP renewals done once per cluster), and A2A push configs and cards shared
+  across workers and nodes. Wave 19 (crew routing, docs/crew-routing.md) is under way: L150 to
+  L152 are in, L153 (gateway wiring) is assigned, L154 and L155 are queued.
 - docs/parity.md counts 565 parity rows: done 377, partial 164, missing 0, out of scope 15,
-  n/a 9, plus 38 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,807 passed (plus 8 Python tests), 0 failed;
-  e2e "all passed" on Bun and http1; `make ui` all passed (309 checks); `make openapi-check` ok;
-  `make web-check` up to date; `tov-patches/tests/run.sh` passed.
+  n/a 9, plus 42 Raiju-only extras. Wave 18 narrowed "Open:" notes; no row changed status.
+- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,896 passed, 0 failed,
+  plus the Python tests (gen_pricing, the h2/gRPC interop suite with grpcio and h2, crew_priors);
+  e2e "all passed" on Bun and http1; `make openapi-check` ok. `make ui` and `make web-check` were
+  last run in wave 17 (no UI change since).
+- Test tools now needed: `pip install grpcio h2 numpy scipy`, and Go with GOTOOLCHAIN=go1.26.9 for
+  the A2A gRPC e2e client (tests/a2a_grpc_client; e2e skips it if go is missing).
 - The Tov runtime carries eight patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
   plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2), 0008
   streamed request bodies. They apply in order only; `make tov` rebuilds the compiler.
@@ -35,8 +41,9 @@ start new work on a fresh branch from `main`.
 - Realtime and live sessions are metered, guarded and billed on every path (WebRTC, WebSocket,
   realtime calls on Raiju's own peer). Set `RAIJU_WEBRTC_BIND` and `RAIJU_WEBRTC_ICE_SERVERS`
   for deployment.
-- The built-in price table's audio and per-second rates are merged from LiteLLM's public price
-  file (`scripts/gen_pricing.py --merge`, L135); its token rates are an older Bifrost datasheet
+- Audio is billed (L144): transcriptions by audio tokens then seconds, speech by characters. The
+  built-in price table's audio, per-second and per-character rates are merged from LiteLLM's public
+  price file (`scripts/gen_pricing.py --merge`, L135, L144); its token rates are an older Bifrost datasheet
   snapshot (388 disagree with LiteLLM). Regenerate with `scripts/gen_pricing.py` from
   https://getbifrost.ai/datasheet (this environment's network policy blocks that host; add it
   under Allowed domains to do it here). Pricing sync at runtime overrides the table.
@@ -45,15 +52,19 @@ start new work on a fresh branch from `main`.
 
 No row is queued; the remainders are the "Open:" notes in LEDGER.md. The larger ones:
 
-- Pricing data: regenerate the token rates from the Bifrost datasheet (above); transcription is
-  not billed by the second; no OpenAI live model is in the table (L135).
-- Large requests: Responses to non-OpenAI providers, Messages to OpenAI/Gemini/Cohere,
-  embeddings and completions to other formats still buffer; Bedrock streams are replayed (L136).
-- A2A: no gRPC binding (needs an HTTP/2 server and a protobuf decoder in Tov); push state is per
-  node; a card fetched by one worker stays on it (L138).
+- Wave 19, crew routing: L153 gateway wiring (assigned), then L154 outcomes, credibility learning,
+  pacing and the sequential layer, then L155 the Crews UI tab and metrics. Briefs for finished rows
+  are the pattern; the design is docs/crew-routing.md.
+- Pricing data: regenerate the token rates from the Bifrost datasheet (above; getbifrost.ai must be
+  allowed); Gemini transcription carries no usage on its native path (L144).
+- Large requests: completions to other formats and Titan embeddings buffer; Bedrock Messages
+  streams are replayed (L136, L146).
+- A2A gRPC: no TLS (as Bifrost), no ErrorInfo details, GRPC-only upstream agents are not dialed
+  (L148).
+- config.json writes are not atomic: Tov's node:fs has no rename (a runtime patch would add it;
+  L147).
 - Plugins: compiled-in plugins stay chat-only on the provider-format routes; embedContent,
   Bedrock rerank, count-tokens and batch routes are not hooked (L139).
-- MCP: token-exchange renewals are not coordinated across workers or nodes (L140).
 - Realtime: transcription sessions and ephemeral ek_ tokens (L137).
 - Streams under block-capable guards arrive after the answer ends (L131, by design).
 - Upstream: the Tov patches and the compiler bugs found could be offered to Tov.
@@ -105,11 +116,11 @@ The open questions from the last handoff are answered:
 
 - **Ports.** Every e2e gateway has a fixed port. Give each worker two free ones and never
   reuse. `tests/e2e.py` refuses to start on a duplicate. Port registry:
-  - used by e2e and the UI tests: 18100–18157, 18159–18161, 18163–18170, 18173–18178, 18180,
-    18181, 18183, 18185, 18187, 18188, 18193
-  - openapi-check: 18190–18199
-  - free for new workers: 18158, 18162, 18171, 18172, 18179, 18182, 18184, 18186, 18189
-    (check with `grep -oE '181[0-9][0-9]' tests/e2e.py tests/ui_e2e.mjs | sort -u` first)
+  - 18100–18189 is full (18171 is the only gap); openapi-check uses 18190–18199
+  - 18200–18259: waves 16 to 19, handed out four per worker (L142 18220–18223 ... L153 18256–18259);
+    a port listed in tests/e2e.py is taken
+  - free for new workers: 18260 and up (check with `grep -oE '18[0-9]{3}' tests/e2e.py
+    tests/ui_e2e.mjs | sort -u` first)
 - **Shared mock.** Background senders (bulk, export, alert hooks, log posts) hit the same mock;
   `background()` in tests/e2e.py filters them. A test that asserts on `/_seen` must filter too.
 - **MCP tool lists change request bodies.** e2e waits for the MCP tools at startup
@@ -149,6 +160,11 @@ The open questions from the last handoff are answered:
 - **Verify a runtime patch with its own compiler.** Build a compiler inside the scratch worktree
   (copy build/tov there and run scripts/build-tov.sh, about 2 minutes incrementally) and run
   every check with it; rebuild the shared compiler only after the merge.
+- **Workers that skip the lock break everyone's e2e.** One worker left 28 gateways and mocks running
+  outside the lock (ppid 1) and every later e2e failed with "Address already in use". Before trusting
+  a red e2e, list orphans: `ps -eo pid,ppid,cmd | awk '$2==1' | grep -E 'build/raiju|_mock'`.
+- **Never run Python from the shared scratchpad.** A worker left a `bisect.py` there, which shadowed
+  the standard library for every script run in that folder.
 - **Workers' cleanup can kill your runs.** A worker's `pkill` matched the lead's e2e gateways and
   cut an http1 run short ("connection refused" mid-run). Rerun before blaming the code; tell
   workers to kill only processes they started.
