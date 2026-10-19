@@ -5534,6 +5534,244 @@ def l147_cluster_e2e(env):
         srv.shutdown()
         srv.server_close()
 
+GW_L144 = "http://127.0.0.1:18228"  # audio billing: speech by its characters, transcriptions by their usage, budgets and the log rows
+
+
+def l144_config() -> dict:
+    """OpenAI's audio through the mock. Two virtual keys: one with room for the whole run, one whose budget the audio spends."""
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l144-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool-l144", "value": "sk-l144", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l144")}],
+            "budgets": [{"id": "b-l144-big", "max_limit": 1.0, "reset_duration": "1d"}, {"id": "b-l144-small", "max_limit": 0.0002, "reset_duration": "1d"}],
+            "virtual_keys": [{"id": "vk-l144-big", "value": "sk-bf-l144-big", "budget_id": "b-l144-big"}, {"id": "vk-l144-small", "value": "sk-bf-l144-small", "budget_id": "b-l144-small"}],
+        },
+    }
+
+
+def l144_e2e(env):
+    """Audio is billed as Bifrost bills it: speech by its input characters, a transcription by the usage its answer
+    reports (seconds, tokens with the audio split, a streamed answer's last event) or else the verbose answer's duration.
+    Each answer is a log row with its cost, charged to its key's budget, and a key whose budget the audio has spent is
+    refused. Its own gateway, started and stopped here."""
+    cfg_path = os.path.join(BUILD, "e2e.l144.json")
+    json.dump(l144_config(), open(cfg_path, "w"))
+    # the log store persists across runs; this run's rows are the only ones it counts
+    import shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l144-logs"), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18228", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l144.log"), "w"))
+    big = {"authorization": "Bearer sk-bf-l144-big"}
+    small = {"authorization": "Bearer sk-bf-l144-small"}
+    adm_h = {"authorization": "Bearer sk-admin-l144"}
+    speech_body = {"model": "openai/tts-1", "input": "say ping", "voice": "alloy"}
+
+    def rows_of(vk, op, model=None):
+        s, _, b = call("GET", "/api/logs", None, adm_h, base=GW_L144, auth=False)
+        rows = json.loads(b).get("logs", []) if s == 200 else []
+        # the list repeats a row (one copy per page of the store), so each id counts once
+        out, ids = [], set()
+        for x in rows:
+            if x.get("virtual_key_id") != vk or x.get("object") != op or (model is not None and x.get("model") != model) or x.get("id") in ids:
+                continue
+            ids.add(x.get("id"))
+            out.append(x)
+        return out
+
+    def stt(fields, headers, path="/v1/audio/transcriptions"):
+        parts = [("model", None, "text/plain", fields.get("model", "openai/whisper-1"))]
+        for k, v in fields.items():
+            if k != "model":
+                parts.append((k, None, "text/plain", v))
+        parts.append(("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt "))
+        return mp_form(GW_L144, path, parts, headers)
+
+    try:
+        wait(GW_L144 + "/health")
+        # speech: 8 characters at the tts-1 character rate, and the audio comes back unchanged
+        s, _, audio = call_bytes("POST", "/v1/audio/speech", speech_body, big, base=GW_L144)
+        check("speech is answered with the audio, unchanged", s == 200 and audio == bytes([0x49, 0x44, 0x33, 0xff, 0xfb, 0x90, 0x00, 0x80, 0xc3, 0x28]), (s, audio[:20]))
+        sp = rows_of("vk-l144-big", "speech")
+        check("speech is logged with its cost: 8 characters at the tts-1 character rate", len(sp) == 1 and sp[0].get("provider") == "openai" and sp[0].get("model") == "tts-1" and near(float(sp[0].get("cost") or 0), 8 * 0.000015), sp[:1])
+
+        # whisper-1 reports seconds: 12.5 s at the whisper rate per second (0.0001 USD)
+        s, _, b = stt({"model": "openai/whisper-1"}, big)
+        check("a transcription with a duration usage is answered", s == 200 and "transcribed by whisper-1" in b, (s, b[:200]))
+        # verbose_json reports no usage, only its duration: the fallback seconds, 7.5 s
+        s, _, b = stt({"model": "openai/whisper-1", "response_format": "verbose_json"}, big)
+        check("a verbose transcription with no usage bills its own duration", s == 200 and "transcribed by whisper-1" in b, (s, b[:200]))
+        # gpt-4o-transcribe reports tokens: 10 audio and 4 text tokens of the prompt, 6 output tokens
+        s, _, b = stt({"model": "openai/gpt-4o-transcribe"}, big)
+        check("a transcription with a token usage is answered", s == 200 and "transcribed by gpt-4o-transcribe" in b, (s, b[:200]))
+        # streamed: the usage is on the last event (3 prompt and 1 output tokens), and the events come back as they were
+        s, _, b = stt({"model": "openai/gpt-4o-transcribe", "stream": "true"}, big)
+        check("a streamed transcription comes back as its events", s == 200 and "transcript.text.done" in b and "data: [DONE]" in b, (s, b[:200]))
+        s, _, b = stt({"model": "openai/whisper-1"}, big, path="/v1/audio/translations")
+        check("a translation is billed the same way", s == 200 and "transcribed by whisper-1" in b, (s, b[:200]))
+
+        tr = rows_of("vk-l144-big", "transcription")
+        check("each transcription and translation is one log row", len(tr) == 5, [x.get("model") for x in tr])
+        costs = sorted(round(float(x.get("cost") or 0), 9) for x in tr)
+        want = sorted(round(c, 9) for c in [12.5 * 0.0001, 7.5 * 0.0001, 10 * 0.0000025 + 4 * 0.0000025 + 6 * 0.00001, 3 * 0.0000025 + 1 * 0.00001, 12.5 * 0.0001])
+        check("their costs: the seconds at the whisper rate, the tokens at the gpt-4o-transcribe rates", costs == want, (costs, want))
+        tok_rows = [x for x in tr if x.get("model") == "gpt-4o-transcribe"]
+        check("a token usage is logged with its prompt and output tokens, the streamed one too", sorted((x.get("prompt_tokens"), x.get("completion_tokens")) for x in tok_rows) == [(3, 1), (14, 6)], [(x.get("prompt_tokens"), x.get("completion_tokens")) for x in tok_rows])
+        check("a duration usage is logged with no tokens", all((x.get("prompt_tokens") or 0) == 0 for x in tr if x.get("model") == "whisper-1"), [x.get("prompt_tokens") for x in tr if x.get("model") == "whisper-1"])
+        s, _, m = call("GET", "/metrics", None, None, base=GW_L144, auth=False)
+        check("the metrics count the speech cost by model", s == 200 and any(x.startswith("bifrost_cost_total{") and 'model="tts-1"' in x for x in m.splitlines()), s)
+
+        # the small key's budget (0.0002 USD): the speech fits, the whisper answer is admitted and charged, and then nothing does
+        s1, _, _ = call_bytes("POST", "/v1/audio/speech", speech_body, small, base=GW_L144)
+        s2, _, b2 = stt({"model": "openai/whisper-1"}, small)
+        s3, _, b3 = call("POST", "/v1/audio/speech", speech_body, small, base=GW_L144, auth=False)
+        s4, _, b4 = stt({"model": "openai/whisper-1"}, small)
+        check("a key's budget admits the audio until it is spent, then refuses speech and transcription", s1 == 200 and s2 == 200 and s3 == 402 and "budget" in b3 and s4 == 402 and "budget" in b4, (s1, s2, s3, s4, b3[:200]))
+        sm = rows_of("vk-l144-small", "transcription")
+        check("the audio that was admitted is charged to the key's budget and logged", len(sm) == 1 and near(float(sm[0].get("cost") or 0), 12.5 * 0.0001), [x.get("cost") for x in sm])
+    finally:
+        gw.terminate()
+
+
+GW_L149_A = "http://127.0.0.1:18248"  # two cluster nodes, each with its own logs folder: push configs and the relay across them
+GW_L149_B = "http://127.0.0.1:18249"
+GW_L149_W = "http://127.0.0.1:18250"  # two workers of one node: the card fetched once, served by both, fetched once per period
+L149_ADMIN = {"authorization": "Bearer sk-admin-l149"}
+L149_KEY = {"x-bf-vk": "sk-bf-l149"}
+
+def l149_config(tag, card, node=None, peer=None, period=0):
+    """The L149 gateway: the mock's v1 agent registered as "w" (with its card, or none), a virtual key, an admin, and a logs
+    folder of its own. With node and peer it is a cluster member; the members share encryption_key, so the callback
+    secrets sealed on one open on the other."""
+    import hashlib
+    agent = {"name": "w", "agent_card_url": MOCK + "/a2a/v1/.well-known/agent-card.json", "allow_private_network": True, "allow_by_default": True}
+    if card is not None:
+        agent["card"] = card
+        agent["card_fetched_at"] = int(time.time() * 1000)
+    cfg = {
+        "encryption_key": "an e2e passphrase of some length",
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "a2a_card_refresh_seconds": period},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l149-logs-" + tag)},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"a2a_allow_private_push_callbacks": True},
+        "providers": {"openai": {"keys": [{"name": "l149", "value": "sk-l149", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l149".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-l149", "value": "sk-bf-l149"}],
+        },
+        "agents": [agent],
+    }
+    if node is not None:
+        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l149", "interval_ms": 200, "peers": [peer]}
+    return cfg
+
+def l149_cluster_e2e(env):
+    """L149: push configs are cluster-wide. A callback registered through node A is listed and answered by node B; an
+    agent's push that lands on node B's ingress is relayed to the caller's callback once, with the caller's own token
+    (sealed on the cluster state, opened by B); a config deleted on A is gone on B. Nodes 18248 and 18249."""
+    import shutil
+    from urllib.parse import urlparse
+    card = call("GET", "/a2a/v1/.well-known/agent-card.json", base=MOCK)[2]
+    for tag in ["a", "b"]:
+        shutil.rmtree(os.path.join(BUILD, "e2e-l149-logs-" + tag), ignore_errors=True)
+    pa = os.path.join(BUILD, "e2e.l149a.json")
+    pb = os.path.join(BUILD, "e2e.l149b.json")
+    json.dump(l149_config("a", card, "l149-a", GW_L149_B), open(pa, "w"))
+    json.dump(l149_config("b", card, "l149-b", GW_L149_A), open(pb, "w"))
+    call("GET", "/_a2a/reset", base=MOCK)
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    ga = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18248", "-host", "127.0.0.1", "-config", pa, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l149a.log"), "w"))
+    gb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18249", "-host", "127.0.0.1", "-config", pb, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l149b.log"), "w"))
+    cb = MOCK + "/cb/push"
+    def rpc(base, method, params):
+        return call("POST", "/agents/a2a/w/json-rpc", {"jsonrpc": "2.0", "id": "7", "method": method, "params": params}, L149_KEY, base=base, auth=False)
+    def listed(base):
+        s, _, b = call("GET", "/api/agents/push-configs?limit=100", base=base, headers=L149_ADMIN, auth=False)
+        return json.loads(b).get("total_count") if s == 200 else -1
+    def delivered(task):
+        return [c for c in json.loads(call("GET", "/_a2a/cb-seen", base=MOCK)[2]) if not c["failed"] and task in c["request"]["body"]]
+    try:
+        wait(GW_L149_A + "/health")
+        wait(GW_L149_B + "/health")
+        # the nodes hear from each other before the registration is made
+        time.sleep(3.0)
+        s, _, b = rpc(GW_L149_A, "SendMessage", {"message": {"messageId": "m-l149-1", "role": "ROLE_USER", "contextId": "l149-1", "parts": [{"text": "hi"}]}})
+        task = json.loads(b)["result"]["task"]["id"] if s == 200 and "task" in b else ""
+        check("node A makes a task for the send", task != "", (s, b[:200]))
+        s, _, b = rpc(GW_L149_A, "CreateTaskPushNotificationConfig", {"taskId": task, "id": "c1", "url": cb, "token": "cb-token-l149"})
+        check("node A registers the callback", s == 200 and json.loads(b).get("result", {}).get("id") == "c1", (s, b[:200]))
+        check("node B lists the registration made on node A", l147_until(lambda: listed(GW_L149_B) == 1, 15), listed(GW_L149_B))
+        s, _, b = rpc(GW_L149_B, "GetTaskPushNotificationConfig", {"taskId": task, "id": "c1"})
+        check("node B answers the get of it, with the callback URL", s == 200 and json.loads(b).get("result", {}).get("url") == cb, (s, b[:200]))
+        pushes = [p for p in json.loads(call("GET", "/_a2a/pushes", base=MOCK)[2]) if p["taskId"] == task]
+        check("the agent was given node A's ingress and a token of its own", len(pushes) == 1 and pushes[0]["url"].startswith(GW_L149_A + "/agents/a2a/w/push/callback") and pushes[0]["token"] != "", pushes)
+        # the agent pushes to node B's ingress (the URL names node A; the token is the one the agent holds)
+        ingress_b = GW_L149_B + urlparse(pushes[0]["url"]).path
+        body = json.dumps({"task": {"id": task, "contextId": "l149-1", "status": {"state": "TASK_STATE_COMPLETED"}}})
+        s, _, b = call("POST", urlparse(ingress_b).path, body, {"a2a-notification-token": pushes[0]["token"], "content-type": "application/a2a+json"}, base=GW_L149_B, auth=False)
+        check("node B takes the agent's push at its own ingress", s == 202, (s, b[:200]))
+        check("the push reaches the caller's callback", l147_until(lambda: len(delivered(task)) >= 1, 15), len(delivered(task)))
+        time.sleep(3.0)
+        got = delivered(task)
+        check("the push reaches the caller's callback once", len(got) == 1, len(got))
+        check("the callback carries the caller's own token, opened by node B", got and got[0]["request"]["headers"].get("a2a-notification-token") == "cb-token-l149", got[:1])
+        s, _, b = call("DELETE", f"/api/agents/push-configs/w/{task}/c1", base=GW_L149_A, headers=L149_ADMIN, auth=False)
+        check("node A deletes the registration", s == 204, (s, b[:200]))
+        check("node B no longer lists it", l147_until(lambda: listed(GW_L149_B) == 0, 15), listed(GW_L149_B))
+        check("node A does not list it either", listed(GW_L149_A) == 0, listed(GW_L149_A))
+    finally:
+        for p in [ga, gb]:
+            p.terminate()
+            p.wait()
+
+def l149_workers_e2e(env):
+    """L149: with two workers of one node, a card fetched once (through one worker) is served by every worker, with no 503
+    (it is shared on the cluster state), and the mock agent sees one card fetch per refresh period (three seconds here), not
+    one per worker. The gateway is 18250 with RAIJU_WORKERS=2; the card timer runs in both."""
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+    logs = os.path.join(BUILD, "e2e-l149-logs-w")
+    shutil.rmtree(logs, ignore_errors=True)
+    cfg_path = os.path.join(BUILD, "e2e.l149w.json")
+    json.dump(l149_config("w", None, period=3), open(cfg_path, "w"))
+    call("GET", "/_a2a/reset", base=MOCK)
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18250", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env={**env, "RAIJU_WORKERS": "2"}, stderr=open(os.path.join(BUILD, "e2e.l149w.log"), "w"))
+    def card_codes(n):
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            return list(ex.map(lambda _: call("GET", "/agents/a2a/w/.well-known/agent-card.json", None, L149_KEY, base=GW_L149_W, auth=False)[0], range(n)))
+    def card_fetches():
+        seen = json.loads(call("GET", "/_a2a/seen", base=MOCK)[2])
+        return len([x for x in seen if x["path"] == "/a2a/v1/.well-known/agent-card.json"])
+    try:
+        wait(GW_L149_W + "/health")
+        codes = card_codes(8)
+        check("before any fetch every worker answers 503 for the card", all(c == 503 for c in codes), codes)
+        s, _, b = call("POST", "/api/agents/w/refresh-card", {}, L149_ADMIN, base=GW_L149_W, auth=False)
+        check("the card is fetched through one worker", s == 200 and json.loads(b)["card"]["name"] == "v1-agent", (s, b[:200]))
+        served = []
+        for _ in range(40):
+            served = card_codes(8)
+            if all(c == 200 for c in served):
+                break
+            time.sleep(0.25)
+        check("after the fetch every worker serves the card, no 503", all(c == 200 for c in served), served)
+        call("GET", "/_a2a/reset", base=MOCK)
+        time.sleep(10.0)
+        n = card_fetches()
+        check("the mock agent sees about one card fetch per refresh period, not one per worker", 2 <= n <= 5, n)
+        served = card_codes(8)
+        check("the workers still serve the card after the timer's fetches", all(c == 200 for c in served), served)
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -7630,7 +7868,7 @@ def l129_e2e(env):
         s, _, b = l124_http(port, "POST", "/v1/responses", l129_json("anthropic/claude-3-5-sonnet-20241022", 9 * 1048576))
         check("... and a converted one is not held, so it is not stopped by client.max_request_body_size_mb (L145)", s == 200, (s, b[:200]))
         s, _, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-4o-mini", 9 * 1048576))
-        check("... on the Messages route too", s == 413, (s, b[:200]))
+        check("... on the Messages route too, the body is converted as it streams in: the 9 MiB request is served (L146)", s == 200 and json.loads(b).get("type") == "message", (s, b[:200]))
         s, _, b = l124_http(port, "POST", "/v1/responses", l129_json("openai/resp-x", 4096) + b" ", headers={"content-length": str(200 * 1048576)})
         check("a declared length over max_payload_bytes is refused with a 413 on the Responses route", s == 413 and "maximum payload" in b.decode(), (s, b[:200]))
 
@@ -7641,7 +7879,7 @@ def l129_e2e(env):
         s, hs, b = l124_http(port, "POST", "/v1/audio/transcriptions", form, headers=fh)
         got = mine("/v1/audio/transcriptions")
         check("a 6 MiB transcription upload reaches OpenAI intact, with the model renamed", s == 200 and b"transcribed by whisper-1" in b and got and got[-1]["size"] == len(want) and got[-1]["sha"] == sha(want), (s, b[:200], got[-1]["size"] if got else None, len(want)))
-        check("the provider's own answer comes back as it is (usage included)", s == 200 and json.loads(b)["usage"]["input_tokens"] == 14, b[:200])
+        check("the provider's own answer comes back as it is (usage included)", s == 200 and json.loads(b)["usage"]["seconds"] == 12.5, b[:200])
         pieces = [form[i:i + 100000] for i in range(0, len(form), 100000)]
         s, _, b = l124_http(port, "POST", "/v1/audio/transcriptions", pieces, chunked=True, headers=fh)
         got = mine("/v1/audio/transcriptions")
@@ -8139,6 +8377,139 @@ def l145_e2e(env):
         gw145b.terminate()
         gw145b.wait()
 
+
+GW_L146 = "http://127.0.0.1:18236"  # large Messages to OpenAI-format, Gemini and Cohere, and large embeddings to Gemini: converted as they stream
+GW_L146B = "http://127.0.0.1:18237"  # the same with client.max_request_body_size_mb 1: what is held is bounded by it
+
+def l146_e2e(env):
+    """large_payload_optimization for Messages to OpenAI-format, Gemini and Cohere providers, and for embeddings to Gemini (L146): a
+    40 MiB Messages request becomes a chat body (Gemini's and Cohere's bodies for those) while it streams in, its answer comes back in
+    Messages format, and a 40 MiB embeddings request becomes one batchEmbedContents body. Bodies arrive intact by content hash, with
+    no memory growth in the gateway. Its own gateways (18236, and 18237 with a 1 MiB hold limit)."""
+    import hashlib, shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l146-logs"), ignore_errors=True)
+    providers = {
+        "openai": {"keys": [{"name": "o", "value": "sk-" + "l146", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "gemini": {"keys": [{"name": "g", "value": "g-" + "l146", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "cohere": {"keys": [{"name": "c", "value": "co-" + "l146", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+    }
+    lp = {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "max_request_body_size_mb": 64},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l146-logs"), "content_logging": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": lp,
+        "governance": {
+            "budgets": [{"id": "b-l146", "max_limit": 100, "reset_duration": "1d"}],
+            "pricing_overrides": [{"id": "po-l146", "name": "l146", "scope_kind": "global", "match_type": "wildcard", "pattern": "*", "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}],
+            "virtual_keys": [{"id": "vk-l146", "value": "sk-bf-l146-budget-0123456789", "budget_id": "b-l146"}],
+        },
+        "providers": providers,
+    }
+    path = os.path.join(BUILD, "e2e.l146.json")
+    json.dump(cfg, open(path, "w"))
+    cfg_b = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 1},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": lp,
+        "providers": {"openai": providers["openai"]},
+    }
+    path_b = os.path.join(BUILD, "e2e.l146b.json")
+    json.dump(cfg_b, open(path_b, "w"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18236", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l146.log"), "w"))
+    gwb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18237", "-host", "127.0.0.1", "-config", path_b, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l146b.log"), "w"))
+    port = 18236
+    try:
+        wait(GW_L146 + "/health")
+        wait(GW_L146B + "/health")
+        mine = lambda p_: [x for x in seen() if x["path"] == p_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L146, auth=False)[2])["budgets"]}
+        logs = lambda: json.loads(call("GET", "/api/logs?limit=500", base=GW_L146, auth=False)[2])["entries"]
+        MB = 1048576
+        FILL = lambda n, c="F": c * n
+
+        def msg(model, n, stream=False):
+            st = ',"stream":true' if stream else ""
+            return ('{"model":"%s","max_tokens":16%s,"messages":[{"role":"user","content":"%s"}]}' % (model, st, FILL(n))).encode()
+        # what each provider should receive (the converted body, whole)
+        def chat_want(model, n, stream=False):
+            st = ',"stream":true,"stream_options":{"include_usage":true}' if stream else ""
+            return ('{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":16%s}' % (model, FILL(n), st)).encode()
+        def gemini_want(n):
+            return ('{"contents":[{"role":"user","parts":[{"text":"%s"}]}],"generationConfig":{"maxOutputTokens":16}}' % FILL(n)).encode()
+        def cohere_want(model, n):
+            return ('{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":16}' % (model, FILL(n))).encode()
+
+        hwm0 = l124_vm(gw.pid, "VmHWM")
+        # ---- a 40 MiB Messages request to an OpenAI-format provider: a chat body as it streams in; the answer in Messages format ----
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-l146", 40 * MB), timeout=180)
+        got = mine("/v1/chat/completions")
+        row = got[-1] if got else {}
+        want = chat_want("gpt-l146", 40 * MB)
+        check("a 40 MiB Messages request to an OpenAI-format provider arrives as a chat body, intact by content hash", s == 200 and row.get("size") == len(want) and row.get("sha") == sha(want), (s, b[:200], row.get("size"), len(want)))
+        check("... and its answer comes back as a Messages answer", s == 200 and b'"type":"message"' in b and b'"stop_reason"' in b, (s, b[:200]))
+
+        # ---- the same to Gemini, and as a stream: Gemini's body, the answer as Messages events ----
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("gemini/gemini-l146", 40 * MB), timeout=180)
+        row = mine("/v1beta/models/gemini-l146:generateContent")[-1]
+        check("a 40 MiB Messages request to Gemini arrives as a Gemini body, intact by content hash", s == 200 and row["sha"] == sha(gemini_want(40 * MB)), (s, b[:200], row["size"]))
+        check("... and its answer comes back as a Messages answer", s == 200 and b'"text":"Hi from gemini"' in b, (s, b[:200]))
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("gemini/gemini-l146", 40 * MB, stream=True), timeout=180)
+        t = b.decode("utf8", "replace")
+        row = mine("/v1beta/models/gemini-l146:streamGenerateContent")[-1]
+        check("a 40 MiB streamed Messages request to Gemini: the stream is called with the Gemini body, and the answer is Messages events", s == 200 and row["sha"] == sha(gemini_want(40 * MB)) and hdr(hs, "content-type") == "text/event-stream" and "event: message_start" in t and "event: message_stop" in t and "".join(json.loads(l[6:]).get("delta", {}).get("text", "") for l in t.split("\n") if l.startswith("data: {") and "text_delta" in l) == "Hi from gemini", (s, hs, t[:300], row["size"]))
+
+        # ---- the same to Cohere ----
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("cohere/command-l146", 40 * MB), timeout=180)
+        row = mine("/v2/chat")[-1]
+        check("a 40 MiB Messages request to Cohere arrives as a Cohere body, intact by content hash", s == 200 and row["sha"] == sha(cohere_want("command-l146", 40 * MB)), (s, b[:200], row["size"]))
+        check("... and its answer comes back as a Messages answer", s == 200 and b'"text":"Hi from cohere"' in b, (s, b[:200]))
+        hwm1 = l124_vm(gw.pid, "VmHWM")
+        check("the gateway's peak memory grew by under 24 MiB across the 40 MiB Messages requests (%d to %d MiB)" % (hwm0, hwm1), hwm1 - hwm0 < 24, (hwm0, hwm1))
+
+        # ---- a 40 MiB embeddings request to Gemini: one batchEmbedContents body, one entry per input ----
+        half = 20 * MB
+        emb = ('{"dimensions":8,"model":"gemini/text-embedding-l146","input":["%s","%s"]}' % (FILL(half, "A"), FILL(half, "B"))).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", emb, timeout=180)
+        row = mine("/v1beta/models/text-embedding-l146:batchEmbedContents")[-1]
+        emb_want = ('{"requests":[{"model":"models/text-embedding-l146","content":{"parts":[{"text":"%s"}]},"outputDimensionality":8},{"model":"models/text-embedding-l146","content":{"parts":[{"text":"%s"}]},"outputDimensionality":8}]}' % (FILL(half, "A"), FILL(half, "B"))).encode()
+        check("a 40 MiB embeddings request to Gemini arrives as one batch body, intact by content hash", s == 200 and row["sha"] == sha(emb_want), (s, b[:200], row["size"], len(emb_want)))
+        check("... and its answer is the embeddings list, one vector per input", s == 200 and b'"object":"list"' in b and b.count(b'"embedding":') == 2, (s, b[:200]))
+        hwm2 = l124_vm(gw.pid, "VmHWM")
+        check("the gateway's peak memory grew by under 24 MiB across the embeddings request (%d to %d MiB)" % (hwm1, hwm2), hwm2 - hwm1 < 24, (hwm1, hwm2))
+        # the output size goes first, as Gemini takes it per input: dimensions before input
+        small = ('{"dimensions":8,"model":"gemini/text-embedding-l146","input":["%s"]}' % FILL(300000)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", small, timeout=120)
+        row = mine("/v1beta/models/text-embedding-l146:batchEmbedContents")[-1]
+        dim_want = ('{"requests":[{"model":"models/text-embedding-l146","content":{"parts":[{"text":"%s"}]},"outputDimensionality":8}]}' % FILL(300000)).encode()
+        check("an embeddings request with dimensions before its input carries them on each input", s == 200 and row["sha"] == sha(dim_want), (s, b[:200], row["size"]))
+        late = ('{"model":"gemini/text-embedding-l146","input":["%s"],"dimensions":8}' % FILL(300000)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", late, timeout=120)
+        row = mine("/v1beta/models/text-embedding-l146:batchEmbedContents")[-1]
+        check("... and dimensions after the input are held and written on each input, the same body", s == 200 and row["sha"] == sha(dim_want), (s, b[:200], row["size"]))
+
+        # ---- usage: a converted Messages request is charged to its key's budget and logged with its tokens and cost ----
+        vk = "sk-bf-l146-budget-0123456789"
+        u0 = used()["b-l146"]
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-l146", 1 * MB), headers={"x-bf-vk": vk}, timeout=120)
+        u1 = used()["b-l146"]
+        check("a converted Messages request is charged to its key's budget (3 + 4 tokens at 1e-6 each)", s == 200 and abs((u1 - u0) - 7e-6) < 1e-9, (s, b[:100], u0, u1))
+        time.sleep(0.5)
+        rows = [e for e in logs() if e.get("model") == "openai/gpt-l146" and e.get("prompt_tokens") == 3 and e.get("completion_tokens") == 4]
+        check("... and its log row carries the tokens and the cost", len(rows) >= 1 and any(abs((e.get("cost") or 0) - 7e-6) < 1e-9 for e in rows), [(e.get("prompt_tokens"), e.get("completion_tokens"), e.get("cost")) for e in rows[:3]])
+
+        # ---- the hold limit on the second gateway: a system prompt that is an array is held whole, a user message is not ----
+        portb = 18237
+        big_sys = ('{"model":"openai/gpt-l146","max_tokens":16,"system":[{"type":"text","text":"%s"}],"messages":[{"role":"user","content":"hi"}]}' % FILL(3 * MB)).encode()
+        s, hs, b = l124_http(portb, "POST", "/anthropic/v1/messages", big_sys)
+        check("a system prompt array over the hold limit is refused with a 400 that says so", s == 400 and "too large to convert while streaming" in b.decode(), (s, b[:300]))
+        s, hs, b = l124_http(portb, "POST", "/anthropic/v1/messages", msg("openai/gpt-l146", 3 * MB), timeout=120)
+        check("... while a user message of the same size streams through", s == 200 and b'"type":"message"' in b, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gwb.terminate()
 
 def main():
     unique_ports()
@@ -10437,6 +10808,12 @@ def main():
         # L147: the token_exchange admin credential renewed once across two workers, and once across two cluster nodes (sealed through the cluster state)
         l147_workers_e2e(env)
         l147_cluster_e2e(env)
+        # audio billing: speech by its characters, transcriptions and translations by their usage, the log rows and the budgets: their own gateway
+        l144_e2e(env)
+        # L149: push configs shared across the cluster (a callback registered on one node is answered and relayed by another), and
+        # a card fetched by one worker served by both, fetched once per period: their own gateways
+        l149_cluster_e2e(env)
+        l149_workers_e2e(env)
         # WebAssembly plugins (a .wasm path in plugins[]): rewrites, short circuits, traps, limits and the plugin API: their own gateway
         l121_e2e(env)
         # the plugin chain as Bifrost runs it: HTTP transport hooks, the LLM hooks on every request type and on streams, has_error: their own gateway
@@ -10455,6 +10832,8 @@ def main():
         l136_e2e(env)
         # large_payload_optimization for Responses requests to providers whose format differs: converted as they stream: their own gateways
         l145_e2e(env)
+        # large_payload_optimization for Messages to OpenAI-format, Gemini and Cohere, and embeddings to Gemini (L146): their own gateways
+        l146_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

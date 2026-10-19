@@ -13,18 +13,21 @@ import * as openai from "./providers/openai"
 import * as providers from "./providers/index"
 import { ChatConv, MessagesConv, ConvOpts, TailFn, F_ANTHROPIC, F_VERTEX_CLAUDE, F_GEMINI, F_CONVERSE, F_COHERE } from "./streamconv"
 import { RespConv, respCorpus, streamedChat, canonJson } from "./respconv"
+import { MsgToChat, MsgChain } from "./msgconv"
+import { EmbConv, EMB_GEMINI, EMB_VERTEX, EMB_COHERE, EMB_BEDROCK } from "./embconv"
 import { bytesOf, textOfBytes, ByteOut } from "./jsonstream"
 import { LargeBody } from "./largepayload"
 import { Sha256, sha256, toHex } from "./crypto"
 import { newId } from "./schemas"
 import { readFileBytesSync, appendFileSync, mkdirSync, rmSync, unlinkSync, readdirSync, statSync, existsSync } from "node:fs"
 
-// A converter for one request: a chat body to the provider's format, or a Messages body to Bedrock/Vertex Claude. A
-// Responses request is converted to chat first (respconv.tov), and the chat body goes through the chat converter.
+// A converter for one request: a chat body to the provider's format, a Messages body to Bedrock/Vertex Claude, a
+// Messages body to chat (possibly chained to a chat converter), or an embeddings body to the provider's batch format.
+// A Responses request is converted to chat first (respconv.tov), and the chat body goes through the chat converter.
 export class AnyConv {
   resp: RespConv | undefined = undefined
 
-  constructor(readonly chat: ChatConv | undefined, readonly msgs: MessagesConv | undefined) {}
+  constructor(readonly chat: ChatConv | undefined, readonly msgs: MessagesConv | undefined, readonly mchain: MsgChain | undefined, readonly emb: EmbConv | undefined) {}
 
   // the chat or Messages converter's output for a chunk of its input (the chunk itself when there is none)
   private through(b: u8[]): u8[][] throws SyntaxError {
@@ -32,6 +35,10 @@ export class AnyConv {
     if (c !== undefined) return try c.push(b)
     const m = this.msgs
     if (m !== undefined) return try m.push(b)
+    const mc = this.mchain
+    if (mc !== undefined) return try mc.push(b)
+    const e = this.emb
+    if (e !== undefined) return try e.push(b)
     return [b]
   }
 
@@ -40,6 +47,10 @@ export class AnyConv {
     if (c !== undefined) return try c.finish()
     const m = this.msgs
     if (m !== undefined) return try m.finish()
+    const mc = this.mchain
+    if (mc !== undefined) return try mc.finish()
+    const e = this.emb
+    if (e !== undefined) return try e.finish()
     return []
   }
 
@@ -119,6 +130,18 @@ export function familyFor(route: string, kind: string, model: string, cfg: Provi
     // (a Messages stream from Bedrock comes as binary event frames in Bedrock's own envelope: that path stays buffered)
     if (kind === "bedrock") return stream ? "" : "messages-bedrock"
     if (kind === "vertex" && vertex.isClaude(model)) return "messages-vertex"
+    // the other formats: the Messages body becomes a chat body, which is then the provider's format (Gemini, Cohere)
+    if (kind === "gemini" || (kind === "vertex" && !vertex.isClaude(model))) return "messages-gemini"
+    if (kind === "cohere") return "messages-cohere"
+    if (providers.streamsNatively(kind)) return "messages-chat"
+    return ""
+  }
+  if (route === "embeddings") {
+    // the batch bodies of the providers whose embeddings are not OpenAI's (Titan takes one input per call: buffered)
+    if (kind === "gemini") return EMB_GEMINI
+    if (kind === "vertex") return EMB_VERTEX
+    if (kind === "cohere") return EMB_COHERE
+    if (kind === "bedrock" && model.startsWith("cohere.embed-")) return EMB_BEDROCK
   }
   return ""
 }
@@ -126,7 +149,7 @@ export function familyFor(route: string, kind: string, model: string, cfg: Provi
 // Bedrock signs the payload, so its body is known whole (and hashed) before the request is made.
 export function needsHash(family: string): bool {
   const f = family.startsWith("resp-") ? family.slice(5) : family
-  return f === "converse" || f === "messages-bedrock"
+  return f === "converse" || f === "messages-bedrock" || f === EMB_BEDROCK
 }
 
 // The converter for a family. `autoCache`: the request or the provider asks for prompt cache breakpoints. `wire`: the
@@ -135,12 +158,19 @@ export function newConv(family: string, model: string, cfg: ProviderConfig, auto
   if (family.startsWith("resp-")) {
     // a Responses request, converted to chat as it streams in, then by its chat family's converter (none for OpenAI-format)
     const sub = family.slice(5)
-    const c = sub === "openai" ? new AnyConv(undefined, undefined) : newConv(sub, model, cfg, autoCache, wire, holdMax, strMax)
+    const c = sub === "openai" ? new AnyConv(undefined, undefined, undefined, undefined) : newConv(sub, model, cfg, autoCache, wire, holdMax, strMax)
     c.resp = new RespConv(model, sub === "openai", holdMax, strMax)
     return c
   }
-  if (family === "messages-bedrock") return new AnyConv(undefined, new MessagesConv(true, "bedrock-2023-05-31", false, strMax))
-  if (family === "messages-vertex") return new AnyConv(undefined, new MessagesConv(false, vertex.CLAUDE_VERSION, wire, strMax))
+  if (family === "messages-bedrock") return new AnyConv(undefined, new MessagesConv(true, "bedrock-2023-05-31", false, strMax), undefined, undefined)
+  if (family === "messages-vertex") return new AnyConv(undefined, new MessagesConv(false, vertex.CLAUDE_VERSION, wire, strMax), undefined, undefined)
+  if (family === "messages-chat") return new AnyConv(undefined, undefined, new MsgChain(new MsgToChat(model, holdMax, strMax), undefined), undefined)
+  if (family === "messages-gemini" || family === "messages-cohere") {
+    // the chat converter of the provider's format, behind the Messages-to-chat stage
+    const inner = newConv(family === "messages-gemini" ? "gemini" : "cohere", model, cfg, autoCache, wire, holdMax, strMax)
+    return new AnyConv(undefined, undefined, new MsgChain(new MsgToChat(model, holdMax, strMax), inner.chat), undefined)
+  }
+  if (family === EMB_GEMINI || family === EMB_VERTEX || family === EMB_COHERE || family === EMB_BEDROCK) return new AnyConv(undefined, undefined, undefined, new EmbConv(family, model, strMax, holdMax))
   let fmt = F_ANTHROPIC
   let tail: TailFn = (req, body) => try anthropic.messagesTail(req, body, wire)
   let cache = autoCache
@@ -162,7 +192,7 @@ export function newConv(family: string, model: string, cfg: ProviderConfig, auto
     }
   }
   const o: ConvOpts = { fmt: fmt, model: model, autoCache: cache, cacheMarker: anthropic.cacheMarker(cfg.prompt_cache?.ttl), version: vertex.CLAUDE_VERSION, holdMax: holdMax, strMax: strMax, tail: tail }
-  return new AnyConv(new ChatConv(o), undefined)
+  return new AnyConv(new ChatConv(o), undefined, undefined, undefined)
 }
 
 // The upstream request (URL and headers, no body) for a converted body. `wire`: called as a stream. `hash` is the
@@ -175,8 +205,18 @@ export function upstreamFor(family: string, t: Target, wire: bool, hash: string)
   }
   if (family.startsWith("resp-")) return try upstreamFor(family.slice(5), t, wire, hash)
   if (family === "anthropic") return anthropic.largeRequest(t)
-  if (family === "gemini") return t.kind === "vertex" ? try vertex.largeRequest(t, t.key.value ?? "", wire) : gemini.largeRequest(t, wire)
-  if (family === "cohere") return cohere.largeRequest(t)
+  if (family === "gemini" || family === "messages-gemini") return t.kind === "vertex" ? try vertex.largeRequest(t, t.key.value ?? "", wire) : gemini.largeRequest(t, wire)
+  if (family === "cohere" || family === "messages-cohere") return cohere.largeRequest(t)
+  if (family === "messages-chat") {
+    const up = openai.chatRequest(t, [])
+    return { url: up.url, headers: up.headers, body: "" }
+  }
+  if (family === EMB_BEDROCK) return bedrock.largeRequest(t, "invoke", hash)
+  if (family === EMB_GEMINI || family === EMB_VERTEX || family === EMB_COHERE) {
+    // the provider's URL and headers (the body is the converter's): a one-input body is enough to name them
+    const up = try providers.embeddingsUpstream(t, [{ key: "input", raw: `"x"` }])
+    return { url: up.url, headers: up.headers, body: "" }
+  }
   if (family === "vertex-claude") return try vertex.largeRequest(t, t.key.value ?? "", wire)
   if (family === "messages-vertex") return try vertex.largeRequest(t, t.key.value ?? "", wire)
   if (family === "converse") {
@@ -544,7 +584,6 @@ test("families by route and provider", () => {
   expect(familyFor("messages", "bedrock", "b", {}, false)).toBe("messages-bedrock")
   expect(familyFor("messages", "bedrock", "b", {}, true)).toBe("")
   expect(familyFor("messages", "vertex", "claude-x", {}, true)).toBe("messages-vertex")
-  expect(familyFor("messages", "vertex", "gemini-x", {}, false)).toBe("")
   expect(familyFor("responses", "anthropic", "claude", {}, false)).toBe("resp-anthropic")
   expect(familyFor("responses", "gemini", "g", {}, false)).toBe("resp-gemini")
   expect(familyFor("responses", "vertex", "claude-x", {}, false)).toBe("resp-vertex-claude")
@@ -555,7 +594,21 @@ test("families by route and provider", () => {
   expect(familyFor("responses", "openai", "o", {}, false)).toBe("")
   expect(familyFor("responses", "anthropic", "claude", { prompt_cache: { cache_control_injection_points: [{ role: "user" }] } }, false)).toBe("")
   expect(needsHash("resp-converse")).toBe(true)
+  expect(familyFor("messages", "vertex", "gemini-x", {}, false)).toBe("messages-gemini")
+  expect(familyFor("messages", "gemini", "g", {}, true)).toBe("messages-gemini")
+  expect(familyFor("messages", "cohere", "c", {}, false)).toBe("messages-cohere")
+  expect(familyFor("messages", "openai", "gpt-4o", {}, false)).toBe("messages-chat")
+  expect(familyFor("messages", "groq", "llama", {}, true)).toBe("messages-chat")
+  expect(familyFor("messages", "cloudflare", "m", {}, false)).toBe("")
+  expect(familyFor("embeddings", "cohere", "embed-v4", {}, false)).toBe(EMB_COHERE)
+  expect(familyFor("embeddings", "gemini", "text-embedding-004", {}, false)).toBe(EMB_GEMINI)
+  expect(familyFor("embeddings", "vertex", "text-embedding-005", {}, false)).toBe(EMB_VERTEX)
+  expect(familyFor("embeddings", "bedrock", "cohere.embed-english-v3", {}, false)).toBe(EMB_BEDROCK)
+  expect(familyFor("embeddings", "bedrock", "amazon.titan-embed-text-v2:0", {}, false)).toBe("")
+  expect(familyFor("embeddings", "cloudflare", "m", {}, false)).toBe("")
   expect(needsHash("converse")).toBe(true)
+  expect(needsHash(EMB_BEDROCK)).toBe(true)
+  expect(needsHash("messages-chat")).toBe(false)
   expect(needsHash("anthropic")).toBe(false)
   expect(needsHash("resp-anthropic")).toBe(false)
 })

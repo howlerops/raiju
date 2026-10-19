@@ -9,7 +9,7 @@ import { CohereToOpenAI } from "./streams_cohere"
 import { CohereStream } from "./cohere_in"
 import { GenAIStream } from "./genai_in"
 import { ConverseStream, InvokeStream } from "./bedrock_in"
-import { StreamState } from "./providers/anthropic_in"
+import { StreamState, toMessage } from "./providers/anthropic_in"
 import { AffinityStore, resolveSticky, sessionId, sessionTtl, affinityMode } from "./affinity"
 import { Tier, tierTarget, overrideTier } from "./complexity"
 import * as cplx from "./complexity"
@@ -35,7 +35,8 @@ import * as anthropicBeta from "./anthropic_beta"
 import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
 import { errorParts, classifyFailure, holdsKey } from "./refusal"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
-import { Pricing, PriceRow } from "./pricing"
+import { Pricing, PriceRow, CostParts, SttUsage } from "./pricing"
+import { MediaRoute, MediaBill, handleMedia, transcriptionUsage, billedMedia } from "./media"
 import { SocketGate } from "./ws"
 import { ResponseCache, CacheOrigin, cacheKey, keyScope, parseTtl } from "./cache"
 import { appOf } from "./logapi"
@@ -576,6 +577,8 @@ function routeOf(op: string): string {
 function takesBodyAsIs(route: string, kind: string): bool {
   if (route === "responses") return kind === "openai"
   if (route === "messages") return kind === "anthropic"
+  // (Cloudflare and Databricks take the OpenAI embeddings body under their own URLs)
+  if (route === "embeddings") return providers.streamsNatively(kind) || kind === "cloudflare" || kind === "databricks"
   return providers.streamsNatively(kind)
 }
 
@@ -590,6 +593,8 @@ test("a large body goes as it is only to a provider that takes its route's forma
   expect(takesBodyAsIs("messages", "anthropic")).toBe(true)
   expect(takesBodyAsIs("messages", "bedrock")).toBe(false)
   expect(takesBodyAsIs("messages", "openai")).toBe(false)
+  expect(takesBodyAsIs("embeddings", "cloudflare")).toBe(true)
+  expect(takesBodyAsIs("embeddings", "cohere")).toBe(false)
 })
 
 function requestType(op: string, streamed: bool): string {
@@ -3454,6 +3459,102 @@ export class Engine {
     this.gov.record(grant, promptTokens + completionTokens, c.cost)
   }
 
+  // The billing of an audio request (speech, transcription, translation): the gate admits its model under the
+  // caller's key before the upstream call, and the grant it was admitted under takes the charge (mediaAnswer).
+  mediaBill(h: Hdrs): MediaBill {
+    const bill = new MediaBill()
+    const gov = this.gov
+    bill.gate = (provider: string, model: string): Response | undefined => {
+      const a = gov.admit(h, provider, model)
+      if (a.kind === "denial") return errorResponse(a.status, a.message, a.type, noHeaders())
+      bill.grant = a
+      return undefined
+    }
+    return bill
+  }
+
+  // Charges an audio answer as a chat answer is (settle): a log row, the budgets and token limits, and the metrics.
+  // Speech is billed by its input characters, a transcription or translation by the usage its answer reports
+  // (media.tov transcriptionUsage). Only a 200 answer of an admitted request is charged; any other answer is
+  // returned as it is.
+  async mediaAnswer(route: MediaRoute, bill: MediaBill, res: Response, h: Hdrs, started: f64, rid: string): Promise<Response> {
+    const grant = bill.grant
+    if (grant === undefined || res.status !== 200) return res
+    const speech = route.op === "audio.speech"
+    let out = res
+    let usage: SttUsage = { prompt: 0, completion: 0, inputAudio: 0, inputText: 0, seconds: undefined }
+    let parts: CostParts = { input: 0.0, output: 0.0 }
+    if (speech) {
+      // the speech answer is the audio itself: nothing to read, the characters of the request are the usage
+      parts = this.pricing.speechCost(bill.provider, bill.model, bill.chars, 0, 0)
+    } else {
+      try {
+        const bytes = try await res.bytes()
+        // a body that is not text reports no usage
+        let text = ""
+        try {
+          text = new TextDecoder().decode(bytes)
+        } catch (e) {
+          text = ""
+        }
+        usage = transcriptionUsage(text) ?? usage
+        out = new Response(bytes, { status: 200, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } })
+      } catch (e) {
+        return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+      }
+      parts = this.pricing.transcriptionCost(bill.provider, bill.model, usage)
+    }
+    const op = speech ? "speech" : "transcription"
+    const c = parts.input + parts.output
+    const ctx = new ReqCtx(rid, op, started)
+    ctx.provider = bill.provider
+    ctx.model = bill.model
+    ctx.requested = bill.model
+    ctx.status = 200
+    ctx.promptTokens = usage.prompt
+    ctx.completionTokens = usage.completion
+    ctx.cost = c
+    ctx.inputCost = parts.input
+    ctx.outputCost = parts.output
+    ctx.virtualKey = grant.vk?.id ?? ""
+    ctx.userId = grant.vk?.user_id ?? ""
+    const at: Attribution = grant.attr ?? noAttribution()
+    ctx.teamId = at.teamId
+    ctx.customerId = at.customerId
+    ctx.businessUnitId = at.businessUnitId
+    ctx.projectId = at.projectId
+    ctx.userAgent = h.get("user-agent") ?? ""
+    ctx.sessionId = sessionId(h) ?? ""
+    this.record(ctx)
+    this.gov.record(grant, usage.prompt + usage.completion, c)
+    if (grant.budgets.length > 0 && this.pricing.priceFor(bill.provider, bill.model, false) === undefined) {
+      const key = bill.provider + "/" + bill.model
+      if (!this.unpriced.has(key)) {
+        this.unpriced.add(key)
+        console.error(`raiju: no price for ${key}: budgets don't count its requests; add a pricing override`)
+      }
+    }
+    const rl = metrics.newLabels(bill.provider, bill.model, requestType(op, false))
+    const gvk = grant.vk
+    if (gvk !== undefined) {
+      rl.virtualKeyId = gvk.id
+      rl.virtualKeyName = gvk.name ?? ""
+    }
+    metrics.observeUsage(rl, { input: usage.prompt, output: usage.completion, cost: c, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
+    return out
+  }
+
+  // An audio request is billed (mediaBill, mediaAnswer); the other media routes pass through as they did.
+  async media(req: Request, route: MediaRoute): Promise<Response> throws TypeError {
+    if (!billedMedia(route.op)) return try await handleMedia(this.cfg, req, route)
+    const h = snapshot(req.headers)
+    const started = performance.now()
+    const rid = h.get("x-request-id") ?? newId("req_")
+    const bill = this.mediaBill(h)
+    const res = try await handleMedia(this.cfg, req, route, bill)
+    return await this.mediaAnswer(route, bill, res, h, started, rid)
+  }
+
   // Sends queued spans to the collector in the background; export failures are logged, never raised.
   flushTraces(tracer: Tracer): void {
     if (usesGrpc(tracer.cfg)) {
@@ -3611,13 +3712,16 @@ export class Engine {
     const tiny: Field[] = [{ key: "model", raw: quote(meta.model) }]
     // A chat stream to a converted provider is called as a stream and its events are converted as they arrive (Bedrock's
     // binary event frames are not: its answer is read whole and replayed). A Messages stream passes through.
-    const live = family !== "" && family !== "converse" && route === "chat" && stream
+    // (a Messages stream converted to chat, Gemini or Cohere is converted as it arrives, as a chat stream is)
+    const msgLive = route === "messages" && (family === "messages-chat" || family === "messages-gemini" || family === "messages-cohere")
+    const live = family !== "" && family !== "converse" && stream && (route === "chat" || msgLive)
     const wire = live || (route === "messages" && stream)
     const holder = new ConvRef()
     const autoCache = this.autoPromptCache || hs.get("x-bf-prompt-cache-auto-inject") === "true" || (p?.prompt_cache?.auto_inject ?? false)
     if (family !== "") {
-      // the answer is converted back (a chat answer), or is the provider's own Messages answer (the Messages route)
-      lg.passAnswer = route === "messages"
+      // the answer is converted back (a chat or embeddings answer), or passes as the provider's own Messages answer
+      // (Bedrock and Vertex Claude)
+      lg.passAnswer = family === "messages-bedrock" || family === "messages-vertex"
       if (needsHash(family)) {
         if (this.gov.enforce && this.gov.findKey(hs) === undefined) {
           if (!ended) await src.cancel()
@@ -3649,7 +3753,7 @@ export class Engine {
         return try upstreamFor(family, t, wire, lg.payloadHash)
       }
       if (!takesBodyAsIs(route, t.kind)) throw new SyntaxError(`${t.provider} needs the whole request body in memory, which large_payload_optimization does not allow: a large ${route} request goes only to a provider that takes its format as it is`)
-      const up = route === "embeddings" ? openai.embeddingsRequest(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : route === "responses" ? openai.responsesRequest(t, tiny) : route === "messages" ? anthropicNative.nativeRequest(t, tiny) : openai.chatRequest(t, tiny)
+      const up = route === "embeddings" ? try providers.embeddingsUpstream(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : route === "responses" ? openai.responsesRequest(t, tiny) : route === "messages" ? anthropicNative.nativeRequest(t, tiny) : openai.chatRequest(t, tiny)
       return { url: up.url, headers: up.headers, body: "" }
     }
     // the answer of a request that streams on is a small one here (a big one is passed through): its usage is read from the text
@@ -3667,9 +3771,14 @@ export class Engine {
         }
         return { body: try toResponse(o.body, meta.model, echo), promptTokens: o.promptTokens, completionTokens: o.completionTokens }
       }
-      if (route === "responses" || route === "messages") {
+      if (route === "responses" || (route === "messages" && lg.passAnswer)) {
         const u = usageOfText(text)
         return { body: text, promptTokens: u.promptTokens, completionTokens: u.completionTokens }
+      }
+      if (route === "messages") {
+        // a provider's chat answer, in Messages format (a stream is converted as it arrives, in largeLive)
+        const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        return { body: try toMessage(tr.body, meta.model), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
       if (route === "embeddings") return try providers.embeddingsTranslate(t.kind, t.model, text, requested)
       if (route === "completions") return try openai.chatResponse(text, requested)
@@ -3735,7 +3844,10 @@ export class Engine {
     const mk: ConverterFactory = (t, requested) => {
       if (!streamable(t)) return undefined
       const hc = holder.conv
-      const conv = new StreamConverter(converterKind(t), requested, hc !== undefined && hc.wantsUsage())
+      // a Messages stream is answered as Messages events (with usage, as the whole-body route asks the provider for it)
+      const messages = op === "anthropic.messages"
+      const conv = new StreamConverter(converterKind(t), requested, messages || (hc !== undefined && hc.wantsUsage()))
+      if (messages) conv.asAnthropic(rawStr(modelBody, "model") ?? "")
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return conv
     }

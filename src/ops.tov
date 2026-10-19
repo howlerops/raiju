@@ -42,6 +42,8 @@ import { relay } from "./passthrough"
 import { findAgent, grantAllows, endpointOf, restEndpointOf, gatewayCard, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
 import { Call, PushSpec, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, interfacesOf, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
 import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
+import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CARD_NS } from "./a2ashare"
+import { FileLease } from "./filelease"
 import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
 import { tempTokenAllows } from "./mcpuser"
 import * as vmcp from "./vmcp"
@@ -946,6 +948,10 @@ export class Ops {
       this.nodeId = "node"
     }
     this.configure(engine.cfg)
+    // a card another worker or node fetched arrives through the cluster state (a2ashare.tov)
+    clusterState().onChange(CARD_NS, (name: string, value: string | undefined): void => {
+      this.adoptRemoteCard(name, value)
+    })
     this.loadCatalogAttrs()
     // MCP tool executions go to the request log store (kind "mcp")
     setMcpToolLog((c: McpToolCall) => {
@@ -970,6 +976,11 @@ export class Ops {
       }
     }
     ps.open = (v: string): string => openStored(this.store.cipher, v) ?? ""
+    ps.openSecret = (v: string): string | undefined => openStored(this.store.cipher, v)
+    // push configs and agent cards travel on the cluster state (a2ashare.tov); a card is sent when it changes
+    pushShare()
+    const cards = cardShare()
+    for (const a of cfg.agents ?? []) cards.publish(a.name, a.agent_card_url, a.card ?? "", a.card_fetched_at ?? 0)
     if (ps.dir === "" && lsw !== undefined && lsw.enabled === true) ps.persistTo(join(lsw.dir ?? "logs", "a2a-push.jsonl"))
     const gov = cfg.governance
     const users: UserConfig[] = gov?.users ?? []
@@ -2984,20 +2995,30 @@ export class Ops {
   }
 
   // Starts the card timer (client.a2a_card_refresh_seconds, 300 by default, 0 for none): each pass fetches the
-  // card of every enabled agent again and saves the ones that changed. Only the process that may save the
-  // config runs it.
+  // card of every enabled agent the node owns again and saves the ones that changed. Every worker runs the timer;
+  // cardTick gives each period's turn to one of them.
   startCardRefresh(): void {
     this.cardRefreshOn = true
     const secs = this.store.cfg.client?.a2a_card_refresh_seconds ?? 300
     if (secs <= 0) return
     setInterval(() => {
-      this.refreshCards()
+      this.cardTick(secs * 1000)
     }, secs * 1000)
   }
 
-  // One pass of the card timer.
+  // One tick of the card timer: one process of the node takes each period's turn (a lease in the node's share folder).
+  cardTick(periodMs: int): void {
+    const dir = this.shareDir === "" ? "" : this.shareDir + "/leases"
+    if (!takePeriod(new FileLease(dir, periodMs), "a2a-card-refresh", periodMs, Math.floor(Date.now()))) return
+    this.refreshCards()
+  }
+
+  // One pass of the card timer, over the agents this node owns (ownerOf over the live nodes): the other nodes adopt
+  // their cards from the cluster state.
   async refreshCards(): Promise<void> {
-    const list = this.store.cfg.agents ?? []
+    const nodes = this.liveNodes()
+    const me = cluster.nodeOf(this.nodeId)
+    const list = (this.store.cfg.agents ?? []).filter((a) => ownerOf(a.name, nodes) === me)
     if (list.length === 0) return
     try {
       const r = await refreshAll(list)
@@ -3032,7 +3053,39 @@ export class Ops {
     const last = this.cardRefreshAt.get(name) ?? 0.0
     if (now - last < 60000.0) return
     this.cardRefreshAt.set(name, now)
+    // one process of the node, once a minute
+    const dir = this.shareDir === "" ? "" : this.shareDir + "/leases"
+    if (!takePeriod(new FileLease(dir, 60000), "a2a-card-soon:" + name, 60000, Math.floor(now))) return
     this.refreshOne(name)
+  }
+
+  // A card another worker or node fetched arrives through the cluster state. It replaces this registration's card when
+  // it is for the same URL and newer (or the registration has none), in the config this process holds and in the
+  // engine's. A card held here that is newer goes back to the state, which keeps the last write it merged.
+  adoptRemoteCard(name: string, value: string | undefined): void {
+    if (value === undefined) return
+    const w = cardOf(value)
+    if (w === undefined) return
+    const mine = findAgent(this.store.cfg.agents, name)
+    if (mine === undefined || mine.agent_card_url !== w.url) return
+    const have = mine.card ?? ""
+    if (have !== "" && (mine.card_fetched_at ?? 0) > w.fetched_at) {
+      cardShare().put(name, mine.agent_card_url, have, mine.card_fetched_at ?? 0)
+      return
+    }
+    cardShare().known(name, w)
+    const s = adoptCard(this.store.cfg.agents ?? [], name, w)
+    if (s !== undefined) {
+      let c = this.store.cfg
+      c.agents = s
+      this.store.cfg = c
+    }
+    const e = adoptCard(this.engine.cfg.agents ?? [], name, w)
+    if (e !== undefined) {
+      let c = this.engine.cfg
+      c.agents = e
+      this.engine.cfg = c
+    }
   }
 
   async refreshOne(name: string): Promise<void> {

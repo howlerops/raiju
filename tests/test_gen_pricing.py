@@ -67,8 +67,8 @@ class MergeTest(unittest.TestCase):
         _, out, changes, disagreements, skipped, _, _ = self.merge(ROWS, PRICES)
         by_key = {r[0]: r for r in out}
         base = by_key["acme-base"]
-        self.assertEqual(len(base), 10)
-        self.assertEqual(base[7:10], ["0.00003", "0.00006", ""])
+        self.assertEqual(len(base), 11)
+        self.assertEqual(base[7:11], ["0.00003", "0.00006", "", ""])
         self.assertEqual(base[2:7], ["0.001", "0.002", "0.0001", "", "acme-base"])
         self.assertEqual(by_key["acme-live"][9], "0.0005")
         self.assertEqual(by_key["acme-live"][2:7], ["0.003", "0.004", "", "", "acme-live"])
@@ -102,8 +102,8 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(len(skipped), 1)
         self.assertIn("acme-live", skipped[0])
         self.assertEqual(out[1][0:2], ["acme-live", "other-co"])
-        self.assertEqual(len(out[1]), 10)
-        self.assertEqual(out[1][9], "")
+        # a row with no audio or per-second rate is written with seven columns
+        self.assertEqual(out[1], ["acme-live", "other-co", "0.003", "0.004", "", "", "acme-live"])
         self.assertFalse(any(c[0] == "acme-live" for c in changes))
 
     def test_a_bare_key_falls_back_to_the_provider_prefixed_one(self):
@@ -113,6 +113,25 @@ class MergeTest(unittest.TestCase):
         _, out, changes, _, _, _, _ = self.merge(rows, prices)
         self.assertEqual(out[0][9], "0.00005")
         self.assertEqual(changes, [("gemini-3", "input_cost_per_second", None, "0.00005")])
+
+    def test_a_character_rate_fills_the_eleventh_column(self):
+        prices = copy.deepcopy(PRICES)
+        prices["acme-base"]["input_cost_per_character"] = 0.00002
+        _, out, changes, _, _, _, _ = self.merge(ROWS, prices)
+        self.assertEqual(out[0][10], "0.00002")
+        self.assertIn(("acme-base", "input_cost_per_character", None, "0.00002"), changes)
+
+    def test_a_row_the_table_lacks_is_added_from_the_price_file(self):
+        prices = copy.deepcopy(PRICES)
+        prices["tts-1"] = {"litellm_provider": "openai", "input_cost_per_character": 0.000015}
+        prices["whisper-1"] = {"litellm_provider": "azure", "input_cost_per_second": 0.0001}
+        _, out, changes, _, _, _, _ = self.merge(ROWS, prices)
+        by_key = {r[0]: r for r in out}
+        # OpenAI's TTS model is added with the price file's character rate; its token rates are none
+        self.assertEqual(by_key["tts-1"], ["tts-1", "openai", "", "", "", "", "tts-1", "", "", "", "0.000015"])
+        self.assertIn(("tts-1", "row", None, "added"), changes)
+        # a model the list names under another provider is not added
+        self.assertNotIn("whisper-1", by_key)
 
     def test_a_second_merge_changes_nothing(self):
         _, _, _, _, _, table, path = self.merge(ROWS, PRICES)
@@ -126,7 +145,8 @@ class MergeTest(unittest.TestCase):
     def test_the_header_keeps_the_source_and_records_the_merge(self):
         header, _, _, _, _, table, path = self.merge(ROWS, PRICES, name="litellm-prices.json")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        self.assertEqual(header, HEADER[:2])
+        # the header keeps the generator's first two lines and carries the column note as the generator writes it now
+        self.assertEqual(header, HEADER[:2] + gp.COLUMNS_NOTE)
         text = table.read_text(encoding="utf-8")
         self.assertIn("// Audio and per-second columns merged from litellm-prices.json (sha256 %s, 2026-10-19)" % digest, text)
         self.assertNotIn("an old note", text)
@@ -141,7 +161,7 @@ class MergeTest(unittest.TestCase):
 
     def test_the_committed_table_round_trips(self):
         header, rows = gp.read_table(gp.OUT)
-        self.assertTrue(all(len(r) in (7, 10) for r in rows))
+        self.assertTrue(all(len(r) in (7, 11) for r in rows))
         again = gp.render(header, rows)
         self.assertEqual(again.partition(gp.EXPORT)[2], gp.OUT.read_text(encoding="utf-8").partition(gp.EXPORT)[2])
 

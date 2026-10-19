@@ -1,0 +1,396 @@
+// A2A state shared across the workers of a node and the nodes of a cluster. Bifrost keeps push configs and agent cards
+// in its config database, which every node of a cluster shares; Raiju carries them on the cluster state
+// (clusterstate.tov), which the cluster sync and the workers' share folder both merge.
+//
+// Push configs travel under the namespace "a2a.push". The key is pushKey (agent, task and config id); the value is the
+// config as JSON with its callback token and its credentials sealed under the encryption key the nodes share (store.tov
+// sealStored). A config a node writes is put there, a removal is a tombstone, and every node applies what the state
+// holds to its own push store, so a callback registered through one node is accepted and relayed by another. Queued
+// pushes are not shared: the node that received one delivers it.
+//
+// Agent cards travel under "a2a.card": the key is the agent's name, the value {url, fetched_at, card}. A registration
+// adopts a card for its URL when it holds an older card or none. The newer fetch wins: a node that holds a newer card
+// than the state's entry puts its own back, so a stale copy never stays.
+//
+// The card timer runs in every worker. takePeriod lets one worker of a node take each period's turn (a FileLease in
+// the node's share folder), and a node fetches the cards of the agents it owns (ownerOf over the live nodes).
+import { ClusterState, clusterState } from "./clusterstate"
+import { PushStore, PushConfig, pushKey, pushStore } from "./a2apush"
+import { AgentConfig } from "./config"
+import { withCard } from "./agents"
+import { FileLease } from "./filelease"
+import { rmSync } from "node:fs"
+
+export const PUSH_NS = "a2a.push"
+export const CARD_NS = "a2a.card"
+
+// The config as the state carries it: its JSON, the callback token and the credentials sealed.
+export function pushValue(c: PushConfig, seal: (v: string) => string): string {
+  const x: PushConfig = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: seal(c.token), scheme: c.scheme, credentials: seal(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
+  return JSON.stringify(x)
+}
+
+// A config from its value, its secrets opened. undefined when the value does not parse, or a secret is sealed under a
+// key this node does not hold (such a config is not applied, rather than applied without its token).
+export function pushOf(value: string, open: (v: string) => string | undefined): PushConfig | undefined {
+  let c: PushConfig | undefined = undefined
+  try {
+    c = JSON.parse(value) as PushConfig
+  } catch (e) {
+    return undefined
+  }
+  if (c === undefined) return undefined
+  const token = open(c.token)
+  const creds = open(c.credentials)
+  if (token === undefined || creds === undefined) return undefined
+  return { agent: c.agent, task: c.task, id: c.id, url: c.url, token: token, scheme: c.scheme, credentials: creds, ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
+}
+
+// The agent, task and config id a state key names, or undefined when the key is not one.
+export function pushIdOf(key: string): { agent: string, task: string, id: string } | undefined {
+  let k: string[] = []
+  try {
+    k = JSON.parse(key) as string[]
+  } catch (e) {
+    return undefined
+  }
+  if (k.length !== 3) return undefined
+  return { agent: k[0]!, task: k[1]!, id: k[2]! }
+}
+
+// Carries the push configs between a push store and a cluster state, both ways.
+export class PushShare {
+  // set while a config from the state is applied, so that the apply is not sent back to the state
+  private applying = false
+
+  constructor(readonly store: PushStore, readonly state: ClusterState) {}
+
+  // The store tells this of its writes, and the state of the entries merged in.
+  attach(): void {
+    this.store.changed = (c: PushConfig, gone: bool): void => {
+      this.wrote(c, gone)
+    }
+    this.state.onChange(PUSH_NS, (key: string, value: string | undefined): void => {
+      this.apply(key, value)
+    })
+  }
+
+  // A config this process wrote goes to the state (sealed); a removal is a tombstone there.
+  wrote(c: PushConfig, gone: bool): void {
+    if (this.applying) return
+    const key = pushKey(c.agent, c.task, c.id)
+    if (gone) this.state.del(PUSH_NS, key)
+    else this.state.put(PUSH_NS, key, pushValue(c, this.store.seal))
+  }
+
+  // An entry merged in from another process or node is applied to the store. A config the store already holds as it
+  // is stays as it is, so that the workers of a node do not rewrite each other's files.
+  apply(key: string, value: string | undefined): void {
+    const k = pushIdOf(key)
+    if (k === undefined) return
+    this.applying = true
+    try {
+      if (value === undefined) {
+        this.store.remove(k.agent, k.task, k.id)
+      } else {
+        const c = pushOf(value, this.store.openSecret)
+        if (c !== undefined && !this.same(c)) this.store.saveConfig(c)
+      }
+    } catch (e) {
+      console.error(`raiju: a2a push: could not apply a config from the cluster: ${e.message}`)
+    }
+    this.applying = false
+  }
+
+  // Whether the store holds c as it is (the fields a write changes).
+  private same(c: PushConfig): bool {
+    const have = this.store.config(c.agent, c.task, c.id)
+    if (have === undefined) return false
+    return have.url === c.url && have.token === c.token && have.scheme === c.scheme && have.credentials === c.credentials && have.ingress === c.ingress && have.updated_at === c.updated_at
+  }
+}
+
+let shareInstance: PushShare | undefined = undefined
+
+// The process's push share, attached on first use: the process's push store and cluster state.
+export function pushShare(): PushShare {
+  let s = shareInstance
+  if (s === undefined) {
+    s = new PushShare(pushStore(), clusterState())
+    s.attach()
+    shareInstance = s
+  }
+  return s
+}
+
+// The value of an agent's card on the state.
+export type CardWire = { url: string, fetched_at: int, card: string }
+
+export function cardValue(url: string, card: string, fetchedAt: int): string {
+  return JSON.stringify({ url: url, fetched_at: fetchedAt, card: card })
+}
+
+// The card a state entry carries, or undefined when the entry does not parse or names no card.
+export function cardOf(value: string): CardWire | undefined {
+  let w: CardWire | undefined = undefined
+  try {
+    w = JSON.parse(value) as CardWire
+  } catch (e) {
+    return undefined
+  }
+  if (w === undefined || w.card === "") return undefined
+  return w
+}
+
+// The agent list with the card of registration name replaced by w, when w is for the registration's URL and the
+// registration holds no card or an older one. undefined when nothing changes.
+export function adoptCard(list: AgentConfig[], name: string, w: CardWire): AgentConfig[] | undefined {
+  let hit = false
+  const out: AgentConfig[] = []
+  for (const a of list) {
+    const have = a.card ?? ""
+    if (a.name === name && a.agent_card_url === w.url && have !== w.card && (have === "" || (a.card_fetched_at ?? 0) < w.fetched_at)) {
+      // a registration with the card in place of the old one, its other fields as they were
+      let b = withCard(a, w.card, w.fetched_at)
+      b.updated_at = a.updated_at
+      out.push(b)
+      hit = true
+    } else {
+      out.push(a)
+    }
+  }
+  return hit ? out : undefined
+}
+
+// Publishes the cards of this process's registrations. A card is sent once; a card the state already holds for the
+// same URL that is at least as new stays.
+export class CardShare {
+  // the last value sent for each agent (cardValue), so an unchanged card is not sent again
+  private sent: Map<string, string> = new Map()
+
+  constructor(readonly state: ClusterState) {}
+
+  publish(name: string, url: string, card: string, fetchedAt: int): void {
+    if (card === "") return
+    const v = cardValue(url, card, fetchedAt)
+    if (this.sent.get(name) === v) return
+    this.sent.set(name, v)
+    this.put(name, url, card, fetchedAt)
+  }
+
+  // Puts a card on the state whatever the sent memo says: a stale entry merged in is replaced by the newer card held here.
+  put(name: string, url: string, card: string, fetchedAt: int): void {
+    const cur = this.state.get(CARD_NS, name)
+    if (cur !== undefined) {
+      const w = cardOf(cur)
+      if (w !== undefined && w.url === url && w.fetched_at >= fetchedAt) return
+    }
+    this.state.put(CARD_NS, name, cardValue(url, card, fetchedAt))
+  }
+
+  // Notes a card this process adopted, so that it is not sent back.
+  known(name: string, w: CardWire): void {
+    this.sent.set(name, cardValue(w.url, w.card, w.fetched_at))
+  }
+}
+
+let cardInstance: CardShare | undefined = undefined
+
+// The process's card share (the process's cluster state).
+export function cardShare(): CardShare {
+  let s = cardInstance
+  if (s === undefined) {
+    s = new CardShare(clusterState())
+    cardInstance = s
+  }
+  return s
+}
+
+// Whether this process takes the turn of a timed job for the period nowMs falls in: one process of a node runs it once
+// per period, the one whose take of the period's lease comes first (a FileLease whose name is the job and the period's
+// index). The lease of the period before is removed. With no folder (one process) every call takes the turn.
+export function takePeriod(lease: FileLease, job: string, periodMs: int, nowMs: int): bool {
+  const p = Math.floor(nowMs / periodMs)
+  if (p > 0) lease.release(job + ":" + (p - 1), 0)
+  return lease.take(job + ":" + p, nowMs * 1.0) >= 0
+}
+
+// ---- tests ----
+
+function pushCfg(agent: string, task: string, id: string, hash: string): PushConfig {
+  return { agent: agent, task: task, id: id, url: "https://cb.example/h", token: "cb-token", scheme: "bearer", credentials: "cb-cred", ingress: hash, created_at: 1000, updated_at: 1000 }
+}
+
+// A sealing that marks its output, and an opener that refuses what it did not seal (a node without the key).
+function sealMark(v: string): string {
+  return v === "" ? v : "sealed:" + v
+}
+
+function openMark(v: string): string | undefined {
+  if (v.startsWith("sealed:")) return v.slice(7)
+  return v
+}
+
+function openNoKey(v: string): string | undefined {
+  if (v.startsWith("sealed:")) return undefined
+  return v
+}
+
+test("a push config's key names it, and its value seals the callback token and credentials", () => {
+  const key = pushKey("echo", "t1", "c1")
+  const id = pushIdOf(key)
+  expect(id!.agent).toBe("echo")
+  expect(id!.task).toBe("t1")
+  expect(id!.id).toBe("c1")
+  expect(pushIdOf("not a key") === undefined).toBe(true)
+  const v = pushValue(pushCfg("echo", "t1", "c1", "h1"), sealMark)
+  expect(v.includes(`"token":"sealed:cb-token"`)).toBe(true)
+  expect(v.includes(`"credentials":"sealed:cb-cred"`)).toBe(true)
+  expect(v.includes(`"url":"https://cb.example/h"`)).toBe(true)
+  const back = pushOf(v, openMark)
+  expect(back!.token).toBe("cb-token")
+  expect(back!.credentials).toBe("cb-cred")
+  expect(back!.ingress).toBe("h1")
+  // a node without the key does not apply the config, rather than applying it without its token
+  expect(pushOf(v, openNoKey) === undefined).toBe(true)
+  expect(pushOf("{", openMark) === undefined).toBe(true)
+})
+
+test("a config saved on one node reaches another through the state, sealed, and its removal removes it there", () => {
+  const sa = new PushStore()
+  const sb = new PushStore()
+  sa.seal = sealMark
+  sa.open = (v: string): string => openMark(v) ?? ""
+  sa.openSecret = openMark
+  sb.seal = sealMark
+  sb.open = (v: string): string => openMark(v) ?? ""
+  sb.openSecret = openMark
+  const ca = new ClusterState("a")
+  const cb = new ClusterState("b")
+  new PushShare(sa, ca).attach()
+  new PushShare(sb, cb).attach()
+  sa.saveConfig(pushCfg("echo", "t1", "c1", "h1"))
+  const text = ca.get(PUSH_NS, pushKey("echo", "t1", "c1"))!
+  expect(text.includes('"cb-token"')).toBe(false)
+  cb.merge(ca.wire(1000.0), 1000.0)
+  const got = sb.config("echo", "t1", "c1")
+  expect(got!.token).toBe("cb-token")
+  expect(got!.credentials).toBe("cb-cred")
+  expect(sb.byIngress("echo", "h1")!.task).toBe("t1")
+  // a deletion on a is a tombstone that removes the config on b, once
+  sa.remove("echo", "t1", "c1")
+  cb.merge(ca.wire(2000.0), 2000.0)
+  expect(sb.config("echo", "t1", "c1") === undefined).toBe(true)
+  expect(sa.config("echo", "t1", "c1") === undefined).toBe(true)
+  expect(ca.keys(PUSH_NS).length).toBe(0)
+})
+
+test("a node that cannot open the secrets refuses the config, and a queued push is not published", () => {
+  const sa = new PushStore()
+  const sb = new PushStore()
+  sa.seal = sealMark
+  sa.open = (v: string): string => openMark(v) ?? ""
+  sa.openSecret = openMark
+  sb.seal = sealMark
+  sb.open = (v: string): string => openNoKey(v) ?? ""
+  sb.openSecret = openNoKey
+  const ca = new ClusterState("a")
+  const cb = new ClusterState("b")
+  new PushShare(sa, ca).attach()
+  new PushShare(sb, cb).attach()
+  sa.saveConfig(pushCfg("echo", "t1", "c1", "h1"))
+  sa.addDelivery({ id: "d1", agent: "echo", task: "t1", config: "c1", payload: "{}", status: "pending", attempts: 0, next_at: 0, last_error: "", created_at: 0, updated_at: 0 })
+  expect(ca.keys(PUSH_NS).length).toBe(1)
+  cb.merge(ca.wire(1000.0), 1000.0)
+  expect(sb.config("echo", "t1", "c1") === undefined).toBe(true)
+  expect(sb.delivery("d1") === undefined).toBe(true)
+})
+
+test("a change applied from the state is not sent back to it", () => {
+  const sb = new PushStore()
+  sb.seal = sealMark
+  sb.open = (v: string): string => openMark(v) ?? ""
+  sb.openSecret = openMark
+  const cb = new ClusterState("b")
+  new PushShare(sb, cb).attach()
+  const sa = new PushStore()
+  sa.seal = sealMark
+  sa.open = (v: string): string => openMark(v) ?? ""
+  sa.openSecret = openMark
+  const ca = new ClusterState("a")
+  new PushShare(sa, ca).attach()
+  sa.saveConfig(pushCfg("echo", "t1", "c1", "h1"))
+  cb.merge(ca.wire(1000.0), 1000.0)
+  // b applied it: its own state entry is the one a wrote, not a new write of b's
+  const before = cb.wire(1000.0)
+  expect(before.length).toBe(1)
+  expect(before[0]!.by).toBe("a")
+})
+
+function cardAgent(name: string, url: string, card: string, at: int): AgentConfig throws SyntaxError {
+  return try JSON.parse(`{"name":${JSON.stringify(name)},"agent_card_url":${JSON.stringify(url)},"card":${JSON.stringify(card)},"card_fetched_at":${at},"allow_by_default":true}`) as AgentConfig
+}
+
+test("a card is adopted by the registration for its URL when it is newer or the registration has none", () => {
+  const w0 = try cardAgent("w", "https://a.example/card", "", 0)
+  const v0 = try cardAgent("v", "https://v.example/card", `{"name":"v"}`, 5)
+  const list = [w0, v0]
+  const fresh: CardWire = { url: "https://a.example/card", fetched_at: 100, card: `{"name":"w"}` }
+  const one = adoptCard(list, "w", fresh)
+  expect(one!.length).toBe(2)
+  expect(one![0]!.card).toBe(`{"name":"w"}`)
+  expect(one![0]!.card_fetched_at).toBe(100)
+  expect(one![1]!.card).toBe(`{"name":"v"}`)
+  // another URL is not this registration's card
+  expect(adoptCard(list, "w", { url: "https://other.example/card", fetched_at: 100, card: `{"name":"w"}` }) === undefined).toBe(true)
+  // an older card does not replace a newer one
+  const held = adoptCard(one!, "w", { url: "https://a.example/card", fetched_at: 50, card: `{"name":"old"}` })
+  expect(held === undefined).toBe(true)
+  // a newer one does
+  const newer = adoptCard(one!, "w", { url: "https://a.example/card", fetched_at: 200, card: `{"name":"w2"}` })
+  expect(newer![0]!.card).toBe(`{"name":"w2"}`)
+  // the same card changes nothing
+  expect(adoptCard(one!, "w", fresh) === undefined).toBe(true)
+  expect(cardOf(cardValue("u", `{"a":1}`, 7))!.fetched_at).toBe(7)
+  expect(cardOf(cardValue("u", "", 7)) === undefined).toBe(true)
+  expect(cardOf("not json") === undefined).toBe(true)
+})
+
+test("a card is sent once, and a stale entry on the state is replaced by the newer card held here", () => {
+  const st = new ClusterState("a")
+  const share = new CardShare(st)
+  share.publish("w", "https://a.example/card", `{"name":"w"}`, 100)
+  share.publish("w", "https://a.example/card", `{"name":"w"}`, 100)
+  expect(st.keys(CARD_NS).length).toBe(1)
+  // a peer's older card arrives: the card held here goes back
+  st.put(CARD_NS, "w", cardValue("https://a.example/card", `{"name":"stale"}`, 50))
+  share.put("w", "https://a.example/card", `{"name":"w"}`, 100)
+  expect(cardOf(st.get(CARD_NS, "w")!)!.card).toBe(`{"name":"w"}`)
+  // a card that is no newer than the state's is not put
+  share.put("w", "https://a.example/card", `{"name":"older"}`, 10)
+  expect(cardOf(st.get(CARD_NS, "w")!)!.card).toBe(`{"name":"w"}`)
+  // a changed card is sent
+  share.publish("w", "https://a.example/card", `{"name":"w3"}`, 300)
+  expect(cardOf(st.get(CARD_NS, "w")!)!.card).toBe(`{"name":"w3"}`)
+})
+
+let periodSeq = 0
+
+test("one process of a node takes each period's turn, and the lease of the period before goes", () => {
+  periodSeq += 1
+  const dir = "/tmp/raiju-a2ashare-test-" + process.pid + "-" + Math.floor(Date.now()) + "-" + periodSeq
+  const a = new FileLease(dir, 1000)
+  const b = new FileLease(dir, 1000)
+  expect(takePeriod(a, "card", 1000, 5000)).toBe(true)
+  expect(takePeriod(b, "card", 1000, 5400)).toBe(false)
+  expect(takePeriod(b, "card", 1000, 5900)).toBe(false)
+  expect(takePeriod(b, "card", 1000, 6100)).toBe(true)
+  expect(takePeriod(a, "card", 1000, 6200)).toBe(false)
+  // the period before's lease is removed when the next period's turn is taken
+  expect(takePeriod(a, "other", 1000, 6300)).toBe(true)
+  // with no folder every call takes the turn
+  const solo = new FileLease("", 1000)
+  expect(takePeriod(solo, "card", 1000, 5000)).toBe(true)
+  expect(takePeriod(solo, "card", 1000, 5000)).toBe(true)
+  try rmSync(dir, { recursive: true, force: true })
+})
