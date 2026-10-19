@@ -17,25 +17,27 @@ start new work on a fresh branch from `main`.
 
 ## Where things stand
 
-- Waves 1 to 16 are merged on the branch above (PR howlerops/raiju#2). Wave 16 (L128 to L134)
-  built the open items left after wave 15. Every ledger row is done or partial with its "Open:"
+- Waves 1 to 17 are merged on the branch above (PR howlerops/raiju#2). Wave 17 (L135 to L141)
+  built the open items left after wave 16. Every ledger row is done or partial with its "Open:"
   remainder in LEDGER.md.
 - docs/parity.md counts 565 parity rows: done 377, partial 164, missing 0, out of scope 15,
   n/a 9, plus 38 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,746 passed, 0 failed;
-  e2e "all passed" on Bun and http1; `make ui` all passed (258 checks); `make openapi-check` ok;
+- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,807 passed (plus 8 Python tests), 0 failed;
+  e2e "all passed" on Bun and http1; `make ui` all passed (309 checks); `make openapi-check` ok;
   `make web-check` up to date; `tov-patches/tests/run.sh` passed.
 - The Tov runtime carries eight patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
   plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2), 0008
   streamed request bodies. They apply in order only; `make tov` rebuilds the compiler.
 - Admin UI: SolidJS 2.0 RC in `web/`, embedded through the committed `src/ui_assets.tov`;
-  charts, MCP access and virtual MCP screens, role-aware actions (L132). `make web` after any
+  charts with zoom and series toggles, MCP access and virtual MCP screens, role-aware actions
+  (L132), and a Roles tab that edits custom roles (L141). `make web` after any
   spec change.
 - Realtime and live sessions are metered, guarded and billed on every path (WebRTC, WebSocket,
   realtime calls on Raiju's own peer). Set `RAIJU_WEBRTC_BIND` and `RAIJU_WEBRTC_ICE_SERVERS`
   for deployment.
-- The built-in price table's audio rates for gpt-realtime and gpt-realtime-mini were entered by
-  hand and no row has a per-second voice rate: regenerate with `scripts/gen_pricing.py` from
+- The built-in price table's audio and per-second rates are merged from LiteLLM's public price
+  file (`scripts/gen_pricing.py --merge`, L135); its token rates are an older Bifrost datasheet
+  snapshot (388 disagree with LiteLLM). Regenerate with `scripts/gen_pricing.py` from
   https://getbifrost.ai/datasheet (this environment's network policy blocks that host; add it
   under Allowed domains to do it here). Pricing sync at runtime overrides the table.
 
@@ -43,14 +45,16 @@ start new work on a fresh branch from `main`.
 
 No row is queued; the remainders are the "Open:" notes in LEDGER.md. The larger ones:
 
-- Pricing data: regenerate the datasheet (above).
-- Large requests to providers whose format differs still buffer (no streaming converter);
-  streamed chat usage needs the caller's stream_options.include_usage (L129).
-- Realtime: one log row per session where Bifrost logs one per turn; budgets charged at session
-  end; transcription sessions and ephemeral ek_ tokens (L128).
-- A2A: push store per process (multi-worker), no gRPC binding (L134).
-- Plugins: LLM hooks not on Anthropic Messages, GenAI, Bedrock, Cohere routes (L130).
-- MCP: the token-exchange admin credential is not refreshed (L133).
+- Pricing data: regenerate the token rates from the Bifrost datasheet (above); transcription is
+  not billed by the second; no OpenAI live model is in the table (L135).
+- Large requests: Responses to non-OpenAI providers, Messages to OpenAI/Gemini/Cohere,
+  embeddings and completions to other formats still buffer; Bedrock streams are replayed (L136).
+- A2A: no gRPC binding (needs an HTTP/2 server and a protobuf decoder in Tov); push state is per
+  node; a card fetched by one worker stays on it (L138).
+- Plugins: compiled-in plugins stay chat-only on the provider-format routes; embedContent,
+  Bedrock rerank, count-tokens and batch routes are not hooked (L139).
+- MCP: token-exchange renewals are not coordinated across workers or nodes (L140).
+- Realtime: transcription sessions and ephemeral ek_ tokens (L137).
 - Streams under block-capable guards arrive after the answer ends (L131, by design).
 - Upstream: the Tov patches and the compiler bugs found could be offered to Tov.
 
