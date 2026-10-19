@@ -39,6 +39,7 @@ unit: build/h2_echo
 	$(TOV) test src/main.tov
 	python3 -m unittest tests/test_gen_pricing.py
 	python3 -m unittest tests/h2_test.py
+	python3 -m unittest tests/test_crew_priors.py
 
 # the HTTP/2 and gRPC echo server the h2 tests drive (tests/h2_test.py)
 build/h2_echo: tests/h2_echo.tov src/h2.tov src/hpack.tov src/grpcwire.tov src/grpc.tov

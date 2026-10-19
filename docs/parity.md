@@ -32,11 +32,11 @@ Priority: P0 means a Bifrost user would hit it on the first day of switching, or
 ## Summary
 
 <!-- parity-count:start -->
-Parity rows (one per feature or route family): **565**. Status counts: done 377, partial 164, missing 0, out-of-scope 15, n/a 9. Raiju-only extras (not parity items, listed for context): 40.
+Parity rows (one per feature or route family): **565**. Status counts: done 377, partial 164, missing 0, out-of-scope 15, n/a 9. Raiju-only extras (not parity items, listed for context): 41.
 
 | Section | done | partial | missing | out-of-scope | n/a | Parity rows | Raiju-only extras |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| (a) HTTP routes | 107 | 36 | 0 | 5 | 1 | 149 | 10 |
+| (a) HTTP routes | 107 | 36 | 0 | 5 | 1 | 149 | 11 |
 | (b) Headers | 58 | 3 | 0 | 0 | 3 | 64 | 11 |
 | (c) config.json | 75 | 41 | 0 | 2 | 2 | 120 | 8 |
 | (d) Providers | 36 | 31 | 0 | 4 | 0 | 71 | 1 |
@@ -45,7 +45,7 @@ Parity rows (one per feature or route family): **565**. Status counts: done 377,
 | (g) MCP | 20 | 12 | 0 | 0 | 0 | 32 | 0 |
 | (h) Observability | 36 | 4 | 0 | 1 | 0 | 41 | 4 |
 | (i) Enterprise | 18 | 13 | 0 | 3 | 2 | 36 | 3 |
-| **Total** | **377** | **164** | **0** | **15** | **9** | **565** | **40** |
+| **Total** | **377** | **164** | **0** | **15** | **9** | **565** | **41** |
 <!-- parity-count:end -->
 
 The `n/a` rows are features Bifrost has removed (x-bf-azure-endpoint, x-bf-bedrock-*, x-bf-prom-*), features Bifrost has not shipped (Google and GitHub SSO), a managed offering (InVPC), or Go-runtime settings with no HTTP or config meaning. The `out-of-scope` rows are the SCOPE.md "Out" items: videos, containers, media providers (Runware included), Warp, the skills marketplace and Sidekiq (added in L96d).
@@ -250,6 +250,7 @@ Bifrost: `transports/bifrost-http/handlers/*.go`, documented in `docs/openapi/op
 | POST /mcp/{slug} (virtual MCP) | handlers/mcpserver.go | done | `server.tov` `dispatch` → `ops.tov` `mcp` (virtual name) → `vmcp.tov`. |
 | /ws (UI WebSocket) | handlers/websocket.go | partial | `server.tov` `wsUpgrade` → `ops.tov` `UiSocket` and `UiHub` (log feed, scoped to the caller's data access). Accepts `?ticket=` from /api/session/ws-ticket (L97c). Heartbeat, and a registry shared across worker processes (L102). L119: the feed is cluster-wide and resumable (the Raiju-only row in (h2)): `?since=node:seq,...` replays what the client missed on any replica, `?batch=1` sends arrays every 100 ms, and a slow batch client is closed with 1013. The SolidJS Live screen (L113, `web/src/live.ts`) asks for `batch=1`, keeps the highest seq per producer and resumes with `since=` on every reconnect (backoff 1 s doubling to 30 s), shows the gap notice and a node column and filter, keeps the newest 5,000 rows (newest on top, pause and resume, duplicates by event id dropped) and draws them through a fixed-row-height virtualizer (`web/src/virtual.ts`; @tanstack/solid-virtual does not accept solid-js 2), so an event adds one row and rebuilds none. Open: Bifrost's store updates are not in the replay ring. |
 | HTTP/1.1 server and Bun.serve | n/a | done (Raiju-only) | `front.tov`, `server.tov` `start`. |
+| Crew routing offline priors and classifier training (Raiju-only) | not in Bifrost | partial (Raiju-only) | L152, `scripts/crew_priors.py`: `fit-priors` (role-additive fit with a metadata prior, leaderboard moments, optional interactions, per-candidate IRT by marginal likelihood when numpy and scipy are installed), `train-classifier` (the file format of `src/taskclass.tov`, int8, at most 2,000 weights per class), `frontier` (class frontiers and knee). Tests in `tests/test_crew_priors.py`. Open: the gateway loads these files (L153, L154). |
 
 ## (b) Headers
 
