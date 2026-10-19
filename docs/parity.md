@@ -32,7 +32,7 @@ Priority: P0 means a Bifrost user would hit it on the first day of switching, or
 ## Summary
 
 <!-- parity-count:start -->
-Parity rows (one per feature or route family): **565**. Status counts: done 377, partial 164, missing 0, out-of-scope 15, n/a 9. Raiju-only extras (not parity items, listed for context): 39.
+Parity rows (one per feature or route family): **565**. Status counts: done 377, partial 164, missing 0, out-of-scope 15, n/a 9. Raiju-only extras (not parity items, listed for context): 40.
 
 | Section | done | partial | missing | out-of-scope | n/a | Parity rows | Raiju-only extras |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -44,8 +44,8 @@ Parity rows (one per feature or route family): **565**. Status counts: done 377,
 | (f) Governance | 21 | 13 | 0 | 0 | 1 | 35 | 0 |
 | (g) MCP | 20 | 12 | 0 | 0 | 0 | 32 | 0 |
 | (h) Observability | 36 | 4 | 0 | 1 | 0 | 41 | 4 |
-| (i) Enterprise | 18 | 13 | 0 | 3 | 2 | 36 | 2 |
-| **Total** | **377** | **164** | **0** | **15** | **9** | **565** | **39** |
+| (i) Enterprise | 18 | 13 | 0 | 3 | 2 | 36 | 3 |
+| **Total** | **377** | **164** | **0** | **15** | **9** | **565** | **40** |
 <!-- parity-count:end -->
 
 The `n/a` rows are features Bifrost has removed (x-bf-azure-endpoint, x-bf-bedrock-*, x-bf-prom-*), features Bifrost has not shipped (Google and GitHub SSO), a managed offering (InVPC), or Go-runtime settings with no HTTP or config meaning. The `out-of-scope` rows are the SCOPE.md "Out" items: videos, containers, media providers (Runware included), Warp, the skills marketplace and Sidekiq (added in L96d).
@@ -808,6 +808,7 @@ Bifrost: `docs/enterprise/*.mdx`, `handlers/notifications.go`, `handlers/webhook
 | Sidekiq (Bifrost queue integration) | handlers/sidekiq.go | out-of-scope | Not built (L88 decision). Not in `SCOPE.md` yet. |
 | Encryption of stored keys | encryption_key | done | `aesgcm.tov`: AES-256-GCM config encryption at rest (L80). |
 | Task classifier for crew routing (`crew/<pool>`, docs/crew-routing.md) | not in Bifrost | done (Raiju-only) | L151: `taskclass.tov`. Hashed word uni- and bi-grams (FNV-1a 32, 2^18 buckets), named label, stack-trace, code and verb features, int8 weights (at most 2,000 per class), temperature and prior floor; uncertain tasks take the uncertain class. Module only: the built-in placeholder weights until the trained file (L152), and the gateway wiring (L153). |
+| Crew routing (task-level multi-model routing, Pareto crewing) | not in Bifrost | partial (Raiju-only) | `crewmath.tov`: the formulas only (role cost, per-role argmax and coordinate ascent, frontier and knee, AIQ, pacing, credibility, reservation index, verifier threshold, within-task posterior, sequential step). No routes, config keys or headers yet (L153 to L154). Design: `docs/crew-routing.md`. |
 
 ## Gaps
 

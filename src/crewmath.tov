@@ -1,0 +1,1117 @@
+// Crew routing math for Raiju (docs/crew-routing.md; Radha, "Pareto Crewing", sections 2-4).
+// Pure functions over numbers: no I/O, no clock, no randomness. Quality is a success
+// probability or a review score in [0, 1]; cost is dollars per task. Comments cite the
+// paper's equations, propositions, definitions and theorems.
+
+export type Route = "api" | "local" | "subscription"
+
+// Expected calls and tokens per call of one role on one class (Def. 4).
+export type CallProfile = { calls: number, input_tokens: number, output_tokens: number }
+
+// List price in dollars per token.
+export type TokenPrice = { input: number, output: number }
+
+// h(phi) of Def. 4: zero at or above freeUntil, rising linearly to 1 at phi = 0.
+export function subscriptionFactor(phi: number, freeUntil: number): number {
+  if (phi >= freeUntil) return 0
+  if (phi <= 0) return 1
+  return (freeUntil - phi) / freeUntil
+}
+
+// Route-aware marginal cost of one role (Def. 4, eq. 1). A local route costs nothing; a
+// subscription costs its list price times h(phi), so it is free until its quota runs low.
+export function roleCost(profile: CallProfile, price: TokenPrice, route: Route, phi: number, freeUntil: number): number {
+  let factor: number = 1
+  if (route === "local") factor = 0
+  if (route === "subscription") factor = subscriptionFactor(phi, freeUntil)
+  const perCall = profile.input_tokens * price.input + profile.output_tokens * price.output
+  return profile.calls * perCall * factor
+}
+
+// A crew model for one class (section 2). Configurations are indices into the per-role
+// tables: admit[s] is M_s, delta[s][m] the main effect q_s(m; c) (Def. 8), cost[s][m] the
+// role cost c_s(m; c) (eq. 1). q0 is the reference crew's quality. inter holds the pairwise
+// terms I_st(a, b; c) with s < t; a term applies when role s holds a and role t holds b.
+// With no inter terms the roles are additive (Assumption 1).
+export type Interaction = { s: int, t: int, a: int, b: int, v: number }
+export type CrewModel = {
+  q0: number,
+  admit: int[][],
+  delta: number[][],
+  cost: number[][],
+  inter: Interaction[],
+}
+
+export function crewQuality(model: CrewModel, crew: int[]): number {
+  let q = model.q0
+  for (let s = 0; s < crew.length; s++) q += model.delta[s]![crew[s]!]!
+  for (const it of model.inter) {
+    if (crew[it.s] === it.a && crew[it.t] === it.b) q += it.v
+  }
+  return q
+}
+
+export function crewCost(model: CrewModel, crew: int[]): number {
+  let c = 0
+  for (let s = 0; s < crew.length; s++) c += model.cost[s]![crew[s]!]!
+  return c
+}
+
+// L_lambda(m; c) = Q(m; c) - lambda C(m; c) (Prop. 1).
+export function lagrangian(model: CrewModel, crew: int[], lambda: number): number {
+  return crewQuality(model, crew) - lambda * crewCost(model, crew)
+}
+
+// Per-role argmax of delta - lambda cost (Prop. 7). Ties go to the cheaper configuration.
+// Returns -1 when the role admits nothing.
+function bestInRole(model: CrewModel, s: int, lambda: number): int {
+  let best = -1
+  let bestVal = 0
+  let bestCost = 0
+  for (const m of model.admit[s]!) {
+    const c = model.cost[s]![m]!
+    const v = model.delta[s]![m]! - lambda * c
+    if (best < 0 || v > bestVal || (v === bestVal && c < bestCost)) {
+      best = m
+      bestVal = v
+      bestCost = c
+    }
+  }
+  return best
+}
+
+// The crew maximising L_lambda. Without interactions this is the per-role argmax (Prop. 7,
+// sum of |M_s| evaluations). With interactions it starts there and runs cyclic coordinate
+// ascent, reassigning one role at a time, until no single-role change improves L (Prop. 8);
+// the result is a role-wise optimum within eta of the global one. Undefined if a role admits
+// no configuration.
+export function bestCrew(model: CrewModel, lambda: number): int[] | undefined {
+  const n = model.admit.length
+  const crew: int[] = []
+  for (let s = 0; s < n; s++) {
+    const m = bestInRole(model, s, lambda)
+    if (m < 0) return undefined
+    crew.push(m)
+  }
+  if (model.inter.length === 0) return crew
+  let improved = true
+  while (improved) {
+    improved = false
+    for (let s = 0; s < n; s++) {
+      const cur = crew[s]!
+      let best = cur
+      let bestVal = lagrangian(model, crew, lambda)
+      for (const m of model.admit[s]!) {
+        if (m === cur) continue
+        crew[s] = m
+        const v = lagrangian(model, crew, lambda)
+        if (v > bestVal) {
+          bestVal = v
+          best = m
+        }
+      }
+      crew[s] = best
+      if (best !== cur) improved = true
+    }
+  }
+  return crew
+}
+
+// The best uniform crew over M∩ = the configurations admissible in every role (Def. 2): what
+// a single-model router can reach. Undefined when M∩ is empty.
+export function diagonalBest(model: CrewModel, lambda: number): int[] | undefined {
+  if (model.admit.length === 0) return undefined
+  let best: int[] | undefined = undefined
+  let bestVal = 0
+  for (const m of model.admit[0]!) {
+    let inAll = true
+    for (let s = 1; s < model.admit.length; s++) {
+      if (model.admit[s]!.indexOf(m) < 0) inAll = false
+    }
+    if (!inAll) continue
+    const crew: int[] = []
+    for (let s = 0; s < model.admit.length; s++) crew.push(m)
+    const v = lagrangian(model, crew, lambda)
+    if (best === undefined || v > bestVal) {
+      best = crew
+      bestVal = v
+    }
+  }
+  return best
+}
+
+// A vertex of the frontier: expected cost and quality of the deterministic crews that attain
+// it, one crew per class (a single-class frontier has one).
+export type FrontierPoint = { cost: number, quality: number, crews: int[][] }
+
+// The upper concave envelope F(B) (Prop. 1) as vertices in increasing cost, and the slope
+// between each pair of neighbours. The slopes are the multipliers at which the optimal vertex
+// changes, decreasing along the frontier.
+export type Frontier = { points: FrontierPoint[], slopes: number[] }
+
+// Sample points for the sweep: the midpoints of the intervals cut by the positive breakpoints,
+// starting at 0 and running past the last one. Each vertex is the argmax on one such interval.
+function sampleLambdas(breaks: number[]): number[] {
+  const xs = breaks.slice()
+  xs.sort((a, b) => a - b)
+  const cuts: number[] = [0]
+  for (const x of xs) {
+    if (x > cuts[cuts.length - 1]!) cuts.push(x)
+  }
+  const out: number[] = []
+  for (let i = 0; i + 1 < cuts.length; i++) out.push((cuts[i]! + cuts[i + 1]!) / 2)
+  const last = cuts[cuts.length - 1]!
+  out.push(last + Math.max(1, last))
+  return out
+}
+
+// Cross product of (a - o) and (b - o) in (cost, quality): negative for a clockwise turn.
+function turn(o: FrontierPoint, a: FrontierPoint, b: FrontierPoint): number {
+  return (a.cost - o.cost) * (b.quality - o.quality) - (a.quality - o.quality) * (b.cost - o.cost)
+}
+
+// Upper hull of the Pareto-optimal points. F is non-decreasing and concave, so dominated
+// points and points under a chord are not vertices.
+function hullOf(raw: FrontierPoint[]): Frontier {
+  const sorted = raw.slice()
+  sorted.sort((a, b) => (a.cost !== b.cost ? a.cost - b.cost : b.quality - a.quality))
+  const pareto: FrontierPoint[] = []
+  for (const p of sorted) {
+    if (pareto.length === 0 || p.quality > pareto[pareto.length - 1]!.quality) pareto.push(p)
+  }
+  const hull: FrontierPoint[] = []
+  for (const p of pareto) {
+    while (hull.length >= 2 && turn(hull[hull.length - 2]!, hull[hull.length - 1]!, p) >= 0) {
+      hull.pop()
+    }
+    hull.push(p)
+  }
+  const slopes: number[] = []
+  for (let i = 0; i + 1 < hull.length; i++) {
+    const a = hull[i]!
+    const b = hull[i + 1]!
+    slopes.push((b.quality - a.quality) / (b.cost - a.cost))
+  }
+  return { points: hull, slopes }
+}
+
+// Prop. 1 for one class: sweep lambda over the breakpoints of the additive part (two
+// configurations of a role swap at (delta_b - delta_a) / (c_b - c_a)), take the best crew at
+// each sampled lambda, and keep the upper hull. Exact under role additivity; with interactions
+// each crew is the coordinate-ascent optimum, so the vertices are approximate.
+export function classFrontier(model: CrewModel): Frontier {
+  const breaks: number[] = []
+  for (let s = 0; s < model.admit.length; s++) {
+    const ms = model.admit[s]!
+    for (let i = 0; i < ms.length; i++) {
+      for (let j = i + 1; j < ms.length; j++) {
+        const a = ms[i]!
+        const b = ms[j]!
+        const dc = model.cost[s]![b]! - model.cost[s]![a]!
+        if (dc === 0) continue
+        const lam = (model.delta[s]![b]! - model.delta[s]![a]!) / dc
+        if (lam > 0) breaks.push(lam)
+      }
+    }
+  }
+  const raw: FrontierPoint[] = []
+  for (const lam of sampleLambdas(breaks)) {
+    const crew = bestCrew(model, lam)
+    if (crew === undefined) return { points: [], slopes: [] }
+    raw.push({ cost: crewCost(model, crew), quality: crewQuality(model, crew), crews: [crew] })
+  }
+  return hullOf(raw)
+}
+
+// F(B) by linear interpolation between vertices; 0 below the cheapest vertex (Def. 5) and flat
+// above the most expensive one.
+export function frontierAt(f: Frontier, budget: number): number {
+  const pts = f.points
+  if (pts.length === 0 || budget < pts[0]!.cost) return 0
+  const last = pts[pts.length - 1]!
+  if (budget >= last.cost) return last.quality
+  let i = 0
+  while (pts[i + 1]!.cost <= budget) i++
+  const a = pts[i]!
+  const b = pts[i + 1]!
+  return a.quality + ((b.quality - a.quality) * (budget - a.cost)) / (b.cost - a.cost)
+}
+
+// The vertex that maximises Q - lambda C (ties go to the cheaper one).
+export function vertexAt(f: Frontier, lambda: number): FrontierPoint | undefined {
+  let best: FrontierPoint | undefined = undefined
+  let bestVal = 0
+  for (const p of f.points) {
+    const v = p.quality - lambda * p.cost
+    if (best === undefined || v > bestVal) {
+      best = p
+      bestVal = v
+    }
+  }
+  return best
+}
+
+// Def. 5: AIQ over [blo, bhi] in log cost. On a linear piece F(B) = a + s B the integral of
+// F(B)/B is a ln(y/x) + s (y - x) exactly, so no quadrature is needed.
+export function aiq(f: Frontier, blo: number, bhi: number): number {
+  if (!(bhi > blo) || !(blo > 0)) return 0
+  const c0 = f.points.length > 0 ? f.points[0]!.cost : bhi
+  const cuts: number[] = [blo]
+  for (const p of f.points) {
+    if (p.cost > blo && p.cost < bhi) cuts.push(p.cost)
+  }
+  cuts.push(bhi)
+  cuts.sort((a, b) => a - b)
+  let total = 0
+  for (let i = 0; i + 1 < cuts.length; i++) {
+    const x = cuts[i]!
+    const y = cuts[i + 1]!
+    // F is 0 below the cheapest vertex and jumps there, so no piece may straddle it
+    if (y <= x || y <= c0) continue
+    const fx = frontierAt(f, x)
+    const fy = frontierAt(f, y)
+    const s = (fy - fx) / (y - x)
+    const a = fx - s * x
+    total += a * Math.log(y / x) + s * (y - x)
+  }
+  return total / Math.log(bhi / blo)
+}
+
+export type Knee = { budget: number, u: number, quality: number, lambda: number, endpoint: boolean }
+
+// Def. 6 (Kneedle on F(e^u)) over the frontier's own cost range [Bmin, Bmax]. The distance above
+// the chord is convex between vertices, so its maximum is at a vertex or an endpoint. Ties go to
+// the smaller u. lambda_knee = dbar / e^{u*} (Prop. 2). endpoint is true when the knee sits at
+// Bmin or Bmax, where that multiplier need not be supporting.
+export function knee(f: Frontier): Knee | undefined {
+  // vertices that cost nothing (free local crews) have no log budget; the domain starts at the
+  // first priced vertex
+  const pts: FrontierPoint[] = []
+  for (const p of f.points) {
+    if (p.cost > 0) pts.push(p)
+  }
+  if (pts.length < 2) return undefined
+  const first = pts[0]!
+  const last = pts[pts.length - 1]!
+  const u0 = Math.log(first.cost)
+  const u1 = Math.log(last.cost)
+  const F0 = first.quality
+  const F1 = last.quality
+  const dbar = (F1 - F0) / (u1 - u0)
+  let bestB = first.cost
+  let bestG = 0
+  let found = false
+  for (const p of pts) {
+    const g = p.quality - F0 - dbar * (Math.log(p.cost) - u0)
+    if (!found || g > bestG + 1e-12) {
+      found = true
+      bestG = g
+      bestB = p.cost
+    }
+  }
+  return {
+    budget: bestB,
+    u: Math.log(bestB),
+    quality: frontierAt(f, bestB),
+    lambda: dbar / bestB,
+    endpoint: bestB === first.cost || bestB === last.cost,
+  }
+}
+
+// Population frontier over classes with weights (normalised here). At a common lambda the
+// population optimum is each class's own argmax (Prop. 1 per class), so its vertices are
+// weighted sums of the class vertices. crews holds one crew per class.
+export function populationFrontier(classes: Frontier[], weights: number[]): Frontier {
+  let wsum = 0
+  for (let c = 0; c < classes.length; c++) wsum += weights[c]!
+  const breaks: number[] = []
+  for (const f of classes) {
+    for (const x of f.slopes) {
+      if (x > 0) breaks.push(x)
+    }
+  }
+  const raw: FrontierPoint[] = []
+  for (const lam of sampleLambdas(breaks)) {
+    let cost = 0
+    let quality = 0
+    const crews: int[][] = []
+    for (let c = 0; c < classes.length; c++) {
+      const v = vertexAt(classes[c]!, lam)
+      if (v === undefined) return { points: [], slopes: [] }
+      const w = weights[c]! / wsum
+      cost += w * v.cost
+      quality += w * v.quality
+      crews.push(v.crews[0]!)
+    }
+    raw.push({ cost, quality, crews })
+  }
+  return hullOf(raw)
+}
+
+// Warm start for budget pacing: the multiplier whose predicted policy cost equals the budget,
+// i.e. the slope of the frontier segment that spans it (Prop. 1). Above the most expensive vertex
+// it is 0; below the cheapest one, the largest breakpoint.
+export function warmStart(f: Frontier, budget: number): number {
+  const pts = f.points
+  if (pts.length < 2) return 0
+  if (budget >= pts[pts.length - 1]!.cost) return 0
+  if (budget <= pts[0]!.cost) return f.slopes[0]!
+  let i = 0
+  while (pts[i + 1]!.cost < budget) i++
+  return f.slopes[i]!
+}
+
+// Eq. (12): a multiplicative dual step on the budget constraint, the realised ratio clipped to
+// [-1, 1]. Lambda and budget must be positive; otherwise lambda comes back unchanged.
+export function pace(lambda: number, realisedCost: number, budget: number, step: number): number {
+  if (!(lambda > 0) || !(budget > 0)) return lambda
+  let x = realisedCost / budget - 1
+  if (x > 1) x = 1
+  if (x < -1) x = -1
+  return lambda * Math.exp(step * x)
+}
+
+// Eq. (10) and Prop. 9: credibility blend of a cell's own estimate with its prior. Z = nI /
+// (nI + scale^-2); with no evidence the prior stands. info is the mean information per task.
+export function credibilityWeight(n: number, info: number, priorScale: number): number {
+  const ni = n * info
+  if (!(ni > 0)) return 0
+  return ni / (ni + 1 / (priorScale * priorScale))
+}
+
+export function credibility(own: number, n: number, info: number, prior: number, priorScale: number): number {
+  const z = credibilityWeight(n, info, priorScale)
+  return z * own + (1 - z) * prior
+}
+
+// One level of the nested blend (Prop. 9): its own estimate, evidence count and mean information,
+// and the between-level prior scale.
+export type CredLevel = { own: number, n: number, info: number, scale: number }
+
+// The exact recursion of Prop. 9: each level's prior has variance scale^2 + v_prev, so the
+// posterior mean and variance carry down the levels. base and baseVar are the top prior
+// (catalog metadata, or 0 with baseVar 0 when nothing is known above the first level).
+export function credibilityChain(base: number, baseVar: number, levels: CredLevel[]): { mean: number, variance: number } {
+  let mean = base
+  let v = baseVar
+  for (const lv of levels) {
+    const pv = lv.scale * lv.scale + v
+    const ni = lv.n * lv.info
+    const z = ni > 0 ? ni / (ni + 1 / pv) : 0
+    mean = z * lv.own + (1 - z) * mean
+    v = 1 / (1 / pv + ni)
+  }
+  return { mean, variance: v }
+}
+
+// Prop. 11: the reservation value sigma of a noisy binary verifier of accuracy r (r > 1/2) on an
+// attempt of success probability p and cost C, at multiplier lambda. It solves
+// E[(X - sigma)+] = lambda C for the posterior X of the attempt's correctness. As r -> 1/2
+// the value tends to p - lambda C; at r = 1 it is 1 - lambda C / p while lambda C <= p, and
+// p - lambda C after that. For p outside (0, 1) it is p - lambda C.
+export function reservationIndex(p: number, r: number, lambda: number, cost: number): number {
+  const lc = lambda * cost
+  if (!(p > 0) || !(p < 1)) return p - lc
+  const pPlus = p * r + (1 - p) * (1 - r)
+  const xPlus = (p * r) / pPlus
+  const xMinus = (p * (1 - r)) / (1 - pPlus)
+  if (lc <= pPlus * (xPlus - xMinus)) return xPlus - lc / pPlus
+  return p - lc
+}
+
+export type Threshold = { rStar: number, D: number }
+
+// Theorem 2: the verifier accuracy above which the two-stage cascade (cheap model 1, then model 2
+// on a failed verdict) beats the chord between the two configurations. p1, p2 are the success
+// probabilities, C1 < C2 the costs, p10 and p01 the discordance probabilities. Returns undefined
+// ("not applicable") when D <= 0, when the costs are not 0 <= C1 < C2, or when the escalation
+// probability e(r) = p1(1-r) + (1-p1)r exceeds 1 - rho at r* or at r = 1 (e is linear in r).
+export function verifierThreshold(p1: number, p2: number, C1: number, C2: number, p10: number, p01: number): Threshold | undefined {
+  if (!(C2 > 0) || !(C1 >= 0) || !(C1 < C2)) return undefined
+  const rho = C1 / C2
+  const chi = (p2 - p1) / (1 - rho)
+  const D = p10 + p01 - (1 - 2 * p1) * chi
+  if (!(D > 0)) return undefined
+  const rStar = (p10 + p1 * chi) / D
+  const eAtStar = p1 * (1 - rStar) + (1 - p1) * rStar
+  const eAtOne = 1 - p1
+  if (eAtStar > 1 - rho || eAtOne > 1 - rho) return undefined
+  return { rStar, D }
+}
+
+// G(r) = D (r - r*), the cascade's advantage over the chord (Thm. 2).
+export function verifierGain(t: Threshold, r: number): number {
+  return t.D * (r - t.rStar)
+}
+
+// Gauss-Hermite rule for the standard normal: nodes z and weights w summing to 1. Computed by
+// Newton iteration on the Hermite recurrence (Numerical Recipes gauher), then rescaled from the
+// physicists' weight e^{-x^2}. Exact for polynomials up to degree 2n - 1.
+export type Quad = { z: number[], w: number[] }
+
+export function gaussHermiteNormal(n: int): Quad {
+  const x: number[] = []
+  const wt: number[] = []
+  for (let i = 0; i < n; i++) {
+    x.push(0)
+    wt.push(0)
+  }
+  const m = Math.floor((n + 1) / 2)
+  let z = 0
+  for (let i = 0; i < m; i++) {
+    if (i === 0) z = Math.sqrt(2 * n + 1) - 1.85575 * Math.pow(2 * n + 1, -1 / 6)
+    else if (i === 1) z = z - (1.14 * Math.pow(n, 0.426)) / z
+    else if (i === 2) z = 1.86 * z - 0.86 * x[0]!
+    else if (i === 3) z = 1.91 * z - 0.91 * x[1]!
+    else z = 2 * z - x[i - 2]!
+    let pp = 1
+    for (let it = 0; it < 100; it++) {
+      let p1 = 0.7511255444649425
+      let p2 = 0
+      for (let j = 1; j <= n; j++) {
+        const p3 = p2
+        p2 = p1
+        p1 = z * Math.sqrt(2 / j) * p2 - Math.sqrt((j - 1) / j) * p3
+      }
+      pp = Math.sqrt(2 * n) * p2
+      const z1 = z
+      z = z1 - p1 / pp
+      if (Math.abs(z - z1) < 1e-13) break
+    }
+    x[i] = z
+    x[n - 1 - i] = -z
+    wt[i] = 2 / (pp * pp)
+    wt[n - 1 - i] = wt[i]!
+  }
+  const zs: number[] = []
+  const ws: number[] = []
+  for (let i = 0; i < n; i++) {
+    zs.push(Math.sqrt(2) * x[i]!)
+    ws.push(wt[i]! / Math.sqrt(Math.PI))
+  }
+  return { z: zs, w: ws }
+}
+
+function sigmoid(x: number): number {
+  return 1 / (1 + Math.exp(-x))
+}
+
+// A candidate of the within-task model (section 2.1, 3.4): logit ell and discrimination kappa,
+// its base model (candidates of one base share the effect u), and omega, the spread of the
+// task-by-candidate effect e.
+export type WithinCand = { logit: number, kappa: number, base: int, omega: number }
+
+// tau: spread of task difficulty; omegaBase: spread of the base-model effect; r: verifier
+// accuracy; cands: the candidates in the order the attempts refer to them.
+export type WithinSpec = { tau: number, omegaBase: number, r: number, cands: WithinCand[] }
+
+// One attempt: the candidate's index and the verifier's signal (pass or fail).
+export type Attempt = { cand: int, pass: boolean }
+
+// next[m]: probability that candidate m's next attempt succeeds, given the signals so far.
+// answer[t]: probability that attempt t's answer is correct, given all signals so far.
+export type WithinPosterior = { next: number[], answer: number[] }
+
+// Posterior over the task after its attempts (section 3.4). Success of attempt of candidate m is
+// sigma(ell_m - kappa_m tau z + u_base + e_m), with z ~ N(0,1) the task difficulty, u the base
+// effect and e_m the task-by-candidate effect (fresh for each candidate, so a retry of a failed
+// candidate repeats it). A verifier signal of accuracy r is P(signal | outcome). Given z the
+// bases are independent, so z is integrated on a 41-point grid, u per base on 9 points and e per
+// candidate on 15 points (Gauss-Hermite). The only approximation is that grid.
+export function withinPosterior(spec: WithinSpec, attempts: Attempt[]): WithinPosterior {
+  const zq = gaussHermiteNormal(41)
+  const uq = gaussHermiteNormal(9)
+  const eq = gaussHermiteNormal(15)
+  const nz = zq.z.length
+  const nu = uq.z.length
+  const ne = eq.z.length
+  const nc = spec.cands.length
+  const r = spec.r
+  // Signal likelihoods: q1 = P(signal | correct), q0 = P(signal | wrong).
+  const q1: number[] = []
+  const q0: number[] = []
+  for (const a of attempts) {
+    q1.push(a.pass ? r : 1 - r)
+    q0.push(a.pass ? 1 - r : r)
+  }
+  // For candidate m and cell (i, j) = (z node, u node): F is the e-integral of the signal
+  // likelihood of its attempts, H the same with the success probability, G[t] the e-integral of
+  // attempt t's correct-and-signal term with the other attempts' likelihoods.
+  const F: number[][] = []
+  const H: number[][] = []
+  const G: number[][] = []
+  for (let t = 0; t < attempts.length; t++) G.push([])
+  for (let m = 0; m < nc; m++) {
+    const c = spec.cands[m]!
+    const mine: int[] = []
+    for (let t = 0; t < attempts.length; t++) {
+      if (attempts[t]!.cand === m) mine.push(t)
+    }
+    const ma = mine.length
+    const fm: number[] = []
+    const hm: number[] = []
+    for (let i = 0; i < nz; i++) {
+      for (let j = 0; j < nu; j++) {
+        let fs = 0
+        let hs = 0
+        const acc: number[] = []
+        for (let q = 0; q < ma; q++) acc.push(0)
+        for (let k = 0; k < ne; k++) {
+          const eta = c.logit - c.kappa * spec.tau * zq.z[i]! + spec.omegaBase * uq.z[j]! + c.omega * eq.z[k]!
+          const s = sigmoid(eta)
+          const fv: number[] = []
+          for (let q = 0; q < ma; q++) fv.push(s * q1[mine[q]!]! + (1 - s) * q0[mine[q]!]!)
+          let prod = 1
+          for (let q = 0; q < ma; q++) prod *= fv[q]!
+          fs += eq.w[k]! * prod
+          hs += eq.w[k]! * s * prod
+          for (let q = 0; q < ma; q++) {
+            let others = s * q1[mine[q]!]!
+            for (let q2 = 0; q2 < ma; q2++) {
+              if (q2 !== q) others *= fv[q2]!
+            }
+            acc[q] = acc[q]! + eq.w[k]! * others
+          }
+        }
+        fm.push(fs)
+        hm.push(hs)
+        for (let q = 0; q < ma; q++) G[mine[q]!]!.push(acc[q]!)
+      }
+    }
+    F.push(fm)
+    H.push(hm)
+  }
+  // Bases: distinct base ids in order of first use.
+  const bases: int[] = []
+  for (const c of spec.cands) {
+    if (bases.indexOf(c.base) < 0) bases.push(c.base)
+  }
+  // phi[b][i]: the integral over u of base b's candidates at difficulty node i.
+  const phi: number[][] = []
+  for (const b of bases) {
+    const row: number[] = []
+    for (let i = 0; i < nz; i++) {
+      let sum = 0
+      for (let j = 0; j < nu; j++) {
+        let p = 1
+        for (let m = 0; m < nc; m++) {
+          if (spec.cands[m]!.base === b) p *= F[m]![i * nu + j]!
+        }
+        sum += uq.w[j]! * p
+      }
+      row.push(sum)
+    }
+    phi.push(row)
+  }
+  let ztot = 0
+  for (let i = 0; i < nz; i++) {
+    let p = 1
+    for (let bi = 0; bi < bases.length; bi++) p *= phi[bi]![i]!
+    ztot += zq.w[i]! * p
+  }
+  const next: number[] = []
+  for (let m = 0; m < nc; m++) {
+    next.push(sharedTotal(spec, bases, phi, F, H[m]!, m, zq.w, uq.w, nz, nu) / ztot)
+  }
+  const answer: number[] = []
+  for (let t = 0; t < attempts.length; t++) {
+    const m = attempts[t]!.cand
+    answer.push(sharedTotal(spec, bases, phi, F, G[t]!, m, zq.w, uq.w, nz, nu) / ztot)
+  }
+  return { next, answer }
+}
+
+// Sum over the posterior grid of the candidate m's own term vals, with the other candidates'
+// factors: the other bases at each z node (phi), and the same base's other candidates at each
+// (z, u) cell (F).
+function sharedTotal(spec: WithinSpec, bases: int[], phi: number[][], F: number[][], vals: number[], m: int, zw: number[], uw: number[], nz: int, nu: int): number {
+  const base = spec.cands[m]!.base
+  let total = 0
+  for (let i = 0; i < nz; i++) {
+    let ex = 1
+    for (let bi = 0; bi < bases.length; bi++) {
+      if (bases[bi]! !== base) ex *= phi[bi]![i]!
+    }
+    let inner = 0
+    for (let j = 0; j < nu; j++) {
+      const cell = i * nu + j
+      let oth = 1
+      for (let m2 = 0; m2 < spec.cands.length; m2++) {
+        if (m2 !== m && spec.cands[m2]!.base === base) oth *= F[m2]![cell]!
+      }
+      inner += uw[j]! * vals[cell]! * oth
+    }
+    total += zw[i]! * ex * inner
+  }
+  return total
+}
+
+// State of the sequential layer at one step (section 3.4). next and cost are per candidate;
+// used counts each candidate's attempts so far; total the attempts so far.
+export type SeqState = {
+  lambda: number,
+  r: number,
+  bestInHand: number,
+  next: number[],
+  cost: number[],
+  used: int[],
+  total: number,
+  maxTotal: number,
+  perCandidate: number,
+}
+
+export type SeqStep = { action: "accept" } | { action: "attempt", cand: int, index: number }
+
+// Pandora's rule on the posterior: open the candidate with the largest reservation index while
+// that index exceeds the value of accepting the best answer in hand; otherwise accept. A
+// verifier with r <= 1/2 carries no information, so the step accepts.
+export function sequentialStep(s: SeqState): SeqStep {
+  if (s.total >= s.maxTotal || !(s.r > 0.5)) return { action: "accept" }
+  let best = -1
+  let bestIdx = 0
+  for (let m = 0; m < s.next.length; m++) {
+    if (s.used[m]! >= s.perCandidate) continue
+    const idx = reservationIndex(s.next[m]!, s.r, s.lambda, s.cost[m]!)
+    if (best < 0 || idx > bestIdx) {
+      best = m
+      bestIdx = idx
+    }
+  }
+  if (best < 0 || bestIdx <= s.bestInHand) return { action: "accept" }
+  return { action: "attempt", cand: best, index: bestIdx }
+}
+
+// ---- tests ----
+
+// Prop. 4(ii) and Prop. 5 examples; the pairs are two configurations (0 = cheap, 1 = strong).
+function twoByTwo(delta: number[][], cost: number[][], inter: Interaction[]): CrewModel {
+  return { q0: 0, admit: [[0, 1], [0, 1]], delta, cost, inter }
+}
+
+// Deterministic generator (Lehmer), so the randomised checks are reproducible.
+function rnd(inout st: int[]): number {
+  st[0] = (st[0]! * 16807) % 2147483647
+  return st[0]! / 2147483647
+}
+
+function randomModel(inout st: int[], n: int, k: int, withInter: bool): CrewModel {
+  const admit: int[][] = []
+  const delta: number[][] = []
+  const cost: number[][] = []
+  const inter: Interaction[] = []
+  for (let s = 0; s < n; s++) {
+    const ms: int[] = []
+    const ds: number[] = []
+    const cs: number[] = []
+    for (let m = 0; m < k; m++) {
+      ms.push(m)
+      ds.push(rnd(&st))
+      cs.push(0.5 + 2.5 * rnd(&st))
+    }
+    admit.push(ms)
+    delta.push(ds)
+    cost.push(cs)
+  }
+  if (withInter) {
+    for (let s = 0; s < n; s++) {
+      for (let t = s + 1; t < n; t++) {
+        for (let a = 0; a < k; a++) {
+          for (let b = 0; b < k; b++) {
+            inter.push({ s, t, a, b, v: 0.6 * rnd(&st) - 0.3 })
+          }
+        }
+      }
+    }
+  }
+  return { q0: 0, admit, delta, cost, inter }
+}
+
+function allCrews(admit: int[][]): int[][] {
+  let out: int[][] = [[]]
+  for (const ms of admit) {
+    const next: int[][] = []
+    for (const c of out) {
+      for (const m of ms) {
+        const d = c.slice()
+        d.push(m)
+        next.push(d)
+      }
+    }
+    out = next
+  }
+  return out
+}
+
+function interOf(model: CrewModel, crew: int[]): number {
+  let v = 0
+  for (const it of model.inter) {
+    if (crew[it.s] === it.a && crew[it.t] === it.b) v += it.v
+  }
+  return v
+}
+
+test("roleCost follows Def. 4: API list price, local free, subscription times h(phi)", () => {
+  const p: CallProfile = { calls: 40, input_tokens: 9000, output_tokens: 700 }
+  const price: TokenPrice = { input: 0.000003, output: 0.000015 }
+  expect(roleCost(p, price, "api", 0.5, 0.2)).toBeCloseTo(1.5, 9)
+  expect(roleCost(p, price, "local", 0, 0.2)).toBeCloseTo(0, 9)
+  expect(roleCost(p, price, "subscription", 0.1, 0.2)).toBeCloseTo(0.75, 9)
+  expect(roleCost(p, price, "subscription", 0.2, 0.2)).toBeCloseTo(0, 9)
+  expect(roleCost(p, price, "subscription", 0, 0.2)).toBeCloseTo(1.5, 9)
+  expect(subscriptionFactor(0.05, 0.2)).toBeCloseTo(0.75, 9)
+})
+
+test("bestCrew is the per-role argmax without interactions (Prop. 7), and matches exhaustive search", () => {
+  let st: int[] = [4242]
+  for (let it = 0; it < 80; it++) {
+    const model = randomModel(&st, 3, 4, false)
+    const lam = 3 * rnd(&st)
+    const best = bestCrew(model, lam)
+    expect(best !== undefined).toBe(true)
+    const b = best!
+    let maxL: number = -1000000
+    for (const c of allCrews(model.admit)) {
+      const L = lagrangian(model, c, lam)
+      if (L > maxL) maxL = L
+    }
+    expect(Math.abs(lagrangian(model, b, lam) - maxL) < 1e-9).toBe(true)
+  }
+})
+
+test("Prop. 4(ii): with leverage ratios straddling lambda the best crew is off the diagonal", () => {
+  // Leverage 0.4 in role 1 and 0.1 in role 2; lambda 0.2 lies between them
+  const model = twoByTwo([[0.5, 0.9], [0.6, 0.7]], [[1, 2], [1, 2]], [])
+  const best = bestCrew(model, 0.2)
+  expect(best).toEqual([1, 0])
+  expect(diagonalBest(model, 0.2)).toEqual([1, 1])
+  expect(lagrangian(model, [1, 0], 0.2)).toBeCloseTo(0.9, 9)
+  expect(lagrangian(model, [1, 1], 0.2)).toBeCloseTo(0.8, 9)
+  expect(lagrangian(model, [0, 0], 0.2)).toBeCloseTo(0.7, 9)
+})
+
+test("Prop. 5: a compensating role gives an off-diagonal optimum the additive surrogate misses", () => {
+  // Q(a,a)=0.5, Q(a,b)=0.8, Q(b,a)=0.7, Q(b,b)=0.9 written as q0 + main effects + one term
+  // relative to the reference (b, b); costs 1 for a and 2 for b in both roles; lambda 0.25
+  const delta: number[][] = [[-0.1, 0], [-0.2, 0]]
+  const cost: number[][] = [[1, 2], [1, 2]]
+  const withInter: CrewModel = { q0: 0.9, admit: [[0, 1], [0, 1]], delta, cost, inter: [{ s: 0, t: 1, a: 0, b: 0, v: -0.1 }] }
+  expect(crewQuality(withInter, [0, 0])).toBeCloseTo(0.5, 9)
+  expect(crewQuality(withInter, [0, 1])).toBeCloseTo(0.8, 9)
+  expect(crewQuality(withInter, [1, 0])).toBeCloseTo(0.7, 9)
+  expect(crewQuality(withInter, [1, 1])).toBeCloseTo(0.9, 9)
+  expect(bestCrew(withInter, 0.25)).toEqual([0, 1])
+  expect(lagrangian(withInter, [0, 1], 0.25)).toBeCloseTo(0.05, 9)
+  expect(diagonalBest(withInter, 0.25)).toEqual([0, 0])
+  // The additive surrogate (no interaction term) picks the uniform cheap crew
+  const surrogate: CrewModel = { q0: 0.9, admit: [[0, 1], [0, 1]], delta, cost, inter: [] }
+  expect(bestCrew(surrogate, 0.25)).toEqual([0, 0])
+})
+
+test("Prop. 8: coordinate ascent is a role-wise optimum within eta of the best crew", () => {
+  let st: int[] = [99]
+  for (let it = 0; it < 60; it++) {
+    const model = randomModel(&st, 3, 4, true)
+    const lam = 0.1 + 2 * rnd(&st)
+    const crews = allCrews(model.admit)
+    let maxL: number = -1000000
+    let minI: number = 1000000
+    let maxI: number = -1000000
+    for (const c of crews) {
+      const L = lagrangian(model, c, lam)
+      if (L > maxL) maxL = L
+      const I = interOf(model, c)
+      if (I < minI) minI = I
+      if (I > maxI) maxI = I
+    }
+    const best = bestCrew(model, lam)
+    expect(best !== undefined).toBe(true)
+    const b = best!
+    expect(lagrangian(model, b, lam) >= maxL - (maxI - minI) - 1e-9).toBe(true)
+    for (let s = 0; s < 3; s++) {
+      for (const m of model.admit[s]!) {
+        const alt = b.slice()
+        alt[s] = m
+        expect(lagrangian(model, alt, lam) <= lagrangian(model, b, lam) + 1e-12).toBe(true)
+      }
+    }
+  }
+})
+
+test("Prop. 1: the frontier's vertices support every Lagrangian optimum", () => {
+  let st: int[] = [777]
+  for (let it = 0; it < 30; it++) {
+    const model = randomModel(&st, 3, 4, false)
+    const f = classFrontier(model)
+    expect(f.points.length >= 1).toBe(true)
+    for (let i = 0; i + 1 < f.slopes.length; i++) {
+      expect(f.slopes[i]! >= f.slopes[i + 1]! - 1e-12).toBe(true)
+    }
+    for (let j = 0; j < 40; j++) {
+      const lam = 0.02 + 0.1 * j + 0.013 * rnd(&st)
+      let maxL: number = -1000000
+      for (const c of allCrews(model.admit)) {
+        const L = lagrangian(model, c, lam)
+        if (L > maxL) maxL = L
+      }
+      const v = vertexAt(f, lam)
+      expect(v !== undefined).toBe(true)
+      const vv = v!
+      expect(Math.abs(vv.quality - lam * vv.cost - maxL) < 1e-9).toBe(true)
+    }
+  }
+})
+
+test("AIQ integrates F(B)/B exactly on the log scale (Def. 5)", () => {
+  const one: Frontier = { points: [{ cost: 2, quality: 0.6, crews: [[0]] }], slopes: [] }
+  // flat at 0.6 over [2, 20]: the integral is 0.6 ln 10, divided by ln 10
+  expect(aiq(one, 2, 20)).toBeCloseTo(0.6, 9)
+  // F(1) = 0.2, F(10) = 0.8, linear between: 0.13333 + 0.6 / ln 10 (Python reference 0.3939100)
+  const two: Frontier = {
+    points: [{ cost: 1, quality: 0.2, crews: [[0]] }, { cost: 10, quality: 0.8, crews: [[0]] }],
+    slopes: [0.6 / 9],
+  }
+  expect(aiq(two, 1, 10)).toBeCloseTo(0.39391, 5)
+  // zero below the cheapest vertex
+  expect(aiq(two, 0.5, 10)).toBeCloseTo(0.39391 * Math.log(10) / Math.log(20), 5)
+})
+
+test("knee is the Kneedle point, and lambda_knee = dbar / B* (Def. 6)", () => {
+  const f: Frontier = {
+    points: [
+      { cost: 1, quality: 0.2, crews: [[0]] },
+      { cost: 2, quality: 0.6, crews: [[0]] },
+      { cost: 4, quality: 0.7, crews: [[0]] },
+      { cost: 8, quality: 0.75, crews: [[0]] },
+    ],
+    slopes: [0.4, 0.05, 0.0125],
+  }
+  const k = knee(f)
+  expect(k !== undefined).toBe(true)
+  const kk = k!
+  expect(kk.budget).toBeCloseTo(2, 9)
+  expect(kk.endpoint).toBe(false)
+  expect(kk.lambda).toBeCloseTo(0.132247, 5)
+  // a free vertex in front (a local crew) does not move the knee
+  const withFree: FrontierPoint[] = [{ cost: 0, quality: 0.1, crews: [[0]] }]
+  for (const p of f.points) withFree.push(p)
+  const freeFirst: Frontier = { points: withFree, slopes: [] }
+  expect(knee(freeFirst)!.budget).toBeCloseTo(2, 9)
+  // knee is invariant to rescaling all prices (budget scales, lambda scales inversely)
+  const g: Frontier = {
+    points: [
+      { cost: 7, quality: 0.2, crews: [[0]] },
+      { cost: 14, quality: 0.6, crews: [[0]] },
+      { cost: 28, quality: 0.7, crews: [[0]] },
+      { cost: 56, quality: 0.75, crews: [[0]] },
+    ],
+    slopes: [0.4 / 7, 0.05 / 7, 0.0125 / 7],
+  }
+  const k2 = knee(g)
+  expect(k2 !== undefined).toBe(true)
+  expect(k2!.budget).toBeCloseTo(14, 9)
+  expect(k2!.lambda).toBeCloseTo(kk.lambda / 7, 9)
+})
+
+test("the knee crew does not change when all prices are rescaled (Prop. 2)", () => {
+  let st: int[] = [31337]
+  const model = randomModel(&st, 3, 4, false)
+  const scaled: CrewModel = {
+    q0: model.q0,
+    admit: model.admit,
+    delta: model.delta,
+    cost: model.cost.map((row: number[]) => row.map((c: number) => 7 * c)),
+    inter: model.inter,
+  }
+  const k1 = knee(classFrontier(model))
+  const k2 = knee(classFrontier(scaled))
+  expect(k1 !== undefined && k2 !== undefined).toBe(true)
+  const a = bestCrew(model, k1!.lambda)
+  const b = bestCrew(scaled, k2!.lambda)
+  expect(a).toEqual(b)
+  expect(k2!.budget).toBeCloseTo(7 * k1!.budget, 9)
+})
+
+test("warm start returns the slope of the segment spanning the budget; pace moves lambda with the clip", () => {
+  const f: Frontier = {
+    points: [
+      { cost: 1, quality: 0.2, crews: [[0]] },
+      { cost: 2, quality: 0.6, crews: [[0]] },
+      { cost: 4, quality: 0.7, crews: [[0]] },
+      { cost: 8, quality: 0.75, crews: [[0]] },
+    ],
+    slopes: [0.4, 0.05, 0.0125],
+  }
+  expect(warmStart(f, 3)).toBeCloseTo(0.05, 9)
+  expect(warmStart(f, 1.5)).toBeCloseTo(0.4, 9)
+  expect(warmStart(f, 9)).toBeCloseTo(0, 9)
+  // the argmax just above the slope is the cheaper vertex
+  expect(vertexAt(f, 0.05 + 1e-9)!.cost).toBeCloseTo(2, 9)
+  expect(vertexAt(f, 0.05 - 1e-9)!.cost).toBeCloseTo(4, 9)
+
+  expect(pace(1, 2, 1, 0.5)).toBeCloseTo(Math.exp(0.5), 9)
+  expect(pace(1, 100, 1, 0.5)).toBeCloseTo(Math.exp(0.5), 9)
+  expect(pace(1, 0.5, 1, 0.5)).toBeCloseTo(Math.exp(-0.25), 9)
+  expect(pace(1, 1, 1, 0.5)).toBeCloseTo(1, 9)
+  expect(pace(0, 5, 1, 0.5)).toBeCloseTo(0, 9)
+})
+
+test("population frontier of identical classes is the class frontier", () => {
+  let st: int[] = [5]
+  const model = randomModel(&st, 3, 4, false)
+  const f = classFrontier(model)
+  const pop = populationFrontier([f, f], [0.3, 0.7])
+  expect(pop.points.length).toBe(f.points.length)
+  for (let i = 0; i < f.points.length; i++) {
+    expect(pop.points[i]!.cost).toBeCloseTo(f.points[i]!.cost, 9)
+    expect(pop.points[i]!.quality).toBeCloseTo(f.points[i]!.quality, 9)
+  }
+})
+
+test("credibility blends own and prior by Z = nI / (nI + scale^-2) (eq. 10)", () => {
+  expect(credibilityWeight(3, 0.5, 1)).toBeCloseTo(0.6, 9)
+  expect(credibility(1, 3, 0.5, 0, 1)).toBeCloseTo(0.6, 9)
+  expect(credibility(1, 0, 0.5, 0.3, 1)).toBeCloseTo(0.3, 9)
+  // nested: level 1 gives mean 0.6 and variance 0.4; level 2 (prior variance 1.4) gives 1.416667
+  const c = credibilityChain(0, 0, [
+    { own: 1, n: 3, info: 0.5, scale: 1 },
+    { own: 2, n: 2, info: 0.5, scale: 1 },
+  ])
+  expect(c.mean).toBeCloseTo(1.416667, 5)
+  expect(c.variance).toBeCloseTo(0.583333, 5)
+})
+
+test("Gauss-Hermite rule with 41 nodes integrates the standard normal moments exactly", () => {
+  const q = gaussHermiteNormal(41)
+  expect(q.z.length).toBe(41)
+  let m0: number = 0
+  let m2: number = 0
+  let m4: number = 0
+  let m8: number = 0
+  let m20: number = 0
+  for (let i = 0; i < q.z.length; i++) {
+    const z = q.z[i]!
+    const w = q.w[i]!
+    m0 += w
+    m2 += w * z * z
+    m4 += w * z * z * z * z
+    m8 += w * Math.pow(z, 8)
+    m20 += w * Math.pow(z, 20)
+  }
+  expect(m0).toBeCloseTo(1, 12)
+  expect(m2).toBeCloseTo(1, 10)
+  expect(m4).toBeCloseTo(3, 10)
+  expect(m8).toBeCloseTo(105, 6)
+  expect(m20).toBeCloseTo(654729075, 0)
+})
+
+test("Prop. 11: closed-form reservation index, both branches, and the defining equation", () => {
+  // r = 1/2: no option value, sigma = p - lambda C
+  expect(reservationIndex(0.4, 0.5, 2, 0.1)).toBeCloseTo(0.2, 9)
+  // r = 1: sigma = 1 - lambda C / p while lambda C <= p, else p - lambda C
+  expect(reservationIndex(0.4, 1, 2, 0.1)).toBeCloseTo(0.5, 9)
+  expect(reservationIndex(0.4, 1, 5, 0.1)).toBeCloseTo(-0.1, 9)
+  // interior: p = 0.3, r = 0.8, lambda C = 0.1 gives sigma = x+ - 0.1 / P+ = 0.368421
+  expect(reservationIndex(0.3, 0.8, 1, 0.1)).toBeCloseTo(0.368421, 5)
+  // and f(sigma) = E(X - sigma)+ = P+ (x+ - sigma) = lambda C there
+  const pPlus = 0.3 * 0.8 + 0.7 * 0.2
+  const sigma = reservationIndex(0.3, 0.8, 1, 0.1)
+  expect(pPlus * (0.24 / pPlus - sigma)).toBeCloseTo(0.1, 6)
+  // lambda C = 0.3 is past the first branch: sigma = p - lambda C = 0
+  expect(reservationIndex(0.3, 0.8, 3, 0.1)).toBeCloseTo(0, 9)
+})
+
+test("Theorem 2: verifier threshold r* and D, Corollary 1, and the not-applicable cases", () => {
+  const t = verifierThreshold(0.3, 0.7, 1, 10, 0.09, 0.49)
+  expect(t !== undefined).toBe(true)
+  expect(t!.D).toBeCloseTo(0.402222, 5)
+  expect(t!.rStar).toBeCloseTo(0.555249, 5)
+  // the second form of (13): 1/2 + rho (p2 - p1) / (2 (1 - rho) D)
+  expect(0.5 + (0.1 * 0.4) / (2 * 0.9 * t!.D)).toBeCloseTo(t!.rStar, 9)
+  expect(verifierGain(t!, 0.8)).toBeCloseTo(t!.D * (0.8 - t!.rStar), 9)
+  // free cheap stage: r* tends to 1/2
+  const free = verifierThreshold(0.3, 0.7, 0.000000001, 1, 0.09, 0.49)
+  expect(free !== undefined).toBe(true)
+  expect(free!.rStar).toBeCloseTo(0.5, 5)
+  // D <= 0: not applicable
+  expect(verifierThreshold(0.5, 0.6, 1, 10, 0, 0)).toBeUndefined()
+  // escalation probability above 1 - rho: not applicable
+  expect(verifierThreshold(0.5, 0.6, 0.9, 1, 0.2, 0.3)).toBeUndefined()
+})
+
+test("withinPosterior: no evidence gives the prior, a sigmoid when there is no spread", () => {
+  const spec: WithinSpec = { tau: 1.6, omegaBase: 0, r: 0.8, cands: [{ logit: 0.5, kappa: 0, base: 0, omega: 0 }] }
+  const p = withinPosterior(spec, [])
+  expect(p.next[0]!).toBeCloseTo(0.6224593, 6)
+  expect(p.answer.length).toBe(0)
+  // fresh candidate with spread 1.5: E[sigma(0.5 + 1.5 e)] = 0.5876 (Python reference)
+  const spread: WithinSpec = { tau: 1.6, omegaBase: 0, r: 0.8, cands: [{ logit: 0.5, kappa: 0, base: 0, omega: 1.5 }] }
+  expect(withinPosterior(spread, []).next[0]!).toBeCloseTo(0.587596, 3)
+})
+
+test("withinPosterior: a signal on one candidate moves the others through the shared difficulty", () => {
+  const cands: WithinCand[] = [
+    { logit: 0.3, kappa: 1, base: 0, omega: 1.5 },
+    { logit: 0.5, kappa: 1, base: 0, omega: 0.5 },
+  ]
+  const spec: WithinSpec = { tau: 1.6, omegaBase: 0.2, r: 0.85, cands }
+  // Python reference values (dense Gauss-Hermite over z, u and e)
+  const prior = withinPosterior(spec, [])
+  expect(prior.next[0]!).toBeCloseTo(0.542706, 3)
+  expect(prior.next[1]!).toBeCloseTo(0.582662, 3)
+  const passed = withinPosterior(spec, [{ cand: 0, pass: true }])
+  expect(passed.next[0]!).toBeCloseTo(0.683244, 3)
+  expect(passed.next[1]!).toBeCloseTo(0.6646, 3)
+  expect(passed.answer[0]!).toBeCloseTo(0.870551, 3)
+  const failed = withinPosterior(spec, [{ cand: 0, pass: false }])
+  expect(failed.next[0]!).toBeCloseTo(0.384295, 3)
+  expect(failed.next[1]!).toBeCloseTo(0.490304, 3)
+  expect(failed.answer[0]!).toBeCloseTo(0.173165, 3)
+})
+
+test("withinPosterior: a failed candidate retries less well than a fresh one of equal strength", () => {
+  const cands: WithinCand[] = [
+    { logit: 0.4, kappa: 1, base: 0, omega: 1.5 },
+    { logit: 0.4, kappa: 1, base: 0, omega: 1.5 },
+  ]
+  const spec: WithinSpec = { tau: 1.6, omegaBase: 0.2, r: 0.85, cands }
+  const p = withinPosterior(spec, [{ cand: 0, pass: false }])
+  expect(p.next[0]! < p.next[1]!).toBe(true)
+})
+
+test("withinPosterior: an exact verifier makes the answer's correctness equal its signal", () => {
+  const spec: WithinSpec = { tau: 1.6, omegaBase: 0, r: 1, cands: [{ logit: 0.2, kappa: 1, base: 0, omega: 1 }] }
+  expect(withinPosterior(spec, [{ cand: 0, pass: true }]).answer[0]!).toBeCloseTo(1, 9)
+  expect(withinPosterior(spec, [{ cand: 0, pass: false }]).answer[0]!).toBeCloseTo(0, 9)
+})
+
+test("sequentialStep opens the largest index above the value in hand, else accepts", () => {
+  // indices: candidate 0 gives -0.2, candidate 1 gives 0.1
+  const s1 = sequentialStep(seqState(0.9, 0, 0, [0, 0]))
+  expect(s1.action).toBe("attempt")
+  if (s1.action === "attempt") {
+    expect(s1.cand).toBe(1)
+    expect(s1.index).toBeCloseTo(0.1, 9)
+  }
+  // the best answer in hand is worth more than every index
+  expect(sequentialStep(seqState(0.9, 0.2, 0, [0, 0])).action).toBe("accept")
+  // attempt budget used up
+  expect(sequentialStep(seqState(0.9, 0, 6, [0, 0])).action).toBe("accept")
+  // candidate 1 used up its attempts per candidate; candidate 0 has a negative index
+  expect(sequentialStep(seqState(0.9, 0, 0, [0, 2])).action).toBe("accept")
+  // a verifier with r <= 1/2 carries no information
+  expect(sequentialStep(seqState(0.5, 0, 0, [0, 0])).action).toBe("accept")
+})
+
+function seqState(r: number, bestInHand: number, total: int, used: int[]): SeqState {
+  return {
+    lambda: 1,
+    r,
+    bestInHand,
+    next: [0.3, 0.6],
+    cost: [0.5, 0.5],
+    used,
+    total,
+    maxTotal: 6,
+    perCandidate: 2,
+  }
+}
