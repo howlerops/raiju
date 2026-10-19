@@ -10,6 +10,7 @@ import {
   ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig, CircuitPolicyConfig,
   WebhookEndpoint, AgentConfig, AgentAuth, AgentOAuth, AgentTls, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping, PluginSpec,
   BudgetOverride, PricingSyncConfig, ComplexitySettings, ProjectMember, MemberShare, RateLimitShare, EntityDac, ProfileRole, ApiKeyConfig,
+  loadRawConfig,
 } from "./config"
 import { RoutingRule, RuleTarget } from "./cel"
 import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom } from "./govapi"
@@ -59,7 +60,7 @@ type RoleBody = { name?: string, description?: string, dac?: string, permissions
 
 
 // The resources a custom role may name, the operations on them, and the data access scopes.
-export const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster", "APIKeys"]
+export const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster", "APIKeys", "Crews"]
 export const OPERATIONS = ["View", "Create", "Update", "Delete", "Download", "Reveal", "RunInference"]
 const DACS = ["own-data", "team-data", "business-unit-data", "customer-data", "all-data"]
 // The governance collections a scoped user (see scope.tov) may read and change, record by record.
@@ -907,6 +908,56 @@ export function openStored(cipher: ConfigCipher | undefined, v: string): string 
   return openValue(cipher, v)
 }
 
+// A retained credential as the cluster state carries it (clusterstate.tov): its JSON, with the access and refresh
+// tokens sealed like the config file's secrets. Without a cipher the tokens travel as the config file holds them.
+export function sealAdminRow(cipher: ConfigCipher | undefined, row: McpUserToken): string throws Error {
+  const x = try JSON.parse(JSON.stringify(row)) as McpUserToken
+  x.access_token = try sealStored(cipher, row.access_token)
+  x.refresh_token = try sealStored(cipher, row.refresh_token)
+  return JSON.stringify(x)
+}
+
+// The credential a cluster state entry carries, its tokens opened; undefined when the entry does not parse or a token
+// is sealed under a key this node does not hold.
+export function openAdminRow(cipher: ConfigCipher | undefined, text: string): McpUserToken | undefined {
+  let x: McpUserToken | undefined = undefined
+  try {
+    x = JSON.parse(text) as McpUserToken
+  } catch (e) {
+    return undefined
+  }
+  if (x === undefined) return undefined
+  const at = openStored(cipher, x.access_token)
+  const rt = openStored(cipher, x.refresh_token)
+  if (at === undefined || rt === undefined) return undefined
+  x.access_token = at
+  x.refresh_token = rt
+  return x
+}
+
+// The admin credential of one client as the config file holds it now (other workers and nodes save there). undefined
+// when the file cannot be read or holds none for the client.
+export function readStoredAdmin(path: string, cipher: ConfigCipher | undefined, client: string): McpUserToken | undefined {
+  let c: Config | undefined = undefined
+  try {
+    c = loadRawConfig(path)
+  } catch (e) {
+    return undefined
+  }
+  if (c === undefined) return undefined
+  let opened: Config = c
+  try {
+    opened = openConfig(c, cipher).cfg
+  } catch (e) {
+    return undefined
+  }
+  for (const r of opened.mcp?.exchange_admin ?? []) {
+    // a token that is still sealed was not opened (no key, or another key): it is not taken
+    if (r.mcp_client_name === client && !r.access_token.startsWith(SEALED)) return r
+  }
+  return undefined
+}
+
 // The header values of an agent's auth, sealed or opened (see secretValue).
 function sealAuth(cipher: ConfigCipher | undefined, seal: bool, a: AgentAuth | undefined, path: string, inout errors: string[]): AgentAuth | undefined throws Error {
   if (a === undefined) return a
@@ -1138,6 +1189,7 @@ export class ConfigStore {
   // Writes the config as JSON. node:fs has no rename, so the previous file is
   // kept as <path>.bak first; a crash mid-write leaves that copy behind.
   save(): void throws Error {
+    this.keepNewerAdmin()
     let text = JSON.stringify(try sealConfig(this.cfg, this.cipher), undefined, 2)
     if (this.extras.length > 0) {
       const end = text.byteLength - 1
@@ -1149,6 +1201,38 @@ export class ConfigStore {
       try writeFileSync(this.path + ".bak", old)
     }
     try writeFileSync(this.path, text + "\n")
+  }
+
+  // A save never writes back a retained admin credential older than the one the file holds: another worker or node
+  // renewed it since this copy was read (a renewal moves last_refreshed_at forward). The newer row is kept here too.
+  private keepNewerAdmin(): void {
+    if (!existsSync(this.path)) return
+    let disk: Config | undefined = undefined
+    try {
+      disk = openConfig(loadRawConfig(this.path), this.cipher).cfg
+    } catch (e) {
+      return
+    }
+    if (disk === undefined) return
+    const theirs = disk.mcp?.exchange_admin ?? []
+    let changed = false
+    let kept: McpUserToken[] = []
+    for (const r of this.cfg.mcp?.exchange_admin ?? []) {
+      let keep = r
+      for (const d of theirs) {
+        if (d.mcp_client_name === r.mcp_client_name && d.last_refreshed_at > r.last_refreshed_at && !d.access_token.startsWith(SEALED)) {
+          keep = d
+          changed = true
+        }
+      }
+      kept.push(keep)
+    }
+    if (!changed) return
+    let c = this.cfg
+    let m = c.mcp ?? {}
+    m.exchange_admin = kept
+    c.mcp = m
+    this.cfg = c
   }
 
   // Swaps in the next config, saves it and notifies. A failed save restores
@@ -1167,7 +1251,7 @@ export class ConfigStore {
     // the dashboard hears of every saved change (notify.tov)
     notify({ severity: "info", title: "Configuration changed", message: `${id} was saved (configuration version ${this.version}).` })
     const f = this.onChange
-    if (f !== undefined) f(next)
+    if (f !== undefined) f(this.cfg)
     return { kind: "ok", id: id }
   }
 
@@ -3978,6 +4062,26 @@ test("a failed save leaves the in-memory config and version unchanged", () => {
   expect(statusOf(r)).toBe(500)
   expect(s.cfg.providers === undefined).toBe(true)
   expect(s.version).toBe(0)
+})
+
+test("a save keeps the newer retained admin credential the file holds, and the change hears the kept one", () => {
+  const path = tmpPath()
+  const client: McpClientConfig = { name: "jira", connection_type: "http", connection_string: "http://127.0.0.1:1/mcp", auth_type: "token_exchange", token_exchange: { audience: "api://jira", client_id: "exch" } }
+  const row = (access: string, rt: string, at: f64): McpUserToken => ({ id: "exchange-jira", mcp_client_name: "jira", virtual_key_id: "", session_id: "", access_token: access, refresh_token: rt, token_expires_at: 0.0, scopes: [], created_at: 1.0, last_refreshed_at: at })
+  // another worker renewed the credential (rt-2) and saved it; this copy still holds the older one (rt-1)
+  try writeFileSync(path, JSON.stringify({ mcp: { client_configs: [client], exchange_admin: [row("new", "rt-2", 2000.0)] } }))
+  const s = new ConfigStore(path, { mcp: { client_configs: [client], exchange_admin: [row("old", "rt-1", 1000.0)] } })
+  const heard: string[] = []
+  s.onChange = (c: Config) => {
+    const ea = c.mcp?.exchange_admin ?? []
+    if (ea.length > 0) heard.push(ea[0]!.access_token)
+  }
+  expect(statusOf(s.upsertBudget({ id: "b1", max_limit: 5.0, reset_duration: "1d" }))).toBe(200)
+  expect(s.cfg.mcp!.exchange_admin![0]!.refresh_token).toBe("rt-2")
+  expect(heard).toEqual(["new"])
+  expect(try readFileSync(path, "utf8").includes("rt-2")).toBe(true)
+  expect(try readFileSync(path, "utf8").includes("rt-1")).toBe(false)
+  cleanup(path)
 })
 
 test("onChange runs once per successful change only", () => {

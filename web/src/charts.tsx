@@ -447,3 +447,262 @@ export function RankBars(props: { id: string; title: string; rows: RankRow[]; fo
     </figure>
   )
 }
+
+// ---- the crew frontier: cost on a log axis against quality (docs/crew-routing.md) ----
+
+export interface FrontierMark {
+  label: string
+  cost: number
+  quality: number
+}
+
+export interface FrontierProps {
+  id: string
+  title: string
+  desc: string
+  // the hull vertices of the class frontier
+  frontier: FrontierMark[]
+  // the uniform crews (one candidate for every role), drawn as a second series when the listing gives them
+  uniform?: FrontierMark[]
+  // the knee of the frontier (Def. 6)
+  knee?: FrontierMark
+  // the crew the class's multiplier picks
+  current?: FrontierMark
+  costFormat: (n: number) => string
+  qualityFormat: (n: number) => string
+  height?: number
+}
+
+// The cost axis is logarithmic, from a power of ten at or below the least positive cost to one at or above the most.
+// A free crew (cost 0) sits on the left edge.
+export function logCostDomain(costs: number[]): [number, number] {
+  const pos = costs.filter((c) => c > 0)
+  if (pos.length === 0) return [0.001, 1]
+  let lo = Math.min(...pos)
+  let hi = Math.max(...pos)
+  if (lo === hi) {
+    lo = lo / 2
+    hi = hi * 2
+  }
+  return [Math.pow(10, Math.floor(Math.log10(lo))), Math.pow(10, Math.ceil(Math.log10(hi)))]
+}
+
+// The quality axis: the range of the points with some room, within 0..1.
+export function qualityDomain(qs: number[]): [number, number] {
+  if (qs.length === 0) return [0, 1]
+  const lo = Math.min(...qs)
+  const hi = Math.max(...qs)
+  const pad = Math.max(0.02, (hi - lo) * 0.15)
+  return [Math.max(0, lo - pad), Math.min(1, hi + pad)]
+}
+
+export function FrontierChart(props: FrontierProps) {
+  const { w, ref } = useWidth(600)
+  // the index of the hovered frontier vertex (in cost order), -1 for none
+  const [hover, setHover] = createSignal(-1)
+  const H = () => props.height ?? 260
+  const ML = 60
+  const MR = 12
+  const MT = 10
+  const MB = 30
+
+  // the frontier in cost order: the arrow keys and the pointer walk it
+  const sorted = createMemo(() => [...props.frontier].sort((a, b) => a.cost - b.cost))
+  const everything = () => [...props.frontier, ...(props.uniform ?? []), ...(props.knee ? [props.knee] : []), ...(props.current ? [props.current] : [])]
+  const xDom = createMemo(() => logCostDomain(everything().map((p) => p.cost)))
+  const yDom = createMemo(() => qualityDomain(everything().map((p) => p.quality)))
+  const plotW = () => Math.max(40, w() - ML - MR)
+  const plotH = () => H() - MT - MB
+  const xOf = (c: number): number => {
+    const [lo, hi] = xDom()
+    const t = (Math.log10(Math.max(c, lo)) - Math.log10(lo)) / (Math.log10(hi) - Math.log10(lo))
+    return ML + t * plotW()
+  }
+  const yOf = (q: number): number => {
+    const [lo, hi] = yDom()
+    return MT + plotH() * (1 - (q - lo) / (hi - lo))
+  }
+  const xTicks = createMemo((): number[] => {
+    const [lo, hi] = xDom()
+    const out: number[] = []
+    for (let k = Math.floor(Math.log10(lo)); k <= Math.ceil(Math.log10(hi)); k++) {
+      const v = Math.pow(10, k)
+      if (v >= lo && v <= hi) out.push(v)
+    }
+    return out
+  })
+  const yTicks = createMemo((): number[] => {
+    const [lo, hi] = yDom()
+    return [0, 0.5, 1].map((f) => lo + f * (hi - lo))
+  })
+  const frontierPts = createMemo(() => sorted().map((p, i) => ({ key: "f" + i, x: xOf(p.cost), y: yOf(p.quality), i })))
+  const uniformPts = createMemo(() => (props.uniform ?? []).map((p, i) => ({ key: "u" + i, x: xOf(p.cost), y: yOf(p.quality) })))
+
+  // the frontier vertex nearest the pointer, by cost
+  const nearest = (ev: PointerEvent): number => {
+    const r = (ev.currentTarget as SVGElement).getBoundingClientRect()
+    const x = ev.clientX - r.left
+    let best = -1
+    let bestD = Infinity
+    sorted().forEach((p, i) => {
+      const d = Math.abs(xOf(p.cost) - x)
+      if (d < bestD) {
+        bestD = d
+        best = i
+      }
+    })
+    return best
+  }
+  const move = (ev: PointerEvent) => setHover(nearest(ev))
+  const key = (ev: KeyboardEvent) => {
+    const n = sorted().length
+    if (ev.key === "ArrowRight" || ev.key === "ArrowUp") setHover(Math.min(n - 1, hover() + 1))
+    else if (ev.key === "ArrowLeft" || ev.key === "ArrowDown") setHover(Math.max(0, hover() < 0 ? n - 1 : hover() - 1))
+    else if (ev.key === "Escape") setHover(-1)
+    else return
+    ev.preventDefault()
+  }
+  const hovered = (): FrontierMark | undefined => (hover() >= 0 && hover() < sorted().length ? sorted()[hover()] : undefined)
+  const tipLeft = () => {
+    const p = hovered()
+    if (!p) return {}
+    const x = xOf(p.cost)
+    return x > w() / 2 ? { right: w() - x + 10 + "px" } : { left: x + 10 + "px" }
+  }
+  const kneeXY = () => (props.knee ? { x: xOf(props.knee.cost), y: yOf(props.knee.quality) } : undefined)
+  const curXY = () => (props.current ? { x: xOf(props.current.cost), y: yOf(props.current.quality) } : undefined)
+
+  return (
+    <figure class="chart" id={props.id} ref={ref}>
+      <figcaption>{props.title}</figcaption>
+      <Show when={props.frontier.length > 0} fallback={<p class="muted chart-empty">No frontier: the class has no crew to price.</p>}>
+        <ul class="legend" aria-label={props.title + " legend"}>
+          <li>
+            <span class="swatch" style={{ background: "var(--c1)" }}></span>Frontier crew
+          </li>
+          <Show when={props.knee}>
+            <li>
+              <span class="swatch" style={{ background: "var(--c2)" }}></span>Knee
+            </li>
+          </Show>
+          <Show when={props.current}>
+            <li>
+              <span class="swatch" style={{ background: "var(--c4)" }}></span>Crew at the current multiplier
+            </li>
+          </Show>
+          <Show when={(props.uniform ?? []).length > 0}>
+            <li>
+              <span class="swatch" style={{ background: "var(--c-other)" }}></span>Uniform crew
+            </li>
+          </Show>
+        </ul>
+        <div class="chart-plot">
+          <svg
+            width={w()}
+            height={H()}
+            viewBox={"0 0 " + w() + " " + H()}
+            role="img"
+            aria-labelledby={props.id + "-t " + props.id + "-d"}
+            tabindex="0"
+            onPointerMove={move}
+            onPointerLeave={() => setHover(-1)}
+            onKeyDown={key}
+            onBlur={() => setHover(-1)}
+          >
+            <title id={props.id + "-t"}>{props.title}</title>
+            <desc id={props.id + "-d"}>{props.desc + " Arrow keys read the frontier crews one by one; the table below has every value."}</desc>
+            <For each={yTicks()}>
+              {(t) => (
+                <g>
+                  <line class="grid" x1={ML} x2={ML + plotW()} y1={yOf(t)} y2={yOf(t)} />
+                  <text class="axis" x={ML - 6} y={yOf(t) + 4} text-anchor="end">
+                    {props.qualityFormat(t)}
+                  </text>
+                </g>
+              )}
+            </For>
+            <For each={xTicks()}>
+              {(t) => (
+                <g>
+                  <line class="grid" x1={xOf(t)} x2={xOf(t)} y1={MT} y2={MT + plotH()} />
+                  <text class="axis" x={xOf(t)} y={H() - 14} text-anchor="middle">
+                    {props.costFormat(t)}
+                  </text>
+                </g>
+              )}
+            </For>
+            <text class="axis" x={ML + plotW() / 2} y={H() - 2} text-anchor="middle">
+              cost per task, log scale
+            </text>
+            <For each={uniformPts()} keyed={(u) => u.key}>
+              {(u) => <circle cx={u().x} cy={u().y} r="3.5" fill="none" stroke="var(--c-other)" stroke-width="1.5" />}
+            </For>
+            <For each={frontierPts()} keyed={(f) => f.key}>
+              {(f) => <circle cx={f().x} cy={f().y} r={f().i === hover() ? 6 : 4} fill="var(--c1)" stroke="var(--surface)" stroke-width="1.5" />}
+            </For>
+            <Show when={kneeXY()}>
+              {(k) => (
+                <polygon
+                  points={`${k().x},${k().y - 7} ${k().x + 7},${k().y} ${k().x},${k().y + 7} ${k().x - 7},${k().y}`}
+                  fill="var(--c2)"
+                  stroke="var(--surface)"
+                  stroke-width="1"
+                />
+              )}
+            </Show>
+            <Show when={curXY()}>
+              {(c) => <circle cx={c().x} cy={c().y} r="9" fill="none" stroke="var(--c4)" stroke-width="2.5" />}
+            </Show>
+            <Show when={hovered()}>
+              {(p) => <line class="cross" x1={xOf(p().cost)} x2={xOf(p().cost)} y1={MT} y2={MT + plotH()} />}
+            </Show>
+          </svg>
+          <Show when={hovered()}>
+            {(p) => (
+              <div class="chart-tip" role="status" style={tipLeft()}>
+                <strong>{p().label}</strong>
+                <div>Cost: {props.costFormat(p().cost)}</div>
+                <div>Quality: {props.qualityFormat(p().quality)}</div>
+              </div>
+            )}
+          </Show>
+        </div>
+        <details class="chart-table">
+          <summary>Data table</summary>
+          <Table cols={["Crew", "Kind", "Cost per task", "Quality"]}>
+            <For each={sorted()}>
+              {(p) => (
+                <tr>
+                  <td>{p.label}</td>
+                  <td>{p.label === props.current?.label ? "frontier, current" : "frontier"}</td>
+                  <td>{props.costFormat(p.cost)}</td>
+                  <td>{props.qualityFormat(p.quality)}</td>
+                </tr>
+              )}
+            </For>
+            <For each={props.uniform ?? []}>
+              {(p) => (
+                <tr>
+                  <td>{p.label}</td>
+                  <td>uniform</td>
+                  <td>{props.costFormat(p.cost)}</td>
+                  <td>{props.qualityFormat(p.quality)}</td>
+                </tr>
+              )}
+            </For>
+            <Show when={props.knee}>
+              {(k) => (
+                <tr>
+                  <td>{k().label}</td>
+                  <td>knee</td>
+                  <td>{props.costFormat(k().cost)}</td>
+                  <td>{props.qualityFormat(k().quality)}</td>
+                </tr>
+              )}
+            </Show>
+          </Table>
+        </details>
+      </Show>
+    </figure>
+  )
+}

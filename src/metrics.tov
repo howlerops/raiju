@@ -44,6 +44,16 @@ const MCP_BUCKETS: Buckets = {
   les: ["0.01", "0.02", "0.05", "0.1", "0.2", "0.5", "1", "2", "5", "10", "30", "60", "120", "300"],
 }
 
+// Crew routing: an attempt's quality in 0..1, and a task's cost in USD (docs/crew-routing.md).
+const QUALITY_BUCKETS: Buckets = {
+  bounds: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1],
+  les: ["0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.7", "0.8", "0.9", "1"],
+}
+const TASK_COST_BUCKETS: Buckets = {
+  bounds: [0.001, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50],
+  les: ["0.001", "0.01", "0.05", "0.1", "0.5", "1", "5", "10", "50"],
+}
+
 function bucketsFor(name: string): Buckets {
   if (name === "bifrost_upstream_latency_seconds" || name === "http_request_duration_seconds") return UPSTREAM_BUCKETS
   if (name === "bifrost_overhead_latency_microseconds" || name === "bifrost_overhead_component_microseconds") return OVERHEAD_BUCKETS
@@ -52,6 +62,8 @@ function bucketsFor(name: string): Buckets {
   if (name === "http_request_size_bytes" || name === "http_response_size_bytes") return SIZE_BUCKETS
   if (name === "bifrost_request_retries") return RETRY_BUCKETS
   if (name === "bifrost_mcp_client_operation_duration_seconds") return MCP_BUCKETS
+  if (name === "raiju_crew_outcome_quality") return QUALITY_BUCKETS
+  if (name === "raiju_crew_task_cost_usd") return TASK_COST_BUCKETS
   return RAIJU_BUCKETS
 }
 
@@ -92,6 +104,16 @@ const HELP: Help[] = [
   { name: "bifrost_routing_llm_requests_total", text: "Total number of chat completions made by llm complexity routing, labeled by the classifier provider/model." },
   { name: "bifrost_routing_llm_cost_total", text: "Total cost in USD of llm complexity routing completions, labeled by the classifier provider/model. Recorded regardless of whether the cost counts toward budgets." },
   { name: "bifrost_mcp_client_operation_duration_seconds", text: "Duration of an MCP tool call as observed by Bifrost (the MCP client)." },
+  { name: "raiju_crew_assignments_total", text: "Tasks given a crew by a crew/<pool> call or the assign API, by pool and class (Raiju extra)." },
+  { name: "raiju_crew_calls_total", text: "Calls routed to a crew's candidate, by pool, role and candidate (Raiju extra)." },
+  { name: "raiju_crew_attempts_total", text: "Attempts a task started: its first attempt and each attempt the sequential layer opened, by pool and class (Raiju extra)." },
+  { name: "raiju_crew_escalations_total", text: "Attempts the sequential layer opened after a verifier signal (the attempts beyond a task's first), by pool and class (Raiju extra)." },
+  { name: "raiju_crew_accepts_total", text: "Tasks the sequential layer accepted, by pool and class (Raiju extra)." },
+  { name: "raiju_crew_outcomes_total", text: "Attempt outcomes recorded, by pool, class and verifier (pass, fail or none) (Raiju extra)." },
+  { name: "raiju_crew_outcome_quality", text: "Quality of the recorded attempt outcomes, by pool and class; the mean is the sum over the count (Raiju extra)." },
+  { name: "raiju_crew_task_cost_usd", text: "Cost in USD of each completed crew task (the log rows of all its attempts), by pool (Raiju extra)." },
+  { name: "raiju_crew_lambda", text: "The quality-per-dollar multiplier lambda in use for a pool's class (Raiju extra)." },
+  { name: "raiju_crew_subscription_phi", text: "Remaining quota fraction phi of a crew subscription in its window; 1 when unused (Raiju extra)." },
 ]
 
 function helpFor(name: string): string {
@@ -223,6 +245,10 @@ function familyOf(name: string, kinds: Map<string, string>): string {
   return name
 }
 
+// Gauges every worker reports alike (the pool's multiplier and the subscriptions' quota fractions come from the
+// cluster state and the shared logs): the merge keeps the largest instead of summing them.
+const MAX_MERGED: string[] = ["raiju_crew_lambda", "raiju_crew_subscription_phi"]
+
 // Several workers' expositions as one: every sample summed by series, each family's HELP and
 // TYPE once, and each family's samples kept together (even when workers saw different series).
 export function mergeRendered(texts: string[]): string {
@@ -252,8 +278,13 @@ export function mergeRendered(texts: string[]): string {
       const key = line.slice(0, sp)
       const v = parseFloat(line.slice(sp + 1))
       if (v === undefined) continue
-      if (!values.has(key)) keyOrder.push(key)
-      values.set(key, (values.get(key) ?? 0.0) + v)
+      const cur = values.get(key)
+      if (cur === undefined) {
+        keyOrder.push(key)
+        values.set(key, v)
+      } else {
+        values.set(key, MAX_MERGED.includes(sampleName(key)) ? Math.max(cur, v) : cur + v)
+      }
     }
   }
   const famOf: Map<string, string> = new Map()
@@ -564,6 +595,53 @@ export function observeMcp(client: string, tool: string, errorType: string, seco
   observe("bifrost_mcp_client_operation_duration_seconds", `mcp_client="${esc(client)}",mcp_tool_name="${esc(tool)}",mcp_method="tools/call",error_type="${esc(errorType)}"`, seconds)
 }
 
+// ---- crew routing (crew.tov; docs/crew-routing.md) ----
+
+function crewLabels(pool: string, klass: string): string {
+  return `pool="${esc(pool)}",class="${esc(klass)}"`
+}
+
+// A task is given its crew: by a crew/<pool> call with no assignment in force, or by the assign API.
+export function observeCrewAssignment(pool: string, klass: string): void {
+  inc("raiju_crew_assignments_total", crewLabels(pool, klass), 1.0)
+}
+
+// A call routed to a role's candidate.
+export function observeCrewCall(pool: string, role: string, candidate: string): void {
+  inc("raiju_crew_calls_total", `pool="${esc(pool)}",role="${esc(role)}",candidate="${esc(candidate)}"`, 1.0)
+}
+
+// An attempt started. escalation is true when the sequential layer opened it (next), false for a task's first attempt.
+export function observeCrewAttempt(pool: string, klass: string, escalation: bool): void {
+  inc("raiju_crew_attempts_total", crewLabels(pool, klass), 1.0)
+  if (escalation) inc("raiju_crew_escalations_total", crewLabels(pool, klass), 1.0)
+}
+
+export function observeCrewAccept(pool: string, klass: string): void {
+  inc("raiju_crew_accepts_total", crewLabels(pool, klass), 1.0)
+}
+
+// A recorded outcome (a repeat of an attempt's outcome is not recorded twice). verifier is pass, fail or "" (none).
+export function observeCrewOutcome(pool: string, klass: string, verifier: string, quality: f64): void {
+  const v = verifier === "" ? "none" : verifier
+  inc("raiju_crew_outcomes_total", crewLabels(pool, klass) + `,verifier="${esc(v)}"`, 1.0)
+  observe("raiju_crew_outcome_quality", crewLabels(pool, klass), quality)
+}
+
+// A completed task's cost, once per task and writer.
+export function observeCrewTaskCost(pool: string, cost: f64): void {
+  observe("raiju_crew_task_cost_usd", `pool="${esc(pool)}"`, cost)
+}
+
+// The multiplier a class is priced at now.
+export function setCrewLambda(pool: string, klass: string, lambda: f64): void {
+  setGauge("raiju_crew_lambda", crewLabels(pool, klass), lambda)
+}
+
+export function setCrewQuotaFraction(pool: string, subscription: string, phi: f64): void {
+  setGauge("raiju_crew_subscription_phi", `pool="${esc(pool)}",subscription="${esc(subscription)}"`, phi)
+}
+
 test("key, active-request, rotation and MCP families carry Bifrost names and labels", () => {
   observeKeyUp("openai", "key-1", "primary", false)
   observeRotation("openai", "gpt-4o", "key-1", "primary", "provider_rate_limited")
@@ -694,4 +772,37 @@ test("worker expositions merge by series and stay grouped by family", () => {
   const a = "# HELP x_total Help.\n# TYPE x_total counter\nx_total{p=\"a\"} 2\nx_total{p=\"b\"} 1\n# TYPE h histogram\nh_bucket{le=\"1\"} 1\nh_bucket{le=\"+Inf\"} 1\nh_sum 0.5\nh_count 1\n# TYPE y gauge\ny 7\n"
   const b = "# HELP x_total Help.\n# TYPE x_total counter\nx_total{p=\"a\"} 3\nx_total{p=\"c\"} 4\n# TYPE h histogram\nh_bucket{le=\"1\"} 0\nh_bucket{le=\"+Inf\"} 2\nh_sum 1.5\nh_count 2\n"
   expect(mergeRendered([a, b])).toBe("# HELP x_total Help.\n# TYPE x_total counter\nx_total{p=\"a\"} 5\nx_total{p=\"b\"} 1\nx_total{p=\"c\"} 4\n# TYPE h histogram\nh_bucket{le=\"1\"} 1\nh_bucket{le=\"+Inf\"} 3\nh_sum 2\nh_count 3\n# TYPE y gauge\ny 7\n")
+})
+
+test("crew families carry their labels, the escalation split and the quality and cost buckets", () => {
+  observeCrewAssignment("codeaf-m", "bug-fix")
+  observeCrewCall("codeaf-m", "worker", "cheap")
+  observeCrewAttempt("codeaf-m", "bug-fix", false)
+  observeCrewAttempt("codeaf-m", "bug-fix", true)
+  observeCrewAccept("codeaf-m", "bug-fix")
+  observeCrewOutcome("codeaf-m", "bug-fix", "fail", 0.4)
+  observeCrewOutcome("codeaf-m", "bug-fix", "", 0.9)
+  observeCrewTaskCost("codeaf-m", 0.02)
+  setCrewLambda("codeaf-m", "bug-fix", 1.5)
+  setCrewQuotaFraction("codeaf-m", "team", 0.5)
+  const text = render()
+  expect(text.includes(`raiju_crew_assignments_total{pool="codeaf-m",class="bug-fix"} 1`)).toBe(true)
+  expect(text.includes(`raiju_crew_calls_total{pool="codeaf-m",role="worker",candidate="cheap"} 1`)).toBe(true)
+  expect(text.includes(`raiju_crew_attempts_total{pool="codeaf-m",class="bug-fix"} 2`)).toBe(true)
+  expect(text.includes(`raiju_crew_escalations_total{pool="codeaf-m",class="bug-fix"} 1`)).toBe(true)
+  expect(text.includes(`raiju_crew_accepts_total{pool="codeaf-m",class="bug-fix"} 1`)).toBe(true)
+  expect(text.includes(`raiju_crew_outcomes_total{pool="codeaf-m",class="bug-fix",verifier="fail"} 1`)).toBe(true)
+  expect(text.includes(`raiju_crew_outcomes_total{pool="codeaf-m",class="bug-fix",verifier="none"} 1`)).toBe(true)
+  expect(text.includes(`raiju_crew_outcome_quality_bucket{pool="codeaf-m",class="bug-fix",le="0.5"} 1`)).toBe(true)
+  expect(text.includes(`raiju_crew_outcome_quality_count{pool="codeaf-m",class="bug-fix"} 2`)).toBe(true)
+  expect(text.includes(`raiju_crew_task_cost_usd_bucket{pool="codeaf-m",le="0.05"} 1`)).toBe(true)
+  expect(text.includes(`raiju_crew_lambda{pool="codeaf-m",class="bug-fix"} 1.5`)).toBe(true)
+  expect(text.includes(`raiju_crew_subscription_phi{pool="codeaf-m",subscription="team"} 0.5`)).toBe(true)
+  expect(text.includes("# TYPE raiju_crew_outcome_quality histogram\n")).toBe(true)
+})
+
+test("the merge keeps the largest crew gauge and sums the crew counters", () => {
+  const a = "# TYPE raiju_crew_lambda gauge\nraiju_crew_lambda{pool=\"p\",class=\"c\"} 1.5\n# TYPE raiju_crew_calls_total counter\nraiju_crew_calls_total{pool=\"p\"} 2\n"
+  const b = "# TYPE raiju_crew_lambda gauge\nraiju_crew_lambda{pool=\"p\",class=\"c\"} 1.5\n# TYPE raiju_crew_calls_total counter\nraiju_crew_calls_total{pool=\"p\"} 3\n"
+  expect(mergeRendered([a, b])).toBe("# TYPE raiju_crew_lambda gauge\nraiju_crew_lambda{pool=\"p\",class=\"c\"} 1.5\n# TYPE raiju_crew_calls_total counter\nraiju_crew_calls_total{pool=\"p\"} 5\n")
 })

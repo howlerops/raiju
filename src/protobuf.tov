@@ -1,13 +1,18 @@
-// Protocol Buffers wire encoding for the OTLP gRPC exporter. The gRPC path sends the
-// same data the OTLP/HTTP JSON path does: the JSON body that otel.tov and
-// otel_metrics.tov build is parsed here and encoded as ExportTraceServiceRequest or
-// ExportMetricsServiceRequest. Field numbers follow opentelemetry-proto. Fields are
-// written in ascending number order, and proto3 defaults are left out, so the bytes
-// match what the reference encoder writes (see the tests).
+// Protocol Buffers wire format. The OTLP gRPC exporter sends the same data the OTLP/HTTP JSON
+// path does: the JSON body that otel.tov and otel_metrics.tov build is parsed here and encoded as
+// ExportTraceServiceRequest or ExportMetricsServiceRequest. Field numbers follow
+// opentelemetry-proto. Fields are written in ascending number order, and proto3 defaults are left
+// out, so the bytes match what the reference encoder writes (see the tests).
+//
+// The rest of the file is the generic wire layer that a2apb.tov (the A2A gRPC messages) builds on:
+// a bounds-checked reader, zigzag, fixed32 and float conversions, and strict UTF-8. Varints are
+// int64 (two's complement, as protobuf writes negative int32 and int64); bits past the 64th are an
+// error, as protobuf-go reports them.
 
 const WIRE_VARINT: int = 0
 const WIRE_FIXED64: int = 1
 const WIRE_LEN: int = 2
+const WIRE_FIXED32: int = 5
 
 // Appends protobuf fields to a buffer. Each method writes its field; callers skip
 // fields at their proto3 default when the default is not wanted on the wire.
@@ -56,6 +61,16 @@ export class PbWriter {
 
   double(field: int, v: f64): void {
     this.fixed64(field, doubleBits(v))
+  }
+
+  fixed32(field: int, bits: int): void {
+    this.key(field, WIRE_FIXED32)
+    for (let i = 0; i < 4; i++) this.buf.push(u8((bits >> (i * 8)) & 0xff))
+  }
+
+  // A field key alone, for callers that write the payload themselves.
+  tag(field: int, wire: int): void {
+    this.key(field, wire)
   }
 
   bytes(field: int, data: u8[]): void {
@@ -378,6 +393,180 @@ export function toHex(b: u8[]): string {
   return out
 }
 
+// ---- generic wire layer ----
+
+const INT64_MIN: int = -9223372036854775807 - 1
+const MAX_FIELD: int = 536870911
+
+// Reads fields from a buffer. Every read is bounds-checked: a truncated or malformed buffer throws
+// an Error and never reads past its end. Groups (wire types 3 and 4) are an error.
+export class PbReader {
+  pos = 0
+  constructor(readonly buf: u8[]) {}
+
+  more(): bool {
+    return this.pos < this.buf.length
+  }
+
+  private byte(): int throws Error {
+    if (this.pos >= this.buf.length) throw new Error("protobuf: truncated message")
+    const b = int(this.buf[this.pos]!)
+    this.pos += 1
+    return b
+  }
+
+  // A varint as an int64. Nine bytes carry 63 bits; a tenth may carry the sign bit and no more.
+  varint(): int throws Error {
+    let v: int = 0
+    for (let k = 0; k < 9; k++) {
+      const b = try this.byte()
+      v += (b & 127) << (7 * k)
+      if (b < 128) return v
+    }
+    const last = try this.byte()
+    if (last > 1) throw new Error("protobuf: varint overflows 64 bits")
+    return last === 1 ? v + INT64_MIN : v
+  }
+
+  // A field key: the field number and the wire type.
+  key(): { field: int, wire: int } throws Error {
+    const k = try this.varint()
+    const field = k >> 3
+    if (k < 0 || field < 1 || field > MAX_FIELD) throw new Error("protobuf: bad field number")
+    const wire = k & 7
+    if (wire === 3 || wire === 4 || wire === 6 || wire === 7) throw new Error("protobuf: unsupported wire type " + wire)
+    return { field: field, wire: wire }
+  }
+
+  // A 32-bit value, as an unsigned int.
+  fixed32(): int throws Error {
+    let v: int = 0
+    for (let i = 0; i < 4; i++) v += (try this.byte()) << (8 * i)
+    return v
+  }
+
+  // A 64-bit value, as an int (two's complement).
+  fixed64(): int throws Error {
+    let v: int = 0
+    for (let i = 0; i < 8; i++) v += (try this.byte()) << (8 * i)
+    return v
+  }
+
+  // The payload of a length-delimited field.
+  bytes(): u8[] throws Error {
+    const n = try this.varint()
+    if (n < 0 || n > this.buf.length - this.pos) throw new Error("protobuf: length past the end of the message")
+    const out = this.buf.slice(this.pos, this.pos + n)
+    this.pos += n
+    return out
+  }
+
+  // Skips the payload of a field with this wire type.
+  skip(wire: int): void throws Error {
+    if (wire === WIRE_VARINT) {
+      const _v = try this.varint()
+    } else if (wire === WIRE_FIXED64) {
+      const _f = try this.fixed64()
+    } else if (wire === WIRE_LEN) {
+      const _b = try this.bytes()
+    } else if (wire === WIRE_FIXED32) {
+      const _w = try this.fixed32()
+    } else {
+      throw new Error("protobuf: unsupported wire type " + wire)
+    }
+  }
+}
+
+// The varints of a packed repeated field's payload.
+export function packedVarints(data: u8[]): int[] throws Error {
+  const r = new PbReader(data)
+  const out: int[] = []
+  while (r.more()) out.push(try r.varint())
+  return out
+}
+
+// Zigzag maps signed values to unsigned ones so small magnitudes stay short (sint32, sint64).
+export function zigzag(v: int): int {
+  return (v << 1) ^ (v >> 63)
+}
+
+export function unzigzag(n: int): int {
+  return ((n >> 1) & 9223372036854775807) ^ -(n & 1)
+}
+
+// The sign bit of a 32-bit pattern, as an int32 value (fixed32 and sfixed32 read this way).
+export function int32Of(bits: int): int {
+  const u = bits & 4294967295
+  return u >= 2147483648 ? u - 4294967296 : u
+}
+
+// Infinity and NaN, computed (IEEE division by zero; the names are not in Tov).
+function infinity(sign: f64): f64 {
+  const zero: f64 = 0.0
+  return sign / zero
+}
+
+function notANumber(): f64 {
+  const zero: f64 = 0.0
+  return zero / zero
+}
+
+// The double a 64-bit pattern holds (exact).
+export function bitsToDouble(bits: int): f64 {
+  const sign = bits < 0 ? -1.0 : 1.0
+  const exp = (bits >> 52) & 2047
+  const frac = bits & 4503599627370495
+  if (exp === 2047) return frac === 0 ? infinity(sign) : notANumber()
+  if (exp === 0) return sign * frac * Math.pow(2, -1074)
+  return sign * (frac + 4503599627370496) * Math.pow(2, exp - 1075)
+}
+
+// The float a 32-bit pattern holds (exact, as a double).
+export function bitsToFloat(bits: int): f64 {
+  const sign = ((bits >> 31) & 1) === 1 ? -1.0 : 1.0
+  const exp = (bits >> 23) & 255
+  const frac = bits & 8388607
+  if (exp === 255) return frac === 0 ? infinity(sign) : notANumber()
+  if (exp === 0) return sign * frac * Math.pow(2, -149)
+  return sign * (frac + 8388608) * Math.pow(2, exp - 150)
+}
+
+// The IEEE 754 single-precision bit pattern of a double, rounded to nearest (ties up). Values past
+// the float range become infinities.
+export function floatBits(v: f64): int {
+  const neg = v < 0 || (v === 0 && 1 / v < 0)
+  const x = neg ? -v : v
+  const sign: int = neg ? 2147483648 : 0
+  if (x !== x) return 2143289344
+  if (x === 0) return sign
+  if (x === infinity(1.0)) return sign | 2139095040
+  let e: int = Math.floor(Math.log2(x))
+  let m = x / Math.pow(2, e)
+  while (m >= 2) {
+    m = m / 2
+    e = e + 1
+  }
+  while (m < 1) {
+    m = m * 2
+    e = e - 1
+  }
+  if (e > 127) return sign | 2139095040
+  if (e < -126) return sign | int(Math.round(x * Math.pow(2, 149)))
+  let frac: int = int(Math.round((m - 1) * 8388608.0))
+  if (frac === 8388608) {
+    frac = 0
+    e = e + 1
+    if (e > 127) return sign | 2139095040
+  }
+  return sign | ((e + 127) << 23) | frac
+}
+
+// Bytes as UTF-8 text; invalid UTF-8 is an error (proto3 string fields must be valid).
+export function utf8Strict(b: u8[]): string throws Error {
+  const td = try new TextDecoder("utf-8", { fatal: true })
+  return try td.decode(b)
+}
+
 // ---- tests ----
 // Expected bytes are from the opentelemetry-proto Python classes (ParseDict on the same
 // JSON, deterministic serialization).
@@ -439,4 +628,78 @@ test("trace export encodes to the reference bytes", () => {
 
 test("metrics export encodes to the reference bytes", () => {
   expect(toHex(try encodeMetricsRequest(METRICS_JSON))).toBe(METRICS_HEX)
+})
+
+test("the reader reads back what the writer wrote, sign bit and all", () => {
+  const w = new PbWriter()
+  const vals = [0, 127, 128, 300, 4611686018427387904, -1, -9223372036854775807 - 1]
+  for (const v of vals) w.varint(v)
+  w.fixed32(9, 3221225472)
+  w.fixed64(10, -2)
+  const r = new PbReader(w.buf)
+  for (const v of vals) expect(try r.varint()).toBe(v)
+  const k = try r.key()
+  expect(k.field).toBe(9)
+  expect(k.wire).toBe(5)
+  expect(try r.fixed32()).toBe(3221225472)
+  const k2 = try r.key()
+  expect(k2.field).toBe(10)
+  expect(try r.fixed64()).toBe(-2)
+  expect(r.more()).toBe(false)
+})
+
+test("truncated and malformed input throws, never reads past the end", () => {
+  let threw = 0
+  const bad: u8[][] = [[u8(128)], [u8(255), u8(255), u8(255), u8(255), u8(255), u8(255), u8(255), u8(255), u8(255), u8(2)], [u8(10), u8(5), u8(1)], [u8(11)], [u8(8), u8(128)]]
+  for (const b of bad) {
+    try {
+      const r = new PbReader(b)
+      const k = try r.key()
+      try r.skip(k.wire)
+      if (k.wire === 2) {
+        const _x = try r.bytes()
+      }
+    } catch (e) {
+      threw += 1
+    }
+  }
+  expect(threw).toBe(bad.length)
+})
+
+test("zigzag maps signed values to small unsigned ones and back", () => {
+  expect(zigzag(0)).toBe(0)
+  expect(zigzag(-1)).toBe(1)
+  expect(zigzag(1)).toBe(2)
+  expect(zigzag(-2)).toBe(3)
+  expect(zigzag(2147483647)).toBe(4294967294)
+  expect(unzigzag(zigzag(-9223372036854775807 - 1))).toBe(-9223372036854775807 - 1)
+  expect(unzigzag(zigzag(-5))).toBe(-5)
+  expect(unzigzag(4294967294)).toBe(2147483647)
+})
+
+test("fixed32 and float bit patterns, and doubles back from bits", () => {
+  expect(floatBits(1.5)).toBe(1069547520)
+  expect(floatBits(-2.0)).toBe(3221225472)
+  expect(bitsToFloat(1069547520)).toBe(1.5)
+  expect(bitsToFloat(floatBits(0.25))).toBe(0.25)
+  expect(int32Of(3221225472)).toBe(-1073741824)
+  expect(int32Of(4294967295)).toBe(-1)
+  expect(bitsToDouble(doubleBits(0.1))).toBe(0.1)
+  expect(bitsToDouble(doubleBits(-2.5))).toBe(-2.5)
+  expect(bitsToDouble(doubleBits(5e-324))).toBe(5e-324)
+  expect(bitsToDouble(doubleBits(1e300))).toBe(1e300)
+})
+
+test("packed varints and strict UTF-8", () => {
+  const pv = try packedVarints([u8(1), u8(172), u8(2)])
+  expect(pv.length).toBe(2)
+  expect(pv[1]).toBe(300)
+  expect(try utf8Strict([u8(104), u8(105)])).toBe("hi")
+  let bad = false
+  try {
+    const _s = try utf8Strict([u8(255)])
+  } catch (e) {
+    bad = true
+  }
+  expect(bad).toBe(true)
 })

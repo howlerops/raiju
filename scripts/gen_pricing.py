@@ -5,12 +5,12 @@ Usage: scripts/gen_pricing.py DATASHEET.json
        scripts/gen_pricing.py --merge PRICES.json
 
 The datasheet is a JSON object keyed by model name (https://getbifrost.ai/datasheet).
-Each entry with a token price becomes one line of a compact table:
+Each entry with a token price, a rate per second or a rate per character becomes one line of a compact table:
 
-    key  provider  input  output  cacheRead  cacheWrite  baseModel  [inputAudio  outputAudio  perSecond]
+    key  provider  input  output  cacheRead  cacheWrite  baseModel  [inputAudio  outputAudio  perSecond  inputCharacter]
 
-The last three columns are written only for a model with an audio token rate or a voice rate per second
-(realtime and live models); other rows keep seven columns.
+The last four columns are written only for a model with an audio token rate, a voice rate per second or a
+rate per input character (realtime, live, transcription and speech models); other rows keep seven columns.
 Prices are USD per token as plain decimals; a missing rate is an empty field.
 Lines are sorted by (key length, key), so the first line for a provider and
 base model is the plainest name. Re-run this after replacing the datasheet.
@@ -36,9 +36,20 @@ from decimal import Decimal
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / "src" / "pricing_data.tov"
 EXPORT = "export const PRICING_DATA: string = "
+# the header's description of the columns (a merge writes it again, so an older table is brought up to date)
+COLUMNS_NOTE = [
+    "// Columns, tab-separated: key, provider, input, output, cacheRead, cacheWrite, baseModel, and for",
+    "// a realtime, live, transcription or speech model inputAudio, outputAudio, perSecond, inputCharacter",
+    "// (a row has 7 or 11 columns). Prices are USD per token (perSecond: per second, inputCharacter: per",
+    "// character); an empty field means the datasheet has no such rate.",
+]
 # the token-rate columns (USD per token) and the audio and per-second columns of a row
 TOKEN_COLUMNS = (("input_cost_per_token", 2), ("output_cost_per_token", 3), ("cache_read_input_token_cost", 4), ("cache_creation_input_token_cost", 5))
-WIDE_COLUMNS = (("input_cost_per_audio_token", 7), ("output_cost_per_audio_token", 8), ("input_cost_per_second", 9))
+WIDE_COLUMNS = (("input_cost_per_audio_token", 7), ("output_cost_per_audio_token", 8), ("input_cost_per_second", 9), ("input_cost_per_character", 10))
+# the columns of a row with audio or per-second rates, and the rows a merge adds from the price file (OpenAI's
+# realtime, live, transcription and speech models the datasheet this table was built from has no row for)
+WIDE = len(WIDE_COLUMNS) + 7
+ADDED_ROWS = ("gpt-live-1", "gpt-live-transcribe", "gpt-realtime-whisper", "gpt-realtime-translate", "whisper-1", "tts-1", "tts-1-hd")
 # header lines that a merge writes; a merge drops them from the header it reads and writes its own
 MERGE_NOTE = "// Audio and per-second columns merged from"
 NOTES = ("// (The audio columns", MERGE_NOTE)
@@ -123,11 +134,27 @@ def amount(value):
     return 0.0 if value is None else float(value)
 
 
-def merge(table, prices_path, day):
-    """Fills the audio and per-second columns of the table from a price file.
+def fill_wide(row, entry, key, changes):
+    """Sets the audio and per-second cells of a row from its price file entry, and reports each change."""
+    row.extend([""] * (WIDE - len(row)))
+    for field, col in WIDE_COLUMNS:
+        value = entry.get(field)
+        if value is None:
+            continue
+        new = plain(value, key)
+        old = row[col]
+        if old != "" and math.isclose(float(old), float(new), rel_tol=1e-9):
+            continue
+        changes.append((key, field, old or None, new))
+        row[col] = new
 
-    Returns (changes, disagreements, skipped): changes are (key, field, old, new), disagreements are
-    (key, field, table, price file) for token rates that differ and are not applied, skipped are reasons.
+
+def merge(table, prices_path, day):
+    """Fills the audio and per-second columns of the table from a price file, and adds ADDED_ROWS.
+
+    Returns (changes, disagreements, skipped): changes are (key, field, old, new) (an added row is (key, "row",
+    None, "added")), disagreements are (key, field, table, price file) for token rates that differ and are not
+    applied, skipped are reasons.
     """
     raw = prices_path.read_bytes()
     prices = json.loads(raw)
@@ -146,27 +173,31 @@ def merge(table, prices_path, day):
         for field, col in TOKEN_COLUMNS:
             if not math.isclose(cell(row[col]), amount(entry.get(field))):
                 disagreements.append((key, field, row[col] or None, entry.get(field)))
-        row.extend([""] * (10 - len(row)))
-        for field, col in WIDE_COLUMNS:
-            value = entry.get(field)
-            if value is None:
-                continue
-            new = plain(value, key)
-            old = row[col]
-            if old != "" and math.isclose(float(old), float(new), rel_tol=1e-9):
-                continue
-            changes.append((key, field, old or None, new))
-            row[col] = new
-        # as the generator writes them: a row has the audio columns only when one of them has a rate
-        if not any(row[7:10]):
-            del row[7:]
+        fill_wide(row, entry, key, changes)
+    # a row the table lacks gets the price file's rates for it (its token rates too: the datasheet has none)
+    have = {row[0] for row in rows}
+    for key in ADDED_ROWS:
+        entry = prices.get(key)
+        if key in have or not isinstance(entry, dict) or provider_name(entry.get("litellm_provider") or "") != "openai":
+            continue
+        row = [key, "openai"] + [plain(entry.get(field), key) for field in ("input_cost_per_token", "output_cost_per_token", "cache_read_input_token_cost", "cache_creation_input_token_cost")] + [key]
+        fill_wide(row, entry, key, changes)
+        changes.append((key, "row", None, "added"))
+        rows.append(row)
+    # as the generator writes them: a row has the audio columns only when one of them has a rate
+    for row in rows:
+        if len(row) > 7:
+            row.extend([""] * (WIDE - len(row)))
+            if not any(row[7:WIDE]):
+                del row[7:]
     digest = hashlib.sha256(raw).hexdigest()
     note = [
         "%s %s (sha256 %s, %s) by scripts/gen_pricing.py --merge." % (MERGE_NOTE, prices_path.name, digest, day),
         "// Its price file is LiteLLM's model_prices_and_context_window.json, which the Bifrost datasheet descends from.",
-        "// Token rates are the datasheet's; the merge never changes them.",
+        "// Token rates are the datasheet's; the merge never changes them, except in a row it adds (ADDED_ROWS: the",
+        "// table had no row for the model, so the price file's token rates are taken).",
     ]
-    table.write_text(render(header + note, rows), encoding="utf-8")
+    table.write_text(render(header[:2] + COLUMNS_NOTE + note, rows), encoding="utf-8")
     return changes, disagreements, skipped
 
 
@@ -184,7 +215,8 @@ def generate(src):
         inp = entry.get("input_cost_per_token")
         out = entry.get("output_cost_per_token")
         sec = entry.get("input_cost_per_second")
-        if inp is None and out is None and sec is None:
+        # a speech model can carry only a rate per character
+        if inp is None and out is None and sec is None and entry.get("input_cost_per_character") is None:
             continue
         text(key, key)
         row = (
@@ -196,11 +228,13 @@ def generate(src):
             plain(entry.get("cache_creation_input_token_cost"), key),
             text(entry.get("base_model"), key),
         )
-        # realtime and live models carry audio token rates and a voice rate per second: three more columns
+        # realtime, live, transcription and speech models carry audio token rates, a voice rate per second or a
+        # rate per character: four more columns
         wide = (
             plain(entry.get("input_cost_per_audio_token"), key),
             plain(entry.get("output_cost_per_audio_token"), key),
             plain(sec, key),
+            plain(entry.get("input_cost_per_character"), key),
         )
         rows.append(row + wide if any(wide) else row)
     rows.sort(key=lambda r: (len(r[0].encode("utf-8")), r[0]))
@@ -209,9 +243,7 @@ def generate(src):
     header = [
         "// Generated by scripts/gen_pricing.py from a Bifrost pricing datasheet. Do not edit.",
         "// Source: %s, sha256 %s, %d priced entries." % (src.name, digest, len(rows)),
-        "// Columns, tab-separated: key, provider, input, output, cacheRead, cacheWrite, baseModel, and for",
-        "// a realtime or live model inputAudio, outputAudio, perSecond (a row has 7 or 10 columns).",
-        "// Prices are USD per token (perSecond: per second); an empty field means the datasheet has no such rate.",
+        *COLUMNS_NOTE,
     ]
     OUT.write_text(render(header, rows), encoding="utf-8")
     print("wrote %s: %d entries" % (OUT, len(rows)))

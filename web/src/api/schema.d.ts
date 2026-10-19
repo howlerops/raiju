@@ -28,7 +28,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Prometheus text metrics */
+        /**
+         * Prometheus text metrics
+         * @description Families follow Bifrost's telemetry plugin; the raiju_* families are Raiju's own. The crew routing families (raiju_crew_assignments_total, raiju_crew_calls_total, raiju_crew_attempts_total, raiju_crew_escalations_total, raiju_crew_accepts_total, raiju_crew_outcomes_total, raiju_crew_outcome_quality, raiju_crew_task_cost_usd, raiju_crew_lambda, raiju_crew_subscription_phi) are described in docs/crew-routing.md. Counters and histograms add up over the workers of a node; the lambda and quota gauges take the largest.
+         */
         get: operations["getMetrics"];
         put?: never;
         post?: never;
@@ -2490,6 +2493,106 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/crews": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Crew pools, with per class the multiplier in use, the crew, the frontier and the knee
+         * @description Raiju-only (docs/crew-routing.md). Each pool lists its candidates with their prices, its subscriptions with the spend and quota fraction in their window, and per class the lambda and where it came from (knee, lambda or budget), the crew (one candidate per role), the frontier points and the knee. A class profile says whether it is configured, learned from the task log rows, or the default.
+         */
+        get: operations["getApiCrews"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/crews/{pool}/assign": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The crew of a task, made now when the task has none in force
+         * @description The same store as crew/<pool> routing, so the crew returned is the one the task's calls go to. The class is the caller's (class), else the classifier's on text and labels; a task keeps its first assignment until task_ttl_seconds passes.
+         */
+        post: operations["postApiCrewsPoolAssign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/crews/tasks/{task_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A task's assignment, attempts and calls, with the cost summed from the log rows
+         * @description The pool is named by the pool query parameter. The calls are the log rows the task wrote for that pool; the cost is their sum.
+         */
+        get: operations["getApiCrewsTasksTaskId"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/crews/tasks/{task_id}/outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Records an attempt's outcome on a task (quality, verifier signal, accuracy)
+         * @description The attempt's cost is summed from its log rows (x-raiju-task-attempt). The first outcome of an attempt counts: a repeat answers with the stored one (recorded false) and changes nothing. The outcome is credited to the learned evidence of the crew's roles. A pass or no verifier completes the task (its cost is paced in budget mode); a fail leaves it open for next.
+         */
+        post: operations["postApiCrewsTasksTaskIdOutcome"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/crews/tasks/{task_id}/next": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The sequential layer's decision after a task's attempts (accept, or the next attempt's crew)
+         * @description Pandora's rule on the within-task posterior (paper section 3.4, Prop. 11), over the class frontier's crews given the attempts' verifier signals. It accepts when the layer is off for the pool, the task is complete, the attempt budget is used up, the verifier's accuracy is unknown or at or below the threshold of Theorem 2, or no crew is worth its cost; accept completes the task. Otherwise it starts attempt k+1 on the crew it picks: later calls carrying that attempt number go to that crew, and calls carrying an earlier one keep theirs.
+         */
+        post: operations["postApiCrewsTasksTaskIdNext"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/alerts": {
         parameters: {
             query?: never;
@@ -4155,6 +4258,188 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description One role of a crew and the candidate that plays it. */
+        CrewPart: {
+            role: string;
+            candidate: string;
+        };
+        /** @description A candidate of a pool, with its price per token (USD) from the pricing table. */
+        CrewCandidate: {
+            id?: string;
+            model?: string;
+            provider?: string;
+            /** @enum {string} */
+            route?: "api" | "local" | "subscription";
+            roles?: string[];
+            subscription?: string;
+            reasoning_effort?: string;
+            price?: {
+                input?: number;
+                output?: number;
+                priced?: boolean;
+            };
+        };
+        /** @description A subscription's spend in its window and its quota fraction phi; h is the subscription factor of Def. 4. */
+        CrewSubscription: {
+            name?: string;
+            window_hours?: number;
+            limit_usd?: number;
+            free_until_fraction?: number;
+            spent_usd?: number;
+            phi?: number;
+            h?: number;
+        };
+        /** @description A vertex of the class frontier, with the crew that attains it. */
+        CrewFrontierPoint: {
+            cost?: number | null;
+            quality?: number | null;
+            crew?: components["schemas"]["CrewPart"][];
+        };
+        /** @description One class of a pool, with its multiplier and where it came from, the crew, the frontier and the knee. */
+        CrewClass: {
+            class?: string;
+            lambda?: number | null;
+            lambda_source?: string;
+            cost?: number | null;
+            quality?: number | null;
+            crew?: components["schemas"]["CrewPart"][];
+            /** @description The knee of the frontier (Def. 6); endpoint is true when the knee is an end vertex. */
+            knee?: {
+                budget?: number;
+                quality?: number;
+                lambda?: number;
+                endpoint?: boolean;
+            } | null;
+            frontier?: components["schemas"]["CrewFrontierPoint"][];
+            profiles?: {
+                role?: string;
+                calls?: number;
+                input_tokens?: number;
+                output_tokens?: number;
+                source?: string;
+            }[];
+            /** @description The outcomes credited to the class, the reference crew's quality and each crew's mean quality. */
+            learned?: {
+                outcomes?: number | null;
+                mean_quality?: number | null;
+                reference_quality?: number;
+                crews?: {
+                    crew?: components["schemas"]["CrewPart"][];
+                    outcomes?: number;
+                    mean_quality?: number | null;
+                }[];
+            };
+        };
+        /** @description One learned role effect: its prior, its blend with the outcomes (eq. 10) and the evidence behind it. */
+        CrewLearnedCell: {
+            class?: string;
+            role?: string;
+            candidate?: string;
+            prior_delta?: number;
+            delta_hat?: number;
+            outcomes?: number;
+            mean_excess?: number | null;
+        };
+        /** @description Where a pool's priors or classifier come from - a file (its path) or inline, or the built-in classifier. */
+        CrewSource: {
+            source: string;
+            path?: string;
+        };
+        /** @description A crew pool as the listing shows it. */
+        CrewPool: {
+            name: string;
+            roles?: string[];
+            classes?: string[];
+            uncertain_class?: string;
+            task_ttl_seconds?: number;
+            candidates: components["schemas"]["CrewCandidate"][];
+            subscriptions?: components["schemas"]["CrewSubscription"][];
+            operating_point?: {
+                /** @enum {string} */
+                mode?: "knee" | "lambda" | "budget";
+                lambda?: number | null;
+                budget_usd?: number | null;
+                step?: number;
+            };
+            /** @description The operating point's mode, the multiplier the live writers share (null when none is paced), the running mean cost of completed tasks. */
+            pacing?: {
+                mode?: string;
+                lambda?: number | null;
+                lambda_source?: string;
+                live_writers?: number;
+                tasks_completed?: number;
+                mean_task_cost?: number | null;
+                budget_usd?: number | null;
+                step?: number;
+            };
+            priors?: components["schemas"]["CrewSource"];
+            classifier?: components["schemas"]["CrewSource"];
+            credibility?: {
+                prior_scale?: number;
+            };
+            learned_cells?: components["schemas"]["CrewLearnedCell"][];
+            classes_detail: components["schemas"]["CrewClass"][];
+        };
+        /** @description An attempt's recorded outcome (null until it is scored). */
+        CrewOutcome: {
+            /** @description pass, fail or empty (no verifier) */
+            verifier?: string;
+            quality?: number;
+            accuracy?: number | null;
+            cost?: number;
+        } | null;
+        /** @description An attempt of an assignment, with its crew and outcome. */
+        CrewAttemptRecord: {
+            attempt?: number;
+            crew?: components["schemas"]["CrewPart"][];
+            outcome?: components["schemas"]["CrewOutcome"];
+        };
+        /** @description The task's assignment in force (null when none is recorded). */
+        CrewAssignment: {
+            task_id?: string;
+            pool?: string;
+            class?: string;
+            posterior?: {
+                class?: string;
+                p?: number;
+            }[];
+            crew?: components["schemas"]["CrewPart"][];
+            attempt?: number;
+            attempts?: components["schemas"]["CrewAttemptRecord"][];
+            lambda?: number | null;
+            created?: number;
+            paced?: boolean;
+            expired?: boolean;
+        } | null;
+        /** @description One attempt of a task as the log rows show it, with its assignment record when there is one. */
+        CrewTaskAttempt: {
+            attempt?: number;
+            crew?: components["schemas"]["CrewPart"][] | null;
+            outcome?: components["schemas"]["CrewOutcome"];
+            calls?: number;
+            cost?: number;
+        };
+        /** @description A task's assignment, its attempts and its calls, with the cost summed from the log rows. */
+        CrewTaskDetail: {
+            task_id: string;
+            pool: string;
+            assignment?: components["schemas"]["CrewAssignment"];
+            calls: number;
+            cost: number;
+            attempts: components["schemas"]["CrewTaskAttempt"][];
+            rows: {
+                request_id?: string;
+                ts?: number;
+                role?: string;
+                candidate?: string;
+                attempt?: number;
+                model?: string;
+                status?: number;
+                prompt_tokens?: number;
+                completion_tokens?: number;
+                cost?: number;
+            }[];
+        };
         /** @description Authentication for the card fetch (discovery_auth) or the proxied calls (runtime_auth). Header values, the OAuth client and the TLS certificates may be env.NAME references; stored values are returned masked. */
         AgentUpstreamAuth: {
             /** @enum {string} */
@@ -4586,7 +4871,7 @@ export interface components {
         };
         CustomRolePermission: {
             /** @enum {string} */
-            resource: "Logs" | "MCPLogs" | "AuditLogs" | "ModelProvider" | "Observability" | "VirtualKeys" | "Users" | "MCPGateway" | "Teams" | "Customers" | "BusinessUnits" | "Projects" | "RBAC" | "AccessProfiles" | "RoutingRules" | "Governance" | "Settings" | "Cluster";
+            resource: "Logs" | "MCPLogs" | "AuditLogs" | "ModelProvider" | "Observability" | "VirtualKeys" | "Users" | "MCPGateway" | "Teams" | "Customers" | "BusinessUnits" | "Projects" | "RBAC" | "AccessProfiles" | "RoutingRules" | "Governance" | "Settings" | "Cluster" | "APIKeys" | "Crews";
             /** @enum {string} */
             operation: "View" | "Create" | "Update" | "Delete" | "Download" | "Reveal" | "RunInference";
         };
@@ -17717,6 +18002,315 @@ export interface operations {
                 };
             };
             /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiCrews: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        pools: components["schemas"]["CrewPool"][];
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiCrewsPoolAssign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Pool name */
+                pool: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    task_id: string;
+                    /** @description The task's first user turn, for the classifier */
+                    text?: string;
+                    labels?: string[];
+                    /** @description The class, instead of the classifier's */
+                    class?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description The body names no valid task, or a class the pool does not have. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No pool of that name. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiCrewsTasksTaskId: {
+        parameters: {
+            query: {
+                /** @description Pool name */
+                pool: string;
+            };
+            header?: never;
+            path: {
+                /** @description Task id */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CrewTaskDetail"];
+                };
+            };
+            /** @description The pool query parameter is missing. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such pool, or no task of that name in it. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiCrewsTasksTaskIdOutcome: {
+        parameters: {
+            query: {
+                /** @description Pool name */
+                pool: string;
+            };
+            header?: never;
+            path: {
+                /** @description Task id */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The task's quality for this attempt, 0 to 1 */
+                    quality: number;
+                    /**
+                     * @description The verifier's signal, when it spoke
+                     * @enum {string}
+                     */
+                    verifier?: "pass" | "fail";
+                    /** @description The attempt; the task's current attempt when left out */
+                    attempt?: number;
+                    /** @description The verifier's accuracy, when known (else the pool's sequential.verifier_accuracy for the class) */
+                    accuracy?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description OK, with the attempt's stored outcome and whether this call recorded it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description The body names no valid quality, verifier, attempt or accuracy. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No pool of that name, no task in force, or no record of the attempt. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiCrewsTasksTaskIdNext: {
+        parameters: {
+            query: {
+                /** @description Pool name */
+                pool: string;
+            };
+            header?: never;
+            path: {
+                /** @description Task id */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK, with action accept (and its reason) or attempt (its number, crew and reservation index) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No pool of that name, or no task in force. */
             404: {
                 headers: {
                     [name: string]: unknown;

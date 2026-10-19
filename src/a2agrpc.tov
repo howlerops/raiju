@@ -1,0 +1,418 @@
+// The A2A gRPC binding (Bifrost's handlers/agentgatewaygrpc.go): the lf.a2a.v1 service on a listener of its own, with
+// each agent under <name>.<server.a2a_grpc_base_domain>. The agent is the first label of the request's :authority under
+// that domain; a foreign host, no agent or more labels is NOT_FOUND. The caller's virtual key is read from the metadata
+// in the order Bifrost reads it, and the call passes the gate of the HTTP bindings (Ops.a2aGrpcGate). A method decodes
+// its request (a2apb), runs the operation the JSON-RPC binding would run (Ops.a2aCall, binding "grpc") and encodes the
+// answer; an agent's error is a gRPC status as a2a-go maps it.
+//
+// Not built: TLS (h2c only, as Bifrost's listener); the ErrorInfo details a2a-go attaches to a status; a client's
+// cancellation ends a call only at its deadline.
+import { listen, H2Header } from "./h2"
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs"
+import { grpcServe, unaryRun, serverRun, GrpcRun, GrpcCall, GrpcError, httpToGrpc, GRPC_INTERNAL, GRPC_INVALID_ARGUMENT, GRPC_NOT_FOUND, GRPC_UNIMPLEMENTED, GRPC_FAILED_PRECONDITION, GRPC_UNAUTHENTICATED, GRPC_PERMISSION_DENIED, GRPC_RESOURCE_EXHAUSTED, GRPC_UNAVAILABLE, GRPC_DEADLINE_EXCEEDED } from "./grpcwire"
+import { Ops, GrpcGate } from "./ops"
+import { requestOf, responseOf, encode, decode } from "./a2apb"
+import { rpcCall, Call, SseSplitter } from "./a2a"
+import { Field, fields, find, rawStr, rawNum, isNull } from "./json"
+import { Hdrs } from "./schemas"
+import { AgentConfig, ServerSectionConfig, VirtualKeyConfig } from "./config"
+
+const SERVICE = "/lf.a2a.v1.A2AService/"
+// grpc-go's default largest request message
+const MAX_RECV: int = 4194304
+// the prefix of a virtual key (governance.tov's VK_PREFIX)
+const VK_PREFIX = "sk-bf-"
+
+function trimDots(s: string): string {
+  let a: int = 0
+  let b: int = s.byteLength
+  while (a < b && s.slice(a, a + 1) === ".") a = a + 1
+  while (b > a && s.slice(b - 1, b) === ".") b = b - 1
+  return s.slice(a, b)
+}
+
+// The agent an :authority names under the domain: its first label, lower-cased, with the port dropped. "" when the
+// authority is not under the domain, names no agent, or has more labels (Bifrost's agentNameFromAuthority).
+export function agentOfAuthority(authority: string, domain: string): string {
+  const parts = authority.split(":")
+  // an IPv6 literal or a stray colon is no DNS name
+  if (parts.length > 2) return ""
+  const host = trimDots(parts[0]!.toLowerCase())
+  const base = trimDots(domain.toLowerCase())
+  if (base === "" || !host.endsWith("." + base)) return ""
+  const name = host.slice(0, host.byteLength - base.byteLength - 1)
+  if (name === "" || name.includes(".")) return ""
+  return name
+}
+
+// The virtual key a call sent and the metadata it came in on (Bifrost's resolveVirtualKeyFromGRPCMetadata): x-bf-vk
+// first, then a Bearer token, then x-api-key, x-goog-api-key or api-key. The last three count only with the sk-bf- prefix.
+export function keyOf(md: H2Header[]): { value: string, header: string } {
+  const get = (name: string): string => {
+    for (const h of md) {
+      if (h.name === name) return h.value.trim()
+    }
+    return ""
+  }
+  const vk = get("x-bf-vk")
+  if (vk !== "") return { value: vk, header: "x-bf-vk" }
+  const auth = get("authorization")
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    const token = auth.slice(7, auth.byteLength).trim()
+    if (token.toLowerCase().startsWith(VK_PREFIX)) return { value: token, header: "authorization" }
+  }
+  for (const name of ["x-api-key", "x-goog-api-key", "api-key"]) {
+    const v = get(name)
+    if (v.toLowerCase().startsWith(VK_PREFIX)) return { value: v, header: name }
+  }
+  return { value: "", header: "" }
+}
+
+// The call's metadata as the gateway's headers: lower-cased names, the first value of each, without the transport's own
+// fields (:pseudo, grpc-*) and a2a-version (Bifrost's sanitizeGRPCMetadata). The key stays: the gateway takes the key it
+// was sent with out of what goes to the agent, and forward_accepted_credential sends it on where the agent asks.
+export function headersOf(md: H2Header[]): Hdrs {
+  const h: Hdrs = new Map()
+  for (const x of md) {
+    const n = x.name.toLowerCase()
+    if (n.startsWith(":") || n.startsWith("grpc-") || n === "a2a-version") continue
+    if (h.get(n) === undefined) h.set(n, x.value)
+  }
+  return h
+}
+
+// The gRPC status of a JSON-RPC error code, as a2a-go maps it: the A2A error the code stands for, then the status of
+// that error (internal/jsonrpc's codes, then grpcutil's table). Unknown codes are INTERNAL.
+export function grpcOfRpcCode(code: int): int {
+  if (code === -32601) return GRPC_UNIMPLEMENTED
+  if (code === -32602 || code === -32600 || code === -32700 || code === -32005) return GRPC_INVALID_ARGUMENT
+  if (code === -32001) return GRPC_NOT_FOUND
+  if (code === -32002 || code === -32003 || code === -32004 || code === -32007 || code === -32008 || code === -32009) return GRPC_FAILED_PRECONDITION
+  if (code === -31401) return GRPC_UNAUTHENTICATED
+  if (code === -31403) return GRPC_PERMISSION_DENIED
+  return GRPC_INTERNAL
+}
+
+// The gRPC status of a refusal by the gate: its HTTP status, with the budget and limit refusals (402, 429) as
+// RESOURCE_EXHAUSTED and a gateway without its public URL as UNAVAILABLE.
+export function grpcOfDenial(status: int): int {
+  if (status === 400) return GRPC_INVALID_ARGUMENT
+  if (status === 401) return GRPC_UNAUTHENTICATED
+  if (status === 402 || status === 429) return GRPC_RESOURCE_EXHAUSTED
+  if (status === 403) return GRPC_PERMISSION_DENIED
+  if (status === 404) return GRPC_NOT_FOUND
+  if (status === 503) return GRPC_UNAVAILABLE
+  return httpToGrpc(status)
+}
+
+function envelopeOf(text: string): Field[] | undefined {
+  try {
+    return fields(text)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The result of a JSON-RPC answer, or the error it carries as a GrpcError. An answer that is no envelope is judged by its
+// HTTP status.
+function resultOf(text: string, status: int): string throws GrpcError {
+  const fs = envelopeOf(text)
+  if (fs !== undefined) {
+    const er = find(fs, "error")
+    if (er !== undefined && !isNull(er)) {
+      const ef = envelopeOf(er) ?? []
+      const code = Math.floor(rawNum(ef, "code") ?? -32603.0)
+      throw new GrpcError(grpcOfRpcCode(code), rawStr(ef, "message") ?? "the agent failed")
+    }
+    const res = find(fs, "result")
+    if (res !== undefined && status < 400) return res
+  }
+  throw new GrpcError(status >= 400 ? httpToGrpc(status) : GRPC_INTERNAL, `the agent answered HTTP ${status}`)
+}
+
+// The call the JSON-RPC binding builds for an operation under its v1 name (a2a.tov's rpcCall), from the request as JSON.
+function callOf(op: string, params: string): Call throws GrpcError {
+  const r = rpcCall(`{"jsonrpc":"2.0","id":1,"method":"${op}","params":${params}}`)
+  if (r.kind === "fail") throw new GrpcError(GRPC_INVALID_ARGUMENT, r.message)
+  return r.call
+}
+
+// The request message as the JSON the gateway works on.
+function requestJson(req: u8[], op: string): string throws GrpcError {
+  try {
+    return try decode(req, requestOf(op))
+  } catch (e) {
+    throw new GrpcError(GRPC_INVALID_ARGUMENT, "failed to convert request: " + e.message)
+  }
+}
+
+// The response message bytes of an operation's result (Empty has none).
+function bytesOf(op: string, result: string): u8[] throws Error {
+  const msg = responseOf(op)
+  if (msg === "Empty") return []
+  return try encode(result, msg)
+}
+
+// A call that passed the gate: its agent, the caller's key, its headers and the gateway's public URL.
+type Admitted = { agent: AgentConfig, vk: VirtualKeyConfig | undefined, h: Hdrs, base: string }
+
+// The gate of a call: the agent its authority names, the key it sent, the grants and the limits.
+function admit(ops: Ops, domain: string, call: GrpcCall): Admitted throws GrpcError {
+  const name = agentOfAuthority(call.authority, domain)
+  if (name === "") throw new GrpcError(GRPC_NOT_FOUND, "agent not found")
+  const h = headersOf(call.metadata)
+  const g: GrpcGate = ops.a2aGrpcGate(name, h, keyOf(call.metadata).value !== "")
+  const agent = g.agent
+  if (g.status !== 0 || agent === undefined) throw new GrpcError(grpcOfDenial(g.status), g.message)
+  return { agent: agent, vk: g.vk, h: h, base: g.base }
+}
+
+type Timed<T> = { late: bool, value: T | undefined }
+
+async function tagged<T>(p: Promise<T, Error>): Promise<Timed<T>, Error> {
+  const v = try await p
+  return { late: false, value: v }
+}
+
+// The answer of p, or DEADLINE_EXCEEDED when it is not in by the call's deadline (grpc-timeout). p itself runs on to its own
+// limit; the caller has what it needs to stop waiting.
+async function within<T>(p: Promise<T, Error>, deadlineMs: int | undefined): Promise<T, Error> {
+  if (deadlineMs === undefined) return try await p
+  const left = deadlineMs - Math.trunc(Date.now())
+  if (left <= 0) throw new GrpcError(GRPC_DEADLINE_EXCEEDED, "deadline exceeded")
+  const timer: Promise<Timed<T>, Error> = new Promise<Timed<T>, Error>((resolve) => {
+    setTimeout(() => resolve({ late: true, value: undefined }), left)
+  })
+  const first: Promise<Timed<T>, Error> = tagged(p)
+  const got = try await Promise.race([first, timer])
+  const v = got.value
+  if (got.late || v === undefined) throw new GrpcError(GRPC_DEADLINE_EXCEEDED, "deadline exceeded")
+  return v
+}
+
+// The operation through the gateway: the call as the grpc binding (the agent's card decides the names it goes out in)
+// and the answer, which the binding turns into a result or an error.
+async function answer(ops: Ops, a: Admitted, op: string, params: string): Promise<{ status: int, text: string, body: ReadableStream | undefined, ct: string }, Error> {
+  const call = try callOf(op, params)
+  const r = await ops.a2aCall(a.agent, call, "grpc", "1", a.h, a.vk, a.base)
+  const body = r.body
+  const ct = r.headers.get("content-type") ?? ""
+  if (r.status < 400 && ct.includes("text/event-stream") && body !== undefined) return { status: r.status, text: "", body: body, ct: ct }
+  const text = try await r.text()
+  return { status: r.status, text: text, body: undefined, ct: ct }
+}
+
+// One unary method: its request, the operation, its response.
+function unary(ops: Ops, domain: string, op: string): GrpcRun {
+  return unaryRun(async (req: u8[], call: GrpcCall): Promise<u8[], Error> => {
+    const a = try admit(ops, domain, call)
+    const params = try requestJson(req, op)
+    const got = try await within(answer(ops, a, op, params), call.deadlineMs)
+    return try bytesOf(op, try resultOf(got.text, got.status))
+  })
+}
+
+// Sends one event of a stream: its result as a StreamResponse, or the error it carries.
+async function sendEvent(call: GrpcCall, op: string, data: string): Promise<void, Error> {
+  const result = try resultOf(data, 200)
+  try await call.send(try bytesOf(op, result))
+}
+
+// Passes an event stream on, one StreamResponse per event, as the events arrive.
+async function passEvents(body: ReadableStream, call: GrpcCall, op: string): Promise<void, Error> {
+  const dec = try new TextDecoder()
+  const split = new SseSplitter()
+  const reader = try body.getReader()
+  while (true) {
+    const r = try await within(reader.read(), call.deadlineMs)
+    if (r.done) break
+    const v = r.value
+    if (v === undefined) continue
+    for (const d of split.push(try dec.decode(v, { stream: true }))) {
+      try await sendEvent(call, op, d)
+    }
+  }
+  const tail = split.rest()
+  if (tail !== undefined) try await sendEvent(call, op, tail)
+}
+
+// One server-streaming method: its request, the operation, and each event of its answer.
+function streamed(ops: Ops, domain: string, op: string): GrpcRun {
+  return serverRun(async (req: u8[], call: GrpcCall): Promise<void, Error> => {
+    const a = try admit(ops, domain, call)
+    const params = try requestJson(req, op)
+    const got = try await within(answer(ops, a, op, params), call.deadlineMs)
+    const body = got.body
+    if (body !== undefined) {
+      try await passEvents(body, call, op)
+      return
+    }
+    // an answer that is not a stream is one event
+    try await call.send(try bytesOf(op, try resultOf(got.text, got.status)))
+  })
+}
+
+// The methods of the lf.a2a.v1 service, by their gRPC paths. Each is served over the gateway's dispatch for the agent
+// its authority names.
+export function grpcMethods(ops: Ops, domain: string): Map<string, GrpcRun> {
+  const m: Map<string, GrpcRun> = new Map()
+  for (const op of ["SendMessage", "GetTask", "ListTasks", "CancelTask", "CreateTaskPushNotificationConfig", "GetTaskPushNotificationConfig", "ListTaskPushNotificationConfigs", "DeleteTaskPushNotificationConfig", "GetExtendedAgentCard"]) {
+    m.set(SERVICE + op, unary(ops, domain, op))
+  }
+  for (const op of ["SendStreamingMessage", "SubscribeToTask"]) {
+    m.set(SERVICE + op, streamed(ops, domain, op))
+  }
+  return m
+}
+
+// The gRPC settings: when server.a2a_grpc_base_domain and server.a2a_grpc_port are both set (Bifrost starts the listener
+// under the same two), the cards of every worker advertise the interface (ops.a2aGrpc). Returns the reason the settings
+// are refused, "" otherwise. RAIJU_A2A_GRPC_LISTEN_PORT, when set, is the port the listener binds (see listenA2aGrpc).
+export function setA2aGrpc(ops: Ops, server: ServerSectionConfig | undefined): string {
+  const domain = trimDots((server?.a2a_grpc_base_domain ?? "").toLowerCase())
+  const port: int = server?.a2a_grpc_port ?? 0
+  if (domain === "" || port <= 0) return ""
+  const raw = process.env.RAIJU_A2A_GRPC_LISTEN_PORT ?? ""
+  if (raw !== "") {
+    const p = parseInt(raw) ?? 0
+    if (p <= 0 || p > 65535) return `invalid RAIJU_A2A_GRPC_LISTEN_PORT ${raw}`
+  }
+  ops.a2aGrpc = { domain: domain, port: port }
+  return ""
+}
+
+// The port the listener binds: RAIJU_A2A_GRPC_LISTEN_PORT, else the advertised port.
+function bindPortOf(port: int): int {
+  const raw = process.env.RAIJU_A2A_GRPC_LISTEN_PORT ?? ""
+  if (raw === "") return port
+  return Math.trunc(parseInt(raw) ?? port)
+}
+
+// Opens the listener in this process, when the settings are on (setA2aGrpc). A single-process gateway calls it at start.
+// A port it cannot bind stops the process (listen does, as it does for the HTTP listeners).
+export function listenA2aGrpc(ops: Ops, host: string, server: ServerSectionConfig | undefined): void {
+  const domain = trimDots((server?.a2a_grpc_base_domain ?? "").toLowerCase())
+  const port: int = server?.a2a_grpc_port ?? 0
+  if (domain === "" || port <= 0) return
+  const bind = bindPortOf(port)
+  listen({ hostname: host, port: bind, maxStreams: 100 }, grpcServe(grpcMethods(ops, domain), MAX_RECV))
+  console.error(`raiju a2a grpc listening on ${host}:${bind} (process ${process.pid}, advertised port ${port}) for *.${domain}`)
+}
+
+// With several bun workers, the listener is opened by exactly one of them: the one that takes the lease, a directory made
+// with mkdir in the node's share folder whose pid file names the holder. A lease whose holder is gone is taken over (on
+// Linux, where a missing /proc/<pid> shows it; elsewhere a lease is kept). Returns whether this worker opened the listener.
+export function claimA2aGrpc(ops: Ops, host: string, server: ServerSectionConfig | undefined, shareDir: string): bool {
+  const domain = trimDots((server?.a2a_grpc_base_domain ?? "").toLowerCase())
+  const port: int = server?.a2a_grpc_port ?? 0
+  if (domain === "" || port <= 0) return false
+  if (shareDir === "") {
+    console.error("raiju: a2a grpc listener not started: the workers have no share folder")
+    return false
+  }
+  if (!takeLease(shareDir + "/a2a-grpc-lease")) return false
+  listenA2aGrpc(ops, host, server)
+  return true
+}
+
+function takeLease(lease: string): bool {
+  try {
+    mkdirSync(lease)
+    writeFileSync(lease + "/pid", `${process.pid}`)
+    return true
+  } catch (e) {
+    // the lease is held, or was left by a holder that is gone
+  }
+  let holder: int = 0
+  try {
+    holder = Math.trunc(parseInt(readFileSync(lease + "/pid", "utf8")) ?? 0)
+  } catch (e) {
+    holder = 0
+  }
+  if (holder > 0 && existsSync("/proc/self") && !existsSync(`/proc/${holder}`)) {
+    try {
+      rmSync(lease, { recursive: true, force: true })
+      mkdirSync(lease)
+      writeFileSync(lease + "/pid", `${process.pid}`)
+      return true
+    } catch (e) {
+      return false
+    }
+  }
+  return false
+}
+
+// ---- tests ----
+
+test("the agent is the first label of the authority under the domain", () => {
+  expect(agentOfAuthority("echo.gw.test", "gw.test")).toBe("echo")
+  expect(agentOfAuthority("echo.gw.test:18246", "gw.test")).toBe("echo")
+  expect(agentOfAuthority("ECHO.GW.TEST.", "gw.test")).toBe("echo")
+  expect(agentOfAuthority("echo.gw.test", ".GW.Test.")).toBe("echo")
+  expect(agentOfAuthority("gw.test", "gw.test")).toBe("")
+  expect(agentOfAuthority(".gw.test", "gw.test")).toBe("")
+  expect(agentOfAuthority("a.b.gw.test", "gw.test")).toBe("")
+  expect(agentOfAuthority("echo.other.test", "gw.test")).toBe("")
+  expect(agentOfAuthority("echo.gw.test.evil", "gw.test")).toBe("")
+  expect(agentOfAuthority("echo.gw.test", "")).toBe("")
+  expect(agentOfAuthority("[::1]:18246", "gw.test")).toBe("")
+})
+
+test("the virtual key is read in Bifrost's order, and an unprefixed credential is not a key", () => {
+  const md = (pairs: string[][]): H2Header[] => pairs.map((p) => ({ name: p[0]!, value: p[1]! }))
+  const vk = "sk-bf-" + "unit-1"
+  expect(keyOf(md([["x-bf-vk", vk], ["authorization", "Bearer sk-bf-other"]])).header).toBe("x-bf-vk")
+  expect(keyOf(md([["authorization", "bearer  " + vk]])).value).toBe(vk)
+  expect(keyOf(md([["authorization", "Bearer " + vk]])).header).toBe("authorization")
+  expect(keyOf(md([["authorization", "Bearer agent-token"]])).value).toBe("")
+  expect(keyOf(md([["x-api-key", "agent-key"], ["api-key", vk]])).header).toBe("api-key")
+  expect(keyOf(md([["x-goog-api-key", vk]])).header).toBe("x-goog-api-key")
+  expect(keyOf(md([])).value).toBe("")
+})
+
+test("metadata reaches the gateway without the transport's fields, the first value of each name", () => {
+  const h = headersOf([{ name: ":authority", value: "echo.gw.test" }, { name: "grpc-trace-bin", value: "x" }, { name: "A2A-Version", value: "1.0" }, { name: "x-team", value: "a" }, { name: "x-team", value: "b" }])
+  expect(h.get("x-team")).toBe("a")
+  expect(h.has(":authority")).toBe(false)
+  expect(h.has("grpc-trace-bin")).toBe(false)
+  expect(h.has("a2a-version")).toBe(false)
+})
+
+test("JSON-RPC error codes and refusals map to gRPC statuses as a2a-go does", () => {
+  expect(grpcOfRpcCode(-32001)).toBe(GRPC_NOT_FOUND)
+  expect(grpcOfRpcCode(-32002)).toBe(GRPC_FAILED_PRECONDITION)
+  expect(grpcOfRpcCode(-32601)).toBe(GRPC_UNIMPLEMENTED)
+  expect(grpcOfRpcCode(-32602)).toBe(GRPC_INVALID_ARGUMENT)
+  expect(grpcOfRpcCode(-32603)).toBe(GRPC_INTERNAL)
+  expect(grpcOfRpcCode(-31401)).toBe(GRPC_UNAUTHENTICATED)
+  expect(grpcOfRpcCode(-31403)).toBe(GRPC_PERMISSION_DENIED)
+  expect(grpcOfRpcCode(-99999)).toBe(GRPC_INTERNAL)
+  expect(grpcOfDenial(401)).toBe(GRPC_UNAUTHENTICATED)
+  expect(grpcOfDenial(403)).toBe(GRPC_PERMISSION_DENIED)
+  expect(grpcOfDenial(404)).toBe(GRPC_NOT_FOUND)
+  expect(grpcOfDenial(429)).toBe(GRPC_RESOURCE_EXHAUSTED)
+  expect(grpcOfDenial(503)).toBe(GRPC_UNAVAILABLE)
+})
+
+test("an answer is its result, or the error it carries as a status", () => {
+  expect(try resultOf(`{"jsonrpc":"2.0","id":1,"result":{"id":"t1"}}`, 200)).toBe(`{"id":"t1"}`)
+  let code: int = -1
+  let msg = ""
+  try {
+    const x = try resultOf(`{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"task not found"}}`, 200)
+  } catch (e) {
+    if (e instanceof GrpcError) {
+      code = e.code
+      msg = e.message
+    }
+  }
+  expect(code).toBe(GRPC_NOT_FOUND)
+  expect(msg).toBe("task not found")
+  let plain: int = -1
+  try {
+    const y = try resultOf("upstream went away", 502)
+  } catch (e) {
+    if (e instanceof GrpcError) plain = e.code
+  }
+  expect(plain).toBe(GRPC_UNAVAILABLE)
+})

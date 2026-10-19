@@ -1,0 +1,416 @@
+// Streaming conversion of a large /v1/embeddings request to the batch body of a provider whose format is not
+// OpenAI's (large_payload_optimization). The request is read token by token (jsonstream.tov) and each input string
+// is written into the provider's body as it arrives, so a list of inputs of any size is not held. What is held:
+// the small fields (dimensions, input_type), and for Gemini the inputs when "dimensions" comes after them (up to
+// holdMax, then the request is refused).
+//
+// The bodies are those of embeddings_native.tov (Gemini's batchEmbedContents, Vertex's predict) and of cohere.tov
+// (Cohere v2 embed) and Bedrock's Cohere embed (InvokeModel, signed through the spool). Bedrock's Titan takes one
+// input per call, so it is not converted here.
+//
+// Gemini gives each input its own output size. When "dimensions" comes before the inputs they stream with it; when it
+// comes after, the inputs are held (bounded by holdMax) and written at the end. Vertex takes the size at the end of
+// its body, and Cohere and Bedrock do not take it.
+import { Field, fields, elements, quote, rawNum, rawStr, isNull, decodeString } from "./json"
+import { JsonTokenizer, ByteOut, Compact, Tok, bytesOf, textOfBytes, T_OBJ, T_OBJ_END, T_ARR, T_ARR_END, T_KEY, T_STR, T_STRH, T_STRP, T_STRE, T_LIT } from "./jsonstream"
+import { Target } from "./providers/types"
+import * as cohere from "./providers/cohere"
+
+export const EMB_GEMINI = "embeddings-gemini"
+export const EMB_VERTEX = "embeddings-vertex"
+export const EMB_COHERE = "embeddings-cohere"
+export const EMB_BEDROCK = "embeddings-bedrock"
+
+const TS_START = 0
+const TS_KEYS = 1
+const TS_VALUE = 2
+const TS_DONE = 3
+
+// A raw JSON string (the bytes between the quotes, escapes in) as text.
+function rawText(raw: u8[]): string {
+  const s = textOfBytes(raw)
+  if (s.indexOf("\\") < 0) return s
+  try {
+    return decodeString("\"" + s + "\"")
+  } catch (e) {
+    return s
+  }
+}
+
+export class EmbConv {
+  private tk: JsonTokenizer
+  private out: ByteOut = new ByteOut()
+  private ts = TS_START
+  private curKey = ""
+  private vstart = false
+  private keep = false
+  private vd = 0
+  private vlong = false
+  private vout: ByteOut
+  private vcomp: Compact
+  // the input list
+  private arr = false
+  private begun = false
+  private items = 0
+  private elStream = false
+  // the small fields
+  private dims = ""
+  private inputType = ""
+  private gotInputType = false
+  // Gemini's inputs held until the end (when "dimensions" came after them): each input's bytes, and the bytes held
+  private holding = false
+  private cur: ByteOut | undefined = undefined
+  private elems: u8[][] = []
+  private heldSize = 0
+
+  constructor(readonly family: string, readonly model: string, strMax: int, readonly holdMax: int) {
+    this.tk = new JsonTokenizer(strMax, 65536)
+    this.vout = new ByteOut()
+    this.vcomp = new Compact(this.vout)
+  }
+
+  // Reads the next bytes of the request; the provider's body bytes they complete.
+  push(b: u8[]): u8[][] throws SyntaxError {
+    for (const t of try this.tk.push(b)) try this.tok(t)
+    return this.out.take()
+  }
+
+  // The end of the request; the rest of the provider's body.
+  finish(): u8[][] throws SyntaxError {
+    for (const t of try this.tk.finish()) try this.tok(t)
+    if (this.ts !== TS_DONE) throw new SyntaxError("the request body must be a JSON object")
+    if (!this.begun) throw new SyntaxError("input is required")
+    if (this.holding) this.flushHeld()
+    else this.tail()
+    return this.out.take()
+  }
+
+  private tok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (this.ts === TS_START) {
+      if (k !== T_OBJ) throw new SyntaxError("the request body must be a JSON object")
+      this.ts = TS_KEYS
+    } else if (this.ts === TS_KEYS) {
+      if (k === T_KEY) {
+        this.curKey = rawText(t.raw)
+        this.ts = TS_VALUE
+        this.vstart = true
+        this.vd = 0
+        this.vlong = false
+        this.keep = this.curKey === "dimensions" || this.curKey === "input_type"
+        this.vout = new ByteOut()
+        this.vcomp = new Compact(this.vout)
+      } else if (k === T_OBJ_END) {
+        this.ts = TS_DONE
+      } else {
+        throw new SyntaxError("the request body must be a JSON object")
+      }
+    } else if (this.ts === TS_VALUE) {
+      if (this.curKey === "input") {
+        try this.inputTok(t)
+      } else {
+        try this.valueTok(t)
+      }
+    }
+  }
+
+  // The input: one string, or an array of strings. Each string is written as it arrives.
+  private inputTok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    this.vstart = false
+    if (this.elStream) {
+      if (k === T_STRP) {
+        this.dest().bytes(t.raw)
+      } else if (k === T_STRE) {
+        this.elStream = false
+        this.vlong = false
+        try this.elemEnd()
+      }
+    } else if (k === T_ARR && !this.arr && this.vd === 0) {
+      this.arr = true
+      this.vd = 1
+    } else if (k === T_ARR_END && this.arr && this.vd === 1) {
+      this.arr = false
+      this.vd = 0
+      if (this.items === 0) throw new SyntaxError("input must not be empty")
+    } else if (k === T_STR) {
+      if (t.raw.length === 0) throw new SyntaxError("input must not be empty")
+      this.elemBegin()
+      this.dest().bytes(t.raw)
+      try this.elemEnd()
+    } else if (k === T_STRH) {
+      this.elemBegin()
+      this.dest().bytes(t.raw)
+      this.elStream = true
+      this.vlong = true
+    } else if (this.arr) {
+      throw new SyntaxError("token-array input is not supported; send strings")
+    } else if (k === T_LIT && rawText(t.raw) === "null") {
+      throw new SyntaxError("input is required")
+    } else {
+      throw new SyntaxError("input must be a string or an array of strings")
+    }
+    if (!this.elStream && this.vd === 0 && !this.vlong) this.ts = TS_KEYS
+  }
+
+  // The small fields: dimensions and input_type are kept whole; anything else is skipped.
+  private valueTok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    this.vstart = false
+    if (this.keep) {
+      this.vcomp.tok(t)
+      if (this.vout.size > 65536) throw new SyntaxError(`the request field ${this.curKey} is too large to convert while streaming`)
+    }
+    if (k === T_STRH) this.vlong = true
+    else if (k === T_STRE) this.vlong = false
+    if (k === T_OBJ || k === T_ARR) this.vd += 1
+    else if (k === T_OBJ_END || k === T_ARR_END) this.vd -= 1
+    if (this.vd === 0 && !this.vlong) {
+      const raw = textOfBytes(this.vout.all())
+      if (this.keep && this.curKey === "dimensions" && !isNull(raw)) try this.setDims(raw)
+      if (this.keep && this.curKey === "input_type") {
+        this.inputType = rawStr([{ key: "input_type", raw: raw }], "input_type") ?? ""
+        this.gotInputType = true
+      }
+      this.keep = false
+      this.ts = TS_KEYS
+    }
+  }
+
+  // A positive integer size, as embeddings_native.tov takes it.
+  private setDims(raw: string): void throws SyntaxError {
+    const d = rawNum([{ key: "dimensions", raw: raw }], "dimensions")
+    if (d === undefined || d < 1 || d !== Math.floor(d)) throw new SyntaxError("dimensions must be a positive integer")
+    this.dims = raw
+  }
+
+  // ---- the provider's body ----
+
+  // where the bytes of the body go: the open input (held for Gemini), or the output
+  private dest(): ByteOut {
+    const c = this.cur
+    return c !== undefined ? c : this.out
+  }
+
+  // the head is written before the first input (Gemini's inputs are held until the end when it has no size yet)
+  private elemBegin(): void {
+    if (!this.begun) {
+      this.begun = true
+      this.holding = this.family === EMB_GEMINI && this.dims === ""
+      if (!this.holding) this.out.text(this.headText())
+    }
+    if (this.holding) this.cur = new ByteOut()
+    const d = this.dest()
+    if (!this.holding && this.items > 0) d.byte(44)
+    this.items += 1
+    const f = this.family
+    if (f === EMB_GEMINI) d.text(`{"model":${quote("models/" + this.model)},"content":{"parts":[{"text":"`)
+    else if (f === EMB_VERTEX) d.text(`{"content":"`)
+    else d.byte(34)
+  }
+
+  private elemEnd(): void throws SyntaxError {
+    const f = this.family
+    if (this.holding) {
+      const c = this.cur
+      if (c !== undefined) {
+        c.text(`"}]}`)
+        const b = c.all()
+        this.heldSize += b.length
+        if (this.heldSize > this.holdMax) throw new SyntaxError("the embeddings inputs are too large to convert while held (client.max_request_body_size_mb): put dimensions before input")
+        this.elems.push(b)
+      }
+      this.cur = undefined
+      return
+    }
+    const d = this.dest()
+    if (f === EMB_GEMINI) {
+      d.text(`"}]}`)
+      if (this.dims !== "") d.text(`,"outputDimensionality":${this.dims}`)
+      d.byte(125)
+    } else if (f === EMB_VERTEX) {
+      d.text(`"}`)
+    } else {
+      d.byte(34)
+    }
+  }
+
+  // Gemini's held inputs, each with the size the body carries (when it has one), in order.
+  private flushHeld(): void {
+    this.out.text(this.headText())
+    for (let i = 0; i < this.elems.length; i++) {
+      if (i > 0) this.out.byte(44)
+      this.out.bytes(this.elems[i]!)
+      if (this.dims !== "") this.out.text(`,"outputDimensionality":${this.dims}`)
+      this.out.byte(125)
+    }
+    this.out.text(`]}`)
+  }
+
+  private headText(): string {
+    const f = this.family
+    if (f === EMB_GEMINI) return `{"requests":[`
+    if (f === EMB_VERTEX) return `{"instances":[`
+    if (f === EMB_COHERE) return `{"model":${quote(this.model)},"texts":[`
+    return `{"texts":[`
+  }
+
+  private tail(): void {
+    const f = this.family
+    if (f === EMB_GEMINI) {
+      this.out.text(`]}`)
+    } else if (f === EMB_VERTEX) {
+      this.out.byte(93)
+      if (this.dims !== "") this.out.text(`,"parameters":{"outputDimensionality":${this.dims}}`)
+      this.out.byte(125)
+    } else if (f === EMB_COHERE) {
+      const it = this.gotInputType ? this.inputType : "search_document"
+      this.out.text(`],"input_type":${quote(it)},"embedding_types":["float"]}`)
+    } else {
+      this.out.text(`],"input_type":"search_document"}`)
+    }
+  }
+}
+
+// ---- tests: the streaming body against the whole-request bodies ----
+
+// A JSON text with its keys sorted and its strings re-escaped one way, to compare two bodies that mean the same.
+function canon(raw: string): string throws SyntaxError {
+  const t = raw.trim()
+  if (t.startsWith("{")) {
+    const fs = try fields(t)
+    fs.sort((a, b) => (a.key < b.key ? -1 : (a.key > b.key ? 1 : 0)))
+    const parts: string[] = []
+    for (const f of fs) parts.push(quote(f.key) + ":" + (try canon(f.raw)))
+    return "{" + parts.join(",") + "}"
+  }
+  if (t.startsWith("[")) {
+    const parts: string[] = []
+    for (const e of try elements(t)) parts.push(try canon(e))
+    return "[" + parts.join(",") + "]"
+  }
+  if (t.startsWith("\"")) return quote(try decodeString(t))
+  return t
+}
+
+const MODEL = "target-model"
+
+// the converted body when the request arrives `step` bytes at a time, with the holding limit `holdMax`
+function streamedEmbWith(family: string, text: string, step: int, strMax: int, holdMax: int): string throws SyntaxError {
+  const c = new EmbConv(family, MODEL, strMax, holdMax)
+  const out = new ByteOut()
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    for (const p of try c.push(b.slice(i, e))) out.bytes(p)
+    i = e
+  }
+  for (const p of try c.finish()) out.bytes(p)
+  return textOfBytes(out.all())
+}
+
+function streamedEmb(family: string, text: string, step: int, strMax: int): string throws SyntaxError {
+  return try streamedEmbWith(family, text, step, strMax, 1048576)
+}
+
+test("the Gemini batch body carries each input with the size, whatever the chunking", () => {
+  const cases: string[][] = [
+    [
+      `{"model":"m","dimensions":256,"input":["alpha text here, long enough","beta \\u00e9 \\"q\\""]}`,
+      `{"requests":[{"model":"models/target-model","content":{"parts":[{"text":"alpha text here, long enough"}]},"outputDimensionality":256},{"model":"models/target-model","content":{"parts":[{"text":"beta \\u00e9 \\"q\\""}]},"outputDimensionality":256}]}`,
+    ],
+    [
+      `{"dimensions":8,"model":"m","input":"one string only, a long one, really long"}`,
+      `{"requests":[{"model":"models/target-model","content":{"parts":[{"text":"one string only, a long one, really long"}]},"outputDimensionality":8}]}`,
+    ],
+    [
+      `{"model":"m","input":["x"],"encoding_format":"float","user":"u-1"}`,
+      `{"requests":[{"model":"models/target-model","content":{"parts":[{"text":"x"}]}}]}`,
+    ],
+  ]
+  for (const c of cases) {
+    for (const step of [1, 9, 100000]) {
+      for (const mx of [4, 4096]) {
+        expect(try streamedEmb(EMB_GEMINI, c[0]!, step, mx)).toBe(c[1]!)
+      }
+    }
+  }
+})
+
+test("a Gemini body with dimensions after its inputs holds the inputs and writes the size on each", () => {
+  const cases: string[][] = [
+    [
+      `{"model":"m","input":["alpha, a long one here"],"dimensions":256}`,
+      `{"requests":[{"model":"models/target-model","content":{"parts":[{"text":"alpha, a long one here"}]},"outputDimensionality":256}]}`,
+    ],
+    [
+      `{"model":"m","input":["a","bb"],"dimensions":4}`,
+      `{"requests":[{"model":"models/target-model","content":{"parts":[{"text":"a"}]},"outputDimensionality":4},{"model":"models/target-model","content":{"parts":[{"text":"bb"}]},"outputDimensionality":4}]}`,
+    ],
+  ]
+  for (const c of cases) {
+    for (const step of [1, 9, 100000]) {
+      for (const mx of [4, 4096]) {
+        expect(try streamedEmb(EMB_GEMINI, c[0]!, step, mx)).toBe(c[1]!)
+      }
+    }
+  }
+})
+
+test("a held Gemini body over holdMax is refused", () => {
+  let threw = false
+  try {
+    streamedEmbWith(EMB_GEMINI, `{"model":"m","input":["${"x".repeat(200)}"],"dimensions":4}`, 7, 16, 64)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("the Cohere body is the one cohere.embeddingsRequest writes, with the input type at the end", () => {
+  const t: Target = { provider: "cohere", kind: "cohere", model: MODEL, key: {}, cfg: {} }
+  const texts = [
+    `{"model":"m","input":["one, long enough","two"],"input_type":"query"}`,
+    `{"model":"m","input":"single text here, long enough to stream","dimensions":64}`,
+    `{"input_type":"classification","model":"m","input":["a b"]}`,
+  ]
+  for (const text of texts) {
+    const want = try canon((try cohere.embeddingsRequest(t, try fields(text))).body)
+    for (const step of [1, 11, 100000]) {
+      for (const mx of [4, 4096]) {
+        expect(try canon(try streamedEmb(EMB_COHERE, text, step, mx))).toBe(want)
+      }
+    }
+  }
+})
+
+test("the Vertex and Bedrock bodies", () => {
+  const v = `{"model":"m","input":["a","b\\n"],"dimensions":64}`
+  expect(try streamedEmb(EMB_VERTEX, v, 4, 16)).toBe(`{"instances":[{"content":"a"},{"content":"b\\n"}],"parameters":{"outputDimensionality":64}}`)
+  expect(try streamedEmb(EMB_VERTEX, `{"model":"m","input":"solo"}`, 100, 16)).toBe(`{"instances":[{"content":"solo"}]}`)
+  expect(try streamedEmb(EMB_BEDROCK, `{"model":"m","input":["x","y"]}`, 3, 16)).toBe(`{"texts":["x","y"],"input_type":"search_document"}`)
+})
+
+test("an input that is refused says why", () => {
+  const bad: string[][] = [
+    [EMB_GEMINI, `{"model":"m","input":[]}`],
+    [EMB_GEMINI, `{"model":"m","input":""}`],
+    [EMB_GEMINI, `{"model":"m","input":[[1,2]]}`],
+    [EMB_GEMINI, `{"model":"m","input":[1]}`],
+    [EMB_GEMINI, `{"model":"m"}`],
+    [EMB_GEMINI, `{"model":"m","input":null}`],
+    [EMB_GEMINI, `{"model":"m","input":["a"],"dimensions":0}`],
+    [EMB_GEMINI, `{"model":"m","input":["a"],"dimensions":2.5}`],
+    [EMB_VERTEX, `[]`],
+  ]
+  for (const b of bad) {
+    let threw = false
+    try {
+      streamedEmb(b[0]!, b[1]!, 5, 16)
+    } catch (e) {
+      threw = true
+    }
+    expect(threw).toBe(true)
+  }
+})

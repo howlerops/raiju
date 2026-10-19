@@ -10,7 +10,7 @@ import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf, poolOf } f
 import { isOpenAICompatible, modelsRequest } from "./providers/openai"
 import * as replicate from "./providers/replicate"
 import { parseModel, target, kindOf, pickKey, timeoutMs } from "./router"
-import { Field, fields, find, rawStr, rawNum, setField, build, quote } from "./json"
+import { Field, fields, find, rawStr, rawNum, setField, build, quote, isNull } from "./json"
 import { errorJson, snapshot, nowSeconds } from "./schemas"
 import { deadline } from "./deadline"
 import { LargeSettings, LargeBody, formPrefix, boundaryOf, readAhead, readRest } from "./largepayload"
@@ -20,8 +20,96 @@ import * as cloudAuth from "./cloud_auth"
 import * as base64 from "./base64"
 import { S3Creds, awsCall } from "./exports"
 import { parseServiceAccount } from "./providers/vertex"
+import { Grant } from "./governance"
+import { SttUsage } from "./pricing"
 
 export type MediaRoute = { op: string, method: string, upstreamPath: string, modelIn: "json" | "form" | "none" }
+
+// The billing of one audio request (speech, transcription, translation), filled as handleMedia serves it.
+// begin() names the target and asks the gate to admit its model before the upstream call: a refusal is the
+// answer. The grant the gate admitted under takes the charge (gateway.tov mediaAnswer). chars is a speech
+// request's input in characters.
+export class MediaBill {
+  provider = ""
+  model = ""
+  chars = 0
+  grant: Grant | undefined = undefined
+  gate: (provider: string, model: string) => Response | undefined = (provider: string, model: string): Response | undefined => undefined
+
+  begin(t: Target): Response | undefined {
+    this.provider = t.provider
+    this.model = t.model
+    return this.gate(t.provider, t.model)
+  }
+}
+
+// The routes whose answers are billed: speech, transcriptions and translations.
+export function billedMedia(op: string): bool {
+  return op === "audio.speech" || op === "audio.transcriptions" || op === "audio.translations"
+}
+
+// The characters of a text as Bifrost counts them (utf8.RuneCountInString): the bytes that start a character.
+export function charCount(s: string): int {
+  let n = 0
+  for (const b of new TextEncoder().encode(s)) {
+    if ((int(b) & 0xc0) !== 0x80) n += 1
+  }
+  return n
+}
+
+// The usage of one answer's fields: its usage when that carries seconds or tokens, else the answer's own
+// duration (a verbose answer's, the fallback seconds Bifrost's passthrough reader takes). undefined when none.
+function usageOfFields(fs: Field[]): SttUsage | undefined throws SyntaxError {
+  const raw = find(fs, "usage")
+  if (raw !== undefined && !isNull(raw)) {
+    const uf = try fields(raw)
+    const seconds = rawNum(uf, "seconds")
+    if (rawStr(uf, "type") === "duration" && seconds !== undefined && seconds > 0) {
+      return { prompt: 0, completion: 0, inputAudio: 0, inputText: 0, seconds: seconds }
+    }
+    if ((rawNum(uf, "total_tokens") ?? 0.0) > 0) {
+      const d = find(uf, "input_token_details")
+      let details: Field[] = []
+      if (d !== undefined && !isNull(d)) details = try fields(d)
+      return {
+        prompt: Math.trunc(rawNum(uf, "input_tokens") ?? 0.0),
+        completion: Math.trunc(rawNum(uf, "output_tokens") ?? 0.0),
+        inputAudio: Math.trunc(rawNum(details, "audio_tokens") ?? 0.0),
+        inputText: Math.trunc(rawNum(details, "text_tokens") ?? 0.0),
+        seconds: seconds,
+      }
+    }
+  }
+  const dur = rawNum(fs, "duration")
+  if (dur !== undefined && dur > 0) return { prompt: 0, completion: 0, inputAudio: 0, inputText: 0, seconds: dur }
+  return undefined
+}
+
+// The usage a transcription or translation answer reports: a JSON answer's, or a streamed one's (server-sent
+// events; the last event with a usage counts). undefined when the answer reports none.
+export function transcriptionUsage(body: string): SttUsage | undefined {
+  let found: SttUsage | undefined = undefined
+  let streamed = false
+  for (const line of body.split("\n")) {
+    const l = line.trim()
+    if (!l.startsWith("data:")) continue
+    streamed = true
+    const payload = l.slice(5).trim()
+    if (payload === "[DONE]") continue
+    try {
+      const u = usageOfFields(try fields(payload))
+      if (u !== undefined) found = u
+    } catch (e) {
+      // an event that is not JSON counts for nothing
+    }
+  }
+  if (streamed) return found
+  try {
+    return usageOfFields(try fields(body))
+  } catch (e) {
+    return undefined
+  }
+}
 
 // Azure's api-version when the key does not set one (as in openai.tov).
 const API_VERSION = "2024-10-21"
@@ -285,7 +373,8 @@ export async function send(t: Target, mr: native.MediaRequest): Promise<Response
 
 // Serves one media, file or batch request: picks the provider, rewrites the
 // model when the body carries one, and returns the upstream response as it came.
-export async function handleMedia(cfg: Config, req: Request, route: MediaRoute): Promise<Response> throws TypeError {
+// A bill (audio requests) is admitted at the model, before the upstream call; a refusal is the answer.
+export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, bill?: MediaBill): Promise<Response> throws TypeError {
   const url = try new URL(req.url)
   const sp = new URLSearchParams(url.search)
   const provider = providerFor(snapshot(req.headers), sp)
@@ -304,6 +393,11 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       const mt = modelTarget(cfg, model)
       if (mt === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
       t = mt
+      if (bill !== undefined) {
+        bill.chars = route.op === "audio.speech" ? charCount(rawStr(try fields(text), "input") ?? "") : 0
+        const refused = bill.begin(mt)
+        if (refused !== undefined) return refused
+      }
       if (isNative(mt.kind)) return await nativeMedia(mt, route, qs, text, undefined)
       body = try rewriteJsonModel(text, mt.model)
       contentType = "application/json"
@@ -313,6 +407,10 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
       if (typeof model !== "string") return errorReply(400, "the request needs a \"model\" field", "invalid_request_error")
       t = modelTarget(cfg, model)
       if (t === undefined) return errorReply(404, `no provider or key serves model "${model}"`, "invalid_request_error")
+      if (bill !== undefined) {
+        const refused = bill.begin(t)
+        if (refused !== undefined) return refused
+      }
       if (isNative(t.kind)) return await nativeMedia(t, route, qs, "", fd)
       body = formWithModel(fd, t.model)
     } else {
@@ -355,7 +453,7 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute):
 // Returns undefined for a request this does not touch (under the threshold), the Request to go on with (the
 // body was small after all, or its provider needs it whole: native providers, or a model field that comes
 // after the file) or the Response (refused, or the provider's answer).
-export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRoute, lp: LargeSettings): Promise<Response | Request | undefined> {
+export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRoute, lp: LargeSettings, bill?: MediaBill): Promise<Response | Request | undefined> {
   if (req.method !== "POST") return undefined
   const dtext = req.headers.get("content-length")
   const declared = dtext === undefined ? -1 : (parseInt(dtext) ?? -1)
@@ -413,6 +511,13 @@ export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRo
   if (!supported(tt.kind)) {
     await src.cancel()
     return errorReply(400, `provider "${tt.provider}" does not support ${route.op}`, "invalid_request_error")
+  }
+  if (bill !== undefined) {
+    const refused = bill.begin(tt)
+    if (refused !== undefined) {
+      await src.cancel()
+      return refused
+    }
   }
   const lg = new LargeBody(lp, ahead.head, meta, ahead.ended ? undefined : src, declared)
   lg.plain = true
@@ -1873,4 +1978,40 @@ test("wafer file objects read as OpenAI's: ready is processed, dates are seconds
   const f = try waferFileToOpenAI(`{"id":"file_1","purpose":"fine-tune","filename":"a.jsonl","mime_type":"application/jsonl","bytes":12,"status":"ready","created_at":"2026-10-14T13:00:00.123Z","expires_at":"2026-11-14T13:00:00Z"}`)
   expect(f).toBe(`{"id":"file_1","object":"file","bytes":12,"created_at":1791982800,"filename":"a.jsonl","purpose":"fine-tune","status":"processed","expires_at":1794661200}`)
   expect(try waferFileToOpenAI(`{"id":"file_2","status":"pending"}`).includes(`"status":"uploaded"`)).toBe(true)
+})
+
+test("a character is a UTF-8 lead byte, as Bifrost counts runes", () => {
+  expect(charCount("say ping")).toBe(8)
+  expect(charCount("héllo")).toBe(5)
+  expect(charCount("日本")).toBe(2)
+  expect(charCount("")).toBe(0)
+  expect(billedMedia("audio.speech") && billedMedia("audio.transcriptions") && billedMedia("audio.translations")).toBe(true)
+  expect(billedMedia("images.generations") || billedMedia("audio.other")).toBe(false)
+})
+
+test("a transcription reports its duration or its tokens, else its verbose duration", () => {
+  const d = transcriptionUsage(`{"text":"hi","usage":{"type":"duration","seconds":12.5}}`)!
+  expect(d.seconds!).toBeCloseTo(12.5)
+  expect(d.prompt).toBe(0)
+  const t = transcriptionUsage(`{"text":"hi","usage":{"type":"tokens","input_tokens":14,"output_tokens":6,"total_tokens":20,"input_token_details":{"audio_tokens":10,"text_tokens":4}}}`)!
+  expect(t.prompt).toBe(14)
+  expect(t.completion).toBe(6)
+  expect(t.inputAudio).toBe(10)
+  expect(t.inputText).toBe(4)
+  expect(t.seconds).toBeUndefined()
+  // no usage, or a usage with no tokens: the verbose answer's duration
+  expect(transcriptionUsage(`{"text":"hi","duration":7.5}`)!.seconds!).toBeCloseTo(7.5)
+  expect(transcriptionUsage(`{"text":"hi","duration":7.5,"usage":{"type":"tokens","total_tokens":0}}`)!.seconds!).toBeCloseTo(7.5)
+  expect(transcriptionUsage(`{"text":"hi"}`)).toBeUndefined()
+  expect(transcriptionUsage("{")).toBeUndefined()
+})
+
+test("a streamed transcription's usage is on its last event that has one", () => {
+  const s = "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hi\"}\n\n" +
+    "data: {\"type\":\"transcript.text.done\",\"text\":\"hi\",\"usage\":{\"type\":\"tokens\",\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}\n\n" +
+    "data: [DONE]\n\n"
+  const u = transcriptionUsage(s)!
+  expect(u.prompt).toBe(3)
+  expect(u.completion).toBe(1)
+  expect(transcriptionUsage("data: {\"type\":\"transcript.text.delta\",\"delta\":\"hi\"}\n\ndata: [DONE]\n\n")).toBeUndefined()
 })

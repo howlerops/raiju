@@ -39,9 +39,11 @@ import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp, rpcError } from "./mcpserver"
 import { isMetaTool, metaToolDefs } from "./codemode"
 import { relay } from "./passthrough"
-import { findAgent, grantAllows, endpointOf, restEndpointOf, gatewayCard, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
+import { findAgent, grantAllows, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
 import { Call, PushSpec, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, interfacesOf, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
 import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
+import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CARD_NS } from "./a2ashare"
+import { FileLease } from "./filelease"
 import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
 import { tempTokenAllows } from "./mcpuser"
 import * as vmcp from "./vmcp"
@@ -60,6 +62,7 @@ import * as b64 from "./base64"
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync } from "node:fs"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
+import { clusterState, ownerOf } from "./clusterstate"
 import { FeedRing, FeedQueue, FeedItem, feedEnvelope, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
@@ -270,6 +273,14 @@ function a2aDeny(rest: bool, status: int, message: string, type: string): Respon
   if (status === 401) h.set("www-authenticate", `ApiKey name="x-bf-vk", in="header"`)
   return new Response(restErrorOfStatus(status, message), { status: status, headers: h })
 }
+
+// The refusal of a gate check: the answer in the caller's binding, with its status and message for the gRPC binding.
+function gateRefusal(rest: bool, status: int, message: string, type: string, vk: VirtualKeyConfig | undefined): { refusal: Response | undefined, vk: VirtualKeyConfig | undefined, status: int, message: string } {
+  return { refusal: a2aDeny(rest, status, message, type), vk: vk, status: status, message: message }
+}
+
+// The answer of the gRPC binding's gate (Ops.a2aGrpcGate): status 0 when the call may go on.
+export type GrpcGate = { status: int, message: string, agent: AgentConfig | undefined, vk: VirtualKeyConfig | undefined, base: string }
 
 // Whether an If-None-Match value names the tag.
 function etagMatches(header: string, tag: string): bool {
@@ -854,6 +865,9 @@ function logEventView(e: LogEntry): LogEvent {
 export class Ops {
   rbac: RbacConfig = { users: [] }
   authOn = false
+  // the A2A gRPC binding's domain and advertised port (server.a2a_grpc_base_domain, a2a_grpc_port), set at start when
+  // both are configured: the served cards then list the gRPC interface (a2agrpc.tov)
+  a2aGrpc: { domain: string, port: int } | undefined = undefined
   // the A2A push relay: a pass in progress, and the passes made (the housekeeping runs on the first of each hour's)
   relayBusy = false
   relayTicks = 0
@@ -945,6 +959,10 @@ export class Ops {
       this.nodeId = "node"
     }
     this.configure(engine.cfg)
+    // a card another worker or node fetched arrives through the cluster state (a2ashare.tov)
+    clusterState().onChange(CARD_NS, (name: string, value: string | undefined): void => {
+      this.adoptRemoteCard(name, value)
+    })
     this.loadCatalogAttrs()
     // MCP tool executions go to the request log store (kind "mcp")
     setMcpToolLog((c: McpToolCall) => {
@@ -969,6 +987,11 @@ export class Ops {
       }
     }
     ps.open = (v: string): string => openStored(this.store.cipher, v) ?? ""
+    ps.openSecret = (v: string): string | undefined => openStored(this.store.cipher, v)
+    // push configs and agent cards travel on the cluster state (a2ashare.tov); a card is sent when it changes
+    pushShare()
+    const cards = cardShare()
+    for (const a of cfg.agents ?? []) cards.publish(a.name, a.agent_card_url, a.card ?? "", a.card_fetched_at ?? 0)
     if (ps.dir === "" && lsw !== undefined && lsw.enabled === true) ps.persistTo(join(lsw.dir ?? "logs", "a2a-push.jsonl"))
     const gov = cfg.governance
     const users: UserConfig[] = gov?.users ?? []
@@ -1054,6 +1077,7 @@ export class Ops {
     const id = cc.node_id ?? ""
     if (id !== "") this.nodeId = id
     if (this.counters === undefined) this.counters = new Counters(this.nodeId)
+    clusterState().setWriter(this.nodeId)
     this.engine.health.holds.setNode(this.nodeId)
     this.clusterTimer = setInterval(() => {
       this.syncCluster()
@@ -1175,6 +1199,7 @@ export class Ops {
     }
     // each worker is its own slot (inherited counters would collide)
     this.counters = new Counters(this.nodeId + "/" + process.pid)
+    clusterState().setWriter(this.nodeId + "/" + process.pid)
     this.engine.health.holds.setNode(this.nodeId + "/" + process.pid)
     this.pushed = new Map()
     this.pushedWindow = new Map()
@@ -1202,6 +1227,25 @@ export class Ops {
     this.shareTimer = setInterval(() => {
       this.shareTick()
     }, 100)
+  }
+
+  // Reads the node's share folder now, as the share tick does: the other workers' usage, holds and cluster state, so
+  // the cards they fetched are adopted into this worker's configs before this returns. A process alone has no folder.
+  syncShared(): void {
+    if (this.shareDir === "") return
+    this.shareTick()
+  }
+
+  // Puts the cards of the agents on the cluster state now and writes this worker's share file at once, so the other
+  // workers of the node take them at their next share tick (every 100 ms, shareTimer): every worker holds a card
+  // fetched by one of them within that interval. Called after a card is saved, by the timer's pass and by the agents
+  // API, without waiting for the config change to be applied (configure publishes them as well, later).
+  publishCards(): void {
+    const cards = cardShare()
+    for (const a of this.store.cfg.agents ?? []) {
+      if ((a.card ?? "") !== "") cards.publish(a.name, a.agent_card_url, a.card ?? "", a.card_fetched_at ?? 0)
+    }
+    this.syncShared()
   }
 
   shareTick(): void {
@@ -1251,6 +1295,8 @@ export class Ops {
     }
     // the key holds travel with the usage (holds.tov); they exist only under adaptive load balancing
     c.setHolds(this.engine.health.holds.wire(now))
+    // the replicated state (clusterstate.tov) travels the same way
+    c.setState(clusterState().wire(now))
   }
 
   applyRemote(c: Counters): void {
@@ -1259,6 +1305,25 @@ export class Ops {
     for (const u of gov.sharedUsage(now)) gov.setRemote(u.name, u.window, Math.max(0.0, c.total(u.name, u.window) - u.used), now)
     const hs = c.takeHolds()
     if (this.engine.cfg.health?.adaptive === true) this.engine.health.holds.merge(hs, now)
+    clusterState().merge(c.takeState(), now)
+  }
+
+  // The live nodes: this one and the peers heard from within the leader window, by node id (a worker counts as its node).
+  liveNodes(): string[] {
+    const me = cluster.nodeOf(this.nodeId)
+    const out: string[] = [me]
+    const c = this.counters
+    if (c === undefined || this.clusterCfg === undefined) return out
+    for (const p of c.peers(Date.now() - cluster.LEADER_WINDOW_MS)) {
+      const n = cluster.nodeOf(p.id)
+      if (!out.includes(n)) out.push(n)
+    }
+    return out
+  }
+
+  // Whether this node owns the retained admin credential of an MCP client (one node renews each, see gateway.tov).
+  ownsAdmin(client: string): bool {
+    return ownerOf(client, this.liveNodes()) === cluster.nodeOf(this.nodeId)
   }
 
   syncCluster(): void {
@@ -2630,21 +2695,48 @@ export class Ops {
   // The checks every call under /agents/a2a/{name} passes: the agent is registered and enabled, the caller's
   // virtual key (required when auth is enforced), the agent's grants, and the key's budgets. count also takes
   // the key's request and token limits (a call does; discovery does not). refusal is the answer when one fails.
-  a2aGate(agent: AgentConfig | undefined, name: string, h: Hdrs, rest: bool, count: bool): { refusal: Response | undefined, vk: VirtualKeyConfig | undefined } {
-    if (agent === undefined || agent.enabled === false) return { refusal: a2aDeny(rest, 404, `no agent named ${name}`, "not_found_error"), vk: undefined }
+  a2aGate(agent: AgentConfig | undefined, name: string, h: Hdrs, rest: bool, count: bool): { refusal: Response | undefined, vk: VirtualKeyConfig | undefined, status: int, message: string } {
+    if (agent === undefined || agent.enabled === false) return gateRefusal(rest, 404, `no agent named ${name}`, "not_found_error", undefined)
     const vk = this.engine.gov.findKey(h)
-    if (this.engine.gov.enforce && vk === undefined) return { refusal: a2aDeny(rest, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error"), vk: vk }
-    if (!grantAllows(agent, vk?.id)) return { refusal: a2aDeny(rest, 403, `this key may not call the agent ${name}`, "permission_error"), vk: vk }
+    if (this.engine.gov.enforce && vk === undefined) return gateRefusal(rest, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", vk)
+    if (!grantAllows(agent, vk?.id)) return gateRefusal(rest, 403, `this key may not call the agent ${name}`, "permission_error", vk)
     const gate = this.engine.gov.admitTool(h)
-    if (gate.kind === "denial") return { refusal: a2aDeny(rest, gate.status, gate.message, gate.type), vk: vk }
+    if (gate.kind === "denial") return gateRefusal(rest, gate.status, gate.message, gate.type, vk)
+    // an agent whose card is not fetched yet has no endpoint to call: refused here, in every binding, before any
+    // budget is counted (the same 503 the card route answers; the gRPC binding maps it to UNAVAILABLE)
+    if ((agent.card ?? "") === "") return gateRefusal(rest, 503, `the card of ${name} has not been fetched: refresh it through /api/agents/${name}/refresh-card`, "api_error", vk)
     if (count) {
       // the key's request and token limits count each call (admitTool checks the budgets only)
       const rls: string[] = []
       if (vk !== undefined && vk.rate_limit_id !== undefined) rls.push(vk.rate_limit_id)
       const limited = this.engine.gov.checkLimits(vk, [], rls)
-      if (limited.kind === "denial") return { refusal: a2aDeny(rest, limited.status, limited.message, limited.type), vk: vk }
+      if (limited.kind === "denial") return gateRefusal(rest, limited.status, limited.message, limited.type, vk)
     }
-    return { refusal: undefined, vk: vk }
+    return { refusal: undefined, vk: vk, status: 200, message: "" }
+  }
+
+  // The agent a call names, as this worker serves it. A worker that does not hold the agent's card yet first reads the
+  // node's share folder (syncShared), where the worker that fetched the card wrote it (publishCards), so the answer does
+  // not depend on which worker was asked.
+  heldAgent(name: string): AgentConfig | undefined {
+    const a = findAgent(this.engine.cfg.agents, name)
+    if (a === undefined || (a.card ?? "") !== "") return a
+    this.syncShared()
+    return findAgent(this.engine.cfg.agents, name)
+  }
+
+  // The gRPC binding's gate (a2agrpc.tov), in Bifrost's order: the gateway's public URL is set (the push ingress is
+  // advertised there), the agent the authority named exists, a key that was sent is one the gateway knows (refused
+  // even where auth is not enforced, as Bifrost does), then a2aGate. status is 0 when the call may go on.
+  a2aGrpcGate(name: string, h: Hdrs, presented: bool): GrpcGate {
+    const base = publicBase(this.engine.cfg.client?.a2a_external_client_url, "")
+    if (base === "") return { status: 503, message: "agent gateway disabled: configure client.a2a_external_client_url", agent: undefined, vk: undefined, base: base }
+    const agent = this.heldAgent(name)
+    if (agent === undefined || agent.enabled === false) return { status: 404, message: "agent not found", agent: undefined, vk: undefined, base: base }
+    if (presented && this.engine.gov.findKey(h) === undefined) return { status: 401, message: "authentication required", agent: agent, vk: undefined, base: base }
+    const gate = this.a2aGate(agent, name, h, false, true)
+    if (gate.refusal !== undefined) return { status: gate.status, message: gate.message, agent: agent, vk: gate.vk, base: base }
+    return { status: 0, message: "", agent: agent, vk: gate.vk, base: base }
   }
 
   // The routes under /agents/a2a/{name}: the agent's card (GET .../.well-known/agent-card.json), its JSON-RPC
@@ -2660,7 +2752,7 @@ export class Ops {
     if (!isCard && !isRpc && !isRest) return json(404, errorJson("no such agent route", "invalid_request_error", undefined))
     if (isCard && req.method !== "GET") return json(405, errorJson("use GET for the agent card", "invalid_request_error", undefined))
     if (isRpc && req.method !== "POST") return json(405, errorJson("use POST for JSON-RPC", "invalid_request_error", undefined))
-    const agent = findAgent(this.engine.cfg.agents, name)
+    const agent = this.heldAgent(name)
     const h = snapshot(req.headers)
     const gate = this.a2aGate(agent, name, h, isRest, true)
     const refusal = gate.refusal
@@ -2668,8 +2760,10 @@ export class Ops {
     if (agent === undefined) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
     if (isCard) {
       const card = agent.card ?? ""
-      if (card === "") return json(503, errorJson(`the card of ${name} has not been fetched: refresh it through /api/agents/${name}/refresh-card`, "api_error", undefined))
-      return a2aCardResponse(gatewayCard(card, base, name, true), h)
+      // the gRPC interface is listed when the binding listens (Bifrost lists it under the same two settings)
+      const grpc = this.a2aGrpc
+      const served = grpc === undefined ? gatewayCard(card, base, name, true) : withGrpcInterface(gatewayCard(card, base, name, true), name, grpc.domain, grpc.port)
+      return a2aCardResponse(served, h)
     }
     const body = await req.text()
     if (isRpc) {
@@ -2960,20 +3054,30 @@ export class Ops {
   }
 
   // Starts the card timer (client.a2a_card_refresh_seconds, 300 by default, 0 for none): each pass fetches the
-  // card of every enabled agent again and saves the ones that changed. Only the process that may save the
-  // config runs it.
+  // card of every enabled agent the node owns again and saves the ones that changed. Every worker runs the timer;
+  // cardTick gives each period's turn to one of them.
   startCardRefresh(): void {
     this.cardRefreshOn = true
     const secs = this.store.cfg.client?.a2a_card_refresh_seconds ?? 300
     if (secs <= 0) return
     setInterval(() => {
-      this.refreshCards()
+      this.cardTick(secs * 1000)
     }, secs * 1000)
   }
 
-  // One pass of the card timer.
+  // One tick of the card timer: one process of the node takes each period's turn (a lease in the node's share folder).
+  cardTick(periodMs: int): void {
+    const dir = this.shareDir === "" ? "" : this.shareDir + "/leases"
+    if (!takePeriod(new FileLease(dir, periodMs), "a2a-card-refresh", periodMs, Math.floor(Date.now()))) return
+    this.refreshCards()
+  }
+
+  // One pass of the card timer, over the agents this node owns (ownerOf over the live nodes): the other nodes adopt
+  // their cards from the cluster state.
   async refreshCards(): Promise<void> {
-    const list = this.store.cfg.agents ?? []
+    const nodes = this.liveNodes()
+    const me = cluster.nodeOf(this.nodeId)
+    const list = (this.store.cfg.agents ?? []).filter((a) => ownerOf(a.name, nodes) === me)
     if (list.length === 0) return
     try {
       const r = await refreshAll(list)
@@ -2981,6 +3085,7 @@ export class Ops {
       const next = r.next
       if (next !== undefined) {
         this.store.setAgents(this.mergeCards(next, r.changed))
+        this.publishCards()
         console.error(`raiju: agent card changed: ${r.changed.join(", ")}`)
       }
     } catch (e) {
@@ -3008,7 +3113,39 @@ export class Ops {
     const last = this.cardRefreshAt.get(name) ?? 0.0
     if (now - last < 60000.0) return
     this.cardRefreshAt.set(name, now)
+    // one process of the node, once a minute
+    const dir = this.shareDir === "" ? "" : this.shareDir + "/leases"
+    if (!takePeriod(new FileLease(dir, 60000), "a2a-card-soon:" + name, 60000, Math.floor(now))) return
     this.refreshOne(name)
+  }
+
+  // A card another worker or node fetched arrives through the cluster state. It replaces this registration's card when
+  // it is for the same URL and newer (or the registration has none), in the config this process holds and in the
+  // engine's. A card held here that is newer goes back to the state, which keeps the last write it merged.
+  adoptRemoteCard(name: string, value: string | undefined): void {
+    if (value === undefined) return
+    const w = cardOf(value)
+    if (w === undefined) return
+    const mine = findAgent(this.store.cfg.agents, name)
+    if (mine === undefined || mine.agent_card_url !== w.url) return
+    const have = mine.card ?? ""
+    if (have !== "" && (mine.card_fetched_at ?? 0) > w.fetched_at) {
+      cardShare().put(name, mine.agent_card_url, have, mine.card_fetched_at ?? 0)
+      return
+    }
+    cardShare().known(name, w)
+    const s = adoptCard(this.store.cfg.agents ?? [], name, w)
+    if (s !== undefined) {
+      let c = this.store.cfg
+      c.agents = s
+      this.store.cfg = c
+    }
+    const e = adoptCard(this.engine.cfg.agents ?? [], name, w)
+    if (e !== undefined) {
+      let c = this.engine.cfg
+      c.agents = e
+      this.engine.cfg = c
+    }
   }
 
   async refreshOne(name: string): Promise<void> {
@@ -3019,6 +3156,7 @@ export class Ops {
       const next = r.next
       if (next !== undefined) {
         this.store.setAgents(this.mergeCards(next, r.changed))
+        this.publishCards()
         console.error(`raiju: agent card changed: ${name}`)
       }
     } catch (e) {

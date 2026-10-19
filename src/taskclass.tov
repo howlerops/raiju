@@ -1,0 +1,699 @@
+// Task classifier for crew routing. Maps a task's text and labels to a posterior
+// over the task classes (bug-fix, open-ended, other), as section 3.1 of the
+// Pareto crewing paper describes: a pruned multinomial logistic regression on
+// hashed word uni- and bi-grams, plus named structural features, at most 2,000
+// non-zero int8 weights per class, a softmax temperature, and a floor mixed with
+// the class prior. Pure: no I/O. The weights come from a JSON file (trained by
+// scripts/crew_priors.py, L152) or from defaultClassifier().
+//
+// Features
+//
+// - Hashed: each distinct word unigram and bigram, counted once (presence).
+//   Text is read as UTF-8 bytes. A word is a maximal run of ASCII letters and
+//   digits; A-Z are lowered to a-z; every other byte (space, punctuation,
+//   underscore, any non-ASCII byte) ends a word. A bigram is two adjacent words
+//   joined by one space. A feature string is hashed with FNV-1a 32 over its UTF-8
+//   bytes (offset 0x811c9dc5, then XOR the byte and multiply by 0x01000193 modulo
+//   2^32), and its bucket is the hash & 0x3ffff (2^18 buckets).
+// - Named (not hashed): "label:<name>" for each task label (the caller splits
+//   x-raiju-task-labels on commas; names are trimmed, lowered, empty ones dropped);
+//   "has:stacktrace" when a line is a traceback frame: Python ("Traceback (most
+//   recent call last)", 'File "...", line N'), JS or Java ("at f (x.js:12:3)"
+//   or "at a.B.c(B.java:12)"), "Caused by: ", "Exception in thread", Go ("panic: ",
+//   "goroutine N [running]:") or Rust ("thread '...' panicked at");
+//   "has:code" when the text has one complete ``` fence pair; and "verb:<v>" for
+//   each of add, support, implement, refactor, rename, document, fix, crash,
+//   error, regression that starts the title or a sentence. A sentence starts at the
+//   text's start or after '.', '!', '?' or a line break, skipping spaces, tabs and
+//   the markers - * # >.
+//
+// Scoring
+//
+//   z_c   = bias_c + scale_c * sum of w over the features present in class c
+//   p_c   = softmax(z / temperature)
+//   psi_c = (1 - floor) * p_c + floor * prior_c
+//   The decision is the argmax of psi, or uncertain_class when the max psi is below
+//   uncertain_below (the paper routes uncertain tasks as open-ended).
+//
+// Weight file (JSON, version 1). Fields are read by name; unknown fields are ignored.
+//
+//   {"version": 1, "buckets": 262144, "hash": "fnv1a32",
+//    "classes": ["bug-fix", "open-ended", "other"],
+//    "prior": {"bug-fix": 0.4, "open-ended": 0.45, "other": 0.15},  (sums to 1)
+//    "temperature": 1.0, "floor": 0.05,
+//    "uncertain_below": 0.5, "uncertain_class": "open-ended",
+//    "bias": {"bug-fix": 0.0, ...}, "scale": {"bug-fix": 0.1, ...},  (scale > 0)
+//    "weights": {"bug-fix": [[bucket, int8], ...], ...},  (optional)
+//    "named": {"bug-fix": {"label:bug": int8, "has:stacktrace": int8}, ...}}  (optional)
+//
+// Limits: the file is at most 1 MiB; each class has at most 2,000 non-zero weights
+// (hashed and named together); a bucket is 0..262143; an int8 is -128..127 and not 0.
+// A named key must start with "label:", "has:" or "verb:". Every class needs a bias,
+// a scale and a prior; a class with no weights scores on its bias alone.
+//
+// Hash test vectors (scripts/crew_priors.py must produce the same values):
+//   fnv1a32("")          = 0x811c9dc5, bucket 40389
+//   fnv1a32("a")         = 0xe40c292c, bucket 10540
+//   fnv1a32("foobar")    = 0xbf9cf968, bucket 63848
+//   fnv1a32("fix crash") = 0x19f848eb, bucket 18667
+//   fnv1a32("bug-fix")   = 0x583fb213, bucket 242195
+
+import { Field, fields, elements, find, decodeString } from "./json"
+import { utf8 } from "./crypto"
+import { readFileSync } from "node:fs"
+
+const M32 = 0xffffffff
+const BUCKET_MASK = 0x3ffff
+const BUCKETS = 262144
+const MAX_FILE_BYTES = 1048576
+const MAX_WEIGHTS = 2000
+const VERBS = ["add", "support", "implement", "refactor", "rename", "document", "fix", "crash", "error", "regression"]
+// Bytes that may sit between a sentence end and the start of its first word:
+// space, tab, and the list and heading markers - * # >.
+const SKIP_BEFORE = [32, 9, 45, 42, 35, 62]
+
+// FNV-1a, 32 bit, over the UTF-8 bytes of s.
+export function fnv1a32(s: string): int {
+  let h = 0x811c9dc5
+  for (const b of utf8(s)) {
+    h = h ^ int(b)
+    h = (h * 0x01000193) & M32
+  }
+  return h
+}
+
+// The hashed bucket of a feature string.
+export function bucketOf(feature: string): int {
+  return fnv1a32(feature) & BUCKET_MASK
+}
+
+function isAlnum(c: int): bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+// Whether the word starting at byte pos begins a sentence (see the header).
+function sentenceStart(b: u8[], pos: int): bool {
+  let j = pos - 1
+  while (j >= 0 && SKIP_BEFORE.includes(int(b[j]!))) j--
+  if (j < 0) return true
+  const c = int(b[j]!)
+  return c === 46 || c === 33 || c === 63 || c === 10 || c === 13
+}
+
+type Word = { text: string, initial: bool }
+
+// The words of the text, lowered, each with whether it starts a sentence.
+function wordsOf(text: string): Word[] {
+  const b = utf8(text)
+  const out: Word[] = []
+  let start = -1
+  for (let i = 0; i < b.length; i++) {
+    if (isAlnum(int(b[i]!))) {
+      if (start < 0) start = i
+    } else if (start >= 0) {
+      out.push({ text: text.slice(start, i).toLowerCase(), initial: sentenceStart(b, start) })
+      start = -1
+    }
+  }
+  if (start >= 0) out.push({ text: text.slice(start, b.length).toLowerCase(), initial: sentenceStart(b, start) })
+  return out
+}
+
+// The words of the text, lowered: the unigrams.
+export function tokens(text: string): string[] {
+  return wordsOf(text).map((w) => w.text)
+}
+
+// Distinct hashed buckets of the text's unigrams and bigrams.
+export function hashedFeatures(text: string): int[] {
+  const ws = wordsOf(text)
+  const seen: Map<int, bool> = new Map()
+  for (let i = 0; i < ws.length; i++) {
+    seen.set(bucketOf(ws[i]!.text), true)
+    if (i + 1 < ws.length) seen.set(bucketOf(ws[i]!.text + " " + ws[i + 1]!.text), true)
+  }
+  return seen.keys()
+}
+
+// "at f (path/file.js:12:3)": a call in parentheses whose inside has a colon
+// followed by a digit. Prose such as "at least (see: docs)" does not match.
+function frameLike(t: string): bool {
+  if (!t.endsWith(")")) return false
+  const open = t.indexOf("(")
+  if (open < 0) return false
+  const inner = t.slice(open + 1, t.byteLength - 1)
+  for (let i = 0; i + 1 < inner.byteLength; i++) {
+    if (inner.slice(i, i + 1) === ":") {
+      const d = inner.slice(i + 1, i + 2)
+      if (d >= "0" && d <= "9") return true
+    }
+  }
+  return false
+}
+
+function hasStackTrace(text: string): bool {
+  for (const line of text.split("\n")) {
+    const t = line.trim()
+    if (t.startsWith("Traceback (most recent call last)")) return true
+    if (t.startsWith("File \"") && t.includes("\", line ")) return true
+    if (t.startsWith("at ") && frameLike(t)) return true
+    if (t.startsWith("Caused by: ") || t.startsWith("Exception in thread")) return true
+    if (t.startsWith("panic: ") || (t.startsWith("goroutine ") && t.includes(" [running]:"))) return true
+    if (t.startsWith("thread '") && t.includes("' panicked at")) return true
+  }
+  return false
+}
+
+// The named features of a task: labels, structure and sentence-initial verbs.
+export function namedFeatures(text: string, labels: string[]): string[] {
+  const out: string[] = []
+  for (const raw of labels) {
+    const l = raw.trim().toLowerCase()
+    if (l === "") continue
+    const f = "label:" + l
+    if (!out.includes(f)) out.push(f)
+  }
+  if (hasStackTrace(text)) out.push("has:stacktrace")
+  if (text.split("```").length >= 3) out.push("has:code")
+  for (const w of wordsOf(text)) {
+    if (!w.initial || !VERBS.includes(w.text)) continue
+    const f = "verb:" + w.text
+    if (!out.includes(f)) out.push(f)
+  }
+  return out
+}
+
+// One class's weights. hashed maps a bucket to its int8 weight; named maps a
+// named feature to its int8 weight. The effective weight is scale * int8.
+export class ClassWeights {
+  constructor(readonly bias: f64, readonly scale: f64, readonly hashed: Map<int, int>, readonly named: Map<string, int>) {}
+}
+
+export type Verdict = {
+  decision: string, // top, or uncertain_class when the posterior is uncertain
+  top: string, // argmax of the posterior
+  uncertain: bool,
+  posterior: Map<string, f64>, // psi per class, in the file's class order
+}
+
+export type ClassifierSpec = {
+  classes: string[],
+  prior: Map<string, f64>, // sums to 1
+  temperature: f64,
+  floor: f64,
+  uncertainBelow: f64,
+  uncertainClass: string,
+  weights: Map<string, ClassWeights>,
+}
+
+export class TaskClassifier {
+  constructor(private readonly spec: ClassifierSpec) {}
+
+  // The class names, in the file's order.
+  classNames(): string[] {
+    return this.spec.classes
+  }
+
+  // The posterior for a task's text and labels, and the decision.
+  classify(text: string, labels: string[]): Verdict {
+    const hashed = hashedFeatures(text)
+    const named = namedFeatures(text, labels)
+    const z: f64[] = []
+    for (const c of this.spec.classes) {
+      const w = this.spec.weights.get(c)!
+      let s: f64 = w.bias
+      for (const b of hashed) {
+        const v = w.hashed.get(b)
+        if (v !== undefined) s += w.scale * v
+      }
+      for (const n of named) {
+        const v = w.named.get(n)
+        if (v !== undefined) s += w.scale * v
+      }
+      z.push(s)
+    }
+    let zmax: f64 = z[0]!
+    for (const v of z) if (v > zmax) zmax = v
+    let sum: f64 = 0
+    const e: f64[] = []
+    for (const v of z) {
+      const x = Math.exp((v - zmax) / this.spec.temperature)
+      e.push(x)
+      sum += x
+    }
+    const posterior: Map<string, f64> = new Map()
+    let top = ""
+    let topP: f64 = -1
+    for (let i = 0; i < this.spec.classes.length; i++) {
+      const c = this.spec.classes[i]!
+      const p = (1 - this.spec.floor) * (e[i]! / sum) + this.spec.floor * this.spec.prior.get(c)!
+      posterior.set(c, p)
+      if (p > topP) {
+        topP = p
+        top = c
+      }
+    }
+    const uncertain = topP < this.spec.uncertainBelow
+    return {
+      decision: uncertain ? this.spec.uncertainClass : top,
+      top: top,
+      uncertain: uncertain,
+      posterior: posterior,
+    }
+  }
+}
+
+function bad(field: string, why: string): Error {
+  return new Error(`classifier file: ${field}: ${why}`)
+}
+
+function numberOf(raw: string | undefined, field: string): f64 throws Error {
+  if (raw === undefined) throw bad(field, "missing")
+  const v = parseFloat(raw)
+  if (v === undefined) throw bad(field, "not a number")
+  return v
+}
+
+// An integer in lo..hi. The range is checked first, so Math.trunc never overflows.
+function intOf(raw: string | undefined, field: string, lo: f64, hi: f64): int throws Error {
+  const v = try numberOf(raw, field)
+  if (v < lo || v > hi) throw bad(field, `must be from ${lo} to ${hi}`)
+  if (Math.trunc(v) !== v) throw bad(field, "must be an integer")
+  return Math.trunc(v)
+}
+
+// A non-zero int8 weight.
+function int8Of(raw: string | undefined, field: string): int throws Error {
+  const v = try intOf(raw, field, -128, 127)
+  if (v === 0) throw bad(field, "is zero; leave it out")
+  return v
+}
+
+function stringOf(raw: string | undefined, field: string): string throws Error {
+  if (raw === undefined || !raw.startsWith("\"")) throw bad(field, "not a string")
+  try {
+    return decodeString(raw)
+  } catch (e) {
+    throw bad(field, "not a string")
+  }
+}
+
+function elementsOf(raw: string | undefined, field: string): string[] throws Error {
+  if (raw === undefined) throw bad(field, "missing")
+  try {
+    return elements(raw)
+  } catch (e) {
+    throw bad(field, "not an array")
+  }
+}
+
+function objectOf(raw: string | undefined, field: string): Field[] throws Error {
+  if (raw === undefined) throw bad(field, "missing")
+  try {
+    return fields(raw)
+  } catch (e) {
+    throw bad(field, "not an object")
+  }
+}
+
+function optionalObjectOf(raw: string | undefined, field: string): Field[] throws Error {
+  if (raw === undefined) return []
+  return try objectOf(raw, field)
+}
+
+function checkClassKeys(fs: Field[], field: string, classes: string[]): void throws Error {
+  for (const f of fs) {
+    if (!classes.includes(f.key)) throw bad(`${field}.${f.key}`, "is not one of the classes")
+  }
+}
+
+// Parses a weight file (see the header). Errors name the field that failed.
+export function loadClassifier(text: string): TaskClassifier throws Error {
+  if (text.byteLength > MAX_FILE_BYTES) {
+    throw new Error(`classifier file: size ${text.byteLength} bytes is over the ${MAX_FILE_BYTES} byte limit`)
+  }
+  let top: Field[] = []
+  try {
+    top = fields(text)
+  } catch (e) {
+    throw new Error("classifier file: not a JSON object")
+  }
+  const version = try intOf(find(top, "version"), "version", 1, 1)
+  try intOf(find(top, "buckets"), "buckets", BUCKETS, BUCKETS)
+  const hash = try stringOf(find(top, "hash"), "hash")
+  if (hash !== "fnv1a32") throw bad("hash", "must be \"fnv1a32\"")
+  if (version !== 1) throw bad("version", "must be 1")
+
+  const classesRaw = try elementsOf(find(top, "classes"), "classes")
+  const classes: string[] = []
+  for (const raw of classesRaw) {
+    const c = try stringOf(raw, "classes")
+    if (c === "" || classes.includes(c)) throw bad("classes", `"${c}" is empty or repeated`)
+    classes.push(c)
+  }
+  if (classes.length < 2) throw bad("classes", "needs at least two classes")
+
+  const priorFs = try objectOf(find(top, "prior"), "prior")
+  try checkClassKeys(priorFs, "prior", classes)
+  const prior: Map<string, f64> = new Map()
+  let psum: f64 = 0
+  for (const c of classes) {
+    const p = try numberOf(find(priorFs, c), `prior.${c}`)
+    if (p < 0 || p > 1) throw bad(`prior.${c}`, "must be from 0 to 1")
+    prior.set(c, p)
+    psum += p
+  }
+  if (Math.abs(psum - 1) > 0.001) throw bad("prior", `sums to ${psum}, not 1`)
+  for (const c of classes) prior.set(c, prior.get(c)! / psum)
+
+  const temperature = try numberOf(find(top, "temperature"), "temperature")
+  if (!(temperature > 0)) throw bad("temperature", "must be above 0")
+  const floor = try numberOf(find(top, "floor"), "floor")
+  if (floor < 0 || floor >= 1) throw bad("floor", "must be at least 0 and below 1")
+  const uncertainBelow = try numberOf(find(top, "uncertain_below"), "uncertain_below")
+  if (uncertainBelow < 0 || uncertainBelow > 1) throw bad("uncertain_below", "must be from 0 to 1")
+  const uncertainClass = try stringOf(find(top, "uncertain_class"), "uncertain_class")
+  if (!classes.includes(uncertainClass)) throw bad("uncertain_class", "is not one of the classes")
+
+  const biasFs = try objectOf(find(top, "bias"), "bias")
+  const scaleFs = try objectOf(find(top, "scale"), "scale")
+  const weightFs = try optionalObjectOf(find(top, "weights"), "weights")
+  const namedFs = try optionalObjectOf(find(top, "named"), "named")
+  try checkClassKeys(biasFs, "bias", classes)
+  try checkClassKeys(scaleFs, "scale", classes)
+  try checkClassKeys(weightFs, "weights", classes)
+  try checkClassKeys(namedFs, "named", classes)
+
+  const weights: Map<string, ClassWeights> = new Map()
+  for (const c of classes) {
+    const bias = try numberOf(find(biasFs, c), `bias.${c}`)
+    const scale = try numberOf(find(scaleFs, c), `scale.${c}`)
+    if (!(scale > 0)) throw bad(`scale.${c}`, "must be above 0")
+
+    const hashed: Map<int, int> = new Map()
+    // a class left out of weights has none (it scores on its bias alone, as the header says)
+    const wraw = find(weightFs, c)
+    let pairs: string[] = []
+    if (wraw !== undefined) pairs = try elementsOf(wraw, `weights.${c}`)
+    for (const pair of pairs) {
+      const kv = try elementsOf(pair, `weights.${c}`)
+      if (kv.length !== 2) throw bad(`weights.${c}`, "entries are [bucket, weight] pairs")
+      const bucket = try intOf(kv[0], `weights.${c}`, 0, BUCKETS - 1)
+      const w = try int8Of(kv[1], `weights.${c}`)
+      if (hashed.has(bucket)) throw bad(`weights.${c}`, `bucket ${bucket} is repeated`)
+      hashed.set(bucket, w)
+    }
+
+    const named: Map<string, int> = new Map()
+    const nameFs = try optionalObjectOf(find(namedFs, c), `named.${c}`)
+    for (const f of nameFs) {
+      if (!(f.key.startsWith("label:") || f.key.startsWith("has:") || f.key.startsWith("verb:"))) {
+        throw bad(`named.${c}.${f.key}`, "must start with label:, has: or verb:")
+      }
+      const nw = try int8Of(f.raw, `named.${c}.${f.key}`)
+      named.set(f.key, nw)
+    }
+
+    if (hashed.size + named.size > MAX_WEIGHTS) {
+      throw bad(`weights.${c}`, `has more than ${MAX_WEIGHTS} non-zero weights`)
+    }
+    weights.set(c, new ClassWeights(bias, scale, hashed, named))
+  }
+
+  return new TaskClassifier({
+    classes: classes,
+    prior: prior,
+    temperature: temperature,
+    floor: floor,
+    uncertainBelow: uncertainBelow,
+    uncertainClass: uncertainClass,
+    weights: weights,
+  })
+}
+
+// Splits the x-raiju-task-labels header value. Names are normalised by namedFeatures.
+export function splitLabels(raw: string): string[] {
+  return raw.split(",")
+}
+
+// The built-in weights, used until a weight file is loaded. Placeholder: the
+// word lists and named weights are hand-set; the trained file (L152) replaces them.
+// At scale 0.1 a word weight of 60 is 6 logits; a label, stack trace or
+// sentence-initial verb weight of 40 is 4 logits.
+const BUG_WORDS = ["fix", "fixes", "fixed", "bug", "bugs", "crash", "crashes", "crashing", "error",
+  "errors", "exception", "traceback", "regression", "fails", "failing", "broken", "panic",
+  "segfault", "leak", "hang", "hangs", "wrong", "incorrect", "defect", "unexpected", "timeout", "nil"]
+const OPEN_WORDS = ["add", "adds", "added", "adding", "support", "feature", "features", "implement",
+  "implements", "refactor", "refactors", "rename", "docs", "documentation", "design", "improve",
+  "improves", "enhancement", "new", "introduce", "extend", "allow", "proposal", "redesign",
+  "migrate", "cleanup", "document", "readme"]
+
+function wordMap(words: string[], w: int): Map<int, int> {
+  const m: Map<int, int> = new Map()
+  for (const word of words) m.set(bucketOf(word), w)
+  return m
+}
+
+function namedMap(names: string[], w: int): Map<string, int> {
+  const m: Map<string, int> = new Map()
+  for (const n of names) m.set(n, w)
+  return m
+}
+
+export function defaultClassifier(): TaskClassifier {
+  const classes = ["bug-fix", "open-ended", "other"]
+  const prior: Map<string, f64> = new Map()
+  prior.set("bug-fix", 0.4)
+  prior.set("open-ended", 0.45)
+  prior.set("other", 0.15)
+  const weights: Map<string, ClassWeights> = new Map()
+  weights.set("bug-fix", new ClassWeights(0, 0.1, wordMap(BUG_WORDS, 60), namedMap(
+    ["label:bug", "label:defect", "label:regression", "has:stacktrace", "verb:fix", "verb:crash", "verb:error", "verb:regression"], 40)))
+  weights.set("open-ended", new ClassWeights(0, 0.1, wordMap(OPEN_WORDS, 60), namedMap(
+    ["label:enhancement", "label:feature", "label:refactor", "label:documentation", "verb:add", "verb:support", "verb:implement", "verb:refactor", "verb:rename", "verb:document"], 40)))
+  weights.set("other", new ClassWeights(0, 0.1, new Map(), new Map()))
+  return new TaskClassifier({
+    classes: classes,
+    prior: prior,
+    temperature: 1.0,
+    floor: 0.05,
+    uncertainBelow: 0.5,
+    uncertainClass: "open-ended",
+    weights: weights,
+  })
+}
+
+// ---- tests ----
+
+test("fnv1a32 test vectors", () => {
+  expect(fnv1a32("")).toBe(0x811c9dc5)
+  expect(fnv1a32("a")).toBe(0xe40c292c)
+  expect(fnv1a32("foobar")).toBe(0xbf9cf968)
+  expect(fnv1a32("fix crash")).toBe(0x19f848eb)
+  expect(fnv1a32("bug-fix")).toBe(0x583fb213)
+  expect(bucketOf("")).toBe(40389)
+  expect(bucketOf("a")).toBe(10540)
+  expect(bucketOf("foobar")).toBe(63848)
+  expect(bucketOf("fix crash")).toBe(18667)
+  expect(bucketOf("bug-fix")).toBe(242195)
+})
+
+test("words are ASCII alphanumerics, lowered; everything else splits", () => {
+  expect(tokens("Fix crash: NullPointer_error in parse-JSON v2!").join(" ")).toBe("fix crash nullpointer error in parse json v2")
+  // the two UTF-8 bytes of é are not ASCII alphanumerics
+  expect(tokens("café au lait").join(" ")).toBe("caf au lait")
+  expect(tokens("  \n\t ").length).toBe(0)
+})
+
+test("hashed features are distinct unigrams and bigrams", () => {
+  const fs = hashedFeatures("fix crash fix")
+  // fix, crash, "fix crash", "crash fix": four distinct buckets
+  expect(fs.length).toBe(4)
+  expect(fs.includes(bucketOf("fix"))).toBe(true)
+  expect(fs.includes(bucketOf("crash"))).toBe(true)
+  expect(fs.includes(bucketOf("fix crash"))).toBe(true)
+  expect(fs.includes(bucketOf("crash fix"))).toBe(true)
+  expect(hashedFeatures("").length).toBe(0)
+})
+
+test("labels are normalised and kept distinct", () => {
+  expect(splitLabels(" Bug, enhancement ,").length).toBe(3)
+  const n = namedFeatures("x", ["Bug", " bug ", "", "enhancement"])
+  expect(n.join(",")).toBe("label:bug,label:enhancement")
+})
+
+test("structural features: stack traces and code fences", () => {
+  expect(namedFeatures('Traceback (most recent call last):\n  File "app.py", line 3, in main', []).includes("has:stacktrace")).toBe(true)
+  expect(namedFeatures("TypeError: x\n    at parse (/srv/app/index.js:12:5)", []).includes("has:stacktrace")).toBe(true)
+  expect(namedFeatures("boom\n\tat com.acme.Parser.parse(Parser.java:42)", []).includes("has:stacktrace")).toBe(true)
+  expect(namedFeatures("panic: runtime error: index out of range", []).includes("has:stacktrace")).toBe(true)
+  expect(namedFeatures("at least 3 tests (see: docs)", []).includes("has:stacktrace")).toBe(false)
+  expect(namedFeatures("we are at home (ok)", []).includes("has:stacktrace")).toBe(false)
+  expect(namedFeatures("```\ncode\n```", []).includes("has:code")).toBe(true)
+  expect(namedFeatures("```\ncode", []).includes("has:code")).toBe(false)
+})
+
+test("imperative verbs count only at a sentence start", () => {
+  const a = namedFeatures("Add retry logic.\nFix the parser", [])
+  expect(a.includes("verb:add")).toBe(true)
+  expect(a.includes("verb:fix")).toBe(true)
+  expect(namedFeatures("We should add retry", []).includes("verb:add")).toBe(false)
+  expect(namedFeatures("- crash on save", []).includes("verb:crash")).toBe(true)
+  expect(namedFeatures("well-add", []).includes("verb:add")).toBe(false)
+  expect(namedFeatures("It is fine. Add tests", []).includes("verb:add")).toBe(true)
+})
+
+// A one-class-pair file: "bug-fix" and "open-ended", the crash word weighted 60 for bug-fix.
+function sampleFile(temperature: string, floor: string, below: string, weights: string): string {
+  return '{"version":1,"buckets":262144,"hash":"fnv1a32",' +
+    '"classes":["bug-fix","open-ended"],"prior":{"bug-fix":0.4,"open-ended":0.6},' +
+    `"temperature":${temperature},"floor":${floor},"uncertain_below":${below},"uncertain_class":"open-ended",` +
+    '"bias":{"bug-fix":0,"open-ended":0},"scale":{"bug-fix":0.1,"open-ended":0.1},' +
+    `"weights":{"bug-fix":${weights},"open-ended":[]},` +
+    '"named":{"bug-fix":{"label:bug":80}}}'
+}
+
+function crashWeights(): string {
+  return `[[${bucketOf("crash")},60]]`
+}
+
+// The loader's error message for a file, or "" when it loads.
+function errorOf(text: string): string {
+  try {
+    try loadClassifier(text)
+    return ""
+  } catch (e) {
+    return e.message
+  }
+}
+
+test("a valid file loads and classifies", () => {
+  const c = try loadClassifier(sampleFile("1.0", "0.0", "0.5", crashWeights()))
+  expect(c.classNames().join(",")).toBe("bug-fix,open-ended")
+  const v = c.classify("crash on start", [])
+  expect(v.decision).toBe("bug-fix")
+  expect(v.top).toBe("bug-fix")
+  expect(v.uncertain).toBe(false)
+})
+
+test("a class left out of weights and named loads with no weights", () => {
+  // open-ended has no weights and no named list: it scores on its bias alone
+  const text = '{"version":1,"buckets":262144,"hash":"fnv1a32","classes":["bug-fix","open-ended"],"prior":{"bug-fix":0.4,"open-ended":0.6},"temperature":1.0,"floor":0.0,"uncertain_below":0.5,"uncertain_class":"open-ended","bias":{"bug-fix":0,"open-ended":0},"scale":{"bug-fix":0.1,"open-ended":0.1},"weights":{"bug-fix":[[' + bucketOf("crash") + ',60]]},"named":{"bug-fix":{"label:bug":80}}}'
+  expect(errorOf(text)).toBe("")
+  const c = try loadClassifier(text)
+  expect(c.classify("crash on start", []).top).toBe("bug-fix")
+})
+
+test("loader errors name the field", () => {
+  const ok = sampleFile("1.0", "0.0", "0.5", crashWeights())
+  expect(errorOf(ok)).toBe("")
+  expect(errorOf("[1,2]").includes("not a JSON object")).toBe(true)
+  expect(errorOf(ok.replace('"version":1', '"version":2')).includes("version")).toBe(true)
+  expect(errorOf(ok.replace('"buckets":262144', '"buckets":1024')).includes("buckets")).toBe(true)
+  expect(errorOf(ok.replace('"hash":"fnv1a32"', '"hash":"md5"')).includes("hash")).toBe(true)
+  expect(errorOf(ok.replace('"prior":{"bug-fix":0.4,"open-ended":0.6}', '"prior":{"bug-fix":0.4,"open-ended":0.4}')).includes("prior")).toBe(true)
+  expect(errorOf(ok.replace('"prior":{"bug-fix":0.4,"open-ended":0.6}', '"prior":{"bug-fix":0.4,"open-ended":0.6,"x":0}')).includes("prior.x")).toBe(true)
+  expect(errorOf(ok.replace('"temperature":1.0', '"temperature":0')).includes("temperature")).toBe(true)
+  expect(errorOf(ok.replace('"floor":0.0', '"floor":1')).includes("floor")).toBe(true)
+  expect(errorOf(ok.replace('"uncertain_below":0.5', '"uncertain_below":1.5')).includes("uncertain_below")).toBe(true)
+  expect(errorOf(ok.replace('"uncertain_class":"open-ended"', '"uncertain_class":"docs"')).includes("uncertain_class")).toBe(true)
+  expect(errorOf(ok.replace('"bias":{"bug-fix":0,"open-ended":0}', '"bias":{"bug-fix":0}')).includes("bias.open-ended")).toBe(true)
+  expect(errorOf(ok.replace('"scale":{"bug-fix":0.1,"open-ended":0.1}', '"scale":{"bug-fix":0.1,"open-ended":0}')).includes("scale.open-ended")).toBe(true)
+  expect(errorOf(ok.replace('"scale":{"bug-fix":0.1,"open-ended":0.1}', '"scale":{"bug-fix":0.1,"open-ended":0.1,"other":1}')).includes("scale.other")).toBe(true)
+  expect(errorOf(ok.replace('"classes":["bug-fix","open-ended"]', '"classes":["bug-fix","bug-fix"]')).includes("classes")).toBe(true)
+  expect(errorOf(sampleFile("1.0", "0.0", "0.5", "[[5,200]]")).includes("weights.bug-fix")).toBe(true)
+  expect(errorOf(sampleFile("1.0", "0.0", "0.5", "[[5,0]]")).includes("weights.bug-fix")).toBe(true)
+  expect(errorOf(sampleFile("1.0", "0.0", "0.5", "[[5.5,3]]")).includes("weights.bug-fix")).toBe(true)
+  expect(errorOf(sampleFile("1.0", "0.0", "0.5", "[[262144,3]]")).includes("weights.bug-fix")).toBe(true)
+  expect(errorOf(sampleFile("1.0", "0.0", "0.5", "[[5,3],[5,4]]")).includes("repeated")).toBe(true)
+  expect(errorOf(sampleFile("1.0", "0.0", "0.5", "[[5]]")).includes("weights.bug-fix")).toBe(true)
+  expect(errorOf(ok.replace('"label:bug":80', '"bug":80')).includes("named.bug-fix.bug")).toBe(true)
+  expect(errorOf(ok.replace('"label:bug":80', '"label:bug":0')).includes("named.bug-fix.label:bug")).toBe(true)
+})
+
+test("the size caps: 2,000 weights per class and 1 MiB per file", () => {
+  // sampleFile adds one named weight (label:bug), so 1,999 hashed weights make 2,000
+  const parts: string[] = []
+  for (let i = 0; i < 1999; i++) parts.push(`[${i},1]`)
+  expect(errorOf(sampleFile("1.0", "0.0", "0.5", "[" + parts.join(",") + "]"))).toBe("")
+  parts.push("[1999,1]")
+  const over = errorOf(sampleFile("1.0", "0.0", "0.5", "[" + parts.join(",") + "]"))
+  expect(over.includes("weights.bug-fix")).toBe(true)
+  expect(over.includes("2000")).toBe(true)
+  // named and hashed weights count together
+  const mixed = errorOf(sampleFile("1.0", "0.0", "0.5", "[" + parts.slice(0, 1999).join(",") + "]").replace('"label:bug":80', '"label:bug":80,"has:code":1,"verb:fix":2'))
+  expect(mixed.includes("2000")).toBe(true)
+  expect(errorOf(" ".repeat(1048577) + sampleFile("1.0", "0.0", "0.5", crashWeights())).includes("limit")).toBe(true)
+})
+
+test("calibration: psi sums to 1 and never falls below the floor share of the prior", () => {
+  const c = try loadClassifier(sampleFile("1.0", "0.2", "0.0", crashWeights()))
+  for (const text of ["crash", "add a feature", "", "crash crash crash bug"]) {
+    const v = c.classify(text, [])
+    let sum: f64 = 0
+    for (const p of v.posterior.values()) sum += p
+    expect(Math.abs(sum - 1) < 1e-9).toBe(true)
+  }
+  const v = c.classify("crash", [])
+  // floor 0.2 times the priors 0.4 and 0.6
+  expect(v.posterior.get("bug-fix")! >= 0.2 * 0.4).toBe(true)
+  expect(v.posterior.get("open-ended")! >= 0.2 * 0.6).toBe(true)
+  // psi = 0.8 * sigmoid(6) + 0.2 * 0.4
+  expect(v.posterior.get("bug-fix")! > 0.87 && v.posterior.get("bug-fix")! < 0.89).toBe(true)
+  // a higher temperature flattens the posterior
+  const hot = try loadClassifier(sampleFile("10.0", "0.0", "0.0", crashWeights()))
+  expect(hot.classify("crash", []).posterior.get("bug-fix")! < 0.7).toBe(true)
+})
+
+test("uncertain posteriors take the uncertain class", () => {
+  const c = try loadClassifier(sampleFile("1.0", "0.0", "0.999", crashWeights()))
+  const v = c.classify("crash", [])
+  expect(v.uncertain).toBe(true)
+  expect(v.top).toBe("bug-fix")
+  expect(v.decision).toBe("open-ended")
+  // no features at all: the posterior is near uniform, so the decision is uncertain
+  const d = defaultClassifier().classify("", [])
+  expect(d.uncertain).toBe(true)
+  expect(d.decision).toBe("open-ended")
+})
+
+test("the default weights classify obvious examples", () => {
+  const d = defaultClassifier()
+  expect(d.classify("Fix crash in parser: traceback below", []).decision).toBe("bug-fix")
+  expect(d.classify("Parser panics on empty input\n\nTraceback (most recent call last):\n  File \"p.py\", line 9", []).decision).toBe("bug-fix")
+  expect(d.classify("Null pointer exception when saving", []).decision).toBe("bug-fix")
+  expect(d.classify("Parser is slow", ["bug"]).decision).toBe("bug-fix")
+  expect(d.classify("Add support for a new provider", []).decision).toBe("open-ended")
+  expect(d.classify("Refactor the router module", []).decision).toBe("open-ended")
+  expect(d.classify("Document the cache options", ["documentation"]).decision).toBe("open-ended")
+  // one bug-fix cue and one open-ended cue tie: uncertain, so the decision is open-ended
+  const tie = d.classify("Add retry logic.\nFix the parser", [])
+  expect(tie.uncertain).toBe(true)
+  expect(tie.decision).toBe("open-ended")
+  const v = d.classify("Fix crash in parser", [])
+  expect(v.posterior.size).toBe(3)
+})
+
+// The trainer (scripts/crew_priors.py) and this module must agree bit for bit: the fixture holds a classifier the
+// trainer wrote and its own verdicts on texts that exercise every feature; this module must reach the same ones.
+test("the trainer's verdicts are reproduced (tests/fixtures/crew_classifier_parity.json)", () => {
+  const raw = try readFileSync("tests/fixtures/crew_classifier_parity.json", "utf8")
+  const top = try fields(raw)
+  const c = try loadClassifier(find(top, "classifier") ?? "")
+  let n = 0
+  for (const one of try elements(find(top, "cases") ?? "[]")) {
+    const f = try fields(one)
+    const labels: string[] = []
+    for (const l of try elements(find(f, "labels") ?? "[]")) labels.push(try decodeString(l))
+    const v = c.classify(try decodeString(find(f, "text") ?? "\"\""), labels)
+    expect(v.decision).toBe(try decodeString(find(f, "decision") ?? "\"\""))
+    expect(v.top).toBe(try decodeString(find(f, "top") ?? "\"\""))
+    for (const p of try fields(find(f, "posterior") ?? "{}")) {
+      const want = parseFloat(p.raw) ?? -2.0
+      const got = v.posterior.get(p.key) ?? -1.0
+      expect(Math.abs(got - want) < 0.000001).toBe(true)
+    }
+    n += 1
+  }
+  expect(n > 10).toBe(true)
+})

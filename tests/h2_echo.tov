@@ -1,0 +1,94 @@
+// A gRPC test server for tests/h2_test.py: HTTP/2 over plaintext with prior knowledge, as
+// grpc-go serves without TLS. The service is test.Echo:
+//   Unary         echoes the request message; x-echo-* metadata comes back as headers;
+//                 x-status makes the call fail with that code; x-sleep-ms delays the answer
+//                 (and a call past its grpc-timeout fails with DEADLINE_EXCEEDED)
+//   ServerStream  a request "count:size" gets count messages of size bytes; each starts
+//                 with its index
+//   ClientStream  answers "count:bytes" for the messages it received
+// H2_PORT is the port (18220 by default); H2_MAX_RECV is the largest request message
+// (4 MiB, grpc-go's default, unless set; the test uses 16 MiB for the 8 MiB messages).
+
+import { listen, H2Header } from "../src/h2"
+import { grpcServe, unaryRun, serverRun, clientRun, GrpcRun, GrpcError, GrpcCall, GRPC_DEADLINE_EXCEEDED } from "../src/grpcwire"
+
+const port = parseInt(process.env.H2_PORT ?? "18220") ?? 18220
+const maxRecv = parseInt(process.env.H2_MAX_RECV ?? "16777216") ?? 16777216
+
+function sleep(ms: int): Promise<void, Error> {
+  return new Promise<void, Error>((resolve) => {
+    setTimeout(() => resolve(), ms)
+  })
+}
+
+// The x-echo-* metadata of a call, as response headers.
+function echoed(call: GrpcCall): H2Header[] {
+  const out: H2Header[] = []
+  for (const h of call.metadata) {
+    if (h.name.startsWith("x-echo-")) out.push(h)
+  }
+  return out
+}
+
+function bytesOf(s: string): u8[] {
+  return new TextEncoder().encode(s)
+}
+
+// "count:size" from a request message, as two integers (0 when a part is missing).
+function pairOf(req: u8[]): int[] throws Error {
+  const d = try new TextDecoder()
+  const s = try d.decode(req)
+  const at = s.indexOf(":")
+  const a = parseInt(s.slice(0, at)) ?? 0
+  const b = parseInt(s.slice(at + 1)) ?? 0
+  return [a, b]
+}
+
+const methods: Map<string, GrpcRun> = new Map()
+
+methods.set("/test.Echo/Unary", unaryRun(async (req: u8[], call: GrpcCall): Promise<u8[], Error> => {
+  const sl = call.metadata.find((h) => h.name === "x-sleep-ms")
+  if (sl !== undefined) {
+    try await sleep(parseInt(sl.value) ?? 0)
+  }
+  const dl = call.deadlineMs
+  if (dl !== undefined && Math.trunc(Date.now()) > dl) {
+    throw new GrpcError(GRPC_DEADLINE_EXCEEDED, "past the deadline")
+  }
+  const st = call.metadata.find((h) => h.name === "x-status")
+  if (st !== undefined) {
+    throw new GrpcError(parseInt(st.value) ?? 0, "requested by x-status")
+  }
+  call.sendHeaders(echoed(call))
+  return req
+}))
+
+methods.set("/test.Echo/ServerStream", serverRun(async (req: u8[], call: GrpcCall): Promise<void, Error> => {
+  const p = try pairOf(req)
+  call.sendHeaders(echoed(call))
+  for (let i = 0; i < p[0]!; i++) {
+    const m: u8[] = []
+    for (let j = 0; j < p[1]!; j++) {
+      let b: int = 0
+      if (j === 0) b = i & 255
+      m.push(u8(b))
+    }
+    try await call.send(m)
+  }
+}))
+
+methods.set("/test.Echo/ClientStream", clientRun(async (call: GrpcCall): Promise<u8[], Error> => {
+  let count: int = 0
+  let total: int = 0
+  while (true) {
+    const m = try await call.recv()
+    if (m === undefined) break
+    count = count + 1
+    total = total + m.length
+  }
+  return bytesOf(`${count}:${total}`)
+}))
+
+const handler = grpcServe(methods, maxRecv)
+listen({ hostname: "127.0.0.1", port: port, maxStreams: 100 }, handler)
+console.log(`h2 echo on ${port}`)

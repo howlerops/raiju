@@ -7,6 +7,7 @@
 import { hmacSha256, toHex, utf8 } from "./crypto"
 import { DiscoveryConfig, baseUrl } from "./discovery"
 import { HoldWire, holdProblem } from "./holds"
+import { StateWire, stateProblem } from "./clusterstate"
 
 // Bifrost's cluster_config.broker (type "broker"): where the nodes reach the broker, and the port it serves on.
 export type BrokerConfig = { address: string, tls?: bool, listen_port?: int }
@@ -57,8 +58,9 @@ export function electLeader(ids: string[]): string {
 
 type WireCounter = { name: string, window: string, slots: Record<string, f64> }
 // roster: only in a broker's answer, the ids of the nodes it has heard from. holds: the key holds of
-// adaptive load balancing (holds.tov), joined by write count and writer.
-type Wire = { node: string, ts: f64, counters: WireCounter[], roster?: string[], holds?: HoldWire[] }
+// adaptive load balancing (holds.tov), joined by write count and writer. state: the replicated entries of
+// clusterstate.tov, joined by version and writer.
+type Wire = { node: string, ts: f64, counters: WireCounter[], roster?: string[], holds?: HoldWire[], state?: StateWire[] }
 
 // Slot values must be finite; NaN and infinities would poison every total.
 // Far above any budget or token count, and below the f64 limit.
@@ -73,6 +75,10 @@ function parseWire(text: string): Wire throws SyntaxError {
   }
   for (const h of w.holds ?? []) {
     const p = holdProblem(h)
+    if (p !== "") throw new SyntaxError("cluster payload: " + p)
+  }
+  for (const e of w.state ?? []) {
+    const p = stateProblem(e)
     if (p !== "") throw new SyntaxError("cluster payload: " + p)
   }
   for (const c of w.counters) {
@@ -95,6 +101,9 @@ export class Counters {
   // the holds this node sends (set before encode), and the holds received since the last takeHolds
   private outHolds: HoldWire[] = []
   private inHolds: HoldWire[] = []
+  // the replicated state entries this node sends, and those received since the last takeState
+  private outState: StateWire[] = []
+  private inState: StateWire[] = []
   // Last time a peer's payload was merged, by node id. Own node is never tracked.
   private seen: Map<string, f64> = new Map()
   constructor(readonly nodeId: string) {}
@@ -151,8 +160,21 @@ export class Counters {
     return out
   }
 
+  // The state entries this node sends with its next encode (clusterstate.tov).
+  setState(list: StateWire[]): void {
+    this.outState = list
+  }
+
+  // The state entries received from peers since the last call; the caller merges them into its clusterState.
+  takeState(): StateWire[] {
+    const out = this.inState
+    this.inState = []
+    return out
+  }
+
   private apply(w: Wire): void {
     for (const h of w.holds ?? []) this.inHolds.push(h)
+    for (const e of w.state ?? []) this.inState.push(e)
     for (const rc of w.counters) {
       const cur = this.counters.get(rc.name)
       if (cur === undefined || rc.window > cur.window) {
@@ -177,7 +199,7 @@ export class Counters {
       const c = this.counters.get(name)!
       counters.push({ name, window: c.window, slots: c.slots })
     }
-    const w: Wire = { node: this.nodeId, ts: Date.now(), counters: counters, roster: roster, holds: this.outHolds }
+    const w: Wire = { node: this.nodeId, ts: Date.now(), counters: counters, roster: roster, holds: this.outHolds, state: this.outState }
     return JSON.stringify(w)
   }
 
@@ -433,4 +455,36 @@ test("key holds travel with the counters, and a payload with a bad hold changes 
   expect(threw).toBe(1)
   expect(c.total("c", "w")).toBe(0)
   expect(c.takeHolds().length).toBe(0)
+})
+
+test("replicated state entries travel in the payload, and a payload with a bad entry changes nothing", () => {
+  const a = new Counters("a")
+  const b = new Counters("b")
+  const e: StateWire = { ns: "mcp.exchange_admin", key: "jira", value: `{"access_token":"x"}`, ver: 5000, by: "a", deleted: false, at: 5000.0 }
+  a.setState([e])
+  const text = a.encode()
+  try b.merge(text, 1000)
+  const got = b.takeState()
+  expect(got.length).toBe(1)
+  expect(got[0]!.key).toBe("jira")
+  expect(got[0]!.value).toBe(`{"access_token":"x"}`)
+  expect(b.takeState().length).toBe(0)
+  // a relayed answer carries the state the broker holds
+  const hub = new Counters("broker")
+  hub.setState([e])
+  const answer = new Counters("c")
+  try answer.relay(hub.encode(["a"]), 2000)
+  expect(answer.takeState().length).toBe(1)
+  // an entry with no writer refuses the whole payload, its counters included
+  const c = new Counters("c")
+  const bad = `{"node":"x","ts":1,"counters":[{"name":"c","window":"w","slots":{"x":1}}],"state":[{"ns":"n","key":"k","value":"1","ver":1,"by":"","deleted":false,"at":1}]}`
+  let threw = 0
+  try {
+    c.merge(bad)
+  } catch (err) {
+    if (err instanceof SyntaxError) threw += 1
+  }
+  expect(threw).toBe(1)
+  expect(c.total("c", "w")).toBe(0)
+  expect(c.takeState().length).toBe(0)
 })

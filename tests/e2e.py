@@ -5332,6 +5332,446 @@ def l140_e2e(env):
         srv.shutdown()
         srv.server_close()
 
+L147_STUB = "http://127.0.0.1:18240"  # the identity provider's token endpoint and the MCP server, for both L147 parts
+L147_WORKERS = "http://127.0.0.1:18243"  # two workers of one node (Bun; one process on http1)
+L147_NODE_A = "http://127.0.0.1:18241"  # two cluster nodes
+L147_NODE_B = "http://127.0.0.1:18242"
+
+def l147_idp():
+    """An identity provider and MCP server stub for the L147 tests. Tokens live for st["life"] seconds; a refresh token
+    is single use (a rotating provider: one that was spent is refused with invalid_grant); every refresh grant is kept;
+    /_expire-all ends every live token. The MCP server takes only live tokens."""
+    import urllib.parse, threading
+    lock = threading.Lock()
+    st = {"n": 0, "life": 8, "live": {}, "issued": [], "spent": set(), "refreshes": [], "lock": lock}
+    def issue(rt_too):
+        st["n"] += 1
+        tok = "adm-%d" % st["n"]
+        st["live"][tok] = time.time() + st["life"]
+        out = {"access_token": tok, "token_type": "Bearer", "expires_in": st["life"]}
+        if rt_too:
+            rt = "rt-%d" % st["n"]
+            st["issued"].append(rt)
+            out["refresh_token"] = rt
+        return out
+    def route(method, path, headers, body):
+        with lock:
+            if path == "/_expire-all":
+                st["live"] = {}
+                return 200, "{}", "application/json"
+            if path == "/token":
+                form = urllib.parse.parse_qs(body)
+                def one(k):
+                    return (form.get(k) or [""])[0]
+                if one("client_id") != "exch-client" or one("client_secret") != "exch-secret":
+                    return 401, json.dumps({"error": "invalid_client"}), "application/json"
+                if one("grant_type") == "refresh_token":
+                    rt = one("refresh_token")
+                    st["refreshes"].append(rt)
+                    if rt in st["spent"] or rt not in st["issued"]:
+                        return 400, json.dumps({"error": "invalid_grant", "error_description": "refresh token spent"}), "application/json"
+                    st["spent"].add(rt)
+                    return 200, json.dumps(issue(True)), "application/json"
+                if not one("subject_token").startswith("idp-"):
+                    return 400, json.dumps({"error": "invalid_grant", "error_description": "subject token not recognised"}), "application/json"
+                return 200, json.dumps(issue(one("subject_token").startswith("idp-admin"))), "application/json"
+            if path == "/mcp":
+                auth = headers.get("authorization") or ""
+                tok = auth[7:] if auth.startswith("Bearer ") else ""
+                if st["live"].get(tok, 0) <= time.time():
+                    return 401, "unauthorized", "text/plain"
+                msg = json.loads(body)
+                m = msg.get("method")
+                if "id" not in msg:
+                    return 202, "", "application/json"
+                if m == "initialize":
+                    res = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "l147", "version": "1"}}
+                elif m == "tools/list":
+                    res = {"tools": [{"name": "lookup", "description": "Looks a key up", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}}}]}
+                elif m == "tools/call":
+                    res = {"content": [{"type": "text", "text": "found " + str(msg["params"]["arguments"].get("key"))}]}
+                else:
+                    return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "no such method"}}), "application/json"
+                return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}), "application/json"
+            return 404, "{}", "application/json"
+    return st, route
+
+def l147_config(node=None, peer=None):
+    """A token_exchange MCP client at the stub, its secrets sealed with one encryption key; with node and peer, a cluster member."""
+    exch = {"audience": "api://jira", "client_id": "exch-client", "client_secret": "exch-secret", "scopes": ["offline_access"], "authorization_server_url": L147_STUB + "/token"}
+    cfg = {
+        "encryption_key": "an e2e passphrase of some length",
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "k", "value": "sk-l147", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
+            {"name": "jira", "connection_type": "http", "connection_string": L147_STUB + "/mcp", "auth_type": "token_exchange", "token_exchange": exch, "tool_sync_interval": "1s"},
+        ]},
+    }
+    if node is not None:
+        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l147", "interval_ms": 200, "peers": [peer]}
+    return cfg
+
+def l147_jira(base):
+    _, _, b = call("GET", "/api/mcp", None, None, base=base, auth=False)
+    return l133_find_named(json.loads(b), "jira") or {}
+
+def l147_calls(base, n, tag):
+    return [call("POST", "/v1/mcp/tool/execute", l117_tool("jira-lookup", {"key": "%s-%d" % (tag, i)}), {"authorization": "Bearer idp-alice.p.s"}, base=base, auth=False)[0] for i in range(n)]
+
+def l147_until(pred, secs):
+    end = time.time() + secs
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.2)
+    return pred()
+
+def l147_workers_e2e(env):
+    """L147: with two workers on one node, a token_exchange admin credential whose refresh token rotates is renewed
+    once. When it falls due exactly one refresh_token grant reaches the provider (the worker holding the lease renews,
+    the other reads the renewed credential from the config file), both workers keep serving, and a 401 that both
+    workers see renews it once more. The gateway is 18243 with RAIJU_WORKERS=2; the provider stub is 18240."""
+    st, route = l147_idp()
+    srv = serve(18240, route)
+    base = L147_WORKERS
+    cfg_path = os.path.join(BUILD, "e2e.l147w.json")
+    json.dump(l147_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18243", "-host", "127.0.0.1", "-config", cfg_path], env={**env, "RAIJU_WORKERS": "2"}, stderr=open(os.path.join(BUILD, "e2e.l147w.log"), "w"))
+    def refreshes():
+        with st["lock"]:
+            return len(st["refreshes"])
+    try:
+        wait(base + "/health")
+        with st["lock"]:
+            st["life"] = 8
+        t0 = time.time()
+        s, _, b = call("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-admin.p.s"}, None, base=base, auth=False)
+        check("workers: the verification keeps the exchanged token and its refresh token", s == 200 and json.loads(b)["tools_count"] >= 1, (s, b[:300]))
+        check("workers: the client connects with the retained credential", l147_until(lambda: l147_jira(base).get("connected") is True, 15), l147_jira(base))
+        # the token issued from here lives an hour, so the first token's renewal is the only one this test waits for
+        time.sleep(1.0)
+        with st["lock"]:
+            st["life"] = 3600
+        check("workers: the credential falls due and is renewed", l147_until(lambda: refreshes() >= 1, 10), refreshes())
+        time.sleep(max(0.0, t0 + 10.0 - time.time()))
+        with st["lock"]:
+            rts = list(st["refreshes"])
+        check("workers: exactly one refresh_token grant reaches the provider, after the first token's expiry", rts == ["rt-1"], rts)
+        codes = l147_calls(base, 12, "W")
+        check("workers: both workers keep serving tool calls after the renewal", all(c == 200 for c in codes), codes)
+        j = l147_jira(base)
+        check("workers: the client stays connected, listing its tools, with an active credential", j.get("connected") is True and j.get("error", "") == "" and int(j.get("tools", 0)) >= 1 and (j.get("credential") or {}).get("status") == "active", j)
+        with st["lock"]:
+            st["live"] = {}
+        renewed_once = l147_until(lambda: refreshes() == 2, 20)
+        time.sleep(2.0)
+        check("workers: a 401 renews the credential once for both workers", renewed_once and refreshes() == 2, refreshes())
+        codes = l147_calls(base, 8, "X")
+        check("workers: both workers serve after the 401 renewal", all(c == 200 for c in codes), codes)
+        saved = open(cfg_path).read()
+        check("workers: the renewed credential is sealed in the saved config", "exchange_admin" in saved and "rt-" not in saved and "adm-" not in saved, saved[-300:])
+    finally:
+        gw.terminate()
+        gw.wait()
+        srv.shutdown()
+        srv.server_close()
+
+def l147_cluster_e2e(env):
+    """L147: two cluster nodes share a token_exchange admin credential whose refresh token rotates. Node A verifies it and
+    node B learns it through the cluster state, sealed. When it falls due one node renews it (one refresh_token grant in
+    all) and the other learns the renewed credential; both serve. Refused by the provider, one renewal serves both again.
+    The nodes are 18241 and 18242; the provider stub is 18240."""
+    st, route = l147_idp()
+    srv = serve(18240, route)
+    pa = os.path.join(BUILD, "e2e.l147a.json")
+    pb = os.path.join(BUILD, "e2e.l147b.json")
+    json.dump(l147_config("l147-a", L147_NODE_B), open(pa, "w"))
+    json.dump(l147_config("l147-b", L147_NODE_A), open(pb, "w"))
+    ga = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18241", "-host", "127.0.0.1", "-config", pa], env=env, stderr=open(os.path.join(BUILD, "e2e.l147a.log"), "w"))
+    gb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18242", "-host", "127.0.0.1", "-config", pb], env=env, stderr=open(os.path.join(BUILD, "e2e.l147b.log"), "w"))
+    def refreshes():
+        with st["lock"]:
+            return len(st["refreshes"])
+    try:
+        wait(L147_NODE_A + "/health")
+        wait(L147_NODE_B + "/health")
+        # the nodes hear from each other before the credential is verified
+        time.sleep(3.0)
+        with st["lock"]:
+            st["life"] = 8
+        t0 = time.time()
+        s, _, b = call("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-admin.p.s"}, None, base=L147_NODE_A, auth=False)
+        check("cluster: node A verifies the exchange and keeps the admin credential", s == 200, (s, b[:300]))
+        check("cluster: node A connects with it", l147_until(lambda: l147_jira(L147_NODE_A).get("connected") is True, 15), l147_jira(L147_NODE_A))
+        check("cluster: node B learns the credential node A verified, through the cluster state", l147_until(lambda: l147_jira(L147_NODE_B).get("connected") is True, 20), l147_jira(L147_NODE_B))
+        time.sleep(1.0)
+        with st["lock"]:
+            st["life"] = 3600
+        check("cluster: the credential falls due and one node renews it", l147_until(lambda: refreshes() >= 1, 10), refreshes())
+        time.sleep(max(0.0, t0 + 10.0 - time.time()))
+        with st["lock"]:
+            rts = list(st["refreshes"])
+        check("cluster: exactly one refresh_token grant reaches the provider across both nodes", rts == ["rt-1"], rts)
+        ja = l147_jira(L147_NODE_A)
+        jb = l147_jira(L147_NODE_B)
+        check("cluster: the other node learns the renewed credential", (jb.get("credential") or {}).get("last_refreshed_at") is not None and (ja.get("credential") or {}).get("last_refreshed_at") == (jb.get("credential") or {}).get("last_refreshed_at"), (ja.get("credential"), jb.get("credential")))
+        codes = l147_calls(L147_NODE_A, 4, "A") + l147_calls(L147_NODE_B, 4, "B")
+        check("cluster: both nodes serve tool calls after the renewal", all(c == 200 for c in codes), codes)
+        with st["lock"]:
+            st["live"] = {}
+        renewed_once = l147_until(lambda: refreshes() == 2, 25)
+        time.sleep(3.0)
+        check("cluster: a 401 on both nodes renews once more, for both", renewed_once and refreshes() == 2, refreshes())
+        codes = l147_calls(L147_NODE_A, 4, "C") + l147_calls(L147_NODE_B, 4, "D")
+        check("cluster: both nodes serve after the 401 renewal", all(c == 200 for c in codes), codes)
+        ok = all(l147_jira(u).get("connected") is True and (l147_jira(u).get("credential") or {}).get("status") == "active" for u in [L147_NODE_A, L147_NODE_B])
+        check("cluster: both nodes stay connected with an active credential", ok, (l147_jira(L147_NODE_A), l147_jira(L147_NODE_B)))
+    finally:
+        for p in [ga, gb]:
+            p.terminate()
+            p.wait()
+        srv.shutdown()
+        srv.server_close()
+
+GW_L144 = "http://127.0.0.1:18228"  # audio billing: speech by its characters, transcriptions by their usage, budgets and the log rows
+
+
+def l144_config() -> dict:
+    """OpenAI's audio through the mock. Two virtual keys: one with room for the whole run, one whose budget the audio spends."""
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l144-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "pool-l144", "value": "sk-l144", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l144")}],
+            "budgets": [{"id": "b-l144-big", "max_limit": 1.0, "reset_duration": "1d"}, {"id": "b-l144-small", "max_limit": 0.0002, "reset_duration": "1d"}],
+            "virtual_keys": [{"id": "vk-l144-big", "value": "sk-bf-l144-big", "budget_id": "b-l144-big"}, {"id": "vk-l144-small", "value": "sk-bf-l144-small", "budget_id": "b-l144-small"}],
+        },
+    }
+
+
+def l144_e2e(env):
+    """Audio is billed as Bifrost bills it: speech by its input characters, a transcription by the usage its answer
+    reports (seconds, tokens with the audio split, a streamed answer's last event) or else the verbose answer's duration.
+    Each answer is a log row with its cost, charged to its key's budget, and a key whose budget the audio has spent is
+    refused. Its own gateway, started and stopped here."""
+    cfg_path = os.path.join(BUILD, "e2e.l144.json")
+    json.dump(l144_config(), open(cfg_path, "w"))
+    # the log store persists across runs; this run's rows are the only ones it counts
+    import shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l144-logs"), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18228", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l144.log"), "w"))
+    big = {"authorization": "Bearer sk-bf-l144-big"}
+    small = {"authorization": "Bearer sk-bf-l144-small"}
+    adm_h = {"authorization": "Bearer sk-admin-l144"}
+    speech_body = {"model": "openai/tts-1", "input": "say ping", "voice": "alloy"}
+
+    def rows_of(vk, op, model=None):
+        s, _, b = call("GET", "/api/logs", None, adm_h, base=GW_L144, auth=False)
+        rows = json.loads(b).get("logs", []) if s == 200 else []
+        # the list repeats a row (one copy per page of the store), so each id counts once
+        out, ids = [], set()
+        for x in rows:
+            if x.get("virtual_key_id") != vk or x.get("object") != op or (model is not None and x.get("model") != model) or x.get("id") in ids:
+                continue
+            ids.add(x.get("id"))
+            out.append(x)
+        return out
+
+    def stt(fields, headers, path="/v1/audio/transcriptions"):
+        parts = [("model", None, "text/plain", fields.get("model", "openai/whisper-1"))]
+        for k, v in fields.items():
+            if k != "model":
+                parts.append((k, None, "text/plain", v))
+        parts.append(("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt "))
+        return mp_form(GW_L144, path, parts, headers)
+
+    try:
+        wait(GW_L144 + "/health")
+        # speech: 8 characters at the tts-1 character rate, and the audio comes back unchanged
+        s, _, audio = call_bytes("POST", "/v1/audio/speech", speech_body, big, base=GW_L144)
+        check("speech is answered with the audio, unchanged", s == 200 and audio == bytes([0x49, 0x44, 0x33, 0xff, 0xfb, 0x90, 0x00, 0x80, 0xc3, 0x28]), (s, audio[:20]))
+        sp = rows_of("vk-l144-big", "speech")
+        check("speech is logged with its cost: 8 characters at the tts-1 character rate", len(sp) == 1 and sp[0].get("provider") == "openai" and sp[0].get("model") == "tts-1" and near(float(sp[0].get("cost") or 0), 8 * 0.000015), sp[:1])
+
+        # whisper-1 reports seconds: 12.5 s at the whisper rate per second (0.0001 USD)
+        s, _, b = stt({"model": "openai/whisper-1"}, big)
+        check("a transcription with a duration usage is answered", s == 200 and "transcribed by whisper-1" in b, (s, b[:200]))
+        # verbose_json reports no usage, only its duration: the fallback seconds, 7.5 s
+        s, _, b = stt({"model": "openai/whisper-1", "response_format": "verbose_json"}, big)
+        check("a verbose transcription with no usage bills its own duration", s == 200 and "transcribed by whisper-1" in b, (s, b[:200]))
+        # gpt-4o-transcribe reports tokens: 10 audio and 4 text tokens of the prompt, 6 output tokens
+        s, _, b = stt({"model": "openai/gpt-4o-transcribe"}, big)
+        check("a transcription with a token usage is answered", s == 200 and "transcribed by gpt-4o-transcribe" in b, (s, b[:200]))
+        # streamed: the usage is on the last event (3 prompt and 1 output tokens), and the events come back as they were
+        s, _, b = stt({"model": "openai/gpt-4o-transcribe", "stream": "true"}, big)
+        check("a streamed transcription comes back as its events", s == 200 and "transcript.text.done" in b and "data: [DONE]" in b, (s, b[:200]))
+        s, _, b = stt({"model": "openai/whisper-1"}, big, path="/v1/audio/translations")
+        check("a translation is billed the same way", s == 200 and "transcribed by whisper-1" in b, (s, b[:200]))
+
+        tr = rows_of("vk-l144-big", "transcription")
+        check("each transcription and translation is one log row", len(tr) == 5, [x.get("model") for x in tr])
+        costs = sorted(round(float(x.get("cost") or 0), 9) for x in tr)
+        want = sorted(round(c, 9) for c in [12.5 * 0.0001, 7.5 * 0.0001, 10 * 0.0000025 + 4 * 0.0000025 + 6 * 0.00001, 3 * 0.0000025 + 1 * 0.00001, 12.5 * 0.0001])
+        check("their costs: the seconds at the whisper rate, the tokens at the gpt-4o-transcribe rates", costs == want, (costs, want))
+        tok_rows = [x for x in tr if x.get("model") == "gpt-4o-transcribe"]
+        check("a token usage is logged with its prompt and output tokens, the streamed one too", sorted((x.get("prompt_tokens"), x.get("completion_tokens")) for x in tok_rows) == [(3, 1), (14, 6)], [(x.get("prompt_tokens"), x.get("completion_tokens")) for x in tok_rows])
+        check("a duration usage is logged with no tokens", all((x.get("prompt_tokens") or 0) == 0 for x in tr if x.get("model") == "whisper-1"), [x.get("prompt_tokens") for x in tr if x.get("model") == "whisper-1"])
+        s, _, m = call("GET", "/metrics", None, None, base=GW_L144, auth=False)
+        check("the metrics count the speech cost by model", s == 200 and any(x.startswith("bifrost_cost_total{") and 'model="tts-1"' in x for x in m.splitlines()), s)
+
+        # the small key's budget (0.0002 USD): the speech fits, the whisper answer is admitted and charged, and then nothing does
+        s1, _, _ = call_bytes("POST", "/v1/audio/speech", speech_body, small, base=GW_L144)
+        s2, _, b2 = stt({"model": "openai/whisper-1"}, small)
+        s3, _, b3 = call("POST", "/v1/audio/speech", speech_body, small, base=GW_L144, auth=False)
+        s4, _, b4 = stt({"model": "openai/whisper-1"}, small)
+        check("a key's budget admits the audio until it is spent, then refuses speech and transcription", s1 == 200 and s2 == 200 and s3 == 402 and "budget" in b3 and s4 == 402 and "budget" in b4, (s1, s2, s3, s4, b3[:200]))
+        sm = rows_of("vk-l144-small", "transcription")
+        check("the audio that was admitted is charged to the key's budget and logged", len(sm) == 1 and near(float(sm[0].get("cost") or 0), 12.5 * 0.0001), [x.get("cost") for x in sm])
+    finally:
+        gw.terminate()
+
+
+GW_L149_A = "http://127.0.0.1:18248"  # two cluster nodes, each with its own logs folder: push configs and the relay across them
+GW_L149_B = "http://127.0.0.1:18249"
+GW_L149_W = "http://127.0.0.1:18250"  # two workers of one node: the card fetched once, served by both, fetched once per period
+L149_ADMIN = {"authorization": "Bearer sk-admin-l149"}
+L149_KEY = {"x-bf-vk": "sk-bf-l149"}
+
+def l149_config(tag, card, node=None, peer=None, period=0):
+    """The L149 gateway: the mock's v1 agent registered as "w" (with its card, or none), a virtual key, an admin, and a logs
+    folder of its own. With node and peer it is a cluster member; the members share encryption_key, so the callback
+    secrets sealed on one open on the other."""
+    import hashlib
+    agent = {"name": "w", "agent_card_url": MOCK + "/a2a/v1/.well-known/agent-card.json", "allow_private_network": True, "allow_by_default": True}
+    if card is not None:
+        agent["card"] = card
+        agent["card_fetched_at"] = int(time.time() * 1000)
+    cfg = {
+        "encryption_key": "an e2e passphrase of some length",
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "a2a_card_refresh_seconds": period},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l149-logs-" + tag)},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"a2a_allow_private_push_callbacks": True},
+        "providers": {"openai": {"keys": [{"name": "l149", "value": "sk-l149", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l149".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-l149", "value": "sk-bf-l149"}],
+        },
+        "agents": [agent],
+    }
+    if node is not None:
+        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l149", "interval_ms": 200, "peers": [peer]}
+    return cfg
+
+def l149_cluster_e2e(env):
+    """L149: push configs are cluster-wide. A callback registered through node A is listed and answered by node B; an
+    agent's push that lands on node B's ingress is relayed to the caller's callback once, with the caller's own token
+    (sealed on the cluster state, opened by B); a config deleted on A is gone on B. Nodes 18248 and 18249."""
+    import shutil
+    from urllib.parse import urlparse
+    card = call("GET", "/a2a/v1/.well-known/agent-card.json", base=MOCK)[2]
+    for tag in ["a", "b"]:
+        shutil.rmtree(os.path.join(BUILD, "e2e-l149-logs-" + tag), ignore_errors=True)
+    pa = os.path.join(BUILD, "e2e.l149a.json")
+    pb = os.path.join(BUILD, "e2e.l149b.json")
+    json.dump(l149_config("a", card, "l149-a", GW_L149_B), open(pa, "w"))
+    json.dump(l149_config("b", card, "l149-b", GW_L149_A), open(pb, "w"))
+    call("GET", "/_a2a/reset", base=MOCK)
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    ga = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18248", "-host", "127.0.0.1", "-config", pa, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l149a.log"), "w"))
+    gb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18249", "-host", "127.0.0.1", "-config", pb, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l149b.log"), "w"))
+    cb = MOCK + "/cb/push"
+    def rpc(base, method, params):
+        return call("POST", "/agents/a2a/w/json-rpc", {"jsonrpc": "2.0", "id": "7", "method": method, "params": params}, L149_KEY, base=base, auth=False)
+    def listed(base):
+        s, _, b = call("GET", "/api/agents/push-configs?limit=100", base=base, headers=L149_ADMIN, auth=False)
+        return json.loads(b).get("total_count") if s == 200 else -1
+    def delivered(task):
+        return [c for c in json.loads(call("GET", "/_a2a/cb-seen", base=MOCK)[2]) if not c["failed"] and task in c["request"]["body"]]
+    try:
+        wait(GW_L149_A + "/health")
+        wait(GW_L149_B + "/health")
+        # the nodes hear from each other before the registration is made
+        time.sleep(3.0)
+        s, _, b = rpc(GW_L149_A, "SendMessage", {"message": {"messageId": "m-l149-1", "role": "ROLE_USER", "contextId": "l149-1", "parts": [{"text": "hi"}]}})
+        task = json.loads(b)["result"]["task"]["id"] if s == 200 and "task" in b else ""
+        check("node A makes a task for the send", task != "", (s, b[:200]))
+        s, _, b = rpc(GW_L149_A, "CreateTaskPushNotificationConfig", {"taskId": task, "id": "c1", "url": cb, "token": "cb-token-l149"})
+        check("node A registers the callback", s == 200 and json.loads(b).get("result", {}).get("id") == "c1", (s, b[:200]))
+        check("node B lists the registration made on node A", l147_until(lambda: listed(GW_L149_B) == 1, 15), listed(GW_L149_B))
+        s, _, b = rpc(GW_L149_B, "GetTaskPushNotificationConfig", {"taskId": task, "id": "c1"})
+        check("node B answers the get of it, with the callback URL", s == 200 and json.loads(b).get("result", {}).get("url") == cb, (s, b[:200]))
+        pushes = [p for p in json.loads(call("GET", "/_a2a/pushes", base=MOCK)[2]) if p["taskId"] == task]
+        check("the agent was given node A's ingress and a token of its own", len(pushes) == 1 and pushes[0]["url"].startswith(GW_L149_A + "/agents/a2a/w/push/callback") and pushes[0]["token"] != "", pushes)
+        # the agent pushes to node B's ingress (the URL names node A; the token is the one the agent holds)
+        ingress_b = GW_L149_B + urlparse(pushes[0]["url"]).path
+        body = json.dumps({"task": {"id": task, "contextId": "l149-1", "status": {"state": "TASK_STATE_COMPLETED"}}})
+        s, _, b = call("POST", urlparse(ingress_b).path, body, {"a2a-notification-token": pushes[0]["token"], "content-type": "application/a2a+json"}, base=GW_L149_B, auth=False)
+        check("node B takes the agent's push at its own ingress", s == 202, (s, b[:200]))
+        check("the push reaches the caller's callback", l147_until(lambda: len(delivered(task)) >= 1, 15), len(delivered(task)))
+        time.sleep(3.0)
+        got = delivered(task)
+        check("the push reaches the caller's callback once", len(got) == 1, len(got))
+        check("the callback carries the caller's own token, opened by node B", got and got[0]["request"]["headers"].get("a2a-notification-token") == "cb-token-l149", got[:1])
+        s, _, b = call("DELETE", f"/api/agents/push-configs/w/{task}/c1", base=GW_L149_A, headers=L149_ADMIN, auth=False)
+        check("node A deletes the registration", s == 204, (s, b[:200]))
+        check("node B no longer lists it", l147_until(lambda: listed(GW_L149_B) == 0, 15), listed(GW_L149_B))
+        check("node A does not list it either", listed(GW_L149_A) == 0, listed(GW_L149_A))
+    finally:
+        for p in [ga, gb]:
+            p.terminate()
+            p.wait()
+
+def l149_workers_e2e(env):
+    """L149: with two workers of one node, a card fetched once (through one worker) is served by every worker, with no 503
+    (it is shared on the cluster state), and the mock agent sees one card fetch per refresh period (three seconds here), not
+    one per worker. The gateway is 18250 with RAIJU_WORKERS=2; the card timer runs in both."""
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+    logs = os.path.join(BUILD, "e2e-l149-logs-w")
+    shutil.rmtree(logs, ignore_errors=True)
+    cfg_path = os.path.join(BUILD, "e2e.l149w.json")
+    json.dump(l149_config("w", None, period=3), open(cfg_path, "w"))
+    call("GET", "/_a2a/reset", base=MOCK)
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18250", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env={**env, "RAIJU_WORKERS": "2"}, stderr=open(os.path.join(BUILD, "e2e.l149w.log"), "w"))
+    def card_codes(n):
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            return list(ex.map(lambda _: call("GET", "/agents/a2a/w/.well-known/agent-card.json", None, L149_KEY, base=GW_L149_W, auth=False)[0], range(n)))
+    def card_fetches():
+        seen = json.loads(call("GET", "/_a2a/seen", base=MOCK)[2])
+        return len([x for x in seen if x["path"] == "/a2a/v1/.well-known/agent-card.json"])
+    try:
+        wait(GW_L149_W + "/health")
+        codes = card_codes(8)
+        check("before any fetch every worker answers 503 for the card", all(c == 503 for c in codes), codes)
+        s, _, b = call("POST", "/api/agents/w/refresh-card", {}, L149_ADMIN, base=GW_L149_W, auth=False)
+        check("the card is fetched through one worker", s == 200 and json.loads(b)["card"]["name"] == "v1-agent", (s, b[:200]))
+        served = []
+        for _ in range(40):
+            served = card_codes(8)
+            if all(c == 200 for c in served):
+                break
+            time.sleep(0.25)
+        check("after the fetch every worker serves the card, no 503", all(c == 200 for c in served), served)
+        call("GET", "/_a2a/reset", base=MOCK)
+        time.sleep(10.0)
+        n = card_fetches()
+        check("the mock agent sees about one card fetch per refresh period, not one per worker", 2 <= n <= 5, n)
+        served = card_codes(8)
+        check("the workers still serve the card after the timer's fetches", all(c == 200 for c in served), served)
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def unique_ports():
     """Every long-lived gateway this file starts needs its own port; a clash makes later checks talk to the wrong gateway."""
     import re
@@ -7426,9 +7866,9 @@ def l129_e2e(env):
         s, _, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-4o-mini", 1048576))
         check("a big Messages request to an OpenAI provider is buffered and converted", s == 200 and len(mine("/v1/chat/completions")) == n2 + 1 and json.loads(b).get("type") == "message", (s, b[:300]))
         s, _, b = l124_http(port, "POST", "/v1/responses", l129_json("anthropic/claude-3-5-sonnet-20241022", 9 * 1048576))
-        check("... but not past client.max_request_body_size_mb", s == 413, (s, b[:200]))
+        check("... and a converted one is not held, so it is not stopped by client.max_request_body_size_mb (L145)", s == 200, (s, b[:200]))
         s, _, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-4o-mini", 9 * 1048576))
-        check("... on the Messages route too", s == 413, (s, b[:200]))
+        check("... on the Messages route too, the body is converted as it streams in: the 9 MiB request is served (L146)", s == 200 and json.loads(b).get("type") == "message", (s, b[:200]))
         s, _, b = l124_http(port, "POST", "/v1/responses", l129_json("openai/resp-x", 4096) + b" ", headers={"content-length": str(200 * 1048576)})
         check("a declared length over max_payload_bytes is refused with a 413 on the Responses route", s == 413 and "maximum payload" in b.decode(), (s, b[:200]))
 
@@ -7439,7 +7879,7 @@ def l129_e2e(env):
         s, hs, b = l124_http(port, "POST", "/v1/audio/transcriptions", form, headers=fh)
         got = mine("/v1/audio/transcriptions")
         check("a 6 MiB transcription upload reaches OpenAI intact, with the model renamed", s == 200 and b"transcribed by whisper-1" in b and got and got[-1]["size"] == len(want) and got[-1]["sha"] == sha(want), (s, b[:200], got[-1]["size"] if got else None, len(want)))
-        check("the provider's own answer comes back as it is (usage included)", s == 200 and json.loads(b)["usage"]["input_tokens"] == 14, b[:200])
+        check("the provider's own answer comes back as it is (usage included)", s == 200 and json.loads(b)["usage"]["seconds"] == 12.5, b[:200])
         pieces = [form[i:i + 100000] for i in range(0, len(form), 100000)]
         s, _, b = l124_http(port, "POST", "/v1/audio/transcriptions", pieces, chunked=True, headers=fh)
         got = mine("/v1/audio/transcriptions")
@@ -7801,6 +8241,919 @@ def l136_e2e(env):
         gwb.terminate()
         gwb.wait()
 
+
+GW_L145 = "http://127.0.0.1:18232"  # large /v1/responses requests to providers whose format differs: converted to chat as they stream in
+GW_L145B = "http://127.0.0.1:18233"  # the same with client.max_request_body_size_mb 1: what is held is bounded by it
+
+def l145_e2e(env):
+    """large_payload_optimization for Responses requests to providers whose format differs (L145): a big /v1/responses request to
+    Anthropic, Gemini and an OpenAI-format provider is converted to chat while it streams in (the gateway holds none of it), arrives
+    intact by content hash, and its answer comes back as a Responses object, counted in the key's budget. Its own gateways (18232,
+    and 18233 with a 1 MiB hold limit)."""
+    import hashlib, shutil
+    logs_dir = os.path.join(BUILD, "e2e-l145-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    providers = {
+        "anthropic": {"keys": [{"name": "a", "value": "sk-ant-" + "l145", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "gemini": {"keys": [{"name": "g", "value": "g-" + "l145", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "groq": {"keys": [{"name": "gq", "value": "gsk-" + "l145", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+    }
+    lpo = {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "max_request_body_size_mb": 8},
+        "logs_store": {"enabled": True, "dir": logs_dir, "content_logging": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": lpo,
+        "governance": {
+            "budgets": [{"id": "b-l145", "max_limit": 100, "reset_duration": "1d"}],
+            "pricing_overrides": [{"id": "po-l145", "name": "l145", "scope_kind": "global", "match_type": "wildcard", "pattern": "*", "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}],
+            "virtual_keys": [{"id": "vk-l145", "value": "sk-bf-l145-budget-0123456789", "budget_id": "b-l145"}],
+        },
+        "providers": providers,
+    }
+    path = os.path.join(BUILD, "e2e.l145.json")
+    json.dump(cfg, open(path, "w"))
+    cfg_b = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 1},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": lpo,
+        "providers": {"anthropic": providers["anthropic"]},
+    }
+    path_b = os.path.join(BUILD, "e2e.l145b.json")
+    json.dump(cfg_b, open(path_b, "w"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw145 = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18232", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l145.log"), "w"))
+    gw145b = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18233", "-host", "127.0.0.1", "-config", path_b, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l145b.log"), "w"))
+    port = 18232
+    portb = 18233
+    try:
+        wait(GW_L145 + "/health")
+        wait(GW_L145B + "/health")
+        mine = lambda p_: [x for x in seen() if x["path"] == p_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L145, auth=False)[2])["budgets"]}
+        FILL = lambda n, c="F": c * n
+        B64 = lambda n: "QUJD" * (n // 4)
+        MB = 1048576
+
+        def resp_text(model, n):
+            return ('{"model":"%s","max_output_tokens":16,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"}]}]}' % (model, FILL(n))).encode()
+        def resp_image(model, n):
+            return ('{"model":"%s","instructions":"be brief","max_output_tokens":16,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"look"},{"type":"input_image","image_url":"data:image/png;base64,%s"}]}]}' % (model, B64(n))).encode()
+        # what each provider should receive: the converted chat body, as the chat converters write it
+        def want_text(fam, n, model=""):
+            f = FILL(n)
+            return {
+                "anthropic": '{"model":"%s","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16}' % (model, f),
+                "gemini": '{"contents":[{"role":"user","parts":[{"text":"%s"}]}],"generationConfig":{"maxOutputTokens":16}}' % f,
+                "openai": '{"model":"%s","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16}' % (model, f),
+            }[fam].encode()
+        def want_image(fam, n, model=""):
+            b = B64(n)
+            return {
+                "anthropic": '{"model":"%s","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"%s"}}]}],"system":"be brief","max_tokens":16}' % (model, b),
+                "gemini": '{"contents":[{"role":"user","parts":[{"text":"look"},{"inline_data":{"mime_type":"image/png","data":"%s"}}]}],"systemInstruction":{"parts":[{"text":"be brief"}]},"generationConfig":{"maxOutputTokens":16}}' % b,
+            }[fam].encode()
+        targets = [
+            # family, the model the caller names, the path the provider sees, what its answer says, the model the body names
+            ("anthropic", "anthropic/claude-l145", "/v1/messages", "Hi from claude", "claude-l145"),
+            ("gemini", "gemini/gemini-l145", "/v1beta/models/gemini-l145:generateContent", "Hi from gemini", ""),
+            ("openai", "groq/llama-l145", "/v1/chat/completions", None, "llama-l145"),
+        ]
+
+        # ---- a text request of 12 MiB to each provider: converted while it streams, intact by content hash ----
+        for fam, model, ppath, says, bmodel in targets:
+            want = want_text(fam, 12 * MB, bmodel)
+            s, hs, b = l124_http(port, "POST", "/v1/responses", resp_text(model, 12 * MB), timeout=120)
+            row = mine(ppath)[-1]
+            check("a 12 MiB Responses request to %s arrives as the %s chat body, intact by content hash" % (model, fam), s == 200 and row["size"] == len(want) and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+            t = b.decode("utf8", "replace")
+            if says is not None:
+                check("... and its answer comes back as a Responses object with the text", s == 200 and '"object":"response"' in t and says in t and '"output_text"' in t, t[:200])
+            else:
+                check("... and its answer comes back as a Responses object", s == 200 and '"object":"response"' in t and '"output_text"' in t, t[:200])
+
+        # ---- an image of 12 MiB (base64 inside the message) and the instructions as the system prompt ----
+        for fam, model, ppath, says, bmodel in targets[:2]:
+            want = want_image(fam, 12 * MB, bmodel)
+            s, hs, b = l124_http(port, "POST", "/v1/responses", resp_image(model, 12 * MB), timeout=120)
+            row = mine(ppath)[-1]
+            check("a 12 MiB image in a Responses request to %s arrives as the %s body, instructions hoisted" % (model.split("/")[0], fam), s == 200 and row["size"] == len(want) and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+
+        # ---- a stream the caller asked for: the answer is replayed as Responses events, as the whole-request path does ----
+        sb = ('{"model":"anthropic/claude-l145","stream":true,"max_output_tokens":16,"input":"%s"}' % FILL(2 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/responses", sb, timeout=120)
+        t = b.decode("utf8", "replace")
+        check("a big streamed Responses request to Anthropic gets Responses events with the answer and response.completed", s == 200 and hdr(hs, "content-type") == "text/event-stream" and "response.output_text.delta" in t and "response.completed" in t and "Hi from claude" in t, (s, hs, t[:300]))
+
+        # ---- the gateway does not hold the body ----
+        pid = gw145.pid
+        hwm0 = l124_vm(pid, "VmHWM")
+        s, _, b = l124_http(port, "POST", "/v1/responses", resp_image("anthropic/claude-l145", 48 * MB), timeout=180)
+        hwm1 = l124_vm(pid, "VmHWM")
+        row = mine("/v1/messages")[-1]
+        check("a 48 MiB image in a Responses request to Anthropic arrives intact (%d to %d MiB)" % (hwm0, hwm1), s == 200 and row["sha"] == sha(want_image("anthropic", 48 * MB, "claude-l145")) and hwm1 - hwm0 < 24, (s, b[:200], hwm0, hwm1))
+        s, _, b = l124_http(port, "POST", "/v1/responses", resp_image("gemini/gemini-l145", 48 * MB), timeout=180)
+        hwm2 = l124_vm(pid, "VmHWM")
+        row = mine("/v1beta/models/gemini-l145:generateContent")[-1]
+        check("a 48 MiB image in a Responses request to Gemini arrives intact, with no memory growth (%d to %d MiB)" % (hwm1, hwm2), s == 200 and row["sha"] == sha(want_image("gemini", 48 * MB)) and hwm2 - hwm1 < 24, (s, b[:200], hwm1, hwm2))
+
+        # ---- usage: the converted answer is counted in the key's budget (11 + 5 tokens) ----
+        vk = "sk-bf-l145-budget-0123456789"
+        u0 = used()["b-l145"]
+        s, _, b = l124_http(port, "POST", "/v1/responses", resp_text("anthropic/claude-l145u", 1 * MB), headers={"x-bf-vk": vk})
+        u1 = used()["b-l145"]
+        check("a converted Responses answer is counted in the key's budget (11 + 5 tokens)", s == 200 and abs((u1 - u0) - 16e-6) < 1e-9, (s, b[:100], u0, u1))
+
+        # ---- the hold limit: client.max_request_body_size_mb bounds what is held (1 MiB on the second gateway) ----
+        big_instr = ('{"model":"anthropic/claude-l145","max_output_tokens":16,"instructions":"%s","input":"hi"}' % FILL(3 * MB)).encode()
+        s, _, b = l124_http(portb, "POST", "/v1/responses", big_instr)
+        check("instructions over the hold limit are refused with a 400 that says so", s == 400 and "too large to convert while streaming" in b.decode(), (s, b[:300]))
+        s, _, b = l124_http(portb, "POST", "/v1/responses", resp_text("anthropic/claude-l145", 3 * MB), timeout=120)
+        check("... while a message of the same size streams through", s == 200, (s, b[:200]))
+    finally:
+        gw145.terminate()
+        gw145.wait()
+        gw145b.terminate()
+        gw145b.wait()
+
+
+GW_L146 = "http://127.0.0.1:18236"  # large Messages to OpenAI-format, Gemini and Cohere, and large embeddings to Gemini: converted as they stream
+GW_L146B = "http://127.0.0.1:18237"  # the same with client.max_request_body_size_mb 1: what is held is bounded by it
+
+def l146_e2e(env):
+    """large_payload_optimization for Messages to OpenAI-format, Gemini and Cohere providers, and for embeddings to Gemini (L146): a
+    40 MiB Messages request becomes a chat body (Gemini's and Cohere's bodies for those) while it streams in, its answer comes back in
+    Messages format, and a 40 MiB embeddings request becomes one batchEmbedContents body. Bodies arrive intact by content hash, with
+    no memory growth in the gateway. Its own gateways (18236, and 18237 with a 1 MiB hold limit)."""
+    import hashlib, shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l146-logs"), ignore_errors=True)
+    providers = {
+        "openai": {"keys": [{"name": "o", "value": "sk-" + "l146", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "gemini": {"keys": [{"name": "g", "value": "g-" + "l146", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        "cohere": {"keys": [{"name": "c", "value": "co-" + "l146", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+    }
+    lp = {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "max_request_body_size_mb": 64},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l146-logs"), "content_logging": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": lp,
+        "governance": {
+            "budgets": [{"id": "b-l146", "max_limit": 100, "reset_duration": "1d"}],
+            "pricing_overrides": [{"id": "po-l146", "name": "l146", "scope_kind": "global", "match_type": "wildcard", "pattern": "*", "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}],
+            "virtual_keys": [{"id": "vk-l146", "value": "sk-bf-l146-budget-0123456789", "budget_id": "b-l146"}],
+        },
+        "providers": providers,
+    }
+    path = os.path.join(BUILD, "e2e.l146.json")
+    json.dump(cfg, open(path, "w"))
+    cfg_b = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 1},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "large_payload_optimization": lp,
+        "providers": {"openai": providers["openai"]},
+    }
+    path_b = os.path.join(BUILD, "e2e.l146b.json")
+    json.dump(cfg_b, open(path_b, "w"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18236", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l146.log"), "w"))
+    gwb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18237", "-host", "127.0.0.1", "-config", path_b, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l146b.log"), "w"))
+    port = 18236
+    try:
+        wait(GW_L146 + "/health")
+        wait(GW_L146B + "/health")
+        mine = lambda p_: [x for x in seen() if x["path"] == p_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L146, auth=False)[2])["budgets"]}
+        logs = lambda: json.loads(call("GET", "/api/logs?limit=500", base=GW_L146, auth=False)[2])["entries"]
+        MB = 1048576
+        FILL = lambda n, c="F": c * n
+
+        def msg(model, n, stream=False):
+            st = ',"stream":true' if stream else ""
+            return ('{"model":"%s","max_tokens":16%s,"messages":[{"role":"user","content":"%s"}]}' % (model, st, FILL(n))).encode()
+        # what each provider should receive (the converted body, whole)
+        def chat_want(model, n, stream=False):
+            st = ',"stream":true,"stream_options":{"include_usage":true}' if stream else ""
+            return ('{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":16%s}' % (model, FILL(n), st)).encode()
+        def gemini_want(n):
+            return ('{"contents":[{"role":"user","parts":[{"text":"%s"}]}],"generationConfig":{"maxOutputTokens":16}}' % FILL(n)).encode()
+        def cohere_want(model, n):
+            return ('{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":16}' % (model, FILL(n))).encode()
+
+        hwm0 = l124_vm(gw.pid, "VmHWM")
+        # ---- a 40 MiB Messages request to an OpenAI-format provider: a chat body as it streams in; the answer in Messages format ----
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-l146", 40 * MB), timeout=180)
+        got = mine("/v1/chat/completions")
+        row = got[-1] if got else {}
+        want = chat_want("gpt-l146", 40 * MB)
+        check("a 40 MiB Messages request to an OpenAI-format provider arrives as a chat body, intact by content hash", s == 200 and row.get("size") == len(want) and row.get("sha") == sha(want), (s, b[:200], row.get("size"), len(want)))
+        check("... and its answer comes back as a Messages answer", s == 200 and b'"type":"message"' in b and b'"stop_reason"' in b, (s, b[:200]))
+
+        # ---- the same to Gemini, and as a stream: Gemini's body, the answer as Messages events ----
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("gemini/gemini-l146", 40 * MB), timeout=180)
+        row = mine("/v1beta/models/gemini-l146:generateContent")[-1]
+        check("a 40 MiB Messages request to Gemini arrives as a Gemini body, intact by content hash", s == 200 and row["sha"] == sha(gemini_want(40 * MB)), (s, b[:200], row["size"]))
+        check("... and its answer comes back as a Messages answer", s == 200 and b'"text":"Hi from gemini"' in b, (s, b[:200]))
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("gemini/gemini-l146", 40 * MB, stream=True), timeout=180)
+        t = b.decode("utf8", "replace")
+        row = mine("/v1beta/models/gemini-l146:streamGenerateContent")[-1]
+        check("a 40 MiB streamed Messages request to Gemini: the stream is called with the Gemini body, and the answer is Messages events", s == 200 and row["sha"] == sha(gemini_want(40 * MB)) and hdr(hs, "content-type") == "text/event-stream" and "event: message_start" in t and "event: message_stop" in t and "".join(json.loads(l[6:]).get("delta", {}).get("text", "") for l in t.split("\n") if l.startswith("data: {") and "text_delta" in l) == "Hi from gemini", (s, hs, t[:300], row["size"]))
+
+        # ---- the same to Cohere ----
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("cohere/command-l146", 40 * MB), timeout=180)
+        row = mine("/v2/chat")[-1]
+        check("a 40 MiB Messages request to Cohere arrives as a Cohere body, intact by content hash", s == 200 and row["sha"] == sha(cohere_want("command-l146", 40 * MB)), (s, b[:200], row["size"]))
+        check("... and its answer comes back as a Messages answer", s == 200 and b'"text":"Hi from cohere"' in b, (s, b[:200]))
+        hwm1 = l124_vm(gw.pid, "VmHWM")
+        check("the gateway's peak memory grew by under 24 MiB across the 40 MiB Messages requests (%d to %d MiB)" % (hwm0, hwm1), hwm1 - hwm0 < 24, (hwm0, hwm1))
+
+        # ---- a 40 MiB embeddings request to Gemini: one batchEmbedContents body, one entry per input ----
+        half = 20 * MB
+        emb = ('{"dimensions":8,"model":"gemini/text-embedding-l146","input":["%s","%s"]}' % (FILL(half, "A"), FILL(half, "B"))).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", emb, timeout=180)
+        row = mine("/v1beta/models/text-embedding-l146:batchEmbedContents")[-1]
+        emb_want = ('{"requests":[{"model":"models/text-embedding-l146","content":{"parts":[{"text":"%s"}]},"outputDimensionality":8},{"model":"models/text-embedding-l146","content":{"parts":[{"text":"%s"}]},"outputDimensionality":8}]}' % (FILL(half, "A"), FILL(half, "B"))).encode()
+        check("a 40 MiB embeddings request to Gemini arrives as one batch body, intact by content hash", s == 200 and row["sha"] == sha(emb_want), (s, b[:200], row["size"], len(emb_want)))
+        check("... and its answer is the embeddings list, one vector per input", s == 200 and b'"object":"list"' in b and b.count(b'"embedding":') == 2, (s, b[:200]))
+        hwm2 = l124_vm(gw.pid, "VmHWM")
+        check("the gateway's peak memory grew by under 24 MiB across the embeddings request (%d to %d MiB)" % (hwm1, hwm2), hwm2 - hwm1 < 24, (hwm1, hwm2))
+        # the output size goes first, as Gemini takes it per input: dimensions before input
+        small = ('{"dimensions":8,"model":"gemini/text-embedding-l146","input":["%s"]}' % FILL(300000)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", small, timeout=120)
+        row = mine("/v1beta/models/text-embedding-l146:batchEmbedContents")[-1]
+        dim_want = ('{"requests":[{"model":"models/text-embedding-l146","content":{"parts":[{"text":"%s"}]},"outputDimensionality":8}]}' % FILL(300000)).encode()
+        check("an embeddings request with dimensions before its input carries them on each input", s == 200 and row["sha"] == sha(dim_want), (s, b[:200], row["size"]))
+        late = ('{"model":"gemini/text-embedding-l146","input":["%s"],"dimensions":8}' % FILL(300000)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", late, timeout=120)
+        row = mine("/v1beta/models/text-embedding-l146:batchEmbedContents")[-1]
+        check("... and dimensions after the input are held and written on each input, the same body", s == 200 and row["sha"] == sha(dim_want), (s, b[:200], row["size"]))
+
+        # ---- usage: a converted Messages request is charged to its key's budget and logged with its tokens and cost ----
+        vk = "sk-bf-l146-budget-0123456789"
+        u0 = used()["b-l146"]
+        s, hs, b = l124_http(port, "POST", "/anthropic/v1/messages", msg("openai/gpt-l146", 1 * MB), headers={"x-bf-vk": vk}, timeout=120)
+        u1 = used()["b-l146"]
+        check("a converted Messages request is charged to its key's budget (3 + 4 tokens at 1e-6 each)", s == 200 and abs((u1 - u0) - 7e-6) < 1e-9, (s, b[:100], u0, u1))
+        time.sleep(0.5)
+        rows = [e for e in logs() if e.get("model") == "openai/gpt-l146" and e.get("prompt_tokens") == 3 and e.get("completion_tokens") == 4]
+        check("... and its log row carries the tokens and the cost", len(rows) >= 1 and any(abs((e.get("cost") or 0) - 7e-6) < 1e-9 for e in rows), [(e.get("prompt_tokens"), e.get("completion_tokens"), e.get("cost")) for e in rows[:3]])
+
+        # ---- the hold limit on the second gateway: a system prompt that is an array is held whole, a user message is not ----
+        portb = 18237
+        big_sys = ('{"model":"openai/gpt-l146","max_tokens":16,"system":[{"type":"text","text":"%s"}],"messages":[{"role":"user","content":"hi"}]}' % FILL(3 * MB)).encode()
+        s, hs, b = l124_http(portb, "POST", "/anthropic/v1/messages", big_sys)
+        check("a system prompt array over the hold limit is refused with a 400 that says so", s == 400 and "too large to convert while streaming" in b.decode(), (s, b[:300]))
+        s, hs, b = l124_http(portb, "POST", "/anthropic/v1/messages", msg("openai/gpt-l146", 3 * MB), timeout=120)
+        check("... while a user message of the same size streams through", s == 200 and b'"type":"message"' in b, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gwb.terminate()
+
+
+A2A_GRPC_LISTEN = 18245  # the port the listener binds (RAIJU_A2A_GRPC_LISTEN_PORT)
+A2A_GRPC_ADVERTISED = 18246  # server.a2a_grpc_port: what the cards advertise
+A2A_GRPC_DOMAIN = "gw.grpc.test"
+
+def l148_config(logs: str = "e2e-l148-logs"):
+    """The L148 gateway: the gRPC binding under gw.grpc.test (advertised on 18246), one agent granted to one key, and a key
+    without the grant. Push callbacks may go to the (private) mock, and the gateway's public URL is set."""
+    import hashlib
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True, "a2a_external_client_url": "https://gw.example.test/"},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, logs)},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"a2a_allow_private_push_callbacks": True, "a2a_grpc_base_domain": A2A_GRPC_DOMAIN, "a2a_grpc_port": A2A_GRPC_ADVERTISED},
+        "providers": {"openai": {"keys": [{"name": "l148", "value": "sk-l148", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l148".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-l148-a", "value": "sk-bf-l148-a"}, {"id": "vk-l148-b", "value": "sk-bf-l148-b"}],
+        },
+        "agents": [{"name": "grpc", "agent_card_url": MOCK + "/a2a/v1/.well-known/agent-card.json", "allow_private_network": True, "virtual_key_ids": ["vk-l148-a"]}],
+    }
+
+def l148_run(env, workers: int, label: str, port: int):
+    """A2A over gRPC: the lf.a2a.v1 service on its own listener (bound on RAIJU_A2A_GRPC_LISTEN_PORT, advertised as
+    server.a2a_grpc_port), the agent named by the :authority, the virtual key read from the metadata, and the eleven methods on
+    the A2A dispatch. tests/a2a_grpc_client talks to it: the SDK's own gRPC transport for the calls that work, the generated stub
+    for the statuses. The calls reach the mock agent without the caller's key and are logged under the agent's name. Needs go
+    (skipped without it). Its own gateway on 18244."""
+    import shutil
+    if shutil.which("go") is None:
+        print("skip the A2A gRPC checks: go is not installed")
+        return
+    client_dir = os.path.join(ROOT, "tests/a2a_grpc_client")
+    client = os.path.join(BUILD, "a2a_grpc_client")
+    built = subprocess.run(["go", "build", "-o", client, "."], cwd=client_dir, env={**os.environ, "GOTOOLCHAIN": "go1.26.9", "GOFLAGS": "-mod=mod"}, capture_output=True, text=True)
+    check("the A2A gRPC test client builds", built.returncode == 0, built.stderr[-600:])
+    if built.returncode != 0:
+        return
+    cfg_path = os.path.join(BUILD, f"e2e.{label}.json")
+    json.dump(l148_config(f"e2e-{label}-logs"), open(cfg_path, "w"))
+    shutil.rmtree(os.path.join(BUILD, f"e2e-{label}-logs"), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", cfg_path, "-workers", str(workers)], env={**env, "RAIJU_A2A_GRPC_LISTEN_PORT": str(A2A_GRPC_LISTEN)}, stderr=open(os.path.join(BUILD, f"e2e.{label}.log"), "w"))
+    base = f"http://127.0.0.1:{port}"
+    ADM = {"authorization": "Bearer sk-admin-l148"}
+    A = {"authorization": "Bearer sk-bf-l148-a"}
+    def api(method, path, body=None):
+        return call(method, path, body, ADM, base=base, auth=False)
+    def gwc(method, path, body=None, headers=None):
+        return call(method, path, body, headers, base=base, auth=False)
+    def upstream():
+        got = json.loads(call("GET", "/_a2a/seen", base=MOCK)[2])
+        return [x for x in got if x["path"] == "/a2a/v1/json-rpc"]
+    try:
+        wait(base + "/health")
+        # before the card is fetched, a call is refused in both bindings: 503 over HTTP, UNAVAILABLE over gRPC, the same message
+        s, _, b = gwc("POST", "/agents/a2a/grpc/json-rpc", {"jsonrpc": "2.0", "id": "1", "method": "GetTask", "params": {"id": "precard-task"}}, A)
+        check("a call before the agent's card is fetched is refused with 503 and the card's message", s == 503 and "has not been fetched" in b, (s, b[:200]))
+        pre = subprocess.run([client, "-addr", f"127.0.0.1:{A2A_GRPC_LISTEN}", "-domain", A2A_GRPC_DOMAIN, "-agent", "grpc", "-key", "sk-bf-l148-a", "-precard"], capture_output=True, text=True, timeout=120)
+        pre_row = json.loads(pre.stdout.strip().splitlines()[0]) if pre.returncode == 0 and pre.stdout.strip() != "" else {}
+        check("a gRPC call before the agent's card is fetched is UNAVAILABLE with the same message", pre_row.get("code") == "UNAVAILABLE" and pre_row.get("message") == "the card of grpc has not been fetched: refresh it through /api/agents/grpc/refresh-card", (pre.returncode, pre.stdout[:200], pre.stderr[-300:], b[:200]))
+        s, _, b = api("POST", "/api/agents/grpc/refresh-card")
+        check("the agent's card is fetched for the gRPC checks", s == 200, (s, b[:200]))
+        s, _, b = gwc("GET", "/agents/a2a/grpc/.well-known/agent-card.json", None, A)
+        card = json.loads(b) if s == 200 else {}
+        grpc_ifs = [i for i in card.get("supportedInterfaces", []) if i.get("protocolBinding") == "GRPC"]
+        check("the served card lists the gRPC interface under the agent's name and the advertised port", len(grpc_ifs) == 1 and grpc_ifs[0]["url"] == f"grpc.{A2A_GRPC_DOMAIN}:{A2A_GRPC_ADVERTISED}", (s, b[:300]))
+        s, _, b = api("GET", "/api/agents/history?limit=200")
+        before = len(json.loads(b).get("history", [])) if s == 200 else 0
+        before_up = len(upstream())
+        run = subprocess.run([client, "-addr", f"127.0.0.1:{A2A_GRPC_LISTEN}", "-domain", A2A_GRPC_DOMAIN, "-agent", "grpc", "-key", "sk-bf-l148-a", "-nogrant", "sk-bf-l148-b", "-push", MOCK + "/cb/push"], capture_output=True, text=True, timeout=300)
+        check("the gRPC client runs to the end", run.returncode == 0, (run.returncode, run.stderr[-600:]))
+        rows = {}
+        for line in run.stdout.splitlines():
+            if line.strip() != "":
+                r = json.loads(line)
+                rows[r["case"]] = r
+        def row(name):
+            return rows.get(name, {"code": "MISSING", "message": "", "result": "", "events": []})
+        def ok_with(name, *words):
+            r = row(name)
+            text = (r.get("result", "") + " " + " ".join(r.get("events", []))).lower()
+            return r["code"] == "OK" and all(w in text for w in words)
+        check("SendMessage (the SDK's transport) answers the task, with the agent's echo", ok_with("send-message", "hi-grpc", "complet"), row("send-message"))
+        check("SendStreamingMessage passes each event of the agent's stream as it arrives", row("send-streaming-message")["code"] == "OK" and len(row("send-streaming-message")["events"]) >= 2 and "complet" in row("send-streaming-message")["events"][-1].lower(), row("send-streaming-message"))
+        check("GetTask reads the task", ok_with("get-task", "complet"), row("get-task"))
+        check("CancelTask cancels it", ok_with("cancel-task", "cancel"), row("cancel-task"))
+        check("a push config is created for the task", ok_with("push-create", "cfg-grpc"), row("push-create"))
+        check("a push config is read back", ok_with("push-get", "cfg-grpc"), row("push-get"))
+        check("the push configs of the task are listed", ok_with("push-list", "cfg-grpc"), row("push-list"))
+        check("a push config is deleted", row("push-delete")["code"] == "OK", row("push-delete"))
+        check("GetExtendedAgentCard answers the agent's card", ok_with("extended-card", "v1-agent"), row("extended-card"))
+        check("SubscribeToTask streams the task's events", row("subscribe-to-task")["code"] == "OK" and len(row("subscribe-to-task")["events"]) >= 1, row("subscribe-to-task"))
+        check("an authority under another domain is NOT_FOUND", row("wrong-authority")["code"] == "NOT_FOUND" and row("wrong-authority")["message"] == "agent not found", row("wrong-authority"))
+        check("an authority that is the domain itself names no agent: NOT_FOUND", row("domain-only")["code"] == "NOT_FOUND", row("domain-only"))
+        check("an agent the gateway does not have is NOT_FOUND, as an unknown authority is", row("unknown-agent")["code"] == "NOT_FOUND" and row("unknown-agent")["message"] == "agent not found", row("unknown-agent"))
+        check("a call without a virtual key is UNAUTHENTICATED", row("no-key")["code"] == "UNAUTHENTICATED", row("no-key"))
+        check("a call with a key the gateway does not know is UNAUTHENTICATED", row("bad-key")["code"] == "UNAUTHENTICATED", row("bad-key"))
+        check("a key without the agent's grant is PERMISSION_DENIED", row("no-grant")["code"] == "PERMISSION_DENIED", row("no-grant"))
+        check("a task the agent does not have is NOT_FOUND with the agent's message", row("task-missing")["code"] == "NOT_FOUND" and row("task-missing")["message"] == "task not found", row("task-missing"))
+        check("an agent's error is INTERNAL with its message", row("agent-error")["code"] == "INTERNAL" and row("agent-error")["message"] == "agent failed on request", row("agent-error"))
+        check("the key sent as x-api-key is read", row("api-key-header")["code"] == "OK", row("api-key-header"))
+        sent = upstream()[before_up:]
+        check("the calls reach the mock agent as JSON-RPC with the v1 method names", any(x["body"].find('"method":"SendMessage"') >= 0 for x in sent) and any(x["body"].find('"method":"CancelTask"') >= 0 for x in sent), [x["body"][:120] for x in sent[:3]])
+        check("the agent does not get the caller's virtual key", len(sent) > 0 and all("sk-bf-l148" not in json.dumps(x) for x in sent), sent[:1])
+        s, _, b = api("GET", "/api/agents/history?limit=200")
+        hist = json.loads(b).get("history", []) if s == 200 else []
+        mine = [x for x in hist[: max(0, len(hist) - before)]]
+        check("every call that reached the agent is logged under its name, with its method", s == 200 and len(mine) >= 8 and all(x["agent_name"] == "grpc" for x in mine) and any(x["method"] == "SendMessage" for x in mine), (s, len(mine), b[:200]))
+        s, _, b = api("GET", "/api/agents/history?agent_names=grpc&limit=200")
+        check("the agent history selects the gRPC calls by name", s == 200 and json.loads(b).get("total", 0) >= 8, (s, b[:200]))
+        s, _, _ = gwc("GET", "/health")
+        check("the HTTP side of the gateway still answers", s == 200, s)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+def l148_e2e(env):
+    """The L148 checks on a single-process gateway, which opens the gRPC listener at start (its own gateway on 18244)."""
+    l148_run(env, 1, "l148", 18244)
+
+def l148w_e2e(env):
+    """The L148 checks on a bun gateway with two workers: one worker opens the gRPC listener after the fork (the lease in the
+    share folder), the cards of both advertise the interface, and calls to either reach the agent. Its own gateway on 18244,
+    after the single-process one has stopped. http1 runs one process, so it is skipped there."""
+    if os.environ.get("RAIJU_SERVER", "bun") == "http1":
+        print("skip the two-worker A2A gRPC checks: http1 runs one process")
+        return
+    l148_run(env, 2, "l148w", 18244)
+
+
+
+GW_L153 = "http://127.0.0.1:18256"  # crew routing: a pool of three candidates on mock providers, two roles, the assign API and the task detail
+GW_L153W = "http://127.0.0.1:18257"  # the same pool with two workers of one node (Bun only)
+GW_L153X = "http://127.0.0.1:18258"  # a crews config that does not check: the gateway refuses to start
+L153_ADMIN = {"authorization": "Bearer sk-admin-l153"}
+L153_POOL = "codeaf"
+
+def l153_priors():
+    """Priors for the pool. The open-ended worker prefers the cheap candidate and the open-ended checker the strong one;
+    the bug-fix worker prefers the strong candidate and the bug-fix checker the subscription, which is free while its
+    quota is above 20 percent of its limit. At lambda 1 these are the per-role argmaxes of delta - lambda cost."""
+    table = {
+        ("bug-fix", "worker"): {"cheap": 0.0, "strong": 0.10, "sub": 0.05},
+        ("bug-fix", "checker"): {"cheap": 0.0, "strong": 0.20, "sub": 0.30},
+        ("open-ended", "worker"): {"cheap": 0.09, "strong": 0.10, "sub": 0.0},
+        ("open-ended", "checker"): {"cheap": 0.10, "strong": 0.12, "sub": 0.0},
+    }
+    cells = []
+    for (klass, role), row in table.items():
+        for cand, delta in row.items():
+            cells.append({"class": klass, "role": role, "candidate": cand, "delta": delta, "n": 40, "info": 0.5})
+    return {"version": 1, "baseline": {"bug-fix": 0.4, "open-ended": 0.4}, "cells": cells}
+
+def l153_config(tag):
+    """The crew gateway: the mock as two OpenAI-format providers (openai, and alpha for the subscription candidate), the
+    prices, the pool with its priors in a file beside the config (a relative path) and its own logs. Admin is a governance
+    user; inference needs no key."""
+    import hashlib
+    pricing = {
+        "openai/crew-cheap": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001},
+        "openai/crew-strong": {"input_cost_per_token": 0.00001, "output_cost_per_token": 0.00001},
+        "alpha/crew-sub": {"input_cost_per_token": 0.00001, "output_cost_per_token": 0.00001},
+    }
+    profiles = {c: {"worker": {"calls": 2, "input_tokens": 1000, "output_tokens": 500}, "checker": {"calls": 1, "input_tokens": 1000, "output_tokens": 200}} for c in ["bug-fix", "open-ended", "other"]}
+    priors_name = "crew-priors-l153-" + tag + ".json"
+    json.dump(l153_priors(), open(os.path.join(BUILD, priors_name), "w"))
+    return {
+        "client": {"enforce_auth_on_inference": False},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l153".encode()).hexdigest()}]},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l153-logs-" + tag)},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "pricing": pricing,
+        "providers": {
+            "openai": {"keys": [{"name": "l153", "value": "sk-l153", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "alpha": {"keys": [{"name": "l153a", "value": "sk-alpha-l153", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "crews": {"task_ttl_seconds": 3600, "pools": [{
+            "name": L153_POOL,
+            "roles": ["worker", "checker"],
+            "classes": ["bug-fix", "open-ended", "other"],
+            "uncertain_class": "open-ended",
+            "candidates": [
+                {"id": "cheap", "model": "openai/crew-cheap", "route": "api"},
+                {"id": "strong", "model": "openai/crew-strong", "route": "api"},
+                {"id": "sub", "model": "alpha/crew-sub", "route": "subscription", "subscription": "team"},
+            ],
+            "subscriptions": [{"name": "team", "window_hours": 5, "limit_usd": 50, "free_until_fraction": 0.2}],
+            "profiles": profiles,
+            "priors": priors_name,
+            "operating_point": {"mode": "lambda", "lambda": 1.0},
+            "credibility": {"prior_scale": 1.2},
+        }]},
+    }
+
+def l153_chat(base, marker, role=None, task=None, cls=None, text=None, model="crew/" + L153_POOL):
+    """A chat call of a crew model. Its user turn carries the marker, which finds the call in the mock's record."""
+    h = {}
+    if task is not None:
+        h["x-raiju-task-id"] = task
+    if role is not None:
+        h["x-raiju-crew-role"] = role
+    if cls is not None:
+        h["x-raiju-task-class"] = cls
+    body = {"model": model, "messages": [{"role": "user", "content": text or ("Fix the crash in the parser, the traceback shows a NullPointerError " + marker)}]}
+    return call("POST", "/v1/chat/completions", body, h, base=base, auth=False)
+
+def l153_upstream(marker):
+    """The model and key the mock received for the call that carries the marker (None when it did not arrive)."""
+    for x in seen():
+        if marker in x.get("body", ""):
+            return json.loads(x["body"])["model"], x["auth"]
+    return None
+
+def l153_task(base, task, pool=L153_POOL):
+    return call("GET", f"/api/crews/tasks/{task}?pool={pool}", None, L153_ADMIN, base=base, auth=False)
+
+def l153_assign(base, pool, body):
+    return call("POST", f"/api/crews/{pool}/assign", body, L153_ADMIN, base=base, auth=False)
+
+def l153_e2e(env):
+    """L153: crew routing. A model named crew/codeaf takes its task from x-raiju-task-id and its role from x-raiju-crew-role.
+    The first call of a task fixes its class and crew, and each call goes to its role's candidate. Checked: the refusals;
+    two roles of one task on their candidates (the upstream sees each candidate's model, and the subscription's provider
+    its own key); a forced class; a bug-fix-looking first message classified bug-fix; the assign API agreeing with routing;
+    the crew listing; the task's calls and cost summed from its log rows; a config that does not check refuses to start.
+    With RAIJU_WORKERS=2 on Bun, the calls of one task on either worker use one crew."""
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    shutil.rmtree(os.path.join(BUILD, "e2e-l153-logs-a"), ignore_errors=True)
+    cfg_path = os.path.join(BUILD, "e2e.l153.json")
+    json.dump(l153_config("a"), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18256", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l153.log"), "w"))
+    try:
+        wait(GW_L153 + "/health")
+        # the refusals (none of them reaches the upstream)
+        s, _, b = l153_chat(GW_L153, "mk-r1", task=None, role="worker")
+        check("a crew call without x-raiju-task-id is a 400 that names the header", s == 400 and "x-raiju-task-id" in b, (s, b[:200]))
+        s, _, b = l153_chat(GW_L153, "mk-r2", task="t153-r", role=None)
+        check("a crew call without x-raiju-crew-role is a 400 that names the header", s == 400 and "x-raiju-crew-role" in b, (s, b[:200]))
+        s, _, b = l153_chat(GW_L153, "mk-r3", task="t153-r", role="judge")
+        check("an unknown role is a 400 that lists the pool's roles", s == 400 and "worker, checker" in b, (s, b[:200]))
+        s, _, b = l153_chat(GW_L153, "mk-r4", task="t153-r", role="worker", cls="poetry")
+        check("an unknown x-raiju-task-class is a 400", s == 400 and "poetry" in b, (s, b[:200]))
+        s, _, b = l153_chat(GW_L153, "mk-r5", task="t153-r", role="worker", model="crew/nope")
+        check("an unknown pool is a 404", s == 404 and "nope" in b, (s, b[:200]))
+        check("no refused call reached the upstream", l153_upstream("mk-r1") is None and l153_upstream("mk-r5") is None)
+
+        # two roles of one task: the worker's call goes to the strong candidate, the checker's to the subscription
+        s, h, b = l153_chat(GW_L153, "mk-a1", role="worker", task="t153-a")
+        hd = {k.lower(): v for k, v in h.items()}
+        check("a worker call of a new task is answered", s == 200, (s, b[:200]))
+        check("the worker's answer names its candidate, class and attempt", hd.get("x-raiju-crew-candidate") == "strong" and hd.get("x-raiju-crew-class") == "bug-fix" and hd.get("x-raiju-crew-attempt") == "1", hd)
+        up = l153_upstream("mk-a1")
+        check("the worker's call reaches the strong candidate's model, with the openai key", up == ("crew-strong", "Bearer sk-l153"), up)
+        s, h, b = l153_chat(GW_L153, "mk-a2", role="checker", task="t153-a")
+        hd = {k.lower(): v for k, v in h.items()}
+        check("the checker's call of the same task goes to the subscription candidate", hd.get("x-raiju-crew-candidate") == "sub" and hd.get("x-raiju-crew-class") == "bug-fix", hd)
+        up = l153_upstream("mk-a2")
+        check("the subscription's provider serves it, with its own key", up == ("crew-sub", "Bearer sk-alpha-l153"), up)
+        s, h, b = l153_chat(GW_L153, "mk-a3", role="worker", task="t153-a")
+        check("a later worker call of the task keeps the strong candidate", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == "strong", h)
+
+        # a forced class: that class's crew, whatever the text says
+        s, h, b = l153_chat(GW_L153, "mk-b1", role="worker", task="t153-b", cls="open-ended")
+        hd = {k.lower(): v for k, v in h.items()}
+        check("a forced class takes its own crew: the open-ended worker is the cheap candidate", hd.get("x-raiju-crew-class") == "open-ended" and hd.get("x-raiju-crew-candidate") == "cheap", hd)
+        s, h, b = l153_chat(GW_L153, "mk-b2", role="checker", task="t153-b")
+        check("and its checker is the strong one, on the same task", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == "strong", h)
+
+        # no class header: the classifier reads the first user turn
+        s, h, b = l153_chat(GW_L153, "mk-c1", role="worker", task="t153-c")
+        check("a bug-fix-looking first message is classified bug-fix", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-class") == "bug-fix", h)
+
+        # the assign API makes the assignment routing would make, and a task keeps the one it has
+        s, _, b = l153_assign(GW_L153, L153_POOL, {"task_id": "t153-d", "text": "Fix the crash in the parser: the traceback shows a NullPointerError", "labels": ["bug"]})
+        a = json.loads(b) if s == 200 else {}
+        crew = {x["role"]: x["candidate"] for x in a.get("crew", [])}
+        check("the assign API classes the task and returns its crew", s == 200 and a.get("class") == "bug-fix" and crew == {"worker": "strong", "checker": "sub"}, (s, b[:300]))
+        check("the assign API reports the classifier's posterior over the classes", sorted(p["class"] for p in a.get("posterior", [])) == ["bug-fix", "open-ended", "other"], a.get("posterior"))
+        s, h, b = l153_chat(GW_L153, "mk-d1", role="checker", task="t153-d")
+        check("routing of that task follows the assignment", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == crew.get("checker"), (h, crew))
+        s, _, b = l153_assign(GW_L153, L153_POOL, {"task_id": "t153-a", "class": "other"})
+        a2 = json.loads(b) if s == 200 else {}
+        t0 = json.loads(l153_task(GW_L153, "t153-a")[2])
+        check("assigning a task that has one returns it unchanged", s == 200 and a2.get("class") == "bug-fix" and a2.get("created") == t0["assignment"]["created"], (s, b[:200]))
+        s, _, b = l153_assign(GW_L153, L153_POOL, {"task_id": "t153-e", "class": "poetry"})
+        check("assign refuses a class the pool does not have", s == 400, (s, b[:200]))
+        s, _, b = l153_assign(GW_L153, "nope", {"task_id": "t153-e"})
+        check("assign to an unknown pool is a 404", s == 404, (s, b[:200]))
+
+        # the crew listing: per class the multiplier, the crew and the frontier
+        s, _, b = call("GET", "/api/crews", None, L153_ADMIN, base=GW_L153, auth=False)
+        pools = json.loads(b)["pools"] if s == 200 else []
+        pool = pools[0] if len(pools) == 1 else {}
+        classes = {c["class"]: c for c in pool.get("classes_detail", [])}
+        check("the crew listing has the pool, its candidates and its subscription", s == 200 and pool.get("name") == L153_POOL and [c["id"] for c in pool.get("candidates", [])] == ["cheap", "strong", "sub"] and 0.99 < pool["subscriptions"][0]["phi"] <= 1.0, (s, b[:300]))
+        check("each class carries its multiplier, where it came from and the crew", classes.get("bug-fix", {}).get("lambda") == 1.0 and classes["bug-fix"]["lambda_source"] == "lambda" and {x["role"]: x["candidate"] for x in classes["bug-fix"]["crew"]} == {"worker": "strong", "checker": "sub"}, classes.get("bug-fix"))
+        check("the open-ended crew is the cheap worker and the strong checker", {x["role"]: x["candidate"] for x in classes.get("open-ended", {}).get("crew", [])} == {"worker": "cheap", "checker": "strong"}, classes.get("open-ended"))
+        check("the configured profiles are reported as configured", all(p["source"] == "configured" for p in classes.get("bug-fix", {}).get("profiles", [])) and len(classes.get("bug-fix", {}).get("profiles", [])) == 2, classes.get("bug-fix"))
+
+        # the task detail: the calls of the task, their attempts and the cost summed from the log rows
+        s, _, b = l153_task(GW_L153, "t153-a")
+        t = json.loads(b) if s == 200 else {}
+        rows = t.get("rows", [])
+        check("the task detail counts the task's calls", s == 200 and t.get("calls") == 3 and len(rows) == 3, (s, b[:300]))
+        check("the task's cost is the sum of its rows' costs, and positive", t.get("cost", 0) > 0 and abs(t.get("cost", 0) - sum(r["cost"] for r in rows)) < 1e-12, (t.get("cost"), [r["cost"] for r in rows]))
+        check("the rows say which role and candidate each call took", sorted((r["role"], r["candidate"]) for r in rows) == [("checker", "sub"), ("worker", "strong"), ("worker", "strong")], [(r["role"], r["candidate"]) for r in rows])
+        check("the task's assignment is there, and its attempts count the calls", t.get("assignment", {}).get("class") == "bug-fix" and [(x["attempt"], x["calls"]) for x in t.get("attempts", [])] == [(1, 3)], (t.get("assignment"), t.get("attempts")))
+        s, _, b = call("GET", "/api/crews/tasks/t153-a", None, L153_ADMIN, base=GW_L153, auth=False)
+        check("the task detail needs its pool", s == 400, (s, b[:200]))
+        s, _, b = l153_task(GW_L153, "t153-nothing")
+        check("a task with no assignment and no calls is a 404", s == 404, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+    # a config that does not check: the named field is logged, the exit status is 1 and nothing listens
+    bad = l153_config("x")
+    bad["crews"]["pools"][0]["candidates"][0]["model"] = "nowhere/crew-cheap"
+    bad_path = os.path.join(BUILD, "e2e.l153x.json")
+    json.dump(bad, open(bad_path, "w"))
+    bad_log = os.path.join(BUILD, "e2e.l153x.log")
+    gx = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18258", "-host", "127.0.0.1", "-config", bad_path, "-server", server], env=env, stderr=open(bad_log, "w"))
+    try:
+        code = gx.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        gx.kill()
+        gx.wait()
+        code = None
+    log_text = open(bad_log).read()
+    check("a crews config with an unknown provider refuses to start, naming the candidate's model field", code == 1 and "crews.pools[0].candidates[0].model" in log_text, (code, log_text[-300:]))
+
+    if server == "http1":
+        return
+    # two workers of one node: a task's calls on either worker use one crew (the first call's assignment travels on the share)
+    shutil.rmtree(os.path.join(BUILD, "e2e-l153-logs-w"), ignore_errors=True)
+    wcfg_path = os.path.join(BUILD, "e2e.l153w.json")
+    json.dump(l153_config("w"), open(wcfg_path, "w"))
+    gw2 = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18257", "-host", "127.0.0.1", "-config", wcfg_path, "-server", server], env={**env, "RAIJU_WORKERS": "2"}, stderr=open(os.path.join(BUILD, "e2e.l153w.log"), "w"))
+    try:
+        wait(GW_L153W + "/health")
+        s, h, b = l153_chat(GW_L153W, "mk-w1", role="worker", task="t153-w")
+        first = {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate")
+        time.sleep(2.0)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            res = list(ex.map(lambda i: l153_chat(GW_L153W, f"mk-w{i}", role="worker", task="t153-w"), range(2, 14)))
+            res2 = list(ex.map(lambda i: l153_chat(GW_L153W, f"mk-wc{i}", role="checker", task="t153-w"), range(2, 14)))
+        cands = [{k.lower(): v for k, v in x[1].items()}.get("x-raiju-crew-candidate") for x in res]
+        cands2 = [{k.lower(): v for k, v in x[1].items()}.get("x-raiju-crew-candidate") for x in res2]
+        check("the first call on one worker fixes the crew", first == "strong", first)
+        check("the worker's calls of that task, on either worker, use one candidate", cands == ["strong"] * 12, cands)
+        check("and the checker's calls use one candidate", cands2 == ["sub"] * 12, cands2)
+        s, _, b = l153_task(GW_L153W, "t153-w")
+        t = json.loads(b) if s == 200 else {}
+        check("the task's rows from both workers are one task: 25 calls, each on its role's candidate", t.get("calls") == 25 and all(r["candidate"] == ("strong" if r["role"] == "worker" else "sub") for r in t.get("rows", [])), (s, t.get("calls")))
+    finally:
+        gw2.terminate()
+        gw2.wait()
+
+GW_L154 = "http://127.0.0.1:18260"  # crew outcomes: an escalation pool (cheap, then strong), the sequential layer, learning
+GW_L154B = "http://127.0.0.1:18261"  # the same pool in budget mode: a completed task over budget paces the multiplier
+GW_L154E = "http://127.0.0.1:18262"  # the same pool with a one-second task ttl: an expired task leaves the state
+L154_ADMIN = {"authorization": "Bearer sk-admin-l154"}
+L154_POOL = "codeaf"
+L154_CLASSES = ["bug-fix", "open-ended", "other"]
+
+def l154_config(tag, operating_point, ttl, pricing):
+    """The crew gateway for L154: the mock as one OpenAI-format provider; two candidates, cheap and strong, whose costs are
+    set by pricing; the worker's prior favours the strong candidate by 0.55 over the reference (the cheap one); explicit
+    call profiles, so the learned ones do not move the multiplier; the sequential layer on, with one attempt per crew."""
+    import hashlib
+    profiles = {c: {"worker": {"calls": 1, "input_tokens": 2000, "output_tokens": 500}, "checker": {"calls": 1, "input_tokens": 2000, "output_tokens": 500}} for c in L154_CLASSES}
+    return {
+        "client": {"enforce_auth_on_inference": False},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l154".encode()).hexdigest()}]},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l154-logs-" + tag)},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "pricing": pricing,
+        "providers": {
+            "openai": {"keys": [{"name": "l154", "value": "sk-l154", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "crews": {"task_ttl_seconds": ttl, "pools": [{
+            "name": L154_POOL,
+            "roles": ["worker", "checker"],
+            "classes": L154_CLASSES,
+            "uncertain_class": "open-ended",
+            "candidates": [
+                {"id": "cheap", "model": "openai/crew-cheap", "route": "api"},
+                {"id": "strong", "model": "openai/crew-strong", "route": "api"},
+            ],
+            "profiles": profiles,
+            "priors": {"baseline": {"bug-fix": 0.4}, "cells": [{"class": "bug-fix", "role": "worker", "candidate": "strong", "delta": 0.55, "n": 50, "info": 0.2}]},
+            "operating_point": operating_point,
+            "sequential": {"enabled": True, "max_attempts": 6, "per_candidate": 1, "verifier_accuracy": {"bug-fix": 0.9}},
+            "credibility": {"prior_scale": 1.2},
+        }]},
+    }
+
+L154_CHEAP = {"openai/crew-cheap": {"input_cost_per_token": 0.0000001, "output_cost_per_token": 0.0000001}, "openai/crew-strong": {"input_cost_per_token": 0.00001, "output_cost_per_token": 0.00001}}
+# dear, with the strong candidate dearer: the frontier needs two vertices, else the warm start is 0 and eq. 12 cannot move it
+L154_DEAR = {"openai/crew-cheap": {"input_cost_per_token": 0.01, "output_cost_per_token": 0.01}, "openai/crew-strong": {"input_cost_per_token": 0.1, "output_cost_per_token": 0.1}}
+
+def l154_chat(base, marker, task, role, attempt=None):
+    """A chat call of the pool's task, forced to bug-fix; its user turn carries the marker that finds it at the mock."""
+    h = {"x-raiju-task-id": task, "x-raiju-crew-role": role, "x-raiju-task-class": "bug-fix"}
+    if attempt is not None:
+        h["x-raiju-task-attempt"] = str(attempt)
+    body = {"model": "crew/" + L154_POOL, "messages": [{"role": "user", "content": "Fix the crash in the parser " + marker}]}
+    return call("POST", "/v1/chat/completions", body, h, base=base, auth=False)
+
+def l154_post(base, task, action, body):
+    return call("POST", f"/api/crews/tasks/{task}/{action}?pool={L154_POOL}", body, L154_ADMIN, base=base, auth=False)
+
+def l154_task(base, task):
+    return call("GET", f"/api/crews/tasks/{task}?pool={L154_POOL}", None, L154_ADMIN, base=base, auth=False)
+
+def l154_listing(base):
+    s, _, b = call("GET", "/api/crews", None, L154_ADMIN, base=base, auth=False)
+    pools = json.loads(b).get("pools", []) if s == 200 else []
+    return next((p for p in pools if p.get("name") == L154_POOL), {})
+
+def l154_e2e(env):
+    """L154: outcomes, online learning, budget pacing and the sequential layer. A task whose cheap worker fails goes to a
+    next attempt on the strong worker (the sequential layer), which its own pass completes; the outcome credits the strong
+    worker's cell, which the listing shows as learned. The outcome API's refusals and its idempotence. In budget mode a
+    completed task over budget steps the multiplier up by exp(step) (the cost is far above the budget, so the step clips).
+    With a one-second ttl an expired task leaves the state, and its cost is paced."""
+    import shutil, math
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-a"), ignore_errors=True)
+    cfg_path = os.path.join(BUILD, "e2e.l154.json")
+    json.dump(l154_config("a", {"mode": "lambda", "lambda": 23}, 3600, L154_CHEAP), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18260", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l154.log"), "w"))
+    try:
+        wait(GW_L154 + "/health")
+        s, h, b = l154_chat(GW_L154, "mk-l1", "t154-a", "worker")
+        hd = {k.lower(): v for k, v in h.items()}
+        check("the first worker call takes the cheap candidate at lambda 23, as attempt 1", s == 200 and hd.get("x-raiju-crew-candidate") == "cheap" and hd.get("x-raiju-crew-attempt") == "1", (s, hd))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.1, "verifier": "fail", "accuracy": 0.9})
+        check("the failed outcome is recorded on attempt 1", s == 200 and '"recorded":true' in b and '"completed":false' in b, (s, b[:300]))
+        s, _, b = l154_post(GW_L154, "t154-a", "next", {})
+        nx = json.loads(b) if s == 200 else {}
+        crew2 = {x.get("role"): x.get("candidate") for x in nx.get("crew", [])}
+        check("the sequential layer starts attempt 2 on the strong worker", nx.get("action") == "attempt" and nx.get("attempt") == 2 and crew2.get("worker") == "strong", (s, b[:300]))
+        s, h, b = l154_chat(GW_L154, "mk-l2", "t154-a", "worker", attempt=2)
+        hd = {k.lower(): v for k, v in h.items()}
+        check("a call carrying attempt 2 goes to the strong worker, and the mock gets its model", hd.get("x-raiju-crew-candidate") == "strong" and l153_upstream("mk-l2") == ("crew-strong", "Bearer sk-l154"), (hd, l153_upstream("mk-l2")))
+        s, h, b = l154_chat(GW_L154, "mk-l3", "t154-a", "worker", attempt=1)
+        hd = {k.lower(): v for k, v in h.items()}
+        check("a call carrying attempt 1 keeps the cheap worker", hd.get("x-raiju-crew-candidate") == "cheap", hd)
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.3, "verifier": "pass", "attempt": 2})
+        check("the strong worker's pass completes the task", s == 200 and '"completed":true' in b, (s, b[:300]))
+        s, _, b = l154_post(GW_L154, "t154-a", "next", {})
+        check("the sequential layer then accepts: the task is complete", s == 200 and json.loads(b).get("reason") == "the task is complete", (s, b[:300]))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.9, "verifier": "pass", "attempt": 2})
+        check("a second outcome for attempt 2 changes nothing (recorded false, the stored quality)", s == 200 and '"recorded":false' in b and '"quality":0.3' in b, (s, b[:300]))
+        pool = l154_listing(GW_L154)
+        cells = [c for c in pool.get("learned_cells", []) if c.get("class") == "bug-fix" and c.get("role") == "worker" and c.get("candidate") == "strong"]
+        check("the strong worker's cell is learned from its outcome: one outcome, its estimate below the prior", len(cells) == 1 and cells[0]["outcomes"] == 1 and cells[0]["delta_hat"] < cells[0]["prior_delta"] - 0.05, cells)
+        bugfix = next((c for c in pool.get("classes_detail", []) if c.get("class") == "bug-fix"), {})
+        check("the class lists what it learned: its two credited outcomes (the reference crew, and the strong worker) and the reference quality", bugfix.get("learned", {}).get("outcomes") == 2 and bugfix["learned"]["reference_quality"] > 0, bugfix.get("learned"))
+        s, _, b = l154_task(GW_L154, "t154-a")
+        t = json.loads(b) if s == 200 else {}
+        atts = {x["attempt"]: x for x in t.get("attempts", [])}
+        check("the task's detail lists both attempts with their crews, outcomes and costs", sorted(atts) == [1, 2] and atts[1]["outcome"]["verifier"] == "fail" and atts[2]["outcome"]["verifier"] == "pass" and atts[2]["crew"][0]["candidate"] == "strong" and atts[1]["cost"] > 0, (s, b[:400]))
+        s, _, b = l154_post(GW_L154, "nope-task", "outcome", {"quality": 0.5})
+        check("an outcome for a task with no assignment is a 404", s == 404, (s, b[:200]))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 1.5})
+        check("a quality above 1 is a 400", s == 400 and "quality" in b, (s, b[:200]))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.5, "verifier": "maybe"})
+        check("a verifier that is neither pass nor fail is a 400", s == 400 and "verifier" in b, (s, b[:200]))
+        s, _, b = l154_post(GW_L154, "t154-a", "outcome", {"quality": 0.5, "attempt": 9})
+        check("an attempt with no record is a 404 that says so", s == 404 and "attempt 9" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/crews/tasks/t154-a/outcome", {"quality": 0.5}, L154_ADMIN, base=GW_L154, auth=False)
+        check("the outcome route needs its pool", s == 400 and "pool" in b, (s, b[:200]))
+        s, _, b = call("GET", f"/api/crews/tasks/t154-a/next?pool={L154_POOL}", None, L154_ADMIN, base=GW_L154, auth=False)
+        check("next takes POST only", s == 405, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+    # budget mode: a completed task whose cost is far above the budget steps the multiplier up by exp(step)
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-b"), ignore_errors=True)
+    cfg_b = os.path.join(BUILD, "e2e.l154b.json")
+    json.dump(l154_config("b", {"mode": "budget", "budget_usd": 0.0001, "step": 0.5}, 3600, L154_DEAR), open(cfg_b, "w"))
+    gb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18261", "-host", "127.0.0.1", "-config", cfg_b, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l154b.log"), "w"))
+    try:
+        wait(GW_L154B + "/health")
+        l154_chat(GW_L154B, "mk-p1", "t154-p1", "worker")
+        lam0 = next((c["lambda"] for c in l154_listing(GW_L154B).get("classes_detail", []) if c.get("class") == "bug-fix"), None)
+        s, _, b = l154_post(GW_L154B, "t154-p1", "outcome", {"quality": 0.8, "verifier": "pass"})
+        check("the completed task is paced", s == 200 and '"completed":true' in b, (s, b[:200]))
+        pool = l154_listing(GW_L154B)
+        pc = pool.get("pacing", {})
+        lam1 = pc.get("lambda")
+        check("a completed task over budget steps the multiplier up by exp(step), and the class plan follows it", lam0 and lam1 and abs(lam1 / lam0 - math.exp(0.5)) < 1e-6 and next(c["lambda"] for c in pool["classes_detail"] if c["class"] == "bug-fix") == lam1, (lam0, pc))
+        check("the pacing shows its mode, one live writer, one completed task and its mean cost", pc.get("mode") == "budget" and pc.get("live_writers") == 1 and pc.get("tasks_completed") == 1 and pc.get("mean_task_cost", 0) > 0, pc)
+    finally:
+        gb.terminate()
+        gb.wait()
+
+    # a one-second ttl: an expired task leaves the state when it is read, and it counts as completed (its cost paced)
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-e"), ignore_errors=True)
+    cfg_e = os.path.join(BUILD, "e2e.l154e.json")
+    json.dump(l154_config("e", {"mode": "lambda", "lambda": 23}, 1, L154_CHEAP), open(cfg_e, "w"))
+    ge = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18262", "-host", "127.0.0.1", "-config", cfg_e, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l154e.log"), "w"))
+    try:
+        wait(GW_L154E + "/health")
+        s, h, b = l154_chat(GW_L154E, "mk-x1", "t154-x1", "worker")
+        check("a task in force has its assignment", s == 200 and {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") in ("cheap", "strong"), (s, b[:200]))
+        time.sleep(2.5)
+        s, _, b = l154_task(GW_L154E, "t154-x1")
+        t = json.loads(b) if s == 200 else {}
+        check("an expired task's assignment is gone from the detail, its calls stay in the log", s == 200 and t.get("assignment") is None and t.get("calls") == 1, (s, b[:300]))
+        check("the expired task counts as completed in the pacing", l154_listing(GW_L154E).get("pacing", {}).get("tasks_completed") == 1, l154_listing(GW_L154E).get("pacing"))
+        s, _, b = l154_post(GW_L154E, "t154-x1", "outcome", {"quality": 0.5})
+        check("an outcome for an expired task is a 404", s == 404, (s, b[:200]))
+    finally:
+        ge.terminate()
+        ge.wait()
+
+GW_L155 = "http://127.0.0.1:18264"  # crew metrics: the L154 pool, one task through an escalation, the assign API, the readers
+GW_L155S = "http://127.0.0.1:18265"  # the same pool with a subscription candidate: the quota gauge and the subscription's h
+
+def metric(text, series):
+    """The value of one series in a /metrics text (its name and labels exactly as rendered), or None when it is absent."""
+    for line in text.split("\n"):
+        if line.startswith(series + " "):
+            return float(line[len(series) + 1:])
+    return None
+
+def l155_metrics(base):
+    s, _, b = call("GET", "/metrics", None, None, base=base, auth=False)
+    return b if s == 200 else ""
+
+def l155_user(base, name, role):
+    """A management user with a built-in or custom role, and its token (the admin creates it)."""
+    s, _, b = call("POST", "/api/users", {"name": name, "role": role}, L154_ADMIN, base=base, auth=False)
+    return json.loads(b).get("token", "") if s in (200, 201) else ""
+
+def l155_as(token):
+    return {"authorization": "Bearer " + token}
+
+def l155_e2e(env):
+    """L155: the crew families on /metrics and the Crews screen's reads and writes by role. One pool (as L154) runs a task
+    that fails its cheap worker, escalates to the strong worker and passes: the counters count one assignment per task,
+    the attempts, the escalation, the outcomes by verifier, the quality sum, the accept and the task's cost, and the class's
+    multiplier is a gauge. The readers: a viewer and a custom role with Crews View read the listing and the task, and a
+    writer-less role gets 403; only the admin (and a custom role with Crews Create) assigns. A pool with a subscription
+    candidate shows its quota gauge and the subscription's h at full quota (0)."""
+    import shutil
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-m"), ignore_errors=True)
+    cfg_path = os.path.join(BUILD, "e2e.l155.json")
+    json.dump(l154_config("m", {"mode": "lambda", "lambda": 23}, 3600, L154_CHEAP), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18264", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l155.log"), "w"))
+    try:
+        wait(GW_L155 + "/health")
+        s, h, b = l154_chat(GW_L155, "mk-m1", "t155-a", "worker")
+        check("the first worker call of t155-a takes the cheap candidate, as attempt 1", s == 200 and {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == "cheap", (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/{L154_POOL}/assign", {"task_id": "t155-b", "class": "other"}, L154_ADMIN, base=GW_L155, auth=False)
+        check("the assign API gives a second task its crew", s == 200 and json.loads(b).get("class") == "other", (s, b[:200]))
+        s, _, b = l154_post(GW_L155, "t155-a", "outcome", {"quality": 0.1, "verifier": "fail", "accuracy": 0.9})
+        check("the failed outcome of attempt 1 is recorded", s == 200 and '"recorded":true' in b, (s, b[:200]))
+        s, _, b = l154_post(GW_L155, "t155-a", "next", {})
+        check("next starts attempt 2 on the strong worker", s == 200 and json.loads(b).get("action") == "attempt", (s, b[:200]))
+        s, h, b = l154_chat(GW_L155, "mk-m2", "t155-a", "worker", attempt=2)
+        check("the attempt-2 call goes to the strong worker", {k.lower(): v for k, v in h.items()}.get("x-raiju-crew-candidate") == "strong", (s, b[:200]))
+        s, _, b = l154_post(GW_L155, "t155-a", "outcome", {"quality": 0.3, "verifier": "pass", "attempt": 2})
+        check("the pass completes t155-a", s == 200 and '"completed":true' in b, (s, b[:200]))
+        s, _, b = l154_post(GW_L155, "t155-a", "next", {})
+        check("next accepts the completed task", s == 200 and json.loads(b).get("action") == "accept", (s, b[:200]))
+
+        text = l155_metrics(GW_L155)
+        check("assignments count one task per class, by the routing call and by the assign API",
+              metric(text, 'raiju_crew_assignments_total{pool="codeaf",class="bug-fix"}') == 1 and metric(text, 'raiju_crew_assignments_total{pool="codeaf",class="other"}') == 1, text[:300])
+        check("calls count each role's candidate: the cheap worker's call and the strong worker's",
+              metric(text, 'raiju_crew_calls_total{pool="codeaf",role="worker",candidate="cheap"}') == 1 and metric(text, 'raiju_crew_calls_total{pool="codeaf",role="worker",candidate="strong"}') == 1)
+        check("attempts count the first attempt and the one next opened; escalations count the latter", metric(text, 'raiju_crew_attempts_total{pool="codeaf",class="bug-fix"}') == 2 and metric(text, 'raiju_crew_escalations_total{pool="codeaf",class="bug-fix"}') == 1)
+        check("outcomes count by verifier, and the quality histogram keeps the count and the sum of the qualities",
+              metric(text, 'raiju_crew_outcomes_total{pool="codeaf",class="bug-fix",verifier="fail"}') == 1 and metric(text, 'raiju_crew_outcomes_total{pool="codeaf",class="bug-fix",verifier="pass"}') == 1
+              and metric(text, 'raiju_crew_outcome_quality_count{pool="codeaf",class="bug-fix"}') == 2 and abs((metric(text, 'raiju_crew_outcome_quality_sum{pool="codeaf",class="bug-fix"}') or 0) - 0.4) < 1e-9
+              and metric(text, 'raiju_crew_outcome_quality_bucket{pool="codeaf",class="bug-fix",le="0.1"}') == 1, text[-400:])
+        check("accepts count the tasks next completed", metric(text, 'raiju_crew_accepts_total{pool="codeaf",class="bug-fix"}') == 1)
+        check("the task cost histogram takes each completed task once", metric(text, 'raiju_crew_task_cost_usd_count{pool="codeaf"}') == 1 and (metric(text, 'raiju_crew_task_cost_usd_sum{pool="codeaf"}') or 0) > 0)
+        check("the class multiplier is a gauge: lambda 23 as configured", metric(text, 'raiju_crew_lambda{pool="codeaf",class="bug-fix"}') == 23)
+        check("the families carry their TYPE lines", "# TYPE raiju_crew_outcome_quality histogram\n" in text and "# TYPE raiju_crew_calls_total counter\n" in text and "# TYPE raiju_crew_lambda gauge\n" in text)
+
+        viewer = l155_user(GW_L155, "l155-viewer", "viewer")
+        editor = l155_user(GW_L155, "l155-editor", "editor")
+        s, _, _ = call("POST", "/api/roles", {"name": "l155-reader", "permissions": [{"resource": "Crews", "operation": "View"}]}, L154_ADMIN, base=GW_L155, auth=False)
+        reader = l155_user(GW_L155, "l155-reader-user", "l155-reader") if s in (200, 201) else ""
+        s, _, _ = call("POST", "/api/roles", {"name": "l155-keys", "permissions": [{"resource": "VirtualKeys", "operation": "View"}]}, L154_ADMIN, base=GW_L155, auth=False)
+        keys = l155_user(GW_L155, "l155-keys-user", "l155-keys") if s in (200, 201) else ""
+        check("the readers and the writer-less roles exist", bool(viewer) and bool(editor) and bool(reader) and bool(keys))
+        s, _, b = call("GET", "/api/crews", None, l155_as(viewer), base=GW_L155, auth=False)
+        check("a viewer reads the crews listing", s == 200 and len(json.loads(b).get("pools", [])) == 1, (s, b[:200]))
+        s, _, b = call("GET", f"/api/crews/tasks/t155-a?pool={L154_POOL}", None, l155_as(viewer), base=GW_L155, auth=False)
+        check("a viewer reads a task's detail", s == 200 and json.loads(b).get("attempts", [])[0]["attempt"] == 1, (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/{L154_POOL}/assign", {"task_id": "t155-c"}, l155_as(viewer), base=GW_L155, auth=False)
+        check("a viewer cannot assign a task", s == 403, (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/tasks/t155-a/outcome?pool={L154_POOL}", {"quality": 0.5}, l155_as(viewer), base=GW_L155, auth=False)
+        check("a viewer cannot record an outcome", s == 403, (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/tasks/t155-a/next?pool={L154_POOL}", None, l155_as(editor), base=GW_L155, auth=False)
+        check("an editor cannot ask for the next step", s == 403, (s, b[:200]))
+        s, _, b = call("GET", "/api/crews", None, l155_as(editor), base=GW_L155, auth=False)
+        check("an editor reads the crews listing", s == 200, (s, b[:200]))
+        s, _, b = call("GET", "/api/crews", None, l155_as(reader), base=GW_L155, auth=False)
+        check("a custom role with Crews View reads the listing", s == 200, (s, b[:200]))
+        s, _, b = call("POST", f"/api/crews/{L154_POOL}/assign", {"task_id": "t155-c"}, l155_as(reader), base=GW_L155, auth=False)
+        check("a custom role with only Crews View cannot assign", s == 403, (s, b[:200]))
+        s, _, b = call("GET", "/api/crews", None, l155_as(keys), base=GW_L155, auth=False)
+        check("a custom role without Crews View is refused the listing", s == 403, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+    # a pool with a subscription candidate: its quota fraction is a gauge, and its h is 0 at a full quota
+    shutil.rmtree(os.path.join(BUILD, "e2e-l154-logs-s"), ignore_errors=True)
+    cfg_s = os.path.join(BUILD, "e2e.l155s.json")
+    conf = l154_config("s", {"mode": "lambda", "lambda": 23}, 3600, L154_CHEAP)
+    pool = conf["crews"]["pools"][0]
+    pool["subscriptions"] = [{"name": "team", "window_hours": 5, "limit_usd": 50, "free_until_fraction": 0.2}]
+    pool["candidates"][1]["route"] = "subscription"
+    pool["candidates"][1]["subscription"] = "team"
+    json.dump(conf, open(cfg_s, "w"))
+    gs = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18265", "-host", "127.0.0.1", "-config", cfg_s, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l155s.log"), "w"))
+    try:
+        wait(GW_L155S + "/health")
+        s, h, b = l154_chat(GW_L155S, "mk-s1", "t155-s", "worker")
+        check("a call with a subscription candidate is served", s == 200, (s, b[:200]))
+        text = l155_metrics(GW_L155S)
+        check("the subscription's quota fraction is a gauge, full before any spend", metric(text, 'raiju_crew_subscription_phi{pool="codeaf",subscription="team"}') == 1, text[-300:])
+        s, _, b = call("GET", "/api/crews", None, L154_ADMIN, base=GW_L155S, auth=False)
+        subs = json.loads(b)["pools"][0]["subscriptions"] if s == 200 else []
+        check("the listing gives the same subscription with its h(phi) of 0", len(subs) == 1 and subs[0]["phi"] == 1 and subs[0]["h"] == 0, subs)
+    finally:
+        gs.terminate()
+        gs.wait()
 
 def main():
     unique_ports()
@@ -10086,6 +11439,10 @@ def main():
         l134b_e2e(env)
         # L138: A2A push state shared by the workers of a node, exactly-once relay across workers: their own gateway
         l138_e2e(env)
+        # L148: A2A over gRPC: the lf.a2a.v1 listener, the agent named by the authority, the key from the metadata, the eleven methods (go client): their own gateway
+        l148_e2e(env)
+        # L148 with two bun workers: the listener opened by one of them, the cards in both
+        l148w_e2e(env)
         # MCP code mode: the meta-tools in chat requests, stubs and docs, programs over the MCP tools, the key gates on nested calls and the limits: their own gateways
         l117_e2e(env)
         # management API keys: a value shown once, a key's own permissions, the ceiling on grants, expiry, deletion and a restart: their own gateway
@@ -10096,6 +11453,15 @@ def main():
         l133_e2e(env)
         # the token_exchange admin credential renewed with its refresh token (scheduled and after a 401), and needs_reauth once refused: its own gateway
         l140_e2e(env)
+        # L147: the token_exchange admin credential renewed once across two workers, and once across two cluster nodes (sealed through the cluster state)
+        l147_workers_e2e(env)
+        l147_cluster_e2e(env)
+        # audio billing: speech by its characters, transcriptions and translations by their usage, the log rows and the budgets: their own gateway
+        l144_e2e(env)
+        # L149: push configs shared across the cluster (a callback registered on one node is answered and relayed by another), and
+        # a card fetched by one worker served by both, fetched once per period: their own gateways
+        l149_cluster_e2e(env)
+        l149_workers_e2e(env)
         # WebAssembly plugins (a .wasm path in plugins[]): rewrites, short circuits, traps, limits and the plugin API: their own gateway
         l121_e2e(env)
         # the plugin chain as Bifrost runs it: HTTP transport hooks, the LLM hooks on every request type and on streams, has_error: their own gateway
@@ -10112,6 +11478,16 @@ def main():
         l129_e2e(env)
         # large_payload_optimization for providers whose format differs: converted while the body streams in: their own gateways
         l136_e2e(env)
+        # large_payload_optimization for Responses requests to providers whose format differs: converted as they stream: their own gateways
+        l145_e2e(env)
+        # large_payload_optimization for Messages to OpenAI-format, Gemini and Cohere, and embeddings to Gemini (L146): their own gateways
+        l146_e2e(env)
+        # L153: crew routing (crew/<pool> models, the task headers, the assign API, the task detail): its own gateways
+        l153_e2e(env)
+        # L154: crew outcomes, learning, budget pacing and the sequential layer: its own gateways
+        l154_e2e(env)
+        # L155: the crew metrics on /metrics and the Crews screen's reads and writes by role: its own gateways
+        l155_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

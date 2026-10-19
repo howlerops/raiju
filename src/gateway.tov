@@ -9,7 +9,7 @@ import { CohereToOpenAI } from "./streams_cohere"
 import { CohereStream } from "./cohere_in"
 import { GenAIStream } from "./genai_in"
 import { ConverseStream, InvokeStream } from "./bedrock_in"
-import { StreamState } from "./providers/anthropic_in"
+import { StreamState, toMessage } from "./providers/anthropic_in"
 import { AffinityStore, resolveSticky, sessionId, sessionTtl, affinityMode } from "./affinity"
 import { Tier, tierTarget, overrideTier } from "./complexity"
 import * as cplx from "./complexity"
@@ -28,14 +28,16 @@ import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream
 import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, RS } from "./providers/types"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
-import { ResponsesToChatStream } from "./responses"
+import { ResponsesToChatStream, toResponse, toResponseStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias } from "./router"
+import { CrewPick, crewRoute, withReasoningEffort, reasoningEffortText } from "./crew"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import * as anthropicBeta from "./anthropic_beta"
 import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
 import { errorParts, classifyFailure, holdsKey } from "./refusal"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
-import { Pricing, PriceRow } from "./pricing"
+import { Pricing, PriceRow, CostParts, SttUsage } from "./pricing"
+import { MediaRoute, MediaBill, handleMedia, transcriptionUsage, billedMedia } from "./media"
 import { SocketGate } from "./ws"
 import { ResponseCache, CacheOrigin, cacheKey, keyScope, parseTtl } from "./cache"
 import { appOf } from "./logapi"
@@ -56,8 +58,9 @@ import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
 import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches, adminRowOf } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
-import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewDue, nextRenewal, needsReverify, RENEW_RETRY_MS } from "./tokenexchange"
+import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewAt, needsReverify, RENEW_RETRY_MS, ADMIN_TAKEOVER_MS, ADMIN_WAIT_MS, ADMIN_POLL_MS } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
+import { FileLease, FILE_LEASE_MS } from "./filelease"
 import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, consentLink, startUserFlow, refreshUserRow } from "./mcpuser"
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
@@ -575,6 +578,8 @@ function routeOf(op: string): string {
 function takesBodyAsIs(route: string, kind: string): bool {
   if (route === "responses") return kind === "openai"
   if (route === "messages") return kind === "anthropic"
+  // (Cloudflare and Databricks take the OpenAI embeddings body under their own URLs)
+  if (route === "embeddings") return providers.streamsNatively(kind) || kind === "cloudflare" || kind === "databricks"
   return providers.streamsNatively(kind)
 }
 
@@ -589,6 +594,8 @@ test("a large body goes as it is only to a provider that takes its route's forma
   expect(takesBodyAsIs("messages", "anthropic")).toBe(true)
   expect(takesBodyAsIs("messages", "bedrock")).toBe(false)
   expect(takesBodyAsIs("messages", "openai")).toBe(false)
+  expect(takesBodyAsIs("embeddings", "cloudflare")).toBe(true)
+  expect(takesBodyAsIs("embeddings", "cohere")).toBe(false)
 })
 
 function requestType(op: string, streamed: bool): string {
@@ -1036,6 +1043,8 @@ class ReqCtx {
   promptId = ""
   promptName = ""
   promptVersion: int | undefined = undefined
+  // the crew routing of a crew/<pool> call (crew.tov): empty when the call names a model directly
+  crew: CrewPick | undefined = undefined
   app = ""
   maximIds: Record<string, string> | undefined = undefined
   maximTags: Record<string, string> | undefined = undefined
@@ -1193,12 +1202,18 @@ export class Engine {
   idp: IdpEndpoints = new IdpEndpoints()
   exchanges: ExchangeCache = new ExchangeCache()
   // their retained admin credentials: saved after a renewal (the server writes them to the config file), the
-  // timer of the next renewal, the retry time of a renewal that failed for a passing reason, and the renewals
-  // in flight
+  // timer of the next renewal, and the retry time of a renewal that failed for a passing reason. The renewal of a
+  // credential runs under adminLease, shared by the workers of a node (main.tov sets it; one process when unset).
+  // The hooks main.tov sets: adminOwns (whether this node owns a client's renewal; every node when unset),
+  // adminStored (the credential the config file holds for a client, read for the workers and nodes that renewed it
+  // elsewhere) and adminPublish (sends a renewed credential to the other nodes, sealed; see clusterstate.tov).
   adminSaved: ((r: McpUserToken) => void) | undefined = undefined
+  adminLease: FileLease = new FileLease("", FILE_LEASE_MS)
+  adminOwns: ((client: string) => bool) | undefined = undefined
+  adminStored: ((client: string) => McpUserToken | undefined) | undefined = undefined
+  adminPublish: ((r: McpUserToken) => void) | undefined = undefined
   private adminTimer: int = -1
   private adminRetry: Map<string, f64> = new Map()
-  private adminBusy: string[] = []
   guard: GuardConfig | undefined = undefined
   rules: RuleSet | undefined = undefined
   logStore: LogStore | undefined = undefined
@@ -2338,41 +2353,154 @@ export class Engine {
     if (f !== undefined) f(row)
   }
 
-  // Renews a token_exchange client's retained admin credential with its refresh token: when it is due, or now
-  // with force (the server answered 401 to it). The renewed credential, or the mark that it needs a new
-  // verification, goes to the running session and is saved. Returns the token to use ("" when there is none).
-  async renewAdminCredential(client: string, force: bool): Promise<string> {
-    const row = adminRowOf(this.cfg.mcp?.exchange_admin, client)
+  // When a retained admin credential is due for renewal, in epoch milliseconds (0: never). A node that does not own
+  // the client's renewal waits ADMIN_TAKEOVER_MS more, so the owner's renewal comes first.
+  adminDueAt(r: McpUserToken): f64 {
+    const at = renewAt(r)
+    if (at <= 0.0) return 0.0
+    const owns = this.adminOwns
+    return owns === undefined || owns(r.mcp_client_name) ? at : at + ADMIN_TAKEOVER_MS
+  }
+
+  // Whether a retained admin credential is due now: its time has come and no retry holds it.
+  private adminDue(r: McpUserToken, nowMs: f64): bool {
+    const at = this.adminDueAt(r)
+    return at > 0.0 && at <= nowMs && (this.adminRetry.get(r.mcp_client_name) ?? 0.0) <= nowMs
+  }
+
+  // The retained admin credential of a client as this process holds it.
+  private adminRowNow(client: string): McpUserToken | undefined {
+    return adminRowOf(this.cfg.mcp?.exchange_admin, client)
+  }
+
+  // Takes the credential the config file holds for a client when it is newer than the one held here: a worker of
+  // this node, or a node, renewed it and saved it.
+  private adoptStored(client: string): void {
+    const read = this.adminStored
+    if (read === undefined) return
+    const stored = read(client)
+    if (stored === undefined) return
+    const cur = this.adminRowNow(client)
+    if (cur !== undefined) {
+      // a marked credential keeps its renewal time, so a mark is a change of its own
+      if (stored.last_refreshed_at < cur.last_refreshed_at) return
+      if (stored.last_refreshed_at === cur.last_refreshed_at && needsReverify(stored) === needsReverify(cur)) return
+    }
+    this.setAdminRow(stored, false)
+  }
+
+  // Puts a credential in place of the one held for its client, in the config in memory and in the running session,
+  // and saves it (adminSaved). publish sends it to the other nodes (a renewal does; a credential from them does not).
+  private setAdminRow(row: McpUserToken, publish: boolean): void {
+    let c = this.cfg
+    if (!tokenExchangeNames(c.mcp?.client_configs).includes(row.mcp_client_name)) return
+    let m = c.mcp ?? {}
+    let next: McpUserToken[] = []
+    let found = false
+    for (const r of m.exchange_admin ?? []) {
+      if (r.mcp_client_name === row.mcp_client_name) {
+        next.push(row)
+        found = true
+      } else {
+        next.push(r)
+      }
+    }
+    if (!found) next.push(row)
+    m.exchange_admin = next
+    c.mcp = m
+    this.cfg = c
+    const live = this.mcp
+    if (live !== undefined) live.setAdmin(row)
+    const f = this.adminSaved
+    if (f !== undefined) f(row)
+    if (publish) {
+      const p = this.adminPublish
+      if (p !== undefined) p(row)
+    }
+    this.scheduleAdminRenewal()
+  }
+
+  // A credential another node renewed or verified arrives through the cluster state (clusterstate.tov, last writer
+  // wins): it takes the place of the one held here, unless that one is the same.
+  adoptRemoteAdmin(row: McpUserToken): void {
+    const cur = this.adminRowNow(row.mcp_client_name)
+    if (cur !== undefined && cur.access_token === row.access_token && cur.refresh_token === row.refresh_token && needsReverify(cur) === needsReverify(row)) return
+    this.setAdminRow(row, false)
+  }
+
+  // Renews a token_exchange client's retained admin credential with its refresh token. used is the access token the
+  // server refused (after a 401), or "" when the renewal is due. A due credential is renewed by its owner node (and by
+  // another once ADMIN_TAKEOVER_MS have passed). Within a node the renewal runs under adminLease: a worker that finds
+  // it held waits for the holder's result, which it reads from the config file, and renews only when that does not
+  // come in ADMIN_WAIT_MS. Returns the token to use ("" when there is none).
+  async renewAdminCredential(client: string, used: string): Promise<string> {
+    const waitUntil = Date.now() + ADMIN_WAIT_MS
+    const name = "mcp-admin:" + client
+    for (;;) {
+      this.adoptStored(client)
+      const row = this.adminRowNow(client)
+      if (row === undefined || needsReverify(row)) return ""
+      const now = Date.now()
+      if (used !== "") {
+        if (row.access_token !== used) return row.access_token
+      } else if (!this.adminDue(row, now)) {
+        return row.access_token
+      }
+      // after a 401 the owner node is given the time to renew first; the others renew once it has had it
+      const owns = this.adminOwns
+      if (used !== "" && owns !== undefined && !owns(client) && now < waitUntil) {
+        await sleep(ADMIN_POLL_MS)
+        continue
+      }
+      const gen = this.adminLease.take(name, now)
+      if (gen < 0) {
+        if (now >= waitUntil) {
+          this.adminRetry.set(client, now + RENEW_RETRY_MS)
+          return ""
+        }
+        await sleep(ADMIN_POLL_MS)
+        continue
+      }
+      try {
+        return await this.renewHeld(client, used)
+      } finally {
+        this.adminLease.release(name, gen)
+      }
+    }
+  }
+
+  // The renewal itself, by the process that holds the lease: the credential as the config file holds it now, the
+  // refresh, the save and the publication to the other nodes.
+  private async renewHeld(client: string, used: string): Promise<string> {
+    this.adoptStored(client)
+    const row = this.adminRowNow(client)
     if (row === undefined || needsReverify(row)) return ""
     const now = Date.now()
-    if (!force && !renewDue(row, this.adminRetry.get(client) ?? 0.0, now)) return row.access_token
-    if (this.adminBusy.includes(client)) return ""
+    if (used !== "") {
+      if (row.access_token !== used) return row.access_token
+    } else if (!this.adminDue(row, now)) {
+      return row.access_token
+    }
     let te: McpTokenExchange | undefined = undefined
     for (const c of this.cfg.mcp?.client_configs ?? []) {
       if (c.name === client && c.auth_type === "token_exchange") te = c.token_exchange
     }
     if (te === undefined) return ""
-    this.adminBusy.push(client)
     const oc = this.cfg.oidc
     const out = await renewAdmin(te, row, this.idp, oc?.issuer ?? "", oc?.client_id ?? "", oc?.client_secret ?? "", now)
-    this.adminBusy = this.adminBusy.filter((n) => n !== client)
     if (!out.changed) {
       this.adminRetry.set(client, Date.now() + RENEW_RETRY_MS)
       console.error(`raiju: mcp ${client}: the admin credential could not be renewed (${out.error}); trying again in ${Math.round(RENEW_RETRY_MS / 1000.0)}s`)
       return ""
     }
+    // a refusal is believed only when nothing newer arrived meanwhile: a refresh token that another process has
+    // already rotated is the one that counts
+    this.adoptStored(client)
+    const latest = this.adminRowNow(client)
+    if (needsReverify(out.row) && latest !== undefined && latest.refresh_token !== row.refresh_token) return needsReverify(latest) ? "" : latest.access_token
     this.adminRetry.delete(client)
     if (needsReverify(out.row)) console.error(`raiju: mcp ${client}: ${out.row.status_reason ?? ""}; verify the client again`)
-    // the config in memory takes the row at once, so the next look does not renew it again before the save lands
-    let c = this.cfg
-    let m = c.mcp ?? {}
-    m.exchange_admin = (m.exchange_admin ?? []).map((r) => (r.mcp_client_name === client ? out.row : r))
-    c.mcp = m
-    this.cfg = c
-    const live = this.mcp
-    if (live !== undefined) live.setAdmin(out.row)
-    const f = this.adminSaved
-    if (f !== undefined) f(out.row)
+    this.setAdminRow(out.row, true)
     return needsReverify(out.row) ? "" : out.row.access_token
   }
 
@@ -2381,9 +2509,18 @@ export class Engine {
   scheduleAdminRenewal(): void {
     if (this.adminTimer >= 0) clearTimeout(this.adminTimer)
     this.adminTimer = -1
-    const at = nextRenewal(this.cfg.mcp?.exchange_admin ?? [], this.adminRetry, tokenExchangeNames(this.cfg.mcp?.client_configs))
-    if (at <= 0.0) return
-    const wait: int = Math.max(0, Math.round(at - Date.now()))
+    const names = tokenExchangeNames(this.cfg.mcp?.client_configs)
+    let best: f64 = 0.0
+    for (const r of this.cfg.mcp?.exchange_admin ?? []) {
+      if (!names.includes(r.mcp_client_name)) continue
+      let at = this.adminDueAt(r)
+      if (at <= 0.0) continue
+      const hold = this.adminRetry.get(r.mcp_client_name) ?? 0.0
+      if (hold > at) at = hold
+      if (best === 0.0 || at < best) best = at
+    }
+    if (best <= 0.0) return
+    const wait: int = Math.max(0, Math.round(best - Date.now()))
     this.adminTimer = setTimeout(() => {
       this.renewDueAdmins()
     }, wait)
@@ -2393,9 +2530,10 @@ export class Engine {
   async renewDueAdmins(): Promise<void> {
     if (this.adminTimer >= 0) clearTimeout(this.adminTimer)
     this.adminTimer = -1
-    const now = Date.now()
+    const names = tokenExchangeNames(this.cfg.mcp?.client_configs)
     for (const r of this.cfg.mcp?.exchange_admin ?? []) {
-      if (renewDue(r, this.adminRetry.get(r.mcp_client_name) ?? 0.0, now)) await this.renewAdminCredential(r.mcp_client_name, false)
+      if (!names.includes(r.mcp_client_name)) continue
+      if (this.adminDue(r, Date.now())) await this.renewAdminCredential(r.mcp_client_name, "")
     }
     this.scheduleAdminRenewal()
   }
@@ -2720,12 +2858,20 @@ export class Engine {
     ctx.userAgent = h.get("user-agent") ?? ""
     ctx.sessionId = sessionId(h) ?? ""
     if (this.logStore !== undefined && (!ctx.contentOff || ctx.hidden)) ctx.input = text
+    // a crew/<pool> model: the task's crew picks the candidate, and the call is served as if that model had been named
+    // (crew.tov); the refusals (missing task or role headers, unknown pool or role) are answered here
+    const named = modelName ?? rawStr(body, "model") ?? ""
+    const pick: CrewPick | undefined = named.startsWith("crew/") ? crewRoute(named, h, text, Date.now(), this.logStore, this.pricing) : undefined
+    if (pick !== undefined && pick.status !== 0) return errorResponse(pick.status, pick.message, pick.status === 404 ? "not_found_error" : "invalid_request_error", noHeaders())
+    if (pick !== undefined) ctx.crew = pick
+    if (pick !== undefined && compat !== undefined) compat.crewEffort = pick.effort
+    const callModel = pick === undefined ? modelName : pick.model
     // bifrost_active_requests: in flight from here until the answer (or the throw) is out
     const method = requestType(op, streamed)
     metrics.activeRequests(method, 1.0)
     let res: Response = new Response(undefined, { status: 500 })
     try {
-      res = try await this.serveInner(req, h, ctx, modelName, body, text, build, translate, streamed, compat)
+      res = try await this.serveInner(req, h, ctx, callModel, body, text, build, translate, streamed, compat)
     } finally {
       metrics.activeRequests(method, -1.0)
     }
@@ -2749,6 +2895,13 @@ export class Engine {
     // Bifrost's tracing middleware echoes the request id as x-request-id too
     out.set("x-request-id", rid)
     out.set("x-bifrost-request-type", requestType(op, streamed))
+    // a crew/<pool> call says which candidate, class and attempt it was routed by (crew.tov)
+    const crew = ctx.crew
+    if (crew !== undefined) {
+      out.set("x-raiju-crew-candidate", crew.candidate)
+      out.set("x-raiju-crew-class", crew.taskClass)
+      out.set("x-raiju-crew-attempt", "" + crew.attempt)
+    }
     const span = ctx.span
     if (span !== undefined) out.set("x-bifrost-trace-id", span.traceId)
     const model = modelName ?? rawStr(body, "model")
@@ -3205,6 +3358,12 @@ export class Engine {
         selected_prompt_id: c.promptId === "" ? undefined : c.promptId,
         selected_prompt_name: c.promptName === "" ? undefined : c.promptName,
         selected_prompt_version: c.promptVersion,
+        task_id: c.crew === undefined ? undefined : c.crew.taskId,
+        crew_pool: c.crew === undefined ? undefined : c.crew.pool,
+        crew_role: c.crew === undefined ? undefined : c.crew.role,
+        crew_class: c.crew === undefined ? undefined : c.crew.taskClass,
+        crew_candidate: c.crew === undefined ? undefined : c.crew.candidate,
+        crew_attempt: c.crew === undefined ? undefined : c.crew.attempt,
         raw_request: c.contentOff || c.rawRequest === "" ? undefined : this.redactRaw(c.rawRequest, false),
         raw_response: c.contentOff || c.rawResponse === "" ? undefined : this.redactRaw(c.rawResponse, true),
         id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
@@ -3322,6 +3481,102 @@ export class Engine {
     c.agentId = cids.agent
     this.record(c)
     this.gov.record(grant, promptTokens + completionTokens, c.cost)
+  }
+
+  // The billing of an audio request (speech, transcription, translation): the gate admits its model under the
+  // caller's key before the upstream call, and the grant it was admitted under takes the charge (mediaAnswer).
+  mediaBill(h: Hdrs): MediaBill {
+    const bill = new MediaBill()
+    const gov = this.gov
+    bill.gate = (provider: string, model: string): Response | undefined => {
+      const a = gov.admit(h, provider, model)
+      if (a.kind === "denial") return errorResponse(a.status, a.message, a.type, noHeaders())
+      bill.grant = a
+      return undefined
+    }
+    return bill
+  }
+
+  // Charges an audio answer as a chat answer is (settle): a log row, the budgets and token limits, and the metrics.
+  // Speech is billed by its input characters, a transcription or translation by the usage its answer reports
+  // (media.tov transcriptionUsage). Only a 200 answer of an admitted request is charged; any other answer is
+  // returned as it is.
+  async mediaAnswer(route: MediaRoute, bill: MediaBill, res: Response, h: Hdrs, started: f64, rid: string): Promise<Response> {
+    const grant = bill.grant
+    if (grant === undefined || res.status !== 200) return res
+    const speech = route.op === "audio.speech"
+    let out = res
+    let usage: SttUsage = { prompt: 0, completion: 0, inputAudio: 0, inputText: 0, seconds: undefined }
+    let parts: CostParts = { input: 0.0, output: 0.0 }
+    if (speech) {
+      // the speech answer is the audio itself: nothing to read, the characters of the request are the usage
+      parts = this.pricing.speechCost(bill.provider, bill.model, bill.chars, 0, 0)
+    } else {
+      try {
+        const bytes = try await res.bytes()
+        // a body that is not text reports no usage
+        let text = ""
+        try {
+          text = new TextDecoder().decode(bytes)
+        } catch (e) {
+          text = ""
+        }
+        usage = transcriptionUsage(text) ?? usage
+        out = new Response(bytes, { status: 200, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } })
+      } catch (e) {
+        return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+      }
+      parts = this.pricing.transcriptionCost(bill.provider, bill.model, usage)
+    }
+    const op = speech ? "speech" : "transcription"
+    const c = parts.input + parts.output
+    const ctx = new ReqCtx(rid, op, started)
+    ctx.provider = bill.provider
+    ctx.model = bill.model
+    ctx.requested = bill.model
+    ctx.status = 200
+    ctx.promptTokens = usage.prompt
+    ctx.completionTokens = usage.completion
+    ctx.cost = c
+    ctx.inputCost = parts.input
+    ctx.outputCost = parts.output
+    ctx.virtualKey = grant.vk?.id ?? ""
+    ctx.userId = grant.vk?.user_id ?? ""
+    const at: Attribution = grant.attr ?? noAttribution()
+    ctx.teamId = at.teamId
+    ctx.customerId = at.customerId
+    ctx.businessUnitId = at.businessUnitId
+    ctx.projectId = at.projectId
+    ctx.userAgent = h.get("user-agent") ?? ""
+    ctx.sessionId = sessionId(h) ?? ""
+    this.record(ctx)
+    this.gov.record(grant, usage.prompt + usage.completion, c)
+    if (grant.budgets.length > 0 && this.pricing.priceFor(bill.provider, bill.model, false) === undefined) {
+      const key = bill.provider + "/" + bill.model
+      if (!this.unpriced.has(key)) {
+        this.unpriced.add(key)
+        console.error(`raiju: no price for ${key}: budgets don't count its requests; add a pricing override`)
+      }
+    }
+    const rl = metrics.newLabels(bill.provider, bill.model, requestType(op, false))
+    const gvk = grant.vk
+    if (gvk !== undefined) {
+      rl.virtualKeyId = gvk.id
+      rl.virtualKeyName = gvk.name ?? ""
+    }
+    metrics.observeUsage(rl, { input: usage.prompt, output: usage.completion, cost: c, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
+    return out
+  }
+
+  // An audio request is billed (mediaBill, mediaAnswer); the other media routes pass through as they did.
+  async media(req: Request, route: MediaRoute): Promise<Response> throws TypeError {
+    if (!billedMedia(route.op)) return try await handleMedia(this.cfg, req, route)
+    const h = snapshot(req.headers)
+    const started = performance.now()
+    const rid = h.get("x-request-id") ?? newId("req_")
+    const bill = this.mediaBill(h)
+    const res = try await handleMedia(this.cfg, req, route, bill)
+    return await this.mediaAnswer(route, bill, res, h, started, rid)
   }
 
   // Sends queued spans to the collector in the background; export failures are logged, never raised.
@@ -3481,13 +3736,16 @@ export class Engine {
     const tiny: Field[] = [{ key: "model", raw: quote(meta.model) }]
     // A chat stream to a converted provider is called as a stream and its events are converted as they arrive (Bedrock's
     // binary event frames are not: its answer is read whole and replayed). A Messages stream passes through.
-    const live = family !== "" && family !== "converse" && route === "chat" && stream
+    // (a Messages stream converted to chat, Gemini or Cohere is converted as it arrives, as a chat stream is)
+    const msgLive = route === "messages" && (family === "messages-chat" || family === "messages-gemini" || family === "messages-cohere")
+    const live = family !== "" && family !== "converse" && stream && (route === "chat" || msgLive)
     const wire = live || (route === "messages" && stream)
     const holder = new ConvRef()
     const autoCache = this.autoPromptCache || hs.get("x-bf-prompt-cache-auto-inject") === "true" || (p?.prompt_cache?.auto_inject ?? false)
     if (family !== "") {
-      // the answer is converted back (a chat answer), or is the provider's own Messages answer (the Messages route)
-      lg.passAnswer = route === "messages"
+      // the answer is converted back (a chat or embeddings answer), or passes as the provider's own Messages answer
+      // (Bedrock and Vertex Claude)
+      lg.passAnswer = family === "messages-bedrock" || family === "messages-vertex"
       if (needsHash(family)) {
         if (this.gov.enforce && this.gov.findKey(hs) === undefined) {
           if (!ended) await src.cancel()
@@ -3519,14 +3777,32 @@ export class Engine {
         return try upstreamFor(family, t, wire, lg.payloadHash)
       }
       if (!takesBodyAsIs(route, t.kind)) throw new SyntaxError(`${t.provider} needs the whole request body in memory, which large_payload_optimization does not allow: a large ${route} request goes only to a provider that takes its format as it is`)
-      const up = route === "embeddings" ? openai.embeddingsRequest(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : route === "responses" ? openai.responsesRequest(t, tiny) : route === "messages" ? anthropicNative.nativeRequest(t, tiny) : openai.chatRequest(t, tiny)
+      const up = route === "embeddings" ? try providers.embeddingsUpstream(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : route === "responses" ? openai.responsesRequest(t, tiny) : route === "messages" ? anthropicNative.nativeRequest(t, tiny) : openai.chatRequest(t, tiny)
       return { url: up.url, headers: up.headers, body: "" }
     }
     // the answer of a request that streams on is a small one here (a big one is passed through): its usage is read from the text
     const translate: Translate = (t, text, requested) => {
-      if (route === "responses" || route === "messages") {
+      if (route === "responses" && family !== "") {
+        // a Responses request converted to chat: its chat answer is converted back as the whole-request path does it
+        const hc = holder.conv
+        const echo = hc === undefined ? "{}" : hc.echo()
+        let o: Translated = { body: "", promptTokens: 0, completionTokens: 0 }
+        if (stream && providers.streamsNatively(t.kind)) o = openai.streamResponse(text, requested)
+        else o = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        if (stream) {
+          const sse = o.body.startsWith("{") ? try completionToSse(o.body, true) : o.body
+          return { body: toResponseStream(sse, meta.model), promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+        }
+        return { body: try toResponse(o.body, meta.model, echo), promptTokens: o.promptTokens, completionTokens: o.completionTokens }
+      }
+      if (route === "responses" || (route === "messages" && lg.passAnswer)) {
         const u = usageOfText(text)
         return { body: text, promptTokens: u.promptTokens, completionTokens: u.completionTokens }
+      }
+      if (route === "messages") {
+        // a provider's chat answer, in Messages format (a stream is converted as it arrives, in largeLive)
+        const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        return { body: try toMessage(tr.body, meta.model), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
       if (route === "embeddings") return try providers.embeddingsTranslate(t.kind, t.model, text, requested)
       if (route === "completions") return try openai.chatResponse(text, requested)
@@ -3592,7 +3868,10 @@ export class Engine {
     const mk: ConverterFactory = (t, requested) => {
       if (!streamable(t)) return undefined
       const hc = holder.conv
-      const conv = new StreamConverter(converterKind(t), requested, hc !== undefined && hc.wantsUsage())
+      // a Messages stream is answered as Messages events (with usage, as the whole-body route asks the provider for it)
+      const messages = op === "anthropic.messages"
+      const conv = new StreamConverter(converterKind(t), requested, messages || (hc !== undefined && hc.wantsUsage()))
+      if (messages) conv.asAnthropic(rawStr(modelBody, "model") ?? "")
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return conv
     }
@@ -3825,8 +4104,11 @@ export class Engine {
       return try providers.chatUpstream(t, try tc.get(), try this.withInjected(t, b), autoFor(t))
     }
     const build: Build = (t) => {
-      const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      // a routed crew/<pool> candidate's reasoning effort goes on the body (crew.tov)
+      const eff = cp.crewEffort
+      const sh = try cp.shape(t.provider, t.kind, t.model, eff === "" ? body : withReasoningEffort(body, eff))
       if (sh.route === "responses") return openai.responsesRequest(t, streamedBody(sh.body, canPipe))
+      if (eff !== "" && !sh.changed) return try sendChat(t, sh.body, new LazyChat(reasoningEffortText(body, eff)))
       return try sendChat(t, sh.body, sh.changed ? new LazyChat(sh.text) : typed)
     }
     const outGuard = this.guardOutput ? guard : undefined

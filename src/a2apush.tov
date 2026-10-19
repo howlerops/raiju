@@ -20,6 +20,7 @@ import { isPrivateHost, isMetadataHost } from "./netguard"
 import { deadline } from "./deadline"
 import { pushEventTaskId } from "./a2a"
 import { isoMs } from "./exports"
+import { FileLease } from "./filelease"
 
 export const INGRESS_SUFFIX = "/push/callback"
 export const TOKEN_HEADER = "a2a-notification-token"
@@ -85,6 +86,11 @@ function newestFirst(a: PushConfig, b: PushConfig): int {
   return order(a.id, b.id)
 }
 
+// The key a config travels under on the cluster state (a2ashare.tov): its agent, task and config id as a JSON array.
+export function pushKey(agent: string, task: string, id: string): string {
+  return JSON.stringify([agent, task, id])
+}
+
 // The file a config is kept in, and the file a queued push is kept in (its id is a hex digest).
 function configFile(agent: string, task: string, id: string): string {
   return "c-" + toHex(sha256(utf8(agent + "\u0000" + task + "\u0000" + id))) + ".json"
@@ -100,20 +106,27 @@ function deliveryFile(id: string): string {
 // different items never lose each other's writes. Two processes changing the same item is last writer wins, as with
 // any PUT. A file that cannot be parsed (it is being written) keeps the copy already in memory.
 //
-// A queued push is relayed by one process at a time: claim takes a lease on it (a directory made with mkdir, which
-// only one process can make), the holder sends and writes the outcome, and release gives the lease up. A lease whose
-// holder died is taken over after leaseMs, as a new generation, so there is still one owner.
+// A queued push is relayed by one process at a time: claim takes a lease on it (a FileLease in the directory, see
+// filelease.tov), the holder sends and writes the outcome, and release gives the lease up. A lease whose holder died
+// is taken over after leaseMs, as a new generation, so there is still one owner.
 export class PushStore {
   configs: PushConfig[] = []
   deliveries: PushDelivery[] = []
   dir = ""
   made = false
   leaseMs = LEASE_MS
+  // the leases on queued pushes, in the directory (none without one)
+  lease: FileLease = new FileLease("", LEASE_MS)
   // deliveries this instance holds a lease on: id to the lease generation
   held: Map<string, int> = new Map()
   // seals and opens the secrets kept in the files (identity when there is no key)
   seal: (v: string) => string = (v: string): string => v
   open: (v: string) => string = (v: string): string => v
+  // opens a sealed secret, undefined when it cannot be opened here (the cluster state applies no such config)
+  openSecret: (v: string) => string | undefined = (v: string): string | undefined => v
+  // told of each config this process writes or removes (the cluster state takes them up, a2ashare.tov); not of the
+  // ones it reads from the directory
+  changed: ((c: PushConfig, gone: bool) => void) | undefined = undefined
 
   // Keeps the items in a directory (named like the old single file, without its .jsonl) and reads what is there. A
   // single-file store left by an earlier version is moved in once.
@@ -130,6 +143,7 @@ export class PushStore {
     const memD = this.deliveries
     this.dir = dir
     this.made = false
+    this.lease = new FileLease(dir, this.leaseMs)
     for (const c of mem) {
       if (!existsSync(dir + "/" + configFile(c.agent, c.task, c.id))) this.writeConfig(c)
     }
@@ -183,6 +197,12 @@ export class PushStore {
     } catch (e) {
       return undefined
     }
+  }
+
+  // Tells the changed hook of a write (gone for a removal).
+  private note(c: PushConfig, gone: bool): void {
+    const f = this.changed
+    if (f !== undefined) f(c, gone)
   }
 
   // Makes the directory (once) before a write.
@@ -291,6 +311,7 @@ export class PushStore {
       this.configs.push(c)
     }
     this.writeConfig(next)
+    this.note(next, false)
   }
 
   config(agent: string, task: string, id: string): PushConfig | undefined {
@@ -317,8 +338,10 @@ export class PushStore {
     this.sync()
     const i = this.indexOfConfig(agent, task, id)
     if (i < 0) return false
+    const old = this.configs[i]!
     this.configs = this.configs.filter((c) => !(c.agent === agent && c.task === task && c.id === id))
     this.dropFile(configFile(agent, task, id))
+    this.note(old, true)
     return true
   }
 
@@ -328,7 +351,10 @@ export class PushStore {
     const gone = this.configs.filter((c) => c.agent === agent && c.ingress === hash && c.task === pendingTask)
     if (gone.length === 0) return false
     this.configs = this.configs.filter((c) => !(c.agent === agent && c.ingress === hash && c.task === pendingTask))
-    for (const c of gone) this.dropFile(configFile(c.agent, c.task, c.id))
+    for (const c of gone) {
+      this.dropFile(configFile(c.agent, c.task, c.id))
+      this.note(c, true)
+    }
     return true
   }
 
@@ -349,6 +375,8 @@ export class PushStore {
         this.configs[i] = moved
         this.writeConfig(moved)
         this.dropFile(configFile(c.agent, c.task, c.id))
+        this.note(c, true)
+        this.note(moved, false)
       }
     }
   }
@@ -410,10 +438,6 @@ export class PushStore {
     this.writeDelivery(d)
   }
 
-  leasePath(id: string, gen: int): string {
-    return this.dir + "/l-" + id + "-" + gen
-  }
-
   // Takes the lease on a queued push so that this process alone sends it. The delivery is read again once the lease
   // is held, so a push another process just finished (and released) is not sent twice. undefined when the push is not
   // due, is finished, or another process holds the lease.
@@ -425,29 +449,11 @@ export class PushStore {
       this.held.set(id, 0)
       return m
     }
-    let gen = 0
-    let last = -1
-    while (existsSync(this.leasePath(id, gen))) {
-      last = gen
-      gen += 1
-    }
-    if (last >= 0) {
-      let age = 0
-      try {
-        age = now - Math.floor(statSync(this.leasePath(id, last)).mtimeMs)
-      } catch (e) {
-        return undefined
-      }
-      if (age <= this.leaseMs) return undefined
-    }
-    try {
-      mkdirSync(this.leasePath(id, gen))
-    } catch (e) {
-      return undefined
-    }
+    const gen = this.lease.take(id, now * 1.0)
+    if (gen < 0) return undefined
     const fresh = this.readDelivery(deliveryFile(id))
     if (fresh === undefined || fresh.status !== "pending" || fresh.next_at > now) {
-      this.dropLease(id, gen)
+      this.lease.release(id, gen)
       return undefined
     }
     this.held.set(id, gen)
@@ -458,18 +464,7 @@ export class PushStore {
   holds(id: string): bool {
     const gen = this.held.get(id)
     if (gen === undefined) return false
-    return this.dir === "" || !existsSync(this.leasePath(id, gen + 1))
-  }
-
-  // Removes a lease and the older ones it replaced.
-  dropLease(id: string, gen: int): void {
-    for (let g = 0; g <= gen; g++) {
-      try {
-        rmSync(this.leasePath(id, g), { recursive: true, force: true })
-      } catch (e) {
-        continue
-      }
-    }
+    return this.lease.holds(id, gen)
   }
 
   // Gives the lease up (after the outcome is written). A holder that was overtaken leaves the new holder's lease alone.
@@ -477,9 +472,7 @@ export class PushStore {
     const gen = this.held.get(id)
     if (gen === undefined) return
     this.held.delete(id)
-    if (this.dir === "") return
-    if (existsSync(this.leasePath(id, gen + 1))) return
-    this.dropLease(id, gen)
+    this.lease.release(id, gen)
   }
 
   // Drops finished deliveries after a week, embedded configs no push ever bound after an hour, and the
@@ -492,6 +485,8 @@ export class PushStore {
     if (goneC.length > 0) this.configs = this.configs.filter((c) => agents.includes(c.agent) && !(c.task.startsWith(PENDING_PREFIX) && now - c.created_at > PENDING_TTL_MS))
     for (const d of goneD) this.dropFile(deliveryFile(d.id))
     for (const c of goneC) this.dropFile(configFile(c.agent, c.task, c.id))
+    // the cluster state learns of the drops too, or it would send them back
+    for (const c of goneC) this.note(c, true)
     if (this.dir === "") return
     try {
       for (const f of readdirSync(this.dir)) {

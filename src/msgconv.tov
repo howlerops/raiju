@@ -1,0 +1,758 @@
+// Streaming conversion of a large Anthropic Messages request to an OpenAI chat request (large_payload_optimization):
+// the body is read token by token (jsonstream.tov) and the chat body is written as it goes, so a message with a
+// large image or text reaches the provider without being held. The chat body is the one anthropic_in's
+// toChatRequest writes for the same request: a message is written as convertMessage writes it, and the parameters
+// come from chatParams.
+//
+// What is held: the parameters (chatParams' fields), a system prompt that is an array of blocks, a tool call's
+// input, and any message or block whose large string cannot stream yet (up to holdMax). What flows through: text,
+// image data and tool result text, as the raw JSON string bytes the caller sent (the escapes are kept; the JSON
+// means the same).
+//
+// A string streams when the keys in front of it are known: "role" before "content" in a message; "type" before
+// "text" in a text block; "type", "source", then "type" and "media_type" before "data" (or "type" before "url") in
+// an image block; "tool_use_id" before "content" in a tool result. Other blocks and messages are held whole.
+//
+// The messages are written where the body has them. A system prompt written before "messages" comes first in
+// the output, as in the whole-body conversion; one written after the messages stays where it stands.
+import { Field, fields, elements, find, quote, rawStr, decodeString } from "./json"
+import { JsonTokenizer, ByteOut, Compact, Tok, bytesOf, textOfBytes, T_OBJ, T_OBJ_END, T_ARR, T_ARR_END, T_KEY, T_STR, T_STRH, T_STRP, T_STRE, T_LIT } from "./jsonstream"
+import { contentText, convertMessage, blockOf, chatParams, toChatRequest } from "./providers/anthropic_in"
+import { ChatConv, ConvOpts, TailFn, F_GEMINI, F_COHERE } from "./streamconv"
+import { ChatRequest } from "./schemas"
+import { Target } from "./providers/types"
+import * as gemini from "./providers/gemini"
+import * as cohere from "./providers/cohere"
+
+// the request object's keys (the top level)
+const TS_START = 0
+const TS_KEYS = 1
+const TS_VALUE = 2
+const TS_MSGS = 3
+const TS_DONE = 4
+
+// a message's keys and values
+const MS_KEY = 0
+const MS_ROLE = 1
+const MS_CONTENT = 2
+const MS_SKIP = 3
+const MS_BLOCKS = 4
+
+// the top-level fields a chat body takes from a Messages body (chatParams)
+const KEPT = ["max_tokens", "temperature", "top_p", "stop_sequences", "stream", "tools", "tool_choice", "metadata"]
+
+// A raw JSON string (the bytes between the quotes, escapes in) as text. The tokenizer has checked the escapes, so
+// a string that does not decode is read as it is.
+function rawText(raw: u8[]): string {
+  const s = textOfBytes(raw)
+  if (s.indexOf("\\") < 0) return s
+  try {
+    return decodeString("\"" + s + "\"")
+  } catch (e) {
+    return s
+  }
+}
+
+// A text as the inside of a JSON string literal (its quotes left out, so more pieces can follow).
+function innerQuote(s: string): string {
+  const q = quote(s)
+  return q.slice(1, q.byteLength - 1)
+}
+
+export class MsgToChat {
+  private tk: JsonTokenizer
+  private out: ByteOut = new ByteOut()
+  // the top level
+  private ts = TS_START
+  private curKey = ""
+  private vstart = false
+  private vd = 0
+  private vlong = false
+  private keep = false
+  private sysValue = false
+  private sysStream = false
+  private sawMessages = false
+  private sawSystem = false
+  private vout: ByteOut
+  private vcomp: Compact
+  private top: Field[] = []
+  // the chat messages written so far (for the separators)
+  private items = 0
+  // the message being read
+  private inMsg = false
+  private ms = MS_KEY
+  private md = 0
+  private role = ""
+  private hasRole = false
+  private hold = false
+  private recOn = false
+  private mrec: ByteOut
+  private mcomp: Compact
+  private cstr = false
+  // the chat message being written: its header is out once a part or a tool call needs it
+  private open = false
+  private partsOpen = false
+  private parts = 0
+  private calls: string[] = []
+  // the content block being read
+  private inBlock = false
+  private bStreamed = false
+  private brec: ByteOut
+  private bcomp: Compact
+  private btype = ""
+  private tid = ""
+  private tidOk = false
+  private pkey = ""
+  private pdepth = 0
+  private bval = false
+  private inSource = false
+  private stype = ""
+  private mtype = ""
+  private mtOk = false
+  // a streamed string: 1 text part, 2 image data, 3 image url, 4 tool result content
+  private stream = 0
+
+  // the output starts with the model and the opening of the messages array, which the rest is written into
+  constructor(readonly model: string, readonly holdMax: int, strMax: int) {
+    this.tk = new JsonTokenizer(strMax, 65536)
+    this.vout = new ByteOut()
+    this.vcomp = new Compact(this.vout)
+    this.mrec = new ByteOut()
+    this.mcomp = new Compact(this.mrec)
+    this.brec = new ByteOut()
+    this.bcomp = new Compact(this.brec)
+    this.out.text(`{"model":${quote(model)},"messages":[`)
+  }
+
+  // Reads the next bytes of the request; the chat bytes they complete.
+  push(b: u8[]): u8[][] throws SyntaxError {
+    for (const t of try this.tk.push(b)) try this.tok(t)
+    return this.out.take()
+  }
+
+  // The end of the request; the rest of the chat body.
+  finish(): u8[][] throws SyntaxError {
+    for (const t of try this.tk.finish()) try this.tok(t)
+    if (this.ts !== TS_DONE) throw new SyntaxError("the request body must be a JSON object")
+    this.closeMsg()
+    this.out.byte(93)
+    for (const p of try chatParams(this.top)) {
+      this.out.byte(44)
+      this.out.text(p)
+    }
+    this.out.byte(125)
+    return this.out.take()
+  }
+
+  private tok(t: Tok): void throws SyntaxError {
+    if (this.ts === TS_MSGS) {
+      if (this.inMsg) {
+        try this.msgTok(t)
+      } else if (t.kind === T_OBJ) {
+        this.startMessage(t)
+      } else if (t.kind === T_ARR_END) {
+        this.ts = TS_KEYS
+      } else {
+        throw new SyntaxError("each message must be an object")
+      }
+      return
+    }
+    try this.topTok(t)
+  }
+
+  // ---- the request object ----
+
+  private topTok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (this.ts === TS_START) {
+      if (k !== T_OBJ) throw new SyntaxError("the request body must be a JSON object")
+      this.ts = TS_KEYS
+    } else if (this.ts === TS_KEYS) {
+      if (k === T_KEY) {
+        this.curKey = rawText(t.raw)
+        this.ts = TS_VALUE
+        this.vstart = true
+        this.vd = 0
+        this.vlong = false
+        this.keep = false
+        this.vout = new ByteOut()
+        this.vcomp = new Compact(this.vout)
+      } else if (k === T_OBJ_END) {
+        this.ts = TS_DONE
+      } else {
+        throw new SyntaxError("the request body must be a JSON object")
+      }
+    } else if (this.ts === TS_VALUE) {
+      try this.valueTok(t)
+    }
+  }
+
+  // A top-level value: messages open the list, a system prompt streams when it is a string, a parameter is kept
+  // whole, and anything else is skipped.
+  private valueTok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (this.vstart) {
+      this.vstart = false
+      if (this.curKey === "messages") {
+        if (k === T_ARR && !this.sawMessages) {
+          this.sawMessages = true
+          this.ts = TS_MSGS
+          return
+        }
+        if (k === T_LIT && rawText(t.raw) === "null") {
+          this.ts = TS_KEYS
+          return
+        }
+        throw new SyntaxError("messages must be an array")
+      }
+      // a second system prompt is ignored, as the first one is the one the whole-body conversion reads
+      this.sysValue = this.curKey === "system" && !this.sawSystem
+      if (this.sysValue) this.sawSystem = true
+      if (this.sysValue && k === T_STR) {
+        if (t.raw.length > 0) {
+          this.sep()
+          this.out.text(`{"role":"system","content":"`)
+          this.out.bytes(t.raw)
+          this.out.text(`"}`)
+        }
+        this.ts = TS_KEYS
+        this.sysValue = false
+        return
+      }
+      if (this.sysValue && k === T_STRH) {
+        this.sep()
+        this.out.text(`{"role":"system","content":"`)
+        this.out.bytes(t.raw)
+        this.sysStream = true
+        return
+      }
+      this.keep = this.sysValue ? k === T_ARR : KEPT.includes(this.curKey)
+    }
+    if (this.sysStream) {
+      if (k === T_STRP) {
+        this.out.bytes(t.raw)
+      } else if (k === T_STRE) {
+        this.out.text(`"}`)
+        this.sysStream = false
+        this.sysValue = false
+        this.ts = TS_KEYS
+      }
+      return
+    }
+    if (this.keep) {
+      this.vcomp.tok(t)
+      if (this.vout.size > this.holdMax) throw new SyntaxError(`the request field ${this.curKey} is too large to convert while streaming (client.max_request_body_size_mb)`)
+    }
+    if (k === T_STRH) this.vlong = true
+    else if (k === T_STRE) this.vlong = false
+    if (k === T_OBJ || k === T_ARR) this.vd += 1
+    else if (k === T_OBJ_END || k === T_ARR_END) this.vd -= 1
+    if (this.vd === 0 && !this.vlong) {
+      if (this.sysValue) {
+        // a system array: its text blocks joined, as contentText joins them
+        if (this.keep) {
+          const text = try contentText(textOfBytes(this.vout.all()))
+          if (text !== "") {
+            this.sep()
+            this.out.text(`{"role":"system","content":${quote(text)}}`)
+          }
+        }
+      } else if (this.keep) {
+        this.top.push({ key: this.curKey, raw: textOfBytes(this.vout.all()) })
+      }
+      this.keep = false
+      this.sysValue = false
+      this.ts = TS_KEYS
+    }
+  }
+
+  // ---- a message ----
+
+  private startMessage(t: Tok): void {
+    this.inMsg = true
+    this.md = 1
+    this.ms = MS_KEY
+    this.role = ""
+    this.hasRole = false
+    this.hold = false
+    this.recOn = true
+    this.mrec = new ByteOut()
+    this.mcomp = new Compact(this.mrec)
+    this.mcomp.tok(t)
+    this.calls = []
+    this.cstr = false
+    this.inBlock = false
+  }
+
+  private msgTok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (this.recOn) {
+      this.mcomp.tok(t)
+      if (this.mrec.size > this.holdMax) throw new SyntaxError("a message is too large to convert while streaming: put \"role\" before \"content\" in each message (client.max_request_body_size_mb)")
+    }
+    if (k === T_STRH) this.vlong = true
+    else if (k === T_STRE) this.vlong = false
+    if (k === T_OBJ || k === T_ARR) this.md += 1
+    else if (k === T_OBJ_END || k === T_ARR_END) this.md -= 1
+    if (k === T_OBJ_END && this.md === 0) {
+      try this.endMsg()
+      return
+    }
+    const m = this.ms
+    if (m === MS_KEY) {
+      if (k === T_KEY) {
+        const name = rawText(t.raw)
+        if (name === "role") {
+          this.ms = MS_ROLE
+        } else if (name === "content") {
+          // a content that comes before the role is held whole, and converted when the message ends
+          this.hold = !this.hasRole
+          if (!this.hold) this.recOn = false
+          this.ms = MS_CONTENT
+          this.cstr = false
+        } else {
+          this.ms = MS_SKIP
+        }
+      }
+    } else if (m === MS_ROLE) {
+      if (k === T_STR && this.md === 1) {
+        this.role = rawText(t.raw)
+        this.hasRole = true
+        this.ms = MS_KEY
+      } else if (k === T_STRH) {
+        throw new SyntaxError("a message role is too long to convert while streaming")
+      } else if (this.md === 1 && !this.vlong) {
+        this.ms = MS_KEY
+      }
+    } else if (m === MS_SKIP) {
+      if (this.md === 1 && !this.vlong) this.ms = MS_KEY
+    } else if (m === MS_CONTENT) {
+      try this.contentTok(t)
+    } else if (m === MS_BLOCKS) {
+      if (k === T_ARR_END && this.md === 1) {
+        this.ms = MS_KEY
+      } else if (this.inBlock) {
+        try this.blockTok(t)
+        if (k === T_OBJ_END && this.md === 2) try this.endBlock()
+      } else if (k === T_OBJ && this.md === 3) {
+        this.startBlock(t)
+      } else {
+        throw new SyntaxError("each content block must be an object")
+      }
+    }
+  }
+
+  // the value of a message's content
+  private contentTok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (this.hold) {
+      if (this.md === 1 && !this.vlong) this.ms = MS_KEY
+      return
+    }
+    if (this.cstr) {
+      if (k === T_STRP) {
+        this.out.bytes(t.raw)
+      } else if (k === T_STRE) {
+        this.out.text(`"}`)
+        this.cstr = false
+        this.ms = MS_KEY
+      }
+      return
+    }
+    if (k === T_STR) {
+      this.openStrMsg()
+      this.out.bytes(t.raw)
+      this.out.text(`"}`)
+      this.ms = MS_KEY
+    } else if (k === T_STRH) {
+      this.openStrMsg()
+      this.out.bytes(t.raw)
+      this.cstr = true
+    } else if (k === T_ARR) {
+      this.ms = MS_BLOCKS
+    } else if (k === T_LIT && rawText(t.raw) === "null") {
+      this.ms = MS_KEY
+    } else {
+      throw new SyntaxError("the content of a message must be a string or an array of blocks")
+    }
+  }
+
+  private endMsg(): void throws SyntaxError {
+    if (this.hold) {
+      // the message came with its content before its role: converted whole, as the whole-body conversion does
+      const fs = try fields(textOfBytes(this.mrec.all()))
+      const content = find(fs, "content")
+      if (content !== undefined && content !== "null") {
+        const role = rawStr(fs, "role") ?? "user"
+        let msgs: string[] = []
+        try convertMessage(role, content, &msgs)
+        for (const m of msgs) {
+          this.sep()
+          this.out.text(m)
+        }
+      }
+    } else {
+      if (this.calls.length > 0) this.openMsg()
+      this.closeMsg()
+    }
+    this.inMsg = false
+    this.hold = false
+    this.recOn = false
+    this.mrec = new ByteOut()
+    this.mcomp = new Compact(this.mrec)
+  }
+
+  // ---- the chat messages ----
+
+  private sep(): void {
+    if (this.items > 0) this.out.byte(44)
+    this.items += 1
+  }
+
+  // A message whose content is a string: its header, and the string's first bytes are written by the caller.
+  private openStrMsg(): void {
+    this.sep()
+    this.out.text(`{"role":${quote(this.role)},"content":"`)
+  }
+
+  // The header of a chat message with parts or tool calls, written when the first one needs it.
+  private openMsg(): void {
+    if (this.open) return
+    this.sep()
+    this.out.text(`{"role":${quote(this.role)}`)
+    this.open = true
+    this.partsOpen = false
+    this.parts = 0
+  }
+
+  // The start of a part in the open message.
+  private beginPart(): void {
+    this.openMsg()
+    if (!this.partsOpen) {
+      this.out.text(`,"content":[`)
+      this.partsOpen = true
+      this.parts = 0
+    }
+    if (this.parts > 0) this.out.byte(44)
+    this.parts += 1
+  }
+
+  // The end of the open chat message: its parts, its tool calls, its closing brace.
+  private closeMsg(): void {
+    if (!this.open) return
+    if (this.partsOpen) this.out.byte(93)
+    else if (this.calls.length > 0) this.out.text(`,"content":null`)
+    if (this.calls.length > 0) this.out.text(`,"tool_calls":[${this.calls.join(",")}]`)
+    this.out.byte(125)
+    this.open = false
+    this.partsOpen = false
+    this.calls = []
+  }
+
+  // ---- a content block ----
+
+  private startBlock(t: Tok): void {
+    this.inBlock = true
+    this.bStreamed = false
+    this.brec = new ByteOut()
+    this.bcomp = new Compact(this.brec)
+    this.bcomp.tok(t)
+    this.btype = ""
+    this.tid = ""
+    this.tidOk = false
+    this.pkey = ""
+    this.pdepth = 0
+    this.bval = false
+    this.inSource = false
+    this.stype = ""
+    this.mtype = ""
+    this.mtOk = false
+    this.stream = 0
+  }
+
+  private blockTok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (this.stream !== 0) {
+      if (k === T_STRP) {
+        this.out.bytes(t.raw)
+      } else if (k === T_STRE) {
+        this.out.text(this.stream === 1 || this.stream === 4 ? `"}` : `"}}`)
+        this.stream = 0
+      }
+      return
+    }
+    if (k === T_KEY) {
+      if (this.md === 3) {
+        this.pkey = rawText(t.raw)
+        this.pdepth = 3
+        this.bval = true
+      } else if (this.md === 4 && this.inSource) {
+        this.pkey = rawText(t.raw)
+        this.pdepth = 4
+        this.bval = true
+      }
+    } else if (this.bval) {
+      if ((k === T_STR || k === T_STRH || k === T_LIT) && this.md === this.pdepth) {
+        this.bval = false
+        try this.valueStart(t)
+      } else if ((k === T_OBJ || k === T_ARR) && this.md === this.pdepth + 1) {
+        this.bval = false
+        if (k === T_OBJ && this.pdepth === 3 && this.pkey === "source" && this.btype === "image") this.inSource = true
+      }
+    }
+    if (k === T_OBJ_END && this.md === 3) this.inSource = false
+    if (!this.bStreamed) {
+      this.bcomp.tok(t)
+      if (this.brec.size > this.holdMax) throw new SyntaxError("a content block is too large to convert while streaming: put \"type\" before the data in each block (client.max_request_body_size_mb)")
+    }
+  }
+
+  // The first token of a block's key value: a string streams when the keys in front of it say what it is.
+  private valueStart(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    const key = this.pkey
+    if (this.pdepth === 3) {
+      if (key === "type" && k === T_STR) {
+        this.btype = rawText(t.raw)
+      } else if (key === "tool_use_id" && k === T_STR) {
+        this.tid = rawText(t.raw)
+        this.tidOk = true
+      } else if (key === "text" && k === T_STRH && this.btype === "text") {
+        this.beginPart()
+        this.out.text(`{"type":"text","text":"`)
+        this.out.bytes(t.raw)
+        this.stream = 1
+        this.bStreamed = true
+      } else if (key === "content" && k === T_STRH && this.btype === "tool_result" && this.tidOk) {
+        this.closeMsg()
+        this.sep()
+        this.out.text(`{"role":"tool","tool_call_id":${quote(this.tid)},"content":"`)
+        this.out.bytes(t.raw)
+        this.stream = 4
+        this.bStreamed = true
+      }
+    } else if (this.pdepth === 4) {
+      if (key === "type" && k === T_STR) {
+        this.stype = rawText(t.raw)
+      } else if (key === "media_type" && k === T_STR) {
+        this.mtype = rawText(t.raw)
+        this.mtOk = true
+      } else if (key === "data" && k === T_STRH && this.btype === "image" && this.stype === "base64" && this.mtOk) {
+        this.beginPart()
+        this.out.text(`{"type":"image_url","image_url":{"url":"${innerQuote("data:" + this.mtype + ";base64,")}`)
+        this.out.bytes(t.raw)
+        this.stream = 2
+        this.bStreamed = true
+      } else if (key === "url" && k === T_STRH && this.btype === "image" && this.stype !== "" && this.stype !== "base64") {
+        this.beginPart()
+        this.out.text(`{"type":"image_url","image_url":{"url":"`)
+        this.out.bytes(t.raw)
+        this.stream = 3
+        this.bStreamed = true
+      }
+    }
+  }
+
+  // A block that was not streamed is converted whole, as the whole-body conversion converts it.
+  private endBlock(): void throws SyntaxError {
+    this.inBlock = false
+    if (this.bStreamed) return
+    const b = try fields(textOfBytes(this.brec.all()))
+    let parts: string[] = []
+    let calls: string[] = []
+    let results: string[] = []
+    try blockOf(this.role, b, &parts, &calls, &results)
+    for (const r of results) {
+      this.closeMsg()
+      this.sep()
+      this.out.text(r)
+    }
+    for (const p of parts) {
+      this.beginPart()
+      this.out.text(p)
+    }
+    if (calls.length > 0) {
+      this.openMsg()
+      for (const c of calls) this.calls.push(c)
+    }
+  }
+}
+
+// The converted body through a chain: the Messages to chat stage, then (for a provider whose format is not chat)
+// the chat converter of that format. c is undefined for a provider that takes chat as it is.
+export class MsgChain {
+  constructor(readonly m: MsgToChat, readonly c: ChatConv | undefined) {}
+
+  push(b: u8[]): u8[][] throws SyntaxError {
+    const parts = try this.m.push(b)
+    return try this.through(parts, false)
+  }
+
+  finish(): u8[][] throws SyntaxError {
+    const parts = try this.m.finish()
+    return try this.through(parts, true)
+  }
+
+  private through(parts: u8[][], last: bool): u8[][] throws SyntaxError {
+    const c = this.c
+    if (c === undefined) return parts
+    const out: u8[][] = []
+    for (const p of parts) {
+      for (const q of try c.push(p)) out.push(q)
+    }
+    if (last) {
+      for (const q of try c.finish()) out.push(q)
+    }
+    return out
+  }
+}
+
+// ---- tests: the streaming conversion against the whole-body conversions ----
+
+// A JSON text with its keys sorted and its strings re-escaped one way, to compare two bodies that mean the same.
+function canon(raw: string): string throws SyntaxError {
+  const t = raw.trim()
+  if (t.startsWith("{")) {
+    const fs = try fields(t)
+    fs.sort((a, b) => (a.key < b.key ? -1 : (a.key > b.key ? 1 : 0)))
+    const parts: string[] = []
+    for (const f of fs) parts.push(quote(f.key) + ":" + (try canon(f.raw)))
+    return "{" + parts.join(",") + "}"
+  }
+  if (t.startsWith("[")) {
+    const parts: string[] = []
+    for (const e of try elements(t)) parts.push(try canon(e))
+    return "[" + parts.join(",") + "]"
+  }
+  if (t.startsWith("\"")) return quote(try decodeString(t))
+  return t
+}
+
+const MODEL = "target-model"
+const B64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=".repeat(8)
+
+function corpus(): string[] {
+  return [
+    `{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hello there, how are you"}]}`,
+    `{"model":"m","system":"be brief and kind to people","messages":[{"role":"user","content":"hi there friend"},{"role":"assistant","content":"hello back to you, friend"},{"role":"user","content":"and this one too"}],"max_tokens":9,"temperature":0.25,"top_p":0.5,"stop_sequences":["END"],"stream":true,"metadata":{"user_id":"u-1"}}`,
+    `{"model":"m","system":[{"type":"text","text":"first block of rules, long"},{"type":"text","text":"second block"}],"messages":[{"role":"user","content":"x"}]}`,
+    `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"look at these, please"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"${B64}"}},{"type":"image","source":{"type":"url","url":"https://example.com/cat.png"}}]}]}`,
+    `{"model":"m","messages":[{"role":"user","content":"weather?"},{"role":"assistant","content":[{"type":"thinking","thinking":"hmm","signature":"s"},{"type":"text","text":"Checking."},{"type":"tool_use","id":"tu1","name":"weather","input":{"city":"Paris","units":"c"}},{"type":"tool_use","id":"tu2","name":"time","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"18 C"},{"type":"tool_result","tool_use_id":"tu2","content":[{"type":"text","text":"12:00"},{"type":"text","text":" UTC"}]},{"type":"text","text":"also, be quick"}]}],"tools":[{"name":"weather","description":"look up","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"tool_choice":{"type":"tool","name":"weather"}}`,
+    `{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"look","input":{"q":1}}]},{"role":"user","content":""},{"role":"assistant","content":null},{"role":"user"},{"role":"user","content":"after the empties, fine"}]}`,
+    `{"model":"m","messages":[{"content":"a long enough text, honest","role":"user"},{"content":[{"type":"text","text":"parts first, long enough"}],"role":"assistant"}]}`,
+    `{"model":"m","messages":[{"role":"user","content":"caf\\u00e9 \\"quoted\\" \\\\ back\\nslash and \\/ slash"}]}`,
+    `{"model":"m","messages":[{"role":"user","content":[{"text":"type comes last here, long enough","type":"text"},{"type":"image","source":{"data":"${B64}","media_type":"image/jpeg","type":"base64"}}]},{"role":"user","content":[{"content":"result text after its id","tool_use_id":"x9","type":"tool_result"}]}]}`,
+    `{"model":"m","messages":[{"role":"user","content":"unicode: é 日本語 🙂 and more text here"}]}`,
+    `{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":50,"stop_sequences":["a"],"tool_choice":{"type":"any"},"tools":[],"top_k":5,"service_tier":"auto"}`,
+    `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"data:image/png;base64,AAAA"}},{"type":"image","source":{"url":"https://x.example/y.png"}},{"type":"server_tool_use","id":"s1","name":"x","input":{}},{"type":"text","text":"after unknown blocks"}]}]}`,
+    `{"model":"m","messages":[]}`,
+    `{"model":"m","max_tokens":5}`,
+    `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"${"w".repeat(120)}"},{"type":"image","source":{"type":"base64","media_type":"image/gif","data":"${B64}"}}]},{"role":"assistant","content":"${"v".repeat(90)}"}]}`,
+  ]
+}
+
+// the converted body when the request arrives `step` bytes at a time, through the chain of `strMax`
+function streamedChat(text: string, step: int, strMax: int): string throws SyntaxError {
+  const c = new MsgToChat(MODEL, 1048576, strMax)
+  const out = new ByteOut()
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    for (const p of try c.push(b.slice(i, e))) out.bytes(p)
+    i = e
+  }
+  for (const p of try c.finish()) out.bytes(p)
+  return textOfBytes(out.all())
+}
+
+// the converted body through a chat converter of a provider's format (fmt), the request `step` bytes at a time
+function streamedFormat(fmt: int, text: string, step: int, strMax: int): string throws SyntaxError {
+  const tail: TailFn = fmt === F_GEMINI
+    ? (req, body) => try gemini.generateTail(req, body, MODEL)
+    : (req, body) => try cohere.chatTail(req, body)
+  const o: ConvOpts = { fmt: fmt, model: MODEL, autoCache: false, cacheMarker: "", version: "", holdMax: 1048576, strMax: strMax, tail: tail }
+  const chain = new MsgChain(new MsgToChat(MODEL, 1048576, strMax), new ChatConv(o))
+  const out = new ByteOut()
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    for (const p of try chain.push(b.slice(i, e))) out.bytes(p)
+    i = e
+  }
+  for (const p of try chain.finish()) out.bytes(p)
+  return textOfBytes(out.all())
+}
+
+test("the streamed chat body is the body toChatRequest writes, for every chunk size and string limit", () => {
+  let n = 0
+  for (const text of corpus()) {
+    const want = try canon(try toChatRequest(text, MODEL))
+    for (const step of [1, 7, 100000]) {
+      for (const mx of [16, 4096]) {
+        const got = try canon(try streamedChat(text, step, mx))
+        if (got !== want) console.log(`MISMATCH step=${step} strMax=${mx}\n  input: ${text}\n  want:  ${want}\n  got:   ${got}`)
+        expect(got).toBe(want)
+        n += 1
+      }
+    }
+  }
+  expect(n).toBe(corpus().length * 6)
+})
+
+test("a chat body with no escapes is written byte for byte as toChatRequest writes it", () => {
+  const text = `{"model":"m","system":"be brief","messages":[{"role":"user","content":[{"type":"text","text":"what is in this picture, tell me"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"look","input":{"q":1}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a cat"},{"type":"text","text":"thanks"}]}],"max_tokens":9}`
+  expect(try streamedChat(text, 3, 16)).toBe(try toChatRequest(text, MODEL))
+})
+
+test("the chain to Gemini and to Cohere writes the bodies of the whole-body converters", () => {
+  const t: Target = { provider: "cohere", kind: "cohere", model: MODEL, key: {}, cfg: {} }
+  for (const text of corpus()) {
+    const chat = try toChatRequest(text, MODEL)
+    const req = try JSON.parse(chat) as ChatRequest
+    const fs = try fields(chat)
+    const wantG = try canon(try gemini.generateBody(req, fs, MODEL))
+    const wantC = try canon((try cohere.chatRequest(t, req, fs)).body)
+    for (const step of [1, 13]) {
+      expect(try canon(try streamedFormat(F_GEMINI, text, step, 16))).toBe(wantG)
+      expect(try canon(try streamedFormat(F_COHERE, text, step, 16))).toBe(wantC)
+    }
+  }
+})
+
+test("a system prompt written after the messages stays where it stands", () => {
+  const text = `{"model":"m","messages":[{"role":"user","content":"first message here"}],"system":"late rules","max_tokens":4}`
+  expect(try streamedChat(text, 5, 4096)).toBe(`{"model":"target-model","messages":[{"role":"user","content":"first message here"},{"role":"system","content":"late rules"}],"max_tokens":4}`)
+})
+
+test("bad bodies are refused and a held thing over holdMax is refused", () => {
+  const bad = [`[]`, `{"model":"m","messages":{}}`, `{"model":"m","messages":[1]}`, `{"model":"m","messages":[{"content":5}]}`, `{"model":"m","messages":[{"role":"user","content":"x"}`]
+  for (const s of bad) {
+    let threw = false
+    try {
+      streamedChat(s, 7, 16)
+    } catch (e) {
+      threw = true
+    }
+    expect(threw).toBe(true)
+  }
+  let big = false
+  try {
+    const c = new MsgToChat(MODEL, 50, 16)
+    const pieces = try c.push(bytesOf(`{"model":"m","system":[{"type":"text","text":"${"s".repeat(300)}"}],"messages":[]}`))
+    const rest = try c.finish()
+    expect(pieces.length + rest.length > 0).toBe(true)
+  } catch (e) {
+    big = true
+  }
+  expect(big).toBe(true)
+})
+
+test("MsgChain without a chat converter passes the chat body through", () => {
+  const chain = new MsgChain(new MsgToChat(MODEL, 1048576, 4096), undefined)
+  const out = new ByteOut()
+  for (const p of try chain.push(bytesOf(`{"model":"m","messages":[{"role":"user","content":"hi there"}]}`))) out.bytes(p)
+  for (const p of try chain.finish()) out.bytes(p)
+  expect(textOfBytes(out.all())).toBe(`{"model":"target-model","messages":[{"role":"user","content":"hi there"}]}`)
+})
