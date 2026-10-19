@@ -1,8 +1,9 @@
-// HTTP/2 client (RFC 9113) for unary gRPC, over plaintext with prior knowledge (h2c), or
-// over TLS with ALPN "h2" (the server must pick it). Tov's fetch speaks HTTP/1.1 only, so
-// this runs on a raw socket. HPACK (RFC 7541) is here too: the encoder writes literal
-// fields with no Huffman coding and no indexing; the decoder reads the static and dynamic
-// tables and Huffman strings, since servers index and Huffman-code their fields.
+// HTTP/2 (RFC 9113) on raw sockets: a client for unary gRPC, over plaintext with prior
+// knowledge (h2c), or over TLS with ALPN "h2" (the server must pick it), and the server
+// side that serves h2c. Tov's fetch speaks HTTP/1.1 only, so both run on Bun.connect and
+// Bun.listen. HPACK is in hpack.tov.
+
+import { HpackDecoder, HpackEncoder, HpackField, hpackEncode } from "./hpack"
 
 export type H2Header = { name: string, value: string }
 
@@ -56,317 +57,6 @@ function be32(v: int): u8[] {
 
 function read32(p: u8[], at: int): int {
   return (int(p[at]!) << 24) | (int(p[at + 1]!) << 16) | (int(p[at + 2]!) << 8) | int(p[at + 3]!)
-}
-
-// ---- HPACK ----
-
-// Huffman codes (RFC 7541 Appendix B), indexed by symbol 0-255, 256 is EOS.
-const HUFF_CODE: int[] = [
-  0x1ff8, 0x7fffd8, 0xfffffe2, 0xfffffe3, 0xfffffe4, 0xfffffe5, 0xfffffe6, 0xfffffe7,
-  0xfffffe8, 0xffffea, 0x3ffffffc, 0xfffffe9, 0xfffffea, 0x3ffffffd, 0xfffffeb, 0xfffffec,
-  0xfffffed, 0xfffffee, 0xfffffef, 0xffffff0, 0xffffff1, 0xffffff2, 0x3ffffffe, 0xffffff3,
-  0xffffff4, 0xffffff5, 0xffffff6, 0xffffff7, 0xffffff8, 0xffffff9, 0xffffffa, 0xffffffb,
-  0x14, 0x3f8, 0x3f9, 0xffa, 0x1ff9, 0x15, 0xf8, 0x7fa,
-  0x3fa, 0x3fb, 0xf9, 0x7fb, 0xfa, 0x16, 0x17, 0x18,
-  0x0, 0x1, 0x2, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
-  0x1e, 0x1f, 0x5c, 0xfb, 0x7ffc, 0x20, 0xffb, 0x3fc,
-  0x1ffa, 0x21, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62,
-  0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a,
-  0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72,
-  0xfc, 0x73, 0xfd, 0x1ffb, 0x7fff0, 0x1ffc, 0x3ffc, 0x22,
-  0x7ffd, 0x3, 0x23, 0x4, 0x24, 0x5, 0x25, 0x26,
-  0x27, 0x6, 0x74, 0x75, 0x28, 0x29, 0x2a, 0x7,
-  0x2b, 0x76, 0x2c, 0x8, 0x9, 0x2d, 0x77, 0x78,
-  0x79, 0x7a, 0x7b, 0x7ffe, 0x7fc, 0x3ffd, 0x1ffd, 0xffffffc,
-  0xfffe6, 0x3fffd2, 0xfffe7, 0xfffe8, 0x3fffd3, 0x3fffd4, 0x3fffd5, 0x7fffd9,
-  0x3fffd6, 0x7fffda, 0x7fffdb, 0x7fffdc, 0x7fffdd, 0x7fffde, 0xffffeb, 0x7fffdf,
-  0xffffec, 0xffffed, 0x3fffd7, 0x7fffe0, 0xffffee, 0x7fffe1, 0x7fffe2, 0x7fffe3,
-  0x7fffe4, 0x1fffdc, 0x3fffd8, 0x7fffe5, 0x3fffd9, 0x7fffe6, 0x7fffe7, 0xffffef,
-  0x3fffda, 0x1fffdd, 0xfffe9, 0x3fffdb, 0x3fffdc, 0x7fffe8, 0x7fffe9, 0x1fffde,
-  0x7fffea, 0x3fffdd, 0x3fffde, 0xfffff0, 0x1fffdf, 0x3fffdf, 0x7fffeb, 0x7fffec,
-  0x1fffe0, 0x1fffe1, 0x3fffe0, 0x1fffe2, 0x7fffed, 0x3fffe1, 0x7fffee, 0x7fffef,
-  0xfffea, 0x3fffe2, 0x3fffe3, 0x3fffe4, 0x7ffff0, 0x3fffe5, 0x3fffe6, 0x7ffff1,
-  0x3ffffe0, 0x3ffffe1, 0xfffeb, 0x7fff1, 0x3fffe7, 0x7ffff2, 0x3fffe8, 0x1ffffec,
-  0x3ffffe2, 0x3ffffe3, 0x3ffffe4, 0x7ffffde, 0x7ffffdf, 0x3ffffe5, 0xfffff1, 0x1ffffed,
-  0x7fff2, 0x1fffe3, 0x3ffffe6, 0x7ffffe0, 0x7ffffe1, 0x3ffffe7, 0x7ffffe2, 0xfffff2,
-  0x1fffe4, 0x1fffe5, 0x3ffffe8, 0x3ffffe9, 0xffffffd, 0x7ffffe3, 0x7ffffe4, 0x7ffffe5,
-  0xfffec, 0xfffff3, 0xfffed, 0x1fffe6, 0x3fffe9, 0x1fffe7, 0x1fffe8, 0x7ffff3,
-  0x3fffea, 0x3fffeb, 0x1ffffee, 0x1ffffef, 0xfffff4, 0xfffff5, 0x3ffffea, 0x7ffff4,
-  0x3ffffeb, 0x7ffffe6, 0x3ffffec, 0x3ffffed, 0x7ffffe7, 0x7ffffe8, 0x7ffffe9, 0x7ffffea,
-  0x7ffffeb, 0xffffffe, 0x7ffffec, 0x7ffffed, 0x7ffffee, 0x7ffffef, 0x7fffff0, 0x3ffffee,
-  0x3fffffff,
-]
-const HUFF_LEN: int[] = [
-  13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
-  28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-  6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
-  5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
-  13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-  7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
-  15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
-  6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
-  20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
-  24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
-  22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
-  21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
-  26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
-  19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
-  20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
-  26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
-  30,
-]
-// Static table names and values (RFC 7541 Appendix A); index 1 is element 0.
-const STATIC_NAME: string[] = [
-  ":authority", ":method", ":method", ":path",
-  ":path", ":scheme", ":scheme", ":status",
-  ":status", ":status", ":status", ":status",
-  ":status", ":status", "accept-charset", "accept-encoding",
-  "accept-language", "accept-ranges", "accept", "access-control-allow-origin",
-  "age", "allow", "authorization", "cache-control",
-  "content-disposition", "content-encoding", "content-language", "content-length",
-  "content-location", "content-range", "content-type", "cookie",
-  "date", "etag", "expect", "expires",
-  "from", "host", "if-match", "if-modified-since",
-  "if-none-match", "if-range", "if-unmodified-since", "last-modified",
-  "link", "location", "max-forwards", "proxy-authenticate",
-  "proxy-authorization", "range", "referer", "refresh",
-  "retry-after", "server", "set-cookie", "strict-transport-security",
-  "transfer-encoding", "user-agent", "vary", "via",
-  "www-authenticate",
-]
-const STATIC_VALUE: string[] = [
-  "", "GET", "POST", "/",
-  "/index.html", "http", "https", "200",
-  "204", "206", "304", "400",
-  "404", "500", "", "gzip, deflate",
-  "", "", "", "",
-  "", "", "", "",
-  "", "", "", "",
-  "", "", "", "",
-  "", "", "", "",
-  "", "", "", "",
-  "", "", "", "",
-  "", "", "", "",
-  "", "", "", "",
-  "", "", "", "",
-  "", "", "", "",
-  "",
-]
-
-const HUFF_EOS: int = 256
-
-// Static table index 1 is element 0 of STATIC_NAME and STATIC_VALUE.
-const STATIC_COUNT: int = 61
-
-// Integer with an n-bit prefix (RFC 7541 5.1). The bits above the prefix in the first
-// byte belong to the caller.
-function readInt(buf: u8[], pos: int, n: int): { v: int, next: int } throws Error {
-  if (pos >= buf.length) throw new Error("hpack: truncated integer")
-  const mask: int = (1 << n) - 1
-  let v: int = int(buf[pos]!) & mask
-  let p = pos + 1
-  if (v < mask) return { v: v, next: p }
-  let m: int = 0
-  while (true) {
-    if (p >= buf.length) throw new Error("hpack: truncated integer")
-    const b = int(buf[p]!)
-    p = p + 1
-    v = v + ((b & 127) << m)
-    m = m + 7
-    if (m > 28) throw new Error("hpack: integer too large")
-    if ((b & 128) === 0) break
-  }
-  return { v: v, next: p }
-}
-
-let huffMap: Map<int, int> | undefined = undefined
-
-// (length, code) keyed by length * 2^32 + code, for the decoder's bit-by-bit match.
-function huffTable(): Map<int, int> {
-  const cached = huffMap
-  if (cached !== undefined) return cached
-  const m: Map<int, int> = new Map()
-  for (let s = 0; s <= HUFF_EOS; s++) {
-    m.set(HUFF_LEN[s]! * 4294967296 + HUFF_CODE[s]!, s)
-  }
-  huffMap = m
-  return m
-}
-
-// A Huffman-coded string (RFC 7541 5.2). The padding must be the EOS prefix, under 8 bits.
-function huffDecode(src: u8[]): u8[] throws Error {
-  const table = huffTable()
-  const out: u8[] = []
-  let code: int = 0
-  let len: int = 0
-  for (const b of src) {
-    const byte = int(b)
-    for (let i = 7; i >= 0; i--) {
-      code = (code << 1) | ((byte >> i) & 1)
-      len = len + 1
-      const sym = table.get(len * 4294967296 + code)
-      if (sym !== undefined) {
-        if (sym === HUFF_EOS) throw new Error("hpack: EOS in a huffman string")
-        out.push(u8(sym))
-        code = 0
-        len = 0
-      } else if (len >= 30) {
-        throw new Error("hpack: bad huffman code")
-      }
-    }
-  }
-  if (len > 7 || (len > 0 && code !== (1 << len) - 1)) throw new Error("hpack: bad huffman padding")
-  return out
-}
-
-function textOf(b: u8[]): string throws Error {
-  const d = try new TextDecoder()
-  return try d.decode(b)
-}
-
-// A string literal: the Huffman bit, a 7-bit length, then the bytes.
-function readStr(buf: u8[], pos: int): { text: string, next: int } throws Error {
-  if (pos >= buf.length) throw new Error("hpack: truncated string")
-  const huff = (int(buf[pos]!) & 128) !== 0
-  const r = try readInt(buf, pos, 7)
-  const end = r.next + r.v
-  if (end > buf.length) throw new Error("hpack: string past the block")
-  const raw = buf.slice(r.next, end)
-  let bytes: u8[] = raw
-  if (huff) bytes = try huffDecode(raw)
-  return { text: try textOf(bytes), next: end }
-}
-
-// Bytes of a dynamic table entry (RFC 7541 4.1): name, value and 32 more.
-function entrySize(h: H2Header): int {
-  return h.name.byteLength + h.value.byteLength + 32
-}
-
-export class HpackDecoder {
-  // The dynamic table; the newest entry is last, so index 62 is the last element.
-  private dyn: H2Header[] = []
-  private size: int = 0
-  private maxSize: int = 4096
-
-  // The fields of one header block, in order. The table state carries over between blocks.
-  decode(block: u8[]): H2Header[] throws Error {
-    const out: H2Header[] = []
-    let pos: int = 0
-    while (pos < block.length) {
-      const b = int(block[pos]!)
-      if ((b & 128) !== 0) {
-        // indexed field
-        const r = try readInt(block, pos, 7)
-        pos = r.next
-        const e = try this.entry(r.v)
-        out.push(e)
-      } else if ((b & 192) === 64) {
-        // literal with incremental indexing
-        const r = try readInt(block, pos, 6)
-        pos = r.next
-        const h = try this.literal(block, r.v, pos)
-        pos = h.next
-        this.add(h.field)
-        out.push(h.field)
-      } else if ((b & 224) === 32) {
-        // dynamic table size update
-        const r = try readInt(block, pos, 5)
-        pos = r.next
-        this.maxSize = r.v
-        this.evict()
-      } else {
-        // literal without indexing (0000) or never indexed (0001)
-        const r = try readInt(block, pos, 4)
-        pos = r.next
-        const h = try this.literal(block, r.v, pos)
-        pos = h.next
-        out.push(h.field)
-      }
-    }
-    return out
-  }
-
-  // A literal's name (by index, or as a string when the index is 0) and value.
-  private literal(block: u8[], nameIndex: int, pos: int): { field: H2Header, next: int } throws Error {
-    let name = ""
-    let at = pos
-    if (nameIndex === 0) {
-      const n = try readStr(block, at)
-      name = n.text
-      at = n.next
-    } else {
-      const e = try this.entry(nameIndex)
-      name = e.name
-    }
-    const v = try readStr(block, at)
-    return { field: { name: name, value: v.text }, next: v.next }
-  }
-
-  private entry(idx: int): H2Header throws Error {
-    if (idx <= 0) throw new Error("hpack: index 0")
-    if (idx <= STATIC_COUNT) return { name: STATIC_NAME[idx - 1]!, value: STATIC_VALUE[idx - 1]! }
-    const k = idx - STATIC_COUNT - 1
-    if (k >= this.dyn.length) throw new Error("hpack: index past the dynamic table")
-    return this.dyn[this.dyn.length - 1 - k]!
-  }
-
-  private add(h: H2Header): void {
-    const sz = entrySize(h)
-    if (sz > this.maxSize) {
-      this.dyn = []
-      this.size = 0
-      return
-    }
-    this.dyn.push(h)
-    this.size = this.size + sz
-    this.evict()
-  }
-
-  // Drops the oldest entries until the table fits its size.
-  private evict(): void {
-    while (this.size > this.maxSize && this.dyn.length > 0) {
-      const old = this.dyn.shift()!
-      this.size = this.size - entrySize(old)
-    }
-  }
-}
-
-// Writes an integer with an n-bit prefix, with the prefix bits in `flags`.
-function intBytes(v: int, n: int, flags: int): u8[] {
-  const out: u8[] = []
-  const max: int = (1 << n) - 1
-  if (v < max) {
-    out.push(u8(flags | v))
-    return out
-  }
-  out.push(u8(flags | max))
-  let r = v - max
-  while (r >= 128) {
-    out.push(u8((r & 127) | 128))
-    r = r >> 7
-  }
-  out.push(u8(r))
-  return out
-}
-
-// A string literal with no Huffman coding.
-function strBytes(s: string): u8[] {
-  const b = new TextEncoder().encode(s)
-  const out = intBytes(b.length, 7, 0)
-  for (const x of b) out.push(x)
-  return out
-}
-
-// Literal header fields without indexing (0000 prefix, new name each time). The peer
-// never has to track our table, so this needs no state.
-export function hpackEncode(headers: H2Header[]): u8[] {
-  const out: u8[] = []
-  for (const h of headers) {
-    out.push(u8(0))
-    for (const x of strBytes(h.name)) out.push(x)
-    for (const x of strBytes(h.value)) out.push(x)
-  }
-  return out
 }
 
 // ---- the connection ----
@@ -724,18 +414,731 @@ export class H2Conn {
   }
 }
 
-// ---- tests ----
+// ---- the server ----
 
-function hexOf(s: string): u8[] {
-  const digits = "0123456789abcdef"
-  const out: u8[] = []
-  for (let i = 0; i + 1 < s.byteLength; i += 2) {
-    const hi = digits.indexOf(s.slice(i, i + 1))
-    const lo = digits.indexOf(s.slice(i + 1, i + 2))
-    out.push(u8(hi * 16 + lo))
+// Error codes (RFC 9113 7). A connection error ends the connection with GOAWAY; a stream
+// error ends one stream with RST_STREAM.
+export const H2_NO_ERROR: int = 0
+export const H2_PROTOCOL_ERROR: int = 1
+export const H2_INTERNAL_ERROR: int = 2
+export const H2_FLOW_CONTROL_ERROR: int = 3
+export const H2_STREAM_CLOSED: int = 5
+export const H2_FRAME_SIZE_ERROR: int = 6
+export const H2_REFUSED_STREAM: int = 7
+export const H2_CANCEL: int = 8
+export const H2_COMPRESSION_ERROR: int = 9
+export const H2_ENHANCE_YOUR_CALM: int = 11
+
+const MAX_WINDOW: int = 2147483647
+// queued response bytes above which a write waits for the peer
+const OUT_HIGH: int = 65536
+// a header block (HEADERS with its CONTINUATIONs) larger than this is refused
+const MAX_BLOCK: int = 262144
+
+// A protocol error found while reading a frame: stream 0 is a connection error, any other
+// id a stream error.
+class H2Fault extends Error {
+  constructor(readonly code: int, readonly stream: int, message: string) {
+    super(message)
   }
-  return out
 }
+
+// What the server hands a handler for one request.
+export type H2Request = { method: string, path: string, scheme: string, authority: string, headers: H2Header[], body: H2Body }
+
+// The handler runs once per request, when its headers are in. It answers through res.
+export type H2Handler = (req: H2Request, res: H2Reply) => void throws Error
+
+// The request body of one stream, in the pieces DATA frames brought. next() hands the
+// pieces out one at a time and gives the window back as it goes, so a handler that is
+// behind holds the peer back: the windows bound what is held.
+export class H2Body {
+  private chunks: u8[][] = []
+  private queued: int = 0
+  private done: bool = false
+  private failed: string = ""
+  private dropping: bool = false
+  private waiter: ((n: int) => void) | undefined = undefined
+  weak sess: H2Session | undefined
+
+  constructor(sess: H2Session, readonly sid: int) {
+    this.sess = sess
+  }
+
+  // The next piece, or undefined at the end. Throws when the stream is reset or the
+  // connection is lost before the end.
+  async next(): Promise<u8[] | undefined> throws Error {
+    while (true) {
+      const c = this.chunks.shift()
+      if (c !== undefined) {
+        this.queued = this.queued - c.length
+        const s = this.sess
+        if (s !== undefined) s.credit(this.sid, c.length)
+        return c
+      }
+      if (this.failed !== "") throw new Error(this.failed)
+      if (this.done) return undefined
+      await new Promise<int>((resolve) => {
+        this.waiter = resolve
+      })
+    }
+  }
+
+  // A DATA payload from the peer. False when the body was discarded: the caller gives the
+  // window back then.
+  push(b: u8[]): bool {
+    if (this.dropping) return false
+    this.chunks.push(b)
+    this.queued = this.queued + b.length
+    this.wake()
+    return true
+  }
+
+  // The peer's end of the body.
+  finish(): void {
+    this.done = true
+    this.wake()
+  }
+
+  // The stream is reset or the connection lost.
+  fail(msg: string): void {
+    if (this.done || this.failed !== "") return
+    this.failed = msg
+    this.wake()
+  }
+
+  // The handler has no use for the rest. What is held is dropped; the bytes given back are
+  // returned so the caller can credit them.
+  discard(): int {
+    const n = this.queued
+    this.dropping = true
+    this.chunks = []
+    this.queued = 0
+    if (!this.done && this.failed === "") this.failed = "h2: the request body was discarded"
+    this.wake()
+    return n
+  }
+
+  private wake(): void {
+    const w = this.waiter
+    if (w !== undefined) {
+      this.waiter = undefined
+      w(0)
+    }
+  }
+}
+
+// The response of one stream. Writes queue on the stream and go out as the windows allow;
+// write() waits while more than OUT_HIGH bytes are queued.
+export class H2Reply {
+  weak sess: H2Session | undefined
+
+  constructor(sess: H2Session, readonly sid: int) {
+    this.sess = sess
+  }
+
+  // The response head. Without :status it is 200. Sent once.
+  headers(hs: H2Header[]): void {
+    const s = this.sess
+    if (s !== undefined) s.respond(this.sid, hs, false)
+  }
+
+  // A piece of the response body (the head goes first if it has not).
+  async write(b: u8[]): Promise<void, Error> {
+    const s = this.sess
+    if (s === undefined) throw new Error("h2: the connection is gone")
+    s.respond(this.sid, [], false)
+    try s.queue(this.sid, b)
+    try await s.drained(this.sid)
+  }
+
+  // Ends the response; trailers are sent after the body when given.
+  end(trailers: H2Header[] | undefined): void {
+    const s = this.sess
+    if (s !== undefined) s.endResponse(this.sid, trailers)
+  }
+
+  // A head that is also the end of the response (a trailers-only response).
+  trailersOnly(hs: H2Header[]): void {
+    const s = this.sess
+    if (s !== undefined) s.respond(this.sid, hs, true)
+  }
+
+  // Resets the stream with a code.
+  reset(code: int): void {
+    const s = this.sess
+    if (s !== undefined) s.resetStream(this.sid, code)
+  }
+}
+
+// One stream: the request's header block while it arrives, its body, its reply, and the
+// flow-control windows both ways.
+class SrvStream {
+  body: H2Body
+  reply: H2Reply
+  // the peer's window for our DATA, and our window for the peer's DATA
+  sendWindow: int
+  recvWindow: int
+  block: u8[] = []
+  endStream: bool = false
+  headersDone: bool = false
+  // refused by the stream limit or a GOAWAY: the block is decoded and the stream reset
+  refused: bool = false
+  responded: bool = false
+  endPending: bool = false
+  finished: bool = false
+  ended: bool = false
+  trailers: H2Header[] | undefined = undefined
+  out: u8[] = []
+  off: int = 0
+  waiters: (() => void)[] = []
+
+  constructor(readonly id: int, sess: H2Session, sendWindow: int, recvWindow: int) {
+    this.body = new H2Body(sess, id)
+    this.reply = new H2Reply(sess, id)
+    this.sendWindow = sendWindow
+    this.recvWindow = recvWindow
+  }
+
+  queued(): int {
+    return this.out.length - this.off
+  }
+}
+
+// The payload without its padding (flag PADDED). Padding longer than the rest is a
+// connection error.
+function unpad(p: u8[], flags: int): u8[] throws H2Fault {
+  if ((flags & F_PADDED) === 0) return p
+  if (p.length < 1 || int(p[0]!) >= p.length) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: bad padding")
+  return p.slice(1, p.length - int(p[0]!))
+}
+
+// One HTTP/2 connection on the server side. Frames are read as the socket delivers them;
+// the streams run their handlers as their headers complete.
+cyclic class H2Session {
+  sock: Socket<H2Session> | undefined = undefined
+  closed: bool = false
+  private pre: u8[] = []
+  private preLeft: int = 24
+  private rbuf: u8[] = []
+  private settingsSeen: bool = false
+  private dec: HpackDecoder = new HpackDecoder()
+  private enc: HpackEncoder = new HpackEncoder()
+  private streams: Map<int, SrvStream> = new Map()
+  private lastId: int = 0
+  // the peer's SETTINGS_INITIAL_WINDOW_SIZE and SETTINGS_MAX_FRAME_SIZE
+  private peerInit: int = DEFAULT_WINDOW
+  private peerMaxFrame: int = DEFAULT_FRAME
+  // the connection's windows: for our DATA to the peer, and for the peer's DATA to us
+  private connWindow: int = DEFAULT_WINDOW
+  private recvWindow: int = DEFAULT_WINDOW
+  // the stream whose header block continues in CONTINUATION frames, or 0
+  private contId: int = 0
+  // the peer sent GOAWAY: no new streams, and the connection closes when the last one ends
+  private goneAway: bool = false
+
+  constructor(readonly handler: H2Handler, readonly maxStreams: int) {
+    this.pre = new TextEncoder().encode(PREFACE)
+  }
+
+  // The server's SETTINGS: the stream limit. The rest stays at the protocol's defaults.
+  start(): void {
+    const st: u8[] = [u8(0), u8(3)]
+    for (const b of be32(this.maxStreams)) st.push(b)
+    this.write(frameBytes(T_SETTINGS, 0, 0, st))
+  }
+
+  // Bytes from the socket: the client preface first, then frames.
+  feed(bytes: u8[]): void {
+    if (this.closed) return
+    let i: int = 0
+    while (this.preLeft > 0 && i < bytes.length) {
+      if (int(bytes[i]!) !== int(this.pre[this.pre.length - this.preLeft]!)) {
+        this.goaway(H2_PROTOCOL_ERROR, "h2: bad client preface")
+        return
+      }
+      this.preLeft = this.preLeft - 1
+      i = i + 1
+    }
+    for (let j = i; j < bytes.length; j++) this.rbuf.push(bytes[j]!)
+    this.parse()
+  }
+
+  // Credits n bytes of the request body that the handler took: the peer may send n more on
+  // the connection and on the stream.
+  credit(sid: int, n: int): void {
+    if (n <= 0 || this.closed) return
+    this.recvWindow = this.recvWindow + n
+    this.write(frameBytes(T_WINDOW_UPDATE, 0, 0, be32(n)))
+    const st = this.streams.get(sid)
+    if (st !== undefined) {
+      st.recvWindow = st.recvWindow + n
+      this.write(frameBytes(T_WINDOW_UPDATE, 0, sid, be32(n)))
+    }
+  }
+
+  // The response head for stream sid, once. endStream makes it the whole response.
+  respond(sid: int, hs: H2Header[], endStream: bool): void {
+    const st = this.streams.get(sid)
+    if (st === undefined || st.responded) return
+    st.responded = true
+    const fields: HpackField[] = []
+    let hasStatus = false
+    for (const h of hs) {
+      if (h.name === ":status") hasStatus = true
+    }
+    if (!hasStatus) fields.push({ name: ":status", value: "200" })
+    for (const h of hs) fields.push(h)
+    this.sendBlock(sid, this.enc.encode(fields), endStream)
+    if (endStream) {
+      st.finished = true
+      this.afterEnd(st)
+    } else {
+      this.pump(st)
+    }
+  }
+
+  // Queues response body bytes. Throws when the response is already ended or the stream is gone.
+  queue(sid: int, b: u8[]): void throws Error {
+    const st = this.streams.get(sid)
+    if (st === undefined || st.finished || st.endPending) throw new Error("h2: the response is finished")
+    if (st.off > 0) {
+      st.out = st.out.slice(st.off)
+      st.off = 0
+    }
+    for (const x of b) st.out.push(x)
+    this.pump(st)
+  }
+
+  // Waits until the stream's queue is under OUT_HIGH. Throws when the stream is gone.
+  async drained(sid: int): Promise<void, Error> {
+    while (true) {
+      const st = this.streams.get(sid)
+      if (st === undefined) throw new Error("h2: the stream is closed")
+      if (st.queued() <= OUT_HIGH) return
+      await new Promise<void, Error>((resolve) => {
+        st.waiters.push(() => resolve())
+      })
+    }
+  }
+
+  // The end of the response, with trailers when given.
+  endResponse(sid: int, trailers: H2Header[] | undefined): void {
+    const st = this.streams.get(sid)
+    if (st === undefined || st.finished || st.endPending) return
+    if (!st.responded) this.respond(sid, [], false)
+    st.endPending = true
+    st.trailers = trailers
+    this.pump(st)
+  }
+
+  // Resets a stream: RST_STREAM goes out and its request body fails.
+  resetStream(sid: int, code: int): void {
+    if (this.streams.get(sid) === undefined) return
+    this.streamError(sid, code)
+  }
+
+  // The socket closed: every stream fails.
+  detach(): void {
+    this.closed = true
+    this.sock = undefined
+    this.failAll("h2: the connection closed")
+  }
+
+  // Reads the frames that are whole in rbuf.
+  private parse(): void {
+    const b = this.rbuf
+    let pos: int = 0
+    while (!this.closed && b.length - pos >= 9) {
+      const n = (int(b[pos]!) << 16) | (int(b[pos + 1]!) << 8) | int(b[pos + 2]!)
+      if (n > DEFAULT_FRAME) {
+        this.goaway(H2_FRAME_SIZE_ERROR, "h2: frame too large")
+        break
+      }
+      if (b.length - pos < 9 + n) break
+      const type = int(b[pos + 3]!)
+      const flags = int(b[pos + 4]!)
+      const sid = read32(b, pos + 5) & 2147483647
+      const payload = b.slice(pos + 9, pos + 9 + n)
+      pos = pos + 9 + n
+      try {
+        this.frame(type, flags, sid, payload)
+      } catch (e) {
+        if (e instanceof H2Fault) {
+          if (e.stream === 0) this.goaway(e.code, e.message)
+          else this.streamError(e.stream, e.code)
+        } else {
+          this.goaway(H2_INTERNAL_ERROR, "h2: internal error")
+        }
+      }
+    }
+    if (!this.closed) this.rbuf = b.slice(pos)
+  }
+
+  private frame(type: int, flags: int, sid: int, p: u8[]): void throws H2Fault {
+    if (this.contId !== 0 && (type !== T_CONTINUATION || sid !== this.contId)) {
+      throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: CONTINUATION expected")
+    }
+    if (!this.settingsSeen && type !== T_SETTINGS) {
+      throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: SETTINGS expected first")
+    }
+    if (type === T_DATA) {
+      try this.onData(flags, sid, p)
+    } else if (type === T_HEADERS) {
+      try this.onHeaders(flags, sid, p)
+    } else if (type === T_CONTINUATION) {
+      try this.onContinuation(flags, sid, p)
+    } else if (type === T_SETTINGS) {
+      try this.onSettings(flags, sid, p)
+    } else if (type === T_PING) {
+      if (sid !== 0) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: PING on a stream")
+      if (p.length !== 8) throw new H2Fault(H2_FRAME_SIZE_ERROR, 0, "h2: PING length")
+      if ((flags & F_ACK) === 0) this.write(frameBytes(T_PING, F_ACK, 0, p))
+    } else if (type === T_WINDOW_UPDATE) {
+      try this.onWindowUpdate(sid, p)
+    } else if (type === T_RST_STREAM) {
+      if (sid === 0) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: RST_STREAM on stream 0")
+      if (p.length !== 4) throw new H2Fault(H2_FRAME_SIZE_ERROR, 0, "h2: RST_STREAM length")
+      this.dropStream(sid, `h2: the stream was reset by the client (code ${read32(p, 0)})`)
+    } else if (type === T_GOAWAY) {
+      if (sid !== 0) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: GOAWAY on a stream")
+      this.goneAway = true
+      this.maybeClose()
+    } else if (type === T_PUSH_PROMISE) {
+      throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: a client cannot send PUSH_PROMISE")
+    }
+    // PRIORITY and unknown frame types are ignored (RFC 9113 4.1)
+  }
+
+  private onData(flags: int, sid: int, p: u8[]): void throws H2Fault {
+    if (sid === 0) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: DATA on stream 0")
+    // the whole payload, padding included, counts against the connection window
+    this.recvWindow = this.recvWindow - p.length
+    if (this.recvWindow < 0) throw new H2Fault(H2_FLOW_CONTROL_ERROR, 0, "h2: the connection window is overrun")
+    const data = try unpad(p, flags)
+    const st = this.streams.get(sid)
+    if (st === undefined) {
+      // a stream that is gone: its bytes are given back at once
+      this.credit(sid, p.length)
+      return
+    }
+    st.recvWindow = st.recvWindow - p.length
+    if (st.recvWindow < 0) throw new H2Fault(H2_FLOW_CONTROL_ERROR, sid, "h2: the stream window is overrun")
+    if (st.ended) throw new H2Fault(H2_STREAM_CLOSED, sid, "h2: DATA after END_STREAM")
+    const pad = p.length - data.length
+    if (pad > 0) this.credit(sid, pad)
+    if (data.length > 0 && !st.body.push(data)) this.credit(sid, data.length)
+    if ((flags & F_END_STREAM) !== 0) this.endRequest(st)
+  }
+
+  private onHeaders(flags: int, sid: int, p: u8[]): void throws H2Fault {
+    if (sid === 0) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: HEADERS on stream 0")
+    let block = try unpad(p, flags)
+    if ((flags & F_PRIORITY) !== 0) {
+      if (block.length < 5) throw new H2Fault(H2_FRAME_SIZE_ERROR, 0, "h2: short PRIORITY fields")
+      block = block.slice(5)
+    }
+    const old = this.streams.get(sid)
+    if (old !== undefined) {
+      // trailers of a request whose headers are in
+      if (old.ended) throw new H2Fault(H2_STREAM_CLOSED, sid, "h2: HEADERS after END_STREAM")
+      if ((flags & F_END_STREAM) === 0) throw new H2Fault(H2_PROTOCOL_ERROR, sid, "h2: trailers without END_STREAM")
+      old.block = block
+      old.endStream = true
+      if ((flags & F_END_HEADERS) !== 0) try this.finishBlock(old)
+      else this.contId = sid
+      return
+    }
+    if (sid <= this.lastId) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: stream id out of order")
+    this.lastId = sid
+    const st = new SrvStream(sid, this, this.peerInit, DEFAULT_WINDOW)
+    st.refused = this.goneAway || this.streams.size >= this.maxStreams
+    st.endStream = (flags & F_END_STREAM) !== 0
+    st.block = block
+    this.streams.set(sid, st)
+    if ((flags & F_END_HEADERS) !== 0) try this.finishBlock(st)
+    else this.contId = sid
+  }
+
+  private onContinuation(flags: int, sid: int, p: u8[]): void throws H2Fault {
+    const st = this.streams.get(sid)
+    if (this.contId === 0 || st === undefined) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: unexpected CONTINUATION")
+    for (const b of p) st.block.push(b)
+    if (st.block.length > MAX_BLOCK) throw new H2Fault(H2_ENHANCE_YOUR_CALM, 0, "h2: header block too large")
+    if ((flags & F_END_HEADERS) !== 0) {
+      this.contId = 0
+      try this.finishBlock(st)
+    }
+  }
+
+  private onSettings(flags: int, sid: int, p: u8[]): void throws H2Fault {
+    if (sid !== 0) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: SETTINGS on a stream")
+    if ((flags & F_ACK) !== 0) {
+      if (p.length !== 0) throw new H2Fault(H2_FRAME_SIZE_ERROR, 0, "h2: SETTINGS ACK with a payload")
+      return
+    }
+    if (p.length % 6 !== 0) throw new H2Fault(H2_FRAME_SIZE_ERROR, 0, "h2: SETTINGS length")
+    let at: int = 0
+    while (at + 6 <= p.length) {
+      const id = (int(p[at]!) << 8) | int(p[at + 1]!)
+      const val = read32(p, at + 2)
+      if (id === 1) {
+        // the table our encoder may fill is the one the peer's decoder allows
+        this.enc.setMaxSize(val)
+      } else if (id === 4) {
+        if (val > MAX_WINDOW) throw new H2Fault(H2_FLOW_CONTROL_ERROR, 0, "h2: INITIAL_WINDOW_SIZE too large")
+        const delta = val - this.peerInit
+        this.peerInit = val
+        for (const st of this.streams.values()) {
+          st.sendWindow = st.sendWindow + delta
+          if (st.sendWindow > MAX_WINDOW) throw new H2Fault(H2_FLOW_CONTROL_ERROR, 0, "h2: stream window overflow")
+        }
+      } else if (id === 5) {
+        if (val < DEFAULT_FRAME || val > MAX_FRAME) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: bad MAX_FRAME_SIZE")
+        this.peerMaxFrame = val
+      }
+      at = at + 6
+    }
+    this.settingsSeen = true
+    this.write(frameBytes(T_SETTINGS, F_ACK, 0, []))
+    this.pumpAll()
+  }
+
+  private onWindowUpdate(sid: int, p: u8[]): void throws H2Fault {
+    if (p.length !== 4) throw new H2Fault(H2_FRAME_SIZE_ERROR, 0, "h2: WINDOW_UPDATE length")
+    const inc = read32(p, 0) & 2147483647
+    if (inc === 0) throw new H2Fault(H2_PROTOCOL_ERROR, sid, "h2: WINDOW_UPDATE of 0")
+    if (sid === 0) {
+      this.connWindow = this.connWindow + inc
+      if (this.connWindow > MAX_WINDOW) throw new H2Fault(H2_FLOW_CONTROL_ERROR, 0, "h2: connection window overflow")
+      this.pumpAll()
+      return
+    }
+    const st = this.streams.get(sid)
+    if (st === undefined) return
+    st.sendWindow = st.sendWindow + inc
+    if (st.sendWindow > MAX_WINDOW) throw new H2Fault(H2_FLOW_CONTROL_ERROR, sid, "h2: stream window overflow")
+    this.pump(st)
+  }
+
+  // A complete header block: a new request's headers, or the trailers of one.
+  private finishBlock(st: SrvStream): void throws H2Fault {
+    const block = st.block
+    st.block = []
+    let fields: HpackField[] = []
+    try {
+      fields = this.dec.decode(block)
+    } catch (e) {
+      throw new H2Fault(H2_COMPRESSION_ERROR, 0, "h2: bad header block")
+    }
+    if (st.headersDone) {
+      st.trailers = fields
+      if (!st.endStream) throw new H2Fault(H2_PROTOCOL_ERROR, st.id, "h2: trailers without END_STREAM")
+      this.endRequest(st)
+      return
+    }
+    st.headersDone = true
+    if (st.refused) {
+      this.streams.delete(st.id)
+      st.body.discard()
+      this.write(frameBytes(T_RST_STREAM, 0, st.id, be32(H2_REFUSED_STREAM)))
+      this.maybeClose()
+      return
+    }
+    let method = ""
+    let path = ""
+    let scheme = ""
+    let authority = ""
+    const hs: H2Header[] = []
+    for (const f of fields) {
+      if (f.name === ":method") method = f.value
+      else if (f.name === ":path") path = f.value
+      else if (f.name === ":scheme") scheme = f.value
+      else if (f.name === ":authority") authority = f.value
+      else if (!f.name.startsWith(":")) hs.push({ name: f.name, value: f.value })
+    }
+    if (method === "" || path === "") throw new H2Fault(H2_PROTOCOL_ERROR, st.id, "h2: a request needs :method and :path")
+    if (st.endStream) this.endRequest(st)
+    const req: H2Request = { method: method, path: path, scheme: scheme, authority: authority, headers: hs, body: st.body }
+    try {
+      this.handler(req, st.reply)
+    } catch (e) {
+      st.reply.reset(H2_INTERNAL_ERROR)
+    }
+  }
+
+  // The peer's end of the request body.
+  private endRequest(st: SrvStream): void {
+    st.ended = true
+    st.body.finish()
+    this.maybeRemove(st)
+  }
+
+  // Sends what the windows allow of a stream's queued response, then its end.
+  private pump(st: SrvStream): void {
+    if (st.responded && !st.finished) {
+      while (st.off < st.out.length && this.connWindow > 0 && st.sendWindow > 0) {
+        let n: int = st.out.length - st.off
+        if (n > this.connWindow) n = this.connWindow
+        if (n > st.sendWindow) n = st.sendWindow
+        if (n > this.peerMaxFrame) n = this.peerMaxFrame
+        this.write(frameBytes(T_DATA, 0, st.id, st.out.slice(st.off, st.off + n)))
+        st.off = st.off + n
+        this.connWindow = this.connWindow - n
+        st.sendWindow = st.sendWindow - n
+      }
+      if (st.off >= st.out.length) {
+        st.out = []
+        st.off = 0
+      }
+      if (st.endPending && st.off >= st.out.length) {
+        st.finished = true
+        st.endPending = false
+        const tr = st.trailers
+        if (tr !== undefined) this.sendBlock(st.id, this.enc.encode(tr), true)
+        else this.write(frameBytes(T_DATA, F_END_STREAM, st.id, []))
+        this.afterEnd(st)
+      }
+    }
+    this.wakeAll(st)
+  }
+
+  // The response has ended. The request body is given up (what comes of it is credited as
+  // it arrives), and a request the peer has not ended is reset with NO_ERROR.
+  private afterEnd(st: SrvStream): void {
+    const freed = st.body.discard()
+    this.credit(st.id, freed)
+    if (!st.ended) {
+      st.ended = true
+      this.write(frameBytes(T_RST_STREAM, 0, st.id, be32(H2_NO_ERROR)))
+    }
+    this.maybeRemove(st)
+  }
+
+  private pumpAll(): void {
+    for (const st of this.streams.values()) this.pump(st)
+  }
+
+  private maybeRemove(st: SrvStream): void {
+    if (st.finished && st.ended) {
+      this.streams.delete(st.id)
+      this.wakeAll(st)
+      this.maybeClose()
+    }
+  }
+
+  // A stream error: the stream is dropped and reset.
+  private streamError(sid: int, code: int): void {
+    this.dropStream(sid, `h2: the stream failed (code ${code})`)
+    this.write(frameBytes(T_RST_STREAM, 0, sid, be32(code)))
+  }
+
+  // Forgets a stream; its request body fails with msg.
+  private dropStream(sid: int, msg: string): void {
+    const st = this.streams.get(sid)
+    if (st === undefined) return
+    this.streams.delete(sid)
+    st.finished = true
+    st.body.fail(msg)
+    this.wakeAll(st)
+    this.maybeClose()
+  }
+
+  // Connection error: GOAWAY with the last stream the peer opened, then the socket closes
+  // once that is out.
+  private goaway(code: int, msg: string): void {
+    if (this.closed) return
+    const body: u8[] = be32(this.lastId)
+    for (const x of be32(code)) body.push(x)
+    for (const x of new TextEncoder().encode(msg)) body.push(x)
+    this.write(frameBytes(T_GOAWAY, 0, 0, body))
+    this.shut()
+  }
+
+  // The peer's GOAWAY was answered and no stream is left: the connection closes.
+  private maybeClose(): void {
+    if (this.goneAway && this.streams.size === 0 && !this.closed) this.goaway(H2_NO_ERROR, "")
+  }
+
+  private shut(): void {
+    this.closed = true
+    const s = this.sock
+    this.sock = undefined
+    if (s !== undefined) s.end()
+    this.failAll("h2: the connection closed")
+  }
+
+  private failAll(msg: string): void {
+    for (const id of this.streams.keys()) {
+      const st = this.streams.get(id)!
+      st.body.fail(msg)
+      this.wakeAll(st)
+    }
+    this.streams = new Map()
+  }
+
+  // Sends a header block (CONTINUATION frames when it is larger than a frame).
+  private sendBlock(sid: int, block: u8[], endStream: bool): void {
+    let off: int = 0
+    let first = true
+    while (true) {
+      let n: int = block.length - off
+      if (n > this.peerMaxFrame) n = this.peerMaxFrame
+      const last = off + n >= block.length
+      let flags: int = 0
+      if (last) flags = flags | F_END_HEADERS
+      if (first && endStream) flags = flags | F_END_STREAM
+      this.write(frameBytes(first ? T_HEADERS : T_CONTINUATION, flags, sid, block.slice(off, off + n)))
+      off = off + n
+      first = false
+      if (last) break
+    }
+  }
+
+  private wakeAll(st: SrvStream): void {
+    const ws = st.waiters
+    st.waiters = []
+    for (const f of ws) f()
+  }
+
+  private write(bytes: u8[]): void {
+    const s = this.sock
+    if (s !== undefined && !this.closed) s.write(bytes)
+  }
+}
+
+// Listens on a port and serves HTTP/2 with prior knowledge (h2c), as grpc-go does without
+// TLS. handler answers each request.
+export function listen(opts: { hostname: string, port: int, maxStreams?: int }, handler: H2Handler): TCPSocketListener<H2Session> {
+  const maxStreams = opts.maxStreams ?? 100
+  return Bun.listen<H2Session>({
+    hostname: opts.hostname,
+    port: opts.port,
+    socket: {
+      open(socket) {
+        const s = new H2Session(handler, maxStreams)
+        s.sock = socket
+        socket.data = s
+        s.start()
+      },
+      data(socket, bytes) {
+        const s = socket.data
+        if (s === undefined || s.closed) return
+        s.feed(bytes)
+      },
+      close(socket) {
+        const s = socket.data
+        if (s !== undefined) s.detach()
+        socket.data = undefined
+      },
+      error(socket) {
+        socket.terminate()
+      },
+    },
+  })
+}
+
+// ---- tests ----
 
 test("frame header: length, type, flags and stream id", () => {
   const f = frameBytes(T_HEADERS, 5, 3, [u8(1), u8(2)])
@@ -747,108 +1150,4 @@ test("frame header: length, type, flags and stream id", () => {
   expect(f[4]).toBe(u8(5))
   expect(f[8]).toBe(u8(3))
   expect(f[9]).toBe(u8(1))
-})
-
-test("HPACK integers: RFC 7541 C.1.1 and C.1.2", () => {
-  // 10 with a 5-bit prefix is one byte; 1337 with a 5-bit prefix is 1f 9a 0a
-  expect(intBytes(10, 5, 0)).toEqual([u8(10)])
-  expect(intBytes(1337, 5, 0)).toEqual([u8(31), u8(154), u8(10)])
-  expect(intBytes(42, 8, 0)).toEqual([u8(42)])
-  const r = try readInt([u8(31), u8(154), u8(10)], 0, 5)
-  expect(r.v).toBe(1337)
-  expect(r.next).toBe(3)
-})
-
-test("HPACK decodes the RFC 7541 C.2 literal examples", () => {
-  const d = new HpackDecoder()
-  // C.2.1 literal with indexing: custom-key: custom-header
-  const a = try d.decode(hexOf("400a637573746f6d2d6b65790d637573746f6d2d686561646572"))
-  expect(a).toEqual([{ name: "custom-key", value: "custom-header" }])
-  // C.2.2 without indexing, indexed name: :path /sample/path
-  const b = try d.decode(hexOf("040c2f73616d706c652f70617468"))
-  expect(b).toEqual([{ name: ":path", value: "/sample/path" }])
-  // C.2.4 indexed: :method GET
-  expect(try d.decode(hexOf("82"))).toEqual([{ name: ":method", value: "GET" }])
-})
-
-test("HPACK decodes Huffman strings: RFC 7541 C.4.1 and C.4.3", () => {
-  const d = new HpackDecoder()
-  // :method GET, :scheme http, :path /, :authority www.example.com (Huffman)
-  const r = try d.decode(hexOf("828684418cf1e3c2e5f23a6ba0ab90f4ff"))
-  expect(r).toEqual([
-    { name: ":method", value: "GET" },
-    { name: ":scheme", value: "http" },
-    { name: ":path", value: "/" },
-    { name: ":authority", value: "www.example.com" },
-  ])
-  // C.4.2 cache-control: no-cache (Huffman value, literal name index 24)
-  const c = try new HpackDecoder().decode(hexOf("5886a8eb10649cbf"))
-  expect(c).toEqual([{ name: "cache-control", value: "no-cache" }])
-})
-
-test("HPACK rejects an index past the tables and a truncated block", () => {
-  const d = new HpackDecoder()
-  let threw = false
-  try {
-    d.decode(hexOf("ff00"))
-  } catch (e) {
-    threw = true
-  }
-  expect(threw).toBe(true)
-  let cut = false
-  try {
-    d.decode(hexOf("400a6375"))
-  } catch (e) {
-    cut = true
-  }
-  expect(cut).toBe(true)
-})
-
-test("HPACK encoder output decodes back to the same fields", () => {
-  const hs: H2Header[] = [
-    { name: ":method", value: "POST" },
-    { name: "content-type", value: "application/grpc" },
-    { name: "x-team", value: "search-ünïcode" },
-  ]
-  const back = try new HpackDecoder().decode(hpackEncode(hs))
-  expect(back).toEqual(hs)
-})
-
-test("HPACK dynamic table carries over between blocks (reference encoder vectors)", () => {
-  // two blocks from the hpack package's encoder, with indexing and Huffman coding
-  const d = new HpackDecoder()
-  const first = try d.decode(hexOf("885f8b1d75d0620d263d4c4d6564408e9acac8b0c842d6958b510f21aa9b903485a9264fafa90b2d03497ea6f66aff408bf2b12d424f4ad3947216cf87ee3a2d2ac7a8bf"))
-  expect(first).toEqual([
-    { name: ":status", value: "200" },
-    { name: "content-type", value: "application/grpc" },
-    { name: "grpc-accept-encoding", value: "identity,deflate,gzip" },
-    { name: "x-custom-header", value: "value-one" },
-  ])
-  const second = try d.decode(hexOf("88c0bfbe40889acac8b21234da8f810740899acac8b5254207317f8d9cb450753c7fff1ffffdd65127"))
-  expect(second).toEqual([
-    { name: ":status", value: "200" },
-    { name: "content-type", value: "application/grpc" },
-    { name: "grpc-accept-encoding", value: "identity,deflate,gzip" },
-    { name: "x-custom-header", value: "value-one" },
-    { name: "grpc-status", value: "0" },
-    { name: "grpc-message", value: "hello wörld" },
-  ])
-})
-
-test("the static table has its 61 entries", () => {
-  expect(STATIC_NAME.length).toBe(61)
-  expect(STATIC_VALUE.length).toBe(61)
-  expect(STATIC_NAME[7]).toBe(":status")
-  expect(STATIC_VALUE[7]).toBe("200")
-})
-
-test("Huffman padding that is not all ones is refused", () => {
-  // 0x00 is five zero bits of code '0' padded with zeros
-  let threw = false
-  try {
-    huffDecode([u8(0)])
-  } catch (e) {
-    threw = true
-  }
-  expect(threw).toBe(true)
 })

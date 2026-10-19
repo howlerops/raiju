@@ -1,0 +1,348 @@
+// gRPC on the HTTP/2 server (h2.tov): the server side of the wire format. Each message
+// is a 5-byte prefix (a compressed flag and a 4-byte length) and the message bytes. Messages
+// are raw bytes here; the service decodes them (protobuf is not in this module). A call
+// answers with its status in the trailers, or in a trailers-only response when it fails
+// before any message. The client side is grpc.tov.
+
+import { H2Body, H2Header, H2Reply, H2Request, H2Handler } from "./h2"
+import { grpcFrame, percentDecode, headerValue } from "./grpc"
+
+export const GRPC_OK: int = 0
+export const GRPC_CANCELLED: int = 1
+export const GRPC_UNKNOWN: int = 2
+export const GRPC_INVALID_ARGUMENT: int = 3
+export const GRPC_DEADLINE_EXCEEDED: int = 4
+export const GRPC_NOT_FOUND: int = 5
+export const GRPC_ALREADY_EXISTS: int = 6
+export const GRPC_PERMISSION_DENIED: int = 7
+export const GRPC_RESOURCE_EXHAUSTED: int = 8
+export const GRPC_FAILED_PRECONDITION: int = 9
+export const GRPC_ABORTED: int = 10
+export const GRPC_OUT_OF_RANGE: int = 11
+export const GRPC_UNIMPLEMENTED: int = 12
+export const GRPC_INTERNAL: int = 13
+export const GRPC_UNAVAILABLE: int = 14
+export const GRPC_DATA_LOSS: int = 15
+export const GRPC_UNAUTHENTICATED: int = 16
+
+// A failure of a call with its status. Thrown by a method, it becomes the call's status.
+export class GrpcError extends Error {
+  constructor(readonly code: int, message: string) {
+    super(message)
+  }
+}
+
+// The HTTP status of a non-gRPC answer, as gRPC maps it (the spec's HTTP to gRPC table).
+export function httpToGrpc(status: int): int {
+  if (status === 400) return GRPC_INTERNAL
+  if (status === 401) return GRPC_UNAUTHENTICATED
+  if (status === 403) return GRPC_PERMISSION_DENIED
+  if (status === 404) return GRPC_UNIMPLEMENTED
+  if (status === 429 || status === 502 || status === 503 || status === 504) return GRPC_UNAVAILABLE
+  return GRPC_UNKNOWN
+}
+
+// A grpc-timeout value (digits and a unit: H, M, S, m, u, n) in milliseconds, rounded down;
+// -1 when it is malformed. At most 8 digits, as the spec allows.
+export function parseTimeout(v: string): int {
+  const b = new TextEncoder().encode(v)
+  if (b.length < 2 || b.length > 9) return -1
+  let n: int = 0
+  for (let i = 0; i < b.length - 1; i++) {
+    const d = int(b[i]!) - 48
+    if (d < 0 || d > 9) return -1
+    n = n * 10 + d
+  }
+  const unit = int(b[b.length - 1]!)
+  if (unit === 72) return n * 3600000
+  if (unit === 77) return n * 60000
+  if (unit === 83) return n * 1000
+  if (unit === 109) return n
+  if (unit === 117) return Math.floor(n / 1000)
+  if (unit === 110) return Math.floor(n / 1000000)
+  return -1
+}
+
+// grpc-message: UTF-8 with every byte outside printable ASCII, and '%', written as %XX.
+export function percentEncode(s: string): string throws Error {
+  const digits = new TextEncoder().encode("0123456789ABCDEF")
+  const out: u8[] = []
+  for (const b of new TextEncoder().encode(s)) {
+    const c = int(b)
+    if (c >= 32 && c <= 126 && c !== 37) {
+      out.push(b)
+    } else {
+      out.push(u8(37))
+      out.push(digits[c >> 4]!)
+      out.push(digits[c & 15]!)
+    }
+  }
+  const d = try new TextDecoder()
+  return try d.decode(out)
+}
+
+// Splits the request body into messages. Bytes come in pieces, as the body delivers them.
+export class GrpcDeframer {
+  private buf: u8[] = []
+
+  constructor(readonly maxRecv: int) {}
+
+  push(b: u8[]): void {
+    for (const x of b) this.buf.push(x)
+  }
+
+  // Bytes held that are not yet a message.
+  pending(): int {
+    return this.buf.length
+  }
+
+  // The next whole message, or undefined while it is incomplete. A compressed message is
+  // refused (no grpc-encoding is accepted), and so is one over maxRecv.
+  next(): u8[] | undefined throws GrpcError {
+    if (this.buf.length < 5) return undefined
+    if (int(this.buf[0]!) !== 0) throw new GrpcError(GRPC_UNIMPLEMENTED, "compressed messages are not supported")
+    const n = (int(this.buf[1]!) << 24) | (int(this.buf[2]!) << 16) | (int(this.buf[3]!) << 8) | int(this.buf[4]!)
+    if (n > this.maxRecv) throw new GrpcError(GRPC_RESOURCE_EXHAUSTED, `grpc: received message larger than max (${n} vs. ${this.maxRecv})`)
+    if (this.buf.length < 5 + n) return undefined
+    const msg = this.buf.slice(5, 5 + n)
+    this.buf = this.buf.slice(5 + n)
+    return msg
+  }
+}
+
+// Metadata the transport owns: it is not passed to the method.
+function transportHeader(name: string): bool {
+  if (name.startsWith(":")) return true
+  return name === "content-type" || name === "te" || name === "grpc-timeout" || name === "grpc-encoding" || name === "grpc-accept-encoding" || name === "user-agent" || name === "content-length"
+}
+
+// One call on the server: the request's metadata and deadline, its messages in and out, and
+// its status. The head is sent with the first message, or with sendHeaders.
+export class GrpcCall {
+  // the request's metadata (without the transport's own fields)
+  metadata: H2Header[] = []
+  // the deadline as Date.now() milliseconds, when the request set grpc-timeout
+  deadlineMs: int | undefined = undefined
+  // extra trailing metadata, sent with the status
+  trailers: H2Header[] = []
+  private headSent: bool = false
+  private ended: bool = false
+  private df: GrpcDeframer
+  private body: H2Body
+  private reply: H2Reply
+
+  constructor(req: H2Request, reply: H2Reply, maxRecv: int) {
+    this.body = req.body
+    this.reply = reply
+    this.df = new GrpcDeframer(maxRecv)
+    for (const h of req.headers) {
+      if (!transportHeader(h.name)) this.metadata.push(h)
+    }
+  }
+
+  // Sends the response head with metadata. Once; a message sends it when it has not gone.
+  sendHeaders(md: H2Header[]): void {
+    if (this.headSent) return
+    this.headSent = true
+    const hs: H2Header[] = [{ name: "content-type", value: "application/grpc" }]
+    for (const h of md) hs.push(h)
+    this.reply.headers(hs)
+  }
+
+  // The next request message, or undefined at the end of the request. A bad frame, or a
+  // message over the limit, is a GrpcError.
+  async recv(): Promise<u8[] | undefined, Error> {
+    while (true) {
+      const m = try this.df.next()
+      if (m !== undefined) return m
+      const piece = try await this.body.next()
+      if (piece === undefined) {
+        if (this.df.pending() === 0) return undefined
+        throw new GrpcError(GRPC_INTERNAL, "the request ends inside a message")
+      }
+      this.df.push(piece)
+    }
+  }
+
+  // Sends one response message.
+  async send(msg: u8[]): Promise<void, Error> {
+    this.sendHeaders([])
+    try await this.reply.write(grpcFrame(msg))
+  }
+
+  // The status of the call, once. Before any head it is a trailers-only response; after
+  // one, the status goes in the trailers.
+  finish(status: int, message: string): void throws Error {
+    if (this.ended) return
+    this.ended = true
+    const tr: H2Header[] = [{ name: "grpc-status", value: "" + status }]
+    if (message !== "") tr.push({ name: "grpc-message", value: try percentEncode(message) })
+    for (const h of this.trailers) tr.push(h)
+    if (!this.headSent) {
+      this.headSent = true
+      const hs: H2Header[] = [{ name: "content-type", value: "application/grpc" }]
+      for (const h of tr) hs.push(h)
+      this.reply.trailersOnly(hs)
+    } else {
+      this.reply.end(tr)
+    }
+  }
+}
+
+// A method's body: it gets the call and sends its messages; a GrpcError is its status.
+export type GrpcRun = (call: GrpcCall) => Promise<void, Error>
+
+// A unary method: one request message, one response message.
+export function unaryRun(fn: (req: u8[], call: GrpcCall) => Promise<u8[], Error>): GrpcRun {
+  return async (call: GrpcCall): Promise<void, Error> => {
+    const req = try await call.recv()
+    if (req === undefined) throw new GrpcError(GRPC_INTERNAL, "no request message")
+    const more = try await call.recv()
+    if (more !== undefined) throw new GrpcError(GRPC_INTERNAL, "more than one request message")
+    const out = try await fn(req, call)
+    try await call.send(out)
+  }
+}
+
+// A server-streaming method: one request message, then as many responses as fn sends.
+export function serverRun(fn: (req: u8[], call: GrpcCall) => Promise<void, Error>): GrpcRun {
+  return async (call: GrpcCall): Promise<void, Error> => {
+    const req = try await call.recv()
+    if (req === undefined) throw new GrpcError(GRPC_INTERNAL, "no request message")
+    try await fn(req, call)
+  }
+}
+
+// A client-streaming method: the request messages in, one response message out.
+export function clientRun(fn: (call: GrpcCall) => Promise<u8[], Error>): GrpcRun {
+  return async (call: GrpcCall): Promise<void, Error> => {
+    const out = try await fn(call)
+    try await call.send(out)
+  }
+}
+
+// The method's run to the end, then its status. A GrpcError is its code; anything else is
+// INTERNAL, with no detail sent.
+async function runCall(run: GrpcRun, call: GrpcCall): Promise<void, Error> {
+  let code: int = GRPC_OK
+  let msg = ""
+  try {
+    try await run(call)
+  } catch (e) {
+    if (e instanceof GrpcError) {
+      code = e.code
+      msg = e.message
+    } else {
+      code = GRPC_INTERNAL
+      msg = "internal error"
+    }
+  }
+  try call.finish(code, msg)
+}
+
+// An h2 handler that serves gRPC: methods by path (/pkg.Service/Method), maxRecv the largest
+// request message (grpc-go's default is 4 MiB). Anything else is answered as gRPC does: a
+// non-POST is 405, a content type other than application/grpc is 415, an unknown method is
+// UNIMPLEMENTED, and a malformed grpc-timeout is INTERNAL.
+export function grpcServe(methods: Map<string, GrpcRun>, maxRecv: int): H2Handler {
+  return (req: H2Request, res: H2Reply) => {
+    if (req.method !== "POST") {
+      res.trailersOnly([{ name: ":status", value: "405" }])
+      return
+    }
+    const ct = headerValue(req.headers, "content-type") ?? ""
+    if (!ct.startsWith("application/grpc")) {
+      res.trailersOnly([{ name: ":status", value: "415" }])
+      return
+    }
+    const call = new GrpcCall(req, res, maxRecv)
+    const enc = headerValue(req.headers, "grpc-encoding")
+    if (enc !== undefined && enc !== "identity") {
+      try call.finish(GRPC_UNIMPLEMENTED, "grpc-encoding " + enc + " is not supported")
+      return
+    }
+    const to = headerValue(req.headers, "grpc-timeout")
+    if (to !== undefined) {
+      const ms = parseTimeout(to)
+      if (ms < 0) {
+        try call.finish(GRPC_INTERNAL, "malformed time-out")
+        return
+      }
+      call.deadlineMs = Math.trunc(Date.now()) + ms
+    }
+    const run = methods.get(req.path)
+    if (run === undefined) {
+      try call.finish(GRPC_UNIMPLEMENTED, "unknown method " + req.path)
+      return
+    }
+    runCall(run, call)
+  }
+}
+
+// ---- tests ----
+
+test("gRPC status codes and the HTTP mapping table", () => {
+  expect(GRPC_UNIMPLEMENTED).toBe(12)
+  expect(GRPC_UNAUTHENTICATED).toBe(16)
+  expect(httpToGrpc(401)).toBe(GRPC_UNAUTHENTICATED)
+  expect(httpToGrpc(404)).toBe(GRPC_UNIMPLEMENTED)
+  expect(httpToGrpc(429)).toBe(GRPC_UNAVAILABLE)
+  expect(httpToGrpc(503)).toBe(GRPC_UNAVAILABLE)
+  expect(httpToGrpc(500)).toBe(GRPC_UNKNOWN)
+  expect(httpToGrpc(200)).toBe(GRPC_UNKNOWN)
+})
+
+test("grpc-timeout: each unit, and malformed values", () => {
+  expect(parseTimeout("5S")).toBe(5000)
+  expect(parseTimeout("100m")).toBe(100)
+  expect(parseTimeout("2M")).toBe(120000)
+  expect(parseTimeout("1H")).toBe(3600000)
+  expect(parseTimeout("1500u")).toBe(1)
+  expect(parseTimeout("2000000n")).toBe(2)
+  expect(parseTimeout("")).toBe(-1)
+  expect(parseTimeout("S")).toBe(-1)
+  expect(parseTimeout("5x")).toBe(-1)
+  expect(parseTimeout("1.5S")).toBe(-1)
+  expect(parseTimeout("123456789S")).toBe(-1)
+})
+
+test("grpc-message percent-encodes what is not printable ASCII, and decodes back", () => {
+  expect(try percentEncode("plain text")).toBe("plain text")
+  expect(try percentEncode("100%")).toBe("100%25")
+  expect(try percentEncode("wörld")).toBe("w%C3%B6rld")
+  expect(try percentDecode(try percentEncode("wörld 100% \n"))).toBe("wörld 100% \n")
+})
+
+test("the deframer joins messages across pieces and refuses compressed or oversize ones", () => {
+  const d = new GrpcDeframer(16)
+  // one message of 3 bytes, cut into single bytes, then a second message whole
+  const wire = grpcFrame([u8(1), u8(2), u8(3)]).concat(grpcFrame([u8(9)]))
+  let got: u8[][] = []
+  for (const b of wire) {
+    d.push([b])
+    const m = try d.next()
+    if (m !== undefined) got.push(m)
+  }
+  expect(got).toEqual([[u8(1), u8(2), u8(3)], [u8(9)]])
+  expect(d.pending()).toBe(0)
+
+  let compressed = false
+  try {
+    const c = new GrpcDeframer(16)
+    c.push([u8(1), u8(0), u8(0), u8(0), u8(0)])
+    const x = try c.next()
+  } catch (e) {
+    compressed = e instanceof GrpcError && e.code === GRPC_UNIMPLEMENTED
+  }
+  expect(compressed).toBe(true)
+
+  let over = false
+  try {
+    const o = new GrpcDeframer(4)
+    o.push([u8(0), u8(0), u8(0), u8(0), u8(5)])
+    const y = try o.next()
+  } catch (e) {
+    over = e instanceof GrpcError && e.code === GRPC_RESOURCE_EXHAUSTED
+  }
+  expect(over).toBe(true)
+})
