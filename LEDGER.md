@@ -352,6 +352,6 @@ fast-forwarding their worktree to the branch tip.
 | L137 | G40 | Realtime and live: one log row per turn as Bifrost logs them, and budgets charged per window or turn, not at session end | worker | assigned |
 | L138 | (g) A2A | A2A push store shared by every worker of a node (and the cluster where Bifrost shares it); the gRPC binding | worker | assigned |
 | L139 | (e) | LLM plugin hooks on the Anthropic Messages, GenAI, Bedrock and Cohere routes | worker | assigned |
-| L140 | (g) MCP | Token-exchange admin credential refreshed before it expires, as Bifrost does | worker | todo |
+| L140 | (g) MCP | Token-exchange admin credential refreshed before it expires, as Bifrost does | worker | assigned |
 | L141 | UI | Chart zoom and series toggles; a permission editor for custom roles | worker | assigned |
 
