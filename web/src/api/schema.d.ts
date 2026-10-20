@@ -48,7 +48,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Server-to-client event stream (sends a connection event, then ends) */
+        /** Server-to-client event stream (a connection event, then a heartbeat comment every 15 s until the client leaves) */
         get: operations["getMcp"];
         put?: never;
         /** MCP server endpoint (JSON-RPC 2.0): initialize, tools/list, tools/call over the connected MCP clients */
@@ -67,7 +67,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Server-to-client event stream for one virtual MCP (sends a connection event, then ends) */
+        /** Server-to-client event stream for one virtual MCP (a connection event, then heartbeats until the client leaves) */
         get: operations["getMcpName"];
         put?: never;
         /** MCP server endpoint for one virtual MCP (its tool set, under its name) */
@@ -3393,6 +3393,87 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/mcp/library": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the MCP server library
+         * @description The catalog of installable MCP servers, synced from framework.pricing.mcp_library_url (pricing_sync.mcp_library_url) and kept beside the config file, with the custom servers published here. Paged (limit 25 by default, at most 100), searchable over name, description and publisher, filtered by category, connection_type and auth_type (comma lists) and tags (each one named must be carried), sorted by name, category, publisher, created_at or updated_at.
+         */
+        get: operations["getApiMcpLibrary"];
+        put?: never;
+        /**
+         * Publish a custom MCP server in the library
+         * @description An org-internal ("custom") server; the remote sync never overwrites it. Its slug is made from its name, and a taken slug is a 409.
+         */
+        post: operations["postApiMcpLibrary"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/library/filterdata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The library's distinct categories, connection types, auth types and tags */
+        get: operations["getApiMcpLibraryFilterdata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/library/force-sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sync the MCP server library now
+         * @description Fetches the catalog from mcp_library_url (https://getbifrost.ai/mcp-library when unset; file:// URLs are read) and upserts its servers. Custom and hidden servers are left alone.
+         */
+        post: operations["postApiMcpLibraryForceSync"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/library/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Hide a library server
+         * @description Hides a remote or custom server for good; the sync does not bring it back.
+         */
+        delete: operations["deleteApiMcpLibraryId"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/mcp/openapi/preview": {
         parameters: {
             query?: never;
@@ -3404,7 +3485,7 @@ export interface paths {
         put?: never;
         /**
          * Preview an OpenAPI document as MCP tools
-         * @description Parses a JSON OpenAPI 3.x document (inline spec, or spec_url fetched now) and lists the tool each operation would make. No client is created. YAML and Swagger 2.0 are refused.
+         * @description Parses an OpenAPI 3.x or Swagger 2.0 document, JSON or YAML (inline spec, or spec_url fetched now), resolves its local $refs and lists the tool each operation would make with its flattened input schema, the operations that cannot become tools and why, and the warnings. No client is created. A fetched document comes back as spec, with the spec_url it was read from.
          */
         post: operations["postApiMcpOpenapiPreview"];
         delete?: never;
@@ -3707,7 +3788,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** OpenAPI spec of an OpenAPI-defined MCP client (none are supported: 404) */
+        /**
+         * The stored OpenAPI document of an OpenAPI-defined MCP client
+         * @description The document as it was stored: inline, or fetched from spec_url when the client was created or updated over the API. Served as application/json or application/yaml by its form. A client from config.json that names only a spec_url has no stored document (404).
+         */
         get: operations["getApiMcpClientNameOpenapiSpec"];
         put?: never;
         post?: never;
@@ -4500,6 +4584,29 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description One MCP server of the library (Bifrost's mcp_library row) */
+        McpLibraryEntry: {
+            id?: number;
+            slug?: string;
+            name?: string;
+            description?: string;
+            category?: string;
+            /** @enum {string} */
+            connection_type?: "http" | "stdio" | "sse";
+            connection_url?: string;
+            stdio_config?: Record<string, never>;
+            auth_type?: string;
+            required_header_keys?: string[];
+            icon_url?: string;
+            docs_url?: string;
+            publisher?: string;
+            tags?: string[];
+            metadata?: Record<string, never>;
+            /** @enum {string} */
+            source?: "remote" | "custom";
+            created_at?: string;
+            updated_at?: string;
+        };
         /** @description One role of a crew and the candidate that plays it. */
         CrewPart: {
             role: string;
@@ -6429,12 +6536,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description text/event-stream with one connection/opened event */
+            /** @description text/event-stream: a connection/opened event, then ": heartbeat" comment lines every 15 seconds; the stream stays open until the client closes it */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "text/event-stream": string;
+                };
             };
             /** @description Authentication required, or the session or token is not valid. */
             401: {
@@ -6564,12 +6673,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description text/event-stream with one connection/opened event */
+            /** @description text/event-stream: a connection/opened event, then ": heartbeat" comment lines every 15 seconds; the stream stays open until the client closes it */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "text/event-stream": string;
+                };
             };
             /** @description Authentication required, or the session or token is not valid. */
             401: {
@@ -22344,6 +22455,348 @@ export interface operations {
             };
         };
     };
+    getApiMcpLibrary: {
+        parameters: {
+            query?: {
+                search?: string;
+                category?: string;
+                connection_type?: string;
+                auth_type?: string;
+                tags?: string;
+                sort_by?: "name" | "category" | "publisher" | "created_at" | "updated_at";
+                order?: "asc" | "desc";
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of library servers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        servers?: components["schemas"]["McpLibraryEntry"][];
+                        count?: number;
+                        total_count?: number;
+                        limit?: number;
+                        offset?: number;
+                    };
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiMcpLibrary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    name: string;
+                    description?: string;
+                    category?: string;
+                    /** @enum {string} */
+                    connection_type: "http" | "stdio" | "sse";
+                    connection_url?: string;
+                    stdio_config?: Record<string, never>;
+                    /** @enum {string} */
+                    auth_type?: "none" | "headers" | "oauth" | "per_user_oauth" | "per_user_headers" | "token_exchange";
+                    required_header_keys?: string[];
+                    icon_url?: string;
+                    docs_url?: string;
+                    publisher?: string;
+                    tags?: string[];
+                };
+            };
+        };
+        responses: {
+            /** @description Published */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        status?: string;
+                        message?: string;
+                        entry?: components["schemas"]["McpLibraryEntry"];
+                    };
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description A library server with this name (slug) exists already. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The library could not be synced or saved. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway runs without a config file, so it keeps no library. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiMcpLibraryFilterdata: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The facets */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        categories?: string[];
+                        connection_types?: string[];
+                        auth_types?: string[];
+                        tags?: string[];
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiMcpLibraryForceSync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Synced */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        status?: string;
+                        message?: string;
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The library could not be synced or saved. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway runs without a config file, so it keeps no library. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiMcpLibraryId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The library server's id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hidden */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        status?: string;
+                        message?: string;
+                    };
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The library could not be synced or saved. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway runs without a config file, so it keeps no library. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     postApiMcpOpenapiPreview: {
         parameters: {
             query?: never;
@@ -22373,13 +22826,24 @@ export interface operations {
                         title?: string;
                         version?: string;
                         openapi_version?: string;
+                        description?: string;
+                        servers?: string[];
                         base_url?: string;
+                        operation_servers?: boolean;
+                        security_schemes?: Record<string, never>[];
                         tool_count?: number;
                         tools?: Record<string, never>[];
+                        unsupported?: Record<string, never>[];
+                        warnings?: string[];
+                        spec_size?: number;
+                        spec_hash?: string;
+                        /** @description The fetched document, when the request named a spec_url */
+                        spec?: string;
+                        spec_url?: string;
                     };
                 };
             };
-            /** @description No spec, the document is not OpenAPI 3.x JSON, or spec_url could not be fetched. */
+            /** @description No spec, the document is not an OpenAPI 3.x or Swagger 2.0 document (JSON or YAML), or spec_url could not be fetched. */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -23174,13 +23638,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description OK */
+            /** @description The stored document */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                    "application/json": Record<string, never>;
+                    "application/yaml": string;
                 };
             };
             /** @description Authentication required, or the session or token is not valid. */

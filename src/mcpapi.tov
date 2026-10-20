@@ -14,14 +14,15 @@ import { secureHex } from "./crypto"
 import { McpClientConfig, McpConfig, McpTlsConfig, McpUserCredential, McpHeaderFlow, McpSession, sanitizeName, durationMsOf, userHeadersOf } from "./mcp"
 import { McpTokenExchange, IdpEndpoints, exchangeToken, adminCredential, needsReverify } from "./tokenexchange"
 import { McpUserToken, UserFlow, userFlowById, userFlowsLive, takeUserFlow, forgetUserFlows, dropUserFlow, startUserFlow, exchangeUserCode, rowFromTokens, upsertUserRow, dropUserRow, userTokenIndex, tokenAction, flowIdOfPath, consentLink } from "./mcpuser"
-import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, parseSpec, inputSchema } from "./openapi"
+import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, Unsupported, parseSpec, inputSchema, previewJson, baseUrlOf, operationServersCover } from "./openapi"
+import { targetProblem } from "./netguard"
 import * as vmcp from "./vmcp"
-import { Field, fields, elements, find, quote, rawStr, rawNum, rawBool } from "./json"
+import { Field, fields, elements, find, quote, rawStr, rawNum, rawBool, setField, build } from "./json"
 
 // The reply. action asks the lead to run a step on the live manager after sending body:
 // "reconnect" or "refresh" for the client named by id. For a refresh the lead answers with
 // the tool count itself.
-export type McpReply = { status: int, body: string, action?: "reconnect" | "refresh", id?: string }
+export type McpReply = { status: int, body: string, action?: "reconnect" | "refresh", id?: string, contentType?: string }
 
 type ClientBody = {
   name?: string,
@@ -59,6 +60,8 @@ const CLIENT_KINDS: string[] = ["name:s", "connection_type:s", "connection_strin
 const VMCP_KINDS: string[] = ["name:s", "endpoint_slug:s", "description:s", "enabled:b", "tools:a"]
 const TOOL_KINDS: string[] = ["mcp_client_id:s", "tool_names:a", "source:s", "as:s", "description:s", "defaults:s"]
 const CONNECT_MS = 15000
+// a spec_url fetched for a caller (Bifrost's openAPISpecFetchTimeout)
+const SPEC_FETCH_MS = 15000
 const VERIFY_ROUTES: string[] =["complete-oauth", "initiate-verification", "reauthorize", "reregister", "verify-headers", "verify-exchange"]
 
 function reply(status: int, body: string): McpReply {
@@ -318,6 +321,17 @@ function maskCreds(m: Map<string, OpenApiCred> | undefined): Map<string, OpenApi
 function keepOpenApi(incoming: OpenApiConfig | undefined, old: OpenApiConfig | undefined): OpenApiConfig | undefined {
   if (incoming === undefined) return undefined
   let n = incoming
+  // the fields an update leaves out keep their stored values
+  if (old !== undefined) {
+    if ((n.spec ?? "") === "" && (n.spec_url ?? "") === "") {
+      n.spec = old.spec
+      n.spec_url = old.spec_url
+    }
+    if (n.base_url === undefined) n.base_url = old.base_url
+    if (n.include_deprecated === undefined) n.include_deprecated = old.include_deprecated
+    if (n.max_response_bytes === undefined) n.max_response_bytes = old.max_response_bytes
+    if (n.security_credentials === undefined) n.security_credentials = old.security_credentials
+  }
   const oldCreds = old === undefined ? undefined : old.security_credentials
   if (n.security_credentials !== undefined) {
     const out: Map<string, OpenApiCred> = new Map()
@@ -365,7 +379,7 @@ function authError(a: McpAuthConfig | undefined): string {
 function connectionError(b: ClientBody, ct: string): string {
   if (ct === "openapi") {
     const oc = b.openapi_config
-    if (oc === undefined || ((oc.spec ?? "") === "" && (oc.spec_url ?? "") === "")) return "openapi_config needs spec or spec_url for openapi connections"
+    if (oc === undefined || ((oc.spec ?? "") === "" && (oc.spec_url ?? "") === "")) return "openapi_config requires spec (inline document) or spec_url"
     if ((b.connection_string ?? "") !== "") return "connection_string must not be set for openapi connections"
     return ""
   }
@@ -509,14 +523,13 @@ function createClient(store: ConfigStore, body: string, publicOnly: bool): McpRe
   }
   const ct = b.connection_type ?? ""
   if (ct !== "http" && ct !== "sse" && ct !== "stdio" && ct !== "openapi") return fail(400, `Invalid connection_type "${ct}": must be one of http, sse, stdio, openapi`)
-  // an inline spec is checked now; a spec_url is fetched when the client connects
-  const specText = b.openapi_config?.spec ?? ""
-  if (specText !== "") {
-    try {
-      parseSpec(specText, b.openapi_config?.include_deprecated === true)
-    } catch (e) {
-      return fail(400, `openapi_config.spec: ${e.message}`)
-    }
+  // the document is checked now (a spec_url was fetched and inlined before this, see inlineSpecUrl)
+  let openapiCfg: OpenApiConfig | undefined = undefined
+  if ((b.openapi_config?.spec_file ?? "").trim() !== "") return fail(400, "openapi_config.spec_file is only supported in config.json; send the document as spec or spec_url")
+  if (ct === "openapi" && b.openapi_config !== undefined && (b.openapi_config.spec ?? "") !== "") {
+    const oc = openapiChecked(name, b.openapi_config, b.tools_to_execute, b.tools_to_auto_execute)
+    if (oc.error !== undefined) return oc.error
+    openapiCfg = oc.config
   }
   const auth = b.auth_type ?? "none"
   const pue = perUserError(auth, ct, b.auth?.type ?? "", b.per_user_header_keys)
@@ -539,7 +552,7 @@ function createClient(store: ConfigStore, body: string, publicOnly: bool): McpRe
   if (ct !== "http" && sticky === false) return fail(400, "needs_session_stickiness false applies only to http connections: sse and stdio stay sticky")
 
   let c: McpClientConfig = { name: name, connection_type: ct }
-  if (ct === "openapi") c.openapi_config = b.openapi_config
+  if (ct === "openapi") c.openapi_config = openapiCfg ?? b.openapi_config
   c.tool_execution_timeout = to.value
   c.is_ping_available = b.is_ping_available ?? true
   c.is_code_mode_client = b.is_code_mode_client
@@ -620,7 +633,15 @@ function updateClient(store: ConfigStore, id: string, body: string, publicOnly: 
   }
   if (has(fs, "openapi_config")) {
     if (c.connection_type !== "openapi") return fail(400, "openapi_config applies only to openapi connections")
-    c.openapi_config = keepOpenApi(b.openapi_config, c.openapi_config)
+    if ((b.openapi_config?.spec_file ?? "").trim() !== "") return fail(400, "openapi_config.spec_file is only supported in config.json; send the document as spec or spec_url")
+    const merged = keepOpenApi(b.openapi_config, c.openapi_config)
+    if (merged !== undefined && (merged.spec ?? "") !== "") {
+      const oc = openapiChecked(c.name, merged, has(fs, "tools_to_execute") ? b.tools_to_execute : c.tools_to_execute, has(fs, "tools_to_auto_execute") ? b.tools_to_auto_execute : c.tools_to_auto_execute)
+      if (oc.error !== undefined) return oc.error
+      c.openapi_config = oc.config
+    } else {
+      c.openapi_config = merged
+    }
   }
   if (has(fs, "is_ping_available")) c.is_ping_available = b.is_ping_available
   if (has(fs, "is_code_mode_client")) c.is_code_mode_client = b.is_code_mode_client
@@ -697,15 +718,112 @@ function runClient(store: ConfigStore, id: string, step: string): McpReply {
   return { status: 200, body: `{"status":"success","message":"MCP client tools refreshed successfully"}`, action: "refresh", id: id }
 }
 
-// The inline OpenAPI document of an openapi client, as it was stored. A spec_url client keeps only the URL.
+// The OpenAPI document of an openapi client, as it was stored (a spec_url sent over the API is fetched and
+// stored with the client). A client from config.json that names only a spec_url fetches it when it connects.
 function openapiSpec(store: ConfigStore, id: string): McpReply {
   const list = clientsOf(store.cfg)
   const at = clientIndex(list, id)
   if (at < 0) return fail(404, "OpenAPI MCP client not found")
   const c = list[at]!
+  if (c.connection_type !== "openapi") return fail(404, "OpenAPI MCP client not found")
   const spec = c.openapi_config?.spec ?? ""
-  if (c.connection_type !== "openapi" || spec === "") return fail(404, "OpenAPI MCP client not found")
-  return reply(200, spec)
+  if (spec.trim() === "") return fail(404, "This client has no stored spec (it is fetched from spec_url at connect time)")
+  return { status: 200, body: spec, contentType: spec.trim().startsWith("{") ? "application/json; charset=utf-8" : "application/yaml; charset=utf-8" }
+}
+
+// Bifrost's prepareOpenAPIConfig for a document sent over the API: max_response_bytes not negative, a document
+// that parses and yields at least one tool, a base URL (base_url or an absolute server, unless every operation
+// names its own), tool lists that name tools the spec defines; the server-computed fields are filled in.
+function openapiChecked(name: string, oc: OpenApiConfig, toolsToExecute: string[] | undefined, toolsToAuto: string[] | undefined): { error?: McpReply, config: OpenApiConfig } {
+  let n = oc
+  if ((n.max_response_bytes ?? 0) < 0) return { error: fail(400, "openapi_config.max_response_bytes must not be negative"), config: n }
+  const text = n.spec ?? ""
+  if (text.trim() === "") return { error: fail(400, "openapi_config requires spec (inline document) or spec_url"), config: n }
+  let doc: OpenApiDoc | undefined = undefined
+  try {
+    doc = parseSpec(text, n.include_deprecated === true, n.spec_url ?? "", name)
+  } catch (e) {
+    return { error: fail(e.message.includes("exceeds") ? 413 : 400, `Invalid openapi_config.spec: ${e.message}`), config: n }
+  }
+  const d = doc!
+  if (d.ops.length === 0) {
+    const reasons = d.unsupported.map((u: Unsupported): string => `${u.method} ${u.path}: ${u.reason}`)
+    return { error: fail(400, "No operation in the spec can be exposed as a tool: " + reasons.join("; ")), config: n }
+  }
+  const bu = (n.base_url ?? "").trim()
+  n.base_url = bu === "" ? undefined : (bu.endsWith("/") ? bu.slice(0, bu.byteLength - 1) : bu)
+  const b = baseUrlOf(d, n.base_url ?? "")
+  if (b.base === "" && !operationServersCover(d)) return { error: fail(400, "The spec declares no absolute server URL; set openapi_config.base_url"), config: n }
+  const names = d.ops.map((o: OpenApiOp): string => o.name)
+  const ue = (toolsToExecute ?? []).filter((t) => t !== "*" && !names.includes(t))
+  if (ue.length > 0) return { error: fail(400, `Invalid tools_to_execute: the spec defines no tool named ${ue.join(", ")}`), config: n }
+  const ua = (toolsToAuto ?? []).filter((t) => t !== "*" && !names.includes(t))
+  if (ua.length > 0) return { error: fail(400, `Invalid tools_to_auto_execute: the spec defines no tool named ${ua.join(", ")}`), config: n }
+  n.spec_size = d.spec_size
+  n.spec_hash = d.spec_hash
+  n.spec_title = d.title
+  n.openapi_version = d.openapi_version
+  n.operation_count = d.ops.length
+  return { config: n }
+}
+
+// Fetches a spec_url for the caller. With dashboard auth off only a public address may be fetched. error is
+// set (with the status to answer) when it cannot be.
+async function fetchSpec(url: string, publicOnly: bool): Promise<{ text: string, error?: McpReply }> {
+  const u = url.trim()
+  if (!u.startsWith("http://") && !u.startsWith("https://")) return { text: "", error: fail(400, `could not load spec_url: invalid spec_url: "${u}" must be an http(s) URL`) }
+  if (publicOnly) {
+    const pr = targetProblem(u, [])
+    if (pr !== "") return { text: "", error: fail(403, pr) }
+  }
+  const dl = deadline(SPEC_FETCH_MS)
+  try {
+    const hs: Record<string, string> = new Map()
+    hs.set("accept", "application/json, application/yaml, application/x-yaml, text/yaml, text/plain;q=0.9, */*;q=0.1")
+    hs.set("user-agent", "Bifrost-OpenAPI-MCP/1.0")
+    const r = await fetch(u, { headers: hs, signal: dl.controller.signal })
+    if (r.status < 200 || r.status >= 300) return { text: "", error: fail(400, `could not load spec_url: fetching spec_url: upstream returned HTTP ${r.status}`) }
+    const text = await r.text()
+    if (text.byteLength > 5242880) return { text: "", error: fail(413, "could not load spec_url: openapi spec exceeds 5242880 bytes") }
+    if (text.trim() === "") return { text: "", error: fail(400, "could not load spec_url: openapi spec is empty") }
+    return { text: text }
+  } catch (e) {
+    const q = e.message.indexOf("?")
+    return { text: "", error: fail(400, `could not load spec_url: fetching spec_url: ${q < 0 ? e.message : e.message.slice(0, q)}`) }
+  } finally {
+    dl.finish()
+  }
+}
+
+// A create or update of an openapi client whose openapi_config names a spec_url and no spec: the document is
+// fetched now and stored inline with the client (spec_url stays as its provenance), as Bifrost does. Any other
+// request passes through unchanged; error is set when the fetch fails.
+export async function inlineSpecUrl(method: string, path: string, body: string, publicOnly: bool): Promise<{ body: string, error?: McpReply }> {
+  const q = path.indexOf("?")
+  const pure = q < 0 ? path : path.slice(0, q)
+  const create = method === "POST" && pure === "/api/mcp/client"
+  const update = method === "PUT" && pure.startsWith("/api/mcp/client/") && pure.split("/").length === 5
+  if (!create && !update) return { body: body }
+  const fs = objectFields(body)
+  if (fs === undefined) return { body: body }
+  const ocRaw = find(fs, "openapi_config")
+  if (ocRaw === undefined || !ocRaw.trim().startsWith("{")) return { body: body }
+  let oc: Field[] = []
+  try {
+    oc = fields(ocRaw.trim())
+  } catch (e) {
+    return { body: body }
+  }
+  const url = rawStr(oc, "spec_url") ?? ""
+  if ((rawStr(oc, "spec") ?? "").trim() !== "" || url.trim() === "") return { body: body }
+  const got = await fetchSpec(url, publicOnly)
+  const err = got.error
+  if (err !== undefined) return { body: body, error: err }
+  setField(&oc, "spec", quote(got.text))
+  setField(&oc, "spec_url", quote(url.trim()))
+  let out = fs
+  setField(&out, "openapi_config", build(oc))
+  return { body: build(out) }
 }
 
 function clientRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string, publicOnly: bool): McpReply {
@@ -1381,45 +1499,34 @@ function virtualRoute(store: ConfigStore, m: string, segs: string[], body: strin
 
 // ---- OpenAPI preview: POST /api/mcp/openapi/preview ----
 
-// The preview of a document: its info, servers and security schemes, and the tool each operation makes.
-function previewJson(text: string, includeDeprecated: bool, base: string): string throws SyntaxError {
-  const doc = try parseSpec(text, includeDeprecated)
-  const servers: string[] = doc.servers.map((s: string): string => quote(s))
-  const resolved = base !== "" ? base : doc.servers.length > 0 ? doc.servers[0]! : ""
-  const schemes: string[] = doc.schemes.map((s: OpScheme): string => `{"name":${quote(s.name)},"type":${quote(s.type)},"in":${quote(s.in)},"param_name":${quote(s.param_name)},"scheme":${quote(s.scheme)}}`)
-  const tools: string[] = doc.ops.map((o: OpenApiOp): string => `{"name":${quote(o.name)},"description":${quote(o.description)},"method":${quote(o.method)},"path":${quote(o.path)},"deprecated":${o.deprecated},"input_schema":${inputSchema(o)}}`)
-  return `{"title":${quote(doc.title)},"version":${quote(doc.version)},"openapi_version":${quote(doc.openapi_version)},"description":${quote(doc.description)},"servers":[${servers.join(",")}],"base_url":${quote(resolved)},"operation_servers":false,"security_schemes":[${schemes.join(",")}],"tools":[${tools.join(",")}],"tool_count":${doc.ops.length}}`
-}
-
-// The preview route. The document is the spec, or spec_url fetched now (the client is not created).
-export async function openapiRoute(method: string, path: string, body: string): Promise<McpReply | undefined> {
+// The preview route (Bifrost's previewOpenAPISpec): the document is the spec, or spec_url fetched now (the
+// client is not created). A fetched document comes back as spec, with the spec_url it was read from.
+export async function openapiRoute(method: string, path: string, body: string, publicOnly?: bool): Promise<McpReply | undefined> {
   const q = path.indexOf("?")
   const pure = q < 0 ? path : path.slice(0, q)
   if (pure !== "/api/mcp/openapi/preview") return undefined
   if (method.toUpperCase() !== "POST") return notAllowed(method)
   const fs = objectFields(body)
   if (fs === undefined) return fail(400, "Invalid request payload")
-  let text = rawStr(fs, "spec") ?? ""
-  const url = rawStr(fs, "spec_url") ?? ""
+  let text = (rawStr(fs, "spec") ?? "").trim()
+  const url = (rawStr(fs, "spec_url") ?? "").trim()
   if (text === "" && url === "") return fail(400, "spec or spec_url is required")
+  let fetched = false
   if (text === "") {
-    const dl = deadline(CONNECT_MS)
-    try {
-      const r = try await fetch(url, { signal: dl.controller.signal })
-      if (r.status < 200 || r.status >= 300) return fail(400, `could not fetch the spec: HTTP ${r.status}`)
-      text = try await r.text()
-    } catch (e) {
-      return fail(400, `could not fetch the spec: ${e.message}`)
-    } finally {
-      dl.finish()
-    }
+    const got = await fetchSpec(url, publicOnly === true)
+    const err = got.error
+    if (err !== undefined) return err
+    text = got.text
+    fetched = true
   }
   let out = ""
   try {
-    out = try previewJson(text, rawBool(fs, "include_deprecated") ?? false, rawStr(fs, "base_url") ?? "")
+    const doc = parseSpec(text, rawBool(fs, "include_deprecated") ?? false, url, (rawStr(fs, "client_name") ?? "").trim())
+    out = previewJson(doc, (rawStr(fs, "base_url") ?? "").trim())
   } catch (e) {
-    return fail(400, `invalid OpenAPI document: ${e.message}`)
+    return fail(e.message.includes("exceeds") ? 413 : 400, `Invalid OpenAPI spec: ${e.message}`)
   }
+  if (fetched) out = `${out.slice(0, out.byteLength - 1)},"spec":${quote(text)},"spec_url":${quote(url)}}`
   return reply(200, out)
 }
 

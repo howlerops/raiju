@@ -17,6 +17,7 @@ import { CostRecalc, RecalcStatus } from "./costrecalc"
 import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE } from "./setupsession"
 import { agentSessionsOf, a2aLogJson, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
+import { McpLibrary, DEFAULT_LIBRARY_URL, DEFAULT_LIBRARY_SYNC_SECONDS, listLibrary, libraryFilterData, createLibraryEntry, deleteLibraryEntry, fetchCatalog } from "./mcplibrary"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
 import { AccessProfile, AgentConfig, CircuitPolicyConfig, LogExportsConfig, PermissionPair, VirtualKeyConfig } from "./config"
 import { rfc3339Of } from "./vkexpiry"
@@ -38,7 +39,7 @@ import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
-import { ExposedTool, SessionStore, handleMcp, rpcError } from "./mcpserver"
+import { ExposedTool, SessionStore, handleMcp, rpcError, sseStream, SSE_HEARTBEAT_MS } from "./mcpserver"
 import { isMetaTool, metaToolDefs } from "./codemode"
 import { relay } from "./passthrough"
 import { upstreamBinding, grpcSend } from "./a2agrpcup"
@@ -1031,6 +1032,7 @@ export class Ops {
       if (problem !== "") console.error(`raiju: virtual MCP ${v.name}: ${problem}`)
     }
     this.configurePricing(cfg.pricing_sync)
+    this.configureLibrary(cfg.pricing_sync)
     this.configureOtelMetrics(cfg.otel)
     this.configurePushGateway(cfg.telemetry?.push_gateway)
     this.configureAlerts(cfg.alerts)
@@ -1661,6 +1663,112 @@ export class Ops {
     const err = await this.loadPricing(url)
     if (err !== "") return { status: 500, body: JSON.stringify({ error: { message: `failed to force pricing sync: ${err}`, type: "api_error" } }), contentType: "application/json" }
     return { status: 200, body: JSON.stringify({ status: "success", message: "pricing synced successfully" }), contentType: "application/json" }
+  }
+
+  // ---- the MCP server library (Bifrost's framework.pricing.mcp_library_url) ----
+
+  libraryTimer: int = -1
+  libraryKey = ""
+
+  // The library as its file holds it now (another worker or node may have synced it).
+  library(): McpLibrary {
+    const lib = new McpLibrary(this.store.path === "" ? "" : this.store.path + ".mcp_library.json")
+    lib.load()
+    return lib
+  }
+
+  // The library syncs in the background when a pricing_sync section turns it on (its mcp_library_url set, or
+  // the section enabled), every mcp_library_sync_interval seconds (a day when unset or negative; 0 never).
+  // The first sync runs now; later ones on the cluster leader only.
+  configureLibrary(ps: PricingSyncConfig | undefined): void {
+    const key = ps === undefined ? "" : JSON.stringify({ u: ps.mcp_library_url ?? "", i: ps.mcp_library_sync_interval ?? -1, e: ps.enabled ?? true })
+    if (key === this.libraryKey) return
+    this.libraryKey = key
+    if (this.libraryTimer >= 0) {
+      clearInterval(this.libraryTimer)
+      this.libraryTimer = -1
+    }
+    if (ps === undefined) return
+    const named = (ps.mcp_library_url ?? "") !== ""
+    if (!named && ps.enabled === false) return
+    const iv = ps.mcp_library_sync_interval ?? -1
+    if (iv === 0) return
+    const every = iv < 0 ? DEFAULT_LIBRARY_SYNC_SECONDS : iv
+    const url = named ? ps.mcp_library_url! : DEFAULT_LIBRARY_URL
+    this.backgroundLibrary(url)
+    this.libraryTimer = setInterval(() => {
+      if (this.isLeader()) this.backgroundLibrary(url)
+    }, every * 1000)
+  }
+
+  async backgroundLibrary(url: string): Promise<void> {
+    const r = await this.syncLibrary(url, true)
+    if (r.error !== "") console.error(`raiju: MCP library sync: ${r.error}`)
+  }
+
+  // One library sync: the catalog fetched (retried with backoff for a network URL when retry), upserted and saved.
+  async syncLibrary(url: string, retry: bool): Promise<{ count: int, error: string }> {
+    let last = ""
+    const tries = retry && !url.startsWith("file://") ? 4 : 1
+    for (let attempt = 0; attempt < tries; attempt++) {
+      if (attempt > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(10000, 1000 * Math.pow(2, attempt - 1))))
+      try {
+        const text = await fetchCatalog(url, 45000)
+        const lib = this.library()
+        const n = lib.sync(text, Date.now())
+        lib.save()
+        return { count: n, error: "" }
+      } catch (e) {
+        last = e.message
+      }
+    }
+    return { count: 0, error: `failed to fetch MCP library from ${url}: ${last}` }
+  }
+
+  // /api/mcp/library (GET a page, POST a custom entry), /api/mcp/library/filterdata, /api/mcp/library/force-sync
+  // and DELETE /api/mcp/library/{id}.
+  async libraryRoute(req: Request, path: string, body: string): Promise<Reply> {
+    const m = req.method
+    const noStore = this.store.path === ""
+    const reply = (st: int, b: string): Reply => ({ status: st, body: b, contentType: "application/json" })
+    const notAllowed = reply(405, errorJson(`method ${m} is not allowed on this route`, "invalid_request_error", undefined))
+    if (path === "/api/mcp/library") {
+      if (m === "GET") {
+        if (noStore) return reply(200, `{"servers":[],"count":0,"total_count":0,"limit":0,"offset":0}`)
+        const u = URL.parse(req.url)
+        const r = listLibrary(this.library(), u === undefined ? new URLSearchParams("") : u.searchParams)
+        return reply(r.status, r.body)
+      }
+      if (m === "POST") {
+        if (noStore) return reply(503, errorJson("MCP operations unavailable: config store is disabled", "api_error", undefined))
+        const r = createLibraryEntry(this.library(), body, Date.now())
+        return reply(r.status, r.body)
+      }
+      return notAllowed
+    }
+    if (path === "/api/mcp/library/filterdata") {
+      if (m !== "GET") return notAllowed
+      if (noStore) return reply(200, `{"categories":[],"connection_types":[],"auth_types":[],"tags":[]}`)
+      const r = libraryFilterData(this.library())
+      return reply(r.status, r.body)
+    }
+    if (path === "/api/mcp/library/force-sync") {
+      if (m !== "POST") return notAllowed
+      if (noStore) return reply(503, errorJson("config store not available", "api_error", undefined))
+      const ps = this.store.cfg.pricing_sync
+      const url = (ps?.mcp_library_url ?? "") !== "" ? ps!.mcp_library_url! : DEFAULT_LIBRARY_URL
+      const r = await this.syncLibrary(url, true)
+      if (r.error !== "") return reply(500, errorJson(`failed to sync MCP library: ${r.error}`, "api_error", undefined))
+      return reply(200, JSON.stringify({ status: "success", message: `MCP library sync completed, ${r.count} entries synced` }))
+    }
+    const segs = path.split("/")
+    if (segs.length === 5) {
+      if (m !== "DELETE") return notAllowed
+      if (noStore) return reply(503, errorJson("MCP operations unavailable: config store is disabled", "api_error", undefined))
+      const r = deleteLibraryEntry(this.library(), segs[4]!)
+      return reply(r.status, r.body)
+    }
+    return reply(404, errorJson(`no route for ${path}`, "invalid_request_error", undefined))
   }
 
   // ---- model parameters and the writable catalog ----
@@ -2627,7 +2735,7 @@ export class Ops {
       latency_ms: c.latencyMs,
       prompt_tokens: 0,
       completion_tokens: 0,
-      cost: 0.0,
+      cost: c.cost ?? 0.0,
       cache_hit: false,
       error: c.error === "" ? undefined : c.error,
       kind: "mcp",
@@ -4201,7 +4309,7 @@ export class Ops {
     if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
-    let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs))
+    let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs, this.engine.projectMcp(h, virtualName)))
     // code mode: the four meta-tools stand in for the code mode clients' tools, as in the tool list Bifrost serves
     // (a virtual MCP lists only its own tools)
     if (virtualName === undefined && this.engine.codeEntriesFor(m, h).length > 0) {
@@ -4227,13 +4335,15 @@ export class Ops {
       if (sid !== undefined) this.mcpSessions.delete(sid)
       return new Response(undefined, { status: 204 })
     }
-    // GET is the server-to-client stream (Bifrost's SSE handler): a connection event, and then the
-    // stream ends, since this server sends nothing on its own. Clients reopen it as they need.
+    // GET is the server-to-client stream (Bifrost's SSE handler): a connection event, then heartbeats that
+    // keep it open through proxies until the client leaves.
     if (req.method === "GET") {
       const sh: Record<string, string> = new Map()
       sh.set("content-type", "text/event-stream")
       sh.set("cache-control", "no-cache")
-      return new Response("data: {\"jsonrpc\":\"2.0\",\"method\":\"connection/opened\"}\n\n", { headers: sh })
+      sh.set("connection", "keep-alive")
+      sh.set("x-accel-buffering", "no")
+      return new Response(sseStream(SSE_HEARTBEAT_MS), { headers: sh })
     }
     if (req.method !== "POST") return json(405, errorJson("use POST for MCP requests", "invalid_request_error", undefined))
     const body = await req.text()
@@ -4259,7 +4369,7 @@ export class Ops {
           return { text: `bad arguments: ${e.message}`, isError: true }
         }
       }
-      const gate = this.engine.toolGate(m, h, real)
+      const gate = this.engine.toolGate(m, h, real, virtualName)
       if (gate.kind === "denial") return { text: gate.message, isError: true }
       const ua = try await this.engine.userAuth(real, h, false)
       if (ua.kind === "denial") return { text: ua.message, isError: true }
@@ -4274,7 +4384,7 @@ export class Ops {
     } else {
       for (const t of tools) seen.push(t.name)
     }
-    const iparts = m.instructionParts(allowedTools, vk?.mcp_configs).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
+    const iparts = m.instructionParts(allowedTools, vk?.mcp_configs, this.engine.projectMcp(h, virtualName)).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
     const instructions = m.renderInstructions(iparts)
     const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now, instructions)
     const out: Record<string, string> = new Map()

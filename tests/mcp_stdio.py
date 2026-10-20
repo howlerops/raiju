@@ -17,6 +17,8 @@ for line in sys.stdin:
         continue  # notifications
     if method == "initialize":
         reply(id, {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "stdio-echo", "version": "1"}})
+    elif method == "ping":
+        reply(id, {})
     elif method == "tools/list":
         reply(id, {"tools": [{"name": "echo", "description": "Repeats text", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}}]})
     elif method == "tools/call":

@@ -250,7 +250,7 @@ def background(x):
     and log exporter flushes (a flush landing between a request and seen() would read as that request)."""
     if x["path"] in ("/v1/secret/data/raiju", "/_bulk", "/export-hook", "/alert-hook") or x["path"].startswith("/logs/"):
         return True
-    return x["path"].startswith("/mcp") and any(m in x.get("body", "") for m in ('"tools/list"', '"initialize"', '"notifications/'))
+    return x["path"].startswith("/mcp") and any(m in x.get("body", "") for m in ('"tools/list"', '"initialize"', '"notifications/', '"method":"ping"'))
 
 def wait_mcp_tools(base, names, tries=120):
     """Waits until the gateway's MCP clients have listed their tools. Agent mode adds them to every
@@ -5359,6 +5359,8 @@ def l140_e2e(env):
                     res = {"tools": [{"name": "lookup", "description": "Looks a key up", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}}}]}
                 elif m == "tools/call":
                     res = {"content": [{"type": "text", "text": "found " + str(msg["params"]["arguments"].get("key"))}]}
+                elif m == "ping":
+                    res = {}
                 else:
                     return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "no such method"}}), "application/json"
                 return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}), "application/json"
@@ -5512,6 +5514,8 @@ def l147_idp():
                     res = {"tools": [{"name": "lookup", "description": "Looks a key up", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}}}]}
                 elif m == "tools/call":
                     res = {"content": [{"type": "text", "text": "found " + str(msg["params"]["arguments"].get("key"))}]}
+                elif m == "ping":
+                    res = {}
                 else:
                     return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "no such method"}}), "application/json"
                 return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}), "application/json"
@@ -10109,6 +10113,212 @@ def l158_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L166 = "http://127.0.0.1:18285"  # MCP management: SSE heartbeats, OpenAPI YAML/$ref/security, spec_url, library, ping, tool cost, Responses, project MCP access
+
+def l166_config():
+    """The L166 gateway: MCP servers checked every second (one pinged, one that cannot be, one per-call whose instructions
+    change), an OpenAPI client read from a YAML spec_url with priced tools, the MCP library synced from the mock, a key whose
+    team's customer holds a small budget, and an open intersect project that caps MCP access and is assigned a virtual MCP."""
+    import hashlib
+    def client(name, **kw):
+        return {"name": name, "connection_type": "http", "connection_string": MOCK + "/mcp-i/" + name, **kw}
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l166-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False, "mcp_library_url": MOCK + "/mcp-i/_library"},
+        "providers": {"openai": {"keys": [{"name": "l166", "value": "sk-l166", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"client_configs": [
+            client("pingy", tool_sync_interval="1s"),
+            client("noping", tool_sync_interval="1s", is_ping_available=False),
+            client("dyn", tool_sync_interval="1s", needs_session_stickiness=False),
+            {"name": "echo", "connection_type": "openapi", "tool_pricing": {"getNote": 0.25},
+             "openapi_config": {"spec_url": MOCK + "/mcp-i/_spec.yaml", "security_credentials": {"apiKey": {"value": "key-l166"}, "bearer": {"value": "tok-l166"}}}},
+            # the same document from a file beside the config (spec_file), and one that tries to leave that folder
+            {"name": "filed", "connection_type": "openapi", "openapi_config": {"spec_file": "e2e-l166-spec.yaml"}},
+            {"name": "escaped", "connection_type": "openapi", "openapi_config": {"spec_file": "../e2e-l166-spec.yaml"}},
+        ]},
+        "virtual_mcps": [{"name": "vdyn", "tools": [{"source": "dyn-lookup"}]}],
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l166".encode()).hexdigest()}],
+            "budgets": [{"id": "b-l166", "max_limit": 0.4, "reset_duration": "1d"}],
+            "customers": [{"id": "c-l166", "name": "Toolco", "budget_id": "b-l166"}],
+            "teams": [{"id": "t-l166", "name": "tools", "customer_id": "c-l166"}],
+            "virtual_keys": [{"id": "vk-l166", "value": "sk-bf-l166"}, {"id": "vk-l166-team", "value": "sk-bf-l166-team", "team_id": "t-l166"}],
+            "projects": [{"id": "p-l166", "name": "tool-proj", "membership_mode": "open", "access_rule": "intersect", "provider_configs": [{"provider": "openai"}],
+                          "mcp_configs": [{"mcp_client_name": "pingy", "tools_to_execute": ["lookup"]}], "virtual_mcps": ["vdyn"]}],
+        },
+    }
+
+def l166_e2e(env):
+    """L166: the MCP management items of WP5. GET /mcp stays open with heartbeats; OpenAPI clients from YAML with $ref, per-operation
+    security and flattened schemas, and a spec_url stored with a client created over the API (openapi-spec, preview); the MCP
+    library routes and the mcp_library_url sync; the ping health check; tool cost on the MCP log and the debit of the team's
+    customer; MCP tools and instructions on Responses requests, with instructions re-read on the periodic check; a project's
+    mcp_configs and its assigned virtual MCP. Its own gateway on 18285."""
+    import shutil, http.client
+    cfg_path = os.path.join(BUILD, "e2e.l166.json")
+    json.dump(l166_config(), open(cfg_path, "w"))
+    open(os.path.join(BUILD, "e2e-l166-spec.yaml"), "w").write(call("GET", "/mcp-i/_spec.yaml", base=MOCK)[2])
+    shutil.rmtree(os.path.join(BUILD, "e2e-l166-logs"), ignore_errors=True)
+    for f in (cfg_path + ".mcp_library.json",):
+        if os.path.exists(f):
+            os.remove(f)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18285", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l166.log"), "w"))
+    ADM = {"authorization": "Bearer sk-admin-l166"}
+    KEY = {"x-bf-vk": "sk-bf-l166"}
+    PROJ = {**KEY, "x-bf-project-id": "p-l166"}
+    def gwc(method, path, body=None, headers=None):
+        return call(method, path, body, headers, base=GW_L166, auth=False)
+    def tool(name, args, headers=KEY):
+        s, _, b = gwc("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}, headers)
+        content = json.loads(b).get("content", "") if s == 200 else b
+        return s, content
+    try:
+        wait(GW_L166 + "/health")
+        call("POST", "/_a2a/mcp-instr?name=dyn&text=Dyn+v1", base=MOCK)
+        for _ in range(120):
+            s, h, _ = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-ready", "version": "1"}}}, KEY)
+            s, _, b = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**KEY, "mcp-session-id": hdr(h, "mcp-session-id") or ""})
+            if all(n in b for n in ["pingy-lookup", "noping-lookup", "dyn-lookup", "echo-getNote", "echo-addNote", "echo-missing"]):
+                break
+            time.sleep(0.25)
+        check("an OpenAPI client read from a YAML spec_url lists its operations as tools", all(n in b for n in ["echo-getNote", "echo-addNote", "echo-missing"]), b[:400])
+        for _ in range(40):
+            if "filed-getNote" in b:
+                break
+            time.sleep(0.25)
+            s, _, b = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**KEY, "mcp-session-id": hdr(h, "mcp-session-id") or ""})
+        st = json.loads(call("GET", "/api/mcp", None, ADM, base=GW_L166, auth=False)[2]).get("clients", [])
+        esc = [c for c in st if c["name"] == "escaped"]
+        check("a spec_file beside the config is read; one outside its folder is refused", "filed-getNote" in b and esc and not esc[0]["connected"] and "outside the config directory" in esc[0]["error"], (b[:200], esc))
+
+        # ---- GET /mcp: the stream stays open, with a heartbeat comment every 15 seconds ----
+        conn = http.client.HTTPConnection("127.0.0.1", 18285, timeout=25)
+        conn.request("GET", "/mcp", headers={**KEY, "accept": "text/event-stream"})
+        resp = conn.getresponse()
+        first = resp.readline().decode() + resp.readline().decode()
+        t0 = time.time()
+        beat = resp.readline().decode()
+        waited = time.time() - t0
+        conn.close()
+        check("GET /mcp answers an event stream that opens with connection/opened", resp.status == 200 and "text/event-stream" in (resp.getheader("content-type") or "") and '"method":"connection/opened"' in first, (resp.status, first))
+        check("the stream stays open and sends Bifrost's heartbeat comment after about 15 seconds", beat == ": heartbeat\n" and 10 < waited < 22, (beat, waited))
+
+        # ---- OpenAPI calls: the operation's request, its credentials, flattened arguments ----
+        s, c = tool("echo-getNote", {"id": "a b", "verbose": True})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("an OpenAPI tool call sends the path parameter ($ref) and the query, with the document's apiKey security", got.get("path") == "/mcp-i/_api/notes/a%20b" and "verbose=true" in got.get("query", "") and got.get("api_key") == "key-l166" and got.get("authorization") == "", (s, c[:300]))
+        s, c = tool("echo-addNote", {"title": "groceries"})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("an operation's own security (bearer) replaces the document's, and the body's properties are the arguments", got.get("method") == "POST" and got.get("authorization") == "Bearer tok-l166" and got.get("api_key") == "" and json.loads(got.get("body") or "{}") == {"title": "groceries"}, (s, c[:300]))
+        s, c = tool("echo-missing", {})
+        check("an upstream 404 comes back as the tool's error, led by the HTTP status", s == 200 and "HTTP 404 Not Found" in c, (s, c[:200]))
+
+        # ---- tool cost: on the MCP log, and debited from the team's customer budget (0.4) ----
+        TEAM = {"x-bf-vk": "sk-bf-l166-team"}
+        s0, _ = tool("echo-getNote", {"id": "n1"}, TEAM)
+        s1, _ = tool("echo-getNote", {"id": "n2"}, TEAM)
+        s2, c2 = tool("echo-getNote", {"id": "n3"}, TEAM)
+        check("a priced tool is refused once the team's customer budget is spent (the third call at 0.25 each)", s0 == 200 and s1 == 200 and s2 == 402, (s0, s1, s2, c2[:200]))
+        logs = []
+        for _ in range(40):
+            s, _, b = call("GET", "/api/mcp-logs?limit=50", None, ADM, base=GW_L166, auth=False)
+            logs = json.loads(b).get("logs", []) if s == 200 else []
+            if sum(1 for x in logs if x.get("tool_name") == "getNote") >= 2:
+                break
+            time.sleep(0.25)
+        priced = [x for x in logs if x.get("tool_name") == "getNote"]
+        check("the MCP log entry of a priced tool carries its cost", len(priced) >= 2 and all(abs(float(x.get("cost") or 0) - 0.25) < 1e-9 for x in priced), [(x.get("tool_name"), x.get("cost")) for x in logs][:6])
+        check("an unpriced tool's entry costs nothing", any(x.get("tool_name") == "addNote" and float(x.get("cost") or 0) == 0 for x in logs), [(x.get("tool_name"), x.get("cost")) for x in logs][:6])
+
+        # ---- spec_url sent over the API: fetched and stored with the client ----
+        s, _, b = call("POST", "/api/mcp/client", {"name": "echo2", "connection_type": "openapi", "openapi_config": {"spec_url": MOCK + "/mcp-i/_spec.yaml"}}, ADM, base=GW_L166, auth=False)
+        made = json.loads(b) if s in (200, 201) else {}
+        oc = made.get("openapi_config", {})
+        check("a client created with a spec_url stores the document and its metadata", s == 201 and oc.get("spec_url") == MOCK + "/mcp-i/_spec.yaml" and oc.get("openapi_version") == "3.0.3" and oc.get("operation_count") == 3 and oc.get("spec_title") == "Echo API", (s, b[:400]))
+        s, h, b = call("GET", "/api/mcp/client/echo2/openapi-spec", None, ADM, base=GW_L166, auth=False)
+        check("openapi-spec returns the stored YAML document as YAML", s == 200 and (hdr(h, "content-type") or "").startswith("application/yaml") and b.startswith("openapi: 3.0.3"), (s, hdr(h, "content-type"), b[:80]))
+        s, _, b = call("GET", "/api/mcp/client/echo/openapi-spec", None, ADM, base=GW_L166, auth=False)
+        check("a config.json client that names only a spec_url has no stored spec", s == 404 and "no stored spec" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/client", {"name": "badspec", "connection_type": "openapi", "openapi_config": {"spec_url": MOCK + "/mcp-i/_spec.yaml"}, "tools_to_execute": ["nope"]}, ADM, base=GW_L166, auth=False)
+        check("tools_to_execute must name tools the spec defines", s == 400 and "the spec defines no tool named nope" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/openapi/preview", {"spec_url": MOCK + "/mcp-i/_spec.yaml", "client_name": "echo"}, ADM, base=GW_L166, auth=False)
+        pv = json.loads(b) if s == 200 else {}
+        add = [t for t in pv.get("tools", []) if t["name"] == "addNote"]
+        check("the preview of a spec_url returns the fetched document, the tools and their flattened schemas", s == 200 and pv.get("spec", "").startswith("openapi:") and pv.get("tool_count") == 3 and add and add[0]["input_schema"] == {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}, (s, b[:500]))
+
+        # ---- the MCP library: synced from mcp_library_url, then custom rows, hiding and force-sync ----
+        lib = {}
+        for _ in range(80):
+            s, _, b = call("GET", "/api/mcp/library", None, ADM, base=GW_L166, auth=False)
+            lib = json.loads(b) if s == 200 else {}
+            if lib.get("total_count") == 2:
+                break
+            time.sleep(0.25)
+        names = [x["name"] for x in lib.get("servers", [])]
+        check("the library syncs from mcp_library_url at start, sorted by name", names == ["Files", "GitHub"] and lib["servers"][1]["slug"] == "github" and lib["servers"][1]["source"] == "remote", lib)
+        s, _, b = call("GET", "/api/mcp/library/filterdata", None, ADM, base=GW_L166, auth=False)
+        check("library filter data lists the distinct facets", s == 200 and json.loads(b) == {"categories": ["dev", "storage"], "connection_types": ["http", "stdio"], "auth_types": ["oauth"], "tags": ["code", "git", "local"]}, (s, b))
+        s, _, b = call("POST", "/api/mcp/library", {"name": "Team Wiki", "connection_type": "sse", "connection_url": "https://wiki.example/sse", "tags": ["docs"]}, ADM, base=GW_L166, auth=False)
+        check("a custom library server is published", s == 200 and json.loads(b)["entry"]["source"] == "custom" and json.loads(b)["entry"]["auth_type"] == "none", (s, b[:300]))
+        s, _, b = call("POST", "/api/mcp/library", {"name": "team-wiki", "connection_type": "http", "connection_url": "https://x.example"}, ADM, base=GW_L166, auth=False)
+        check("a name with a taken slug is a 409", s == 409, (s, b))
+        gh = [x for x in lib.get("servers", []) if x["slug"] == "github"]
+        s, _, b = call("DELETE", "/api/mcp/library/" + str(gh[0]["id"] if gh else 0), None, ADM, base=GW_L166, auth=False)
+        check("a library row is hidden", s == 200, (s, b))
+        s, _, b = call("POST", "/api/mcp/library/force-sync", None, ADM, base=GW_L166, auth=False)
+        check("force-sync syncs the catalog again, leaving the hidden row out", s == 200 and "1 entries synced" in b, (s, b))
+        s, _, b = call("GET", "/api/mcp/library?search=wiki", None, ADM, base=GW_L166, auth=False)
+        s2, _, b2 = call("GET", "/api/mcp/library?limit=1&sort_by=name&order=desc", None, ADM, base=GW_L166, auth=False)
+        page = json.loads(b2) if s2 == 200 else {}
+        check("the library is searched and paged; the hidden row stays hidden", s == 200 and json.loads(b)["total_count"] == 1 and page.get("total_count") == 2 and page["servers"][0]["name"] == "Team Wiki" and page.get("limit") == 1, (b[:200], b2[:300]))
+
+        # ---- the ping health check, and instructions re-read on the periodic check ----
+        time.sleep(2.5)
+        pings = json.loads(call("GET", "/_a2a/mcp-pings", base=MOCK)[2])
+        check("each check pings a server that offers ping, and not one with is_ping_available false or a per-call one", pings.get("pingy", 0) >= 2 and pings.get("noping", 0) == 0 and pings.get("dyn", 0) == 0, pings)
+        call("POST", "/_a2a/mcp-instr?name=dyn&text=Dyn+v2", base=MOCK)
+        instr = ""
+        for _ in range(40):
+            s, _, b = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}}, KEY)
+            instr = json.loads(b).get("result", {}).get("instructions", "") if s == 200 else ""
+            if "Dyn v2" in instr:
+                break
+            time.sleep(0.25)
+        check("a per-call client's instructions are re-read on the periodic check", "Dyn v2" in instr, instr)
+
+        # ---- Responses requests get the MCP tools and the servers' instructions ----
+        before = len([x for x in seen() if x["path"] == "/v1/responses"])
+        s, _, b = gwc("POST", "/v1/responses", {"model": "openai/gpt-4o-mini", "input": "hi", "instructions": "Be brief.", "tools": [{"type": "function", "name": "pingy-lookup", "parameters": {"type": "object"}}]}, KEY)
+        got = [x for x in seen() if x["path"] == "/v1/responses"]
+        sent = json.loads(got[-1]["body"]) if s == 200 and len(got) > before else {}
+        tnames = [t.get("name") for t in sent.get("tools", [])]
+        check("a Responses request is offered the MCP tools in the Responses shape, a tool it names itself kept", s == 200 and "dyn-lookup" in tnames and "echo-getNote" in tnames and tnames.count("pingy-lookup") == 1 and sent["tools"][0] == {"type": "function", "name": "pingy-lookup", "parameters": {"type": "object"}} and all("function" not in t for t in sent["tools"]), (s, tnames))
+        check("and the servers' instructions follow its own", sent.get("instructions", "").startswith("Be brief.\n\n<mcp_server name=\"dyn\">\nDyn v2\n</mcp_server>"), sent.get("instructions"))
+
+        # ---- a project's MCP access: intersect caps the tools, its virtual MCP still reaches its own ----
+        before = len([x for x in seen() if x["path"] == "/v1/chat/completions"])
+        s, _, b = gwc("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "proj-1"}]}, PROJ)
+        got = [x for x in seen() if x["path"] == "/v1/chat/completions"]
+        sent = json.loads(got[-1]["body"]) if s == 200 and len(got) > before else {}
+        tnames = [t["function"]["name"] for t in sent.get("tools", [])]
+        check("an intersect project's mcp_configs cap the tools a request is offered", s == 200 and tnames == ["pingy-lookup"], (s, tnames))
+        s, c = tool("dyn-lookup", {"q": "x"}, PROJ)
+        check("a tool the project does not allow is refused inside it", s == 403, (s, c[:200]))
+        s, c = tool("pingy-lookup", {"q": "x"}, PROJ)
+        check("a tool it allows runs", s == 200 and "found in pingy" in c, (s, c[:200]))
+        s, h, _ = gwc("POST", "/mcp/vdyn", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}}, PROJ)
+        sid = {"mcp-session-id": hdr(h, "mcp-session-id") or ""}
+        s, _, b = gwc("POST", "/mcp/vdyn", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**PROJ, **sid})
+        vt = [t["name"] for t in json.loads(b).get("result", {}).get("tools", [])] if s == 200 else []
+        s, _, b = gwc("POST", "/mcp/vdyn", {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": vt[0] if vt else "lookup", "arguments": {"q": "y"}}}, {**PROJ, **sid})
+        check("the project's assigned virtual MCP still runs its tools through it", s == 200 and "found in dyn" in b and '"isError":true' not in b, (s, vt, b[:300]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L165 = "http://127.0.0.1:18284"  # built-in role ids, user emails, quota model_configs, role attachments, complexity status, rotate revoking MCP grants
 
 def l165_e2e(env):
@@ -11547,9 +11757,14 @@ def main():
         s, _, b = call("GET", "/cursor/v1/models")
         check("/cursor/v1/models lists models", s == 200 and jget(b).get("object") == "list", (s, b[:200]))
 
-        # GET /mcp: the server-to-client stream (a connection event)
-        s, h, b = call("GET", "/mcp")
-        check("GET /mcp answers the connection event as an event stream", s == 200 and {k.lower(): v for k, v in h.items()}.get("content-type", "").startswith("text/event-stream") and "connection/opened" in b, (s, h, b[:200]))
+        # GET /mcp: the server-to-client stream (a connection event; it then stays open, so only the event is read)
+        import http.client
+        sc = http.client.HTTPConnection("127.0.0.1", int(GW.rsplit(":", 1)[1]), timeout=10)
+        sc.request("GET", "/mcp")
+        sr = sc.getresponse()
+        s, ct, b = sr.status, sr.getheader("content-type") or "", sr.readline().decode() if sr.status == 200 else sr.read().decode()
+        sc.close()
+        check("GET /mcp answers the connection event as an event stream", s == 200 and ct.startswith("text/event-stream") and "connection/opened" in b, (s, ct, b[:200]))
         s, _, b = call("GET", "/mcp/no-such-mcp")
         check("GET /mcp/{name} for an unknown virtual MCP is not found", s == 404, (s, b[:200]))
 
@@ -12728,6 +12943,8 @@ def main():
         # credentials, the aggregated card and the card timer (their own gateway), then MCP server instructions and the agent CLI's headers
         l134_e2e(env)
         l134b_e2e(env)
+        # L166: MCP management (SSE heartbeats, OpenAPI YAML/$ref/security and spec_url, the library, ping, tool cost, Responses, project MCP access): its own gateway
+        l166_e2e(env)
         # L138: A2A push state shared by the workers of a node, exactly-once relay across workers: their own gateway
         l138_e2e(env)
         # L148: A2A over gRPC: the lf.a2a.v1 listener, the agent named by the authority, the key from the metadata, the eleven methods (go client): their own gateway

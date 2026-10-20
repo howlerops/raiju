@@ -1,0 +1,882 @@
+// YAML documents as JSON text, for the OpenAPI specs MCP clients are built from (Bifrost reads specs in
+// JSON or YAML). The subset a spec uses: block mappings and sequences, flow collections, plain, quoted and
+// block scalars (| and > with chomping and indentation indicators), comments, anchors with aliases and
+// << merges, tags (!!str keeps a scalar a string; others are dropped), and the first document of a
+// stream. Plain scalars take the core schema's types; a number keeps the text it was written with when
+// that text is a JSON number (so `openapi: 3.10` reads as 3.10, not 3.1). Complex (? ) keys are refused.
+import { Field, fields, quote } from "./json"
+
+type Line = { indent: int, text: string, no: int }
+
+const DIGITS = "0123456789"
+
+// The number of leading spaces of a line.
+function indentOf(s: string): int {
+  let n = 0
+  while (n < s.byteLength && s.slice(n, n + 1) === " ") n++
+  return n
+}
+
+// Whether a line holds nothing but whitespace or a comment.
+function blankLine(t: string): bool {
+  const s = t.trim()
+  return s === "" || s.startsWith("#")
+}
+
+// The text before a comment: a # at the start or after whitespace, outside quotes and outside nothing else.
+// Quotes count only where a scalar may start (after the start, a space, ":", ",", "[", "{" or "-").
+function stripComment(s: string): string {
+  let q = ""
+  let prev = " "
+  for (let i = 0; i < s.byteLength; i++) {
+    const c = s.slice(i, i + 1)
+    if (q !== "") {
+      if (q === "'" && c === "'") {
+        if (s.slice(i + 1, i + 2) === "'") {
+          i++
+          continue
+        }
+        q = ""
+      } else if (q === "\"" && c === "\\") {
+        i++
+      } else if (q === "\"" && c === "\"") {
+        q = ""
+      }
+      prev = c
+      continue
+    }
+    if ((c === "'" || c === "\"") && " \t:,[{-".includes(prev)) q = c
+    else if (c === "#" && (prev === " " || prev === "\t")) return s.slice(0, i).trimEnd()
+    prev = c
+  }
+  if (s.startsWith("#")) return ""
+  return s.trimEnd()
+}
+
+// Whether text is a JSON number as written.
+function jsonNumber(t: string): bool {
+  let i = 0
+  const n = t.byteLength
+  if (i < n && t.slice(i, i + 1) === "-") i++
+  if (i >= n) return false
+  if (t.slice(i, i + 1) === "0") {
+    i++
+  } else {
+    if (!DIGITS.includes(t.slice(i, i + 1))) return false
+    while (i < n && DIGITS.includes(t.slice(i, i + 1))) i++
+  }
+  if (i < n && t.slice(i, i + 1) === ".") {
+    i++
+    if (i >= n || !DIGITS.includes(t.slice(i, i + 1))) return false
+    while (i < n && DIGITS.includes(t.slice(i, i + 1))) i++
+  }
+  if (i < n && (t.slice(i, i + 1) === "e" || t.slice(i, i + 1) === "E")) {
+    i++
+    if (i < n && (t.slice(i, i + 1) === "+" || t.slice(i, i + 1) === "-")) i++
+    if (i >= n || !DIGITS.includes(t.slice(i, i + 1))) return false
+    while (i < n && DIGITS.includes(t.slice(i, i + 1))) i++
+  }
+  return i === n
+}
+
+// Whether text is a YAML core-schema int or float (which may not be a JSON number as written: +1, 007, 1., .5).
+function yamlNumber(t: string): bool {
+  let s = t
+  if (s.startsWith("+") || s.startsWith("-")) s = s.slice(1)
+  if (s === "" || s === ".") return false
+  let digits = 0
+  let dot = false
+  let i = 0
+  while (i < s.byteLength) {
+    const c = s.slice(i, i + 1)
+    if (DIGITS.includes(c)) {
+      digits++
+    } else if (c === "." && !dot) {
+      dot = true
+    } else if ((c === "e" || c === "E") && digits > 0) {
+      const rest = s.slice(i + 1)
+      const r = rest.startsWith("+") || rest.startsWith("-") ? rest.slice(1) : rest
+      if (r === "") return false
+      for (const ch of r.chars()) {
+        if (!DIGITS.includes(ch)) return false
+      }
+      return true
+    } else {
+      return false
+    }
+    i++
+  }
+  return digits > 0
+}
+
+// The JSON value of a plain scalar (the core schema: null, booleans, numbers, else a string).
+function plainValue(t: string): string {
+  if (t === "" || t === "~" || t === "null" || t === "Null" || t === "NULL") return "null"
+  if (t === "true" || t === "True" || t === "TRUE") return "true"
+  if (t === "false" || t === "False" || t === "FALSE") return "false"
+  if (jsonNumber(t)) return t
+  if (yamlNumber(t)) {
+    const v = parseFloat(t.startsWith("+") ? t.slice(1) : t)
+    if (v !== undefined) return JSON.stringify(v)
+  }
+  return quote(t)
+}
+
+const HEX = "0123456789abcdefABCDEF"
+
+function hexValue(s: string): int {
+  let v = 0
+  for (const c of s.chars()) {
+    const at = HEX.indexOf(c)
+    if (at < 0) return -1
+    v = v * 16 + (at >= 16 ? at - 6 : at)
+  }
+  return v
+}
+
+// The text of a code point (U+0000 to U+10FFFF) as a JSON string literal reads it.
+function codePoint(v: int): string throws SyntaxError {
+  if (v < 0) throw new SyntaxError("bad escape in a double-quoted YAML scalar")
+  if (v < 65536) {
+    const h = "0123456789abcdef"
+    let hex = ""
+    let x = v
+    for (let k = 0; k < 4; k++) {
+      hex = h.slice(x % 16, x % 16 + 1) + hex
+      x = Math.floor(x / 16)
+    }
+    const s: string = try JSON.parse(`"\\u${hex}"`)
+    return s
+  }
+  const u = v - 65536
+  const hi = 55296 + Math.floor(u / 1024)
+  const lo = 56320 + (u % 1024)
+  return (try codePointPair(hi, lo))
+}
+
+function codePointPair(hi: int, lo: int): string throws SyntaxError {
+  const h = "0123456789abcdef"
+  const four = (x: int): string => {
+    let out = ""
+    let y = x
+    for (let k = 0; k < 4; k++) {
+      out = h.slice(y % 16, y % 16 + 1) + out
+      y = Math.floor(y / 16)
+    }
+    return out
+  }
+  const s: string = try JSON.parse(`"\\u${four(hi)}\\u${four(lo)}"`)
+  return s
+}
+
+// Folds the lines of a multi-line flow scalar: a line break becomes a space, an empty line a newline.
+function fold(lines: string[]): string {
+  let out = ""
+  let pendingBreaks = 0
+  for (let i = 0; i < lines.length; i++) {
+    const l = i === 0 ? lines[i]!.trimEnd() : i === lines.length - 1 ? lines[i]!.trimStart() : lines[i]!.trim()
+    if (i > 0 && l === "" && i < lines.length - 1) {
+      pendingBreaks++
+      continue
+    }
+    if (i > 0) out += pendingBreaks > 0 ? "\n".repeat(pendingBreaks) : " "
+    pendingBreaks = 0
+    out += l
+  }
+  return out
+}
+
+// The value of a double-quoted scalar's inside (escapes read).
+function unescapeDouble(s: string): string throws SyntaxError {
+  let out = ""
+  let i = 0
+  while (i < s.byteLength) {
+    const c = s.slice(i, i + 1)
+    if (c !== "\\") {
+      out += c
+      i++
+      continue
+    }
+    const e = s.slice(i + 1, i + 2)
+    i += 2
+    if (e === "n") out += "\n"
+    else if (e === "t" || e === "\t") out += "\t"
+    else if (e === "r") out += "\r"
+    else if (e === "\\") out += "\\"
+    else if (e === "\"") out += "\""
+    else if (e === "/") out += "/"
+    else if (e === " ") out += " "
+    else if (e === "0") out += try codePoint(0)
+    else if (e === "a") out += try codePoint(7)
+    else if (e === "b") out += try codePoint(8)
+    else if (e === "e") out += try codePoint(27)
+    else if (e === "f") out += try codePoint(12)
+    else if (e === "v") out += try codePoint(11)
+    else if (e === "N") out += try codePoint(133)
+    else if (e === "_") out += try codePoint(160)
+    else if (e === "L") out += try codePoint(8232)
+    else if (e === "P") out += try codePoint(8233)
+    else if (e === "x" || e === "u" || e === "U") {
+      const n = e === "x" ? 2 : e === "u" ? 4 : 8
+      out += try codePoint(hexValue(s.slice(i, i + n)))
+      i += n
+    } else throw new SyntaxError(`unknown escape \\${e} in a double-quoted YAML scalar`)
+  }
+  return out
+}
+
+// Where a quoted scalar that starts at s[0] closes: the offset after the closing quote, or -1.
+function quoteEnd(s: string): int {
+  const q = s.slice(0, 1)
+  let i = 1
+  while (i < s.byteLength) {
+    const c = s.slice(i, i + 1)
+    if (q === "\"" && c === "\\") {
+      i += 2
+      continue
+    }
+    if (c === q) {
+      if (q === "'" && s.slice(i + 1, i + 2) === "'") {
+        i += 2
+        continue
+      }
+      return i + 1
+    }
+    i++
+  }
+  return -1
+}
+
+// The JSON string of a whole quoted scalar (its quotes included; it may span lines).
+function quotedValue(s: string): string throws SyntaxError {
+  const q = s.slice(0, 1)
+  const inner = s.slice(1, s.byteLength - 1)
+  if (q === "'") return quote(fold(inner.split("\n")).split("''").join("'"))
+  // a double-quoted line ending in a backslash continues without a space
+  const lines = inner.split("\n")
+  const joined: string[] = []
+  let carry = ""
+  for (let i = 0; i < lines.length; i++) {
+    let l = i === 0 ? lines[i]! : lines[i]!.trimStart()
+    if (i < lines.length - 1 && l.trimEnd().endsWith("\\") && !l.trimEnd().endsWith("\\\\")) {
+      const t = l.trimEnd()
+      carry += t.slice(0, t.byteLength - 1)
+      continue
+    }
+    joined.push(carry + l)
+    carry = ""
+  }
+  if (carry !== "") joined.push(carry)
+  return quote(try unescapeDouble(fold(joined)))
+}
+
+class FlowReader {
+  pos = 0
+  constructor(readonly s: string, readonly doc: YamlDoc) {}
+
+  ws(): void {
+    while (this.pos < this.s.byteLength) {
+      const c = this.s.slice(this.pos, this.pos + 1)
+      if (c === " " || c === "\t" || c === "\n" || c === "\r") {
+        this.pos++
+      } else if (c === "#") {
+        while (this.pos < this.s.byteLength && this.s.slice(this.pos, this.pos + 1) !== "\n") this.pos++
+      } else {
+        return
+      }
+    }
+  }
+
+  peek(): string {
+    return this.s.slice(this.pos, this.pos + 1)
+  }
+
+  // One flow node: a collection, a quoted scalar, an alias or a plain scalar (which ends at , ] } or ": ").
+  node(): string throws SyntaxError {
+    this.ws()
+    const c = this.peek()
+    if (c === "[") return try this.seq()
+    if (c === "{") return try this.map()
+    if (c === "\"" || c === "'") {
+      const end = quoteEnd(this.s.slice(this.pos))
+      if (end < 0) throw new SyntaxError("unterminated quoted scalar in a YAML flow collection")
+      const v = try quotedValue(this.s.slice(this.pos, this.pos + end))
+      this.pos += end
+      return v
+    }
+    if (c === "*") {
+      const start = this.pos + 1
+      while (this.pos < this.s.byteLength && !",]} \n".includes(this.peek())) this.pos++
+      return try this.doc.alias(this.s.slice(start, this.pos))
+    }
+    let anchor = ""
+    if (c === "&") {
+      const start = this.pos + 1
+      while (this.pos < this.s.byteLength && !",]} \n".includes(this.peek())) this.pos++
+      anchor = this.s.slice(start, this.pos)
+      const v = try this.node()
+      this.doc.anchors.set(anchor, v)
+      return v
+    }
+    if (c === "!") {
+      const start = this.pos
+      while (this.pos < this.s.byteLength && !" \n".includes(this.peek())) this.pos++
+      const tag = this.s.slice(start, this.pos)
+      const v = try this.node()
+      return tag === "!!str" && !v.startsWith("\"") && !v.startsWith("{") && !v.startsWith("[") ? quote(v === "null" ? "" : v) : v
+    }
+    const start = this.pos
+    while (this.pos < this.s.byteLength) {
+      const d = this.peek()
+      if (d === "," || d === "]" || d === "}") break
+      if (d === ":" && " \n,]}".includes(this.s.slice(this.pos + 1, this.pos + 2))) break
+      if (d === ":" && this.pos + 1 >= this.s.byteLength) break
+      if (d === "#" && " \t".includes(this.s.slice(this.pos - 1, this.pos))) break
+      this.pos++
+    }
+    return plainValue(fold(this.s.slice(start, this.pos).split("\n")).trim())
+  }
+
+  seq(): string throws SyntaxError {
+    this.pos++
+    const out: string[] = []
+    while (true) {
+      this.ws()
+      if (this.peek() === "]") {
+        this.pos++
+        return "[" + out.join(",") + "]"
+      }
+      if (this.pos >= this.s.byteLength) throw new SyntaxError("unterminated YAML flow sequence")
+      const v = try this.node()
+      this.ws()
+      // a single-pair mapping inside a sequence ([a: 1])
+      if (this.peek() === ":") {
+        this.pos++
+        const val = try this.node()
+        out.push(`{${quote(keyText(v))}:${val}}`)
+      } else {
+        out.push(v)
+      }
+      this.ws()
+      if (this.peek() === ",") this.pos++
+      else if (this.peek() !== "]") throw new SyntaxError("expected , or ] in a YAML flow sequence")
+    }
+  }
+
+  map(): string throws SyntaxError {
+    this.pos++
+    let out: Field[] = []
+    while (true) {
+      this.ws()
+      if (this.peek() === "}") {
+        this.pos++
+        return objectText(out)
+      }
+      if (this.pos >= this.s.byteLength) throw new SyntaxError("unterminated YAML flow mapping")
+      const k = try this.node()
+      this.ws()
+      let v = "null"
+      if (this.peek() === ":") {
+        this.pos++
+        this.ws()
+        if (this.peek() !== "," && this.peek() !== "}") v = try this.node()
+      }
+      putKey(&out, keyText(k), v)
+      this.ws()
+      if (this.peek() === ",") this.pos++
+      else if (this.peek() !== "}") throw new SyntaxError("expected , or } in a YAML flow mapping")
+    }
+  }
+}
+
+// A mapping key as JSON keys take it: a string's text, any other scalar's JSON text.
+function keyText(raw: string): string {
+  if (raw.startsWith("\"")) {
+    try {
+      const s: string = JSON.parse(raw)
+      return s
+    } catch (e) {
+      return raw
+    }
+  }
+  return raw
+}
+
+function putKey(inout fs: Field[], key: string, raw: string): void {
+  for (let i = 0; i < fs.length; i++) {
+    if (fs[i]!.key === key) {
+      fs[i] = { key: key, raw: raw }
+      return
+    }
+  }
+  fs.push({ key: key, raw: raw })
+}
+
+function objectText(fs: Field[]): string {
+  const parts: string[] = []
+  for (const f of fs) parts.push(quote(f.key) + ":" + f.raw)
+  return "{" + parts.join(",") + "}"
+}
+
+// Whether brackets opened in s are all closed (quotes and comments skipped).
+function flowClosed(s: string): bool {
+  let depth = 0
+  let i = 0
+  while (i < s.byteLength) {
+    const c = s.slice(i, i + 1)
+    if (c === "\"" || c === "'") {
+      const end = quoteEnd(s.slice(i))
+      if (end < 0) return false
+      i += end
+      continue
+    }
+    if (c === "#" && (i === 0 || " \t\n".includes(s.slice(i - 1, i)))) {
+      while (i < s.byteLength && s.slice(i, i + 1) !== "\n") i++
+      continue
+    }
+    if (c === "[" || c === "{") depth++
+    if (c === "]" || c === "}") depth--
+    i++
+  }
+  return depth <= 0
+}
+
+// Where the ": " that ends a block mapping key is, outside quotes; -1 when the line is not a key.
+function keyColon(t: string): int {
+  if (t.startsWith("\"") || t.startsWith("'")) {
+    const end = quoteEnd(t)
+    if (end < 0) return -1
+    const rest = t.slice(end).trimStart()
+    if (!rest.startsWith(":")) return -1
+    const at = t.byteLength - rest.byteLength
+    const after = t.slice(at + 1, at + 2)
+    return after === "" || after === " " || after === "\t" ? at : -1
+  }
+  if (t.startsWith("[") || t.startsWith("{") || t.startsWith("#")) return -1
+  for (let i = 0; i < t.byteLength; i++) {
+    const c = t.slice(i, i + 1)
+    if (c === "#" && i > 0 && " \t".includes(t.slice(i - 1, i))) return -1
+    if (c !== ":") continue
+    const after = t.slice(i + 1, i + 2)
+    if (after === "" || after === " " || after === "\t") return i
+  }
+  return -1
+}
+
+class YamlDoc {
+  lines: Line[] = []
+  at = 0
+  anchors: Map<string, string> = new Map()
+
+  alias(name: string): string throws SyntaxError {
+    const v = this.anchors.get(name)
+    if (v === undefined) throw new SyntaxError(`unknown YAML alias *${name}`)
+    return v
+  }
+
+  // The next line that holds content, or undefined at the end of the document.
+  next(): Line | undefined {
+    while (this.at < this.lines.length && blankLine(this.lines[this.at]!.text)) this.at++
+    return this.lines[this.at]
+  }
+
+  // A node whose first line is the next content line, at an indent of at least min.
+  node(min: int): string throws SyntaxError {
+    const l = this.next()
+    if (l === undefined || l.indent < min) return "null"
+    const t = l.text
+    if (t === "-" || t.startsWith("- ") || t.startsWith("-\t")) return try this.seq(l.indent)
+    if (t.startsWith("? ")) throw new SyntaxError(`line ${l.no}: complex mapping keys are not supported`)
+    if (keyColon(t) >= 0) return try this.map(l.indent)
+    // a scalar, a flow collection or an alias on its own line
+    this.at++
+    return try this.value(t, l.indent - 1, l.no)
+  }
+
+  seq(indent: int): string throws SyntaxError {
+    const out: string[] = []
+    while (true) {
+      const l = this.next()
+      if (l === undefined || l.indent !== indent) break
+      const t = l.text
+      if (!(t === "-" || t.startsWith("- ") || t.startsWith("-\t"))) break
+      const rest = t.slice(1).trimStart()
+      if (stripComment(rest) === "") {
+        this.at++
+        out.push(try this.node(indent + 1))
+        continue
+      }
+      // the item's own content starts after the dash: it becomes a line of its own at that indent
+      const off = t.byteLength - rest.byteLength
+      this.lines[this.at] = { indent: indent + off, text: rest, no: l.no }
+      out.push(try this.itemNode(indent + off, indent))
+    }
+    return "[" + out.join(",") + "]"
+  }
+
+  // A sequence item that starts on the dash's line: a nested mapping or sequence, else a value.
+  private itemNode(indent: int, parent: int): string throws SyntaxError {
+    const l = this.next()!
+    const t = l.text
+    if (t === "-" || t.startsWith("- ")) return try this.seq(indent)
+    if (keyColon(t) >= 0 && !t.startsWith("&") && !t.startsWith("*")) return try this.map(indent)
+    this.at++
+    return try this.value(t, parent, l.no)
+  }
+
+  map(indent: int): string throws SyntaxError {
+    let out: Field[] = []
+    const merges: string[] = []
+    while (true) {
+      const l = this.next()
+      if (l === undefined || l.indent !== indent) break
+      const t = l.text
+      if (t === "-" || t.startsWith("- ")) break
+      const colon = keyColon(t)
+      if (colon < 0) throw new SyntaxError(`line ${l.no}: expected a "key: value" mapping entry`)
+      const rawKey = t.slice(0, colon).trim()
+      let key = rawKey
+      if (rawKey.startsWith("\"") || rawKey.startsWith("'")) key = keyText(try quotedValue(rawKey))
+      const rest = t.slice(colon + 1)
+      this.at++
+      const v = try this.entryValue(rest, indent, l.no)
+      if (key === "<<") merges.push(v)
+      else putKey(&out, key, v)
+    }
+    // << merges fill in the keys the mapping does not set itself
+    for (const m of merges) {
+      const list: string[] = m.startsWith("[") ? splitArray(m) : [m]
+      for (const one of list) {
+        if (!one.startsWith("{")) throw new SyntaxError("a YAML << merge needs a mapping")
+        for (const f of try fields(one)) {
+          let has = false
+          for (const o of out) {
+            if (o.key === f.key) has = true
+          }
+          if (!has) out.push(f)
+        }
+      }
+    }
+    return objectText(out)
+  }
+
+  // The value after "key:" on a mapping line at indent: inline, or the block below it.
+  private entryValue(rest: string, indent: int, no: int): string throws SyntaxError {
+    const r = stripComment(rest).trim()
+    if (r === "") {
+      const nx = this.next()
+      if (nx === undefined) return "null"
+      // a sequence may sit at the key's own indent
+      if (nx.indent === indent && (nx.text === "-" || nx.text.startsWith("- "))) return try this.seq(indent)
+      return try this.node(indent + 1)
+    }
+    return try this.value(rest.trim(), indent, no)
+  }
+
+  // An inline value (its text after the key or dash), with the lines that continue it (indented past parent).
+  value(text: string, parent: int, no: int): string throws SyntaxError {
+    let t = text
+    // properties: an anchor, then a tag
+    let anchor = ""
+    if (t.startsWith("&")) {
+      const sp = t.indexOf(" ")
+      anchor = sp < 0 ? t.slice(1) : t.slice(1, sp)
+      t = sp < 0 ? "" : t.slice(sp + 1).trimStart()
+    }
+    let tag = ""
+    if (t.startsWith("!")) {
+      const sp = t.indexOf(" ")
+      tag = sp < 0 ? t : t.slice(0, sp)
+      t = sp < 0 ? "" : t.slice(sp + 1).trimStart()
+    }
+    let v = ""
+    if (stripComment(t) === "") {
+      // the node is the block below
+      const nx = this.next()
+      if (nx !== undefined && nx.indent === parent && (nx.text === "-" || nx.text.startsWith("- "))) v = try this.seq(parent)
+      else v = try this.node(parent + 1)
+    } else if (t.startsWith("*")) {
+      v = try this.alias(stripComment(t).slice(1).trim())
+    } else if (t.startsWith("|") || t.startsWith(">")) {
+      v = quote(this.blockScalar(stripComment(t), parent))
+    } else if (t.startsWith("[") || t.startsWith("{")) {
+      let s = t
+      while (!flowClosed(s)) {
+        if (this.at >= this.lines.length) throw new SyntaxError(`line ${no}: unterminated YAML flow collection`)
+        s += "\n" + this.lines[this.at]!.text
+        this.at++
+      }
+      const fr = new FlowReader(s, this)
+      v = try fr.node()
+      fr.ws()
+      if (fr.pos < s.byteLength) throw new SyntaxError(`line ${no}: unexpected text after a YAML flow collection`)
+    } else if (t.startsWith("\"") || t.startsWith("'")) {
+      let s = t
+      while (quoteEnd(s) < 0) {
+        if (this.at >= this.lines.length) throw new SyntaxError(`line ${no}: unterminated quoted YAML scalar`)
+        s += "\n" + this.lines[this.at]!.text
+        this.at++
+      }
+      const end = quoteEnd(s)
+      if (stripComment(s.slice(end)).trim() !== "") throw new SyntaxError(`line ${no}: unexpected text after a quoted YAML scalar`)
+      v = try quotedValue(s.slice(0, end))
+    } else {
+      // a plain scalar, continued by the more indented lines below it
+      const parts: string[] = [stripComment(t)]
+      while (this.at < this.lines.length) {
+        const l = this.lines[this.at]!
+        if (blankLine(l.text)) {
+          let k = this.at
+          while (k < this.lines.length && blankLine(this.lines[k]!.text)) k++
+          const after = this.lines[k]
+          if (after === undefined || after.indent <= parent || l.text.trim().startsWith("#")) break
+          for (let j = this.at; j < k; j++) parts.push("")
+          this.at = k
+          continue
+        }
+        if (l.indent <= parent || keyColon(l.text) >= 0) break
+        parts.push(stripComment(l.text))
+        this.at++
+      }
+      v = plainValue(fold(parts).trim())
+    }
+    if (tag === "!!str" && !v.startsWith("\"") && !v.startsWith("[") && !v.startsWith("{")) v = quote(v === "null" ? "" : v)
+    if (anchor !== "") this.anchors.set(anchor, v)
+    return v
+  }
+
+  // A literal (|) or folded (>) block scalar: the lines indented past parent, with its chomping indicator.
+  private blockScalar(header: string, parent: int): string {
+    const style = header.slice(0, 1)
+    let chomp = "clip"
+    let explicit = 0
+    for (const c of header.slice(1).chars()) {
+      if (c === "-") chomp = "strip"
+      else if (c === "+") chomp = "keep"
+      else if (DIGITS.includes(c)) explicit = parseInt(c) ?? 0
+    }
+    let indent = explicit > 0 ? parent + explicit : -1
+    const body: string[] = []
+    while (this.at < this.lines.length) {
+      const l = this.lines[this.at]!
+      if (l.text.trim() === "") {
+        body.push("")
+        this.at++
+        continue
+      }
+      if (indent < 0) {
+        if (l.indent <= parent) break
+        indent = l.indent
+      }
+      if (l.indent < indent) break
+      body.push(" ".repeat(l.indent - indent) + l.text)
+      this.at++
+    }
+    // trailing empty lines belong to the chomping, and blank lines that end the block are not its content
+    let trail = 0
+    while (body.length > 0 && body[body.length - 1]! === "") {
+      body.pop()
+      trail++
+    }
+    let text = ""
+    if (style === "|") {
+      text = body.join("\n")
+    } else {
+      // folded: lines of one paragraph join with a space; more indented lines keep their breaks
+      for (let i = 0; i < body.length; i++) {
+        const l = body[i]!
+        if (i === 0) {
+          text = l
+          continue
+        }
+        const prev = body[i - 1]!
+        const moreIndented = l.startsWith(" ") || prev.startsWith(" ")
+        if (l === "") text += "\n"
+        else if (prev === "" || moreIndented) text += (prev === "" && !moreIndented ? "" : "\n") + l
+        else text += " " + l
+      }
+    }
+    if (body.length === 0) return chomp === "keep" ? "\n".repeat(trail) : ""
+    if (chomp === "strip") return text
+    if (chomp === "keep") return text + "\n" + "\n".repeat(trail)
+    return text + "\n"
+  }
+}
+
+function splitArray(raw: string): string[] {
+  try {
+    const out: string[] = []
+    let depth = 0
+    let start = 1
+    let i = 1
+    while (i < raw.byteLength - 1) {
+      const c = raw.slice(i, i + 1)
+      if (c === "\"") {
+        const end = quoteEnd(raw.slice(i))
+        i += end < 0 ? 1 : end
+        continue
+      }
+      if (c === "[" || c === "{") depth++
+      if (c === "]" || c === "}") depth--
+      if (c === "," && depth === 0) {
+        out.push(raw.slice(start, i))
+        start = i + 1
+      }
+      i++
+    }
+    if (raw.byteLength > 2) out.push(raw.slice(start, raw.byteLength - 1))
+    return out
+  } catch (e) {
+    return []
+  }
+}
+
+// The first document of a YAML stream as JSON text.
+export function yamlToJson(text: string): string throws SyntaxError {
+  const doc = new YamlDoc()
+  const raw = text.startsWith("\u{FEFF}") ? text.slice(3) : text
+  let started = false
+  let no = 0
+  for (const line0 of raw.split("\n")) {
+    no++
+    const line = line0.endsWith("\r") ? line0.slice(0, line0.byteLength - 1) : line0
+    if (!started && (line.startsWith("%") || blankLine(line))) continue
+    if (line === "---" || line.startsWith("--- ")) {
+      if (started && doc.lines.some((l) => !blankLine(l.text))) break
+      started = true
+      const after = line.slice(3).trim()
+      if (after !== "" && !after.startsWith("#")) doc.lines.push({ indent: 0, text: after, no: no })
+      continue
+    }
+    if (line === "..." || line.startsWith("... ")) break
+    started = true
+    if (line.includes("\t") && line.trimStart().startsWith("\t") && line.trim() !== "") {
+      const lead = line.slice(0, line.byteLength - line.trimStart().byteLength)
+      if (lead.includes("\t")) throw new SyntaxError(`line ${no}: tabs cannot indent YAML`)
+    }
+    const ind = indentOf(line)
+    doc.lines.push({ indent: ind, text: line.slice(ind), no: no })
+  }
+  const first = doc.next()
+  if (first === undefined) throw new SyntaxError("the YAML document is empty")
+  const out = try doc.node(first.indent)
+  const left = doc.next()
+  if (left !== undefined) throw new SyntaxError(`line ${left.no}: unexpected content (check the indentation)`)
+  return out
+}
+
+test("block mappings, sequences and scalars become JSON", () => {
+  const y = `# a spec
+openapi: 3.10
+info:
+  title: "Pets: the API"
+  version: '1.0'
+  description: It's plain # a comment
+paths:
+  /pets/{id}:
+    get:
+      operationId: getPet
+      tags: [pets, read]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, minLength: 1}
+        - $ref: '#/components/parameters/Verbose'
+      responses:
+        200:
+          description: ok
+empty:
+nums: [1, -2.5, +3, 007, 1e3, .5, 0x1F]
+flags: [yes, true, False, ~, null]
+`
+  const fs = try fields(try yamlToJson(y))
+  expect(fs[0]!.raw).toBe("3.10")
+  const info = try fields(fs[1]!.raw)
+  expect(info[0]!.raw).toBe('"Pets: the API"')
+  expect(info[1]!.raw).toBe('"1.0"')
+  expect(info[2]!.raw).toBe(`"It's plain"`)
+  const j = try yamlToJson(y)
+  expect(j.includes('"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string","minLength":1}},{"$ref":"#/components/parameters/Verbose"}]')).toBe(true)
+  expect(j.includes('"tags":["pets","read"]')).toBe(true)
+  expect(j.includes('"responses":{"200":{"description":"ok"}}')).toBe(true)
+  expect(j.includes('"empty":null')).toBe(true)
+  expect(j.includes('"nums":[1,-2.5,3,7,1e3,0.5,"0x1F"]')).toBe(true)
+  expect(j.includes('"flags":["yes",true,false,null,null]')).toBe(true)
+})
+
+test("block scalars, quoted scalars, anchors and merges", () => {
+  const y = `---
+lit: |
+  line one
+    indented
+  line three
+
+folded: >-
+  one
+  two
+
+  three
+keep: |+
+  x
+
+dq: "a\\tb \\u00e9
+  continued"
+sq: 'it''s'
+base: &base
+  type: object
+  description: shared
+use:
+  <<: *base
+  description: own
+list:
+  - &item {a: 1}
+  - *item
+  - - nested
+    - two
+  - key: v
+    other: w
+tagged: !!str 123
+...
+ignored: true
+`
+  const j = try yamlToJson(y)
+  const fs = try fields(j)
+  expect(fs[0]!.raw).toBe(quote("line one\n  indented\nline three\n"))
+  expect(fs[1]!.raw).toBe(quote("one two\nthree"))
+  expect(fs[2]!.raw).toBe(quote("x\n\n"))
+  expect(fs[3]!.raw).toBe(quote("a\tb é continued"))
+  expect(fs[4]!.raw).toBe(quote("it's"))
+  expect(fs[6]!.raw).toBe('{"description":"own","type":"object"}')
+  expect(fs[7]!.raw).toBe('[{"a":1},{"a":1},["nested","two"],{"key":"v","other":"w"}]')
+  expect(fs[8]!.raw).toBe('"123"')
+  expect(fs.length).toBe(9)
+})
+
+test("a sequence at its key's indent, multi-line flow, and errors", () => {
+  const j = try yamlToJson("a:\n- 1\n- 2\nb: [x,\n  y]\nc: plain\n  continued\n")
+  expect(j).toBe('{"a":[1,2],"b":["x","y"],"c":"plain continued"}')
+  let threw = false
+  try {
+    yamlToJson("a: [1, 2\n")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    yamlToJson("a: 1\n  b: 2\n")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    yamlToJson("? complex\n: v\n")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  expect(try yamlToJson("- a\n- b: 1\n")).toBe('["a",{"b":1}]')
+  expect(try yamlToJson("url: http://x.example/a#frag\n")).toBe('{"url":"http://x.example/a#frag"}')
+})

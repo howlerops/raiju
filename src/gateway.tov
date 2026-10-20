@@ -58,7 +58,7 @@ import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches, adminRowOf } from "./mcp"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
 import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewAt, needsReverify, RENEW_RETRY_MS, ADMIN_TAKEOVER_MS, ADMIN_WAIT_MS, ADMIN_POLL_MS } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
@@ -2192,15 +2192,68 @@ export class Engine {
   withMcpTools(text: string, h: Hdrs): string throws SyntaxError {
     const m = this.mcp
     if (m === undefined) return text
+    const tools = try this.mcpToolsFor(m, h)
+    if (tools.length === 0) return text
+    const withTools = try injectTools(text, tools)
+    return try this.withMcpInstructions(withTools, m, h, tools)
+  }
+
+  // A Responses request with the MCP tools in the Responses shape (a tool the request already names stays as it
+  // is) and the servers' instructions appended to its own instructions, as Bifrost's ParseAndAddToolsToRequest.
+  withMcpResponses(text: string, h: Hdrs): string throws SyntaxError {
+    const m = this.mcp
+    if (m === undefined) return text
+    const tools = try this.mcpToolsFor(m, h)
+    if (tools.length === 0) return text
+    let fs = try fields(text)
+    const names: string[] = []
+    const out: string[] = []
+    const existing = find(fs, "tools")
+    if (existing !== undefined && !isNull(existing)) {
+      for (const el of try elements(existing)) {
+        out.push(el)
+        const ef = try fields(el)
+        const n = rawStr(ef, "name") ?? rawStr(try fields(find(ef, "function") ?? "{}"), "name")
+        if (n !== undefined) names.push(n)
+      }
+    }
+    for (const t of tools) {
+      const tf = try fields(t)
+      const fn = try fields(find(tf, "function") ?? "{}")
+      const n = rawStr(fn, "name") ?? ""
+      if (n === "" || names.includes(n)) continue
+      names.push(n)
+      let rt: Field[] = [{ key: "type", raw: find(tf, "type") ?? "\"function\"" }, { key: "name", raw: quote(n) }]
+      const d = find(fn, "description")
+      if (d !== undefined && !isNull(d)) rt.push({ key: "description", raw: d })
+      const p = find(fn, "parameters")
+      if (p !== undefined && !isNull(p)) rt.push({ key: "parameters", raw: p })
+      const st = find(fn, "strict")
+      if (st !== undefined && !isNull(st)) rt.push({ key: "strict", raw: st })
+      out.push(build(rt))
+    }
+    setField(&fs, "tools", "[" + out.join(",") + "]")
+    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
+    const block = parts.length === 0 ? "" : m.renderInstructions(parts)
+    if (block !== "") {
+      const own = rawStr(fs, "instructions") ?? ""
+      setField(&fs, "instructions", quote(own === "" ? block : own + "\n\n" + block))
+    }
+    return build(fs)
+  }
+
+  // The MCP tools a request is offered (chat tool definitions): the key's rules, then x-bf-mcp-include-clients and
+  // x-bf-mcp-include-tools; the code mode meta-tools stand in for the code mode clients' tools.
+  mcpToolsFor(m: McpManager, h: Hdrs): string[] throws SyntaxError {
     // Bifrost's client.mcp_disable_auto_tool_inject: tools are added only when the request names its clients or tools
     const named = h.get("x-bf-mcp-include-clients") !== undefined || h.get("x-bf-mcp-include-tools") !== undefined
-    if (this.cfg.client?.mcp_disable_auto_tool_inject === true && !named) return text
+    if (this.cfg.client?.mcp_disable_auto_tool_inject === true && !named) return []
     // a key's access profile may limit the MCP tools it gets; clients it doesn't name
     // count only with allow_by_default
-    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs)
+    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, this.projectMcp(h))
     const only = h.get("x-bf-mcp-include-clients")
     if (only !== undefined) {
-      if (only.trim() === "none") return text
+      if (only.trim() === "none") return []
       const names = only.split(",").map((n) => n.trim() + "-")
       tools = tools.filter((t) => names.some((n) => t.includes(`"name":"${n}`)))
     }
@@ -2220,15 +2273,13 @@ export class Engine {
     if (only === undefined && onlyTools === undefined && this.codeEntriesFor(m, h).length > 0) {
       for (const d of metaToolDefs()) tools.push(d)
     }
-    if (tools.length === 0) return text
-    const withTools = try injectTools(text, tools)
-    return try this.withMcpInstructions(withTools, m, h, tools)
+    return tools
   }
 
   // The instructions the connected MCP servers sent (capped as mcp.max_instructions_* say) go to the model
   // as a system message ahead of the caller's own, for the servers that still offer a tool in this request.
   withMcpInstructions(text: string, m: McpManager, h: Hdrs, tools: string[]): string throws SyntaxError {
-    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
+    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
     if (parts.length === 0) return text
     const block = m.renderInstructions(parts)
     if (block === "") return text
@@ -2243,7 +2294,7 @@ export class Engine {
 
   // The code mode servers a caller may reach, as the stubs and the runner name them.
   codeEntriesFor(m: McpManager, h: Hdrs): CodeEntry[] {
-    return codeEntries(m.codeToolsFor(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs))
+    return codeEntries(m.codeToolsFor(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, this.projectMcp(h)))
   }
 
   // One MCP tool call for a request, with the gates a direct call gets: the guardrails on the call, the
@@ -2282,8 +2333,8 @@ export class Engine {
   // The gate of one MCP tool call: the key's MCP rules (access profile patterns and mcp_configs) must
   // allow the tool, and the key's budgets must have room. A tool the gateway does not expose is left to
   // execution, which reports it as unknown.
-  toolGate(m: McpManager, h: Hdrs, name: string): Grant | Denial {
-    if (m.hasTool(name) && !m.mayRun(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, name)) {
+  toolGate(m: McpManager, h: Hdrs, name: string, via?: string): Grant | Denial {
+    if (m.hasTool(name) && !m.mayRun(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, name, this.projectMcp(h, via))) {
       return { kind: "denial", status: 403, type: "permission_error", message: `tool ${name} is not allowed for this key` }
     }
     const client = this.perUserClient(name)
@@ -2291,6 +2342,15 @@ export class Engine {
       return { kind: "denial", status: 401, type: "authentication_error", message: `the per-user headers of MCP client ${client} are not submitted for this key: open a submission with POST /api/mcp/per-user-headers/flows` }
     }
     return this.gov.admitTool(h)
+  }
+
+  // The MCP access of the project the request names (its mcp_configs and access_rule); undefined when it names
+  // none. via is the virtual MCP a call comes through: one the project is assigned lets the project's part pass.
+  projectMcp(h: Hdrs, via?: string): ProjectMcp | undefined {
+    const p = this.gov.projectFor(h)
+    if (p === undefined) return undefined
+    const v = via !== undefined && (p.virtual_mcps ?? []).includes(via)
+    return { rule: p.access_rule ?? "union", keys: p.mcp_configs ?? [], via: v ? true : undefined }
   }
 
   // The per_user_headers client a tool belongs to; undefined for the tools of any other client.
