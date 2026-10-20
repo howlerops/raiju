@@ -44,7 +44,7 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
   plus the Python tests (gen_pricing, the h2/gRPC interop suite with grpcio and h2, crew_priors);
   e2e "all passed" on Bun and http1; `make ui` all passed (333 checks); `make openapi-check` ok;
   `make web-check` up to date.
-- Test tools now needed: `pip install grpcio h2 numpy scipy`, and Go with GOTOOLCHAIN=go1.26.9 for
+- Test tools now needed: `pip install grpcio protobuf h2 numpy scipy`, and Go with GOTOOLCHAIN=go1.26.9 for
   the A2A gRPC e2e client (tests/a2a_grpc_client; e2e skips it if go is missing).
 - The Tov runtime carries ten patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
   plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2), 0008
