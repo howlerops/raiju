@@ -1,6 +1,6 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
-import { Config, VirtualKeyConfig, providerOf, providerNames, resolveEnv } from "./config"
+import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, providerOf, providerNames, resolveEnv } from "./config"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
@@ -53,7 +53,8 @@ import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, 
 import { asyncPoll } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, pathWithId } from "./pluginroute"
-import { kindOfPath } from "./plughttp"
+import { kindOfPath, isInferencePath } from "./plughttp"
+import { EXTRA_PARAMS_HEADER, mergeExtraParams } from "./extraparams"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -730,6 +731,19 @@ async function cors(cfg: Config, req: Request, res: Response): Promise<Response>
 
 export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int }
 
+// The servers' own cap, so the gateway's checks (which follow the config) decide.
+export const NO_BODY_LIMIT = 1099511627776
+
+// The request-body limits of the current config, read per request or connection so a reload moves them:
+// client.max_request_body_size_mb, and the size over which a body reaches the gateway as a stream
+// (large_payload_optimization's request threshold; the limit itself while the feature is off, so a body over it
+// is refused unread).
+export function bodyLimits(engine: Engine): { limit: int, threshold: int } {
+  const limit = (engine.cfg.client?.max_request_body_size_mb ?? 100) * 1048576
+  const lp = engine.large
+  return { limit: limit, threshold: lp === undefined ? Math.max(1, limit) : Math.max(1, lp.requestThreshold) }
+}
+
 // client.max_request_body_size_mb is checked here, not by the server: a declared length over the
 // limit is refused unread, and a body with no length is read as far as the limit and refused when it
 // is over. undefined means refused; otherwise the request to dispatch (rebuilt around its bytes when
@@ -788,7 +802,7 @@ export async function largeFront(engine: Engine, req: Request): Promise<Response
   // an audio upload is billed as its answer comes back (mediaAnswer); a request handed on whole is billed there
   const bill = billedMedia(mr.op) ? engine.mediaBill(snapshot(req.headers)) : undefined
   const started = performance.now()
-  const m = await handleMediaLarge(engine.cfg, req, mr, lp, bill)
+  const m = await handleMediaLarge(engine.cfg, req, mr, lp, bill, async (oc: OAuthKeyConfig, pc: ProviderConfig) => await engine.oauthToken(oc, pc))
   if (m instanceof Response) {
     const answered = bill === undefined ? m : await engine.mediaAnswer(mr, bill, m, snapshot(req.headers), started, req.headers.get("x-request-id") ?? newId("req_"))
     return await echoRequestId(req, await cors(engine.cfg, req, answered))
@@ -936,7 +950,8 @@ export async function markAgentRejection(engine: Engine, req: Request, res: Resp
   return new Response(bytes, { status: res.status, headers: hs })
 }
 
-async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
+async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response> throws TypeError {
+  const req = await withExtraParams(req0)
   // the compat plugin reads a model's datasheet row through the same handler as GET /api/models/parameters
   if (engine.paramsLookup === undefined) {
     engine.paramsLookup = async (model: string): Promise<string | undefined> => {
@@ -1118,7 +1133,7 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
       return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
     }
-    return try await passthroughRoute(engine.cfg, req)
+    return try await passthroughRoute(engine.cfg, req, async (oc: OAuthKeyConfig, pc: ProviderConfig) => await engine.oauthToken(oc, pc))
   }
   // audio, images, files and batches: passed through to OpenAI-compatible providers
   const media = matchRoute(m, p)
@@ -1274,7 +1289,29 @@ export async function routeStream(engine: Engine, req: Request, kind: string, si
   return await markAgentRejection(engine, req, await routeStreamInner(engine, req, kind, sink))
 }
 
-async function routeStreamInner(engine: Engine, req: Request, kind: string, sink?: StreamSink): Promise<Response> {
+// x-bf-passthrough-extra-params: true on an inference route (not a raw passthrough, not a large body, which never
+// gets here): the body's extra_params object is merged into the request before any route reads it (extraparams.tov).
+export async function withExtraParams(req: Request): Promise<Request> {
+  if (req.method !== "POST" || req.headers.get(EXTRA_PARAMS_HEADER) !== "true") return req
+  if ((req.headers.get("content-type") ?? "").toLowerCase().includes("multipart/")) return req
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  if (!isInferencePath(p) || passthroughPath(p)) return req
+  let text = ""
+  try {
+    text = await req.text()
+  } catch (e) {
+    return req
+  }
+  const hs: Record<string, string> = new Map()
+  req.headers.forEach((v, k) => {
+    if (k !== "content-length" && k !== "transfer-encoding") hs.set(k, v)
+  })
+  return new Request(req.url, { method: "POST", headers: hs, body: mergeExtraParams(text) })
+}
+
+async function routeStreamInner(engine: Engine, req0: Request, kind: string, sink?: StreamSink): Promise<Response> {
+  const req = await withExtraParams(req0)
   const u = URL.parse(req.url)
   const dep = deploymentRoute(u === undefined ? "" : u.pathname)
   if (dep !== undefined) return await routeStream(engine, await deploymentRequest(req, dep), kind, sink)
@@ -1482,15 +1519,16 @@ async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Pr
 // The Bun.serve server (the default): streamed chat answers, Tov's multi-process workers,
 // native WebSockets.
 export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
-  const lp = engine.large
   const server = Bun.serve<Session>({
     port: opts.port,
     hostname: opts.hostname,
     workers: opts.workers,
-    // large_payload_optimization: bodies over the request threshold arrive as a stream, and the sizes are
-    // checked by the gateway (client.max_request_body_size_mb, large_payload_optimization.max_payload_bytes)
-    bodyStreamThreshold: lp === undefined ? undefined : Math.max(1, lp.requestThreshold),
-    maxRequestBodySize: lp === undefined ? undefined : 1099511627776,
+    // bodies over the request threshold arrive as a stream (large_payload_optimization's, or the body limit when the
+    // feature is off), and the sizes are checked by the gateway against the current config, so a reload moves them
+    // (client.max_request_body_size_mb, large_payload_optimization.max_payload_bytes). The server's own threshold is
+    // the one at start: a lower one set later applies to the bodies over it.
+    bodyStreamThreshold: bodyLimits(engine).threshold,
+    maxRequestBodySize: NO_BODY_LIMIT,
     fetch(req0, server) {
       const wu = wsUpgrade(engine, ops, req0)
       if (wu.kind === "refused") return errorResponse(wu.status, wu.message, "invalid_request_error", noHeaders())
@@ -1501,7 +1539,7 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
         if (server.upgrade(req0, { data: wu.session, headers: uh })) return
         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
       }
-      return bunHttp(engine, ops, req0, opts.maxBodyBytes ?? 100 * 1048576)
+      return bunHttp(engine, ops, req0, bodyLimits(engine).limit)
     },
     websocket: {
       open: (ws) => {

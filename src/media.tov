@@ -5,7 +5,7 @@
 // rest of each request goes upstream unchanged. Anthropic, Gemini, Vertex and Bedrock
 // have their own APIs: media_native.tov and media_cloud.tov build those requests and the answers
 // are converted to OpenAI's shapes here.
-import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
+import { Config, KeyConfig, ProviderConfig, OAuthKeyConfig, providerOf } from "./config"
 import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf, poolOf } from "./providers/types"
 import { isOpenAICompatible, modelsRequest } from "./providers/openai"
 import * as replicate from "./providers/replicate"
@@ -483,7 +483,21 @@ async function copyPump(upstream: ReadableStream, p: Pump, conv: (chunk: u8[]) =
 // Serves one media, file or batch request: picks the provider, rewrites the
 // model when the body carries one, and returns the upstream response as it came.
 // A bill (audio requests) is admitted at the model, before the upstream call; a refusal is the answer.
-export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, bill?: MediaBill): Promise<Response> throws TypeError {
+// A key with oauth_key_config and no value gets its bearer from `mint` (the gateway's token cache).
+export type Mint = (oc: OAuthKeyConfig, p: ProviderConfig) => Promise<{ token: string, error: string }>
+
+// The target with its minted bearer when its key has oauth_key_config and no value, or the minting error.
+async function minted(t: Target, mint: Mint | undefined): Promise<{ t: Target, error: string }> {
+  const oc = t.key.oauth_key_config
+  if ((t.key.value ?? "") !== "" || oc === undefined || mint === undefined) return { t: t, error: "" }
+  const tok = await mint(oc, t.cfg)
+  if (tok.error !== "") return { t: t, error: tok.error }
+  let n = t
+  n.key.value = tok.token
+  return { t: n, error: "" }
+}
+
+export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, bill?: MediaBill, mint?: Mint): Promise<Response> throws TypeError {
   const url = try new URL(req.url)
   const sp = new URLSearchParams(url.search)
   const provider = providerFor(snapshot(req.headers), sp)
@@ -542,8 +556,12 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, 
   } catch (e) {
     return errorReply(400, `invalid request body: ${e.message}`, "invalid_request_error")
   }
-  const tt: Target = t === undefined ? { provider: provider, kind: "", model: "", key: { value: "" }, cfg: {} } : t
-  if (!supported(tt.kind)) return errorReply(400, `provider "${tt.provider}" does not support ${route.op}`, "invalid_request_error")
+  const t0: Target = t === undefined ? { provider: provider, kind: "", model: "", key: { value: "" }, cfg: {} } : t
+  if (!supported(t0.kind)) return errorReply(400, `provider "${t0.provider}" does not support ${route.op}`, "invalid_request_error")
+  // files, batches and media calls send the minted bearer of an oauth_key_config key too
+  const mt0 = await minted(t0, mint)
+  if (mt0.error !== "") return errorReply(502, mt0.error, "authentication_error")
+  const tt = mt0.t
   if (route.op === "batches.results") {
     try {
       return try await openaiBatchResults(tt, routeId(route))
@@ -562,7 +580,7 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, 
 // Returns undefined for a request this does not touch (under the threshold), the Request to go on with (the
 // body was small after all, or its provider needs it whole: native providers, or a model field that comes
 // after the file) or the Response (refused, or the provider's answer).
-export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRoute, lp: LargeSettings, bill?: MediaBill): Promise<Response | Request | undefined> {
+export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRoute, lp: LargeSettings, bill?: MediaBill, mint?: Mint): Promise<Response | Request | undefined> {
   if (req.method !== "POST") return undefined
   const dtext = req.headers.get("content-length")
   const declared = dtext === undefined ? -1 : (parseInt(dtext) ?? -1)
@@ -628,10 +646,15 @@ export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRo
       return refused
     }
   }
+  const mtl = await minted(tt, mint)
+  if (mtl.error !== "") {
+    await src.cancel()
+    return errorReply(502, mtl.error, "authentication_error")
+  }
   const lg = new LargeBody(lp, ahead.head, meta, ahead.ended ? undefined : src, declared)
   lg.plain = true
   if (route.modelIn === "form") lg.upstreamModel = tt.model
-  const h = authHeaders(tt)
+  const h = authHeaders(mtl.t)
   h.set("content-type", contentType)
   // the length is declared again when the caller declared one (so the provider need not accept chunks)
   if (declared >= 0) h.set("content-length", "" + (declared + lg.delta()))

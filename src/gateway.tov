@@ -70,7 +70,7 @@ import { fetchPluginUrls, missingPluginUrls } from "./plugindl"
 import { BasePlugin, PreResult, PostResult, PluginChain, PluginContext, PluginEntry, PluginRun, PluginTrace, PluginLogEntry, pluginLogsJson, PostOutcome, RUN_HEADER, TRACE_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
 import { SseBuffer, sseData, sseWithData } from "./plughttp"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
-import { Deadline, deadline } from "./deadline"
+import { Deadline, deadline, IdleWatch, idleWatch, streamIdleSeconds } from "./deadline"
 import { logMetadata, correlationIds, maximAttrs, stopReasonOf, toolNamesOfBody, ToolNameStream } from "./reqlog"
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
@@ -87,7 +87,7 @@ type AnswerStep = (s: string) => string throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
 // shortCircuit: the answer (or error) is a plugin's, not the provider's (x-bf-plugin-short-circuit)
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool, shortCircuit?: bool }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool, shortCircuit?: bool, idle?: IdleWatch }
 
 // The answer of a large request whose events are converted as they arrive: the Response is given when the
 // provider's answer starts, and its body is fed by a StreamSink.
@@ -1391,15 +1391,13 @@ function originOf(h: Hdrs): string {
   return (h.get("x-forwarded-proto") ?? "http") + "://" + host
 }
 
-// Cuts a streamed answer when no chunk arrives for idleSec seconds: the request's controller aborts, which
-// fails the pending read. The returned function disarms the cut once the chunk is in.
-function idleCut(dl: Deadline, idleSec: int): () => void {
-  const t = setTimeout(() => {
-    dl.controller.abort(new DOMException(`no data on the stream for ${idleSec} seconds`, "TimeoutError"))
-  }, idleSec * 1000)
-  return () => {
-    clearTimeout(t)
-  }
+// The idle guard of an upstream stream (network_config.stream_idle_timeout_in_seconds, Bifrost's 120 when unset):
+// a read that waits that long aborts the call.
+function idleGuard(dl: Deadline, p: ProviderConfig): IdleWatch {
+  const sec = streamIdleSeconds(p.network_config?.stream_idle_timeout_in_seconds)
+  return idleWatch(sec, () => {
+    dl.controller.abort(new DOMException(`no data on the stream for ${sec} seconds`, "TimeoutError"))
+  })
 }
 
 export class Engine {
@@ -2087,10 +2085,13 @@ export class Engine {
                 this.stick(h, ref, t)
               }
               metrics.observeRequest(tl, { ok: true, status: status, errorType: "", retries: 0.0 }, tookMs / 1000.0)
+              // the answer streams back as it arrives: a silent upstream is cut there too (stream_idle_timeout_in_seconds)
+              const piw = idleGuard(dl, p)
               const finishAnswer = (): void => {
+                piw.stop()
                 dl.finish()
               }
-              return { ok: true, status: status, body: "", contentType: ctype === "" ? "application/json" : ctype, provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasName: aliasNameOf(t.key, ref.model), aliasFamily: aliasFamilyOf(t.key, ref.model), pass: res, finish: finishAnswer, noBilled: t.cfg.ignore_provider_cost === true }
+              return { ok: true, status: status, body: "", contentType: ctype === "" ? "application/json" : ctype, provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasName: aliasNameOf(t.key, ref.model), aliasFamily: aliasFamilyOf(t.key, ref.model), pass: res, finish: finishAnswer, noBilled: t.cfg.ignore_provider_cost === true, idle: piw }
             }
           }
           const sink = ctx.sink
@@ -2120,20 +2121,19 @@ export class Engine {
             // whether any event has gone to the client (replay pacing starts after the first)
             let wrote = false
             let failed = false
+            // a silent upstream is cut (stream_idle_timeout_in_seconds)
+            const iw = idleGuard(dl, p)
             try {
               let chunkIndex = 0
               let lastAt = started
-              // network_config.stream_idle_timeout_in_seconds: a silent upstream is cut after this long
-              const idleSec = p.network_config?.stream_idle_timeout_in_seconds ?? 0
-              let disarm: () => void = () => {}
               while (true) {
                 if (sink.cancelled || conv.halted) {
                   await reader.cancel()
                   break
                 }
-                if (idleSec > 0) disarm = idleCut(dl, idleSec)
+                iw.arm()
                 const c = await reader.read()
-                disarm()
+                iw.disarm()
                 if (c.done) break
                 const v = c.value
                 if (v !== undefined) {
@@ -2165,6 +2165,7 @@ export class Engine {
               failed = true
               if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
             }
+            iw.stop()
             if (keepRaw) ctx.rawResponse = rawText(rawBytes)
             const tail = conv.guarded(conv.end(), true)
             // a held answer that passed goes out now, paced; one cut by an upstream failure is dropped
@@ -2956,15 +2957,22 @@ export class Engine {
 
   // A bearer token minted for a key with oauth_key_config, cached until it nears expiry.
   async oauthKeyToken(t: Target, oc: OAuthKeyConfig): Promise<{ token: string, error: string }> {
-    const key = (oc.token_url ?? "") + "|" + (oc.client_id ?? "")
+    return await this.oauthToken(oc, t.cfg)
+  }
+
+  // The bearer a key with oauth_key_config and no value sends, minted through the provider's proxy and TLS settings
+  // and cached per credential (every field that changes the token) until it nears expiry. Every call the key serves
+  // uses it: the routes, the raw passthrough, batches and files.
+  async oauthToken(oc: OAuthKeyConfig, pc: ProviderConfig): Promise<{ token: string, error: string }> {
+    const key = oauthKey.credentialKey(oc)
     const now = Date.now()
     const cached = this.oauthTokens.get(key, now)
     if (cached !== undefined) return { token: cached, error: "" }
     try {
       const up = oauthKey.tokenRequest(oc, Math.floor(now / 1000))
-      const hs: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" }
+      const hs: Record<string, string> = up.headers
       const dl = deadline(10000)
-      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(pc), tls: tlsOf(pc), pool: poolOf(pc) })
       const text = await res.text()
       dl.finish()
       const tok = oauthKey.parseOAuthToken(text, now)
@@ -4049,12 +4057,13 @@ export class Engine {
 
   // An audio request is billed (mediaBill, mediaAnswer); the other media routes pass through as they did.
   async media(req: Request, route: MediaRoute): Promise<Response> throws TypeError {
-    if (!billedMedia(route.op)) return try await handleMedia(this.cfg, req, route)
+    const mint = async (oc: OAuthKeyConfig, pc: ProviderConfig): Promise<{ token: string, error: string }> => await this.oauthToken(oc, pc)
+    if (!billedMedia(route.op)) return try await handleMedia(this.cfg, req, route, undefined, mint)
     const h = snapshot(req.headers)
     const started = performance.now()
     const rid = h.get("x-request-id") ?? newId("req_")
     const bill = this.mediaBill(h)
-    const res = try await handleMedia(this.cfg, req, route, bill)
+    const res = try await handleMedia(this.cfg, req, route, bill, mint)
     return await this.mediaAnswer(route, bill, res, h, started, rid)
   }
 
@@ -4222,6 +4231,9 @@ export class Engine {
       return new Request(req.url, { method: "POST", headers: hs, body: all })
     }
     const lg = new LargeBody(lp, head, meta, ended ? undefined : src, declared)
+    // a chat or text stream that goes as it is asks for its usage chunk, as Bifrost asks every OpenAI-format stream
+    // (the budgets and the log read it from the answer's tail)
+    lg.askUsage = family === "" && stream && (route === "chat" || route === "completions")
     const tiny: Field[] = [{ key: "model", raw: quote(meta.model) }]
     // A chat stream to a converted provider is called as a stream and its events are converted as they arrive (Bedrock's
     // binary event-stream frames too, from ConverseStream). A Messages stream passes through.
@@ -4437,8 +4449,12 @@ export class Engine {
           return
         }
         let chunk: u8[] | undefined = undefined
+        // only the wait for the upstream counts as idle, not a client that reads slowly
+        const iw = r.idle
         try {
+          if (iw !== undefined) iw.arm()
           const x = await reader.pull()
+          if (iw !== undefined) iw.disarm()
           chunk = x.value
           if (x.done) chunk = undefined
         } catch (e) {

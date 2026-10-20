@@ -3268,7 +3268,16 @@ def l97g_e2e(env):
         st_json = json.loads(b)
         check("setup_token is reported as configured, with setup required", st_json.get("setup_token_configured") is True and st_json.get("setup_required") is True, b[:300])
         s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, None, base=GW_L97G, auth=False)
-        check("the first admin account needs the setup token", s == 403 and "setup token" in b, (s, b[:200]))
+        check("the first admin account needs the setup token (the setup lock's 401)", s == 401 and "X-Bifrost-Setup-Token" in b, (s, b[:200]))
+        # Bifrost's setup lock: every other /api route is locked behind the token too, while no admin exists (L172)
+        s, _, b = call("GET", "/api/providers", None, None, base=GW_L97G, auth=False)
+        check("the setup lock refuses a management route without the token", s == 401 and "setup token" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": "wrong"}, base=GW_L97G, auth=False)
+        check("... and with a wrong token", s == 403 and "invalid setup token" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": "l97g-setup"}, base=GW_L97G, auth=False)
+        check("... and lets the token through", s == 200, (s, b[:200]))
+        s, _, b = call("GET", "/api/session/is-auth-enabled", None, None, base=GW_L97G, auth=False)
+        check("the auth state stays open under the lock", s == 200, (s, b[:200]))
         s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"x-bifrost-setup-token": "l97g-setup"}, base=GW_L97G, auth=False)
         check("the first admin account is created with the setup token", s != 403, (s, b[:200]))
         s, _, b = call("GET", "/api/providers", None, None, base=GW_L97G_AUTH, auth=False)
@@ -3863,6 +3872,9 @@ def l97l_e2e(env):
         value = cookie.split(";")[0].split("=", 1)[1] if cookie != "" else ""
         s, _, b = call("POST", "/api/plugins", {"name": "x-l170", "path": "/tmp/x-l170.wasm"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
         check("a custom plugin path needs genuine admin authentication while dashboard auth is off", s == 403 and "genuine admin authentication" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/config", None, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
+        s2, _, b2 = call("GET", "/api/config", None, None, base=GW_L97L_SETUP, auth=False)
+        check("the setup session cookie opens the locked API, which is closed without it", s == 200 and s2 == 401, (s, s2, b2[:200]))
         s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
         check("the setup session cookie creates the first admin without the token", s in (200, 201), (s, b[:200]))
         s, _, b = call("POST", "/api/session/setup", None, {"x-bifrost-setup-token": "l97l-setup"}, base=GW_L97L_SETUP, auth=False)
@@ -7197,6 +7209,23 @@ def headers_e2e(env):
         s, _, b = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "extra params"}], "extra_params": {"custom_flag": True}}, headers={"x-bf-passthrough-extra-params": "true"})
         sent = json.loads(seen()[-1]["body"])
         check("x-bf-passthrough-extra-params merges extra_params into the request", s == 200 and sent.get("custom_flag") is True and "extra_params" not in sent, sent)
+        # ... on the other routes too: embeddings, Responses and the SDK routes (L172)
+        xp = {"x-bf-passthrough-extra-params": "true"}
+        for path, body, upath in [
+            ("/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "xp embed", "extra_params": {"emb_flag": 1}}, "/v1/embeddings"),
+            ("/v1/responses", {"model": "openai/gpt-4o-mini", "input": "xp responses", "metadata": {"a": "1"}, "extra_params": {"resp_flag": "on", "metadata": {"b": "2"}}}, "/v1/responses"),
+            ("/openai/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "xp sdk", "extra_params": {"sdk_flag": True}}, "/v1/embeddings"),
+        ]:
+            s, _, b = api("POST", path, body, headers=xp)
+            ups = [x for x in seen() if x["path"] == upath and "xp " in x["body"]]
+            sent = json.loads(ups[-1]["body"]) if ups else {}
+            flags = {k: v for k, v in sent.items() if k.endswith("_flag")}
+            check("x-bf-passthrough-extra-params merges extra_params on " + path, s == 200 and len(flags) == 1 and "extra_params" not in sent, (s, b[:200], sent))
+            if path == "/v1/responses":
+                check("an object in extra_params merges into the body's object", sent.get("metadata") == {"a": "1", "b": "2"}, sent)
+        s, _, b = api("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "xp off", "extra_params": {"off_flag": 1}})
+        ups = [x for x in seen() if x["path"] == "/v1/embeddings" and "xp off" in x["body"]]
+        check("without the header extra_params is not merged", s == 200 and ups and "off_flag" not in json.loads(ups[-1]["body"]), ups[-1:])
     finally:
         gw.terminate()
 
@@ -7488,7 +7517,7 @@ def l112a_config_b():
     return {
         "client": {"enable_logging": False, "enforce_auth_on_inference": False},
         "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
-        "providers": {"openai": {"keys": [{"name": "oauth", "value": "", "models": [], "weight": 1.0,
+        "providers": {"openai": {"keys": [{"name": "oauth", "value": "", "models": [], "weight": 1.0, "use_for_batch_api": True,
                                            "oauth_key_config": {"grant_type": "client_credentials", "token_url": MOCK + "/token", "client_id": "cid-l112a", "client_secret": "csec-l112a", "scopes": ["inference.read", "inference.write"]}}],
                                  "network_config": {"base_url": MOCK, "max_retries": 0}}},
     }
@@ -7521,7 +7550,7 @@ def l112a_e2e(env):
         check("two Responses sockets are open under the session cap", all(h.status == 101 for h in held), [h.status for h in held])
         full = WsClient("/v1/responses", port=18164)
         ev = full.recv_json()
-        check("a Responses socket past the cap gets a websocket_connection_limit_reached error and a close", full.status == 101 and ev is not None and ev.get("error", {}).get("code") == "websocket_connection_limit_reached" and full.recv() is None, (full.status, ev))
+        check("a Responses socket past the cap gets Bifrost's 429 websocket_connection_limit_reached event and a close", full.status == 101 and ev is not None and ev.get("status") == 429 and ev.get("error", {}).get("code") == "websocket_connection_limit_reached" and full.recv() is None, (full.status, ev))
         held[0].close()
         time.sleep(0.5)
         again = WsClient("/v1/responses", port=18164)
@@ -7532,15 +7561,28 @@ def l112a_e2e(env):
         t0 = time.time()
         s, _, b = call("POST", "/v1/responses", {"model": "openai/gpt-4o-slow", "stream": True, "input": "hi"}, None, base=GW_L112A, auth=False)
         check("a stream silent past stream_idle_timeout_in_seconds is cut before its late chunk", "response.created" in b and "late" not in b and "response.completed" not in b and time.time() - t0 < 2.5, (s, round(time.time() - t0, 2), b[:300]))
+        t0 = time.time()
+        s, _, b = call("POST", "/openai_passthrough/v1/responses", {"model": "gpt-4o-slow", "stream": True, "input": "hi"}, None, base=GW_L112A, auth=False)
+        check("a native passthrough stream silent that long is cut too", s == 200 and "response.created" in b and "late" not in b and time.time() - t0 < 2.5, (s, round(time.time() - t0, 2), b[:300]))
 
         probe = "oauth-probe-l112a"
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": probe}]}, None, base=GW_L112A_B, auth=False)
         s2, _, b2 = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": probe + "-2"}]}, None, base=GW_L112A_B, auth=False)
-        mints = [x for x in seen(True) if x["path"] == "/token" and "client_id=cid-l112a" in x["body"]]
+        import base64
+        basic = "Basic " + base64.b64encode(b"cid-l112a:csec-l112a").decode()
+        mints = [x for x in seen(True) if x["path"] == "/token" and x["auth"] == basic]
         upstream = [x for x in seen(True) if probe in x["body"]]
         check("a key with oauth_key_config sends the bearer its token endpoint minted", s == 200 and upstream and upstream[0]["auth"] == "Bearer ya29.test-token", (s, upstream[:1]))
-        check("the token request names the client credentials grant and the scopes", mints and "grant_type=client_credentials" in mints[0]["body"] and "scope=inference.read%20inference.write" in mints[0]["body"], mints[:1])
-        check("the minted token is cached for the next request", s2 == 200 and len([x for x in seen(True) if x["path"] == "/token" and "client_id=cid-l112a" in x["body"]]) == len(mints) == 1, (s2, len(mints)))
+        check("the token request names the client credentials grant and the scopes, the client as Basic auth (Bifrost's default auth_style)", mints and "grant_type=client_credentials" in mints[0]["body"] and "scope=inference.read%20inference.write" in mints[0]["body"] and "client_secret" not in mints[0]["body"], mints[:1])
+        check("the minted token is cached for the next request", s2 == 200 and len([x for x in seen(True) if x["path"] == "/token" and x["auth"] == basic]) == len(mints) == 1, (s2, len(mints)))
+        # the raw passthrough and the file routes send the minted bearer too (L172)
+        s, _, b = call("POST", "/openai_passthrough/v1/chat/completions", {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": probe + "-pass"}]}, None, base=GW_L112A_B, auth=False)
+        upstream = [x for x in seen(True) if (probe + "-pass") in x["body"]]
+        check("a passthrough call with an oauth_key_config key sends the minted bearer", s == 200 and upstream and upstream[-1]["auth"] == "Bearer ya29.test-token", (s, b[:200], upstream[-1:]))
+        n_files = len([x for x in seen(True) if x["path"].startswith("/v1/files")])
+        s, _, b = call("GET", "/v1/files?provider=openai", None, None, base=GW_L112A_B, auth=False)
+        files = [x for x in seen(True) if x["path"].startswith("/v1/files")]
+        check("a file call with an oauth_key_config key sends the minted bearer", len(files) == n_files + 1 and files[-1]["auth"] == "Bearer ya29.test-token", (s, b[:200], files[-1:]))
     finally:
         gw_a.terminate()
         gw_b.terminate()
@@ -9034,7 +9076,13 @@ def l124_e2e(env):
         s, hs, b = l124_http(port, "POST", "/v1/chat/completions", sbody)
         b = b.decode()
         got = mine("/v1/chat/completions")
-        check("a big request that asks for a stream is streamed both ways", s == 200 and hdr(hs, "content-type") == "text/event-stream" and b.count("data: ") >= 3000 and b.rstrip().endswith("data: [DONE]") and got[-1]["size"] == len(sbody) - 7, (s, hs, len(b), got[-1]["size"], len(sbody)))
+        # (as Bifrost asks every OpenAI-format stream, the body asks for the usage chunk: stream_options goes first)
+        swant = b'{"stream_options":{"include_usage":true},' + sbody[1:].replace(b'"openai/large-stream"', b'"large-stream"', 1)
+        check("a big request that asks for a stream is streamed both ways, asking for its usage chunk", s == 200 and hdr(hs, "content-type") == "text/event-stream" and b.count("data: ") >= 3000 and b.rstrip().endswith("data: [DONE]") and got[-1]["size"] == len(swant) and got[-1]["sha"] == hashlib.sha256(swant).hexdigest(), (s, hs, len(b), got[-1]["size"], len(swant)))
+        sown = ('{"model":"openai/large-stream","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"%s"}]}' % ("S" * 600000)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", sown)
+        got = mine("/v1/chat/completions")
+        check("... and a stream_options the caller wrote is left as it is", s == 200 and got[-1]["size"] == len(sown) - 7, (s, got[-1]["size"], len(sown)))
         s, hs, b = chat({"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l124 plain"}]})
         check("a small answer is an ordinary answer, with usage", s == 200 and json.loads(b)["usage"]["total_tokens"] == 7, (s, b[:200]))
 
@@ -11735,6 +11783,50 @@ def l164_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L172 = "http://127.0.0.1:18294"  # L172: Vertex tuned endpoints by project_number, body limits that follow a config change
+
+def l172_config() -> dict:
+    """The L172 gateway: Vertex with a project_number (its token from the mock), and a body limit of 1 MiB."""
+    import re
+    src = open(os.path.join(ROOT, "src/jwt.tov")).read()
+    pem = re.search(r"const TEST_PKCS8 = `(.*?)`", src, re.S).group(1)
+    sa = {"type": "service_account", "client_email": "e2e@test.iam.gserviceaccount.com", "private_key": pem, "token_uri": MOCK + "/token"}
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 1},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "o-l172", "value": "sk-l172", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "vertex": {"keys": [{"name": "vx-l172", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "project_number": "998877", "force_single_region": True, "region": "us-central1", "auth_credentials": json.dumps(sa)}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+
+def l172_e2e(env):
+    """L172: a tuned Vertex model (an all-digit id) is called at the project's endpoint by its project_number, and the
+    request body limit follows a config change on both servers. Its own gateway (18294)."""
+    cfg_path = os.path.join(BUILD, "e2e.l172.json")
+    json.dump(l172_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18294", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l172.log"), "w"))
+    try:
+        wait(GW_L172 + "/health")
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "vertex/1234567890", "messages": [{"role": "user", "content": "tuned l172"}]}, None, base=GW_L172, auth=False)
+        up = [x for x in seen(True) if "tuned l172" in x["body"]]
+        check("a tuned Vertex model goes to the project's endpoint by its project_number", s == 200 and "Hi from a tuned vertex model" in b and up and up[-1]["path"] == "/v1beta1/projects/998877/locations/us-central1/endpoints/1234567890:generateContent", (s, b[:200], up[-1:]))
+        s, _, b = call("GET", "/api/providers/vertex", None, None, base=GW_L172, auth=False)
+        check("project_number and force_single_region are kept on the key", s == 200 and '"project_number":"998877"' in b.replace(" ", "") and '"force_single_region":true' in b.replace(" ", ""), (s, b[:400]))
+
+        big = json.dumps({"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l172 limit " + "x" * 1500000}]})
+        st = declared_post(18294, "/v1/chat/completions", 1500000)
+        check("a 1.5 MB body is over a 1 MiB max_request_body_size_mb", st == 413, st)
+        s, _, b = call("PUT", "/api/config", {"client_config": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 3}}, None, base=GW_L172, auth=False)
+        check("the body limit is raised through the config API", s == 200, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", big, None, base=GW_L172, auth=False)
+        check("the servers' body limit follows the config change", s == 200 and "Hello from gpt-4o-mini" in b, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 def main():
     unique_ports()
     build()
@@ -12852,6 +12944,22 @@ def main():
         s, _, b = call("POST", "/cursor/v1/chat/completions", '{"model":"openai/gpt-4o","input":"cursor hello"}')
         cb = jget(b) if s == 200 else {}
         check("/cursor chat with a Responses-shaped body answers a chat completion", s == 200 and cb.get("object") == "chat.completion" and cb.get("choices", [{}])[0].get("message", {}).get("role") == "assistant", (s, b[:200]))
+        # Bifrost's cursor parser fixes: flat tools, Anthropic tool blocks, empty user turns (L172)
+        cur = {"model": "openai/gpt-4o", "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "cursor tools"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_c1", "name": "Shell", "input": {"cmd": "ls"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c1", "content": [{"type": "text", "text": "a.txt"}]}]},
+            {"role": "user", "content": ""}],
+            "tools": [{"name": "Shell", "description": "run", "input_schema": {"type": "object"}}]}
+        s, _, b = call("POST", "/cursor/v1/chat/completions", cur)
+        up = [x for x in seen() if x["path"] == "/v1/responses" and "cursor tools" in x["body"]]
+        ub = json.loads(up[-1]["body"]) if up else {}
+        items = ub.get("input", [])
+        check("/cursor: Anthropic tool blocks become function_call items and Cursor's flat tools Responses tools", s == 200 and [i.get("type", "message") for i in items] == ["message", "function_call", "function_call_output", "message"] and items[1].get("call_id") == "toolu_c1" and items[2].get("output") == "a.txt" and items[3].get("content") == "..." and (ub.get("tools") or [None])[0] == {"type": "function", "name": "Shell", "description": "run", "parameters": {"type": "object"}}, (s, b[:200], ub))
+        s, _, b = call("POST", "/cursor/v1/chat/completions", {"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "cursor chat tools"}, {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_c2", "name": "Shell", "input": {}}]}, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c2", "content": "ok"}]}]})
+        up = [x for x in seen() if x["path"] == "/v1/chat/completions" and "cursor chat tools" in x["body"]]
+        um = json.loads(up[-1]["body"]).get("messages", []) if up else []
+        check("/cursor: in chat messages they become tool calls and tool messages", s == 200 and len(um) == 3 and um[1].get("tool_calls", [{}])[0].get("id") == "toolu_c2" and um[2] == {"role": "tool", "tool_call_id": "toolu_c2", "content": "ok"}, (s, b[:200], um))
         s, _, b = call("GET", "/cursor/v1/models")
         check("/cursor/v1/models lists models", s == 200 and jget(b).get("object") == "list", (s, b[:200]))
 
@@ -14123,6 +14231,8 @@ def main():
         l165_e2e(env)
         # L167: MCP OAuth user mode on the OIDC sign-in, the OAuth status states, flows and codes across restarts, temp tokens and dual credentials: its own gateway
         l167_e2e(env, idp_state)
+        # L172: Vertex tuned endpoints and body limits that follow the config: its own gateway (18294)
+        l172_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

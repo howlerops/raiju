@@ -58,6 +58,69 @@ export function deadline(ms: int): Deadline {
   return d
 }
 
+// network_config.stream_idle_timeout_in_seconds: a streamed answer whose upstream sends nothing for this long is
+// cut (Bifrost's default when it is unset or 0).
+export const DEFAULT_STREAM_IDLE_SECONDS = 120
+
+// The idle limit of a provider's streams, in seconds: the configured value, or Bifrost's default of 120.
+export function streamIdleSeconds(configured: int | undefined): int {
+  const v = configured ?? 0
+  return v > 0 ? v : DEFAULT_STREAM_IDLE_SECONDS
+}
+
+// The idle guard of one upstream stream. It counts only while a read is waiting (arm to the next chunk, then
+// disarm), so a slow client that holds back the reads is not taken for a silent upstream. One interval checks
+// every live guard, so a chunk costs two field writes instead of a timer.
+export class IdleWatch {
+  waiting = false
+  since = 0.0
+  stopped = false
+  fired = false
+  constructor(readonly ms: f64, readonly onIdle: () => void) {}
+  arm(): void {
+    this.waiting = true
+    this.since = performance.now()
+  }
+  disarm(): void {
+    this.waiting = false
+  }
+  stop(): void {
+    this.stopped = true
+    this.waiting = false
+  }
+}
+
+let watches: IdleWatch[] = []
+let watching = false
+
+// Fires the guards whose wait is over and drops the stopped ones.
+export function sweepIdle(): void {
+  const now = performance.now()
+  const keep: IdleWatch[] = []
+  for (const w of watches) {
+    if (w.stopped) continue
+    if (w.waiting && now - w.since >= w.ms) {
+      w.stopped = true
+      w.fired = true
+      w.onIdle()
+      continue
+    }
+    keep.push(w)
+  }
+  watches = keep
+}
+
+// A guard that calls onIdle once a read has waited `seconds`; stop() it when the stream ends.
+export function idleWatch(seconds: int, onIdle: () => void): IdleWatch {
+  if (!watching) {
+    watching = true
+    setInterval(() => sweepIdle(), 250)
+  }
+  const w = new IdleWatch(seconds * 1000.0, onIdle)
+  watches.push(w)
+  return w
+}
+
 test("expired deadlines abort, finished ones don't", () => {
   const a = deadline(-1)
   const b = deadline(-1)
@@ -67,4 +130,38 @@ test("expired deadlines abort, finished ones don't", () => {
   expect(a.controller.signal.aborted).toBe(true)
   expect(b.controller.signal.aborted).toBe(false)
   expect(c.controller.signal.aborted).toBe(false)
+})
+
+test("the idle limit defaults to Bifrost's 120 seconds", () => {
+  expect(streamIdleSeconds(undefined)).toBe(120)
+  expect(streamIdleSeconds(0)).toBe(120)
+  expect(streamIdleSeconds(5)).toBe(5)
+})
+
+test("an idle guard fires only while a read waits past its limit", () => {
+  let hits = 0
+  const a = idleWatch(0, () => {
+    hits += 1
+  })
+  // not waiting: nothing fires
+  sweepIdle()
+  expect(hits).toBe(0)
+  a.arm()
+  sweepIdle()
+  expect(hits).toBe(1)
+  expect(a.fired).toBe(true)
+  // fired once only
+  a.arm()
+  sweepIdle()
+  expect(hits).toBe(1)
+  const b = idleWatch(60, () => {
+    hits += 10
+  })
+  b.arm()
+  sweepIdle()
+  expect(hits).toBe(1)
+  b.disarm()
+  b.stop()
+  sweepIdle()
+  expect(b.fired).toBe(false)
 })

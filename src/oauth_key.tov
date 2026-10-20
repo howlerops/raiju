@@ -1,72 +1,142 @@
-// Bifrost's oauth_key_config: a provider key with no value gets its bearer token from a token endpoint.
-// The grant is RFC 6749 client_credentials, or RFC 7523 jwt_bearer (an RS256 assertion signed with the
-// key's RSA private key). This module builds the token request and reads the answer; gateway.tov
-// caches the token per token URL and client, and mints a new one before it expires.
+// Bifrost's oauth_key_config: a provider key with no value gets its bearer token from a token endpoint
+// (core/providers/utils/tokencache). The grant is RFC 6749 client_credentials (the client's id and secret as
+// HTTP Basic auth, or in the form with auth_style "body"), or RFC 7523 jwt_bearer (an assertion signed with
+// the key's private key: RS256 with an RSA key, ES256 with a P-256 EC key). This module builds the token
+// request and reads the answer; gateway.tov caches the token per credential and mints a new one before it
+// expires, for every call the key serves (the routes, the raw passthrough, batches and files).
 
 import { fields, rawStr, rawNum, quote } from "./json"
-import { utf8 } from "./crypto"
-import { encodeUrl } from "./base64"
+import { utf8, sha256, toHex, secureHex } from "./crypto"
+import { encodeUrl, encode, decode } from "./base64"
 import { signRs256 } from "./jwt"
+import { signEs256 } from "./ecdsa"
 import { pctEncode } from "./cloud_auth"
 import { OAuthKeyConfig } from "./config"
 
-export type OAuthRequest = { url: string, body: string }
+export type OAuthRequest = { url: string, body: string, headers: Map<string, string> }
 
 const JWT_BEARER_URN = "urn:ietf:params:oauth:grant-type:jwt-bearer"
-// the lifetime of a jwt_bearer assertion, in seconds
+// the lifetime of a jwt_bearer assertion when assertion_lifetime_seconds is unset, in seconds
 const ASSERTION_SECONDS = 300
+// iat and nbf are backdated this much, so a host clock a little fast does not issue a future assertion
+const ISSUED_SKEW_SECONDS = 30
 // the token lifetime when the response names none
 const DEFAULT_TOKEN_SECONDS = 3600.0
+// the algorithms an assertion can be signed with here (Bifrost also lists RS384, RS512, PS256 to PS512, ES384, ES512)
+const ALGORITHMS = ["RS256", "ES256"]
 
 // A token URL is an absolute https URL with no userinfo, query or fragment. Plain http is for loopback only.
 function checkTokenUrl(url: string): void throws SyntaxError {
-  const local = url.startsWith("http://localhost") || url.startsWith("http://127.0.0.1")
-  if (!url.startsWith("https://") && !local) throw new SyntaxError("oauth_key_config.token_url must be an https URL")
+  const local = url.startsWith("http://localhost") || url.startsWith("http://127.0.0.1") || url.startsWith("http://[::1]")
+  if (!url.startsWith("https://") && !local) throw new SyntaxError("oauth_key_config.token_url must be https (http is allowed for loopback hosts only)")
   const rest = url.slice(url.indexOf("//") + 2)
-  if (rest.includes("@") || url.includes("?") || url.includes("#")) throw new SyntaxError("oauth_key_config.token_url must not carry userinfo, a query or a fragment")
+  if (rest.includes("@") || url.includes("?") || url.includes("#")) throw new SyntaxError("oauth_key_config.token_url must not carry userinfo, a query, or a fragment; send extra parameters through extra_params")
 }
 
-// The RFC 7523 assertion of a jwt_bearer key, unsigned parts first: iss and sub name the client, aud is the
-// audience (the token URL when none is set). Signed RS256 with the key's private key.
+// The issuer of a jwt_bearer assertion (Bifrost requires issuer; client_id stands in for it here).
+function issuerOf(c: OAuthKeyConfig): string {
+  const iss = (c.issuer ?? "").trim()
+  return iss !== "" ? iss : (c.client_id ?? "").trim()
+}
+
+// The audience of a jwt_bearer assertion (Bifrost requires audience; the token URL stands in for it here).
+function audienceOf(c: OAuthKeyConfig): string {
+  const aud = (c.audience ?? "").trim()
+  return aud !== "" ? aud : (c.token_url ?? "")
+}
+
+// The RFC 7523 assertion of a jwt_bearer key: iss, sub (the subject, else the issuer), aud, iat and nbf (backdated
+// 30 seconds), exp, and a random jti; kid in the header when key_id is set. Signed RS256 or ES256.
 export function jwtAssertion(c: OAuthKeyConfig, nowSeconds: int): string throws SyntaxError {
-  const who = c.client_id ?? ""
-  const aud = c.audience ?? ""
-  const audience = aud === "" ? (c.token_url ?? "") : aud
-  const header = encodeUrl(utf8(`{"alg":"RS256","typ":"JWT"}`))
-  const claims = `{"iss":${quote(who)},"sub":${quote(who)},"aud":${quote(audience)},"iat":${nowSeconds},"exp":${nowSeconds + ASSERTION_SECONDS}}`
-  const input = header + "." + encodeUrl(utf8(claims))
-  const sig = try signRs256(c.private_key ?? "", input)
+  const alg = (c.signing_algorithm ?? "") === "" ? "RS256" : (c.signing_algorithm ?? "")
+  if (!ALGORITHMS.includes(alg)) throw new SyntaxError(`oauth jwt_bearer: signing_algorithm "${alg}" is not supported (RS256 or ES256)`)
+  const iss = issuerOf(c)
+  const sub = (c.subject ?? "").trim() === "" ? iss : (c.subject ?? "").trim()
+  const life = c.assertion_lifetime_seconds ?? 0
+  const lifetime = life > 0 ? life : ASSERTION_SECONDS
+  const kid = c.key_id ?? ""
+  const header = kid === "" ? `{"alg":${quote(alg)},"typ":"JWT"}` : `{"alg":${quote(alg)},"kid":${quote(kid)},"typ":"JWT"}`
+  let jti = ""
+  try {
+    jti = secureHex(32)
+  } catch (e) {
+    throw new SyntaxError(`oauth jwt_bearer: could not generate jti: ${e.message}`)
+  }
+  const issued = nowSeconds - ISSUED_SKEW_SECONDS
+  const claims = `{"aud":${quote(audienceOf(c))},"exp":${nowSeconds + lifetime},"iat":${issued},"iss":${quote(iss)},"jti":${quote(jti)},"nbf":${issued},"sub":${quote(sub)}}`
+  const input = encodeUrl(utf8(header)) + "." + encodeUrl(utf8(claims))
+  const pem = c.private_key ?? ""
+  let sig = ""
+  try {
+    sig = alg === "ES256" ? signEs256(pem, input) : signRs256(pem, input)
+  } catch (e) {
+    throw new SyntaxError(`oauth jwt_bearer: ${alg === "ES256" ? e.message : "private_key could not be parsed as an RSA PEM (PKCS#1 or PKCS#8) for RS256: " + e.message}`)
+  }
   return input + "." + sig
 }
 
-// The token request for a key: the grant's own fields, then the scopes, the audience and the extra
-// parameters, as a form body.
+// The token request for a key: the grant's own fields, then the scopes, the audience (client_credentials) and the
+// extra parameters (sorted), as a form body; a client_credentials key sends its id and secret as Basic auth unless
+// auth_style is "body".
 export function tokenRequest(c: OAuthKeyConfig, nowSeconds: int): OAuthRequest throws SyntaxError {
-  const url = c.token_url ?? ""
+  const url = (c.token_url ?? "").trim()
+  if (url === "") throw new SyntaxError("oauth_key_config.token_url is required")
   try checkTokenUrl(url)
   let parts: string[] = []
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/x-www-form-urlencoded")
+  hs.set("accept", "application/json")
   if (c.grant_type === "jwt_bearer") {
-    if ((c.private_key ?? "") === "") throw new SyntaxError("oauth_key_config: jwt_bearer needs private_key")
+    if ((c.private_key ?? "") === "" || issuerOf(c) === "") throw new SyntaxError("oauth_key_config.private_key, oauth_key_config.issuer and oauth_key_config.audience are required for the jwt_bearer grant")
+    const life = c.assertion_lifetime_seconds ?? 0
+    if (life < 0 || life > 3600) throw new SyntaxError("oauth_key_config.assertion_lifetime_seconds must be between 0 (default) and 3600")
     const assertion = try jwtAssertion(c, nowSeconds)
     parts.push("grant_type=" + pctEncode(JWT_BEARER_URN))
     parts.push("assertion=" + pctEncode(assertion))
   } else if (c.grant_type === "client_credentials") {
-    if ((c.client_id ?? "") === "" || (c.client_secret ?? "") === "") throw new SyntaxError("oauth_key_config: client_credentials needs client_id and client_secret")
+    const id = c.client_id ?? ""
+    const secret = c.client_secret ?? ""
+    if (id === "" || secret === "") throw new SyntaxError("oauth_key_config.client_id and oauth_key_config.client_secret are required for the client_credentials grant")
+    const style = c.auth_style ?? ""
+    if (style !== "" && style !== "header" && style !== "body") throw new SyntaxError("oauth_key_config.auth_style must be header or body")
     parts.push("grant_type=client_credentials")
-    parts.push("client_id=" + pctEncode(c.client_id ?? ""))
-    parts.push("client_secret=" + pctEncode(c.client_secret ?? ""))
+    if (style === "body") {
+      parts.push("client_id=" + pctEncode(id))
+      parts.push("client_secret=" + pctEncode(secret))
+    } else {
+      // RFC 6749 section 2.3.1: the id and secret are form-encoded, then joined for Basic auth
+      hs.set("authorization", "Basic " + encode(utf8(pctEncode(id) + ":" + pctEncode(secret))))
+    }
+  } else if ((c.grant_type ?? "") === "") {
+    throw new SyntaxError("oauth_key_config.grant_type is required")
   } else {
-    throw new SyntaxError(`oauth_key_config: grant_type "${c.grant_type ?? ""}" is not client_credentials or jwt_bearer`)
+    throw new SyntaxError("oauth_key_config.grant_type must be client_credentials or jwt_bearer")
   }
   const scopes = c.scopes ?? []
   if (scopes.length > 0) parts.push("scope=" + pctEncode(scopes.join(" ")))
   const aud = c.audience ?? ""
-  if (aud !== "") parts.push("audience=" + pctEncode(aud))
+  if (c.grant_type === "client_credentials" && aud !== "") parts.push("audience=" + pctEncode(aud))
   const extra = c.extra_params
   if (extra !== undefined) {
-    for (const k of extra.keys()) parts.push(pctEncode(k) + "=" + pctEncode(extra.get(k) ?? ""))
+    const ks = extra.keys()
+    ks.sort((a: string, b: string): int => a < b ? -1 : (a > b ? 1 : 0))
+    for (const k of ks) parts.push(pctEncode(k) + "=" + pctEncode(extra.get(k) ?? ""))
   }
-  return { url: url, body: parts.join("&") }
+  return { url: url, body: parts.join("&"), headers: hs }
+}
+
+// The cache key of a credential: every field that changes which token comes back (Bifrost's oauthKeyCacheKey), so
+// two keys that differ in any of them never share a token.
+export function credentialKey(c: OAuthKeyConfig): string {
+  const extra = c.extra_params
+  const ex: string[] = []
+  if (extra !== undefined) {
+    const ks = extra.keys()
+    ks.sort((a: string, b: string): int => a < b ? -1 : (a > b ? 1 : 0))
+    for (const k of ks) ex.push(k + "=" + (extra.get(k) ?? ""))
+  }
+  const parts = [c.grant_type ?? "", c.token_url ?? "", c.client_id ?? "", c.client_secret ?? "", c.private_key ?? "", c.issuer ?? "", c.subject ?? "", c.audience ?? "", c.key_id ?? "", c.signing_algorithm ?? "", c.auth_style ?? "", (c.scopes ?? []).join(" "), ex.join("&")]
+  return "oauthkey-v1:" + toHex(sha256(utf8(JSON.stringify(parts))))
 }
 
 // The access token and its absolute expiry from a token response. An error answer names its reason.
@@ -77,16 +147,23 @@ export function parseOAuthToken(text: string, nowMs: f64): { token: string, expi
     throw new SyntaxError(`oauth_key_config: token request failed: ${rawStr(fs, "error_description") ?? rawStr(fs, "error") ?? "no access_token"}`)
   }
   const secs = rawNum(fs, "expires_in") ?? DEFAULT_TOKEN_SECONDS
-  return { token: token, expiresAtMs: nowMs + secs * 1000.0 }
+  return { token: token, expiresAtMs: nowMs + (secs > 0.0 ? secs : DEFAULT_TOKEN_SECONDS) * 1000.0 }
 }
 
-test("client credentials request body names the grant, scopes and extra parameters", () => {
+test("client credentials go as Basic auth by default; the body names the grant, scopes and extra parameters", () => {
   const extra: Map<string, string> = new Map()
   extra.set("resource", "x y")
-  const c: OAuthKeyConfig = { grant_type: "client_credentials", token_url: "https://auth.example.test/oauth/token", client_id: "id-1", client_secret: "sec ret", scopes: ["read", "write"], extra_params: extra }
+  extra.set("a", "1")
+  const c: OAuthKeyConfig = { grant_type: "client_credentials", token_url: "https://auth.example.test/oauth/token", client_id: "id-1", client_secret: "sec ret", scopes: ["read", "write"], audience: "api", extra_params: extra }
   const r = try tokenRequest(c, 1000)
   expect(r.url).toBe("https://auth.example.test/oauth/token")
-  expect(r.body).toBe("grant_type=client_credentials&client_id=id-1&client_secret=sec%20ret&scope=read%20write&resource=x%20y")
+  expect(r.body).toBe("grant_type=client_credentials&scope=read%20write&audience=api&a=1&resource=x%20y")
+  expect(r.headers.get("authorization")).toBe("Basic " + encode(utf8("id-1:sec%20ret")))
+  let b = c
+  b.auth_style = "body"
+  const rb = try tokenRequest(b, 1000)
+  expect(rb.body).toBe("grant_type=client_credentials&client_id=id-1&client_secret=sec%20ret&scope=read%20write&audience=api&a=1&resource=x%20y")
+  expect(rb.headers.get("authorization")).toBeUndefined()
 })
 
 function clientCreds(url: string): OAuthKeyConfig {
@@ -112,7 +189,7 @@ test("token URLs must be https, or loopback http, with no query", () => {
   expect(query).toBe(true)
 })
 
-test("a jwt_bearer key needs its private key and a known grant", () => {
+test("a jwt_bearer key needs its private key and a known grant and algorithm", () => {
   let missing = false
   try {
     tokenRequest({ grant_type: "jwt_bearer", token_url: "https://auth.example.test/token", client_id: "a" }, 0)
@@ -127,6 +204,13 @@ test("a jwt_bearer key needs its private key and a known grant", () => {
     unknown = true
   }
   expect(unknown).toBe(true)
+  let alg = ""
+  try {
+    jwtAssertion({ grant_type: "jwt_bearer", token_url: "https://t", private_key: "k", issuer: "i", signing_algorithm: "HS256" }, 0)
+  } catch (e) {
+    alg = e.message
+  }
+  expect(alg.includes("not supported")).toBe(true)
 })
 
 test("token responses give the token and its expiry, or the reason they fail", () => {
@@ -142,4 +226,45 @@ test("token responses give the token and its expiry, or the reason they fail", (
     reason = e.message
   }
   expect(reason.includes("bad secret")).toBe(true)
+})
+
+test("credentials that differ in any field do not share a cache key", () => {
+  const a = clientCreds("https://auth.example.test/token")
+  const b: OAuthKeyConfig = { grant_type: "client_credentials", token_url: "https://auth.example.test/token", client_id: "a", client_secret: "b", scopes: ["x"] }
+  expect(credentialKey(a)).toBe(credentialKey(clientCreds("https://auth.example.test/token")))
+  expect(credentialKey(a) === credentialKey(b)).toBe(false)
+})
+
+// RFC 6979's P-256 test key as a SEC 1 PEM, built here.
+function testEcPem(): string {
+  const der: u8[] = []
+  for (const b of [0x30, 0x31, 0x02, 0x01, 0x01, 0x04, 0x20]) der.push(u8(b))
+  const d = "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721"
+  for (let i = 0; i < 64; i += 2) {
+    const v: int = parseInt(d.slice(i, i + 2), 16) ?? 0
+    der.push(u8(v))
+  }
+  for (const b of [0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]) der.push(u8(b))
+  return "-----BEGIN EC " + "PRIVATE KEY-----\n" + encode(der) + "\n-----END EC " + "PRIVATE KEY-----\n"
+}
+
+test("an ES256 jwt_bearer assertion names its issuer, subject, audience and kid", () => {
+  const c: OAuthKeyConfig = { grant_type: "jwt_bearer", token_url: "https://auth.example.test/token", private_key: testEcPem(), issuer: "svc@example.test", audience: "https://api.example.test", key_id: "k1", signing_algorithm: "ES256", scopes: ["s1"], assertion_lifetime_seconds: 120 }
+  const r = try tokenRequest(c, 1000000)
+  expect(r.body.startsWith("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=")).toBe(true)
+  expect(r.body.endsWith("&scope=s1")).toBe(true)
+  expect(r.headers.get("authorization")).toBeUndefined()
+  const a = try jwtAssertion(c, 1000000)
+  const parts = a.split(".")
+  expect(parts.length).toBe(3)
+  const header = try new TextDecoder().decode(try decode(parts[0]!))
+  expect(header).toBe(`{"alg":"ES256","kid":"k1","typ":"JWT"}`)
+  const claims = try fields(try new TextDecoder().decode(try decode(parts[1]!)))
+  expect(rawStr(claims, "iss")).toBe("svc@example.test")
+  expect(rawStr(claims, "sub")).toBe("svc@example.test")
+  expect(rawStr(claims, "aud")).toBe("https://api.example.test")
+  expect(rawNum(claims, "exp")).toBe(1000120.0)
+  expect(rawNum(claims, "iat")).toBe(999970.0)
+  expect((rawStr(claims, "jti") ?? "").byteLength).toBe(32)
+  expect((try decode(parts[2]!)).length).toBe(64)
 })
