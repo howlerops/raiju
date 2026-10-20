@@ -226,6 +226,16 @@ make web-check # rebuild it and fail when src/ui_assets.tov or the API types wou
 make bench
 ```
 
+### CI
+
+`.github/workflows/ci.yml` runs on pull requests and pushes to `main`: it builds the patched
+compiler once (cached by Tov's revision and a hash of `tov-patches/` and `scripts/build-tov.sh`),
+then check, unit, openapi-check, web-check and the parity count in one job, e2e on Bun and on
+http1, and `make ui` in Chromium; logs are uploaded when a job fails. Pushes to `main` also build
+the Docker image (no push). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all
+of them, or name some (`scripts/ci.sh check unit`; `--help` lists them). It uses `TOV` and `BUN`
+when set; with `CI_LOCK=/tmp/raiju-e2e.lock` the stages that bind fixed ports take that lock.
+
 ### The web UI
 
 The admin client is a browser app in [`web/`](web/): SolidJS 2.0 (release candidate), TypeScript,

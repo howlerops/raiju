@@ -3,13 +3,13 @@
 Raiju is one binary. Terraform modules (Helm release, AWS ECS Fargate) are in
 [terraform/](terraform/README.md).
 
-Raiju is one binary. The image runs it as non-root on a distroless base, with
-no shell. It takes a Bifrost-format `config.json` from `/app/data`, and provider
-keys come from environment variables that the config refers to as `env.NAME`.
+Raiju is one binary. The image runs it as non-root on a slim Debian base
+(bookworm-slim with JavaScriptCore, which the binary links). It takes a
+Bifrost-format `config.json` from `/app/data`, and provider keys come from environment variables that the config refers to as `env.NAME`.
 
 Endpoints for probes and scraping: `GET /health` (200, `{"status":"ok"}`) and
 `GET /metrics` (Prometheus text, Bifrost metric names). The image has no
-HEALTHCHECK (there is no shell or curl), so probe from outside the container.
+HEALTHCHECK (there is no curl), so probe from outside the container.
 
 ## Docker
 
@@ -106,7 +106,8 @@ the HPA, adds another full set of per-process limits.
 ## Limits of this packaging
 
 - The image builds Tov from source (the installer needs network access and takes
-  several minutes). The binary is dynamically linked against glibc and libstdc++, so the
-  runtime is `distroless/cc-debian12`, not `static`.
+  several minutes). The binary is dynamically linked against glibc, libstdc++ and
+  WebKitGTK's JavaScriptCore (Tov links it for `node:*` modules), so the runtime is
+  `debian:bookworm-slim` with `libjavascriptcoregtk-4.1-0`, not distroless.
 - The chart's pod security settings (read-only root filesystem, no capabilities)
   have not been exercised on a cluster.

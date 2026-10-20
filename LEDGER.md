@@ -393,9 +393,9 @@ Ports from 18270.
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L156 | CI | GitHub Actions: the patched compiler built and cached, check, unit, openapi, web-check, parity, e2e on Bun and http1, make ui, image build on main; `scripts/ci.sh` runs the same stages locally | worker | assigned |
+| L156 | CI | GitHub Actions: the patched compiler built and cached, check, unit, openapi, web-check, parity, e2e on Bun and http1, make ui, image build on main; `scripts/ci.sh` runs the same stages locally | worker | done: `scripts/ci.sh` (stages tov, check, unit, openapi, web, parity, e2e-bun, e2e-http1, ui; logs in build/ci) and `.github/workflows/ci.yml` (compiler cached on Tov rev + patch hash, checks, e2e matrix, ui, image build on main) with a shared setup action; the Dockerfile fixed (JavaScriptCore for node:* modules; debian slim runtime). Proven locally except Actions itself and the image build (no daemon) |
 | L157 | (d) Providers | Opt-in real-provider smoke suite (`make smoke`): chat, streams, tools, embeddings, native routes and a large request per provider with a key; skips without keys | worker | assigned |
-| L158 | runtime | tov-patches/0009: node:fs rename and fsync; config.json and other state files written atomically | worker | assigned |
+| L158 | runtime | tov-patches/0009: node:fs rename and fsync; config.json and other state files written atomically | worker | done: tov-patches/0009 adds node:fs renameSync/rename, openSync/writeSync/fsyncSync/fdatasyncSync/closeSync, chmodSync, writeFileSync {mode, flush} and Stats.mode; `atomicfile.tov` writeFileAtomic (temp in the same folder, fsync, rename, folder fsync) used for config.json and every whole-file state rewrite; stale temps cleared at startup. Closes L147's atomic-write item |
 | L159 | (e) Plugins | Compiled-in plugins on the provider-format routes where Bifrost runs them; embedContent, Bedrock rerank, count-tokens hooked | worker | assigned |
 | L160 | G40 | Realtime ephemeral client tokens (ek_) attributed to the minting virtual key; transcription sessions metered and billed; failed response.done logged as such | worker | assigned |
 | L161 | (g) A2A gRPC | google.rpc.Status ErrorInfo details; gRPC-only upstream agents dialed from every inbound binding | worker | assigned |

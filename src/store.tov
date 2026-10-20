@@ -4,6 +4,7 @@
 // engine. Secrets are masked on every read, and a masked value sent back
 // unchanged keeps the stored secret.
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
+import { writeFileAtomic, removeStaleTemps, writeTemp } from "./atomicfile"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
@@ -1172,6 +1173,9 @@ export class ConfigStore {
   constructor(readonly path: string, initial: Config) {
     this.cfg = initial
     setGlobalProxy(initial.proxy_config)
+    // temporary files a crash left between write and rename (a recent one may be another worker's save in progress)
+    removeStaleTemps(path, 600000.0)
+    removeStaleTemps(path + ".bak", 600000.0)
     try {
       if (existsSync(path)) {
         const known = fields(JSON.stringify(initial)).map((f) => f.key)
@@ -1186,8 +1190,8 @@ export class ConfigStore {
     return find(this.extras, name)
   }
 
-  // Writes the config as JSON. node:fs has no rename, so the previous file is
-  // kept as <path>.bak first; a crash mid-write leaves that copy behind.
+  // Writes the config as JSON, atomically (a temporary file renamed over it), so a crash or another worker never
+  // sees half a file. The previous file is kept as <path>.bak.
   save(): void throws Error {
     this.keepNewerAdmin()
     let text = JSON.stringify(try sealConfig(this.cfg, this.cipher), undefined, 2)
@@ -1198,9 +1202,9 @@ export class ConfigStore {
     }
     if (existsSync(this.path)) {
       const old = try readFileSync(this.path, "utf8")
-      try writeFileSync(this.path + ".bak", old)
+      try writeFileAtomic(this.path + ".bak", old)
     }
-    try writeFileSync(this.path, text + "\n")
+    try writeFileAtomic(this.path, text + "\n")
   }
 
   // A save never writes back a retained admin credential older than the one the file holds: another worker or node
@@ -4053,6 +4057,25 @@ test("persistence: saved file parses back to the same config and keeps a backup"
   expect(JSON.stringify(reloaded.cfg, undefined, 2) === JSON.stringify(s.cfg, undefined, 2)).toBe(true)
   expect(statusOf(s.upsertProvider("anthropic", {}))).toBe(200)
   expect(try readFileSync(path + ".bak", "utf8") === text).toBe(true)
+  cleanup(path)
+})
+
+test("persistence: a save is atomic, and a temporary file left by a crash is cleared at startup", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "x", value: "" }))).toBe(200)
+  const saved = try readFileSync(path, "utf8")
+  // a save that died before its rename: the file still holds the last complete save
+  const tmp = try writeTemp(path, "{\"half\":")
+  expect(try readFileSync(path, "utf8") === saved).toBe(true)
+  expect(existsSync(tmp)).toBe(true)
+  // a recent temporary file may be another worker's save in progress: kept
+  const again = new ConfigStore(path, {})
+  expect(existsSync(tmp)).toBe(true)
+  expect(removeStaleTemps(path, -1.0)).toBe(1)
+  expect(statusOf(again.upsertVirtualKey({ id: "vk2", name: "y", value: "" }))).toBe(200)
+  expect((try readFileSync(path, "utf8")).includes("vk2")).toBe(true)
+  expect(existsSync(tmp)).toBe(false)
   cleanup(path)
 })
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0008 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0009 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -127,5 +127,10 @@ expect "$OUT/request_body_client.out" 17 "Bun.serve request body streams"
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/socket_pause.tov" -o "$OUT/socket_pause" >/dev/null
 "$OUT/socket_pause" > "$OUT/socket_pause.out"
 expect "$OUT/socket_pause.out" 2 "Socket.pause"
+
+# node:fs rename, open/write/fsync/close, chmod, writeFileSync mode and flush (patch 0009)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/fs_atomic.tov" -o "$OUT/fs_atomic" >/dev/null
+"$OUT/fs_atomic" > "$OUT/fs_atomic.out"
+expect "$OUT/fs_atomic.out" 17 "node:fs rename and fsync"
 
 echo "tov-patches tests passed"

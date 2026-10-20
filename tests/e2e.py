@@ -9155,6 +9155,61 @@ def l155_e2e(env):
         gs.terminate()
         gs.wait()
 
+GW_L158 = "http://127.0.0.1:18272"  # atomic state files: config.json saved through a temporary file and a rename
+
+def l158_e2e(env):
+    """L158: config.json is replaced atomically. A temporary file a crash left next to it (older than ten minutes) is
+    removed at startup and a recent one is kept (another worker's save may be in progress); saves through the API leave
+    a complete file, its .bak and no temporary file, keep the file's permissions, and the file is a new inode each time
+    (a rename, not a rewrite in place)."""
+    import hashlib, shutil, stat
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l158")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    cfg_path = os.path.join(d, "config.json")
+    json.dump({
+        "client": {"enforce_auth_on_inference": False},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l158".encode()).hexdigest()}]},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l158", "value": "sk-l158", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }, open(cfg_path, "w"))
+    os.chmod(cfg_path, 0o640)
+    stale = os.path.join(d, ".config.json.tmp-1-1")
+    fresh = os.path.join(d, ".config.json.tmp-2-1")
+    open(stale, "w").write('{"half":')
+    open(fresh, "w").write('{"half":')
+    old = time.time() - 3600
+    os.utime(stale, (old, old))
+    admin = {"authorization": "Bearer sk-admin-l158"}
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18272", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l158.log"), "w"))
+    try:
+        wait(GW_L158 + "/health")
+        check("a temporary config file older than ten minutes is removed at startup", not os.path.exists(stale), os.listdir(d))
+        check("a recent temporary config file is kept (a save in progress)", os.path.exists(fresh), os.listdir(d))
+        os.unlink(fresh)
+        inode = os.stat(cfg_path).st_ino
+        s, b = 0, ""
+        for i in range(5):
+            s, _, b = call("POST", "/api/governance/virtual-keys", {"name": f"l158-{i}"}, admin, base=GW_L158, auth=False)
+            if s not in (200, 201):
+                break
+        check("five saves through the API succeed", s in (200, 201), (s, b[:200]))
+        names = sorted(os.listdir(d))
+        check("the saves leave config.json, its .bak and no temporary file", names == ["config.json", "config.json.bak"], names)
+        try:
+            saved = json.load(open(cfg_path))
+        except Exception as e:
+            saved = {"error": str(e)}
+        vks = [v.get("name") for v in saved.get("governance", {}).get("virtual_keys", [])]
+        check("config.json is complete and holds every saved key", all(f"l158-{i}" in vks for i in range(5)), vks)
+        check("config.json was replaced by a rename (a new inode)", os.stat(cfg_path).st_ino != inode, inode)
+        check("config.json keeps its permissions across saves", stat.S_IMODE(os.stat(cfg_path).st_mode) == 0o640, oct(os.stat(cfg_path).st_mode))
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def main():
     unique_ports()
     build()
@@ -11488,6 +11543,8 @@ def main():
         l154_e2e(env)
         # L155: the crew metrics on /metrics and the Crews screen's reads and writes by role: its own gateways
         l155_e2e(env)
+        # L158: config.json written atomically (a temporary file renamed over it): its own gateway
+        l158_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
