@@ -16,18 +16,18 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
 
 ## Where things stand
 
-- **In progress (waves 20 to 22, branch claude/affectionate-shannon-pjwi5z, not yet on main).**
-  Merged on the branch: L156 (CI: `.github/workflows/ci.yml`, `scripts/ci.sh`), L157 (`make smoke`,
-  and a use-after-free fix in tov-patches/0008), L158 (tov-patches/0009, atomic state writes), L159
-  to L169, L171. A triage of every partial row is in the parity notes and LEDGER wave 21/22 rows.
-  Still to merge (each worker left its change unstaged in its worktree under .claude/worktrees/,
-  with its diff at /tmp/claude-0/<id>/mine.patch when it rebased): L168 (in verify), L170 (adds
-  tov-patches/0010, a WASM wall-clock limit: rebuild the shared compiler after merging), L172,
-  L173 (its rebase onto 642ff0f was cut off by the account's weekly usage limit; resume that
-  worker or redo the rebase), and the upstream Tov material (tov-patches/upstream/: write-ups and
-  format-patch series for 0005-0010, compiler-bugs.md, README.md). Behaviour changes to list in
-  the PR: docs/behaviour-changes-waves-20-22.md.
-
+- Waves 20 to 22 (L156 to L173) followed a triage of every partial parity row: CI
+  (`.github/workflows/ci.yml`, `scripts/ci.sh`), an opt-in real-provider smoke suite (`make smoke`),
+  tov-patches 0009 (node:fs rename/fsync, atomic state writes) and 0010 (a WASM wall-clock limit),
+  a use-after-free fix in 0008, native decisions and text completions, provider operation gaps,
+  governance and RBAC API remainders, MCP OpenAPI import, library, user mode and persisted OAuth
+  flows, logs and audit remainders, realtime client tokens and transcription sessions, plugin
+  hooks on every route, A2A versions, failover and gRPC-only agents, stream idle timeouts and
+  oauth_key_config, and the provider leftovers. 40 rows were closed as already built or matching
+  Bifrost. Behaviour changes are listed in docs/behaviour-changes-waves-20-22.md.
+- Upstream: tov-patches/upstream/ holds write-ups and format-patch series for every patch, and
+  compiler-bugs.md (issue-ready reports; C6, a string `switch` with `break` cases corrupting
+  memory, matters for anyone writing Tov). Offering them to Tov is the owner's call.
 - Waves 1 to 17 are on `main`. Wave 18 (L142 to L149) built the open items left after wave 17:
   the A2A gRPC binding (an h2c server, HPACK and gRPC framing written in Tov on raw sockets, a
   protobuf codec for lf.a2a.v1, the binding itself), transcription and speech billing, large
@@ -38,17 +38,17 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
   priors and classifier training, the gateway wiring, outcomes with credibility learning, budget
   pacing and escalation, and the Crews tab with metrics. The price table was regenerated from the
   current Bifrost datasheet.
-- docs/parity.md counts 565 parity rows: done 377, partial 164, missing 0, out of scope 15,
-  n/a 9, plus 41 Raiju-only extras. Wave 18 narrowed "Open:" notes; no row changed status.
-- Tests at handoff (compiler from tov-patches 0001 to 0008): `make unit` 1,949 passed, 0 failed,
+- docs/parity.md counts 566 parity rows: done 469, partial 73, missing 0, out of scope 15,
+  n/a 9, plus 41 Raiju-only extras.
+- Tests at handoff (compiler from tov-patches 0001 to 0010): `make unit` 2,164 passed, 0 failed,
   plus the Python tests (gen_pricing, the h2/gRPC interop suite with grpcio and h2, crew_priors);
   e2e "all passed" on Bun and http1; `make ui` all passed (333 checks); `make openapi-check` ok;
   `make web-check` up to date.
 - Test tools now needed: `pip install grpcio h2 numpy scipy`, and Go with GOTOOLCHAIN=go1.26.9 for
   the A2A gRPC e2e client (tests/a2a_grpc_client; e2e skips it if go is missing).
-- The Tov runtime carries eight patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
+- The Tov runtime carries ten patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
   plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2), 0008
-  streamed request bodies. They apply in order only; `make tov` rebuilds the compiler.
+  streamed request bodies, 0009 node:fs rename and fsync, 0010 a WASM wall-clock limit. They apply in order only; `make tov` rebuilds the compiler.
 - Admin UI: SolidJS 2.0 RC in `web/`, embedded through the committed `src/ui_assets.tov`;
   charts with zoom and series toggles, MCP access and virtual MCP screens, role-aware actions
   (L132), and a Roles tab that edits custom roles (L141). `make web` after any
@@ -64,24 +64,17 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
 
 ## What's next
 
-No row is queued; the remainders are the "Open:" notes in LEDGER.md. The larger ones:
+No row is queued; the remainders are the "Open:" notes in LEDGER.md (L156 to L173 list them).
+The larger ones:
 
-- Crew routing: fit real priors and a classifier from your own evaluation data
-  (`scripts/crew_priors.py`; the built-in classifier and empty priors are placeholders);
-  reasoning_effort is applied on chat completions only; per-role credit from a whole-task outcome is
-  an approximation (L154, L155).
-- Pricing: Gemini transcription carries no usage on its native path, so it costs 0 (L144).
-- Large requests: completions to other formats and Titan embeddings buffer; Bedrock Messages
-  streams are replayed (L136, L146).
-- A2A gRPC: no TLS (as Bifrost), no ErrorInfo details, GRPC-only upstream agents are not dialed
-  (L148).
-- config.json writes are not atomic: Tov's node:fs has no rename (a runtime patch would add it;
-  L147).
-- Plugins: compiled-in plugins stay chat-only on the provider-format routes; embedContent,
-  Bedrock rerank, count-tokens and batch routes are not hooked (L139).
-- Realtime: transcription sessions and ephemeral ek_ tokens (L137).
-- Streams under block-capable guards arrive after the answer ends (L131, by design).
-- Upstream: the Tov patches and the compiler bugs found could be offered to Tov.
+- Real providers: `make smoke` has never run against real keys (none in this environment).
+- HuggingFace multi-backend routing (about 5,000 lines in Bifrost); SCIM bulk and ETags (Bifrost
+  enterprise, not in its source); Gitleaks' worst case is over its time budget.
+- Logs: payload offload of normal logs to object storage, cross-node log reads, logs_only reveal.
+- Governance: projects' redivision job, held provider-config budgets, user budget overrides.
+- Crew routing: fit real priors and a classifier from your own evaluation data.
+- Cluster: MCP client configs are per node.
+- Upstream: offer tov-patches/upstream to Tov.
 
 ## Owner decisions after wave 14 (2026-10-17)
 
