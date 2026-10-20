@@ -39,6 +39,8 @@ import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp, rpcError } from "./mcpserver"
 import { isMetaTool, metaToolDefs } from "./codemode"
 import { relay } from "./passthrough"
+import { upstreamBinding, grpcSend } from "./a2agrpcup"
+import { H2Tls } from "./h2"
 import { findAgent, grantAllows, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
 import { Call, PushSpec, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, interfacesOf, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
 import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
@@ -2829,16 +2831,18 @@ export class Ops {
     return { headers: out, error: "" }
   }
 
-  // Sends one call to the agent, in the binding its card offers that the caller's binding prefers: a REST
-  // caller goes to the card's REST endpoint, else its JSON-RPC one, and the other way round. params is the call's
+  // Sends one call to the agent, in the binding its card offers that the caller's binding prefers: the card's
+  // interface of the caller's own binding, else the first interface the card lists that the gateway can call
+  // (a2agrpcup.tov upstreamBinding). A GRPC interface is called over gRPC (a2aSendGrpc). params is the call's
   // params after any push rewriting.
   async a2aSend(agent: AgentConfig, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined): Promise<Fwd> {
     const card = agent.card ?? ""
-    const rpcUrl = endpointOf(card)
-    const restUrl = restEndpointOf(card)
-    if (rpcUrl === "" && restUrl === "") return fwdFail(`the card of ${agent.name} names no endpoint`)
-    const useRest = binding === "rest" ? restUrl !== "" : rpcUrl === "" && restUrl !== ""
-    let url = rpcUrl
+    const pick = upstreamBinding(card, binding, agent.allow_private_network === true)
+    if (pick.binding === "") return fwdFail(`the card of ${agent.name} names no endpoint`)
+    if (pick.binding === "GRPC") return await this.a2aSendGrpc(agent, call, params, pick.url, rpcId, h, accepted)
+    const useRest = pick.binding === "HTTP+JSON"
+    const restUrl = pick.url
+    let url = pick.url
     let method = "POST"
     let body = ""
     if (useRest) {
@@ -2874,6 +2878,25 @@ export class Ops {
       dl.finish()
       return fwdFail(`the agent did not answer: ${e.message}`)
     }
+  }
+
+  // Sends one call to the agent's gRPC interface (a2agrpcup.tov): the answer comes back as a JSON-RPC answer, or
+  // an event stream of them, so every binding maps it as it maps a JSON-RPC agent's.
+  async a2aSendGrpc(agent: AgentConfig, call: Call, params: string, url: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined): Promise<Fwd> {
+    const hd = await this.a2aHeaders(agent, h, accepted, false, call.stream)
+    if (hd.error !== "") return fwdFail(hd.error)
+    const tls: H2Tls = { ca: "", verify: true }
+    const t = tlsOf(agent.runtime_auth)
+    if (t !== undefined) {
+      const ca = t.ca
+      if (ca !== undefined) tls.ca = ca
+      if (t.rejectUnauthorized === false) tls.verify = false
+    }
+    const g = await grpcSend(url, tls, call, params, rpcId, hd.headers)
+    if (g.error !== "") return fwdFail(`the agent did not answer: ${g.error}`)
+    const st = g.stream
+    if (st !== undefined) return { status: 200, text: "", ct: "text/event-stream", stream: st, rpc: true, error: "" }
+    return { status: 200, text: g.text, ct: "application/json", stream: undefined, rpc: true, error: "" }
   }
 
   // One call, whatever binding it came in on: push configs are kept by the gateway (get and list are answered

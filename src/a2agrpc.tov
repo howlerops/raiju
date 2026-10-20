@@ -5,8 +5,11 @@
 // its request (a2apb), runs the operation the JSON-RPC binding would run (Ops.a2aCall, binding "grpc") and encodes the
 // answer; an agent's error is a gRPC status as a2a-go maps it.
 //
-// Not built: TLS (h2c only, as Bifrost's listener); the ErrorInfo details a2a-go attaches to a status; a client's
-// cancellation ends a call only at its deadline.
+// An error the agent answered (a JSON-RPC error, whatever binding it came in) carries the details a2a-go attaches
+// to its status: a google.rpc.ErrorInfo with the A2A reason in grpc-status-details-bin (grpcstatus.tov). The
+// gateway's own refusals (no agent, no key, no grant, limits) are plain statuses, as Bifrost's are.
+//
+// Not built: TLS (h2c only, as Bifrost's listener); a client's cancellation ends a call only at its deadline.
 import { listen, H2Header } from "./h2"
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
@@ -16,6 +19,7 @@ import { requestOf, responseOf, encode, decode } from "./a2apb"
 import { rpcCall, Call, SseSplitter } from "./a2a"
 import { Field, fields, find, rawStr, rawNum, isNull } from "./json"
 import { Hdrs } from "./schemas"
+import { a2aStatusOf, decodeStatus, decodeErrorInfo } from "./grpcstatus"
 import { AgentConfig, ServerSectionConfig, VirtualKeyConfig } from "./config"
 
 const SERVICE = "/lf.a2a.v1.A2AService/"
@@ -123,7 +127,14 @@ function resultOf(text: string, status: int): string throws GrpcError {
     if (er !== undefined && !isNull(er)) {
       const ef = envelopeOf(er) ?? []
       const code = Math.floor(rawNum(ef, "code") ?? -32603.0)
-      throw new GrpcError(grpcOfRpcCode(code), rawStr(ef, "message") ?? "the agent failed")
+      const g = new GrpcError(grpcOfRpcCode(code), rawStr(ef, "message") ?? "the agent failed")
+      // the status details a2a-go sends for an A2A error: its ErrorInfo (reason, domain, metadata) and Structs
+      try {
+        g.details = try a2aStatusOf(g.code, g.message, code, find(ef, "data"))
+      } catch (e) {
+        g.details = []
+      }
+      throw g
     }
     const res = find(fs, "result")
     if (res !== undefined && status < 400) return res
@@ -409,6 +420,20 @@ test("an answer is its result, or the error it carries as a status", () => {
   }
   expect(code).toBe(GRPC_NOT_FOUND)
   expect(msg).toBe("task not found")
+  let reason = ""
+  let meta = ""
+  try {
+    const z = try resultOf(`{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"task not found","data":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TASK_NOT_FOUND","domain":"a2a-protocol.org","metadata":{"taskId":"t7"}}]}}`, 200)
+  } catch (e) {
+    if (e instanceof GrpcError) {
+      const st = try decodeStatus(e.details)
+      const ei = try decodeErrorInfo(st.details[st.details.length - 1]!.value)
+      reason = ei.reason
+      meta = ei.metadata.get("taskId") ?? ""
+    }
+  }
+  expect(reason).toBe("TASK_NOT_FOUND")
+  expect(meta).toBe("t7")
   let plain: int = -1
   try {
     const y = try resultOf("upstream went away", 502)

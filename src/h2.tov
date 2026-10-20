@@ -61,6 +61,14 @@ function read32(p: u8[], at: int): int {
 
 // ---- the connection ----
 
+// Where a streamed response goes as it arrives: its head once, then each DATA payload. sid is the
+// stream's id once the request is sent (for H2Conn.reset).
+export class H2Sink {
+  sid: int = 0
+
+  constructor(readonly onHeaders: (hs: H2Header[]) => void, readonly onData: (b: u8[]) => void) {}
+}
+
 // One request waiting for its response. The socket's events resolve it.
 class H2Stream {
   headers: H2Header[] | undefined = undefined
@@ -69,6 +77,8 @@ class H2Stream {
   window: int = DEFAULT_WINDOW
   block: u8[] = []
   endStream: bool = false
+  // a streamed response: the head and the DATA go here as they arrive, not into body
+  sink: H2Sink | undefined = undefined
 
   constructor(readonly id: int, readonly resolve: (r: H2Response) => void, readonly reject: (e: Error) => void) {}
 }
@@ -121,6 +131,46 @@ export class H2Conn {
       clearTimeout(timer)
       throw e
     }
+  }
+
+  // Sends one request whose response is streamed: the sink gets its head and each DATA payload as
+  // they arrive, and the promise resolves at the end with the head and the trailers (body empty).
+  // timeoutMs above 0 bounds the whole call, as request does; 0 sets no limit.
+  async requestStream(headers: H2Header[], body: u8[], timeoutMs: int, sink: H2Sink): Promise<H2Response, Error> {
+    try await this.ensure()
+    const sid = this.nextId
+    this.nextId = this.nextId + 2
+    sink.sid = sid
+    const self = this
+    const done = new Promise<H2Response, Error>((resolve, reject) => {
+      const st = new H2Stream(sid, resolve, reject)
+      st.window = self.initWindow
+      st.sink = sink
+      self.streams.set(sid, st)
+    })
+    // no limit is the largest timer delay (about 24 days); the timer is cleared at the end either way
+    let delay: int = 2147483647
+    if (timeoutMs > 0) delay = timeoutMs
+    const timer = setTimeout(() => {
+      self.cancel(sid, new Error("grpc: deadline exceeded"))
+    }, delay)
+    try {
+      this.sendHeaders(sid, headers, body.length === 0)
+      if (body.length > 0) {
+        try await this.sendBody(sid, body)
+      }
+      const r = try await done
+      clearTimeout(timer)
+      return r
+    } catch (e) {
+      clearTimeout(timer)
+      throw e
+    }
+  }
+
+  // Cancels one stream (RST_STREAM CANCEL): its call fails, the connection stays.
+  reset(sid: int): void {
+    this.cancel(sid, new Error("grpc: cancelled"))
   }
 
   // Ends the connection; in-flight requests fail.
@@ -363,7 +413,12 @@ export class H2Conn {
       if (end < start) throw new Error("h2: bad padding")
       const st = this.streams.get(sid)
       if (st !== undefined) {
-        for (let i = start; i < end; i++) st.body.push(p[i]!)
+        const sk = st.sink
+        if (sk !== undefined) {
+          if (end > start) sk.onData(p.slice(start, end))
+        } else {
+          for (let i = start; i < end; i++) st.body.push(p[i]!)
+        }
       }
       // the received bytes return to the windows, so the peer keeps sending
       if (p.length > 0) {
@@ -383,6 +438,8 @@ export class H2Conn {
     st.block = []
     if (st.headers === undefined) {
       st.headers = fields
+      const sk = st.sink
+      if (sk !== undefined) sk.onHeaders(fields)
     } else {
       st.trailers = fields
     }

@@ -1,0 +1,537 @@
+// Calls to an agent over the A2A gRPC binding (lf.a2a.v1), for agents whose card offers it: the client side
+// Bifrost's agent manager builds with a2a-go's gRPC transport (core/agent/manager.go buildGeneration).
+//
+// The interface URL is a dial target as Bifrost reads it (grpcUpstreamTarget): host:port alone or https://host:port
+// is TLS (ALPN h2, the agent's runtime_auth.tls applies), http://host:port is h2c; no path, query or credentials.
+// A call is the operation the gateway already handles (an a2a.tov Call under its v1 name, with its params as JSON):
+// its params are encoded as the method's request message (a2apb), sent on the shared HTTP/2 connection to the agent
+// (h2.tov, grpc.tov), and the answer comes back as the JSON-RPC answer the gateway's dispatch maps for every binding:
+// a result, a JSON-RPC error read from the status as a2a-go reads it (grpcstatus.tov: the ErrorInfo's reason, its
+// metadata and the Struct details become the error's code and data), or, for the two streaming methods, an event
+// stream of JSON-RPC answers, one per StreamResponse, as they arrive.
+//
+// The caller's forwarded headers and the agent's runtime credentials go as metadata (Bifrost sends them as the SDK's
+// service params). Not built: compressed messages (none is asked for), and a v0.3 caller's result is the v1 shape the
+// agent answers (as for JSON-RPC agents, bodies are not translated between protocol versions).
+import { H2Header, H2Response, H2Sink, H2Tls, H2Conn } from "./h2"
+import { grpcConn, grpcFrame, headerValue, percentDecode } from "./grpc"
+import { GrpcDeframer } from "./grpcwire"
+import { encode, decode, requestOf, responseOf } from "./a2apb"
+import { rpcErrorOfGrpc } from "./grpcstatus"
+import { Call, interfacesOf } from "./a2a"
+import { urlProblem } from "./webhooks"
+import { Field, fields, find, quote, build, without, setField } from "./json"
+
+const SERVICE = "/lf.a2a.v1.A2AService/"
+// grpc-go's default largest message a client takes
+const MAX_RECV: int = 4194304
+// a unary call, and a stream until its first event, as the HTTP bindings' upstream calls are bounded
+const UNARY_MS: int = 60000
+const STREAM_HEAD_MS: int = 300000
+
+// ---- the interface ----
+
+// A gRPC interface URL as a dial target: host (without brackets), port, the :authority, and TLS. error says why
+// the URL cannot be dialed ("" when it can).
+export type GrpcTarget = { host: string, port: int, authority: string, tls: bool, error: string }
+
+function badTarget(error: string): GrpcTarget {
+  return { host: "", port: 0, authority: "", tls: false, error: error }
+}
+
+// Bifrost's grpcUpstreamTarget: host:port defaults to TLS, https:// selects TLS and http:// plaintext; the target
+// must carry an explicit port and nothing besides host and port.
+export function grpcTargetOf(raw: string): GrpcTarget {
+  let scheme = "https"
+  let rest = raw.trim()
+  const i = rest.indexOf("://")
+  if (i >= 0) {
+    scheme = rest.slice(0, i).toLowerCase()
+    rest = rest.slice(i + 3)
+  }
+  if (scheme !== "http" && scheme !== "https") return badTarget(`unsupported gRPC interface scheme "${scheme}"`)
+  if (rest === "" || rest.includes("/") || rest.includes("?") || rest.includes("#") || rest.includes("@")) return badTarget("gRPC interface URL must be host:port without credentials, path, or query")
+  let host = ""
+  let portText = ""
+  if (rest.startsWith("[")) {
+    const close = rest.indexOf("]:")
+    if (close < 0) return badTarget("gRPC interface URL requires an explicit host and port")
+    host = rest.slice(1, close)
+    portText = rest.slice(close + 2)
+  } else {
+    const parts = rest.split(":")
+    if (parts.length !== 2) return badTarget("gRPC interface URL requires an explicit host and port")
+    host = parts[0]!
+    portText = parts[1]!
+  }
+  const port = Math.trunc(parseInt(portText) ?? 0)
+  if (host === "" || port <= 0 || port > 65535 || `${port}` !== portText) return badTarget("gRPC interface URL requires an explicit host and port")
+  return { host: host, port: port, authority: rest, tls: scheme === "https", error: "" }
+}
+
+// Why the gateway may not dial a gRPC interface: a malformed target, or the URL guard of the HTTP bindings
+// (plaintext needs allow_private_network, as http:// does; private and metadata addresses as for any endpoint).
+export function grpcUrlProblem(raw: string, allowPrivate: bool): string {
+  const t = grpcTargetOf(raw)
+  if (t.error !== "") return t.error
+  return urlProblem((t.tls ? "https://" : "http://") + t.authority + "/", allowPrivate)
+}
+
+// The binding and URL a call goes out on: the card's interface of the caller's own binding (rpc JSONRPC, rest
+// HTTP+JSON, grpc GRPC), so the call goes on as it came, else the first interface the card lists (its preferred
+// one, as Bifrost tries a card's interfaces in order) that the gateway can call. A GRPC interface the gateway may
+// not dial is passed over. binding is "" when the card offers nothing callable.
+export function upstreamBinding(card: string, caller: string, allowPrivate: bool): { binding: string, url: string } {
+  const want = caller === "rest" ? "HTTP+JSON" : (caller === "grpc" ? "GRPC" : "JSONRPC")
+  const usable: { binding: string, url: string }[] = []
+  for (const i of interfacesOf(card).list) {
+    if (i.binding === "JSONRPC" || i.binding === "HTTP+JSON") usable.push({ binding: i.binding, url: i.url })
+    else if (i.binding === "GRPC" && grpcUrlProblem(i.url, allowPrivate) === "") usable.push({ binding: i.binding, url: i.url })
+  }
+  for (const u of usable) {
+    if (u.binding === want) return u
+  }
+  const first = usable[0]
+  if (first !== undefined) return first
+  return { binding: "", url: "" }
+}
+
+// ---- requests ----
+
+// Headers that are the transport's own, never metadata.
+function reserved(name: string): bool {
+  if (name.startsWith(":") || name.startsWith("grpc-")) return true
+  return ["content-type", "content-length", "accept", "accept-encoding", "te", "host", "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "user-agent", "trailer"].includes(name)
+}
+
+// A metadata name gRPC allows: lower-case letters, digits, "-", "_" and ".".
+function validName(name: string): bool {
+  if (name === "") return false
+  for (const b of new TextEncoder().encode(name)) {
+    const c = int(b)
+    const ok = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 45 || c === 95 || c === 46
+    if (!ok) return false
+  }
+  return true
+}
+
+// A metadata value gRPC allows (printable ASCII); a -bin value is base64 and passes as it is.
+function validValue(v: string): bool {
+  for (const b of new TextEncoder().encode(v)) {
+    const c = int(b)
+    if (c < 32 || c > 126) return false
+  }
+  return true
+}
+
+// The headers of a call to the agent as gRPC metadata: lower-cased names, without the transport's own fields, and
+// without what gRPC cannot carry.
+export function grpcMetadata(h: Map<string, string>): H2Header[] {
+  const out: H2Header[] = []
+  const keys = h.keys()
+  keys.sort()
+  for (const k of keys) {
+    const n = k.toLowerCase()
+    const v = h.get(k) ?? ""
+    if (reserved(n) || !validName(n) || !validValue(v)) continue
+    out.push({ name: n, value: v })
+  }
+  return out
+}
+
+// The request head of a call: the method's path on the target, the metadata, and grpc-timeout when it is bounded.
+export function grpcRequestHeaders(t: GrpcTarget, op: string, md: H2Header[], timeoutMs: int): H2Header[] {
+  const hs: H2Header[] = [
+    { name: ":method", value: "POST" },
+    { name: ":scheme", value: t.tls ? "https" : "http" },
+    { name: ":path", value: SERVICE + op },
+    { name: ":authority", value: t.authority },
+    { name: "content-type", value: "application/grpc" },
+    { name: "te", value: "trailers" },
+  ]
+  if (timeoutMs > 0) hs.push({ name: "grpc-timeout", value: `${timeoutMs}m` })
+  hs.push({ name: "user-agent", value: "raiju" })
+  for (const m of md) hs.push(m)
+  return hs
+}
+
+function objectFields(text: string): Field[] | undefined {
+  const t = text.trim()
+  if (!t.startsWith("{")) return undefined
+  try {
+    return fields(t)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The params of a call as the method's request message JSON: v1 params as they are; a v0.3 push config create is
+// flattened ({taskId, pushNotificationConfig: {...}} is one TaskPushNotificationConfig in v1) and a v0.3 delete
+// names its task and config as v1 does.
+export function v1Params(call: Call, params: string): string {
+  if (!call.v03) return params
+  if (call.op === "CreateTaskPushNotificationConfig") {
+    const fs = objectFields(params) ?? []
+    const inner = objectFields(find(fs, "pushNotificationConfig") ?? "") ?? []
+    let out = without(fs, ["pushNotificationConfig"])
+    for (const f of inner) setField(&out, f.key, f.raw)
+    return build(out)
+  }
+  if (call.op === "DeleteTaskPushNotificationConfig" || call.op === "GetTaskPushNotificationConfig") return `{"taskId":${quote(call.taskId)},"id":${quote(call.configId)}}`
+  return params
+}
+
+// ---- answers ----
+
+function rpcResult(rpcId: string, result: string): string {
+  return `{"jsonrpc":"2.0","id":${rpcId},"result":${result}}`
+}
+
+function rpcError(rpcId: string, code: int, message: string): string {
+  return `{"jsonrpc":"2.0","id":${rpcId},"error":{"code":${code},"message":${quote(message)}}}`
+}
+
+// The status of a finished call (from the trailers, or the head of a trailers-only answer): its code, message and
+// details trailer. code is -1 when the answer has no grpc-status.
+export function statusOf(r: H2Response): { code: int, message: string, details: string } {
+  const tr = r.trailers.length > 0 ? r.trailers : r.headers
+  const st = headerValue(tr, "grpc-status")
+  if (st === undefined) return { code: -1, message: `the agent answered HTTP ${headerValue(r.headers, ":status") ?? "?"} without a gRPC status`, details: "" }
+  let msg = headerValue(tr, "grpc-message") ?? ""
+  try {
+    msg = try percentDecode(msg)
+  } catch (e) {
+    // kept as sent
+  }
+  const code = Math.trunc(parseInt(st) ?? 2)
+  return { code: code < 0 || code > 16 ? 2 : code, message: msg, details: headerValue(tr, "grpc-status-details-bin") ?? "" }
+}
+
+// The JSON-RPC answer of a failed status: the error a2a-go reads from it (grpcstatus.tov).
+function errorAnswer(rpcId: string, code: int, message: string, details: string): string {
+  return `{"jsonrpc":"2.0","id":${rpcId},"error":${rpcErrorOfGrpc(code, message, details)}}`
+}
+
+// The JSON of one response message of an operation.
+function resultJson(op: string, msg: u8[]): string throws Error {
+  return try decode(msg, responseOf(op))
+}
+
+// The JSON-RPC answer for a unary call's whole response: its one message as the result, or its status as the error.
+export function unaryAnswer(op: string, rpcId: string, r: H2Response): string {
+  const st = statusOf(r)
+  if (st.code === -1) return rpcError(rpcId, -32603, st.message)
+  if (st.code !== 0) return errorAnswer(rpcId, st.code, st.message, st.details)
+  try {
+    const df = new GrpcDeframer(MAX_RECV)
+    df.push(r.body)
+    const m = try df.next()
+    if (m === undefined || df.pending() !== 0) return rpcError(rpcId, -32006, "the agent's gRPC answer is not one message")
+    return rpcResult(rpcId, try resultJson(op, m))
+  } catch (e) {
+    return rpcError(rpcId, -32006, "the agent's gRPC answer could not be read: " + e.message)
+  }
+}
+
+// ---- streams ----
+
+// The state of one streamed call: the caller's event stream, the messages being cut out of the DATA, and the waiter
+// for the first outcome (1 the head arrived, 2 the call ended before any head, 3 no head in time).
+class GrpcRelay {
+  ctl: ReadableStreamDefaultController | undefined = undefined
+  cancelled = false
+  broken = false
+  df: GrpcDeframer = new GrpcDeframer(MAX_RECV)
+  head = false
+  woken: int = 0
+  wake: ((n: int) => void) | undefined = undefined
+  end: H2Response | undefined = undefined
+  endError = ""
+  conn: H2Conn | undefined = undefined
+  sid: int = 0
+  // the events sent so far, and the last one
+  sent: int = 0
+  last = ""
+
+  constructor(readonly op: string, readonly rpcId: string) {}
+}
+
+function wakeUp(rl: GrpcRelay, n: int): void {
+  if (rl.woken !== 0) return
+  rl.woken = n
+  const w = rl.wake
+  if (w !== undefined) w(n)
+}
+
+function emit(rl: GrpcRelay, payload: string): void {
+  rl.sent = rl.sent + 1
+  rl.last = payload
+  const c = rl.ctl
+  if (c !== undefined && !rl.cancelled) c.enqueue(new TextEncoder().encode("data: " + payload + "\n\n"))
+}
+
+function closeRelay(rl: GrpcRelay): void {
+  const c = rl.ctl
+  if (c === undefined || rl.cancelled) return
+  try {
+    c.close()
+  } catch (e) {
+    // already closed by the caller
+  }
+}
+
+function resetRelay(rl: GrpcRelay): void {
+  const c = rl.conn
+  if (c !== undefined && rl.sid !== 0) c.reset(rl.sid)
+}
+
+// One DATA payload: each whole message is an event. A message that does not decode ends the stream with an error.
+function relayData(rl: GrpcRelay, b: u8[]): void {
+  if (rl.broken) return
+  rl.df.push(b)
+  try {
+    while (true) {
+      const m = try rl.df.next()
+      if (m === undefined) break
+      emit(rl, rpcResult(rl.rpcId, try resultJson(rl.op, m)))
+    }
+  } catch (e) {
+    rl.broken = true
+    emit(rl, rpcError(rl.rpcId, -32006, "the agent's gRPC stream could not be read: " + e.message))
+    closeRelay(rl)
+    resetRelay(rl)
+  }
+}
+
+// The end of a streamed call. Before any head, the waiter takes the outcome; after one, a failed status is the last
+// event, and the stream closes.
+async function finishRelay(done: Promise<H2Response, Error>, rl: GrpcRelay): Promise<void> {
+  let r: H2Response | undefined = undefined
+  let err = ""
+  try {
+    r = await done
+  } catch (e) {
+    err = e.message
+  }
+  if (!rl.head) {
+    rl.end = r
+    rl.endError = err
+    wakeUp(rl, 2)
+    return
+  }
+  if (!rl.broken) {
+    if (r !== undefined) {
+      if (rl.df.pending() !== 0) emit(rl, rpcError(rl.rpcId, -32006, "the agent's gRPC stream ends inside a message"))
+      const st = statusOf(r)
+      if (st.code === -1) emit(rl, rpcError(rl.rpcId, -32603, st.message))
+      else if (st.code !== 0) emit(rl, errorAnswer(rl.rpcId, st.code, st.message, st.details))
+    } else if (!rl.cancelled) {
+      emit(rl, rpcError(rl.rpcId, -32603, `the agent's stream ended: ${err}`))
+    }
+  }
+  closeRelay(rl)
+}
+
+function emptyStream(): ReadableStream {
+  return new ReadableStream({
+    start: (c) => {
+      c.close()
+    },
+  })
+}
+
+// What a call to the agent answered: the JSON-RPC answer, or for a stream its events (stream), or the reason no
+// answer came (error).
+export type GrpcAnswer = { text: string, stream: ReadableStream | undefined, error: string }
+
+function failed(error: string): GrpcAnswer {
+  return { text: "", stream: undefined, error: error }
+}
+
+async function streamCall(conn: H2Conn, hs: H2Header[], body: u8[], op: string, rpcId: string): Promise<GrpcAnswer> {
+  const rl = new GrpcRelay(op, rpcId)
+  rl.conn = conn
+  const out = new ReadableStream({
+    start: (c) => {
+      rl.ctl = c
+    },
+    cancel: () => {
+      rl.cancelled = true
+      resetRelay(rl)
+    },
+  })
+  const waiter = new Promise<int, Error>((resolve) => {
+    rl.wake = (n: int) => resolve(n)
+  })
+  const sink = new H2Sink((h: H2Header[]) => {
+    // a head with the status is a trailers-only answer: the call ends there
+    if (headerValue(h, "grpc-status") !== undefined) return
+    rl.head = true
+    wakeUp(rl, 1)
+  }, (b: u8[]) => relayData(rl, b))
+  const done = conn.requestStream(hs, body, 0, sink)
+  rl.sid = sink.sid
+  finishRelay(done, rl)
+  const timer = setTimeout(() => wakeUp(rl, 3), STREAM_HEAD_MS)
+  let got: int = 0
+  try {
+    got = await waiter
+  } catch (e) {
+    got = 3
+  }
+  clearTimeout(timer)
+  rl.sid = sink.sid
+  if (got === 1) return { text: "", stream: out, error: "" }
+  if (got === 3) {
+    rl.cancelled = true
+    resetRelay(rl)
+    return failed("the agent did not answer in time")
+  }
+  const end = rl.end
+  if (end === undefined) return failed(rl.endError === "" ? "the agent closed the call" : rl.endError)
+  const st = statusOf(end)
+  if (st.code === 0) return { text: "", stream: emptyStream(), error: "" }
+  if (st.code === -1) return { text: rpcError(rpcId, -32603, st.message), stream: undefined, error: "" }
+  return { text: errorAnswer(rpcId, st.code, st.message, st.details), stream: undefined, error: "" }
+}
+
+// One call to the agent's gRPC interface at url. tls holds the agent's TLS settings (used when the target is TLS);
+// headers are the call's headers (the caller's and the agent's credentials). A unary method answers its JSON-RPC
+// answer as text; a streaming one its events, or text when it failed before any event.
+export async function grpcSend(url: string, tls: H2Tls, call: Call, params: string, rpcId: string, headers: Map<string, string>): Promise<GrpcAnswer> {
+  const t = grpcTargetOf(url)
+  if (t.error !== "") return failed(t.error)
+  const msgName = requestOf(call.op)
+  if (msgName === "") return { text: rpcError(rpcId, -32601, `method not found: ${call.op}`), stream: undefined, error: "" }
+  let msg: u8[] = []
+  try {
+    msg = try encode(v1Params(call, params), msgName)
+  } catch (e) {
+    return { text: rpcError(rpcId, -32602, "invalid params: " + e.message), stream: undefined, error: "" }
+  }
+  const md = grpcMetadata(headers)
+  const conn = grpcConn(t.host, t.port, t.tls ? tls : undefined)
+  try {
+    if (call.stream) return await streamCall(conn, grpcRequestHeaders(t, call.op, md, 0), grpcFrame(msg), call.op, rpcId)
+    const r = try await conn.request(grpcRequestHeaders(t, call.op, md, UNARY_MS), grpcFrame(msg), UNARY_MS)
+    return { text: unaryAnswer(call.op, rpcId, r), stream: undefined, error: "" }
+  } catch (e) {
+    return failed(e.message)
+  }
+}
+
+// ---- tests ----
+
+test("a gRPC interface URL is a dial target as Bifrost reads it", () => {
+  const bare = grpcTargetOf("agent.example:443")
+  expect(bare.error).toBe("")
+  expect(bare.tls).toBe(true)
+  expect(bare.host).toBe("agent.example")
+  expect(bare.port).toBe(443)
+  const plain = grpcTargetOf("http://127.0.0.1:50051")
+  expect(plain.tls).toBe(false)
+  expect(plain.authority).toBe("127.0.0.1:50051")
+  expect(grpcTargetOf("https://a.example:8443").tls).toBe(true)
+  const v6 = grpcTargetOf("http://[::1]:9000")
+  expect(v6.host).toBe("::1")
+  expect(v6.authority).toBe("[::1]:9000")
+  expect(grpcTargetOf("grpc://a.example:1").error).toBe(`unsupported gRPC interface scheme "grpc"`)
+  expect(grpcTargetOf("https://a.example:1/path").error !== "").toBe(true)
+  expect(grpcTargetOf("https://u@a.example:1").error !== "").toBe(true)
+  expect(grpcTargetOf("a.example").error).toBe("gRPC interface URL requires an explicit host and port")
+  expect(grpcTargetOf("a.example:x").error !== "").toBe(true)
+  expect(grpcTargetOf(":80").error !== "").toBe(true)
+  // plaintext needs allow_private_network, as http:// endpoints do
+  expect(grpcUrlProblem("http://agent.example:80", false) !== "").toBe(true)
+  expect(grpcUrlProblem("agent.example:443", false)).toBe("")
+  expect(grpcUrlProblem("127.0.0.1:443", false) !== "").toBe(true)
+  expect(grpcUrlProblem("http://127.0.0.1:50051", true)).toBe("")
+})
+
+test("the binding a call goes out on: the caller's own, else the card's first callable interface", () => {
+  const both = `{"supportedInterfaces":[{"url":"https://a.example/rpc","protocolBinding":"JSONRPC"},{"url":"https://a.example/rest","protocolBinding":"HTTP+JSON"},{"url":"a.example:443","protocolBinding":"GRPC"}]}`
+  expect(upstreamBinding(both, "rpc", false).binding).toBe("JSONRPC")
+  expect(upstreamBinding(both, "rest", false).binding).toBe("HTTP+JSON")
+  expect(upstreamBinding(both, "grpc", false).binding).toBe("GRPC")
+  const only = `{"supportedInterfaces":[{"url":"http://127.0.0.1:50051","protocolBinding":"GRPC","protocolVersion":"1.0"}]}`
+  expect(upstreamBinding(only, "rpc", true).url).toBe("http://127.0.0.1:50051")
+  expect(upstreamBinding(only, "rest", true).binding).toBe("GRPC")
+  // a target the guard refuses is not callable
+  expect(upstreamBinding(only, "rpc", false).binding).toBe("")
+  const prefers = `{"supportedInterfaces":[{"url":"a.example:443","protocolBinding":"GRPC"},{"url":"https://a.example/rest","protocolBinding":"HTTP+JSON"}]}`
+  expect(upstreamBinding(prefers, "rpc", false).binding).toBe("GRPC")
+  expect(upstreamBinding(prefers, "rest", false).binding).toBe("HTTP+JSON")
+  const v03 = `{"url":"https://a.example/rpc","preferredTransport":"JSONRPC","additionalInterfaces":[{"url":"a.example:443","transport":"GRPC"}]}`
+  expect(upstreamBinding(v03, "rest", false).binding).toBe("JSONRPC")
+  expect(upstreamBinding(v03, "grpc", false).binding).toBe("GRPC")
+  expect(upstreamBinding(`{"name":"x"}`, "rpc", false).binding).toBe("")
+})
+
+test("the call's headers become metadata without the transport's fields", () => {
+  const h: Map<string, string> = new Map()
+  h.set("content-type", "application/json")
+  h.set("accept", "text/event-stream")
+  h.set("authorization", "Bearer agent-token")
+  h.set("x-team", "a")
+  h.set("grpc-timeout", "1S")
+  h.set("x-bad", "café")
+  h.set("Bad Name", "v")
+  const md = grpcMetadata(h)
+  expect(md.map((m) => m.name)).toEqual(["authorization", "x-team"])
+  const t = grpcTargetOf("http://127.0.0.1:50051")
+  const hs = grpcRequestHeaders(t, "GetTask", md, 60000)
+  expect(hs[2]!.value).toBe("/lf.a2a.v1.A2AService/GetTask")
+  expect(headerValue(hs, ":authority")).toBe("127.0.0.1:50051")
+  expect(headerValue(hs, "te")).toBe("trailers")
+  expect(headerValue(hs, "grpc-timeout")).toBe("60000m")
+  expect(headerValue(grpcRequestHeaders(t, "SubscribeToTask", md, 0), "grpc-timeout")).toBeUndefined()
+})
+
+test("v0.3 push config calls are brought to the v1 messages", () => {
+  const create: Call = { op: "CreateTaskPushNotificationConfig", v03: true, params: "", stream: false, taskId: "t1", configId: "c1" }
+  expect(v1Params(create, `{"taskId":"t1","pushNotificationConfig":{"id":"c1","url":"https://gw/cb","token":"k"}}`)).toBe(`{"taskId":"t1","id":"c1","url":"https://gw/cb","token":"k"}`)
+  const del: Call = { op: "DeleteTaskPushNotificationConfig", v03: true, params: "", stream: false, taskId: "t1", configId: "c1" }
+  expect(v1Params(del, `{"id":"t1","pushNotificationConfigId":"c1"}`)).toBe(`{"taskId":"t1","id":"c1"}`)
+  const v1: Call = { op: "GetTask", v03: false, params: "", stream: false, taskId: "t1", configId: "" }
+  expect(v1Params(v1, `{"id":"t1"}`)).toBe(`{"id":"t1"}`)
+})
+
+test("a unary answer is its one message as the result, or its status as the JSON-RPC error", () => {
+  const task = try encode(`{"id":"t1","status":{"state":"TASK_STATE_COMPLETED"}}`, "Task")
+  const ok: H2Response = { headers: [{ name: ":status", value: "200" }], trailers: [{ name: "grpc-status", value: "0" }], body: grpcFrame(task) }
+  expect(unaryAnswer("GetTask", "7", ok)).toBe(`{"jsonrpc":"2.0","id":7,"result":{"id":"t1","status":{"state":"TASK_STATE_COMPLETED"}}}`)
+  // a message cut across the body's pieces is still one message; two are not
+  const two: H2Response = { headers: [], trailers: [{ name: "grpc-status", value: "0" }], body: grpcFrame(task).concat(grpcFrame(task)) }
+  expect(unaryAnswer("GetTask", "1", two).includes("-32006")).toBe(true)
+  const only: H2Response = { headers: [{ name: ":status", value: "200" }, { name: "grpc-status", value: "5" }, { name: "grpc-message", value: "task%20not%20found" }], trailers: [], body: [] }
+  expect(unaryAnswer("GetTask", "1", only)).toBe(`{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"task not found"}}`)
+  const none: H2Response = { headers: [{ name: ":status", value: "502" }], trailers: [], body: [] }
+  expect(unaryAnswer("GetTask", "1", none)).toBe(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"the agent answered HTTP 502 without a gRPC status"}}`)
+  const empty: H2Response = { headers: [], trailers: [{ name: "grpc-status", value: "0" }], body: grpcFrame([]) }
+  expect(unaryAnswer("DeleteTaskPushNotificationConfig", "1", empty)).toBe(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+})
+
+test("streamed DATA is cut into one event per message, and a failed status is the last event", () => {
+  const rl = new GrpcRelay("SendStreamingMessage", "3")
+  const out = new ReadableStream({
+    start: (c) => {
+      rl.ctl = c
+    },
+  })
+  const ev = try encode(`{"statusUpdate":{"taskId":"t1","status":{"state":"TASK_STATE_WORKING"}}}`, "StreamResponse")
+  const wire = grpcFrame(ev).concat(grpcFrame(ev))
+  // the two messages arrive cut at every byte
+  for (const b of wire) relayData(rl, [b])
+  expect(rl.broken).toBe(false)
+  expect(rl.df.pending()).toBe(0)
+  expect(rl.sent).toBe(2)
+  expect(rl.last).toBe(`{"jsonrpc":"2.0","id":3,"result":{"statusUpdate":{"taskId":"t1","status":{"state":"TASK_STATE_WORKING"}}}}`)
+  // a message that is not a StreamResponse breaks the stream with an error event, and nothing follows
+  relayData(rl, grpcFrame([u8(255)]))
+  expect(rl.broken).toBe(true)
+  expect(rl.sent).toBe(3)
+  expect(rl.last.includes("-32006")).toBe(true)
+  relayData(rl, grpcFrame(ev))
+  expect(rl.sent).toBe(3)
+  expect(out !== undefined).toBe(true)
+})

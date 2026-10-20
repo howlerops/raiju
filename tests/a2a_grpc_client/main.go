@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -21,11 +22,13 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	a2agrpc "github.com/a2aproject/a2a-go/v2/a2agrpc/v1"
 	a2apb "github.com/a2aproject/a2a-go/v2/a2apb/v1"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 type result struct {
@@ -35,6 +38,13 @@ type result struct {
 	Message string   `json:"message"`
 	Result  string   `json:"result,omitempty"`
 	Events  []string `json:"events,omitempty"`
+	// the google.rpc.ErrorInfo of the status details (grpc-status-details-bin), and the Struct details
+	Reason   string            `json:"reason,omitempty"`
+	Domain   string            `json:"domain,omitempty"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+	Structs  []string          `json:"structs,omitempty"`
+	// the A2A error the SDK read from the status (the sdk path's errors)
+	A2A string `json:"a2a,omitempty"`
 }
 
 func emit(r result) {
@@ -69,6 +79,33 @@ func fail(err error) (string, string) {
 	}
 	st := status.Convert(err)
 	return names[st.Code()], st.Message()
+}
+
+// withDetails adds the ErrorInfo and Struct details of an error's status to its row.
+func withDetails(r result, err error) result {
+	if err == nil {
+		return r
+	}
+	for _, d := range status.Convert(err).Details() {
+		switch v := d.(type) {
+		case *errdetails.ErrorInfo:
+			r.Reason, r.Domain, r.Metadata = v.Reason, v.Domain, v.Metadata
+		case *structpb.Struct:
+			b, _ := json.Marshal(v.AsMap())
+			r.Structs = append(r.Structs, string(b))
+		}
+	}
+	return r
+}
+
+// The A2A error an SDK call failed with, as errors.Is finds it.
+func a2aErrOf(err error) string {
+	for name, sentinel := range map[string]error{"task-not-found": a2a.ErrTaskNotFound, "internal": a2a.ErrInternalError, "task-not-cancelable": a2a.ErrTaskNotCancelable, "unauthenticated": a2a.ErrUnauthenticated} {
+		if errors.Is(err, sentinel) {
+			return name
+		}
+	}
+	return ""
 }
 
 // The SDK's metadata for a key: the authorization header, as an SDK client sends a virtual key.
@@ -210,13 +247,18 @@ func main() {
 	c, m = fail(streamErr)
 	emit(result{Case: "subscribe-to-task", Path: "sdk", Code: c, Message: m, Events: events})
 
+	// the SDK reads the A2A error back from the status details
+	_, err = tr.GetTask(ctx, sdkParams(*key), &a2a.GetTaskRequest{ID: "missing-task"})
+	c, m = fail(err)
+	emit(result{Case: "sdk-task-missing", Path: "sdk", Code: c, Message: m, A2A: a2aErrOf(err)})
+
 	// ---- the stub: the status each refusal and error carries ----
 	stubCall := func(name, auth, k string, call func(context.Context, a2apb.A2AServiceClient) error) {
 		cn := dial(*addr, auth)
 		defer cn.Close()
 		err := call(stubCtx(ctx, k), a2apb.NewA2AServiceClient(cn))
 		c, m := fail(err)
-		emit(result{Case: name, Path: "stub", Code: c, Message: m})
+		emit(withDetails(result{Case: name, Path: "stub", Code: c, Message: m}, err))
 	}
 	getTask := func(id string) func(context.Context, a2apb.A2AServiceClient) error {
 		return func(cx context.Context, s a2apb.A2AServiceClient) error {

@@ -9322,6 +9322,11 @@ def l148_run(env, workers: int, label: str, port: int):
         check("a key without the agent's grant is PERMISSION_DENIED", row("no-grant")["code"] == "PERMISSION_DENIED", row("no-grant"))
         check("a task the agent does not have is NOT_FOUND with the agent's message", row("task-missing")["code"] == "NOT_FOUND" and row("task-missing")["message"] == "task not found", row("task-missing"))
         check("an agent's error is INTERNAL with its message", row("agent-error")["code"] == "INTERNAL" and row("agent-error")["message"] == "agent failed on request", row("agent-error"))
+        # L161: an agent's error carries the google.rpc.ErrorInfo a2a-go sends (grpc-status-details-bin); the gateway's own refusals do not
+        check("a missing task's status carries an ErrorInfo TASK_NOT_FOUND in the A2A domain", row("task-missing").get("reason") == "TASK_NOT_FOUND" and row("task-missing").get("domain") == "a2a-protocol.org", row("task-missing"))
+        check("an agent's server error carries the ErrorInfo SERVER_ERROR", row("agent-error").get("reason") == "SERVER_ERROR", row("agent-error"))
+        check("the gateway's own refusals are plain statuses, without details", all(row(n).get("reason") is None for n in ("no-key", "no-grant", "unknown-agent")), [row(n) for n in ("no-key", "no-grant")])
+        check("the SDK reads the A2A error back from the details (errors.Is a2a.ErrTaskNotFound)", row("sdk-task-missing").get("a2a") == "task-not-found" and row("sdk-task-missing")["message"] == "task not found", row("sdk-task-missing"))
         check("the key sent as x-api-key is read", row("api-key-header")["code"] == "OK", row("api-key-header"))
         sent = upstream()[before_up:]
         check("the calls reach the mock agent as JSON-RPC with the v1 method names", any(x["body"].find('"method":"SendMessage"') >= 0 for x in sent) and any(x["body"].find('"method":"CancelTask"') >= 0 for x in sent), [x["body"][:120] for x in sent[:3]])
@@ -9350,6 +9355,190 @@ def l148w_e2e(env):
         print("skip the two-worker A2A gRPC checks: http1 runs one process")
         return
     l148_run(env, 2, "l148w", 18244)
+
+
+L161_DOMAIN = "gw.l161.test"  # the L161 gateway (18276) serves A2A gRPC on 18277 under this domain
+
+def l161_sse(base, path, body, headers):
+    """The data payloads of an event stream answer, as JSON (status and payloads)."""
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(), method="POST", headers={"content-type": "application/json", "accept": "text/event-stream", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            text = r.read().decode()
+            status = r.status
+    except urllib.error.HTTPError as e:
+        return e.code, [e.read().decode()]
+    out = []
+    for ev in text.replace("\r\n", "\n").split("\n\n"):
+        data = "\n".join(l[5:].lstrip() for l in ev.split("\n") if l.startswith("data:"))
+        if data:
+            out.append(json.loads(data))
+    return status, out
+
+def l161_e2e(env):
+    """L161: an agent whose card offers only the gRPC binding (tests/a2a_grpc_agent.py, grpcio, on ports the system picks)
+    reached from the JSON-RPC, REST and gRPC bindings, unary and streaming, over h2c and over TLS; its errors come back with
+    their ErrorInfo (reason, domain, metadata) in every binding, and grpcio reads the status details the gateway sends. Its
+    own gateway on 18276, on the server under test, with its gRPC listener on 18277."""
+    import shutil
+    try:
+        import grpc
+    except ImportError:
+        print("skip the L161 checks: grpcio is not installed")
+        return
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    from a2a_grpc_agent import fld, parse, first, message as pb_message
+    from grpc_details import details_of
+    tls_dir = os.path.join(BUILD, "e2e-tls")
+    if not os.path.exists(os.path.join(tls_dir, "srv.pem")):
+        make_tls()
+    ca = open(os.path.join(tls_dir, "ca.pem")).read()
+    agent = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/a2a_grpc_agent.py"), os.path.join(tls_dir, "srv.pem"), os.path.join(tls_dir, "srv.key")], stdout=subprocess.PIPE, stderr=open(os.path.join(BUILD, "e2e.l161-agent.log"), "w"), text=True)
+    gw = None
+    try:
+        ready = agent.stdout.readline().split()
+        check("the gRPC-only agent starts", len(ready) == 4 and ready[0] == "ready", ready)
+        if len(ready) != 4:
+            return
+        web = f"http://127.0.0.1:{ready[1]}"
+        import hashlib
+        cfg = {
+            "client": {"enable_logging": True, "enforce_auth_on_inference": True, "a2a_external_client_url": "https://gw.l161.example/"},
+            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l161-logs")},
+            "alerts": {"enabled": False},
+            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+            "server": {"a2a_grpc_base_domain": L161_DOMAIN, "a2a_grpc_port": 18277},
+            "providers": {"openai": {"keys": [{"name": "l161", "value": "sk-l161", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+            "governance": {
+                "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l161".encode()).hexdigest()}],
+                "virtual_keys": [{"id": "vk-l161", "value": "sk-bf-l161"}],
+            },
+            "agents": [
+                {"name": "gonly", "agent_card_url": web + "/card", "allow_private_network": True, "virtual_key_ids": ["vk-l161"], "runtime_auth": {"type": "headers", "headers": {"x-agent-token": "tok-l161"}}},
+                {"name": "gtls", "agent_card_url": web + "/tls-card", "allow_private_network": True, "virtual_key_ids": ["vk-l161"], "runtime_auth": {"type": "headers", "headers": {"x-agent-token": "tok-l161-tls"}, "tls": {"ca_cert_pem": ca}}},
+            ],
+        }
+        cfg_path = os.path.join(BUILD, "e2e.l161.json")
+        json.dump(cfg, open(cfg_path, "w"))
+        shutil.rmtree(os.path.join(BUILD, "e2e-l161-logs"), ignore_errors=True)
+        genv = {k: v for k, v in env.items() if k != "RAIJU_A2A_GRPC_LISTEN_PORT"}
+        gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18276", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=genv, stderr=open(os.path.join(BUILD, "e2e.l161.log"), "w"))
+        base = "http://127.0.0.1:18276"
+        ADM = {"authorization": "Bearer sk-admin-l161"}
+        K = {"authorization": "Bearer sk-bf-l161"}
+        wait(base + "/health")
+        for name in ("gonly", "gtls"):
+            s, _, b = call("POST", f"/api/agents/{name}/refresh-card", None, ADM, base=base, auth=False)
+            check(f"the card of the gRPC-only agent {name} is fetched (a card with only a GRPC interface is accepted)", s == 200, (s, b[:300]))
+        def rpc(agent_name, method, params):
+            s, _, b = call("POST", f"/agents/a2a/{agent_name}/json-rpc", {"jsonrpc": "2.0", "id": "r1", "method": method, "params": params}, K, base=base, auth=False)
+            return s, (json.loads(b) if b.strip().startswith("{") else {"raw": b})
+        def rest(method, path, body=None):
+            s, _, b = call(method, "/agents/a2a/gonly/rest" + path, body, K, base=base, auth=False)
+            return s, (json.loads(b) if b.strip().startswith("{") else {"raw": b})
+        msg = lambda text: {"message": {"messageId": "m-" + text, "role": "ROLE_USER", "parts": [{"text": text}]}}
+        def info_of(details):
+            return next((d for d in details or [] if d.get("@type") == "type.googleapis.com/google.rpc.ErrorInfo"), {})
+
+        # ---- JSON-RPC in ----
+        s, r = rpc("gonly", "SendMessage", msg("hi-rpc"))
+        task = r.get("result", {}).get("task", {})
+        check("JSON-RPC SendMessage reaches the gRPC-only agent and answers its task", s == 200 and task.get("status", {}).get("state") == "TASK_STATE_COMPLETED" and "echo: hi-rpc" in json.dumps(task) and r.get("id") == "r1", (s, r))
+        tid = task.get("id", "")
+        s, evs = l161_sse(base, "/agents/a2a/gonly/json-rpc", {"jsonrpc": "2.0", "id": "s1", "method": "SendStreamingMessage", "params": msg("stream-rpc")}, K)
+        check("JSON-RPC SendStreamingMessage streams the agent's four events as JSON-RPC answers", s == 200 and len(evs) == 4 and all(isinstance(e, dict) and e.get("id") == "s1" and "result" in e for e in evs) and "statusUpdate" in evs[-1]["result"] and "COMPLETED" in json.dumps(evs[-1]), (s, evs))
+        s, r = rpc("gonly", "GetTask", {"id": tid})
+        check("JSON-RPC GetTask reads the task from the agent", s == 200 and r.get("result", {}).get("id") == tid, (s, r))
+        s, r = rpc("gonly", "GetTask", {"id": "nope-l161"})
+        e = r.get("error", {})
+        check("a missing task is the JSON-RPC error -32001 with the agent's message and its ErrorInfo (reason, metadata)", e.get("code") == -32001 and e.get("message") == "task not found" and info_of(e.get("data")).get("reason") == "TASK_NOT_FOUND" and info_of(e.get("data")).get("metadata") == {"taskId": "nope-l161"}, (s, r))
+        s, r = rpc("gonly", "SendMessage", msg("fail"))
+        e = r.get("error", {})
+        check("an agent's INTERNAL status is -32603 with its message, its Struct detail and its ErrorInfo metadata", e.get("code") == -32603 and e.get("message") == "agent failed on request" and any(d.get("hint") == "try again" for d in e.get("data", [])) and info_of(e.get("data")).get("metadata") == {"agent": "grpc-only"}, (s, r))
+        s, evs = l161_sse(base, "/agents/a2a/gonly/json-rpc", {"jsonrpc": "2.0", "id": "s2", "method": "SendStreamingMessage", "params": msg("fail-stream")}, K)
+        check("a stream that fails after an event ends with the status as a JSON-RPC error event", s == 200 and len(evs) == 2 and "result" in evs[0] and evs[1].get("error", {}).get("message") == "the stream broke", (s, evs))
+        s, r = rpc("gonly", "GetExtendedAgentCard", {})
+        check("a method the agent does not serve (UNIMPLEMENTED) is -32601", r.get("error", {}).get("code") == -32601, (s, r))
+        s, r = rpc("gonly", "message/send", {"message": {"kind": "message", "messageId": "m-v03", "role": "user", "parts": [{"kind": "text", "text": "hi-v03"}]}})
+        check("a v0.3 JSON-RPC send reaches the gRPC agent (roles and parts read as v1)", s == 200 and "echo: hi-v03" in json.dumps(r.get("result", {})), (s, r))
+
+        # ---- REST in ----
+        s, r = rest("POST", "/message:send", msg("hi-rest"))
+        check("REST message:send reaches the gRPC-only agent", s == 200 and "echo: hi-rest" in json.dumps(r), (s, r))
+        s, evs = l161_sse(base, "/agents/a2a/gonly/rest/message:stream", msg("stream-rest"), K)
+        check("REST message:stream streams the agent's events as REST payloads", s == 200 and len(evs) == 4 and isinstance(evs[0], dict) and "jsonrpc" not in evs[0] and "task" in evs[0] and "COMPLETED" in json.dumps(evs[-1]), (s, evs))
+        s, r = rest("GET", "/tasks/nope-l161")
+        check("REST: a missing task is 404 NOT_FOUND with the ErrorInfo TASK_NOT_FOUND", s == 404 and r.get("error", {}).get("status") == "NOT_FOUND" and info_of(r.get("error", {}).get("details")).get("reason") == "TASK_NOT_FOUND", (s, r))
+        s, r = rest("POST", f"/tasks/{tid}:cancel", {})
+        check("REST: a task the agent cannot cancel (FAILED_PRECONDITION, TASK_NOT_CANCELABLE) is 409", s == 409 and info_of(r.get("error", {}).get("details")).get("reason") == "TASK_NOT_CANCELABLE", (s, r))
+
+        # ---- gRPC in (grpcio) ----
+        ch = grpc.insecure_channel("127.0.0.1:18277", options=[("grpc.default_authority", "gonly." + L161_DOMAIN)])
+        md = [("authorization", "Bearer sk-bf-l161")]
+        u = lambda m: ch.unary_unary("/lf.a2a.v1.A2AService/" + m, request_serializer=None, response_deserializer=None)
+        st = lambda m: ch.unary_stream("/lf.a2a.v1.A2AService/" + m, request_serializer=None, response_deserializer=None)
+        gtid = ""
+        try:
+            resp = u("SendMessage")(fld(2, pb_message("m-grpc", "", "", 1, "hi-grpc")), metadata=md, timeout=30)
+            gtid = first(parse(first(parse(resp), 1)), 1).decode()
+            check("gRPC SendMessage through the gateway reaches the gRPC-only agent", gtid.startswith("gt-") and b"echo: hi-grpc" in resp, resp[:200])
+        except grpc.RpcError as e:
+            check("gRPC SendMessage through the gateway reaches the gRPC-only agent", False, (e.code(), e.details()))
+        try:
+            got = list(st("SendStreamingMessage")(fld(2, pb_message("m-grpcs", "", "", 1, "stream-grpc")), metadata=md, timeout=30))
+            check("gRPC SendStreamingMessage passes the agent's four StreamResponses", len(got) == 4 and sorted(parse(got[-1]).keys()) == [3], [g[:40] for g in got])
+        except grpc.RpcError as e:
+            check("gRPC SendStreamingMessage passes the agent's four StreamResponses", False, (e.code(), e.details()))
+        try:
+            got = list(st("SubscribeToTask")(fld(2, gtid), metadata=md, timeout=30))
+            check("gRPC SubscribeToTask streams the agent's events", len(got) == 2, len(got))
+        except grpc.RpcError as e:
+            check("gRPC SubscribeToTask streams the agent's events", False, (e.code(), e.details()))
+        def grpc_err(m, body):
+            try:
+                u(m)(body, metadata=md, timeout=30)
+                return None, "", None
+            except grpc.RpcError as e:
+                return e.code(), e.details(), details_of(e.trailing_metadata())
+        def ei_of(det):
+            return next((d for d in (det or {}).get("details", []) if d["type"] == "ErrorInfo"), {})
+        code, text, det = grpc_err("GetTask", fld(2, "nope-l161"))
+        ei = ei_of(det)
+        check("gRPC: a missing task is NOT_FOUND, and grpcio reads the ErrorInfo with the agent's reason and metadata", code == grpc.StatusCode.NOT_FOUND and text == "task not found" and ei.get("reason") == "TASK_NOT_FOUND" and ei.get("domain") == "a2a-protocol.org" and ei.get("metadata") == {"taskId": "nope-l161"} and det["code"] == 5, (code, text, det))
+        code, text, det = grpc_err("CancelTask", fld(2, gtid))
+        check("gRPC: a task that cannot be canceled is FAILED_PRECONDITION with TASK_NOT_CANCELABLE", code == grpc.StatusCode.FAILED_PRECONDITION and ei_of(det).get("reason") == "TASK_NOT_CANCELABLE", (code, text, det))
+        code, text, det = grpc_err("SendMessage", fld(2, pb_message("m-f", "", "", 1, "fail")))
+        structs = [d["value"] for d in (det or {}).get("details", []) if d["type"] == "Struct"]
+        check("gRPC: an agent's failure is INTERNAL with its Struct details and ErrorInfo, as a2a-go sends them", code == grpc.StatusCode.INTERNAL and text == "agent failed on request" and {"hint": "try again"} in structs and ei_of(det).get("reason") == "INTERNAL_ERROR", (code, text, det))
+        ch.close()
+        bad = grpc.insecure_channel("127.0.0.1:18277", options=[("grpc.default_authority", "nosuch." + L161_DOMAIN)])
+        try:
+            bad.unary_unary("/lf.a2a.v1.A2AService/GetTask", request_serializer=None, response_deserializer=None)(fld(2, "x"), metadata=md, timeout=10)
+            check("the gateway's own refusal (an unknown agent) carries no details", False, "answered")
+        except grpc.RpcError as e:
+            check("the gateway's own refusal (an unknown agent) carries no details", e.code() == grpc.StatusCode.NOT_FOUND and details_of(e.trailing_metadata()) is None, (e.code(), e.trailing_metadata()))
+        bad.close()
+
+        # ---- TLS ----
+        s, r = rpc("gtls", "SendMessage", msg("hi-tls"))
+        check("an agent whose gRPC interface is a bare host:port is called over TLS (ALPN h2, the agent's CA)", s == 200 and "echo: hi-tls" in json.dumps(r.get("result", {})), (s, r))
+        s, evs = l161_sse(base, "/agents/a2a/gtls/json-rpc", {"jsonrpc": "2.0", "id": "t1", "method": "SendStreamingMessage", "params": msg("stream-tls")}, K)
+        check("... and streams over TLS", s == 200 and len(evs) == 4, (s, evs))
+
+        # ---- what the agent saw, and the logs ----
+        seen = json.loads(call("GET", "/seen", base=web)[2])
+        plain = [x for x in seen if x["metadata"].get("x-agent-token") == "tok-l161"]
+        check("the agent gets the runtime credentials as metadata, and never the caller's virtual key", len(plain) >= 8 and all("sk-bf-l161" not in json.dumps(x) for x in seen), seen[:2])
+        check("the TLS agent gets its own credentials", any(x["metadata"].get("x-agent-token") == "tok-l161-tls" for x in seen), [x["metadata"] for x in seen][-2:])
+        s, _, b = call("GET", "/api/agents/history?agent_names=gonly&limit=200", None, ADM, base=base, auth=False)
+        hist = json.loads(b).get("history", []) if s == 200 else []
+        check("the calls to the gRPC-only agent are logged under its name", len(hist) >= 10 and all(x["agent_name"] == "gonly" for x in hist), (s, len(hist)))
+    finally:
+        if gw is not None:
+            gw.terminate()
+            gw.wait()
+        agent.terminate()
+        agent.wait()
 
 
 
@@ -12215,6 +12404,8 @@ def main():
         l148_e2e(env)
         # L148 with two bun workers: the listener opened by one of them, the cards in both
         l148w_e2e(env)
+        # L161: a gRPC-only agent reached from JSON-RPC, REST and gRPC, unary and streaming, h2c and TLS, with ErrorInfo details: its own gateway
+        l161_e2e(env)
         # MCP code mode: the meta-tools in chat requests, stubs and docs, programs over the MCP tools, the key gates on nested calls and the limits: their own gateways
         l117_e2e(env)
         # management API keys: a value shown once, a key's own permissions, the ceiling on grants, expiry, deletion and a restart: their own gateway
