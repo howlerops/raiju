@@ -16,6 +16,18 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
 
 ## Where things stand
 
+- **In progress (waves 20 to 22, branch claude/affectionate-shannon-pjwi5z, not yet on main).**
+  Merged on the branch: L156 (CI: `.github/workflows/ci.yml`, `scripts/ci.sh`), L157 (`make smoke`,
+  and a use-after-free fix in tov-patches/0008), L158 (tov-patches/0009, atomic state writes), L159
+  to L169, L171. A triage of every partial row is in the parity notes and LEDGER wave 21/22 rows.
+  Still to merge (each worker left its change unstaged in its worktree under .claude/worktrees/,
+  with its diff at /tmp/claude-0/<id>/mine.patch when it rebased): L168 (in verify), L170 (adds
+  tov-patches/0010, a WASM wall-clock limit: rebuild the shared compiler after merging), L172,
+  L173 (its rebase onto 642ff0f was cut off by the account's weekly usage limit; resume that
+  worker or redo the rebase), and the upstream Tov material (tov-patches/upstream/: write-ups and
+  format-patch series for 0005-0010, compiler-bugs.md, README.md). Behaviour changes to list in
+  the PR: docs/behaviour-changes-waves-20-22.md.
+
 - Waves 1 to 17 are on `main`. Wave 18 (L142 to L149) built the open items left after wave 17:
   the A2A gRPC binding (an h2c server, HPACK and gRPC framing written in Tov on raw sockets, a
   protobuf codec for lf.a2a.v1, the binding itself), transcription and speech billing, large

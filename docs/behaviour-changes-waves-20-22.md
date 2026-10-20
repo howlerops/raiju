@@ -1,0 +1,5 @@
+- (L166) OpenAPI MCP tool names now follow Bifrost (post__pets -> post_pets); an intersect project with no mcp_configs permits no MCP tools; every MCP client gets a 10-minute health check.
+- (L172) oauth client_credentials defaults to HTTP Basic auth (auth_style "body" for the form); a config with setup_token and no admin locks /api; streams are cut after 120 s of upstream silence by default (Bifrost's default); with large_payload off, a body over max_request_body_size_mb is refused without being read.
+- (L170) PUT /api/plugins/{name} on a missing known plugin creates it (was 404); an unknown plugin is 400.
+- (L171) Agent cards are fetched at start or on first use (no more 503 before the refresh).
+- (L173) /openai/v1/decisions (and SDK-prefixed) speak OpenAI's Decisions API strictly (TypeSafe-only fields refused); Replicate keys without use_deployments_endpoint no longer list deployments; key blacklisted_models wins over models and aliases.
