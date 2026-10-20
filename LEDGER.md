@@ -413,3 +413,15 @@ From a triage of every partial row (work packages WP1 to WP9). Ports from 18280.
 | L166 | (g) MCP | WP5a: GET /mcp heartbeats, OpenAPI import, spec_url, library, ping, per-client timeout, tool cost, instructions on Responses | worker | partial: GET /mcp SSE kept open with heartbeats; OpenAPI import ported from Bifrost's openapimcp (3.0-3.2 and Swagger 2.0, JSON or YAML via `yaml.tov`, $ref resolution, Bifrost's tool names, flattened schemas, per-operation security, spec_file); spec_url fetched and stored, openapi-spec served as json/yaml, Bifrost's preview shape; the MCP library routes and mcp_library_url sync (`mcplibrary.tov`); a connection checker with ping per client; tool cost on MCP log rows and charged to the caller's funding chain; MCP tools and instructions on Responses requests; projects' mcp_configs applied. Open: 3.2 querystring params, deepObject form styles, auto-execution of MCP tools on Responses |
 | L167 | (g) MCP | WP5b: MCP user mode on OIDC, OAuth status states, persisted auth codes and flow state, temp tokens, dual-credential conflict check | worker | assigned |
 | L168 | (h) Observability | WP7: logs, audit, retained content, webhooks, OTLP A2A histogram, cache clear across workers, logs_only redaction | worker | assigned |
+
+## Wave 22 (the remainders of WP3, WP6, WP8, WP9 and the provider leftovers)
+
+Ports from 18290.
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L169 | G40, (d) | WP3 remainder: streamed transcription and speech pass-through, refused and failed audio calls logged, audio per-second rate, Sarvam native and streamed speech, a second response.create refused, live delegation checks | worker | assigned |
+| L170 | (e) Plugins | WP6 remainder: pre_hook per fallback, post_hook on cache hits, chunk skip, HTTP hooks on /mcp and Bedrock streams, .wasm from a URL, a WASM wall-clock bound, /api/plugins placement, plugin remainders, hooks on the other batch and file calls | worker | assigned |
+| L171 | (g) A2A | WP8 remainder: A2A-Version enforcement and translation, interface failover, protocolVersion checks, cancellation, startup card fetch and reconciliation, extension_uris and tenant, raw capture, agent history routes, profile and project grants | worker | assigned |
+| L172 | G48, network | WP9 remainder: include_usage on large streams, threshold reload, stream idle timeout, oauth_key_config on pass-through and ES256, Vertex project_number, extra params, websocket 429, Cursor parser, setup lock, SCIM bulk and ETags, routing-info on streamed Anthropic | worker | assigned |
+| L173 | (d) Providers | Provider leftovers of L163 and L164: Bedrock text stream, OpenAI-shaped decisions route, Mantle Responses, Replicate listing and extra params, auto_inject cache points, alias override fields, watsonx listing, listing blacklist and aliases, HuggingFace backends | worker | todo |
